@@ -1,0 +1,492 @@
+[package]
+name = "mary"
+version = "0.1.0"
+edition = "2021"
+description = "Neural-network models as content-addressed graphs in TribleSpace. A tensor is a self-describing Array<F32> leaf; a module is an entity; composition is role-edges. Named for Mary — both Mary Wollstonecraft Shelley, who wrote the creature into being, and her mother Mary Wollstonecraft. The format in which dead weights become a living, recomposable model-graph; the franken-stitch is the spark."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+burn = { version = "0.21.0", default-features = false, features = ["wgpu", "metal", "autodiff"] }
+# Kernel fusion for the qwen3tts decode loop, WITHOUT flipping burn-wgpu's
+# global "fusion" flag: that flag rewrites the `Metal` alias to the Fusion
+# wrapper, which breaks gemma's zero-copy CubeTensor seam (persist.rs). These
+# two deps only add the Fusion wrapper type + its impl for CubeBackend;
+# qwen3tts declares its own fused alias (nn::backend::BFused) and everything
+# else keeps the raw backend. (burn 0.21's top-level "fusion" feature is
+# unresolvable on crates.io — it pulls a pre-release burn-cpu.)
+burn-fusion = { version = "0.21.0", optional = true }
+burn-cubecl = { version = "0.21.0", default-features = false, features = ["fusion"], optional = true }
+triblespace = { version = "0.47.0", path = "../triblespace-rs", default-features = false }
+anybytes = "0.20"
+# safetensors is IMPORT-ONLY: runtime builds load weights exclusively from
+# piles. Only the `import` feature (persist importers + parity gates) compiles
+# a safetensors reader — inference/serve builds cannot reach one.
+safetensors = { version = "0.4.5", optional = true }
+half = { version = "2", features = ["zerocopy"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Pile loading (mary::persist) is THE runtime weight path, so its deps are
+# unconditional: a Repository needs a signing key (ed25519 + OsRng via rand)
+# and the loaders report errors via anyhow.
+anyhow = "1"
+
+# Flux.2 port (mary::models::flux) deps mary's other models don't need.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
+tokenizers = { version = "0.21", optional = true }
+rand = "0.8"
+# exact (erf-based) gelu for the CPU codec-encoder port (qwen3tts)
+libm = { version = "0.2", optional = true }
+
+# Gemma 4 multimodal port (mary::models::gemma) deps — all optional, gated behind `gemma`.
+burn-train = { version = "0.21.0", optional = true }
+burn-ndarray = { version = "0.21.0", optional = true }
+cubecl = { version = "0.10.0", default-features = false, features = ["wgpu", "std"], optional = true }
+wgpu = { version = "29", optional = true }
+pollster = { version = "0.4", optional = true }
+memmap2 = { version = "0.9", optional = true }
+sha2 = { version = "0.10", optional = true }
+bytes = { version = "1", optional = true }
+rustfft = { version = "6", optional = true }
+rubato = { version = "0.16", optional = true }
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "wav", "pcm", "flac", "aac", "isomp4"], optional = true }
+# Live mic capture for the listen loops (gemma_listen, voxtral_listen --mic):
+# open a NAMED CoreAudio input device (Reachy Mini XVF3800 array or any Mac
+# mic). Input side only; playback stays with the caller.
+cpal = { version = "0.17", optional = true }
+# On-disk pile persistence (mary::persist) needs a Repository signing key.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+
+[features]
+# Safetensors → pile IMPORT support. The ONLY feature that compiles a
+# safetensors reader (`WeightLoader::SingleFile`/`MultiShard`,
+# `ingest::save_safetensors`, `persist::persist_safetensors_to_pile`, the
+# `load_*_from_hf` constructors). Importer binaries and parity gates require
+# it; every runtime/inference/serve path loads from piles and builds without it.
+import = ["dep:safetensors"]
+flux = ["dep:image", "dep:tokenizers"]
+# SmolVLA (mary::models::smolvla) — vision-language-action; SigLIP vision +
+# tokenizer + flow-matching sampler. Same dep surface as flux.
+smolvla = ["dep:image", "dep:tokenizers"]
+# Qwen3-TTS-12Hz-1.7B-Base (mary::models::qwen3tts) — streaming-voice
+# candidate A: talker + code predictor + ECAPA speaker encoder + 12Hz codec
+# decoder. Needs the Qwen2 BPE (tokenizers) + sampling (rand).
+qwen3tts = ["dep:tokenizers", "dep:burn-fusion", "dep:burn-cubecl", "dep:libm", "dep:memmap2", "dep:sha2"]
+# Research prototype: hand-fused cubecl kernels for the talker's single-token
+# decode step (qwen3tts::megakernel) — one dispatch per fused stage instead of
+# ~18 burn ops per layer. The lever is host submission count, not FLOPs.
+megakernel = ["qwen3tts", "dep:cubecl"]
+# PersonaPlex-7B LM port (mary::models::personaplex::temporal) parity lane:
+# the CPU-f32 probe runs the 7B under burn-ndarray (Accelerate BLAS) for a
+# single deterministic numeric path — parity before performance. The model
+# code itself is backend-generic and rides `qwen3tts` (it reuses those layers).
+personaplex = ["qwen3tts", "dep:burn-ndarray", "burn-ndarray/blas-accelerate"]
+# PersonaPlex realtime lane: q4 (4-bit grouped) weight quantization with a
+# dequant-in-kernel matvec (mary::nn::q4) — the bandwidth lever that turns the
+# Moshi temporal transformer's 17.2 GB/step f16 stream into ~4.8 GB. Additive:
+# a cubecl kernel + host wrapper + the moshi_q4_probe spike; no model changes.
+# memmap2 backs the zero-copy load seam (mmap'd derived-sibling blobs aliased
+# onto the GPU via register_external_aliased — models/personaplex/qpile.rs).
+q4 = ["dep:cubecl", "dep:memmap2"]
+# `mary::speak` — the production voice seam: Qwen3-TTS synthesis loading its
+# weights from a durable standalone pile (no safetensors in the load path).
+speak = ["qwen3tts"]
+# Voxtral-Mini-4B-Realtime (mary::models::voxtral) — delay-
+# conditioned streaming STT. Tekken tokenizer is decode-only (serde_json,
+# already unconditional); fusion deps for the BFused decode loop; memmap2
+# for the rawhalf lane's zero-copy leaf aliasing (MmapRaw owner downcast).
+voxtral = ["dep:burn-fusion", "dep:burn-cubecl", "dep:memmap2"]
+# Construct a `tokenizers::Tokenizer` DIRECTLY from a tokenizer graph
+# (mary::tokenizer::build_tokenizer + persist::load_tokenizer_from_pile) —
+# the load half of tokenizers-as-tribles: no tokenizer.json anywhere in the
+# runtime path, the `tokenizers` crate is just the executor (as Burn is for
+# weights).
+tokenizer = ["dep:tokenizers"]
+# CLIP ViT-B/32 multi-modal embedder (mary::embed) — image+text into one
+# contrastive space behind LocalEmbedder. Needs image decode + tokenizers;
+# light enough to stay out of the default build. Embedders load from a
+# content-addressed pile.
+embed = ["dep:image", "dep:tokenizers", "tokenizer"]
+gemma = [
+    "burn/train",
+    "burn/ndarray",
+    "dep:burn-train",
+    "dep:burn-ndarray",
+    "dep:cubecl",
+    "dep:wgpu",
+    "dep:pollster",
+    "dep:memmap2",
+    "dep:bytes",
+    "dep:rustfft",
+    "dep:rubato",
+    "dep:symphonia",
+    "dep:image",
+    "dep:tokenizers",
+    "half/num-traits",
+]
+# gemma_gen in half precision (f16 weights) — lets the dense 31B fit 128GB.
+f16gen = []
+# Live mic capture (cpal) — the model-agnostic half of a listen loop. Both
+# ear lanes compose it with their model feature: `gemma,listen` builds
+# gemma_listen; `voxtral,listen` unlocks voxtral_listen's --mic mode.
+listen = ["dep:cpal"]
+# The in-process text-generation seam for the playground (mary::local). Pulls in
+# the gemma engine. The playground depends on mary behind this feature;
+# the default build stays light.
+local-model = ["gemma"]
+# Hand-run probes / parity gates that build under the default (f5-only) deps.
+# Gating them keeps the DEFAULT build a pure library: `cargo build --release`
+# produces no separately-built binaries, so nothing in any production path can
+# drift stale against the pile blob format (stale-standalone-binary drift is
+# fixed at the class level — consumers call `mary::say` in-process). Run a
+# probe with `--features dev-tools`.
+# The probes compare against safetensors oracles, so this pulls `import`.
+dev-tools = ["import"]
+# Hand-run dev probes / parity gates (f5-only deps) — kept out of the default
+# (library-only) build behind `dev-tools`.
+[[bin]]
+name = "forward_test"
+required-features = ["dev-tools"]
+[[bin]]
+name = "pile_test"
+required-features = ["dev-tools"]
+[[bin]]
+name = "probe"
+required-features = ["dev-tools"]
+[[bin]]
+name = "probe_cfm"
+required-features = ["dev-tools"]
+[[bin]]
+name = "probe_mel"
+required-features = ["dev-tools"]
+[[bin]]
+name = "probe_vocos"
+required-features = ["dev-tools"]
+[[bin]]
+name = "say_serve"
+required-features = ["dev-tools"]
+[[bin]]
+name = "speak"
+required-features = ["dev-tools"]
+
+# The flux round-trip gate needs the flux feature; keep it out of the default build.
+[[bin]]
+name = "flux_pile_test"
+required-features = ["flux", "import"]
+
+# The Gemma audio-understanding gate. Pile-only weights (like gemma_gen).
+[[bin]]
+name = "gemma_hear"
+required-features = ["gemma"]
+
+# The live listen loop: named input device → VAD → hearing → jsonl.
+[[bin]]
+name = "gemma_listen"
+required-features = ["gemma", "listen"]
+
+# Audio-tower parity gate: mary's feature extractor / tower / embedder vs
+# HF-transformers goldens (capture_goldens.py). The trust gate for the audio path.
+[[bin]]
+name = "gemma_audio_parity"
+required-features = ["gemma", "import"]
+
+# Read-only census of the tensor keys inside a mary weight pile.
+[[bin]]
+name = "gemma_pile_keys"
+required-features = ["gemma"]
+
+# Gemma 4 as a pure text LLM, in-process (the in-substrate brain).
+[[bin]]
+name = "gemma_gen"
+required-features = ["gemma"]
+
+# Gemma 4 pile round-trip parity gate (safetensors vs pile token-id identity).
+[[bin]]
+name = "gemma_pile_test"
+required-features = ["gemma", "import"]
+
+# Dump gemma-4-31B-it final-position logits (from pile) for the HF cross-check.
+[[bin]]
+name = "gemma31b_parity"
+required-features = ["gemma"]
+
+# Concurrent-fit check: PersonaPlex-7B + Gemma-4-31B resident at once (peak RSS).
+[[bin]]
+name = "gemma31b_fit"
+required-features = ["gemma"]
+
+# Vision-encoder load + sanity-forward check for the 31B (from pile).
+[[bin]]
+name = "gemma31b_vision"
+required-features = ["gemma"]
+
+# Gemma 4 E4B LoRA training smoke (overfit one sentence under Autodiff<Metal>).
+[[bin]]
+name = "gemma_train_lora"
+required-features = ["gemma", "import"]
+
+# Persist Gemma 4 weights into a real on-disk pile (shell-is-physics endpoint).
+[[bin]]
+name = "gemma_persist"
+required-features = ["gemma", "import"]
+
+# Persist the F5-TTS + Vocos checkpoints into the durable voice-origin pile
+# (the weights `mary::say` loads from).
+[[bin]]
+name = "f5_persist"
+required-features = ["import"]
+
+# Persist SmolVLA (lerobot/smolvla_base) into the durable action-model pile.
+[[bin]]
+name = "smolvla_persist"
+required-features = ["import"]
+
+# Persist the four embedders (CLIP, SigLIP2, nomic text, nomic vision) from the
+# local HF cache into their standalone piles.
+[[bin]]
+name = "embed_persist"
+required-features = ["embed", "import"]
+
+# Persist a FLUX.2 model dir (text_encoder + transformer + vae) into one pile,
+# component-prefixed so the pipeline loads each phase separately.
+[[bin]]
+name = "flux_persist"
+required-features = ["import"]
+
+# Persist → fresh-pile-load → parity gate (no safetensors at load time).
+[[bin]]
+name = "gemma_persist_test"
+required-features = ["gemma", "import"]
+
+# Streaming pile-load parity gate (streamed == materialized, token-identical).
+[[bin]]
+name = "gemma_stream_test"
+required-features = ["gemma", "import"]
+
+# Phase 2 zero-copy aliasing proof (one tensor, mmap->GPU no-copy).
+[[bin]]
+name = "zerocopy_probe"
+required-features = ["gemma"]
+
+[[bin]]
+name = "gemma_alias_probe"
+required-features = ["gemma", "import"]
+
+[[bin]]
+name = "gemma_aliased_test"
+required-features = ["gemma", "import"]
+
+# Exercise the playground↔mary LocalTextEngine seam end-to-end.
+[[bin]]
+name = "local_demo"
+required-features = ["local-model"]
+
+# The SmolVLA parity gate.
+[[bin]]
+name = "smolvla_probe"
+required-features = ["smolvla", "import"]
+
+# The SmolVLA pile round-trip (ingest → materialize → end-to-end parity).
+[[bin]]
+name = "smolvla_pile_test"
+required-features = ["smolvla", "import"]
+
+# Run SmolVLA on a real image + instruction → action chunk.
+[[bin]]
+name = "smolvla_infer"
+required-features = ["smolvla"]
+
+# De-risk the retarget: confirm autodiff flows gradients into the expert.
+[[bin]]
+name = "smolvla_grad_test"
+required-features = ["smolvla", "import"]
+
+# De-risk the retarget, step 2: prove the SGD loop overfits the expert head.
+[[bin]]
+name = "smolvla_overfit"
+required-features = ["smolvla", "import"]
+
+# CLIP embedder parity gate (rust-vs-HF cosine > 0.99 + semantic ordering).
+[[bin]]
+name = "clip_embed_test"
+required-features = ["embed", "import"]
+
+# Qwen3-TTS parity gates (vs oracle goldens in the port worktree).
+[[bin]]
+name = "qwen3tts_probe"
+required-features = ["qwen3tts", "import"]
+
+# Qwen3-TTS end-to-end: clone a reference voice clip, speak an arbitrary line.
+[[bin]]
+name = "qwen3tts_say"
+required-features = ["qwen3tts"]
+
+# Mimi codec (PersonaPlex Phase 1) parity gate vs the moshi CPU-f32 oracle.
+[[bin]]
+name = "mimi_probe"
+required-features = ["qwen3tts", "import"]
+
+# PersonaPlex-7B checkpoint → shelf pile (LM + Mimi codec), with the
+# bit-exact round-trip gate and config-truth shape assertions. Also the
+# derive step for the runtime-format sibling piles (--derive-fmt /
+# --derive-depth — the zero-copy load seam, needs q4 for the quantizers).
+[[bin]]
+name = "personaplex_persist"
+required-features = ["personaplex", "q4", "import"]
+
+# PersonaPlex-7B temporal transformer (LM part 1) CPU-f32 parity gate vs the
+# moshi oracle goldens. Loads weights from the shelf pile only — no safetensors.
+[[bin]]
+name = "personaplex_probe"
+required-features = ["personaplex"]
+
+# Qwen3-TTS pile round-trip (ingest → materialize → bit-identical forward).
+[[bin]]
+name = "qwen3tts_pile_test"
+required-features = ["qwen3tts", "import"]
+
+# Persist both Qwen3-TTS checkpoints (talker+predictor+speaker, codec) into a
+# real on-disk pile — the durable weights `mary::speak` loads from.
+[[bin]]
+name = "qwen3tts_persist"
+required-features = ["speak", "import"]
+
+# Voxtral-Mini-4B-Realtime: HF checkpoint → real on-disk pile
+# (models/voxtral_mini.pile), bf16→f32 exact, bit-exactness gate inline.
+[[bin]]
+name = "voxtral_persist"
+required-features = ["import"]
+
+# Voxtral parity gates vs the CPU-f32 oracle goldens (golden/voxtral_capture.py).
+[[bin]]
+name = "voxtral_probe"
+required-features = ["voxtral"]
+
+# Qwen3-TTS streaming synthesis: PCM out while generating; TTFA + margins.
+[[bin]]
+name = "qwen3tts_stream"
+required-features = ["qwen3tts"]
+
+[[bin]]
+name = "qwen3tts_megakernel_probe"
+required-features = ["megakernel"]
+
+# Moshi (PersonaPlex-7B) realtime spike: temporal + depth transformer decode
+# timing at real dims with synthetic random weights — the 80 ms/frame verdict.
+[[bin]]
+name = "moshi_realtime_probe"
+required-features = ["qwen3tts"]
+
+# Realtime lane B: the fast CPU depformer predictor (depth_fast) — parity gate
+# vs the oracle goldens + exact-token agreement vs the burn depth.rs reference,
+# and the 16-step frame bench (min-of-medians).
+[[bin]]
+name = "moshi_depth_probe"
+required-features = ["personaplex"]
+
+# The q4 weight-quant follow-up spike: does dequant-in-kernel 4-bit matvec
+# deliver the ~3.5x bandwidth win at Moshi decode shapes? Correctness gate +
+# decode-step-shaped benchmark + frame projection.
+[[bin]]
+name = "moshi_q4_probe"
+required-features = ["q4"]
+
+# PersonaPlex realtime gates: the q4/Metal temporal decode build
+# (temporal_metal) vs the moshi goldens (cos + argmax, honest q4 bars) plus
+# ms/step at cache fills 256/1024/3000.
+[[bin]]
+name = "personaplex_rt_probe"
+required-features = ["personaplex", "q4"]
+
+# PersonaPlex surface probe: teacher-force a text phrase onto stream 0 (the
+# inner-monologue) during a silence gap, then release — measures auto-complete
+# vs keep-the-line-open (Q1) and whether the agent audio vocalizes the surfaced
+# text / the silent-thought mode (Q2). The text-surfacing seam study.
+[[bin]]
+name = "personaplex_surface_probe"
+required-features = ["personaplex", "q4"]
+
+# SigLIP2 so400m embedder parity gate (rust-vs-HF cosine > 0.99 + semantic).
+[[bin]]
+name = "siglip_embed_test"
+required-features = ["embed", "import"]
+
+# Embedder pile round-trip parity gate: persist CLIP + SigLIP safetensors into a
+# temp pile, load from pile vs from safetensors, assert cosine > 0.999999.
+[[bin]]
+name = "embed_pile_test"
+required-features = ["embed", "import"]
+
+# nomic-embed-text-v1.5 parity gate (rust-vs-sentence-transformers cosine > 0.99
+# incl long-context text + pile round-trip).
+[[bin]]
+name = "nomic_text_test"
+required-features = ["embed", "import"]
+
+# nomic-embed-vision-v1.5 parity gate (rust-vs-HF cosine > 0.99 + pile round-trip).
+[[bin]]
+name = "nomic_vision_test"
+required-features = ["embed", "import"]
+
+# Cross-modal bake-off: Nomic (vision↔text, shared 768-d) vs SigLIP2 rankings.
+[[bin]]
+name = "embed_bakeoff"
+required-features = ["embed", "import"]
+
+[[bin]]
+name = "nomic_semantic_probe"
+required-features = ["embed", "import"]
+
+[dev-dependencies]
+burn-ndarray = "0.21.0"
+
+[patch.crates-io]
+# Forked to add a zero-copy "register an externally-created GPU buffer as a
+# tensor handle" seam (mmap'd f16 pile pages -> Metal newBufferWithBytesNoCopy ->
+# wgpu buffer -> cubecl handle). Unmodified baseline first; patched below.
+cubecl-runtime = { path = "../cubecl-fork/cubecl-runtime" }
+cubecl-wgpu = { path = "../cubecl-fork/cubecl-wgpu" }
+# Local triblespace-core: V3 uniform 256-byte headers — every record 256-aligned,
+# so mmap'd blobs sit at GPU-ready offsets for zero-copy aliasing (cat-merge safe).
+triblespace-core = { path = "../triblespace-rs/triblespace-core" }
+
+# Silent gate harness for the mary::speak seam (pile-loaded; no audio device).
+[[bin]]
+name = "speak_check"
+required-features = ["speak"]
+
+# Gate for the zero-copy talker lane: weights bit-identity + teacher-forced
+# forward bit-exactness across raw-fold/folded-alias (the fused talker lane
+# was removed 2026-07-12 — raw is the ONLY talker lane).
+[[bin]]
+name = "qwen3tts_raw_gate"
+required-features = ["speak"]
+
+# The nomic-embed-multimodal-7b (BiQwen2_5 / qwen2_5_vl) parity tests all ride
+# the `gemma` feature (qwen2_5_vl reuses gemma's RoPE + deps); declare it so
+# `--all-targets` under other feature sets doesn't try to compile them.
+[[test]]
+name = "nomic_mm7b_aliased_parity"
+required-features = ["gemma"]
+[[test]]
+name = "nomic_mm7b_embedder"
+required-features = ["gemma"]
+[[test]]
+name = "nomic_mm7b_image_parity"
+required-features = ["gemma"]
+[[test]]
+name = "nomic_mm7b_parity"
+required-features = ["gemma"]
+[[test]]
+name = "nomic_mm7b_preprocess_parity"
+required-features = ["gemma"]
+[[test]]
+name = "nomic_mm7b_real_parity"
+required-features = ["gemma"]
+[[test]]
+name = "nomic_mm7b_vision_parity"
+required-features = ["gemma"]
+
+# The STT lane, live: file-paced streaming transcription + (morning) mic mode.
+[[bin]]
+name = "voxtral_listen"
+required-features = ["voxtral"]

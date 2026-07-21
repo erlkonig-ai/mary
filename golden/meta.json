@@ -1,0 +1,6 @@
+{
+ "ref_text": "The tide rolls in across the flat sand, and the evening light settles slowly over the harbor as the last boats come home.",
+ "test_line": "If you can hear this clearly, the port worked: the same reference voice, synthesized end to end by the new engine in real time.",
+ "ref_code_frames": 130,
+ "greedy_frames": 1199
+}

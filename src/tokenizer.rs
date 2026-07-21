@@ -1,0 +1,1116 @@
+//! mary — tokenizers as content-addressed graphs in TribleSpace.
+//!
+//! The companion to [`crate::format`]: where `format` decomposes a model's
+//! *weights* into self-describing tensor leaves, this module decomposes a
+//! model's *tokenizer* into tribles — so the tokenizer travels **with** the
+//! pile instead of riding along as an opaque `tokenizer.json` side-file in the
+//! HuggingFace cache (which evaporates the moment the cache is cleared under
+//! disk pressure — the failure that motivated this).
+//!
+//! Two layers, mirroring the two very different cost profiles of a tokenizer:
+//!
+//!   - **the bulk** — `vocab` (token↔id), `merges` (ordered BPE pairs), and
+//!     `added_tokens`. Uniform, content-addressed, dedups across shared vocabs.
+//!     Represented here as proper tribles (this module).
+//!   - **the config tail** — normalizer / pre-tokenizer / decoder: a small
+//!     typed AST whose nodes each map 1:1 to a `tokenizers` constructor call.
+//!     Types and boolean options are `metadata::tag` discriminants; regex /
+//!     behaviour / prefix are flat attrs; `Sequence` children are ordered
+//!     `member` edges. (No post-processor is stored: mary hand-frames its
+//!     sentinels — `[CLS]`/`[SEP]`, bos/eos — itself, see `embed.rs`.)
+//!
+//! Load is **construct-from-graph, no JSON**: [`build_tokenizer`] (feature
+//! `tokenizer`) queries the graph and feeds the parts into `tokenizers`'
+//! programmatic builders (`Tokenizer::new(model)`, `.with_normalizer(..)`, …)
+//! — the exact shape of how `format` reads the weight graph and builds Burn
+//! tensors; the `tokenizers` crate is purely the executor, as Burn is for
+//! weights. JSON is touched exactly once, at ingest, the way
+//! `ingest::save_safetensors` reads a safetensors file once.
+//!
+//! Attribute provenance: the structural + bulk ids below were minted with
+//! `trible genid` on 2026-07-16 (recorded on compass goal 67b09f72). The
+//! scaffolding attributes (`model_name`, `kind`, `index`, `member`) are
+//! **reused** from [`crate::format`] by re-declaring their exact hex — the same
+//! reuse idiom `models/gemma/lora.rs` uses for `model_name`.
+
+use std::collections::HashMap;
+use triblespace::core::metadata;
+use triblespace::prelude::*;
+
+type Err = Box<dyn std::error::Error>;
+
+// ── classification concepts, via the canonical `metadata::tag` (presence = "this
+// concept applies"). There is NO `metadata::kind` attribute — tags ARE the
+// classifier (KIND_TAG = kind discriminants, KIND_MULTI = multiple simultaneous
+// kinds). Minted 2026-07-16 (compass 67b09f72). `ty::*` are the type
+// discriminants (role-agnostic — the *edge* gives the role); `flag::*` the bools.
+#[allow(dead_code)]
+mod ty {
+    use triblespace::macros::id_hex;
+    use triblespace::prelude::Id;
+    pub const BERT_NORMALIZER: Id = id_hex!("AC009EBADB3488042EDCD3D2C8648342");
+    pub const SEQUENCE: Id = id_hex!("33E6588376EEEDCBD4CD16DA197B7F90");
+    pub const NFC: Id = id_hex!("4D9204FC08700571D2407B74C0348DE0");
+    pub const REPLACE: Id = id_hex!("48927BD29F9321104585A69B1B541812");
+    pub const LOWERCASE: Id = id_hex!("C670B7A8105E77D2F6EF0DA05A8F5C99");
+    pub const BERT_PRE_TOKENIZER: Id = id_hex!("A6259970638C680F95F061D9EA7F2975");
+    pub const SPLIT: Id = id_hex!("B39A4D683D9B44F7D72BE118DA8E46BD");
+    pub const BYTE_LEVEL: Id = id_hex!("4FDB5C7C0999B4DECA894AD75E5A94C6");
+    pub const WORD_PIECE: Id = id_hex!("85A060015E6E94F70479E0E6B6BE0D98");
+    pub const BPE: Id = id_hex!("71F4DAC1D6392375923D7A2A9FA53650");
+}
+#[allow(dead_code)]
+mod flag {
+    use triblespace::macros::id_hex;
+    use triblespace::prelude::Id;
+    pub const CLEAN_TEXT: Id = id_hex!("C3A27148CDE4AC009B47E1EE141D477B");
+    pub const HANDLE_CHINESE_CHARS: Id = id_hex!("56D740D98D843D6E9B3E7CEB09B1949D");
+    pub const LOWERCASE: Id = id_hex!("46D626BCA9C575916A51DAAF0D4A3E16");
+    pub const INVERT: Id = id_hex!("1C84B18C4CD06F912C6FAF93FD64C48A");
+    pub const ADD_PREFIX_SPACE: Id = id_hex!("19B8979BAED4ADF439A7C8867ABC8727");
+    pub const TRIM_OFFSETS: Id = id_hex!("E7CC5D08B8995F31A4736B1482124071");
+    pub const CLEANUP: Id = id_hex!("42A792CDD8594CE881541C784C65B03F");
+    pub const FUSE_UNK: Id = id_hex!("39F4E0AF4C309CB77AADD1EB33495967");
+    pub const SPECIAL: Id = id_hex!("BBB4BCA9CA25CAB5F2ECABF787B0A638");
+    pub const NORMALIZED: Id = id_hex!("266A99918C6951D5C9F2D0A961C05D4A");
+}
+
+pub mod attrs {
+    use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString, U256BE};
+    use triblespace::prelude::*;
+
+    attributes! {
+        // ── reused from `crate::format` (same hex — do NOT re-mint) ──
+        /// Ordered position among siblings — merge rank, added-token order,
+        /// `Sequence` config-node child order. Reused from `format::attrs::index`.
+        "33CE12B1B940B13E48D8E5B0ADFD2421" as index: U256BE;
+        /// Homogeneous ordered membership — reused for a `Sequence` config
+        /// node → its child steps. From `format::attrs::member`.
+        "B4B6EC08A0CD70DE63A690168EE78F0F" as member: GenId;
+        /// The tokenizer's source id (e.g. "nomic-ai/nomic-embed-text-v1.5").
+        /// Reused from `format::attrs::model_name`.
+        "4C1CD1611863E7854C59C7DC706DF77A" as model_name: Handle<blobencodings::LongString>;
+
+        // ── minted 2026-07-16 (compass 67b09f72) — structural edges ──
+        /// A model root → its tokenizer entity.
+        "E7014108A8F9512B19E3E8272E8A71F9" as tokenizer: GenId;
+        /// Tokenizer → a vocab entry (repeated).
+        "E839AA8F549C0D608FB86476A1EF3416" as vocab: GenId;
+        /// Tokenizer → a merge entity (repeated, BPE only).
+        "E229769197BB035A2D6F61BC6A7D44BC" as merge: GenId;
+        /// Tokenizer → an added/special token entity (repeated).
+        "B2553118F4CAAF1D028619956DE7F145" as added: GenId;
+        /// Tokenizer → its normalizer config node.
+        "53BAF87A0E7F1410F8212B3EDF2A498C" as normalizer: GenId;
+        /// Tokenizer → its pre-tokenizer config node.
+        "6EEBF39CADD11B7CFBB624019AE21585" as pre_tokenizer: GenId;
+        /// Tokenizer → its post-processor config node.
+        "98EC58B28F4D0BB43965DF7C5FF22713" as post_processor: GenId;
+        /// Tokenizer → its decoder config node.
+        "F3AAA4CD8EE04E5592059564A21FE953" as decoder: GenId;
+
+        // ── minted 2026-07-16 — bulk leaves ──
+        /// A token/subword string (vocab entry, added-token content). A
+        /// `LongString` blob, NOT `ShortString`: CLIP has 27 tokens over the
+        /// 32-byte inline ceiling (byte-level BPE emoji clusters, up to 64 B).
+        /// Content-addressed, so identical pieces (incl. merge halves) dedup.
+        "AE7FE29F2F38153F58C542D5CA4A9356" as piece: Handle<blobencodings::LongString>;
+        /// A token's vocab id (vocab entry, added token). Small int in a U256BE.
+        "F0E2E782F7BB62F52B1186DDE0EB5388" as token_id: U256BE;
+        /// A BPE merge's left piece (`LongString`, dedups against `piece`).
+        "5723ECE1FF426C58879B79D5669A7CF1" as merge_left: Handle<blobencodings::LongString>;
+        /// A BPE merge's right piece (`LongString`, dedups against `piece`).
+        "5C78FEB151F35A2C5D07BEC92E860752" as merge_right: Handle<blobencodings::LongString>;
+
+        // ── minted 2026-07-16 — config-tail model knobs (flat scalars) ──
+        /// The unknown-token string (WordPiece "[UNK]", BPE "<|endoftext|>").
+        "68F1A9E6ED735E7C3ADCCA076AFF1742" as unk_token: ShortString;
+        /// WordPiece continuing-subword prefix ("##"); empty for BPE.
+        "11F76A2C0856C16CB030C4327D5A3B93" as continuing_subword_prefix: ShortString;
+        /// BPE end-of-word suffix ("</w>").
+        "6FB969E8A3EDD1A657C721DD5A7D42EA" as end_of_word_suffix: ShortString;
+        /// WordPiece max input chars per word (100).
+        "DF3F88DBFA2B44A7783169C9640014AF" as max_input_chars: U256BE;
+
+        // ── minted 2026-07-16 — config-node flat fields ──
+        /// A Replace/Split node's regex pattern string (stored raw; both our
+        /// tokenizers use the Regex variant, reconstructed as Regex).
+        "C8262D5668B8A1F541B3C35D54201BEC" as pattern: Handle<blobencodings::LongString>;
+        /// A Replace node's replacement content (e.g. " ").
+        "3AC7574C07D02D389B4E7AD3B3B084D9" as replace_content: ShortString;
+        /// A Split node's SplitDelimiterBehavior name ("Removed"/"Isolated"/…).
+        "964B4FCF7477E7E4436F0325F89B7CB5" as behavior: ShortString;
+    }
+}
+
+/// Split a HuggingFace `merges` entry into its two pieces. Newer tokenizer.json
+/// stores each merge as a 2-element array `["a","b"]`; older ones as a single
+/// space-joined string `"a b"`. Handles both.
+fn merge_pair(m: &serde_json::Value) -> Option<(String, String)> {
+    if let Some(pair) = m.as_array() {
+        if pair.len() == 2 {
+            return Some((pair[0].as_str()?.to_string(), pair[1].as_str()?.to_string()));
+        }
+    }
+    let s = m.as_str()?;
+    let (l, r) = s.split_once(' ')?;
+    Some((l.to_string(), r.to_string()))
+}
+
+/// Ingest a HuggingFace `tokenizer.json` into a tokenizer graph. Parses the JSON
+/// **once** and emits the bulk (vocab / merges / added-tokens) as tribles under
+/// a tokenizer entity tagged with its model kind. Returns the Fragment rooted at
+/// the tokenizer entity (link it to a model root with `attrs::tokenizer`).
+///
+/// Alongside the bulk it writes the flat model knobs (`unk_token`, …) and the
+/// normalizer / pre-tokenizer / decoder config subtrees ([`save_config_node`]).
+/// The post-processor is deliberately NOT stored — mary hand-frames sentinels
+/// itself (see `embed.rs`), so a reconstructed tokenizer needs none.
+pub fn save_tokenizer_json(
+    json: &[u8],
+    source_name: &str,
+    blobs: &mut impl BlobStorePut,
+) -> Result<Fragment, Err> {
+    let v: serde_json::Value = serde_json::from_slice(json)?;
+    let model = &v["model"];
+    let model_kind = model["type"].as_str().unwrap_or("");
+    let mut facts = TribleSet::new();
+
+    // ── vocab: { piece, token_id } per entry ──
+    let mut vocab_ids: Vec<Id> = Vec::new();
+    if let Some(vocab) = model["vocab"].as_object() {
+        for (tok, id) in vocab {
+            let id = id.as_u64().ok_or("vocab id not an integer")?;
+            let ph = blobs.put::<blobencodings::LongString, _>(tok.clone())?;
+            let e = entity! { _ @ attrs::piece: ph, attrs::token_id: id };
+            vocab_ids.push(e.root().expect("vocab entry root"));
+            facts += e.into_facts();
+        }
+    }
+
+    // ── merges: { merge_left, merge_right, index=rank } (BPE) ──
+    let mut merge_ids: Vec<Id> = Vec::new();
+    if let Some(merges) = model["merges"].as_array() {
+        for (rank, m) in merges.iter().enumerate() {
+            let (l, r) = merge_pair(m).ok_or("malformed merge entry")?;
+            let lh = blobs.put::<blobencodings::LongString, _>(l)?;
+            let rh = blobs.put::<blobencodings::LongString, _>(r)?;
+            let e = entity! { _ @
+                attrs::merge_left: lh,
+                attrs::merge_right: rh,
+                attrs::index: rank as u64,
+            };
+            merge_ids.push(e.root().expect("merge root"));
+            facts += e.into_facts();
+        }
+    }
+
+    // ── added / special tokens: { piece, token_id, index=order } ──
+    // (the boolean flags — special/single_word/lstrip/rstrip/normalized — are
+    //  config-tail; deferred with the rest of the field schema.)
+    let mut added_ids: Vec<Id> = Vec::new();
+    if let Some(added) = v["added_tokens"].as_array() {
+        for (order, t) in added.iter().enumerate() {
+            let content = t["content"].as_str().ok_or("added token missing content")?;
+            let id = t["id"].as_u64().ok_or("added token id not an integer")?;
+            let ch = blobs.put::<blobencodings::LongString, _>(content.to_string())?;
+            let e = entity! { _ @
+                attrs::piece: ch,
+                attrs::token_id: id,
+                attrs::index: order as u64,
+            };
+            added_ids.push(e.root().expect("added token root"));
+            facts += e.into_facts();
+        }
+    }
+
+    // ── the tokenizer entity (+ flat model knobs; absent ones are omitted) ──
+    let name_h = blobs.put::<blobencodings::LongString, _>(source_name.to_string())?;
+    let unk = model["unk_token"].as_str();
+    let csp = model["continuing_subword_prefix"].as_str().filter(|s| !s.is_empty());
+    let eows = model["end_of_word_suffix"].as_str().filter(|s| !s.is_empty());
+    let max_chars = model["max_input_chars_per_word"].as_u64();
+    let model_type = match model_kind {
+        "WordPiece" => ty::WORD_PIECE,
+        "BPE" => ty::BPE,
+        other => return Err(format!("unsupported tokenizer model type: {other:?}").into()),
+    };
+
+    // ── config tail: normalizer / pre-tokenizer / decoder subtrees. The
+    //    post-processor is deliberately omitted — mary hand-frames [CLS]/[SEP]
+    //    (nomic) and bos/eos (clip) itself, like embed.rs already does. ──
+    let norm_id = match v.get("normalizer").filter(|x| !x.is_null()) {
+        Some(n) => Some(save_config_node(n, blobs, &mut facts)?),
+        None => None,
+    };
+    let pretok_id = match v.get("pre_tokenizer").filter(|x| !x.is_null()) {
+        Some(n) => Some(save_config_node(n, blobs, &mut facts)?),
+        None => None,
+    };
+    let dec_id = match v.get("decoder").filter(|x| !x.is_null()) {
+        Some(n) => Some(save_config_node(n, blobs, &mut facts)?),
+        None => None,
+    };
+
+    let tok = entity! { _ @
+        metadata::tag: model_type,
+        attrs::model_name: name_h,
+        attrs::normalizer?: norm_id,
+        attrs::pre_tokenizer?: pretok_id,
+        attrs::decoder?: dec_id,
+        attrs::unk_token?: unk,
+        attrs::continuing_subword_prefix?: csp,
+        attrs::end_of_word_suffix?: eows,
+        attrs::max_input_chars?: max_chars,
+        attrs::vocab*: vocab_ids.iter(),
+        attrs::merge*: merge_ids.iter(),
+        attrs::added*: added_ids.iter(),
+    };
+    let tok_id = tok.root().expect("tokenizer root");
+    facts += tok.into_facts();
+    Ok(Fragment::rooted(tok_id, facts))
+}
+
+/// Ingest one config node (a normalizer / pre-tokenizer / decoder subtree) into
+/// `facts`, returning its entity id. The node's TYPE is a `metadata::tag`
+/// discriminant (`ty::*`); boolean options are `metadata::tag` flags (`flag::*`,
+/// presence = true); regex/behaviour/prefix are flat attrs; a `Sequence`'s
+/// ordered children are `member*` edges carrying an `index`. Recursive.
+fn save_config_node(
+    v: &serde_json::Value,
+    blobs: &mut impl BlobStorePut,
+    facts: &mut TribleSet,
+) -> Result<Id, Err> {
+    let node_type = v["type"].as_str().ok_or("config node missing type")?;
+    let mut tags: Vec<Id> = Vec::new();
+    let mut pattern_h = None;
+    let mut replace_content: Option<&str> = None;
+    let mut behavior: Option<&str> = None;
+    let mut prefix: Option<&str> = None;
+    let mut members: Vec<Id> = Vec::new();
+
+    // pattern is a tagged enum object {Regex|String: "…"}; both our tokenizers
+    // are Regex, so we store the string and reconstruct as Regex (see spec).
+    let pattern_str = || {
+        v["pattern"]["Regex"]
+            .as_str()
+            .or_else(|| v["pattern"]["String"].as_str())
+    };
+
+    match node_type {
+        "BertNormalizer" => {
+            tags.push(ty::BERT_NORMALIZER);
+            if v["clean_text"].as_bool() == Some(true) {
+                tags.push(flag::CLEAN_TEXT);
+            }
+            if v["handle_chinese_chars"].as_bool() == Some(true) {
+                tags.push(flag::HANDLE_CHINESE_CHARS);
+            }
+            if v["lowercase"].as_bool() == Some(true) {
+                tags.push(flag::LOWERCASE);
+            }
+            // strip_accents: null in nomic → emit nothing (reconstruct = None).
+        }
+        "Sequence" => {
+            tags.push(ty::SEQUENCE);
+            let children = v["normalizers"]
+                .as_array()
+                .or_else(|| v["pretokenizers"].as_array())
+                .ok_or("Sequence node missing normalizers/pretokenizers array")?;
+            for (i, child) in children.iter().enumerate() {
+                let cid = save_config_node(child, blobs, facts)?;
+                *facts += entity! { ExclusiveId::force_ref(&cid) @ attrs::index: i as u64 }
+                    .into_facts();
+                members.push(cid);
+            }
+        }
+        "NFC" => tags.push(ty::NFC),
+        "Lowercase" => tags.push(ty::LOWERCASE),
+        "BertPreTokenizer" => tags.push(ty::BERT_PRE_TOKENIZER),
+        "Replace" => {
+            tags.push(ty::REPLACE);
+            let pat = pattern_str().ok_or("Replace node missing pattern")?;
+            pattern_h = Some(blobs.put::<blobencodings::LongString, _>(pat.to_string())?);
+            replace_content = v["content"].as_str();
+        }
+        "Split" => {
+            tags.push(ty::SPLIT);
+            let pat = pattern_str().ok_or("Split node missing pattern")?;
+            pattern_h = Some(blobs.put::<blobencodings::LongString, _>(pat.to_string())?);
+            behavior = v["behavior"].as_str();
+            if v["invert"].as_bool() == Some(true) {
+                tags.push(flag::INVERT);
+            }
+        }
+        "ByteLevel" => {
+            tags.push(ty::BYTE_LEVEL);
+            if v["add_prefix_space"].as_bool() == Some(true) {
+                tags.push(flag::ADD_PREFIX_SPACE);
+            }
+            if v["trim_offsets"].as_bool() == Some(true) {
+                tags.push(flag::TRIM_OFFSETS);
+            }
+        }
+        "WordPiece" => {
+            // the decoder role (the model WordPiece is the tok-root, not here);
+            // reuse the continuing_subword_prefix attr for the decoder prefix.
+            tags.push(ty::WORD_PIECE);
+            prefix = v["prefix"].as_str();
+            if v["cleanup"].as_bool() == Some(true) {
+                tags.push(flag::CLEANUP);
+            }
+        }
+        other => return Err(format!("unknown config node type: {other:?}").into()),
+    }
+
+    let node = entity! { _ @
+        metadata::tag*: tags.iter(),
+        attrs::pattern?: pattern_h,
+        attrs::replace_content?: replace_content,
+        attrs::behavior?: behavior,
+        attrs::continuing_subword_prefix?: prefix,
+        attrs::member*: members.iter(),
+    };
+    let id = node.root().expect("config node root");
+    *facts += node.into_facts();
+    Ok(id)
+}
+
+/// Read a `LongString` blob handle back to an owned `String`.
+fn read_piece(
+    blobs: &impl BlobStoreGet,
+    h: Inline<inlineencodings::Handle<blobencodings::LongString>>,
+) -> String {
+    let v: anybytes::View<str> = blobs.get(h).expect("piece blob");
+    v.to_string()
+}
+
+/// Materialize a tokenizer's vocab back into a `token → id` map by walking its
+/// `vocab` members. The dual of the vocab half of [`save_tokenizer_json`].
+pub fn load_vocab(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    tok_id: Id,
+) -> HashMap<String, u64> {
+    // Single joined query — tokenizer → vocab entry → piece + id — the engine
+    // does the join (`_?entry` is a pattern-local join var, projected away).
+    // Kept on IDIOM grounds (concise, "use the engine"), NOT speed: a
+    // warming-controlled 3-round A/B on CLIP's 49k vocab shows this and a
+    // find!-per-entry loop are EQUIVALENT (~575ms each, <1% apart, on the
+    // Atreides+agglomerative default planner). Load is ~575ms either way; the
+    // real cost is the one-time 90s ingest. (Two earlier "findings" — 2.3x
+    // slower, then 2x faster — were both measurement artifacts: cross-run
+    // ingest noise, then cold-first-query ordering. Only the warm multi-round
+    // same-process A/B told the truth.)
+    find!(
+        (p, i: u64),
+        pattern!(tribles, [
+            { tok_id @ attrs::vocab: _?entry },
+            { _?entry @ attrs::piece: ?p, attrs::token_id: ?i },
+        ])
+    )
+    .map(|(ph, id)| (read_piece(blobs, ph), id))
+    .collect()
+}
+
+/// Materialize a tokenizer's BPE merges back into a rank-ordered `Vec<(left,
+/// right)>`. Empty for WordPiece/WordLevel/Unigram (no merges).
+pub fn load_merges(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    tok_id: Id,
+) -> Vec<(String, String)> {
+    // Single joined query — tokenizer → merge → {left, right, rank} (see
+    // load_vocab: joined ≈ per-entry on speed; kept for idiom/concision).
+    let mut ranked: Vec<(u64, String, String)> = find!(
+        (l, r, k: u64),
+        pattern!(tribles, [
+            { tok_id @ attrs::merge: _?m },
+            { _?m @ attrs::merge_left: ?l, attrs::merge_right: ?r, attrs::index: ?k },
+        ])
+    )
+    .map(|(lh, rh, rank)| (rank, read_piece(blobs, lh), read_piece(blobs, rh)))
+    .collect();
+    ranked.sort_by_key(|(rank, _, _)| *rank);
+    ranked.into_iter().map(|(_, l, r)| (l, r)).collect()
+}
+
+/// Materialize a tokenizer's added/special tokens back into an order-preserved
+/// `Vec<(content, id)>` (their `index` is the original `added_tokens` order).
+pub fn load_added(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    tok_id: Id,
+) -> Vec<(String, u64)> {
+    let mut ordered: Vec<(u64, String, u64)> = find!(
+        (p, i: u64, k: u64),
+        pattern!(tribles, [
+            { tok_id @ attrs::added: _?a },
+            { _?a @ attrs::piece: ?p, attrs::token_id: ?i, attrs::index: ?k },
+        ])
+    )
+    .map(|(ph, id, order)| (order, read_piece(blobs, ph), id))
+    .collect();
+    ordered.sort_by_key(|(order, _, _)| *order);
+    ordered.into_iter().map(|(_, p, id)| (p, id)).collect()
+}
+
+/// The tokenizer ROOT entity in a fact set, if any — the entity carrying BOTH
+/// a model-kind discriminant tag and a `model_name`. The tag alone is NOT
+/// enough: a WordPiece DECODER config node is also tagged `ty::WORD_PIECE`
+/// (the type ids are role-agnostic — the edge gives the role), and picking it
+/// up here builds a tokenizer with an empty vocab. Only the tokenizer root
+/// carries both; weight entities have `model_name` but no kind tag, config
+/// nodes have kind tags but no name. A multi-tokenizer pile would need
+/// disambiguation BY the name; every current model pile holds one tokenizer.
+pub fn find_tokenizer(tribles: &TribleSet) -> Option<Id> {
+    find!(
+        (e: Id, t: Id, n: Inline<inlineencodings::Handle<blobencodings::LongString>>),
+        pattern!(tribles, [{ ?e @ metadata::tag: ?t, attrs::model_name: ?n }])
+    )
+    .find(|&(_, t, _)| t == ty::WORD_PIECE || t == ty::BPE)
+    .map(|(e, _, _)| e)
+}
+
+/// All `metadata::tag` discriminants on a node (type + boolean flags).
+pub fn node_tags(tribles: &TribleSet, node: Id) -> Vec<Id> {
+    find!((t: Id), pattern!(tribles, [{ node @ metadata::tag: ?t }]))
+        .map(|(t,)| t)
+        .collect()
+}
+
+/// A `Sequence` config node's children, in their persisted `index` order.
+pub fn ordered_members(tribles: &TribleSet, node: Id) -> Vec<Id> {
+    let mut v: Vec<(u64, Id)> = find!(
+        (m: Id, i: u64),
+        pattern!(tribles, [{ node @ attrs::member: ?m }, { ?m @ attrs::index: ?i }])
+    )
+    .map(|(m, i)| (i, m))
+    .collect();
+    v.sort_by_key(|(i, _)| *i);
+    v.into_iter().map(|(_, m)| m).collect()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Construct-from-graph: query the graph and feed the parts into `tokenizers`'
+// programmatic builders. No JSON anywhere in this path — the `tokenizers`
+// crate is purely the executor, exactly as Burn is for the weight graph.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Read a node's optional `ShortString` field.
+#[cfg(feature = "tokenizer")]
+macro_rules! short_field {
+    ($tribles:expr, $node:expr, $attr:path) => {
+        find!((s: String), pattern!($tribles, [{ ($node) @ $attr: ?s }]))
+            .next()
+            .map(|(s,)| s)
+    };
+}
+
+/// Read a node's optional `LongString`-handle field back to a `String`.
+#[cfg(feature = "tokenizer")]
+macro_rules! long_field {
+    ($tribles:expr, $blobs:expr, $node:expr, $attr:path) => {
+        find!((h,), pattern!($tribles, [{ ($node) @ $attr: ?h }]))
+            .next()
+            .map(|(h,)| read_piece($blobs, h))
+    };
+}
+
+/// Read a node's optional `GenId` edge.
+#[cfg(feature = "tokenizer")]
+macro_rules! edge_field {
+    ($tribles:expr, $node:expr, $attr:path) => {
+        find!((e: Id), pattern!($tribles, [{ ($node) @ $attr: ?e }]))
+            .next()
+            .map(|(e,)| e)
+    };
+}
+
+/// Build a ready-to-encode [`tokenizers::Tokenizer`] from a tokenizer graph —
+/// the dual of [`save_tokenizer_json`], and the whole point of the module:
+/// model (vocab/merges + knobs), normalizer, pre-tokenizer, decoder, and
+/// added tokens are all queried from the graph and fed to the `tokenizers`
+/// builders. No post-processor is reconstructed (none is stored): callers
+/// hand-frame their sentinels (`[CLS]`/`[SEP]`, bos/eos) themselves, as
+/// `embed.rs` does.
+#[cfg(feature = "tokenizer")]
+pub fn build_tokenizer(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    tok_id: Id,
+) -> Result<tokenizers::Tokenizer, Err> {
+    use tokenizers::models::bpe::BPE;
+    use tokenizers::models::wordpiece::WordPiece;
+
+    let tags = node_tags(tribles, tok_id);
+    let vocab: tokenizers::models::bpe::Vocab = load_vocab(tribles, blobs, tok_id)
+        .into_iter()
+        .map(|(t, i)| (t, i as u32))
+        .collect();
+    let unk = short_field!(tribles, tok_id, attrs::unk_token);
+    let csp = short_field!(tribles, tok_id, attrs::continuing_subword_prefix);
+    let eows = short_field!(tribles, tok_id, attrs::end_of_word_suffix);
+    let max_chars = find!(
+        (m: u64),
+        pattern!(tribles, [{ tok_id @ attrs::max_input_chars: ?m }])
+    )
+    .next()
+    .map(|(m,)| m);
+
+    let model: tokenizers::ModelWrapper = if tags.contains(&ty::WORD_PIECE) {
+        let mut b = WordPiece::builder().vocab(vocab);
+        if let Some(u) = unk {
+            b = b.unk_token(u);
+        }
+        if let Some(p) = csp {
+            b = b.continuing_subword_prefix(p);
+        }
+        if let Some(m) = max_chars {
+            b = b.max_input_chars_per_word(m as usize);
+        }
+        b.build().map_err(|e| format!("build WordPiece model: {e}"))?.into()
+    } else if tags.contains(&ty::BPE) {
+        let merges = load_merges(tribles, blobs, tok_id);
+        let mut b = BPE::builder().vocab_and_merges(vocab, merges);
+        if let Some(u) = unk {
+            b = b.unk_token(u);
+        }
+        if let Some(p) = csp {
+            b = b.continuing_subword_prefix(p);
+        }
+        if let Some(s) = eows {
+            b = b.end_of_word_suffix(s);
+        }
+        b.build().map_err(|e| format!("build BPE model: {e}"))?.into()
+    } else {
+        return Err("tokenizer entity carries no model-kind tag (WordPiece/BPE)".into());
+    };
+
+    let mut tok = tokenizers::Tokenizer::new(model);
+    if let Some(n) = edge_field!(tribles, tok_id, attrs::normalizer) {
+        tok.with_normalizer(Some(build_normalizer(tribles, blobs, n)?));
+    }
+    if let Some(p) = edge_field!(tribles, tok_id, attrs::pre_tokenizer) {
+        tok.with_pre_tokenizer(Some(build_pre_tokenizer(tribles, blobs, p)?));
+    }
+    if let Some(d) = edge_field!(tribles, tok_id, attrs::decoder) {
+        tok.with_decoder(Some(build_decoder(tribles, blobs, d)?));
+    }
+
+    // Added tokens: their boolean flags (special/lstrip/…) are config-tail and
+    // not yet persisted; every added token of our tokenizers (nomic's BERT
+    // sentinels, CLIP's <|startoftext|>/<|endoftext|>) is `special: true`, so
+    // reconstruct them as special. Ids resolve against the vocab (all our
+    // added tokens are also vocab entries), so no id drift is possible.
+    let added: Vec<tokenizers::AddedToken> = load_added(tribles, blobs, tok_id)
+        .into_iter()
+        .map(|(content, _id)| tokenizers::AddedToken::from(content, true))
+        .collect();
+    if !added.is_empty() {
+        tok.add_special_tokens(&added);
+    }
+    Ok(tok)
+}
+
+/// Reconstruct one normalizer node (recursing through `Sequence`).
+#[cfg(feature = "tokenizer")]
+fn build_normalizer(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    node: Id,
+) -> Result<tokenizers::NormalizerWrapper, Err> {
+    use tokenizers::normalizers as n;
+    let tags = node_tags(tribles, node);
+    let has = |id: Id| tags.contains(&id);
+    if has(ty::BERT_NORMALIZER) {
+        // strip_accents was never emitted (null in our sources) → None.
+        Ok(n::BertNormalizer::new(
+            has(flag::CLEAN_TEXT),
+            has(flag::HANDLE_CHINESE_CHARS),
+            None,
+            has(flag::LOWERCASE),
+        )
+        .into())
+    } else if has(ty::SEQUENCE) {
+        let kids = ordered_members(tribles, node)
+            .into_iter()
+            .map(|k| build_normalizer(tribles, blobs, k))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(n::Sequence::new(kids).into())
+    } else if has(ty::NFC) {
+        Ok(n::NFC.into())
+    } else if has(ty::LOWERCASE) {
+        Ok(n::Lowercase.into())
+    } else if has(ty::REPLACE) {
+        let pat = long_field!(tribles, blobs, node, attrs::pattern)
+            .ok_or("Replace node missing pattern")?;
+        let content = short_field!(tribles, node, attrs::replace_content).unwrap_or_default();
+        // Patterns are stored raw from the Regex variant; rebuild as Regex.
+        Ok(n::Replace::new(n::replace::ReplacePattern::Regex(pat), content)
+            .map_err(|e| format!("build Replace normalizer: {e}"))?
+            .into())
+    } else {
+        Err(format!("normalizer node {node:?} has no known type tag").into())
+    }
+}
+
+/// Reconstruct one pre-tokenizer node (recursing through `Sequence`).
+#[cfg(feature = "tokenizer")]
+fn build_pre_tokenizer(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    node: Id,
+) -> Result<tokenizers::PreTokenizerWrapper, Err> {
+    use tokenizers::pre_tokenizers as p;
+    let tags = node_tags(tribles, node);
+    let has = |id: Id| tags.contains(&id);
+    if has(ty::BERT_PRE_TOKENIZER) {
+        Ok(p::bert::BertPreTokenizer.into())
+    } else if has(ty::SEQUENCE) {
+        let kids = ordered_members(tribles, node)
+            .into_iter()
+            .map(|k| build_pre_tokenizer(tribles, blobs, k))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(p::sequence::Sequence::new(kids).into())
+    } else if has(ty::SPLIT) {
+        let pat = long_field!(tribles, blobs, node, attrs::pattern)
+            .ok_or("Split node missing pattern")?;
+        let behavior = short_field!(tribles, node, attrs::behavior)
+            .ok_or("Split node missing behavior")?;
+        Ok(p::split::Split::new(
+            p::split::SplitPattern::Regex(pat),
+            parse_behavior(&behavior)?,
+            has(flag::INVERT),
+        )
+        .map_err(|e| format!("build Split pre-tokenizer: {e}"))?
+        .into())
+    } else if has(ty::BYTE_LEVEL) {
+        // use_regex is not yet persisted (no flag minted): default true, the
+        // HF default. Revisit before ingesting CLIP, whose pre-tok ByteLevel
+        // sits after a Split and sets use_regex=false.
+        Ok(p::byte_level::ByteLevel::new(
+            has(flag::ADD_PREFIX_SPACE),
+            has(flag::TRIM_OFFSETS),
+            true,
+        )
+        .into())
+    } else {
+        Err(format!("pre-tokenizer node {node:?} has no known type tag").into())
+    }
+}
+
+/// Reconstruct the decoder node.
+#[cfg(feature = "tokenizer")]
+fn build_decoder(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    node: Id,
+) -> Result<tokenizers::DecoderWrapper, Err> {
+    let tags = node_tags(tribles, node);
+    let has = |id: Id| tags.contains(&id);
+    if has(ty::WORD_PIECE) {
+        let prefix = short_field!(tribles, node, attrs::continuing_subword_prefix)
+            .unwrap_or_else(|| "##".to_string());
+        Ok(tokenizers::decoders::wordpiece::WordPiece::new(prefix, has(flag::CLEANUP)).into())
+    } else if has(ty::BYTE_LEVEL) {
+        Ok(tokenizers::pre_tokenizers::byte_level::ByteLevel::new(
+            has(flag::ADD_PREFIX_SPACE),
+            has(flag::TRIM_OFFSETS),
+            true,
+        )
+        .into())
+    } else {
+        let _ = blobs;
+        Err(format!("decoder node {node:?} has no known type tag").into())
+    }
+}
+
+/// `SplitDelimiterBehavior` from its persisted name.
+#[cfg(feature = "tokenizer")]
+fn parse_behavior(name: &str) -> Result<tokenizers::SplitDelimiterBehavior, Err> {
+    use tokenizers::SplitDelimiterBehavior as B;
+    Ok(match name {
+        "Removed" => B::Removed,
+        "Isolated" => B::Isolated,
+        "MergedWithPrevious" => B::MergedWithPrevious,
+        "MergedWithNext" => B::MergedWithNext,
+        "Contiguous" => B::Contiguous,
+        other => return Err(format!("unknown SplitDelimiterBehavior {other:?}").into()),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A tiny WordPiece-ish tokenizer.json exercising vocab + added tokens.
+    // (Full added-token fields + "version" so `Tokenizer::from_bytes` also
+    // accepts it — the parity tests compare graph-built vs json-built.)
+    const WP: &str = r###"{
+      "version": "1.0",
+      "added_tokens": [
+        {"id": 0, "content": "[PAD]", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+        {"id": 2, "content": "[CLS]", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+      ],
+      "normalizer": {"type": "BertNormalizer", "clean_text": true, "handle_chinese_chars": true, "strip_accents": null, "lowercase": true},
+      "pre_tokenizer": {"type": "BertPreTokenizer"},
+      "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true},
+      "model": { "type": "WordPiece", "unk_token": "[UNK]",
+        "continuing_subword_prefix": "##", "max_input_chars_per_word": 100, "vocab": {
+        "[PAD]": 0, "hello": 1, "[CLS]": 2, "##ing": 3, "telecommunications": 4
+      } }
+    }"###;
+
+    // A tiny BPE tokenizer.json exercising merges (both array + string forms
+    // are accepted; HF current form is the array).
+    const BPE: &str = r#"{
+      "version": "1.0",
+      "added_tokens": [],
+      "normalizer": {"type": "Sequence", "normalizers": [
+        {"type": "NFC"},
+        {"type": "Replace", "pattern": {"Regex": "\\s+"}, "content": " "},
+        {"type": "Lowercase"}
+      ]},
+      "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+        {"type": "Split", "pattern": {"Regex": "foo"}, "behavior": "Removed", "invert": true},
+        {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true}
+      ]},
+      "decoder": {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true},
+      "model": { "type": "BPE",
+        "vocab": {"a": 0, "b": 1, "ab": 2, "c": 3, "abc": 4},
+        "merges": [["a","b"], ["ab","c"]]
+      }
+    }"#;
+
+    #[test]
+    fn wordpiece_vocab_round_trips() {
+        let mut blobs = MemoryBlobStore::new();
+        let frag = save_tokenizer_json(WP.as_bytes(), "test/wp", &mut blobs).unwrap();
+        let tok_id = frag.root().expect("root");
+        let tribles: TribleSet = frag.into();
+        let reader = BlobStore::reader(&mut blobs).unwrap();
+
+        let vocab = load_vocab(&tribles, &reader, tok_id);
+        assert_eq!(vocab.len(), 5);
+        assert_eq!(vocab.get("telecommunications"), Some(&4));
+        assert_eq!(vocab.get("##ing"), Some(&3));
+        assert_eq!(vocab.get("[PAD]"), Some(&0));
+        assert!(load_merges(&tribles, &reader, tok_id).is_empty());
+
+        // flat model knob round-trips (U256BE -> u64 via TryFromInline)
+        let max: Option<u64> = find!(
+            (m: u64),
+            pattern!(&tribles, [{ tok_id @ attrs::max_input_chars: ?m }])
+        )
+        .next()
+        .map(|(m,)| m);
+        assert_eq!(max, Some(100));
+    }
+
+    #[test]
+    fn bpe_merges_round_trip_in_rank_order() {
+        let mut blobs = MemoryBlobStore::new();
+        let frag = save_tokenizer_json(BPE.as_bytes(), "test/bpe", &mut blobs).unwrap();
+        let tok_id = frag.root().expect("root");
+        let tribles: TribleSet = frag.into();
+        let reader = BlobStore::reader(&mut blobs).unwrap();
+
+        let merges = load_merges(&tribles, &reader, tok_id);
+        assert_eq!(
+            merges,
+            vec![
+                ("a".to_string(), "b".to_string()),
+                ("ab".to_string(), "c".to_string()),
+            ]
+        );
+    }
+
+    // Real-data validation against an actual HuggingFace tokenizer.json (30k+
+    // vocabs, byte-level BPE emoji tokens over the 32-byte inline ceiling).
+    // Ignored by default; run pointed at a file:
+    //   TOK_JSON=<path> TOK_VOCAB=<n> cargo test -p mary --lib \
+    //     tokenizer::tests::real_tokenizer_bulk -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn real_tokenizer_bulk() {
+        let Ok(path) = std::env::var("TOK_JSON") else {
+            eprintln!("[real] set TOK_JSON to run");
+            return;
+        };
+        let json = std::fs::read(&path).expect("read TOK_JSON");
+        let mut blobs = MemoryBlobStore::new();
+        let t = std::time::Instant::now();
+        let frag = save_tokenizer_json(&json, "real", &mut blobs).unwrap();
+        let ingest_ms = t.elapsed().as_millis();
+        let tok_id = frag.root().expect("root");
+        let t = std::time::Instant::now();
+        let tribles: TribleSet = frag.into();
+        let into_ms = t.elapsed().as_millis();
+        let reader = BlobStore::reader(&mut blobs).unwrap();
+
+        let t = std::time::Instant::now();
+        let vocab = load_vocab(&tribles, &reader, tok_id);
+        let load_vocab_ms = t.elapsed().as_millis();
+        let t = std::time::Instant::now();
+        let merges = load_merges(&tribles, &reader, tok_id);
+        let load_merges_ms = t.elapsed().as_millis();
+        eprintln!(
+            "[real] {path}: {} vocab, {} merges | ingest {ingest_ms}ms  frag->set {into_ms}ms  load_vocab {load_vocab_ms}ms  load_merges {load_merges_ms}ms",
+            vocab.len(),
+            merges.len()
+        );
+        // prove an over-inline-ceiling token survived the LongString round-trip
+        if let Some((tok, id)) = vocab.iter().find(|(t, _)| t.len() > 32) {
+            eprintln!("[real]   >32-byte token round-tripped: {tok:?} = {id}");
+        }
+        if let Ok(n) = std::env::var("TOK_VOCAB") {
+            assert_eq!(vocab.len(), n.parse::<usize>().unwrap(), "vocab count");
+        }
+    }
+
+    // Same-process A/B: point-lookup vs single joined pattern!, both on the SAME
+    // ingested TribleSet — kills cross-run ingest variance, isolating the pure
+    // planner cost of the two query shapes. Runs on whatever engine triblespace
+    // links (currently the residual/agglomerative planner).
+    //   TOK_JSON=<path> cargo test -p mary --lib tokenizer::tests::real_load_ab \
+    //     -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn real_load_ab() {
+        let Ok(path) = std::env::var("TOK_JSON") else {
+            eprintln!("[ab] set TOK_JSON to run");
+            return;
+        };
+        let json = std::fs::read(&path).expect("read TOK_JSON");
+        let mut blobs = MemoryBlobStore::new();
+        let frag = save_tokenizer_json(&json, "real", &mut blobs).unwrap();
+        let tok_id = frag.root().expect("root");
+        let tribles: TribleSet = frag.into();
+        let reader = BlobStore::reader(&mut blobs).unwrap();
+
+        // Alternate joined (B) and point-lookup (A) across rounds to expose any
+        // cache-warming / ordering effect (ingest is paid once; queries are cheap).
+        for round in 0..3 {
+            let t = std::time::Instant::now();
+            let b: HashMap<String, u64> = find!(
+                (p, i: u64),
+                pattern!(&tribles, [
+                    { tok_id @ attrs::vocab: _?entry },
+                    { _?entry @ attrs::piece: ?p, attrs::token_id: ?i },
+                ])
+            )
+            .map(|(ph, id)| (read_piece(&reader, ph), id))
+            .collect();
+            let b_ms = t.elapsed().as_millis();
+
+            let t = std::time::Instant::now();
+            let a = load_vocab(&tribles, &reader, tok_id);
+            let a_ms = t.elapsed().as_millis();
+
+            eprintln!("[ab] round {round}: B joined {b_ms}ms  |  A point {a_ms}ms");
+            assert_eq!(a.len(), b.len(), "A and B must agree");
+        }
+    }
+
+    // the config edge can't be a runtime param (pattern! needs the attr at
+    // expansion), so a tiny dispatch:
+    fn edge(tribles: &TribleSet, subj: Id, which: &str) -> Option<Id> {
+        match which {
+            "normalizer" => find!((n: Id), pattern!(tribles, [{ subj @ attrs::normalizer: ?n }]))
+                .next()
+                .map(|(n,)| n),
+            "pre_tokenizer" => {
+                find!((n: Id), pattern!(tribles, [{ subj @ attrs::pre_tokenizer: ?n }]))
+                    .next()
+                    .map(|(n,)| n)
+            }
+            "decoder" => find!((n: Id), pattern!(tribles, [{ subj @ attrs::decoder: ?n }]))
+                .next()
+                .map(|(n,)| n),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn config_tail_round_trips() {
+        // WordPiece: BertNormalizer + BertPreTokenizer + WordPiece decoder
+        let mut blobs = MemoryBlobStore::new();
+        let frag = save_tokenizer_json(WP.as_bytes(), "test/wp", &mut blobs).unwrap();
+        let tok_id = frag.root().expect("root");
+        let tribles: TribleSet = frag.into();
+
+        let norm = edge(&tribles, tok_id, "normalizer").expect("normalizer edge");
+        let nt = node_tags(&tribles, norm);
+        assert!(nt.contains(&ty::BERT_NORMALIZER));
+        assert!(nt.contains(&flag::CLEAN_TEXT));
+        assert!(nt.contains(&flag::LOWERCASE));
+
+        let pretok = edge(&tribles, tok_id, "pre_tokenizer").expect("pre_tokenizer edge");
+        assert!(node_tags(&tribles, pretok).contains(&ty::BERT_PRE_TOKENIZER));
+
+        let dec = edge(&tribles, tok_id, "decoder").expect("decoder edge");
+        let dt = node_tags(&tribles, dec);
+        assert!(dt.contains(&ty::WORD_PIECE));
+        assert!(dt.contains(&flag::CLEANUP));
+
+        // BPE: Sequence[NFC, Replace, Lowercase] normalizer, ORDERED
+        let mut blobs = MemoryBlobStore::new();
+        let frag = save_tokenizer_json(BPE.as_bytes(), "test/bpe", &mut blobs).unwrap();
+        let tok_id = frag.root().expect("root");
+        let tribles: TribleSet = frag.into();
+
+        let seq = edge(&tribles, tok_id, "normalizer").expect("normalizer");
+        assert!(node_tags(&tribles, seq).contains(&ty::SEQUENCE));
+        let kids = ordered_members(&tribles, seq);
+        assert_eq!(kids.len(), 3, "NFC, Replace, Lowercase");
+        assert!(node_tags(&tribles, kids[0]).contains(&ty::NFC));
+        assert!(node_tags(&tribles, kids[1]).contains(&ty::REPLACE));
+        assert!(node_tags(&tribles, kids[2]).contains(&ty::LOWERCASE));
+    }
+
+    // Regression (real bug, 2026-07-18): the WP fixture's DECODER node is
+    // also tagged ty::WORD_PIECE (type ids are role-agnostic), and
+    // find_tokenizer once matched it by tag alone — query iteration order
+    // decided whether callers got the root or a config node whose empty
+    // vocab broke [CLS] resolution downstream. The root is the only entity
+    // carrying tag + model_name.
+    #[test]
+    fn find_tokenizer_skips_the_wordpiece_decoder_node() {
+        let mut blobs = MemoryBlobStore::new();
+        let frag = save_tokenizer_json(WP.as_bytes(), "test/wp", &mut blobs).unwrap();
+        let root = frag.root().expect("root");
+        let tribles: TribleSet = frag.into();
+        let dec = edge(&tribles, root, "decoder").expect("decoder edge");
+        assert!(
+            node_tags(&tribles, dec).contains(&ty::WORD_PIECE),
+            "fixture precondition: decoder node shares the WordPiece tag"
+        );
+        assert_eq!(find_tokenizer(&tribles), Some(root));
+        assert_ne!(root, dec);
+    }
+
+    // ── construct-from-graph parity: the graph-built tokenizer must encode
+    //    exactly like the json-built one (same `tokenizers` executor, two
+    //    different loading substrates). ──
+
+    /// A byte-level BPE fixture whose vocab can actually encode text (Ġ = the
+    /// byte-level space), so parity is meaningful, not vacuous.
+    #[cfg(feature = "tokenizer")]
+    const BPE_BYTELEVEL: &str = r#"{
+      "version": "1.0",
+      "added_tokens": [],
+      "normalizer": {"type": "Lowercase"},
+      "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true},
+      "decoder": {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true},
+      "model": { "type": "BPE",
+        "vocab": {"a": 0, "b": 1, "c": 2, "ab": 3, "abc": 4,
+                  "Ġ": 5, "Ġa": 6, "Ġab": 7, "Ġabc": 8},
+        "merges": [["a","b"], ["ab","c"], ["Ġ","a"], ["Ġa","b"], ["Ġab","c"]]
+      }
+    }"#;
+
+    #[cfg(feature = "tokenizer")]
+    fn assert_encode_parity(json: &str, texts: &[&str]) {
+        let mut blobs = MemoryBlobStore::new();
+        let frag = save_tokenizer_json(json.as_bytes(), "test/parity", &mut blobs).unwrap();
+        let tok_id = frag.root().expect("root");
+        let tribles: TribleSet = frag.into();
+        assert_eq!(find_tokenizer(&tribles), Some(tok_id), "find_tokenizer");
+        let reader = BlobStore::reader(&mut blobs).unwrap();
+
+        let graph_tok = build_tokenizer(&tribles, &reader, tok_id).expect("build from graph");
+        let json_tok = tokenizers::Tokenizer::from_bytes(json.as_bytes()).expect("from_bytes");
+        for text in texts {
+            let g = graph_tok.encode(*text, false).expect("graph encode");
+            let j = json_tok.encode(*text, false).expect("json encode");
+            assert_eq!(
+                g.get_ids(),
+                j.get_ids(),
+                "graph/json encode diverged on {text:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "tokenizer")]
+    #[test]
+    fn graph_built_wordpiece_encodes_like_json_built() {
+        assert_encode_parity(
+            WP,
+            &[
+                "hello telecommunications",
+                "HELLO Hello hello",         // BertNormalizer lowercase
+                "telecommunicationsing",     // WordPiece ##ing continuation
+                "[CLS] hello [PAD]",         // added tokens match as specials
+            ],
+        );
+    }
+
+    #[cfg(feature = "tokenizer")]
+    #[test]
+    fn graph_built_bytelevel_bpe_encodes_like_json_built() {
+        assert_encode_parity(
+            BPE_BYTELEVEL,
+            &["ab abc", "ABC aB", "abc ab a", "a b c"],
+        );
+    }
+
+    // Sequence/Split/Replace plumbing: the original BPE fixture's pre-tok
+    // (Split invert "foo" + ByteLevel) is degenerate for real text, but the
+    // graph and json builds must still agree on whatever it produces.
+    #[cfg(feature = "tokenizer")]
+    #[test]
+    fn graph_built_sequence_split_replace_encodes_like_json_built() {
+        assert_encode_parity(BPE, &["foofoo", "ab   abc", "a c"]);
+    }
+
+    // Real-data parity: graph-built vs json-built on an actual HuggingFace
+    // tokenizer.json, over real prose. Ignored by default; run pointed at a
+    // file:
+    //   TOK_JSON=<path> cargo test --features tokenizer --lib \
+    //     tokenizer::tests::real_graph_parity -- --ignored --nocapture
+    #[cfg(feature = "tokenizer")]
+    #[test]
+    #[ignore]
+    fn real_graph_parity() {
+        let Ok(path) = std::env::var("TOK_JSON") else {
+            eprintln!("[parity] set TOK_JSON to run");
+            return;
+        };
+        let json = std::fs::read(&path).expect("read TOK_JSON");
+        let mut blobs = MemoryBlobStore::new();
+        let frag = save_tokenizer_json(&json, "real", &mut blobs).unwrap();
+        let tok_id = frag.root().expect("root");
+        let tribles: TribleSet = frag.into();
+        let reader = BlobStore::reader(&mut blobs).unwrap();
+
+        let t = std::time::Instant::now();
+        let graph_tok = build_tokenizer(&tribles, &reader, tok_id).expect("build from graph");
+        let build_ms = t.elapsed().as_millis();
+        let json_tok = tokenizers::Tokenizer::from_bytes(&json).expect("from_bytes");
+
+        let texts = [
+            "search_document: The pile is the durable store; the HF cache is an evictable download artifact.",
+            "search_query: tokenizer as a content-addressed graph",
+            "Attention Is All You Need (Vaswani et al., 2017) — 10,000+ citations.",
+            "naïve façade coöperation — diacritics exercise the normalizer",
+            "[CLS] explicit sentinels survive [SEP]",
+            "CamelCase suffixes: telecommunications infrastructure modernization",
+            "punctuation, quotes \"double\" and 'single'; hyphen-ated words!",
+            "     leading and trailing whitespace     ",
+        ];
+        for text in texts {
+            let g = graph_tok.encode(text, false).expect("graph encode");
+            let j = json_tok.encode(text, false).expect("json encode");
+            assert_eq!(
+                g.get_ids(),
+                j.get_ids(),
+                "graph/json encode diverged on {text:?}"
+            );
+        }
+        eprintln!(
+            "[parity] {path}: {} texts identical (graph build {build_ms}ms)",
+            texts.len()
+        );
+    }
+}

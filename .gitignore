@@ -1,0 +1,13 @@
+/target
+/weights
+/probes
+/models
+/.claude/
+*.wav
+*.pt
+*.safetensors
+
+# voxtral deep-tap goldens: heavy + regenerable (golden/voxtral_capture.py)
+golden/voxtral/deep_*.npy
+# voxtral clip fixtures: regenerate locally from any TTS (see docs/VOXTRAL_ARCH.md)
+golden/voxtral/clips/
