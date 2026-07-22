@@ -1,15 +1,22 @@
 # mary
 
-**Our Burn model zoo, held in TribleSpace.**
+**A model is data — so store it like data.**
 
-`mary` ports neural networks to the [Burn](https://burn.dev) framework and stores
-them not as opaque weight files but as **content-addressed graphs** in
-[TribleSpace](https://github.com/triblespace) — so a model becomes something you
-can query, deduplicate, and *recompose*.
+Model weights ship as opaque, multi-gigabyte blobs: a `safetensors` here, an
+ONNX graph there, a GGUF somewhere else. You can't query them, you can't tell
+when two models share a tensor, and lifting one model's component into another
+means wrangling file formats by hand.
 
-Named for Mary — both **Mary Wollstonecraft Shelley**, who wrote the creature
-into being, and her mother **Mary Wollstonecraft**. The crate brings dead weights
-to life as composable model-graphs.
+`mary` ports models to [Burn](https://burn.dev) and stores them as
+**content-addressed graphs** in a database ([TribleSpace](https://github.com/triblespace))
+— every tensor a leaf, every module an entity, every wiring an edge. Store your
+whole zoo as recombinable parts in one place: identical weights **deduplicate**
+across models automatically, loading is **config-free**, and **franken-stitching**
+a component out of one model and into another is just rewiring edges — no format
+conversion, no glue scripts, no safetensors at runtime.
+
+Named for Mary Shelley, author of *Frankenstein*: mary stitches a living model
+from parts.
 
 ## The format
 
@@ -75,7 +82,7 @@ M-series), with output identical to f32 on the small E2B. The same module's
 `gemma_hear` bin does audio understanding, and `gemma_train_lora`
 finetunes LoRA adapters on any variant (E4B and 12B fit f32 training on 128GB).
 
-### `voice` — F5-TTS
+### `f5` — F5-TTS (expressive text-to-speech)
 
 A from-scratch Burn port of [F5-TTS](https://github.com/SWivid/F5-TTS)
 (flow-matching TTS) + the [Vocos](https://github.com/gemelo-ai/vocos) vocoder,
