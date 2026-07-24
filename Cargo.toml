@@ -25,6 +25,9 @@ safetensors = { version = "0.4.5", optional = true }
 # clap powers the `mary` CLI (the import front door); import-only, kept out of
 # lib-consumer and inference/serve builds.
 clap = { version = "4", features = ["derive"], optional = true }
+# hf-hub auto-downloads models from the HuggingFace hub for `mary import`
+# (sync/ureq client, no async runtime needed). Import-only.
+hf-hub = { version = "0.3", optional = true }
 half = { version = "2", features = ["zerocopy"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -65,7 +68,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 # `ingest::save_safetensors`, `persist::persist_safetensors_to_pile`, the
 # `load_*_from_hf` constructors). Importer binaries and parity gates require
 # it; every runtime/inference/serve path loads from piles and builds without it.
-import = ["dep:safetensors", "dep:clap"]
+import = ["dep:safetensors", "dep:clap", "dep:hf-hub"]
 flux = ["dep:image", "dep:tokenizers"]
 # SmolVLA (mary::models::smolvla) — vision-language-action; SigLIP vision +
 # tokenizer + flow-matching sampler. Same dep surface as flux.

@@ -15,9 +15,9 @@
 //! mary import HuggingFaceTB/SmolLM2-135M    --pile models.pile --model-id smollm2
 //! ```
 //!
-//! The source is either a HuggingFace model id (resolved from the local HF
-//! cache — run `huggingface-cli download <id>` first) or a local directory of
-//! `.safetensors` shards. With `--model-id`, the model becomes a proper entity
+//! The source is either a HuggingFace model id (auto-downloaded from the hub if
+//! not already in the local cache) or a local directory of `.safetensors`
+//! shards. With `--model-id`, the model becomes a proper entity
 //! on the pile's `mary` branch, so many models coexist in one pile (each loaded
 //! back by id) — no separate consolidation step: appending a model is just
 //! another import. The resulting pile is self-contained: no safetensors needed.
@@ -159,12 +159,52 @@ fn resolve_source(source: &str) -> anyhow::Result<PathBuf> {
     if let Some(dir) = hf_snapshot_dir(source) {
         return Ok(dir);
     }
-    anyhow::bail!(
-        "could not resolve '{source}': it is neither a local directory nor a model \
-         present in the HuggingFace cache. Fetch it first with \
-         `huggingface-cli download {source}`, or pass a local directory of \
-         `.safetensors` shards."
-    )
+    // Not a directory and not cached → treat as a HuggingFace model id and pull
+    // its safetensors from the hub into the local cache, then resolve.
+    eprintln!("mary import: '{source}' not in the local cache — downloading from the HuggingFace hub...");
+    download_hf_safetensors(source)?;
+    hf_snapshot_dir(source).ok_or_else(|| {
+        anyhow::anyhow!(
+            "downloaded '{source}' but found no .safetensors in its cache snapshot — the \
+             model may ship weights in another format (pytorch .bin / gguf) not yet supported."
+        )
+    })
+}
+
+/// Pull a model's safetensors weights from the HuggingFace hub into the local
+/// cache — single-file, or every shard named by the `.index.json` weight-map.
+/// Weights only: mary loads from the pile, so config/tokenizer files are skipped.
+fn download_hf_safetensors(id: &str) -> anyhow::Result<()> {
+    use hf_hub::api::sync::Api;
+    let repo = Api::new()
+        .map_err(|e| anyhow::anyhow!("hf-hub api init: {e}"))?
+        .model(id.to_string());
+    // Sharded checkpoints carry a weight-map index; single-file ones don't.
+    match repo.get("model.safetensors.index.json") {
+        Ok(index_path) => {
+            let index: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&index_path)?)?;
+            let shards: std::collections::BTreeSet<String> = index
+                .get("weight_map")
+                .and_then(|m| m.as_object())
+                .map(|m| m.values().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            if shards.is_empty() {
+                anyhow::bail!("safetensors index for '{id}' lists no shards");
+            }
+            for shard in &shards {
+                eprintln!("  fetching {shard} ...");
+                repo.get(shard).map_err(|e| anyhow::anyhow!("fetch {shard}: {e}"))?;
+            }
+        }
+        Err(_) => {
+            eprintln!("  fetching model.safetensors ...");
+            repo.get("model.safetensors").map_err(|e| {
+                anyhow::anyhow!("fetch model.safetensors for '{id}': {e} (and no sharded index)")
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Locate the HF cache snapshot directory for `id` (e.g. `org/name`) that holds
