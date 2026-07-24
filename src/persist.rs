@@ -101,19 +101,25 @@ pub fn persist_safetensors_files_to_pile(
 /// Returns the imported root's entity id (the content address).
 #[cfg(feature = "import")]
 pub fn persist_model_to_pile(
-    safetensors_dir: &Path,
+    model_dir: &Path,
     pile_path: &Path,
     dtype: LeafDtype,
     source: &str,
     quantization: &str,
 ) -> anyhow::Result<Id> {
-    let files: Vec<(std::path::PathBuf, String)> = shard_paths(safetensors_dir)?
+    // Detect the container the directory actually ships (safetensors / gguf /
+    // pytorch pickle) and gather its weight files. Every format funnels into the
+    // SAME content-addressed member path below, so the model-root id stays the
+    // pure hash of the f32 tensors regardless of source format.
+    let (fmt, weight_files) = crate::formats::detect_format(model_dir)?;
+    let files: Vec<(std::path::PathBuf, String)> = weight_files
         .into_iter()
         .map(|p| {
             let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("model").to_string();
             (p, name)
         })
         .collect();
+    eprintln!("[persist] detected {fmt:?} — {} weight file(s)", files.len());
 
     // Pile::open requires the file to exist; create an empty one if needed —
     // loudly, so a typo'd path to an existing pile is visible instead of
@@ -152,11 +158,21 @@ pub fn persist_model_to_pile(
     let mut facts = TribleSet::new();
     let mut provenance: Vec<String> = Vec::new();
     for (path, name) in &files {
-        let bytes = read_safetensors_file(path);
-        eprintln!("[persist] ingesting {name} ({} bytes)...", bytes.len());
-        let (mut shard_members, shard_facts) =
-            crate::ingest::ingest_members(&bytes, repo.storage_mut(), dtype, |_| true)
-                .map_err(|e| anyhow::anyhow!("ingest {path:?}: {e}"))?;
+        let (mut shard_members, shard_facts) = match fmt {
+            crate::formats::WeightFormat::Safetensors => {
+                let bytes = read_safetensors_file(path);
+                eprintln!("[persist] ingesting {name} ({} bytes, safetensors)...", bytes.len());
+                crate::ingest::ingest_members(&bytes, repo.storage_mut(), dtype, |_| true)
+                    .map_err(|e| anyhow::anyhow!("ingest {path:?}: {e}"))?
+            }
+            crate::formats::WeightFormat::Gguf | crate::formats::WeightFormat::Pickle => {
+                let tensors = crate::formats::extract_tensors(fmt, path)
+                    .map_err(|e| anyhow::anyhow!("extract {path:?}: {e}"))?;
+                eprintln!("[persist] ingesting {name} ({} tensors, {fmt:?})...", tensors.len());
+                crate::ingest::ingest_tensors(tensors.into_iter(), repo.storage_mut(), dtype)
+                    .map_err(|e| anyhow::anyhow!("ingest {path:?}: {e}"))?
+            }
+        };
         members.append(&mut shard_members);
         facts += shard_facts;
         provenance.push(name.clone());

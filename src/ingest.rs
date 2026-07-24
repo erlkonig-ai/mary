@@ -1,8 +1,10 @@
-//! Bridge between safetensors files and the `mary::format` graph. Ingest *any*
-//! safetensors into the pile — each tensor a content-addressed leaf inside a
-//! named module, gathered under a model entity — and materialize it back into a
-//! `key → (data, shape)` map for the `WeightLoader::Pile` reconstruction path.
-//! Generic over model: F5/voice, flux, gaze all ingest the same way.
+//! Bridge between weight files and the `mary::format` graph. Ingest tensors into
+//! the pile — each a content-addressed leaf inside a named module, gathered under
+//! a model entity — and materialize them back into a `key → (data, shape)` map
+//! for the `WeightLoader::Pile` reconstruction path. Generic over model AND over
+//! source format: safetensors decode here ([`ingest_members`]); GGUF and pytorch
+//! pickle decode in [`crate::formats`] and feed the same format-agnostic core
+//! ([`ingest_tensors`]), so every format lands in one content-addressed graph.
 
 use crate::format::attrs;
 #[cfg(feature = "import")]
@@ -75,6 +77,14 @@ pub fn save_safetensors_filtered(
 /// decides how the members are grouped (per-file, or ONE root composing every
 /// shard's members). Each tensor is a `{data|data_f16, shape}` leaf reached by a
 /// `{kind, safetensor_path, weight}` module; identical tensors dedup by content.
+///
+/// This is the safetensors extractor: it decodes the container to
+/// `(name, f32-data, shape)` tuples and hands them to the format-agnostic
+/// [`ingest_tensors`]. Other formats (GGUF, pytorch pickle — see
+/// [`crate::formats`]) produce the SAME tuples and reuse `ingest_tensors`, so a
+/// model imported from any format lands in the identical content-addressed graph
+/// (the member ids, and hence the model-root id, are the pure hash of the
+/// `(name, f32-bytes, shape)` set, format-independent).
 #[cfg(feature = "import")]
 pub fn ingest_members(
     bytes: &[u8],
@@ -83,16 +93,42 @@ pub fn ingest_members(
     keep: impl Fn(&str) -> bool,
 ) -> Result<(Vec<Id>, TribleSet), Err> {
     let st = SafeTensors::deserialize(bytes)?;
+    let tensors = st
+        .names()
+        .into_iter()
+        .filter(|k| keep(k))
+        .filter_map(|key| {
+            // skip non-float tensors (int buffers etc.) — the forward never loads them
+            use safetensors::Dtype;
+            let view = st.tensor(key).ok()?;
+            if !matches!(view.dtype(), Dtype::F64 | Dtype::F32 | Dtype::F16 | Dtype::BF16) {
+                return None;
+            }
+            let (data, shape) = get_tensor_f32(&st, key);
+            Some((key.to_string(), data, shape))
+        })
+        .collect::<Vec<_>>();
+    ingest_tensors(tensors.into_iter(), blobs, dtype)
+}
+
+/// Ingest a stream of already-decoded `(name, f32-data, shape)` tensors into
+/// content-addressed member MODULES — the FORMAT-AGNOSTIC core shared by every
+/// importer (safetensors, GGUF, pytorch pickle). Each tensor becomes a
+/// `{data|data_f16, shape}` leaf reached by a `{kind, safetensor_path, weight}`
+/// module; identical tensors dedup by content. Returns `(member module ids,
+/// facts)`. Because the member id is derived purely from the tensor's f32 bytes +
+/// shape + name (never the source format), the SAME weights imported from two
+/// different container formats produce the SAME members — and hence the same
+/// content-addressed model root.
+#[cfg(feature = "import")]
+pub fn ingest_tensors(
+    tensors: impl Iterator<Item = (String, Vec<f32>, Vec<usize>)>,
+    blobs: &mut impl BlobStorePut,
+    dtype: LeafDtype,
+) -> Result<(Vec<Id>, TribleSet), Err> {
     let mut members: Vec<Id> = Vec::new();
     let mut facts = TribleSet::new();
-    for key in st.names().into_iter().filter(|k| keep(k)) {
-        // skip non-float tensors (int buffers etc.) — the model forward never loads them
-        let view = st.tensor(key)?;
-        use safetensors::Dtype;
-        if !matches!(view.dtype(), Dtype::F64 | Dtype::F32 | Dtype::F16 | Dtype::BF16) {
-            continue;
-        }
-        let (data, shape) = get_tensor_f32(&st, key);
+    for (name, data, shape) in tensors {
         let shp: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
         let leaf = match dtype {
             LeafDtype::F32 => put_raw(blobs, &data, &shp)?,
@@ -106,7 +142,7 @@ pub fn ingest_members(
             3 => "conv",
             _ => "tensor",
         };
-        let name_h = blobs.put::<LongString, _>(key.to_string())?;
+        let name_h = blobs.put::<LongString, _>(name)?;
         let m = entity! { _ @ attrs::kind: kind, attrs::safetensor_path: name_h, attrs::weight: leaf_id };
         members.push(m.root().expect("module root"));
         facts += m.into_facts();

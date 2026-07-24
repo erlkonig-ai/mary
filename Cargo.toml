@@ -22,6 +22,18 @@ anybytes = "0.20"
 # piles. Only the `import` feature (persist importers + parity gates) compiles
 # a safetensors reader — inference/serve builds cannot reach one.
 safetensors = { version = "0.4.5", optional = true }
+# GGUF (.gguf) import — container parsing only (no async, no backend); the ggml
+# block dequant to f32 lives in `formats::gguf`. Lean: hashbrown + serde +
+# thiserror + libm, all already in-tree or trivial. Import-only.
+gguf-rs-lib = { version = "0.2.5", default-features = false, features = ["std", "alloc", "libm"], optional = true }
+# PyTorch pickle .bin/.pth import — `formats::pickle` walks the ZIP's `data.pkl`
+# with a small self-contained pickle-opcode interpreter (no candle/torch
+# runtime, no fragile third-party pickle crate — the torch `state_dict` opcode
+# set is small and stable), then reads each storage member out of the ZIP. Only
+# `zip` is needed; the pickle reader is hand-rolled in-tree. Pure-Rust deflate
+# backend only (torch storages are STOREd uncompressed, data.pkl may be
+# deflated) — no bzip2/zstd/aes C deps. Import-only.
+zip = { version = "0.6", default-features = false, features = ["deflate"], optional = true }
 # clap powers the `mary` CLI (the import front door); import-only, kept out of
 # lib-consumer and inference/serve builds.
 clap = { version = "4", features = ["derive"], optional = true }
@@ -68,7 +80,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 # `ingest::save_safetensors`, `persist::persist_safetensors_to_pile`, the
 # `load_*_from_hf` constructors). Importer binaries and parity gates require
 # it; every runtime/inference/serve path loads from piles and builds without it.
-import = ["dep:safetensors", "dep:clap", "dep:hf-hub"]
+import = ["dep:safetensors", "dep:clap", "dep:hf-hub", "dep:gguf-rs-lib", "dep:zip"]
 flux = ["dep:image", "dep:tokenizers"]
 # SmolVLA (mary::models::smolvla) — vision-language-action; SigLIP vision +
 # tokenizer + flow-matching sampler. Same dep surface as flux.
@@ -497,6 +509,12 @@ required-features = ["gemma"]
 [[test]]
 name = "nomic_mm7b_vision_parity"
 required-features = ["gemma"]
+
+# GGUF / pytorch-.bin import validation (import path); the value-check bodies are
+# `#[ignore]` (need a cached HF model), the compile is the always-on part.
+[[test]]
+name = "formats_import"
+required-features = ["import"]
 
 # The STT lane, live: file-paced streaming transcription + (morning) mic mode.
 [[bin]]

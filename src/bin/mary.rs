@@ -16,14 +16,19 @@
 //! ```
 //!
 //! The source is either a HuggingFace model id (auto-downloaded from the hub if
-//! not already in the local cache) or a local directory of `.safetensors` shards
-//! (which needs a `--name`, since there is no hf-id to label it with). The model
+//! not already in the local cache) or a local directory of weight files (which
+//! needs a `--name`, since there is no hf-id to label it with). The format is
+//! auto-detected — `.safetensors` shards, a `.gguf` (dequantized to f32), or a
+//! pytorch pickle `state_dict` — and every format funnels into the SAME
+//! content-addressed member path, so the root id is the pure hash of the tensor
+//! set regardless of source format (a model imported from GGUF/f16 or from
+//! safetensors with the same weights resolves to the same root). The model
 //! becomes a content-addressed ROOT entity on the pile's `mary` branch — its id
 //! the pure content-address of its weight set — so many models coexist in one
 //! pile, each loaded back by its `source` label (the hf-id / `--name`) or by its
 //! entity id. Re-importing the same weights dedups to the same root; no separate
-//! consolidation step. The resulting pile is self-contained: no safetensors
-//! needed.
+//! consolidation step. The resulting pile is self-contained: no weight files
+//! needed at load time.
 
 use std::path::{Path, PathBuf};
 
@@ -44,7 +49,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Import a model's safetensors weights into a pile (the durable weight store).
+    /// Import a model's weights into a pile (the durable weight store). Accepts
+    /// safetensors, GGUF (.gguf), or pytorch pickle (pytorch_model*.bin / .pth).
     Import(ImportArgs),
     /// Load ONE model from a pile's `mary` branch — by `--source` (+ optional
     /// `--quantization`) or by `--root` entity id — and print its tensor count +
@@ -55,7 +61,9 @@ enum Cmd {
 #[derive(Args)]
 struct ImportArgs {
     /// A HuggingFace model id (resolved from the local HF cache, or downloaded)
-    /// OR a local directory holding the model's `.safetensors` shards.
+    /// OR a local directory holding the model's weight files. The format is
+    /// auto-detected: `.safetensors` shards, a `.gguf`, or a pytorch pickle
+    /// `state_dict` (`pytorch_model*.bin` / `.pth`).
     source: String,
     /// Output pile path. Created if absent; a model added to an existing pile
     /// is appended on the `mary` branch (content-addressing dedups shared blobs).
@@ -182,11 +190,14 @@ fn import(a: ImportArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolve the import source to a directory of `.safetensors` shards. A local
+/// Resolve the import source to a directory of importable weight files. A local
 /// directory is used as-is; otherwise the source is a HuggingFace model id and
-/// we locate its snapshot directory in the local HF cache. Kept inline (rather
-/// than via `mary::embed::hf_cache_resolve`) so `mary import` stays behind the
-/// lean `import` feature and never drags in the `embed` stack.
+/// we locate (or download) its snapshot directory in the local HF cache. Any of
+/// the three supported formats counts — safetensors, GGUF, or a pytorch pickle
+/// `state_dict` — since `mary::formats::detect_format` picks the decoder at
+/// import time. Kept inline (rather than via `mary::embed::hf_cache_resolve`) so
+/// `mary import` stays behind the lean `import` feature and never drags in the
+/// `embed` stack.
 fn resolve_source(source: &str) -> anyhow::Result<PathBuf> {
     let p = Path::new(source);
     if p.is_dir() {
@@ -196,57 +207,137 @@ fn resolve_source(source: &str) -> anyhow::Result<PathBuf> {
         return Ok(dir);
     }
     // Not a directory and not cached → treat as a HuggingFace model id and pull
-    // its safetensors from the hub into the local cache, then resolve.
+    // whichever weight format it actually ships into the local cache, then resolve.
     eprintln!("mary import: '{source}' not in the local cache — downloading from the HuggingFace hub...");
-    download_hf_safetensors(source)?;
+    download_hf_weights(source)?;
     hf_snapshot_dir(source).ok_or_else(|| {
         anyhow::anyhow!(
-            "downloaded '{source}' but found no .safetensors in its cache snapshot — the \
-             model may ship weights in another format (pytorch .bin / gguf) not yet supported."
+            "downloaded '{source}' but found no importable weights (.safetensors / .gguf / \
+             pytorch_model*.bin) in its cache snapshot"
         )
     })
 }
 
-/// Pull a model's safetensors weights from the HuggingFace hub into the local
-/// cache — single-file, or every shard named by the `.index.json` weight-map.
-/// Weights only: mary loads from the pile, so config/tokenizer files are skipped.
-fn download_hf_safetensors(id: &str) -> anyhow::Result<()> {
+/// Pull a model's weight files from the HuggingFace hub into the local cache,
+/// in whichever format the repo ships — preferring safetensors, then GGUF, then
+/// pytorch pickle. Weights only: mary loads from the pile, so config/tokenizer
+/// files are skipped. Sharded checkpoints (safetensors or pytorch) are resolved
+/// through their `*.index.json` weight-map; single-file ones fetched directly.
+/// The repo's actual file list (`info().siblings`) drives GGUF selection so we
+/// don't have to guess arbitrary `.gguf` filenames.
+fn download_hf_weights(id: &str) -> anyhow::Result<()> {
     use hf_hub::api::sync::Api;
     let repo = Api::new()
         .map_err(|e| anyhow::anyhow!("hf-hub api init: {e}"))?
         .model(id.to_string());
-    // Sharded checkpoints carry a weight-map index; single-file ones don't.
-    match repo.get("model.safetensors.index.json") {
-        Ok(index_path) => {
-            let index: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(&index_path)?)?;
-            let shards: std::collections::BTreeSet<String> = index
-                .get("weight_map")
-                .and_then(|m| m.as_object())
-                .map(|m| m.values().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default();
-            if shards.is_empty() {
-                anyhow::bail!("safetensors index for '{id}' lists no shards");
-            }
-            for shard in &shards {
-                eprintln!("  fetching {shard} ...");
-                repo.get(shard).map_err(|e| anyhow::anyhow!("fetch {shard}: {e}"))?;
-            }
+
+    // List the repo's files up front (best-effort; falls back to name probing).
+    let files: Vec<String> = repo
+        .info()
+        .map(|i| i.siblings.into_iter().map(|s| s.rfilename).collect())
+        .unwrap_or_default();
+    let has = |name: &str| files.iter().any(|f| f == name);
+
+    // 1) safetensors (the faithful native path) — sharded via index, else single-file.
+    if has("model.safetensors.index.json") {
+        let index_path = repo.get("model.safetensors.index.json")?;
+        fetch_sharded(&repo, &index_path)?;
+        return Ok(());
+    }
+    let safetensors: Vec<String> =
+        files.iter().filter(|f| f.ends_with(".safetensors")).cloned().collect();
+    if !safetensors.is_empty() {
+        // single-file, or an un-indexed multi-file safetensors set
+        for s in &safetensors {
+            eprintln!("  fetching {s} ...");
+            repo.get(s).map_err(|e| anyhow::anyhow!("fetch {s}: {e}"))?;
         }
-        Err(_) => {
-            eprintln!("  fetching model.safetensors ...");
-            repo.get("model.safetensors").map_err(|e| {
-                anyhow::anyhow!("fetch model.safetensors for '{id}': {e} (and no sharded index)")
-            })?;
+        return Ok(());
+    }
+    if files.is_empty() && repo.get("model.safetensors").is_ok() {
+        eprintln!("  fetched model.safetensors");
+        return Ok(());
+    }
+
+    // 2) GGUF — pick every `.gguf` file the repo actually lists. A repo may ship
+    //    several quant variants under arbitrary names; grab them all (import
+    //    selects one, and detect_format confirms the magic). If we couldn't list
+    //    the repo, fall back to probing common conventional names.
+    let ggufs: Vec<&String> = files.iter().filter(|f| f.ends_with(".gguf")).collect();
+    if !ggufs.is_empty() {
+        for g in ggufs {
+            eprintln!("  fetching {g} ...");
+            repo.get(g).map_err(|e| anyhow::anyhow!("fetch {g}: {e}"))?;
         }
+        return Ok(());
+    }
+    if files.is_empty() {
+        if let Some(fetched) = probe_gguf_names(&repo, id)? {
+            eprintln!("  fetched {fetched}");
+            return Ok(());
+        }
+    }
+
+    // 3) pytorch pickle — sharded via index, else single-file `pytorch_model.bin`.
+    if has("pytorch_model.bin.index.json") {
+        let index_path = repo.get("pytorch_model.bin.index.json")?;
+        fetch_sharded(&repo, &index_path)?;
+        return Ok(());
+    }
+    if has("pytorch_model.bin") || repo.get("pytorch_model.bin").is_ok() {
+        eprintln!("  fetched pytorch_model.bin");
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "'{id}': the hub repo ships no recognized weight file \
+         (*.safetensors[.index.json], *.gguf, or pytorch_model.bin[.index.json])"
+    )
+}
+
+/// Fetch every shard named by a `*.index.json` weight-map (shared by the
+/// safetensors and pytorch sharded layouts — both use the `weight_map` schema).
+fn fetch_sharded(repo: &hf_hub::api::sync::ApiRepo, index_path: &Path) -> anyhow::Result<()> {
+    let index: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(index_path)?)?;
+    let shards: std::collections::BTreeSet<String> = index
+        .get("weight_map")
+        .and_then(|m| m.as_object())
+        .map(|m| m.values().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    if shards.is_empty() {
+        anyhow::bail!("weight-map index lists no shards");
+    }
+    for shard in &shards {
+        eprintln!("  fetching {shard} ...");
+        repo.get(shard).map_err(|e| anyhow::anyhow!("fetch {shard}: {e}"))?;
     }
     Ok(())
 }
 
+/// Fallback when the repo file list is unavailable: probe a short list of
+/// conventional single-file GGUF names and return the first that resolves.
+fn probe_gguf_names(repo: &hf_hub::api::sync::ApiRepo, id: &str) -> anyhow::Result<Option<String>> {
+    let base = id.rsplit('/').next().unwrap_or(id);
+    let candidates = [
+        format!("{base}.gguf"),
+        format!("{}.gguf", base.to_lowercase()),
+        "model.gguf".to_string(),
+        "ggml-model-f16.gguf".to_string(),
+        "ggml-model-q4_0.gguf".to_string(),
+    ];
+    for name in candidates {
+        if repo.get(&name).is_ok() {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
 /// Locate the HF cache snapshot directory for `id` (e.g. `org/name`) that holds
-/// the model's safetensors shards. Mirrors the standard hub layout
+/// the model's weight files. Mirrors the standard hub layout
 /// `<HF_HOME|~/.cache/huggingface>/hub/models--<org>--<name>/snapshots/<rev>/`,
-/// picking the snapshot that actually contains `.safetensors` files.
+/// picking the snapshot that actually contains an importable weight file
+/// (safetensors, gguf, or pytorch pickle).
 fn hf_snapshot_dir(id: &str) -> Option<PathBuf> {
     let hf_home = std::env::var_os("HF_HOME")
         .map(PathBuf::from)
@@ -262,16 +353,12 @@ fn hf_snapshot_dir(id: &str) -> Option<PathBuf> {
         .filter(|p| p.is_dir())
         .collect();
     dirs.sort();
-    dirs.into_iter().find(|d| has_safetensors(d))
+    dirs.into_iter().find(|d| has_importable_weights(d))
 }
 
-/// True iff `dir` contains at least one `.safetensors` file (following the
-/// symlinks the HF cache uses from `snapshots/` into `blobs/`).
-fn has_safetensors(dir: &Path) -> bool {
-    std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .any(|e| e.path().extension().is_some_and(|x| x == "safetensors"))
-        })
-        .unwrap_or(false)
+/// True iff `dir` contains at least one importable weight file (following the
+/// symlinks the HF cache uses from `snapshots/` into `blobs/`) — i.e.
+/// `mary::formats::detect_format` would succeed.
+fn has_importable_weights(dir: &Path) -> bool {
+    mary::formats::detect_format(dir).is_ok()
 }
