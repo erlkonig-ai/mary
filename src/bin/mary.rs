@@ -38,6 +38,13 @@ struct Cli {
 enum Cmd {
     /// Import a model's safetensors weights into a pile (the durable weight store).
     Import(ImportArgs),
+    /// Consolidate per-model piles into one pile on a shared `mary` branch, each
+    /// model tagged by a `model_id` (the genealogy discriminator). Weight blobs
+    /// transfer lazily; the read side is `load_keymap_from_mary_branch`.
+    Consolidate(ConsolidateArgs),
+    /// Load ONE model from a pile's `mary` branch by `model_id` and print its
+    /// tensor count + a sample — a round-trip check of the consolidated store.
+    Keys(KeysArgs),
 }
 
 #[derive(Args)]
@@ -53,6 +60,42 @@ struct ImportArgs {
     /// width the source used); `f16` halves the pile for 16-bit-native weights.
     #[arg(long, value_enum, default_value_t = Dtype::F32)]
     dtype: Dtype,
+}
+
+#[derive(Args)]
+struct ConsolidateArgs {
+    /// Target pile — the shared model pile. Models land on its `mary` branch
+    /// (the pile is created if absent).
+    #[arg(long)]
+    into: PathBuf,
+    /// One or more `model_id=source.pile` pairs. Each source model's weights are
+    /// consolidated onto the target `mary` branch, tagged with its `model_id`.
+    #[arg(value_parser = parse_model_source, required = true)]
+    models: Vec<(String, PathBuf)>,
+}
+
+#[derive(Args)]
+struct KeysArgs {
+    /// The consolidated model pile to read from.
+    #[arg(long)]
+    pile: PathBuf,
+    /// The `model_id` to load from the pile's `mary` branch.
+    #[arg(long)]
+    model: String,
+}
+
+/// Parse a `model_id=source.pile` CLI argument.
+fn parse_model_source(s: &str) -> Result<(String, PathBuf), String> {
+    let (id, path) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected model_id=source.pile, got '{s}'"))?;
+    if id.is_empty() {
+        return Err(format!("empty model_id in '{s}'"));
+    }
+    if path.is_empty() {
+        return Err(format!("empty source pile in '{s}'"));
+    }
+    Ok((id.to_string(), PathBuf::from(path)))
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -73,7 +116,38 @@ impl From<Dtype> for LeafDtype {
 fn main() -> anyhow::Result<()> {
     match Cli::parse().cmd {
         Cmd::Import(a) => import(a),
+        Cmd::Consolidate(a) => consolidate(a),
+        Cmd::Keys(a) => keys(a),
     }
+}
+
+fn keys(a: KeysArgs) -> anyhow::Result<()> {
+    let km = mary::persist::load_keymap_from_mary_branch(&a.pile, &a.model)?;
+    let mut names: Vec<&String> = km.keys().collect();
+    names.sort();
+    eprintln!(
+        "mary keys: model_id={} on the mary branch of {} -> {} tensors",
+        a.model,
+        a.pile.display(),
+        km.len()
+    );
+    for n in names.iter().take(8) {
+        let (data, shape) = &km[*n];
+        eprintln!("  {n}  shape={shape:?}  ({} f32)", data.len());
+    }
+    Ok(())
+}
+
+fn consolidate(a: ConsolidateArgs) -> anyhow::Result<()> {
+    for (model_id, source) in &a.models {
+        mary::persist::consolidate_into_mary(&a.into, source, model_id)?;
+    }
+    eprintln!(
+        "mary consolidate: {} model(s) -> {} (mary branch)",
+        a.models.len(),
+        a.into.display()
+    );
+    Ok(())
 }
 
 fn import(a: ImportArgs) -> anyhow::Result<()> {

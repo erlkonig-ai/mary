@@ -950,6 +950,106 @@ pub fn load_keymap_from_mary_branch_prefixed(
     Ok(keymap)
 }
 
+/// Consolidate ONE model's weights from its own `main`-branch pile into a shared
+/// target pile on the `mary` branch, tagging every model entity with `model_id`
+/// (the genealogy discriminator). Weight blobs transfer lazily by handle (no
+/// full materialization — safe for tens of GB); the model-graph facts are
+/// re-committed on `mary` with the `model_id` added. The read twin is
+/// [`load_keymap_from_mary_branch`]. Mirrors the `trible pile branch export`
+/// transfer path.
+#[cfg(feature = "import")]
+pub fn consolidate_into_mary(
+    target_pile: &Path,
+    source_pile: &Path,
+    model_id: &str,
+) -> anyhow::Result<()> {
+    use triblespace::core::repo;
+
+    // ---- SOURCE: model-graph facts + a reader + the main-branch meta handle ----
+    let mut src = Pile::open(source_pile)
+        .map_err(|e| anyhow::anyhow!("open source {source_pile:?}: {e:?}"))?;
+    src.refresh()
+        .map_err(|e| anyhow::anyhow!("source {source_pile:?} failed to load ({e:?})"))?;
+    let mut src_repo = Repository::new(src, SigningKey::generate(&mut rand::rngs::OsRng), TribleSet::new())
+        .map_err(|e| anyhow::anyhow!("src repo new: {e:?}"))?;
+    let src_main = src_repo
+        .lookup_branch("main")
+        .map_err(|e| anyhow::anyhow!("src lookup main: {e:?}"))?
+        .ok_or_else(|| anyhow::anyhow!("no 'main' branch in source {source_pile:?}"))?;
+    let mut src_ws = src_repo.pull(src_main).map_err(|e| anyhow::anyhow!("src pull: {e:?}"))?;
+    let src_head = src_ws
+        .head()
+        .ok_or_else(|| anyhow::anyhow!("source 'main' has no commits"))?;
+    let src_facts: TribleSet = src_ws
+        .checkout(ancestors(src_head))
+        .map_err(|e| anyhow::anyhow!("src checkout: {e:?}"))?
+        .facts()
+        .clone();
+    let src_meta = src_repo
+        .storage_mut()
+        .head(src_main)
+        .map_err(|e| anyhow::anyhow!("src head: {e:?}"))?
+        .ok_or_else(|| anyhow::anyhow!("source 'main' meta handle missing"))?;
+    let src_reader = src_repo
+        .storage_mut()
+        .reader()
+        .map_err(|e| anyhow::anyhow!("src reader: {e:?}"))?;
+
+    // ---- TARGET: transfer weight blobs, then commit tagged facts on `mary` ----
+    if !target_pile.exists() {
+        eprintln!("[consolidate] target {target_pile:?} does not exist — creating a NEW empty pile");
+        std::fs::File::create(target_pile)
+            .map_err(|e| anyhow::anyhow!("create target {target_pile:?}: {e}"))?;
+    }
+    let mut tgt = Pile::open(target_pile)
+        .map_err(|e| anyhow::anyhow!("open target {target_pile:?}: {e:?}"))?;
+    tgt.refresh()
+        .map_err(|e| anyhow::anyhow!("target {target_pile:?} failed to load ({e:?})"))?;
+    let mut tgt_repo = Repository::new(tgt, SigningKey::generate(&mut rand::rngs::OsRng), TribleSet::new())
+        .map_err(|e| anyhow::anyhow!("tgt repo new: {e:?}"))?;
+
+    // Copy every blob reachable from the source main branch (weights + graph)
+    // into the target storage — lazy, by handle, no full materialization.
+    let handles = repo::reachable(&src_reader, std::iter::once(src_meta.transmute()));
+    let mut n_blobs = 0usize;
+    for r in repo::transfer(&src_reader, tgt_repo.storage_mut(), handles) {
+        r.map_err(|e| anyhow::anyhow!("blob transfer: {e}"))?;
+        n_blobs += 1;
+    }
+
+    // Tag every model entity (each shard/component) with model_id.
+    let mut tagged = src_facts.clone();
+    let mut n_models = 0usize;
+    for (e, _n) in find!(
+        (e: Id, n: Inline<inlineencodings::Handle<blobencodings::LongString>>),
+        pattern!(&src_facts, [{ ?e @ crate::format::attrs::model_name: ?n }])
+    ) {
+        tagged += entity! { ExclusiveId::force_ref(&e) @ crate::format::attrs::model_id: model_id }.into_facts();
+        n_models += 1;
+    }
+    if n_models == 0 {
+        anyhow::bail!("no model entity (attrs::model_name) in source {source_pile:?}");
+    }
+
+    // Commit the tagged model graph onto the shared `mary` branch (created if absent).
+    let mary_bid = tgt_repo
+        .ensure_branch("mary", None)
+        .map_err(|e| anyhow::anyhow!("ensure 'mary' branch: {e:?}"))?;
+    let mut tgt_ws = tgt_repo.pull(mary_bid).map_err(|e| anyhow::anyhow!("tgt pull mary: {e:?}"))?;
+    tgt_ws.commit(
+        tagged,
+        &format!("consolidate model {model_id} ({n_models} entities, {n_blobs} blobs)"),
+    );
+    tgt_repo.push(&mut tgt_ws).map_err(|e| anyhow::anyhow!("tgt push: {e:?}"))?;
+
+    tgt_repo.close().map_err(|e| anyhow::anyhow!("close target: {e:?}"))?;
+    src_repo.close().map_err(|e| anyhow::anyhow!("close source: {e:?}"))?;
+    eprintln!(
+        "[consolidate] {source_pile:?} -> {target_pile:?}: model_id={model_id}, {n_models} entities, {n_blobs} blobs"
+    );
+    Ok(())
+}
+
 /// Construct a ready-to-encode `tokenizers::Tokenizer` from the tokenizer
 /// GRAPH in a pile ([`crate::tokenizer`]) — the tokenizer twin of
 /// [`load_keymap_from_pile`]: same `main`-branch checkout, and the parts are
