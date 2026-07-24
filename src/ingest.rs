@@ -38,13 +38,19 @@ pub fn save_safetensors(
     blobs: &mut impl BlobStorePut,
     dtype: LeafDtype,
 ) -> Result<Fragment, Err> {
-    save_safetensors_filtered(bytes, model_name, blobs, dtype, |_| true, None)
+    save_safetensors_filtered(bytes, model_name, blobs, dtype, |_| true)
 }
 
 /// [`save_safetensors`] restricted to the tensors whose name passes `keep` —
 /// the way to persist ONE component of a multi-component checkpoint under its own
 /// model entity (e.g. the qwen3tts talker as a half-width `talker_f16` variant
 /// next to the exact f32 leaves).
+///
+/// This is the LEGACY, `main`-branch shape: ONE model entity per file, its id
+/// derived from `{model_name, member*}` (name-keyed provenance IS the core here).
+/// The content-addressed model-ROOT path — where the id is derived from the model
+/// IDENTITY `{model_id, quantization, weights}` and `model_name` is demoted to
+/// non-core provenance — is [`ingest_members`] + [`build_model_root`].
 #[cfg(feature = "import")]
 pub fn save_safetensors_filtered(
     bytes: &[u8],
@@ -52,8 +58,30 @@ pub fn save_safetensors_filtered(
     blobs: &mut impl BlobStorePut,
     dtype: LeafDtype,
     keep: impl Fn(&str) -> bool,
-    model_id: Option<&str>,
 ) -> Result<Fragment, Err> {
+    let (members, mut facts) = ingest_members(bytes, blobs, dtype, keep)?;
+    let mn = blobs.put::<LongString, _>(model_name.to_string())?;
+    let model = entity! { _ @ attrs::model_name: mn, attrs::member*: members.iter() };
+    let model_root_id = model.root().expect("model root");
+    facts += model.into_facts();
+    Ok(Fragment::rooted(model_root_id, facts))
+}
+
+/// Ingest one safetensors blob's float tensors (those whose name passes `keep`)
+/// into content-addressed member MODULES, returning `(member module ids, facts)`
+/// — the shared front half of both the legacy per-file model entity
+/// ([`save_safetensors_filtered`]) and the content-addressed model ROOT
+/// ([`build_model_root`]). No model/root entity is created here: the caller
+/// decides how the members are grouped (per-file, or ONE root composing every
+/// shard's members). Each tensor is a `{data|data_f16, shape}` leaf reached by a
+/// `{kind, safetensor_path, weight}` module; identical tensors dedup by content.
+#[cfg(feature = "import")]
+pub fn ingest_members(
+    bytes: &[u8],
+    blobs: &mut impl BlobStorePut,
+    dtype: LeafDtype,
+    keep: impl Fn(&str) -> bool,
+) -> Result<(Vec<Id>, TribleSet), Err> {
     let st = SafeTensors::deserialize(bytes)?;
     let mut members: Vec<Id> = Vec::new();
     let mut facts = TribleSet::new();
@@ -83,18 +111,58 @@ pub fn save_safetensors_filtered(
         members.push(m.root().expect("module root"));
         facts += m.into_facts();
     }
-    let mn = blobs.put::<LongString, _>(model_name.to_string())?;
-    let model = entity! { _ @ attrs::model_name: mn, attrs::member*: members.iter() };
-    let model_root_id = model.root().expect("model root");
-    facts += model.into_facts();
-    // A caller-supplied model_id makes this a *proper* addressable entity: the
-    // discriminator that lets many models share one branch (one pile), which
-    // `load_keymap_from_mary_branch` filters on. Set intrinsically at creation.
-    if let Some(id) = model_id {
-        facts += entity! { ExclusiveId::force_ref(&model_root_id) @ crate::format::attrs::model_id: id }
-            .into_facts();
+    Ok((members, facts))
+}
+
+/// Build a content-addressed model-ROOT entity over already-ingested member
+/// modules — "identity IS content" for a model. The root id is derived by
+/// `entity!` from the CORE attr ALONE:
+///   - `member*` — the tensor-leaf modules (already content-addressed, so the
+///                 weight CONTENT flows into the id).
+/// so the id is the PURE content-address of the weight set:
+/// `entity!{ _ @ member* }`. Importing the same weights twice yields the SAME
+/// root id (dedup across piles); a genuinely different model has different member
+/// leaves, so a different id. `member*` is a set: shard/order/duplicates don't
+/// move the id. Native vs fp4 differ by their actual weight bytes → different
+/// members → different ids automatically, which is why `quantization` need NOT
+/// be core.
+///
+/// `quantization` (the weight-format tag), `source` (the HF id it came from, or a
+/// `--name` for a local dir), and `provenance` (the shard file names, as
+/// `model_name` facts) are ALL NON-core: attached to the content-derived root id
+/// via `ExclusiveId::force_ref`, they are queryable LABELS that never influence
+/// the identity. (A consequence: the SAME weights tagged with two different
+/// `quantization` labels resolve to the SAME entity id — the label rides on the
+/// weights' identity.) Returns the root Fragment carrying the member facts plus
+/// the root's own core + label facts.
+#[cfg(feature = "import")]
+pub fn build_model_root(
+    blobs: &mut impl BlobStorePut,
+    source: &str,
+    quantization: &str,
+    members: Vec<Id>,
+    member_facts: TribleSet,
+    provenance: &[String],
+) -> Result<Fragment, Err> {
+    let mut facts = member_facts;
+    // CORE: the id is the PURE content-address of the weight set (members alone).
+    let root = entity! { _ @ attrs::member*: members.iter() };
+    let root_id = root.root().expect("model root");
+    facts += root.into_facts();
+    // NON-core labels on the (content-derived) root id — queryable, no id
+    // influence: the weight-format tag, the `source` it was imported from, and
+    // which files it came from.
+    let source_h = blobs.put::<LongString, _>(source.to_string())?;
+    facts += entity! { ExclusiveId::force_ref(&root_id) @
+        attrs::quantization: quantization,
+        attrs::source: source_h,
     }
-    Ok(Fragment::rooted(model_root_id, facts))
+    .into_facts();
+    for name in provenance {
+        let mn = blobs.put::<LongString, _>(name.clone())?;
+        facts += entity! { ExclusiveId::force_ref(&root_id) @ attrs::model_name: mn }.into_facts();
+    }
+    Ok(Fragment::rooted(root_id, facts))
 }
 
 fn read_string(blobs: &impl BlobStoreGet, h: Inline<inlineencodings::Handle<LongString>>) -> String {

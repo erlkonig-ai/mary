@@ -94,13 +94,24 @@ pub mod attrs {
         "B4B6EC08A0CD70DE63A690168EE78F0F" as member: GenId;
         /// Model name / HuggingFace id (shared id with avatar/gaze).
         "4C1CD1611863E7854C59C7DC706DF77A" as model_name: Handle<blobencodings::LongString>;
-        /// Canonical model identity on a shared `mary` branch (e.g. "clip_vit_base",
-        /// "qwen3tts", "flux_klein") — lets a loader select ONE model out of a pile
-        /// that holds many. The genealogy discriminator: a root (original) and its
-        /// derivations (naive-fp4, tuned-fp4-vN) share a `model_id`, distinguished
-        /// by `format_marker`; a child links to its root via `model_root`. Minted
-        /// 2026-07-24.
-        "C8A11B350180DC49007393D5E0AB7100" as model_id: ShortString;
+        /// SOURCE of a content-addressed model-root entity — the model's canonical
+        /// name: the HuggingFace id it was imported from (e.g.
+        /// "openai/clip-vit-base-patch32"), or a `--name` for a local-dir import.
+        /// NON-core: a queryable LABEL attached to the (content-derived) root id,
+        /// NOT part of the identity — the id is the content-address of
+        /// `(quantization, weights)` alone. A `Handle<LongString>` because HF ids
+        /// routinely exceed 32 bytes. Minted 2026-07-24.
+        /// (`trible genid` → D20B8E3556C35FF6D18D104C3443D6CF)
+        "D20B8E3556C35FF6D18D104C3443D6CF" as source: Handle<blobencodings::LongString>;
+        /// Weight FORMAT tag of a content-addressed model-root entity (e.g.
+        /// "native", "fp4", "q8"). NON-core: a queryable LABEL on the
+        /// (content-derived) root id, NOT part of the identity — the id is the
+        /// PURE content-address of the weight `member*`s alone. (Native vs fp4
+        /// already differ by their weight bytes → different members → different
+        /// ids, so the tag needn't be core; and the SAME weights under two
+        /// different tags share one entity id.) Minted 2026-07-24.
+        /// (`trible genid` → 7AF87320C144AA29C29FE2A5EE7C7EB2)
+        "7AF87320C144AA29C29FE2A5EE7C7EB2" as quantization: ShortString;
     }
 }
 

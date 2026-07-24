@@ -76,22 +76,37 @@ pub fn persist_safetensors_files_to_pile(
     pile_path: &Path,
     dtype: LeafDtype,
 ) -> anyhow::Result<()> {
-    persist_files_to_pile(files, pile_path, dtype, None, "main")
+    persist_files_to_pile(files, pile_path, dtype)
 }
 
 /// Import a model directory's safetensors into a SHARED model pile on the `mary`
-/// branch, tagging every model entity with `model_id` — so many models coexist
-/// in one pile, each loadable by id via [`load_keymap_from_mary_branch`]. This
-/// is the consolidated-MODEL_PILE front door (`mary import --model-id`): the
-/// model becomes a proper addressable entity AT import, so no separate
-/// consolidation step exists — appending another model is just another import.
+/// branch as ONE content-addressed model-ROOT entity — so many models coexist in
+/// one pile, each loadable by `(source [, quantization])` via
+/// [`load_keymap_from_mary_branch`] (or by the root's entity id via
+/// [`load_keymap_from_mary_branch_by_root`]). This is the consolidated-MODEL_PILE
+/// front door (`mary import`): the model becomes a proper addressable entity AT
+/// import, so no separate consolidation step exists — appending another model is
+/// just another import.
+///
+/// `source` is the model's canonical NAME — the HF id it was imported from, or a
+/// `--name` for a local-dir import. The root's id is CONTENT-DERIVED from its
+/// identity `(source, quantization, weight members)`: importing the same
+/// `(source, quantization, weights)` twice yields the SAME root id (dedup), while
+/// a different `quantization` of the same model is a DISTINCT entity. For a
+/// MULTI-shard model, the ONE root composes EVERY shard's tensor members
+/// (order-independent set), and each shard's file name is recorded as NON-core
+/// `model_name` provenance on the root.
+///
+/// `quantization` tags the weight format ("native" for the faithful import).
+/// Returns the imported root's entity id (the content address).
 #[cfg(feature = "import")]
 pub fn persist_model_to_pile(
     safetensors_dir: &Path,
     pile_path: &Path,
     dtype: LeafDtype,
-    model_id: &str,
-) -> anyhow::Result<()> {
+    source: &str,
+    quantization: &str,
+) -> anyhow::Result<Id> {
     let files: Vec<(std::path::PathBuf, String)> = shard_paths(safetensors_dir)?
         .into_iter()
         .map(|p| {
@@ -99,21 +114,80 @@ pub fn persist_model_to_pile(
             (p, name)
         })
         .collect();
-    persist_files_to_pile(&files, pile_path, dtype, Some(model_id), "mary")
+
+    // Pile::open requires the file to exist; create an empty one if needed —
+    // loudly, so a typo'd path to an existing pile is visible instead of
+    // silently persisting into a fresh file somewhere else.
+    if !pile_path.exists() {
+        eprintln!("[persist] pile {pile_path:?} does not exist — creating a NEW empty pile");
+        std::fs::File::create(pile_path)
+            .map_err(|e| anyhow::anyhow!("create pile {pile_path:?}: {e}"))?;
+    }
+    let mut pile = Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open pile {pile_path:?}: {e:?}"))?;
+    // Non-mutating load; NEVER amputate here. A corrupt tail on a weights
+    // pile must fail loud — truncation is an explicit operator decision
+    // (`trible pile amputate`), not a persist side effect.
+    pile.refresh().map_err(|e| {
+        anyhow::anyhow!(
+            "pile {pile_path:?} failed to load ({e:?}); refusing to auto-truncate — \
+             if the tail is a genuinely torn write, amputate explicitly with \
+             `trible pile amputate`"
+        )
+    })?;
+
+    let mut repo = Repository::new(pile, SigningKey::generate(&mut rand::rngs::OsRng), TribleSet::new())
+        .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
+    // Reuse the mary branch if it exists (append into an existing pile), else create it.
+    let branch_id = match repo.lookup_branch("mary").map_err(|e| anyhow::anyhow!("lookup mary: {e:?}"))? {
+        Some(id) => id,
+        None => *repo.create_branch("mary", None).map_err(|e| anyhow::anyhow!("create mary: {e:?}"))?,
+    };
+    let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull mary: {e:?}"))?;
+
+    // Ingest EVERY shard's weight blobs straight into the pile storage (no
+    // in-memory carryover), gathering ALL shards' tensor members under ONE root
+    // whose id is content-derived from (model_id, quantization, members). Each
+    // shard's file name becomes non-core provenance on that root.
+    let mut members: Vec<Id> = Vec::new();
+    let mut facts = TribleSet::new();
+    let mut provenance: Vec<String> = Vec::new();
+    for (path, name) in &files {
+        let bytes = read_safetensors_file(path);
+        eprintln!("[persist] ingesting {name} ({} bytes)...", bytes.len());
+        let (mut shard_members, shard_facts) =
+            crate::ingest::ingest_members(&bytes, repo.storage_mut(), dtype, |_| true)
+                .map_err(|e| anyhow::anyhow!("ingest {path:?}: {e}"))?;
+        members.append(&mut shard_members);
+        facts += shard_facts;
+        provenance.push(name.clone());
+    }
+    let root = crate::ingest::build_model_root(
+        repo.storage_mut(),
+        source,
+        quantization,
+        members,
+        facts,
+        &provenance,
+    )
+    .map_err(|e| anyhow::anyhow!("build model root: {e}"))?;
+    let root_id = root.root().expect("model root id");
+
+    ws.commit(root.into_facts(), &format!("ingest model {source} ({quantization})"));
+    repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+    repo.close().map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+    Ok(root_id)
 }
 
-/// The engine behind [`persist_safetensors_files_to_pile`] (untagged, `main`)
-/// and [`persist_model_to_pile`] (tagged with `model_id`, `mary` branch): ingest
-/// each file's weight blobs straight into `pile_path`'s storage (no in-memory
-/// carryover) and commit the model-graph facts on `branch`, creating the pile
-/// and branch if absent.
+/// The engine behind [`persist_safetensors_files_to_pile`] (untagged, `main`):
+/// ingest each file's weight blobs straight into `pile_path`'s storage (no
+/// in-memory carryover) and commit ONE model entity PER file on `main`, creating
+/// the pile and branch if absent. (The content-addressed model-ROOT path is
+/// [`persist_model_to_pile`], `mary` branch.)
 #[cfg(feature = "import")]
 fn persist_files_to_pile(
     files: &[(std::path::PathBuf, String)],
     pile_path: &Path,
     dtype: LeafDtype,
-    model_id: Option<&str>,
-    branch: &str,
 ) -> anyhow::Result<()> {
     // Pile::open requires the file to exist; create an empty one if needed —
     // loudly, so a typo'd path to an existing pile is visible instead of
@@ -138,36 +212,24 @@ fn persist_files_to_pile(
     let mut repo = Repository::new(pile, SigningKey::generate(&mut rand::rngs::OsRng), TribleSet::new())
         .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
     // Reuse the branch if it exists (append into an existing pile), else create it.
-    let branch_id = match repo.lookup_branch(branch).map_err(|e| anyhow::anyhow!("lookup {branch}: {e:?}"))? {
+    let branch_id = match repo.lookup_branch("main").map_err(|e| anyhow::anyhow!("lookup main: {e:?}"))? {
         Some(id) => id,
-        None => *repo.create_branch(branch, None).map_err(|e| anyhow::anyhow!("create {branch}: {e:?}"))?,
+        None => *repo.create_branch("main", None).map_err(|e| anyhow::anyhow!("create main: {e:?}"))?,
     };
-    let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull {branch}: {e:?}"))?;
+    let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull main: {e:?}"))?;
 
     // Ingest each file's weight blobs straight into the pile storage (no
-    // in-memory carryover), accumulating only the model-graph facts. When a
-    // model_id is given, save_safetensors_filtered tags the model entity with it.
+    // in-memory carryover), accumulating only the model-graph facts.
     let mut facts = TribleSet::new();
     for (path, name) in files {
         let bytes = read_safetensors_file(path);
         eprintln!("[persist] ingesting {name} ({} bytes)...", bytes.len());
-        let frag = crate::ingest::save_safetensors_filtered(
-            &bytes,
-            name,
-            repo.storage_mut(),
-            dtype,
-            |_| true,
-            model_id,
-        )
-        .map_err(|e| anyhow::anyhow!("ingest {path:?}: {e}"))?;
+        let frag = crate::ingest::save_safetensors_filtered(&bytes, name, repo.storage_mut(), dtype, |_| true)
+            .map_err(|e| anyhow::anyhow!("ingest {path:?}: {e}"))?;
         facts += frag.into_facts();
     }
 
-    let msg = match model_id {
-        Some(id) => format!("ingest model {id}"),
-        None => "ingest model weights".to_string(),
-    };
-    ws.commit(facts, &msg);
+    ws.commit(facts, "ingest model weights");
     repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
     repo.close().map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
     Ok(())
@@ -215,7 +277,7 @@ pub fn persist_safetensors_file_filtered_to_pile(
 
     let bytes = read_safetensors_file(file);
     eprintln!("[persist] ingesting {entity_name} (filtered from {} bytes)...", bytes.len());
-    let frag = crate::ingest::save_safetensors_filtered(&bytes, entity_name, repo.storage_mut(), dtype, keep, None)
+    let frag = crate::ingest::save_safetensors_filtered(&bytes, entity_name, repo.storage_mut(), dtype, keep)
         .map_err(|e| anyhow::anyhow!("ingest {file:?}: {e}"))?;
 
     ws.commit(frag.into_facts(), "ingest model weights (filtered component)");
@@ -926,26 +988,93 @@ pub fn load_keymap_from_pile_prefixed(
     Ok(keymap)
 }
 
+/// The default weight-format tag: the faithful import (no derived quantization).
+pub const QUANTIZATION_NATIVE: &str = "native";
+
 /// Load a model's keymap from the shared `mary` branch of a consolidated model
-/// pile — the mary-branch twin of [`load_keymap_from_pile`]. Selects the ONE
-/// model whose `model_id` matches, out of a pile that holds many. See the
-/// mary-model-pile consolidation design (`model_id` genealogy discriminator).
+/// pile — the mary-branch twin of [`load_keymap_from_pile`]. Resolves the ONE
+/// content-addressed model-ROOT labelled with `source` at
+/// `quantization="native"`, out of a pile that holds many, and materializes ALL
+/// its members. For a non-native format use
+/// [`load_keymap_from_mary_branch_quantized`]; to address a root directly by its
+/// entity id use [`load_keymap_from_mary_branch_by_root`].
 pub fn load_keymap_from_mary_branch(
     pile_path: &Path,
-    model_id: &str,
+    source: &str,
 ) -> anyhow::Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
-    load_keymap_from_mary_branch_prefixed(pile_path, model_id, "")
+    load_keymap_from_mary_branch_quantized(pile_path, source, QUANTIZATION_NATIVE)
 }
 
-/// Like [`load_keymap_from_mary_branch`], but restricts to the requested model's
-/// entities whose `model_name` also starts with `name_prefix` — the
-/// per-component load (flux's `transformer/`, `vae/`, `text_encoder/`) now that
-/// all models share one `mary` branch keyed by `model_id`.
-pub fn load_keymap_from_mary_branch_prefixed(
+/// Like [`load_keymap_from_mary_branch`], but selects the root by BOTH `source`
+/// AND `quantization`. `quantization` is a CORE identity coordinate; `source` is
+/// a non-core label — together they name one root (a given `(source,
+/// quantization)` pair maps to a single import). `native` and `fp4` of the same
+/// model are distinct roots; this picks the requested one.
+pub fn load_keymap_from_mary_branch_quantized(
     pile_path: &Path,
-    model_id: &str,
-    name_prefix: &str,
+    source: &str,
+    quantization: &str,
 ) -> anyhow::Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
+    let (tribles, reader) = checkout_mary_branch(pile_path)?;
+    // Constrain `quantization` engine-side (a ShortString value on the root),
+    // then match the projected `source` label by its blob string. `source` is a
+    // `Handle<LongString>` so its value lives in a blob, not inline — resolve it
+    // through the reader.
+    let root: Id = find!(
+        (m: Id, s: Inline<inlineencodings::Handle<blobencodings::LongString>>),
+        pattern!(&tribles, [{ ?m @
+            crate::format::attrs::quantization: quantization,
+            crate::format::attrs::source: ?s,
+        }])
+    )
+    .filter(|&(_m, s)| {
+        let v: anybytes::View<str> = reader.get(s).expect("source blob");
+        &*v == source
+    })
+    .map(|(m, _s)| m)
+    .next()
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "no model root (source={source:?}, quantization={quantization:?}) on the \
+             'mary' branch in pile {pile_path:?}"
+        )
+    })?;
+
+    let keymap = load_keymap(&tribles, &reader, root);
+    if keymap.is_empty() {
+        anyhow::bail!("keymap empty after materializing model root {root} from the mary branch");
+    }
+    Ok(keymap)
+}
+
+/// Load a model's keymap from the `mary` branch by the model-root's ENTITY ID
+/// directly — the content address itself, no `(model_id, quantization)` lookup.
+/// The complement to [`load_keymap_from_mary_branch_quantized`]: the id is what
+/// `persist_model_to_pile` returns, so a caller that recorded it can round-trip
+/// straight back to the exact weights.
+pub fn load_keymap_from_mary_branch_by_root(
+    pile_path: &Path,
+    root: Id,
+) -> anyhow::Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
+    let (tribles, reader) = checkout_mary_branch(pile_path)?;
+    let keymap = load_keymap(&tribles, &reader, root);
+    if keymap.is_empty() {
+        anyhow::bail!(
+            "no members under model root {root} on the 'mary' branch in pile {pile_path:?} \
+             (unknown root id, or an empty model)"
+        );
+    }
+    Ok(keymap)
+}
+
+/// Open a pile, resolve its `mary` branch, and return `(full-history facts, blob
+/// reader)` — the shared read-side plumbing behind the mary-branch loaders. The
+/// repo is closed before returning; the reader's mmap stays valid afterward (each
+/// blob keeps the mapping alive, as in [`load_split_index_from_pile`]). NEVER
+/// amputates: a corrupt tail fails loud (see [`load_keymap_from_pile`]).
+fn checkout_mary_branch(
+    pile_path: &Path,
+) -> anyhow::Result<(TribleSet, triblespace::core::repo::pile::PileReader)> {
     let mut pile = Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open pile {pile_path:?}: {e:?}"))?;
     // Read path: non-mutating load, NEVER amputate (see load_keymap_from_pile).
     pile.refresh().map_err(|e| {
@@ -970,35 +1099,8 @@ pub fn load_keymap_from_mary_branch_prefixed(
         .storage_mut()
         .reader()
         .map_err(|e| anyhow::anyhow!("pile reader: {e:?}"))?;
-
-    // Constrain `model_id` engine-side (the ShortString value), then filter the
-    // projected `model_name` by prefix — mirrors load_keymap_from_pile_prefixed.
-    let model_entities: Vec<Id> = find!(
-        (m: Id, n: Inline<inlineencodings::Handle<blobencodings::LongString>>),
-        pattern!(&tribles, [{ ?m @ crate::format::attrs::model_id: model_id, crate::format::attrs::model_name: ?n }])
-    )
-    .filter(|&(_m, n)| {
-        let v: anybytes::View<str> = reader.get(n).expect("model name blob");
-        v.starts_with(name_prefix)
-    })
-    .map(|(m, _n)| m)
-    .collect();
-    if model_entities.is_empty() {
-        anyhow::bail!(
-            "no model entity (model_id={model_id:?}, name_prefix={name_prefix:?}) on the \
-             'mary' branch in pile {pile_path:?}"
-        );
-    }
-
-    let mut keymap: HashMap<String, (Vec<f32>, Vec<usize>)> = HashMap::new();
-    for id in model_entities {
-        keymap.extend(load_keymap(&tribles, &reader, id));
-    }
     repo.close().map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
-    if keymap.is_empty() {
-        anyhow::bail!("keymap empty after materializing from the mary branch");
-    }
-    Ok(keymap)
+    Ok((tribles, reader))
 }
 
 /// Construct a ready-to-encode `tokenizers::Tokenizer` from the tokenizer

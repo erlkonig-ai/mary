@@ -8,25 +8,28 @@
 //! Bootstrap a model in one line:
 //!
 //! ```text
-//! # one model per pile (legacy, main branch):
-//! mary import ./my-model-dir --pile my.pile --dtype f16
-//! # many models in one shared MODEL_PILE, each addressable by --model-id:
-//! mary import openai/clip-vit-base-patch32 --pile models.pile --model-id clip_vit_base
-//! mary import HuggingFaceTB/SmolLM2-135M    --pile models.pile --model-id smollm2
+//! # many models in one shared MODEL_PILE — each a content-addressed root on the
+//! # `mary` branch, its id the pure hash of its weights:
+//! mary import openai/clip-vit-base-patch32 --pile models.pile
+//! mary import HuggingFaceTB/SmolLM2-135M    --pile models.pile --dtype f16
+//! mary import ./my-model-dir --pile models.pile --name my_model   # local dir
 //! ```
 //!
 //! The source is either a HuggingFace model id (auto-downloaded from the hub if
-//! not already in the local cache) or a local directory of `.safetensors`
-//! shards. With `--model-id`, the model becomes a proper entity
-//! on the pile's `mary` branch, so many models coexist in one pile (each loaded
-//! back by id) — no separate consolidation step: appending a model is just
-//! another import. The resulting pile is self-contained: no safetensors needed.
+//! not already in the local cache) or a local directory of `.safetensors` shards
+//! (which needs a `--name`, since there is no hf-id to label it with). The model
+//! becomes a content-addressed ROOT entity on the pile's `mary` branch — its id
+//! the pure content-address of its weight set — so many models coexist in one
+//! pile, each loaded back by its `source` label (the hf-id / `--name`) or by its
+//! entity id. Re-importing the same weights dedups to the same root; no separate
+//! consolidation step. The resulting pile is self-contained: no safetensors
+//! needed.
 
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use mary::ingest::LeafDtype;
-use mary::persist::persist_safetensors_to_pile;
+use triblespace::prelude::Id;
 
 #[derive(Parser)]
 #[command(
@@ -43,30 +46,35 @@ struct Cli {
 enum Cmd {
     /// Import a model's safetensors weights into a pile (the durable weight store).
     Import(ImportArgs),
-    /// Load ONE model from a pile's `mary` branch by `model_id` and print its
-    /// tensor count + a sample — a round-trip check of the consolidated store.
+    /// Load ONE model from a pile's `mary` branch — by `--source` (+ optional
+    /// `--quantization`) or by `--root` entity id — and print its tensor count +
+    /// a sample. A round-trip check of the content-addressed store.
     Keys(KeysArgs),
 }
 
 #[derive(Args)]
 struct ImportArgs {
-    /// A HuggingFace model id (resolved from the local HF cache) OR a local
-    /// directory holding the model's `.safetensors` shards.
+    /// A HuggingFace model id (resolved from the local HF cache, or downloaded)
+    /// OR a local directory holding the model's `.safetensors` shards.
     source: String,
     /// Output pile path. Created if absent; a model added to an existing pile
-    /// is appended on the `main` branch (content-addressing dedups shared blobs).
+    /// is appended on the `mary` branch (content-addressing dedups shared blobs).
     #[arg(long)]
     pile: PathBuf,
     /// Leaf storage dtype. `f32` is lossless (the faithful original, whatever
     /// width the source used); `f16` halves the pile for 16-bit-native weights.
     #[arg(long, value_enum, default_value_t = Dtype::F32)]
     dtype: Dtype,
-    /// Model id for a shared MODEL_PILE: the model becomes a proper entity
-    /// carrying this id on the pile's `mary` branch, so many models coexist in
-    /// one pile (each loadable by id). Omit for a legacy single-model pile
-    /// (`main` branch, untagged).
+    /// The model's canonical `source` LABEL on the `mary` branch (a queryable
+    /// non-core name; the root id is the pure content-address of the weights).
+    /// Defaults to the hf-id `source` argument; REQUIRED for a local directory,
+    /// which has no hf-id to label it with.
     #[arg(long)]
-    model_id: Option<String>,
+    name: Option<String>,
+    /// Weight-format tag recorded as a non-core label on the root (e.g. "native",
+    /// "fp4"). Defaults to "native" — the faithful import.
+    #[arg(long, default_value = "native")]
+    quantization: String,
 }
 
 #[derive(Args)]
@@ -74,9 +82,18 @@ struct KeysArgs {
     /// The consolidated model pile to read from.
     #[arg(long)]
     pile: PathBuf,
-    /// The `model_id` to load from the pile's `mary` branch.
-    #[arg(long)]
-    model: String,
+    /// The `source` label to load from the pile's `mary` branch (the hf-id or the
+    /// `--name` used at import). Mutually exclusive with `--root`.
+    #[arg(long, conflicts_with = "root")]
+    source: Option<String>,
+    /// The weight-format label to disambiguate when the same `source` was
+    /// imported under several tags. Defaults to "native".
+    #[arg(long, default_value = "native")]
+    quantization: String,
+    /// Load the model directly by its ROOT entity id (hex) — the content address
+    /// `mary import` printed. Mutually exclusive with `--source`.
+    #[arg(long, conflicts_with = "source")]
+    root: Option<String>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -102,12 +119,27 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn keys(a: KeysArgs) -> anyhow::Result<()> {
-    let km = mary::persist::load_keymap_from_mary_branch(&a.pile, &a.model)?;
+    let (km, label) = match (&a.source, &a.root) {
+        (Some(source), None) => {
+            let km = mary::persist::load_keymap_from_mary_branch_quantized(
+                &a.pile,
+                source,
+                &a.quantization,
+            )?;
+            (km, format!("source={source} quantization={}", a.quantization))
+        }
+        (None, Some(hex)) => {
+            let root = Id::from_hex(hex)
+                .ok_or_else(|| anyhow::anyhow!("--root {hex:?} is not a valid 32-hex entity id"))?;
+            let km = mary::persist::load_keymap_from_mary_branch_by_root(&a.pile, root)?;
+            (km, format!("root={hex}"))
+        }
+        _ => anyhow::bail!("mary keys: pass exactly one of --source or --root"),
+    };
     let mut names: Vec<&String> = km.keys().collect();
     names.sort();
     eprintln!(
-        "mary keys: model_id={} on the mary branch of {} -> {} tensors",
-        a.model,
+        "mary keys: {label} on the mary branch of {} -> {} tensors",
         a.pile.display(),
         km.len()
     );
@@ -124,25 +156,29 @@ fn import(a: ImportArgs) -> anyhow::Result<()> {
         Dtype::F32 => "f32",
         Dtype::F16 => "f16",
     };
-    match &a.model_id {
-        Some(id) => {
-            eprintln!(
-                "mary import: {} -> {} ({dt} leaves, model_id={id} on the mary branch)",
-                dir.display(),
-                a.pile.display()
-            );
-            mary::persist::persist_model_to_pile(&dir, &a.pile, a.dtype.into(), id)?;
-        }
+    // The model's `source` LABEL: an explicit `--name`, else the hf-id argument.
+    // A local directory has no hf-id, so `--name` is required there.
+    let label = match &a.name {
+        Some(n) => n.clone(),
         None => {
-            eprintln!(
-                "mary import: {} -> {} ({dt} leaves, main branch)",
-                dir.display(),
-                a.pile.display()
-            );
-            persist_safetensors_to_pile(&dir, &a.pile, a.dtype.into())?;
+            if Path::new(&a.source).is_dir() {
+                anyhow::bail!(
+                    "mary import: a local directory has no hf-id to use as its `source` label — \
+                     pass `--name <n>`"
+                );
+            }
+            a.source.clone()
         }
-    }
-    eprintln!("mary import: done — pile at {}", a.pile.display());
+    };
+    eprintln!(
+        "mary import: {} -> {} ({dt} leaves, source={label} quantization={} on the mary branch)",
+        dir.display(),
+        a.pile.display(),
+        a.quantization,
+    );
+    let root =
+        mary::persist::persist_model_to_pile(&dir, &a.pile, a.dtype.into(), &label, &a.quantization)?;
+    eprintln!("mary import: done — model root {root:X} in pile {}", a.pile.display());
     Ok(())
 }
 
