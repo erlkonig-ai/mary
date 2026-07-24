@@ -22,6 +22,9 @@ anybytes = "0.20"
 # piles. Only the `import` feature (persist importers + parity gates) compiles
 # a safetensors reader — inference/serve builds cannot reach one.
 safetensors = { version = "0.4.5", optional = true }
+# clap powers the `mary` CLI (the import front door); import-only, kept out of
+# lib-consumer and inference/serve builds.
+clap = { version = "4", features = ["derive"], optional = true }
 half = { version = "2", features = ["zerocopy"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -62,7 +65,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 # `ingest::save_safetensors`, `persist::persist_safetensors_to_pile`, the
 # `load_*_from_hf` constructors). Importer binaries and parity gates require
 # it; every runtime/inference/serve path loads from piles and builds without it.
-import = ["dep:safetensors"]
+import = ["dep:safetensors", "dep:clap"]
 flux = ["dep:image", "dep:tokenizers"]
 # SmolVLA (mary::models::smolvla) — vision-language-action; SigLIP vision +
 # tokenizer + flow-matching sampler. Same dep surface as flux.
@@ -141,6 +144,12 @@ local-model = ["gemma"]
 # probe with `--features dev-tools`.
 # The probes compare against safetensors oracles, so this pulls `import`.
 dev-tools = ["import"]
+# The `mary` CLI — the import front door. Behind `import` (safetensors + clap),
+# out of the default library build.
+[[bin]]
+name = "mary"
+required-features = ["import"]
+
 # Hand-run dev probes / parity gates (f5-only deps) — kept out of the default
 # (library-only) build behind `dev-tools`.
 [[bin]]
