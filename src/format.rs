@@ -94,6 +94,13 @@ pub mod attrs {
         "B4B6EC08A0CD70DE63A690168EE78F0F" as member: GenId;
         /// Model name / HuggingFace id (shared id with avatar/gaze).
         "4C1CD1611863E7854C59C7DC706DF77A" as model_name: Handle<blobencodings::LongString>;
+        /// Canonical model identity on a shared `mary` branch (e.g. "clip_vit_base",
+        /// "qwen3tts", "flux_klein") — lets a loader select ONE model out of a pile
+        /// that holds many. The genealogy discriminator: a root (original) and its
+        /// derivations (naive-fp4, tuned-fp4-vN) share a `model_id`, distinguished
+        /// by `format_marker`; a child links to its root via `model_root`. Minted
+        /// 2026-07-24.
+        "C8A11B350180DC49007393D5E0AB7100" as model_id: ShortString;
     }
 }
 

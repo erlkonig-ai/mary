@@ -875,6 +875,81 @@ pub fn load_keymap_from_pile_prefixed(
     Ok(keymap)
 }
 
+/// Load a model's keymap from the shared `mary` branch of a consolidated model
+/// pile — the mary-branch twin of [`load_keymap_from_pile`]. Selects the ONE
+/// model whose `model_id` matches, out of a pile that holds many. See the
+/// mary-model-pile consolidation design (`model_id` genealogy discriminator).
+pub fn load_keymap_from_mary_branch(
+    pile_path: &Path,
+    model_id: &str,
+) -> anyhow::Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
+    load_keymap_from_mary_branch_prefixed(pile_path, model_id, "")
+}
+
+/// Like [`load_keymap_from_mary_branch`], but restricts to the requested model's
+/// entities whose `model_name` also starts with `name_prefix` — the
+/// per-component load (flux's `transformer/`, `vae/`, `text_encoder/`) now that
+/// all models share one `mary` branch keyed by `model_id`.
+pub fn load_keymap_from_mary_branch_prefixed(
+    pile_path: &Path,
+    model_id: &str,
+    name_prefix: &str,
+) -> anyhow::Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
+    let mut pile = Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open pile {pile_path:?}: {e:?}"))?;
+    // Read path: non-mutating load, NEVER amputate (see load_keymap_from_pile).
+    pile.refresh().map_err(|e| {
+        anyhow::anyhow!(
+            "pile {pile_path:?} failed to load ({e:?}); refusing to auto-truncate on a \
+             read path — amputate explicitly with `trible pile amputate` if the tail is torn"
+        )
+    })?;
+    let mut repo = Repository::new(pile, SigningKey::generate(&mut rand::rngs::OsRng), TribleSet::new())
+        .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
+    let branch_id = repo
+        .lookup_branch("mary")
+        .map_err(|e| anyhow::anyhow!("lookup mary: {e:?}"))?
+        .ok_or_else(|| anyhow::anyhow!("no 'mary' branch in pile {pile_path:?}"))?;
+    let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull mary: {e:?}"))?;
+    let head = ws.head().ok_or_else(|| anyhow::anyhow!("'mary' branch has no commits"))?;
+    let checkout = ws
+        .checkout(ancestors(head))
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let tribles: TribleSet = checkout.facts().clone();
+    let reader = repo
+        .storage_mut()
+        .reader()
+        .map_err(|e| anyhow::anyhow!("pile reader: {e:?}"))?;
+
+    // Constrain `model_id` engine-side (the ShortString value), then filter the
+    // projected `model_name` by prefix — mirrors load_keymap_from_pile_prefixed.
+    let model_entities: Vec<Id> = find!(
+        (m: Id, n: Inline<inlineencodings::Handle<blobencodings::LongString>>),
+        pattern!(&tribles, [{ ?m @ crate::format::attrs::model_id: model_id, crate::format::attrs::model_name: ?n }])
+    )
+    .filter(|&(_m, n)| {
+        let v: anybytes::View<str> = reader.get(n).expect("model name blob");
+        v.starts_with(name_prefix)
+    })
+    .map(|(m, _n)| m)
+    .collect();
+    if model_entities.is_empty() {
+        anyhow::bail!(
+            "no model entity (model_id={model_id:?}, name_prefix={name_prefix:?}) on the \
+             'mary' branch in pile {pile_path:?}"
+        );
+    }
+
+    let mut keymap: HashMap<String, (Vec<f32>, Vec<usize>)> = HashMap::new();
+    for id in model_entities {
+        keymap.extend(load_keymap(&tribles, &reader, id));
+    }
+    repo.close().map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+    if keymap.is_empty() {
+        anyhow::bail!("keymap empty after materializing from the mary branch");
+    }
+    Ok(keymap)
+}
+
 /// Construct a ready-to-encode `tokenizers::Tokenizer` from the tokenizer
 /// GRAPH in a pile ([`crate::tokenizer`]) — the tokenizer twin of
 /// [`load_keymap_from_pile`]: same `main`-branch checkout, and the parts are
