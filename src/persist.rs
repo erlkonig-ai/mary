@@ -19,7 +19,7 @@
 
 use crate::ingest::load_keymap;
 #[cfg(feature = "import")]
-use crate::ingest::{save_safetensors, LeafDtype};
+use crate::ingest::LeafDtype;
 #[cfg(feature = "import")]
 use crate::nn::weight_loader::read_safetensors_file;
 use ed25519_dalek::SigningKey;
@@ -76,6 +76,45 @@ pub fn persist_safetensors_files_to_pile(
     pile_path: &Path,
     dtype: LeafDtype,
 ) -> anyhow::Result<()> {
+    persist_files_to_pile(files, pile_path, dtype, None, "main")
+}
+
+/// Import a model directory's safetensors into a SHARED model pile on the `mary`
+/// branch, tagging every model entity with `model_id` — so many models coexist
+/// in one pile, each loadable by id via [`load_keymap_from_mary_branch`]. This
+/// is the consolidated-MODEL_PILE front door (`mary import --model-id`): the
+/// model becomes a proper addressable entity AT import, so no separate
+/// consolidation step exists — appending another model is just another import.
+#[cfg(feature = "import")]
+pub fn persist_model_to_pile(
+    safetensors_dir: &Path,
+    pile_path: &Path,
+    dtype: LeafDtype,
+    model_id: &str,
+) -> anyhow::Result<()> {
+    let files: Vec<(std::path::PathBuf, String)> = shard_paths(safetensors_dir)?
+        .into_iter()
+        .map(|p| {
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("model").to_string();
+            (p, name)
+        })
+        .collect();
+    persist_files_to_pile(&files, pile_path, dtype, Some(model_id), "mary")
+}
+
+/// The engine behind [`persist_safetensors_files_to_pile`] (untagged, `main`)
+/// and [`persist_model_to_pile`] (tagged with `model_id`, `mary` branch): ingest
+/// each file's weight blobs straight into `pile_path`'s storage (no in-memory
+/// carryover) and commit the model-graph facts on `branch`, creating the pile
+/// and branch if absent.
+#[cfg(feature = "import")]
+fn persist_files_to_pile(
+    files: &[(std::path::PathBuf, String)],
+    pile_path: &Path,
+    dtype: LeafDtype,
+    model_id: Option<&str>,
+    branch: &str,
+) -> anyhow::Result<()> {
     // Pile::open requires the file to exist; create an empty one if needed —
     // loudly, so a typo'd path to an existing pile is visible instead of
     // silently persisting into a fresh file somewhere else.
@@ -98,25 +137,37 @@ pub fn persist_safetensors_files_to_pile(
 
     let mut repo = Repository::new(pile, SigningKey::generate(&mut rand::rngs::OsRng), TribleSet::new())
         .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
-    // Reuse main if it already exists (re-persist into an existing pile), else create it.
-    let branch_id = match repo.lookup_branch("main").map_err(|e| anyhow::anyhow!("lookup main: {e:?}"))? {
+    // Reuse the branch if it exists (append into an existing pile), else create it.
+    let branch_id = match repo.lookup_branch(branch).map_err(|e| anyhow::anyhow!("lookup {branch}: {e:?}"))? {
         Some(id) => id,
-        None => *repo.create_branch("main", None).map_err(|e| anyhow::anyhow!("create main: {e:?}"))?,
+        None => *repo.create_branch(branch, None).map_err(|e| anyhow::anyhow!("create {branch}: {e:?}"))?,
     };
-    let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull main: {e:?}"))?;
+    let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull {branch}: {e:?}"))?;
 
     // Ingest each file's weight blobs straight into the pile storage (no
-    // in-memory carryover), accumulating only the model-graph facts.
+    // in-memory carryover), accumulating only the model-graph facts. When a
+    // model_id is given, save_safetensors_filtered tags the model entity with it.
     let mut facts = TribleSet::new();
     for (path, name) in files {
         let bytes = read_safetensors_file(path);
         eprintln!("[persist] ingesting {name} ({} bytes)...", bytes.len());
-        let frag = save_safetensors(&bytes, name, repo.storage_mut(), dtype)
-            .map_err(|e| anyhow::anyhow!("ingest {path:?}: {e}"))?;
+        let frag = crate::ingest::save_safetensors_filtered(
+            &bytes,
+            name,
+            repo.storage_mut(),
+            dtype,
+            |_| true,
+            model_id,
+        )
+        .map_err(|e| anyhow::anyhow!("ingest {path:?}: {e}"))?;
         facts += frag.into_facts();
     }
 
-    ws.commit(facts, "ingest model weights");
+    let msg = match model_id {
+        Some(id) => format!("ingest model {id}"),
+        None => "ingest model weights".to_string(),
+    };
+    ws.commit(facts, &msg);
     repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
     repo.close().map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
     Ok(())
@@ -164,7 +215,7 @@ pub fn persist_safetensors_file_filtered_to_pile(
 
     let bytes = read_safetensors_file(file);
     eprintln!("[persist] ingesting {entity_name} (filtered from {} bytes)...", bytes.len());
-    let frag = crate::ingest::save_safetensors_filtered(&bytes, entity_name, repo.storage_mut(), dtype, keep)
+    let frag = crate::ingest::save_safetensors_filtered(&bytes, entity_name, repo.storage_mut(), dtype, keep, None)
         .map_err(|e| anyhow::anyhow!("ingest {file:?}: {e}"))?;
 
     ws.commit(frag.into_facts(), "ingest model weights (filtered component)");
@@ -948,106 +999,6 @@ pub fn load_keymap_from_mary_branch_prefixed(
         anyhow::bail!("keymap empty after materializing from the mary branch");
     }
     Ok(keymap)
-}
-
-/// Consolidate ONE model's weights from its own `main`-branch pile into a shared
-/// target pile on the `mary` branch, tagging every model entity with `model_id`
-/// (the genealogy discriminator). Weight blobs transfer lazily by handle (no
-/// full materialization — safe for tens of GB); the model-graph facts are
-/// re-committed on `mary` with the `model_id` added. The read twin is
-/// [`load_keymap_from_mary_branch`]. Mirrors the `trible pile branch export`
-/// transfer path.
-#[cfg(feature = "import")]
-pub fn consolidate_into_mary(
-    target_pile: &Path,
-    source_pile: &Path,
-    model_id: &str,
-) -> anyhow::Result<()> {
-    use triblespace::core::repo;
-
-    // ---- SOURCE: model-graph facts + a reader + the main-branch meta handle ----
-    let mut src = Pile::open(source_pile)
-        .map_err(|e| anyhow::anyhow!("open source {source_pile:?}: {e:?}"))?;
-    src.refresh()
-        .map_err(|e| anyhow::anyhow!("source {source_pile:?} failed to load ({e:?})"))?;
-    let mut src_repo = Repository::new(src, SigningKey::generate(&mut rand::rngs::OsRng), TribleSet::new())
-        .map_err(|e| anyhow::anyhow!("src repo new: {e:?}"))?;
-    let src_main = src_repo
-        .lookup_branch("main")
-        .map_err(|e| anyhow::anyhow!("src lookup main: {e:?}"))?
-        .ok_or_else(|| anyhow::anyhow!("no 'main' branch in source {source_pile:?}"))?;
-    let mut src_ws = src_repo.pull(src_main).map_err(|e| anyhow::anyhow!("src pull: {e:?}"))?;
-    let src_head = src_ws
-        .head()
-        .ok_or_else(|| anyhow::anyhow!("source 'main' has no commits"))?;
-    let src_facts: TribleSet = src_ws
-        .checkout(ancestors(src_head))
-        .map_err(|e| anyhow::anyhow!("src checkout: {e:?}"))?
-        .facts()
-        .clone();
-    let src_meta = src_repo
-        .storage_mut()
-        .head(src_main)
-        .map_err(|e| anyhow::anyhow!("src head: {e:?}"))?
-        .ok_or_else(|| anyhow::anyhow!("source 'main' meta handle missing"))?;
-    let src_reader = src_repo
-        .storage_mut()
-        .reader()
-        .map_err(|e| anyhow::anyhow!("src reader: {e:?}"))?;
-
-    // ---- TARGET: transfer weight blobs, then commit tagged facts on `mary` ----
-    if !target_pile.exists() {
-        eprintln!("[consolidate] target {target_pile:?} does not exist — creating a NEW empty pile");
-        std::fs::File::create(target_pile)
-            .map_err(|e| anyhow::anyhow!("create target {target_pile:?}: {e}"))?;
-    }
-    let mut tgt = Pile::open(target_pile)
-        .map_err(|e| anyhow::anyhow!("open target {target_pile:?}: {e:?}"))?;
-    tgt.refresh()
-        .map_err(|e| anyhow::anyhow!("target {target_pile:?} failed to load ({e:?})"))?;
-    let mut tgt_repo = Repository::new(tgt, SigningKey::generate(&mut rand::rngs::OsRng), TribleSet::new())
-        .map_err(|e| anyhow::anyhow!("tgt repo new: {e:?}"))?;
-
-    // Copy every blob reachable from the source main branch (weights + graph)
-    // into the target storage — lazy, by handle, no full materialization.
-    let handles = repo::reachable(&src_reader, std::iter::once(src_meta.transmute()));
-    let mut n_blobs = 0usize;
-    for r in repo::transfer(&src_reader, tgt_repo.storage_mut(), handles) {
-        r.map_err(|e| anyhow::anyhow!("blob transfer: {e}"))?;
-        n_blobs += 1;
-    }
-
-    // Tag every model entity (each shard/component) with model_id.
-    let mut tagged = src_facts.clone();
-    let mut n_models = 0usize;
-    for (e, _n) in find!(
-        (e: Id, n: Inline<inlineencodings::Handle<blobencodings::LongString>>),
-        pattern!(&src_facts, [{ ?e @ crate::format::attrs::model_name: ?n }])
-    ) {
-        tagged += entity! { ExclusiveId::force_ref(&e) @ crate::format::attrs::model_id: model_id }.into_facts();
-        n_models += 1;
-    }
-    if n_models == 0 {
-        anyhow::bail!("no model entity (attrs::model_name) in source {source_pile:?}");
-    }
-
-    // Commit the tagged model graph onto the shared `mary` branch (created if absent).
-    let mary_bid = tgt_repo
-        .ensure_branch("mary", None)
-        .map_err(|e| anyhow::anyhow!("ensure 'mary' branch: {e:?}"))?;
-    let mut tgt_ws = tgt_repo.pull(mary_bid).map_err(|e| anyhow::anyhow!("tgt pull mary: {e:?}"))?;
-    tgt_ws.commit(
-        tagged,
-        &format!("consolidate model {model_id} ({n_models} entities, {n_blobs} blobs)"),
-    );
-    tgt_repo.push(&mut tgt_ws).map_err(|e| anyhow::anyhow!("tgt push: {e:?}"))?;
-
-    tgt_repo.close().map_err(|e| anyhow::anyhow!("close target: {e:?}"))?;
-    src_repo.close().map_err(|e| anyhow::anyhow!("close source: {e:?}"))?;
-    eprintln!(
-        "[consolidate] {source_pile:?} -> {target_pile:?}: model_id={model_id}, {n_models} entities, {n_blobs} blobs"
-    );
-    Ok(())
 }
 
 /// Construct a ready-to-encode `tokenizers::Tokenizer` from the tokenizer

@@ -8,14 +8,19 @@
 //! Bootstrap a model in one line:
 //!
 //! ```text
-//! mary import openai/clip-vit-base-patch32 --pile clip.pile
+//! # one model per pile (legacy, main branch):
 //! mary import ./my-model-dir --pile my.pile --dtype f16
+//! # many models in one shared MODEL_PILE, each addressable by --model-id:
+//! mary import openai/clip-vit-base-patch32 --pile models.pile --model-id clip_vit_base
+//! mary import HuggingFaceTB/SmolLM2-135M    --pile models.pile --model-id smollm2
 //! ```
 //!
 //! The source is either a HuggingFace model id (resolved from the local HF
 //! cache — run `huggingface-cli download <id>` first) or a local directory of
-//! `.safetensors` shards. The resulting pile is self-contained: no safetensors
-//! are needed to load the model again.
+//! `.safetensors` shards. With `--model-id`, the model becomes a proper entity
+//! on the pile's `mary` branch, so many models coexist in one pile (each loaded
+//! back by id) — no separate consolidation step: appending a model is just
+//! another import. The resulting pile is self-contained: no safetensors needed.
 
 use std::path::{Path, PathBuf};
 
@@ -38,10 +43,6 @@ struct Cli {
 enum Cmd {
     /// Import a model's safetensors weights into a pile (the durable weight store).
     Import(ImportArgs),
-    /// Consolidate per-model piles into one pile on a shared `mary` branch, each
-    /// model tagged by a `model_id` (the genealogy discriminator). Weight blobs
-    /// transfer lazily; the read side is `load_keymap_from_mary_branch`.
-    Consolidate(ConsolidateArgs),
     /// Load ONE model from a pile's `mary` branch by `model_id` and print its
     /// tensor count + a sample — a round-trip check of the consolidated store.
     Keys(KeysArgs),
@@ -60,18 +61,12 @@ struct ImportArgs {
     /// width the source used); `f16` halves the pile for 16-bit-native weights.
     #[arg(long, value_enum, default_value_t = Dtype::F32)]
     dtype: Dtype,
-}
-
-#[derive(Args)]
-struct ConsolidateArgs {
-    /// Target pile — the shared model pile. Models land on its `mary` branch
-    /// (the pile is created if absent).
+    /// Model id for a shared MODEL_PILE: the model becomes a proper entity
+    /// carrying this id on the pile's `mary` branch, so many models coexist in
+    /// one pile (each loadable by id). Omit for a legacy single-model pile
+    /// (`main` branch, untagged).
     #[arg(long)]
-    into: PathBuf,
-    /// One or more `model_id=source.pile` pairs. Each source model's weights are
-    /// consolidated onto the target `mary` branch, tagged with its `model_id`.
-    #[arg(value_parser = parse_model_source, required = true)]
-    models: Vec<(String, PathBuf)>,
+    model_id: Option<String>,
 }
 
 #[derive(Args)]
@@ -82,20 +77,6 @@ struct KeysArgs {
     /// The `model_id` to load from the pile's `mary` branch.
     #[arg(long)]
     model: String,
-}
-
-/// Parse a `model_id=source.pile` CLI argument.
-fn parse_model_source(s: &str) -> Result<(String, PathBuf), String> {
-    let (id, path) = s
-        .split_once('=')
-        .ok_or_else(|| format!("expected model_id=source.pile, got '{s}'"))?;
-    if id.is_empty() {
-        return Err(format!("empty model_id in '{s}'"));
-    }
-    if path.is_empty() {
-        return Err(format!("empty source pile in '{s}'"));
-    }
-    Ok((id.to_string(), PathBuf::from(path)))
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -116,7 +97,6 @@ impl From<Dtype> for LeafDtype {
 fn main() -> anyhow::Result<()> {
     match Cli::parse().cmd {
         Cmd::Import(a) => import(a),
-        Cmd::Consolidate(a) => consolidate(a),
         Cmd::Keys(a) => keys(a),
     }
 }
@@ -138,30 +118,30 @@ fn keys(a: KeysArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn consolidate(a: ConsolidateArgs) -> anyhow::Result<()> {
-    for (model_id, source) in &a.models {
-        mary::persist::consolidate_into_mary(&a.into, source, model_id)?;
-    }
-    eprintln!(
-        "mary consolidate: {} model(s) -> {} (mary branch)",
-        a.models.len(),
-        a.into.display()
-    );
-    Ok(())
-}
-
 fn import(a: ImportArgs) -> anyhow::Result<()> {
     let dir = resolve_source(&a.source)?;
-    eprintln!(
-        "mary import: {} -> {} ({} leaves)",
-        dir.display(),
-        a.pile.display(),
-        match a.dtype {
-            Dtype::F32 => "f32",
-            Dtype::F16 => "f16",
+    let dt = match a.dtype {
+        Dtype::F32 => "f32",
+        Dtype::F16 => "f16",
+    };
+    match &a.model_id {
+        Some(id) => {
+            eprintln!(
+                "mary import: {} -> {} ({dt} leaves, model_id={id} on the mary branch)",
+                dir.display(),
+                a.pile.display()
+            );
+            mary::persist::persist_model_to_pile(&dir, &a.pile, a.dtype.into(), id)?;
         }
-    );
-    persist_safetensors_to_pile(&dir, &a.pile, a.dtype.into())?;
+        None => {
+            eprintln!(
+                "mary import: {} -> {} ({dt} leaves, main branch)",
+                dir.display(),
+                a.pile.display()
+            );
+            persist_safetensors_to_pile(&dir, &a.pile, a.dtype.into())?;
+        }
+    }
     eprintln!("mary import: done — pile at {}", a.pile.display());
     Ok(())
 }

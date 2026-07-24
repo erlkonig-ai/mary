@@ -38,7 +38,7 @@ pub fn save_safetensors(
     blobs: &mut impl BlobStorePut,
     dtype: LeafDtype,
 ) -> Result<Fragment, Err> {
-    save_safetensors_filtered(bytes, model_name, blobs, dtype, |_| true)
+    save_safetensors_filtered(bytes, model_name, blobs, dtype, |_| true, None)
 }
 
 /// [`save_safetensors`] restricted to the tensors whose name passes `keep` —
@@ -52,6 +52,7 @@ pub fn save_safetensors_filtered(
     blobs: &mut impl BlobStorePut,
     dtype: LeafDtype,
     keep: impl Fn(&str) -> bool,
+    model_id: Option<&str>,
 ) -> Result<Fragment, Err> {
     let st = SafeTensors::deserialize(bytes)?;
     let mut members: Vec<Id> = Vec::new();
@@ -84,9 +85,16 @@ pub fn save_safetensors_filtered(
     }
     let mn = blobs.put::<LongString, _>(model_name.to_string())?;
     let model = entity! { _ @ attrs::model_name: mn, attrs::member*: members.iter() };
-    let model_id = model.root().expect("model root");
+    let model_root_id = model.root().expect("model root");
     facts += model.into_facts();
-    Ok(Fragment::rooted(model_id, facts))
+    // A caller-supplied model_id makes this a *proper* addressable entity: the
+    // discriminator that lets many models share one branch (one pile), which
+    // `load_keymap_from_mary_branch` filters on. Set intrinsically at creation.
+    if let Some(id) = model_id {
+        facts += entity! { ExclusiveId::force_ref(&model_root_id) @ crate::format::attrs::model_id: id }
+            .into_facts();
+    }
+    Ok(Fragment::rooted(model_root_id, facts))
 }
 
 fn read_string(blobs: &impl BlobStoreGet, h: Inline<inlineencodings::Handle<LongString>>) -> String {
