@@ -98,7 +98,7 @@ use cubecl::prelude::*;
 use cubecl::server::Handle;
 use half::f16;
 
-use burn::backend::wgpu::WgpuRuntime;
+use crate::nn::q4::Rt;
 
 use super::config as cfg;
 use crate::nn::q4::{self, f16_matvec, quantize_q4, Q4Linear};
@@ -752,7 +752,7 @@ impl QLinear {
                 assert_eq!(*in_dim % 32, 0);
                 let y_len = if swiglu_pairs { *out_dim / 2 } else { *out_dim };
                 unsafe {
-                    q8_matvec_kernel::launch_unchecked::<WgpuRuntime>(
+                    q8_matvec_kernel::launch_unchecked::<Rt>(
                         client,
                         CubeCount::new_1d(*out_dim as u32 / 8),
                         CubeDim::new_1d(8 * 32),
@@ -1170,7 +1170,7 @@ impl TemporalMetal {
         let arr = |h: &Handle, n: usize| unsafe { ArrayArg::from_raw_parts(h.clone(), n) };
 
         unsafe {
-            weighted_rms_kernel::launch_unchecked::<WgpuRuntime>(
+            weighted_rms_kernel::launch_unchecked::<Rt>(
                 c,
                 CubeCount::new_single(),
                 CubeDim::new_1d(256),
@@ -1186,7 +1186,7 @@ impl TemporalMetal {
             let l = &self.layers[i];
             l.qkv.forward(c, &self.xn, &self.qkvb);
             unsafe {
-                rope_cache_kernel::launch_unchecked::<WgpuRuntime>(
+                rope_cache_kernel::launch_unchecked::<Rt>(
                     c,
                     CubeCount::new_1d(d / 256),
                     CubeDim::new_1d(256),
@@ -1201,7 +1201,7 @@ impl TemporalMetal {
                     HALF,
                     MAX_SEQ as u32,
                 );
-                attn_partial_kernel::launch_unchecked::<WgpuRuntime>(
+                attn_partial_kernel::launch_unchecked::<Rt>(
                     c,
                     CubeCount::new_1d(HEADS * N_CHUNKS),
                     CubeDim::new_1d(HEAD_DIM),
@@ -1218,7 +1218,7 @@ impl TemporalMetal {
                     N_CHUNKS,
                     CHUNK_CAP,
                 );
-                attn_combine_kernel::launch_unchecked::<WgpuRuntime>(
+                attn_combine_kernel::launch_unchecked::<Rt>(
                     c,
                     CubeCount::new_1d(HEADS),
                     CubeDim::new_1d(HEAD_DIM),
@@ -1232,7 +1232,7 @@ impl TemporalMetal {
             }
             l.o.forward(c, &self.attn, &self.delta);
             unsafe {
-                add_rms_kernel::launch_unchecked::<WgpuRuntime>(
+                add_rms_kernel::launch_unchecked::<Rt>(
                     c,
                     CubeCount::new_single(),
                     CubeDim::new_1d(256),
@@ -1255,7 +1255,7 @@ impl TemporalMetal {
                 None => (&self.out_norm_w, &self.hidden),
             };
             unsafe {
-                add_rms_kernel::launch_unchecked::<WgpuRuntime>(
+                add_rms_kernel::launch_unchecked::<Rt>(
                     c,
                     CubeCount::new_single(),
                     CubeDim::new_1d(256),

@@ -47,9 +47,16 @@ use cubecl::prelude::*;
 use cubecl::server::Handle;
 use half::f16;
 
-use burn::backend::wgpu::WgpuRuntime;
 
-pub type Client = cubecl::client::ComputeClient<WgpuRuntime>;
+// Backend selection. `cuda-backend` swaps the whole q4 lane onto CUDA; the
+// default stays wgpu/Metal. burn re-exports the same WgpuRuntime type
+// (burn-wgpu lib.rs:17), so naming cubecl directly drops burn out of this
+// module entirely.
+#[cfg(feature = "cuda-backend")]
+pub use cubecl::cuda::CudaRuntime as Rt;
+#[cfg(not(feature = "cuda-backend"))]
+pub use cubecl::wgpu::WgpuRuntime as Rt;
+pub type Client = cubecl::client::ComputeClient<Rt>;
 
 /// Quantization group size (weights per f16 scale), along the input dim.
 pub const GROUP: usize = 32;
@@ -386,7 +393,7 @@ impl Q4Linear {
         assert_eq!(self.in_dim % GROUP, 0);
         let y_len = if swiglu_pairs { self.out_dim / 2 } else { self.out_dim };
         unsafe {
-            q4_matvec_kernel::launch_unchecked::<WgpuRuntime>(
+            q4_matvec_kernel::launch_unchecked::<Rt>(
                 client,
                 CubeCount::new_1d(self.out_dim as u32 / ROWS_PER_CUBE),
                 CubeDim::new_1d(ROWS_PER_CUBE * THREADS_PER_ROW),
@@ -439,7 +446,7 @@ fn f16_launch(
     assert_eq!(in_dim % GROUP, 0); // implies the vec4 loads' in_dim % 8 == 0
     let y_len = if swiglu_pairs { out_dim / 2 } else { out_dim };
     unsafe {
-        f16_matvec_kernel::launch_unchecked::<WgpuRuntime>(
+        f16_matvec_kernel::launch_unchecked::<Rt>(
             client,
             CubeCount::new_1d(out_dim as u32 / ROWS_PER_CUBE),
             CubeDim::new_1d(ROWS_PER_CUBE * THREADS_PER_ROW),
@@ -458,8 +465,7 @@ fn f16_launch(
 /// queue) burn's `Metal` backends use, so buffers and timings interleave.
 pub fn client_for_default_device() -> Client {
     use cubecl::Runtime;
-    let device: burn::backend::wgpu::WgpuDevice = Default::default();
-    WgpuRuntime::client(&device)
+    Rt::client(&Default::default())
 }
 
 /// Alias a pile blob's mmap'd bytes straight onto the Metal device as a

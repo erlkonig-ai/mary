@@ -417,6 +417,18 @@ pub fn load_aliased_loader_from_pile(
 /// resolve on demand through the pile mmap, and `view_f32` serves zero-copy
 /// slices). The one loader every PersonaPlex probe and the realtime
 /// pipeline share.
+/// Non-macOS sibling of [`personaplex_loader`]. There is no Metal aliasing
+/// seam off macOS, so weights are materialized through `WeightLoader::Pile`
+/// instead: with an empty `f16_prefix` the split predicate routes every leaf to
+/// the f32 side, which is exactly the fallback the macOS path already takes
+/// when aliasing is refused. Slower to load, identical semantics.
+#[cfg(all(feature = "qwen3tts", not(target_os = "macos")))]
+pub fn personaplex_loader(
+    pile_path: &Path,
+) -> anyhow::Result<crate::nn::weight_loader::WeightLoader> {
+    load_aliased_loader_from_pile(pile_path, "")
+}
+
 #[cfg(all(feature = "qwen3tts", target_os = "macos"))]
 pub fn personaplex_loader(
     pile_path: &Path,
