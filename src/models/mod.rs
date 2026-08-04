@@ -4,6 +4,10 @@
 
 pub mod f5;
 
+// Kimi K3 (Moonshot) -- 2.78 T-param hybrid-attention MoE, landing primitive
+// by primitive. Ungated: pure Burn tensor ops, no dependency of its own.
+pub mod kimi_k3;
+
 // Qwen2.5-VL text backbone (BiQwen2_5 / nomic-embed-multimodal-7b). Reuses
 // gemma's RoPE table, so it rides the `gemma` feature.
 #[cfg(feature = "gemma")]

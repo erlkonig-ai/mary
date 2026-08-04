@@ -159,6 +159,15 @@ local-model = ["gemma"]
 # probe with `--features dev-tools`.
 # The probes compare against safetensors oracles, so this pulls `import`.
 dev-tools = ["import"]
+
+# Kimi K3 primitive gates (`kimi_situ_gate`, ...). The `mary::models::kimi_k3`
+# module itself is unconditional -- pure Burn tensor ops, no new dependency --
+# so this feature exists only for the gates: burn-ndarray gives the oracle
+# comparison one deterministic CPU arithmetic that is not the GPU's.
+kimi-k3 = ["burn/ndarray", "dep:burn-ndarray"]
+# ... and the GB10/sm_121 lane on top, so a primitive is also checked on the
+# backend it will actually run on here. Needs the CUDA toolkit present.
+kimi-k3-cuda = ["kimi-k3", "burn/cuda"]
 # The `mary` CLI — the import front door. Behind `import` (safetensors + clap),
 # out of the default library build.
 [[bin]]
@@ -520,3 +529,10 @@ required-features = ["import"]
 [[bin]]
 name = "voxtral_listen"
 required-features = ["voxtral"]
+
+# Kimi K3: the `situ` activation against oracle vectors captured from the
+# shipped `SituAndMul`. CPU lane only under `kimi-k3`; add `kimi-k3-cuda` for
+# the GPU lane as well.
+[[bin]]
+name = "kimi_situ_gate"
+required-features = ["kimi-k3"]
