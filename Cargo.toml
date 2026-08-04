@@ -536,3 +536,16 @@ required-features = ["voxtral"]
 [[bin]]
 name = "mxfp4_gate"
 required-features = ["mxfp4"]
+
+# How far the bit-exact transcode reaches: sweep the E8M0 exponent span of a
+# checkpoint's scale planes (reads scales only, never a weight byte).
+[[bin]]
+name = "mxfp4_span_sweep"
+required-features = ["mxfp4"]
+
+# Which block-scaled FP4 tensor-core shapes THIS GPU reports (MXFP4 ue8m0
+# scale_vec::2X vs NVFP4 e4m3 scale_vec::4X) — the transcode's target, asked
+# rather than assumed.
+[[bin]]
+name = "mxfp4_mma_probe"
+required-features = ["mxfp4", "cuda-backend"]
