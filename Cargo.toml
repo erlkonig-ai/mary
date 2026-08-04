@@ -80,12 +80,20 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 # the realtime lane never instantiates a burn backend (RealtimePipeline has no
 # B: Backend generic, TemporalMetal is raw cubecl, DepthFast/Mimi are CPU).
 cuda-backend = ["q4", "cubecl?/cuda"]
+# Kimi-K3 (mary::models::k3) - the 2.78 T-param MoE vision-language model.
+# Currently the loading skeleton only: config parsing plus the checkpoint
+# name->module-slot layout. serde/serde_json are unconditional deps, so this
+# feature adds nothing to the dependency graph; it only gates compilation.
+k3 = []
 # Safetensors → pile IMPORT support. The ONLY feature that compiles a
 # safetensors reader (`WeightLoader::SingleFile`/`MultiShard`,
 # `ingest::save_safetensors`, `persist::persist_safetensors_to_pile`, the
 # `load_*_from_hf` constructors). Importer binaries and parity gates require
 # it; every runtime/inference/serve path loads from piles and builds without it.
-import = ["dep:safetensors", "dep:clap", "dep:hf-hub", "dep:gguf-rs-lib", "dep:zip"]
+# Owns memmap2: every importer reads its shards through an mmap (a K3 shard
+# is 17 GB and there are 96 of them), and `--features import` on its own did
+# not link one before.
+import = ["dep:safetensors", "dep:clap", "dep:hf-hub", "dep:gguf-rs-lib", "dep:zip", "dep:memmap2"]
 flux = ["dep:image", "dep:tokenizers"]
 # SmolVLA (mary::models::smolvla) — vision-language-action; SigLIP vision +
 # tokenizer + flow-matching sampler. Same dep surface as flux.
@@ -169,6 +177,13 @@ dev-tools = ["import"]
 [[bin]]
 name = "mary"
 required-features = ["import"]
+
+# Totality gate for the K3 checkpoint layout: walks the real safetensors headers
+# and asserts the tensor-name/module-slot mapping is a bijection. Header-only -
+# it reads no tensor data - but it needs a safetensors reader, hence `import`.
+[[bin]]
+name = "k3_layout_gate"
+required-features = ["k3", "import"]
 
 # Hand-run dev probes / parity gates (f5-only deps) — kept out of the default
 # (library-only) build behind `dev-tools`.

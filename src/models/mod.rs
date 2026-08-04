@@ -28,3 +28,9 @@ pub mod personaplex;
 
 #[cfg(feature = "voxtral")]
 pub mod voxtral;
+
+// Kimi-K3 (2.78 T MoE vision-language). Loading skeleton only so far: config +
+// checkpoint-name -> module-slot layout, no forward pass. Pure serde: no backend,
+// no new dependencies.
+#[cfg(feature = "k3")]
+pub mod k3;
