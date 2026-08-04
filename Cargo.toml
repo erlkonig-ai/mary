@@ -531,8 +531,8 @@ required-features = ["qwen3tts", "q4"]
 
 [[bin]]
 name = "personaplex_listen"
-required-features = ["personaplex", "q4", "tokenizer"]
+required-features = ["personaplex", "q4"]
 
 [[bin]]
 name = "spm_graph_roundtrip"
-required-features = ["personaplex", "tokenizer"]
+required-features = ["personaplex"]

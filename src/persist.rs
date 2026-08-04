@@ -1353,7 +1353,7 @@ fn checkout_mary_branch(
 /// because the blob reader is an associated type and `BlobStoreGet` is not
 /// dyn-compatible — more machinery than the ~25 duplicated lines are worth,
 /// and it would put the proven reader at risk for no behavioural gain.
-#[cfg(feature = "tokenizer")]
+#[cfg(feature = "qwen3tts")]
 pub fn load_spm_tokenizer_from_pile(
     pile_path: &Path,
 ) -> anyhow::Result<crate::models::personaplex::spm::SpmTokenizer> {
@@ -1415,7 +1415,7 @@ pub fn load_spm_tokenizer_from_pile(
 /// Refuses to write a second tokenizer into a pile that already has one:
 /// `find_tokenizer` returns a single node, so two would make which-one-you-get
 /// depend on iteration order.
-#[cfg(feature = "tokenizer")]
+#[cfg(feature = "qwen3tts")]
 pub fn ingest_spm_tokenizer(
     pile_path: &Path,
     model_file: &Path,
