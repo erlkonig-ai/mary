@@ -28,3 +28,9 @@ pub mod personaplex;
 
 #[cfg(feature = "voxtral")]
 pub mod voxtral;
+
+// Kimi K3 (`kimi_linear`) — the KDA linear-attention layers. Pure-Rust, no
+// extra dependencies; the feature exists only so the default build stays a
+// library with no binaries, per the `dev-tools` policy in Cargo.toml.
+#[cfg(feature = "kimi-k3")]
+pub mod kimi_k3;
