@@ -21,7 +21,8 @@ use std::fs;
 /// Load a safetensors file from disk, returning the raw bytes.
 #[cfg(feature = "import")]
 pub fn read_safetensors_file(path: &Path) -> Vec<u8> {
-    fs::read(path).unwrap_or_else(|e| panic!("Failed to read safetensors file {}: {}", path.display(), e))
+    fs::read(path)
+        .unwrap_or_else(|e| panic!("Failed to read safetensors file {}: {}", path.display(), e))
 }
 
 /// Extract a named tensor from a SafeTensors container, converting to f32.
@@ -96,19 +97,31 @@ pub fn load_tensor<B: Backend, const D: usize>(
 
 /// Load a 1D tensor.
 #[cfg(feature = "import")]
-pub fn load_tensor_1d<B: Backend>(st: &SafeTensors, name: &str, device: &B::Device) -> Tensor<B, 1> {
+pub fn load_tensor_1d<B: Backend>(
+    st: &SafeTensors,
+    name: &str,
+    device: &B::Device,
+) -> Tensor<B, 1> {
     load_tensor::<B, 1>(st, name, device)
 }
 
 /// Load a 2D tensor.
 #[cfg(feature = "import")]
-pub fn load_tensor_2d<B: Backend>(st: &SafeTensors, name: &str, device: &B::Device) -> Tensor<B, 2> {
+pub fn load_tensor_2d<B: Backend>(
+    st: &SafeTensors,
+    name: &str,
+    device: &B::Device,
+) -> Tensor<B, 2> {
     load_tensor::<B, 2>(st, name, device)
 }
 
 /// Load a 4D tensor (for conv weights).
 #[cfg(feature = "import")]
-pub fn load_tensor_4d<B: Backend>(st: &SafeTensors, name: &str, device: &B::Device) -> Tensor<B, 4> {
+pub fn load_tensor_4d<B: Backend>(
+    st: &SafeTensors,
+    name: &str,
+    device: &B::Device,
+) -> Tensor<B, 4> {
     load_tensor::<B, 4>(st, name, device)
 }
 
@@ -281,7 +294,13 @@ impl AliasedPile {
         f32_reader: triblespace::core::repo::pile::PileReader,
         device: burn::backend::wgpu::WgpuDevice,
     ) -> Self {
-        Self { f16, f32, f16_reader, f32_reader, device }
+        Self {
+            f16,
+            f32,
+            f16_reader,
+            f32_reader,
+            device,
+        }
     }
 
     /// Number of half-width / exact leaves indexed.
@@ -386,7 +405,10 @@ impl AliasedPile {
     fn leaf(
         &self,
         name: &str,
-    ) -> Option<(crate::ingest::LeafHandles, &triblespace::core::repo::pile::PileReader)> {
+    ) -> Option<(
+        crate::ingest::LeafHandles,
+        &triblespace::core::repo::pile::PileReader,
+    )> {
         self.f32
             .get(name)
             .map(|h| (*h, &self.f32_reader))
@@ -401,7 +423,8 @@ impl AliasedPile {
 #[cfg(all(any(feature = "qwen3tts", feature = "voxtral"), target_os = "macos"))]
 pub(crate) fn same_type<T: 'static, U: 'static>(t: T) -> U {
     let any: Box<dyn std::any::Any> = Box::new(t);
-    *any.downcast::<U>().expect("same_type called across distinct types")
+    *any.downcast::<U>()
+        .expect("same_type called across distinct types")
 }
 
 /// Upload f16 leaf bytes to `B` (an f16 backend) DIRECTLY — no f32
@@ -469,7 +492,9 @@ impl WeightLoader {
     /// Build the runtime loader from a persisted pile: materialize the union
     /// keymap (see [`crate::persist::load_keymap_from_pile`]).
     pub fn from_pile(pile_path: &Path) -> anyhow::Result<Self> {
-        Ok(WeightLoader::Pile(crate::persist::load_keymap_from_pile(pile_path)?))
+        Ok(WeightLoader::Pile(crate::persist::load_keymap_from_pile(
+            pile_path,
+        )?))
     }
 
     pub fn load_tensor<B: Backend, const D: usize>(
@@ -576,9 +601,7 @@ impl WeightLoader {
     pub fn has_weight(&self, name: &str) -> bool {
         match self {
             #[cfg(feature = "import")]
-            WeightLoader::SingleFile(loader) => {
-                loader.tensor_names().iter().any(|n| n == name)
-            }
+            WeightLoader::SingleFile(loader) => loader.tensor_names().iter().any(|n| n == name),
             #[cfg(feature = "import")]
             WeightLoader::MultiShard(loader) => loader.has_weight(name),
             WeightLoader::Pile(map) => map.contains_key(name),

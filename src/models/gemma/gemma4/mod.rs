@@ -11,14 +11,14 @@
 //! - Logit softcapping via Burn's attention kernel
 //! - GELU (pytorch tanh) activation throughout
 
-pub mod config;
-pub mod layers;
-pub mod decoder;
-pub mod lm;
-pub mod weights;
-pub mod vision;
-pub mod preprocess;
 pub mod audio;
-pub mod audio_preprocess;
 pub mod audio_load;
+pub mod audio_preprocess;
+pub mod config;
+pub mod decoder;
 pub mod hear;
+pub mod layers;
+pub mod lm;
+pub mod preprocess;
+pub mod vision;
+pub mod weights;

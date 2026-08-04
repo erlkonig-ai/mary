@@ -29,8 +29,10 @@
 use mary::models::f5::wav;
 use mary::models::voxtral::config::*;
 use mary::models::voxtral::fast::RealtimeTranscriber;
-use mary::models::voxtral::pipeline::{Transcriber, SttPipeline, StreamedToken, StreamingTranscriber};
-use mary::nn::backend::{B, BFused, BFusedHalf, BHalf};
+use mary::models::voxtral::pipeline::{
+    StreamedToken, StreamingTranscriber, SttPipeline, Transcriber,
+};
+use mary::nn::backend::{BFused, BFusedHalf, BHalf, B};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -64,7 +66,9 @@ fn main() -> anyhow::Result<()> {
     set_interactive_qos();
     let argv: Vec<String> = std::env::args().collect();
     let arg = |flag: &str| -> Option<String> {
-        argv.iter().position(|a| a == flag).map(|i| argv[i + 1].clone())
+        argv.iter()
+            .position(|a| a == flag)
+            .map(|i| argv[i + 1].clone())
     };
     let flag = |name: &str| argv.iter().any(|a| a == name);
 
@@ -88,7 +92,10 @@ fn main() -> anyhow::Result<()> {
     let lane = arg("--lane").unwrap_or_else(|| "half".into());
 
     let dev = Default::default();
-    eprintln!("[listen] loading stt from {:?} (lane {lane}) ...", args.pile);
+    eprintln!(
+        "[listen] loading stt from {:?} (lane {lane}) ...",
+        args.pile
+    );
     let t0 = std::time::Instant::now();
     // Sibling-aware: when `<stem>_f16.pile` sits next to the pile (derived by
     // `voxtral_persist --f16-derive`), the half lane uploads its f16 leaves at
@@ -100,31 +107,52 @@ fn main() -> anyhow::Result<()> {
         "raw" => {
             let stt = Transcriber::<B>::load(&loader, &args.tekken, max_tokens, &dev)?;
             drop(loader);
-            eprintln!("[listen] loaded in {:.1}s; delay {} ms", t0.elapsed().as_secs_f64(), args.delay_ms);
+            eprintln!(
+                "[listen] loaded in {:.1}s; delay {} ms",
+                t0.elapsed().as_secs_f64(),
+                args.delay_ms
+            );
             go(&stt, &args)
         }
         "fused" => {
             let stt = Transcriber::<BFused>::load(&loader, &args.tekken, max_tokens, &dev)?;
             drop(loader);
-            eprintln!("[listen] loaded in {:.1}s; delay {} ms", t0.elapsed().as_secs_f64(), args.delay_ms);
+            eprintln!(
+                "[listen] loaded in {:.1}s; delay {} ms",
+                t0.elapsed().as_secs_f64(),
+                args.delay_ms
+            );
             go(&stt, &args)
         }
         "fold" => {
             let stt = RealtimeTranscriber::<BFused>::load(&loader, &args.tekken, max_tokens, &dev)?;
             drop(loader);
-            eprintln!("[listen] loaded in {:.1}s; delay {} ms", t0.elapsed().as_secs_f64(), args.delay_ms);
+            eprintln!(
+                "[listen] loaded in {:.1}s; delay {} ms",
+                t0.elapsed().as_secs_f64(),
+                args.delay_ms
+            );
             go(&stt, &args)
         }
         "half" => {
-            let stt = RealtimeTranscriber::<BFusedHalf>::load(&loader, &args.tekken, max_tokens, &dev)?;
+            let stt =
+                RealtimeTranscriber::<BFusedHalf>::load(&loader, &args.tekken, max_tokens, &dev)?;
             drop(loader);
-            eprintln!("[listen] loaded in {:.1}s; delay {} ms", t0.elapsed().as_secs_f64(), args.delay_ms);
+            eprintln!(
+                "[listen] loaded in {:.1}s; delay {} ms",
+                t0.elapsed().as_secs_f64(),
+                args.delay_ms
+            );
             go(&stt, &args)
         }
         "rawhalf" => {
             let stt = RealtimeTranscriber::<BHalf>::load(&loader, &args.tekken, max_tokens, &dev)?;
             drop(loader);
-            eprintln!("[listen] loaded in {:.1}s; delay {} ms", t0.elapsed().as_secs_f64(), args.delay_ms);
+            eprintln!(
+                "[listen] loaded in {:.1}s; delay {} ms",
+                t0.elapsed().as_secs_f64(),
+                args.delay_ms
+            );
             go(&stt, &args)
         }
         other => anyhow::bail!("unknown --lane {other} (raw|fused|fold|half|rawhalf)"),
@@ -151,7 +179,11 @@ fn go<B: burn::prelude::Backend, O: SttPipeline<B>>(stt: &O, args: &Args) -> any
         eprintln!(
             "[listen] streaming {wav_path} ({:.1}s) in {chunk_ms} ms chunks{}",
             audio.len() as f32 / SAMPLE_RATE as f32,
-            if args.fast { " (unpaced)" } else { " (real-time paced)" }
+            if args.fast {
+                " (unpaced)"
+            } else {
+                " (real-time paced)"
+            }
         );
         // warm the pipeline shapes (JIT/autotune) on the silence prefix
         let toks = stream.push(&[]);
@@ -203,7 +235,10 @@ fn go<B: burn::prelude::Backend, O: SttPipeline<B>>(stt: &O, args: &Args) -> any
         #[cfg(feature = "listen")]
         return mic_mode(stt, args.delay_ms, args.mic_device.clone());
         #[cfg(not(feature = "listen"))]
-        anyhow::bail!("mic mode ({:?}) requires --features listen", args.mic_device);
+        anyhow::bail!(
+            "mic mode ({:?}) requires --features listen",
+            args.mic_device
+        );
     }
 
     anyhow::bail!("pass --wav <file> or --mic (mic requires --features voxtral,listen)");
@@ -258,7 +293,8 @@ fn word_accuracy(got: &str, want: &str) -> (f32, usize, usize) {
     let mut dp = vec![0usize; (n + 1) * (m + 1)];
     for i in 1..=n {
         for j in 1..=m {
-            dp[i * (m + 1) + j] = if a[i - 1].trim_matches(|c: char| !c.is_alphanumeric())
+            dp[i * (m + 1) + j] = if a[i - 1]
+                .trim_matches(|c: char| !c.is_alphanumeric())
                 .eq_ignore_ascii_case(b[j - 1].trim_matches(|c: char| !c.is_alphanumeric()))
             {
                 dp[(i - 1) * (m + 1) + j - 1] + 1

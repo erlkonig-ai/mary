@@ -63,21 +63,28 @@ fn main() {
     let chat = format!("<bos><|turn>user\n{PROMPT}<turn|>\n<|turn>model\n");
 
     // ── Path 1: direct safetensors ─────────────────────────────────────────
-    eprintln!("[safetensors] loading {MODEL_ID} from {} shard(s)...", paths.len());
-    let lm_safe = GemmaLM::<B>::load(config.clone(), &paths, Path::new(&tokenizer_path), device.clone());
+    eprintln!(
+        "[safetensors] loading {MODEL_ID} from {} shard(s)...",
+        paths.len()
+    );
+    let lm_safe = GemmaLM::<B>::load(
+        config.clone(),
+        &paths,
+        Path::new(&tokenizer_path),
+        device.clone(),
+    );
     let ids_safe = lm_safe.complete_ids(&chat, MAX_NEW);
     let text_safe = lm_safe.decode(&ids_safe);
     drop(lm_safe);
 
     // ── Persist to a TEMP pile FILE on disk ────────────────────────────────
-    let pile_path = std::env::temp_dir().join(format!(
-        "mary_gemma_persist_{}.pile",
-        std::process::id()
-    ));
+    let pile_path =
+        std::env::temp_dir().join(format!("mary_gemma_persist_{}.pile", std::process::id()));
     // Start clean if a stale file is lying around.
     let _ = std::fs::remove_file(&pile_path);
     eprintln!("[persist] writing weights → {pile_path:?} ...");
-    persist_safetensors_to_pile(snapshot_dir, &pile_path, mary::ingest::LeafDtype::F16).expect("persist to pile");
+    persist_safetensors_to_pile(snapshot_dir, &pile_path, mary::ingest::LeafDtype::F16)
+        .expect("persist to pile");
     let pile_size = std::fs::metadata(&pile_path).unwrap().len();
     eprintln!(
         "[persist] pile is {} bytes ({:.2} GiB) on disk.",
@@ -88,9 +95,17 @@ fn main() {
     // ── Path 2: load from JUST the pile FILE (fresh Pile::open) ────────────
     eprintln!("[pile] loading keymap from the pile file (no safetensors)...");
     let keymap = load_keymap_from_pile(&pile_path).expect("load keymap from pile");
-    eprintln!("[pile] materialized {} tensors from the pile file.", keymap.len());
+    eprintln!(
+        "[pile] materialized {} tensors from the pile file.",
+        keymap.len()
+    );
 
-    let lm_pile = GemmaLM::<B>::from_keymap(config.clone(), keymap, Path::new(&tokenizer_path), device.clone());
+    let lm_pile = GemmaLM::<B>::from_keymap(
+        config.clone(),
+        keymap,
+        Path::new(&tokenizer_path),
+        device.clone(),
+    );
     let ids_pile = lm_pile.complete_ids(&chat, MAX_NEW);
     let text_pile = lm_pile.decode(&ids_pile);
 

@@ -51,9 +51,16 @@ fn main() {
             content: "list files in the current directory in long format".into(),
         },
     ];
-    let params = LocalGenParams { max_tokens: 24, stop: vec!["\n".into()], ..Default::default() };
+    let params = LocalGenParams {
+        max_tokens: 24,
+        stop: vec!["\n".into()],
+        ..Default::default()
+    };
 
     let g = engine.generate(&turns, &params).expect("generate");
     println!("command: {:?}", g.text);
-    println!("prompt_tokens={} completion_tokens={}", g.prompt_tokens, g.completion_tokens);
+    println!(
+        "prompt_tokens={} completion_tokens={}",
+        g.prompt_tokens, g.completion_tokens
+    );
 }

@@ -20,11 +20,17 @@ use std::path::Path;
 
 const PILE: &str = "models/smolvla.pile";
 const TOKENIZER: &str = concat!(env!("HOME"), "/.cache/huggingface/hub/models--HuggingFaceTB--SmolVLM2-500M-Video-Instruct/snapshots/7b375e1b73b11138ff12fe22c8f2822d8fe03467/tokenizer.json");
-const JOINTS: [&str; 9] = ["head_x", "head_y", "head_z", "roll", "pitch", "yaw", "body_yaw", "ant_l", "ant_r"];
+const JOINTS: [&str; 9] = [
+    "head_x", "head_y", "head_z", "roll", "pitch", "yaw", "body_yaw", "ant_l", "ant_r",
+];
 
 fn main() {
-    let img_path = std::env::args().nth(1).expect("usage: smolvla_infer <image> <instruction>");
-    let instruction = std::env::args().nth(2).expect("usage: smolvla_infer <image> <instruction>");
+    let img_path = std::env::args()
+        .nth(1)
+        .expect("usage: smolvla_infer <image> <instruction>");
+    let instruction = std::env::args()
+        .nth(2)
+        .expect("usage: smolvla_infer <image> <instruction>");
     let dev: WgpuDevice = Default::default();
 
     // image → [1,3,H,W] in [0,1] → resize-with-pad + normalize
@@ -63,7 +69,10 @@ fn main() {
     let a = actions.into_data().to_vec::<f32>().unwrap(); // 50×32 row-major
     println!("\nSmolVLA · \"{instruction}\" · {img_path}");
     println!("action chunk: 50 poses × 32 dims (expressive 9 shown)\n");
-    println!("  {:>9} {:>9} {:>9} {:>9}", "joint", "pose[0]", "pose[24]", "pose[49]");
+    println!(
+        "  {:>9} {:>9} {:>9} {:>9}",
+        "joint", "pose[0]", "pose[24]", "pose[49]"
+    );
     for (j, name) in JOINTS.iter().enumerate() {
         let at = |p: usize| a[p * 32 + j];
         println!("  {name:>9} {:>9.4} {:>9.4} {:>9.4}", at(0), at(24), at(49));

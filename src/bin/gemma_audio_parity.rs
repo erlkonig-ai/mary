@@ -40,7 +40,9 @@ use std::path::Path;
 type B = Wgpu;
 
 fn arg(args: &[String], k: &str) -> Option<String> {
-    args.iter().position(|s| s == k).map(|i| args[i + 1].clone())
+    args.iter()
+        .position(|s| s == k)
+        .map(|i| args[i + 1].clone())
 }
 
 /// Read a golden .bin: u32 LE ndim, u32 dims..., f32 LE data.
@@ -93,12 +95,19 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let model_dir = arg(&args, "--model-dir").expect("need --model-dir <hf snapshot dir>");
     let wav_dir = arg(&args, "--wavs").unwrap_or_else(|| "/tmp/gemma_audio_work/wavs".into());
-    let golden_dir = arg(&args, "--goldens").unwrap_or_else(|| "/tmp/gemma_audio_work/goldens".into());
-    let threshold: f64 = arg(&args, "--threshold").and_then(|s| s.parse().ok()).unwrap_or(0.999);
+    let golden_dir =
+        arg(&args, "--goldens").unwrap_or_else(|| "/tmp/gemma_audio_work/goldens".into());
+    let threshold: f64 = arg(&args, "--threshold")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.999);
 
     let device = WgpuDevice::default();
     let config = Gemma4Config::load(&Path::new(&model_dir).join("config.json"));
-    let audio_cfg = config.audio_config.as_ref().expect("model has no audio_config").clone();
+    let audio_cfg = config
+        .audio_config
+        .as_ref()
+        .expect("model has no audio_config")
+        .clone();
 
     // Tower + embedder from the SAME checkpoint the goldens came from.
     let mut shard_paths: Vec<String> = std::fs::read_dir(&model_dir)
@@ -108,8 +117,14 @@ fn main() {
         .filter(|p| p.ends_with(".safetensors"))
         .collect();
     shard_paths.sort();
-    eprintln!("Loading tower + embedder from {} shard(s)...", shard_paths.len());
-    let shard_data: Vec<Vec<u8>> = shard_paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    eprintln!(
+        "Loading tower + embedder from {} shard(s)...",
+        shard_paths.len()
+    );
+    let shard_data: Vec<Vec<u8>> = shard_paths
+        .iter()
+        .map(|p| std::fs::read(p).unwrap())
+        .collect();
     let shards: Vec<SafeTensors> = shard_data
         .iter()
         .map(|d| SafeTensors::deserialize(d).unwrap())
@@ -137,15 +152,23 @@ fn main() {
     let mut all_pass = true;
     println!("stage thresholds: cos >= {threshold}\n");
     for wav in &wavs {
-        let name = Path::new(wav).file_stem().unwrap().to_string_lossy().to_string();
-        let g = |suffix: &str| read_bin(&Path::new(&golden_dir).join(format!("{name}.{suffix}.bin")));
+        let name = Path::new(wav)
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let g =
+            |suffix: &str| read_bin(&Path::new(&golden_dir).join(format!("{name}.{suffix}.bin")));
 
         let wave = load_audio_16k_mono(Path::new(wav)).unwrap();
         println!("== {name} ({:.2}s) ==", wave.len() as f32 / 16000.0);
 
         // --- Stage 1: features ---
         let (feat, mask, n_frames) = fe.extract(&wave);
-        assert!(mask.iter().all(|&m| m), "{name}: padded frames in mary extract");
+        assert!(
+            mask.iter().all(|&m| m),
+            "{name}: padded frames in mary extract"
+        );
         let (g_feat, g_fdims) = g("features");
         assert_eq!(
             (n_frames, fe.feature_size),
@@ -157,41 +180,62 @@ fn main() {
         all_pass &= pass;
         println!(
             "  features [{n_frames}x{}]  cos={:.7}  max|d|={:.3e}  rmse={:.3e}  {}",
-            fe.feature_size, s.cos, s.max_abs, s.rmse, if pass { "PASS" } else { "FAIL" }
+            fe.feature_size,
+            s.cos,
+            s.max_abs,
+            s.rmse,
+            if pass { "PASS" } else { "FAIL" }
         );
 
         // --- Stage 2: tower on GOLDEN features (isolated) ---
-        let gf = Tensor::<B, 1>::from_floats(&g_feat[..], &device).reshape([1, g_fdims[0], g_fdims[1]]);
+        let gf =
+            Tensor::<B, 1>::from_floats(&g_feat[..], &device).reshape([1, g_fdims[0], g_fdims[1]]);
         let tower_out = tower.forward(gf);
         let [_, t4, hid] = tower_out.dims();
         let ours: Vec<f32> = tower_out.clone().to_data().to_vec().unwrap();
         let (g_tower, g_tdims) = g("tower");
-        assert_eq!((t4, hid), (g_tdims[0], g_tdims[1]), "{name}: tower shape mismatch");
+        assert_eq!(
+            (t4, hid),
+            (g_tdims[0], g_tdims[1]),
+            "{name}: tower shape mismatch"
+        );
         let s = compare(&ours, &g_tower);
         let pass = s.cos >= threshold;
         all_pass &= pass;
         println!(
             "  tower    [{t4}x{hid}]  cos={:.7}  max|d|={:.3e}  rmse={:.3e}  {}",
-            s.cos, s.max_abs, s.rmse, if pass { "PASS" } else { "FAIL" }
+            s.cos,
+            s.max_abs,
+            s.rmse,
+            if pass { "PASS" } else { "FAIL" }
         );
 
         // --- Stage 3: embedder on GOLDEN tower output (isolated) ---
-        let gt = Tensor::<B, 1>::from_floats(&g_tower[..], &device).reshape([g_tdims[0], g_tdims[1]]);
+        let gt =
+            Tensor::<B, 1>::from_floats(&g_tower[..], &device).reshape([g_tdims[0], g_tdims[1]]);
         let emb_out = embedder.forward(gt);
         let [n_tok, text_h] = emb_out.dims();
         let ours: Vec<f32> = emb_out.to_data().to_vec().unwrap();
         let (g_emb, g_edims) = g("embed");
-        assert_eq!((n_tok, text_h), (g_edims[0], g_edims[1]), "{name}: embed shape mismatch");
+        assert_eq!(
+            (n_tok, text_h),
+            (g_edims[0], g_edims[1]),
+            "{name}: embed shape mismatch"
+        );
         let s = compare(&ours, &g_emb);
         let pass = s.cos >= threshold;
         all_pass &= pass;
         println!(
             "  embedder [{n_tok}x{text_h}]  cos={:.7}  max|d|={:.3e}  rmse={:.3e}  {}",
-            s.cos, s.max_abs, s.rmse, if pass { "PASS" } else { "FAIL" }
+            s.cos,
+            s.max_abs,
+            s.rmse,
+            if pass { "PASS" } else { "FAIL" }
         );
 
         // --- Stage 4: full mary cascade vs golden embed ---
-        let mf = Tensor::<B, 1>::from_floats(&feat[..], &device).reshape([1, n_frames, fe.feature_size]);
+        let mf =
+            Tensor::<B, 1>::from_floats(&feat[..], &device).reshape([1, n_frames, fe.feature_size]);
         let cascade = embedder.forward(tower.forward(mf).reshape([t4, hid]));
         let ours: Vec<f32> = cascade.to_data().to_vec().unwrap();
         let s = compare(&ours, &g_emb);
@@ -199,7 +243,10 @@ fn main() {
         all_pass &= pass;
         println!(
             "  cascade  [{t4}x{text_h}]  cos={:.7}  max|d|={:.3e}  rmse={:.3e}  {}",
-            s.cos, s.max_abs, s.rmse, if pass { "PASS" } else { "FAIL" }
+            s.cos,
+            s.max_abs,
+            s.rmse,
+            if pass { "PASS" } else { "FAIL" }
         );
 
         // --- Pile stages: same three components, loaded from the pile ---
@@ -212,7 +259,10 @@ fn main() {
             all_pass &= pass;
             println!(
                 "  tower(pile)    cos={:.7}  max|d|={:.3e}  rmse={:.3e}  {}",
-                s.cos, s.max_abs, s.rmse, if pass { "PASS" } else { "FAIL" }
+                s.cos,
+                s.max_abs,
+                s.rmse,
+                if pass { "PASS" } else { "FAIL" }
             );
 
             let gt = Tensor::<B, 1>::from_floats(&g_tower[..], &device)
@@ -223,11 +273,17 @@ fn main() {
             all_pass &= pass;
             println!(
                 "  embed(pile)    cos={:.7}  max|d|={:.3e}  rmse={:.3e}  {}",
-                s.cos, s.max_abs, s.rmse, if pass { "PASS" } else { "FAIL" }
+                s.cos,
+                s.max_abs,
+                s.rmse,
+                if pass { "PASS" } else { "FAIL" }
             );
 
-            let mf = Tensor::<B, 1>::from_floats(&feat[..], &device)
-                .reshape([1, n_frames, fe.feature_size]);
+            let mf = Tensor::<B, 1>::from_floats(&feat[..], &device).reshape([
+                1,
+                n_frames,
+                fe.feature_size,
+            ]);
             let cascade = p_embedder.forward(p_tower.forward(mf).reshape([t4, hid]));
             let ours: Vec<f32> = cascade.to_data().to_vec().unwrap();
             let s = compare(&ours, &g_emb);
@@ -235,7 +291,10 @@ fn main() {
             all_pass &= pass;
             println!(
                 "  cascade(pile)  cos={:.7}  max|d|={:.3e}  rmse={:.3e}  {}",
-                s.cos, s.max_abs, s.rmse, if pass { "PASS" } else { "FAIL" }
+                s.cos,
+                s.max_abs,
+                s.rmse,
+                if pass { "PASS" } else { "FAIL" }
             );
         }
         println!();

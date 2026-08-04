@@ -132,7 +132,10 @@ fn gate(pile: &str, fmt: WeightFmt) {
     let steps = ghs[0];
     assert_eq!(steps, n_vp + ts[0], "temporal steps = vp + token steps");
     assert_eq!(gls, vec![steps, cfg::TEXT_LOGITS]);
-    println!("goldens: {steps} temporal steps ({n_vp} embedding-fed + {} token-fed)", ts[0]);
+    println!(
+        "goldens: {steps} temporal steps ({n_vp} embedding-fed + {} token-fed)",
+        ts[0]
+    );
 
     let mut tm = load_model(pile, fmt);
 
@@ -276,9 +279,17 @@ fn fill(n: usize, seed: u64, scale: f32) -> Vec<f32> {
 }
 
 fn bench(pile: &str, fmt: WeightFmt) {
-    let rounds: usize = std::env::var("RT_ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
-    let steps: usize = std::env::var("RT_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
-    println!("bench ({fmt:?}): {rounds} rounds x {steps} steps, min-of-medians, fill pinned per step");
+    let rounds: usize = std::env::var("RT_ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let steps: usize = std::env::var("RT_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
+    println!(
+        "bench ({fmt:?}): {rounds} rounds x {steps} steps, min-of-medians, fill pinned per step"
+    );
     println!("(desktop machine — ambient GPU contention inflates; compare within a window)");
 
     let mut tm = load_model(pile, fmt);
@@ -442,7 +453,9 @@ fn framebench(pile: &str, fmt: WeightFmt, depth_f16: bool) {
         "framebench ({fmt:?} temporal + f16 head + {} depformer + CPU mimi): ms per emitted frame",
         if depth_f16 { "f16" } else { "f32" }
     );
-    println!("(desktop machine — ambient contention inflates; min-of-medians + raw best/worst reported)");
+    println!(
+        "(desktop machine — ambient contention inflates; min-of-medians + raw best/worst reported)"
+    );
     let t0 = Instant::now();
     let loader = pile_loader(pile);
     let mut p = RealtimePipeline::load_auto(Path::new(pile), &loader, fmt, depth_f16);
@@ -468,7 +481,10 @@ fn framebench(pile: &str, fmt: WeightFmt, depth_f16: bool) {
         let marginal = prev
             .map(|(pt, pm)| format!("  ({:.1} ms/frame marginal)", (m - pm) / (t - pt) as f64))
             .unwrap_or_default();
-        println!("  {t:3} frames  {m:8.1} ms total  {:6.1} ms/frame amortized{marginal}", m / t as f64);
+        println!(
+            "  {t:3} frames  {m:8.1} ms total  {:6.1} ms/frame amortized{marginal}",
+            m / t as f64
+        );
         prev = Some((t, m));
     }
 
@@ -498,7 +514,9 @@ fn framebench(pile: &str, fmt: WeightFmt, depth_f16: bool) {
     // independent) — lets a short quiet window catch the deep windows
     // without the full 3000-step walk. Windows below the target stay empty
     // and are skipped in the report.
-    let skip: Option<usize> = std::env::var("RT_FB_SKIP").ok().and_then(|s| s.parse().ok());
+    let skip: Option<usize> = std::env::var("RT_FB_SKIP")
+        .ok()
+        .and_then(|s| s.parse().ok());
     let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, [u32; mimi_cfg::NUM_CODEBOOKS])>(8);
     let decoder = &p.decoder;
     let mimi_times: Vec<(usize, f64)> = std::thread::scope(|sc| {
@@ -549,13 +567,18 @@ fn framebench(pile: &str, fmt: WeightFmt, depth_f16: bool) {
             let (hidden, logits) = p.temporal.read_hidden_logits();
             let temporal = ts.elapsed().as_secs_f64() * 1e3;
             let sampled = argmax(&logits) as i64;
-            let next_text = if pr.provided[0] { pr.target[0] } else { sampled };
+            let next_text = if pr.provided[0] {
+                pr.target[0]
+            } else {
+                sampled
+            };
             let td = Instant::now();
             let dep = p.depth.frame(&hidden, next_text, &pr.forced(), None, None);
             let depth = td.elapsed().as_secs_f64() * 1e3;
             let out = p.stream.commit(&pr, sampled, &dep);
             if let Some(o) = &out {
-                tx.send((emitted, agent_codes(o))).expect("decode worker alive");
+                tx.send((emitted, agent_codes(o)))
+                    .expect("decode worker alive");
                 emitted += 1;
             }
             let total = ts.elapsed().as_secs_f64() * 1e3;
@@ -586,7 +609,13 @@ fn framebench(pile: &str, fmt: WeightFmt, depth_f16: bool) {
             }
             if let Some(w) = win {
                 assert!(out.is_some(), "window frame past the delay horizon");
-                windows[w].push(FrameRow { total, temporal, submit, depth, mimi: 0.0 });
+                windows[w].push(FrameRow {
+                    total,
+                    temporal,
+                    submit,
+                    depth,
+                    mimi: 0.0,
+                });
                 window_idx[w].push(emitted - 1);
             }
             if p.temporal.len().is_multiple_of(256) {
@@ -625,7 +654,13 @@ fn framebench(pile: &str, fmt: WeightFmt, depth_f16: bool) {
     println!(" worker-side per-frame cost, which must only stay under the frame budget)");
     println!(
         "{:>6}  {:>8}  {:>32}  {:>7}  {:>8}  {:>7}  {:>15}",
-        "fill", "frame", "temporal (of which host submit)", "depth", "mimi(off)", "other", "raw best/worst"
+        "fill",
+        "frame",
+        "temporal (of which host submit)",
+        "depth",
+        "mimi(off)",
+        "other",
+        "raw best/worst"
     );
     let mut all_ok = true;
     for (w, &t) in targets.iter().enumerate() {
@@ -655,7 +690,11 @@ fn framebench(pile: &str, fmt: WeightFmt, depth_f16: bool) {
     );
     println!(
         "PERSONAPLEX RT FRAMEBENCH ({fmt:?}): {}",
-        if all_ok { "inside the frame budget at all three fills" } else { "OVER BUDGET at ≥1 fill" }
+        if all_ok {
+            "inside the frame budget at all three fills"
+        } else {
+            "OVER BUDGET at ≥1 fill"
+        }
     );
 }
 
@@ -705,7 +744,10 @@ fn pipeline_gate(pile: &str, fmt: WeightFmt, depth_f16: bool) {
     assert_eq!(s, vec![n_gen, 8], "user_codes shape");
     let (text, _) = golden_i64("text_prompt_tokens");
     let (vp_cache, s) = golden_i64("vp_cache");
-    assert_eq!(s, vec![1, cfg::NUM_STREAMS, mary::models::personaplex::lmgen::CT]);
+    assert_eq!(
+        s,
+        vec![1, cfg::NUM_STREAMS, mary::models::personaplex::lmgen::CT]
+    );
     let (vp, vps) = golden_f32("vp_embeddings"); // [50, 1, 1, 4096]
     assert_eq!(&vps[1..], &[1, 1, cfg::DIM], "vp_embeddings shape");
     let n_vp = vps[0];
@@ -714,10 +756,18 @@ fn pipeline_gate(pile: &str, fmt: WeightFmt, depth_f16: bool) {
     let (step_toks, s) = golden_i64("step_tokens"); // [63, 17]
     assert_eq!(s, vec![steps - n_vp, cfg::NUM_STREAMS], "step_tokens shape");
     let (gaudio, s) = golden_f32("out_audio");
-    assert_eq!(s, vec![n_gen * mimi_cfg::SAMPLES_PER_FRAME], "out_audio shape");
+    assert_eq!(
+        s,
+        vec![n_gen * mimi_cfg::SAMPLES_PER_FRAME],
+        "out_audio shape"
+    );
 
     let n_silence = 6; // int(0.5 s × 12.5 Hz), meta.json phases
-    assert_eq!(n_vp + 2 * n_silence + text.len() + n_gen, steps, "phase counts");
+    assert_eq!(
+        n_vp + 2 * n_silence + text.len() + n_gen,
+        steps,
+        "phase counts"
+    );
     let gen_start = steps - n_gen;
     let mut sched: Vec<Phase> = Vec::with_capacity(steps);
     sched.extend((0..n_vp).map(Phase::Vp));
@@ -734,7 +784,10 @@ fn pipeline_gate(pile: &str, fmt: WeightFmt, depth_f16: bool) {
     let (mut samples, sr) = wav::read_pcm16_mono(Path::new(INPUT_WAV));
     assert_eq!(sr, mimi_cfg::SAMPLE_RATE, "input wav sample rate");
     let n_samples = n_gen * mimi_cfg::SAMPLES_PER_FRAME;
-    assert!(samples.len() >= n_samples, "input wav shorter than the oracle window");
+    assert!(
+        samples.len() >= n_samples,
+        "input wav shorter than the oracle window"
+    );
     samples.truncate(n_samples);
     println!("input: {INPUT_WAV} ({n_samples} samples = {n_gen} frames)");
 
@@ -790,7 +843,11 @@ fn pipeline_gate(pile: &str, fmt: WeightFmt, depth_f16: bool) {
         let ts = Instant::now();
         let trace = match &sched[s] {
             Phase::Vp(i) => p.step_embedding(&vp[i * cfg::DIM..(i + 1) * cfg::DIM]),
-            Phase::Silence => p.step(Some(&SINE), Some(&SILENCE), Some(cfg::TEXT_PAD_TOKEN as i64)),
+            Phase::Silence => p.step(
+                Some(&SINE),
+                Some(&SILENCE),
+                Some(cfg::TEXT_PAD_TOKEN as i64),
+            ),
             Phase::Text(t) => p.step(Some(&SINE), Some(&SILENCE), Some(*t)),
             Phase::User(r) => {
                 let cf: [i64; 8] = codes[*r].map(|c| c as i64);
@@ -836,8 +893,8 @@ fn pipeline_gate(pile: &str, fmt: WeightFmt, depth_f16: bool) {
                 for cb in 0..8 {
                     let gt = gdep_tokens[s * cfg::DEP_Q + cb];
                     if trace.dep_tokens[cb] != gt {
-                        let gr = &dep_logits
-                            [(s * cfg::DEP_Q + cb) * cfg::CARD..(s * cfg::DEP_Q + cb + 1) * cfg::CARD];
+                        let gr = &dep_logits[(s * cfg::DEP_Q + cb) * cfg::CARD
+                            ..(s * cfg::DEP_Q + cb + 1) * cfg::CARD];
                         div = Some(Divergence {
                             step: s,
                             what: format!("agent dep token cb {cb} (stream {})", cb + 1),
@@ -914,7 +971,11 @@ fn pipeline_gate(pile: &str, fmt: WeightFmt, depth_f16: bool) {
             let (dcos, _) = cos_maxd(&d.rt_row, &d.gold_row);
             let rt_margin = d.rt_row[d.rt_tok as usize] - d.rt_row[d.gold_tok as usize];
             let gold_margin = d.gold_row[d.gold_tok as usize] - d.gold_row[d.rt_tok as usize];
-            let gold_rank = d.rt_row.iter().filter(|&&v| v > d.rt_row[d.gold_tok as usize]).count();
+            let gold_rank = d
+                .rt_row
+                .iter()
+                .filter(|&&v| v > d.rt_row[d.gold_tok as usize])
+                .count();
             let scale = {
                 let mut top = f32::NEG_INFINITY;
                 let mut second = f32::NEG_INFINITY;
@@ -956,7 +1017,10 @@ fn pipeline_gate(pile: &str, fmt: WeightFmt, depth_f16: bool) {
     let dec_secs = t0.elapsed().as_secs_f64();
     assert_eq!(pcm.len(), gaudio.len(), "decoded sample count");
     wav::write_pcm16_mono(Path::new(OUT_WAV), &pcm, mimi_cfg::SAMPLE_RATE);
-    println!("wrote {OUT_WAV} ({} samples, decode {dec_secs:.1}s)", pcm.len());
+    println!(
+        "wrote {OUT_WAV} ({} samples, decode {dec_secs:.1}s)",
+        pcm.len()
+    );
 
     let pre_frames = r_div.unwrap_or(n_gen);
     let pre = pre_frames * mimi_cfg::SAMPLES_PER_FRAME;
@@ -979,7 +1043,9 @@ fn pipeline_gate(pile: &str, fmt: WeightFmt, depth_f16: bool) {
                 "  -- audio vs parity pipeline wav (pcm16), same prefix       cos={cos_p:.9}  max|Δ|={maxd_p:.3e}"
             );
         } else {
-            println!("  -- {PARITY_WAV} not found (run `personaplex_probe pipeline` first) — skipped");
+            println!(
+                "  -- {PARITY_WAV} not found (run `personaplex_probe pipeline` first) — skipped"
+            );
         }
     }
 
@@ -1000,7 +1066,10 @@ fn pipeline_gate(pile: &str, fmt: WeightFmt, depth_f16: bool) {
         "        mimi encode {enc_secs:.1}s / decode {dec_secs:.1}s for {n_gen} frames (batch; ~{:.0} ms/frame sequential cost in a live loop)",
         dec_secs * 1e3 / n_gen as f64
     );
-    println!("ran {steps} steps in {run_secs:.1}s ({:.0} ms/step)", run_secs * 1e3 / steps as f64);
+    println!(
+        "ran {steps} steps in {run_secs:.1}s ({:.0} ms/step)",
+        run_secs * 1e3 / steps as f64
+    );
 
     // ── verdict ──
     // Exactness expectations are per-format: f16 must reproduce the oracle
@@ -1032,8 +1101,13 @@ fn pipeline_gate(pile: &str, fmt: WeightFmt, depth_f16: bool) {
 /// The full golden prompt schedule + gen phase, reusable by the reset gate.
 /// Returns `(sched, vp_embeddings, vp_cache, n_vp, codes)`.
 #[cfg(feature = "q4")]
-fn reset_schedule() -> (Vec<Phase>, Vec<f32>, Vec<i64>, usize, Vec<[u32; mimi_cfg::NUM_CODEBOOKS]>)
-{
+fn reset_schedule() -> (
+    Vec<Phase>,
+    Vec<f32>,
+    Vec<i64>,
+    usize,
+    Vec<[u32; mimi_cfg::NUM_CODEBOOKS]>,
+) {
     let (gl, s) = golden_f32("tt_text_logits");
     let steps = s[0];
     let (text, _) = golden_i64("text_prompt_tokens");
@@ -1075,7 +1149,11 @@ fn reset_run(
     for (s, phase) in sched.iter().enumerate() {
         let trace = match phase {
             Phase::Vp(i) => p.step_embedding(&vp[i * cfg::DIM..(i + 1) * cfg::DIM]),
-            Phase::Silence => p.step(Some(&SINE), Some(&SILENCE), Some(cfg::TEXT_PAD_TOKEN as i64)),
+            Phase::Silence => p.step(
+                Some(&SINE),
+                Some(&SILENCE),
+                Some(cfg::TEXT_PAD_TOKEN as i64),
+            ),
             Phase::Text(t) => p.step(Some(&SINE), Some(&SILENCE), Some(*t)),
             Phase::User(_) => {
                 let cf: [i64; 8] = codes[r].map(|c| c as i64);
@@ -1112,7 +1190,14 @@ fn reset_gate(pile: &str, fmt: WeightFmt, depth_f16: bool) {
     for mode in ["greedy", "sampling"] {
         let apply = |p: &mut RealtimePipeline| {
             if mode == "sampling" {
-                p.set_sampling(SamplingConfig { temp: 0.8, top_k: 64, top_p: 0.95 }, 0xC0FFEE);
+                p.set_sampling(
+                    SamplingConfig {
+                        temp: 0.8,
+                        top_k: 64,
+                        top_p: 0.95,
+                    },
+                    0xC0FFEE,
+                );
             } else {
                 p.set_greedy();
             }
@@ -1189,12 +1274,18 @@ fn main() {
             eprintln!("  gate        113-step golden stream: cos + argmax vs tt_text_logits (per-format bars)");
             eprintln!("  bench       ms/step at cache fill 256/1024/3000, f16 vs q4 logit head");
             eprintln!("  framebench  ms per EMITTED FRAME on the LM critical path (temporal + depformer +");
-            eprintln!("              overhead; mimi decode on its own thread, worker cost reported) at");
+            eprintln!(
+                "              overhead; mimi decode on its own thread, worker cost reported) at"
+            );
             eprintln!("              cache fill 256/1024/2999 via a long synthetic free-run");
             eprintln!("  quantcheck  per-matvec q4 error, raw vs norm-alpha-folded weights");
             eprintln!("  pipeline    assembled realtime pipeline free-run: WAV → encode → LM → decode → WAV,");
-            eprintln!("              agreement % + first divergence + near-tie check + prefix audio cos");
-            eprintln!("  reset       reset_session == reload, token-exact (greedy + seeded sampling)");
+            eprintln!(
+                "              agreement % + first divergence + near-tie check + prefix audio cos"
+            );
+            eprintln!(
+                "  reset       reset_session == reload, token-exact (greedy + seeded sampling)"
+            );
             std::process::exit(2);
         }
     }

@@ -43,7 +43,11 @@ fn try_hf_file(model_id: &str, filename: &str) -> Option<String> {
         .output()
         .ok()?;
     let p = String::from_utf8(o.stdout).ok()?.trim().to_string();
-    if p.is_empty() || !Path::new(&p).exists() { None } else { Some(p) }
+    if p.is_empty() || !Path::new(&p).exists() {
+        None
+    } else {
+        Some(p)
+    }
 }
 
 fn find_hf_file(model_id: &str, filename: &str) -> String {
@@ -75,7 +79,9 @@ fn resolve_shards(model_id: &str) -> Vec<String> {
 }
 
 fn arg(args: &[String], k: &str) -> Option<String> {
-    args.iter().position(|s| s == k).map(|i| args[i + 1].clone())
+    args.iter()
+        .position(|s| s == k)
+        .map(|i| args[i + 1].clone())
 }
 
 /// Expand short variant aliases to full HF model ids; anything else (a full
@@ -160,12 +166,23 @@ impl AdamW {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let model_id = resolve_model_id(&arg(&args, "--model").unwrap_or_else(|| "google/gemma-4-E4B-it".into()));
-    let steps: usize = arg(&args, "--steps").and_then(|s| s.parse().ok()).unwrap_or(200);
-    let lr: f32 = arg(&args, "--lr").and_then(|s| s.parse().ok()).unwrap_or(5e-4);
-    let rank: usize = arg(&args, "--rank").and_then(|s| s.parse().ok()).unwrap_or(16);
-    let alpha: f32 = arg(&args, "--alpha").and_then(|s| s.parse().ok()).unwrap_or(16.0);
-    let weight_decay: f32 = arg(&args, "--weight-decay").and_then(|s| s.parse().ok()).unwrap_or(0.01);
+    let model_id =
+        resolve_model_id(&arg(&args, "--model").unwrap_or_else(|| "google/gemma-4-E4B-it".into()));
+    let steps: usize = arg(&args, "--steps")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
+    let lr: f32 = arg(&args, "--lr")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5e-4);
+    let rank: usize = arg(&args, "--rank")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
+    let alpha: f32 = arg(&args, "--alpha")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16.0);
+    let weight_decay: f32 = arg(&args, "--weight-decay")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.01);
     let text = arg(&args, "--text").unwrap_or_else(|| {
         "The quick brown fox jumps over the lazy dog beside the quiet riverbank.".into()
     });
@@ -244,7 +261,11 @@ fn main() {
 
         // Fresh KV caches every step — prefill-only forward, no decode.
         let mut caches = model.new_caches();
-        let emb = model.decoder.embed.forward(tokens.clone()).mul_scalar(scale);
+        let emb = model
+            .decoder
+            .embed
+            .forward(tokens.clone())
+            .mul_scalar(scale);
         let logits = model.forward_embeds(
             emb,
             tokens.clone(),

@@ -63,8 +63,7 @@ fn main() -> anyhow::Result<()> {
 
     if let Some(xp) = &xvec_out {
         let dev = Default::default();
-        let loader =
-            mary::persist::load_aliased_loader_from_pile(Path::new(pile), "talker_f16")?;
+        let loader = mary::persist::load_aliased_loader_from_pile(Path::new(pile), "talker_f16")?;
         let spk_enc = SpeakerEncoder::<B>::load(&loader, &dev);
         let (samples, sr) = wav::read_pcm16_mono(Path::new(ref_wav));
         eprintln!("ref wav: {} samples @ {sr}", samples.len());
@@ -82,14 +81,15 @@ fn main() -> anyhow::Result<()> {
         use mary::models::qwen3tts::talker::Talker;
         use mary::models::qwen3tts::tokenizer::TextTokenizer;
         let dev = Default::default();
-        let loader =
-            mary::persist::load_aliased_loader_from_pile(Path::new(pile), "talker_f16")?;
+        let loader = mary::persist::load_aliased_loader_from_pile(Path::new(pile), "talker_f16")?;
         let talker = Talker::<B>::load(&loader, &dev);
         let predictor = CodePredictor::load(&loader);
         let spk_enc = SpeakerEncoder::<B>::load(&loader, &dev);
         let _codec = CodecDecoder::<B>::load(&loader, &dev);
         drop(loader);
-        let tok = TextTokenizer::load(&std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/qwen3tts"));
+        let tok = TextTokenizer::load(
+            &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/qwen3tts"),
+        );
         let (samples, _sr) = wav::read_pcm16_mono(Path::new(ref_wav));
         let spk_embedding = spk_enc.forward(SpeakerMel::<B>::new(&dev).forward(&samples, &dev));
         let (rc, rcs) = npy::load_npy(Path::new(ref_codes))?;
@@ -107,12 +107,20 @@ fn main() -> anyhow::Result<()> {
             ref_ids: tok.encode(&format!("<|im_start|>assistant\n{ref_text}<|im_end|>\n")),
             spk_embedding,
         };
-        let line = text.clone().unwrap_or_else(|| "The quick brown fox jumps over the lazy dog.".into());
+        let line = text
+            .clone()
+            .unwrap_or_else(|| "The quick brown fox jumps over the lazy dog.".into());
         let text_ids = tok.encode(&format!(
             "<|im_start|>assistant\n{line}<|im_end|>\n<|im_start|>assistant\n"
         ));
-        let (prefill, trailing, _pad) =
-            pipeline::build_prefill(&talker, &predictor, &prompt, &text_ids, Some(LANG_ENGLISH), &dev);
+        let (prefill, trailing, _pad) = pipeline::build_prefill(
+            &talker,
+            &predictor,
+            &prompt,
+            &text_ids,
+            Some(LANG_ENGLISH),
+            &dev,
+        );
         let dims = prefill.dims();
         eprintln!("prefill dims {:?}, trailing {:?}", dims, trailing.dims());
         let v: Vec<f32> = prefill.into_data().to_vec().unwrap();

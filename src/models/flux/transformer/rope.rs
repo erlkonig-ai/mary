@@ -31,10 +31,8 @@ pub fn flux2_rope<B: Backend>(
 
     for (axis_idx, &dim) in axes_dims.iter().enumerate() {
         // Extract positions for this axis: [S, 1] -> [S]
-        let pos_2d = ids
-            .clone()
-            .slice([0..seq_len, axis_idx..axis_idx + 1]); // [S, 1]
-        // Squeeze from [S, 1] to [S] by reshaping
+        let pos_2d = ids.clone().slice([0..seq_len, axis_idx..axis_idx + 1]); // [S, 1]
+                                                                              // Squeeze from [S, 1] to [S] by reshaping
         let pos = pos_2d.reshape([seq_len]); // [S]
 
         // Compute 1D rotary embedding for this axis
@@ -108,17 +106,17 @@ fn repeat_interleave<B: Backend>(x: Tensor<B, 2>) -> Tensor<B, 2> {
 /// This uses the same rotate_half pattern as the text encoder RoPE, but adapted for
 /// the [B, S, H, D] layout used by Flux2 attention (sequence_dim=1).
 pub fn apply_rotary_emb<B: Backend>(
-    x: Tensor<B, 4>,    // [B, S, H, D]
-    cos: Tensor<B, 2>,   // [S, D]
-    sin: Tensor<B, 2>,   // [S, D]
+    x: Tensor<B, 4>,   // [B, S, H, D]
+    cos: Tensor<B, 2>, // [S, D]
+    sin: Tensor<B, 2>, // [S, D]
 ) -> Tensor<B, 4> {
     // cos: [S, D] -> [1, S, 1, D]
     let cos = cos
-        .unsqueeze_dim::<3>(0)   // [1, S, D]
-        .unsqueeze_dim::<4>(2);  // [1, S, 1, D]
+        .unsqueeze_dim::<3>(0) // [1, S, D]
+        .unsqueeze_dim::<4>(2); // [1, S, 1, D]
     let sin = sin
-        .unsqueeze_dim::<3>(0)   // [1, S, D]
-        .unsqueeze_dim::<4>(2);  // [1, S, 1, D]
+        .unsqueeze_dim::<3>(0) // [1, S, D]
+        .unsqueeze_dim::<4>(2); // [1, S, 1, D]
 
     // rotate_half for [B, S, H, D]: reshape to [B, S, H, D/2, 2], swap and negate
     let x_rotated = rotate_half_bshd(x.clone());

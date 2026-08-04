@@ -2,7 +2,9 @@
 //! suitable for `AudioFeatureExtractor::extract`. Uses symphonia for
 //! decoding and rubato for sample-rate conversion.
 
-use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
+use rubato::{
+    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+};
 use std::path::Path;
 use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::DecoderOptions;
@@ -24,7 +26,12 @@ pub fn load_audio_16k_mono(path: &Path) -> Result<Vec<f32>, String> {
     }
 
     let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
         .map_err(|e| format!("probe: {e}"))?;
     let mut reader = probed.format;
 
@@ -48,7 +55,9 @@ pub fn load_audio_16k_mono(path: &Path) -> Result<Vec<f32>, String> {
             Err(SymError::ResetRequired) => break,
             Err(e) => return Err(format!("next_packet: {e}")),
         };
-        if packet.track_id() != track_id { continue; }
+        if packet.track_id() != track_id {
+            continue;
+        }
         let decoded = match decoder.decode(&packet) {
             Ok(d) => d,
             Err(SymError::IoError(_)) | Err(SymError::DecodeError(_)) => continue,
@@ -59,11 +68,15 @@ pub fn load_audio_16k_mono(path: &Path) -> Result<Vec<f32>, String> {
             channels = Some(decoded.spec().channels.count());
         }
         let ch = channels.unwrap();
-        if per_ch.is_empty() { per_ch = (0..ch).map(|_| Vec::new()).collect(); }
+        if per_ch.is_empty() {
+            per_ch = (0..ch).map(|_| Vec::new()).collect();
+        }
 
         match decoded {
             AudioBufferRef::F32(buf) => {
-                for c in 0..ch { per_ch[c].extend_from_slice(buf.chan(c)); }
+                for c in 0..ch {
+                    per_ch[c].extend_from_slice(buf.chan(c));
+                }
             }
             AudioBufferRef::S16(buf) => {
                 for c in 0..ch {
@@ -80,7 +93,9 @@ pub fn load_audio_16k_mono(path: &Path) -> Result<Vec<f32>, String> {
                 let duration = other.capacity() as u64;
                 let mut fbuf = symphonia::core::audio::AudioBuffer::<f32>::new(duration, spec);
                 other.convert(&mut fbuf);
-                for c in 0..ch { per_ch[c].extend_from_slice(fbuf.chan(c)); }
+                for c in 0..ch {
+                    per_ch[c].extend_from_slice(fbuf.chan(c));
+                }
             }
         }
     }
@@ -93,10 +108,14 @@ pub fn load_audio_16k_mono(path: &Path) -> Result<Vec<f32>, String> {
         let src = &per_ch[c];
         // Guard against channels of different lengths.
         let m = src.len().min(n);
-        for i in 0..m { mono[i] += src[i]; }
+        for i in 0..m {
+            mono[i] += src[i];
+        }
     }
     let inv = 1.0 / channels as f32;
-    for v in &mut mono { *v *= inv; }
+    for v in &mut mono {
+        *v *= inv;
+    }
 
     resample_to_16k(mono, src_rate)
 }
@@ -126,7 +145,8 @@ pub fn resample_to_16k(mono: Vec<f32>, src_rate: usize) -> Result<Vec<f32>, Stri
     let mut i = 0;
     while i + chunk <= mono.len() {
         let waves_in = vec![mono[i..i + chunk].to_vec()];
-        let waves_out = resampler.process(&waves_in, None)
+        let waves_out = resampler
+            .process(&waves_in, None)
             .map_err(|e| format!("rubato process: {e}"))?;
         out.extend_from_slice(&waves_out[0]);
         i += chunk;
@@ -136,7 +156,8 @@ pub fn resample_to_16k(mono: Vec<f32>, src_rate: usize) -> Result<Vec<f32>, Stri
         let mut tail = vec![0.0f32; chunk];
         tail[..mono.len() - i].copy_from_slice(&mono[i..]);
         let waves_in = vec![tail];
-        let waves_out = resampler.process(&waves_in, None)
+        let waves_out = resampler
+            .process(&waves_in, None)
             .map_err(|e| format!("rubato process tail: {e}"))?;
         // Trim the output to account for the zero-padded tail.
         let valid_out = ((mono.len() - i) as f64 * ratio).ceil() as usize;

@@ -42,7 +42,12 @@ pub struct NomicMultimodalEmbedder<B: Backend> {
 
 impl<B: Backend> NomicMultimodalEmbedder<B> {
     pub fn new(model: QwenTextModel<B>, tokenizer: Tokenizer, device: B::Device) -> Self {
-        Self { model, vision: None, tokenizer, device }
+        Self {
+            model,
+            vision: None,
+            tokenizer,
+            device,
+        }
     }
 
     /// Attach a parity-verified vision tower, enabling [`Self::embed_image`].
@@ -111,7 +116,12 @@ impl<B: Backend> NomicMultimodalEmbedder<B> {
     pub fn embed_ids(&self, ids: &[i64]) -> Vec<f32> {
         let s = ids.len();
         let t = Tensor::<B, 2, Int>::from_data(TensorData::new(ids.to_vec(), [1, s]), &self.device);
-        self.model.embed(t).into_data().convert::<f32>().to_vec::<f32>().unwrap()
+        self.model
+            .embed(t)
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .unwrap()
     }
 
     /// Document embedding: plain tokenization (ColQwen `process_texts`).
@@ -173,7 +183,12 @@ impl<B: Backend> NomicMultimodalEmbedder<B> {
                 k += 1;
             }
         }
-        debug_assert_eq!(k, vision_tokens.dims()[0], "spliced {k} of {} vision tokens", vision_tokens.dims()[0]);
+        debug_assert_eq!(
+            k,
+            vision_tokens.dims()[0],
+            "spliced {k} of {} vision tokens",
+            vision_tokens.dims()[0]
+        );
         embeds
     }
 

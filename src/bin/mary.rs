@@ -134,7 +134,10 @@ fn keys(a: KeysArgs) -> anyhow::Result<()> {
                 source,
                 &a.quantization,
             )?;
-            (km, format!("source={source} quantization={}", a.quantization))
+            (
+                km,
+                format!("source={source} quantization={}", a.quantization),
+            )
         }
         (None, Some(hex)) => {
             let root = Id::from_hex(hex)
@@ -184,9 +187,17 @@ fn import(a: ImportArgs) -> anyhow::Result<()> {
         a.pile.display(),
         a.quantization,
     );
-    let root =
-        mary::persist::persist_model_to_pile(&dir, &a.pile, a.dtype.into(), &label, &a.quantization)?;
-    eprintln!("mary import: done — model root {root:X} in pile {}", a.pile.display());
+    let root = mary::persist::persist_model_to_pile(
+        &dir,
+        &a.pile,
+        a.dtype.into(),
+        &label,
+        &a.quantization,
+    )?;
+    eprintln!(
+        "mary import: done — model root {root:X} in pile {}",
+        a.pile.display()
+    );
     Ok(())
 }
 
@@ -208,7 +219,9 @@ fn resolve_source(source: &str) -> anyhow::Result<PathBuf> {
     }
     // Not a directory and not cached → treat as a HuggingFace model id and pull
     // whichever weight format it actually ships into the local cache, then resolve.
-    eprintln!("mary import: '{source}' not in the local cache — downloading from the HuggingFace hub...");
+    eprintln!(
+        "mary import: '{source}' not in the local cache — downloading from the HuggingFace hub..."
+    );
     download_hf_weights(source)?;
     hf_snapshot_dir(source).ok_or_else(|| {
         anyhow::anyhow!(
@@ -244,8 +257,11 @@ fn download_hf_weights(id: &str) -> anyhow::Result<()> {
         fetch_sharded(&repo, &index_path)?;
         return Ok(());
     }
-    let safetensors: Vec<String> =
-        files.iter().filter(|f| f.ends_with(".safetensors")).cloned().collect();
+    let safetensors: Vec<String> = files
+        .iter()
+        .filter(|f| f.ends_with(".safetensors"))
+        .cloned()
+        .collect();
     if !safetensors.is_empty() {
         // single-file, or an un-indexed multi-file safetensors set
         for s in &safetensors {
@@ -302,14 +318,19 @@ fn fetch_sharded(repo: &hf_hub::api::sync::ApiRepo, index_path: &Path) -> anyhow
     let shards: std::collections::BTreeSet<String> = index
         .get("weight_map")
         .and_then(|m| m.as_object())
-        .map(|m| m.values().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|m| {
+            m.values()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     if shards.is_empty() {
         anyhow::bail!("weight-map index lists no shards");
     }
     for shard in &shards {
         eprintln!("  fetching {shard} ...");
-        repo.get(shard).map_err(|e| anyhow::anyhow!("fetch {shard}: {e}"))?;
+        repo.get(shard)
+            .map_err(|e| anyhow::anyhow!("fetch {shard}: {e}"))?;
     }
     Ok(())
 }

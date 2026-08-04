@@ -24,7 +24,8 @@ const GOLD: &str = "/tmp/mimi_work/golden";
 const REF_WAV: &str = "ref_voice.wav";
 
 fn golden(name: &str) -> (Vec<f32>, Vec<usize>) {
-    npy::load_npy(&Path::new(GOLD).join(format!("{name}.npy"))).unwrap_or_else(|e| panic!("golden {name}: {e}"))
+    npy::load_npy(&Path::new(GOLD).join(format!("{name}.npy")))
+        .unwrap_or_else(|e| panic!("golden {name}: {e}"))
 }
 
 fn metrics(name: &str, a: &[f32], b: &[f32], cos_gate: f64) -> bool {
@@ -39,7 +40,10 @@ fn metrics(name: &str, a: &[f32], b: &[f32], cos_gate: f64) -> bool {
     }
     let cos = dot / (na.sqrt() * nb.sqrt());
     let ok = cos > cos_gate;
-    println!("  {} {name:22} cos={cos:.8}  max|Δ|={maxabs:.3e}", if ok { "OK" } else { "XX" });
+    println!(
+        "  {} {name:22} cos={cos:.8}  max|Δ|={maxabs:.3e}",
+        if ok { "OK" } else { "XX" }
+    );
     ok
 }
 
@@ -47,7 +51,11 @@ fn main() {
     let loader = WeightLoader::SingleFile(SingleFileLoader::new(Path::new(CKPT)));
     let (samples, sr) = wav::read_pcm16_mono(Path::new(REF_WAV));
     assert_eq!(sr, SAMPLE_RATE);
-    println!("ref wav: {} samples ({} frames)", samples.len(), samples.len() / SAMPLES_PER_FRAME);
+    println!(
+        "ref wav: {} samples ({} frames)",
+        samples.len(),
+        samples.len() / SAMPLES_PER_FRAME
+    );
 
     let mut ok = true;
 
@@ -124,13 +132,24 @@ fn main() {
     let wav_out = dec.decode(&ref_codes);
     let (gwav, _) = golden("decode_wav");
     ok &= metrics("decode waveform", &wav_out, &gwav, 0.9999);
-    wav::write_pcm16_mono(Path::new("/tmp/mimi_work/mimi_parity.wav"), &wav_out, SAMPLE_RATE);
+    wav::write_pcm16_mono(
+        Path::new("/tmp/mimi_work/mimi_parity.wav"),
+        &wav_out,
+        SAMPLE_RATE,
+    );
 
     // end-to-end: decode(OUR encode) vs the oracle roundtrip.
     let rt = dec.decode(&codes);
     let (grt, _) = golden("roundtrip_wav");
     ok &= metrics("roundtrip wav", &rt, &grt, 0.9999);
 
-    println!("{}", if ok { "ALL GATES PASSED" } else { "GATES FAILED" });
+    println!(
+        "{}",
+        if ok {
+            "ALL GATES PASSED"
+        } else {
+            "GATES FAILED"
+        }
+    );
     std::process::exit(if ok { 0 } else { 1 });
 }

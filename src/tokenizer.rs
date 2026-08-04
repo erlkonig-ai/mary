@@ -227,8 +227,12 @@ pub fn save_tokenizer_json(
     // ── the tokenizer entity (+ flat model knobs; absent ones are omitted) ──
     let name_h = blobs.put::<blobencodings::LongString, _>(source_name.to_string())?;
     let unk = model["unk_token"].as_str();
-    let csp = model["continuing_subword_prefix"].as_str().filter(|s| !s.is_empty());
-    let eows = model["end_of_word_suffix"].as_str().filter(|s| !s.is_empty());
+    let csp = model["continuing_subword_prefix"]
+        .as_str()
+        .filter(|s| !s.is_empty());
+    let eows = model["end_of_word_suffix"]
+        .as_str()
+        .filter(|s| !s.is_empty());
     let max_chars = model["max_input_chars_per_word"].as_u64();
     let model_type = match model_kind {
         "WordPiece" => ty::WORD_PIECE,
@@ -319,8 +323,8 @@ fn save_config_node(
                 .ok_or("Sequence node missing normalizers/pretokenizers array")?;
             for (i, child) in children.iter().enumerate() {
                 let cid = save_config_node(child, blobs, facts)?;
-                *facts += entity! { ExclusiveId::force_ref(&cid) @ attrs::index: i as u64 }
-                    .into_facts();
+                *facts +=
+                    entity! { ExclusiveId::force_ref(&cid) @ attrs::index: i as u64 }.into_facts();
                 members.push(cid);
             }
         }
@@ -569,7 +573,9 @@ pub fn build_tokenizer(
         if let Some(m) = max_chars {
             b = b.max_input_chars_per_word(m as usize);
         }
-        b.build().map_err(|e| format!("build WordPiece model: {e}"))?.into()
+        b.build()
+            .map_err(|e| format!("build WordPiece model: {e}"))?
+            .into()
     } else if tags.contains(&ty::BPE) {
         let merges = load_merges(tribles, blobs, tok_id);
         let mut b = BPE::builder().vocab_and_merges(vocab, merges);
@@ -582,7 +588,9 @@ pub fn build_tokenizer(
         if let Some(s) = eows {
             b = b.end_of_word_suffix(s);
         }
-        b.build().map_err(|e| format!("build BPE model: {e}"))?.into()
+        b.build()
+            .map_err(|e| format!("build BPE model: {e}"))?
+            .into()
     } else {
         return Err("tokenizer entity carries no model-kind tag (WordPiece/BPE)".into());
     };
@@ -647,9 +655,11 @@ fn build_normalizer(
             .ok_or("Replace node missing pattern")?;
         let content = short_field!(tribles, node, attrs::replace_content).unwrap_or_default();
         // Patterns are stored raw from the Regex variant; rebuild as Regex.
-        Ok(n::Replace::new(n::replace::ReplacePattern::Regex(pat), content)
-            .map_err(|e| format!("build Replace normalizer: {e}"))?
-            .into())
+        Ok(
+            n::Replace::new(n::replace::ReplacePattern::Regex(pat), content)
+                .map_err(|e| format!("build Replace normalizer: {e}"))?
+                .into(),
+        )
     } else {
         Err(format!("normalizer node {node:?} has no known type tag").into())
     }
@@ -676,8 +686,8 @@ fn build_pre_tokenizer(
     } else if has(ty::SPLIT) {
         let pat = long_field!(tribles, blobs, node, attrs::pattern)
             .ok_or("Split node missing pattern")?;
-        let behavior = short_field!(tribles, node, attrs::behavior)
-            .ok_or("Split node missing behavior")?;
+        let behavior =
+            short_field!(tribles, node, attrs::behavior).ok_or("Split node missing behavior")?;
         Ok(p::split::Split::new(
             p::split::SplitPattern::Regex(pat),
             parse_behavior(&behavior)?,
@@ -1039,9 +1049,9 @@ mod tests {
             WP,
             &[
                 "hello telecommunications",
-                "HELLO Hello hello",         // BertNormalizer lowercase
-                "telecommunicationsing",     // WordPiece ##ing continuation
-                "[CLS] hello [PAD]",         // added tokens match as specials
+                "HELLO Hello hello",     // BertNormalizer lowercase
+                "telecommunicationsing", // WordPiece ##ing continuation
+                "[CLS] hello [PAD]",     // added tokens match as specials
             ],
         );
     }
@@ -1049,10 +1059,7 @@ mod tests {
     #[cfg(feature = "tokenizer")]
     #[test]
     fn graph_built_bytelevel_bpe_encodes_like_json_built() {
-        assert_encode_parity(
-            BPE_BYTELEVEL,
-            &["ab abc", "ABC aB", "abc ab a", "a b c"],
-        );
+        assert_encode_parity(BPE_BYTELEVEL, &["ab abc", "ABC aB", "abc ab a", "a b c"]);
     }
 
     // Sequence/Split/Replace plumbing: the original BPE fixture's pre-tok

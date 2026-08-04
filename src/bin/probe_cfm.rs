@@ -5,18 +5,20 @@
 //!   python3 scripts/probe_cfm.py <model.safetensors>
 //!   cargo run --release --bin probe_cfm -- <model.safetensors>
 
-use mary::nn::backend::B;
-use mary::nn::npy;
-use mary::nn::weight_loader::{SingleFileLoader, WeightLoader};
 use burn::prelude::*;
 use burn::tensor::TensorData;
-use std::path::{Path, PathBuf};
 use mary::models::f5::cfm;
 use mary::models::f5::config::{CfmConfig, F5Config};
 use mary::models::f5::model::F5Transformer;
+use mary::nn::backend::B;
+use mary::nn::npy;
+use mary::nn::weight_loader::{SingleFileLoader, WeightLoader};
+use std::path::{Path, PathBuf};
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: probe_cfm <model.safetensors>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: probe_cfm <model.safetensors>");
     let device = Default::default();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let dir = root.join("probes").join("cfm");
@@ -33,7 +35,11 @@ fn main() {
 
     let loader = WeightLoader::SingleFile(SingleFileLoader::new(Path::new(&path)));
     let model = F5Transformer::<B>::load(&loader, F5Config::v1_base(), &device);
-    let cfg = CfmConfig { nfe: 8, sway_coef: -1.0, cfg_strength: 2.0 };
+    let cfg = CfmConfig {
+        nfe: 8,
+        sway_coef: -1.0,
+        cfg_strength: 2.0,
+    };
 
     let mel = cfm::integrate(&model, y0, cond, text, &cfg, &device);
     let data = mel.into_data();

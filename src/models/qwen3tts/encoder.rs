@@ -52,7 +52,13 @@ struct CpuConv {
 }
 
 impl CpuConv {
-    fn load(loader: &WeightLoader, prefix: &str, stride: usize, bias: bool, replicate_pad: bool) -> Self {
+    fn load(
+        loader: &WeightLoader,
+        prefix: &str,
+        stride: usize,
+        bias: bool,
+        replicate_pad: bool,
+    ) -> Self {
         let (w, shape) = loader.load_f32(&format!("{prefix}.weight"));
         let (out, inc, k) = (shape[0], shape[1], shape[2]);
         Self {
@@ -70,8 +76,9 @@ impl CpuConv {
     fn forward(&self, x: &[f32], l: usize) -> (Vec<f32>, usize) {
         let (k, s) = (self.k, self.stride);
         let pad_left = k - s; // padding_total, all left (causal)
-        // extra right padding to a whole number of frames
-        let n_frames = ((l + pad_left).saturating_sub(k) as f64 / s as f64 + 1.0).ceil() as usize - 1;
+                              // extra right padding to a whole number of frames
+        let n_frames =
+            ((l + pad_left).saturating_sub(k) as f64 / s as f64 + 1.0).ceil() as usize - 1;
         let ideal = n_frames * s + k - pad_left;
         let pad_right = ideal.saturating_sub(l);
         let lp = l + pad_left + pad_right;
@@ -157,7 +164,8 @@ impl RvqEncoder {
         let mut norms = Vec::with_capacity(n_q);
         for i in 0..n_q {
             let (sum, _) = loader.load_f32(&format!("{prefix}.layers.{i}.codebook.embed_sum"));
-            let (usage, _) = loader.load_f32(&format!("{prefix}.layers.{i}.codebook.cluster_usage"));
+            let (usage, _) =
+                loader.load_f32(&format!("{prefix}.layers.{i}.codebook.cluster_usage"));
             let mut cb = sum;
             for (r, &u) in usage.iter().enumerate() {
                 let d = u.max(1e-5);
@@ -188,7 +196,14 @@ impl RvqEncoder {
     fn encode(&self, x: &[f32], t: usize) -> Vec<Vec<u32>> {
         // input_proj (k1 conv ≡ matmul): [T, 512] → [T, 256]
         let mut residual = vec![0f32; t * DEC_CODE_DIM];
-        sgemm_nt(x, &self.input_proj, t, ENC_HIDDEN, DEC_CODE_DIM, &mut residual);
+        sgemm_nt(
+            x,
+            &self.input_proj,
+            t,
+            ENC_HIDDEN,
+            DEC_CODE_DIM,
+            &mut residual,
+        );
 
         let mut out = Vec::with_capacity(self.codebooks.len());
         for (cb, norms) in self.codebooks.iter().zip(&self.norms) {
@@ -241,25 +256,53 @@ impl CodecEncoder {
             .iter()
             .enumerate()
             .map(|(i, &r)| EncBlock {
-                res1: CpuConv::load(loader, &format!("{p}.{}.block.1.conv", 3 * i + 1), 1, true, false),
-                res2: CpuConv::load(loader, &format!("{p}.{}.block.3.conv", 3 * i + 1), 1, true, false),
+                res1: CpuConv::load(
+                    loader,
+                    &format!("{p}.{}.block.1.conv", 3 * i + 1),
+                    1,
+                    true,
+                    false,
+                ),
+                res2: CpuConv::load(
+                    loader,
+                    &format!("{p}.{}.block.3.conv", 3 * i + 1),
+                    1,
+                    true,
+                    false,
+                ),
                 down: CpuConv::load(loader, &format!("{p}.{}.conv", 3 * i + 3), r, true, false),
             })
             .collect();
         let t = "encoder.encoder_transformer.layers";
         let tr_layers = (0..ENC_LAYERS)
             .map(|i| EncTrLayer {
-                ln1_w: loader.load_f32(&format!("{t}.{i}.input_layernorm.weight")).0,
+                ln1_w: loader
+                    .load_f32(&format!("{t}.{i}.input_layernorm.weight"))
+                    .0,
                 ln1_b: loader.load_f32(&format!("{t}.{i}.input_layernorm.bias")).0,
-                ln2_w: loader.load_f32(&format!("{t}.{i}.post_attention_layernorm.weight")).0,
-                ln2_b: loader.load_f32(&format!("{t}.{i}.post_attention_layernorm.bias")).0,
-                q: loader.load_f32(&format!("{t}.{i}.self_attn.q_proj.weight")).0,
-                k: loader.load_f32(&format!("{t}.{i}.self_attn.k_proj.weight")).0,
-                v: loader.load_f32(&format!("{t}.{i}.self_attn.v_proj.weight")).0,
-                o: loader.load_f32(&format!("{t}.{i}.self_attn.o_proj.weight")).0,
+                ln2_w: loader
+                    .load_f32(&format!("{t}.{i}.post_attention_layernorm.weight"))
+                    .0,
+                ln2_b: loader
+                    .load_f32(&format!("{t}.{i}.post_attention_layernorm.bias"))
+                    .0,
+                q: loader
+                    .load_f32(&format!("{t}.{i}.self_attn.q_proj.weight"))
+                    .0,
+                k: loader
+                    .load_f32(&format!("{t}.{i}.self_attn.k_proj.weight"))
+                    .0,
+                v: loader
+                    .load_f32(&format!("{t}.{i}.self_attn.v_proj.weight"))
+                    .0,
+                o: loader
+                    .load_f32(&format!("{t}.{i}.self_attn.o_proj.weight"))
+                    .0,
                 fc1: loader.load_f32(&format!("{t}.{i}.mlp.fc1.weight")).0,
                 fc2: loader.load_f32(&format!("{t}.{i}.mlp.fc2.weight")).0,
-                ls_attn: loader.load_f32(&format!("{t}.{i}.self_attn_layer_scale.scale")).0,
+                ls_attn: loader
+                    .load_f32(&format!("{t}.{i}.self_attn_layer_scale.scale"))
+                    .0,
                 ls_mlp: loader.load_f32(&format!("{t}.{i}.mlp_layer_scale.scale")).0,
             })
             .collect();
@@ -269,7 +312,11 @@ impl CodecEncoder {
             final_conv: CpuConv::load(loader, &format!("{p}.14.conv"), 1, true, false),
             tr_layers,
             downsample: CpuConv::load(loader, "encoder.downsample.conv", 2, false, true),
-            semantic: RvqEncoder::load(loader, "encoder.quantizer.semantic_residual_vector_quantizer", 1),
+            semantic: RvqEncoder::load(
+                loader,
+                "encoder.quantizer.semantic_residual_vector_quantizer",
+                1,
+            ),
             acoustic: RvqEncoder::load(
                 loader,
                 "encoder.quantizer.acoustic_residual_vector_quantizer",
@@ -283,7 +330,11 @@ impl CodecEncoder {
         let d = w.len();
         for (row_in, row_out) in x.chunks_exact(d).zip(out.chunks_exact_mut(d)) {
             let mean = row_in.iter().map(|&v| v as f64).sum::<f64>() / d as f64;
-            let var = row_in.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / d as f64;
+            let var = row_in
+                .iter()
+                .map(|&v| (v as f64 - mean).powi(2))
+                .sum::<f64>()
+                / d as f64;
             let inv = ((var + ENC_EPS).sqrt().recip()) as f32;
             let mean = mean as f32;
             for i in 0..d {
@@ -349,7 +400,8 @@ impl CodecEncoder {
                     let qrow = &q[qp * hd + hh * d..qp * hd + (hh + 1) * d];
                     for (si, kp) in (lo..=qp).enumerate() {
                         let krow = &k[kp * hd + hh * d..kp * hd + (hh + 1) * d];
-                        scores[si] = qrow.iter().zip(krow).map(|(&a, &b)| a * b).sum::<f32>() * scale;
+                        scores[si] =
+                            qrow.iter().zip(krow).map(|(&a, &b)| a * b).sum::<f32>() * scale;
                     }
                     let n = qp - lo + 1;
                     super::cpu::softmax(&mut scores[..n]);

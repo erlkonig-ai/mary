@@ -39,7 +39,8 @@ const GOLD: &str = "/tmp/mary-qwen3tts/golden";
 const REF_WAV: &str = "ref_voice.wav";
 
 fn golden(name: &str) -> (Vec<f32>, Vec<usize>) {
-    npy::load_npy(&Path::new(GOLD).join(format!("{name}.npy"))).unwrap_or_else(|e| panic!("golden {name}: {e}"))
+    npy::load_npy(&Path::new(GOLD).join(format!("{name}.npy")))
+        .unwrap_or_else(|e| panic!("golden {name}: {e}"))
 }
 
 fn metrics(name: &str, a: &[f32], b: &[f32], cos_gate: f64) -> bool {
@@ -54,7 +55,10 @@ fn metrics(name: &str, a: &[f32], b: &[f32], cos_gate: f64) -> bool {
     }
     let cos = dot / (na.sqrt() * nb.sqrt());
     let ok = cos > cos_gate;
-    println!("  {} {name:22} cos={cos:.8}  max|Δ|={maxabs:.3e}", if ok { "✓" } else { "✗" });
+    println!(
+        "  {} {name:22} cos={cos:.8}  max|Δ|={maxabs:.3e}",
+        if ok { "✓" } else { "✗" }
+    );
     ok
 }
 
@@ -85,7 +89,11 @@ fn run<B: Backend>(f16: bool) {
         let got = tok.encode(s);
         let m = got == want;
         ok &= m;
-        println!("  {} tokenizer[{i}]           {} tokens", if m { "✓" } else { "✗" }, got.len());
+        println!(
+            "  {} tokenizer[{i}]           {} tokens",
+            if m { "✓" } else { "✗" },
+            got.len()
+        );
         if !m {
             println!("    want {:?}", &want[..want.len().min(20)]);
             println!("    got  {:?}", &got[..got.len().min(20)]);
@@ -93,7 +101,9 @@ fn run<B: Backend>(f16: bool) {
     }
 
     // 2+3. speaker mel + encoder
-    let base = WeightLoader::SingleFile(SingleFileLoader::new(&Path::new(WEIGHTS).join("model.safetensors")));
+    let base = WeightLoader::SingleFile(SingleFileLoader::new(
+        &Path::new(WEIGHTS).join("model.safetensors"),
+    ));
     let (samples, sr) = wav::read_pcm16_mono(Path::new(REF_WAV));
     assert_eq!(sr, 24000);
     let mel_x = SpeakerMel::<B>::new(&dev);
@@ -140,8 +150,14 @@ fn run<B: Backend>(f16: bool) {
         ref_ids,
         spk_embedding: emb,
     };
-    let (prefill, trailing, tts_pad) =
-        pipeline::build_prefill(&talker, &predictor, &prompt, &text_ids, Some(LANG_ENGLISH), &dev);
+    let (prefill, trailing, tts_pad) = pipeline::build_prefill(
+        &talker,
+        &predictor,
+        &prompt,
+        &text_ids,
+        Some(LANG_ENGLISH),
+        &dev,
+    );
     let (gpre, gpres) = golden("prefill_embeds");
     assert_eq!(prefill.dims()[1], gpres[1], "prefill length");
     ok &= metrics("prefill embeds", &to_f32(prefill.clone()), &gpre, tight);
@@ -168,14 +184,7 @@ fn run<B: Backend>(f16: bool) {
     };
     let mut rng = rand::rngs::StdRng::seed_from_u64(0);
     let frames = pipeline::generate(
-        &talker,
-        &predictor,
-        prefill,
-        trailing,
-        tts_pad,
-        &params,
-        &mut rng,
-        &dev,
+        &talker, &predictor, prefill, trailing, tts_pad, &params, &mut rng, &dev,
     );
     let n = frames.len().min(20);
     let mut mism = 0;
@@ -194,7 +203,13 @@ fn run<B: Backend>(f16: bool) {
     }
     println!(
         "  {} greedy frames         {}/{} tokens match over {n} frames{}",
-        if m { "✓" } else if f16 { "·" } else { "✗" },
+        if m {
+            "✓"
+        } else if f16 {
+            "·"
+        } else {
+            "✗"
+        },
         n * NUM_CODE_GROUPS - mism,
         n * NUM_CODE_GROUPS,
         first_div
@@ -204,7 +219,9 @@ fn run<B: Backend>(f16: bool) {
     if !m && !f16 {
         for t in 0..n.min(3) {
             println!("    frame {t}: got {:?}", frames[t]);
-            let want: Vec<u32> = (0..NUM_CODE_GROUPS).map(|q| gc[t * gcs[1] + q] as u32).collect();
+            let want: Vec<u32> = (0..NUM_CODE_GROUPS)
+                .map(|q| gc[t * gcs[1] + q] as u32)
+                .collect();
             println!("    frame {t}: want {want:?}");
         }
     }
@@ -221,7 +238,11 @@ fn run<B: Backend>(f16: bool) {
     let wav_out = codec.decode(&prompt.ref_code, &dev);
     let (gwav, _) = golden("codec_refcodes_wav");
     ok &= metrics("codec waveform", &wav_out, &gwav, 0.99);
-    wav::write_pcm16_mono(Path::new("/tmp/mary-qwen3tts/codec_parity.wav"), &wav_out, SAMPLE_RATE);
+    wav::write_pcm16_mono(
+        Path::new("/tmp/mary-qwen3tts/codec_parity.wav"),
+        &wav_out,
+        SAMPLE_RATE,
+    );
 
     // 8. codec ENCODER (CPU) — encode ref_voice.wav, exact-match the oracle's
     // captured codes (backend-independent, gated in both modes)
@@ -257,7 +278,14 @@ fn run<B: Backend>(f16: bool) {
         prompt.ref_code.len()
     );
 
-    println!("{}", if ok { "ALL GATES PASSED" } else { "GATES FAILED" });
+    println!(
+        "{}",
+        if ok {
+            "ALL GATES PASSED"
+        } else {
+            "GATES FAILED"
+        }
+    );
     std::process::exit(if ok { 0 } else { 1 });
 }
 

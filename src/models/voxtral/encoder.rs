@@ -24,7 +24,12 @@ pub(crate) struct CausalConv<B: Backend> {
 }
 
 impl<B: Backend> CausalConv<B> {
-    pub(crate) fn load(loader: &WeightLoader, prefix: &str, stride: usize, device: &B::Device) -> Self {
+    pub(crate) fn load(
+        loader: &WeightLoader,
+        prefix: &str,
+        stride: usize,
+        device: &B::Device,
+    ) -> Self {
         let weight: Tensor<B, 3> = loader.load_tensor(&format!("{prefix}.weight"), device);
         let k = weight.dims()[2];
         Self {
@@ -85,9 +90,19 @@ impl<B: Backend> AudioEncoder<B> {
             .map(|i| {
                 let p = format!("audio_tower.layers.{i}");
                 EncoderLayer {
-                    attn_norm: RmsNorm::load(loader, &format!("{p}.self_attn_layer_norm.weight"), EPS, device),
+                    attn_norm: RmsNorm::load(
+                        loader,
+                        &format!("{p}.self_attn_layer_norm.weight"),
+                        EPS,
+                        device,
+                    ),
                     attn: Attention::load(loader, &format!("{p}.self_attn"), cfg, device),
-                    mlp_norm: RmsNorm::load(loader, &format!("{p}.final_layer_norm.weight"), EPS, device),
+                    mlp_norm: RmsNorm::load(
+                        loader,
+                        &format!("{p}.final_layer_norm.weight"),
+                        EPS,
+                        device,
+                    ),
                     mlp: Mlp::load(loader, &format!("{p}.mlp"), true, device),
                 }
             })
@@ -126,9 +141,13 @@ impl<B: Backend> AudioEncoder<B> {
         let device = embeds.device();
         let mut x = embeds;
         for (layer, cache) in self.layers.iter().zip(caches.0.iter_mut()) {
-            let att = layer
-                .attn
-                .forward(layer.attn_norm.forward(x.clone()), &cos, &sin, cache, &device);
+            let att = layer.attn.forward(
+                layer.attn_norm.forward(x.clone()),
+                &cos,
+                &sin,
+                cache,
+                &device,
+            );
             let x1 = x + att;
             let mlp = layer.mlp.forward(layer.mlp_norm.forward(x1.clone()));
             x = x1 + mlp;
@@ -140,7 +159,10 @@ impl<B: Backend> AudioEncoder<B> {
     /// decoder space `[1, l/4, 3072]`.
     pub fn project(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
         let [b, l, _] = hidden.dims();
-        assert!(l % DOWNSAMPLE == 0, "project needs a multiple of {DOWNSAMPLE} positions");
+        assert!(
+            l % DOWNSAMPLE == 0,
+            "project needs a multiple of {DOWNSAMPLE} positions"
+        );
         let stacked = hidden.reshape([b, l / DOWNSAMPLE, ENC_HIDDEN * DOWNSAMPLE]);
         self.proj2.forward(gelu(self.proj1.forward(stacked)))
     }

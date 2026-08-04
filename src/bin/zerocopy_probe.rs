@@ -37,20 +37,32 @@ fn main() {
     // SAFETY: ptr is page-aligned, PAGE bytes, lives until end of main.
     let handle = unsafe {
         client.register_external_aliased(
-            ptr as *mut core::ffi::c_void, PAGE as u64, 0, NBYTES as u64,
+            ptr as *mut core::ffi::c_void,
+            PAGE as u64,
+            0,
+            NBYTES as u64,
             std::sync::Arc::new(()),
         )
     };
 
     // Read it back off the GPU.
-    let bytes = client.read_one(handle.clone()).expect("read aliased handle");
+    let bytes = client
+        .read_one(handle.clone())
+        .expect("read aliased handle");
     let got = as_f32(&bytes);
     let ok1 = got.len() >= N && got[..N] == host[..];
-    println!("[alias] read-back matches host ramp: {ok1}  (got[0..3]={:?}, host[0..3]={:?})", &got[..3], &host[..3]);
+    println!(
+        "[alias] read-back matches host ramp: {ok1}  (got[0..3]={:?}, host[0..3]={:?})",
+        &got[..3],
+        &host[..3]
+    );
 
     // Prove it's a TRUE alias: mutate host memory, re-read, expect the change.
     // SAFETY: same region, still alive, no concurrent GPU op in flight.
-    unsafe { *ptr.add(0) = 999.0; *ptr.add(N - 1) = -999.0; }
+    unsafe {
+        *ptr.add(0) = 999.0;
+        *ptr.add(N - 1) = -999.0;
+    }
     let bytes2 = client.read_one(handle).expect("re-read aliased handle");
     let got2 = as_f32(&bytes2);
     let ok2 = (got2[0] - 999.0).abs() < 1e-3 && (got2[N - 1] + 999.0).abs() < 1e-3;

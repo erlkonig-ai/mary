@@ -49,7 +49,7 @@ impl<B: Backend> RotaryEmbedding<B> {
             .cos
             .clone()
             .slice([start_pos..start_pos + s])
-            .unsqueeze::<3>()  // [1, S, D]
+            .unsqueeze::<3>() // [1, S, D]
             .unsqueeze::<4>(); // [1, 1, S, D] — broadcasts with [B, H, S, D]
         let sin = self
             .sin

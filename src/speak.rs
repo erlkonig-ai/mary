@@ -81,11 +81,17 @@ const STREAM_CTX: usize = 25;
 const TALKER_F16_ENTITY: &str = "talker_f16";
 
 fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 fn env_f64(name: &str, default: f64) -> f64 {
-    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 /// Build the runtime weight loader for the speak pile: the fast handle-indexed
@@ -105,7 +111,11 @@ fn load_loader(weights_pile: &Path) -> anyhow::Result<WeightLoader> {
 /// ZERO-COPY alias of the mmap'd pile pages — no fold math at load, no
 /// weight copies. Otherwise the ordinary loader path — leaf-alias + fold at
 /// load — the surviving fallback for piles without the folded sibling.
-fn load_talker<B: Backend>(loader: &WeightLoader, weights_pile: &Path, dev: &B::Device) -> Talker<B> {
+fn load_talker<B: Backend>(
+    loader: &WeightLoader,
+    weights_pile: &Path,
+    dev: &B::Device,
+) -> Talker<B> {
     #[cfg(target_os = "macos")]
     {
         use crate::nn::backend::BHalf;
@@ -187,7 +197,9 @@ impl SpeakStream {
     pub fn finish(mut self) -> anyhow::Result<()> {
         while self.rx.recv().is_ok() {}
         match self.gen.take() {
-            Some(h) => h.join().map_err(|_| anyhow::anyhow!("speak generation thread panicked"))?,
+            Some(h) => h
+                .join()
+                .map_err(|_| anyhow::anyhow!("speak generation thread panicked"))?,
             None => Ok(()),
         }
     }
@@ -263,7 +275,9 @@ enum CodecMsg {
     Frame([u32; NUM_CODE_GROUPS]),
     /// End of a text pass: flush the partial window, reset the decode history
     /// to the reference, and (between passes) emit a short silence gap.
-    PassEnd { gap: bool },
+    PassEnd {
+        gap: bool,
+    },
 }
 
 fn synthesize_stream_impl<B: Backend + 'static>(
@@ -506,7 +520,10 @@ fn synthesize_stream_impl<B: Backend + 'static>(
             Ok(())
         })?;
 
-    Ok(SpeakStream { rx: rx_pcm, gen: Some(gen) })
+    Ok(SpeakStream {
+        rx: rx_pcm,
+        gen: Some(gen),
+    })
 }
 
 /// Convenience: [`synthesize`] then write the result to `out_path` as a 24 kHz

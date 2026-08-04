@@ -5,21 +5,23 @@
 //!   python3 scripts/probe_f5.py <model.safetensors>      # reference first
 //!   cargo run --release --bin probe -- <model.safetensors>
 
+use burn::prelude::*;
+use burn::tensor::TensorData;
+use mary::models::f5::config::F5Config;
+use mary::models::f5::model::F5Transformer;
 use mary::nn::backend::B;
 use mary::nn::npy;
 use mary::nn::weight_loader::{SingleFileLoader, WeightLoader};
-use burn::prelude::*;
-use burn::tensor::TensorData;
 use std::path::{Path, PathBuf};
-use mary::models::f5::config::F5Config;
-use mary::models::f5::model::F5Transformer;
 
 fn load(dir: &Path, name: &str) -> (Vec<f32>, Vec<usize>) {
     npy::load_npy(&dir.join(format!("{name}.npy"))).unwrap()
 }
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: probe <model.safetensors>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: probe <model.safetensors>");
     let device = Default::default();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("probes");
     let py = root.join("python");

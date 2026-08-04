@@ -43,7 +43,9 @@ struct KeymapW {
 }
 impl KeymapW {
     fn get(&self, name: &str) -> &(Vec<f32>, Vec<usize>) {
-        self.map.get(name).unwrap_or_else(|| panic!("missing vision weight {name}"))
+        self.map
+            .get(name)
+            .unwrap_or_else(|| panic!("missing vision weight {name}"))
     }
 }
 impl VisionWeights<B> for KeymapW {
@@ -95,8 +97,12 @@ fn vision_tower_parity() {
         return;
     }
     let device = NdArrayDevice::default();
-    let map = mary::persist::load_keymap_from_pile(Path::new(&pile_path)).expect("load vision pile");
-    eprintln!("[vision-parity] keymap has {} tensors; building tower ...", map.len());
+    let map =
+        mary::persist::load_keymap_from_pile(Path::new(&pile_path)).expect("load vision pile");
+    eprintln!(
+        "[vision-parity] keymap has {} tensors; building tower ...",
+        map.len()
+    );
     let w = KeymapW { map, device };
     let model = VisionTransformer::<B>::load(&w, &vision_cfg(), &device);
 
@@ -108,7 +114,11 @@ fn vision_tower_parity() {
     let want = npy::load_npy(&dir.join("merger_out.npy")).unwrap().0;
     assert_eq!(got.len(), want.len(), "merger_out dim mismatch");
     let cos = cosine(&got, &want);
-    let ma = got.iter().zip(&want).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+    let ma = got
+        .iter()
+        .zip(&want)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max);
     eprintln!("[vision-parity] merger_out: cosine={cos:.7} max_abs={ma:e}  (bar 0.999)");
     assert!(cos >= 0.999, "vision merger_out cosine={cos:.7} < 0.999");
 }
@@ -120,8 +130,8 @@ fn vision_tower_parity() {
 /// Accepts the combined `NOMIC_MM7B_PILE` (has vision keys) or the vision pile.
 #[test]
 fn vision_tower_multiwindow_parity() {
-    let pile_path = std::env::var("NOMIC_MM7B_PILE")
-        .or_else(|_| std::env::var("NOMIC_MM7B_VISION_PILE"));
+    let pile_path =
+        std::env::var("NOMIC_MM7B_PILE").or_else(|_| std::env::var("NOMIC_MM7B_VISION_PILE"));
     let Ok(pile_path) = pile_path else {
         eprintln!("SKIP: set NOMIC_MM7B_PILE or NOMIC_MM7B_VISION_PILE (see file header)");
         return;
@@ -139,11 +149,25 @@ fn vision_tower_multiwindow_parity() {
     let pixel_values = load2(&mw, "pixel_values", &device);
     let grid = vec![(1usize, 10usize, 10usize)]; // 5x5 merged units -> 4 windows
 
-    let got = model.forward(pixel_values, &grid).into_data().to_vec::<f32>().unwrap();
+    let got = model
+        .forward(pixel_values, &grid)
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
     let want = npy::load_npy(&mw.join("merger_out.npy")).unwrap().0;
-    assert_eq!(got.len(), want.len(), "mw merger_out dim mismatch ({} vs {})", got.len(), want.len());
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "mw merger_out dim mismatch ({} vs {})",
+        got.len(),
+        want.len()
+    );
     let cos = cosine(&got, &want);
-    let ma = got.iter().zip(&want).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+    let ma = got
+        .iter()
+        .zip(&want)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max);
     eprintln!("[vision-parity] MULTI-WINDOW merger_out (25 tokens): cosine={cos:.7} max_abs={ma:e}  (bar 0.999)");
     assert!(cos >= 0.999, "mw vision merger_out cosine={cos:.7} < 0.999");
 }

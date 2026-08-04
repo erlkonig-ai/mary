@@ -107,16 +107,31 @@ fn synth_chunk(
     let duration = ref_len + (ref_len as f64 / rb * gb / local_speed) as usize;
     let gen = duration - ref_len;
     let cond = Tensor::cat(
-        vec![ref_mel.clone(), Tensor::<B, 3>::zeros([1, gen, 100], device)],
+        vec![
+            ref_mel.clone(),
+            Tensor::<B, 3>::zeros([1, gen, 100], device),
+        ],
         1,
     );
     let y0 = Tensor::random([1, duration, 100], Distribution::Normal(0.0, 1.0), device);
     // nfe / cfg overridable via env for empirical latency/quality sweeps.
-    let nfe = std::env::var("MARY_NFE").ok().and_then(|s| s.parse().ok()).unwrap_or(32);
-    let cfg_strength = std::env::var("MARY_CFG").ok().and_then(|s| s.parse().ok()).unwrap_or(2.0);
-    let cfg = CfmConfig { nfe, sway_coef: -1.0, cfg_strength };
+    let nfe = std::env::var("MARY_NFE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32);
+    let cfg_strength = std::env::var("MARY_CFG")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2.0);
+    let cfg = CfmConfig {
+        nfe,
+        sway_coef: -1.0,
+        cfg_strength,
+    };
     let sampled = cfm::integrate(model, y0, cond, text, &cfg, device);
-    let gen_mel = sampled.slice([0..1, ref_len..duration, 0..100]).swap_dims(1, 2);
+    let gen_mel = sampled
+        .slice([0..1, ref_len..duration, 0..100])
+        .swap_dims(1, 2);
     vocos.forward(gen_mel).into_data().to_vec().unwrap()
 }
 
@@ -138,7 +153,9 @@ pub fn synthesize(weights_pile: &Path, ref_wav: &Path, ref_text: &str, gen_text:
     assert_eq!(sr, SAMPLE_RATE, "reference clip must be 24 kHz mono");
     let n = samples.len();
     let wavt = Tensor::<B, 1>::from_floats(samples.as_slice(), &device).reshape([1, n]);
-    let ref_mel = MelExtractor::<B>::new(&device).forward(wavt).swap_dims(1, 2);
+    let ref_mel = MelExtractor::<B>::new(&device)
+        .forward(wavt)
+        .swap_dims(1, 2);
     let ref_len = ref_mel.dims()[1];
 
     let t_load = std::time::Instant::now();
@@ -146,7 +163,10 @@ pub fn synthesize(weights_pile: &Path, ref_wav: &Path, ref_text: &str, gen_text:
         .unwrap_or_else(|e| panic!("load voice pile {weights_pile:?}: {e:?}"));
     let model = F5Transformer::<B>::load(&loader, F5Config::v1_base(), &device);
     let vocos = Vocos::<B>::load(&loader, &device);
-    eprintln!("[timing] weight load (pile): {:.2}s", t_load.elapsed().as_secs_f32());
+    eprintln!(
+        "[timing] weight load (pile): {:.2}s",
+        t_load.elapsed().as_secs_f32()
+    );
 
     let chunks = chunk_text(gen_text, MAX_CHARS);
     eprintln!("{} pass(es), ref_len {ref_len}", chunks.len());
@@ -157,7 +177,8 @@ pub fn synthesize(weights_pile: &Path, ref_wav: &Path, ref_text: &str, gen_text:
         let w = synth_chunk(&model, &vocos, &ref_mel, ref_len, ref_text, chunk, &device);
         audio.extend_from_slice(&w);
         if i + 1 < chunks.len() {
-            audio.extend(std::iter::repeat(0.0).take(SAMPLE_RATE as usize / 6)); // ~167 ms gap
+            audio.extend(std::iter::repeat(0.0).take(SAMPLE_RATE as usize / 6));
+            // ~167 ms gap
         }
     }
 
@@ -165,7 +186,9 @@ pub fn synthesize(weights_pile: &Path, ref_wav: &Path, ref_text: &str, gen_text:
     let audio_s = audio.len() as f32 / SAMPLE_RATE as f32;
     eprintln!(
         "[timing] synth: {:.2}s for {:.2}s audio ({:.2}x realtime)",
-        synth_s, audio_s, synth_s / audio_s.max(1e-6)
+        synth_s,
+        audio_s,
+        synth_s / audio_s.max(1e-6)
     );
 
     let peak = audio.iter().fold(0f32, |m, &x| m.max(x.abs())).max(1e-6);

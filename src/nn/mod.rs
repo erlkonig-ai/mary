@@ -5,8 +5,8 @@
 #[cfg(all(any(feature = "qwen3tts", feature = "voxtral"), target_os = "macos"))]
 pub mod alias;
 pub mod backend;
-pub mod npy;
 pub mod norm;
+pub mod npy;
 #[cfg(feature = "q4")]
 pub mod q4;
 pub mod weight_loader;

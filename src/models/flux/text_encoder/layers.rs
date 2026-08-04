@@ -26,7 +26,7 @@ pub fn rms_norm_3d<B: Backend>(x: Tensor<B, 3>, weight: Tensor<B, 1>, eps: f64) 
     let variance = x.clone().powf_scalar(2.0).mean_dim(2); // [B, L, 1]
     let inv_rms = (variance + eps).sqrt().recip(); // [B, L, 1]
     let normed = x * inv_rms; // [B, L, D]
-    // Broadcast multiply with weight [D] -> [1, 1, D]
+                              // Broadcast multiply with weight [D] -> [1, 1, D]
     let w = weight.reshape([1, 1, d]);
     normed * w
 }
@@ -134,9 +134,10 @@ impl<B: Backend> Qwen3Attention<B> {
         let attn_output = attn_weights.matmul(v); // [B, H, L, D]
 
         // Reshape back: [B, H, L, D] -> [B, L, H*D]
-        let attn_output = attn_output
-            .swap_dims(1, 2)
-            .reshape([batch, seq_len, num_heads * head_dim]);
+        let attn_output =
+            attn_output
+                .swap_dims(1, 2)
+                .reshape([batch, seq_len, num_heads * head_dim]);
 
         // Output projection
         linear3d(attn_output, self.o_proj_weight.clone())
@@ -162,10 +163,8 @@ impl<B: Backend> Qwen3Attention<B> {
                 mask_data[i * seq_len + j] = f32::NEG_INFINITY;
             }
         }
-        let mask = Tensor::<B, 2>::from_data(
-            TensorData::new(mask_data, [seq_len, seq_len]),
-            &device,
-        );
+        let mask =
+            Tensor::<B, 2>::from_data(TensorData::new(mask_data, [seq_len, seq_len]), &device);
         // Broadcast: [1, 1, S, S]
         let mask = mask.reshape([1, 1, seq_len, seq_len]);
         attn + mask

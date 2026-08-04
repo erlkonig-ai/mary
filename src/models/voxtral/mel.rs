@@ -73,7 +73,9 @@ impl<B: Backend> VoxtralMel<B> {
         let ksin = Tensor::<B, 1>::from_floats(sin.as_slice(), device).reshape([n_freq, 1, N_FFT]);
 
         // slaney filterbank, slaney norm (transformers mel_filter_bank defaults)
-        let all_freqs: Vec<f64> = (0..n_freq).map(|k| k as f64 * SAMPLE_RATE as f64 / nf).collect();
+        let all_freqs: Vec<f64> = (0..n_freq)
+            .map(|k| k as f64 * SAMPLE_RATE as f64 / nf)
+            .collect();
         let (m_min, m_max) = (hz_to_mel_slaney(0.0), hz_to_mel_slaney(FMAX));
         let f_pts: Vec<f64> = (0..MEL_BINS + 2)
             .map(|i| mel_to_hz_slaney(m_min + (m_max - m_min) * i as f64 / (MEL_BINS + 1) as f64))
@@ -114,7 +116,10 @@ impl<B: Backend> VoxtralMel<B> {
         let power = power.narrow(2, 0, t);
         let [_, nf, _] = power.dims();
         let mel = self.fb.clone().reshape([1, MEL_BINS, nf]).matmul(power);
-        let log = mel.clamp_min(1e-10).log().div_scalar(std::f64::consts::LN_10);
+        let log = mel
+            .clamp_min(1e-10)
+            .log()
+            .div_scalar(std::f64::consts::LN_10);
         let log = log.clamp_min(GLOBAL_LOG_MEL_MAX - 8.0);
         log.add_scalar(4.0).div_scalar(4.0)
     }

@@ -61,7 +61,10 @@ pub fn detect_format(dir: &Path) -> anyhow::Result<(WeightFormat, Vec<std::path:
     if !safet.is_empty() {
         return Ok((WeightFormat::Safetensors, safet));
     }
-    let gguf: Vec<_> = has_ext("gguf").into_iter().filter(|p| is_gguf_file(p)).collect();
+    let gguf: Vec<_> = has_ext("gguf")
+        .into_iter()
+        .filter(|p| is_gguf_file(p))
+        .collect();
     if !gguf.is_empty() {
         return Ok((WeightFormat::Gguf, gguf));
     }
@@ -75,7 +78,10 @@ pub fn detect_format(dir: &Path) -> anyhow::Result<(WeightFormat, Vec<std::path:
                     .and_then(|n| n.to_str())
                     .map(|n| n.starts_with("pytorch_model") || n == "model.bin")
                     .unwrap_or(false);
-            let is_pth = p.extension().map(|x| x == "pth" || x == "pt").unwrap_or(false);
+            let is_pth = p
+                .extension()
+                .map(|x| x == "pth" || x == "pt")
+                .unwrap_or(false);
             is_bin || is_pth
         })
         .cloned()
@@ -102,7 +108,9 @@ pub fn extract_tensors(
         WeightFormat::Gguf => gguf::extract_tensors(file),
         WeightFormat::Pickle => pickle::extract_tensors(file),
         WeightFormat::Safetensors => {
-            anyhow::bail!("safetensors are ingested via ingest::ingest_members, not formats::extract_tensors")
+            anyhow::bail!(
+                "safetensors are ingested via ingest::ingest_members, not formats::extract_tensors"
+            )
         }
     }
 }

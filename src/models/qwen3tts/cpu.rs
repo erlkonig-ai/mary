@@ -85,7 +85,11 @@ pub fn sgemv(w: &[f32], m: usize, n: usize, x: &[f32], y: &mut [f32]) {
     }
     #[cfg(not(target_os = "macos"))]
     for i in 0..m {
-        y[i] = w[i * n..(i + 1) * n].iter().zip(x).map(|(&a, &b)| a * b).sum();
+        y[i] = w[i * n..(i + 1) * n]
+            .iter()
+            .zip(x)
+            .map(|(&a, &b)| a * b)
+            .sum();
     }
 }
 
@@ -151,8 +155,11 @@ pub fn sgemm_nt(a: &[f32], b: &[f32], m: usize, k: usize, n: usize, c: &mut [f32
     #[cfg(not(target_os = "macos"))]
     for i in 0..m {
         for j in 0..n {
-            c[i * n + j] =
-                a[i * k..(i + 1) * k].iter().zip(&b[j * k..(j + 1) * k]).map(|(&x, &y)| x * y).sum();
+            c[i * n + j] = a[i * k..(i + 1) * k]
+                .iter()
+                .zip(&b[j * k..(j + 1) * k])
+                .map(|(&x, &y)| x * y)
+                .sum();
         }
     }
 }
@@ -348,7 +355,9 @@ pub fn sgemv_mt(w: &[f32], m: usize, n: usize, x: &[f32], y: &mut [f32]) {
     debug_assert_eq!(w.len(), m * n);
     debug_assert_eq!(x.len(), n);
     debug_assert_eq!(y.len(), m);
-    let Some(pool) = pool() else { return sgemv(w, m, n, x, y) };
+    let Some(pool) = pool() else {
+        return sgemv(w, m, n, x, y);
+    };
     // ~4 chunks per way (min 64 rows, 64-row aligned) balances steal
     // granularity against per-chunk call overhead.
     let chunk = (m.div_ceil(4 * pool.ways)).next_multiple_of(64).max(64);
@@ -356,7 +365,14 @@ pub fn sgemv_mt(w: &[f32], m: usize, n: usize, x: &[f32], y: &mut [f32]) {
     static DISPATCH: Mutex<()> = Mutex::new(());
     let _d = DISPATCH.lock().unwrap();
     unsafe {
-        *pool.job.get() = Job { w: w.as_ptr(), x: x.as_ptr(), y: y.as_mut_ptr(), m, n, chunk };
+        *pool.job.get() = Job {
+            w: w.as_ptr(),
+            x: x.as_ptr(),
+            y: y.as_mut_ptr(),
+            m,
+            n,
+            chunk,
+        };
     }
     let gen = pool.epoch.load(Ordering::Relaxed) + 1;
     pool.done.store(0, Ordering::Release);

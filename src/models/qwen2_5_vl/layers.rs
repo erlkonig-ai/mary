@@ -19,8 +19,14 @@ use super::config::Qwen2_5VlTextConfig;
 fn apply_rope<B: Backend>(x: Tensor<B, 4>, cos: &Tensor<B, 2>, sin: &Tensor<B, 2>) -> Tensor<B, 4> {
     let [b, nh, seq, hd] = x.dims();
     let half = hd / 2;
-    let cos = cos.clone().reshape([1, 1, seq, half]).expand([b, nh, seq, half]);
-    let sin = sin.clone().reshape([1, 1, seq, half]).expand([b, nh, seq, half]);
+    let cos = cos
+        .clone()
+        .reshape([1, 1, seq, half])
+        .expand([b, nh, seq, half]);
+    let sin = sin
+        .clone()
+        .reshape([1, 1, seq, half])
+        .expand([b, nh, seq, half]);
     let x1 = x.clone().narrow(3, 0, half);
     let x2 = x.narrow(3, half, half);
     let out1 = x1.clone() * cos.clone() - x2.clone() * sin.clone();
@@ -85,7 +91,11 @@ impl<B: Backend> QwenRmsNorm<B> {
         let var = x.clone().powf_scalar(2.0).mean_dim(2);
         let normed = x.mul(var.add_scalar(self.eps).sqrt().recip());
         let d = self.weight.dims()[0];
-        let w = self.weight.clone().cast(burn::tensor::FloatDType::F32).reshape([1, 1, d]);
+        let w = self
+            .weight
+            .clone()
+            .cast(burn::tensor::FloatDType::F32)
+            .reshape([1, 1, d]);
         normed.mul(w).cast(dt)
     }
 }
@@ -164,7 +174,9 @@ impl<B: Backend> QwenAttention<B> {
         let k = Self::repeat_kv(k, n_rep);
         let v = Self::repeat_kv(v, n_rep);
 
-        let scores = q.matmul(k.swap_dims(2, 3)).mul_scalar((hd as f64).powf(-0.5));
+        let scores = q
+            .matmul(k.swap_dims(2, 3))
+            .mul_scalar((hd as f64).powf(-0.5));
         let scores = scores.clone() + Self::causal_mask(s, &scores.device());
         // HF softmaxes attention in fp32 then casts back to the model dtype; in
         // f16 the masked scores + exp can otherwise lose/blow precision. Identity
@@ -289,7 +301,12 @@ pub fn get_rope_index(
             pos.push([p, p, p]);
         }
     }
-    debug_assert_eq!(pos.len(), n, "get_rope_index produced {} of {n} positions", pos.len());
+    debug_assert_eq!(
+        pos.len(),
+        n,
+        "get_rope_index produced {} of {n} positions",
+        pos.len()
+    );
     pos
 }
 
@@ -302,8 +319,8 @@ pub struct QwenTextModel<B: Backend> {
     embed: QwenEmbedding<B>,
     layers: Vec<QwenDecoderLayer<B>>,
     norm: QwenRmsNorm<B>,
-    inv_freq: Vec<f64>,         // [head_dim/2]
-    mrope_section: [usize; 3],  // sums to head_dim/2
+    inv_freq: Vec<f64>,        // [head_dim/2]
+    mrope_section: [usize; 3], // sums to head_dim/2
     device: B::Device,
 }
 
@@ -382,7 +399,12 @@ impl<B: Backend> QwenTextModel<B> {
 
     /// Default text positions: sequential `[i, i, i]` for each of `s` tokens.
     fn text_positions(s: usize) -> Vec<[i64; 3]> {
-        (0..s).map(|i| { let p = i as i64; [p, p, p] }).collect()
+        (0..s)
+            .map(|i| {
+                let p = i as i64;
+                [p, p, p]
+            })
+            .collect()
     }
 
     /// Run the backbone over token ids `[B, S]` → final hidden states `[B, S, H]`

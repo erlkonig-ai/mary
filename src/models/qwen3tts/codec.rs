@@ -49,7 +49,13 @@ struct CausalConv<B: Backend> {
 }
 
 impl<B: Backend> CausalConv<B> {
-    fn load(loader: &WeightLoader, prefix: &str, dilation: usize, groups: usize, device: &B::Device) -> Self {
+    fn load(
+        loader: &WeightLoader,
+        prefix: &str,
+        dilation: usize,
+        groups: usize,
+        device: &B::Device,
+    ) -> Self {
         let w: Tensor<B, 3> = loader.load_tensor(&format!("{prefix}.weight"), device);
         let [o, i, k] = w.dims();
         let w2 = (groups == 1).then(|| w.clone().swap_dims(1, 2).reshape([o, k * i]));
@@ -74,8 +80,9 @@ impl<B: Backend> CausalConv<B> {
         match &self.w2 {
             Some(w2) if k > 1 => {
                 // im2col: rows [x[·, j·dil ..][:l] for j in 0..k] → [1, k·C, L]
-                let shifts: Vec<Tensor<B, 3>> =
-                    (0..k).map(|j| x.clone().narrow(2, j * self.dilation, l)).collect();
+                let shifts: Vec<Tensor<B, 3>> = (0..k)
+                    .map(|j| x.clone().narrow(2, j * self.dilation, l))
+                    .collect();
                 let xs = Tensor::cat(shifts, 1);
                 let o = w2.dims()[0];
                 w2.clone().unsqueeze::<3>().matmul(xs) + self.b.clone().reshape([1, o, 1])
@@ -109,7 +116,10 @@ impl<B: Backend> CausalTransConv<B> {
     fn load(loader: &WeightLoader, prefix: &str, stride: usize, device: &B::Device) -> Self {
         let w: Tensor<B, 3> = loader.load_tensor(&format!("{prefix}.weight"), device); // [in, out, k]
         let [i, o, k] = w.dims();
-        assert!(k % stride == 0 && k / stride <= 2, "transconv k={k} stride={stride}");
+        assert!(
+            k % stride == 0 && k / stride <= 2,
+            "transconv k={k} stride={stride}"
+        );
         // [in, out, k] → [k, out, in] → [k·out, in]
         let w2 = w.permute([2, 1, 0]).reshape([k * o, i]);
         Self {
@@ -125,13 +135,16 @@ impl<B: Backend> CausalTransConv<B> {
         let [_, _, t] = x.dims();
         let (o, k, s) = (self.out_ch, self.k, self.stride);
         let z = self.w2.clone().unsqueeze::<3>().matmul(x); // [1, k·o, T]
-        // out[t·s + j] = Σ_b z[j + s·b, ·, t − b]  (b < k/s), trimmed to T·s
+                                                            // out[t·s + j] = Σ_b z[j + s·b, ·, t − b]  (b < k/s), trimmed to T·s
         let z = z.reshape([k, o, t]);
         let mut acc = z.clone().narrow(0, 0, s); // b = 0 block [s, o, T]
         if k == 2 * s {
             let z1 = z.narrow(0, s, s);
             let shifted = Tensor::cat(
-                vec![Tensor::zeros([s, o, 1], &z1.device()), z1.narrow(2, 0, t - 1)],
+                vec![
+                    Tensor::zeros([s, o, 1], &z1.device()),
+                    z1.narrow(2, 0, t - 1),
+                ],
                 2,
             );
             acc = acc + shifted;
@@ -179,7 +192,13 @@ impl<B: Backend> ConvNeXt<B> {
         let dim = 1024; // latent
         let _ = dim;
         Self {
-            dw: CausalConv::load(loader, &format!("{prefix}.dwconv.conv"), 1, DEC_LATENT, device),
+            dw: CausalConv::load(
+                loader,
+                &format!("{prefix}.dwconv.conv"),
+                1,
+                DEC_LATENT,
+                device,
+            ),
             norm_w: loader.load_tensor(&format!("{prefix}.norm.weight"), device),
             norm_b: loader.load_tensor(&format!("{prefix}.norm.bias"), device),
             pw1: Linear::load(loader, &format!("{prefix}.pwconv1"), true, device),
@@ -191,7 +210,7 @@ impl<B: Backend> ConvNeXt<B> {
     fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         let input = x.clone();
         let h = self.dw.forward(x).swap_dims(1, 2); // [B,T,C]
-        // LayerNorm eps 1e-6 over channels
+                                                    // LayerNorm eps 1e-6 over channels
         let d = self.norm_w.dims()[0];
         let mean = h.clone().mean_dim(2);
         let var = (h.clone() - mean.clone()).powf_scalar(2.0).mean_dim(2);
@@ -249,7 +268,12 @@ impl<B: Backend> Rvq<B> {
             });
         }
         let q = sum.unwrap().swap_dims(0, 1).reshape([1, DEC_CODE_DIM, t]); // [1,256,T]
-        conv1d(q, self.output_proj.clone(), None, ConvOptions::new([1], [0], [1], 1))
+        conv1d(
+            q,
+            self.output_proj.clone(),
+            None,
+            ConvOptions::new([1], [0], [1], 1),
+        )
     }
 }
 
@@ -314,12 +338,22 @@ impl<B: Backend> CodecDecoder<B> {
         let cfg = dec_attn_config();
         Self {
             rvq_first: Rvq::load(loader, "decoder.quantizer.rvq_first", 1, device),
-            rvq_rest: Rvq::load(loader, "decoder.quantizer.rvq_rest", NUM_CODE_GROUPS - 1, device),
+            rvq_rest: Rvq::load(
+                loader,
+                "decoder.quantizer.rvq_rest",
+                NUM_CODE_GROUPS - 1,
+                device,
+            ),
             pre_conv: CausalConv::load(loader, "decoder.pre_conv.conv", 1, 1, device),
             tr_input: Linear::load(loader, "decoder.pre_transformer.input_proj", true, device),
             tr_layers: (0..DEC_TR_LAYERS)
                 .map(|i| {
-                    DecoderLayer::load(loader, &format!("decoder.pre_transformer.layers.{i}"), cfg, device)
+                    DecoderLayer::load(
+                        loader,
+                        &format!("decoder.pre_transformer.layers.{i}"),
+                        cfg,
+                        device,
+                    )
                 })
                 .collect(),
             tr_output: Linear::load(loader, "decoder.pre_transformer.output_proj", true, device)
@@ -355,7 +389,11 @@ impl<B: Backend> CodecDecoder<B> {
     }
 
     /// Split-RVQ decode: `codes[t][q]` frames → `[1, 512, T]`.
-    pub fn quantizer_decode(&self, codes: &[[u32; NUM_CODE_GROUPS]], device: &B::Device) -> Tensor<B, 3> {
+    pub fn quantizer_decode(
+        &self,
+        codes: &[[u32; NUM_CODE_GROUPS]],
+        device: &B::Device,
+    ) -> Tensor<B, 3> {
         let sem: Vec<Vec<u32>> = vec![codes.iter().map(|f| f[0]).collect()];
         let ac: Vec<Vec<u32>> = (1..NUM_CODE_GROUPS)
             .map(|q| codes.iter().map(|f| f[q]).collect())
@@ -385,7 +423,10 @@ impl<B: Backend> CodecDecoder<B> {
         for (layer, cache) in self.tr_layers.iter().zip(caches.iter_mut()) {
             hs = layer.forward(hs, &cos, &sin, cache, device);
         }
-        let h = self.tr_output.forward(super::layers::rms(hs, DEC_TR_EPS)).swap_dims(1, 2); // [1,1024,T]
+        let h = self
+            .tr_output
+            .forward(super::layers::rms(hs, DEC_TR_EPS))
+            .swap_dims(1, 2); // [1,1024,T]
         sync("pre_transformer", &mut t, &h);
 
         let mut h = h;
@@ -401,7 +442,11 @@ impl<B: Backend> CodecDecoder<B> {
         let w = self.dec_tail_conv.forward(self.dec_tail_act.forward(w));
         let w = w.clamp(-1.0, 1.0);
         let n = w.dims()[2];
-        w.reshape([n]).into_data().convert::<f32>().to_vec().unwrap()
+        w.reshape([n])
+            .into_data()
+            .convert::<f32>()
+            .to_vec()
+            .unwrap()
     }
 
     /// Reference `chunked_decode`: 300-frame chunks, 25-frame left context.

@@ -49,7 +49,10 @@ fn main() -> anyhow::Result<()> {
             })
             .collect();
         let t = Instant::now();
-        eprintln!("Persisting {component} ({} file(s)) → {pile_path:?} ...", files.len());
+        eprintln!(
+            "Persisting {component} ({} file(s)) → {pile_path:?} ...",
+            files.len()
+        );
         persist_safetensors_files_to_pile(&files, pile_path, LeafDtype::F16)?;
         eprintln!("  {component}: {:.1}s", t.elapsed().as_secs_f64());
     }

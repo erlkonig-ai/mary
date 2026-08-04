@@ -10,8 +10,8 @@
 
 use burn::nn::{
     conv::{Conv1d, Conv1dConfig, Conv2d, Conv2dConfig},
-    LayerNorm, LayerNormConfig, Linear, LinearConfig, PaddingConfig1d, PaddingConfig2d,
-    RmsNorm, RmsNormConfig,
+    LayerNorm, LayerNormConfig, Linear, LinearConfig, PaddingConfig1d, PaddingConfig2d, RmsNorm,
+    RmsNormConfig,
 };
 use burn::prelude::*;
 use burn::tensor::Tensor;
@@ -152,8 +152,14 @@ pub fn build_subsample<B: Backend>(
     };
 
     SubSampleConvProjection {
-        layer0: SubSampleConvLayer { conv: conv0, norm: norm0 },
-        layer1: SubSampleConvLayer { conv: conv1, norm: norm1 },
+        layer0: SubSampleConvLayer {
+            conv: conv0,
+            norm: norm0,
+        },
+        layer1: SubSampleConvLayer {
+            conv: conv1,
+            norm: norm1,
+        },
         input_proj,
         input_feat_dim,
         hidden_size: config.hidden_size,
@@ -280,7 +286,7 @@ impl<B: Backend> AudioLightConv1d<B> {
         let residual = x.clone();
         let h = self.pre_layer_norm.forward(x);
         let h = self.linear_start.forward(h); // [B, T, 2*hidden]
-        // GLU along last dim: split (a, b), y = a * sigmoid(b)
+                                              // GLU along last dim: split (a, b), y = a * sigmoid(b)
         let [b_, t, two_h] = h.dims();
         let half = two_h / 2;
         let a = h.clone().slice([0..b_, 0..t, 0..half]);
@@ -327,11 +333,7 @@ pub fn build_clippable_linear<B: Backend>(
 }
 
 /// Build an RmsNorm with a preloaded 1D gamma tensor.
-pub fn build_rms_norm<B: Backend>(
-    gamma: Tensor<B, 1>,
-    eps: f64,
-    device: &B::Device,
-) -> RmsNorm<B> {
+pub fn build_rms_norm<B: Backend>(gamma: Tensor<B, 1>, eps: f64, device: &B::Device) -> RmsNorm<B> {
     use burn::module::Param;
     let dim = gamma.dims()[0];
     let mut m = RmsNormConfig::new(dim).with_epsilon(eps).init::<B>(device);
@@ -388,9 +390,15 @@ pub struct AudioAttention<B: Backend> {
 
 impl<B: Backend> AudioAttention<B> {
     /// Debug-only passthrough to internal helpers.
-    pub fn convert_to_block_pub(&self, x: Tensor<B, 4>) -> Tensor<B, 5> { self.convert_to_block(x) }
-    pub fn extract_block_context_pub(&self, x: Tensor<B, 4>) -> Tensor<B, 5> { self.extract_block_context(x) }
-    pub fn rel_shift_pub(&self, x: Tensor<B, 5>) -> Tensor<B, 5> { self.rel_shift(x) }
+    pub fn convert_to_block_pub(&self, x: Tensor<B, 4>) -> Tensor<B, 5> {
+        self.convert_to_block(x)
+    }
+    pub fn extract_block_context_pub(&self, x: Tensor<B, 4>) -> Tensor<B, 5> {
+        self.extract_block_context(x)
+    }
+    pub fn rel_shift_pub(&self, x: Tensor<B, 5>) -> Tensor<B, 5> {
+        self.rel_shift(x)
+    }
 
     /// Split [B, T, H, D] → [B, num_blocks, chunk_size, H, D] (pad tail).
     fn convert_to_block(&self, x: Tensor<B, 4>) -> Tensor<B, 5> {
@@ -455,8 +463,14 @@ impl<B: Backend> AudioAttention<B> {
         let h = self.num_heads;
         let d = self.head_dim;
 
-        let q = self.q_proj.forward(hidden_states.clone()).reshape([b, t, h, d]);
-        let k = self.k_proj.forward(hidden_states.clone()).reshape([b, t, h, d]);
+        let q = self
+            .q_proj
+            .forward(hidden_states.clone())
+            .reshape([b, t, h, d]);
+        let k = self
+            .k_proj
+            .forward(hidden_states.clone())
+            .reshape([b, t, h, d]);
         let v = self.v_proj.forward(hidden_states).reshape([b, t, h, d]);
 
         // q = q * q_scale * softplus(per_dim_scale)
@@ -507,7 +521,9 @@ impl<B: Backend> AudioAttention<B> {
 
         // softcap * tanh((ac + bd) / softcap)
         let attn = matrix_ac + matrix_bd;
-        let attn = (attn.div_scalar(self.softcap)).tanh().mul_scalar(self.softcap);
+        let attn = (attn.div_scalar(self.softcap))
+            .tanh()
+            .mul_scalar(self.softcap);
 
         // Apply mask: set invalid positions to invalid_logits_value
         let attn = if let Some(m) = mask_5d {
@@ -517,7 +533,7 @@ impl<B: Backend> AudioAttention<B> {
         };
 
         let attn_weights = burn::tensor::activation::softmax(attn, 4); // softmax over context dim
-        // out = attn_weights @ v.permute(0, 3, 1, 2, 4) = [B, H, nb, cs, ctx] @ [B, H, nb, ctx, D]
+                                                                       // out = attn_weights @ v.permute(0, 3, 1, 2, 4) = [B, H, nb, cs, ctx] @ [B, H, nb, ctx, D]
         let values = v_ctx.permute([0, 3, 1, 2, 4]); // [B, H, nb, ctx, D]
         let aw4 = attn_weights.reshape([b * h * nb, cs, ctx]);
         let v4 = values.reshape([b * h * nb, ctx, d]);
@@ -568,9 +584,14 @@ impl<B: Backend> AudioEmbedder<B> {
         let (data, shape) = fetch(name).unwrap_or_else(|| panic!("tensor not found: {name}"));
         let w = Tensor::<B, 1>::from_floats(&data[..], device).reshape([shape[0], shape[1]]);
         let [out_dim, in_dim] = w.dims();
-        let mut lin = LinearConfig::new(in_dim, out_dim).with_bias(false).init::<B>(device);
+        let mut lin = LinearConfig::new(in_dim, out_dim)
+            .with_bias(false)
+            .init::<B>(device);
         lin.weight = Param::from_tensor(w.swap_dims(0, 1));
-        AudioEmbedder { embedding_projection: lin, eps }
+        AudioEmbedder {
+            embedding_projection: lin,
+            eps,
+        }
     }
 
     #[cfg(feature = "import")]
@@ -672,10 +693,14 @@ impl<B: Backend> AudioModel<B> {
         for b in 0..num_blocks {
             for row in 0..cs {
                 let q_pos = b * cs + row;
-                if q_pos >= seq_len { continue; } // query past end → row fully masked
+                if q_pos >= seq_len {
+                    continue;
+                } // query past end → row fully masked
                 for o in 0..ctx {
                     let kv_pos_raw = (b * cs + o) as isize - past as isize;
-                    if kv_pos_raw < 0 || (kv_pos_raw as usize) >= seq_len { continue; }
+                    if kv_pos_raw < 0 || (kv_pos_raw as usize) >= seq_len {
+                        continue;
+                    }
                     // Python (sliding_window_mask_function, gemma4):
                     //   dist = q - kv
                     //   left  := dist >= 0 && dist < past
@@ -685,15 +710,16 @@ impl<B: Backend> AudioModel<B> {
                     let delta = q_pos as isize - kv_pos_raw;
                     let left = delta >= 0 && delta < past as isize;
                     let right = delta < 0 && -delta < future as isize;
-                    if !(left || right) { continue; }
+                    if !(left || right) {
+                        continue;
+                    }
                     data[(b * cs + row) * ctx + o] = 0.0;
                 }
             }
         }
         let _ = padded;
 
-        Tensor::<B, 1>::from_floats(&data[..], device)
-            .reshape([1, 1, num_blocks, cs, ctx])
+        Tensor::<B, 1>::from_floats(&data[..], device).reshape([1, 1, num_blocks, cs, ctx])
     }
 
     /// Load the full audio tower from HuggingFace safetensors shards.
@@ -730,8 +756,7 @@ impl<B: Backend> AudioModel<B> {
             name: &str,
             device: &B::Device,
         ) -> Tensor<B, D> {
-            let (data, shape) =
-                fetch(name).unwrap_or_else(|| panic!("tensor not found: {name}"));
+            let (data, shape) = fetch(name).unwrap_or_else(|| panic!("tensor not found: {name}"));
             let dims: [usize; D] = std::array::from_fn(|i| shape[i]);
             Tensor::<B, 1>::from_floats(&data[..], device).reshape(dims)
         }
@@ -772,15 +797,25 @@ impl<B: Backend> AudioModel<B> {
                 let p = format!("{lp}.{sub}");
                 AudioFeedForward {
                     pre_layer_norm: build_rms_norm(
-                        t::<1, B>(fetch, &format!("{p}.pre_layer_norm.weight"), device), eps, device),
+                        t::<1, B>(fetch, &format!("{p}.pre_layer_norm.weight"), device),
+                        eps,
+                        device,
+                    ),
                     post_layer_norm: build_rms_norm(
-                        t::<1, B>(fetch, &format!("{p}.post_layer_norm.weight"), device), eps, device),
+                        t::<1, B>(fetch, &format!("{p}.post_layer_norm.weight"), device),
+                        eps,
+                        device,
+                    ),
                     ffw_layer_1: build_clippable_linear(
                         t::<2, B>(fetch, &format!("{p}.ffw_layer_1.linear.weight"), device),
-                        clip(fetch, &format!("{p}.ffw_layer_1")), device),
+                        clip(fetch, &format!("{p}.ffw_layer_1")),
+                        device,
+                    ),
                     ffw_layer_2: build_clippable_linear(
                         t::<2, B>(fetch, &format!("{p}.ffw_layer_2.linear.weight"), device),
-                        clip(fetch, &format!("{p}.ffw_layer_2")), device),
+                        clip(fetch, &format!("{p}.ffw_layer_2")),
+                        device,
+                    ),
                     post_layer_scale: config.residual_weight,
                     gradient_clipping: config.gradient_clipping,
                 }
@@ -790,18 +825,39 @@ impl<B: Backend> AudioModel<B> {
             let lconv_p = format!("{lp}.lconv1d");
             let lconv = AudioLightConv1d {
                 pre_layer_norm: build_rms_norm(
-                    t::<1, B>(fetch, &format!("{lconv_p}.pre_layer_norm.weight"), device), eps, device),
+                    t::<1, B>(fetch, &format!("{lconv_p}.pre_layer_norm.weight"), device),
+                    eps,
+                    device,
+                ),
                 conv_norm: build_rms_norm(
-                    t::<1, B>(fetch, &format!("{lconv_p}.conv_norm.weight"), device), eps, device),
+                    t::<1, B>(fetch, &format!("{lconv_p}.conv_norm.weight"), device),
+                    eps,
+                    device,
+                ),
                 linear_start: build_clippable_linear(
-                    t::<2, B>(fetch, &format!("{lconv_p}.linear_start.linear.weight"), device),
-                    clip(fetch, &format!("{lconv_p}.linear_start")), device),
+                    t::<2, B>(
+                        fetch,
+                        &format!("{lconv_p}.linear_start.linear.weight"),
+                        device,
+                    ),
+                    clip(fetch, &format!("{lconv_p}.linear_start")),
+                    device,
+                ),
                 linear_end: build_clippable_linear(
-                    t::<2, B>(fetch, &format!("{lconv_p}.linear_end.linear.weight"), device),
-                    clip(fetch, &format!("{lconv_p}.linear_end")), device),
+                    t::<2, B>(
+                        fetch,
+                        &format!("{lconv_p}.linear_end.linear.weight"),
+                        device,
+                    ),
+                    clip(fetch, &format!("{lconv_p}.linear_end")),
+                    device,
+                ),
                 depthwise_conv1d: build_depthwise_conv1d(
                     t::<3, B>(fetch, &format!("{lconv_p}.depthwise_conv1d.weight"), device),
-                    config.hidden_size, config.conv_kernel_size, device),
+                    config.hidden_size,
+                    config.conv_kernel_size,
+                    device,
+                ),
                 gradient_clipping: config.gradient_clipping,
                 kernel_size: config.conv_kernel_size,
             };
@@ -811,7 +867,9 @@ impl<B: Backend> AudioModel<B> {
             let rel_k_w = t::<2, B>(fetch, &format!("{sa_p}.relative_k_proj.weight"), device);
             let [out_dim, in_dim] = rel_k_w.dims();
             let relative_k_proj = {
-                let mut m = LinearConfig::new(in_dim, out_dim).with_bias(false).init::<B>(device);
+                let mut m = LinearConfig::new(in_dim, out_dim)
+                    .with_bias(false)
+                    .init::<B>(device);
                 m.weight = Param::from_tensor(rel_k_w.swap_dims(0, 1));
                 m
             };
@@ -820,16 +878,24 @@ impl<B: Backend> AudioModel<B> {
             let self_attn = AudioAttention {
                 q_proj: build_clippable_linear(
                     t::<2, B>(fetch, &format!("{sa_p}.q_proj.linear.weight"), device),
-                    clip(fetch, &format!("{sa_p}.q_proj")), device),
+                    clip(fetch, &format!("{sa_p}.q_proj")),
+                    device,
+                ),
                 k_proj: build_clippable_linear(
                     t::<2, B>(fetch, &format!("{sa_p}.k_proj.linear.weight"), device),
-                    clip(fetch, &format!("{sa_p}.k_proj")), device),
+                    clip(fetch, &format!("{sa_p}.k_proj")),
+                    device,
+                ),
                 v_proj: build_clippable_linear(
                     t::<2, B>(fetch, &format!("{sa_p}.v_proj.linear.weight"), device),
-                    clip(fetch, &format!("{sa_p}.v_proj")), device),
+                    clip(fetch, &format!("{sa_p}.v_proj")),
+                    device,
+                ),
                 post: build_clippable_linear(
                     t::<2, B>(fetch, &format!("{sa_p}.post.linear.weight"), device),
-                    clip(fetch, &format!("{sa_p}.post")), device),
+                    clip(fetch, &format!("{sa_p}.post")),
+                    device,
+                ),
                 relative_k_proj,
                 per_dim_scale: t::<1, B>(fetch, &format!("{sa_p}.per_dim_scale"), device),
                 num_heads: config.num_attention_heads,
@@ -852,11 +918,20 @@ impl<B: Backend> AudioModel<B> {
                 self_attn,
                 lconv1d: lconv,
                 norm_pre_attn: build_rms_norm(
-                    t::<1, B>(fetch, &format!("{lp}.norm_pre_attn.weight"), device), eps, device),
+                    t::<1, B>(fetch, &format!("{lp}.norm_pre_attn.weight"), device),
+                    eps,
+                    device,
+                ),
                 norm_post_attn: build_rms_norm(
-                    t::<1, B>(fetch, &format!("{lp}.norm_post_attn.weight"), device), eps, device),
+                    t::<1, B>(fetch, &format!("{lp}.norm_post_attn.weight"), device),
+                    eps,
+                    device,
+                ),
                 norm_out: build_rms_norm(
-                    t::<1, B>(fetch, &format!("{lp}.norm_out.weight"), device), eps, device),
+                    t::<1, B>(fetch, &format!("{lp}.norm_out.weight"), device),
+                    eps,
+                    device,
+                ),
                 gradient_clipping: config.gradient_clipping,
             });
         }
@@ -865,13 +940,21 @@ impl<B: Backend> AudioModel<B> {
         let out_w = t::<2, B>(fetch, "model.audio_tower.output_proj.weight", device);
         let out_b = t::<1, B>(fetch, "model.audio_tower.output_proj.bias", device);
         let [out_dim, in_dim] = out_w.dims();
-        let mut output_proj = LinearConfig::new(in_dim, out_dim).with_bias(true).init::<B>(device);
+        let mut output_proj = LinearConfig::new(in_dim, out_dim)
+            .with_bias(true)
+            .init::<B>(device);
         output_proj.weight = Param::from_tensor(out_w.swap_dims(0, 1));
         output_proj.bias = Some(Param::from_tensor(out_b));
 
         let rel_pos = rel_positional_encoding::<B>(&config, device);
 
-        AudioModel { subsample, rel_pos, layers, output_proj, config }
+        AudioModel {
+            subsample,
+            rel_pos,
+            layers,
+            output_proj,
+            config,
+        }
     }
 
     /// Forward: [B, T, feat_dim] log-mel → [B, T/4, output_proj_dims].

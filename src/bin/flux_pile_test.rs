@@ -53,7 +53,13 @@ fn main() {
     let st_path = dir.join("diffusion_pytorch_model.safetensors");
     let bytes = read_safetensors_file(&st_path);
     let mut blobs = MemoryBlobStore::new();
-    let frag = save_safetensors(&bytes, "FLUX.2-klein-4B-transformer", &mut blobs, mary::ingest::LeafDtype::F32).expect("ingest");
+    let frag = save_safetensors(
+        &bytes,
+        "FLUX.2-klein-4B-transformer",
+        &mut blobs,
+        mary::ingest::LeafDtype::F32,
+    )
+    .expect("ingest");
     let model_id = frag.root().expect("model root");
     let mut tribles = TribleSet::new();
     tribles += frag;

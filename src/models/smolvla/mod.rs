@@ -24,13 +24,13 @@
 //! flow-matching sampler fill in layer-by-layer behind probe gates.
 
 pub mod config;
-pub mod projections;
-pub mod time;
-pub mod suffix;
-pub mod sampler;
-pub mod rope;
-pub mod layers;
 pub mod denoiser;
-pub mod vlm;
-pub mod vision;
+pub mod layers;
 pub mod pipeline;
+pub mod projections;
+pub mod rope;
+pub mod sampler;
+pub mod suffix;
+pub mod time;
+pub mod vision;
+pub mod vlm;

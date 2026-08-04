@@ -115,7 +115,8 @@ impl<B: Backend> RopeTable<B> {
 
         // Compute wavelengths for each frequency dimension
         // wavelength = 2π / freq = 2π * theta^(2i/d)
-        let wavelengths: Vec<f64> = base_inv_freq.iter()
+        let wavelengths: Vec<f64> = base_inv_freq
+            .iter()
             .map(|&inv_f| 2.0 * std::f64::consts::PI / inv_f)
             .collect();
 
@@ -126,7 +127,9 @@ impl<B: Backend> RopeTable<B> {
         let high_freq_wavelen = yarn.original_max_pos as f64 / yarn.beta_fast;
 
         // Apply YaRN scaling per dimension
-        let scaled_inv_freq: Vec<f64> = base_inv_freq.iter().zip(wavelengths.iter())
+        let scaled_inv_freq: Vec<f64> = base_inv_freq
+            .iter()
+            .zip(wavelengths.iter())
             .map(|(&inv_f, &wavelen)| {
                 if wavelen < high_freq_wavelen {
                     // High frequency: no scaling needed
@@ -136,8 +139,8 @@ impl<B: Backend> RopeTable<B> {
                     inv_f / yarn.factor
                 } else {
                     // Medium frequency: smooth interpolation
-                    let ramp = (wavelen - high_freq_wavelen)
-                        / (low_freq_wavelen - high_freq_wavelen);
+                    let ramp =
+                        (wavelen - high_freq_wavelen) / (low_freq_wavelen - high_freq_wavelen);
                     let smooth = 1.0 - ramp; // 1 at high_freq boundary, 0 at low_freq
                     let scaled = inv_f / yarn.factor;
                     // Interpolate between unscaled and scaled
@@ -184,19 +187,19 @@ impl<B: Backend> RopeTable<B> {
 
     /// Apply RoPE to a tensor of shape [batch, n_heads, seq_len, head_dim].
     /// `offset` is the position offset for KV cache continuation.
-    pub fn apply(
-        &self,
-        x: Tensor<B, 4>,
-        offset: usize,
-    ) -> Tensor<B, 4> {
+    pub fn apply(&self, x: Tensor<B, 4>, offset: usize) -> Tensor<B, 4> {
         let [batch, n_heads, seq_len, head_dim] = x.dims();
         let half_dim = head_dim / 2;
 
         // Slice cos/sin for the current positions
-        let cos = self.cos.clone()
+        let cos = self
+            .cos
+            .clone()
             .slice([offset..offset + seq_len, 0..half_dim])
             .reshape([1, 1, seq_len, half_dim]);
-        let sin = self.sin.clone()
+        let sin = self
+            .sin
+            .clone()
             .slice([offset..offset + seq_len, 0..half_dim])
             .reshape([1, 1, seq_len, half_dim]);
 

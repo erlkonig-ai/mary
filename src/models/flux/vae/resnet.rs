@@ -25,7 +25,13 @@ pub fn group_norm_4d<B: Backend>(
     let elements = (channels_per_group * height * width) as f64;
     let mean = x.clone().sum_dim(2).sum_dim(3).sum_dim(4) / elements; // [B, G, 1, 1, 1]
     let x_centered = x - mean;
-    let var = x_centered.clone().powf_scalar(2.0).sum_dim(2).sum_dim(3).sum_dim(4) / elements;
+    let var = x_centered
+        .clone()
+        .powf_scalar(2.0)
+        .sum_dim(2)
+        .sum_dim(3)
+        .sum_dim(4)
+        / elements;
     let inv_std = (var + eps).sqrt().recip(); // [B, G, 1, 1, 1]
     let normed = x_centered * inv_std;
 
@@ -157,9 +163,7 @@ impl<B: Backend> ResnetBlock2D<B> {
 
         // Skip connection
         let skip = match (&self.conv_shortcut_weight, &self.conv_shortcut_bias) {
-            (Some(w), Some(b)) => {
-                conv2d_forward(x, w.clone(), Some(b.clone()), [1, 1], [0, 0])
-            }
+            (Some(w), Some(b)) => conv2d_forward(x, w.clone(), Some(b.clone()), [1, 1], [0, 0]),
             _ => x,
         };
 

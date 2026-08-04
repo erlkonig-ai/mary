@@ -48,16 +48,23 @@ where
     let elem = core::mem::size_of::<F>() as u64;
     let nbytes = bytes.len() as u64;
     if nbytes == 0 || !nbytes.is_multiple_of(elem) {
-        return Err(format!("blob length {nbytes} is not a multiple of the {elem}-byte element"));
+        return Err(format!(
+            "blob length {nbytes} is not a multiple of the {elem}-byte element"
+        ));
     }
     // wgpu storage-binding sizes must be 4-byte multiples: an odd-element f16
     // leaf (nbytes ≡ 2 mod 4) must fall back to upload, not panic in the driver.
     if !nbytes.is_multiple_of(4) {
-        return Err(format!("blob length {nbytes} is not a 4-byte multiple (wgpu binding size)"));
+        return Err(format!(
+            "blob length {nbytes} is not a 4-byte multiple (wgpu binding size)"
+        ));
     }
     let blob_ptr = bytes.as_ptr() as u64;
     if !blob_ptr.is_multiple_of(256) {
-        return Err(format!("blob not 256-aligned (ptr % 256 = {})", blob_ptr % 256));
+        return Err(format!(
+            "blob not 256-aligned (ptr % 256 = {})",
+            blob_ptr % 256
+        ));
     }
     // The owner downcast = capability check (mmap-backed?) + region bounds +
     // keepalive, exactly as in the gemma seam.

@@ -15,7 +15,11 @@ use mary::nn::backend::WgpuDevice;
 use std::process::Command;
 
 const IMAGE: &str = "test_image.png"; // any local test image (repo-relative or absolute)
-const TEXTS: [&str; 3] = ["a cartoon mouse", "a photo of a truck", "a screenshot of code"];
+const TEXTS: [&str; 3] = [
+    "a cartoon mouse",
+    "a photo of a truck",
+    "a screenshot of code",
+];
 const REF_JSON: &str = "/tmp/clip_ref.json";
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -28,7 +32,11 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 fn gen_reference() {
     let texts_py = format!(
         "[{}]",
-        TEXTS.iter().map(|t| format!("{t:?}")).collect::<Vec<_>>().join(", ")
+        TEXTS
+            .iter()
+            .map(|t| format!("{t:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     let script = format!(
         r#"
@@ -88,7 +96,13 @@ fn main() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|row| row.as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect())
+        .map(|row| {
+            row.as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_f64().unwrap() as f32)
+                .collect()
+        })
         .collect();
 
     println!("loading ClipEmbedder (mary)...");
@@ -98,13 +112,19 @@ fn main() {
 
     let img_bytes = std::fs::read(IMAGE).expect("read image");
     let rust_image = clip.embed_image(&img_bytes).expect("embed image");
-    let rust_texts: Vec<Vec<f32>> = TEXTS.iter().map(|t| clip.embed_text(t).expect("embed text")).collect();
+    let rust_texts: Vec<Vec<f32>> = TEXTS
+        .iter()
+        .map(|t| clip.embed_text(t).expect("embed text"))
+        .collect();
 
     // ---- PARITY ----
     let mut pass = true;
     println!("\n=== PARITY (cosine rust-vs-HF, must be > 0.99) ===");
     let c_img = cosine(&rust_image, &hf_image);
-    println!("  image                         : {c_img:.6}  {}", mark(c_img > 0.99));
+    println!(
+        "  image                         : {c_img:.6}  {}",
+        mark(c_img > 0.99)
+    );
     pass &= c_img > 0.99;
     for (i, t) in TEXTS.iter().enumerate() {
         let c = cosine(&rust_texts[i], &hf_texts[i]);
@@ -125,7 +145,11 @@ fn main() {
         }
     }
     let semantic_ok = best == 0;
-    println!("  best match: text[{best}] \"{}\"  {}", TEXTS[best], mark(semantic_ok));
+    println!(
+        "  best match: text[{best}] \"{}\"  {}",
+        TEXTS[best],
+        mark(semantic_ok)
+    );
     pass &= semantic_ok;
 
     println!("\n=== {} ===", if pass { "PASS" } else { "FAIL" });

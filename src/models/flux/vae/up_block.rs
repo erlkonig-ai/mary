@@ -16,11 +16,7 @@ pub struct Upsample2D<B: Backend> {
 impl<B: Backend> Upsample2D<B> {
     /// Load from safetensors.
     /// Example prefix: "decoder.up_blocks.0.upsamplers.0"
-    pub fn load(
-        loader: &WeightLoader,
-        prefix: &str,
-        device: &B::Device,
-    ) -> Self {
+    pub fn load(loader: &WeightLoader, prefix: &str, device: &B::Device) -> Self {
         Self {
             conv_weight: loader.load_tensor(&format!("{prefix}.conv.weight"), device),
             conv_bias: loader.load_tensor(&format!("{prefix}.conv.bias"), device),

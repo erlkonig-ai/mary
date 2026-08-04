@@ -32,7 +32,10 @@ pub struct RmsNorm<B: Backend> {
 
 impl<B: Backend> RmsNorm<B> {
     pub fn load(loader: &WeightLoader, name: &str, eps: f64, device: &B::Device) -> Self {
-        Self { weight: loader.load_tensor(name, device), eps }
+        Self {
+            weight: loader.load_tensor(name, device),
+            eps,
+        }
     }
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
@@ -70,7 +73,9 @@ pub fn eager_gqa_attention<B: Backend>(
     let v = v.swap_dims(1, 2);
 
     // scores = q·kᵀ · Dh^-0.5  -> [B,Hq,Lq,Lk]
-    let scores = q.matmul(k.swap_dims(2, 3)).mul_scalar((dh as f64).powf(-0.5));
+    let scores = q
+        .matmul(k.swap_dims(2, 3))
+        .mul_scalar((dh as f64).powf(-0.5));
 
     // mask: [B,Lq,Lk] -> [B,Hq,Lq,Lk]; fill ¬mask with big_neg
     let mask4 = mask.reshape([b, 1, lq, lk]).expand([b, hq, lq, lk]);
@@ -99,12 +104,22 @@ impl<B: Backend> ExpertLayer<B> {
     pub fn load(loader: &WeightLoader, prefix: &str, cfg: TowerConfig, device: &B::Device) -> Self {
         let lin = |n: &str| Linear::load(loader, &format!("{prefix}.{n}"), false, device);
         Self {
-            input_layernorm: RmsNorm::load(loader, &format!("{prefix}.input_layernorm.weight"), cfg.rms_norm_eps, device),
+            input_layernorm: RmsNorm::load(
+                loader,
+                &format!("{prefix}.input_layernorm.weight"),
+                cfg.rms_norm_eps,
+                device,
+            ),
             q_proj: lin("self_attn.q_proj"),
             k_proj: lin("self_attn.k_proj"),
             v_proj: lin("self_attn.v_proj"),
             o_proj: lin("self_attn.o_proj"),
-            post_attention_layernorm: RmsNorm::load(loader, &format!("{prefix}.post_attention_layernorm.weight"), cfg.rms_norm_eps, device),
+            post_attention_layernorm: RmsNorm::load(
+                loader,
+                &format!("{prefix}.post_attention_layernorm.weight"),
+                cfg.rms_norm_eps,
+                device,
+            ),
             gate_proj: lin("mlp.gate_proj"),
             up_proj: lin("mlp.up_proj"),
             down_proj: lin("mlp.down_proj"),
@@ -118,7 +133,9 @@ impl<B: Backend> ExpertLayer<B> {
         let x = x.add(self.o_proj.forward(att)); // residual 1
         let after = x.clone();
         let h = self.post_attention_layernorm.forward(x);
-        let mlp = self.down_proj.forward(silu(self.gate_proj.forward(h.clone())).mul(self.up_proj.forward(h)));
+        let mlp = self
+            .down_proj
+            .forward(silu(self.gate_proj.forward(h.clone())).mul(self.up_proj.forward(h)));
         after.add(mlp) // residual 2
     }
 
@@ -166,8 +183,18 @@ impl<B: Backend> ExpertLayer<B> {
         let (hq, hkv, dh) = (self.cfg.n_heads, self.cfg.n_kv_heads, self.cfg.head_dim);
 
         let h = self.input_layernorm.forward(x.clone());
-        let q = apply_rope(self.q_proj.forward(h.clone()).reshape([b, l, hq, dh]), positions.clone(), ROPE_MAX_WAVELENGTH, device);
-        let k = apply_rope(self.k_proj.forward(h.clone()).reshape([b, l, hkv, dh]), positions, ROPE_MAX_WAVELENGTH, device);
+        let q = apply_rope(
+            self.q_proj.forward(h.clone()).reshape([b, l, hq, dh]),
+            positions.clone(),
+            ROPE_MAX_WAVELENGTH,
+            device,
+        );
+        let k = apply_rope(
+            self.k_proj.forward(h.clone()).reshape([b, l, hkv, dh]),
+            positions,
+            ROPE_MAX_WAVELENGTH,
+            device,
+        );
         let v = self.v_proj.forward(h).reshape([b, l, hkv, dh]);
 
         let att = eager_gqa_attention(q, k.clone(), v.clone(), mask);
@@ -199,8 +226,14 @@ impl<B: Backend> ExpertLayer<B> {
         let q = apply_rope(q, q_positions, ROPE_MAX_WAVELENGTH, device);
 
         // reproject the cached VLM KV (flattened to [B,Lp,Hkv·Dh]); not RoPE'd
-        let k = self.k_proj.forward(vlm_k.reshape([b, lp, hkv * dh])).reshape([b, lp, hkv, dh]);
-        let v = self.v_proj.forward(vlm_v.reshape([b, lp, hkv * dh])).reshape([b, lp, hkv, dh]);
+        let k = self
+            .k_proj
+            .forward(vlm_k.reshape([b, lp, hkv * dh]))
+            .reshape([b, lp, hkv, dh]);
+        let v = self
+            .v_proj
+            .forward(vlm_v.reshape([b, lp, hkv * dh]))
+            .reshape([b, lp, hkv, dh]);
 
         let att = eager_gqa_attention(q, k, v, mask);
         self.residual_mlp(x, att)

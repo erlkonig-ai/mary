@@ -38,6 +38,7 @@ impl Tokenizer {
     pub fn encode_tensor<B: Backend>(&self, text: &str, device: &B::Device) -> Tensor<B, 2, Int> {
         let ids: Vec<i32> = self.encode(text).into_iter().map(|i| i as i32).collect();
         let n = ids.len();
-        Tensor::<B, 1, Int>::from_data(burn::tensor::TensorData::new(ids, [n]), device).reshape([1, n])
+        Tensor::<B, 1, Int>::from_data(burn::tensor::TensorData::new(ids, [n]), device)
+            .reshape([1, n])
     }
 }

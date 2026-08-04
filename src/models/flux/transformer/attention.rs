@@ -103,8 +103,14 @@ impl<B: Backend> Flux2Attention<B> {
         let v_img = linear3d(hidden_states, self.to_v_weight.clone());
 
         // Project text stream Q/K/V: [B, S_txt, inner_dim]
-        let q_txt = linear3d(encoder_hidden_states.clone(), self.add_q_proj_weight.clone());
-        let k_txt = linear3d(encoder_hidden_states.clone(), self.add_k_proj_weight.clone());
+        let q_txt = linear3d(
+            encoder_hidden_states.clone(),
+            self.add_q_proj_weight.clone(),
+        );
+        let k_txt = linear3d(
+            encoder_hidden_states.clone(),
+            self.add_k_proj_weight.clone(),
+        );
         let v_txt = linear3d(encoder_hidden_states, self.add_v_proj_weight.clone());
 
         // Reshape to [B, S, H, D_head] (unflatten last dim)
@@ -143,16 +149,16 @@ impl<B: Backend> Flux2Attention<B> {
 
         // Transpose back and flatten heads: [B, S_total, H*D]
         let s_total = s_txt + s_img;
-        let attn_output = attn_output
-            .swap_dims(1, 2)
-            .reshape([batch, s_total, num_heads * head_dim]);
+        let attn_output =
+            attn_output
+                .swap_dims(1, 2)
+                .reshape([batch, s_total, num_heads * head_dim]);
 
         // Split back into text and image outputs
         let txt_output = attn_output
             .clone()
             .slice([0..batch, 0..s_txt, 0..num_heads * head_dim]);
-        let img_output =
-            attn_output.slice([0..batch, s_txt..s_total, 0..num_heads * head_dim]);
+        let img_output = attn_output.slice([0..batch, s_txt..s_total, 0..num_heads * head_dim]);
 
         // Output projections
         let img_output = linear3d(img_output, self.to_out_weight.clone());
@@ -168,9 +174,9 @@ impl<B: Backend> Flux2Attention<B> {
 /// QK-norm + RoPE, SDPA, SwiGLU on MLP path, concatenate attn+mlp, final projection.
 pub struct Flux2ParallelSelfAttention<B: Backend> {
     pub to_qkv_mlp_proj_weight: Tensor<B, 2>, // [inner_dim*3 + mlp_hidden_dim*2, inner_dim]
-    pub to_out_weight: Tensor<B, 2>,           // [inner_dim, inner_dim + mlp_hidden_dim]
-    pub norm_q_weight: Tensor<B, 1>,           // [head_dim]
-    pub norm_k_weight: Tensor<B, 1>,           // [head_dim]
+    pub to_out_weight: Tensor<B, 2>,          // [inner_dim, inner_dim + mlp_hidden_dim]
+    pub norm_q_weight: Tensor<B, 1>,          // [head_dim]
+    pub norm_k_weight: Tensor<B, 1>,          // [head_dim]
 
     pub num_heads: usize,
     pub head_dim: usize,
@@ -227,21 +233,15 @@ impl<B: Backend> Flux2ParallelSelfAttention<B> {
         let qkv_dim = inner_dim * 3;
         let mlp_dim = mlp_hidden_dim * 2;
 
-        let qkv = projected
-            .clone()
-            .slice([0..batch, 0..seq_len, 0..qkv_dim]);
-        let mlp_input =
-            projected.slice([0..batch, 0..seq_len, qkv_dim..qkv_dim + mlp_dim]);
+        let qkv = projected.clone().slice([0..batch, 0..seq_len, 0..qkv_dim]);
+        let mlp_input = projected.slice([0..batch, 0..seq_len, qkv_dim..qkv_dim + mlp_dim]);
 
         // Split QKV into Q, K, V: each [B, S, inner_dim]
-        let q = qkv
-            .clone()
-            .slice([0..batch, 0..seq_len, 0..inner_dim]);
+        let q = qkv.clone().slice([0..batch, 0..seq_len, 0..inner_dim]);
         let k = qkv
             .clone()
             .slice([0..batch, 0..seq_len, inner_dim..inner_dim * 2]);
-        let v =
-            qkv.slice([0..batch, 0..seq_len, inner_dim * 2..inner_dim * 3]);
+        let v = qkv.slice([0..batch, 0..seq_len, inner_dim * 2..inner_dim * 3]);
 
         // Reshape to [B, S, H, D_head]
         let q = q.reshape([batch, seq_len, num_heads, head_dim]);
@@ -267,9 +267,10 @@ impl<B: Backend> Flux2ParallelSelfAttention<B> {
         let attn_output = attn_weights.matmul(v); // [B, H, S, D]
 
         // Flatten heads: [B, S, H*D]
-        let attn_output = attn_output
-            .swap_dims(1, 2)
-            .reshape([batch, seq_len, num_heads * head_dim]);
+        let attn_output =
+            attn_output
+                .swap_dims(1, 2)
+                .reshape([batch, seq_len, num_heads * head_dim]);
 
         // SwiGLU on MLP path
         let mlp_output = swiglu(mlp_input); // [B, S, mlp_hidden_dim]

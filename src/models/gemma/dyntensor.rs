@@ -20,8 +20,8 @@
 //! / exotic dtypes (`QFloat`, `Bool(U8|U32)`) are not yet supported and
 //! error at encode/decode time; extending the tag set covers them later.
 
-use bytes::Bytes as SharedBytes;
 use burn::tensor::{AllocationProperty, BoolStore, Bytes as BurnBytes, DType, Shape, TensorData};
+use bytes::Bytes as SharedBytes;
 use triblespace::core::metadata::MetaDescribe;
 use triblespace::prelude::*;
 
@@ -132,7 +132,10 @@ impl core::fmt::Display for DynTensorError {
             Self::UnknownDtypeTag(t) => write!(f, "unknown DynTensor dtype tag: {t}"),
             Self::TruncatedHeader => write!(f, "DynTensor blob header truncated"),
             Self::TruncatedData { expected, got } => {
-                write!(f, "DynTensor data truncated: expected {expected} bytes, got {got}")
+                write!(
+                    f,
+                    "DynTensor data truncated: expected {expected} bytes, got {got}"
+                )
             }
             Self::RankMismatch { expected, got } => {
                 write!(f, "DynTensor rank mismatch: expected {expected}, got {got}")
@@ -170,7 +173,11 @@ impl MetaDescribe for DynTensor {
 impl triblespace::core::inline::Encodes<TensorData> for DynTensor {
     type Output = Blob<DynTensor>;
     fn encode(source: TensorData) -> Blob<DynTensor> {
-        let TensorData { bytes, shape, dtype } = source;
+        let TensorData {
+            bytes,
+            shape,
+            dtype,
+        } = source;
         let tag = DTypeTag::from_dtype(dtype).expect("unsupported dtype for DynTensor");
         let rank = shape.num_dims();
         assert!(rank <= u8::MAX as usize, "rank {rank} too large");
@@ -265,4 +272,3 @@ pub fn parse_header(bytes: &anybytes::Bytes) -> Result<ParsedHeader, DynTensorEr
         byte_count,
     })
 }
-

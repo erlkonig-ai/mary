@@ -24,7 +24,12 @@ impl<B: Backend> ExpertDenoiser<B> {
         let layers = (0..cfg.expert.n_layers)
             .map(|i| ExpertLayer::load(loader, &format!("{prefix}.layers.{i}"), cfg.expert, device))
             .collect();
-        let norm = RmsNorm::load(loader, &format!("{prefix}.norm.weight"), cfg.expert.rms_norm_eps, device);
+        let norm = RmsNorm::load(
+            loader,
+            &format!("{prefix}.norm.weight"),
+            cfg.expert.rms_norm_eps,
+            device,
+        );
         Self { layers, norm }
     }
 
@@ -48,7 +53,8 @@ impl<B: Backend> ExpertDenoiser<B> {
         let qpos = positions.clone().sub_scalar(mn);
 
         let [_, b, lp, hkv, dh] = caches_k.dims();
-        let layer_cache = |c: &Tensor<B, 5>, i: usize| c.clone().narrow(0, i, 1).reshape([b, lp, hkv, dh]);
+        let layer_cache =
+            |c: &Tensor<B, 5>, i: usize| c.clone().narrow(0, i, 1).reshape([b, lp, hkv, dh]);
 
         let mut x = suffix;
         for (i, layer) in self.layers.iter().enumerate() {

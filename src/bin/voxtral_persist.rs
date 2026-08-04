@@ -107,14 +107,19 @@ fn main() -> anyhow::Result<()> {
         let LeafHandles::F32(dh, _) = handles else {
             anyhow::bail!("{name}: expected an f32 leaf");
         };
-        let raw: anybytes::Bytes = reader.get(*dh).map_err(|e| anyhow::anyhow!("{name}: {e:?}"))?;
+        let raw: anybytes::Bytes = reader
+            .get(*dh)
+            .map_err(|e| anyhow::anyhow!("{name}: {e:?}"))?;
         if !(raw.as_ptr() as usize).is_multiple_of(256) {
             eprintln!("  MISALIGNED (ptr % 256 != 0): {name}");
             misaligned += 1;
         }
         let (stored, shape) = read_leaf(&reader, *handles);
         let (want, want_shape) = get_tensor_f32(&st, name);
-        anyhow::ensure!(shape == want_shape, "{name}: shape {shape:?} != {want_shape:?}");
+        anyhow::ensure!(
+            shape == want_shape,
+            "{name}: shape {shape:?} != {want_shape:?}"
+        );
         anyhow::ensure!(stored.len() == want.len(), "{name}: len mismatch");
         for (i, (&a, &b)) in stored.iter().zip(want.iter()).enumerate() {
             anyhow::ensure!(
@@ -125,7 +130,10 @@ fn main() -> anyhow::Result<()> {
         checked += 1;
         elems += stored.len();
     }
-    anyhow::ensure!(misaligned == 0, "{misaligned} leaves misaligned — V3 alignment invariant violated");
+    anyhow::ensure!(
+        misaligned == 0,
+        "{misaligned} leaves misaligned — V3 alignment invariant violated"
+    );
 
     let size = std::fs::metadata(pile_path)?.len();
     println!(
@@ -142,9 +150,7 @@ fn main() -> anyhow::Result<()> {
 fn f16_derive_mode(src: &Path, dst: &Path) -> anyhow::Result<()> {
     const ENTITY: &str = "ears_f16";
     let src_len_before = std::fs::metadata(src)?.len();
-    eprintln!(
-        "Deriving f16 sibling {dst:?} from {src:?} ({src_len_before} bytes, READ-ONLY) ..."
-    );
+    eprintln!("Deriving f16 sibling {dst:?} from {src:?} ({src_len_before} bytes, READ-ONLY) ...");
     let t = Instant::now();
     let (count, elems) = derive_f16_pile(src, dst, ENTITY)?;
     let secs = t.elapsed().as_secs_f64();
@@ -184,13 +190,16 @@ fn f16_derive_mode(src: &Path, dst: &Path) -> anyhow::Result<()> {
             LeafHandles::F16(d, s) => (*d, *s),
             LeafHandles::F32(..) => anyhow::bail!("{name}: {ENTITY} entity holds an f32 leaf"),
         };
-        let bytes: anybytes::Bytes =
-            f16_reader.get(dh).map_err(|e| anyhow::anyhow!("{name}: {e:?}"))?;
+        let bytes: anybytes::Bytes = f16_reader
+            .get(dh)
+            .map_err(|e| anyhow::anyhow!("{name}: {e:?}"))?;
         if !(bytes.as_ptr() as usize).is_multiple_of(256) {
             eprintln!("  MISALIGNED (ptr % 256 != 0): {name}");
             misaligned += 1;
         }
-        let stored = bytes.view::<[half::f16]>().map_err(|e| anyhow::anyhow!("{name}: {e:?}"))?;
+        let stored = bytes
+            .view::<[half::f16]>()
+            .map_err(|e| anyhow::anyhow!("{name}: {e:?}"))?;
         let shape = read_shape(&f16_reader, sh);
         let f32_handles = f32_
             .get(name)

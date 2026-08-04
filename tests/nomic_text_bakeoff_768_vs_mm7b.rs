@@ -38,8 +38,10 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 
 /// Rank `query` against the doc embeddings; return (top_id, ok, margin = top1−top2).
 fn rank<'a>(qv: &[f32], doc_vecs: &[(&'a str, Vec<f32>)], want: &str) -> (&'a str, bool, f32) {
-    let mut scored: Vec<(&str, f32)> =
-        doc_vecs.iter().map(|(id, v)| (*id, cosine(qv, v))).collect();
+    let mut scored: Vec<(&str, f32)> = doc_vecs
+        .iter()
+        .map(|(id, v)| (*id, cosine(qv, v)))
+        .collect();
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     let top = scored[0].0;
     let margin = scored[0].1 - scored[1].1;
@@ -92,13 +94,16 @@ fn text_retrieval_bakeoff() {
         ("fast record lookups and storage efficiency", "database"),
         ("shrinking files without losing information", "compression"),
         ("how data travels across the internet", "networking"),
-        ("sending private messages over a public channel", "cryptography"),
+        (
+            "sending private messages over a public channel",
+            "cryptography",
+        ),
         ("predicting storms and rain with computers", "weather"),
     ];
 
     // --- disk gates ---
-    let pile_path = std::env::var("NOMIC_MM7B_PILE")
-        .unwrap_or_else(|_| "models/nomic_mm7b.pile".to_string());
+    let pile_path =
+        std::env::var("NOMIC_MM7B_PILE").unwrap_or_else(|_| "models/nomic_mm7b.pile".to_string());
     if !Path::new(&pile_path).exists() {
         eprintln!("SKIP: no nomic-mm7b pile at {pile_path} (set NOMIC_MM7B_PILE)");
         return;

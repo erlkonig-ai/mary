@@ -66,7 +66,9 @@ use super::config as cfg;
 use super::depth_fast::{self, DepthFast};
 use super::temporal_metal::{self, TemporalMetal, WeightFmt};
 use crate::f16enc::F16Array;
-use crate::format::{attrs, put_raw, put_raw_f16, put_raw_q4, put_raw_q8, F32Array, U32Array, U64Array};
+use crate::format::{
+    attrs, put_raw, put_raw_f16, put_raw_q4, put_raw_q8, F32Array, U32Array, U64Array,
+};
 use crate::ingest::read_shape;
 use crate::nn::q4::quantize_q4;
 use crate::nn::weight_loader::WeightLoader;
@@ -78,7 +80,10 @@ use crate::nn::weight_loader::WeightLoader;
 /// (`q4` / `q8` / `f16` for the temporal stack, `depth` for the depformer
 /// operands).
 pub fn derived_sibling_path(pile_path: &Path, tag: &str) -> PathBuf {
-    let stem = pile_path.file_stem().and_then(|s| s.to_str()).unwrap_or("weights");
+    let stem = pile_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("weights");
     pile_path.with_file_name(format!("{stem}_{tag}.pile"))
 }
 
@@ -163,11 +168,16 @@ impl QPile {
         h: Inline<inlineencodings::Handle<blobencodings::Array<T>>>,
         what: &str,
     ) -> anyhow::Result<anybytes::Bytes> {
-        self.reader.get(h).map_err(|e| anyhow::anyhow!("{what}: {e:?}"))
+        self.reader
+            .get(h)
+            .map_err(|e| anyhow::anyhow!("{what}: {e:?}"))
     }
 
     /// Packed q4 leaf → (nibble-word bytes, scale bytes, logical `[out, in]`).
-    pub fn bytes_q4(&self, name: &str) -> anyhow::Result<(anybytes::Bytes, anybytes::Bytes, Vec<usize>)> {
+    pub fn bytes_q4(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<(anybytes::Bytes, anybytes::Bytes, Vec<usize>)> {
         match self.leaf(name)? {
             QLeaf::Q4(d, sc, sh) => {
                 let shape = read_shape(&self.reader, sh);
@@ -179,7 +189,10 @@ impl QPile {
     }
 
     /// Packed q8 leaf → (biased-byte-word bytes, scale bytes, `[out, in]`).
-    pub fn bytes_q8(&self, name: &str) -> anyhow::Result<(anybytes::Bytes, anybytes::Bytes, Vec<usize>)> {
+    pub fn bytes_q8(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<(anybytes::Bytes, anybytes::Bytes, Vec<usize>)> {
         match self.leaf(name)? {
             QLeaf::Q8(d, sc, sh) => {
                 let shape = read_shape(&self.reader, sh);
@@ -209,7 +222,9 @@ impl QPile {
     /// Zero-copy typed view of an f32 leaf (CPU consumption).
     pub fn view_f32(&self, name: &str) -> anyhow::Result<(anybytes::View<[f32]>, Vec<usize>)> {
         let (b, s) = self.bytes_f32(name)?;
-        let v = b.view::<[f32]>().map_err(|e| anyhow::anyhow!("{name}: f32 view: {e:?}"))?;
+        let v = b
+            .view::<[f32]>()
+            .map_err(|e| anyhow::anyhow!("{name}: f32 view: {e:?}"))?;
         Ok((v, s))
     }
 
@@ -217,7 +232,9 @@ impl QPile {
     /// storage the NEON `hdot` kernel reads.
     pub fn view_u16(&self, name: &str) -> anyhow::Result<(anybytes::View<[u16]>, Vec<usize>)> {
         let (b, s) = self.bytes_f16(name)?;
-        let v = b.view::<[u16]>().map_err(|e| anyhow::anyhow!("{name}: u16 view: {e:?}"))?;
+        let v = b
+            .view::<[u16]>()
+            .map_err(|e| anyhow::anyhow!("{name}: u16 view: {e:?}"))?;
         Ok((v, s))
     }
 
@@ -226,7 +243,8 @@ impl QPile {
     /// tensor data. The reader (and every view/alias resolved through it)
     /// keeps the mmap alive after the repository closes.
     pub fn open(path: &Path, entity_name: &str) -> anyhow::Result<Self> {
-        let mut pile = Pile::open(path).map_err(|e| anyhow::anyhow!("open pile {path:?}: {e:?}"))?;
+        let mut pile =
+            Pile::open(path).map_err(|e| anyhow::anyhow!("open pile {path:?}: {e:?}"))?;
         // Read path: non-mutating load, NEVER amputate (see crate::persist).
         pile.refresh().map_err(|e| {
             anyhow::anyhow!(
@@ -235,14 +253,22 @@ impl QPile {
                  with `trible pile amputate`"
             )
         })?;
-        let mut repo = Repository::new(pile, SigningKey::generate(&mut rand::rngs::OsRng), TribleSet::new())
-            .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
+        let mut repo = Repository::new(
+            pile,
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            TribleSet::new(),
+        )
+        .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
         let branch_id = repo
             .lookup_branch("main")
             .map_err(|e| anyhow::anyhow!("lookup main: {e:?}"))?
             .ok_or_else(|| anyhow::anyhow!("no 'main' branch in pile {path:?}"))?;
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull main: {e:?}"))?;
-        let head = ws.head().ok_or_else(|| anyhow::anyhow!("'main' has no commits"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull main: {e:?}"))?;
+        let head = ws
+            .head()
+            .ok_or_else(|| anyhow::anyhow!("'main' has no commits"))?;
         let tribles: TribleSet = ws
             .checkout(ancestors(head))
             .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
@@ -258,8 +284,9 @@ impl QPile {
             (m: Id, n: Inline<inlineencodings::Handle<blobencodings::LongString>>),
             pattern!(&tribles, [{ ?m @ attrs::model_name: ?n }])
         ) {
-            let name: anybytes::View<str> =
-                reader.get(n).map_err(|e| anyhow::anyhow!("model name blob: {e:?}"))?;
+            let name: anybytes::View<str> = reader
+                .get(n)
+                .map_err(|e| anyhow::anyhow!("model name blob: {e:?}"))?;
             if &*name == entity_name {
                 model_id = Some(m);
             }
@@ -284,8 +311,9 @@ impl QPile {
             )
             .next()
             .ok_or_else(|| anyhow::anyhow!("member without name/weight"))?;
-            let name: anybytes::View<str> =
-                reader.get(name_h).map_err(|e| anyhow::anyhow!("leaf name blob: {e:?}"))?;
+            let name: anybytes::View<str> = reader
+                .get(name_h)
+                .map_err(|e| anyhow::anyhow!("leaf name blob: {e:?}"))?;
             let leaf = if let Some((d, sc, s)) = find!(
                 (d, sc, s),
                 pattern!(&tribles, [{ w_id @ attrs::data_q4: ?d, attrs::q_scales: ?sc, attrs::shape: ?s }])
@@ -319,8 +347,13 @@ impl QPile {
             };
             index.insert(name.to_string(), leaf);
         }
-        repo.close().map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
-        Ok(Self { index, reader, marker })
+        repo.close()
+            .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+        Ok(Self {
+            index,
+            reader,
+            marker,
+        })
     }
 }
 
@@ -408,10 +441,7 @@ pub fn depth_auto(pile: &Path, loader: &WeightLoader, depth_f16: bool) -> DepthF
 /// back the repo + workspace on `main`.
 fn open_dst(
     dst: &Path,
-) -> anyhow::Result<(
-    Repository<Pile>,
-    triblespace::core::repo::Workspace<Pile>,
-)> {
+) -> anyhow::Result<(Repository<Pile>, triblespace::core::repo::Workspace<Pile>)> {
     if !dst.exists() {
         eprintln!("[derive] pile {dst:?} does not exist — creating a NEW empty pile");
         std::fs::File::create(dst).map_err(|e| anyhow::anyhow!("create pile {dst:?}: {e}"))?;
@@ -425,13 +455,24 @@ fn open_dst(
              `trible pile amputate`"
         )
     })?;
-    let mut repo = Repository::new(pile, SigningKey::generate(&mut rand::rngs::OsRng), TribleSet::new())
-        .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
-    let branch_id = match repo.lookup_branch("main").map_err(|e| anyhow::anyhow!("lookup main: {e:?}"))? {
+    let mut repo = Repository::new(
+        pile,
+        SigningKey::generate(&mut rand::rngs::OsRng),
+        TribleSet::new(),
+    )
+    .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
+    let branch_id = match repo
+        .lookup_branch("main")
+        .map_err(|e| anyhow::anyhow!("lookup main: {e:?}"))?
+    {
         Some(id) => id,
-        None => *repo.create_branch("main", None).map_err(|e| anyhow::anyhow!("create main: {e:?}"))?,
+        None => *repo
+            .create_branch("main", None)
+            .map_err(|e| anyhow::anyhow!("create main: {e:?}"))?,
     };
-    let ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull main: {e:?}"))?;
+    let ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow::anyhow!("pull main: {e:?}"))?;
     Ok((repo, ws))
 }
 
@@ -529,18 +570,39 @@ pub fn derive_temporal_pile(
             fmt,
         );
         for (enc, (nm, o, ii)) in encoded.iter().zip(meta) {
-            bytes += put_mat(&mut repo, &mut facts, &mut members, &format!("t.{i}.{nm}"), enc, o, ii)?;
+            bytes += put_mat(
+                &mut repo,
+                &mut facts,
+                &mut members,
+                &format!("t.{i}.{nm}"),
+                enc,
+                o,
+                ii,
+            )?;
             count += 1;
         }
         for (alpha, nm) in [("norm1", "norm1"), ("norm2", "norm2")] {
-            let a = temporal_metal::load_alpha(&loader, &format!("transformer.layers.{i}.{alpha}.alpha"));
+            let a = temporal_metal::load_alpha(
+                &loader,
+                &format!("transformer.layers.{i}.{alpha}.alpha"),
+            );
             let leaf = put_raw(repo.storage_mut(), &a, &[cfg::DIM as u64])
                 .map_err(|e| anyhow::anyhow!("layer {i} {nm}: put alpha: {e}"))?;
-            add_member(&mut repo, &mut facts, &mut members, &format!("t.{i}.{nm}"), leaf)?;
+            add_member(
+                &mut repo,
+                &mut facts,
+                &mut members,
+                &format!("t.{i}.{nm}"),
+                leaf,
+            )?;
             bytes += (a.len() * 4) as u64;
             count += 1;
         }
-        eprint!("\r[derive] temporal layer {:2}/{} packed ({tag})", i + 1, cfg::NUM_LAYERS);
+        eprint!(
+            "\r[derive] temporal layer {:2}/{} packed ({tag})",
+            i + 1,
+            cfg::NUM_LAYERS
+        );
     }
     eprintln!();
 
@@ -583,8 +645,10 @@ pub fn derive_temporal_pile(
         facts,
         &format!("derive personaplex temporal {tag} runtime artifacts (marker {marker:?})"),
     );
-    repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-    repo.close().map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+    repo.push(&mut ws)
+        .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+    repo.close()
+        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
     Ok((count, bytes))
 }
 
@@ -644,14 +708,30 @@ pub fn derive_depth_pile(src: &Path, dst: &Path) -> anyhow::Result<(usize, u64)>
             qkv_all.extend(depth_fast::fold_qkv_step(&in_proj, &a1, t));
         }
         drop(in_proj);
-        bytes += put_both(&mut repo, &mut facts, &mut members, &format!("{l}.qkv"), &qkv_all, &[(n * 3 * d) as u64, d as u64], true)?;
+        bytes += put_both(
+            &mut repo,
+            &mut facts,
+            &mut members,
+            &format!("{l}.qkv"),
+            &qkv_all,
+            &[(n * 3 * d) as u64, d as u64],
+            true,
+        )?;
         count += 2;
         drop(qkv_all);
 
         // o: raw rows (f32 mode maps the canonical leaf) — f16 width only.
         let (out_proj, s) = loader.load_f32(&format!("{src_l}.self_attn.out_proj.weight"));
         anyhow::ensure!(s == vec![n * d, d], "{src_l}: out_proj shape");
-        bytes += put_both(&mut repo, &mut facts, &mut members, &format!("{l}.o"), &out_proj, &[(n * d) as u64, d as u64], false)?;
+        bytes += put_both(
+            &mut repo,
+            &mut facts,
+            &mut members,
+            &format!("{l}.o"),
+            &out_proj,
+            &[(n * d) as u64, d as u64],
+            false,
+        )?;
         count += 1;
         drop(out_proj);
 
@@ -662,7 +742,15 @@ pub fn derive_depth_pile(src: &Path, dst: &Path) -> anyhow::Result<(usize, u64)>
             anyhow::ensure!(s == vec![2 * fh, d], "{src_l}: gating.{t}.linear_in shape");
             gu_all.extend(depth_fast::fold_gate_up(gu, &a2));
         }
-        bytes += put_both(&mut repo, &mut facts, &mut members, &format!("{l}.gate_up"), &gu_all, &[(n * 2 * fh) as u64, d as u64], true)?;
+        bytes += put_both(
+            &mut repo,
+            &mut facts,
+            &mut members,
+            &format!("{l}.gate_up"),
+            &gu_all,
+            &[(n * 2 * fh) as u64, d as u64],
+            true,
+        )?;
         count += 2;
         drop(gu_all);
 
@@ -673,9 +761,21 @@ pub fn derive_depth_pile(src: &Path, dst: &Path) -> anyhow::Result<(usize, u64)>
             anyhow::ensure!(s == vec![d, fh], "{src_l}: gating.{t}.linear_out shape");
             down_all.extend(dn);
         }
-        bytes += put_both(&mut repo, &mut facts, &mut members, &format!("{l}.down"), &down_all, &[(n * d) as u64, fh as u64], false)?;
+        bytes += put_both(
+            &mut repo,
+            &mut facts,
+            &mut members,
+            &format!("{l}.down"),
+            &down_all,
+            &[(n * d) as u64, fh as u64],
+            false,
+        )?;
         count += 1;
-        eprint!("\r[derive] depth layer {}/{} packed", l + 1, cfg::DEP_LAYERS);
+        eprint!(
+            "\r[derive] depth layer {}/{} packed",
+            l + 1,
+            cfg::DEP_LAYERS
+        );
     }
     eprintln!();
 
@@ -686,7 +786,15 @@ pub fn derive_depth_pile(src: &Path, dst: &Path) -> anyhow::Result<(usize, u64)>
         anyhow::ensure!(s == vec![cfg::CARD, d], "linears.{t} shape");
         heads_all.extend(h);
     }
-    bytes += put_both(&mut repo, &mut facts, &mut members, "heads", &heads_all, &[(n * cfg::CARD) as u64, d as u64], false)?;
+    bytes += put_both(
+        &mut repo,
+        &mut facts,
+        &mut members,
+        "heads",
+        &heads_all,
+        &[(n * cfg::CARD) as u64, d as u64],
+        false,
+    )?;
     count += 1;
     drop(heads_all);
 
@@ -698,7 +806,15 @@ pub fn derive_depth_pile(src: &Path, dst: &Path) -> anyhow::Result<(usize, u64)>
         anyhow::ensure!(s == vec![d, cfg::DIM], "depformer_in.{t} shape");
         dep_in_all.extend(w);
     }
-    bytes += put_both(&mut repo, &mut facts, &mut members, "dep_in", &dep_in_all, &[(n * d) as u64, cfg::DIM as u64], true)?;
+    bytes += put_both(
+        &mut repo,
+        &mut facts,
+        &mut members,
+        "dep_in",
+        &dep_in_all,
+        &[(n * d) as u64, cfg::DIM as u64],
+        true,
+    )?;
     count += 2;
     drop(dep_in_all);
 
@@ -718,7 +834,9 @@ pub fn derive_depth_pile(src: &Path, dst: &Path) -> anyhow::Result<(usize, u64)>
         facts,
         &format!("derive personaplex depth runtime operands (marker {marker:?})"),
     );
-    repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-    repo.close().map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+    repo.push(&mut ws)
+        .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+    repo.close()
+        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
     Ok((count, bytes))
 }

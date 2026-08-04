@@ -71,7 +71,12 @@ struct Tdnn<B: Backend>(SameConv<B>);
 
 impl<B: Backend> Tdnn<B> {
     fn load(loader: &WeightLoader, prefix: &str, dilation: usize, device: &B::Device) -> Self {
-        Self(SameConv::load(&loader, &format!("{prefix}.conv"), dilation, device))
+        Self(SameConv::load(
+            &loader,
+            &format!("{prefix}.conv"),
+            dilation,
+            device,
+        ))
     }
     fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         relu(self.0.forward(x))
@@ -93,7 +98,14 @@ impl<B: Backend> SeRes2Net<B> {
         Self {
             tdnn1: Tdnn::load(loader, &format!("{prefix}.tdnn1"), 1, device),
             res2: (0..7)
-                .map(|i| Tdnn::load(loader, &format!("{prefix}.res2net_block.blocks.{i}"), dilation, device))
+                .map(|i| {
+                    Tdnn::load(
+                        loader,
+                        &format!("{prefix}.res2net_block.blocks.{i}"),
+                        dilation,
+                        device,
+                    )
+                })
                 .collect(),
             tdnn2: Tdnn::load(loader, &format!("{prefix}.tdnn2"), 1, device),
             se1: SameConv::load(loader, &format!("{prefix}.se_block.conv1"), 1, device),
@@ -263,7 +275,13 @@ impl<B: Backend> SpeakerMel<B> {
         }
         let fb = Tensor::<B, 1>::from_floats(fb.as_slice(), device).reshape([n_mels, n_freq]);
 
-        Self { kcos, ksin, fb, n_fft, hop }
+        Self {
+            kcos,
+            ksin,
+            fb,
+            n_fft,
+            hop,
+        }
     }
 
     /// samples (24 kHz, [−1,1]) → log-mel `[1, T, 128]`.
@@ -279,11 +297,10 @@ impl<B: Backend> SpeakerMel<B> {
             .sqrt(); // [1, n_freq, T]
         let [_, nf, t] = mag.dims();
         let n_mels = self.fb.dims()[0];
-        let mel = self
-            .fb
-            .clone()
-            .reshape([1, n_mels, nf])
-            .matmul(mag);
-        mel.clamp_min(1e-5).log().reshape([1, n_mels, t]).swap_dims(1, 2)
+        let mel = self.fb.clone().reshape([1, n_mels, nf]).matmul(mag);
+        mel.clamp_min(1e-5)
+            .log()
+            .reshape([1, n_mels, t])
+            .swap_dims(1, 2)
     }
 }

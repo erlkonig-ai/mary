@@ -113,9 +113,12 @@ fn real_text_embed_parity() {
 
     let device = NdArrayDevice::default();
     eprintln!("[real-parity] loading merged backbone keymap from pile {pile_path} ...");
-    let map = mary::persist::load_keymap_from_pile(Path::new(&pile_path))
-        .expect("load keymap from pile");
-    eprintln!("[real-parity] keymap has {} tensors; building model ...", map.len());
+    let map =
+        mary::persist::load_keymap_from_pile(Path::new(&pile_path)).expect("load keymap from pile");
+    eprintln!(
+        "[real-parity] keymap has {} tensors; building model ...",
+        map.len()
+    );
     let w = KeymapW { map, device };
     let model = QwenTextModel::<B>::load(&w, &real_cfg(), &device);
 
@@ -130,7 +133,9 @@ fn real_text_embed_parity() {
             continue;
         }
         let (ids, seq) = load_ids(&dir, ids_name, &device);
-        let want = npy::load_npy(&dir.join(format!("{ref_name}.npy"))).unwrap().0;
+        let want = npy::load_npy(&dir.join(format!("{ref_name}.npy")))
+            .unwrap()
+            .0;
         let got = model.embed(ids).into_data().to_vec::<f32>().unwrap();
         assert_eq!(got.len(), want.len(), "{ref_name}: dim mismatch");
         let cos = cosine(&got, &want);

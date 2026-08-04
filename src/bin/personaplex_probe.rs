@@ -361,8 +361,14 @@ fn depth_gate(pile: &str) {
         let teacher: [i64; cfg::DEP_Q] = g.dep_tokens[s * cfg::DEP_Q..(s + 1) * cfg::DEP_Q]
             .try_into()
             .unwrap();
-        let (toks, logits) =
-            depth.frame(&hidden, next_text, &p.forced(), Some(&teacher), None, &device);
+        let (toks, logits) = depth.frame(
+            &hidden,
+            next_text,
+            &p.forced(),
+            Some(&teacher),
+            None,
+            &device,
+        );
         for cb in 0..cfg::DEP_Q {
             let grow = &g.dep_logits
                 [(s * cfg::DEP_Q + cb) * cfg::CARD..(s * cfg::DEP_Q + cb + 1) * cfg::CARD];
@@ -722,7 +728,12 @@ fn prompt_sources_gate() -> (Prompt, bool) {
     let mut hits = 0usize;
     for case in battery {
         let text = case["text"].as_str().unwrap();
-        let want: Vec<i64> = case["ids"].as_array().unwrap().iter().map(|v| v.as_i64().unwrap()).collect();
+        let want: Vec<i64> = case["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_i64().unwrap())
+            .collect();
         let got = spm.encode(text);
         if got == want {
             hits += 1;
@@ -776,7 +787,12 @@ fn prompt_sources_gate() -> (Prompt, bool) {
         gvp.len(),
         voice.n_frames
     );
-    let cache_hits = voice.cache.iter().zip(&gcache).filter(|(a, b)| a == b).count();
+    let cache_hits = voice
+        .cache
+        .iter()
+        .zip(&gcache)
+        .filter(|(a, b)| a == b)
+        .count();
     let ok_cache = voice.cache.len() == gcache.len() && cache_hits == gcache.len();
     ok &= ok_cache;
     println!(
@@ -785,7 +801,11 @@ fn prompt_sources_gate() -> (Prompt, bool) {
         gcache.len()
     );
 
-    let prompt = Prompt { voice, text_tokens: tokens, silence_frames: SILENCE_FRAMES };
+    let prompt = Prompt {
+        voice,
+        text_tokens: tokens,
+        silence_frames: SILENCE_FRAMES,
+    };
     (prompt, ok)
 }
 
@@ -797,7 +817,11 @@ fn prompt_gate(pile: &str) {
     // the primary sources must reproduce).
     let g = stream_goldens();
     let (step_toks, s) = golden_i64("step_tokens");
-    assert_eq!(s, vec![g.steps - g.n_vp, cfg::NUM_STREAMS], "step_tokens shape");
+    assert_eq!(
+        s,
+        vec![g.steps - g.n_vp, cfg::NUM_STREAMS],
+        "step_tokens shape"
+    );
     let (tok_idx, _) = golden_i64("step_token_idx");
     assert_eq!(
         prompt.total_steps() + g.out_tokens.len() / cfg::NUM_STREAMS,
@@ -806,7 +830,10 @@ fn prompt_gate(pile: &str) {
     );
     // step_token_idx semantics: token-fed steps are exactly the post-vp rows.
     let ok_idx = tok_idx.len() == g.steps - g.n_vp
-        && tok_idx.iter().enumerate().all(|(r, &i)| i as usize == g.n_vp + r);
+        && tok_idx
+            .iter()
+            .enumerate()
+            .all(|(r, &i)| i as usize == g.n_vp + r);
     println!(
         "  {} step_token_idx {} token-fed steps contiguous after {} vp steps",
         if ok_idx { "OK" } else { "XX" },
@@ -867,8 +894,7 @@ fn prompt_gate(pile: &str) {
     };
 
     for row in prompt.voice.embeddings.chunks_exact(cfg::DIM) {
-        let x =
-            burn::tensor::Tensor::<B, 1>::from_floats(row, &device).reshape([1, 1, cfg::DIM]);
+        let x = burn::tensor::Tensor::<B, 1>::from_floats(row, &device).reshape([1, 1, cfg::DIM]);
         let trace = lm.step_embeddings(x);
         check(&trace, step_no, &mut first_bad);
         step_no += 1;
@@ -921,7 +947,11 @@ fn prompt_gate(pile: &str) {
     if let Some((s, what)) = first_bad {
         println!("  first divergence: step {s} — {what}");
     }
-    println!("ran {} steps in {secs:.1}s ({:.2} s/step)", g.steps, secs / g.steps as f64);
+    println!(
+        "ran {} steps in {secs:.1}s ({:.2} s/step)",
+        g.steps,
+        secs / g.steps as f64
+    );
 
     verdict("PERSONAPLEX PROMPT ASSEMBLY", ok_src && ok_idx && ok_run);
 }
@@ -946,7 +976,11 @@ fn ownprompt_smoke(voice_pt: &str, text: &str) {
     // nothing ungenerated (−2).
     let cache_ok = voice.cache.iter().enumerate().all(|(i, &t)| {
         let k = i / mary::models::personaplex::lmgen::CT;
-        let hi = if k == 0 { cfg::TEXT_CARD as i64 } else { cfg::CARD as i64 };
+        let hi = if k == 0 {
+            cfg::TEXT_CARD as i64
+        } else {
+            cfg::CARD as i64
+        };
         (0..=hi).contains(&t)
     });
     println!(
@@ -962,21 +996,29 @@ fn ownprompt_smoke(voice_pt: &str, text: &str) {
 
     // Drive the bare StreamCache through the full prompt flow (no model —
     // the token machine is exact by construction, gated in `prompt`).
-    let prompt = Prompt { voice, text_tokens: tokens, silence_frames: SILENCE_FRAMES };
+    let prompt = Prompt {
+        voice,
+        text_tokens: tokens,
+        silence_frames: SILENCE_FRAMES,
+    };
     let mut sc = StreamCache::new();
     let mut inputs_ok = 0usize;
     let mut n_model_inputs = 0usize;
     let dummy = [cfg::CARD as i64; 8];
     let token_step = |sc: &mut StreamCache,
-                          user: &[i64; 8],
-                          agent: &[i64; 8],
-                          text_tok: i64,
-                          n_model_inputs: &mut usize,
-                          inputs_ok: &mut usize| {
+                      user: &[i64; 8],
+                      agent: &[i64; 8],
+                      text_tok: i64,
+                      n_model_inputs: &mut usize,
+                      inputs_ok: &mut usize| {
         let p = sc.prepare(Some(user), Some(agent), Some(text_tok)).unwrap();
         *n_model_inputs += 1;
         let valid = p.input.iter().enumerate().all(|(k, &t)| {
-            let hi = if k == 0 { cfg::TEXT_CARD as i64 } else { cfg::CARD as i64 };
+            let hi = if k == 0 {
+                cfg::TEXT_CARD as i64
+            } else {
+                cfg::CARD as i64
+            };
             (0..=hi).contains(&t)
         });
         *inputs_ok += valid as usize;
@@ -995,13 +1037,34 @@ fn ownprompt_smoke(voice_pt: &str, text: &str) {
     }
     sc.overwrite(&prompt.voice.cache);
     for _ in 0..prompt.silence_frames {
-        token_step(&mut sc, &SINE, &SILENCE, PAD, &mut n_model_inputs, &mut inputs_ok);
+        token_step(
+            &mut sc,
+            &SINE,
+            &SILENCE,
+            PAD,
+            &mut n_model_inputs,
+            &mut inputs_ok,
+        );
     }
     for &t in &prompt.text_tokens {
-        token_step(&mut sc, &SINE, &SILENCE, t, &mut n_model_inputs, &mut inputs_ok);
+        token_step(
+            &mut sc,
+            &SINE,
+            &SILENCE,
+            t,
+            &mut n_model_inputs,
+            &mut inputs_ok,
+        );
     }
     for _ in 0..prompt.silence_frames {
-        token_step(&mut sc, &SINE, &SILENCE, PAD, &mut n_model_inputs, &mut inputs_ok);
+        token_step(
+            &mut sc,
+            &SINE,
+            &SILENCE,
+            PAD,
+            &mut n_model_inputs,
+            &mut inputs_ok,
+        );
     }
     let ok_inputs = inputs_ok == n_model_inputs;
     println!(

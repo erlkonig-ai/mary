@@ -8,11 +8,11 @@ pub mod up_block;
 
 use burn::prelude::*;
 
+use crate::nn::weight_loader::WeightLoader;
 use config::VaeConfig;
 use decoder::Decoder;
 use encoder::Encoder;
 use resnet::conv2d_forward;
-use crate::nn::weight_loader::WeightLoader;
 
 /// AutoencoderKLFlux2 — VAE for FLUX.2 (encode + decode).
 ///
@@ -55,17 +55,11 @@ pub struct AutoencoderKLFlux2<B: Backend> {
 
 impl<B: Backend> AutoencoderKLFlux2<B> {
     /// Load decode-only VAE (backward compatible — skips encoder weights).
-    pub fn load(
-        loader: &WeightLoader,
-        config: VaeConfig,
-        device: &B::Device,
-    ) -> Self {
+    pub fn load(loader: &WeightLoader, config: VaeConfig, device: &B::Device) -> Self {
         let decoder = Decoder::load(loader, &config, device);
 
-        let post_quant_conv_weight =
-            loader.load_tensor::<B, 4>("post_quant_conv.weight", device);
-        let post_quant_conv_bias =
-            loader.load_tensor::<B, 1>("post_quant_conv.bias", device);
+        let post_quant_conv_weight = loader.load_tensor::<B, 4>("post_quant_conv.weight", device);
+        let post_quant_conv_bias = loader.load_tensor::<B, 1>("post_quant_conv.bias", device);
 
         let bn_running_mean = loader.load_tensor::<B, 1>("bn.running_mean", device);
         let bn_running_var = loader.load_tensor::<B, 1>("bn.running_var", device);
@@ -86,22 +80,14 @@ impl<B: Backend> AutoencoderKLFlux2<B> {
     }
 
     /// Load full VAE with both encoder and decoder.
-    pub fn load_with_encoder(
-        loader: &WeightLoader,
-        config: VaeConfig,
-        device: &B::Device,
-    ) -> Self {
+    pub fn load_with_encoder(loader: &WeightLoader, config: VaeConfig, device: &B::Device) -> Self {
         let encoder = Encoder::load(loader, &config, device);
         let decoder = Decoder::load(loader, &config, device);
 
-        let quant_conv_weight =
-            loader.load_tensor::<B, 4>("quant_conv.weight", device);
-        let quant_conv_bias =
-            loader.load_tensor::<B, 1>("quant_conv.bias", device);
-        let post_quant_conv_weight =
-            loader.load_tensor::<B, 4>("post_quant_conv.weight", device);
-        let post_quant_conv_bias =
-            loader.load_tensor::<B, 1>("post_quant_conv.bias", device);
+        let quant_conv_weight = loader.load_tensor::<B, 4>("quant_conv.weight", device);
+        let quant_conv_bias = loader.load_tensor::<B, 1>("quant_conv.bias", device);
+        let post_quant_conv_weight = loader.load_tensor::<B, 4>("post_quant_conv.weight", device);
+        let post_quant_conv_bias = loader.load_tensor::<B, 1>("post_quant_conv.bias", device);
 
         let bn_running_mean = loader.load_tensor::<B, 1>("bn.running_mean", device);
         let bn_running_var = loader.load_tensor::<B, 1>("bn.running_var", device);
@@ -131,21 +117,24 @@ impl<B: Backend> AutoencoderKLFlux2<B> {
     ///   2. quant_conv -> [B, 64, H/8, W/8]
     ///   3. Split: mean = first 32 channels (deterministic encoding)
     pub fn encode(&self, image: Tensor<B, 4>) -> Tensor<B, 4> {
-        let encoder = self.encoder.as_ref().expect("Encoder not loaded — use load_with_encoder()");
-        let qc_weight = self.quant_conv_weight.as_ref().expect("quant_conv not loaded");
-        let qc_bias = self.quant_conv_bias.as_ref().expect("quant_conv not loaded");
+        let encoder = self
+            .encoder
+            .as_ref()
+            .expect("Encoder not loaded — use load_with_encoder()");
+        let qc_weight = self
+            .quant_conv_weight
+            .as_ref()
+            .expect("quant_conv not loaded");
+        let qc_bias = self
+            .quant_conv_bias
+            .as_ref()
+            .expect("quant_conv not loaded");
 
         // 1. Encoder forward
         let h = encoder.forward(image);
 
         // 2. quant_conv: 1x1 convolution
-        let h = conv2d_forward(
-            h,
-            qc_weight.clone(),
-            Some(qc_bias.clone()),
-            [1, 1],
-            [0, 0],
-        );
+        let h = conv2d_forward(h, qc_weight.clone(), Some(qc_bias.clone()), [1, 1], [0, 0]);
 
         // 3. Split into mean and logvar, return mean (deterministic)
         let [b, c, height, width] = h.dims();

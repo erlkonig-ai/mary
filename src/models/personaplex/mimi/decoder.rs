@@ -40,14 +40,22 @@ impl CpuConv {
     fn load(loader: &WeightLoader, prefix: &str, stride: usize) -> Self {
         let (w, shape) = loader.load_host_f32(&format!("{prefix}.weight"));
         let (out, inc, k) = (shape[0], shape[1], shape[2]);
-        Self { w, b: Some(loader.load_host_f32(&format!("{prefix}.bias")).0), out, inc, k, stride }
+        Self {
+            w,
+            b: Some(loader.load_host_f32(&format!("{prefix}.bias")).0),
+            out,
+            inc,
+            k,
+            stride,
+        }
     }
 
     /// `x: [in, L]` → `[out, T]`. Dense (`groups=1`).
     fn forward(&self, x: &[f32], l: usize) -> (Vec<f32>, usize) {
         let (k, s) = (self.k, self.stride);
         let pad_left = k - s;
-        let n_frames = ((l + pad_left).saturating_sub(k) as f64 / s as f64 + 1.0).ceil() as usize - 1;
+        let n_frames =
+            ((l + pad_left).saturating_sub(k) as f64 / s as f64 + 1.0).ceil() as usize - 1;
         let ideal = n_frames * s + k - pad_left;
         let pad_right = ideal.saturating_sub(l);
         let lp = l + pad_left + pad_right;
@@ -214,8 +222,8 @@ fn elu(x: &mut [f32]) {
 /// One RVQ bank decode side: pre-divided codebooks `[2048, 256]` (DERIVED at
 /// load, stays computed) + output_proj (as shipped → zero-copy pile view).
 struct RvqDecoder {
-    codebooks: Vec<Vec<f32>>,   // per q: [2048·256]
-    output_proj: HostF32,       // [512, 256]
+    codebooks: Vec<Vec<f32>>, // per q: [2048·256]
+    output_proj: HostF32,     // [512, 256]
 }
 
 impl RvqDecoder {
@@ -237,7 +245,9 @@ impl RvqDecoder {
             .collect();
         Self {
             codebooks,
-            output_proj: loader.load_host_f32(&format!("{prefix}.output_proj.weight")).0,
+            output_proj: loader
+                .load_host_f32(&format!("{prefix}.output_proj.weight"))
+                .0,
         }
     }
 
@@ -293,9 +303,23 @@ impl MimiDecoder {
             .iter()
             .enumerate()
             .map(|(i, &r)| DecBlock {
-                up: CpuTransConv::load(loader, &format!("decoder.model.{}.convtr.convtr", 3 * i + 2), r, 1, true),
-                res1: CpuConv::load(loader, &format!("decoder.model.{}.block.1.conv.conv", 3 * i + 3), 1),
-                res2: CpuConv::load(loader, &format!("decoder.model.{}.block.3.conv.conv", 3 * i + 3), 1),
+                up: CpuTransConv::load(
+                    loader,
+                    &format!("decoder.model.{}.convtr.convtr", 3 * i + 2),
+                    r,
+                    1,
+                    true,
+                ),
+                res1: CpuConv::load(
+                    loader,
+                    &format!("decoder.model.{}.block.1.conv.conv", 3 * i + 3),
+                    1,
+                ),
+                res2: CpuConv::load(
+                    loader,
+                    &format!("decoder.model.{}.block.3.conv.conv", 3 * i + 3),
+                    1,
+                ),
             })
             .collect();
         Self {
@@ -316,7 +340,9 @@ impl MimiDecoder {
     pub fn quantizer_decode(&self, codes: &[[u32; NUM_CODEBOOKS]]) -> (Vec<f32>, usize) {
         let t = codes.len();
         let sem: Vec<Vec<u32>> = vec![codes.iter().map(|f| f[0]).collect()];
-        let ac: Vec<Vec<u32>> = (1..NUM_CODEBOOKS).map(|q| codes.iter().map(|f| f[q]).collect()).collect();
+        let ac: Vec<Vec<u32>> = (1..NUM_CODEBOOKS)
+            .map(|q| codes.iter().map(|f| f[q]).collect())
+            .collect();
         let a = self.rvq_first.decode(&sem, t);
         let b = self.rvq_rest.decode(&ac, t);
         let mut out = a;

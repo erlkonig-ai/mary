@@ -149,7 +149,8 @@ impl CodePredictor {
     /// `out: [2048]` — the predictor's share of a talker input position.
     pub fn accumulate_frame(&self, frame: &[u32; NUM_CODE_GROUPS], out: &mut [f32]) {
         for i in 1..NUM_CODE_GROUPS {
-            let row = &self.embeddings[i - 1][frame[i] as usize * self.talker_width..][..self.talker_width];
+            let row = &self.embeddings[i - 1][frame[i] as usize * self.talker_width..]
+                [..self.talker_width];
             for (o, &r) in out.iter_mut().zip(row) {
                 *o += r;
             }
@@ -256,7 +257,9 @@ impl CodePredictor {
     /// `proj(x)` — small_to_mtp_projection talker_width → 1024, or the
     /// 0.6B's identity.
     fn project(&self, x: &[f32]) -> Vec<f32> {
-        let Some((proj_w, proj_b)) = &self.proj else { return x.to_vec() };
+        let Some((proj_w, proj_b)) = &self.proj else {
+            return x.to_vec();
+        };
         let t = std::time::Instant::now();
         let mut y = vec![0f32; PRED_HIDDEN];
         sgemv_mt(proj_w, PRED_HIDDEN, self.talker_width, x, &mut y);
@@ -324,7 +327,13 @@ impl CodePredictor {
         for step in 0..NUM_CODE_GROUPS - 1 {
             let th = std::time::Instant::now();
             rms_norm(&h, &self.norm_w, TALKER_EPS, &mut normed);
-            sgemv_mt(&self.lm_heads[step], PRED_VOCAB, PRED_HIDDEN, &normed, &mut logits);
+            sgemv_mt(
+                &self.lm_heads[step],
+                PRED_VOCAB,
+                PRED_HIDDEN,
+                &normed,
+                &mut logits,
+            );
             let code = if do_sample {
                 // full-vocab gumbel-max: argmax(v/T + g) ~ multinomial(softmax(v/T))
                 let mut best = (f32::MIN, 0usize);
@@ -349,7 +358,8 @@ impl CodePredictor {
             if bench {
                 add(&T_HEAD, th.elapsed().as_secs_f64());
             }
-            let row = &self.embeddings[step][code as usize * self.talker_width..][..self.talker_width];
+            let row =
+                &self.embeddings[step][code as usize * self.talker_width..][..self.talker_width];
             for (o, &r) in embed_sum.iter_mut().zip(row) {
                 *o += r;
             }

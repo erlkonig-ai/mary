@@ -101,7 +101,10 @@ pub fn ingest_members(
             // skip non-float tensors (int buffers etc.) — the forward never loads them
             use safetensors::Dtype;
             let view = st.tensor(key).ok()?;
-            if !matches!(view.dtype(), Dtype::F64 | Dtype::F32 | Dtype::F16 | Dtype::BF16) {
+            if !matches!(
+                view.dtype(),
+                Dtype::F64 | Dtype::F32 | Dtype::F16 | Dtype::BF16
+            ) {
                 return None;
             }
             let (data, shape) = get_tensor_f32(&st, key);
@@ -201,7 +204,10 @@ pub fn build_model_root(
     Ok(Fragment::rooted(root_id, facts))
 }
 
-fn read_string(blobs: &impl BlobStoreGet, h: Inline<inlineencodings::Handle<LongString>>) -> String {
+fn read_string(
+    blobs: &impl BlobStoreGet,
+    h: Inline<inlineencodings::Handle<LongString>>,
+) -> String {
     let v: anybytes::View<str> = blobs.get(h).expect("string blob");
     v.to_string()
 }
@@ -252,7 +258,11 @@ pub fn read_shape(
     sh: Inline<inlineencodings::Handle<crate::format::U64Array>>,
 ) -> Vec<usize> {
     let sbb: anybytes::Bytes = blobs.get(sh).expect("shape blob");
-    sbb.view::<[u64]>().expect("shape view").iter().map(|&d| d as usize).collect()
+    sbb.view::<[u64]>()
+        .expect("shape view")
+        .iter()
+        .map(|&d| d as usize)
+        .collect()
 }
 
 /// Build a `name → handle-pair` INDEX of a model graph — reads only the small
@@ -267,7 +277,8 @@ pub fn index_keymap(
     model_id: Id,
 ) -> HashMap<String, LeafHandles> {
     let mut map = HashMap::new();
-    let members: Vec<_> = find!((m: Id), pattern!(tribles, [{ model_id @ attrs::member: ?m }])).collect();
+    let members: Vec<_> =
+        find!((m: Id), pattern!(tribles, [{ model_id @ attrs::member: ?m }])).collect();
     for (mid,) in members {
         let (name_h, w_id) = find!(
             (n, w: Id),

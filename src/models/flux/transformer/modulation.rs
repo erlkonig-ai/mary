@@ -57,12 +57,14 @@ pub fn split_modulation<B: Backend>(
         let shift = mod_3d
             .clone()
             .slice([0..batch, 0..1, base..base + chunk_size]); // [B, 1, dim]
-        let scale = mod_3d
-            .clone()
-            .slice([0..batch, 0..1, base + chunk_size..base + 2 * chunk_size]);
-        let gate = mod_3d
-            .clone()
-            .slice([0..batch, 0..1, base + 2 * chunk_size..base + 3 * chunk_size]);
+        let scale =
+            mod_3d
+                .clone()
+                .slice([0..batch, 0..1, base + chunk_size..base + 2 * chunk_size]);
+        let gate =
+            mod_3d
+                .clone()
+                .slice([0..batch, 0..1, base + 2 * chunk_size..base + 3 * chunk_size]);
         result.push((shift, scale, gate));
     }
     result

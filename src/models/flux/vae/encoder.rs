@@ -109,8 +109,7 @@ impl<B: Backend> Encoder<B> {
         // Output normalization and convolution
         let conv_norm_out_weight =
             loader.load_tensor::<B, 1>("encoder.conv_norm_out.weight", device);
-        let conv_norm_out_bias =
-            loader.load_tensor::<B, 1>("encoder.conv_norm_out.bias", device);
+        let conv_norm_out_bias = loader.load_tensor::<B, 1>("encoder.conv_norm_out.bias", device);
         let conv_out_weight = loader.load_tensor::<B, 4>("encoder.conv_out.weight", device);
         let conv_out_bias = loader.load_tensor::<B, 1>("encoder.conv_out.bias", device);
 

@@ -137,8 +137,7 @@ impl<B: Backend> Flux2TimestepGuidanceEmbeddings<B> {
         device: &B::Device,
     ) -> Tensor<B, 2> {
         // Sinusoidal time projection: flip_sin_to_cos=true, downscale_freq_shift=0
-        let timesteps_proj =
-            get_timestep_embedding(timestep, self.in_channels, true, 0.0, device);
+        let timesteps_proj = get_timestep_embedding(timestep, self.in_channels, true, 0.0, device);
         let mut temb = self.timestep_embedder.forward(timesteps_proj);
 
         // Add guidance embedding if present

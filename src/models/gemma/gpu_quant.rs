@@ -42,11 +42,13 @@ pub struct GpuQuantTensor<B: Backend> {
 /// The quantization is per-group where each group is one head_dim vector.
 ///
 /// All operations happen on GPU via burn tensor ops.
-pub fn gpu_quantize<B: Backend<IntElem = i32>>(
-    input: Tensor<B, 4>,
-) -> GpuQuantTensor<B> {
+pub fn gpu_quantize<B: Backend<IntElem = i32>>(input: Tensor<B, 4>) -> GpuQuantTensor<B> {
     let [batch, n_kv_heads, seq_len, head_dim] = input.dims();
-    assert!(head_dim % 4 == 0, "head_dim must be divisible by 4, got {}", head_dim);
+    assert!(
+        head_dim % 4 == 0,
+        "head_dim must be divisible by 4, got {}",
+        head_dim
+    );
 
     let n_groups = batch * n_kv_heads * seq_len;
     let packed_dim = head_dim / 4;
@@ -78,10 +80,21 @@ pub fn gpu_quantize<B: Backend<IntElem = i32>>(
     let q_grouped = q_int.reshape([n_groups, packed_dim, 4]);
 
     // Extract each of the 4 lanes
-    let v0 = q_grouped.clone().slice([0..n_groups, 0..packed_dim, 0..1]).reshape([n_groups, packed_dim]);
-    let v1 = q_grouped.clone().slice([0..n_groups, 0..packed_dim, 1..2]).reshape([n_groups, packed_dim]);
-    let v2 = q_grouped.clone().slice([0..n_groups, 0..packed_dim, 2..3]).reshape([n_groups, packed_dim]);
-    let v3 = q_grouped.slice([0..n_groups, 0..packed_dim, 3..4]).reshape([n_groups, packed_dim]);
+    let v0 = q_grouped
+        .clone()
+        .slice([0..n_groups, 0..packed_dim, 0..1])
+        .reshape([n_groups, packed_dim]);
+    let v1 = q_grouped
+        .clone()
+        .slice([0..n_groups, 0..packed_dim, 1..2])
+        .reshape([n_groups, packed_dim]);
+    let v2 = q_grouped
+        .clone()
+        .slice([0..n_groups, 0..packed_dim, 2..3])
+        .reshape([n_groups, packed_dim]);
+    let v3 = q_grouped
+        .slice([0..n_groups, 0..packed_dim, 3..4])
+        .reshape([n_groups, packed_dim]);
 
     let packed = v0
         .bitwise_or(v1.bitwise_left_shift_scalar(8))
@@ -104,18 +117,28 @@ pub fn gpu_quantize<B: Backend<IntElem = i32>>(
 ///
 /// Output: `[batch, n_kv_heads, seq_len, head_dim]` as f32 tensor.
 /// All operations happen on GPU via burn tensor ops.
-pub fn gpu_dequantize<B: Backend<IntElem = i32>>(
-    qt: &GpuQuantTensor<B>,
-) -> Tensor<B, 4> {
+pub fn gpu_dequantize<B: Backend<IntElem = i32>>(qt: &GpuQuantTensor<B>) -> Tensor<B, 4> {
     let [batch, n_kv_heads, seq_len, head_dim] = qt.shape;
     let n_groups = batch * n_kv_heads * seq_len;
     let packed_dim = head_dim / 4;
 
     // Unpack: extract 4 uint8 values from each i32
     let v0 = qt.packed.clone().bitwise_and_scalar(0xFF);
-    let v1 = qt.packed.clone().bitwise_right_shift_scalar(8).bitwise_and_scalar(0xFF);
-    let v2 = qt.packed.clone().bitwise_right_shift_scalar(16).bitwise_and_scalar(0xFF);
-    let v3 = qt.packed.clone().bitwise_right_shift_scalar(24).bitwise_and_scalar(0xFF);
+    let v1 = qt
+        .packed
+        .clone()
+        .bitwise_right_shift_scalar(8)
+        .bitwise_and_scalar(0xFF);
+    let v2 = qt
+        .packed
+        .clone()
+        .bitwise_right_shift_scalar(16)
+        .bitwise_and_scalar(0xFF);
+    let v3 = qt
+        .packed
+        .clone()
+        .bitwise_right_shift_scalar(24)
+        .bitwise_and_scalar(0xFF);
 
     // Interleave back to [n_groups, head_dim]
     // Stack along last dim: [n_groups, packed_dim, 4]
@@ -123,8 +146,7 @@ pub fn gpu_dequantize<B: Backend<IntElem = i32>>(
     let v1 = v1.reshape([n_groups, packed_dim, 1]);
     let v2 = v2.reshape([n_groups, packed_dim, 1]);
     let v3 = v3.reshape([n_groups, packed_dim, 1]);
-    let unpacked = Tensor::cat(vec![v0, v1, v2, v3], 2)
-        .reshape([n_groups, head_dim]);
+    let unpacked = Tensor::cat(vec![v0, v1, v2, v3], 2).reshape([n_groups, head_dim]);
 
     // Convert to float: dequantized = q * scale + zero
     let q_float = unpacked.float();
@@ -177,8 +199,7 @@ impl<B: Backend> GpuQuantKvCache<B> {
             let packed_dim = head_dim / 4;
             (n_groups * packed_dim + 2 * n_groups) * 4
         };
-        self.k.as_ref().map_or(0, per_tensor)
-            + self.v.as_ref().map_or(0, per_tensor)
+        self.k.as_ref().map_or(0, per_tensor) + self.v.as_ref().map_or(0, per_tensor)
     }
 
     /// What the equivalent uncompressed f32 KV cache would use in bytes.
@@ -251,19 +272,17 @@ fn concat_gpu_quant<B: Backend<IntElem = i32>>(
     let n_bh = batch * n_kv_heads;
     let a_packed = a.packed.reshape([n_bh, seq_a, packed_dim]);
     let b_packed = b.packed.reshape([n_bh, seq_b, packed_dim]);
-    let cat_packed = Tensor::cat(vec![a_packed, b_packed], 1)
-        .reshape([n_bh * total_seq, packed_dim]);
+    let cat_packed =
+        Tensor::cat(vec![a_packed, b_packed], 1).reshape([n_bh * total_seq, packed_dim]);
 
     // Scale and zero: reshape to [batch * n_kv_heads, seq], cat, flatten.
     let a_scale = a.scale.reshape([n_bh, seq_a]);
     let b_scale = b.scale.reshape([n_bh, seq_b]);
-    let cat_scale = Tensor::cat(vec![a_scale, b_scale], 1)
-        .reshape([n_bh * total_seq]);
+    let cat_scale = Tensor::cat(vec![a_scale, b_scale], 1).reshape([n_bh * total_seq]);
 
     let a_zero = a.zero.reshape([n_bh, seq_a]);
     let b_zero = b.zero.reshape([n_bh, seq_b]);
-    let cat_zero = Tensor::cat(vec![a_zero, b_zero], 1)
-        .reshape([n_bh * total_seq]);
+    let cat_zero = Tensor::cat(vec![a_zero, b_zero], 1).reshape([n_bh * total_seq]);
 
     GpuQuantTensor {
         packed: cat_packed,
@@ -364,14 +383,11 @@ fn lloyd_max_centroids_f32(bits: usize) -> Vec<f32> {
         1 => vec![-0.7978846, 0.7978846],
         2 => vec![-1.510, -0.4528, 0.4528, 1.510],
         3 => vec![
-            -2.1519, -1.3440, -0.7560, -0.2451,
-             0.2451,  0.7560,  1.3440,  2.1519,
+            -2.1519, -1.3440, -0.7560, -0.2451, 0.2451, 0.7560, 1.3440, 2.1519,
         ],
         4 => vec![
-            -2.7326, -2.0690, -1.6180, -1.2562,
-            -0.9424, -0.6568, -0.3881, -0.1284,
-             0.1284,  0.3881,  0.6568,  0.9424,
-             1.2562,  1.6180,  2.0690,  2.7326,
+            -2.7326, -2.0690, -1.6180, -1.2562, -0.9424, -0.6568, -0.3881, -0.1284, 0.1284, 0.3881,
+            0.6568, 0.9424, 1.2562, 1.6180, 2.0690, 2.7326,
         ],
         _ => panic!("Lloyd-Max tables only for 1..=4 bits, got {}", bits),
     }
@@ -381,14 +397,10 @@ fn lloyd_max_boundaries_f32(bits: usize) -> Vec<f32> {
     match bits {
         1 => vec![0.0],
         2 => vec![-0.9816, 0.0, 0.9816],
-        3 => vec![
-            -1.7480, -1.0500, -0.5006, 0.0, 0.5006, 1.0500, 1.7480,
-        ],
+        3 => vec![-1.7480, -1.0500, -0.5006, 0.0, 0.5006, 1.0500, 1.7480],
         4 => vec![
-            -2.4008, -1.8435, -1.4372, -1.0993,
-            -0.7996, -0.5224, -0.2582, 0.0,
-             0.2582,  0.5224,  0.7996,  1.0993,
-             1.4372,  1.8435,  2.4008,
+            -2.4008, -1.8435, -1.4372, -1.0993, -0.7996, -0.5224, -0.2582, 0.0, 0.2582, 0.5224,
+            0.7996, 1.0993, 1.4372, 1.8435, 2.4008,
         ],
         _ => panic!("Lloyd-Max tables only for 1..=4 bits, got {}", bits),
     }
@@ -396,7 +408,9 @@ fn lloyd_max_boundaries_f32(bits: usize) -> Vec<f32> {
 
 /// Next power of 2 >= n.
 fn next_pow2(n: usize) -> usize {
-    if n.is_power_of_two() { return n; }
+    if n.is_power_of_two() {
+        return n;
+    }
     let mut v = n;
     v -= 1;
     v |= v >> 1;
@@ -414,7 +428,11 @@ impl<B: Backend<IntElem = i32>> GpuTurboQuantCtx<B> {
         let dim = config.head_dim;
         let padded_dim = next_pow2(dim);
         let norm = 1.0 / (padded_dim as f64).sqrt();
-        let mse_bits = if config.residual_bits > 0 { config.bits - 1 } else { config.bits };
+        let mse_bits = if config.residual_bits > 0 {
+            config.bits - 1
+        } else {
+            config.bits
+        };
         let n_levels = 1 << mse_bits;
 
         // Generate Rademacher signs using same xorshift64 as CPU version
@@ -422,7 +440,11 @@ impl<B: Backend<IntElem = i32>> GpuTurboQuantCtx<B> {
         let signs_data: Vec<f32> = (0..padded_dim)
             .map(|_| {
                 state = xorshift64(state);
-                if state & 1 == 0 { 1.0f32 } else { -1.0f32 }
+                if state & 1 == 0 {
+                    1.0f32
+                } else {
+                    -1.0f32
+                }
             })
             .collect();
         let signs = Tensor::<B, 1>::from_floats(&signs_data[..], device);
@@ -440,7 +462,11 @@ impl<B: Backend<IntElem = i32>> GpuTurboQuantCtx<B> {
             let qjl_data: Vec<f32> = (0..m * dim)
                 .map(|_| {
                     qjl_state = xorshift64(qjl_state);
-                    if qjl_state & 1 == 0 { 1.0f32 } else { -1.0f32 }
+                    if qjl_state & 1 == 0 {
+                        1.0f32
+                    } else {
+                        -1.0f32
+                    }
                 })
                 .collect();
             Some(Tensor::<B, 1>::from_floats(&qjl_data[..], device).reshape([m, dim]))
@@ -573,9 +599,12 @@ impl<B: Backend<IntElem = i32>> GpuTurboQuantCtx<B> {
             let reshaped = buf.reshape([n_groups, n_blocks, 2, half]);
 
             // Extract a and b: the two halves along dim 2
-            let a = reshaped.clone().slice([0..n_groups, 0..n_blocks, 0..1, 0..half])
+            let a = reshaped
+                .clone()
+                .slice([0..n_groups, 0..n_blocks, 0..1, 0..half])
                 .reshape([n_groups, n_blocks, half]);
-            let b = reshaped.slice([0..n_groups, 0..n_blocks, 1..2, 0..half])
+            let b = reshaped
+                .slice([0..n_groups, 0..n_blocks, 1..2, 0..half])
                 .reshape([n_groups, n_blocks, half]);
 
             // Butterfly: a' = a + b, b' = a - b
@@ -635,10 +664,10 @@ impl<B: Backend<IntElem = i32>> GpuTurboQuantCtx<B> {
         // we compute it via arithmetic:
         //   mask = (x_expanded - boundaries) as sign, clamp to 0..1
         let diff = x_expanded - boundaries; // [n_groups, dim, n_boundaries]
-        // step function: 1 where diff > 0, 0 otherwise
-        // Use: (sign(diff) + 1) / 2, clamped. sign gives -1, 0, 1.
-        // For diff=0, we want bin index to round up (match CPU: boundary hit -> upper bin)
-        // So use >= 0: (sign(diff + epsilon) + 1) / 2
+                                            // step function: 1 where diff > 0, 0 otherwise
+                                            // Use: (sign(diff) + 1) / 2, clamped. sign gives -1, 0, 1.
+                                            // For diff=0, we want bin index to round up (match CPU: boundary hit -> upper bin)
+                                            // So use >= 0: (sign(diff + epsilon) + 1) / 2
         let step = diff.add_scalar(1e-7).sign().add_scalar(1.0).div_scalar(2.0);
         // Sum along boundaries dimension to get bin index
         let bin_index = step.sum_dim(2).reshape([n_groups, dim]); // float in [0, n_boundaries]
@@ -653,7 +682,11 @@ impl<B: Backend<IntElem = i32>> GpuTurboQuantCtx<B> {
     /// Dequantize: bin indices + sigma -> reconstructed rotated values.
     /// indices: [n_groups, dim] int tensor, sigma: [n_groups] float tensor.
     /// Returns [n_groups, dim] float tensor of reconstructed rotated values.
-    fn lloyd_max_dequantize(&self, indices: Tensor<B, 2, Int>, sigma: Tensor<B, 1>) -> Tensor<B, 2> {
+    fn lloyd_max_dequantize(
+        &self,
+        indices: Tensor<B, 2, Int>,
+        sigma: Tensor<B, 1>,
+    ) -> Tensor<B, 2> {
         let [n_groups, dim] = indices.dims();
 
         // Gather centroids: indices -> centroid values
@@ -721,7 +754,8 @@ impl<B: Backend<IntElem = i32>> GpuTurboQuantCtx<B> {
         // Pad dim to multiple of vals_per_word if needed
         let padded_dim = packed_dim * vals_per_word;
         let indices = if padded_dim > dim {
-            let padding = Tensor::<B, 2, Int>::zeros([n_groups, padded_dim - dim], &indices.device());
+            let padding =
+                Tensor::<B, 2, Int>::zeros([n_groups, padded_dim - dim], &indices.device());
             Tensor::cat(vec![indices, padding], 1)
         } else {
             indices
@@ -731,13 +765,15 @@ impl<B: Backend<IntElem = i32>> GpuTurboQuantCtx<B> {
         let grouped = indices.reshape([n_groups, packed_dim, vals_per_word]);
 
         // Pack: shift each lane by (lane_index * bits) and OR together
-        let mut packed = grouped.clone()
+        let mut packed = grouped
+            .clone()
             .slice([0..n_groups, 0..packed_dim, 0..1])
             .reshape([n_groups, packed_dim]);
 
         for lane in 1..vals_per_word {
-            let lane_vals = grouped.clone()
-                .slice([0..n_groups, 0..packed_dim, lane..(lane+1)])
+            let lane_vals = grouped
+                .clone()
+                .slice([0..n_groups, 0..packed_dim, lane..(lane + 1)])
                 .reshape([n_groups, packed_dim]);
             let shift = (lane * bits) as i32;
             packed = packed.bitwise_or(lane_vals.bitwise_left_shift_scalar(shift));
@@ -759,14 +795,14 @@ impl<B: Backend<IntElem = i32>> GpuTurboQuantCtx<B> {
         let mut lanes: Vec<Tensor<B, 3, Int>> = Vec::with_capacity(vals_per_word);
         for lane in 0..vals_per_word {
             let shift = (lane * bits) as i32;
-            let lane_vals = packed.clone()
+            let lane_vals = packed
+                .clone()
                 .bitwise_right_shift_scalar(shift)
                 .bitwise_and_scalar(mask);
             lanes.push(lane_vals.reshape([n_groups, packed_dim, 1]));
         }
 
-        let interleaved = Tensor::cat(lanes, 2)
-            .reshape([n_groups, packed_dim * vals_per_word]);
+        let interleaved = Tensor::cat(lanes, 2).reshape([n_groups, packed_dim * vals_per_word]);
 
         // Truncate to original dim (remove padding)
         if packed_dim * vals_per_word > dim {
@@ -786,7 +822,11 @@ impl<B: Backend<IntElem = i32>> GpuTurboQuantCtx<B> {
     /// Returns a GpuTurboQuantTensor with all data on GPU.
     pub fn quantize(&self, input: Tensor<B, 4>) -> GpuTurboQuantTensor<B> {
         let [batch, n_kv_heads, seq_len, head_dim] = input.dims();
-        assert_eq!(head_dim, self.dim, "head_dim mismatch: expected {}, got {}", self.dim, head_dim);
+        assert_eq!(
+            head_dim, self.dim,
+            "head_dim mismatch: expected {}, got {}",
+            self.dim, head_dim
+        );
         let n_groups = batch * n_kv_heads * seq_len;
 
         // Flatten to [n_groups, dim]
@@ -816,14 +856,16 @@ impl<B: Backend<IntElem = i32>> GpuTurboQuantCtx<B> {
             let deq_normalized = self.rotate_inv(deq_rotated);
             // Compute residual
             let residual = normalized - deq_normalized; // [n_groups, dim]
-            // Compute residual norms
-            let rnorms = (residual.clone() * residual.clone()).sum_dim(1).sqrt()
+                                                        // Compute residual norms
+            let rnorms = (residual.clone() * residual.clone())
+                .sum_dim(1)
+                .sqrt()
                 .reshape([n_groups]); // [n_groups]
 
             // Project: projected = residual @ qjl_matrix^T -> [n_groups, m]
             let projected = residual.matmul(qjl_matrix.clone().transpose()); // [n_groups, m]
-            // Store sign bits: 1 where projected >= 0, 0 elsewhere
-            // Pack into i32: 32 sign bits per i32
+                                                                             // Store sign bits: 1 where projected >= 0, 0 elsewhere
+                                                                             // Pack into i32: 32 sign bits per i32
             let sign_float = projected.sign().add_scalar(1.0).div_scalar(2.0); // 0 or 1
             let sign_int = sign_float.add_scalar(0.5).int(); // [n_groups, m]
 
@@ -832,19 +874,22 @@ impl<B: Backend<IntElem = i32>> GpuTurboQuantCtx<B> {
             let padded_m = qjl_packed_dim * 32;
 
             let sign_padded = if padded_m > m {
-                let padding = Tensor::<B, 2, Int>::zeros([n_groups, padded_m - m], &packed.device());
+                let padding =
+                    Tensor::<B, 2, Int>::zeros([n_groups, padded_m - m], &packed.device());
                 Tensor::cat(vec![sign_int, padding], 1)
             } else {
                 sign_int
             };
 
             let sign_grouped = sign_padded.reshape([n_groups, qjl_packed_dim, 32]);
-            let mut qjl_packed = sign_grouped.clone()
+            let mut qjl_packed = sign_grouped
+                .clone()
                 .slice([0..n_groups, 0..qjl_packed_dim, 0..1])
                 .reshape([n_groups, qjl_packed_dim]);
             for bit in 1..32 {
-                let lane = sign_grouped.clone()
-                    .slice([0..n_groups, 0..qjl_packed_dim, bit..(bit+1)])
+                let lane = sign_grouped
+                    .clone()
+                    .slice([0..n_groups, 0..qjl_packed_dim, bit..(bit + 1)])
                     .reshape([n_groups, qjl_packed_dim]);
                 qjl_packed = qjl_packed.bitwise_or(lane.bitwise_left_shift_scalar(bit as i32));
             }
@@ -893,13 +938,13 @@ impl<B: Backend<IntElem = i32>> GpuTurboQuantCtx<B> {
             // Unpack sign bits from i32
             let mut sign_lanes: Vec<Tensor<B, 3, Int>> = Vec::with_capacity(32);
             for bit in 0..32 {
-                let lane = qjl_packed.clone()
+                let lane = qjl_packed
+                    .clone()
                     .bitwise_right_shift_scalar(bit as i32)
                     .bitwise_and_scalar(1);
                 sign_lanes.push(lane.reshape([n_groups, qjl_packed_dim, 1]));
             }
-            let sign_unpacked = Tensor::cat(sign_lanes, 2)
-                .reshape([n_groups, qjl_packed_dim * 32]);
+            let sign_unpacked = Tensor::cat(sign_lanes, 2).reshape([n_groups, qjl_packed_dim * 32]);
             // Truncate to m
             let sign_bits = if qjl_packed_dim * 32 > m {
                 sign_unpacked.slice([0..n_groups, 0..m])
@@ -971,7 +1016,11 @@ impl<B: Backend<IntElem = i32>> GpuTurboQuantKvCache<B> {
     /// Create an empty GPU TurboQuant cache.
     pub fn new(config: &TurboQuantConfig, device: &B::Device) -> Self {
         let ctx = GpuTurboQuantCtx::new(config, device);
-        Self { k: None, v: None, ctx }
+        Self {
+            k: None,
+            v: None,
+            ctx,
+        }
     }
 
     /// Current sequence length stored in cache (0 if empty).
@@ -988,15 +1037,18 @@ impl<B: Backend<IntElem = i32>> GpuTurboQuantKvCache<B> {
             let n_groups = qt.sigma.dims()[0];
             let packed_bytes = n_groups * qt.packed_dim * 4; // i32 per packed word
             let sigma_bytes = n_groups * 4; // f32
-            let norm_bytes = n_groups * 4;  // f32
-            let qjl_bytes = qt.qjl_packed.as_ref()
+            let norm_bytes = n_groups * 4; // f32
+            let qjl_bytes = qt
+                .qjl_packed
+                .as_ref()
                 .map_or(0, |p| p.dims()[0] * p.dims()[1] * 4);
-            let rnorm_bytes = qt.qjl_residual_norms.as_ref()
+            let rnorm_bytes = qt
+                .qjl_residual_norms
+                .as_ref()
                 .map_or(0, |r| r.dims()[0] * 4);
             packed_bytes + sigma_bytes + norm_bytes + qjl_bytes + rnorm_bytes
         };
-        self.k.as_ref().map_or(0, per_tensor)
-            + self.v.as_ref().map_or(0, per_tensor)
+        self.k.as_ref().map_or(0, per_tensor) + self.v.as_ref().map_or(0, per_tensor)
     }
 
     /// What the equivalent uncompressed f32 KV cache would use in bytes.
@@ -1059,20 +1111,18 @@ fn concat_gpu_turbo_quant<B: Backend<IntElem = i32>>(
     // Concatenate packed data along seq dimension
     let a_packed = a.packed.reshape([n_bh, seq_a, packed_dim]);
     let b_packed = b.packed.reshape([n_bh, seq_b, packed_dim]);
-    let cat_packed = Tensor::cat(vec![a_packed, b_packed], 1)
-        .reshape([n_bh * total_seq, packed_dim]);
+    let cat_packed =
+        Tensor::cat(vec![a_packed, b_packed], 1).reshape([n_bh * total_seq, packed_dim]);
 
     // Concatenate sigma
     let a_sigma = a.sigma.reshape([n_bh, seq_a]);
     let b_sigma = b.sigma.reshape([n_bh, seq_b]);
-    let cat_sigma = Tensor::cat(vec![a_sigma, b_sigma], 1)
-        .reshape([n_bh * total_seq]);
+    let cat_sigma = Tensor::cat(vec![a_sigma, b_sigma], 1).reshape([n_bh * total_seq]);
 
     // Concatenate norms
     let a_norms = a.norms.reshape([n_bh, seq_a]);
     let b_norms = b.norms.reshape([n_bh, seq_b]);
-    let cat_norms = Tensor::cat(vec![a_norms, b_norms], 1)
-        .reshape([n_bh * total_seq]);
+    let cat_norms = Tensor::cat(vec![a_norms, b_norms], 1).reshape([n_bh * total_seq]);
 
     // Concatenate optional QJL data
     let cat_qjl_packed = match (a.qjl_packed, b.qjl_packed) {
@@ -1080,8 +1130,7 @@ fn concat_gpu_turbo_quant<B: Backend<IntElem = i32>>(
             let qjl_packed_dim = a_qjl.dims()[1];
             let a_qjl = a_qjl.reshape([n_bh, seq_a, qjl_packed_dim]);
             let b_qjl = b_qjl.reshape([n_bh, seq_b, qjl_packed_dim]);
-            Some(Tensor::cat(vec![a_qjl, b_qjl], 1)
-                .reshape([n_bh * total_seq, qjl_packed_dim]))
+            Some(Tensor::cat(vec![a_qjl, b_qjl], 1).reshape([n_bh * total_seq, qjl_packed_dim]))
         }
         _ => None,
     };
@@ -1119,7 +1168,9 @@ impl<B: Backend<IntElem = i32>> GpuTurboQuantLayerCaches<B> {
     /// Create empty GPU TurboQuant caches for `n_layers` transformer layers.
     pub fn new(n_layers: usize, config: &TurboQuantConfig, device: &B::Device) -> Self {
         Self {
-            caches: (0..n_layers).map(|_| GpuTurboQuantKvCache::new(config, device)).collect(),
+            caches: (0..n_layers)
+                .map(|_| GpuTurboQuantKvCache::new(config, device))
+                .collect(),
         }
     }
 
@@ -1153,17 +1204,11 @@ mod tests {
         // [1, 2, 3, 4] — batch=1, 2 heads, 3 positions, head_dim=4
         let data: Vec<f32> = vec![
             // head 0
-            -1.0, 0.5, 2.0, -0.3,
-             0.0, 0.0, 0.0,  0.0,
-             1.0, 1.0, 1.0,  1.0,
-            // head 1
-            -10.0, 10.0, 5.0, -5.0,
-              0.1,  0.2, 0.3,  0.4,
-            100.0, -100.0, 0.0, 50.0,
+            -1.0, 0.5, 2.0, -0.3, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, // head 1
+            -10.0, 10.0, 5.0, -5.0, 0.1, 0.2, 0.3, 0.4, 100.0, -100.0, 0.0, 50.0,
         ];
 
-        let input = Tensor::<B, 1>::from_floats(&data[..], &device)
-            .reshape([1, 2, 3, 4]);
+        let input = Tensor::<B, 1>::from_floats(&data[..], &device).reshape([1, 2, 3, 4]);
 
         let qt = gpu_quantize(input.clone());
         let output = gpu_dequantize(&qt);
@@ -1176,14 +1221,22 @@ mod tests {
         for (orig, recon) in input_data.iter().zip(output_data.iter()) {
             let err = (orig - recon).abs();
             // Int8: max error per group is range/255. Widest range is [-100, 100] → step ~0.78
-            assert!(err < 1.0,
-                "Roundtrip error too large: orig={}, recon={}, err={}", orig, recon, err);
+            assert!(
+                err < 1.0,
+                "Roundtrip error too large: orig={}, recon={}, err={}",
+                orig,
+                recon,
+                err
+            );
         }
 
         // All-zeros group should roundtrip exactly (or near-exactly)
         for i in 4..8 {
-            assert!(output_data[i].abs() < 0.01,
-                "Zero group should roundtrip near-exactly, got {}", output_data[i]);
+            assert!(
+                output_data[i].abs() < 0.01,
+                "Zero group should roundtrip near-exactly, got {}",
+                output_data[i]
+            );
         }
     }
 
@@ -1194,9 +1247,9 @@ mod tests {
         let mut cache = GpuQuantKvCache::<B>::new();
 
         // First update: batch=1, 1 head, 2 positions, head_dim=4
-        let k1 = Tensor::<B, 1>::from_floats(
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0][..], &device
-        ).reshape([1, 1, 2, 4]);
+        let k1 =
+            Tensor::<B, 1>::from_floats(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0][..], &device)
+                .reshape([1, 1, 2, 4]);
         let v1 = k1.clone();
 
         let (full_k, _full_v) = cache.update(k1, v1);
@@ -1204,9 +1257,8 @@ mod tests {
         assert_eq!(cache.seq_len(), 2);
 
         // Second update: 1 new position
-        let k2 = Tensor::<B, 1>::from_floats(
-            &[9.0, 10.0, 11.0, 12.0][..], &device
-        ).reshape([1, 1, 1, 4]);
+        let k2 = Tensor::<B, 1>::from_floats(&[9.0, 10.0, 11.0, 12.0][..], &device)
+            .reshape([1, 1, 1, 4]);
         let v2 = k2.clone();
 
         let (full_k, _full_v) = cache.update(k2, v2);
@@ -1216,9 +1268,21 @@ mod tests {
         // Check that the concatenated result has reasonable values
         let data: Vec<f32> = full_k.to_data().to_vec().unwrap();
         // First two positions should be close to original values
-        assert!((data[0] - 1.0).abs() < 0.5, "Position 0 value drift: {}", data[0]);
-        assert!((data[4] - 5.0).abs() < 0.5, "Position 1 value drift: {}", data[4]);
-        assert!((data[8] - 9.0).abs() < 0.5, "Position 2 value drift: {}", data[8]);
+        assert!(
+            (data[0] - 1.0).abs() < 0.5,
+            "Position 0 value drift: {}",
+            data[0]
+        );
+        assert!(
+            (data[4] - 5.0).abs() < 0.5,
+            "Position 1 value drift: {}",
+            data[4]
+        );
+        assert!(
+            (data[8] - 9.0).abs() < 0.5,
+            "Position 2 value drift: {}",
+            data[8]
+        );
     }
 
     #[test]
@@ -1228,25 +1292,19 @@ mod tests {
         // batch=1, 2 heads, 2 positions, head_dim=4
         let a_data: Vec<f32> = vec![
             // head 0, pos 0-1
-            1.0, 2.0, 3.0, 4.0,
-            5.0, 6.0, 7.0, 8.0,
-            // head 1, pos 0-1
-            10.0, 20.0, 30.0, 40.0,
-            50.0, 60.0, 70.0, 80.0,
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, // head 1, pos 0-1
+            10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0,
         ];
-        let a = Tensor::<B, 1>::from_floats(&a_data[..], &device)
-            .reshape([1, 2, 2, 4]);
+        let a = Tensor::<B, 1>::from_floats(&a_data[..], &device).reshape([1, 2, 2, 4]);
         let qa = gpu_quantize(a);
 
         // 1 new position
         let b_data: Vec<f32> = vec![
             // head 0, pos 2
-            9.0, 10.0, 11.0, 12.0,
-            // head 1, pos 2
+            9.0, 10.0, 11.0, 12.0, // head 1, pos 2
             90.0, 100.0, 110.0, 120.0,
         ];
-        let b = Tensor::<B, 1>::from_floats(&b_data[..], &device)
-            .reshape([1, 2, 1, 4]);
+        let b = Tensor::<B, 1>::from_floats(&b_data[..], &device).reshape([1, 2, 1, 4]);
         let qb = gpu_quantize(b);
 
         let cat = concat_gpu_quant(qa, qb);
@@ -1256,14 +1314,14 @@ mod tests {
         let data: Vec<f32> = result.to_data().to_vec().unwrap();
 
         // Check head 0 ordering
-        assert!((data[0] - 1.0).abs() < 0.5);   // head 0, pos 0, dim 0
-        assert!((data[4] - 5.0).abs() < 0.5);   // head 0, pos 1, dim 0
-        assert!((data[8] - 9.0).abs() < 0.5);   // head 0, pos 2, dim 0
+        assert!((data[0] - 1.0).abs() < 0.5); // head 0, pos 0, dim 0
+        assert!((data[4] - 5.0).abs() < 0.5); // head 0, pos 1, dim 0
+        assert!((data[8] - 9.0).abs() < 0.5); // head 0, pos 2, dim 0
 
         // Check head 1 ordering
-        assert!((data[12] - 10.0).abs() < 1.0);  // head 1, pos 0, dim 0
-        assert!((data[16] - 50.0).abs() < 1.0);  // head 1, pos 1, dim 0
-        assert!((data[20] - 90.0).abs() < 1.0);  // head 1, pos 2, dim 0
+        assert!((data[12] - 10.0).abs() < 1.0); // head 1, pos 0, dim 0
+        assert!((data[16] - 50.0).abs() < 1.0); // head 1, pos 1, dim 0
+        assert!((data[20] - 90.0).abs() < 1.0); // head 1, pos 2, dim 0
     }
 
     // ===================================================================
@@ -1286,8 +1344,7 @@ mod tests {
             *v = (state as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32;
         }
 
-        let input = Tensor::<B, 1>::from_floats(&data[..], &device)
-            .reshape([n_groups, head_dim]);
+        let input = Tensor::<B, 1>::from_floats(&data[..], &device).reshape([n_groups, head_dim]);
 
         // Rotate then inverse-rotate
         let rotated = ctx.rotate(input.clone());
@@ -1296,9 +1353,12 @@ mod tests {
         let input_data: Vec<f32> = input.to_data().to_vec().unwrap();
         let recovered_data: Vec<f32> = recovered.to_data().to_vec().unwrap();
 
-        let mse: f32 = input_data.iter().zip(recovered_data.iter())
+        let mse: f32 = input_data
+            .iter()
+            .zip(recovered_data.iter())
             .map(|(a, b)| (a - b).powi(2))
-            .sum::<f32>() / (n_groups * head_dim) as f32;
+            .sum::<f32>()
+            / (n_groups * head_dim) as f32;
 
         assert!(mse < 1e-4, "GPU Hadamard roundtrip MSE too large: {}", mse);
     }
@@ -1318,8 +1378,7 @@ mod tests {
             *v = (state as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32;
         }
 
-        let input = Tensor::<B, 1>::from_floats(&data[..], &device)
-            .reshape([n_groups, head_dim]);
+        let input = Tensor::<B, 1>::from_floats(&data[..], &device).reshape([n_groups, head_dim]);
 
         let input_norms = (input.clone() * input.clone()).sum_dim(1).sqrt();
         let rotated = ctx.rotate(input);
@@ -1330,7 +1389,11 @@ mod tests {
 
         for (a, b) in in_data.iter().zip(rot_data.iter()) {
             let rel_err = ((a - b) / a).abs();
-            assert!(rel_err < 0.02, "Rotation changed norm by {:.2}%", rel_err * 100.0);
+            assert!(
+                rel_err < 0.02,
+                "Rotation changed norm by {:.2}%",
+                rel_err * 100.0
+            );
         }
     }
 
@@ -1349,15 +1412,19 @@ mod tests {
             let data: Vec<i32> = (0..n_groups * head_dim)
                 .map(|i| (i % n_levels) as i32)
                 .collect();
-            let indices = Tensor::<B, 1, Int>::from_ints(&data[..], &device)
-                .reshape([n_groups, head_dim]);
+            let indices =
+                Tensor::<B, 1, Int>::from_ints(&data[..], &device).reshape([n_groups, head_dim]);
 
             let (packed, _packed_dim) = ctx.pack_indices(indices.clone());
             let unpacked = ctx.unpack_indices(packed, head_dim);
 
             let orig: Vec<i32> = indices.to_data().to_vec().unwrap();
             let recovered: Vec<i32> = unpacked.to_data().to_vec().unwrap();
-            assert_eq!(orig, recovered, "Pack/unpack roundtrip failed for {}-bit", bits);
+            assert_eq!(
+                orig, recovered,
+                "Pack/unpack roundtrip failed for {}-bit",
+                bits
+            );
         }
     }
 
@@ -1377,8 +1444,7 @@ mod tests {
             *v = (state as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32;
         }
 
-        let input = Tensor::<B, 1>::from_floats(&data[..], &device)
-            .reshape([1, 2, 4, head_dim]);
+        let input = Tensor::<B, 1>::from_floats(&data[..], &device).reshape([1, 2, 4, head_dim]);
 
         let qt = ctx.quantize(input.clone());
         let output = ctx.dequantize(&qt);
@@ -1388,9 +1454,12 @@ mod tests {
 
         assert_eq!(input_data.len(), output_data.len());
 
-        let mse: f32 = input_data.iter().zip(output_data.iter())
+        let mse: f32 = input_data
+            .iter()
+            .zip(output_data.iter())
             .map(|(a, b)| (a - b).powi(2))
-            .sum::<f32>() / input_data.len() as f32;
+            .sum::<f32>()
+            / input_data.len() as f32;
 
         // For 3-bit TurboQuant, MSE should be reasonable
         assert!(mse < 0.1, "GPU TurboQuant 3-bit MSE too large: {}", mse);
@@ -1433,7 +1502,12 @@ mod tests {
         // Memory should be compressed
         let mem = cache.memory_bytes();
         let uncomp = cache.uncompressed_bytes();
-        assert!(mem < uncomp, "GPU TurboQuant should compress: {} vs {}", mem, uncomp);
+        assert!(
+            mem < uncomp,
+            "GPU TurboQuant should compress: {} vs {}",
+            mem,
+            uncomp
+        );
     }
 
     #[test]
@@ -1451,8 +1525,8 @@ mod tests {
             *v = (state as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32;
         }
 
-        let input = Tensor::<B, 1>::from_floats(&data[..], &device)
-            .reshape([1, 1, n_groups, head_dim]);
+        let input =
+            Tensor::<B, 1>::from_floats(&data[..], &device).reshape([1, 1, n_groups, head_dim]);
 
         let qt = ctx.quantize(input.clone());
         let output = ctx.dequantize(&qt);
@@ -1460,9 +1534,12 @@ mod tests {
         let input_data: Vec<f32> = input.to_data().to_vec().unwrap();
         let output_data: Vec<f32> = output.to_data().to_vec().unwrap();
 
-        let mse: f32 = input_data.iter().zip(output_data.iter())
+        let mse: f32 = input_data
+            .iter()
+            .zip(output_data.iter())
             .map(|(a, b)| (a - b).powi(2))
-            .sum::<f32>() / input_data.len() as f32;
+            .sum::<f32>()
+            / input_data.len() as f32;
 
         // 2-bit has higher MSE, but should still be bounded
         assert!(mse < 0.5, "GPU TurboQuant 2-bit MSE too large: {}", mse);
@@ -1476,8 +1553,7 @@ mod tests {
         let ctx = GpuTurboQuantCtx::<B>::new(&config, &device);
 
         let data = vec![0.5f32; 1 * 8 * 10 * head_dim];
-        let input = Tensor::<B, 1>::from_floats(&data[..], &device)
-            .reshape([1, 8, 10, head_dim]);
+        let input = Tensor::<B, 1>::from_floats(&data[..], &device).reshape([1, 8, 10, head_dim]);
 
         let qt = ctx.quantize(input);
         let n_groups = 80; // 1*8*10
@@ -1491,8 +1567,12 @@ mod tests {
         let expected = packed_bytes + sigma_bytes + norm_bytes;
         let uncompressed = 80 * 128 * 4;
 
-        assert!(expected < uncompressed,
+        assert!(
+            expected < uncompressed,
             "GPU TurboQuant 3-bit should compress: {} vs {} ({:.1}x)",
-            expected, uncompressed, uncompressed as f64 / expected as f64);
+            expected,
+            uncompressed,
+            uncompressed as f64 / expected as f64
+        );
     }
 }

@@ -37,8 +37,7 @@ impl<B: Backend> Mistral3Model<B> {
             layers.push(MistralDecoderLayer::load(loader, &config, i, device));
         }
 
-        let norm: Tensor<B, 1> =
-            loader.load_tensor("language_model.model.norm.weight", device);
+        let norm: Tensor<B, 1> = loader.load_tensor("language_model.model.norm.weight", device);
 
         Self {
             embed_tokens,

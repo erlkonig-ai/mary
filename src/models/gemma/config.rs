@@ -41,12 +41,12 @@ impl MistralConfig {
         Self {
             n_layers: 26,
             hidden_dim: 3072,
-            ffn_dim: 9216,    // corrected from 8192
-            n_heads: 32,       // corrected from 24
+            ffn_dim: 9216, // corrected from 8192
+            n_heads: 32,   // corrected from 24
             n_kv_heads: 8,
             head_dim: 128,
             vocab_size: 131_072,
-            rope_theta: 1e6,   // corrected from 1e9
+            rope_theta: 1e6, // corrected from 1e9
             rms_norm_eps: 1e-5,
             max_seq_len: 16384,
             yarn_max_seq_len: Some(262144),
@@ -131,7 +131,11 @@ impl MistralConfig {
             other => {
                 // Fallback: take after last '/', truncate to 31 bytes
                 let s = other.rsplit('/').next().unwrap_or(other);
-                if s.len() <= 31 { s } else { &s[..31] }
+                if s.len() <= 31 {
+                    s
+                } else {
+                    &s[..31]
+                }
             }
         }
     }

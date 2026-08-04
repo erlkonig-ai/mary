@@ -88,22 +88,23 @@ pub fn unpatchify_latents<B: Backend>(latents: Tensor<B, 4>) -> Tensor<B, 4> {
 }
 
 /// Prepare text position IDs: [B, L, 4] with (t=0, h=0, w=0, l=0..L-1)
-pub fn prepare_text_ids<B: Backend>(batch_size: usize, seq_len: usize, device: &B::Device) -> Tensor<B, 3> {
+pub fn prepare_text_ids<B: Backend>(
+    batch_size: usize,
+    seq_len: usize,
+    device: &B::Device,
+) -> Tensor<B, 3> {
     // For each token position l, the ID is (0, 0, 0, l)
     let mut data = vec![0.0f32; batch_size * seq_len * 4];
     for b in 0..batch_size {
         for l in 0..seq_len {
             let base = (b * seq_len + l) * 4;
-            data[base] = 0.0;     // t
+            data[base] = 0.0; // t
             data[base + 1] = 0.0; // h
             data[base + 2] = 0.0; // w
             data[base + 3] = l as f32; // l
         }
     }
-    Tensor::from_data(
-        TensorData::new(data, [batch_size, seq_len, 4]),
-        device,
-    )
+    Tensor::from_data(TensorData::new(data, [batch_size, seq_len, 4]), device)
 }
 
 /// Prepare latent (image) position IDs: [B, H*W, 4] with (t=0, h=0..H-1, w=0..W-1, l=0)
@@ -120,17 +121,14 @@ pub fn prepare_latent_ids<B: Backend>(
             for w in 0..width {
                 let idx = b * seq_len + h * width + w;
                 let base = idx * 4;
-                data[base] = 0.0;     // t
+                data[base] = 0.0; // t
                 data[base + 1] = h as f32; // h
                 data[base + 2] = w as f32; // w
                 data[base + 3] = 0.0; // l
             }
         }
     }
-    Tensor::from_data(
-        TensorData::new(data, [batch_size, seq_len, 4]),
-        device,
-    )
+    Tensor::from_data(TensorData::new(data, [batch_size, seq_len, 4]), device)
 }
 
 /// Convert output tensor [B, 3, H, W] (values in [-1, 1]) to an RGB image.

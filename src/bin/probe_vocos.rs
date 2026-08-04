@@ -5,13 +5,13 @@
 //!   python3 scripts/probe_vocos.py            # reference + weight export
 //!   cargo run --release --bin probe_vocos
 
+use burn::prelude::*;
+use burn::tensor::TensorData;
+use mary::models::f5::vocos::Vocos;
 use mary::nn::backend::B;
 use mary::nn::npy;
 use mary::nn::weight_loader::{SingleFileLoader, WeightLoader};
-use burn::prelude::*;
-use burn::tensor::TensorData;
 use std::path::{Path, PathBuf};
-use mary::models::f5::vocos::Vocos;
 
 fn main() {
     let device = Default::default();

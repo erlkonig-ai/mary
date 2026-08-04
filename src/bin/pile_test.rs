@@ -14,7 +14,9 @@ use std::path::Path;
 use triblespace::prelude::*;
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: pile_test <f5.safetensors>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: pile_test <f5.safetensors>");
     let device = Default::default();
     let cfg = F5Config::v1_base();
 
@@ -26,7 +28,13 @@ fn main() {
     // 2. ingest safetensors → pile (each tensor a content-addressed leaf in a module)
     let bytes = read_safetensors_file(Path::new(&path));
     let mut blobs = MemoryBlobStore::new();
-    let frag = save_safetensors(&bytes, "F5TTS_v1_Base", &mut blobs, mary::ingest::LeafDtype::F32).expect("ingest");
+    let frag = save_safetensors(
+        &bytes,
+        "F5TTS_v1_Base",
+        &mut blobs,
+        mary::ingest::LeafDtype::F32,
+    )
+    .expect("ingest");
     let model_id = frag.root().expect("model root");
     let mut tribles = TribleSet::new();
     tribles += frag;

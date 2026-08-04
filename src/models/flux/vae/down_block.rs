@@ -90,7 +90,10 @@ impl<B: Backend> DownEncoderBlock2D<B> {
             None
         };
 
-        Self { resnets, downsample }
+        Self {
+            resnets,
+            downsample,
+        }
     }
 
     /// Forward: run through all ResNet blocks, then optionally downsample.

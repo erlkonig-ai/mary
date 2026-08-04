@@ -497,8 +497,7 @@ fn q8_matvec_kernel(
     }
     let acc = acc0 + acc1;
 
-    let mut red =
-        SharedMemory::<f32>::new(comptime!((rows_per_cube * threads_per_row) as usize));
+    let mut red = SharedMemory::<f32>::new(comptime!((rows_per_cube * threads_per_row) as usize));
     red[UNIT_POS_X as usize] = acc;
     sync_cube();
     let mut stride = u32::new((threads_per_row / 2) as i64);
@@ -587,7 +586,11 @@ pub(crate) fn layer_mats_f32(
     let (o_w, s) = loader.load_f32(&format!("{src}.self_attn.out_proj.weight"));
     assert_eq!(s, vec![d, d], "{src}: out_proj shape");
     let (gu, s) = loader.load_f32(&format!("{src}.gating.linear_in.weight"));
-    assert_eq!(s, vec![cfg::FFN_FUSED_IN, d], "{src}: gating.linear_in shape");
+    assert_eq!(
+        s,
+        vec![cfg::FFN_FUSED_IN, d],
+        "{src}: gating.linear_in shape"
+    );
     let (down_w, s) = loader.load_f32(&format!("{src}.gating.linear_out.weight"));
     assert_eq!(s, vec![d, fh], "{src}: gating.linear_out shape");
 
@@ -708,7 +711,13 @@ fn encode(w: &[f32], out_dim: usize, in_dim: usize, fmt: WeightFmt) -> Encoded {
 }
 
 impl QLinear {
-    fn upload(client: &q4::Client, enc: &Encoded, out_dim: usize, in_dim: usize, fmt: WeightFmt) -> Self {
+    fn upload(
+        client: &q4::Client,
+        enc: &Encoded,
+        out_dim: usize,
+        in_dim: usize,
+        fmt: WeightFmt,
+    ) -> Self {
         match (fmt, enc) {
             (WeightFmt::Q4, Encoded::Packed(wq, sc)) => {
                 Self::Q4(Q4Linear::from_packed(client, wq, sc, out_dim, in_dim))
@@ -747,7 +756,12 @@ impl QLinear {
                     l.forward(client, x, y)
                 }
             }
-            Self::Q8 { wq, scales, out_dim, in_dim } => {
+            Self::Q8 {
+                wq,
+                scales,
+                out_dim,
+                in_dim,
+            } => {
                 assert_eq!(*out_dim % 8, 0);
                 assert_eq!(*in_dim % 32, 0);
                 let y_len = if swiglu_pairs { *out_dim / 2 } else { *out_dim };
@@ -854,8 +868,8 @@ struct MetalLayer {
     /// epilogue runs in-kernel — one dispatch replaces gate + up + swiglu.
     gateup: QLinear,
     down: QLinear,
-    norm1: Handle, // [DIM] f32 — alphas applied in the norm kernels, NOT
-    norm2: Handle, // folded into the quantized weights (see module docs)
+    norm1: Handle,  // [DIM] f32 — alphas applied in the norm kernels, NOT
+    norm2: Handle,  // folded into the quantized weights (see module docs)
     kcache: Handle, // [DIM, MAX_SEQ] f16, dim-major
     vcache: Handle, // [MAX_SEQ, DIM] f16, position-major
 }
@@ -932,7 +946,11 @@ impl TemporalMetal {
                 kcache: client.empty(d * MAX_SEQ * 2),
                 vcache: client.empty(MAX_SEQ * d * 2),
             });
-            eprint!("\r  encoded layer {:2}/{} ({fmt:?})", i + 1, cfg::NUM_LAYERS);
+            eprint!(
+                "\r  encoded layer {:2}/{} ({fmt:?})",
+                i + 1,
+                cfg::NUM_LAYERS
+            );
         }
         eprintln!();
 
@@ -957,7 +975,9 @@ impl TemporalMetal {
         let out_norm_w = client.create_from_slice(as_bytes(&out_norm));
         let head_f16 = client.create_from_slice(as_bytes(&head_half));
         let head_q4 = Q4Linear::from_packed(&client, &hq, &hs, cfg::TEXT_LOGITS, d);
-        Self::assemble(client, layers, out_norm_w, head_f16, head_q4, text_emb, audio_emb)
+        Self::assemble(
+            client, layers, out_norm_w, head_f16, head_q4, text_emb, audio_emb,
+        )
     }
 
     /// Shared tail of both load paths: the RoPE half-tables (computed, not
@@ -1073,7 +1093,11 @@ impl TemporalMetal {
                             w.len() == shape[0] * shape[1] * 2,
                             "{key}: f16 byte count vs shape"
                         );
-                        QLinear::F16 { w: alias(&w)?, out_dim: shape[0], in_dim: shape[1] }
+                        QLinear::F16 {
+                            w: alias(&w)?,
+                            out_dim: shape[0],
+                            in_dim: shape[1],
+                        }
                     }
                 };
                 mats.push(q);
@@ -1123,7 +1147,9 @@ impl TemporalMetal {
             })
             .collect();
 
-        Ok(Self::assemble(client, layers, out_norm_w, head_f16, head_q4, text_emb, audio_emb))
+        Ok(Self::assemble(
+            client, layers, out_norm_w, head_f16, head_q4, text_emb, audio_emb,
+        ))
     }
 
     /// moshi `embed_codes` on the host: one step's 17 tokens (delays already
@@ -1136,7 +1162,10 @@ impl TemporalMetal {
         for cb in 0..cfg::N_Q {
             let t = tokens[1 + cb];
             if t >= 0 {
-                assert!((t as usize) < cfg::AUDIO_VOCAB, "audio token {t} out of range");
+                assert!(
+                    (t as usize) < cfg::AUDIO_VOCAB,
+                    "audio token {t} out of range"
+                );
                 let row = &self.audio_emb[cb][t as usize * DIM..(t as usize + 1) * DIM];
                 for (a, &r) in acc.iter_mut().zip(row) {
                     *a += r;
@@ -1145,7 +1174,10 @@ impl TemporalMetal {
         }
         let t = tokens[0];
         if t >= 0 {
-            assert!((t as usize) < cfg::TEXT_VOCAB, "text token {t} out of range");
+            assert!(
+                (t as usize) < cfg::TEXT_VOCAB,
+                "text token {t} out of range"
+            );
             let row = &self.text_emb[t as usize * DIM..(t as usize + 1) * DIM];
             for (a, &r) in acc.iter_mut().zip(row) {
                 *a += r;
@@ -1285,7 +1317,9 @@ impl TemporalMetal {
                 cfg::TEXT_LOGITS,
                 DIM,
             ),
-            Head::Q4 => self.head_q4.forward(&self.client, &self.hidden, &self.logits),
+            Head::Q4 => self
+                .head_q4
+                .forward(&self.client, &self.hidden, &self.logits),
         }
     }
 
@@ -1306,7 +1340,9 @@ impl TemporalMetal {
     /// the values are identical to the two single reads).
     pub fn read_hidden_logits(&self) -> (Vec<f32>, Vec<f32>) {
         use cubecl::CubeElement;
-        let mut out = self.client.read(vec![self.hidden.clone(), self.logits.clone()]);
+        let mut out = self
+            .client
+            .read(vec![self.hidden.clone(), self.logits.clone()]);
         let lg = out.pop().expect("logits readback");
         let hd = out.pop().expect("hidden readback");
         let mut h = vec![0f32; DIM];
@@ -1396,6 +1432,9 @@ mod tests {
         let rel = (num / den).sqrt();
         // analytic q8_0 on uniform[-a,a]: step ≈ a/127, RMS err step/√12,
         // signal RMS a/√3 => rel ≈ (√3/√12)/127 ≈ 3.9e-3
-        assert!(rel < 6e-3, "q8 round-trip rel RMS {rel} out of class (expect ~4e-3)");
+        assert!(
+            rel < 6e-3,
+            "q8 round-trip rel RMS {rel} out of class (expect ~4e-3)"
+        );
     }
 }

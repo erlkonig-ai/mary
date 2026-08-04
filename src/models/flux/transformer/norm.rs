@@ -21,12 +21,7 @@ pub struct AdaLayerNormContinuous<B: Backend> {
 }
 
 impl<B: Backend> AdaLayerNormContinuous<B> {
-    pub fn load(
-        loader: &WeightLoader,
-        prefix: &str,
-        eps: f64,
-        device: &B::Device,
-    ) -> Self {
+    pub fn load(loader: &WeightLoader, prefix: &str, eps: f64, device: &B::Device) -> Self {
         Self {
             linear_weight: loader.load_tensor(&format!("{prefix}.linear.weight"), device),
             eps,
@@ -37,11 +32,7 @@ impl<B: Backend> AdaLayerNormContinuous<B> {
     /// x: [B, S, inner_dim]
     /// conditioning: [B, inner_dim] (temb)
     /// Returns: [B, S, inner_dim]
-    pub fn forward(
-        &self,
-        x: Tensor<B, 3>,
-        conditioning: Tensor<B, 2>,
-    ) -> Tensor<B, 3> {
+    pub fn forward(&self, x: Tensor<B, 3>, conditioning: Tensor<B, 2>) -> Tensor<B, 3> {
         let [batch, _dim] = conditioning.dims();
 
         // silu(conditioning) -> linear -> [B, inner_dim * 2]

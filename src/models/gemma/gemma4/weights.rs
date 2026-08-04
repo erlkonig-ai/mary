@@ -6,19 +6,19 @@ use std::collections::HashMap;
 #[cfg(feature = "import")]
 use std::path::Path;
 
+use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNormConfig};
 use burn::prelude::*;
-use burn::nn::{Linear, LinearConfig, Embedding, EmbeddingConfig, RmsNormConfig};
-#[cfg(feature = "import")]
-use safetensors::SafeTensors;
 #[cfg(feature = "import")]
 use memmap2::Mmap;
+#[cfg(feature = "import")]
+use safetensors::SafeTensors;
 
 use super::config::Gemma4Config;
 use super::decoder::{Gemma4Decoder, Gemma4Model};
-use super::layers::{Gemma4Attention, Gemma4MLP, Gemma4DecoderLayer, PerLayerInput};
-use crate::models::gemma::weights::{make_rms_norm, set_linear_weight};
+use super::layers::{Gemma4Attention, Gemma4DecoderLayer, Gemma4MLP, PerLayerInput};
 #[cfg(feature = "import")]
 use crate::models::gemma::weights::bytes_to_f32_pub;
+use crate::models::gemma::weights::{make_rms_norm, set_linear_weight};
 
 /// A source of named tensors: either mmap'd safetensors shards or a pile-derived
 /// keymap (name → (f32 data, shape)). The loader resolves names/aliases via
@@ -98,7 +98,13 @@ pub(crate) fn f32_ctx<'a, B: Backend>(source: &'a TensorSource<'a>) -> WeightCtx
 }
 
 fn resolve_name<B: Backend>(ctx: &WeightCtx<B>, name: &str) -> String {
-    for prefix in ["", "model.", "model.language_model.", "language_model.model.", "language_model."] {
+    for prefix in [
+        "",
+        "model.",
+        "model.language_model.",
+        "language_model.model.",
+        "language_model.",
+    ] {
         let full = format!("{}{}", prefix, name);
         if (ctx.has)(&full) {
             return full;
@@ -116,13 +122,23 @@ fn resolve_name<B: Backend>(ctx: &WeightCtx<B>, name: &str) -> String {
 }
 
 fn tensor_exists<B: Backend>(ctx: &WeightCtx<B>, name: &str) -> bool {
-    for prefix in ["", "model.", "model.language_model.", "language_model.model.", "language_model."] {
+    for prefix in [
+        "",
+        "model.",
+        "model.language_model.",
+        "language_model.model.",
+        "language_model.",
+    ] {
         let full = format!("{}{}", prefix, name);
-        if (ctx.has)(&full) { return true; }
+        if (ctx.has)(&full) {
+            return true;
+        }
         if name.ends_with(".weight") {
             let base = &name[..name.len() - 7];
             let full = format!("{}{}.linear.weight", prefix, base);
-            if (ctx.has)(&full) { return true; }
+            if (ctx.has)(&full) {
+                return true;
+            }
         }
     }
     false
@@ -138,15 +154,15 @@ fn load_2d<B: Backend>(
     let actual = resolve_name(ctx, name);
     let (tensor, shape) = (ctx.get)(&actual, device).unwrap();
     let tensor = tensor.reshape([shape[0], shape[1]]);
-    if transpose { tensor.swap_dims(0, 1) } else { tensor }
+    if transpose {
+        tensor.swap_dims(0, 1)
+    } else {
+        tensor
+    }
 }
 
 /// Load a 1D tensor from the source.
-fn load_1d<B: Backend>(
-    ctx: &WeightCtx<B>,
-    name: &str,
-    device: &B::Device,
-) -> Tensor<B, 1> {
+fn load_1d<B: Backend>(ctx: &WeightCtx<B>, name: &str, device: &B::Device) -> Tensor<B, 1> {
     let actual = resolve_name(ctx, name);
     (ctx.get)(&actual, device).unwrap().0
 }
@@ -170,11 +186,7 @@ fn make_embedding<B: Backend>(weight: Tensor<B, 2>, device: &B::Device) -> Embed
 }
 
 /// Load a 3D tensor from the source (for position embedding table etc.)
-fn load_3d<B: Backend>(
-    ctx: &WeightCtx<B>,
-    name: &str,
-    device: &B::Device,
-) -> Tensor<B, 3> {
+fn load_3d<B: Backend>(ctx: &WeightCtx<B>, name: &str, device: &B::Device) -> Tensor<B, 3> {
     let actual = resolve_name(ctx, name);
     let (tensor, shape) = (ctx.get)(&actual, device).unwrap();
     tensor.reshape([shape[0], shape[1], shape[2]])
@@ -206,7 +218,12 @@ fn load_clip_bounds<B: Backend>(
     let output_min = try_scalar("output_min")?;
     let output_max = try_scalar("output_max")?;
 
-    Some(super::vision::ClipBounds { input_min, input_max, output_min, output_max })
+    Some(super::vision::ClipBounds {
+        input_min,
+        input_max,
+        output_min,
+        output_max,
+    })
 }
 
 /// Load Gemma 4 vision encoder weights from safetensors.
@@ -219,13 +236,28 @@ pub(crate) fn load_vision_encoder<B: Backend>(
     let eps = config.rms_norm_eps;
     let head_dim = config.head_dim;
 
-    println!("  Loading vision encoder ({} layers)...", config.num_hidden_layers);
+    println!(
+        "  Loading vision encoder ({} layers)...",
+        config.num_hidden_layers
+    );
 
     // Patch embedder
     // Vision input_proj: NOT a clipped linear, weight stored as [768, 768]
     // Burn convention: [in, out], PyTorch: [out, in] → transpose
-    let input_proj = make_linear(load_2d::<B>(ctx, "vision_tower.patch_embedder.input_proj.weight", device, true), device);
-    let position_embedding_table = load_3d::<B>(ctx, "vision_tower.patch_embedder.position_embedding_table", device);
+    let input_proj = make_linear(
+        load_2d::<B>(
+            ctx,
+            "vision_tower.patch_embedder.input_proj.weight",
+            device,
+            true,
+        ),
+        device,
+    );
+    let position_embedding_table = load_3d::<B>(
+        ctx,
+        "vision_tower.patch_embedder.position_embedding_table",
+        device,
+    );
 
     let patch_embedder = super::vision::Gemma4PatchEmbedder {
         input_proj,
@@ -238,27 +270,80 @@ pub(crate) fn load_vision_encoder<B: Backend>(
         let p = format!("vision_tower.encoder.layers.{i}");
 
         layers.push(super::vision::Gemma4VisionLayer {
-            q_proj: make_linear(load_2d::<B>(ctx, &format!("{p}.self_attn.q_proj.weight"), device, true), device),
+            q_proj: make_linear(
+                load_2d::<B>(ctx, &format!("{p}.self_attn.q_proj.weight"), device, true),
+                device,
+            ),
             q_clip: load_clip_bounds(ctx, &format!("{p}.self_attn.q_proj"), device),
-            k_proj: make_linear(load_2d::<B>(ctx, &format!("{p}.self_attn.k_proj.weight"), device, true), device),
+            k_proj: make_linear(
+                load_2d::<B>(ctx, &format!("{p}.self_attn.k_proj.weight"), device, true),
+                device,
+            ),
             k_clip: load_clip_bounds(ctx, &format!("{p}.self_attn.k_proj"), device),
-            v_proj: make_linear(load_2d::<B>(ctx, &format!("{p}.self_attn.v_proj.weight"), device, true), device),
+            v_proj: make_linear(
+                load_2d::<B>(ctx, &format!("{p}.self_attn.v_proj.weight"), device, true),
+                device,
+            ),
             v_clip: load_clip_bounds(ctx, &format!("{p}.self_attn.v_proj"), device),
-            o_proj: make_linear(load_2d::<B>(ctx, &format!("{p}.self_attn.o_proj.weight"), device, true), device),
+            o_proj: make_linear(
+                load_2d::<B>(ctx, &format!("{p}.self_attn.o_proj.weight"), device, true),
+                device,
+            ),
             o_clip: load_clip_bounds(ctx, &format!("{p}.self_attn.o_proj"), device),
-            q_norm: make_rms_norm(load_1d::<B>(ctx, &format!("{p}.self_attn.q_norm.weight"), device), eps, device),
-            k_norm: make_rms_norm(load_1d::<B>(ctx, &format!("{p}.self_attn.k_norm.weight"), device), eps, device),
+            q_norm: make_rms_norm(
+                load_1d::<B>(ctx, &format!("{p}.self_attn.q_norm.weight"), device),
+                eps,
+                device,
+            ),
+            k_norm: make_rms_norm(
+                load_1d::<B>(ctx, &format!("{p}.self_attn.k_norm.weight"), device),
+                eps,
+                device,
+            ),
             v_norm: RmsNormConfig::new(head_dim).with_epsilon(eps).init(device), // no learned weights
-            gate_proj: make_linear(load_2d::<B>(ctx, &format!("{p}.mlp.gate_proj.weight"), device, true), device),
+            gate_proj: make_linear(
+                load_2d::<B>(ctx, &format!("{p}.mlp.gate_proj.weight"), device, true),
+                device,
+            ),
             gate_clip: load_clip_bounds(ctx, &format!("{p}.mlp.gate_proj"), device),
-            up_proj: make_linear(load_2d::<B>(ctx, &format!("{p}.mlp.up_proj.weight"), device, true), device),
+            up_proj: make_linear(
+                load_2d::<B>(ctx, &format!("{p}.mlp.up_proj.weight"), device, true),
+                device,
+            ),
             up_clip: load_clip_bounds(ctx, &format!("{p}.mlp.up_proj"), device),
-            down_proj: make_linear(load_2d::<B>(ctx, &format!("{p}.mlp.down_proj.weight"), device, true), device),
+            down_proj: make_linear(
+                load_2d::<B>(ctx, &format!("{p}.mlp.down_proj.weight"), device, true),
+                device,
+            ),
             down_clip: load_clip_bounds(ctx, &format!("{p}.mlp.down_proj"), device),
-            input_layernorm: make_rms_norm(load_1d::<B>(ctx, &format!("{p}.input_layernorm.weight"), device), eps, device),
-            post_attention_layernorm: make_rms_norm(load_1d::<B>(ctx, &format!("{p}.post_attention_layernorm.weight"), device), eps, device),
-            pre_feedforward_layernorm: make_rms_norm(load_1d::<B>(ctx, &format!("{p}.pre_feedforward_layernorm.weight"), device), eps, device),
-            post_feedforward_layernorm: make_rms_norm(load_1d::<B>(ctx, &format!("{p}.post_feedforward_layernorm.weight"), device), eps, device),
+            input_layernorm: make_rms_norm(
+                load_1d::<B>(ctx, &format!("{p}.input_layernorm.weight"), device),
+                eps,
+                device,
+            ),
+            post_attention_layernorm: make_rms_norm(
+                load_1d::<B>(ctx, &format!("{p}.post_attention_layernorm.weight"), device),
+                eps,
+                device,
+            ),
+            pre_feedforward_layernorm: make_rms_norm(
+                load_1d::<B>(
+                    ctx,
+                    &format!("{p}.pre_feedforward_layernorm.weight"),
+                    device,
+                ),
+                eps,
+                device,
+            ),
+            post_feedforward_layernorm: make_rms_norm(
+                load_1d::<B>(
+                    ctx,
+                    &format!("{p}.post_feedforward_layernorm.weight"),
+                    device,
+                ),
+                eps,
+                device,
+            ),
             n_heads: config.num_attention_heads,
             head_dim,
         });
@@ -269,7 +354,12 @@ pub(crate) fn load_vision_encoder<B: Backend>(
         .with_epsilon(eps)
         .init(device); // No learned weights
     let embedding_projection = make_linear(
-        load_2d::<B>(ctx, "embed_vision.embedding_projection.weight", device, true),
+        load_2d::<B>(
+            ctx,
+            "embed_vision.embedding_projection.weight",
+            device,
+            true,
+        ),
         device,
     );
 
@@ -325,15 +415,25 @@ pub fn load_gemma4<B: Backend>(
     config: Gemma4Config,
     paths: &[&Path],
     device: &B::Device,
-) -> (Gemma4Model<B>, Option<super::vision::Gemma4VisionEncoder<B>>) {
-    let files: Vec<_> = paths.iter().map(|p| {
-        let file = std::fs::File::open(p).unwrap_or_else(|e| panic!("Can't open {:?}: {e}", p));
-        unsafe { Mmap::map(&file) }.unwrap_or_else(|e| panic!("Can't mmap {:?}: {e}", p))
-    }).collect();
+) -> (
+    Gemma4Model<B>,
+    Option<super::vision::Gemma4VisionEncoder<B>>,
+) {
+    let files: Vec<_> = paths
+        .iter()
+        .map(|p| {
+            let file = std::fs::File::open(p).unwrap_or_else(|e| panic!("Can't open {:?}: {e}", p));
+            unsafe { Mmap::map(&file) }.unwrap_or_else(|e| panic!("Can't mmap {:?}: {e}", p))
+        })
+        .collect();
 
-    let safetensors: Vec<_> = files.iter().map(|mmap| {
-        SafeTensors::deserialize(mmap).unwrap_or_else(|e| panic!("Can't parse safetensors: {e}"))
-    }).collect();
+    let safetensors: Vec<_> = files
+        .iter()
+        .map(|mmap| {
+            SafeTensors::deserialize(mmap)
+                .unwrap_or_else(|e| panic!("Can't parse safetensors: {e}"))
+        })
+        .collect();
 
     let mut tensors: HashMap<String, &SafeTensors<'_>> = HashMap::new();
     for st in &safetensors {
@@ -341,7 +441,11 @@ pub fn load_gemma4<B: Backend>(
             tensors.insert(name.to_string(), st);
         }
     }
-    println!("Loading {} tensors from {} shards", tensors.len(), paths.len());
+    println!(
+        "Loading {} tensors from {} shards",
+        tensors.len(),
+        paths.len()
+    );
 
     let source = TensorSource::Safe(tensors);
     let ctx = f32_ctx::<B>(&source);
@@ -355,7 +459,10 @@ pub fn load_gemma4_from_keymap<B: Backend>(
     config: Gemma4Config,
     keymap: HashMap<String, (Vec<f32>, Vec<usize>)>,
     device: &B::Device,
-) -> (Gemma4Model<B>, Option<super::vision::Gemma4VisionEncoder<B>>) {
+) -> (
+    Gemma4Model<B>,
+    Option<super::vision::Gemma4VisionEncoder<B>>,
+) {
     let source = TensorSource::Pile(keymap);
     let ctx = f32_ctx::<B>(&source);
     load_gemma4_from_source(config, &ctx, device)
@@ -371,10 +478,15 @@ pub fn load_gemma4_streaming<'a, B: Backend>(
     index: HashMap<String, crate::ingest::LeafHandles>,
     blobs: &'a (impl triblespace::prelude::BlobStoreGet + 'a),
     device: &B::Device,
-) -> (Gemma4Model<B>, Option<super::vision::Gemma4VisionEncoder<B>>) {
+) -> (
+    Gemma4Model<B>,
+    Option<super::vision::Gemma4VisionEncoder<B>>,
+) {
     let names: std::collections::HashSet<String> = index.keys().cloned().collect();
     let source = TensorSource::Stream {
-        get: Box::new(move |name: &str| index.get(name).map(|&h| crate::ingest::read_leaf(blobs, h))),
+        get: Box::new(move |name: &str| {
+            index.get(name).map(|&h| crate::ingest::read_leaf(blobs, h))
+        }),
         names,
     };
     let ctx = f32_ctx::<B>(&source);
@@ -388,7 +500,10 @@ pub(crate) fn load_gemma4_from_source<B: Backend>(
     config: Gemma4Config,
     ctx: &WeightCtx<B>,
     device: &B::Device,
-) -> (Gemma4Model<B>, Option<super::vision::Gemma4VisionEncoder<B>>) {
+) -> (
+    Gemma4Model<B>,
+    Option<super::vision::Gemma4VisionEncoder<B>>,
+) {
     let tc = &config.text_config;
     let eps = tc.rms_norm_eps;
 
@@ -469,7 +584,8 @@ pub(crate) fn load_gemma4_from_source<B: Backend>(
         // v_proj from the checkpoint — Python reuses k_proj as v. Fall
         // back to loading k_proj weights for v_proj so the attention
         // forward's `k = v.clone()` still produces the right tensor.
-        let layer_k_eq_v = tc.attention_k_eq_v && layer_type == super::config::LayerType::FullAttention;
+        let layer_k_eq_v =
+            tc.attention_k_eq_v && layer_type == super::config::LayerType::FullAttention;
         let v_proj_name = format!("{p}.self_attn.v_proj.weight");
         let v_weight = if layer_k_eq_v && !tensor_exists(ctx, &v_proj_name) {
             load_2d::<B>(ctx, &format!("{p}.self_attn.k_proj.weight"), device, true)
@@ -477,12 +593,29 @@ pub(crate) fn load_gemma4_from_source<B: Backend>(
             load_2d::<B>(ctx, &v_proj_name, device, true)
         };
         let attention = Gemma4Attention {
-            q_proj: make_linear(load_2d::<B>(ctx, &format!("{p}.self_attn.q_proj.weight"), device, true), device),
-            k_proj: make_linear(load_2d::<B>(ctx, &format!("{p}.self_attn.k_proj.weight"), device, true), device),
+            q_proj: make_linear(
+                load_2d::<B>(ctx, &format!("{p}.self_attn.q_proj.weight"), device, true),
+                device,
+            ),
+            k_proj: make_linear(
+                load_2d::<B>(ctx, &format!("{p}.self_attn.k_proj.weight"), device, true),
+                device,
+            ),
             v_proj: make_linear(v_weight, device),
-            o_proj: make_linear(load_2d::<B>(ctx, &format!("{p}.self_attn.o_proj.weight"), device, true), device),
-            q_norm: make_rms_norm(load_1d::<B>(ctx, &format!("{p}.self_attn.q_norm.weight"), device), eps, device),
-            k_norm: make_rms_norm(load_1d::<B>(ctx, &format!("{p}.self_attn.k_norm.weight"), device), eps, device),
+            o_proj: make_linear(
+                load_2d::<B>(ctx, &format!("{p}.self_attn.o_proj.weight"), device, true),
+                device,
+            ),
+            q_norm: make_rms_norm(
+                load_1d::<B>(ctx, &format!("{p}.self_attn.q_norm.weight"), device),
+                eps,
+                device,
+            ),
+            k_norm: make_rms_norm(
+                load_1d::<B>(ctx, &format!("{p}.self_attn.k_norm.weight"), device),
+                eps,
+                device,
+            ),
             // v_norm has no learned weights — just RMSNorm with gamma=1.0 (initialized by default)
             v_norm: RmsNormConfig::new(head_dim).with_epsilon(eps).init(device),
             n_heads: tc.num_attention_heads,
@@ -497,9 +630,18 @@ pub(crate) fn load_gemma4_from_source<B: Backend>(
         };
 
         let mlp = Gemma4MLP {
-            gate_proj: make_linear(load_2d::<B>(ctx, &format!("{p}.mlp.gate_proj.weight"), device, true), device),
-            up_proj: make_linear(load_2d::<B>(ctx, &format!("{p}.mlp.up_proj.weight"), device, true), device),
-            down_proj: make_linear(load_2d::<B>(ctx, &format!("{p}.mlp.down_proj.weight"), device, true), device),
+            gate_proj: make_linear(
+                load_2d::<B>(ctx, &format!("{p}.mlp.gate_proj.weight"), device, true),
+                device,
+            ),
+            up_proj: make_linear(
+                load_2d::<B>(ctx, &format!("{p}.mlp.up_proj.weight"), device, true),
+                device,
+            ),
+            down_proj: make_linear(
+                load_2d::<B>(ctx, &format!("{p}.mlp.down_proj.weight"), device, true),
+                device,
+            ),
         };
 
         // layer_scalar is saved on every decoder layer (Python registers it
@@ -509,14 +651,40 @@ pub(crate) fn load_gemma4_from_source<B: Backend>(
         // Read dtype-agnostically: the backend element may be f16 (half-precision
         // weight path), so don't assume f32 in to_vec.
         let layer_scalar: f32 = load_1d::<B>(ctx, &format!("{p}.layer_scalar"), device)
-            .slice([0..1]).into_scalar().elem();
+            .slice([0..1])
+            .into_scalar()
+            .elem();
 
         let ple = if let Some(ref slices) = ple_slices {
             Some(PerLayerInput {
                 embed_slice: slices[i].clone(),
-                gate: make_linear(load_2d::<B>(ctx, &format!("{p}.per_layer_input_gate.weight"), device, true), device),
-                projection: make_linear(load_2d::<B>(ctx, &format!("{p}.per_layer_projection.weight"), device, true), device),
-                post_norm: make_rms_norm(load_1d::<B>(ctx, &format!("{p}.post_per_layer_input_norm.weight"), device), eps, device),
+                gate: make_linear(
+                    load_2d::<B>(
+                        ctx,
+                        &format!("{p}.per_layer_input_gate.weight"),
+                        device,
+                        true,
+                    ),
+                    device,
+                ),
+                projection: make_linear(
+                    load_2d::<B>(
+                        ctx,
+                        &format!("{p}.per_layer_projection.weight"),
+                        device,
+                        true,
+                    ),
+                    device,
+                ),
+                post_norm: make_rms_norm(
+                    load_1d::<B>(
+                        ctx,
+                        &format!("{p}.post_per_layer_input_norm.weight"),
+                        device,
+                    ),
+                    eps,
+                    device,
+                ),
                 layer_scalar: 1.0, // unused now; see Gemma4DecoderLayer::forward
             })
         } else {
@@ -531,12 +699,36 @@ pub(crate) fn load_gemma4_from_source<B: Backend>(
         };
 
         layers.push(Gemma4DecoderLayer {
-            input_layernorm: make_rms_norm(load_1d::<B>(ctx, &format!("{p}.input_layernorm.weight"), device), eps, device),
+            input_layernorm: make_rms_norm(
+                load_1d::<B>(ctx, &format!("{p}.input_layernorm.weight"), device),
+                eps,
+                device,
+            ),
             attention,
-            post_attention_layernorm: make_rms_norm(load_1d::<B>(ctx, &format!("{p}.post_attention_layernorm.weight"), device), eps, device),
-            pre_feedforward_layernorm: make_rms_norm(load_1d::<B>(ctx, &format!("{p}.pre_feedforward_layernorm.weight"), device), eps, device),
+            post_attention_layernorm: make_rms_norm(
+                load_1d::<B>(ctx, &format!("{p}.post_attention_layernorm.weight"), device),
+                eps,
+                device,
+            ),
+            pre_feedforward_layernorm: make_rms_norm(
+                load_1d::<B>(
+                    ctx,
+                    &format!("{p}.pre_feedforward_layernorm.weight"),
+                    device,
+                ),
+                eps,
+                device,
+            ),
             mlp,
-            post_feedforward_layernorm: make_rms_norm(load_1d::<B>(ctx, &format!("{p}.post_feedforward_layernorm.weight"), device), eps, device),
+            post_feedforward_layernorm: make_rms_norm(
+                load_1d::<B>(
+                    ctx,
+                    &format!("{p}.post_feedforward_layernorm.weight"),
+                    device,
+                ),
+                eps,
+                device,
+            ),
             ple,
             moe,
             layer_scalar,
@@ -544,17 +736,25 @@ pub(crate) fn load_gemma4_from_source<B: Backend>(
     }
 
     // Model-level PLE projection (E2B/E4B)
-    let (per_layer_model_projection, per_layer_projection_norm, ple_proj_scale, ple_input_scale) = if tc.has_ple() {
-        println!("  Loading PLE model projection...");
-        let proj = make_linear(load_2d::<B>(ctx, "per_layer_model_projection.weight", device, true), device);
-        let norm = make_rms_norm(load_1d::<B>(ctx, "per_layer_projection_norm.weight", device), eps, device);
-        // Scale factors: 1/sqrt(hidden_size) and 1/sqrt(2)
-        let proj_scale = 1.0 / (tc.hidden_size as f64).sqrt() as f32;
-        let input_scale = (0.5f64).sqrt() as f32; // 1/sqrt(2)
-        (Some(proj), Some(norm), proj_scale, input_scale)
-    } else {
-        (None, None, 1.0, 1.0)
-    };
+    let (per_layer_model_projection, per_layer_projection_norm, ple_proj_scale, ple_input_scale) =
+        if tc.has_ple() {
+            println!("  Loading PLE model projection...");
+            let proj = make_linear(
+                load_2d::<B>(ctx, "per_layer_model_projection.weight", device, true),
+                device,
+            );
+            let norm = make_rms_norm(
+                load_1d::<B>(ctx, "per_layer_projection_norm.weight", device),
+                eps,
+                device,
+            );
+            // Scale factors: 1/sqrt(hidden_size) and 1/sqrt(2)
+            let proj_scale = 1.0 / (tc.hidden_size as f64).sqrt() as f32;
+            let input_scale = (0.5f64).sqrt() as f32; // 1/sqrt(2)
+            (Some(proj), Some(norm), proj_scale, input_scale)
+        } else {
+            (None, None, 1.0, 1.0)
+        };
 
     // Final norm
     println!("  Loading output head...");
@@ -566,7 +766,10 @@ pub(crate) fn load_gemma4_from_source<B: Backend>(
     let lm_head = if tc.tie_word_embeddings {
         None
     } else {
-        Some(make_linear(load_2d::<B>(ctx, "lm_head.weight", device, true), device))
+        Some(make_linear(
+            load_2d::<B>(ctx, "lm_head.weight", device, true),
+            device,
+        ))
     };
 
     let decoder = Gemma4Decoder {
@@ -582,17 +785,20 @@ pub(crate) fn load_gemma4_from_source<B: Backend>(
     };
     // Optionally load vision encoder
     let vision_encoder = config.vision_config.as_ref().map(|vc| {
-        let vision_config: super::vision::Gemma4VisionConfig = serde_json::from_value(vc.clone())
-            .expect("Failed to parse vision config");
+        let vision_config: super::vision::Gemma4VisionConfig =
+            serde_json::from_value(vc.clone()).expect("Failed to parse vision config");
         load_vision_encoder::<B>(&vision_config, tc.hidden_size, ctx, device)
     });
 
     println!("All Gemma 4 weights loaded.");
 
-    (Gemma4Model {
-        decoder,
-        config: config.text_config,
-    }, vision_encoder)
+    (
+        Gemma4Model {
+            decoder,
+            config: config.text_config,
+        },
+        vision_encoder,
+    )
 }
 
 /// Build a Gemma4MoeBlock (26B-A4B) for a single decoder layer. `p` is the
@@ -608,14 +814,17 @@ fn load_moe_block<B: Backend>(
     let eps = tc.rms_norm_eps;
     let num_experts = tc.num_experts.expect("num_experts must be set for MoE");
     let top_k = tc.top_k_experts.expect("top_k_experts must be set for MoE");
-    let moe_inter = tc.expert_intermediate_size.expect("moe intermediate size must be set");
+    let moe_inter = tc
+        .expert_intermediate_size
+        .expect("moe intermediate size must be set");
     let h = tc.hidden_size;
 
     // Router: norm has no learned scale (Python's with_scale=False).
     let router_norm = RmsNormConfig::new(h).with_epsilon(eps).init(device);
     let router_proj = make_linear(
         load_2d::<B>(ctx, &format!("{p}.router.proj.weight"), device, true),
-        device);
+        device,
+    );
     let router_scale = load_1d::<B>(ctx, &format!("{p}.router.scale"), device);
     let router_per_expert = load_1d::<B>(ctx, &format!("{p}.router.per_expert_scale"), device);
 
@@ -633,20 +842,42 @@ fn load_moe_block<B: Backend>(
     let gate_up_proj = load_3d::<B>(ctx, &format!("{p}.experts.gate_up_proj"), device);
     let down_proj = load_3d::<B>(ctx, &format!("{p}.experts.down_proj"), device);
     let experts = Gemma4Experts {
-        gate_up_proj, down_proj,
-        hidden_size: h, intermediate_size: moe_inter, num_experts,
+        gate_up_proj,
+        down_proj,
+        hidden_size: h,
+        intermediate_size: moe_inter,
+        num_experts,
     };
 
     Gemma4MoeBlock {
-        router, experts,
+        router,
+        experts,
         post_ffn_norm_1: make_rms_norm(
-            load_1d::<B>(ctx, &format!("{p}.post_feedforward_layernorm_1.weight"), device),
-            eps, device),
+            load_1d::<B>(
+                ctx,
+                &format!("{p}.post_feedforward_layernorm_1.weight"),
+                device,
+            ),
+            eps,
+            device,
+        ),
         pre_ffn_norm_2: make_rms_norm(
-            load_1d::<B>(ctx, &format!("{p}.pre_feedforward_layernorm_2.weight"), device),
-            eps, device),
+            load_1d::<B>(
+                ctx,
+                &format!("{p}.pre_feedforward_layernorm_2.weight"),
+                device,
+            ),
+            eps,
+            device,
+        ),
         post_ffn_norm_2: make_rms_norm(
-            load_1d::<B>(ctx, &format!("{p}.post_feedforward_layernorm_2.weight"), device),
-            eps, device),
+            load_1d::<B>(
+                ctx,
+                &format!("{p}.post_feedforward_layernorm_2.weight"),
+                device,
+            ),
+            eps,
+            device,
+        ),
     }
 }

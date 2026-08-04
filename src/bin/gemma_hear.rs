@@ -54,23 +54,32 @@ fn find_hf_file(model_id: &str, filename: &str) -> String {
 }
 
 fn arg(args: &[String], k: &str) -> Option<String> {
-    args.iter().position(|s| s == k).map(|i| args[i + 1].clone())
+    args.iter()
+        .position(|s| s == k)
+        .map(|i| args[i + 1].clone())
 }
 
 /// Current process resident-set size in GiB (macOS `ps`). GPU allocations on
 /// Apple silicon are unified memory, so this is the real system footprint.
 fn rss_gib() -> f64 {
     let pid = std::process::id().to_string();
-    let o = Command::new("ps").args(["-o", "rss=", "-p", &pid]).output().unwrap();
-    let kb: f64 = String::from_utf8(o.stdout).unwrap().trim().parse().unwrap_or(0.0);
+    let o = Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid])
+        .output()
+        .unwrap();
+    let kb: f64 = String::from_utf8(o.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap_or(0.0);
     kb / 1048576.0
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let audio_path = arg(&args, "--audio").expect("need --audio <path>");
-    let question = arg(&args, "--prompt")
-        .unwrap_or_else(|| "What is being said in this audio?".into());
+    let question =
+        arg(&args, "--prompt").unwrap_or_else(|| "What is being said in this audio?".into());
     let max_new = arg(&args, "--tokens")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(150);
@@ -92,8 +101,8 @@ fn main() {
 
     // --- Load audio from disk (symphonia + rubato) ---
     println!("Loading {audio_path}...");
-    let wave = load_audio_16k_mono(Path::new(&audio_path))
-        .unwrap_or_else(|e| panic!("audio load: {e}"));
+    let wave =
+        load_audio_16k_mono(Path::new(&audio_path)).unwrap_or_else(|e| panic!("audio load: {e}"));
     let audio_secs = wave.len() as f64 / 16_000.0;
     println!("  {} samples @ 16 kHz ({audio_secs:.2}s)", wave.len());
 
@@ -127,11 +136,8 @@ fn main() {
     let mut warm_secs = f64::INFINITY;
     for pass in ["cold", "warm"] {
         let t = Instant::now();
-        let input = Tensor::<B, 1>::from_floats(&feat[..], &device).reshape([
-            1,
-            n_frames,
-            fe.feature_size,
-        ]);
+        let input =
+            Tensor::<B, 1>::from_floats(&feat[..], &device).reshape([1, n_frames, fe.feature_size]);
         let out = tower.forward(input);
         let [_, n_tok, mh] = out.dims();
         let emb = embedder.forward(out.reshape([n_tok, mh]));

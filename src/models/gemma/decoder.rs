@@ -1,12 +1,15 @@
 //! Full Mistral decoder model: embedding + N transformer layers + output head.
 
+use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig};
 use burn::prelude::*;
-use burn::nn::{Linear, LinearConfig, Embedding, EmbeddingConfig};
 
 use crate::models::gemma::config::MistralConfig;
-use crate::models::gemma::layers::{TransformerLayer, RmsNorm, LayerCaches, QuantizedLayerCaches, QuantConfig, TurboQuantLayerCaches};
-use crate::models::gemma::turbo_quant::TurboQuantConfig;
+use crate::models::gemma::layers::{
+    LayerCaches, QuantConfig, QuantizedLayerCaches, RmsNorm, TransformerLayer,
+    TurboQuantLayerCaches,
+};
 use crate::models::gemma::rope::RopeTable;
+use crate::models::gemma::turbo_quant::TurboQuantConfig;
 
 /// The complete Mistral decoder.
 #[derive(Module, Debug)]
@@ -26,8 +29,7 @@ pub struct MistralModel<B: Backend> {
 impl<B: Backend> MistralModel<B> {
     /// Initialize with random weights (for testing architecture).
     pub fn new(config: MistralConfig, device: &B::Device) -> Self {
-        let embed = EmbeddingConfig::new(config.vocab_size, config.hidden_dim)
-            .init(device);
+        let embed = EmbeddingConfig::new(config.vocab_size, config.hidden_dim).init(device);
 
         let layers = (0..config.n_layers)
             .map(|_| TransformerLayer::new(&config, device))
@@ -41,7 +43,12 @@ impl<B: Backend> MistralModel<B> {
             .with_bias(false)
             .init(device);
 
-        let decoder = MistralDecoder { embed, layers, norm, lm_head };
+        let decoder = MistralDecoder {
+            embed,
+            layers,
+            norm,
+            lm_head,
+        };
         Self { decoder, config }
     }
 
@@ -188,7 +195,11 @@ impl<B: Backend> MistralModel<B> {
     where
         B: Backend<IntElem = i32>,
     {
-        crate::models::gemma::gpu_quant::GpuTurboQuantLayerCaches::new(self.config.n_layers, config, device)
+        crate::models::gemma::gpu_quant::GpuTurboQuantLayerCaches::new(
+            self.config.n_layers,
+            config,
+            device,
+        )
     }
 
     /// Build the RoPE table for this model's configuration.

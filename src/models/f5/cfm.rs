@@ -50,8 +50,14 @@ pub fn integrate<B: Backend>(
         let v = if cfg.cfg_strength < 1e-5 {
             v_cond
         } else {
-            let v_uncond =
-                model.forward_cfg(x.clone(), cond_mel.clone(), text_ids.clone(), time, true, true);
+            let v_uncond = model.forward_cfg(
+                x.clone(),
+                cond_mel.clone(),
+                text_ids.clone(),
+                time,
+                true,
+                true,
+            );
             v_cond.clone() + (v_cond - v_uncond) * cfg.cfg_strength
         };
         x = x + v * dt;

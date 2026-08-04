@@ -34,13 +34,16 @@ use mary::models::f5::wav;
 use mary::models::voxtral::config::*;
 use mary::models::voxtral::decoder::time_embedding;
 use mary::models::voxtral::fast::RealtimeTranscriber;
-use mary::models::voxtral::pipeline::{pad_audio, prompt_ids, transcribe, Transcriber, SttPipeline};
-use mary::nn::backend::{B, BFused, BFusedHalf, BHalf};
+use mary::models::voxtral::pipeline::{
+    pad_audio, prompt_ids, transcribe, SttPipeline, Transcriber,
+};
+use mary::nn::backend::{BFused, BFusedHalf, BHalf, B};
 use mary::nn::npy;
 use std::path::{Path, PathBuf};
 
 fn golden(gold: &Path, name: &str) -> (Vec<f32>, Vec<usize>) {
-    npy::load_npy(&gold.join(format!("{name}.npy"))).unwrap_or_else(|e| panic!("golden {name}: {e}"))
+    npy::load_npy(&gold.join(format!("{name}.npy")))
+        .unwrap_or_else(|e| panic!("golden {name}: {e}"))
 }
 
 fn metrics(name: &str, a: &[f32], b: &[f32], cos_gate: f64) -> bool {
@@ -55,22 +58,28 @@ fn metrics(name: &str, a: &[f32], b: &[f32], cos_gate: f64) -> bool {
     }
     let cos = dot / (na.sqrt() * nb.sqrt());
     let ok = cos > cos_gate;
-    println!("  {} {name:24} cos={cos:.8}  max|Δ|={maxabs:.3e}", if ok { "✓" } else { "✗" });
+    println!(
+        "  {} {name:24} cos={cos:.8}  max|Δ|={maxabs:.3e}",
+        if ok { "✓" } else { "✗" }
+    );
     ok
 }
 
 fn to_host<const D: usize>(t: Tensor<B, D>) -> Vec<f32> {
-    t.into_data().convert::<f32>().into_vec().expect("host readback")
+    t.into_data()
+        .convert::<f32>()
+        .into_vec()
+        .expect("host readback")
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |flag: &str| -> Option<String> {
-        args.iter().position(|a| a == flag).map(|i| args[i + 1].clone())
+        args.iter()
+            .position(|a| a == flag)
+            .map(|i| args[i + 1].clone())
     };
-    let pile = PathBuf::from(
-        arg("--pile").unwrap_or_else(|| "models/voxtral_mini.pile".into()),
-    );
+    let pile = PathBuf::from(arg("--pile").unwrap_or_else(|| "models/voxtral_mini.pile".into()));
     let gold = PathBuf::from(arg("--gold").unwrap_or_else(|| "golden/voxtral".into()));
     let long = args.iter().any(|a| a == "--long");
     let tekken = PathBuf::from(arg("--tekken").unwrap_or_else(|| {
@@ -91,20 +100,22 @@ fn main() {
     match lane.as_str() {
         "raw" => {}
         "fold" => {
-            let stt = RealtimeTranscriber::<BFused>::load(&loader, &tekken, 4096, &dev).expect("stt load");
+            let stt = RealtimeTranscriber::<BFused>::load(&loader, &tekken, 4096, &dev)
+                .expect("stt load");
             drop(loader);
             eprintln!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
             return fast_lane_gates(&stt, &gold, long, /*exact*/ true);
         }
         "half" => {
-            let stt =
-                RealtimeTranscriber::<BFusedHalf>::load(&loader, &tekken, 4096, &dev).expect("stt load");
+            let stt = RealtimeTranscriber::<BFusedHalf>::load(&loader, &tekken, 4096, &dev)
+                .expect("stt load");
             drop(loader);
             eprintln!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
             return fast_lane_gates(&stt, &gold, long, /*exact*/ false);
         }
         "rawhalf" => {
-            let stt = RealtimeTranscriber::<BHalf>::load(&loader, &tekken, 4096, &dev).expect("stt load");
+            let stt =
+                RealtimeTranscriber::<BHalf>::load(&loader, &tekken, 4096, &dev).expect("stt load");
             drop(loader);
             eprintln!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
             return fast_lane_gates(&stt, &gold, long, /*exact*/ false);
@@ -124,15 +135,19 @@ fn main() {
     let oracle_ids: Vec<u32> = ids_f.iter().map(|&x| x as u32).collect();
     let ours = prompt_ids(6);
     let ids_ok = ours == oracle_ids;
-    println!("  {} input_ids ({} tokens)", if ids_ok { "✓" } else { "✗" }, ours.len());
+    println!(
+        "  {} input_ids ({} tokens)",
+        if ids_ok { "✓" } else { "✗" },
+        ours.len()
+    );
     gate(ids_ok);
 
     let (clip, sr) = wav::read_pcm16_mono(&gold.join("clips/en_short.wav"));
     assert_eq!(sr, 16000);
     let (opad, _) = golden(&gold, "deep_padded_audio");
     let padded = pad_audio(&clip, 6);
-    let pad_ok = padded.len() == opad.len()
-        && padded.iter().zip(&opad).all(|(a, b)| (a - b).abs() < 1e-6);
+    let pad_ok =
+        padded.len() == opad.len() && padded.iter().zip(&opad).all(|(a, b)| (a - b).abs() < 1e-6);
     println!(
         "  {} padded audio ({} vs {} samples)",
         if pad_ok { "✓" } else { "✗" },
@@ -159,13 +174,23 @@ fn main() {
     let mut caches = stt.encoder.new_caches();
     let enc = stt.encoder.forward(stem.clone(), &mut caches);
     let (oenc, _) = golden(&gold, "deep_enc_final");
-    gate(metrics("encoder_final", &to_host(enc.clone()), &oenc, 0.999));
+    gate(metrics(
+        "encoder_final",
+        &to_host(enc.clone()),
+        &oenc,
+        0.999,
+    ));
 
     // ── 5. projector ─────────────────────────────────────────────────────
     println!("gate 5: projector");
     let audio_embeds = stt.encoder.project(enc);
     let (oemb, _) = golden(&gold, "deep_audio_embeds");
-    gate(metrics("audio_embeds", &to_host(audio_embeds.clone()), &oemb, 0.999));
+    gate(metrics(
+        "audio_embeds",
+        &to_host(audio_embeds.clone()),
+        &oemb,
+        0.999,
+    ));
 
     // ── 6. delay conditioning (the whole point — tight gates) ───────────
     println!("gate 6: delay conditioning");
@@ -177,7 +202,12 @@ fn main() {
         let scales = stt.decoder.ada_scales(nd, &dev);
         let ours: Vec<f32> = scales.0.iter().flat_map(|s| to_host(s.clone())).collect();
         // oracle saved (1 + ada(t_cond)) per layer, stacked [26, 1, 3072]
-        gate(metrics(&format!("ada_scales_d{nd}"), &ours, &oada, 0.999999));
+        gate(metrics(
+            &format!("ada_scales_d{nd}"),
+            &ours,
+            &oada,
+            0.999999,
+        ));
     }
 
     // ── 7. decoder prefill ───────────────────────────────────────────────
@@ -186,13 +216,23 @@ fn main() {
     let tok = stt.decoder.embed.forward(&oracle_ids, &dev);
     let embeds = tok + audio_embeds.clone().narrow(1, 0, l);
     let (opre, _) = golden(&gold, "deep_prefill_embeds");
-    gate(metrics("prefill_embeds", &to_host(embeds.clone()), &opre, 0.9999));
+    gate(metrics(
+        "prefill_embeds",
+        &to_host(embeds.clone()),
+        &opre,
+        0.9999,
+    ));
 
     let ada = stt.decoder.ada_scales(6, &dev);
     let mut dcaches = stt.decoder.new_caches();
     let hidden = stt.decoder.forward(embeds, &ada, &mut dcaches);
     let (ohid, _) = golden(&gold, "deep_dec_final");
-    gate(metrics("dec_final_hidden", &to_host(hidden.clone()), &ohid, 0.999));
+    gate(metrics(
+        "dec_final_hidden",
+        &to_host(hidden.clone()),
+        &ohid,
+        0.999,
+    ));
 
     let logits = stt.decoder.logits_last(hidden);
     let (ologits, _) = golden(&gold, "deep_prefill_logits");
@@ -211,7 +251,12 @@ fn main() {
         .unwrap()
         .0;
     let am_ok = oargmax == aargmax;
-    println!("  {} prefill argmax {} vs {}", if am_ok { "✓" } else { "✗" }, aargmax, oargmax);
+    println!(
+        "  {} prefill argmax {} vs {}",
+        if am_ok { "✓" } else { "✗" },
+        aargmax,
+        oargmax
+    );
     gate(am_ok);
 
     // ── 8+10. greedy streams + transcripts ───────────────────────────────
@@ -273,9 +318,10 @@ fn main() {
     let mut inc_caches = stt.encoder.new_caches();
     let mut chunks = Vec::new();
     for t in 0..n_tok {
-        let h = stt
-            .encoder
-            .forward(stem.clone().narrow(1, t * DOWNSAMPLE, DOWNSAMPLE), &mut inc_caches);
+        let h = stt.encoder.forward(
+            stem.clone().narrow(1, t * DOWNSAMPLE, DOWNSAMPLE),
+            &mut inc_caches,
+        );
         chunks.push(stt.encoder.project(h));
     }
     let inc = Tensor::cat(chunks, 1);
@@ -309,8 +355,12 @@ fn main() {
 /// identical batch graph, and every streaming-sized f16 shape is fine.
 fn fast_lane_gates<BX: Backend, O: SttPipeline<BX>>(stt: &O, gold: &Path, long: bool, exact: bool) {
     let mut all_ok = true;
-    let mut clips: Vec<(&str, usize)> =
-        vec![("en_short", 6), ("en_short", 12), ("en_short", 30), ("de_short", 6)];
+    let mut clips: Vec<(&str, usize)> = vec![
+        ("en_short", 6),
+        ("en_short", 12),
+        ("en_short", 30),
+        ("de_short", 6),
+    ];
     if long {
         clips.push(("denglish", 6));
         clips.push(("en_long", 6));
@@ -323,9 +373,14 @@ fn fast_lane_gates<BX: Backend, O: SttPipeline<BX>>(stt: &O, gold: &Path, long: 
         let secs = t0.elapsed().as_secs_f64();
         let (otok_f, _) = golden(gold, &format!("{clip}_d{nd}_tokens"));
         let oracle: Vec<u32> = otok_f.iter().map(|&x| x as u32).collect();
-        let matched = out.tokens.iter().zip(&oracle).take_while(|(a, b)| a == b).count();
-        let otext =
-            std::fs::read_to_string(gold.join(format!("{clip}_d{nd}_text.txt"))).unwrap_or_default();
+        let matched = out
+            .tokens
+            .iter()
+            .zip(&oracle)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let otext = std::fs::read_to_string(gold.join(format!("{clip}_d{nd}_text.txt")))
+            .unwrap_or_default();
         let (lcs, total) = word_lcs(&out.text, &otext);
         let ok = if exact {
             matched == oracle.len() && out.tokens.len() == oracle.len() && out.text == otext

@@ -55,7 +55,11 @@ fn zip_entries(data: &[u8]) -> HashMap<String, &[u8]> {
 
     let mut map = HashMap::new();
     for _ in 0..n_entries {
-        assert_eq!(&data[cd..cd + 4], b"PK\x01\x02", "zip: central directory header");
+        assert_eq!(
+            &data[cd..cd + 4],
+            b"PK\x01\x02",
+            "zip: central directory header"
+        );
         let method = u16at(cd + 10);
         let csize = u32at(cd + 20);
         let usize_ = u32at(cd + 24);
@@ -66,7 +70,10 @@ fn zip_entries(data: &[u8]) -> HashMap<String, &[u8]> {
         let name = std::str::from_utf8(&data[cd + 46..cd + 46 + name_len])
             .expect("zip: entry name utf8")
             .to_string();
-        assert_eq!(method, 0, "zip: {name}: only STORED entries (torch saves) supported");
+        assert_eq!(
+            method, 0,
+            "zip: {name}: only STORED entries (torch saves) supported"
+        );
         assert_eq!(csize, usize_, "zip: {name}: stored size mismatch");
         // Local header: sizes may be in a data descriptor; name/extra lengths
         // are authoritative here.
@@ -139,10 +146,10 @@ fn unpickle(b: &[u8]) -> V {
         let op = b[i];
         i += 1;
         match op {
-            0x80 => i += 1,            // PROTO n
-            b'}' => stack.push(V::Dict(Vec::new())), // EMPTY_DICT
+            0x80 => i += 1,                           // PROTO n
+            b'}' => stack.push(V::Dict(Vec::new())),  // EMPTY_DICT
             b')' => stack.push(V::Tuple(Vec::new())), // EMPTY_TUPLE
-            b'(' => stack.push(V::Mark), // MARK
+            b'(' => stack.push(V::Mark),              // MARK
             b'N' => stack.push(V::None),
             0x88 => stack.push(V::Bool(true)),  // NEWTRUE
             0x89 => stack.push(V::Bool(false)), // NEWFALSE
@@ -151,11 +158,15 @@ fn unpickle(b: &[u8]) -> V {
                 i += 1;
             }
             b'M' => {
-                stack.push(V::Int(u16::from_le_bytes(b[i..i + 2].try_into().unwrap()) as i64)); // BININT2
+                stack.push(V::Int(
+                    u16::from_le_bytes(b[i..i + 2].try_into().unwrap()) as i64
+                )); // BININT2
                 i += 2;
             }
             b'J' => {
-                stack.push(V::Int(i32::from_le_bytes(b[i..i + 4].try_into().unwrap()) as i64)); // BININT
+                stack.push(V::Int(
+                    i32::from_le_bytes(b[i..i + 4].try_into().unwrap()) as i64
+                )); // BININT
                 i += 4;
             }
             b'X' => {
@@ -210,7 +221,8 @@ fn unpickle(b: &[u8]) -> V {
                 memo.insert(k, stack.last().expect("memo").clone());
             }
             0x94 => {
-                memo.insert(memo.len() as u64, stack.last().expect("memo").clone()); // MEMOIZE
+                memo.insert(memo.len() as u64, stack.last().expect("memo").clone());
+                // MEMOIZE
             }
             b'h' => {
                 stack.push(memo[&(b[i] as u64)].clone()); // BINGET
@@ -246,7 +258,10 @@ fn unpickle(b: &[u8]) -> V {
                     V::Tuple(t) => t,
                     v => panic!("pickle: BINPERSID arg {v:?}"),
                 };
-                assert!(matches!(&pid[0], V::Str(s) if s == "storage"), "persid kind");
+                assert!(
+                    matches!(&pid[0], V::Str(s) if s == "storage"),
+                    "persid kind"
+                );
                 let storage_type = match &pid[1] {
                     V::Global(g) => g
                         .strip_prefix("torch ")
@@ -344,11 +359,16 @@ fn contiguous(shape: &[usize], strides: &[usize]) -> bool {
 fn to_f32(stub: &TensorStub, raw: &[u8]) -> Vec<f32> {
     let n: usize = stub.shape.iter().product();
     assert_eq!(stub.offset, 0, "voice prompt: nonzero storage offset");
-    assert!(contiguous(&stub.shape, &stub.strides), "voice prompt: non-contiguous tensor");
+    assert!(
+        contiguous(&stub.shape, &stub.strides),
+        "voice prompt: non-contiguous tensor"
+    );
     match stub.storage_type.as_str() {
         "FloatStorage" => {
             assert_eq!(raw.len(), n * 4, "f32 storage size");
-            raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+            raw.chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
         }
         "BFloat16Storage" => {
             assert_eq!(raw.len(), n * 2, "bf16 storage size");
@@ -377,7 +397,11 @@ impl VoicePrompt {
             .clone();
         let prefix = pkl_name.strip_suffix("data.pkl").unwrap().to_string();
         if let Some(bo) = entries.get(&format!("{prefix}byteorder")) {
-            assert_eq!(&bo[..6.min(bo.len())], b"little", "voice prompt: big-endian save");
+            assert_eq!(
+                &bo[..6.min(bo.len())],
+                b"little",
+                "voice prompt: big-endian save"
+            );
         }
 
         let root = unpickle(entries[&pkl_name]);
@@ -409,9 +433,15 @@ impl VoicePrompt {
         assert_eq!(c.offset, 0, "cache offset");
         let raw = entries[&format!("{prefix}data/{}", c.storage_key)];
         assert_eq!(raw.len(), cfg::NUM_STREAMS * CT * 8, "cache storage size");
-        let cache: Vec<i64> =
-            raw.chunks_exact(8).map(|ch| i64::from_le_bytes(ch.try_into().unwrap())).collect();
+        let cache: Vec<i64> = raw
+            .chunks_exact(8)
+            .map(|ch| i64::from_le_bytes(ch.try_into().unwrap()))
+            .collect();
 
-        Self { n_frames, embeddings, cache }
+        Self {
+            n_frames,
+            embeddings,
+            cache,
+        }
     }
 }

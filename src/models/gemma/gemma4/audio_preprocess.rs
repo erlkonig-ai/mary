@@ -29,7 +29,9 @@ pub struct AudioFeatureExtractor {
 }
 
 impl Default for AudioFeatureExtractor {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AudioFeatureExtractor {
@@ -49,14 +51,27 @@ impl AudioFeatureExtractor {
 
         let window = hann_periodic(frame_length);
         let mel_filters = mel_filter_bank_htk(
-            num_freq_bins, feature_size, min_frequency, max_frequency, sampling_rate,
+            num_freq_bins,
+            feature_size,
+            min_frequency,
+            max_frequency,
+            sampling_rate,
         );
 
         Self {
-            sampling_rate, frame_length, hop_length, fft_length, feature_size,
-            min_frequency, max_frequency, mel_floor: 1e-3,
-            max_length: 480_000, pad_to_multiple_of: 128,
-            window, mel_filters, num_freq_bins,
+            sampling_rate,
+            frame_length,
+            hop_length,
+            fft_length,
+            feature_size,
+            min_frequency,
+            max_frequency,
+            mel_floor: 1e-3,
+            max_length: 480_000,
+            pad_to_multiple_of: 128,
+            window,
+            mel_filters,
+            num_freq_bins,
         }
     }
 
@@ -71,12 +86,13 @@ impl AudioFeatureExtractor {
         let mut wv: Vec<f32> = waveform.iter().take(self.max_length).copied().collect();
         // Sample-level attention mask: 1 where real audio, 0 where padded.
         let real_len = wv.len();
-        let target_len = ((real_len + self.pad_to_multiple_of - 1)
-            / self.pad_to_multiple_of)
+        let target_len = ((real_len + self.pad_to_multiple_of - 1) / self.pad_to_multiple_of)
             * self.pad_to_multiple_of;
         wv.resize(target_len, 0.0);
         let mut mask_samples = vec![true; target_len];
-        for i in real_len..target_len { mask_samples[i] = false; }
+        for i in real_len..target_len {
+            mask_samples[i] = false;
+        }
 
         // Semicausal pad: prepend frame_length // 2 zeros.
         let pad_left = self.frame_length / 2;
@@ -90,7 +106,9 @@ impl AudioFeatureExtractor {
         let total = padded.len();
         let num_frames = if total >= unfold_size {
             (total - unfold_size) / self.hop_length + 1
-        } else { 0 };
+        } else {
+            0
+        };
 
         // Preemphasis is 0 → we take the first `frame_length` samples of each
         // unfolded window (Python: frames_to_process[..., :-1]).
@@ -105,7 +123,9 @@ impl AudioFeatureExtractor {
         for f in 0..num_frames {
             let start = f * self.hop_length;
             // Populate buf with windowed frame, zero-pad to fft_length.
-            for i in 0..self.fft_length { buf[i] = Complex32::new(0.0, 0.0); }
+            for i in 0..self.fft_length {
+                buf[i] = Complex32::new(0.0, 0.0);
+            }
             for i in 0..self.frame_length {
                 buf[i] = Complex32::new(padded[start + i] * self.window[i], 0.0);
             }
@@ -137,7 +157,9 @@ impl AudioFeatureExtractor {
         for f in 0..num_frames {
             if !mask[f] {
                 let row_out = f * self.feature_size;
-                for m in 0..self.feature_size { out[row_out + m] = 0.0; }
+                for m in 0..self.feature_size {
+                    out[row_out + m] = 0.0;
+                }
             }
         }
 
@@ -151,10 +173,12 @@ impl AudioFeatureExtractor {
 fn hann_periodic(n: usize) -> Vec<f32> {
     let np = (n + 1) as f64;
     // np.hanning(M) returns 0.5 - 0.5 cos(2π i / (M-1)) for i in 0..M.
-    (0..n).map(|i| {
-        let v = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / (np - 1.0)).cos();
-        v as f32
-    }).collect()
+    (0..n)
+        .map(|i| {
+            let v = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / (np - 1.0)).cos();
+            v as f32
+        })
+        .collect()
 }
 
 fn hz_to_mel_htk(f: f32) -> f32 {

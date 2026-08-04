@@ -1,7 +1,7 @@
 //! Gemma 4 text decoder: embedding + N transformer layers + output head.
 
-use burn::prelude::*;
 use burn::nn::{Embedding, Linear, RmsNorm};
+use burn::prelude::*;
 
 use super::config::Gemma4TextConfig;
 use super::layers::Gemma4DecoderLayer;
@@ -56,7 +56,15 @@ impl<B: Backend> Gemma4Model<B> {
         mm_ranges: &[(usize, usize)],
         lora: Option<&LoraWeights<B>>,
     ) -> Tensor<B, 3> {
-        self.forward_inner(inputs_embeds, tokens, rope_sliding, rope_global, caches, mm_ranges, lora)
+        self.forward_inner(
+            inputs_embeds,
+            tokens,
+            rope_sliding,
+            rope_global,
+            caches,
+            mm_ranges,
+            lora,
+        )
     }
 
     /// Forward pass with KV cache for incremental decoding.
@@ -70,7 +78,15 @@ impl<B: Backend> Gemma4Model<B> {
     ) -> Tensor<B, 3> {
         let scale = (self.config.hidden_size as f64).sqrt() as f32;
         let inputs_embeds = self.decoder.embed.forward(tokens.clone()).mul_scalar(scale);
-        self.forward_inner(inputs_embeds, tokens, rope_sliding, rope_global, caches, &[], None)
+        self.forward_inner(
+            inputs_embeds,
+            tokens,
+            rope_sliding,
+            rope_global,
+            caches,
+            &[],
+            None,
+        )
     }
 
     /// Inner forward: shared between forward_cached and forward_embeds.
@@ -107,8 +123,12 @@ impl<B: Backend> Gemma4Model<B> {
             // PLE table lookup: pad-substituted tokens at every multimodal
             // span (image and/or audio).
             let ple_tokens = if !mm_ranges.is_empty() {
-                let mut tok_data: Vec<i32> = tokens.clone().reshape([batch * seq])
-                    .to_data().to_vec().unwrap();
+                let mut tok_data: Vec<i32> = tokens
+                    .clone()
+                    .reshape([batch * seq])
+                    .to_data()
+                    .to_vec()
+                    .unwrap();
                 for &(s, e) in mm_ranges {
                     let s = s.min(seq);
                     let e = e.min(seq);
@@ -118,30 +138,38 @@ impl<B: Backend> Gemma4Model<B> {
                         }
                     }
                 }
-                Tensor::<B, 1, Int>::from_ints(&tok_data[..], &device)
-                    .reshape([batch, seq])
+                Tensor::<B, 1, Int>::from_ints(&tok_data[..], &device).reshape([batch, seq])
             } else {
                 tokens.clone()
             };
 
             // Project the MERGED inputs_embeds (vision features included) so
             // that PLE for image positions is informed by vision.
-            let projected = proj.forward(inputs_embeds.clone())
-                * self.decoder.per_layer_model_projection_scale;
+            let projected =
+                proj.forward(inputs_embeds.clone()) * self.decoder.per_layer_model_projection_scale;
             let projected = projected.reshape([batch, seq, n_layers, ple_dim]);
             let projected = proj_norm.forward(projected);
 
             let flat_ids = ple_tokens.reshape([batch * seq]);
-            self.decoder.layers.iter().enumerate().map(|(i, layer)| {
-                layer.ple.as_ref().map(|ple| {
-                    let ple_embed = ple.embed_slice.clone().select(0, flat_ids.clone())
-                        .reshape([batch, seq, ple_dim]);
-                    let proj_slice = projected.clone()
-                        .slice([0..batch, 0..seq, i..i+1, 0..ple_dim])
-                        .reshape([batch, seq, ple_dim]);
-                    (proj_slice + ple_embed) * self.decoder.per_layer_input_scale
+            self.decoder
+                .layers
+                .iter()
+                .enumerate()
+                .map(|(i, layer)| {
+                    layer.ple.as_ref().map(|ple| {
+                        let ple_embed = ple
+                            .embed_slice
+                            .clone()
+                            .select(0, flat_ids.clone())
+                            .reshape([batch, seq, ple_dim]);
+                        let proj_slice = projected
+                            .clone()
+                            .slice([0..batch, 0..seq, i..i + 1, 0..ple_dim])
+                            .reshape([batch, seq, ple_dim]);
+                        (proj_slice + ple_embed) * self.decoder.per_layer_input_scale
+                    })
                 })
-            }).collect()
+                .collect()
         } else {
             self.decoder.layers.iter().map(|_| None).collect()
         };
@@ -156,20 +184,27 @@ impl<B: Backend> Gemma4Model<B> {
         // built and the attention layer falls back to its builtin causal.
         let bidir_vision = self.config.use_bidirectional_attention.as_deref() == Some("vision");
         let [_, seq_len, _] = h.dims();
-        let sliding_mask: Option<Tensor<B, 4>> = if bidir_vision && seq_len > 1 && !mm_ranges.is_empty() {
+        let sliding_mask: Option<Tensor<B, 4>> = if bidir_vision
+            && seq_len > 1
+            && !mm_ranges.is_empty()
+        {
             // Start from pure causal, then OR-unmask within each span.
             let mut data = vec![f32::NEG_INFINITY; seq_len * seq_len];
             for i in 0..seq_len {
-                for j in 0..=i { data[i * seq_len + j] = 0.0; }
-            }
-            for &(s, e) in mm_ranges {
-                let s = s.min(seq_len); let e = e.min(seq_len);
-                for i in s..e {
-                    for j in s..e { data[i * seq_len + j] = 0.0; }
+                for j in 0..=i {
+                    data[i * seq_len + j] = 0.0;
                 }
             }
-            Some(Tensor::<B, 1>::from_floats(&data[..], &device)
-                .reshape([1, 1, seq_len, seq_len]))
+            for &(s, e) in mm_ranges {
+                let s = s.min(seq_len);
+                let e = e.min(seq_len);
+                for i in s..e {
+                    for j in s..e {
+                        data[i * seq_len + j] = 0.0;
+                    }
+                }
+            }
+            Some(Tensor::<B, 1>::from_floats(&data[..], &device).reshape([1, 1, seq_len, seq_len]))
         } else {
             None
         };
@@ -187,8 +222,7 @@ impl<B: Backend> Gemma4Model<B> {
                     data[i * seq_len + j] = 0.0;
                 }
             }
-            Some(Tensor::<B, 1>::from_floats(&data[..], &device)
-                .reshape([1, 1, seq_len, seq_len]))
+            Some(Tensor::<B, 1>::from_floats(&data[..], &device).reshape([1, 1, seq_len, seq_len]))
         } else {
             None
         };
@@ -199,7 +233,10 @@ impl<B: Backend> Gemma4Model<B> {
         let mut shared_kv: std::collections::HashMap<usize, (Tensor<B, 4>, Tensor<B, 4>)> =
             std::collections::HashMap::new();
 
-        for (i, (layer, cache)) in self.decoder.layers.iter()
+        for (i, (layer, cache)) in self
+            .decoder
+            .layers
+            .iter()
             .zip(caches.caches.iter_mut())
             .enumerate()
         {
@@ -232,13 +269,19 @@ impl<B: Backend> Gemma4Model<B> {
                 }
                 super::config::LayerType::FullAttention => causal_mask.as_ref(),
             };
-            h = layer.forward(h, rope, cache, ple_inputs[i].as_ref(), layer_mask,
-                lora.map(|l| (l, i)));
+            h = layer.forward(
+                h,
+                rope,
+                cache,
+                ple_inputs[i].as_ref(),
+                layer_mask,
+                lora.map(|l| (l, i)),
+            );
 
             // Debug: dump per-layer output when GAZE_DUMP_LAYERS env is set.
             if std::env::var("GAZE_DUMP_LAYERS").is_ok() && seq_len > 1 {
-                let dir = std::env::var("GAZE_DUMP_DIR")
-                    .unwrap_or_else(|_| "/tmp/rust_layers".into());
+                let dir =
+                    std::env::var("GAZE_DUMP_DIR").unwrap_or_else(|_| "/tmp/rust_layers".into());
                 std::fs::create_dir_all(&dir).ok();
                 let data: Vec<f32> = h.clone().to_data().to_vec().unwrap();
                 let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -311,7 +354,10 @@ impl<B: Backend> Gemma4Model<B> {
             global_head_dim,
             global_max_len,
             global_config.rope_theta,
-            self.config.rope_parameters.full_attention.partial_rotary_factor,
+            self.config
+                .rope_parameters
+                .full_attention
+                .partial_rotary_factor,
             device,
         );
 
