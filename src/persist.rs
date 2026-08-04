@@ -1345,11 +1345,152 @@ fn checkout_mary_branch(
     Ok((tribles, reader))
 }
 
+/// Reconstruct a SentencePiece UNIGRAM tokenizer from a pile's tokenizer graph.
+/// The `.model` file is not needed — the pieces ARE the model.
+///
+/// NOTE: this mirrors [`load_tokenizer_from_pile`]'s pile-opening prologue
+/// rather than sharing it. Factoring the two would need a callback trait,
+/// because the blob reader is an associated type and `BlobStoreGet` is not
+/// dyn-compatible — more machinery than the ~25 duplicated lines are worth,
+/// and it would put the proven reader at risk for no behavioural gain.
+#[cfg(feature = "tokenizer")]
+pub fn load_spm_tokenizer_from_pile(
+    pile_path: &Path,
+) -> anyhow::Result<crate::models::personaplex::spm::SpmTokenizer> {
+    let mut pile =
+        Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open pile {pile_path:?}: {e:?}"))?;
+    pile.refresh()
+        .map_err(|e| anyhow::anyhow!("pile {pile_path:?} failed to load ({e:?})"))?;
+    let mut repo = Repository::new(
+        pile,
+        SigningKey::generate(&mut rand::rngs::OsRng),
+        TribleSet::new(),
+    )
+    .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
+    let branch_id = repo
+        .lookup_branch("main")
+        .map_err(|e| anyhow::anyhow!("lookup main: {e:?}"))?
+        .ok_or_else(|| anyhow::anyhow!("no 'main' branch in pile {pile_path:?}"))?;
+    let mut ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow::anyhow!("pull main: {e:?}"))?;
+    let head = ws
+        .head()
+        .ok_or_else(|| anyhow::anyhow!("'main' has no commits"))?;
+    let checkout = ws
+        .checkout(ancestors(head))
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let tribles: TribleSet = checkout.facts().clone();
+    let reader = repo
+        .storage_mut()
+        .reader()
+        .map_err(|e| anyhow::anyhow!("pile reader: {e:?}"))?;
+    // Close BEFORE anything fallible: the reader keeps its own mmap alive, so
+    // it outlives the repository, and every bail below would otherwise drop the
+    // pile unclosed ("data may not be persisted").
+    repo.close()
+        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+    let tok_id = crate::tokenizer::find_tokenizer(&tribles)
+        .ok_or_else(|| anyhow::anyhow!("no tokenizer graph in pile {pile_path:?}"))?;
+    let pieces = crate::tokenizer::load_spm_pieces(&tribles, &reader, tok_id);
+    if pieces.is_empty() {
+        anyhow::bail!("tokenizer graph in {pile_path:?} has no scored pieces — not UNIGRAM?");
+    }
+    let adp = crate::tokenizer::has_add_prefix_space(&tribles, tok_id);
+    Ok(crate::models::personaplex::spm::SpmTokenizer::from_pieces(
+        &pieces, adp,
+    ))
+}
+
+/// Ingest a SentencePiece `.model` file into a pile as a tokenizer GRAPH — the
+/// write side of [`load_spm_tokenizer_from_pile`].
+///
+/// The `.proto` is parsed and DISCARDED: what lands in the pile is one entity
+/// per piece (bytes, id, score, type tag) plus a tokenizer node, not the
+/// original file as an opaque blob. That is the whole point — a blob would
+/// persist the tokenizer, but only the graph makes it *queryable*, and only the
+/// graph can be diffed, merged, or partially reused the way every other fact in
+/// the pile can.
+///
+/// Refuses to write a second tokenizer into a pile that already has one:
+/// `find_tokenizer` returns a single node, so two would make which-one-you-get
+/// depend on iteration order.
+#[cfg(feature = "tokenizer")]
+pub fn ingest_spm_tokenizer(
+    pile_path: &Path,
+    model_file: &Path,
+    source_name: &str,
+) -> anyhow::Result<usize> {
+    let (pieces, add_dummy_prefix, byte_fallback) =
+        crate::models::personaplex::spm::SpmTokenizer::parse_model(model_file);
+    if pieces.is_empty() {
+        anyhow::bail!("{model_file:?} parsed to zero pieces");
+    }
+
+    let mut pile =
+        Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open pile {pile_path:?}: {e:?}"))?;
+    pile.refresh()
+        .map_err(|e| anyhow::anyhow!("pile {pile_path:?} failed to load ({e:?})"))?;
+    let mut repo = Repository::new(
+        pile,
+        SigningKey::generate(&mut rand::rngs::OsRng),
+        TribleSet::new(),
+    )
+    .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
+    let branch_id = match repo
+        .lookup_branch("main")
+        .map_err(|e| anyhow::anyhow!("lookup main: {e:?}"))?
+    {
+        Some(id) => id,
+        None => *repo
+            .create_branch("main", None)
+            .map_err(|e| anyhow::anyhow!("create main: {e:?}"))?,
+    };
+    let mut ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow::anyhow!("pull main: {e:?}"))?;
+
+    // A pile is append-only, so a duplicate tokenizer cannot be taken back.
+    // Close before bailing — an early return here would drop the pile unclosed.
+    let existing = match ws.head() {
+        Some(head) => {
+            let checkout = ws
+                .checkout(ancestors(head))
+                .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+            crate::tokenizer::find_tokenizer(checkout.facts())
+        }
+        None => None,
+    };
+    if let Some(existing) = existing {
+        repo.close()
+            .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+        anyhow::bail!(
+            "pile {pile_path:?} already contains tokenizer {existing:?}; \
+             refusing to add a second (a pile is append-only — this cannot be undone)"
+        );
+    }
+
+    let frag = crate::tokenizer::save_spm_unigram(
+        &pieces,
+        add_dummy_prefix,
+        byte_fallback,
+        source_name,
+        repo.storage_mut(),
+    )
+    .map_err(|e| anyhow::anyhow!("build tokenizer graph: {e}"))?;
+    let facts = frag.into_facts();
+    let n = facts.len();
+    ws.commit(facts, "ingest SentencePiece UNIGRAM tokenizer graph");
+    repo.push(&mut ws)
+        .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+    repo.close()
+        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+    Ok(n)
+}
+
 /// Construct a ready-to-encode `tokenizers::Tokenizer` from the tokenizer
-/// GRAPH in a pile ([`crate::tokenizer`]) — the tokenizer twin of
-/// [`load_keymap_from_pile`]: same `main`-branch checkout, and the parts are
-/// queried from the graph and fed to the `tokenizers` builders. No
-/// tokenizer.json exists anywhere in this path.
+/// GRAPH in a pile — the HuggingFace (BPE/WordPiece) counterpart to
+/// [`load_spm_tokenizer_from_pile`].
 #[cfg(feature = "tokenizer")]
 pub fn load_tokenizer_from_pile(pile_path: &Path) -> anyhow::Result<tokenizers::Tokenizer> {
     let mut pile =

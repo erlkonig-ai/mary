@@ -137,6 +137,15 @@ impl<'a> FieldVal<'a> {
 
 impl SpmTokenizer {
     pub fn load(path: &Path) -> Self {
+        let (pieces, add_dummy_prefix, _byte_fallback) = Self::parse_model(path);
+        Self::from_pieces(&pieces, add_dummy_prefix)
+    }
+
+    /// Parse the `.model` proto into its raw piece table plus the two knobs the
+    /// port depends on. Exposed so the pile-ingest path can persist exactly what
+    /// [`Self::from_pieces`] consumes — the graph then holds the model, and the
+    /// file becomes unnecessary.
+    pub fn parse_model(path: &Path) -> (Vec<(Vec<u8>, f32, u64)>, bool, bool) {
         let data = std::fs::read(path).unwrap_or_else(|e| panic!("spm model {path:?}: {e}"));
         let mut pieces: Vec<(Vec<u8>, f32, u64)> = Vec::new(); // (bytes, score, type)
         let (mut trainer, mut normalizer): (Option<&[u8]>, Option<&[u8]>) = (None, None);
@@ -211,6 +220,15 @@ impl SpmTokenizer {
         );
         assert!(escape_ws, "spm: escape_whitespaces=false is not ported");
 
+        (pieces, add_dummy_prefix, byte_fallback)
+    }
+
+    /// Build the tokenizer from the raw `(bytes, score, type)` piece table.
+    ///
+    /// Split out of [`Self::load`] so the pile-backed constructor shares the
+    /// EXACT construction semantics that were gated against the oracle — the
+    /// only difference between the two paths is where the pieces came from.
+    pub fn from_pieces(pieces: &[(Vec<u8>, f32, u64)], add_dummy_prefix: bool) -> Self {
         // Match table: NORMAL (type 1) pieces only — CONTROL/UNK/BYTE pieces
         // never match from text (model.cc BuildTrie). No USER_DEFINED pieces
         // exist in this model (they'd need always-match semantics).
