@@ -186,6 +186,76 @@ fn read_npy(path: &Path) -> Arr {
     Arr { shape, data, bits }
 }
 
+/// Check the loaded arrays against `index.json`'s declaration.
+///
+/// The gate read whatever `.npy` files happened to be in the directory and
+/// compared against them. `index.json` sits beside those files carrying the
+/// source `.npz` path, its sha256, and every array's shape and dtype — and was
+/// never opened. So a regenerated, truncated, partially-extracted or simply
+/// different oracle would have been compared against silently, and a green
+/// result would describe agreement with an unknown reference.
+///
+/// This does not prove the oracle is *correct*; it proves it is the SAME oracle
+/// the gate was written against. Those are different claims and only the second
+/// is checkable here.
+fn verify_against_index(dir: &Path, loaded: &HashMap<String, Arr>) {
+    let idx_path = dir.join("index.json");
+    let raw = match fs::read_to_string(&idx_path) {
+        Ok(t) => t,
+        Err(e) => panic!(
+            "{}: {e}. The oracle's manifest is how this gate knows it is reading the \
+             intended arrays; refusing to compare against an unidentified reference.",
+            idx_path.display()
+        ),
+    };
+    let idx: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{}: {e}", idx_path.display()));
+    let arrays = idx
+        .get("arrays")
+        .and_then(|a| a.as_object())
+        .unwrap_or_else(|| panic!("{} has no `arrays` object", idx_path.display()));
+
+    println!(
+        "oracle identity: {} arrays declared, source sha256 {}",
+        arrays.len(),
+        idx.get("source_sha256")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(absent)")
+    );
+
+    let mut problems: Vec<String> = Vec::new();
+    for (name, spec) in arrays {
+        let Some(got) = loaded.get(name) else {
+            problems.push(format!("declared but not loaded: {name}"));
+            continue;
+        };
+        let want: Vec<usize> = spec
+            .get("shape")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect())
+            .unwrap_or_default();
+        if want != got.shape {
+            problems.push(format!("{name}: shape {:?} declared, {:?} loaded", want, got.shape));
+        }
+        let n: usize = want.iter().product::<usize>().max(if want.is_empty() { 1 } else { 0 });
+        if got.len() != n {
+            problems.push(format!("{name}: {n} elements declared, {} loaded", got.len()));
+        }
+    }
+    for name in loaded.keys() {
+        if !arrays.contains_key(name) {
+            problems.push(format!("loaded but not declared: {name}"));
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "oracle does not match its own index.json — {} discrepanc(y/ies):\n  {}",
+        problems.len(),
+        problems.join("\n  ")
+    );
+    println!("oracle identity: OK — every declared array present with the declared shape\n");
+}
+
 fn load_oracle(dir: &Path) -> HashMap<String, Arr> {
     let mut out = HashMap::new();
     for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display())) {
@@ -200,6 +270,7 @@ fn load_oracle(dir: &Path) -> HashMap<String, Arr> {
         "{} holds no situ oracle (expected the .npz members as .npy)",
         dir.display()
     );
+    verify_against_index(dir, &out);
     out
 }
 
