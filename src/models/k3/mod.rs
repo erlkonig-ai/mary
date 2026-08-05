@@ -23,13 +23,16 @@
 //!   of depth checkpoints plus the running accumulator, rather than a plain
 //!   residual add.
 //!
-//! See [`config`] for the layer-index base trap, and [`layout`] for how the
-//! name mapping is checked in both directions.
+//! See [`config`] for the layer-index base trap, [`layout`] for how the name
+//! mapping is checked in both directions, and [`attn_res`] for the depth-axis
+//! mixture and the snapshot boundary that resets it.
 
+pub mod attn_res;
 pub mod config;
 pub mod layout;
 pub mod mla;
 
+pub use attn_res::{AttnResMix, AttnResParams, DepthMixer, LayerEntry};
 pub use config::{AttnKind, K3Config, K3TextConfig, K3VisionConfig, LinearAttnConfig};
 pub use layout::{describe, for_each_slot, Dtype, Shape, Slot, TensorSlot};
 pub use mla::{MlaBlock, MlaConfig, MlaKvCache, MlaTrace, MlaWeights, Precision};
