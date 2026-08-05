@@ -363,6 +363,41 @@ mod tests {
         assert_eq!(exact.len(), 18);
     }
 
+    /// The EMITTING side, anchored to literal bytes.
+    ///
+    /// Everything else about `e4m3_from_pow2` was checked by round trip —
+    /// `e4m3_to_f32(e4m3_from_pow2(e)) == 2^e` — which proves a property of the
+    /// PAIR and nothing about either half. Two mutations survived that:
+    ///
+    ///   M1: `e4m3_from_pow2` ORs 0x80 into every byte and `e4m3_to_f32` drops
+    ///       the sign. Round trip unchanged, all unit tests green, whole gate
+    ///       exit 0 — and every emitted block-scale byte has its sign bit set,
+    ///       so every weight is NEGATED for any consumer that is not this
+    ///       module. The bytes are the shipped artifact; a tensor-core kernel
+    ///       reads them, not our reader.
+    ///   M7: both XOR 0x10. Composition unchanged, the exact-pow2 window is
+    ///       still exactly {-9..8} so the window test cannot see it, and all
+    ///       nine tensors come out 4x wrong under ml_dtypes.
+    ///
+    /// These literals are the E4M3FN encodings of 2^0, 2^8 and 2^-9 (the
+    /// subnormal floor), taken from the format definition rather than from this
+    /// module's own reader.
+    #[test]
+    fn e4m3_from_pow2_emits_known_bytes() {
+        assert_eq!(e4m3_from_pow2(0), Some(0x38), "2^0 must encode as 0x38");
+        assert_eq!(e4m3_from_pow2(8), Some(0x78), "2^8 must encode as 0x78");
+        assert_eq!(e4m3_from_pow2(-9), Some(0x01), "2^-9 subnormal must encode as 0x01");
+        assert_eq!(e4m3_from_pow2(-6), Some(0x08), "2^-6 must encode as 0x08");
+        // Outside the window at both ends.
+        assert_eq!(e4m3_from_pow2(9), None);
+        assert_eq!(e4m3_from_pow2(-10), None);
+        // No emitted byte may carry the sign bit: block scales are magnitudes.
+        for e in E4M3_POW2_MIN..=E4M3_POW2_MAX {
+            let b = e4m3_from_pow2(e).expect("inside the window");
+            assert_eq!(b & 0x80, 0, "emitted byte {b:#04x} for 2^{e} has the sign bit set");
+        }
+    }
+
     #[test]
     fn e4m3_known_encodings() {
         assert_eq!(e4m3_to_f32(0x38), 1.0);
