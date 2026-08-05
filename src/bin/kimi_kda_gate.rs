@@ -87,6 +87,10 @@ fn main() -> ExitCode {
     );
 
     let mut r = Report::new();
+    check_shipping_config(
+        &mut r,
+        std::path::Path::new("./kimi-k3/config.json"),
+    );
     check_premises(&mut r, &kda);
     check_gate_sweep(&mut r, &kda);
     check_stages(&mut r, &kda);
@@ -128,7 +132,12 @@ fn compare<E: Elem>(mine: &[E], reference: &[f64]) -> Cmp {
     let mut refmax = 0.0f64;
     for (i, (&m, &r)) in mine.iter().zip(reference).enumerate() {
         let d = (m.to_f64() - r).abs();
-        if d > maxabs {
+        // `!(d <= maxabs)`, NOT `d > maxabs`. For d = NaN the latter is FALSE,
+        // so a non-finite element never updates the maximum and scores as ZERO
+        // error — the metric silently agrees with any garbage output. Injecting
+        // a NaN into every token of every case previously yielded 72/72 PASS
+        // with rows printing `maxabs 5.551e-17 rel 9.872e-16 PASS`.
+        if !(d <= maxabs) {
             maxabs = d;
             at = i;
         }
@@ -272,6 +281,90 @@ fn arr<E: Elem>(a: &NpyArray) -> Vec<E> {
 /// The constants this port hard-codes, checked against the oracle rather than
 /// assumed. Cheap, and a premise error has been the expensive failure mode on
 /// this model.
+/// Check the SHIPPING config against the checkpoint's own `config.json`.
+///
+/// `KdaConfig::kimi_k3()` had exactly one occurrence in the tree — its own
+/// definition. Every check ran a 4-head `case_cfg()`, so `96` appeared nowhere
+/// and corrupting `kimi_k3()` to `num_heads: 7, head_k_dim: 3, conv_kernel: 9,
+/// gate_lower_bound: None` still yielded 72/72 and exit 0. The gate proved the
+/// algorithm and never touched the configuration the model will actually run
+/// with.
+///
+/// This reads the checkpoint, not the oracle. The previous "premise check"
+/// compared the port's -5.0 against the oracle npz's -5.0 — both descended from
+/// one reading of config.json, so it could only ever confirm that reading
+/// against itself.
+fn check_shipping_config(r: &mut Report, config_json: &std::path::Path) {
+    let raw = match std::fs::read_to_string(config_json) {
+        Ok(t) => t,
+        Err(e) => {
+            r.expect_true(
+                "shipping config: config.json readable",
+                false,
+                &format!("{}: {e}", config_json.display()),
+            );
+            return;
+        }
+    };
+    // Deliberately not a JSON dependency: these are unambiguous scalar fields
+    // and a regex keeps the gate free of a parser whose own behaviour would
+    // then need gating.
+    let field = |name: &str| -> Option<f64> {
+        regex_lite_find(&raw, name)
+    };
+    let cfg = mary::models::kimi_k3::kda::KdaConfig::kimi_k3();
+
+    let checks: [(&str, Option<f64>, f64); 4] = [
+        ("num_heads", field("\"num_heads\""), cfg.num_heads as f64),
+        ("head_dim", field("\"head_dim\""), cfg.head_k_dim as f64),
+        ("short_conv_kernel_size", field("\"short_conv_kernel_size\""), cfg.conv_kernel as f64),
+        ("gate_lower_bound", field("\"gate_lower_bound\""), cfg.gate_lower_bound.unwrap_or(f64::NAN)),
+    ];
+    for (name, found, mine) in checks {
+        match found {
+            Some(v) => r.expect_true(
+                &format!("shipping config: {name}"),
+                (v - mine).abs() < 1e-9,
+                &format!("config.json {v} vs KdaConfig::kimi_k3() {mine}"),
+            ),
+            None => r.expect_true(
+                &format!("shipping config: {name}"),
+                false,
+                "field absent from config.json",
+            ),
+        }
+    }
+    // head_v_dim is not a separate config field on this checkpoint; assert the
+    // identity the port relies on rather than leaving it unchecked.
+    r.expect_true(
+        "shipping config: head_v_dim == head_k_dim",
+        cfg.head_v_dim == cfg.head_k_dim,
+        &format!("{} vs {}", cfg.head_v_dim, cfg.head_k_dim),
+    );
+}
+
+/// Find `"name": <number>` in raw JSON. Returns the FIRST occurrence inside the
+/// linear_attn_config block when present, else the first anywhere.
+fn regex_lite_find(raw: &str, quoted_name: &str) -> Option<f64> {
+    let scope = raw
+        .find("\"linear_attn_config\"")
+        .map(|i| &raw[i..])
+        .unwrap_or(raw);
+    for hay in [scope, raw] {
+        if let Some(i) = hay.find(quoted_name) {
+            let rest = &hay[i + quoted_name.len()..];
+            let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+            let end = rest
+                .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e'))
+                .unwrap_or(rest.len());
+            if let Ok(v) = rest[..end].parse::<f64>() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
 fn check_premises(r: &mut Report, kda: &Npz) {
     println!("=== 1. Premises ===");
     let lb = kda.get("gate_lower_bound").scalar();
