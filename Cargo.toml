@@ -159,11 +159,26 @@ local-model = ["gemma"]
 # probe with `--features dev-tools`.
 # The probes compare against safetensors oracles, so this pulls `import`.
 dev-tools = ["import"]
+# Kimi K3 (mary::models::kimi_k3). Dep-free at the model layer — the router
+# is pure Rust over slices, no burn backend and no safetensors: the gate
+# projection is an 896x7168 f32 matmul whose *reduction order* is load-bearing
+# (the margin between the 16th and 17th score gets down to 3.1e-06 on real
+# tokens, so a sloppier reduction reroutes tokens), which is a poor fit for a
+# backend's default gemm. `sha2` is for the gate binary, which asserts the
+# exported weight artifact against a digest taken from the safetensors shards.
+kimi-k3 = ["dep:sha2"]
 # The `mary` CLI — the import front door. Behind `import` (safetensors + clap),
 # out of the default library build.
 [[bin]]
 name = "mary"
 required-features = ["import"]
+
+# MoE-router parity gate: mary::models::kimi_k3::router against the Kimi K3
+# whole-layer oracle. Reads .npz + config.json only — no safetensors at
+# runtime — so it does not ride `dev-tools`/`import`.
+[[bin]]
+name = "k3_router_gate"
+required-features = ["kimi-k3"]
 
 # Hand-run dev probes / parity gates (f5-only deps) — kept out of the default
 # (library-only) build behind `dev-tools`.
