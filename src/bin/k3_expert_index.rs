@@ -144,6 +144,58 @@ fn main() {
     }
     println!("GATE PASS: {n_experts} experts, every one exactly {EXPERT_BYTES} bytes\n");
 
+    // ── the resident set: everything that is NOT a routed expert ──
+    //
+    // Routed experts stream; everything else has to be pinned, because it is
+    // touched for every token. This is the number that decides whether B=1
+    // inference fits at all on a 128 GB machine, and it was previously derived
+    // from a separate header pass — recomputing it from the same address book
+    // the loader uses removes one place for the two to drift apart.
+    let mut resident: HashMap<&str, u64> = HashMap::new();
+    let mut resident_total = 0u64;
+    for (n, l) in book.iter() {
+        if n.contains(".experts.") {
+            continue;
+        }
+        let bucket = if n.contains("self_attn") || n.contains("attn") {
+            "attention"
+        } else if n.contains("shared_expert") {
+            "shared experts"
+        } else if n.contains("embed_tokens") {
+            "embed_tokens"
+        } else if n.contains("lm_head") {
+            "lm_head"
+        } else if n.contains("vision") || n.contains("vt_") || n.contains("mm_proj") {
+            "vision tower"
+        } else if n.contains("gate") && n.contains("moe") {
+            "router gates"
+        } else {
+            "other (norms, dense mlp, projections)"
+        };
+        *resident.entry(bucket).or_insert(0) += l.len;
+        resident_total += l.len;
+    }
+    let mut buckets: Vec<(&&str, &u64)> = resident.iter().collect();
+    buckets.sort_by(|a, b| b.1.cmp(a.1));
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    println!("\nresident set (everything that is not a routed expert):");
+    for (name, bytes) in &buckets {
+        println!("  {:<38} {:>8.2} GiB", name, gib(**bytes));
+    }
+    println!("  {:<38} {:>8.2} GiB  TOTAL", "", gib(resident_total));
+    let streamed: u64 = by_expert.values().sum();
+    println!(
+        "  streamed (routed experts)              {:>8.2} GiB   {:.2}% of the checkpoint",
+        gib(streamed),
+        streamed as f64 / (streamed + resident_total) as f64 * 100.0
+    );
+    // 128 GB machine, minus the OS, the CUDA context and activations.
+    const MACHINE_BYTES: f64 = 128.0e9;
+    println!(
+        "  headroom on a 128 GB box: {:.2} GB before OS/CUDA/activations/KV",
+        (MACHINE_BYTES - resident_total as f64) / 1e9
+    );
+
     // ── fetch through the real path ──
     //
     // The member names are DERIVED from the address book, not guessed. A first
