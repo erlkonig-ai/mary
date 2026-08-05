@@ -6,6 +6,7 @@
 pub mod alias;
 pub mod backend;
 pub mod npy;
+pub mod npz;
 pub mod norm;
 #[cfg(feature = "q4")]
 pub mod q4;

@@ -97,7 +97,15 @@ pub struct K3TextConfig {
     pub num_key_value_heads: usize,
     /// Vocabulary size.
     pub vocab_size: usize,
-    /// RMSNorm epsilon, shared by every norm in the decoder.
+    /// RMSNorm epsilon of every norm the **decoder layer** builds:
+    /// `input_layernorm`, `post_attention_layernorm`, both AttnRes norms, the
+    /// routed-expert norm and the final `model.norm`. 1e-5 here.
+    ///
+    /// **Not** the epsilon of MLA's two internal norms. `KimiMLAAttention`
+    /// constructs `q_a_layernorm` and `kv_a_layernorm` with a bare
+    /// `KimiRMSNorm(rank)` — no `eps=` argument — so those take
+    /// `KimiRMSNorm.__init__`'s default of **1e-6**, ten times smaller, three
+    /// lines away in the same file. See [`crate::models::k3::mla::LORA_NORM_EPS`].
     pub rms_norm_eps: f64,
     /// Longest position the model was trained to address.
     pub max_position_embeddings: usize,

@@ -1,0 +1,506 @@
+{
+ "baseline": {
+  "build": "ok",
+  "gate": "PASS",
+  "n_failed": 0,
+  "failing": [],
+  "detail": ""
+ },
+ "final": {
+  "build": "ok",
+  "gate": "PASS",
+  "n_failed": 0,
+  "failing": [],
+  "detail": ""
+ },
+ "n": 26,
+ "caught": 25,
+ "survived": 1,
+ "unexpected": [],
+ "mutants": [
+  {
+   "build": "ok",
+   "gate": "FAIL",
+   "n_failed": 21,
+   "failing": [
+    "f64/attn_probs_precast",
+    "f64/attn_probs",
+    "f64/attn_out_heads",
+    "f64/o_proj_in",
+    "f64/block_out",
+    "f64/attn_scores"
+   ],
+   "detail": "",
+   "id": "M01",
+   "file": "mla.rs",
+   "mutation": "softmax scale 128^-0.5 instead of 192^-0.5 (forgetting the carried lane counts)",
+   "expectation": "caught",
+   "caught": true,
+   "verdict": "CAUGHT",
+   "as_expected": true
+  },
+  {
+   "build": "ok",
+   "gate": "FAIL",
+   "n_failed": 14,
+   "failing": [
+    "f64/q_a_layernorm_out",
+    "f64/q_b_proj_out",
+    "f64/kv_a_layernorm_out",
+    "f64/kv_b_proj_out",
+    "f64/query_states",
+    "f64/key_states"
+   ],
+   "detail": "",
+   "id": "M02",
+   "file": "mla.rs",
+   "mutation": "MLA's internal RMSNorm epsilon set to config.rms_norm_eps instead of KimiRMSNorm's default",
+   "expectation": "caught",
+   "caught": true,
+   "verdict": "CAUGHT",
+   "as_expected": true
+  },
+  {
+   "build": "ok",
+   "gate": "FAIL",
+   "n_failed": 6,
+   "failing": [
+    "tf/q_a_layernorm",
+    "tf/kv_a_layernorm",
+    "tf/q_a_layernorm",
+    "tf/kv_a_layernorm",
+    "tf/q_a_layernorm",
+    "tf/kv_a_layernorm"
+   ],
+   "detail": "",
+   "id": "M03",
+   "file": "mla.rs",
+   "mutation": "RMSNorm scales by the weight before casting back, rounding once instead of twice",
+   "expectation": "caught",
+   "caught": true,
+   "verdict": "CAUGHT",
+   "as_expected": true
+  },
+  {
+   "build": "ok",
+   "gate": "FAIL",
+   "n_failed": 35,
+   "failing": [
+    "f64/q_a_layernorm_out",
+    "f64/q_b_proj_out",
+    "f64/kv_a_layernorm_out",
+    "f64/kv_b_proj_out",
+    "f64/query_states",
+    "f64/key_states"
+   ],
+   "detail": "",
+   "id": "M04",
+   "file": "mla.rs",
+   "mutation": "RMSNorm sums the squares instead of averaging them",
+   "expectation": "caught",
+   "caught": true,
+   "verdict": "CAUGHT",
+   "as_expected": true
+  },
+  {
+   "build": "ok",
+   "gate": "FAIL",
+   "n_failed": 25,
+   "failing": [
+    "f64/key_states",
+    "f64/value_states",
+    "f64/attn_probs_precast",
+    "f64/attn_probs",
+    "f64/attn_out_heads",
+    "f64/o_proj_in"
+   ],
+   "detail": "",
+   "id": "M05",
+   "file": "mla.rs",
+   "mutation": "kv_b_proj's two halves swapped: value first, key second",
+   "expectation": "caught",
+   "caught": true,
+   "verdict": "CAUGHT",
+   "as_expected": true
+  },
+  {
+   "build": "ok",
+   "gate": "FAIL",
+   "n_failed": 20,
+   "failing": [
+    "f64/key_states",
+    "f64/attn_probs_precast",
+    "f64/attn_probs",
+    "f64/attn_out_heads",
+    "f64/o_proj_in",
+    "f64/block_out"
+   ],
+   "detail": "",
+   "id": "M06",
+   "file": "mla.rs",
+   "mutation": "carried key taken from kv_a_proj's head instead of its tail",
+   "expectation": "caught",
+   "caught": true,
+   "verdict": "CAUGHT",
+   "as_expected": true
+  },
+  {
+   "build": "ok",
+   "gate": "PANIC",
+   "detail": "thread 'main' (797357) panicked at src/models/k3/mla.rs:909:9:",
+   "id": "M07",
+   "file": "mla.rs",
+   "mutation": "query assembled carried-first while the key stays passed-first (a one-sided permutation)",
+   "expectation": "caught",
+   "caught": true,
+   "verdict": "CAUGHT",
+   "as_expected": true
+  },
+  {
+   "build": "ok",
+   "gate": "FAIL",
+   "n_failed": 20,
+   "failing": [
+    "f64/query_states",
+    "f64/attn_probs_precast",
+    "f64/attn_probs",
+    "f64/attn_out_heads",
+    "f64/o_proj_in",
+    "f64/block_out"
+   ],
+   "detail": "",
+   "id": "M08",
+   "file": "mla.rs",
+   "mutation": "THE HEADLINE MUTANT: a rotation applied to the carried lane of the query (rotate_half, the RoPE kernel)",
+   "expectation": "caught",
+   "caught": true,
+   "verdict": "CAUGHT",
+   "as_expected": true
+  },
+  {
+   "build": "ok",
+   "gate": "FAIL",
+   "n_failed": 7,
+   "failing": [
+    "f64/o_proj_in",
+    "f64/block_out",
+    "f32/o_proj_in",
+    "f32/block_out",
+    "tf/output_gate",
+    "tf/output_gate"
+   ],
+   "detail": "",
+   "id": "M09",
+   "file": "mla.rs",
+   "mutation": "the sigmoid output gate dropped entirely",
+   "expectation": "caught",
+   "caught": true,
+   "verdict": "CAUGHT",
+   "as_expected": true
+  },
+  {
+   "build": "ok",
+   "gate": "FAIL",
+   "n_failed": 7,
+   "failing": [
+    "f64/o_proj_in",
+    "f64/block_out",
+    "f32/o_proj_in",
+    "f32/block_out",
+    "tf/output_gate",
+    "tf/output_gate"
+   ],
+   "detail": "",
+   "id": "M10",
+   "file": "mla.rs",
+   "mutation": "the output gate applied without its sigmoid",
+   "expectation": "caught",
+   "caught": true,
+   "verdict": "CAUGHT",
+   "as_expected": true
+  },
+  {
+   "build": "ok",
+   "gate": "FAIL",
+   "n_failed": 20,
+   "failing": [
+    "f64/key_states",
+    "f64/attn_probs_precast",
+    "f64/attn_probs",
+    "f64/attn_out_heads",
+    "f64/o_proj_in",
+    "f64/block_out"
+   ],
+   "detail": "",
+   "id": "M11",
+   "file": "mla.rs",
+   "mutation": "carried key broadcast from token 0 to every token, not per token",
+   "expectation": "caught",
+   "caught": true,
+   "verdict": "CAUGHT",
+   "as_expected": true
+  },
+  {
+   "build": "ok",
+   "gate": "FAIL",
+   "n_failed": 18,
+   "failing": [
+    "f64/causal_mask",
+    "f64/attn_probs_precast",
+    "f64/attn_probs",
+    "f64/attn_out_heads",
+    "f64/o_proj_in",
+    "f64/block_out"
+   ],
+   "detail": "",
+   "id": "M12",
+   "file": "mla.rs",
+   "mutation": "causal mask off by one: every token may attend one step into the future",
+   "expectation": "caught",
+   "caught": true,
+   "verdict": "CAUGHT",
+   "as_expected": true
+  },
+  {
+   "build": "ok",
+   "gate": "FAIL",
+   "n_failed": 18,
+   "failing": [
+    "f64/causal_mask",
+    "f64/attn_probs_precast",
+    "f64/attn_probs",
+    "f64/attn_out_heads",
+    "f64/o_proj_in",
+    "f64/block_out"
+   ],
+   "detail": "",
+   "id": "M13",
+   "file": "mla.rs",
+   "mutation": "no causal mask at all: full bidirectional attention",
+   "expectation": "caught",
+   "caught": true,
+   "verdict": "CAUGHT",
+   "as_expected": true
+  },
+  {
+   "build": "ok",
+   "gate": "FAIL",
+   "n_failed": 19,
+   "failing": [
+    "f64/attn_probs_precast",
+    "f64/attn_probs",
+    "f64/attn_out_heads",
+    "f64/o_proj_in",
+    "f64/block_out",
+    "f64/swapped_halves_is_an_invariance"
+   ],
+   "detail": "",
+   "id": "M14",
+   "file": "mla.rs",
+   "mutation": "softmax over the query axis instead of the key axis",
+   "expectation": "caught",
+   "caught": true,
+   "verdict": "CAUGHT",
+   "as_expected": true
+  },
+  {
+   "build": "ok",
+   "gate": "PANIC",
+   "detail": "thread 'main' (812332) panicked at src/models/k3/mla.rs:700:17: | assertion `left == right` failed: g_proj output shape",
+   "id": "M15",
+   "file": "mla.rs",
+   "mutation": "probs*v left in [B,H,T,dv] so the flatten interleaves heads and tokens",
+   "expectation": "caught",
+   "caught": true,
+   "verdict": "CAUGHT",
+   "as_expected": true
+  },
+  {
+   "build": "ok",
+   "gate": "FAIL",
+   "n_failed": 3,
+   "failing": [
+    "tf/attend_probs",
+    "tf/attend_probs",
+    "tf/attend_probs"
+   ],
+   "detail": "",
+   "id": "M16",
+   "file": "mla.rs",
+   "mutation": "the softmax's cast back to the activation dtype skipped (fp32 island left open)",
+   "expectation": "caught",
+   "caught": true,
+   "verdict": "CAUGHT",
+   "as_expected": true
+  },
+  {
+   "build": "ok",
+   "gate": "FAIL",
+   "n_failed": 23,
+   "failing": [
+    "f64/kv_a_layernorm_out",
+    "f64/kv_b_proj_out",
+    "f64/key_states",
+    "f64/value_states",
+    "f64/attn_probs_precast",
+    "f64/attn_probs"
+   ],
+   "detail": "",
+   "id": "M17",
+   "file": "mla.rs",
+   "mutation": "kv_a_layernorm skipped: the raw latent fed to kv_b_proj",
+   "expectation": "caught",
+   "caught": true,
+   "verdict": "CAUGHT",
+   "as_expected": true
+  },
+  {
+   "build": "ok",
+   "gate": "PANIC",
+   "detail": "thread 'main' (816600) panicked at src/models/k3/mla.rs:909:9:",
+   "id": "M18",
+   "file": "mla.rs",
+   "mutation": "KV cache appends new tokens BEFORE the history",
+   "expectation": "caught",
+   "caught": true,
+   "verdict": "CAUGHT",
+   "as_expected": true
+  },
+  {
+   "build": "ok",
+   "gate": "FAIL",
+   "n_failed": 22,
+   "failing": [
+    "f64/q_b_proj_out",
+    "f64/query_states",
+    "f64/attn_probs_precast",
+    "f64/attn_probs",
+    "f64/attn_out_heads",
+    "f64/o_proj_in"
+   ],
+   "detail": "",
+   "id": "M19",
+   "file": "k3_mla_gate.rs",
+   "mutation": "q_b_proj loaded from the next MLA layer's shard (a plausible weight-map slip)",
+   "expectation": "caught",
+   "caught": true,
+   "verdict": "CAUGHT",
+   "as_expected": true
+  },
+  {
+   "build": "ok",
+   "gate": "FAIL",
+   "n_failed": 2,
+   "failing": [
+    "f64/block_out",
+    "f32/block_out"
+   ],
+   "detail": "",
+   "id": "M20",
+   "file": "k3_mla_gate.rs",
+   "mutation": "o_proj weights negated on load (the shipped-negated-weights failure mode)",
+   "expectation": "caught",
+   "caught": true,
+   "verdict": "CAUGHT",
+   "as_expected": true
+  },
+  {
+   "build": "ok",
+   "gate": "FAIL",
+   "n_failed": 59,
+   "failing": [
+    "tf/q_a_proj",
+    "tf/q_a_layernorm",
+    "tf/q_b_proj",
+    "tf/kv_a_proj",
+    "tf/kv_a_layernorm",
+    "tf/kv_b_proj"
+   ],
+   "detail": "",
+   "id": "G01",
+   "file": "mla.rs",
+   "mutation": "the port emits a single NaN element in every bfloat16 tensor \u2014 does the gate notice, or does a NaN score as zero error?",
+   "expectation": "caught",
+   "caught": true,
+   "verdict": "CAUGHT",
+   "as_expected": true
+  },
+  {
+   "build": "ok",
+   "gate": "PASS",
+   "n_failed": 0,
+   "failing": [],
+   "detail": "",
+   "id": "G02",
+   "file": "k3_mla_gate.rs",
+   "mutation": "GATE MUTANT: the NaN-propagating max written the obvious `fold(0.0, f64::max)` way, with G01's NaN in flight and the bit-agreement floor removed",
+   "expectation": "survives",
+   "caught": false,
+   "verdict": "SURVIVED",
+   "as_expected": true
+  },
+  {
+   "build": "ok",
+   "gate": "PANIC",
+   "detail": "thread 'main' (822886) panicked at src/bin/k3_mla_gate.rs:1526:5: | assertion `left == right` failed: f32 lane check count drifted",
+   "id": "G03",
+   "file": "k3_mla_gate.rs",
+   "mutation": "GATE MUTANT: a whole lane silently removed \u2014 does the check count notice?",
+   "expectation": "caught",
+   "caught": true,
+   "verdict": "CAUGHT",
+   "as_expected": true
+  },
+  {
+   "build": "ok",
+   "gate": "FAIL",
+   "n_failed": 1,
+   "failing": [
+    "control/rope_would_break_it"
+   ],
+   "detail": "",
+   "id": "G04",
+   "file": "k3_mla_gate.rs",
+   "mutation": "GATE MUTANT: the RoPE positive control made a no-op \u2014 the control must fail",
+   "expectation": "caught",
+   "caught": true,
+   "verdict": "CAUGHT",
+   "as_expected": true
+  },
+  {
+   "build": "ok",
+   "gate": "FAIL",
+   "n_failed": 1,
+   "failing": [
+    "setup/sha256_layer_oracle_prefix13_bf16.npz"
+   ],
+   "detail": "",
+   "id": "G05",
+   "file": "k3_mla_gate.rs",
+   "mutation": "GATE MUTANT: the oracle is not the pinned oracle",
+   "expectation": "caught",
+   "caught": true,
+   "verdict": "CAUGHT",
+   "as_expected": true
+  },
+  {
+   "build": "ok",
+   "gate": "FAIL",
+   "n_failed": 3,
+   "failing": [
+    "tf/assemble_query",
+    "tf/assemble_query",
+    "tf/assemble_query"
+   ],
+   "detail": "",
+   "id": "G06",
+   "file": "k3_mla_gate.rs",
+   "mutation": "a 1e-7 perturbation of an assembly that must be bit-exact",
+   "expectation": "caught",
+   "caught": true,
+   "verdict": "CAUGHT",
+   "as_expected": true
+  }
+ ],
+ "seconds": 2455.3
+}
