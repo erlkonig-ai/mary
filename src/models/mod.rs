@@ -38,3 +38,7 @@ pub mod voxtral;
 // no new dependencies.
 #[cfg(feature = "k3")]
 pub mod k3;
+// Kimi K3 (`kimi_linear`) — the MoE router so far. Behind `kimi-k3` so the
+// default build stays a pure library with no extra binaries.
+#[cfg(feature = "kimi-k3")]
+pub mod kimi_k3;

@@ -4,6 +4,7 @@
 //! the safetensors `WeightLoader`, `.npy` I/O, normalization primitives, and
 //! the 4-bit weight codecs (`q4` for mary-quantized weights, `mxfp4` for the
 //! microscaling format checkpoints ship in).
+//! the safetensors `WeightLoader`, `.npy`/`.npz` I/O, and normalization primitives.
 //! Model-specific layers live with their model under `mary::models`.
 
 #[cfg(all(any(feature = "qwen3tts", feature = "voxtral"), target_os = "macos"))]

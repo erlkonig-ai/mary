@@ -1,0 +1,290 @@
+=== UNMUTATED baseline ===
+  exit=0  ['GATE PASS — 374 checks, 0 failures']
+
+=== M01 combining weight taken from the BIASED score (the named trap) ===
+  exit=1 failures=24 panic=False -> CAUGHT (29s)
+    L01 route [f64 accum] weight per expert == captured              n     512  maxabs  3.500e-2  |ref|max  2.754e-1  rel  1.271e-1  tol  1.0e-6 FAIL
+    L01 route [f32 accum] weight per expert == captured              n     512  maxabs  3.500e-2  |ref|max  2.754e-1  rel  1.271e-1  tol  1.0e-6 FAIL
+    L02 route [f64 accum] weight per expert == captured              n     512  maxabs  5.568e-2  |ref|max  1.571e-1  rel  3.543e-1  tol  1.0e-6 FAIL
+    L02 route [f32 accum] weight per expert == captured              n     512  maxabs  5.567e-2  |ref|max  1.571e-1  rel  3.543e-1  tol  1.0e-6 FAIL
+
+=== M02 bias added to the LOGIT instead of the score ===
+  exit=1 failures=48 panic=False -> CAUGHT (30s)
+    L01 route [f64 accum] selection == captured topk_idx             0/32 tokens agree                                          FAIL
+    L01 route [f64 accum] weight per expert == captured              index sets differ; weights not comparable                  FAIL
+    L01 route [f32 accum] selection == captured topk_idx             0/32 tokens agree                                          FAIL
+    L01 route [f32 accum] weight per expert == captured              index sets differ; weights not comparable                  FAIL
+
+=== M03 correction bias dropped entirely ===
+  exit=1 failures=61 panic=False -> CAUGHT (30s)
+    L01 scores_for_choice = oracle scores + bias (EXACT)             n   28672  maxabs  8.447e-2  |ref|max  7.553e-1  rel  1.118e-1  tol   0.0e0 FAIL
+    L01 route [f64 accum] selection == captured topk_idx             0/32 tokens agree                                          FAIL
+    L01 route [f64 accum] weight per expert == captured              index sets differ; weights not comparable                  FAIL
+    L01 route [f32 accum] selection == captured topk_idx             0/32 tokens agree                                          FAIL
+
+=== M04 bias broadcast over the WRONG axis (per token, not per expert) ===
+  exit=1 failures=61 panic=False -> CAUGHT (32s)
+    L01 scores_for_choice = oracle scores + bias (EXACT)             n   28672  maxabs  1.045e-1  |ref|max  7.553e-1  rel  1.383e-1  tol   0.0e0 FAIL
+    L01 route [f64 accum] selection == captured topk_idx             0/32 tokens agree                                          FAIL
+    L01 route [f64 accum] weight per expert == captured              index sets differ; weights not comparable                  FAIL
+    L01 route [f32 accum] selection == captured topk_idx             0/32 tokens agree                                          FAIL
+
+=== M05 renormalize turned off in the shipping config ===
+  exit=1 failures=73 panic=False -> CAUGHT (30s)
+    config: moe_renormalize                                          checkpoint Some(true) vs port false                        FAIL
+    L01 normalize(oracle prerenorm) == captured topk_weight          n     512  maxabs  5.648e-1  |ref|max  2.754e-1  rel   2.051e0  tol  1.0e-6 FAIL
+    L01 route [f64 accum] weights finite, positive, sum to the factor the PORT's own weights, not the oracle's                   FAIL
+    L01 route [f64 accum] weight per expert == captured              n     512  maxabs  5.648e-1  |ref|max  2.754e-1  rel   2.051e0  tol  1.0e-6 FAIL
+
+=== M06 routed_scaling_factor 1.0 -> 2.0 ===
+  exit=1 failures=61 panic=False -> CAUGHT (31s)
+    config: routed_scaling_factor                                    checkpoint Some(1.0) vs port 2                             FAIL
+    L01 normalize(oracle prerenorm) == captured topk_weight          n     512  maxabs  2.754e-1  |ref|max  2.754e-1  rel   1.000e0  tol  1.0e-6 FAIL
+    L01 weights positive and sum to the scaling factor               all > 0, row sums within 1e-6 of 1.0                       FAIL
+    L01 route [f64 accum] weight per expert == captured              n     512  maxabs  2.754e-1  |ref|max  2.754e-1  rel   1.000e0  tol  1.0e-6 FAIL
+
+=== M07 top_k 16 -> 8 ===
+  exit=101 failures=13 panic=True -> CAUGHT (27s)
+    config: num_experts_per_token                                    checkpoint Some(16.0) vs port 8                            FAIL
+    L01 shapes: 896 experts / 16 active / 7168 hidden, from 3 sources logits [32, 896] idx [32, 16] gate_in [2, 16, 7168] W [896, 7168] FAIL
+    L02 shapes: 896 experts / 16 active / 7168 hidden, from 3 sources logits [32, 896] idx [32, 16] gate_in [2, 16, 7168] W [896, 7168] FAIL
+    L03 shapes: 896 experts / 16 active / 7168 hidden, from 3 sources logits [32, 896] idx [32, 16] gate_in [2, 16, 7168] W [896, 7168] FAIL
+    PANIC: note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+=== M08 num_experts 896 -> 895 ===
+  exit=101 failures=13 panic=True -> CAUGHT (28s)
+    config: num_experts                                              checkpoint Some(896.0) vs port 895                         FAIL
+    L01 shapes: 896 experts / 16 active / 7168 hidden, from 3 sources logits [32, 896] idx [32, 16] gate_in [2, 16, 7168] W [896, 7168] FAIL
+    L02 shapes: 896 experts / 16 active / 7168 hidden, from 3 sources logits [32, 896] idx [32, 16] gate_in [2, 16, 7168] W [896, 7168] FAIL
+    L03 shapes: 896 experts / 16 active / 7168 hidden, from 3 sources logits [32, 896] idx [32, 16] gate_in [2, 16, 7168] W [896, 7168] FAIL
+    PANIC: note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+=== M09 select takes the BOTTOM 16 (comparator reversed) ===
+  exit=1 failures=73 panic=False -> CAUGHT (29s)
+    L01 SELECTION from oracle sfc == captured topk_idx (as sets)     0/32 tokens agree                                          FAIL
+    L01 route [f64 accum] selection == captured topk_idx             0/32 tokens agree                                          FAIL
+    L01 route [f64 accum] weight per expert == captured              index sets differ; weights not comparable                  FAIL
+    L01 route [f32 accum] selection == captured topk_idx             0/32 tokens agree                                          FAIL
+
+=== M10 select off by one (ranks 2..17 instead of 1..16) ===
+  exit=1 failures=73 panic=False -> CAUGHT (32s)
+    L01 SELECTION from oracle sfc == captured topk_idx (as sets)     0/32 tokens agree                                          FAIL
+    L01 route [f64 accum] selection == captured topk_idx             0/32 tokens agree                                          FAIL
+    L01 route [f64 accum] weight per expert == captured              index sets differ; weights not comparable                  FAIL
+    L01 route [f32 accum] selection == captured topk_idx             0/32 tokens agree                                          FAIL
+
+=== M11 select emits the top expert 16 times (duplicates) ===
+  exit=1 failures=90 panic=False -> CAUGHT (31s)
+    L01 SELECTION from oracle sfc == captured topk_idx (as sets)     0/32 tokens agree                                          FAIL
+    L01 topk indices distinct, in range, exactly 16                  16 distinct experts < 896 per token                        FAIL
+    L01 route [f64 accum] selection == captured topk_idx             0/32 tokens agree                                          FAIL
+    L01 route [f64 accum] weight per expert == captured              index sets differ; weights not comparable                  FAIL
+
+=== M12 gather from expert e+1 (weights off by one expert) ===
+  exit=1 failures=60 panic=False -> CAUGHT (31s)
+    L01 prerenorm weight = oracle scores @ ORACLE idx (EXACT)        n     512  maxabs  6.564e-1  |ref|max  7.548e-1  rel  8.697e-1  tol   0.0e0 FAIL
+    L01 route [f64 accum] weight per expert == captured              n     512  maxabs  2.183e-1  |ref|max  2.754e-1  rel  7.928e-1  tol  1.0e-6 FAIL
+    L01 route [f32 accum] weight per expert == captured              n     512  maxabs  2.183e-1  |ref|max  2.754e-1  rel  7.928e-1  tol  1.0e-6 FAIL
+    L01 CONTROL bias-in-weight reproduces the stored ALT array       n     512  maxabs  2.065e-1  |ref|max  2.685e-1  rel  7.692e-1  tol  1.0e-6 FAIL
+
+=== M13 normalize divides by k instead of by the sum ===
+  exit=1 failures=72 panic=False -> CAUGHT (38s)
+    L01 normalize(oracle prerenorm) == captured topk_weight          n     512  maxabs  2.314e-1  |ref|max  2.754e-1  rel  8.404e-1  tol  1.0e-6 FAIL
+    L01 route [f64 accum] weights finite, positive, sum to the factor the PORT's own weights, not the oracle's                   FAIL
+    L01 route [f64 accum] weight per expert == captured              n     512  maxabs  2.314e-1  |ref|max  2.754e-1  rel  8.404e-1  tol  1.0e-6 FAIL
+    L01 route [f32 accum] weights finite, positive, sum to the factor the PORT's own weights, not the oracle's                   FAIL
+
+=== M14 the +1e-20 epsilon inflated to +1e-2 ===
+  exit=1 failures=72 panic=False -> CAUGHT (31s)
+    L01 normalize(oracle prerenorm) == captured topk_weight          n     512  maxabs  1.074e-3  |ref|max  2.754e-1  rel  3.901e-3  tol  1.0e-6 FAIL
+    L01 route [f64 accum] weights finite, positive, sum to the factor the PORT's own weights, not the oracle's                   FAIL
+    L01 route [f64 accum] weight per expert == captured              n     512  maxabs  1.074e-3  |ref|max  2.754e-1  rel  3.901e-3  tol  1.0e-6 FAIL
+    L01 route [f32 accum] weights finite, positive, sum to the factor the PORT's own weights, not the oracle's                   FAIL
+
+=== M15 logits read the NEXT expert's weight row ===
+  exit=1 failures=72 panic=False -> CAUGHT (30s)
+    L01 logits (f64 accum) vs oracle [pinned]                        n   28672  maxabs   3.597e0  |ref|max   3.952e0  rel  9.102e-1  tol  1.0e-5 FAIL
+    L01 logits (f32 accum) vs oracle [pinned]                        n   28672  maxabs   3.597e0  |ref|max   3.952e0  rel  9.102e-1  tol  1.0e-3 FAIL
+    L01 route [f64 accum] selection == captured topk_idx             0/32 tokens agree                                          FAIL
+    L01 route [f64 accum] weight per expert == captured              index sets differ; weights not comparable                  FAIL
+
+=== M16 f64 accumulation lane drops the multiply ===
+  exit=1 failures=36 panic=False -> CAUGHT (36s)
+    L01 logits (f64 accum) vs oracle [pinned]                        n   28672  maxabs   7.019e0  |ref|max   3.952e0  rel   1.776e0  tol  1.0e-5 FAIL
+    L01 route [f64 accum] selection == captured topk_idx             0/32 tokens agree                                          FAIL
+    L01 route [f64 accum] weight per expert == captured              index sets differ; weights not comparable                  FAIL
+    L02 logits (f64 accum) vs oracle [pinned]                        n   28672  maxabs   8.929e0  |ref|max   4.803e0  rel   1.859e0  tol  1.0e-5 FAIL
+
+=== M17 f32 accumulation lane drops the multiply ===
+  exit=1 failures=36 panic=False -> CAUGHT (34s)
+    L01 logits (f32 accum) vs oracle [pinned]                        n   28672  maxabs   7.019e0  |ref|max   3.952e0  rel   1.776e0  tol  1.0e-3 FAIL
+    L01 route [f32 accum] selection == captured topk_idx             0/32 tokens agree                                          FAIL
+    L01 route [f32 accum] weight per expert == captured              index sets differ; weights not comparable                  FAIL
+    L02 logits (f32 accum) vs oracle [pinned]                        n   28672  maxabs   8.929e0  |ref|max   4.803e0  rel   1.859e0  tol  1.0e-3 FAIL
+
+=== M18 sigmoid replaced by the identity ===
+  exit=1 failures=82 panic=False -> CAUGHT (32s)
+    L01 scores = sigmoid(oracle logits) [pinned]                     n   28672  maxabs   3.971e0  |ref|max  7.548e-1  rel   5.261e0  tol  1.2e-7 FAIL
+    L01 route [f64 accum] selection == captured topk_idx             0/32 tokens agree                                          FAIL
+    L01 route [f64 accum] weights finite, positive, sum to the factor the PORT's own weights, not the oracle's                   FAIL
+    L01 route [f64 accum] weight per expert == captured              index sets differ; weights not comparable                  FAIL
+
+=== M19 bf16 widening shifts by 8 instead of 16 ===
+  exit=1 failures=96 panic=False -> CAUGHT (39s)
+    L01 logits (f64 accum) vs oracle [pinned]                        n   28672  maxabs   3.952e0  |ref|max   3.952e0  rel   1.000e0  tol  1.0e-5 FAIL
+    L01 logits (f32 accum) vs oracle [pinned]                        n   28672  maxabs   3.952e0  |ref|max   3.952e0  rel   1.000e0  tol  1.0e-3 FAIL
+    L01 scores_for_choice = oracle scores + bias (EXACT)             n   28672  maxabs  8.447e-2  |ref|max  7.553e-1  rel  1.118e-1  tol   0.0e0 FAIL
+    L01 route [f64 accum] selection == captured topk_idx             0/32 tokens agree                                          FAIL
+
+=== M20 grouped-routing refusal removed (silently routes as if ungrouped) ===
+  exit=1 failures=1 panic=False -> CAUGHT (34s)
+    port: the grouped-routing branch is refused, not faked           num_expert_group=8/topk_group=4 rejected; shipping config accepted FAIL
+
+=== M21 NaN injected into Router::normalize's output ===
+  exit=1 failures=96 panic=False -> CAUGHT (32s)
+    L01 normalize(oracle prerenorm) == captured topk_weight          n     512  maxabs  2.980e-8  |ref|max  2.754e-1  rel  1.082e-7  tol  1.0e-6  NON-FINI
+    L01 route [f64 accum] weights finite, positive, sum to the factor the PORT's own weights, not the oracle's                   FAIL
+    L01 route [f64 accum] weight per expert == captured              n     512  maxabs  1.639e-7  |ref|max  2.754e-1  rel  5.953e-7  tol  1.0e-6  NON-FINI
+    L01 route [f32 accum] weights finite, positive, sum to the factor the PORT's own weights, not the oracle's                   FAIL
+
+=== M22 same NaN + the comparator relaxed to `d > maxabs` ===
+  exit=1 failures=96 panic=False -> CAUGHT (35s)
+    L01 normalize(oracle prerenorm) == captured topk_weight          n     512  maxabs  2.980e-8  |ref|max  2.754e-1  rel  1.082e-7  tol  1.0e-6  NON-FINI
+    L01 route [f64 accum] weights finite, positive, sum to the factor the PORT's own weights, not the oracle's                   FAIL
+    L01 route [f64 accum] weight per expert == captured              n     512  maxabs  1.639e-7  |ref|max  2.754e-1  rel  5.953e-7  tol  1.0e-6  NON-FINI
+    L01 route [f32 accum] weights finite, positive, sum to the factor the PORT's own weights, not the oracle's                   FAIL
+
+=== M37 same NaN + the non-finite counter neutered ===
+  exit=1 failures=24 panic=False -> CAUGHT (37s)
+    L01 route [f64 accum] weights finite, positive, sum to the factor the PORT's own weights, not the oracle's                   FAIL
+    L01 route [f32 accum] weights finite, positive, sum to the factor the PORT's own weights, not the oracle's                   FAIL
+    L02 route [f64 accum] weights finite, positive, sum to the factor the PORT's own weights, not the oracle's                   FAIL
+    L02 route [f32 accum] weights finite, positive, sum to the factor the PORT's own weights, not the oracle's                   FAIL
+
+=== M38 same NaN + counter neutered + port-weight sanity check neutered ===
+  exit=0 failures=0 panic=False -> SURVIVED (32s)
+
+=== M23 LAYERS shortened to [1] (a lane silently dropped) ===
+  exit=1 failures=2 panic=False -> CAUGHT (30s)
+    manifest: one entry per exported array                           manifest 36 entries, npz 36 arrays, expected 3             FAIL
+    f32-vs-bf16 bias: the divergence count is the pinned one         1 of 32 token selections change (pinned 6)                 FAIL
+
+=== M24 the per-layer loop skipped entirely (a fold over nothing is vacuous) ===
+  exit=1 failures=2 panic=False -> CAUGHT (31s)
+    totality: every MoE layer in the prefix was gated                gated [], expected [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] FAIL
+    f32-vs-bf16 bias: the divergence count is the pinned one         0 of 384 token selections change (pinned 6)                FAIL
+
+=== M25 tie-margin measured as (17th - 16th), i.e. negative ===
+  exit=1 failures=12 panic=False -> CAUGHT (34s)
+    L01 selection is well-determined (16th > 17th sfc, strictly)     min margin -4.212216e-3                                    FAIL
+    L02 selection is well-determined (16th > 17th sfc, strictly)     min margin -2.345502e-3                                    FAIL
+    L03 selection is well-determined (16th > 17th sfc, strictly)     min margin -8.816928e-3                                    FAIL
+    L04 selection is well-determined (16th > 17th sfc, strictly)     min margin -6.268963e-3                                    FAIL
+
+=== M26 the bias-in-weight CONTROL rebuilt from the unbiased scores ===
+  exit=1 failures=24 panic=False -> CAUGHT (36s)
+    L01 CONTROL bias-in-weight reproduces the stored ALT array       n     512  maxabs  3.500e-2  |ref|max  2.685e-1  rel  1.304e-1  tol  1.0e-6 FAIL
+    L01 CONTROL bias-in-weight MISSES the true topk_weight           n     512  maxabs  2.980e-8  |ref|max  2.754e-1  required min  1.0e-3 FAIL
+    L02 CONTROL bias-in-weight reproduces the stored ALT array       n     512  maxabs  5.568e-2  |ref|max  1.646e-1  rel  3.383e-1  tol  1.0e-6 FAIL
+    L02 CONTROL bias-in-weight MISSES the true topk_weight           n     512  maxabs  1.490e-8  |ref|max  1.571e-1  required min  1.0e-3 FAIL
+
+=== M27 the bias-on-logits CONTROL uses half the bias ===
+  exit=1 failures=12 panic=False -> CAUGHT (37s)
+    L01 CONTROL bias-on-logits reproduces the stored ALT idx         15/32 tokens agree                                         FAIL
+    L02 CONTROL bias-on-logits reproduces the stored ALT idx         14/32 tokens agree                                         FAIL
+    L03 CONTROL bias-on-logits reproduces the stored ALT idx         10/32 tokens agree                                         FAIL
+    L04 CONTROL bias-on-logits reproduces the stored ALT idx         16/32 tokens agree                                         FAIL
+
+=== M28 the 'bias changes the chosen experts' check fed the BIASED scores ===
+  exit=1 failures=12 panic=False -> CAUGHT (33s)
+    L01 the correction bias CHANGES the chosen experts               dropping the bias reroutes 0/32 tokens, 0 expert swaps     FAIL
+    L02 the correction bias CHANGES the chosen experts               dropping the bias reroutes 0/32 tokens, 0 expert swaps     FAIL
+    L03 the correction bias CHANGES the chosen experts               dropping the bias reroutes 0/32 tokens, 0 expert swaps     FAIL
+    L04 the correction bias CHANGES the chosen experts               dropping the bias reroutes 0/32 tokens, 0 expert swaps     FAIL
+
+=== M29 set_equal_rows made vacuous AND select takes the bottom 16 ===
+  exit=1 failures=49 panic=False -> CAUGHT (30s)
+    L01 route [f64 accum] weight per expert == captured              index sets differ; weights not comparable                  FAIL
+    L01 route [f32 accum] weight per expert == captured              index sets differ; weights not comparable                  FAIL
+    L01 CONTROL bias-on-logits reroutes; count matches the oracle's  32/32 tokens keep the same set (oracle counted 0)          FAIL
+    L01 the correction bias CHANGES the chosen experts               dropping the bias reroutes 0/32 tokens, 512 expert swaps   FAIL
+
+=== M30 layer 5 gate weights NEGATED in the exported npz ===
+  exit=1 failures=7 panic=False -> CAUGHT
+    artifact L05_gate_weight_bf16bits                                sha256 ef7c9d56299367c7… shape [896, 7168]                 FAIL
+    L05 logits (f64 accum) vs oracle [pinned]                        n   28672  maxabs   1.116e1  |ref|max   5.581e0  rel   2.000e0  tol  1.0e-5 FAIL
+    L05 logits (f32 accum) vs oracle [pinned]                        n   28672  maxabs   1.116e1  |ref|max   5.581e0  rel   2.000e0  tol  1.0e-3 FAIL
+    L05 route [f64 accum] selection == captured topk_idx             0/32 tokens agree                                          FAIL
+
+=== M31 an exported array truncated to length 0 ===
+  exit=101 failures=0 panic=True -> CAUGHT
+    PANIC: note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+=== M32 the manifest's sha256 for one array falsified ===
+  exit=1 failures=1 panic=False -> CAUGHT
+    artifact L07_gate_weight_bf16bits                                sha256 3f439c23cfdb52f6… shape [896, 7168]                 FAIL
+
+=== M33 the f32 bias replaced by its own bf16 rounding ===
+  exit=1 failures=2 panic=False -> CAUGHT
+    L12 f32-vs-bf16 bias divergence measured (not asserted equal)    max|f32-bf16| 0.000e0; 0/32 token selections change        FAIL
+    f32-vs-bf16 bias: the divergence count is the pinned one         2 of 384 token selections change (pinned 6)                FAIL
+
+=== M34 one bf16 bias value moved by 1 ulp ===
+  exit=1 failures=2 panic=False -> CAUGHT
+    L09 exported bias == oracle-captured bias (bit-for-bit)          896 values, 1 differ                                       FAIL
+    L09 scores_for_choice = oracle scores + bias (EXACT)             n   28672  maxabs  6.104e-5  |ref|max  9.177e-1  rel  6.651e-5  tol   0.0e0 FAIL
+
+=== M35 an exported array missing entirely ===
+  exit=101 failures=1 panic=True -> CAUGHT
+    manifest: one entry per exported array                           manifest 35 entries, npz 35 arrays, expected 36            FAIL
+    PANIC: note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+=== M36 the vectors directory does not exist ===
+  exit=1 -> CAUGHT: GATE FAIL — cannot open layer_oracle_prefix13_bf16.npz: No such file or directory (os error 2)
+
+=== reverted: exit=0 ['GATE PASS — 374 checks, 0 failures'] ===
+
+==============================================================================================================
+mutant                                                             targets                                      verdict
+UNMUTATED                                                          -                                            PASS (0)
+M01 combining weight taken from the BIASED score (the named trap)  route: weight per expert                     CAUGHT (24)
+M02 bias added to the LOGIT instead of the score                   route: selection + weight                    CAUGHT (48)
+M03 correction bias dropped entirely                               scores_for_choice EXACT                      CAUGHT (61)
+M04 bias broadcast over the WRONG axis (per token, not per expert) scores_for_choice EXACT                      CAUGHT (61)
+M05 renormalize turned off in the shipping config                  config + weights                             CAUGHT (73)
+M06 routed_scaling_factor 1.0 -> 2.0                               config + weights                             CAUGHT (61)
+M07 top_k 16 -> 8                                                  config + shapes                              CAUGHT (14)
+M08 num_experts 896 -> 895                                         config + shapes                              CAUGHT (14)
+M09 select takes the BOTTOM 16 (comparator reversed)               SELECTION                                    CAUGHT (73)
+M10 select off by one (ranks 2..17 instead of 1..16)               SELECTION                                    CAUGHT (73)
+M11 select emits the top expert 16 times (duplicates)              idx well-formed                              CAUGHT (90)
+M12 gather from expert e+1 (weights off by one expert)             prerenorm EXACT                              CAUGHT (60)
+M13 normalize divides by k instead of by the sum                   normalize                                    CAUGHT (72)
+M14 the +1e-20 epsilon inflated to +1e-2                           normalize                                    CAUGHT (72)
+M15 logits read the NEXT expert's weight row                       logits                                       CAUGHT (72)
+M16 f64 accumulation lane drops the multiply                       logits f64                                   CAUGHT (36)
+M17 f32 accumulation lane drops the multiply                       logits f32                                   CAUGHT (36)
+M18 sigmoid replaced by the identity                               scores                                       CAUGHT (82)
+M19 bf16 widening shifts by 8 instead of 16                        logits (artifact hash cannot see this)       CAUGHT (96)
+M20 grouped-routing refusal removed (silently routes as if ungrouped) port: grouped branch refused                 CAUGHT (1)
+M21 NaN injected into Router::normalize's output                   non-finite counter + port-weight sanity      CAUGHT (96)
+M22 same NaN + the comparator relaxed to `d > maxabs`              non-finite counter (the comparator alone never held it) CAUGHT (96)
+M37 same NaN + the non-finite counter neutered                     port-weight sanity check alone               CAUGHT (24)
+M38 same NaN + counter neutered + port-weight sanity check neutered EXPECTED SURVIVOR — names exactly what stands between a NaN and a green gate SURVIVED (0)
+M23 LAYERS shortened to [1] (a lane silently dropped)              totality + check-count floor                 CAUGHT (2)
+M24 the per-layer loop skipped entirely (a fold over nothing is vacuous) totality + check-count floor                 CAUGHT (2)
+M25 tie-margin measured as (17th - 16th), i.e. negative            selection well-determined                    CAUGHT (12)
+M26 the bias-in-weight CONTROL rebuilt from the unbiased scores    CONTROL reproduces ALT / misses truth        CAUGHT (24)
+M27 the bias-on-logits CONTROL uses half the bias                  CONTROL reproduces ALT idx                   CAUGHT (12)
+M28 the 'bias changes the chosen experts' check fed the BIASED scores bias CHANGES chosen experts                  CAUGHT (12)
+M29 set_equal_rows made vacuous AND select takes the bottom 16     defense in depth: weight pairing must still catch it CAUGHT (49)
+M30 layer 5 gate weights NEGATED in the exported npz               artifact sha256 + logits                     CAUGHT (7)
+M31 an exported array truncated to length 0                        EMPTY assert / premise shapes                CAUGHT (1)
+M32 the manifest's sha256 for one array falsified                  artifact sha256                              CAUGHT (1)
+M33 the f32 bias replaced by its own bf16 rounding                 pinned f32-vs-bf16 divergence count          CAUGHT (2)
+M34 one bf16 bias value moved by 1 ulp                             artifact sha256 + oracle-bias equality       CAUGHT (2)
+M35 an exported array missing entirely                             manifest count / npz lookup                  CAUGHT (2)
+M36 the vectors directory does not exist                           absent file                                  CAUGHT (1)
+
+38 mutants, 37 caught, 1 survived
+  SURVIVOR: M38 same NaN + counter neutered + port-weight sanity check neutered
