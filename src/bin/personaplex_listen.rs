@@ -17,11 +17,19 @@
 //! GREEDY on purpose: with sampling off, two runs differ ONLY by the weight
 //! format. Any audible difference is quantisation, not a different draw.
 //!
-//! USER AUDIO IS REQUIRED, and this is not a detail. PersonaPlex is
-//! full-duplex: prompt it and then feed silence, and the agent correctly says
-//! NOTHING — it is waiting for someone to speak. A first run that fed SILENCE
-//! produced rms 0.0002 (-74 dB), which is the model behaving properly, not a
-//! bug. So we Mimi-encode a real WAV as the user turn and let the agent reply.
+//! USER AUDIO IS REQUIRED, and so is STOPPING IT. PersonaPlex is full-duplex,
+//! which cuts both ways. Feed it nothing and the agent correctly says NOTHING —
+//! a first run that fed pure SILENCE produced rms 0.0002 (-74 dB), the model
+//! behaving properly, not a bug. But feed it a CONTINUOUS user turn for the
+//! whole window and it does the other correct thing: it yields the floor,
+//! speaking only in short interjections and falling quiet again whenever the
+//! user is still going. That produces audio that breaks off after a couple of
+//! seconds and resumes later — which is good conversational behaviour and a
+//! USELESS quantisation comparison, because the agent barely speaks.
+//!
+//! So the user turn is deliberately SHORT: `user_frames` of real speech, then
+//! silence for the rest, which hands the agent the floor and gets a continuous
+//! reply worth listening to.
 //!
 //!   personaplex_listen <fmt> <out.wav> [frames] [user.wav] [pile] [voice.pt]
 //!     fmt    f16 | q8 | q4
@@ -124,13 +132,23 @@ fn main() {
     if samples.len() < need { samples.resize(need, 0.0); }
     samples.truncate(need);
     let user_codes = pipe.encoder.encode(&samples);
-    println!("user   : {} frames Mimi-encoded", user_codes.len());
+    // Hand the floor over after a short turn. Without this the model keeps
+    // deferring to a user who never stops talking.
+    let user_frames: usize = std::env::var("PERSONAPLEX_USER_FRAMES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or((frames / 3).clamp(1, 40));
+    println!(
+        "user   : {} frames Mimi-encoded, speaking for {user_frames} ({:.1}s) then yielding",
+        user_codes.len(),
+        user_frames as f64 / 12.5
+    );
 
     let t1 = Instant::now();
     let mut agent: Vec<[u32; mimi_cfg::NUM_CODEBOOKS]> = Vec::with_capacity(frames);
     let mut skipped = 0usize;
     for f in 0..frames {
-        let c: [i64; 8] = match user_codes.get(f) {
+        let c: [i64; 8] = match user_codes.get(f).filter(|_| f < user_frames) {
             Some(u) => std::array::from_fn(|q| u[q] as i64),
             None => SILENCE,
         };
