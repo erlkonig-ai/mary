@@ -564,6 +564,15 @@ required-features = ["kimi-k3"]
 
 # MXFP4 decode + MXFP4 -> NVFP4 transcode gate: bit-exactness against the
 # k3oracle reference decode of real Kimi-K3 expert bytes.
+# The latent MoE block against the whole-layer oracle: the router, the latent
+# bottleneck, one expert in isolation, the 16-of-896 combination over the real
+# expert set, and the shared experts. Reads the checkpoint directly (safetensors
+# headers are parsed in the gate, so no `import` feature) and decodes the routed
+# experts with mary::nn::mxfp4, hence `mxfp4`; `k3` supplies the config.
+[[bin]]
+name = "k3_moe_gate"
+required-features = ["kimi-k3", "k3", "mxfp4"]
+
 [[bin]]
 name = "mxfp4_gate"
 required-features = ["mxfp4"]
