@@ -193,6 +193,12 @@ required-features = ["import"]
 [[bin]]
 name = "k3_layout_gate"
 required-features = ["k3", "import"]
+# KDA parity gate: mary::models::kimi_k3::kda against the flash-linear-attention
+# oracle vectors (Triton kernels + fla's own float64 references). Reads .npz
+# only — no checkpoint, no safetensors — so it does not ride `dev-tools`.
+[[bin]]
+name = "kimi_kda_gate"
+required-features = ["kimi-k3"]
 
 # Hand-run dev probes / parity gates (f5-only deps) — kept out of the default
 # (library-only) build behind `dev-tools`.
