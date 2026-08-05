@@ -40,6 +40,12 @@ clap = { version = "4", features = ["derive"], optional = true }
 # hf-hub auto-downloads models from the HuggingFace hub for `mary import`
 # (sync/ureq client, no async runtime needed). Import-only.
 hf-hub = { version = "0.3", optional = true }
+# Kimi-K3's tiktoken pre-tokenizer (mary::tiktoken). fancy-regex, not regex:
+# the shipped `pat_str` ends in `\s+(?!\S)`, a negative lookahead the `regex`
+# crate rejects outright — and fancy-regex is the engine `tiktoken` itself runs
+# the pattern on, so the pre-tokenizer is identical by construction. Pure Rust,
+# no C deps. Behind `k3tok`; the default build stays light.
+fancy-regex = { version = "0.14", optional = true }
 half = { version = "2", features = ["zerocopy"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -124,6 +130,10 @@ voxtral = ["dep:burn-fusion", "dep:burn-cubecl", "dep:memmap2"]
 # runtime path, the `tokenizers` crate is just the executor (as Burn is for
 # weights).
 tokenizer = ["dep:tokenizers"]
+# Kimi-K3's tiktoken byte-level BPE (mary::tiktoken + tokenizer::save_tiktoken)
+# — a pure-Rust port of the shipped `tokenization_kimi.py`, gated id-for-id
+# against it by the `k3_tokenizer_gate` binary. Only dep is fancy-regex.
+k3tok = ["dep:fancy-regex"]
 # CLIP ViT-B/32 multi-modal embedder (mary::embed) — image+text into one
 # contrastive space behind LocalEmbedder. Needs image decode + tokenizers;
 # light enough to stay out of the default build. Embedders load from a
@@ -169,6 +179,14 @@ dev-tools = ["import"]
 [[bin]]
 name = "mary"
 required-features = ["import"]
+
+# The Kimi-K3 tokenizer gate: ingest tiktoken.model into a tokenizer graph, read
+# the tokenizer back OUT of that graph, and require every id sequence to equal
+# the shipped Python's (golden/capture_k3_tokenizer.py). Run it with
+# `--mutate <name>` to check the gate can still fail.
+[[bin]]
+name = "k3_tokenizer_gate"
+required-features = ["k3tok"]
 
 # Hand-run dev probes / parity gates (f5-only deps) — kept out of the default
 # (library-only) build behind `dev-tools`.

@@ -16,6 +16,12 @@ pub mod format;
 /// merges, and added-tokens as tribles so the tokenizer travels with the pile
 /// instead of as a HuggingFace-cache `tokenizer.json` side-file.
 pub mod tokenizer;
+/// tiktoken-style byte-level BPE (Kimi-K3): the rank table IS the merge order,
+/// so there is no merges list — the engine half of what [`tokenizer`]'s
+/// `ty::TIKTOKEN` stores as facts. Gated id-for-id against the shipped
+/// `tokenization_kimi.py` by the `k3_tokenizer_gate` binary.
+#[cfg(feature = "k3tok")]
+pub mod tiktoken;
 /// A generic, modality-blind ML dataset / sample-management schema on
 /// TribleSpace: Dataset snapshots, multimodal Samples, TrainingRuns, and
 /// Preferences. Domain-free — it knows nothing about any one dataset's labels.
