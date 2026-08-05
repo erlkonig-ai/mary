@@ -71,9 +71,13 @@ fn shard_entries(path: &Path) -> std::io::Result<(u64, Vec<(String, u64, u64)>)>
 }
 
 fn main() {
+    // Positional > environment > relative. No absolute path into anyone's home
+    // directory: those leak the machine's layout into a public repository and
+    // break for every other operator. K3_MODEL_DIR is the knob.
     let dir = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "./kimi-k3".into());
+        .or_else(|| std::env::var("K3_MODEL_DIR").ok())
+        .unwrap_or_else(|| "models/kimi-k3".into());
     let dir = PathBuf::from(dir);
 
     let t0 = Instant::now();
