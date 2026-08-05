@@ -1,4 +1,4 @@
-//! `k3_moe_gate` — the correctness gate for [`mary::models::kimi_k3::moe`].
+//! `k3_moe_gate` — the correctness gate for [`mary::models::k3::moe`].
 //!
 //! The oracle is the **whole-layer** capture: a real 13-layer prefix of Kimi K3
 //! driven on real token ids through the shipped `KimiLinearModel.forward`, with
@@ -55,7 +55,7 @@
 use burn::backend::NdArray;
 use burn::prelude::*;
 use mary::models::k3::{K3Config, K3TextConfig};
-use mary::models::kimi_k3::moe::{
+use mary::models::k3::moe::{
     ActRound, ExpertWeights, LatentMoe, LatentMoeWeights, MoeDims, RouterWeights, Routing,
     SharedExpertWeights,
 };
@@ -835,7 +835,7 @@ fn main() {
     );
     let fast = std::env::var("K3MOE_FAST").is_ok();
 
-    println!("k3_moe_gate — mary::models::kimi_k3::moe against the whole-layer oracle");
+    println!("k3_moe_gate — mary::models::k3::moe against the whole-layer oracle");
     println!("  oracle: {}", oracle_dir.display());
     println!("  model:  {}", model_dir.display());
     if fast {
@@ -928,8 +928,8 @@ fn main() {
     let dims = MoeDims::from_text_config(&cfg.text_config).expect("MoeDims from the real config");
     r.boolean(
         "C1",
-        "MoeDims::from_text_config(real config) == the hard-coded MoeDims::kimi_k3()",
-        dims == MoeDims::kimi_k3(),
+        "MoeDims::from_text_config(real config) == the hard-coded MoeDims::k3()",
+        dims == MoeDims::k3(),
         format!("{dims:?}"),
     );
     {

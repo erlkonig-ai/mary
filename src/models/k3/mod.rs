@@ -26,13 +26,42 @@
 //! See [`config`] for the layer-index base trap, [`layout`] for how the name
 //! mapping is checked in both directions, and [`attn_res`] for the depth-axis
 //! mixture and the snapshot boundary that resets it.
+//!
+//! Ported operators, each landed with its own gate against vectors captured
+//! from the shipped `modeling_kimi_linear.py`:
+//!
+//! * [`situ`] — the soft-clipped gated activation every MLP and expert uses.
+//! * [`kda`] — the decay gate, the gated delta-rule recurrence, the four-tap
+//!   short convolutions and the output gate.
+//! * [`mla`] — the NoPE full-attention block.
+//! * [`attn_res`] — the depth-axis mixture and its snapshot boundary.
+//! * [`router`] — the `noaux_tc` sigmoid gate with its trained
+//!   `e_score_correction_bias`.
+//! * [`moe`] — the latent MoE block: 3584-wide bottleneck, 16 of 896 routed
+//!   MXFP4 experts, 2 always-on shared experts.
+//! * [`layer`] — the whole decoder layer: all of the above composed, gated end
+//!   to end and at every sub-block boundary against the whole-layer oracle.
 
 pub mod attn_res;
+pub mod ckpt;
 pub mod config;
+pub mod kda;
+pub mod layer;
+pub mod kda_attn;
 pub mod layout;
 pub mod mla;
+pub mod moe;
+pub mod ops;
+pub mod router;
+pub mod situ;
 
 pub use attn_res::{AttnResMix, AttnResParams, DepthMixer, LayerEntry};
+pub use ckpt::Ckpt;
 pub use config::{AttnKind, K3Config, K3TextConfig, K3VisionConfig, LinearAttnConfig};
 pub use layout::{describe, for_each_slot, Dtype, Shape, Slot, TensorSlot};
 pub use mla::{MlaBlock, MlaConfig, MlaKvCache, MlaTrace, MlaWeights, Precision};
+pub use kda_attn::{KdaAttnConfig, KdaAttnWeights, KdaAttention, KdaCache, KdaTrace};
+pub use layer::{K3Attn, K3AttnCache, K3DecoderLayer, K3Ffn, K3LayerTrace};
+pub use moe::{LatentMoe, MoeDims};
+pub use ops::{linear, rms_norm, ActRound};
+pub use situ::{Situ, K3_BETA, K3_LINEAR_BETA};

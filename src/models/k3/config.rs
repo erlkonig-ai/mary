@@ -14,7 +14,7 @@
 //! layers — a model that still runs and still emits fluent garbage. The evidence
 //! that the attention lists are 1-based, all three independent:
 //!
-//! 1. `configuration_kimi_k3.py::KimiLinearConfig::is_kda_layer` reads
+//! 1. `configuration_k3.py::KimiLinearConfig::is_kda_layer` reads
 //!    `(layer_idx + 1) in self.linear_attn_config["kda_layers"]`, and its caller
 //!    (`modeling_kimi_linear.py::KimiDecoderLayer`) is constructed from
 //!    `range(config.num_hidden_layers)`, i.e. 0-based.

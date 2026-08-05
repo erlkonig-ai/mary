@@ -1,4 +1,4 @@
-//! Parity gate for [`mary::models::kimi_k3::kda`] against the
+//! Parity gate for [`mary::models::k3::kda`] against the
 //! `flash-linear-attention` oracle vectors.
 //!
 //! The oracle (`./k3-oracle`) is **executed third-party code**,
@@ -37,7 +37,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use mary::models::kimi_k3::kda::{
+use mary::models::k3::kda::{
     decay_gate, l2_normalize, rms_norm_gated, sigmoid, Elem, Kda, KdaConfig, KdaParams,
     KdaScratch, KdaState, KdaToken, ShortConv, ShortConvState,
 };
@@ -283,9 +283,9 @@ fn arr<E: Elem>(a: &NpyArray) -> Vec<E> {
 /// this model.
 /// Check the SHIPPING config against the checkpoint's own `config.json`.
 ///
-/// `KdaConfig::kimi_k3()` had exactly one occurrence in the tree — its own
+/// `KdaConfig::k3()` had exactly one occurrence in the tree — its own
 /// definition. Every check ran a 4-head `case_cfg()`, so `96` appeared nowhere
-/// and corrupting `kimi_k3()` to `num_heads: 7, head_k_dim: 3, conv_kernel: 9,
+/// and corrupting `k3()` to `num_heads: 7, head_k_dim: 3, conv_kernel: 9,
 /// gate_lower_bound: None` still yielded 72/72 and exit 0. The gate proved the
 /// algorithm and never touched the configuration the model will actually run
 /// with.
@@ -312,7 +312,7 @@ fn check_shipping_config(r: &mut Report, config_json: &std::path::Path) {
     let field = |name: &str| -> Option<f64> {
         regex_lite_find(&raw, name)
     };
-    let cfg = mary::models::kimi_k3::kda::KdaConfig::kimi_k3();
+    let cfg = mary::models::k3::kda::KdaConfig::k3();
 
     let checks: [(&str, Option<f64>, f64); 4] = [
         ("num_heads", field("\"num_heads\""), cfg.num_heads as f64),
@@ -325,7 +325,7 @@ fn check_shipping_config(r: &mut Report, config_json: &std::path::Path) {
             Some(v) => r.expect_true(
                 &format!("shipping config: {name}"),
                 (v - mine).abs() < 1e-9,
-                &format!("config.json {v} vs KdaConfig::kimi_k3() {mine}"),
+                &format!("config.json {v} vs KdaConfig::k3() {mine}"),
             ),
             None => r.expect_true(
                 &format!("shipping config: {name}"),

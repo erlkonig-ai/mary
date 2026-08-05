@@ -84,25 +84,19 @@ cuda-backend = ["q4", "cubecl?/cuda"]
 # Currently the loading skeleton only: config parsing plus the checkpoint
 # name->module-slot layout. serde/serde_json are unconditional deps, so this
 # feature adds nothing to the dependency graph; it only gates compilation.
-k3 = []
-# Kimi-K3 MLA (mary::models::k3::mla) - the NoPE full-attention block, and the
-# parity gate that holds it to the shipped module. The block itself needs
-# nothing beyond burn; the gate needs a safetensors reader + mmap (it streams
-# the eight MLA weights straight out of the 17 GB shards), sha2 (the oracle
-# .npz bundles are pinned by hash), and burn-ndarray for the CPU f32/f64
-# reference lanes - float64 is the only width in which a wrong RMSNorm epsilon
-# is visible at all.
-k3-mla = ["k3", "dep:safetensors", "dep:memmap2", "dep:sha2", "dep:burn-ndarray"]
-# AttnRes (mary::models::k3::attn_res) - the depth-axis mixture and the
-# snapshot boundary that resets it, in Burn. The module itself needs nothing
-# new; this feature exists for `k3_attn_res_gate`, which wants burn-ndarray for
-# a deterministic CPU arithmetic that is not the GPU's, and `import` for a
-# safetensors reader (the gate takes the AttnRes weights from the checkpoint
-# itself, not from the oracle).
-k3-attn-res = ["k3", "import", "burn/ndarray", "dep:burn-ndarray"]
-# ...and the GB10/sm_121 lane on top, so the primitive is also checked on the
+# Kimi-K3 (mary::models::k3) - the 2.78 T-param hybrid-attention MoE: config,
+# checkpoint name->module-slot layout, the ported operators (SiTU, KDA, MLA,
+# AttnRes, the noaux_tc router, the latent MoE block) and the whole decoder
+# layer that composes them, plus every gate that holds them to the shipped
+# module. One feature, because the pieces only mean anything together: the
+# layer gate streams its weights out of the 17 GB shards (safetensors + mmap),
+# pins its oracle .npz bundles by hash (sha2), and runs a deterministic CPU
+# reference lane that is not the GPU's (burn-ndarray) - float64 is the only
+# width in which a wrong RMSNorm epsilon is visible at all.
+k3 = ["import", "mxfp4", "burn/ndarray", "dep:safetensors", "dep:memmap2", "dep:sha2", "dep:burn-ndarray"]
+# ...and the GB10/sm_121 lane on top, so the layer is also checked on the
 # backend it will actually run on here. Needs the CUDA toolkit present.
-k3-attn-res-cuda = ["k3-attn-res", "burn/cuda"]
+k3-cuda = ["k3", "burn/cuda"]
 # Safetensors → pile IMPORT support. The ONLY feature that compiles a
 # safetensors reader (`WeightLoader::SingleFile`/`MultiShard`,
 # `ingest::save_safetensors`, `persist::persist_safetensors_to_pile`, the
@@ -196,14 +190,6 @@ local-model = ["gemma"]
 # The probes compare against safetensors oracles, so this pulls `import`.
 dev-tools = ["import"]
 
-# Kimi K3 primitive gates (`kimi_situ_gate`, ...). The `mary::models::kimi_k3`
-# module itself is unconditional -- pure Burn tensor ops, no new dependency --
-# so this feature exists only for the gates: burn-ndarray gives the oracle
-# comparison one deterministic CPU arithmetic that is not the GPU's.
-kimi-k3 = ["burn/ndarray", "dep:burn-ndarray"]
-# ... and the GB10/sm_121 lane on top, so a primitive is also checked on the
-# backend it will actually run on here. Needs the CUDA toolkit present.
-kimi-k3-cuda = ["kimi-k3", "burn/cuda"]
 # Kimi K3 (mary::models::kimi_k3). Dep-free at the model layer — the router
 # is pure Rust over slices, no burn backend and no safetensors: the gate
 # projection is an 896x7168 f32 matmul whose *reduction order* is load-bearing
@@ -211,7 +197,6 @@ kimi-k3-cuda = ["kimi-k3", "burn/cuda"]
 # tokens, so a sloppier reduction reroutes tokens), which is a poor fit for a
 # backend's default gemm. `sha2` is for the gate binary, which asserts the
 # exported weight artifact against a digest taken from the safetensors shards.
-kimi-k3 = ["dep:sha2"]
 # The `mary` CLI — the import front door. Behind `import` (safetensors + clap),
 # out of the default library build.
 [[bin]]
@@ -223,34 +208,34 @@ required-features = ["import"]
 # it reads no tensor data - but it needs a safetensors reader, hence `import`.
 [[bin]]
 name = "k3_layout_gate"
-required-features = ["k3", "import"]
+required-features = ["k3"]
 # KDA parity gate: mary::models::kimi_k3::kda against the flash-linear-attention
 # oracle vectors (Triton kernels + fla's own float64 references). Reads .npz
 # only — no checkpoint, no safetensors — so it does not ride `dev-tools`.
 [[bin]]
 name = "kimi_kda_gate"
-required-features = ["kimi-k3"]
+required-features = ["k3"]
 
 # MLA parity gate: mary::models::k3::mla against the whole-layer oracle captured
 # from the shipped KimiMLAAttention on real checkpoint weights. Reads the
 # checkpoint shards directly (mmap + safetensors) and two oracle .npz bundles.
 [[bin]]
 name = "k3_mla_gate"
-required-features = ["k3-mla"]
+required-features = ["k3"]
 
 # AttnRes parity gate: mary::models::k3::attn_res against the whole-layer
 # oracle captured from the shipped `KimiLinearModel.forward`, with the AttnRes
 # weights read from the checkpoint itself.
 [[bin]]
 name = "k3_attn_res_gate"
-required-features = ["k3-attn-res"]
+required-features = ["k3"]
 
 # MoE-router parity gate: mary::models::kimi_k3::router against the Kimi K3
 # whole-layer oracle. Reads .npz + config.json only — no safetensors at
 # runtime — so it does not ride `dev-tools`/`import`.
 [[bin]]
 name = "k3_router_gate"
-required-features = ["kimi-k3"]
+required-features = ["k3"]
 
 # Hand-run dev probes / parity gates (f5-only deps) — kept out of the default
 # (library-only) build behind `dev-tools`.
@@ -609,11 +594,11 @@ name = "voxtral_listen"
 required-features = ["voxtral"]
 
 # Kimi K3: the `situ` activation against oracle vectors captured from the
-# shipped `SituAndMul`. CPU lane only under `kimi-k3`; add `kimi-k3-cuda` for
+# shipped `SituAndMul`. CPU lane only under `k3`; add `k3-cuda` for
 # the GPU lane as well.
 [[bin]]
 name = "kimi_situ_gate"
-required-features = ["kimi-k3"]
+required-features = ["k3"]
 
 # MXFP4 decode + MXFP4 -> NVFP4 transcode gate: bit-exactness against the
 # k3oracle reference decode of real Kimi-K3 expert bytes.
@@ -624,7 +609,15 @@ required-features = ["kimi-k3"]
 # experts with mary::nn::mxfp4, hence `mxfp4`; `k3` supplies the config.
 [[bin]]
 name = "k3_moe_gate"
-required-features = ["kimi-k3", "k3", "mxfp4"]
+required-features = ["k3"]
+
+# The whole-layer gate: one Kimi-K3 decoder layer composed out of the ported
+# primitives, held to the whole-layer oracle at every sub-block boundary. Reads
+# the checkpoint shards directly (safetensors + mmap) and the oracle .npz, so it
+# needs the k3 feature in full.
+[[bin]]
+name = "k3_layer_gate"
+required-features = ["k3"]
 
 [[bin]]
 name = "mxfp4_gate"

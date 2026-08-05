@@ -244,7 +244,7 @@ pub struct KdaConfig {
 impl KdaConfig {
     /// Kimi K3's `linear_attn_config`: 96 heads, `head_dim` 128,
     /// `short_conv_kernel_size` 4, `gate_lower_bound` -5.0.
-    pub fn kimi_k3() -> Self {
+    pub fn k3() -> Self {
         Self {
             num_heads: 96,
             head_k_dim: 128,

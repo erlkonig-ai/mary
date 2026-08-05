@@ -75,7 +75,7 @@ pub struct Situ {
 
 impl Default for Situ {
     fn default() -> Self {
-        Self::kimi_k3()
+        Self::k3()
     }
 }
 
@@ -87,7 +87,7 @@ impl Situ {
     }
 
     /// The shipped Kimi K3 setting: `beta = 4`, `linear_beta = 25`.
-    pub const fn kimi_k3() -> Self {
+    pub const fn k3() -> Self {
         Self::new(K3_BETA, Some(K3_LINEAR_BETA))
     }
 

@@ -17,7 +17,7 @@ import sys
 import time
 
 REPO = "<worktree>"
-ROUTER = os.path.join(REPO, "src/models/kimi_k3/router.rs")
+ROUTER = os.path.join(REPO, "src/models/k3/router.rs")
 GATE = os.path.join(REPO, "src/bin/k3_router_gate.rs")
 VEC = "./k3-oracle"
 WORK = "<path>"

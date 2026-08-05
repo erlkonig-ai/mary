@@ -363,6 +363,53 @@ impl<B: Backend> DepthMixer<B> {
         Self { schedule, bank: Vec::new(), accumulator: None, layer: 0, stage: Stage::Entry }
     }
 
+    /// Resume a mixer at layer `layer` with a bank someone else built.
+    ///
+    /// The 93-layer state machine is a chain: layer *n*'s bank is everything
+    /// layers 0..n snapshotted, so gating layer 4 in isolation means either
+    /// running layers 0..3 first or supplying the bank. This is the second
+    /// option, and it is not free — the resumed bank is *evidence from
+    /// elsewhere*, and a gate that uses it is checking one layer against a
+    /// reference, not thirteen layers against themselves. Callers must say so.
+    ///
+    /// What is still checked here is the one thing a caller cannot get wrong
+    /// quietly: the bank's **length** must equal the number of checkpoint
+    /// layers strictly before `layer`, because that count is a function of the
+    /// schedule alone. A bank of the wrong depth is the failure mode this
+    /// constructor exists to make impossible, and it is exactly the failure a
+    /// hand-built `bank` invites.
+    ///
+    /// The stage is [`Entry`](Self::enter_layer): a resumed mixer is always
+    /// about to enter a layer, never in the middle of one.
+    pub fn resume(schedule: Vec<bool>, bank: Vec<Tensor<B, 2>>, layer: usize) -> Self {
+        assert!(!schedule.is_empty(), "AttnRes schedule covers zero layers");
+        assert!(
+            schedule[0],
+            "layer 0 is not a checkpoint layer in this schedule"
+        );
+        assert!(
+            layer < schedule.len(),
+            "resuming at layer {layer} but the schedule covers {} layers",
+            schedule.len()
+        );
+        let want = schedule[..layer].iter().filter(|&&b| b).count();
+        assert_eq!(
+            bank.len(),
+            want,
+            "resuming at layer {layer} with a bank of {} snapshots; the schedule \
+             takes {want} before it",
+            bank.len()
+        );
+        if let Some(first) = bank.first() {
+            let d = first.dims();
+            assert!(d[0] > 0 && d[1] > 0, "resumed bank entry is empty: {d:?}");
+            for (i, e) in bank.iter().enumerate() {
+                assert_eq!(e.dims(), d, "resumed bank entry {i} has a different shape");
+            }
+        }
+        Self { schedule, bank, accumulator: None, layer, stage: Stage::Entry }
+    }
+
     /// Build the schedule from the model config. `None` when the config has no
     /// `attn_res_block_size`, i.e. the model is a plain-residual one.
     pub fn from_config(cfg: &K3TextConfig) -> Option<Self> {

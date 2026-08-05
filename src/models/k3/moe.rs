@@ -79,38 +79,12 @@ use burn::tensor::IndexingUpdateOp;
 
 use super::situ::Situ;
 
-/// Where the block rounds intermediate activations.
-///
-/// The shipped module's arithmetic is fp32 at the pinned sites and the model
-/// dtype everywhere else; this selects the "everywhere else".
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ActRound {
-    /// Keep f32 — reproduces a `dtype=torch.float32` run of the shipped block.
-    None,
-    /// Round to bfloat16 at every `nn.Linear` output, every activation output,
-    /// every norm output and the residual add — reproduces the shipped
-    /// `dtype=torch.bfloat16` run, which is what this checkpoint ships as.
-    Bf16,
-}
-
-impl ActRound {
-    /// Round `t` to this lane's storage precision.
-    pub fn apply<B: Backend, const D: usize>(self, t: Tensor<B, D>) -> Tensor<B, D> {
-        match self {
-            ActRound::None => t,
-            ActRound::Bf16 => {
-                let device = t.device();
-                let dims = t.dims();
-                let v: Vec<f32> = t.into_data().to_vec().expect("f32 tensor data");
-                let v: Vec<f32> = v
-                    .into_iter()
-                    .map(|x| half::bf16::from_f32(x).to_f32())
-                    .collect();
-                Tensor::from_data(TensorData::new(v, dims), &device)
-            }
-        }
-    }
-}
+/// Where the block rounds intermediate activations. Re-exported from
+/// [`super::ops`], which is where the layer-wide rounding policy now lives —
+/// the MLA block, the KDA block and the two per-layer norms all need the same
+/// one, and four copies of it is how a rounding fix goes missing from three of
+/// them.
+pub use super::ops::ActRound;
 
 /// The subset of `text_config` the MoE block reads, with every field this port
 /// does *not* model turned into a refusal at construction time.
@@ -151,7 +125,7 @@ impl MoeDims {
     /// The Kimi-K3 settings, as literals. Kept next to
     /// [`Self::from_text_config`] so a config-driven build and a hard-coded one
     /// can be compared against each other (the gate does exactly that).
-    pub fn kimi_k3() -> Self {
+    pub fn k3() -> Self {
         Self {
             hidden_size: 7168,
             moe_hidden_size: 3584,
@@ -163,7 +137,7 @@ impl MoeDims {
             routed_scaling_factor: 1.0,
             latent_moe_use_norm: true,
             rms_norm_eps: 1e-5,
-            situ: Situ::kimi_k3(),
+            situ: Situ::k3(),
         }
     }
 }
@@ -414,44 +388,23 @@ impl LatentMoe {
         }
     }
 
-    /// `nn.Linear(bias=False)`: `x @ Wᵀ` for a `[out, in]` weight, rounded to
-    /// the lane's storage precision exactly as a torch module output is.
+    /// `nn.Linear(bias=False)`, at this block's rounding policy.
+    ///
+    /// One line, because the operation itself lives in [`super::ops::linear`]:
+    /// it is shared with the KDA block and the two per-layer norms, and the
+    /// place where the rounding goes is exactly the kind of subtlety that must
+    /// not exist in four copies.
     pub fn linear<B: Backend>(&self, x: Tensor<B, 2>, w: Tensor<B, 2>) -> Tensor<B, 2> {
-        let [_, k] = x.dims();
-        let [_, kw] = w.dims();
-        assert_eq!(k, kw, "linear: x is [_, {k}] but the weight is [_, {kw}]");
-        self.round.apply(x.matmul(w.transpose()))
+        super::ops::linear(x, &w, self.round)
     }
 
-    /// `KimiRMSNorm`: normalise in f32, cast **before** scaling by the weight.
+    /// `KimiRMSNorm` at this block's epsilon and rounding policy.
     ///
-    /// Two things here are load-bearing, and both were settled by measurement
-    /// against the shipped module rather than read off it:
-    ///
-    /// * **The cast placement.** `return self.weight * x.to(dtype)` rounds the
-    ///   normalised value first and the product second — two roundings, not
-    ///   one. With them in the right places a float64 evaluation of this
-    ///   expression reproduces the shipped bf16 output **bit-for-bit**; with a
-    ///   single rounding it reproduces only ~74% of it.
-    /// * **`x / sqrt(v)`, never `x * sqrt(v).recip()`.** `Tensor::recip` on the
-    ///   ndarray backend dispatches to a SIMD *approximate* reciprocal
-    ///   (`RecipVec` -> `Vector::recip`), which on aarch64 is accurate to about
-    ///   1.4e-3 relative — roughly ten bits, not twenty-four. Written the
-    ///   obvious way this norm reproduced ~85% of the shipped bits; written as
-    ///   a division it reproduces ~100%. MEASURED, not inferred:
-    ///   `1/sqrt(2.21722e-4)` came back as exactly 67.25 against a true
-    ///   67.15773. The shipped code uses `torch.rsqrt`, which is correctly
-    ///   rounded, so the division is the faithful choice as well as the
-    ///   accurate one — it differs from a correctly-rounded `rsqrt` by at
-    ///   most one f32 ulp, four decades below a bf16 rounding boundary.
-    ///
-    /// The second point is a trap for every RMSNorm in this crate, not just
-    /// this one.
+    /// The two load-bearing subtleties — where the cast goes, and why this must
+    /// be a division and never `sqrt().recip()` — are documented at
+    /// [`super::ops::rms_norm`], with the code they describe.
     pub fn rms_norm<B: Backend>(&self, x: Tensor<B, 2>, weight: Tensor<B, 1>) -> Tensor<B, 2> {
-        let ms = x.clone().powf_scalar(2.0).mean_dim(1);
-        let denom = ms.add_scalar(self.dims.rms_norm_eps).sqrt();
-        let normed = self.round.apply(x / denom);
-        self.round.apply(weight.unsqueeze::<2>() * normed)
+        super::ops::rms_norm(x, &weight, self.dims.rms_norm_eps, self.round)
     }
 
     /// `KimiMoEGate.forward`, plus the intermediates it discards.

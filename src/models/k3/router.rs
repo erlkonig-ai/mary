@@ -109,7 +109,7 @@ impl RouterConfig {
     /// Kimi K3's shipping values (`config.json`, `text_config`). Every one of
     /// these is re-read from the checkpoint by the gate binary rather than
     /// trusted here.
-    pub fn kimi_k3() -> Self {
+    pub fn k3() -> Self {
         Self {
             hidden_size: 7168,
             num_experts: 896,

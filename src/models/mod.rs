@@ -4,9 +4,6 @@
 
 pub mod f5;
 
-// Kimi K3 (Moonshot) -- 2.78 T-param hybrid-attention MoE, landing primitive
-// by primitive. Ungated: pure Burn tensor ops, no dependency of its own.
-pub mod kimi_k3;
 
 // Qwen2.5-VL text backbone (BiQwen2_5 / nomic-embed-multimodal-7b). Reuses
 // gemma's RoPE table, so it rides the `gemma` feature.
@@ -33,12 +30,8 @@ pub mod personaplex;
 #[cfg(feature = "voxtral")]
 pub mod voxtral;
 
-// Kimi-K3 (2.78 T MoE vision-language). Loading skeleton only so far: config +
-// checkpoint-name -> module-slot layout, no forward pass. Pure serde: no backend,
-// no new dependencies.
+// Kimi-K3 (`kimi_linear`, 2.78 T MoE). Config + checkpoint-name->module-slot
+// layout, the ported operators (SiTU, KDA, MLA, AttnRes, router, latent MoE)
+// and the whole decoder layer that composes them.
 #[cfg(feature = "k3")]
 pub mod k3;
-// Kimi K3 (`kimi_linear`) — the MoE router so far. Behind `kimi-k3` so the
-// default build stays a pure library with no extra binaries.
-#[cfg(feature = "kimi-k3")]
-pub mod kimi_k3;

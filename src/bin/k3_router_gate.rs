@@ -1,4 +1,4 @@
-//! Parity gate for [`mary::models::kimi_k3::router`] against the Kimi K3
+//! Parity gate for [`mary::models::k3::router`] against the Kimi K3
 //! whole-layer oracle.
 //!
 //! ## What it is gated against
@@ -45,7 +45,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use mary::models::kimi_k3::router::{
+use mary::models::k3::router::{
     bf16_bits_to_f32, Accum, Router, RouterActivation, RouterConfig, Scores, ScoresForChoice,
 };
 use mary::nn::npz::{NpyArray, NpyData, Npz};
@@ -422,7 +422,7 @@ fn shape_of<'a>(z: &'a Npz, name: &str) -> &'a [usize] {
 // 0. the shipping config, read from the checkpoint
 // ---------------------------------------------------------------------------
 
-/// Every field `RouterConfig::kimi_k3()` hard-codes, re-read from the
+/// Every field `RouterConfig::k3()` hard-codes, re-read from the
 /// checkpoint's own `config.json`.
 ///
 /// This exists because a port's config constants are the one thing an oracle
@@ -449,7 +449,7 @@ fn check_shipping_config(r: &mut Report, config_json: &Path) {
         }
     };
     let tc = v.get("text_config").unwrap_or(&v);
-    let cfg = RouterConfig::kimi_k3();
+    let cfg = RouterConfig::k3();
 
     let num = |k: &str| -> Option<f64> { tc.get(k).and_then(|x| x.as_f64()) };
     let text = |k: &str| -> Option<&str> { tc.get(k).and_then(|x| x.as_str()) };
@@ -591,7 +591,7 @@ fn check_artifact(r: &mut Report, w: &Npz, manifest: &serde_json::Value, oracle:
 
 fn check_premises(r: &mut Report, o: &Npz, w: &Npz) {
     println!("--- premises (config / oracle capture / checkpoint shard must agree) ---");
-    let cfg = RouterConfig::kimi_k3();
+    let cfg = RouterConfig::k3();
     for &l in LAYERS.iter() {
         let lg = shape_of(o, &key(l, "moe_router_logits")).to_vec();
         let ix = shape_of(o, &key(l, "moe_gate_out_topk_idx")).to_vec();
@@ -612,7 +612,7 @@ fn check_premises(r: &mut Report, o: &Npz, w: &Npz) {
 }
 
 fn build_router(w: &Npz, l: usize) -> Router {
-    let cfg = RouterConfig::kimi_k3();
+    let cfg = RouterConfig::k3();
     let weight = bf16s(w, &key(l, "gate_weight_bf16bits"));
     // the bf16 rounding, because that is what the oracle's model held
     let bias = bf16s(w, &key(l, "gate_bias_bf16bits"));

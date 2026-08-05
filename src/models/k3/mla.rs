@@ -142,6 +142,18 @@ pub enum Precision {
 }
 
 impl Precision {
+    /// The same choice, as the crate-wide [`ActRound`](crate::models::k3::ops::ActRound).
+    ///
+    /// The two enums are the same distinction named twice — this one predates
+    /// the shared one. Kept as a conversion rather than a rename so the MLA
+    /// gate's vocabulary does not move under it.
+    pub fn act_round(self) -> crate::models::k3::ops::ActRound {
+        match self {
+            Precision::Exact => crate::models::k3::ops::ActRound::None,
+            Precision::Bf16 => crate::models::k3::ops::ActRound::Bf16,
+        }
+    }
+
     /// Round to bfloat16 if this is the bfloat16 lane; otherwise identity.
     ///
     /// Round-to-nearest-even, matching torch's f32→bf16 cast. Going through
@@ -857,10 +869,22 @@ fn rms_norm<B: Backend>(
 ) -> Tensor<B, 3> {
     let [_b, _t, d] = x.dims();
     assert_eq!(weight.dims()[0], d, "rms_norm: weight width != activation width");
-    let ms = (x.clone() * x.clone()).mean_dim(2); // [b, t, 1], fp32 island
-    let normed = x * (ms + eps).sqrt().recip();
-    let normed = p.round(normed); // x.to(dtype)
-    p.round(normed * weight.clone().reshape([1, 1, d]))
+    let [b, t, _] = x.dims();
+    // Delegated to the one shared transcription rather than repeated here.
+    //
+    // This function used to read `x * (ms + eps).sqrt().recip()`, and that is a
+    // MEASURED accuracy bug, not a style point: `Tensor::recip` on the ndarray
+    // backend dispatches to a SIMD *approximate* reciprocal, ~1.4e-3 relative
+    // on aarch64 — ten bits, not twenty-four. The error lands on a scale shared
+    // by every one of the row's 1536 (or 512) dimensions, so it survives the
+    // reduction intact and re-rounds a fifth of the row. Measured against the
+    // shipped bf16 `q_a_layernorm`, the `recip` form reproduced 81.3% of the
+    // bits and the division reproduces 99.99%. `attn_res.rs`, `moe.rs` and
+    // `ops.rs` each carry a comment warning about exactly this; this module had
+    // the bug. That is what four copies of a two-line function costs, and it is
+    // why there is now one.
+    crate::models::k3::ops::rms_norm_with(x.reshape([b * t, d]), weight, eps, |v| p.round(v))
+        .reshape([b, t, d])
 }
 
 /// `F.softmax(x, dim)`: subtract the max along `dim`, exponentiate, divide by
@@ -881,7 +905,11 @@ fn softmax_dim<B: Backend, const D: usize>(x: Tensor<B, D>, dim: usize) -> Tenso
 /// `torch.sigmoid`: `1 / (1 + exp(-x))`. Explicit for the same reason as
 /// [`softmax_dim`]. Saturates to 1 and 0 rather than overflowing.
 fn sigmoid<B: Backend, const D: usize>(x: Tensor<B, D>) -> Tensor<B, D> {
-    (x.neg().exp() + 1.0).recip()
+    // A DIVISION, not `recip()` — see `rms_norm` above. The gate measured the
+    // difference here too: with `recip()` the output gate reproduced 72.2% of
+    // the shipped bf16 bits, with a division 99.9%.
+    let d = x.neg().exp() + 1.0;
+    d.clone().ones_like() / d
 }
 
 /// Host-readback of a tensor's elements as f64, in row-major order.

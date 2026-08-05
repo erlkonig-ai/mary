@@ -1,4 +1,4 @@
-//! kimi_situ_gate — the correctness gate for `mary::models::kimi_k3::situ`.
+//! kimi_situ_gate — the correctness gate for `mary::models::k3::situ`.
 //!
 //! The oracle is `situ_activation.npz`, captured by instantiating and running
 //! Kimi K3's *shipped* `SituAndMul` module (torch 2.13, CPU) over a 1868-point
@@ -44,7 +44,7 @@
 
 use burn::prelude::*;
 use burn::tensor::activation::sigmoid;
-use mary::models::kimi_k3::Situ;
+use mary::models::k3::Situ;
 use std::collections::HashMap;
 use std::fs;
 use std::panic::{self, AssertUnwindSafe};
@@ -431,7 +431,7 @@ fn probe_backend<B: Backend>(dev: &Device<B>, x32: &[f32]) -> (f64, f64, bool) {
 /// Everything the gate checks on one backend. Returns `true` on a clean pass.
 fn run_lane<B: Backend>(name: &str, dev: &Device<B>, o: &HashMap<String, Arr>) -> bool {
     println!("\n=== lane: {name} ===");
-    let situ = Situ::kimi_k3();
+    let situ = Situ::k3();
     let mut ok = true;
     let get = |k: &str| o.get(k).unwrap_or_else(|| panic!("oracle missing {k}"));
 
@@ -698,11 +698,11 @@ fn main() {
         .or_else(|| std::env::var("SITU_ORACLE_DIR").ok())
         .unwrap_or_else(|| "./k3-situ/oracle_npy".to_string())
         .into();
-    println!("kimi_situ_gate — mary::models::kimi_k3::situ vs the shipped SituAndMul");
+    println!("kimi_situ_gate — mary::models::k3::situ vs the shipped SituAndMul");
     println!("oracle: {}", dir.display());
     println!("criterion: |got-want| <= {ATOL:e} + rtol·|want|, rtol per lane (>= {RTOL_FLOOR:e})");
     let o = load_oracle(&dir);
-    let situ = Situ::kimi_k3();
+    let situ = Situ::k3();
     // The betas are the whole activation; assert the port's constants are the
     // config's before anything else is measured.
     assert_eq!(situ.beta, o["beta"].data[0], "beta disagrees with the oracle");
