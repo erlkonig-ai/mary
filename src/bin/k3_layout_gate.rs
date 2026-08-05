@@ -259,6 +259,148 @@ fn report(label: &str, problems: &[String]) -> usize {
     problems.len()
 }
 
+/// Every config field the layout claims to consult must demonstrably change at
+/// least one derived slot. Perturb each field; if nothing moves, the field is
+/// decorative and the gate proves less than it appears to.
+///
+/// This closes two holes at once, both found by adversarial review.
+///
+/// COINCIDENCE. The gate compared derived numbers against header shapes, so a
+/// wrong config field holding the SAME value was indistinguishable from the
+/// right one. Four such mutations passed clean — `A_log` length taken from
+/// `v_head_dim` instead of `head_dim` (both 128), `o_norm` from
+/// `qk_nope_head_dim` (both 128), `pos_emb` from `mm_hidden_size` (both 1024),
+/// `b_proj` rows from `num_attention_heads` (both 96). Perturbing the SOURCE
+/// field separates them: if the layout really reads `head_dim`, changing
+/// `head_dim` alone must move something.
+///
+/// UNCONSULTED FIELDS. `use_full_rank_gate`, `mla_use_output_gate` and
+/// `attn_res_block_size` were parsed, documented, and never read — a synthetic
+/// config with any of them flipped still produced a "total bijection in both
+/// directions". Totality was true of THIS checkpoint under THIS config, which
+/// is a much weaker claim than it looked.
+fn check_config_fields_are_consulted(cfg: &K3Config) -> Vec<String> {
+    // Fingerprint = every slot's name, shape and dtype, folded into one string.
+    // A perturbation that PANICS is also evidence the field is consulted — e.g.
+    // bumping num_hidden_layers puts a layer in neither the KDA nor the
+    // full-attention list, which config.rs rejects. Catching it keeps the test
+    // about "does this field matter" rather than about "is every perturbation a
+    // valid config", which it is not and need not be.
+    let fingerprint = |c: &K3Config| -> Option<String> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut v: Vec<String> = Vec::new();
+            mary::models::k3::layout::for_each_slot(c, |ts| {
+                v.push(format!("{}|{:?}|{:?}", ts.name, ts.shape, ts.dtype));
+            });
+            v.sort();
+            v.join("\n")
+        }))
+        .ok()
+    };
+    let base = fingerprint(cfg).expect("the real config must describe cleanly");
+
+    // (name, mutated config). Each perturbation must change the fingerprint.
+    let mut cases: Vec<(&str, K3Config)> = Vec::new();
+    let mut push = |name: &'static str, f: fn(&mut K3Config), out: &mut Vec<(&str, K3Config)>| {
+        let mut c = cfg.clone();
+        f(&mut c);
+        out.push((name, c));
+    };
+    push("text.hidden_size", |c| c.text_config.hidden_size += 8, &mut cases);
+    push("text.num_hidden_layers", |c| c.text_config.num_hidden_layers += 1, &mut cases);
+    push("text.vocab_size", |c| c.text_config.vocab_size += 1, &mut cases);
+    push("linear_attn.num_heads", |c| c.text_config.linear_attn_config.num_heads += 1, &mut cases);
+    push("linear_attn.head_dim", |c| c.text_config.linear_attn_config.head_dim += 1, &mut cases);
+    push(
+        "linear_attn.short_conv_kernel_size",
+        |c| c.text_config.linear_attn_config.short_conv_kernel_size += 1,
+        &mut cases,
+    );
+    push("vision.vt_hidden_size", |c| c.vision_config.vt_hidden_size += 8, &mut cases);
+    // The three adversarial review showed were parsed, documented and never
+    // read. Included deliberately: if the layout genuinely does not depend on
+    // them, this test must SAY so rather than let a clean bijection imply a
+    // totality that holds only for this checkpoint under this config.
+    push(
+        "linear_attn.use_full_rank_gate",
+        |c| c.text_config.linear_attn_config.use_full_rank_gate ^= true,
+        &mut cases,
+    );
+    push(
+        "text.mla_use_output_gate",
+        |c| c.text_config.mla_use_output_gate ^= true,
+        &mut cases,
+    );
+    push(
+        "text.attn_res_block_size",
+        |c| c.text_config.attn_res_block_size = None,
+        &mut cases,
+    );
+
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    // Fields the layout does not model are not automatically a defect — but the
+    // layout must then REFUSE a config where they differ, instead of emitting a
+    // wrong mapping and reporting a clean bijection. Each one is therefore
+    // pinned to the value this layout was written against. "Total in both
+    // directions" is only ever a claim about a config, and this is what makes
+    // which config explicit.
+    let pinned: &[(&str, bool, String)] = &[
+        (
+            "linear_attn.use_full_rank_gate",
+            cfg.text_config.linear_attn_config.use_full_rank_gate,
+            "true".into(),
+        ),
+        (
+            "text.mla_use_output_gate",
+            cfg.text_config.mla_use_output_gate,
+            "true".into(),
+        ),
+        (
+            "text.attn_res_block_size",
+            cfg.text_config.attn_res_block_size == Some(12),
+            "Some(12)".into(),
+        ),
+    ];
+
+    let mut problems = Vec::new();
+    for (name, holds, want) in pinned {
+        if !holds {
+            problems.push(format!(
+                "config field {name} differs from the value this layout assumes ({want}), and \
+                 the layout does not model it — refusing rather than emitting a mapping that \
+                 would look total and be wrong"
+            ));
+        }
+    }
+    let unmodelled: [&str; 3] = [
+        "linear_attn.use_full_rank_gate",
+        "text.mla_use_output_gate",
+        "text.attn_res_block_size",
+    ];
+    for (name, mutated) in &cases {
+        // None == panicked == the field is consulted.
+        if fingerprint(mutated).as_deref() == Some(base.as_str()) {
+            if unmodelled.contains(name) {
+                // Known-unmodelled and pinned above; report, do not fail twice.
+                println!("  note: {name} is not modelled by the layout (pinned to its assumed value)");
+            } else {
+                problems.push(format!(
+                    "config field {name} is NEVER CONSULTED — perturbing it changes no derived \
+                     slot, so any agreement involving it is coincidence"
+                ));
+            }
+        }
+    }
+    std::panic::set_hook(prev);
+    println!(
+        "\nconfig fields consulted: {}/{} perturbations moved a derived slot",
+        cases.len() - problems.len(),
+        cases.len()
+    );
+    problems
+}
+
 fn main() -> Result<()> {
     let dir = std::env::args()
         .nth(1)
@@ -411,6 +553,12 @@ fn main() -> Result<()> {
     // A_log's shape disagreement with the shipped modelling code is RESOLVED —
     // by measurement, and the resolution inverted what this used to print. See
     // the AttnPart::ALog docs in mary::models::k3::layout.
+    let consulted = check_config_fields_are_consulted(&cfg);
+    for p in &consulted {
+        println!("  {p}");
+    }
+    failures += consulted.len();
+
     println!("\nNOTES (recorded, not gated):");
     let a_log = headers
         .get("language_model.model.layers.0.self_attn.A_log")
