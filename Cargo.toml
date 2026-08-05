@@ -549,3 +549,7 @@ required-features = ["mxfp4"]
 [[bin]]
 name = "mxfp4_mma_probe"
 required-features = ["mxfp4", "cuda-backend"]
+
+[[bin]]
+name = "mxmma_probe"
+required-features = ["mxfp4", "cuda-backend"]
