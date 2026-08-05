@@ -180,17 +180,31 @@ pub enum AttnPart {
     VConv1d,
     /// Log of the per-head decay rate.
     ///
-    /// **This tensor does not match the shipped modelling code.** The checkpoint
-    /// ships `[head_dim]`; `KimiDeltaAttention.__init__` declares
-    /// `torch.empty(self.num_heads)`, and the fla kernel it calls indexes
-    /// `A_log + i_hv` with `i_hv` a *head* index. Here `head_dim` is 128 and
-    /// `num_heads` is 96, so the two readings are distinguishable — and two
-    /// other KDA tensors independently pin the head count at 96 (`b_proj` is
-    /// `[96, 7168]`, `dt_bias` is `[96 * 128]`). The layout follows the
-    /// checkpoint, since that is what a loader has to read; `k3_layout_gate`
-    /// reports the disagreement rather than papering over it. A port that
-    /// assumes "one entry per head" will take the first 96 of 128 values and
-    /// get a wrong decay everywhere, silently.
+    /// The checkpoint ships `[128]` while `KimiDeltaAttention.__init__`
+    /// declares `torch.empty(self.num_heads)` = `[96]`, and the fla kernel
+    /// indexes `A_log + i_hv` with `i_hv` a *head* index.
+    ///
+    /// **RESOLVED BY MEASUREMENT, 2026-08-05 — and the earlier warning here was
+    /// exactly backwards.** On all **69/69** KDA layers, `A_log[0..96]` is
+    /// entirely non-zero and lies in the `log(Uniform(1,16))` range, while
+    /// `A_log[96..128]` is **exactly 0.0**. Controls on the same layers
+    /// (`o_norm`, the `f_a_proj`/`f_b_proj` 128-axes, `dt_bias`) show no such
+    /// trailing zeros, so it is not an artefact of how the file was written.
+    ///
+    /// It is **96 per-head entries zero-padded to the next power of two**,
+    /// which on this model coincides with `head_dim`. So:
+    ///
+    /// - **Taking the first 96 is CORRECT.**
+    /// - The port that gets a wrong decay is the one that BELIEVES the old
+    ///   warning and uses all 128 — because `exp(0) = 1`, the padding is
+    ///   decay-rate **1**, i.e. no decay at all, not a harmless no-op.
+    ///
+    /// This doc previously asserted the opposite, the gate printed it every
+    /// run, and it was routed to another window as needing a forward-pass
+    /// oracle to settle. It needed 512 bytes per layer. Worth noting that an
+    /// architecture fragment written a day earlier already said "one parameter
+    /// per head (96 of them)" — two artifacts in the same repository
+    /// disagreeing about one tensor, with nothing watching for that.
     ALog,
     /// Per-channel bias added to the decay-gate input before the nonlinearity.
     DtBias,
@@ -757,7 +771,10 @@ fn describe_attn(cfg: &K3Config, part: AttnPart) -> Option<(Shape, Dtype)> {
             Shape::new(&[la.proj_dim(), 1, la.short_conv_kernel_size]),
             Dtype::F32,
         ),
-        // See the `AttnPart::ALog` docs: the checkpoint ships `head_dim`, the
+        // See the `AttnPart::ALog` docs: 96 live per-head entries zero-padded
+        // to the next power of two, which here equals `head_dim`. The layout
+        // follows the checkpoint because that is what a loader must read.
+        // (was: the checkpoint ships `head_dim`, the
         // shipped modelling code declares `num_heads`, and they disagree here.
         AttnPart::ALog => (Shape::new(&[la.head_dim]), Dtype::F32),
         AttnPart::DtBias => (Shape::new(&[la.proj_dim()]), Dtype::F32),

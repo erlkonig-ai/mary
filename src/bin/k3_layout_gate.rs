@@ -408,24 +408,26 @@ fn main() -> Result<()> {
     failures += report("header/index disagreements", &index_problems);
     failures += report("layer-kind disagreements", &kind_problems);
 
-    // Not a failure, but not something to leave for a reader to notice: the
-    // checkpoint and the shipped modelling code disagree about A_log's shape.
-    // See the AttnPart::ALog docs in mary::models::k3::layout.
-    println!("\nANOMALIES (recorded, not gated):");
+    // A_log's shape disagreement with the shipped modelling code is RESOLVED —
+    // by measurement, and the resolution inverted what this used to print. See
+    // the AttnPart::ALog docs in mary::models::k3::layout.
+    println!("\nNOTES (recorded, not gated):");
     let a_log = headers
         .get("language_model.model.layers.0.self_attn.A_log")
         .map(|e| e.shape);
     println!(
-        "  self_attn.A_log is {} in the checkpoint; modeling_kimi_linear.py declares \
-         torch.empty(num_heads) = [{}], and the fla kernel indexes it per head (A_log + i_hv). \
-         b_proj [{}, {}] and dt_bias [{}] both pin the head count at {}. A port that treats \
-         A_log as one-entry-per-head reads the first {} of {} values and gets a wrong decay, \
-         silently.",
+        "  self_attn.A_log is {} in the checkpoint while modeling_kimi_linear.py declares \
+         torch.empty(num_heads) = [{}]. RESOLVED 2026-08-05 by reading the values: on all \
+         69/69 KDA layers entries 0..{} are non-zero and {}..{} are exactly 0.0, with controls \
+         (o_norm, f_a_proj/f_b_proj, dt_bias) showing no such padding. It is {} per-head \
+         entries zero-padded to the next power of two. TAKING THE FIRST {} IS CORRECT; using \
+         all {} is the error, because exp(0) = 1 makes the padding decay-rate 1 rather than a \
+         no-op. This line previously asserted the opposite.",
         a_log.map(|s| s.to_string()).unwrap_or_else(|| "absent".into()),
         t.linear_attn_config.num_heads,
         t.linear_attn_config.num_heads,
-        t.hidden_size,
-        t.linear_attn_config.proj_dim(),
+        t.linear_attn_config.num_heads,
+        t.linear_attn_config.head_dim,
         t.linear_attn_config.num_heads,
         t.linear_attn_config.num_heads,
         t.linear_attn_config.head_dim,
