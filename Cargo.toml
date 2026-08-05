@@ -540,3 +540,7 @@ required-features = ["import"]
 [[bin]]
 name = "voxtral_listen"
 required-features = ["voxtral"]
+
+[[bin]]
+name = "k3_expert_index"
+required-features = ["k3"]
