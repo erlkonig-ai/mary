@@ -40,7 +40,26 @@
 //! - The block-scale array is produced in **logical row-major** order. A
 //!   tensor-core kernel generally wants a swizzled scale-factor layout; that
 //!   permutation is the consumer's business and is not applied here.
-//! - **It is NOT established that the transcode is necessary.** This module
+//! - **MEASURED 2026-08-05: the transcode is NOT necessary to reach the tensor
+//!   cores.** `ptxas` 13.0 assembles a block-scaled FP4 `mma.sync` for
+//!   `sm_121a` in BOTH encodings, and `nvdisasm` shows two DIFFERENT real
+//!   tensor-core opcodes:
+//!
+//!     MXFP4 (`scale_vec::2X`, `.ue8m0`)  ->  OMMA.SF.16864.F32.E2M1.E2M1.E8
+//!     NVFP4 (`scale_vec::4X`, `.ue4m3`)  ->  OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X
+//!
+//!   So the checkpoint's own format has its own instruction and needs no
+//!   relabelling to be executable. Only `m16n8k64` assembles; `m16n8k32` is
+//!   rejected for both, and the target must be `sm_121a` — plain `sm_121`
+//!   refuses. A bogus shape (`m16n8k99`) exits 255, so the assembler is
+//!   genuinely validating rather than accepting anything.
+//!
+//!   What this does NOT establish: that the hardware EXECUTES either correctly
+//!   (that needs a launch against a CPU reference), or which of the two is
+//!   faster. This module therefore becomes insurance and a possible performance
+//!   option, not a required step — which is the opposite of the premise it was
+//!   written under.
+//! - The older note this replaces said only that necessity was unestablished. This module
 //!   exists because NVFP4 is the encoding verified to execute on sm_121 — that
 //!   verification was a real kernel launched against a CPU reference and it
 //!   stands. But whether the checkpoint's own MXFP4 *also* reaches the tensor
