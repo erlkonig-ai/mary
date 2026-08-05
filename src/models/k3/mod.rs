@@ -28,6 +28,8 @@
 
 pub mod config;
 pub mod layout;
+pub mod mla;
 
 pub use config::{AttnKind, K3Config, K3TextConfig, K3VisionConfig, LinearAttnConfig};
 pub use layout::{describe, for_each_slot, Dtype, Shape, Slot, TensorSlot};
+pub use mla::{MlaBlock, MlaConfig, MlaKvCache, MlaTrace, MlaWeights, Precision};

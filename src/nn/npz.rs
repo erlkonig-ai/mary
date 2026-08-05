@@ -30,6 +30,10 @@ pub enum NpyData {
     F32(Vec<f32>),
     I64(Vec<i64>),
     U16(Vec<u16>),
+    /// Raw bytes. Unlike `u16` this is unambiguous — an oracle stores `u8` for
+    /// things that really are bytes (packed MXFP4 nibbles, E8M0 exponents), so
+    /// widening it to a small integer is the right reading.
+    U8(Vec<u8>),
 }
 
 /// One array out of an `.npz`: its shape and its raw elements.
@@ -47,6 +51,7 @@ impl NpyArray {
             NpyData::F32(v) => v.len(),
             NpyData::I64(v) => v.len(),
             NpyData::U16(v) => v.len(),
+            NpyData::U8(v) => v.len(),
         }
     }
 
@@ -62,6 +67,7 @@ impl NpyArray {
             NpyData::F64(v) => v.clone(),
             NpyData::F32(v) => v.iter().map(|&x| x as f64).collect(),
             NpyData::I64(v) => v.iter().map(|&x| x as f64).collect(),
+            NpyData::U8(v) => v.iter().map(|&x| x as f64).collect(),
             NpyData::U16(_) => panic!(
                 "uint16 array read as float: these hold raw bfloat16 bit patterns \
                  — use bf16_to_f64()"
@@ -105,6 +111,7 @@ fn other_kind(d: &NpyData) -> &'static str {
         NpyData::F32(_) => "f32",
         NpyData::I64(_) => "i64",
         NpyData::U16(_) => "u16",
+        NpyData::U8(_) => "u8",
     }
 }
 
@@ -244,6 +251,8 @@ fn parse_npy(bytes: &[u8], name: &str) -> NpyArray {
         NpyData::I64(chunks(raw, 8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect())
     } else if header.contains("'<u2'") || header.contains("'|u2'") {
         NpyData::U16(chunks(raw, 2).map(|c| u16::from_le_bytes(c.try_into().unwrap())).collect())
+    } else if header.contains("'|u1'") || header.contains("'<u1'") {
+        NpyData::U8(raw.to_vec())
     } else {
         panic!("member '{}': unsupported dtype in header: {}", name, header.trim())
     };
@@ -254,6 +263,7 @@ fn parse_npy(bytes: &[u8], name: &str) -> NpyArray {
         NpyData::F32(v) => v.len(),
         NpyData::I64(v) => v.len(),
         NpyData::U16(v) => v.len(),
+        NpyData::U8(v) => v.len(),
     };
     assert_eq!(got, n, "member '{}': shape {:?} vs {} elements", name, shape, got);
     NpyArray { shape, data }

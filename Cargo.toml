@@ -85,6 +85,14 @@ cuda-backend = ["q4", "cubecl?/cuda"]
 # name->module-slot layout. serde/serde_json are unconditional deps, so this
 # feature adds nothing to the dependency graph; it only gates compilation.
 k3 = []
+# Kimi-K3 MLA (mary::models::k3::mla) - the NoPE full-attention block, and the
+# parity gate that holds it to the shipped module. The block itself needs
+# nothing beyond burn; the gate needs a safetensors reader + mmap (it streams
+# the eight MLA weights straight out of the 17 GB shards), sha2 (the oracle
+# .npz bundles are pinned by hash), and burn-ndarray for the CPU f32/f64
+# reference lanes - float64 is the only width in which a wrong RMSNorm epsilon
+# is visible at all.
+k3-mla = ["k3", "dep:safetensors", "dep:memmap2", "dep:sha2", "dep:burn-ndarray"]
 # Safetensors → pile IMPORT support. The ONLY feature that compiles a
 # safetensors reader (`WeightLoader::SingleFile`/`MultiShard`,
 # `ingest::save_safetensors`, `persist::persist_safetensors_to_pile`, the
@@ -204,6 +212,13 @@ required-features = ["k3", "import"]
 [[bin]]
 name = "kimi_kda_gate"
 required-features = ["kimi-k3"]
+
+# MLA parity gate: mary::models::k3::mla against the whole-layer oracle captured
+# from the shipped KimiMLAAttention on real checkpoint weights. Reads the
+# checkpoint shards directly (mmap + safetensors) and two oracle .npz bundles.
+[[bin]]
+name = "k3_mla_gate"
+required-features = ["k3-mla"]
 
 # Hand-run dev probes / parity gates (f5-only deps) — kept out of the default
 # (library-only) build behind `dev-tools`.
