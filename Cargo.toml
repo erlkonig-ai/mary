@@ -85,6 +85,16 @@ cuda-backend = ["q4", "cubecl?/cuda"]
 # name->module-slot layout. serde/serde_json are unconditional deps, so this
 # feature adds nothing to the dependency graph; it only gates compilation.
 k3 = []
+# AttnRes (mary::models::k3::attn_res) - the depth-axis mixture and the
+# snapshot boundary that resets it, in Burn. The module itself needs nothing
+# new; this feature exists for `k3_attn_res_gate`, which wants burn-ndarray for
+# a deterministic CPU arithmetic that is not the GPU's, and `import` for a
+# safetensors reader (the gate takes the AttnRes weights from the checkpoint
+# itself, not from the oracle).
+k3-attn-res = ["k3", "import", "burn/ndarray", "dep:burn-ndarray"]
+# ...and the GB10/sm_121 lane on top, so the primitive is also checked on the
+# backend it will actually run on here. Needs the CUDA toolkit present.
+k3-attn-res-cuda = ["k3-attn-res", "burn/cuda"]
 # Safetensors → pile IMPORT support. The ONLY feature that compiles a
 # safetensors reader (`WeightLoader::SingleFile`/`MultiShard`,
 # `ingest::save_safetensors`, `persist::persist_safetensors_to_pile`, the
@@ -184,6 +194,13 @@ required-features = ["import"]
 [[bin]]
 name = "k3_layout_gate"
 required-features = ["k3", "import"]
+
+# AttnRes parity gate: mary::models::k3::attn_res against the whole-layer
+# oracle captured from the shipped `KimiLinearModel.forward`, with the AttnRes
+# weights read from the checkpoint itself.
+[[bin]]
+name = "k3_attn_res_gate"
+required-features = ["k3-attn-res"]
 
 # Hand-run dev probes / parity gates (f5-only deps) — kept out of the default
 # (library-only) build behind `dev-tools`.
