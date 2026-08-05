@@ -1,23 +1,40 @@
-//! `mxfp4_mma_probe` — ask *this* GPU which block-scaled FP4 tensor-core
-//! shapes it actually reports, instead of reading a capability table.
+//! `mxfp4_mma_probe` — report which block-scaled FP4 tensor-core shapes
+//! **CubeCL believes** this architecture supports.
 //!
-//! [`mary::nn::mxfp4`]'s transcode exists to land 4-bit weights on a
-//! block-scaled MMA. Which encoding to land them *in* is a property of the
-//! device, not of the format: sm_120-class hardware exposes `mma.sync
-//! ...kind::mxf4nvf4.block_scale`, and the scale operand can be either a
-//! `ue8m0` at `scale_vec::2X` (one scale per 32 elements — MXFP4, the
-//! checkpoint's own layout) or an `e4m3` at `scale_vec::4X` (one per 16 —
-//! NVFP4, the transcode's target). Assuming which one is present is exactly
-//! the sort of premise that costs a day, so this prints what the runtime
-//! enumerates on the machine it runs on.
+//! ## Read this before quoting its output
 //!
-//! ## Gate
+//! An earlier version of this file claimed to "ask *this* GPU ... instead of
+//! reading a capability table". That was wrong, and the wrongness was load
+//! bearing: it was used to argue that the checkpoint's own MXFP4 might reach
+//! the tensor cores with no transcode at all.
 //!
-//! An empty feature set is ambiguous — it could mean "this GPU has no scaled
-//! MMA" or "the query never reached a device". So before reporting anything,
-//! the probe requires the *plain* (unscaled) MMA set to be non-empty. That set
-//! is populated for every CUDA arch from sm_70 up, so its presence proves the
-//! runtime enumerated a real device and any absence below is a real absence.
+//! What actually happens: creating the client does touch the device, but only
+//! to read its architecture version. The feature sets below are then produced
+//! by `supported_scaled_mma_combinations(arch)`, a **pure function of that
+//! version number** — no `cuDeviceGetAttribute`, no `ptxas` probe, no kernel.
+//! The rows printed for sm_121 follow deterministically from `120 <= 121 < 130`
+//! and would print identically on any sm_12x, working or not. `ptxas` is not
+//! even installed on this machine.
+//!
+//! The gate below inherits the same flaw. It requires the *plain* MMA set to be
+//! non-empty as evidence that "the query reached a device" — but that set comes
+//! from the same version-keyed table, so its non-emptiness proves only that an
+//! architecture version was parsed. It cannot distinguish a real capability
+//! from a table entry.
+//!
+//! So this binary answers "what does CubeCL think sm_121 can do", which is
+//! useful for choosing a code path and worthless as evidence about silicon.
+//!
+//! ## What would actually settle it
+//!
+//! Install `ptxas`, assemble a block-scaled FP4 `mma.sync` with a `ue8m0` scale
+//! operand at `scale_vec::2X`, launch it on the GB10, and compare against a CPU
+//! reference. If MXFP4 executes natively, [`mary::nn::mxfp4`]'s NVFP4 transcode
+//! is unnecessary; if it does not, the transcode is on the critical path. That
+//! measurement has NOT been made.
+//!
+//! (For contrast: NVFP4 matmul on sm_121 *was* verified by launching a real
+//! kernel against a CPU reference. That result stands. This one is a table.)
 //!
 //! Build: `--features cuda-backend,mxfp4`.
 
@@ -44,7 +61,11 @@ fn main() {
     let props = client.properties();
     let features = &props.features;
 
-    // ---- gate: prove the query reached a device -------------------------
+    // ---- gate: NOT a proof of hardware capability ------------------------
+    // This establishes only that an architecture version was parsed. Both sets
+    // below are pure functions of that version, so neither says anything about
+    // what the silicon executes. Kept because an empty plain set would mean the
+    // runtime failed entirely, which is still worth catching.
     if features.matmul.mma.is_empty() {
         eprintln!(
             "GATE FAILED — the runtime reports no plain MMA combinations at all, so an empty \
@@ -53,7 +74,7 @@ fn main() {
         std::process::exit(1);
     }
     println!(
-        "gate ok — runtime enumerated a device: {} plain MMA combinations reported\n",
+        "gate ok — an architecture version was parsed: {} plain MMA combinations listed.\n  NOTE: these are CubeCL's version-keyed table entries, NOT a device capability\n  query. Nothing below is evidence about silicon; see the module doc.\n",
         features.matmul.mma.len()
     );
 

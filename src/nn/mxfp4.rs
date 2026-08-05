@@ -40,6 +40,17 @@
 //! - The block-scale array is produced in **logical row-major** order. A
 //!   tensor-core kernel generally wants a swizzled scale-factor layout; that
 //!   permutation is the consumer's business and is not applied here.
+//! - **It is NOT established that the transcode is necessary.** This module
+//!   exists because NVFP4 is the encoding verified to execute on sm_121 — that
+//!   verification was a real kernel launched against a CPU reference and it
+//!   stands. But whether the checkpoint's own MXFP4 *also* reaches the tensor
+//!   cores natively, making this whole relabelling unnecessary, has NOT been
+//!   measured. The one artifact that looked like that measurement
+//!   (`mxfp4_mma_probe`) reads CubeCL's version-keyed capability table, which
+//!   is a pure function of the architecture number; see its module doc. The
+//!   deciding experiment is to assemble a block-scaled FP4 `mma.sync` with a
+//!   `ue8m0` scale operand and launch it. Until then, treat this module as
+//!   insurance rather than as a known-required step.
 //! - Three experts out of 82,432 were measured. [`transcode_to_nvfp4`] checks
 //!   the span of the tensor in front of it and returns an error rather than
 //!   assuming, so a wider expert fails loudly instead of quietly rounding.
