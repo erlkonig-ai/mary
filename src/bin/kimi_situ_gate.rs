@@ -226,6 +226,18 @@ struct Cmp {
 /// `|got − want| <= ATOL + rtol·|want|`, per point.
 fn compare(got: &[f32], want: &[f64], rtol: f64) -> Cmp {
     assert_eq!(got.len(), want.len(), "length mismatch in comparison");
+    // NON-EMPTY, and this is not pedantry. Equal lengths were asserted and
+    // non-emptiness was not, so a zero-length oracle array compared to a
+    // zero-length result reported `tanh 0.00 ulp` — a green measurement of
+    // nothing — AND tightened the derived budget to the floor. On a machine
+    // where the arrays failed to load, or a CPU-only box, the whole gate went
+    // green having compared no numbers at all.
+    assert!(
+        !got.is_empty(),
+        "empty comparison: {} elements. An empty array compares equal to anything; \
+         this is the vacuous-green path, not a pass.",
+        got.len()
+    );
     let mut c = Cmp {
         n: got.len(),
         rtol,
@@ -581,6 +593,12 @@ fn run_controls<B: Backend>(dev: &Device<B>, o: &HashMap<String, Arr>, rtol: f64
 /// A GPU lane must not turn "no device on this box" into a silent pass, nor
 /// into a crash that hides the other lanes. Backend init panics rather than
 /// returning, so it is caught and reported as `unavailable`.
+thread_local! {
+    /// Lanes whose device would not initialise. Kept so their absence is a
+    /// reported fact rather than a silent hole in the coverage.
+    static DROPPED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn try_lane<B: Backend, F>(name: &str, build: F, o: &HashMap<String, Arr>) -> Option<bool>
 where
     F: FnOnce() -> Device<B>,
@@ -592,7 +610,12 @@ where
     match dev {
         Ok(dev) => Some(run_lane::<B>(name, &dev, o)),
         Err(_) => {
+            // Recorded, not discarded. A dropped lane used to vanish from
+            // `lanes`, and `lanes.iter().all()` is vacuously TRUE over an empty
+            // set — so a box where every backend failed to initialise reported
+            // GATE PASS having verified nothing.
             println!("\n=== lane: {name} === unavailable (device init panicked)");
+            DROPPED.with(|d| d.borrow_mut().push(name.to_string()));
             None
         }
     }
@@ -640,6 +663,14 @@ fn main() {
             lanes.push(("cuda", r));
         }
     }
+    // A lane compiled OUT is a coverage hole too, and a quieter one than a
+    // dropped lane: it leaves no trace at runtime at all. Say so, so that a
+    // green summary cannot be read as "verified on CUDA".
+    #[cfg(not(feature = "kimi-k3-cuda"))]
+    println!(
+        "\n=== lane: cuda === NOT COMPILED IN (build with --features kimi-k3-cuda). \
+         Nothing below is evidence about the CUDA backend."
+    );
     {
         type Gpu = burn::backend::Wgpu;
         if let Some(r) = try_lane::<Gpu, _>("wgpu-vulkan", Device::<Gpu>::default, &o) {
@@ -651,8 +682,36 @@ fn main() {
     for (n, r) in &lanes {
         println!("  {:<14} {}", n, if *r { "PASS" } else { "FAIL" });
     }
-    let pass = lanes.iter().all(|(_, r)| *r);
-    println!("\nGATE: {}", if pass { "PASS" } else { "FAIL" });
+    let dropped = DROPPED.with(|d| d.borrow().clone());
+    for n in &dropped {
+        println!("  {:<14} DROPPED (device init failed)", n);
+    }
+    // `all()` over an empty set is TRUE, so an empty lane list must be an
+    // explicit failure rather than an implicit pass.
+    let ran_any = !lanes.is_empty();
+    if !ran_any {
+        println!("\n  NO LANE RAN — nothing was verified.");
+    }
+    // A dropped lane is a coverage hole. It is only acceptable when the
+    // operator says so, which forces the absence to be acknowledged instead of
+    // inferred from a green summary.
+    let allow_missing = std::env::var("SITU_ALLOW_MISSING_LANES").is_ok();
+    if !dropped.is_empty() && !allow_missing {
+        println!(
+            "\n  {} lane(s) DROPPED and SITU_ALLOW_MISSING_LANES is not set — treating as \
+             failure. A backend that did not run is not a backend that passed.",
+            dropped.len()
+        );
+    }
+    let pass = ran_any
+        && lanes.iter().all(|(_, r)| *r)
+        && (dropped.is_empty() || allow_missing);
+    println!(
+        "\nGATE: {}  ({} lane(s) ran, {} dropped)",
+        if pass { "PASS" } else { "FAIL" },
+        lanes.len(),
+        dropped.len()
+    );
     if !pass {
         std::process::exit(1);
     }
