@@ -118,6 +118,11 @@ personaplex = ["qwen3tts", "dep:burn-ndarray", "burn-ndarray/blas-accelerate"]
 # memmap2 backs the zero-copy load seam (mmap'd derived-sibling blobs aliased
 # onto the GPU via register_external_aliased — models/personaplex/qpile.rs).
 q4 = ["dep:cubecl", "dep:memmap2"]
+# MXFP4 (microscaling FP4) decode + the bit-exact MXFP4 -> NVFP4 transcode
+# gate (`mxfp4_gate`). The codec itself (mary::nn::mxfp4) is dependency-free
+# and always compiled; only the gate needs sha2, to hash the full decode of
+# real checkpoint bytes against the k3oracle reference hashes.
+mxfp4 = ["dep:sha2"]
 # `mary::speak` — the production voice seam: Qwen3-TTS synthesis loading its
 # weights from a durable standalone pile (no safetensors in the load path).
 speak = ["qwen3tts"]
@@ -562,3 +567,25 @@ required-features = ["voxtral"]
 [[bin]]
 name = "kimi_situ_gate"
 required-features = ["kimi-k3"]
+# MXFP4 decode + MXFP4 -> NVFP4 transcode gate: bit-exactness against the
+# k3oracle reference decode of real Kimi-K3 expert bytes.
+[[bin]]
+name = "mxfp4_gate"
+required-features = ["mxfp4"]
+
+# How far the bit-exact transcode reaches: sweep the E8M0 exponent span of a
+# checkpoint's scale planes (reads scales only, never a weight byte).
+[[bin]]
+name = "mxfp4_span_sweep"
+required-features = ["mxfp4"]
+
+# Which block-scaled FP4 tensor-core shapes THIS GPU reports (MXFP4 ue8m0
+# scale_vec::2X vs NVFP4 e4m3 scale_vec::4X) — the transcode's target, asked
+# rather than assumed.
+[[bin]]
+name = "mxfp4_mma_probe"
+required-features = ["mxfp4", "cuda-backend"]
+
+[[bin]]
+name = "mxmma_probe"
+required-features = ["mxfp4", "cuda-backend"]
