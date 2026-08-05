@@ -54,9 +54,18 @@
 //!   refuses. A bogus shape (`m16n8k99`) exits 255, so the assembler is
 //!   genuinely validating rather than accepting anything.
 //!
-//!   What this does NOT establish: that the hardware EXECUTES either correctly
-//!   (that needs a launch against a CPU reference), or which of the two is
-//!   faster. This module therefore becomes insurance and a possible performance
+//!   AND IT EXECUTES. A launched kernel (32 threads, one `mma.sync`) with every
+//!   A and B element set to the E2M1 code for 1.0 and every scale byte to E8M0
+//!   127 = 2^0 returns exactly 64.0 in all 128 output floats — the correct
+//!   k=64 dot product — with zero mismatches. Uniform operands make this
+//!   independent of fragment layout, so it tests the arithmetic and not our
+//!   understanding of which thread holds what. Raising both scale operands to
+//!   2^1 returns exactly 256.0, which is what discriminates a real scaled MMA
+//!   from one that ignores the scale operand and would have returned 64.0
+//!   either way.
+//!
+//!   What this still does NOT establish: which of the two encodings is FASTER.
+//!   That is a throughput question and is unmeasured. This module therefore becomes insurance and a possible performance
 //!   option, not a required step — which is the opposite of the premise it was
 //!   written under.
 //! - The older note this replaces said only that necessity was unestablished. This module
