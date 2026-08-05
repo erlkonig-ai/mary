@@ -64,8 +64,23 @@
 //!   from one that ignores the scale operand and would have returned 64.0
 //!   either way.
 //!
-//!   What this still does NOT establish: which of the two encodings is FASTER.
-//!   That is a throughput question and is unmeasured. This module therefore becomes insurance and a possible performance
+//!   AND THEY ARE THE SAME SPEED. Instruction throughput measured with four
+//!   independent accumulators (so the loop is not latency-bound), 20,000
+//!   iterations x 50 launches, three repetitions: MXFP4 28.687 / 28.697 /
+//!   28.685 ms against NVFP4 28.700 / 28.686 / 28.689 ms — ratios 0.9996,
+//!   1.0004, 0.9998, a spread of about 0.08%. Indistinguishable.
+//!
+//!   So the transcode buys nothing on either axis. If anything the untested
+//!   direction favours leaving the checkpoint alone: NVFP4 carries one scale
+//!   byte per 16 elements against MXFP4's one per 32, so a bandwidth-bound
+//!   GEMM moves TWICE the scale data in NVFP4 — an inference from the format,
+//!   not a measurement, and the measurement above is one warp with no memory
+//!   traffic, so a real GEMM could differ.
+//!
+//!   CONCLUSION: this module is not required and not faster. It is kept as
+//!   insurance against a consumer that only speaks NVFP4, and as a worked
+//!   example of an exact relabelling. It should not be on anyone's critical
+//!   path. This module therefore becomes insurance and a possible performance
 //!   option, not a required step — which is the opposite of the premise it was
 //!   written under.
 //! - The older note this replaces said only that necessity was unestablished. This module
