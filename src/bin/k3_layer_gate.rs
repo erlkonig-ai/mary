@@ -2395,6 +2395,194 @@ const N_KDA: usize = 21;
 /// that stops running drops it.
 const N_ORACLE_ARRAYS_MIN: usize = 117;
 
+/// The M lane: the whole prefix, from token ids to the final hidden state.
+///
+/// Returns the number of checks it added, so `Z1` can keep accounting for
+/// every check rather than trusting a constant.
+fn lane_model(
+    r: &mut Report,
+    p: &Oracle,
+    ck: &Ckpt,
+    cfg: &K3Config,
+    dims: &MoeDims,
+    dev: &Dev,
+) -> usize {
+    let before = r.checks.len();
+    let t = &cfg.text_config;
+    let n_layers = p.i64("meta_n_layers")[0] as usize;
+    let ids = p.i64("model_input_ids");
+    let ish = p.shape("model_input_ids");
+    assert_eq!(ish.len(), 2, "model_input_ids rank");
+    let (batch, seq) = (ish[0], ish[1]);
+    let tokens = batch * seq;
+    let hidden = t.hidden_size;
+    assert_eq!(ids.len(), tokens, "model_input_ids length");
+
+    println!("
+== M: the whole {n_layers}-layer prefix, token ids -> hidden ==");
+
+    // ---- embed_tokens ---------------------------------------------------
+    //
+    // Gathered row by row out of the raw checkpoint bytes. The table is
+    // vocab x hidden and only `tokens` of its rows are ever touched, so
+    // decoding all of it would cost gigabytes to read 32 rows.
+    let (dt, esh, ebytes) = ck.raw("language_model.model.embed_tokens.weight");
+    assert_eq!(dt, "BF16", "embed_tokens dtype");
+    assert_eq!(esh, vec![t.vocab_size, hidden], "embed_tokens shape");
+    let mut emb: Vec<f32> = Vec::with_capacity(tokens * hidden);
+    for &id in &ids {
+        let row = usize::try_from(id).expect("token id is not negative");
+        assert!(row < t.vocab_size, "token id {row} outside the vocabulary");
+        let base = row * hidden * 2;
+        for j in 0..hidden {
+            let o = base + j * 2;
+            emb.push(f32::from_bits(
+                (u16::from_le_bytes([ebytes[o], ebytes[o + 1]]) as u32) << 16,
+            ));
+        }
+    }
+    // The first layer's recorded input IS the embedding output, so this is a
+    // real comparison and not a restatement: it catches a wrong row order
+    // (the [b, t] -> b*seq + t flattening) and a wrong table.
+    r.exact(
+        "M/embed",
+        "embed_tokens, gathered for this drive's ids, equals the input the oracle \
+         recorded for layer 0 — bit for bit. Catches both a wrong table and a wrong \
+         row order, which a shape check cannot tell apart",
+        &emb,
+        &p.bf16("L00_layer_in_bf16bits"),
+    );
+
+    // ---- the chain ------------------------------------------------------
+    let schedule: Vec<bool> = (0..n_layers).map(|l| t.is_attn_res_checkpoint(l)).collect();
+    let mut mixer = DepthMixer::<B>::new(schedule.clone());
+    let mut hs = t2v(emb, tokens, hidden, dev);
+    let mut rel: Vec<f64> = Vec::with_capacity(n_layers);
+
+    for layer in 0..n_layers {
+        let lp = format!("language_model.model.layers.{layer}");
+        let (ln1_w, ln2_w) = ck.layer_norms::<B>(layer, dev);
+        let sa_res: AttnResParams<B> =
+            ck.attn_res_site(&format!("{lp}.self_attention_res"), t.rms_norm_eps, dev);
+        let mlp_res: AttnResParams<B> =
+            ck.attn_res_site(&format!("{lp}.mlp_res"), t.rms_norm_eps, dev);
+        let attn = match t.attn_kind(layer) {
+            AttnKind::Mla => {
+                let mc = MlaConfig::from_text_config(t).expect("MlaConfig");
+                K3Attn::Mla(Box::new(MlaBlock::new(mc.clone(), ck.mla_weights::<B>(layer, &mc, dev), Precision::Bf16)))
+            }
+            AttnKind::Kda => {
+                let kc = KdaAttnConfig::from_text_config(t).expect("KdaAttnConfig");
+                K3Attn::Kda(Box::new(KdaAttention::new(kc.clone(), ck.kda_weights::<B>(layer, &kc, dev), ActRound::Bf16)))
+            }
+        };
+        let ffn = if t.is_moe_layer(layer) {
+            K3Ffn::Moe(Box::new(ck.moe_block_weights::<B>(layer, true, dev)))
+        } else {
+            K3Ffn::Dense(Box::new(ck.mlp_weights::<B>(&format!("{lp}.mlp"), dev)))
+        };
+        let dec = K3DecoderLayer::new(
+            layer,
+            dims.clone(),
+            ActRound::Bf16,
+            ln1_w,
+            ln2_w,
+            sa_res,
+            mlp_res,
+            attn,
+            ffn,
+        );
+        let mut cache = dec.new_cache(batch);
+        let tr = dec.forward(&mut mixer, hs.clone(), batch, &mut cache, |id| {
+            ck.expert(layer, id, dev)
+        });
+        hs = tr.out.clone();
+
+        // The bank depth after this layer is a structural fact the schedule
+        // fixes in advance; a mixer that took a snapshot on the wrong layer
+        // lands here rather than drifting numerically for five more layers.
+        let want_bank = schedule[..=layer].iter().filter(|&&b| b).count();
+        r.boolean(
+            &format!("M/L{layer:02}.bank"),
+            "the depth bank holds exactly the snapshots the schedule takes through this \
+             layer — a snapshot on the wrong layer is structural and shows here",
+            mixer.bank().len() == want_bank,
+            format!("{} snapshots, schedule takes {want_bank} through layer {layer}", mixer.bank().len()),
+        );
+
+        let want = p.bf16(&format!("L{layer:02}_layer_out_bf16bits"));
+        let got = vec_of(hs.clone());
+        let c = compare(&got, &want);
+        let scale = absmax(&want);
+        rel.push(if scale > 0.0 { c.max_abs / scale } else { f64::INFINITY });
+        // 8 ulps per layer, accumulated. Stated up front rather than fitted to
+        // what the run produced; if the real accumulation does not fit, that is
+        // a measurement worth having and not a number to widen.
+        r.close(
+            &format!("M/L{layer:02}.out"),
+            "the hidden state after this layer, carried from the token ids through every \
+             layer before it under its own error — no oracle tensor enters the chain",
+            &got,
+            &want,
+            bf16_budget(8 * (layer + 1), scale),
+            None,
+        );
+    }
+
+    // ---- the model-level AttnRes and the final norm ----------------------
+    let out_res: AttnResParams<B> =
+        ck.attn_res_site("language_model.model.output_attn_res", t.rms_norm_eps, dev);
+    let mix = mixer.finish(hs.clone(), &out_res);
+    let (nsh, nw) = ck.bf16("language_model.model.norm.weight");
+    assert_eq!(nsh, vec![hidden], "model.norm.weight shape");
+    // via t2v + reshape rather than a from_floats overload, so this uses the
+    // same tensor construction every other check in this file goes through
+    let norm_w = t2v(nw, 1, hidden, dev).reshape([hidden]);
+    let normed = rms_norm(mix.out.clone(), &norm_w, t.rms_norm_eps, ActRound::Bf16);
+    let want_final = p.bf16("model_last_hidden_state_bf16bits");
+    let fscale = absmax(&want_final);
+    r.close(
+        "M/last_hidden_state",
+        "the whole prefix: token ids, embedding, thirteen decoder layers, the \
+         model-level depth mixture and model.norm, against the hidden state the \
+         shipped model returned",
+        &vec_of(normed),
+        &want_final,
+        bf16_budget(8 * (n_layers + 1), fscale),
+        None,
+    );
+
+    // ---- how the error GREW ---------------------------------------------
+    //
+    // The more useful instrument. A bug confined to one layer barely moves the
+    // final number when thirteen layers of honest rounding sit on top of it,
+    // but it shows as a STEP here. The bound is on the ratio between
+    // consecutive layers, so it does not care about the absolute scale.
+    let mut worst = (0usize, 1.0f64);
+    for l in 1..rel.len() {
+        let prev = rel[l - 1];
+        let ratio = if prev > 0.0 { rel[l] / prev } else { f64::INFINITY };
+        if ratio > worst.1 {
+            worst = (l, ratio);
+        }
+    }
+    println!("  relative error by layer:");
+    for (l, e) in rel.iter().enumerate() {
+        println!("    L{l:02}  {e:.4e}");
+    }
+    r.boolean(
+        "M/growth",
+        "the relative error grows smoothly along the chain — no single layer multiplies \
+         it by more than 8. A layer that is wrong in a way thirteen layers of rounding \
+         would otherwise hide shows up as a step here rather than as a slightly larger \
+         final number",
+        worst.1 <= 8.0 && rel.iter().all(|e| e.is_finite()),
+        format!("worst step at L{:02}, x{:.2}", worst.0, worst.1),
+    );
+
+    r.checks.len() - before
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let oracle_dir = PathBuf::from(
@@ -2466,7 +2654,16 @@ fn main() {
         per_layer.push((l, res));
     }
 
-    println!("\n== X: cross-implementation, no oracle involved ==");
+    let n_model = if std::env::var("K3_MODEL_LANE").is_ok() {
+        lane_model(&mut r, &p, &ck, &cfg, &dims, &dev)
+    } else {
+        println!("
+== M: skipped (set K3_MODEL_LANE=1 for the whole-prefix chain) ==");
+        0
+    };
+
+    println!("
+== X: cross-implementation, no oracle involved ==");
     let before = r.checks.len();
     lane_cross(&mut r, &p, &ck, &dims, &dev, 4);
     assert_eq!(r.checks.len() - before, N_CROSS, "the X lane changed size");
@@ -2483,7 +2680,7 @@ fn main() {
         .iter()
         .map(|(l, res)| format!("L{l:02}:{}({}+{})", res.checks, res.checks - res.attn_checks, res.attn_checks))
         .collect();
-    let derived = N_SELFTEST + N_PREMISES + N_ORACLE + N_CROSS + sum_layers;
+    let derived = N_SELFTEST + N_PREMISES + N_ORACLE + N_CROSS + sum_layers + n_model;
     r.boolean(
         "Z1",
         "the check count is the sum of the lane counts, and each gated layer contributed \
@@ -2493,7 +2690,7 @@ fn main() {
          the sum, so a complete run is derived + 2",
         r.checks.len() == derived && shapes_ok && per_layer.len() == LAYERS.len(),
         format!(
-            "{} = S{N_SELFTEST} + P{N_PREMISES} + O{N_ORACLE} + X{N_CROSS} + {}",
+            "{} = S{N_SELFTEST} + P{N_PREMISES} + O{N_ORACLE} + X{N_CROSS} + M{n_model} + {}",
             r.checks.len(),
             per_layer_desc.join(" + ")
         ),
