@@ -430,6 +430,48 @@ impl Report {
         );
     }
 
+    /// A negative control, stated as what it means: the positive check would
+    /// REJECT this wrong variant, and the wrong variant is clearly separated
+    /// from where the correct implementation actually lands.
+    ///
+    /// Prefer this to `must_differ` with a hand-scaled floor. A floor derived
+    /// from a budget rides on the layer's activation scale, so the same
+    /// control can pass on one layer and fail on another for reasons that have
+    /// nothing to do with whether it discriminates -- which is precisely what
+    /// happened to `neg.a_log_last96` on layer 12.
+    fn must_reject(
+        &mut self,
+        id: &str,
+        what: &str,
+        got: &[f32],
+        want: &[f32],
+        budget: f64,
+        correct_dev: f64,
+    ) {
+        let c = compare(got, want);
+        let clears_budget = !(c.max_abs <= budget);
+        let separated = !(c.max_abs <= CONTROL_MARGIN * correct_dev);
+        self.push(
+            id,
+            what,
+            clears_budget && separated && c.max_abs.is_finite(),
+            format!(
+                "n={} max|d|={:.5e}; positive check's budget {:.5e} ({}); correct \
+                 implementation measures {:.5e}, so separation {:.1}x (need {:.0}x) ({}); \
+                 bit-exact {:.3}%",
+                c.n,
+                c.max_abs,
+                budget,
+                if clears_budget { "exceeded" } else { "NOT EXCEEDED" },
+                correct_dev,
+                c.max_abs / correct_dev,
+                CONTROL_MARGIN,
+                if separated { "separated" } else { "NOT SEPARATED" },
+                c.exact_frac * 100.0
+            ),
+        );
+    }
+
     fn failures(&self) -> Vec<&Check> {
         self.checks.iter().filter(|c| !c.ok).collect()
     }
@@ -571,7 +613,55 @@ fn lane_selftest(r: &mut Report) {
     let s6 = !probe.checks.pop().unwrap().ok;
     probe.exact("_", "_", &base, &base);
     let s6b = probe.checks.pop().unwrap().ok;
-    r.boolean(
+    {
+
+        // S5b: must_reject's two arms, each shown failing ALONE. An arm that is
+
+        // never exercised is not a control, and this comparator has two.
+
+        let base: Vec<f32> = (0..64).map(|i| i as f32 * 0.01).collect();
+
+        let mut far = base.clone();
+
+        far[7] += 1.0;
+
+        let mut s = Report::new();
+
+        // clears a tiny budget, but the correct implementation is just as far off
+
+        s.must_reject("probe", "budget cleared, separation absent", &far, &base, 1e-6, 1.0);
+
+        // stands clear of a tiny correct error, but never reaches the budget
+
+        s.must_reject("probe", "separated, budget not reached", &far, &base, 1e9, 1e-9);
+
+        // and both together pass
+
+        s.must_reject("probe", "both", &far, &base, 1e-6, 1e-9);
+
+        let v: Vec<bool> = s.checks.iter().map(|c| c.ok).collect();
+
+        r.boolean(
+
+            "S5b",
+
+            "must_reject() FAILS when EITHER arm fails — a wrong variant that clears the \
+
+             budget but sits where the correct implementation does is not a control, and \
+
+             neither is one that is well separated but never reaches the rejection \
+
+             threshold. Both arms shown failing alone, then passing together",
+
+            v == vec![false, false, true],
+
+            format!("[budget-only, separation-only, both] ok = {v:?}"),
+
+        );
+
+        }
+
+        r.boolean(
         "S6",
         "exact() FAILS on a one-ulp difference in one element of 64 and PASSES on an \
          identical array",
@@ -859,8 +949,8 @@ fn routing_divergence(
     ref_w: &[f32],
     tokens: usize,
     k: usize,
-) -> (usize, f64) {
-    let mut flips = 0usize;
+) -> (Vec<usize>, f64) {
+    let mut flipped: Vec<usize> = Vec::new();
     let mut wmax = 0f64;
     for tk in 0..tokens {
         let mine: BTreeSet<usize> = routing.topk_idx[tk * k..(tk + 1) * k].iter().copied().collect();
@@ -869,7 +959,7 @@ fn routing_divergence(
         assert_eq!(mine.len(), k, "duplicate expert in this port's selection");
         assert_eq!(theirs.len(), k, "duplicate expert in the shipped selection");
         if mine != theirs {
-            flips += 1;
+            flipped.push(tk);
         }
         for j in 0..k {
             let id = routing.topk_idx[tk * k + j];
@@ -883,7 +973,7 @@ fn routing_divergence(
             }
         }
     }
-    (flips, wmax)
+    (flipped, wmax)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1035,7 +1125,21 @@ fn run_layer(
         Some(EXACT_FRAC_ELEMENTWISE),
     );
 
-    let v_mlp = stack_candidates(&bank, t2v(mlp_prefix_ref.clone(), tokens, hidden, dev));
+    // AT A BOUNDARY THE MLP SITE MIXES OVER ONE MORE CANDIDATE THAN THE
+    // SELF-ATTENTION SITE. The snapshot is pushed BETWEEN the two mixtures, so
+    // the sa site sees `bank ++ [acc]` and the mlp site sees
+    // `bank ++ [snapshot] ++ [acc]`. Gating only layers 3 and 4 — neither a
+    // boundary — this distinction never arose, and the gate stacked the
+    // pre-snapshot bank at both sites. Adding layer 12 surfaced it immediately
+    // as a shape mismatch (2 slots offered where the oracle had 3).
+    let mlp_bank: Vec<Tensor<B, 2>> = if t.is_attn_res_checkpoint(layer) {
+        let mut b = bank.clone();
+        b.push(t2v(layer_in.clone(), tokens, hidden, dev));
+        b
+    } else {
+        bank.clone()
+    };
+    let v_mlp = stack_candidates(&mlp_bank, t2v(mlp_prefix_ref.clone(), tokens, hidden, dev));
     r.exact(
         &format!("{tag}/tf.attnres_mlp.stack"),
         "the MLP AttnRes candidate stack, accumulator LAST — bit-exact against the \
@@ -1117,13 +1221,13 @@ fn run_layer(
     );
     let ref_idx = p.i64(&format!("{tag}_moe_gate_out_topk_idx"));
     let ref_w = p.f32(&format!("{tag}_moe_gate_out_topk_weight"));
-    let (flips, wmax) = routing_divergence(&tf_bt.routing, &ref_idx, &ref_w, tokens, dims.top_k);
+    let (flipped, wmax) = routing_divergence(&tf_bt.routing, &ref_idx, &ref_w, tokens, dims.top_k);
     r.boolean(
         &format!("{tag}/tf.moe.router_set"),
         "driven from the oracle's own moe_in, the routed-expert SET is the shipped one \
          for EVERY token and the combining weights agree through the index pairing",
-        flips == 0 && !(wmax > 1e-6),
-        format!("{tokens} tokens x top-{}, 0 set flips required, {flips} seen, max |dw| = {wmax:.3e}", dims.top_k),
+        flipped.is_empty() && !(wmax > 1e-6),
+        format!("{tokens} tokens x top-{}, 0 set flips required, {} seen, max |dw| = {wmax:.3e}", dims.top_k, flipped.len()),
     );
     r.close(
         &format!("{tag}/tf.moe.scores"),
@@ -1232,13 +1336,15 @@ fn run_layer(
     let sc = compare(&vec_of(bt.routing.scores.clone()), &sref);
     let sfc = p.f32(&format!("{tag}_moe_router_scores_for_choice"));
     let n_exp = sfc.len() / tokens;
-    let mut min_margin = f64::INFINITY;
+    let mut margins: Vec<f64> = Vec::with_capacity(tokens);
     for tk in 0..tokens {
         let mut row: Vec<f32> = sfc[tk * n_exp..(tk + 1) * n_exp].to_vec();
         row.sort_by(|a, b| b.partial_cmp(a).expect("finite router scores"));
-        min_margin = min_margin.min((row[dims.top_k - 1] - row[dims.top_k]) as f64);
+        margins.push((row[dims.top_k - 1] - row[dims.top_k]) as f64);
     }
-    let (c_flips, c_wmax) = routing_divergence(&bt.routing, &ref_idx, &ref_w, tokens, dims.top_k);
+    let min_margin = margins.iter().copied().fold(f64::INFINITY, f64::min);
+    let (c_flipped, c_wmax) = routing_divergence(&bt.routing, &ref_idx, &ref_w, tokens, dims.top_k);
+    let c_flips = c_flipped.len();
     r.boolean(
         &format!("{tag}/R1"),
         "MEASURED: K3's top-16 expert selection is NOT stable under bfloat16-scale input \
@@ -1254,12 +1360,68 @@ fn run_layer(
             drift.max_abs, drift.ref_absmax, sc.max_abs
         ),
     );
+    // ...and every one of those flips stays at the BOUNDARY.
+    //
+    // Two earlier versions of this check were unsound in opposite ways. The
+    // first bounded the flip COUNT at a quarter of the tokens, which passed
+    // layers 3 and 4 and failed layer 12 -- not because layer 12 is ported
+    // wrong (its teacher-forced router is bit-exact for every token) but
+    // because its 16/17 margin is 25x tighter, so rounding moves far more
+    // tokens across it. The second required each flipped token's margin to be
+    // under twice the drift, which layer 12 satisfies for EVERY token by a
+    // factor of five -- a check that could not fail on the layer it was
+    // written for.
+    //
+    // What rounding can actually do is bounded in the score axis, not the
+    // token axis: a perturbation of `drift` moves an expert across the
+    // threshold only if it was already within `drift` of it. So every expert
+    // that enters or leaves a token's set must lie in that window. An expert
+    // ranked far above the cut cannot be dropped by re-rounding, and a port
+    // that drops one is wrong no matter how few tokens it touches.
+    let window = 2.0 * sc.max_abs;
+    let mut outside: Vec<(usize, usize, f64)> = Vec::new();
+    let mut excluded = 0usize;
+    for tk in 0..tokens {
+        let row = &sfc[tk * n_exp..(tk + 1) * n_exp];
+        let mut srt: Vec<f32> = row.to_vec();
+        srt.sort_by(|a, b| b.partial_cmp(a).expect("finite router scores"));
+        let thr = srt[dims.top_k - 1] as f64;
+        // the witness: experts this token's window puts out of reach
+        excluded += row.iter().filter(|&&s| ((s as f64) - thr).abs() > window).count();
+        if !c_flipped.contains(&tk) {
+            continue;
+        }
+        let mine_t: BTreeSet<usize> =
+            bt.routing.topk_idx[tk * dims.top_k..(tk + 1) * dims.top_k].iter().copied().collect();
+        let theirs_t: BTreeSet<usize> = ref_idx[tk * dims.top_k..(tk + 1) * dims.top_k]
+            .iter()
+            .map(|&x| x as usize)
+            .collect();
+        for &e in mine_t.symmetric_difference(&theirs_t) {
+            let d = ((row[e] as f64) - thr).abs();
+            if !(d <= window) {
+                outside.push((tk, e, d));
+            }
+        }
+    }
     r.boolean(
         &format!("{tag}/R2"),
-        "...but the instability is bounded: at most a quarter of the tokens change their \
-         selected set. More than that would not be rounding, it would be a wrong router",
-        c_flips * 4 <= tokens,
-        format!("{c_flips} of {tokens} tokens ({:.1}%)", 100.0 * c_flips as f64 / tokens as f64),
+        "...and every flip stays at the BOUNDARY: a score moves by at most the drift, so \
+         an expert can only cross the top-16 threshold if it was already within that of \
+         it. An expert entering or leaving a set from FURTHER away did not get there by \
+         rounding, and no flip count — high or low — would notice",
+        outside.is_empty() && excluded > 0,
+        format!(
+            "{c_flips} of {tokens} tokens flip; every changed expert within {window:.3e} of \
+             its token's threshold ({} outside{}); witness: the window puts {excluded} of \
+             {} token-expert pairs out of reach, so this check has something to catch",
+            outside.len(),
+            outside
+                .first()
+                .map(|&(tk, e, d)| format!(", worst: token {tk} expert {e} at {d:.3e}"))
+                .unwrap_or_default(),
+            tokens * n_exp
+        ),
     );
 
     // The routing term: when a token swaps one of its k experts, the block's
@@ -1274,17 +1436,44 @@ fn run_layer(
     let meta: BTreeSet<usize> =
         p.i64(&format!("meta_expert_ids_{tag}")).into_iter().map(|v| v as usize).collect();
     let mine: BTreeSet<usize> = fetched.iter().copied().collect();
+    // What is left here is only what a broken port could actually violate.
+    // The previous version asserted every "extra" expert traces to a flipped
+    // token; that is a theorem (a non-flipped token selects exactly the
+    // shipped set, so every extra necessarily comes from a flipped one) and
+    // theorems do not test anything. R2 above now carries the real
+    // constraint on WHICH experts may differ.
+    //
+    // Sparsity does have teeth: a port that quietly ran the MoE densely, or
+    // fetched an expert twice, produces a fetch list this rejects. So does
+    // the count bound -- the port cannot need more experts than the shipped
+    // run plus what the flipped tokens' set differences can introduce.
+    let mut symdiff_total = 0usize;
+    for &tk in &c_flipped {
+        let mine_t: BTreeSet<usize> =
+            bt.routing.topk_idx[tk * dims.top_k..(tk + 1) * dims.top_k].iter().copied().collect();
+        let theirs_t: BTreeSet<usize> = ref_idx[tk * dims.top_k..(tk + 1) * dims.top_k]
+            .iter()
+            .map(|&x| x as usize)
+            .collect();
+        symdiff_total += mine_t.difference(&theirs_t).count();
+    }
+    let extra = mine.difference(&meta).count();
     r.boolean(
         &format!("{tag}/casc.moe.expert_set"),
-        "the experts the layer fetched are a subset of the ones the shipped run \
-         materialised, and it fetched each exactly once — a dense port would touch all 896",
-        mine.is_subset(&meta) && fetched.len() == mine.len() && !mine.is_empty(),
+        "the layer fetched each expert exactly once and touched far fewer than all 896 — a \
+         port that silently went dense, or double-fetched, fails here — and needed no more \
+         beyond the shipped run's set than the flipped tokens' differences can introduce",
+        fetched.len() == mine.len()
+            && !mine.is_empty()
+            && mine.len() < dims.num_experts
+            && extra <= symdiff_total,
         format!(
-            "{} distinct in {} calls; shipped run materialised {} of {}",
+            "{} distinct in {} calls, of {}; shipped run materialised {}; {extra} beyond it, \
+             flipped tokens introduce at most {symdiff_total}",
             mine.len(),
             fetched.len(),
-            meta.len(),
-            dims.num_experts
+            dims.num_experts,
+            meta.len()
         ),
     );
     r.stage(
@@ -1298,13 +1487,48 @@ fn run_layer(
             + routing_term * absmax(&moe_out_ref),
         None,
     );
+    // A boundary layer PUSHES a snapshot; a non-boundary one must not. Checking
+    // only the length would still pass mutant M05, which replaces the snapshot's
+    // CONTENT with the mixture output — so the pushed slot is compared against
+    // the oracle bit-for-bit. The snapshot is the raw layer input, appended
+    // last, and nothing downstream in this layer reads it, which is exactly why
+    // a wrong one is invisible until the next boundary twelve layers later.
+    let is_boundary = t.is_attn_res_checkpoint(layer);
+    let want_len = nblocks + usize::from(is_boundary);
     r.boolean(
         &format!("{tag}/casc.bank"),
-        "the depth bank is unchanged across a non-boundary layer, and the mixer advanced \
-         exactly one layer",
-        tr.bank_len == nblocks && mixer.layer() == layer + 1,
-        format!("bank {nblocks} -> {}, mixer at layer {}", tr.bank_len, mixer.layer()),
+        "the depth bank grew by exactly one snapshot at a boundary layer and not at all \
+         otherwise, and the mixer advanced exactly one layer",
+        tr.bank_len == want_len && mixer.layer() == layer + 1,
+        format!(
+            "bank {nblocks} -> {} (want {want_len}, boundary {is_boundary}), mixer at layer {}",
+            tr.bank_len,
+            mixer.layer()
+        ),
     );
+    if is_boundary {
+        // `blockres_out` holds the bank AFTER this layer: oldest first, the new
+        // snapshot last.
+        let out_flat = p.bf16(&format!("{tag}_blockres_out_bf16bits"));
+        let oshape = p.shape(&format!("{tag}_blockres_out_bf16bits"));
+        assert_eq!(oshape, vec![tokens, want_len, hidden], "{tag}_blockres_out shape");
+        let last = want_len - 1;
+        let mut want_snap = Vec::with_capacity(tokens * hidden);
+        for tok in 0..tokens {
+            let base = tok * want_len * hidden + last * hidden;
+            want_snap.extend_from_slice(&out_flat[base..base + hidden]);
+        }
+        let got_snap = vec_of(mixer.bank()[last].clone());
+        let c = compare(&got_snap, &want_snap);
+        r.boolean(
+            &format!("{tag}/casc.snapshot"),
+            "the snapshot this boundary pushed is BIT-EXACT against the oracle's bank — it \
+             is the raw layer input and nothing in this layer reads it back, so a wrong \
+             snapshot stays invisible until the next boundary twelve layers on",
+            c.max_abs == 0.0,
+            format!("max|d| {:.4e}, {:.4}% bit-exact over {} elems", c.max_abs, c.exact_frac * 100.0, c.n),
+        );
+    }
     println!("         (cascade forward: {:.1} s, {} experts)", elapsed.as_secs_f64(), fetched.len());
 
     // ---- the same cascade with the SHIPPED routing pinned ----------------
@@ -1947,15 +2171,6 @@ fn run_kda_tf(
         &st_ref,
         CONTROL_MARGIN * bf16_budget(1, absmax(&st_ref)),
     );
-    r.must_differ(
-        &format!("{tag}/neg.a_log_last96"),
-        "NEGATIVE: taking A_log as the LAST 96 of the padded 128 must not reproduce the \
-         recurrence output — the 32 padding zeros would give those heads a decay rate of \
-         exp(0) = 1, i.e. no decay at all",
-        &p.bf16(&format!("{tag}_kda_ALT_o_A_log_last96_of_padded_bf16bits")),
-        &core_ref,
-        CONTROL_MARGIN * bf16_budget(4, absmax(&core_ref)),
-    );
     let flags = p.i64(&format!("{tag}_kda_flags"));
     let lb = p.scalar(&format!("{tag}_kda_lower_bound"));
     r.boolean(
@@ -1996,6 +2211,22 @@ fn run_kda_tf(
         &format!("{tag}_kda_out_o_bf16bits"),
         8,
         None,
+    );
+    // Measured against what `tf.kda.core` above would actually do to this
+    // variant, and against where that check's own port output lands -- not
+    // against a budget, which on layer 12 sits an order of magnitude above the
+    // correct implementation and made a 21x-separated control look like a
+    // failure.
+    let core_dev = compare(&vec_of(tr.core_out.clone()), &core_ref).max_abs;
+    r.must_reject(
+        &format!("{tag}/neg.a_log_last96"),
+        "NEGATIVE: taking A_log as the LAST 96 of the padded 128 must not reproduce the \
+         recurrence output — the 32 padding zeros would give those heads a decay rate of \
+         exp(0) = 1, i.e. no decay at all",
+        &p.bf16(&format!("{tag}_kda_ALT_o_A_log_last96_of_padded_bf16bits")),
+        &core_ref,
+        bf16_budget(8, absmax(&core_ref)),
+        core_dev,
     );
     one(
         r,
@@ -2144,7 +2375,7 @@ fn lane_cross(r: &mut Report, p: &Oracle, ck: &Ckpt, dims: &MoeDims, dev: &Dev, 
 
 /// Checks the S lane produces. Exact, not a floor: a lane that lost a check is
 /// a lane that stopped testing something.
-const N_SELFTEST: usize = 7;
+const N_SELFTEST: usize = 8;
 /// Checks the P lane produces.
 const N_PREMISES: usize = 6;
 /// Checks the O lane produces.
@@ -2228,7 +2459,7 @@ fn main() {
         ),
     );
 
-    const LAYERS: [usize; 2] = [3, 4];
+    const LAYERS: [usize; 3] = [3, 4, 12];
     let mut per_layer: Vec<(usize, LayerResult)> = Vec::new();
     for l in LAYERS {
         let res = run_layer(&mut r, &p, &ck, &cfg, &dims, &dev, l);
@@ -2241,10 +2472,18 @@ fn main() {
     assert_eq!(r.checks.len() - before, N_CROSS, "the X lane changed size");
 
     println!("\n== Z: totality ==");
-    let l3 = &per_layer.iter().find(|(l, _)| *l == 3).expect("layer 3 ran").1;
-    let l4 = &per_layer.iter().find(|(l, _)| *l == 4).expect("layer 4 ran").1;
-    let (mla_n, kda_n) = (l3.checks, l4.checks);
-    let derived = N_SELFTEST + N_PREMISES + N_ORACLE + N_CROSS + mla_n + kda_n;
+    // Derived from whatever LAYERS actually ran, so adding a layer cannot make
+    // the totality check quietly stop covering it.
+    let sum_layers: usize = per_layer.iter().map(|(_, res)| res.checks).sum();
+    let shapes_ok = per_layer.iter().all(|(_, res)| {
+        (res.attn_checks == N_MLA || res.attn_checks == N_KDA)
+            && res.checks - res.attn_checks >= N_LAYER_COMMON
+    });
+    let per_layer_desc: Vec<String> = per_layer
+        .iter()
+        .map(|(l, res)| format!("L{l:02}:{}({}+{})", res.checks, res.checks - res.attn_checks, res.attn_checks))
+        .collect();
+    let derived = N_SELFTEST + N_PREMISES + N_ORACLE + N_CROSS + sum_layers;
     r.boolean(
         "Z1",
         "the check count is the sum of the lane counts, and each gated layer contributed \
@@ -2252,19 +2491,11 @@ fn main() {
          narrowed itself (skipping later layers, returning early) lands here rather than \
          in the headline. The two totality checks themselves are the only ones outside \
          the sum, so a complete run is derived + 2",
-        r.checks.len() == derived
-            && l3.attn_checks == N_MLA
-            && l4.attn_checks == N_KDA
-            && l3.checks - l3.attn_checks == N_LAYER_COMMON
-            && l4.checks - l4.attn_checks == N_LAYER_COMMON,
+        r.checks.len() == derived && shapes_ok && per_layer.len() == LAYERS.len(),
         format!(
-            "{} = S{N_SELFTEST} + P{N_PREMISES} + O{N_ORACLE} + L03:{mla_n} (common {} + \
-             MLA {}) + L04:{kda_n} (common {} + KDA {}) + X{N_CROSS}",
+            "{} = S{N_SELFTEST} + P{N_PREMISES} + O{N_ORACLE} + X{N_CROSS} + {}",
             r.checks.len(),
-            l3.checks - l3.attn_checks,
-            l3.attn_checks,
-            l4.checks - l4.attn_checks,
-            l4.attn_checks
+            per_layer_desc.join(" + ")
         ),
     );
     r.boolean(
