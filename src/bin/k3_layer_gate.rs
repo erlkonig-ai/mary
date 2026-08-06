@@ -83,7 +83,7 @@ use mary::models::k3::ckpt::Ckpt;
 use mary::models::k3::kda::{Kda, KdaParams, KdaScratch, KdaState, KdaToken};
 use mary::models::k3::kda_attn::{KdaAttnConfig, KdaCache};
 use mary::models::k3::layer::{K3Attn, K3DecoderLayer, K3Ffn, K3FfnTrace};
-use mary::models::k3::mla::{MlaBlock, MlaConfig, Precision};
+use mary::models::k3::mla::{MlaBlock, MlaConfig, MlaKvCache, Precision};
 use mary::models::k3::moe::{BlockTrace, LatentMoe, MoeDims, Routing as MoeRouting};
 use mary::models::k3::ops::{linear, rms_norm, ActRound};
 use mary::models::k3::router::{Accum, Router, RouterConfig};
@@ -2583,6 +2583,143 @@ fn lane_model(
     r.checks.len() - before
 }
 
+/// Rows of `[b, t]`-major `hidden` for one time slice `t`, all batches.
+///
+/// A time slice is NOT contiguous in this layout (row `b*seq + t`), which is
+/// exactly the indexing a decode loop has to get right, so it is done once
+/// here rather than open-coded per call site.
+fn time_slice(hidden: &[f32], batch: usize, seq: usize, width: usize, t: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(batch * width);
+    for b in 0..batch {
+        let base = (b * seq + t) * width;
+        out.extend_from_slice(&hidden[base..base + width]);
+    }
+    out
+}
+
+/// The D lane: feeding a block in chunks must equal feeding it all at once.
+fn lane_decode(
+    r: &mut Report,
+    p: &Oracle,
+    ck: &Ckpt,
+    cfg: &K3Config,
+    dev: &Dev,
+    layers: &[usize],
+) -> usize {
+    let before = r.checks.len();
+    let t = &cfg.text_config;
+    println!("
+== D: chunked decode against a single pass ==");
+
+    for &layer in layers {
+        let tag = format!("L{layer:02}");
+        let shape = p.shape(&format!("{tag}_layer_in_bf16bits"));
+        let (batch, seq, hidden) = (shape[0], shape[1], shape[2]);
+        let tokens = batch * seq;
+        // Realistic input of the right shape; the property under test is
+        // self-consistency, so what matters is that both routes see the SAME
+        // tensor, not which tensor it is.
+        let x = p.bf16(&format!("{tag}_layer_in_bf16bits"));
+
+        match t.attn_kind(layer) {
+            AttnKind::Kda => {
+                let kc = KdaAttnConfig::from_text_config(t).expect("KdaAttnConfig");
+                let w = ck.kda_weights::<B>(layer, &kc, dev);
+                let blk = KdaAttention::new(kc, w, ActRound::Bf16);
+
+                let mut c_all = KdaCache::zeros(&blk, batch);
+                let whole = vec_of(blk.forward(t2v(x.clone(), tokens, hidden, dev), &mut c_all).out);
+
+                // one token at a time, state carried across `seq` calls
+                let mut c_step = KdaCache::zeros(&blk, batch);
+                let mut stepped: Vec<Vec<f32>> = Vec::with_capacity(seq);
+                for ti in 0..seq {
+                    let slice = time_slice(&x, batch, seq, hidden, ti);
+                    stepped.push(vec_of(
+                        blk.forward(t2v(slice, batch, hidden, dev), &mut c_step).out,
+                    ));
+                }
+                // reassemble [b, t] order from the per-step [b] slices
+                let mut got = vec![0f32; tokens * hidden];
+                for (ti, s) in stepped.iter().enumerate() {
+                    for b in 0..batch {
+                        let dst = (b * seq + ti) * hidden;
+                        got[dst..dst + hidden]
+                            .copy_from_slice(&s[b * hidden..(b + 1) * hidden]);
+                    }
+                }
+                r.exact(
+                    &format!("{tag}/D.kda.step_vs_whole"),
+                    "KDA: {seq} single-token calls carrying recurrent state across the cache \
+                     boundary reproduce one call over the whole sequence, BIT FOR BIT — the \
+                     port steps internally, so chunking must not perturb the arithmetic at all",
+                    &got,
+                    &whole,
+                );
+            }
+            AttnKind::Mla => {
+                let mc = MlaConfig::from_text_config(t).expect("MlaConfig");
+                let w = ck.mla_weights::<B>(layer, &mc, dev);
+                let blk = MlaBlock::new(mc, w, Precision::Bf16);
+
+                let x3 = t2v(x.clone(), tokens, hidden, dev).reshape([batch, seq, hidden]);
+                let mask = MlaBlock::<B>::causal_mask(batch, seq, seq, 0, dev);
+                let mut c_all = MlaKvCache::new();
+                let whole = vec_of(
+                    blk.forward(x3, Some(mask), Some(&mut c_all))
+                        .out
+                        .reshape([tokens, hidden]),
+                );
+
+                // two chunks: a prefill of `seq/2`, then the rest one at a time,
+                // which is the shape a real decode loop actually has
+                let half = seq / 2;
+                let mut c_step = MlaKvCache::new();
+                let mut got = vec![0f32; tokens * hidden];
+                let mut done = 0usize;
+                while done < seq {
+                    let take = if done == 0 { half } else { 1 };
+                    let mut chunk = Vec::with_capacity(batch * take * hidden);
+                    for b in 0..batch {
+                        for ti in done..done + take {
+                            let base = (b * seq + ti) * hidden;
+                            chunk.extend_from_slice(&x[base..base + hidden]);
+                        }
+                    }
+                    let m = MlaBlock::<B>::causal_mask(batch, take, done + take, done, dev);
+                    let o = vec_of(
+                        blk.forward(
+                            t2v(chunk, batch * take, hidden, dev).reshape([batch, take, hidden]),
+                            Some(m),
+                            Some(&mut c_step),
+                        )
+                        .out
+                        .reshape([batch * take, hidden]),
+                    );
+                    for b in 0..batch {
+                        for k in 0..take {
+                            let dst = (b * seq + done + k) * hidden;
+                            let srz = (b * take + k) * hidden;
+                            got[dst..dst + hidden].copy_from_slice(&o[srz..srz + hidden]);
+                        }
+                    }
+                    done += take;
+                }
+                r.exact(
+                    &format!("{tag}/D.mla.chunk_vs_whole"),
+                    "MLA: a prefill followed by single-token steps, appending to the KV cache \
+                     and masking with a growing offset, reproduces one pass over the whole \
+                     sequence BIT FOR BIT. A dropped or misordered cache entry is off by \
+                     percent; a reduction-order artifact would sit in the last ulp",
+                    &got,
+                    &whole,
+                );
+            }
+        }
+    }
+    r.checks.len() - before
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let oracle_dir = PathBuf::from(
@@ -2654,6 +2791,8 @@ fn main() {
         per_layer.push((l, res));
     }
 
+    let n_decode = lane_decode(&mut r, &p, &ck, &cfg, &dev, &LAYERS);
+
     let n_model = if std::env::var("K3_MODEL_LANE").is_ok() {
         lane_model(&mut r, &p, &ck, &cfg, &dims, &dev)
     } else {
@@ -2680,7 +2819,8 @@ fn main() {
         .iter()
         .map(|(l, res)| format!("L{l:02}:{}({}+{})", res.checks, res.checks - res.attn_checks, res.attn_checks))
         .collect();
-    let derived = N_SELFTEST + N_PREMISES + N_ORACLE + N_CROSS + sum_layers + n_model;
+    let derived =
+        N_SELFTEST + N_PREMISES + N_ORACLE + N_CROSS + sum_layers + n_model + n_decode;
     r.boolean(
         "Z1",
         "the check count is the sum of the lane counts, and each gated layer contributed \
@@ -2690,7 +2830,7 @@ fn main() {
          the sum, so a complete run is derived + 2",
         r.checks.len() == derived && shapes_ok && per_layer.len() == LAYERS.len(),
         format!(
-            "{} = S{N_SELFTEST} + P{N_PREMISES} + O{N_ORACLE} + X{N_CROSS} + M{n_model} + {}",
+            "{} = S{N_SELFTEST} + P{N_PREMISES} + O{N_ORACLE} + X{N_CROSS} + M{n_model} + D{n_decode} + {}",
             r.checks.len(),
             per_layer_desc.join(" + ")
         ),
