@@ -95,7 +95,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-type B = burn::backend::Cuda<half::bf16>;
+type B = burn::backend::Cuda<f32>;
 type Dev = Device<B>;
 
 // ===========================================================================
