@@ -103,6 +103,17 @@ k3 = ["import", "mxfp4", "burn/ndarray", "dep:safetensors", "dep:memmap2", "dep:
 # ...and the GB10/sm_121 lane on top, so the layer is also checked on the
 # backend it will actually run on here. Needs the CUDA toolkit present.
 k3-cuda = ["k3", "burn/cuda"]
+
+# AttnRes (mary::models::k3::attn_res) - the depth-axis mixture and the
+# snapshot boundary that resets it, in Burn. The module itself needs nothing
+# new; this feature exists for `k3_attn_res_gate`, which wants burn-ndarray for
+# a deterministic CPU arithmetic that is not the GPU's, and `import` for a
+# safetensors reader (the gate takes the AttnRes weights from the checkpoint
+# itself, not from the oracle).
+k3-attn-res = ["k3", "import", "burn/ndarray", "dep:burn-ndarray"]
+# ...and the GB10/sm_121 lane on top, so the primitive is also checked on the
+# backend it will actually run on here. Needs the CUDA toolkit present.
+k3-attn-res-cuda = ["k3-attn-res", "burn/cuda"]
 # Safetensors → pile IMPORT support. The ONLY feature that compiles a
 # safetensors reader (`WeightLoader::SingleFile`/`MultiShard`,
 # `ingest::save_safetensors`, `persist::persist_safetensors_to_pile`, the

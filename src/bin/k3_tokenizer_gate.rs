@@ -41,7 +41,10 @@ use mary::tokenizer;
 use serde_json::Value;
 use triblespace::prelude::*;
 
-const MODEL_DIR: &str = "./kimi-k3";
+/// Checkpoint directory. `K3_MODEL_DIR` overrides, as in the other gates.
+fn model_dir() -> String {
+    std::env::var("K3_MODEL_DIR").unwrap_or_else(|_| "./kimi-k3".into())
+}
 const GOLDEN: &str = "/tmp/mary-k3tok/golden/k3_tokenizer_battery.json";
 
 /// The deliberate breakages. Each one is a real, plausible porting mistake; the
@@ -139,7 +142,7 @@ fn main() {
     .expect("golden json");
 
     // ── ingest into the graph, then read the tokenizer back OUT of it ───────
-    let dir = PathBuf::from(MODEL_DIR);
+    let dir = PathBuf::from(model_dir());
     let mut model_file = std::fs::read(dir.join("tiktoken.model")).expect("tiktoken.model");
     let config_json = std::fs::read(dir.join("tokenizer_config.json")).expect("tokenizer_config.json");
 
