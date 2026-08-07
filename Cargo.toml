@@ -569,6 +569,7 @@ burn-wgpu = { path = "../burn-fork/crates/burn-wgpu" }
 # tensor handle" seam (mmap'd f16 pile pages -> Metal newBufferWithBytesNoCopy ->
 # wgpu buffer -> cubecl handle). Unmodified baseline first; patched below.
 cubecl-runtime = { path = "../cubecl-fork/cubecl-runtime" }
+cubecl-cuda = { path = "../cubecl-fork/cubecl-cuda" }
 cubecl-wgpu = { path = "../cubecl-fork/cubecl-wgpu" }
 # Local triblespace-core: V3 uniform 256-byte headers — every record 256-aligned,
 # so mmap'd blobs sit at GPU-ready offsets for zero-copy aliasing (cat-merge safe).
