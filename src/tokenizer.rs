@@ -58,6 +58,21 @@ mod ty {
     pub const BYTE_LEVEL: Id = id_hex!("4FDB5C7C0999B4DECA894AD75E5A94C6");
     pub const WORD_PIECE: Id = id_hex!("85A060015E6E94F70479E0E6B6BE0D98");
     pub const BPE: Id = id_hex!("71F4DAC1D6392375923D7A2A9FA53650");
+    // ── minted 2026-08-05 (`trible genid`) for the tiktoken lane ──
+    /// Model type: **tiktoken-style byte-level BPE**. Distinct from `BPE`, and
+    /// not a flavour of it: there is no merges list at all — the rank table IS
+    /// the merge order (a pair merges iff its concatenation is a token, at that
+    /// token's rank), so a `TIKTOKEN` tokenizer has `vocab*` but never `merge*`,
+    /// and its pieces are raw bytes (`attrs::piece_bytes`) rather than the
+    /// byte-level-unicode strings a HuggingFace `tokenizer.json` carries.
+    pub const TIKTOKEN: Id = id_hex!("BB88D3A2CAFF2AAA7DC00CA78945CC2E");
+    /// Pre-tokenizer type: **one fancy-regex `find_iter` over `pat_str`**. Not
+    /// `SPLIT` (which splits *on* a delimiter and reconstructs with a
+    /// `SplitDelimiterBehavior`): this one keeps only what the pattern matches,
+    /// and needs a backtracking engine — the pattern's `\s+(?!\S)` branch is a
+    /// negative lookahead the `regex` crate rejects outright. The pattern
+    /// string itself rides the existing `attrs::pattern`.
+    pub const TIKTOKEN_PRE_TOKENIZER: Id = id_hex!("AF6D6B71213E710F92E434D451540805");
 }
 #[allow(dead_code)]
 mod flag {
@@ -117,6 +132,18 @@ pub mod attrs {
         "AE7FE29F2F38153F58C542D5CA4A9356" as piece: Handle<blobencodings::LongString>;
         /// A token's vocab id (vocab entry, added token). Small int in a U256BE.
         "F0E2E782F7BB62F52B1186DDE0EB5388" as token_id: U256BE;
+
+        // ── minted 2026-08-05 — the tiktoken lane ──
+        /// A token's RAW BYTES. The byte-level sibling of `piece`, and the
+        /// reason it had to be minted rather than reused: `piece` is a
+        /// `LongString`, and a tiktoken vocab is not UTF-8 — 1,172 of Kimi-K3's
+        /// 163,584 base tokens are mid-codepoint merge fragments that no
+        /// `String` can hold. (A HuggingFace `tokenizer.json` sidesteps this by
+        /// storing GPT-2 byte-level-unicode *strings*; `tiktoken.model` stores
+        /// base64 of the actual bytes, and re-encoding them into a byte-map the
+        /// source file never mentions would be inventing a representation.)
+        /// Content-addressed like `piece`, so shared tokens still dedup.
+        "714AE13F801202EB27C83E3AB2290669" as piece_bytes: Handle<blobencodings::RawBytes>;
         /// A BPE merge's left piece (`LongString`, dedups against `piece`).
         "5723ECE1FF426C58879B79D5669A7CF1" as merge_left: Handle<blobencodings::LongString>;
         /// A BPE merge's right piece (`LongString`, dedups against `piece`).
@@ -264,6 +291,95 @@ pub fn save_tokenizer_json(
         attrs::max_input_chars?: max_chars,
         attrs::vocab*: vocab_ids.iter(),
         attrs::merge*: merge_ids.iter(),
+        attrs::added*: added_ids.iter(),
+    };
+    let tok_id = tok.root().expect("tokenizer root");
+    facts += tok.into_facts();
+    Ok(Fragment::rooted(tok_id, facts))
+}
+
+/// How many reserved special-token slots a tiktoken tokenizer appends above its
+/// base vocab — `TikTokenTokenizer.num_reserved_special_tokens` in the shipped
+/// `tokenization_kimi.py`. Kimi-K3: 163,584 base + 256 = 163,840 total.
+pub const NUM_RESERVED_SPECIAL_TOKENS: u64 = 256;
+
+/// Ingest a **tiktoken** tokenizer — `tiktoken.model` plus the
+/// `tokenizer_config.json` that names its reserved slots — into a tokenizer
+/// graph. The tiktoken counterpart of [`save_tokenizer_json`], and structurally
+/// simpler: no merges (the rank table is the merge order) and no normalizer or
+/// decoder (byte-level BPE is its own inverse), so the graph is the rank table,
+/// the 256 special tokens, and one pre-tokenizer node holding `pat_str`.
+///
+/// The reserved-slot naming mirrors the shipped `__init__` exactly: ids
+/// `n_base .. n_base + 256` take their content from `added_tokens_decoder` when
+/// the config names them, and `<|reserved_token_{id}|>` (the ABSOLUTE id, not
+/// an offset) otherwise. Slots the config marks `"special": true` carry
+/// `flag::SPECIAL`; the handful marked `false` (`<|open|>`, `<|close|>`,
+/// `<|sep|>`) do not — but all 256 are special *to the encoder*, which is what
+/// `added` membership means here.
+#[cfg(feature = "k3tok")]
+pub fn save_tiktoken(
+    model_file: &[u8],
+    config_json: &[u8],
+    pat_str: &str,
+    source_name: &str,
+    blobs: &mut impl BlobStorePut,
+) -> Result<Fragment, Err> {
+    let ranks = crate::tiktoken::parse_tiktoken_model(model_file)?;
+    let cfg: serde_json::Value = serde_json::from_slice(config_json)?;
+    let mut facts = TribleSet::new();
+
+    // ── the rank table: { piece_bytes, token_id = rank } per entry ──
+    let mut vocab_ids: Vec<Id> = Vec::with_capacity(ranks.len());
+    for (tok, rank) in &ranks {
+        let bh = blobs.put::<blobencodings::RawBytes, _>(tok.clone())?;
+        let e = entity! { _ @ attrs::piece_bytes: bh, attrs::token_id: *rank as u64 };
+        vocab_ids.push(e.root().expect("vocab entry root"));
+        facts += e.into_facts();
+    }
+
+    // ── the 256 reserved special slots: { piece, token_id, index } ──
+    let n_base = ranks.len() as u64;
+    let named = cfg["added_tokens_decoder"].as_object();
+    let mut added_ids: Vec<Id> = Vec::new();
+    for (order, id) in (n_base..n_base + NUM_RESERVED_SPECIAL_TOKENS).enumerate() {
+        let entry = named.and_then(|m| m.get(&id.to_string()));
+        let content = match entry.and_then(|e| e["content"].as_str()) {
+            Some(c) => c.to_string(),
+            None => format!("<|reserved_token_{id}|>"),
+        };
+        let mut tags: Vec<Id> = Vec::new();
+        if entry.map(|e| e["special"].as_bool() == Some(true)).unwrap_or(false) {
+            tags.push(flag::SPECIAL);
+        }
+        let ch = blobs.put::<blobencodings::LongString, _>(content)?;
+        let e = entity! { _ @
+            attrs::piece: ch,
+            attrs::token_id: id,
+            attrs::index: order as u64,
+            metadata::tag*: tags.iter(),
+        };
+        added_ids.push(e.root().expect("added token root"));
+        facts += e.into_facts();
+    }
+
+    // ── the pre-tokenizer node: the pattern, and the fact that it is applied
+    //    by find_iter rather than as a Split (see ty::TIKTOKEN_PRE_TOKENIZER) ──
+    let pat_h = blobs.put::<blobencodings::LongString, _>(pat_str.to_string())?;
+    let pretok = entity! { _ @
+        metadata::tag: ty::TIKTOKEN_PRE_TOKENIZER,
+        attrs::pattern: pat_h,
+    };
+    let pretok_id = pretok.root().expect("pre-tokenizer root");
+    facts += pretok.into_facts();
+
+    let name_h = blobs.put::<blobencodings::LongString, _>(source_name.to_string())?;
+    let tok = entity! { _ @
+        metadata::tag: ty::TIKTOKEN,
+        attrs::model_name: name_h,
+        attrs::pre_tokenizer: pretok_id,
+        attrs::unk_token?: cfg["unk_token"].as_str(),
+        attrs::vocab*: vocab_ids.iter(),
         attrs::added*: added_ids.iter(),
     };
     let tok_id = tok.root().expect("tokenizer root");
@@ -455,6 +571,47 @@ pub fn load_added(
     ordered.into_iter().map(|(_, p, id)| (p, id)).collect()
 }
 
+/// Materialize a **tiktoken** tokenizer's rank table back into `(token bytes,
+/// rank)` pairs — the dual of the vocab half of [`save_tiktoken`]. Unordered
+/// (the rank rides in the pair); feed straight into `Tiktoken::new`.
+pub fn load_tiktoken_ranks(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    tok_id: Id,
+) -> Vec<(Vec<u8>, u64)> {
+    find!(
+        (p, i: u64),
+        pattern!(tribles, [
+            { tok_id @ attrs::vocab: _?entry },
+            { _?entry @ attrs::piece_bytes: ?p, attrs::token_id: ?i },
+        ])
+    )
+    .map(|(bh, rank)| {
+        let b: anybytes::Bytes = blobs.get(bh).expect("piece_bytes blob");
+        (b.to_vec(), rank)
+    })
+    .collect()
+}
+
+/// The pre-tokenizer pattern string a tokenizer's pre-tokenizer node carries
+/// (`attrs::pattern`), if it has one. For a `TIKTOKEN` tokenizer this is the
+/// whole pre-tokenizer: the regex IS the algorithm.
+pub fn load_pre_tokenizer_pattern(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    tok_id: Id,
+) -> Option<String> {
+    find!(
+        (p,),
+        pattern!(tribles, [
+            { tok_id @ attrs::pre_tokenizer: _?node },
+            { _?node @ attrs::pattern: ?p },
+        ])
+    )
+    .next()
+    .map(|(ph,)| read_piece(blobs, ph))
+}
+
 /// The tokenizer ROOT entity in a fact set, if any — the entity carrying BOTH
 /// a model-kind discriminant tag and a `model_name`. The tag alone is NOT
 /// enough: a WordPiece DECODER config node is also tagged `ty::WORD_PIECE`
@@ -468,7 +625,7 @@ pub fn find_tokenizer(tribles: &TribleSet) -> Option<Id> {
         (e: Id, t: Id, n: Inline<inlineencodings::Handle<blobencodings::LongString>>),
         pattern!(tribles, [{ ?e @ metadata::tag: ?t, attrs::model_name: ?n }])
     )
-    .find(|&(_, t, _)| t == ty::WORD_PIECE || t == ty::BPE)
+    .find(|&(_, t, _)| t == ty::WORD_PIECE || t == ty::BPE || t == ty::TIKTOKEN)
     .map(|(e, _, _)| e)
 }
 
@@ -988,6 +1145,52 @@ mod tests {
         );
         assert_eq!(find_tokenizer(&tribles), Some(root));
         assert_ne!(root, dec);
+    }
+
+    /// The tiktoken save/load pair on a three-token toy vocab: raw bytes (NOT
+    /// a `String` — that is the whole reason `piece_bytes` exists), the 256
+    /// reserved slots with their two naming rules, and the pattern. The
+    /// full-scale version of this is `k3_tokenizer_gate`, which additionally
+    /// checks every id against the shipped Python.
+    #[cfg(feature = "k3tok")]
+    #[test]
+    fn tiktoken_ranks_and_specials_round_trip() {
+        // 0xff is not valid UTF-8 on its own — exactly the case a `LongString`
+        // `piece` could not hold.
+        let model = "YQ== 0\nYg== 1\nYWI= 2\n/w== 3\n";
+        let config = r#"{"added_tokens_decoder": {"5": {"content": "[BOS]", "special": true}},
+                         "unk_token": "[UNK]"}"#;
+        let mut blobs = MemoryBlobStore::new();
+        let frag =
+            save_tiktoken(model.as_bytes(), config.as_bytes(), "PAT", "test/tik", &mut blobs).unwrap();
+        let root = frag.root().expect("root");
+        let tribles: TribleSet = frag.into();
+        let reader = BlobStore::reader(&mut blobs).unwrap();
+
+        assert_eq!(find_tokenizer(&tribles), Some(root));
+        let mut ranks = load_tiktoken_ranks(&tribles, &reader, root);
+        ranks.sort_by_key(|(_, r)| *r);
+        assert_eq!(
+            ranks,
+            vec![
+                (b"a".to_vec(), 0),
+                (b"b".to_vec(), 1),
+                (b"ab".to_vec(), 2),
+                (vec![0xffu8], 3),
+            ]
+        );
+        assert_eq!(
+            load_pre_tokenizer_pattern(&tribles, &reader, root).as_deref(),
+            Some("PAT")
+        );
+
+        let added = load_added(&tribles, &reader, root);
+        assert_eq!(added.len(), NUM_RESERVED_SPECIAL_TOKENS as usize);
+        // named by the config where it names them, `<|reserved_token_{ABSOLUTE
+        // id}|>` everywhere else — the shipped `__init__`'s two rules.
+        assert_eq!(added[0], ("<|reserved_token_4|>".to_string(), 4));
+        assert_eq!(added[1], ("[BOS]".to_string(), 5));
+        assert_eq!(added[255], ("<|reserved_token_259|>".to_string(), 259));
     }
 
     // ── construct-from-graph parity: the graph-built tokenizer must encode
