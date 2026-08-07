@@ -234,7 +234,7 @@ pub struct KdaAttention<B: Backend> {
 }
 
 fn vec2<B: Backend>(t: &Tensor<B, 2>) -> Vec<f32> {
-    t.clone().into_data().to_vec().expect("f32 tensor data")
+    t.clone().into_data().convert::<f32>().to_vec().expect("tensor -> f32")
 }
 
 fn t2<B: Backend>(v: Vec<f32>, rows: usize, cols: usize, device: &B::Device) -> Tensor<B, 2> {

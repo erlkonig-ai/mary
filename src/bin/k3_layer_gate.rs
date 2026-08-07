@@ -95,7 +95,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-type B = NdArray<f32>;
+type B = burn::backend::Cuda<half::bf16>;
 type Dev = Device<B>;
 
 // ===========================================================================
@@ -493,7 +493,9 @@ fn t1v(v: Vec<f32>, dev: &Dev) -> Tensor<B, 1> {
 }
 
 fn vec_of<const D: usize>(t: Tensor<B, D>) -> Vec<f32> {
-    t.into_data().to_vec().expect("f32 tensor")
+    // The backend element is bf16; widening to f32 is exact, so the oracle
+    // comparisons below keep their meaning and their budgets.
+    t.into_data().convert::<f32>().to_vec().expect("tensor -> f32")
 }
 
 fn bf(x: f32) -> f32 {

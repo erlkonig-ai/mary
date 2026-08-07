@@ -38,7 +38,7 @@ impl ActRound {
             ActRound::Bf16 => {
                 let device = t.device();
                 let dims = t.dims();
-                let v: Vec<f32> = t.into_data().to_vec().expect("f32 tensor data");
+                let v: Vec<f32> = t.into_data().convert::<f32>().to_vec().expect("tensor -> f32");
                 let v: Vec<f32> = v
                     .into_iter()
                     .map(|x| half::bf16::from_f32(x).to_f32())

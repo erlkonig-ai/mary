@@ -428,9 +428,10 @@ impl LatentMoe {
         let sfc: Vec<f32> = scores_for_choice
             .clone()
             .into_data()
+            .convert::<f32>()
             .to_vec()
             .expect("scores_for_choice f32");
-        let sc: Vec<f32> = scores.clone().into_data().to_vec().expect("scores f32");
+        let sc: Vec<f32> = scores.clone().into_data().convert::<f32>().to_vec().expect("scores -> f32");
 
         let k = self.dims.top_k;
         let mut topk_idx = Vec::with_capacity(tokens * k);
