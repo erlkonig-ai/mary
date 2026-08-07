@@ -35,3 +35,8 @@ pub mod voxtral;
 // and the whole decoder layer that composes them.
 #[cfg(feature = "k3")]
 pub mod k3;
+
+// Inkling (Thinking Machines, 975 B / 276 B MoE, natively multimodal). Config +
+// checkpoint-name->module-slot layout; no operators yet.
+#[cfg(feature = "inkling")]
+pub mod inkling;

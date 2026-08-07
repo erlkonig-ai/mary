@@ -104,6 +104,10 @@ k3 = ["import", "mxfp4", "burn/ndarray", "dep:safetensors", "dep:memmap2", "dep:
 # backend it will actually run on here. Needs the CUDA toolkit present.
 k3-cuda = ["k3", "burn/cuda"]
 
+# Inkling (Thinking Machines) - config + checkpoint layout. Header-only so far:
+# no burn backend, no tensor ops, so this pulls nothing beyond safetensors.
+inkling = ["import", "dep:safetensors", "dep:memmap2"]
+
 # AttnRes (mary::models::k3::attn_res) - the depth-axis mixture and the
 # snapshot boundary that resets it, in Burn. The module itself needs nothing
 # new; this feature exists for `k3_attn_res_gate`, which wants burn-ndarray for
@@ -230,6 +234,12 @@ required-features = ["import"]
 [[bin]]
 name = "k3_layout_gate"
 required-features = ["k3"]
+
+# Totality gate for the Inkling checkpoint layout: asserts the name->slot map is
+# a bijection onto a real checkpoint. Reads safetensors headers only.
+[[bin]]
+name = "inkling_layout_gate"
+required-features = ["inkling"]
 # KDA parity gate: mary::models::kimi_k3::kda against the flash-linear-attention
 # oracle vectors (Triton kernels + fla's own float64 references). Reads .npz
 # only — no checkpoint, no safetensors — so it does not ride `dev-tools`.
