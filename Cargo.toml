@@ -202,6 +202,11 @@ required-features = ["k3", "import"]
 name = "k3_attn_res_gate"
 required-features = ["k3-attn-res"]
 
+# ADVERSARIAL REVIEW: AttnRes at nine slots and across all 93 layers.
+[[bin]]
+name = "k3_attn_res_slots9"
+required-features = ["k3-attn-res"]
+
 # Hand-run dev probes / parity gates (f5-only deps) — kept out of the default
 # (library-only) build behind `dev-tools`.
 [[bin]]
