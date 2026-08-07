@@ -316,11 +316,22 @@ impl RealtimePipeline {
             Some(smp) => smp.token(&text_logits) as i64,
             None => argmax(&text_logits) as i64,
         };
-        let next_text = if p.provided[0] { p.target[0] } else { sampled_text };
+        let next_text = if p.provided[0] {
+            p.target[0]
+        } else {
+            sampled_text
+        };
         let dep_tokens =
-            self.depth.frame(&hidden, next_text, &p.forced(), None, self.sampler.as_mut());
+            self.depth
+                .frame(&hidden, next_text, &p.forced(), None, self.sampler.as_mut());
         let out = self.stream.commit(&p, sampled_text, &dep_tokens);
-        RtStepTrace { input, next_text, dep_tokens, out, text_logits }
+        RtStepTrace {
+            input,
+            next_text,
+            dep_tokens,
+            out,
+            text_logits,
+        }
     }
 
     /// moshi `LMGen.step` on the fast stages (see [`super::lmgen::LmGen::step`]
@@ -352,7 +363,8 @@ impl RealtimePipeline {
         let dummy = [cfg::CARD as i64; 8];
         let p = loop {
             if let Some(p) =
-                self.stream.prepare(Some(&dummy), Some(&dummy), Some(cfg::TEXT_PAD_TOKEN as i64))
+                self.stream
+                    .prepare(Some(&dummy), Some(&dummy), Some(cfg::TEXT_PAD_TOKEN as i64))
             {
                 break p;
             }
@@ -364,7 +376,11 @@ impl RealtimePipeline {
     /// embeddings (`[n, 4096]` row-major), then overwrite the token ring
     /// with the packaged cache snapshot (`[17, CT]` row-major).
     pub fn prompt_voice(&mut self, embeddings: &[f32], cache_snapshot: &[i64]) {
-        assert_eq!(embeddings.len() % cfg::DIM, 0, "vp embeddings not row-aligned");
+        assert_eq!(
+            embeddings.len() % cfg::DIM,
+            0,
+            "vp embeddings not row-aligned"
+        );
         for row in embeddings.chunks_exact(cfg::DIM) {
             self.step_embedding(row);
         }
@@ -374,7 +390,11 @@ impl RealtimePipeline {
     /// Silence spacer (moshi `_step_audio_silence`).
     pub fn prompt_silence(&mut self, frames: usize) {
         for _ in 0..frames {
-            self.step(Some(&SINE), Some(&SILENCE), Some(cfg::TEXT_PAD_TOKEN as i64));
+            self.step(
+                Some(&SINE),
+                Some(&SILENCE),
+                Some(cfg::TEXT_PAD_TOKEN as i64),
+            );
         }
     }
 

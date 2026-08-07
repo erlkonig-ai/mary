@@ -59,7 +59,9 @@ impl<B: Backend> Talker<B> {
             text_fc1: Linear::load(loader, "talker.text_projection.linear_fc1", true, device),
             text_fc2: Linear::load(loader, "talker.text_projection.linear_fc2", true, device),
             layers: (0..TALKER_LAYERS)
-                .map(|i| DecoderLayer::load(loader, &format!("talker.model.layers.{i}"), cfg, device))
+                .map(|i| {
+                    DecoderLayer::load(loader, &format!("talker.model.layers.{i}"), cfg, device)
+                })
                 .collect(),
             norm: RmsNorm::load(loader, "talker.model.norm.weight", TALKER_EPS, device),
             codec_head: loader.load_f32("talker.codec_head.weight").0,
@@ -75,7 +77,8 @@ impl<B: Backend> Talker<B> {
     /// Text ids → talker-space embeddings (text_embedding + ResizeMLP).
     pub fn embed_text(&self, ids: &[u32], device: &B::Device) -> Tensor<B, 3> {
         let e = self.text_embedding.forward(ids, device);
-        self.text_fc2.forward(burn::tensor::activation::silu(self.text_fc1.forward(e)))
+        self.text_fc2
+            .forward(burn::tensor::activation::silu(self.text_fc1.forward(e)))
     }
 
     /// Codec ids → talker-space embeddings.

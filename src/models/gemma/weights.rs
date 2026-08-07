@@ -3,15 +3,15 @@
 //! Safetensors: prefix stripping, bf16→f32, Linear transpose, weight tying.
 //! Pile: per-tensor F32Array blobs with TribleSpace metadata entities.
 
+use burn::prelude::*;
+#[cfg(feature = "import")]
+use memmap2::Mmap;
+#[cfg(feature = "import")]
+use safetensors::SafeTensors;
 #[cfg(feature = "import")]
 use std::collections::HashMap;
 #[cfg(feature = "import")]
 use std::path::Path;
-use burn::prelude::*;
-#[cfg(feature = "import")]
-use safetensors::SafeTensors;
-#[cfg(feature = "import")]
-use memmap2::Mmap;
 
 #[cfg(feature = "import")]
 use crate::models::gemma::config::MistralConfig;
@@ -28,23 +28,24 @@ pub fn bytes_to_f32_pub(data: &[u8], dtype: safetensors::Dtype) -> Vec<f32> {
 #[cfg(feature = "import")]
 fn bytes_to_f32(data: &[u8], dtype: safetensors::Dtype) -> Vec<f32> {
     match dtype {
-        safetensors::Dtype::BF16 => {
-            data.chunks_exact(2).map(|chunk| {
+        safetensors::Dtype::BF16 => data
+            .chunks_exact(2)
+            .map(|chunk| {
                 let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
                 half::bf16::from_bits(bits).to_f32()
-            }).collect()
-        }
-        safetensors::Dtype::F16 => {
-            data.chunks_exact(2).map(|chunk| {
+            })
+            .collect(),
+        safetensors::Dtype::F16 => data
+            .chunks_exact(2)
+            .map(|chunk| {
                 let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
                 half::f16::from_bits(bits).to_f32()
-            }).collect()
-        }
-        safetensors::Dtype::F32 => {
-            data.chunks_exact(4).map(|chunk| {
-                f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-            }).collect()
-        }
+            })
+            .collect(),
+        safetensors::Dtype::F32 => data
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect(),
         safetensors::Dtype::F8_E4M3 => {
             // FP8 E4M3: 1 sign bit, 4 exponent bits, 3 mantissa bits
             // Range: [-448, 448], needs scale_inv for dequantization
@@ -59,8 +60,8 @@ fn bytes_to_f32(data: &[u8], dtype: safetensors::Dtype) -> Vec<f32> {
 #[cfg(feature = "import")]
 fn fp8_e4m3_to_f32(bits: u8) -> f32 {
     let sign = (bits >> 7) & 1;
-    let exp = (bits >> 3) & 0xF;  // 4 bits
-    let mant = bits & 0x7;        // 3 bits
+    let exp = (bits >> 3) & 0xF; // 4 bits
+    let mant = bits & 0x7; // 3 bits
 
     if exp == 0 && mant == 0 {
         return if sign == 1 { -0.0 } else { 0.0 };
@@ -77,7 +78,11 @@ fn fp8_e4m3_to_f32(bits: u8) -> f32 {
         (1.0 + mant as f32 / 8.0) * 2.0f32.powi(exp as i32 - 7)
     };
 
-    if sign == 1 { -value } else { value }
+    if sign == 1 {
+        -value
+    } else {
+        value
+    }
 }
 
 /// Load a tensor from safetensors, converting to f32 and optionally transposing.
@@ -90,7 +95,9 @@ fn load_tensor<B: Backend>(
     transpose: bool,
 ) -> Tensor<B, 2> {
     let (st, local_name) = find_tensor(tensors, name);
-    let view = st.tensor(local_name).unwrap_or_else(|e| panic!("Missing tensor {name}: {e}"));
+    let view = st
+        .tensor(local_name)
+        .unwrap_or_else(|e| panic!("Missing tensor {name}: {e}"));
     let data = view.data();
     let shape = view.shape();
     let dtype = view.dtype();
@@ -99,16 +106,25 @@ fn load_tensor<B: Backend>(
 
     // For FP8, apply scale_inv dequantization if available
     if matches!(dtype, safetensors::Dtype::F8_E4M3) {
-        let scale_name = format!("{}.weight_scale_inv",
-            name.strip_suffix(".weight").unwrap_or(name));
-        if let Ok((scale_st, scale_local)) = std::panic::catch_unwind(|| find_tensor(tensors, &scale_name)) {
+        let scale_name = format!(
+            "{}.weight_scale_inv",
+            name.strip_suffix(".weight").unwrap_or(name)
+        );
+        if let Ok((scale_st, scale_local)) =
+            std::panic::catch_unwind(|| find_tensor(tensors, &scale_name))
+        {
             let scale_view = scale_st.tensor(scale_local).unwrap();
             let scale_bytes = scale_view.data();
             let scale = if scale_view.dtype() == safetensors::Dtype::BF16 {
                 let bits = u16::from_le_bytes([scale_bytes[0], scale_bytes[1]]);
                 half::bf16::from_bits(bits).to_f32()
             } else {
-                f32::from_le_bytes([scale_bytes[0], scale_bytes[1], scale_bytes[2], scale_bytes[3]])
+                f32::from_le_bytes([
+                    scale_bytes[0],
+                    scale_bytes[1],
+                    scale_bytes[2],
+                    scale_bytes[3],
+                ])
             };
             for v in &mut f32_data {
                 *v *= scale;
@@ -118,8 +134,7 @@ fn load_tensor<B: Backend>(
 
     let rows = shape[0];
     let cols = shape[1];
-    let tensor = Tensor::<B, 1>::from_floats(&f32_data[..], device)
-        .reshape([rows, cols]);
+    let tensor = Tensor::<B, 1>::from_floats(&f32_data[..], device).reshape([rows, cols]);
 
     if transpose {
         tensor.swap_dims(0, 1)
@@ -136,7 +151,9 @@ fn load_tensor_1d<B: Backend>(
     device: &B::Device,
 ) -> Tensor<B, 1> {
     let (st, local_name) = find_tensor(tensors, name);
-    let view = st.tensor(local_name).unwrap_or_else(|e| panic!("Missing tensor {name}: {e}"));
+    let view = st
+        .tensor(local_name)
+        .unwrap_or_else(|e| panic!("Missing tensor {name}: {e}"));
     let f32_data = bytes_to_f32(view.data(), view.dtype());
     Tensor::<B, 1>::from_floats(&f32_data[..], device)
 }
@@ -206,10 +223,7 @@ pub fn make_rms_norm<B: Backend>(
 }
 
 /// Set a Linear module's weight from a loaded tensor.
-pub fn set_linear_weight<B: Backend>(
-    linear: &mut burn::nn::Linear<B>,
-    weight: Tensor<B, 2>,
-) {
+pub fn set_linear_weight<B: Backend>(linear: &mut burn::nn::Linear<B>, weight: Tensor<B, 2>) {
     // burn's Linear stores weight as a Param. We need to reconstruct.
     // For now, use the record mechanism.
     let record = burn::nn::LinearRecord {
@@ -227,14 +241,21 @@ pub fn load_ministral<B: Backend>(
     device: &B::Device,
 ) -> MistralModel<B> {
     // Memory-map all shard files
-    let files: Vec<_> = paths.iter().map(|p| {
-        let file = std::fs::File::open(p).unwrap_or_else(|e| panic!("Can't open {:?}: {e}", p));
-        unsafe { Mmap::map(&file) }.unwrap_or_else(|e| panic!("Can't mmap {:?}: {e}", p))
-    }).collect();
+    let files: Vec<_> = paths
+        .iter()
+        .map(|p| {
+            let file = std::fs::File::open(p).unwrap_or_else(|e| panic!("Can't open {:?}: {e}", p));
+            unsafe { Mmap::map(&file) }.unwrap_or_else(|e| panic!("Can't mmap {:?}: {e}", p))
+        })
+        .collect();
 
-    let safetensors: Vec<_> = files.iter().map(|mmap| {
-        SafeTensors::deserialize(mmap).unwrap_or_else(|e| panic!("Can't parse safetensors: {e}"))
-    }).collect();
+    let safetensors: Vec<_> = files
+        .iter()
+        .map(|mmap| {
+            SafeTensors::deserialize(mmap)
+                .unwrap_or_else(|e| panic!("Can't parse safetensors: {e}"))
+        })
+        .collect();
 
     // Build lookup: tensor_name → which shard
     let mut tensors: HashMap<String, &SafeTensors<'_>> = HashMap::new();
@@ -244,7 +265,11 @@ pub fn load_ministral<B: Backend>(
         }
     }
 
-    println!("Loading {} tensors from {} shards", tensors.len(), paths.len());
+    println!(
+        "Loading {} tensors from {} shards",
+        tensors.len(),
+        paths.len()
+    );
 
     // Initialize model with random weights (will be overwritten)
     let mut model = MistralModel::new(config.clone(), device);
@@ -276,14 +301,38 @@ pub fn load_ministral<B: Backend>(
         println!("  Loading layer {i}/{}", config.n_layers);
 
         // Attention norm
-        let attn_norm_w = load_tensor_1d::<B>(&tensors, &format!("{prefix}.input_layernorm.weight"), device);
+        let attn_norm_w = load_tensor_1d::<B>(
+            &tensors,
+            &format!("{prefix}.input_layernorm.weight"),
+            device,
+        );
         model.decoder.layers[i].attn_norm = make_rms_norm(attn_norm_w, config.rms_norm_eps, device);
 
         // Attention projections (all need transpose: PyTorch [out, in] → Burn [in, out])
-        let q_w = load_tensor::<B>(&tensors, &format!("{prefix}.self_attn.q_proj.weight"), device, true);
-        let k_w = load_tensor::<B>(&tensors, &format!("{prefix}.self_attn.k_proj.weight"), device, true);
-        let v_w = load_tensor::<B>(&tensors, &format!("{prefix}.self_attn.v_proj.weight"), device, true);
-        let o_w = load_tensor::<B>(&tensors, &format!("{prefix}.self_attn.o_proj.weight"), device, true);
+        let q_w = load_tensor::<B>(
+            &tensors,
+            &format!("{prefix}.self_attn.q_proj.weight"),
+            device,
+            true,
+        );
+        let k_w = load_tensor::<B>(
+            &tensors,
+            &format!("{prefix}.self_attn.k_proj.weight"),
+            device,
+            true,
+        );
+        let v_w = load_tensor::<B>(
+            &tensors,
+            &format!("{prefix}.self_attn.v_proj.weight"),
+            device,
+            true,
+        );
+        let o_w = load_tensor::<B>(
+            &tensors,
+            &format!("{prefix}.self_attn.o_proj.weight"),
+            device,
+            true,
+        );
 
         set_linear_weight(&mut model.decoder.layers[i].attention.q_proj, q_w);
         set_linear_weight(&mut model.decoder.layers[i].attention.k_proj, k_w);
@@ -292,20 +341,49 @@ pub fn load_ministral<B: Backend>(
 
         // QK-norm (Qwen3 only)
         if config.qk_norm {
-            let q_norm_w = load_tensor_1d::<B>(&tensors, &format!("{prefix}.self_attn.q_norm.weight"), device);
-            let k_norm_w = load_tensor_1d::<B>(&tensors, &format!("{prefix}.self_attn.k_norm.weight"), device);
-            model.decoder.layers[i].attention.q_norm = Some(make_rms_norm(q_norm_w, config.rms_norm_eps, device));
-            model.decoder.layers[i].attention.k_norm = Some(make_rms_norm(k_norm_w, config.rms_norm_eps, device));
+            let q_norm_w = load_tensor_1d::<B>(
+                &tensors,
+                &format!("{prefix}.self_attn.q_norm.weight"),
+                device,
+            );
+            let k_norm_w = load_tensor_1d::<B>(
+                &tensors,
+                &format!("{prefix}.self_attn.k_norm.weight"),
+                device,
+            );
+            model.decoder.layers[i].attention.q_norm =
+                Some(make_rms_norm(q_norm_w, config.rms_norm_eps, device));
+            model.decoder.layers[i].attention.k_norm =
+                Some(make_rms_norm(k_norm_w, config.rms_norm_eps, device));
         }
 
         // FFN norm
-        let ffn_norm_w = load_tensor_1d::<B>(&tensors, &format!("{prefix}.post_attention_layernorm.weight"), device);
+        let ffn_norm_w = load_tensor_1d::<B>(
+            &tensors,
+            &format!("{prefix}.post_attention_layernorm.weight"),
+            device,
+        );
         model.decoder.layers[i].ffn_norm = make_rms_norm(ffn_norm_w, config.rms_norm_eps, device);
 
         // FFN projections (all need transpose)
-        let gate_w = load_tensor::<B>(&tensors, &format!("{prefix}.mlp.gate_proj.weight"), device, true);
-        let up_w = load_tensor::<B>(&tensors, &format!("{prefix}.mlp.up_proj.weight"), device, true);
-        let down_w = load_tensor::<B>(&tensors, &format!("{prefix}.mlp.down_proj.weight"), device, true);
+        let gate_w = load_tensor::<B>(
+            &tensors,
+            &format!("{prefix}.mlp.gate_proj.weight"),
+            device,
+            true,
+        );
+        let up_w = load_tensor::<B>(
+            &tensors,
+            &format!("{prefix}.mlp.up_proj.weight"),
+            device,
+            true,
+        );
+        let down_w = load_tensor::<B>(
+            &tensors,
+            &format!("{prefix}.mlp.down_proj.weight"),
+            device,
+            true,
+        );
 
         set_linear_weight(&mut model.decoder.layers[i].ffn.gate_proj, gate_w);
         set_linear_weight(&mut model.decoder.layers[i].ffn.up_proj, up_w);
@@ -315,4 +393,3 @@ pub fn load_ministral<B: Backend>(
     println!("All weights loaded.");
     model
 }
-

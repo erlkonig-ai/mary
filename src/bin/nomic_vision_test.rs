@@ -42,7 +42,10 @@ fn mark(ok: bool) -> &'static str {
 fn hf_cache_resolve(model_id: &str, filename: &str) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     let repo = format!("models--{}", model_id.replace('/', "--"));
-    let snapshots = Path::new(&home).join(".cache/huggingface/hub").join(repo).join("snapshots");
+    let snapshots = Path::new(&home)
+        .join(".cache/huggingface/hub")
+        .join(repo)
+        .join("snapshots");
     for snap in std::fs::read_dir(&snapshots).ok()?.flatten() {
         let p = snap.path().join(filename);
         if p.exists() {
@@ -171,7 +174,10 @@ fn main() {
         .iter()
         .map(|v| v.as_f64().unwrap() as f32)
         .collect();
-    println!("reference source: {}", refv["source"].as_str().unwrap_or("?"));
+    println!(
+        "reference source: {}",
+        refv["source"].as_str().unwrap_or("?")
+    );
 
     println!("loading NomicVisionEmbedder (mary)...");
     let device: WgpuDevice = Default::default();
@@ -189,20 +195,33 @@ fn main() {
 
     // ---- PILE ROUND-TRIP ----
     println!("\n=== PILE ROUND-TRIP (cosine pile-vs-safetensors, must be ~1.0) ===");
-    let weights = hf_cache_resolve(MODEL_ID, "model.safetensors").expect("nomic-vision weights in cache");
+    let weights =
+        hf_cache_resolve(MODEL_ID, "model.safetensors").expect("nomic-vision weights in cache");
     let snapshot_dir = weights.parent().unwrap();
-    let pile_path = std::env::temp_dir().join(format!("mary_embed_nomic_vision_{}.pile", std::process::id()));
+    let pile_path = std::env::temp_dir().join(format!(
+        "mary_embed_nomic_vision_{}.pile",
+        std::process::id()
+    ));
     let _ = std::fs::remove_file(&pile_path);
     eprintln!("[nomic-vision] persisting {snapshot_dir:?} → {pile_path:?} ...");
-    persist_safetensors_to_pile(snapshot_dir, &pile_path, mary::ingest::LeafDtype::F32).expect("persist nomic-vision to pile");
+    persist_safetensors_to_pile(snapshot_dir, &pile_path, mary::ingest::LeafDtype::F32)
+        .expect("persist nomic-vision to pile");
     let pile_size = std::fs::metadata(&pile_path).unwrap().len();
-    eprintln!("[nomic-vision] pile is {} bytes ({:.3} GiB).", pile_size, gib(pile_size));
+    eprintln!(
+        "[nomic-vision] pile is {} bytes ({:.3} GiB).",
+        pile_size,
+        gib(pile_size)
+    );
 
-    let from_pile = load_nomic_vision_from_pile(&pile_path, device.clone()).expect("load from pile");
+    let from_pile =
+        load_nomic_vision_from_pile(&pile_path, device.clone()).expect("load from pile");
     let pile_vec = from_pile.embed_image(&bytes).expect("pile embed");
     let c_pile = cosine(&pile_vec, &rust_vec);
     let pile_ok = c_pile > 0.999999;
-    println!("  cos(pile, safetensors) [mickey] = {c_pile:.8}  {}", mark(pile_ok));
+    println!(
+        "  cos(pile, safetensors) [mickey] = {c_pile:.8}  {}",
+        mark(pile_ok)
+    );
     pass &= pile_ok;
     let _ = std::fs::remove_file(&pile_path);
 

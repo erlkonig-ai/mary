@@ -24,7 +24,8 @@ const MODEL_ID: &str = "nomic-ai/nomic-embed-text-v1.5";
 const REF_JSON: &str = "/tmp/nomic_ref.json";
 
 const SHORT: &str = "a cartoon mouse";
-const SENTENCE: &str = "The quick brown fox jumps over the lazy dog while the sun sets behind the hills.";
+const SENTENCE: &str =
+    "The quick brown fox jumps over the lazy dog while the sun sets behind the hills.";
 const LONG: &str = "A glacier is not a single block of ice but a slow river of compacted \
 snow, each season adding a distinct layer that records the climate of its year. \
 Some layers carry volcanic ash, others trap ancient air, and together they flow \
@@ -82,7 +83,11 @@ fn gib(bytes: u64) -> f64 {
 fn gen_reference() {
     let texts_py = format!(
         "[{}]",
-        texts().iter().map(|t| format!("{t:?}")).collect::<Vec<_>>().join(", ")
+        texts()
+            .iter()
+            .map(|t| format!("{t:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     // Prefer sentence-transformers; fall back to transformers AutoModel with a
     // hand-rolled masked-mean-pool + normalize if sentence_transformers is absent.
@@ -134,7 +139,13 @@ fn main() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|row| row.as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect())
+        .map(|row| {
+            row.as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_f64().unwrap() as f32)
+                .collect()
+        })
         .collect();
 
     println!("loading NomicTextEmbedder (mary)...");
@@ -142,8 +153,10 @@ fn main() {
     let nomic = load_nomic_text_from_hf(MODEL_ID, device.clone()).expect("load nomic");
     assert_eq!(nomic.dim(), NOMIC_TEXT_DIM);
 
-    let rust_texts: Vec<Vec<f32>> =
-        texts().iter().map(|t| nomic.embed_document(t).expect("embed_document")).collect();
+    let rust_texts: Vec<Vec<f32>> = texts()
+        .iter()
+        .map(|t| nomic.embed_document(t).expect("embed_document"))
+        .collect();
 
     let mut pass = true;
     println!("\n=== PARITY (cosine rust-vs-reference, must be > 0.99) ===");
@@ -164,18 +177,28 @@ fn main() {
     let weights = hf_cache_resolve(MODEL_ID, "model.safetensors").expect("nomic weights in cache");
     let tokenizer = hf_cache_resolve(MODEL_ID, "tokenizer.json").expect("nomic tokenizer in cache");
     let snapshot_dir = weights.parent().unwrap();
-    let pile_path = std::env::temp_dir().join(format!("mary_embed_nomic_{}.pile", std::process::id()));
+    let pile_path =
+        std::env::temp_dir().join(format!("mary_embed_nomic_{}.pile", std::process::id()));
     let _ = std::fs::remove_file(&pile_path);
     eprintln!("[nomic] persisting {snapshot_dir:?} → {pile_path:?} ...");
-    persist_safetensors_to_pile(snapshot_dir, &pile_path, mary::ingest::LeafDtype::F32).expect("persist nomic to pile");
+    persist_safetensors_to_pile(snapshot_dir, &pile_path, mary::ingest::LeafDtype::F32)
+        .expect("persist nomic to pile");
     let pile_size = std::fs::metadata(&pile_path).unwrap().len();
-    eprintln!("[nomic] pile is {} bytes ({:.3} GiB).", pile_size, gib(pile_size));
+    eprintln!(
+        "[nomic] pile is {} bytes ({:.3} GiB).",
+        pile_size,
+        gib(pile_size)
+    );
 
-    let from_pile = load_nomic_text_from_pile(&pile_path, &tokenizer, device.clone()).expect("load from pile");
+    let from_pile =
+        load_nomic_text_from_pile(&pile_path, &tokenizer, device.clone()).expect("load from pile");
     let pile_vec = from_pile.embed_document(SENTENCE).expect("pile embed");
     let c_pile = cosine(&pile_vec, &rust_texts[1]);
     let pile_ok = c_pile > 0.999999;
-    println!("  cos(pile, safetensors) [sentence] = {c_pile:.8}  {}", mark(pile_ok));
+    println!(
+        "  cos(pile, safetensors) [sentence] = {c_pile:.8}  {}",
+        mark(pile_ok)
+    );
     pass &= pile_ok;
     let _ = std::fs::remove_file(&pile_path);
 

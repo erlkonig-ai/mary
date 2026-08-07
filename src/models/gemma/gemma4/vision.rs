@@ -6,8 +6,8 @@
 //!   Pooler: 3x3 spatial average pooling + scale by sqrt(hidden_size)
 //!   Projection: linear + RMSNorm to text decoder hidden_size
 
-use burn::prelude::*;
 use burn::nn::{Linear, RmsNorm};
+use burn::prelude::*;
 use serde::Deserialize;
 
 /// Clipping bounds for Gemma4ClippableLinear layers.
@@ -31,27 +31,29 @@ impl ClipBounds {
 /// Vision encoder configuration (from config.json vision_config).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Gemma4VisionConfig {
-    pub hidden_size: usize,          // 768
-    pub intermediate_size: usize,    // 3072
-    pub num_hidden_layers: usize,    // 16
-    pub num_attention_heads: usize,  // 12
-    pub num_key_value_heads: usize,  // 12
-    pub head_dim: usize,             // 64
-    pub patch_size: usize,           // 16
-    pub pooling_kernel_size: usize,  // 3
+    pub hidden_size: usize,         // 768
+    pub intermediate_size: usize,   // 3072
+    pub num_hidden_layers: usize,   // 16
+    pub num_attention_heads: usize, // 12
+    pub num_key_value_heads: usize, // 12
+    pub head_dim: usize,            // 64
+    pub patch_size: usize,          // 16
+    pub pooling_kernel_size: usize, // 3
     #[serde(default = "default_pos_embed_size")]
     pub position_embedding_size: usize, // 10240
-    pub rms_norm_eps: f64,           // 1e-6
+    pub rms_norm_eps: f64,          // 1e-6
     #[serde(default)]
-    pub standardize: bool,           // false for E2B
+    pub standardize: bool, // false for E2B
 }
 
-fn default_pos_embed_size() -> usize { 10240 }
+fn default_pos_embed_size() -> usize {
+    10240
+}
 
 /// Patch embedder: flattens 16x16 RGB patches and projects to hidden_size.
 /// Adds learned 2D positional embedding via one-hot lookup table.
 pub struct Gemma4PatchEmbedder<B: Backend> {
-    pub input_proj: Linear<B>,  // [3*16*16=768, hidden_size=768]
+    pub input_proj: Linear<B>, // [3*16*16=768, hidden_size=768]
     /// Position embedding table: [2, position_embedding_size, hidden_size]
     /// Index 0 = x positions, index 1 = y positions
     pub position_embedding_table: Tensor<B, 3>,
@@ -116,12 +118,18 @@ impl<B: Backend> Gemma4VisionLayer<B> {
         let residual = x.clone();
         let h = self.input_layernorm.forward(x);
 
-        let q = self.clipped_forward(&self.q_proj, &self.q_clip, h.clone())
-            .reshape([batch, seq_len, self.n_heads, self.head_dim]).swap_dims(1, 2);
-        let k = self.clipped_forward(&self.k_proj, &self.k_clip, h.clone())
-            .reshape([batch, seq_len, self.n_heads, self.head_dim]).swap_dims(1, 2);
-        let v = self.clipped_forward(&self.v_proj, &self.v_clip, h)
-            .reshape([batch, seq_len, self.n_heads, self.head_dim]).swap_dims(1, 2);
+        let q = self
+            .clipped_forward(&self.q_proj, &self.q_clip, h.clone())
+            .reshape([batch, seq_len, self.n_heads, self.head_dim])
+            .swap_dims(1, 2);
+        let k = self
+            .clipped_forward(&self.k_proj, &self.k_clip, h.clone())
+            .reshape([batch, seq_len, self.n_heads, self.head_dim])
+            .swap_dims(1, 2);
+        let v = self
+            .clipped_forward(&self.v_proj, &self.v_clip, h)
+            .reshape([batch, seq_len, self.n_heads, self.head_dim])
+            .swap_dims(1, 2);
 
         let q = self.q_norm.forward(q);
         let k = self.k_norm.forward(k);
@@ -143,8 +151,10 @@ impl<B: Backend> Gemma4VisionLayer<B> {
         let attn_weights = burn::tensor::activation::softmax(attn_scores, 3);
         let attn_out = attn_weights.matmul(v);
 
-        let attn_out = attn_out.swap_dims(1, 2)
-            .reshape([batch, seq_len, self.n_heads * self.head_dim]);
+        let attn_out =
+            attn_out
+                .swap_dims(1, 2)
+                .reshape([batch, seq_len, self.n_heads * self.head_dim]);
         let h = self.clipped_forward(&self.o_proj, &self.o_clip, attn_out);
         let h = self.post_attention_layernorm.forward(h);
         let x = residual + h;
@@ -152,8 +162,11 @@ impl<B: Backend> Gemma4VisionLayer<B> {
         // MLP block
         let residual = x.clone();
         let h = self.pre_feedforward_layernorm.forward(x);
-        let gate = burn::tensor::activation::gelu_approximate(
-            self.clipped_forward(&self.gate_proj, &self.gate_clip, h.clone()));
+        let gate = burn::tensor::activation::gelu_approximate(self.clipped_forward(
+            &self.gate_proj,
+            &self.gate_clip,
+            h.clone(),
+        ));
         let up = self.clipped_forward(&self.up_proj, &self.up_clip, h);
         let h = self.clipped_forward(&self.down_proj, &self.down_clip, gate * up);
         let h = self.post_feedforward_layernorm.forward(h);
@@ -161,7 +174,12 @@ impl<B: Backend> Gemma4VisionLayer<B> {
     }
 
     /// Apply a linear layer with optional clipping (Gemma4ClippableLinear).
-    fn clipped_forward(&self, linear: &Linear<B>, clip: &Option<ClipBounds>, x: Tensor<B, 3>) -> Tensor<B, 3> {
+    fn clipped_forward(
+        &self,
+        linear: &Linear<B>,
+        clip: &Option<ClipBounds>,
+        x: Tensor<B, 3>,
+    ) -> Tensor<B, 3> {
         match clip {
             Some(bounds) => bounds.apply(x, linear),
             None => linear.forward(x),
@@ -170,19 +188,19 @@ impl<B: Backend> Gemma4VisionLayer<B> {
 
     /// Apply 2D RoPE by splitting head_dim into two halves (x, y) and applying 1D RoPE to each.
     pub fn apply_2d_rope(
-        x: Tensor<B, 4>,       // [B, H, S, D]
-        cos: &Tensor<B, 3>,    // [B, S, D] (concatenated x+y cos)
-        sin: &Tensor<B, 3>,    // [B, S, D]
-        half: usize,           // D/2 = size of each spatial part
+        x: Tensor<B, 4>,    // [B, H, S, D]
+        cos: &Tensor<B, 3>, // [B, S, D] (concatenated x+y cos)
+        sin: &Tensor<B, 3>, // [B, S, D]
+        half: usize,        // D/2 = size of each spatial part
     ) -> Tensor<B, 4> {
         let [_batch, _n_heads, _seq_len, _head_dim] = x.dims();
 
         // Split x into two spatial halves
-        let x_spatial = x.clone().narrow(3, 0, half);        // [B, H, S, half]
-        let y_spatial = x.narrow(3, half, half);              // [B, H, S, half]
+        let x_spatial = x.clone().narrow(3, 0, half); // [B, H, S, half]
+        let y_spatial = x.narrow(3, half, half); // [B, H, S, half]
 
         // Split cos/sin into two spatial halves [B, S, half] each
-        let cos_x = cos.clone().narrow(2, 0, half).unsqueeze_dim::<4>(1);  // [B, 1, S, half]
+        let cos_x = cos.clone().narrow(2, 0, half).unsqueeze_dim::<4>(1); // [B, 1, S, half]
         let sin_x = sin.clone().narrow(2, 0, half).unsqueeze_dim::<4>(1);
         let cos_y = cos.clone().narrow(2, half, half).unsqueeze_dim::<4>(1);
         let sin_y = sin.clone().narrow(2, half, half).unsqueeze_dim::<4>(1);
@@ -195,11 +213,7 @@ impl<B: Backend> Gemma4VisionLayer<B> {
     }
 
     /// Standard rotate_half + apply: x * cos + rotate_half(x) * sin
-    fn rotate_half_apply(
-        x: Tensor<B, 4>,
-        cos: Tensor<B, 4>,
-        sin: Tensor<B, 4>,
-    ) -> Tensor<B, 4> {
+    fn rotate_half_apply(x: Tensor<B, 4>, cos: Tensor<B, 4>, sin: Tensor<B, 4>) -> Tensor<B, 4> {
         let [b, h, s, d] = x.dims();
         let half = d / 2;
         let x1 = x.clone().narrow(3, 0, half);
@@ -229,17 +243,22 @@ impl<B: Backend> Gemma4VisionEncoder<B> {
         let config = &self.config;
 
         // Patch embedding (normalization happens inside patch_embedder)
-        let mut h = self.patch_embedder.forward(pixel_values, pixel_position_ids.clone(), device);
+        let mut h = self
+            .patch_embedder
+            .forward(pixel_values, pixel_position_ids.clone(), device);
 
         // Compute 2D RoPE cos/sin
         let (cos, sin) = self.compute_2d_rope(&pixel_position_ids, device);
 
         // Build 2D padding mask: valid queries can attend to valid keys only
         // Mask shape: [batch, 1, seq, seq] — 0 for valid pair, -inf if either is padding
-        let pos_x: Vec<i32> = pixel_position_ids.clone()
+        let pos_x: Vec<i32> = pixel_position_ids
+            .clone()
             .slice([0..batch, 0..num_patches, 0..1])
             .reshape([num_patches])
-            .to_data().to_vec().unwrap();
+            .to_data()
+            .to_vec()
+            .unwrap();
         let is_valid: Vec<bool> = pos_x.iter().map(|&x| x >= 0).collect();
 
         let mut mask_data = vec![0.0f32; num_patches * num_patches];
@@ -250,8 +269,12 @@ impl<B: Backend> Gemma4VisionEncoder<B> {
                 }
             }
         }
-        let attn_mask = Tensor::<B, 1>::from_floats(&mask_data[..], device)
-            .reshape([1, 1, num_patches, num_patches]);
+        let attn_mask = Tensor::<B, 1>::from_floats(&mask_data[..], device).reshape([
+            1,
+            1,
+            num_patches,
+            num_patches,
+        ]);
 
         // Encoder layers (bidirectional)
         // Note: Python uses SDPA with a bidirectional mask that masks padding.
@@ -261,10 +284,13 @@ impl<B: Backend> Gemma4VisionEncoder<B> {
         }
 
         // Count valid (non-padding) patches (for later stripping)
-        let pos_data: Vec<i32> = pixel_position_ids.clone()
+        let pos_data: Vec<i32> = pixel_position_ids
+            .clone()
             .slice([0..1, 0..num_patches, 0..1])
             .reshape([num_patches])
-            .to_data().to_vec().unwrap();
+            .to_data()
+            .to_vec()
+            .unwrap();
         let n_valid = pos_data.iter().filter(|&&v| v >= 0).count();
 
         // Spatial pooling: average k*k patches → output_length tokens
@@ -284,8 +310,14 @@ impl<B: Backend> Gemma4VisionEncoder<B> {
         // Optional standardization (31B): per-channel shift + scale.
         let h = match (&self.std_bias, &self.std_scale) {
             (Some(b), Some(s)) => {
-                let b = b.clone().reshape([1, 1, config.hidden_size]).cast(burn::tensor::FloatDType::F32);
-                let s = s.clone().reshape([1, 1, config.hidden_size]).cast(burn::tensor::FloatDType::F32);
+                let b = b
+                    .clone()
+                    .reshape([1, 1, config.hidden_size])
+                    .cast(burn::tensor::FloatDType::F32);
+                let s = s
+                    .clone()
+                    .reshape([1, 1, config.hidden_size])
+                    .cast(burn::tensor::FloatDType::F32);
                 (h - b) * s
             }
             _ => h,
@@ -293,7 +325,7 @@ impl<B: Backend> Gemma4VisionEncoder<B> {
 
         // Norm (run in f32 to avoid f16 overflow on large scaled values)
         let h = self.embedding_pre_projection_norm.forward(h);
-        
+
         // Cast back to original dtype before projection
         let h = h.cast(dt);
         let h = self.embedding_projection.forward(h);
@@ -318,8 +350,8 @@ impl<B: Backend> Gemma4VisionEncoder<B> {
         let inv_freq: Vec<f32> = (0..half_spatial)
             .map(|i| (1.0 / theta.powf(2.0 * i as f64 / spatial_dim as f64)) as f32)
             .collect();
-        let inv_freq_t = Tensor::<B, 1>::from_floats(&inv_freq[..], device)
-            .reshape([1, half_spatial, 1]); // [1, freq, 1]
+        let inv_freq_t =
+            Tensor::<B, 1>::from_floats(&inv_freq[..], device).reshape([1, half_spatial, 1]); // [1, freq, 1]
 
         let [batch, num_patches, _] = position_ids.dims();
 
@@ -329,15 +361,18 @@ impl<B: Backend> Gemma4VisionEncoder<B> {
 
         for dim in 0..2 {
             // Extract positions for this spatial dimension
-            let pos = position_ids.clone()
-                .slice([0..batch, 0..num_patches, dim..dim+1])
+            let pos = position_ids
+                .clone()
+                .slice([0..batch, 0..num_patches, dim..dim + 1])
                 .reshape([batch, num_patches])
                 .float()
                 .clamp_min(0.0); // Clamp -1 padding to 0
 
             // Outer product: [batch, 1, num_patches] × [1, freq, 1] → [batch, freq, num_patches]
             let pos_expanded = pos.unsqueeze_dim::<3>(1); // [batch, 1, num_patches]
-            let freqs = inv_freq_t.clone().expand([batch, half_spatial, 1])
+            let freqs = inv_freq_t
+                .clone()
+                .expand([batch, half_spatial, 1])
                 .matmul(pos_expanded); // [batch, freq, num_patches]
             let freqs = freqs.swap_dims(1, 2); // [batch, num_patches, freq]
 
@@ -374,8 +409,12 @@ impl<B: Backend> Gemma4VisionEncoder<B> {
         for p in 0..num_patches {
             let x = pos[p * 2];
             let y = pos[p * 2 + 1];
-            if x > max_x { max_x = x; }
-            if y > max_y { max_y = y; }
+            if x > max_x {
+                max_x = x;
+            }
+            if y > max_y {
+                max_y = y;
+            }
         }
         let pw = (max_x + 1) as usize;
         let ph = (max_y + 1) as usize;
@@ -384,8 +423,9 @@ impl<B: Backend> Gemma4VisionEncoder<B> {
         // Convert to f32 first: under the BHalf backend the tensor data is f16,
         // and a bare to_vec::<f32>() TypeMismatches. This CPU pooling scatter is
         // backend-width-agnostic.
-        let hidden_states_data: Vec<f32> = hidden_states.to_data().convert::<f32>().to_vec().unwrap();
-        
+        let hidden_states_data: Vec<f32> =
+            hidden_states.to_data().convert::<f32>().to_vec().unwrap();
+
         let out_ph = ph / k;
         let out_pw = pw / k;
         let out_num_patches = out_ph * out_pw;
@@ -396,15 +436,17 @@ impl<B: Backend> Gemma4VisionEncoder<B> {
             for p in 0..num_patches {
                 let x = pos[b * num_patches * 2 + p * 2];
                 let y = pos[b * num_patches * 2 + p * 2 + 1];
-                if x < 0 || y < 0 { continue; } // padding
+                if x < 0 || y < 0 {
+                    continue;
+                } // padding
                 let (x, y) = (x as usize, y as usize);
-                
+
                 let out_x = x / k;
                 let out_y = y / k;
                 let out_p = out_y * out_pw + out_x;
-                
+
                 count_grid[b * out_num_patches + out_p] += 1;
-                
+
                 for h in 0..hidden {
                     let src = b * num_patches * hidden + p * hidden + h;
                     let dst = b * out_num_patches * hidden + out_p * hidden + h;
@@ -425,8 +467,11 @@ impl<B: Backend> Gemma4VisionEncoder<B> {
             }
         }
 
-        Tensor::<B, 1>::from_floats(&out_grid[..], &device)
-            .reshape([batch, out_num_patches, hidden])
+        Tensor::<B, 1>::from_floats(&out_grid[..], &device).reshape([
+            batch,
+            out_num_patches,
+            hidden,
+        ])
     }
 }
 
@@ -434,8 +479,8 @@ impl<B: Backend> Gemma4PatchEmbedder<B> {
     /// Forward: normalize, project flattened patches + add position embeddings.
     pub fn forward(
         &self,
-        pixel_values: Tensor<B, 3>,        // [batch, num_patches, 3*16*16] in [0, 1]
-        position_ids: Tensor<B, 3, Int>,    // [batch, num_patches, 2]
+        pixel_values: Tensor<B, 3>, // [batch, num_patches, 3*16*16] in [0, 1]
+        position_ids: Tensor<B, 3, Int>, // [batch, num_patches, 2]
         device: &B::Device,
     ) -> Tensor<B, 3> {
         let [batch, num_patches, _] = pixel_values.dims();
@@ -456,21 +501,27 @@ impl<B: Backend> Gemma4PatchEmbedder<B> {
         let mut pos_embed = Tensor::<B, 3>::zeros([batch, num_patches, hidden_size], device)
             .cast(burn::tensor::FloatDType::F32);
         for dim in 0..2usize {
-            let dim_pos = clamped.clone()
-                .slice([0..batch, 0..num_patches, dim..dim+1])
+            let dim_pos = clamped
+                .clone()
+                .slice([0..batch, 0..num_patches, dim..dim + 1])
                 .reshape([batch, num_patches]); // [batch, num_patches]
 
             // One-hot: [batch, num_patches] → [batch, num_patches, pos_embed_size]
-            let one_hot = burn::tensor::Tensor::<B, 2, Int>::one_hot(dim_pos, pos_embed_size)
-                .float(); // [batch, num_patches, pos_embed_size]
+            let one_hot =
+                burn::tensor::Tensor::<B, 2, Int>::one_hot(dim_pos, pos_embed_size).float(); // [batch, num_patches, pos_embed_size]
 
             // Lookup: [batch, num_patches, pos_embed_size] @ [pos_embed_size, hidden_size]
-            let table_slice = self.position_embedding_table.clone()
-                .slice([dim..dim+1, 0..pos_embed_size, 0..hidden_size])
+            let table_slice = self
+                .position_embedding_table
+                .clone()
+                .slice([dim..dim + 1, 0..pos_embed_size, 0..hidden_size])
                 .reshape([pos_embed_size, hidden_size]); // [pos_embed_size, hidden_size]
 
-            let dim_embed = one_hot.cast(burn::tensor::FloatDType::F32)
-                .matmul(table_slice.cast(burn::tensor::FloatDType::F32).unsqueeze::<3>()); // [batch, num_patches, hidden_size]
+            let dim_embed = one_hot.cast(burn::tensor::FloatDType::F32).matmul(
+                table_slice
+                    .cast(burn::tensor::FloatDType::F32)
+                    .unsqueeze::<3>(),
+            ); // [batch, num_patches, hidden_size]
             pos_embed = pos_embed + dim_embed;
         }
 

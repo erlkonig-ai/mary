@@ -93,7 +93,12 @@ pub struct FastKv<B: Backend> {
 
 impl<B: Backend> FastKv<B> {
     pub fn new(window: usize) -> Self {
-        Self { k: None, v: None, pos: 0, keep: window - 1 }
+        Self {
+            k: None,
+            v: None,
+            pos: 0,
+            keep: window - 1,
+        }
     }
 
     fn stored(&self) -> usize {
@@ -188,7 +193,10 @@ impl<B: Backend> FastAttention<B> {
         let hidden = qk.dims()[1];
         let qk3 = qk.clone().reshape([h + hkv, d, hidden]);
         let qk_rot = Tensor::cat(
-            vec![qk3.clone().narrow(1, half, half).neg(), qk3.narrow(1, 0, half)],
+            vec![
+                qk3.clone().narrow(1, half, half).neg(),
+                qk3.narrow(1, 0, half),
+            ],
             1,
         )
         .reshape([(h + hkv) * d, hidden]);
@@ -208,7 +216,10 @@ impl<B: Backend> FastAttention<B> {
             let bqk: Tensor<B, 1> = Tensor::cat(vec![bq, Tensor::zeros([hkv * d], device)], 0);
             let b2 = bqk.clone().reshape([h + hkv, d]);
             let b_rot = Tensor::cat(
-                vec![b2.clone().narrow(1, half, half).neg(), b2.narrow(1, 0, half)],
+                vec![
+                    b2.clone().narrow(1, half, half).neg(),
+                    b2.narrow(1, 0, half),
+                ],
                 1,
             )
             .reshape([(h + hkv) * d]);
@@ -387,7 +398,12 @@ impl<B: Backend> FastEncoder<B> {
             conv2: CausalConv::load(loader, "audio_tower.embedder.conv2", 2, device),
             layers,
             rope: RopeTable::new(ROPE_THETA, ENC_HEAD_DIM, max_positions, device),
-            proj1_t: linear_t(loader, "multi_modal_projector.linear_1", Some(tiled), device),
+            proj1_t: linear_t(
+                loader,
+                "multi_modal_projector.linear_1",
+                Some(tiled),
+                device,
+            ),
             proj2: Linear::load(loader, "multi_modal_projector.linear_2", false, device),
         }
     }
@@ -425,9 +441,13 @@ impl<B: Backend> FastEncoder<B> {
     /// embeds `[1, l/4, 3072]`.
     pub fn project(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
         let [b, l, _] = hidden.dims();
-        assert!(l % DOWNSAMPLE == 0, "project needs a multiple of {DOWNSAMPLE} positions");
+        assert!(
+            l % DOWNSAMPLE == 0,
+            "project needs a multiple of {DOWNSAMPLE} positions"
+        );
         let stacked = hidden.reshape([b, l / DOWNSAMPLE, ENC_HIDDEN * DOWNSAMPLE]);
-        self.proj2.forward(gelu(stacked.matmul(self.proj1_t.clone())))
+        self.proj2
+            .forward(gelu(stacked.matmul(self.proj1_t.clone())))
     }
 }
 

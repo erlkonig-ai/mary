@@ -86,17 +86,49 @@ fn synth_loader(g: &StackGeom, prefix: &str) -> WeightLoader {
     for i in 0..g.layers {
         let p = format!("{prefix}.{i}");
         // attention projections: weights are [out, in]
-        put(format!("{p}.self_attn.q_proj.weight"), vec![q_out, g.hidden], in_scale(g.hidden));
-        put(format!("{p}.self_attn.k_proj.weight"), vec![kv_out, g.hidden], in_scale(g.hidden));
-        put(format!("{p}.self_attn.v_proj.weight"), vec![kv_out, g.hidden], in_scale(g.hidden));
-        put(format!("{p}.self_attn.o_proj.weight"), vec![g.hidden, q_out], in_scale(q_out));
+        put(
+            format!("{p}.self_attn.q_proj.weight"),
+            vec![q_out, g.hidden],
+            in_scale(g.hidden),
+        );
+        put(
+            format!("{p}.self_attn.k_proj.weight"),
+            vec![kv_out, g.hidden],
+            in_scale(g.hidden),
+        );
+        put(
+            format!("{p}.self_attn.v_proj.weight"),
+            vec![kv_out, g.hidden],
+            in_scale(g.hidden),
+        );
+        put(
+            format!("{p}.self_attn.o_proj.weight"),
+            vec![g.hidden, q_out],
+            in_scale(q_out),
+        );
         // pre-norm weights [hidden]
         put(format!("{p}.input_layernorm.weight"), vec![g.hidden], 0.02);
-        put(format!("{p}.post_attention_layernorm.weight"), vec![g.hidden], 0.02);
+        put(
+            format!("{p}.post_attention_layernorm.weight"),
+            vec![g.hidden],
+            0.02,
+        );
         // MLP: gate/up [inter, hidden], down [hidden, inter]
-        put(format!("{p}.mlp.gate_proj.weight"), vec![g.inter, g.hidden], in_scale(g.hidden));
-        put(format!("{p}.mlp.up_proj.weight"), vec![g.inter, g.hidden], in_scale(g.hidden));
-        put(format!("{p}.mlp.down_proj.weight"), vec![g.hidden, g.inter], in_scale(g.inter));
+        put(
+            format!("{p}.mlp.gate_proj.weight"),
+            vec![g.inter, g.hidden],
+            in_scale(g.hidden),
+        );
+        put(
+            format!("{p}.mlp.up_proj.weight"),
+            vec![g.inter, g.hidden],
+            in_scale(g.hidden),
+        );
+        put(
+            format!("{p}.mlp.down_proj.weight"),
+            vec![g.hidden, g.inter],
+            in_scale(g.inter),
+        );
     }
     // small offset so folded weights (near 0.02) don't zero everything
     for (_, (v, _)) in m.iter_mut() {
@@ -132,7 +164,11 @@ impl<B: Backend> SynthStack<B> {
             .map(|i| DecoderLayer::<B>::load(&loader, &format!("layers.{i}"), cfg, device))
             .collect();
         let rope = RopeTable::<B>::new(g.rope_theta, g.head_dim, max_len, device);
-        Self { layers, rope, hidden: g.hidden }
+        Self {
+            layers,
+            rope,
+            hidden: g.hidden,
+        }
     }
 
     fn new_caches(&self) -> Vec<KvCache<B>> {
@@ -140,7 +176,12 @@ impl<B: Backend> SynthStack<B> {
     }
 
     /// One forward over `l` new tokens at cache offset. Returns the last hidden.
-    fn forward(&self, x: Tensor<B, 3>, caches: &mut [KvCache<B>], device: &B::Device) -> Tensor<B, 3> {
+    fn forward(
+        &self,
+        x: Tensor<B, 3>,
+        caches: &mut [KvCache<B>],
+        device: &B::Device,
+    ) -> Tensor<B, 3> {
         let offset = caches[0].seq_len();
         let l = x.dims()[1];
         let (cos, sin) = self.rope.slices(offset, l);
@@ -214,11 +255,8 @@ fn bench_decode<B: Backend>(
     let mut caches = prefill(stack, ctx, device);
     // warm the decode-shape JIT (discarded)
     for w in 0..3 {
-        let e = Tensor::<B, 1>::from_floats(
-            fill(stack.hidden, 100 + w, 0.1).as_slice(),
-            device,
-        )
-        .reshape([1, 1, stack.hidden]);
+        let e = Tensor::<B, 1>::from_floats(fill(stack.hidden, 100 + w, 0.1).as_slice(), device)
+            .reshape([1, 1, stack.hidden]);
         let h = stack.forward(e, &mut caches, device);
         let _ = sync_scalar(&h);
     }
@@ -268,11 +306,8 @@ fn bench_depth_frame<B: Backend>(
     for _ in 0..3 {
         let mut caches = stack.new_caches();
         for _k in 0..8 {
-            let e = Tensor::<B, 1>::from_floats(
-                fill(stack.hidden, 55, 0.1).as_slice(),
-                device,
-            )
-            .reshape([1, 1, stack.hidden]);
+            let e = Tensor::<B, 1>::from_floats(fill(stack.hidden, 55, 0.1).as_slice(), device)
+                .reshape([1, 1, stack.hidden]);
             let h = stack.forward(e, &mut caches, device);
             let _ = sync_scalar(&h);
         }
@@ -344,7 +379,12 @@ where
     };
     println!(
         "\nTEMPORAL transformer: d_model {}, {} layers, {} heads (kv {}), head_dim {}, ffn {}",
-        temporal.hidden, temporal.layers, temporal.heads, temporal.kv_heads, temporal.head_dim, temporal.inter
+        temporal.hidden,
+        temporal.layers,
+        temporal.heads,
+        temporal.kv_heads,
+        temporal.head_dim,
+        temporal.inter
     );
     let max_len = 3072;
     println!("  building synthetic stack (random weights, max_len {max_len})...");
@@ -393,7 +433,11 @@ where
         let verdict = if total <= 80.0 {
             format!("CLEARS by {:.1} ms", 80.0 - total)
         } else {
-            format!("OVER by {:.1} ms ({:.1}× budget)", total - 80.0, total / 80.0)
+            format!(
+                "OVER by {:.1} ms ({:.1}× budget)",
+                total - 80.0,
+                total / 80.0
+            )
         };
         println!(
             "  ctx {ctx:>4}: temporal {full:5.2} + depth {dfull:5.2} + mimi ~{mimi_allowance:.0} = {total:5.2} ms/frame  →  {verdict}"
@@ -407,9 +451,14 @@ where
 }
 
 fn main() {
-    let rounds: usize = std::env::var("MOSHI_ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(7);
+    let rounds: usize = std::env::var("MOSHI_ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(7);
     println!("moshi_realtime_probe — PersonaPlex-7B (Moshi) temporal+depth realtime spike");
-    println!("synthetic random weights, single-token DECODE regime, {rounds} rounds, min-of-medians");
+    println!(
+        "synthetic random weights, single-token DECODE regime, {rounds} rounds, min-of-medians"
+    );
     println!("budget: 80 ms/frame @ 12.5 Hz");
 
     // Backend selection via MOSHI_BACKEND (default: half = raw f16 Metal).
@@ -421,12 +470,18 @@ fn main() {
     // can miscompile deep decode graphs at these dims (GlobalArgsLaunch::strides
     // codegen panic) — the raw path is the robust measurement here.
     let backends: Vec<&str> = std::env::var("MOSHI_BACKEND")
-        .map(|s| s.split(',').map(|x| Box::leak(x.trim().to_string().into_boxed_str()) as &str).collect())
+        .map(|s| {
+            s.split(',')
+                .map(|x| Box::leak(x.trim().to_string().into_boxed_str()) as &str)
+                .collect()
+        })
         .unwrap_or_else(|_| vec!["half"]);
     for b in backends {
         match b {
             "half" => run_backend::<BHalf>("Metal<f16> (raw f16 Metal — robust path)", rounds),
-            "fused-half" => run_backend::<BFusedHalf>("BFusedHalf (fused f16 Metal — production)", rounds),
+            "fused-half" => {
+                run_backend::<BFusedHalf>("BFusedHalf (fused f16 Metal — production)", rounds)
+            }
             "f32" => run_backend::<BMetal>("Metal<f32> (raw f32 reference)", rounds),
             "fused-f32" => run_backend::<BFused>("BFused (fused f32 reference)", rounds),
             other => eprintln!("unknown backend '{other}', skipping"),

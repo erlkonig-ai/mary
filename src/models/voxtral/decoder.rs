@@ -41,7 +41,9 @@ struct AdaRmsNorm<B: Backend> {
 impl<B: Backend> AdaRmsNorm<B> {
     /// `1 + linear2(gelu(linear1(t_cond)))` → `[1, 1, 3072]`.
     fn scale(&self, t_cond: Tensor<B, 3>) -> Tensor<B, 3> {
-        self.linear2.forward(gelu(self.linear1.forward(t_cond))).add_scalar(1.0)
+        self.linear2
+            .forward(gelu(self.linear1.forward(t_cond)))
+            .add_scalar(1.0)
     }
 }
 
@@ -81,7 +83,12 @@ impl<B: Backend> Decoder<B> {
             .map(|i| {
                 let p = format!("language_model.model.layers.{i}");
                 DecoderLayer {
-                    input_norm: RmsNorm::load(loader, &format!("{p}.input_layernorm.weight"), EPS, device),
+                    input_norm: RmsNorm::load(
+                        loader,
+                        &format!("{p}.input_layernorm.weight"),
+                        EPS,
+                        device,
+                    ),
                     attn: Attention::load(loader, &format!("{p}.self_attn"), cfg, device),
                     post_norm: RmsNorm::load(
                         loader,
@@ -90,8 +97,18 @@ impl<B: Backend> Decoder<B> {
                         device,
                     ),
                     ada: AdaRmsNorm {
-                        linear1: Linear::load(loader, &format!("{p}.ada_rms_norm.linear1"), false, device),
-                        linear2: Linear::load(loader, &format!("{p}.ada_rms_norm.linear2"), false, device),
+                        linear1: Linear::load(
+                            loader,
+                            &format!("{p}.ada_rms_norm.linear1"),
+                            false,
+                            device,
+                        ),
+                        linear2: Linear::load(
+                            loader,
+                            &format!("{p}.ada_rms_norm.linear2"),
+                            false,
+                            device,
+                        ),
                     },
                     mlp: Mlp::load(loader, &format!("{p}.mlp"), false, device),
                 }
@@ -134,9 +151,13 @@ impl<B: Backend> Decoder<B> {
         let device = embeds.device();
         let mut x = embeds;
         for (i, (layer, cache)) in self.layers.iter().zip(caches.0.iter_mut()).enumerate() {
-            let att = layer
-                .attn
-                .forward(layer.input_norm.forward(x.clone()), &cos, &sin, cache, &device);
+            let att = layer.attn.forward(
+                layer.input_norm.forward(x.clone()),
+                &cos,
+                &sin,
+                cache,
+                &device,
+            );
             let x1 = x + att;
             let h = layer.post_norm.forward(x1.clone());
             let mlp = layer.mlp.forward(h.mul(ada.0[i].clone()));

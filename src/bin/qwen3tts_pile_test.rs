@@ -57,7 +57,10 @@ fn main() {
     let wav_st = codec_st.decode(&frames, &dev);
     drop(codec_st);
 
-    let pile = roundtrip(&read_safetensors_file(&codec_path), "qwen3-tts-tokenizer-12hz");
+    let pile = roundtrip(
+        &read_safetensors_file(&codec_path),
+        "qwen3-tts-tokenizer-12hz",
+    );
     let codec_pile = CodecDecoder::<B>::load(&pile, &dev);
     let wav_pile = codec_pile.decode(&frames, &dev);
     drop(codec_pile);
@@ -72,7 +75,8 @@ fn main() {
 
     // ── talker (the 1.7B): prefill forward on the golden embeds both ways ──
     let base_path = Path::new(WEIGHTS).join("model.safetensors");
-    let (ge, ges) = npy::load_npy(&Path::new(GOLD).join("prefill_embeds.npy")).expect("golden embeds");
+    let (ge, ges) =
+        npy::load_npy(&Path::new(GOLD).join("prefill_embeds.npy")).expect("golden embeds");
     let embeds = Tensor::<B, 3>::from_data(TensorData::new(ge, ges), &dev);
 
     let st = WeightLoader::SingleFile(SingleFileLoader::new(&base_path));
@@ -84,7 +88,10 @@ fn main() {
     drop(talker_st);
     drop(st);
 
-    let pile = roundtrip(&read_safetensors_file(&base_path), "qwen3-tts-12hz-1.7b-base");
+    let pile = roundtrip(
+        &read_safetensors_file(&base_path),
+        "qwen3-tts-12hz-1.7b-base",
+    );
     let talker_pile = Talker::<B>::load(&pile, &dev);
     let mut caches = talker_pile.new_caches();
     let h_pile = talker_pile.forward(embeds, &mut caches, &dev);

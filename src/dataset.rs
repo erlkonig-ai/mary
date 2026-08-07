@@ -31,7 +31,7 @@
 //! never by forking this library.
 
 use triblespace::prelude::blobencodings::{LongString, RawBytes};
-use triblespace::prelude::inlineencodings::{F64, GenId, Handle, ShortString};
+use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString, F64};
 use triblespace::prelude::*;
 
 attributes! {
@@ -167,7 +167,11 @@ mod tests {
         )
         .map(|(s,)| s)
         .collect();
-        assert_eq!(train_samples.len(), 2, "both samples are train-split members");
+        assert_eq!(
+            train_samples.len(),
+            2,
+            "both samples are train-split members"
+        );
         assert!(train_samples.contains(&sample_a_id));
         assert!(train_samples.contains(&sample_b_id));
 
@@ -183,7 +187,11 @@ mod tests {
         )
         .map(|(s, _, _)| s)
         .collect();
-        assert_eq!(multimodal, vec![sample_a_id], "only sample_a carries both modalities");
+        assert_eq!(
+            multimodal,
+            vec![sample_a_id],
+            "only sample_a carries both modalities"
+        );
 
         // ── query: provenance — which dataset trained the run's model ─────
         let (trained_on,) = find!(

@@ -40,7 +40,10 @@ fn cosine(a: &[f32], b: &[f32]) -> f64 {
 }
 
 fn max_abs(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
 }
 
 /// npy-dir-backed weight source: logical `a.b.c` → file `a__b__c.npy`.
@@ -102,7 +105,10 @@ fn tiny_cfg() -> Qwen2_5VlTextConfig {
 
 fn skip_if_missing(dir: &Path) -> bool {
     if !dir.join("rms_out.npy").exists() {
-        eprintln!("skipping: run `python3 scripts/nomic_mm7b_dump_tiny.py` to create {}", dir.display());
+        eprintln!(
+            "skipping: run `python3 scripts/nomic_mm7b_dump_tiny.py` to create {}",
+            dir.display()
+        );
         return true;
     }
     false
@@ -111,28 +117,42 @@ fn skip_if_missing(dir: &Path) -> bool {
 #[test]
 fn rms_norm_parity() {
     let dir = golden_dir();
-    if skip_if_missing(&dir) { return; }
+    if skip_if_missing(&dir) {
+        return;
+    }
     let device = NdArrayDevice::default();
     let x = load_dir::<3>(&dir, "rms_in", &device);
     let w = load_dir::<1>(&dir, "rms_weight", &device);
     let want = npy::load_npy(&dir.join("rms_out.npy")).unwrap().0;
-    let got = QwenRmsNorm::<B>::from_weight(w, 1e-6).forward(x).into_data().to_vec::<f32>().unwrap();
+    let got = QwenRmsNorm::<B>::from_weight(w, 1e-6)
+        .forward(x)
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
     assert_parity(&got, &want, "rms_norm");
 }
 
 #[test]
 fn mlp_parity() {
     let dir = golden_dir();
-    if skip_if_missing(&dir) { return; }
+    if skip_if_missing(&dir) {
+        return;
+    }
     let device = NdArrayDevice::default();
     // Re-key the mlp_* goldens into the names QwenMlp::load expects.
     let x = load_dir::<3>(&dir, "mlp_in", &device);
     let want = npy::load_npy(&dir.join("mlp_out.npy")).unwrap().0;
-    struct MlpW<'a> { dir: &'a Path, device: NdArrayDevice }
+    struct MlpW<'a> {
+        dir: &'a Path,
+        device: NdArrayDevice,
+    }
     impl QwenWeights<B> for MlpW<'_> {
-        fn t1(&self, _: &str) -> Tensor<B, 1> { unreachable!() }
+        fn t1(&self, _: &str) -> Tensor<B, 1> {
+            unreachable!()
+        }
         fn t2(&self, name: &str) -> Tensor<B, 2> {
-            let key = match name { // map "mlp.gate_proj.weight" -> "mlp_gate_w"
+            let key = match name {
+                // map "mlp.gate_proj.weight" -> "mlp_gate_w"
                 n if n.ends_with("gate_proj.weight") => "mlp_gate_w",
                 n if n.ends_with("up_proj.weight") => "mlp_up_w",
                 n if n.ends_with("down_proj.weight") => "mlp_down_w",
@@ -142,40 +162,67 @@ fn mlp_parity() {
         }
     }
     let w = MlpW { dir: &dir, device };
-    let got = QwenMlp::<B>::load(&w, "mlp").forward(x).into_data().to_vec::<f32>().unwrap();
+    let got = QwenMlp::<B>::load(&w, "mlp")
+        .forward(x)
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
     assert_parity(&got, &want, "swiglu_mlp");
 }
 
 #[test]
 fn embedding_parity() {
     let dir = golden_dir();
-    if skip_if_missing(&dir) { return; }
+    if skip_if_missing(&dir) {
+        return;
+    }
     let device = NdArrayDevice::default();
     let weight = load_dir::<2>(&dir, "embed_tokens__weight", &device);
     let ids = Tensor::<B, 2, Int>::from_data(
-        TensorData::new(vec![5i64, 9, 2, 41, 17, 3, 88], [1, 7]), &device);
+        TensorData::new(vec![5i64, 9, 2, 41, 17, 3, 88], [1, 7]),
+        &device,
+    );
     let want = npy::load_npy(&dir.join("emb_out.npy")).unwrap().0;
-    let got = QwenEmbedding::new(weight).forward(ids).into_data().to_vec::<f32>().unwrap();
+    let got = QwenEmbedding::new(weight)
+        .forward(ids)
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
     assert_parity(&got, &want, "embedding");
 }
 
 #[test]
 fn text_model_parity() {
     let dir = golden_dir();
-    if skip_if_missing(&dir) { return; }
+    if skip_if_missing(&dir) {
+        return;
+    }
     let device = NdArrayDevice::default();
     let w = NpyDir { dir: &dir, device };
     let model = QwenTextModel::load(&w, &tiny_cfg(), &device);
     let ids = Tensor::<B, 2, Int>::from_data(
-        TensorData::new(vec![5i64, 9, 2, 41, 17, 3, 88], [1, 7]), &device);
+        TensorData::new(vec![5i64, 9, 2, 41, 17, 3, 88], [1, 7]),
+        &device,
+    );
 
     // Final hidden states (after the single decoder layer + model.norm).
     let want_final = npy::load_npy(&dir.join("final_out.npy")).unwrap().0;
-    let got_final = model.hidden(ids.clone()).into_data().to_vec::<f32>().unwrap();
-    assert_parity(&got_final, &want_final, "text_model_final (attn+rope+mlp+norms)");
+    let got_final = model
+        .hidden(ids.clone())
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
+    assert_parity(
+        &got_final,
+        &want_final,
+        "text_model_final (attn+rope+mlp+norms)",
+    );
 
     // Dense embedding: last-token pool + L2-norm; sanity-check unit norm.
     let emb = model.embed(ids).into_data().to_vec::<f32>().unwrap();
     let n: f32 = emb.iter().map(|v| v * v).sum::<f32>().sqrt();
-    assert!((n - 1.0).abs() < 1e-4, "dense embedding not L2-normalized: |emb|={n}");
+    assert!(
+        (n - 1.0).abs() < 1e-4,
+        "dense embedding not L2-normalized: |emb|={n}"
+    );
 }

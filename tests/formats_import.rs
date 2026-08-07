@@ -11,10 +11,12 @@ use std::path::PathBuf;
 
 /// Locate a cached HF snapshot dir for `id`, or `None` if not downloaded.
 fn hf_snapshot(id: &str) -> Option<PathBuf> {
-    let hf_home = std::env::var_os("HF_HOME").map(PathBuf::from).unwrap_or_else(|| {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
-        PathBuf::from(home).join(".cache/huggingface")
-    });
+    let hf_home = std::env::var_os("HF_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
+            PathBuf::from(home).join(".cache/huggingface")
+        });
     let repo = format!("models--{}", id.replace('/', "--"));
     let snaps = hf_home.join("hub").join(repo).join("snapshots");
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(&snaps)
@@ -23,7 +25,8 @@ fn hf_snapshot(id: &str) -> Option<PathBuf> {
         .filter(|p| p.is_dir())
         .collect();
     dirs.sort();
-    dirs.into_iter().find(|d| mary::formats::detect_format(d).is_ok())
+    dirs.into_iter()
+        .find(|d| mary::formats::detect_format(d).is_ok())
 }
 
 #[test]
@@ -37,7 +40,11 @@ fn pytorch_bin_import_roundtrip() {
         }
     };
     let (fmt, files) = mary::formats::detect_format(&dir).unwrap();
-    assert_eq!(fmt, mary::formats::WeightFormat::Pickle, "should detect pickle");
+    assert_eq!(
+        fmt,
+        mary::formats::WeightFormat::Pickle,
+        "should detect pickle"
+    );
     assert_eq!(files.len(), 1);
 
     let tmp = std::env::temp_dir().join(format!("mary_pickle_test_{}.pile", std::process::id()));
@@ -52,8 +59,8 @@ fn pytorch_bin_import_roundtrip() {
     .unwrap();
     eprintln!("imported root {root:X}");
 
-    let km =
-        mary::persist::load_keymap_from_mary_branch_quantized(&tmp, "mistral-tiny", "native").unwrap();
+    let km = mary::persist::load_keymap_from_mary_branch_quantized(&tmp, "mistral-tiny", "native")
+        .unwrap();
     // The tiny Mistral has these tensors with these exact shapes.
     let (embed, eshape) = &km["model.embed_tokens.weight"];
     assert_eq!(eshape, &[32000, 32], "embed shape");
@@ -62,7 +69,10 @@ fn pytorch_bin_import_roundtrip() {
     assert_eq!(lshape, &[32]);
     // input_layernorm initializes to all-ones in this fixture.
     for &v in ln.iter() {
-        assert!((v - 1.0).abs() < 1e-6, "layernorm weight should be 1.0, got {v}");
+        assert!(
+            (v - 1.0).abs() < 1e-6,
+            "layernorm weight should be 1.0, got {v}"
+        );
     }
     // Finite, non-degenerate weights everywhere.
     assert!(embed.iter().all(|v| v.is_finite()));

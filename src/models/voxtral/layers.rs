@@ -53,7 +53,10 @@ pub struct RmsNorm<B: Backend> {
 
 impl<B: Backend> RmsNorm<B> {
     pub fn load(loader: &WeightLoader, name: &str, eps: f64, device: &B::Device) -> Self {
-        Self { weight: loader.load_tensor(name, device), eps }
+        Self {
+            weight: loader.load_tensor(name, device),
+            eps,
+        }
     }
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
@@ -74,7 +77,9 @@ pub struct Embedding<B: Backend> {
 
 impl<B: Backend> Embedding<B> {
     pub fn load(loader: &WeightLoader, name: &str, device: &B::Device) -> Self {
-        Self { weight: loader.load_tensor(name, device) }
+        Self {
+            weight: loader.load_tensor(name, device),
+        }
     }
 
     pub fn forward(&self, ids: &[u32], device: &B::Device) -> Tensor<B, 3> {
@@ -117,8 +122,14 @@ impl<B: Backend> RopeTable<B> {
     /// cos/sin slices for query positions `offset..offset+l`, `[1,1,l,D]`.
     pub fn slices(&self, offset: usize, l: usize) -> (Tensor<B, 4>, Tensor<B, 4>) {
         (
-            self.cos.clone().narrow(0, offset, l).reshape([1, 1, l, self.d]),
-            self.sin.clone().narrow(0, offset, l).reshape([1, 1, l, self.d]),
+            self.cos
+                .clone()
+                .narrow(0, offset, l)
+                .reshape([1, 1, l, self.d]),
+            self.sin
+                .clone()
+                .narrow(0, offset, l)
+                .reshape([1, 1, l, self.d]),
         )
     }
 }
@@ -127,7 +138,10 @@ impl<B: Backend> RopeTable<B> {
 fn rotate_half<B: Backend>(x: Tensor<B, 4>) -> Tensor<B, 4> {
     let d = x.dims()[3];
     let half = d / 2;
-    Tensor::cat(vec![x.clone().narrow(3, half, half).neg(), x.narrow(3, 0, half)], 3)
+    Tensor::cat(
+        vec![x.clone().narrow(3, half, half).neg(), x.narrow(3, 0, half)],
+        3,
+    )
 }
 
 /// Growing KV cache: `[B, Hkv, L, D]` per tensor.
@@ -203,9 +217,8 @@ impl<B: Backend> Attention<B> {
         let (h, hkv, d) = (self.cfg.heads, self.cfg.kv_heads, self.cfg.head_dim);
         let offset = cache.seq_len();
 
-        let heads = |t: Tensor<B, 3>, n: usize| -> Tensor<B, 4> {
-            t.reshape([b, l, n, d]).swap_dims(1, 2)
-        };
+        let heads =
+            |t: Tensor<B, 3>, n: usize| -> Tensor<B, 4> { t.reshape([b, l, n, d]).swap_dims(1, 2) };
         let q = heads(self.q_proj.forward(x.clone()), h);
         let k = heads(self.k_proj.forward(x.clone()), hkv);
         let v = heads(self.v_proj.forward(x), hkv);

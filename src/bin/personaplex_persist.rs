@@ -59,7 +59,9 @@ const MIMI_FILE: &str = "tokenizer-e351c8d8-checkpoint125.safetensors";
 
 /// Assert one tensor's shape, by name, against the expectation from config.
 fn expect_shape(st: &SafeTensors, name: &str, want: &[usize]) {
-    let view = st.tensor(name).unwrap_or_else(|e| panic!("missing {name}: {e}"));
+    let view = st
+        .tensor(name)
+        .unwrap_or_else(|e| panic!("missing {name}: {e}"));
     assert_eq!(view.shape(), want, "{name}: shape mismatch vs config");
 }
 
@@ -102,9 +104,14 @@ fn run_derive(mode: &str, args: &[String]) -> anyhow::Result<()> {
 
     let (fmt, src_i) = match mode {
         "--derive-fmt" => {
-            let f = args.first().and_then(|s| WeightFmt::parse(s)).ok_or_else(|| {
-                anyhow::anyhow!("usage: personaplex_persist --derive-fmt <q4|q8|f16> <src-pile> [dst-pile]")
-            })?;
+            let f = args
+                .first()
+                .and_then(|s| WeightFmt::parse(s))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "usage: personaplex_persist --derive-fmt <q4|q8|f16> <src-pile> [dst-pile]"
+                    )
+                })?;
             (Some(f), 1)
         }
         "--derive-depth" => (None, 0),
@@ -127,7 +134,10 @@ fn run_derive(mode: &str, args: &[String]) -> anyhow::Result<()> {
     let src_sha = sha256_file(src)?;
     let dir = src.parent().unwrap_or(Path::new("."));
     let before = pile_lengths(dir, &dst)?;
-    eprintln!("[derive] source sha256 {src_sha}; {} sibling pile(s) length-recorded", before.len());
+    eprintln!(
+        "[derive] source sha256 {src_sha}; {} sibling pile(s) length-recorded",
+        before.len()
+    );
 
     let t = Instant::now();
     let (count, bytes) = match fmt {
@@ -197,7 +207,10 @@ fn main() -> anyhow::Result<()> {
 
     // ── gate: round-trip bit-exactness + config-truth shape assertions ──
     let (_f16, leaves, reader) = load_split_index_from_pile(pile_path, "")?;
-    eprintln!("Pile holds {} leaves; verifying against the safetensors sources ...", leaves.len());
+    eprintln!(
+        "Pile holds {} leaves; verifying against the safetensors sources ...",
+        leaves.len()
+    );
 
     let mut lm_count = 0usize;
     let (mut checked, mut elems) = (0usize, 0usize);
@@ -207,11 +220,31 @@ fn main() -> anyhow::Result<()> {
 
         if *entity == LM_FILE {
             // Config truth: the load-bearing dims, asserted against real shapes.
-            expect_shape(&st, "transformer.layers.0.self_attn.in_proj_weight", &[3 * cfg::DIM, cfg::DIM]);
-            expect_shape(&st, "transformer.layers.0.self_attn.out_proj.weight", &[cfg::DIM, cfg::DIM]);
-            expect_shape(&st, "transformer.layers.0.gating.linear_in.weight", &[cfg::FFN_FUSED_IN, cfg::DIM]);
-            expect_shape(&st, "transformer.layers.0.gating.linear_out.weight", &[cfg::DIM, cfg::FFN_HIDDEN]);
-            expect_shape(&st, &format!("transformer.layers.{}.norm2.alpha", cfg::NUM_LAYERS - 1), &[1, 1, cfg::DIM]);
+            expect_shape(
+                &st,
+                "transformer.layers.0.self_attn.in_proj_weight",
+                &[3 * cfg::DIM, cfg::DIM],
+            );
+            expect_shape(
+                &st,
+                "transformer.layers.0.self_attn.out_proj.weight",
+                &[cfg::DIM, cfg::DIM],
+            );
+            expect_shape(
+                &st,
+                "transformer.layers.0.gating.linear_in.weight",
+                &[cfg::FFN_FUSED_IN, cfg::DIM],
+            );
+            expect_shape(
+                &st,
+                "transformer.layers.0.gating.linear_out.weight",
+                &[cfg::DIM, cfg::FFN_HIDDEN],
+            );
+            expect_shape(
+                &st,
+                &format!("transformer.layers.{}.norm2.alpha", cfg::NUM_LAYERS - 1),
+                &[1, 1, cfg::DIM],
+            );
             expect_shape(&st, "out_norm.alpha", &[1, 1, cfg::DIM]);
             expect_shape(
                 &st,
@@ -225,16 +258,40 @@ fn main() -> anyhow::Result<()> {
             );
             expect_shape(
                 &st,
-                &format!("depformer.layers.{}.gating.{}.linear_in.weight", cfg::DEP_LAYERS - 1, cfg::WEIGHTS_PER_STEP - 1),
+                &format!(
+                    "depformer.layers.{}.gating.{}.linear_in.weight",
+                    cfg::DEP_LAYERS - 1,
+                    cfg::WEIGHTS_PER_STEP - 1
+                ),
                 &[2 * cfg::DEP_FFN_HIDDEN, cfg::DEP_DIM],
             );
-            expect_shape(&st, &format!("emb.{}.weight", cfg::N_Q - 1), &[cfg::AUDIO_VOCAB, cfg::DIM]);
+            expect_shape(
+                &st,
+                &format!("emb.{}.weight", cfg::N_Q - 1),
+                &[cfg::AUDIO_VOCAB, cfg::DIM],
+            );
             expect_shape(&st, "text_emb.weight", &[cfg::TEXT_VOCAB, cfg::DIM]);
             expect_shape(&st, "text_linear.weight", &[cfg::TEXT_LOGITS, cfg::DIM]);
-            expect_shape(&st, &format!("depformer_in.{}.weight", cfg::DEP_Q - 1), &[cfg::DEP_DIM, cfg::DIM]);
-            expect_shape(&st, &format!("depformer_emb.{}.weight", cfg::DEP_Q - 2), &[cfg::AUDIO_VOCAB, cfg::DEP_DIM]);
-            expect_shape(&st, "depformer_text_emb.weight", &[cfg::TEXT_VOCAB, cfg::DEP_DIM]);
-            expect_shape(&st, &format!("linears.{}.weight", cfg::DEP_Q - 1), &[cfg::CARD, cfg::DEP_DIM]);
+            expect_shape(
+                &st,
+                &format!("depformer_in.{}.weight", cfg::DEP_Q - 1),
+                &[cfg::DEP_DIM, cfg::DIM],
+            );
+            expect_shape(
+                &st,
+                &format!("depformer_emb.{}.weight", cfg::DEP_Q - 2),
+                &[cfg::AUDIO_VOCAB, cfg::DEP_DIM],
+            );
+            expect_shape(
+                &st,
+                "depformer_text_emb.weight",
+                &[cfg::TEXT_VOCAB, cfg::DEP_DIM],
+            );
+            expect_shape(
+                &st,
+                &format!("linears.{}.weight", cfg::DEP_Q - 1),
+                &[cfg::CARD, cfg::DEP_DIM],
+            );
             eprintln!("config-truth shape assertions PASSED (temporal ffn {} fused {}, depth ffn {}, {} per-step)",
                 cfg::FFN_HIDDEN, cfg::FFN_FUSED_IN, cfg::DEP_FFN_HIDDEN, cfg::WEIGHTS_PER_STEP);
         }
@@ -243,7 +300,10 @@ fn main() -> anyhow::Result<()> {
         for name in st.names() {
             use safetensors::Dtype;
             let view = st.tensor(name)?;
-            if !matches!(view.dtype(), Dtype::F64 | Dtype::F32 | Dtype::F16 | Dtype::BF16) {
+            if !matches!(
+                view.dtype(),
+                Dtype::F64 | Dtype::F32 | Dtype::F16 | Dtype::BF16
+            ) {
                 continue; // ingest skips non-float buffers
             }
             if *entity == LM_FILE {
@@ -255,7 +315,9 @@ fn main() -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("{entity}/{name}: no pile leaf"))?;
             // Alignment: the raw data blob must sit 256-aligned in the mmap.
             if let mary::ingest::LeafHandles::F32(dh, _) = handles {
-                let b: anybytes::Bytes = reader.get(*dh).map_err(|e| anyhow::anyhow!("{name}: {e:?}"))?;
+                let b: anybytes::Bytes = reader
+                    .get(*dh)
+                    .map_err(|e| anyhow::anyhow!("{name}: {e:?}"))?;
                 if b.as_ptr() as usize % 256 != 0 {
                     eprintln!("  MISALIGNED (ptr % 256 != 0): {name}");
                     misaligned += 1;
@@ -264,8 +326,16 @@ fn main() -> anyhow::Result<()> {
                 anyhow::bail!("{entity}/{name}: expected an f32 leaf");
             }
             let (got, got_shape) = read_leaf(&reader, *handles);
-            anyhow::ensure!(got_shape == want_shape, "{name}: shape {got_shape:?} != {want_shape:?}");
-            anyhow::ensure!(got.len() == want.len(), "{name}: len {} != {}", got.len(), want.len());
+            anyhow::ensure!(
+                got_shape == want_shape,
+                "{name}: shape {got_shape:?} != {want_shape:?}"
+            );
+            anyhow::ensure!(
+                got.len() == want.len(),
+                "{name}: len {} != {}",
+                got.len(),
+                want.len()
+            );
             for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
                 anyhow::ensure!(
                     g.to_bits() == w.to_bits(),
@@ -275,7 +345,10 @@ fn main() -> anyhow::Result<()> {
             checked += 1;
             elems += got.len();
         }
-        anyhow::ensure!(misaligned == 0, "{entity}: {misaligned} leaves misaligned — V3 alignment invariant violated");
+        anyhow::ensure!(
+            misaligned == 0,
+            "{entity}: {misaligned} leaves misaligned — V3 alignment invariant violated"
+        );
         eprintln!("{entity}: round-trip verified");
     }
     anyhow::ensure!(

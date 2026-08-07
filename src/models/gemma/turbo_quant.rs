@@ -35,25 +35,19 @@ const LLOYD_MAX_2BIT_BOUNDARIES: [f64; 3] = [-0.9816, 0.0, 0.9816];
 
 /// Centroids for 3-bit (8-level) Lloyd-Max quantizer on N(0,1).
 const LLOYD_MAX_3BIT_CENTROIDS: [f64; 8] = [
-    -2.1519, -1.3440, -0.7560, -0.2451,
-     0.2451,  0.7560,  1.3440,  2.1519,
+    -2.1519, -1.3440, -0.7560, -0.2451, 0.2451, 0.7560, 1.3440, 2.1519,
 ];
-const LLOYD_MAX_3BIT_BOUNDARIES: [f64; 7] = [
-    -1.7480, -1.0500, -0.5006, 0.0, 0.5006, 1.0500, 1.7480,
-];
+const LLOYD_MAX_3BIT_BOUNDARIES: [f64; 7] =
+    [-1.7480, -1.0500, -0.5006, 0.0, 0.5006, 1.0500, 1.7480];
 
 /// Centroids for 4-bit (16-level) Lloyd-Max quantizer on N(0,1).
 const LLOYD_MAX_4BIT_CENTROIDS: [f64; 16] = [
-    -2.7326, -2.0690, -1.6180, -1.2562,
-    -0.9424, -0.6568, -0.3881, -0.1284,
-     0.1284,  0.3881,  0.6568,  0.9424,
-     1.2562,  1.6180,  2.0690,  2.7326,
+    -2.7326, -2.0690, -1.6180, -1.2562, -0.9424, -0.6568, -0.3881, -0.1284, 0.1284, 0.3881, 0.6568,
+    0.9424, 1.2562, 1.6180, 2.0690, 2.7326,
 ];
 const LLOYD_MAX_4BIT_BOUNDARIES: [f64; 15] = [
-    -2.4008, -1.8435, -1.4372, -1.0993,
-    -0.7996, -0.5224, -0.2582, 0.0,
-     0.2582,  0.5224,  0.7996,  1.0993,
-     1.4372,  1.8435,  2.4008,
+    -2.4008, -1.8435, -1.4372, -1.0993, -0.7996, -0.5224, -0.2582, 0.0, 0.2582, 0.5224, 0.7996,
+    1.0993, 1.4372, 1.8435, 2.4008,
 ];
 
 /// Retrieve the Lloyd-Max centroids for the given bit width (1..=4).
@@ -63,7 +57,10 @@ fn lloyd_max_centroids(bits: usize) -> &'static [f64] {
         2 => &LLOYD_MAX_2BIT_CENTROIDS,
         3 => &LLOYD_MAX_3BIT_CENTROIDS,
         4 => &LLOYD_MAX_4BIT_CENTROIDS,
-        _ => panic!("Lloyd-Max tables only precomputed for 1..=4 bits, got {}", bits),
+        _ => panic!(
+            "Lloyd-Max tables only precomputed for 1..=4 bits, got {}",
+            bits
+        ),
     }
 }
 
@@ -77,7 +74,10 @@ fn lloyd_max_boundaries(bits: usize) -> &'static [f64] {
         2 => &LLOYD_MAX_2BIT_BOUNDARIES,
         3 => &LLOYD_MAX_3BIT_BOUNDARIES,
         4 => &LLOYD_MAX_4BIT_BOUNDARIES,
-        _ => panic!("Lloyd-Max tables only precomputed for 1..=4 bits, got {}", bits),
+        _ => panic!(
+            "Lloyd-Max tables only precomputed for 1..=4 bits, got {}",
+            bits
+        ),
     }
 }
 
@@ -87,7 +87,7 @@ fn quantize_scalar(val: f64, boundaries: &[f64]) -> usize {
     // Binary search: find the first boundary >= val
     match boundaries.binary_search_by(|b| b.partial_cmp(&val).unwrap()) {
         Ok(i) => i + 1, // val exactly equals boundary[i] -> goes to upper bin
-        Err(i) => i,     // val < boundary[i] for all j>=i, so belongs to bin i
+        Err(i) => i,    // val < boundary[i] for all j>=i, so belongs to bin i
     }
 }
 
@@ -111,7 +111,11 @@ impl Rademacher {
         let signs: Vec<f64> = (0..dim)
             .map(|_| {
                 state = xorshift64(state);
-                if state & 1 == 0 { 1.0 } else { -1.0 }
+                if state & 1 == 0 {
+                    1.0
+                } else {
+                    -1.0
+                }
             })
             .collect();
         Self { signs }
@@ -252,7 +256,11 @@ impl QjlCtx {
         let matrix: Vec<i8> = (0..total)
             .map(|_| {
                 state = xorshift64(state);
-                if state & 1 == 0 { 1i8 } else { -1i8 }
+                if state & 1 == 0 {
+                    1i8
+                } else {
+                    -1i8
+                }
             })
             .collect();
         Self { matrix, m, d }
@@ -324,19 +332,36 @@ pub struct TurboQuantConfig {
 impl TurboQuantConfig {
     /// MSE-optimal only: no QJL residual. All `bits` go to Lloyd-Max quantization.
     pub fn mse_only(bits: usize, head_dim: usize) -> Self {
-        Self { bits, residual_bits: 0, head_dim, seed: 0x5A3D_7E1F_C8B2_A406 }
+        Self {
+            bits,
+            residual_bits: 0,
+            head_dim,
+            seed: 0x5A3D_7E1F_C8B2_A406,
+        }
     }
 
     /// Inner-product optimal (Algorithm 2): (bits-1) bits for MSE quantization,
     /// then QJL on the residual with `head_dim` sketch bits (1 bit per coordinate).
     pub fn inner_product(bits: usize, head_dim: usize) -> Self {
-        assert!(bits >= 2, "Inner-product TurboQuant requires bits >= 2 (need at least 1 for MSE + 1 for QJL)");
-        Self { bits, residual_bits: head_dim, head_dim, seed: 0x5A3D_7E1F_C8B2_A406 }
+        assert!(
+            bits >= 2,
+            "Inner-product TurboQuant requires bits >= 2 (need at least 1 for MSE + 1 for QJL)"
+        );
+        Self {
+            bits,
+            residual_bits: head_dim,
+            head_dim,
+            seed: 0x5A3D_7E1F_C8B2_A406,
+        }
     }
 
     /// Effective MSE quantization bits (bits if no QJL, bits-1 if QJL is used).
     fn mse_bits(&self) -> usize {
-        if self.residual_bits > 0 { self.bits - 1 } else { self.bits }
+        if self.residual_bits > 0 {
+            self.bits - 1
+        } else {
+            self.bits
+        }
     }
 
     /// Total bits per coordinate (approximate, not counting per-group overhead).
@@ -389,7 +414,11 @@ impl TurboQuantCtx {
         let rotation = RotationCtx::new(config.head_dim, config.seed);
         let qjl = if config.residual_bits > 0 {
             // Use a different seed for the QJL matrix
-            Some(QjlCtx::new(config.residual_bits, config.head_dim, config.seed.wrapping_add(1)))
+            Some(QjlCtx::new(
+                config.residual_bits,
+                config.head_dim,
+                config.seed.wrapping_add(1),
+            ))
         } else {
             None
         };
@@ -448,17 +477,25 @@ impl TurboQuantCtx {
 
             // 2. Normalize to unit sphere, then rotate
             //    (The paper assumes ||x||=1; we store the norm separately and rescale)
-            let inv_norm = if vec_norm > 1e-12 { 1.0 / vec_norm } else { 0.0 };
+            let inv_norm = if vec_norm > 1e-12 {
+                1.0 / vec_norm
+            } else {
+                0.0
+            };
             let normalized: Vec<f32> = group.iter().map(|v| v * inv_norm).collect();
             let rot = self.rotation.rotate(&normalized);
 
             // 3. Estimate sigma = std of rotated coordinates
             //    Theoretical: sigma = 1/sqrt(d), but we estimate from the data for robustness.
             let mean: f64 = rot.iter().map(|&v| v as f64).sum::<f64>() / head_dim as f64;
-            let var: f64 = rot.iter().map(|&v| {
-                let d = v as f64 - mean;
-                d * d
-            }).sum::<f64>() / head_dim as f64;
+            let var: f64 = rot
+                .iter()
+                .map(|&v| {
+                    let d = v as f64 - mean;
+                    d * d
+                })
+                .sum::<f64>()
+                / head_dim as f64;
             let sigma = var.sqrt().max(1e-10);
             sigma_vec.push(sigma as f32);
 
@@ -485,7 +522,8 @@ impl TurboQuantCtx {
                 // Inverse rotate to get back to original normalized space
                 let deq_normalized = self.rotation.rotate_inv(&deq_rotated);
                 // Residual in the original normalized space
-                let residual: Vec<f32> = normalized.iter()
+                let residual: Vec<f32> = normalized
+                    .iter()
                     .zip(deq_normalized.iter())
                     .map(|(a, b)| a - b)
                     .collect();
@@ -500,8 +538,16 @@ impl TurboQuantCtx {
             indices,
             sigma: sigma_vec,
             norm: norm_vec,
-            qjl_signs: if self.config.residual_bits > 0 { Some(qjl_signs_all) } else { None },
-            residual_norm: if self.config.residual_bits > 0 { Some(residual_norms) } else { None },
+            qjl_signs: if self.config.residual_bits > 0 {
+                Some(qjl_signs_all)
+            } else {
+                None
+            },
+            residual_norm: if self.config.residual_bits > 0 {
+                Some(residual_norms)
+            } else {
+                None
+            },
             shape,
             config: self.config.clone(),
         }
@@ -579,7 +625,7 @@ impl TurboQuantCtx {
 
         let index_bytes = qt.indices.len();
         let sigma_bytes = n_groups * 4; // f32 per group
-        let norm_bytes = n_groups * 4;  // f32 per group
+        let norm_bytes = n_groups * 4; // f32 per group
         let qjl_bytes = qt.qjl_signs.as_ref().map_or(0, |s| s.len());
         let rnorm_bytes = qt.residual_norm.as_ref().map_or(0, |r| r.len() * 4);
 
@@ -667,16 +713,21 @@ mod tests {
             x[i] = ((i as f32 + 1.0) * 0.1).sin();
         }
         let norm: f32 = x.iter().map(|v| v * v).sum::<f32>().sqrt();
-        for v in x.iter_mut() { *v /= norm; }
+        for v in x.iter_mut() {
+            *v /= norm;
+        }
 
         // Rotate and inverse-rotate
         let rotated = ctx.rotate(&x);
         let recovered = ctx.rotate_inv(&rotated);
 
         // Check roundtrip error
-        let mse: f32 = x.iter().zip(recovered.iter())
+        let mse: f32 = x
+            .iter()
+            .zip(recovered.iter())
             .map(|(a, b)| (a - b).powi(2))
-            .sum::<f32>() / dim as f32;
+            .sum::<f32>()
+            / dim as f32;
         assert!(mse < 1e-6, "Rotation roundtrip MSE too large: {}", mse);
     }
 
@@ -694,7 +745,11 @@ mod tests {
         let norm_after: f32 = rotated.iter().map(|v| v * v).sum::<f32>().sqrt();
 
         let rel_err = ((norm_before - norm_after) / norm_before).abs();
-        assert!(rel_err < 0.01, "Rotation changed norm by {:.2}%", rel_err * 100.0);
+        assert!(
+            rel_err < 0.01,
+            "Rotation changed norm by {:.2}%",
+            rel_err * 100.0
+        );
     }
 
     #[test]
@@ -762,9 +817,12 @@ mod tests {
         assert_eq!(deq.len(), data.len());
 
         // Compute MSE
-        let mse: f32 = data.iter().zip(deq.iter())
+        let mse: f32 = data
+            .iter()
+            .zip(deq.iter())
             .map(|(a, b)| (a - b).powi(2))
-            .sum::<f32>() / data.len() as f32;
+            .sum::<f32>()
+            / data.len() as f32;
 
         // For 3-bit quantization, the paper claims D_mse ~ 0.03 for unit vectors.
         // Our vectors aren't unit, but MSE should still be reasonable.
@@ -807,11 +865,17 @@ mod tests {
 
         let ip_error = (true_ip - recon_ip).abs();
         let rel_error = ip_error / true_ip.abs().max(1e-6);
-        println!("True IP: {:.6}, Reconstructed IP: {:.6}, Error: {:.6}, Rel: {:.4}",
-            true_ip, recon_ip, ip_error, rel_error);
+        println!(
+            "True IP: {:.6}, Reconstructed IP: {:.6}, Error: {:.6}, Rel: {:.4}",
+            true_ip, recon_ip, ip_error, rel_error
+        );
 
         // Inner product error should be modest
-        assert!(rel_error < 0.5, "Inner product relative error too large: {}", rel_error);
+        assert!(
+            rel_error < 0.5,
+            "Inner product relative error too large: {}",
+            rel_error
+        );
     }
 
     #[test]
@@ -845,8 +909,17 @@ mod tests {
 
         // 2-bit: 2*128/8 = 32 bytes per group for indices, + 4(sigma) + 4(norm) = 40 bytes
         // vs f32: 128*4 = 512 bytes per group. ~12.8x compression on data alone.
-        assert!(mem < uncompressed, "TurboQuant should use less memory than f32: {} vs {}", mem, uncompressed);
-        println!("TurboQuant 2-bit memory: {} bytes vs {} f32 bytes ({:.1}x compression)",
-            mem, uncompressed, uncompressed as f64 / mem as f64);
+        assert!(
+            mem < uncompressed,
+            "TurboQuant should use less memory than f32: {} vs {}",
+            mem,
+            uncompressed
+        );
+        println!(
+            "TurboQuant 2-bit memory: {} bytes vs {} f32 bytes ({:.1}x compression)",
+            mem,
+            uncompressed,
+            uncompressed as f64 / mem as f64
+        );
     }
 }

@@ -214,8 +214,8 @@ impl Segmenter {
                     self.in_speech = true;
                     self.silence_run = 0;
                     self.current = self.preroll.iter().copied().collect();
-                    self.utt_start_sample =
-                        (self.samples_seen + frame.len() as u64).saturating_sub(self.current.len() as u64);
+                    self.utt_start_sample = (self.samples_seen + frame.len() as u64)
+                        .saturating_sub(self.current.len() as u64);
                 }
             } else {
                 self.speech_run = 0;
@@ -237,8 +237,7 @@ impl Segmenter {
                     self.close_utterance(0, emit);
                 }
             }
-            if self.in_speech
-                && self.current.len() as f32 >= self.cfg.max_utt_s * self.rate as f32
+            if self.in_speech && self.current.len() as f32 >= self.cfg.max_utt_s * self.rate as f32
             {
                 self.close_utterance(0, emit);
             }
@@ -271,7 +270,12 @@ impl Segmenter {
         if samples.len() >= min_len {
             let start_s = self.utt_start_sample as f64 / self.rate as f64;
             let end_s = start_s + samples.len() as f64 / self.rate as f64;
-            emit(Utterance { samples, rate: self.rate, start_s, end_s });
+            emit(Utterance {
+                samples,
+                rate: self.rate,
+                start_s,
+                end_s,
+            });
         }
     }
 }
@@ -281,7 +285,9 @@ impl Segmenter {
 // ---------------------------------------------------------------------------
 
 fn arg(args: &[String], k: &str) -> Option<String> {
-    args.iter().position(|s| s == k).map(|i| args[i + 1].clone())
+    args.iter()
+        .position(|s| s == k)
+        .map(|i| args[i + 1].clone())
 }
 
 fn find_hf_file(model_id: &str, filename: &str) -> String {
@@ -349,7 +355,9 @@ fn list_input_devices() {
     match host.input_devices() {
         Ok(devs) => {
             for dev in devs {
-                let Ok(desc) = dev.description() else { continue };
+                let Ok(desc) = dev.description() else {
+                    continue;
+                };
                 let name = desc.name().to_string();
                 let cfg = dev
                     .default_input_config()
@@ -362,7 +370,11 @@ fn list_input_devices() {
                         )
                     })
                     .unwrap_or_else(|e| format!("no default config: {e}"));
-                let marker = if Some(&name) == default_name.as_ref() { "  [default]" } else { "" };
+                let marker = if Some(&name) == default_name.as_ref() {
+                    "  [default]"
+                } else {
+                    ""
+                };
                 println!("  {name}{marker}\n      {cfg}");
             }
         }
@@ -384,7 +396,14 @@ struct UttLog<'a> {
 impl UttLog<'_> {
     /// Run one utterance through the stt and record it (print + jsonl +
     /// optional segment wav). `wave16k` must already be 16 kHz mono.
-    fn handle(&mut self, hearing: &Hearing<B>, source: &str, u: &Utterance, wave16k: Vec<f32>, max_new: usize) {
+    fn handle(
+        &mut self,
+        hearing: &Hearing<B>,
+        source: &str,
+        u: &Utterance,
+        wave16k: Vec<f32>,
+        max_new: usize,
+    ) {
         self.n += 1;
         let utc_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -453,9 +472,11 @@ fn main() {
             std::process::exit(2);
         });
     let model_id = arg(&args, "--model").unwrap_or_else(|| "google/gemma-4-E4B-it".into());
-    let prompt = arg(&args, "--prompt")
-        .unwrap_or_else(|| "Transcribe exactly what is being said.".into());
-    let max_new = arg(&args, "--tokens").and_then(|s| s.parse().ok()).unwrap_or(80);
+    let prompt =
+        arg(&args, "--prompt").unwrap_or_else(|| "Transcribe exactly what is being said.".into());
+    let max_new = arg(&args, "--tokens")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(80);
     let log_path = arg(&args, "--log").unwrap_or_else(|| "/tmp/gemma_listen.jsonl".into());
     let save_dir = arg(&args, "--save-segments");
     if let Some(d) = &save_dir {
@@ -553,7 +574,10 @@ fn main() {
     let sup = dev.default_input_config().expect("default input config");
     let rate = sup.sample_rate() as usize;
     let channels = sup.channels() as usize;
-    eprintln!("Capturing from {dev_name:?}: {channels} ch @ {rate} Hz, {:?}", sup.sample_format());
+    eprintln!(
+        "Capturing from {dev_name:?}: {channels} ch @ {rate} Hz, {:?}",
+        sup.sample_format()
+    );
 
     let (tx, rx) = std::sync::mpsc::channel::<Vec<f32>>();
     let cfg: cpal::StreamConfig = sup.config();
@@ -597,7 +621,10 @@ fn main() {
         }
     };
     stream.play().expect("start capture stream");
-    eprintln!("Listening. Speak; utterances end after {} ms of silence. Ctrl-C to stop.", vad.hangover_ms);
+    eprintln!(
+        "Listening. Speak; utterances end after {} ms of silence. Ctrl-C to stop.",
+        vad.hangover_ms
+    );
 
     let mut seg = Segmenter::new(rate, vad);
     let source = format!("device:{dev_name}");
@@ -614,7 +641,11 @@ fn main() {
             if paused != was_paused {
                 eprintln!(
                     "[half-duplex] {}",
-                    if paused { "paused (mouth speaking)" } else { "resumed listening" }
+                    if paused {
+                        "paused (mouth speaking)"
+                    } else {
+                        "resumed listening"
+                    }
                 );
                 was_paused = paused;
             }

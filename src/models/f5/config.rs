@@ -6,13 +6,13 @@
 /// The flow-matching DiT backbone (single-stream, AdaLN-zero, RoPE).
 #[derive(Debug, Clone)]
 pub struct F5Config {
-    pub dim: usize,          // hidden width
-    pub depth: usize,        // transformer blocks
-    pub heads: usize,        // attention heads
-    pub ff_mult: usize,      // ff_dim = dim * ff_mult
-    pub text_dim: usize,     // char-embedding width
-    pub conv_layers: usize,  // ConvNeXt-V2 text-refinement blocks
-    pub text_vocab: usize,   // char vocab size (from vocab.txt)
+    pub dim: usize,         // hidden width
+    pub depth: usize,       // transformer blocks
+    pub heads: usize,       // attention heads
+    pub ff_mult: usize,     // ff_dim = dim * ff_mult
+    pub text_dim: usize,    // char-embedding width
+    pub conv_layers: usize, // ConvNeXt-V2 text-refinement blocks
+    pub text_vocab: usize,  // char vocab size (from vocab.txt)
     pub mel: MelConfig,
     pub cfm: CfmConfig,
 }
@@ -44,10 +44,24 @@ impl F5Config {
             text_dim: 512,
             conv_layers: 4,
             text_vocab: 2546,
-            mel: MelConfig { n_mel: 100, sample_rate: 24000, hop_length: 256, win_length: 1024, n_fft: 1024 },
-            cfm: CfmConfig { nfe: 32, sway_coef: -1.0, cfg_strength: 2.0 },
+            mel: MelConfig {
+                n_mel: 100,
+                sample_rate: 24000,
+                hop_length: 256,
+                win_length: 1024,
+                n_fft: 1024,
+            },
+            cfm: CfmConfig {
+                nfe: 32,
+                sway_coef: -1.0,
+                cfg_strength: 2.0,
+            },
         }
     }
-    pub fn head_dim(&self) -> usize { self.dim / self.heads }
-    pub fn ff_dim(&self) -> usize { self.dim * self.ff_mult }
+    pub fn head_dim(&self) -> usize {
+        self.dim / self.heads
+    }
+    pub fn ff_dim(&self) -> usize {
+        self.dim * self.ff_mult
+    }
 }

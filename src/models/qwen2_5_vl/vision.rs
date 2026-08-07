@@ -67,7 +67,8 @@ struct VisionMlp<B: Backend> {
 }
 impl<B: Backend> VisionMlp<B> {
     fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        self.down.forward(silu(self.gate.forward(x.clone())) * self.up.forward(x))
+        self.down
+            .forward(silu(self.gate.forward(x.clone())) * self.up.forward(x))
     }
 }
 
@@ -101,7 +102,10 @@ impl<B: Backend> VisionAttention<B> {
         let k = Self::rope(split(1), cos, sin);
         let v = split(2);
 
-        let scores = q.matmul(k.swap_dims(2, 3)).mul_scalar((hd as f64).powf(-0.5)) + mask;
+        let scores = q
+            .matmul(k.swap_dims(2, 3))
+            .mul_scalar((hd as f64).powf(-0.5))
+            + mask;
         // fp32 softmax (HF convention); identity on an f32 backend.
         let dt = scores.dtype();
         let probs = softmax(scores.cast(burn::tensor::FloatDType::F32), 3).cast(dt);
@@ -164,7 +168,10 @@ struct PatchMerger<B: Backend> {
 impl<B: Backend> PatchMerger<B> {
     fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
         let seq = x.dims()[0];
-        let normed = self.ln_q.forward(x.unsqueeze::<3>()).reshape([seq, self.context_dim]);
+        let normed = self
+            .ln_q
+            .forward(x.unsqueeze::<3>())
+            .reshape([seq, self.context_dim]);
         let grouped = normed.reshape([seq / self.merge_unit, self.context_dim * self.merge_unit]);
         self.fc2.forward(gelu(self.fc1.forward(grouped)))
     }
@@ -180,12 +187,23 @@ pub struct VisionTransformer<B: Backend> {
 }
 
 impl<B: Backend> VisionTransformer<B> {
-    pub fn load(w: &impl VisionWeights<B>, cfg: &Qwen2_5VlVisionConfig, device: &B::Device) -> Self {
+    pub fn load(
+        w: &impl VisionWeights<B>,
+        cfg: &Qwen2_5VlVisionConfig,
+        device: &B::Device,
+    ) -> Self {
         let hidden = cfg.hidden_size;
         let in_flat = cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
-        let patch_proj = Linear::new(w.patch_proj("patch_embed.proj.weight", hidden, in_flat), None);
-        let lin =
-            |n: &str| Linear::new(w.t2(&format!("{n}.weight")), Some(w.t1(&format!("{n}.bias"))));
+        let patch_proj = Linear::new(
+            w.patch_proj("patch_embed.proj.weight", hidden, in_flat),
+            None,
+        );
+        let lin = |n: &str| {
+            Linear::new(
+                w.t2(&format!("{n}.weight")),
+                Some(w.t1(&format!("{n}.bias"))),
+            )
+        };
         let blocks = (0..cfg.depth)
             .map(|i| {
                 let p = format!("blocks.{i}");
@@ -214,7 +232,13 @@ impl<B: Backend> VisionTransformer<B> {
             context_dim: hidden,
             merge_unit,
         };
-        Self { patch_proj, blocks, merger, cfg: cfg.clone(), device: device.clone() }
+        Self {
+            patch_proj,
+            blocks,
+            merger,
+            cfg: cfg.clone(),
+            device: device.clone(),
+        }
     }
 
     /// Run the tower over `pixel_values` `[seq, in_flat]` with `grid` `[(t,h,w)]`.
@@ -258,7 +282,7 @@ impl<B: Backend> VisionTransformer<B> {
         }
 
         let merged = self.merger.forward(x); // [n_units, out_hidden], window order
-        // scatter back to raster order: out[raster] = merged[argsort(unit_index)]
+                                             // scatter back to raster order: out[raster] = merged[argsort(unit_index)]
         let back: Vec<i64> = argsort(&unit_index);
         gather_rows(merged, &back, &self.device)
     }
@@ -271,8 +295,9 @@ impl<B: Backend> VisionTransformer<B> {
         let rdim = head_dim / 2; // 40
         let nfreq = rdim / 2; // 20
         let theta = 10000.0f64;
-        let inv: Vec<f64> =
-            (0..nfreq).map(|j| 1.0 / theta.powf((2 * j) as f64 / rdim as f64)).collect();
+        let inv: Vec<f64> = (0..nfreq)
+            .map(|j| 1.0 / theta.powf((2 * j) as f64 / rdim as f64))
+            .collect();
         let freqs = |p: usize| -> Vec<f32> { inv.iter().map(|&f| (p as f64 * f) as f32).collect() };
 
         let mut cos = Vec::new();

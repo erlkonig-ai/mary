@@ -41,20 +41,14 @@ pub struct Decoder<B: Backend> {
 
 impl<B: Backend> Decoder<B> {
     /// Load the decoder from a single safetensors file.
-    pub fn load(
-        loader: &WeightLoader,
-        config: &VaeConfig,
-        device: &B::Device,
-    ) -> Self {
+    pub fn load(loader: &WeightLoader, config: &VaeConfig, device: &B::Device) -> Self {
         let num_groups = config.norm_num_groups;
         let block_out_channels = &config.block_out_channels;
         let last_ch = *block_out_channels.last().unwrap(); // 512
 
         // conv_in: latent_channels -> last_ch
-        let conv_in_weight =
-            loader.load_tensor::<B, 4>("decoder.conv_in.weight", device);
-        let conv_in_bias =
-            loader.load_tensor::<B, 1>("decoder.conv_in.bias", device);
+        let conv_in_weight = loader.load_tensor::<B, 4>("decoder.conv_in.weight", device);
+        let conv_in_bias = loader.load_tensor::<B, 1>("decoder.conv_in.bias", device);
 
         // Mid block: 2 resnets + 1 attention, all operating at last_ch=512
         let mid_resnet0 = ResnetBlock2D::load(
@@ -118,12 +112,9 @@ impl<B: Backend> Decoder<B> {
         // Output normalization and convolution
         let conv_norm_out_weight =
             loader.load_tensor::<B, 1>("decoder.conv_norm_out.weight", device);
-        let conv_norm_out_bias =
-            loader.load_tensor::<B, 1>("decoder.conv_norm_out.bias", device);
-        let conv_out_weight =
-            loader.load_tensor::<B, 4>("decoder.conv_out.weight", device);
-        let conv_out_bias =
-            loader.load_tensor::<B, 1>("decoder.conv_out.bias", device);
+        let conv_norm_out_bias = loader.load_tensor::<B, 1>("decoder.conv_norm_out.bias", device);
+        let conv_out_weight = loader.load_tensor::<B, 4>("decoder.conv_out.weight", device);
+        let conv_out_bias = loader.load_tensor::<B, 1>("decoder.conv_out.bias", device);
 
         Self {
             conv_in_weight,

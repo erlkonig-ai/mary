@@ -33,8 +33,12 @@ fn main() {
 
     let pile = std::env::temp_dir().join(format!("mary_gemma_stream_{}.pile", std::process::id()));
     println!("[persist] {snapshot_dir:?} -> {pile:?}");
-    persist_safetensors_to_pile(snapshot_dir, &pile, mary::ingest::LeafDtype::F16).expect("persist");
-    println!("[persist] pile is {} bytes", std::fs::metadata(&pile).map(|m| m.len()).unwrap_or(0));
+    persist_safetensors_to_pile(snapshot_dir, &pile, mary::ingest::LeafDtype::F16)
+        .expect("persist");
+    println!(
+        "[persist] pile is {} bytes",
+        std::fs::metadata(&pile).map(|m| m.len()).unwrap_or(0)
+    );
 
     let chat = "<bos><|turn>user\nWhat is 17 times 23? Answer with just the number.<turn|>\n<|turn>model\n";
 
@@ -60,9 +64,18 @@ fn main() {
 
     let _ = std::fs::remove_file(&pile);
 
-    println!("streaming   ids {ids_stream:?} -> {:?}", streamed_text(&materialized, &ids_stream));
-    println!("materialized ids {ids_keymap:?} -> {:?}", streamed_text(&materialized, &ids_keymap));
-    assert_eq!(ids_stream, ids_keymap, "streaming pile load diverged from materialized");
+    println!(
+        "streaming   ids {ids_stream:?} -> {:?}",
+        streamed_text(&materialized, &ids_stream)
+    );
+    println!(
+        "materialized ids {ids_keymap:?} -> {:?}",
+        streamed_text(&materialized, &ids_keymap)
+    );
+    assert_eq!(
+        ids_stream, ids_keymap,
+        "streaming pile load diverged from materialized"
+    );
     println!("=== PASS — streaming pile load is token-identical to materialized ===");
 }
 

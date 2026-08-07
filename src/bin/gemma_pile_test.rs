@@ -65,8 +65,16 @@ fn main() {
     let chat = format!("<bos><|turn>user\n{PROMPT}<turn|>\n<|turn>model\n");
 
     // ── Path 1: direct safetensors ─────────────────────────────────────────
-    eprintln!("[safetensors] loading {MODEL_ID} from {} shard(s)...", paths.len());
-    let lm_safe = GemmaLM::<B>::load(config.clone(), &paths, Path::new(&tokenizer_path), device.clone());
+    eprintln!(
+        "[safetensors] loading {MODEL_ID} from {} shard(s)...",
+        paths.len()
+    );
+    let lm_safe = GemmaLM::<B>::load(
+        config.clone(),
+        &paths,
+        Path::new(&tokenizer_path),
+        device.clone(),
+    );
     let ids_safe = lm_safe.complete_ids(&chat, MAX_NEW);
     let text_safe = lm_safe.decode(&ids_safe);
     drop(lm_safe);
@@ -78,8 +86,12 @@ fn main() {
     let mut model_ids: Vec<Id> = Vec::new();
     for shard in &paths {
         let bytes = read_safetensors_file(shard);
-        let name = shard.file_name().and_then(|s| s.to_str()).unwrap_or("gemma4");
-        let frag = save_safetensors(&bytes, name, &mut blobs, mary::ingest::LeafDtype::F16).expect("ingest");
+        let name = shard
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("gemma4");
+        let frag = save_safetensors(&bytes, name, &mut blobs, mary::ingest::LeafDtype::F16)
+            .expect("ingest");
         model_ids.push(frag.root().expect("model root"));
         tribles += frag;
     }
@@ -91,7 +103,12 @@ fn main() {
     }
     eprintln!("[pile] materialized {} tensors from pile", keymap.len());
 
-    let lm_pile = GemmaLM::<B>::from_keymap(config.clone(), keymap, Path::new(&tokenizer_path), device.clone());
+    let lm_pile = GemmaLM::<B>::from_keymap(
+        config.clone(),
+        keymap,
+        Path::new(&tokenizer_path),
+        device.clone(),
+    );
     let ids_pile = lm_pile.complete_ids(&chat, MAX_NEW);
     let text_pile = lm_pile.decode(&ids_pile);
 

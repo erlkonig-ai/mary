@@ -29,7 +29,7 @@ use crate::nn::weight_loader::WeightLoader;
 
 /// Bias-optional Linear, stored ready-to-matmul: `[1, in, out]`.
 pub struct Linear<B: Backend> {
-    pub weight_t: Tensor<B, 3>, // [1, in, out]
+    pub weight_t: Tensor<B, 3>,     // [1, in, out]
     pub bias: Option<Tensor<B, 3>>, // [1, 1, out]
 }
 
@@ -93,7 +93,10 @@ pub struct RmsNorm<B: Backend> {
 
 impl<B: Backend> RmsNorm<B> {
     pub fn load(loader: &WeightLoader, name: &str, eps: f64, device: &B::Device) -> Self {
-        Self { weight: loader.load_tensor(name, device), eps }
+        Self {
+            weight: loader.load_tensor(name, device),
+            eps,
+        }
     }
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
@@ -109,7 +112,9 @@ pub struct Embedding<B: Backend> {
 
 impl<B: Backend> Embedding<B> {
     pub fn load(loader: &WeightLoader, name: &str, device: &B::Device) -> Self {
-        Self { weight: loader.load_tensor(name, device) }
+        Self {
+            weight: loader.load_tensor(name, device),
+        }
     }
 
     pub fn forward(&self, ids: &[u32], device: &B::Device) -> Tensor<B, 3> {
@@ -155,8 +160,14 @@ impl<B: Backend> RopeTable<B> {
     /// computed once per stack forward and shared by all layers.
     pub fn slices(&self, offset: usize, l: usize) -> (Tensor<B, 4>, Tensor<B, 4>) {
         (
-            self.cos.clone().narrow(0, offset, l).reshape([1, 1, l, self.d]),
-            self.sin.clone().narrow(0, offset, l).reshape([1, 1, l, self.d]),
+            self.cos
+                .clone()
+                .narrow(0, offset, l)
+                .reshape([1, 1, l, self.d]),
+            self.sin
+                .clone()
+                .narrow(0, offset, l)
+                .reshape([1, 1, l, self.d]),
         )
     }
 }
@@ -230,7 +241,13 @@ impl<B: Backend> Attention<B> {
         o_proj: Linear<B>,
         cfg: AttnConfig,
     ) -> Self {
-        Self { wide_t, w, w_rot, o_proj, cfg }
+        Self {
+            wide_t,
+            w,
+            w_rot,
+            o_proj,
+            cfg,
+        }
     }
 
     /// `fold_in`: the preceding RMSNorm's weight (folded into `wide_t` rows).
@@ -245,14 +262,19 @@ impl<B: Backend> Attention<B> {
     ) -> Self {
         let (h, hkv, d) = (cfg.heads, cfg.kv_heads, cfg.head_dim);
         let half = d / 2;
-        let w2 = |n: &str| -> Tensor<B, 2> { loader.load_tensor(&format!("{prefix}.{n}.weight"), device) };
+        let w2 = |n: &str| -> Tensor<B, 2> {
+            loader.load_tensor(&format!("{prefix}.{n}.weight"), device)
+        };
 
         // rotate_half on OUTPUT rows: rows [heads, d, in] → [-rows[half..] ‖ rows[..half]]
         let qk: Tensor<B, 2> = Tensor::cat(vec![w2("q_proj"), w2("k_proj")], 0); // [(H+Hkv)D, in]
         let hidden = qk.dims()[1];
         let qk3 = qk.clone().reshape([h + hkv, d, hidden]);
         let qk_rot = Tensor::cat(
-            vec![qk3.clone().narrow(1, half, half).neg(), qk3.narrow(1, 0, half)],
+            vec![
+                qk3.clone().narrow(1, half, half).neg(),
+                qk3.narrow(1, 0, half),
+            ],
             1,
         )
         .reshape([(h + hkv) * d, hidden]);
@@ -274,12 +296,17 @@ impl<B: Backend> Attention<B> {
             (Tensor::ones([d], device), Tensor::ones([d], device))
         };
         let perm = |t: Tensor<B, 1>| -> Tensor<B, 1> {
-            Tensor::cat(vec![t.clone().narrow(0, half, half), t.narrow(0, 0, half)], 0)
+            Tensor::cat(
+                vec![t.clone().narrow(0, half, half), t.narrow(0, 0, half)],
+                0,
+            )
         };
         let heads_w = |q: Tensor<B, 1>, k: Tensor<B, 1>| -> Tensor<B, 4> {
             Tensor::cat(
                 vec![
-                    q.mul_scalar(scale).reshape([1, 1, 1, d]).expand([1, h, 1, d]),
+                    q.mul_scalar(scale)
+                        .reshape([1, 1, 1, d])
+                        .expand([1, h, 1, d]),
                     k.reshape([1, 1, 1, d]).expand([1, hkv, 1, d]),
                 ],
                 1,
@@ -292,7 +319,13 @@ impl<B: Backend> Attention<B> {
         if let Some(s) = fold_out {
             o_proj = o_proj.fold_out(s);
         }
-        Self { wide_t, w, w_rot, o_proj, cfg }
+        Self {
+            wide_t,
+            w,
+            w_rot,
+            o_proj,
+            cfg,
+        }
     }
 
     /// Causal (optionally sliding-window) self-attention with cache.
@@ -313,7 +346,7 @@ impl<B: Backend> Attention<B> {
         let offset = cache.seq_len();
 
         let qkv = x.matmul(self.wide_t.clone()); // [B,L,(2(H+Hkv)+Hkv)·D]
-        // [B,L,heads·D] → [B,heads,L,D]; for L=1 the reshape alone is exact.
+                                                 // [B,L,heads·D] → [B,heads,L,D]; for L=1 the reshape alone is exact.
         let heads = |t: Tensor<B, 3>, n: usize| -> Tensor<B, 4> {
             if l == 1 {
                 t.reshape([b, n, 1, d])
@@ -414,14 +447,24 @@ impl<B: Backend> DecoderLayer<B> {
         down_proj: Linear<B>,
         eps: f64,
     ) -> Self {
-        Self { attn, gate_up_t, down_proj, eps }
+        Self {
+            attn,
+            gate_up_t,
+            down_proj,
+            eps,
+        }
     }
 
     pub fn load(loader: &WeightLoader, prefix: &str, cfg: AttnConfig, device: &B::Device) -> Self {
-        let w = |n: &str| -> Tensor<B, 2> { loader.load_tensor(&format!("{prefix}.{n}.weight"), device) };
-        let w1 = |n: &str| -> Tensor<B, 1> { loader.load_tensor(&format!("{prefix}.{n}.weight"), device) };
+        let w = |n: &str| -> Tensor<B, 2> {
+            loader.load_tensor(&format!("{prefix}.{n}.weight"), device)
+        };
+        let w1 = |n: &str| -> Tensor<B, 1> {
+            loader.load_tensor(&format!("{prefix}.{n}.weight"), device)
+        };
         let scale = |n: &str| -> Option<Tensor<B, 1>> {
-            cfg.layer_scale.then(|| loader.load_tensor(&format!("{prefix}.{n}.scale"), device))
+            cfg.layer_scale
+                .then(|| loader.load_tensor(&format!("{prefix}.{n}.scale"), device))
         };
         let attn = Attention::load(
             loader,
@@ -441,7 +484,12 @@ impl<B: Backend> DecoderLayer<B> {
         if let Some(s) = scale("mlp_layer_scale") {
             down_proj = down_proj.fold_out(s);
         }
-        Self { attn, gate_up_t, down_proj, eps: cfg.eps }
+        Self {
+            attn,
+            gate_up_t,
+            down_proj,
+            eps: cfg.eps,
+        }
     }
 
     pub fn forward(
@@ -452,9 +500,13 @@ impl<B: Backend> DecoderLayer<B> {
         cache: &mut KvCache<B>,
         device: &B::Device,
     ) -> Tensor<B, 3> {
-        let att = self
-            .attn
-            .forward(rms(x.clone(), self.eps), cos.clone(), sin.clone(), cache, device);
+        let att = self.attn.forward(
+            rms(x.clone(), self.eps),
+            cos.clone(),
+            sin.clone(),
+            cache,
+            device,
+        );
         let x = x + att;
         let h = rms(x.clone(), self.eps);
         let gu = h.matmul(self.gate_up_t.clone());

@@ -13,7 +13,7 @@
 
 use crate::models::gemma::gemma4::config::Gemma4Config;
 use crate::models::gemma::gemma4::lm::GemmaLM;
-use crate::nn::backend::{WgpuDevice, B, BHalf};
+use crate::nn::backend::{BHalf, WgpuDevice, B};
 use burn::prelude::Backend;
 use std::path::Path;
 
@@ -22,7 +22,9 @@ use std::path::Path;
 /// at f16; the default device panics in cubecl dispatch on the large buffers).
 /// Pass this as the `device` to the loaders for big models. Pair with the f16
 /// constructors so 31B's ~60 GB fits 128 GB (f32 is ~120 GB and will not).
-pub use crate::models::gemma::metal_device::{init_metal_device_16gb, init_metal_device_with_large_buffers};
+pub use crate::models::gemma::metal_device::{
+    init_metal_device_16gb, init_metal_device_with_large_buffers,
+};
 
 /// Chat role. Gemma has no native system turn, so System content is folded into
 /// the next user turn (the standard Gemma convention).
@@ -54,7 +56,13 @@ pub struct LocalGenParams {
 
 impl Default for LocalGenParams {
     fn default() -> Self {
-        Self { max_tokens: 128, temperature: 0.0, top_p: None, stop: vec![], seed: None }
+        Self {
+            max_tokens: 128,
+            temperature: 0.0,
+            top_p: None,
+            stop: vec![],
+            seed: None,
+        }
     }
 }
 
@@ -104,7 +112,10 @@ fn split_channels(raw: &str) -> (String, Option<String>) {
     let mut channels: Vec<(String, String)> = Vec::new();
     for seg in raw.split("<|channel>").skip(1) {
         if let Some((name, content)) = seg.split_once("<channel|>") {
-            channels.push((name.trim().to_lowercase(), strip_markers(content).trim().to_string()));
+            channels.push((
+                name.trim().to_lowercase(),
+                strip_markers(content).trim().to_string(),
+            ));
         } else {
             // Header with no close marker — treat the whole segment as content.
             channels.push((String::new(), strip_markers(seg).trim().to_string()));
@@ -124,7 +135,11 @@ fn split_channels(raw: &str) -> (String, Option<String>) {
         .filter(|(i, (_, c))| *i != final_idx && !c.is_empty())
         .map(|(_, (_, c))| c.clone())
         .collect();
-    let reasoning = if reasoning.is_empty() { None } else { Some(reasoning.join("\n")) };
+    let reasoning = if reasoning.is_empty() {
+        None
+    } else {
+        Some(reasoning.join("\n"))
+    };
     (text, reasoning)
 }
 
@@ -197,10 +212,16 @@ where
         // Generate fully (no early stop-string) so a thinking model's channels
         // complete; the stop-string applies to the FINAL channel, post-split, so
         // a "\n" cuts the command and not the reasoning.
-        let (raw, prompt_tokens, completion_tokens) = self.lm.complete(&chat, params.max_tokens, &[]);
+        let (raw, prompt_tokens, completion_tokens) =
+            self.lm.complete(&chat, params.max_tokens, &[]);
         let (final_text, reasoning) = split_channels(&raw);
         let text = apply_stop(&final_text, &params.stop);
-        Ok(LocalGeneration { text, reasoning, prompt_tokens, completion_tokens })
+        Ok(LocalGeneration {
+            text,
+            reasoning,
+            prompt_tokens,
+            completion_tokens,
+        })
     }
 }
 
@@ -277,7 +298,9 @@ mod channel_tests {
     #[test]
     fn stop_string_cuts_final_text_only() {
         // reasoning may contain newlines; stop must apply to the final text.
-        let (t, _r) = split_channels("<|channel>thought<channel|>line one\nline two<|channel>final<channel|>ls -l\nrm x");
+        let (t, _r) = split_channels(
+            "<|channel>thought<channel|>line one\nline two<|channel>final<channel|>ls -l\nrm x",
+        );
         assert_eq!(apply_stop(&t, &["\n".to_string()]), "ls -l");
     }
 }

@@ -73,6 +73,22 @@ mod ty {
     /// negative lookahead the `regex` crate rejects outright. The pattern
     /// string itself rides the existing `attrs::pattern`.
     pub const TIKTOKEN_PRE_TOKENIZER: Id = id_hex!("AF6D6B71213E710F92E434D451540805");
+
+    // ── minted 2026-08-04 — SentencePiece UNIGRAM support ──
+    // PersonaPlex's tokenizer is `model_type = UNIGRAM`: a Viterbi lattice over
+    // per-piece log-probs with NO merges. The BPE/WordPiece schema above cannot
+    // express it — a unigram model is *defined* by its scores, and only NORMAL
+    // pieces are lattice edges, so piece type is load-bearing too.
+    /// SentencePiece unigram model (scores, no merges).
+    pub const UNIGRAM: Id = id_hex!("AAC02E8BB835F423DF9EA5C0BAA3CAD6");
+    /// SentencePiece piece types. Only NORMAL pieces enter the match table;
+    /// CONTROL/UNKNOWN never match from text; BYTE backs `byte_fallback`.
+    pub const PIECE_NORMAL: Id = id_hex!("EEEA86BCCE689C062D7C26EF1EEF936A");
+    pub const PIECE_UNKNOWN: Id = id_hex!("8F7B8C418D447BA7E45CEA8BB4914AC2");
+    pub const PIECE_CONTROL: Id = id_hex!("3EE7240B7CB58403D1DF30E39277CFF2");
+    pub const PIECE_USER_DEFINED: Id = id_hex!("9796A2F548F7C646D1798EFE7E8B4001");
+    pub const PIECE_BYTE: Id = id_hex!("9D9E4D16DD83083B49D34056344FD082");
+    pub const PIECE_UNUSED: Id = id_hex!("DD28C23E8DE557BC00F0451A8ED7C1C6");
 }
 #[allow(dead_code)]
 mod flag {
@@ -91,7 +107,7 @@ mod flag {
 }
 
 pub mod attrs {
-    use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString, U256BE};
+    use triblespace::prelude::inlineencodings::{Boolean, F64, GenId, Handle, ShortString, U256BE};
     use triblespace::prelude::*;
 
     attributes! {
@@ -158,6 +174,16 @@ pub mod attrs {
         "6FB969E8A3EDD1A657C721DD5A7D42EA" as end_of_word_suffix: ShortString;
         /// WordPiece max input chars per word (100).
         "DF3F88DBFA2B44A7783169C9640014AF" as max_input_chars: U256BE;
+
+        // ── minted 2026-08-04 — SentencePiece UNIGRAM leaves ──
+        /// A vocab entry's unigram log-probability. `F64` because scores are
+        /// stored f32 in the SPM proto and f64 holds them losslessly; the
+        /// Viterbi lattice sums these, so precision is not decorative.
+        /// Absent on BPE/WordPiece entries.
+        "3BCB70478942DB710ED2A4FB023F3457" as piece_score: F64;
+        /// Whether the model falls back to the 256 `<0xXX>` BYTE pieces for
+        /// characters no NORMAL piece covers. `Boolean`, on the tokenizer node.
+        "EE4C6647619A836326196F0DBF84FA98" as byte_fallback: Boolean;
 
         // ── minted 2026-07-16 — config-node flat fields ──
         /// A Replace/Split node's regex pattern string (stored raw; both our
@@ -254,8 +280,12 @@ pub fn save_tokenizer_json(
     // ── the tokenizer entity (+ flat model knobs; absent ones are omitted) ──
     let name_h = blobs.put::<blobencodings::LongString, _>(source_name.to_string())?;
     let unk = model["unk_token"].as_str();
-    let csp = model["continuing_subword_prefix"].as_str().filter(|s| !s.is_empty());
-    let eows = model["end_of_word_suffix"].as_str().filter(|s| !s.is_empty());
+    let csp = model["continuing_subword_prefix"]
+        .as_str()
+        .filter(|s| !s.is_empty());
+    let eows = model["end_of_word_suffix"]
+        .as_str()
+        .filter(|s| !s.is_empty());
     let max_chars = model["max_input_chars_per_word"].as_u64();
     let model_type = match model_kind {
         "WordPiece" => ty::WORD_PIECE,
@@ -435,8 +465,8 @@ fn save_config_node(
                 .ok_or("Sequence node missing normalizers/pretokenizers array")?;
             for (i, child) in children.iter().enumerate() {
                 let cid = save_config_node(child, blobs, facts)?;
-                *facts += entity! { ExclusiveId::force_ref(&cid) @ attrs::index: i as u64 }
-                    .into_facts();
+                *facts +=
+                    entity! { ExclusiveId::force_ref(&cid) @ attrs::index: i as u64 }.into_facts();
                 members.push(cid);
             }
         }
@@ -625,7 +655,17 @@ pub fn find_tokenizer(tribles: &TribleSet) -> Option<Id> {
         (e: Id, t: Id, n: Inline<inlineencodings::Handle<blobencodings::LongString>>),
         pattern!(tribles, [{ ?e @ metadata::tag: ?t, attrs::model_name: ?n }])
     )
-    .find(|&(_, t, _)| t == ty::WORD_PIECE || t == ty::BPE || t == ty::TIKTOKEN)
+    // The model-type tags, and ONLY those: a tokenizer node also carries flag
+    // tags (ADD_PREFIX_SPACE, ...), and `find!` yields one row per tag, so this
+    // filter is what distinguishes the tokenizer node from its own flags.
+    //
+    // All four kinds belong here. TIKTOKEN because Kimi-K3's byte-level BPE has
+    // no merges list; UNIGRAM because omitting it made
+    // `load_spm_tokenizer_from_pile` report "no tokenizer graph" on a pile that
+    // had just been written.
+    .find(|&(_, t, _)| {
+        t == ty::WORD_PIECE || t == ty::BPE || t == ty::TIKTOKEN || t == ty::UNIGRAM
+    })
     .map(|(e, _, _)| e)
 }
 
@@ -726,7 +766,9 @@ pub fn build_tokenizer(
         if let Some(m) = max_chars {
             b = b.max_input_chars_per_word(m as usize);
         }
-        b.build().map_err(|e| format!("build WordPiece model: {e}"))?.into()
+        b.build()
+            .map_err(|e| format!("build WordPiece model: {e}"))?
+            .into()
     } else if tags.contains(&ty::BPE) {
         let merges = load_merges(tribles, blobs, tok_id);
         let mut b = BPE::builder().vocab_and_merges(vocab, merges);
@@ -739,7 +781,9 @@ pub fn build_tokenizer(
         if let Some(s) = eows {
             b = b.end_of_word_suffix(s);
         }
-        b.build().map_err(|e| format!("build BPE model: {e}"))?.into()
+        b.build()
+            .map_err(|e| format!("build BPE model: {e}"))?
+            .into()
     } else {
         return Err("tokenizer entity carries no model-kind tag (WordPiece/BPE)".into());
     };
@@ -804,9 +848,11 @@ fn build_normalizer(
             .ok_or("Replace node missing pattern")?;
         let content = short_field!(tribles, node, attrs::replace_content).unwrap_or_default();
         // Patterns are stored raw from the Regex variant; rebuild as Regex.
-        Ok(n::Replace::new(n::replace::ReplacePattern::Regex(pat), content)
-            .map_err(|e| format!("build Replace normalizer: {e}"))?
-            .into())
+        Ok(
+            n::Replace::new(n::replace::ReplacePattern::Regex(pat), content)
+                .map_err(|e| format!("build Replace normalizer: {e}"))?
+                .into(),
+        )
     } else {
         Err(format!("normalizer node {node:?} has no known type tag").into())
     }
@@ -833,8 +879,8 @@ fn build_pre_tokenizer(
     } else if has(ty::SPLIT) {
         let pat = long_field!(tribles, blobs, node, attrs::pattern)
             .ok_or("Split node missing pattern")?;
-        let behavior = short_field!(tribles, node, attrs::behavior)
-            .ok_or("Split node missing behavior")?;
+        let behavior =
+            short_field!(tribles, node, attrs::behavior).ok_or("Split node missing behavior")?;
         Ok(p::split::Split::new(
             p::split::SplitPattern::Regex(pat),
             parse_behavior(&behavior)?,
@@ -1242,9 +1288,9 @@ mod tests {
             WP,
             &[
                 "hello telecommunications",
-                "HELLO Hello hello",         // BertNormalizer lowercase
-                "telecommunicationsing",     // WordPiece ##ing continuation
-                "[CLS] hello [PAD]",         // added tokens match as specials
+                "HELLO Hello hello",     // BertNormalizer lowercase
+                "telecommunicationsing", // WordPiece ##ing continuation
+                "[CLS] hello [PAD]",     // added tokens match as specials
             ],
         );
     }
@@ -1252,10 +1298,7 @@ mod tests {
     #[cfg(feature = "tokenizer")]
     #[test]
     fn graph_built_bytelevel_bpe_encodes_like_json_built() {
-        assert_encode_parity(
-            BPE_BYTELEVEL,
-            &["ab abc", "ABC aB", "abc ab a", "a b c"],
-        );
+        assert_encode_parity(BPE_BYTELEVEL, &["ab abc", "ABC aB", "abc ab a", "a b c"]);
     }
 
     // Sequence/Split/Replace plumbing: the original BPE fixture's pre-tok
@@ -1316,4 +1359,107 @@ mod tests {
             texts.len()
         );
     }
+}
+
+// ───────────────────── SentencePiece UNIGRAM (added 2026-08-04) ─────────────
+
+/// Map a SentencePiece piece-type discriminant to its tag id.
+fn spm_type_tag(typ: u64) -> Id {
+    match typ {
+        1 => ty::PIECE_NORMAL,
+        2 => ty::PIECE_UNKNOWN,
+        3 => ty::PIECE_CONTROL,
+        4 => ty::PIECE_USER_DEFINED,
+        5 => ty::PIECE_UNUSED,
+        6 => ty::PIECE_BYTE,
+        other => panic!("spm: unknown piece type {other}"),
+    }
+}
+
+fn spm_tag_type(tag: Id) -> u64 {
+    match tag {
+        t if t == ty::PIECE_NORMAL => 1,
+        t if t == ty::PIECE_UNKNOWN => 2,
+        t if t == ty::PIECE_CONTROL => 3,
+        t if t == ty::PIECE_USER_DEFINED => 4,
+        t if t == ty::PIECE_UNUSED => 5,
+        t if t == ty::PIECE_BYTE => 6,
+        _ => panic!("spm: vocab entry carries no piece-type tag"),
+    }
+}
+
+/// Ingest a SentencePiece UNIGRAM model as a queryable graph.
+///
+/// Unlike BPE/WordPiece there are no merges: a unigram model IS its scored
+/// piece table, so each vocab entry carries `piece_score` (the log-prob that
+/// the Viterbi lattice sums) and a piece-type tag (only NORMAL pieces are
+/// lattice edges; BYTE pieces back `byte_fallback`). Graph-only — the raw
+/// `.model` proto is NOT stored, the pieces ARE the model.
+pub fn save_spm_unigram(
+    pieces: &[(Vec<u8>, f32, u64)],
+    add_dummy_prefix: bool,
+    byte_fallback: bool,
+    source_name: &str,
+    blobs: &mut impl BlobStorePut,
+) -> Result<Fragment, Err> {
+    let mut facts = TribleSet::new();
+    let mut vocab_ids: Vec<Id> = Vec::with_capacity(pieces.len());
+
+    for (id, (bytes, score, typ)) in pieces.iter().enumerate() {
+        // Every SPM piece is valid UTF-8: NORMAL pieces are text (still
+        // `▁`-escaped), BYTE pieces are the literal "<0xAB>" surface.
+        let text = String::from_utf8(bytes.clone())
+            .map_err(|e| format!("spm piece {id} is not utf8: {e}"))?;
+        let ph = blobs.put::<blobencodings::LongString, _>(text)?;
+        let e = entity! { _ @
+            metadata::tag: spm_type_tag(*typ),
+            attrs::piece: ph,
+            attrs::token_id: id as u64,
+            attrs::piece_score: *score as f64,
+        };
+        vocab_ids.push(e.root().expect("vocab entry root"));
+        facts += e.into_facts();
+    }
+
+    let name_h = blobs.put::<blobencodings::LongString, _>(source_name.to_string())?;
+    let mut tags: Vec<Id> = vec![ty::UNIGRAM];
+    if add_dummy_prefix {
+        tags.push(flag::ADD_PREFIX_SPACE);
+    }
+    let tok = entity! { _ @
+        metadata::tag*: tags.iter(),
+        attrs::model_name: name_h,
+        attrs::byte_fallback: byte_fallback,
+        attrs::vocab*: vocab_ids.iter(),
+    };
+    let tok_id = tok.root().expect("tokenizer root");
+    facts += tok.into_facts();
+    Ok(Fragment::rooted(tok_id, facts))
+}
+
+/// Read a UNIGRAM tokenizer back as the `(bytes, score, type)` table
+/// [`crate::models::personaplex::spm::SpmTokenizer::from_pieces`] consumes,
+/// ordered by `token_id`.
+pub fn load_spm_pieces(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    tok_id: Id,
+) -> Vec<(Vec<u8>, f32, u64)> {
+    let mut rows: Vec<(u64, Vec<u8>, f32, u64)> = find!(
+        (p, i: u64, sc: f64, t: Id),
+        pattern!(tribles, [
+            { tok_id @ attrs::vocab: _?entry },
+            { _?entry @ attrs::piece: ?p, attrs::token_id: ?i,
+                        attrs::piece_score: ?sc, metadata::tag: ?t }
+        ])
+    )
+    .map(|(ph, i, sc, t)| (i, read_piece(blobs, ph).into_bytes(), sc as f32, spm_tag_type(t)))
+    .collect();
+    rows.sort_by_key(|r| r.0);
+    rows.into_iter().map(|(_, b, s, t)| (b, s, t)).collect()
+}
+
+/// Does this tokenizer node carry the `add_prefix_space` flag?
+pub fn has_add_prefix_space(tribles: &TribleSet, tok_id: Id) -> bool {
+    node_tags(tribles, tok_id).contains(&flag::ADD_PREFIX_SPACE)
 }

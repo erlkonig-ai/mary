@@ -85,10 +85,7 @@ impl<B: Backend> Qwen3Model<B> {
                     }
                 }
             }
-            Tensor::<B, 4>::from_data(
-                TensorData::new(mask_data, [1, 1, seq_len, seq_len]),
-                device,
-            )
+            Tensor::<B, 4>::from_data(TensorData::new(mask_data, [1, 1, seq_len, seq_len]), device)
         });
 
         // Run through layers, collecting hidden states

@@ -108,7 +108,10 @@ fn adapt_layer_steps(loader: &WeightLoader, i: usize) -> Vec<WeightLoader> {
     let (out_proj, s) = loader.load_f32(&format!("{src}.self_attn.out_proj.weight"));
     assert_eq!(s, vec![n * d, d], "{src}: out_proj shape");
     let mut norms: Vec<(String, Vec<f32>)> = Vec::new();
-    for (moshi, mary) in [("norm1", "input_layernorm"), ("norm2", "post_attention_layernorm")] {
+    for (moshi, mary) in [
+        ("norm1", "input_layernorm"),
+        ("norm2", "post_attention_layernorm"),
+    ] {
         let (a, s) = loader.load_f32(&format!("{src}.{moshi}.alpha"));
         assert_eq!(s, vec![1, 1, d], "{src}: {moshi}.alpha shape");
         norms.push((format!("l.{mary}.weight"), a));
@@ -134,8 +137,14 @@ fn adapt_layer_steps(loader: &WeightLoader, i: usize) -> Vec<WeightLoader> {
 
             let (gu, s) = loader.load_f32(&format!("{src}.gating.{t}.linear_in.weight"));
             assert_eq!(s, vec![2 * fh, d], "{src}: gating.{t}.linear_in shape");
-            map.insert("l.mlp.gate_proj.weight".into(), (gu[..fh * d].to_vec(), vec![fh, d]));
-            map.insert("l.mlp.up_proj.weight".into(), (gu[fh * d..].to_vec(), vec![fh, d]));
+            map.insert(
+                "l.mlp.gate_proj.weight".into(),
+                (gu[..fh * d].to_vec(), vec![fh, d]),
+            );
+            map.insert(
+                "l.mlp.up_proj.weight".into(),
+                (gu[fh * d..].to_vec(), vec![fh, d]),
+            );
             let (down, s) = loader.load_f32(&format!("{src}.gating.{t}.linear_out.weight"));
             assert_eq!(s, vec![d, fh], "{src}: gating.{t}.linear_out shape");
             map.insert("l.mlp.down_proj.weight".into(), (down, vec![d, fh]));
@@ -171,8 +180,9 @@ pub struct DepthTransformer<B: Backend> {
 impl<B: Backend> DepthTransformer<B> {
     pub fn load(loader: &WeightLoader, device: &B::Device) -> Self {
         let cfg_a = attn_config();
-        let mut steps: Vec<Vec<DecoderLayer<B>>> =
-            (0..cfg::WEIGHTS_PER_STEP).map(|_| Vec::with_capacity(cfg::DEP_LAYERS)).collect();
+        let mut steps: Vec<Vec<DecoderLayer<B>>> = (0..cfg::WEIGHTS_PER_STEP)
+            .map(|_| Vec::with_capacity(cfg::DEP_LAYERS))
+            .collect();
         for i in 0..cfg::DEP_LAYERS {
             for (t, adapted) in adapt_layer_steps(loader, i).iter().enumerate() {
                 steps[t].push(DecoderLayer::load(adapted, "l", cfg_a, device));
@@ -189,11 +199,19 @@ impl<B: Backend> DepthTransformer<B> {
             g.insert(format!("linears.{t}.weight"), (w, s));
         }
         let (w, s) = loader.load_f32("depformer_text_emb.weight");
-        assert_eq!(s, vec![cfg::TEXT_VOCAB, cfg::DEP_DIM], "depformer_text_emb shape");
+        assert_eq!(
+            s,
+            vec![cfg::TEXT_VOCAB, cfg::DEP_DIM],
+            "depformer_text_emb shape"
+        );
         g.insert("depformer_text_emb.weight".into(), (w, s));
         for t in 0..cfg::WEIGHTS_PER_STEP - 1 {
             let (w, s) = loader.load_f32(&format!("depformer_emb.{t}.weight"));
-            assert_eq!(s, vec![cfg::AUDIO_VOCAB, cfg::DEP_DIM], "depformer_emb.{t} shape");
+            assert_eq!(
+                s,
+                vec![cfg::AUDIO_VOCAB, cfg::DEP_DIM],
+                "depformer_emb.{t} shape"
+            );
             g.insert(format!("depformer_emb.{t}.weight"), (w, s));
         }
         let g = WeightLoader::Pile(g);
@@ -238,32 +256,42 @@ impl<B: Backend> DepthTransformer<B> {
         mut sampler: Option<&mut Sampler>,
         device: &B::Device,
     ) -> ([i64; cfg::DEP_Q], Vec<Vec<f32>>) {
-        let mut caches: Vec<KvCache<B>> =
-            (0..cfg::DEP_LAYERS).map(|_| KvCache::empty()).collect();
+        let mut caches: Vec<KvCache<B>> = (0..cfg::DEP_LAYERS).map(|_| KvCache::empty()).collect();
         let mut tokens = [0i64; cfg::DEP_Q];
         let mut logits_out = Vec::with_capacity(cfg::DEP_Q);
         let mut prev = text_token;
         for s in 0..cfg::DEP_Q {
             let emb = if s == 0 {
-                assert!((0..cfg::TEXT_VOCAB as i64).contains(&prev), "text token {prev}");
+                assert!(
+                    (0..cfg::TEXT_VOCAB as i64).contains(&prev),
+                    "text token {prev}"
+                );
                 self.text_emb.weight.clone().narrow(0, prev as usize, 1)
             } else {
-                assert!((0..cfg::AUDIO_VOCAB as i64).contains(&prev), "audio token {prev}");
-                self.audio_emb[s - 1].weight.clone().narrow(0, prev as usize, 1)
+                assert!(
+                    (0..cfg::AUDIO_VOCAB as i64).contains(&prev),
+                    "audio token {prev}"
+                );
+                self.audio_emb[s - 1]
+                    .weight
+                    .clone()
+                    .narrow(0, prev as usize, 1)
             }
             .reshape([1, 1, cfg::DEP_DIM]);
             let mut h = self.dep_in[s].forward(transformer_out.clone()) + emb;
             for (layer, cache) in self.steps[s].iter().zip(caches.iter_mut()) {
                 h = layer.forward(h, &self.cos, &self.sin, cache, device);
             }
-            let logits: Vec<f32> =
-                self.heads[s].forward(h).into_data().to_vec::<f32>().unwrap();
+            let logits: Vec<f32> = self.heads[s]
+                .forward(h)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap();
             tokens[s] = match sampler.as_deref_mut() {
                 Some(smp) => smp.token(&logits) as i64,
                 None => argmax(&logits) as i64,
             };
-            prev = forced[s]
-                .unwrap_or_else(|| teacher.map_or(tokens[s], |t| t[s]));
+            prev = forced[s].unwrap_or_else(|| teacher.map_or(tokens[s], |t| t[s]));
             logits_out.push(logits);
         }
         (tokens, logits_out)

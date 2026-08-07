@@ -39,8 +39,8 @@ pub struct Flux2Transformer2DModel<B: Backend> {
     pub single_stream_modulation: Flux2Modulation<B>,
 
     // Input projections
-    pub x_embedder_weight: Tensor<B, 2>,       // [inner_dim, in_channels]
-    pub context_embedder_weight: Tensor<B, 2>,  // [inner_dim, joint_attention_dim]
+    pub x_embedder_weight: Tensor<B, 2>, // [inner_dim, in_channels]
+    pub context_embedder_weight: Tensor<B, 2>, // [inner_dim, joint_attention_dim]
 
     // Transformer blocks
     pub transformer_blocks: Vec<Flux2TransformerBlock<B>>,
@@ -57,11 +57,7 @@ pub struct Flux2Transformer2DModel<B: Backend> {
 impl<B: Backend> Flux2Transformer2DModel<B> {
     /// Load all weights (header + all blocks) into memory.
     /// Suitable for models that fit entirely in GPU memory (e.g. Klein ~12GB f32).
-    pub fn load(
-        loader: &WeightLoader,
-        config: Flux2TransformerConfig,
-        device: &B::Device,
-    ) -> Self {
+    pub fn load(loader: &WeightLoader, config: Flux2TransformerConfig, device: &B::Device) -> Self {
         let inner_dim = config.inner_dim();
         let mlp_hidden_dim = config.mlp_hidden_dim();
         let num_heads = config.num_attention_heads;
@@ -69,8 +65,7 @@ impl<B: Backend> Flux2Transformer2DModel<B> {
         let eps = config.eps;
 
         // Time embedding
-        let time_guidance_embed =
-            Flux2TimestepGuidanceEmbeddings::load(loader, &config, device);
+        let time_guidance_embed = Flux2TimestepGuidanceEmbeddings::load(loader, &config, device);
 
         // Shared modulation layers
         let double_stream_modulation_img =
@@ -81,8 +76,7 @@ impl<B: Backend> Flux2Transformer2DModel<B> {
             Flux2Modulation::load(loader, "single_stream_modulation", 1, device);
 
         // Input projections
-        let x_embedder_weight: Tensor<B, 2> =
-            loader.load_tensor("x_embedder.weight", device);
+        let x_embedder_weight: Tensor<B, 2> = loader.load_tensor("x_embedder.weight", device);
         let context_embedder_weight: Tensor<B, 2> =
             loader.load_tensor("context_embedder.weight", device);
 
@@ -111,8 +105,7 @@ impl<B: Backend> Flux2Transformer2DModel<B> {
 
         // Output layers
         let norm_out = AdaLayerNormContinuous::load(loader, "norm_out", eps, device);
-        let proj_out_weight: Tensor<B, 2> =
-            loader.load_tensor("proj_out.weight", device);
+        let proj_out_weight: Tensor<B, 2> = loader.load_tensor("proj_out.weight", device);
 
         Self {
             time_guidance_embed,
@@ -136,8 +129,7 @@ impl<B: Backend> Flux2Transformer2DModel<B> {
         config: Flux2TransformerConfig,
         device: &B::Device,
     ) -> Self {
-        let time_guidance_embed =
-            Flux2TimestepGuidanceEmbeddings::load(loader, &config, device);
+        let time_guidance_embed = Flux2TimestepGuidanceEmbeddings::load(loader, &config, device);
 
         let double_stream_modulation_img =
             Flux2Modulation::load(loader, "double_stream_modulation_img", 2, device);
@@ -146,14 +138,12 @@ impl<B: Backend> Flux2Transformer2DModel<B> {
         let single_stream_modulation =
             Flux2Modulation::load(loader, "single_stream_modulation", 1, device);
 
-        let x_embedder_weight: Tensor<B, 2> =
-            loader.load_tensor("x_embedder.weight", device);
+        let x_embedder_weight: Tensor<B, 2> = loader.load_tensor("x_embedder.weight", device);
         let context_embedder_weight: Tensor<B, 2> =
             loader.load_tensor("context_embedder.weight", device);
 
         let norm_out = AdaLayerNormContinuous::load(loader, "norm_out", config.eps, device);
-        let proj_out_weight: Tensor<B, 2> =
-            loader.load_tensor("proj_out.weight", device);
+        let proj_out_weight: Tensor<B, 2> = loader.load_tensor("proj_out.weight", device);
 
         Self {
             time_guidance_embed,
@@ -209,8 +199,7 @@ impl<B: Backend> Flux2Transformer2DModel<B> {
         let single_mods = split_modulation(single_mod, 1);
 
         // 3. Input projections
-        let mut hidden_states =
-            linear3d(hidden_states, self.x_embedder_weight.clone());
+        let mut hidden_states = linear3d(hidden_states, self.x_embedder_weight.clone());
         let mut encoder_hidden_states =
             linear3d(encoder_hidden_states, self.context_embedder_weight.clone());
 
@@ -261,8 +250,7 @@ impl<B: Backend> Flux2Transformer2DModel<B> {
         }
 
         // 6. Concatenate text + image for single-stream blocks
-        let mut combined =
-            Tensor::cat(vec![encoder_hidden_states, hidden_states], 1);
+        let mut combined = Tensor::cat(vec![encoder_hidden_states, hidden_states], 1);
 
         // 7. Single-stream transformer blocks
         let (ss_shift, ss_scale, ss_gate) = single_mods[0].clone();
@@ -280,8 +268,7 @@ impl<B: Backend> Flux2Transformer2DModel<B> {
         // 8. Remove text tokens (keep only image portion)
         let s_total = combined.dims()[1];
         let inner_dim = self.config.inner_dim();
-        let hidden_states =
-            combined.slice([0..batch, s_txt..s_total, 0..inner_dim]);
+        let hidden_states = combined.slice([0..batch, s_txt..s_total, 0..inner_dim]);
 
         // 9. Output norm + projection
         let hidden_states = self.norm_out.forward(hidden_states, temb);
@@ -380,7 +367,14 @@ impl<B: Backend> Flux2Transformer2DModel<B> {
         let (ss_shift, ss_scale, ss_gate) = single_mods[0].clone();
         for i in 0..self.config.num_single_layers {
             let block = Flux2SingleTransformerBlock::load(
-                loader, i, num_heads, head_dim, inner_dim, mlp_hidden_dim, eps, device,
+                loader,
+                i,
+                num_heads,
+                head_dim,
+                inner_dim,
+                mlp_hidden_dim,
+                eps,
+                device,
             );
             combined = block.forward(
                 combined,

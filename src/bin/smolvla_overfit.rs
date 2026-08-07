@@ -23,8 +23,12 @@ fn main() {
     let loader = WeightLoader::SingleFile(SingleFileLoader::new(Path::new(CKPT)));
 
     // The real expert head (720 -> 32), lifted to trainable leaves.
-    let mut w = loader.load_tensor::<B, 2>("model.action_out_proj.weight", &dev).require_grad(); // [32,720]
-    let mut b = loader.load_tensor::<B, 1>("model.action_out_proj.bias", &dev).require_grad(); // [32]
+    let mut w = loader
+        .load_tensor::<B, 2>("model.action_out_proj.weight", &dev)
+        .require_grad(); // [32,720]
+    let mut b = loader
+        .load_tensor::<B, 1>("model.action_out_proj.bias", &dev)
+        .require_grad(); // [32]
 
     // One fixed synthetic demo: a frozen 50-step suffix-out, regress to a frozen
     // target action chunk. Detached so they are constants, not graph leaves.
@@ -35,10 +39,15 @@ fn main() {
     let steps = 300;
     let mut first = 0f32;
     for step in 0..=steps {
-        let v = x.clone().matmul(w.clone().transpose().unsqueeze()).add(b.clone().unsqueeze()); // [1,50,32]
+        let v = x
+            .clone()
+            .matmul(w.clone().transpose().unsqueeze())
+            .add(b.clone().unsqueeze()); // [1,50,32]
         let loss = (v - target.clone()).powf_scalar(2.0).mean();
         let loss_val: f32 = loss.clone().into_scalar().elem();
-        if step == 0 { first = loss_val; }
+        if step == 0 {
+            first = loss_val;
+        }
         if step % 30 == 0 {
             println!("step {step:>3}  MSE = {loss_val:.6}");
         }
@@ -53,9 +62,21 @@ fn main() {
         b = Tensor::from_inner(b.inner() - gb * lr).require_grad();
     }
 
-    let final_v = x.matmul(w.clone().transpose().unsqueeze()).add(b.unsqueeze());
-    let final_loss: f32 = (final_v - target).powf_scalar(2.0).mean().into_scalar().elem();
-    println!("\nMSE {first:.4} -> {final_loss:.6}  ({:.0}x reduction over {steps} SGD steps)", first / final_loss.max(1e-9));
-    assert!(final_loss < first * 0.01, "loss did not collapse — optimizer loop broken");
+    let final_v = x
+        .matmul(w.clone().transpose().unsqueeze())
+        .add(b.unsqueeze());
+    let final_loss: f32 = (final_v - target)
+        .powf_scalar(2.0)
+        .mean()
+        .into_scalar()
+        .elem();
+    println!(
+        "\nMSE {first:.4} -> {final_loss:.6}  ({:.0}x reduction over {steps} SGD steps)",
+        first / final_loss.max(1e-9)
+    );
+    assert!(
+        final_loss < first * 0.01,
+        "loss did not collapse — optimizer loop broken"
+    );
     println!("✓ the finetune loop learns: forward → loss → backward → SGD drives the real expert head to fit. T3 mechanics are de-risked; only demos remain.");
 }

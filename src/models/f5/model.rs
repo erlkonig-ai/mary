@@ -40,16 +40,28 @@ pub struct F5Transformer<B: Backend> {
 impl<B: Backend> F5Transformer<B> {
     pub fn load(loader: &WeightLoader, cfg: F5Config, device: &B::Device) -> Self {
         let t = "ema_model.transformer";
-        let pos_w1: Tensor<B, 3> = loader.load_tensor(&format!("{t}.input_embed.conv_pos_embed.conv1d.0.weight"), device);
+        let pos_w1: Tensor<B, 3> = loader.load_tensor(
+            &format!("{t}.input_embed.conv_pos_embed.conv1d.0.weight"),
+            device,
+        );
         let pos_groups = cfg.dim / pos_w1.dims()[1];
         let blocks = (0..cfg.depth)
             .map(|i| F5Block::load(loader, i, cfg.heads, cfg.head_dim(), device))
             .collect();
         Self {
             proj: Linear::load(loader, &format!("{t}.input_embed.proj"), true, device),
-            pos_b1: loader.load_tensor(&format!("{t}.input_embed.conv_pos_embed.conv1d.0.bias"), device),
-            pos_w2: loader.load_tensor(&format!("{t}.input_embed.conv_pos_embed.conv1d.2.weight"), device),
-            pos_b2: loader.load_tensor(&format!("{t}.input_embed.conv_pos_embed.conv1d.2.bias"), device),
+            pos_b1: loader.load_tensor(
+                &format!("{t}.input_embed.conv_pos_embed.conv1d.0.bias"),
+                device,
+            ),
+            pos_w2: loader.load_tensor(
+                &format!("{t}.input_embed.conv_pos_embed.conv1d.2.weight"),
+                device,
+            ),
+            pos_b2: loader.load_tensor(
+                &format!("{t}.input_embed.conv_pos_embed.conv1d.2.bias"),
+                device,
+            ),
             pos_w1,
             pos_groups,
             time_mlp0: Linear::load(loader, &format!("{t}.time_embed.time_mlp.0"), true, device),
@@ -67,9 +79,19 @@ impl<B: Backend> F5Transformer<B> {
     fn pos_conv(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         let pad = self.pos_w1.dims()[2] / 2;
         let xc = x.swap_dims(1, 2); // [B, dim, T]
-        let h = conv1d(xc, self.pos_w1.clone(), Some(self.pos_b1.clone()), ConvOptions::new([1], [pad], [1], self.pos_groups));
+        let h = conv1d(
+            xc,
+            self.pos_w1.clone(),
+            Some(self.pos_b1.clone()),
+            ConvOptions::new([1], [pad], [1], self.pos_groups),
+        );
         let h = mish(h);
-        let h = conv1d(h, self.pos_w2.clone(), Some(self.pos_b2.clone()), ConvOptions::new([1], [pad], [1], self.pos_groups));
+        let h = conv1d(
+            h,
+            self.pos_w2.clone(),
+            Some(self.pos_b2.clone()),
+            ConvOptions::new([1], [pad], [1], self.pos_groups),
+        );
         let h = mish(h); // F5 has a Mish after the 2nd conv too
         h.swap_dims(1, 2)
     }
@@ -115,11 +137,21 @@ impl<B: Backend> F5Transformer<B> {
     ) -> Tensor<B, 3> {
         let device = noised.device();
         let [b, s, _] = noised.dims();
-        let cond = if drop_audio_cond { cond.zeros_like() } else { cond };
+        let cond = if drop_audio_cond {
+            cond.zeros_like()
+        } else {
+            cond
+        };
         // curtail/pad text to the mel length with filler (−1 → +1 = 0), as F5 does
         let n = text_ids.dims()[1];
         let text_ids = if n < s {
-            Tensor::cat(vec![text_ids, Tensor::<B, 2, Int>::zeros([b, s - n], &device) - 1], 1)
+            Tensor::cat(
+                vec![
+                    text_ids,
+                    Tensor::<B, 2, Int>::zeros([b, s - n], &device) - 1,
+                ],
+                1,
+            )
         } else if n > s {
             text_ids.slice([0..b, 0..s])
         } else {

@@ -69,7 +69,7 @@ pub fn f5_rope<B: Backend>(
     let half = inv_freq.dims()[0];
     let pos = Tensor::<B, 1, Int>::arange(0..seq_len as i64, device).float(); // [S]
     let freqs = pos.reshape([seq_len, 1]) * inv_freq.reshape([1, half]); // [S, half]
-    // interleaved repeat: [f0,f0,f1,f1,…] to match the pair-wise rotate_half.
+                                                                         // interleaved repeat: [f0,f0,f1,f1,…] to match the pair-wise rotate_half.
     let cf = freqs.clone().cos().reshape([seq_len, half, 1]);
     let sf = freqs.sin().reshape([seq_len, half, 1]);
     let cos = Tensor::cat(vec![cf.clone(), cf], 2).reshape([seq_len, 2 * half]);
@@ -162,10 +162,14 @@ impl<B: Backend> F5Block<B> {
     ) -> Tensor<B, 3> {
         let dim = x.dims()[2] as i64;
         // AdaLN-zero: modulation = Linear(SiLU(t)) → [B, 6·dim] → [B,1,6·dim]
-        let m = self
-            .attn_norm
-            .forward(silu(time_emb).unsqueeze_dim::<3>(1));
-        let chunk = |i: i64| m.clone().slice([0..m.dims()[0], 0..1, (i * dim) as usize..((i + 1) * dim) as usize]);
+        let m = self.attn_norm.forward(silu(time_emb).unsqueeze_dim::<3>(1));
+        let chunk = |i: i64| {
+            m.clone().slice([
+                0..m.dims()[0],
+                0..1,
+                (i * dim) as usize..((i + 1) * dim) as usize,
+            ])
+        };
         let (sa_shift, sa_scale, sa_gate) = (chunk(0), chunk(1), chunk(2));
         let (mlp_shift, mlp_scale, mlp_gate) = (chunk(3), chunk(4), chunk(5));
 

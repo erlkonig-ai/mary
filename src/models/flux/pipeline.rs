@@ -3,7 +3,6 @@ use std::path::Path;
 use burn::prelude::*;
 use burn::tensor::TensorData;
 
-use crate::nn::backend::{BHalf, WgpuDevice, B};
 use crate::models::flux::mistral_encoder::config::Mistral3Config;
 use crate::models::flux::mistral_encoder::Mistral3Model;
 use crate::models::flux::scheduler::FlowMatchEulerDiscreteScheduler;
@@ -15,6 +14,7 @@ use crate::models::flux::transformer::Flux2Transformer2DModel;
 use crate::models::flux::utils;
 use crate::models::flux::vae::config::VaeConfig;
 use crate::models::flux::vae::AutoencoderKLFlux2;
+use crate::nn::backend::{BHalf, WgpuDevice, B};
 use crate::nn::weight_loader::WeightLoader;
 
 /// Model variant auto-detected from directory contents.
@@ -130,11 +130,8 @@ impl Flux2Pipeline {
                 .unwrap_or_else(|e| panic!("load transformer from pile {pile:?}: {e:?}")),
         );
 
-        let transformer = Flux2Transformer2DModel::<B>::load(
-            &transformer_loader,
-            transformer_config,
-            device,
-        );
+        let transformer =
+            Flux2Transformer2DModel::<B>::load(&transformer_loader, transformer_config, device);
 
         if lora_path.is_some() {
             eprintln!("Warning: LoRA merging is not part of this milestone; --lora ignored.");
@@ -246,8 +243,12 @@ impl Flux2Pipeline {
         .unsqueeze::<2>();
 
         let extract_layers = [9, 18, 27];
-        let prompt_embeds =
-            text_encoder.forward(input_ids_tensor, &extract_layers, Some(&attention_mask), device);
+        let prompt_embeds = text_encoder.forward(
+            input_ids_tensor,
+            &extract_layers,
+            Some(&attention_mask),
+            device,
+        );
 
         let [_b, _l, d] = prompt_embeds.dims();
         eprintln!("  Text embeddings: [1, {}, {}]", seq_len, d);
@@ -279,8 +280,7 @@ impl Flux2Pipeline {
         );
 
         let extract_layers = [10, 20, 30];
-        let text_encoder =
-            Mistral3Model::<B>::load(&te_loader, te_config, &extract_layers, device);
+        let text_encoder = Mistral3Model::<B>::load(&te_loader, te_config, &extract_layers, device);
 
         let input_ids_tensor = Tensor::<B, 1, Int>::from_data(
             TensorData::new(
@@ -339,9 +339,14 @@ impl Flux2Pipeline {
         let streaming = matches!(variant, ModelVariant::Dev);
         eprintln!(
             "Generating {}x{} image (latent {}x{}) with {} steps [{:?}{}]",
-            width, height, latent_w, latent_h, num_steps, variant,
+            width,
+            height,
+            latent_w,
+            latent_h,
+            num_steps,
+            variant,
             match variant {
-                ModelVariant::Klein => "",  // Klein: all f32 (fits in memory)
+                ModelVariant::Klein => "", // Klein: all f32 (fits in memory)
                 ModelVariant::Dev => ", f16 text encoder, streaming f32 transformer",
             }
         );
@@ -358,8 +363,7 @@ impl Flux2Pipeline {
                 eprintln!("Phase 1: Text encoding (f16)...");
                 let (embeds_half, seq_len) =
                     Self::encode_text_dev::<BHalf>(prompt, model_dir, pile, device);
-                let embeds: Tensor<B, 3> =
-                    Tensor::from_data(embeds_half.into_data(), device);
+                let embeds: Tensor<B, 3> = Tensor::from_data(embeds_half.into_data(), device);
                 (embeds, seq_len)
             }
         };
@@ -428,7 +432,10 @@ impl Flux2Pipeline {
         eprintln!("Phase 2: Preparing latents...");
         let latents = generate_noise::<B>(1, latent_channels, packed_h, packed_w, seed, device);
         let mut latents = utils::pack_latents(latents);
-        eprintln!("  Latent shape: [1, {}, {}]", image_seq_len, latent_channels);
+        eprintln!(
+            "  Latent shape: [1, {}, {}]",
+            image_seq_len, latent_channels
+        );
 
         eprintln!("Phase 3: Loading transformer and denoising (f32)...");
         let transformer_loader = WeightLoader::Pile(
@@ -503,7 +510,10 @@ impl Flux2Pipeline {
         eprintln!("Phase 2: Preparing latents...");
         let latents = generate_noise::<B>(1, latent_channels, packed_h, packed_w, seed, device);
         let mut latents = utils::pack_latents(latents);
-        eprintln!("  Latent shape: [1, {}, {}]", image_seq_len, latent_channels);
+        eprintln!(
+            "  Latent shape: [1, {}, {}]",
+            image_seq_len, latent_channels
+        );
 
         if lora_path.is_some() {
             eprintln!("Warning: LoRA is not yet supported with streaming transformer (Dev). LoRA will be ignored.");

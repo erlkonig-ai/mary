@@ -115,7 +115,10 @@ fn goldens() -> Goldens {
     assert_eq!(s, vec![n_out, 8], "user_codes shape");
     let (text, _) = golden_i64("text_prompt_tokens");
     let (vp_cache, s) = golden_i64("vp_cache");
-    assert_eq!(s, vec![1, cfg::NUM_STREAMS, mary::models::personaplex::lmgen::CT]);
+    assert_eq!(
+        s,
+        vec![1, cfg::NUM_STREAMS, mary::models::personaplex::lmgen::CT]
+    );
     let (tt_hidden, s) = golden_f32("tt_hidden");
     assert_eq!(s, vec![steps, cfg::DIM], "tt_hidden shape");
     let (tt_text_logits, s) = golden_f32("tt_text_logits");
@@ -166,7 +169,11 @@ fn gate(pile: &str, f16: bool, vs_burn: bool) {
 
     println!(
         "loading depth_fast ({}) from {pile} …",
-        if f16 { "f16 storage, f32 accumulate" } else { "f32" }
+        if f16 {
+            "f16 storage, f32 accumulate"
+        } else {
+            "f32"
+        }
     );
     let t0 = Instant::now();
     let loader = pile_loader(pile);
@@ -205,11 +212,16 @@ fn gate(pile: &str, f16: bool, vs_burn: bool) {
         let hidden = &g.tt_hidden[s * cfg::DIM..(s + 1) * cfg::DIM];
         let sampled_text =
             argmax(&g.tt_text_logits[s * cfg::TEXT_LOGITS..(s + 1) * cfg::TEXT_LOGITS]) as i64;
-        let next_text = if p.provided[0] { p.target[0] } else { sampled_text };
+        let next_text = if p.provided[0] {
+            p.target[0]
+        } else {
+            sampled_text
+        };
         text_hits += (next_text == g.dep_in_text[s]) as usize;
 
-        let teacher: [i64; cfg::DEP_Q] =
-            g.dep_tokens[s * cfg::DEP_Q..(s + 1) * cfg::DEP_Q].try_into().unwrap();
+        let teacher: [i64; cfg::DEP_Q] = g.dep_tokens[s * cfg::DEP_Q..(s + 1) * cfg::DEP_Q]
+            .try_into()
+            .unwrap();
         let toks = fast.frame(hidden, next_text, &p.forced(), Some(&teacher), None);
         for cb in 0..cfg::DEP_Q {
             let grow = &g.dep_logits
@@ -225,14 +237,19 @@ fn gate(pile: &str, f16: bool, vs_burn: bool) {
         }
 
         if let Some(depth) = &burn_depth {
-            let ht = burn::tensor::Tensor::<B, 1>::from_floats(hidden, &device)
-                .reshape([1, 1, cfg::DIM]);
+            let ht = burn::tensor::Tensor::<B, 1>::from_floats(hidden, &device).reshape([
+                1,
+                1,
+                cfg::DIM,
+            ]);
             let (btoks, blogits) =
                 depth.frame(&ht, next_text, &p.forced(), Some(&teacher), None, &device);
             for cb in 0..cfg::DEP_Q {
                 vs_token_hits += (toks[cb] == btoks[cb]) as usize;
-                let (c, d) =
-                    cos_maxd(&fast.logits()[cb * cfg::CARD..(cb + 1) * cfg::CARD], &blogits[cb]);
+                let (c, d) = cos_maxd(
+                    &fast.logits()[cb * cfg::CARD..(cb + 1) * cfg::CARD],
+                    &blogits[cb],
+                );
                 vs_min_cos = vs_min_cos.min(c);
                 vs_max_d = vs_max_d.max(d);
             }
@@ -261,7 +278,11 @@ fn gate(pile: &str, f16: bool, vs_burn: bool) {
 
     println!("per-codebook min cos over {} steps:", g.steps);
     for (cb, mc) in min_cos_cb.iter().enumerate() {
-        let kind = if cb == 0 || cb == 8 { "semantic" } else { "acoustic" };
+        let kind = if cb == 0 || cb == 8 {
+            "semantic"
+        } else {
+            "acoustic"
+        };
         let side = if cb < 8 { "agent" } else { "user-pred" };
         println!("  cb {cb:2} ({side:9} {kind:8})  min cos={mc:.9}");
     }
@@ -301,7 +322,11 @@ fn gate(pile: &str, f16: bool, vs_burn: bool) {
     println!(
         "timing (gate replay, {frames} frames): {total:.1} ms/frame = cond {cond:.1} + stack gemv {gemv:.1} + head {head:.1} + scalar {scalar:.1}"
     );
-    println!("ran {} steps in {secs:.1}s ({:.0} ms/step incl. burn ref)", g.steps, secs / g.steps as f64 * 1e3);
+    println!(
+        "ran {} steps in {secs:.1}s ({:.0} ms/step incl. burn ref)",
+        g.steps,
+        secs / g.steps as f64 * 1e3
+    );
 
     verdict("DEPTH_FAST PARITY", ok_cos && ok_int && ok_burn);
 }
@@ -314,19 +339,29 @@ fn median(mut v: Vec<f64>) -> f64 {
 }
 
 fn bench(pile: &str, f16: bool, synth: bool) {
-    let rounds: usize =
-        std::env::var("MOSHI_ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
-    let frames: usize =
-        std::env::var("MOSHI_FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(25);
+    let rounds: usize = std::env::var("MOSHI_ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let frames: usize = std::env::var("MOSHI_FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(25);
 
     let mut fast = if synth {
-        println!("synthetic weights ({}) at real shapes …", if f16 { "f16" } else { "f32" });
+        println!(
+            "synthetic weights ({}) at real shapes …",
+            if f16 { "f16" } else { "f32" }
+        );
         let t0 = Instant::now();
         let f = DepthFast::synthetic(f16);
         println!("built in {:.1}s", t0.elapsed().as_secs_f64());
         f
     } else {
-        println!("loading depth_fast ({}) from {pile} …", if f16 { "f16" } else { "f32" });
+        println!(
+            "loading depth_fast ({}) from {pile} …",
+            if f16 { "f16" } else { "f32" }
+        );
         let t0 = Instant::now();
         let loader = pile_loader(pile);
         let f = DepthFast::load(&loader, f16);
@@ -343,7 +378,12 @@ fn bench(pile: &str, f16: bool, synth: bool) {
         (h, n)
     } else {
         println!("(no goldens found — synthetic hidden)");
-        ((0..cfg::DIM).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect(), 1)
+        (
+            (0..cfg::DIM)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0)
+                .collect(),
+            1,
+        )
     };
     let forced: [Option<i64>; cfg::DEP_Q] = [None; cfg::DEP_Q];
 
@@ -357,7 +397,13 @@ fn bench(pile: &str, f16: bool, synth: bool) {
 
     // warmup: touch every weight twice (page-in + pool spin-up)
     for w in 0..2 {
-        fast.frame(&hiddens[(w % n_h) * cfg::DIM..][..cfg::DIM], PAD, &forced, None, None);
+        fast.frame(
+            &hiddens[(w % n_h) * cfg::DIM..][..cfg::DIM],
+            PAD,
+            &forced,
+            None,
+            None,
+        );
     }
     let _ = fast.take_bench();
 

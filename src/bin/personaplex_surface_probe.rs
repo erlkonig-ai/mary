@@ -105,7 +105,11 @@ fn tok_str(spm: &SpmTokenizer, t: i64) -> String {
         2 => "<eos>".into(),
         _ if t >= 0 && (t as usize) < spm.vocab_size() => {
             let s = spm.decode_token(t);
-            if s.is_empty() { "∅".into() } else { format!("{s:?}") }
+            if s.is_empty() {
+                "∅".into()
+            } else {
+                format!("{s:?}")
+            }
         }
         _ => format!("id{t}"),
     }
@@ -117,7 +121,9 @@ fn decode_run(spm: &SpmTokenizer, ids: &[i64]) -> String {
     let words: Vec<i64> = ids
         .iter()
         .copied()
-        .filter(|&t| !(matches!(t as u32, cfg::TEXT_PAD_TOKEN | cfg::TEXT_EPAD_TOKEN) || t == 1 || t == 2))
+        .filter(|&t| {
+            !(matches!(t as u32, cfg::TEXT_PAD_TOKEN | cfg::TEXT_EPAD_TOKEN) || t == 1 || t == 2)
+        })
         .collect();
     if words.is_empty() {
         "(all padding/silence)".into()
@@ -157,7 +163,10 @@ fn main() {
     assert_eq!(&vps[1..], &[1, 1, cfg::DIM], "vp_embeddings shape");
     let n_vp = vps[0];
     let (vp_cache, s) = golden_i64("vp_cache");
-    assert_eq!(s, vec![1, cfg::NUM_STREAMS, mary::models::personaplex::lmgen::CT]);
+    assert_eq!(
+        s,
+        vec![1, cfg::NUM_STREAMS, mary::models::personaplex::lmgen::CT]
+    );
     let (text, _) = golden_i64("text_prompt_tokens");
     let n_silence = 6usize;
 
@@ -169,14 +178,28 @@ fn main() {
 
     let spm = SpmTokenizer::load(Path::new(SPM_MODEL));
 
-    println!("=== PersonaPlex surface probe ({fmt:?}{}) ===", if sampling { format!(", temp={temp}, seeded") } else { ", greedy".into() });
+    println!(
+        "=== PersonaPlex surface probe ({fmt:?}{}) ===",
+        if sampling {
+            format!(", temp={temp}, seeded")
+        } else {
+            ", greedy".into()
+        }
+    );
     println!("prompt: {n_vp} voice-replay + {n_silence} silence + {} text + {n_silence} silence = {} steps", text.len(), sched.len());
 
     let t0 = Instant::now();
     let loader = pile_loader(&pile);
     let mut p = RealtimePipeline::load_auto(Path::new(&pile), &loader, fmt, false);
     if sampling {
-        p.set_sampling(SamplingConfig { temp, top_k: 64, top_p: 0.95 }, 0x5EED);
+        p.set_sampling(
+            SamplingConfig {
+                temp,
+                top_k: 64,
+                top_p: 0.95,
+            },
+            0x5EED,
+        );
     }
     println!("loaded in {:.1}s\n", t0.elapsed().as_secs_f64());
 
@@ -187,7 +210,11 @@ fn main() {
                 p.step_embedding(&vp[k * cfg::DIM..(k + 1) * cfg::DIM]);
             }
             Phase::Silence => {
-                p.step(Some(&SINE), Some(&SILENCE), Some(cfg::TEXT_PAD_TOKEN as i64));
+                p.step(
+                    Some(&SINE),
+                    Some(&SILENCE),
+                    Some(cfg::TEXT_PAD_TOKEN as i64),
+                );
             }
             Phase::Text(t) => {
                 p.step(Some(&SINE), Some(&SILENCE), Some(*t));
@@ -197,7 +224,10 @@ fn main() {
             p.stream.overwrite(&vp_cache); // oracle: cache.copy_(voice_prompt_cache)
         }
     }
-    println!("reached the trailing silence gap (offset {}).", p.stream.offset());
+    println!(
+        "reached the trailing silence gap (offset {}).",
+        p.stream.offset()
+    );
 
     // A silent-baseline RMS: what the agent audio decodes to when we hand it
     // the canonical SILENCE_TOKENS directly (the reference "no vocalization"
@@ -212,7 +242,10 @@ fn main() {
     // ── the phrases ──
     // A complete thought and a dangling fragment (Q1: does release finish it?).
     let phrases: &[(&str, &str)] = &[
-        ("complete", "I have two goals, ship the loop and port the model."),
+        (
+            "complete",
+            "I have two goals, ship the loop and port the model.",
+        ),
         ("fragment", "I have two goals,"),
     ];
 
@@ -242,7 +275,11 @@ fn main() {
             let mut forced_frame_rms: Vec<f64> = Vec::new();
             let mut forced_out_frames: Vec<[i64; cfg::NUM_STREAMS]> = Vec::new();
             for &t in &ids {
-                let moshi = if force_agent_silence { Some(&SILENCE) } else { None };
+                let moshi = if force_agent_silence {
+                    Some(&SILENCE)
+                } else {
+                    None
+                };
                 let trace = p.step(Some(&SINE), moshi, Some(t));
                 // The model's OWN sampled stream-0 token this step (what it
                 // would have emitted if not forced) — the "shadow" monologue.
@@ -272,7 +309,8 @@ fn main() {
             // ---- report ----
             // Q1: the forced-window shadow (its own choice while being forced)
             println!("    forced-window shadow (model's own stream-0 argmax while forced):");
-            let shadow_toks: Vec<String> = forced_shadow.iter().map(|&t| tok_str(&spm, t)).collect();
+            let shadow_toks: Vec<String> =
+                forced_shadow.iter().map(|&t| tok_str(&spm, t)).collect();
             println!("      tokens: {}", shadow_toks.join(" "));
             println!("      as text: {}", decode_run(&spm, &forced_shadow));
 
@@ -281,15 +319,29 @@ fn main() {
             let rel_toks: Vec<String> = released_text.iter().map(|&t| tok_str(&spm, t)).collect();
             println!("      tokens: {}", rel_toks.join(" "));
             println!("      as text: {}", decode_run(&spm, &released_text));
-            let pad_run = released_text.iter().take_while(|&&t| matches!(t as u32, cfg::TEXT_PAD_TOKEN | cfg::TEXT_EPAD_TOKEN)).count();
-            let n_word = released_text.iter().filter(|&&t| !(matches!(t as u32, cfg::TEXT_PAD_TOKEN | cfg::TEXT_EPAD_TOKEN) || t == 1 || t == 2)).count();
+            let pad_run = released_text
+                .iter()
+                .take_while(|&&t| matches!(t as u32, cfg::TEXT_PAD_TOKEN | cfg::TEXT_EPAD_TOKEN))
+                .count();
+            let n_word = released_text
+                .iter()
+                .filter(|&&t| {
+                    !(matches!(t as u32, cfg::TEXT_PAD_TOKEN | cfg::TEXT_EPAD_TOKEN)
+                        || t == 1
+                        || t == 2)
+                })
+                .count();
             println!("      leading pad/epad frames: {pad_run}/{}   non-pad (word) tokens in window: {n_word}", released_text.len());
 
             // Q2: agent audio during the forced window
             let fr = rms(&forced_agent_pcm);
             let fp = peak(&forced_agent_pcm);
             let rr = rms(&released_agent_pcm);
-            let ratio = if sil_rms > 0.0 { fr / sil_rms } else { f64::INFINITY };
+            let ratio = if sil_rms > 0.0 {
+                fr / sil_rms
+            } else {
+                f64::INFINITY
+            };
             println!("    agent audio during FORCED text: rms={fr:.5} (×{ratio:.1} vs SILENCE_TOKENS baseline)  peak={fp:.5}");
             if !forced_frame_rms.is_empty() {
                 let per: Vec<String> = forced_frame_rms.iter().map(|r| format!("{r:.4}")).collect();
@@ -369,7 +421,9 @@ fn main() {
         }
     }
     let pad_frac = |v: &[i64]| {
-        v.iter().filter(|&&t| matches!(t as u32, cfg::TEXT_PAD_TOKEN | cfg::TEXT_EPAD_TOKEN)).count() as f64
+        v.iter()
+            .filter(|&&t| matches!(t as u32, cfg::TEXT_PAD_TOKEN | cfg::TEXT_EPAD_TOKEN))
+            .count() as f64
             / v.len() as f64
     };
     println!(
@@ -414,7 +468,11 @@ fn main() {
                 }
             }
         }
-        let mean_rank = if ranks.is_empty() { 0.0 } else { ranks.iter().sum::<usize>() as f64 / ranks.len() as f64 };
+        let mean_rank = if ranks.is_empty() {
+            0.0
+        } else {
+            ranks.iter().sum::<usize>() as f64 / ranks.len() as f64
+        };
         let med_rank = {
             let mut r = ranks.clone();
             r.sort_unstable();
@@ -472,7 +530,14 @@ fn reprompt(
 ) {
     p.reset_session();
     if sampling {
-        p.set_sampling(SamplingConfig { temp, top_k: 64, top_p: 0.95 }, 0x5EED);
+        p.set_sampling(
+            SamplingConfig {
+                temp,
+                top_k: 64,
+                top_p: 0.95,
+            },
+            0x5EED,
+        );
     }
     for (i, phase) in sched.iter().enumerate() {
         match phase {
@@ -480,7 +545,11 @@ fn reprompt(
                 p.step_embedding(&vp[k * cfg::DIM..(k + 1) * cfg::DIM]);
             }
             Phase::Silence => {
-                p.step(Some(&SINE), Some(&SILENCE), Some(cfg::TEXT_PAD_TOKEN as i64));
+                p.step(
+                    Some(&SINE),
+                    Some(&SILENCE),
+                    Some(cfg::TEXT_PAD_TOKEN as i64),
+                );
             }
             Phase::Text(t) => {
                 p.step(Some(&SINE), Some(&SILENCE), Some(*t));

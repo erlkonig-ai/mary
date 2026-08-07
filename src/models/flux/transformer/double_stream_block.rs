@@ -89,8 +89,7 @@ impl<B: Backend> Flux2TransformerBlock<B> {
         let norm_txt = norm_txt * (txt_scale_msa + 1.0) + txt_shift_msa;
 
         // 3. Joint attention (concatenate text+image internally)
-        let (attn_img, attn_txt) =
-            self.attn.forward(norm_img, norm_txt, rope_cos, rope_sin);
+        let (attn_img, attn_txt) = self.attn.forward(norm_img, norm_txt, rope_cos, rope_sin);
 
         // 4. Residual with gating for image attention
         let hidden_states = hidden_states + img_gate_msa * attn_img;

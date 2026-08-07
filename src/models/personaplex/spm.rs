@@ -137,6 +137,15 @@ impl<'a> FieldVal<'a> {
 
 impl SpmTokenizer {
     pub fn load(path: &Path) -> Self {
+        let (pieces, add_dummy_prefix, _byte_fallback) = Self::parse_model(path);
+        Self::from_pieces(&pieces, add_dummy_prefix)
+    }
+
+    /// Parse the `.model` proto into its raw piece table plus the two knobs the
+    /// port depends on. Exposed so the pile-ingest path can persist exactly what
+    /// [`Self::from_pieces`] consumes — the graph then holds the model, and the
+    /// file becomes unnecessary.
+    pub fn parse_model(path: &Path) -> (Vec<(Vec<u8>, f32, u64)>, bool, bool) {
         let data = std::fs::read(path).unwrap_or_else(|e| panic!("spm model {path:?}: {e}"));
         let mut pieces: Vec<(Vec<u8>, f32, u64)> = Vec::new(); // (bytes, score, type)
         let (mut trainer, mut normalizer): (Option<&[u8]>, Option<&[u8]>) = (None, None);
@@ -166,7 +175,10 @@ impl SpmTokenizer {
 
         // TrainerSpec: 3 = model_type (1 = UNIGRAM), 35 = byte_fallback.
         let (mut model_type, mut byte_fallback) = (1u64, false);
-        let mut tr = Reader { b: trainer.expect("spm: no trainer_spec"), i: 0 };
+        let mut tr = Reader {
+            b: trainer.expect("spm: no trainer_spec"),
+            i: 0,
+        };
         while let Some((f, v)) = tr.field() {
             match f {
                 3 => model_type = v.uint(),
@@ -175,14 +187,20 @@ impl SpmTokenizer {
             }
         }
         assert_eq!(model_type, 1, "spm: only the UNIGRAM model is ported");
-        assert!(byte_fallback, "spm: expected byte_fallback (this port relies on it)");
+        assert!(
+            byte_fallback,
+            "spm: expected byte_fallback (this port relies on it)"
+        );
 
         // NormalizerSpec: 2 = precompiled_charsmap, 3 = add_dummy_prefix,
         // 4 = remove_extra_whitespaces (proto2 default TRUE — only an
         // explicit false is supported), 5 = escape_whitespaces (default true).
         let (mut charsmap_len, mut add_dummy_prefix) = (0usize, true);
         let (mut remove_extra_ws, mut escape_ws) = (true, true);
-        let mut nr = Reader { b: normalizer.expect("spm: no normalizer_spec"), i: 0 };
+        let mut nr = Reader {
+            b: normalizer.expect("spm: no normalizer_spec"),
+            i: 0,
+        };
         while let Some((f, v)) = nr.field() {
             match f {
                 2 => charsmap_len = v.bytes().len(),
@@ -196,9 +214,21 @@ impl SpmTokenizer {
             charsmap_len, 0,
             "spm: non-empty precompiled_charsmap (NFKC-style normalizer) is not ported"
         );
-        assert!(!remove_extra_ws, "spm: remove_extra_whitespaces=true is not ported");
+        assert!(
+            !remove_extra_ws,
+            "spm: remove_extra_whitespaces=true is not ported"
+        );
         assert!(escape_ws, "spm: escape_whitespaces=false is not ported");
 
+        (pieces, add_dummy_prefix, byte_fallback)
+    }
+
+    /// Build the tokenizer from the raw `(bytes, score, type)` piece table.
+    ///
+    /// Split out of [`Self::load`] so the pile-backed constructor shares the
+    /// EXACT construction semantics that were gated against the oracle — the
+    /// only difference between the two paths is where the pieces came from.
+    pub fn from_pieces(pieces: &[(Vec<u8>, f32, u64)], add_dummy_prefix: bool) -> Self {
         // Match table: NORMAL (type 1) pieces only — CONTROL/UNK/BYTE pieces
         // never match from text (model.cc BuildTrie). No USER_DEFINED pieces
         // exist in this model (they'd need always-match semantics).
@@ -212,25 +242,41 @@ impl SpmTokenizer {
                     max_len = max_len.max(piece.len());
                     min_score = min_score.min(*score);
                     map.insert(piece.clone(), (id as i64, *score));
-                    id_to_piece.push(Piece { bytes: piece.clone(), is_byte: false });
+                    id_to_piece.push(Piece {
+                        bytes: piece.clone(),
+                        is_byte: false,
+                    });
                 }
                 6 => {
                     // "<0xAB>"
                     let s = std::str::from_utf8(piece).expect("byte piece utf8");
                     let b = u8::from_str_radix(&s[3..5], 16).expect("byte piece hex");
                     byte_id[b as usize] = id as i64;
-                    id_to_piece.push(Piece { bytes: vec![b], is_byte: true });
+                    id_to_piece.push(Piece {
+                        bytes: vec![b],
+                        is_byte: true,
+                    });
                 }
                 4 => panic!("spm: USER_DEFINED pieces are not ported"),
                 // UNK (2), CONTROL (3), UNUSED (5): not matchable from text.
                 // Keep their literal surface for decode completeness (they
                 // never surface from `encode`, so decode gates skip them).
-                _ => id_to_piece.push(Piece { bytes: piece.clone(), is_byte: false }),
+                _ => id_to_piece.push(Piece {
+                    bytes: piece.clone(),
+                    is_byte: false,
+                }),
             }
         }
         assert!(byte_id.iter().all(|&i| i >= 0), "spm: missing byte pieces");
 
-        Self { map, byte_id, max_len, unk_score: min_score - UNK_PENALTY, add_dummy_prefix, id_to_piece }
+        Self {
+            map,
+            byte_id,
+            max_len,
+            unk_score: min_score - UNK_PENALTY,
+            add_dummy_prefix,
+            id_to_piece,
+        }
     }
 
     /// Encode to piece ids (no BOS/EOS — matches the oracle's plain
@@ -310,7 +356,10 @@ impl SpmTokenizer {
             }
             pos += cl;
         }
-        assert!(best[n] > NEG, "spm viterbi: unreachable end (corrupt utf8?)");
+        assert!(
+            best[n] > NEG,
+            "spm viterbi: unreachable end (corrupt utf8?)"
+        );
 
         // Backtrack; UNK edges decompose into byte pieces (byte_fallback).
         let mut rev: Vec<i64> = Vec::new();
@@ -436,12 +485,12 @@ mod tests {
         vec![
             "Hello, world!",
             "The quick brown fox.",
-            "a  b   c",              // whitespace runs (remove_extra_ws=false)
-            "tab\tand\nnewline",     // tab/newline pass through
-            "Grüße aus München",     // German umlauts
-            "日本語のテスト",         // CJK
-            "Привет мир",            // Cyrillic
-            "emoji 😀🎉 test",        // multi-byte, some byte-fallback
+            "a  b   c",          // whitespace runs (remove_extra_ws=false)
+            "tab\tand\nnewline", // tab/newline pass through
+            "Grüße aus München", // German umlauts
+            "日本語のテスト",    // CJK
+            "Привет мир",        // Cyrillic
+            "emoji 😀🎉 test",   // multi-byte, some byte-fallback
             "<system>be nice</system>",
             "mixed 混合 text 123",
             "punctuation: (a) [b] {c} <d>",

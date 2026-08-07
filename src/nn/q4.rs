@@ -156,8 +156,7 @@ fn q4_matvec_kernel(
     }
     let acc = acc0 + acc1;
 
-    let mut red =
-        SharedMemory::<f32>::new(comptime!((rows_per_cube * threads_per_row) as usize));
+    let mut red = SharedMemory::<f32>::new(comptime!((rows_per_cube * threads_per_row) as usize));
     red[UNIT_POS_X as usize] = acc;
     sync_cube();
     let mut stride = u32::new((threads_per_row / 2) as i64);
@@ -228,8 +227,7 @@ fn f16_matvec_kernel(
         o += threads_per_row;
     }
 
-    let mut red =
-        SharedMemory::<f32>::new(comptime!((rows_per_cube * threads_per_row) as usize));
+    let mut red = SharedMemory::<f32>::new(comptime!((rows_per_cube * threads_per_row) as usize));
     red[UNIT_POS_X as usize] = acc;
     sync_cube();
     let mut stride = u32::new((threads_per_row / 2) as i64);
@@ -318,9 +316,7 @@ pub fn dequantize_q4(wq: &[u32], scales: &[f16], out_dim: usize, in_dim: usize) 
 // ---------------------------------------------------------------------------
 
 fn as_bytes<T>(v: &[T]) -> &[u8] {
-    unsafe {
-        core::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v))
-    }
+    unsafe { core::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
 /// A q4-quantized Linear weight resident on the GPU: packed nibbles + f16
@@ -391,7 +387,11 @@ impl Q4Linear {
     fn launch(&self, client: &Client, x: &Handle, y: &Handle, swiglu_pairs: bool) {
         assert_eq!(self.out_dim as u32 % ROWS_PER_CUBE, 0);
         assert_eq!(self.in_dim % GROUP, 0);
-        let y_len = if swiglu_pairs { self.out_dim / 2 } else { self.out_dim };
+        let y_len = if swiglu_pairs {
+            self.out_dim / 2
+        } else {
+            self.out_dim
+        };
         unsafe {
             q4_matvec_kernel::launch_unchecked::<Rt>(
                 client,
@@ -399,10 +399,7 @@ impl Q4Linear {
                 CubeDim::new_1d(ROWS_PER_CUBE * THREADS_PER_ROW),
                 ArrayArg::from_raw_parts(x.clone(), self.in_dim / 4),
                 ArrayArg::from_raw_parts(self.wq.clone(), self.out_dim * self.in_dim / 8),
-                ArrayArg::from_raw_parts(
-                    self.scales.clone(),
-                    self.out_dim * self.in_dim / GROUP,
-                ),
+                ArrayArg::from_raw_parts(self.scales.clone(), self.out_dim * self.in_dim / GROUP),
                 ArrayArg::from_raw_parts(y.clone(), y_len),
                 self.in_dim as u32,
                 ROWS_PER_CUBE,
@@ -415,7 +412,14 @@ impl Q4Linear {
 
 /// Submit `y = W · x` for a raw row-major `[out, in]` **f16** weight buffer —
 /// the controlled baseline sharing [`q4_matvec_kernel`]'s thread shape.
-pub fn f16_matvec(client: &Client, x: &Handle, w: &Handle, y: &Handle, out_dim: usize, in_dim: usize) {
+pub fn f16_matvec(
+    client: &Client,
+    x: &Handle,
+    w: &Handle,
+    y: &Handle,
+    out_dim: usize,
+    in_dim: usize,
+) {
     f16_launch(client, x, w, y, out_dim, in_dim, false);
 }
 
@@ -485,7 +489,11 @@ pub fn alias_pile_blob(client: &Client, bytes: &anybytes::Bytes) -> Option<Handl
     const PAGE: u64 = 16384;
     let blob_ptr = bytes.as_ptr() as u64;
     let nbytes = bytes.len() as u64;
-    assert_eq!(blob_ptr % 256, 0, "pile blob not 256-aligned — V3 invariant violated");
+    assert_eq!(
+        blob_ptr % 256,
+        0,
+        "pile blob not 256-aligned — V3 invariant violated"
+    );
     // The owner downcast = capability check (mmap?) + region bounds + keepalive.
     let mmap = bytes.clone().downcast_to_owner::<MmapRaw>().ok()?;
     let region_end = mmap.as_ptr() as u64 + mmap.len() as u64;
@@ -542,7 +550,10 @@ mod tests {
         let rel = (num / den).sqrt();
         // analytic q4_0 error for uniform[-a,a]: step d ≈ a/8, RMS error
         // d/√12, signal RMS a/√3  =>  rel ≈ (1/8)·(√3/√12) ≈ 0.063
-        assert!(rel < 0.08, "q4 round-trip rel RMS {rel} out of class (expect ~0.063)");
+        assert!(
+            rel < 0.08,
+            "q4 round-trip rel RMS {rel} out of class (expect ~0.063)"
+        );
     }
 
     #[test]

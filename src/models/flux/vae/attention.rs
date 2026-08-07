@@ -42,20 +42,16 @@ impl<B: Backend> VaeAttention<B> {
         device: &B::Device,
     ) -> Self {
         Self {
-            group_norm_weight: loader
-                .load_tensor(&format!("{prefix}.group_norm.weight"), device),
-            group_norm_bias: loader
-                .load_tensor(&format!("{prefix}.group_norm.bias"), device),
+            group_norm_weight: loader.load_tensor(&format!("{prefix}.group_norm.weight"), device),
+            group_norm_bias: loader.load_tensor(&format!("{prefix}.group_norm.bias"), device),
             to_q_weight: loader.load_tensor(&format!("{prefix}.to_q.weight"), device),
             to_q_bias: loader.load_tensor(&format!("{prefix}.to_q.bias"), device),
             to_k_weight: loader.load_tensor(&format!("{prefix}.to_k.weight"), device),
             to_k_bias: loader.load_tensor(&format!("{prefix}.to_k.bias"), device),
             to_v_weight: loader.load_tensor(&format!("{prefix}.to_v.weight"), device),
             to_v_bias: loader.load_tensor(&format!("{prefix}.to_v.bias"), device),
-            to_out_weight: loader
-                .load_tensor(&format!("{prefix}.to_out.0.weight"), device),
-            to_out_bias: loader
-                .load_tensor(&format!("{prefix}.to_out.0.bias"), device),
+            to_out_weight: loader.load_tensor(&format!("{prefix}.to_out.0.weight"), device),
+            to_out_bias: loader.load_tensor(&format!("{prefix}.to_out.0.bias"), device),
             channels,
             num_groups,
         }
@@ -64,17 +60,13 @@ impl<B: Backend> VaeAttention<B> {
     /// Linear projection: x @ W^T + b
     /// x: [B, S, C], weight: [C_out, C_in], bias: [C_out]
     /// Returns: [B, S, C_out]
-    fn linear_3d(
-        x: Tensor<B, 3>,
-        weight: Tensor<B, 2>,
-        bias: Tensor<B, 1>,
-    ) -> Tensor<B, 3> {
+    fn linear_3d(x: Tensor<B, 3>, weight: Tensor<B, 2>, bias: Tensor<B, 1>) -> Tensor<B, 3> {
         // weight: [C_out, C_in] -> transpose -> [C_in, C_out]
         // x: [B, S, C_in] @ [C_in, C_out] = [B, S, C_out]
         let [_batch, _seq, _c_in] = x.dims();
         let [c_out, _] = weight.dims();
         let out = x.matmul(weight.transpose().unsqueeze::<3>()); // [B, S, C_out]
-        // Add bias: [C_out] -> [1, 1, C_out]
+                                                                 // Add bias: [C_out] -> [1, 1, C_out]
         out + bias.reshape([1, 1, c_out])
     }
 
@@ -101,21 +93,9 @@ impl<B: Backend> VaeAttention<B> {
         let h = h.reshape([batch, channels, seq_len]).swap_dims(1, 2);
 
         // Q, K, V projections: [B, H*W, C]
-        let q = Self::linear_3d(
-            h.clone(),
-            self.to_q_weight.clone(),
-            self.to_q_bias.clone(),
-        );
-        let k = Self::linear_3d(
-            h.clone(),
-            self.to_k_weight.clone(),
-            self.to_k_bias.clone(),
-        );
-        let v = Self::linear_3d(
-            h,
-            self.to_v_weight.clone(),
-            self.to_v_bias.clone(),
-        );
+        let q = Self::linear_3d(h.clone(), self.to_q_weight.clone(), self.to_q_bias.clone());
+        let k = Self::linear_3d(h.clone(), self.to_k_weight.clone(), self.to_k_bias.clone());
+        let v = Self::linear_3d(h, self.to_v_weight.clone(), self.to_v_bias.clone());
 
         // Scaled dot-product attention (single head, head_dim = channels)
         let scale = (channels as f64).sqrt();

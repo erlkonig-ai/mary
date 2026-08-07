@@ -18,7 +18,12 @@ use burn::tensor::module::{conv1d, conv_transpose1d};
 use burn::tensor::ops::{ConvOptions, ConvTransposeOptions};
 
 /// Affine LayerNorm over the last dim.
-fn layer_norm<B: Backend>(x: Tensor<B, 3>, w: &Tensor<B, 1>, b: &Tensor<B, 1>, eps: f64) -> Tensor<B, 3> {
+fn layer_norm<B: Backend>(
+    x: Tensor<B, 3>,
+    w: &Tensor<B, 1>,
+    b: &Tensor<B, 1>,
+    eps: f64,
+) -> Tensor<B, 3> {
     let c = x.dims()[2];
     let mean = x.clone().mean_dim(2);
     let xc = x - mean;
@@ -55,7 +60,12 @@ impl<B: Backend> ConvNeXt<B> {
 
     fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         let res = x.clone();
-        let h = conv1d(x, self.dw_w.clone(), Some(self.dw_b.clone()), ConvOptions::new([1], [3], [1], self.ch));
+        let h = conv1d(
+            x,
+            self.dw_w.clone(),
+            Some(self.dw_b.clone()),
+            ConvOptions::new([1], [3], [1], self.ch),
+        );
         let h = h.swap_dims(1, 2); // [B,T,C]
         let h = layer_norm(h, &self.n_w, &self.n_b, 1e-6);
         let h = gelu(self.pw1.forward(h));
@@ -135,7 +145,12 @@ impl<B: Backend> Vocos<B> {
     /// mel: [B, 100, T] → waveform [B, (T-1)*hop].
     pub fn forward(&self, mel: Tensor<B, 3>) -> Tensor<B, 2> {
         // backbone
-        let x = conv1d(mel, self.embed_w.clone(), Some(self.embed_b.clone()), ConvOptions::new([1], [3], [1], 1));
+        let x = conv1d(
+            mel,
+            self.embed_w.clone(),
+            Some(self.embed_b.clone()),
+            ConvOptions::new([1], [3], [1], 1),
+        );
         let x = layer_norm(x.swap_dims(1, 2), &self.norm_w, &self.norm_b, 1e-6).swap_dims(1, 2); // [B,512,T]
         let mut x = x;
         for blk in &self.blocks {
@@ -162,7 +177,11 @@ impl<B: Backend> Vocos<B> {
         let opts = ConvTransposeOptions::new([self.hop], [0], [0], [1], 1);
         let framesp = frames.swap_dims(1, 2); // [B,n_fft,T]
         let num = conv_transpose1d(framesp, self.eye.clone(), None, opts.clone()); // [B,1,Lfull]
-        let win2 = self.window.clone().powf_scalar(2.0).reshape([1, self.n_fft, 1]);
+        let win2 = self
+            .window
+            .clone()
+            .powf_scalar(2.0)
+            .reshape([1, self.n_fft, 1]);
         let win2f = win2 * Tensor::<B, 3>::ones([b, self.n_fft, t], &num.device());
         let den = conv_transpose1d(win2f, self.eye.clone(), None, opts);
         let y = num.squeeze_dim::<2>(1) / (den.squeeze_dim::<2>(1) + 1e-11); // [B, Lfull]
@@ -176,15 +195,27 @@ impl<B: Backend> Vocos<B> {
     /// `forward` with named intermediate taps for parity probing against the
     /// reference vocos. Tap points mirror `scripts/probe_vocos.py`'s hooks.
     #[allow(clippy::type_complexity)]
-    pub fn forward_probed(&self, mel: Tensor<B, 3>) -> (Tensor<B, 2>, Vec<(String, Vec<f32>, Vec<usize>)>) {
+    pub fn forward_probed(
+        &self,
+        mel: Tensor<B, 3>,
+    ) -> (Tensor<B, 2>, Vec<(String, Vec<f32>, Vec<usize>)>) {
         let mut p: Vec<(String, Vec<f32>, Vec<usize>)> = Vec::new();
-        fn tap<B: Backend, const D: usize>(p: &mut Vec<(String, Vec<f32>, Vec<usize>)>, name: &str, t: &Tensor<B, D>) {
+        fn tap<B: Backend, const D: usize>(
+            p: &mut Vec<(String, Vec<f32>, Vec<usize>)>,
+            name: &str,
+            t: &Tensor<B, D>,
+        ) {
             let data = t.clone().into_data();
             let shape = data.shape.to_vec();
             p.push((name.to_string(), data.to_vec::<f32>().unwrap(), shape));
         }
 
-        let emb = conv1d(mel, self.embed_w.clone(), Some(self.embed_b.clone()), ConvOptions::new([1], [3], [1], 1));
+        let emb = conv1d(
+            mel,
+            self.embed_w.clone(),
+            Some(self.embed_b.clone()),
+            ConvOptions::new([1], [3], [1], 1),
+        );
         tap(&mut p, "embed", &emb);
         let x = layer_norm(emb.swap_dims(1, 2), &self.norm_w, &self.norm_b, 1e-6).swap_dims(1, 2);
         let mut x = x;
@@ -210,7 +241,11 @@ impl<B: Backend> Vocos<B> {
         let opts = ConvTransposeOptions::new([self.hop], [0], [0], [1], 1);
         let framesp = frames.swap_dims(1, 2);
         let num = conv_transpose1d(framesp, self.eye.clone(), None, opts.clone());
-        let win2 = self.window.clone().powf_scalar(2.0).reshape([1, self.n_fft, 1]);
+        let win2 = self
+            .window
+            .clone()
+            .powf_scalar(2.0)
+            .reshape([1, self.n_fft, 1]);
         let win2f = win2 * Tensor::<B, 3>::ones([b, self.n_fft, t], &num.device());
         let den = conv_transpose1d(win2f, self.eye.clone(), None, opts);
         let y = num.squeeze_dim::<2>(1) / (den.squeeze_dim::<2>(1) + 1e-11);

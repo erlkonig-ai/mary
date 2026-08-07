@@ -2,8 +2,8 @@
 //!
 //! Uses Burn's built-in attention kernel with softcap support.
 
-use burn::prelude::*;
 use burn::nn::{Linear, LinearConfig, RmsNorm, RmsNormConfig};
+use burn::prelude::*;
 
 use super::config::{Gemma4TextConfig, LayerType};
 use crate::models::gemma::lora::{maybe_lora, LoraWeights};
@@ -50,13 +50,27 @@ impl<B: Backend> Gemma4Attention<B> {
         let kv_dim = n_kv_heads * head_dim;
 
         Self {
-            q_proj: LinearConfig::new(config.hidden_size, q_dim).with_bias(false).init(device),
-            k_proj: LinearConfig::new(config.hidden_size, kv_dim).with_bias(false).init(device),
-            v_proj: LinearConfig::new(config.hidden_size, kv_dim).with_bias(false).init(device),
-            o_proj: LinearConfig::new(q_dim, config.hidden_size).with_bias(false).init(device),
-            q_norm: RmsNormConfig::new(head_dim).with_epsilon(config.rms_norm_eps).init(device),
-            k_norm: RmsNormConfig::new(head_dim).with_epsilon(config.rms_norm_eps).init(device),
-            v_norm: RmsNormConfig::new(head_dim).with_epsilon(config.rms_norm_eps).init(device),
+            q_proj: LinearConfig::new(config.hidden_size, q_dim)
+                .with_bias(false)
+                .init(device),
+            k_proj: LinearConfig::new(config.hidden_size, kv_dim)
+                .with_bias(false)
+                .init(device),
+            v_proj: LinearConfig::new(config.hidden_size, kv_dim)
+                .with_bias(false)
+                .init(device),
+            o_proj: LinearConfig::new(q_dim, config.hidden_size)
+                .with_bias(false)
+                .init(device),
+            q_norm: RmsNormConfig::new(head_dim)
+                .with_epsilon(config.rms_norm_eps)
+                .init(device),
+            k_norm: RmsNormConfig::new(head_dim)
+                .with_epsilon(config.rms_norm_eps)
+                .init(device),
+            v_norm: RmsNormConfig::new(head_dim)
+                .with_epsilon(config.rms_norm_eps)
+                .init(device),
             n_heads: config.num_attention_heads,
             n_kv_heads,
             head_dim,
@@ -110,7 +124,9 @@ impl<B: Backend> Gemma4Attention<B> {
 
         // Project Q (always needed)
         let q = maybe_lora(&self.q_proj, x.clone(), lora_w, key(0));
-        let q = q.reshape([batch, new_len, self.n_heads, self.head_dim]).swap_dims(1, 2);
+        let q = q
+            .reshape([batch, new_len, self.n_heads, self.head_dim])
+            .swap_dims(1, 2);
         let q = self.q_norm.forward(q);
         let q = rope.apply(q, offset);
 
@@ -118,8 +134,14 @@ impl<B: Backend> Gemma4Attention<B> {
         let (full_k, full_v) = if self.is_kv_shared {
             // KV-shared layer: cache was pre-populated by the decoder with source layer's KV.
             // Don't compute k_proj/v_proj — just use the cache directly.
-            let k = cache.k.clone().expect("KV-shared layer needs pre-populated cache");
-            let v = cache.v.clone().expect("KV-shared layer needs pre-populated cache");
+            let k = cache
+                .k
+                .clone()
+                .expect("KV-shared layer needs pre-populated cache");
+            let v = cache
+                .v
+                .clone()
+                .expect("KV-shared layer needs pre-populated cache");
             (k, v)
         } else {
             // Normal layer: compute K/V from input. With K=V (full-attention
@@ -135,8 +157,12 @@ impl<B: Backend> Gemma4Attention<B> {
                 maybe_lora(&self.k_proj, x, lora_w, key(1))
             };
 
-            let k = k.reshape([batch, new_len, self.n_kv_heads, self.head_dim]).swap_dims(1, 2);
-            let v = v.reshape([batch, new_len, self.n_kv_heads, self.head_dim]).swap_dims(1, 2);
+            let k = k
+                .reshape([batch, new_len, self.n_kv_heads, self.head_dim])
+                .swap_dims(1, 2);
+            let v = v
+                .reshape([batch, new_len, self.n_kv_heads, self.head_dim])
+                .swap_dims(1, 2);
 
             let k = self.k_norm.forward(k);
             let v = self.v_norm.forward(v);
@@ -174,39 +200,61 @@ impl<B: Backend> Gemma4Attention<B> {
         };
 
         // Reshape back and project output
-        let out = out.swap_dims(1, 2).reshape([batch, new_len, self.n_heads * self.head_dim]);
+        let out = out
+            .swap_dims(1, 2)
+            .reshape([batch, new_len, self.n_heads * self.head_dim]);
         maybe_lora(&self.o_proj, out, lora_w, key(3))
     }
 
     /// Build a sliding window + causal attention mask.
     fn sliding_window_mask<B2: Backend>(
-        &self, new_len: usize, total_len: usize, offset: usize, device: &B2::Device,
+        &self,
+        new_len: usize,
+        total_len: usize,
+        offset: usize,
+        device: &B2::Device,
     ) -> Tensor<B2, 4> {
-        let rows: Vec<Tensor<B2, 2>> = (0..new_len).map(|i| {
-            let query_pos = offset + i;
-            let window_start = query_pos.saturating_sub(self.sliding_window - 1);
-            let row: Vec<f32> = (0..total_len).map(|j| {
-                if j <= query_pos && j >= window_start { 0.0 } else { f32::NEG_INFINITY }
-            }).collect();
-            Tensor::<B2, 1>::from_floats(&row[..], device).unsqueeze::<2>()
-        }).collect();
+        let rows: Vec<Tensor<B2, 2>> = (0..new_len)
+            .map(|i| {
+                let query_pos = offset + i;
+                let window_start = query_pos.saturating_sub(self.sliding_window - 1);
+                let row: Vec<f32> = (0..total_len)
+                    .map(|j| {
+                        if j <= query_pos && j >= window_start {
+                            0.0
+                        } else {
+                            f32::NEG_INFINITY
+                        }
+                    })
+                    .collect();
+                Tensor::<B2, 1>::from_floats(&row[..], device).unsqueeze::<2>()
+            })
+            .collect();
         Tensor::<B2, 2>::cat(rows, 0).reshape([1, 1, new_len, total_len])
     }
 
     /// Causal attention mask: future positions get -inf.
     fn causal_mask(attn: Tensor<B, 4>, seq_len: usize, _offset: usize) -> Tensor<B, 4> {
-        if seq_len <= 1 { return attn; }
+        if seq_len <= 1 {
+            return attn;
+        }
         let device = attn.device();
-        let rows: Vec<Tensor<B, 2>> = (0..seq_len).map(|i| {
-            let row: Vec<f32> = (0..seq_len).map(|j| if j <= i { 0.0 } else { f32::NEG_INFINITY }).collect();
-            Tensor::<B, 1>::from_floats(&row[..], &device).unsqueeze::<2>()
-        }).collect();
+        let rows: Vec<Tensor<B, 2>> = (0..seq_len)
+            .map(|i| {
+                let row: Vec<f32> = (0..seq_len)
+                    .map(|j| if j <= i { 0.0 } else { f32::NEG_INFINITY })
+                    .collect();
+                Tensor::<B, 1>::from_floats(&row[..], &device).unsqueeze::<2>()
+            })
+            .collect();
         let mask = Tensor::<B, 2>::cat(rows, 0).reshape([1, 1, seq_len, seq_len]);
         attn + mask
     }
 
     fn repeat_kv(x: Tensor<B, 4>, n_rep: usize) -> Tensor<B, 4> {
-        if n_rep == 1 { return x; }
+        if n_rep == 1 {
+            return x;
+        }
         let [batch, n_kv_heads, seq_len, head_dim] = x.dims();
         x.unsqueeze_dim::<5>(2)
             .expand([batch, n_kv_heads, n_rep, seq_len, head_dim])
@@ -228,10 +276,10 @@ impl<B: Backend> Gemma4Attention<B> {
 ///   top_k_w /= top_k_w.sum(-1)      # re-normalize chosen subset
 ///   top_k_w *= per_expert_scale[top_k_i]
 pub struct Gemma4Router<B: Backend> {
-    pub norm: RmsNorm<B>,                // with_scale=False
-    pub proj: Linear<B>,                 // [H, E], no bias
-    pub scale: Tensor<B, 1>,             // [H]
-    pub per_expert_scale: Tensor<B, 1>,  // [E]
+    pub norm: RmsNorm<B>,               // with_scale=False
+    pub proj: Linear<B>,                // [H, E], no bias
+    pub scale: Tensor<B, 1>,            // [H]
+    pub per_expert_scale: Tensor<B, 1>, // [E]
     pub inv_sqrt_hidden: f32,
     pub top_k: usize,
     pub num_experts: usize,
@@ -243,7 +291,12 @@ impl<B: Backend> Gemma4Router<B> {
         let [bs, h] = x.dims();
         let h_normed = self.norm.forward(x);
         let device = h_normed.device();
-        let h_scaled = h_normed * self.scale.clone().reshape([1, h]).mul_scalar(self.inv_sqrt_hidden);
+        let h_scaled = h_normed
+            * self
+                .scale
+                .clone()
+                .reshape([1, h])
+                .mul_scalar(self.inv_sqrt_hidden);
         let scores = self.proj.forward(h_scaled); // [B*S, E]
         let probs = burn::tensor::activation::softmax(scores, 1);
 
@@ -266,8 +319,7 @@ impl<B: Backend> Gemma4Router<B> {
                 top_k_index[row].push(*i);
             }
         }
-        let weights = Tensor::<B, 1>::from_floats(&top_k_weights[..], &device)
-            .reshape([bs, k]);
+        let weights = Tensor::<B, 1>::from_floats(&top_k_weights[..], &device).reshape([bs, k]);
         (weights, top_k_index)
     }
 }
@@ -277,7 +329,7 @@ pub struct Gemma4Experts<B: Backend> {
     pub gate_up_proj: Tensor<B, 3>, // [E, 2*I, H]
     pub down_proj: Tensor<B, 3>,    // [E, H, I]
     pub hidden_size: usize,
-    pub intermediate_size: usize,   // moe_intermediate_size
+    pub intermediate_size: usize, // moe_intermediate_size
     pub num_experts: usize,
 }
 
@@ -316,7 +368,9 @@ impl<B: Backend> Gemma4Experts<B> {
         let mut out = vec![0.0f32; bs * h];
         for exp in 0..self.num_experts {
             let tokens = &per_expert[exp];
-            if tokens.is_empty() { continue; }
+            if tokens.is_empty() {
+                continue;
+            }
             let t = tokens.len();
 
             // Gather the token rows assigned to this expert.
@@ -327,19 +381,23 @@ impl<B: Backend> Gemma4Experts<B> {
             let src_t = Tensor::<B, 1>::from_floats(&src[..], &device).reshape([t, h]);
 
             // gate_up_proj[exp] has shape [2I, H]; matmul via [t, H] @ [H, 2I].
-            let gu = self.gate_up_proj.clone()
-                .slice([exp..exp+1, 0..2*i, 0..h])
-                .reshape([2*i, h])
+            let gu = self
+                .gate_up_proj
+                .clone()
+                .slice([exp..exp + 1, 0..2 * i, 0..h])
+                .reshape([2 * i, h])
                 .swap_dims(0, 1); // [H, 2I]
             let gu_out = src_t.matmul(gu); // [t, 2I]
-            // Chunk into (gate, up) along last dim.
+                                           // Chunk into (gate, up) along last dim.
             let gate = gu_out.clone().slice([0..t, 0..i]);
-            let up = gu_out.slice([0..t, i..2*i]);
+            let up = gu_out.slice([0..t, i..2 * i]);
             let acted = burn::tensor::activation::gelu_approximate(gate) * up;
 
             // down_proj[exp] has shape [H, I]; matmul via [t, I] @ [I, H].
-            let dp = self.down_proj.clone()
-                .slice([exp..exp+1, 0..h, 0..i])
+            let dp = self
+                .down_proj
+                .clone()
+                .slice([exp..exp + 1, 0..h, 0..i])
                 .reshape([h, i])
                 .swap_dims(0, 1); // [I, H]
             let acted_out = acted.matmul(dp); // [t, H]
@@ -375,9 +433,15 @@ impl<B: Backend> Gemma4MLP<B> {
     pub fn new(config: &Gemma4TextConfig, device: &B::Device) -> Self {
         let intermediate = config.intermediate_size;
         Self {
-            gate_proj: LinearConfig::new(config.hidden_size, intermediate).with_bias(false).init(device),
-            up_proj: LinearConfig::new(config.hidden_size, intermediate).with_bias(false).init(device),
-            down_proj: LinearConfig::new(intermediate, config.hidden_size).with_bias(false).init(device),
+            gate_proj: LinearConfig::new(config.hidden_size, intermediate)
+                .with_bias(false)
+                .init(device),
+            up_proj: LinearConfig::new(config.hidden_size, intermediate)
+                .with_bias(false)
+                .init(device),
+            down_proj: LinearConfig::new(intermediate, config.hidden_size)
+                .with_bias(false)
+                .init(device),
         }
     }
 
@@ -394,9 +458,12 @@ impl<B: Backend> Gemma4MLP<B> {
         });
         let key = |j: usize| keys.as_ref().map_or("", |k| k[j].as_str());
 
-        let gate = burn::tensor::activation::gelu_approximate(
-            maybe_lora(&self.gate_proj, x.clone(), lora_w, key(0)),
-        );
+        let gate = burn::tensor::activation::gelu_approximate(maybe_lora(
+            &self.gate_proj,
+            x.clone(),
+            lora_w,
+            key(0),
+        ));
         let up = maybe_lora(&self.up_proj, x, lora_w, key(1));
         maybe_lora(&self.down_proj, gate * up, lora_w, key(2))
     }
@@ -510,7 +577,9 @@ impl<B: Backend> Gemma4DecoderLayer<B> {
 
         // MLP / MoE block.
         let residual = x.clone();
-        let h_mlp = self.mlp.forward(self.pre_feedforward_layernorm.forward(x), lora);
+        let h_mlp = self
+            .mlp
+            .forward(self.pre_feedforward_layernorm.forward(x), lora);
 
         let combined = if let Some(moe) = &self.moe {
             // Dense MLP output normed once, MoE output normed independently,

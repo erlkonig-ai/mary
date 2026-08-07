@@ -58,7 +58,10 @@ fn nomic_tokenizer() -> Option<PathBuf> {
         "models--nomic-ai--nomic-embed-multimodal-7b",
         "models--Qwen--Qwen2.5-VL-7B-Instruct",
     ] {
-        let base = PathBuf::from(&home).join(".cache/huggingface/hub").join(pat).join("snapshots");
+        let base = PathBuf::from(&home)
+            .join(".cache/huggingface/hub")
+            .join(pat)
+            .join("snapshots");
         if let Ok(rd) = std::fs::read_dir(&base) {
             for e in rd.flatten() {
                 let p = e.path().join("tokenizer.json");
@@ -116,7 +119,9 @@ fn aliased_metal_embed_parity() {
         }
         let ids = load_ids(&dir, ids_name);
         let seq = ids.len();
-        let want = npy::load_npy(&dir.join(format!("{ref_name}.npy"))).unwrap().0;
+        let want = npy::load_npy(&dir.join(format!("{ref_name}.npy")))
+            .unwrap()
+            .0;
         let t = Instant::now();
         let got = embedder.embed_ids(&ids);
         let ms = t.elapsed().as_millis();
@@ -125,7 +130,10 @@ fn aliased_metal_embed_parity() {
         let n: f32 = got.iter().map(|v| v * v).sum::<f32>().sqrt();
         eprintln!("[aliased] {ref_name} (seq={seq}): cosine={cos:.7}  |emb|={n:.5}  ({ms} ms)");
         worst = worst.min(cos);
-        assert!(cos >= 0.999, "{ref_name}: f16-Metal cosine={cos:.7} < 0.999");
+        assert!(
+            cos >= 0.999,
+            "{ref_name}: f16-Metal cosine={cos:.7} < 0.999"
+        );
     }
 
     // --- IMAGE: vision tower -> splice -> M-RoPE backbone, all f16 on Metal ---
@@ -134,8 +142,7 @@ fn aliased_metal_embed_parity() {
         let input_ids = load_ids(&dir, "image_input_ids");
         let grid = vec![(1usize, 4usize, 4usize)]; // 56x56 probe: grid_thw (1,4,4)
         let (pd, ps) = npy::load_npy(&vdir.join("pixel_values.npy")).unwrap();
-        let pixel_values =
-            Tensor::<B, 2>::from_data(TensorData::new(pd, ps), &device);
+        let pixel_values = Tensor::<B, 2>::from_data(TensorData::new(pd, ps), &device);
         let want = npy::load_npy(&dir.join("image_emb.npy")).unwrap().0;
         let t = Instant::now();
         let got = embedder
@@ -171,7 +178,13 @@ fn aliased_metal_embed_parity() {
     let long_emb = embedder.embed_ids(&long_ids);
     let ms = t.elapsed().as_millis();
     let nrm: f32 = long_emb.iter().map(|v| v * v).sum::<f32>().sqrt();
-    assert!(long_emb.iter().all(|v| v.is_finite()), "long-seq embedding has non-finite values");
-    assert!((nrm - 1.0).abs() < 1e-2, "long-seq embedding not unit-norm: |emb|={nrm}");
+    assert!(
+        long_emb.iter().all(|v| v.is_finite()),
+        "long-seq embedding has non-finite values"
+    );
+    assert!(
+        (nrm - 1.0).abs() < 1e-2,
+        "long-seq embedding not unit-norm: |emb|={nrm}"
+    );
     eprintln!("[aliased] O(n^2) attention @ seq=2048: ran on Metal, |emb|={nrm:.5}  ({ms} ms)");
 }

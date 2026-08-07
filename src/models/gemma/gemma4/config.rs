@@ -21,7 +21,9 @@ pub struct RopeParams {
     pub partial_rotary_factor: f64,
 }
 
-fn default_partial_rotary() -> f64 { 1.0 }
+fn default_partial_rotary() -> f64 {
+    1.0
+}
 
 /// Dual RoPE configuration: separate params for sliding vs full attention.
 #[derive(Debug, Clone, Deserialize)]
@@ -98,8 +100,12 @@ pub struct Gemma4TextConfig {
     pub use_bidirectional_attention: Option<String>,
 }
 
-fn default_softcap() -> f64 { 30.0 }
-fn default_activation() -> String { "gelu_pytorch_tanh".to_string() }
+fn default_softcap() -> f64 {
+    30.0
+}
+fn default_activation() -> String {
+    "gelu_pytorch_tanh".to_string()
+}
 
 /// Gemma 4 audio encoder config (Conformer with chunked local attention).
 #[derive(Debug, Clone, Deserialize)]
@@ -141,22 +147,54 @@ pub struct Gemma4AudioConfig {
     pub output_proj_dims: usize,
 }
 
-fn default_audio_hidden() -> usize { 1024 }
-fn default_audio_layers() -> usize { 12 }
-fn default_audio_heads() -> usize { 8 }
-fn default_audio_act() -> String { "silu".to_string() }
-fn default_subsampling_channels() -> Vec<usize> { vec![128, 32] }
-fn default_conv_kernel() -> usize { 5 }
-fn default_residual_weight() -> f32 { 0.5 }
-fn default_attention_chunk() -> usize { 12 }
-fn default_attention_context_left() -> usize { 13 }
-fn default_attention_context_right() -> usize { 0 }
-fn default_attention_logit_cap() -> f32 { 50.0 }
-fn default_invalid_logits() -> f32 { -1.0e9 }
-fn default_true() -> bool { true }
-fn default_rms_eps() -> f64 { 1e-6 }
-fn default_gradient_clipping() -> f32 { 1e10 }
-fn default_output_proj_dims() -> usize { 1536 }
+fn default_audio_hidden() -> usize {
+    1024
+}
+fn default_audio_layers() -> usize {
+    12
+}
+fn default_audio_heads() -> usize {
+    8
+}
+fn default_audio_act() -> String {
+    "silu".to_string()
+}
+fn default_subsampling_channels() -> Vec<usize> {
+    vec![128, 32]
+}
+fn default_conv_kernel() -> usize {
+    5
+}
+fn default_residual_weight() -> f32 {
+    0.5
+}
+fn default_attention_chunk() -> usize {
+    12
+}
+fn default_attention_context_left() -> usize {
+    13
+}
+fn default_attention_context_right() -> usize {
+    0
+}
+fn default_attention_logit_cap() -> f32 {
+    50.0
+}
+fn default_invalid_logits() -> f32 {
+    -1.0e9
+}
+fn default_true() -> bool {
+    true
+}
+fn default_rms_eps() -> f64 {
+    1e-6
+}
+fn default_gradient_clipping() -> f32 {
+    1e10
+}
+fn default_output_proj_dims() -> usize {
+    1536
+}
 
 /// Top-level Gemma 4 config (wraps text + vision + audio configs).
 #[derive(Debug, Clone, Deserialize)]
@@ -187,7 +225,8 @@ impl Gemma4Config {
 impl Gemma4TextConfig {
     /// Effective KV heads for global attention layers.
     pub fn global_kv_heads(&self) -> usize {
-        self.num_global_key_value_heads.unwrap_or(self.num_key_value_heads)
+        self.num_global_key_value_heads
+            .unwrap_or(self.num_key_value_heads)
     }
 
     /// Effective head dim for global attention layers.

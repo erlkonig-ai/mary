@@ -11,10 +11,10 @@
 
 use burn::prelude::*;
 use mary::models::gemma::gemma4::config::Gemma4Config;
-use std::path::Path;
-use std::process::Command;
 use mary::models::gemma::gemma4::lm::GemmaLM;
 use mary::models::gemma::gemma4::preprocess::pil_resize_bicubic;
+use std::path::Path;
+use std::process::Command;
 
 #[cfg(feature = "f16gen")]
 use mary::nn::backend::BHalf as B;
@@ -23,15 +23,22 @@ use mary::nn::backend::B;
 
 fn find_hf_file(model_id: &str, filename: &str) -> String {
     let o = Command::new("python3")
-        .args(["-c", &format!(
-            "from huggingface_hub import hf_hub_download; print(hf_hub_download('{}', '{}'))",
-            model_id, filename)])
-        .output().unwrap();
+        .args([
+            "-c",
+            &format!(
+                "from huggingface_hub import hf_hub_download; print(hf_hub_download('{}', '{}'))",
+                model_id, filename
+            ),
+        ])
+        .output()
+        .unwrap();
     String::from_utf8(o.stdout).unwrap().trim().to_string()
 }
 
 fn arg(args: &[String], k: &str) -> Option<String> {
-    args.iter().position(|s| s == k).map(|i| args[i + 1].clone())
+    args.iter()
+        .position(|s| s == k)
+        .map(|i| args[i + 1].clone())
 }
 
 fn main() {
@@ -40,13 +47,19 @@ fn main() {
     let config_path = find_hf_file("google/gemma-4-31B-it", "config.json");
     // Keep vision_config THIS time — we want the vision tower loaded.
     let config = Gemma4Config::load(Path::new(&config_path));
-    assert!(config.vision_config.is_some(), "31B config must carry a vision_config");
+    assert!(
+        config.vision_config.is_some(),
+        "31B config must carry a vision_config"
+    );
 
     let device = mary::models::gemma::metal_device::init_metal_device_16gb();
     eprintln!("[vision] streaming 31B (WITH vision tower) from {pile}...");
     let (_decoder, vision) = mary::persist::load_gemma4_streaming_from_pile::<B>(
-        Path::new(&pile), config.clone(), &device,
-    ).expect("stream 31b (+vision) from pile");
+        Path::new(&pile),
+        config.clone(),
+        &device,
+    )
+    .expect("stream 31b (+vision) from pile");
 
     let enc = vision.expect("vision encoder must be present for the 31B");
     eprintln!(
@@ -82,13 +95,18 @@ fn main() {
                 }
             }
         }
-        let pixel_values = Tensor::<B, 1>::from_floats(&pv[..], &device)
-            .reshape([1, num_patches, patch_dim]);
+        let pixel_values =
+            Tensor::<B, 1>::from_floats(&pv[..], &device).reshape([1, num_patches, patch_dim]);
 
         let mut pos: Vec<i32> = Vec::with_capacity(num_patches * 2);
-        for y in 0..grid { for x in 0..grid { pos.push(x as i32); pos.push(y as i32); } }
-        let pixel_position_ids = Tensor::<B, 1, Int>::from_ints(&pos[..], &device)
-            .reshape([1, num_patches, 2]);
+        for y in 0..grid {
+            for x in 0..grid {
+                pos.push(x as i32);
+                pos.push(y as i32);
+            }
+        }
+        let pixel_position_ids =
+            Tensor::<B, 1, Int>::from_ints(&pos[..], &device).reshape([1, num_patches, 2]);
 
         eprintln!("[vision] encoding image...");
         let soft = enc.forward(pixel_values, pixel_position_ids, &device);
@@ -102,7 +120,12 @@ fn main() {
         // Wait, `load_gemma4_streaming_from_pile` returned `(_decoder, vision)`.
         // _decoder IS `Gemma4Model<B>`. Let's wrap it!
         let tokenizer_path = find_hf_file("google/gemma-4-31B-it", "tokenizer.json");
-        let lm = GemmaLM::from_model(config.clone(), _decoder, Path::new(&tokenizer_path), device.clone());
+        let lm = GemmaLM::from_model(
+            config.clone(),
+            _decoder,
+            Path::new(&tokenizer_path),
+            device.clone(),
+        );
 
         eprintln!("[vision] assembling prompt...");
         let pre = format!("<bos><|turn>user\n");
@@ -122,36 +145,64 @@ fn main() {
         let pv: Vec<f32> = (0..num_patches * patch_dim)
             .map(|i| ((i % 255) as f32 / 255.0) - 0.5)
             .collect();
-        let pixel_values = Tensor::<B, 1>::from_floats(&pv[..], &device)
-            .reshape([1, num_patches, patch_dim]);
+        let pixel_values =
+            Tensor::<B, 1>::from_floats(&pv[..], &device).reshape([1, num_patches, patch_dim]);
         let mut pos: Vec<i32> = Vec::with_capacity(num_patches * 2);
-        for y in 0..grid { for x in 0..grid { pos.push(x as i32); pos.push(y as i32); } }
-        let pixel_position_ids = Tensor::<B, 1, Int>::from_ints(&pos[..], &device)
-            .reshape([1, num_patches, 2]);
+        for y in 0..grid {
+            for x in 0..grid {
+                pos.push(x as i32);
+                pos.push(y as i32);
+            }
+        }
+        let pixel_position_ids =
+            Tensor::<B, 1, Int>::from_ints(&pos[..], &device).reshape([1, num_patches, 2]);
 
         eprintln!("[vision] running encoder forward on a {grid}x{grid} synthetic patch grid...");
         let soft = enc.forward(pixel_values, pixel_position_ids, &device);
         let dims = soft.dims();
-        let flat: Vec<f32> = soft.reshape([dims[0] * dims[1]]).to_data().convert::<f32>().to_vec().unwrap();
+        let flat: Vec<f32> = soft
+            .reshape([dims[0] * dims[1]])
+            .to_data()
+            .convert::<f32>()
+            .to_vec()
+            .unwrap();
         let finite = flat.iter().filter(|x| x.is_finite()).count();
-        let (mn, mx) = flat.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &x| (a.min(x), b.max(x)));
+        let (mn, mx) = flat
+            .iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &x| {
+                (a.min(x), b.max(x))
+            });
 
         for (i, &val) in flat.iter().enumerate() {
             if !val.is_finite() {
                 let token_idx = i / dims[1];
                 let channel_idx = i % dims[1];
                 println!("Token {token_idx}, Channel {channel_idx} is {val}");
-                if i > dims[1] * 3 { break; } // just print a few
+                if i > dims[1] * 3 {
+                    break;
+                } // just print a few
             }
         }
 
         println!("\n=== VISION ENCODER (31B) ===");
         println!("encoder layers        : {}", enc.config.num_hidden_layers);
-        println!("soft-token output     : {:?} (pooled_tokens x text_hidden)", dims);
+        println!(
+            "soft-token output     : {:?} (pooled_tokens x text_hidden)",
+            dims
+        );
         println!("finite / total        : {finite} / {}", flat.len());
         println!("value range           : [{mn:.4}, {mx:.4}]");
         let ok = finite == flat.len() && dims[1] == config.text_config.hidden_size;
-        println!("GATE: {}", if ok { "PASS (encoder loads + forwards, output in text-hidden space, all finite)" } else { "FAIL" });
-        if !ok { std::process::exit(1); }
+        println!(
+            "GATE: {}",
+            if ok {
+                "PASS (encoder loads + forwards, output in text-hidden space, all finite)"
+            } else {
+                "FAIL"
+            }
+        );
+        if !ok {
+            std::process::exit(1);
+        }
     }
 }

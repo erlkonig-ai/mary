@@ -189,7 +189,10 @@ pub fn transcribe<B: Backend, O: SttPipeline<B>>(
     let audio_embeds: Tensor<B, 3> = if incremental_encoder {
         let mut chunks = Vec::with_capacity(n_tokens);
         for t in 0..n_tokens {
-            let h = organs.encode(stem.clone().narrow(1, t * DOWNSAMPLE, DOWNSAMPLE), &mut enc_caches);
+            let h = organs.encode(
+                stem.clone().narrow(1, t * DOWNSAMPLE, DOWNSAMPLE),
+                &mut enc_caches,
+            );
             chunks.push(organs.project(h));
         }
         Tensor::cat(chunks, 1)
@@ -231,7 +234,12 @@ pub fn transcribe<B: Backend, O: SttPipeline<B>>(
     }
 
     let text = organs.tekken().decode(&tokens);
-    Transcription { tokens, prompt_len: l, text, timings }
+    Transcription {
+        tokens,
+        prompt_len: l,
+        text,
+        timings,
+    }
 }
 
 /// Argmax with host readback — one sync per frame.
@@ -282,8 +290,8 @@ pub struct StreamingTranscriber<'a, B: Backend, O: SttPipeline<B>> {
     /// (latency is measured from here — encoder + queueing + decoder) + the
     /// wall time the encoder side spent on this token.
     queue: std::collections::VecDeque<(Tensor<B, 3>, Instant, f32)>,
-    pub tokens: Vec<u32>,  // full sequence: prompt + generated
-    finished: bool,        // saw EOS
+    pub tokens: Vec<u32>, // full sequence: prompt + generated
+    finished: bool,       // saw EOS
 }
 
 impl<'a, B: Backend, O: SttPipeline<B>> StreamingTranscriber<'a, B, O> {
@@ -364,7 +372,9 @@ impl<'a, B: Backend, O: SttPipeline<B>> StreamingTranscriber<'a, B, O> {
             let t0 = Instant::now();
             let audio = Tensor::cat(audio, 1);
             let tok = self.stt.embed(&self.prompt);
-            let hidden = self.stt.decode_step(tok + audio, &self.ada, &mut self.dec_caches);
+            let hidden = self
+                .stt
+                .decode_step(tok + audio, &self.ada, &mut self.dec_caches);
             let id = argmax_host::<B>(self.stt.logits_last(hidden));
             self.tokens.extend_from_slice(&self.prompt);
             self.tokens.push(id);
@@ -387,7 +397,9 @@ impl<'a, B: Backend, O: SttPipeline<B>> StreamingTranscriber<'a, B, O> {
             let t0 = Instant::now();
             let prev = *self.tokens.last().unwrap();
             let tok = self.stt.embed(&[prev]);
-            let hidden = self.stt.decode_step(tok + audio, &self.ada, &mut self.dec_caches);
+            let hidden = self
+                .stt
+                .decode_step(tok + audio, &self.ada, &mut self.dec_caches);
             let id = argmax_host::<B>(self.stt.logits_last(hidden));
             self.tokens.push(id);
             out.push(StreamedToken {

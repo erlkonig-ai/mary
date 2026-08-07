@@ -42,7 +42,13 @@ struct CpuConv {
 }
 
 impl CpuConv {
-    fn load(loader: &WeightLoader, prefix: &str, stride: usize, bias: bool, replicate_pad: bool) -> Self {
+    fn load(
+        loader: &WeightLoader,
+        prefix: &str,
+        stride: usize,
+        bias: bool,
+        replicate_pad: bool,
+    ) -> Self {
         let (w, shape) = loader.load_host_f32(&format!("{prefix}.weight"));
         let (out, inc, k) = (shape[0], shape[1], shape[2]);
         Self {
@@ -60,7 +66,8 @@ impl CpuConv {
     fn forward(&self, x: &[f32], l: usize) -> (Vec<f32>, usize) {
         let (k, s) = (self.k, self.stride);
         let pad_left = k - s;
-        let n_frames = ((l + pad_left).saturating_sub(k) as f64 / s as f64 + 1.0).ceil() as usize - 1;
+        let n_frames =
+            ((l + pad_left).saturating_sub(k) as f64 / s as f64 + 1.0).ceil() as usize - 1;
         let ideal = n_frames * s + k - pad_left;
         let pad_right = ideal.saturating_sub(l);
         let lp = l + pad_left + pad_right;
@@ -121,7 +128,7 @@ pub(super) struct TrLayer {
     ln1_b: HostF32,
     ln2_w: HostF32,
     ln2_b: HostF32,
-    in_proj: HostF32, // [3·512, 512] fused qkv
+    in_proj: HostF32,  // [3·512, 512] fused qkv
     out_proj: HostF32, // [512, 512]
     fc1: HostF32,      // [2048, 512]
     fc2: HostF32,      // [512, 2048]
@@ -145,8 +152,10 @@ impl RvqEncoder {
         let mut codebooks = Vec::with_capacity(n_q);
         let mut norms = Vec::with_capacity(n_q);
         for i in 0..n_q {
-            let (sum, _) = loader.load_f32(&format!("{prefix}.vq.layers.{i}._codebook.embedding_sum"));
-            let (usage, _) = loader.load_f32(&format!("{prefix}.vq.layers.{i}._codebook.cluster_usage"));
+            let (sum, _) =
+                loader.load_f32(&format!("{prefix}.vq.layers.{i}._codebook.embedding_sum"));
+            let (usage, _) =
+                loader.load_f32(&format!("{prefix}.vq.layers.{i}._codebook.cluster_usage"));
             let mut cb = sum;
             for (r, &u) in usage.iter().enumerate() {
                 let d = u.max(1e-5);
@@ -156,14 +165,21 @@ impl RvqEncoder {
             }
             norms.push(
                 (0..usage.len())
-                    .map(|r| cb[r * CODE_DIM..(r + 1) * CODE_DIM].iter().map(|&v| v * v).sum::<f32>())
+                    .map(|r| {
+                        cb[r * CODE_DIM..(r + 1) * CODE_DIM]
+                            .iter()
+                            .map(|&v| v * v)
+                            .sum::<f32>()
+                    })
                     .collect(),
             );
             codebooks.push(cb);
         }
         // input_proj weight is [256, 512, 1] (k1 conv) → flatten trailing 1.
         Self {
-            input_proj: loader.load_host_f32(&format!("{prefix}.input_proj.weight")).0,
+            input_proj: loader
+                .load_host_f32(&format!("{prefix}.input_proj.weight"))
+                .0,
             codebooks,
             norms,
         }
@@ -192,7 +208,10 @@ impl RvqEncoder {
                 }
                 codes.push(best.1 as u32);
                 let e = &cb[best.1 * CODE_DIM..(best.1 + 1) * CODE_DIM];
-                for (r, &ev) in residual[ti * CODE_DIM..(ti + 1) * CODE_DIM].iter_mut().zip(e) {
+                for (r, &ev) in residual[ti * CODE_DIM..(ti + 1) * CODE_DIM]
+                    .iter_mut()
+                    .zip(e)
+                {
                     *r -= ev;
                 }
             }
@@ -221,13 +240,33 @@ impl MimiEncoder {
             .iter()
             .enumerate()
             .map(|(i, &r)| EncBlock {
-                res1: CpuConv::load(loader, &format!("{p}.{}.block.1.conv.conv", 3 * i + 1), 1, true, false),
-                res2: CpuConv::load(loader, &format!("{p}.{}.block.3.conv.conv", 3 * i + 1), 1, true, false),
-                down: CpuConv::load(loader, &format!("{p}.{}.conv.conv", 3 * i + 3), r, true, false),
+                res1: CpuConv::load(
+                    loader,
+                    &format!("{p}.{}.block.1.conv.conv", 3 * i + 1),
+                    1,
+                    true,
+                    false,
+                ),
+                res2: CpuConv::load(
+                    loader,
+                    &format!("{p}.{}.block.3.conv.conv", 3 * i + 1),
+                    1,
+                    true,
+                    false,
+                ),
+                down: CpuConv::load(
+                    loader,
+                    &format!("{p}.{}.conv.conv", 3 * i + 3),
+                    r,
+                    true,
+                    false,
+                ),
             })
             .collect();
         let t = "encoder_transformer.transformer.layers";
-        let tr_layers = (0..TR_LAYERS).map(|i| Self::load_layer(loader, t, i)).collect();
+        let tr_layers = (0..TR_LAYERS)
+            .map(|i| Self::load_layer(loader, t, i))
+            .collect();
         Self {
             stem: CpuConv::load(loader, &format!("{p}.0.conv.conv"), 1, true, false),
             blocks,
@@ -241,16 +280,32 @@ impl MimiEncoder {
 
     fn load_layer(loader: &WeightLoader, prefix: &str, i: usize) -> TrLayer {
         TrLayer {
-            ln1_w: loader.load_host_f32(&format!("{prefix}.{i}.norm1.weight")).0,
+            ln1_w: loader
+                .load_host_f32(&format!("{prefix}.{i}.norm1.weight"))
+                .0,
             ln1_b: loader.load_host_f32(&format!("{prefix}.{i}.norm1.bias")).0,
-            ln2_w: loader.load_host_f32(&format!("{prefix}.{i}.norm2.weight")).0,
+            ln2_w: loader
+                .load_host_f32(&format!("{prefix}.{i}.norm2.weight"))
+                .0,
             ln2_b: loader.load_host_f32(&format!("{prefix}.{i}.norm2.bias")).0,
-            in_proj: loader.load_host_f32(&format!("{prefix}.{i}.self_attn.in_proj_weight")).0,
-            out_proj: loader.load_host_f32(&format!("{prefix}.{i}.self_attn.out_proj.weight")).0,
-            fc1: loader.load_host_f32(&format!("{prefix}.{i}.linear1.weight")).0,
-            fc2: loader.load_host_f32(&format!("{prefix}.{i}.linear2.weight")).0,
-            ls1: loader.load_host_f32(&format!("{prefix}.{i}.layer_scale_1.scale")).0,
-            ls2: loader.load_host_f32(&format!("{prefix}.{i}.layer_scale_2.scale")).0,
+            in_proj: loader
+                .load_host_f32(&format!("{prefix}.{i}.self_attn.in_proj_weight"))
+                .0,
+            out_proj: loader
+                .load_host_f32(&format!("{prefix}.{i}.self_attn.out_proj.weight"))
+                .0,
+            fc1: loader
+                .load_host_f32(&format!("{prefix}.{i}.linear1.weight"))
+                .0,
+            fc2: loader
+                .load_host_f32(&format!("{prefix}.{i}.linear2.weight"))
+                .0,
+            ls1: loader
+                .load_host_f32(&format!("{prefix}.{i}.layer_scale_1.scale"))
+                .0,
+            ls2: loader
+                .load_host_f32(&format!("{prefix}.{i}.layer_scale_2.scale"))
+                .0,
         }
     }
 
@@ -259,7 +314,11 @@ impl MimiEncoder {
         let d = w.len();
         for (row_in, row_out) in x.chunks_exact(d).zip(out.chunks_exact_mut(d)) {
             let mean = row_in.iter().map(|&v| v as f64).sum::<f64>() / d as f64;
-            let var = row_in.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / d as f64;
+            let var = row_in
+                .iter()
+                .map(|&v| (v as f64 - mean).powi(2))
+                .sum::<f64>()
+                / d as f64;
             let inv = ((var + TR_EPS).sqrt().recip()) as f32;
             let mean = mean as f32;
             for i in 0..d {
@@ -386,8 +445,14 @@ pub(super) fn transformer_forward(layers: &[TrLayer], h: &mut [f32], t: usize) {
         // RoPE q and k per head
         for pos in 0..t {
             for hh in 0..nh {
-                rope(&mut qkv[pos * 3 * hd + hh * d..pos * 3 * hd + (hh + 1) * d], pos);
-                rope(&mut qkv[pos * 3 * hd + hd + hh * d..pos * 3 * hd + hd + (hh + 1) * d], pos);
+                rope(
+                    &mut qkv[pos * 3 * hd + hh * d..pos * 3 * hd + (hh + 1) * d],
+                    pos,
+                );
+                rope(
+                    &mut qkv[pos * 3 * hd + hd + hh * d..pos * 3 * hd + hd + (hh + 1) * d],
+                    pos,
+                );
             }
         }
         attn.fill(0.0);
@@ -405,7 +470,8 @@ pub(super) fn transformer_forward(layers: &[TrLayer], h: &mut [f32], t: usize) {
                 softmax(&mut scores[..n]);
                 let out = &mut attn[qp * hd + hh * d..qp * hd + (hh + 1) * d];
                 for (si, kp) in (lo..=qp).enumerate() {
-                    let vrow = &qkv[kp * 3 * hd + 2 * hd + hh * d..kp * 3 * hd + 2 * hd + (hh + 1) * d];
+                    let vrow =
+                        &qkv[kp * 3 * hd + 2 * hd + hh * d..kp * 3 * hd + 2 * hd + (hh + 1) * d];
                     let p = scores[si];
                     for (o, &vv) in out.iter_mut().zip(vrow) {
                         *o += p * vv;
@@ -434,6 +500,8 @@ pub(super) fn transformer_forward(layers: &[TrLayer], h: &mut [f32], t: usize) {
 impl MimiEncoder {
     /// Load just the transformer layers (for the decoder's own bottleneck).
     pub(super) fn load_tr_layers(loader: &WeightLoader, prefix: &str) -> Vec<TrLayer> {
-        (0..TR_LAYERS).map(|i| Self::load_layer(loader, prefix, i)).collect()
+        (0..TR_LAYERS)
+            .map(|i| Self::load_layer(loader, prefix, i))
+            .collect()
     }
 }

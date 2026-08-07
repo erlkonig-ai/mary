@@ -35,18 +35,36 @@ fn synth(
     text: &str,
     device: &WgpuDevice,
 ) -> Vec<f32> {
-    let nfe = std::env::var("MARY_NFE").ok().and_then(|s| s.parse().ok()).unwrap_or(32);
-    let cfg_strength = std::env::var("MARY_CFG").ok().and_then(|s| s.parse().ok()).unwrap_or(2.0);
+    let nfe = std::env::var("MARY_NFE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32);
+    let cfg_strength = std::env::var("MARY_CFG")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2.0);
     let toks = Tokenizer::new().encode_tensor::<B>(&format!("{ref_text} {text}"), device);
     let (rb, gb) = (ref_text.len() as f64, text.len() as f64);
     let local_speed = if text.len() < 10 { 0.3 } else { 1.0 };
     let duration = ref_len + (ref_len as f64 / rb * gb / local_speed) as usize;
     let gen = duration - ref_len;
-    let cond = Tensor::cat(vec![ref_mel.clone(), Tensor::<B, 3>::zeros([1, gen, 100], device)], 1);
+    let cond = Tensor::cat(
+        vec![
+            ref_mel.clone(),
+            Tensor::<B, 3>::zeros([1, gen, 100], device),
+        ],
+        1,
+    );
     let y0 = Tensor::random([1, duration, 100], Distribution::Normal(0.0, 1.0), device);
-    let cfg = CfmConfig { nfe, sway_coef: -1.0, cfg_strength };
+    let cfg = CfmConfig {
+        nfe,
+        sway_coef: -1.0,
+        cfg_strength,
+    };
     let sampled = cfm::integrate(model, y0, cond, toks, &cfg, device);
-    let gen_mel = sampled.slice([0..1, ref_len..duration, 0..100]).swap_dims(1, 2);
+    let gen_mel = sampled
+        .slice([0..1, ref_len..duration, 0..100])
+        .swap_dims(1, 2);
     vocos.forward(gen_mel).into_data().to_vec().unwrap()
 }
 
@@ -64,25 +82,38 @@ fn main() {
     assert_eq!(sr, 24000, "reference clip must be 24 kHz mono");
     let n = samples.len();
     let wavt = Tensor::<B, 1>::from_floats(samples.as_slice(), &device).reshape([1, n]);
-    let ref_mel = MelExtractor::<B>::new(&device).forward(wavt).swap_dims(1, 2);
+    let ref_mel = MelExtractor::<B>::new(&device)
+        .forward(wavt)
+        .swap_dims(1, 2);
     let ref_len = ref_mel.dims()[1];
     let loader = WeightLoader::from_pile(Path::new(pile_path))
         .unwrap_or_else(|e| panic!("load voice pile {pile_path}: {e:?}"));
     let model = F5Transformer::<B>::load(&loader, F5Config::v1_base(), &device);
     let vocos = Vocos::<B>::load(&loader, &device);
-    eprintln!("[load] model + ref warm in {:.2}s — ready, ref_len {ref_len}", t_load.elapsed().as_secs_f32());
+    eprintln!(
+        "[load] model + ref warm in {:.2}s — ready, ref_len {ref_len}",
+        t_load.elapsed().as_secs_f32()
+    );
 
     // Warm the kernels once with a throwaway synth so request #1 is also fast
     // (this is where the shader JIT is paid). Comment-measured below instead:
     let stdin = std::io::stdin();
     let mut req = 0usize;
     for line in stdin.lock().lines() {
-        let line = match line { Ok(l) => l, Err(_) => break };
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
         let line = line.trim();
-        if line.is_empty() { continue }
+        if line.is_empty() {
+            continue;
+        }
         let (out_path, text) = match line.split_once('\t') {
             Some((o, t)) => (o, t),
-            None => { eprintln!("[skip] expected <out.wav>\\t<text>"); continue }
+            None => {
+                eprintln!("[skip] expected <out.wav>\\t<text>");
+                continue;
+            }
         };
         req += 1;
         let t = std::time::Instant::now();
@@ -92,8 +123,12 @@ fn main() {
         wav::write_pcm16_mono(Path::new(out_path), &audio, 24000);
         let synth_s = t.elapsed().as_secs_f32();
         let audio_s = audio.len() as f32 / 24000.0;
-        eprintln!("[req {req}] {:.2}s synth for {:.2}s audio ({:.2}x realtime) -> {out_path}",
-            synth_s, audio_s, synth_s / audio_s);
+        eprintln!(
+            "[req {req}] {:.2}s synth for {:.2}s audio ({:.2}x realtime) -> {out_path}",
+            synth_s,
+            audio_s,
+            synth_s / audio_s
+        );
         std::io::stderr().flush().ok();
     }
     eprintln!("[done] served {req} request(s)");

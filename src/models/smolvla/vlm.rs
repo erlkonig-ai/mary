@@ -26,7 +26,10 @@ impl<B: Backend> VlmTower<B> {
         let layers = (0..cfg.vlm.n_layers)
             .map(|i| ExpertLayer::load(loader, &format!("{p}.layers.{i}"), cfg.vlm, device))
             .collect();
-        Self { embed_tokens, layers }
+        Self {
+            embed_tokens,
+            layers,
+        }
     }
 
     /// Embed token ids `[B,L]` → `[B,L,960]` (row lookup into embed_tokens).
@@ -34,7 +37,10 @@ impl<B: Backend> VlmTower<B> {
         let [b, l] = ids.dims();
         let dim = self.embed_tokens.dims()[1];
         let flat = ids.reshape([b * l]);
-        self.embed_tokens.clone().select(0, flat).reshape([b, l, dim])
+        self.embed_tokens
+            .clone()
+            .select(0, flat)
+            .reshape([b, l, dim])
     }
 
     /// Run the prefix through the decoder, returning the stacked per-layer KV

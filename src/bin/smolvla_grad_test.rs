@@ -21,12 +21,18 @@ fn main() {
     let loader = WeightLoader::SingleFile(SingleFileLoader::new(Path::new(CKPT)));
 
     // action_out_proj: the expert head (720 -> 32), a trainable leaf
-    let w = loader.load_tensor::<B, 2>("model.action_out_proj.weight", &dev).require_grad(); // [32,720]
-    let bias = loader.load_tensor::<B, 1>("model.action_out_proj.bias", &dev).require_grad(); // [32]
+    let w = loader
+        .load_tensor::<B, 2>("model.action_out_proj.weight", &dev)
+        .require_grad(); // [32,720]
+    let bias = loader
+        .load_tensor::<B, 1>("model.action_out_proj.bias", &dev)
+        .require_grad(); // [32]
 
     // a flow-matching-style step: predict v from a noised suffix-out, regress to u_t
     let x = Tensor::<B, 3>::random([1, 50, 720], Distribution::Normal(0.0, 1.0), &dev);
-    let v = x.matmul(w.clone().transpose().unsqueeze()).add(bias.clone().unsqueeze()); // [1,50,32]
+    let v = x
+        .matmul(w.clone().transpose().unsqueeze())
+        .add(bias.clone().unsqueeze()); // [1,50,32]
     let u = Tensor::<B, 3>::random([1, 50, 32], Distribution::Normal(0.0, 1.0), &dev);
     let loss = (v - u).powf_scalar(2.0).mean();
     let loss_val: f32 = loss.clone().into_scalar().elem();
@@ -38,8 +44,14 @@ fn main() {
     let gb_norm: f32 = gb.powf_scalar(2.0).sum().sqrt().into_scalar().elem();
 
     println!("loss = {loss_val:.4}");
-    println!("|grad action_out_proj.weight| = {gw_norm:.4}  (shape {:?})", w.dims());
+    println!(
+        "|grad action_out_proj.weight| = {gw_norm:.4}  (shape {:?})",
+        w.dims()
+    );
     println!("|grad action_out_proj.bias|   = {gb_norm:.4}");
-    assert!(gw_norm > 0.0 && gb_norm > 0.0, "no gradient flowed — autodiff path broken");
+    assert!(
+        gw_norm > 0.0 && gb_norm > 0.0,
+        "no gradient flowed — autodiff path broken"
+    );
     println!("✓ gradients flow into the expert weights under Autodiff<Metal> — retarget autodiff path is viable.");
 }

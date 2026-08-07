@@ -69,7 +69,13 @@ impl<B: Backend> MelExtractor<B> {
         }
         let fb = Tensor::<B, 1>::from_floats(fb.as_slice(), device).reshape([n_mels, n_freq]);
 
-        Self { kcos, ksin, fb, n_fft, hop }
+        Self {
+            kcos,
+            ksin,
+            fb,
+            n_fft,
+            hop,
+        }
     }
 
     /// wav: [1, n_samples] → log-mel [1, n_mels, n_frames] (center padding).

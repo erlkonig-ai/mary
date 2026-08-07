@@ -101,9 +101,10 @@ impl<B: Backend> MistralAttention<B> {
         let attn_output = attn_weights.matmul(v); // [B, H, L, D]
 
         // Reshape back: [B, H, L, D] -> [B, L, H*D]
-        let attn_output = attn_output
-            .swap_dims(1, 2)
-            .reshape([batch, seq_len, num_heads * head_dim]);
+        let attn_output =
+            attn_output
+                .swap_dims(1, 2)
+                .reshape([batch, seq_len, num_heads * head_dim]);
 
         // Output projection: [B, L, num_heads*head_dim] -> [B, L, hidden_size]
         linear3d(attn_output, self.o_proj_weight.clone())
@@ -129,10 +130,8 @@ impl<B: Backend> MistralAttention<B> {
                 mask_data[i * seq_len + j] = f32::NEG_INFINITY;
             }
         }
-        let mask = Tensor::<B, 2>::from_data(
-            TensorData::new(mask_data, [seq_len, seq_len]),
-            &device,
-        );
+        let mask =
+            Tensor::<B, 2>::from_data(TensorData::new(mask_data, [seq_len, seq_len]), &device);
         let mask = mask.reshape([1, 1, seq_len, seq_len]);
         attn + mask
     }

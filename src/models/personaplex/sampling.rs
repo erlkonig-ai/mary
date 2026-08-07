@@ -50,7 +50,11 @@ impl SamplingConfig {
     /// The parity default: argmax, no randomness. Equivalent to any config
     /// with `temp <= 0.0` — [`sample`] short-circuits to [`argmax`].
     pub const fn greedy() -> Self {
-        Self { temp: 0.0, top_k: 0, top_p: 1.0 }
+        Self {
+            temp: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+        }
     }
 
     /// Whether this config is the greedy (argmax) path.
@@ -98,7 +102,9 @@ pub fn sample(logits: &[f32], cfg: &SamplingConfig, rng: &mut StdRng) -> usize {
     // matching argmax: a stable sort keeps the lower index first among equals).
     let mut idx: Vec<usize> = (0..logits.len()).collect();
     idx.sort_by(|&a, &b| {
-        logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal)
+        logits[b]
+            .partial_cmp(&logits[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     // top-k: keep the k highest logits (0 = keep all).
@@ -152,7 +158,11 @@ impl Sampler {
     /// A sampler with `cfg`, RNG seeded from `seed`.
     pub fn new(cfg: SamplingConfig, seed: u64) -> Self {
         use rand::SeedableRng;
-        Self { cfg, seed, rng: StdRng::seed_from_u64(seed) }
+        Self {
+            cfg,
+            seed,
+            rng: StdRng::seed_from_u64(seed),
+        }
     }
 
     /// Sample one token id from a logit row (greedy iff `cfg.is_greedy()`).
@@ -186,7 +196,9 @@ mod tests {
         let mut s = seed;
         (0..n)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 ((s >> 33) as f32) / (1u32 << 31) as f32 - 1.0
             })
             .collect()
@@ -199,7 +211,11 @@ mod tests {
         for seed in 0..50 {
             let l = logits(2048, seed);
             let mut rng = StdRng::seed_from_u64(seed);
-            assert_eq!(sample(&l, &cfg, &mut rng), argmax(&l), "greedy != argmax seed {seed}");
+            assert_eq!(
+                sample(&l, &cfg, &mut rng),
+                argmax(&l),
+                "greedy != argmax seed {seed}"
+            );
         }
     }
 
@@ -211,7 +227,11 @@ mod tests {
     /// not a bug; the exact-argmax guarantee is the greedy flag, gated above.)
     #[test]
     fn tiny_temp_equals_argmax() {
-        let cfg = SamplingConfig { temp: 1e-4, top_k: 0, top_p: 1.0 };
+        let cfg = SamplingConfig {
+            temp: 1e-4,
+            top_k: 0,
+            top_p: 1.0,
+        };
         for seed in 0..50u64 {
             let mut l = logits(2048, seed + 999);
             // Give a clear winner (well above the [-1, 1] fixture range) so the
@@ -230,7 +250,11 @@ mod tests {
     /// is drawn. If EVERY logit is non-finite, it falls back to argmax.
     #[test]
     fn non_finite_logits_do_not_panic() {
-        let cfg = SamplingConfig { temp: 0.8, top_k: 50, top_p: 0.95 };
+        let cfg = SamplingConfig {
+            temp: 0.8,
+            top_k: 50,
+            top_p: 0.95,
+        };
         for (seed, bad) in [(1u64, f32::NAN), (2, f32::INFINITY), (3, f32::NEG_INFINITY)] {
             let mut l = logits(2048, seed);
             l[7] = bad;
@@ -239,10 +263,17 @@ mod tests {
             l[42] = 50.0; // a clear finite winner
             let mut rng = StdRng::seed_from_u64(seed);
             let got = sample(&l, &cfg, &mut rng); // must not panic
-            assert!(l[got].is_finite(), "sampled a non-finite index (seed {seed})");
+            assert!(
+                l[got].is_finite(),
+                "sampled a non-finite index (seed {seed})"
+            );
         }
         // All non-finite -> argmax fallback (no panic).
-        let cfg = SamplingConfig { temp: 1.0, top_k: 0, top_p: 1.0 };
+        let cfg = SamplingConfig {
+            temp: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+        };
         let mut rng = StdRng::seed_from_u64(0);
         let _ = sample(&vec![f32::NAN; 16], &cfg, &mut rng); // must not panic
     }
@@ -250,13 +281,23 @@ mod tests {
     /// Same seed → same token sequence across two independent runs.
     #[test]
     fn seeded_is_deterministic() {
-        let cfg = SamplingConfig { temp: 1.0, top_k: 64, top_p: 0.95 };
+        let cfg = SamplingConfig {
+            temp: 1.0,
+            top_k: 64,
+            top_p: 0.95,
+        };
         let l = logits(2048, 7);
         let draw = |seed: u64| {
             let mut rng = StdRng::seed_from_u64(seed);
-            (0..100).map(|_| sample(&l, &cfg, &mut rng)).collect::<Vec<_>>()
+            (0..100)
+                .map(|_| sample(&l, &cfg, &mut rng))
+                .collect::<Vec<_>>()
         };
-        assert_eq!(draw(42), draw(42), "same seed must reproduce the token stream");
+        assert_eq!(
+            draw(42),
+            draw(42),
+            "same seed must reproduce the token stream"
+        );
         // And a different seed generally diverges (guards against a constant).
         assert_ne!(draw(42), draw(43), "different seeds should diverge");
     }
@@ -265,7 +306,11 @@ mod tests {
     #[test]
     fn top_k_truncates() {
         let k = 8;
-        let cfg = SamplingConfig { temp: 2.0, top_k: k, top_p: 1.0 };
+        let cfg = SamplingConfig {
+            temp: 2.0,
+            top_k: k,
+            top_p: 1.0,
+        };
         let l = logits(2048, 3);
         // The k highest logit indices.
         let mut idx: Vec<usize> = (0..l.len()).collect();
@@ -284,10 +329,18 @@ mod tests {
         // A row with one dominant logit: nucleus 0.5 must always pick it.
         let mut l = vec![0.0f32; 2048];
         l[123] = 20.0; // softmax mass ≈ 1.0 on index 123
-        let cfg = SamplingConfig { temp: 1.0, top_k: 0, top_p: 0.5 };
+        let cfg = SamplingConfig {
+            temp: 1.0,
+            top_k: 0,
+            top_p: 0.5,
+        };
         let mut rng = StdRng::seed_from_u64(5);
         for _ in 0..500 {
-            assert_eq!(sample(&l, &cfg, &mut rng), 123, "nucleus should collapse to the peak");
+            assert_eq!(
+                sample(&l, &cfg, &mut rng),
+                123,
+                "nucleus should collapse to the peak"
+            );
         }
     }
 
@@ -295,7 +348,11 @@ mod tests {
     /// degenerate argmax-in-disguise) — sanity that randomness is live.
     #[test]
     fn wide_sampling_is_nondegenerate() {
-        let cfg = SamplingConfig { temp: 1.5, top_k: 128, top_p: 1.0 };
+        let cfg = SamplingConfig {
+            temp: 1.5,
+            top_k: 128,
+            top_p: 1.0,
+        };
         let l = logits(2048, 11);
         let mut rng = StdRng::seed_from_u64(2);
         let seen: std::collections::HashSet<usize> =

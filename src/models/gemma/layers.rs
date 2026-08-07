@@ -1,7 +1,7 @@
 //! Core transformer layers: RMSNorm, SwiGLU FFN, GQA Attention, KV Cache.
 
-use burn::prelude::*;
 use burn::nn::{Linear, LinearConfig};
+use burn::prelude::*;
 
 use crate::models::gemma::config::MistralConfig;
 use crate::models::gemma::rope::RopeTable;
@@ -94,22 +94,34 @@ pub struct QuantConfig {
 impl QuantConfig {
     /// Int8 quantization (4x compression, simplest).
     pub fn int8() -> Self {
-        Self { bits: QuantBits::Int8, residual_bits: false }
+        Self {
+            bits: QuantBits::Int8,
+            residual_bits: false,
+        }
     }
 
     /// Int4 quantization (8x compression).
     pub fn int4() -> Self {
-        Self { bits: QuantBits::Int4, residual_bits: false }
+        Self {
+            bits: QuantBits::Int4,
+            residual_bits: false,
+        }
     }
 
     /// Int8 with 1-bit residual sign correction (TurboQuant-style).
     pub fn int8_residual() -> Self {
-        Self { bits: QuantBits::Int8, residual_bits: true }
+        Self {
+            bits: QuantBits::Int8,
+            residual_bits: true,
+        }
     }
 
     /// Int4 with 1-bit residual sign correction (TurboQuant-style).
     pub fn int4_residual() -> Self {
-        Self { bits: QuantBits::Int4, residual_bits: true }
+        Self {
+            bits: QuantBits::Int4,
+            residual_bits: true,
+        }
     }
 
     fn max_int(&self) -> f32 {
@@ -134,7 +146,11 @@ impl QuantConfig {
             QuantBits::Int8 => 8.0,
             QuantBits::Int4 => 4.0,
         };
-        if self.residual_bits { base + 1.0 } else { base }
+        if self.residual_bits {
+            base + 1.0
+        } else {
+            base
+        }
     }
 }
 
@@ -188,8 +204,12 @@ impl QuantizedTensor {
                     let mut min_val = f32::INFINITY;
                     let mut max_val = f32::NEG_INFINITY;
                     for &v in group {
-                        if v < min_val { min_val = v; }
-                        if v > max_val { max_val = v; }
+                        if v < min_val {
+                            min_val = v;
+                        }
+                        if v > max_val {
+                            max_val = v;
+                        }
                     }
 
                     let range = max_val - min_val;
@@ -216,8 +236,12 @@ impl QuantizedTensor {
                     let mut min_val = f32::INFINITY;
                     let mut max_val = f32::NEG_INFINITY;
                     for &v in group {
-                        if v < min_val { min_val = v; }
-                        if v > max_val { max_val = v; }
+                        if v < min_val {
+                            min_val = v;
+                        }
+                        if v > max_val {
+                            max_val = v;
+                        }
                     }
 
                     let range = max_val - min_val;
@@ -231,7 +255,9 @@ impl QuantizedTensor {
                     while i < head_dim {
                         let hi = ((group[i] - min_val) / scale).round().clamp(0.0, max_int) as u8;
                         let lo = if i + 1 < head_dim {
-                            ((group[i + 1] - min_val) / scale).round().clamp(0.0, max_int) as u8
+                            ((group[i + 1] - min_val) / scale)
+                                .round()
+                                .clamp(0.0, max_int) as u8
                         } else {
                             0
                         };
@@ -314,9 +340,7 @@ impl QuantizedTensor {
 
             for d in 0..head_dim {
                 let q_val = match self.config.bits {
-                    QuantBits::Int8 => {
-                        self.data[g * head_dim + d] as f32
-                    }
+                    QuantBits::Int8 => self.data[g * head_dim + d] as f32,
                     QuantBits::Int4 => {
                         let byte_idx = g * ((head_dim + 1) / 2) + d / 2;
                         if d % 2 == 0 {
@@ -330,8 +354,7 @@ impl QuantizedTensor {
                 let mut val = q_val * scale + zero;
 
                 // Apply residual sign correction
-                if let (Some(ref signs), Some(ref rscales)) =
-                    (&self.residual, &self.residual_scale)
+                if let (Some(ref signs), Some(ref rscales)) = (&self.residual, &self.residual_scale)
                 {
                     let flat_idx = g * head_dim + d;
                     let sign_bit = (signs[flat_idx / 8] >> (flat_idx % 8)) & 1;
@@ -413,42 +436,49 @@ impl<B: Backend> QuantizedKvCache<B> {
         // Merge with existing cache data, then re-quantize the full sequence.
         // This is simpler than appending to quantized storage and avoids
         // dealing with packed format concatenation.
-        let (full_k_data, full_v_data, total_len) = if let (Some(prev_k), Some(prev_v)) =
-            (self.k.take(), self.v.take())
-        {
-            let prev_len = prev_k.shape[2];
-            let total = prev_len + new_len;
+        let (full_k_data, full_v_data, total_len) =
+            if let (Some(prev_k), Some(prev_v)) = (self.k.take(), self.v.take()) {
+                let prev_len = prev_k.shape[2];
+                let total = prev_len + new_len;
 
-            // Dequantize previous cache
-            let prev_k_data = prev_k.dequantize();
-            let prev_v_data = prev_v.dequantize();
+                // Dequantize previous cache
+                let prev_k_data = prev_k.dequantize();
+                let prev_v_data = prev_v.dequantize();
 
-            // Interleave: for each [batch, head], append new seq positions after old ones.
-            // Both are in [batch, n_heads, seq_len, head_dim] row-major order.
-            // We need to insert new_len * head_dim values after each prev_len * head_dim block.
-            let mut merged_k = Vec::with_capacity(batch * n_heads * total * head_dim);
-            let mut merged_v = Vec::with_capacity(batch * n_heads * total * head_dim);
+                // Interleave: for each [batch, head], append new seq positions after old ones.
+                // Both are in [batch, n_heads, seq_len, head_dim] row-major order.
+                // We need to insert new_len * head_dim values after each prev_len * head_dim block.
+                let mut merged_k = Vec::with_capacity(batch * n_heads * total * head_dim);
+                let mut merged_v = Vec::with_capacity(batch * n_heads * total * head_dim);
 
-            for b in 0..batch {
-                for h in 0..n_heads {
-                    // Previous positions for this [batch, head]
-                    let prev_offset = (b * n_heads + h) * prev_len * head_dim;
-                    merged_k.extend_from_slice(&prev_k_data[prev_offset..prev_offset + prev_len * head_dim]);
-                    // New positions for this [batch, head]
-                    let new_offset = (b * n_heads + h) * new_len * head_dim;
-                    merged_k.extend_from_slice(&new_k_data[new_offset..new_offset + new_len * head_dim]);
+                for b in 0..batch {
+                    for h in 0..n_heads {
+                        // Previous positions for this [batch, head]
+                        let prev_offset = (b * n_heads + h) * prev_len * head_dim;
+                        merged_k.extend_from_slice(
+                            &prev_k_data[prev_offset..prev_offset + prev_len * head_dim],
+                        );
+                        // New positions for this [batch, head]
+                        let new_offset = (b * n_heads + h) * new_len * head_dim;
+                        merged_k.extend_from_slice(
+                            &new_k_data[new_offset..new_offset + new_len * head_dim],
+                        );
 
-                    let prev_offset_v = (b * n_heads + h) * prev_len * head_dim;
-                    merged_v.extend_from_slice(&prev_v_data[prev_offset_v..prev_offset_v + prev_len * head_dim]);
-                    let new_offset_v = (b * n_heads + h) * new_len * head_dim;
-                    merged_v.extend_from_slice(&new_v_data[new_offset_v..new_offset_v + new_len * head_dim]);
+                        let prev_offset_v = (b * n_heads + h) * prev_len * head_dim;
+                        merged_v.extend_from_slice(
+                            &prev_v_data[prev_offset_v..prev_offset_v + prev_len * head_dim],
+                        );
+                        let new_offset_v = (b * n_heads + h) * new_len * head_dim;
+                        merged_v.extend_from_slice(
+                            &new_v_data[new_offset_v..new_offset_v + new_len * head_dim],
+                        );
+                    }
                 }
-            }
 
-            (merged_k, merged_v, total)
-        } else {
-            (new_k_data, new_v_data, new_len)
-        };
+                (merged_k, merged_v, total)
+            } else {
+                (new_k_data, new_v_data, new_len)
+            };
 
         let shape = [batch, n_heads, total_len, head_dim];
 
@@ -566,36 +596,43 @@ impl<B: Backend> TurboQuantKvCache<B> {
         let new_v_data: Vec<f32> = new_v.to_data().to_vec().unwrap();
 
         // Merge with existing cache data then re-quantize
-        let (full_k_data, full_v_data, total_len) = if let (Some(prev_k), Some(prev_v)) =
-            (self.k.take(), self.v.take())
-        {
-            let prev_len = prev_k.shape[2];
-            let total = prev_len + new_len;
+        let (full_k_data, full_v_data, total_len) =
+            if let (Some(prev_k), Some(prev_v)) = (self.k.take(), self.v.take()) {
+                let prev_len = prev_k.shape[2];
+                let total = prev_len + new_len;
 
-            let prev_k_data = self.ctx.dequantize(&prev_k);
-            let prev_v_data = self.ctx.dequantize(&prev_v);
+                let prev_k_data = self.ctx.dequantize(&prev_k);
+                let prev_v_data = self.ctx.dequantize(&prev_v);
 
-            let mut merged_k = Vec::with_capacity(batch * n_heads * total * head_dim);
-            let mut merged_v = Vec::with_capacity(batch * n_heads * total * head_dim);
+                let mut merged_k = Vec::with_capacity(batch * n_heads * total * head_dim);
+                let mut merged_v = Vec::with_capacity(batch * n_heads * total * head_dim);
 
-            for b in 0..batch {
-                for h in 0..n_heads {
-                    let prev_offset = (b * n_heads + h) * prev_len * head_dim;
-                    merged_k.extend_from_slice(&prev_k_data[prev_offset..prev_offset + prev_len * head_dim]);
-                    let new_offset = (b * n_heads + h) * new_len * head_dim;
-                    merged_k.extend_from_slice(&new_k_data[new_offset..new_offset + new_len * head_dim]);
+                for b in 0..batch {
+                    for h in 0..n_heads {
+                        let prev_offset = (b * n_heads + h) * prev_len * head_dim;
+                        merged_k.extend_from_slice(
+                            &prev_k_data[prev_offset..prev_offset + prev_len * head_dim],
+                        );
+                        let new_offset = (b * n_heads + h) * new_len * head_dim;
+                        merged_k.extend_from_slice(
+                            &new_k_data[new_offset..new_offset + new_len * head_dim],
+                        );
 
-                    let prev_offset_v = (b * n_heads + h) * prev_len * head_dim;
-                    merged_v.extend_from_slice(&prev_v_data[prev_offset_v..prev_offset_v + prev_len * head_dim]);
-                    let new_offset_v = (b * n_heads + h) * new_len * head_dim;
-                    merged_v.extend_from_slice(&new_v_data[new_offset_v..new_offset_v + new_len * head_dim]);
+                        let prev_offset_v = (b * n_heads + h) * prev_len * head_dim;
+                        merged_v.extend_from_slice(
+                            &prev_v_data[prev_offset_v..prev_offset_v + prev_len * head_dim],
+                        );
+                        let new_offset_v = (b * n_heads + h) * new_len * head_dim;
+                        merged_v.extend_from_slice(
+                            &new_v_data[new_offset_v..new_offset_v + new_len * head_dim],
+                        );
+                    }
                 }
-            }
 
-            (merged_k, merged_v, total)
-        } else {
-            (new_k_data, new_v_data, new_len)
-        };
+                (merged_k, merged_v, total)
+            } else {
+                (new_k_data, new_v_data, new_len)
+            };
 
         let shape = [batch, n_heads, total_len, head_dim];
 
@@ -624,8 +661,13 @@ impl<B: Backend> TurboQuantKvCache<B> {
 
     /// Approximate memory usage in bytes for the cached K+V data.
     pub fn memory_bytes(&self) -> usize {
-        self.k.as_ref().map_or(0, |t| TurboQuantCtx::memory_bytes(t))
-            + self.v.as_ref().map_or(0, |t| TurboQuantCtx::memory_bytes(t))
+        self.k
+            .as_ref()
+            .map_or(0, |t| TurboQuantCtx::memory_bytes(t))
+            + self
+                .v
+                .as_ref()
+                .map_or(0, |t| TurboQuantCtx::memory_bytes(t))
     }
 
     /// What the equivalent uncompressed f32 KV cache would use in bytes.
@@ -693,7 +735,11 @@ impl<B: Backend> SwiGluFfn<B> {
             .with_bias(false)
             .init(device);
 
-        Self { gate_proj, up_proj, down_proj }
+        Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+        }
     }
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
@@ -728,13 +774,24 @@ impl<B: Backend> GqaAttention<B> {
         let q_dim = config.n_heads * config.head_dim;
         let kv_dim = config.n_kv_heads * config.head_dim;
 
-        let q_proj = LinearConfig::new(config.hidden_dim, q_dim).with_bias(false).init(device);
-        let k_proj = LinearConfig::new(config.hidden_dim, kv_dim).with_bias(false).init(device);
-        let v_proj = LinearConfig::new(config.hidden_dim, kv_dim).with_bias(false).init(device);
-        let o_proj = LinearConfig::new(q_dim, config.hidden_dim).with_bias(false).init(device);
+        let q_proj = LinearConfig::new(config.hidden_dim, q_dim)
+            .with_bias(false)
+            .init(device);
+        let k_proj = LinearConfig::new(config.hidden_dim, kv_dim)
+            .with_bias(false)
+            .init(device);
+        let v_proj = LinearConfig::new(config.hidden_dim, kv_dim)
+            .with_bias(false)
+            .init(device);
+        let o_proj = LinearConfig::new(q_dim, config.hidden_dim)
+            .with_bias(false)
+            .init(device);
 
         Self {
-            q_proj, k_proj, v_proj, o_proj,
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
             q_norm: None,
             k_norm: None,
             n_heads: config.n_heads,
@@ -760,12 +817,7 @@ impl<B: Backend> GqaAttention<B> {
     /// Forward pass with RoPE (no cache — recomputes everything).
     /// x: [batch, seq_len, hidden_dim]
     /// Returns: [batch, seq_len, hidden_dim]
-    pub fn forward(
-        &self,
-        x: Tensor<B, 3>,
-        rope: &RopeTable<B>,
-        offset: usize,
-    ) -> Tensor<B, 3> {
+    pub fn forward(&self, x: Tensor<B, 3>, rope: &RopeTable<B>, offset: usize) -> Tensor<B, 3> {
         let [batch, seq_len, _] = x.dims();
 
         // Project to Q, K, V
@@ -774,11 +826,14 @@ impl<B: Backend> GqaAttention<B> {
         let v = self.v_proj.forward(x);
 
         // Reshape to [batch, n_heads, seq_len, head_dim]
-        let q = q.reshape([batch, seq_len, self.n_heads, self.head_dim])
+        let q = q
+            .reshape([batch, seq_len, self.n_heads, self.head_dim])
             .swap_dims(1, 2);
-        let k = k.reshape([batch, seq_len, self.n_kv_heads, self.head_dim])
+        let k = k
+            .reshape([batch, seq_len, self.n_kv_heads, self.head_dim])
             .swap_dims(1, 2);
-        let v = v.reshape([batch, seq_len, self.n_kv_heads, self.head_dim])
+        let v = v
+            .reshape([batch, seq_len, self.n_kv_heads, self.head_dim])
             .swap_dims(1, 2);
 
         // Optional per-head QK-norm (Qwen3)
@@ -804,7 +859,8 @@ impl<B: Backend> GqaAttention<B> {
         let out = attn.matmul(v);
 
         // Reshape back to [batch, seq_len, hidden_dim]
-        let out = out.swap_dims(1, 2)
+        let out = out
+            .swap_dims(1, 2)
             .reshape([batch, seq_len, self.n_heads * self.head_dim]);
 
         self.o_proj.forward(out)
@@ -830,11 +886,14 @@ impl<B: Backend> GqaAttention<B> {
         let v = self.v_proj.forward(x);
 
         // Reshape to [batch, n_heads, new_len, head_dim]
-        let q = q.reshape([batch, new_len, self.n_heads, self.head_dim])
+        let q = q
+            .reshape([batch, new_len, self.n_heads, self.head_dim])
             .swap_dims(1, 2);
-        let k = k.reshape([batch, new_len, self.n_kv_heads, self.head_dim])
+        let k = k
+            .reshape([batch, new_len, self.n_kv_heads, self.head_dim])
             .swap_dims(1, 2);
-        let v = v.reshape([batch, new_len, self.n_kv_heads, self.head_dim])
+        let v = v
+            .reshape([batch, new_len, self.n_kv_heads, self.head_dim])
             .swap_dims(1, 2);
 
         // Optional per-head QK-norm (Qwen3)
@@ -859,20 +918,35 @@ impl<B: Backend> GqaAttention<B> {
         let out = if new_len > 1 {
             // Prefill: flash attention with causal mask.
             burn::tensor::module::attention(
-                q, full_k, full_v, None, None,
-                burn::tensor::ops::AttentionModuleOptions { is_causal: true, ..Default::default() },
+                q,
+                full_k,
+                full_v,
+                None,
+                None,
+                burn::tensor::ops::AttentionModuleOptions {
+                    is_causal: true,
+                    ..Default::default()
+                },
             )
         } else {
             // Decode: flash attention WITHOUT causal mask.
             // Single query attends to all cached positions.
             burn::tensor::module::attention(
-                q, full_k, full_v, None, None,
-                burn::tensor::ops::AttentionModuleOptions { is_causal: false, ..Default::default() },
+                q,
+                full_k,
+                full_v,
+                None,
+                None,
+                burn::tensor::ops::AttentionModuleOptions {
+                    is_causal: false,
+                    ..Default::default()
+                },
             )
         };
 
         // Reshape back to [batch, new_len, hidden_dim]
-        let out = out.swap_dims(1, 2)
+        let out = out
+            .swap_dims(1, 2)
             .reshape([batch, new_len, self.n_heads * self.head_dim]);
 
         self.o_proj.forward(out)
@@ -895,11 +969,14 @@ impl<B: Backend> GqaAttention<B> {
         let v = self.v_proj.forward(x);
 
         // Reshape to [batch, n_heads, new_len, head_dim]
-        let q = q.reshape([batch, new_len, self.n_heads, self.head_dim])
+        let q = q
+            .reshape([batch, new_len, self.n_heads, self.head_dim])
             .swap_dims(1, 2);
-        let k = k.reshape([batch, new_len, self.n_kv_heads, self.head_dim])
+        let k = k
+            .reshape([batch, new_len, self.n_kv_heads, self.head_dim])
             .swap_dims(1, 2);
-        let v = v.reshape([batch, new_len, self.n_kv_heads, self.head_dim])
+        let v = v
+            .reshape([batch, new_len, self.n_kv_heads, self.head_dim])
             .swap_dims(1, 2);
 
         let (q, k) = self.apply_qk_norm(q, k);
@@ -930,7 +1007,8 @@ impl<B: Backend> GqaAttention<B> {
         let attn = burn::tensor::activation::softmax(attn, 3);
         let out = attn.matmul(full_v);
 
-        let out = out.swap_dims(1, 2)
+        let out = out
+            .swap_dims(1, 2)
             .reshape([batch, new_len, self.n_heads * self.head_dim]);
 
         self.o_proj.forward(out)
@@ -950,11 +1028,14 @@ impl<B: Backend> GqaAttention<B> {
         let k = self.k_proj.forward(x.clone());
         let v = self.v_proj.forward(x);
 
-        let q = q.reshape([batch, new_len, self.n_heads, self.head_dim])
+        let q = q
+            .reshape([batch, new_len, self.n_heads, self.head_dim])
             .swap_dims(1, 2);
-        let k = k.reshape([batch, new_len, self.n_kv_heads, self.head_dim])
+        let k = k
+            .reshape([batch, new_len, self.n_kv_heads, self.head_dim])
             .swap_dims(1, 2);
-        let v = v.reshape([batch, new_len, self.n_kv_heads, self.head_dim])
+        let v = v
+            .reshape([batch, new_len, self.n_kv_heads, self.head_dim])
             .swap_dims(1, 2);
 
         let (q, k) = self.apply_qk_norm(q, k);
@@ -981,7 +1062,8 @@ impl<B: Backend> GqaAttention<B> {
         let attn = burn::tensor::activation::softmax(attn, 3);
         let out = attn.matmul(full_v);
 
-        let out = out.swap_dims(1, 2)
+        let out = out
+            .swap_dims(1, 2)
             .reshape([batch, new_len, self.n_heads * self.head_dim]);
 
         self.o_proj.forward(out)
@@ -1005,11 +1087,14 @@ impl<B: Backend> GqaAttention<B> {
         let k = self.k_proj.forward(x.clone());
         let v = self.v_proj.forward(x);
 
-        let q = q.reshape([batch, new_len, self.n_heads, self.head_dim])
+        let q = q
+            .reshape([batch, new_len, self.n_heads, self.head_dim])
             .swap_dims(1, 2);
-        let k = k.reshape([batch, new_len, self.n_kv_heads, self.head_dim])
+        let k = k
+            .reshape([batch, new_len, self.n_kv_heads, self.head_dim])
             .swap_dims(1, 2);
-        let v = v.reshape([batch, new_len, self.n_kv_heads, self.head_dim])
+        let v = v
+            .reshape([batch, new_len, self.n_kv_heads, self.head_dim])
             .swap_dims(1, 2);
 
         let (q, k) = self.apply_qk_norm(q, k);
@@ -1036,7 +1121,8 @@ impl<B: Backend> GqaAttention<B> {
         let attn = burn::tensor::activation::softmax(attn, 3);
         let out = attn.matmul(full_v);
 
-        let out = out.swap_dims(1, 2)
+        let out = out
+            .swap_dims(1, 2)
             .reshape([batch, new_len, self.n_heads * self.head_dim]);
 
         self.o_proj.forward(out)
@@ -1061,11 +1147,14 @@ impl<B: Backend> GqaAttention<B> {
         let k = self.k_proj.forward(x.clone());
         let v = self.v_proj.forward(x);
 
-        let q = q.reshape([batch, new_len, self.n_heads, self.head_dim])
+        let q = q
+            .reshape([batch, new_len, self.n_heads, self.head_dim])
             .swap_dims(1, 2);
-        let k = k.reshape([batch, new_len, self.n_kv_heads, self.head_dim])
+        let k = k
+            .reshape([batch, new_len, self.n_kv_heads, self.head_dim])
             .swap_dims(1, 2);
-        let v = v.reshape([batch, new_len, self.n_kv_heads, self.head_dim])
+        let v = v
+            .reshape([batch, new_len, self.n_kv_heads, self.head_dim])
             .swap_dims(1, 2);
 
         let (q, k) = self.apply_qk_norm(q, k);
@@ -1092,7 +1181,8 @@ impl<B: Backend> GqaAttention<B> {
         let attn = burn::tensor::activation::softmax(attn, 3);
         let out = attn.matmul(full_v);
 
-        let out = out.swap_dims(1, 2)
+        let out = out
+            .swap_dims(1, 2)
             .reshape([batch, new_len, self.n_heads * self.head_dim]);
 
         self.o_proj.forward(out)
@@ -1100,7 +1190,9 @@ impl<B: Backend> GqaAttention<B> {
 
     /// Repeat KV heads to match query heads for GQA.
     fn repeat_kv(x: Tensor<B, 4>, n_rep: usize) -> Tensor<B, 4> {
-        if n_rep == 1 { return x; }
+        if n_rep == 1 {
+            return x;
+        }
         let [batch, n_kv_heads, seq_len, head_dim] = x.dims();
         x.unsqueeze_dim::<5>(2)
             .expand([batch, n_kv_heads, n_rep, seq_len, head_dim])
@@ -1109,13 +1201,19 @@ impl<B: Backend> GqaAttention<B> {
 
     /// Apply causal attention mask (for full-sequence forward without cache).
     fn causal_mask(attn: Tensor<B, 4>, seq_len: usize, _offset: usize) -> Tensor<B, 4> {
-        if seq_len <= 1 { return attn; }
+        if seq_len <= 1 {
+            return attn;
+        }
         let device = attn.device();
         // Build mask row by row to avoid shape ambiguity
-        let rows: Vec<Tensor<B, 2>> = (0..seq_len).map(|i| {
-            let row: Vec<f32> = (0..seq_len).map(|j| if j <= i { 0.0 } else { f32::NEG_INFINITY }).collect();
-            Tensor::<B, 1>::from_floats(&row[..], &device).unsqueeze::<2>()
-        }).collect();
+        let rows: Vec<Tensor<B, 2>> = (0..seq_len)
+            .map(|i| {
+                let row: Vec<f32> = (0..seq_len)
+                    .map(|j| if j <= i { 0.0 } else { f32::NEG_INFINITY })
+                    .collect();
+                Tensor::<B, 1>::from_floats(&row[..], &device).unsqueeze::<2>()
+            })
+            .collect();
         let mask = Tensor::<B, 2>::cat(rows, 0) // [seq_len, seq_len]
             .reshape([1, 1, seq_len, seq_len]);
         attn + mask
@@ -1132,15 +1230,22 @@ impl<B: Backend> GqaAttention<B> {
         offset: usize,
     ) -> Tensor<B, 4> {
         let device = attn.device();
-        let rows: Vec<Tensor<B, 2>> = (0..new_len).map(|i| {
-            let query_pos = offset + i;
-            let row: Vec<f32> = (0..total_len).map(|j| {
-                if j <= query_pos { 0.0 } else { f32::NEG_INFINITY }
-            }).collect();
-            Tensor::<B, 1>::from_floats(&row[..], &device).unsqueeze::<2>()
-        }).collect();
-        let mask = Tensor::<B, 2>::cat(rows, 0)
-            .reshape([1, 1, new_len, total_len]);
+        let rows: Vec<Tensor<B, 2>> = (0..new_len)
+            .map(|i| {
+                let query_pos = offset + i;
+                let row: Vec<f32> = (0..total_len)
+                    .map(|j| {
+                        if j <= query_pos {
+                            0.0
+                        } else {
+                            f32::NEG_INFINITY
+                        }
+                    })
+                    .collect();
+                Tensor::<B, 1>::from_floats(&row[..], &device).unsqueeze::<2>()
+            })
+            .collect();
+        let mask = Tensor::<B, 2>::cat(rows, 0).reshape([1, 1, new_len, total_len]);
         attn + mask
     }
 }
@@ -1160,8 +1265,7 @@ pub struct TransformerLayer<B: Backend> {
 
 impl<B: Backend> TransformerLayer<B> {
     pub fn new(config: &MistralConfig, device: &B::Device) -> Self {
-        let norm_config = RmsNormConfig::new(config.hidden_dim)
-            .with_epsilon(config.rms_norm_eps);
+        let norm_config = RmsNormConfig::new(config.hidden_dim).with_epsilon(config.rms_norm_eps);
         Self {
             attn_norm: norm_config.init(device),
             attention: GqaAttention::new(config, device),
@@ -1171,18 +1275,12 @@ impl<B: Backend> TransformerLayer<B> {
     }
 
     /// Forward pass without KV cache (recomputes everything).
-    pub fn forward(
-        &self,
-        x: Tensor<B, 3>,
-        rope: &RopeTable<B>,
-        offset: usize,
-    ) -> Tensor<B, 3> {
+    pub fn forward(&self, x: Tensor<B, 3>, rope: &RopeTable<B>, offset: usize) -> Tensor<B, 3> {
         // Pre-norm attention with residual
-        let h = x.clone() + self.attention.forward(
-            self.attn_norm.forward(x.clone()),
-            rope,
-            offset,
-        );
+        let h = x.clone()
+            + self
+                .attention
+                .forward(self.attn_norm.forward(x.clone()), rope, offset);
         // Pre-norm FFN with residual
         h.clone() + self.ffn.forward(self.ffn_norm.forward(h))
     }
@@ -1195,11 +1293,10 @@ impl<B: Backend> TransformerLayer<B> {
         cache: &mut KvCache<B>,
     ) -> Tensor<B, 3> {
         // Pre-norm attention with residual
-        let h = x.clone() + self.attention.forward_cached(
-            self.attn_norm.forward(x.clone()),
-            rope,
-            cache,
-        );
+        let h = x.clone()
+            + self
+                .attention
+                .forward_cached(self.attn_norm.forward(x.clone()), rope, cache);
         // Pre-norm FFN with residual
         h.clone() + self.ffn.forward(self.ffn_norm.forward(h))
     }
@@ -1212,11 +1309,12 @@ impl<B: Backend> TransformerLayer<B> {
         cache: &mut QuantizedKvCache<B>,
     ) -> Tensor<B, 3> {
         // Pre-norm attention with residual
-        let h = x.clone() + self.attention.forward_quantized_cached(
-            self.attn_norm.forward(x.clone()),
-            rope,
-            cache,
-        );
+        let h = x.clone()
+            + self.attention.forward_quantized_cached(
+                self.attn_norm.forward(x.clone()),
+                rope,
+                cache,
+            );
         // Pre-norm FFN with residual
         h.clone() + self.ffn.forward(self.ffn_norm.forward(h))
     }
@@ -1228,11 +1326,10 @@ impl<B: Backend> TransformerLayer<B> {
         rope: &RopeTable<B>,
         cache: &mut TurboQuantKvCache<B>,
     ) -> Tensor<B, 3> {
-        let h = x.clone() + self.attention.forward_turbo_cached(
-            self.attn_norm.forward(x.clone()),
-            rope,
-            cache,
-        );
+        let h = x.clone()
+            + self
+                .attention
+                .forward_turbo_cached(self.attn_norm.forward(x.clone()), rope, cache);
         h.clone() + self.ffn.forward(self.ffn_norm.forward(h))
     }
 
@@ -1246,11 +1343,12 @@ impl<B: Backend> TransformerLayer<B> {
     where
         B: Backend<IntElem = i32>,
     {
-        let h = x.clone() + self.attention.forward_gpu_quant_cached(
-            self.attn_norm.forward(x.clone()),
-            rope,
-            cache,
-        );
+        let h = x.clone()
+            + self.attention.forward_gpu_quant_cached(
+                self.attn_norm.forward(x.clone()),
+                rope,
+                cache,
+            );
         h.clone() + self.ffn.forward(self.ffn_norm.forward(h))
     }
 
@@ -1264,11 +1362,12 @@ impl<B: Backend> TransformerLayer<B> {
     where
         B: Backend<IntElem = i32>,
     {
-        let h = x.clone() + self.attention.forward_gpu_turbo_cached(
-            self.attn_norm.forward(x.clone()),
-            rope,
-            cache,
-        );
+        let h = x.clone()
+            + self.attention.forward_gpu_turbo_cached(
+                self.attn_norm.forward(x.clone()),
+                rope,
+                cache,
+            );
         h.clone() + self.ffn.forward(self.ffn_norm.forward(h))
     }
 }
@@ -1287,16 +1386,11 @@ mod tests {
         // Simulate a [1, 2, 3, 4] shaped tensor (batch=1, heads=2, seq=3, head_dim=4)
         let data: Vec<f32> = vec![
             // head 0, pos 0
-            -1.0, 0.5, 2.0, -0.3,
-            // head 0, pos 1
-            0.0, 0.0, 0.0, 0.0,
-            // head 0, pos 2
-            1.0, 1.0, 1.0, 1.0,
-            // head 1, pos 0
-            -10.0, 10.0, 5.0, -5.0,
-            // head 1, pos 1
-            0.1, 0.2, 0.3, 0.4,
-            // head 1, pos 2
+            -1.0, 0.5, 2.0, -0.3, // head 0, pos 1
+            0.0, 0.0, 0.0, 0.0, // head 0, pos 2
+            1.0, 1.0, 1.0, 1.0, // head 1, pos 0
+            -10.0, 10.0, 5.0, -5.0, // head 1, pos 1
+            0.1, 0.2, 0.3, 0.4, // head 1, pos 2
             100.0, -100.0, 0.0, 50.0,
         ];
         let shape = [1, 2, 3, 4];
@@ -1312,7 +1406,13 @@ mod tests {
             let err = (orig - recon).abs();
             // Generous bound: for the widest range group [-100, 100],
             // step size = 200/255 ≈ 0.78. Allow 1.0 max error.
-            assert!(err < 1.0, "Int8 roundtrip error too large: orig={}, recon={}, err={}", orig, recon, err);
+            assert!(
+                err < 1.0,
+                "Int8 roundtrip error too large: orig={}, recon={}, err={}",
+                orig,
+                recon,
+                err
+            );
         }
 
         // Check the all-zeros group roundtrips exactly
@@ -1325,7 +1425,7 @@ mod tests {
     #[test]
     fn test_int4_roundtrip() {
         let data: Vec<f32> = vec![
-            0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0,  // head 0, pos 0
+            0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, // head 0, pos 0
             -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5, // head 0, pos 1
         ];
         let shape = [1, 1, 2, 8];
@@ -1339,7 +1439,13 @@ mod tests {
         // Group 0: range=7, step=7/15≈0.467. Group 1: range=3.5, step=3.5/15≈0.233.
         for (orig, recon) in data.iter().zip(deq.iter()) {
             let err = (orig - recon).abs();
-            assert!(err < 0.5, "Int4 roundtrip error too large: orig={}, recon={}, err={}", orig, recon, err);
+            assert!(
+                err < 0.5,
+                "Int4 roundtrip error too large: orig={}, recon={}, err={}",
+                orig,
+                recon,
+                err
+            );
         }
     }
 
@@ -1359,13 +1465,19 @@ mod tests {
         let deq_with_res = qt_with_res.dequantize();
 
         // Compute MSE for each
-        let mse_no_res: f32 = data.iter().zip(deq_no_res.iter())
+        let mse_no_res: f32 = data
+            .iter()
+            .zip(deq_no_res.iter())
             .map(|(a, b)| (a - b).powi(2))
-            .sum::<f32>() / data.len() as f32;
+            .sum::<f32>()
+            / data.len() as f32;
 
-        let mse_with_res: f32 = data.iter().zip(deq_with_res.iter())
+        let mse_with_res: f32 = data
+            .iter()
+            .zip(deq_with_res.iter())
             .map(|(a, b)| (a - b).powi(2))
-            .sum::<f32>() / data.len() as f32;
+            .sum::<f32>()
+            / data.len() as f32;
 
         // Residual correction should not make things worse
         // (it might not always help for every distribution, but for uniform-ish data it should)

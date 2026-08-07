@@ -13,21 +13,21 @@
 //! safetensors loading.
 
 pub mod config;
-pub mod rope;
-pub mod layers;
 pub mod decoder;
-pub mod weights;
-pub mod turbo_quant;
-pub mod gpu_quant;
-pub mod metal_device;
 pub mod dyntensor;
 pub mod gemma4;
+pub mod gpu_quant;
+pub mod layers;
 pub mod lora;
+pub mod metal_device;
+pub mod rope;
+pub mod turbo_quant;
+pub mod weights;
 
 // Re-export KV cache types for convenience.
-pub use layers::{KvCache, LayerCaches};
-pub use layers::{QuantizedKvCache, QuantizedLayerCaches, QuantConfig, QuantBits};
-pub use turbo_quant::{TurboQuantConfig, TurboQuantCtx};
-pub use layers::{TurboQuantKvCache, TurboQuantLayerCaches};
 pub use gpu_quant::{GpuQuantKvCache, GpuQuantLayerCaches};
-pub use gpu_quant::{GpuTurboQuantKvCache, GpuTurboQuantLayerCaches, GpuTurboQuantCtx};
+pub use gpu_quant::{GpuTurboQuantCtx, GpuTurboQuantKvCache, GpuTurboQuantLayerCaches};
+pub use layers::{KvCache, LayerCaches};
+pub use layers::{QuantBits, QuantConfig, QuantizedKvCache, QuantizedLayerCaches};
+pub use layers::{TurboQuantKvCache, TurboQuantLayerCaches};
+pub use turbo_quant::{TurboQuantConfig, TurboQuantCtx};

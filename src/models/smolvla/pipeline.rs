@@ -27,7 +27,11 @@ pub fn preprocess_image<B: Backend>(img: Tensor<B, 4>, target: usize) -> Tensor<
     let resized = if rh == h && rw == w {
         img
     } else {
-        interpolate(img, [rh, rw], InterpolateOptions::new(InterpolateMode::Bilinear))
+        interpolate(
+            img,
+            [rh, rw],
+            InterpolateOptions::new(InterpolateMode::Bilinear),
+        )
     };
     // pad left/top to target (right/bottom stay 0)
     let padded = if rh < target || rw < target {
@@ -41,7 +45,11 @@ pub fn preprocess_image<B: Backend>(img: Tensor<B, 4>, target: usize) -> Tensor<
 /// Prefix attention (SmolVLA `embed_prefix` + `make_att_2d_masks`): image and
 /// language tokens attend each other bidirectionally; the trailing state token
 /// attends everything. Returns `(positions [1,Lp], mask [1,Lp,Lp])`.
-fn prefix_masks<B: Backend>(n_img: usize, n_lang: usize, device: &B::Device) -> (Tensor<B, 2>, Tensor<B, 3, Bool>) {
+fn prefix_masks<B: Backend>(
+    n_img: usize,
+    n_lang: usize,
+    device: &B::Device,
+) -> (Tensor<B, 2>, Tensor<B, 3, Bool>) {
     let lp = n_img + n_lang + 1;
     let state = lp - 1; // the single state token, the only `att_mask=1` entry
     let mut m = vec![0f32; lp * lp];
@@ -64,7 +72,11 @@ fn prefix_masks<B: Backend>(n_img: usize, n_lang: usize, device: &B::Device) -> 
 /// Denoise attention: the action chunk attends the full prefix, and is causal
 /// among itself. Returns `(positions [1,chunk], mask [1,chunk,Lp+chunk])`,
 /// positions continuing the prefix.
-fn denoise_masks<B: Backend>(lp: usize, chunk: usize, device: &B::Device) -> (Tensor<B, 2>, Tensor<B, 3, Bool>) {
+fn denoise_masks<B: Backend>(
+    lp: usize,
+    chunk: usize,
+    device: &B::Device,
+) -> (Tensor<B, 2>, Tensor<B, 3, Bool>) {
     let total = lp + chunk;
     let mut m = vec![0f32; chunk * total];
     for i in 0..chunk {
@@ -134,10 +146,25 @@ impl<B: Backend> SmolVla<B> {
         let lp = caches_k.dims()[2];
         let chunk = noise.dims()[1];
         let (suffix_positions, suffix_mask) = denoise_masks::<B>(lp, chunk, device);
-        let cross_mask = suffix_mask.clone().float().narrow(2, 0, lp).greater_elem(0.5);
+        let cross_mask = suffix_mask
+            .clone()
+            .float()
+            .narrow(2, 0, lp)
+            .greater_elem(0.5);
         let denoise = |x_t: Tensor<B, 3>, t: f64| {
-            let tt = Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(vec![t as f32], vec![1]), device);
-            let sfx = embed_suffix::<B>(&self.proj, &self.cfg, self.cfg.min_period, self.cfg.max_period, x_t, tt, device);
+            let tt = Tensor::<B, 1>::from_data(
+                burn::tensor::TensorData::new(vec![t as f32], vec![1]),
+                device,
+            );
+            let sfx = embed_suffix::<B>(
+                &self.proj,
+                &self.cfg,
+                self.cfg.min_period,
+                self.cfg.max_period,
+                x_t,
+                tt,
+                device,
+            );
             let e = self.denoiser.forward(
                 sfx,
                 suffix_positions.clone(),

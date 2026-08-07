@@ -707,3 +707,18 @@ required-features = ["mxfp4", "cuda-backend"]
 [[bin]]
 name = "k3_expert_index"
 required-features = ["k3"]
+[[bin]]
+name = "personaplex_xdev_probe"
+required-features = ["qwen3tts", "q4"]
+
+[[bin]]
+name = "depth_xdev_probe"
+required-features = ["qwen3tts", "q4"]
+
+[[bin]]
+name = "personaplex_listen"
+required-features = ["personaplex", "q4"]
+
+[[bin]]
+name = "spm_graph_roundtrip"
+required-features = ["personaplex"]

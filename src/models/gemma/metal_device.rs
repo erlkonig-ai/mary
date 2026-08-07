@@ -15,7 +15,7 @@
 
 use burn::backend::wgpu::WgpuDevice;
 #[cfg(target_os = "macos")]
-use burn::backend::wgpu::{RuntimeOptions, WgpuSetup, init_device};
+use burn::backend::wgpu::{init_device, RuntimeOptions, WgpuSetup};
 #[cfg(target_os = "macos")]
 use pollster::block_on;
 #[cfg(target_os = "macos")]

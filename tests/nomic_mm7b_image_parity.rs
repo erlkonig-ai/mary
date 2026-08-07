@@ -47,7 +47,10 @@ fn cosine(a: &[f32], b: &[f32]) -> f64 {
 }
 
 fn max_abs(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
 }
 
 /// The 56x56 probe image: 15-token prompt, grid_thw (1,4,4) -> 4 image-pad rows.
@@ -81,9 +84,11 @@ fn get_rope_index_parity() {
     for (i, p) in pos.iter().enumerate() {
         for axis in 0..3 {
             assert_eq!(
-                p[axis], want[axis * s + i],
+                p[axis],
+                want[axis * s + i],
                 "position_ids[axis={axis}][token={i}]: got {} want {}",
-                p[axis], want[axis * s + i]
+                p[axis],
+                want[axis * s + i]
             );
         }
     }
@@ -96,7 +101,9 @@ struct KeymapW {
 }
 impl KeymapW {
     fn get(&self, name: &str) -> &(Vec<f32>, Vec<usize>) {
-        self.map.get(name).unwrap_or_else(|| panic!("missing weight {name}"))
+        self.map
+            .get(name)
+            .unwrap_or_else(|| panic!("missing weight {name}"))
     }
 }
 impl QwenWeights<B> for KeymapW {
@@ -149,7 +156,10 @@ fn image_embed_parity() {
     let device = NdArrayDevice::default();
     eprintln!("[image-parity] loading combined keymap from {pile_path} ...");
     let map = mary::persist::load_keymap_from_pile(Path::new(&pile_path)).expect("load pile");
-    eprintln!("[image-parity] keymap has {} tensors; building text + vision ...", map.len());
+    eprintln!(
+        "[image-parity] keymap has {} tensors; building text + vision ...",
+        map.len()
+    );
     let w = KeymapW { map, device };
     let text = QwenTextModel::<B>::load(&w, &text_cfg(), &device);
     let vision = VisionTransformer::<B>::load(&w, &vision_cfg(), &device);
@@ -179,7 +189,9 @@ fn image_embed_parity() {
     }
     assert_eq!(k, vision_tokens.dims()[0], "spliced {k} vision tokens");
     let got_splice = embeds.clone().into_data().to_vec::<f32>().unwrap();
-    let want_splice = npy::load_npy(&dir.join("image_inputs_embeds.npy")).unwrap().0;
+    let want_splice = npy::load_npy(&dir.join("image_inputs_embeds.npy"))
+        .unwrap()
+        .0;
     let cos_splice = cosine(&got_splice, &want_splice);
     let ma_splice = max_abs(&got_splice, &want_splice);
     eprintln!("[image-parity] ANCHOR splice (inputs_embeds): cosine={cos_splice:.7} max_abs={ma_splice:e}");
@@ -191,10 +203,17 @@ fn image_embed_parity() {
     let want_hidden = npy::load_npy(&dir.join("image_last_hidden.npy")).unwrap().0;
     let cos_hidden = cosine(&got_hidden, &want_hidden);
     eprintln!("[image-parity] ANCHOR backbone (last_hidden): cosine={cos_hidden:.7}");
-    assert!(cos_hidden >= 0.999, "backbone hidden cosine {cos_hidden:.7} < 0.999");
+    assert!(
+        cos_hidden >= 0.999,
+        "backbone hidden cosine {cos_hidden:.7} < 0.999"
+    );
 
     // --- FINAL: dense image embedding (pool + L2) vs reference ---
-    let got = text.embed_from_embeds(embeds, &position_ids).into_data().to_vec::<f32>().unwrap();
+    let got = text
+        .embed_from_embeds(embeds, &position_ids)
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
     let want = npy::load_npy(&dir.join("image_emb.npy")).unwrap().0;
     assert_eq!(got.len(), want.len(), "image_emb dim");
     let cos = cosine(&got, &want);
@@ -209,10 +228,15 @@ fn image_embed_parity() {
         let embedder = NomicMultimodalEmbedder::<B>::load_with_vision(&w, &tok_path, device)
             .expect("load embedder");
         let pixel_values = load2(&vdir, "pixel_values", &device);
-        let via_api = embedder.embed_image_pixels(pixel_values, &grid, &input_ids).expect("embed_image");
+        let via_api = embedder
+            .embed_image_pixels(pixel_values, &grid, &input_ids)
+            .expect("embed_image");
         let cos_api = cosine(&via_api, &want);
         eprintln!("[image-parity] embed_image() API: cosine={cos_api:.7}");
-        assert!(cos_api >= 0.9999, "embed_image API cosine={cos_api:.7} < 0.9999");
+        assert!(
+            cos_api >= 0.9999,
+            "embed_image API cosine={cos_api:.7} < 0.9999"
+        );
     }
     eprintln!("[image-parity] ALL anchors + final + API  OK");
 }
@@ -225,7 +249,10 @@ fn nomic_tokenizer() -> Option<PathBuf> {
         "models--nomic-ai--nomic-embed-multimodal-7b",
         "models--Qwen--Qwen2.5-VL-7B-Instruct",
     ] {
-        let base = PathBuf::from(&home).join(".cache/huggingface/hub").join(pat).join("snapshots");
+        let base = PathBuf::from(&home)
+            .join(".cache/huggingface/hub")
+            .join(pat)
+            .join("snapshots");
         if let Ok(rd) = std::fs::read_dir(&base) {
             for e in rd.flatten() {
                 let p = e.path().join("tokenizer.json");

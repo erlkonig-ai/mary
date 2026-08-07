@@ -51,15 +51,23 @@ pub fn extract_tensors(path: &Path) -> Result<Vec<(String, Vec<f32>, Vec<usize>)
             // GGUF dims are fastest-first; reverse to row-major for mary.
             let mut dims: Vec<usize> = ti.shape().dims().iter().map(|&d| d as usize).collect();
             dims.reverse();
-            (ti.name().to_string(), ti.tensor_type(), dims, ti.data_offset())
+            (
+                ti.name().to_string(),
+                ti.tensor_type(),
+                dims,
+                ti.data_offset(),
+            )
         })
         .collect();
 
     let mut out = Vec::with_capacity(infos.len());
     for (name, ty, shape, offset) in infos {
-        let n: usize = shape.iter().product::<usize>().max(if shape.is_empty() { 0 } else { 1 });
-        let nbytes = block_bytes(ty, n)
-            .with_context(|| format!("size gguf tensor {name:?} ({ty:?})"))?;
+        let n: usize = shape
+            .iter()
+            .product::<usize>()
+            .max(if shape.is_empty() { 0 } else { 1 });
+        let nbytes =
+            block_bytes(ty, n).with_context(|| format!("size gguf tensor {name:?} ({ty:?})"))?;
         let data = reader
             .read_tensor_data_at(offset, nbytes)
             .map_err(|e| anyhow!("read gguf tensor {name:?} @ {offset} ({nbytes} B): {e}"))?;
@@ -564,7 +572,10 @@ fn dequant_iq4_nl(raw: &[u8], n: usize) -> Result<Vec<f32>> {
 /// produced at least `n` values.
 fn finish(mut out: Vec<f32>, n: usize, ty: &str) -> Result<Vec<f32>> {
     if out.len() < n {
-        bail!("{ty}: dequantized {} values but tensor needs {n} (truncated GGUF data?)", out.len());
+        bail!(
+            "{ty}: dequantized {} values but tensor needs {n} (truncated GGUF data?)",
+            out.len()
+        );
     }
     out.truncate(n);
     Ok(out)
@@ -588,7 +599,12 @@ mod tests {
         blk.extend(qs.iter().map(|&q| q as u8));
         let out = dequant_q8_0(&blk, 32).unwrap();
         for (i, &q) in qs.iter().enumerate() {
-            assert!((out[i] - d * q as f32).abs() < 1e-4, "elem {i}: {} vs {}", out[i], d * q as f32);
+            assert!(
+                (out[i] - d * q as f32).abs() < 1e-4,
+                "elem {i}: {} vs {}",
+                out[i],
+                d * q as f32
+            );
         }
     }
 
@@ -636,12 +652,18 @@ mod tests {
     #[test]
     fn f16_and_bf16_readers() {
         let vals = [1.5f32, -2.0, 0.0, 100.0];
-        let f16b: Vec<u8> = vals.iter().flat_map(|&x| f16::from_f32(x).to_le_bytes()).collect();
+        let f16b: Vec<u8> = vals
+            .iter()
+            .flat_map(|&x| f16::from_f32(x).to_le_bytes())
+            .collect();
         let got = read_f16(&f16b, 4);
         for (a, b) in got.iter().zip(vals.iter()) {
             assert!((a - b).abs() < 0.1);
         }
-        let bf16b: Vec<u8> = vals.iter().flat_map(|&x| bf16::from_f32(x).to_le_bytes()).collect();
+        let bf16b: Vec<u8> = vals
+            .iter()
+            .flat_map(|&x| bf16::from_f32(x).to_le_bytes())
+            .collect();
         let got = read_bf16(&bf16b, 4);
         for (a, b) in got.iter().zip(vals.iter()) {
             assert!((a - b).abs() < 1.0);

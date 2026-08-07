@@ -10,9 +10,9 @@
 
 use crate::models::gemma::gemma4::config::Gemma4Config;
 use crate::models::gemma::gemma4::decoder::Gemma4Model;
-use crate::models::gemma::gemma4::weights::load_gemma4_from_keymap;
 #[cfg(feature = "import")]
 use crate::models::gemma::gemma4::weights::load_gemma4;
+use crate::models::gemma::gemma4::weights::load_gemma4_from_keymap;
 use crate::models::gemma::rope::RopeTable;
 use burn::prelude::*;
 use std::collections::HashMap;
@@ -23,7 +23,10 @@ fn argmax(v: &[f32]) -> usize {
     let mut i = 0;
     let mut b = f32::NEG_INFINITY;
     for (k, &x) in v.iter().enumerate() {
-        if x > b { b = x; i = k; }
+        if x > b {
+            b = x;
+            i = k;
+        }
     }
     i
 }
@@ -77,9 +80,12 @@ impl<B: Backend> GemmaLM<B> {
         tokenizer_path: &Path,
         device: B::Device,
     ) -> Self {
-        let (model, _vision) =
-            crate::persist::load_gemma4_streaming_from_pile::<B>(pile_path, config.clone(), &device)
-                .unwrap_or_else(|e| panic!("stream gemma4 from pile {pile_path:?}: {e:?}"));
+        let (model, _vision) = crate::persist::load_gemma4_streaming_from_pile::<B>(
+            pile_path,
+            config.clone(),
+            &device,
+        )
+        .unwrap_or_else(|e| panic!("stream gemma4 from pile {pile_path:?}: {e:?}"));
         Self::from_model(config, model, tokenizer_path, device)
     }
 
@@ -102,7 +108,15 @@ impl<B: Backend> GemmaLM<B> {
             .copied()
             .unwrap_or(u32::MAX);
         let scale = (config.text_config.hidden_size as f64).sqrt() as f32;
-        Self { model, rope_s, rope_g, tokenizer, scale, eot, device }
+        Self {
+            model,
+            rope_s,
+            rope_g,
+            tokenizer,
+            scale,
+            eot,
+            device,
+        }
     }
 
     /// Greedy-decode a completion for `prompt` (wrapped in the single-user Gemma
@@ -128,9 +142,22 @@ impl<B: Backend> GemmaLM<B> {
         let n_chat = ids.len();
 
         let tokens = Tensor::<B, 1, Int>::from_ints(&ids[..], &self.device).reshape([1, n_chat]);
-        let emb = self.model.decoder.embed.forward(tokens.clone()).mul_scalar(self.scale);
+        let emb = self
+            .model
+            .decoder
+            .embed
+            .forward(tokens.clone())
+            .mul_scalar(self.scale);
         let mut caches = self.model.new_caches();
-        let l = self.model.forward_embeds(emb, tokens.clone(), &self.rope_s, &self.rope_g, &mut caches, &[], None);
+        let l = self.model.forward_embeds(
+            emb,
+            tokens.clone(),
+            &self.rope_s,
+            &self.rope_g,
+            &mut caches,
+            &[],
+            None,
+        );
         let [_, sl, vv] = l.dims();
         let last: Vec<f32> = l
             .slice([0..1, (sl - 1)..sl, 0..vv])
@@ -153,12 +180,19 @@ impl<B: Backend> GemmaLM<B> {
             // to cut at "\n"). Truncate at the earliest stop and return.
             if !stop.is_empty() {
                 let so_far = self.tokenizer.decode(&out_ids, false).unwrap_or_default();
-                if let Some(cut) = stop.iter().filter(|s| !s.is_empty()).filter_map(|s| so_far.find(s.as_str())).min() {
+                if let Some(cut) = stop
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| so_far.find(s.as_str()))
+                    .min()
+                {
                     return (so_far[..cut].to_string(), n_chat, n);
                 }
             }
             let inp = Tensor::<B, 1, Int>::from_ints([cur as i32], &self.device).reshape([1, 1]);
-            let l = self.model.forward_cached(inp, &self.rope_s, &self.rope_g, &mut caches);
+            let l = self
+                .model
+                .forward_cached(inp, &self.rope_s, &self.rope_g, &mut caches);
             let v = l.dims()[2];
             let d: Vec<f32> = l.reshape([v]).to_data().convert::<f32>().to_vec().unwrap();
             cur = argmax(&d);
@@ -180,8 +214,22 @@ impl<B: Backend> GemmaLM<B> {
         post_text: &str,
         max_new: usize,
     ) -> String {
-        let pre_ids: Vec<i32> = self.tokenizer.encode(pre_text, false).unwrap().get_ids().iter().map(|&x| x as i32).collect();
-        let post_ids: Vec<i32> = self.tokenizer.encode(post_text, false).unwrap().get_ids().iter().map(|&x| x as i32).collect();
+        let pre_ids: Vec<i32> = self
+            .tokenizer
+            .encode(pre_text, false)
+            .unwrap()
+            .get_ids()
+            .iter()
+            .map(|&x| x as i32)
+            .collect();
+        let post_ids: Vec<i32> = self
+            .tokenizer
+            .encode(post_text, false)
+            .unwrap()
+            .get_ids()
+            .iter()
+            .map(|&x| x as i32)
+            .collect();
 
         let n_pre = pre_ids.len();
         let n_post = post_ids.len();
@@ -189,10 +237,21 @@ impl<B: Backend> GemmaLM<B> {
         let n_chat = n_pre + n_soft + n_post;
 
         let pre_t = Tensor::<B, 1, Int>::from_ints(&pre_ids[..], &self.device).reshape([1, n_pre]);
-        let post_t = Tensor::<B, 1, Int>::from_ints(&post_ids[..], &self.device).reshape([1, n_post]);
+        let post_t =
+            Tensor::<B, 1, Int>::from_ints(&post_ids[..], &self.device).reshape([1, n_post]);
 
-        let pre_emb = self.model.decoder.embed.forward(pre_t.clone()).mul_scalar(self.scale);
-        let post_emb = self.model.decoder.embed.forward(post_t.clone()).mul_scalar(self.scale);
+        let pre_emb = self
+            .model
+            .decoder
+            .embed
+            .forward(pre_t.clone())
+            .mul_scalar(self.scale);
+        let post_emb = self
+            .model
+            .decoder
+            .embed
+            .forward(post_t.clone())
+            .mul_scalar(self.scale);
 
         // Soft tokens are already in the text hidden space, just reshape to [1, n_soft, hidden]
         let soft_emb = soft_tokens.reshape([1, n_soft, hidden]);
@@ -207,10 +266,19 @@ impl<B: Backend> GemmaLM<B> {
         all_ids.extend(soft_ids);
         all_ids.extend(post_ids);
 
-        let tokens = Tensor::<B, 1, Int>::from_ints(&all_ids[..], &self.device).reshape([1, n_chat]);
+        let tokens =
+            Tensor::<B, 1, Int>::from_ints(&all_ids[..], &self.device).reshape([1, n_chat]);
 
         let mut caches = self.model.new_caches();
-        let l = self.model.forward_embeds(emb, tokens, &self.rope_s, &self.rope_g, &mut caches, &[], None);
+        let l = self.model.forward_embeds(
+            emb,
+            tokens,
+            &self.rope_s,
+            &self.rope_g,
+            &mut caches,
+            &[],
+            None,
+        );
         let [_, sl, vv] = l.dims();
         let last: Vec<f32> = l
             .slice([0..1, (sl - 1)..sl, 0..vv])
@@ -230,7 +298,9 @@ impl<B: Backend> GemmaLM<B> {
             out_ids.push(cur as u32);
             n += 1;
             let inp = Tensor::<B, 1, Int>::from_ints([cur as i32], &self.device).reshape([1, 1]);
-            let l = self.model.forward_cached(inp, &self.rope_s, &self.rope_g, &mut caches);
+            let l = self
+                .model
+                .forward_cached(inp, &self.rope_s, &self.rope_g, &mut caches);
             let v = l.dims()[2];
             let d: Vec<f32> = l.reshape([v]).to_data().convert::<f32>().to_vec().unwrap();
             cur = argmax(&d);
@@ -253,9 +323,22 @@ impl<B: Backend> GemmaLM<B> {
         let n_chat = ids.len();
 
         let tokens = Tensor::<B, 1, Int>::from_ints(&ids[..], &self.device).reshape([1, n_chat]);
-        let emb = self.model.decoder.embed.forward(tokens.clone()).mul_scalar(self.scale);
+        let emb = self
+            .model
+            .decoder
+            .embed
+            .forward(tokens.clone())
+            .mul_scalar(self.scale);
         let mut caches = self.model.new_caches();
-        let l = self.model.forward_embeds(emb, tokens.clone(), &self.rope_s, &self.rope_g, &mut caches, &[], None);
+        let l = self.model.forward_embeds(
+            emb,
+            tokens.clone(),
+            &self.rope_s,
+            &self.rope_g,
+            &mut caches,
+            &[],
+            None,
+        );
         let [_, sl, vv] = l.dims();
         let last: Vec<f32> = l
             .slice([0..1, (sl - 1)..sl, 0..vv])
@@ -275,7 +358,9 @@ impl<B: Backend> GemmaLM<B> {
             out_ids.push(cur as u32);
             n += 1;
             let inp = Tensor::<B, 1, Int>::from_ints([cur as i32], &self.device).reshape([1, 1]);
-            let l = self.model.forward_cached(inp, &self.rope_s, &self.rope_g, &mut caches);
+            let l = self
+                .model
+                .forward_cached(inp, &self.rope_s, &self.rope_g, &mut caches);
             let v = l.dims()[2];
             let d: Vec<f32> = l.reshape([v]).to_data().convert::<f32>().to_vec().unwrap();
             cur = argmax(&d);
@@ -296,9 +381,12 @@ impl GemmaLM<crate::nn::backend::BHalf> {
         tokenizer_path: &Path,
         device: burn::backend::wgpu::WgpuDevice,
     ) -> Self {
-        let model =
-            crate::persist::load_gemma4_aliased_from_pile(pile_path, config.clone(), device.clone())
-                .unwrap_or_else(|e| panic!("alias gemma4 from pile {pile_path:?}: {e:?}"));
+        let model = crate::persist::load_gemma4_aliased_from_pile(
+            pile_path,
+            config.clone(),
+            device.clone(),
+        )
+        .unwrap_or_else(|e| panic!("alias gemma4 from pile {pile_path:?}: {e:?}"));
         Self::from_model(config, model, tokenizer_path, device)
     }
 }

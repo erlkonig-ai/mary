@@ -64,7 +64,11 @@ fn precompute_coeffs(src_size: usize, dst_size: usize) -> (Vec<(usize, usize)>, 
     let scale_i = (1u64 << PRECISION_BITS) as f64;
     let mut weights_i = vec![0i32; dst_size * ksize];
     for (i, &w) in weights_f.iter().enumerate() {
-        let rounded = if w < 0.0 { -0.5 + w * scale_i } else { 0.5 + w * scale_i };
+        let rounded = if w < 0.0 {
+            -0.5 + w * scale_i
+        } else {
+            0.5 + w * scale_i
+        };
         weights_i[i] = rounded as i32;
     }
 
@@ -84,9 +88,7 @@ fn clip8(acc: i32) -> u8 {
 }
 
 /// Horizontal pass on u8 RGB data, shape (src_h, src_w, 3) → (src_h, dst_w, 3).
-fn resample_horizontal_u8(
-    src: &[u8], src_w: usize, src_h: usize, dst_w: usize,
-) -> Vec<u8> {
+fn resample_horizontal_u8(src: &[u8], src_w: usize, src_h: usize, dst_w: usize) -> Vec<u8> {
     let (bounds, ksize, weights) = precompute_coeffs(src_w, dst_w);
     let mut out = vec![0u8; src_h * dst_w * 3];
     for y in 0..src_h {
@@ -113,9 +115,7 @@ fn resample_horizontal_u8(
 }
 
 /// Vertical pass on u8 RGB data, shape (src_h, dst_w, 3) → (dst_h, dst_w, 3).
-fn resample_vertical_u8(
-    src: &[u8], dst_w: usize, src_h: usize, dst_h: usize,
-) -> Vec<u8> {
+fn resample_vertical_u8(src: &[u8], dst_w: usize, src_h: usize, dst_h: usize) -> Vec<u8> {
     let (bounds, ksize, weights) = precompute_coeffs(src_h, dst_h);
     let mut out = vec![0u8; dst_h * dst_w * 3];
     for yy in 0..dst_h {
@@ -159,7 +159,11 @@ pub fn pil_resize_bicubic(img: &RgbImage, dst_w: u32, dst_h: u32) -> RgbImage {
     for y in 0..dst_h_u {
         for x in 0..dst_w_u {
             let off = (y * dst_w_u + x) * 3;
-            out.put_pixel(x as u32, y as u32, Rgb([v_out[off], v_out[off + 1], v_out[off + 2]]));
+            out.put_pixel(
+                x as u32,
+                y as u32,
+                Rgb([v_out[off], v_out[off + 1], v_out[off + 2]]),
+            );
         }
     }
     out

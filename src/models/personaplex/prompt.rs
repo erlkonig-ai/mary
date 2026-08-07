@@ -53,7 +53,11 @@ impl Prompt {
         } else {
             spm.encode(&wrap_with_system_tags(system_text))
         };
-        Self { voice: VoicePrompt::load(voice_pt), text_tokens, silence_frames: SILENCE_FRAMES }
+        Self {
+            voice: VoicePrompt::load(voice_pt),
+            text_tokens,
+            silence_frames: SILENCE_FRAMES,
+        }
     }
 
     /// Total temporal steps the prompt phases consume (the delay horizon's

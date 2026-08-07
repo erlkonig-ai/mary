@@ -108,14 +108,20 @@ fn adapt_layer(loader: &WeightLoader, i: usize) -> WeightLoader {
         "l.self_attn.k_proj.weight".into(),
         (deinterleave_rows(&in_proj[d2..2 * d2], d), vec![d, d]),
     );
-    map.insert("l.self_attn.v_proj.weight".into(), (in_proj[2 * d2..].to_vec(), vec![d, d]));
+    map.insert(
+        "l.self_attn.v_proj.weight".into(),
+        (in_proj[2 * d2..].to_vec(), vec![d, d]),
+    );
 
     let (o, s) = loader.load_f32(&format!("{src}.self_attn.out_proj.weight"));
     assert_eq!(s, vec![d, d], "{src}: out_proj shape");
     map.insert("l.self_attn.o_proj.weight".into(), (o, vec![d, d]));
 
     // norm alphas [1,1,D] → [D]
-    for (moshi, mary) in [("norm1", "input_layernorm"), ("norm2", "post_attention_layernorm")] {
+    for (moshi, mary) in [
+        ("norm1", "input_layernorm"),
+        ("norm2", "post_attention_layernorm"),
+    ] {
         let (a, s) = loader.load_f32(&format!("{src}.{moshi}.alpha"));
         assert_eq!(s, vec![1, 1, d], "{src}: {moshi}.alpha shape");
         map.insert(format!("l.{mary}.weight"), (a, vec![d]));
@@ -123,9 +129,19 @@ fn adapt_layer(loader: &WeightLoader, i: usize) -> WeightLoader {
 
     // fused gate|up — rows [0:11264) SiLU (gate), rows [11264:22528) linear (up)
     let (gu, s) = loader.load_f32(&format!("{src}.gating.linear_in.weight"));
-    assert_eq!(s, vec![cfg::FFN_FUSED_IN, d], "{src}: gating.linear_in shape");
-    map.insert("l.mlp.gate_proj.weight".into(), (gu[..fh * d].to_vec(), vec![fh, d]));
-    map.insert("l.mlp.up_proj.weight".into(), (gu[fh * d..].to_vec(), vec![fh, d]));
+    assert_eq!(
+        s,
+        vec![cfg::FFN_FUSED_IN, d],
+        "{src}: gating.linear_in shape"
+    );
+    map.insert(
+        "l.mlp.gate_proj.weight".into(),
+        (gu[..fh * d].to_vec(), vec![fh, d]),
+    );
+    map.insert(
+        "l.mlp.up_proj.weight".into(),
+        (gu[fh * d..].to_vec(), vec![fh, d]),
+    );
 
     let (down, s) = loader.load_f32(&format!("{src}.gating.linear_out.weight"));
     assert_eq!(s, vec![d, fh], "{src}: gating.linear_out shape");
@@ -233,14 +249,26 @@ impl<B: Backend> TemporalTransformer<B> {
         for cb in 0..cfg::N_Q {
             let t = tokens[1 + cb];
             if t >= 0 {
-                assert!((t as usize) < cfg::AUDIO_VOCAB, "audio token {t} out of range");
-                add(&mut acc, self.audio_emb[cb].weight.clone().narrow(0, t as usize, 1));
+                assert!(
+                    (t as usize) < cfg::AUDIO_VOCAB,
+                    "audio token {t} out of range"
+                );
+                add(
+                    &mut acc,
+                    self.audio_emb[cb].weight.clone().narrow(0, t as usize, 1),
+                );
             }
         }
         let t = tokens[0];
         if t >= 0 {
-            assert!((t as usize) < cfg::TEXT_VOCAB, "text token {t} out of range");
-            add(&mut acc, self.text_emb.weight.clone().narrow(0, t as usize, 1));
+            assert!(
+                (t as usize) < cfg::TEXT_VOCAB,
+                "text token {t} out of range"
+            );
+            add(
+                &mut acc,
+                self.text_emb.weight.clone().narrow(0, t as usize, 1),
+            );
         }
         match acc {
             Some(a) => a.reshape([1, 1, cfg::DIM]),

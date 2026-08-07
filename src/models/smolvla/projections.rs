@@ -7,9 +7,9 @@
 //! presence are pinned during the first probe-parity pass against the PyTorch
 //! reference; `load` takes the prefix so the names live in one place.
 
-use burn::prelude::*;
-use crate::nn::weight_loader::WeightLoader;
 use super::config::SmolVlaConfig;
+use crate::nn::weight_loader::WeightLoader;
+use burn::prelude::*;
 
 /// `y = x @ wᵀ (+ b)` for a `[.., in]` tensor against a `[out, in]` weight
 /// (PyTorch `nn.Linear` layout).
@@ -27,7 +27,7 @@ fn linear<B: Backend, const D: usize>(
 
 /// A single `nn.Linear` (weight + optional bias) held as raw tensors.
 pub struct Linear<B: Backend> {
-    pub weight: Tensor<B, 2>,    // [out, in]
+    pub weight: Tensor<B, 2>,       // [out, in]
     pub bias: Option<Tensor<B, 1>>, // [out]
 }
 
@@ -63,9 +63,24 @@ impl<B: Backend> Projections<B> {
         Self {
             state_proj: Linear::load(loader, &format!("{prefix}.state_proj"), true, device),
             action_in_proj: Linear::load(loader, &format!("{prefix}.action_in_proj"), true, device),
-            action_out_proj: Linear::load(loader, &format!("{prefix}.action_out_proj"), true, device),
-            action_time_mlp_in: Linear::load(loader, &format!("{prefix}.action_time_mlp_in"), true, device),
-            action_time_mlp_out: Linear::load(loader, &format!("{prefix}.action_time_mlp_out"), true, device),
+            action_out_proj: Linear::load(
+                loader,
+                &format!("{prefix}.action_out_proj"),
+                true,
+                device,
+            ),
+            action_time_mlp_in: Linear::load(
+                loader,
+                &format!("{prefix}.action_time_mlp_in"),
+                true,
+                device,
+            ),
+            action_time_mlp_out: Linear::load(
+                loader,
+                &format!("{prefix}.action_time_mlp_out"),
+                true,
+                device,
+            ),
         }
     }
 }

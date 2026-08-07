@@ -285,13 +285,22 @@ fn hpool() -> Option<&'static HPool> {
 /// of which thread claims its chunk.
 fn hgemv_mt(w: &[u16], m: usize, n: usize, x: &[f32], y: &mut [f32]) {
     debug_assert_eq!(w.len(), m * n);
-    let Some(pool) = hpool() else { return hgemv(w, m, n, x, y) };
+    let Some(pool) = hpool() else {
+        return hgemv(w, m, n, x, y);
+    };
     let chunk = (m.div_ceil(4 * pool.ways)).next_multiple_of(32).max(32);
     let n_chunks = m.div_ceil(chunk);
     static DISPATCH: Mutex<()> = Mutex::new(());
     let _d = DISPATCH.lock().unwrap();
     unsafe {
-        *pool.job.get() = HJob { w: w.as_ptr(), x: x.as_ptr(), y: y.as_mut_ptr(), m, n, chunk };
+        *pool.job.get() = HJob {
+            w: w.as_ptr(),
+            x: x.as_ptr(),
+            y: y.as_mut_ptr(),
+            m,
+            n,
+            chunk,
+        };
     }
     let gen = pool.epoch.load(Ordering::Relaxed) + 1;
     pool.done.store(0, Ordering::Release);
@@ -327,7 +336,11 @@ enum Mat {
 impl Mat {
     fn new(v: Vec<f32>, f16: bool) -> Self {
         if f16 {
-            Mat::F16(v.into_iter().map(|x| half::f16::from_f32(x).to_bits()).collect())
+            Mat::F16(
+                v.into_iter()
+                    .map(|x| half::f16::from_f32(x).to_bits())
+                    .collect(),
+            )
         } else {
             Mat::F32(v)
         }
@@ -442,16 +455,16 @@ pub struct DepthFast {
     audio_emb: Vec<HostF32>,
 
     // fixed scratch
-    cond: Vec<f32>,   // [16·1024] per-step conditioning
-    kc: Vec<f32>,     // [6·16·1024] key slots
-    vc: Vec<f32>,     // [6·16·1024] value slots
-    x: Vec<f32>,      // [1024] residual stream
-    xin: Vec<f32>,    // [1024] normed input
-    qkv_buf: Vec<f32>, // [3·1024]
-    attn: Vec<f32>,   // [1024]
-    proj: Vec<f32>,   // [1024]
-    gu: Vec<f32>,     // [2·2816]
-    act: Vec<f32>,    // [2816]
+    cond: Vec<f32>,       // [16·1024] per-step conditioning
+    kc: Vec<f32>,         // [6·16·1024] key slots
+    vc: Vec<f32>,         // [6·16·1024] value slots
+    x: Vec<f32>,          // [1024] residual stream
+    xin: Vec<f32>,        // [1024] normed input
+    qkv_buf: Vec<f32>,    // [3·1024]
+    attn: Vec<f32>,       // [1024]
+    proj: Vec<f32>,       // [1024]
+    gu: Vec<f32>,         // [2·2816]
+    act: Vec<f32>,        // [2816]
     logits_buf: Vec<f32>, // [16·2048], valid after frame()
 
     // always-on timing decomposition (µs-scale overhead per frame)
@@ -469,7 +482,10 @@ impl DepthFast {
         let n = cfg::WEIGHTS_PER_STEP;
         let mut steps: Vec<StepW> = Vec::with_capacity(n);
         for _ in 0..n {
-            steps.push(StepW { layers: Vec::with_capacity(LAYERS), head: Mat::F32(Vec::new()) });
+            steps.push(StepW {
+                layers: Vec::with_capacity(LAYERS),
+                head: Mat::F32(Vec::new()),
+            });
         }
 
         for i in 0..LAYERS {
@@ -522,7 +538,12 @@ impl DepthFast {
             })
             .collect();
 
-        Self::assemble(steps, Mat::new(dep_in_all, f16), HostF32::Owned(text_emb), audio_emb)
+        Self::assemble(
+            steps,
+            Mat::new(dep_in_all, f16),
+            HostF32::Owned(text_emb),
+            audio_emb,
+        )
     }
 
     /// ZERO-COPY load from the derived depth sibling pile (`qpile`): every
@@ -551,12 +572,15 @@ impl DepthFast {
         );
         let n = cfg::WEIGHTS_PER_STEP;
         let mut steps: Vec<StepW> = (0..n)
-            .map(|_| StepW { layers: Vec::with_capacity(LAYERS), head: Mat::F32(Vec::new()) })
+            .map(|_| StepW {
+                layers: Vec::with_capacity(LAYERS),
+                head: Mat::F32(Vec::new()),
+            })
             .collect();
         let canon_f32 = |name: &str, want: &[usize]| -> anyhow::Result<anybytes::View<[f32]>> {
-            let (v, s) = loader
-                .view_f32(name)
-                .ok_or_else(|| anyhow::anyhow!("{name}: no zero-copy f32 view from the canonical pile"))?;
+            let (v, s) = loader.view_f32(name).ok_or_else(|| {
+                anyhow::anyhow!("{name}: no zero-copy f32 view from the canonical pile")
+            })?;
             anyhow::ensure!(s == want, "{name}: shape {s:?} != {want:?}");
             Ok(v)
         };
@@ -587,10 +611,8 @@ impl DepthFast {
                 let src = format!("depformer.layers.{l}");
                 let o_v = canon_f32(&format!("{src}.self_attn.out_proj.weight"), &[n * D, D])?;
                 for (t, step) in steps.iter_mut().enumerate() {
-                    let down_v = canon_f32(
-                        &format!("{src}.gating.{t}.linear_out.weight"),
-                        &[D, FH],
-                    )?;
+                    let down_v =
+                        canon_f32(&format!("{src}.gating.{t}.linear_out.weight"), &[D, FH])?;
                     step.layers.push(LayerW {
                         qkv: Mat::F32Map(qkv_v.clone(), t * 3 * D * D, 3 * D * D),
                         o: Mat::F32Map(o_v.clone(), t * D * D, D * D),
@@ -641,7 +663,9 @@ impl DepthFast {
         let mut fill = |len: usize| -> Vec<f32> {
             (0..len)
                 .map(|_| {
-                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
                     (((state >> 40) as f32) / (1u32 << 24) as f32 - 0.5) * 0.04
                 })
                 .collect()
@@ -661,7 +685,9 @@ impl DepthFast {
             .collect();
         let dep_in = Mat::new(fill(STEPS * D * cfg::DIM), f16);
         let text_emb = HostF32::Owned(fill(cfg::TEXT_VOCAB * D));
-        let audio_emb = (0..STEPS - 1).map(|_| HostF32::Owned(fill(cfg::AUDIO_VOCAB * D))).collect();
+        let audio_emb = (0..STEPS - 1)
+            .map(|_| HostF32::Owned(fill(cfg::AUDIO_VOCAB * D)))
+            .collect();
         Self::assemble(steps, dep_in, text_emb, audio_emb)
     }
 
@@ -727,7 +753,8 @@ impl DepthFast {
 
         // all 16 conditioning projections in one gemv
         let t0 = Instant::now();
-        self.dep_in.gemv(STEPS * D, cfg::DIM, transformer_out, &mut self.cond);
+        self.dep_in
+            .gemv(STEPS * D, cfg::DIM, transformer_out, &mut self.cond);
         self.t_cond += t0.elapsed().as_secs_f64();
 
         let mut tokens = [0i64; cfg::DEP_Q];
@@ -735,10 +762,16 @@ impl DepthFast {
         for s in 0..STEPS {
             // x = dep_in_s(transformer_out) + emb(prev)
             let emb = if s == 0 {
-                assert!((0..cfg::TEXT_VOCAB as i64).contains(&prev), "text token {prev}");
+                assert!(
+                    (0..cfg::TEXT_VOCAB as i64).contains(&prev),
+                    "text token {prev}"
+                );
                 &self.text_emb[prev as usize * D..(prev as usize + 1) * D]
             } else {
-                assert!((0..cfg::AUDIO_VOCAB as i64).contains(&prev), "audio token {prev}");
+                assert!(
+                    (0..cfg::AUDIO_VOCAB as i64).contains(&prev),
+                    "audio token {prev}"
+                );
                 &self.audio_emb[s - 1][prev as usize * D..(prev as usize + 1) * D]
             };
             for i in 0..D {
@@ -850,10 +883,14 @@ mod tests {
         let n = 2816;
         let mut state = 12345u64;
         let mut rnd = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((state >> 40) as f32) / (1u32 << 24) as f32 - 0.5
         };
-        let w16: Vec<u16> = (0..n).map(|_| half::f16::from_f32(rnd()).to_bits()).collect();
+        let w16: Vec<u16> = (0..n)
+            .map(|_| half::f16::from_f32(rnd()).to_bits())
+            .collect();
         let x: Vec<f32> = (0..n).map(|_| rnd()).collect();
         let got = unsafe { hdot(w16.as_ptr(), x.as_ptr(), n) };
         let want: f64 = w16
@@ -873,10 +910,14 @@ mod tests {
         let (m, n) = (321 * 4, 1024); // not chunk-aligned on purpose... m mult of 1 row
         let mut state = 999u64;
         let mut rnd = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((state >> 40) as f32) / (1u32 << 24) as f32 - 0.5
         };
-        let w: Vec<u16> = (0..m * n).map(|_| half::f16::from_f32(rnd()).to_bits()).collect();
+        let w: Vec<u16> = (0..m * n)
+            .map(|_| half::f16::from_f32(rnd()).to_bits())
+            .collect();
         let x: Vec<f32> = (0..n).map(|_| rnd()).collect();
         let mut y_serial = vec![0f32; m];
         let mut y_mt = vec![0f32; m];

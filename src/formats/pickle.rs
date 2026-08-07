@@ -45,7 +45,9 @@ pub fn extract_tensors(path: &Path) -> Result<Vec<(String, Vec<f32>, Vec<usize>)
     let prefix = data_pkl.strip_suffix("data.pkl").unwrap_or("").to_string();
 
     let pkl_bytes = {
-        let mut f = zip.by_name(&data_pkl).map_err(|e| anyhow!("read data.pkl: {e}"))?;
+        let mut f = zip
+            .by_name(&data_pkl)
+            .map_err(|e| anyhow!("read data.pkl: {e}"))?;
         let mut buf = Vec::with_capacity(f.size() as usize);
         f.read_to_end(&mut buf)?;
         buf
@@ -86,7 +88,9 @@ pub fn extract_tensors(path: &Path) -> Result<Vec<(String, Vec<f32>, Vec<usize>)
         out.push((t.name, f32s, t.shape));
     }
     if out.is_empty() {
-        bail!("no float tensors found in pytorch pickle {path:?} (empty or all-integer state_dict?)");
+        bail!(
+            "no float tensors found in pytorch pickle {path:?} (empty or all-integer state_dict?)"
+        );
     }
     Ok(out)
 }
@@ -207,7 +211,9 @@ fn parse_state_dict(buf: &[u8]) -> Result<Vec<TorchTensor>> {
 
     macro_rules! pop {
         () => {
-            stack.pop().ok_or_else(|| anyhow!("pickle stack underflow"))?
+            stack
+                .pop()
+                .ok_or_else(|| anyhow!("pickle stack underflow"))?
         };
     }
     // Pop everything back to (and discarding) the topmost Mark; return the popped
@@ -232,14 +238,14 @@ fn parse_state_dict(buf: &[u8]) -> Result<Vec<TorchTensor>> {
             b'\x80' => {
                 i += 1; // PROTO <version byte>
             }
-            b'.' => break, // STOP
-            b'(' => stack.push(Val::Mark),          // MARK
-            b'}' => stack.push(Val::Dict(Vec::new())), // EMPTY_DICT
-            b']' => stack.push(Val::List(Vec::new())), // EMPTY_LIST
+            b'.' => break,                              // STOP
+            b'(' => stack.push(Val::Mark),              // MARK
+            b'}' => stack.push(Val::Dict(Vec::new())),  // EMPTY_DICT
+            b']' => stack.push(Val::List(Vec::new())),  // EMPTY_LIST
             b')' => stack.push(Val::Tuple(Vec::new())), // EMPTY_TUPLE
-            b'N' => stack.push(Val::None),          // NONE
-            b'\x88' => stack.push(Val::Bool(true)), // NEWTRUE
-            b'\x89' => stack.push(Val::Bool(false)), // NEWFALSE
+            b'N' => stack.push(Val::None),              // NONE
+            b'\x88' => stack.push(Val::Bool(true)),     // NEWTRUE
+            b'\x89' => stack.push(Val::Bool(false)),    // NEWFALSE
             // ---- ints ----
             b'K' => {
                 let v = buf[i] as i64;
@@ -272,8 +278,7 @@ fn parse_state_dict(buf: &[u8]) -> Result<Vec<TorchTensor>> {
             }
             // ---- strings ----
             b'X' => {
-                let len =
-                    u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]) as usize;
+                let len = u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]) as usize;
                 i += 4;
                 let s = String::from_utf8_lossy(&buf[i..i + len]).into_owned();
                 i += len;
@@ -287,8 +292,7 @@ fn parse_state_dict(buf: &[u8]) -> Result<Vec<TorchTensor>> {
                 stack.push(Val::Str(s));
             } // SHORT_BINUNICODE
             b'\x8d' => {
-                let len =
-                    u64::from_le_bytes(buf[i..i + 8].try_into().unwrap()) as usize;
+                let len = u64::from_le_bytes(buf[i..i + 8].try_into().unwrap()) as usize;
                 i += 8;
                 let s = String::from_utf8_lossy(&buf[i..i + len]).into_owned();
                 i += len;
@@ -302,8 +306,7 @@ fn parse_state_dict(buf: &[u8]) -> Result<Vec<TorchTensor>> {
                 stack.push(Val::Bytes);
             } // SHORT_BINBYTES
             b'B' => {
-                let len =
-                    u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]) as usize;
+                let len = u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]) as usize;
                 i += 4;
                 i += len; // skip the bytes payload
                 stack.push(Val::Bytes);
@@ -326,12 +329,20 @@ fn parse_state_dict(buf: &[u8]) -> Result<Vec<TorchTensor>> {
             b'h' => {
                 let idx = buf[i] as u32;
                 i += 1;
-                stack.push(memo.get(&idx).cloned().ok_or_else(|| anyhow!("BINGET miss {idx}"))?);
+                stack.push(
+                    memo.get(&idx)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("BINGET miss {idx}"))?,
+                );
             } // BINGET
             b'j' => {
                 let idx = u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
                 i += 4;
-                stack.push(memo.get(&idx).cloned().ok_or_else(|| anyhow!("LONG_BINGET miss {idx}"))?);
+                stack.push(
+                    memo.get(&idx)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("LONG_BINGET miss {idx}"))?,
+                );
             } // LONG_BINGET
             // ---- tuples ----
             b'\x85' => {
@@ -553,9 +564,10 @@ fn as_int(v: &Val) -> Option<i64> {
 
 fn as_usize_tuple(v: &Val) -> Option<Vec<usize>> {
     match v {
-        Val::Tuple(items) | Val::List(items) => {
-            items.iter().map(|x| as_int(x).map(|n| n as usize)).collect()
-        }
+        Val::Tuple(items) | Val::List(items) => items
+            .iter()
+            .map(|x| as_int(x).map(|n| n as usize))
+            .collect(),
         _ => None,
     }
 }

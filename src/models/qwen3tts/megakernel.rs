@@ -436,7 +436,10 @@ impl TalkerEngine {
     /// Build the engine over a loaded talker. `max_seq` bounds prefill+frames
     /// (cache memory: `28 layers × 2 × max_seq × 4 KiB`).
     pub fn new(talker: &Talker<Raw>, max_seq: usize) -> Self {
-        assert!(max_seq <= MAX_SCORES as usize, "max_seq exceeds kernel shared-memory cap");
+        assert!(
+            max_seq <= MAX_SCORES as usize,
+            "max_seq exceeds kernel shared-memory cap"
+        );
         let probe = talker.norm.weight.clone();
         let client = match probe.into_primitive() {
             TensorPrimitive::Float(c) => c.client,

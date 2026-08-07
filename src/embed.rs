@@ -34,9 +34,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::nn::backend::{WgpuDevice, B};
-use crate::nn::weight_loader::WeightLoader;
 #[cfg(feature = "import")]
 use crate::nn::weight_loader::SingleFileLoader;
+use crate::nn::weight_loader::WeightLoader;
 
 /// clip-vit-base-patch32 shared contrastive space dimension.
 pub const CLIP_DIM: usize = 512;

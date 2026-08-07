@@ -79,7 +79,13 @@ impl Default for SamplingParams {
 
 /// Sample from logits with top-k + temperature (HF warper order:
 /// temperature → top-k → multinomial). Greedy = argmax.
-fn sample_logits(logits: &[f32], do_sample: bool, top_k: usize, temp: f64, rng: &mut StdRng) -> u32 {
+fn sample_logits(
+    logits: &[f32],
+    do_sample: bool,
+    top_k: usize,
+    temp: f64,
+    rng: &mut StdRng,
+) -> u32 {
     if !do_sample {
         let mut best = 0usize;
         for (i, &v) in logits.iter().enumerate() {
@@ -156,7 +162,10 @@ pub fn build_prefill<B: Backend>(
     }
     let rest = Tensor::<B, 1>::from_floats(rest.as_slice(), device).reshape([1, t, hidden]);
     let icl_codec = Tensor::cat(
-        vec![talker.embed_codec(&[CODEC_BOS], device), talker.embed_codec(&code0s, device) + rest],
+        vec![
+            talker.embed_codec(&[CODEC_BOS], device),
+            talker.embed_codec(&code0s, device) + rest,
+        ],
         1,
     );
 
@@ -218,7 +227,17 @@ pub fn generate<B: Backend>(
     rng: &mut StdRng,
     device: &B::Device,
 ) -> Vec<[u32; NUM_CODE_GROUPS]> {
-    generate_streaming(talker, predictor, prefill, trailing, tts_pad, params, rng, device, |_| {})
+    generate_streaming(
+        talker,
+        predictor,
+        prefill,
+        trailing,
+        tts_pad,
+        params,
+        rng,
+        device,
+        |_| {},
+    )
 }
 
 /// [`generate`] with a per-frame sink — the streaming path hands each frame
@@ -266,7 +285,13 @@ pub fn generate_streaming<B: Backend>(
         let tl = std::time::Instant::now();
         let mut logits = talker.logits_from(&h);
         process_talker_logits(&mut logits, &generated, step, params.repetition_penalty);
-        let code0 = sample_logits(&logits, params.do_sample, params.top_k, params.temperature, rng);
+        let code0 = sample_logits(
+            &logits,
+            params.do_sample,
+            params.top_k,
+            params.temperature,
+            rng,
+        );
         t_logits += tl.elapsed().as_secs_f64();
         generated.push(code0);
         if code0 == CODEC_EOS {

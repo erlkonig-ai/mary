@@ -36,14 +36,18 @@ impl<B: Backend> LayerNorm<B> {
         let xc = x.sub(mean);
         let var = xc.clone().powf_scalar(2.0).mean_dim(2);
         let norm = xc.div(var.add_scalar(self.eps).sqrt());
-        norm.mul(self.weight.clone().reshape([1, 1, d])).add(self.bias.clone().reshape([1, 1, d]))
+        norm.mul(self.weight.clone().reshape([1, 1, d]))
+            .add(self.bias.clone().reshape([1, 1, d]))
     }
 }
 
 /// GELU (tanh approximation) — `gelu_pytorch_tanh`.
 fn gelu_tanh<B: Backend>(x: Tensor<B, 3>) -> Tensor<B, 3> {
     let x3 = x.clone().powf_scalar(3.0);
-    let inner = x.clone().add(x3.mul_scalar(0.044715)).mul_scalar(0.7978845608028654);
+    let inner = x
+        .clone()
+        .add(x3.mul_scalar(0.044715))
+        .mul_scalar(0.7978845608028654);
     x.mul(inner.tanh().add_scalar(1.0)).mul_scalar(0.5)
 }
 
@@ -61,7 +65,14 @@ struct VisionLayer<B: Backend> {
 }
 
 impl<B: Backend> VisionLayer<B> {
-    fn load(loader: &WeightLoader, p: &str, eps: f64, n_heads: usize, head_dim: usize, device: &B::Device) -> Self {
+    fn load(
+        loader: &WeightLoader,
+        p: &str,
+        eps: f64,
+        n_heads: usize,
+        head_dim: usize,
+        device: &B::Device,
+    ) -> Self {
         let lin = |n: &str| Linear::load(loader, &format!("{p}.{n}"), true, device);
         Self {
             ln1: LayerNorm::load(loader, &format!("{p}.layer_norm1"), eps, device),
@@ -86,11 +97,13 @@ impl<B: Backend> VisionLayer<B> {
         let q = shape(self.q.forward(hidden.clone()));
         let k = shape(self.k.forward(hidden.clone()));
         let v = shape(self.v.forward(hidden));
-        let scores = q.matmul(k.swap_dims(2, 3)).mul_scalar((hd as f64).powf(-0.5));
+        let scores = q
+            .matmul(k.swap_dims(2, 3))
+            .mul_scalar((hd as f64).powf(-0.5));
         let probs = burn::tensor::activation::softmax(scores, 3);
         let att = probs.matmul(v).swap_dims(1, 2).reshape([b, s, d]);
         let x = x.add(self.out.forward(att)); // residual 1
-        // MLP
+                                              // MLP
         let h2 = self.ln2.forward(x.clone());
         let mlp = self.fc2.forward(gelu_tanh(self.fc1.forward(h2)));
         x.add(mlp) // residual 2
@@ -114,15 +127,34 @@ impl<B: Backend> VisionEncoder<B> {
         // SigLIP vision config (fixed for SmolVLM2-500M): 768/12 layers/12 heads/64, eps 1e-6
         let (n_layers, n_heads, head_dim, eps) = (12usize, 12usize, 64usize, 1e-6);
         let layers = (0..n_layers)
-            .map(|i| VisionLayer::load(loader, &format!("{vp}.encoder.layers.{i}"), eps, n_heads, head_dim, device))
+            .map(|i| {
+                VisionLayer::load(
+                    loader,
+                    &format!("{vp}.encoder.layers.{i}"),
+                    eps,
+                    n_heads,
+                    head_dim,
+                    device,
+                )
+            })
             .collect();
         Self {
-            patch_weight: loader.load_tensor(&format!("{vp}.embeddings.patch_embedding.weight"), device),
-            patch_bias: loader.load_tensor(&format!("{vp}.embeddings.patch_embedding.bias"), device),
-            position_embedding: loader.load_tensor(&format!("{vp}.embeddings.position_embedding.weight"), device),
+            patch_weight: loader
+                .load_tensor(&format!("{vp}.embeddings.patch_embedding.weight"), device),
+            patch_bias: loader
+                .load_tensor(&format!("{vp}.embeddings.patch_embedding.bias"), device),
+            position_embedding: loader.load_tensor(
+                &format!("{vp}.embeddings.position_embedding.weight"),
+                device,
+            ),
             layers,
             post_ln: LayerNorm::load(loader, &format!("{vp}.post_layernorm"), eps, device),
-            connector: Linear::load(loader, "model.vlm_with_expert.vlm.model.connector.modality_projection.proj", false, device),
+            connector: Linear::load(
+                loader,
+                "model.vlm_with_expert.vlm.model.connector.modality_projection.proj",
+                false,
+                device,
+            ),
             patch_size: 16,
             scale_factor: 4,
         }
@@ -132,7 +164,12 @@ impl<B: Backend> VisionEncoder<B> {
     pub fn embeddings(&self, image: Tensor<B, 4>) -> Tensor<B, 3> {
         let [b, _, _, _] = image.dims();
         let opts = ConvOptions::new([self.patch_size, self.patch_size], [0, 0], [1, 1], 1);
-        let patch = conv2d(image, self.patch_weight.clone(), Some(self.patch_bias.clone()), opts); // [b,768,gh,gw]
+        let patch = conv2d(
+            image,
+            self.patch_weight.clone(),
+            Some(self.patch_bias.clone()),
+            opts,
+        ); // [b,768,gh,gw]
         let [_, c, gh, gw] = patch.dims();
         let patch = patch.reshape([b, c, gh * gw]).swap_dims(1, 2); // [b, np, 768]
         let np = gh * gw;

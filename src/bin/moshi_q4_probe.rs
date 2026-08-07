@@ -346,8 +346,14 @@ fn alloc_custom_layers(client: &q4::Client, is_q4: bool) -> Vec<Vec<Q4Linear>> {
 // ---------------------------------------------------------------------------
 
 fn main() {
-    let rounds: usize = std::env::var("Q4_ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
-    let steps: usize = std::env::var("Q4_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+    let rounds: usize = std::env::var("Q4_ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let steps: usize = std::env::var("Q4_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
     println!("moshi_q4_probe — q4 weight-quant matvec spike (PersonaPlex-7B temporal decode)");
     println!("{rounds} rounds x {steps} steps, min-of-medians\n");
 
@@ -458,7 +464,9 @@ fn main() {
         println!("    ctx {ctx:>4}: temporal {temporal:6.1} + depth {DEPTH_MS} + mimi {MIMI_MS} = {total:6.1} ms  ->  {verdict}");
     }
     println!("  with-levers floor: q4 matmuls + true KV reads at measured bandwidth +");
-    println!("  megakernel-class submission ({SUBMIT_LEVER_MS} ms) + attention compute (~free at M=1):");
+    println!(
+        "  megakernel-class submission ({SUBMIT_LEVER_MS} ms) + attention compute (~free at M=1):"
+    );
     let eff_gbps = q4_gb / (q4_full / 1e3);
     for (ctx, _) in probe_temporal {
         // full-MHA KV: 32 layers x 2 (K+V) x ctx x 4096 x 2 B, f16

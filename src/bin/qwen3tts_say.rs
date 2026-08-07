@@ -59,7 +59,9 @@ fn run<B: Backend>(args: &Args) {
     let codec_dev = mary::nn::backend::WgpuDevice::default();
     let codec = CodecDecoder::<BFused>::load(&loader, &codec_dev);
     let encoder = CodecEncoder::load(&loader);
-    let tok = TextTokenizer::load(&std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/qwen3tts"));
+    let tok = TextTokenizer::load(
+        &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/qwen3tts"),
+    );
     eprintln!("weights loaded in {:.1}s", t0.elapsed().as_secs_f64());
 
     // clone prompt, fully in-process (CPU codec encoder + GPU x-vector)
@@ -84,15 +86,23 @@ fn run<B: Backend>(args: &Args) {
     ));
 
     let t1 = Instant::now();
-    let (prefill, trailing, tts_pad) =
-        pipeline::build_prefill(&talker, &predictor, &prompt, &text_ids, Some(LANG_ENGLISH), &dev);
+    let (prefill, trailing, tts_pad) = pipeline::build_prefill(
+        &talker,
+        &predictor,
+        &prompt,
+        &text_ids,
+        Some(LANG_ENGLISH),
+        &dev,
+    );
     let params = SamplingParams {
         do_sample: !args.greedy,
         subtalker_do_sample: !args.greedy,
         ..Default::default()
     };
     let mut rng = rand::rngs::StdRng::seed_from_u64(args.seed);
-    let frames = pipeline::generate(&talker, &predictor, prefill, trailing, tts_pad, &params, &mut rng, &dev);
+    let frames = pipeline::generate(
+        &talker, &predictor, prefill, trailing, tts_pad, &params, &mut rng, &dev,
+    );
     let t_gen = t1.elapsed().as_secs_f64();
 
     let t2 = Instant::now();

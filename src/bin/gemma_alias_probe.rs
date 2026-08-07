@@ -33,7 +33,12 @@ fn main() {
          st.save_file({{'w': w}}, {st:?})\n",
         st = st.to_str().unwrap()
     );
-    assert!(Command::new("python3").arg("-c").arg(&py).status().unwrap().success());
+    assert!(Command::new("python3")
+        .arg("-c")
+        .arg(&py)
+        .status()
+        .unwrap()
+        .success());
 
     // 2. Persist as f16 leaves.
     let pile = dir.join("tiny.pile");
@@ -65,7 +70,10 @@ fn main() {
 
     // 6. Page-aligned superset of the blob, clamped to the real mapping.
     let page_start = blob_ptr & !((PAGE - 1) as usize);
-    assert!(page_start >= region_base, "page rounding underflowed the mapping");
+    assert!(
+        page_start >= region_base,
+        "page rounding underflowed the mapping"
+    );
     let off_in_page = (blob_ptr - page_start) as u64;
     let want_end = ((blob_ptr + n * 2) as u64 + PAGE - 1) & !(PAGE - 1);
     let page_len = want_end.min(region_end as u64) - page_start as u64;
@@ -96,7 +104,9 @@ fn main() {
     println!("aliased tensor[0..4] = {:?}", &got[..4.min(n)]);
     println!("pile f16    [0..4] = {:?}", &expected[..4.min(n)]);
     if ok {
-        println!("=== PASS — aliased burn Tensor equals the pile's f16 weight (real-data zero-copy) ===");
+        println!(
+            "=== PASS — aliased burn Tensor equals the pile's f16 weight (real-data zero-copy) ==="
+        );
     } else {
         println!("=== FAIL ===");
         std::process::exit(1);
@@ -107,7 +117,12 @@ fn open_pile(pile_path: &Path) -> (TribleSet, impl BlobStoreGet, Id) {
     use ed25519_dalek::SigningKey;
     let mut pile = Pile::open(pile_path).unwrap();
     pile.refresh().unwrap();
-    let mut repo = Repository::new(pile, SigningKey::generate(&mut rand::rngs::OsRng), TribleSet::new()).unwrap();
+    let mut repo = Repository::new(
+        pile,
+        SigningKey::generate(&mut rand::rngs::OsRng),
+        TribleSet::new(),
+    )
+    .unwrap();
     let branch_id = repo.lookup_branch("main").unwrap().unwrap();
     let mut ws = repo.pull(branch_id).unwrap();
     let head = ws.head().unwrap();

@@ -44,7 +44,10 @@ fn find_hf_file(model_id: &str, filename: &str) -> String {
         ])
         .output()
         .unwrap_or_else(|e| panic!("hf_hub_download {model_id}/{filename}: {e}"));
-    let p = String::from_utf8(o.stdout).expect("utf8").trim().to_string();
+    let p = String::from_utf8(o.stdout)
+        .expect("utf8")
+        .trim()
+        .to_string();
     if p.is_empty() || !Path::new(&p).exists() {
         panic!("hf_hub_download failed for {model_id}/{filename}");
     }
@@ -52,7 +55,9 @@ fn find_hf_file(model_id: &str, filename: &str) -> String {
 }
 
 fn arg(args: &[String], k: &str) -> Option<String> {
-    args.iter().position(|s| s == k).map(|i| args[i + 1].clone())
+    args.iter()
+        .position(|s| s == k)
+        .map(|i| args[i + 1].clone())
 }
 
 /// Expand short variant aliases to full HF model ids; anything else (a full
@@ -70,9 +75,13 @@ fn resolve_model_id(arg: &str) -> String {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let prompt = arg(&args, "--prompt").unwrap_or_else(|| "Explain what a trible is in one sentence.".into());
-    let model_id = resolve_model_id(&arg(&args, "--model").unwrap_or_else(|| "google/gemma-4-E2B-it".into()));
-    let max_new = arg(&args, "--tokens").and_then(|s| s.parse::<usize>().ok()).unwrap_or(120);
+    let prompt = arg(&args, "--prompt")
+        .unwrap_or_else(|| "Explain what a trible is in one sentence.".into());
+    let model_id =
+        resolve_model_id(&arg(&args, "--model").unwrap_or_else(|| "google/gemma-4-E2B-it".into()));
+    let max_new = arg(&args, "--tokens")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(120);
     let pile = arg(&args, "--pile")
         .or_else(|| std::env::var("GEMMA_PILE").ok())
         .unwrap_or_else(|| {
@@ -99,11 +108,17 @@ fn main() {
 
     eprintln!(
         "Loading {model_id} ({} hidden, {} layers, vocab {}) from pile {pile} (streaming)...",
-        config.text_config.hidden_size, config.text_config.num_hidden_layers,
+        config.text_config.hidden_size,
+        config.text_config.num_hidden_layers,
         config.text_config.vocab_size
     );
     let t_load = Instant::now();
-    let lm = GemmaLM::<B>::from_streaming_pile(config, Path::new(&pile), Path::new(&tokenizer_path), device);
+    let lm = GemmaLM::<B>::from_streaming_pile(
+        config,
+        Path::new(&pile),
+        Path::new(&tokenizer_path),
+        device,
+    );
     eprintln!("Loaded in {:.1}s.\n", t_load.elapsed().as_secs_f64());
 
     let t_gen = Instant::now();

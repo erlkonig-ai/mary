@@ -3,15 +3,17 @@
 //!
 //!   cargo run --release --bin forward_test -- <path-to-model_1250000.safetensors>
 
-use mary::nn::backend::B;
-use mary::nn::weight_loader::{SingleFileLoader, WeightLoader};
 use burn::prelude::*;
-use std::path::Path;
 use mary::models::f5::config::F5Config;
 use mary::models::f5::model::F5Transformer;
+use mary::nn::backend::B;
+use mary::nn::weight_loader::{SingleFileLoader, WeightLoader};
+use std::path::Path;
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: forward_test <model.safetensors>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: forward_test <model.safetensors>");
     let device = Default::default();
 
     eprintln!("loading {path} …");

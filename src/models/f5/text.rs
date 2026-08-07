@@ -13,7 +13,12 @@ use burn::tensor::module::conv1d;
 use burn::tensor::ops::ConvOptions;
 
 /// Affine LayerNorm over the last dim.
-fn layer_norm<B: Backend>(x: Tensor<B, 3>, w: &Tensor<B, 1>, b: &Tensor<B, 1>, eps: f64) -> Tensor<B, 3> {
+fn layer_norm<B: Backend>(
+    x: Tensor<B, 3>,
+    w: &Tensor<B, 1>,
+    b: &Tensor<B, 1>,
+    eps: f64,
+) -> Tensor<B, 3> {
     let c = x.dims()[2];
     let mean = x.clone().mean_dim(2);
     let centered = x - mean;
@@ -24,7 +29,12 @@ fn layer_norm<B: Backend>(x: Tensor<B, 3>, w: &Tensor<B, 1>, b: &Tensor<B, 1>, e
 
 /// ConvNeXt-V2 Global Response Normalization over the channel dim (last),
 /// aggregating across time (dim 1).
-fn grn<B: Backend>(x: Tensor<B, 3>, gamma: &Tensor<B, 1>, beta: &Tensor<B, 1>, eps: f64) -> Tensor<B, 3> {
+fn grn<B: Backend>(
+    x: Tensor<B, 3>,
+    gamma: &Tensor<B, 1>,
+    beta: &Tensor<B, 1>,
+    eps: f64,
+) -> Tensor<B, 3> {
     let c = x.dims()[2];
     let gx = x.clone().powf_scalar(2.0).sum_dim(1).sqrt(); // [B,1,C] — L2 over time
     let nx = gx.clone() / (gx.mean_dim(2) + eps); // normalise by mean over channels → [B,1,C]
@@ -89,10 +99,17 @@ pub struct TextEmbed<B: Backend> {
 }
 
 impl<B: Backend> TextEmbed<B> {
-    pub fn load(loader: &WeightLoader, n_blocks: usize, text_dim: usize, device: &B::Device) -> Self {
+    pub fn load(
+        loader: &WeightLoader,
+        n_blocks: usize,
+        text_dim: usize,
+        device: &B::Device,
+    ) -> Self {
         let base = "ema_model.transformer.text_embed";
         let blocks = (0..n_blocks)
-            .map(|i| ConvNeXtBlock::load(loader, &format!("{base}.text_blocks.{i}"), text_dim, device))
+            .map(|i| {
+                ConvNeXtBlock::load(loader, &format!("{base}.text_blocks.{i}"), text_dim, device)
+            })
             .collect();
         Self {
             embed: loader.load_tensor(&format!("{base}.text_embed.weight"), device),
@@ -137,7 +154,9 @@ fn freqs_cis<B: Backend>(end: usize, dim: usize, device: &B::Device) -> Tensor<B
         .map(|i| (1.0 / 10000f64.powf((2 * i) as f64 / dim as f64)) as f32)
         .collect();
     let inv = Tensor::<B, 1>::from_floats(inv.as_slice(), device).reshape([1, half]);
-    let pos = Tensor::<B, 1, Int>::arange(0..end as i64, device).float().reshape([end, 1]);
+    let pos = Tensor::<B, 1, Int>::arange(0..end as i64, device)
+        .float()
+        .reshape([end, 1]);
     let f = pos * inv; // [end, half]
     Tensor::cat(vec![f.clone().cos(), f.sin()], 1) // [end, dim]
 }

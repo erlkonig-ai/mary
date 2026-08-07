@@ -34,7 +34,7 @@ use crate::format::F32Array;
 pub mod attrs {
     use crate::format::F32Array;
     use triblespace::prelude::blobencodings::LongString;
-    use triblespace::prelude::inlineencodings::{F64, GenId, Handle, ShortString, U256BE};
+    use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString, F64, U256BE};
     use triblespace::prelude::*;
 
     attributes! {
@@ -80,7 +80,11 @@ impl<B: Backend> LoraAdapter<B> {
             device,
         );
         let lora_b = Tensor::zeros([out_features, rank], device);
-        Self { lora_a, lora_b, scale }
+        Self {
+            lora_a,
+            lora_b,
+            scale,
+        }
     }
 }
 
@@ -127,8 +131,8 @@ impl<B: Backend> LoraWeights<B> {
                 (format!("layers.{i}.mlp.down_proj"), hidden, inter),
             ];
             if i < first_shared {
-                let k_is_v = config.attention_k_eq_v
-                    && config.layer_type(i) == LayerType::FullAttention;
+                let k_is_v =
+                    config.attention_k_eq_v && config.layer_type(i) == LayerType::FullAttention;
                 if !k_is_v {
                     targets.push((format!("layers.{i}.self_attn.k_proj"), kv_dim, hidden));
                 }
@@ -141,9 +145,16 @@ impl<B: Backend> LoraWeights<B> {
 
         eprintln!(
             "Initialized {} LoRA adapters (rank={}, alpha={}, scale={:.4})",
-            adapters.len(), rank, alpha, scale
+            adapters.len(),
+            rank,
+            alpha,
+            scale
         );
-        Self { adapters, rank, alpha }
+        Self {
+            adapters,
+            rank,
+            alpha,
+        }
     }
 
     /// Get a LoRA adapter by key, if it exists.
@@ -175,10 +186,18 @@ impl<B: Backend> LoraWeights<B> {
             shape: Vec<usize>,
         }
         impl safetensors::View for RawTensor {
-            fn dtype(&self) -> Dtype { Dtype::F32 }
-            fn shape(&self) -> &[usize] { &self.shape }
-            fn data(&self) -> Cow<'_, [u8]> { Cow::Borrowed(&self.data) }
-            fn data_len(&self) -> usize { self.data.len() }
+            fn dtype(&self) -> Dtype {
+                Dtype::F32
+            }
+            fn shape(&self) -> &[usize] {
+                &self.shape
+            }
+            fn data(&self) -> Cow<'_, [u8]> {
+                Cow::Borrowed(&self.data)
+            }
+            fn data_len(&self) -> usize {
+                self.data.len()
+            }
         }
 
         let mut tensors: Vec<(String, RawTensor)> = Vec::new();
@@ -233,7 +252,9 @@ impl<B: Backend> LoraWeights<B> {
 
         let mut adapters = HashMap::new();
         for name in st.names() {
-            let Some(key) = name.strip_suffix(".lora_A.weight") else { continue };
+            let Some(key) = name.strip_suffix(".lora_A.weight") else {
+                continue;
+            };
             let get = |n: &str| -> Tensor<B, 2> {
                 let view = st.tensor(n).unwrap();
                 assert_eq!(view.dtype(), safetensors::Dtype::F32, "{n}: expected f32");
@@ -256,9 +277,16 @@ impl<B: Backend> LoraWeights<B> {
 
         eprintln!(
             "Loaded {} LoRA adapters from {} (rank={}, alpha={})",
-            adapters.len(), path.display(), rank, alpha
+            adapters.len(),
+            path.display(),
+            rank,
+            alpha
         );
-        Self { adapters, rank, alpha }
+        Self {
+            adapters,
+            rank,
+            alpha,
+        }
     }
 
     /// Save LoRA weights as structured entities into a blob store (pile or
@@ -303,7 +331,9 @@ impl<B: Backend> LoraWeights<B> {
 
         eprintln!(
             "Saved {} LoRA adapters to pile (rank={}, alpha={}).",
-            adapter_ids.len(), self.rank, self.alpha
+            adapter_ids.len(),
+            self.rank,
+            self.alpha
         );
         Ok(Fragment::rooted(root, facts))
     }
@@ -349,18 +379,31 @@ impl<B: Backend> LoraWeights<B> {
 
             let in_features = a_data.len() / rank;
             let out_features = b_data.len() / rank;
-            let lora_a = Tensor::<B, 1>::from_floats(&a_data[..], device)
-                .reshape([rank, in_features]);
-            let lora_b = Tensor::<B, 1>::from_floats(&b_data[..], device)
-                .reshape([out_features, rank]);
-            adapters.insert(proj, LoraAdapter { lora_a, lora_b, scale });
+            let lora_a =
+                Tensor::<B, 1>::from_floats(&a_data[..], device).reshape([rank, in_features]);
+            let lora_b =
+                Tensor::<B, 1>::from_floats(&b_data[..], device).reshape([out_features, rank]);
+            adapters.insert(
+                proj,
+                LoraAdapter {
+                    lora_a,
+                    lora_b,
+                    scale,
+                },
+            );
         }
 
         eprintln!(
             "Loaded {} LoRA adapters from pile (rank={}, alpha={}).",
-            adapters.len(), rank, alpha
+            adapters.len(),
+            rank,
+            alpha
         );
-        Self { adapters, rank, alpha }
+        Self {
+            adapters,
+            rank,
+            alpha,
+        }
     }
 }
 
@@ -411,7 +454,10 @@ mod tests {
             "layers.0.self_attn.q_proj".to_string(),
             LoraAdapter::<TB> {
                 lora_a: Tensor::from_floats([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], &device),
-                lora_b: Tensor::from_floats([[0.5, -0.5], [1.5, 2.5], [0.0, 1.0], [-1.0, 0.25]], &device),
+                lora_b: Tensor::from_floats(
+                    [[0.5, -0.5], [1.5, 2.5], [0.0, 1.0], [-1.0, 0.25]],
+                    &device,
+                ),
                 scale,
             },
         );
@@ -423,7 +469,11 @@ mod tests {
                 scale,
             },
         );
-        let lora = LoraWeights::<TB> { adapters, rank, alpha };
+        let lora = LoraWeights::<TB> {
+            adapters,
+            rank,
+            alpha,
+        };
 
         let dir = std::env::temp_dir().join(format!("mary_lora_pile_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -435,12 +485,17 @@ mod tests {
         {
             let mut pile = Pile::open(&pile_path).unwrap();
             pile.refresh().unwrap();
-            let mut repo =
-                Repository::new(pile, SigningKey::generate(&mut rand::rngs::OsRng), TribleSet::new())
-                    .unwrap();
+            let mut repo = Repository::new(
+                pile,
+                SigningKey::generate(&mut rand::rngs::OsRng),
+                TribleSet::new(),
+            )
+            .unwrap();
             let branch_id = *repo.create_branch("main", None).unwrap();
             let mut ws = repo.pull(branch_id).unwrap();
-            let frag = lora.save_to_pile("gemma-4-E4B-it", repo.storage_mut()).unwrap();
+            let frag = lora
+                .save_to_pile("gemma-4-E4B-it", repo.storage_mut())
+                .unwrap();
             ws.commit(frag.into_facts(), "lora adapters");
             repo.push(&mut ws).unwrap();
             repo.close().unwrap();
@@ -450,9 +505,12 @@ mod tests {
         let loaded = {
             let mut pile = Pile::open(&pile_path).unwrap();
             pile.refresh().unwrap();
-            let mut repo =
-                Repository::new(pile, SigningKey::generate(&mut rand::rngs::OsRng), TribleSet::new())
-                    .unwrap();
+            let mut repo = Repository::new(
+                pile,
+                SigningKey::generate(&mut rand::rngs::OsRng),
+                TribleSet::new(),
+            )
+            .unwrap();
             let branch_id = repo.lookup_branch("main").unwrap().expect("main exists");
             let mut ws = repo.pull(branch_id).unwrap();
             let head = ws.head().expect("main has a commit");
@@ -468,7 +526,9 @@ mod tests {
         assert_eq!(loaded.alpha, alpha);
         assert_eq!(loaded.adapters.len(), lora.adapters.len());
         for (key, orig) in &lora.adapters {
-            let got = loaded.get(key).unwrap_or_else(|| panic!("missing adapter {key}"));
+            let got = loaded
+                .get(key)
+                .unwrap_or_else(|| panic!("missing adapter {key}"));
             assert_eq!(got.lora_a.dims(), orig.lora_a.dims());
             assert_eq!(got.lora_b.dims(), orig.lora_b.dims());
             assert_eq!(tensor_vec(&got.lora_a), tensor_vec(&orig.lora_a));
@@ -497,10 +557,16 @@ mod tests {
                 scale: alpha / rank as f32,
             },
         );
-        let lora = LoraWeights::<TB> { adapters, rank, alpha };
+        let lora = LoraWeights::<TB> {
+            adapters,
+            rank,
+            alpha,
+        };
 
-        let path = std::env::temp_dir()
-            .join(format!("mary_lora_st_test_{}.safetensors", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "mary_lora_st_test_{}.safetensors",
+            std::process::id()
+        ));
         lora.save(&path);
         let loaded = LoraWeights::<TB>::load(&path, &device);
         let _ = std::fs::remove_file(&path);
@@ -508,7 +574,9 @@ mod tests {
         assert_eq!(loaded.rank, rank);
         assert_eq!(loaded.alpha, alpha);
         let orig = &lora.adapters["layers.1.self_attn.o_proj"];
-        let got = loaded.get("layers.1.self_attn.o_proj").expect("adapter present");
+        let got = loaded
+            .get("layers.1.self_attn.o_proj")
+            .expect("adapter present");
         assert_eq!(tensor_vec(&got.lora_a), tensor_vec(&orig.lora_a));
         assert_eq!(tensor_vec(&got.lora_b), tensor_vec(&orig.lora_b));
         assert_eq!(got.scale, orig.scale);
@@ -547,14 +615,32 @@ mod tests {
         assert!(lora.get("layers.2.self_attn.k_proj").is_none());
         assert!(lora.get("layers.3.self_attn.v_proj").is_none());
         // Sliding layer 0: q_dim = 4*4 = 16, kv_dim = 2*4 = 8.
-        assert_eq!(lora.get("layers.0.self_attn.q_proj").unwrap().lora_b.dims(), [16, 2]);
-        assert_eq!(lora.get("layers.0.self_attn.k_proj").unwrap().lora_b.dims(), [8, 2]);
+        assert_eq!(
+            lora.get("layers.0.self_attn.q_proj").unwrap().lora_b.dims(),
+            [16, 2]
+        );
+        assert_eq!(
+            lora.get("layers.0.self_attn.k_proj").unwrap().lora_b.dims(),
+            [8, 2]
+        );
         // Full layer 1: q_dim = 4*8 = 32, kv_dim = 2*8 = 16.
-        assert_eq!(lora.get("layers.1.self_attn.q_proj").unwrap().lora_b.dims(), [32, 2]);
-        assert_eq!(lora.get("layers.1.self_attn.v_proj").unwrap().lora_b.dims(), [16, 2]);
-        assert_eq!(lora.get("layers.1.self_attn.o_proj").unwrap().lora_a.dims(), [2, 32]);
+        assert_eq!(
+            lora.get("layers.1.self_attn.q_proj").unwrap().lora_b.dims(),
+            [32, 2]
+        );
+        assert_eq!(
+            lora.get("layers.1.self_attn.v_proj").unwrap().lora_b.dims(),
+            [16, 2]
+        );
+        assert_eq!(
+            lora.get("layers.1.self_attn.o_proj").unwrap().lora_a.dims(),
+            [2, 32]
+        );
         // MLP shapes are layer-type independent.
-        assert_eq!(lora.get("layers.3.mlp.down_proj").unwrap().lora_b.dims(), [16, 2]);
+        assert_eq!(
+            lora.get("layers.3.mlp.down_proj").unwrap().lora_b.dims(),
+            [16, 2]
+        );
 
         // K=V (dense 12B/31B structure): full-attention layers drop the
         // k_proj adapter (k is defined as v; k_proj never runs) but keep
@@ -584,14 +670,28 @@ mod tests {
         assert!(lora_keqv.get("layers.0.self_attn.k_proj").is_some());
         assert!(lora_keqv.get("layers.1.self_attn.k_proj").is_none());
         // Full layer 1: kv_dim = 1 * 8 = 8.
-        assert_eq!(lora_keqv.get("layers.1.self_attn.v_proj").unwrap().lora_b.dims(), [8, 2]);
+        assert_eq!(
+            lora_keqv
+                .get("layers.1.self_attn.v_proj")
+                .unwrap()
+                .lora_b
+                .dims(),
+            [8, 2]
+        );
 
         // maybe_lora: zero-init B ⇒ adapted forward == base forward.
-        let linear = burn::nn::LinearConfig::new(16, 16).with_bias(false).init(&device);
+        let linear = burn::nn::LinearConfig::new(16, 16)
+            .with_bias(false)
+            .init(&device);
         let lora_fresh = LoraWeights::<TB>::init_gemma4(&config, 2, 4.0, &device);
         let x = Tensor::<TB, 3>::random([1, 3, 16], burn::tensor::Distribution::Default, &device);
         let base = linear.forward(x.clone());
-        let adapted = maybe_lora(&linear, x.clone(), Some(&lora_fresh), "layers.0.self_attn.q_proj");
+        let adapted = maybe_lora(
+            &linear,
+            x.clone(),
+            Some(&lora_fresh),
+            "layers.0.self_attn.q_proj",
+        );
         let none = maybe_lora(&linear, x, None, "layers.0.self_attn.q_proj");
         assert_eq!(tensor_vec(&base), tensor_vec(&adapted));
         assert_eq!(tensor_vec(&base), tensor_vec(&none));

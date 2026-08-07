@@ -59,7 +59,9 @@ fn argmax(v: &[f32]) -> usize {
 fn synth_ids(n: usize, mut seed: u64) -> Vec<u32> {
     (0..n)
         .map(|_| {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((seed >> 33) % 2048) as u32
         })
         .collect()
@@ -161,7 +163,10 @@ fn main() {
     // repeated over `--rounds`, per-block medians, and a final min-of-medians
     // per path — min because contention only ever inflates.
     let rounds = arg("--rounds", 3);
-    println!("\nbench: {bench} frames/path x {rounds} rounds at seq≈{}", prefill_len + steps);
+    println!(
+        "\nbench: {bench} frames/path x {rounds} rounds at seq≈{}",
+        prefill_len + steps
+    );
     let bench_ids = synth_ids(bench, 1234);
 
     let mut fused = if flag("--skip-fused") {
@@ -178,8 +183,11 @@ fn main() {
         // warm the decode-shape JIT like the other paths' parity steps did
         for &id in &step_ids {
             let row = ftalker.codec_row(id).to_vec();
-            let e = Tensor::<BFused, 1>::from_floats(row.as_slice(), &fdev)
-                .reshape([1, 1, TALKER_HIDDEN]);
+            let e = Tensor::<BFused, 1>::from_floats(row.as_slice(), &fdev).reshape([
+                1,
+                1,
+                TALKER_HIDDEN,
+            ]);
             let h = ftalker.forward(e, &mut fcaches, &fdev);
             let _ = ftalker.last_hidden(h);
         }
@@ -222,8 +230,11 @@ fn main() {
             for &id in &bench_ids {
                 let frow = ftalker.codec_row(id).to_vec();
                 let t0 = Instant::now();
-                let e = Tensor::<BFused, 1>::from_floats(frow.as_slice(), fdev)
-                    .reshape([1, 1, TALKER_HIDDEN]);
+                let e = Tensor::<BFused, 1>::from_floats(frow.as_slice(), fdev).reshape([
+                    1,
+                    1,
+                    TALKER_HIDDEN,
+                ]);
                 let h = ftalker.forward(e, fcaches, fdev);
                 let t1 = t0.elapsed().as_secs_f64();
                 let _ = ftalker.last_hidden(h);
@@ -248,8 +259,14 @@ fn main() {
         }
     }
     println!("  min-of-medians:");
-    println!("  burn-raw   submit {:6.2} ms/frame  full {:6.2} ms/frame", best_raw.0, best_raw.1);
-    println!("  engine     submit {:6.2} ms/frame  full {:6.2} ms/frame", best_eng.0, best_eng.1);
+    println!(
+        "  burn-raw   submit {:6.2} ms/frame  full {:6.2} ms/frame",
+        best_raw.0, best_raw.1
+    );
+    println!(
+        "  engine     submit {:6.2} ms/frame  full {:6.2} ms/frame",
+        best_eng.0, best_eng.1
+    );
     if best_fus.0 < f64::MAX {
         println!(
             "  burn-fused submit {:6.2} ms/frame  full {:6.2} ms/frame",
@@ -269,10 +286,16 @@ fn main() {
         let meds = bench_fused::<BFusedHalf>(&loader, &fids, &step_ids, &bench_ids, rounds);
         let mut best = (f64::MAX, f64::MAX);
         for (r, m) in meds.iter().enumerate() {
-            println!("  round {r}: fused-f16 {:6.2}/{:6.2}  (submit/full ms)", m.0, m.1);
+            println!(
+                "  round {r}: fused-f16 {:6.2}/{:6.2}  (submit/full ms)",
+                m.0, m.1
+            );
             best = (best.0.min(m.0), best.1.min(m.1));
         }
-        println!("  min-of-medians: submit {:6.2} ms/frame  full {:6.2} ms/frame", best.0, best.1);
+        println!(
+            "  min-of-medians: submit {:6.2} ms/frame  full {:6.2} ms/frame",
+            best.0, best.1
+        );
     }
 
     // ---- phase 3: microbenchmarks ----------------------------------------
@@ -284,7 +307,6 @@ fn main() {
         std::process::exit(1);
     }
 }
-
 
 /// Bench one Burn-fused talker variant (f32 `BFused` or the production-exact
 /// f16 `BFusedHalf`): fresh load + prefill + JIT warm, then `rounds` blocks of
@@ -343,7 +365,9 @@ fn micro() {
     let k_steps: u32 = 100;
 
     let touch = client.create_from_slice(&[0u8; 4]);
-    let w_host: Vec<f32> = (0..n * n).map(|i| ((i % 61) as f32 - 30.0) / 900.0).collect();
+    let w_host: Vec<f32> = (0..n * n)
+        .map(|i| ((i % 61) as f32 - 30.0) / 900.0)
+        .collect();
     let x_host: Vec<f32> = (0..2 * n).map(|i| ((i % 17) as f32 - 8.0) / 8.0).collect();
     let bytes =
         |v: &[f32]| unsafe { core::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };

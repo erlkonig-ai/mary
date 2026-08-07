@@ -189,7 +189,11 @@ impl StreamCache {
     /// cache)` — replace the token ring wholesale (row-major `[17, CT]`);
     /// `provided` flags and offset are deliberately untouched.
     pub fn overwrite(&mut self, snapshot: &[i64]) {
-        assert_eq!(snapshot.len(), cfg::NUM_STREAMS * CT, "cache snapshot shape");
+        assert_eq!(
+            snapshot.len(),
+            cfg::NUM_STREAMS * CT,
+            "cache snapshot shape"
+        );
         for k in 0..cfg::NUM_STREAMS {
             self.cache[k].copy_from_slice(&snapshot[k * CT..(k + 1) * CT]);
         }
@@ -225,7 +229,12 @@ pub struct LmGen<B: Backend> {
 
 impl<B: Backend> LmGen<B> {
     pub fn new(temporal: TemporalTransformer<B>, depth: DepthTransformer<B>) -> Self {
-        Self { temporal, depth, stream: StreamCache::new(), sampler: None }
+        Self {
+            temporal,
+            depth,
+            stream: StreamCache::new(),
+            sampler: None,
+        }
     }
 
     /// Switch the step machine onto seeded sampling (`cfg` + `seed`) for both
@@ -263,7 +272,12 @@ impl<B: Backend> LmGen<B> {
         device: &B::Device,
     ) -> StepTrace {
         let Some(p) = self.stream.prepare(input_tokens, moshi_tokens, text_token) else {
-            return StepTrace { input: None, next_text: -1, dep_tokens: [0; cfg::DEP_Q], out: None };
+            return StepTrace {
+                input: None,
+                next_text: -1,
+                dep_tokens: [0; cfg::DEP_Q],
+                out: None,
+            };
         };
         let input = p.input;
         let x = self.temporal.embed_codes(&input, device);
@@ -278,7 +292,8 @@ impl<B: Backend> LmGen<B> {
         let dummy = [cfg::CARD as i64; 8];
         let p = loop {
             if let Some(p) =
-                self.stream.prepare(Some(&dummy), Some(&dummy), Some(cfg::TEXT_PAD_TOKEN as i64))
+                self.stream
+                    .prepare(Some(&dummy), Some(&dummy), Some(cfg::TEXT_PAD_TOKEN as i64))
             {
                 break p;
             }
@@ -301,11 +316,26 @@ impl<B: Backend> LmGen<B> {
             Some(smp) => smp.token(&tl) as i64,
             None => argmax(&tl) as i64,
         };
-        let next_text = if p.provided[0] { p.target[0] } else { sampled_text };
-        let (dep_tokens, _) =
-            self.depth.frame(&hidden, next_text, &p.forced(), None, self.sampler.as_mut(), &device);
+        let next_text = if p.provided[0] {
+            p.target[0]
+        } else {
+            sampled_text
+        };
+        let (dep_tokens, _) = self.depth.frame(
+            &hidden,
+            next_text,
+            &p.forced(),
+            None,
+            self.sampler.as_mut(),
+            &device,
+        );
         let out = self.stream.commit(&p, sampled_text, &dep_tokens);
-        StepTrace { input, next_text, dep_tokens, out }
+        StepTrace {
+            input,
+            next_text,
+            dep_tokens,
+            out,
+        }
     }
 }
 
@@ -318,7 +348,9 @@ mod tests {
     fn lcg(seed: u64) -> impl FnMut() -> i64 {
         let mut s = seed;
         move || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 40) as i64) % (cfg::CARD as i64)
         }
     }

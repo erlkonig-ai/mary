@@ -49,7 +49,10 @@ fn main() -> Result<()> {
         ("fast record lookups and storage efficiency", "database"),
         ("shrinking files without losing information", "compression"),
         ("how data travels across the internet", "networking"),
-        ("sending private messages over a public channel", "cryptography"),
+        (
+            "sending private messages over a public channel",
+            "cryptography",
+        ),
         ("predicting storms and rain with computers", "weather"),
     ];
 

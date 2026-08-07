@@ -32,7 +32,13 @@ fn main() {
     // 1. ingest safetensors → pile
     let bytes = read_safetensors_file(Path::new(CKPT));
     let mut blobs = MemoryBlobStore::new();
-    let frag = save_safetensors(&bytes, "smolvla_base", &mut blobs, mary::ingest::LeafDtype::F32).expect("ingest");
+    let frag = save_safetensors(
+        &bytes,
+        "smolvla_base",
+        &mut blobs,
+        mary::ingest::LeafDtype::F32,
+    )
+    .expect("ingest");
     let model_id = frag.root().expect("model root");
     let mut tribles = TribleSet::new();
     tribles += frag;
@@ -59,7 +65,9 @@ fn main() {
 
     // 5. parity vs the PyTorch golden
     let got = actions.into_data().to_vec::<f32>().unwrap();
-    let gold = npy::load_npy(&Path::new(G).join("golden/actions_final.npy")).unwrap().0;
+    let gold = npy::load_npy(&Path::new(G).join("golden/actions_final.npy"))
+        .unwrap()
+        .0;
     let (mut dot, mut na, mut nb, mut maxabs) = (0f64, 0f64, 0f64, 0f64);
     for (x, y) in got.iter().zip(&gold) {
         let (x, y) = (*x as f64, *y as f64);
@@ -70,6 +78,9 @@ fn main() {
     }
     let cos = dot / (na.sqrt() * nb.sqrt());
     println!("pile-loaded SmolVLA → actions: cos={cos:.8}  max|Δ|={maxabs:.3e}");
-    assert!(cos > 0.9999 && maxabs < 1e-3, "pile load diverges from golden");
+    assert!(
+        cos > 0.9999 && maxabs < 1e-3,
+        "pile load diverges from golden"
+    );
     println!("✓ SmolVLA round-trips through the mary pile — end-to-end parity exact.");
 }

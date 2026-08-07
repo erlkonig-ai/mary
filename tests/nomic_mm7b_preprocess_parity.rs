@@ -44,7 +44,10 @@ fn probe_image_png() -> Vec<u8> {
 }
 
 fn max_abs(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f64 {
@@ -75,7 +78,11 @@ fn preprocess_and_prompt_parity() {
     assert_eq!(pixels.len(), seq * PATCH_DIM, "pixel_values flat length");
 
     let (want_pv, want_shape) = npy::load_npy(&pv_path).unwrap();
-    assert_eq!(want_shape, vec![seq, PATCH_DIM], "golden pixel_values shape");
+    assert_eq!(
+        want_shape,
+        vec![seq, PATCH_DIM],
+        "golden pixel_values shape"
+    );
     let ma = max_abs(&pixels, &want_pv);
     let cos = cosine(&pixels, &want_pv);
     eprintln!("[preprocess] pixel_values: max_abs={ma:e}  cosine={cos:.9}  ({seq}×{PATCH_DIM})");
@@ -92,11 +99,18 @@ fn preprocess_and_prompt_parity() {
         let enc = tok.encode(prompt.as_str(), false).expect("tokenize");
         let got_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
         assert_eq!(got_ids, want_ids, "image input_ids EXACT mismatch");
-        eprintln!("[preprocess] input_ids: EXACT match ({} tokens)  OK", got_ids.len());
+        eprintln!(
+            "[preprocess] input_ids: EXACT match ({} tokens)  OK",
+            got_ids.len()
+        );
     } else {
         eprintln!("[preprocess] input_ids: SKIP exact check (no tokenizer.json in HF cache)");
         // Structural sanity even without a tokenizer: 4 image-pad placeholders.
-        assert_eq!(prompt.matches("<|image_pad|>").count(), 4, "image-pad count");
+        assert_eq!(
+            prompt.matches("<|image_pad|>").count(),
+            4,
+            "image-pad count"
+        );
     }
     eprintln!("[preprocess] ANCHOR 1 (pixels) + ANCHOR 2 (ids)  OK");
 }
@@ -126,7 +140,9 @@ fn embed_image_bytes_parity() {
     let embedder =
         NomicMultimodalEmbedder::<B>::load_with_vision(&w, &tok_path, device).expect("embedder");
 
-    let got = embedder.embed_image(&probe_image_png()).expect("embed_image(bytes)");
+    let got = embedder
+        .embed_image(&probe_image_png())
+        .expect("embed_image(bytes)");
     let want = npy::load_npy(&dir.join("image_emb.npy")).unwrap().0;
     assert_eq!(got.len(), want.len(), "image_emb dim");
     let cos = cosine(&got, &want);
@@ -149,7 +165,9 @@ struct KeymapW {
 }
 impl KeymapW {
     fn get(&self, name: &str) -> &(Vec<f32>, Vec<usize>) {
-        self.map.get(name).unwrap_or_else(|| panic!("missing weight {name}"))
+        self.map
+            .get(name)
+            .unwrap_or_else(|| panic!("missing weight {name}"))
     }
 }
 impl QwenWeights<B> for KeymapW {
@@ -182,7 +200,10 @@ fn nomic_tokenizer() -> Option<PathBuf> {
         "models--nomic-ai--nomic-embed-multimodal-7b",
         "models--Qwen--Qwen2.5-VL-7B-Instruct",
     ] {
-        let base = PathBuf::from(&home).join(".cache/huggingface/hub").join(pat).join("snapshots");
+        let base = PathBuf::from(&home)
+            .join(".cache/huggingface/hub")
+            .join(pat)
+            .join("snapshots");
         if let Ok(rd) = std::fs::read_dir(&base) {
             for e in rd.flatten() {
                 let p = e.path().join("tokenizer.json");

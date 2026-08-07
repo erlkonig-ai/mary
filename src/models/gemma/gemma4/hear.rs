@@ -95,7 +95,10 @@ impl<B: Backend> Hearing<B> {
 
         // --- Chat frame ---
         //   <bos><|turn>user\n<|audio>[audio_soft × N]<audio|>{prompt}<turn|>\n<|turn>model\n
-        let pre = self.tokenizer.encode("<bos><|turn>user\n<|audio>", false).unwrap();
+        let pre = self
+            .tokenizer
+            .encode("<bos><|turn>user\n<|audio>", false)
+            .unwrap();
         let post_str = format!("<audio|>{prompt}<turn|>\n<|turn>model\n");
         let post = self.tokenizer.encode(post_str.as_str(), false).unwrap();
         assert_eq!(*pre.get_ids().last().unwrap() as i64, BOA_TOKEN_ID);
@@ -112,9 +115,13 @@ impl<B: Backend> Hearing<B> {
         // --- Merge audio soft tokens into the input embeddings ---
         let scale = (self.model.config.hidden_size as f64).sqrt() as f32;
         let tok_i32: Vec<i32> = ids.iter().map(|&x| x as i32).collect();
-        let tokens =
-            Tensor::<B, 1, Int>::from_ints(&tok_i32[..], device).reshape([1, n_chat]);
-        let mut emb = self.model.decoder.embed.forward(tokens.clone()).mul_scalar(scale);
+        let tokens = Tensor::<B, 1, Int>::from_ints(&tok_i32[..], device).reshape([1, n_chat]);
+        let mut emb = self
+            .model
+            .decoder
+            .embed
+            .forward(tokens.clone())
+            .mul_scalar(scale);
         {
             let [_, _, h] = emb.dims();
             let mut d: Vec<f32> = emb.to_data().to_vec().unwrap();
@@ -158,12 +165,14 @@ impl<B: Backend> Hearing<B> {
         let mut out = String::new();
         let mut cur = argmax(&last);
         if !stop(cur as u32) {
-            let piece = self.tokenizer.decode(&[cur as u32], false).unwrap_or_default();
+            let piece = self
+                .tokenizer
+                .decode(&[cur as u32], false)
+                .unwrap_or_default();
             on_token(&piece);
             out.push_str(&piece);
             for _ in 0..max_new {
-                let inp =
-                    Tensor::<B, 1, Int>::from_ints([cur as i32], device).reshape([1, 1]);
+                let inp = Tensor::<B, 1, Int>::from_ints([cur as i32], device).reshape([1, 1]);
                 let l = self.model.forward_cached(
                     inp,
                     &self.rope_sliding,
@@ -176,7 +185,10 @@ impl<B: Backend> Hearing<B> {
                 if stop(cur as u32) {
                     break;
                 }
-                let piece = self.tokenizer.decode(&[cur as u32], false).unwrap_or_default();
+                let piece = self
+                    .tokenizer
+                    .decode(&[cur as u32], false)
+                    .unwrap_or_default();
                 on_token(&piece);
                 out.push_str(&piece);
             }

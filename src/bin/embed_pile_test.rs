@@ -14,7 +14,8 @@
 //!   cargo run --release --features embed --bin embed_pile_test
 
 use mary::embed::{
-    load_clip_from_hf, load_clip_from_pile, load_siglip_from_hf, load_siglip_from_pile, LocalEmbedder,
+    load_clip_from_hf, load_clip_from_pile, load_siglip_from_hf, load_siglip_from_pile,
+    LocalEmbedder,
 };
 use mary::nn::backend::WgpuDevice;
 use mary::persist::persist_safetensors_to_pile;
@@ -78,15 +79,22 @@ fn main() {
             .expect("clip tokenizer.json not in HF cache");
         let snapshot_dir = weights.parent().unwrap();
 
-        let pile_path = std::env::temp_dir().join(format!("mary_embed_clip_{}.pile", std::process::id()));
+        let pile_path =
+            std::env::temp_dir().join(format!("mary_embed_clip_{}.pile", std::process::id()));
         let _ = std::fs::remove_file(&pile_path);
         eprintln!("[clip] persisting {snapshot_dir:?} → {pile_path:?} ...");
-        persist_safetensors_to_pile(snapshot_dir, &pile_path, mary::ingest::LeafDtype::F32).expect("persist clip to pile");
+        persist_safetensors_to_pile(snapshot_dir, &pile_path, mary::ingest::LeafDtype::F32)
+            .expect("persist clip to pile");
         let pile_size = std::fs::metadata(&pile_path).unwrap().len();
-        eprintln!("[clip] pile is {} bytes ({:.3} GiB).", pile_size, gib(pile_size));
+        eprintln!(
+            "[clip] pile is {} bytes ({:.3} GiB).",
+            pile_size,
+            gib(pile_size)
+        );
 
         let from_safe = load_clip_from_hf(CLIP_ID, device.clone()).expect("load clip from hf");
-        let from_pile = load_clip_from_pile(&pile_path, &tokenizer, device.clone()).expect("load clip from pile");
+        let from_pile = load_clip_from_pile(&pile_path, &tokenizer, device.clone())
+            .expect("load clip from pile");
 
         let safe_img = from_safe.embed_image(&img_bytes).expect("safe image");
         let pile_img = from_pile.embed_image(&img_bytes).expect("pile image");
@@ -97,9 +105,19 @@ fn main() {
         let c_txt = cosine(&pile_txt, &safe_txt);
         let img_ok = c_img > THRESHOLD;
         let txt_ok = c_txt > THRESHOLD;
-        println!("  image cos(pile, safetensors) = {c_img:.8}  {}", mark(img_ok));
-        println!("  text  cos(pile, safetensors) = {c_txt:.8}  {}", mark(txt_ok));
-        println!("  pile file: {pile_path:?}  ({} bytes, {:.3} GiB)", pile_size, gib(pile_size));
+        println!(
+            "  image cos(pile, safetensors) = {c_img:.8}  {}",
+            mark(img_ok)
+        );
+        println!(
+            "  text  cos(pile, safetensors) = {c_txt:.8}  {}",
+            mark(txt_ok)
+        );
+        println!(
+            "  pile file: {pile_path:?}  ({} bytes, {:.3} GiB)",
+            pile_size,
+            gib(pile_size)
+        );
         all_pass &= img_ok && txt_ok;
 
         let _ = std::fs::remove_file(&pile_path);
@@ -114,15 +132,23 @@ fn main() {
             .expect("siglip tokenizer.json not in HF cache");
         let snapshot_dir = weights.parent().unwrap();
 
-        let pile_path = std::env::temp_dir().join(format!("mary_embed_siglip_{}.pile", std::process::id()));
+        let pile_path =
+            std::env::temp_dir().join(format!("mary_embed_siglip_{}.pile", std::process::id()));
         let _ = std::fs::remove_file(&pile_path);
         eprintln!("[siglip] persisting {snapshot_dir:?} → {pile_path:?} ...");
-        persist_safetensors_to_pile(snapshot_dir, &pile_path, mary::ingest::LeafDtype::F32).expect("persist siglip to pile");
+        persist_safetensors_to_pile(snapshot_dir, &pile_path, mary::ingest::LeafDtype::F32)
+            .expect("persist siglip to pile");
         let pile_size = std::fs::metadata(&pile_path).unwrap().len();
-        eprintln!("[siglip] pile is {} bytes ({:.3} GiB).", pile_size, gib(pile_size));
+        eprintln!(
+            "[siglip] pile is {} bytes ({:.3} GiB).",
+            pile_size,
+            gib(pile_size)
+        );
 
-        let from_safe = load_siglip_from_hf(SIGLIP_ID, device.clone()).expect("load siglip from hf");
-        let from_pile = load_siglip_from_pile(&pile_path, &tokenizer, device.clone()).expect("load siglip from pile");
+        let from_safe =
+            load_siglip_from_hf(SIGLIP_ID, device.clone()).expect("load siglip from hf");
+        let from_pile = load_siglip_from_pile(&pile_path, &tokenizer, device.clone())
+            .expect("load siglip from pile");
 
         let safe_img = from_safe.embed_image(&img_bytes).expect("safe image");
         let pile_img = from_pile.embed_image(&img_bytes).expect("pile image");
@@ -133,9 +159,19 @@ fn main() {
         let c_txt = cosine(&pile_txt, &safe_txt);
         let img_ok = c_img > THRESHOLD;
         let txt_ok = c_txt > THRESHOLD;
-        println!("  image cos(pile, safetensors) = {c_img:.8}  {}", mark(img_ok));
-        println!("  text  cos(pile, safetensors) = {c_txt:.8}  {}", mark(txt_ok));
-        println!("  pile file: {pile_path:?}  ({} bytes, {:.3} GiB)", pile_size, gib(pile_size));
+        println!(
+            "  image cos(pile, safetensors) = {c_img:.8}  {}",
+            mark(img_ok)
+        );
+        println!(
+            "  text  cos(pile, safetensors) = {c_txt:.8}  {}",
+            mark(txt_ok)
+        );
+        println!(
+            "  pile file: {pile_path:?}  ({} bytes, {:.3} GiB)",
+            pile_size,
+            gib(pile_size)
+        );
         all_pass &= img_ok && txt_ok;
 
         let _ = std::fs::remove_file(&pile_path);
