@@ -16,11 +16,12 @@ import subprocess
 import sys
 import time
 
-REPO = "<worktree>"
+# The checkout this harness lives in — correct in every clone, unlike a default.
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ROUTER = os.path.join(REPO, "src/models/k3/router.rs")
 GATE = os.path.join(REPO, "src/bin/k3_router_gate.rs")
-VEC = "./k3-oracle"
-WORK = "<path>"
+VEC = os.environ.get("K3_ORACLE_DIR", "./k3-oracle")
+WORK = os.environ.get("K3_WORK_DIR", "./k3-work")
 ENV = dict(os.environ, PATH=os.path.expanduser("~/.cargo/bin") + ":" + os.environ["PATH"])
 
 PRISTINE = {ROUTER: io.open(ROUTER, encoding="utf-8").read(),
@@ -405,7 +406,7 @@ def main():
 
     # ---- absent file ------------------------------------------------------
     print("\n=== M36 the vectors directory does not exist ===", flush=True)
-    rc, out, serr = run_gate("<path>")
+    rc, out, serr = run_gate(os.path.join(WORK, "does_not_exist"))
     verdict = "CAUGHT" if rc != 0 else "SURVIVED"
     print(f"  exit={rc} -> {verdict}: {(out+serr).strip().splitlines()[-1][:120]}", flush=True)
     results.append(("M36 the vectors directory does not exist", "absent file",

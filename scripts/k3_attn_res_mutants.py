@@ -10,7 +10,8 @@ import os
 import subprocess
 import sys
 
-ROOT = "<worktree>"
+# The checkout this harness lives in — correct in every clone.
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FEATURES = os.environ.get("K3_GATE_FEATURES", "k3-attn-res")
 AR = os.path.join(ROOT, "src/models/k3/attn_res.rs")
 CF = os.path.join(ROOT, "src/models/k3/config.rs")
@@ -193,7 +194,7 @@ def main():
         for p, s in originals.items():
             write(p, s)
 
-    with open("<path>", "w") as f:
+    with open(os.path.join(os.environ.get("K3_WORK_DIR", "./k3-work"), "MUTANTS_attn_res.json"), "w") as f:
         json.dump(results, f, indent=1)
     n = len(results)
     caught = sum(1 for r in results if r["outcome"] == "CAUGHT")

@@ -23,7 +23,8 @@ import subprocess
 import sys
 import time
 
-ROOT = "<worktree>"
+# The checkout this harness lives in — correct in every clone.
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MLA = os.path.join(ROOT, "src/models/k3/mla.rs")
 GATE = os.path.join(ROOT, "src/bin/k3_mla_gate.rs")
 ENV = dict(os.environ, PATH=os.path.expanduser("~/.cargo/bin") + ":" + os.environ["PATH"])

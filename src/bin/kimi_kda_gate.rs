@@ -89,7 +89,8 @@ fn main() -> ExitCode {
     let mut r = Report::new();
     check_shipping_config(
         &mut r,
-        std::path::Path::new("./kimi-k3/config.json"),
+        std::path::Path::new(&std::env::var("K3_MODEL_DIR").unwrap_or_else(|_| "./kimi-k3".into()))
+            .join("config.json"),
     );
     check_premises(&mut r, &kda);
     check_gate_sweep(&mut r, &kda);

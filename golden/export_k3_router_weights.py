@@ -20,9 +20,11 @@ import numpy as np
 import torch
 from safetensors import safe_open
 
-MODEL = "./kimi-k3"
-OUT = "./k3-oracle/k3router_gateweights_routerport.npz"
-SIDE = "./k3-oracle/k3router_gateweights_routerport_manifest.json"
+MODEL = os.environ.get("K3_MODEL_DIR", "./kimi-k3")
+OUT = os.path.join(os.environ.get("K3_ORACLE_DIR", "./k3-oracle"),
+              "k3router_gateweights_routerport.npz")
+SIDE = os.path.join(os.environ.get("K3_ORACLE_DIR", "./k3-oracle"),
+               "k3router_gateweights_routerport_manifest.json")
 LAYERS = list(range(1, 13))
 
 index = json.load(open(os.path.join(MODEL, "model.safetensors.index.json")))["weight_map"]

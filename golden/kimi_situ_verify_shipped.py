@@ -9,6 +9,7 @@
 # EXACT source segment, exec that text, instantiate it with config.json's betas
 # and compare BITWISE against the stored columns. Nothing is retyped -- the
 # class body executed here is the shipped bytes. The checkpoint is only read.
+import os
 import ast
 import hashlib
 import json
@@ -18,9 +19,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-MODEL = "./kimi-k3"
+MODEL = os.environ.get("K3_MODEL_DIR", "./kimi-k3")
 SRC = f"{MODEL}/modeling_kimi_linear.py"
-NPZ = "./k3-oracle/situ_activation.npz"
+NPZ = os.path.join(os.environ.get("K3_ORACLE_DIR", "./k3-oracle"),
+              "situ_activation.npz")
 
 text = open(SRC).read()
 print("modeling_kimi_linear.py sha256:", hashlib.sha256(text.encode()).hexdigest())

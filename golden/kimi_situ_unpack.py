@@ -19,8 +19,8 @@ import sys
 
 import numpy as np
 
-SRC = sys.argv[1] if len(sys.argv) > 1 else "./k3-oracle/situ_activation.npz"
-DST = sys.argv[2] if len(sys.argv) > 2 else "./k3-situ/oracle_npy"
+SRC = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ.get("K3_ORACLE_DIR", "./k3-oracle"), "situ_activation.npz")
+DST = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("K3_SITU_OUT", "./k3-situ/oracle_npy")
 
 # sha256 of the capture this port was gated against (2026-08-05).
 EXPECT = "e22d1ba33e19367c5b5484d791fdf1ff0e239684c084704a84544b0b5f001ed7"
