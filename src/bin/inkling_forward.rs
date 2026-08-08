@@ -59,7 +59,7 @@ fn main() -> Result<()> {
     let t = &cfg.text_config;
     let cp = Checkpoint::open(&ckpt)?;
 
-    let ids: Vec<usize> = std::fs::read(&ids_path)?
+    let mut ids: Vec<usize> = std::fs::read(&ids_path)?
         .chunks_exact(8)
         .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as usize)
         .collect();
@@ -74,12 +74,26 @@ fn main() -> Result<()> {
              t.num_hidden_layers, t.n_routed_experts, t.n_shared_experts);
     println!("  tensors    : {}", cp.len());
 
+    // How many tokens to generate past the prompt. 0 reproduces the original
+    // single-forward behaviour exactly.
+    let gen_steps: usize = std::env::var("INK_GEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
     let started = Instant::now();
+    // Hoisted: re-reading 4.8 GB of embedding tables per generated token would
+    // dwarf everything else in the loop.
     let embed_w = cp.tensor("model.llm.embed.weight")?.data;
     let embed_n = cp.tensor("model.llm.embed_norm.weight")?.data;
+    let fnorm = cp.tensor("model.llm.norm.weight")?.data;
+    let unembed = cp.tensor("model.llm.unembed.weight")?.data;
+    println!("  embedding tables loaded in {:.1}s", started.elapsed().as_secs_f32());
+
+    let mut top_all: Vec<i64> = Vec::new();
+    for step in 0..=gen_steps {
+    let n = ids.len();
     let mut x = embed_and_norm(&ids, &embed_w, &embed_n, t.rms_norm_eps, t.vocab_size, h);
-    drop(embed_w);
-    println!("  embedded in {:.1}s", started.elapsed().as_secs_f32());
 
     if let Ok(dir) = std::env::var("INK_DUMP_DIR") {
         std::fs::create_dir_all(&dir)?;
@@ -96,6 +110,7 @@ fn main() -> Result<()> {
     };
     let mask_local = causal_mask(n, Some(t.sliding_window_size));
     let mask_global = causal_mask(n, None);
+    #[allow(unused_assignments)]
     let mut expert_loads = 0usize;
     let (mut t_attn, mut t_decode, mut t_expert, mut t_other) =
         (0f64, 0f64, 0f64, 0f64);
@@ -231,8 +246,6 @@ fn main() -> Result<()> {
     }
 
     // ---- head --------------------------------------------------------------
-    let fnorm = cp.tensor("model.llm.norm.weight")?.data;
-    let unembed = cp.tensor("model.llm.unembed.weight")?.data;
     let logits = head(
         &x, &fnorm, &unembed,
         t.logits_mup_width_multiplier as f32,
@@ -251,7 +264,23 @@ fn main() -> Result<()> {
     println!("      shared + dense    {:8.1}", t_other - t_decode - t_expert);
     println!("  elapsed: {:.1}s", started.elapsed().as_secs_f32());
 
-    let mut top_all: Vec<i64> = Vec::new();
+    // Greedy: the last position's argmax is the next token.
+    let last = &logits[(n - 1) * v..n * v];
+    let mut best = 0usize;
+    for (i, &val) in last.iter().enumerate() {
+        if val > last[best] {
+            best = i;
+        }
+    }
+    if gen_steps > 0 {
+        println!("  step {step}: +{best}");
+        ids.push(best);
+        if step < gen_steps {
+            continue;
+        }
+    }
+
+    top_all.clear();
     for ti in 0..n {
         let row = &logits[ti * v..(ti + 1) * v];
         let mut idx: Vec<usize> = (0..v).collect();
@@ -263,6 +292,9 @@ fn main() -> Result<()> {
         for &i in &top {
             top_all.push(i as i64);
         }
+    }
+
+    break;
     }
 
     let mut bytes = Vec::new();
