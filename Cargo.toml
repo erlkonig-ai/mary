@@ -275,6 +275,11 @@ required-features = ["inkling"]
 [[bin]]
 name = "inkling_stack_gate"
 required-features = ["inkling"]
+
+# The vision (HMLP) and audio (dMel) towers, including the derived scale plan.
+[[bin]]
+name = "inkling_towers_gate"
+required-features = ["inkling"]
 # KDA parity gate: mary::models::kimi_k3::kda against the flash-linear-attention
 # oracle vectors (Triton kernels + fla's own float64 references). Reads .npz
 # only — no checkpoint, no safetensors — so it does not ride `dev-tools`.
