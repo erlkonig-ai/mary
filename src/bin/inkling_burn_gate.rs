@@ -29,9 +29,18 @@
 //! RMSNorm under the identical metric passes at 1.1e-6 — so this is not a
 //! cancellation artifact and not the elementwise path. About 4.3e-4 relative is
 //! roughly eleven bits of mantissa, which is what a TF32 tensor-core matmul
-//! gives. The likely cause is cubecl dispatching f32 matmul to TF32 on this
-//! backend; confirming that and finding the switch to force full f32 accumulate
-//! is open work.
+//! gives. CONFIRMED by the discriminator this gate now runs first: 2049 has a
+//! 12-bit significand, so it is exact in f32 and absent from the TF32 grid,
+//! whose neighbours here are 2048 and 2050. ndarray returns 2049; CUDA returns
+//! 2050. The inputs are being reduced to an 11-bit significand.
+//!
+//! (2050 rather than 2048 because 2049 is an exact tie and NVIDIA's
+//! `cvt.rna.tf32.f32` rounds ties away from zero. The first version of this
+//! check predicted 2048 from a ties-to-even assumption and misclassified the
+//! result as "neither"; the classifier now tests grid membership instead of one
+//! guessed value.)
+//!
+//! Finding the switch to force full f32 accumulate is open work.
 //!
 //! The budget is deliberately NOT widened to accommodate it. A GPU lane that
 //! silently carries eleven mantissa bits is a fact worth failing over, and the
@@ -113,6 +122,35 @@ fn run<B: Backend>(dev: &B::Device, label: &str) -> (usize, usize) {
     let x = fill(tokens * h, 0x51ED);
     let gain = fill(h, 0xA17);
     let eps = 1e-6f64;
+
+    // ---- precision discriminator ------------------------------------------
+    // Exact in f32, unrepresentable in TF32. Reports the matmul's input
+    // precision outright rather than inferring it from an error magnitude.
+    {
+        let a: Tensor<B, 2> =
+            Tensor::from_data(TensorData::new(vec![2049.0f32, 1.0], [1, 2]), dev);
+        let b: Tensor<B, 2> =
+            Tensor::from_data(TensorData::new(vec![1.0f32, 0.0], [2, 1]), dev);
+        let got = a.matmul(b).into_data().convert::<f32>().to_vec::<f32>().unwrap()[0];
+        checks += 1;
+        // Membership in the TF32 grid, not equality with a guessed value. Near
+        // 2049 an 11-bit significand can represent 2048 and 2050 and nothing
+        // between, and which of the two a tie lands on is the rounding mode's
+        // business, not ours: cvt.rna.tf32.f32 rounds ties away from zero and
+        // gives 2050, while ties-to-even would give 2048. Both are TF32.
+        let on_tf32_grid = got == 2048.0 || got == 2050.0;
+        let bits = if got == 2049.0 {
+            "f32 (24-bit significand)"
+        } else if on_tf32_grid {
+            "TF32 (11-bit significand) — inputs ARE being truncated"
+        } else {
+            "neither f32 nor the TF32 grid — unexpected, investigate"
+        };
+        println!("  matmul precision: 2049*1 -> {got}  => {bits}");
+        if got != 2049.0 {
+            println!("    this is the cause of any matmul-only budget failure below");
+        }
+    }
 
     // ---- RMSNorm ----------------------------------------------------------
     let mine = {
