@@ -58,6 +58,15 @@ def get(name):
         return f.get_tensor(name).float()
 
 
+def _deint(t, dim):
+    """Split an interleaved fused gate/up tensor: even rows gate, odd rows up."""
+    n = t.shape[dim]
+    assert n % 2 == 0, (t.shape, dim)
+    idx_g = torch.arange(0, n, 2)
+    idx_u = torch.arange(1, n, 2)
+    return t.index_select(dim, idx_g).contiguous(), t.index_select(dim, idx_u).contiguous()
+
+
 def w(name, t):
     a = np.ascontiguousarray(t.detach().cpu().numpy().astype("<f4"))
     open(os.path.join(OUT, name), "wb").write(a.tobytes())
@@ -112,9 +121,9 @@ for idx in (0, 1):
         "self_attn.rel_logits_proj.proj": get(p + "attn.rel_logits_proj.proj"),
     }
     fused = get(p + "mlp.w13_dn.weight")
-    half = fused.shape[0] // 2
-    sd["mlp.gate_proj.weight"] = fused[:half].contiguous()
-    sd["mlp.up_proj.weight"] = fused[half:].contiguous()
+    g_, u_ = _deint(fused, 0)                     # INTERLEAVED, not halved
+    sd["mlp.gate_proj.weight"] = g_
+    sd["mlp.up_proj.weight"] = u_
     sd["mlp.down_proj.weight"] = get(p + "mlp.w2_md.weight")
     sd["mlp.global_scale"] = get(p + "mlp.global_scale")
 

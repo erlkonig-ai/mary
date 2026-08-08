@@ -119,9 +119,9 @@ sd = {
 
 if is_dense:
     w13 = get(pfx + "mlp.w13_dn.weight")          # [2 * dense_inter, hidden]
-    half = w13.shape[0] // 2
-    sd["mlp.gate_proj.weight"] = w13[:half].contiguous()   # w1
-    sd["mlp.up_proj.weight"] = w13[half:].contiguous()     # w3
+    g_, u_ = _deint(w13, 0)                       # INTERLEAVED, not halved
+    sd["mlp.gate_proj.weight"] = g_
+    sd["mlp.up_proj.weight"] = u_
     sd["mlp.down_proj.weight"] = get(pfx + "mlp.w2_md.weight")
     sd["mlp.global_scale"] = get(pfx + "mlp.global_scale")
 else:
@@ -129,14 +129,17 @@ else:
     sd["mlp.gate.weight"] = get(pfx + "mlp.gate.weight")
     sd["mlp.gate.e_score_correction_bias"] = get(pfx + "mlp.gate.bias")
     sd["mlp.gate.global_scale"] = get(pfx + "mlp.gate.global_scale")
-    sd["mlp.experts.gate_up_proj"] = get_expert(pfx + "mlp.experts.w13_weight")
+    _gu = get_expert(pfx + "mlp.experts.w13_weight")
+    _g, _u = _deint(_gu, 1)
+    sd["mlp.experts.gate_up_proj"] = torch.cat([_g, _u], dim=1).contiguous()
     sd["mlp.experts.down_proj"] = get_expert(pfx + "mlp.experts.w2_weight")
     # shared_w13 is [n_shared, 2*inter, hidden] under the [out, in] convention
     # that shared_w2 [n_shared, hidden, inter] pins; split on the OUT dim.
     sw13 = get(pfx + "mlp.shared_experts.shared_w13_weight")
     assert sw13.shape[1] == 2 * inter, (sw13.shape, inter)
-    sd["mlp.shared_experts.gate_proj"] = sw13[:, :inter].contiguous()
-    sd["mlp.shared_experts.up_proj"] = sw13[:, inter:].contiguous()
+    _sg, _su = _deint(sw13, 1)
+    sd["mlp.shared_experts.gate_proj"] = _sg
+    sd["mlp.shared_experts.up_proj"] = _su
     sd["mlp.shared_experts.down_proj"] = get(pfx + "mlp.shared_experts.shared_w2_weight")
 
 layer = InklingDecoderLayer(cfg, LAYER)
@@ -162,6 +165,15 @@ with torch.no_grad():
 if not is_dense:
     _h.remove()
     assert "gate" in captured, "the router hook never fired"
+
+
+def _deint(t, dim):
+    """Split an interleaved fused gate/up tensor: even rows gate, odd rows up."""
+    n = t.shape[dim]
+    assert n % 2 == 0, (t.shape, dim)
+    idx_g = torch.arange(0, n, 2)
+    idx_u = torch.arange(1, n, 2)
+    return t.index_select(dim, idx_g).contiguous(), t.index_select(dim, idx_u).contiguous()
 
 
 def w(name, t):
