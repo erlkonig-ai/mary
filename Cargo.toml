@@ -287,6 +287,13 @@ required-features = ["inkling"]
 [[bin]]
 name = "inkling_mtp_gate"
 required-features = ["inkling"]
+
+# A real forward of the released checkpoint on one machine, paging expert slabs
+# per layer. The one check that can validate the name mapping independently:
+# coherent continuations cannot come out of a wrong mapping.
+[[bin]]
+name = "inkling_forward"
+required-features = ["inkling"]
 # KDA parity gate: mary::models::kimi_k3::kda against the flash-linear-attention
 # oracle vectors (Triton kernels + fla's own float64 references). Reads .npz
 # only — no checkpoint, no safetensors — so it does not ride `dev-tools`.

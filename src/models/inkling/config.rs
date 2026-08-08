@@ -52,6 +52,11 @@ pub struct InklingTextConfig {
     pub swa_head_dim: usize,
 
     pub vocab_size: usize,
+    /// Real vocabulary width. `vocab_size` is padded (201024 against 200058 on
+    /// both releases) and the head's output is truncated to this. Zero means
+    /// the config did not name it, in which case nothing is dropped.
+    #[serde(default)]
+    pub unpadded_vocab_size: usize,
 
     /// Rank of the learned relative-position path (16).
     pub d_rel: usize,
@@ -152,6 +157,16 @@ impl InklingTextConfig {
     /// Per-head width used by QK-norm in a layer of this kind.
     pub fn norm_dim(&self, kind: AttnKind) -> usize {
         self.heads(kind).2
+    }
+
+    /// The vocabulary the head actually emits, falling back to the padded
+    /// width when the config does not name a smaller one.
+    pub fn effective_vocab(&self) -> usize {
+        if self.unpadded_vocab_size > 0 && self.unpadded_vocab_size <= self.vocab_size {
+            self.unpadded_vocab_size
+        } else {
+            self.vocab_size
+        }
     }
 
     /// Rows of the router matrix. This is the field that makes the router
