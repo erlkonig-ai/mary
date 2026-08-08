@@ -56,6 +56,19 @@ pub fn dense_mlp(
     out
 }
 
+/// One expert's feed-forward on one token: `down(silu(gate) * up)`.
+///
+/// `gate_up` is `[2 * intermediate, hidden]` with the gate rows FIRST; the
+/// checkpoint interleaves them and `load::deinterleave_fused` puts them in this
+/// order. This is the unit the Burn lane implements, so both lanes call the
+/// same arithmetic rather than two transcriptions of it.
+pub fn expert_ffn_one(x: &[f32], gate_up: &[f32], down: &[f32], hidden: usize, inter: usize) -> Vec<f32> {
+    assert_eq!(x.len(), hidden);
+    let both = linear(x, gate_up, 1, hidden, 2 * inter);
+    let act: Vec<f32> = (0..inter).map(|i| silu(both[i]) * both[inter + i]).collect();
+    linear(&act, down, 1, inter, hidden)
+}
+
 /// Routed experts over a stacked `[experts, 2 * intermediate, hidden]` matrix.
 ///
 /// Each token goes to its `top_k` experts, is weighted by that expert's routing
@@ -80,10 +93,7 @@ pub fn routed_experts(
         for (slot, &e) in r.experts.iter().enumerate() {
             let gu = &gate_up[e * 2 * inter * hidden..(e + 1) * 2 * inter * hidden];
             let dn = &down[e * hidden * inter..(e + 1) * hidden * inter];
-            let both = linear(xt, gu, 1, hidden, 2 * inter);
-            // chunk(2, dim=-1): the first half is the gate, the second the up.
-            let act: Vec<f32> = (0..inter).map(|i| silu(both[i]) * both[inter + i]).collect();
-            let contrib = linear(&act, dn, 1, inter, hidden);
+            let contrib = expert_ffn_one(xt, gu, dn, hidden, inter);
             let wgt = r.weights[slot];
             for (o, c) in out[t * hidden..(t + 1) * hidden].iter_mut().zip(&contrib) {
                 *o += c * wgt;

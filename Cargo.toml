@@ -107,6 +107,11 @@ k3-cuda = ["k3", "burn/cuda"]
 # Inkling (Thinking Machines) - config + checkpoint layout. Header-only so far:
 # no burn backend, no tensor ops, so this pulls nothing beyond safetensors.
 inkling = ["import", "dep:safetensors", "dep:memmap2"]
+# The Burn lane beside the f32 slice lane, the way k3 keeps kda.rs beside its
+# Burn path. `inkling-burn` runs on ndarray so the gate works without a GPU;
+# `inkling-cuda` adds the GB10 backend on top.
+inkling-burn = ["inkling", "burn/ndarray", "dep:burn-ndarray"]
+inkling-cuda = ["inkling-burn", "burn/cuda"]
 
 # AttnRes (mary::models::k3::attn_res) - the depth-axis mixture and the
 # snapshot boundary that resets it, in Burn. The module itself needs nothing
@@ -294,6 +299,12 @@ required-features = ["inkling"]
 [[bin]]
 name = "inkling_forward"
 required-features = ["inkling"]
+
+# Burn lane vs the f32 slice lane, at real model dimensions. The slice lane is
+# itself gated against transformers, so this needs no torch.
+[[bin]]
+name = "inkling_burn_gate"
+required-features = ["inkling-burn"]
 # KDA parity gate: mary::models::kimi_k3::kda against the flash-linear-attention
 # oracle vectors (Triton kernels + fla's own float64 references). Reads .npz
 # only — no checkpoint, no safetensors — so it does not ride `dev-tools`.
