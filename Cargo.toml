@@ -280,6 +280,13 @@ required-features = ["inkling"]
 [[bin]]
 name = "inkling_towers_gate"
 required-features = ["inkling"]
+
+# The MTP blocks. transformers ships the MTP config surface and no
+# implementation, so the blocks are gated and the composition is reported as
+# having no oracle rather than silently guessed.
+[[bin]]
+name = "inkling_mtp_gate"
+required-features = ["inkling"]
 # KDA parity gate: mary::models::kimi_k3::kda against the flash-linear-attention
 # oracle vectors (Triton kernels + fla's own float64 references). Reads .npz
 # only — no checkpoint, no safetensors — so it does not ride `dev-tools`.
