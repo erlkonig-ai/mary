@@ -97,6 +97,8 @@ fn main() -> Result<()> {
     let mask_local = causal_mask(n, Some(t.sliding_window_size));
     let mask_global = causal_mask(n, None);
     let mut expert_loads = 0usize;
+    let (mut t_attn, mut t_decode, mut t_expert, mut t_other) =
+        (0f64, 0f64, 0f64, 0f64);
 
     for layer in 0..t.num_hidden_layers {
         let l0 = Instant::now();
@@ -107,6 +109,7 @@ fn main() -> Result<()> {
         let g = |nm: &str| -> Result<Vec<f32>> { Ok(cp.tensor(&format!("{p}{nm}"))?.data) };
 
         // ---- attention ----------------------------------------------------
+        let t_a = Instant::now();
         let attn_norm = g("attn_norm.weight")?;
         let hn = rms_norm(&x, &attn_norm, t.rms_norm_eps, n, h);
         let dims = AttnDims {
@@ -140,6 +143,8 @@ fn main() -> Result<()> {
         }
 
         // ---- MLP ----------------------------------------------------------
+        t_attn += t_a.elapsed().as_secs_f64();
+        let t_o = Instant::now();
         let mlp_norm = g("mlp_norm.weight")?;
         let hn = rms_norm(&x, &mlp_norm, t.rms_norm_eps, n, h);
 
@@ -169,10 +174,13 @@ fn main() -> Result<()> {
 
             let mut acc = vec![0f32; n * h];
             for (&e, toks) in &by_expert {
+                let t_d = Instant::now();
                 let gu_raw = cp.expert_slice(&format!("{p}mlp.experts.w13_weight"), e)?.data;
                 let gu = deinterleave_fused(&gu_raw, 2 * inter, h);
                 let dn = cp.expert_slice(&format!("{p}mlp.experts.w2_weight"), e)?.data;
+                t_decode += t_d.elapsed().as_secs_f64();
                 expert_loads += 1;
+                let t_x = Instant::now();
                 for &(ti, wgt) in toks {
                     let xt = &hn[ti * h..(ti + 1) * h];
                     let both = linear(xt, &gu, 1, h, 2 * inter);
@@ -183,6 +191,7 @@ fn main() -> Result<()> {
                         *o += c * wgt;
                     }
                 }
+                t_expert += t_x.elapsed().as_secs_f64();
                 // Dropped here: one expert resident at a time, not 256.
             }
 
@@ -215,6 +224,7 @@ fn main() -> Result<()> {
             }
             std::fs::write(format!("{dir}/h_after_{layer:02}.bin"), &bytes)?;
         }
+        t_other += t_o.elapsed().as_secs_f64();
         let norm: f32 = (x.iter().map(|v| (v * v) as f64).sum::<f64>() / x.len() as f64).sqrt() as f32;
         println!("  layer {layer:2} [{}] {:.1}s  rms {norm:.4}",
                  if is_local { "local " } else { "global" }, l0.elapsed().as_secs_f32());
@@ -232,6 +242,13 @@ fn main() -> Result<()> {
 
     println!("\n=== predictions ===");
     println!("  expert slabs decoded: {expert_loads}");
+    // t_other covers the whole MLP half, so the expert buckets are inside it.
+    println!("  where the time went, seconds:");
+    println!("    attention half      {t_attn:8.1}");
+    println!("    mlp half            {t_other:8.1}   of which:");
+    println!("      expert slab decode{t_decode:8.1}   (disk + NVFP4 unpack)");
+    println!("      expert arithmetic {t_expert:8.1}");
+    println!("      shared + dense    {:8.1}", t_other - t_decode - t_expert);
     println!("  elapsed: {:.1}s", started.elapsed().as_secs_f32());
 
     let mut top_all: Vec<i64> = Vec::new();
