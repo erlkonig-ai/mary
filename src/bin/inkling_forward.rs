@@ -18,7 +18,7 @@
 //!
 //!   cargo run --release --features inkling --bin inkling_forward -- <ckpt> <ids.bin> <out.bin>
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -89,6 +89,20 @@ fn main() -> Result<()> {
     let fnorm = cp.tensor("model.llm.norm.weight")?.data;
     let unembed = cp.tensor("model.llm.unembed.weight")?.data;
     println!("  embedding tables loaded in {:.1}s", started.elapsed().as_secs_f32());
+
+    // Decoded experts, keyed (layer, expert). One pair is ~101 MB at f32, so the
+    // budget is in GB and eviction is plain LRU over insertion/use order.
+    let cache_budget: usize = std::env::var("INK_EXPERT_CACHE_GB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|g| (g * 1024.0 * 1024.0 * 1024.0) as usize)
+        .unwrap_or(8 * 1024 * 1024 * 1024);
+    let mut expert_cache: HashMap<(usize, usize), (Vec<f32>, Vec<f32>)> = HashMap::new();
+    let mut lru: Vec<(usize, usize)> = Vec::new();
+    let mut cache_bytes = 0usize;
+    let mut cache_hits = 0usize;
+    let mut expert_requests = 0usize;
+    println!("  expert cache budget: {:.1} GB", cache_budget as f64 / 1e9);
 
     let mut top_all: Vec<i64> = Vec::new();
     for step in 0..=gen_steps {
@@ -189,19 +203,42 @@ fn main() -> Result<()> {
 
             let mut acc = vec![0f32; n * h];
             for (&e, toks) in &by_expert {
+                let key = (layer, e);
+                expert_requests += 1;
                 let t_d = Instant::now();
-                let gu_raw = cp.expert_slice(&format!("{p}mlp.experts.w13_weight"), e)?.data;
-                let gu = deinterleave_fused(&gu_raw, 2 * inter, h);
-                let dn = cp.expert_slice(&format!("{p}mlp.experts.w2_weight"), e)?.data;
+                if !expert_cache.contains_key(&key) {
+                    let gu_raw = cp.expert_slice(&format!("{p}mlp.experts.w13_weight"), e)?.data;
+                    let gu = deinterleave_fused(&gu_raw, 2 * inter, h);
+                    let dn = cp.expert_slice(&format!("{p}mlp.experts.w2_weight"), e)?.data;
+                    let bytes = (gu.len() + dn.len()) * 4;
+                    while cache_bytes + bytes > cache_budget && !lru.is_empty() {
+                        let old = lru.remove(0);
+                        if let Some((a, b)) = expert_cache.remove(&old) {
+                            cache_bytes -= (a.len() + b.len()) * 4;
+                        }
+                    }
+                    cache_bytes += bytes;
+                    expert_cache.insert(key, (gu, dn));
+                    lru.push(key);
+                    expert_loads += 1;
+                } else {
+                    if let Some(pos) = lru.iter().position(|&k| k == key) {
+                        let k = lru.remove(pos);
+                        lru.push(k);
+                    }
+                    cache_hits += 1;
+                }
                 t_decode += t_d.elapsed().as_secs_f64();
-                expert_loads += 1;
+                // Map fully mutated above; the borrow starts here and ends with
+                // this expert's arithmetic.
+                let (gu, dn) = expert_cache.get(&key).expect("just inserted");
                 let t_x = Instant::now();
                 for &(ti, wgt) in toks {
                     let xt = &hn[ti * h..(ti + 1) * h];
-                    let both = linear(xt, &gu, 1, h, 2 * inter);
+                    let both = linear(xt, gu, 1, h, 2 * inter);
                     let act: Vec<f32> =
                         (0..inter).map(|i| silu(both[i]) * both[inter + i]).collect();
-                    let contrib = linear(&act, &dn, 1, inter, h);
+                    let contrib = linear(&act, dn, 1, inter, h);
                     for (o, c) in acc[ti * h..(ti + 1) * h].iter_mut().zip(&contrib) {
                         *o += c * wgt;
                     }
@@ -255,6 +292,8 @@ fn main() -> Result<()> {
 
     println!("\n=== predictions ===");
     println!("  expert slabs decoded: {expert_loads}");
+    println!("  expert cache hits   : {cache_hits}  resident {:.1} GB in {} entries",
+             cache_bytes as f64 / 1e9, expert_cache.len());
     // t_other covers the whole MLP half, so the expert buckets are inside it.
     println!("  where the time went, seconds:");
     println!("    attention half      {t_attn:8.1}");
@@ -263,6 +302,9 @@ fn main() -> Result<()> {
     println!("      expert arithmetic {t_expert:8.1}");
     println!("      shared + dense    {:8.1}", t_other - t_decode - t_expert);
     println!("  elapsed: {:.1}s", started.elapsed().as_secs_f32());
+
+    println!("  [step {step}] requests {expert_requests}, hits {cache_hits}, decodes {expert_loads}, entries {}",
+             expert_cache.len());
 
     // Greedy: the last position's argmax is the next token.
     let last = &logits[(n - 1) * v..n * v];

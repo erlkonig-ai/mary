@@ -1,8 +1,13 @@
 //! Parity gate for the Inkling Burn lane against the f32 slice lane.
 //!
-//! The slice lane is the reference here, and it is itself gated against
-//! `transformers` by `inkling_layer_gate` and `inkling_real_gate`. So this
-//! needs no torch: the oracle is code that already has one.
+//! The reference is PYTHON, read from the oracle bundles that
+//! `golden/capture_inkling_*.py` dump. Those are raw f32 arrays of
+//! transformers' own outputs, so they gate any implementation -- there is no
+//! reason to compare Burn against the slice lane and inherit a second hop.
+//!
+//! It is also the slow hop: the slice lane is scalar CPU at ~95s a forward
+//! while the Python reference is GPU-accelerated. Gating against the dumps
+//! keeps the iteration loop in seconds.
 //!
 //! Budget, written down before any number was read: worst absolute error over
 //! the tensor's own scale, `1e-5`. Looser than the slice-vs-torch gates because
@@ -97,7 +102,15 @@ fn cmp(a: &[f32], b: &[f32]) -> D {
     d
 }
 
-fn run<B: Backend>(dev: &B::Device, label: &str) -> (usize, usize) {
+fn read_f32(p: &std::path::Path) -> Vec<f32> {
+    let b = std::fs::read(p).unwrap_or_else(|e| panic!("reading {}: {e}", p.display()));
+    assert!(!b.is_empty(), "{} is empty -- the gate would be vacuous", p.display());
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+fn run<B: Backend>(dev: &B::Device, oracle: &std::path::Path, label: &str) -> (usize, usize) {
     let mut checks = 0usize;
     let mut fails = 0usize;
     let mut report = |name: &str, d: D, checks: &mut usize, fails: &mut usize| {
@@ -116,12 +129,15 @@ fn run<B: Backend>(dev: &B::Device, label: &str) -> (usize, usize) {
 
     // Real model dimensions: a toy size would not exercise a backend matmul's
     // blocking, which is the only reason the two lanes differ at all.
-    let (tokens, h, inter, dense_inter) = (8usize, 4096usize, 2048usize, 16384usize);
-    println!("\n=== {label}: tokens {tokens}, hidden {h}, inter {inter}, dense {dense_inter} ===");
+    let (h, inter, dense_inter) = (4096usize, 2048usize, 16384usize);
+    println!("\n=== {label}: hidden {h}, inter {inter}, dense {dense_inter} ===");
 
-    let x = fill(tokens * h, 0x51ED);
-    let gain = fill(h, 0xA17);
+    // Inputs come from the oracle so the comparison is against the same numbers
+    // transformers saw, not merely the same shapes.
+    let x = read_f32(&oracle.join("blk_rms_x.bin"));
+    let gain = read_f32(&oracle.join("blk_rms_w.bin"));
     let eps = 1e-6f64;
+    let tokens = x.len() / h;
 
     // ---- precision discriminator ------------------------------------------
     // Exact in f32, unrepresentable in TF32. Reports the matmul's input
@@ -161,8 +177,8 @@ fn run<B: Backend>(dev: &B::Device, label: &str) -> (usize, usize) {
             .to_vec::<f32>()
             .unwrap()
     };
-    let theirs = mary::models::inkling::block::rms_norm(&x, &gain, eps, tokens, h);
-    report("rms_norm", cmp(&mine, &theirs), &mut checks, &mut fails);
+    let theirs = read_f32(&oracle.join("blk_rms_y.bin"));
+    report("rms_norm vs python", cmp(&mine, &theirs), &mut checks, &mut fails);
 
     // ---- one expert's feed-forward ----------------------------------------
     let gu = fill(2 * inter * h, 0xBEEF);
@@ -185,7 +201,8 @@ fn run<B: Backend>(dev: &B::Device, label: &str) -> (usize, usize) {
         }
         out
     };
-    report("expert_ffn", cmp(&mine, &theirs), &mut checks, &mut fails);
+    report("expert_ffn vs slice (NO python dump at this shape yet)",
+           cmp(&mine, &theirs), &mut checks, &mut fails);
 
     // ---- dense MLP ---------------------------------------------------------
     let g = fill(dense_inter * h, 0x1234);
@@ -204,13 +221,19 @@ fn run<B: Backend>(dev: &B::Device, label: &str) -> (usize, usize) {
     .to_vec::<f32>()
     .unwrap();
     let theirs = slice_lane::dense_mlp(&x, &g, &u, &d, gs, tokens, h, dense_inter);
-    report("dense_mlp", cmp(&mine, &theirs), &mut checks, &mut fails);
+    report("dense_mlp vs slice (NO python dump at this shape yet)",
+           cmp(&mine, &theirs), &mut checks, &mut fails);
 
     (checks, fails)
 }
 
 fn main() {
-    let want_cuda = std::env::args().nth(1).as_deref() == Some("cuda");
+    let args: Vec<String> = std::env::args().collect();
+    let want_cuda = args.iter().any(|a| a == "cuda");
+    let oracle = std::path::PathBuf::from(
+        args.iter().find(|a| a.starts_with('/')).cloned()
+            .unwrap_or_else(|| "./inkling-oracle".to_string()));
+    println!("  python oracle: {}", oracle.display());
     println!("=== Inkling Burn lane vs the f32 slice lane ===");
     println!("  the slice lane is itself gated against transformers, so this needs no torch");
     println!("  budget: worst-absolute-over-scale {BUDGET:e}, written down first");
@@ -221,7 +244,7 @@ fn main() {
     #[cfg(feature = "inkling-cuda")]
     if want_cuda {
         type C = burn::backend::Cuda<f32>;
-        let (c, f) = run::<C>(&Default::default(), "cuda");
+        let (c, f) = run::<C>(&Default::default(), &oracle, "cuda");
         total = (total.0 + c, total.1 + f);
     }
     #[cfg(not(feature = "inkling-cuda"))]
@@ -231,7 +254,7 @@ fn main() {
 
     if !want_cuda {
         type N = burn::backend::NdArray<f32>;
-        let (c, f) = run::<N>(&Default::default(), "ndarray");
+        let (c, f) = run::<N>(&Default::default(), &oracle, "ndarray");
         total = (total.0 + c, total.1 + f);
     }
 
