@@ -58,23 +58,8 @@
 use burn::prelude::*;
 use burn::tensor::{Tensor, TensorData};
 
-use mary::models::inkling::mlp as slice_lane;
 
 const BUDGET: f32 = 1e-5;
-
-/// Deterministic pseudo-random values — no rng dependency, and the same numbers
-/// on every run so a failure can be re-examined.
-fn fill(n: usize, seed: u64) -> Vec<f32> {
-    let mut s = seed | 1;
-    (0..n)
-        .map(|_| {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            ((s >> 40) as f32 / 16_777_216.0) - 0.5
-        })
-        .collect()
-}
 
 fn t2<B: Backend>(v: &[f32], r: usize, c: usize, dev: &B::Device) -> Tensor<B, 2> {
     Tensor::from_data(TensorData::new(v.to_vec(), [r, c]), dev)
@@ -181,10 +166,12 @@ fn run<B: Backend>(dev: &B::Device, oracle: &std::path::Path, label: &str) -> (u
     report("rms_norm vs python", cmp(&mine, &theirs), &mut checks, &mut fails);
 
     // ---- one expert's feed-forward ----------------------------------------
-    let gu = fill(2 * inter * h, 0xBEEF);
-    let dn = fill(h * inter, 0xF00D);
+    let gu = read_f32(&oracle.join("bop_expert_gate_up.bin"));
+    let dn = read_f32(&oracle.join("bop_expert_down.bin"));
+    let xb = read_f32(&oracle.join("bop_x.bin"));
+    let tok_b = xb.len() / h;
     let mine = mary::models::inkling::burn::expert_ffn(
-        t2::<B>(&x, tokens, h, dev),
+        t2::<B>(&xb, tok_b, h, dev),
         t2::<B>(&gu, 2 * inter, h, dev),
         t2::<B>(&dn, h, inter, dev),
     )
@@ -192,25 +179,16 @@ fn run<B: Backend>(dev: &B::Device, oracle: &std::path::Path, label: &str) -> (u
     .convert::<f32>()
     .to_vec::<f32>()
     .unwrap();
-    let theirs = {
-        let mut out = vec![0f32; tokens * h];
-        for t in 0..tokens {
-            let xt = &x[t * h..(t + 1) * h];
-            let contrib = slice_lane::expert_ffn_one(xt, &gu, &dn, h, inter);
-            out[t * h..(t + 1) * h].copy_from_slice(&contrib);
-        }
-        out
-    };
-    report("expert_ffn vs slice (NO python dump at this shape yet)",
-           cmp(&mine, &theirs), &mut checks, &mut fails);
+    let theirs = read_f32(&oracle.join("bop_expert_y.bin"));
+    report("expert_ffn vs python", cmp(&mine, &theirs), &mut checks, &mut fails);
 
     // ---- dense MLP ---------------------------------------------------------
-    let g = fill(dense_inter * h, 0x1234);
-    let u = fill(dense_inter * h, 0x5678);
-    let d = fill(h * dense_inter, 0x9ABC);
+    let g = read_f32(&oracle.join("bop_dense_gate.bin"));
+    let u = read_f32(&oracle.join("bop_dense_up.bin"));
+    let d = read_f32(&oracle.join("bop_dense_down.bin"));
     let gs = 1.7f32;
     let mine = mary::models::inkling::burn::dense_mlp(
-        t2::<B>(&x, tokens, h, dev),
+        t2::<B>(&xb, tok_b, h, dev),
         t2::<B>(&g, dense_inter, h, dev),
         t2::<B>(&u, dense_inter, h, dev),
         t2::<B>(&d, h, dense_inter, dev),
@@ -220,9 +198,8 @@ fn run<B: Backend>(dev: &B::Device, oracle: &std::path::Path, label: &str) -> (u
     .convert::<f32>()
     .to_vec::<f32>()
     .unwrap();
-    let theirs = slice_lane::dense_mlp(&x, &g, &u, &d, gs, tokens, h, dense_inter);
-    report("dense_mlp vs slice (NO python dump at this shape yet)",
-           cmp(&mine, &theirs), &mut checks, &mut fails);
+    let theirs = read_f32(&oracle.join("bop_dense_y.bin"));
+    report("dense_mlp vs python", cmp(&mine, &theirs), &mut checks, &mut fails);
 
     (checks, fails)
 }
@@ -261,7 +238,7 @@ fn main() {
     println!("\n=== verdict ===");
     println!("  checks: {}", total.0);
     if total.1 == 0 {
-        println!("GATE PASSED — {} checks, the Burn lane matches the slice lane", total.0);
+        println!("GATE PASSED — {} checks, the Burn lane matches python", total.0);
     } else {
         println!("GATE FAILED — {} checks, {} FAILURES", total.0, total.1);
         std::process::exit(1);
