@@ -200,18 +200,45 @@ impl Checkpoint {
     }
 }
 
-/// Split a fused `[2 * inter, hidden]` gate-and-up matrix into its halves.
+/// De-interleave a fused matrix along its OUTPUT axis.
 ///
-/// The checkpoint stores `w1` and `w3` concatenated along the OUTPUT dimension:
-/// weight row `i` produces output `i`, and the reference chunks the fused
-/// output as `(gate, up)`, so the gate occupies the first half of the rows.
+/// The checkpoint stores gate and up rows alternating — `g0, u0, g1, u1, …` —
+/// so the even rows are the gate and the odd rows the up projection. Returns
+/// them as two contiguous blocks, which is what every consumer here expects.
+pub fn deinterleave_rows(fused: &[f32], rows: usize, cols: usize) -> (Vec<f32>, Vec<f32>) {
+    assert_eq!(fused.len(), rows * cols);
+    assert!(rows % 2 == 0, "a fused gate/up matrix must have an even row count");
+    let half = rows / 2;
+    let mut a = Vec::with_capacity(half * cols);
+    let mut b = Vec::with_capacity(half * cols);
+    for r in 0..half {
+        a.extend_from_slice(&fused[(2 * r) * cols..(2 * r + 1) * cols]);
+        b.extend_from_slice(&fused[(2 * r + 1) * cols..(2 * r + 2) * cols]);
+    }
+    (a, b)
+}
+
+/// Split a fused gate-and-up matrix stored `[2 * inter, hidden]`.
 ///
-/// This split is an interpretation of the checkpoint, not something its shapes
-/// force — swapping the halves yields the same shapes and a wrong model. It
-/// follows the LLaMA convention that `w1` is the gate and `w3` the up
-/// projection, which is also what the fused MoE path implies.
+/// Authoritative source: `transformers/conversion_mapping.py`, which converts
+/// `mlp.w13_dn.weight` with `[Interleave(dim=0), Chunk(dim=0)]`. The interleave
+/// comes FIRST, so the rows alternate gate/up rather than sitting in halves.
+/// A contiguous split is shape-identical and numerically wrong, and no
+/// comparison against a reference that makes the same split can detect it.
 pub fn split_gate_up(fused: &[f32], hidden: usize) -> (Vec<f32>, Vec<f32>) {
-    assert_eq!(fused.len() % (2 * hidden), 0, "fused matrix is not [2*inter, hidden]");
-    let half = fused.len() / 2;
-    (fused[..half].to_vec(), fused[half..].to_vec())
+    assert_eq!(fused.len() % hidden, 0, "fused matrix is not [rows, hidden]");
+    deinterleave_rows(fused, fused.len() / hidden, hidden)
+}
+
+/// Re-pack an interleaved fused expert matrix into gate-then-up order.
+///
+/// `mlp.experts.w13_weight` is converted with `Interleave(dim=1)` and left
+/// fused, because `InklingExperts` chunks the PRODUCT at run time; so the
+/// stored rows must be de-interleaved once at load and then behave as two
+/// contiguous halves.
+pub fn deinterleave_fused(fused: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let (a, b) = deinterleave_rows(fused, rows, cols);
+    let mut out = a;
+    out.extend_from_slice(&b);
+    out
 }

@@ -27,7 +27,7 @@ use anyhow::{Context, Result};
 use mary::models::inkling::attn::{attention, causal_mask, AttnDims, AttnWeights, LogScaling};
 use mary::models::inkling::block::{rms_norm, route, short_conv, Routing};
 use mary::models::inkling::config::{AttnKind, InklingConfig};
-use mary::models::inkling::load::{split_gate_up, Checkpoint};
+use mary::models::inkling::load::{deinterleave_fused, split_gate_up, Checkpoint};
 use mary::models::inkling::mlp::{dense_mlp, shared_experts};
 use mary::models::inkling::stack::{embed_and_norm, head};
 
@@ -169,7 +169,8 @@ fn main() -> Result<()> {
 
             let mut acc = vec![0f32; n * h];
             for (&e, toks) in &by_expert {
-                let gu = cp.expert_slice(&format!("{p}mlp.experts.w13_weight"), e)?.data;
+                let gu_raw = cp.expert_slice(&format!("{p}mlp.experts.w13_weight"), e)?.data;
+                let gu = deinterleave_fused(&gu_raw, 2 * inter, h);
                 let dn = cp.expert_slice(&format!("{p}mlp.experts.w2_weight"), e)?.data;
                 expert_loads += 1;
                 for &(ti, wgt) in toks {
@@ -191,8 +192,9 @@ fn main() -> Result<()> {
             let mut su = Vec::with_capacity(sfused.len() / 2);
             for s in 0..t.n_shared_experts {
                 let blk = &sfused[s * per..(s + 1) * per];
-                sg.extend_from_slice(&blk[..per / 2]);
-                su.extend_from_slice(&blk[per / 2..]);
+                let (a, b) = mary::models::inkling::load::deinterleave_rows(blk, 2 * inter, h);
+                sg.extend_from_slice(&a);
+                su.extend_from_slice(&b);
             }
             drop(sfused);
             let sd = cp.tensor(&format!("{p}mlp.shared_experts.shared_w2_weight"))?.data;
