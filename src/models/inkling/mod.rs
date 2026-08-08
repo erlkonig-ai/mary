@@ -21,5 +21,6 @@ pub mod layout;
 pub mod load;
 pub mod mlp;
 pub mod nvfp4;
+pub mod stack;
 
 pub use config::InklingConfig;
