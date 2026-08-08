@@ -16,7 +16,9 @@
 pub mod attn;
 pub mod block;
 pub mod config;
+pub mod layer;
 pub mod layout;
+pub mod mlp;
 pub mod nvfp4;
 
 pub use config::InklingConfig;
