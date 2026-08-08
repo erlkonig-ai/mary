@@ -16,6 +16,28 @@
 //! values it compared. A gate that ran on 4x4 tensors would pass without
 //! touching the blocking behaviour that makes a backend matmul differ at all.
 //!
+//! MEASURED 2026-08-08 on the GB10. ndarray passes; CUDA does NOT, and the
+//! shape of the failure is the finding:
+//!
+//! ```text
+//!   rms_norm    1.1e-6   passes
+//!   expert_ffn  4.5e-4   FAILS, 45x over
+//!   dense_mlp   4.3e-4   FAILS, 43x over
+//! ```
+//!
+//! Only the matmul-bearing checks fail, both at the same magnitude, while
+//! RMSNorm under the identical metric passes at 1.1e-6 — so this is not a
+//! cancellation artifact and not the elementwise path. About 4.3e-4 relative is
+//! roughly eleven bits of mantissa, which is what a TF32 tensor-core matmul
+//! gives. The likely cause is cubecl dispatching f32 matmul to TF32 on this
+//! backend; confirming that and finding the switch to force full f32 accumulate
+//! is open work.
+//!
+//! The budget is deliberately NOT widened to accommodate it. A GPU lane that
+//! silently carries eleven mantissa bits is a fact worth failing over, and the
+//! whole point of gating the Burn lane against the slice lane is to surface
+//! exactly this before anything depends on it.
+//!
 //!   cargo run --release --features inkling-burn --bin inkling_burn_gate
 //!   cargo run --release --features inkling-cuda --bin inkling_burn_gate -- cuda
 
