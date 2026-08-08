@@ -263,6 +263,12 @@ required-features = ["inkling"]
 [[bin]]
 name = "inkling_layer_gate"
 required-features = ["inkling"]
+
+# End-to-end gate: one REAL layer of the released checkpoint, loaded through the
+# layout and the NVFP4 decode, against transformers running the same layer.
+[[bin]]
+name = "inkling_real_gate"
+required-features = ["inkling"]
 # KDA parity gate: mary::models::kimi_k3::kda against the flash-linear-attention
 # oracle vectors (Triton kernels + fla's own float64 references). Reads .npz
 # only — no checkpoint, no safetensors — so it does not ride `dev-tools`.
