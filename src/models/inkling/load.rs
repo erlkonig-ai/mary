@@ -30,6 +30,20 @@ pub struct Loaded {
     pub shape: Vec<usize>,
 }
 
+/// One expert's packed NVFP4 weight, exactly as it sits in the checkpoint.
+///
+/// `codes` is `[rows, cols]` bytes, two 4-bit E2M1 codes each, low nibble
+/// first. `scales` is `[rows, rows_of_scales]` raw E4M3 bytes, one per
+/// [`crate::models::inkling::nvfp4::GROUP`] logical elements. `scale2` is the
+/// single F32 factor this expert carries. Logical width is `cols * 2`.
+pub struct PackedExpert {
+    pub codes: Vec<u8>,
+    pub scales: Vec<u8>,
+    pub scale2: f32,
+    pub rows: usize,
+    pub cols: usize,
+}
+
 impl Checkpoint {
     /// Open a checkpoint, reading `model.safetensors.index.json`.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
@@ -149,23 +163,16 @@ impl Checkpoint {
             return Ok(Loaded { data, shape: vec![rows, cols] });
         }
 
-        let logical = cols * 2;
-        let scales_per_row = logical / GROUP;
-        let scale2 = self.tensor(&format!("{base}.scale2"))?;
-        anyhow::ensure!(scale2.data.len() == experts, "scale2 is {}", scale2.data.len());
-        let codes = self.with_bytes(base, |raw| {
-            Ok(raw[e * rows * cols..(e + 1) * rows * cols].to_vec())
-        })?;
-        let scales = self.with_bytes(&format!("{base}.scale"), |raw| {
-            let s0 = e * rows * scales_per_row;
-            Ok(raw[s0..s0 + rows * scales_per_row].to_vec())
-        })?;
-        let mut out = vec![0f32; rows * logical];
+        // Slice once, here, and decode on top -- so the device path and this
+        // path cannot disagree about where an expert's bytes are.
+        let q = self.expert_slice_packed(base, e)?;
+        let logical = q.cols * 2;
+        let mut out = vec![0f32; q.rows * logical];
         let n = decode_stacked(
-            &codes, &scales, &scale2.data[e..e + 1], 1, rows, cols, &mut out,
+            &q.codes, &q.scales, &[q.scale2], 1, q.rows, q.cols, &mut out,
         );
         anyhow::ensure!(n == out.len(), "decoded {n} of {}", out.len());
-        Ok(Loaded { data: out, shape: vec![rows, logical] })
+        Ok(Loaded { data: out, shape: vec![q.rows, logical] })
     }
 
     /// Map a shard and hand the tensor's raw bytes to `f` without copying them.
@@ -195,6 +202,50 @@ impl Checkpoint {
     }
 
     /// Read the tensor a layout slot names.
+    /// Whether an expert stack is packed NVFP4 rather than BF16.
+    ///
+    /// Inkling-Small is mixed precision: 39 of its 40 MoE layers are NVFP4, and
+    /// layer 2 — the first — is BF16 with no `.scale` sidecar. A device lane
+    /// that assumes NVFP4 everywhere dies on exactly one layer out of forty,
+    /// which is the kind of thing a sampled gate never sees.
+    pub fn is_nvfp4(&self, base: &str) -> bool {
+        self.shard_of.contains_key(&format!("{base}.scale"))
+    }
+
+    /// One expert's NVFP4 bytes, sliced out of the stack and **not decoded**.
+    ///
+    /// The decode is the expensive part -- 53% of a measured forward -- and on
+    /// a GPU it belongs on the device, so the bytes have to be reachable
+    /// undecoded. [`Checkpoint::expert_slice`] is this plus
+    /// [`crate::models::inkling::nvfp4::decode_stacked`], which keeps the two
+    /// lanes reading the same offsets.
+    pub fn expert_slice_packed(&self, base: &str, e: usize) -> Result<PackedExpert> {
+        let shape = self.shape_of(base)?;
+        anyhow::ensure!(shape.len() == 3, "{base} is rank {}", shape.len());
+        let (experts, rows, cols) = (shape[0], shape[1], shape[2]);
+        anyhow::ensure!(e < experts, "expert {e} of {experts}");
+        anyhow::ensure!(
+            self.shard_of.contains_key(&format!("{base}.scale")),
+            "{base} has no .scale sidecar -- it is not NVFP4",
+        );
+
+        let logical = cols * 2;
+        anyhow::ensure!(logical % GROUP == 0, "{logical} logical is not a multiple of {GROUP}");
+        let scales_per_row = logical / GROUP;
+        let scale2 = self.tensor(&format!("{base}.scale2"))?;
+        anyhow::ensure!(scale2.data.len() == experts, "scale2 is {}", scale2.data.len());
+        let codes = self.with_bytes(base, |raw| {
+            anyhow::ensure!(raw.len() == experts * rows * cols, "{base} is {} bytes", raw.len());
+            Ok(raw[e * rows * cols..(e + 1) * rows * cols].to_vec())
+        })?;
+        let scales = self.with_bytes(&format!("{base}.scale"), |raw| {
+            let s0 = e * rows * scales_per_row;
+            anyhow::ensure!(raw.len() >= s0 + rows * scales_per_row, "{base}.scale is short");
+            Ok(raw[s0..s0 + rows * scales_per_row].to_vec())
+        })?;
+        Ok(PackedExpert { codes, scales, scale2: scale2.data[e], rows, cols })
+    }
+
     pub fn slot(&self, slot: Slot) -> Result<Loaded> {
         self.tensor(&slot.tensor_name())
     }

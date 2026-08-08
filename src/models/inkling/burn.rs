@@ -160,3 +160,137 @@ pub fn dequant_nvfp4<B: Backend>(
     // Block scale first, then the per-row factor -- the reference's order.
     vals.mul(s).mul(scale2.reshape([rows, 1]).repeat_dim(1, logical))
 }
+
+
+/// Reorder a fused `[2 * intermediate, hidden]` from the checkpoint's
+/// interleave to gate-rows-first, on device.
+///
+/// The checkpoint stores gate and up **alternating by row**: gate is the even
+/// output rows, up the odd ones. It does NOT store them as contiguous halves.
+/// Splitting down the middle loads without complaint and scrambles every
+/// SwiGLU in every layer -- shape-identical, catastrophically wrong, and
+/// invisible to any check that compares two lanes which share the assumption.
+/// Authority is `transformers`' `conversion_mapping.py`, key `inkling_mm_model`.
+///
+/// This is the device twin of
+/// [`crate::models::inkling::load::deinterleave_fused`]; the two must agree.
+pub fn deinterleave_rows_device<B: Backend>(fused: Tensor<B, 2>) -> Tensor<B, 2> {
+    let [rows, _] = fused.dims();
+    assert!(rows % 2 == 0, "fused row count {rows} is odd; gate/up cannot interleave");
+    let half = rows / 2;
+    let mut order: Vec<i32> = Vec::with_capacity(rows);
+    order.extend((0..half).map(|r| (2 * r) as i32)); // gate: even rows
+    order.extend((0..half).map(|r| (2 * r + 1) as i32)); // up: odd rows
+    let dev = fused.device();
+    let idx = Tensor::<B, 1, Int>::from_data(TensorData::new(order, [rows]), &dev);
+    fused.select(0, idx)
+}
+
+/// Upload one expert's packed NVFP4 bytes and dequantise them on the device.
+///
+/// Takes exactly what [`crate::models::inkling::load::Checkpoint::expert_slice_packed`]
+/// returns, so the host never materialises the f32 weight. Returns
+/// `[rows, cols * 2]`.
+///
+/// `scale2` is one factor for the whole expert; it is broadcast to every row
+/// because [`dequant_nvfp4`] takes a per-row vector, which is the shape the
+/// stacked layout would need if scale2 ever became per-row.
+pub fn expert_weight_from_packed<B: Backend>(
+    codes: &[u8],
+    scales: &[u8],
+    scale2: f32,
+    rows: usize,
+    cols: usize,
+    dev: &B::Device,
+) -> Tensor<B, 2> {
+    assert_eq!(codes.len(), rows * cols, "codes is {} bytes, want {rows}x{cols}", codes.len());
+    assert_eq!(scales.len() % rows, 0, "{} scales do not divide {rows} rows", scales.len());
+    let n_scales = scales.len() / rows;
+
+    // Bitcast four bytes into a word rather than widening each to an i32:
+    // same bytes, a quarter of the elements, and no host-side expansion of the
+    // very data the packed path exists to keep packed.
+    assert_eq!(cols % 4, 0, "{cols} bytes per row does not pack into i32 words");
+    assert_eq!(n_scales % 4, 0, "{n_scales} scales per row does not pack into i32 words");
+    let word = |b: &[u8]| -> Vec<i32> {
+        b.chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    };
+    let codes_t =
+        Tensor::<B, 2, Int>::from_data(TensorData::new(word(codes), [rows, cols / 4]), dev);
+    let scales_t =
+        Tensor::<B, 2, Int>::from_data(TensorData::new(word(scales), [rows, n_scales / 4]), dev);
+    let s2 = Tensor::<B, 1>::from_data(TensorData::new(vec![scale2; rows], [rows]), dev);
+    dequant_nvfp4_words(codes_t, scales_t, s2)
+}
+
+
+/// Dequantise NVFP4 from **word-packed** codes, so the host never widens them.
+///
+/// `code_words` is `[rows, cols / 4]`: four consecutive packed bytes bitcast
+/// into one little-endian `i32`. `scale_words` is `[rows, n_scales / 4]`, the
+/// same treatment for the raw E4M3 scale bytes. Returns `[rows, cols * 2]`.
+///
+/// Why words: uploading one `i32` per byte expands the packed weight 4x on the
+/// host, which measured at 27.6s of a 38.8s expert lane against 4.5s of actual
+/// device work. A bitcast moves the same bytes and a quarter as many elements.
+///
+/// The nibble arithmetic is simpler here than in the byte form, not more
+/// complex. Little-endian byte j occupies bits `8j..8j+7`, and NVFP4 stores the
+/// low nibble first, so logical element k of a word is exactly `(w >> 4k) & 0xF`
+/// for k in 0..8 — the byte stage has no reason to exist. Sign extension from
+/// the arithmetic shift is discarded by the mask.
+///
+/// Gated against [`dequant_nvfp4`], which is itself bit-exact against
+/// `compressed_tensors`, so this inherits that oracle rather than asserting its
+/// own correctness.
+pub fn dequant_nvfp4_words<B: Backend>(
+    code_words: Tensor<B, 2, Int>,
+    scale_words: Tensor<B, 2, Int>,
+    scale2: Tensor<B, 1>,
+) -> Tensor<B, 2> {
+    use crate::models::inkling::nvfp4::GROUP;
+    let dev = code_words.device();
+    let (fp4_lut, e4m3_lut) = luts::<B>(&dev);
+    let [rows, cwords] = code_words.dims();
+    let [rows_s, swords] = scale_words.dims();
+    assert_eq!(rows, rows_s, "codes have {rows} rows, scales {rows_s}");
+    let logical = cwords * 8;
+
+    // Eight 4-bit codes per word, low nibble first, in logical order.
+    let mut nib = Vec::with_capacity(8);
+    for k in 0..8u32 {
+        nib.push(
+            code_words
+                .clone()
+                .bitwise_right_shift_scalar(((4 * k) as i32).elem())
+                .bitwise_and_scalar(0x0Fi32.elem())
+                .reshape([rows, cwords, 1]),
+        );
+    }
+    let codes = Tensor::cat(nib, 2).reshape([rows, logical]);
+    let vals = gather2(fp4_lut, codes);
+
+    // Four E4M3 scale bytes per word, likewise in order.
+    let mut by = Vec::with_capacity(4);
+    for j in 0..4u32 {
+        by.push(
+            scale_words
+                .clone()
+                .bitwise_right_shift_scalar(((8 * j) as i32).elem())
+                .bitwise_and_scalar(0xFFi32.elem())
+                .reshape([rows, swords, 1]),
+        );
+    }
+    let n_scales = swords * 4;
+    assert_eq!(n_scales * GROUP, logical, "{n_scales} scales cannot cover {logical} values");
+    let s = gather2(e4m3_lut, Tensor::cat(by, 2).reshape([rows, n_scales]))
+        .reshape([rows, n_scales, 1])
+        .repeat_dim(2, GROUP)
+        .reshape([rows, logical]);
+
+    // Block scale first, then the per-row factor -- the reference's order,
+    // because float multiplication does not associate.
+    vals.mul(s).mul(scale2.reshape([rows, 1]).repeat_dim(1, logical))
+}

@@ -18,7 +18,7 @@
 //!
 //!   cargo run --release --features inkling --bin inkling_forward -- <ckpt> <ids.bin> <out.bin>
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -37,16 +37,138 @@ fn silu(x: f32) -> f32 {
 }
 
 /// `y = x W^T`, `W` stored `[out, in]`.
+///
+/// The accumulation is strictly sequential f32, which is the worst-case order
+/// for error growth over 4096 terms. `INK_HOST_SUM=reverse` sums the identical
+/// products from the far end: same mathematics, different rounding, same lane.
+/// That makes the host disagree with itself, which is the only honest way to
+/// measure how much of a host-vs-device gap is just f32 reassociation.
 fn linear(x: &[f32], w: &[f32], rows: usize, in_dim: usize, out_dim: usize) -> Vec<f32> {
+    let rev = std::env::var("INK_HOST_SUM").map(|v| v == "reverse").unwrap_or(false);
     let mut out = vec![0f32; rows * out_dim];
     for r in 0..rows {
         let xr = &x[r * in_dim..(r + 1) * in_dim];
         for o in 0..out_dim {
             let wr = &w[o * in_dim..(o + 1) * in_dim];
-            out[r * out_dim + o] = xr.iter().zip(wr).map(|(a, b)| a * b).sum();
+            out[r * out_dim + o] = if rev {
+                xr.iter().zip(wr).rev().map(|(a, b)| a * b).sum()
+            } else {
+                xr.iter().zip(wr).map(|(a, b)| a * b).sum()
+            };
         }
     }
     out
+}
+
+/// The backend the device lane runs on.
+#[cfg(feature = "inkling-cuda")]
+type Bk = burn::backend::Cuda<f32>;
+#[cfg(feature = "inkling-cuda")]
+use burn::prelude::Backend;
+
+/// Every routed expert for one layer, on the device, without a host f32 copy.
+///
+/// The host never sees a dequantised weight: `expert_slice_packed` hands over
+/// the checkpoint's own bytes, they are uploaded as-is, and the E2M1/E4M3
+/// decode happens on the device through the same gated lookup tables the CPU
+/// lane uses. That removes the 60.2s of a measured 113.7s forward that was
+/// scalar unpacking, and the 67 MB per-expert host allocation with it.
+///
+/// All of an expert's tokens go through in one matmul rather than one each.
+/// That reassociates the sums, so this is NOT bitwise identical to the host
+/// lane and must be gated on a tolerance, not on equality.
+///
+/// Syncs before returning, so the caller's timer measures work and not
+/// enqueueing.
+#[cfg(feature = "inkling-cuda")]
+#[allow(clippy::too_many_arguments)]
+fn routed_experts_gpu<B: Backend>(
+    cp: &Checkpoint,
+    prefix: &str,
+    by_expert: &BTreeMap<usize, Vec<(usize, f32)>>,
+    hn: &[f32],
+    n: usize,
+    h: usize,
+    inter: usize,
+    dev: &B::Device,
+    host: &mut (f64, f64),
+) -> Result<Vec<f32>> {
+    use burn::tensor::{Int, Tensor, TensorData};
+    use mary::models::inkling::burn::{
+        deinterleave_rows_device, expert_ffn, expert_weight_from_packed,
+    };
+
+    let hn_dev: Tensor<B, 2> =
+        Tensor::from_data(TensorData::new(hn.to_vec(), [n, h]), dev);
+    let mut acc: Tensor<B, 2> = Tensor::zeros([n, h], dev);
+
+    for (&e, toks) in by_expert {
+        let n13 = format!("{prefix}mlp.experts.w13_weight");
+        let n2 = format!("{prefix}mlp.experts.w2_weight");
+
+        // 39 of 40 MoE layers are packed NVFP4; layer 2 is BF16. The packed
+        // branch never makes a host f32 copy. The BF16 branch has to widen
+        // somewhere, so it widens on the host — one layer in forty, stated
+        // rather than hidden.
+        let t_s = Instant::now();
+        let (fused, dn) = if cp.is_nvfp4(&n13) {
+            let w13 = cp.expert_slice_packed(&n13, e)?;
+            let w2 = cp.expert_slice_packed(&n2, e)?;
+            host.0 += t_s.elapsed().as_secs_f64();
+            let t_w = Instant::now();
+            let r = (
+                expert_weight_from_packed::<B>(
+                    &w13.codes, &w13.scales, w13.scale2, w13.rows, w13.cols, dev,
+                ),
+                expert_weight_from_packed::<B>(
+                    &w2.codes, &w2.scales, w2.scale2, w2.rows, w2.cols, dev,
+                ),
+            );
+            host.1 += t_w.elapsed().as_secs_f64();
+            r
+        } else {
+            let a = cp.expert_slice(&n13, e)?;
+            let b = cp.expert_slice(&n2, e)?;
+            host.0 += t_s.elapsed().as_secs_f64();
+            let t_w = Instant::now();
+            let r = (
+                Tensor::<B, 2>::from_data(TensorData::new(a.data, [2 * inter, h]), dev),
+                Tensor::<B, 2>::from_data(TensorData::new(b.data, [h, inter]), dev),
+            );
+            host.1 += t_w.elapsed().as_secs_f64();
+            r
+        };
+        // One permutation for both branches: the fused tensor arrives in
+        // checkpoint interleave either way.
+        //
+        // INK_MUTATE_NO_DEINTERLEAVE exists so the lane gate can be watched
+        // rejecting something, because a gate that has never failed and a gate
+        // that cannot fail look identical from outside.
+        let gu = if std::env::var("INK_MUTATE_NO_DEINTERLEAVE").is_ok() {
+            fused
+        } else {
+            deinterleave_rows_device(fused)
+        };
+        anyhow::ensure!(gu.dims() == [2 * inter, h], "w13 is {:?}, want [{}, {h}]", gu.dims(), 2 * inter);
+        anyhow::ensure!(dn.dims() == [h, inter], "w2 is {:?}, want [{h}, {inter}]", dn.dims());
+
+        let rows: Vec<i32> = toks.iter().map(|&(ti, _)| ti as i32).collect();
+        let wts: Vec<f32> = toks.iter().map(|&(_, w)| w).collect();
+        let k = rows.len();
+        let idx: Tensor<B, 1, Int> =
+            Tensor::from_data(TensorData::new(rows, [k]), dev);
+        let wt: Tensor<B, 2> =
+            Tensor::from_data(TensorData::new(wts, [k, 1]), dev);
+
+        let xs = hn_dev.clone().select(0, idx.clone());
+        let ys = expert_ffn(xs, gu, dn) * wt;
+        acc = acc.select_assign(0, idx, ys, burn::tensor::IndexingUpdateOp::Add);
+    }
+
+    // Reading back is the sync. It is also the only host copy in the routine:
+    // [n, h] f32, 131 KB at these dimensions, against the 67 MB per expert the
+    // host lane allocates.
+    Ok(acc.into_data().convert::<f32>().to_vec::<f32>().expect("acc to host"))
 }
 
 fn main() -> Result<()> {
@@ -90,19 +212,22 @@ fn main() -> Result<()> {
     let unembed = cp.tensor("model.llm.unembed.weight")?.data;
     println!("  embedding tables loaded in {:.1}s", started.elapsed().as_secs_f32());
 
-    // Decoded experts, keyed (layer, expert). One pair is ~101 MB at f32, so the
-    // budget is in GB and eviction is plain LRU over insertion/use order.
-    let cache_budget: usize = std::env::var("INK_EXPERT_CACHE_GB")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .map(|g| (g * 1024.0 * 1024.0 * 1024.0) as usize)
-        .unwrap_or(8 * 1024 * 1024 * 1024);
-    let mut expert_cache: HashMap<(usize, usize), (Vec<f32>, Vec<f32>)> = HashMap::new();
-    let mut lru: Vec<(usize, usize)> = Vec::new();
-    let mut cache_bytes = 0usize;
-    let mut cache_hits = 0usize;
-    let mut expert_requests = 0usize;
-    println!("  expert cache budget: {:.1} GB", cache_budget as f64 / 1e9);
+    // Experts are read, applied and dropped. There is no decoded-expert cache:
+    // it measured as no speedup, and it existed to paper over a capacity
+    // shortfall (160 GB of checkpoint against 119 GB of box) that a second
+    // Spark closes. See this file's header.
+    let experts_on_gpu = std::env::var("INK_EXPERTS").map(|v| v == "gpu").unwrap_or(false);
+    println!("  routed experts     : {}", if experts_on_gpu { "device" } else { "host (f32 oracle)" });
+    if std::env::var("INK_HOST_SUM").map(|v| v == "reverse").unwrap_or(false) {
+        println!("  host sum order     : REVERSED (reassociation control)");
+    }
+    if std::env::var("INK_MUTATE_NO_DEINTERLEAVE").is_ok() {
+        println!("  !! MUTATION ACTIVE : deinterleave SKIPPED -- this output is expected to be WRONG");
+    }
+    #[cfg(feature = "inkling-cuda")]
+    let dev = burn::backend::cuda::CudaDevice::default();
+    #[cfg(not(feature = "inkling-cuda"))]
+    anyhow::ensure!(!experts_on_gpu, "INK_EXPERTS=gpu needs --features inkling-cuda");
 
     let mut top_all: Vec<i64> = Vec::new();
     for step in 0..=gen_steps {
@@ -126,8 +251,10 @@ fn main() -> Result<()> {
     let mask_global = causal_mask(n, None);
     #[allow(unused_assignments)]
     let mut expert_loads = 0usize;
-    let (mut t_attn, mut t_decode, mut t_expert, mut t_other) =
-        (0f64, 0f64, 0f64, 0f64);
+    let (mut t_attn, mut t_expert, mut t_other) = (0f64, 0f64, 0f64);
+    // (slice, widen+upload) -- host-side and therefore honestly attributable,
+    // unlike anything downstream of an enqueued device call.
+    let mut host_t = (0f64, 0f64);
 
     for layer in 0..t.num_hidden_layers {
         let l0 = Instant::now();
@@ -201,51 +328,41 @@ fn main() -> Result<()> {
                 }
             }
 
-            let mut acc = vec![0f32; n * h];
-            for (&e, toks) in &by_expert {
-                let key = (layer, e);
-                expert_requests += 1;
-                let t_d = Instant::now();
-                if !expert_cache.contains_key(&key) {
+            let t_d = Instant::now();
+            let acc = if experts_on_gpu {
+                #[cfg(feature = "inkling-cuda")]
+                {
+                    let a = routed_experts_gpu::<Bk>(&cp, &p, &by_expert, &hn, n, h, inter, &dev, &mut host_t)?;
+                    expert_loads += by_expert.len();
+                    a
+                }
+                #[cfg(not(feature = "inkling-cuda"))]
+                unreachable!("guarded at startup")
+            } else {
+                let mut acc = vec![0f32; n * h];
+                for (&e, toks) in &by_expert {
                     let gu_raw = cp.expert_slice(&format!("{p}mlp.experts.w13_weight"), e)?.data;
                     let gu = deinterleave_fused(&gu_raw, 2 * inter, h);
                     let dn = cp.expert_slice(&format!("{p}mlp.experts.w2_weight"), e)?.data;
-                    let bytes = (gu.len() + dn.len()) * 4;
-                    while cache_bytes + bytes > cache_budget && !lru.is_empty() {
-                        let old = lru.remove(0);
-                        if let Some((a, b)) = expert_cache.remove(&old) {
-                            cache_bytes -= (a.len() + b.len()) * 4;
+                    expert_loads += 1;
+                    for &(ti, wgt) in toks {
+                        let xt = &hn[ti * h..(ti + 1) * h];
+                        let both = linear(xt, &gu, 1, h, 2 * inter);
+                        let act: Vec<f32> =
+                            (0..inter).map(|i| silu(both[i]) * both[inter + i]).collect();
+                        let contrib = linear(&act, &dn, 1, inter, h);
+                        for (o, c) in acc[ti * h..(ti + 1) * h].iter_mut().zip(&contrib) {
+                            *o += c * wgt;
                         }
                     }
-                    cache_bytes += bytes;
-                    expert_cache.insert(key, (gu, dn));
-                    lru.push(key);
-                    expert_loads += 1;
-                } else {
-                    if let Some(pos) = lru.iter().position(|&k| k == key) {
-                        let k = lru.remove(pos);
-                        lru.push(k);
-                    }
-                    cache_hits += 1;
+                    // Dropped here: one expert resident at a time, not 256.
                 }
-                t_decode += t_d.elapsed().as_secs_f64();
-                // Map fully mutated above; the borrow starts here and ends with
-                // this expert's arithmetic.
-                let (gu, dn) = expert_cache.get(&key).expect("just inserted");
-                let t_x = Instant::now();
-                for &(ti, wgt) in toks {
-                    let xt = &hn[ti * h..(ti + 1) * h];
-                    let both = linear(xt, gu, 1, h, 2 * inter);
-                    let act: Vec<f32> =
-                        (0..inter).map(|i| silu(both[i]) * both[inter + i]).collect();
-                    let contrib = linear(&act, dn, 1, inter, h);
-                    for (o, c) in acc[ti * h..(ti + 1) * h].iter_mut().zip(&contrib) {
-                        *o += c * wgt;
-                    }
-                }
-                t_expert += t_x.elapsed().as_secs_f64();
-                // Dropped here: one expert resident at a time, not 256.
-            }
+                acc
+            };
+            // One number, not two. On the device lane the calls are queued, so a
+            // decode/arithmetic split would time enqueueing rather than work;
+            // `routed_experts_gpu` syncs before returning, so this total is real.
+            t_expert += t_d.elapsed().as_secs_f64();
 
             let sfused = cp.tensor(&format!("{p}mlp.shared_experts.shared_w13_weight"))?.data;
             let per = sfused.len() / t.n_shared_experts;
@@ -292,19 +409,23 @@ fn main() -> Result<()> {
 
     println!("\n=== predictions ===");
     println!("  expert slabs decoded: {expert_loads}");
-    println!("  expert cache hits   : {cache_hits}  resident {:.1} GB in {} entries",
-             cache_bytes as f64 / 1e9, expert_cache.len());
     // t_other covers the whole MLP half, so the expert buckets are inside it.
     println!("  where the time went, seconds:");
     println!("    attention half      {t_attn:8.1}");
     println!("    mlp half            {t_other:8.1}   of which:");
-    println!("      expert slab decode{t_decode:8.1}   (disk + NVFP4 unpack)");
-    println!("      expert arithmetic {t_expert:8.1}");
-    println!("      shared + dense    {:8.1}", t_other - t_decode - t_expert);
+    println!("      routed experts    {t_expert:8.1}   ({})",
+             if experts_on_gpu { "slice + upload + dequant + matmul, device" }
+             else { "disk + NVFP4 unpack + matmul, host" });
+    println!("      shared + dense    {:8.1}", t_other - t_expert);
+    if experts_on_gpu {
+        println!("    of the routed-expert total, the host-synchronous parts:");
+        println!("      slice from mmap   {:8.1}", host_t.0);
+        println!("      widen + upload    {:8.1}", host_t.1);
+        println!("      remainder         {:8.1}   (enqueue + the sync, so device work lives here)",
+                 t_expert - host_t.0 - host_t.1);
+    }
     println!("  elapsed: {:.1}s", started.elapsed().as_secs_f32());
 
-    println!("  [step {step}] requests {expert_requests}, hits {cache_hits}, decodes {expert_loads}, entries {}",
-             expert_cache.len());
 
     // Greedy: the last position's argmax is the next token.
     let last = &logits[(n - 1) * v..n * v];
