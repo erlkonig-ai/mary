@@ -16,7 +16,7 @@
 //! added it should get that treatment explicitly rather than by default.
 
 use burn::prelude::*;
-use burn::tensor::Tensor;
+use burn::tensor::{ElementConversion, Int, Tensor, TensorData};
 
 /// `x * sigmoid(x)`, elementwise.
 pub fn silu<B: Backend>(x: Tensor<B, 2>) -> Tensor<B, 2> {
@@ -84,4 +84,79 @@ pub fn dense_mlp<B: Backend>(
     let g = linear(x.clone(), gate);
     let u = linear(x, up);
     linear(silu(g) * u, down).mul_scalar(global_scale)
+}
+
+
+/// FP4 (E2M1) values by 4-bit code, and the E4M3 table, as device tensors.
+///
+/// Built on the host from the scalar decoders in
+/// [`crate::models::inkling::nvfp4`], which are gated bit-exactly against
+/// `compressed_tensors` and against torch over all 256 E4M3 patterns. A gather
+/// through those tables cannot drift from the CPU lane; a reimplemented
+/// bit-twiddle could.
+fn luts<B: Backend>(dev: &B::Device) -> (Tensor<B, 1>, Tensor<B, 1>) {
+    use crate::models::inkling::nvfp4::{e4m3_to_f32, FP4_E2M1};
+    let fp4 = Tensor::from_data(TensorData::new(FP4_E2M1.to_vec(), [16]), dev);
+    // NaN would poison a gather, and only 0x7F/0xFF are NaN in E4M3-fn; they
+    // never appear as a block scale, so map them to zero rather than carrying
+    // NaN into every product in the row.
+    let e4m3: Vec<f32> = (0..256u16)
+        .map(|b| {
+            let v = e4m3_to_f32(b as u8);
+            if v.is_nan() { 0.0 } else { v }
+        })
+        .collect();
+    let e4m3 = Tensor::from_data(TensorData::new(e4m3, [256]), dev);
+    (fp4, e4m3)
+}
+
+/// Look up `idx` in a 1-D table, preserving the index tensor's shape.
+fn gather2<B: Backend>(table: Tensor<B, 1>, idx: Tensor<B, 2, Int>) -> Tensor<B, 2> {
+    let [r, c] = idx.dims();
+    table.select(0, idx.reshape([r * c])).reshape([r, c])
+}
+
+/// Dequantise NVFP4 on device.
+///
+/// `codes` is `[rows, bytes]` holding the packed byte values, `scales` is
+/// `[rows, bytes * 2 / GROUP]` holding raw E4M3 byte values, and `scale2` is one
+/// factor per row. Returns `[rows, bytes * 2]`.
+///
+/// Nibble order is low-first, settled against
+/// `compressed_tensors.compressors.unpack_fp4_from_uint8`; the association is
+/// `(fp4 * block_scale) * scale2`, matching the reference, because float
+/// multiplication does not associate and the CPU lane was gated on that order.
+pub fn dequant_nvfp4<B: Backend>(
+    codes: Tensor<B, 2, Int>,
+    scales: Tensor<B, 2, Int>,
+    scale2: Tensor<B, 1>,
+) -> Tensor<B, 2> {
+    use crate::models::inkling::nvfp4::GROUP;
+    let dev = codes.device();
+    let (fp4_lut, e4m3_lut) = luts::<B>(&dev);
+    let [rows, bytes] = codes.dims();
+    let logical = bytes * 2;
+
+    // Two 4-bit codes per byte, low nibble FIRST.
+    let lo = codes.clone().bitwise_and_scalar(0x0Fi32.elem());
+    let hi = codes
+        .bitwise_right_shift_scalar(4i32.elem())
+        .bitwise_and_scalar(0x0Fi32.elem());
+    // Interleave: [rows, bytes, 2] -> [rows, 2 * bytes] gives lo, hi, lo, hi...
+    let pairs = Tensor::cat(
+        vec![lo.reshape([rows, bytes, 1]), hi.reshape([rows, bytes, 1])],
+        2,
+    )
+    .reshape([rows, logical]);
+    let vals = gather2(fp4_lut, pairs);
+
+    // One E4M3 scale per GROUP logical elements, widened to match.
+    let n_scales = logical / GROUP;
+    let s = gather2(e4m3_lut, scales)
+        .reshape([rows, n_scales, 1])
+        .repeat_dim(2, GROUP)
+        .reshape([rows, logical]);
+
+    // Block scale first, then the per-row factor -- the reference's order.
+    vals.mul(s).mul(scale2.reshape([rows, 1]).repeat_dim(1, logical))
 }

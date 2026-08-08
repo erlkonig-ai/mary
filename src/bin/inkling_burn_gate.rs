@@ -182,6 +182,57 @@ fn run<B: Backend>(dev: &B::Device, oracle: &std::path::Path, label: &str) -> (u
     let theirs = read_f32(&oracle.join("bop_expert_y.bin"));
     report("expert_ffn vs python", cmp(&mine, &theirs), &mut checks, &mut fails);
 
+    // ---- NVFP4 dequant on device ------------------------------------------
+    // Same oracle the CPU decode was gated on: compressed_tensors' own answer.
+    {
+        let man = std::fs::read_to_string(oracle.join("nvfp4_manifest.json")).unwrap();
+        let numf = |k: &str| -> usize {
+            let at = man.find(&format!("\"{k}\"")).unwrap();
+            man[at..].split(':').nth(1).unwrap()
+                .chars().skip_while(|c| c.is_whitespace())
+                .take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap()
+        };
+        let experts = numf("experts");
+        let rws = numf("rows");
+        let bpr = numf("bytes_per_row");
+        let rows = experts * rws;
+        let codes_b = std::fs::read(oracle.join("nvfp4_codes.bin")).unwrap();
+        let scal_b = std::fs::read(oracle.join("nvfp4_scale_e4m3.bin")).unwrap();
+        let s2 = read_f32(&oracle.join("nvfp4_scale2_f32.bin"));
+        let want = read_f32(&oracle.join("nvfp4_expected_f32.bin"));
+        let nsc = scal_b.len() / rows;
+
+        let ci: Vec<i32> = codes_b.iter().map(|&b| b as i32).collect();
+        let si: Vec<i32> = scal_b.iter().map(|&b| b as i32).collect();
+        let codes: Tensor<B, 2, burn::tensor::Int> =
+            Tensor::from_data(TensorData::new(ci, [rows, bpr]), dev);
+        let scales: Tensor<B, 2, burn::tensor::Int> =
+            Tensor::from_data(TensorData::new(si, [rows, nsc]), dev);
+        // scale2 is per EXPERT; every row of an expert shares it.
+        let per_row: Vec<f32> = (0..rows).map(|r| s2[r / rws]).collect();
+        let s2t: Tensor<B, 1> = Tensor::from_data(TensorData::new(per_row, [rows]), dev);
+
+        let got = mary::models::inkling::burn::dequant_nvfp4(codes, scales, s2t)
+            .into_data().convert::<f32>().to_vec::<f32>().unwrap();
+        let d = cmp(&got, &want);
+        checks += d.n;
+        println!("  nvfp4 dequant vs compressed_tensors: {} values, worst abs {:e}, rel {:e}",
+                 d.n, d.abs, d.rel);
+        if d.n == 0 {
+            println!("    FAIL  compared nothing");
+            fails += 1;
+        } else if d.abs != 0.0 {
+            println!("    NOTE  not bitwise; both sides multiply the same exact values in the");
+            println!("          same order, so the bar here is 0 and this is a real difference");
+            if d.scaled() > BUDGET {
+                println!("    FAIL  and over budget");
+                fails += 1;
+            }
+        } else {
+            println!("    bitwise identical");
+        }
+    }
+
     // ---- dense MLP ---------------------------------------------------------
     let g = read_f32(&oracle.join("bop_dense_gate.bin"));
     let u = read_f32(&oracle.join("bop_dense_up.bin"));
