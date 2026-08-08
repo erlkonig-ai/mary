@@ -45,10 +45,15 @@ torch.manual_seed(20260808)
 torch.set_default_dtype(torch.float32)
 
 raw = json.load(open(CKPT + "/config.json"))["text_config"]
+# See note in the module docstring: the checkpoint's `intermediate_size` IS the
+# per-expert width, and transformers would otherwise fall back to a default
+# that is only right for the 66-layer release.
+raw.setdefault("moe_intermediate_size", raw["intermediate_size"])
 cfg = InklingTextConfig(**raw)
+assert cfg.moe_intermediate_size == raw["intermediate_size"], cfg.moe_intermediate_size
 cfg._attn_implementation = "eager"
 H = cfg.hidden_size
-T = 16
+T = int(os.environ.get('INK_T', '16'))
 
 weight_map = json.load(open(CKPT + "/model.safetensors.index.json"))["weight_map"]
 
@@ -56,6 +61,37 @@ weight_map = json.load(open(CKPT + "/model.safetensors.index.json"))["weight_map
 def get(name):
     with safe_open(CKPT + "/" + weight_map[name], framework="pt") as f:
         return f.get_tensor(name).float()
+
+
+FP4 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], dtype=np.float32)
+
+
+def get_expert(name):
+    """Read a stacked expert matrix, dequantising if it is NVFP4.
+
+    A layer's experts are either NVFP4 with four sidecars or plain BF16 with
+    none -- the layout gate asserts that all-or-nothing invariant -- so the
+    presence of `.scale` decides. Nibble order is low-first, settled against
+    compressed_tensors; the association is (fp4 * block_scale) * scale2 to match
+    the decode mary was gated on.
+    """
+    if name + ".scale" not in weight_map:
+        return get(name)
+    with safe_open(CKPT + "/" + weight_map[name], framework="pt") as f:
+        codes = f.get_tensor(name).numpy().astype(np.uint8)
+    scale = get(name + ".scale").numpy()
+    scale2 = get(name + ".scale2").numpy()
+    lo, hi = codes & 0x0F, (codes >> 4) & 0x0F
+    vals = np.empty(codes.shape[:-1] + (codes.shape[-1] * 2,), dtype=np.float32)
+    vals[..., 0::2] = FP4[lo]
+    vals[..., 1::2] = FP4[hi]
+    n_scales = scale.shape[-1]
+    group = vals.shape[-1] // n_scales
+    assert group == 16, group
+    deq = vals.reshape(*vals.shape[:-1], n_scales, group) * scale[..., None]
+    deq = deq.reshape(*vals.shape) * scale2[:, None, None]
+    return torch.from_numpy(deq)
 
 
 pfx = f"model.llm.layers.{LAYER}."
@@ -89,7 +125,19 @@ if is_dense:
     sd["mlp.down_proj.weight"] = get(pfx + "mlp.w2_md.weight")
     sd["mlp.global_scale"] = get(pfx + "mlp.global_scale")
 else:
-    raise SystemExit("sparse layers not handled by this capture yet")
+    inter = cfg.moe_intermediate_size
+    sd["mlp.gate.weight"] = get(pfx + "mlp.gate.weight")
+    sd["mlp.gate.e_score_correction_bias"] = get(pfx + "mlp.gate.bias")
+    sd["mlp.gate.global_scale"] = get(pfx + "mlp.gate.global_scale")
+    sd["mlp.experts.gate_up_proj"] = get_expert(pfx + "mlp.experts.w13_weight")
+    sd["mlp.experts.down_proj"] = get_expert(pfx + "mlp.experts.w2_weight")
+    # shared_w13 is [n_shared, 2*inter, hidden] under the [out, in] convention
+    # that shared_w2 [n_shared, hidden, inter] pins; split on the OUT dim.
+    sw13 = get(pfx + "mlp.shared_experts.shared_w13_weight")
+    assert sw13.shape[1] == 2 * inter, (sw13.shape, inter)
+    sd["mlp.shared_experts.gate_proj"] = sw13[:, :inter].contiguous()
+    sd["mlp.shared_experts.up_proj"] = sw13[:, inter:].contiguous()
+    sd["mlp.shared_experts.down_proj"] = get(pfx + "mlp.shared_experts.shared_w2_weight")
 
 layer = InklingDecoderLayer(cfg, LAYER)
 missing, unexpected = layer.load_state_dict(sd, strict=False)
@@ -104,8 +152,16 @@ x = torch.randn(1, T, H) * 0.05      # activations at a plausible scale
 mk = create_sliding_window_causal_mask if is_sliding else create_causal_mask
 mask = mk(config=cfg, inputs_embeds=x, attention_mask=None,
           past_key_values=None, position_ids=torch.arange(T).unsqueeze(0))
+captured = {}
+if not is_dense:
+    def _grab(_mod, _inp, out):
+        captured["gate"] = out
+    _h = layer.mlp.gate.register_forward_hook(_grab)
 with torch.no_grad():
     y = layer(x, attention_mask=mask, conv_mask=None, past_key_values=None)
+if not is_dense:
+    _h.remove()
+    assert "gate" in captured, "the router hook never fired"
 
 
 def w(name, t):
@@ -115,6 +171,16 @@ def w(name, t):
 
 w("real_x.bin", x)
 w("real_y.bin", y)
+
+if not is_dense:
+    # From the hook, so this is the routing the layer ACTUALLY used.
+    _, topk_w, topk_i, gammas = captured["gate"]
+    w("real_topk_w.bin", topk_w)
+    w("real_gammas.bin", gammas)
+    open(os.path.join(OUT, "real_topk_idx.bin"), "wb").write(
+        np.ascontiguousarray(topk_i.cpu().numpy().astype("<i8")).tobytes())
+    used = sorted(set(topk_i.flatten().tolist()))
+    print("  routed through %d distinct experts of %d" % (len(used), cfg.n_routed_experts))
 
 # Compact per-tensor fingerprints: a loading error lands on one line instead of
 # smearing across the output.
@@ -143,7 +209,13 @@ manifest = {
     "dense_intermediate": cfg.intermediate_size,
     "log_scaling_n_floor": cfg.log_scaling_n_floor,
     "log_scaling_alpha": cfg.log_scaling_alpha,
-    "w13_split": "rows [0:half] = gate (w1), [half:] = up (w3)  -- ASSUMPTION",
+    "w13_split": "out-dim rows [0:inter] = gate (w1), [inter:] = up (w3)",
+    "orientation": "checkpoint stores [experts, out, in]; PINNED by w2 being non-square",
+    "moe_intermediate": cfg.moe_intermediate_size,
+    "n_routed": cfg.n_routed_experts,
+    "n_shared": cfg.n_shared_experts,
+    "top_k": cfg.num_experts_per_tok,
+    "route_scale": cfg.route_scale,
     "fingerprints": fps,
 }
 json.dump(manifest, open(os.path.join(OUT, "real_manifest.json"), "w"), indent=1)

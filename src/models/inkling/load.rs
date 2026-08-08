@@ -123,6 +123,61 @@ impl Checkpoint {
         Ok(Loaded { data: out, shape: vec![experts, rows, logical] })
     }
 
+    /// Read ONE expert's slab from a stacked matrix, dequantising if needed.
+    ///
+    /// Returns `[rows, logical]` for expert `e`. Reading the whole stack would
+    /// be 26 GB at f32 on the 42-layer model, and a short prompt activates a few
+    /// dozen experts out of 256.
+    pub fn expert_slice(&self, base: &str, e: usize) -> Result<Loaded> {
+        let shape = self.shape_of(base)?;
+        anyhow::ensure!(shape.len() == 3, "{base} is rank {}", shape.len());
+        let (experts, rows, cols) = (shape[0], shape[1], shape[2]);
+        anyhow::ensure!(e < experts, "expert {e} of {experts}");
+
+        let quantized = self.shard_of.contains_key(&format!("{base}.scale"));
+        if !quantized {
+            // BF16, two bytes per element. Slice the mapping, do not copy the
+            // whole stack: it is 8 GB and this wants 33 MB of it.
+            let per = rows * cols;
+            let data = self.with_bytes(base, |raw| {
+                anyhow::ensure!(raw.len() == experts * per * 2, "{base} is {} bytes", raw.len());
+                Ok(raw[e * per * 2..(e + 1) * per * 2]
+                    .chunks_exact(2)
+                    .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                    .collect::<Vec<f32>>())
+            })?;
+            return Ok(Loaded { data, shape: vec![rows, cols] });
+        }
+
+        let logical = cols * 2;
+        let scales_per_row = logical / GROUP;
+        let scale2 = self.tensor(&format!("{base}.scale2"))?;
+        anyhow::ensure!(scale2.data.len() == experts, "scale2 is {}", scale2.data.len());
+        let codes = self.with_bytes(base, |raw| {
+            Ok(raw[e * rows * cols..(e + 1) * rows * cols].to_vec())
+        })?;
+        let scales = self.with_bytes(&format!("{base}.scale"), |raw| {
+            let s0 = e * rows * scales_per_row;
+            Ok(raw[s0..s0 + rows * scales_per_row].to_vec())
+        })?;
+        let mut out = vec![0f32; rows * logical];
+        let n = decode_stacked(
+            &codes, &scales, &scale2.data[e..e + 1], 1, rows, cols, &mut out,
+        );
+        anyhow::ensure!(n == out.len(), "decoded {n} of {}", out.len());
+        Ok(Loaded { data: out, shape: vec![rows, logical] })
+    }
+
+    /// Map a shard and hand the tensor's raw bytes to `f` without copying them.
+    fn with_bytes<R>(&self, name: &str, f: impl FnOnce(&[u8]) -> Result<R>) -> Result<R> {
+        let shard = self.shard_of.get(name).with_context(|| format!("{name} not in index"))?;
+        let file = std::fs::File::open(self.dir.join(shard))?;
+        // SAFETY: the checkpoint is read-only and nothing else writes it.
+        let mmap = unsafe { Mmap::map(&file) }?;
+        let st = SafeTensors::deserialize(&mmap)?;
+        f(st.tensor(name)?.data())
+    }
+
     fn raw_bytes(&self, name: &str) -> Result<Vec<u8>> {
         let shard = self.shard_of.get(name).with_context(|| format!("{name} not in index"))?;
         let file = std::fs::File::open(self.dir.join(shard))?;

@@ -128,8 +128,8 @@ fn main() -> Result<()> {
     let mut fails = 0usize;
     let mut checks = 0usize;
 
-    let p = format!("model.llm.layers.{layer}.");
-    let g = |n: &str| -> Result<Vec<f32>> { Ok(cp.tensor(&format!("{p}{n}"))?.data) };
+    let pfx = format!("model.llm.layers.{layer}.");
+    let g = |n: &str| -> Result<Vec<f32>> { Ok(cp.tensor(&format!("{pfx}{n}"))?.data) };
 
     println!("\n=== 1. loaded tensors against the reference's fingerprints ===");
     let attn_norm = g("attn_norm.weight")?;
@@ -146,9 +146,6 @@ fn main() -> Result<()> {
     let ks = g("attn.k_sconv.weight")?;
     let vs = g("attn.v_sconv.weight")?;
     let rp = g("attn.rel_logits_proj.proj")?;
-    let fused = g("mlp.w13_dn.weight")?;
-    let down = g("mlp.w2_md.weight")?;
-    let gscale = g("mlp.global_scale")?;
 
     check_fp(&man, "input_layernorm.weight", &attn_norm, &mut checks, &mut fails);
     check_fp(&man, "post_attention_layernorm.weight", &mlp_norm, &mut checks, &mut fails);
@@ -164,25 +161,111 @@ fn main() -> Result<()> {
     check_fp(&man, "self_attn.k_sconv.conv1d.weight", &ks, &mut checks, &mut fails);
     check_fp(&man, "self_attn.v_sconv.conv1d.weight", &vs, &mut checks, &mut fails);
     check_fp(&man, "self_attn.rel_logits_proj.proj", &rp, &mut checks, &mut fails);
-    check_fp(&man, "mlp.down_proj.weight", &down, &mut checks, &mut fails);
-    check_fp(&man, "mlp.global_scale", &gscale, &mut checks, &mut fails);
+    let is_dense = man.contains("\"is_dense\": true");
 
-    println!("\n=== 2. the fused w13 split ===");
-    let (gate, up) = split_gate_up(&fused, h);
-    println!("  fused {} -> gate {} + up {}", fused.len(), gate.len(), up.len());
-    check_fp(&man, "mlp.gate_proj.weight", &gate, &mut checks, &mut fails);
-    check_fp(&man, "mlp.up_proj.weight", &up, &mut checks, &mut fails);
-    // The halves must be distinguishable, or the split's ORDER is untested here
-    // even though its correctness would still be assumed.
-    checks += 1;
-    let gs: f64 = gate.iter().map(|&x| x as f64).sum();
-    let us: f64 = up.iter().map(|&x| x as f64).sum();
-    if (gs - us).abs() / gs.abs().max(1.0) < 1e-3 {
-        println!("  FAIL  the two halves have indistinguishable sums — swapping them would pass");
-        fails += 1;
+    // These outlive the LayerMlp that borrows them.
+    let (fused, dgate, dup, ddown, dscale);
+    let (rw, rb, rg, sgate, sup, sdown, cgu, cdn);
+
+    let mlp = if is_dense {
+        fused = g("mlp.w13_dn.weight")?;
+        ddown = g("mlp.w2_md.weight")?;
+        dscale = g("mlp.global_scale")?;
+        check_fp(&man, "mlp.down_proj.weight", &ddown, &mut checks, &mut fails);
+        check_fp(&man, "mlp.global_scale", &dscale, &mut checks, &mut fails);
+
+        println!("\n=== 2. the fused w13 split ===");
+        let (a, b) = split_gate_up(&fused, h);
+        dgate = a;
+        dup = b;
+        check_fp(&man, "mlp.gate_proj.weight", &dgate, &mut checks, &mut fails);
+        check_fp(&man, "mlp.up_proj.weight", &dup, &mut checks, &mut fails);
+        checks += 1;
+        let gs: f64 = dgate.iter().map(|&x| x as f64).sum();
+        let us: f64 = dup.iter().map(|&x| x as f64).sum();
+        if (gs - us).abs() / gs.abs().max(1.0) < 1e-3 {
+            println!("  FAIL  the halves have indistinguishable sums — a swap would pass");
+            fails += 1;
+        } else {
+            println!("  halves differ (gate {gs:+.6e} vs up {us:+.6e}), so a swap is visible");
+        }
+        LayerMlp::Dense { gate: &dgate, up: &dup, down: &ddown, global_scale: dscale[0], inter: di }
     } else {
-        println!("  halves differ (gate sum {gs:+.6e} vs up sum {us:+.6e}), so a swap is visible");
-    }
+        let mi = num(&man, "moe_intermediate")? as usize;
+        let n_routed = num(&man, "n_routed")? as usize;
+        let n_shared = num(&man, "n_shared")? as usize;
+        let top_k = num(&man, "top_k")? as usize;
+        let route_scale = num(&man, "route_scale")? as f32;
+        println!("\n=== 2. router, shared experts, and the orientation argument ===");
+        println!("  moe_intermediate {mi}: note 2*{mi} = {} vs hidden {h}", 2 * mi);
+        println!("  w2 is [experts, hidden, intermediate] and NON-square, which pins");
+        println!("  the checkpoint's convention to [experts, out, in]; w13's squareness");
+        println!("  is then not an open question but a consequence of that convention.");
+
+        rw = g("mlp.gate.weight")?;
+        rb = g("mlp.gate.bias")?;
+        rg = g("mlp.gate.global_scale")?;
+        check_fp(&man, "mlp.gate.weight", &rw, &mut checks, &mut fails);
+        check_fp(&man, "mlp.gate.e_score_correction_bias", &rb, &mut checks, &mut fails);
+        check_fp(&man, "mlp.gate.global_scale", &rg, &mut checks, &mut fails);
+        checks += 1;
+        if rw.len() != (n_routed + n_shared) * h {
+            println!("  FAIL  router is {} floats, expected {}", rw.len(), (n_routed + n_shared) * h);
+            fails += 1;
+        } else {
+            println!("  router is [{}+{}, {h}] — the shared experts have their own rows",
+                     n_routed, n_shared);
+        }
+
+        // shared_w13 is [n_shared, 2*inter, hidden]; split each expert's block
+        // on the OUT dimension.
+        let sfused = g("mlp.shared_experts.shared_w13_weight")?;
+        let per = sfused.len() / n_shared;
+        let mut a = Vec::with_capacity(sfused.len() / 2);
+        let mut b = Vec::with_capacity(sfused.len() / 2);
+        for sidx in 0..n_shared {
+            let blk = &sfused[sidx * per..(sidx + 1) * per];
+            a.extend_from_slice(&blk[..per / 2]);
+            b.extend_from_slice(&blk[per / 2..]);
+        }
+        sgate = a;
+        sup = b;
+        sdown = g("mlp.shared_experts.shared_w2_weight")?;
+        check_fp(&man, "mlp.shared_experts.gate_proj", &sgate, &mut checks, &mut fails);
+        check_fp(&man, "mlp.shared_experts.up_proj", &sup, &mut checks, &mut fails);
+        check_fp(&man, "mlp.shared_experts.down_proj", &sdown, &mut checks, &mut fails);
+
+        println!("\n=== 3. expert slabs ===");
+        println!("  which experts a layer uses is not knowable before its attention runs,");
+        println!("  so all {n_routed} are fetched, one slab at a time out of the mapping.");
+        let mut gu: Vec<f32> = Vec::with_capacity(n_routed * 2 * mi * h);
+        let mut dv: Vec<f32> = Vec::with_capacity(n_routed * h * mi);
+        for e in 0..n_routed {
+            gu.extend_from_slice(&cp.expert_slice(&format!("{pfx}mlp.experts.w13_weight"), e)?.data);
+            dv.extend_from_slice(&cp.expert_slice(&format!("{pfx}mlp.experts.w2_weight"), e)?.data);
+        }
+        cgu = gu;
+        cdn = dv;
+        println!("  gate_up {} floats, down {} floats", cgu.len(), cdn.len());
+        checks += 2;
+        if cgu.len() != n_routed * 2 * mi * h {
+            println!("  FAIL  gate_up is {} floats, expected {}", cgu.len(), n_routed * 2 * mi * h);
+            fails += 1;
+        }
+        if cdn.len() != n_routed * h * mi {
+            println!("  FAIL  down is {} floats, expected {}", cdn.len(), n_routed * h * mi);
+            fails += 1;
+        }
+        check_fp(&man, "mlp.experts.gate_up_proj", &cgu, &mut checks, &mut fails);
+        check_fp(&man, "mlp.experts.down_proj", &cdn, &mut checks, &mut fails);
+
+        LayerMlp::Sparse {
+            router_weight: &rw, router_bias: &rb, router_global_scale: rg[0],
+            route_scale, top_k, gate_up: &cgu, down: &cdn,
+            shared_gate: &sgate, shared_up: &sup, shared_down: &sdown,
+            experts: n_routed, n_shared, inter: mi,
+        }
+    };
 
     println!("\n=== 3. run the layer ===");
     let x = read_f32(&oracle.join("real_x.bin"))?;
@@ -203,10 +286,46 @@ fn main() -> Result<()> {
         attn_norm: &attn_norm, mlp_norm: &mlp_norm,
         attn_sconv: &attn_sconv, mlp_sconv: &mlp_sconv,
     };
-    let mlp = LayerMlp::Dense { gate: &gate, up: &up, down: &down, global_scale: gscale[0], inter: di };
     let mask = causal_mask(t, if is_sliding { Some(window) } else { None });
 
-    let (mine, _) = decoder_layer(&x, &lw, &aw, &dims, Some(LogScaling { n_floor, alpha }), &mlp, &mask, t);
+    let (mine, routing) = decoder_layer(&x, &lw, &aw, &dims, Some(LogScaling { n_floor, alpha }), &mlp, &mask, t);
+
+    // Compare the routing itself, so a routing disagreement is reported as one.
+    if let Some(r) = &routing {
+        let mut sel: Vec<usize> = r.iter().flat_map(|x| x.experts.clone()).collect();
+        sel.sort_unstable();
+        sel.dedup();
+        println!("  the layer routed through {} distinct experts", sel.len());
+        checks += 1;
+        if sel.len() < 2 {
+            println!("  FAIL  fewer than two experts used — per-expert indexing barely exercised");
+            fails += 1;
+        }
+        if let Ok(bytes) = std::fs::read(oracle.join("real_topk_idx.bin")) {
+            let refidx: Vec<i64> = bytes
+                .chunks_exact(8)
+                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            let k = refidx.len() / t;
+            let mut bad = 0usize;
+            for ti in 0..t {
+                checks += 1;
+                let mut a: Vec<usize> = r[ti].experts.clone();
+                let mut b: Vec<usize> =
+                    refidx[ti * k..(ti + 1) * k].iter().map(|&v| v as usize).collect();
+                a.sort_unstable();
+                b.sort_unstable();
+                if a != b {
+                    if bad < 3 {
+                        println!("  FAIL  token {ti} routed to {a:?}, reference {b:?}");
+                    }
+                    bad += 1;
+                }
+            }
+            println!("  expert-set mismatches vs the reference: {bad} of {t} tokens");
+            fails += bad;
+        }
+    }
 
     let mut worst_abs = 0f32;
     let mut scale = 0f32;
