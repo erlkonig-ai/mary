@@ -246,6 +246,12 @@ required-features = ["inkling"]
 [[bin]]
 name = "inkling_nvfp4_gate"
 required-features = ["inkling"]
+
+# Parity gate for the block primitives (RMSNorm, short convolution, router)
+# against the transformers reference implementation.
+[[bin]]
+name = "inkling_block_gate"
+required-features = ["inkling"]
 # KDA parity gate: mary::models::kimi_k3::kda against the flash-linear-attention
 # oracle vectors (Triton kernels + fla's own float64 references). Reads .npz
 # only — no checkpoint, no safetensors — so it does not ride `dev-tools`.
