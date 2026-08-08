@@ -240,6 +240,12 @@ required-features = ["k3"]
 [[bin]]
 name = "inkling_layout_gate"
 required-features = ["inkling"]
+
+# Parity gate for the NVFP4 expert decode against compressed_tensors, which is
+# the library that defines this packing. Reads a small raw-binary oracle bundle.
+[[bin]]
+name = "inkling_nvfp4_gate"
+required-features = ["inkling"]
 # KDA parity gate: mary::models::kimi_k3::kda against the flash-linear-attention
 # oracle vectors (Triton kernels + fla's own float64 references). Reads .npz
 # only — no checkpoint, no safetensors — so it does not ride `dev-tools`.
