@@ -13,6 +13,7 @@
 //! changes. The FP4 decode is *not*: K3 is MXFP4 (E8M0 scales, block 32),
 //! Inkling is NVFP4 (E4M3 scales, block 16, plus a per-expert F32 second level).
 
+pub mod attn;
 pub mod block;
 pub mod config;
 pub mod layout;

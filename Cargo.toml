@@ -252,6 +252,12 @@ required-features = ["inkling"]
 [[bin]]
 name = "inkling_block_gate"
 required-features = ["inkling"]
+
+# Parity gate for Inkling attention against the transformers reference, run on
+# BOTH a sliding-window and a global layer -- they are different functions.
+[[bin]]
+name = "inkling_attn_gate"
+required-features = ["inkling"]
 # KDA parity gate: mary::models::kimi_k3::kda against the flash-linear-attention
 # oracle vectors (Triton kernels + fla's own float64 references). Reads .npz
 # only — no checkpoint, no safetensors — so it does not ride `dev-tools`.
