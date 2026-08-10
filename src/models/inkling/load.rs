@@ -30,6 +30,18 @@ pub struct Loaded {
     pub shape: Vec<usize>,
 }
 
+/// A tensor read out of the checkpoint in its OWN dtype.
+///
+/// `dtype` is the safetensors name ("BF16", "F32", ...) rather than an enum,
+/// because the reader's job is to report what the file says and let the caller
+/// decide whether it can handle it. An unknown dtype should be a caller-side
+/// refusal with the name in the message, not a variant this file has to grow.
+pub struct RawTensor {
+    pub dtype: String,
+    pub shape: Vec<usize>,
+    pub bytes: Vec<u8>,
+}
+
 /// One expert's packed NVFP4 weight, exactly as it sits in the checkpoint.
 ///
 /// `codes` is `[rows, cols]` bytes, two 4-bit E2M1 codes each, low nibble
@@ -105,6 +117,44 @@ impl Checkpoint {
             other => anyhow::bail!("{name} holds {other}, which this reader does not widen"),
         };
         Ok(Loaded { data, shape })
+    }
+
+    /// Every tensor name the index holds, sorted.
+    pub fn names(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.shard_of.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// Read one tensor WITHOUT widening it — dtype, shape and the bytes as they
+    /// sit in the checkpoint.
+    ///
+    /// The complement to [`Checkpoint::tensor`], which widens everything to f32
+    /// so the runtime can compute with it. An importer wants the opposite: a
+    /// BF16 weight should land in the pile as BF16, because widening it doubles
+    /// the pile and then the loader has to narrow it again to hand it to a GPU
+    /// that wanted BF16 all along. Round-tripping through f32 is lossless for
+    /// BF16 (every BF16 is an f32 with a truncated mantissa) but it is not
+    /// free, and the free version is to not do it.
+    ///
+    /// Copies once, out of the mmap, because the mapping is local to this call.
+    pub fn tensor_raw(&self, name: &str) -> Result<RawTensor> {
+        let shard = self
+            .shard_of
+            .get(name)
+            .with_context(|| format!("{name} is not in the index"))?;
+        let path = self.dir.join(shard);
+        let file =
+            std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+        // SAFETY: the checkpoint is read-only and nothing else writes it.
+        let mmap = unsafe { Mmap::map(&file) }?;
+        let st = SafeTensors::deserialize(&mmap)?;
+        let view = st.tensor(name)?;
+        Ok(RawTensor {
+            dtype: format!("{:?}", view.dtype()),
+            shape: view.shape().to_vec(),
+            bytes: view.data().to_vec(),
+        })
     }
 
     /// Read a stacked expert matrix, dequantising when it is NVFP4.

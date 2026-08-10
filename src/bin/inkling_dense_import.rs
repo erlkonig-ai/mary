@@ -1,0 +1,311 @@
+//! Import Inkling's DENSE tensors — everything that is not a packed expert —
+//! into a pile as typed tensor leaves, in their own dtype.
+//!
+//! The experts go through `inkling_pile_import`, which packs NVFP4. This is the
+//! other half: attention projections, norms, embeddings, the router, the vision
+//! tower — stored as `Tensor<BF16, RANK>` or `Tensor<F32, RANK>` according to
+//! what the checkpoint actually holds, not widened on the way in.
+//!
+//! Not widening is the point. `Checkpoint::tensor` widens everything to f32 so
+//! the runtime can compute with it, which is right for a runtime and wrong for
+//! an importer: it would double the pile and then oblige the loader to narrow
+//! the bytes again before handing them to a GPU that wanted BF16 in the first
+//! place. Round-tripping BF16 through f32 is lossless — every BF16 is an f32
+//! with a truncated mantissa — but the cost is real and avoidable.
+//!
+//! Element type and rank live in the attribute id, so a reader asking for BF16
+//! matrices cannot be handed the f32 router bias by accident. Both dtypes share
+//! ONE anchor, so this is the same `weight` attribute at different types rather
+//! than a family of parallel ones.
+//!
+//! Read-only by default: with no pile path it converts, verifies and reports,
+//! touching nothing. The dry run is worth having precisely because it still
+//! does the encoding and the check — it answers "would this import cleanly"
+//! without committing to it.
+//!
+//!   inkling_dense_import <checkpoint-dir> [pile] [--limit N]
+
+use anyhow::{Context, Result};
+use ed25519_dalek::SigningKey;
+use mary::models::inkling::load::Checkpoint;
+use mary::models::inkling::pile::{attrs, layer_of};
+use triblespace::core::blob::encodings::tensor::elements::{BF16, F32};
+use triblespace::core::blob::encodings::tensor::{tensor_blob, TensorView};
+use triblespace::core::blob::TryFromBlob;
+use triblespace::core::id::ExclusiveId;
+use triblespace::core::metadata;
+use triblespace::core::repo::Repository;
+use triblespace::macros::entity;
+use triblespace::prelude::*;
+
+/// Build the typed blob, check it decodes back to exactly what went in, and —
+/// only when writing — store it and record the facts.
+///
+/// The dispatch is over BOTH dtype and rank, which is what putting them in the
+/// attribute id costs. It is paid here, once, at import.
+macro_rules! dense_leaf {
+    ($elem:ty, $rank:literal, $writing:expr, $dims:expr, $bytes:expr, $name:expr) => {{
+        let dims: [u64; $rank] = $dims.as_slice().try_into().expect("rank checked by caller");
+        let payload = anybytes::Bytes::from_source($bytes);
+        let blob = tensor_blob::<$elem, $rank>(dims, payload.clone())
+            .map_err(|e| anyhow::anyhow!("{}: {e}", $name))?;
+
+        // Checked against the bytes that went in, not against a fixture.
+        let view: TensorView = TryFromBlob::try_from_blob(blob.clone())
+            .map_err(|e| anyhow::anyhow!("{}: decoding the blob just built: {e}", $name))?;
+        anyhow::ensure!(
+            view.dims() == dims,
+            "{}: dims {:?} after a round trip, expected {:?}",
+            $name,
+            view.dims(),
+            dims
+        );
+        anyhow::ensure!(
+            &view.payload()[..] == &payload[..],
+            "{}: payload differs after a round trip",
+            $name
+        );
+
+        let len = blob.bytes.len();
+        if let Some((_, ws, change)) = $writing.as_mut() {
+            // put() returns the handle the facts then name, so the blob and the
+            // fact about it cannot refer to different bytes.
+            let handle = ws.put(blob);
+            let name_h = ws.put::<blobencodings::LongString, _>($name.to_string());
+            let mut facts = entity! { &ufoid() @
+                attrs::weight::<$elem, $rank>(): handle,
+                metadata::name: name_h,
+            };
+            // Absent rather than zero when the name carries no layer: a tensor
+            // that silently joined layer 0 would ship to the wrong machine.
+            if let Some(l) = layer_of($name) {
+                let root = facts.root().expect("rooted");
+                facts += entity! { ExclusiveId::force_ref(&root) @ attrs::layer: l };
+            }
+            *change += facts;
+        }
+        len
+    }};
+}
+
+macro_rules! by_rank {
+    ($elem:ty, $writing:expr, $dims:expr, $bytes:expr, $name:expr) => {
+        match $dims.len() {
+            0 => dense_leaf!($elem, 0, $writing, $dims, $bytes, $name),
+            1 => dense_leaf!($elem, 1, $writing, $dims, $bytes, $name),
+            2 => dense_leaf!($elem, 2, $writing, $dims, $bytes, $name),
+            3 => dense_leaf!($elem, 3, $writing, $dims, $bytes, $name),
+            4 => dense_leaf!($elem, 4, $writing, $dims, $bytes, $name),
+            5 => dense_leaf!($elem, 5, $writing, $dims, $bytes, $name),
+            r => anyhow::bail!("{}: rank {r} is beyond the arms here", $name),
+        }
+    };
+}
+
+
+/// Re-read every dense tensor from the checkpoint and compare it to what the
+/// pile holds under that name.
+///
+/// The import already checks that each blob decodes back to the bytes that went
+/// in, and content addressing carries that to disk. What neither covers is
+/// whether the FACT GRAPH points at the right blob for the right name — a
+/// mis-wired attribute or a name attached to the wrong leaf produces a pile
+/// that is internally consistent and still wrong. That failure mode is not
+/// hypothetical: mary spent today unable to read any model pile because its
+/// attribute ids had silently drifted, and every byte on disk was fine.
+fn verify_pile(dir: &str, pile_path: &str, limit: usize) -> Result<()> {
+    let ck = Checkpoint::open(dir).with_context(|| format!("opening {dir}"))?;
+    let (tribles, reader) = {
+        let path = std::path::Path::new(pile_path);
+        let mut pile = Pile::open(path).map_err(|e| anyhow::anyhow!("open {path:?}: {e:?}"))?;
+        pile.refresh()
+            .map_err(|e| anyhow::anyhow!("load {path:?}: {e:?}"))?;
+        let mut repo = Repository::new(
+            pile,
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            TribleSet::new(),
+        )
+        .map_err(|e| anyhow::anyhow!("repo: {e:?}"))?;
+        let branch = repo
+            .lookup_branch("inkling")
+            .map_err(|e| anyhow::anyhow!("lookup: {e:?}"))?
+            .context("no 'inkling' branch")?;
+        let mut ws = repo.pull(branch).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let head = ws.head().context("'inkling' has no commits")?;
+        let facts: TribleSet = ws
+            .checkout(triblespace::core::repo::ancestors(head))
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
+            .facts()
+            .clone();
+        let rd = repo
+            .storage_mut()
+            .reader()
+            .map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
+        repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
+        (facts, rd)
+    };
+
+    // name -> (dims, payload), read AS its type. One sweep per (dtype, rank).
+    let mut index: std::collections::HashMap<String, (Vec<u64>, anybytes::Bytes)> =
+        Default::default();
+    macro_rules! sweep {
+        ($elem:ty, $rank:literal) => {{
+            for (n, h) in triblespace::macros::find!(
+                (n: Inline<inlineencodings::Handle<blobencodings::LongString>>,
+                 h: Inline<inlineencodings::Handle<
+                     triblespace::core::blob::encodings::tensor::Tensor<$elem, $rank>>>),
+                triblespace::macros::pattern!(&tribles, [
+                    { _?e @ metadata::name: ?n, attrs::weight::<$elem, $rank>(): ?h },
+                ])
+            ) {
+                let name: anybytes::View<str> =
+                    reader.get(n).map_err(|e| anyhow::anyhow!("name blob: {e:?}"))?;
+                let blob: triblespace::core::blob::Blob<
+                    triblespace::core::blob::encodings::tensor::Tensor<$elem, $rank>> =
+                    reader.get(h).map_err(|e| anyhow::anyhow!("leaf blob: {e:?}"))?;
+                let view: TensorView = TryFromBlob::try_from_blob(blob)
+                    .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+                index.insert(name.to_string(), (view.dims().to_vec(), view.payload().clone()));
+            }
+        }};
+    }
+    sweep!(BF16, 0); sweep!(BF16, 1); sweep!(BF16, 2); sweep!(BF16, 3); sweep!(BF16, 4);
+    sweep!(F32, 0); sweep!(F32, 1); sweep!(F32, 2); sweep!(F32, 3); sweep!(F32, 4);
+    println!("pile       {} typed dense leaves", index.len());
+
+    let names = ck.names();
+    let dense: Vec<&String> = names.iter().filter(|n| !n.contains(".experts.")).collect();
+    let (mut checked, mut bytes) = (0usize, 0usize);
+    for name in dense.into_iter().take(limit) {
+        let (dims, payload) = index
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("{name}: absent from the pile"))?;
+        let raw = ck.tensor_raw(name)?;
+        let want: Vec<u64> = raw.shape.iter().map(|&d| d as u64).collect();
+        anyhow::ensure!(dims == &want, "{name}: dims {dims:?} != checkpoint {want:?}");
+        anyhow::ensure!(
+            &payload[..] == &raw.bytes[..],
+            "{name}: payload differs from the checkpoint"
+        );
+        checked += 1;
+        bytes += raw.bytes.len();
+        if checked % 200 == 0 {
+            println!("  {checked} verified ...");
+        }
+    }
+    println!(
+        "verified   {checked} tensors, {:.2} GiB, byte-identical to the checkpoint",
+        bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let mut args = std::env::args().skip(1);
+    let dir = args
+        .next()
+        .context("usage: inkling_dense_import <checkpoint-dir> [pile] [--limit N]")?;
+    let mut pile_path: Option<String> = None;
+    let mut limit = usize::MAX;
+    let mut verify: Option<String> = None;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--limit" => limit = args.next().context("--limit needs a value")?.parse()?,
+            "--verify" => verify = Some(args.next().context("--verify needs a pile")?),
+            other => pile_path = Some(other.to_string()),
+        }
+    }
+
+    if let Some(v) = verify {
+        return verify_pile(&dir, &v, limit);
+    }
+
+    let ck = Checkpoint::open(&dir).with_context(|| format!("opening {dir}"))?;
+    let names = ck.names();
+    println!("checkpoint {dir}");
+    println!("tensors    {} in the index", names.len());
+
+    // A packed expert needs its sidecars and a different encoding entirely, so
+    // it is skipped here rather than half-handled. The skip is REPORTED with a
+    // count: a silent skip in an importer is how a model arrives missing a
+    // third of itself and nothing says so.
+    let (dense, experts): (Vec<&String>, Vec<&String>) =
+        names.iter().partition(|n| !n.contains(".experts."));
+    println!(
+        "           {} dense, {} expert (skipped here — see inkling_pile_import)",
+        dense.len(),
+        experts.len()
+    );
+
+    let mut writing = match &pile_path {
+        None => {
+            println!("mode       read-only (no pile path given)");
+            None
+        }
+        Some(p) => {
+            let path = std::path::Path::new(p);
+            if !path.exists() {
+                println!("creating a new pile at {p}");
+                std::fs::File::create(path)?;
+            }
+            let store = Pile::open(path).map_err(|e| anyhow::anyhow!("open pile: {e:?}"))?;
+            let mut repo = Repository::new(
+                store,
+                SigningKey::generate(&mut rand::rngs::OsRng),
+                TribleSet::new(),
+            )
+            .map_err(|e| anyhow::anyhow!("repository: {e:?}"))?;
+            let branch = repo
+                .ensure_branch("inkling", None)
+                .map_err(|e| anyhow::anyhow!("branch: {e:?}"))?;
+            let ws = repo
+                .pull(branch)
+                .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+            Some((repo, ws, TribleSet::new()))
+        }
+    };
+
+    let mut by_dtype: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut by_rank_count: std::collections::BTreeMap<usize, usize> = Default::default();
+    let (mut done, mut total_bytes) = (0usize, 0usize);
+
+    for name in dense.into_iter().take(limit) {
+        let raw = ck
+            .tensor_raw(name)
+            .with_context(|| format!("reading {name}"))?;
+        let dims: Vec<u64> = raw.shape.iter().map(|&d| d as u64).collect();
+        *by_dtype.entry(raw.dtype.clone()).or_default() += 1;
+        *by_rank_count.entry(dims.len()).or_default() += 1;
+
+        let bytes = match raw.dtype.as_str() {
+            "BF16" => by_rank!(BF16, writing, dims, raw.bytes, name),
+            "F32" => by_rank!(F32, writing, dims, raw.bytes, name),
+            other => anyhow::bail!(
+                "{name} holds {other}; add an element type rather than widening it"
+            ),
+        };
+
+        total_bytes += bytes;
+        done += 1;
+        if done % 100 == 0 {
+            println!("  {done} tensors ...");
+        }
+    }
+
+    println!("dtypes     {by_dtype:?}");
+    println!("ranks      {by_rank_count:?}");
+    println!(
+        "encoded    {done} tensors, {:.2} GiB, each verified to decode back to \
+         the bytes that went in",
+        total_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
+
+    if let Some((mut repo, mut ws, change)) = writing {
+        ws.commit(change, "inkling dense tensors");
+        repo.push(&mut ws)
+            .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+        repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
+        println!("wrote      {}", pile_path.unwrap());
+    }
+    Ok(())
+}
