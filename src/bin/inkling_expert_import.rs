@@ -29,6 +29,152 @@ use triblespace::core::repo::Repository;
 use triblespace::macros::entity;
 use triblespace::prelude::*;
 
+
+/// Confirm a pile actually holds a node's whole share, byte for byte.
+///
+/// The import round-trips each expert as it encodes it, which proves the
+/// packing. This proves POSSESSION: for every expert the layer range implies,
+/// the pile has a leaf under that name and index, and its bytes match the
+/// checkpoint.
+///
+/// The completeness half is what makes it worth running. A node holding 200 of
+/// its 256 experts does not fail — it computes, and returns wrong tokens. So
+/// the check is driven by what the CHECKPOINT says should be there, never by
+/// what the pile happens to contain; asking the pile to enumerate itself would
+/// make a missing expert invisible by construction.
+fn verify_share(
+    ck: &Checkpoint,
+    pile_path: &str,
+    lo: i64,
+    hi: i64,
+    experts_cap: usize,
+) -> Result<()> {
+    let path = std::path::Path::new(pile_path);
+    let mut pile = Pile::open(path).map_err(|e| anyhow::anyhow!("open {path:?}: {e:?}"))?;
+    pile.refresh()
+        .map_err(|e| anyhow::anyhow!("load {path:?}: {e:?}"))?;
+    let mut repo = Repository::new(
+        pile,
+        SigningKey::generate(&mut rand::rngs::OsRng),
+        TribleSet::new(),
+    )
+    .map_err(|e| anyhow::anyhow!("repo: {e:?}"))?;
+    let branch = repo
+        .lookup_branch("inkling")
+        .map_err(|e| anyhow::anyhow!("lookup: {e:?}"))?
+        .context("no 'inkling' branch")?;
+    let mut ws = repo.pull(branch).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+    let head = ws.head().context("'inkling' has no commits")?;
+    let facts: TribleSet = ws
+        .checkout(triblespace::core::repo::ancestors(head))
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
+        .facts()
+        .clone();
+    let reader = repo
+        .storage_mut()
+        .reader()
+        .map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
+    repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
+
+    // (name, expert index) -> payload, read AS its type.
+    let mut packed_ix: std::collections::HashMap<(String, i64), anybytes::Bytes> =
+        Default::default();
+    for (n, i, h) in triblespace::macros::find!(
+        (n: Inline<inlineencodings::Handle<blobencodings::LongString>>,
+         i: i64,
+         h: Inline<inlineencodings::Handle<
+             triblespace::core::blob::encodings::tensor::Tensor<
+                 triblespace::core::blob::encodings::tensor::elements::NVFP4, 2>>>),
+        triblespace::macros::pattern!(&facts, [
+            { _?e @ metadata::name: ?n, attrs::expert_index: ?i, attrs::weight_nvfp4_2: ?h },
+        ])
+    ) {
+        let name: anybytes::View<str> =
+            reader.get(n).map_err(|e| anyhow::anyhow!("name: {e:?}"))?;
+        let blob: triblespace::core::blob::Blob<
+            triblespace::core::blob::encodings::tensor::Tensor<
+                triblespace::core::blob::encodings::tensor::elements::NVFP4, 2>> =
+            reader.get(h).map_err(|e| anyhow::anyhow!("blob: {e:?}"))?;
+        let view: TensorView = TryFromBlob::try_from_blob(blob)
+            .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+        packed_ix.insert((name.to_string(), i), view.payload().clone());
+    }
+    let mut bf16_ix: std::collections::HashMap<(String, i64), anybytes::Bytes> = Default::default();
+    for (n, i, h) in triblespace::macros::find!(
+        (n: Inline<inlineencodings::Handle<blobencodings::LongString>>,
+         i: i64,
+         h: Inline<inlineencodings::Handle<
+             triblespace::core::blob::encodings::tensor::Tensor<
+                 triblespace::core::blob::encodings::tensor::elements::BF16, 2>>>),
+        triblespace::macros::pattern!(&facts, [
+            { _?e @ metadata::name: ?n, attrs::expert_index: ?i,
+              attrs::weight::<triblespace::core::blob::encodings::tensor::elements::BF16, 2>(): ?h },
+        ])
+    ) {
+        let name: anybytes::View<str> =
+            reader.get(n).map_err(|e| anyhow::anyhow!("name: {e:?}"))?;
+        let blob: triblespace::core::blob::Blob<
+            triblespace::core::blob::encodings::tensor::Tensor<
+                triblespace::core::blob::encodings::tensor::elements::BF16, 2>> =
+            reader.get(h).map_err(|e| anyhow::anyhow!("blob: {e:?}"))?;
+        let view: TensorView = TryFromBlob::try_from_blob(blob)
+            .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+        bf16_ix.insert((name.to_string(), i), view.payload().clone());
+    }
+    println!("pile       {} NVFP4 + {} BF16 expert leaves", packed_ix.len(), bf16_ix.len());
+
+    let mut bases: Vec<String> = ck
+        .names()
+        .into_iter()
+        .filter(|n| n.ends_with(".experts.w13_weight") || n.ends_with(".experts.w2_weight"))
+        .filter(|n| matches!(layer_of(n), Some(l) if l >= lo && l <= hi))
+        .collect();
+    bases.sort();
+
+    let (mut ok, mut bytes) = (0usize, 0usize);
+    for base in &bases {
+        let count = ck.expert_count(base)?.min(experts_cap);
+        for e in 0..count {
+            let key = (base.clone(), e as i64);
+            if ck.is_nvfp4(base) {
+                let have = packed_ix
+                    .get(&key)
+                    .ok_or_else(|| anyhow::anyhow!("{base}[{e}]: MISSING from the pile"))?;
+                let q = ck.expert_slice_packed(base, e)?;
+                let (codes, scales, scale2) = split_payload(have, q.rows * q.cols * 2)?;
+                anyhow::ensure!(codes == &q.codes[..], "{base}[{e}]: codes differ");
+                anyhow::ensure!(scales == &q.scales[..], "{base}[{e}]: scales differ");
+                anyhow::ensure!(scale2 == q.scale2, "{base}[{e}]: scale2 differs");
+            } else {
+                let have = bf16_ix
+                    .get(&key)
+                    .ok_or_else(|| anyhow::anyhow!("{base}[{e}]: MISSING from the pile"))?;
+                let raw = ck.expert_slice_bf16(base, e)?;
+                anyhow::ensure!(&have[..] == &raw.bytes[..], "{base}[{e}]: payload differs");
+            }
+            bytes += have_len(&packed_ix, &bf16_ix, &key);
+            ok += 1;
+            if ok % 200 == 0 {
+                println!("  {ok} experts verified ...");
+            }
+        }
+    }
+    println!(
+        "verified   {ok} experts across {} matrices, {:.2} GiB, byte-identical to the checkpoint",
+        bases.len(),
+        bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
+    Ok(())
+}
+
+fn have_len(
+    a: &std::collections::HashMap<(String, i64), anybytes::Bytes>,
+    b: &std::collections::HashMap<(String, i64), anybytes::Bytes>,
+    k: &(String, i64),
+) -> usize {
+    a.get(k).map(|v| v.len()).or_else(|| b.get(k).map(|v| v.len())).unwrap_or(0)
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let dir = args
@@ -39,6 +185,7 @@ fn main() -> Result<()> {
         .context("usage: inkling_expert_import <ckpt-dir> <pile> --layers A-B [--experts N]")?;
     let mut layers: Option<(i64, i64)> = None;
     let mut experts_cap = usize::MAX;
+    let mut verify = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--layers" => {
@@ -47,12 +194,16 @@ fn main() -> Result<()> {
                 layers = Some((a.parse()?, b.parse()?));
             }
             "--experts" => experts_cap = args.next().context("--experts needs N")?.parse()?,
+            "--verify" => verify = true,
             other => anyhow::bail!("unknown argument {other}"),
         }
     }
     let (lo, hi) = layers.context("--layers A-B is required — this imports a node's share")?;
 
     let ck = Checkpoint::open(&dir).with_context(|| format!("opening {dir}"))?;
+    if verify {
+        return verify_share(&ck, &pile_path, lo, hi, experts_cap);
+    }
 
     // The stacked expert matrices in range. Sidecars are reached through the
     // index by the reader, so only the weights are enumerated here.
