@@ -257,6 +257,15 @@ pub enum WeightLoader {
     MultiShard(MultiShardLoader),
     /// Model materialized out of a mary pile: key → (flat data, shape).
     Pile(HashMap<String, (Vec<f32>, Vec<usize>)>),
+    /// Model read from a pile of TYPED tensor leaves: key → a view over the
+    /// pile's mapping, not a copy.
+    ///
+    /// The general zero-copy path. [`WeightLoader::Aliased`] below is the older
+    /// one and is gated to macOS AND to two model features, so everywhere else
+    /// every load materialized. A typed leaf carries its shape in the blob
+    /// header, so serving an aligned `[f32]` view is a slice — no platform
+    /// check, no per-model feature, no alias preconditions to fail.
+    Typed(HashMap<String, crate::leaf::TypedLeaf>),
     /// ZERO-COPY pile loader: tensor requests on the fused Metal backends alias
     /// the mmap'd pile blobs straight onto the GPU (no host materialization);
     /// everything else (CPU stages via [`WeightLoader::load_f32`], non-fused
@@ -491,7 +500,19 @@ impl WeightLoader {
 
     /// Build the runtime loader from a persisted pile: materialize the union
     /// keymap (see [`crate::persist::load_keymap_from_pile`]).
+    /// Build the runtime loader from a persisted pile, preferring the typed
+    /// layout.
+    ///
+    /// One constructor, so every caller gets zero-copy loading the moment its
+    /// pile is converted, and keeps working when it is not. The fallback is on
+    /// EMPTY rather than on error: a pile with no typed leaves is an
+    /// unconverted pile, not a broken one.
     pub fn from_pile(pile_path: &Path) -> anyhow::Result<Self> {
+        match crate::persist::load_typed_keymap_from_pile(pile_path) {
+            Ok(map) if !map.is_empty() => return Ok(WeightLoader::Typed(map)),
+            Ok(_) => {}
+            Err(e) => eprintln!("[weights] typed index unavailable ({e}); materializing"),
+        }
         Ok(WeightLoader::Pile(crate::persist::load_keymap_from_pile(
             pile_path,
         )?))
@@ -515,6 +536,19 @@ impl WeightLoader {
                 let mut dims = [0usize; D];
                 dims[..D].copy_from_slice(&shape[..D]);
                 Tensor::<B, 1>::from_floats(&data[..], device).reshape(dims)
+            }
+            WeightLoader::Typed(map) => {
+                let leaf = map
+                    .get(name)
+                    .unwrap_or_else(|| panic!("pile missing tensor {name}"));
+                let shape = leaf.shape();
+                assert_eq!(shape.len(), D, "rank mismatch for {name}");
+                let mut dims = [0usize; D];
+                dims[..D].copy_from_slice(&shape[..D]);
+                // A copy still happens here because Burn wants to own the
+                // tensor; what is avoided is the SECOND copy the materialized
+                // keymap makes when it builds the map up front.
+                Tensor::<B, 1>::from_floats(&leaf.to_f32()[..], device).reshape(dims)
             }
             #[cfg(all(any(feature = "qwen3tts", feature = "voxtral"), target_os = "macos"))]
             WeightLoader::Aliased(pile) => {
@@ -555,6 +589,12 @@ impl WeightLoader {
                 .get(name)
                 .unwrap_or_else(|| panic!("pile missing tensor {name}"))
                 .clone(),
+            WeightLoader::Typed(map) => {
+                let leaf = map
+                    .get(name)
+                    .unwrap_or_else(|| panic!("pile missing tensor {name}"));
+                (leaf.to_f32(), leaf.shape())
+            }
             #[cfg(all(any(feature = "qwen3tts", feature = "voxtral"), target_os = "macos"))]
             WeightLoader::Aliased(pile) => {
                 let (handles, reader) = pile
@@ -571,6 +611,11 @@ impl WeightLoader {
     /// [`Self::load_f32`] (an owned copy, same bytes).
     pub fn view_f32(&self, name: &str) -> Option<(anybytes::View<[f32]>, Vec<usize>)> {
         match self {
+            // Serves on every platform, for every model — see the variant docs.
+            WeightLoader::Typed(map) => {
+                let leaf = map.get(name)?;
+                Some((leaf.view_f32()?, leaf.shape()))
+            }
             #[cfg(all(any(feature = "qwen3tts", feature = "voxtral"), target_os = "macos"))]
             WeightLoader::Aliased(pile) => {
                 use triblespace::prelude::BlobStoreGet;
@@ -605,6 +650,7 @@ impl WeightLoader {
             #[cfg(feature = "import")]
             WeightLoader::MultiShard(loader) => loader.has_weight(name),
             WeightLoader::Pile(map) => map.contains_key(name),
+            WeightLoader::Typed(map) => map.contains_key(name),
             #[cfg(all(any(feature = "qwen3tts", feature = "voxtral"), target_os = "macos"))]
             WeightLoader::Aliased(pile) => pile.leaf(name).is_some(),
         }

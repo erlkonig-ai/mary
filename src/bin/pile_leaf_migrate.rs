@@ -92,10 +92,15 @@ macro_rules! typed_leaf {
 
 /// Dispatch over the ranks models actually use.
 ///
-/// Rank 0 is a real case, not an edge case: `clip`'s `logit_scale` is a scalar,
-/// and a rank-0 tensor is one element with no dims. Rank 5+ is REFUSED rather
-/// than flattened — a pile holding one should say so, not come back as
-/// plausible numbers.
+/// Both ends of the range are real cases found in the piles, not defensive
+/// padding: `clip`'s `logit_scale` is a rank-0 scalar, and `nomic_mm7b` holds a
+/// rank-5 tensor. Both were found by this dispatch REFUSING them — which is the
+/// argument for refusing rather than flattening. A converter that reshaped the
+/// rank-5 tensor to fit would have reported success and written a model whose
+/// weights are silently misframed.
+///
+/// Beyond rank 6 it still refuses. The encoding allows up to 32; the arms stop
+/// where the evidence stops.
 macro_rules! by_rank {
     ($elem:ty, $ws:expr, $id:expr, $dims:expr, $payload:expr, $name:expr) => {
         match $dims.len() {
@@ -104,8 +109,10 @@ macro_rules! by_rank {
             2 => typed_leaf!($elem, 2, $ws, $id, $dims, $payload, $name),
             3 => typed_leaf!($elem, 3, $ws, $id, $dims, $payload, $name),
             4 => typed_leaf!($elem, 4, $ws, $id, $dims, $payload, $name),
+            5 => typed_leaf!($elem, 5, $ws, $id, $dims, $payload, $name),
+            6 => typed_leaf!($elem, 6, $ws, $id, $dims, $payload, $name),
             r => anyhow::bail!(
-                "{}: rank {r} exceeds the ranks this converter dispatches (0..=4); \
+                "{}: rank {r} exceeds the ranks this converter dispatches (0..=6); \
                  add an arm rather than flattening",
                 $name
             ),

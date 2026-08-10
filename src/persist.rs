@@ -1316,7 +1316,7 @@ pub fn load_keymap_from_mary_branch_by_root(
 /// repo is closed before returning; the reader's mmap stays valid afterward (each
 /// blob keeps the mapping alive, as in [`load_split_index_from_pile`]). NEVER
 /// amputates: a corrupt tail fails loud (see [`load_keymap_from_pile`]).
-pub fn checkout_mary_branch(
+fn checkout_mary_branch(
     pile_path: &Path,
 ) -> anyhow::Result<(TribleSet, triblespace::core::repo::pile::PileReader)> {
     let mut pile =
@@ -1355,6 +1355,78 @@ pub fn checkout_mary_branch(
     repo.close()
         .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
     Ok((tribles, reader))
+}
+
+/// Open a pile and return `(branch name, facts, blob reader)` from whichever
+/// branch holds the model — `mary` if present, else `main`.
+///
+/// Detected, not assumed. Both layouts are in the wild, and a loader that
+/// guesses wrong reports "no model" for a pile that plainly has one.
+/// NEVER amputates: a corrupt tail fails loud.
+pub fn checkout_any_branch(
+    pile_path: &Path,
+) -> anyhow::Result<(
+    &'static str,
+    TribleSet,
+    triblespace::core::repo::pile::PileReader,
+)> {
+    for branch in ["mary", "main"] {
+        let mut pile =
+            Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open {pile_path:?}: {e:?}"))?;
+        pile.refresh().map_err(|e| {
+            anyhow::anyhow!("{pile_path:?} failed to load ({e:?}); refusing to auto-truncate")
+        })?;
+        let mut repo = Repository::new(
+            pile,
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            TribleSet::new(),
+        )
+        .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
+        let found = repo
+            .lookup_branch(branch)
+            .map_err(|e| anyhow::anyhow!("lookup {branch}: {e:?}"))?;
+        let Some(branch_id) = found else {
+            repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
+            continue;
+        };
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull {branch}: {e:?}"))?;
+        let Some(head) = ws.head() else {
+            repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
+            continue;
+        };
+        let tribles: TribleSet = ws
+            .checkout(ancestors(head))
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
+            .facts()
+            .clone();
+        let reader = repo
+            .storage_mut()
+            .reader()
+            .map_err(|e| anyhow::anyhow!("pile reader: {e:?}"))?;
+        repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
+        return Ok((branch, tribles, reader));
+    }
+    anyhow::bail!("no 'mary' or 'main' branch with commits in {pile_path:?}")
+}
+
+/// Index a pile's TYPED tensor leaves by name, without materializing any of
+/// them.
+///
+/// The typed twin of [`load_keymap_from_pile`], and the difference is the whole
+/// point: that one returns `(Vec<f32>, Vec<usize>)` per tensor — every weight in
+/// the model, in RAM, as owned copies — while this returns views over the
+/// pile's mapping. Loading becomes a decision the caller makes per tensor
+/// rather than a cost paid up front for all of them.
+///
+/// Returns an empty map for a pile with no typed leaves (i.e. one not yet
+/// converted); callers should treat empty as "not a typed pile" and fall back.
+pub fn load_typed_keymap_from_pile(
+    pile_path: &Path,
+) -> anyhow::Result<std::collections::HashMap<String, crate::leaf::TypedLeaf>> {
+    let (_, tribles, reader) = checkout_any_branch(pile_path)?;
+    Ok(crate::leaf::index_typed_by_name(&tribles, &reader))
 }
 
 /// Reconstruct a SentencePiece UNIGRAM tokenizer from a pile's tokenizer graph.

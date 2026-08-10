@@ -196,17 +196,21 @@ impl TypedLeaf {
     }
 }
 
-/// Index every typed leaf in a model by its `safetensor_path` name.
+/// Index every typed leaf in a pile by its `safetensor_path` name.
 ///
-/// One query per `(element, rank)` — eight, not one — because that is what
+/// One query per `(element, rank)` — fourteen, not one — because that is what
 /// typing the attribute means. Each hit is read AS its type; nothing is
 /// interpreted without one.
 ///
+/// Joins module to leaf directly rather than walking `member` edges from a
+/// model root, so a pile holding several models (or one whose root layout
+/// differs) indexes the same way. Names are unique within a pile by
+/// construction — they are the safetensors keys.
+///
 /// Costs headers and handles, not weights: the views alias the pile's mapping.
-pub fn index_typed(
+pub fn index_typed_by_name(
     tribles: &TribleSet,
     blobs: &impl triblespace::prelude::BlobStoreGet,
-    model_id: Id,
 ) -> std::collections::HashMap<String, TypedLeaf> {
     use crate::format::attrs;
     let mut map = std::collections::HashMap::new();
@@ -217,7 +221,6 @@ pub fn index_typed(
                 (n: Inline<Handle<blobencodings::LongString>>,
                  h: Inline<Handle<Tensor<$elem, $rank>>>),
                 triblespace::macros::pattern!(tribles, [
-                    { model_id @ attrs::member: _?m },
                     { _?m @ attrs::safetensor_path: ?n, attrs::weight: _?w },
                     { _?w @ leaf::<$elem, $rank>(): ?h },
                 ])
@@ -236,11 +239,15 @@ pub fn index_typed(
     sweep!(F32, 2, Elem::F32);
     sweep!(F32, 3, Elem::F32);
     sweep!(F32, 4, Elem::F32);
+    sweep!(F32, 5, Elem::F32);
+    sweep!(F32, 6, Elem::F32);
     sweep!(F16, 0, Elem::F16);
     sweep!(F16, 1, Elem::F16);
     sweep!(F16, 2, Elem::F16);
     sweep!(F16, 3, Elem::F16);
     sweep!(F16, 4, Elem::F16);
+    sweep!(F16, 5, Elem::F16);
+    sweep!(F16, 6, Elem::F16);
 
     map
 }
@@ -278,11 +285,15 @@ pub fn index_typed_all(
     sweep_all!(F32, 2, Elem::F32);
     sweep_all!(F32, 3, Elem::F32);
     sweep_all!(F32, 4, Elem::F32);
+    sweep_all!(F32, 5, Elem::F32);
+    sweep_all!(F32, 6, Elem::F32);
     sweep_all!(F16, 0, Elem::F16);
     sweep_all!(F16, 1, Elem::F16);
     sweep_all!(F16, 2, Elem::F16);
     sweep_all!(F16, 3, Elem::F16);
     sweep_all!(F16, 4, Elem::F16);
+    sweep_all!(F16, 5, Elem::F16);
+    sweep_all!(F16, 6, Elem::F16);
 
     map
 }
