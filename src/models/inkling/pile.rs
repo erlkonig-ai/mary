@@ -96,6 +96,52 @@ pub fn split_payload(payload: &[u8], elems: usize) -> Result<(&[u8], &[u8], f32)
     Ok((codes, scales, scale2))
 }
 
+/// Facts naming an expert blob.
+///
+/// The weight attribute is DERIVED per (element, rank) from one anchor, so
+/// `Handle<Tensor<NVFP4, 2>>` and `Handle<Tensor<BF16, 3>>` are different
+/// attributes with different ids. A query for packed rank-2 experts cannot
+/// return a dense rank-3 tensor: the type is the query, not a convention the
+/// caller has to remember.
+pub mod attrs {
+    use super::*;
+    use triblespace::core::attribute::Attribute;
+    use triblespace::core::id_hex;
+    use triblespace::core::inline::encodings::hash::Handle;
+    use triblespace::prelude::*;
+
+    /// Anchor the weight attribute family derives from. Minted 2026-08-10.
+    pub const WEIGHT_ANCHOR: Id = id_hex!("0B51DA3E67216213871743E045590DBC");
+
+    /// The weight attribute for any element format and rank.
+    ///
+    /// One anchor yields a distinct id per `(element, rank)`, which is what
+    /// makes the type the query. `weight_nvfp4_2` below is this same attribute
+    /// spelled concretely — `attributes!` derives from `(anchor, encoding)`
+    /// exactly as `Attribute::anchored` does, so the ids are identical — and it
+    /// exists because `entity!` takes an attribute PATH rather than an
+    /// expression.
+    pub fn weight<T: TensorElement, const RANK: usize>(
+    ) -> Attribute<Handle<Tensor<T, RANK>>> {
+        Attribute::anchored(WEIGHT_ANCHOR)
+    }
+
+    attributes! {
+        /// A packed rank-2 expert. Same anchor as [`weight`], so this is that
+        /// attribute at `(NVFP4, 2)` and not a second one beside it.
+        "0B51DA3E67216213871743E045590DBC" as weight_nvfp4_2:
+            inlineencodings::Handle<Tensor<NVFP4, 2>>;
+        // The checkpoint tensor name lives in `metadata::name` as a LongString
+        // handle, not here. It was a ShortString attribute until a real name —
+        // `model.llm.layers.10.mlp.experts.w13_weight`, 42 characters — panicked
+        // the encoder, which answers a too-long value with unwrap() rather than
+        // an error. Two copies of one string, and the redundant one was the copy
+        // that could not hold it.
+        /// Which expert of the stacked matrix.
+        "A6ED6DBA4BE63E4E34F2787DA84AD860" as expert_index: inlineencodings::I256BE;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
