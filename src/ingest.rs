@@ -204,7 +204,7 @@ pub fn build_model_root(
     Ok(Fragment::rooted(root_id, facts))
 }
 
-fn read_string(
+pub fn read_string(
     blobs: &impl BlobStoreGet,
     h: Inline<inlineencodings::Handle<LongString>>,
 ) -> String {

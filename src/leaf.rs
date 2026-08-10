@@ -36,6 +36,7 @@
 
 use anyhow::Result;
 use triblespace::core::attribute::Attribute;
+use triblespace::core::blob::encodings::tensor::elements::{F16, F32};
 use triblespace::core::blob::encodings::tensor::{
     tensor_blob, Tensor, TensorElement, TensorView,
 };
@@ -83,7 +84,6 @@ pub fn read_leaf<T: TensorElement, const RANK: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use triblespace::core::blob::encodings::tensor::elements::{F16, F32};
 
     fn bytes(n: usize) -> anybytes::Bytes {
         anybytes::Bytes::from_source(vec![0u8; n])
@@ -120,4 +120,125 @@ mod tests {
         assert!(leaf_blob::<F32, 2>([8, 16], bytes(8 * 16 * 2)).is_err());
         assert!(leaf_blob::<F16, 2>([8, 16], bytes(8 * 16 * 2)).is_ok());
     }
+}
+
+/// Which element format a typed leaf turned out to hold.
+///
+/// The type parameter is gone by the time a leaf is in a by-name index — a
+/// keymap spans every dtype in the model — so the fact travels as data instead.
+/// This is erasure done ONCE, at the index boundary, from a read that was
+/// typed: the leaf was fetched as `Tensor<F32, 2>` or not at all. It is not the
+/// untyped iteration the module docs warn about, where a q4 leaf can be read as
+/// f16, because no read here is performed without its type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Elem {
+    F32,
+    F16,
+}
+
+/// One typed leaf, resolved.
+///
+/// Holds a [`TensorView`], which holds `Bytes` — a view over the pile's mapping,
+/// not a copy. Building an index of a whole model therefore costs handles and
+/// headers, not weights.
+pub struct TypedLeaf {
+    pub elem: Elem,
+    pub view: TensorView,
+}
+
+impl TypedLeaf {
+    /// Logical dims.
+    pub fn dims(&self) -> &[u64] {
+        self.view.dims()
+    }
+
+    /// Shape as the `Vec<usize>` the loaders speak.
+    pub fn shape(&self) -> Vec<usize> {
+        self.view.dims().iter().map(|&d| d as usize).collect()
+    }
+
+    /// ZERO-COPY view of an f32 leaf. `None` for f16 — the caller wants
+    /// [`Self::to_f32`] there, which must convert and therefore must allocate.
+    ///
+    /// Works on every platform and for every model, which the previous
+    /// zero-copy path did not: it existed only behind
+    /// `WeightLoader::Aliased`, gated to macOS and two model features. The
+    /// payload is a slice of the blob starting at a 256-byte boundary, so it is
+    /// aligned for `[f32]` by construction.
+    pub fn view_f32(&self) -> Option<anybytes::View<[f32]>> {
+        match self.elem {
+            Elem::F32 => self.view.payload().clone().view::<[f32]>().ok(),
+            Elem::F16 => None,
+        }
+    }
+
+    /// Materialise as f32. Allocates — call [`Self::view_f32`] first and only
+    /// fall back to this when it returns `None`.
+    pub fn to_f32(&self) -> Vec<f32> {
+        match self.elem {
+            Elem::F32 => self
+                .view
+                .payload()
+                .clone()
+                .view::<[f32]>()
+                .expect("f32 payload view")[..]
+                .to_vec(),
+            Elem::F16 => self
+                .view
+                .payload()
+                .clone()
+                .view::<[half::f16]>()
+                .expect("f16 payload view")
+                .iter()
+                .map(|h| h.to_f32())
+                .collect(),
+        }
+    }
+}
+
+/// Index every typed leaf in a model by its `safetensor_path` name.
+///
+/// One query per `(element, rank)` — eight, not one — because that is what
+/// typing the attribute means. Each hit is read AS its type; nothing is
+/// interpreted without one.
+///
+/// Costs headers and handles, not weights: the views alias the pile's mapping.
+pub fn index_typed(
+    tribles: &TribleSet,
+    blobs: &impl triblespace::prelude::BlobStoreGet,
+    model_id: Id,
+) -> std::collections::HashMap<String, TypedLeaf> {
+    use crate::format::attrs;
+    let mut map = std::collections::HashMap::new();
+
+    macro_rules! sweep {
+        ($elem:ty, $rank:literal, $tag:expr) => {{
+            for (n, h) in triblespace::macros::find!(
+                (n: Inline<Handle<blobencodings::LongString>>,
+                 h: Inline<Handle<Tensor<$elem, $rank>>>),
+                triblespace::macros::pattern!(tribles, [
+                    { model_id @ attrs::member: _?m },
+                    { _?m @ attrs::safetensor_path: ?n, attrs::weight: _?w },
+                    { _?w @ leaf::<$elem, $rank>(): ?h },
+                ])
+            ) {
+                let name = crate::ingest::read_string(blobs, n);
+                let blob: Blob<Tensor<$elem, $rank>> =
+                    blobs.get(h).expect("typed leaf blob");
+                let view = TensorView::try_from_blob(blob).expect("typed leaf decodes");
+                map.insert(name, TypedLeaf { elem: $tag, view });
+            }
+        }};
+    }
+
+    sweep!(F32, 1, Elem::F32);
+    sweep!(F32, 2, Elem::F32);
+    sweep!(F32, 3, Elem::F32);
+    sweep!(F32, 4, Elem::F32);
+    sweep!(F16, 1, Elem::F16);
+    sweep!(F16, 2, Elem::F16);
+    sweep!(F16, 3, Elem::F16);
+    sweep!(F16, 4, Elem::F16);
+
+    map
 }
