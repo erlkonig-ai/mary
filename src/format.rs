@@ -38,14 +38,14 @@ pub mod attrs {
     attributes! {
         // ── tensor leaf ──
         /// Flat f32 data of a tensor leaf.
-        "572B45D52A47608F283D0F778597137A" as data: Handle<F32Array>;
+        "572B45D52A47608F283D0F778597137A" unsafe as data: Handle<F32Array>;
         /// Flat f16 (half) data of a tensor leaf — the half-width alternative to
         /// `data`, used for weights whose native dtype is 16-bit (halves the pile
         /// and matches the GPU dtype for zero-copy load). A leaf carries `data`
         /// XOR `data_f16`, plus `shape`.
-        "467CCF3FDCCCCE599F6C1B933EACD933" as data_f16: Handle<F16Array>;
+        "467CCF3FDCCCCE599F6C1B933EACD933" unsafe as data_f16: Handle<F16Array>;
         /// Row-major shape (u64 dims) of a tensor leaf.
-        "D09A91FC3F04C40AE4A42CD6628A9E38" as shape: Handle<U64Array>;
+        "D09A91FC3F04C40AE4A42CD6628A9E38" unsafe as shape: Handle<U64Array>;
 
         // ── quantized tensor leaf (derived runtime formats) ──
         // A quantized leaf carries `data_q4` XOR `data_q8`, plus `q_scales`
@@ -56,44 +56,44 @@ pub mod attrs {
         /// GGUF-Q4_0-style packed nibbles of a row-major `[out, in]` weight:
         /// word `k/8` of a row holds weights `k..k+8`, nibble `k%8` at bits
         /// `4·(k%8)`; dequant `w = (nibble − 8) · scale`. Minted 2026-07-12.
-        "2ADC6462A7F70E230558C5D681E38768" as data_q4: Handle<U32Array>;
+        "2ADC6462A7F70E230558C5D681E38768" unsafe as data_q4: Handle<U32Array>;
         /// q8_0-style packed BIASED bytes of a row-major `[out, in]` weight:
         /// word `k/4` holds weights `k..k+4`, byte `k%4` at bits `8·(k%4)`,
         /// stored `q + 128`; dequant `w = (byte − 128) · scale`. Minted
         /// 2026-07-12.
-        "23178058559C762BB4B1FEAA36B3566D" as data_q8: Handle<U32Array>;
+        "23178058559C762BB4B1FEAA36B3566D" unsafe as data_q8: Handle<U32Array>;
         /// Per-group f16 scales of a quantized leaf — one scale per 32
         /// consecutive weights along the input dim, row-major `[out, in/32]`.
         /// Minted 2026-07-12.
-        "F9EA2FB90DC094D42A4845B013950032" as q_scales: Handle<F16Array>;
+        "F9EA2FB90DC094D42A4845B013950032" unsafe as q_scales: Handle<F16Array>;
         /// Layout/ABI version of a DERIVED model entity (quantized sibling
         /// piles). The value is a minted version id; a loader accepts the
         /// pile only when the marker equals its compiled-in constant — the
         /// file format IS the kernel ABI, so any layout change mints a new
         /// version id and re-derives. Minted 2026-07-12.
-        "2CC4D16369C4980BCB512937DA204FF5" as format_marker: GenId;
+        "2CC4D16369C4980BCB512937DA204FF5" unsafe as format_marker: GenId;
 
         // ── universal module params (role-edges → tensor leaves) ──
         /// A module's weight tensor.
-        "4629D277AD6B52B50DA78DEF63440AF1" as weight: GenId;
+        "4629D277AD6B52B50DA78DEF63440AF1" unsafe as weight: GenId;
         /// A module's bias tensor (optional).
-        "18E898172078C843A0351C3D880CC238" as bias: GenId;
+        "18E898172078C843A0351C3D880CC238" unsafe as bias: GenId;
 
         // ── module metadata ──
         /// Module kind tag ("linear", "layernorm", "conv", "embedding", …).
-        "52C4A211D2A08BA25C27FFD79FF24C93" as kind: ShortString;
+        "52C4A211D2A08BA25C27FFD79FF24C93" unsafe as kind: ShortString;
         /// Provenance: the tensor's original safetensors key (e.g. "…grn.gamma").
-        "09EA2F7BCF9B0C9714EE39CF269DF2D5" as safetensor_path: Handle<blobencodings::LongString>;
+        "09EA2F7BCF9B0C9714EE39CF269DF2D5" unsafe as safetensor_path: Handle<blobencodings::LongString>;
         /// Ordered position among siblings (for layer sequences).
-        "33CE12B1B940B13E48D8E5B0ADFD2421" as index: U256BE;
+        "33CE12B1B940B13E48D8E5B0ADFD2421" unsafe as index: U256BE;
 
         // ── model root ──
         /// Reference to a model's root entity.
-        "3F46CDE630964D78D62DA32F4A8558C1" as model_root: GenId;
+        "3F46CDE630964D78D62DA32F4A8558C1" unsafe as model_root: GenId;
         /// A model's module (repeated edge model → module entities).
-        "B4B6EC08A0CD70DE63A690168EE78F0F" as member: GenId;
+        "B4B6EC08A0CD70DE63A690168EE78F0F" unsafe as member: GenId;
         /// Model name / HuggingFace id (shared id with avatar/gaze).
-        "4C1CD1611863E7854C59C7DC706DF77A" as model_name: Handle<blobencodings::LongString>;
+        "4C1CD1611863E7854C59C7DC706DF77A" unsafe as model_name: Handle<blobencodings::LongString>;
         /// SOURCE of a content-addressed model-root entity — the model's canonical
         /// name: the HuggingFace id it was imported from (e.g.
         /// "openai/clip-vit-base-patch32"), or a `--name` for a local-dir import.
@@ -102,7 +102,7 @@ pub mod attrs {
         /// `(quantization, weights)` alone. A `Handle<LongString>` because HF ids
         /// routinely exceed 32 bytes. Minted 2026-07-24.
         /// (`trible genid` → D20B8E3556C35FF6D18D104C3443D6CF)
-        "D20B8E3556C35FF6D18D104C3443D6CF" as source: Handle<blobencodings::LongString>;
+        "D20B8E3556C35FF6D18D104C3443D6CF" unsafe as source: Handle<blobencodings::LongString>;
         /// Weight FORMAT tag of a content-addressed model-root entity (e.g.
         /// "native", "fp4", "q8"). NON-core: a queryable LABEL on the
         /// (content-derived) root id, NOT part of the identity — the id is the
@@ -111,7 +111,7 @@ pub mod attrs {
         /// ids, so the tag needn't be core; and the SAME weights under two
         /// different tags share one entity id.) Minted 2026-07-24.
         /// (`trible genid` → 7AF87320C144AA29C29FE2A5EE7C7EB2)
-        "7AF87320C144AA29C29FE2A5EE7C7EB2" as quantization: ShortString;
+        "7AF87320C144AA29C29FE2A5EE7C7EB2" unsafe as quantization: ShortString;
     }
 }
 

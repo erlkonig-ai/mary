@@ -114,40 +114,40 @@ pub mod attrs {
         // ── reused from `crate::format` (same hex — do NOT re-mint) ──
         /// Ordered position among siblings — merge rank, added-token order,
         /// `Sequence` config-node child order. Reused from `format::attrs::index`.
-        "33CE12B1B940B13E48D8E5B0ADFD2421" as index: U256BE;
+        "33CE12B1B940B13E48D8E5B0ADFD2421" unsafe as index: U256BE;
         /// Homogeneous ordered membership — reused for a `Sequence` config
         /// node → its child steps. From `format::attrs::member`.
-        "B4B6EC08A0CD70DE63A690168EE78F0F" as member: GenId;
+        "B4B6EC08A0CD70DE63A690168EE78F0F" unsafe as member: GenId;
         /// The tokenizer's source id (e.g. "nomic-ai/nomic-embed-text-v1.5").
         /// Reused from `format::attrs::model_name`.
-        "4C1CD1611863E7854C59C7DC706DF77A" as model_name: Handle<blobencodings::LongString>;
+        "4C1CD1611863E7854C59C7DC706DF77A" unsafe as model_name: Handle<blobencodings::LongString>;
 
         // ── minted 2026-07-16 (compass 67b09f72) — structural edges ──
         /// A model root → its tokenizer entity.
-        "E7014108A8F9512B19E3E8272E8A71F9" as tokenizer: GenId;
+        "E7014108A8F9512B19E3E8272E8A71F9" unsafe as tokenizer: GenId;
         /// Tokenizer → a vocab entry (repeated).
-        "E839AA8F549C0D608FB86476A1EF3416" as vocab: GenId;
+        "E839AA8F549C0D608FB86476A1EF3416" unsafe as vocab: GenId;
         /// Tokenizer → a merge entity (repeated, BPE only).
-        "E229769197BB035A2D6F61BC6A7D44BC" as merge: GenId;
+        "E229769197BB035A2D6F61BC6A7D44BC" unsafe as merge: GenId;
         /// Tokenizer → an added/special token entity (repeated).
-        "B2553118F4CAAF1D028619956DE7F145" as added: GenId;
+        "B2553118F4CAAF1D028619956DE7F145" unsafe as added: GenId;
         /// Tokenizer → its normalizer config node.
-        "53BAF87A0E7F1410F8212B3EDF2A498C" as normalizer: GenId;
+        "53BAF87A0E7F1410F8212B3EDF2A498C" unsafe as normalizer: GenId;
         /// Tokenizer → its pre-tokenizer config node.
-        "6EEBF39CADD11B7CFBB624019AE21585" as pre_tokenizer: GenId;
+        "6EEBF39CADD11B7CFBB624019AE21585" unsafe as pre_tokenizer: GenId;
         /// Tokenizer → its post-processor config node.
-        "98EC58B28F4D0BB43965DF7C5FF22713" as post_processor: GenId;
+        "98EC58B28F4D0BB43965DF7C5FF22713" unsafe as post_processor: GenId;
         /// Tokenizer → its decoder config node.
-        "F3AAA4CD8EE04E5592059564A21FE953" as decoder: GenId;
+        "F3AAA4CD8EE04E5592059564A21FE953" unsafe as decoder: GenId;
 
         // ── minted 2026-07-16 — bulk leaves ──
         /// A token/subword string (vocab entry, added-token content). A
         /// `LongString` blob, NOT `ShortString`: CLIP has 27 tokens over the
         /// 32-byte inline ceiling (byte-level BPE emoji clusters, up to 64 B).
         /// Content-addressed, so identical pieces (incl. merge halves) dedup.
-        "AE7FE29F2F38153F58C542D5CA4A9356" as piece: Handle<blobencodings::LongString>;
+        "AE7FE29F2F38153F58C542D5CA4A9356" unsafe as piece: Handle<blobencodings::LongString>;
         /// A token's vocab id (vocab entry, added token). Small int in a U256BE.
-        "F0E2E782F7BB62F52B1186DDE0EB5388" as token_id: U256BE;
+        "F0E2E782F7BB62F52B1186DDE0EB5388" unsafe as token_id: U256BE;
 
         // ── minted 2026-08-05 — the tiktoken lane ──
         /// A token's RAW BYTES. The byte-level sibling of `piece`, and the
@@ -159,40 +159,40 @@ pub mod attrs {
         /// base64 of the actual bytes, and re-encoding them into a byte-map the
         /// source file never mentions would be inventing a representation.)
         /// Content-addressed like `piece`, so shared tokens still dedup.
-        "714AE13F801202EB27C83E3AB2290669" as piece_bytes: Handle<blobencodings::RawBytes>;
+        "714AE13F801202EB27C83E3AB2290669" unsafe as piece_bytes: Handle<blobencodings::RawBytes>;
         /// A BPE merge's left piece (`LongString`, dedups against `piece`).
-        "5723ECE1FF426C58879B79D5669A7CF1" as merge_left: Handle<blobencodings::LongString>;
+        "5723ECE1FF426C58879B79D5669A7CF1" unsafe as merge_left: Handle<blobencodings::LongString>;
         /// A BPE merge's right piece (`LongString`, dedups against `piece`).
-        "5C78FEB151F35A2C5D07BEC92E860752" as merge_right: Handle<blobencodings::LongString>;
+        "5C78FEB151F35A2C5D07BEC92E860752" unsafe as merge_right: Handle<blobencodings::LongString>;
 
         // ── minted 2026-07-16 — config-tail model knobs (flat scalars) ──
         /// The unknown-token string (WordPiece "[UNK]", BPE "<|endoftext|>").
-        "68F1A9E6ED735E7C3ADCCA076AFF1742" as unk_token: ShortString;
+        "68F1A9E6ED735E7C3ADCCA076AFF1742" unsafe as unk_token: ShortString;
         /// WordPiece continuing-subword prefix ("##"); empty for BPE.
-        "11F76A2C0856C16CB030C4327D5A3B93" as continuing_subword_prefix: ShortString;
+        "11F76A2C0856C16CB030C4327D5A3B93" unsafe as continuing_subword_prefix: ShortString;
         /// BPE end-of-word suffix ("</w>").
-        "6FB969E8A3EDD1A657C721DD5A7D42EA" as end_of_word_suffix: ShortString;
+        "6FB969E8A3EDD1A657C721DD5A7D42EA" unsafe as end_of_word_suffix: ShortString;
         /// WordPiece max input chars per word (100).
-        "DF3F88DBFA2B44A7783169C9640014AF" as max_input_chars: U256BE;
+        "DF3F88DBFA2B44A7783169C9640014AF" unsafe as max_input_chars: U256BE;
 
         // ── minted 2026-08-04 — SentencePiece UNIGRAM leaves ──
         /// A vocab entry's unigram log-probability. `F64` because scores are
         /// stored f32 in the SPM proto and f64 holds them losslessly; the
         /// Viterbi lattice sums these, so precision is not decorative.
         /// Absent on BPE/WordPiece entries.
-        "3BCB70478942DB710ED2A4FB023F3457" as piece_score: F64;
+        "3BCB70478942DB710ED2A4FB023F3457" unsafe as piece_score: F64;
         /// Whether the model falls back to the 256 `<0xXX>` BYTE pieces for
         /// characters no NORMAL piece covers. `Boolean`, on the tokenizer node.
-        "EE4C6647619A836326196F0DBF84FA98" as byte_fallback: Boolean;
+        "EE4C6647619A836326196F0DBF84FA98" unsafe as byte_fallback: Boolean;
 
         // ── minted 2026-07-16 — config-node flat fields ──
         /// A Replace/Split node's regex pattern string (stored raw; both our
         /// tokenizers use the Regex variant, reconstructed as Regex).
-        "C8262D5668B8A1F541B3C35D54201BEC" as pattern: Handle<blobencodings::LongString>;
+        "C8262D5668B8A1F541B3C35D54201BEC" unsafe as pattern: Handle<blobencodings::LongString>;
         /// A Replace node's replacement content (e.g. " ").
-        "3AC7574C07D02D389B4E7AD3B3B084D9" as replace_content: ShortString;
+        "3AC7574C07D02D389B4E7AD3B3B084D9" unsafe as replace_content: ShortString;
         /// A Split node's SplitDelimiterBehavior name ("Removed"/"Isolated"/…).
-        "964B4FCF7477E7E4436F0325F89B7CB5" as behavior: ShortString;
+        "964B4FCF7477E7E4436F0325F89B7CB5" unsafe as behavior: ShortString;
     }
 }
 

@@ -1316,7 +1316,7 @@ pub fn load_keymap_from_mary_branch_by_root(
 /// repo is closed before returning; the reader's mmap stays valid afterward (each
 /// blob keeps the mapping alive, as in [`load_split_index_from_pile`]). NEVER
 /// amputates: a corrupt tail fails loud (see [`load_keymap_from_pile`]).
-fn checkout_mary_branch(
+pub fn checkout_mary_branch(
     pile_path: &Path,
 ) -> anyhow::Result<(TribleSet, triblespace::core::repo::pile::PileReader)> {
     let mut pile =
