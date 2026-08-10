@@ -76,6 +76,29 @@ fn checkout_any(
     anyhow::bail!("no 'mary' or 'main' branch with commits in {pile_path:?}")
 }
 
+
+/// Entity ids of the leaves a conversion would convert: those carrying
+/// `data` or `data_f16` alongside `shape`.
+///
+/// Leaves in other encodings (q4/q8) are deliberately NOT here — they are not
+/// converted, so none of their facts may be dropped.
+fn src_leaves_ids(tribles: &TribleSet) -> HashSet<Id> {
+    let mut ids = HashSet::new();
+    for (e,) in find!(
+        (e: Id),
+        pattern!(tribles, [{ ?e @ attrs::data: _?d, attrs::shape: _?s }])
+    ) {
+        ids.insert(e);
+    }
+    for (e,) in find!(
+        (e: Id),
+        pattern!(tribles, [{ ?e @ attrs::data_f16: _?d, attrs::shape: _?s }])
+    ) {
+        ids.insert(e);
+    }
+    ids
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let src = args
@@ -95,15 +118,26 @@ fn main() -> Result<()> {
     println!("branch      '{src_branch}'");
 
     // ── 1. every non-replaced fact survived, unchanged ──────────────────────
+    //
+    // Filtered by (attribute AND entity), matching the converter. Filtering by
+    // attribute alone — which this did until 2026-08-11 — excludes a dropped
+    // `shape` from BOTH sides of the comparison, so the check cannot see it.
+    // That is not a weak check, it is an anti-check: it validated the exact bug
+    // it existed to catch, and personaplex_f16 (195 shapes, 194 leaves) passed
+    // while missing one.
+    //
+    // A comparison that filters both sides by the same rule can only ever
+    // confirm that rule was applied.
     let replaced = [attrs::data.id(), attrs::data_f16.id(), attrs::shape.id()];
+    let converted_src: HashSet<Id> = src_leaves_ids(&src_tribles);
     let carried: TribleSet = src_tribles
         .iter()
-        .filter(|t| !replaced.contains(t.a()))
+        .filter(|t| !(replaced.contains(t.a()) && converted_src.contains(t.e())))
         .cloned()
         .collect();
     let dst_carried: TribleSet = dst_tribles
         .iter()
-        .filter(|t| !replaced.contains(t.a()))
+        .filter(|t| !(replaced.contains(t.a()) && converted_src.contains(t.e())))
         .cloned()
         .collect();
 
