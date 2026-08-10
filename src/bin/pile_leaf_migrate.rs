@@ -12,6 +12,10 @@
 //!   - each leaf keeps its OWN entity id and gains one typed leaf fact;
 //!   - every blob is copied except the superseded data and shape blobs.
 //!
+//! Substitution applies ONLY to the leaves actually converted. Everything else
+//! — including leaves in encodings this tool has no path for, such as the q4/q8
+//! quantized ones — passes through whole, `shape` included.
+//!
 //! This matters more than it sounds. A converter that rebuilds only what it
 //! understands silently drops what it does not — and these piles carry more
 //! than weights. `nomic_text` holds a 30,000-piece tokenizer graph hanging off
@@ -237,12 +241,24 @@ fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("pull {branch}: {e:?}"))?;
 
     // ── the substitution ────────────────────────────────────────────────────
-    // Carry every fact EXCEPT the three being replaced. Values are copied
-    // verbatim, so nothing needs to be understood in order to survive.
+    // Carry every fact EXCEPT the three being replaced ON THE LEAVES ACTUALLY
+    // CONVERTED. The entity check is not a refinement, it is the difference
+    // between substitution and quiet mutilation: a quantized leaf carries
+    // `data_q4`/`data_q8` + `q_scales` + `shape`, so it is NOT in `leaves`
+    // (no `data`/`data_f16`) and gets no typed leaf — but a blanket filter on
+    // the attribute would still strip its `shape`, leaving a leaf whose
+    // dimensions are simply gone.
+    //
+    // personaplex_q4.pile: 195 shape facts, 66 convertible leaves, 129 q4. A
+    // blanket filter converts 66 and silently unshapes 129, and reports
+    // success. Found by auditing this tool against the very failure it was
+    // written to avoid — the docs above claimed copy-and-substitute "cannot
+    // lose data it has no schema for", and for `shape` that was false.
+    let converted: HashSet<Id> = leaves.iter().map(|(e, _)| *e).collect();
     let replaced = [attrs::data.id(), attrs::data_f16.id(), attrs::shape.id()];
     let mut facts: TribleSet = tribles
         .iter()
-        .filter(|t| !replaced.contains(t.a()))
+        .filter(|t| !(replaced.contains(t.a()) && converted.contains(t.e())))
         .cloned()
         .collect();
     eprintln!(
