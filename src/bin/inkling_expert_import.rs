@@ -68,17 +68,17 @@ fn main() -> Result<()> {
     println!("layers     {lo}..={hi}");
     println!("matrices   {}", bases.len());
 
-    // Skip-and-report, never skip-silently.
+    // A checkpoint holds BOTH kinds — Inkling's layer 2 experts are plain BF16
+    // while the rest are NVFP4 — and the presence of a `.scale` sidecar is what
+    // decides. Both are imported, each through its own path; neither is guessed
+    // at, because the packed path on a BF16 stack would read sidecars that do
+    // not exist and produce plausible noise.
     let (packed, dense): (Vec<&String>, Vec<&String>) =
         bases.iter().partition(|b| ck.is_nvfp4(b));
+    println!("           {} NVFP4, {} BF16", packed.len(), dense.len());
     if !dense.is_empty() {
-        println!(
-            "           {} matrix/matrices are BF16, not NVFP4 — SKIPPED (no sidecars): {:?}",
-            dense.len(),
-            dense
-        );
+        println!("           BF16: {dense:?}");
     }
-    println!("           {} NVFP4 matrices to import", packed.len());
 
     let path = std::path::Path::new(&pile_path);
     if !path.exists() {
@@ -106,12 +106,15 @@ fn main() -> Result<()> {
         // How many experts this matrix stacks — asked of the checkpoint rather
         // than assumed, so a model with a different expert count imports
         // correctly instead of silently importing a prefix.
+        // Asked, not assumed — and not inferred from an error, which would
+        // swallow a genuine read failure as "that was the last one".
+        let count = ck.expert_count(base)?;
+        let take = count.min(experts_cap);
         let mut e = 0usize;
-        while e < experts_cap {
-            let q = match ck.expert_slice_packed(base, e) {
-                Ok(q) => q,
-                Err(_) => break, // past the last expert in this stack
-            };
+        while e < take {
+            let q = ck
+                .expert_slice_packed(base, e)
+                .with_context(|| format!("{base}[{e}]"))?;
             let blob = expert_blob(&q).with_context(|| format!("{base}[{e}] to blob"))?;
             let blob2 = expert_blob(&q)?;
 
@@ -155,6 +158,61 @@ fn main() -> Result<()> {
         }
         println!("  {base}: {e} experts");
     }
+
+    // ── the BF16 stacks ─────────────────────────────────────────────────────
+    // Same facts, different element type. `weight` is anchored, so
+    // Tensor<BF16, 2> is that attribute at BF16 rather than a second attribute
+    // beside it — and a reader asking for packed experts cannot be handed one
+    // of these by accident.
+    let mut bf16_n = 0usize;
+    for base in dense {
+        let layer = layer_of(base);
+        let count = ck.expert_count(base)?;
+        let take = count.min(experts_cap);
+        for e in 0..take {
+            let raw = ck
+                .expert_slice_bf16(base, e)
+                .with_context(|| format!("{base}[{e}]"))?;
+            let dims: [u64; 2] = [raw.shape[0] as u64, raw.shape[1] as u64];
+            let payload = anybytes::Bytes::from_source(raw.bytes);
+            let blob = triblespace::core::blob::encodings::tensor::tensor_blob::<
+                triblespace::core::blob::encodings::tensor::elements::BF16,
+                2,
+            >(dims, payload.clone())
+            .map_err(|err| anyhow::anyhow!("{base}[{e}]: {err}"))?;
+
+            let view: TensorView = TryFromBlob::try_from_blob(blob.clone())
+                .map_err(|err| anyhow::anyhow!("{base}[{e}]: decode: {err}"))?;
+            anyhow::ensure!(
+                view.dims() == dims && &view.payload()[..] == &payload[..],
+                "{base}[{e}]: did not round-trip"
+            );
+
+            let bytes = blob.bytes.len();
+            let handle = ws.put(blob);
+            let name_h = ws.put::<blobencodings::LongString, _>(base.to_string());
+            let mut facts = entity! { &ufoid() @
+                attrs::weight::<triblespace::core::blob::encodings::tensor::elements::BF16, 2>(): handle,
+                attrs::expert_index: e as i64,
+                metadata::name: name_h,
+            };
+            if let Some(l) = layer {
+                let root = facts.root().expect("rooted");
+                facts += entity! { ExclusiveId::force_ref(&root) @ attrs::layer: l };
+            }
+            change += facts;
+            total += bytes;
+            bf16_n += 1;
+            if bf16_n % 100 == 0 {
+                println!(
+                    "  {bf16_n} BF16 experts, {:.1} GiB ...",
+                    total as f64 / (1024.0 * 1024.0 * 1024.0)
+                );
+            }
+        }
+        println!("  {base}: {take} BF16 experts");
+    }
+    n += bf16_n;
 
     ws.commit(change, &format!("inkling experts, layers {lo}..={hi}"));
     repo.push(&mut ws)

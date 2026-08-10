@@ -157,6 +157,81 @@ impl Checkpoint {
         })
     }
 
+    /// Slice ONE expert out of a stacked BF16 expert matrix, without widening
+    /// and without materialising the stack.
+    ///
+    /// The BF16 counterpart to [`Checkpoint::expert_slice_packed`]. Needed
+    /// because a checkpoint can hold both: Inkling's layer 2 experts are plain
+    /// BF16 while the rest are NVFP4, which the presence of a `.scale` sidecar
+    /// decides.
+    ///
+    /// Slicing rather than reading the whole tensor is the point. A stacked
+    /// BF16 `[256, 6144, 6144]` is 19 GB; [`Checkpoint::tensor_raw`] would copy
+    /// all of it to hand back one 75 MB expert. This maps the shard and copies
+    /// only the slice, so importing 256 experts costs 256 slices rather than
+    /// 256 whole-stack reads.
+    pub fn expert_slice_bf16(&self, base: &str, e: usize) -> Result<RawTensor> {
+        let shard = self
+            .shard_of
+            .get(base)
+            .with_context(|| format!("{base} is not in the index"))?;
+        let path = self.dir.join(shard);
+        let file =
+            std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+        // SAFETY: the checkpoint is read-only and nothing else writes it.
+        let mmap = unsafe { Mmap::map(&file) }?;
+        let st = SafeTensors::deserialize(&mmap)?;
+        let view = st.tensor(base)?;
+        let dtype = format!("{:?}", view.dtype());
+        anyhow::ensure!(
+            dtype == "BF16",
+            "{base} holds {dtype}; expert_slice_bf16 is for the unquantised stacks"
+        );
+        let shape = view.shape();
+        anyhow::ensure!(
+            shape.len() == 3,
+            "{base} has shape {shape:?}; a stacked expert matrix is rank 3"
+        );
+        let (n, rows, cols) = (shape[0], shape[1], shape[2]);
+        anyhow::ensure!(e < n, "{base} stacks {n} experts; {e} is out of range");
+        let per = rows * cols * 2;
+        let raw = view.data();
+        anyhow::ensure!(
+            raw.len() == n * per,
+            "{base}: {} bytes for {n}x{rows}x{cols} BF16, expected {}",
+            raw.len(),
+            n * per
+        );
+        Ok(RawTensor {
+            dtype,
+            shape: vec![rows, cols],
+            bytes: raw[e * per..(e + 1) * per].to_vec(),
+        })
+    }
+
+    /// How many experts a stacked matrix holds.
+    ///
+    /// Asked of the checkpoint rather than assumed, so a model with a different
+    /// expert count imports fully instead of silently importing a prefix.
+    pub fn expert_count(&self, base: &str) -> Result<usize> {
+        let shard = self
+            .shard_of
+            .get(base)
+            .with_context(|| format!("{base} is not in the index"))?;
+        let path = self.dir.join(shard);
+        let file =
+            std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+        // SAFETY: the checkpoint is read-only and nothing else writes it.
+        let mmap = unsafe { Mmap::map(&file) }?;
+        let st = SafeTensors::deserialize(&mmap)?;
+        let shape = st.tensor(base)?.shape().to_vec();
+        anyhow::ensure!(
+            shape.len() == 3,
+            "{base} has shape {shape:?}; a stacked expert matrix is rank 3"
+        );
+        Ok(shape[0])
+    }
+
     /// Read a stacked expert matrix, dequantising when it is NVFP4.
     ///
     /// A layer's experts are either NVFP4 with four sidecars or plain BF16 with
