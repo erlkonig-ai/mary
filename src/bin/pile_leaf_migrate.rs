@@ -1,73 +1,74 @@
 //! Convert a model pile's leaves from `{data|data_f16, shape}` to typed tensors.
 //!
-//! Pile to pile, into a NEW file. The source is only ever read — these are the
-//! curated model piles, so a conversion writes elsewhere and is then COMPARED
-//! against the original rather than trusted.
+//! Pile to pile, into a NEW file. The source is only ever read.
 //!
-//! What changes per leaf: two handles become one, the shape moves from a
-//! separate blob into the tensor's header, and the element type and rank move
-//! into the attribute id. What does not change: a single byte of tensor data.
-//! This binary verifies that rather than asserting it: each leaf is decoded back
-//! out of the blob just built and its payload compared, byte for byte, to the
-//! source blob's bytes.
+//! # Substitution, not reconstruction
 //!
-//! The conversion never materialises a tensor. It moves the source blob's bytes
-//! into the tensor payload verbatim — no `view::<[f32]>()`, no `Vec`, no cast —
-//! which is both why it is fast and why bit-identity is cheap to establish:
-//! there is no decode/encode roundtrip to be lossy in. (Contrast
-//! `derive_f16_pile`, which goes through `Vec<f32>` because it is genuinely
-//! computing new values.)
+//! The converter does not rebuild the model graph. It COPIES the pile and
+//! substitutes one representation for another:
 //!
-//! Byte-identity all the way to disk is then two facts, neither assumed: the
-//! payload equals the source bytes (checked here, per leaf), and the handle is
-//! the hash of the blob, which the store checks on every read.
+//!   - every fact is carried over verbatim except the three being replaced
+//!     (`data`, `data_f16`, `shape`);
+//!   - each leaf keeps its OWN entity id and gains one typed leaf fact;
+//!   - every blob is copied except the superseded data and shape blobs.
 //!
-//! # What is preserved, and what necessarily is not
+//! This matters more than it sounds. A converter that rebuilds only what it
+//! understands silently drops what it does not — and these piles carry more
+//! than weights. `nomic_text` holds a 30,000-piece tokenizer graph hanging off
+//! its own root; the rebuild-the-members version of this tool would have
+//! reported a confident "112 leaves converted" and produced a pile with no
+//! tokenizer in it. Copy-and-substitute cannot lose data it has no schema for,
+//! which is exactly the property worth having when the pile knows things the
+//! tool does not.
 //!
-//! Entity ids here are CONTENT-DERIVED (`entity! { _ @ … }`). Changing how a
-//! leaf is stored changes the leaf's content, hence its id, hence the module
-//! that points at it, hence the model root. So the converted pile's ids differ
-//! from the source's, unavoidably — that is content addressing working, not a
-//! defect. What survives is the `(source, quantization)` label pair, which is
-//! how every mary-branch loader actually resolves a model. A caller that
-//! recorded a raw root id needs the new one; this binary prints the mapping.
+//! Preserving ids also means nothing dangles and nothing downstream has to be
+//! told a new address: module edges, model roots, `member` lists and tokenizer
+//! references all still resolve. The weights are bit-identical, so the model an
+//! id names is the same model; only how its bytes are framed has changed.
+//!
+//! # What is verified
+//!
+//! Byte-identity is established twice, and neither half is assumed: each
+//! payload is decoded back out of the blob just built and compared to the
+//! source bytes (here), and the handle IS the hash of those bytes, which the
+//! store checks on every read. `pile_leaf_verify` then re-checks the finished
+//! pile cold, through the code path a real loader uses.
+//!
+//! The conversion never materialises a tensor — no `view::<[f32]>()`, no `Vec`,
+//! no cast. The source blob's bytes go into the tensor payload as they are.
 //!
 //!   pile_leaf_migrate <src.pile> <dst.pile>
 
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use mary::format::attrs;
-use mary::ingest::LeafHandles;
 use mary::leaf;
+use std::collections::HashSet;
 use std::path::Path;
 use triblespace::core::blob::encodings::tensor::elements::{F16, F32};
-use triblespace::core::repo::{ancestors, Repository};
+use triblespace::core::blob::encodings::UnknownBlob;
+use triblespace::core::blob::Blob;
+use triblespace::core::id::ExclusiveId;
+use triblespace::core::repo::{ancestors, BlobStoreList, Repository};
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
 
-/// Build the typed blob, put it, and return the leaf entity — all inside the
-/// arm that knows the rank.
+/// Build the typed blob, verify it against the source bytes, and attach it to
+/// the leaf's OWN entity id.
 ///
-/// This is where rank-in-the-type is paid for: `shape.len()` is a runtime value
-/// and `RANK` is not, so SOMETHING has to dispatch. Worth noting what this
-/// replaces rather than adds — `format::load_tensor` already carried
-/// `assert_eq!(shp.len(), D)`, so every consumer was already passing the rank
-/// statically and eating a runtime check for it. The dispatch moves that check
-/// here, once, at conversion time.
+/// The rank dispatch is the price of rank-in-the-type, paid once here rather
+/// than by every reader — and worth being precise about, because it replaces a
+/// check rather than adding one: `format::load_tensor` already carried
+/// `assert_eq!(shp.len(), D)`, so consumers were already passing the rank
+/// statically and paying for it at runtime.
 macro_rules! typed_leaf {
-    ($elem:ty, $rank:literal, $ws:expr, $dims:expr, $payload:expr, $name:expr) => {{
+    ($elem:ty, $rank:literal, $ws:expr, $id:expr, $dims:expr, $payload:expr, $name:expr) => {{
         let dims: [u64; $rank] = $dims.as_slice().try_into().expect("rank checked by caller");
         let src_bytes = $payload;
         let blob = leaf::leaf_blob::<$elem, $rank>(dims, src_bytes.clone())?;
 
-        // VERIFY, per leaf, before it is stored: decode the blob we just built
-        // and check that the payload is the source bytes and the dims are the
-        // source dims. Cheap — a view, not a copy — and it closes the encode
-        // step. Disk integrity is then content-addressing's job: the handle IS
-        // the hash of these bytes and the store checks it on read, so a blob
-        // that verifies here and reads back under that handle later is the same
-        // blob. That is the whole byte-identity argument, and neither half is
-        // assumed.
+        // Verified where both halves are in hand: decode what was just built
+        // and compare. A view, not a copy.
         let view = leaf::read_leaf::<$elem, $rank>(blob.clone())?;
         anyhow::ensure!(
             view.dims() == dims,
@@ -85,24 +86,26 @@ macro_rules! typed_leaf {
         );
 
         let handle = $ws.put(blob);
-        entity! { _ @ leaf::leaf::<$elem, $rank>(): handle }
+        entity! { $id @ leaf::leaf::<$elem, $rank>(): handle }
     }};
 }
 
-/// Dispatch over the ranks a model actually uses.
+/// Dispatch over the ranks models actually use.
 ///
-/// Rank 5+ is REFUSED, not flattened. A pile containing a rank-5 leaf should
-/// say so loudly; silently reshaping it is how a tensor comes back as plausible
-/// numbers instead of an error.
+/// Rank 0 is a real case, not an edge case: `clip`'s `logit_scale` is a scalar,
+/// and a rank-0 tensor is one element with no dims. Rank 5+ is REFUSED rather
+/// than flattened — a pile holding one should say so, not come back as
+/// plausible numbers.
 macro_rules! by_rank {
-    ($elem:ty, $ws:expr, $dims:expr, $payload:expr, $name:expr) => {
+    ($elem:ty, $ws:expr, $id:expr, $dims:expr, $payload:expr, $name:expr) => {
         match $dims.len() {
-            1 => typed_leaf!($elem, 1, $ws, $dims, $payload, $name),
-            2 => typed_leaf!($elem, 2, $ws, $dims, $payload, $name),
-            3 => typed_leaf!($elem, 3, $ws, $dims, $payload, $name),
-            4 => typed_leaf!($elem, 4, $ws, $dims, $payload, $name),
+            0 => typed_leaf!($elem, 0, $ws, $id, $dims, $payload, $name),
+            1 => typed_leaf!($elem, 1, $ws, $id, $dims, $payload, $name),
+            2 => typed_leaf!($elem, 2, $ws, $id, $dims, $payload, $name),
+            3 => typed_leaf!($elem, 3, $ws, $id, $dims, $payload, $name),
+            4 => typed_leaf!($elem, 4, $ws, $id, $dims, $payload, $name),
             r => anyhow::bail!(
-                "{}: rank {r} exceeds the ranks this converter dispatches (1..=4); \
+                "{}: rank {r} exceeds the ranks this converter dispatches (0..=4); \
                  add an arm rather than flattening",
                 $name
             ),
@@ -110,133 +113,96 @@ macro_rules! by_rank {
     };
 }
 
-
-/// Resolve a pile's model roots under either layout.
+/// Read a pile's facts from whichever branch holds them.
 ///
-/// Returns `(facts, blob reader, [(root id, source label, quantization)])`.
-/// A `main`-layout pile has no quantization coordinate, so its models are
-/// reported as `native` — which is what they are: faithful imports, no derived
-/// format. That is a statement about the old layout, not a guess about content.
-fn read_roots(
-    src: &Path,
+/// Two layouts exist in the wild: the current `mary` branch and the older
+/// `main`. Detected, not assumed — and the branch NAME is carried out so the
+/// destination lands on the same one.
+fn checkout_any(
+    pile_path: &Path,
 ) -> Result<(
+    &'static str,
     TribleSet,
     triblespace::core::repo::pile::PileReader,
-    Vec<(Id, String, String)>,
 )> {
-    if let Ok((tribles, reader)) = mary::persist::checkout_mary_branch(src) {
-        let mut roots: Vec<(Id, String, String)> = Vec::new();
-        for (m, s_h, q) in find!(
-            (m: Id,
-             s: Inline<inlineencodings::Handle<blobencodings::LongString>>,
-             q: String),
-            pattern!(&tribles, [{ ?m @
-                attrs::source: ?s,
-                attrs::quantization: ?q,
-            }])
-        ) {
-            let sv: anybytes::View<str> = reader
-                .get(s_h)
-                .map_err(|e| anyhow::anyhow!("source blob: {e:?}"))?;
-            roots.push((m, sv.to_string(), q));
-        }
-        if !roots.is_empty() {
-            eprintln!("[migrate] layout: 'mary' branch (source + quantization)");
-            roots.sort_by(|a, b| (&a.1, &a.2).cmp(&(&b.1, &b.2)));
-            return Ok((tribles, reader, roots));
-        }
+    for branch in ["mary", "main"] {
+        let mut pile =
+            Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open {pile_path:?}: {e:?}"))?;
+        pile.refresh().map_err(|e| {
+            anyhow::anyhow!("{pile_path:?} failed to load ({e:?}); refusing to auto-truncate")
+        })?;
+        let mut repo = Repository::new(
+            pile,
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            TribleSet::new(),
+        )
+        .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
+        let found = repo
+            .lookup_branch(branch)
+            .map_err(|e| anyhow::anyhow!("lookup {branch}: {e:?}"))?;
+        let Some(branch_id) = found else {
+            repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
+            continue;
+        };
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull {branch}: {e:?}"))?;
+        let Some(head) = ws.head() else {
+            repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
+            continue;
+        };
+        let tribles: TribleSet = ws
+            .checkout(ancestors(head))
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
+            .facts()
+            .clone();
+        let reader = repo
+            .storage_mut()
+            .reader()
+            .map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
+        repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
+        return Ok((branch, tribles, reader));
     }
-
-    let (tribles, reader) = checkout_main_branch(src)?;
-    let mut roots: Vec<(Id, String, String)> = Vec::new();
-    for (m, n_h) in find!(
-        (m: Id, n: Inline<inlineencodings::Handle<blobencodings::LongString>>),
-        pattern!(&tribles, [{ ?m @ attrs::model_name: ?n }])
-    ) {
-        let nv: anybytes::View<str> = reader
-            .get(n_h)
-            .map_err(|e| anyhow::anyhow!("model name blob: {e:?}"))?;
-        roots.push((m, nv.to_string(), mary::persist::QUANTIZATION_NATIVE.to_string()));
-    }
-    if !roots.is_empty() {
-        eprintln!("[migrate] layout: 'main' branch (model_name)");
-    }
-    roots.sort_by(|a, b| (&a.1, &a.2).cmp(&(&b.1, &b.2)));
-    Ok((tribles, reader, roots))
-}
-
-/// The `main`-branch twin of `checkout_mary_branch`. NEVER amputates: a corrupt
-/// tail fails loud rather than being silently truncated on a read path.
-fn checkout_main_branch(
-    pile_path: &Path,
-) -> Result<(TribleSet, triblespace::core::repo::pile::PileReader)> {
-    let mut pile =
-        Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open {pile_path:?}: {e:?}"))?;
-    pile.refresh().map_err(|e| {
-        anyhow::anyhow!("{pile_path:?} failed to load ({e:?}); refusing to auto-truncate")
-    })?;
-    let mut repo = Repository::new(
-        pile,
-        SigningKey::generate(&mut rand::rngs::OsRng),
-        TribleSet::new(),
-    )
-    .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
-    let branch_id = repo
-        .lookup_branch("main")
-        .map_err(|e| anyhow::anyhow!("lookup main: {e:?}"))?
-        .ok_or_else(|| anyhow::anyhow!("no 'main' branch in {pile_path:?}"))?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull main: {e:?}"))?;
-    let head = ws
-        .head()
-        .ok_or_else(|| anyhow::anyhow!("'main' has no commits"))?;
-    let tribles: TribleSet = ws
-        .checkout(ancestors(head))
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
-        .facts()
-        .clone();
-    let reader = repo
-        .storage_mut()
-        .reader()
-        .map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
-    repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
-    Ok((tribles, reader))
+    anyhow::bail!("no 'mary' or 'main' branch with commits in {pile_path:?}")
 }
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let src = args.next().context("usage: pile_leaf_migrate <src.pile> <dst.pile>")?;
-    let dst = args.next().context("usage: pile_leaf_migrate <src.pile> <dst.pile>")?;
-    if let Some(extra) = args.next() {
-        anyhow::bail!("unexpected argument {extra}");
-    }
+    let src = args
+        .next()
+        .context("usage: pile_leaf_migrate <src.pile> <dst.pile>")?;
+    let dst = args
+        .next()
+        .context("usage: pile_leaf_migrate <src.pile> <dst.pile>")?;
     let (src, dst) = (Path::new(&src), Path::new(&dst));
     anyhow::ensure!(
         src.canonicalize()? != dst.canonicalize().unwrap_or_else(|_| dst.to_path_buf()),
         "src and dst are the same pile file — refusing to write into the source"
     );
 
-    // Two layouts exist in the wild and a converter has to read both:
-    //
-    //   `mary` branch  — a CONTENT-ADDRESSED root labelled `source` +
-    //                    `quantization` (the current form).
-    //   `main` branch  — one entity per persisted shard carrying `model_name`
-    //                    (the older form; most of ~/models is still this).
-    //
-    // Detected, not assumed: try the mary branch, fall back to main. The
-    // destination always gets the current form, so conversion doubles as the
-    // layout upgrade.
-    let (tribles, reader, roots) = read_roots(src)?;
-    anyhow::ensure!(
-        !roots.is_empty(),
-        "no model roots found in {src:?} (neither a 'mary' branch with \
-         source+quantization, nor 'main' with model_name)"
+    let (branch, tribles, reader) = checkout_any(src)?;
+    eprintln!(
+        "[migrate] {src:?}: branch '{branch}', {} facts",
+        tribles.len()
     );
-    eprintln!("[migrate] {} model root(s) in {src:?}:", roots.len());
-    for (id, source, quant) in &roots {
-        eprintln!("[migrate]   {id}  {source}  ({quant})");
+
+    // Every leaf, by its own entity id. `data` XOR `data_f16`, plus `shape`.
+    let mut leaves: Vec<(Id, bool)> = Vec::new();
+    for (e,) in find!(
+        (e: Id),
+        pattern!(&tribles, [{ ?e @ attrs::data: _?d, attrs::shape: _?s }])
+    ) {
+        leaves.push((e, false));
     }
+    for (e,) in find!(
+        (e: Id),
+        pattern!(&tribles, [{ ?e @ attrs::data_f16: _?d, attrs::shape: _?s }])
+    ) {
+        leaves.push((e, true));
+    }
+    anyhow::ensure!(!leaves.is_empty(), "no tensor leaves in {src:?}");
+    leaves.sort_by_key(|(e, _)| format!("{e}"));
+    eprintln!("[migrate] {} leaves", leaves.len());
 
     if !dst.exists() {
         std::fs::File::create(dst).map_err(|e| anyhow::anyhow!("create {dst:?}: {e}"))?;
@@ -251,97 +217,114 @@ fn main() -> Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
     let branch_id = match repo
-        .lookup_branch("mary")
-        .map_err(|e| anyhow::anyhow!("lookup mary: {e:?}"))?
+        .lookup_branch(branch)
+        .map_err(|e| anyhow::anyhow!("lookup {branch}: {e:?}"))?
     {
         Some(id) => id,
         None => *repo
-            .create_branch("mary", None)
-            .map_err(|e| anyhow::anyhow!("create mary: {e:?}"))?,
+            .create_branch(branch, None)
+            .map_err(|e| anyhow::anyhow!("create {branch}: {e:?}"))?,
     };
     let mut ws = repo
         .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull mary: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("pull {branch}: {e:?}"))?;
 
-    let mut facts = TribleSet::new();
+    // ── the substitution ────────────────────────────────────────────────────
+    // Carry every fact EXCEPT the three being replaced. Values are copied
+    // verbatim, so nothing needs to be understood in order to survive.
+    let replaced = [attrs::data.id(), attrs::data_f16.id(), attrs::shape.id()];
+    let mut facts: TribleSet = tribles
+        .iter()
+        .filter(|t| !replaced.contains(t.a()))
+        .cloned()
+        .collect();
+    eprintln!(
+        "[migrate] carrying {} facts verbatim, replacing {}",
+        facts.len(),
+        tribles.len() - facts.len()
+    );
+
+    // The blobs the old representation used, which the new one supersedes.
+    let mut superseded: HashSet<[u8; 32]> = HashSet::new();
     let (mut f32n, mut f16n, mut total) = (0usize, 0usize, 0usize);
-    let mut mapping: Vec<(String, String, Id, Id)> = Vec::new();
 
-    for (root, source, quant) in &roots {
-        let index = mary::ingest::index_keymap(&tribles, &reader, *root);
-        anyhow::ensure!(!index.is_empty(), "{source}: root {root} has no members");
-        let mut names: Vec<&String> = index.keys().collect();
-        names.sort();
-        eprintln!("[migrate] {source} ({quant}): {} leaves", names.len());
-
-        let mut members: Vec<Id> = Vec::new();
-        for name in names {
-            let handles = index[name];
-            let dims_usize = match handles {
-                LeafHandles::F32(_, sh) | LeafHandles::F16(_, sh) => {
-                    mary::ingest::read_shape(&reader, sh)
-                }
-            };
-            let dims: Vec<u64> = dims_usize.iter().map(|&d| d as u64).collect();
-
-            // The payload, as RAW BYTES. No view::<[f32]>(), no Vec, no cast —
-            // the bytes in the source blob are the bytes in the tensor payload.
-            let (payload_len, leaf_entity) = match handles {
-                LeafHandles::F32(dh, _) => {
-                    let bytes: anybytes::Bytes = reader
-                        .get(dh)
-                        .map_err(|e| anyhow::anyhow!("{name}: data blob: {e:?}"))?;
-                    f32n += 1;
-                    let n = bytes.len();
-                    (n, by_rank!(F32, ws, dims, bytes, name))
-                }
-                LeafHandles::F16(dh, _) => {
-                    let bytes: anybytes::Bytes = reader
-                        .get(dh)
-                        .map_err(|e| anyhow::anyhow!("{name}: data_f16 blob: {e:?}"))?;
-                    f16n += 1;
-                    let n = bytes.len();
-                    (n, by_rank!(F16, ws, dims, bytes, name))
-                }
-            };
-            let leaf_id = leaf_entity.root().expect("leaf root");
-            total += payload_len;
-            facts += leaf_entity.into_facts();
-
-            // Module structure carried over unchanged: same kind vocabulary,
-            // same name edge, same `weight` role-edge. Only the leaf's storage
-            // differs, so only the leaf's attribute should.
-            let kind = match dims.len() {
-                1 => "vector",
-                2 => "matrix",
-                3 => "conv",
-                _ => "tensor",
-            };
-            let name_h = ws.put::<blobencodings::LongString, _>(name.clone());
-            let m = entity! { _ @
-                attrs::kind: kind,
-                attrs::safetensor_path: name_h,
-                attrs::weight: leaf_id,
-            };
-            members.push(m.root().expect("module root"));
-            facts += m.into_facts();
-            if (f32n + f16n) % 100 == 0 {
-                eprintln!("[migrate] {} leaves converted ...", f32n + f16n);
-            }
-        }
-
-        // The labels are what loaders resolve by, so they carry over verbatim.
-        // The root ID changes because its members did — see the module docs.
-        let src_h = ws.put::<blobencodings::LongString, _>(source.clone());
-        let new_root = entity! { _ @
-            attrs::source: src_h,
-            attrs::quantization: quant.as_str(),
-            attrs::member*: members.iter(),
+    for (leaf_id, is_f16) in &leaves {
+        let leaf_id = *leaf_id;
+        let (dh_raw, sh) = if *is_f16 {
+            find!(
+                (d: Inline<inlineencodings::Handle<mary::f16enc::F16Array>>,
+                 s: Inline<inlineencodings::Handle<mary::format::U64Array>>),
+                pattern!(&tribles, [{ leaf_id @ attrs::data_f16: ?d, attrs::shape: ?s }])
+            )
+            .next()
+            .map(|(d, s)| (d.raw, s))
+            .context("f16 leaf handles")?
+        } else {
+            find!(
+                (d: Inline<inlineencodings::Handle<mary::format::F32Array>>,
+                 s: Inline<inlineencodings::Handle<mary::format::U64Array>>),
+                pattern!(&tribles, [{ leaf_id @ attrs::data: ?d, attrs::shape: ?s }])
+            )
+            .next()
+            .map(|(d, s)| (d.raw, s))
+            .context("f32 leaf handles")?
         };
-        let new_root_id = new_root.root().expect("model root");
-        facts += new_root.into_facts();
-        mapping.push((source.clone(), quant.clone(), *root, new_root_id));
+        superseded.insert(dh_raw);
+        superseded.insert(sh.raw);
+
+        let dims: Vec<u64> = mary::ingest::read_shape(&reader, sh)
+            .iter()
+            .map(|&d| d as u64)
+            .collect();
+        let handle: Inline<inlineencodings::Handle<UnknownBlob>> = Inline::new(dh_raw);
+        let bytes: anybytes::Bytes = reader
+            .get(handle)
+            .map_err(|e| anyhow::anyhow!("{leaf_id}: data blob: {e:?}"))?;
+        total += bytes.len();
+
+        let name = format!("{leaf_id}");
+        let e = if *is_f16 {
+            f16n += 1;
+            by_rank!(F16, ws, ExclusiveId::force_ref(&leaf_id), dims, bytes, name)
+        } else {
+            f32n += 1;
+            by_rank!(F32, ws, ExclusiveId::force_ref(&leaf_id), dims, bytes, name)
+        };
+        facts += e.into_facts();
+
+        if (f32n + f16n) % 200 == 0 {
+            eprintln!("[migrate] {} leaves converted ...", f32n + f16n);
+        }
     }
+
+    // ── carry the remaining blobs ───────────────────────────────────────────
+    // Everything the pile holds that the substitution did not supersede:
+    // tokenizer pieces, names, anything this tool has no schema for. Copied by
+    // bytes, so the handles come out identical and every carried fact still
+    // resolves.
+    let mut copied = 0usize;
+    let mut copied_bytes = 0usize;
+    for info in reader.blobs() {
+        let info = info.map_err(|e| anyhow::anyhow!("list blobs: {e:?}"))?;
+        if superseded.contains(&info.handle.raw) {
+            continue;
+        }
+        let bytes: anybytes::Bytes = reader
+            .get(info.handle)
+            .map_err(|e| anyhow::anyhow!("copy blob: {e:?}"))?;
+        copied_bytes += bytes.len();
+        let out: Inline<inlineencodings::Handle<blobencodings::RawBytes>> =
+            ws.put(Blob::<blobencodings::RawBytes>::new(bytes));
+        anyhow::ensure!(
+            out.raw == info.handle.raw,
+            "blob handle changed on copy — content addressing violated"
+        );
+        copied += 1;
+    }
+    eprintln!(
+        "[migrate] carried {copied} other blobs ({:.2} GiB)",
+        copied_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
 
     ws.commit(facts, "typed tensor leaves");
     repo.push(&mut ws)
@@ -354,9 +337,5 @@ fn main() -> Result<()> {
         f32n + f16n,
         total as f64 / (1024.0 * 1024.0 * 1024.0)
     );
-    eprintln!("[migrate] root id mapping (old -> new):");
-    for (source, quant, old, new) in &mapping {
-        eprintln!("[migrate]   {source} ({quant}): {old} -> {new}");
-    }
     Ok(())
 }

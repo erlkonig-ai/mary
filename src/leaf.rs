@@ -231,14 +231,58 @@ pub fn index_typed(
         }};
     }
 
+    sweep!(F32, 0, Elem::F32);
     sweep!(F32, 1, Elem::F32);
     sweep!(F32, 2, Elem::F32);
     sweep!(F32, 3, Elem::F32);
     sweep!(F32, 4, Elem::F32);
+    sweep!(F16, 0, Elem::F16);
     sweep!(F16, 1, Elem::F16);
     sweep!(F16, 2, Elem::F16);
     sweep!(F16, 3, Elem::F16);
     sweep!(F16, 4, Elem::F16);
+
+    map
+}
+
+/// Index EVERY typed leaf in a pile by its entity id, regardless of which model
+/// root (if any) reaches it.
+///
+/// The by-name index walks `member` edges and so only sees leaves hanging off a
+/// model. This sees all of them, which is what a verifier wants: it must not
+/// take the graph's word for what exists.
+pub fn index_typed_all(
+    tribles: &TribleSet,
+    blobs: &impl triblespace::prelude::BlobStoreGet,
+) -> std::collections::HashMap<Id, TypedLeaf> {
+    let mut map = std::collections::HashMap::new();
+
+    macro_rules! sweep_all {
+        ($elem:ty, $rank:literal, $tag:expr) => {{
+            for (e, h) in triblespace::macros::find!(
+                (e: Id, h: Inline<Handle<Tensor<$elem, $rank>>>),
+                triblespace::macros::pattern!(tribles, [
+                    { ?e @ leaf::<$elem, $rank>(): ?h },
+                ])
+            ) {
+                let blob: Blob<Tensor<$elem, $rank>> =
+                    blobs.get(h).expect("typed leaf blob");
+                let view = TensorView::try_from_blob(blob).expect("typed leaf decodes");
+                map.insert(e, TypedLeaf { elem: $tag, view });
+            }
+        }};
+    }
+
+    sweep_all!(F32, 0, Elem::F32);
+    sweep_all!(F32, 1, Elem::F32);
+    sweep_all!(F32, 2, Elem::F32);
+    sweep_all!(F32, 3, Elem::F32);
+    sweep_all!(F32, 4, Elem::F32);
+    sweep_all!(F16, 0, Elem::F16);
+    sweep_all!(F16, 1, Elem::F16);
+    sweep_all!(F16, 2, Elem::F16);
+    sweep_all!(F16, 3, Elem::F16);
+    sweep_all!(F16, 4, Elem::F16);
 
     map
 }

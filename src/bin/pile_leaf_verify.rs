@@ -1,126 +1,218 @@
-//! Verify a converted pile against its source, tensor by tensor.
+//! Verify a converted pile against its source.
 //!
 //! `pile_leaf_migrate` checks each payload as it encodes it, which proves the
-//! ENCODE step. This proves the round trip: it opens both piles independently,
-//! reads the source through the old two-handle path and the destination through
-//! the typed path, and compares name sets, shapes, and bytes.
+//! ENCODE step against bytes it already holds. This opens both piles cold and
+//! answers the two questions a converter cannot ask itself:
 //!
-//! Worth doing separately rather than trusting the converter's own report. The
-//! converter checks a blob it holds in memory against bytes it just read; this
-//! reads both piles cold, through the code paths a real loader uses, and so it
-//! also answers the question the converter cannot: is the output actually
-//! LOADABLE? A converter that produces unreadable output while reporting
-//! success is exactly the failure this crate just spent an afternoon on.
+//!   1. is the output LOADABLE — does the typed read path find every tensor,
+//!      with the same shape and the same bytes?
+//!   2. did anything ELSE get lost — every fact the converter did not replace,
+//!      and every blob it did not supersede?
+//!
+//! (2) is the one worth having. A converter that silently drops what it has no
+//! schema for reports success either way; only a comparison of the full fact
+//! sets catches a missing tokenizer.
+//!
+//! Leaves are compared BY ENTITY ID, not by name. The conversion preserves ids,
+//! so identity is checkable directly rather than through a naming convention
+//! that could itself be wrong.
 //!
 //!   pile_leaf_verify <src.pile> <dst.pile>
 
 use anyhow::{Context, Result};
+use ed25519_dalek::SigningKey;
 use mary::format::attrs;
-use mary::ingest::LeafHandles;
 use mary::leaf;
+use std::collections::HashSet;
 use std::path::Path;
+use triblespace::core::repo::{ancestors, Repository};
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
+fn checkout_any(
+    pile_path: &Path,
+) -> Result<(
+    &'static str,
+    TribleSet,
+    triblespace::core::repo::pile::PileReader,
+)> {
+    for branch in ["mary", "main"] {
+        let mut pile =
+            Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open {pile_path:?}: {e:?}"))?;
+        pile.refresh()
+            .map_err(|e| anyhow::anyhow!("{pile_path:?} failed to load ({e:?})"))?;
+        let mut repo = Repository::new(
+            pile,
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            TribleSet::new(),
+        )
+        .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
+        let found = repo
+            .lookup_branch(branch)
+            .map_err(|e| anyhow::anyhow!("lookup {branch}: {e:?}"))?;
+        let Some(branch_id) = found else {
+            repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
+            continue;
+        };
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull {branch}: {e:?}"))?;
+        let Some(head) = ws.head() else {
+            repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
+            continue;
+        };
+        let tribles: TribleSet = ws
+            .checkout(ancestors(head))
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
+            .facts()
+            .clone();
+        let reader = repo
+            .storage_mut()
+            .reader()
+            .map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
+        repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
+        return Ok((branch, tribles, reader));
+    }
+    anyhow::bail!("no 'mary' or 'main' branch with commits in {pile_path:?}")
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let src = args.next().context("usage: pile_leaf_verify <src.pile> <dst.pile>")?;
-    let dst = args.next().context("usage: pile_leaf_verify <src.pile> <dst.pile>")?;
+    let src = args
+        .next()
+        .context("usage: pile_leaf_verify <src.pile> <dst.pile>")?;
+    let dst = args
+        .next()
+        .context("usage: pile_leaf_verify <src.pile> <dst.pile>")?;
     let (src, dst) = (Path::new(&src), Path::new(&dst));
 
-    // ── source: the old two-handle form ─────────────────────────────────────
-    let (_, src_index, src_reader) = mary::persist::load_split_index_from_pile(src, "")?;
-    anyhow::ensure!(!src_index.is_empty(), "no leaves in source {src:?}");
-    println!("source      {} leaves", src_index.len());
-
-    // ── destination: the typed form ─────────────────────────────────────────
-    let (dst_tribles, dst_reader) = mary::persist::checkout_mary_branch(dst)?;
-    let roots: Vec<Id> = find!(
-        (m: Id, s: Inline<inlineencodings::Handle<blobencodings::LongString>>),
-        pattern!(&dst_tribles, [{ ?m @ attrs::source: ?s, attrs::quantization: "native" }])
-    )
-    .map(|(m, _)| m)
-    .collect();
-    anyhow::ensure!(!roots.is_empty(), "no native model root in {dst:?}");
-
-    let mut dst_index = std::collections::HashMap::new();
-    for root in &roots {
-        dst_index.extend(leaf::index_typed(&dst_tribles, &dst_reader, *root));
-    }
-    println!("destination {} typed leaves", dst_index.len());
-
-    // ── compare ─────────────────────────────────────────────────────────────
-    let mut missing = Vec::new();
-    for name in src_index.keys() {
-        if !dst_index.contains_key(name) {
-            missing.push(name.clone());
-        }
-    }
-    let extra: Vec<&String> = dst_index
-        .keys()
-        .filter(|n| !src_index.contains_key(*n))
-        .collect();
+    let (src_branch, src_tribles, src_reader) = checkout_any(src)?;
+    let (dst_branch, dst_tribles, dst_reader) = checkout_any(dst)?;
     anyhow::ensure!(
-        missing.is_empty(),
-        "{} tensors missing from the converted pile, e.g. {:?}",
-        missing.len(),
-        &missing[..missing.len().min(5)]
+        src_branch == dst_branch,
+        "branch differs: source '{src_branch}', converted '{dst_branch}'"
     );
-    anyhow::ensure!(extra.is_empty(), "{} unexpected tensors in the converted pile", extra.len());
+    println!("branch      '{src_branch}'");
 
-    let mut names: Vec<&String> = src_index.keys().collect();
-    names.sort();
+    // ── 1. every non-replaced fact survived, unchanged ──────────────────────
+    let replaced = [attrs::data.id(), attrs::data_f16.id(), attrs::shape.id()];
+    let carried: TribleSet = src_tribles
+        .iter()
+        .filter(|t| !replaced.contains(t.a()))
+        .cloned()
+        .collect();
+    let dst_carried: TribleSet = dst_tribles
+        .iter()
+        .filter(|t| !replaced.contains(t.a()))
+        .cloned()
+        .collect();
+
+    let src_set: HashSet<_> = carried.iter().collect();
+    let dst_set: HashSet<_> = dst_carried.iter().collect();
+    let lost: Vec<_> = src_set.difference(&dst_set).take(5).collect();
+    anyhow::ensure!(
+        lost.is_empty(),
+        "{} source facts did not survive the conversion",
+        src_set.difference(&dst_set).count()
+    );
+    println!(
+        "facts       {} carried verbatim, none lost",
+        src_set.len()
+    );
+    anyhow::ensure!(
+        !dst_tribles
+            .iter()
+            .any(|t| t.a() == &attrs::data.id() || t.a() == &attrs::data_f16.id()),
+        "the converted pile still holds old-format leaf facts"
+    );
+
+    // ── 2. every leaf reads back, by entity id ──────────────────────────────
+    let mut src_leaves: Vec<(Id, bool)> = Vec::new();
+    for (e,) in find!(
+        (e: Id),
+        pattern!(&src_tribles, [{ ?e @ attrs::data: _?d, attrs::shape: _?s }])
+    ) {
+        src_leaves.push((e, false));
+    }
+    for (e,) in find!(
+        (e: Id),
+        pattern!(&src_tribles, [{ ?e @ attrs::data_f16: _?d, attrs::shape: _?s }])
+    ) {
+        src_leaves.push((e, true));
+    }
+    anyhow::ensure!(!src_leaves.is_empty(), "no leaves in source {src:?}");
+
+    let typed = leaf::index_typed_all(&dst_tribles, &dst_reader);
+    println!(
+        "leaves      {} in source, {} typed in converted",
+        src_leaves.len(),
+        typed.len()
+    );
+    anyhow::ensure!(
+        typed.len() == src_leaves.len(),
+        "leaf count differs: {} source vs {} converted",
+        src_leaves.len(),
+        typed.len()
+    );
+
     let (mut checked, mut bytes_checked, mut zero_copy) = (0usize, 0usize, 0usize);
+    for (leaf_id, is_f16) in &src_leaves {
+        let leaf_id = *leaf_id;
+        let t = typed
+            .get(&leaf_id)
+            .ok_or_else(|| anyhow::anyhow!("{leaf_id}: no typed leaf in the converted pile"))?;
 
-    for name in names {
-        let typed = &dst_index[name];
-
-        // Source: raw payload bytes + shape, straight from the old handles.
-        let handles = src_index[name];
-        let (src_bytes, src_shape) = match handles {
-            LeafHandles::F32(dh, sh) => {
-                let b: anybytes::Bytes = src_reader
-                    .get(dh)
-                    .map_err(|e| anyhow::anyhow!("{name}: data: {e:?}"))?;
-                (b, mary::ingest::read_shape(&src_reader, sh))
-            }
-            LeafHandles::F16(dh, sh) => {
-                let b: anybytes::Bytes = src_reader
-                    .get(dh)
-                    .map_err(|e| anyhow::anyhow!("{name}: data_f16: {e:?}"))?;
-                (b, mary::ingest::read_shape(&src_reader, sh))
-            }
+        let (dh_raw, sh) = if *is_f16 {
+            find!(
+                (d: Inline<inlineencodings::Handle<mary::f16enc::F16Array>>,
+                 s: Inline<inlineencodings::Handle<mary::format::U64Array>>),
+                pattern!(&src_tribles, [{ leaf_id @ attrs::data_f16: ?d, attrs::shape: ?s }])
+            )
+            .next()
+            .map(|(d, s)| (d.raw, s))
+            .context("f16 handles")?
+        } else {
+            find!(
+                (d: Inline<inlineencodings::Handle<mary::format::F32Array>>,
+                 s: Inline<inlineencodings::Handle<mary::format::U64Array>>),
+                pattern!(&src_tribles, [{ leaf_id @ attrs::data: ?d, attrs::shape: ?s }])
+            )
+            .next()
+            .map(|(d, s)| (d.raw, s))
+            .context("f32 handles")?
         };
+        let src_shape = mary::ingest::read_shape(&src_reader, sh);
+        let handle: Inline<inlineencodings::Handle<blobencodings::RawBytes>> =
+            Inline::new(dh_raw);
+        let src_bytes: anybytes::Bytes = src_reader
+            .get(handle)
+            .map_err(|e| anyhow::anyhow!("{leaf_id}: source data blob: {e:?}"))?;
 
         anyhow::ensure!(
-            typed.shape() == src_shape,
-            "{name}: shape differs: {:?} (source) vs {:?} (converted)",
+            t.shape() == src_shape,
+            "{leaf_id}: shape differs: {:?} vs {:?}",
             src_shape,
-            typed.shape()
+            t.shape()
         );
         anyhow::ensure!(
-            &typed.view.payload()[..] == &src_bytes[..],
-            "{name}: payload differs ({} vs {} bytes)",
+            &t.view.payload()[..] == &src_bytes[..],
+            "{leaf_id}: payload differs ({} vs {} bytes)",
             src_bytes.len(),
-            typed.view.payload().len()
+            t.view.payload().len()
         );
 
-        // And confirm the point of the exercise: an f32 leaf serves a ZERO-COPY
-        // view of the pile's mapping, on this platform, without a model-specific
-        // feature gate.
-        if typed.elem == leaf::Elem::F32 {
-            let v = typed
+        if t.elem == leaf::Elem::F32 {
+            let v = t
                 .view_f32()
-                .ok_or_else(|| anyhow::anyhow!("{name}: f32 leaf served no zero-copy view"))?;
+                .ok_or_else(|| anyhow::anyhow!("{leaf_id}: f32 leaf served no zero-copy view"))?;
             anyhow::ensure!(
-                v.len() == src_shape.iter().product::<usize>(),
-                "{name}: view length {} != {:?}",
+                v.len() == src_shape.iter().product::<usize>().max(1) || src_shape.is_empty(),
+                "{leaf_id}: view length {} != shape {:?}",
                 v.len(),
                 src_shape
             );
             zero_copy += 1;
         }
-
         checked += 1;
         bytes_checked += src_bytes.len();
     }
