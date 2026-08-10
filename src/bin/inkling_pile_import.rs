@@ -13,7 +13,7 @@
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use mary::models::inkling::load::Checkpoint;
-use mary::models::inkling::pile::{attrs, expert_blob, split_payload};
+use mary::models::inkling::pile::{attrs, expert_blob, experts_in_layers, layer_of, split_payload};
 use triblespace::core::blob::encodings::tensor::TensorView;
 use triblespace::core::blob::TryFromBlob;
 use triblespace::core::metadata;
@@ -88,11 +88,18 @@ fn main() -> Result<()> {
             // put() returns the handle the facts then name, so the blob and the
             // fact about it cannot refer to different bytes.
             let handle = ws.put(blob2);
-            *change += entity! { &ufoid() @
+            let mut facts = entity! { &ufoid() @
                 attrs::weight_nvfp4_2: handle,
                 attrs::expert_index: e as i64,
                 metadata::name: base.to_string().to_blob().get_handle(),
             };
+            // Absent rather than zero when the name carries no layer: a tensor
+            // that silently joined layer 0 would ship to the wrong machine.
+            if let Some(l) = layer_of(&base) {
+                let root = facts.root().expect("rooted");
+                facts += entity! { ExclusiveId::force_ref(&root) @ attrs::layer: l };
+            }
+            *change += facts;
         }
 
         total += bytes;
@@ -102,11 +109,32 @@ fn main() -> Result<()> {
         );
     }
 
+    // Read back what was written, as a QUERY over layers rather than a read of
+    // bytes. This is the split: a node asks for the layers it holds and gets
+    // handles, and nothing is materialised to answer.
+    if let Some((_, ws, _)) = writing.as_mut() {
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let _ = &space;
+    }
+
     if let Some((mut repo, mut ws, change)) = writing {
         ws.commit(change, "inkling experts");
         repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
         repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
-        println!("wrote {count} expert(s) to {}", pile_path.unwrap());
+        println!("wrote {count} expert(s) to {}", pile_path.clone().unwrap());
+
+        // Query the pile we just wrote, by layer.
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let held = experts_in_layers(&space, 0..=20);
+        let all = experts_in_layers(&space, i64::MIN..=i64::MAX);
+        println!(
+            "query layers 0..=20 -> {} expert handle(s) of {} total, nothing materialised",
+            held.len(),
+            all.len()
+        );
+        for r in all.iter().take(3) {
+            println!("  layer {:>3}  expert {:>3}  {:?}", r.layer, r.expert, r.handle);
+        }
     }
 
     println!(
