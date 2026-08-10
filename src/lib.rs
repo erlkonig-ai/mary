@@ -32,6 +32,7 @@ pub mod f16enc;
 #[cfg(feature = "embed")]
 pub mod embed;
 pub mod ingest;
+pub mod leaf;
 /// Non-safetensors weight-file importers (GGUF, pickled PyTorch `state_dict`).
 /// Each decodes to the same `(name, f32-data, shape)` tuples [`ingest`] consumes,
 /// so every format lands in one content-addressed graph. Import-only.
