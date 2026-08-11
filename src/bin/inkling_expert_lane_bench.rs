@@ -298,6 +298,104 @@ fn main() -> Result<()> {
         println!("   (current lane, B + G scaled to w13+w2, is ~{:.1} ms/expert)", 2.74 + 10.98 * 1.5);
     }
 
+
+    // ---------------------------------------------------------------- K/L
+    // The two device lanes, like for like: packed bytes in, [tokens, hidden]
+    // f32 out, synced. This is the ONLY place the tensor cores can contribute,
+    // and it is deliberately measured apart from the host plumbing above.
+    #[cfg(feature = "inkling-cuda")]
+    {
+        use burn::prelude::Backend;
+        use burn::tensor::{Tensor, TensorData};
+        use cubecl::prelude::*;
+        use mary::models::inkling::burn::{deinterleave_rows_device, expert_ffn, expert_weight_from_packed};
+        use mary::models::inkling::fp4gemm::{
+            fp4_linear_launch, gate_up_silu_launch, upload_quantized_act, ExpertSource,
+        };
+        type Bk = burn::backend::Cuda<f32>;
+        type Rt = cubecl::cuda::CudaRuntime;
+
+        let src = ExpertSource::open(&ckpt)?;
+        let w13 = src.expert(&base13(), 0)?;
+        let w2 = src.expert(&base2(), 0)?;
+        let (nn, kk) = (w13.rows, w13.cols * 2);
+        let inter = nn / 2;
+        let tokens = 5usize;
+
+        // A real activation: decoded rows of another expert.
+        let mut x = vec![0f32; tokens * kk];
+        {
+            let p = src.expert(&base13(), 7)?;
+            for r in 0..tokens {
+                for j in 0..kk {
+                    let byte = p.codes[r * (kk / 2) + j / 2];
+                    let c = if j % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+                    x[r * kk + j] = mary::models::inkling::nvfp4::FP4_E2M1[c as usize]
+                        * mary::models::inkling::nvfp4::e4m3_to_f32(p.scales[r * (kk / 16) + j / 16])
+                        * p.scale2;
+                }
+            }
+        }
+
+        let reps = 8;
+
+        // ---- K: native FP4 ------------------------------------------------
+        let client = Rt::client(&Default::default());
+        let run_fp4 = |client: &ComputeClient<Rt>| {
+            let (a, asc, m_pad) = upload_quantized_act(client, &x, tokens, kk);
+            let b = client.create_from_slice(w13.codes);
+            let bsc = client.create_from_slice(w13.scales);
+            let both = fp4_linear_launch(client, &a, &asc, &b, &bsc, m_pad, kk, nn, w13.scale2);
+            let act = gate_up_silu_launch(client, &both, m_pad, inter);
+            let actf = f32::from_bytes(&client.read_one(act).expect("read")).to_vec();
+            let (a2, asc2, _) = upload_quantized_act(client, &actf, m_pad, inter);
+            let b2 = client.create_from_slice(w2.codes);
+            let bsc2 = client.create_from_slice(w2.scales);
+            fp4_linear_launch(client, &a2, &asc2, &b2, &bsc2, m_pad, inter, w2.rows, w2.scale2)
+        };
+        let h = run_fp4(&client);
+        client.sync();
+        core::hint::black_box(&h);
+        let t = Instant::now();
+        for _ in 0..reps {
+            let h = run_fp4(&client);
+            core::hint::black_box(&h);
+        }
+        client.sync();
+        let t_fp4 = ms(t.elapsed()) / reps as f64;
+
+        // ---- L: decode to f32, then f32 matmul ----------------------------
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let xt: Tensor<Bk, 2> =
+            Tensor::from_data(TensorData::new(x.clone(), [tokens, kk]), &dev);
+        let run_f32 = || {
+            let gu = expert_weight_from_packed::<Bk>(
+                w13.codes, w13.scales, w13.scale2, w13.rows, w13.cols, &dev,
+            );
+            let dn = expert_weight_from_packed::<Bk>(
+                w2.codes, w2.scales, w2.scale2, w2.rows, w2.cols, &dev,
+            );
+            expert_ffn(xt.clone(), deinterleave_rows_device(gu), dn)
+        };
+        let y = run_f32();
+        <Bk as Backend>::sync(&dev);
+        core::hint::black_box(&y);
+        let t = Instant::now();
+        for _ in 0..reps {
+            let y = run_f32();
+            core::hint::black_box(&y);
+        }
+        <Bk as Backend>::sync(&dev);
+        let t_f32 = ms(t.elapsed()) / reps as f64;
+
+        println!();
+        println!("--- device lane, like for like ({tokens} tokens, N={nn}, K={kk}) ---");
+        println!("K. native NVFP4 (packed in, tensor cores)            : {t_fp4:8.2} ms/expert");
+        println!("L. decode to f32 on device, then f32 matmul          : {t_f32:8.2} ms/expert");
+        println!("   device-side speedup from the FP4 path             : {:8.2}x", t_f32 / t_fp4);
+        println!("   (L materialises 67.1 + 33.6 MB of f32 per expert; K materialises none)");
+    }
+
     core::hint::black_box(sink);
     println!();
     println!("Per-forward scaling: the forward touches ~237 distinct experts per layer");
