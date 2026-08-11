@@ -30,6 +30,32 @@
 //! scales would likely be a handful of round values, and the E4M3 decode is
 //! exactly the part most likely to be wrong. Real rows bring real scale bytes.
 //!
+//! ## The fragment and scale layout, as measured
+//!
+//! CubeCL's `MmaDefinition` hands you these, so nothing here needs them. They
+//! are recorded because they were measured rather than read off a doc, and
+//! anyone hand-rolling this instruction outside CubeCL has to get them right.
+//! Measured on GB10 / sm_121a by one-hot probing a live kernel (all scales
+//! 1.0 reproduced a CPU reference with **max_abs_err = 0** over a 16x8x64
+//! tile, which is what pins the A/B/D mapping).
+//!
+//! With `groupID = lane >> 2` and `tig = lane & 3`, for
+//! `m16n8k64` / `.scale_vec::4X`:
+//!
+//! * **A** (16x64, 32 codes/lane, 4 x `.b32`, 8 nibbles each, low nibble first)
+//!   — for element `e` in `0..32`: `row = groupID + 8*((e % 16) / 8)`,
+//!   `col = tig*8 + (e % 8) + 32*(e / 16)`.
+//! * **B** (8x64, 16 codes/lane, 2 x `.b32`) — for `e` in `0..16`:
+//!   `n = groupID`, `k = tig*8 + (e % 8) + 32*(e / 8)`.
+//! * **D/C** (16x8 f32, 4/lane) — `row = groupID + 8*(i/2)`,
+//!   `col = tig*2 + (i % 2)`.
+//! * **Scales**, with the `{byte-id, thread-id}` immediates both 0: only the
+//!   lanes with `tig ∈ {0,1}` supply A's scale factors. Lane `4*g + t`
+//!   (`t ∈ {0,1}`) carries the four scale bytes of **row `g + 8*t`**, and byte
+//!   `b` of that `.b32` is the scale for **k-block `b`** (elements
+//!   `16*b .. 16*b+16`). That is 16 lanes x 4 bytes = the 64 E4M3 scales a
+//!   16-row, k=64 A tile needs — i.e. exactly NVFP4's one scale per 16.
+//!
 //! Build: `--features cuda-backend,inkling`
 //! Run:   `nvfp4_mma_probe [<checkpoint dir>]`
 
