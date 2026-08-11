@@ -168,6 +168,39 @@ fn quantize_searched(x: &[f32]) -> Vec<f32> {
     out
 }
 
+
+/// THE INVARIANT: a correct block scale puts the block's own maximum on the top
+/// E2M1 code.
+///
+/// `scale = amax/6` maps the largest element to exactly 6.0, i.e. code 7. E4M3
+/// rounding can only move `amax/scale` inside about +-6.5% (3 mantissa bits),
+/// and the code-7 threshold is 5.0, so a correct implementation lands on 7 for
+/// every non-zero block. A peak of code 4 (2.0) would mean the scale is 3x too
+/// large; a peak of 6 (4.0) would mean 1.5x.
+///
+/// Returns (histogram of peak codes, count of non-zero blocks).
+fn peak_code_histogram(codes: &[u8], nblocks: usize) -> ([usize; 8], usize) {
+    let mut hist = [0usize; 8];
+    let mut nonzero = 0;
+    for b in 0..nblocks {
+        let mut peak = 0u8;
+        for i in 0..GROUP {
+            let j = b * GROUP + i;
+            let byte = codes[j / 2];
+            let c = if j % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+            let m = c & 0x07;
+            if m > peak {
+                peak = m;
+            }
+        }
+        if peak > 0 {
+            nonzero += 1;
+        }
+        hist[peak as usize] += 1;
+    }
+    (hist, nonzero)
+}
+
 fn stats(orig: &[f32], deq: &[f32]) -> (f64, f64, f64) {
     let mut sum = 0.0f64;
     let mut worst = 0.0f64;
@@ -256,6 +289,34 @@ fn main() -> Result<()> {
     let sub2 = s2.iter().filter(|&&b| (b >> 3) & 0x0F == 0).count();
     let zero1 = s1.iter().filter(|&&b| b == 0).count();
     let zero2 = s2.iter().filter(|&&b| b == 0).count();
+    // ---- the invariant check -------------------------------------------
+    {
+        let w = src.expert(&b13, 0)?;
+        let k = w.cols * 2;
+        let x = decode(w.codes, w.scales, 16, k, w.scale2);
+        let (c1, _s1) = quantize_act_host(&x, k);
+        let nblocks = x.len() / GROUP;
+        let (hist, nonzero) = peak_code_histogram(&c1, nblocks);
+        println!();
+        println!("PEAK-CODE INVARIANT (every non-zero block must peak at code 7 = 6.0)");
+        println!("  blocks: {nblocks}  non-zero: {nonzero}");
+        for (c, n) in hist.iter().enumerate() {
+            if *n > 0 {
+                println!(
+                    "    peak code {c} (value {:>3}) : {n:>6}  {:>6.2}%",
+                    ["0", "0.5", "1", "1.5", "2", "3", "4", "6"][c],
+                    100.0 * *n as f64 / nblocks as f64
+                );
+            }
+        }
+        let bad = nonzero - hist[7];
+        if bad == 0 {
+            println!("  -> HOLDS: all {nonzero} non-zero blocks peak at code 7.");
+        } else {
+            println!("  -> VIOLATED: {bad} non-zero blocks do not peak at code 7 (scale too large).");
+        }
+    }
+
     println!();
     println!("block scales that fell into E4M3 SUBNORMALS (3 bits of precision or fewer):");
     println!("  one level : {sub1} of {} ({:.1}%), of which {zero1} rounded to exactly zero",

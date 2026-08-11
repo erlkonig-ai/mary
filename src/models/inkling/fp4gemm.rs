@@ -155,13 +155,22 @@ pub fn gate_up_silu(
     both: &Tensor<f32>,
     act: &mut Tensor<f32>,
     #[comptime] inter: usize,
+    #[comptime] halved: bool,
 ) {
     let idx = ABSOLUTE_POS as usize;
     if idx < act.len() {
         let r = idx / inter;
         let i = idx % inter;
-        let g = both[r * 2 * inter + 2 * i];
-        let u = both[r * 2 * inter + 2 * i + 1];
+        // Two readings of w13's output axis are live in this tree: INTERLEAVED
+        // (g0,u0,g1,u1,...) and HALVED (all gates, then all ups). They are
+        // shape-identical and numerically different, which is exactly the kind
+        // of thing that passes every parity gate built on the same assumption.
+        // `halved` exists so the question can be settled by running it.
+        let (g, u) = if comptime!(halved) {
+            (both[r * 2 * inter + i], both[r * 2 * inter + inter + i])
+        } else {
+            (both[r * 2 * inter + 2 * i], both[r * 2 * inter + 2 * i + 1])
+        };
         act[idx] = (g / (1.0f32 + Exp::exp(-g))) * u;
     }
 }
@@ -214,6 +223,8 @@ pub fn gate_up_silu_launch<R: Runtime>(
     m_pad: usize,
     inter: usize,
 ) -> Handle {
+    // INK_W13_HALVED=1 selects the contiguous reading, for the A/B.
+    let halved = std::env::var("INK_W13_HALVED").map(|v| v == "1").unwrap_or(false);
     let n = m_pad * inter;
     let act = client.empty(n * core::mem::size_of::<f32>());
     let threads = 256u32;
@@ -226,6 +237,7 @@ pub fn gate_up_silu_launch<R: Runtime>(
             TensorArg::from_raw_parts(both.clone(), [2 * inter, 1].into(), [m_pad, 2 * inter].into()),
             TensorArg::from_raw_parts(act.clone(), [inter, 1].into(), [m_pad, inter].into()),
             inter,
+            halved,
         )
     };
     act
