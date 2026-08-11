@@ -131,7 +131,16 @@ k3-attn-res-cuda = ["k3-attn-res", "burn/cuda"]
 # Owns memmap2: every importer reads its shards through an mmap (a K3 shard
 # is 17 GB and there are 96 of them), and `--features import` on its own did
 # not link one before.
-import = ["dep:safetensors", "dep:clap", "dep:hf-hub", "dep:gguf-rs-lib", "dep:zip", "dep:memmap2"]
+# Reading checkpoints that are already on disk. Deliberately does NOT include
+# hf-hub: downloading from the Hub is a separate concern (`hub`), and bundling
+# them meant a machine that only ever reads local files still had to link a
+# system TLS stack. That bit — a second Spark could not build the importer for
+# want of libssl-dev, to satisfy a downloader it would never call.
+import = ["dep:safetensors", "dep:clap", "dep:gguf-rs-lib", "dep:zip", "dep:memmap2"]
+# Fetching weights from the HuggingFace Hub. Pulls hf-hub, which hard-wires
+# native-tls (hf-hub 0.3 offers no rustls backend), hence the system OpenSSL
+# dependency. Anything that only reads local checkpoints should not enable it.
+hub = ["dep:hf-hub"]
 flux = ["dep:image", "dep:tokenizers"]
 # SmolVLA (mary::models::smolvla) — vision-language-action; SigLIP vision +
 # tokenizer + flow-matching sampler. Same dep surface as flux.
@@ -185,6 +194,7 @@ k3tok = ["dep:fancy-regex"]
 # content-addressed pile.
 embed = ["dep:image", "dep:tokenizers", "tokenizer"]
 gemma = [
+    "hub",
     "burn/train",
     "burn/ndarray",
     "dep:burn-train",
@@ -231,7 +241,7 @@ dev-tools = ["import"]
 # out of the default library build.
 [[bin]]
 name = "mary"
-required-features = ["import"]
+required-features = ["import", "hub"]
 
 # Totality gate for the K3 checkpoint layout: walks the real safetensors headers
 # and asserts the tensor-name/module-slot mapping is a bijection. Header-only -
