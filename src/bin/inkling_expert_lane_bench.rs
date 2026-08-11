@@ -254,6 +254,50 @@ fn main() -> Result<()> {
         );
     }
 
+
+    // ---------------------------------------------------------------- H
+    // The replacement source: headers parsed once, slabs borrowed not copied.
+    {
+        use mary::models::inkling::fp4gemm::ExpertSource;
+        let t = Instant::now();
+        let src = ExpertSource::open(&ckpt)?;
+        let open_ms = ms(t.elapsed());
+        println!();
+        println!("H. ExpertSource::open (ALL shard headers, ONCE)      : {:8.2} ms  (one-time)", open_ms);
+
+        let mut t_e = std::time::Duration::ZERO;
+        let mut acc = 0u64;
+        for e in 0..n_experts {
+            let t = Instant::now();
+            let a = src.expert(&base13(), e)?;
+            let b = src.expert(&base2(), e)?;
+            t_e += t.elapsed();
+            acc += a.codes[0] as u64 + b.codes[0] as u64 + a.scales[0] as u64;
+        }
+        println!("I. ExpertSource::expert x2 per expert (borrowed)     : {:8.4} ms/expert   [vs B above]", ms(t_e) / n_experts as f64);
+
+        use cubecl::prelude::*;
+        type Rt = cubecl::cuda::CudaRuntime;
+        let client = Rt::client(&Default::default());
+        let _ = client.create_from_slice(&[0u8; 1024]);
+        client.sync();
+        let t = Instant::now();
+        let mut keep = Vec::new();
+        for e in 0..n_experts {
+            let a = src.expert(&base13(), e)?;
+            let b = src.expert(&base2(), e)?;
+            keep.push(client.create_from_slice(a.codes));
+            keep.push(client.create_from_slice(a.scales));
+            keep.push(client.create_from_slice(b.codes));
+            keep.push(client.create_from_slice(b.scales));
+        }
+        client.sync();
+        let t_new = t.elapsed();
+        core::hint::black_box((&keep, acc));
+        println!("J. NEW LANE: borrow + upload w13+w2 packed, one sync : {:8.2} ms/expert   [12.6 MB]", ms(t_new) / n_experts as f64);
+        println!("   (current lane, B + G scaled to w13+w2, is ~{:.1} ms/expert)", 2.74 + 10.98 * 1.5);
+    }
+
     core::hint::black_box(sink);
     println!();
     println!("Per-forward scaling: the forward touches ~237 distinct experts per layer");

@@ -230,3 +230,163 @@ pub fn gate_up_silu_launch<R: Runtime>(
     };
     act
 }
+
+// ---------------------------------------------------------------------------
+// Where the expert bytes come from
+// ---------------------------------------------------------------------------
+
+use anyhow::{bail, Context, Result};
+use memmap2::Mmap;
+use std::collections::HashMap;
+use std::path::Path;
+
+/// One expert's packed NVFP4 weight, **borrowed** out of the checkpoint mapping.
+///
+/// The point of the lifetime is that there is no copy: `codes` and `scales`
+/// point into the mmap'd shard. `Checkpoint::expert_slice_packed` returns the
+/// same data as two owned `Vec<u8>`, which measured at 2.74 ms per expert
+/// against 0.0000 ms here, because it re-runs `SafeTensors::deserialize` four
+/// times per slab and then copies 12.6 MB out.
+pub struct PackedRef<'a> {
+    pub codes: &'a [u8],
+    pub scales: &'a [u8],
+    pub scale2: f32,
+    /// Output rows of this expert's matrix.
+    pub rows: usize,
+    /// Packed bytes per row; the logical width is `2 * cols`.
+    pub cols: usize,
+}
+
+/// The checkpoint's shards, mapped once, with every tensor's extent resolved up
+/// front.
+///
+/// [`crate::models::inkling::load::Checkpoint`] re-opens, re-maps and re-parses
+/// a shard on every single accessor call — `shape_of`, `tensor`, and each
+/// `with_bytes` — so reading one expert slab costs four full header
+/// deserializations of a multi-gigabyte file. Here the headers are parsed once
+/// at construction (9 shards, ~0.2 ms each) and every later lookup is pointer
+/// arithmetic.
+///
+/// The header is parsed directly rather than through `SafeTensors` because a
+/// `SafeTensors` borrows its mapping, which would make this struct
+/// self-referential; extents are plain numbers and outlive nothing.
+pub struct ExpertSource {
+    maps: Vec<Mmap>,
+    /// tensor name -> (map index, start, end) relative to the file
+    extents: HashMap<String, (usize, u64, u64)>,
+    shapes: HashMap<String, Vec<usize>>,
+    dtypes: HashMap<String, String>,
+}
+
+impl ExpertSource {
+    /// Map every shard named by the index and resolve all tensor extents.
+    pub fn open(dir: &Path) -> Result<Self> {
+        let idx: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.join("model.safetensors.index.json")).context("reading index")?,
+        )?;
+        let wm = idx["weight_map"].as_object().context("index has no weight_map")?;
+        let mut shard_names: Vec<String> =
+            wm.values().filter_map(|v| v.as_str().map(str::to_string)).collect();
+        shard_names.sort();
+        shard_names.dedup();
+
+        let mut maps = Vec::with_capacity(shard_names.len());
+        let mut extents = HashMap::new();
+        let mut shapes = HashMap::new();
+        let mut dtypes = HashMap::new();
+
+        for (mi, shard) in shard_names.iter().enumerate() {
+            let file = std::fs::File::open(dir.join(shard))
+                .with_context(|| format!("opening shard {shard}"))?;
+            // SAFETY: the checkpoint is read-only and nothing else writes it.
+            let map = unsafe { Mmap::map(&file) }?;
+            let hlen = u64::from_le_bytes(map[0..8].try_into().unwrap());
+            let header: serde_json::Value = serde_json::from_slice(&map[8..8 + hlen as usize])
+                .with_context(|| format!("parsing header of {shard}"))?;
+            let data_start = 8 + hlen;
+            for (name, meta) in header.as_object().context("header is not an object")? {
+                if name == "__metadata__" {
+                    continue;
+                }
+                let Some(off) = meta.get("data_offsets").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                let (s, e) = (off[0].as_u64().unwrap(), off[1].as_u64().unwrap());
+                extents.insert(name.clone(), (mi, data_start + s, data_start + e));
+                if let Some(sh) = meta.get("shape").and_then(|v| v.as_array()) {
+                    shapes.insert(
+                        name.clone(),
+                        sh.iter().map(|v| v.as_u64().unwrap_or(0) as usize).collect(),
+                    );
+                }
+                if let Some(dt) = meta.get("dtype").and_then(|v| v.as_str()) {
+                    dtypes.insert(name.clone(), dt.to_string());
+                }
+            }
+            maps.push(map);
+        }
+        Ok(ExpertSource { maps, extents, shapes, dtypes })
+    }
+
+    /// The whole tensor, borrowed.
+    pub fn bytes(&self, name: &str) -> Result<&[u8]> {
+        let &(mi, s, e) = self
+            .extents
+            .get(name)
+            .with_context(|| format!("{name} is not in the checkpoint"))?;
+        Ok(&self.maps[mi][s as usize..e as usize])
+    }
+
+    pub fn shape(&self, name: &str) -> Result<&[usize]> {
+        Ok(self.shapes.get(name).with_context(|| format!("{name} has no shape"))?)
+    }
+
+    pub fn has(&self, name: &str) -> bool {
+        self.extents.contains_key(name)
+    }
+
+    /// Is this expert stack packed NVFP4 (as opposed to the one BF16 layer)?
+    pub fn is_nvfp4(&self, base: &str) -> bool {
+        self.has(&format!("{base}.scale"))
+            && self.dtypes.get(base).map(|d| d == "U8").unwrap_or(false)
+    }
+
+    /// Expert `e` of a `[experts, rows, cols]` packed stack, without copying.
+    pub fn expert(&self, base: &str, e: usize) -> Result<PackedRef<'_>> {
+        let shape = self.shape(base)?;
+        if shape.len() != 3 {
+            bail!("{base} is rank {}", shape.len());
+        }
+        let (experts, rows, cols) = (shape[0], shape[1], shape[2]);
+        if e >= experts {
+            bail!("expert {e} of {experts}");
+        }
+        let logical = cols * 2;
+        if logical % GROUP != 0 {
+            bail!("{logical} logical is not a multiple of {GROUP}");
+        }
+        let spr = logical / GROUP;
+
+        let all = self.bytes(base)?;
+        if all.len() != experts * rows * cols {
+            bail!("{base} is {} bytes, want {}", all.len(), experts * rows * cols);
+        }
+        let codes = &all[e * rows * cols..(e + 1) * rows * cols];
+
+        let sname = format!("{base}.scale");
+        let sall = self.bytes(&sname)?;
+        let s0 = e * rows * spr;
+        if sall.len() < s0 + rows * spr {
+            bail!("{sname} is short");
+        }
+        let scales = &sall[s0..s0 + rows * spr];
+
+        let s2 = self.bytes(&format!("{base}.scale2"))?;
+        if s2.len() < 4 * (e + 1) {
+            bail!("{base}.scale2 is short");
+        }
+        let scale2 = f32::from_le_bytes(s2[4 * e..4 * e + 4].try_into().unwrap());
+
+        Ok(PackedRef { codes, scales, scale2, rows, cols })
+    }
+}
