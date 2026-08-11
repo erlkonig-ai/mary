@@ -367,35 +367,55 @@ fn main() -> Result<()> {
     // --- correctness ------------------------------------------------------
     // The MMA sees codes and block scales only, so its result must be scaled by
     // the two global scale2 factors to be comparable with the decoded reference.
+    // Any f32 dot product over 4096 terms carries summation-order error, so a
+    // bare GPU-vs-CPU-f32 delta cannot distinguish "the MMA is wrong" from "the
+    // two summed in different orders". An f64 accumulation of the same decoded
+    // values is the arbiter: it is what BOTH f32 lanes are approximating, so
+    // comparing each against it says which one is drifting.
     let global = scale2 * scale2_b;
-    let mut worst = 0.0f32;
+    let mut worst_gpu = 0.0f64;
+    let mut worst_cpu = 0.0f64;
     let mut worst_at = (0usize, 0usize);
     for i in 0..m {
         for j in 0..n {
-            let mut s = 0.0f32;
+            let mut s32 = 0.0f32;
+            let mut s64 = 0.0f64;
             for l in 0..k {
-                s += a_ref[i][l] * b_ref[j][l];
+                s32 += a_ref[i][l] * b_ref[j][l];
+                s64 += a_ref[i][l] as f64 * b_ref[j][l] as f64;
             }
             let g = got[i * n + j] * global;
             if !g.is_finite() {
                 println!("NON-FINITE at ({i},{j}) — FAIL");
                 std::process::exit(1);
             }
-            let r = (g - s).abs() / s.abs().max(1e-12);
-            if r > worst {
-                worst = r;
+            let denom = s64.abs().max(1e-12);
+            let r_gpu = (g as f64 - s64).abs() / denom;
+            let r_cpu = (s32 as f64 - s64).abs() / denom;
+            if r_gpu > worst_gpu {
+                worst_gpu = r_gpu;
                 worst_at = (i, j);
+            }
+            if r_cpu > worst_cpu {
+                worst_cpu = r_cpu;
             }
         }
     }
     println!(
-        "max relative error {worst:.3e} at {worst_at:?}  (K = {k}, {} MMA tiles accumulated)",
+        "max relative error vs f64 reference:  GPU (NVFP4 MMA) {worst_gpu:.3e} at {worst_at:?}\n\
+         max relative error vs f64 reference:  CPU f32 decode-and-multiply {worst_cpu:.3e}\n\
+         (K = {k}, {} MMA tiles accumulated)",
         k / 64
     );
+    if worst_gpu < worst_cpu {
+        println!(
+            "  -> the tensor-core result is CLOSER to the exact sum than the f32 CPU lane is, \
+             so the earlier GPU-vs-CPU delta was the CPU's own summation drift."
+        );
+    }
 
-    // f32 accumulation over 4096 terms in a different order than the CPU sums
-    // them; a few ulp of drift per term is expected and is not a wrong answer.
-    if worst > 1e-4 {
+    // Judge the GPU against the exact sum, not against another f32 lane.
+    if worst_gpu > 1e-4 {
         println!("FAIL — CubeCL's NVFP4 MMA did not reproduce the reference");
         std::process::exit(1);
     }
