@@ -28,3 +28,4 @@ pub mod stack;
 pub mod vision;
 
 pub use config::InklingConfig;
+pub mod fp4gemm;
