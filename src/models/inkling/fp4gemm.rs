@@ -390,3 +390,178 @@ impl ExpertSource {
         Ok(PackedRef { codes, scales, scale2, rows, cols })
     }
 }
+
+// ---------------------------------------------------------------------------
+// Activation quantisation
+// ---------------------------------------------------------------------------
+
+/// Quantise activations to NVFP4: E2M1 codes, one E4M3 scale per 16.
+///
+/// One unit per 16-element block. `x` is `[rows, k]` f32 flattened; `codes` is
+/// `[rows, k/8]` u32 with element `i` of a block at bits `4*(i%8)` of word
+/// `i/8` (low nibble first, so the bytes match the checkpoint's own packing and
+/// the same buffer can be bound as `e2m1x2`); `scales` is `[rows, k/16]` E4M3.
+///
+/// The recipe is the checkpoint's: `scale = amax/6` rounded to E4M3, then each
+/// element rounded to the nearest E2M1 code of `x/scale`. Rounding is
+/// round-to-nearest with exact midpoints going AWAY from zero (a midpoint lands
+/// on the `<` boundary and falls through to the larger code). An all-zero block
+/// yields a zero scale byte and zero codes.
+#[cube(launch)]
+pub fn quantize_act(x: &Tensor<f32>, codes: &mut Tensor<u32>, scales: &mut Tensor<e4m3>) {
+    let blk = ABSOLUTE_POS as usize;
+    if blk < scales.len() {
+        let base = blk * GROUP;
+
+        let mut amax = 0.0f32;
+        #[unroll]
+        for i in 0..GROUP {
+            let v = Abs::abs(x[base + i]);
+            if v > amax {
+                amax = v;
+            }
+        }
+
+        // Round the block scale through E4M3 and read back what it became: the
+        // codes have to be computed against the scale the MMA will actually
+        // apply, not the exact amax/6 the host imagined.
+        let sq = e4m3::cast_from(amax / 6.0f32);
+        let s = f32::cast_from(sq);
+        scales[blk] = sq;
+
+        let mut w0 = 0u32;
+        let mut w1 = 0u32;
+        if s > 0.0f32 {
+            let inv = 1.0f32 / s;
+            #[unroll]
+            for i in 0..GROUP {
+                let q = x[base + i] * inv;
+                let a = Abs::abs(q);
+                // magnitude grid 0, .5, 1, 1.5, 2, 3, 4, 6 -> midpoints below
+                let mut m = 7u32;
+                if a < 0.25f32 {
+                    m = 0u32;
+                } else if a < 0.75f32 {
+                    m = 1u32;
+                } else if a < 1.25f32 {
+                    m = 2u32;
+                } else if a < 1.75f32 {
+                    m = 3u32;
+                } else if a < 2.5f32 {
+                    m = 4u32;
+                } else if a < 3.5f32 {
+                    m = 5u32;
+                } else if a < 5.0f32 {
+                    m = 6u32;
+                }
+                let c = if q < 0.0f32 { m + 8u32 } else { m };
+                if i < 8 {
+                    w0 |= c << (4 * i as u32);
+                } else {
+                    w1 |= c << (4 * (i - 8) as u32);
+                }
+            }
+        }
+        codes[2 * blk] = w0;
+        codes[2 * blk + 1] = w1;
+    }
+}
+
+/// Host-side twin of [`quantize_act`], for gates and for the CPU lane.
+///
+/// Returns `(packed_bytes, scale_bytes)` in exactly the layout the device
+/// kernel writes, so a gate can compare them bitwise.
+pub fn quantize_act_host(x: &[f32], k: usize) -> (Vec<u8>, Vec<u8>) {
+    use crate::models::inkling::nvfp4::e4m3_to_f32;
+    assert_eq!(x.len() % k, 0, "x is not a whole number of rows of {k}");
+    assert_eq!(k % GROUP, 0, "{k} is not a multiple of {GROUP}");
+    let nblocks = x.len() / GROUP;
+    let mut codes = vec![0u8; x.len() / 2];
+    let mut scales = vec![0u8; nblocks];
+    for b in 0..nblocks {
+        let base = b * GROUP;
+        let amax = (0..GROUP).map(|i| x[base + i].abs()).fold(0.0f32, f32::max);
+        let sb = f32_to_e4m3(amax / 6.0);
+        scales[b] = sb;
+        let s = e4m3_to_f32(sb);
+        if !(s > 0.0) {
+            continue;
+        }
+        for i in 0..GROUP {
+            let q = x[base + i] / s;
+            let a = q.abs();
+            let m: u8 = if a < 0.25 {
+                0
+            } else if a < 0.75 {
+                1
+            } else if a < 1.25 {
+                2
+            } else if a < 1.75 {
+                3
+            } else if a < 2.5 {
+                4
+            } else if a < 3.5 {
+                5
+            } else if a < 5.0 {
+                6
+            } else {
+                7
+            };
+            let c = if q < 0.0 { m + 8 } else { m };
+            let j = base + i;
+            if j % 2 == 0 {
+                codes[j / 2] |= c;
+            } else {
+                codes[j / 2] |= c << 4;
+            }
+        }
+    }
+    (codes, scales)
+}
+
+/// Round a non-negative f32 to the nearest E4M3 (bias 7, 3 mantissa bits) byte.
+///
+/// Exhaustive rather than clever: E4M3FN has 256 patterns and the finite
+/// non-negative ones are 128, so scanning them is both obviously correct and
+/// fast enough for the few thousand block scales an expert needs. A hand-rolled
+/// bit twiddle is what got the subnormal branch of `e4m3_to_f32` wrong once
+/// already.
+pub fn f32_to_e4m3(v: f32) -> u8 {
+    use crate::models::inkling::nvfp4::e4m3_to_f32;
+    if !(v > 0.0) {
+        return 0;
+    }
+    let mut best = 0u8;
+    let mut bestd = f32::INFINITY;
+    for b in 0u16..128 {
+        let d = e4m3_to_f32(b as u8);
+        if !d.is_finite() {
+            continue;
+        }
+        let e = (d - v).abs();
+        if e < bestd {
+            bestd = e;
+            best = b as u8;
+        }
+    }
+    best
+}
+
+/// Quantise an `[rows, k]` f32 host slice and upload it, ready for
+/// [`fp4_linear_launch`]. `rows` is padded up to a multiple of [`MTILE`].
+pub fn upload_quantized_act<R: Runtime>(
+    client: &ComputeClient<R>,
+    x: &[f32],
+    rows: usize,
+    k: usize,
+) -> (Handle, Handle, usize) {
+    let m_pad = rows.div_ceil(MTILE) * MTILE;
+    let mut padded = vec![0f32; m_pad * k];
+    padded[..rows * k].copy_from_slice(&x[..rows * k]);
+    let (codes, scales) = quantize_act_host(&padded, k);
+    (
+        client.create_from_slice(&codes),
+        client.create_from_slice(&scales),
+        m_pad,
+    )
+}
