@@ -18,6 +18,7 @@ pub mod burn;
 pub mod attn;
 pub mod block;
 pub mod config;
+#[cfg(feature = "q4")] pub mod fp4quant;
 pub mod layer;
 pub mod layout;
 pub mod load;
