@@ -194,6 +194,7 @@ fn routed_experts_gpu<B: Backend>(
 #[allow(clippy::too_many_arguments)]
 fn routed_experts_fp4(
     src: &mary::models::inkling::fp4gemm::ExpertSource,
+    aliases: Option<&mary::models::inkling::fp4gemm::AliasedShards>,
     client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
     prefix: &str,
     by_expert: &BTreeMap<usize, Vec<(usize, f32)>>,
@@ -204,7 +205,9 @@ fn routed_experts_fp4(
     host: &mut (f64, f64),
 ) -> Result<Vec<f32>> {
     use cubecl::prelude::CubeElement;
-    use mary::models::inkling::fp4gemm::{fp4_linear_launch, gate_up_silu_launch, MTILE};
+    use mary::models::inkling::fp4gemm::{
+        alias_or_copy, fp4_linear_launch, gate_up_silu_launch, MTILE,
+    };
     use mary::models::inkling::fp4quant::quantize_nvfp4;
 
     let n13 = format!("{prefix}mlp.experts.w13_weight");
@@ -233,15 +236,28 @@ fn routed_experts_fp4(
         let x_h = client.create_from_slice(f32::as_bytes(&xp));
         let (a, asc) = quantize_nvfp4(client, &x_h, m_pad, h);
 
-        let b = client.create_from_slice(w13.codes);
-        let bsc = client.create_from_slice(w13.scales);
+        // Zero copy where the hardware allows it: the GPU reads the
+        // checkpoint's mmap'd pages in place. The shards were registered ONCE
+        // at startup, so this is offset arithmetic, not a device round trip.
+        let (b, bsc) = match aliases.and_then(|al| src.expert_aliased(al, &n13, e).ok().flatten()) {
+            Some(v) => v,
+            None => (
+                alias_or_copy(client, w13.codes, w13.codes_keep.clone()),
+                alias_or_copy(client, w13.scales, w13.scales_keep.clone()),
+            ),
+        };
         let both = fp4_linear_launch(client, &a, &asc, &b, &bsc, m_pad, h, 2 * inter, w13.scale2);
 
         let act_h = gate_up_silu_launch(client, &both, m_pad, inter);
         let (a2, asc2) = quantize_nvfp4(client, &act_h, m_pad, inter);
 
-        let b2 = client.create_from_slice(w2.codes);
-        let bsc2 = client.create_from_slice(w2.scales);
+        let (b2, bsc2) = match aliases.and_then(|al| src.expert_aliased(al, &n2, e).ok().flatten()) {
+            Some(v) => v,
+            None => (
+                alias_or_copy(client, w2.codes, w2.codes_keep.clone()),
+                alias_or_copy(client, w2.scales, w2.scales_keep.clone()),
+            ),
+        };
         let y_h = fp4_linear_launch(client, &a2, &asc2, &b2, &bsc2, m_pad, inter, h, w2.scale2);
         let y = f32::from_bytes(&client.read_one(y_h).expect("read y")).to_vec();
         host.1 += t_w.elapsed().as_secs_f64();
@@ -338,6 +354,25 @@ fn main() -> Result<()> {
         Some(cubecl::cuda::CudaRuntime::client(&Default::default()))
     } else {
         None
+    };
+    // Nine blocking device round trips for the whole run, instead of four per
+    // expert. Every later slab is an offset view of one of these.
+    let zerocopy_on = std::env::var("INK_ZEROCOPY").map(|v| v != "0").unwrap_or(true);
+    #[cfg(feature = "inkling-cuda")]
+    let fp4_aliases = match (&fp4_src, &fp4_client) {
+        // INK_ZEROCOPY=0 forces the copying lane, so the seam can be A/B'd
+        // against it with the page cache in the same state.
+        (Some(s), Some(c)) if zerocopy_on => {
+            let t = Instant::now();
+            let a = s.alias_shards(c);
+            println!(
+                "  zero-copy shards   : {} in {:.1} ms",
+                if a.is_some() { "registered" } else { "UNSUPPORTED, copying" },
+                t.elapsed().as_secs_f64() * 1e3
+            );
+            a
+        }
+        _ => None,
     };
     #[cfg(not(feature = "inkling-cuda"))]
     anyhow::ensure!(!experts_on_gpu, "INK_EXPERTS=gpu needs --features inkling-cuda");
@@ -455,6 +490,7 @@ fn main() -> Result<()> {
                     let a = if experts_fp4 && packed {
                         routed_experts_fp4(
                             fp4_src.as_ref().unwrap(),
+                            fp4_aliases.as_ref(),
                             fp4_client.as_ref().unwrap(),
                             &p, &by_expert, &hn, n, h, inter, &mut host_t,
                         )?

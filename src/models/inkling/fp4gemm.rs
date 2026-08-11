@@ -255,6 +255,11 @@ pub struct PackedRef<'a> {
     pub rows: usize,
     /// Packed bytes per row; the logical width is `2 * cols`.
     pub cols: usize,
+    /// The mapping `codes` points into. Cloning this `Arc` is what a zero-copy
+    /// handle holds so the pages cannot be unmapped under a running kernel;
+    /// codes and scales live in DIFFERENT shards, hence two of them.
+    pub codes_keep: std::sync::Arc<Mmap>,
+    pub scales_keep: std::sync::Arc<Mmap>,
 }
 
 /// The checkpoint's shards, mapped once, with every tensor's extent resolved up
@@ -271,7 +276,7 @@ pub struct PackedRef<'a> {
 /// `SafeTensors` borrows its mapping, which would make this struct
 /// self-referential; extents are plain numbers and outlive nothing.
 pub struct ExpertSource {
-    maps: Vec<Mmap>,
+    maps: Vec<std::sync::Arc<Mmap>>,
     /// tensor name -> (map index, start, end) relative to the file
     extents: HashMap<String, (usize, u64, u64)>,
     shapes: HashMap<String, Vec<usize>>,
@@ -323,7 +328,7 @@ impl ExpertSource {
                     dtypes.insert(name.clone(), dt.to_string());
                 }
             }
-            maps.push(map);
+            maps.push(std::sync::Arc::new(map));
         }
         Ok(ExpertSource { maps, extents, shapes, dtypes })
     }
@@ -335,6 +340,15 @@ impl ExpertSource {
             .get(name)
             .with_context(|| format!("{name} is not in the checkpoint"))?;
         Ok(&self.maps[mi][s as usize..e as usize])
+    }
+
+    /// The mapping a tensor's bytes live in, for use as a zero-copy keepalive.
+    pub fn keepalive(&self, name: &str) -> Result<std::sync::Arc<Mmap>> {
+        let &(mi, _, _) = self
+            .extents
+            .get(name)
+            .with_context(|| format!("{name} is not in the checkpoint"))?;
+        Ok(self.maps[mi].clone())
     }
 
     pub fn shape(&self, name: &str) -> Result<&[usize]> {
@@ -387,7 +401,15 @@ impl ExpertSource {
         }
         let scale2 = f32::from_le_bytes(s2[4 * e..4 * e + 4].try_into().unwrap());
 
-        Ok(PackedRef { codes, scales, scale2, rows, cols })
+        Ok(PackedRef {
+            codes,
+            scales,
+            scale2,
+            rows,
+            cols,
+            codes_keep: self.keepalive(base)?,
+            scales_keep: self.keepalive(&sname)?,
+        })
     }
 }
 
@@ -564,4 +586,164 @@ pub fn upload_quantized_act<R: Runtime>(
         client.create_from_slice(&scales),
         m_pad,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Zero copy
+// ---------------------------------------------------------------------------
+
+/// Expose `data` to the GPU **without copying it**, keeping `keep` alive for as
+/// long as the returned handle (and anything derived from it) exists.
+///
+/// Returns `None` when the device cannot address host memory directly, or when
+/// the region is not aligned well enough for the vectorised loads the expert
+/// GEMM issues — callers fall back to a copy rather than get a wrong answer.
+///
+/// ## What keeps the mapping alive
+///
+/// `keep` is an `Arc<Mmap>` cloned from [`ExpertSource`], handed to cubecl as
+/// the storage entry's keepalive. cubecl drops it only when it deallocates that
+/// entry, which it cannot do while a handle referencing it is alive. So the
+/// chain is: kernel -> binding -> Handle -> storage entry -> Arc<Mmap> -> pages.
+/// Nothing in that chain is a bare pointer with an implicit lifetime, which
+/// matters because a kernel reading unmapped pages does NOT reliably fault —
+/// it reads whatever the address holds now, and that is a wrong answer rather
+/// than a crash.
+pub fn alias_bytes<R: Runtime>(
+    client: &ComputeClient<R>,
+    data: &[u8],
+    keep: std::sync::Arc<Mmap>,
+) -> Option<Handle> {
+    if !cubecl::cuda::supports_zero_copy_host(0) {
+        return None;
+    }
+    // The expert GEMM binds these bytes as `Vector<e2m1x2, 4>` -- four 1-byte
+    // e2m1x2 elements, i.e. a 4-byte load -- so 4-byte alignment is the real
+    // requirement and 16 would be a superstition. It matters that this is the
+    // true bound and not a guess: safetensors packs tensors back to back with
+    // no padding, and this checkpoint puts w13_weight and w2_weight at offsets
+    // congruent to 4 (mod 16), so a 16-byte test would refuse every weight
+    // slab in the model and fall back to copying forever while looking like it
+    // worked. `inkling_zerocopy_gate` checks the aliased result byte-for-byte
+    // against the copied one, which is what actually settles it.
+    if (data.as_ptr() as usize) % 4 != 0 || data.is_empty() {
+        return None;
+    }
+    let len = data.len() as u64;
+    // SAFETY: `data` borrows pages of `keep`'s mapping, which is read-only
+    // (`PROT_READ`, `MAP_PRIVATE`) and lives at least as long as the `Arc` we
+    // hand over. cubecl pins external handles immutable, so no kernel will try
+    // to write them.
+    Some(unsafe {
+        client.register_external_aliased(
+            data.as_ptr() as *mut core::ffi::c_void,
+            len,
+            0,
+            len,
+            keep as std::sync::Arc<dyn core::any::Any + Send + Sync>,
+        )
+    })
+}
+
+/// [`alias_bytes`], falling back to an ordinary copy when aliasing is refused.
+pub fn alias_or_copy<R: Runtime>(
+    client: &ComputeClient<R>,
+    data: &[u8],
+    keep: std::sync::Arc<Mmap>,
+) -> Handle {
+    match alias_bytes(client, data, keep) {
+        Some(h) => h,
+        None => client.create_from_slice(data),
+    }
+}
+
+/// Every shard mapping, registered with the GPU **once**.
+///
+/// The obvious way to alias — call
+/// [`ComputeClient::register_external_aliased`] per expert slab — is a trap on
+/// this backend, and measurably so: it cost 2.6 s more per forward than simply
+/// copying. `create_from_slice` posts its work with `submit`, which returns
+/// immediately, but `register_external_aliased` has to hand back a `Handle` the
+/// server constructs, so it uses `submit_blocking` — a synchronous round trip
+/// to the device thread. At four slabs per expert and ~9950 expert-loads that
+/// is ~40 000 blocking hops, and they cost far more than the copies they save.
+///
+/// Registering is per *mapping*, though, not per tensor: nine shards, nine
+/// round trips for the whole run. Everything after that is
+/// [`Handle::offset_start`], which is pure arithmetic on the client side.
+pub struct AliasedShards {
+    shards: Vec<Handle>,
+    lens: Vec<u64>,
+}
+
+impl ExpertSource {
+    /// Register all mapped shards for zero-copy access. `None` if the device
+    /// cannot address host memory directly.
+    pub fn alias_shards<R: Runtime>(&self, client: &ComputeClient<R>) -> Option<AliasedShards> {
+        if !cubecl::cuda::supports_zero_copy_host(0) {
+            return None;
+        }
+        let mut shards = Vec::with_capacity(self.maps.len());
+        let mut lens = Vec::with_capacity(self.maps.len());
+        for m in &self.maps {
+            let len = m.len() as u64;
+            let keep: std::sync::Arc<dyn core::any::Any + Send + Sync> = m.clone();
+            // SAFETY: the mapping is read-only and `keep` holds it for as long
+            // as the handle lives; cubecl pins external handles immutable.
+            let h = unsafe {
+                client.register_external_aliased(
+                    m.as_ptr() as *mut core::ffi::c_void,
+                    len,
+                    0,
+                    len,
+                    keep,
+                )
+            };
+            shards.push(h);
+            lens.push(len);
+        }
+        Some(AliasedShards { shards, lens })
+    }
+
+    /// An expert's packed codes and scales as zero-copy offset views.
+    ///
+    /// Returns `None` when any slab is not 4-byte aligned — the expert GEMM
+    /// issues 4-byte vector loads, so that is the real bound (this checkpoint's
+    /// weight tensors sit at offsets congruent to 4 mod 16, which is fine for a
+    /// 4-byte load and would fail a naive 16-byte test).
+    pub fn expert_aliased(
+        &self,
+        al: &AliasedShards,
+        base: &str,
+        e: usize,
+    ) -> Result<Option<(Handle, Handle)>> {
+        let shape = self.shape(base)?;
+        let (rows, cols) = (shape[1], shape[2]);
+        let spr = cols * 2 / GROUP;
+        let sname = format!("{base}.scale");
+
+        let &(mi_c, cs, _) = self.extents.get(base).context("codes extent")?;
+        let &(mi_s, ss, _) = self.extents.get(&sname).context("scales extent")?;
+
+        let c_off = cs + (e * rows * cols) as u64;
+        let c_len = (rows * cols) as u64;
+        let s_off = ss + (e * rows * spr) as u64;
+        let s_len = (rows * spr) as u64;
+
+        let c_ptr = self.maps[mi_c].as_ptr() as usize + c_off as usize;
+        let s_ptr = self.maps[mi_s].as_ptr() as usize + s_off as usize;
+        if c_ptr % 4 != 0 || s_ptr % 4 != 0 {
+            return Ok(None);
+        }
+
+        let ch = al.shards[mi_c]
+            .clone()
+            .offset_start(c_off)
+            .offset_end(al.lens[mi_c] - c_off - c_len);
+        let sh = al.shards[mi_s]
+            .clone()
+            .offset_start(s_off)
+            .offset_end(al.lens[mi_s] - s_off - s_len);
+        Ok(Some((ch, sh)))
+    }
 }
