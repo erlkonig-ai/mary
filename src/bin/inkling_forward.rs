@@ -171,6 +171,84 @@ fn routed_experts_gpu<B: Backend>(
     Ok(acc.into_data().convert::<f32>().to_vec::<f32>().expect("acc to host"))
 }
 
+
+/// Every routed expert for one layer, on the NATIVE NVFP4 tensor-core path.
+///
+/// Differs from [`routed_experts_gpu`] in two independent ways, which the
+/// timers keep apart because they have completely different fixes:
+///
+/// * the slab arrives from [`ExpertSource`], which parsed every shard header
+///   once at startup and hands out a borrow, instead of
+///   `Checkpoint::expert_slice_packed`, which re-runs
+///   `SafeTensors::deserialize` four times per slab and then copies 12.6 MB;
+/// * the packed bytes go straight into `mma.sync…kind::mxf4nvf4…ue4m3`
+///   instead of being decoded into a 67.1 + 33.6 MB f32 pair per expert that
+///   is read once and dropped.
+///
+/// Activations are quantised to E2M1 in dynamic per-16 blocks with E4M3
+/// scales, which the instruction requires and which is what the checkpoint's
+/// own `hf_quant_config.json` specifies for `*input_quantizer`. This lane is
+/// therefore CLOSER to the checkpoint's intended numerics than the f32-
+/// activation lane it replaces, not further from it.
+#[cfg(feature = "inkling-cuda")]
+#[allow(clippy::too_many_arguments)]
+fn routed_experts_fp4(
+    src: &mary::models::inkling::fp4gemm::ExpertSource,
+    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+    prefix: &str,
+    by_expert: &BTreeMap<usize, Vec<(usize, f32)>>,
+    hn: &[f32],
+    n: usize,
+    h: usize,
+    inter: usize,
+    host: &mut (f64, f64),
+) -> Result<Vec<f32>> {
+    use cubecl::prelude::CubeElement;
+    use mary::models::inkling::fp4gemm::{
+        fp4_linear_launch, gate_up_silu_launch, upload_quantized_act,
+    };
+
+    let n13 = format!("{prefix}mlp.experts.w13_weight");
+    let n2 = format!("{prefix}mlp.experts.w2_weight");
+    let mut acc = vec![0f32; n * h];
+
+    for (&e, toks) in by_expert {
+        let t_s = Instant::now();
+        let w13 = src.expert(&n13, e)?;
+        let w2 = src.expert(&n2, e)?;
+        host.0 += t_s.elapsed().as_secs_f64();
+
+        let t_w = Instant::now();
+        let m = toks.len();
+        let mut x = vec![0f32; m * h];
+        for (i, &(ti, _)) in toks.iter().enumerate() {
+            x[i * h..(i + 1) * h].copy_from_slice(&hn[ti * h..(ti + 1) * h]);
+        }
+
+        let (a, asc, m_pad) = upload_quantized_act(client, &x, m, h);
+        let b = client.create_from_slice(w13.codes);
+        let bsc = client.create_from_slice(w13.scales);
+        let both = fp4_linear_launch(client, &a, &asc, &b, &bsc, m_pad, h, 2 * inter, w13.scale2);
+
+        let act_h = gate_up_silu_launch(client, &both, m_pad, inter);
+        let actf = f32::from_bytes(&client.read_one(act_h).expect("read act")).to_vec();
+
+        let (a2, asc2, _) = upload_quantized_act(client, &actf, m_pad, inter);
+        let b2 = client.create_from_slice(w2.codes);
+        let bsc2 = client.create_from_slice(w2.scales);
+        let y_h = fp4_linear_launch(client, &a2, &asc2, &b2, &bsc2, m_pad, inter, h, w2.scale2);
+        let y = f32::from_bytes(&client.read_one(y_h).expect("read y")).to_vec();
+        host.1 += t_w.elapsed().as_secs_f64();
+
+        for (i, &(ti, wgt)) in toks.iter().enumerate() {
+            for o in 0..h {
+                acc[ti * h + o] += y[i * h + o] * wgt;
+            }
+        }
+    }
+    Ok(acc)
+}
+
 fn main() -> Result<()> {
     let ckpt = std::env::args().nth(1).map(PathBuf::from).context("usage: <ckpt> <ids> <out>")?;
     let ids_path = std::env::args().nth(2).map(PathBuf::from).context("usage: <ckpt> <ids> <out>")?;
@@ -216,8 +294,19 @@ fn main() -> Result<()> {
     // it measured as no speedup, and it existed to paper over a capacity
     // shortfall (160 GB of checkpoint against 119 GB of box) that a second
     // Spark closes. See this file's header.
-    let experts_on_gpu = std::env::var("INK_EXPERTS").map(|v| v == "gpu").unwrap_or(false);
-    println!("  routed experts     : {}", if experts_on_gpu { "device" } else { "host (f32 oracle)" });
+    let ink_experts = std::env::var("INK_EXPERTS").unwrap_or_default();
+    let experts_fp4 = ink_experts == "fp4";
+    let experts_on_gpu = ink_experts == "gpu" || experts_fp4;
+    println!(
+        "  routed experts     : {}",
+        if experts_fp4 {
+            "device, NATIVE NVFP4 tensor cores"
+        } else if experts_on_gpu {
+            "device, decode to f32 then f32 matmul"
+        } else {
+            "host (f32 oracle)"
+        }
+    );
     if std::env::var("INK_HOST_SUM").map(|v| v == "reverse").unwrap_or(false) {
         println!("  host sum order     : REVERSED (reassociation control)");
     }
@@ -226,6 +315,24 @@ fn main() -> Result<()> {
     }
     #[cfg(feature = "inkling-cuda")]
     let dev = burn::backend::cuda::CudaDevice::default();
+    // Parsed once for the whole run. The lane it replaces re-parsed a shard
+    // header four times per expert slab, ~9950 times over a forward.
+    #[cfg(feature = "inkling-cuda")]
+    let fp4_src = if experts_fp4 {
+        let t = Instant::now();
+        let s = mary::models::inkling::fp4gemm::ExpertSource::open(&ckpt)?;
+        println!("  ExpertSource       : all shard headers parsed in {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+        Some(s)
+    } else {
+        None
+    };
+    #[cfg(feature = "inkling-cuda")]
+    let fp4_client = if experts_fp4 {
+        use cubecl::prelude::Runtime;
+        Some(cubecl::cuda::CudaRuntime::client(&Default::default()))
+    } else {
+        None
+    };
     #[cfg(not(feature = "inkling-cuda"))]
     anyhow::ensure!(!experts_on_gpu, "INK_EXPERTS=gpu needs --features inkling-cuda");
 
@@ -332,7 +439,22 @@ fn main() -> Result<()> {
             let acc = if experts_on_gpu {
                 #[cfg(feature = "inkling-cuda")]
                 {
-                    let a = routed_experts_gpu::<Bk>(&cp, &p, &by_expert, &hn, n, h, inter, &dev, &mut host_t)?;
+                    // Layer 2 is BF16 and has no `.scale` sidecar, so the FP4
+                    // lane cannot take it; that one layer falls back rather
+                    // than the whole run refusing.
+                    let packed = fp4_src
+                        .as_ref()
+                        .map(|s| s.is_nvfp4(&format!("{p}mlp.experts.w13_weight")))
+                        .unwrap_or(false);
+                    let a = if experts_fp4 && packed {
+                        routed_experts_fp4(
+                            fp4_src.as_ref().unwrap(),
+                            fp4_client.as_ref().unwrap(),
+                            &p, &by_expert, &hn, n, h, inter, &mut host_t,
+                        )?
+                    } else {
+                        routed_experts_gpu::<Bk>(&cp, &p, &by_expert, &hn, n, h, inter, &dev, &mut host_t)?
+                    };
                     expert_loads += by_expert.len();
                     a
                 }
@@ -414,7 +536,8 @@ fn main() -> Result<()> {
     println!("    attention half      {t_attn:8.1}");
     println!("    mlp half            {t_other:8.1}   of which:");
     println!("      routed experts    {t_expert:8.1}   ({})",
-             if experts_on_gpu { "slice + upload + dequant + matmul, device" }
+             if experts_fp4 { "borrow + upload + NVFP4 tensor cores, device" }
+             else if experts_on_gpu { "slice + upload + dequant + matmul, device" }
              else { "disk + NVFP4 unpack + matmul, host" });
     println!("      shared + dense    {:8.1}", t_other - t_expert);
     if experts_on_gpu {
