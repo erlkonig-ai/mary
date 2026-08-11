@@ -3574,7 +3574,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "jerky"
 version = "0.9.0"
-source = "git+https://github.com/triblespace/jerky.git?rev=97c4545eb5030e7d235e6207edc426fbab97d92b#97c4545eb5030e7d235e6207edc426fbab97d92b"
+source = "git+https://github.com/triblespace/jerky.git?rev=fc0be54529f6bc0a6c5e7312cd649de21a7f3316#fc0be54529f6bc0a6c5e7312cd649de21a7f3316"
 dependencies = [
  "anybytes",
  "num-traits",
@@ -7057,6 +7057,7 @@ dependencies = [
  "itertools 0.14.0",
  "jerky",
  "json-event-parser",
+ "libc",
  "memmap2",
  "num-rational",
  "page_size",
@@ -7074,6 +7075,7 @@ dependencies = [
  "ux",
  "winnow 0.7.15",
  "zerocopy",
+ "zeroize",
 ]
 
 [[package]]

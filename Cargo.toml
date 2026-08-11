@@ -310,6 +310,14 @@ required-features = ["inkling"]
 name = "inkling_forward"
 required-features = ["inkling"]
 
+# The same forward split across two machines by layer range. One box is 40 GiB
+# short of the checkpoint and pages the difference off disk every token; two
+# boxes hold it, so the wire carries [n, 4096] f32 once per boundary and the
+# experts stop moving at all.
+[[bin]]
+name = "inkling_pipe"
+required-features = ["inkling-cuda"]
+
 # Burn lane vs the f32 slice lane, at real model dimensions. The slice lane is
 # itself gated against transformers, so this needs no torch.
 [[bin]]
@@ -538,6 +546,12 @@ required-features = ["qwen3tts"]
 # Mimi codec (PersonaPlex Phase 1) parity gate vs the moshi CPU-f32 oracle.
 [[bin]]
 name = "mimi_probe"
+required-features = ["qwen3tts", "import"]
+
+# Mimi codec round-trip: WAV -> encode -> decode -> WAV. Measures what the
+# codec alone preserves (sung vs spoken input), independent of any LM.
+[[bin]]
+name = "mimi_roundtrip"
 required-features = ["qwen3tts", "import"]
 
 # PersonaPlex-7B checkpoint → shelf pile (LM + Mimi codec), with the
