@@ -204,9 +204,8 @@ fn routed_experts_fp4(
     host: &mut (f64, f64),
 ) -> Result<Vec<f32>> {
     use cubecl::prelude::CubeElement;
-    use mary::models::inkling::fp4gemm::{
-        fp4_linear_launch, gate_up_silu_launch, upload_quantized_act,
-    };
+    use mary::models::inkling::fp4gemm::{fp4_linear_launch, gate_up_silu_launch, MTILE};
+    use mary::models::inkling::fp4quant::quantize_nvfp4;
 
     let n13 = format!("{prefix}mlp.experts.w13_weight");
     let n2 = format!("{prefix}mlp.experts.w2_weight");
@@ -225,15 +224,22 @@ fn routed_experts_fp4(
             x[i * h..(i + 1) * h].copy_from_slice(&hn[ti * h..(ti + 1) * h]);
         }
 
-        let (a, asc, m_pad) = upload_quantized_act(client, &x, m, h);
+        // Quantise on the DEVICE, both times. The host lane this replaces had
+        // to bring the intermediate activation back across the bus between the
+        // two GEMMs purely to requantise it; `act_h` never leaves the device.
+        let m_pad = m.div_ceil(MTILE) * MTILE;
+        let mut xp = vec![0f32; m_pad * h];
+        xp[..m * h].copy_from_slice(&x);
+        let x_h = client.create_from_slice(f32::as_bytes(&xp));
+        let (a, asc) = quantize_nvfp4(client, &x_h, m_pad, h);
+
         let b = client.create_from_slice(w13.codes);
         let bsc = client.create_from_slice(w13.scales);
         let both = fp4_linear_launch(client, &a, &asc, &b, &bsc, m_pad, h, 2 * inter, w13.scale2);
 
         let act_h = gate_up_silu_launch(client, &both, m_pad, inter);
-        let actf = f32::from_bytes(&client.read_one(act_h).expect("read act")).to_vec();
+        let (a2, asc2) = quantize_nvfp4(client, &act_h, m_pad, inter);
 
-        let (a2, asc2, _) = upload_quantized_act(client, &actf, m_pad, inter);
         let b2 = client.create_from_slice(w2.codes);
         let bsc2 = client.create_from_slice(w2.scales);
         let y_h = fp4_linear_launch(client, &a2, &asc2, &b2, &bsc2, m_pad, inter, h, w2.scale2);
