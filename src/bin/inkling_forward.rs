@@ -60,6 +60,40 @@ fn linear(x: &[f32], w: &[f32], rows: usize, in_dim: usize, out_dim: usize) -> V
     out
 }
 
+/// Seed a host short convolution's rolling history from a prefill.
+///
+/// The `kernel - 1` most recent rows, oldest first, left-padded with the same
+/// zeros [`short_conv`] assumes for positions before the sequence — so a prompt
+/// shorter than the kernel starts correct rather than shifted.
+fn conv_history_host(x: &[f32], tokens: usize, dim: usize, kernel: usize) -> Vec<f32> {
+    let want = kernel - 1;
+    let mut h = vec![0f32; want * dim];
+    let take = want.min(tokens);
+    h[(want - take) * dim..].copy_from_slice(&x[(tokens - take) * dim..tokens * dim]);
+    h
+}
+
+/// One position of the host short convolution, advancing `hist` in place.
+///
+/// `cat(hist, x)` is exactly the window the last row of [`short_conv`] reads,
+/// so the tap arithmetic is not restated here — there is one implementation and
+/// the cached lane cannot drift from the uncached one.
+fn short_conv_step_host(
+    hist: &mut Vec<f32>,
+    x: &[f32],
+    weight: &[f32],
+    dim: usize,
+    kernel: usize,
+) -> Vec<f32> {
+    assert_eq!(x.len(), dim, "a decode step convolves exactly one position");
+    assert_eq!(hist.len(), (kernel - 1) * dim, "history must be the {} rows before it", kernel - 1);
+    let mut win = std::mem::take(hist);
+    win.extend_from_slice(x);
+    let out = short_conv(&win, weight, kernel, dim, kernel);
+    *hist = win[dim..].to_vec();
+    out[(kernel - 1) * dim..].to_vec()
+}
+
 /// The backend the device lane runs on.
 #[cfg(feature = "inkling-cuda")]
 type Bk = burn::backend::Cuda<f32>;
@@ -252,11 +286,20 @@ fn main() -> Result<()> {
     let attn_on_gpu = lane("INK_ATTN");
     let mlp_on_gpu = lane("INK_MLP");
     let head_on_gpu = lane("INK_HEAD");
+    // The KV cache. Off by default so the uncached lane stays available as the
+    // thing to check against: the decisive test of a cache is that it produces
+    // the same token sequence as not having one, and that needs both to run.
+    let kv = std::env::var("INK_KV").map(|v| v == "1" || v == "on").unwrap_or(false);
+    anyhow::ensure!(
+        !kv || attn_on_gpu,
+        "INK_KV needs attention on the device -- set INK_ATTN=gpu or INK_GPU=all"
+    );
     let say = |b: bool| if b { "device" } else { "host (f32 oracle)" };
     println!("  attention          : {}", say(attn_on_gpu));
     println!("  shared + dense MLP : {}", say(mlp_on_gpu));
     println!("  routed experts     : {}", say(experts_on_gpu));
     println!("  head (unembed)     : {}", say(head_on_gpu));
+    println!("  kv cache           : {}", if kv { "on" } else { "off (prefix recomputed each step)" });
     if std::env::var("INK_HOST_SUM").map(|v| v == "reverse").unwrap_or(false) {
         println!("  host sum order     : REVERSED (reassociation control)");
     }
@@ -285,10 +328,35 @@ fn main() -> Result<()> {
         None
     };
 
+    // Everything one layer carries between generated tokens. The attention
+    // cache is the headline, but the two layer-level short convolutions have
+    // state too: they reach `kernel - 1` positions back, and a cache that
+    // remembers K and V while forgetting those is wrong in a way that still
+    // produces fluent-looking text.
+    #[cfg(feature = "inkling-cuda")]
+    struct LayerCache {
+        attn: dev_lane::AttnCache<Bk>,
+        attn_sconv: BT<Bk, 2>,
+        mlp_sconv: Vec<f32>,
+    }
+    #[cfg(feature = "inkling-cuda")]
+    let mut caches: Vec<LayerCache> = Vec::new();
+
     let mut top_all: Vec<i64> = Vec::new();
     for step in 0..=gen_steps {
-    let n = ids.len();
-    let mut x = embed_and_norm(&ids, &embed_w, &embed_n, t.rms_norm_eps, t.vocab_size, h);
+    let pass = Instant::now();
+    // With a cache, every pass past the prefill feeds exactly the token the
+    // previous pass produced; without one, the whole prefix goes through again.
+    // `pos0` is that token's ABSOLUTE position, which is what log scaling and
+    // the relative bias are functions of -- it is only equal to zero on a pass
+    // that starts from the beginning.
+    let (feed, pos0): (Vec<usize>, usize) = if kv && step > 0 {
+        (vec![*ids.last().expect("a step past the prefill has produced a token")], ids.len() - 1)
+    } else {
+        (ids.clone(), 0)
+    };
+    let n = feed.len();
+    let mut x = embed_and_norm(&feed, &embed_w, &embed_n, t.rms_norm_eps, t.vocab_size, h);
 
     if let Ok(dir) = std::env::var("INK_DUMP_DIR") {
         std::fs::create_dir_all(&dir)?;
@@ -342,6 +410,10 @@ fn main() -> Result<()> {
             kind,
         };
         let mask = if is_local { &mask_local } else { &mask_global };
+        // The same distinction the mask carries, in the form the cache needs:
+        // how far back a query may look, and therefore how much of the cache
+        // can never be read again.
+        let window = if is_local { Some(t.sliding_window_size) } else { None };
         let a = if attn_on_gpu {
             #[cfg(feature = "inkling-cuda")]
             {
@@ -360,17 +432,47 @@ fn main() -> Result<()> {
                     k_norm: up1(g("attn.k_norm.weight")?, head_dim, &dev),
                     rel_proj: up2(g("attn.rel_logits_proj.proj")?, t.d_rel, t.rel_span(kind), &dev),
                 };
-                let y = dev_lane::attention(
-                    up2(hn.clone(), n, h, &dev),
-                    &w,
-                    &dims,
-                    Some(ls),
-                    up2(mask.clone(), n, n, &dev),
-                );
-                down(dev_lane::short_conv(
-                    y,
-                    up2(g("attn_sconv.weight")?, h, t.sconv_kernel_size, &dev),
-                ))
+                let sconv_w = up2(g("attn_sconv.weight")?, h, t.sconv_kernel_size, &dev);
+                if kv && step > 0 {
+                    let y = dev_lane::attention_step(
+                        up2(hn.clone(), n, h, &dev),
+                        &w,
+                        &dims,
+                        Some(ls),
+                        pos0,
+                        window,
+                        &mut caches[layer].attn,
+                    );
+                    let (out, hist) = dev_lane::short_conv_step(
+                        caches[layer].attn_sconv.clone(),
+                        y,
+                        sconv_w,
+                    );
+                    caches[layer].attn_sconv = hist;
+                    down(out)
+                } else if kv {
+                    let (y, attn) = dev_lane::attention_prefill(
+                        up2(hn.clone(), n, h, &dev),
+                        &w,
+                        &dims,
+                        Some(ls),
+                        up2(mask.clone(), n, n, &dev),
+                        window,
+                    );
+                    let hist = dev_lane::conv_history(y.clone(), t.sconv_kernel_size);
+                    let out = down(dev_lane::short_conv(y, sconv_w));
+                    caches.push(LayerCache { attn, attn_sconv: hist, mlp_sconv: Vec::new() });
+                    out
+                } else {
+                    let y = dev_lane::attention(
+                        up2(hn.clone(), n, h, &dev),
+                        &w,
+                        &dims,
+                        Some(ls),
+                        up2(mask.clone(), n, n, &dev),
+                    );
+                    down(dev_lane::short_conv(y, sconv_w))
+                }
             }
             #[cfg(not(feature = "inkling-cuda"))]
             unreachable!("guarded at startup")
@@ -525,7 +627,31 @@ fn main() -> Result<()> {
             acc.iter().zip(&sh).map(|(a, b)| a + b).collect()
         };
 
-        let y = short_conv(&y, &g("mlp_sconv.weight")?, n, h, t.sconv_kernel_size);
+        // The MLP half's own short convolution carries state across generated
+        // tokens exactly as attention's do.
+        let mlp_sconv_w = g("mlp_sconv.weight")?;
+        let y = if kv {
+            #[cfg(feature = "inkling-cuda")]
+            {
+                if step > 0 {
+                    short_conv_step_host(
+                        &mut caches[layer].mlp_sconv,
+                        &y,
+                        &mlp_sconv_w,
+                        h,
+                        t.sconv_kernel_size,
+                    )
+                } else {
+                    caches[layer].mlp_sconv =
+                        conv_history_host(&y, n, h, t.sconv_kernel_size);
+                    short_conv(&y, &mlp_sconv_w, n, h, t.sconv_kernel_size)
+                }
+            }
+            #[cfg(not(feature = "inkling-cuda"))]
+            unreachable!("guarded at startup")
+        } else {
+            short_conv(&y, &mlp_sconv_w, n, h, t.sconv_kernel_size)
+        };
         for (xi, yi) in x.iter_mut().zip(&y) {
             *xi += yi;
         }
@@ -608,29 +734,40 @@ fn main() -> Result<()> {
             best = i;
         }
     }
+
+    // Per-position top-5. Uncached, the final pass has recomputed every
+    // position, so it reports all of them and earlier passes report nothing.
+    // Cached, each pass computes only the positions it was handed and they
+    // accumulate -- prefill contributes the prompt, every step one more -- so
+    // the two lanes end with the same table over the same sequence, which is
+    // what makes the outputs comparable.
+    if !kv {
+        top_all.clear();
+    }
+    if kv || step == gen_steps {
+        for ti in 0..n {
+            let pos = pos0 + ti;
+            let row = &logits[ti * v..(ti + 1) * v];
+            let mut idx: Vec<usize> = (0..v).collect();
+            idx.sort_unstable_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap());
+            let top: Vec<usize> = idx[..5].to_vec();
+            println!("  after token {pos} (id {}): top5 {:?}  logits {:?}",
+                     ids[pos], top,
+                     top.iter().map(|&i| (row[i] * 100.0).round() / 100.0).collect::<Vec<_>>());
+            for &i in &top {
+                top_all.push(i as i64);
+            }
+        }
+    }
+
     if gen_steps > 0 {
-        println!("  step {step}: +{best}");
+        println!("  step {step}: +{best}   [pass {:.1}s, total {:.1}s, ctx {}]",
+                 pass.elapsed().as_secs_f32(), started.elapsed().as_secs_f32(), ids.len());
         ids.push(best);
-        if step < gen_steps {
-            continue;
-        }
     }
-
-    top_all.clear();
-    for ti in 0..n {
-        let row = &logits[ti * v..(ti + 1) * v];
-        let mut idx: Vec<usize> = (0..v).collect();
-        idx.sort_unstable_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap());
-        let top: Vec<usize> = idx[..5].to_vec();
-        println!("  after token {ti} (id {}): top5 {:?}  logits {:?}",
-                 ids[ti], top,
-                 top.iter().map(|&i| (row[i] * 100.0).round() / 100.0).collect::<Vec<_>>());
-        for &i in &top {
-            top_all.push(i as i64);
-        }
+    if step == gen_steps {
+        break;
     }
-
-    break;
     }
 
     let mut bytes = Vec::new();
