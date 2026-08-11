@@ -5,10 +5,17 @@
 //! `transformers`, and this is checked against *it*. So the Burn lane gets a
 //! real oracle without needing torch in the loop.
 //!
-//! Scope is the cost-dominant part first. A 5-token forward decoded 929 expert
-//! slabs; each one is a `[2 * intermediate, hidden]` and a
-//! `[hidden, intermediate]` matmul, which is where the time goes. RMSNorm is
-//! here too because every block runs two of them.
+//! Scope was the cost-dominant part first — the routed experts — and is now the
+//! whole arithmetic of a decoder layer: attention with its two short
+//! convolutions, the shared experts, the dense MLP, RMSNorm, and the NVFP4
+//! decode. What drove the second half was a measured 401 s forward of 109
+//! tokens in which attention was 108 s and the shared plus dense MLPs 145 s, all
+//! of it scalar host code left behind as a correctness reference. Moving both
+//! took them to 8.9 s and 15.0 s.
+//!
+//! Every one of these is gated against `transformers` by `inkling_burn_gate`,
+//! not against the slice lane: the two lanes were written by the same hand and
+//! agreeing with each other proves only that.
 //!
 //! Everything stays f32. The slice lane is f32 and the checkpoint's dense
 //! weights are BF16 widened to f32, so a rounding policy like K3's `ActRound`
@@ -86,6 +93,242 @@ pub fn dense_mlp<B: Backend>(
     linear(silu(g) * u, down).mul_scalar(global_scale)
 }
 
+/// The shared experts, on device — every token visits all of them.
+///
+/// `gate` and `up` are `[n_shared * intermediate, hidden]`, `down` is
+/// `[n_shared * hidden, intermediate]`, and `gammas` is `[tokens, n_shared]`.
+/// The gamma multiplies the **activation**, before the down projection — not
+/// the block's output, which is algebraically the same only because `down` is
+/// linear and is a different function the moment anything else is inserted.
+///
+/// Gate and up arrive already split rather than fused, so this can be gated
+/// straight against `transformers`' own `shared_experts.gate_proj` /
+/// `up_proj` with nothing transcribed in between; the checkpoint's interleaved
+/// `shared_w13_weight` is turned into these by [`split_shared_fused`].
+pub fn shared_experts<B: Backend>(
+    x: Tensor<B, 2>,
+    gate: Tensor<B, 2>,
+    up: Tensor<B, 2>,
+    down: Tensor<B, 2>,
+    gammas: Tensor<B, 2>,
+    n_shared: usize,
+) -> Tensor<B, 2> {
+    let [tokens, hidden] = x.dims();
+    let [drows, inter] = down.dims();
+    assert_eq!(drows, n_shared * hidden, "shared w2 has {drows} rows, want {}", n_shared * hidden);
+    assert_eq!(gate.dims(), [n_shared * inter, hidden], "shared gate is {:?}", gate.dims());
+    assert_eq!(up.dims(), [n_shared * inter, hidden], "shared up is {:?}", up.dims());
+    assert_eq!(gammas.dims(), [tokens, n_shared], "gammas must be [tokens, n_shared]");
+
+    let mut acc: Option<Tensor<B, 2>> = None;
+    for s in 0..n_shared {
+        let g = gate.clone().slice([s * inter..(s + 1) * inter, 0..hidden]);
+        let u = up.clone().slice([s * inter..(s + 1) * inter, 0..hidden]);
+        let dn = down.clone().slice([s * hidden..(s + 1) * hidden, 0..inter]);
+        let gamma = gammas.clone().slice([0..tokens, s..s + 1]);
+        let act = silu(linear(x.clone(), g)) * linear(x.clone(), u) * gamma;
+        let contrib = linear(act, dn);
+        acc = Some(match acc {
+            None => contrib,
+            Some(a) => a + contrib,
+        });
+    }
+    acc.expect("a MoE layer has at least one shared expert")
+}
+
+/// Split the checkpoint's fused `shared_w13_weight` into gate and up blocks.
+///
+/// `fused` is `[n_shared * 2 * intermediate, hidden]` in **checkpoint
+/// interleave** — gate on the even rows, up on the odd ones, per shared expert.
+/// Returns `[n_shared * intermediate, hidden]` twice, which is what
+/// [`shared_experts`] wants.
+///
+/// Splitting on device keeps the host copy in raw checkpoint order, so the
+/// 33 M-element shuffle per layer never happens on a scalar loop.
+pub fn split_shared_fused<B: Backend>(
+    fused: Tensor<B, 2>,
+    n_shared: usize,
+) -> (Tensor<B, 2>, Tensor<B, 2>) {
+    let [frows, hidden] = fused.dims();
+    assert_eq!(frows % (2 * n_shared), 0, "{frows} rows do not split into {n_shared} experts");
+    let inter = frows / (2 * n_shared);
+    let mut gates = Vec::with_capacity(n_shared);
+    let mut ups = Vec::with_capacity(n_shared);
+    for s in 0..n_shared {
+        let gu = deinterleave_rows_device(
+            fused.clone().slice([s * 2 * inter..(s + 1) * 2 * inter, 0..hidden]),
+        );
+        gates.push(gu.clone().slice([0..inter, 0..hidden]));
+        ups.push(gu.slice([inter..2 * inter, 0..hidden]));
+    }
+    (Tensor::cat(gates, 0), Tensor::cat(ups, 0))
+}
+
+/// Depthwise causal short convolution **plus its internal residual**, on device.
+///
+/// The device twin of [`crate::models::inkling::block::short_conv`]:
+///
+/// ```text
+/// conv[t] = sum_{j=0}^{k-1} w[j] * x[t + j - (k - 1)]        x[<0] = 0
+/// out[t]  = x[t] + conv[t]
+/// ```
+///
+/// Written as `k` shifted slices of a front-zero-padded input rather than as a
+/// convolution kernel, because `k` is 4 and the shift is exactly what the
+/// formula says. Returning only `conv` — dropping the module's own residual —
+/// is the mistake this shape makes hard to hide.
+pub fn short_conv<B: Backend>(x: Tensor<B, 2>, weight: Tensor<B, 2>) -> Tensor<B, 2> {
+    let [tokens, dim] = x.dims();
+    let [wdim, kernel] = weight.dims();
+    assert_eq!(dim, wdim, "short_conv: x is [_, {dim}] but the weight is [{wdim}, _]");
+    assert!(kernel > 0, "a short convolution needs a kernel");
+    let dev = x.device();
+    let pad: Tensor<B, 2> = Tensor::zeros([kernel - 1, dim], &dev);
+    let padded = Tensor::cat(vec![pad, x.clone()], 0);
+
+    let mut conv: Option<Tensor<B, 2>> = None;
+    for j in 0..kernel {
+        // t + j - (kernel - 1) in x is t + j in the padded tensor.
+        let seg = padded.clone().slice([j..j + tokens, 0..dim]);
+        let wj = weight.clone().slice([0..dim, j..j + 1]).reshape([1, dim]);
+        let term = seg * wj;
+        conv = Some(match conv {
+            None => term,
+            Some(c) => c + term,
+        });
+    }
+    x + conv.expect("kernel > 0")
+}
+
+/// RMS-normalize each head slice of `[tokens, heads * head_dim]`.
+fn head_rms_norm<B: Backend>(
+    v: Tensor<B, 2>,
+    gain: Tensor<B, 1>,
+    heads: usize,
+    head_dim: usize,
+    eps: f64,
+) -> Tensor<B, 2> {
+    let [tokens, width] = v.dims();
+    assert_eq!(width, heads * head_dim, "{width} is not {heads} x {head_dim}");
+    rms_norm(v.reshape([tokens * heads, head_dim]), gain, eps).reshape([tokens, width])
+}
+
+/// Every weight one attention layer needs, already on the device.
+///
+/// Orientations are the checkpoint's: `w*` are `[out, in]` the way `nn.Linear`
+/// stores them, the short convolutions are `[dim, kernel]`, and `rel_proj` is
+/// `[d_rel, rel_extent]`.
+pub struct AttnWeightsDev<B: Backend> {
+    pub wq: Tensor<B, 2>,
+    pub wk: Tensor<B, 2>,
+    pub wv: Tensor<B, 2>,
+    pub wr: Tensor<B, 2>,
+    pub wo: Tensor<B, 2>,
+    pub k_sconv: Tensor<B, 2>,
+    pub v_sconv: Tensor<B, 2>,
+    pub q_norm: Tensor<B, 1>,
+    pub k_norm: Tensor<B, 1>,
+    pub rel_proj: Tensor<B, 2>,
+}
+
+/// One attention layer over a whole sequence, on the device, no cache.
+///
+/// The device twin of [`crate::models::inkling::attn::attention`] and gated
+/// against the same `transformers` capture, not against it: matching the slice
+/// lane would only prove the two agree, and they were written by the same hand.
+///
+/// `mask` is the additive `[tokens, tokens]` mask — zero where a key is visible
+/// and `-inf` where it is not — because a local layer's mask carries the sliding
+/// window and a global layer's does not.
+///
+/// Two things are folded together here that a careless reading separates:
+/// log scaling multiplies the query **and** the relative-position bias, and only
+/// on global layers; and the bias is zero outside `0 <= q - k < rel_extent`,
+/// while causality lives in the mask.
+pub fn attention<B: Backend>(
+    x: Tensor<B, 2>,
+    w: &AttnWeightsDev<B>,
+    d: &crate::models::inkling::attn::AttnDims,
+    log_scaling: Option<crate::models::inkling::attn::LogScaling>,
+    mask: Tensor<B, 2>,
+) -> Tensor<B, 2> {
+    use crate::models::inkling::config::AttnKind;
+
+    let [tokens, hidden] = x.dims();
+    assert_eq!(hidden, d.hidden, "x is [_, {hidden}] but the config says {}", d.hidden);
+    assert_eq!(mask.dims(), [tokens, tokens], "the mask must be [tokens, tokens]");
+    let dev = x.device();
+    let (heads, kv_heads, head_dim) = (d.heads, d.kv_heads, d.head_dim);
+    let groups = d.groups();
+    assert_eq!(groups * kv_heads, heads, "{heads} heads do not divide into {kv_heads} kv heads");
+
+    // K and V pass through their short convolutions; Q does not.
+    let q = linear(x.clone(), w.wq.clone());
+    let k = short_conv(linear(x.clone(), w.wk.clone()), w.k_sconv.clone());
+    let v = short_conv(linear(x.clone(), w.wv.clone()), w.v_sconv.clone());
+    let r = linear(x, w.wr.clone());
+
+    let q = head_rms_norm(q, w.q_norm.clone(), heads, head_dim, d.rms_eps);
+    let k = head_rms_norm(k, w.k_norm.clone(), kv_heads, head_dim, d.rms_eps);
+
+    // Log scaling: the same vector the slice lane builds, from the same method.
+    let taus: Vec<f32> = (0..tokens)
+        .map(|t| match (d.kind, log_scaling) {
+            (AttnKind::Global, Some(ls)) => ls.tau(t),
+            _ => 1.0,
+        })
+        .collect();
+    let tau: Tensor<B, 1> = Tensor::from_data(TensorData::new(taus, [tokens]), &dev);
+    let q = q * tau.clone().reshape([tokens, 1]);
+
+    // Only distances that can occur are worth projecting: a distance is at most
+    // `tokens - 1` and the table stops at `rel_extent`.
+    let eff = d.rel_extent.min(tokens);
+    let mut idx = vec![0i32; tokens * tokens];
+    let mut valid = vec![0f32; tokens * tokens];
+    for qi in 0..tokens {
+        for ki in 0..tokens {
+            let dist = qi as isize - ki as isize;
+            if dist >= 0 && (dist as usize) < d.rel_extent {
+                idx[qi * tokens + ki] = dist as i32;
+                valid[qi * tokens + ki] = 1.0;
+            }
+        }
+    }
+    let idx: Tensor<B, 3, Int> =
+        Tensor::from_data(TensorData::new(idx, [1, tokens, tokens]), &dev).repeat_dim(0, heads);
+    let valid: Tensor<B, 3> = Tensor::from_data(TensorData::new(valid, [1, tokens, tokens]), &dev);
+
+    let rel = r
+        .reshape([tokens * heads, d.d_rel])
+        .matmul(w.rel_proj.clone().slice([0..d.d_rel, 0..eff]))
+        .reshape([tokens, heads, eff])
+        .swap_dims(0, 1)
+        * tau.reshape([1, tokens, 1]);
+    let bias = rel.gather(2, idx) * valid;
+
+    // [heads, tokens, head_dim]; the KV heads are repeated in place, so head h
+    // reads kv head h / groups exactly as the slice lane indexes it.
+    let qh = q.reshape([tokens, heads, head_dim]).swap_dims(0, 1);
+    let expand = |t: Tensor<B, 2>| -> Tensor<B, 3> {
+        t.reshape([tokens, kv_heads, head_dim])
+            .swap_dims(0, 1)
+            .reshape([kv_heads, 1, tokens, head_dim])
+            .repeat_dim(1, groups)
+            .reshape([heads, tokens, head_dim])
+    };
+    let kh = expand(k);
+    let vh = expand(v);
+
+    let scores = qh.matmul(kh.swap_dims(1, 2)).mul_scalar(d.scaling()) + bias
+        + mask.reshape([1, tokens, tokens]);
+    let probs = burn::tensor::activation::softmax(scores, 2);
+    let out = probs
+        .matmul(vh)
+        .swap_dims(0, 1)
+        .reshape([tokens, heads * head_dim]);
+    linear(out, w.wo.clone())
+}
 
 /// FP4 (E2M1) values by 4-bit code, and the E4M3 table, as device tensors.
 ///

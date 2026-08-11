@@ -1,4 +1,8 @@
-//! Parity gate for the Inkling Burn lane against the f32 slice lane.
+//! Parity gate for the Inkling Burn lane against `transformers`.
+//!
+//! Covers every stage that runs on the device: RMSNorm, the short convolution,
+//! attention (local and global), one routed expert's feed-forward, the shared
+//! experts, the dense MLP, the NVFP4 decode, and the gate/up de-interleave.
 //!
 //! The reference is PYTHON, read from the oracle bundles that
 //! `golden/capture_inkling_*.py` dump. Those are raw f32 arrays of
@@ -20,17 +24,32 @@
 //! 2048, dense intermediate 16384), not toys, and every check prints how many
 //! values it compared. A gate that ran on 4x4 tensors would pass without
 //! touching the blocking behaviour that makes a backend matmul differ at all.
+//! Attention is gated TWICE for this reason: once on the toy capture, whose
+//! configuration is chosen so that every branch engages, and once at hidden
+//! 4096 over 109 tokens, where the branches are inert but the matmul is real.
 //!
-//! MEASURED 2026-08-08 on the GB10. ndarray passes; CUDA does NOT, and the
-//! shape of the failure is the finding:
+//! MEASURED 2026-08-11 on the GB10. ndarray passes everything; CUDA fails
+//! exactly the matmul-bearing checks, and the shape of the failure is the
+//! finding:
 //!
 //! ```text
-//!   rms_norm    1.1e-6   passes
-//!   expert_ffn  4.5e-4   FAILS, 45x over
-//!   dense_mlp   4.3e-4   FAILS, 43x over
+//!                      ndarray     cuda
+//!   rms_norm            2.2e-7    2.2e-7   passes
+//!   short_conv          8.1e-8    8.1e-8   passes
+//!   nvfp4 dequant        exact     exact   bitwise
+//!   expert_ffn          2.2e-6    4.6e-4   FAILS on cuda
+//!   dense_mlp           4.7e-6    5.5e-4   FAILS on cuda
+//!   shared_experts      2.0e-7    3.3e-4   FAILS on cuda
+//!   attention (toy)     2.0e-7    5.4e-4   FAILS on cuda
+//!   attention (real)    2.4e-6    4.5e-4   FAILS on cuda
 //! ```
 //!
-//! Only the matmul-bearing checks fail, both at the same magnitude, while
+//! Every ported stage lands at the same 3-6e-4 on CUDA and passes on ndarray,
+//! which places the discrepancy in the backend's matmul and not in any of the
+//! ports. The elementwise checks — RMSNorm, the short convolution, the FP4
+//! decode — are unaffected on both.
+//!
+//! Only the matmul-bearing checks fail, all at the same magnitude, while
 //! RMSNorm under the identical metric passes at 1.1e-6 — so this is not a
 //! cancellation artifact and not the elementwise path. About 4.3e-4 relative is
 //! roughly eleven bits of mantissa, which is what a TF32 tensor-core matmul
@@ -45,15 +64,30 @@
 //! result as "neither"; the classifier now tests grid membership instead of one
 //! guessed value.)
 //!
-//! Finding the switch to force full f32 accumulate is open work.
+//! Finding the switch to force full f32 accumulate is open work, but it is no
+//! longer a mystery where the switch would go. `cubek-matmul`'s
+//! `definition::blueprint::adjust_dtypes` rewrites the stage and register
+//! element types from f32 to tf32 — and *only* when the chosen tile matmul
+//! reports `requires_accelerator()`. The unit routines (`SimpleUnitAlgorithm`,
+//! `DoubleUnitAlgorithm`) do not, so they keep f32 end to end. What is missing
+//! is a way to ask for one: burn's `MatmulStrategy` offers `Cube` (which passes
+//! `cubek`'s `Strategy::Auto`) and `Autotune` (which picks by speed, and the
+//! accelerator is faster), and neither can name a routine. The fix belongs
+//! upstream in burn as a precision knob on the matmul, not here.
 //!
 //! The budget is deliberately NOT widened to accommodate it. A GPU lane that
 //! silently carries eleven mantissa bits is a fact worth failing over, and the
-//! whole point of gating the Burn lane against the slice lane is to surface
+//! whole point of gating the Burn lane against `transformers` is to surface
 //! exactly this before anything depends on it.
 //!
-//!   cargo run --release --features inkling-burn --bin inkling_burn_gate
-//!   cargo run --release --features inkling-cuda --bin inkling_burn_gate -- cuda
+//! What it costs end to end, measured on the 109-token forward: 106 of 109
+//! positions keep the same argmax against the all-host run, the three that move
+//! are near-ties inside the top five, and the prompt's own continuation is
+//! unchanged. So this is a real loss of precision with a small consequence —
+//! which is a statement about this prompt, not a licence to stop measuring.
+//!
+//!   cargo run --release --features inkling-burn --bin inkling_burn_gate -- <oracle>
+//!   cargo run --release --features inkling-cuda --bin inkling_burn_gate -- cuda <oracle>
 
 use burn::prelude::*;
 use burn::tensor::{Tensor, TensorData};
@@ -93,6 +127,25 @@ fn read_f32(p: &std::path::Path) -> Vec<f32> {
     b.chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
+}
+
+/// One of the capture scripts' manifests.
+fn manifest(oracle: &std::path::Path, name: &str) -> serde_json::Value {
+    let p = oracle.join(name);
+    let s = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("reading {}: {e}", p.display()));
+    serde_json::from_str(&s).unwrap_or_else(|e| panic!("parsing {}: {e}", p.display()))
+}
+
+fn mu(v: &serde_json::Value, k: &str) -> usize {
+    v.get(k)
+        .and_then(|x| x.as_u64())
+        .unwrap_or_else(|| panic!("manifest has no unsigned {k}")) as usize
+}
+
+fn mf(v: &serde_json::Value, k: &str) -> f64 {
+    v.get(k)
+        .and_then(|x| x.as_f64())
+        .unwrap_or_else(|| panic!("manifest has no number {k}"))
 }
 
 fn run<B: Backend>(dev: &B::Device, oracle: &std::path::Path, label: &str) -> (usize, usize) {
@@ -251,6 +304,218 @@ fn run<B: Backend>(dev: &B::Device, oracle: &std::path::Path, label: &str) -> (u
     .unwrap();
     let theirs = read_f32(&oracle.join("bop_dense_y.bin"));
     report("dense_mlp vs python", cmp(&mine, &theirs), &mut checks, &mut fails);
+
+    // ---- short convolution -------------------------------------------------
+    // At the real width, from `InklingShortConvolution` itself. The oracle also
+    // carries the residual-free convolution, so the gate can say WHICH of the
+    // two an implementation matches instead of reporting "wrong numbers".
+    {
+        let m = manifest(oracle, "blk_manifest.json");
+        let k = mu(&m, "kernel");
+        let xs = read_f32(&oracle.join("blk_sconv_x.bin"));
+        let ws = read_f32(&oracle.join("blk_sconv_w.bin"));
+        let ys = read_f32(&oracle.join("blk_sconv_y.bin"));
+        let pure = read_f32(&oracle.join("blk_sconv_y_noresid.bin"));
+        let toks = xs.len() / h;
+        let mine = mary::models::inkling::burn::short_conv(
+            t2::<B>(&xs, toks, h, dev),
+            t2::<B>(&ws, h, k, dev),
+        )
+        .into_data()
+        .convert::<f32>()
+        .to_vec::<f32>()
+        .unwrap();
+        report("short_conv vs python", cmp(&mine, &ys), &mut checks, &mut fails);
+        let d = cmp(&mine, &pure);
+        checks += 1;
+        println!("  short_conv against the RESIDUAL-FREE convolution: {:e}", d.scaled());
+        if d.scaled() <= BUDGET {
+            println!("    FAIL  indistinguishable from dropping the module's own residual");
+            fails += 1;
+        }
+    }
+
+    // ---- the device gate/up split ------------------------------------------
+    // A permutation, so the bar is bitwise. The host side is gated against the
+    // real checkpoint by `inkling_real_gate`; this is the two lanes agreeing,
+    // which is the only claim a permutation can be wrong about.
+    {
+        let (rows, cols) = (2 * 12usize, 7usize);
+        let ramp: Vec<f32> = (0..rows * cols).map(|i| i as f32).collect();
+        let (hg, hu) = mary::models::inkling::load::deinterleave_rows(&ramp, rows, cols);
+        let (dg, du) = mary::models::inkling::burn::split_shared_fused(
+            t2::<B>(&ramp, rows, cols, dev),
+            1,
+        );
+        let dg = dg.into_data().convert::<f32>().to_vec::<f32>().unwrap();
+        let du = du.into_data().convert::<f32>().to_vec::<f32>().unwrap();
+        checks += dg.len() + du.len();
+        let bad = dg.iter().zip(&hg).filter(|(a, b)| a != b).count()
+            + du.iter().zip(&hu).filter(|(a, b)| a != b).count();
+        println!("  split_shared_fused vs load::deinterleave_rows: {} values, {bad} differ",
+                 dg.len() + du.len());
+        if bad != 0 {
+            println!("    FAIL  the device split and the host split disagree");
+            fails += 1;
+        }
+    }
+
+    // ---- shared experts ----------------------------------------------------
+    // Against `InklingMoE.shared_experts` run on its own, which the capture
+    // dumps separately from the routed half precisely so the two cannot be
+    // confused for each other.
+    {
+        let m = manifest(oracle, "lyr_manifest.json");
+        let (tok, hid) = (mu(&m, "tokens"), mu(&m, "hidden"));
+        let inter = mu(&m, "moe_intermediate");
+        let n_shared = mu(&m, "n_shared");
+        let x = read_f32(&oracle.join("lyr_x.bin"));
+        let g = read_f32(&oracle.join("lyr_moe_shared_experts_gate_proj.bin"));
+        let up = read_f32(&oracle.join("lyr_moe_shared_experts_up_proj.bin"));
+        let dn = read_f32(&oracle.join("lyr_moe_shared_experts_down_proj.bin"));
+        let gam = read_f32(&oracle.join("lyr_moe_gammas.bin"));
+        let want = read_f32(&oracle.join("lyr_moe_shared.bin"));
+        let routed = read_f32(&oracle.join("lyr_moe_routed.bin"));
+        let mine = mary::models::inkling::burn::shared_experts(
+            t2::<B>(&x, tok, hid, dev),
+            t2::<B>(&g, n_shared * inter, hid, dev),
+            t2::<B>(&up, n_shared * inter, hid, dev),
+            t2::<B>(&dn, n_shared * hid, inter, dev),
+            t2::<B>(&gam, tok, n_shared, dev),
+            n_shared,
+        )
+        .into_data()
+        .convert::<f32>()
+        .to_vec::<f32>()
+        .unwrap();
+        report("shared_experts vs python", cmp(&mine, &want), &mut checks, &mut fails);
+        // Non-vacuity: the shared half must not be a rounding error beside the
+        // routed half, or matching it would prove nothing about either.
+        let scale = |v: &[f32]| v.iter().fold(0f32, |a, b| a.max(b.abs()));
+        checks += 1;
+        println!("  shared |max| {:e} against routed |max| {:e}", scale(&want), scale(&routed));
+        if scale(&want) < 0.05 * scale(&routed) {
+            println!("    FAIL  the shared half is negligible here; the check is near-vacuous");
+            fails += 1;
+        }
+    }
+
+    // ---- attention ---------------------------------------------------------
+    // Twice over: the toy capture, where every branch engages, and the real
+    // capture at hidden 4096, where a backend matmul's blocking and input
+    // precision do.
+    for (man_name, prefix, label, kinds_must_differ) in [
+        ("attn_manifest.json", "attn_", "toy config, every branch live", true),
+        ("areal_manifest.json", "areal_", "real config, hidden 4096", false),
+    ] {
+        let m = manifest(oracle, man_name);
+        let tok = mu(&m, "tokens");
+        let hid = mu(&m, "hidden");
+        let d_rel = mu(&m, "d_rel");
+        let kernel = mu(&m, "kernel");
+        let eps = mf(&m, "rms_norm_eps");
+        let window = mu(&m, "sliding_window");
+        let ls = mary::models::inkling::attn::LogScaling {
+            n_floor: mf(&m, "log_scaling_n_floor") as f32,
+            alpha: mf(&m, "log_scaling_alpha") as f32,
+        };
+        let x = read_f32(&oracle.join(format!("{prefix}x.bin")));
+        assert_eq!(x.len(), tok * hid, "{prefix}x.bin is not [tokens, hidden]");
+        println!("\n  -- attention: {label} ({tok} tokens, hidden {hid}) --");
+
+        for tag in ["local", "global"] {
+            let l = &m["layers"][tag];
+            let heads = mu(l, "num_heads");
+            let kv_heads = mu(l, "num_kv_heads");
+            let head_dim = mu(l, "head_dim");
+            let rel_extent = mu(l, "rel_extent");
+            let is_local = tag == "local";
+            let p = |n: &str| oracle.join(format!("{prefix}{tag}_{n}"));
+
+            let dims = mary::models::inkling::attn::AttnDims {
+                hidden: hid,
+                heads,
+                kv_heads,
+                head_dim,
+                d_rel,
+                rel_extent,
+                kernel,
+                rms_eps: eps,
+                kind: if is_local {
+                    mary::models::inkling::config::AttnKind::Local
+                } else {
+                    mary::models::inkling::config::AttnKind::Global
+                },
+            };
+            checks += 1;
+            if (dims.scaling() as f64 - mf(l, "scaling")).abs() > 1e-9 {
+                println!("    FAIL  scaling {} != reference {}", dims.scaling(), mf(l, "scaling"));
+                fails += 1;
+            }
+
+            let load = |n: &str, r: usize, c: usize| t2::<B>(&read_f32(&p(n)), r, c, dev);
+            let w = mary::models::inkling::burn::AttnWeightsDev::<B> {
+                wq: load("wq.bin", heads * head_dim, hid),
+                wk: load("wk.bin", kv_heads * head_dim, hid),
+                wv: load("wv.bin", kv_heads * head_dim, hid),
+                wr: load("wr.bin", heads * d_rel, hid),
+                wo: load("wo.bin", hid, heads * head_dim),
+                k_sconv: load("k_sconv.bin", kv_heads * head_dim, kernel),
+                v_sconv: load("v_sconv.bin", kv_heads * head_dim, kernel),
+                q_norm: Tensor::<B, 1>::from_data(
+                    TensorData::new(read_f32(&p("q_norm.bin")), [head_dim]), dev),
+                k_norm: Tensor::<B, 1>::from_data(
+                    TensorData::new(read_f32(&p("k_norm.bin")), [head_dim]), dev),
+                rel_proj: load("rel_proj.bin", d_rel, rel_extent),
+            };
+            let mask = mary::models::inkling::attn::causal_mask(
+                tok, if is_local { Some(window) } else { None });
+            let run_kind = |w: &mary::models::inkling::burn::AttnWeightsDev<B>,
+                            d: &mary::models::inkling::attn::AttnDims,
+                            mask: &[f32]| {
+                mary::models::inkling::burn::attention(
+                    t2::<B>(&x, tok, hid, dev), w, d, Some(ls), t2::<B>(mask, tok, tok, dev),
+                )
+                .into_data()
+                .convert::<f32>()
+                .to_vec::<f32>()
+                .unwrap()
+            };
+            let mine = run_kind(&w, &dims, &mask);
+            let theirs = read_f32(&p("y.bin"));
+            report(&format!("attention {tag} vs python"), cmp(&mine, &theirs), &mut checks, &mut fails);
+
+            // Non-vacuity: on the toy corpus the same weights under the OTHER
+            // kind must disagree, or the `kind` argument is untested.
+            //
+            // On the real config at this length they CANNOT disagree, and that
+            // is a fact about the model rather than a weakness of the gate: the
+            // window is 512 and both relative tables reach at least 512, so at
+            // 109 tokens neither bites, and `log_scaling_n_floor` is 128000, so
+            // tau is exactly 1. A local and a global layer are the same
+            // function until the sequence is long enough to tell them apart.
+            // Demanding a difference here would only teach the gate to lie.
+            let other = mary::models::inkling::attn::AttnDims {
+                kind: if is_local {
+                    mary::models::inkling::config::AttnKind::Global
+                } else {
+                    mary::models::inkling::config::AttnKind::Local
+                },
+                ..dims
+            };
+            let other_mask = mary::models::inkling::attn::causal_mask(
+                tok, if is_local { None } else { Some(window) });
+            let flipped = run_kind(&w, &other, &other_mask);
+            let fd = cmp(&flipped, &theirs);
+            checks += 1;
+            println!("    same weights under the OTHER kind: {:e}{}", fd.scaled(),
+                     if kinds_must_differ { "  <- must differ" } else { "  (cannot differ at this length)" });
+            if kinds_must_differ && fd.scaled() <= BUDGET {
+                println!("    FAIL  the two kinds are indistinguishable here");
+                fails += 1;
+            }
+        }
+    }
 
     (checks, fails)
 }

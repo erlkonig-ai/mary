@@ -65,6 +65,33 @@ fn linear(x: &[f32], w: &[f32], rows: usize, in_dim: usize, out_dim: usize) -> V
 type Bk = burn::backend::Cuda<f32>;
 #[cfg(feature = "inkling-cuda")]
 use burn::prelude::Backend;
+#[cfg(feature = "inkling-cuda")]
+use burn::tensor::{Tensor as BT, TensorData as BTD};
+#[cfg(feature = "inkling-cuda")]
+use mary::models::inkling::burn as dev_lane;
+
+/// Move a host `[rows, cols]` matrix to the device, consuming it.
+///
+/// Takes the `Vec` by value on purpose: the dense `w13` is 537 MB at f32 and a
+/// borrowing helper would hold two copies of it at once.
+#[cfg(feature = "inkling-cuda")]
+fn up2<B: Backend>(v: Vec<f32>, rows: usize, cols: usize, dev: &B::Device) -> BT<B, 2> {
+    assert_eq!(v.len(), rows * cols, "{} values are not [{rows}, {cols}]", v.len());
+    BT::from_data(BTD::new(v, [rows, cols]), dev)
+}
+
+#[cfg(feature = "inkling-cuda")]
+fn up1<B: Backend>(v: Vec<f32>, len: usize, dev: &B::Device) -> BT<B, 1> {
+    assert_eq!(v.len(), len, "{} values are not [{len}]", v.len());
+    BT::from_data(BTD::new(v, [len]), dev)
+}
+
+/// Read a `[rows, cols]` device tensor back to the host. This is also the sync,
+/// so a timer around the call measures work rather than enqueueing.
+#[cfg(feature = "inkling-cuda")]
+fn down<B: Backend>(t: BT<B, 2>) -> Vec<f32> {
+    t.into_data().convert::<f32>().to_vec::<f32>().expect("device readback")
+}
 
 /// Every routed expert for one layer, on the device, without a host f32 copy.
 ///
@@ -209,15 +236,27 @@ fn main() -> Result<()> {
     let embed_w = cp.tensor("model.llm.embed.weight")?.data;
     let embed_n = cp.tensor("model.llm.embed_norm.weight")?.data;
     let fnorm = cp.tensor("model.llm.norm.weight")?.data;
-    let unembed = cp.tensor("model.llm.unembed.weight")?.data;
+    #[allow(unused_mut)]
+    let mut unembed = cp.tensor("model.llm.unembed.weight")?.data;
     println!("  embedding tables loaded in {:.1}s", started.elapsed().as_secs_f32());
 
     // Experts are read, applied and dropped. There is no decoded-expert cache:
     // it measured as no speedup, and it existed to paper over a capacity
     // shortfall (160 GB of checkpoint against 119 GB of box) that a second
     // Spark closes. See this file's header.
-    let experts_on_gpu = std::env::var("INK_EXPERTS").map(|v| v == "gpu").unwrap_or(false);
-    println!("  routed experts     : {}", if experts_on_gpu { "device" } else { "host (f32 oracle)" });
+    // One switch per lane, so a regression can be bisected to the lane that
+    // caused it, plus `INK_GPU=all` for the everything-on-device run.
+    let all_gpu = std::env::var("INK_GPU").map(|v| v == "all").unwrap_or(false);
+    let lane = |k: &str| all_gpu || std::env::var(k).map(|v| v == "gpu").unwrap_or(false);
+    let experts_on_gpu = lane("INK_EXPERTS");
+    let attn_on_gpu = lane("INK_ATTN");
+    let mlp_on_gpu = lane("INK_MLP");
+    let head_on_gpu = lane("INK_HEAD");
+    let say = |b: bool| if b { "device" } else { "host (f32 oracle)" };
+    println!("  attention          : {}", say(attn_on_gpu));
+    println!("  shared + dense MLP : {}", say(mlp_on_gpu));
+    println!("  routed experts     : {}", say(experts_on_gpu));
+    println!("  head (unembed)     : {}", say(head_on_gpu));
     if std::env::var("INK_HOST_SUM").map(|v| v == "reverse").unwrap_or(false) {
         println!("  host sum order     : REVERSED (reassociation control)");
     }
@@ -227,7 +266,24 @@ fn main() -> Result<()> {
     #[cfg(feature = "inkling-cuda")]
     let dev = burn::backend::cuda::CudaDevice::default();
     #[cfg(not(feature = "inkling-cuda"))]
-    anyhow::ensure!(!experts_on_gpu, "INK_EXPERTS=gpu needs --features inkling-cuda");
+    anyhow::ensure!(
+        !(experts_on_gpu || attn_on_gpu || mlp_on_gpu || head_on_gpu),
+        "a device lane needs --features inkling-cuda"
+    );
+
+    // The unembed table is 3.3 GB at f32 and does not change between generated
+    // tokens, so it is uploaded ONCE here rather than once per step, and the
+    // host copy is dropped rather than kept alongside it.
+    #[cfg(feature = "inkling-cuda")]
+    let unembed_dev = if head_on_gpu {
+        let v = t.effective_vocab();
+        let d = up2::<Bk>(std::mem::take(&mut unembed), t.vocab_size, h, &dev)
+            .slice([0..v, 0..h]);
+        println!("  unembed uploaded, {v} x {h}");
+        Some(d)
+    } else {
+        None
+    };
 
     let mut top_all: Vec<i64> = Vec::new();
     for step in 0..=gen_steps {
@@ -251,7 +307,11 @@ fn main() -> Result<()> {
     let mask_global = causal_mask(n, None);
     #[allow(unused_assignments)]
     let mut expert_loads = 0usize;
-    let (mut t_attn, mut t_expert, mut t_other) = (0f64, 0f64, 0f64);
+    let (mut t_attn, mut t_expert, mut t_other, mut t_shared) = (0f64, 0f64, 0f64, 0f64);
+    // Reading a tensor out of the mapping and widening BF16 to f32 is host work
+    // no lane can move, so it is counted once, separately, rather than being
+    // smeared across whichever bucket happened to ask for the weight.
+    let t_read = std::cell::Cell::new(0f64);
     // (slice, widen+upload) -- host-side and therefore honestly attributable,
     // unlike anything downstream of an enqueued device call.
     let mut host_t = (0f64, 0f64);
@@ -262,7 +322,12 @@ fn main() -> Result<()> {
         let is_local = kind == AttnKind::Local;
         let (heads, kv_heads, head_dim) = t.heads(kind);
         let p = format!("model.llm.layers.{layer}.");
-        let g = |nm: &str| -> Result<Vec<f32>> { Ok(cp.tensor(&format!("{p}{nm}"))?.data) };
+        let g = |nm: &str| -> Result<Vec<f32>> {
+            let s = Instant::now();
+            let r = cp.tensor(&format!("{p}{nm}"))?.data;
+            t_read.set(t_read.get() + s.elapsed().as_secs_f64());
+            Ok(r)
+        };
 
         // ---- attention ----------------------------------------------------
         let t_a = Instant::now();
@@ -276,24 +341,58 @@ fn main() -> Result<()> {
             rms_eps: t.rms_norm_eps,
             kind,
         };
-        let wq = g("attn.wq_du.weight")?;
-        let wk = g("attn.wk_dv.weight")?;
-        let wv = g("attn.wv_dv.weight")?;
-        let wr = g("attn.wr_du.weight")?;
-        let wo = g("attn.wo_ud.weight")?;
-        let qn = g("attn.q_norm.weight")?;
-        let kn = g("attn.k_norm.weight")?;
-        let ks = g("attn.k_sconv.weight")?;
-        let vs = g("attn.v_sconv.weight")?;
-        let rp = g("attn.rel_logits_proj.proj")?;
-        let aw = AttnWeights {
-            wq: &wq, wk: &wk, wv: &wv, wr: &wr, wo: &wo,
-            k_sconv: &ks, v_sconv: &vs, q_norm: &qn, k_norm: &kn, rel_proj: &rp,
-        };
         let mask = if is_local { &mask_local } else { &mask_global };
-        let a = attention(&hn, &aw, &dims, Some(ls), mask, n);
-        drop((wq, wk, wv, wr, wo));
-        let a = short_conv(&a, &g("attn_sconv.weight")?, n, h, t.sconv_kernel_size);
+        let a = if attn_on_gpu {
+            #[cfg(feature = "inkling-cuda")]
+            {
+                // Both projections and the two short convolutions go over, and
+                // so does the layer-level `attn_sconv` that follows: leaving one
+                // of the five on the host would pay a round trip to save nothing.
+                let w = dev_lane::AttnWeightsDev::<Bk> {
+                    wq: up2(g("attn.wq_du.weight")?, heads * head_dim, h, &dev),
+                    wk: up2(g("attn.wk_dv.weight")?, kv_heads * head_dim, h, &dev),
+                    wv: up2(g("attn.wv_dv.weight")?, kv_heads * head_dim, h, &dev),
+                    wr: up2(g("attn.wr_du.weight")?, heads * t.d_rel, h, &dev),
+                    wo: up2(g("attn.wo_ud.weight")?, h, heads * head_dim, &dev),
+                    k_sconv: up2(g("attn.k_sconv.weight")?, kv_heads * head_dim, t.sconv_kernel_size, &dev),
+                    v_sconv: up2(g("attn.v_sconv.weight")?, kv_heads * head_dim, t.sconv_kernel_size, &dev),
+                    q_norm: up1(g("attn.q_norm.weight")?, head_dim, &dev),
+                    k_norm: up1(g("attn.k_norm.weight")?, head_dim, &dev),
+                    rel_proj: up2(g("attn.rel_logits_proj.proj")?, t.d_rel, t.rel_span(kind), &dev),
+                };
+                let y = dev_lane::attention(
+                    up2(hn.clone(), n, h, &dev),
+                    &w,
+                    &dims,
+                    Some(ls),
+                    up2(mask.clone(), n, n, &dev),
+                );
+                down(dev_lane::short_conv(
+                    y,
+                    up2(g("attn_sconv.weight")?, h, t.sconv_kernel_size, &dev),
+                ))
+            }
+            #[cfg(not(feature = "inkling-cuda"))]
+            unreachable!("guarded at startup")
+        } else {
+            let wq = g("attn.wq_du.weight")?;
+            let wk = g("attn.wk_dv.weight")?;
+            let wv = g("attn.wv_dv.weight")?;
+            let wr = g("attn.wr_du.weight")?;
+            let wo = g("attn.wo_ud.weight")?;
+            let qn = g("attn.q_norm.weight")?;
+            let kn = g("attn.k_norm.weight")?;
+            let ks = g("attn.k_sconv.weight")?;
+            let vs = g("attn.v_sconv.weight")?;
+            let rp = g("attn.rel_logits_proj.proj")?;
+            let aw = AttnWeights {
+                wq: &wq, wk: &wk, wv: &wv, wr: &wr, wo: &wo,
+                k_sconv: &ks, v_sconv: &vs, q_norm: &qn, k_norm: &kn, rel_proj: &rp,
+            };
+            let a = attention(&hn, &aw, &dims, Some(ls), mask, n);
+            drop((wq, wk, wv, wr, wo));
+            short_conv(&a, &g("attn_sconv.weight")?, n, h, t.sconv_kernel_size)
+        };
         for (xi, ai) in x.iter_mut().zip(&a) {
             *xi += ai;
         }
@@ -305,11 +404,34 @@ fn main() -> Result<()> {
         let hn = rms_norm(&x, &mlp_norm, t.rms_norm_eps, n, h);
 
         let y = if t.is_dense(layer) {
-            let fused = g("mlp.w13_dn.weight")?;
-            let (gate, up) = split_gate_up(&fused, h);
-            let down = g("mlp.w2_md.weight")?;
-            let gs = g("mlp.global_scale")?;
-            dense_mlp(&hn, &gate, &up, &down, gs[0], n, h, t.dense_intermediate_size)
+            let di = t.dense_intermediate_size;
+            let gs = g("mlp.global_scale")?[0];
+            if mlp_on_gpu {
+                #[cfg(feature = "inkling-cuda")]
+                {
+                    // The gate/up de-interleave happens on device too: the fused
+                    // dense weight is 134 M elements, and shuffling it in a
+                    // scalar loop costs more than the matmul it feeds.
+                    let fused = up2::<Bk>(g("mlp.w13_dn.weight")?, 2 * di, h, &dev);
+                    let gu = dev_lane::deinterleave_rows_device(fused);
+                    let gate = gu.clone().slice([0..di, 0..h]);
+                    let upw = gu.slice([di..2 * di, 0..h]);
+                    down(dev_lane::dense_mlp(
+                        up2(hn.clone(), n, h, &dev),
+                        gate,
+                        upw,
+                        up2(g("mlp.w2_md.weight")?, h, di, &dev),
+                        gs,
+                    ))
+                }
+                #[cfg(not(feature = "inkling-cuda"))]
+                unreachable!("guarded at startup")
+            } else {
+                let fused = g("mlp.w13_dn.weight")?;
+                let (gate, up) = split_gate_up(&fused, h);
+                let down = g("mlp.w2_md.weight")?;
+                dense_mlp(&hn, &gate, &up, &down, gs, n, h, di)
+            }
         } else {
             let inter = t.intermediate_size;
             let rw = g("mlp.gate.weight")?;
@@ -364,20 +486,42 @@ fn main() -> Result<()> {
             // `routed_experts_gpu` syncs before returning, so this total is real.
             t_expert += t_d.elapsed().as_secs_f64();
 
-            let sfused = cp.tensor(&format!("{p}mlp.shared_experts.shared_w13_weight"))?.data;
-            let per = sfused.len() / t.n_shared_experts;
-            let mut sg = Vec::with_capacity(sfused.len() / 2);
-            let mut su = Vec::with_capacity(sfused.len() / 2);
-            for s in 0..t.n_shared_experts {
-                let blk = &sfused[s * per..(s + 1) * per];
-                let (a, b) = mary::models::inkling::load::deinterleave_rows(blk, 2 * inter, h);
-                sg.extend_from_slice(&a);
-                su.extend_from_slice(&b);
-            }
-            drop(sfused);
-            let sd = cp.tensor(&format!("{p}mlp.shared_experts.shared_w2_weight"))?.data;
+            let ns = t.n_shared_experts;
             let gammas: Vec<f32> = routing.iter().flat_map(|r| r.shared_gammas.clone()).collect();
-            let sh = shared_experts(&hn, &sg, &su, &sd, &gammas, t.n_shared_experts, n, h, inter);
+            let t_s = Instant::now();
+            let sh = if mlp_on_gpu {
+                #[cfg(feature = "inkling-cuda")]
+                {
+                    let sfused = g("mlp.shared_experts.shared_w13_weight")?;
+                    let (sg, su) = dev_lane::split_shared_fused(
+                        up2::<Bk>(sfused, ns * 2 * inter, h, &dev), ns);
+                    down(dev_lane::shared_experts(
+                        up2(hn.clone(), n, h, &dev),
+                        sg,
+                        su,
+                        up2(g("mlp.shared_experts.shared_w2_weight")?, ns * h, inter, &dev),
+                        up2(gammas, n, ns, &dev),
+                        ns,
+                    ))
+                }
+                #[cfg(not(feature = "inkling-cuda"))]
+                unreachable!("guarded at startup")
+            } else {
+                let sfused = g("mlp.shared_experts.shared_w13_weight")?;
+                let per = sfused.len() / ns;
+                let mut sg = Vec::with_capacity(sfused.len() / 2);
+                let mut su = Vec::with_capacity(sfused.len() / 2);
+                for s in 0..ns {
+                    let blk = &sfused[s * per..(s + 1) * per];
+                    let (a, b) = mary::models::inkling::load::deinterleave_rows(blk, 2 * inter, h);
+                    sg.extend_from_slice(&a);
+                    su.extend_from_slice(&b);
+                }
+                drop(sfused);
+                let sd = g("mlp.shared_experts.shared_w2_weight")?;
+                shared_experts(&hn, &sg, &su, &sd, &gammas, ns, n, h, inter)
+            };
+            t_shared += t_s.elapsed().as_secs_f64();
             acc.iter().zip(&sh).map(|(a, b)| a + b).collect()
         };
 
@@ -400,23 +544,52 @@ fn main() -> Result<()> {
     }
 
     // ---- head --------------------------------------------------------------
-    let logits = head(
-        &x, &fnorm, &unembed,
-        t.logits_mup_width_multiplier as f32,
-        t.vocab_size, t.effective_vocab(), t.rms_norm_eps, n, h,
-    );
     let v = t.effective_vocab();
+    let t_h = Instant::now();
+    let logits = if head_on_gpu {
+        #[cfg(feature = "inkling-cuda")]
+        {
+            // 109 x 4096 x 200058 is 89 G multiply-adds — the single largest
+            // matmul in the forward, and the one left standing once attention
+            // and the MLPs move. The muP divisor divides BEFORE the projection,
+            // matching the reference: doing it after is algebraically equal and
+            // numerically not.
+            let hs = dev_lane::rms_norm(
+                up2::<Bk>(x.clone(), n, h, &dev),
+                up1(fnorm.clone(), h, &dev),
+                t.rms_norm_eps,
+            )
+            .div_scalar(t.logits_mup_width_multiplier as f32);
+            down(dev_lane::linear(
+                hs,
+                unembed_dev.clone().expect("uploaded when head_on_gpu"),
+            ))
+        }
+        #[cfg(not(feature = "inkling-cuda"))]
+        unreachable!("guarded at startup")
+    } else {
+        head(
+            &x, &fnorm, &unembed,
+            t.logits_mup_width_multiplier as f32,
+            t.vocab_size, t.effective_vocab(), t.rms_norm_eps, n, h,
+        )
+    };
+    let t_head = t_h.elapsed().as_secs_f64();
 
     println!("\n=== predictions ===");
     println!("  expert slabs decoded: {expert_loads}");
     // t_other covers the whole MLP half, so the expert buckets are inside it.
     println!("  where the time went, seconds:");
-    println!("    attention half      {t_attn:8.1}");
+    println!("    attention half      {t_attn:8.1}   ({})", if attn_on_gpu { "device" } else { "host" });
     println!("    mlp half            {t_other:8.1}   of which:");
     println!("      routed experts    {t_expert:8.1}   ({})",
              if experts_on_gpu { "slice + upload + dequant + matmul, device" }
              else { "disk + NVFP4 unpack + matmul, host" });
-    println!("      shared + dense    {:8.1}", t_other - t_expert);
+    println!("      shared experts    {t_shared:8.1}   ({})", if mlp_on_gpu { "device" } else { "host" });
+    println!("      rest of the half  {:8.1}   (routing, dense layers, sconv, norms)",
+             t_other - t_expert - t_shared);
+    println!("    head / unembed      {t_head:8.1}   ({})", if head_on_gpu { "device" } else { "host" });
+    println!("    of the above, host-only tensor reads (mmap + BF16 widening): {:8.1}", t_read.get());
     if experts_on_gpu {
         println!("    of the routed-expert total, the host-synchronous parts:");
         println!("      slice from mmap   {:8.1}", host_t.0);
