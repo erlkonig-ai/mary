@@ -575,6 +575,10 @@ fn main() -> Result<()> {
     let experts_fp4 = ink_experts == "fp4";
     let experts_on_gpu = all_gpu || ink_experts == "gpu" || experts_fp4;
     let attn_on_gpu = lane("INK_ATTN");
+    // `INK_RESIDENT` reads the same on both lanes -- hold a weight instead of
+    // re-reading it every token -- and differs only in WHERE, because a device
+    // lane never reads the host copy again. Off, attention streams as before.
+    let attn_resident = cp.resident_on();
     // Two names for the shared+dense MLP lane, and they are NOT the same
     // implementation: INK_DENSE=gpu uploads those weights ONCE and keeps them
     // (spark1's device residency), INK_MLP=gpu / INK_GPU=all re-uploads per
@@ -639,6 +643,16 @@ fn main() -> Result<()> {
          use INK_DENSE=gpu (device-resident, honours it) or the host lane"
     );
     println!(
+        "  attention weights  : {}",
+        if attn_on_gpu && attn_resident {
+            "DEVICE-RESIDENT -- read, widened and uploaded once, then held"
+        } else if attn_on_gpu {
+            "streamed -- re-read, re-widened and re-uploaded every token"
+        } else {
+            "host"
+        }
+    );
+    println!(
         "  shared w13 split   : {}",
         if shared_halved { "HALVED (contiguous)" } else { "INTERLEAVED" }
     );
@@ -646,6 +660,26 @@ fn main() -> Result<()> {
     let dev = burn::backend::cuda::CudaDevice::default();
     #[cfg(feature = "inkling-cuda")]
     let mut ddense = if dense_gpu { Some(DeviceDense::default()) } else { None };
+    // Every attention layer's projections, on the device, for the whole run.
+    //
+    // Attention was the last lane that still STREAMED, and it streamed because
+    // of a reading of `INK_RESIDENT` that stopped one step short: the host copy
+    // is indeed worthless after the upload, so the lane declined to hold it --
+    // and then held nothing at all, and paid the read, the widen AND the
+    // transfer again on every token. Measured on the pile, decode step, 42
+    // layers: 2.2 s widening 6.9 GiB of BF16 into f32 and 6.0 s pushing it
+    // across, against 0.2 s of attention. The weights do not change between
+    // tokens; only where they are held was ever in question, and on a device
+    // lane the answer is the device.
+    //
+    // Keyed by the layer prefix, exactly as [`DeviceDense`] is, and populated
+    // on first use rather than eagerly: a lane that is never taken should not
+    // pay for the upload.
+    #[cfg(feature = "inkling-cuda")]
+    let mut dattn: std::collections::BTreeMap<String, (dev_lane::AttnWeightsDev<Bk>, T2)> =
+        std::collections::BTreeMap::new();
+    #[cfg(feature = "inkling-cuda")]
+    let mut dattn_bytes = 0u64;
     // Checked by running it, on the first MoE layer of the first pass: the two
     // lanes are two transcriptions of the same arithmetic and a gate that is
     // never run is not a gate.
@@ -754,6 +788,12 @@ fn main() -> Result<()> {
     #[allow(unused_assignments)]
     let mut expert_loads = 0usize;
     let (mut t_attn, mut t_expert, mut t_other, mut t_shared) = (0f64, 0f64, 0f64, 0f64);
+    // The attention half at its two host-side seams: reading+widening the ten
+    // projections out of the source, and getting them onto the device. What is
+    // left over is device work. The sync after the uploads is what makes the
+    // second number a TRANSFER rather than an enqueue.
+    #[allow(unused_mut)]
+    let (mut t_attn_read, mut t_attn_up) = (0f64, 0f64);
     // Reading a tensor out of the mapping and widening BF16 to f32 is host work
     // no lane can move, so it is counted once, separately, rather than being
     // smeared across whichever bucket happened to ask for the weight.
@@ -811,20 +851,53 @@ fn main() -> Result<()> {
                 // Both projections and the two short convolutions go over, and
                 // so does the layer-level `attn_sconv` that follows: leaving one
                 // of the five on the host would pay a round trip to save nothing.
-                let w = dev_lane::AttnWeightsDev::<Bk> {
-                    wq: up2(gv("attn.wq_du.weight")?, heads * head_dim, h, &dev),
-                    wk: up2(gv("attn.wk_dv.weight")?, kv_heads * head_dim, h, &dev),
-                    wv: up2(gv("attn.wv_dv.weight")?, kv_heads * head_dim, h, &dev),
-                    wr: up2(gv("attn.wr_du.weight")?, heads * t.d_rel, h, &dev),
-                    wo: up2(gv("attn.wo_ud.weight")?, h, heads * head_dim, &dev),
-                    k_sconv: up2(gv("attn.k_sconv.weight")?, kv_heads * head_dim, t.sconv_kernel_size, &dev),
-                    v_sconv: up2(gv("attn.v_sconv.weight")?, kv_heads * head_dim, t.sconv_kernel_size, &dev),
-                    q_norm: up1(gv("attn.q_norm.weight")?, head_dim, &dev),
-                    k_norm: up1(gv("attn.k_norm.weight")?, head_dim, &dev),
-                    rel_proj: up2(gv("attn.rel_logits_proj.proj")?, t.d_rel, t.rel_span(kind), &dev),
+                //
+                // Built on the FIRST token that reaches this layer and then held
+                // (see `dattn`). The timers therefore measure a first-token cost
+                // under residency and a per-token cost without it, which is the
+                // difference the flag names. The sync is what makes the second
+                // one a transfer rather than an enqueue.
+                if !dattn.contains_key(&p) {
+                    let r0 = t_read.get();
+                    let t_w0 = Instant::now();
+                    let built = dev_lane::AttnWeightsDev::<Bk> {
+                        wq: up2(gv("attn.wq_du.weight")?, heads * head_dim, h, &dev),
+                        wk: up2(gv("attn.wk_dv.weight")?, kv_heads * head_dim, h, &dev),
+                        wv: up2(gv("attn.wv_dv.weight")?, kv_heads * head_dim, h, &dev),
+                        wr: up2(gv("attn.wr_du.weight")?, heads * t.d_rel, h, &dev),
+                        wo: up2(gv("attn.wo_ud.weight")?, h, heads * head_dim, &dev),
+                        k_sconv: up2(gv("attn.k_sconv.weight")?, kv_heads * head_dim, t.sconv_kernel_size, &dev),
+                        v_sconv: up2(gv("attn.v_sconv.weight")?, kv_heads * head_dim, t.sconv_kernel_size, &dev),
+                        q_norm: up1(gv("attn.q_norm.weight")?, head_dim, &dev),
+                        k_norm: up1(gv("attn.k_norm.weight")?, head_dim, &dev),
+                        rel_proj: up2(gv("attn.rel_logits_proj.proj")?, t.d_rel, t.rel_span(kind), &dev),
+                    };
+                    let sconv = up2(gv("attn_sconv.weight")?, h, t.sconv_kernel_size, &dev);
+                    <Bk as burn::tensor::backend::Backend>::sync(&dev)
+                        .expect("sync after the attention uploads");
+                    let span = t_w0.elapsed().as_secs_f64();
+                    let rd = t_read.get() - r0;
+                    t_attn_read += rd;
+                    t_attn_up += span - rd;
+                    if attn_resident {
+                        dattn_bytes += 4 * (heads * head_dim * h
+                            + 2 * kv_heads * head_dim * h
+                            + heads * t.d_rel * h
+                            + h * heads * head_dim
+                            + 2 * kv_heads * head_dim * t.sconv_kernel_size
+                            + 2 * head_dim
+                            + t.d_rel * t.rel_span(kind)
+                            + h * t.sconv_kernel_size) as u64;
+                    }
+                    dattn.insert(p.clone(), (built, sconv));
+                }
+                let (w, sconv_w) = {
+                    let e = dattn.get(&p).expect("inserted directly above");
+                    // The projections are BORROWED for the call; only the layer
+                    // sconv is cloned, and a Burn clone is a handle, not 3.3 MB.
+                    (&e.0, e.1.clone())
                 };
-                let sconv_w = up2(gv("attn_sconv.weight")?, h, t.sconv_kernel_size, &dev);
-                if kv && step > 0 {
+                let out = if kv && step > 0 {
                     let y = dev_lane::attention_step(
                         up2(hn.clone(), n, h, &dev),
                         &w,
@@ -863,7 +936,15 @@ fn main() -> Result<()> {
                         up2(mask.clone(), n, n, &dev),
                     );
                     down(dev_lane::short_conv(y, sconv_w))
+                };
+                // Residency off means hold NOTHING, not hold everything: the
+                // streaming lane is what a box too small for the working set
+                // runs, and a map that grew to all 42 layers regardless would
+                // have quietly removed that option.
+                if !attn_resident {
+                    dattn.remove(&p);
                 }
+                out
             }
             #[cfg(not(feature = "inkling-cuda"))]
             unreachable!("guarded at startup")
@@ -1167,6 +1248,13 @@ fn main() -> Result<()> {
     // t_other covers the whole MLP half, so the expert buckets are inside it.
     println!("  where the time went, seconds:");
     println!("    attention half      {t_attn:8.1}   ({})", if attn_on_gpu { "device" } else { "host" });
+    #[cfg(feature = "inkling-cuda")]
+    if attn_on_gpu {
+        println!("      read + widen      {t_attn_read:8.1}   (host: slice the mapping, BF16 -> f32)");
+        println!("      upload            {t_attn_up:8.1}   (host -> device, synced)");
+        println!("      device            {:8.1}   (projections, scores, sconv)",
+                 t_attn - t_attn_read - t_attn_up);
+    }
     println!("    mlp half            {t_other:8.1}   of which:");
     println!("      routed experts    {t_expert:8.1}   ({})",
              if experts_on_gpu { "slice + upload + dequant + matmul, device" }
@@ -1204,6 +1292,14 @@ fn main() -> Result<()> {
             dd.bytes as f64 / GIB,
             dd.shared.len(),
             dd.dense.len()
+        );
+    }
+    #[cfg(feature = "inkling-cuda")]
+    if attn_resident && attn_on_gpu {
+        println!(
+            "    device-resident     {:8.2} GiB in {} attention layers",
+            dattn_bytes as f64 / GIB,
+            dattn.len()
         );
     }
     if std::env::var("INK_IOSTATS").is_ok() {
