@@ -752,13 +752,16 @@ fn main() -> Result<()> {
     // re-reading it every token -- and differs only in WHERE, because a device
     // lane never reads the host copy again. Off, attention streams as before.
     let attn_resident = cp.resident_on();
-    // Two names for the shared+dense MLP lane, and they are NOT the same
-    // implementation: INK_DENSE=gpu uploads those weights ONCE and keeps them
-    // (spark1's device residency), INK_MLP=gpu / INK_GPU=all re-uploads per
-    // layer per token but de-interleaves on the device (spark2's). Resident
-    // wins where both are asked for; the banner says which one ran.
-    let dense_gpu = std::env::var("INK_DENSE").map(|v| v == "gpu").unwrap_or(false);
-    let mlp_on_gpu = lane("INK_MLP") || dense_gpu;
+    // The shared+dense MLP lane. There used to be two implementations here --
+    // this one, which uploads the weights ONCE and holds them, and an
+    // `INK_MLP=gpu` lane that re-uploaded them per layer per token and
+    // de-interleaved on the device. They computed the same thing and the
+    // per-token one lost on every axis: slower (it paid the upload 42 times a
+    // token), and it could not express INK_SHARED_W13_HALVED at all, so the
+    // control was silently ignored on exactly one of four lanes. Deleted rather
+    // than left as an option, because a lane nobody selects is a lane nobody
+    // tests. `INK_GPU=all` now reaches the resident one.
+    let dense_gpu = all_gpu || std::env::var("INK_DENSE").map(|v| v == "gpu").unwrap_or(false);
     let head_on_gpu = lane("INK_HEAD");
     // The KV cache. Off by default so the uncached lane stays available as the
     // thing to check against: the decisive test of a cache is that it produces
@@ -777,8 +780,6 @@ fn main() -> Result<()> {
         "  shared + dense MLP : {}",
         if dense_gpu {
             "DEVICE-RESIDENT -- uploaded once, matmul on the GPU"
-        } else if mlp_on_gpu {
-            "device -- uploaded per layer per token"
         } else {
             "host f32 (the reference lane)"
         }
@@ -804,17 +805,11 @@ fn main() -> Result<()> {
     }
     // The SHARED experts' w13 is square, so nothing but a forward can tell the
     // two readings apart. INK_SHARED_W13_HALVED=1 selects the other one.
+    // Every surviving lane honours it, so the guard that used to sit here --
+    // refusing the run because the per-token device lane hard-coded the
+    // INTERLEAVED reading and would have ignored the control silently -- went
+    // with that lane.
     let shared_halved = mary::models::inkling::load::shared_w13_halved();
-    // `split_shared_fused` (the per-token device lane) hard-codes the
-    // INTERLEAVED reading -- which is the settled one, so the default is right,
-    // but it cannot express the control. Refuse rather than run the mutation on
-    // three lanes and silently not on the fourth: a control that is quietly
-    // ignored on one lane reads as "the mutation made no difference there".
-    anyhow::ensure!(
-        !(shared_halved && lane("INK_MLP") && !std::env::var("INK_DENSE").map(|v| v == "gpu").unwrap_or(false)),
-        "INK_SHARED_W13_HALVED=1 does not reach the INK_MLP=gpu shared-expert lane; \
-         use INK_DENSE=gpu (device-resident, honours it) or the host lane"
-    );
     println!(
         "  attention weights  : {}",
         if attn_on_gpu && attn_resident {
@@ -889,7 +884,7 @@ fn main() -> Result<()> {
     };
     #[cfg(not(feature = "inkling-cuda"))]
     anyhow::ensure!(
-        !(experts_on_gpu || attn_on_gpu || mlp_on_gpu || head_on_gpu),
+        !(experts_on_gpu || attn_on_gpu || dense_gpu || head_on_gpu),
         "a device lane needs --features inkling-cuda"
     );
 
@@ -1224,9 +1219,8 @@ fn main() -> Result<()> {
             };
             #[cfg(feature = "inkling-cuda")]
             {
-                // Device-RESIDENT first (INK_DENSE=gpu): uploaded once for the
-                // whole run. Then the per-token device lane (INK_MLP=gpu), which
-                // de-interleaves on the device. Then the host reference.
+                // Device-RESIDENT (INK_DENSE=gpu, or INK_GPU=all): uploaded once
+                // for the whole run. Otherwise the host reference.
                 if let Some(dd) = ddense.as_mut() {
                     let (dg, du, ddn, dsc) = dd.dense_for(&cp, &p, h, &dev)?;
                     let xd: T2 = burn::tensor::Tensor::from_data(
@@ -1234,22 +1228,6 @@ fn main() -> Result<()> {
                     let yd = mary::models::inkling::burn::dense_mlp(
                         xd, dg.clone(), du.clone(), ddn.clone(), *dsc);
                     yd.into_data().convert::<f32>().to_vec::<f32>().expect("dense mlp to host")
-                } else if mlp_on_gpu {
-                    let gs = gv("mlp.global_scale")?[0];
-                    // The gate/up de-interleave happens on device too: the fused
-                    // dense weight is 134 M elements, and shuffling it in a
-                    // scalar loop costs more than the matmul it feeds.
-                    let fused = up2::<Bk>(gv("mlp.w13_dn.weight")?, 2 * di, h, &dev);
-                    let gu = dev_lane::deinterleave_rows_device(fused);
-                    let gate = gu.clone().slice([0..di, 0..h]);
-                    let upw = gu.slice([di..2 * di, 0..h]);
-                    down(dev_lane::dense_mlp(
-                        up2(hn.clone(), n, h, &dev),
-                        gate,
-                        upw,
-                        up2(gv("mlp.w2_md.weight")?, h, di, &dev),
-                        gs,
-                    ))
                 } else {
                     host_dense(&hn)?
                 }
@@ -1370,18 +1348,6 @@ fn main() -> Result<()> {
                     );
                 }
                 dsh
-            } else if mlp_on_gpu {
-                let sfused = gv("mlp.shared_experts.shared_w13_weight")?;
-                let (sg, su) = dev_lane::split_shared_fused(
-                    up2::<Bk>(sfused, ns * 2 * inter, h, &dev), ns);
-                down(dev_lane::shared_experts(
-                    up2(hn.clone(), n, h, &dev),
-                    sg,
-                    su,
-                    up2(gv("mlp.shared_experts.shared_w2_weight")?, ns * h, inter, &dev),
-                    up2(gammas.clone(), n, ns, &dev),
-                    ns,
-                ))
             } else {
                 host_shared(&hn)?
             };
@@ -1524,7 +1490,7 @@ fn main() -> Result<()> {
     println!("      routed experts    {t_expert:8.1}   ({})",
              if experts_on_gpu { "slice + upload + dequant + matmul, device" }
              else { "disk + NVFP4 unpack + matmul, host" });
-    println!("      shared experts    {t_shared:8.1}   ({})", if mlp_on_gpu { "device" } else { "host" });
+    println!("      shared experts    {t_shared:8.1}   ({})", if dense_gpu { "device" } else { "host" });
     println!("      rest of the half  {:8.1}   (routing, dense layers, sconv, norms)",
              t_other - t_expert - t_shared);
     println!(
