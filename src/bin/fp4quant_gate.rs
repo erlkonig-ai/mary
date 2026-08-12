@@ -19,6 +19,15 @@
 //! a mismatch can be attributed rather than papered over. It does not loosen
 //! the gate.
 //!
+//! ## Bit-identity is not the whole claim
+//!
+//! Two lanes agreeing bitwise says they implement the same recipe. It does not
+//! say the recipe puts the block scale at the right *magnitude* — a scale
+//! uniformly 1.5x or 3x too large would be reproduced bit-for-bit by both. So
+//! the gate also checks the invariant that pins the magnitude directly: a
+//! correct block scale puts the block's own maximum on the top E2M1 code. See
+//! [`peak_code_check`] for the arithmetic and for the three cases it splits on.
+//!
 //! ## The input is real, and deliberately in two shapes
 //!
 //! Both cases are the same real bytes: `model.llm.layers.10.mlp.experts.w13_weight`,
@@ -334,6 +343,203 @@ fn nibble(codes: &[u32], i: usize) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// The block-scale invariant.
+// ---------------------------------------------------------------------------
+
+/// What the peak-code check found, per block.
+struct PeakCheck {
+    /// How many blocks peaked at each E2M1 magnitude code 0..=7.
+    hist: [usize; 8],
+    /// Blocks whose scale byte is a NORMAL E4M3 value (exponent != 0).
+    normal: usize,
+    /// Blocks whose scale byte is an E4M3 SUBNORMAL (exponent == 0, byte != 0).
+    subnormal: usize,
+    /// Blocks whose scale byte is exactly zero.
+    zero_scale: usize,
+    violations: usize,
+    first: Option<String>,
+}
+
+/// THE BLOCK-SCALE INVARIANT: a correct block scale puts the block's **own
+/// maximum** on the top E2M1 code.
+///
+/// `scale = amax/6` maps the largest element to exactly 6.0, i.e. code 7, and
+/// nothing but the E4M3 rounding of the scale can move it off. That makes the
+/// peak code a *direct* readout of whether the scale has the right magnitude,
+/// which no aggregate error number gives: a scale 1.5x too large peaks at code
+/// 6 (4.0) and a scale 3x too large peaks at code 4 (2.0), while the mean
+/// relative error moves by a few percent and looks like ordinary 4-bit noise.
+///
+/// The bound is arithmetic, not empirical, and it splits three ways on the
+/// scale byte the kernel emitted:
+///
+/// * **normal** (exponent != 0) — round-to-nearest over E4M3's 3 mantissa bits
+///   moves the scale by at most a factor 1.0667 (the widest case is a value
+///   just past the midpoint at the bottom of a binade, and the subnormal-to-
+///   normal step is no worse), so `amax/s >= 6/1.0667 = 5.63`, which is above
+///   the code-7 threshold of 5.0. **Peak MUST be 7.** The 448 clamp only makes
+///   `amax/s` larger. This is the case that holds for every block of real
+///   Inkling data, so this is a live assertion and not a formality.
+/// * **subnormal** (exponent == 0, byte != 0) — the subnormal ladder is
+///   `m * 2^-9`, whose steps are up to a factor 2 apart (`m = 1`), so the scale
+///   can round up by 2x and `amax/s >= 3.0`. **Peak MUST be >= 5.**
+/// * **zero** — the codes are all zero by construction, and that is only
+///   legitimate when `amax/6` was at or below half the smallest subnormal:
+///   **`amax <= 3 * 2^-9`**.
+///
+/// Note this is about the quantizer's OWN output. It is not the same question
+/// as "does a block of the checkpoint's stored weights reach code 7" — most do
+/// not, precisely because their scale was chosen against a different (whole
+/// tensor) normalisation. See `check_layout_against_checkpoint`.
+fn peak_code_check(x: &[f32], codes: &[u32], scales: &[u8], blocks: usize) -> PeakCheck {
+    /// `3 * 2^-9` — the largest `amax` whose `amax/6` rounds to a zero E4M3.
+    const ZERO_SCALE_AMAX: f32 = 3.0 * (1.0 / 512.0);
+
+    let mut c = PeakCheck {
+        hist: [0; 8],
+        normal: 0,
+        subnormal: 0,
+        zero_scale: 0,
+        violations: 0,
+        first: None,
+    };
+
+    for b in 0..blocks {
+        let mut peak = 0u32;
+        let mut amax = 0.0f32;
+        for i in 0..GROUP {
+            let g = b * GROUP + i;
+            let m = nibble(codes, g) & 0x7;
+            if m > peak {
+                peak = m;
+            }
+            let a = x[g].abs();
+            if a > amax {
+                amax = a;
+            }
+        }
+        c.hist[peak as usize] += 1;
+
+        let byte = scales[b];
+        let (kind, want) = if byte == 0 {
+            c.zero_scale += 1;
+            ("zero-scale", if peak == 0 && amax <= ZERO_SCALE_AMAX { None } else { Some("peak 0 and amax <= 3*2^-9") })
+        } else if (byte >> 3) & 0x0F == 0 {
+            c.subnormal += 1;
+            ("subnormal-scale", if peak >= 5 { None } else { Some("peak >= 5") })
+        } else {
+            c.normal += 1;
+            ("normal-scale", if peak == 7 { None } else { Some("peak == 7") })
+        };
+        if let Some(want) = want {
+            c.violations += 1;
+            if c.first.is_none() {
+                c.first = Some(format!(
+                    "block {b}: {kind} 0x{byte:02X} ({:e}), amax {amax:e}, peak code {peak} \
+                     (value {}) — expected {want}",
+                    e4m3_to_f32(byte),
+                    FP4_E2M1[peak as usize]
+                ));
+            }
+        }
+    }
+    c
+}
+
+/// Print the peak-code distribution and say whether the invariant holds.
+fn report_peak_check(c: &PeakCheck, blocks: usize) -> bool {
+    println!(
+        "  block-scale invariant — peak E2M1 code per 16-element block \
+         ({} normal-scale, {} subnormal-scale, {} zero-scale):",
+        c.normal, c.subnormal, c.zero_scale
+    );
+    for (code, n) in c.hist.iter().enumerate() {
+        if *n > 0 {
+            println!(
+                "      peak code {code} (value {:>3}) : {n:>6}  {:>6.2}%",
+                FP4_E2M1[code],
+                100.0 * *n as f64 / blocks as f64
+            );
+        }
+    }
+    if let Some(f) = &c.first {
+        println!("    first violation: {f}");
+    }
+    let ok = c.violations == 0;
+    println!(
+        "    -> {}",
+        if ok {
+            "HOLDS: every block's own maximum lands on the top code its scale allows"
+        } else {
+            "VIOLATED: the block scale is the wrong magnitude"
+        }
+    );
+    ok
+}
+
+/// The control that makes the invariant a measurement: quantize the same real
+/// data with a block scale deliberately **3x too large** and require the check
+/// to say so.
+///
+/// A gate that cannot fail and a gate that has never failed look identical from
+/// outside, and this particular check needs the distinction more than most: a
+/// uniformly mis-scaled quantizer is reproduced bit-for-bit by any host
+/// reference implementing the same wrong recipe, so the bitwise comparison
+/// above would still pass, and its mean relative error moves by a few percent
+/// and reads as ordinary 4-bit noise. The peak code is the thing that moves
+/// unmistakably — and this prints what that looks like: with `amax/2` in place
+/// of `amax/6`, the peak lands on code 4 (2.0) instead of 7 (6.0).
+fn mutant_check(x: &[f32], ladder: &[f64]) -> bool {
+    let blocks = x.len() / GROUP;
+    let mut codes = vec![0u32; x.len() / 8];
+    let mut scales = vec![0u8; blocks];
+    for b in 0..blocks {
+        let base = b * GROUP;
+        let mut amax = 0.0f64;
+        for i in 0..GROUP {
+            let a = (x[base + i] as f64).abs();
+            if a > amax {
+                amax = a;
+            }
+        }
+        // THE MUTATION, and the only line that differs from `host_quantize`.
+        let byte = e4m3_encode(3.0 * amax / FP4_MAX as f64, ladder);
+        scales[b] = byte;
+        let s = e4m3_to_f32(byte) as f64;
+        for i in 0..GROUP {
+            let v = x[base + i] as f64;
+            let mut m = 0u32;
+            if s > 0.0 {
+                let a = (v / s).abs();
+                for (j, &thr) in E2M1_MIDPOINTS.iter().enumerate() {
+                    if a >= thr {
+                        m = j as u32 + 1;
+                    }
+                }
+                if v < 0.0 {
+                    m += 8;
+                }
+            }
+            let g = base + i;
+            codes[g / 8] |= m << (4 * (g % 8));
+        }
+    }
+
+    println!("\n=== mutation control — the same data quantized with a 3x-too-large block scale ===");
+    let flagged = !report_peak_check(&peak_code_check(x, &codes, &scales, blocks), blocks);
+    println!(
+        "  -> {}",
+        if flagged {
+            "the invariant REJECTS a knowingly mis-scaled quantizer, so the HOLDS above is a \
+             measurement and not a tautology"
+        } else {
+            "BROKEN: the invariant accepted a knowingly mis-scaled quantizer"
+        }
+    );
+    flagged
+}
+
+// ---------------------------------------------------------------------------
 
 struct Verdict {
     ok: bool,
@@ -462,9 +668,19 @@ fn run_case(
         host.zero_scale_blocks
     );
 
-    let ok = scale_diff.is_empty() && code_diff.is_empty();
-    println!("  -> device vs host reference: {}", if ok { "bit-identical" } else { "MISMATCH" });
-    Verdict { ok, dev_code_bytes, dev_scales }
+    // --- the block-scale invariant, on the DEVICE output -----------------
+    // Bit-identity to the host reference says the two lanes agree; it says
+    // nothing about whether the recipe they agree on puts the scale at the
+    // right magnitude. That is a separate claim and it gets a separate check.
+    let peak = peak_code_check(x, &dev_codes, &dev_scales, blocks);
+    let peak_ok = report_peak_check(&peak, blocks);
+
+    let bitwise = scale_diff.is_empty() && code_diff.is_empty();
+    println!(
+        "  -> device vs host reference: {}",
+        if bitwise { "bit-identical" } else { "MISMATCH" }
+    );
+    Verdict { ok: bitwise && peak_ok, dev_code_bytes, dev_scales }
 }
 
 /// Bitwise host-vs-device over a range of shapes, on slices of the same real
@@ -507,12 +723,19 @@ fn sweep(
 
         let host = host_quantize(x, ladder);
         let same = dev_codes == &host.codes[..] && dev_scales == &host.scales[..];
-        ok &= same;
+        // The invariant is per-block, so it must survive every launch geometry
+        // too — a tail thread that read the wrong block would show up here as a
+        // peak code that is not 7 long before it showed up as a wrong norm.
+        let peak = peak_code_check(x, dev_codes, dev_scales, blocks);
+        ok &= same && peak.violations == 0;
         println!(
-            "  [{rows:>2}, {k:>4}] = {blocks:>4} blocks ({:>2} cube(s), tail {:>3}): {}",
+            "  [{rows:>2}, {k:>4}] = {blocks:>4} blocks ({:>2} cube(s), tail {:>3}): {}, \
+             {} of {blocks} blocks peak at code 7{}",
             blocks.div_ceil(256),
             blocks % 256,
-            if same { "bit-identical" } else { "MISMATCH" }
+            if same { "bit-identical" } else { "MISMATCH" },
+            peak.hist[7],
+            if peak.violations == 0 { "" } else { " — INVARIANT VIOLATED" }
         );
     }
     ok
@@ -581,9 +804,16 @@ fn check_layout_against_checkpoint(w: &[Row], rows: usize, k: usize, v: &Verdict
 
     println!(
         "\n=== packed-layout identity vs the checkpoint's own bytes ===\n  \
-         {checked} full-range blocks compared ({skipped_range} skipped: largest code < 6, the \
-         quantizer rescales those; {skipped_negzero} skipped: contain the 0x8 negative-zero code)\n  \
-         packed 8-byte groups differing: {byte_mismatch}   scale bytes differing: {scale_mismatch}"
+         {checked} of {} blocks qualified and were compared.\n  \
+         skipped {skipped_range}: the CHECKPOINT's stored codes in that block do not reach ±6 \
+         (a fact about the stored weights, whose scale was chosen against a whole tensor, NOT \
+         about this quantizer's output — the quantizer rescales such a block so that its own \
+         peak is code 7, which is exactly why the bytes cannot match and why the block is \
+         excluded here; the peak-code distribution of the quantizer's own output is the \
+         `block-scale invariant` line in each case above).\n  \
+         skipped {skipped_negzero}: contain the 0x8 negative-zero code.\n  \
+         packed 8-byte groups differing: {byte_mismatch}   scale bytes differing: {scale_mismatch}",
+        checked + skipped_range + skipped_negzero
     );
     if let Some(f) = first {
         println!("    first: {f}");
@@ -691,16 +921,19 @@ fn main() -> Result<()> {
     ok &= layout.ok;
     ok &= check_layout_against_checkpoint(&w, ROWS, K, &layout);
     ok &= sweep(&mixed, &ladder, &client);
+    ok &= mutant_check(&aligned, &ladder);
 
     if !ok {
         println!(
-            "\nFAIL — the device NVFP4 activation quantizer is not bit-identical to the host reference"
+            "\nFAIL — the device NVFP4 activation quantizer is not bit-identical to the host \
+             reference, or its block scale is the wrong magnitude"
         );
         std::process::exit(1);
     }
     println!(
         "\nPASS — quantize_nvfp4 reproduces the host f64 reference bit-for-bit (codes and E4M3 \
-         scale bytes) on real Inkling data, in both block alignments"
+         scale bytes) on real Inkling data, in both block alignments, and every block's own \
+         maximum lands on the top E2M1 code"
     );
     Ok(())
 }
