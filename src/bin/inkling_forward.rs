@@ -73,6 +73,8 @@ use mary::models::inkling::config::{AttnKind, InklingConfig};
 use mary::models::inkling::load::{deinterleave_fused, split_gate_up, Held, Loaded};
 use mary::models::inkling::source::Weights;
 use mary::models::inkling::mlp::{dense_mlp, shared_experts};
+use mary::models::inkling::mtp::{mtp_block, Concat as MtpConcat, MtpHead};
+use mary::models::inkling::layer::{LayerMlp, LayerWeights};
 use mary::models::inkling::stack::{embed_and_norm, head};
 
 /// One gibibyte, as the divisor every byte count here is printed against.
@@ -288,6 +290,75 @@ struct DeviceDense {
     shared: std::collections::BTreeMap<String, SharedOnDevice>,
     dense: std::collections::BTreeMap<String, (T2, T2, T2, f32)>,
     bytes: u64,
+}
+
+/// One MTP head's weights, OWNED, so the borrowed [`MtpHead`] handed to
+/// `mtp_block` can be rebuilt per draft without re-reading anything.
+///
+/// The split exists because `MtpHead` borrows and the loop needs the owner to
+/// outlive every borrow. `gate`/`up` are materialised rather than held because
+/// `split_gate_up` de-interleaves the fused matrix into two, and doing that once
+/// per head at load beats doing it once per draft.
+struct MtpOwned {
+    embed_norm: Held,
+    hidden_norm: Held,
+    input_proj: Held,
+    attn_norm: Held,
+    mlp_norm: Held,
+    attn_sconv: Held,
+    mlp_sconv: Held,
+    wq: Held,
+    wk: Held,
+    wv: Held,
+    wr: Held,
+    wo: Held,
+    q_norm: Held,
+    k_norm: Held,
+    k_sconv: Held,
+    v_sconv: Held,
+    rel_proj: Held,
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    down: Held,
+    global_scale: f32,
+    dims: AttnDims,
+    local: bool,
+}
+
+impl MtpOwned {
+    /// Borrow this head in the shape `mtp_block` wants.
+    fn borrow(&self, inter: usize) -> MtpHead<'_> {
+        MtpHead {
+            embed_norm: &self.embed_norm.data,
+            hidden_norm: &self.hidden_norm.data,
+            input_proj: &self.input_proj.data,
+            lw: LayerWeights {
+                attn_norm: &self.attn_norm.data,
+                mlp_norm: &self.mlp_norm.data,
+                attn_sconv: &self.attn_sconv.data,
+                mlp_sconv: &self.mlp_sconv.data,
+            },
+            aw: AttnWeights {
+                wq: &self.wq.data,
+                wk: &self.wk.data,
+                wv: &self.wv.data,
+                wr: &self.wr.data,
+                wo: &self.wo.data,
+                k_sconv: &self.k_sconv.data,
+                v_sconv: &self.v_sconv.data,
+                q_norm: &self.q_norm.data,
+                k_norm: &self.k_norm.data,
+                rel_proj: &self.rel_proj.data,
+            },
+            mlp: LayerMlp::Dense {
+                gate: &self.gate,
+                up: &self.up,
+                down: &self.down.data,
+                global_scale: self.global_scale,
+                inter,
+            },
+        }
+    }
 }
 
 #[cfg(feature = "inkling-cuda")]
@@ -723,6 +794,90 @@ fn main() -> Result<()> {
     #[allow(unused_mut)]
     let mut unembed = if want_head { Some(cp.held("model.llm.unembed.weight")?) } else { None };
     println!("  embedding tables loaded in {:.1}s", started.elapsed().as_secs_f32());
+
+    // `INK_MTP=k` drafts k tokens ahead with the MTP heads and scores them
+    // against what the stack actually generates. It measures ACCEPTANCE, which
+    // is the only oracle the composition has -- see mary::models::inkling::mtp.
+    // Read here rather than beside the other lane switches because the heads are
+    // loaded with the embedding tables, and the switch has to precede its use.
+    let mtp_k: usize = std::env::var("INK_MTP").ok().map(|v| v.parse()).transpose()?.unwrap_or(0);
+    let mtp_order = match std::env::var("INK_MTP_ORDER") {
+        Ok(v) => MtpConcat::parse(&v)
+            .with_context(|| format!("INK_MTP_ORDER wants hidden|embed, got {v:?}"))?,
+        Err(_) => MtpConcat::HiddenFirst,
+    };
+
+    // The MTP heads, only when asked for: eight dense blocks is 4.16 GiB, and a
+    // run that is not drafting should not pay for them.
+    let mtp_heads: Vec<MtpOwned> = if mtp_k > 0 {
+        let t0 = Instant::now();
+        let mut v = Vec::with_capacity(mtp_k);
+        for i in 0..mtp_k {
+            let p = format!("model.mtp.layers.{i}.transformer_block.");
+            let g = |n: &str| cp.held(&format!("{p}{n}"));
+            let fused = cp.held(&format!("{p}mlp.w13_dn.weight"))?;
+            let (gate, up) = split_gate_up(&fused.data, h);
+            let local = cfg.mtp_config.attn_kind(i) == AttnKind::Local;
+            v.push(MtpOwned {
+                embed_norm: cp.held(&format!("model.mtp.layers.{i}.embed_norm.weight"))?,
+                hidden_norm: cp.held(&format!("model.mtp.layers.{i}.hidden_norm.weight"))?,
+                input_proj: cp.held(&format!("model.mtp.layers.{i}.input_proj.weight"))?,
+                attn_norm: g("attn_norm.weight")?,
+                mlp_norm: g("mlp_norm.weight")?,
+                attn_sconv: g("attn_sconv.weight")?,
+                mlp_sconv: g("mlp_sconv.weight")?,
+                wq: g("attn.wq_du.weight")?,
+                wk: g("attn.wk_dv.weight")?,
+                wv: g("attn.wv_dv.weight")?,
+                wr: g("attn.wr_du.weight")?,
+                wo: g("attn.wo_ud.weight")?,
+                q_norm: g("attn.q_norm.weight")?,
+                k_norm: g("attn.k_norm.weight")?,
+                k_sconv: g("attn.k_sconv.weight")?,
+                v_sconv: g("attn.v_sconv.weight")?,
+                rel_proj: g("attn.rel_logits_proj.proj")?,
+                gate,
+                up,
+                down: g("mlp.w2_md.weight")?,
+                global_scale: g("mlp.global_scale")?.data[0],
+                dims: AttnDims {
+                    hidden: h,
+                    heads: t.num_attention_heads,
+                    kv_heads: t.num_key_value_heads,
+                    head_dim: t.head_dim,
+                    d_rel: t.d_rel,
+                    // The same span rule the LLM's layers use, asked of the
+                    // config rather than restated -- an MTP block's kind comes
+                    // from mtp_config, but what a kind REACHES is one fact.
+                    rel_extent: t.rel_span(if local { AttnKind::Local } else { AttnKind::Global }),
+                    kernel: t.sconv_kernel_size,
+                    rms_eps: t.rms_norm_eps,
+                    kind: if local { AttnKind::Local } else { AttnKind::Global },
+                },
+                local,
+            });
+        }
+        println!(
+            "  MTP heads          : {mtp_k} loaded in {:.1}s, concat {} ({})",
+            t0.elapsed().as_secs_f32(),
+            mtp_order.name(),
+            if mtp_order == MtpConcat::HiddenFirst {
+                "what mtp_hidden_states_first reads as"
+            } else {
+                "the alternative reading"
+            }
+        );
+        v
+    } else {
+        Vec::new()
+    };
+    // Drafts waiting to be scored: (the step whose token they predict, how many
+    // heads deep, the token). Scored by DRAINING on the step they name, so a
+    // draft is compared against what the stack actually produced rather than
+    // against another draft.
+    let mut mtp_pending: Vec<(usize, usize, usize)> = Vec::new();
+    let mut mtp_hits = vec![0usize; mtp_k];
+    let mut mtp_seen = vec![0usize; mtp_k];
     println!(
         "  dense weights      : {}",
         if cp.resident_on() {
@@ -773,6 +928,28 @@ fn main() -> Result<()> {
     anyhow::ensure!(
         !kv || attn_on_gpu,
         "INK_KV needs attention on the device -- set INK_ATTN=gpu or INK_GPU=all"
+    );
+    // An MTP block carries attention, so it needs the sequence to attend over.
+    // With the KV cache on, every pass past the prefill hands back a hidden
+    // state for ONE position, and drafting from that would measure a head
+    // attending to a single token -- which scores badly whether or not the
+    // composition is right, and would read as "the composition is wrong".
+    // Refuse instead: a measurement that cannot distinguish its own failure
+    // from the thing it measures is worse than no measurement.
+    anyhow::ensure!(
+        mtp_k == 0 || !kv,
+        "INK_MTP needs the whole sequence's hidden states and INK_KV hands back one position; \
+         run the draft experiment with INK_KV unset"
+    );
+    anyhow::ensure!(
+        mtp_k == 0 || pipe_spec.is_none(),
+        "INK_MTP is single-machine for now -- the head owns no unembedding and the tail owns no \
+         embedding table, so neither end can draft alone"
+    );
+    anyhow::ensure!(
+        mtp_k <= cfg.mtp_config.num_nextn_predict_layers,
+        "INK_MTP={mtp_k} but the checkpoint ships {} MTP heads",
+        cfg.mtp_config.num_nextn_predict_layers
     );
     let say = |b: bool| if b { "device" } else { "host (f32 oracle)" };
     println!("  attention          : {}", say(attn_on_gpu));
@@ -1467,6 +1644,117 @@ fn main() -> Result<()> {
         s.write_all(&(best as i64).to_le_bytes())?;
         s.flush()?;
     }
+
+    // ---- MTP: score the drafts that named this step, then draft afresh -----
+    if mtp_k > 0 {
+        // SCORE FIRST, against `best` -- the token the full stack just produced.
+        // This is the whole experiment: a draft is right or it is not, and the
+        // rate over many steps is the only oracle the composition has.
+        mtp_pending.retain(|&(target, depth, tok)| {
+            if target != step {
+                return true;
+            }
+            mtp_seen[depth] += 1;
+            if tok == best {
+                mtp_hits[depth] += 1;
+            }
+            println!(
+                "  MTP depth {}: drafted {tok}, actual {best} -- {}",
+                depth + 1,
+                if tok == best { "HIT" } else { "miss" }
+            );
+            false
+        });
+
+        // DRAFT. Head i is fed the previous stage's hidden states and the
+        // embeddings of the tokens shifted one further along, so head 0 sees
+        // the token the stack just chose and head i sees draft i-1.
+        let e_w = embed_w.as_ref().expect("drafting needs the embedding table");
+        let fnorm_d = fnorm.as_ref().expect("drafting needs the final norm");
+        let unembed_d = unembed
+            .as_ref()
+            .context("INK_MTP needs the host unembed table; it is dropped when INK_HEAD=gpu \
+                     uploads it, so run the draft experiment with the host head lane")?;
+        // Which hidden state head 0 is fed. `x` is the stack's RAW output, which
+        // `head` norms on its way to logits. Feeding the FINAL-NORMED one
+        // measured twice as well (25% -> 50% on a matched 20-token run), so it
+        // is the default; `INK_MTP_RAW=1` is the control that established it.
+        //
+        // Why it is not merely a scale fix: RMS norm is scale-invariant, so the
+        // two differ ONLY by the final norm's learned weight vector applied in
+        // between. That the weights help says the heads were trained on
+        // post-final-norm hidden states.
+        //
+        // It also makes `chain_hidden_post_norm: false` coherent, which the raw
+        // reading did not. That flag governs the CHAIN — whether a head's output
+        // is normed before the next head sees it — and it is off, so stages 1..k
+        // stay raw. The ENTRY from the main stack is a separate question and the
+        // flag never spoke to it.
+        let mut stage = if std::env::var("INK_MTP_RAW").map(|v| v == "1").unwrap_or(false) {
+            x.clone()
+        } else {
+            rms_norm(&x, &fnorm.as_ref().expect("the MTP entry norm is the final norm").data,
+                     t.rms_norm_eps, n, h)
+        };
+        // The token at each position, one step ahead: position j predicts
+        // ids[j+1], and the LAST position predicts `best`.
+        let mut ahead: Vec<usize> = ids[1..].to_vec();
+        ahead.push(best);
+        let t_mtp = Instant::now();
+        for (d, headw) in mtp_heads.iter().enumerate() {
+            debug_assert_eq!(ahead.len(), n, "one shifted token per position");
+            let mut embeds = vec![0f32; n * h];
+            for (j, &tok) in ahead.iter().enumerate() {
+                embeds[j * h..(j + 1) * h].copy_from_slice(&e_w.data[tok * h..(tok + 1) * h]);
+            }
+            let mask = if headw.local { &mask_local } else { &mask_global };
+            stage = mtp_block(
+                &stage,
+                &embeds,
+                // DENSE intermediate, not the routed experts' -- every MTP block
+                // is dense regardless of dense_mlp_idx, and the two sizes differ
+                // by 8x (16384 against 2048).
+                &headw.borrow(t.dense_intermediate_size),
+                &headw.dims,
+                Some(ls),
+                mask,
+                n,
+                mtp_order,
+            );
+            let dl = head(
+                &stage,
+                &fnorm_d.data,
+                &unembed_d.data,
+                t.logits_mup_width_multiplier as f32,
+                t.vocab_size,
+                v,
+                t.rms_norm_eps,
+                n,
+                h,
+            );
+            let last = &dl[(n - 1) * v..n * v];
+            let mut b = 0usize;
+            for (i, &val) in last.iter().enumerate() {
+                if val > last[b] {
+                    b = i;
+                }
+            }
+            // Head d predicts the token d+1 steps past the one just chosen.
+            mtp_pending.push((step + d + 1, d, b));
+            ahead.remove(0);
+            ahead.push(b);
+        }
+        println!(
+            "  MTP drafted {} token(s) in {:.2}s: {:?}",
+            mtp_heads.len(),
+            t_mtp.elapsed().as_secs_f32(),
+            mtp_pending
+                .iter()
+                .filter(|&&(tg, _, _)| tg > step)
+                .map(|&(_, _, tk)| tk)
+                .collect::<Vec<_>>()
+        );
+    }
     // A tail follows the sequence by RECOMPUTING it, not by being told: it owns
     // the argmax, so pushing it here keeps its `ids` identical to the head's
     // without a second thing on the wire to get out of step.
@@ -1586,6 +1874,51 @@ fn main() -> Result<()> {
     if step == gen_steps {
         break;
     }
+    }
+
+    // ---- the MTP experiment's result --------------------------------------
+    // Reported whether or not it looks good. A composition that drafts badly is
+    // the measurement working, not the run failing, and burying a 0% would make
+    // the next window repeat the experiment.
+    if mtp_k > 0 {
+        println!("\n=== MTP acceptance, concat {} ===", mtp_order.name());
+        let scored: usize = mtp_seen.iter().sum();
+        if scored == 0 {
+            println!("  nothing scored -- every draft named a step past the end of the run.");
+            println!("  raise INK_GEN above INK_MTP so drafts have a token to be judged against.");
+        } else {
+            for d in 0..mtp_k {
+                if mtp_seen[d] == 0 {
+                    println!("  depth {}: never scored", d + 1);
+                    continue;
+                }
+                println!(
+                    "  depth {}: {}/{} = {:.0}%",
+                    d + 1,
+                    mtp_hits[d],
+                    mtp_seen[d],
+                    100.0 * mtp_hits[d] as f64 / mtp_seen[d] as f64
+                );
+            }
+            let hits: usize = mtp_hits.iter().sum();
+            println!("  overall: {hits}/{scored} = {:.0}%", 100.0 * hits as f64 / scored as f64);
+            // What the number MEANS, said here rather than left to the reader,
+            // because the whole point of this experiment is that a low rate is
+            // evidence about the composition and not about the model.
+            println!(
+                "  {}",
+                if hits * 4 >= scored * 3 {
+                    "high -- this reading of mtp_hidden_states_first computes something the \
+                     stack agrees with"
+                } else if hits == 0 {
+                    "zero -- either this concat order is wrong or the wrapper composes some \
+                     other way; run INK_MTP_ORDER with the other order before concluding"
+                } else {
+                    "partial -- better than chance over a 200k vocabulary, so the composition is \
+                     close to right; the shortfall is what to explain next"
+                }
+            );
+        }
     }
 
     // A zero-length batch is the head saying it is done, so the tail's loop
