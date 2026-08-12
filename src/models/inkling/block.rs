@@ -88,6 +88,44 @@ pub fn short_conv(
     out
 }
 
+/// The last `kernel - 1` rows of `x`, front-padded with zeros when the sequence
+/// is shorter than that — the state [`short_conv_step`] reads.
+///
+/// A tap reaches `kernel - 1` positions back and a sequence that has not got
+/// that far yet is padded with the same zeros [`short_conv`] assumes for
+/// positions before the sequence. Seeding the history from a prefill shorter
+/// than the kernel and *not* padding would silently shift every subsequent tap
+/// by one position.
+pub fn conv_history(x: &[f32], tokens: usize, dim: usize, kernel: usize) -> Vec<f32> {
+    assert_eq!(x.len(), tokens * dim);
+    let want = kernel - 1;
+    let mut h = vec![0f32; want * dim];
+    let take = want.min(tokens);
+    h[(want - take) * dim..].copy_from_slice(&x[(tokens - take) * dim..tokens * dim]);
+    h
+}
+
+/// One position of the short convolution, advancing `hist` in place.
+///
+/// `cat(hist, x)` is exactly the window the last row of [`short_conv`] reads,
+/// so the tap arithmetic is not restated here — there is one implementation and
+/// the cached lane cannot drift from the uncached one.
+pub fn short_conv_step(
+    hist: &mut Vec<f32>,
+    x: &[f32],
+    weight: &[f32],
+    dim: usize,
+    kernel: usize,
+) -> Vec<f32> {
+    assert_eq!(x.len(), dim, "a decode step convolves exactly one position");
+    assert_eq!(hist.len(), (kernel - 1) * dim, "history must be the {} rows before it", kernel - 1);
+    let mut win = std::mem::take(hist);
+    win.extend_from_slice(x);
+    let out = short_conv(&win, weight, kernel, dim, kernel);
+    *hist = win[dim..].to_vec();
+    out[(kernel - 1) * dim..].to_vec()
+}
+
 /// What the router decided for one token.
 #[derive(Debug, Clone)]
 pub struct Routing {

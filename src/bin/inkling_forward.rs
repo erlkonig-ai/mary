@@ -68,12 +68,16 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 
 use mary::models::inkling::attn::{attention, causal_mask, AttnDims, AttnWeights, LogScaling};
-use mary::models::inkling::block::{rms_norm, route, short_conv, Routing};
+use mary::models::inkling::block::{
+    conv_history, rms_norm, route, short_conv, short_conv_step, Routing,
+};
 use mary::models::inkling::config::{AttnKind, InklingConfig};
 use mary::models::inkling::load::{deinterleave_fused, split_gate_up, Held, Loaded};
 use mary::models::inkling::source::Weights;
 use mary::models::inkling::mlp::{dense_mlp, shared_experts};
-use mary::models::inkling::mtp::{mtp_block, Concat as MtpConcat, MtpHead};
+use mary::models::inkling::mtp::{
+    mtp_block, mtp_block_prefill, mtp_block_step, Concat as MtpConcat, MtpCache, MtpHead,
+};
 use mary::models::inkling::layer::{LayerMlp, LayerWeights};
 use mary::models::inkling::stack::{embed_and_norm, head};
 
@@ -173,40 +177,6 @@ fn linear(x: &[f32], w: &[f32], rows: usize, in_dim: usize, out_dim: usize) -> V
         }
     }
     out
-}
-
-/// Seed a host short convolution's rolling history from a prefill.
-///
-/// The `kernel - 1` most recent rows, oldest first, left-padded with the same
-/// zeros [`short_conv`] assumes for positions before the sequence — so a prompt
-/// shorter than the kernel starts correct rather than shifted.
-fn conv_history_host(x: &[f32], tokens: usize, dim: usize, kernel: usize) -> Vec<f32> {
-    let want = kernel - 1;
-    let mut h = vec![0f32; want * dim];
-    let take = want.min(tokens);
-    h[(want - take) * dim..].copy_from_slice(&x[(tokens - take) * dim..tokens * dim]);
-    h
-}
-
-/// One position of the host short convolution, advancing `hist` in place.
-///
-/// `cat(hist, x)` is exactly the window the last row of [`short_conv`] reads,
-/// so the tap arithmetic is not restated here — there is one implementation and
-/// the cached lane cannot drift from the uncached one.
-fn short_conv_step_host(
-    hist: &mut Vec<f32>,
-    x: &[f32],
-    weight: &[f32],
-    dim: usize,
-    kernel: usize,
-) -> Vec<f32> {
-    assert_eq!(x.len(), dim, "a decode step convolves exactly one position");
-    assert_eq!(hist.len(), (kernel - 1) * dim, "history must be the {} rows before it", kernel - 1);
-    let mut win = std::mem::take(hist);
-    win.extend_from_slice(x);
-    let out = short_conv(&win, weight, kernel, dim, kernel);
-    *hist = win[dim..].to_vec();
-    out[(kernel - 1) * dim..].to_vec()
 }
 
 /// The backend the device lane runs on.
@@ -326,6 +296,22 @@ struct MtpOwned {
 }
 
 impl MtpOwned {
+    /// The sliding window this head attends within, or `None` on a global
+    /// one.
+    ///
+    /// One fact in one place: the causal mask and the cache's idea of which
+    /// keys can never be read again are the same distinction. A head that
+    /// masked as local while caching as global would still answer correctly
+    /// and grow its cache without bound, which is the kind of bug that only
+    /// ever shows up as a memory graph.
+    fn window(&self, sliding: usize) -> Option<usize> {
+        if self.local {
+            Some(sliding)
+        } else {
+            None
+        }
+    }
+
     /// Borrow this head in the shape `mtp_block` wants.
     fn borrow(&self, inter: usize) -> MtpHead<'_> {
         MtpHead {
@@ -878,6 +864,15 @@ fn main() -> Result<()> {
     let mut mtp_pending: Vec<(usize, usize, usize)> = Vec::new();
     let mut mtp_hits = vec![0usize; mtp_k];
     let mut mtp_seen = vec![0usize; mtp_k];
+    // The MTP entry hidden state for every position, retained. 16 KB a token
+    // at f32, and the reason the cached lane can draft at all -- see the draft
+    // block for why a row, once produced, never changes.
+    let mut mtp_main: Vec<f32> = Vec::new();
+    // Per head: its STABLE hidden rows, which are what the NEXT head reads,
+    // and its own K/V cache. Ragged by one row per depth, because head d's
+    // stable rows stop at position seq-1-d.
+    let mut mtp_stage: Vec<Vec<f32>> = vec![Vec::new(); mtp_k];
+    let mut mtp_caches: Vec<Option<MtpCache>> = (0..mtp_k).map(|_| None).collect();
     println!(
         "  dense weights      : {}",
         if cp.resident_on() {
@@ -929,17 +924,15 @@ fn main() -> Result<()> {
         !kv || attn_on_gpu,
         "INK_KV needs attention on the device -- set INK_ATTN=gpu or INK_GPU=all"
     );
-    // An MTP block carries attention, so it needs the sequence to attend over.
-    // With the KV cache on, every pass past the prefill hands back a hidden
-    // state for ONE position, and drafting from that would measure a head
-    // attending to a single token -- which scores badly whether or not the
-    // composition is right, and would read as "the composition is wrong".
-    // Refuse instead: a measurement that cannot distinguish its own failure
-    // from the thing it measures is worse than no measurement.
+    // Head d's first STABLE row sits at position seq-1-d, so a prompt shorter
+    // than the number of heads leaves a depth with no stable row at all: every
+    // position of that head would be a function of drafts and the cache would
+    // have nothing to hold. Refuse rather than quietly fall back to recomputing
+    // the prefix, which is the failure this whole change exists to remove.
     anyhow::ensure!(
-        mtp_k == 0 || !kv,
-        "INK_MTP needs the whole sequence's hidden states and INK_KV hands back one position; \
-         run the draft experiment with INK_KV unset"
+        mtp_k == 0 || !kv || ids.len() >= mtp_k,
+        "INK_MTP={mtp_k} with INK_KV needs a prompt of at least {mtp_k} tokens, this one is {}",
+        ids.len()
     );
     anyhow::ensure!(
         mtp_k == 0 || pipe_spec.is_none(),
@@ -1541,7 +1534,7 @@ fn main() -> Result<()> {
             #[cfg(feature = "inkling-cuda")]
             {
                 if step > 0 {
-                    short_conv_step_host(
+                    short_conv_step(
                         &mut caches[slot].mlp_sconv,
                         &y,
                         &mlp_sconv_w,
@@ -1550,7 +1543,7 @@ fn main() -> Result<()> {
                     )
                 } else {
                     caches[slot].mlp_sconv =
-                        conv_history_host(&y, n, h, t.sconv_kernel_size);
+                        conv_history(&y, n, h, t.sconv_kernel_size);
                     short_conv(&y, &mlp_sconv_w, n, h, t.sconv_kernel_size)
                 }
             }
@@ -1666,9 +1659,9 @@ fn main() -> Result<()> {
             false
         });
 
-        // DRAFT. Head i is fed the previous stage's hidden states and the
+        // DRAFT. Head d is fed the previous stage's hidden states and the
         // embeddings of the tokens shifted one further along, so head 0 sees
-        // the token the stack just chose and head i sees draft i-1.
+        // the token the stack just chose and head d sees draft d-1.
         let e_w = embed_w.as_ref().expect("drafting needs the embedding table");
         let fnorm_d = fnorm.as_ref().expect("drafting needs the final norm");
         // Optional: the device head lane drops this after uploading, and the
@@ -1689,49 +1682,45 @@ fn main() -> Result<()> {
         // is normed before the next head sees it — and it is off, so stages 1..k
         // stay raw. The ENTRY from the main stack is a separate question and the
         // flag never spoke to it.
-        let mut stage = if std::env::var("INK_MTP_RAW").map(|v| v == "1").unwrap_or(false) {
+        let entry = if std::env::var("INK_MTP_RAW").map(|val| val == "1").unwrap_or(false) {
             x.clone()
         } else {
-            rms_norm(&x, &fnorm.as_ref().expect("the MTP entry norm is the final norm").data,
-                     t.rms_norm_eps, n, h)
+            rms_norm(&x, &fnorm_d.data, t.rms_norm_eps, n, h)
         };
-        // The token at each position, one step ahead: position j predicts
-        // ids[j+1], and the LAST position predicts `best`.
-        let mut ahead: Vec<usize> = ids[1..].to_vec();
-        ahead.push(best);
-        let t_mtp = Instant::now();
-        for (d, headw) in mtp_heads.iter().enumerate() {
-            debug_assert_eq!(ahead.len(), n, "one shifted token per position");
-            let mut embeds = vec![0f32; n * h];
-            for (j, &tok) in ahead.iter().enumerate() {
-                embeds[j * h..(j + 1) * h].copy_from_slice(&e_w.data[tok * h..(tok + 1) * h]);
-            }
-            let mask = if headw.local { &mask_local } else { &mask_global };
-            stage = mtp_block(
-                &stage,
-                &embeds,
-                // DENSE intermediate, not the routed experts' -- every MTP block
-                // is dense regardless of dense_mlp_idx, and the two sizes differ
-                // by 8x (16384 against 2048).
-                &headw.borrow(t.dense_intermediate_size),
-                &headw.dims,
-                Some(ls),
-                mask,
-                n,
-                mtp_order,
-            );
-            // The draft's unembed is the same 89 G multiply-adds the real head
-            // pays, and it is the whole cost of drafting. Take whichever head
-            // lane the run already has: on the device when the unembed table is
-            // up there, on the host otherwise. This is why there is no longer a
-            // guard refusing INK_HEAD=gpu -- the lane that DROPS the host table
-            // is exactly the lane that does not need it.
+        // RETAIN it, and that is the whole enabling change. An MTP head's input
+        // at position j is (main_hidden[j], embed(token[j+1])), and
+        // main_hidden[j] never changes once produced -- attention is causal, so
+        // nothing later reaches back and alters it. What stopped the cached lane
+        // from drafting was never that the values move; it was that the loop
+        // DISCARDED them. 16 KB a token at f32, against a 144 GiB working set.
+        //
+        // Uncached, every pass recomputes the whole prefix, so this is an
+        // assignment there and an append here, and both lanes end holding the
+        // same table over the same sequence.
+        if kv {
+            mtp_main.extend_from_slice(&entry);
+        } else {
+            mtp_main = entry;
+        }
+        let seq = ids.len();
+        debug_assert_eq!(mtp_main.len(), seq * h, "one retained hidden row per token");
+
+        // One row of logits, argmaxed. The device lane returns the FULL vocab
+        // width and the host lane the effective one, so index by what came back
+        // rather than by whichever constant happens to match, or the argmax
+        // silently reads the wrong row.
+        //
+        // ONE row and not `n` of them: a draft is read off the last position and
+        // the head is per-row, so unembedding the prefix was 89 G multiply-adds
+        // per position thrown away.
+        let draft_argmax = |row: &[f32]| -> usize {
+            debug_assert_eq!(row.len(), h, "the draft head unembeds exactly one position");
             let dl = {
                 #[cfg(feature = "inkling-cuda")]
                 {
                     if let Some(ud) = unembed_dev.as_ref() {
                         let hs = dev_lane::rms_norm(
-                            up2::<Bk>(stage.clone(), n, h, &dev),
+                            up2::<Bk>(row.to_vec(), 1, h, &dev),
                             up1r(&fnorm_d.data, h, &dev),
                             t.rms_norm_eps,
                         )
@@ -1739,48 +1728,193 @@ fn main() -> Result<()> {
                         down(dev_lane::linear(hs, ud.clone()))
                     } else {
                         head(
-                            &stage, &fnorm_d.data,
+                            row, &fnorm_d.data,
                             &unembed_d.as_ref().expect("host draft head needs the unembed table").data,
                             t.logits_mup_width_multiplier as f32,
-                            t.vocab_size, v, t.rms_norm_eps, n, h,
+                            t.vocab_size, v, t.rms_norm_eps, 1, h,
                         )
                     }
                 }
                 #[cfg(not(feature = "inkling-cuda"))]
                 head(
-                    &stage, &fnorm_d.data,
+                    row, &fnorm_d.data,
                     &unembed_d.as_ref().expect("host draft head needs the unembed table").data,
                     t.logits_mup_width_multiplier as f32,
-                    t.vocab_size, v, t.rms_norm_eps, n, h,
+                    t.vocab_size, v, t.rms_norm_eps, 1, h,
                 )
             };
-            // The device lane returns the FULL vocab width; the host lane
-            // returns the effective one. Index by what came back rather than by
-            // whichever constant happens to match, or the argmax silently reads
-            // the wrong row.
-            let width = dl.len() / n;
-            let last = &dl[(n - 1) * width..n * width];
             let mut b = 0usize;
-            for (i, &val) in last.iter().take(v).enumerate() {
-                if val > last[b] {
+            for (i, &val) in dl.iter().take(v).enumerate() {
+                if val > dl[b] {
                     b = i;
                 }
             }
+            b
+        };
+
+        // The whole-sequence draft: every head over every position. This is what
+        // the uncached lane runs, and what `INK_MTP_CHECK` gates the cached lane
+        // against. `hidden` is the ENTRY state for the WHOLE sequence, which is
+        // precisely the thing the cache exists so as not to need.
+        let draft_whole = |hidden: &[f32], seq: usize, ids: &[usize], best: usize| -> Vec<usize> {
+            let mut stage = hidden.to_vec();
+            // The token at each position, one step ahead: position j predicts
+            // ids[j+1], and the LAST position predicts `best`.
+            let mut ahead: Vec<usize> = ids[1..].to_vec();
+            ahead.push(best);
+            let mut out = Vec::with_capacity(mtp_heads.len());
+            for headw in mtp_heads.iter() {
+                debug_assert_eq!(ahead.len(), seq, "one shifted token per position");
+                let mut embeds = vec![0f32; seq * h];
+                for (j, &tok) in ahead.iter().enumerate() {
+                    embeds[j * h..(j + 1) * h].copy_from_slice(&e_w.data[tok * h..(tok + 1) * h]);
+                }
+                stage = mtp_block(
+                    &stage,
+                    &embeds,
+                    // DENSE intermediate, not the routed experts' -- every MTP
+                    // block is dense regardless of dense_mlp_idx, and the two
+                    // sizes differ by 8x (16384 against 2048).
+                    &headw.borrow(t.dense_intermediate_size),
+                    &headw.dims,
+                    Some(ls),
+                    headw.window(t.sliding_window_size),
+                    seq,
+                    mtp_order,
+                );
+                let b = draft_argmax(&stage[(seq - 1) * h..seq * h]);
+                out.push(b);
+                ahead.remove(0);
+                ahead.push(b);
+            }
+            out
+        };
+
+        let t_mtp = Instant::now();
+        let drafts: Vec<usize> = if kv {
+            // Head d's newest STABLE row is at position seq-1-d: past that, its
+            // input embedding is a token the stack has not produced yet. So a
+            // step appends exactly ONE row per head, and the d rows after it --
+            // the ones the draft is actually read off -- are functions of drafts
+            // and run against a CLONE of the cache that is then dropped.
+            // Rollback is the default and there is no commit path to forget,
+            // which matters because a speculative K/V left behind does not
+            // error: it shows up months later as an acceptance rate that drifts
+            // down.
+            let mut prev_rows: Vec<Vec<f32>> = Vec::new();
+            let mut drafts: Vec<usize> = Vec::with_capacity(mtp_heads.len());
+            for (d, headw) in mtp_heads.iter().enumerate() {
+                let window = headw.window(t.sliding_window_size);
+                let hw = headw.borrow(t.dense_intermediate_size);
+                let want = seq - d;
+                let have = mtp_stage[d].len() / h;
+                let stable: Vec<f32> = if have == 0 {
+                    // The prefill: every stable row this head has, in one
+                    // whole-sequence pass -- the same call the uncached lane
+                    // makes, so the same arithmetic seeds the cache.
+                    let mut embeds = vec![0f32; want * h];
+                    for j in 0..want {
+                        let tok = if j + d + 1 < seq { ids[j + d + 1] } else { best };
+                        embeds[j * h..(j + 1) * h]
+                            .copy_from_slice(&e_w.data[tok * h..(tok + 1) * h]);
+                    }
+                    let hin: &[f32] = if d == 0 {
+                        &mtp_main[..want * h]
+                    } else {
+                        &mtp_stage[d - 1][..want * h]
+                    };
+                    let (y, cache) = mtp_block_prefill(
+                        hin, &embeds, &hw, &headw.dims, Some(ls), window, want, mtp_order,
+                    );
+                    mtp_caches[d] = Some(cache);
+                    y
+                } else {
+                    // One row, at the position the token just produced made
+                    // stable. Its embedding is `best` for EVERY head: head d's
+                    // row seq-1-d wants the token at seq, whatever d is.
+                    assert_eq!(have + 1, want, "a step makes exactly one row stable");
+                    let p = want - 1;
+                    let hin: &[f32] = if d == 0 {
+                        &mtp_main[p * h..(p + 1) * h]
+                    } else {
+                        &mtp_stage[d - 1][p * h..(p + 1) * h]
+                    };
+                    mtp_block_step(
+                        hin,
+                        &e_w.data[best * h..(best + 1) * h],
+                        &hw,
+                        &headw.dims,
+                        Some(ls),
+                        p,
+                        window,
+                        mtp_caches[d].as_mut().expect("prefilled on the first pass"),
+                        mtp_order,
+                    )
+                };
+                mtp_stage[d].extend_from_slice(&stable);
+                debug_assert_eq!(mtp_stage[d].len(), want * h);
+
+                // The speculative tail: positions want..seq-1, one per draft
+                // already made, each attending to the ones before it. `rows` is
+                // what head d+1 reads -- the input to its own stable row, then
+                // the inputs to its speculative ones.
+                let mut rows: Vec<Vec<f32>> = vec![mtp_stage[d][(want - 1) * h..want * h].to_vec()];
+                let mut last = rows[0].clone();
+                if d > 0 {
+                    let mut scratch = mtp_caches[d].as_ref().expect("prefilled").clone();
+                    for i in 0..d {
+                        last = mtp_block_step(
+                            &prev_rows[i],
+                            &e_w.data[drafts[i] * h..(drafts[i] + 1) * h],
+                            &hw,
+                            &headw.dims,
+                            Some(ls),
+                            want + i,
+                            window,
+                            &mut scratch,
+                            mtp_order,
+                        );
+                        rows.push(last.clone());
+                    }
+                }
+                // `scratch` is gone with the block: the speculative K and V
+                // never reached the cache, so a wrong draft leaves nothing to
+                // undo.
+                drafts.push(draft_argmax(&last));
+                prev_rows = rows;
+            }
+            drafts
+        } else {
+            draft_whole(&mtp_main, seq, &ids, best)
+        };
+        for (d, &b) in drafts.iter().enumerate() {
             // Head d predicts the token d+1 steps past the one just chosen.
             mtp_pending.push((step + d + 1, d, b));
-            ahead.remove(0);
-            ahead.push(b);
         }
         println!(
-            "  MTP drafted {} token(s) in {:.2}s: {:?}",
+            "  MTP drafted {} token(s) in {:.2}s: {drafts:?}",
             mtp_heads.len(),
             t_mtp.elapsed().as_secs_f32(),
-            mtp_pending
-                .iter()
-                .filter(|&&(tg, _, _)| tg > step)
-                .map(|&(_, _, tk)| tk)
-                .collect::<Vec<_>>()
         );
+        // The cached lane against the whole-sequence one, on the SAME retained
+        // hidden states -- so a disagreement is about the CACHE and nothing
+        // else. Both lanes are scalar host arithmetic summed in the same order,
+        // so the drafts should agree EXACTLY; anything less is a bug and not
+        // rounding, which is what makes this worth asserting rather than
+        // reporting.
+        if kv && std::env::var("INK_MTP_CHECK").map(|val| val == "1").unwrap_or(false) {
+            let t_c = Instant::now();
+            let whole = draft_whole(&mtp_main, seq, &ids, best);
+            println!(
+                "  MTP cache check ({:.2}s): cached {drafts:?} vs whole-sequence {whole:?} -- {}",
+                t_c.elapsed().as_secs_f32(),
+                if whole == drafts { "agree" } else { "DISAGREE" }
+            );
+            anyhow::ensure!(
+                whole == drafts,
+                "the MTP cache drafted {drafts:?} where the whole sequence drafts {whole:?}"
+            );
+        }
     }
     // A tail follows the sequence by RECOMPUTING it, not by being told: it owns
     // the argmax, so pushing it here keeps its `ids` identical to the head's
