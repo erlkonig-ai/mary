@@ -31,6 +31,7 @@ pub mod layer;
 pub mod layout;
 pub mod load;
 pub mod mlp;
+pub mod mtp;
 pub mod nvfp4;
 pub mod pile;
 // One interface over the two places a running model's weights can come from —
