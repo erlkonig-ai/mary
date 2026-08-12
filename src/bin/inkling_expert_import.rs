@@ -15,12 +15,30 @@
 //! rather than guessed at: the packed path would read sidecars that do not
 //! exist, and inventing them is how a model comes back as plausible noise.
 //!
+//! It commits PER STACKED MATRIX rather than once at the end, and that is a
+//! correctness property rather than a progress bar. A workspace stages blobs in
+//! memory until it is pushed, so the single-commit shape held the whole share
+//! in RAM and left the pile file empty until the last expert was encoded —
+//! measured at 0 bytes after 71 GiB of experts. For a 144 GiB share that is not
+//! a slow start; it is a run that cannot be interrupted.
+//!
+//! Because a push uploads a matrix's blobs before it moves the branch head, an
+//! interrupted run leaves a pile whose head names only whole matrices, and the
+//! next run asks the pile what it already holds and skips it. Resuming and
+//! re-running are the same code path: a complete re-run writes nothing and
+//! leaves the file byte-identical. A run killed mid-append leaves a partial
+//! record on the end, which `--repair` truncates — see the block that does it
+//! for why that is a flag and not the open path.
+//!
 //!   inkling_expert_import <ckpt-dir> <pile> --layers A-B [--experts N]
+//!                                           [--verify] [--repair]
 
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use mary::models::inkling::load::Checkpoint;
-use mary::models::inkling::pile::{attrs, expert_blob, layer_of, split_payload};
+use mary::models::inkling::pile::{
+    attrs, expert_blob, experts_in_layers, layer_of, split_payload,
+};
 use triblespace::core::blob::encodings::tensor::TensorView;
 use triblespace::core::blob::TryFromBlob;
 use triblespace::core::id::ExclusiveId;
@@ -131,7 +149,7 @@ fn verify_share(
         .collect();
     bases.sort();
 
-    let (mut ok, mut bytes) = (0usize, 0usize);
+    let (mut ok, mut bytes, mut ok_nvfp4) = (0usize, 0usize, 0usize);
     for base in &bases {
         let count = ck.expert_count(base)?.min(experts_cap);
         for e in 0..count {
@@ -145,6 +163,7 @@ fn verify_share(
                 anyhow::ensure!(codes == &q.codes[..], "{base}[{e}]: codes differ");
                 anyhow::ensure!(scales == &q.scales[..], "{base}[{e}]: scales differ");
                 anyhow::ensure!(scale2 == q.scale2, "{base}[{e}]: scale2 differs");
+                ok_nvfp4 += 1;
             } else {
                 let have = bf16_ix
                     .get(&key)
@@ -164,6 +183,24 @@ fn verify_share(
         bases.len(),
         bytes as f64 / (1024.0 * 1024.0 * 1024.0)
     );
+
+    // The reader's half of the same question, and a genuinely different one.
+    // Everything above asks whether the pile holds the right BYTES under the
+    // right name; this asks whether the selector a node actually calls can FIND
+    // them. `experts_in_layers` joins on `attrs::layer`, which no check above
+    // touches — so an import that wrote every leaf perfectly and dropped the
+    // layer facts would pass all of the above and hand a node zero experts.
+    // Two faces of one interface; reading one and concluding about the pair is
+    // how a green check comes to prove nothing.
+    let refs = experts_in_layers(&facts, lo..=hi);
+    anyhow::ensure!(
+        refs.len() == ok_nvfp4,
+        "experts_in_layers({lo}..={hi}) selects {} of the {ok_nvfp4} packed \
+         experts just verified — the leaves are on disk but the layer facts \
+         that reach them are not",
+        refs.len()
+    );
+    println!("selector   experts_in_layers({lo}..={hi}) reaches all {ok_nvfp4} packed experts");
     Ok(())
 }
 
@@ -179,13 +216,20 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let dir = args
         .next()
-        .context("usage: inkling_expert_import <ckpt-dir> <pile> --layers A-B [--experts N]")?;
+        .context(
+            "usage: inkling_expert_import <ckpt-dir> <pile> --layers A-B \
+             [--experts N] [--verify] [--repair]",
+        )?;
     let pile_path = args
         .next()
-        .context("usage: inkling_expert_import <ckpt-dir> <pile> --layers A-B [--experts N]")?;
+        .context(
+            "usage: inkling_expert_import <ckpt-dir> <pile> --layers A-B \
+             [--experts N] [--verify] [--repair]",
+        )?;
     let mut layers: Option<(i64, i64)> = None;
     let mut experts_cap = usize::MAX;
     let mut verify = false;
+    let mut repair = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--layers" => {
@@ -195,6 +239,7 @@ fn main() -> Result<()> {
             }
             "--experts" => experts_cap = args.next().context("--experts needs N")?.parse()?,
             "--verify" => verify = true,
+            "--repair" => repair = true,
             other => anyhow::bail!("unknown argument {other}"),
         }
     }
@@ -236,7 +281,52 @@ fn main() -> Result<()> {
         println!("creating a new pile at {pile_path}");
         std::fs::File::create(path)?;
     }
-    let store = Pile::open(path).map_err(|e| anyhow::anyhow!("open pile: {e:?}"))?;
+    let mut store = Pile::open(path).map_err(|e| anyhow::anyhow!("open pile: {e:?}"))?;
+
+    // ── the tail an interrupted run leaves ──────────────────────────────────
+    // Committing per matrix makes an interrupted import resumable, but it does
+    // not make the file self-healing, and the difference had to be MEASURED
+    // rather than assumed: SIGKILL during a 144 GiB import lands inside a
+    // `write_all` more often than not, and the pile that survives has a partial
+    // record on the end. `Pile::open` does not validate; the refresh does, and
+    // it refuses the file outright rather than guessing where the good data
+    // stops.
+    //
+    // Everything before that offset is intact — the push uploads a matrix's
+    // blobs BEFORE it CASes the branch head, so a torn record is always past
+    // the last head, i.e. bytes nothing references. `amputate` truncates there.
+    // It stays behind a flag anyway: it is destructive, and an older binary
+    // reading a newer record format would see the same "corruption" and eat
+    // real data. Loud by default, surgical on request.
+    let before = std::fs::metadata(path)?.len();
+    if repair {
+        store
+            .amputate()
+            .map_err(|e| anyhow::anyhow!("amputating {pile_path}: {e:?}"))?;
+        let after = std::fs::metadata(path)?.len();
+        if after < before {
+            println!(
+                "repaired   truncated a torn tail: {} bytes ({:.2} MiB) discarded",
+                before - after,
+                (before - after) as f64 / (1024.0 * 1024.0)
+            );
+        } else {
+            println!("repaired   nothing to do, the pile was already whole");
+        }
+    } else {
+        store.refresh().map_err(|e| {
+            anyhow::anyhow!(
+                "{pile_path}: {e:?}\n\n\
+                 A partial record on the end is what an interrupted append \
+                 leaves — the one the process was writing when it died. \
+                 Everything before that offset is intact and the branch head \
+                 never points past it. Re-run with --repair to truncate there \
+                 and resume; copy the file first if this is not a pile this \
+                 importer wrote."
+            )
+        })?;
+    }
+
     let mut repo = Repository::new(
         store,
         SigningKey::generate(&mut rand::rngs::OsRng),
@@ -249,9 +339,96 @@ fn main() -> Result<()> {
     let mut ws = repo
         .pull(branch)
         .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+
+    // ── what the pile already holds ─────────────────────────────────────────
+    // Asked once, up front, and it is what makes a second run safe. An
+    // expert's entity id is a `ufoid`, so importing the same matrix twice
+    // writes a SECOND entity for every expert in it: the blobs dedupe (they
+    // are content-addressed) but the FACTS do not, and `experts_in_layers`
+    // then hands the runtime each expert twice. One question to the pile turns
+    // that into a skip — which is the resumption mechanism after an
+    // interrupted run and the reason a complete re-run is a no-op rather than
+    // a duplication. Driven by what the pile HAS, matched against what the
+    // checkpoint says should be there; nothing is inferred from a file size.
+    let mut present: std::collections::HashSet<(String, i64)> = Default::default();
+    if let Some(head) = ws.head() {
+        let facts: TribleSet = ws
+            .checkout(triblespace::core::repo::ancestors(head))
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
+            .facts()
+            .clone();
+        let reader = repo
+            .storage_mut()
+            .reader()
+            .map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
+        // Both element types, because this binary writes both. The weight
+        // handle is matched but never fetched: a name and an index with no
+        // weight beside them is not an imported expert, and reading 144 GiB
+        // back to find out what is missing would defeat the point.
+        for (nh, i, _h) in triblespace::macros::find!(
+            (n: Inline<inlineencodings::Handle<blobencodings::LongString>>,
+             i: i64,
+             h: Inline<inlineencodings::Handle<
+                 triblespace::core::blob::encodings::tensor::Tensor<
+                     triblespace::core::blob::encodings::tensor::elements::NVFP4, 2>>>),
+            triblespace::macros::pattern!(&facts, [
+                { _?e @ metadata::name: ?n, attrs::expert_index: ?i, attrs::weight_nvfp4_2: ?h },
+            ])
+        ) {
+            let name: anybytes::View<str> =
+                reader.get(nh).map_err(|e| anyhow::anyhow!("name: {e:?}"))?;
+            present.insert((name.to_string(), i));
+        }
+        for (nh, i, _h) in triblespace::macros::find!(
+            (n: Inline<inlineencodings::Handle<blobencodings::LongString>>,
+             i: i64,
+             h: Inline<inlineencodings::Handle<
+                 triblespace::core::blob::encodings::tensor::Tensor<
+                     triblespace::core::blob::encodings::tensor::elements::BF16, 2>>>),
+            triblespace::macros::pattern!(&facts, [
+                { _?e @ metadata::name: ?n, attrs::expert_index: ?i,
+                  attrs::weight::<triblespace::core::blob::encodings::tensor::elements::BF16, 2>(): ?h },
+            ])
+        ) {
+            let name: anybytes::View<str> =
+                reader.get(nh).map_err(|e| anyhow::anyhow!("name: {e:?}"))?;
+            present.insert((name.to_string(), i));
+        }
+        println!("resuming   {} experts already in the pile", present.len());
+    }
+
     let mut change = TribleSet::new();
 
     let (mut n, mut total) = (0usize, 0usize);
+    let (mut pending, mut commits, mut skipped) = (0usize, 0usize, 0usize);
+
+    // ── one commit per stacked matrix, pushed the moment it is built ────────
+    // This binary used to accumulate every blob in `ws.staged` — a
+    // MemoryBlobStore — and issue a single commit and push after the last
+    // expert. Two consequences, both measured: the pile file stayed 0 bytes
+    // through 71 GiB of experts, and the resident set grew with the model. At
+    // 144 GiB that is not a slow start, it is a run that cannot be
+    // interrupted; killing it at 90% loses all of it.
+    //
+    // `try_push` uploads the staged blobs FIRST and only then CASes the branch
+    // head, so the head never names a matrix whose blobs are not already on
+    // disk. Interrupt anywhere and the pile is valid, holding whole matrices;
+    // the worst case is orphan blobs from a matrix whose CAS never landed, and
+    // a content-addressed store is exactly where an orphan blob costs nothing.
+    // The push also clears `staged`, which is what stops the resident set from
+    // tracking the model rather than the matrix.
+    macro_rules! flush {
+        ($msg:expr) => {
+            if pending > 0 {
+                let batch = std::mem::replace(&mut change, TribleSet::new());
+                ws.commit(batch, $msg);
+                repo.push(&mut ws)
+                    .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+                commits += 1;
+                pending = 0;
+            }
+        };
+    }
     for base in packed {
         let layer = layer_of(base);
         // How many experts this matrix stacks — asked of the checkpoint rather
@@ -261,17 +438,31 @@ fn main() -> Result<()> {
         // swallow a genuine read failure as "that was the last one".
         let count = ck.expert_count(base)?;
         let take = count.min(experts_cap);
-        let mut e = 0usize;
+        // This matrix's share of what is already imported, gathered once so
+        // the per-expert test is a lookup rather than a scan.
+        let done_here: std::collections::HashSet<i64> = present
+            .iter()
+            .filter(|(name, _)| name == base)
+            .map(|(_, i)| *i)
+            .collect();
+        let (mut e, mut wrote) = (0usize, 0usize);
         while e < take {
+            if done_here.contains(&(e as i64)) {
+                skipped += 1;
+                e += 1;
+                continue;
+            }
             let q = ck
                 .expert_slice_packed(base, e)
                 .with_context(|| format!("{base}[{e}]"))?;
             let blob = expert_blob(&q).with_context(|| format!("{base}[{e}] to blob"))?;
-            let blob2 = expert_blob(&q)?;
 
             // Same checks the probe makes, kept at scale: the round trip is
-            // where a packing bug shows up, and it costs a decode.
-            let view: TensorView = TryFromBlob::try_from_blob(blob)
+            // where a packing bug shows up, and it costs a decode. On a CLONE
+            // of the blob rather than a second `expert_blob` — `Blob` is
+            // refcounted bytes, so the check costs a decode instead of a
+            // decode plus a rebuilt 7 MiB payload.
+            let view: TensorView = TryFromBlob::try_from_blob(blob.clone())
                 .map_err(|err| anyhow::anyhow!("{base}[{e}]: decode: {err}"))?;
             anyhow::ensure!(
                 view.dims() == [q.rows as u64, (q.cols * 2) as u64],
@@ -283,8 +474,8 @@ fn main() -> Result<()> {
             anyhow::ensure!(scales == &q.scales[..], "{base}[{e}]: scales differ");
             anyhow::ensure!(scale2 == q.scale2, "{base}[{e}]: global scale differs");
 
-            let bytes = blob2.bytes.len();
-            let handle = ws.put(blob2);
+            let bytes = blob.bytes.len();
+            let handle = ws.put(blob);
             let name_h = ws.put::<blobencodings::LongString, _>(base.to_string());
             let mut facts = entity! { &ufoid() @
                 attrs::weight_nvfp4_2: handle,
@@ -298,7 +489,9 @@ fn main() -> Result<()> {
             change += facts;
 
             total += bytes;
+            pending += 1;
             n += 1;
+            wrote += 1;
             e += 1;
             if n % 200 == 0 {
                 println!(
@@ -307,7 +500,8 @@ fn main() -> Result<()> {
                 );
             }
         }
-        println!("  {base}: {e} experts");
+        flush!(&format!("inkling experts: {base}"));
+        println!("  {base}: {wrote} written, {} already present", take - wrote);
     }
 
     // ── the BF16 stacks ─────────────────────────────────────────────────────
@@ -320,7 +514,17 @@ fn main() -> Result<()> {
         let layer = layer_of(base);
         let count = ck.expert_count(base)?;
         let take = count.min(experts_cap);
+        let done_here: std::collections::HashSet<i64> = present
+            .iter()
+            .filter(|(name, _)| name == base)
+            .map(|(_, i)| *i)
+            .collect();
+        let mut wrote = 0usize;
         for e in 0..take {
+            if done_here.contains(&(e as i64)) {
+                skipped += 1;
+                continue;
+            }
             let raw = ck
                 .expert_slice_bf16(base, e)
                 .with_context(|| format!("{base}[{e}]"))?;
@@ -353,7 +557,9 @@ fn main() -> Result<()> {
             }
             change += facts;
             total += bytes;
+            pending += 1;
             bf16_n += 1;
+            wrote += 1;
             if bf16_n % 100 == 0 {
                 println!(
                     "  {bf16_n} BF16 experts, {:.1} GiB ...",
@@ -361,19 +567,22 @@ fn main() -> Result<()> {
                 );
             }
         }
-        println!("  {base}: {take} BF16 experts");
+        flush!(&format!("inkling experts: {base}"));
+        println!("  {base}: {wrote} BF16 written, {} already present", take - wrote);
     }
     n += bf16_n;
 
-    ws.commit(change, &format!("inkling experts, layers {lo}..={hi}"));
-    repo.push(&mut ws)
-        .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+    // Nothing is left staged: every matrix pushed as it finished, so this is
+    // a close rather than the one write the whole run was building toward.
+    debug_assert_eq!(pending, 0, "a matrix was built and never flushed");
     repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
 
     println!(
-        "imported   {n} experts, {:.2} GiB, each verified to round-trip",
+        "imported   {n} experts in {commits} commits, {:.2} GiB, each verified \
+         to round-trip",
         total as f64 / (1024.0 * 1024.0 * 1024.0)
     );
+    println!("skipped    {skipped} experts already present");
     println!("wrote      {pile_path}");
     Ok(())
 }

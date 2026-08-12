@@ -208,10 +208,12 @@ fn main() -> Result<()> {
     let mut pile_path: Option<String> = None;
     let mut limit = usize::MAX;
     let mut verify: Option<String> = None;
+    let mut repair = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--limit" => limit = args.next().context("--limit needs a value")?.parse()?,
             "--verify" => verify = Some(args.next().context("--verify needs a pile")?),
+            "--repair" => repair = true,
             other => pile_path = Some(other.to_string()),
         }
     }
@@ -237,6 +239,12 @@ fn main() -> Result<()> {
         experts.len()
     );
 
+    // Names the pile already holds. Same reason as the expert importer: the
+    // entity id is a `ufoid`, so a second pass over the same checkpoint writes
+    // a second entity per tensor — identical bytes, doubled facts, and a reader
+    // that gets two answers to "what is this tensor". Asking first turns a
+    // re-run into a no-op and an interrupted run into a resume.
+    let mut present: std::collections::HashSet<String> = Default::default();
     let mut writing = match &pile_path {
         None => {
             println!("mode       read-only (no pile path given)");
@@ -248,7 +256,32 @@ fn main() -> Result<()> {
                 println!("creating a new pile at {p}");
                 std::fs::File::create(path)?;
             }
-            let store = Pile::open(path).map_err(|e| anyhow::anyhow!("open pile: {e:?}"))?;
+            let mut store = Pile::open(path).map_err(|e| anyhow::anyhow!("open pile: {e:?}"))?;
+            // A torn tail is what an interrupted append leaves; see the same
+            // block in inkling_expert_import for why it is a flag and not an
+            // open path. It matters more here, not less: this writes into the
+            // pile the experts already live in.
+            let before = std::fs::metadata(path)?.len();
+            if repair {
+                store
+                    .amputate()
+                    .map_err(|e| anyhow::anyhow!("amputating {p}: {e:?}"))?;
+                let after = std::fs::metadata(path)?.len();
+                println!(
+                    "repaired   {} bytes discarded from a torn tail",
+                    before - after
+                );
+            } else {
+                store.refresh().map_err(|e| {
+                    anyhow::anyhow!(
+                        "{p}: {e:?}\n\n\
+                         A partial record on the end is what an interrupted \
+                         append leaves. Everything before that offset is \
+                         intact. Re-run with --repair to truncate there and \
+                         resume."
+                    )
+                })?;
+            }
             let mut repo = Repository::new(
                 store,
                 SigningKey::generate(&mut rand::rngs::OsRng),
@@ -258,9 +291,43 @@ fn main() -> Result<()> {
             let branch = repo
                 .ensure_branch("inkling", None)
                 .map_err(|e| anyhow::anyhow!("branch: {e:?}"))?;
-            let ws = repo
+            let mut ws = repo
                 .pull(branch)
                 .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+            if let Some(head) = ws.head() {
+                let facts: TribleSet = ws
+                    .checkout(triblespace::core::repo::ancestors(head))
+                    .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
+                    .facts()
+                    .clone();
+                let reader = repo
+                    .storage_mut()
+                    .reader()
+                    .map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
+                // One sweep per (dtype, rank), matching the weight handle but
+                // never fetching it — a name with no weight beside it is not an
+                // imported tensor, and reading the leaves back to find out what
+                // is missing would defeat the point.
+                macro_rules! seen {
+                    ($elem:ty, $rank:literal) => {{
+                        for (n, _h) in triblespace::macros::find!(
+                            (n: Inline<inlineencodings::Handle<blobencodings::LongString>>,
+                             h: Inline<inlineencodings::Handle<
+                                 triblespace::core::blob::encodings::tensor::Tensor<$elem, $rank>>>),
+                            triblespace::macros::pattern!(&facts, [
+                                { _?e @ metadata::name: ?n, attrs::weight::<$elem, $rank>(): ?h },
+                            ])
+                        ) {
+                            let name: anybytes::View<str> =
+                                reader.get(n).map_err(|e| anyhow::anyhow!("name: {e:?}"))?;
+                            present.insert(name.to_string());
+                        }
+                    }};
+                }
+                seen!(BF16, 0); seen!(BF16, 1); seen!(BF16, 2); seen!(BF16, 3); seen!(BF16, 4);
+                seen!(F32, 0); seen!(F32, 1); seen!(F32, 2); seen!(F32, 3); seen!(F32, 4);
+                println!("resuming   {} tensors already in the pile", present.len());
+            }
             Some((repo, ws, TribleSet::new()))
         }
     };
@@ -268,8 +335,18 @@ fn main() -> Result<()> {
     let mut by_dtype: std::collections::BTreeMap<String, usize> = Default::default();
     let mut by_rank_count: std::collections::BTreeMap<usize, usize> = Default::default();
     let (mut done, mut total_bytes) = (0usize, 0usize);
+    let (mut pending, mut commits, mut skipped) = (0usize, 0usize, 0usize);
+    // A commit every FLUSH_EVERY tensors rather than one at the end. The
+    // dense side is only ~15 GiB, but it shares a pile with 144 GiB of experts
+    // and the failure is the same one: blobs pile up in the workspace's
+    // MemoryBlobStore, the file stays empty, and an interrupt loses all of it.
+    const FLUSH_EVERY: usize = 64;
 
     for name in dense.into_iter().take(limit) {
+        if present.contains(name.as_str()) {
+            skipped += 1;
+            continue;
+        }
         let raw = ck
             .tensor_raw(name)
             .with_context(|| format!("reading {name}"))?;
@@ -287,6 +364,16 @@ fn main() -> Result<()> {
 
         total_bytes += bytes;
         done += 1;
+        pending += 1;
+        if let Some((repo, ws, change)) = writing.as_mut() {
+            if pending >= FLUSH_EVERY {
+                let batch = std::mem::replace(change, TribleSet::new());
+                ws.commit(batch, "inkling dense tensors");
+                repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+                commits += 1;
+                pending = 0;
+            }
+        }
         if done % 100 == 0 {
             println!("  {done} tensors ...");
         }
@@ -300,11 +387,16 @@ fn main() -> Result<()> {
         total_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
     );
 
+    println!("skipped    {skipped} tensors already present");
     if let Some((mut repo, mut ws, change)) = writing {
-        ws.commit(change, "inkling dense tensors");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+        if pending > 0 {
+            ws.commit(change, "inkling dense tensors");
+            repo.push(&mut ws)
+                .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+            commits += 1;
+        }
         repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
+        println!("committed  {commits} commits");
         println!("wrote      {}", pile_path.unwrap());
     }
     Ok(())
