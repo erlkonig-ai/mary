@@ -32,7 +32,9 @@ use anyhow::{Context, Result};
 use mary::models::inkling::attn::{causal_mask, AttnDims, AttnWeights, LogScaling};
 use mary::models::inkling::config::AttnKind;
 use mary::models::inkling::layer::{decoder_layer, LayerMlp, LayerWeights};
-use mary::models::inkling::load::{split_gate_up, split_shared_w13, Checkpoint};
+use mary::models::inkling::load::{
+    deinterleave_fused, split_gate_up, split_shared_w13, Checkpoint,
+};
 
 const BUDGET: f32 = 1e-5;
 
@@ -336,7 +338,13 @@ fn main() -> Result<()> {
         let mut gu: Vec<f32> = Vec::with_capacity(n_routed * 2 * mi * h);
         let mut dv: Vec<f32> = Vec::with_capacity(n_routed * h * mi);
         for e in 0..n_routed {
-            gu.extend_from_slice(&cp.expert_slice(&format!("{pfx}mlp.experts.w13_weight"), e)?.data);
+            // The checkpoint interleaves each expert's w13 rows exactly as it does
+            // the shared block, and `expert_ffn_one` wants the gate rows FIRST --
+            // so de-interleave here, the way `inkling_forward` does. The
+            // fingerprint below cannot catch a miss: it is a sum, and the two
+            // layouts are permutations of each other with the identical total.
+            let raw = cp.expert_slice(&format!("{pfx}mlp.experts.w13_weight"), e)?.data;
+            gu.extend_from_slice(&deinterleave_fused(&raw, 2 * mi, h));
             dv.extend_from_slice(&cp.expert_slice(&format!("{pfx}mlp.experts.w2_weight"), e)?.data);
         }
         cgu = gu;
