@@ -87,6 +87,55 @@ pub fn dense_mlp<B: Backend>(
 }
 
 
+/// The SHARED experts, on the device, from weights that are ALREADY on it.
+///
+/// The host lane in [`crate::models::inkling::mlp::shared_experts`] is the
+/// reference and this has to agree with it. Two details are easy to lose in
+/// translation and each one changes every token:
+///
+/// * the gamma multiplies the ACTIVATION — between the SwiGLU and the down
+///   projection — not the block's output. Applying it after `down` is a
+///   different function whenever `down` is not the identity, which is always.
+/// * gammas arrive token-major, `[token, shared]`, so shared expert `s` takes a
+///   stride-`n_shared` column and not a contiguous block. A contiguous read is
+///   correct for `n_shared == 1` and silently wrong for 2, which is what this
+///   checkpoint has.
+///
+/// `gate` and `up` are `[inter, hidden]` per shared expert and `down` is
+/// `[hidden, inter]` — one tensor each rather than a stacked rank 3, because
+/// these are uploaded once for the whole run and never sliced again. That is
+/// the entire point: the caller holds the handles, and a token costs a matmul
+/// against memory the device already owns rather than a fresh upload.
+pub fn shared_experts_dev<B: Backend>(
+    x: Tensor<B, 2>,
+    gate: &[Tensor<B, 2>],
+    up: &[Tensor<B, 2>],
+    down: &[Tensor<B, 2>],
+    gammas: &[f32],
+    n_shared: usize,
+) -> Tensor<B, 2> {
+    assert_eq!(gate.len(), n_shared, "{} gate weights for {n_shared} shared experts", gate.len());
+    assert_eq!(up.len(), n_shared, "{} up weights for {n_shared} shared experts", up.len());
+    assert_eq!(down.len(), n_shared, "{} down weights for {n_shared} shared experts", down.len());
+    let [n, _] = x.dims();
+    assert_eq!(gammas.len(), n * n_shared, "{} gammas for {n} tokens", gammas.len());
+
+    let dev = x.device();
+    let mut out: Option<Tensor<B, 2>> = None;
+    for s in 0..n_shared {
+        let g = linear(x.clone(), gate[s].clone());
+        let u = linear(x.clone(), up[s].clone());
+        let col: Vec<f32> = (0..n).map(|t| gammas[t * n_shared + s]).collect();
+        let gam = Tensor::<B, 2>::from_data(TensorData::new(col, [n, 1]), &dev);
+        let c = linear(silu(g) * u * gam, down[s].clone());
+        out = Some(match out {
+            Some(o) => o + c,
+            None => c,
+        });
+    }
+    out.expect("a MoE layer with no shared experts")
+}
+
 /// FP4 (E2M1) values by 4-bit code, and the E4M3 table, as device tensors.
 ///
 /// Built on the host from the scalar decoders in

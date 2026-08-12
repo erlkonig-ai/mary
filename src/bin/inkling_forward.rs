@@ -27,9 +27,29 @@ use anyhow::{Context, Result};
 use mary::models::inkling::attn::{attention, causal_mask, AttnDims, AttnWeights, LogScaling};
 use mary::models::inkling::block::{rms_norm, route, short_conv, Routing};
 use mary::models::inkling::config::{AttnKind, InklingConfig};
-use mary::models::inkling::load::{deinterleave_fused, split_gate_up, Checkpoint};
+use mary::models::inkling::load::{deinterleave_fused, split_gate_up, Checkpoint, Held, Loaded};
 use mary::models::inkling::mlp::{dense_mlp, shared_experts};
 use mary::models::inkling::stack::{embed_and_norm, head};
+
+/// One gibibyte, as the divisor every byte count here is printed against.
+const GIB: f64 = (1u64 << 30) as f64;
+
+/// Bytes this process has actually pulled off the block device.
+///
+/// NOT the same as bytes read: a page-cache hit costs nothing here. That is
+/// precisely what makes it the right instrument for residency — a working set
+/// that is genuinely held reads ~0 on the second pass, and one that is merely
+/// "probably still in the page cache" does not.
+fn io_read_bytes() -> u64 {
+    std::fs::read_to_string("/proc/self/io")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("read_bytes:"))
+                .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse().ok()))
+        })
+        .unwrap_or(0)
+}
 
 /// `x * sigmoid(x)`.
 fn silu(x: f32) -> f32 {
@@ -65,6 +85,107 @@ fn linear(x: &[f32], w: &[f32], rows: usize, in_dim: usize, out_dim: usize) -> V
 type Bk = burn::backend::Cuda<f32>;
 #[cfg(feature = "inkling-cuda")]
 use burn::prelude::Backend;
+
+/// A device tensor of this run's backend, named once so the residency types
+/// below do not have to repeat it.
+#[cfg(feature = "inkling-cuda")]
+type T2 = burn::tensor::Tensor<Bk, 2>;
+
+/// One layer's shared experts, on the device.
+#[cfg(feature = "inkling-cuda")]
+struct SharedOnDevice {
+    gate: Vec<T2>,
+    up: Vec<T2>,
+    down: Vec<T2>,
+}
+
+/// The dense weights that live in DEVICE-allocated memory for the whole run.
+///
+/// Distinct from the host-resident set behind `INK_RESIDENT`, and the
+/// difference is the point. Host residency stops the re-read and the re-widen;
+/// it leaves the arithmetic on the CPU. Device residency moves the weight into
+/// the pool the GPU reads fastest and lets the matmul run there, so the token
+/// costs a kernel over memory the device already owns rather than an upload.
+///
+/// These weights are NOT also held on the host: they are read out of the
+/// checkpoint once, uploaded, and the host copy is dropped. Holding both would
+/// double a budget for no gain, since after the upload nothing on the host ever
+/// reads them again.
+#[cfg(feature = "inkling-cuda")]
+#[derive(Default)]
+struct DeviceDense {
+    shared: std::collections::BTreeMap<String, SharedOnDevice>,
+    dense: std::collections::BTreeMap<String, (T2, T2, T2, f32)>,
+    bytes: u64,
+}
+
+#[cfg(feature = "inkling-cuda")]
+impl DeviceDense {
+    fn up2(v: Vec<f32>, rows: usize, cols: usize, dev: &burn::backend::cuda::CudaDevice) -> T2 {
+        assert_eq!(v.len(), rows * cols, "{} values for [{rows}, {cols}]", v.len());
+        burn::tensor::Tensor::from_data(burn::tensor::TensorData::new(v, [rows, cols]), dev)
+    }
+
+    /// One layer's shared experts, uploaded on first use.
+    #[allow(clippy::too_many_arguments)]
+    fn shared_for(
+        &mut self,
+        cp: &Checkpoint,
+        p: &str,
+        n_shared: usize,
+        inter: usize,
+        h: usize,
+        halved: bool,
+        dev: &burn::backend::cuda::CudaDevice,
+    ) -> Result<&SharedOnDevice> {
+        if !self.shared.contains_key(p) {
+            let fused = cp.tensor(&format!("{p}mlp.shared_experts.shared_w13_weight"))?;
+            let (g, u) = mary::models::inkling::load::split_shared_w13(
+                &fused.data, n_shared, inter, h, halved,
+            );
+            drop(fused);
+            let d = cp.tensor(&format!("{p}mlp.shared_experts.shared_w2_weight"))?;
+            let (per_gu, per_d) = (inter * h, h * inter);
+            let mut sd = SharedOnDevice { gate: Vec::new(), up: Vec::new(), down: Vec::new() };
+            for e in 0..n_shared {
+                sd.gate.push(Self::up2(g[e * per_gu..(e + 1) * per_gu].to_vec(), inter, h, dev));
+                sd.up.push(Self::up2(u[e * per_gu..(e + 1) * per_gu].to_vec(), inter, h, dev));
+                sd.down
+                    .push(Self::up2(d.data[e * per_d..(e + 1) * per_d].to_vec(), h, inter, dev));
+            }
+            self.bytes += (n_shared * (2 * per_gu + per_d) * 4) as u64;
+            self.shared.insert(p.to_string(), sd);
+        }
+        Ok(&self.shared[p])
+    }
+
+    /// One dense layer's MLP, uploaded on first use.
+    fn dense_for(
+        &mut self,
+        cp: &Checkpoint,
+        p: &str,
+        h: usize,
+        dev: &burn::backend::cuda::CudaDevice,
+    ) -> Result<&(T2, T2, T2, f32)> {
+        if !self.dense.contains_key(p) {
+            let fused = cp.tensor(&format!("{p}mlp.w13_dn.weight"))?;
+            let (g, u) = split_gate_up(&fused.data, h);
+            drop(fused);
+            let down = cp.tensor(&format!("{p}mlp.w2_md.weight"))?;
+            let gs = cp.tensor(&format!("{p}mlp.global_scale"))?;
+            let inter = g.len() / h;
+            self.bytes += ((g.len() + u.len() + down.data.len()) * 4) as u64;
+            let trip = (
+                Self::up2(g, inter, h, dev),
+                Self::up2(u, inter, h, dev),
+                Self::up2(down.data, h, inter, dev),
+                gs.data[0],
+            );
+            self.dense.insert(p.to_string(), trip);
+        }
+        Ok(&self.dense[p])
+    }
+}
 
 /// Every routed expert for one layer, on the device, without a host f32 copy.
 ///
@@ -306,11 +427,19 @@ fn main() -> Result<()> {
     let started = Instant::now();
     // Hoisted: re-reading 4.8 GB of embedding tables per generated token would
     // dwarf everything else in the loop.
-    let embed_w = cp.tensor("model.llm.embed.weight")?.data;
-    let embed_n = cp.tensor("model.llm.embed_norm.weight")?.data;
-    let fnorm = cp.tensor("model.llm.norm.weight")?.data;
-    let unembed = cp.tensor("model.llm.unembed.weight")?.data;
+    let embed_w = cp.held("model.llm.embed.weight")?;
+    let embed_n = cp.held("model.llm.embed_norm.weight")?;
+    let fnorm = cp.held("model.llm.norm.weight")?;
+    let unembed = cp.held("model.llm.unembed.weight")?;
     println!("  embedding tables loaded in {:.1}s", started.elapsed().as_secs_f32());
+    println!(
+        "  dense weights      : {}",
+        if cp.resident_on() {
+            "RESIDENT -- read and widened once, then held for the whole run"
+        } else {
+            "streamed -- re-read and re-widened from the checkpoint every token"
+        }
+    );
 
     // Experts are read, applied and dropped. There is no decoded-expert cache:
     // it measured as no speedup, and it existed to paper over a capacity
@@ -342,8 +471,28 @@ fn main() -> Result<()> {
         "  shared w13 split   : {}",
         if shared_halved { "HALVED (contiguous)" } else { "INTERLEAVED" }
     );
+    // INK_DENSE=gpu puts the shared experts and the dense MLPs on the device,
+    // resident. Separate from INK_RESIDENT (host) because they are separate
+    // claims and one can be true while the other is not.
+    let dense_gpu = std::env::var("INK_DENSE").map(|v| v == "gpu").unwrap_or(false);
+    println!(
+        "  shared + dense MLP : {}",
+        if dense_gpu {
+            "DEVICE-RESIDENT -- uploaded once, matmul on the GPU"
+        } else {
+            "host f32 (the reference lane)"
+        }
+    );
+    #[cfg(not(feature = "inkling-cuda"))]
+    anyhow::ensure!(!dense_gpu, "INK_DENSE=gpu needs --features inkling-cuda");
     #[cfg(feature = "inkling-cuda")]
     let dev = burn::backend::cuda::CudaDevice::default();
+    #[cfg(feature = "inkling-cuda")]
+    let mut ddense = if dense_gpu { Some(DeviceDense::default()) } else { None };
+    // Checked by running it, on the first MoE layer of the first pass: the two
+    // lanes are two transcriptions of the same arithmetic and a gate that is
+    // never run is not a gate.
+    let mut dense_checked = false;
     // Parsed once for the whole run. The lane it replaces re-parsed a shard
     // header four times per expert slab, ~9950 times over a forward.
     #[cfg(feature = "inkling-cuda")]
@@ -387,7 +536,10 @@ fn main() -> Result<()> {
     let mut top_all: Vec<i64> = Vec::new();
     for step in 0..=gen_steps {
     let n = ids.len();
-    let mut x = embed_and_norm(&ids, &embed_w, &embed_n, t.rms_norm_eps, t.vocab_size, h);
+    let step_t0 = Instant::now();
+    let io0 = io_read_bytes();
+    cp.io_reset();
+    let mut x = embed_and_norm(&ids, &embed_w.data, &embed_n.data, t.rms_norm_eps, t.vocab_size, h);
 
     if let Ok(dir) = std::env::var("INK_DUMP_DIR") {
         std::fs::create_dir_all(&dir)?;
@@ -417,12 +569,14 @@ fn main() -> Result<()> {
         let is_local = kind == AttnKind::Local;
         let (heads, kv_heads, head_dim) = t.heads(kind);
         let p = format!("model.llm.layers.{layer}.");
-        let g = |nm: &str| -> Result<Vec<f32>> { Ok(cp.tensor(&format!("{p}{nm}"))?.data) };
+        // `held`, not `tensor`: with INK_RESIDENT this is a pointer copy after
+        // the first token, and without it it is exactly the old call.
+        let g = |nm: &str| -> Result<Held> { cp.held(&format!("{p}{nm}")) };
 
         // ---- attention ----------------------------------------------------
         let t_a = Instant::now();
         let attn_norm = g("attn_norm.weight")?;
-        let hn = rms_norm(&x, &attn_norm, t.rms_norm_eps, n, h);
+        let hn = rms_norm(&x, &attn_norm.data, t.rms_norm_eps, n, h);
         let dims = AttnDims {
             hidden: h, heads, kv_heads, head_dim,
             d_rel: t.d_rel,
@@ -442,13 +596,13 @@ fn main() -> Result<()> {
         let vs = g("attn.v_sconv.weight")?;
         let rp = g("attn.rel_logits_proj.proj")?;
         let aw = AttnWeights {
-            wq: &wq, wk: &wk, wv: &wv, wr: &wr, wo: &wo,
-            k_sconv: &ks, v_sconv: &vs, q_norm: &qn, k_norm: &kn, rel_proj: &rp,
+            wq: &wq.data, wk: &wk.data, wv: &wv.data, wr: &wr.data, wo: &wo.data,
+            k_sconv: &ks.data, v_sconv: &vs.data,
+            q_norm: &qn.data, k_norm: &kn.data, rel_proj: &rp.data,
         };
         let mask = if is_local { &mask_local } else { &mask_global };
         let a = attention(&hn, &aw, &dims, Some(ls), mask, n);
-        drop((wq, wk, wv, wr, wo));
-        let a = short_conv(&a, &g("attn_sconv.weight")?, n, h, t.sconv_kernel_size);
+        let a = short_conv(&a, &g("attn_sconv.weight")?.data, n, h, t.sconv_kernel_size);
         for (xi, ai) in x.iter_mut().zip(&a) {
             *xi += ai;
         }
@@ -457,21 +611,51 @@ fn main() -> Result<()> {
         t_attn += t_a.elapsed().as_secs_f64();
         let t_o = Instant::now();
         let mlp_norm = g("mlp_norm.weight")?;
-        let hn = rms_norm(&x, &mlp_norm, t.rms_norm_eps, n, h);
+        let hn = rms_norm(&x, &mlp_norm.data, t.rms_norm_eps, n, h);
 
+        // The host lane, as a closure, so the device lane can be an
+        // alternative to it rather than an addition. Running both and throwing
+        // one away would have measured nothing.
+        //
+        // The SPLIT is what is held, not the fused tensor. Caching the fused
+        // form would still de-interleave 3.8 GiB of f32 per token and would pin
+        // 7.5 GiB to do it; caching the halves pins 3.8 and copies nothing.
+        let host_dense = |hn: &[f32]| -> Result<Vec<f32>> {
+            let wkey = format!("{p}mlp.w13_dn.weight");
+            let (gate, up) = cp.derived_pair(&wkey, || {
+                let fused = cp.tensor(&wkey)?;
+                let (a, b) = split_gate_up(&fused.data, h);
+                let shp = vec![a.len() / h, h];
+                Ok((Loaded { data: a, shape: shp.clone() }, Loaded { data: b, shape: shp }))
+            })?;
+            let down = cp.held(&format!("{p}mlp.w2_md.weight"))?;
+            let gs = cp.held(&format!("{p}mlp.global_scale"))?;
+            Ok(dense_mlp(hn, &gate.data, &up.data, &down.data, gs.data[0], n, h,
+                         t.dense_intermediate_size))
+        };
         let y = if t.is_dense(layer) {
-            let fused = g("mlp.w13_dn.weight")?;
-            let (gate, up) = split_gate_up(&fused, h);
-            let down = g("mlp.w2_md.weight")?;
-            let gs = g("mlp.global_scale")?;
-            dense_mlp(&hn, &gate, &up, &down, gs[0], n, h, t.dense_intermediate_size)
+            #[cfg(feature = "inkling-cuda")]
+            {
+                if let Some(dd) = ddense.as_mut() {
+                    let (dg, du, ddn, dsc) = dd.dense_for(&cp, &p, h, &dev)?;
+                    let xd: T2 = burn::tensor::Tensor::from_data(
+                        burn::tensor::TensorData::new(hn.clone(), [n, h]), &dev);
+                    let yd = mary::models::inkling::burn::dense_mlp(
+                        xd, dg.clone(), du.clone(), ddn.clone(), *dsc);
+                    yd.into_data().convert::<f32>().to_vec::<f32>().expect("dense mlp to host")
+                } else {
+                    host_dense(&hn)?
+                }
+            }
+            #[cfg(not(feature = "inkling-cuda"))]
+            host_dense(&hn)?
         } else {
             let inter = t.intermediate_size;
             let rw = g("mlp.gate.weight")?;
             let rb = g("mlp.gate.bias")?;
             let rg = g("mlp.gate.global_scale")?;
             let routing: Vec<Routing> = route(
-                &hn, &rw, &rb, rg[0], t.route_scale as f32,
+                &hn, &rw.data, &rb.data, rg.data[0], t.route_scale as f32,
                 n, h, t.n_routed_experts, t.n_shared_experts, t.num_experts_per_tok,
             );
 
@@ -535,18 +719,57 @@ fn main() -> Result<()> {
             // `routed_experts_gpu` syncs before returning, so this total is real.
             t_expert += t_d.elapsed().as_secs_f64();
 
-            let sfused = cp.tensor(&format!("{p}mlp.shared_experts.shared_w13_weight"))?.data;
-            let (sg, su) = mary::models::inkling::load::split_shared_w13(
-                &sfused, t.n_shared_experts, inter, h, shared_halved,
-            );
-            drop(sfused);
-            let sd = cp.tensor(&format!("{p}mlp.shared_experts.shared_w2_weight"))?.data;
             let gammas: Vec<f32> = routing.iter().flat_map(|r| r.shared_gammas.clone()).collect();
-            let sh = shared_experts(&hn, &sg, &su, &sd, &gammas, t.n_shared_experts, n, h, inter);
+            let host_shared = |hn: &[f32]| -> Result<Vec<f32>> {
+                let skey = format!("{p}mlp.shared_experts.shared_w13_weight");
+                let (sg, su) = cp.derived_pair(&skey, || {
+                    let sfused = cp.tensor(&skey)?;
+                    let (a, b) = mary::models::inkling::load::split_shared_w13(
+                        &sfused.data, t.n_shared_experts, inter, h, shared_halved,
+                    );
+                    let shp = vec![t.n_shared_experts, inter, h];
+                    Ok((Loaded { data: a, shape: shp.clone() }, Loaded { data: b, shape: shp }))
+                })?;
+                let sd = cp.held(&format!("{p}mlp.shared_experts.shared_w2_weight"))?;
+                Ok(shared_experts(hn, &sg.data, &su.data, &sd.data, &gammas,
+                                  t.n_shared_experts, n, h, inter))
+            };
+            #[cfg(feature = "inkling-cuda")]
+            let sh = if ddense.is_some() {
+                let dsh = {
+                    let dd = ddense.as_mut().unwrap();
+                    let sw = dd.shared_for(&cp, &p, t.n_shared_experts, inter, h,
+                                           shared_halved, &dev)?;
+                    let xd: T2 = burn::tensor::Tensor::from_data(
+                        burn::tensor::TensorData::new(hn.clone(), [n, h]), &dev);
+                    let y = mary::models::inkling::burn::shared_experts_dev(
+                        xd, &sw.gate, &sw.up, &sw.down, &gammas, t.n_shared_experts);
+                    y.into_data().convert::<f32>().to_vec::<f32>().expect("shared to host")
+                };
+                // Run the host lane ONCE, on the first MoE layer of the run, and
+                // say what the two lanes differ by. A device lane that has never
+                // been compared to its reference and one that cannot be told
+                // apart from it look identical from outside.
+                if !dense_checked {
+                    dense_checked = true;
+                    let hsh = host_shared(&hn)?;
+                    let scale = hsh.iter().fold(0f32, |a, v| a.max(v.abs()));
+                    let worst = hsh.iter().zip(&dsh).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+                    println!(
+                        "  shared experts, device vs host lane, layer {layer}: worst abs {worst:e} / scale {scale:e} = {:e}",
+                        worst / scale.max(f32::MIN_POSITIVE)
+                    );
+                }
+                dsh
+            } else {
+                host_shared(&hn)?
+            };
+            #[cfg(not(feature = "inkling-cuda"))]
+            let sh = host_shared(&hn)?;
             acc.iter().zip(&sh).map(|(a, b)| a + b).collect()
         };
 
-        let y = short_conv(&y, &g("mlp_sconv.weight")?, n, h, t.sconv_kernel_size);
+        let y = short_conv(&y, &g("mlp_sconv.weight")?.data, n, h, t.sconv_kernel_size);
         for (xi, yi) in x.iter_mut().zip(&y) {
             *xi += yi;
         }
@@ -566,7 +789,7 @@ fn main() -> Result<()> {
 
     // ---- head --------------------------------------------------------------
     let logits = head(
-        &x, &fnorm, &unembed,
+        &x, &fnorm.data, &unembed.data,
         t.logits_mup_width_multiplier as f32,
         t.vocab_size, t.effective_vocab(), t.rms_norm_eps, n, h,
     );
@@ -589,6 +812,31 @@ fn main() -> Result<()> {
         println!("      widen + upload    {:8.1}", host_t.1);
         println!("      remainder         {:8.1}   (enqueue + the sync, so device work lives here)",
                  t_expert - host_t.0 - host_t.1);
+    }
+    let (calls, hits, fileb, hostb, loader_ns) = cp.io_totals();
+    let (rb, rn) = cp.resident_bytes();
+    println!("  what this ONE forward pass moved:");
+    println!("    loader reads        {calls:8}   answered from RAM {hits:8}");
+    println!("    checkpoint bytes    {:8.2} GiB   (what the reads touched, stored precision)",
+             fileb as f64 / GIB);
+    println!("    host f32 bytes      {:8.2} GiB   (what they became after widening)",
+             hostb as f64 / GIB);
+    println!("    seconds in loader   {:8.1}", loader_ns as f64 / 1e9);
+    println!("    disk read_bytes     {:8.2} GiB   (/proc/self/io -- page-cache hits are free)",
+             (io_read_bytes() - io0) as f64 / GIB);
+    println!("    resident set        {:8.2} GiB in {rn} weights  (host)", rb as f64 / GIB);
+    #[cfg(feature = "inkling-cuda")]
+    if let Some(dd) = ddense.as_ref() {
+        println!(
+            "    device-resident     {:8.2} GiB in {} shared + {} dense layers",
+            dd.bytes as f64 / GIB,
+            dd.shared.len(),
+            dd.dense.len()
+        );
+    }
+    println!("    step wall           {:8.1}s", step_t0.elapsed().as_secs_f32());
+    if std::env::var("INK_IOSTATS").is_ok() {
+        print!("{}", cp.io_table(28));
     }
     println!("  elapsed: {:.1}s", started.elapsed().as_secs_f32());
 

@@ -8,8 +8,10 @@
 //! copied out and widened, and the mapping dropped — a layer is on the order of
 //! a gigabyte at f32 and the whole checkpoint is 159.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use memmap2::Mmap;
@@ -22,6 +24,37 @@ use crate::models::inkling::nvfp4::{decode_stacked, GROUP};
 pub struct Checkpoint {
     dir: PathBuf,
     shard_of: HashMap<String, String>,
+    /// What the loader has moved, per tensor name. Behind a mutex because
+    /// [`Checkpoint::tensor`] takes `&self`; the lock is held for an add, so
+    /// it costs nothing against a read that widens a gigabyte.
+    io: Mutex<BTreeMap<String, NameIo>>,
+    /// Weights kept for the whole run, keyed by tensor name (or by a derived
+    /// key for a split half). Empty unless `INK_RESIDENT` is set.
+    resident: Mutex<HashMap<String, Held>>,
+    resident_on: bool,
+}
+
+/// A weight the run HOLDS, instead of re-reading it once per token.
+pub type Held = Arc<Loaded>;
+
+/// What the loader moved on account of one tensor name.
+///
+/// Not a profiler. It counts exactly the two quantities the residency question
+/// turns on: how many bytes OF FILE a name costs each time it is asked for, and
+/// how many bytes of f32 that becomes on the host. For every BF16 tensor in
+/// this checkpoint the second is twice the first, which is why "7.7 GiB of
+/// checkpoint per token" and "15.5 GB of f32 per token" are both true
+/// statements about the same reads — the widening is [`Checkpoint::tensor`],
+/// and it is per call.
+#[derive(Default, Clone)]
+pub struct NameIo {
+    /// Reads that actually touched the file.
+    pub calls: u64,
+    /// Asks that a resident copy answered.
+    pub hits: u64,
+    pub file_bytes: u64,
+    pub host_bytes: u64,
+    pub nanos: u64,
 }
 
 /// A tensor read out of the checkpoint and widened to f32.
@@ -73,7 +106,16 @@ impl Checkpoint {
             .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
             .collect::<HashMap<_, _>>();
         anyhow::ensure!(!shard_of.is_empty(), "weight_map is empty");
-        Ok(Checkpoint { dir, shard_of })
+        Ok(Checkpoint {
+            dir,
+            shard_of,
+            io: Mutex::new(BTreeMap::new()),
+            resident: Mutex::new(HashMap::new()),
+            // Off by default: residency pins tens of gigabytes, and this box
+            // has 119 of them against a 159 GiB checkpoint. It is a deliberate
+            // call, so it is a deliberate flag.
+            resident_on: std::env::var("INK_RESIDENT").map(|v| v != "0").unwrap_or(false),
+        })
     }
 
     /// How many tensors the index names — an examined count for callers.
@@ -92,6 +134,7 @@ impl Checkpoint {
     /// expert weights are not read here — they need their sidecars, so they go
     /// through [`Checkpoint::expert_matrix`].
     pub fn tensor(&self, name: &str) -> Result<Loaded> {
+        let t0 = Instant::now();
         let shard = self
             .shard_of
             .get(name)
@@ -105,7 +148,7 @@ impl Checkpoint {
         let shape = view.shape().to_vec();
         let raw = view.data();
         let debug = format!("{:?}", view.dtype());
-        let data = match debug.as_str() {
+        let data: Vec<f32> = match debug.as_str() {
             "BF16" => raw
                 .chunks_exact(2)
                 .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
@@ -116,6 +159,7 @@ impl Checkpoint {
                 .collect(),
             other => anyhow::bail!("{name} holds {other}, which this reader does not widen"),
         };
+        self.note(name, raw.len() as u64, (data.len() * 4) as u64, t0);
         Ok(Loaded { data, shape })
     }
 
@@ -278,6 +322,7 @@ impl Checkpoint {
             // BF16, two bytes per element. Slice the mapping, do not copy the
             // whole stack: it is 8 GB and this wants 33 MB of it.
             let per = rows * cols;
+            let t_slab = Instant::now();
             let data = self.with_bytes(base, |raw| {
                 anyhow::ensure!(raw.len() == experts * per * 2, "{base} is {} bytes", raw.len());
                 Ok(raw[e * per * 2..(e + 1) * per * 2]
@@ -285,6 +330,7 @@ impl Checkpoint {
                     .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
                     .collect::<Vec<f32>>())
             })?;
+            self.note(base, (per * 2) as u64, (per * 4) as u64, t_slab);
             return Ok(Loaded { data, shape: vec![rows, cols] });
         }
 
@@ -345,6 +391,7 @@ impl Checkpoint {
     /// [`crate::models::inkling::nvfp4::decode_stacked`], which keeps the two
     /// lanes reading the same offsets.
     pub fn expert_slice_packed(&self, base: &str, e: usize) -> Result<PackedExpert> {
+        let t_slab = Instant::now();
         let shape = self.shape_of(base)?;
         anyhow::ensure!(shape.len() == 3, "{base} is rank {}", shape.len());
         let (experts, rows, cols) = (shape[0], shape[1], shape[2]);
@@ -368,12 +415,193 @@ impl Checkpoint {
             anyhow::ensure!(raw.len() >= s0 + rows * scales_per_row, "{base}.scale is short");
             Ok(raw[s0..s0 + rows * scales_per_row].to_vec())
         })?;
+        // Packed: no widening, so host bytes are file bytes. Charged to the
+        // stack's own name, which is what makes the routed half of a
+        // per-token total separable from the dense half.
+        let moved = (codes.len() + scales.len()) as u64;
+        self.note(base, moved, moved, t_slab);
         Ok(PackedExpert { codes, scales, scale2: scale2.data[e], rows, cols })
     }
 
     pub fn slot(&self, slot: Slot) -> Result<Loaded> {
         self.tensor(&slot.tensor_name())
     }
+
+    // ---- accounting -----------------------------------------------------
+
+    /// Charge one read to a tensor name.
+    fn note(&self, name: &str, file_bytes: u64, host_bytes: u64, t0: Instant) {
+        let mut io = self.io.lock().expect("io stats poisoned");
+        let e = io.entry(name.to_string()).or_default();
+        e.calls += 1;
+        e.file_bytes += file_bytes;
+        e.host_bytes += host_bytes;
+        e.nanos += t0.elapsed().as_nanos() as u64;
+    }
+
+    /// Charge one ask that a resident copy answered.
+    fn note_hit(&self, name: &str) {
+        let mut io = self.io.lock().expect("io stats poisoned");
+        io.entry(name.to_string()).or_default().hits += 1;
+    }
+
+    /// `(calls, hits, file bytes, host bytes, nanos)` since the last reset.
+    pub fn io_totals(&self) -> (u64, u64, u64, u64, u64) {
+        let io = self.io.lock().expect("io stats poisoned");
+        io.values().fold((0, 0, 0, 0, 0), |a, e| {
+            (a.0 + e.calls, a.1 + e.hits, a.2 + e.file_bytes, a.3 + e.host_bytes, a.4 + e.nanos)
+        })
+    }
+
+    /// Zero the counters, so a per-token figure is a per-token figure.
+    pub fn io_reset(&self) {
+        self.io.lock().expect("io stats poisoned").clear();
+    }
+
+    /// The `top` heaviest names by bytes, as a table.
+    ///
+    /// Names are collapsed on the layer index — `layers.17.attn.wq_du.weight`
+    /// and `layers.3.attn.wq_du.weight` are the same weight in different
+    /// layers, and forty rows of the same shape teach nothing that one row
+    /// times forty does not.
+    pub fn io_table(&self, top: usize) -> String {
+        let io = self.io.lock().expect("io stats poisoned");
+        let mut rolled: BTreeMap<String, NameIo> = BTreeMap::new();
+        for (name, e) in io.iter() {
+            let key = collapse_layer(name);
+            let r = rolled.entry(key).or_default();
+            r.calls += e.calls;
+            r.hits += e.hits;
+            r.file_bytes += e.file_bytes;
+            r.host_bytes += e.host_bytes;
+            r.nanos += e.nanos;
+        }
+        let mut v: Vec<_> = rolled.into_iter().collect();
+        v.sort_by_key(|(_, e)| std::cmp::Reverse(e.file_bytes.max(e.host_bytes)));
+        let mut out = String::from("    reads   hits       file MiB       host MiB      s  name\n");
+        for (name, e) in v.into_iter().take(top) {
+            out.push_str(&format!(
+                "  {:7} {:6} {:14.1} {:14.1} {:6.1}  {}\n",
+                e.calls,
+                e.hits,
+                e.file_bytes as f64 / (1u64 << 20) as f64,
+                e.host_bytes as f64 / (1u64 << 20) as f64,
+                e.nanos as f64 / 1e9,
+                name
+            ));
+        }
+        out
+    }
+
+    // ---- residency ------------------------------------------------------
+
+    /// Whether weights asked for through [`Checkpoint::held`] stay in RAM.
+    pub fn resident_on(&self) -> bool {
+        self.resident_on
+    }
+
+    /// How many bytes of f32 the resident set holds, and how many weights.
+    pub fn resident_bytes(&self) -> (u64, usize) {
+        let r = self.resident.lock().expect("resident poisoned");
+        (r.values().map(|h| (h.data.len() * 4) as u64).sum(), r.len())
+    }
+
+    /// One dense weight — widened once and then KEPT, when residency is on.
+    ///
+    /// The forward asks for the same few hundred names on every token, and
+    /// [`Checkpoint::tensor`] re-maps the shard, re-parses its header and
+    /// re-widens the BF16 every single time. Off, this is that call with an
+    /// `Arc` around it and nothing survives it. On, the first ask pays the read
+    /// and the widen and every later one is a pointer copy.
+    ///
+    /// The page cache cannot do this job here, which is the non-obvious part:
+    /// the routed experts stream ~130 GiB of the same checkpoint per token
+    /// through it, so the dense pages are evicted between one token and the
+    /// next no matter how warm they were. An owned allocation is not evictable,
+    /// and that is the whole difference.
+    pub fn held(&self, name: &str) -> Result<Held> {
+        if self.resident_on {
+            let hit = self
+                .resident
+                .lock()
+                .expect("resident poisoned")
+                .get(name)
+                .cloned();
+            if let Some(h) = hit {
+                self.note_hit(name);
+                return Ok(h);
+            }
+        }
+        let h = Arc::new(self.tensor(name)?);
+        if self.resident_on {
+            self.resident
+                .lock()
+                .expect("resident poisoned")
+                .insert(name.to_string(), h.clone());
+        }
+        Ok(h)
+    }
+
+    /// A PAIR of weights DERIVED from checkpoint bytes — the two halves of a
+    /// fused gate/up matrix — held under their own key.
+    ///
+    /// Residency has to cover the derived form or it barely helps. The dense
+    /// MLP's `mlp.w13_dn.weight` is 1.9 GiB of BF16 that widens to 3.8 GiB of
+    /// f32 and is then de-interleaved into two halves; caching only the fused
+    /// tensor would still copy 3.8 GiB per token and would hold 7.5 GiB to do
+    /// it. Caching the halves holds 3.8 and copies nothing.
+    ///
+    /// `make` is not called at all on a hit, so it may be as expensive as it
+    /// likes.
+    pub fn derived_pair(
+        &self,
+        key: &str,
+        make: impl FnOnce() -> Result<(Loaded, Loaded)>,
+    ) -> Result<(Held, Held)> {
+        let (k0, k1) = (format!("{key}#0"), format!("{key}#1"));
+        if self.resident_on {
+            let hit = {
+                let r = self.resident.lock().expect("resident poisoned");
+                match (r.get(&k0), r.get(&k1)) {
+                    (Some(a), Some(b)) => Some((a.clone(), b.clone())),
+                    _ => None,
+                }
+            };
+            if let Some(pair) = hit {
+                self.note_hit(key);
+                return Ok(pair);
+            }
+        }
+        let (a, b) = make()?;
+        let (a, b) = (Arc::new(a), Arc::new(b));
+        if self.resident_on {
+            let mut r = self.resident.lock().expect("resident poisoned");
+            r.insert(k0, a.clone());
+            r.insert(k1, b.clone());
+        }
+        Ok((a, b))
+    }
+}
+
+/// `model.llm.layers.17.attn.wq_du.weight` -> `model.llm.layers.N.attn.wq_du.weight`.
+fn collapse_layer(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut it = name.split('.').peekable();
+    while let Some(seg) = it.next() {
+        out.push_str(seg);
+        if seg == "layers" {
+            if let Some(next) = it.peek() {
+                if next.chars().all(|c| c.is_ascii_digit()) {
+                    it.next();
+                    out.push_str(".N");
+                }
+            }
+        }
+        if it.peek().is_some() {
+            out.push('.');
+        }
+    }
+    out
 }
 
 /// De-interleave a fused matrix along its OUTPUT axis.
