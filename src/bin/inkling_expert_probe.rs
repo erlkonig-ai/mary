@@ -289,6 +289,31 @@ fn main() -> Result<()> {
         sunk as f64 / 1e9 / (up - 2.0 * memcpy).max(1e-9)
     );
 
+    // Where the wait actually happens — and what the instrument itself costs.
+    // The loop above drops each handle the moment it is made, which returns
+    // memory to the pool and is NOT part of an upload; holding them until
+    // after the clock stops separates the three.
+    let t0 = Instant::now();
+    let mut held = Vec::with_capacity(n_experts * 4);
+    for (a, b) in &refs {
+        held.push(mary::models::inkling::dequant_cuda::upload_held(a.codes(), a.scales(), &dev));
+        held.push(mary::models::inkling::dequant_cuda::upload_held(b.codes(), b.scales(), &dev));
+    }
+    let enqueue = t0.elapsed().as_secs_f64();
+    let t1 = Instant::now();
+    sync();
+    let drain = t1.elapsed().as_secs_f64();
+    let t2 = Instant::now();
+    drop(held);
+    let freed = t2.elapsed().as_secs_f64();
+    println!(
+        "  blocks the caller (no sync)     : {}   ({:.1} GB/s host-visible)",
+        ms(enqueue, n_experts),
+        sunk as f64 / 1e9 / enqueue.max(1e-9)
+    );
+    println!("  waited for at the sync          : {} (whole batch)", ms(drain, n_experts));
+    println!("  returning the buffers to the pool: {}", ms(freed, n_experts));
+
     // ---- the whole per-expert lane -----------------------------------------
     //
     // Slice, decode, gather this expert's tokens, both matmuls, scatter back:

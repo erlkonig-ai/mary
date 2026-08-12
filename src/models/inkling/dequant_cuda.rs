@@ -134,10 +134,18 @@ fn luts(client: &Client) -> (Handle, Handle) {
 /// Upload the packed bytes and nothing else — the floor every decode path
 /// shares, and the only part of an expert load that is irreducibly a copy.
 pub fn upload_only(codes: &[u8], scales: &[u8], device: &CudaDevice) {
+    drop(upload_held(codes, scales, device));
+}
+
+/// The same upload, handing the handles BACK.
+///
+/// Dropping a handle returns its memory to the pool, which is real work and
+/// is not part of an upload. A probe that drops inside its own timer measures
+/// the two together and reports an upload slower than the whole lane that
+/// contains it — which is how this function came to exist.
+pub fn upload_held(codes: &[u8], scales: &[u8], device: &CudaDevice) -> (Handle, Handle) {
     let client = CudaRuntime::client(device);
-    let a = client.create_from_slice(codes);
-    let b = client.create_from_slice(scales);
-    drop((a, b));
+    (client.create_from_slice(codes), client.create_from_slice(scales))
 }
 
 /// Upload one expert's packed weight and decode it, in two kernels' worth of
