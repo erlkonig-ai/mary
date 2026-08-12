@@ -1671,10 +1671,9 @@ fn main() -> Result<()> {
         // the token the stack just chose and head i sees draft i-1.
         let e_w = embed_w.as_ref().expect("drafting needs the embedding table");
         let fnorm_d = fnorm.as_ref().expect("drafting needs the final norm");
-        let unembed_d = unembed
-            .as_ref()
-            .context("INK_MTP needs the host unembed table; it is dropped when INK_HEAD=gpu \
-                     uploads it, so run the draft experiment with the host head lane")?;
+        // Optional: the device head lane drops this after uploading, and the
+        // draft below uses the device table when that is what exists.
+        let unembed_d = unembed.as_ref();
         // Which hidden state head 0 is fed. `x` is the stack's RAW output, which
         // `head` norms on its way to logits. Feeding the FINAL-NORMED one
         // measured twice as well (25% -> 50% on a matched 20-token run), so it
@@ -1721,20 +1720,48 @@ fn main() -> Result<()> {
                 n,
                 mtp_order,
             );
-            let dl = head(
-                &stage,
-                &fnorm_d.data,
-                &unembed_d.data,
-                t.logits_mup_width_multiplier as f32,
-                t.vocab_size,
-                v,
-                t.rms_norm_eps,
-                n,
-                h,
-            );
-            let last = &dl[(n - 1) * v..n * v];
+            // The draft's unembed is the same 89 G multiply-adds the real head
+            // pays, and it is the whole cost of drafting. Take whichever head
+            // lane the run already has: on the device when the unembed table is
+            // up there, on the host otherwise. This is why there is no longer a
+            // guard refusing INK_HEAD=gpu -- the lane that DROPS the host table
+            // is exactly the lane that does not need it.
+            let dl = {
+                #[cfg(feature = "inkling-cuda")]
+                {
+                    if let Some(ud) = unembed_dev.as_ref() {
+                        let hs = dev_lane::rms_norm(
+                            up2::<Bk>(stage.clone(), n, h, &dev),
+                            up1r(&fnorm_d.data, h, &dev),
+                            t.rms_norm_eps,
+                        )
+                        .div_scalar(t.logits_mup_width_multiplier as f32);
+                        down(dev_lane::linear(hs, ud.clone()))
+                    } else {
+                        head(
+                            &stage, &fnorm_d.data,
+                            &unembed_d.as_ref().expect("host draft head needs the unembed table").data,
+                            t.logits_mup_width_multiplier as f32,
+                            t.vocab_size, v, t.rms_norm_eps, n, h,
+                        )
+                    }
+                }
+                #[cfg(not(feature = "inkling-cuda"))]
+                head(
+                    &stage, &fnorm_d.data,
+                    &unembed_d.as_ref().expect("host draft head needs the unembed table").data,
+                    t.logits_mup_width_multiplier as f32,
+                    t.vocab_size, v, t.rms_norm_eps, n, h,
+                )
+            };
+            // The device lane returns the FULL vocab width; the host lane
+            // returns the effective one. Index by what came back rather than by
+            // whichever constant happens to match, or the argmax silently reads
+            // the wrong row.
+            let width = dl.len() / n;
+            let last = &dl[(n - 1) * width..n * width];
             let mut b = 0usize;
-            for (i, &val) in last.iter().enumerate() {
+            for (i, &val) in last.iter().take(v).enumerate() {
                 if val > last[b] {
                     b = i;
                 }
