@@ -608,20 +608,39 @@ impl PileSource {
             bytes += b.len() as u64;
             leaves += 1;
         }
+        // One byte per 4 KiB, exactly as the dense arm above, and for the same
+        // reason: these pages have to be FAULTED, not merely named.
+        //
+        // This used to resolve the handle and add its length, on the belief that
+        // reading a blob validates it and so touches every page. It does not —
+        // the reader hands back a VIEW over the pile's mapping, and a view costs
+        // nothing to make. The counter therefore reported bytes nobody had read,
+        // and the giveaway was in the number it produced: a second pass claiming
+        // 155.81 GiB "touched" in 3.3 s is 47 GB/s, which is not a memory
+        // bandwidth this part has and certainly not a disk one. A residency
+        // instrument that reports a working set it never faulted answers the one
+        // question it exists to answer with a number that cannot be wrong,
+        // which is worse than not asking.
         for ((name, idx), r) in self.experts.iter() {
             if r.layer < lo || r.layer > hi {
                 continue;
             }
-            // Reading an expert blob validates it, which touches every page —
-            // so the warm and the integrity check are the same pass.
+            let mut touch = |b: &[u8]| {
+                let mut i = 0usize;
+                while i < b.len() {
+                    sum = sum.wrapping_add(b[i] as u64);
+                    i += 4096;
+                }
+                b.len() as u64
+            };
             let n = match r.handle {
                 ExpertHandle::Nvfp4(_) => {
                     let q = self.expert_packed(name, *idx as usize)?;
-                    q.codes.len() + q.scales.len()
+                    touch(&q.codes) + touch(&q.scales)
                 }
-                ExpertHandle::Bf16(_) => self.expert_bf16(name, *idx as usize)?.bytes.len(),
+                ExpertHandle::Bf16(_) => touch(&self.expert_bf16(name, *idx as usize)?.bytes),
             };
-            bytes += n as u64;
+            bytes += n;
             leaves += 1;
         }
         std::hint::black_box(sum);

@@ -26,8 +26,42 @@
 //!
 //!   cargo run --release --features inkling-cuda,cuda-backend --bin inkling_forward \
 //!       -- <ckpt> <ids.bin> <out.bin>
+//!
+//! # Two machines, and why it is a MODE here rather than its own binary
+//!
+//! One machine cannot hold this model resident: 144 GiB of weights against 121
+//! GiB of RAM, so the page cache evicts what the next token needs and every
+//! token pays real block-device I/O for its expert slabs. Split by LAYER across
+//! two boxes it is ~72 GiB each, which fits with headroom.
+//!
+//! `INK_LAYERS=LO:HI` runs only that half-open range; `INK_PIPE=head:HOST:PORT`
+//! sends the residual stream on when the range ends, and `INK_PIPE=tail:ADDR`
+//! receives it, finishes the stack and returns the argmax. Only `[n, 4096]` f32
+//! crosses — 16 KB per token per boundary, once — which is why the split is by
+//! layer and not within one: splitting a layer needs an all-reduce per layer and
+//! 1 GbE cannot carry it.
+//!
+//! This is a mode and not a second program on purpose. It WAS a second program
+//! (`inkling_pipe`), and that program forked: it kept a copy of this file's
+//! layer loop from before attention went device-resident, before the fused
+//! NVFP4 decode and before the residency cache, so the two lanes computed
+//! different things at different speeds and no number from one was comparable
+//! to a number from the other. There is one layer loop, so there is nothing
+//! left to drift.
+//!
+//! Byte-balanced at layer 20 rather than the midpoint: layer 2 carries BF16
+//! experts (12.7 GiB against 3.55 GiB for an NVFP4 layer), so an even 21/21
+//! split is a lopsided 85/71 GiB one. Layers 0..20 are 77.6 GiB and 20..42 are
+//! 78.2 GiB.
+//!
+//!   # tail, on the second box
+//!   INK_LAYERS=20:42 INK_PIPE=tail:0.0.0.0:7654 inkling_forward <ckpt> <ids> <out>
+//!   # head, on the first
+//!   INK_LAYERS=0:20  INK_PIPE=head:<tail-host>:7654 inkling_forward <ckpt> <ids> <out>
 
 use std::collections::BTreeMap;
+use std::io::{Read as _, Write as _};
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -64,6 +98,55 @@ fn io_read_bytes() -> u64 {
 /// `x * sigmoid(x)`.
 fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
+}
+
+/// Which end of a two-machine split this process is, if it is one.
+///
+/// The head owns the embedding and the token loop; the tail owns the final norm,
+/// the unembedding and the argmax. Neither loads the other's tables — on a box
+/// chosen because the working set only just fits, pinning 3.3 GB of unembedding
+/// on the machine that will never read it is the whole problem in miniature.
+enum Pipe {
+    Head(TcpStream),
+    Tail(TcpStream),
+}
+
+/// The residual stream, on the wire.
+///
+/// `pos0` travels with it because the tail's half of the stack needs it and
+/// cannot derive it: with a KV cache a decode step feeds ONE token whose
+/// absolute position is what log scaling and the relative bias are functions of,
+/// and the tail has never seen the sequence it belongs to.
+fn send_stream(s: &mut TcpStream, n: usize, pos0: usize, x: &[f32]) -> Result<()> {
+    let mut b = Vec::with_capacity(16 + x.len() * 4);
+    b.extend_from_slice(&(n as u64).to_le_bytes());
+    b.extend_from_slice(&(pos0 as u64).to_le_bytes());
+    for v in x {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    s.write_all(&b)?;
+    s.flush()?;
+    Ok(())
+}
+
+/// The other side of [`send_stream`]. `None` when the peer is done.
+fn recv_stream(s: &mut TcpStream, h: usize) -> Result<Option<(usize, usize, Vec<f32>)>> {
+    let mut hdr = [0u8; 16];
+    if s.read_exact(&mut hdr).is_err() {
+        return Ok(None);
+    }
+    let n = u64::from_le_bytes(hdr[..8].try_into().unwrap()) as usize;
+    let pos0 = u64::from_le_bytes(hdr[8..].try_into().unwrap()) as usize;
+    if n == 0 {
+        return Ok(None);
+    }
+    let mut buf = vec![0u8; n * h * 4];
+    s.read_exact(&mut buf)?;
+    let x = buf
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    Ok(Some((n, pos0, x)))
 }
 
 /// `y = x W^T`, `W` stored `[out, in]`.
@@ -505,6 +588,36 @@ fn main() -> Result<()> {
     };
     let open_secs = t_open.elapsed().as_secs_f64();
 
+    // Which layers THIS process runs. The default is the whole stack, so a
+    // single-machine run is the `INK_LAYERS` unset case and not a special one.
+    let (lo, hi) = match std::env::var("INK_LAYERS") {
+        Ok(s) => {
+            let (a, b) = s.split_once(':').context("INK_LAYERS wants LO:HI")?;
+            (a.parse::<usize>()?, b.parse::<usize>()?)
+        }
+        Err(_) => (0, t.num_hidden_layers),
+    };
+    anyhow::ensure!(lo < hi, "INK_LAYERS wants LO < HI, got {lo}:{hi}");
+    anyhow::ensure!(
+        hi <= t.num_hidden_layers,
+        "INK_LAYERS {lo}:{hi} runs past the {}-layer stack",
+        t.num_hidden_layers
+    );
+    // A pipe end is only a pipe end if it is not the whole stack; refusing the
+    // contradiction here is cheaper than debugging a head that also unembeds.
+    let pipe_spec = std::env::var("INK_PIPE").ok();
+    let is_head = pipe_spec.as_deref().map(|s| s.starts_with("head:")).unwrap_or(false);
+    let is_tail = pipe_spec.as_deref().map(|s| s.starts_with("tail:")).unwrap_or(false);
+    anyhow::ensure!(
+        pipe_spec.is_none() || is_head || is_tail,
+        "INK_PIPE wants head:HOST:PORT or tail:ADDR:PORT"
+    );
+    anyhow::ensure!(
+        !is_head || hi < t.num_hidden_layers,
+        "a head that runs to the last layer has nothing to send; set INK_LAYERS"
+    );
+    anyhow::ensure!(!is_tail || lo > 0, "a tail that starts at layer 0 has nothing to receive");
+
     let mut ids: Vec<usize> = std::fs::read(&ids_path)?
         .chunks_exact(8)
         .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as usize)
@@ -523,12 +636,65 @@ fn main() -> Result<()> {
     println!("  tokens     : {n}  {ids:?}");
     println!("  layers     : {}  hidden {h}  experts {}+{} shared",
              t.num_hidden_layers, t.n_routed_experts, t.n_shared_experts);
+    println!(
+        "  this process: layers {lo}..{hi} ({} of {}){}",
+        hi - lo,
+        t.num_hidden_layers,
+        match (is_head, is_tail) {
+            (true, _) => "  PIPE HEAD -- embeds, then sends the stream on",
+            (_, true) => "  PIPE TAIL -- receives the stream, unembeds, argmax",
+            _ => "  whole stack on one machine",
+        }
+    );
     // Not the same unit on both sides, and saying so is the point: the
     // checkpoint names 1 360 tensors of which the expert ones are STACKS of
     // 256, the pile names each expert leaf on its own — 968 dense + 20 480
     // experts. Same model, two granularities, and the pile's is the one a
     // layer split can partition.
     println!("  {}", cp.inventory());
+
+    // ---- does this node's share FIT? ---------------------------------------
+    //
+    // The decode loop cannot answer this on its own, and it is worth saying why,
+    // because its per-token `read_bytes` looks like the answer. A token routes
+    // to ~5 of 256 experts per layer, so nine tokens touch about a tenth of a
+    // node's share: most of what they read off disk is a FIRST touch, not a page
+    // the kernel evicted. Compulsory misses and capacity misses are different
+    // claims about different things, and only the second one is what a layer
+    // split is for.
+    //
+    // So ask directly. Touch the whole share, twice, and report each pass's
+    // block-device traffic: a share that fits reads it once and then reads ~zero,
+    // and one that does not reads back exactly what had to be evicted to make
+    // room for the tail of the first pass. `INK_WARM=1` also leaves the share hot
+    // for a decode measurement that follows, which is the other reason to want it.
+    // `INK_WARM=N` runs N passes, and more than two is often what it takes to
+    // get an answer: the cache a node starts with holds pages from whatever ran
+    // before -- on these boxes, the OTHER half of the very same pile, copied in
+    // whole -- and those age out only by being outlived. A share that fits shows
+    // its disk column falling to zero and staying; one that does not shows a
+    // column that will not fall however long you look at it.
+    let warm_passes: usize = std::env::var("INK_WARM")
+        .ok()
+        .map(|v| if v == "1" { 2 } else { v.parse().unwrap_or(0) })
+        .unwrap_or(0);
+    if warm_passes > 0 {
+        println!("  warming layers {lo}..{hi} -- {warm_passes} passes, so eviction is visible:");
+        for pass in 1..=warm_passes {
+            let t0 = Instant::now();
+            let before = io_read_bytes();
+            let (bytes, leaves) = cp.warm(lo as i64..=hi as i64 - 1)?;
+            let disk = io_read_bytes() - before;
+            println!(
+                "    pass {pass}: touched {:6.2} GiB in {leaves} leaves in {:5.1}s  \
+                 -> {:6.2} GiB off disk ({:.0} MB/s)",
+                bytes as f64 / GIB,
+                t0.elapsed().as_secs_f32(),
+                disk as f64 / GIB,
+                disk as f64 / 1e6 / t0.elapsed().as_secs_f64().max(1e-9)
+            );
+        }
+    }
 
     // How many tokens to generate past the prompt. 0 reproduces the original
     // single-forward behaviour exactly.
@@ -540,15 +706,22 @@ fn main() -> Result<()> {
     let started = Instant::now();
     // Hoisted: re-reading 4.8 GB of embedding tables per generated token would
     // dwarf everything else in the loop.
-    let embed_w = cp.held("model.llm.embed.weight")?;
-    let embed_n = cp.held("model.llm.embed_norm.weight")?;
-    let fnorm = cp.held("model.llm.norm.weight")?;
+    //
+    // Split by role, and NOT loaded by the end that will never read them. That
+    // is not tidiness: the whole reason for two machines is that this model's
+    // working set does not fit in one page cache, and 4.8 GB of embedding
+    // pinned on the box that only unembeds is 4.8 GB of expert slabs evicted.
+    let want_embed = !is_tail;
+    let want_head = !is_head;
+    let embed_w = if want_embed { Some(cp.held("model.llm.embed.weight")?) } else { None };
+    let embed_n = if want_embed { Some(cp.held("model.llm.embed_norm.weight")?) } else { None };
+    let fnorm = if want_head { Some(cp.held("model.llm.norm.weight")?) } else { None };
     // `Option`, so the head lane can DROP the 3.3 GB host copy after uploading
     // it. `held` only keeps it alive in the resident map when INK_RESIDENT is
     // set, so dropping the handle frees it in the non-resident case — which is
     // what the lane that replaced `std::mem::take` here has to preserve.
     #[allow(unused_mut)]
-    let mut unembed = Some(cp.held("model.llm.unembed.weight")?);
+    let mut unembed = if want_head { Some(cp.held("model.llm.unembed.weight")?) } else { None };
     println!("  embedding tables loaded in {:.1}s", started.elapsed().as_secs_f32());
     println!(
         "  dense weights      : {}",
@@ -724,7 +897,7 @@ fn main() -> Result<()> {
     // tokens, so it is uploaded ONCE here rather than once per step, and the
     // host copy is dropped rather than kept alongside it.
     #[cfg(feature = "inkling-cuda")]
-    let unembed_dev = if head_on_gpu {
+    let unembed_dev = if head_on_gpu && want_head {
         let v = t.effective_vocab();
         let d = up2r::<Bk>(&unembed.as_ref().expect("unembed held").data, t.vocab_size, h, &dev)
             .slice([0..v, 0..h]);
@@ -752,8 +925,46 @@ fn main() -> Result<()> {
     #[cfg(feature = "inkling-cuda")]
     let mut caches: Vec<LayerCache> = Vec::new();
 
+    // The wire, opened AFTER the weights so a connection is never left hanging
+    // while the other end spends a minute building its index. The tail binds and
+    // waits; the head connects, so the tail must be started first.
+    let mut pipe = match pipe_spec.as_deref() {
+        Some(s) if is_head => {
+            let addr = &s["head:".len()..];
+            let t0 = Instant::now();
+            let sock = TcpStream::connect(addr)
+                .with_context(|| format!("connecting to the tail at {addr}"))?;
+            sock.set_nodelay(true)?;
+            println!("  pipe: connected to the tail at {addr} in {:.1}s", t0.elapsed().as_secs_f32());
+            Some(Pipe::Head(sock))
+        }
+        Some(s) if is_tail => {
+            let addr = &s["tail:".len()..];
+            let l = TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
+            println!("  pipe: listening on {addr}");
+            let (sock, peer) = l.accept()?;
+            sock.set_nodelay(true)?;
+            println!("  pipe: head connected from {peer}");
+            Some(Pipe::Tail(sock))
+        }
+        _ => None,
+    };
+
     let mut top_all: Vec<i64> = Vec::new();
     for step in 0..=gen_steps {
+    // A tail's step BEGINS on the wire, and it waits before its own timers
+    // start: a tail that charged itself for the head's half would report the
+    // pipeline's latency as its own cost, and the per-machine split is the
+    // entire question here.
+    let incoming = match pipe.as_mut() {
+        Some(Pipe::Tail(s)) => match recv_stream(s, h)? {
+            Some(v) => Some(v),
+            // The head closed. Not an error -- it is how a finished run ends.
+            None => break,
+        },
+        _ => None,
+    };
+
     let pass = Instant::now();
     let io0 = io_read_bytes();
     cp.io_reset();
@@ -767,8 +978,18 @@ fn main() -> Result<()> {
     } else {
         (ids.clone(), 0)
     };
-    let n = feed.len();
-    let mut x = embed_and_norm(&feed, &embed_w.data, &embed_n.data, t.rms_norm_eps, t.vocab_size, h);
+    // The tail is handed the stream the head already embedded and ran; it takes
+    // `n` and `pos0` from the wire rather than from `ids`, because those are
+    // facts about the pass and only the head owns the token loop.
+    let (n, pos0, mut x) = match incoming {
+        Some((n, p, x)) => (n, p, x),
+        None => {
+            let n = feed.len();
+            let e_w = embed_w.as_ref().expect("the head owns the embedding table");
+            let e_n = embed_n.as_ref().expect("the head owns the embedding norm");
+            (n, pos0, embed_and_norm(&feed, &e_w.data, &e_n.data, t.rms_norm_eps, t.vocab_size, h))
+        }
+    };
 
     if let Ok(dir) = std::env::var("INK_DUMP_DIR") {
         std::fs::create_dir_all(&dir)?;
@@ -802,7 +1023,11 @@ fn main() -> Result<()> {
     // unlike anything downstream of an enqueued device call.
     let mut host_t = (0f64, 0f64);
 
-    for layer in 0..t.num_hidden_layers {
+    for layer in lo..hi {
+        // Cache slot, not layer number. A tail running 20..42 keeps 22 caches
+        // and its first layer is its slot 0 — indexing by the absolute layer
+        // would walk off the end of a Vec that only ever holds this node's half.
+        let slot = layer - lo;
         let l0 = Instant::now();
         let kind = t.attn_kind(layer);
         let is_local = kind == AttnKind::Local;
@@ -905,14 +1130,14 @@ fn main() -> Result<()> {
                         Some(ls),
                         pos0,
                         window,
-                        &mut caches[layer].attn,
+                        &mut caches[slot].attn,
                     );
                     let (out, hist) = dev_lane::short_conv_step(
-                        caches[layer].attn_sconv.clone(),
+                        caches[slot].attn_sconv.clone(),
                         y,
                         sconv_w,
                     );
-                    caches[layer].attn_sconv = hist;
+                    caches[slot].attn_sconv = hist;
                     down(out)
                 } else if kv {
                     let (y, attn) = dev_lane::attention_prefill(
@@ -1174,14 +1399,14 @@ fn main() -> Result<()> {
             {
                 if step > 0 {
                     short_conv_step_host(
-                        &mut caches[layer].mlp_sconv,
+                        &mut caches[slot].mlp_sconv,
                         &y,
                         &mlp_sconv_w,
                         h,
                         t.sconv_kernel_size,
                     )
                 } else {
-                    caches[layer].mlp_sconv =
+                    caches[slot].mlp_sconv =
                         conv_history_host(&y, n, h, t.sconv_kernel_size);
                     short_conv(&y, &mlp_sconv_w, n, h, t.sconv_kernel_size)
                 }
@@ -1208,10 +1433,22 @@ fn main() -> Result<()> {
                  if is_local { "local " } else { "global" }, l0.elapsed().as_secs_f32());
     }
 
-    // ---- head --------------------------------------------------------------
+    // ---- head, or the wire in its place ------------------------------------
     let v = t.effective_vocab();
     let t_h = Instant::now();
-    let logits = if head_on_gpu {
+    // A head has no logits and never will: the rest of the stack and the
+    // unembedding both live on the other machine. So it hands the stream over
+    // and takes the argmax back, and that blocking call is charged to the same
+    // slot the head/unembed occupies on a whole-stack run — which is what makes
+    // the two reports read against each other line for line.
+    let mut best_wire = None;
+    let logits = if let Some(Pipe::Head(s)) = pipe.as_mut() {
+        send_stream(s, n, pos0, &x)?;
+        let mut back = [0u8; 8];
+        s.read_exact(&mut back).context("the tail closed mid-step")?;
+        best_wire = Some(i64::from_le_bytes(back) as usize);
+        Vec::new()
+    } else if head_on_gpu {
         #[cfg(feature = "inkling-cuda")]
         {
             // 109 x 4096 x 200058 is 89 G multiply-adds — the single largest
@@ -1221,7 +1458,7 @@ fn main() -> Result<()> {
             // numerically not.
             let hs = dev_lane::rms_norm(
                 up2::<Bk>(x.clone(), n, h, &dev),
-                up1r(&fnorm.data, h, &dev),
+                up1r(&fnorm.as_ref().expect("the head owns the final norm").data, h, &dev),
                 t.rms_norm_eps,
             )
             .div_scalar(t.logits_mup_width_multiplier as f32);
@@ -1235,13 +1472,41 @@ fn main() -> Result<()> {
     } else {
         head(
             &x,
-            &fnorm.data,
+            &fnorm.as_ref().expect("the head owns the final norm").data,
             &unembed.as_ref().expect("the host head lane needs the unembed table").data,
             t.logits_mup_width_multiplier as f32,
             t.vocab_size, t.effective_vocab(), t.rms_norm_eps, n, h,
         )
     };
     let t_head = t_h.elapsed().as_secs_f64();
+
+    // Greedy: the last position's argmax is the next token. A head took it off
+    // the wire instead of computing it, and either way it is decided HERE --
+    // before the reporting -- so a tail can answer its peer immediately rather
+    // than making the head wait on a page of printing.
+    let best = match best_wire {
+        Some(b) => b,
+        None => {
+            let last = &logits[(n - 1) * v..n * v];
+            let mut best = 0usize;
+            for (i, &val) in last.iter().enumerate() {
+                if val > last[best] {
+                    best = i;
+                }
+            }
+            best
+        }
+    };
+    if let Some(Pipe::Tail(s)) = pipe.as_mut() {
+        s.write_all(&(best as i64).to_le_bytes())?;
+        s.flush()?;
+    }
+    // A tail follows the sequence by RECOMPUTING it, not by being told: it owns
+    // the argmax, so pushing it here keeps its `ids` identical to the head's
+    // without a second thing on the wire to get out of step.
+    if is_tail && gen_steps > 0 {
+        ids.push(best);
+    }
 
     println!("\n=== predictions ===");
     println!("  expert slabs decoded: {expert_loads}");
@@ -1262,7 +1527,17 @@ fn main() -> Result<()> {
     println!("      shared experts    {t_shared:8.1}   ({})", if mlp_on_gpu { "device" } else { "host" });
     println!("      rest of the half  {:8.1}   (routing, dense layers, sconv, norms)",
              t_other - t_expert - t_shared);
-    println!("    head / unembed      {t_head:8.1}   ({})", if head_on_gpu { "device" } else { "host" });
+    println!(
+        "    {:19} {t_head:8.1}   ({})",
+        if best_wire.is_some() { "tail + wire" } else { "head / unembed" },
+        if best_wire.is_some() {
+            "BLOCKING: the other machine's layers, its head, and the round trip"
+        } else if head_on_gpu {
+            "device"
+        } else {
+            "host"
+        }
+    );
     println!("    of the above, host-only tensor reads (mmap + BF16 widening): {:8.1}", t_read.get());
     if experts_on_gpu {
         println!("    of the routed-expert total, the host-synchronous parts:");
@@ -1308,15 +1583,6 @@ fn main() -> Result<()> {
     println!("  elapsed: {:.1}s", started.elapsed().as_secs_f32());
 
 
-    // Greedy: the last position's argmax is the next token.
-    let last = &logits[(n - 1) * v..n * v];
-    let mut best = 0usize;
-    for (i, &val) in last.iter().enumerate() {
-        if val > last[best] {
-            best = i;
-        }
-    }
-
     // Per-position top-5. Uncached, the final pass has recomputed every
     // position, so it reports all of them and earlier passes report nothing.
     // Cached, each pass computes only the positions it was handed and they
@@ -1326,7 +1592,8 @@ fn main() -> Result<()> {
     if !kv {
         top_all.clear();
     }
-    if kv || step == gen_steps {
+    // A head has no logits to rank -- the tail owns the table, and writes it.
+    if (kv || step == gen_steps) && best_wire.is_none() {
         for ti in 0..n {
             let pos = pos0 + ti;
             let row = &logits[ti * v..(ti + 1) * v];
@@ -1345,13 +1612,28 @@ fn main() -> Result<()> {
     if gen_steps > 0 {
         println!("  step {step}: +{best}   [pass {:.1}s, total {:.1}s, ctx {}]",
                  pass.elapsed().as_secs_f32(), started.elapsed().as_secs_f32(), ids.len());
-        ids.push(best);
+        // The tail already pushed, when it answered its peer.
+        if !is_tail {
+            ids.push(best);
+        }
     }
     if step == gen_steps {
         break;
     }
     }
 
+    // A zero-length batch is the head saying it is done, so the tail's loop
+    // ends on a read rather than blocking forever on a peer that has exited.
+    if let Some(Pipe::Head(s)) = pipe.as_mut() {
+        let _ = send_stream(s, 0, 0, &[]);
+    }
+
+    // The head has no top-5 table -- the tail computed the logits and wrote it.
+    // Writing an empty file here would look like a run that produced nothing.
+    if is_head {
+        println!("  head done; the tail wrote the top-5 table. ids {ids:?}");
+        return Ok(());
+    }
     let mut bytes = Vec::new();
     for i in top_all {
         bytes.extend_from_slice(&i.to_le_bytes());
