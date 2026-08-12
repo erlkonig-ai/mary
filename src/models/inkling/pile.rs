@@ -129,7 +129,21 @@ pub mod attrs {
     attributes! {
         /// A packed rank-2 expert. Same anchor as [`weight`], so this is that
         /// attribute at `(NVFP4, 2)` and not a second one beside it.
-        "0B51DA3E67216213871743E045590DBC" unsafe as weight_nvfp4_2:
+        ///
+        /// DELIBERATELY the ANCHORED arm (`as`, not `unsafe as`). Every other
+        /// minted id in this crate is pinned, because a pinned id is a promise
+        /// that data on disk stays reachable. This one is the exception: its
+        /// entire purpose is to COINCIDE with `weight::<NVFP4, 2>()`, which is
+        /// `Attribute::anchored` and therefore derives. Pin it and the two stop
+        /// being the same attribute — the importer writes experts under the
+        /// literal while every generic reader looks under the derived id and
+        /// finds nothing.
+        ///
+        /// That is not hypothetical. A bulk pass on 2026-08-11 converted all 52
+        /// minted ids to `unsafe as` to repair genuine drift, and swept this one
+        /// up with them. Caught before 144 GiB of experts were written under an
+        /// id no reader would have asked for. The invariant is asserted below.
+        "0B51DA3E67216213871743E045590DBC" as weight_nvfp4_2:
             inlineencodings::Handle<Tensor<NVFP4, 2>>;
         // The checkpoint tensor name lives in `metadata::name` as a LongString
         // handle, not here. It was a ShortString attribute until a real name —
@@ -200,6 +214,29 @@ pub fn experts_in_layers(
 pub fn layer_of(tensor_name: &str) -> Option<i64> {
     let rest = tensor_name.split("layers.").nth(1)?;
     rest.split('.').next()?.parse().ok()
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::attrs;
+    use triblespace::core::blob::encodings::tensor::elements::NVFP4;
+
+    /// `weight_nvfp4_2` and `weight::<NVFP4, 2>()` must be ONE attribute.
+    ///
+    /// They are declared two different ways — one through `attributes!`, one
+    /// through `Attribute::anchored` — and nothing but this test keeps them
+    /// equal. A single `unsafe` keyword on the declaration silently separates
+    /// them, and the symptom is an importer and a reader that disagree about
+    /// where the weights are, with no error from either side.
+    #[test]
+    fn nvfp4_expert_attribute_matches_the_generic() {
+        assert_eq!(
+            attrs::weight_nvfp4_2.id(),
+            attrs::weight::<NVFP4, 2>().id(),
+            "weight_nvfp4_2 must be weight::<NVFP4,2>(); if this fails, check \
+             whether the declaration was changed to `unsafe as`"
+        );
+    }
 }
 
 #[cfg(test)]
