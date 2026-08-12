@@ -26,10 +26,29 @@
 //! measurement `transformers` does not ship: run both orders, and the data
 //! picks. The failure mode is "slower than not speculating", visible in one
 //! run, and never a wrong answer.
+//!
+//! # Why a head can be cached, which is not obvious
+//!
+//! An MTP block carries attention, so drafting reads like a whole-sequence
+//! operation and [`mtp_block`] is one. It need not be. A head's input at
+//! position `j` is `(main_hidden[j], embed(token[j + 1]))`, and `main_hidden[j]`
+//! never changes once produced — attention is causal, so nothing later reaches
+//! back and alters it. Its K and V are therefore stable the moment position `j`
+//! exists, for exactly the reason the main model's are, and
+//! [`mtp_block_prefill`] / [`mtp_block_step`] are the pair that keeps them.
+//!
+//! What that leaves is a chain of triangles. Head `d`'s row at position `j`
+//! wants the token at `j + d + 1`, so its newest STABLE row trails the sequence
+//! by `d`, and the `d` rows past it are functions of drafts. Those go into a
+//! CLONE of the cache which is then dropped: rollback is the default and
+//! commitment the exception, because a rejected draft that left K and V behind
+//! shows up as a slowly falling acceptance rate rather than as an error.
 
-use crate::models::inkling::attn::{AttnDims, AttnWeights, LogScaling};
+use crate::models::inkling::attn::{causal_mask, AttnDims, AttnWeights, LogScaling};
 use crate::models::inkling::block::rms_norm;
-use crate::models::inkling::layer::{decoder_layer, LayerMlp, LayerWeights};
+use crate::models::inkling::layer::{
+    decoder_layer_prefill, decoder_layer_step, LayerCache, LayerMlp, LayerWeights,
+};
 
 /// Which operand occupies the first `hidden` columns of `input_proj`'s input.
 ///
@@ -78,25 +97,25 @@ pub struct MtpHead<'a> {
     pub mlp: LayerMlp<'a>,
 }
 
-/// Run one MTP head over a whole sequence and return its hidden states.
+/// Everything one MTP head retains between generated tokens.
 ///
-/// `hidden` is `[tokens, hidden]` from the previous stage — the main stack for
-/// head 0, the previous head thereafter. `embeds` is `[tokens, hidden]`, the
-/// embedding of the token each position is being asked to predict FROM; the
-/// caller does the shifting, because the shift is what distinguishes head `i`
-/// from head `i+1` and hiding it in here would make the chain opaque.
+/// The same three things any decoder layer retains — see
+/// [`crate::models::inkling::layer::LayerCache`]. Named here because the head's
+/// callers never touch a layer directly, and because a head's cache is indexed
+/// by ITS position, which trails the sequence by the head's depth.
+pub type MtpCache = LayerCache;
+
+/// The wrapper half: norm each operand by its own weight, concatenate, project.
 ///
-/// The block carries attention, so this is a whole-sequence operation and not
-/// a per-position one. That is why the sequence is an argument rather than the
-/// last row: drafting from the final position still needs the positions before
-/// it to attend over.
-pub fn mtp_block(
+/// Factored out because both the whole-sequence and the single-position entries
+/// need it and a second transcription of a concat order is exactly the kind of
+/// thing that drifts silently — the two orders differ only in which `hidden`
+/// columns of `input_proj` a value lands in.
+fn mtp_input(
     hidden: &[f32],
     embeds: &[f32],
     head: &MtpHead<'_>,
     dims: &AttnDims,
-    log_scaling: Option<LogScaling>,
-    mask: &[f32],
     tokens: usize,
     order: Concat,
 ) -> Vec<f32> {
@@ -133,7 +152,94 @@ pub fn mtp_block(
             x[t * h + o] = acc;
         }
     }
+    x
+}
 
-    let (y, _) = decoder_layer(&x, &head.lw, &head.aw, dims, log_scaling, &head.mlp, mask, tokens);
+/// Run one MTP head over a whole sequence and return its hidden states.
+///
+/// `hidden` is `[tokens, hidden]` from the previous stage — the main stack for
+/// head 0, the previous head thereafter. `embeds` is `[tokens, hidden]`, the
+/// embedding of the token each position is being asked to predict FROM; the
+/// caller does the shifting, because the shift is what distinguishes head `i`
+/// from head `i+1` and hiding it in here would make the chain opaque.
+///
+/// `window` is the sliding window on a local head and `None` on a global one;
+/// the causal mask follows from it, so there is no way to pass a mask that
+/// disagrees with the cache's idea of what a query may reach.
+///
+/// [`mtp_block_prefill`] with the cache dropped.
+pub fn mtp_block(
+    hidden: &[f32],
+    embeds: &[f32],
+    head: &MtpHead<'_>,
+    dims: &AttnDims,
+    log_scaling: Option<LogScaling>,
+    window: Option<usize>,
+    tokens: usize,
+    order: Concat,
+) -> Vec<f32> {
+    mtp_block_prefill(hidden, embeds, head, dims, log_scaling, window, tokens, order).0
+}
+
+/// The same, keeping what a single-position draft will need.
+///
+/// The cache is indexed by the HEAD's positions, which are the sequence's:
+/// head `d`'s row `j` sits at absolute position `j`, it is just that `j` only
+/// becomes stable once the token at `j + d + 1` exists.
+pub fn mtp_block_prefill(
+    hidden: &[f32],
+    embeds: &[f32],
+    head: &MtpHead<'_>,
+    dims: &AttnDims,
+    log_scaling: Option<LogScaling>,
+    window: Option<usize>,
+    tokens: usize,
+    order: Concat,
+) -> (Vec<f32>, MtpCache) {
+    let x = mtp_input(hidden, embeds, head, dims, tokens, order);
+    let mask = causal_mask(tokens, window);
+    let (y, _, cache) = decoder_layer_prefill(
+        &x,
+        &head.lw,
+        &head.aw,
+        dims,
+        log_scaling,
+        &head.mlp,
+        &mask,
+        tokens,
+        window,
+    );
+    (y, cache)
+}
+
+/// One position of one MTP head, reading the cache.
+///
+/// This is what makes drafting affordable: the same shape the main model's
+/// decode step already has, against K and V the prefix has already paid for.
+/// Pass a CLONE of the cache for a speculative position — the row it appends
+/// must not survive a rejected draft.
+pub fn mtp_block_step(
+    hidden: &[f32],
+    embeds: &[f32],
+    head: &MtpHead<'_>,
+    dims: &AttnDims,
+    log_scaling: Option<LogScaling>,
+    pos: usize,
+    window: Option<usize>,
+    cache: &mut MtpCache,
+    order: Concat,
+) -> Vec<f32> {
+    let x = mtp_input(hidden, embeds, head, dims, 1, order);
+    let (y, _) = decoder_layer_step(
+        &x,
+        &head.lw,
+        &head.aw,
+        dims,
+        log_scaling,
+        &head.mlp,
+        pos,
+        window,
+        cache,
+    );
     y
 }
