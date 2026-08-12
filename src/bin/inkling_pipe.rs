@@ -29,12 +29,10 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use memmap2::Mmap;
-use safetensors::SafeTensors;
 
 use burn::prelude::Backend;
 use burn::tensor::{Int, Tensor, TensorData};
@@ -43,7 +41,8 @@ use mary::models::inkling::attn::{attention, causal_mask, AttnDims, AttnWeights,
 use mary::models::inkling::block::{rms_norm, route, short_conv, Routing};
 use mary::models::inkling::burn::{deinterleave_rows_device, expert_ffn, expert_weight_from_packed};
 use mary::models::inkling::config::{AttnKind, InklingConfig, InklingTextConfig};
-use mary::models::inkling::load::{split_gate_up, Checkpoint};
+use mary::models::inkling::load::split_gate_up;
+use mary::models::inkling::source::Weights;
 use mary::models::inkling::mlp::{dense_mlp, shared_experts};
 use mary::models::inkling::stack::{embed_and_norm, head};
 
@@ -67,59 +66,6 @@ fn io_read_bytes() -> u64 {
         .unwrap_or(0)
 }
 
-/// Which layer a checkpoint tensor belongs to, or `None` for the ends.
-///
-/// The embedding, the final norm and the unembedding carry no layer. Returning
-/// `None` rather than 0 keeps them from silently joining the first node's
-/// share, which would look like a working split and be a wrong one.
-fn layer_of(name: &str) -> Option<usize> {
-    let rest = name.split("layers.").nth(1)?;
-    rest.split('.').next()?.parse().ok()
-}
-
-/// Fault this node's share into the page cache, and report what it cost.
-///
-/// Touching one byte per 4 KiB page is enough — the kernel's readahead turns a
-/// forward-sequential fault pattern into large sequential reads. The checksum
-/// exists so the loop is not optimised away.
-fn warm(dir: &Path, lo: usize, hi: usize) -> Result<(u64, u64)> {
-    let text = std::fs::read_to_string(dir.join("model.safetensors.index.json"))?;
-    let v: serde_json::Value = serde_json::from_str(&text)?;
-    let map = v.get("weight_map").and_then(|m| m.as_object()).context("weight_map")?;
-
-    let mut by_shard: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (name, shard) in map {
-        let keep = match layer_of(name) {
-            Some(l) => l >= lo && l < hi,
-            // The ends are loaded eagerly by whoever needs them; warming them
-            // here would double-count and, on the wrong node, waste 3 GiB of
-            // cache on a table it never reads.
-            None => false,
-        };
-        if keep {
-            by_shard.entry(shard.as_str().unwrap_or("").to_string()).or_default().push(name.clone());
-        }
-    }
-
-    let (mut bytes, mut sum) = (0u64, 0u64);
-    for (shard, names) in &by_shard {
-        let file = std::fs::File::open(dir.join(shard))?;
-        // SAFETY: the checkpoint is read-only and nothing else writes it.
-        let mmap = unsafe { Mmap::map(&file) }?;
-        let st = SafeTensors::deserialize(&mmap)?;
-        for name in names {
-            let d = st.tensor(name)?.data();
-            bytes += d.len() as u64;
-            let mut i = 0usize;
-            while i < d.len() {
-                sum = sum.wrapping_add(d[i] as u64);
-                i += 4096;
-            }
-        }
-    }
-    Ok((bytes, sum))
-}
-
 /// Every routed expert of one layer, on the device, without a host f32 copy.
 ///
 /// Lifted unchanged in behaviour from `inkling_forward`: the host never sees a
@@ -127,7 +73,7 @@ fn warm(dir: &Path, lo: usize, hi: usize) -> Result<(u64, u64)> {
 /// the device, and each distinct expert is decoded once for all of its tokens.
 #[allow(clippy::too_many_arguments)]
 fn routed_experts_gpu<B: Backend>(
-    cp: &Checkpoint,
+    cp: &Weights,
     prefix: &str,
     by_expert: &BTreeMap<usize, Vec<(usize, f32)>>,
     hn: &[f32],
@@ -144,19 +90,19 @@ fn routed_experts_gpu<B: Backend>(
         let n2 = format!("{prefix}mlp.experts.w2_weight");
 
         let (fused, dn) = if cp.is_nvfp4(&n13) {
-            let w13 = cp.expert_slice_packed(&n13, e)?;
-            let w2 = cp.expert_slice_packed(&n2, e)?;
+            let w13 = cp.expert_packed(&n13, e)?;
+            let w2 = cp.expert_packed(&n2, e)?;
             (
                 expert_weight_from_packed::<B>(
-                    &w13.codes, &w13.scales, w13.scale2, w13.rows, w13.cols, dev,
+                    w13.codes(), w13.scales(), w13.scale2(), w13.rows(), w13.cols(), dev,
                 ),
                 expert_weight_from_packed::<B>(
-                    &w2.codes, &w2.scales, w2.scale2, w2.rows, w2.cols, dev,
+                    w2.codes(), w2.scales(), w2.scale2(), w2.rows(), w2.cols(), dev,
                 ),
             )
         } else {
-            let a = cp.expert_slice(&n13, e)?;
-            let b = cp.expert_slice(&n2, e)?;
+            let a = cp.expert_f32(&n13, e)?;
+            let b = cp.expert_f32(&n2, e)?;
             (
                 Tensor::<B, 2>::from_data(TensorData::new(a.data, [2 * inter, h]), dev),
                 Tensor::<B, 2>::from_data(TensorData::new(b.data, [h, inter]), dev),
@@ -187,7 +133,7 @@ fn routed_experts_gpu<B: Backend>(
 /// single-machine forward exactly.
 #[allow(clippy::too_many_arguments)]
 fn run_layers(
-    cp: &Checkpoint,
+    cp: &Weights,
     t: &InklingTextConfig,
     x: &mut [f32],
     n: usize,
@@ -334,6 +280,8 @@ fn bytes_to_f32s(b: &[u8]) -> Vec<f32> {
 
 struct Args {
     ckpt: PathBuf,
+    pile: Option<PathBuf>,
+    branch: String,
     role: String,
     lo: usize,
     hi: usize,
@@ -346,14 +294,16 @@ struct Args {
 
 fn parse() -> Result<Args> {
     let mut a = Args {
-        ckpt: PathBuf::new(), role: String::new(), lo: 0, hi: 0,
+        ckpt: PathBuf::new(), pile: None, branch: "inkling".to_string(),
+        role: String::new(), lo: 0, hi: 0,
         addr: String::new(), ids: None, gen: 0, warm: false, dump: None,
     };
     let v: Vec<String> = std::env::args().skip(1).collect();
     if v.is_empty() {
         anyhow::bail!(
-            "usage: inkling_pipe --ckpt DIR --role head|tail --layers LO:HI \
-             (--peer HOST:PORT | --listen ADDR:PORT) [--ids F] [--gen N] [--warm] [--dump DIR]"
+            "usage: inkling_pipe --ckpt DIR [--pile P [--branch B]] --role head|tail \
+             --layers LO:HI (--peer HOST:PORT | --listen ADDR:PORT) [--ids F] [--gen N] \
+             [--warm] [--dump DIR]"
         );
     }
     let mut i = 0;
@@ -365,6 +315,8 @@ fn parse() -> Result<Args> {
         };
         match k {
             "--ckpt" => a.ckpt = PathBuf::from(next(&mut i)?),
+            "--pile" => a.pile = Some(PathBuf::from(next(&mut i)?)),
+            "--branch" => a.branch = next(&mut i)?,
             "--role" => a.role = next(&mut i)?,
             "--layers" => {
                 let s = next(&mut i)?;
@@ -391,19 +343,24 @@ fn main() -> Result<()> {
     let cfg = InklingConfig::from_json(&cfg_text).context("parsing config.json")?;
     let t = &cfg.text_config;
     let h = t.hidden_size;
-    let cp = Checkpoint::open(&a.ckpt)?;
+    // `--ckpt` is always the config; `--pile` swaps the WEIGHT source.
+    let cp = match &a.pile {
+        Some(p) => Weights::open_pile(p, &a.branch)?,
+        None => Weights::open_ckpt(&a.ckpt)?,
+    };
     let dev = burn::backend::cuda::CudaDevice::default();
 
     println!("=== inkling_pipe {} layers {}..{} ===", a.role, a.lo, a.hi);
-    println!("  checkpoint : {}", a.ckpt.display());
+    println!("  config     : {}", a.ckpt.display());
+    println!("  weights    : {}", cp.kind());
     println!("  hidden {h}  layers {}  experts {}+{}", t.num_hidden_layers, t.n_routed_experts, t.n_shared_experts);
 
     if a.warm {
         let t0 = Instant::now();
         let before = io_read_bytes();
-        let (bytes, _sum) = warm(&a.ckpt, a.lo, a.hi)?;
+        let (bytes, leaves) = cp.warm(a.lo as i64..=a.hi as i64 - 1)?;
         let disk = io_read_bytes() - before;
-        println!("  warmed {:.1} GiB of layer share in {:.1}s ({:.0} MB/s), {:.1} GiB off disk",
+        println!("  warmed {:.1} GiB of layer share ({leaves} leaves) in {:.1}s ({:.0} MB/s), {:.1} GiB off disk",
                  bytes as f64 / (1u64 << 30) as f64, t0.elapsed().as_secs_f32(),
                  bytes as f64 / 1e6 / t0.elapsed().as_secs_f64().max(1e-9),
                  disk as f64 / (1u64 << 30) as f64);
@@ -421,9 +378,9 @@ fn main() -> Result<()> {
             for pass in 1..=2 {
                 let t0 = Instant::now();
                 let before = io_read_bytes();
-                let (bytes, _s) = warm(&a.ckpt, a.lo, a.hi)?;
+                let (bytes, leaves) = cp.warm(a.lo as i64..=a.hi as i64 - 1)?;
                 let disk = io_read_bytes() - before;
-                println!("  pass {pass}: touched {:.1} GiB in {:.1}s, {:.2} GiB came off disk",
+                println!("  pass {pass}: touched {:.1} GiB in {leaves} leaves in {:.1}s, {:.2} GiB came off disk",
                          bytes as f64 / (1u64 << 30) as f64,
                          t0.elapsed().as_secs_f32(),
                          disk as f64 / (1u64 << 30) as f64);

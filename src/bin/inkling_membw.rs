@@ -31,7 +31,7 @@ use anyhow::{Context, Result};
 use cubecl::prelude::*;
 use memmap2::Mmap;
 
-use mary::models::inkling::fp4gemm::alias_bytes;
+use mary::models::inkling::fp4gemm::Aliases;
 
 type Rt = cubecl::cuda::CudaRuntime;
 
@@ -141,13 +141,22 @@ fn main() -> Result<()> {
     // SAFETY: the checkpoint is read-only and nothing else writes it.
     let map = Arc::new(unsafe { Mmap::map(&file) }?);
     anyhow::ensure!(map.len() > bytes + 4096, "{shard} is smaller than the working set");
-    // Page-aligned: `alias_bytes` needs 4-byte alignment and a page boundary is
-    // the least surprising way to be sure of it.
+    // Page-aligned: aliasing needs 4-byte alignment and a page boundary is the
+    // least surprising way to be sure of it.
     let off = ((map.len() - bytes) / 4096) * 4096;
     let slice: &[u8] = &map[off..off + bytes];
 
     let io0 = io_read_bytes();
-    let h_host = alias_bytes(&client, slice, map.clone()).context("aliasing refused")?;
+    let al = Aliases::register(
+        &client,
+        vec![(
+            map.as_ptr() as usize,
+            map.len(),
+            map.clone() as Arc<dyn std::any::Any + Send + Sync>,
+        )],
+    )
+    .context("the device cannot address host memory directly")?;
+    let h_host = al.slice(slice).context("aliasing refused")?;
     let cold = time_read(&client, &h_host, n_f32);
     let cold_disk = io_read_bytes() - io0;
     println!(

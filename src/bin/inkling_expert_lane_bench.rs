@@ -258,23 +258,23 @@ fn main() -> Result<()> {
     // ---------------------------------------------------------------- H
     // The replacement source: headers parsed once, slabs borrowed not copied.
     {
-        use mary::models::inkling::fp4gemm::ExpertSource;
+        use mary::models::inkling::source::Weights;
         let t = Instant::now();
-        let src = ExpertSource::open(&ckpt)?;
+        let src = Weights::open_ckpt(&ckpt)?;
         let open_ms = ms(t.elapsed());
         println!();
-        println!("H. ExpertSource::open (ALL shard headers, ONCE)      : {:8.2} ms  (one-time)", open_ms);
+        println!("H. Weights::open_ckpt (the shard index, ONCE)        : {:8.2} ms  (one-time)", open_ms);
 
         let mut t_e = std::time::Duration::ZERO;
         let mut acc = 0u64;
         for e in 0..n_experts {
             let t = Instant::now();
-            let a = src.expert(&base13(), e)?;
-            let b = src.expert(&base2(), e)?;
+            let a = src.expert_packed(&base13(), e)?;
+            let b = src.expert_packed(&base2(), e)?;
             t_e += t.elapsed();
-            acc += a.codes[0] as u64 + b.codes[0] as u64 + a.scales[0] as u64;
+            acc += a.codes()[0] as u64 + b.codes()[0] as u64 + a.scales()[0] as u64;
         }
-        println!("I. ExpertSource::expert x2 per expert (borrowed)     : {:8.4} ms/expert   [vs B above]", ms(t_e) / n_experts as f64);
+        println!("I. Weights::expert_packed x2 per expert (borrowed)   : {:8.4} ms/expert   [vs B above]", ms(t_e) / n_experts as f64);
 
         use cubecl::prelude::*;
         type Rt = cubecl::cuda::CudaRuntime;
@@ -284,12 +284,12 @@ fn main() -> Result<()> {
         let t = Instant::now();
         let mut keep = Vec::new();
         for e in 0..n_experts {
-            let a = src.expert(&base13(), e)?;
-            let b = src.expert(&base2(), e)?;
-            keep.push(client.create_from_slice(a.codes));
-            keep.push(client.create_from_slice(a.scales));
-            keep.push(client.create_from_slice(b.codes));
-            keep.push(client.create_from_slice(b.scales));
+            let a = src.expert_packed(&base13(), e)?;
+            let b = src.expert_packed(&base2(), e)?;
+            keep.push(client.create_from_slice(a.codes()));
+            keep.push(client.create_from_slice(a.scales()));
+            keep.push(client.create_from_slice(b.codes()));
+            keep.push(client.create_from_slice(b.scales()));
         }
         client.sync();
         let t_new = t.elapsed();
@@ -310,29 +310,30 @@ fn main() -> Result<()> {
         use cubecl::prelude::*;
         use mary::models::inkling::burn::{deinterleave_rows_device, expert_ffn, expert_weight_from_packed};
         use mary::models::inkling::fp4gemm::{
-            fp4_linear_launch, gate_up_silu_launch, upload_quantized_act, ExpertSource,
+            fp4_linear_launch, gate_up_silu_launch, upload_quantized_act,
         };
+        use mary::models::inkling::source::Weights;
         type Bk = burn::backend::Cuda<f32>;
         type Rt = cubecl::cuda::CudaRuntime;
 
-        let src = ExpertSource::open(&ckpt)?;
-        let w13 = src.expert(&base13(), 0)?;
-        let w2 = src.expert(&base2(), 0)?;
-        let (nn, kk) = (w13.rows, w13.cols * 2);
+        let src = Weights::open_ckpt(&ckpt)?;
+        let w13 = src.expert_packed(&base13(), 0)?;
+        let w2 = src.expert_packed(&base2(), 0)?;
+        let (nn, kk) = (w13.rows(), w13.cols() * 2);
         let inter = nn / 2;
         let tokens = 5usize;
 
         // A real activation: decoded rows of another expert.
         let mut x = vec![0f32; tokens * kk];
         {
-            let p = src.expert(&base13(), 7)?;
+            let p = src.expert_packed(&base13(), 7)?;
             for r in 0..tokens {
                 for j in 0..kk {
-                    let byte = p.codes[r * (kk / 2) + j / 2];
+                    let byte = p.codes()[r * (kk / 2) + j / 2];
                     let c = if j % 2 == 0 { byte & 0x0F } else { byte >> 4 };
                     x[r * kk + j] = mary::models::inkling::nvfp4::FP4_E2M1[c as usize]
-                        * mary::models::inkling::nvfp4::e4m3_to_f32(p.scales[r * (kk / 16) + j / 16])
-                        * p.scale2;
+                        * mary::models::inkling::nvfp4::e4m3_to_f32(p.scales()[r * (kk / 16) + j / 16])
+                        * p.scale2();
                 }
             }
         }
@@ -343,15 +344,15 @@ fn main() -> Result<()> {
         let client = Rt::client(&Default::default());
         let run_fp4 = |client: &ComputeClient<Rt>| {
             let (a, asc, m_pad) = upload_quantized_act(client, &x, tokens, kk);
-            let b = client.create_from_slice(w13.codes);
-            let bsc = client.create_from_slice(w13.scales);
-            let both = fp4_linear_launch(client, &a, &asc, &b, &bsc, m_pad, kk, nn, w13.scale2);
+            let b = client.create_from_slice(w13.codes());
+            let bsc = client.create_from_slice(w13.scales());
+            let both = fp4_linear_launch(client, &a, &asc, &b, &bsc, m_pad, kk, nn, w13.scale2());
             let act = gate_up_silu_launch(client, &both, m_pad, inter);
             let actf = f32::from_bytes(&client.read_one(act).expect("read")).to_vec();
             let (a2, asc2, _) = upload_quantized_act(client, &actf, m_pad, inter);
-            let b2 = client.create_from_slice(w2.codes);
-            let bsc2 = client.create_from_slice(w2.scales);
-            fp4_linear_launch(client, &a2, &asc2, &b2, &bsc2, m_pad, inter, w2.rows, w2.scale2)
+            let b2 = client.create_from_slice(w2.codes());
+            let bsc2 = client.create_from_slice(w2.scales());
+            fp4_linear_launch(client, &a2, &asc2, &b2, &bsc2, m_pad, inter, w2.rows(), w2.scale2())
         };
         let h = run_fp4(&client);
         client.sync();
@@ -370,10 +371,10 @@ fn main() -> Result<()> {
             Tensor::from_data(TensorData::new(x.clone(), [tokens, kk]), &dev);
         let run_f32 = || {
             let gu = expert_weight_from_packed::<Bk>(
-                w13.codes, w13.scales, w13.scale2, w13.rows, w13.cols, &dev,
+                w13.codes(), w13.scales(), w13.scale2(), w13.rows(), w13.cols(), &dev,
             );
             let dn = expert_weight_from_packed::<Bk>(
-                w2.codes, w2.scales, w2.scale2, w2.rows, w2.cols, &dev,
+                w2.codes(), w2.scales(), w2.scale2(), w2.rows(), w2.cols(), &dev,
             );
             expert_ffn(xt.clone(), deinterleave_rows_device(gu), dn)
         };

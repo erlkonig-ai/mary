@@ -10,9 +10,16 @@
 //! That makes the interesting failure mode a lifetime bug rather than an
 //! addressing one, and lifetime bugs here are nasty: a kernel reading unmapped
 //! pages does not reliably fault, it reads whatever the address holds now. So
-//! the third check below deliberately destroys the `ExpertSource` — every
-//! `Mmap` it owns — while a handle is still alive, and then reads through that
+//! the third check below deliberately destroys the weight source — every
+//! mapping it owns — while a handle is still alive, and then reads through that
 //! handle. It passes only if the keepalive really is holding the mapping.
+//!
+//! Runs against EITHER backing: a checkpoint directory or a `.pile`. The seam
+//! is the same one — [`Aliases`] registers whatever mappings the source reads
+//! through and locates a slab inside them by pointer containment — so a pile,
+//! being one file, is one registration where the checkpoint is nine.
+//!
+//!   inkling_zerocopy_gate <ckpt-dir | pile> [branch]
 //!
 //! Build: `--features cuda-backend,inkling`
 
@@ -22,10 +29,9 @@ use std::time::Instant;
 use anyhow::Result;
 use cubecl::prelude::*;
 
-use mary::models::inkling::fp4gemm::{
-    alias_bytes, fp4_linear_launch, upload_quantized_act, ExpertSource,
-};
+use mary::models::inkling::fp4gemm::{fp4_linear_launch, upload_quantized_act, Aliases};
 use mary::models::inkling::nvfp4::{e4m3_to_f32, FP4_E2M1};
+use mary::models::inkling::source::Weights;
 
 type Rt = cubecl::cuda::CudaRuntime;
 const LAYER: usize = 10;
@@ -48,9 +54,19 @@ fn main() -> Result<()> {
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("models/thinkingmachines-inkling-small-nvfp4"));
+    let branch = std::env::args().nth(2).unwrap_or_else(|| "inkling".to_string());
     let b13 = format!("model.llm.layers.{LAYER}.mlp.experts.w13_weight");
+    // One line decides the backing, and nothing below it knows which won.
+    let open = || -> Result<Weights> {
+        if dir.extension().map(|e| e == "pile").unwrap_or(false) {
+            Weights::open_pile(&dir, &branch)
+        } else {
+            Weights::open_ckpt(&dir)
+        }
+    };
 
     let client = Rt::client(&Default::default());
+    println!("  source : {}", open()?.kind());
     println!("=== zero-copy seam ===");
     println!(
         "  device can address host memory directly : {}",
@@ -60,45 +76,48 @@ fn main() -> Result<()> {
     // ---------------------------------------------------------------- 1
     // Alignment of what we are actually going to alias.
     {
-        let src = ExpertSource::open(&dir)?;
-        let w = src.expert(&b13, 0)?;
+        let src = open()?;
+        let w = src.expert_packed(&b13, 0)?;
         println!(
             "  w13 expert-0 slab: {:.1} MB at {:p}  (mod 4 = {}, mod 16 = {})",
-            w.codes.len() as f64 / 1e6,
-            w.codes.as_ptr(),
-            w.codes.as_ptr() as usize % 4,
-            w.codes.as_ptr() as usize % 16,
+            w.codes().len() as f64 / 1e6,
+            w.codes().as_ptr(),
+            w.codes().as_ptr() as usize % 4,
+            w.codes().as_ptr() as usize % 16,
         );
         println!(
             "  scale slab:        {:.1} MB at {:p}  (mod 16 = {})",
-            w.scales.len() as f64 / 1e6,
-            w.scales.as_ptr(),
-            w.scales.as_ptr() as usize % 16,
+            w.scales().len() as f64 / 1e6,
+            w.scales().as_ptr(),
+            w.scales().as_ptr() as usize % 16,
         );
+        println!("  mappings to register: {}", src.mappings()?.len());
     }
 
     // ---------------------------------------------------------------- 2
     // Aliased vs copied, through the real expert GEMM. Same bytes and the same
     // kernel, so anything but a bitwise match is the seam's fault.
     let (n, k, worst, bitmatch, gbps_alias, gbps_copy) = {
-        let src = ExpertSource::open(&dir)?;
-        let w13 = src.expert(&b13, 0)?;
-        let (n, k) = (w13.rows, w13.cols * 2);
+        let src = open()?;
+        let al = Aliases::register(&client, src.mappings()?)
+            .expect("the device cannot address host memory directly");
+        let w13 = src.expert_packed(&b13, 0)?;
+        let (n, k) = (w13.rows(), w13.cols() * 2);
 
-        let probe = src.expert(&b13, 7)?;
+        let probe = src.expert_packed(&b13, 7)?;
         let tokens = 5usize;
-        let x = decode(probe.codes, probe.scales, tokens, k, probe.scale2);
+        let x = decode(probe.codes(), probe.scales(), tokens, k, probe.scale2());
         let (a, asc, m_pad) = upload_quantized_act(&client, &x, tokens, k);
 
-        let alias_codes = alias_bytes(&client, w13.codes, w13.codes_keep.clone())
+        let alias_codes = al
+            .slice(w13.codes())
             .expect("aliasing refused -- see the alignment line above");
-        let alias_scales = alias_bytes(&client, w13.scales, w13.scales_keep.clone())
-            .expect("aliasing refused for scales");
-        let copy_codes = client.create_from_slice(w13.codes);
-        let copy_scales = client.create_from_slice(w13.scales);
+        let alias_scales = al.slice(w13.scales()).expect("aliasing refused for scales");
+        let copy_codes = client.create_from_slice(w13.codes());
+        let copy_scales = client.create_from_slice(w13.scales());
 
         let run = |bc: &cubecl::server::Handle, bs: &cubecl::server::Handle| {
-            fp4_linear_launch(&client, &a, &asc, bc, bs, m_pad, k, n, w13.scale2)
+            fp4_linear_launch(&client, &a, &asc, bc, bs, m_pad, k, n, w13.scale2())
         };
 
         let ya = f32::from_bytes(&client.read_one(run(&alias_codes, &alias_scales)).unwrap()).to_vec();
@@ -112,7 +131,7 @@ fn main() -> Result<()> {
             let (ac, asb) = mary::models::inkling::fp4gemm::quantize_act_host(&padded, k);
             decode(&ac, &asb, tokens, k, 1.0)
         };
-        let b_deq = decode(w13.codes, w13.scales, n, k, w13.scale2);
+        let b_deq = decode(w13.codes(), w13.scales(), n, k, w13.scale2());
         let mut worst = 0.0f64;
         for r in 0..tokens {
             for c in (0..n).step_by(211) {
@@ -128,7 +147,7 @@ fn main() -> Result<()> {
         }
 
         // Bandwidth: the GEMM streams the whole weight once per call.
-        let bytes = (w13.codes.len() + w13.scales.len()) as f64;
+        let bytes = (w13.codes().len() + w13.scales().len()) as f64;
         let reps = 20;
         let bench = |bc: &cubecl::server::Handle, bs: &cubecl::server::Handle| {
             let h = run(bc, bs);
@@ -159,13 +178,15 @@ fn main() -> Result<()> {
     // The lifetime gate. Destroy every mapping the source owns while a handle
     // derived from it is still alive, then read through that handle.
     let (handle, expected) = {
-        let src = ExpertSource::open(&dir)?;
-        let w = src.expert(&b13, 3)?;
-        let expected = w.codes[..4096].to_vec();
-        let h = alias_bytes(&client, w.codes, w.codes_keep.clone()).expect("alias");
+        let src = open()?;
+        let al = Aliases::register(&client, src.mappings()?).expect("zero copy");
+        let w = src.expert_packed(&b13, 3)?;
+        let expected = w.codes()[..4096].to_vec();
+        let h = al.slice(w.codes()).expect("alias");
         (h, expected)
-        // `src` — and every `Mmap` it owns — is dropped HERE. The only thing
-        // left holding those pages is the Arc inside cubecl's storage entry.
+        // `src`, `al` — and every mapping they own — are dropped HERE. The only
+        // thing left holding those pages is the Arc inside cubecl's storage
+        // entry.
     };
     // Churn the address space so a stale mapping would be likely to show up as
     // something other than the bytes we want.

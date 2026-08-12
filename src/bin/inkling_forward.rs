@@ -16,7 +16,16 @@
 //! Each distinct expert is decoded ONCE and applied to every token that chose
 //! it; decoding per (token, expert) pair would repeat most of the work.
 //!
-//!   cargo run --release --features inkling --bin inkling_forward -- <ckpt> <ids.bin> <out.bin>
+//! # Where the weights come from
+//!
+//! `<ckpt>` is a safetensors checkpoint directory. `INK_PILE=<path>` swaps the
+//! WEIGHT source for a pile on branch `INK_PILE_BRANCH` (default `inkling`) —
+//! the directory is then read only for `config.json`, which is not a weight and
+//! does not live in the pile. One environment variable is the whole A/B, which
+//! is the point: everything below this line is the same code either way.
+//!
+//!   cargo run --release --features inkling-cuda,cuda-backend --bin inkling_forward \
+//!       -- <ckpt> <ids.bin> <out.bin>
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -27,7 +36,8 @@ use anyhow::{Context, Result};
 use mary::models::inkling::attn::{attention, causal_mask, AttnDims, AttnWeights, LogScaling};
 use mary::models::inkling::block::{rms_norm, route, short_conv, Routing};
 use mary::models::inkling::config::{AttnKind, InklingConfig};
-use mary::models::inkling::load::{deinterleave_fused, split_gate_up, Checkpoint, Held, Loaded};
+use mary::models::inkling::load::{deinterleave_fused, split_gate_up, Held, Loaded};
+use mary::models::inkling::source::Weights;
 use mary::models::inkling::mlp::{dense_mlp, shared_experts};
 use mary::models::inkling::stack::{embed_and_norm, head};
 
@@ -208,7 +218,7 @@ impl DeviceDense {
     #[allow(clippy::too_many_arguments)]
     fn shared_for(
         &mut self,
-        cp: &Checkpoint,
+        cp: &Weights,
         p: &str,
         n_shared: usize,
         inter: usize,
@@ -240,7 +250,7 @@ impl DeviceDense {
     /// One dense layer's MLP, uploaded on first use.
     fn dense_for(
         &mut self,
-        cp: &Checkpoint,
+        cp: &Weights,
         p: &str,
         h: usize,
         dev: &burn::backend::cuda::CudaDevice,
@@ -288,7 +298,7 @@ impl DeviceDense {
 #[cfg(feature = "inkling-cuda")]
 #[allow(clippy::too_many_arguments)]
 fn routed_experts_gpu(
-    cp: &Checkpoint,
+    cp: &Weights,
     prefix: &str,
     by_expert: &BTreeMap<usize, Vec<(usize, f32)>>,
     hn: &[f32],
@@ -321,35 +331,35 @@ fn routed_experts_gpu(
         let deint = std::env::var("INK_MUTATE_NO_DEINTERLEAVE").is_err();
         let t_s = Instant::now();
         let gu_dn = if cp.is_nvfp4(&n13) {
-            let w13 = cp.expert_packed_ref(&n13, e)?;
-            let w2 = cp.expert_packed_ref(&n2, e)?;
+            let w13 = cp.expert_packed(&n13, e)?;
+            let w2 = cp.expert_packed(&n2, e)?;
             host.0 += t_s.elapsed().as_secs_f64();
             let t_w = Instant::now();
             let r = if chain_decode {
                 let gu = expert_weight_from_packed::<B>(
-                    w13.codes(), w13.scales(), w13.scale2, w13.rows, w13.cols, dev,
+                    w13.codes(), w13.scales(), w13.scale2(), w13.rows(), w13.cols(), dev,
                 );
                 (
                     if deint { deinterleave_rows_device(gu) } else { gu },
                     expert_weight_from_packed::<B>(
-                        w2.codes(), w2.scales(), w2.scale2, w2.rows, w2.cols, dev,
+                        w2.codes(), w2.scales(), w2.scale2(), w2.rows(), w2.cols(), dev,
                     ),
                 )
             } else {
                 (
                     expert_weight_fused(
-                        w13.codes(), w13.scales(), w13.scale2, w13.rows, w13.cols, deint, dev,
+                        w13.codes(), w13.scales(), w13.scale2(), w13.rows(), w13.cols(), deint, dev,
                     ),
                     expert_weight_fused(
-                        w2.codes(), w2.scales(), w2.scale2, w2.rows, w2.cols, false, dev,
+                        w2.codes(), w2.scales(), w2.scale2(), w2.rows(), w2.cols(), false, dev,
                     ),
                 )
             };
             host.1 += t_w.elapsed().as_secs_f64();
             r
         } else {
-            let a = cp.expert_slice(&n13, e)?;
-            let b = cp.expert_slice(&n2, e)?;
+            let a = cp.expert_f32(&n13, e)?;
+            let b = cp.expert_f32(&n2, e)?;
             host.0 += t_s.elapsed().as_secs_f64();
             let t_w = Instant::now();
             let fused = Tensor::<B, 2>::from_data(TensorData::new(a.data, [2 * inter, h]), dev);
@@ -389,16 +399,15 @@ fn routed_experts_gpu(
 
 /// Every routed expert for one layer, on the NATIVE NVFP4 tensor-core path.
 ///
-/// Differs from [`routed_experts_gpu`] in two independent ways, which the
-/// timers keep apart because they have completely different fixes:
+/// Differs from [`routed_experts_gpu`] in that the packed bytes go straight
+/// into `mma.sync…kind::mxf4nvf4…ue4m3` instead of being decoded into a
+/// 67.1 + 33.6 MB f32 pair per expert that is read once and dropped.
 ///
-/// * the slab arrives from [`ExpertSource`], which parsed every shard header
-///   once at startup and hands out a borrow, instead of
-///   `Checkpoint::expert_slice_packed`, which re-runs
-///   `SafeTensors::deserialize` four times per slab and then copies 12.6 MB;
-/// * the packed bytes go straight into `mma.sync…kind::mxf4nvf4…ue4m3`
-///   instead of being decoded into a 67.1 + 33.6 MB f32 pair per expert that
-///   is read once and dropped.
+/// The slab is a BORROW either way — of a checkpoint shard's mapping or of the
+/// pile's — and where it came from is not visible here. It used to be: this
+/// lane took a second, parallel safetensors reader that existed only because
+/// the first one re-parsed a shard header on every accessor call. Both of those
+/// facts stopped being true, and the reader went with them.
 ///
 /// Activations are quantised to E2M1 in dynamic per-16 blocks with E4M3
 /// scales, which the instruction requires and which is what the checkpoint's
@@ -408,8 +417,8 @@ fn routed_experts_gpu(
 #[cfg(feature = "inkling-cuda")]
 #[allow(clippy::too_many_arguments)]
 fn routed_experts_fp4(
-    src: &mary::models::inkling::fp4gemm::ExpertSource,
-    aliases: Option<&mary::models::inkling::fp4gemm::AliasedShards>,
+    src: &Weights,
+    aliases: Option<&mary::models::inkling::fp4gemm::Aliases>,
     client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
     prefix: &str,
     by_expert: &BTreeMap<usize, Vec<(usize, f32)>>,
@@ -420,10 +429,16 @@ fn routed_experts_fp4(
     host: &mut (f64, f64),
 ) -> Result<Vec<f32>> {
     use cubecl::prelude::CubeElement;
-    use mary::models::inkling::fp4gemm::{
-        alias_or_copy, fp4_linear_launch, gate_up_silu_launch, MTILE,
-    };
+    use mary::models::inkling::fp4gemm::{fp4_linear_launch, gate_up_silu_launch, MTILE};
     use mary::models::inkling::fp4quant::quantize_nvfp4;
+
+    // Zero copy where the hardware allows it: the GPU reads the source's own
+    // mapped pages in place. The mappings were registered ONCE at startup, so
+    // this is offset arithmetic on a pointer, not a device round trip.
+    let bind = |data: &[u8]| match aliases {
+        Some(al) => al.slice_or_copy(client, data),
+        None => client.create_from_slice(data),
+    };
 
     let n13 = format!("{prefix}mlp.experts.w13_weight");
     let n2 = format!("{prefix}mlp.experts.w2_weight");
@@ -431,8 +446,8 @@ fn routed_experts_fp4(
 
     for (&e, toks) in by_expert {
         let t_s = Instant::now();
-        let w13 = src.expert(&n13, e)?;
-        let w2 = src.expert(&n2, e)?;
+        let w13 = src.expert_packed(&n13, e)?;
+        let w2 = src.expert_packed(&n2, e)?;
         host.0 += t_s.elapsed().as_secs_f64();
 
         let t_w = Instant::now();
@@ -451,29 +466,14 @@ fn routed_experts_fp4(
         let x_h = client.create_from_slice(f32::as_bytes(&xp));
         let (a, asc) = quantize_nvfp4(client, &x_h, m_pad, h);
 
-        // Zero copy where the hardware allows it: the GPU reads the
-        // checkpoint's mmap'd pages in place. The shards were registered ONCE
-        // at startup, so this is offset arithmetic, not a device round trip.
-        let (b, bsc) = match aliases.and_then(|al| src.expert_aliased(al, &n13, e).ok().flatten()) {
-            Some(v) => v,
-            None => (
-                alias_or_copy(client, w13.codes, w13.codes_keep.clone()),
-                alias_or_copy(client, w13.scales, w13.scales_keep.clone()),
-            ),
-        };
-        let both = fp4_linear_launch(client, &a, &asc, &b, &bsc, m_pad, h, 2 * inter, w13.scale2);
+        let (b, bsc) = (bind(w13.codes()), bind(w13.scales()));
+        let both = fp4_linear_launch(client, &a, &asc, &b, &bsc, m_pad, h, 2 * inter, w13.scale2());
 
         let act_h = gate_up_silu_launch(client, &both, m_pad, inter);
         let (a2, asc2) = quantize_nvfp4(client, &act_h, m_pad, inter);
 
-        let (b2, bsc2) = match aliases.and_then(|al| src.expert_aliased(al, &n2, e).ok().flatten()) {
-            Some(v) => v,
-            None => (
-                alias_or_copy(client, w2.codes, w2.codes_keep.clone()),
-                alias_or_copy(client, w2.scales, w2.scales_keep.clone()),
-            ),
-        };
-        let y_h = fp4_linear_launch(client, &a2, &asc2, &b2, &bsc2, m_pad, inter, h, w2.scale2);
+        let (b2, bsc2) = (bind(w2.codes()), bind(w2.scales()));
+        let y_h = fp4_linear_launch(client, &a2, &asc2, &b2, &bsc2, m_pad, inter, h, w2.scale2());
         let y = f32::from_bytes(&client.read_one(y_h).expect("read y")).to_vec();
         host.1 += t_w.elapsed().as_secs_f64();
 
@@ -494,7 +494,16 @@ fn main() -> Result<()> {
     let cfg_text = std::fs::read_to_string(ckpt.join("config.json"))?;
     let cfg = InklingConfig::from_json(&cfg_text).context("parsing config.json")?;
     let t = &cfg.text_config;
-    let cp = Checkpoint::open(&ckpt)?;
+    // The one line that decides where the weights come from. `INK_PILE` swaps
+    // the source; nothing downstream of here asks which it was.
+    let pile_path = std::env::var("INK_PILE").ok();
+    let pile_branch = std::env::var("INK_PILE_BRANCH").unwrap_or_else(|_| "inkling".to_string());
+    let t_open = Instant::now();
+    let cp = match &pile_path {
+        Some(p) => Weights::open_pile(p, &pile_branch)?,
+        None => Weights::open_ckpt(&ckpt)?,
+    };
+    let open_secs = t_open.elapsed().as_secs_f64();
 
     let mut ids: Vec<usize> = std::fs::read(&ids_path)?
         .chunks_exact(8)
@@ -505,11 +514,21 @@ fn main() -> Result<()> {
 
     let h = t.hidden_size;
     println!("=== forward ===");
-    println!("  checkpoint : {}", ckpt.display());
+    println!("  config     : {}", ckpt.display());
+    println!(
+        "  weights    : {} {}  (index built in {open_secs:.1}s)",
+        cp.kind(),
+        pile_path.as_deref().unwrap_or(&ckpt.display().to_string()),
+    );
     println!("  tokens     : {n}  {ids:?}");
     println!("  layers     : {}  hidden {h}  experts {}+{} shared",
              t.num_hidden_layers, t.n_routed_experts, t.n_shared_experts);
-    println!("  tensors    : {}", cp.len());
+    // Not the same unit on both sides, and saying so is the point: the
+    // checkpoint names 1 360 tensors of which the expert ones are STACKS of
+    // 256, the pile names each expert leaf on its own — 968 dense + 20 480
+    // experts. Same model, two granularities, and the pile's is the one a
+    // layer split can partition.
+    println!("  {}", cp.inventory());
 
     // How many tokens to generate past the prompt. 0 reproduces the original
     // single-forward behaviour exactly.
@@ -634,15 +653,6 @@ fn main() -> Result<()> {
     // Parsed once for the whole run. The lane it replaces re-parsed a shard
     // header four times per expert slab, ~9950 times over a forward.
     #[cfg(feature = "inkling-cuda")]
-    let fp4_src = if experts_fp4 {
-        let t = Instant::now();
-        let s = mary::models::inkling::fp4gemm::ExpertSource::open(&ckpt)?;
-        println!("  ExpertSource       : all shard headers parsed in {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
-        Some(s)
-    } else {
-        None
-    };
-    #[cfg(feature = "inkling-cuda")]
     let fp4_client = if experts_fp4 {
         use cubecl::prelude::Runtime;
         Some(cubecl::cuda::CudaRuntime::client(&Default::default()))
@@ -653,14 +663,16 @@ fn main() -> Result<()> {
     // expert. Every later slab is an offset view of one of these.
     let zerocopy_on = std::env::var("INK_ZEROCOPY").map(|v| v != "0").unwrap_or(true);
     #[cfg(feature = "inkling-cuda")]
-    let fp4_aliases = match (&fp4_src, &fp4_client) {
+    let fp4_aliases = match &fp4_client {
         // INK_ZEROCOPY=0 forces the copying lane, so the seam can be A/B'd
         // against it with the page cache in the same state.
-        (Some(s), Some(c)) if zerocopy_on => {
+        Some(c) if zerocopy_on => {
             let t = Instant::now();
-            let a = s.alias_shards(c);
+            let maps = cp.mappings()?;
+            let n = maps.len();
+            let a = mary::models::inkling::fp4gemm::Aliases::register(c, maps);
             println!(
-                "  zero-copy shards   : {} in {:.1} ms",
+                "  zero-copy mappings : {} {n} in {:.1} ms",
                 if a.is_some() { "registered" } else { "UNSUPPORTED, copying" },
                 t.elapsed().as_secs_f64() * 1e3
             );
@@ -963,13 +975,10 @@ fn main() -> Result<()> {
                     // Layer 2 is BF16 and has no `.scale` sidecar, so the FP4
                     // lane cannot take it; that one layer falls back rather
                     // than the whole run refusing.
-                    let packed = fp4_src
-                        .as_ref()
-                        .map(|s| s.is_nvfp4(&format!("{p}mlp.experts.w13_weight")))
-                        .unwrap_or(false);
+                    let packed = cp.is_nvfp4(&format!("{p}mlp.experts.w13_weight"));
                     let a = if experts_fp4 && packed {
                         routed_experts_fp4(
-                            fp4_src.as_ref().expect("fp4 source"),
+                            &cp,
                             fp4_aliases.as_ref(),
                             fp4_client.as_ref().expect("fp4 client"),
                             &p, &by_expert, &hn, n, h, inter, &mut host_t,
@@ -987,9 +996,9 @@ fn main() -> Result<()> {
             } else {
                 let mut acc = vec![0f32; n * h];
                 for (&e, toks) in &by_expert {
-                    let gu_raw = cp.expert_slice(&format!("{p}mlp.experts.w13_weight"), e)?.data;
+                    let gu_raw = cp.expert_f32(&format!("{p}mlp.experts.w13_weight"), e)?.data;
                     let gu = deinterleave_fused(&gu_raw, 2 * inter, h);
-                    let dn = cp.expert_slice(&format!("{p}mlp.experts.w2_weight"), e)?.data;
+                    let dn = cp.expert_f32(&format!("{p}mlp.experts.w2_weight"), e)?.data;
                     expert_loads += 1;
                     for &(ti, wgt) in toks {
                         let xt = &hn[ti * h..(ti + 1) * h];
@@ -1180,7 +1189,7 @@ fn main() -> Result<()> {
     let (rb, rn) = cp.resident_bytes();
     println!("  what this ONE pass moved:");
     println!("    loader reads        {calls:8}   answered from RAM {hits:8}");
-    println!("    checkpoint bytes    {:8.2} GiB   (what the reads touched, stored precision)",
+    println!("    stored bytes        {:8.2} GiB   (what the reads touched, stored precision)",
              fileb as f64 / GIB);
     println!("    host f32 bytes      {:8.2} GiB   (what they became after widening)",
              hostb as f64 / GIB);

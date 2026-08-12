@@ -33,6 +33,10 @@ pub mod load;
 pub mod mlp;
 pub mod nvfp4;
 pub mod pile;
+// One interface over the two places a running model's weights can come from —
+// a safetensors checkpoint or a pile — plus the residency cache and the byte
+// counters, which belong to the asking rather than to either storage.
+pub mod source;
 pub mod stack;
 pub mod vision;
 

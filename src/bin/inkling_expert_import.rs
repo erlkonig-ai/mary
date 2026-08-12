@@ -192,15 +192,21 @@ fn verify_share(
     // layer facts would pass all of the above and hand a node zero experts.
     // Two faces of one interface; reading one and concluding about the pair is
     // how a green check comes to prove nothing.
+    //
+    // Against `ok`, not `ok_nvfp4`: the selector sweeps both element formats, so
+    // layer 2's BF16 experts are inside its answer. Comparing against the packed
+    // count alone would have passed while the selector silently dropped a whole
+    // layer, which is the failure this check exists to catch.
     let refs = experts_in_layers(&facts, lo..=hi);
+    let _ = ok_nvfp4;
     anyhow::ensure!(
-        refs.len() == ok_nvfp4,
-        "experts_in_layers({lo}..={hi}) selects {} of the {ok_nvfp4} packed \
-         experts just verified — the leaves are on disk but the layer facts \
-         that reach them are not",
+        refs.len() == ok,
+        "experts_in_layers({lo}..={hi}) selects {} of the {ok} experts just \
+         verified — the leaves are on disk but the layer facts that reach them \
+         are not",
         refs.len()
     );
-    println!("selector   experts_in_layers({lo}..={hi}) reaches all {ok_nvfp4} packed experts");
+    println!("selector   experts_in_layers({lo}..={hi}) reaches all {ok} experts");
     Ok(())
 }
 

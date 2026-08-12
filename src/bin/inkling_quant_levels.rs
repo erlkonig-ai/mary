@@ -28,7 +28,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use mary::models::inkling::fp4gemm::{f32_to_e4m3, quantize_act_host, ExpertSource, GROUP};
+use mary::models::inkling::fp4gemm::{f32_to_e4m3, quantize_act_host, GROUP};
+use mary::models::inkling::source::Weights;
 use mary::models::inkling::nvfp4::{e4m3_to_f32, FP4_E2M1};
 
 const LAYER: usize = 10;
@@ -228,7 +229,7 @@ fn main() -> Result<()> {
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("models/thinkingmachines-inkling-small-nvfp4"));
-    let src = ExpertSource::open(&dir)?;
+    let src = Weights::open_ckpt(&dir)?;
     let b13 = format!("model.llm.layers.{LAYER}.mlp.experts.w13_weight");
 
     println!("=== activation quantiser: one level vs two ===");
@@ -244,10 +245,10 @@ fn main() -> Result<()> {
     let mut tot2 = 0.0;
     let mut n = 0;
     for e in [0usize, 3, 7, 11, 19] {
-        let w = src.expert(&b13, e)?;
-        let k = w.cols * 2;
+        let w = src.expert_packed(&b13, e)?;
+        let k = w.cols() * 2;
         let rows = 16;
-        let x = decode(w.codes, w.scales, rows, k, w.scale2);
+        let x = decode(w.codes(), w.scales(), rows, k, w.scale2());
 
         let (c1, s1) = quantize_act_host(&x, k);
         let d1 = decode(&c1, &s1, rows, k, 1.0);
@@ -280,9 +281,9 @@ fn main() -> Result<()> {
     );
 
     // Why: where do the block scales actually land in E4M3's range?
-    let w = src.expert(&b13, 0)?;
-    let k = w.cols * 2;
-    let x = decode(w.codes, w.scales, 16, k, w.scale2);
+    let w = src.expert_packed(&b13, 0)?;
+    let k = w.cols() * 2;
+    let x = decode(w.codes(), w.scales(), 16, k, w.scale2());
     let (_, s1) = quantize_act_host(&x, k);
     let (_, s2, _) = quantize_two_level(&x, k);
     let sub1 = s1.iter().filter(|&&b| (b >> 3) & 0x0F == 0).count();
@@ -291,9 +292,9 @@ fn main() -> Result<()> {
     let zero2 = s2.iter().filter(|&&b| b == 0).count();
     // ---- the invariant check -------------------------------------------
     {
-        let w = src.expert(&b13, 0)?;
-        let k = w.cols * 2;
-        let x = decode(w.codes, w.scales, 16, k, w.scale2);
+        let w = src.expert_packed(&b13, 0)?;
+        let k = w.cols() * 2;
+        let x = decode(w.codes(), w.scales(), 16, k, w.scale2());
         let (c1, _s1) = quantize_act_host(&x, k);
         let nblocks = x.len() / GROUP;
         let (hist, nonzero) = peak_code_histogram(&c1, nblocks);

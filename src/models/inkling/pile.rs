@@ -31,10 +31,11 @@
 use anyhow::Result;
 use anybytes::Bytes;
 use triblespace::core::blob::encodings::tensor::{
-    elements::{NVFP4, NVFP4_BLOCK},
-    tensor_blob, Tensor, TensorElement,
+    elements::{BF16, F32, NVFP4, NVFP4_BLOCK},
+    tensor_blob, Tensor, TensorElement, TensorView,
 };
-use triblespace::core::blob::Blob;
+use triblespace::core::blob::{Blob, TryFromBlob};
+use triblespace::prelude::BlobStoreGet;
 
 use super::load::PackedExpert;
 
@@ -163,6 +164,27 @@ pub mod attrs {
     }
 }
 
+/// Which element format an expert leaf holds, and its handle.
+///
+/// Two variants because the weight attribute is DERIVED per (element, rank):
+/// `Handle<Tensor<NVFP4, 2>>` and `Handle<Tensor<BF16, 2>>` are different
+/// attributes with different ids, so "every expert" is two queries and the
+/// answer has to be able to say which one it came from. That is the type being
+/// the query, paid for at the one place it costs anything.
+#[derive(Debug, Clone, Copy)]
+pub enum ExpertHandle {
+    Nvfp4(
+        triblespace::prelude::Inline<
+            triblespace::core::inline::encodings::hash::Handle<Tensor<NVFP4, 2>>,
+        >,
+    ),
+    Bf16(
+        triblespace::prelude::Inline<
+            triblespace::core::inline::encodings::hash::Handle<Tensor<BF16, 2>>,
+        >,
+    ),
+}
+
 /// One expert in a pile, named but NOT loaded.
 ///
 /// A handle, not bytes. Selecting which experts a machine holds must not depend
@@ -172,35 +194,55 @@ pub mod attrs {
 pub struct ExpertRef {
     pub layer: i64,
     pub expert: i64,
-    pub handle: triblespace::prelude::Inline<
-        triblespace::core::inline::encodings::hash::Handle<Tensor<NVFP4, 2>>,
-    >,
+    pub handle: ExpertHandle,
 }
 
-/// Every expert whose layer falls in `range`, as handles.
+/// Every expert whose layer falls in `range`, as handles — BOTH element formats.
 ///
 /// This is what makes splitting a model across machines a QUERY. A node asks
 /// for the layers it holds and gets references; nothing is read until something
-/// is actually computed. The weight attribute is typed per (element, rank), so
-/// this cannot return a dense tensor by accident — a BF16 rank-3 weight is a
-/// different attribute and simply does not match.
+/// is actually computed.
+///
+/// It sweeps NVFP4 **and** BF16 because Inkling-Small's layer 2 is the odd one
+/// out: its experts have no `.scale` sidecar in the checkpoint and land in the
+/// pile as `Tensor<BF16, 2>`. A packed-only query is not a filter over that
+/// layer, it is a hole — a node told it holds layers 0..=20 would receive every
+/// expert of nineteen layers and none of layer 2, compute anyway, and be wrong
+/// in exactly one fortieth of the model. Which of the two a leaf is stays in the
+/// answer (see [`ExpertHandle`]) rather than being re-derived from a name.
 pub fn experts_in_layers(
     space: &triblespace::prelude::TribleSet,
     range: std::ops::RangeInclusive<i64>,
 ) -> Vec<ExpertRef> {
+    use triblespace::core::inline::encodings::hash::Handle;
     use triblespace::macros::pattern;
-    let mut out: Vec<ExpertRef> = triblespace::macros::find!(
-        (layer: i64, expert: i64, handle: triblespace::prelude::Inline<
-            triblespace::core::inline::encodings::hash::Handle<Tensor<NVFP4, 2>>>),
+    use triblespace::prelude::Inline;
+
+    let mut out: Vec<ExpertRef> = Vec::new();
+    for (layer, expert, handle) in triblespace::macros::find!(
+        (layer: i64, expert: i64, handle: Inline<Handle<Tensor<NVFP4, 2>>>),
         pattern!(space, [{ _?e @
             attrs::layer: ?layer,
             attrs::expert_index: ?expert,
             attrs::weight_nvfp4_2: ?handle
         }])
-    )
-    .filter(|(layer, _, _)| range.contains(layer))
-    .map(|(layer, expert, handle)| ExpertRef { layer, expert, handle })
-    .collect();
+    ) {
+        if range.contains(&layer) {
+            out.push(ExpertRef { layer, expert, handle: ExpertHandle::Nvfp4(handle) });
+        }
+    }
+    for (layer, expert, handle) in triblespace::macros::find!(
+        (layer: i64, expert: i64, handle: Inline<Handle<Tensor<BF16, 2>>>),
+        pattern!(space, [{ _?e @
+            attrs::layer: ?layer,
+            attrs::expert_index: ?expert,
+            attrs::weight::<BF16, 2>(): ?handle
+        }])
+    ) {
+        if range.contains(&layer) {
+            out.push(ExpertRef { layer, expert, handle: ExpertHandle::Bf16(handle) });
+        }
+    }
     out.sort_by_key(|r| (r.layer, r.expert));
     out
 }
@@ -214,6 +256,468 @@ pub fn experts_in_layers(
 pub fn layer_of(tensor_name: &str) -> Option<i64> {
     let rest = tensor_name.split("layers.").nth(1)?;
     rest.split('.').next()?.parse().ok()
+}
+
+// ---------------------------------------------------------------------------
+// Reading the model back OUT
+// ---------------------------------------------------------------------------
+
+/// Which element format a leaf turned out to hold.
+///
+/// The type parameter is gone by the time a leaf sits in a by-name index — the
+/// model spans two dtypes and five ranks — so the fact travels as data instead.
+/// This is erasure done ONCE, at the index boundary, from reads that were each
+/// typed: a leaf was fetched as `Tensor<BF16, 2>` or not at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Elem {
+    Bf16,
+    F32,
+}
+
+impl Elem {
+    /// Bytes one element occupies on disk.
+    pub fn width(self) -> usize {
+        match self {
+            Elem::Bf16 => 2,
+            Elem::F32 => 4,
+        }
+    }
+}
+
+/// One tensor of the model, resolved: its dims from the blob header, its bytes
+/// as a VIEW over the pile's mapping.
+///
+/// Not a `Vec`. `Bytes` here is `Bytes::from_raw_parts(slice, mmap.clone())` —
+/// the pile's own mapping with an `Arc` keeping it alive — so an index over the
+/// whole model costs handles and headers, never weights, and a lane that hands
+/// the bytes to a GPU hands over the mapping itself.
+#[derive(Clone)]
+pub struct Leaf {
+    pub elem: Elem,
+    pub dims: Vec<u64>,
+    pub bytes: anybytes::Bytes,
+    /// Which transformer layer this tensor belongs to, when it belongs to one.
+    ///
+    /// A FACT the importer wrote, not a substring of the name — which is what
+    /// makes "give me layers 0..=19" a query. `None` for the embedding, the
+    /// final norm and the unembedding: absent rather than zero, because a
+    /// tensor that silently joined layer 0 would ship to the wrong machine.
+    pub layer: Option<i64>,
+}
+
+impl Leaf {
+    /// Shape as the `Vec<usize>` the loaders speak.
+    pub fn shape(&self) -> Vec<usize> {
+        self.dims.iter().map(|&d| d as usize).collect()
+    }
+
+    /// How many elements. From the dims, not from the byte length.
+    pub fn elems(&self) -> usize {
+        self.dims.iter().product::<u64>() as usize
+    }
+
+    /// Widen to f32 — the ONE conversion, made explicit and made the caller's.
+    ///
+    /// [`crate::models::inkling::load::Checkpoint::tensor`] does this on every
+    /// read because a safetensors reader has nothing else to hand back; here the
+    /// stored form is reachable, so widening is a thing a caller ASKS for when
+    /// it is about to compute in f32, and a device lane that wants the bytes
+    /// takes [`Leaf::bytes`] instead.
+    pub fn to_f32(&self) -> Vec<f32> {
+        match self.elem {
+            Elem::Bf16 => self
+                .bytes
+                .chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect(),
+            Elem::F32 => self
+                .bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+        }
+    }
+}
+
+/// One expert's packed NVFP4 weight, read out of the pile.
+///
+/// The three planes are `Bytes` slices of ONE blob, which is what the pile
+/// format made atomic: the checkpoint binds `w13_weight`, `.scale` and
+/// `.scale2` by naming convention across three different shards, and a reader
+/// holding only the first has bytes it cannot interpret. Here there is one
+/// handle, and the planes are offsets inside it that both sides compute from the
+/// same two facts (see [`split_payload`]).
+pub struct PackedSlab {
+    pub codes: anybytes::Bytes,
+    pub scales: anybytes::Bytes,
+    pub scale2: f32,
+    /// Output rows of this expert's matrix.
+    pub rows: usize,
+    /// Packed bytes per row; the logical width is `2 * cols`.
+    pub cols: usize,
+}
+
+/// A model located in a pile: every tensor found, nothing widened, nothing
+/// copied.
+///
+/// The whole reader is two hash maps built once at open. There is no shard
+/// index, no header cache, no mapping cache and no span table, because the
+/// questions those answer — which file is this tensor in, where in it, is the
+/// header parsed yet — do not exist for a content-addressed store. A handle IS
+/// the location.
+pub struct PileSource {
+    reader: triblespace::core::repo::pile::PileReader,
+    /// Dense tensors, read as their type at index time. `Leaf` is a view, so
+    /// holding all 968 of them costs kilobytes.
+    dense: std::collections::HashMap<String, Leaf>,
+    /// Experts, as HANDLES: 20 480 of them, and reading even one to build the
+    /// index would be 7 MiB of BLAKE3 for a lookup table.
+    experts: std::collections::HashMap<(String, i64), ExpertRef>,
+    /// How many experts each stacked matrix name has — from the facts, so a
+    /// caller never infers a count from an error.
+    stacked: std::collections::HashMap<String, usize>,
+}
+
+impl PileSource {
+    /// Open a pile and resolve every tensor of the model on `branch`.
+    ///
+    /// Reads the dense leaves (their headers and their content hashes; the
+    /// payloads stay in the mapping) and takes the experts as handles.
+    pub fn open(path: &std::path::Path, branch: &str) -> Result<Self> {
+        use triblespace::core::inline::encodings::hash::Handle;
+        use triblespace::core::metadata;
+        use triblespace::core::repo::{ancestors, Repository};
+        use triblespace::macros::{find, pattern};
+        use triblespace::prelude::*;
+
+        let mut pile = Pile::open(path).map_err(|e| anyhow::anyhow!("open {path:?}: {e:?}"))?;
+        // Read path: never amputate. A torn tail is an operator decision.
+        pile.refresh()
+            .map_err(|e| anyhow::anyhow!("load {path:?}: {e:?}"))?;
+        let mut repo = Repository::new(
+            pile,
+            ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng),
+            TribleSet::new(),
+        )
+        .map_err(|e| anyhow::anyhow!("repo: {e:?}"))?;
+        let branch_id = repo
+            .lookup_branch(branch)
+            .map_err(|e| anyhow::anyhow!("lookup {branch}: {e:?}"))?
+            .ok_or_else(|| anyhow::anyhow!("no {branch:?} branch in {path:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let head = ws
+            .head()
+            .ok_or_else(|| anyhow::anyhow!("{branch:?} has no commits"))?;
+        let facts: TribleSet = ws
+            .checkout(ancestors(head))
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
+            .facts()
+            .clone();
+        let reader = repo
+            .storage_mut()
+            .reader()
+            .map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
+        repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
+
+        // ── the experts, as handles ─────────────────────────────────────────
+        // First, because what it produces is also what tells the dense sweep
+        // which entities are NOT dense. An expert entity carries an
+        // `expert_index`; a dense one does not. That is the distinction, and it
+        // is a FACT rather than a substring test on the name — which matters,
+        // because all 256 experts of one matrix share one name and a dense map
+        // built without the distinction would hold whichever of them the query
+        // happened to yield last.
+        let mut experts = std::collections::HashMap::new();
+        let mut stacked: std::collections::HashMap<String, usize> = Default::default();
+        let mut expert_ids: std::collections::HashSet<Id> = Default::default();
+        macro_rules! sweep_experts {
+            ($ty:ty, $attr:expr, $wrap:expr) => {{
+                for (e, n, i, l, h) in find!(
+                    (e: Id,
+                     n: Inline<Handle<blobencodings::LongString>>,
+                     i: i64,
+                     l: i64,
+                     h: Inline<Handle<Tensor<$ty, 2>>>),
+                    pattern!(&facts, [
+                        { ?e @ metadata::name: ?n, attrs::expert_index: ?i,
+                          attrs::layer: ?l, $attr: ?h },
+                    ])
+                ) {
+                    let name: anybytes::View<str> = reader
+                        .get(n)
+                        .map_err(|err| anyhow::anyhow!("expert name blob: {err:?}"))?;
+                    let name = name.to_string();
+                    let c = stacked.entry(name.clone()).or_insert(0);
+                    *c = (*c).max(i as usize + 1);
+                    expert_ids.insert(e);
+                    experts.insert(
+                        (name, i),
+                        ExpertRef { layer: l, expert: i, handle: $wrap(h) },
+                    );
+                }
+            }};
+        }
+        sweep_experts!(NVFP4, attrs::weight_nvfp4_2, ExpertHandle::Nvfp4);
+        sweep_experts!(BF16, attrs::weight::<BF16, 2>(), ExpertHandle::Bf16);
+
+        // ── the dense tensors, by name ──────────────────────────────────────
+        // One query per (element, rank) — ten, not one — because that is what
+        // typing the attribute means, and each hit is read AS its type. Nothing
+        // is interpreted without one, so a BF16 matrix cannot arrive where f32
+        // was asked for.
+        let mut dense = std::collections::HashMap::new();
+        macro_rules! sweep_dense {
+            ($ty:ty, $rank:literal, $tag:expr) => {{
+                for (e, n, h) in find!(
+                    (e: Id,
+                     n: Inline<Handle<blobencodings::LongString>>,
+                     h: Inline<Handle<Tensor<$ty, $rank>>>),
+                    pattern!(&facts, [
+                        { ?e @ metadata::name: ?n, attrs::weight::<$ty, $rank>(): ?h },
+                    ])
+                ) {
+                    if expert_ids.contains(&e) {
+                        continue;
+                    }
+                    let name: anybytes::View<str> = reader
+                        .get(n)
+                        .map_err(|err| anyhow::anyhow!("name blob: {err:?}"))?;
+                    let blob: Blob<Tensor<$ty, $rank>> = reader
+                        .get(h)
+                        .map_err(|err| anyhow::anyhow!("{}: leaf blob: {err:?}", &*name))?;
+                    let view: TensorView = TensorView::try_from_blob(blob)
+                        .map_err(|err| anyhow::anyhow!("{}: decode: {err}", &*name))?;
+                    // The layer is optional in the graph, so it is optional
+                    // here: an `exists!` rather than a second required clause,
+                    // which would silently drop the embedding and the head.
+                    let layer = find!(
+                        (l: i64),
+                        pattern!(&facts, [{ (e) @ attrs::layer: ?l }])
+                    )
+                    .next()
+                    .map(|(l,)| l);
+                    dense.insert(
+                        name.to_string(),
+                        Leaf {
+                            elem: $tag,
+                            dims: view.dims().to_vec(),
+                            bytes: view.payload().clone(),
+                            layer,
+                        },
+                    );
+                }
+            }};
+        }
+        sweep_dense!(BF16, 0, Elem::Bf16);
+        sweep_dense!(BF16, 1, Elem::Bf16);
+        sweep_dense!(BF16, 2, Elem::Bf16);
+        sweep_dense!(BF16, 3, Elem::Bf16);
+        sweep_dense!(BF16, 4, Elem::Bf16);
+        sweep_dense!(F32, 0, Elem::F32);
+        sweep_dense!(F32, 1, Elem::F32);
+        sweep_dense!(F32, 2, Elem::F32);
+        sweep_dense!(F32, 3, Elem::F32);
+        sweep_dense!(F32, 4, Elem::F32);
+
+        anyhow::ensure!(!dense.is_empty(), "{path:?}: no dense leaves on {branch:?}");
+        Ok(PileSource { reader, dense, experts, stacked })
+    }
+
+    /// One dense tensor by checkpoint name, as a view.
+    pub fn leaf(&self, name: &str) -> Result<&Leaf> {
+        self.dense
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("{name} is not in the pile"))
+    }
+
+    /// Every dense tensor name, sorted.
+    pub fn names(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.dense.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// How many tensors this source located — dense leaves plus experts.
+    pub fn len(&self) -> usize {
+        self.dense.len() + self.experts.len()
+    }
+
+    /// Dense leaves in the index.
+    pub fn dense_len(&self) -> usize {
+        self.dense.len()
+    }
+
+    /// Expert leaves in the index — each expert of each stack, individually.
+    pub fn expert_len(&self) -> usize {
+        self.experts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// How many experts a stacked matrix holds.
+    pub fn expert_count(&self, base: &str) -> Result<usize> {
+        self.stacked
+            .get(base)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("{base} is not a stacked expert matrix in this pile"))
+    }
+
+    /// Whether a stacked matrix's experts are packed NVFP4 rather than BF16.
+    ///
+    /// Answered by the ATTRIBUTE the leaves were written under, not by probing
+    /// for a `.scale` sidecar's existence. The checkpoint has to ask "is there a
+    /// tensor with this name plus `.scale`?", which is a question about a naming
+    /// convention; here the element format is part of the leaf's identity.
+    pub fn is_nvfp4(&self, base: &str) -> bool {
+        matches!(
+            self.experts.get(&(base.to_string(), 0)),
+            Some(ExpertRef { handle: ExpertHandle::Nvfp4(_), .. })
+        )
+    }
+
+    /// Fault a LAYER RANGE's whole share into memory, and say what it cost.
+    ///
+    /// The deployment question a split has to answer is not how fast a pass is
+    /// but whether a node's share STAYS resident, and that needs the share
+    /// named without reading the model to find it. Here it is a query over the
+    /// layer facts — dense leaves and experts alike, both element formats — so
+    /// the thing warmed is exactly the thing
+    /// [`experts_in_layers`] would hand a node.
+    ///
+    /// Returns `(bytes touched, leaves touched)`.
+    pub fn warm(&self, lo: i64, hi: i64) -> Result<(u64, usize)> {
+        let (mut bytes, mut leaves) = (0u64, 0usize);
+        let mut sum = 0u64;
+        for leaf in self
+            .dense
+            .values()
+            .filter(|l| matches!(l.layer, Some(x) if x >= lo && x <= hi))
+        {
+            // One byte per 4 KiB page: the kernel's readahead turns a
+            // forward-sequential fault pattern into large sequential reads.
+            let b: &[u8] = &leaf.bytes;
+            let mut i = 0usize;
+            while i < b.len() {
+                sum = sum.wrapping_add(b[i] as u64);
+                i += 4096;
+            }
+            bytes += b.len() as u64;
+            leaves += 1;
+        }
+        for ((name, idx), r) in self.experts.iter() {
+            if r.layer < lo || r.layer > hi {
+                continue;
+            }
+            // Reading an expert blob validates it, which touches every page —
+            // so the warm and the integrity check are the same pass.
+            let n = match r.handle {
+                ExpertHandle::Nvfp4(_) => {
+                    let q = self.expert_packed(name, *idx as usize)?;
+                    q.codes.len() + q.scales.len()
+                }
+                ExpertHandle::Bf16(_) => self.expert_bf16(name, *idx as usize)?.bytes.len(),
+            };
+            bytes += n as u64;
+            leaves += 1;
+        }
+        std::hint::black_box(sum);
+        Ok((bytes, leaves))
+    }
+
+    /// One expert's NVFP4 planes, read out of the pile and **not decoded**.
+    pub fn expert_packed(&self, base: &str, e: usize) -> Result<PackedSlab> {
+        let h = match self.experts.get(&(base.to_string(), e as i64)).map(|r| r.handle) {
+            Some(ExpertHandle::Nvfp4(h)) => h,
+            Some(ExpertHandle::Bf16(_)) => {
+                anyhow::bail!("{base}[{e}] is BF16, not packed NVFP4")
+            }
+            None => anyhow::bail!("{base}[{e}] is not in the pile"),
+        };
+        let blob: Blob<Tensor<NVFP4, 2>> = self
+            .reader
+            .get(h)
+            .map_err(|err| anyhow::anyhow!("{base}[{e}]: {err:?}"))?;
+        let view: TensorView = TensorView::try_from_blob(blob)
+            .map_err(|err| anyhow::anyhow!("{base}[{e}]: decode: {err}"))?;
+        let dims = view.dims();
+        anyhow::ensure!(dims.len() == 2, "{base}[{e}] is rank {}", dims.len());
+        let (rows, logical) = (dims[0] as usize, dims[1] as usize);
+        let elems = rows * logical;
+        let payload = view.payload();
+        // The boundaries are derived, here, from the element count and the
+        // block size — the same two facts the writer used. Nothing on disk
+        // records them, so the two sides cannot disagree about them.
+        let codes_len = elems / 2;
+        let scales_len = elems / NVFP4_BLOCK;
+        let (_, _, scale2) = split_payload(payload, elems)?;
+        Ok(PackedSlab {
+            codes: payload.slice(..codes_len),
+            scales: payload.slice(codes_len..codes_len + scales_len),
+            scale2,
+            rows,
+            cols: logical / 2,
+        })
+    }
+
+    /// The pile's mapping, as `(base, len, keepalive)` — a list of ONE.
+    ///
+    /// A pile is one file, so a zero-copy lane registers it once and every slab
+    /// afterwards is offset arithmetic. The checkpoint's answer is nine shards,
+    /// and the only reason that number is not one is that safetensors has a
+    /// 2 GiB-ish practical shard ceiling and a 159 GiB model does not fit in it.
+    ///
+    /// Recovered from a leaf rather than stored: the pile hands out
+    /// `Bytes::from_raw_parts(slice, mmap.clone())`, so the mapping IS the
+    /// owner of every payload and asking a payload for its owner is exact. A
+    /// second `mmap` of the same file would be a different address range and
+    /// every offset computed against it would be silently wrong.
+    pub fn mappings(&self) -> Result<Vec<(usize, usize, std::sync::Arc<dyn std::any::Any + Send + Sync>)>> {
+        let any = self
+            .dense
+            .values()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no leaves to recover the mapping from"))?;
+        let map: std::sync::Arc<memmap2::MmapRaw> = any
+            .bytes
+            .clone()
+            .downcast_to_owner()
+            .map_err(|_| anyhow::anyhow!("a pile leaf is not backed by the pile's mapping"))?;
+        Ok(vec![(
+            map.as_ptr() as usize,
+            map.len(),
+            map as std::sync::Arc<dyn std::any::Any + Send + Sync>,
+        )])
+    }
+
+    /// One expert of a BF16 stack, as a view.
+    pub fn expert_bf16(&self, base: &str, e: usize) -> Result<Leaf> {
+        let h = match self.experts.get(&(base.to_string(), e as i64)).map(|r| r.handle) {
+            Some(ExpertHandle::Bf16(h)) => h,
+            Some(ExpertHandle::Nvfp4(_)) => {
+                anyhow::bail!("{base}[{e}] is packed NVFP4, not BF16")
+            }
+            None => anyhow::bail!("{base}[{e}] is not in the pile"),
+        };
+        let blob: Blob<Tensor<BF16, 2>> = self
+            .reader
+            .get(h)
+            .map_err(|err| anyhow::anyhow!("{base}[{e}]: {err:?}"))?;
+        let view: TensorView = TensorView::try_from_blob(blob)
+            .map_err(|err| anyhow::anyhow!("{base}[{e}]: decode: {err}"))?;
+        Ok(Leaf {
+            elem: Elem::Bf16,
+            dims: view.dims().to_vec(),
+            bytes: view.payload().clone(),
+            layer: self
+                .experts
+                .get(&(base.to_string(), e as i64))
+                .map(|r| r.layer),
+        })
+    }
 }
 
 #[cfg(test)]
