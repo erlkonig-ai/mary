@@ -96,12 +96,19 @@ def get_expert(name):
     vals = np.empty(codes.shape[:-1] + (codes.shape[-1] * 2,), dtype=np.float32)
     vals[..., 0::2] = FP4[lo]
     vals[..., 1::2] = FP4[hi]
+    del lo, hi, codes
     n_scales = scale.shape[-1]
     group = vals.shape[-1] // n_scales
     assert group == 16, group
-    deq = vals.reshape(*vals.shape[:-1], n_scales, group) * scale[..., None]
-    deq = deq.reshape(*vals.shape) * scale2[:, None, None]
-    return torch.from_numpy(deq)
+    # In place, and on a reshaped VIEW: a layer's w13 is 17 GB dequantised, so
+    # each out-of-place multiply would cost another 17 GB and this OOMs a
+    # 128 GB Spark. Same f32 products in the same order -- memory, not numerics.
+    shape = vals.shape
+    vals = vals.reshape(*shape[:-1], n_scales, group)
+    vals *= scale[..., None]
+    vals = vals.reshape(shape)
+    vals *= scale2[:, None, None]
+    return torch.from_numpy(vals)
 
 
 pfx = f"model.llm.layers.{LAYER}."
@@ -127,6 +134,16 @@ sd = {
     "self_attn.rel_logits_proj.proj": get(pfx + "attn.rel_logits_proj.proj"),
 }
 
+
+def _deint(t, dim):
+    """Split an interleaved fused gate/up tensor: even rows gate, odd rows up."""
+    n = t.shape[dim]
+    assert n % 2 == 0, (t.shape, dim)
+    idx_g = torch.arange(0, n, 2)
+    idx_u = torch.arange(1, n, 2)
+    return t.index_select(dim, idx_g).contiguous(), t.index_select(dim, idx_u).contiguous()
+
+
 if is_dense:
     w13 = get(pfx + "mlp.w13_dn.weight")          # [2 * dense_inter, hidden]
     g_, u_ = _deint(w13, 0)                       # INTERLEAVED, not halved
@@ -141,7 +158,9 @@ else:
     sd["mlp.gate.global_scale"] = get(pfx + "mlp.gate.global_scale")
     _gu = get_expert(pfx + "mlp.experts.w13_weight")
     _g, _u = _deint(_gu, 1)
+    del _gu                                       # 17 GB; the cat below needs the room
     sd["mlp.experts.gate_up_proj"] = torch.cat([_g, _u], dim=1).contiguous()
+    del _g, _u
     sd["mlp.experts.down_proj"] = get_expert(pfx + "mlp.experts.w2_weight")
     # shared_w13 is [n_shared, 2*inter, hidden] under the [out, in] convention
     # that shared_w2 [n_shared, hidden, inter] pins; split on the OUT dim.
@@ -175,15 +194,7 @@ with torch.no_grad():
 if not is_dense:
     _h.remove()
     assert "gate" in captured, "the router hook never fired"
-
-
-def _deint(t, dim):
-    """Split an interleaved fused gate/up tensor: even rows gate, odd rows up."""
-    n = t.shape[dim]
-    assert n % 2 == 0, (t.shape, dim)
-    idx_g = torch.arange(0, n, 2)
-    idx_u = torch.arange(1, n, 2)
-    return t.index_select(dim, idx_g).contiguous(), t.index_select(dim, idx_u).contiguous()
+del layer          # its parameter copy is another 26 GB, and nothing below reads it
 
 
 def w(name, t):
@@ -212,7 +223,10 @@ for k, v in sorted(sd.items()):
     fps[k] = {
         "shape": list(v.shape),
         "sum": float(f.sum()),
-        "sumsq": float((f.double() ** 2).sum()),
+        # Chunked so the f64 temporary of a 4.3e9-element expert stack is
+        # 0.5 GB and not 34 GB; for anything smaller than one chunk this is
+        # exactly the old single-shot expression.
+        "sumsq": sum(float((c.double() ** 2).sum()) for c in torch.split(f, 1 << 26)),
         "min": float(f.min()), "max": float(f.max()),
         "first4": [float(z) for z in f[:4]],
     }
