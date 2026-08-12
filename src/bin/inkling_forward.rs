@@ -335,6 +335,13 @@ fn main() -> Result<()> {
     if std::env::var("INK_MUTATE_NO_DEINTERLEAVE").is_ok() {
         println!("  !! MUTATION ACTIVE : deinterleave SKIPPED -- this output is expected to be WRONG");
     }
+    // The SHARED experts' w13 is square, so nothing but a forward can tell the
+    // two readings apart. INK_SHARED_W13_HALVED=1 selects the other one.
+    let shared_halved = mary::models::inkling::load::shared_w13_halved();
+    println!(
+        "  shared w13 split   : {}",
+        if shared_halved { "HALVED (contiguous)" } else { "INTERLEAVED" }
+    );
     #[cfg(feature = "inkling-cuda")]
     let dev = burn::backend::cuda::CudaDevice::default();
     // Parsed once for the whole run. The lane it replaces re-parsed a shard
@@ -529,15 +536,9 @@ fn main() -> Result<()> {
             t_expert += t_d.elapsed().as_secs_f64();
 
             let sfused = cp.tensor(&format!("{p}mlp.shared_experts.shared_w13_weight"))?.data;
-            let per = sfused.len() / t.n_shared_experts;
-            let mut sg = Vec::with_capacity(sfused.len() / 2);
-            let mut su = Vec::with_capacity(sfused.len() / 2);
-            for s in 0..t.n_shared_experts {
-                let blk = &sfused[s * per..(s + 1) * per];
-                let (a, b) = mary::models::inkling::load::deinterleave_rows(blk, 2 * inter, h);
-                sg.extend_from_slice(&a);
-                su.extend_from_slice(&b);
-            }
+            let (sg, su) = mary::models::inkling::load::split_shared_w13(
+                &sfused, t.n_shared_experts, inter, h, shared_halved,
+            );
             drop(sfused);
             let sd = cp.tensor(&format!("{p}mlp.shared_experts.shared_w2_weight"))?.data;
             let gammas: Vec<f32> = routing.iter().flat_map(|r| r.shared_gammas.clone()).collect();

@@ -32,9 +32,29 @@ use anyhow::{Context, Result};
 use mary::models::inkling::attn::{causal_mask, AttnDims, AttnWeights, LogScaling};
 use mary::models::inkling::config::AttnKind;
 use mary::models::inkling::layer::{decoder_layer, LayerMlp, LayerWeights};
-use mary::models::inkling::load::{split_gate_up, Checkpoint};
+use mary::models::inkling::load::{split_gate_up, split_shared_w13, Checkpoint};
 
 const BUDGET: f32 = 1e-5;
+
+/// The settled reading of the SHARED experts' `shared_w13_weight`: INTERLEAVED.
+///
+/// Settled by A/B on a real forward with everything else held fixed
+/// (`INK_SHARED_W13_HALVED` selects the other reading in `inkling_forward`),
+/// inkling-small-nvfp4, prompt `"The capital of France is"`, routed experts on
+/// the native NVFP4 lane:
+///
+/// ```text
+///   INTERLEAVED  ' Paris'  ' a'  '...'  ' the'  ' $\'          top-1 18.69
+///                continuation: "Paris. The capital of Germany is Berlin. …"
+///   HALVED       '<|begin_of_text|>' '<|audio_end|>' '.' 'a' ' or'  top-1 8.94
+///                continuation: special tokens, no English at all
+/// ```
+///
+/// 9.75 logits is not numerical drift; it is the noise a swapped gate/up half
+/// produces. Keep this constant and the toggle: a square tensor whose
+/// orientation rests on an experiment nobody can re-run is one refactor from
+/// drifting back.
+const SHARED_W13_HALVED: bool = false;
 
 fn read_f32(p: &std::path::Path) -> Result<Vec<f32>> {
     let b = std::fs::read(p).with_context(|| format!("reading {}", p.display()))?;
@@ -93,6 +113,85 @@ fn check_fp(man: &str, key: &str, v: &[f32], checks: &mut usize, fails: &mut usi
         *fails += 1;
     } else {
         println!("  ok    {:-42} sum {:+.6e}  n={}", key, sum, v.len());
+    }
+}
+
+/// Which of the two readings of `shared_w13_weight` does the ORACLE agree with?
+///
+/// The block is square, so a wrong split is shape-legal, loads without
+/// complaint, and computes nonsense; and the two readings have the SAME total
+/// sum, so every fingerprint that does not separate the halves agrees with
+/// both. A gate that simply splits one way and compares therefore certifies its
+/// own assumption whenever the oracle shares it — which is exactly what
+/// happened here: this gate halved, `capture_inkling_real.py` documented halved
+/// while its code de-interleaved, and the shipped `inkling_oracle_fp4` manifest
+/// records the halved sums.
+///
+/// So compute BOTH candidates and ask which one the oracle matches. That turns
+/// a shared misreading from a green light into a named failure.
+fn assert_shared_orientation(
+    man: &str,
+    fused: &[f32],
+    n_shared: usize,
+    inter: usize,
+    hidden: usize,
+    checks: &mut usize,
+    fails: &mut usize,
+) {
+    let want = match fingerprint(man, "mlp.shared_experts.gate_proj", "sum") {
+        Ok(w) => w,
+        Err(e) => {
+            println!("  FAIL  shared w13 orientation: {e}");
+            *fails += 1;
+            return;
+        }
+    };
+    *checks += 1;
+    let sum = |v: &[f32]| v.iter().map(|&x| x as f64).sum::<f64>();
+    let si = sum(&split_shared_w13(fused, n_shared, inter, hidden, false).0);
+    let sh = sum(&split_shared_w13(fused, n_shared, inter, hidden, true).0);
+    let rel = |s: f64| (s - want).abs() / want.abs().max(1.0);
+    println!(
+        "  shared w13 gate-half sum: INTERLEAVED {si:+.6e}  HALVED {sh:+.6e}  oracle {want:+.6e}"
+    );
+
+    match (rel(si) <= 1e-4, rel(sh) <= 1e-4) {
+        (true, true) => {
+            println!(
+                "  FAIL  both readings match the oracle — this tensor cannot discriminate them, \
+                 so the orientation is NOT established here"
+            );
+            *fails += 1;
+        }
+        (false, false) => {
+            println!(
+                "  FAIL  neither reading matches the oracle — the shared w13 mapping is wrong in \
+                 some third way"
+            );
+            *fails += 1;
+        }
+        (i_ok, _) => {
+            let oracle_halved = !i_ok;
+            if oracle_halved == SHARED_W13_HALVED {
+                println!(
+                    "  ok    oracle was captured {}, which is the reading a real forward settled",
+                    if oracle_halved { "HALVED" } else { "INTERLEAVED" }
+                );
+            } else {
+                println!(
+                    "  FAIL  oracle was captured {}, but a real forward settled {} \
+                     (' Paris' at top-1 logit 18.69 versus '<|begin_of_text|>' at 8.94).\n  \
+                     \x20     The ORACLE is stale, not the loader: golden/capture_inkling_real.py \
+                     already calls _deint for shared_w13 — it is that file's docstring and the \
+                     manifest's \"w13_split\" string that still say halved. Re-run it to \
+                     regenerate this oracle; until then this gate cannot certify the layer, \
+                     because its reference layer was built with a swapped gate/up half.",
+                    if oracle_halved { "HALVED" } else { "INTERLEAVED" },
+                    if SHARED_W13_HALVED { "HALVED" } else { "INTERLEAVED" }
+                );
+                *fails += 1;
+            }
+        }
     }
 }
 
@@ -218,18 +317,14 @@ fn main() -> Result<()> {
         }
 
         // shared_w13 is [n_shared, 2*inter, hidden]; split each expert's block
-        // on the OUT dimension.
+        // on the OUT dimension. WHICH split is not a shape question — the block
+        // is square — so it is settled by experiment and then asserted here.
         let sfused = g("mlp.shared_experts.shared_w13_weight")?;
-        let per = sfused.len() / n_shared;
-        let mut a = Vec::with_capacity(sfused.len() / 2);
-        let mut b = Vec::with_capacity(sfused.len() / 2);
-        for sidx in 0..n_shared {
-            let blk = &sfused[sidx * per..(sidx + 1) * per];
-            a.extend_from_slice(&blk[..per / 2]);
-            b.extend_from_slice(&blk[per / 2..]);
-        }
+        let (a, b) = split_shared_w13(&sfused, n_shared, mi, h, SHARED_W13_HALVED);
         sgate = a;
         sup = b;
+        assert_shared_orientation(&man, &sfused, n_shared, mi, h, &mut checks, &mut fails);
+        drop(sfused);
         sdown = g("mlp.shared_experts.shared_w2_weight")?;
         check_fp(&man, "mlp.shared_experts.gate_proj", &sgate, &mut checks, &mut fails);
         check_fp(&man, "mlp.shared_experts.up_proj", &sup, &mut checks, &mut fails);
@@ -348,8 +443,9 @@ fn main() -> Result<()> {
 
     println!("\n=== what this does not prove ===");
     println!("  the checkpoint-name -> module mapping is authored on BOTH sides here,");
-    println!("  so a shared misreading passes. The w13 split order in particular is an");
-    println!("  assumption; only a full forward producing coherent text would settle it.");
+    println!("  so a shared misreading passes — as the w13 split order did, on both");
+    println!("  sides, until a real forward settled it (INTERLEAVED). That one is now");
+    println!("  asserted above rather than assumed; the rest of the mapping is not.");
     println!("  log scaling is inert at {t} tokens with n_floor {n_floor} — untested here.");
 
     println!("\n=== verdict ===");

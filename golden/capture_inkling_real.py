@@ -7,15 +7,25 @@ The released weights use the original TML names (`wq_du`, `w13_dn`,
 makes its TOTALITY machine-checked -- every target parameter filled, nothing
 left over -- which is the part that can be checked mechanically.
 
-What CANNOT be checked by comparing two of my own implementations: whether
-`w13` splits as [gate; up] or [up; gate]. Both lanes would share the mistake.
-The split follows the LLaMA convention that w1 is the gate and w3 the up
-projection, and the MoE path corroborates it -- the reference chunks the fused
-`gate_up_proj` output as (gate, up) along the output dimension, and weight row
-i produces output i, so gate occupies the first half of the rows. It is
-recorded here as an assumption rather than a verified fact. What would settle
-it is a full forward producing coherent text, which needs more memory than one
-Spark has.
+What CANNOT be checked by comparing two of my own implementations: how `w13`
+splits into gate and up. Both lanes would share the mistake. It has now been
+SETTLED, by the thing this docstring used to say was out of reach -- a full
+forward producing coherent text, which one Spark does manage by paging expert
+slabs (`inkling_forward`). Both the routed and the shared w13 are INTERLEAVED:
+the rows alternate g0, u0, g1, u1, ..., which is what `_deint` below does and
+what `transformers/conversion_mapping.py` specifies as [Interleave(dim=0),
+Chunk(dim=0)]. On "The capital of France is", interleaved answers ' Paris' at
+top-1 logit 18.69 and continues "Paris. The capital of Germany is Berlin.";
+halving the shared block instead collapses the top-1 to '<|begin_of_text|>' at
+8.94 and emits no English at all.
+
+WARNING for anyone holding an older oracle: this file's docstring, its
+`w13_split` manifest string and the shipped `inkling_oracle_fp4` all described
+a HALVED shared split while this code de-interleaved. The two are
+shape-identical and numerically different (shared gate-half sum -1.412489e+03
+interleaved versus -6.243070e+02 halved, identical totals), so an oracle
+captured under the old text certifies a swapped gate/up half. Regenerate any
+oracle whose manifest still reads "rows [0:inter] = gate".
 
 Weights are not dumped -- they are gigabytes and Rust reads them from the
 checkpoint itself, which is the point. Instead each mapped tensor gets a
@@ -221,7 +231,7 @@ manifest = {
     "dense_intermediate": cfg.intermediate_size,
     "log_scaling_n_floor": cfg.log_scaling_n_floor,
     "log_scaling_alpha": cfg.log_scaling_alpha,
-    "w13_split": "out-dim rows [0:inter] = gate (w1), [inter:] = up (w3)",
+    "w13_split": "out-dim rows INTERLEAVED: even = gate (w1), odd = up (w3)",
     "orientation": "checkpoint stores [experts, out, in]; PINNED by w2 being non-square",
     "moe_intermediate": cfg.moe_intermediate_size,
     "n_routed": cfg.n_routed_experts,

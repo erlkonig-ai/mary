@@ -279,15 +279,13 @@ fn run_layers(
             let acc = routed_experts_gpu::<Bk>(cp, &p, &by_expert, &hn, n, h, inter, dev)?;
 
             let sfused = cp.tensor(&format!("{p}mlp.shared_experts.shared_w13_weight"))?.data;
-            let per = sfused.len() / t.n_shared_experts;
-            let mut sg = Vec::with_capacity(sfused.len() / 2);
-            let mut su = Vec::with_capacity(sfused.len() / 2);
-            for s in 0..t.n_shared_experts {
-                let blk = &sfused[s * per..(s + 1) * per];
-                let (aa, bb) = mary::models::inkling::load::deinterleave_rows(blk, 2 * inter, h);
-                sg.extend_from_slice(&aa);
-                su.extend_from_slice(&bb);
-            }
+            let (sg, su) = mary::models::inkling::load::split_shared_w13(
+                &sfused,
+                t.n_shared_experts,
+                inter,
+                h,
+                mary::models::inkling::load::shared_w13_halved(),
+            );
             drop(sfused);
             let sd = cp.tensor(&format!("{p}mlp.shared_experts.shared_w2_weight"))?.data;
             let gammas: Vec<f32> = routing.iter().flat_map(|r| r.shared_gammas.clone()).collect();

@@ -8,6 +8,17 @@
 //!   `2 * intermediate == hidden`, so it is square and a transposed reading
 //!   loads without complaint and computes nonsense. The oracle config makes it
 //!   non-square on purpose so the gate can see the difference.
+//! * **`shared_w13_weight` is square for the same reason, and had the same
+//!   hazard with no warning attached.** `[n_shared, 2 * intermediate, hidden]`
+//!   = `[2, 4096, 4096]`, so neither its shape nor any total sum distinguishes
+//!   the INTERLEAVED reading (`g0, u0, g1, u1, …`) from the HALVED one (all
+//!   gates, then all ups) — the two splits are permutations of each other and
+//!   have the identical total. It is INTERLEAVED, settled by running both on a
+//!   real forward: ' Paris' at top-1 logit 18.69 against '<|begin_of_text|>' at
+//!   8.94, the latter emitting no English at all. `load::split_shared_w13` is
+//!   the one place that does the split, `inkling_real_gate` asserts the
+//!   orientation against the oracle, and `INK_SHARED_W13_HALVED=1` re-runs the
+//!   experiment.
 //! * The shared experts consume the MoE block's **original input**, not the
 //!   routed output — they run beside the routed path, not after it.
 //! * The dense MLP has its own `global_scale` scalar, applied to the block's

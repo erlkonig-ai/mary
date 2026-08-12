@@ -418,3 +418,68 @@ pub fn deinterleave_fused(fused: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     out.extend_from_slice(&b);
     out
 }
+
+/// Which reading of the SHARED experts' `shared_w13_weight` output axis to use.
+///
+/// `false` (the default) is INTERLEAVED — `g0, u0, g1, u1, …`, the same
+/// convention as [`split_gate_up`]. `INK_SHARED_W13_HALVED=1` selects the
+/// contiguous reading, so the question can be settled by running it rather than
+/// by argument. See [`split_shared_w13`].
+pub fn shared_w13_halved() -> bool {
+    std::env::var("INK_SHARED_W13_HALVED").map(|v| v == "1").unwrap_or(false)
+}
+
+/// Split the shared experts' `shared_w13_weight`, `[n_shared, 2 * inter, hidden]`,
+/// into gate and up, each `[n_shared, inter, hidden]`.
+///
+/// **This is a hazard, and it is a worse one than the routed experts'.** In both
+/// released checkpoints `2 * inter == hidden == 4096`, so the tensor is square
+/// on its last two axes and a wrong split loads without complaint and computes
+/// nonsense — the same trap [`super::mlp`] documents for the routed matrix. But
+/// the routed split has a witness the shared one does not: `w2` is non-square,
+/// which pins the `[out, in]` convention, and the routed fused matrix is
+/// converted by `transformers/conversion_mapping.py` with an explicit
+/// `[Interleave(dim=0), Chunk(dim=0)]`. Nothing in the shared tensor's shape or
+/// in a conversion rule distinguishes interleaved from halved, and the two
+/// readings have the SAME total sum, so every aggregate fingerprint that does
+/// not separate the halves agrees with both.
+///
+/// This tree contained both readings at once, and the contradiction had never
+/// been run: `inkling_forward`/`inkling_pipe` de-interleaved, `inkling_real_gate`
+/// halved, and `golden/capture_inkling_real.py` had a docstring and a manifest
+/// saying halved above code that calls `_deint`. The shipped
+/// `inkling_oracle_fp4` manifest records the shared gate/up sums as
+/// `-6.243070e+02 / -6.074423e+02`, which are exactly the HALVED split of layer
+/// 3 of `inkling-small-nvfp4`; the interleaved split of the same bytes is
+/// `-1.412489e+03 / +1.807401e+02`. So the golden was captured against the other
+/// reading than the code that now sits above it — a stale oracle, not a
+/// corroboration.
+pub fn split_shared_w13(
+    fused: &[f32],
+    n_shared: usize,
+    inter: usize,
+    hidden: usize,
+    halved: bool,
+) -> (Vec<f32>, Vec<f32>) {
+    let per = 2 * inter * hidden;
+    assert_eq!(
+        fused.len(),
+        n_shared * per,
+        "shared_w13 is not [{n_shared}, {}, {hidden}]",
+        2 * inter
+    );
+    let mut gate = Vec::with_capacity(n_shared * inter * hidden);
+    let mut up = Vec::with_capacity(n_shared * inter * hidden);
+    for s in 0..n_shared {
+        let blk = &fused[s * per..(s + 1) * per];
+        if halved {
+            gate.extend_from_slice(&blk[..per / 2]);
+            up.extend_from_slice(&blk[per / 2..]);
+        } else {
+            let (g, u) = deinterleave_rows(blk, 2 * inter, hidden);
+            gate.extend_from_slice(&g);
+            up.extend_from_slice(&u);
+        }
+    }
+    (gate, up)
+}
