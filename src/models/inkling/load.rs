@@ -43,6 +43,32 @@ impl Span {
     }
 }
 
+/// One expert's BF16 weight, BORROWED out of the checkpoint mapping.
+///
+/// The unquantised twin of [`PackedExpertRef`], borrowed for the same reason:
+/// [`Checkpoint::expert_slice_bf16`] copies 33.6 MB per expert so an importer
+/// can own the bytes, and a device lane does not want to own them — it hands
+/// them to a host-to-device copy, or to a zero-copy alias of the mapping
+/// itself, and never reads them again.
+pub struct Bf16ExpertRef {
+    slab: Span,
+    off: usize,
+    len: usize,
+    /// Output rows of this expert's matrix.
+    pub rows: usize,
+    /// Input columns. Unlike the packed form this is the LOGICAL width: BF16
+    /// stores one element per element.
+    pub cols: usize,
+}
+
+impl Bf16ExpertRef {
+    /// This expert's `[rows, cols]` little-endian BF16 bytes.
+    pub fn bytes(&self) -> &[u8] {
+        let b = self.slab.bytes();
+        &b[self.off..self.off + self.len]
+    }
+}
+
 /// A checkpoint directory plus its tensor-to-shard index.
 ///
 /// `maps` and `spans` are caches, hence the `Mutex` behind `&self`: reading a
@@ -339,6 +365,42 @@ impl Checkpoint {
             shape: vec![rows, cols],
             bytes: raw[e * per..(e + 1) * per].to_vec(),
         })
+    }
+
+    /// One expert's BF16 bytes, BORROWED rather than copied — see
+    /// [`Bf16ExpertRef`].
+    ///
+    /// What the device lane calls for layer 2. Every bound is checked against
+    /// the shard's own header, and the ABSENCE of a `.scale` sidecar is
+    /// asserted rather than assumed: a packed stack read as BF16 has exactly
+    /// the right byte count for half the logical width, so the mistake produces
+    /// numbers rather than an error.
+    pub fn expert_bf16_ref(&self, base: &str, e: usize) -> Result<Bf16ExpertRef> {
+        let slab = self.span(base)?;
+        anyhow::ensure!(
+            slab.dtype == "BF16",
+            "{base} holds {}; expert_bf16_ref is for the unquantised stacks",
+            slab.dtype
+        );
+        anyhow::ensure!(
+            !self.shard_of.contains_key(&format!("{base}.scale")),
+            "{base} has a .scale sidecar -- it is NVFP4, not BF16",
+        );
+        let shape = slab.shape.clone();
+        anyhow::ensure!(
+            shape.len() == 3,
+            "{base} has shape {shape:?}; a stacked expert matrix is rank 3"
+        );
+        let (experts, rows, cols) = (shape[0], shape[1], shape[2]);
+        anyhow::ensure!(e < experts, "{base} stacks {experts} experts; {e} is out of range");
+        let per = rows * cols * 2;
+        anyhow::ensure!(
+            slab.len == experts * per,
+            "{base}: {} bytes for {experts}x{rows}x{cols} BF16, expected {}",
+            slab.len,
+            experts * per
+        );
+        Ok(Bf16ExpertRef { slab, off: e * per, len: per, rows, cols })
     }
 
     /// How many experts a stacked matrix holds.

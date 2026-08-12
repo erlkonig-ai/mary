@@ -44,9 +44,12 @@
 //! lane nobody tests; a host lane you CAN select is one you will run by
 //! accident, which is how a 401 s forward happened.
 //!
-//! Layer 2's experts are BF16 and therefore have no lane at all — see the
-//! `unimplemented!` in the routed block. Widening them to f32 to reuse the f32
-//! path is the exact thing this file no longer does.
+//! Mixed precision is not a second lane either. Layer 2's experts are BF16 and
+//! the other 41 layers' are NVFP4, so the routed block picks the instruction the
+//! stored format calls for — `mma.sync…bf16` or the block-scaled
+//! `…mxf4nvf4.block_scale` — and nothing else changes. Both accumulate in f32,
+//! which is the MMA's own output type and not a widening; widening the BF16
+//! weight to f32 to reuse the f32 path is the exact thing this file does not do.
 //!
 //! # Where the weights come from
 //!
@@ -478,6 +481,84 @@ fn routed_experts_fp4(
     Ok(acc)
 }
 
+/// The same lane for layer 2, whose experts are BF16.
+///
+/// Deliberately the same shape as [`routed_experts_fp4`], line for line: the
+/// same grouping by expert, the same pointer-containment binding, the same ONE
+/// sync for the layer with the accumulation in `BTreeMap` order. What the
+/// format takes away is all that differs — no block scales to bind, no `scale2`
+/// to fold in, no activation quantiser. What it puts back is one cast: the MMA
+/// takes the same type on both operands, so the f32 residual stream is rounded
+/// to BF16 on the device before it enters. That is not a liberty — the
+/// reference implementation runs this layer in BF16 throughout, so a BF16
+/// activation is what `transformers` multiplies too.
+fn routed_experts_bf16(
+    src: &Weights,
+    aliases: Option<&mary::models::inkling::fp4gemm::Aliases>,
+    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+    prefix: &str,
+    by_expert: &BTreeMap<usize, Vec<(usize, f32)>>,
+    hn: &[f32],
+    n: usize,
+    h: usize,
+    inter: usize,
+    host: &mut (f64, f64),
+) -> Result<Vec<f32>> {
+    use cubecl::prelude::CubeElement;
+    use mary::models::inkling::bf16gemm::{bf16_linear_launch, upload_bf16_act};
+    use mary::models::inkling::fp4gemm::gate_up_silu_bf16_launch;
+
+    let bind = |data: &[u8]| match aliases {
+        Some(al) => al.slice_or_copy(client, data),
+        None => client.create_from_slice(data),
+    };
+
+    let n13 = format!("{prefix}mlp.experts.w13_weight");
+    let n2 = format!("{prefix}mlp.experts.w2_weight");
+    let mut acc = vec![0f32; n * h];
+    let mut pending: Vec<(&Vec<(usize, f32)>, cubecl::server::Handle)> =
+        Vec::with_capacity(by_expert.len());
+
+    for (&e, toks) in by_expert {
+        let t_s = Instant::now();
+        let w13 = src.expert_bf16(&n13, e)?;
+        let w2 = src.expert_bf16(&n2, e)?;
+        host.0 += t_s.elapsed().as_secs_f64();
+
+        let t_w = Instant::now();
+        let m = toks.len();
+        let mut x = vec![0f32; m * h];
+        for (i, &(ti, _)) in toks.iter().enumerate() {
+            x[i * h..(i + 1) * h].copy_from_slice(&hn[ti * h..(ti + 1) * h]);
+        }
+
+        let (a, m_pad) = upload_bf16_act(client, &x, m, h);
+        let b = bind(w13.bytes());
+        let both = bf16_linear_launch(client, &a, &b, m_pad, h, 2 * inter);
+
+        // The intermediate never leaves the device and never becomes f32 on the
+        // host: `gate_up_silu` writes BF16 straight into the second MMA's A
+        // operand.
+        let act = gate_up_silu_bf16_launch(client, &both, m_pad, inter);
+        let b2 = bind(w2.bytes());
+        let y_h = bf16_linear_launch(client, &act, &b2, m_pad, inter, h);
+        pending.push((toks, y_h));
+        host.1 += t_w.elapsed().as_secs_f64();
+    }
+
+    let t_r = Instant::now();
+    for (toks, y_h) in pending {
+        let y = f32::from_bytes(&client.read_one(y_h).expect("read y")).to_vec();
+        for (i, &(ti, wgt)) in toks.iter().enumerate() {
+            for o in 0..h {
+                acc[ti * h + o] += y[i * h + o] * wgt;
+            }
+        }
+    }
+    host.1 += t_r.elapsed().as_secs_f64();
+    Ok(acc)
+}
+
 fn main() -> Result<()> {
     let ckpt = std::env::args().nth(1).map(PathBuf::from).context("usage: <ckpt> <ids> <out>")?;
     let ids_path = std::env::args().nth(2).map(PathBuf::from).context("usage: <ckpt> <ids> <out>")?;
@@ -744,7 +825,7 @@ fn main() -> Result<()> {
     );
     println!("  attention          : device, weights DEVICE-RESIDENT");
     println!("  shared + dense MLP : device, uploaded once and held");
-    println!("  routed experts     : device, NATIVE NVFP4 tensor cores");
+    println!("  routed experts     : device, NATIVE tensor cores -- NVFP4 where packed, BF16 at layer 2");
     println!("  head (unembed)     : device");
     println!("  kv cache           : {}", if kv { "on" } else { "off (prefix recomputed each step)" });
     // The SHARED experts' w13 is square, so nothing but a forward can tell the
@@ -1110,33 +1191,36 @@ fn main() -> Result<()> {
             }
 
             let t_d = Instant::now();
-            // Layer 2's experts are BF16 and have no `.scale` sidecar, so the
-            // NVFP4 tensor cores cannot take them. There is no fallback, and
-            // that is the point: the fallback WAS `expert_weight_bf16`, which
-            // widened the stored BF16 into f32 on the device and multiplied
-            // that -- 604 MB of f32 per token for the six experts a token
-            // routes to, to hold weights the checkpoint stores in 151 MB. A
-            // BF16 weight wants a BF16 MMA (`mma.sync...bf16`, f32
-            // accumulator, which is the instruction's own output type and not
-            // a widening). That kernel does not exist here yet, so this
-            // panics rather than quietly running the model at a precision
-            // nobody asked for.
+            // Two formats, two instructions, one lane. 41 of the 42 layers
+            // carry NVFP4 experts and go through the block-scaled MMA; layer 2
+            // carries plain BF16 ones -- no `.scale` sidecar, because nothing
+            // quantised them -- and goes through the unscaled BF16 MMA
+            // (`mma.sync...bf16`, f32 accumulator, which is the instruction's
+            // own output type and not a widening).
+            //
+            // Which one is decided by the checkpoint, not by a flag. What used
+            // to sit here was `expert_weight_bf16`, which widened the stored
+            // BF16 into f32 on the device and multiplied that -- 604 MB of f32
+            // per token for the six experts a token routes to, to hold weights
+            // the checkpoint stores in 151 MB -- and then, once that was
+            // deleted, an `unimplemented!` that made every 42-layer run
+            // impossible. Neither is a lane; this is.
             let acc = {
-                if !cp.is_nvfp4(&format!("{p}mlp.experts.w13_weight")) {
-                    unimplemented!(
-                        "layer {layer}'s routed experts are BF16 and there is no BF16 \
-                         tensor-core path here yet. Run a layer range that excludes this \
-                         layer, or write the bf16 MMA. What is NOT acceptable is widening \
-                         the weight to f32 to reuse the f32 lane -- that is what this \
-                         commit deleted."
-                    );
-                }
-                let a = routed_experts_fp4(
-                    &cp,
-                    fp4_aliases.as_ref(),
-                    &fp4_client,
-                    &p, &by_expert, &hn, n, h, inter, &mut host_t,
-                )?;
+                let a = if cp.is_nvfp4(&format!("{p}mlp.experts.w13_weight")) {
+                    routed_experts_fp4(
+                        &cp,
+                        fp4_aliases.as_ref(),
+                        &fp4_client,
+                        &p, &by_expert, &hn, n, h, inter, &mut host_t,
+                    )?
+                } else {
+                    routed_experts_bf16(
+                        &cp,
+                        fp4_aliases.as_ref(),
+                        &fp4_client,
+                        &p, &by_expert, &hn, n, h, inter, &mut host_t,
+                    )?
+                };
                 expert_loads += by_expert.len();
                 a
             };
@@ -1203,7 +1287,12 @@ fn main() -> Result<()> {
         }
         t_other += t_o.elapsed().as_secs_f64();
         let norm: f32 = (x.iter().map(|v| (v * v) as f64).sum::<f64>() / x.len() as f64).sqrt() as f32;
-        println!("  layer {layer:2} [{}] {:.1}s  rms {norm:.4}",
+        // Milliseconds, not tenths. A decode pass through an NVFP4 layer is
+        // ~50 ms and through layer 2's BF16 experts ~600 ms, and at one decimal
+        // place the first of those prints as 0.0s -- which makes the one
+        // comparison this line exists for, layer 2 against its neighbours,
+        // unanswerable from the log.
+        println!("  layer {layer:2} [{}] {:.3}s  rms {norm:.4}",
                  if is_local { "local " } else { "global" }, l0.elapsed().as_secs_f32());
     }
 
@@ -1539,7 +1628,7 @@ fn main() -> Result<()> {
                  t_attn - t_attn_read - t_attn_up);
     }
     println!("    mlp half            {t_other:8.1}   of which:");
-    println!("      routed experts    {t_expert:8.1}   (slice + bind + NVFP4 mma, device)");
+    println!("      routed experts    {t_expert:8.1}   (slice + bind + native mma, device)");
     println!("      shared experts    {t_shared:8.1}   (device)");
     println!("      rest of the half  {:8.1}   (routing, dense layers, sconv, norms)",
              t_other - t_expert - t_shared);

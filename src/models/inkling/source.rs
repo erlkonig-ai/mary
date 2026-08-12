@@ -29,8 +29,8 @@ use std::time::Instant;
 
 use anyhow::Result;
 
-use super::load::{Checkpoint, Held, Loaded, PackedExpertRef};
-use super::pile::{PackedSlab, PileSource};
+use super::load::{Bf16ExpertRef, Checkpoint, Held, Loaded, PackedExpertRef};
+use super::pile::{Bf16Slab, PackedSlab, PileSource};
 
 /// What the loader moved on account of one tensor name.
 ///
@@ -100,6 +100,43 @@ impl Slab {
     /// Storage bytes this slab spans — codes plus block scales.
     pub fn bytes(&self) -> usize {
         self.codes().len() + self.scales().len()
+    }
+}
+
+/// One expert's BF16 plane, borrowed from whichever source holds it.
+///
+/// [`Slab`] with the scales taken out. Both arms borrow, for the same reason
+/// and with the same keepalive discipline: layer 2's `w13` is 33.6 MB per
+/// expert and 8.6 GiB per layer, and the caller hands the bytes to a device and
+/// never reads them again.
+pub enum BfSlab {
+    Ckpt(Bf16ExpertRef),
+    Pile(Bf16Slab),
+}
+
+impl BfSlab {
+    /// This expert's `[rows, cols]` little-endian BF16 bytes.
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            BfSlab::Ckpt(r) => r.bytes(),
+            BfSlab::Pile(p) => &p.bytes,
+        }
+    }
+
+    /// Output rows of this expert's matrix.
+    pub fn rows(&self) -> usize {
+        match self {
+            BfSlab::Ckpt(r) => r.rows,
+            BfSlab::Pile(p) => p.rows,
+        }
+    }
+
+    /// Input columns.
+    pub fn cols(&self) -> usize {
+        match self {
+            BfSlab::Ckpt(r) => r.cols,
+            BfSlab::Pile(p) => p.cols,
+        }
     }
 }
 
@@ -282,6 +319,24 @@ impl Weights {
         };
         // Packed: nothing is widened, so host bytes are storage bytes.
         let moved = s.bytes() as u64;
+        self.note(base, moved, moved, t0);
+        Ok(s)
+    }
+
+    /// One expert's BF16 plane, borrowed, unwidened.
+    ///
+    /// The counterpart of [`Weights::expert_packed`] for the one layer that was
+    /// never quantised. Charged through the same counters at the same seam, so
+    /// a per-token byte total covers both formats in one unit.
+    pub fn expert_bf16(&self, base: &str, e: usize) -> Result<BfSlab> {
+        let t0 = Instant::now();
+        let s = match &self.src {
+            Src::Ckpt(c) => BfSlab::Ckpt(c.expert_bf16_ref(base, e)?),
+            Src::Pile(p) => BfSlab::Pile(p.expert_bf16(base, e)?),
+        };
+        // Stored BF16, handed on as stored BF16: host bytes ARE storage bytes,
+        // and that identity is the whole point of this lane.
+        let moved = s.bytes().len() as u64;
         self.note(base, moved, moved, t0);
         Ok(s)
     }

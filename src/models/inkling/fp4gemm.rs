@@ -152,9 +152,9 @@ pub fn fp4_linear<AB: Scalar, S: Scalar, NA: Size, NC: Size>(
 /// the de-interleave here, on the `[m, 2*inter]` result, moves it off the
 /// `[2*inter, hidden]` weight — 16x2048 elements touched instead of 4096x4096.
 #[cube(launch)]
-pub fn gate_up_silu(
+pub fn gate_up_silu<O: Scalar + Cast>(
     both: &Tensor<f32>,
-    act: &mut Tensor<f32>,
+    act: &mut Tensor<O>,
     #[comptime] inter: usize,
     #[comptime] halved: bool,
 ) {
@@ -172,7 +172,13 @@ pub fn gate_up_silu(
         } else {
             (both[r * 2 * inter + 2 * i], both[r * 2 * inter + 2 * i + 1])
         };
-        act[idx] = (g / (1.0f32 + Exp::exp(-g))) * u;
+        // The output type is the NEXT matmul's operand type: f32 for the NVFP4
+        // lane, whose second GEMM re-quantises from f32 anyway, and bf16 for
+        // the layer-2 lane, whose second GEMM takes bf16 directly. ONE
+        // implementation of the interleave, because the INTERLEAVED/HALVED
+        // question above is exactly the kind that a second transcription gets
+        // silently wrong. `O::cast_from` is the identity when `O` is f32.
+        act[idx] = O::cast_from((g / (1.0f32 + Exp::exp(-g))) * u);
     }
 }
 
@@ -217,8 +223,31 @@ pub fn fp4_linear_launch<R: Runtime>(
     out
 }
 
-/// Launch [`gate_up_silu`] over an `[m_pad, 2 * inter]` fused result.
+/// Launch [`gate_up_silu`] over an `[m_pad, 2 * inter]` fused result, f32 out.
 pub fn gate_up_silu_launch<R: Runtime>(
+    client: &ComputeClient<R>,
+    both: &Handle,
+    m_pad: usize,
+    inter: usize,
+) -> Handle {
+    gate_up_silu_launch_as::<f32, R>(client, both, m_pad, inter)
+}
+
+/// The same, BF16 out — what the layer-2 lane feeds straight back into the MMA.
+///
+/// A separate entry point rather than a turbofish at the call site so the two
+/// lanes read the same, and so nothing but the element type differs between
+/// them.
+pub fn gate_up_silu_bf16_launch<R: Runtime>(
+    client: &ComputeClient<R>,
+    both: &Handle,
+    m_pad: usize,
+    inter: usize,
+) -> Handle {
+    gate_up_silu_launch_as::<half::bf16, R>(client, both, m_pad, inter)
+}
+
+fn gate_up_silu_launch_as<O: Scalar + Cast + CubeElement, R: Runtime>(
     client: &ComputeClient<R>,
     both: &Handle,
     m_pad: usize,
@@ -227,11 +256,11 @@ pub fn gate_up_silu_launch<R: Runtime>(
     // INK_W13_HALVED=1 selects the contiguous reading, for the A/B.
     let halved = std::env::var("INK_W13_HALVED").map(|v| v == "1").unwrap_or(false);
     let n = m_pad * inter;
-    let act = client.empty(n * core::mem::size_of::<f32>());
+    let act = client.empty(n * core::mem::size_of::<O>());
     let threads = 256u32;
     let blocks = n.div_ceil(threads as usize) as u32;
     unsafe {
-        gate_up_silu::launch::<R>(
+        gate_up_silu::launch::<O, R>(
             client,
             CubeCount::Static(blocks, 1, 1),
             CubeDim::new_1d(threads),

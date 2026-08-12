@@ -357,6 +357,19 @@ pub struct PackedSlab {
     pub cols: usize,
 }
 
+/// One expert's BF16 weight, read out of the pile as a VIEW.
+///
+/// The unquantised sibling of [`PackedSlab`], and simpler for the reason layer
+/// 2 exists at all: nothing was quantised, so there are no planes to split and
+/// the payload IS the matrix.
+pub struct Bf16Slab {
+    pub bytes: Bytes,
+    /// Output rows of this expert's matrix.
+    pub rows: usize,
+    /// Input columns — logical, and here also stored.
+    pub cols: usize,
+}
+
 /// A model located in a pile: every tensor found, nothing widened, nothing
 /// copied.
 ///
@@ -612,6 +625,38 @@ impl PileSource {
             rows,
             cols: logical / 2,
         })
+    }
+
+    /// One expert's BF16 bytes, as a view over the pile's mapping.
+    ///
+    /// The dual of [`PileSource::expert_packed`], and it refuses the other
+    /// format for the same reason that one does: which of the two a leaf holds
+    /// is part of its identity here, so asking for the wrong one is an error
+    /// and never a reinterpretation.
+    pub fn expert_bf16(&self, base: &str, e: usize) -> Result<Bf16Slab> {
+        let h = match self.experts.get(&(base.to_string(), e as i64)).map(|r| r.handle) {
+            Some(ExpertHandle::Bf16(h)) => h,
+            Some(ExpertHandle::Nvfp4(_)) => {
+                anyhow::bail!("{base}[{e}] is packed NVFP4, not BF16")
+            }
+            None => anyhow::bail!("{base}[{e}] is not in the pile"),
+        };
+        let blob: Blob<Tensor<BF16, 2>> = self
+            .reader
+            .get(h)
+            .map_err(|err| anyhow::anyhow!("{base}[{e}]: {err:?}"))?;
+        let view: TensorView = TensorView::try_from_blob(blob)
+            .map_err(|err| anyhow::anyhow!("{base}[{e}]: decode: {err}"))?;
+        let dims = view.dims();
+        anyhow::ensure!(dims.len() == 2, "{base}[{e}] is rank {}", dims.len());
+        let (rows, cols) = (dims[0] as usize, dims[1] as usize);
+        let payload = view.payload();
+        anyhow::ensure!(
+            payload.len() == rows * cols * 2,
+            "{base}[{e}]: {} bytes for {rows}x{cols} BF16",
+            payload.len()
+        );
+        Ok(Bf16Slab { bytes: payload.clone(), rows, cols })
     }
 
     /// The pile's mapping, as `(base, len, keepalive)` — a list of ONE.

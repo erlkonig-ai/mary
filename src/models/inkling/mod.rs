@@ -41,4 +41,7 @@ pub mod stack;
 pub mod vision;
 
 pub use config::InklingConfig;
+// Layer 2's experts are BF16 and have no scales; the same tiling, the same
+// device residency, the unscaled sibling of the instruction.
+pub mod bf16gemm;
 pub mod fp4gemm;
