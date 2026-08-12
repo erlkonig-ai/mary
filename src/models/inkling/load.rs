@@ -80,6 +80,29 @@ pub struct RawTensor {
     pub bytes: Vec<u8>,
 }
 
+/// One expert's BF16 bytes, BORROWED out of the checkpoint mapping.
+///
+/// The counterpart to [`PackedExpertRef`] for the one layer Inkling leaves
+/// unquantised. [`Checkpoint::expert_slice`] widens those bytes to f32 on the
+/// host — 25.2 M scalar conversions and a 100 MB allocation per expert — which
+/// is the single most expensive thing a decode token does. A device lane wants
+/// the two bytes as they sit, and to widen them where the arithmetic is.
+pub struct Bf16ExpertRef {
+    span: Span,
+    off: usize,
+    len: usize,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl Bf16ExpertRef {
+    /// This expert's `[rows, cols]` BF16 bytes, little-endian, two per element.
+    pub fn bytes(&self) -> &[u8] {
+        let b = self.span.bytes();
+        &b[self.off..self.off + self.len]
+    }
+}
+
 /// One expert's packed NVFP4 weight, exactly as it sits in the checkpoint.
 ///
 /// `codes` is `[rows, cols]` bytes, two 4-bit E2M1 codes each, low nibble
@@ -421,6 +444,20 @@ impl Checkpoint {
     /// lanes reading the same offsets.
     pub fn expert_slice_packed(&self, base: &str, e: usize) -> Result<PackedExpert> {
         Ok(self.expert_packed_ref(base, e)?.to_owned_expert())
+    }
+
+    /// One expert's BF16 bytes, borrowed rather than widened — see
+    /// [`Bf16ExpertRef`]. Every bound is checked against the shard's own header.
+    pub fn expert_bf16_ref(&self, base: &str, e: usize) -> Result<Bf16ExpertRef> {
+        let span = self.span(base)?;
+        anyhow::ensure!(span.dtype == "BF16", "{base} holds {}, not BF16", span.dtype);
+        let shape = span.shape.clone();
+        anyhow::ensure!(shape.len() == 3, "{base} is rank {}", shape.len());
+        let (experts, rows, cols) = (shape[0], shape[1], shape[2]);
+        anyhow::ensure!(e < experts, "expert {e} of {experts}");
+        let per = rows * cols * 2;
+        anyhow::ensure!(span.len == experts * per, "{base} is {} bytes", span.len);
+        Ok(Bf16ExpertRef { span, off: e * per, len: per, rows, cols })
     }
 
     /// The same bytes, borrowed rather than copied — see [`PackedExpertRef`].

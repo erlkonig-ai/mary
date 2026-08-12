@@ -468,7 +468,7 @@ fn routed_experts_gpu(
     use mary::models::inkling::burn::{
         deinterleave_rows_device, expert_ffn, expert_weight_from_packed,
     };
-    use mary::models::inkling::dequant_cuda::expert_weight_fused;
+    use mary::models::inkling::dequant_cuda::{expert_weight_bf16, expert_weight_fused};
 
     let hn_dev: Tensor<B, 2> =
         Tensor::from_data(TensorData::new(hn.to_vec(), [n, h]), dev);
@@ -512,14 +512,21 @@ fn routed_experts_gpu(
             host.1 += t_w.elapsed().as_secs_f64();
             r
         } else {
-            let a = cp.expert_f32(&n13, e)?;
-            let b = cp.expert_f32(&n2, e)?;
+            // The BF16 branch — Inkling's layer 2. The bytes go up as they sit
+            // and the widen happens on the device. Widening on the host is 25.2
+            // M scalar conversions into a fresh 100 MB allocation per expert,
+            // then a 604 MB f32 upload for the six experts a token routes to:
+            // measured 0.55 s of a 1.6 s decode token, for ONE layer in
+            // forty-two. BF16 -> f32 is a shift, so both lanes produce the same
+            // bits and only the place changes.
+            let a = cp.expert_bf16(&n13, e)?;
+            let b = cp.expert_bf16(&n2, e)?;
             host.0 += t_s.elapsed().as_secs_f64();
             let t_w = Instant::now();
-            let fused = Tensor::<B, 2>::from_data(TensorData::new(a.data, [2 * inter, h]), dev);
+            let fused = expert_weight_bf16(a.bytes(), a.rows(), a.cols(), dev);
             let r = (
                 if deint { deinterleave_rows_device(fused) } else { fused },
-                Tensor::<B, 2>::from_data(TensorData::new(b.data, [h, inter]), dev),
+                expert_weight_bf16(b.bytes(), b.rows(), b.cols(), dev),
             );
             host.1 += t_w.elapsed().as_secs_f64();
             r
@@ -597,6 +604,8 @@ fn routed_experts_fp4(
     let n13 = format!("{prefix}mlp.experts.w13_weight");
     let n2 = format!("{prefix}mlp.experts.w2_weight");
     let mut acc = vec![0f32; n * h];
+    let mut pending: Vec<(&Vec<(usize, f32)>, cubecl::server::Handle)> =
+        Vec::with_capacity(by_expert.len());
 
     for (&e, toks) in by_expert {
         let t_s = Instant::now();
@@ -628,15 +637,27 @@ fn routed_experts_fp4(
 
         let (b2, bsc2) = (bind(w2.codes()), bind(w2.scales()));
         let y_h = fp4_linear_launch(client, &a2, &asc2, &b2, &bsc2, m_pad, inter, h, w2.scale2());
-        let y = f32::from_bytes(&client.read_one(y_h).expect("read y")).to_vec();
+        pending.push((toks, y_h));
         host.1 += t_w.elapsed().as_secs_f64();
+    }
 
+    // ONE sync for the layer, not one per expert. Reading each expert's result
+    // the moment it was enqueued drained the queue 234 times a token and left
+    // the device idle across the host's next slab; the queue is the whole point
+    // of having one. `pending` is in the `BTreeMap` order the loop walked, so
+    // the accumulation is the same sum in the same order and the result is
+    // bit-identical -- which is what makes this a scheduling change and not a
+    // numerics one.
+    let t_r = Instant::now();
+    for (toks, y_h) in pending {
+        let y = f32::from_bytes(&client.read_one(y_h).expect("read y")).to_vec();
         for (i, &(ti, wgt)) in toks.iter().enumerate() {
             for o in 0..h {
                 acc[ti * h + o] += y[i * h + o] * wgt;
             }
         }
     }
+    host.1 += t_r.elapsed().as_secs_f64();
     Ok(acc)
 }
 
@@ -1824,9 +1845,14 @@ fn main() -> Result<()> {
         println!("    of the routed-expert total, the host-synchronous parts:");
         println!("      slice from mmap   {:8.1}   ({:.3} ms x {expert_loads} loads)",
                  host_t.0, host_t.0 * 1e3 / expert_loads.max(1) as f64);
-        println!("      upload + enqueue  {:8.1}   ({:.3} ms x {expert_loads} loads)",
+        // NOT \"upload\": this bucket is everything after the slice -- binding
+        // the weight (an offset when it aliases, a copy when it does not),
+        // quantising the activation, four kernel enqueues, and the layer\u0027s one
+        // blocking read. Calling it an upload sent a profiling session looking
+        // for a transfer that was 4% of it.
+        println!("      bind+enqueue+sync {:8.1}   ({:.3} ms x {expert_loads} loads)",
                  host_t.1, host_t.1 * 1e3 / expert_loads.max(1) as f64);
-        println!("      remainder         {:8.1}   (enqueue + the sync, so device work lives here)",
+        println!("      remainder         {:8.1}   (whatever the two buckets above did not cover)",
                  t_expert - host_t.0 - host_t.1);
     }
     let (calls, hits, fileb, hostb, loader_ns) = cp.io_totals();

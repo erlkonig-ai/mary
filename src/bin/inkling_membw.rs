@@ -166,6 +166,38 @@ fn main() -> Result<()> {
         cold_disk as f64 / GIB
     );
 
+    // ---- host-mapped, COLD to the GPU but CPU-PREFAULTED -------------------
+    // A DIFFERENT 8 GiB region of the same shard, which this process has not
+    // touched from either side. The CPU walks it first, one byte per 4 KiB, so
+    // every page is present in this process's page table before the GPU asks
+    // for it. If the cold figure above is the cost of establishing those
+    // mappings, this one is fast; if it is a property of the pool, it is not.
+    {
+        let off2 = 0usize;
+        let slice2: &[u8] = &map[off2..off2 + bytes];
+        let h2 = al.slice(slice2).context("aliasing refused")?;
+        let t_pf = Instant::now();
+        let mut sink = 0u64;
+        let mut i = 0usize;
+        while i < slice2.len() {
+            sink = sink.wrapping_add(slice2[i] as u64);
+            i += 4096;
+        }
+        std::hint::black_box(sink);
+        let pf = t_pf.elapsed().as_secs_f64();
+        let c2 = time_read(&client, &h2, n_f32);
+        println!(
+            "  host-mapped, CPU-PREFAULTED then GPU-cold  {:8.1} GB/s   {:8.1} ms  (CPU walk took {:.1} ms = {:.1} GB/s)",
+            bytes as f64 / c2 / 1e9,
+            c2 * 1e3,
+            pf * 1e3,
+            bytes as f64 / pf / 1e9
+        );
+        let c3 = time_read(&client, &h2, n_f32);
+        println!("  same region, 2nd GPU pass                  {:8.1} GB/s   {:8.1} ms",
+                 bytes as f64 / c3 / 1e9, c3 * 1e3);
+    }
+
     // ---- host-mapped, WARM -------------------------------------------------
     let io1 = io_read_bytes();
     let warm = time_read(&client, &h_host, n_f32);

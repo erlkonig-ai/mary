@@ -59,6 +59,36 @@ pub enum Slab {
     Pile(PackedSlab),
 }
 
+/// One expert's BF16 bytes, borrowed from whichever source holds them.
+pub enum Bf16Slab {
+    Ckpt(crate::models::inkling::load::Bf16ExpertRef),
+    Pile(super::pile::Leaf),
+}
+
+impl Bf16Slab {
+    /// `[rows, cols]` BF16 bytes, little-endian.
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Bf16Slab::Ckpt(r) => r.bytes(),
+            Bf16Slab::Pile(l) => &l.bytes,
+        }
+    }
+
+    pub fn rows(&self) -> usize {
+        match self {
+            Bf16Slab::Ckpt(r) => r.rows,
+            Bf16Slab::Pile(l) => l.dims[0] as usize,
+        }
+    }
+
+    pub fn cols(&self) -> usize {
+        match self {
+            Bf16Slab::Ckpt(r) => r.cols,
+            Bf16Slab::Pile(l) => l.dims[1] as usize,
+        }
+    }
+}
+
 impl Slab {
     pub fn codes(&self) -> &[u8] {
         match self {
@@ -287,6 +317,22 @@ impl Weights {
         };
         // Packed: nothing is widened, so host bytes are storage bytes.
         let moved = s.bytes() as u64;
+        self.note(base, moved, moved, t0);
+        Ok(s)
+    }
+
+    /// One expert's UNQUANTISED bytes, borrowed and NOT widened.
+    ///
+    /// [`Weights::expert_f32`] is the widening twin; this is what a device lane
+    /// wants, because BF16 -> f32 is a shift and belongs where the weights are
+    /// going rather than on the host in front of a 100 MB allocation.
+    pub fn expert_bf16(&self, base: &str, e: usize) -> Result<Bf16Slab> {
+        let t0 = Instant::now();
+        let s = match &self.src {
+            Src::Ckpt(c) => Bf16Slab::Ckpt(c.expert_bf16_ref(base, e)?),
+            Src::Pile(p) => Bf16Slab::Pile(p.expert_bf16(base, e)?),
+        };
+        let moved = s.bytes().len() as u64;
         self.note(base, moved, moved, t0);
         Ok(s)
     }

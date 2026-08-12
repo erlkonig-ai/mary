@@ -131,6 +131,60 @@ fn luts(client: &Client) -> (Handle, Handle) {
     })
 }
 
+/// Widen BF16 to f32 on the device: one thread per packed pair.
+///
+/// BF16 -> f32 is the sixteen stored bits in the HIGH half of an f32 and zeros
+/// below, so this is a shift and a mask, exact in both directions. The host
+/// twin in [`crate::models::inkling::load::Checkpoint::expert_slice`] computes
+/// the same thing one scalar at a time behind a 100 MB allocation.
+#[cube(launch_unchecked)]
+fn bf16_widen_kernel(words: &Array<u32>, out: &mut Array<f32>) {
+    let i = ABSOLUTE_POS;
+    let w = words[i];
+    // Little-endian: the low half-word is the EARLIER element.
+    out[2 * i] = f32::reinterpret(w << u32::new(16));
+    out[2 * i + 1] = f32::reinterpret(w & u32::new(0xffff_0000i64));
+}
+
+/// Upload one expert's BF16 bytes and widen them on the device.
+///
+/// `raw` is `[rows, cols]` little-endian BF16 — exactly what
+/// [`crate::models::inkling::load::Bf16ExpertRef`] borrows out of the mapping.
+/// Returns `[rows, cols]` f32, bit-identical to widening on the host.
+pub fn expert_weight_bf16(
+    raw: &[u8],
+    rows: usize,
+    cols: usize,
+    device: &CudaDevice,
+) -> Tensor<Bk, 2> {
+    let client = CudaRuntime::client(device);
+    let n = rows * cols;
+    assert_eq!(raw.len(), n * 2, "raw is {} bytes, want {rows}x{cols} BF16", raw.len());
+    assert_eq!(n % 2, 0, "{n} elements do not pack into 4-byte words");
+    let words = n / 2;
+    assert_eq!(words % CUBE, 0, "{words} words do not divide into cubes of {CUBE}");
+
+    let src_h = client.create_from_slice(raw);
+    let out_h = client.empty(n * core::mem::size_of::<f32>());
+    unsafe {
+        bf16_widen_kernel::launch_unchecked::<CudaRuntime>(
+            &client,
+            CubeCount::new_1d((words / CUBE) as u32),
+            CubeDim::new_1d(CUBE as u32),
+            ArrayArg::from_raw_parts(src_h, words),
+            ArrayArg::from_raw_parts(out_h.clone(), n),
+        );
+    }
+    let cube = CubeTensor::<CudaRuntime>::new_contiguous(
+        client.clone(),
+        device.clone(),
+        [rows, cols].into(),
+        out_h,
+        DType::F32,
+    );
+    Tensor::from_primitive(TensorPrimitive::Float(cube))
+}
+
 /// Upload the packed bytes and nothing else — the floor every decode path
 /// shares, and the only part of an expert load that is irreducibly a copy.
 pub fn upload_only(codes: &[u8], scales: &[u8], device: &CudaDevice) {
