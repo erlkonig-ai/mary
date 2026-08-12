@@ -1,20 +1,52 @@
-//! A real forward pass of Inkling-Small on one machine, paging experts.
+//! A real forward pass of Inkling-Small across a CLUSTER, on the device.
 //!
-//! Every gate so far ends with the same disclaimer: the checkpoint-name to
-//! module mapping is authored on both sides, so a shared misreading would pass.
-//! This is the check that can settle it. Coherent continuations cannot come out
-//! of a wrong mapping — a transposed projection or a swapped gate/up half
+//! Every gate ends with the same disclaimer: the checkpoint-name to module
+//! mapping is authored on both sides, so a shared misreading would pass. This
+//! is the check that can settle it. Coherent continuations cannot come out of
+//! a wrong mapping — a transposed projection or a swapped gate/up half
 //! produces noise, not English.
 //!
-//! It fits on one machine because the router is small. The layer's experts are
-//! 26 GB at f32 and a short prompt touches a few dozen of 256, but which ones
-//! is not known until attention has run — so each layer runs attention, routes,
-//! and only then reads the selected expert slabs out of the mapping, applying
-//! and dropping each before the next. Peak residency is one layer, not one
-//! model.
+//! # There is no single-node mode, and that is deliberate
 //!
-//! Each distinct expert is decoded ONCE and applied to every token that chose
-//! it; decoding per (token, expert) pair would repeat most of the work.
+//! One box cannot hold this model: 144 GiB of weights against 119 GiB of RAM.
+//! It USED to run anyway, by streaming — re-reading each token's expert slabs
+//! off the SSD because the page cache had evicted them — and every measurement
+//! taken in that mode was a measurement of a disk, not of a model. So
+//! `INK_LAYERS` is now REQUIRED and must name a strict subrange: a process that
+//! would run the whole stack refuses to start.
+//!
+//! Not "exactly two". Two is what THIS model needs (byte-balanced at layer 20:
+//! layer 2 carries BF16 experts, 12.7 GiB against 3.55 GiB for an NVFP4 layer,
+//! so an even 21/21 split is a lopsided 85/71 GiB one). The 66-layer sibling
+//! wants five to seven. The rule is that no node runs the whole stack.
+//!
+//! `INK_LAYERS=LO:HI` runs that half-open range; `INK_PIPE=head:HOST:PORT`
+//! sends the residual stream on when the range ends, and `INK_PIPE=tail:ADDR`
+//! receives it, finishes the stack and returns the argmax. Only `[n, 4096]` f32
+//! crosses — 16 KB per token per boundary, once — which is why the split is by
+//! layer and not within one: splitting a layer needs an all-reduce per layer and
+//! 1 GbE cannot carry it.
+//!
+//!   # tail, on the second box
+//!   INK_LAYERS=20:42 INK_PIPE=tail:0.0.0.0:7654 inkling_forward <ckpt> <ids> <out>
+//!   # head, on the first
+//!   INK_LAYERS=0:20  INK_PIPE=head:<tail-host>:7654 inkling_forward <ckpt> <ids> <out>
+//!
+//! # One lane, all the way down
+//!
+//! There is nothing to select. Attention, the dense and shared MLPs, the head
+//! and the routed experts are all on the device, always; residency is
+//! unconditional; the routed experts go through the NVFP4 tensor cores as the
+//! NVFP4 they are stored as. `INK_GPU`, `INK_ATTN`, `INK_DENSE`, `INK_HEAD`,
+//! `INK_EXPERTS`, `INK_RESIDENT`, `INK_DEQUANT`, `INK_ZEROCOPY`, `INK_WARM` and
+//! `INK_HOST_SUM` all named a second, slower, host-or-widening implementation
+//! of something, and each of them is gone with it. A lane nobody selects is a
+//! lane nobody tests; a host lane you CAN select is one you will run by
+//! accident, which is how a 401 s forward happened.
+//!
+//! Layer 2's experts are BF16 and therefore have no lane at all — see the
+//! `unimplemented!` in the routed block. Widening them to f32 to reuse the f32
+//! path is the exact thing this file no longer does.
 //!
 //! # Where the weights come from
 //!
@@ -24,40 +56,8 @@
 //! does not live in the pile. One environment variable is the whole A/B, which
 //! is the point: everything below this line is the same code either way.
 //!
-//!   cargo run --release --features inkling-cuda,cuda-backend --bin inkling_forward \
-//!       -- <ckpt> <ids.bin> <out.bin>
-//!
-//! # Two machines, and why it is a MODE here rather than its own binary
-//!
-//! One machine cannot hold this model resident: 144 GiB of weights against 121
-//! GiB of RAM, so the page cache evicts what the next token needs and every
-//! token pays real block-device I/O for its expert slabs. Split by LAYER across
-//! two boxes it is ~72 GiB each, which fits with headroom.
-//!
-//! `INK_LAYERS=LO:HI` runs only that half-open range; `INK_PIPE=head:HOST:PORT`
-//! sends the residual stream on when the range ends, and `INK_PIPE=tail:ADDR`
-//! receives it, finishes the stack and returns the argmax. Only `[n, 4096]` f32
-//! crosses — 16 KB per token per boundary, once — which is why the split is by
-//! layer and not within one: splitting a layer needs an all-reduce per layer and
-//! 1 GbE cannot carry it.
-//!
-//! This is a mode and not a second program on purpose. It WAS a second program
-//! (`inkling_pipe`), and that program forked: it kept a copy of this file's
-//! layer loop from before attention went device-resident, before the fused
-//! NVFP4 decode and before the residency cache, so the two lanes computed
-//! different things at different speeds and no number from one was comparable
-//! to a number from the other. There is one layer loop, so there is nothing
-//! left to drift.
-//!
-//! Byte-balanced at layer 20 rather than the midpoint: layer 2 carries BF16
-//! experts (12.7 GiB against 3.55 GiB for an NVFP4 layer), so an even 21/21
-//! split is a lopsided 85/71 GiB one. Layers 0..20 are 77.6 GiB and 20..42 are
-//! 78.2 GiB.
-//!
-//!   # tail, on the second box
-//!   INK_LAYERS=20:42 INK_PIPE=tail:0.0.0.0:7654 inkling_forward <ckpt> <ids> <out>
-//!   # head, on the first
-//!   INK_LAYERS=0:20  INK_PIPE=head:<tail-host>:7654 inkling_forward <ckpt> <ids> <out>
+//!   cargo run --release --features inkling-cuda,cuda-backend,import \
+//!       --bin inkling_forward -- <ckpt> <ids.bin> <out.bin>
 
 use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
@@ -67,19 +67,18 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 
-use mary::models::inkling::attn::{attention, causal_mask, AttnDims, AttnWeights, LogScaling};
+use mary::models::inkling::attn::{causal_mask, AttnDims, AttnWeights, LogScaling};
 use mary::models::inkling::block::{
     conv_history, rms_norm, route, short_conv, short_conv_step, Routing,
 };
 use mary::models::inkling::config::{AttnKind, InklingConfig};
-use mary::models::inkling::load::{deinterleave_fused, split_gate_up, Held, Loaded};
+use mary::models::inkling::load::{split_gate_up, Held};
 use mary::models::inkling::source::Weights;
-use mary::models::inkling::mlp::{dense_mlp, shared_experts};
 use mary::models::inkling::mtp::{
     mtp_block, mtp_block_prefill, mtp_block_step, Concat as MtpConcat, MtpCache, MtpHead,
 };
 use mary::models::inkling::layer::{LayerMlp, LayerWeights};
-use mary::models::inkling::stack::{embed_and_norm, head};
+use mary::models::inkling::stack::embed_and_norm;
 
 /// One gibibyte, as the divisor every byte count here is printed against.
 const GIB: f64 = (1u64 << 30) as f64;
@@ -99,11 +98,6 @@ fn io_read_bytes() -> u64 {
                 .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse().ok()))
         })
         .unwrap_or(0)
-}
-
-/// `x * sigmoid(x)`.
-fn silu(x: f32) -> f32 {
-    x / (1.0 + (-x).exp())
 }
 
 /// Which end of a two-machine split this process is, if it is one.
@@ -155,45 +149,16 @@ fn recv_stream(s: &mut TcpStream, h: usize) -> Result<Option<(usize, usize, Vec<
     Ok(Some((n, pos0, x)))
 }
 
-/// `y = x W^T`, `W` stored `[out, in]`.
-///
-/// The accumulation is strictly sequential f32, which is the worst-case order
-/// for error growth over 4096 terms. `INK_HOST_SUM=reverse` sums the identical
-/// products from the far end: same mathematics, different rounding, same lane.
-/// That makes the host disagree with itself, which is the only honest way to
-/// measure how much of a host-vs-device gap is just f32 reassociation.
-fn linear(x: &[f32], w: &[f32], rows: usize, in_dim: usize, out_dim: usize) -> Vec<f32> {
-    let rev = std::env::var("INK_HOST_SUM").map(|v| v == "reverse").unwrap_or(false);
-    let mut out = vec![0f32; rows * out_dim];
-    for r in 0..rows {
-        let xr = &x[r * in_dim..(r + 1) * in_dim];
-        for o in 0..out_dim {
-            let wr = &w[o * in_dim..(o + 1) * in_dim];
-            out[r * out_dim + o] = if rev {
-                xr.iter().zip(wr).rev().map(|(a, b)| a * b).sum()
-            } else {
-                xr.iter().zip(wr).map(|(a, b)| a * b).sum()
-            };
-        }
-    }
-    out
-}
-
 /// The backend the device lane runs on.
-#[cfg(feature = "inkling-cuda")]
 type Bk = burn::backend::Cuda<f32>;
-#[cfg(feature = "inkling-cuda")]
 use burn::prelude::Backend;
-#[cfg(feature = "inkling-cuda")]
 use burn::tensor::{Tensor as BT, TensorData as BTD};
-#[cfg(feature = "inkling-cuda")]
 use mary::models::inkling::burn as dev_lane;
 
 /// Move a host `[rows, cols]` matrix to the device, consuming it.
 ///
 /// Takes the `Vec` by value on purpose: the dense `w13` is 537 MB at f32 and a
 /// borrowing helper would hold two copies of it at once.
-#[cfg(feature = "inkling-cuda")]
 fn up2<B: Backend>(v: Vec<f32>, rows: usize, cols: usize, dev: &B::Device) -> BT<B, 2> {
     assert_eq!(v.len(), rows * cols, "{} values are not [{rows}, {cols}]", v.len());
     BT::from_data(BTD::new(v, [rows, cols]), dev)
@@ -204,19 +169,16 @@ fn up2<B: Backend>(v: Vec<f32>, rows: usize, cols: usize, dev: &B::Device) -> BT
 /// The owning [`up2`] exists so a 537 MB dense weight is moved rather than
 /// duplicated. A resident weight cannot be moved (the run keeps it), so this
 /// copies; the copy is unavoidable and is stated rather than hidden.
-#[cfg(feature = "inkling-cuda")]
 fn up2r<B: Backend>(v: &[f32], rows: usize, cols: usize, dev: &B::Device) -> BT<B, 2> {
     assert_eq!(v.len(), rows * cols, "{} values are not [{rows}, {cols}]", v.len());
     BT::from_data(BTD::new(v.to_vec(), [rows, cols]), dev)
 }
 
-#[cfg(feature = "inkling-cuda")]
 fn up1r<B: Backend>(v: &[f32], len: usize, dev: &B::Device) -> BT<B, 1> {
     assert_eq!(v.len(), len, "{} values are not [{len}]", v.len());
     BT::from_data(BTD::new(v.to_vec(), [len]), dev)
 }
 
-#[cfg(feature = "inkling-cuda")]
 fn up1<B: Backend>(v: Vec<f32>, len: usize, dev: &B::Device) -> BT<B, 1> {
     assert_eq!(v.len(), len, "{} values are not [{len}]", v.len());
     BT::from_data(BTD::new(v, [len]), dev)
@@ -224,18 +186,15 @@ fn up1<B: Backend>(v: Vec<f32>, len: usize, dev: &B::Device) -> BT<B, 1> {
 
 /// Read a `[rows, cols]` device tensor back to the host. This is also the sync,
 /// so a timer around the call measures work rather than enqueueing.
-#[cfg(feature = "inkling-cuda")]
 fn down<B: Backend>(t: BT<B, 2>) -> Vec<f32> {
     t.into_data().convert::<f32>().to_vec::<f32>().expect("device readback")
 }
 
 /// A device tensor of this run's backend, named once so the residency types
 /// below do not have to repeat it.
-#[cfg(feature = "inkling-cuda")]
 type T2 = burn::tensor::Tensor<Bk, 2>;
 
 /// One layer's shared experts, on the device.
-#[cfg(feature = "inkling-cuda")]
 struct SharedOnDevice {
     gate: Vec<T2>,
     up: Vec<T2>,
@@ -254,7 +213,6 @@ struct SharedOnDevice {
 /// checkpoint once, uploaded, and the host copy is dropped. Holding both would
 /// double a budget for no gain, since after the upload nothing on the host ever
 /// reads them again.
-#[cfg(feature = "inkling-cuda")]
 #[derive(Default)]
 struct DeviceDense {
     shared: std::collections::BTreeMap<String, SharedOnDevice>,
@@ -347,7 +305,6 @@ impl MtpOwned {
     }
 }
 
-#[cfg(feature = "inkling-cuda")]
 impl DeviceDense {
     fn up2(v: Vec<f32>, rows: usize, cols: usize, dev: &burn::backend::cuda::CudaDevice) -> T2 {
         assert_eq!(v.len(), rows * cols, "{} values for [{rows}, {cols}]", v.len());
@@ -415,140 +372,15 @@ impl DeviceDense {
     }
 }
 
-/// Every routed expert for one layer, on the device, without a host f32 copy.
-///
-/// The host never sees a dequantised weight: the checkpoint's own bytes are
-/// BORROWED out of the mapping, uploaded as-is, and the E2M1/E4M3 decode
-/// happens on the device. That removed the 60.2s of a measured 113.7s forward
-/// that was scalar unpacking, and the 67 MB per-expert host allocation with it.
-///
-/// The decode is one fused kernel per weight
-/// ([`mary::models::inkling::dequant_cuda`]), with the gate/up de-interleave
-/// folded into where it writes. `INK_DEQUANT=chain` selects the Burn tensor
-/// chain instead — 46 launches a weight and 1.4 GB of device traffic to make
-/// 100 MB of f32 — because the fused kernel is gated bitwise AGAINST it and a
-/// reference you cannot still run is not a reference.
-///
-/// All of an expert's tokens go through in one matmul rather than one each.
-/// That reassociates the sums, so this is NOT bitwise identical to the host
-/// lane and must be gated on a tolerance, not on equality.
-///
-/// Syncs before returning, so the caller's timer measures work and not
-/// enqueueing.
-#[cfg(feature = "inkling-cuda")]
-#[allow(clippy::too_many_arguments)]
-fn routed_experts_gpu(
-    cp: &Weights,
-    prefix: &str,
-    by_expert: &BTreeMap<usize, Vec<(usize, f32)>>,
-    hn: &[f32],
-    n: usize,
-    h: usize,
-    inter: usize,
-    dev: &burn::backend::cuda::CudaDevice,
-    chain_decode: bool,
-    host: &mut (f64, f64),
-) -> Result<Vec<f32>> {
-    type B = Bk;
-    use burn::tensor::{Int, Tensor, TensorData};
-    use mary::models::inkling::burn::{
-        deinterleave_rows_device, expert_ffn, expert_weight_from_packed,
-    };
-    use mary::models::inkling::dequant_cuda::{expert_weight_bf16, expert_weight_fused};
-
-    let hn_dev: Tensor<B, 2> =
-        Tensor::from_data(TensorData::new(hn.to_vec(), [n, h]), dev);
-    let mut acc: Tensor<B, 2> = Tensor::zeros([n, h], dev);
-
-    for (&e, toks) in by_expert {
-        let n13 = format!("{prefix}mlp.experts.w13_weight");
-        let n2 = format!("{prefix}mlp.experts.w2_weight");
-
-        // 39 of 40 MoE layers are packed NVFP4; layer 2 is BF16. The packed
-        // branch never makes a host f32 copy. The BF16 branch has to widen
-        // somewhere, so it widens on the host — one layer in forty, stated
-        // rather than hidden.
-        let deint = std::env::var("INK_MUTATE_NO_DEINTERLEAVE").is_err();
-        let t_s = Instant::now();
-        let gu_dn = if cp.is_nvfp4(&n13) {
-            let w13 = cp.expert_packed(&n13, e)?;
-            let w2 = cp.expert_packed(&n2, e)?;
-            host.0 += t_s.elapsed().as_secs_f64();
-            let t_w = Instant::now();
-            let r = if chain_decode {
-                let gu = expert_weight_from_packed::<B>(
-                    w13.codes(), w13.scales(), w13.scale2(), w13.rows(), w13.cols(), dev,
-                );
-                (
-                    if deint { deinterleave_rows_device(gu) } else { gu },
-                    expert_weight_from_packed::<B>(
-                        w2.codes(), w2.scales(), w2.scale2(), w2.rows(), w2.cols(), dev,
-                    ),
-                )
-            } else {
-                (
-                    expert_weight_fused(
-                        w13.codes(), w13.scales(), w13.scale2(), w13.rows(), w13.cols(), deint, dev,
-                    ),
-                    expert_weight_fused(
-                        w2.codes(), w2.scales(), w2.scale2(), w2.rows(), w2.cols(), false, dev,
-                    ),
-                )
-            };
-            host.1 += t_w.elapsed().as_secs_f64();
-            r
-        } else {
-            // The BF16 branch — Inkling's layer 2. The bytes go up as they sit
-            // and the widen happens on the device. Widening on the host is 25.2
-            // M scalar conversions into a fresh 100 MB allocation per expert,
-            // then a 604 MB f32 upload for the six experts a token routes to:
-            // measured 0.55 s of a 1.6 s decode token, for ONE layer in
-            // forty-two. BF16 -> f32 is a shift, so both lanes produce the same
-            // bits and only the place changes.
-            let a = cp.expert_bf16(&n13, e)?;
-            let b = cp.expert_bf16(&n2, e)?;
-            host.0 += t_s.elapsed().as_secs_f64();
-            let t_w = Instant::now();
-            let fused = expert_weight_bf16(a.bytes(), a.rows(), a.cols(), dev);
-            let r = (
-                if deint { deinterleave_rows_device(fused) } else { fused },
-                expert_weight_bf16(b.bytes(), b.rows(), b.cols(), dev),
-            );
-            host.1 += t_w.elapsed().as_secs_f64();
-            r
-        };
-        // INK_MUTATE_NO_DEINTERLEAVE exists so the lane gate can be watched
-        // rejecting something, because a gate that has never failed and a gate
-        // that cannot fail look identical from outside.
-        let (gu, dn) = gu_dn;
-        anyhow::ensure!(gu.dims() == [2 * inter, h], "w13 is {:?}, want [{}, {h}]", gu.dims(), 2 * inter);
-        anyhow::ensure!(dn.dims() == [h, inter], "w2 is {:?}, want [{h}, {inter}]", dn.dims());
-
-        let rows: Vec<i32> = toks.iter().map(|&(ti, _)| ti as i32).collect();
-        let wts: Vec<f32> = toks.iter().map(|&(_, w)| w).collect();
-        let k = rows.len();
-        let idx: Tensor<B, 1, Int> =
-            Tensor::from_data(TensorData::new(rows, [k]), dev);
-        let wt: Tensor<B, 2> =
-            Tensor::from_data(TensorData::new(wts, [k, 1]), dev);
-
-        let xs = hn_dev.clone().select(0, idx.clone());
-        let ys = expert_ffn(xs, gu, dn) * wt;
-        acc = acc.select_assign(0, idx, ys, burn::tensor::IndexingUpdateOp::Add);
-    }
-
-    // Reading back is the sync. It is also the only host copy in the routine:
-    // [n, h] f32, 131 KB at these dimensions, against the 67 MB per expert the
-    // host lane allocates.
-    Ok(acc.into_data().convert::<f32>().to_vec::<f32>().expect("acc to host"))
-}
-
-
 /// Every routed expert for one layer, on the NATIVE NVFP4 tensor-core path.
 ///
-/// Differs from [`routed_experts_gpu`] in that the packed bytes go straight
-/// into `mma.sync…kind::mxf4nvf4…ue4m3` instead of being decoded into a
-/// 67.1 + 33.6 MB f32 pair per expert that is read once and dropped.
+/// The only routed lane there is. The packed bytes go straight into
+/// `mma.sync…kind::mxf4nvf4…ue4m3`. The lane this replaced (`INK_EXPERTS=gpu`)
+/// decoded each expert into a 67.1 + 33.6 MB f32 pair, multiplied THAT, and
+/// dropped it — 100 MB of device memory materialised per expert to hold a
+/// weight the checkpoint stores in 12.6, four times a token per layer. It is
+/// gone rather than kept as a control, because the control was a widening and
+/// the whole point of an NVFP4 checkpoint is that the weight is never widened.
 ///
 /// The slab is a BORROW either way — of a checkpoint shard's mapping or of the
 /// pile's — and where it came from is not visible here. It used to be: this
@@ -561,7 +393,6 @@ fn routed_experts_gpu(
 /// own `hf_quant_config.json` specifies for `*input_quantizer`. This lane is
 /// therefore CLOSER to the checkpoint's intended numerics than the f32-
 /// activation lane it replaces, not further from it.
-#[cfg(feature = "inkling-cuda")]
 #[allow(clippy::too_many_arguments)]
 fn routed_experts_fp4(
     src: &Weights,
@@ -666,19 +497,40 @@ fn main() -> Result<()> {
     };
     let open_secs = t_open.elapsed().as_secs_f64();
 
-    // Which layers THIS process runs. The default is the whole stack, so a
-    // single-machine run is the `INK_LAYERS` unset case and not a special one.
-    let (lo, hi) = match std::env::var("INK_LAYERS") {
-        Ok(s) => {
-            let (a, b) = s.split_once(':').context("INK_LAYERS wants LO:HI")?;
-            (a.parse::<usize>()?, b.parse::<usize>()?)
-        }
-        Err(_) => (0, t.num_hidden_layers),
-    };
+    // Which layers THIS process runs. REQUIRED, and a strict subrange.
+    //
+    // There is no default any more. Unset used to mean "the whole stack here",
+    // which on a 119 GiB box against 144 GiB of weights means the page cache
+    // evicts what the next token needs and every token pays real block-device
+    // I/O — and a run that reads the SSD between tokens is not this model
+    // running, it is a disk benchmark wearing its name.
+    //
+    // The bound is `hi - lo < num_hidden_layers`, NOT `nodes == 2`. Two is what
+    // this model happens to need; the 66-layer sibling wants five to seven.
+    // What is actually required is that no node carries the whole stack, and
+    // that is what this says.
+    let spec = std::env::var("INK_LAYERS").map_err(|_| {
+        anyhow::anyhow!(
+            "INK_LAYERS is required: this model does not fit one node ({} GiB of weights), so \
+             every process runs a strict subrange and at least two nodes are needed.\n  \
+             tail: INK_LAYERS=20:{}  INK_PIPE=tail:0.0.0.0:7654\n  \
+             head: INK_LAYERS=0:20   INK_PIPE=head:<tail-host>:7654",
+            144,
+            t.num_hidden_layers,
+        )
+    })?;
+    let (a, b) = spec.split_once(':').context("INK_LAYERS wants LO:HI")?;
+    let (lo, hi) = (a.parse::<usize>()?, b.parse::<usize>()?);
     anyhow::ensure!(lo < hi, "INK_LAYERS wants LO < HI, got {lo}:{hi}");
     anyhow::ensure!(
         hi <= t.num_hidden_layers,
         "INK_LAYERS {lo}:{hi} runs past the {}-layer stack",
+        t.num_hidden_layers
+    );
+    anyhow::ensure!(
+        hi - lo < t.num_hidden_layers,
+        "INK_LAYERS {lo}:{hi} is the whole {}-layer stack on one node, which does not fit. \
+         Split it: no node may run every layer, and two is the MINIMUM rather than the number.",
         t.num_hidden_layers
     );
     // A pipe end is only a pipe end if it is not the whole stack; refusing the
@@ -731,49 +583,6 @@ fn main() -> Result<()> {
     // layer split can partition.
     println!("  {}", cp.inventory());
 
-    // ---- does this node's share FIT? ---------------------------------------
-    //
-    // The decode loop cannot answer this on its own, and it is worth saying why,
-    // because its per-token `read_bytes` looks like the answer. A token routes
-    // to ~5 of 256 experts per layer, so nine tokens touch about a tenth of a
-    // node's share: most of what they read off disk is a FIRST touch, not a page
-    // the kernel evicted. Compulsory misses and capacity misses are different
-    // claims about different things, and only the second one is what a layer
-    // split is for.
-    //
-    // So ask directly. Touch the whole share, twice, and report each pass's
-    // block-device traffic: a share that fits reads it once and then reads ~zero,
-    // and one that does not reads back exactly what had to be evicted to make
-    // room for the tail of the first pass. `INK_WARM=1` also leaves the share hot
-    // for a decode measurement that follows, which is the other reason to want it.
-    // `INK_WARM=N` runs N passes, and more than two is often what it takes to
-    // get an answer: the cache a node starts with holds pages from whatever ran
-    // before -- on these boxes, the OTHER half of the very same pile, copied in
-    // whole -- and those age out only by being outlived. A share that fits shows
-    // its disk column falling to zero and staying; one that does not shows a
-    // column that will not fall however long you look at it.
-    let warm_passes: usize = std::env::var("INK_WARM")
-        .ok()
-        .map(|v| if v == "1" { 2 } else { v.parse().unwrap_or(0) })
-        .unwrap_or(0);
-    if warm_passes > 0 {
-        println!("  warming layers {lo}..{hi} -- {warm_passes} passes, so eviction is visible:");
-        for pass in 1..=warm_passes {
-            let t0 = Instant::now();
-            let before = io_read_bytes();
-            let (bytes, leaves) = cp.warm(lo as i64..=hi as i64 - 1)?;
-            let disk = io_read_bytes() - before;
-            println!(
-                "    pass {pass}: touched {:6.2} GiB in {leaves} leaves in {:5.1}s  \
-                 -> {:6.2} GiB off disk ({:.0} MB/s)",
-                bytes as f64 / GIB,
-                t0.elapsed().as_secs_f32(),
-                disk as f64 / GIB,
-                disk as f64 / 1e6 / t0.elapsed().as_secs_f64().max(1e-9)
-            );
-        }
-    }
-
     // How many tokens to generate past the prompt. 0 reproduces the original
     // single-forward behaviour exactly.
     let gen_steps: usize = std::env::var("INK_GEN")
@@ -794,12 +603,9 @@ fn main() -> Result<()> {
     let embed_w = if want_embed { Some(cp.held("model.llm.embed.weight")?) } else { None };
     let embed_n = if want_embed { Some(cp.held("model.llm.embed_norm.weight")?) } else { None };
     let fnorm = if want_head { Some(cp.held("model.llm.norm.weight")?) } else { None };
-    // `Option`, so the head lane can DROP the 3.3 GB host copy after uploading
-    // it. `held` only keeps it alive in the resident map when INK_RESIDENT is
-    // set, so dropping the handle frees it in the non-resident case — which is
-    // what the lane that replaced `std::mem::take` here has to preserve.
-    #[allow(unused_mut)]
-    let mut unembed = if want_head { Some(cp.held("model.llm.unembed.weight")?) } else { None };
+    // `Option`, so the tail can DROP its handle on the 3.3 GB host copy once the
+    // table is on the device and nothing on the host will read it again.
+    let unembed = if want_head { Some(cp.held("model.llm.unembed.weight")?) } else { None };
     println!("  embedding tables loaded in {:.1}s", started.elapsed().as_secs_f32());
 
     // `INK_MTP=k` drafts k tokens ahead with the MTP heads and scores them
@@ -894,57 +700,26 @@ fn main() -> Result<()> {
     // stable rows stop at position seq-1-d.
     let mut mtp_stage: Vec<Vec<f32>> = vec![Vec::new(); mtp_k];
     let mut mtp_caches: Vec<Option<MtpCache>> = (0..mtp_k).map(|_| None).collect();
-    println!(
-        "  dense weights      : {}",
-        if cp.resident_on() {
-            "RESIDENT -- read and widened once, then held for the whole run"
-        } else {
-            "streamed -- re-read and re-widened from the checkpoint every token"
-        }
-    );
 
     // Experts are read, applied and dropped. There is no decoded-expert cache:
     // it measured as no speedup, and it existed to paper over a capacity
     // shortfall (160 GB of checkpoint against 119 GB of box) that a second
     // Spark closes. See this file's header.
-    // One switch per lane, so a regression can be bisected to the lane that
-    // caused it, plus `INK_GPU=all` for the everything-on-device run.
-    let all_gpu = std::env::var("INK_GPU").map(|v| v == "all").unwrap_or(false);
-    let lane = |k: &str| all_gpu || std::env::var(k).map(|v| v == "gpu").unwrap_or(false);
-    // INK_EXPERTS is three-valued, so both branches' spellings keep working:
-    //   fp4 -> native NVFP4 tensor cores (spark1's lane)
-    //   gpu -> decode to f32, then an f32 matmul (spark2's lane, and what
-    //          INK_GPU=all alone selects, exactly as it did before the merge)
-    let ink_experts = std::env::var("INK_EXPERTS").unwrap_or_default();
-    let experts_fp4 = ink_experts == "fp4";
-    let experts_on_gpu = all_gpu || ink_experts == "gpu" || experts_fp4;
-    let attn_on_gpu = lane("INK_ATTN");
-    // `INK_RESIDENT` reads the same on both lanes -- hold a weight instead of
-    // re-reading it every token -- and differs only in WHERE, because a device
-    // lane never reads the host copy again. Off, attention streams as before.
-    let attn_resident = cp.resident_on();
-    // The shared+dense MLP lane. There used to be two implementations here --
-    // this one, which uploads the weights ONCE and holds them, and an
-    // `INK_MLP=gpu` lane that re-uploaded them per layer per token and
-    // de-interleaved on the device. They computed the same thing and the
-    // per-token one lost on every axis: slower (it paid the upload 42 times a
-    // token), and it could not express INK_SHARED_W13_HALVED at all, so the
-    // control was silently ignored on exactly one of four lanes. Deleted rather
-    // than left as an option, because a lane nobody selects is a lane nobody
-    // tests. `INK_GPU=all` now reaches the resident one.
-    let dense_gpu = all_gpu || std::env::var("INK_DENSE").map(|v| v == "gpu").unwrap_or(false);
-    let head_on_gpu = lane("INK_HEAD");
-    // The KV cache. Off by default so the uncached lane stays available as the
-    // thing to check against: the decisive test of a cache is that it produces
-    // the same token sequence as not having one, and that needs both to run.
+    //
+    // There are no lane switches left. `INK_GPU`, `INK_ATTN`, `INK_DENSE`,
+    // `INK_HEAD` and `INK_EXPERTS` each chose between a device implementation
+    // and a host one; `INK_RESIDENT` chose between holding a weight and
+    // re-reading it off the SSD every token; `INK_DEQUANT=chain` chose the
+    // 46-launch Burn decode over the fused kernel. Every one of those choices
+    // has a right answer on this hardware and a wrong one that still runs, and
+    // a wrong one that still runs is a wrong one you will ship. The right
+    // answers are now the only answers.
+    //
+    // The KV cache is the one thing still switched, and it is not a host/device
+    // choice: `INK_KV=0` is the uncached lane, which is the ONLY oracle the
+    // cached lane has (`INK_MTP_CHECK` compares the two in one process), so
+    // deleting it would delete the check that the cache is right.
     let kv = std::env::var("INK_KV").map(|v| v == "1" || v == "on").unwrap_or(false);
-    // The NVFP4 decode: one fused kernel per weight, or the Burn tensor chain
-    // it is gated against. Default fused; `INK_DEQUANT=chain` is the control.
-    let chain_decode = std::env::var("INK_DEQUANT").map(|v| v == "chain").unwrap_or(false);
-    anyhow::ensure!(
-        !kv || attn_on_gpu,
-        "INK_KV needs attention on the device -- set INK_ATTN=gpu or INK_GPU=all"
-    );
     // Head d's first STABLE row sits at position seq-1-d, so a prompt shorter
     // than the number of heads leaves a depth with no stable row at all: every
     // position of that head would be a function of drafts and the cache would
@@ -957,68 +732,30 @@ fn main() -> Result<()> {
     );
     anyhow::ensure!(
         mtp_k == 0 || pipe_spec.is_none(),
-        "INK_MTP is single-machine for now -- the head owns no unembedding and the tail owns no \
-         embedding table, so neither end can draft alone"
+        "INK_MTP needs one process to own both ends -- the head owns no unembedding and the tail \
+         owns no embedding table, so neither can draft alone. Which means drafting cannot run at \
+         all on a stack that no longer fits one node; the heads and the check are kept because \
+         the composition they gate is what a cross-node draft would be built from."
     );
     anyhow::ensure!(
         mtp_k <= cfg.mtp_config.num_nextn_predict_layers,
         "INK_MTP={mtp_k} but the checkpoint ships {} MTP heads",
         cfg.mtp_config.num_nextn_predict_layers
     );
-    let say = |b: bool| if b { "device" } else { "host (f32 oracle)" };
-    println!("  attention          : {}", say(attn_on_gpu));
-    println!(
-        "  shared + dense MLP : {}",
-        if dense_gpu {
-            "DEVICE-RESIDENT -- uploaded once, matmul on the GPU"
-        } else {
-            "host f32 (the reference lane)"
-        }
-    );
-    println!(
-        "  routed experts     : {}",
-        if experts_fp4 {
-            "device, NATIVE NVFP4 tensor cores"
-        } else if experts_on_gpu {
-            "device, decode to f32 then f32 matmul"
-        } else {
-            "host (f32 oracle)"
-        }
-    );
-    println!("  head (unembed)     : {}", say(head_on_gpu));
+    println!("  attention          : device, weights DEVICE-RESIDENT");
+    println!("  shared + dense MLP : device, uploaded once and held");
+    println!("  routed experts     : device, NATIVE NVFP4 tensor cores");
+    println!("  head (unembed)     : device");
     println!("  kv cache           : {}", if kv { "on" } else { "off (prefix recomputed each step)" });
-    println!("  nvfp4 decode       : {}", if chain_decode { "Burn tensor chain (46 launches/weight)" } else { "fused kernel (1 launch/weight)" });
-    if std::env::var("INK_HOST_SUM").map(|v| v == "reverse").unwrap_or(false) {
-        println!("  host sum order     : REVERSED (reassociation control)");
-    }
-    if std::env::var("INK_MUTATE_NO_DEINTERLEAVE").is_ok() {
-        println!("  !! MUTATION ACTIVE : deinterleave SKIPPED -- this output is expected to be WRONG");
-    }
     // The SHARED experts' w13 is square, so nothing but a forward can tell the
     // two readings apart. INK_SHARED_W13_HALVED=1 selects the other one.
-    // Every surviving lane honours it, so the guard that used to sit here --
-    // refusing the run because the per-token device lane hard-coded the
-    // INTERLEAVED reading and would have ignored the control silently -- went
-    // with that lane.
     let shared_halved = mary::models::inkling::load::shared_w13_halved();
-    println!(
-        "  attention weights  : {}",
-        if attn_on_gpu && attn_resident {
-            "DEVICE-RESIDENT -- read, widened and uploaded once, then held"
-        } else if attn_on_gpu {
-            "streamed -- re-read, re-widened and re-uploaded every token"
-        } else {
-            "host"
-        }
-    );
     println!(
         "  shared w13 split   : {}",
         if shared_halved { "HALVED (contiguous)" } else { "INTERLEAVED" }
     );
-    #[cfg(feature = "inkling-cuda")]
     let dev = burn::backend::cuda::CudaDevice::default();
-    #[cfg(feature = "inkling-cuda")]
-    let mut ddense = if dense_gpu { Some(DeviceDense::default()) } else { None };
+    let mut ddense = DeviceDense::default();
     // Every attention layer's projections, on the device, for the whole run.
     //
     // Attention was the last lane that still STREAMED, and it streamed because
@@ -1029,86 +766,66 @@ fn main() -> Result<()> {
     // layers: 2.2 s widening 6.9 GiB of BF16 into f32 and 6.0 s pushing it
     // across, against 0.2 s of attention. The weights do not change between
     // tokens; only where they are held was ever in question, and on a device
-    // lane the answer is the device.
+    // lane the answer is the device -- which is why there is no longer a flag
+    // that can answer it the other way.
     //
     // Keyed by the layer prefix, exactly as [`DeviceDense`] is, and populated
     // on first use rather than eagerly: a lane that is never taken should not
     // pay for the upload.
-    #[cfg(feature = "inkling-cuda")]
     let mut dattn: std::collections::BTreeMap<String, (dev_lane::AttnWeightsDev<Bk>, T2)> =
         std::collections::BTreeMap::new();
-    #[cfg(feature = "inkling-cuda")]
     let mut dattn_bytes = 0u64;
-    // Checked by running it, on the first MoE layer of the first pass: the two
-    // lanes are two transcriptions of the same arithmetic and a gate that is
-    // never run is not a gate.
-    let mut dense_checked = false;
     // Parsed once for the whole run. The lane it replaces re-parsed a shard
     // header four times per expert slab, ~9950 times over a forward.
-    #[cfg(feature = "inkling-cuda")]
-    let fp4_client = if experts_fp4 {
+    let fp4_client = {
         use cubecl::prelude::Runtime;
-        Some(cubecl::cuda::CudaRuntime::client(&Default::default()))
-    } else {
-        None
+        cubecl::cuda::CudaRuntime::client(&Default::default())
     };
     // Nine blocking device round trips for the whole run, instead of four per
-    // expert. Every later slab is an offset view of one of these.
-    let zerocopy_on = std::env::var("INK_ZEROCOPY").map(|v| v != "0").unwrap_or(true);
-    #[cfg(feature = "inkling-cuda")]
-    let fp4_aliases = match &fp4_client {
-        // INK_ZEROCOPY=0 forces the copying lane, so the seam can be A/B'd
-        // against it with the page cache in the same state.
-        Some(c) if zerocopy_on => {
-            let t = Instant::now();
-            let maps = cp.mappings()?;
-            let n = maps.len();
-            let a = mary::models::inkling::fp4gemm::Aliases::register(c, maps);
-            println!(
-                "  zero-copy mappings : {} {n} in {:.1} ms",
-                if a.is_some() { "registered" } else { "UNSUPPORTED, copying" },
-                t.elapsed().as_secs_f64() * 1e3
-            );
-            a
-        }
-        _ => None,
+    // expert. Every later slab is an offset view of one of these. `INK_ZEROCOPY=0`
+    // used to force a copying lane for the A/B; the A/B is settled and a copy of
+    // a weight the device can read where it lies is a copy for nothing.
+    let fp4_aliases = {
+        let t = Instant::now();
+        let maps = cp.mappings()?;
+        let nmaps = maps.len();
+        let a = mary::models::inkling::fp4gemm::Aliases::register(&fp4_client, maps);
+        println!(
+            "  zero-copy mappings : {} {nmaps} in {:.1} ms",
+            if a.is_some() { "registered" } else { "UNSUPPORTED, copying" },
+            t.elapsed().as_secs_f64() * 1e3
+        );
+        a
     };
-    #[cfg(not(feature = "inkling-cuda"))]
-    anyhow::ensure!(
-        !(experts_on_gpu || attn_on_gpu || dense_gpu || head_on_gpu),
-        "a device lane needs --features inkling-cuda"
-    );
 
     // The unembed table is 3.3 GB at f32 and does not change between generated
     // tokens, so it is uploaded ONCE here rather than once per step, and the
     // host copy is dropped rather than kept alongside it.
-    #[cfg(feature = "inkling-cuda")]
-    let unembed_dev = if head_on_gpu && want_head {
+    let unembed_dev = if want_head {
         let v = t.effective_vocab();
         let d = up2r::<Bk>(&unembed.as_ref().expect("unembed held").data, t.vocab_size, h, &dev)
             .slice([0..v, 0..h]);
-        // The host copy has no reader left. Dropping the handle frees it when
-        // residency is off; with INK_RESIDENT the resident map still holds it,
-        // which is that flag's declared cost, not a leak.
-        unembed = None;
         println!("  unembed uploaded, {v} x {h}");
         Some(d)
     } else {
         None
     };
+    // The host copy has no reader left: the head is on the device and there is
+    // no host head lane to fall back to, and the draft head reads the device
+    // table too. Residency still holds it, which is what residency IS, not a
+    // leak.
+    drop(unembed);
 
     // Everything one layer carries between generated tokens. The attention
     // cache is the headline, but the two layer-level short convolutions have
     // state too: they reach `kernel - 1` positions back, and a cache that
     // remembers K and V while forgetting those is wrong in a way that still
     // produces fluent-looking text.
-    #[cfg(feature = "inkling-cuda")]
     struct LayerCache {
         attn: dev_lane::AttnCache<Bk>,
         attn_sconv: BT<Bk, 2>,
         mlp_sconv: Vec<f32>,
     }
-    #[cfg(feature = "inkling-cuda")]
     let mut caches: Vec<LayerCache> = Vec::new();
 
     // The wire, opened AFTER the weights so a connection is never left hanging
@@ -1231,7 +948,6 @@ fn main() -> Result<()> {
             t_read.set(t_read.get() + s.elapsed().as_secs_f64());
             Ok(r)
         };
-        #[cfg_attr(not(feature = "inkling-cuda"), allow(unused_variables))]
         let gv = |nm: &str| -> Result<Vec<f32>> {
             let s = Instant::now();
             let r = cp.tensor(&format!("{p}{nm}"))?.data;
@@ -1256,9 +972,7 @@ fn main() -> Result<()> {
         // how far back a query may look, and therefore how much of the cache
         // can never be read again.
         let window = if is_local { Some(t.sliding_window_size) } else { None };
-        let a = if attn_on_gpu {
-            #[cfg(feature = "inkling-cuda")]
-            {
+        let a = {
                 // Both projections and the two short convolutions go over, and
                 // so does the layer-level `attn_sconv` that follows: leaving one
                 // of the five on the host would pay a round trip to save nothing.
@@ -1290,7 +1004,7 @@ fn main() -> Result<()> {
                     let rd = t_read.get() - r0;
                     t_attn_read += rd;
                     t_attn_up += span - rd;
-                    if attn_resident {
+                    {
                         dattn_bytes += 4 * (heads * head_dim * h
                             + 2 * kv_heads * head_dim * h
                             + heads * t.d_rel * h
@@ -1348,36 +1062,11 @@ fn main() -> Result<()> {
                     );
                     down(dev_lane::short_conv(y, sconv_w))
                 };
-                // Residency off means hold NOTHING, not hold everything: the
-                // streaming lane is what a box too small for the working set
-                // runs, and a map that grew to all 42 layers regardless would
-                // have quietly removed that option.
-                if !attn_resident {
-                    dattn.remove(&p);
-                }
+                // The map grows to this node's whole share and stays. It used
+                // to be emptied per layer when `INK_RESIDENT` was off, so that
+                // a box too small for the working set could still stream --
+                // which is the configuration this binary now refuses to be.
                 out
-            }
-            #[cfg(not(feature = "inkling-cuda"))]
-            unreachable!("guarded at startup")
-        } else {
-            let wq = g("attn.wq_du.weight")?;
-            let wk = g("attn.wk_dv.weight")?;
-            let wv = g("attn.wv_dv.weight")?;
-            let wr = g("attn.wr_du.weight")?;
-            let wo = g("attn.wo_ud.weight")?;
-            let qn = g("attn.q_norm.weight")?;
-            let kn = g("attn.k_norm.weight")?;
-            let ks = g("attn.k_sconv.weight")?;
-            let vs = g("attn.v_sconv.weight")?;
-            let rp = g("attn.rel_logits_proj.proj")?;
-            let aw = AttnWeights {
-                wq: &wq.data, wk: &wk.data, wv: &wv.data, wr: &wr.data, wo: &wo.data,
-                k_sconv: &ks.data, v_sconv: &vs.data,
-                q_norm: &qn.data, k_norm: &kn.data, rel_proj: &rp.data,
-            };
-            let a = attention(&hn, &aw, &dims, Some(ls), mask, n);
-            drop((wq, wk, wv, wr, wo));
-            short_conv(&a, &g("attn_sconv.weight")?.data, n, h, t.sconv_kernel_size)
         };
         for (xi, ai) in x.iter_mut().zip(&a) {
             *xi += ai;
@@ -1390,41 +1079,18 @@ fn main() -> Result<()> {
         let hn = rms_norm(&x, &mlp_norm.data, t.rms_norm_eps, n, h);
 
         let y = if t.is_dense(layer) {
-            let di = t.dense_intermediate_size;
-            // The host lane as a closure, so a device lane is an ALTERNATIVE to
-            // it rather than an addition — running both and discarding one would
-            // have measured nothing. The SPLIT is what residency holds, not the
-            // fused tensor: caching the fused form would still de-interleave
-            // 3.8 GiB of f32 per token and would pin 7.5 GiB to do it.
-            let host_dense = |hn: &[f32]| -> Result<Vec<f32>> {
-                let wkey = format!("{p}mlp.w13_dn.weight");
-                let (gate, up) = cp.derived_pair(&wkey, || {
-                    let fused = cp.tensor(&wkey)?;
-                    let (a, b) = split_gate_up(&fused.data, h);
-                    let shp = vec![a.len() / h, h];
-                    Ok((Loaded { data: a, shape: shp.clone() }, Loaded { data: b, shape: shp }))
-                })?;
-                let dn = cp.held(&format!("{p}mlp.w2_md.weight"))?;
-                let gs = cp.held(&format!("{p}mlp.global_scale"))?;
-                Ok(dense_mlp(hn, &gate.data, &up.data, &dn.data, gs.data[0], n, h, di))
-            };
-            #[cfg(feature = "inkling-cuda")]
-            {
-                // Device-RESIDENT (INK_DENSE=gpu, or INK_GPU=all): uploaded once
-                // for the whole run. Otherwise the host reference.
-                if let Some(dd) = ddense.as_mut() {
-                    let (dg, du, ddn, dsc) = dd.dense_for(&cp, &p, h, &dev)?;
-                    let xd: T2 = burn::tensor::Tensor::from_data(
-                        burn::tensor::TensorData::new(hn.clone(), [n, h]), &dev);
-                    let yd = mary::models::inkling::burn::dense_mlp(
-                        xd, dg.clone(), du.clone(), ddn.clone(), *dsc);
-                    yd.into_data().convert::<f32>().to_vec::<f32>().expect("dense mlp to host")
-                } else {
-                    host_dense(&hn)?
-                }
-            }
-            #[cfg(not(feature = "inkling-cuda"))]
-            host_dense(&hn)?
+            // Device-resident: uploaded on the first token that reaches this
+            // layer and held for the run. The host reference that used to sit
+            // beside it (`host_dense`, selected by leaving `INK_DENSE` unset)
+            // was a scalar f32 lane over a 537 MB weight; it is not a lane a
+            // 276 B model has any use for, and being selectable is how it got
+            // run by accident.
+            let (dg, du, ddn, dsc) = ddense.dense_for(&cp, &p, h, &dev)?;
+            let xd: T2 = burn::tensor::Tensor::from_data(
+                burn::tensor::TensorData::new(hn.clone(), [n, h]), &dev);
+            let yd = mary::models::inkling::burn::dense_mlp(
+                xd, dg.clone(), du.clone(), ddn.clone(), *dsc);
+            yd.into_data().convert::<f32>().to_vec::<f32>().expect("dense mlp to host")
         } else {
             let inter = t.intermediate_size;
             let rw = g("mlp.gate.weight")?;
@@ -1444,106 +1110,63 @@ fn main() -> Result<()> {
             }
 
             let t_d = Instant::now();
-            let acc = if experts_on_gpu {
-                #[cfg(feature = "inkling-cuda")]
-                {
-                    // Layer 2 is BF16 and has no `.scale` sidecar, so the FP4
-                    // lane cannot take it; that one layer falls back rather
-                    // than the whole run refusing.
-                    let packed = cp.is_nvfp4(&format!("{p}mlp.experts.w13_weight"));
-                    let a = if experts_fp4 && packed {
-                        routed_experts_fp4(
-                            &cp,
-                            fp4_aliases.as_ref(),
-                            fp4_client.as_ref().expect("fp4 client"),
-                            &p, &by_expert, &hn, n, h, inter, &mut host_t,
-                        )?
-                    } else {
-                        routed_experts_gpu(
-                            &cp, &p, &by_expert, &hn, n, h, inter, &dev, chain_decode, &mut host_t,
-                        )?
-                    };
-                    expert_loads += by_expert.len();
-                    a
+            // Layer 2's experts are BF16 and have no `.scale` sidecar, so the
+            // NVFP4 tensor cores cannot take them. There is no fallback, and
+            // that is the point: the fallback WAS `expert_weight_bf16`, which
+            // widened the stored BF16 into f32 on the device and multiplied
+            // that -- 604 MB of f32 per token for the six experts a token
+            // routes to, to hold weights the checkpoint stores in 151 MB. A
+            // BF16 weight wants a BF16 MMA (`mma.sync...bf16`, f32
+            // accumulator, which is the instruction's own output type and not
+            // a widening). That kernel does not exist here yet, so this
+            // panics rather than quietly running the model at a precision
+            // nobody asked for.
+            let acc = {
+                if !cp.is_nvfp4(&format!("{p}mlp.experts.w13_weight")) {
+                    unimplemented!(
+                        "layer {layer}'s routed experts are BF16 and there is no BF16 \
+                         tensor-core path here yet. Run a layer range that excludes this \
+                         layer, or write the bf16 MMA. What is NOT acceptable is widening \
+                         the weight to f32 to reuse the f32 lane -- that is what this \
+                         commit deleted."
+                    );
                 }
-                #[cfg(not(feature = "inkling-cuda"))]
-                unreachable!("guarded at startup")
-            } else {
-                let mut acc = vec![0f32; n * h];
-                for (&e, toks) in &by_expert {
-                    let gu_raw = cp.expert_f32(&format!("{p}mlp.experts.w13_weight"), e)?.data;
-                    let gu = deinterleave_fused(&gu_raw, 2 * inter, h);
-                    let dn = cp.expert_f32(&format!("{p}mlp.experts.w2_weight"), e)?.data;
-                    expert_loads += 1;
-                    for &(ti, wgt) in toks {
-                        let xt = &hn[ti * h..(ti + 1) * h];
-                        let both = linear(xt, &gu, 1, h, 2 * inter);
-                        let act: Vec<f32> =
-                            (0..inter).map(|i| silu(both[i]) * both[inter + i]).collect();
-                        let contrib = linear(&act, &dn, 1, inter, h);
-                        for (o, c) in acc[ti * h..(ti + 1) * h].iter_mut().zip(&contrib) {
-                            *o += c * wgt;
-                        }
-                    }
-                    // Dropped here: one expert resident at a time, not 256.
-                }
-                acc
+                let a = routed_experts_fp4(
+                    &cp,
+                    fp4_aliases.as_ref(),
+                    &fp4_client,
+                    &p, &by_expert, &hn, n, h, inter, &mut host_t,
+                )?;
+                expert_loads += by_expert.len();
+                a
             };
-            // One number, not two. On the device lane the calls are queued, so a
+            // One number, not two. The device calls are queued, so a
             // decode/arithmetic split would time enqueueing rather than work;
-            // `routed_experts_gpu` syncs before returning, so this total is real.
+            // `routed_experts_fp4` syncs before returning, so this total is real.
             t_expert += t_d.elapsed().as_secs_f64();
 
             let ns = t.n_shared_experts;
             let gammas: Vec<f32> = routing.iter().flat_map(|r| r.shared_gammas.clone()).collect();
             let t_s = Instant::now();
-            // The host lane. `split_shared_w13` is the settled reading — this
-            // used to be an open `deinterleave_rows` here and a halved split in
-            // the gate, which is the contradiction the INTERLEAVED result closed.
-            let host_shared = |hn: &[f32]| -> Result<Vec<f32>> {
-                let skey = format!("{p}mlp.shared_experts.shared_w13_weight");
-                let (sg, su) = cp.derived_pair(&skey, || {
-                    let sfused = cp.tensor(&skey)?;
-                    let (a, b) = mary::models::inkling::load::split_shared_w13(
-                        &sfused.data, ns, inter, h, shared_halved,
-                    );
-                    let shp = vec![ns, inter, h];
-                    Ok((Loaded { data: a, shape: shp.clone() }, Loaded { data: b, shape: shp }))
-                })?;
-                let sd = cp.held(&format!("{p}mlp.shared_experts.shared_w2_weight"))?;
-                Ok(shared_experts(hn, &sg.data, &su.data, &sd.data, &gammas, ns, n, h, inter))
+            // Device-resident, uploaded once. `split_shared_w13` is the
+            // settled reading — this used to be an open `deinterleave_rows`
+            // here and a halved split in the gate, which is the contradiction
+            // the INTERLEAVED result closed.
+            //
+            // The host twin (`host_shared`) is gone, and with it the once-per-
+            // run device-vs-host comparison it fed. That comparison reported
+            // 6.6e-5 relative, every run, and what it actually established was
+            // that two f32 transcriptions of the same sums reassociate — which
+            // is a fact about f32, not a check on this lane. The lane's real
+            // oracle is `inkling_real_gate`, against a bundle Python wrote.
+            let sh = {
+                let sw = ddense.shared_for(&cp, &p, ns, inter, h, shared_halved, &dev)?;
+                let xd: T2 = burn::tensor::Tensor::from_data(
+                    burn::tensor::TensorData::new(hn.clone(), [n, h]), &dev);
+                let y = mary::models::inkling::burn::shared_experts_dev(
+                    xd, &sw.gate, &sw.up, &sw.down, &gammas, ns);
+                y.into_data().convert::<f32>().to_vec::<f32>().expect("shared to host")
             };
-            #[cfg(feature = "inkling-cuda")]
-            let sh = if ddense.is_some() {
-                let dsh = {
-                    let dd = ddense.as_mut().expect("device-resident dense");
-                    let sw = dd.shared_for(&cp, &p, ns, inter, h, shared_halved, &dev)?;
-                    let xd: T2 = burn::tensor::Tensor::from_data(
-                        burn::tensor::TensorData::new(hn.clone(), [n, h]), &dev);
-                    let y = mary::models::inkling::burn::shared_experts_dev(
-                        xd, &sw.gate, &sw.up, &sw.down, &gammas, ns);
-                    y.into_data().convert::<f32>().to_vec::<f32>().expect("shared to host")
-                };
-                // Run the host lane ONCE, on the first MoE layer of the run, and
-                // say what the two lanes differ by. A device lane that has never
-                // been compared to its reference and one that cannot be told
-                // apart from it look identical from outside.
-                if !dense_checked {
-                    dense_checked = true;
-                    let hsh = host_shared(&hn)?;
-                    let scale = hsh.iter().fold(0f32, |a, v| a.max(v.abs()));
-                    let worst = hsh.iter().zip(&dsh).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
-                    println!(
-                        "  shared experts, device vs host lane, layer {layer}: worst abs {worst:e} / scale {scale:e} = {:e}",
-                        worst / scale.max(f32::MIN_POSITIVE)
-                    );
-                }
-                dsh
-            } else {
-                host_shared(&hn)?
-            };
-            #[cfg(not(feature = "inkling-cuda"))]
-            let sh = host_shared(&hn)?;
             t_shared += t_s.elapsed().as_secs_f64();
             acc.iter().zip(&sh).map(|(a, b)| a + b).collect()
         };
@@ -1552,24 +1175,18 @@ fn main() -> Result<()> {
         // tokens exactly as attention's do.
         let mlp_sconv_w = g("mlp_sconv.weight")?.data.clone();
         let y = if kv {
-            #[cfg(feature = "inkling-cuda")]
-            {
-                if step > 0 {
-                    short_conv_step(
-                        &mut caches[slot].mlp_sconv,
-                        &y,
-                        &mlp_sconv_w,
-                        h,
-                        t.sconv_kernel_size,
-                    )
-                } else {
-                    caches[slot].mlp_sconv =
-                        conv_history(&y, n, h, t.sconv_kernel_size);
-                    short_conv(&y, &mlp_sconv_w, n, h, t.sconv_kernel_size)
-                }
+            if step > 0 {
+                short_conv_step(
+                    &mut caches[slot].mlp_sconv,
+                    &y,
+                    &mlp_sconv_w,
+                    h,
+                    t.sconv_kernel_size,
+                )
+            } else {
+                caches[slot].mlp_sconv = conv_history(&y, n, h, t.sconv_kernel_size);
+                short_conv(&y, &mlp_sconv_w, n, h, t.sconv_kernel_size)
             }
-            #[cfg(not(feature = "inkling-cuda"))]
-            unreachable!("guarded at startup")
         } else {
             short_conv(&y, &mlp_sconv_w, n, h, t.sconv_kernel_size)
         };
@@ -1605,35 +1222,23 @@ fn main() -> Result<()> {
         s.read_exact(&mut back).context("the tail closed mid-step")?;
         best_wire = Some(i64::from_le_bytes(back) as usize);
         Vec::new()
-    } else if head_on_gpu {
-        #[cfg(feature = "inkling-cuda")]
-        {
-            // 109 x 4096 x 200058 is 89 G multiply-adds — the single largest
-            // matmul in the forward, and the one left standing once attention
-            // and the MLPs move. The muP divisor divides BEFORE the projection,
-            // matching the reference: doing it after is algebraically equal and
-            // numerically not.
-            let hs = dev_lane::rms_norm(
-                up2::<Bk>(x.clone(), n, h, &dev),
-                up1r(&fnorm.as_ref().expect("the head owns the final norm").data, h, &dev),
-                t.rms_norm_eps,
-            )
-            .div_scalar(t.logits_mup_width_multiplier as f32);
-            down(dev_lane::linear(
-                hs,
-                unembed_dev.clone().expect("uploaded when head_on_gpu"),
-            ))
-        }
-        #[cfg(not(feature = "inkling-cuda"))]
-        unreachable!("guarded at startup")
     } else {
-        head(
-            &x,
-            &fnorm.as_ref().expect("the head owns the final norm").data,
-            &unembed.as_ref().expect("the host head lane needs the unembed table").data,
-            t.logits_mup_width_multiplier as f32,
-            t.vocab_size, t.effective_vocab(), t.rms_norm_eps, n, h,
+        // 109 x 4096 x 200058 is 89 G multiply-adds — the single largest
+        // matmul in the forward, and the one left standing once attention and
+        // the MLPs move. There is no host twin: 89 G scalar multiply-adds is
+        // not a reference, it is an afternoon. The muP divisor divides BEFORE
+        // the projection, matching the reference: doing it after is
+        // algebraically equal and numerically not.
+        let hs = dev_lane::rms_norm(
+            up2::<Bk>(x.clone(), n, h, &dev),
+            up1r(&fnorm.as_ref().expect("the head owns the final norm").data, h, &dev),
+            t.rms_norm_eps,
         )
+        .div_scalar(t.logits_mup_width_multiplier as f32);
+        down(dev_lane::linear(
+            hs,
+            unembed_dev.clone().expect("the tail uploads the unembed table"),
+        ))
     };
     let t_head = t_h.elapsed().as_secs_f64();
 
@@ -1685,9 +1290,6 @@ fn main() -> Result<()> {
         // the token the stack just chose and head d sees draft d-1.
         let e_w = embed_w.as_ref().expect("drafting needs the embedding table");
         let fnorm_d = fnorm.as_ref().expect("drafting needs the final norm");
-        // Optional: the device head lane drops this after uploading, and the
-        // draft below uses the device table when that is what exists.
-        let unembed_d = unembed.as_ref();
         // Which hidden state head 0 is fed. `x` is the stack's RAW output, which
         // `head` norms on its way to logits. Feeding the FINAL-NORMED one
         // measured twice as well (25% -> 50% on a matched 20-token run), so it
@@ -1726,10 +1328,9 @@ fn main() -> Result<()> {
         let seq = ids.len();
         debug_assert_eq!(mtp_main.len(), seq * h, "one retained hidden row per token");
 
-        // One row of logits, argmaxed. The device lane returns the FULL vocab
-        // width and the host lane the effective one, so index by what came back
-        // rather than by whichever constant happens to match, or the argmax
-        // silently reads the wrong row.
+        // One row of logits, argmaxed. The device head returns the FULL vocab
+        // width, so index by what came back rather than by whichever constant
+        // happens to match, or the argmax silently reads the wrong row.
         //
         // ONE row and not `n` of them: a draft is read off the last position and
         // the head is per-row, so unembedding the prefix was 89 G multiply-adds
@@ -1737,32 +1338,14 @@ fn main() -> Result<()> {
         let draft_argmax = |row: &[f32]| -> usize {
             debug_assert_eq!(row.len(), h, "the draft head unembeds exactly one position");
             let dl = {
-                #[cfg(feature = "inkling-cuda")]
-                {
-                    if let Some(ud) = unembed_dev.as_ref() {
-                        let hs = dev_lane::rms_norm(
-                            up2::<Bk>(row.to_vec(), 1, h, &dev),
-                            up1r(&fnorm_d.data, h, &dev),
-                            t.rms_norm_eps,
-                        )
-                        .div_scalar(t.logits_mup_width_multiplier as f32);
-                        down(dev_lane::linear(hs, ud.clone()))
-                    } else {
-                        head(
-                            row, &fnorm_d.data,
-                            &unembed_d.as_ref().expect("host draft head needs the unembed table").data,
-                            t.logits_mup_width_multiplier as f32,
-                            t.vocab_size, v, t.rms_norm_eps, 1, h,
-                        )
-                    }
-                }
-                #[cfg(not(feature = "inkling-cuda"))]
-                head(
-                    row, &fnorm_d.data,
-                    &unembed_d.as_ref().expect("host draft head needs the unembed table").data,
-                    t.logits_mup_width_multiplier as f32,
-                    t.vocab_size, v, t.rms_norm_eps, 1, h,
+                let ud = unembed_dev.as_ref().expect("drafting needs the unembed table");
+                let hs = dev_lane::rms_norm(
+                    up2::<Bk>(row.to_vec(), 1, h, &dev),
+                    up1r(&fnorm_d.data, h, &dev),
+                    t.rms_norm_eps,
                 )
+                .div_scalar(t.logits_mup_width_multiplier as f32);
+                down(dev_lane::linear(hs, ud.clone()))
             };
             let mut b = 0usize;
             for (i, &val) in dl.iter().take(v).enumerate() {
@@ -1948,19 +1531,16 @@ fn main() -> Result<()> {
     println!("  expert slabs decoded: {expert_loads}");
     // t_other covers the whole MLP half, so the expert buckets are inside it.
     println!("  where the time went, seconds:");
-    println!("    attention half      {t_attn:8.1}   ({})", if attn_on_gpu { "device" } else { "host" });
-    #[cfg(feature = "inkling-cuda")]
-    if attn_on_gpu {
+    println!("    attention half      {t_attn:8.1}   (device)");
+    {
         println!("      read + widen      {t_attn_read:8.1}   (host: slice the mapping, BF16 -> f32)");
         println!("      upload            {t_attn_up:8.1}   (host -> device, synced)");
         println!("      device            {:8.1}   (projections, scores, sconv)",
                  t_attn - t_attn_read - t_attn_up);
     }
     println!("    mlp half            {t_other:8.1}   of which:");
-    println!("      routed experts    {t_expert:8.1}   ({})",
-             if experts_on_gpu { "slice + upload + dequant + matmul, device" }
-             else { "disk + NVFP4 unpack + matmul, host" });
-    println!("      shared experts    {t_shared:8.1}   ({})", if dense_gpu { "device" } else { "host" });
+    println!("      routed experts    {t_expert:8.1}   (slice + bind + NVFP4 mma, device)");
+    println!("      shared experts    {t_shared:8.1}   (device)");
     println!("      rest of the half  {:8.1}   (routing, dense layers, sconv, norms)",
              t_other - t_expert - t_shared);
     println!(
@@ -1968,14 +1548,12 @@ fn main() -> Result<()> {
         if best_wire.is_some() { "tail + wire" } else { "head / unembed" },
         if best_wire.is_some() {
             "BLOCKING: the other machine's layers, its head, and the round trip"
-        } else if head_on_gpu {
-            "device"
         } else {
-            "host"
+            "device"
         }
     );
     println!("    of the above, host-only tensor reads (mmap + BF16 widening): {:8.1}", t_read.get());
-    if experts_on_gpu {
+    {
         println!("    of the routed-expert total, the host-synchronous parts:");
         println!("      slice from mmap   {:8.1}   ({:.3} ms x {expert_loads} loads)",
                  host_t.0, host_t.0 * 1e3 / expert_loads.max(1) as f64);
@@ -2001,23 +1579,17 @@ fn main() -> Result<()> {
     println!("    disk read_bytes     {:8.2} GiB   (/proc/self/io -- page-cache hits are free)",
              (io_read_bytes() - io0) as f64 / GIB);
     println!("    resident set        {:8.2} GiB in {rn} weights  (host)", rb as f64 / GIB);
-    #[cfg(feature = "inkling-cuda")]
-    if let Some(dd) = ddense.as_ref() {
-        println!(
-            "    device-resident     {:8.2} GiB in {} shared + {} dense layers",
-            dd.bytes as f64 / GIB,
-            dd.shared.len(),
-            dd.dense.len()
-        );
-    }
-    #[cfg(feature = "inkling-cuda")]
-    if attn_resident && attn_on_gpu {
-        println!(
-            "    device-resident     {:8.2} GiB in {} attention layers",
-            dattn_bytes as f64 / GIB,
-            dattn.len()
-        );
-    }
+    println!(
+        "    device-resident     {:8.2} GiB in {} shared + {} dense layers",
+        ddense.bytes as f64 / GIB,
+        ddense.shared.len(),
+        ddense.dense.len()
+    );
+    println!(
+        "    device-resident     {:8.2} GiB in {} attention layers",
+        dattn_bytes as f64 / GIB,
+        dattn.len()
+    );
     if std::env::var("INK_IOSTATS").is_ok() {
         print!("{}", cp.io_table(28));
     }

@@ -579,74 +579,6 @@ impl PileSource {
         )
     }
 
-    /// Fault a LAYER RANGE's whole share into memory, and say what it cost.
-    ///
-    /// The deployment question a split has to answer is not how fast a pass is
-    /// but whether a node's share STAYS resident, and that needs the share
-    /// named without reading the model to find it. Here it is a query over the
-    /// layer facts — dense leaves and experts alike, both element formats — so
-    /// the thing warmed is exactly the thing
-    /// [`experts_in_layers`] would hand a node.
-    ///
-    /// Returns `(bytes touched, leaves touched)`.
-    pub fn warm(&self, lo: i64, hi: i64) -> Result<(u64, usize)> {
-        let (mut bytes, mut leaves) = (0u64, 0usize);
-        let mut sum = 0u64;
-        for leaf in self
-            .dense
-            .values()
-            .filter(|l| matches!(l.layer, Some(x) if x >= lo && x <= hi))
-        {
-            // One byte per 4 KiB page: the kernel's readahead turns a
-            // forward-sequential fault pattern into large sequential reads.
-            let b: &[u8] = &leaf.bytes;
-            let mut i = 0usize;
-            while i < b.len() {
-                sum = sum.wrapping_add(b[i] as u64);
-                i += 4096;
-            }
-            bytes += b.len() as u64;
-            leaves += 1;
-        }
-        // One byte per 4 KiB, exactly as the dense arm above, and for the same
-        // reason: these pages have to be FAULTED, not merely named.
-        //
-        // This used to resolve the handle and add its length, on the belief that
-        // reading a blob validates it and so touches every page. It does not —
-        // the reader hands back a VIEW over the pile's mapping, and a view costs
-        // nothing to make. The counter therefore reported bytes nobody had read,
-        // and the giveaway was in the number it produced: a second pass claiming
-        // 155.81 GiB "touched" in 3.3 s is 47 GB/s, which is not a memory
-        // bandwidth this part has and certainly not a disk one. A residency
-        // instrument that reports a working set it never faulted answers the one
-        // question it exists to answer with a number that cannot be wrong,
-        // which is worse than not asking.
-        for ((name, idx), r) in self.experts.iter() {
-            if r.layer < lo || r.layer > hi {
-                continue;
-            }
-            let mut touch = |b: &[u8]| {
-                let mut i = 0usize;
-                while i < b.len() {
-                    sum = sum.wrapping_add(b[i] as u64);
-                    i += 4096;
-                }
-                b.len() as u64
-            };
-            let n = match r.handle {
-                ExpertHandle::Nvfp4(_) => {
-                    let q = self.expert_packed(name, *idx as usize)?;
-                    touch(&q.codes) + touch(&q.scales)
-                }
-                ExpertHandle::Bf16(_) => touch(&self.expert_bf16(name, *idx as usize)?.bytes),
-            };
-            bytes += n;
-            leaves += 1;
-        }
-        std::hint::black_box(sum);
-        Ok((bytes, leaves))
-    }
-
     /// One expert's NVFP4 planes, read out of the pile and **not decoded**.
     pub fn expert_packed(&self, base: &str, e: usize) -> Result<PackedSlab> {
         let h = match self.experts.get(&(base.to_string(), e as i64)).map(|r| r.handle) {
@@ -712,31 +644,6 @@ impl PileSource {
         )])
     }
 
-    /// One expert of a BF16 stack, as a view.
-    pub fn expert_bf16(&self, base: &str, e: usize) -> Result<Leaf> {
-        let h = match self.experts.get(&(base.to_string(), e as i64)).map(|r| r.handle) {
-            Some(ExpertHandle::Bf16(h)) => h,
-            Some(ExpertHandle::Nvfp4(_)) => {
-                anyhow::bail!("{base}[{e}] is packed NVFP4, not BF16")
-            }
-            None => anyhow::bail!("{base}[{e}] is not in the pile"),
-        };
-        let blob: Blob<Tensor<BF16, 2>> = self
-            .reader
-            .get(h)
-            .map_err(|err| anyhow::anyhow!("{base}[{e}]: {err:?}"))?;
-        let view: TensorView = TensorView::try_from_blob(blob)
-            .map_err(|err| anyhow::anyhow!("{base}[{e}]: decode: {err}"))?;
-        Ok(Leaf {
-            elem: Elem::Bf16,
-            dims: view.dims().to_vec(),
-            bytes: view.payload().clone(),
-            layer: self
-                .experts
-                .get(&(base.to_string(), e as i64))
-                .map(|r| r.layer),
-        })
-    }
 }
 
 #[cfg(test)]

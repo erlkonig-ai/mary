@@ -13,20 +13,19 @@
 //! changes. The FP4 decode is *not*: K3 is MXFP4 (E8M0 scales, block 32),
 //! Inkling is NVFP4 (E4M3 scales, block 16, plus a per-expert F32 second level).
 
-#[cfg(feature = "inkling-burn")]
+// Nothing here is conditional any more. The module tree used to be gated three
+// ways — `inkling` for the headers, `inkling-burn` for the Burn lane,
+// `inkling-cuda` for the device one — and the gating was already a fiction:
+// `fp4gemm` below sat outside all of it and needs cubecl, so the header-only
+// build had not compiled in some time. One feature, one lane, no cfg.
 pub mod burn;
-// The NVFP4 decode as one CUDA kernel: the Burn chain above is 46 launches a
-// weight, and the routed lane runs it 1 666 times a forward.
-#[cfg(feature = "inkling-cuda")]
-pub mod dequant_cuda;
 pub mod attn;
 pub mod block;
 pub mod config;
-// The NVFP4 ACTIVATION quantiser. Gated on `q4` when it arrived, but the
-// native-FP4 routed-expert lane in `inkling_forward` is compiled under
-// `inkling-cuda` and calls it, so `--features inkling-cuda` has to be a
-// complete feature set on its own. `q4` alone still selects it as before.
-#[cfg(any(feature = "q4", feature = "inkling-cuda"))] pub mod fp4quant;
+// The NVFP4 ACTIVATION quantiser, on the device. The routed-expert lane calls
+// it twice per expert; there is no host twin in the data plane to select
+// between, so there is nothing to gate.
+pub mod fp4quant;
 pub mod layer;
 pub mod layout;
 pub mod load;

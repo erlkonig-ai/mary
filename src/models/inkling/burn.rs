@@ -1,29 +1,27 @@
-//! Inkling's Burn lane — the same arithmetic as the f32 slice lane, on a backend.
+//! Inkling's device lane — the whole arithmetic of a decoder layer, in Burn.
 //!
-//! Mirrors how `k3` keeps `kda.rs` beside its Burn path: the slice lane in
-//! [`crate::models::inkling::mlp`] is the reference, gated against
-//! `transformers`, and this is checked against *it*. So the Burn lane gets a
-//! real oracle without needing torch in the loop.
+//! There is no other lane. This file used to be one of a pair: a scalar f32
+//! host lane in [`crate::models::inkling::mlp`] was the reference, this was
+//! "the Burn lane beside it", and `inkling_forward` picked between them per
+//! stage with `INK_ATTN`/`INK_DENSE`/`INK_HEAD`. A host reference you can
+//! select at run time is a host reference you can accidentally run, and it was
+//! costing 401 s a forward when it was.
 //!
-//! Scope was the cost-dominant part first — the routed experts — and is now the
-//! whole arithmetic of a decoder layer: attention with its two short
-//! convolutions, the shared experts, the dense MLP, RMSNorm, and the NVFP4
-//! decode. What drove the second half was a measured 401 s forward of 109
-//! tokens in which attention was 108 s and the shared plus dense MLPs 145 s, all
-//! of it scalar host code left behind as a correctness reference. Moving both
-//! took them to 8.9 s and 15.0 s.
+//! Scope is attention with its two short convolutions and its KV cache, the
+//! shared experts, the dense MLP and RMSNorm. The routed experts are NOT here:
+//! they go through `mma.sync...kind::mxf4nvf4` in
+//! [`crate::models::inkling::fp4gemm`] as the NVFP4 they are stored as. The
+//! `dequant_nvfp4`/`expert_weight_from_packed` chain that used to live at the
+//! bottom of this file decoded them into f32 first, which is the widening this
+//! model is quantized precisely to avoid.
 //!
-//! Every one of these is gated against `transformers` by `inkling_burn_gate`,
-//! not against the slice lane: the two lanes were written by the same hand and
-//! agreeing with each other proves only that.
-//!
-//! Everything stays f32. The slice lane is f32 and the checkpoint's dense
-//! weights are BF16 widened to f32, so a rounding policy like K3's `ActRound`
-//! would be describing a lane that does not exist yet; when a bf16 lane is
-//! added it should get that treatment explicitly rather than by default.
+//! Everything here is f32 because the weights it touches ARE f32 in the
+//! checkpoint or are BF16 whose only consumer is an f32 op; the accumulator of
+//! an FP4 MMA is f32 too, and that is the instruction's own output type, not a
+//! widening.
 
 use burn::prelude::*;
-use burn::tensor::{ElementConversion, Int, Tensor, TensorData};
+use burn::tensor::{Int, Tensor, TensorData};
 
 /// `x * sigmoid(x)`, elementwise.
 pub fn silu<B: Backend>(x: Tensor<B, 2>) -> Tensor<B, 2> {
@@ -55,29 +53,6 @@ pub fn rms_norm<B: Backend>(x: Tensor<B, 2>, gain: Tensor<B, 1>, eps: f64) -> Te
     let denom = mean_sq.add_scalar(eps).sqrt();
     let normed = x / denom;
     normed * gain.unsqueeze::<2>()
-}
-
-/// One expert's feed-forward: `down(silu(gate) * up)`.
-///
-/// `gate_up` is `[2 * intermediate, hidden]` with the gate rows FIRST — the
-/// checkpoint stores them interleaved and
-/// [`crate::models::inkling::load::deinterleave_fused`] puts them in this order
-/// at load. Passing a raw checkpoint tensor here is shape-identical and wrong,
-/// which is exactly the bug that made the whole model emit noise while every
-/// parity gate passed.
-pub fn expert_ffn<B: Backend>(
-    x: Tensor<B, 2>,
-    gate_up: Tensor<B, 2>,
-    down: Tensor<B, 2>,
-) -> Tensor<B, 2> {
-    let [two_inter, _] = gate_up.dims();
-    assert!(two_inter % 2 == 0, "gate_up must have an even row count");
-    let inter = two_inter / 2;
-    let both = linear(x, gate_up);
-    let [rows, _] = both.dims();
-    let gate = both.clone().slice([0..rows, 0..inter]);
-    let up = both.slice([0..rows, inter..2 * inter]);
-    linear(silu(gate) * up, down)
 }
 
 /// The dense MLP: `down(silu(gate(x)) * up(x)) * global_scale`.
@@ -134,34 +109,6 @@ pub fn shared_experts<B: Backend>(
         });
     }
     acc.expect("a MoE layer has at least one shared expert")
-}
-
-/// Split the checkpoint's fused `shared_w13_weight` into gate and up blocks.
-///
-/// `fused` is `[n_shared * 2 * intermediate, hidden]` in **checkpoint
-/// interleave** — gate on the even rows, up on the odd ones, per shared expert.
-/// Returns `[n_shared * intermediate, hidden]` twice, which is what
-/// [`shared_experts`] wants.
-///
-/// Splitting on device keeps the host copy in raw checkpoint order, so the
-/// 33 M-element shuffle per layer never happens on a scalar loop.
-pub fn split_shared_fused<B: Backend>(
-    fused: Tensor<B, 2>,
-    n_shared: usize,
-) -> (Tensor<B, 2>, Tensor<B, 2>) {
-    let [frows, hidden] = fused.dims();
-    assert_eq!(frows % (2 * n_shared), 0, "{frows} rows do not split into {n_shared} experts");
-    let inter = frows / (2 * n_shared);
-    let mut gates = Vec::with_capacity(n_shared);
-    let mut ups = Vec::with_capacity(n_shared);
-    for s in 0..n_shared {
-        let gu = deinterleave_rows_device(
-            fused.clone().slice([s * 2 * inter..(s + 1) * 2 * inter, 0..hidden]),
-        );
-        gates.push(gu.clone().slice([0..inter, 0..hidden]));
-        ups.push(gu.slice([inter..2 * inter, 0..hidden]));
-    }
-    (Tensor::cat(gates, 0), Tensor::cat(ups, 0))
 }
 
 /// The last `kernel - 1` rows of `x`, left-padded with zeros when `x` is short.
@@ -625,218 +572,10 @@ pub fn shared_experts_dev<B: Backend>(
     out.expect("a MoE layer with no shared experts")
 }
 
-/// FP4 (E2M1) values by 4-bit code, and the E4M3 table, as device tensors.
-///
-/// Built on the host from the scalar decoders in
-/// [`crate::models::inkling::nvfp4`], which are gated bit-exactly against
-/// `compressed_tensors` and against torch over all 256 E4M3 patterns. A gather
-/// through those tables cannot drift from the CPU lane; a reimplemented
-/// bit-twiddle could.
-fn luts<B: Backend>(dev: &B::Device) -> (Tensor<B, 1>, Tensor<B, 1>) {
-    use crate::models::inkling::nvfp4::{e4m3_to_f32, FP4_E2M1};
-    let fp4 = Tensor::from_data(TensorData::new(FP4_E2M1.to_vec(), [16]), dev);
-    // NaN would poison a gather, and only 0x7F/0xFF are NaN in E4M3-fn; they
-    // never appear as a block scale, so map them to zero rather than carrying
-    // NaN into every product in the row.
-    let e4m3: Vec<f32> = (0..256u16)
-        .map(|b| {
-            let v = e4m3_to_f32(b as u8);
-            if v.is_nan() { 0.0 } else { v }
-        })
-        .collect();
-    let e4m3 = Tensor::from_data(TensorData::new(e4m3, [256]), dev);
-    (fp4, e4m3)
-}
-
-/// Look up `idx` in a 1-D table, preserving the index tensor's shape.
-fn gather2<B: Backend>(table: Tensor<B, 1>, idx: Tensor<B, 2, Int>) -> Tensor<B, 2> {
-    let [r, c] = idx.dims();
-    table.select(0, idx.reshape([r * c])).reshape([r, c])
-}
-
-/// Dequantise NVFP4 on device.
-///
-/// `codes` is `[rows, bytes]` holding the packed byte values, `scales` is
-/// `[rows, bytes * 2 / GROUP]` holding raw E4M3 byte values, and `scale2` is one
-/// factor per row. Returns `[rows, bytes * 2]`.
-///
-/// Nibble order is low-first, settled against
-/// `compressed_tensors.compressors.unpack_fp4_from_uint8`; the association is
-/// `(fp4 * block_scale) * scale2`, matching the reference, because float
-/// multiplication does not associate and the CPU lane was gated on that order.
-pub fn dequant_nvfp4<B: Backend>(
-    codes: Tensor<B, 2, Int>,
-    scales: Tensor<B, 2, Int>,
-    scale2: Tensor<B, 1>,
-) -> Tensor<B, 2> {
-    use crate::models::inkling::nvfp4::GROUP;
-    let dev = codes.device();
-    let (fp4_lut, e4m3_lut) = luts::<B>(&dev);
-    let [rows, bytes] = codes.dims();
-    let logical = bytes * 2;
-
-    // Two 4-bit codes per byte, low nibble FIRST.
-    let lo = codes.clone().bitwise_and_scalar(0x0Fi32.elem());
-    let hi = codes
-        .bitwise_right_shift_scalar(4i32.elem())
-        .bitwise_and_scalar(0x0Fi32.elem());
-    // Interleave: [rows, bytes, 2] -> [rows, 2 * bytes] gives lo, hi, lo, hi...
-    let pairs = Tensor::cat(
-        vec![lo.reshape([rows, bytes, 1]), hi.reshape([rows, bytes, 1])],
-        2,
-    )
-    .reshape([rows, logical]);
-    let vals = gather2(fp4_lut, pairs);
-
-    // One E4M3 scale per GROUP logical elements, widened to match.
-    let n_scales = logical / GROUP;
-    let s = gather2(e4m3_lut, scales)
-        .reshape([rows, n_scales, 1])
-        .repeat_dim(2, GROUP)
-        .reshape([rows, logical]);
-
-    // Block scale first, then the per-row factor -- the reference's order.
-    vals.mul(s).mul(scale2.reshape([rows, 1]).repeat_dim(1, logical))
-}
-
-
-/// Reorder a fused `[2 * intermediate, hidden]` from the checkpoint's
-/// interleave to gate-rows-first, on device.
-///
-/// The checkpoint stores gate and up **alternating by row**: gate is the even
-/// output rows, up the odd ones. It does NOT store them as contiguous halves.
-/// Splitting down the middle loads without complaint and scrambles every
-/// SwiGLU in every layer -- shape-identical, catastrophically wrong, and
-/// invisible to any check that compares two lanes which share the assumption.
-/// Authority is `transformers`' `conversion_mapping.py`, key `inkling_mm_model`.
-///
-/// This is the device twin of
-/// [`crate::models::inkling::load::deinterleave_fused`]; the two must agree.
-pub fn deinterleave_rows_device<B: Backend>(fused: Tensor<B, 2>) -> Tensor<B, 2> {
-    let [rows, _] = fused.dims();
-    assert!(rows % 2 == 0, "fused row count {rows} is odd; gate/up cannot interleave");
-    let half = rows / 2;
-    let mut order: Vec<i32> = Vec::with_capacity(rows);
-    order.extend((0..half).map(|r| (2 * r) as i32)); // gate: even rows
-    order.extend((0..half).map(|r| (2 * r + 1) as i32)); // up: odd rows
-    let dev = fused.device();
-    let idx = Tensor::<B, 1, Int>::from_data(TensorData::new(order, [rows]), &dev);
-    fused.select(0, idx)
-}
-
-/// Upload one expert's packed NVFP4 bytes and dequantise them on the device.
-///
-/// Takes exactly what [`crate::models::inkling::load::Checkpoint::expert_slice_packed`]
-/// returns, so the host never materialises the f32 weight. Returns
-/// `[rows, cols * 2]`.
-///
-/// `scale2` is one factor for the whole expert; it is broadcast to every row
-/// because [`dequant_nvfp4`] takes a per-row vector, which is the shape the
-/// stacked layout would need if scale2 ever became per-row.
-pub fn expert_weight_from_packed<B: Backend>(
-    codes: &[u8],
-    scales: &[u8],
-    scale2: f32,
-    rows: usize,
-    cols: usize,
-    dev: &B::Device,
-) -> Tensor<B, 2> {
-    assert_eq!(codes.len(), rows * cols, "codes is {} bytes, want {rows}x{cols}", codes.len());
-    assert_eq!(scales.len() % rows, 0, "{} scales do not divide {rows} rows", scales.len());
-    let n_scales = scales.len() / rows;
-
-    // Bitcast four bytes into a word rather than widening each to an i32:
-    // same bytes, a quarter of the elements, and no host-side expansion of the
-    // very data the packed path exists to keep packed.
-    assert_eq!(cols % 4, 0, "{cols} bytes per row does not pack into i32 words");
-    assert_eq!(n_scales % 4, 0, "{n_scales} scales per row does not pack into i32 words");
-    let word = |b: &[u8]| -> Vec<i32> {
-        b.chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
-    };
-    let codes_t =
-        Tensor::<B, 2, Int>::from_data(TensorData::new(word(codes), [rows, cols / 4]), dev);
-    let scales_t =
-        Tensor::<B, 2, Int>::from_data(TensorData::new(word(scales), [rows, n_scales / 4]), dev);
-    let s2 = Tensor::<B, 1>::from_data(TensorData::new(vec![scale2; rows], [rows]), dev);
-    dequant_nvfp4_words(codes_t, scales_t, s2)
-}
-
-
-/// Dequantise NVFP4 from **word-packed** codes, so the host never widens them.
-///
-/// `code_words` is `[rows, cols / 4]`: four consecutive packed bytes bitcast
-/// into one little-endian `i32`. `scale_words` is `[rows, n_scales / 4]`, the
-/// same treatment for the raw E4M3 scale bytes. Returns `[rows, cols * 2]`.
-///
-/// Why words: uploading one `i32` per byte expands the packed weight 4x on the
-/// host, which measured at 27.6s of a 38.8s expert lane against 4.5s of actual
-/// device work. A bitcast moves the same bytes and a quarter as many elements.
-///
-/// The nibble arithmetic is simpler here than in the byte form, not more
-/// complex. Little-endian byte j occupies bits `8j..8j+7`, and NVFP4 stores the
-/// low nibble first, so logical element k of a word is exactly `(w >> 4k) & 0xF`
-/// for k in 0..8 — the byte stage has no reason to exist. Sign extension from
-/// the arithmetic shift is discarded by the mask.
-///
-/// Gated against [`dequant_nvfp4`], which is itself bit-exact against
-/// `compressed_tensors`, so this inherits that oracle rather than asserting its
-/// own correctness.
-pub fn dequant_nvfp4_words<B: Backend>(
-    code_words: Tensor<B, 2, Int>,
-    scale_words: Tensor<B, 2, Int>,
-    scale2: Tensor<B, 1>,
-) -> Tensor<B, 2> {
-    use crate::models::inkling::nvfp4::GROUP;
-    let dev = code_words.device();
-    let (fp4_lut, e4m3_lut) = luts::<B>(&dev);
-    let [rows, cwords] = code_words.dims();
-    let [rows_s, swords] = scale_words.dims();
-    assert_eq!(rows, rows_s, "codes have {rows} rows, scales {rows_s}");
-    let logical = cwords * 8;
-
-    // Eight 4-bit codes per word, low nibble first, in logical order.
-    let mut nib = Vec::with_capacity(8);
-    for k in 0..8u32 {
-        nib.push(
-            code_words
-                .clone()
-                .bitwise_right_shift_scalar(((4 * k) as i32).elem())
-                .bitwise_and_scalar(0x0Fi32.elem())
-                .reshape([rows, cwords, 1]),
-        );
-    }
-    let codes = Tensor::cat(nib, 2).reshape([rows, logical]);
-    let vals = gather2(fp4_lut, codes);
-
-    // Four E4M3 scale bytes per word, likewise in order.
-    let mut by = Vec::with_capacity(4);
-    for j in 0..4u32 {
-        by.push(
-            scale_words
-                .clone()
-                .bitwise_right_shift_scalar(((8 * j) as i32).elem())
-                .bitwise_and_scalar(0xFFi32.elem())
-                .reshape([rows, swords, 1]),
-        );
-    }
-    let n_scales = swords * 4;
-    assert_eq!(n_scales * GROUP, logical, "{n_scales} scales cannot cover {logical} values");
-    let s = gather2(e4m3_lut, Tensor::cat(by, 2).reshape([rows, n_scales]))
-        .reshape([rows, n_scales, 1])
-        .repeat_dim(2, GROUP)
-        .reshape([rows, logical]);
-
-    // Block scale first, then the per-row factor -- the reference's order,
-    // because float multiplication does not associate.
-    vals.mul(s).mul(scale2.reshape([rows, 1]).repeat_dim(1, logical))
-}
-
 /// The KV cache against the lane it is supposed to be an optimization of.
 ///
-/// The oracle here is [`attention`] itself — the function `inkling_burn_gate`
-/// checks against `transformers`. So these tests do not re-litigate whether the
+/// The oracle here is [`attention`] itself, which `inkling_real_gate` holds to
+/// a Python-generated bundle. So these tests do not re-litigate whether the
 /// layer is right; they check the only thing a cache can get wrong, which is
 /// whether feeding one token at a time reproduces feeding all of them.
 ///
@@ -851,7 +590,10 @@ mod tests {
     use crate::models::inkling::attn::{causal_mask, AttnDims, LogScaling};
     use crate::models::inkling::config::AttnKind;
 
-    type B = burn_ndarray::NdArray<f32>;
+    // The only backend there is. These tests compare a cached lane against an
+    // uncached one on the SAME device, so what they need from a backend is
+    // that it exists — and after the feature collapse exactly one does.
+    type B = burn::backend::Cuda<f32>;
 
     /// Deterministic filler. A fixed pattern rather than a seeded RNG so a
     /// failure is reproducible from the source alone.
@@ -875,7 +617,7 @@ mod tests {
         }
     }
 
-    fn weights(d: &AttnDims, dev: &burn_ndarray::NdArrayDevice) -> AttnWeightsDev<B> {
+    fn weights(d: &AttnDims, dev: &burn::backend::cuda::CudaDevice) -> AttnWeightsDev<B> {
         let m = |rows: usize, cols: usize, seed: f32| -> Tensor<B, 2> {
             Tensor::from_data(TensorData::new(fill(rows * cols, seed), [rows, cols]), dev)
         };
@@ -908,7 +650,7 @@ mod tests {
         prefill: usize,
         sabotage_conv_history: bool,
     ) -> f32 {
-        let dev = burn_ndarray::NdArrayDevice::default();
+        let dev = burn::backend::cuda::CudaDevice::default();
         let d = dims(kind, rel_extent);
         let w = weights(&d, &dev);
         let xs: Tensor<B, 2> = Tensor::from_data(

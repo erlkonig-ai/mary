@@ -29,8 +29,9 @@
 //! shape this lane actually runs — M is the handful of tokens that routed to
 //! one expert, against N=4096, K=4096 — the arithmetic intensity is so low that
 //! the kernel is bound by streaming the weights in, and a fancier tiling would
-//! not change that. See `inkling_expert_lane_bench` for where the lane's time
-//! really goes.
+//! not change that. `inkling_forward`'s own per-pass report breaks the lane
+//! into slice / bind+enqueue+sync / remainder, which is where that number comes
+//! from now that the lane-comparison bench is gone with the lanes it compared.
 
 use cubecl::ir::MatrixIdent;
 use cubecl::prelude::*;

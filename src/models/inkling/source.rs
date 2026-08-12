@@ -59,36 +59,6 @@ pub enum Slab {
     Pile(PackedSlab),
 }
 
-/// One expert's BF16 bytes, borrowed from whichever source holds them.
-pub enum Bf16Slab {
-    Ckpt(crate::models::inkling::load::Bf16ExpertRef),
-    Pile(super::pile::Leaf),
-}
-
-impl Bf16Slab {
-    /// `[rows, cols]` BF16 bytes, little-endian.
-    pub fn bytes(&self) -> &[u8] {
-        match self {
-            Bf16Slab::Ckpt(r) => r.bytes(),
-            Bf16Slab::Pile(l) => &l.bytes,
-        }
-    }
-
-    pub fn rows(&self) -> usize {
-        match self {
-            Bf16Slab::Ckpt(r) => r.rows,
-            Bf16Slab::Pile(l) => l.dims[0] as usize,
-        }
-    }
-
-    pub fn cols(&self) -> usize {
-        match self {
-            Bf16Slab::Ckpt(r) => r.cols,
-            Bf16Slab::Pile(l) => l.dims[1] as usize,
-        }
-    }
-}
-
 impl Slab {
     pub fn codes(&self) -> &[u8] {
         match self {
@@ -143,7 +113,6 @@ pub enum Src {
 /// of counters over both.
 pub struct Weights {
     src: Src,
-    resident_on: bool,
     resident: Mutex<HashMap<String, Held>>,
     io: Mutex<BTreeMap<String, NameIo>>,
 }
@@ -159,13 +128,15 @@ impl Weights {
         Ok(Self::wrap(Src::Pile(PileSource::open(path.as_ref(), branch)?)))
     }
 
+    /// Residency is not a choice. `INK_RESIDENT` used to default it OFF,
+    /// because pinning tens of gigabytes on a 119 GiB box against a 159 GiB
+    /// model was a deliberate call — and that framing is what a second node
+    /// retires. A node holds ITS share, which fits; a node that streams is a
+    /// node reading the SSD in the middle of a decode step, which is the one
+    /// thing this runtime must never do.
     fn wrap(src: Src) -> Self {
         Weights {
             src,
-            // Off by default: residency pins tens of gigabytes, and this box
-            // has 119 of them against a 159 GiB model. A deliberate call, so a
-            // deliberate flag.
-            resident_on: std::env::var("INK_RESIDENT").map(|v| v != "0").unwrap_or(false),
             resident: Mutex::new(HashMap::new()),
             io: Mutex::new(BTreeMap::new()),
         }
@@ -244,20 +215,16 @@ impl Weights {
     /// survives it. On, the first ask pays the read and the widen and every
     /// later one is a pointer copy.
     pub fn held(&self, name: &str) -> Result<Held> {
-        if self.resident_on {
-            let hit = self.resident.lock().expect("resident").get(name).cloned();
-            if let Some(h) = hit {
-                self.note_hit(name);
-                return Ok(h);
-            }
+        let hit = self.resident.lock().expect("resident").get(name).cloned();
+        if let Some(h) = hit {
+            self.note_hit(name);
+            return Ok(h);
         }
         let h = Arc::new(self.tensor(name)?);
-        if self.resident_on {
-            self.resident
-                .lock()
-                .expect("resident")
-                .insert(name.to_string(), h.clone());
-        }
+        self.resident
+            .lock()
+            .expect("resident")
+            .insert(name.to_string(), h.clone());
         Ok(h)
     }
 
@@ -273,22 +240,20 @@ impl Weights {
         make: impl FnOnce() -> Result<(Loaded, Loaded)>,
     ) -> Result<(Held, Held)> {
         let (k0, k1) = (format!("{key}#0"), format!("{key}#1"));
-        if self.resident_on {
-            let hit = {
-                let r = self.resident.lock().expect("resident");
-                match (r.get(&k0), r.get(&k1)) {
-                    (Some(a), Some(b)) => Some((a.clone(), b.clone())),
-                    _ => None,
-                }
-            };
-            if let Some(pair) = hit {
-                self.note_hit(key);
-                return Ok(pair);
+        let hit = {
+            let r = self.resident.lock().expect("resident");
+            match (r.get(&k0), r.get(&k1)) {
+                (Some(a), Some(b)) => Some((a.clone(), b.clone())),
+                _ => None,
             }
+        };
+        if let Some(pair) = hit {
+            self.note_hit(key);
+            return Ok(pair);
         }
         let (a, b) = make()?;
         let (a, b) = (Arc::new(a), Arc::new(b));
-        if self.resident_on {
+        {
             let mut r = self.resident.lock().expect("resident");
             r.insert(k0, a.clone());
             r.insert(k1, b.clone());
@@ -319,90 +284,6 @@ impl Weights {
         let moved = s.bytes() as u64;
         self.note(base, moved, moved, t0);
         Ok(s)
-    }
-
-    /// One expert's UNQUANTISED bytes, borrowed and NOT widened.
-    ///
-    /// [`Weights::expert_f32`] is the widening twin; this is what a device lane
-    /// wants, because BF16 -> f32 is a shift and belongs where the weights are
-    /// going rather than on the host in front of a 100 MB allocation.
-    pub fn expert_bf16(&self, base: &str, e: usize) -> Result<Bf16Slab> {
-        let t0 = Instant::now();
-        let s = match &self.src {
-            Src::Ckpt(c) => Bf16Slab::Ckpt(c.expert_bf16_ref(base, e)?),
-            Src::Pile(p) => Bf16Slab::Pile(p.expert_bf16(base, e)?),
-        };
-        let moved = s.bytes().len() as u64;
-        self.note(base, moved, moved, t0);
-        Ok(s)
-    }
-
-    /// One expert as f32 — the reference lane, which has to decode.
-    pub fn expert_f32(&self, base: &str, e: usize) -> Result<Loaded> {
-        let t0 = Instant::now();
-        match &self.src {
-            Src::Ckpt(c) => {
-                let l = c.expert_slice(base, e)?;
-                self.note(base, (l.data.len() * 2) as u64, (l.data.len() * 4) as u64, t0);
-                Ok(l)
-            }
-            Src::Pile(p) => {
-                let l = if p.is_nvfp4(base) {
-                    let q = p.expert_packed(base, e)?;
-                    let logical = q.cols * 2;
-                    let mut out = vec![0f32; q.rows * logical];
-                    let n = super::nvfp4::decode_stacked(
-                        &q.codes, &q.scales, &[q.scale2], 1, q.rows, q.cols, &mut out,
-                    );
-                    anyhow::ensure!(n == out.len(), "decoded {n} of {}", out.len());
-                    Loaded { data: out, shape: vec![q.rows, logical] }
-                } else {
-                    let leaf = p.expert_bf16(base, e)?;
-                    Loaded { data: leaf.to_f32(), shape: leaf.shape() }
-                };
-                self.note(base, (l.data.len() * 2) as u64, (l.data.len() * 4) as u64, t0);
-                Ok(l)
-            }
-        }
-    }
-
-    /// Fault a LAYER RANGE's whole share in, and say what it cost.
-    ///
-    /// The question a layer split has to answer is not how fast a pass is but
-    /// whether a node's share STAYS resident, so this is measured against
-    /// `/proc/self/io` by the caller rather than assumed. Both arms touch one
-    /// byte per 4 KiB page and let the kernel's readahead do the rest.
-    ///
-    /// The difference between the arms is the whole argument for the pile: over
-    /// a checkpoint the share is "every tensor whose NAME parses to a layer in
-    /// range", and over a pile it is a query on a stored fact.
-    pub fn warm(&self, range: std::ops::RangeInclusive<i64>) -> Result<(u64, usize)> {
-        match &self.src {
-            Src::Pile(p) => p.warm(*range.start(), *range.end()),
-            Src::Ckpt(c) => {
-                let (mut bytes, mut leaves, mut sum) = (0u64, 0usize, 0u64);
-                for name in c.names() {
-                    // Absent rather than zero: the embedding and the head carry
-                    // no layer and belong to whoever loads them eagerly, not to
-                    // the first node's share.
-                    match super::pile::layer_of(&name) {
-                        Some(l) if range.contains(&l) => {}
-                        _ => continue,
-                    }
-                    let b = c.span(&name)?;
-                    let b = b.bytes();
-                    let mut i = 0usize;
-                    while i < b.len() {
-                        sum = sum.wrapping_add(b[i] as u64);
-                        i += 4096;
-                    }
-                    bytes += b.len() as u64;
-                    leaves += 1;
-                }
-                std::hint::black_box(sum);
-                Ok((bytes, leaves))
-            }
-        }
     }
 
     /// Every host mapping this source reads through, as `(base, len, keepalive)`.
@@ -445,11 +326,6 @@ impl Weights {
     /// Zero the counters, so a per-token figure is a per-token figure.
     pub fn io_reset(&self) {
         self.io.lock().expect("io stats").clear();
-    }
-
-    /// Whether weights asked for through [`Weights::held`] stay in RAM.
-    pub fn resident_on(&self) -> bool {
-        self.resident_on
     }
 
     /// How many bytes of f32 the resident set holds, and how many weights.

@@ -104,14 +104,27 @@ k3 = ["import", "mxfp4", "burn/ndarray", "dep:safetensors", "dep:memmap2", "dep:
 # backend it will actually run on here. Needs the CUDA toolkit present.
 k3-cuda = ["k3", "burn/cuda"]
 
-# Inkling (Thinking Machines) - config + checkpoint layout. Header-only so far:
-# no burn backend, no tensor ops, so this pulls nothing beyond safetensors.
-inkling = ["import", "dep:safetensors", "dep:memmap2"]
-# The Burn lane beside the f32 slice lane, the way k3 keeps kda.rs beside its
-# Burn path. `inkling-burn` runs on ndarray so the gate works without a GPU;
-# `inkling-cuda` adds the GB10 backend on top.
-inkling-burn = ["inkling", "burn/ndarray", "dep:burn-ndarray"]
-inkling-cuda = ["inkling-burn", "burn/cuda", "dep:cubecl", "cubecl?/cuda"]
+# Inkling (Thinking Machines) - the 42-layer (276 B / 12 B active) MoE, on the
+# only hardware it runs on. ONE feature, where there were three.
+#
+# `inkling` (headers, no backend) and `inkling-burn` (ndarray, so a gate could
+# run without a GPU) described a model you could build without CUDA. Nothing
+# does: every lane in the runtime is a Blackwell tensor-core lane, the NVFP4
+# GEMM is an `mma.sync...kind::mxf4nvf4` intrinsic, and `fp4gemm` was already
+# unconditional inside a module the `inkling` feature claimed needed no cubecl
+# — so `--features inkling` alone had not compiled for some time and nobody
+# noticed, which is what a feature nobody can select buys you.
+#
+# burn/ndarray went with `inkling-burn`: its only reader here was
+# `inkling_burn_gate`, an ndarray-vs-CUDA BACKEND PARITY check, not an oracle.
+inkling-cuda = [
+    "import",
+    "dep:safetensors",
+    "dep:memmap2",
+    "burn/cuda",
+    "dep:cubecl",
+    "cubecl?/cuda",
+]
 
 # AttnRes (mary::models::k3::attn_res) - the depth-axis mixture and the
 # snapshot boundary that resets it, in Burn. The module itself needs nothing
@@ -254,61 +267,61 @@ required-features = ["k3"]
 # a bijection onto a real checkpoint. Reads safetensors headers only.
 [[bin]]
 name = "inkling_layout_gate"
-required-features = ["inkling"]
+required-features = ["inkling-cuda"]
 
 # Parity gate for the NVFP4 expert decode against compressed_tensors, which is
 # the library that defines this packing. Reads a small raw-binary oracle bundle.
 [[bin]]
 name = "inkling_nvfp4_gate"
-required-features = ["inkling"]
+required-features = ["inkling-cuda"]
 
 # Parity gate for the block primitives (RMSNorm, short convolution, router)
 # against the transformers reference implementation.
 [[bin]]
 name = "inkling_block_gate"
-required-features = ["inkling"]
+required-features = ["inkling-cuda"]
 
 # Parity gate for Inkling attention against the transformers reference, run on
 # BOTH a sliding-window and a global layer -- they are different functions.
 [[bin]]
 name = "inkling_attn_gate"
-required-features = ["inkling"]
+required-features = ["inkling-cuda"]
 
 # Parity gate for the MLPs (dense and MoE) and the whole decoder layer.
 [[bin]]
 name = "inkling_layer_gate"
-required-features = ["inkling"]
+required-features = ["inkling-cuda"]
 
 # End-to-end gate: one REAL layer of the released checkpoint, loaded through the
 # layout and the NVFP4 decode, against transformers running the same layer.
 [[bin]]
 name = "inkling_real_gate"
-required-features = ["inkling"]
+required-features = ["inkling-cuda"]
 
 # The text stack's two ends -- embedding + embed_norm in, final norm + muP +
 # head + vocab truncation out -- and two real layers composed.
 [[bin]]
 name = "inkling_stack_gate"
-required-features = ["inkling"]
+required-features = ["inkling-cuda"]
 
 # The vision (HMLP) and audio (dMel) towers, including the derived scale plan.
 [[bin]]
 name = "inkling_towers_gate"
-required-features = ["inkling"]
+required-features = ["inkling-cuda"]
 
 # The MTP blocks. transformers ships the MTP config surface and no
 # implementation, so the blocks are gated and the composition is reported as
 # having no oracle rather than silently guessed.
 [[bin]]
 name = "inkling_mtp_gate"
-required-features = ["inkling"]
+required-features = ["inkling-cuda"]
 
 # A real forward of the released checkpoint on one machine, paging expert slabs
 # per layer. The one check that can validate the name mapping independently:
 # coherent continuations cannot come out of a wrong mapping.
 [[bin]]
 name = "inkling_forward"
-required-features = ["inkling"]
+required-features = ["inkling-cuda"]
 
 # How much DEVICE memory this part hands out, and what a resident set of that
 # size costs to read. Both are properties of the box, and nvidia-smi answers
@@ -322,20 +335,8 @@ required-features = ["inkling-cuda"]
 # measurement, which is how a 992 GB/s number got into circulation.
 [[bin]]
 name = "inkling_membw"
-required-features = ["inkling", "cuda-backend"]
+required-features = ["inkling-cuda", "cuda-backend"]
 
-# What one routed expert costs, in parts, and the bitwise gate on the fused
-# NVFP4 decode. The lane is 833 expert loads a forward, so per-expert cost is
-# the whole lane.
-[[bin]]
-name = "inkling_expert_probe"
-required-features = ["inkling-cuda"]
-
-# Burn lane vs the f32 slice lane, at real model dimensions. The slice lane is
-# itself gated against transformers, so this needs no torch.
-[[bin]]
-name = "inkling_burn_gate"
-required-features = ["inkling-burn"]
 # KDA parity gate: mary::models::kimi_k3::kda against the flash-linear-attention
 # oracle vectors (Triton kernels + fla's own float64 references). Reads .npz
 # only — no checkpoint, no safetensors — so it does not ride `dev-tools`.
@@ -834,7 +835,3 @@ required-features = ["personaplex", "q4"]
 [[bin]]
 name = "spm_graph_roundtrip"
 required-features = ["personaplex"]
-
-[[bin]]
-name = "inkling_words_gate"
-required-features = ["inkling-cuda"]
