@@ -310,6 +310,13 @@ required-features = ["inkling"]
 name = "inkling_forward"
 required-features = ["inkling"]
 
+# How much DEVICE memory this part hands out, and what a resident set of that
+# size costs to read. Both are properties of the box, and nvidia-smi answers
+# [N/A] for both on a unified part, so they have to be measured by allocating.
+[[bin]]
+name = "inkling_device_ceiling"
+required-features = ["inkling-cuda"]
+
 # The same forward split across two machines by layer range. One box is 40 GiB
 # short of the checkpoint and pages the difference off disk every token; two
 # boxes hold it, so the wire carries [n, 4096] f32 once per boundary and the
