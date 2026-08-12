@@ -15,10 +15,18 @@
 
 #[cfg(feature = "inkling-burn")]
 pub mod burn;
+// The NVFP4 decode as one CUDA kernel: the Burn chain above is 46 launches a
+// weight, and the routed lane runs it 1 666 times a forward.
+#[cfg(feature = "inkling-cuda")]
+pub mod dequant_cuda;
 pub mod attn;
 pub mod block;
 pub mod config;
-#[cfg(feature = "q4")] pub mod fp4quant;
+// The NVFP4 ACTIVATION quantiser. Gated on `q4` when it arrived, but the
+// native-FP4 routed-expert lane in `inkling_forward` is compiled under
+// `inkling-cuda` and calls it, so `--features inkling-cuda` has to be a
+// complete feature set on its own. `q4` alone still selects it as before.
+#[cfg(any(feature = "q4", feature = "inkling-cuda"))] pub mod fp4quant;
 pub mod layer;
 pub mod layout;
 pub mod load;

@@ -111,7 +111,7 @@ inkling = ["import", "dep:safetensors", "dep:memmap2"]
 # Burn path. `inkling-burn` runs on ndarray so the gate works without a GPU;
 # `inkling-cuda` adds the GB10 backend on top.
 inkling-burn = ["inkling", "burn/ndarray", "dep:burn-ndarray"]
-inkling-cuda = ["inkling-burn", "burn/cuda"]
+inkling-cuda = ["inkling-burn", "burn/cuda", "dep:cubecl", "cubecl?/cuda"]
 
 # AttnRes (mary::models::k3::attn_res) - the depth-axis mixture and the
 # snapshot boundary that resets it, in Burn. The module itself needs nothing
@@ -330,6 +330,13 @@ required-features = ["inkling", "cuda-backend"]
 # experts stop moving at all.
 [[bin]]
 name = "inkling_pipe"
+required-features = ["inkling-cuda"]
+
+# What one routed expert costs, in parts, and the bitwise gate on the fused
+# NVFP4 decode. The lane is 833 expert loads a forward, so per-expert cost is
+# the whole lane.
+[[bin]]
+name = "inkling_expert_probe"
 required-features = ["inkling-cuda"]
 
 # Burn lane vs the f32 slice lane, at real model dimensions. The slice lane is

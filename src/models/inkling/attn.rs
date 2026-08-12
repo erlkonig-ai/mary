@@ -58,7 +58,10 @@ pub struct LogScaling {
 }
 
 impl LogScaling {
-    fn tau(&self, pos: usize) -> f32 {
+    /// The multiplier for a query at `pos`. Public because the device lane in
+    /// [`crate::models::inkling::burn`] builds the same vector and must not
+    /// transcribe the formula a second time.
+    pub fn tau(&self, pos: usize) -> f32 {
         let ratio = (pos as f32 + 1.0) / self.n_floor;
         1.0 + self.alpha * ratio.max(1.0).ln()
     }
