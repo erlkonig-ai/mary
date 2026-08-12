@@ -40,19 +40,19 @@ pub mod attrs {
     attributes! {
         // Shared IDs with avatar/gaze — same attributes, cross-model LoRA queries.
         /// Low-rank dimension of LoRA adapters.
-        "1A682F45CE40171DD5C6FDB4F086AD69" unsafe as lora_rank: U256BE;
+        "1A682F45CE40171DD5C6FDB4F086AD69" as lora_rank: U256BE;
         /// LoRA alpha (scale = alpha / rank).
-        "198B03AF556B7505CCC9ABD4A1D6E724" unsafe as lora_alpha: F64;
+        "198B03AF556B7505CCC9ABD4A1D6E724" as lora_alpha: F64;
         /// Reference to a LoRA adapter entity (repeated on the LoRA set entity).
-        "B93C4E66F4B9553BF0E8B5DBAD116ECF" unsafe as lora_adapter: GenId;
+        "B93C4E66F4B9553BF0E8B5DBAD116ECF" as lora_adapter: GenId;
         /// Projection name for a LoRA target (e.g. "layers.0.self_attn.q_proj").
-        "FF8335C187823A267E26B4E33EF157E9" unsafe as lora_projection: ShortString;
+        "FF8335C187823A267E26B4E33EF157E9" as lora_projection: ShortString;
         /// LoRA A matrix blob [rank, in_features].
-        "7CD7F0DC8BDA328735A22DF02B4B8828" unsafe as lora_a: Handle<F32Array>;
+        "7CD7F0DC8BDA328735A22DF02B4B8828" as lora_a: Handle<F32Array>;
         /// LoRA B matrix blob [out_features, rank].
-        "1F21DAE68652A4D8CAD973400F04124D" unsafe as lora_b: Handle<F32Array>;
+        "1F21DAE68652A4D8CAD973400F04124D" as lora_b: Handle<F32Array>;
         /// Model name (same shared id as `crate::format::attrs::model_name`).
-        "4C1CD1611863E7854C59C7DC706DF77A" unsafe as model_name: Handle<LongString>;
+        "4C1CD1611863E7854C59C7DC706DF77A" as model_name: Handle<LongString>;
     }
 }
 

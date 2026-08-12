@@ -152,14 +152,14 @@ pub mod attrs {
         // an error. Two copies of one string, and the redundant one was the copy
         // that could not hold it.
         /// Which expert of the stacked matrix.
-        "A6ED6DBA4BE63E4E34F2787DA84AD860" unsafe as expert_index: inlineencodings::I256BE;
+        "A6ED6DBA4BE63E4E34F2787DA84AD860" as expert_index: inlineencodings::I256BE;
         /// Which transformer layer it belongs to.
         ///
         /// Stored as a fact rather than parsed out of the tensor name at read
         /// time, because splitting a model across machines is a QUERY — "give
         /// me layers 0..21" — and a query over a string you have to parse is
         /// not one.
-        "BCDDFBCFF89F67EE0B1E527C4872CED7" unsafe as layer: inlineencodings::I256BE;
+        "BCDDFBCFF89F67EE0B1E527C4872CED7" as layer: inlineencodings::I256BE;
     }
 }
 
