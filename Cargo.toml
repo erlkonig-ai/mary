@@ -317,6 +317,13 @@ required-features = ["inkling"]
 name = "inkling_device_ceiling"
 required-features = ["inkling-cuda"]
 
+# Read bandwidth for device-allocated vs host-mapped memory, on a working set
+# far larger than L2. Any figure above this part's ~273 GB/s bus is a cache
+# measurement, which is how a 992 GB/s number got into circulation.
+[[bin]]
+name = "inkling_membw"
+required-features = ["inkling", "cuda-backend"]
+
 # The same forward split across two machines by layer range. One box is 40 GiB
 # short of the checkpoint and pages the difference off disk every token; two
 # boxes hold it, so the wire carries [n, 4096] f32 once per boundary and the
