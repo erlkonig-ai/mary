@@ -129,11 +129,17 @@ fn down<B: Backend>(t: BT<B, 2>) -> Vec<f32> {
 
 /// Every routed expert for one layer, on the device, without a host f32 copy.
 ///
-/// The host never sees a dequantised weight: `expert_slice_packed` hands over
-/// the checkpoint's own bytes, they are uploaded as-is, and the E2M1/E4M3
-/// decode happens on the device through the same gated lookup tables the CPU
-/// lane uses. That removes the 60.2s of a measured 113.7s forward that was
-/// scalar unpacking, and the 67 MB per-expert host allocation with it.
+/// The host never sees a dequantised weight: the checkpoint's own bytes are
+/// BORROWED out of the mapping, uploaded as-is, and the E2M1/E4M3 decode
+/// happens on the device. That removed the 60.2s of a measured 113.7s forward
+/// that was scalar unpacking, and the 67 MB per-expert host allocation with it.
+///
+/// The decode is one fused kernel per weight
+/// ([`mary::models::inkling::dequant_cuda`]), with the gate/up de-interleave
+/// folded into where it writes. `INK_DEQUANT=chain` selects the Burn tensor
+/// chain instead — 46 launches a weight and 1.4 GB of device traffic to make
+/// 100 MB of f32 — because the fused kernel is gated bitwise AGAINST it and a
+/// reference you cannot still run is not a reference.
 ///
 /// All of an expert's tokens go through in one matmul rather than one each.
 /// That reassociates the sums, so this is NOT bitwise identical to the host
@@ -143,7 +149,7 @@ fn down<B: Backend>(t: BT<B, 2>) -> Vec<f32> {
 /// enqueueing.
 #[cfg(feature = "inkling-cuda")]
 #[allow(clippy::too_many_arguments)]
-fn routed_experts_gpu<B: Backend>(
+fn routed_experts_gpu(
     cp: &Checkpoint,
     prefix: &str,
     by_expert: &BTreeMap<usize, Vec<(usize, f32)>>,
@@ -151,13 +157,16 @@ fn routed_experts_gpu<B: Backend>(
     n: usize,
     h: usize,
     inter: usize,
-    dev: &B::Device,
+    dev: &burn::backend::cuda::CudaDevice,
+    chain_decode: bool,
     host: &mut (f64, f64),
 ) -> Result<Vec<f32>> {
+    type B = Bk;
     use burn::tensor::{Int, Tensor, TensorData};
     use mary::models::inkling::burn::{
         deinterleave_rows_device, expert_ffn, expert_weight_from_packed,
     };
+    use mary::models::inkling::dequant_cuda::expert_weight_fused;
 
     let hn_dev: Tensor<B, 2> =
         Tensor::from_data(TensorData::new(hn.to_vec(), [n, h]), dev);
@@ -171,20 +180,33 @@ fn routed_experts_gpu<B: Backend>(
         // branch never makes a host f32 copy. The BF16 branch has to widen
         // somewhere, so it widens on the host — one layer in forty, stated
         // rather than hidden.
+        let deint = std::env::var("INK_MUTATE_NO_DEINTERLEAVE").is_err();
         let t_s = Instant::now();
-        let (fused, dn) = if cp.is_nvfp4(&n13) {
-            let w13 = cp.expert_slice_packed(&n13, e)?;
-            let w2 = cp.expert_slice_packed(&n2, e)?;
+        let gu_dn = if cp.is_nvfp4(&n13) {
+            let w13 = cp.expert_packed_ref(&n13, e)?;
+            let w2 = cp.expert_packed_ref(&n2, e)?;
             host.0 += t_s.elapsed().as_secs_f64();
             let t_w = Instant::now();
-            let r = (
-                expert_weight_from_packed::<B>(
-                    &w13.codes, &w13.scales, w13.scale2, w13.rows, w13.cols, dev,
-                ),
-                expert_weight_from_packed::<B>(
-                    &w2.codes, &w2.scales, w2.scale2, w2.rows, w2.cols, dev,
-                ),
-            );
+            let r = if chain_decode {
+                let gu = expert_weight_from_packed::<B>(
+                    w13.codes(), w13.scales(), w13.scale2, w13.rows, w13.cols, dev,
+                );
+                (
+                    if deint { deinterleave_rows_device(gu) } else { gu },
+                    expert_weight_from_packed::<B>(
+                        w2.codes(), w2.scales(), w2.scale2, w2.rows, w2.cols, dev,
+                    ),
+                )
+            } else {
+                (
+                    expert_weight_fused(
+                        w13.codes(), w13.scales(), w13.scale2, w13.rows, w13.cols, deint, dev,
+                    ),
+                    expert_weight_fused(
+                        w2.codes(), w2.scales(), w2.scale2, w2.rows, w2.cols, false, dev,
+                    ),
+                )
+            };
             host.1 += t_w.elapsed().as_secs_f64();
             r
         } else {
@@ -192,24 +214,18 @@ fn routed_experts_gpu<B: Backend>(
             let b = cp.expert_slice(&n2, e)?;
             host.0 += t_s.elapsed().as_secs_f64();
             let t_w = Instant::now();
+            let fused = Tensor::<B, 2>::from_data(TensorData::new(a.data, [2 * inter, h]), dev);
             let r = (
-                Tensor::<B, 2>::from_data(TensorData::new(a.data, [2 * inter, h]), dev),
+                if deint { deinterleave_rows_device(fused) } else { fused },
                 Tensor::<B, 2>::from_data(TensorData::new(b.data, [h, inter]), dev),
             );
             host.1 += t_w.elapsed().as_secs_f64();
             r
         };
-        // One permutation for both branches: the fused tensor arrives in
-        // checkpoint interleave either way.
-        //
         // INK_MUTATE_NO_DEINTERLEAVE exists so the lane gate can be watched
         // rejecting something, because a gate that has never failed and a gate
         // that cannot fail look identical from outside.
-        let gu = if std::env::var("INK_MUTATE_NO_DEINTERLEAVE").is_ok() {
-            fused
-        } else {
-            deinterleave_rows_device(fused)
-        };
+        let (gu, dn) = gu_dn;
         anyhow::ensure!(gu.dims() == [2 * inter, h], "w13 is {:?}, want [{}, {h}]", gu.dims(), 2 * inter);
         anyhow::ensure!(dn.dims() == [h, inter], "w2 is {:?}, want [{h}, {inter}]", dn.dims());
 
@@ -290,6 +306,9 @@ fn main() -> Result<()> {
     // thing to check against: the decisive test of a cache is that it produces
     // the same token sequence as not having one, and that needs both to run.
     let kv = std::env::var("INK_KV").map(|v| v == "1" || v == "on").unwrap_or(false);
+    // The NVFP4 decode: one fused kernel per weight, or the Burn tensor chain
+    // it is gated against. Default fused; `INK_DEQUANT=chain` is the control.
+    let chain_decode = std::env::var("INK_DEQUANT").map(|v| v == "chain").unwrap_or(false);
     anyhow::ensure!(
         !kv || attn_on_gpu,
         "INK_KV needs attention on the device -- set INK_ATTN=gpu or INK_GPU=all"
@@ -300,6 +319,7 @@ fn main() -> Result<()> {
     println!("  routed experts     : {}", say(experts_on_gpu));
     println!("  head (unembed)     : {}", say(head_on_gpu));
     println!("  kv cache           : {}", if kv { "on" } else { "off (prefix recomputed each step)" });
+    println!("  nvfp4 decode       : {}", if chain_decode { "Burn tensor chain (46 launches/weight)" } else { "fused kernel (1 launch/weight)" });
     if std::env::var("INK_HOST_SUM").map(|v| v == "reverse").unwrap_or(false) {
         println!("  host sum order     : REVERSED (reassociation control)");
     }
@@ -556,7 +576,9 @@ fn main() -> Result<()> {
             let acc = if experts_on_gpu {
                 #[cfg(feature = "inkling-cuda")]
                 {
-                    let a = routed_experts_gpu::<Bk>(&cp, &p, &by_expert, &hn, n, h, inter, &dev, &mut host_t)?;
+                    let a = routed_experts_gpu(
+                        &cp, &p, &by_expert, &hn, n, h, inter, &dev, chain_decode, &mut host_t,
+                    )?;
                     expert_loads += by_expert.len();
                     a
                 }
@@ -718,8 +740,10 @@ fn main() -> Result<()> {
     println!("    of the above, host-only tensor reads (mmap + BF16 widening): {:8.1}", t_read.get());
     if experts_on_gpu {
         println!("    of the routed-expert total, the host-synchronous parts:");
-        println!("      slice from mmap   {:8.1}", host_t.0);
-        println!("      widen + upload    {:8.1}", host_t.1);
+        println!("      slice from mmap   {:8.1}   ({:.3} ms x {expert_loads} loads)",
+                 host_t.0, host_t.0 * 1e3 / expert_loads.max(1) as f64);
+        println!("      upload + enqueue  {:8.1}   ({:.3} ms x {expert_loads} loads)",
+                 host_t.1, host_t.1 * 1e3 / expert_loads.max(1) as f64);
         println!("      remainder         {:8.1}   (enqueue + the sync, so device work lives here)",
                  t_expert - host_t.0 - host_t.1);
     }

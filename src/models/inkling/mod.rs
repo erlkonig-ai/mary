@@ -15,6 +15,10 @@
 
 #[cfg(feature = "inkling-burn")]
 pub mod burn;
+// The NVFP4 decode as one CUDA kernel: the Burn chain above is 46 launches a
+// weight, and the routed lane runs it 1 666 times a forward.
+#[cfg(feature = "inkling-cuda")]
+pub mod dequant_cuda;
 pub mod attn;
 pub mod block;
 pub mod config;

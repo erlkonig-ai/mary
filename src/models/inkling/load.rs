@@ -4,12 +4,21 @@
 //! the layout is what actually locates weights rather than a parallel set of
 //! string literals that could drift from it.
 //!
-//! Only the tensors asked for are materialised. A shard is mapped, the tensor
-//! copied out and widened, and the mapping dropped — a layer is on the order of
-//! a gigabyte at f32 and the whole checkpoint is 159.
+//! Only the tensors asked for are materialised. A shard stays mapped, the
+//! tensor is copied out and widened on demand — a layer is on the order of a
+//! gigabyte at f32 and the whole checkpoint is 159.
+//!
+//! The mapping is opened ONCE per shard and kept. It used to be opened, parsed
+//! and dropped per call, and the routed-expert lane calls this eight times per
+//! expert: `open` + `mmap` + `SafeTensors::deserialize` (which parses a shard's
+//! whole JSON header — 19 GB shards, thousands of tensors) + `munmap`, 6.7 k
+//! times in a five-token forward. Measured at **6.2 ms of every 20.9 ms
+//! expert**, all of it host time nothing waits on. A shard's tensor spans are
+//! parsed once into [`Span`] and every later read is a pointer offset.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use memmap2::Mmap;
@@ -18,10 +27,36 @@ use safetensors::SafeTensors;
 use crate::models::inkling::layout::Slot;
 use crate::models::inkling::nvfp4::{decode_stacked, GROUP};
 
+/// Where one tensor's bytes sit inside its shard's mapping.
+///
+/// The byte range is derived from the pointer safetensors hands back, so it
+/// cannot disagree with what that library would have returned — this is a
+/// cache of its answer, not a second parser for the format.
+#[derive(Clone)]
+pub struct Span {
+    pub map: Arc<Mmap>,
+    pub off: usize,
+    pub len: usize,
+    pub dtype: String,
+    pub shape: Vec<usize>,
+}
+
+impl Span {
+    /// The tensor's bytes, borrowed out of the live mapping.
+    pub fn bytes(&self) -> &[u8] {
+        &self.map[self.off..self.off + self.len]
+    }
+}
+
 /// A checkpoint directory plus its tensor-to-shard index.
+///
+/// `maps` and `spans` are caches, hence the `Mutex` behind `&self`: reading a
+/// weight is logically a pure lookup and every caller holds a shared reference.
 pub struct Checkpoint {
     dir: PathBuf,
     shard_of: HashMap<String, String>,
+    maps: Mutex<HashMap<String, Arc<Mmap>>>,
+    spans: Mutex<HashMap<String, Span>>,
 }
 
 /// A tensor read out of the checkpoint and widened to f32.
@@ -56,6 +91,50 @@ pub struct PackedExpert {
     pub cols: usize,
 }
 
+/// The same expert, BORROWED out of the checkpoint mapping.
+///
+/// [`PackedExpert`] copies 12.6 MB per expert so the caller can own it. A
+/// device lane does not want to own it: it hands the bytes to a host-to-device
+/// copy and never looks at them again, so the copy into a `Vec` is pure
+/// overhead — 843 of them per forward. The `Arc<Mmap>` keeps the mapping alive
+/// for exactly as long as the borrow.
+pub struct PackedExpertRef {
+    codes: Span,
+    scales: Span,
+    codes_off: usize,
+    codes_len: usize,
+    scales_off: usize,
+    scales_len: usize,
+    pub scale2: f32,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl PackedExpertRef {
+    /// This expert's `[rows, cols]` packed code bytes.
+    pub fn codes(&self) -> &[u8] {
+        let b = self.codes.bytes();
+        &b[self.codes_off..self.codes_off + self.codes_len]
+    }
+
+    /// This expert's raw E4M3 block-scale bytes, one per `GROUP` values.
+    pub fn scales(&self) -> &[u8] {
+        let b = self.scales.bytes();
+        &b[self.scales_off..self.scales_off + self.scales_len]
+    }
+
+    /// Copy into the owning form, for callers that need to keep the bytes.
+    pub fn to_owned_expert(&self) -> PackedExpert {
+        PackedExpert {
+            codes: self.codes().to_vec(),
+            scales: self.scales().to_vec(),
+            scale2: self.scale2,
+            rows: self.rows,
+            cols: self.cols,
+        }
+    }
+}
+
 impl Checkpoint {
     /// Open a checkpoint, reading `model.safetensors.index.json`.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
@@ -73,7 +152,67 @@ impl Checkpoint {
             .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
             .collect::<HashMap<_, _>>();
         anyhow::ensure!(!shard_of.is_empty(), "weight_map is empty");
-        Ok(Checkpoint { dir, shard_of })
+        Ok(Checkpoint {
+            dir,
+            shard_of,
+            maps: Mutex::new(HashMap::new()),
+            spans: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// The mapping for one shard file, opened at most once.
+    fn map_of(&self, shard: &str) -> Result<Arc<Mmap>> {
+        if let Some(m) = self.maps.lock().expect("map cache").get(shard) {
+            return Ok(m.clone());
+        }
+        let path = self.dir.join(shard);
+        let file = std::fs::File::open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        // SAFETY: the checkpoint is read-only and nothing else writes it.
+        let map = Arc::new(unsafe { Mmap::map(&file) }?);
+        self.maps
+            .lock()
+            .expect("map cache")
+            .insert(shard.to_string(), map.clone());
+        Ok(map)
+    }
+
+    /// Where one tensor lives — parsing its shard's header at most once.
+    ///
+    /// A miss inserts EVERY tensor of that shard, because the parse that
+    /// answers one name has already answered all of them; paying it per name
+    /// would keep the cost this cache exists to remove.
+    pub fn span(&self, name: &str) -> Result<Span> {
+        if let Some(s) = self.spans.lock().expect("span cache").get(name) {
+            return Ok(s.clone());
+        }
+        let shard = self
+            .shard_of
+            .get(name)
+            .with_context(|| format!("{name} is not in the index"))?
+            .clone();
+        let map = self.map_of(&shard)?;
+        let st = SafeTensors::deserialize(&map)?;
+        let base = map.as_ptr() as usize;
+        let mut cache = self.spans.lock().expect("span cache");
+        for (nm, view) in st.tensors() {
+            let data = view.data();
+            let off = data.as_ptr() as usize - base;
+            cache.insert(
+                nm,
+                Span {
+                    map: map.clone(),
+                    off,
+                    len: data.len(),
+                    dtype: format!("{:?}", view.dtype()),
+                    shape: view.shape().to_vec(),
+                },
+            );
+        }
+        cache
+            .get(name)
+            .cloned()
+            .with_context(|| format!("{name} is not in shard {shard}"))
     }
 
     /// How many tensors the index names — an examined count for callers.
@@ -92,19 +231,10 @@ impl Checkpoint {
     /// expert weights are not read here — they need their sidecars, so they go
     /// through [`Checkpoint::expert_matrix`].
     pub fn tensor(&self, name: &str) -> Result<Loaded> {
-        let shard = self
-            .shard_of
-            .get(name)
-            .with_context(|| format!("{name} is not in the index"))?;
-        let path = self.dir.join(shard);
-        let file = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
-        // SAFETY: the checkpoint is read-only and nothing else writes it.
-        let mmap = unsafe { Mmap::map(&file) }?;
-        let st = SafeTensors::deserialize(&mmap)?;
-        let view = st.tensor(name)?;
-        let shape = view.shape().to_vec();
-        let raw = view.data();
-        let debug = format!("{:?}", view.dtype());
+        let span = self.span(name)?;
+        let shape = span.shape.clone();
+        let raw = span.bytes();
+        let debug = span.dtype.clone();
         let data = match debug.as_str() {
             "BF16" => raw
                 .chunks_exact(2)
@@ -139,21 +269,11 @@ impl Checkpoint {
     ///
     /// Copies once, out of the mmap, because the mapping is local to this call.
     pub fn tensor_raw(&self, name: &str) -> Result<RawTensor> {
-        let shard = self
-            .shard_of
-            .get(name)
-            .with_context(|| format!("{name} is not in the index"))?;
-        let path = self.dir.join(shard);
-        let file =
-            std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
-        // SAFETY: the checkpoint is read-only and nothing else writes it.
-        let mmap = unsafe { Mmap::map(&file) }?;
-        let st = SafeTensors::deserialize(&mmap)?;
-        let view = st.tensor(name)?;
+        let span = self.span(name)?;
         Ok(RawTensor {
-            dtype: format!("{:?}", view.dtype()),
-            shape: view.shape().to_vec(),
-            bytes: view.data().to_vec(),
+            dtype: span.dtype.clone(),
+            shape: span.shape.clone(),
+            bytes: span.bytes().to_vec(),
         })
     }
 
@@ -171,23 +291,13 @@ impl Checkpoint {
     /// only the slice, so importing 256 experts costs 256 slices rather than
     /// 256 whole-stack reads.
     pub fn expert_slice_bf16(&self, base: &str, e: usize) -> Result<RawTensor> {
-        let shard = self
-            .shard_of
-            .get(base)
-            .with_context(|| format!("{base} is not in the index"))?;
-        let path = self.dir.join(shard);
-        let file =
-            std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
-        // SAFETY: the checkpoint is read-only and nothing else writes it.
-        let mmap = unsafe { Mmap::map(&file) }?;
-        let st = SafeTensors::deserialize(&mmap)?;
-        let view = st.tensor(base)?;
-        let dtype = format!("{:?}", view.dtype());
+        let span = self.span(base)?;
+        let dtype = span.dtype.clone();
         anyhow::ensure!(
             dtype == "BF16",
             "{base} holds {dtype}; expert_slice_bf16 is for the unquantised stacks"
         );
-        let shape = view.shape();
+        let shape = &span.shape;
         anyhow::ensure!(
             shape.len() == 3,
             "{base} has shape {shape:?}; a stacked expert matrix is rank 3"
@@ -195,7 +305,7 @@ impl Checkpoint {
         let (n, rows, cols) = (shape[0], shape[1], shape[2]);
         anyhow::ensure!(e < n, "{base} stacks {n} experts; {e} is out of range");
         let per = rows * cols * 2;
-        let raw = view.data();
+        let raw = span.bytes();
         anyhow::ensure!(
             raw.len() == n * per,
             "{base}: {} bytes for {n}x{rows}x{cols} BF16, expected {}",
@@ -214,17 +324,7 @@ impl Checkpoint {
     /// Asked of the checkpoint rather than assumed, so a model with a different
     /// expert count imports fully instead of silently importing a prefix.
     pub fn expert_count(&self, base: &str) -> Result<usize> {
-        let shard = self
-            .shard_of
-            .get(base)
-            .with_context(|| format!("{base} is not in the index"))?;
-        let path = self.dir.join(shard);
-        let file =
-            std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
-        // SAFETY: the checkpoint is read-only and nothing else writes it.
-        let mmap = unsafe { Mmap::map(&file) }?;
-        let st = SafeTensors::deserialize(&mmap)?;
-        let shape = st.tensor(base)?.shape().to_vec();
+        let shape = self.span(base)?.shape;
         anyhow::ensure!(
             shape.len() == 3,
             "{base} has shape {shape:?}; a stacked expert matrix is rank 3"
@@ -300,30 +400,17 @@ impl Checkpoint {
         Ok(Loaded { data: out, shape: vec![q.rows, logical] })
     }
 
-    /// Map a shard and hand the tensor's raw bytes to `f` without copying them.
+    /// Hand the tensor's raw bytes to `f` without copying them.
     fn with_bytes<R>(&self, name: &str, f: impl FnOnce(&[u8]) -> Result<R>) -> Result<R> {
-        let shard = self.shard_of.get(name).with_context(|| format!("{name} not in index"))?;
-        let file = std::fs::File::open(self.dir.join(shard))?;
-        // SAFETY: the checkpoint is read-only and nothing else writes it.
-        let mmap = unsafe { Mmap::map(&file) }?;
-        let st = SafeTensors::deserialize(&mmap)?;
-        f(st.tensor(name)?.data())
+        f(self.span(name)?.bytes())
     }
 
     fn raw_bytes(&self, name: &str) -> Result<Vec<u8>> {
-        let shard = self.shard_of.get(name).with_context(|| format!("{name} not in index"))?;
-        let file = std::fs::File::open(self.dir.join(shard))?;
-        let mmap = unsafe { Mmap::map(&file) }?;
-        let st = SafeTensors::deserialize(&mmap)?;
-        Ok(st.tensor(name)?.data().to_vec())
+        Ok(self.span(name)?.bytes().to_vec())
     }
 
     fn shape_of(&self, name: &str) -> Result<Vec<usize>> {
-        let shard = self.shard_of.get(name).with_context(|| format!("{name} not in index"))?;
-        let file = std::fs::File::open(self.dir.join(shard))?;
-        let mmap = unsafe { Mmap::map(&file) }?;
-        let st = SafeTensors::deserialize(&mmap)?;
-        Ok(st.tensor(name)?.shape().to_vec())
+        Ok(self.span(name)?.shape)
     }
 
     /// Read the tensor a layout slot names.
@@ -345,7 +432,17 @@ impl Checkpoint {
     /// [`crate::models::inkling::nvfp4::decode_stacked`], which keeps the two
     /// lanes reading the same offsets.
     pub fn expert_slice_packed(&self, base: &str, e: usize) -> Result<PackedExpert> {
-        let shape = self.shape_of(base)?;
+        Ok(self.expert_packed_ref(base, e)?.to_owned_expert())
+    }
+
+    /// The same bytes, borrowed rather than copied — see [`PackedExpertRef`].
+    ///
+    /// Every bound here is checked against the shard's own header, so a wrong
+    /// expert index or a short sidecar is an error rather than a slice of some
+    /// neighbouring expert's weights.
+    pub fn expert_packed_ref(&self, base: &str, e: usize) -> Result<PackedExpertRef> {
+        let codes_span = self.span(base)?;
+        let shape = codes_span.shape.clone();
         anyhow::ensure!(shape.len() == 3, "{base} is rank {}", shape.len());
         let (experts, rows, cols) = (shape[0], shape[1], shape[2]);
         anyhow::ensure!(e < experts, "expert {e} of {experts}");
@@ -359,16 +456,28 @@ impl Checkpoint {
         let scales_per_row = logical / GROUP;
         let scale2 = self.tensor(&format!("{base}.scale2"))?;
         anyhow::ensure!(scale2.data.len() == experts, "scale2 is {}", scale2.data.len());
-        let codes = self.with_bytes(base, |raw| {
-            anyhow::ensure!(raw.len() == experts * rows * cols, "{base} is {} bytes", raw.len());
-            Ok(raw[e * rows * cols..(e + 1) * rows * cols].to_vec())
-        })?;
-        let scales = self.with_bytes(&format!("{base}.scale"), |raw| {
-            let s0 = e * rows * scales_per_row;
-            anyhow::ensure!(raw.len() >= s0 + rows * scales_per_row, "{base}.scale is short");
-            Ok(raw[s0..s0 + rows * scales_per_row].to_vec())
-        })?;
-        Ok(PackedExpert { codes, scales, scale2: scale2.data[e], rows, cols })
+        anyhow::ensure!(
+            codes_span.len == experts * rows * cols,
+            "{base} is {} bytes",
+            codes_span.len
+        );
+        let scales_span = self.span(&format!("{base}.scale"))?;
+        let s0 = e * rows * scales_per_row;
+        anyhow::ensure!(
+            scales_span.len >= s0 + rows * scales_per_row,
+            "{base}.scale is short"
+        );
+        Ok(PackedExpertRef {
+            codes: codes_span,
+            scales: scales_span,
+            codes_off: e * rows * cols,
+            codes_len: rows * cols,
+            scales_off: s0,
+            scales_len: rows * scales_per_row,
+            scale2: scale2.data[e],
+            rows,
+            cols,
+        })
     }
 
     pub fn slot(&self, slot: Slot) -> Result<Loaded> {
