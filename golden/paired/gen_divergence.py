@@ -29,6 +29,7 @@ from the reference is one full stream per token.
 
   gen_divergence.py build   <items.json> <fp4gendir> <out.json>
   gen_divergence.py report  <out.json> <ref.json>
+  gen_divergence.py compare <out.json> <ref.json> <fp4_tf_dir>
 
 `build` reads the NVFP4 generation logs and writes reference items carrying
 `score_from`; feed that to `inkling_bf16_stream.py`; then `report`.
@@ -115,8 +116,65 @@ def report(built_path, ref_path):
               f"{firsts[len(firsts) // 2]}, range {firsts[0]}..{firsts[-1]}")
 
 
+def compare(built_path, ref_path, tfdir):
+    """The apples-to-apples version: both models teacher-forced on the same ids.
+
+    `report` compares the reference's teacher-forced argmax against the tokens
+    the runtime EMITTED, which came out of the KV-cached decode lane. Those are
+    two different lanes as well as two different models, and the comparison
+    cannot tell the two apart. Running the same prompt-plus-continuation through
+    the runtime as a plain uncached forward puts both sides in the same lane on
+    the same input, so what is left is the model difference.
+
+    It also gives the cached-versus-uncached number for free, by comparing the
+    runtime's own two lanes on the same sequence -- which is a property of our
+    implementation and nothing to do with BF16.
+    """
+    built = {it["key"]: it for it in json.load(open(built_path))["items"]}
+    ref = json.load(open(ref_path))["results"]
+    LINE = re.compile(r"after token (\d+) \(id \d+\): top5 \[(\d+)")
+    tot = agree = 0
+    lane_tot = lane_agree = 0
+    print(f"{'item':<16} {'n':>4} {'BF16 vs NVFP4':>15} {'NVFP4 cached vs not':>21}")
+    for key, it in built.items():
+        r = ref.get(key)
+        log = os.path.join(tfdir, key, "tail.log")
+        if r is None or "positions" not in r or not os.path.exists(log):
+            continue
+        fp = {}
+        for m in LINE.finditer(open(log, errors="replace").read()):
+            fp[int(m.group(1))] = int(m.group(2))
+        k = r["positions"]["score_from"]
+        rp = r["positions"]["argmax"]
+        gen = it["generated"]
+        n = min(len(rp), len(gen), sum(1 for i in range(len(rp)) if k + i in fp))
+        same = [rp[i] == fp[k + i] for i in range(n)]
+        lane = [fp[k + i] == gen[i] for i in range(n)]
+        tot += n
+        agree += sum(same)
+        lane_tot += n
+        lane_agree += sum(lane)
+        print(f"{key:<16} {n:>4} {sum(same):>7}/{n:<7} {sum(lane):>13}/{n:<7}")
+    if tot == 0:
+        raise SystemExit("nothing to compare")
+    from paired_score import wilson
+    lo, hi = wilson(agree, tot)
+    print()
+    print(f"BF16 vs NVFP4, both teacher-forced on the same ids: {agree}/{tot} = "
+          f"{100 * agree / tot:.1f}% [95% CI {100 * lo:.1f}–{100 * hi:.1f}]")
+    llo, lhi = wilson(lane_agree, lane_tot)
+    print(f"NVFP4 uncached vs its own KV-cached generation:     {lane_agree}/{lane_tot} = "
+          f"{100 * lane_agree / lane_tot:.1f}% [95% CI {100 * llo:.1f}–{100 * lhi:.1f}]")
+    print()
+    print("The second line is OUR two lanes on one model and has nothing to do with BF16.")
+    print("Whatever it costs is a floor under the first line, in the same way the")
+    print("run-to-run flip rate is a floor under the multiple-choice result.")
+
+
 if __name__ == "__main__":
-    if sys.argv[1] == "build":
+    if sys.argv[1] == "compare":
+        compare(sys.argv[2], sys.argv[3], sys.argv[4])
+    elif sys.argv[1] == "build":
         build(sys.argv[2], sys.argv[3], sys.argv[4])
     elif sys.argv[1] == "report":
         report(sys.argv[2], sys.argv[3])

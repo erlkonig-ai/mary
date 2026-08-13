@@ -1,0 +1,15 @@
+item                n   BF16 vs NVFP4   NVFP4 cached vs not
+gen-prose          48      46/48                 47/48     
+gen-explain        48      42/48                 46/48     
+gen-arith          48      47/48                 43/48     
+gen-code           48      48/48                 47/48     
+gen-list           48      47/48                 47/48     
+gen-dialogue       48      47/48                 46/48     
+gen-defn           48      47/48                 47/48     
+
+BF16 vs NVFP4, both teacher-forced on the same ids: 324/336 = 96.4% [95% CI 93.9–97.9]
+NVFP4 uncached vs its own KV-cached generation:     323/336 = 96.1% [95% CI 93.5–97.7]
+
+The second line is OUR two lanes on one model and has nothing to do with BF16.
+Whatever it costs is a floor under the first line, in the same way the
+run-to-run flip rate is a floor under the multiple-choice result.
