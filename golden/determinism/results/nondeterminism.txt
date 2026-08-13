@@ -148,3 +148,65 @@ diagnostic and a poor fix.
 Nothing here requires relaxing the architectural spec. The weights stay NVFP4,
 nothing widens, no matmul moves to the CPU, and the fix is not a slower
 reduction order -- it is making the pages the GPU reads actually be there.
+
+DOES THIS EXPLAIN THE 8.55% WOBBLE? YES -- THE HARNESS'S OWN SPLIT IS THE TRIGGER
+
+The paired numbers were taken on the loopback head+tail pair at 0:20 + 20:42.
+That is ~147 GiB of weights touched on a 119 GiB box: the two halves cannot both
+be resident, so the kernel reclaims page-cache pages for the entire run. The
+measurement configuration manufactures the noise floor it measured.
+
+Run the same two processes, the same wire, the same code, at a split that FITS:
+
+    0:10 + 10:20  (~73 GiB)      3/3 runs BITWISE IDENTICAL
+                                 top5 = 326072029a52988e, which is also what the
+                                 SINGLE process produces at 0:20 -- so the pipe
+                                 is numerically transparent and is not a suspect
+
+    0:20 + 20:42  (~147 GiB)     run 1  top5 = 66bd3779fb7ec522
+                                 run 2  head PANICKED, block.rs:219, NaN router
+                                 run 3  top5 = c028d63e03ace144
+
+Two completing runs, two different answers, and one NaN panic in three attempts.
+The pair is not a noisier version of the single process; it is the single
+process held permanently in the failure regime.
+
+One consequence for the earlier result: the harness recorded retries on 10 of
+~54 attempts and attributed them to OOM. At least some of those were not OOM --
+`block.rs:219` is the NaN reaching the router's top-k, which is this corruption
+and not memory exhaustion. (One panic observed here out of three; I cannot say
+how many of their ten were which.)
+
+So the 96.4% BF16-vs-NVFP4 agreement and the 96.1% NVFP4-against-itself figure
+are both floors imposed by this defect, not by quantisation. Neither number is
+evidence about NVFP4 until the pair is run where its weights stay resident --
+which is what the two-NODE deployment does by construction, since there each
+node's share fits its own RAM. On one box, the loopback pair cannot measure
+this model.
+
+WHAT THE FIX HAS TO DO
+
+Make the pages the GPU dereferences non-reclaimable, or stop dereferencing host
+pages. Nothing about it touches the arithmetic:
+
+  * the weights stay NVFP4 and BF16, nothing widens
+  * no matmul moves to the CPU
+  * no reduction order changes, and no lane is serialised
+
+The cheap, wrong fix is `INK_ZEROCOPY=0`: it is correct (2/2 canonical under
+pressure) but it copies 22 GB per pass, costs +4.5 s of host time, and needs
+device memory it does not have -- one of three runs died with
+CUDA_ERROR_OUT_OF_MEMORY under the same hog. It is a diagnostic arm, not a lane.
+
+The right fix is to make the mapping unreclaimable for the ranges actually bound
+-- `mlock`/`MAP_LOCKED` on the pile's mapping, or `cuMemHostRegister` on it, so
+the pages cannot be dropped underneath a kernel -- which requires that this
+node's share FIT, which is already the standing architectural requirement and
+already what `INK_LAYERS` exists to enforce. A node whose share does not fit
+should refuse to start for this reason too, not only for the SSD one: today it
+starts and silently multiplies by whatever is at the address.
+
+Separately and independently, `route_from_logits` should not let a NaN through
+the shared-logit path in silence (see above). That is a one-line class of fix
+and worth doing whatever else happens, because it converts the worst failure
+mode into the merely bad one.
