@@ -192,6 +192,61 @@ impl Weights {
         Ok(s)
     }
 
+    /// Read and VALIDATE every expert plane in `layers`, once, before the token
+    /// loop — so that no decode step ever does.
+    ///
+    /// # What this is actually buying, which is not what it looks like
+    ///
+    /// It looks like prefetching. It is not; it is paying a HASH.
+    /// `PileReader::get` verifies a blob's BLAKE3 against the handle that names
+    /// it, because in a content-addressed store the name IS the hash and a read
+    /// that skipped the check would be a read of something else. The result is
+    /// cached per record for the life of the reader, so each blob costs it
+    /// exactly once — but "once" was landing wherever the router happened to
+    /// send a token first, and an expert is 9.4 MB (NVFP4 `w13`) to 33.6 MB
+    /// (layer 2's BF16), so first touch cost 8-13 ms and a decode step paid it
+    /// for however many of its 108 slabs it had not seen.
+    ///
+    /// Measured on the 20-layer head, steps 41..80 of an 80-token generation —
+    /// long past any sensible notion of warm-up — the fastest passes spent 0.5
+    /// ms in the loader and the slowest 274 ms, and that ONE variable explains
+    /// the whole spread. It is also why an A/B between two builds that generate
+    /// different tokens is not a comparison: different tokens route to
+    /// different experts, so the two arms pay different amounts of a cost that
+    /// has nothing to do with either.
+    ///
+    /// It is a full host read of every weight byte this node owns, which is a
+    /// host path through the data plane by any definition. It cannot be moved
+    /// to the device — the check is the storage layer's, and it is the reason
+    /// to believe the bytes — so it moves to STARTUP instead, where it is paid
+    /// once and where a node that then reads the SSD mid-decode is a node whose
+    /// share does not fit.
+    ///
+    /// The slabs are dropped as they are validated. Holding them would cost a
+    /// few MB of handles and change nothing: what persists is the reader's
+    /// validation state, and the payload stays exactly where it was, in the
+    /// mapping.
+    pub fn warm_experts(
+        &self,
+        layers: std::ops::Range<usize>,
+        mut progress: impl FnMut(usize, usize, u64),
+    ) -> Result<(usize, u64)> {
+        let keys = self.src.expert_keys_in(layers);
+        let total = keys.len();
+        let mut bytes = 0u64;
+        for (i, (name, e)) in keys.iter().enumerate() {
+            bytes += match self.src.expert_is_nvfp4(name, *e) {
+                Some(true) => {
+                    let q = self.src.expert_packed(name, *e as usize)?;
+                    (q.codes.len() + q.scales.len()) as u64
+                }
+                _ => self.src.expert_bf16(name, *e as usize)?.bytes.len() as u64,
+            };
+            progress(i + 1, total, bytes);
+        }
+        Ok((total, bytes))
+    }
+
     /// Every host mapping this source reads through, as `(base, len, keepalive)`.
     ///
     /// What a zero-copy lane registers with the GPU, ONCE — and for a pile that

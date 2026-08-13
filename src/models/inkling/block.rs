@@ -165,17 +165,51 @@ pub fn route(
     let rows = n_routed + n_shared;
     assert_eq!(x.len(), tokens * hidden);
     assert_eq!(weight.len(), rows * hidden);
+
+    let mut logits = vec![0f32; tokens * rows];
+    for t in 0..tokens {
+        let xt = &x[t * hidden..(t + 1) * hidden];
+        for e in 0..rows {
+            let w = &weight[e * hidden..(e + 1) * hidden];
+            logits[t * rows + e] = xt.iter().zip(w).map(|(a, b)| a * b).sum::<f32>();
+        }
+    }
+    route_from_logits(&logits, bias, global_scale, route_scale, tokens, n_routed, n_shared, top_k)
+}
+
+/// [`route`] with the projection already done, wherever it was done.
+///
+/// The split is not a refactor for tidiness: the projection is
+/// `[tokens, hidden] x [n_routed + n_shared, hidden]ᵀ`, a real matmul that
+/// belongs on the device, and everything below it — a sigmoid, a sort of 256
+/// scores, a log-softmax over `top_k + n_shared` of them — is CONTROL PLANE. It
+/// decides which weights to read. It touches 258 numbers a token and it decides
+/// something the host has to know anyway, so it stays here.
+///
+/// One implementation of the selection rule, called from both, because the rule
+/// is where the subtlety is: the bias shifts the scores used to PICK and takes
+/// no part in the weights, and a second transcription would eventually forget
+/// that.
+///
+/// `logits` is `[tokens, n_routed + n_shared]` row-major.
+#[allow(clippy::too_many_arguments)]
+pub fn route_from_logits(
+    logits: &[f32],
+    bias: &[f32],
+    global_scale: f32,
+    route_scale: f32,
+    tokens: usize,
+    n_routed: usize,
+    n_shared: usize,
+    top_k: usize,
+) -> Vec<Routing> {
+    let rows = n_routed + n_shared;
+    assert_eq!(logits.len(), tokens * rows);
     assert_eq!(bias.len(), n_routed);
 
     let mut out = Vec::with_capacity(tokens);
     for t in 0..tokens {
-        let xt = &x[t * hidden..(t + 1) * hidden];
-        let logits: Vec<f32> = (0..rows)
-            .map(|e| {
-                let w = &weight[e * hidden..(e + 1) * hidden];
-                xt.iter().zip(w).map(|(a, b)| a * b).sum::<f32>()
-            })
-            .collect();
+        let logits = &logits[t * rows..(t + 1) * rows];
 
         // Selection uses sigmoid(logit) + bias; the weights below do not.
         let mut order: Vec<usize> = (0..n_routed).collect();

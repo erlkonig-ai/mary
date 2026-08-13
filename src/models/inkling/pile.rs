@@ -709,6 +709,25 @@ impl PileSource {
         &self.reader
     }
 
+    /// The same, restricted to a half-open LAYER range.
+    ///
+    /// The layer is a FACT the importer wrote and this index kept
+    /// ([`ExpertRef::layer`]), not a substring of the name, which is what makes
+    /// "the experts this node holds" a lookup rather than a parse. A node that
+    /// warmed the whole pile would read 159 GiB to prepare for the 85 it runs.
+    pub fn expert_keys_in(&self, range: std::ops::Range<usize>) -> Vec<(String, i64)> {
+        let mut v: Vec<(String, i64)> = self
+            .experts
+            .iter()
+            .filter(|((_, _), r)| {
+                r.layer >= range.start as i64 && r.layer < range.end as i64
+            })
+            .map(|((n, e), _)| (n.clone(), *e))
+            .collect();
+        v.sort();
+        v
+    }
+
     /// Every `(stacked matrix name, expert index)` this pile holds, sorted.
     ///
     /// The index is already built at open, so this is a rename of what is in

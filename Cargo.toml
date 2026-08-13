@@ -124,6 +124,13 @@ inkling-cuda = [
     "burn/cuda",
     "dep:cubecl",
     "cubecl?/cuda",
+    # `burn-cubecl` is here for ONE type: `CubeTensor`, which is what a Burn
+    # tensor on the CUDA backend already is underneath. Naming it is how
+    # `models::inkling::seam` gets at the device buffer behind a Burn tensor
+    # without a round trip through the host -- the routed-expert lane is raw
+    # cubecl and everything around it is Burn, and those two have to be the
+    # same bytes or the residual stream cannot stay on the device.
+    "dep:burn-cubecl",
 ]
 
 # AttnRes (mary::models::k3::attn_res) - the depth-axis mixture and the
