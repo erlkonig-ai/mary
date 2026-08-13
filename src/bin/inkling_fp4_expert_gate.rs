@@ -61,15 +61,15 @@ fn main() -> Result<()> {
     let dir = std::env::args()
         .nth(1)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("models/thinkingmachines-inkling-small-nvfp4"));
+        .unwrap_or_else(|| PathBuf::from("converted/inkling-small-complete.pile"));
 
-    let src = mary::models::inkling::source::Weights::open_ckpt(&dir)?;
+    let src = mary::models::inkling::source::Weights::open(&dir, "inkling")?;
     let b13 = format!("model.llm.layers.{LAYER}.mlp.experts.w13_weight");
     anyhow::ensure!(src.is_nvfp4(&b13), "{b13} is not packed NVFP4");
 
     let w13 = src.expert_packed(&b13, 0)?;
-    let (n, k) = (w13.rows(), w13.cols() * 2);
-    println!("expert 0 of {b13}: N={n}  K={k}  scale2={:e}", w13.scale2());
+    let (n, k) = (w13.rows, w13.cols * 2);
+    println!("expert 0 of {b13}: N={n}  K={k}  scale2={:e}", w13.scale2);
 
     // ---- a real activation ------------------------------------------------
     // Real decoded expert rows, not synthetic values: the quantiser's whole job
@@ -77,15 +77,15 @@ fn main() -> Result<()> {
     // exercise the E4M3 block-scale rounding at all.
     let tokens = 5usize;
     let probe = src.expert_packed(&b13, 7)?;
-    let x = decode(probe.codes(), probe.scales(), tokens, k, probe.scale2());
+    let x = decode(&probe.codes, &probe.scales, tokens, k, probe.scale2);
 
     let client = Rt::client(&Default::default());
 
     // ---- device -----------------------------------------------------------
     let (a_h, a_sc_h, m_pad) = upload_quantized_act(&client, &x, tokens, k);
-    let b_h = client.create_from_slice(w13.codes());
-    let b_sc_h = client.create_from_slice(w13.scales());
-    let out_h = fp4_linear_launch(&client, &a_h, &a_sc_h, &b_h, &b_sc_h, m_pad, k, n, w13.scale2());
+    let b_h = client.create_from_slice(&w13.codes);
+    let b_sc_h = client.create_from_slice(&w13.scales);
+    let out_h = fp4_linear_launch(&client, &a_h, &a_sc_h, &b_h, &b_sc_h, m_pad, k, n, w13.scale2);
     let got = f32::from_bytes(&client.read_one(out_h).expect("read")).to_vec();
     println!("launched fp4_linear: m_pad={m_pad}  {} planes", (n / 8) * (m_pad / MTILE));
 
@@ -94,7 +94,7 @@ fn main() -> Result<()> {
     padded[..tokens * k].copy_from_slice(&x);
     let (a_codes, a_scales) = quantize_act_host(&padded, k);
     let a_deq = decode(&a_codes, &a_scales, tokens, k, 1.0);
-    let b_deq = decode(w13.codes(), w13.scales(), n, k, w13.scale2());
+    let b_deq = decode(&w13.codes, &w13.scales, n, k, w13.scale2);
 
     let mut worst = 0.0f64;
     let mut worst_at = (0usize, 0usize);
@@ -136,7 +136,7 @@ fn main() -> Result<()> {
     let b2name = format!("model.llm.layers.{LAYER}.mlp.experts.w2_weight");
     let w2 = src.expert_packed(&b2name, 0)?;
     let inter = n / 2;
-    anyhow::ensure!(w2.cols() * 2 == inter, "w2 K={} but inter={inter}", w2.cols() * 2);
+    anyhow::ensure!(w2.cols * 2 == inter, "w2 K={} but inter={inter}", w2.cols * 2);
 
     let act_h = gate_up_silu_launch(&client, &out_h_clone(&client, &got, m_pad, n), m_pad, inter);
     let act = f32::from_bytes(&client.read_one(act_h).expect("read")).to_vec();

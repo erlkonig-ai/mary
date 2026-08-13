@@ -50,7 +50,7 @@ fn main() -> Result<()> {
     let dir = std::env::args()
         .nth(1)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("models/thinkingmachines-inkling-small-nvfp4"));
+        .unwrap_or_else(|| PathBuf::from("converted/inkling-small-complete.pile"));
 
     let (m, n) = (MTILE, NTILE);
 
@@ -80,20 +80,19 @@ fn main() -> Result<()> {
     }
 
     // --- real layer-2 expert rows -----------------------------------------
-    let src = mary::models::inkling::source::Weights::open_ckpt(&dir)?;
-    let ck = src
-        .checkpoint()
-        .ok_or_else(|| anyhow::anyhow!("this probe reads the checkpoint directly"))?;
+    let src = mary::models::inkling::source::Weights::open(&dir, "inkling")?;
     let base = format!("model.llm.layers.{LAYER}.mlp.experts.w13_weight");
     if src.is_nvfp4(&base) {
         bail!("{base} is packed NVFP4 -- layer {LAYER} is supposed to be the BF16 one");
     }
-    let e0 = ck.expert_slice_bf16(&base, 0)?;
-    let e7 = ck.expert_slice_bf16(&base, 7)?;
-    let k = e0.shape[1];
+    // VIEWS into the pile's mapping, not copies: 33.6 MB an expert, and this
+    // probe reads 24 rows of them.
+    let e0 = src.expert_bf16(&base, 0)?;
+    let e7 = src.expert_bf16(&base, 7)?;
+    let k = e0.cols;
     println!(
-        "{base}: experts are [{}, {k}] {} -- A = 16 rows of expert 7, B = 8 rows of expert 0",
-        e0.shape[0], e0.dtype
+        "{base}: experts are [{}, {k}] BF16 -- A = 16 rows of expert 7, B = 8 rows of expert 0",
+        e0.rows
     );
 
     // A is 16 rows of one expert and B is 8 rows of another: both operands are

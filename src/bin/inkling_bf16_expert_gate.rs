@@ -101,7 +101,7 @@ fn main() -> Result<()> {
     let ckpt = std::env::args()
         .nth(2)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("models/thinkingmachines-inkling-small-nvfp4"));
+        .unwrap_or_else(|| PathBuf::from("converted/inkling-small-complete.pile"));
 
     let man: serde_json::Value =
         serde_json::from_slice(&std::fs::read(oracle.join("bf16_manifest.json"))?)
@@ -156,7 +156,7 @@ fn main() -> Result<()> {
     anyhow::ensure!(x_f32.len() == tokens * h, "x is {} f32", x_f32.len());
     anyhow::ensure!(x_bits.len() == tokens * h, "x bits are {}", x_bits.len());
 
-    let src = mary::models::inkling::source::Weights::open_ckpt(&ckpt)?;
+    let src = mary::models::inkling::source::Weights::open(&ckpt, "inkling")?;
     let n13 = format!("model.llm.layers.{layer}.mlp.experts.w13_weight");
     let n2 = format!("model.llm.layers.{layer}.mlp.experts.w2_weight");
     anyhow::ensure!(!src.is_nvfp4(&n13), "{n13} is packed NVFP4; layer {layer} should be BF16");
@@ -183,33 +183,33 @@ fn main() -> Result<()> {
         let w_e = if mutate == "expert" { e + 1 } else { e };
         let w13 = src.expert_bf16(&n13, w_e)?;
         let w2 = src.expert_bf16(&n2, w_e)?;
-        anyhow::ensure!(w13.rows() == 2 * inter && w13.cols() == h, "w13 is {}x{}", w13.rows(), w13.cols());
-        anyhow::ensure!(w2.rows() == h && w2.cols() == inter, "w2 is {}x{}", w2.rows(), w2.cols());
+        anyhow::ensure!(w13.rows == 2 * inter && w13.cols == h, "w13 is {}x{}", w13.rows, w13.cols);
+        anyhow::ensure!(w2.rows == h && w2.cols == inter, "w2 is {}x{}", w2.rows, w2.cols);
 
         let w13_h = if mutate == "transpose" {
             // Square, so a transposed w13 loads without complaint and computes
             // nonsense — exactly the class of mistake shape checks cannot see.
-            let src_b = w13.bytes();
+            let src_b = &w13.bytes;
             let mut t = vec![0u8; src_b.len()];
-            for r in 0..w13.rows() {
-                for c in 0..w13.cols() {
-                    let (from, to) = ((r * w13.cols() + c) * 2, (c * w13.rows() + r) * 2);
+            for r in 0..w13.rows {
+                for c in 0..w13.cols {
+                    let (from, to) = ((r * w13.cols + c) * 2, (c * w13.rows + r) * 2);
                     t[to] = src_b[from];
                     t[to + 1] = src_b[from + 1];
                 }
             }
             client.create_from_slice(&t)
         } else {
-            client.create_from_slice(w13.bytes())
+            client.create_from_slice(&w13.bytes)
         };
-        let w2_h = client.create_from_slice(w2.bytes());
+        let w2_h = client.create_from_slice(&w2.bytes);
 
         println!("expert {e}{}:", if w_e != e { format!(" (weights from {w_e})") } else { String::new() });
         if let Some(al) = aliases.as_ref() {
             println!(
                 "  zero-copy binding         : w13 {}, w2 {}",
-                if al.slice(w13.bytes()).is_some() { "aliased" } else { "COPIED (alignment)" },
-                if al.slice(w2.bytes()).is_some() { "aliased" } else { "COPIED (alignment)" },
+                if al.slice(&w13.bytes).is_some() { "aliased" } else { "COPIED (alignment)" },
+                if al.slice(&w2.bytes).is_some() { "aliased" } else { "COPIED (alignment)" },
             );
         }
 

@@ -1,27 +1,27 @@
-//! Where a running Inkling gets its weights.
+//! Where a running Inkling gets its weights: the pile, and nothing else.
 //!
-//! Two backings, one interface: a safetensors checkpoint directory, or a pile.
-//! The forward pass does not branch on which — it asks for a tensor by name or
-//! an expert by (matrix, index) and gets bytes.
+//! There used to be two backings behind one interface — a safetensors
+//! checkpoint directory or a pile — and the checkpoint arm is gone. Everything
+//! comes from the pile: the weights, `config.json`, the chat template, the
+//! tokenizer. A source that could also be a directory of shards is a source
+//! that will be one by accident, and then half the run's provenance is a path
+//! nobody recorded.
+//!
+//! [`crate::models::inkling::load::Checkpoint`] still exists and still reads
+//! safetensors. It is how weights get INTO a pile (`inkling_expert_import`,
+//! `inkling_dense_import`, `inkling_pile_import`) and how the parity gates get
+//! the original bytes to feed a Python oracle. What it is no longer is a thing
+//! a forward pass can be pointed at.
 //!
 //! # Why the residency and the accounting live HERE
 //!
-//! They used to live inside [`Checkpoint`], and they cannot stay there once
-//! there are two sources, for two different reasons.
-//!
-//! The accounting has to be ONE instrument or the A/B is not a comparison. "How
-//! many host f32 bytes did this token cost" answered by two different counters
-//! placed at two different depths is two numbers about two questions. Here both
-//! sources are charged at the same seam — the call the forward actually makes —
-//! so the totals are commensurable by construction.
-//!
-//! The residency cache has to be one implementation for the same reason it
-//! existed at all: it is a property of the CALLER's access pattern (the forward
-//! asks for the same few hundred names every token), not of the storage. What
-//! differs between the sources is how much it buys, and that is a measurement,
-//! not a code path — over a pile a "read" is a hash-map lookup returning a view
-//! of the mapping, so all the cache saves is the widening; over safetensors it
-//! also saves re-parsing a shard header and re-copying out of the mmap.
+//! They used to live inside `Checkpoint`, and they did not follow it back.
+//! Residency is a property of the CALLER's access pattern — the forward asks
+//! for the same few hundred names every token — not of the storage, and the
+//! byte counters answer "what did this ONE pass move", which is a question
+//! about the asking. Over a pile a read is a hash-map lookup returning a view
+//! of the mapping, so what the cache saves is the widening and nothing else;
+//! that is a measurement, and it is [`Weights::io_table`] that reports it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -29,7 +29,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 
-use super::load::{Bf16ExpertRef, Checkpoint, Held, Loaded, PackedExpertRef};
+use super::load::{Held, Loaded};
 use super::pile::{Bf16Slab, PackedSlab, PileSource};
 
 /// What the loader moved on account of one tensor name.
@@ -48,202 +48,62 @@ pub struct NameIo {
     pub nanos: u64,
 }
 
-/// One expert's packed NVFP4 planes, borrowed from whichever source holds them.
-///
-/// Both arms borrow. The checkpoint arm points into a shard's mmap and the pile
-/// arm into the pile's, and each carries the keepalive that makes that sound.
-/// Nothing here copies 12.6 MB so a caller can own it — the caller hands the
-/// bytes to a device and never reads them again.
-pub enum Slab {
-    Ckpt(PackedExpertRef),
-    Pile(PackedSlab),
-}
-
-impl Slab {
-    pub fn codes(&self) -> &[u8] {
-        match self {
-            Slab::Ckpt(r) => r.codes(),
-            Slab::Pile(p) => &p.codes,
-        }
-    }
-
-    pub fn scales(&self) -> &[u8] {
-        match self {
-            Slab::Ckpt(r) => r.scales(),
-            Slab::Pile(p) => &p.scales,
-        }
-    }
-
-    pub fn scale2(&self) -> f32 {
-        match self {
-            Slab::Ckpt(r) => r.scale2,
-            Slab::Pile(p) => p.scale2,
-        }
-    }
-
-    /// Output rows of this expert's matrix.
-    pub fn rows(&self) -> usize {
-        match self {
-            Slab::Ckpt(r) => r.rows,
-            Slab::Pile(p) => p.rows,
-        }
-    }
-
-    /// Packed bytes per row; the logical width is `2 * cols`.
-    pub fn cols(&self) -> usize {
-        match self {
-            Slab::Ckpt(r) => r.cols,
-            Slab::Pile(p) => p.cols,
-        }
-    }
-
-    /// Storage bytes this slab spans — codes plus block scales.
-    pub fn bytes(&self) -> usize {
-        self.codes().len() + self.scales().len()
-    }
-}
-
-/// One expert's BF16 plane, borrowed from whichever source holds it.
-///
-/// [`Slab`] with the scales taken out. Both arms borrow, for the same reason
-/// and with the same keepalive discipline: layer 2's `w13` is 33.6 MB per
-/// expert and 8.6 GiB per layer, and the caller hands the bytes to a device and
-/// never reads them again.
-pub enum BfSlab {
-    Ckpt(Bf16ExpertRef),
-    Pile(Bf16Slab),
-}
-
-impl BfSlab {
-    /// This expert's `[rows, cols]` little-endian BF16 bytes.
-    pub fn bytes(&self) -> &[u8] {
-        match self {
-            BfSlab::Ckpt(r) => r.bytes(),
-            BfSlab::Pile(p) => &p.bytes,
-        }
-    }
-
-    /// Output rows of this expert's matrix.
-    pub fn rows(&self) -> usize {
-        match self {
-            BfSlab::Ckpt(r) => r.rows,
-            BfSlab::Pile(p) => p.rows,
-        }
-    }
-
-    /// Input columns.
-    pub fn cols(&self) -> usize {
-        match self {
-            BfSlab::Ckpt(r) => r.cols,
-            BfSlab::Pile(p) => p.cols,
-        }
-    }
-}
-
-/// The two backings.
-pub enum Src {
-    Ckpt(Checkpoint),
-    Pile(PileSource),
-}
-
-/// A model's weights, from either backing, with one residency cache and one set
-/// of counters over both.
+/// A model's weights out of a pile, with a residency cache and byte counters.
 pub struct Weights {
-    src: Src,
+    src: PileSource,
     resident: Mutex<HashMap<String, Held>>,
     io: Mutex<BTreeMap<String, NameIo>>,
 }
 
 impl Weights {
-    /// Weights out of a safetensors checkpoint directory.
-    pub fn open_ckpt(dir: impl AsRef<std::path::Path>) -> Result<Self> {
-        Ok(Self::wrap(Src::Ckpt(Checkpoint::open(dir)?)))
-    }
-
-    /// Weights out of a pile, on the named branch.
-    pub fn open_pile(path: impl AsRef<std::path::Path>, branch: &str) -> Result<Self> {
-        Ok(Self::wrap(Src::Pile(PileSource::open(path.as_ref(), branch)?)))
-    }
-
+    /// Weights out of a pile, on the named branch. The only constructor there
+    /// is.
+    ///
     /// Residency is not a choice. `INK_RESIDENT` used to default it OFF,
     /// because pinning tens of gigabytes on a 119 GiB box against a 159 GiB
     /// model was a deliberate call — and that framing is what a second node
     /// retires. A node holds ITS share, which fits; a node that streams is a
     /// node reading the SSD in the middle of a decode step, which is the one
     /// thing this runtime must never do.
-    fn wrap(src: Src) -> Self {
-        Weights {
-            src,
+    pub fn open(path: impl AsRef<std::path::Path>, branch: &str) -> Result<Self> {
+        Ok(Weights {
+            src: PileSource::open(path.as_ref(), branch)?,
             resident: Mutex::new(HashMap::new()),
             io: Mutex::new(BTreeMap::new()),
-        }
-    }
-
-    /// Which backing this is, for a banner.
-    pub fn kind(&self) -> &'static str {
-        match self.src {
-            Src::Ckpt(_) => "safetensors checkpoint",
-            Src::Pile(_) => "pile",
-        }
-    }
-
-    /// The checkpoint underneath, when there is one.
-    pub fn checkpoint(&self) -> Option<&Checkpoint> {
-        match &self.src {
-            Src::Ckpt(c) => Some(c),
-            Src::Pile(_) => None,
-        }
+        })
     }
 
     /// How many tensors this source located.
     pub fn len(&self) -> usize {
-        match &self.src {
-            Src::Ckpt(c) => c.len(),
-            Src::Pile(p) => p.len(),
-        }
+        self.src.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// What this source holds, in its own unit — which is NOT the same unit on
-    /// both sides, so it says which.
-    ///
-    /// The checkpoint's index names stacked matrices: one name for 256 experts.
-    /// The pile names each expert leaf, because that is the granularity a layer
-    /// split partitions and a deduplicating store addresses.
+    /// What the pile holds, in ITS unit — which is not the checkpoint's, and
+    /// saying so is the point. The safetensors index named stacked matrices,
+    /// one name for 256 experts; the pile names each expert leaf, because that
+    /// is the granularity a layer split partitions and a deduplicating store
+    /// addresses.
     pub fn inventory(&self) -> String {
-        match &self.src {
-            Src::Ckpt(c) => format!("tensors    : {} index entries (expert stacks unsplit)", c.len()),
-            Src::Pile(p) => format!(
-                "tensors    : {} dense leaves + {} expert leaves",
-                p.dense_len(),
-                p.expert_len()
-            ),
-        }
+        format!(
+            "tensors    : {} dense leaves + {} expert leaves",
+            self.src.dense_len(),
+            self.src.expert_len()
+        )
     }
 
     // ---- reading ---------------------------------------------------------
 
-    /// One dense tensor by checkpoint name, widened to f32.
+    /// One dense tensor by name, widened to f32.
     pub fn tensor(&self, name: &str) -> Result<Loaded> {
         let t0 = Instant::now();
-        let out = match &self.src {
-            Src::Ckpt(c) => {
-                let stored = c.span(name)?.len as u64;
-                let l = c.tensor(name)?;
-                self.note(name, stored, (l.data.len() * 4) as u64, t0);
-                l
-            }
-            Src::Pile(p) => {
-                let leaf = p.leaf(name)?;
-                let data = leaf.to_f32();
-                self.note(name, leaf.bytes.len() as u64, (data.len() * 4) as u64, t0);
-                Loaded { data, shape: leaf.shape() }
-            }
-        };
-        Ok(out)
+        let leaf = self.src.leaf(name)?;
+        let data = leaf.to_f32();
+        self.note(name, leaf.bytes.len() as u64, (data.len() * 4) as u64, t0);
+        Ok(Loaded { data, shape: leaf.shape() })
     }
 
     /// One dense weight — widened once and then KEPT, when residency is on.
@@ -304,21 +164,15 @@ impl Weights {
     /// layer 2 is BF16. A lane that assumes NVFP4 everywhere dies on exactly one
     /// layer in forty, which is the kind of thing a sampled gate never sees.
     pub fn is_nvfp4(&self, base: &str) -> bool {
-        match &self.src {
-            Src::Ckpt(c) => c.is_nvfp4(base),
-            Src::Pile(p) => p.is_nvfp4(base),
-        }
+        self.src.is_nvfp4(base)
     }
 
     /// One expert's packed planes, borrowed, undecoded.
-    pub fn expert_packed(&self, base: &str, e: usize) -> Result<Slab> {
+    pub fn expert_packed(&self, base: &str, e: usize) -> Result<PackedSlab> {
         let t0 = Instant::now();
-        let s = match &self.src {
-            Src::Ckpt(c) => Slab::Ckpt(c.expert_packed_ref(base, e)?),
-            Src::Pile(p) => Slab::Pile(p.expert_packed(base, e)?),
-        };
+        let s = self.src.expert_packed(base, e)?;
         // Packed: nothing is widened, so host bytes are storage bytes.
-        let moved = s.bytes() as u64;
+        let moved = (s.codes.len() + s.scales.len()) as u64;
         self.note(base, moved, moved, t0);
         Ok(s)
     }
@@ -328,96 +182,71 @@ impl Weights {
     /// The counterpart of [`Weights::expert_packed`] for the one layer that was
     /// never quantised. Charged through the same counters at the same seam, so
     /// a per-token byte total covers both formats in one unit.
-    pub fn expert_bf16(&self, base: &str, e: usize) -> Result<BfSlab> {
+    pub fn expert_bf16(&self, base: &str, e: usize) -> Result<Bf16Slab> {
         let t0 = Instant::now();
-        let s = match &self.src {
-            Src::Ckpt(c) => BfSlab::Ckpt(c.expert_bf16_ref(base, e)?),
-            Src::Pile(p) => BfSlab::Pile(p.expert_bf16(base, e)?),
-        };
+        let s = self.src.expert_bf16(base, e)?;
         // Stored BF16, handed on as stored BF16: host bytes ARE storage bytes,
         // and that identity is the whole point of this lane.
-        let moved = s.bytes().len() as u64;
+        let moved = s.bytes.len() as u64;
         self.note(base, moved, moved, t0);
         Ok(s)
     }
 
     /// Every host mapping this source reads through, as `(base, len, keepalive)`.
     ///
-    /// What a zero-copy lane registers with the GPU, ONCE. The checkpoint has
-    /// nine (its shards); a pile has one, because a pile IS one file — which is
-    /// the whole of the difference between the two aliasing implementations this
-    /// replaced.
+    /// What a zero-copy lane registers with the GPU, ONCE — and for a pile that
+    /// is exactly one registration, because a pile IS one file. The checkpoint
+    /// reader had nine, one per shard, and the aliasing seam had to be written
+    /// to span them; that generality is what went away with it.
     pub fn mappings(&self) -> Result<Vec<(usize, usize, Arc<dyn std::any::Any + Send + Sync>)>> {
-        match &self.src {
-            Src::Ckpt(c) => c.mappings(),
-            Src::Pile(p) => p.mappings(),
-        }
+        self.src.mappings()
     }
 
     // ---- what the source SAYS about itself --------------------------------
 
-    /// One of the checkpoint's JSON sidecars, by file name.
+    /// One of the model's JSON sidecars, by the file name it had in the
+    /// checkpoint it was imported from.
     ///
     /// The whole reason this is on `Weights` and not on the caller: `config.json`
-    /// is not a weight, and for as long as reading it meant reading the
-    /// checkpoint DIRECTORY, `INK_PILE` moved the 159 GiB and left the run
-    /// depending on the 40 KB. A pile that cannot answer this is not
-    /// authoritative, it is merely large.
+    /// is not a weight, and for as long as reading it meant reading a checkpoint
+    /// DIRECTORY, a pile held the 159 GiB and the run still depended on the 40
+    /// KB. A pile that cannot answer this is not authoritative, it is merely
+    /// large.
     ///
-    /// The pile arm answers from FACTS — one entity per JSON scalar, see
+    /// Answered from FACTS — one entity per JSON scalar, see
     /// [`crate::jsonfacts`] — not from a stored copy of the file, so
     /// `text_config.hidden_size` is reachable as a query and the document
     /// reconstructed here is the same thing read a different way.
     pub fn document(&self, name: &str) -> Result<serde_json::Value> {
-        match &self.src {
-            Src::Ckpt(c) => {
-                let path = c.dir().join(name);
-                let text = std::fs::read_to_string(&path)
-                    .map_err(|e| anyhow::anyhow!("read {path:?}: {e}"))?;
-                serde_json::from_str(&text)
-                    .map_err(|e| anyhow::anyhow!("parse {path:?}: {e}"))
-            }
-            Src::Pile(p) => crate::jsonfacts::load_document(p.facts(), p.reader(), name)
-                .map_err(|e| anyhow::anyhow!("{e}")),
-        }
+        crate::jsonfacts::load_document(self.src.facts(), self.src.reader(), name)
+            .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
     /// A sidecar that is TEXT rather than JSON — the chat template.
     ///
-    /// In a pile it is a document whose root is a JSON string, so it goes
-    /// through exactly the same storage and the same query as the others; there
-    /// is no second mechanism for "files that are not JSON".
+    /// It is a document whose root is a JSON string, so it goes through exactly
+    /// the same storage and the same query as the others; there is no second
+    /// mechanism for "files that are not JSON".
     pub fn text_document(&self, name: &str) -> Result<String> {
-        match &self.src {
-            Src::Ckpt(c) => {
-                let path = c.dir().join(name);
-                std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("read {path:?}: {e}"))
-            }
-            Src::Pile(_) => match self.document(name)? {
-                serde_json::Value::String(s) => Ok(s),
-                other => anyhow::bail!(
-                    "{name} is stored as {} rather than a string",
-                    match other {
-                        serde_json::Value::Object(_) => "an object",
-                        serde_json::Value::Array(_) => "an array",
-                        _ => "a scalar",
-                    }
-                ),
-            },
+        match self.document(name)? {
+            serde_json::Value::String(s) => Ok(s),
+            other => anyhow::bail!(
+                "{name} is stored as {} rather than a string",
+                match other {
+                    serde_json::Value::Object(_) => "an object",
+                    serde_json::Value::Array(_) => "an array",
+                    _ => "a scalar",
+                }
+            ),
         }
     }
 
-    /// Every document this source can answer for. Empty for a checkpoint, whose
-    /// directory is not enumerated — the point of the list is to say what a
-    /// PILE carries.
+    /// Every document this source can answer for.
     pub fn documents(&self) -> Vec<String> {
-        match &self.src {
-            Src::Ckpt(_) => Vec::new(),
-            Src::Pile(p) => crate::jsonfacts::documents(p.facts(), p.reader())
-                .into_iter()
-                .map(|(n, _)| n)
-                .collect(),
-        }
+        crate::jsonfacts::documents(self.src.facts(), self.src.reader())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect()
     }
 
     /// Visit EVERY byte range this source can hand to a device, in place.
@@ -433,60 +262,26 @@ impl Weights {
     /// mapping and collecting them would either copy the model or fight the
     /// borrow checker for nothing.
     ///
-    /// Driven by what the SOURCE contains — `expert_keys` for a pile, the
-    /// safetensors index for a checkpoint — never by what some layer range
-    /// implies. An audit that enumerates the expected set cannot see a leaf that
-    /// is there but unreachable, and cannot see one that is reachable but
-    /// unexpected.
+    /// Driven by what the SOURCE contains — `expert_keys` — never by what some
+    /// layer range implies. An audit that enumerates the expected set cannot see
+    /// a leaf that is there but unreachable, and cannot see one that is
+    /// reachable but unexpected.
     pub fn for_each_bindable(
         &self,
         mut f: impl FnMut(&str, &'static str, &[u8]) -> Result<()>,
     ) -> Result<()> {
-        match &self.src {
-            Src::Pile(p) => {
-                for name in p.names() {
-                    let leaf = p.leaf(&name)?;
-                    f(&name, "dense", &leaf.bytes)?;
-                }
-                for (name, e) in p.expert_keys() {
-                    if p.expert_is_nvfp4(&name, e) == Some(true) {
-                        let q = p.expert_packed(&name, e as usize)?;
-                        f(&name, "codes", &q.codes)?;
-                        f(&name, "scales", &q.scales)?;
-                    } else {
-                        let l = p.expert_bf16(&name, e as usize)?;
-                        f(&name, "expert-bf16", &l.bytes)?;
-                    }
-                }
-            }
-            Src::Ckpt(c) => {
-                let names = c.names();
-                for name in names.iter().filter(|n| !n.contains(".experts.")) {
-                    let span = c.span(name)?;
-                    f(name, "dense", span.bytes())?;
-                }
-                let mut bases: Vec<&String> = names
-                    .iter()
-                    .filter(|n| n.ends_with(".experts.w13_weight") || n.ends_with(".experts.w2_weight"))
-                    .collect();
-                bases.sort();
-                for base in bases {
-                    let count = c.expert_count(base)?;
-                    for e in 0..count {
-                        if c.is_nvfp4(base) {
-                            let q = c.expert_packed_ref(base, e)?;
-                            f(base, "codes", q.codes())?;
-                            f(base, "scales", q.scales())?;
-                        } else {
-                            // BF16 stacks have no borrowing accessor — the
-                            // checkpoint arm copies them out. Reported as such
-                            // rather than skipped: a plane the audit cannot see
-                            // is not a plane that is fine.
-                            let raw = c.expert_slice_bf16(base, e)?;
-                            f(base, "expert-bf16-copied", &raw.bytes)?;
-                        }
-                    }
-                }
+        for name in self.src.names() {
+            let leaf = self.src.leaf(&name)?;
+            f(&name, "dense", &leaf.bytes)?;
+        }
+        for (name, e) in self.src.expert_keys() {
+            if self.src.expert_is_nvfp4(&name, e) == Some(true) {
+                let q = self.src.expert_packed(&name, e as usize)?;
+                f(&name, "codes", &q.codes)?;
+                f(&name, "scales", &q.scales)?;
+            } else {
+                let l = self.src.expert_bf16(&name, e as usize)?;
+                f(&name, "expert-bf16", &l.bytes)?;
             }
         }
         Ok(())

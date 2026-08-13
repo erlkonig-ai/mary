@@ -28,9 +28,9 @@
 //! 1 GbE cannot carry it.
 //!
 //!   # tail, on the second box
-//!   INK_LAYERS=20:42 INK_PIPE=tail:0.0.0.0:7654 inkling_forward <ckpt> <ids> <out>
+//!   INK_LAYERS=20:42 INK_PIPE=tail:0.0.0.0:7654 inkling_forward <pile> <ids> <out>
 //!   # head, on the first
-//!   INK_LAYERS=0:20  INK_PIPE=head:<tail-host>:7654 inkling_forward <ckpt> <ids> <out>
+//!   INK_LAYERS=0:20  INK_PIPE=head:<tail-host>:7654 inkling_forward <pile> <ids> <out>
 //!
 //! # One lane, all the way down
 //!
@@ -53,20 +53,21 @@
 //!
 //! # Where the weights come from
 //!
-//! `<ckpt>` is a safetensors checkpoint directory. `INK_PILE=<path>` swaps the
-//! source for a pile on branch `INK_PILE_BRANCH` (default `inkling`), and it
-//! swaps ALL of it: the weights and `config.json` both come from whichever
-//! source is named, so a pile-backed run reads nothing from the directory. It
-//! used to read the config there regardless, which meant `INK_PILE` moved 159
-//! GiB out of the checkpoint and left the run depending on the 40 KB still in
-//! it. One environment variable is the whole A/B, which is the point:
-//! everything below this line is the same code either way.
+//! The pile, positionally, on branch `INK_PILE_BRANCH` (default `inkling`). All
+//! of it: the weights AND `config.json` AND the chat template, so a run reads
+//! nothing off a checkpoint directory and there is no path it could.
 //!
-//! The argument is still a path so a checkpoint-backed run has somewhere to
-//! read from; with `INK_PILE` set it is only a label, and `--` will do.
+//! It used to be the other way round — a checkpoint directory positionally,
+//! with `INK_PILE=<path>` as an opt-in swap — and by the end that argument was
+//! vestigial theatre: the last runs passed `--` for it because the pile
+//! answered for everything. An opt-in that every real invocation opts into is
+//! a default written backwards, and a source that CAN be a directory of shards
+//! is one that will be by accident. `mary` already made this move for qwen3tts
+//! (8475167) and for the runtime at large (906cbc9, "safetensors gated behind
+//! `import`, runtime is pile-only"); Inkling is the last holdout.
 //!
 //!   cargo run --release --features inkling-cuda,cuda-backend,import \
-//!       --bin inkling_forward -- <ckpt> <ids.bin> <out.bin>
+//!       --bin inkling_forward -- <pile> <ids.bin> <out.bin>
 
 use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
@@ -455,14 +456,14 @@ fn routed_experts_fp4(
         let x_h = client.create_from_slice(f32::as_bytes(&xp));
         let (a, asc) = quantize_nvfp4(client, &x_h, m_pad, h);
 
-        let (b, bsc) = (bind(w13.codes()), bind(w13.scales()));
-        let both = fp4_linear_launch(client, &a, &asc, &b, &bsc, m_pad, h, 2 * inter, w13.scale2());
+        let (b, bsc) = (bind(&w13.codes), bind(&w13.scales));
+        let both = fp4_linear_launch(client, &a, &asc, &b, &bsc, m_pad, h, 2 * inter, w13.scale2);
 
         let act_h = gate_up_silu_launch(client, &both, m_pad, inter);
         let (a2, asc2) = quantize_nvfp4(client, &act_h, m_pad, inter);
 
-        let (b2, bsc2) = (bind(w2.codes()), bind(w2.scales()));
-        let y_h = fp4_linear_launch(client, &a2, &asc2, &b2, &bsc2, m_pad, inter, h, w2.scale2());
+        let (b2, bsc2) = (bind(&w2.codes), bind(&w2.scales));
+        let y_h = fp4_linear_launch(client, &a2, &asc2, &b2, &bsc2, m_pad, inter, h, w2.scale2);
         pending.push((toks, y_h));
         host.1 += t_w.elapsed().as_secs_f64();
     }
@@ -539,14 +540,14 @@ fn routed_experts_bf16(
         }
 
         let (a, m_pad) = upload_bf16_act(client, &x, m, h);
-        let b = bind(w13.bytes());
+        let b = bind(&w13.bytes);
         let both = bf16_linear_launch(client, &a, &b, m_pad, h, 2 * inter);
 
         // The intermediate never leaves the device and never becomes f32 on the
         // host: `gate_up_silu` writes BF16 straight into the second MMA's A
         // operand.
         let act = gate_up_silu_bf16_launch(client, &both, m_pad, inter);
-        let b2 = bind(w2.bytes());
+        let b2 = bind(&w2.bytes);
         let y_h = bf16_linear_launch(client, &act, &b2, m_pad, inter, h);
         pending.push((toks, y_h));
         host.1 += t_w.elapsed().as_secs_f64();
@@ -566,27 +567,25 @@ fn routed_experts_bf16(
 }
 
 fn main() -> Result<()> {
-    let ckpt = std::env::args().nth(1).map(PathBuf::from).context("usage: <ckpt> <ids> <out>")?;
-    let ids_path = std::env::args().nth(2).map(PathBuf::from).context("usage: <ckpt> <ids> <out>")?;
-    let out_path = std::env::args().nth(3).map(PathBuf::from).context("usage: <ckpt> <ids> <out>")?;
+    let pile_path = std::env::args().nth(1).map(PathBuf::from).context("usage: <pile> <ids> <out>")?;
+    let ids_path = std::env::args().nth(2).map(PathBuf::from).context("usage: <pile> <ids> <out>")?;
+    let out_path = std::env::args().nth(3).map(PathBuf::from).context("usage: <pile> <ids> <out>")?;
 
-    // The one line that decides where the weights come from. `INK_PILE` swaps
-    // the source; nothing downstream of here asks which it was.
-    let pile_path = std::env::var("INK_PILE").ok();
+    // The weights, and everything else the run needs to know about the model.
+    // There is no second arm: no `INK_PILE` to opt into, and no checkpoint
+    // directory to fall back to.
     let pile_branch = std::env::var("INK_PILE_BRANCH").unwrap_or_else(|_| "inkling".to_string());
     let t_open = Instant::now();
-    let cp = match &pile_path {
-        Some(p) => Weights::open_pile(p, &pile_branch)?,
-        None => Weights::open_ckpt(&ckpt)?,
-    };
+    let cp = Weights::open(&pile_path, &pile_branch)
+        .with_context(|| format!("opening {} on branch {pile_branch}", pile_path.display()))?;
     let open_secs = t_open.elapsed().as_secs_f64();
 
-    // …and the config comes from the SAME source. It used to come from the
-    // checkpoint directory unconditionally, which meant `INK_PILE` moved 159 GiB
-    // out of the directory and left the run depending on the 40 KB still in it:
-    // a pile that cannot answer this is not authoritative, only large. In a pile
-    // the config is FACTS (one entity per JSON scalar, `mary::jsonfacts`), so
-    // this is a query, not a stored file being read back.
+    // …and the config comes from the SAME source. It used to come from a
+    // checkpoint directory unconditionally, which meant the pile could hold 159
+    // GiB and the run still depended on the 40 KB beside it: a pile that cannot
+    // answer this is not authoritative, only large. In a pile the config is
+    // FACTS (one entity per JSON scalar, `mary::jsonfacts`), so this is a query,
+    // not a stored file being read back.
     //
     // `INK_CONFIG=<file>` overrides it, LOUDLY, for one case: a pile written
     // before the sidecars were facts. That pile still holds every weight and is
@@ -601,9 +600,9 @@ fn main() -> Result<()> {
         None => cp
             .document("config.json")
             .context(
-                "the weight source carries no config.json. For a pile, ingest \
-                 the checkpoint's sidecars as facts (inkling_meta_gate <ckpt> \
-                 <pile>), or point INK_CONFIG at the file to run without them",
+                "this pile carries no config.json. Ingest the checkpoint's \
+                 sidecars as facts (inkling_meta_gate <ckpt> <pile>), or point \
+                 INK_CONFIG at the file to run without them",
             )?
             .to_string(),
     };
@@ -673,18 +672,13 @@ fn main() -> Result<()> {
     println!(
         "  config     : {}",
         match &cfg_source {
-            Some(p) => format!("INK_CONFIG={p}  (OVERRIDE -- the source was not asked)"),
-            None => format!(
-                "config.json from the {} ({})",
-                cp.kind(),
-                pile_path.as_deref().unwrap_or(&ckpt.display().to_string())
-            ),
+            Some(p) => format!("INK_CONFIG={p}  (OVERRIDE -- the pile was not asked)"),
+            None => format!("config.json from the pile ({})", pile_path.display()),
         }
     );
     println!(
-        "  weights    : {} {}  (index built in {open_secs:.1}s)",
-        cp.kind(),
-        pile_path.as_deref().unwrap_or(&ckpt.display().to_string()),
+        "  weights    : pile {}  (index built in {open_secs:.1}s)",
+        pile_path.display(),
     );
     println!("  tokens     : {n}  {ids:?}");
     println!("  layers     : {}  hidden {h}  experts {}+{} shared",
@@ -699,11 +693,11 @@ fn main() -> Result<()> {
             _ => "  whole stack on one machine",
         }
     );
-    // Not the same unit on both sides, and saying so is the point: the
-    // checkpoint names 1 360 tensors of which the expert ones are STACKS of
-    // 256, the pile names each expert leaf on its own — 968 dense + 20 480
-    // experts. Same model, two granularities, and the pile's is the one a
-    // layer split can partition.
+    // 968 dense leaves + 20 480 expert leaves. The safetensors index named
+    // 1 360 tensors for the same model, because its expert entries are STACKS
+    // of 256; the pile names each expert on its own, and that is the
+    // granularity a layer split can partition and a deduplicating store can
+    // address.
     println!("  {}", cp.inventory());
 
     // How many tokens to generate past the prompt. 0 reproduces the original

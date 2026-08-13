@@ -11,19 +11,21 @@
 //! 4-byte rule — so "every plane aliases" here and "every bind aliased" in a
 //! forward are statements about one function.
 //!
-//! # What the two sources do differently, and why it is the DATA
+//! # Why the layout is the DATA
 //!
-//! safetensors packs tensors back to back with no padding, so where a plane
-//! lands is whatever the sum of the preceding tensors' lengths happens to be.
-//! A pile does not: a V3 record's data begins at `record_start + 256` with
+//! safetensors packed tensors back to back with no padding, so where a plane
+//! landed was whatever the sum of the preceding tensors' lengths happened to
+//! be. A pile does not: a V3 record's data begins at `record_start + 256` with
 //! every record a 256-byte multiple, and a tensor blob's header is exactly 256
 //! wide, so a leaf's payload is at an absolutely 256-aligned file offset —
 //! by construction, for every leaf, forever.
 //!
-//! That is the whole of the difference. Same model, same bytes, same kernel;
-//! one layout can alias and the other cannot.
+//! That was the whole of the difference, and the checkpoint side of it is now
+//! history: the runtime loads from a pile and nothing else, so this gate does
+//! too. What keeps it falsifiable is `--mutate N`, not the comparison it used
+//! to be able to run.
 //!
-//!   inkling_align_gate <pile | ckpt-dir> [branch] [--mutate N] [--limit N]
+//!   inkling_align_gate <pile> [branch] [--mutate N] [--limit N]
 //!
 //! `--mutate N` shifts every plane N bytes forward before classifying it. It
 //! exists so this gate can be seen to FAIL: a check that has never failed is
@@ -88,7 +90,7 @@ impl Tally {
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let path = args.next().map(PathBuf::from).context(
-        "usage: inkling_align_gate <pile | ckpt-dir> [branch] [--mutate N] [--limit N]",
+        "usage: inkling_align_gate <pile> [branch] [--mutate N] [--limit N]",
     )?;
     let mut branch = "inkling".to_string();
     let (mut mutate, mut limit) = (0usize, usize::MAX);
@@ -100,15 +102,10 @@ fn main() -> Result<()> {
         }
     }
 
-    let is_pile = path.extension().map(|e| e == "pile").unwrap_or(false);
     let t0 = std::time::Instant::now();
-    let src = if is_pile {
-        Weights::open_pile(&path, &branch)?
-    } else {
-        Weights::open_ckpt(&path)?
-    };
+    let src = Weights::open(&path, &branch)?;
     println!("=== alignment gate ===");
-    println!("  source     : {} {}", src.kind(), path.display());
+    println!("  source     : pile {} on {branch}", path.display());
     println!("  {}", src.inventory());
     println!("  index built in {:.1}s", t0.elapsed().as_secs_f64());
 
