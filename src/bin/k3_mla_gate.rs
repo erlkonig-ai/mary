@@ -4,7 +4,8 @@
 //!
 //! # What this gate is comparing against
 //!
-//! `./k3-oracle/` holds two `.npz` bundles produced by driving
+//! The oracle directory (`--vectors`, else `$MARY_MODELS/k3-oracle`) holds two
+//! `.npz` bundles produced by driving
 //! `modeling_kimi_linear.py`'s own `KimiLinearModel.forward` over a real
 //! 13-layer prefix of the checkpoint. Both files' sha256 are pinned below and
 //! re-checked on every run: a gate that reads whatever happens to be at a path
@@ -1349,16 +1350,29 @@ fn sha256_file(p: &Path) -> String {
 }
 
 fn arg(name: &str, default: &str) -> String {
+    arg_opt(name).unwrap_or_else(|| default.to_string())
+}
+
+/// The optional form of [`arg`]: absent means "not given", which is not the
+/// same as a guessed default. Model paths use this one.
+fn arg_opt(name: &str) -> Option<String> {
     let args: Vec<String> = std::env::args().collect();
     args.iter()
         .position(|a| a == name)
         .and_then(|i| args.get(i + 1).cloned())
-        .unwrap_or_else(|| default.to_string())
 }
 
 fn main() {
-    let ckpt_dir = PathBuf::from(arg("--ckpt", "./kimi-k3"));
-    let vec_dir = PathBuf::from(arg("--vectors", "./k3-oracle"));
+    let ckpt_dir = mary::paths::model(arg_opt("--ckpt").as_deref(), "kimi-k3")
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        });
+    let vec_dir = mary::paths::model(arg_opt("--vectors").as_deref(), "k3-oracle")
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        });
     let json_out = arg("--json", "");
     let t_start = Instant::now();
     let mut g = Gate::default();

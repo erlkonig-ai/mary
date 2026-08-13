@@ -60,7 +60,6 @@ use std::path::Path;
 use std::time::Instant;
 
 const GOLD: &str = "/tmp/mary-personaplex/golden";
-const DEFAULT_PILE: &str = "models/personaplex.pile";
 const SPM_MODEL: &str = "/tmp/personaplex_scratch/ckpt/tokenizer_spm_32k_3.model";
 const OUT_DIR: &str = "/tmp/mary-personaplex";
 
@@ -143,7 +142,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut fmt = WeightFmt::F16; // default to the exact-numerics stack for a clean read
     let mut temp: f32 = 0.0;
-    let mut pile = DEFAULT_PILE.to_string();
+    let mut pile: Option<String> = None;
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         if a == "--temp" {
@@ -152,9 +151,16 @@ fn main() {
         }
         match WeightFmt::parse(a) {
             Some(f) => fmt = f,
-            None => pile = a.clone(),
+            None => pile = Some(a.clone()),
         }
     }
+    let pile = mary::paths::model(pile.as_deref(), "personaplex.pile")
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        })
+        .to_string_lossy()
+        .into_owned();
     let sampling = temp > 0.0;
     std::fs::create_dir_all(OUT_DIR).ok();
 

@@ -65,10 +65,13 @@ const DUMP: usize = 8;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let pile = args
-        .get(1)
-        .cloned()
-        .unwrap_or_else(|| "models/personaplex_q4.pile".to_string());
+    let pile = mary::paths::model(args.get(1).map(String::as_str), "personaplex_q4.pile")
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        })
+        .to_string_lossy()
+        .into_owned();
     let steps: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8);
     let out = args.get(3).cloned().unwrap_or_else(|| "xdev.bin".to_string());
     let fmt = match args.get(4).map(|s| s.as_str()) {

@@ -41,7 +41,6 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::Instant;
 
-const PILE: &str = "models/qwen3tts.pile";
 const REF_WAV: &str = "ref_voice.wav";
 // Transcript of `ref_voice.wav` — set to match your reference clip.
 const REF_TEXT: &str = "The tide rolls in across the flat sand, and the evening light settles slowly over the harbor as the last boats come home.";
@@ -69,9 +68,13 @@ fn run<B: Backend>(args: &Args) {
     mary::models::qwen3tts::cpu::set_interactive_qos();
     let dev: B::Device = Default::default();
     let t0 = Instant::now();
-    let pile = std::env::var("QWEN3TTS_PILE").unwrap_or_else(|_| PILE.to_string());
-    let loader = mary::persist::load_aliased_loader_from_pile(Path::new(&pile), "talker_f16")
-        .unwrap_or_else(|e| panic!("load qwen3tts pile {pile}: {e:?}"));
+    let pile = mary::paths::model(std::env::var("QWEN3TTS_PILE").ok().as_deref(), "qwen3tts.pile")
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        });
+    let loader = mary::persist::load_aliased_loader_from_pile(&pile, "talker_f16")
+        .unwrap_or_else(|e| panic!("load qwen3tts pile {}: {e:?}", pile.display()));
     let talker = Talker::<B>::load(&loader, &dev);
     let predictor = CodePredictor::load(&loader);
     let spk_enc = SpeakerEncoder::<B>::load(&loader, &dev);

@@ -65,7 +65,6 @@ use std::time::Instant;
 type B = burn_ndarray::NdArray<f32>;
 
 const GOLD: &str = "/tmp/mary-personaplex/golden";
-const DEFAULT_PILE: &str = "models/personaplex.pile";
 const GATE: f64 = 0.99999;
 
 fn golden_f32(name: &str) -> (Vec<f32>, Vec<usize>) {
@@ -1090,13 +1089,19 @@ fn main() {
         }
         _ => {}
     }
-    let pile = args.get(2).map(String::as_str).unwrap_or(DEFAULT_PILE);
+    let pile = mary::paths::model(args.get(2).map(String::as_str), "personaplex.pile")
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        })
+        .to_string_lossy()
+        .into_owned();
     match sub {
-        "temporal" => temporal_gate(pile),
-        "depth" => depth_gate(pile),
-        "e2e" => e2e_gate(pile),
-        "pipeline" => pipeline_gate(pile),
-        "prompt" => prompt_gate(pile),
+        "temporal" => temporal_gate(&pile),
+        "depth" => depth_gate(&pile),
+        "e2e" => e2e_gate(&pile),
+        "pipeline" => pipeline_gate(&pile),
+        "prompt" => prompt_gate(&pile),
         _ => {
             eprintln!("usage: personaplex_probe <temporal|depth|e2e|pipeline|prompt> [pile-path]");
             eprintln!("       personaplex_probe ownprompt <voice.pt> [system text]");

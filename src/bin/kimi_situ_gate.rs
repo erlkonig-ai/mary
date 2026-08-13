@@ -38,9 +38,9 @@
 //!   `cargo run --release --features kimi-k3-cuda --bin kimi_situ_gate`
 //! CPU + wgpu lanes only:
 //!   `cargo run --release --features kimi-k3 --bin kimi_situ_gate`
-//! The oracle directory defaults to `./k3-situ/oracle_npy` (the
-//! `.npz` members unpacked into individual `.npy` files); override with argv[1]
-//! or `SITU_ORACLE_DIR`.
+//! The oracle directory (the `.npz` members unpacked into individual `.npy`
+//! files) comes from argv[1], or `SITU_ORACLE_DIR`, or
+//! `$MARY_MODELS/k3-situ/oracle_npy`. There is no baked-in path.
 
 use burn::prelude::*;
 use burn::tensor::activation::sigmoid;
@@ -48,7 +48,7 @@ use mary::models::k3::Situ;
 use std::collections::HashMap;
 use std::fs;
 use std::panic::{self, AssertUnwindSafe};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Tolerance
@@ -693,11 +693,12 @@ where
 }
 
 fn main() {
-    let dir: PathBuf = std::env::args()
-        .nth(1)
-        .or_else(|| std::env::var("SITU_ORACLE_DIR").ok())
-        .unwrap_or_else(|| "./k3-situ/oracle_npy".to_string())
-        .into();
+    let dir_arg = std::env::args().nth(1).or_else(|| std::env::var("SITU_ORACLE_DIR").ok());
+    let dir = mary::paths::model(dir_arg.as_deref(), "k3-situ/oracle_npy")
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        });
     println!("kimi_situ_gate — mary::models::k3::situ vs the shipped SituAndMul");
     println!("oracle: {}", dir.display());
     println!("criterion: |got-want| <= {ATOL:e} + rtol·|want|, rtol per lane (>= {RTOL_FLOOR:e})");

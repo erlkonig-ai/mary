@@ -46,6 +46,9 @@ pub mod leaf;
 pub mod formats;
 #[cfg(feature = "local-model")]
 pub mod local;
+/// Resolving model files without guessing where they live: an explicit path, or
+/// `$MARY_MODELS`, or a loud error naming both. mary ships no default layout.
+pub mod paths;
 /// Persist/load model weights to a real on-disk pile (the shell-is-physics
 /// endpoint). Loading from a pile is THE runtime weight path — every model
 /// family goes through here — so the module is unconditional. The

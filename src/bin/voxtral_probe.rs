@@ -15,8 +15,9 @@
 //!   cargo run --release --features voxtral --bin voxtral_probe -- \
 //!     [--pile <path>] [--gold <dir>] [--long] [--lane raw|fold|half]
 //!
-//! Weights load from `models/voxtral_mini.pile` by default (the persist gate
-//! guarantees the pile is bit-identical to the checkpoint). `--long` adds the
+//! Weights come from `--pile`, else `$MARY_MODELS/voxtral_mini.pile` (the
+//! persist gate guarantees the pile is bit-identical to the checkpoint). There
+//! is no baked-in default path. `--long` adds the
 //! en_long / denglish streams (slow).
 //!
 //! Lanes: `raw` (default) = the full oracle parity suite on the op-for-op
@@ -79,7 +80,11 @@ fn main() {
             .position(|a| a == flag)
             .map(|i| args[i + 1].clone())
     };
-    let pile = PathBuf::from(arg("--pile").unwrap_or_else(|| "models/voxtral_mini.pile".into()));
+    let pile = mary::paths::model(arg("--pile").as_deref(), "voxtral_mini.pile")
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        });
     let gold = PathBuf::from(arg("--gold").unwrap_or_else(|| "golden/voxtral".into()));
     let long = args.iter().any(|a| a == "--long");
     let tekken = PathBuf::from(arg("--tekken").unwrap_or_else(|| {

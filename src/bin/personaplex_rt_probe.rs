@@ -56,7 +56,6 @@ use std::path::Path;
 use std::time::Instant;
 
 const GOLD: &str = "/tmp/mary-personaplex/golden";
-const DEFAULT_PILE: &str = "models/personaplex.pile";
 
 /// Per-format red-line bars (regression tripwires set just under the
 /// MEASURED class of each format — see PORT_NOTES for the measured numbers;
@@ -1251,7 +1250,7 @@ fn main() {
     let sub = args.get(1).map(String::as_str).unwrap_or("");
     let mut fmt = WeightFmt::Q4;
     let mut depth_f16 = false;
-    let mut pile = DEFAULT_PILE.to_string();
+    let mut pile: Option<String> = None;
     for a in &args[2.min(args.len())..] {
         if a == "--depth-f16" {
             depth_f16 = true;
@@ -1259,9 +1258,16 @@ fn main() {
         }
         match WeightFmt::parse(a) {
             Some(f) => fmt = f,
-            None => pile = a.clone(),
+            None => pile = Some(a.clone()),
         }
     }
+    let pile = mary::paths::model(pile.as_deref(), "personaplex.pile")
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        })
+        .to_string_lossy()
+        .into_owned();
     match sub {
         "gate" => gate(&pile, fmt),
         "bench" => bench(&pile, fmt),

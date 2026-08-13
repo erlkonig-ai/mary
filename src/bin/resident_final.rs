@@ -26,7 +26,6 @@ use burn::prelude::*;
 use burn::tensor::FloatDType;
 use mary::models::k3::ckpt::Ckpt;
 use mary::models::k3::K3Config;
-use std::path::PathBuf;
 
 type B = Cuda<f32>;
 
@@ -49,9 +48,11 @@ fn meminfo() -> (f64, f64) {
 const GIB: f64 = (1u64 << 30) as f64;
 
 fn main() {
-    let model = PathBuf::from(
-        std::env::var("K3_MODEL_DIR").unwrap_or_else(|_| "./kimi-k3".into()),
-    );
+    let model = mary::paths::model(std::env::var("K3_MODEL_DIR").ok().as_deref(), "kimi-k3")
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        });
     let n_layers: usize = std::env::var("K3_PROBE_LAYERS")
         .ok()
         .and_then(|v| v.parse().ok())

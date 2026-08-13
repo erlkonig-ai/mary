@@ -27,7 +27,7 @@
 //!
 //!   cargo run --release --features inkling --bin inkling_block_gate -- [<oracle dir>]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 
@@ -118,10 +118,7 @@ fn worst_rel(mine: &[f32], theirs: &[f32]) -> (f32, usize) {
 }
 
 fn main() -> Result<()> {
-    let dir = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("./inkling-oracle"));
+    let dir = mary::paths::model(std::env::args().nth(1).as_deref(), "inkling-oracle")?;
     let man = String::from_utf8(std::fs::read(dir.join("blk_manifest.json"))?)?;
 
     let h = manifest_num(&man, "hidden_size")? as usize;

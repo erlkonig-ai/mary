@@ -38,7 +38,6 @@ use std::time::Instant;
 type B = burn_ndarray::NdArray<f32>;
 
 const GOLD: &str = "/tmp/mary-personaplex/golden";
-const DEFAULT_PILE: &str = "models/personaplex.pile";
 const GATE: f64 = 0.99999;
 const PAD: i64 = cfg::TEXT_PAD_TOKEN as i64;
 
@@ -442,15 +441,19 @@ fn main() {
     let f16 = args.iter().any(|a| a == "--f16");
     let skip_burn = args.iter().any(|a| a == "--skip-burn");
     let synth = args.iter().any(|a| a == "--synth");
-    let pile = args
-        .iter()
-        .skip(2)
-        .find(|a| !a.starts_with("--"))
-        .map(String::as_str)
-        .unwrap_or(DEFAULT_PILE);
+    let pile = mary::paths::model(
+        args.iter().skip(2).find(|a| !a.starts_with("--")).map(String::as_str),
+        "personaplex.pile",
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    })
+    .to_string_lossy()
+    .into_owned();
     match sub {
-        "gate" => gate(pile, f16, !skip_burn),
-        "bench" => bench(pile, f16, synth),
+        "gate" => gate(&pile, f16, !skip_burn),
+        "bench" => bench(&pile, f16, synth),
         _ => {
             eprintln!("usage: moshi_depth_probe <gate|bench> [--f16] [--skip-burn|--synth] [pile]");
             eprintln!("  gate   teacher-forced parity vs goldens + exact tokens vs depth.rs");

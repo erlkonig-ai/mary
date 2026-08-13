@@ -73,8 +73,9 @@
 //! ```text
 //! cargo run --release --features k3 --bin k3_layer_gate
 //! ```
-//! Oracle dir: argv[1] or `K3_ORACLE_DIR` (default `./k3-oracle`).
-//! Model dir:  argv[2] or `K3_MODEL_DIR`  (default `./kimi-k3`).
+//! Oracle dir: argv[1], or `K3_ORACLE_DIR`, or `$MARY_MODELS/k3-oracle`.
+//! Model dir:  argv[2], or `K3_MODEL_DIR`,  or `$MARY_MODELS/kimi-k3`.
+//! No path is baked in: with none of the three the gate says so and exits.
 
 use burn::backend::NdArray;
 use burn::prelude::*;
@@ -92,7 +93,7 @@ use mary::nn::npz::{NpyData, Npz};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 type B = burn::backend::Cuda<f32>;
@@ -2724,18 +2725,18 @@ fn lane_decode(
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let oracle_dir = PathBuf::from(
-        args.get(1)
-            .cloned()
-            .or_else(|| std::env::var("K3_ORACLE_DIR").ok())
-            .unwrap_or_else(|| "./k3-oracle".into()),
-    );
-    let model_dir = PathBuf::from(
-        args.get(2)
-            .cloned()
-            .or_else(|| std::env::var("K3_MODEL_DIR").ok())
-            .unwrap_or_else(|| "./kimi-k3".into()),
-    );
+    let oracle_arg = args.get(1).cloned().or_else(|| std::env::var("K3_ORACLE_DIR").ok());
+    let oracle_dir = mary::paths::model(oracle_arg.as_deref(), "k3-oracle")
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        });
+    let model_arg = args.get(2).cloned().or_else(|| std::env::var("K3_MODEL_DIR").ok());
+    let model_dir = mary::paths::model(model_arg.as_deref(), "kimi-k3")
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        });
     let dev: Dev = Default::default();
     let t_start = Instant::now();
 

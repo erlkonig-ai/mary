@@ -58,10 +58,10 @@
 //! it is not read here because check 1 covers every element of the same
 //! tensors and is strictly stronger.
 //!
-//! Usage: `mxfp4_gate [ORACLE_DIR]` (default `./k3-oracle`).
+//! Usage: `mxfp4_gate [ORACLE_DIR]`; without the argument, `$MARY_MODELS/k3-oracle`.
 //! Exits nonzero on any failure and prints no timing at all in that case.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 use mary::nn::mxfp4::{
@@ -197,10 +197,11 @@ fn decode_nibble_swapped(packed: &[u8], scale: &[u8], rows: usize, cols: usize) 
 }
 
 fn main() {
-    let dir: PathBuf = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "./k3-oracle".to_string())
-        .into();
+    let dir = mary::paths::model(std::env::args().nth(1).as_deref(), "k3-oracle")
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        });
     let stats: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.join("_decode_stats.json")).expect("read _decode_stats.json"))
             .expect("parse _decode_stats.json");

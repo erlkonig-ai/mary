@@ -78,12 +78,13 @@ const IMAGE_TOKEN_ID: i64 = 151655;
 
 #[test]
 fn aliased_metal_embed_parity() {
-    let pile_path = std::env::var("NOMIC_MM7B_PILE")
-        .unwrap_or_else(|_| "/private/tmp/nomic_mm7b_combined.pile".to_string());
-    if !Path::new(&pile_path).exists() {
-        eprintln!("SKIP: no combined pile at {pile_path} (set NOMIC_MM7B_PILE; see header)");
+    let Some(pile_path) = mary::paths::model_opt(
+        std::env::var("NOMIC_MM7B_PILE").ok().as_deref(),
+        "nomic_mm7b_combined.pile",
+    ) else {
+        eprintln!("SKIP: {}", mary::paths::skip_reason("nomic_mm7b_combined.pile"));
         return;
-    }
+    };
     let dir = golden_dir();
     if !dir.join("query_emb.npy").exists() {
         eprintln!("SKIP: run scripts/nomic_mm7b_probe.py to dump reference goldens");
@@ -99,7 +100,7 @@ fn aliased_metal_embed_parity() {
     // --- cold aliased load (timed): mmap f16 -> Metal, zero copy ---
     let t0 = Instant::now();
     let embedder = mary::persist::load_nomic_mm7b_aliased_from_pile(
-        Path::new(&pile_path),
+        &pile_path,
         &tok_path,
         device.clone(),
     )

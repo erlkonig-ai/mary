@@ -1,7 +1,7 @@
 //! Parity gate for [`mary::models::k3::kda`] against the
 //! `flash-linear-attention` oracle vectors.
 //!
-//! The oracle (`./k3-oracle`) is **executed third-party code**,
+//! The oracle is **executed third-party code**,
 //! not a re-reading of Kimi's modeling file: fla 0.5.2's Triton kernels on the
 //! GB10 at Kimi's exact call sites and flags, plus fla's own reference
 //! implementations, plus those same reference implementations re-run in float64
@@ -32,9 +32,9 @@
 //! Fixed below from the oracle's own measured error budget, before the port was
 //! run. They are not tuned to the result.
 //!
-//! Usage: `kimi_kda_gate [vectors_dir]` (default `./k3-oracle`).
+//! Usage: `kimi_kda_gate [vectors_dir]`; without the argument, the vectors are
+//! read from `$MARY_MODELS/k3-oracle`. No path is baked in.
 
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 use mary::models::k3::kda::{
@@ -69,11 +69,11 @@ const TOL_CHUNK: f64 = 5e-3;
 const MIN_CONTROL_GAP: f64 = 1e-2;
 
 fn main() -> ExitCode {
-    let dir = PathBuf::from(
-        std::env::args()
-            .nth(1)
-            .unwrap_or_else(|| "./k3-oracle".to_string()),
-    );
+    let dir = mary::paths::model(std::env::args().nth(1).as_deref(), "k3-oracle")
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        });
     println!("KDA parity gate — oracle vectors in {}", dir.display());
 
     let kda = Npz::open(&dir.join("kda_oracle.npz")).expect("kda_oracle.npz");
@@ -87,11 +87,12 @@ fn main() -> ExitCode {
     );
 
     let mut r = Report::new();
-    check_shipping_config(
-        &mut r,
-        std::path::Path::new(&std::env::var("K3_MODEL_DIR").unwrap_or_else(|_| "./kimi-k3".into()))
-            .join("config.json"),
-    );
+    let model_dir = mary::paths::model(std::env::var("K3_MODEL_DIR").ok().as_deref(), "kimi-k3")
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        });
+    check_shipping_config(&mut r, &model_dir.join("config.json"));
     check_premises(&mut r, &kda);
     check_gate_sweep(&mut r, &kda);
     check_stages(&mut r, &kda);

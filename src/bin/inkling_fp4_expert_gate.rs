@@ -28,8 +28,6 @@
 //!
 //! Build: `--features cuda-backend,inkling`
 
-use std::path::PathBuf;
-
 use anyhow::{Context, Result};
 use cubecl::prelude::*;
 
@@ -58,10 +56,10 @@ fn decode(codes: &[u8], scales: &[u8], rows: usize, k: usize, scale2: f32) -> Ve
 }
 
 fn main() -> Result<()> {
-    let dir = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("converted/inkling-small-complete.pile"));
+    let dir = mary::paths::model(
+        std::env::args().nth(1).as_deref(),
+        "inkling-small-complete.pile",
+    )?;
 
     let src = mary::models::inkling::source::Weights::open(&dir, "inkling")?;
     let b13 = format!("model.llm.layers.{LAYER}.mlp.experts.w13_weight");

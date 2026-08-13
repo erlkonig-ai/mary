@@ -24,7 +24,7 @@
 
 use mary::embed::load_nomic_text_from_hf;
 use mary::models::gemma::metal_device::init_metal_device_16gb;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 const MODEL_768: &str = "nomic-ai/nomic-embed-text-v1.5";
@@ -102,12 +102,13 @@ fn text_retrieval_bakeoff() {
     ];
 
     // --- disk gates ---
-    let pile_path =
-        std::env::var("NOMIC_MM7B_PILE").unwrap_or_else(|_| "models/nomic_mm7b.pile".to_string());
-    if !Path::new(&pile_path).exists() {
-        eprintln!("SKIP: no nomic-mm7b pile at {pile_path} (set NOMIC_MM7B_PILE)");
+    let Some(pile_path) = mary::paths::model_opt(
+        std::env::var("NOMIC_MM7B_PILE").ok().as_deref(),
+        "nomic_mm7b.pile",
+    ) else {
+        eprintln!("SKIP: {}", mary::paths::skip_reason("nomic_mm7b.pile"));
         return;
-    }
+    };
     let Some(tok_path) = nomic_mm7b_tokenizer() else {
         eprintln!("SKIP: no nomic-mm7b/Qwen2.5-VL tokenizer.json in HF cache");
         return;
@@ -145,10 +146,13 @@ fn text_retrieval_bakeoff() {
     drop(nomic768);
 
     // ===== 7b: nomic-embed-multimodal-7b (text path) =====
-    eprintln!("[bakeoff] loading 7b (aliased f16 -> Metal) from {pile_path} ...");
+    eprintln!(
+        "[bakeoff] loading 7b (aliased f16 -> Metal) from {} ...",
+        pile_path.display()
+    );
     let t0 = Instant::now();
     let nomic7b = mary::persist::load_nomic_mm7b_aliased_from_pile(
-        Path::new(&pile_path),
+        &pile_path,
         &tok_path,
         device.clone(),
     )

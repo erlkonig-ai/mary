@@ -102,8 +102,11 @@ fn measure(model_dir: &Path, planes: &[Plane]) -> Vec<(i32, i32)> {
 fn main() {
     let mut args = std::env::args().skip(1);
     let model_dir: PathBuf = args.next().expect("usage: mxfp4_span_sweep <MODEL_DIR> [ORACLE_DIR] [N|all]").into();
-    let oracle_dir: PathBuf =
-        args.next().unwrap_or_else(|| "./k3-oracle".to_string()).into();
+    let oracle_dir = mary::paths::model(args.next().as_deref(), "k3-oracle")
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        });
     let per_layer = args.next().unwrap_or_else(|| "16".to_string());
 
     let index: serde_json::Value =

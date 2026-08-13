@@ -23,7 +23,7 @@
 //!
 //!   cargo run --release --features inkling --bin inkling_nvfp4_gate -- [<oracle dir>]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 
@@ -61,10 +61,7 @@ fn manifest_usize(text: &str, key: &str) -> Result<usize> {
 }
 
 fn main() -> Result<()> {
-    let dir = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("./inkling-oracle"));
+    let dir = mary::paths::model(std::env::args().nth(1).as_deref(), "inkling-oracle")?;
 
     let manifest = String::from_utf8(read_bytes(&dir, "nvfp4_manifest.json")?)
         .context("manifest is not utf-8")?;

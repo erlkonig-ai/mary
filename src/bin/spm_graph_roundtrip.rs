@@ -14,9 +14,6 @@ use std::path::Path;
 use mary::models::personaplex::spm::SpmTokenizer;
 use triblespace::prelude::*;
 
-// Relative to the working directory; override with argv[1].
-const DEFAULT_SPM: &str = "models/tokenizer_spm_32k_3.model";
-
 /// Strings chosen to exercise every lane the port cares about: plain ASCII,
 /// the `▁` word-boundary escape, punctuation, digits, unicode that needs
 /// byte-fallback, and the empty string.
@@ -39,7 +36,17 @@ const PROBES: &[&str] = &[
 ];
 
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| DEFAULT_SPM.into());
+    // argv[1], else `$MARY_MODELS/tokenizer_spm_32k_3.model`; never a guess.
+    let path = mary::paths::model(
+        std::env::args().nth(1).as_deref(),
+        "tokenizer_spm_32k_3.model",
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    })
+    .to_string_lossy()
+    .into_owned();
     println!("spm model: {path}");
 
     // ── 1. the file path (the proven one) ──

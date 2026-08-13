@@ -835,10 +835,10 @@ fn check_layout_against_checkpoint(w: &[Row], rows: usize, k: usize, v: &Verdict
 }
 
 fn main() -> Result<()> {
-    let dir = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("models/thinkingmachines-inkling-small-nvfp4"));
+    let dir = mary::paths::model(
+        std::env::args().nth(1).as_deref(),
+        "thinkingmachines-inkling-small-nvfp4",
+    )?;
 
     const ROWS: usize = 16;
     const K: usize = 4096;

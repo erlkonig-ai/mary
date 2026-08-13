@@ -8,8 +8,6 @@
 //! `_apply_attn_res` — extracted verbatim from the checkpoint's own
 //! `modeling_kimi_linear.py` — on real late-layer weights and real activations.
 
-use std::path::PathBuf;
-
 use anyhow::{Context, Result};
 use burn::prelude::*;
 
@@ -388,9 +386,15 @@ fn run_lane<B: Backend>(lane: &str, dev: &Device<B>, z: &Npz, cfg: &K3Config) ->
 /// per-layer AttnRes weights. The gate's own oracle stops at layer 12.
 fn section_sm93<B: Backend>(g: &mut G, cfg: &K3Config, dev: &Device<B>) {
     println!("  -- shipped state machine, 93 layers --");
-    let path = std::env::var("K3_SM93")
-        .unwrap_or_else(|_| "./k3-oracle/sm93_oracle.npz".into());
-    let z = Npz::open(std::path::Path::new(&path)).expect("opening sm93 oracle");
+    let path = mary::paths::model(
+        std::env::var("K3_SM93").ok().as_deref(),
+        "k3-oracle/sm93_oracle.npz",
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
+    let z = Npz::open(&path).expect("opening sm93 oracle");
     let nl = z.get("meta_layers").scalar() as usize;
     let eps = cfg.text_config.rms_norm_eps;
     g.truth("sm93.layers", nl == cfg.text_config.num_hidden_layers, format!("{nl}"));
@@ -523,12 +527,11 @@ fn section_sm93<B: Backend>(g: &mut G, cfg: &K3Config, dev: &Device<B>) {
 }
 
 fn main() -> Result<()> {
-    let ck = PathBuf::from(
-        std::env::var("K3_CHECKPOINT").unwrap_or_else(|_| "./kimi-k3".into()),
-    );
-    let path = PathBuf::from(
-        std::env::var("K3_SLOTS9").unwrap_or_else(|_| "./k3-oracle/slots9_oracle.npz".into()),
-    );
+    let ck = mary::paths::model(std::env::var("K3_CHECKPOINT").ok().as_deref(), "kimi-k3")?;
+    let path = mary::paths::model(
+        std::env::var("K3_SLOTS9").ok().as_deref(),
+        "k3-oracle/slots9_oracle.npz",
+    )?;
     let cfg = K3Config::from_json(&std::fs::read_to_string(ck.join("config.json"))?)
         .map_err(|e| anyhow::anyhow!(e))?;
     let z = Npz::open(&path).context("opening the 9-slot oracle")?;

@@ -48,10 +48,11 @@ use mary::models::personaplex::sampling::SamplingConfig;
 use mary::models::personaplex::temporal_metal::WeightFmt;
 use mary::models::personaplex::config as cfg;
 
-// Relative to the working directory. Each can be overridden positionally or by
-// the matching environment variable, so nothing here points outside the repo.
-const DEFAULT_PILE: &str = "models/personaplex.pile";
-const DEFAULT_VOICE: &str = "models/voice_prompt.pt";
+// The model files are named, not located: positional argument, else the
+// matching environment variable, else `$MARY_MODELS/<name>`. The user clip is
+// a recording you supply, so it stays relative to the working directory.
+const PILE_NAME: &str = "personaplex.pile";
+const VOICE_NAME: &str = "voice_prompt.pt";
 const DEFAULT_USER: &str = "user_turn_24k.wav";
 const SYSTEM_TEXT: &str = "You are a helpful assistant. You speak with a warm, \
                            curious, and direct voice. Answer clearly.";
@@ -67,9 +68,20 @@ fn main() {
             .or_else(|| std::env::var(env).ok())
             .unwrap_or_else(|| default.into())
     };
+    // positional > environment > $MARY_MODELS/<name>; never a guessed path
+    let pick_model = |arg: Option<&String>, env: &str, name: &str| -> String {
+        let explicit = arg.cloned().or_else(|| std::env::var(env).ok());
+        mary::paths::model(explicit.as_deref(), name)
+            .unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(2)
+            })
+            .to_string_lossy()
+            .into_owned()
+    };
     let user_wav = pick(a.get(4), "PERSONAPLEX_USER_WAV", DEFAULT_USER);
-    let pile = pick(a.get(5), "PERSONAPLEX_PILE", DEFAULT_PILE);
-    let voice_pt = pick(a.get(6), "PERSONAPLEX_VOICE_PROMPT", DEFAULT_VOICE);
+    let pile = pick_model(a.get(5), "PERSONAPLEX_PILE", PILE_NAME);
+    let voice_pt = pick_model(a.get(6), "PERSONAPLEX_VOICE_PROMPT", VOICE_NAME);
 
     let fmt = match fmt_s.as_str() {
         "f16" => WeightFmt::F16,

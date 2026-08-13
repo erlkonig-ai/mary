@@ -48,6 +48,30 @@ mary::models   the ports
 mary::stitch   the franken-stitch (graph surgery across models)   [planned]
 ```
 
+## Where the model files live
+
+mary does not know, and does not guess. It is a library and a set of probes,
+not an installation, so it holds no opinion about your disk layout — a baked-in
+default path is wrong on every machine but the one it was written on, and it
+fails in the worst way: the probe looks in the guessed place, misses, and
+reports "not found" as though you did not have the model.
+
+So every probe takes its path one of two ways:
+
+```sh
+# 1. explicitly, on the command line (always wins)
+cargo run --release --features k3 --bin k3_layout_gate -- /data/kimi-k3
+
+# 2. by name, out of $MARY_MODELS
+export MARY_MODELS=/data/models      # → /data/models/kimi-k3
+cargo run --release --features k3 --bin k3_layout_gate
+```
+
+With neither, the probe says so and exits — it never searches. Per-model
+overrides (`GEMMA_PILE`, `QWEN3TTS_PILE`, `K3_MODEL_DIR`, …) still take
+precedence over `$MARY_MODELS`; they are explicit, which is the point. Tests
+SKIP rather than fail when a model is simply not on the machine.
+
 ## Models
 
 ### `gemma` — Gemma 4 (text LLM, in-substrate)

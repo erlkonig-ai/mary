@@ -17,8 +17,6 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
-const DEFAULT_PILE: &str = "converted/personaplex_typed.pile";
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
@@ -27,13 +25,13 @@ fn main() {
              \n\
              Reads a 24 kHz mono PCM16 WAV, Mimi-encodes it to discrete codes,\n\
              Mimi-decodes those codes back to 24 kHz PCM, and writes the result.\n\
-             Default weights: {DEFAULT_PILE}"
+             Weights: [weights.pile], else $MARY_MODELS/personaplex_typed.pile"
         );
         std::process::exit(2);
     }
     let in_path = args[1].clone();
     let out_path = args[2].clone();
-    let mut pile = DEFAULT_PILE.to_string();
+    let mut pile: Option<String> = None;
     let mut codes_csv: Option<String> = None;
     let mut i = 3;
     while i < args.len() {
@@ -43,11 +41,18 @@ fn main() {
                 i += 2;
             }
             other => {
-                pile = other.to_string();
+                pile = Some(other.to_string());
                 i += 1;
             }
         }
     }
+    let pile = mary::paths::model(pile.as_deref(), "personaplex_typed.pile")
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        })
+        .to_string_lossy()
+        .into_owned();
 
     // ---- weights ----
     println!("[weights] {pile}");

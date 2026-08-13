@@ -16,9 +16,7 @@ use burn::tensor::{Distribution, TensorData};
 use mary::models::smolvla::pipeline::{preprocess_image, SmolVla};
 use mary::nn::backend::{WgpuDevice, B};
 use mary::nn::weight_loader::WeightLoader;
-use std::path::Path;
 
-const PILE: &str = "models/smolvla.pile";
 const TOKENIZER: &str = concat!(env!("HOME"), "/.cache/huggingface/hub/models--HuggingFaceTB--SmolVLM2-500M-Video-Instruct/snapshots/7b375e1b73b11138ff12fe22c8f2822d8fe03467/tokenizer.json");
 const JOINTS: [&str; 9] = [
     "head_x", "head_y", "head_z", "roll", "pitch", "yaw", "body_yaw", "ant_l", "ant_r",
@@ -58,9 +56,13 @@ fn main() {
     let noise = Tensor::<B, 3>::random([1, 50, 32], Distribution::Normal(0.0, 1.0), &dev);
 
     // perceive → act — weights from the durable pile
-    let pile = std::env::var("SMOLVLA_PILE").unwrap_or_else(|_| PILE.to_string());
-    let loader = WeightLoader::from_pile(Path::new(&pile))
-        .unwrap_or_else(|e| panic!("load smolvla pile {pile}: {e:?}"));
+    let pile = mary::paths::model(std::env::var("SMOLVLA_PILE").ok().as_deref(), "smolvla.pile")
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        });
+    let loader = WeightLoader::from_pile(&pile)
+        .unwrap_or_else(|e| panic!("load smolvla pile {}: {e:?}", pile.display()));
     let model = SmolVla::<B>::load(&loader, &dev);
     let (ck, cv) = model.perceive(image, lang_ids, state, &dev);
     let actions = model.act(ck, cv, noise, &dev); // [1,50,32]

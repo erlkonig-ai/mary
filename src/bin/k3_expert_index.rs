@@ -71,14 +71,17 @@ fn shard_entries(path: &Path) -> std::io::Result<(u64, Vec<(String, u64, u64)>)>
 }
 
 fn main() {
-    // Positional > environment > relative. No absolute path into anyone's home
-    // directory: those leak the machine's layout into a public repository and
-    // break for every other operator. K3_MODEL_DIR is the knob.
-    let dir = std::env::args()
+    // Positional > environment > `$MARY_MODELS/kimi-k3`. No path baked in at
+    // all: a guessed one leaks the author's disk layout into a public
+    // repository and is wrong for every other operator. K3_MODEL_DIR is the knob.
+    let dir_arg = std::env::args()
         .nth(1)
-        .or_else(|| std::env::var("K3_MODEL_DIR").ok())
-        .unwrap_or_else(|| "models/kimi-k3".into());
-    let dir = PathBuf::from(dir);
+        .or_else(|| std::env::var("K3_MODEL_DIR").ok());
+    let dir = mary::paths::model(dir_arg.as_deref(), "kimi-k3")
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        });
 
     let t0 = Instant::now();
     let mut book: HashMap<String, Located> = HashMap::new();

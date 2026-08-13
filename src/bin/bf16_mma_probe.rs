@@ -21,8 +21,6 @@
 //! Build: `--features inkling-cuda,cuda-backend,import`
 //! Run:   `bf16_mma_probe [<checkpoint dir>]`
 
-use std::path::PathBuf;
-
 use anyhow::{bail, Result};
 use cubecl::prelude::*;
 use half::bf16;
@@ -47,10 +45,10 @@ fn row(bytes: &[u8], r: usize, k: usize) -> Vec<f32> {
 }
 
 fn main() -> Result<()> {
-    let dir = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("converted/inkling-small-complete.pile"));
+    let dir = mary::paths::model(
+        std::env::args().nth(1).as_deref(),
+        "inkling-small-complete.pile",
+    )?;
 
     let (m, n) = (MTILE, NTILE);
 

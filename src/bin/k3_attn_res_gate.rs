@@ -296,7 +296,6 @@ fn bits_equal(what: &str, a: &[f32], b: &[f32]) -> bool {
     a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
-
 /// The mixture, transcribed once more in float64 on the host.
 ///
 /// This is not a second opinion on whether the port is *right* — it is the same
@@ -739,7 +738,6 @@ fn host<B: Backend, const D: usize>(t: Tensor<B, D>) -> Vec<f32> {
 fn params_of<B: Backend>(p: &ParamPair, eps: f64, dev: &Device<B>) -> AttnResParams<B> {
     AttnResParams::new(t1::<B>(&p.norm, dev), t2::<B>(&p.proj, 1, p.norm.len(), dev), eps)
 }
-
 
 /// One f32 ulp, relative — the unit the primitive measurements are quoted in.
 const F32_EPS: f64 = f32::EPSILON as f64;
@@ -1712,12 +1710,11 @@ fn run_lane<B: Backend>(lane: &str, dev: &Device<B>, o: &Oracle, ck: &Checkpoint
 }
 
 fn main() -> Result<()> {
-    let ck_dir = PathBuf::from(
-        std::env::var("K3_CHECKPOINT").unwrap_or_else(|_| "./kimi-k3".into()),
-    );
-    let oracle_path = PathBuf::from(std::env::var("K3_LAYER_ORACLE").unwrap_or_else(|_| {
-        "./k3-oracle/layer_oracle_prefix13_bf16.npz".into()
-    }));
+    let ck_dir = mary::paths::model(std::env::var("K3_CHECKPOINT").ok().as_deref(), "kimi-k3")?;
+    let oracle_path = mary::paths::model(
+        std::env::var("K3_LAYER_ORACLE").ok().as_deref(),
+        "k3-oracle/layer_oracle_prefix13_bf16.npz",
+    )?;
     let verbose = std::env::var("K3_GATE_VERBOSE").is_ok();
 
     println!("k3_attn_res_gate — mary::models::k3::attn_res vs the shipped AttnRes");

@@ -3,7 +3,7 @@
 //! File mode (real-time-paced chunk feed; `--fast` = unpaced, for compute
 //! benchmarks):
 //!   cargo run --release --features voxtral --bin voxtral_listen -- \
-//!     --pile models/voxtral_mini.pile --wav clip.wav [--delay-ms 480] \
+//!     [--pile <voxtral_mini.pile>] --wav clip.wav [--delay-ms 480] \
 //!     [--chunk-ms 80] [--fast] [--expect-text file.txt] [--lane half]
 //!
 //! Lanes (one backend per process — two fusion runtimes thrash each other):
@@ -73,7 +73,7 @@ fn main() -> anyhow::Result<()> {
     let flag = |name: &str| argv.iter().any(|a| a == name);
 
     let args = Args {
-        pile: PathBuf::from(arg("--pile").unwrap_or_else(|| "models/voxtral_mini.pile".into())),
+        pile: mary::paths::model(arg("--pile").as_deref(), "voxtral_mini.pile")?,
         tekken: PathBuf::from(arg("--tekken").unwrap_or_else(|| {
             let home = std::env::var("HOME").unwrap();
             format!(

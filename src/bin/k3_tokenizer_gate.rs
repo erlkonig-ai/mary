@@ -41,9 +41,16 @@ use mary::tokenizer;
 use serde_json::Value;
 use triblespace::prelude::*;
 
-/// Checkpoint directory. `K3_MODEL_DIR` overrides, as in the other gates.
+/// Checkpoint directory: `K3_MODEL_DIR`, else `$MARY_MODELS/kimi-k3`, as in the
+/// other gates. There is no guessed default.
 fn model_dir() -> String {
-    std::env::var("K3_MODEL_DIR").unwrap_or_else(|_| "./kimi-k3".into())
+    mary::paths::model(std::env::var("K3_MODEL_DIR").ok().as_deref(), "kimi-k3")
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        })
+        .to_string_lossy()
+        .into_owned()
 }
 const GOLDEN: &str = "/tmp/mary-k3tok/golden/k3_tokenizer_battery.json";
 

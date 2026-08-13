@@ -23,7 +23,6 @@
 //!
 //! Build: `--features cuda-backend,inkling`
 
-use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -50,10 +49,10 @@ fn decode(codes: &[u8], scales: &[u8], rows: usize, k: usize, scale2: f32) -> Ve
 }
 
 fn main() -> Result<()> {
-    let dir = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("models/thinkingmachines-inkling-small-nvfp4"));
+    let dir = mary::paths::model(
+        std::env::args().nth(1).as_deref(),
+        "thinkingmachines-inkling-small-nvfp4",
+    )?;
     let branch = std::env::args().nth(2).unwrap_or_else(|| "inkling".to_string());
     let b13 = format!("model.llm.layers.{LAYER}.mlp.experts.w13_weight");
     // Reopened per section on purpose: section 3 DESTROYS the source while a

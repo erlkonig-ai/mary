@@ -42,7 +42,7 @@
 //! Usage: `k3_router_gate [vectors_dir] [model_dir]`.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 
 use mary::models::k3::router::{
@@ -96,14 +96,16 @@ const EXPECTED_F32_BIAS_DIVERGENT_TOKENS: usize = 6;
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
-    let dir = PathBuf::from(
-        args.next()
-            .unwrap_or_else(|| "./k3-oracle".to_string()),
-    );
-    let model = PathBuf::from(
-        args.next()
-            .unwrap_or_else(|| "./kimi-k3".to_string()),
-    );
+    let dir = mary::paths::model(args.next().as_deref(), "k3-oracle")
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        });
+    let model = mary::paths::model(args.next().as_deref(), "kimi-k3")
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        });
     println!("Kimi K3 MoE router gate");
     println!("  oracle vectors : {}", dir.display());
     println!("  checkpoint     : {}", model.display());

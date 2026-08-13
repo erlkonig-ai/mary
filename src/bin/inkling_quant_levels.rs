@@ -24,8 +24,6 @@
 //!
 //! Build: `--features cuda-backend,inkling`
 
-use std::path::PathBuf;
-
 use anyhow::Result;
 
 use mary::models::inkling::fp4gemm::{f32_to_e4m3, quantize_act_host, GROUP};
@@ -100,7 +98,6 @@ fn quantize_two_level(x: &[f32], k: usize) -> (Vec<u8>, Vec<u8>, f32) {
     (codes, scales, global)
 }
 
-
 /// The floor: an EXACT f32 block scale, no E4M3 rounding anywhere. Whatever
 /// error survives this is the E2M1 grid itself, and no scale scheme -- one
 /// level, two levels, or a perfect one -- can remove it.
@@ -120,7 +117,6 @@ fn quantize_ideal(x: &[f32]) -> Vec<f32> {
     }
     out
 }
-
 
 /// Pick the E4M3 block scale that minimises the block's error, instead of
 /// assuming `amax/6` is the best one.
@@ -168,7 +164,6 @@ fn quantize_searched(x: &[f32]) -> Vec<f32> {
     }
     out
 }
-
 
 /// THE INVARIANT: a correct block scale puts the block's own maximum on the top
 /// E2M1 code.
@@ -225,10 +220,10 @@ fn stats(orig: &[f32], deq: &[f32]) -> (f64, f64, f64) {
 }
 
 fn main() -> Result<()> {
-    let dir = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("converted/inkling-small-complete.pile"));
+    let dir = mary::paths::model(
+        std::env::args().nth(1).as_deref(),
+        "inkling-small-complete.pile",
+    )?;
     let src = Weights::open(&dir, "inkling")?;
     let b13 = format!("model.llm.layers.{LAYER}.mlp.experts.w13_weight");
 

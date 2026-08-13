@@ -402,10 +402,8 @@ fn check_config_fields_are_consulted(cfg: &K3Config) -> Vec<String> {
 }
 
 fn main() -> Result<()> {
-    let dir = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "./kimi-k3".to_string());
-    let dir = Path::new(&dir);
+    let dir = mary::paths::model(std::env::args().nth(1).as_deref(), "kimi-k3")?;
+    let dir = dir.as_path();
     println!("checkpoint: {}", dir.display());
 
     let cfg_text = std::fs::read_to_string(dir.join("config.json")).context("reading config.json")?;

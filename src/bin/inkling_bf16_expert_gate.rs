@@ -94,14 +94,11 @@ fn scaled(got: &[f32], reference: &[f64]) -> (f64, f64, usize) {
 }
 
 fn main() -> Result<()> {
-    let oracle = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("inkling_oracle_bf16"));
-    let ckpt = std::env::args()
-        .nth(2)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("converted/inkling-small-complete.pile"));
+    let oracle = mary::paths::model(std::env::args().nth(1).as_deref(), "inkling_oracle_bf16")?;
+    let ckpt = mary::paths::model(
+        std::env::args().nth(2).as_deref(),
+        "inkling-small-complete.pile",
+    )?;
 
     let man: serde_json::Value =
         serde_json::from_slice(&std::fs::read(oracle.join("bf16_manifest.json"))?)

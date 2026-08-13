@@ -107,10 +107,10 @@ fn time_read(
 
 fn main() -> Result<()> {
     let gib: f64 = std::env::var("INK_BW_GIB").ok().and_then(|v| v.parse().ok()).unwrap_or(8.0);
-    let shard = std::env::var("INK_BW_SHARD").unwrap_or_else(|_| {
-        "models/thinkingmachines-inkling-small-nvfp4/model-00005-of-00009.safetensors"
-            .into()
-    });
+    let shard = mary::paths::model(
+        std::env::var("INK_BW_SHARD").ok().as_deref(),
+        "thinkingmachines-inkling-small-nvfp4/model-00005-of-00009.safetensors",
+    )?;
 
     // A whole number of PER * BLOCK * 4-byte grains, so no thread runs off the
     // end and the bounds check is never the thing being measured.
@@ -137,10 +137,15 @@ fn main() -> Result<()> {
     // ---- host-mapped, COLD -------------------------------------------------
     // First, and from the far end of a shard nothing in this process has
     // touched. The disk figure beside it is what makes the label honest.
-    let file = std::fs::File::open(&shard).with_context(|| format!("opening {shard}"))?;
+    let file =
+        std::fs::File::open(&shard).with_context(|| format!("opening {}", shard.display()))?;
     // SAFETY: the checkpoint is read-only and nothing else writes it.
     let map = Arc::new(unsafe { Mmap::map(&file) }?);
-    anyhow::ensure!(map.len() > bytes + 4096, "{shard} is smaller than the working set");
+    anyhow::ensure!(
+        map.len() > bytes + 4096,
+        "{} is smaller than the working set",
+        shard.display()
+    );
     // Page-aligned: aliasing needs 4-byte alignment and a page boundary is the
     // least surprising way to be sure of it.
     let off = ((map.len() - bytes) / 4096) * 4096;

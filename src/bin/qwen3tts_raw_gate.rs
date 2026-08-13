@@ -50,7 +50,6 @@ mod imp {
     use sha2::{Digest, Sha256};
     use std::path::{Path, PathBuf};
 
-    const PILE: &str = "models/qwen3tts.pile";
     const LANES: [&str; 2] = ["raw", "folded"];
 
     fn arg_usize(name: &str, default: usize) -> usize {
@@ -280,8 +279,9 @@ mod imp {
             arg_str("--out").ok_or_else(|| anyhow::anyhow!("--out <dir> required with --lane"))?,
         );
         std::fs::create_dir_all(&out)?;
-        let pile = std::env::var("QWEN3TTS_PILE").unwrap_or_else(|_| PILE.to_string());
-        let pile = Path::new(&pile);
+        let pile =
+            mary::paths::model(std::env::var("QWEN3TTS_PILE").ok().as_deref(), "qwen3tts.pile")?;
+        let pile = pile.as_path();
         let (prefill, steps) = (arg_usize("--prefill", 154), arg_usize("--steps", 32));
 
         match lane.as_str() {

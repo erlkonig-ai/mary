@@ -24,7 +24,7 @@
 //!
 //!   cargo run --release --features inkling --bin inkling_layer_gate -- [<oracle dir>]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 
@@ -90,10 +90,7 @@ fn report(label: &str, d: &Diff, checks: &mut usize, fails: &mut usize) {
 }
 
 fn main() -> Result<()> {
-    let dir = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("./inkling-oracle"));
+    let dir = mary::paths::model(std::env::args().nth(1).as_deref(), "inkling-oracle")?;
     let man = String::from_utf8(std::fs::read(dir.join("lyr_manifest.json"))?)?;
 
     let t = num(&man, "tokens")? as usize;

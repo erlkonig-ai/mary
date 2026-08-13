@@ -281,10 +281,10 @@ fn load_rows(dir: &Path, expert: usize, first_row: usize, n: usize, k: usize) ->
 }
 
 fn main() -> Result<()> {
-    let dir = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("models/thinkingmachines-inkling-small-nvfp4"));
+    let dir = mary::paths::model(
+        std::env::args().nth(1).as_deref(),
+        "thinkingmachines-inkling-small-nvfp4",
+    )?;
 
     let (m, n, sf) = (16usize, 8usize, 4usize);
     // Full K of the checkpoint's w13 expert rows (2048 bytes = 4096 codes).

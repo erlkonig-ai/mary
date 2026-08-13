@@ -46,8 +46,9 @@
 //! ```text
 //! cargo run --release --features kimi-k3,k3,mxfp4 --bin k3_moe_gate
 //! ```
-//! Oracle dir: argv[1] or `K3_ORACLE_DIR` (default `./k3-oracle`).
-//! Model dir:  argv[2] or `K3_MODEL_DIR`  (default `./kimi-k3`).
+//! Oracle dir: argv[1], or `K3_ORACLE_DIR`, or `$MARY_MODELS/k3-oracle`.
+//! Model dir:  argv[2], or `K3_MODEL_DIR`,  or `$MARY_MODELS/kimi-k3`.
+//! No path is baked in: with none of the three the gate says so and exits.
 //! `K3MOE_FAST=1` runs a subset — it prints a PARTIAL banner, names every
 //! skipped lane, and says PARTIAL in the verdict. The authoritative result is a
 //! run without it.
@@ -821,18 +822,18 @@ impl Report {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let oracle_dir = PathBuf::from(
-        args.get(1)
-            .cloned()
-            .or_else(|| std::env::var("K3_ORACLE_DIR").ok())
-            .unwrap_or_else(|| "./k3-oracle".to_string()),
-    );
-    let model_dir = PathBuf::from(
-        args.get(2)
-            .cloned()
-            .or_else(|| std::env::var("K3_MODEL_DIR").ok())
-            .unwrap_or_else(|| "./kimi-k3".to_string()),
-    );
+    let oracle_arg = args.get(1).cloned().or_else(|| std::env::var("K3_ORACLE_DIR").ok());
+    let oracle_dir = mary::paths::model(oracle_arg.as_deref(), "k3-oracle")
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        });
+    let model_arg = args.get(2).cloned().or_else(|| std::env::var("K3_MODEL_DIR").ok());
+    let model_dir = mary::paths::model(model_arg.as_deref(), "kimi-k3")
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        });
     let fast = std::env::var("K3MOE_FAST").is_ok();
 
     println!("k3_moe_gate — mary::models::k3::moe against the whole-layer oracle");
