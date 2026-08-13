@@ -66,8 +66,13 @@ const PROBES: &[&str] = &[
     // are also vocab entries"). All 60 of Inkling's are above the vocab.
     "<|endoftext|>",
     "<|start|>user<|message|>hi<|end|>",
-    // The exact text behind /tmp/prompt.ids, so the gate covers the string the
-    // forward-pass verification actually runs on.
+    // The string behind /tmp/prompt.ids, so the gate covers what the forward-pass
+    // verification actually runs on -- and the leading-space variant beside it,
+    // because they are DIFFERENT first tokens (976 against 623). This comment
+    // named the wrong one of the two until `inkling_encode` re-encoded both and
+    // `cmp`d them against the file, which is the general hazard: a label that
+    // describes an artefact nobody re-derives drifts and stays plausible.
+    "The capital of France is",
     " The capital of France is",
     // Pre-tokens that are NOT vocab entries, which is the only way to reach the
     // merge table at all on this tokenizer.
