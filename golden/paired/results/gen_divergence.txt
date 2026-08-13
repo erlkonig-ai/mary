@@ -1,0 +1,12 @@
+item              gen   agree   first divergence
+gen-prose          48  47/48          at token 6
+gen-explain        48  44/48         at token 37
+gen-arith          48  44/48         at token 12
+gen-code           48  47/48         at token 31
+gen-list           48  46/48          at token 5
+gen-dialogue       48  47/48          at token 6
+gen-defn           48  48/48                none
+
+teacher-forced per-token agreement: 323/336 = 96.1% [95% CI 93.5–97.7]
+sequences identical all the way through: 1/7
+first divergence, when it happens: median token 12, range 5..37

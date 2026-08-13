@@ -1,0 +1,20 @@
+item             family        fp4_all    fp4_rep2   positions  flips
+arith-change     arith             355         355          73      4
+arith-divmod     arith             355         418          75      6   <-- SCORED TOKEN FLIPPED
+arith-units      arith             363         363          80      4
+code-str         code              355         355          65      8
+con-words        constraint        355         355          59      7
+con-longest      constraint        355         355          44      4
+con-notcolour    constraint        418         418          52      4
+con-sumdigits    constraint        363         363          55      6
+
+positions compared     503 over 8 prompt(s)
+argmax flip rate       43/503 = 8.55% [95% CI 6.41–11.32]
+|delta top-1 logit|    median 0.34, max 6.13  (BF16's own batching wobble was 0.875)
+margin where it flipped   max 2.42, median 0.30
+margin where it did not   median 1.73
+SCORED position stable 7/8 = 87.5% [95% CI 52.9–97.8]
+
+Read the scored-position line as the floor under the paired result: a loss
+rate below the rate at which the runtime disagrees with itself is not evidence
+about quantisation.

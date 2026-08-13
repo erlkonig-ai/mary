@@ -28,9 +28,10 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LINE = re.compile(r"after token (\d+) \(id \d+\): top5")
+STEP = re.compile(r"^\s*step (\d+): \+\d+", re.M)
 
 
-def done(rundir, ids):
+def done(rundir, ids, gen=0):
     idsf = os.path.join(rundir, "prompt.ids")
     log = os.path.join(rundir, "tail.log")
     if not (os.path.exists(idsf) and os.path.exists(log)):
@@ -39,7 +40,14 @@ def done(rundir, ids):
     got = list(struct.unpack("<%dq" % (len(raw) // 8), raw))
     if got != list(ids):
         return False
-    hits = [int(m.group(1)) for m in LINE.finditer(open(log, errors="replace").read())]
+    text = open(log, errors="replace").read()
+    if gen:
+        # A generation run is complete when it printed every step it was asked
+        # for. Its last scored POSITION is not `len(ids) - 1` -- the sequence
+        # grew -- so the one-token check below would never pass.
+        steps = [int(m.group(1)) for m in STEP.finditer(text)]
+        return bool(steps) and max(steps) >= gen
+    hits = [int(m.group(1)) for m in LINE.finditer(text)]
     return bool(hits) and max(hits) == len(ids) - 1
 
 
@@ -51,6 +59,10 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--port", default="7654")
+    ap.add_argument("--timeout", type=float, default=1800.0)
+    ap.add_argument("--gen", type=int, default=0,
+                    help="generate this many tokens per prompt (run_fp4_gen.sh) instead of "
+                         "answering one")
     args = ap.parse_args()
 
     items = json.load(open(args.items))["items"]
@@ -64,7 +76,7 @@ def main():
     t0 = time.time()
     for n, it in enumerate(items, 1):
         rundir = os.path.join(args.outdir, it["key"])
-        if not args.force and done(rundir, it["ids"]):
+        if not args.force and done(rundir, it["ids"], args.gen):
             print(f"[{n}/{len(items)}] {it['key']:<16} already done", flush=True)
             continue
         os.makedirs(rundir, exist_ok=True)
@@ -72,9 +84,25 @@ def main():
         with open(idsf, "wb") as fh:
             fh.write(struct.pack("<%dq" % len(it["ids"]), *it["ids"]))
         t = time.time()
-        rc = subprocess.call([os.path.join(HERE, "run_fp4.sh"), idsf, rundir, args.port])
+        # One retry. The observed failure is a cubecl channel `RecvError` in
+        # the head when the box is short of memory, which is transient by
+        # nature -- the next attempt has the field to itself. A failure that
+        # repeats is a real one and is reported rather than retried away.
+        for attempt in (1, 2):
+            try:
+                cmd = ([os.path.join(HERE, "run_fp4_gen.sh"), idsf, rundir,
+                        str(args.gen), args.port] if args.gen else
+                       [os.path.join(HERE, "run_fp4.sh"), idsf, rundir, args.port])
+                rc = subprocess.run(cmd, timeout=args.timeout).returncode
+            except subprocess.TimeoutExpired:
+                rc = -1
+                subprocess.run(["pkill", "-f", idsf], check=False)
+            if done(rundir, it["ids"], args.gen):
+                break
+            if attempt == 1:
+                print(f"    rc={rc}; retrying once", flush=True)
         el = time.time() - t
-        ok = done(rundir, it["ids"])
+        ok = done(rundir, it["ids"], args.gen)
         print(f"[{n}/{len(items)}] {it['key']:<16} rc={rc} {el:6.1f}s "
               f"{'ok' if ok else 'INCOMPLETE'}   elapsed {(time.time() - t0) / 60:.1f} min",
               flush=True)

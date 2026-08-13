@@ -1,0 +1,352 @@
+{
+ "n": 40,
+ "split": "open",
+ "families": "",
+ "flip": 0,
+ "bf16_right": 36,
+ "fp4_right": 36,
+ "agree": 40,
+ "b_lost": 0,
+ "c_gained": 0,
+ "both": 36,
+ "neither": 4,
+ "mcnemar_p": 1.0,
+ "cluster_p_loss": 1.0,
+ "cluster_p_disagree": 1.0,
+ "reference_wobble_logits": 0.875,
+ "fragile_items": [
+  "arith-change",
+  "arith-pct",
+  "arith-divmod",
+  "con-sumdigits"
+ ],
+ "per_family": {
+  "arith": {
+   "n": 8,
+   "bf16_right": 8,
+   "fp4_right": 8,
+   "agree": 8,
+   "lost": 0,
+   "gained": 0,
+   "eligible": 8
+  },
+  "code": {
+   "n": 8,
+   "bf16_right": 6,
+   "fp4_right": 6,
+   "agree": 8,
+   "lost": 0,
+   "gained": 0,
+   "eligible": 6
+  },
+  "constraint": {
+   "n": 8,
+   "bf16_right": 6,
+   "fp4_right": 6,
+   "agree": 8,
+   "lost": 0,
+   "gained": 0,
+   "eligible": 6
+  },
+  "factual": {
+   "n": 8,
+   "bf16_right": 8,
+   "fp4_right": 8,
+   "agree": 8,
+   "lost": 0,
+   "gained": 0,
+   "eligible": 8
+  },
+  "retrieval": {
+   "n": 8,
+   "bf16_right": 8,
+   "fp4_right": 8,
+   "agree": 8,
+   "lost": 0,
+   "gained": 0,
+   "eligible": 8
+  }
+ },
+ "items": [
+  {
+   "key": "fact-o0",
+   "family": "factual",
+   "key_letter": "A",
+   "bf16": "A",
+   "fp4": "A"
+  },
+  {
+   "key": "fact-o1",
+   "family": "factual",
+   "key_letter": "B",
+   "bf16": "B",
+   "fp4": "B"
+  },
+  {
+   "key": "fact-o2",
+   "family": "factual",
+   "key_letter": "C",
+   "bf16": "C",
+   "fp4": "C"
+  },
+  {
+   "key": "fact-o3",
+   "family": "factual",
+   "key_letter": "D",
+   "bf16": "D",
+   "fp4": "D"
+  },
+  {
+   "key": "fact-o4",
+   "family": "factual",
+   "key_letter": "A",
+   "bf16": "A",
+   "fp4": "A"
+  },
+  {
+   "key": "fact-o5",
+   "family": "factual",
+   "key_letter": "B",
+   "bf16": "B",
+   "fp4": "B"
+  },
+  {
+   "key": "fact-o6",
+   "family": "factual",
+   "key_letter": "C",
+   "bf16": "C",
+   "fp4": "C"
+  },
+  {
+   "key": "fact-o7",
+   "family": "factual",
+   "key_letter": "D",
+   "bf16": "D",
+   "fp4": "D"
+  },
+  {
+   "key": "arith-change",
+   "family": "arith",
+   "key_letter": "A",
+   "bf16": "A",
+   "fp4": "A"
+  },
+  {
+   "key": "arith-pct",
+   "family": "arith",
+   "key_letter": "B",
+   "bf16": "B",
+   "fp4": "B"
+  },
+  {
+   "key": "arith-speed",
+   "family": "arith",
+   "key_letter": "C",
+   "bf16": "C",
+   "fp4": "C"
+  },
+  {
+   "key": "arith-seq",
+   "family": "arith",
+   "key_letter": "D",
+   "bf16": "D",
+   "fp4": "D"
+  },
+  {
+   "key": "arith-divmod",
+   "family": "arith",
+   "key_letter": "A",
+   "bf16": "A",
+   "fp4": "A"
+  },
+  {
+   "key": "arith-frac",
+   "family": "arith",
+   "key_letter": "B",
+   "bf16": "B",
+   "fp4": "B"
+  },
+  {
+   "key": "arith-units",
+   "family": "arith",
+   "key_letter": "C",
+   "bf16": "C",
+   "fp4": "C"
+  },
+  {
+   "key": "arith-carry",
+   "family": "arith",
+   "key_letter": "D",
+   "bf16": "D",
+   "fp4": "D"
+  },
+  {
+   "key": "code-alias",
+   "family": "code",
+   "key_letter": "A",
+   "bf16": "A",
+   "fp4": "A"
+  },
+  {
+   "key": "code-fib",
+   "family": "code",
+   "key_letter": "B",
+   "bf16": "D",
+   "fp4": "D"
+  },
+  {
+   "key": "code-slice",
+   "family": "code",
+   "key_letter": "C",
+   "bf16": "C",
+   "fp4": "C"
+  },
+  {
+   "key": "code-default",
+   "family": "code",
+   "key_letter": "D",
+   "bf16": "D",
+   "fp4": "D"
+  },
+  {
+   "key": "code-dict",
+   "family": "code",
+   "key_letter": "A",
+   "bf16": "A",
+   "fp4": "A"
+  },
+  {
+   "key": "code-loop",
+   "family": "code",
+   "key_letter": "B",
+   "bf16": "B",
+   "fp4": "B"
+  },
+  {
+   "key": "code-str",
+   "family": "code",
+   "key_letter": "C",
+   "bf16": "A",
+   "fp4": "A"
+  },
+  {
+   "key": "code-int",
+   "family": "code",
+   "key_letter": "D",
+   "bf16": "D",
+   "fp4": "D"
+  },
+  {
+   "key": "con-notprime",
+   "family": "constraint",
+   "key_letter": "A",
+   "bf16": "A",
+   "fp4": "A"
+  },
+  {
+   "key": "con-words",
+   "family": "constraint",
+   "key_letter": "B",
+   "bf16": "A",
+   "fp4": "A"
+  },
+  {
+   "key": "con-nolettere",
+   "family": "constraint",
+   "key_letter": "C",
+   "bf16": "C",
+   "fp4": "C"
+  },
+  {
+   "key": "con-alpha",
+   "family": "constraint",
+   "key_letter": "D",
+   "bf16": "D",
+   "fp4": "D"
+  },
+  {
+   "key": "con-longest",
+   "family": "constraint",
+   "key_letter": "A",
+   "bf16": "A",
+   "fp4": "A"
+  },
+  {
+   "key": "con-notcolour",
+   "family": "constraint",
+   "key_letter": "B",
+   "bf16": "B",
+   "fp4": "B"
+  },
+  {
+   "key": "con-vowelstart",
+   "family": "constraint",
+   "key_letter": "C",
+   "bf16": "C",
+   "fp4": "C"
+  },
+  {
+   "key": "con-sumdigits",
+   "family": "constraint",
+   "key_letter": "D",
+   "bf16": "C",
+   "fp4": "C"
+  },
+  {
+   "key": "ret-pop",
+   "family": "retrieval",
+   "key_letter": "A",
+   "bf16": "A",
+   "fp4": "A"
+  },
+  {
+   "key": "ret-admin",
+   "family": "retrieval",
+   "key_letter": "B",
+   "bf16": "B",
+   "fp4": "B"
+  },
+  {
+   "key": "ret-export",
+   "family": "retrieval",
+   "key_letter": "C",
+   "bf16": "C",
+   "fp4": "C"
+  },
+  {
+   "key": "ret-where",
+   "family": "retrieval",
+   "key_letter": "D",
+   "bf16": "D",
+   "fp4": "D"
+  },
+  {
+   "key": "ret-field",
+   "family": "retrieval",
+   "key_letter": "A",
+   "bf16": "A",
+   "fp4": "A"
+  },
+  {
+   "key": "ret-founded",
+   "family": "retrieval",
+   "key_letter": "B",
+   "bf16": "B",
+   "fp4": "B"
+  },
+  {
+   "key": "ret-treaty",
+   "family": "retrieval",
+   "key_letter": "C",
+   "bf16": "C",
+   "fp4": "C"
+  },
+  {
+   "key": "ret-largest",
+   "family": "retrieval",
+   "key_letter": "D",
+   "bf16": "D",
+   "fp4": "D"
+  }
+ ]
+}

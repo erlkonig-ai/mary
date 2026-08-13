@@ -318,14 +318,44 @@ def main():
         # Only the last REAL position of each item is ever read, so the [B, T,
         # 201024] logit tensor is never built: 40 x 256 x 201024 floats would be
         # 4.1 GB for 40 rows we want.
-        last = torch.stack([h[b, lens[b] - 1] for b in range(B)]).to(DT)
-        last = last / cfg.logits_mup_width_multiplier
         unembed = get("model.llm.unembed.weight")
-        logits = torch.nn.functional.linear(last, unembed).float()
+
+        def unembed_rows(rows):
+            """[R, hidden] -> [R, unpadded_vocab] float32."""
+            z = torch.nn.functional.linear(rows.to(DT) / cfg.logits_mup_width_multiplier,
+                                           unembed).float()
+            if cfg.unpadded_vocab_size and cfg.unpadded_vocab_size < z.shape[-1]:
+                z = z[..., : cfg.unpadded_vocab_size]
+            return z
+
+        # Only the last REAL position of each item is ever read, so the [B, T,
+        # 201024] logit tensor is never built: 60 x 265 x 201024 floats would be
+        # 12.8 TB for 60 rows we want.
+        last = torch.stack([h[b, lens[b] - 1] for b in range(B)])
+        logits = unembed_rows(last)
+
+        # `score_from` asks for every position from k onward as well -- the
+        # teacher-forced lane. It is the SAME forward: the reference has already
+        # computed a hidden state at every position, and asking it what it would
+        # have emitted at each one costs an unembedding, not another stream.
+        # That is the only affordable way to say anything about the 2nd..nth
+        # token, and it is why the answer to "what about longer outputs" is a
+        # 200-row matmul rather than 200 more passes over 531.9 GB.
+        seqs = {}
+        for b, it in enumerate(batch):
+            k = it.get("score_from")
+            if k is None:
+                continue
+            rows = h[b, k: lens[b]]
+            z = unembed_rows(rows)
+            seqs[it["key"]] = {
+                "score_from": k,
+                "argmax": [int(x) for x in z.argmax(-1).tolist()],
+                "top_logit": [float(x) for x in z.max(-1).values.tolist()],
+            }
+            del z
         del unembed
-        if cfg.unpadded_vocab_size and cfg.unpadded_vocab_size < logits.shape[-1]:
-            logits = logits[..., : cfg.unpadded_vocab_size]
-        return logits, secs, gib
+        return (logits, seqs), secs, gib
 
     t_all = time.time()
     if args.layers:
@@ -334,7 +364,7 @@ def main():
               f"{(time.time() - t_all) / args.layers * cfg.num_hidden_layers:.0f}s", flush=True)
         return
 
-    logits, secs, gib = run(items, "batch", 0)
+    (logits, seqs), secs, gib = run(items, "batch", 0)
 
     out = {
         "checkpoint": args.ckpt,
@@ -361,6 +391,8 @@ def main():
             "top_logits": [float(x) for x in vals.tolist()],
             "argmax": int(idx[0]),
         }
+        if it["key"] in seqs:
+            r["positions"] = seqs[it["key"]]
         if it.get("option_ids"):
             r["option_ids"] = list(it["option_ids"])
             r["option_logits"] = [float(row[i]) for i in it["option_ids"]]
@@ -373,7 +405,7 @@ def main():
     print(f"wrote {args.out} ({time.time() - t_all:.1f}s so far)", flush=True)
 
     if args.selfcheck:
-        solo, _, _ = run(items[:1], "solo", 0)
+        (solo, _), _, _ = run(items[:1], "solo", 0)
         d = (solo[0] - logits[0]).abs().max().item()
         out["selfcheck_max_abs_logit_delta"] = d
         print(f"selfcheck: item {items[0]['key']!r} alone vs in a batch of "

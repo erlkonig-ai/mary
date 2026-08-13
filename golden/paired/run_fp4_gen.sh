@@ -1,24 +1,21 @@
 #!/bin/bash
-# One NVFP4 forward of the whole 42-layer stack, as a head+tail pair on ONE box.
+# The NVFP4 runtime GENERATING, rather than answering one token.
 #
-# `inkling_forward` refuses to run the whole stack in one process, so even a
-# single-machine run is two processes over a socket. Over loopback that says
-# NOTHING about whether the model fits two nodes — both halves are competing for
-# the same 119 GiB here — but it says everything about capability, which is a
-# property of the weights and the arithmetic and not of the wire.
+# Same loopback head+tail pair as `run_fp4.sh`, plus `INK_GEN` steps with the
+# KV cache on. The continuation is what `gen_divergence.py` then hands to the
+# BF16 reference for teacher-forced scoring — the runtime writes the path and
+# the reference says, at every step, whether it would have taken it.
 #
-# The tail binds and the head connects, with no retry on the connect, so the
-# tail has to be listening first: this waits for its "pipe: listening" line
-# rather than sleeping a guessed number of seconds.
+# `INK_KV=1` is deliberate and is not free: it is a different lane from the
+# uncached one every gate in this tree uses as an oracle. It is the lane a real
+# generation runs in, which is the one whose capability is in question.
 #
-#   run_fp4.sh <ids.bin> <outdir> [port]
-#
-# Writes <outdir>/{top5.bin,tail.log,head.log}. The tail owns the logits, so
-# top5.bin and the "after token N" lines both come from tail.log.
+#   run_fp4_gen.sh <ids.bin> <outdir> <n_new> [port]
 set -u
 IDS=$1
 OUT=$2
-PORT=${3:-7654}
+GEN=$3
+PORT=${4:-7655}
 # Neither path is baked in. A default is an opinion about someone else's disk:
 # wrong on every machine but the one it was written on, and it fails by looking
 # in the guessed place and reporting the model missing rather than the path
@@ -41,20 +38,10 @@ SPLIT=${INK_SPLIT:-20}
 NL=${INK_NLAYERS:-42}
 
 mkdir -p "$OUT"
-rm -f "$OUT/tail.log" "$OUT/head.log" "$OUT/top5.bin"
-# The ids that were actually consumed, kept beside the result. The scorer
-# re-reads this and refuses the run if it is not the item's prompt: a result
-# directory that has drifted from the prompt it claims to answer is a failure
-# this tree has already had, and the cure is to make the claim checkable.
+rm -f "$OUT/tail.log" "$OUT/head.log"
 cp "$IDS" "$OUT/prompt.ids"
 
-# `timeout` on both halves is not belt-and-braces. A head that dies mid-pass
-# leaves the tail blocked on a socket read forever, and the first time this
-# happened the whole 60-item set sat on one item for 25 minutes before anyone
-# looked. The head's death is also propagated to the tail explicitly below,
-# because waiting for a 25-minute timeout is only marginally better.
-TMO=${INK_TIMEOUT:-1500}
-timeout $TMO env INK_LAYERS=$SPLIT:$NL INK_PIPE=tail:0.0.0.0:$PORT \
+INK_GEN=$GEN INK_KV=1 INK_LAYERS=$SPLIT:$NL INK_PIPE=tail:0.0.0.0:$PORT \
     "$BIN" "$PILE" "$IDS" "$OUT/top5.bin" > "$OUT/tail.log" 2>&1 &
 TAIL_PID=$!
 
@@ -64,12 +51,11 @@ for _ in $(seq 1 3000); do
     sleep 1
 done
 
-timeout $TMO env INK_LAYERS=0:$SPLIT INK_PIPE=head:127.0.0.1:$PORT \
+INK_GEN=$GEN INK_KV=1 INK_LAYERS=0:$SPLIT INK_PIPE=head:127.0.0.1:$PORT \
     "$BIN" "$PILE" "$IDS" "$OUT/head_top5.bin" > "$OUT/head.log" 2>&1 &
 HEAD_PID=$!
 
 wait $HEAD_PID; HEAD_RC=$?
-[ $HEAD_RC -ne 0 ] && kill $TAIL_PID 2>/dev/null
 wait $TAIL_PID; TAIL_RC=$?
 echo "head rc=$HEAD_RC tail rc=$TAIL_RC"
 exit $(( HEAD_RC | TAIL_RC ))

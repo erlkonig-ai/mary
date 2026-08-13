@@ -1,0 +1,22 @@
+==============================================================================
+PAIRED CAPABILITY: BF16 reference vs NVFP4 runtime   (8 items, split=open)
+==============================================================================
+  BF16 accuracy      5/8 = 62.5%  [95% CI 30.6–86.3]
+  NVFP4 accuracy     4/8 = 50.0%  [95% CI 21.5–78.5]
+  chance             25.0%  (four options, key balanced 25/25/25/25)
+
+  AGREEMENT          7/8 = 87.5%  [95% CI 52.9–97.8]   (same greedy token, no key needed)
+
+  contingency (rows BF16, cols NVFP4)
+      right/right   4   right/wrong   1
+      wrong/right   0   wrong/wrong   3
+
+  LOSS   of the items BF16 gets right, NVFP4 loses 1/5 = 20.0%  [95% CI 3.6–62.4]
+  GAIN   0 item(s) NVFP4 gets right that BF16 does not
+  McNemar exact two-sided p = 1.0000 on 1 discordant pair(s)   -> not distinguishable from noise
+
+  off-menu argmax    BF16 0/8, NVFP4 0/8   (answered with a token that is not A/B/C/D at all)
+  every disagreement, in full
+    arith-divmod     arith      key=A   BF16 margin 0.25  (FRAGILE)
+      BF16  -> A   A:21.88  B:21.62  #1202:20.88  D:20.12  #1416:19.38
+      NVFP4 -> B   B:21.71  A:21.39  D:20.39  #1202:19.70  C:19.66
