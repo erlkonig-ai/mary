@@ -330,6 +330,13 @@ required-features = ["inkling-cuda"]
 name = "inkling_forward"
 required-features = ["inkling-cuda"]
 
+# Text on stdin, an ids file out — the missing half of a forward that reads ids
+# and never text. Same `tokenizers` executor as the gate below, which is what
+# makes it one tokenizer rather than a second transcription.
+[[bin]]
+name = "inkling_encode"
+required-features = ["tokenizer"]
+
 # Does Inkling's BPE tokenizer survive the trip through the trible graph? Both
 # sides of the comparison need the `tokenizers` executor, so this is the one
 # inkling binary gated on `tokenizer` rather than `inkling`.

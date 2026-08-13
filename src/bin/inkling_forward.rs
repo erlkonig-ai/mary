@@ -32,6 +32,21 @@
 //!   # head, on the first
 //!   INK_LAYERS=0:20  INK_PIPE=head:<tail-host>:7654 inkling_forward <pile> <ids> <out>
 //!
+//! # Drafting happens on the tail
+//!
+//! `INK_MTP=k` used to refuse a pipe, on the reasoning that "the head owns no
+//! unembedding and the tail owns no embedding table, so neither end can draft
+//! alone". Half of that is right. An MTP head takes the stack's FINAL hidden
+//! state and the embedding of the token one step ahead, and the tail computes
+//! the last layer, owns the final norm, owns the unembedding, and follows the
+//! sequence by recomputing the argmax rather than being told. The embedding
+//! table was the only missing piece, and a tail with `INK_MTP` set now loads it
+//! — deliberately, for this configuration and no other, since the point of the
+//! split is that neither box pins a table it never reads.
+//!
+//! Set `INK_MTP` on the TAIL process only. It is refused on a head, which holds
+//! neither the final hidden state nor a way to turn one into a token.
+//!
 //! # One lane, all the way down
 //!
 //! There is nothing to select. Attention, the dense and shared MLPs, the head
@@ -108,6 +123,26 @@ fn io_read_bytes() -> u64 {
                 .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse().ok()))
         })
         .unwrap_or(0)
+}
+
+/// A 95% Wilson score interval for `hits` of `n`.
+///
+/// Wilson rather than the textbook normal interval, because this measurement
+/// produces rates at both ends — depth 1 near 3/4, depth 4 at or near 0 — and
+/// there the normal interval runs off the end of [0, 1] and reports a bound that
+/// is not a bound. It is printed beside every rate so the counts can be read as
+/// evidence: 15/20 and 150/200 are the same percentage and not the same claim.
+fn wilson95(hits: usize, n: usize) -> (f64, f64) {
+    if n == 0 {
+        return (0.0, 1.0);
+    }
+    let z = 1.959_963_984_540_054_f64;
+    let (h, n) = (hits as f64, n as f64);
+    let p = h / n;
+    let d = 1.0 + z * z / n;
+    let centre = (p + z * z / (2.0 * n)) / d;
+    let half = z * ((p * (1.0 - p) / n) + z * z / (4.0 * n * n)).sqrt() / d;
+    ((centre - half).max(0.0), (centre + half).min(1.0))
 }
 
 /// Which end of a two-machine split this process is, if it is one.
@@ -903,6 +938,39 @@ fn main() -> Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
+
+    // Drafting runs on the TAIL, and only there. This used to refuse a pipe
+    // outright -- "neither end can draft alone" -- which was true of the head
+    // and false of the tail, and once INK_LAYERS became required it left NO
+    // configuration in which acceptance could be measured at all. The tail
+    // computes the last layer, so `x` at the draft site IS the whole stack's
+    // final hidden state; it owns the final norm and the unembedding because it
+    // takes the argmax; and it follows the sequence by recomputing that argmax
+    // rather than being told, so its `ids` is the head's. The embedding table
+    // was the only missing piece, and it is loaded below.
+    //
+    // `INK_MTP=k` drafts k tokens ahead with the MTP heads and scores them
+    // against what the stack actually generates. It measures ACCEPTANCE, which
+    // is the only oracle the composition has -- see mary::models::inkling::mtp.
+    // Read here rather than beside the other lane switches because it decides
+    // WHICH TABLES THIS PROCESS LOADS: drafting is the one configuration in
+    // which a tail needs the embedding table, and the switch has to precede its
+    // use.
+    let mtp_k: usize = std::env::var("INK_MTP").ok().map(|v| v.parse()).transpose()?.unwrap_or(0);
+    let mtp_order = match std::env::var("INK_MTP_ORDER") {
+        Ok(v) => MtpConcat::parse(&v)
+            .with_context(|| format!("INK_MTP_ORDER wants hidden|embed, got {v:?}"))?,
+        Err(_) => MtpConcat::HiddenFirst,
+    };
+    // A head is still refused, and not out of caution: it holds neither the
+    // final hidden state nor any way to turn one into a token.
+    anyhow::ensure!(
+        mtp_k == 0 || !is_head,
+        "INK_MTP drafts on the TAIL, not the head: a head owns neither the stack's final hidden \
+         state nor the unembedding, so it cannot turn a draft into a token. Set INK_MTP on the \
+         tail process -- it loads the embedding table for exactly this -- and leave it unset here."
+    );
+
     let started = Instant::now();
     // Hoisted: re-reading 4.8 GB of embedding tables per generated token would
     // dwarf everything else in the loop.
@@ -911,7 +979,17 @@ fn main() -> Result<()> {
     // is not tidiness: the whole reason for two machines is that this model's
     // working set does not fit in one page cache, and 4.8 GB of embedding
     // pinned on the box that only unembeds is 4.8 GB of expert slabs evicted.
-    let want_embed = !is_tail;
+    //
+    // Drafting is the ONE exception, and only on the tail. An MTP head takes the
+    // stack's final hidden state and the embedding of the token one step ahead;
+    // the tail already has the first of those (it computes the last layer), the
+    // final norm and the unembedding, so the embedding table is the single
+    // missing piece. `INK_MTP` on a tail buys exactly that piece back, and
+    // nothing else changes about which end holds what. The embedding NORM stays
+    // head-only: it belongs to the main stack's input, and every MTP head norms
+    // its own embeddings with its own `embed_norm`.
+    let want_embed = !is_tail || mtp_k > 0;
+    let want_embed_norm = !is_tail;
     let want_head = !is_head;
     // The embedding table, as the BF16 the pile stores. `cp.held` turned 2.40
     // GiB of stored weight into 4.81 GB of host f32 and pinned it for the run,
@@ -925,26 +1003,25 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    let embed_n = if want_embed { Some(cp.held("model.llm.embed_norm.weight")?) } else { None };
+    // `want_embed_norm`, NOT `want_embed`: a drafting tail takes the embedding
+    // table and leaves the norm behind, because every MTP head norms its own
+    // embeddings with its own `embed_norm`.
+    let embed_n = if want_embed_norm { Some(cp.held("model.llm.embed_norm.weight")?) } else { None };
     let fnorm = if want_head { Some(cp.held("model.llm.norm.weight")?) } else { None };
     // The unembed table is NOT read here any more, and not widened anywhere.
     // It used to be `cp.held(...)`, which turned 1.6 GiB of stored BF16 into
     // 3.3 GB of host f32, uploaded THAT, and dropped the host copy. Now the
     // stored bytes are bound where they lie (see `unembed_w` below) and the
     // 3.3 GB never exists in either place.
-    println!("  embedding tables loaded in {:.1}s", started.elapsed().as_secs_f32());
-
-    // `INK_MTP=k` drafts k tokens ahead with the MTP heads and scores them
-    // against what the stack actually generates. It measures ACCEPTANCE, which
-    // is the only oracle the composition has -- see mary::models::inkling::mtp.
-    // Read here rather than beside the other lane switches because the heads are
-    // loaded with the embedding tables, and the switch has to precede its use.
-    let mtp_k: usize = std::env::var("INK_MTP").ok().map(|v| v.parse()).transpose()?.unwrap_or(0);
-    let mtp_order = match std::env::var("INK_MTP_ORDER") {
-        Ok(v) => MtpConcat::parse(&v)
-            .with_context(|| format!("INK_MTP_ORDER wants hidden|embed, got {v:?}"))?,
-        Err(_) => MtpConcat::HiddenFirst,
-    };
+    println!(
+        "  embedding tables loaded in {:.1}s{}",
+        started.elapsed().as_secs_f32(),
+        if is_tail && mtp_k > 0 {
+            "  (tail + INK_MTP: the embedding table is loaded here too, for drafting)"
+        } else {
+            ""
+        }
+    );
 
     // The MTP heads, only when asked for: eight dense blocks is 4.16 GiB, and a
     // run that is not drafting should not pay for them.
@@ -1017,6 +1094,14 @@ fn main() -> Result<()> {
     let mut mtp_pending: Vec<(usize, usize, usize)> = Vec::new();
     let mut mtp_hits = vec![0usize; mtp_k];
     let mut mtp_seen = vec![0usize; mtp_k];
+    // Per ISSUING step, which depths turned out right. The per-depth rates are
+    // MARGINALS — head d's draft against the true token at step s+d+1 — and an
+    // accept-and-skip loop does not get to keep a correct depth-2 draft that sits
+    // behind a wrong depth-1 one. What it keeps is the LEADING RUN of correct
+    // drafts, so that is measured here rather than inferred from the marginals:
+    // inferring it would need the depths to be independent, and they are not,
+    // because head d is fed draft d-1.
+    let mut mtp_issued: BTreeMap<usize, Vec<Option<bool>>> = BTreeMap::new();
     // The MTP entry hidden state for every position, retained. 16 KB a token
     // at f32, and the reason the cached lane can draft at all -- see the draft
     // block for why a row, once produced, never changes.
@@ -1046,6 +1131,19 @@ fn main() -> Result<()> {
     // cached lane has (`INK_MTP_CHECK` compares the two in one process), so
     // deleting it would delete the check that the cache is right.
     let kv = std::env::var("INK_KV").map(|v| v == "1" || v == "on").unwrap_or(false);
+    // `INK_REPEAT=1` keeps the token loop from GROWING the sequence: every step
+    // re-runs the identical pass over the identical prompt. It exists because
+    // the only pass of a given width a process can otherwise produce is its
+    // FIRST one, which is also the one that pays for uploading every resident
+    // weight -- 34 s against 1.4 s for the next. Comparing the cost of a 1-row
+    // pass with a 2-row one therefore compared two different warm-up states,
+    // not two widths. With this set the second and later steps are warm and
+    // identical, so the widths can be compared by running the binary twice with
+    // two prompts. Measurement only: the generated token is still printed and
+    // still thrown away, so the run produces no continuation.
+    let repeat = std::env::var("INK_REPEAT").map(|v| v == "1" || v == "on").unwrap_or(false);
+    anyhow::ensure!(!repeat || !kv, "INK_REPEAT wants the uncached lane: with a KV cache a \
+         repeated pass would append the same position to the cache again");
     // Head d's first STABLE row sits at position seq-1-d, so a prompt shorter
     // than the number of heads leaves a depth with no stable row at all: every
     // position of that head would be a function of drafts and the cache would
@@ -1055,13 +1153,6 @@ fn main() -> Result<()> {
         mtp_k == 0 || !kv || ids.len() >= mtp_k,
         "INK_MTP={mtp_k} with INK_KV needs a prompt of at least {mtp_k} tokens, this one is {}",
         ids.len()
-    );
-    anyhow::ensure!(
-        mtp_k == 0 || pipe_spec.is_none(),
-        "INK_MTP needs one process to own both ends -- the head owns no unembedding and the tail \
-         owns no embedding table, so neither can draft alone. Which means drafting cannot run at \
-         all on a stack that no longer fits one node; the heads and the check are kept because \
-         the composition they gate is what a cross-node draft would be built from."
     );
     anyhow::ensure!(
         mtp_k <= cfg.mtp_config.num_nextn_predict_layers,
@@ -1552,6 +1643,31 @@ fn main() -> Result<()> {
             }
             t_h_route += t_rt.elapsed().as_secs_f64();
 
+            // `INK_ROUTE_LOG=<path>` appends this layer's routing, one line per
+            // position, plus the layer's DISTINCT-expert count. The count is
+            // written so the file can be checked against `expert slabs
+            // decoded` instead of trusted: the sum of the `distinct=` lines of
+            // a pass must equal that counter, and a log that disagrees with the
+            // number the run acted on is describing a different run.
+            //
+            // Written from `routing`, the same vector the block then feeds to
+            // the experts -- not recomputed -- so the log cannot drift from
+            // what was decoded. Positions are ABSOLUTE (`pos0 + ti`), because a
+            // cached step's `ti` is always 0 and the sequence position is the
+            // whole point of an adjacency measurement.
+            if let Ok(rl) = std::env::var("INK_ROUTE_LOG") {
+                use std::io::Write as _;
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&rl)
+                    .with_context(|| format!("INK_ROUTE_LOG={rl}"))?;
+                for (ti, r) in routing.iter().enumerate() {
+                    writeln!(f, "R {step} {layer} {} {:?}", pos0 + ti, r.experts)?;
+                }
+                writeln!(f, "D {step} {layer} {}", by_expert.len())?;
+            }
+
             let t_d = Instant::now();
             // Two formats, two instructions, one lane. 41 of the 42 layers
             // carry NVFP4 experts and go through the block-scaled MMA; layer 2
@@ -1747,6 +1863,11 @@ fn main() -> Result<()> {
             mtp_seen[depth] += 1;
             if tok == best {
                 mtp_hits[depth] += 1;
+            }
+            // The step this draft was ISSUED at: head d drafted the token d+1
+            // steps ahead, so the issuer is target - depth - 1.
+            if let Some(slots) = mtp_issued.get_mut(&(target - depth - 1)) {
+                slots[depth] = Some(tok == best);
             }
             println!(
                 "  MTP depth {}: drafted {tok}, actual {best} -- {}",
@@ -1963,6 +2084,7 @@ fn main() -> Result<()> {
         } else {
             draft_whole(&mtp_main, seq, &ids, best)
         };
+        mtp_issued.insert(step, vec![None; drafts.len()]);
         for (d, &b) in drafts.iter().enumerate() {
             // Head d predicts the token d+1 steps past the one just chosen.
             mtp_pending.push((step + d + 1, d, b));
@@ -1995,7 +2117,7 @@ fn main() -> Result<()> {
     // A tail follows the sequence by RECOMPUTING it, not by being told: it owns
     // the argmax, so pushing it here keeps its `ids` identical to the head's
     // without a second thing on the wire to get out of step.
-    if is_tail && gen_steps > 0 {
+    if is_tail && gen_steps > 0 && !repeat {
         ids.push(best);
     }
 
@@ -2148,7 +2270,7 @@ fn main() -> Result<()> {
                  pass.elapsed().as_secs_f32(), started.elapsed().as_secs_f32(), ids.len(),
                  pass.elapsed().as_secs_f64() * 1e3);
         // The tail already pushed, when it answered its peer.
-        if !is_tail {
+        if !is_tail && !repeat {
             ids.push(best);
         }
     }
@@ -2173,16 +2295,60 @@ fn main() -> Result<()> {
                     println!("  depth {}: never scored", d + 1);
                     continue;
                 }
+                let (c_lo, c_hi) = wilson95(mtp_hits[d], mtp_seen[d]);
                 println!(
-                    "  depth {}: {}/{} = {:.0}%",
+                    "  depth {}: {:5}/{:<5} = {:5.1}%   95% CI [{:5.1}%, {:5.1}%]",
                     d + 1,
                     mtp_hits[d],
                     mtp_seen[d],
-                    100.0 * mtp_hits[d] as f64 / mtp_seen[d] as f64
+                    100.0 * mtp_hits[d] as f64 / mtp_seen[d] as f64,
+                    100.0 * c_lo,
+                    100.0 * c_hi
                 );
             }
             let hits: usize = mtp_hits.iter().sum();
-            println!("  overall: {hits}/{scored} = {:.0}%", 100.0 * hits as f64 / scored as f64);
+            let (c_lo, c_hi) = wilson95(hits, scored);
+            println!(
+                "  pooled : {hits:5}/{scored:<5} = {:5.1}%   95% CI [{:5.1}%, {:5.1}%]",
+                100.0 * hits as f64 / scored as f64,
+                100.0 * c_lo,
+                100.0 * c_hi
+            );
+            // Pooling across depths is a number to read carefully: it averages a
+            // depth-1 rate with a depth-4 one, so it moves when INK_MTP moves and
+            // is a fact about the configuration as much as about the model. It is
+            // kept because a pooled ZERO settles the concat question at a glance;
+            // the per-depth rows are what a speculation decision reads.
+
+            // What an accept-and-skip loop would actually keep. Only draft sets
+            // every depth of which got scored count — a set whose deeper heads
+            // named steps past the end of the run has no prefix length yet, and
+            // counting it as "prefix ended here" would bias the mean down by
+            // exactly the runs that ran out of tokens.
+            let complete: Vec<&Vec<Option<bool>>> =
+                mtp_issued.values().filter(|v| v.iter().all(|s| s.is_some())).collect();
+            if !complete.is_empty() {
+                let sets = complete.len();
+                let mut hist = vec![0usize; mtp_k + 1];
+                for v in &complete {
+                    let mut run = 0usize;
+                    while run < v.len() && v[run] == Some(true) {
+                        run += 1;
+                    }
+                    hist[run] += 1;
+                }
+                let mean: f64 = hist
+                    .iter()
+                    .enumerate()
+                    .map(|(l, &c)| l as f64 * c as f64)
+                    .sum::<f64>()
+                    / sets as f64;
+                println!("  accepted prefix, over {sets} fully-scored draft sets:");
+                for (l, &c) in hist.iter().enumerate() {
+                    println!("    {l} accepted: {c:5}   ({:5.1}%)", 100.0 * c as f64 / sets as f64);
+                }
+                println!("    mean {mean:.3} draft tokens accepted per verify pass");
+            }
             // What the number MEANS, said here rather than left to the reader,
             // because the whole point of this experiment is that a low rate is
             // evidence about the composition and not about the model.
