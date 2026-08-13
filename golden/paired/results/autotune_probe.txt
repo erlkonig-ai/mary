@@ -1,0 +1,37 @@
+=== CUBECL_AUTOTUNE_LEVEL=0, arith-change, two runs back to back ===
+ position     fp4_at0_a     fp4_at0_b
+        1          6052        200028   <-- FLIPPED
+       33           261           220   <-- FLIPPED
+       48        200008         65570   <-- FLIPPED
+       69            23           279   <-- FLIPPED
+
+positions compared     73 over 1 prompt(s)
+argmax flip rate       4/73 = 5.48% [95% CI 2.15–13.26]
+|delta top-1 logit|    median 0.36, max 3.57  (BF16's own batching wobble was 0.875)
+margin where it flipped   max 0.69, median 0.40
+margin where it did not   median 1.45
+  -> every flip is on a margin narrower than the typical position, which is what rounding looks like and not what a bug looks like
+SCORED position stable 1/1 = 100.0% [95% CI 20.7–100.0]
+
+Read the scored-position line as the floor under the paired result: a loss
+rate below the rate at which the runtime disagrees with itself is not evidence
+about quantisation.
+
+=== autotune ON, same prompt, main run vs repeat ===
+ position  arith-change  arith-change
+       33           261           220   <-- FLIPPED
+       43           328          3343   <-- FLIPPED
+       48        200008         65570   <-- FLIPPED
+       71           483            25   <-- FLIPPED
+
+positions compared     73 over 1 prompt(s)
+argmax flip rate       4/73 = 5.48% [95% CI 2.15–13.26]
+|delta top-1 logit|    median 0.26, max 2.72  (BF16's own batching wobble was 0.875)
+margin where it flipped   max 1.14, median 0.53
+margin where it did not   median 1.70
+  -> every flip is on a margin narrower than the typical position, which is what rounding looks like and not what a bug looks like
+SCORED position stable 1/1 = 100.0% [95% CI 20.7–100.0]
+
+Read the scored-position line as the floor under the paired result: a loss
+rate below the rate at which the runtime disagrees with itself is not evidence
+about quantisation.
