@@ -23,6 +23,8 @@
 use burn::prelude::*;
 use burn::tensor::{Int, Tensor, TensorData};
 
+use crate::models::inkling::seam::{client_of, handle_of, tensor_of, Bk};
+
 /// `x * sigmoid(x)`, elementwise.
 pub fn silu<B: Backend>(x: Tensor<B, 2>) -> Tensor<B, 2> {
     let s = burn::tensor::activation::sigmoid(x.clone());
@@ -77,27 +79,46 @@ pub fn conv_history<B: Backend>(x: Tensor<B, 2>, kernel: usize) -> Tensor<B, 2> 
 /// One position of the short convolution, given the `kernel - 1` inputs before
 /// it. Returns the output row and the history to carry to the next position.
 ///
-/// `hist` is oldest-first, so `cat(hist, x)` is exactly the window
-/// `x[pos - (kernel - 1) ..= pos]` that [`short_conv`]'s last row reads —
-/// which is why this delegates to that function rather than restating the tap
-/// arithmetic. The two lanes cannot drift because there is only one.
-pub fn short_conv_step<B: Backend>(
-    hist: Tensor<B, 2>,
-    x: Tensor<B, 2>,
-    weight: Tensor<B, 2>,
-) -> (Tensor<B, 2>, Tensor<B, 2>) {
+/// `hist` is oldest-first, so the window this convolves is
+/// `[hist[0], …, hist[kernel-2], x]` — exactly the `x[pos - (kernel - 1) ..=
+/// pos]` that [`short_conv`]'s last row reads.
+///
+/// This used to BE that call: concatenate, convolve every position of the
+/// window, keep the last row. It was nineteen launches to produce one row, four
+/// times a layer, and `nsys` charged 1520 of a decode step's 4720 kernels to
+/// it — a third of them, for 1.5 ms of the 84 ms the GPU was busy. It is now
+/// [`crate::models::inkling::sconv`], one kernel, one thread a channel,
+/// accumulating the taps in the same ascending order the slice lane added them.
+///
+/// Concrete on [`Bk`] rather than generic over `B: Backend`, because the kernel
+/// takes a `cubecl::server::Handle` and the seam that produces one is concrete.
+/// That costs nothing: this file's own tests already say "the only backend
+/// there is", and [`short_conv`] — the prefill form, which runs once — stays
+/// generic.
+pub fn short_conv_step(
+    hist: Tensor<Bk, 2>,
+    x: Tensor<Bk, 2>,
+    weight: Tensor<Bk, 2>,
+) -> (Tensor<Bk, 2>, Tensor<Bk, 2>) {
     let [rows, dim] = x.dims();
     assert_eq!(rows, 1, "a decode step convolves exactly one position");
-    let [_, kernel] = weight.dims();
+    let [wdim, kernel] = weight.dims();
+    assert_eq!(dim, wdim, "short_conv_step: x is [_, {dim}] but the weight is [{wdim}, _]");
     assert_eq!(
         hist.dims(),
         [kernel - 1, dim],
         "the history must be the {} rows before this one",
         kernel - 1
     );
-    let win = Tensor::cat(vec![hist, x], 0);
-    let out = short_conv(win.clone(), weight);
-    (out.slice([kernel - 1..kernel, 0..dim]), conv_history(win, kernel))
+    let client = client_of(&x);
+    let dev = x.device();
+    let (h_hist, h_x, h_w) = (handle_of(hist), handle_of(x), handle_of(weight));
+    let (out, next) =
+        crate::models::inkling::sconv::short_conv_decode(&client, &h_hist, &h_x, &h_w, dim, kernel);
+    (
+        tensor_of(client.clone(), dev.clone(), out, 1, dim),
+        tensor_of(client, dev, next, kernel - 1, dim),
+    )
 }
 
 /// Depthwise causal short convolution **plus its internal residual**, on device.
@@ -373,15 +394,19 @@ pub fn attention_prefill<B: Backend>(
 ///
 /// No `mask` argument: causality is structural here — every cached key precedes
 /// `pos` — and the window is applied against the retained distances directly.
-pub fn attention_step<B: Backend>(
-    x: Tensor<B, 2>,
-    w: &AttnWeightsDev<B>,
+///
+/// Concrete on [`Bk`] for the same reason [`short_conv_step`] is: the two
+/// convolutions it runs on K and V are that function, and that function is a
+/// raw cubecl kernel now.
+pub fn attention_step(
+    x: Tensor<Bk, 2>,
+    w: &AttnWeightsDev<Bk>,
     d: &crate::models::inkling::attn::AttnDims,
     log_scaling: Option<crate::models::inkling::attn::LogScaling>,
     pos: usize,
     window: Option<usize>,
-    cache: &mut AttnCache<B>,
-) -> Tensor<B, 2> {
+    cache: &mut AttnCache<Bk>,
+) -> Tensor<Bk, 2> {
     use crate::models::inkling::config::AttnKind;
 
     let [rows, hidden] = x.dims();
@@ -438,10 +463,10 @@ pub fn attention_step<B: Backend>(
         max_dist = max_dist.max(dist);
     }
     let eff = d.rel_extent.min(max_dist + 1);
-    let idx: Tensor<B, 3, Int> =
+    let idx: Tensor<Bk, 3, Int> =
         Tensor::from_data(TensorData::new(idx, [1, 1, len]), &dev).repeat_dim(0, heads);
-    let valid: Tensor<B, 3> = Tensor::from_data(TensorData::new(valid, [1, 1, len]), &dev);
-    let wmask: Tensor<B, 3> = Tensor::from_data(TensorData::new(wmask, [1, 1, len]), &dev);
+    let valid: Tensor<Bk, 3> = Tensor::from_data(TensorData::new(valid, [1, 1, len]), &dev);
+    let wmask: Tensor<Bk, 3> = Tensor::from_data(TensorData::new(wmask, [1, 1, len]), &dev);
 
     let rel = r
         .reshape([heads, d.d_rel])
@@ -451,7 +476,7 @@ pub fn attention_step<B: Backend>(
     let bias = rel.gather(2, idx) * valid;
 
     let qh = q.reshape([1, heads, head_dim]).swap_dims(0, 1);
-    let expand = |t: Tensor<B, 2>| -> Tensor<B, 3> {
+    let expand = |t: Tensor<Bk, 2>| -> Tensor<Bk, 3> {
         t.reshape([len, kv_heads, head_dim])
             .swap_dims(0, 1)
             .reshape([kv_heads, 1, len, head_dim])

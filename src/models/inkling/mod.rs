@@ -37,6 +37,10 @@ pub mod pile;
 // bytes. Two functions; it is what lets the residual stream stay on the device
 // across a lane boundary that is a dialect boundary and nothing more.
 pub mod seam;
+// The short convolution's decode step, as one kernel instead of nineteen Burn
+// ops. Four run per layer and they were a third of every launch in a decode
+// step; the arithmetic is 16384 multiply-adds.
+pub mod sconv;
 // One interface over the two places a running model's weights can come from —
 // a safetensors checkpoint or a pile — plus the residency cache and the byte
 // counters, which belong to the asking rather than to either storage.
