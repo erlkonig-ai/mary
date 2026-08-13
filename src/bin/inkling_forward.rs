@@ -906,18 +906,17 @@ fn main() -> Result<()> {
     };
     // Nine blocking device round trips for the whole run, instead of four per
     // expert. Every later slab is an offset view of one of these.
-    let zerocopy_on = std::env::var("INK_ZEROCOPY").map(|v| v != "0").unwrap_or(true);
     //
-    // Always an `Aliases` when there is a client, even when nothing can be
-    // aliased: `Aliases::disabled()` copies exactly as the old `None` arm did
-    // but COUNTS it, so `INK_ZEROCOPY=0` produces a measurement rather than a
-    // silence. An A/B with an unmeasured side is not an A/B.
+    // Always an `Aliases`, even when nothing can be aliased:
+    // `Aliases::disabled()` copies exactly as the old `None` arm did but COUNTS
+    // it, so a source whose bytes cannot be aliased reports that rather than
+    // going quiet. The registration is unconditional — on a unified-memory part
+    // a copy of a weight the device can read where it lies is a copy for
+    // nothing, and there is no configuration in which we want one.
     #[cfg(feature = "inkling-cuda")]
     let fp4_aliases = {
-        // INK_ZEROCOPY=0 forces the copying lane, so the seam can be A/B'd
-        // against it with the page cache in the same state.
         let c = &fp4_client;
-        if zerocopy_on {
+        {
             let t = Instant::now();
             let maps = cp.mappings()?;
             let n = maps.len();
@@ -928,9 +927,6 @@ fn main() -> Result<()> {
                 t.elapsed().as_secs_f64() * 1e3
             );
             Some(a.unwrap_or_else(mary::models::inkling::fp4gemm::Aliases::disabled))
-        } else {
-            println!("  zero-copy mappings : OFF (INK_ZEROCOPY=0) -- every bind copies");
-            Some(mary::models::inkling::fp4gemm::Aliases::disabled())
         }
     };
 
