@@ -486,19 +486,12 @@ impl DeviceDense {
 
 /// The dense MLP, with every weight the BF16 it is stored as.
 ///
-/// `dev_lane::dense_mlp`'s twin. It exists here rather than there because
-/// [`Bf16W`] is a raw cubecl handle and `dev_lane` is generic over
-/// `B: Backend`; the arithmetic — `down(silu(gate(x)) * up(x)) * global_scale`
-/// — is the same three lines and the elementwise half still runs in Burn.
-fn dense_mlp_bf16(
-    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
-    dev: &burn::backend::cuda::CudaDevice,
-    x: T2,
-    w: &(Bf16W, Bf16W, Bf16W, f32),
-) -> T2 {
-    let g = lin_bf16(client, dev, x.clone(), &w.0);
-    let u = lin_bf16(client, dev, x, &w.1);
-    lin_bf16(client, dev, dev_lane::silu(g) * u, &w.2).mul_scalar(w.3)
+/// `dev_lane::dense_mlp`'s twin: `down(silu(gate(x)) * up(x)) * global_scale`,
+/// with the elementwise half still in Burn.
+fn dense_mlp_bf16(x: T2, w: &(Bf16W, Bf16W, Bf16W, f32)) -> T2 {
+    let g = dev_lane::linear_bf16(x.clone(), &w.0);
+    let u = dev_lane::linear_bf16(x, &w.1);
+    dev_lane::linear_bf16(dev_lane::silu(g) * u, &w.2).mul_scalar(w.3)
 }
 
 /// The shared experts, with every weight the BF16 it is stored as.
@@ -508,7 +501,6 @@ fn dense_mlp_bf16(
 /// algebraically the same only because `down` is linear and is a different
 /// function the moment anything else is inserted.
 fn shared_experts_bf16(
-    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
     dev: &burn::backend::cuda::CudaDevice,
     x: T2,
     sw: &SharedOnDevice,
@@ -521,14 +513,14 @@ fn shared_experts_bf16(
     // [`SharedOnDevice`] for why: four GEMMs against the same activation are
     // four grids of 256 cubes, and this is one of 1024.
     let inter = sw.gate_up.n / (2 * n_shared);
-    let gu = lin_bf16(client, dev, x, &sw.gate_up);
+    let gu = dev_lane::linear_bf16(x, &sw.gate_up);
     let mut out: Option<T2> = None;
     for s in 0..n_shared {
         let g = gu.clone().slice([0..n, s * inter..(s + 1) * inter]);
         let u = gu.clone().slice([0..n, (n_shared + s) * inter..(n_shared + s + 1) * inter]);
         let col: Vec<f32> = (0..n).map(|tk| gammas[tk * n_shared + s]).collect();
         let gam = BT::<Bk, 2>::from_data(BTD::new(col, [n, 1]), dev);
-        let c = lin_bf16(client, dev, dev_lane::silu(g) * u * gam, &sw.down[s]);
+        let c = dev_lane::linear_bf16(dev_lane::silu(g) * u * gam, &sw.down[s]);
         out = Some(match out {
             Some(o) => o + c,
             None => c,
@@ -537,33 +529,12 @@ fn shared_experts_bf16(
     out.expect("a MoE layer with no shared experts")
 }
 
-/// `x @ Wᵀ` where `W` is the BF16 the pile stores and `x` is a Burn tensor.
-///
-/// The bridge in one place: pad `x` to the MMA's M granularity, hand its buffer
-/// to the raw kernel through [`seam::handle_of`], and wrap the f32 accumulator
-/// that comes back. Nothing here materialises the weight in a wider type than
-/// it is stored in, which is the whole point; f32 accumulation is the
-/// instruction's own output and not a widening.
-///
-/// The padding rows are zeros and are sliced off, so a decode step's one row
-/// costs a 16-row tile of arithmetic against a weight read that dwarfs it. The
-/// zeros are written by the BF16 cast, which was visiting every element anyway;
-/// building them here as a `Tensor::cat` cost an allocation and two scatters on
-/// each of the 127 calls a decode step makes.
-fn lin_bf16(
-    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
-    dev: &burn::backend::cuda::CudaDevice,
-    x: T2,
-    w: &mary::models::inkling::bf16gemm::Bf16W,
-) -> T2 {
-    use mary::models::inkling::bf16gemm::{linear_bf16, MTILE};
-    use mary::models::inkling::seam::{handle_of, tensor_of};
-    let [m, k] = x.dims();
-    assert_eq!(k, w.k, "lin_bf16: x is [_, {k}] but the weight is [_, {}]", w.k);
-    let m_pad = m.div_ceil(MTILE) * MTILE;
-    let out = linear_bf16(client, &handle_of(x), w, m, m_pad);
-    tensor_of(client.clone(), dev.clone(), out, m_pad, w.n).slice([0..m, 0..w.n])
-}
+// `lin_bf16` was here. It is `dev_lane::linear_bf16` now: once the attention
+// projections needed the same bridge, keeping a second copy of it in the binary
+// meant two places to get the M padding right. `dev_lane` can host it because
+// nothing about it was generic -- `Bf16W` is a raw cubecl handle and the seam
+// that produces one is concrete on `Bk`, which is exactly what `short_conv_step`
+// already established.
 
 /// One layer's router, on the device except for the part that is a decision.
 ///
@@ -588,7 +559,7 @@ struct RouterDev {
 /// held beside it -- holding both doubles a budget for no gain, since after the
 /// upload nothing on the host reads them again.
 struct LayerDev {
-    attn: dev_lane::AttnWeightsDev<Bk>,
+    attn: dev_lane::AttnWeightsDev,
     attn_sconv: T2,
     mlp_sconv: T2,
     attn_norm: BT<Bk, 1>,
@@ -1524,12 +1495,28 @@ fn main() -> Result<()> {
         if !layers_dev.contains_key(&p) {
             let r0 = t_read.get();
             let t_w0 = Instant::now();
-            let attn = dev_lane::AttnWeightsDev::<Bk> {
-                wq: up2(gv("attn.wq_du.weight")?, heads * head_dim, h, &dev),
-                wk: up2(gv("attn.wk_dv.weight")?, kv_heads * head_dim, h, &dev),
-                wv: up2(gv("attn.wv_dv.weight")?, kv_heads * head_dim, h, &dev),
-                wr: up2(gv("attn.wr_du.weight")?, heads * t.d_rel, h, &dev),
-                wo: up2(gv("attn.wo_ud.weight")?, h, heads * head_dim, &dev),
+            // The five projections bind as the BF16 the pile stores. `gv`
+            // widens to f32 on the way out of the mapping and would double
+            // every one of them on the device for nothing: `mma.sync…bf16`
+            // takes the stored bytes, and where those bytes are inside a
+            // registered mapping `bind_bf16` aliases them instead of copying.
+            let pw = |nm: &str, rows: usize, cols: usize| -> Result<Bf16W> {
+                let s = Instant::now();
+                let leaf = cp.stored(&format!("{p}{nm}"))?;
+                anyhow::ensure!(
+                    leaf.elem == Elem::Bf16,
+                    "{p}{nm} is {:?}; this lane multiplies BF16 by BF16",
+                    leaf.elem
+                );
+                t_read.set(t_read.get() + s.elapsed().as_secs_f64());
+                Ok(bind_bf16(&fp4_client, fp4_aliases.as_ref(), &leaf.bytes, rows, cols))
+            };
+            let attn = dev_lane::AttnWeightsDev {
+                wq: pw("attn.wq_du.weight", heads * head_dim, h)?,
+                wk: pw("attn.wk_dv.weight", kv_heads * head_dim, h)?,
+                wv: pw("attn.wv_dv.weight", kv_heads * head_dim, h)?,
+                wr: pw("attn.wr_du.weight", heads * t.d_rel, h)?,
+                wo: pw("attn.wo_ud.weight", h, heads * head_dim)?,
                 k_sconv: up2(gv("attn.k_sconv.weight")?, kv_heads * head_dim, t.sconv_kernel_size, &dev),
                 v_sconv: up2(gv("attn.v_sconv.weight")?, kv_heads * head_dim, t.sconv_kernel_size, &dev),
                 q_norm: up1(gv("attn.q_norm.weight")?, head_dim, &dev),
@@ -1560,15 +1547,18 @@ fn main() -> Result<()> {
             let rd = t_read.get() - r0;
             t_attn_read += rd;
             t_attn_up += span - rd;
-            dattn_bytes += 4 * (heads * head_dim * h
+            // Two bytes for the projections and four for the rest, because that
+            // is now what is on the device. Counting the projections at four
+            // would report the widening this commit removed.
+            dattn_bytes += (2 * (heads * head_dim * h
                 + 2 * kv_heads * head_dim * h
                 + heads * t.d_rel * h
-                + h * heads * head_dim
-                + 2 * kv_heads * head_dim * t.sconv_kernel_size
-                + 2 * head_dim
-                + t.d_rel * t.rel_span(kind)
-                + 2 * h * t.sconv_kernel_size
-                + 2 * h) as u64;
+                + h * heads * head_dim)
+                + 4 * (2 * kv_heads * head_dim * t.sconv_kernel_size
+                    + 2 * head_dim
+                    + t.d_rel * t.rel_span(kind)
+                    + 2 * h * t.sconv_kernel_size
+                    + 2 * h)) as u64;
             layers_dev.insert(p.clone(), built);
         }
         let ld = layers_dev.get(&p).expect("inserted directly above");
@@ -1627,7 +1617,7 @@ fn main() -> Result<()> {
             // 276 B model has any use for, and being selectable is how it got
             // run by accident.
             let w = ddense.dense_for(&cp, &fp4_client, fp4_aliases.as_ref(), &p, h)?;
-            dense_mlp_bf16(&fp4_client, &dev, hn, w)
+            dense_mlp_bf16(hn, w)
         } else {
             let inter = t.intermediate_size;
             let r = ld.router.as_ref().expect("a MoE layer has a router");
@@ -1720,7 +1710,7 @@ fn main() -> Result<()> {
                 let sw = ddense.shared_for(
                     &cp, &fp4_client, fp4_aliases.as_ref(), &p, ns, inter, h, shared_halved,
                 )?;
-                shared_experts_bf16(&fp4_client, &dev, hn, sw, &gammas, ns)
+                shared_experts_bf16(&dev, hn, sw, &gammas, ns)
             };
             t_shared += t_s.elapsed().as_secs_f64();
             acc + sh
@@ -1836,7 +1826,7 @@ fn main() -> Result<()> {
         )
         .div_scalar(t.logits_mup_width_multiplier as f32);
         let uw = unembed_w.as_ref().expect("the tail binds the unembed table");
-        down(lin_bf16(&fp4_client, &dev, hs, uw).slice([0..n, 0..v]))
+        down(dev_lane::linear_bf16(hs, uw).slice([0..n, 0..v]))
     };
     let t_head = t_h.elapsed().as_secs_f64();
 
@@ -1948,7 +1938,7 @@ fn main() -> Result<()> {
                     t.rms_norm_eps,
                 )
                 .div_scalar(t.logits_mup_width_multiplier as f32);
-                down(lin_bf16(&fp4_client, &dev, hs, ud).slice([0..1, 0..v]))
+                down(dev_lane::linear_bf16(hs, ud).slice([0..1, 0..v]))
             };
             let mut b = 0usize;
             for (i, &val) in dl.iter().take(v).enumerate() {

@@ -23,6 +23,7 @@
 use burn::prelude::*;
 use burn::tensor::{Int, Tensor, TensorData};
 
+use crate::models::inkling::bf16gemm::Bf16W;
 use crate::models::inkling::seam::{client_of, handle_of, tensor_of, Bk};
 
 /// `x * sigmoid(x)`, elementwise.
@@ -40,6 +41,34 @@ pub fn linear<B: Backend>(x: Tensor<B, 2>, w: Tensor<B, 2>) -> Tensor<B, 2> {
     let [_, kw] = w.dims();
     assert_eq!(k, kw, "linear: x is [_, {k}] but the weight is [_, {kw}]");
     x.matmul(w.transpose())
+}
+
+/// The same product, against the BF16 the checkpoint actually stores.
+///
+/// [`linear`] takes a `Tensor<B, 2>`, and on this backend that means f32 — so
+/// every BF16 weight reaching it had to be widened first, at twice the bytes
+/// the pile holds and twice the memory traffic to multiply by. This is the
+/// [`crate::models::inkling::bf16gemm`] lane instead: the stored bytes go into
+/// `mma.sync…bf16` as they lie, the activation is cast to BF16 on the device
+/// by the hardware's round-to-nearest-even, and the f32 that comes back is the
+/// MMA's own accumulator type rather than a widened weight.
+///
+/// Concrete on [`Bk`] for the reason [`short_conv_step`] is: [`Bf16W`] is a raw
+/// cubecl handle and the seam that produces one is not generic.
+///
+/// The M padding is the instruction's, not the caller's: a decode step feeds
+/// one row against a sixteen-row tile, and the fifteen padding rows are written
+/// as zeros by the cast that was visiting every element anyway, then sliced off
+/// here.
+pub fn linear_bf16(x: Tensor<Bk, 2>, w: &Bf16W) -> Tensor<Bk, 2> {
+    use crate::models::inkling::bf16gemm::MTILE;
+    let [m, k] = x.dims();
+    assert_eq!(k, w.k, "linear_bf16: x is [_, {k}] but the weight is [_, {}]", w.k);
+    let m_pad = m.div_ceil(MTILE) * MTILE;
+    let client = client_of(&x);
+    let dev = x.device();
+    let out = crate::models::inkling::bf16gemm::linear_bf16(&client, &handle_of(x), w, m, m_pad);
+    tensor_of(client, dev, out, m_pad, w.n).slice([0..m, 0..w.n])
 }
 
 /// RMS normalization with a per-feature gain.
@@ -175,17 +204,36 @@ fn head_rms_norm<B: Backend>(
 /// Orientations are the checkpoint's: `w*` are `[out, in]` the way `nn.Linear`
 /// stores them, the short convolutions are `[dim, kernel]`, and `rel_proj` is
 /// `[d_rel, rel_extent]`.
-pub struct AttnWeightsDev<B: Backend> {
-    pub wq: Tensor<B, 2>,
-    pub wk: Tensor<B, 2>,
-    pub wv: Tensor<B, 2>,
-    pub wr: Tensor<B, 2>,
-    pub wo: Tensor<B, 2>,
-    pub k_sconv: Tensor<B, 2>,
-    pub v_sconv: Tensor<B, 2>,
-    pub q_norm: Tensor<B, 1>,
-    pub k_norm: Tensor<B, 1>,
-    pub rel_proj: Tensor<B, 2>,
+///
+/// ## Why the five projections are [`Bf16W`] and the rest are not
+///
+/// The projections are the weight. On a 20-layer node they were 3.29 GiB of
+/// device f32 holding 1.64 GiB of stored BF16 — the same widening the dense and
+/// shared MLPs already stopped doing, left in place here because the change was
+/// once refused for not being bit-exact against the f32 lane. It does not need
+/// to be bit-exact against the f32 lane; it needs to be inside budget against
+/// the reference, and `inkling_attn_bf16_gate` measures that.
+///
+/// What stays f32 is what is not worth the plumbing and would not pay: the two
+/// short convolutions are `[dim, 4]`, the two norm gains are `[head_dim]`, and
+/// `rel_proj` is `[16, rel_extent]` — 70 KB a layer between them, against
+/// 88 MB of projections, and none of them is a `[out, in]` matmul the MMA lane
+/// takes.
+///
+/// Not generic over `B` any more: [`Bf16W`] is a raw cubecl handle, so this
+/// struct and the three functions that read it are concrete on [`Bk`], exactly
+/// as [`short_conv_step`] is and for the same reason.
+pub struct AttnWeightsDev {
+    pub wq: Bf16W,
+    pub wk: Bf16W,
+    pub wv: Bf16W,
+    pub wr: Bf16W,
+    pub wo: Bf16W,
+    pub k_sconv: Tensor<Bk, 2>,
+    pub v_sconv: Tensor<Bk, 2>,
+    pub q_norm: Tensor<Bk, 1>,
+    pub k_norm: Tensor<Bk, 1>,
+    pub rel_proj: Tensor<Bk, 2>,
 }
 
 /// Everything one attention layer must retain between generated tokens.
@@ -260,13 +308,13 @@ fn trim<B: Backend>(c: &mut AttnCache<B>, window: Option<usize>) {
 /// log scaling multiplies the query **and** the relative-position bias, and only
 /// on global layers; and the bias is zero outside `0 <= q - k < rel_extent`,
 /// while causality lives in the mask.
-pub fn attention<B: Backend>(
-    x: Tensor<B, 2>,
-    w: &AttnWeightsDev<B>,
+pub fn attention(
+    x: Tensor<Bk, 2>,
+    w: &AttnWeightsDev,
     d: &crate::models::inkling::attn::AttnDims,
     log_scaling: Option<crate::models::inkling::attn::LogScaling>,
-    mask: Tensor<B, 2>,
-) -> Tensor<B, 2> {
+    mask: Tensor<Bk, 2>,
+) -> Tensor<Bk, 2> {
     attention_prefill(x, w, d, log_scaling, mask, None).0
 }
 
@@ -280,14 +328,14 @@ pub fn attention<B: Backend>(
 /// the same distinction [`crate::models::inkling::attn::causal_mask`] takes;
 /// it decides how much of the cache survives, and passing `None` for a local
 /// layer would grow the cache past the window rather than give a wrong answer.
-pub fn attention_prefill<B: Backend>(
-    x: Tensor<B, 2>,
-    w: &AttnWeightsDev<B>,
+pub fn attention_prefill(
+    x: Tensor<Bk, 2>,
+    w: &AttnWeightsDev,
     d: &crate::models::inkling::attn::AttnDims,
     log_scaling: Option<crate::models::inkling::attn::LogScaling>,
-    mask: Tensor<B, 2>,
+    mask: Tensor<Bk, 2>,
     window: Option<usize>,
-) -> (Tensor<B, 2>, AttnCache<B>) {
+) -> (Tensor<Bk, 2>, AttnCache<Bk>) {
     use crate::models::inkling::config::AttnKind;
 
     let [tokens, hidden] = x.dims();
@@ -301,12 +349,12 @@ pub fn attention_prefill<B: Backend>(
     // K and V pass through their short convolutions; Q does not. The
     // pre-convolution projections are kept: they are the convolution's memory,
     // and a decode step cannot reconstruct them from the cached K and V.
-    let q = linear(x.clone(), w.wq.clone());
-    let k_pre = linear(x.clone(), w.wk.clone());
-    let v_pre = linear(x.clone(), w.wv.clone());
+    let q = linear_bf16(x.clone(), &w.wq);
+    let k_pre = linear_bf16(x.clone(), &w.wk);
+    let v_pre = linear_bf16(x.clone(), &w.wv);
     let k = short_conv(k_pre.clone(), w.k_sconv.clone());
     let v = short_conv(v_pre.clone(), w.v_sconv.clone());
-    let r = linear(x, w.wr.clone());
+    let r = linear_bf16(x, &w.wr);
 
     let q = head_rms_norm(q, w.q_norm.clone(), heads, head_dim, d.rms_eps);
     let k = head_rms_norm(k, w.k_norm.clone(), kv_heads, head_dim, d.rms_eps);
@@ -318,7 +366,7 @@ pub fn attention_prefill<B: Backend>(
             _ => 1.0,
         })
         .collect();
-    let tau: Tensor<B, 1> = Tensor::from_data(TensorData::new(taus, [tokens]), &dev);
+    let tau: Tensor<Bk, 1> = Tensor::from_data(TensorData::new(taus, [tokens]), &dev);
     let q = q * tau.clone().reshape([tokens, 1]);
 
     // Only distances that can occur are worth projecting: a distance is at most
@@ -335,9 +383,9 @@ pub fn attention_prefill<B: Backend>(
             }
         }
     }
-    let idx: Tensor<B, 3, Int> =
+    let idx: Tensor<Bk, 3, Int> =
         Tensor::from_data(TensorData::new(idx, [1, tokens, tokens]), &dev).repeat_dim(0, heads);
-    let valid: Tensor<B, 3> = Tensor::from_data(TensorData::new(valid, [1, tokens, tokens]), &dev);
+    let valid: Tensor<Bk, 3> = Tensor::from_data(TensorData::new(valid, [1, tokens, tokens]), &dev);
 
     let rel = r
         .reshape([tokens * heads, d.d_rel])
@@ -350,7 +398,7 @@ pub fn attention_prefill<B: Backend>(
     // [heads, tokens, head_dim]; the KV heads are repeated in place, so head h
     // reads kv head h / groups exactly as the slice lane indexes it.
     let qh = q.reshape([tokens, heads, head_dim]).swap_dims(0, 1);
-    let expand = |t: Tensor<B, 2>| -> Tensor<B, 3> {
+    let expand = |t: Tensor<Bk, 2>| -> Tensor<Bk, 3> {
         t.reshape([tokens, kv_heads, head_dim])
             .swap_dims(0, 1)
             .reshape([kv_heads, 1, tokens, head_dim])
@@ -376,7 +424,7 @@ pub fn attention_prefill<B: Backend>(
         base: 0,
     };
     trim(&mut cache, window);
-    (linear(out, w.wo.clone()), cache)
+    (linear_bf16(out, &w.wo), cache)
 }
 
 /// One generated token through one attention layer, reading the cache.
@@ -400,7 +448,7 @@ pub fn attention_prefill<B: Backend>(
 /// raw cubecl kernel now.
 pub fn attention_step(
     x: Tensor<Bk, 2>,
-    w: &AttnWeightsDev<Bk>,
+    w: &AttnWeightsDev,
     d: &crate::models::inkling::attn::AttnDims,
     log_scaling: Option<crate::models::inkling::attn::LogScaling>,
     pos: usize,
@@ -418,14 +466,14 @@ pub fn attention_step(
     let groups = d.groups();
     assert_eq!(groups * kv_heads, heads, "{heads} heads do not divide into {kv_heads} kv heads");
 
-    let q = linear(x.clone(), w.wq.clone());
+    let q = linear_bf16(x.clone(), &w.wq);
     let (k_new, k_hist) =
-        short_conv_step(cache.k_pre.clone(), linear(x.clone(), w.wk.clone()), w.k_sconv.clone());
+        short_conv_step(cache.k_pre.clone(), linear_bf16(x.clone(), &w.wk), w.k_sconv.clone());
     let (v_new, v_hist) =
-        short_conv_step(cache.v_pre.clone(), linear(x.clone(), w.wv.clone()), w.v_sconv.clone());
+        short_conv_step(cache.v_pre.clone(), linear_bf16(x.clone(), &w.wv), w.v_sconv.clone());
     cache.k_pre = k_hist;
     cache.v_pre = v_hist;
-    let r = linear(x, w.wr.clone());
+    let r = linear_bf16(x, &w.wr);
 
     let q = head_rms_norm(q, w.q_norm.clone(), heads, head_dim, d.rms_eps);
     let k_new = head_rms_norm(k_new, w.k_norm.clone(), kv_heads, head_dim, d.rms_eps);
@@ -489,7 +537,7 @@ pub fn attention_step(
     let scores = qh.matmul(kh.swap_dims(1, 2)).mul_scalar(d.scaling()) + bias + wmask;
     let probs = burn::tensor::activation::softmax(scores, 2);
     let out = probs.matmul(vh).swap_dims(0, 1).reshape([1, heads * head_dim]);
-    linear(out, w.wo.clone())
+    linear_bf16(out, &w.wo)
 }
 
 // `dense_mlp`, `shared_experts` and `shared_experts_dev` were here and are
