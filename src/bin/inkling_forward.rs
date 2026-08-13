@@ -81,12 +81,14 @@ use mary::models::inkling::attn::{causal_mask, AttnDims, AttnWeights, LogScaling
 use mary::models::inkling::block::{rms_norm, route_from_logits, Routing};
 use mary::models::inkling::config::{AttnKind, InklingConfig};
 use mary::models::inkling::load::{split_gate_up, Held};
+use mary::models::inkling::bf16gemm::Bf16W;
+use mary::models::inkling::pile::Elem;
 use mary::models::inkling::source::Weights;
 use mary::models::inkling::mtp::{
     mtp_block, mtp_block_prefill, mtp_block_step, Concat as MtpConcat, MtpCache, MtpHead,
 };
 use mary::models::inkling::layer::{LayerMlp, LayerWeights};
-use mary::models::inkling::stack::embed_and_norm;
+use mary::models::inkling::stack::{embed_and_norm_bf16, embed_row_bf16};
 
 /// One gibibyte, as the divisor every byte count here is printed against.
 const GIB: f64 = (1u64 << 30) as f64;
@@ -172,16 +174,6 @@ fn up2<B: Backend>(v: Vec<f32>, rows: usize, cols: usize, dev: &B::Device) -> BT
     BT::from_data(BTD::new(v, [rows, cols]), dev)
 }
 
-/// The same, from a BORROWED slice — for weights that are held on the host.
-///
-/// The owning [`up2`] exists so a 537 MB dense weight is moved rather than
-/// duplicated. A resident weight cannot be moved (the run keeps it), so this
-/// copies; the copy is unavoidable and is stated rather than hidden.
-fn up2r<B: Backend>(v: &[f32], rows: usize, cols: usize, dev: &B::Device) -> BT<B, 2> {
-    assert_eq!(v.len(), rows * cols, "{} values are not [{rows}, {cols}]", v.len());
-    BT::from_data(BTD::new(v.to_vec(), [rows, cols]), dev)
-}
-
 fn up1r<B: Backend>(v: &[f32], len: usize, dev: &B::Device) -> BT<B, 1> {
     assert_eq!(v.len(), len, "{} values are not [{len}]", v.len());
     BT::from_data(BTD::new(v.to_vec(), [len]), dev)
@@ -226,29 +218,30 @@ struct HostT {
     accum: f64,
 }
 
-/// One layer's shared experts, on the device.
+/// One layer's shared experts, on the device, as the BF16 the pile stores.
 struct SharedOnDevice {
-    gate: Vec<T2>,
-    up: Vec<T2>,
-    down: Vec<T2>,
+    gate: Vec<Bf16W>,
+    up: Vec<Bf16W>,
+    down: Vec<Bf16W>,
 }
 
-/// The dense weights that live in DEVICE-allocated memory for the whole run.
+/// The dense weights that live in DEVICE memory for the whole run, unwidened.
 ///
-/// Distinct from the host-resident set behind `INK_RESIDENT`, and the
-/// difference is the point. Host residency stops the re-read and the re-widen;
-/// it leaves the arithmetic on the CPU. Device residency moves the weight into
-/// the pool the GPU reads fastest and lets the matmul run there, so the token
-/// costs a kernel over memory the device already owns rather than an upload.
+/// Distinct from the host-resident set, and the difference is the point. Host
+/// residency stops the re-read; device residency moves the weight into the
+/// memory the GPU reads fastest and lets the matmul run there.
 ///
-/// These weights are NOT also held on the host: they are read out of the
-/// checkpoint once, uploaded, and the host copy is dropped. Holding both would
-/// double a budget for no gain, since after the upload nothing on the host ever
-/// reads them again.
+/// What changed with rule 3: these used to be `Tensor<Bk, 2>` — Burn f32 — so
+/// every BF16 leaf on the way here was doubled, once into a host `Vec<f32>` and
+/// again into a device buffer. 4.88 GiB of f32 on the 20-layer head to hold
+/// 2.44 GiB of stored weight, and twice the bytes for the GEMM to read on every
+/// token. They are [`Bf16W`] now: a handle over BF16, multiplied by the
+/// `mma.sync…bf16` instruction whose f32 accumulator is its own output type and
+/// not a widening.
 #[derive(Default)]
 struct DeviceDense {
     shared: std::collections::BTreeMap<String, SharedOnDevice>,
-    dense: std::collections::BTreeMap<String, (T2, T2, T2, f32)>,
+    dense: std::collections::BTreeMap<String, (Bf16W, Bf16W, Bf16W, f32)>,
     bytes: u64,
 }
 
@@ -337,71 +330,181 @@ impl MtpOwned {
     }
 }
 
-impl DeviceDense {
-    fn up2(v: Vec<f32>, rows: usize, cols: usize, dev: &burn::backend::cuda::CudaDevice) -> T2 {
-        assert_eq!(v.len(), rows * cols, "{} values for [{rows}, {cols}]", v.len());
-        burn::tensor::Tensor::from_data(burn::tensor::TensorData::new(v, [rows, cols]), dev)
-    }
+/// Bind a `[rows, cols]` BF16 byte block to the device, aliasing where it can.
+///
+/// `bytes` is either a view of the pile's mapping — in which case this is a
+/// pointer, not a transfer — or a de-interleaved copy, which cannot be aliased
+/// because it is not IN the mapping. `Aliases::slice_or_copy` decides by
+/// pointer containment and counts which happened, so the report can say.
+fn bind_bf16(
+    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+    aliases: Option<&mary::models::inkling::fp4gemm::Aliases>,
+    bytes: &[u8],
+    rows: usize,
+    cols: usize,
+) -> Bf16W {
+    assert_eq!(bytes.len(), rows * cols * 2, "{rows}x{cols} BF16 is not {} bytes", bytes.len());
+    assert!(
+        Bf16W::tileable(rows, cols),
+        "{rows}x{cols} does not tile as m16n8k16; this lane multiplies BF16 by BF16 and \
+         widening to reach a shape is what rule 3 forbids"
+    );
+    let h = match aliases {
+        Some(al) => al.slice_or_copy(client, bytes),
+        None => client.create_from_slice(bytes),
+    };
+    Bf16W { h, n: rows, k: cols }
+}
 
-    /// One layer's shared experts, uploaded on first use.
+impl DeviceDense {
+    /// One layer's shared experts, bound on first use.
     #[allow(clippy::too_many_arguments)]
     fn shared_for(
         &mut self,
         cp: &Weights,
+        client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+        aliases: Option<&mary::models::inkling::fp4gemm::Aliases>,
         p: &str,
         n_shared: usize,
         inter: usize,
         h: usize,
         halved: bool,
-        dev: &burn::backend::cuda::CudaDevice,
     ) -> Result<&SharedOnDevice> {
         if !self.shared.contains_key(p) {
-            let fused = cp.tensor(&format!("{p}mlp.shared_experts.shared_w13_weight"))?;
-            let (g, u) = mary::models::inkling::load::split_shared_w13(
-                &fused.data, n_shared, inter, h, halved,
+            let fused = cp.stored(&format!("{p}mlp.shared_experts.shared_w13_weight"))?;
+            anyhow::ensure!(fused.elem == Elem::Bf16, "shared_w13 is {:?}", fused.elem);
+            let (g, u) = mary::models::inkling::load::split_shared_w13_bytes(
+                &fused.bytes, n_shared, inter, h, halved, 2,
             );
-            drop(fused);
-            let d = cp.tensor(&format!("{p}mlp.shared_experts.shared_w2_weight"))?;
-            let (per_gu, per_d) = (inter * h, h * inter);
+            let d = cp.stored(&format!("{p}mlp.shared_experts.shared_w2_weight"))?;
+            anyhow::ensure!(d.elem == Elem::Bf16, "shared_w2 is {:?}", d.elem);
+            let (per_gu, per_d) = (inter * h * 2, h * inter * 2);
             let mut sd = SharedOnDevice { gate: Vec::new(), up: Vec::new(), down: Vec::new() };
             for e in 0..n_shared {
-                sd.gate.push(Self::up2(g[e * per_gu..(e + 1) * per_gu].to_vec(), inter, h, dev));
-                sd.up.push(Self::up2(u[e * per_gu..(e + 1) * per_gu].to_vec(), inter, h, dev));
-                sd.down
-                    .push(Self::up2(d.data[e * per_d..(e + 1) * per_d].to_vec(), h, inter, dev));
+                sd.gate.push(bind_bf16(client, aliases, &g[e * per_gu..(e + 1) * per_gu], inter, h));
+                sd.up.push(bind_bf16(client, aliases, &u[e * per_gu..(e + 1) * per_gu], inter, h));
+                // `w2` is NOT de-interleaved, so this one is a view of the pile
+                // and aliases outright.
+                sd.down.push(bind_bf16(
+                    client, aliases, &d.bytes[e * per_d..(e + 1) * per_d], h, inter,
+                ));
             }
-            self.bytes += (n_shared * (2 * per_gu + per_d) * 4) as u64;
+            self.bytes += (n_shared * (2 * per_gu + per_d)) as u64;
             self.shared.insert(p.to_string(), sd);
         }
         Ok(&self.shared[p])
     }
 
-    /// One dense layer's MLP, uploaded on first use.
+    /// One dense layer's MLP, bound on first use.
     fn dense_for(
         &mut self,
         cp: &Weights,
+        client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+        aliases: Option<&mary::models::inkling::fp4gemm::Aliases>,
         p: &str,
         h: usize,
-        dev: &burn::backend::cuda::CudaDevice,
-    ) -> Result<&(T2, T2, T2, f32)> {
+    ) -> Result<&(Bf16W, Bf16W, Bf16W, f32)> {
         if !self.dense.contains_key(p) {
-            let fused = cp.tensor(&format!("{p}mlp.w13_dn.weight"))?;
-            let (g, u) = split_gate_up(&fused.data, h);
-            drop(fused);
-            let down = cp.tensor(&format!("{p}mlp.w2_md.weight"))?;
-            let gs = cp.tensor(&format!("{p}mlp.global_scale"))?;
-            let inter = g.len() / h;
-            self.bytes += ((g.len() + u.len() + down.data.len()) * 4) as u64;
+            let fused = cp.stored(&format!("{p}mlp.w13_dn.weight"))?;
+            anyhow::ensure!(fused.elem == Elem::Bf16, "dense w13 is {:?}", fused.elem);
+            let (g, u) = mary::models::inkling::load::split_gate_up_bytes(&fused.bytes, h, 2);
+            let down = cp.stored(&format!("{p}mlp.w2_md.weight"))?;
+            anyhow::ensure!(down.elem == Elem::Bf16, "dense w2 is {:?}", down.elem);
+            let (drows, dcols) = (down.dims[0] as usize, down.dims[1] as usize);
+            let inter = g.len() / (h * 2);
+            // The global scale is one f32 and is a SCALAR the product is
+            // multiplied by, not a weight, so it comes through the widening
+            // accessor and costs four bytes.
+            let gs = cp.tensor(&format!("{p}mlp.global_scale"))?.data[0];
+            self.bytes += (g.len() + u.len() + down.bytes.len()) as u64;
             let trip = (
-                Self::up2(g, inter, h, dev),
-                Self::up2(u, inter, h, dev),
-                Self::up2(down.data, h, inter, dev),
-                gs.data[0],
+                bind_bf16(client, aliases, &g, inter, h),
+                bind_bf16(client, aliases, &u, inter, h),
+                bind_bf16(client, aliases, &down.bytes, drows, dcols),
+                gs,
             );
             self.dense.insert(p.to_string(), trip);
         }
         Ok(&self.dense[p])
     }
+}
+
+/// The dense MLP, with every weight the BF16 it is stored as.
+///
+/// `dev_lane::dense_mlp`'s twin. It exists here rather than there because
+/// [`Bf16W`] is a raw cubecl handle and `dev_lane` is generic over
+/// `B: Backend`; the arithmetic — `down(silu(gate(x)) * up(x)) * global_scale`
+/// — is the same three lines and the elementwise half still runs in Burn.
+fn dense_mlp_bf16(
+    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+    dev: &burn::backend::cuda::CudaDevice,
+    x: T2,
+    w: &(Bf16W, Bf16W, Bf16W, f32),
+) -> T2 {
+    let g = lin_bf16(client, dev, x.clone(), &w.0);
+    let u = lin_bf16(client, dev, x, &w.1);
+    lin_bf16(client, dev, dev_lane::silu(g) * u, &w.2).mul_scalar(w.3)
+}
+
+/// The shared experts, with every weight the BF16 it is stored as.
+///
+/// `dev_lane::shared_experts_dev`'s twin, same reason. The gamma multiplies the
+/// ACTIVATION, before the down projection — not the block's output, which is
+/// algebraically the same only because `down` is linear and is a different
+/// function the moment anything else is inserted.
+fn shared_experts_bf16(
+    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+    dev: &burn::backend::cuda::CudaDevice,
+    x: T2,
+    sw: &SharedOnDevice,
+    gammas: &[f32],
+    n_shared: usize,
+) -> T2 {
+    let [n, _] = x.dims();
+    assert_eq!(gammas.len(), n * n_shared, "{} gammas for {n} tokens", gammas.len());
+    let mut out: Option<T2> = None;
+    for s in 0..n_shared {
+        let g = lin_bf16(client, dev, x.clone(), &sw.gate[s]);
+        let u = lin_bf16(client, dev, x.clone(), &sw.up[s]);
+        let col: Vec<f32> = (0..n).map(|tk| gammas[tk * n_shared + s]).collect();
+        let gam = BT::<Bk, 2>::from_data(BTD::new(col, [n, 1]), dev);
+        let c = lin_bf16(client, dev, dev_lane::silu(g) * u * gam, &sw.down[s]);
+        out = Some(match out {
+            Some(o) => o + c,
+            None => c,
+        });
+    }
+    out.expect("a MoE layer with no shared experts")
+}
+
+/// `x @ Wᵀ` where `W` is the BF16 the pile stores and `x` is a Burn tensor.
+///
+/// The bridge in one place: pad `x` to the MMA's M granularity, hand its buffer
+/// to the raw kernel through [`seam::handle_of`], and wrap the f32 accumulator
+/// that comes back. Nothing here materialises the weight in a wider type than
+/// it is stored in, which is the whole point; f32 accumulation is the
+/// instruction's own output and not a widening.
+///
+/// The padding rows are zeros and are sliced off, so a decode step's one row
+/// costs a 16-row tile of arithmetic against a weight read that dwarfs it.
+fn lin_bf16(
+    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+    dev: &burn::backend::cuda::CudaDevice,
+    x: T2,
+    w: &mary::models::inkling::bf16gemm::Bf16W,
+) -> T2 {
+    use mary::models::inkling::bf16gemm::{linear_bf16, MTILE};
+    use mary::models::inkling::seam::{handle_of, tensor_of};
+    let [m, k] = x.dims();
+    assert_eq!(k, w.k, "lin_bf16: x is [_, {k}] but the weight is [_, {}]", w.k);
+    let m_pad = m.div_ceil(MTILE) * MTILE;
+    let xp = if m_pad > m {
+        burn::tensor::Tensor::cat(vec![x, burn::tensor::Tensor::zeros([m_pad - m, k], dev)], 0)
+    } else {
+        x
+    };
+    let out = linear_bf16(client, &handle_of(xp), w, m_pad);
+    tensor_of(client.clone(), dev.clone(), out, m_pad, w.n).slice([0..m, 0..w.n])
 }
 
 /// One layer's router, on the device except for the part that is a decision.
@@ -791,12 +894,25 @@ fn main() -> Result<()> {
     // pinned on the box that only unembeds is 4.8 GB of expert slabs evicted.
     let want_embed = !is_tail;
     let want_head = !is_head;
-    let embed_w = if want_embed { Some(cp.held("model.llm.embed.weight")?) } else { None };
+    // The embedding table, as the BF16 the pile stores. `cp.held` turned 2.40
+    // GiB of stored weight into 4.81 GB of host f32 and pinned it for the run,
+    // on a box chosen because the working set only just fits -- and every token
+    // read one row of it. `stored` hands back a view of the mapping; the
+    // widening is now per LOOKUP, 16 KB a token, which is where it belongs.
+    let embed_w = if want_embed {
+        let leaf = cp.stored("model.llm.embed.weight")?;
+        anyhow::ensure!(leaf.elem == Elem::Bf16, "the embedding table is {:?}", leaf.elem);
+        Some(leaf.bytes.clone())
+    } else {
+        None
+    };
     let embed_n = if want_embed { Some(cp.held("model.llm.embed_norm.weight")?) } else { None };
     let fnorm = if want_head { Some(cp.held("model.llm.norm.weight")?) } else { None };
-    // `Option`, so the tail can DROP its handle on the 3.3 GB host copy once the
-    // table is on the device and nothing on the host will read it again.
-    let unembed = if want_head { Some(cp.held("model.llm.unembed.weight")?) } else { None };
+    // The unembed table is NOT read here any more, and not widened anywhere.
+    // It used to be `cp.held(...)`, which turned 1.6 GiB of stored BF16 into
+    // 3.3 GB of host f32, uploaded THAT, and dropped the host copy. Now the
+    // stored bytes are bound where they lie (see `unembed_w` below) and the
+    // 3.3 GB never exists in either place.
     println!("  embedding tables loaded in {:.1}s", started.elapsed().as_secs_f32());
 
     // `INK_MTP=k` drafts k tokens ahead with the MTP heads and scores them
@@ -1001,23 +1117,56 @@ fn main() -> Result<()> {
         }
     };
 
-    // The unembed table is 3.3 GB at f32 and does not change between generated
-    // tokens, so it is uploaded ONCE here rather than once per step, and the
-    // host copy is dropped rather than kept alongside it.
-    let unembed_dev = if want_head {
-        let v = t.effective_vocab();
-        let d = up2r::<Bk>(&unembed.as_ref().expect("unembed held").data, t.vocab_size, h, &dev)
-            .slice([0..v, 0..h]);
-        println!("  unembed uploaded, {v} x {h}");
-        Some(d)
+    // The unembed table, as the BF16 the pile stores. Not uploaded: BOUND.
+    //
+    // This is the single largest weight in the process and it was the single
+    // largest widening: `[201024, 4096]` BF16 is 1.61 GiB, and reading it as
+    // f32 made it 3.22 GB — on the host first, then again on the device,
+    // costing 1.6 GiB of RAM the box does not have to spare and doubling the
+    // bytes the biggest matmul in the forward has to read. Measured at 22.5 ms
+    // a token, which is 146 GB/s against a 273 GB/s bus: bandwidth-bound, so
+    // the bytes ARE the time.
+    //
+    // Bound through the same `Aliases` seam the experts use, so on this
+    // unified-memory part the GPU reads the pile's own mapped pages and the
+    // table is never copied at all. `slice_or_copy` reports which happened.
+    //
+    // The FULL padded vocabulary is bound, not the effective 200058 rows: the
+    // MMA tiles n by 8 and 200058 does not divide, while the padded 201024
+    // does. The extra rows are the checkpoint's own padding and the argmax
+    // slices them off, exactly as the f32 path sliced them off after uploading
+    // them.
+    let unembed_w = if want_head {
+        use mary::models::inkling::bf16gemm::Bf16W;
+        use mary::models::inkling::pile::Elem;
+        let leaf = cp.stored("model.llm.unembed.weight")?;
+        anyhow::ensure!(
+            leaf.elem == Elem::Bf16,
+            "the unembed table is stored as {:?}, and this lane multiplies BF16 by BF16. \
+             Widening it to reuse an f32 path is the thing rule 3 forbids; a pile holding \
+             f32 here needs an f32 MMA, not a cast.",
+            leaf.elem
+        );
+        let (rows, cols) = (leaf.dims[0] as usize, leaf.dims[1] as usize);
+        anyhow::ensure!(rows == t.vocab_size && cols == h, "unembed is {rows}x{cols}");
+        anyhow::ensure!(
+            Bf16W::tileable(rows, cols),
+            "unembed {rows}x{cols} does not tile as m16n8k16"
+        );
+        let hnd = match fp4_aliases.as_ref() {
+            Some(al) => al.slice_or_copy(&fp4_client, &leaf.bytes),
+            None => fp4_client.create_from_slice(&leaf.bytes),
+        };
+        println!(
+            "  unembed BOUND as BF16, {rows} x {cols} = {:.2} GiB stored (the f32 lane it \
+             replaces materialised {:.2} GiB)",
+            leaf.bytes.len() as f64 / GIB,
+            2.0 * leaf.bytes.len() as f64 / GIB
+        );
+        Some(Bf16W { h: hnd, n: rows, k: cols })
     } else {
         None
     };
-    // The host copy has no reader left: the head is on the device and there is
-    // no host head lane to fall back to, and the draft head reads the device
-    // table too. Residency still holds it, which is what residency IS, not a
-    // leak.
-    drop(unembed);
     // The final norm's gain, uploaded once for the same reason -- it used to be
     // re-uploaded from the host copy on every pass, and on every MTP draft.
     let fnorm_dev = fnorm
@@ -1144,7 +1293,7 @@ fn main() -> Result<()> {
             let n = feed.len();
             let e_w = embed_w.as_ref().expect("the head owns the embedding table");
             let e_n = embed_n.as_ref().expect("the head owns the embedding norm");
-            (n, pos0, embed_and_norm(&feed, &e_w.data, &e_n.data, t.rms_norm_eps, t.vocab_size, h))
+            (n, pos0, embed_and_norm_bf16(&feed, e_w, &e_n.data, t.rms_norm_eps, t.vocab_size, h))
         }
     };
 
@@ -1356,8 +1505,8 @@ fn main() -> Result<()> {
             // was a scalar f32 lane over a 537 MB weight; it is not a lane a
             // 276 B model has any use for, and being selectable is how it got
             // run by accident.
-            let (dg, du, ddn, dsc) = ddense.dense_for(&cp, &p, h, &dev)?;
-            dev_lane::dense_mlp(hn, dg.clone(), du.clone(), ddn.clone(), *dsc)
+            let w = ddense.dense_for(&cp, &fp4_client, fp4_aliases.as_ref(), &p, h)?;
+            dense_mlp_bf16(&fp4_client, &dev, hn, w)
         } else {
             let inter = t.intermediate_size;
             let r = ld.router.as_ref().expect("a MoE layer has a router");
@@ -1422,8 +1571,10 @@ fn main() -> Result<()> {
             // here and a halved split in the gate, which is the contradiction
             // the INTERLEAVED result closed.
             let sh = {
-                let sw = ddense.shared_for(&cp, &p, ns, inter, h, shared_halved, &dev)?;
-                dev_lane::shared_experts_dev(hn, &sw.gate, &sw.up, &sw.down, &gammas, ns)
+                let sw = ddense.shared_for(
+                    &cp, &fp4_client, fp4_aliases.as_ref(), &p, ns, inter, h, shared_halved,
+                )?;
+                shared_experts_bf16(&fp4_client, &dev, hn, sw, &gammas, ns)
             };
             t_shared += t_s.elapsed().as_secs_f64();
             acc + sh
@@ -1538,10 +1689,8 @@ fn main() -> Result<()> {
             t.rms_norm_eps,
         )
         .div_scalar(t.logits_mup_width_multiplier as f32);
-        down(dev_lane::linear(
-            hs,
-            unembed_dev.clone().expect("the tail uploads the unembed table"),
-        ))
+        let uw = unembed_w.as_ref().expect("the tail binds the unembed table");
+        down(lin_bf16(&fp4_client, &dev, hs, uw).slice([0..n, 0..v]))
     };
     let t_head = t_h.elapsed().as_secs_f64();
 
@@ -1641,14 +1790,14 @@ fn main() -> Result<()> {
         let draft_argmax = |row: &[f32]| -> usize {
             debug_assert_eq!(row.len(), h, "the draft head unembeds exactly one position");
             let dl = {
-                let ud = unembed_dev.as_ref().expect("drafting needs the unembed table");
+                let ud = unembed_w.as_ref().expect("drafting needs the unembed table");
                 let hs = dev_lane::rms_norm(
                     up2::<Bk>(row.to_vec(), 1, h, &dev),
-                    up1r(&fnorm_d.data, h, &dev),
+                    fnorm_dev.clone().expect("drafting needs the final norm"),
                     t.rms_norm_eps,
                 )
                 .div_scalar(t.logits_mup_width_multiplier as f32);
-                down(dev_lane::linear(hs, ud.clone()))
+                down(lin_bf16(&fp4_client, &dev, hs, ud).slice([0..1, 0..v]))
             };
             let mut b = 0usize;
             for (i, &val) in dl.iter().take(v).enumerate() {
@@ -1674,7 +1823,8 @@ fn main() -> Result<()> {
                 debug_assert_eq!(ahead.len(), seq, "one shifted token per position");
                 let mut embeds = vec![0f32; seq * h];
                 for (j, &tok) in ahead.iter().enumerate() {
-                    embeds[j * h..(j + 1) * h].copy_from_slice(&e_w.data[tok * h..(tok + 1) * h]);
+                    embeds[j * h..(j + 1) * h]
+                        .copy_from_slice(&embed_row_bf16(e_w, tok, t.vocab_size, h));
                 }
                 stage = mtp_block(
                     &stage,
@@ -1723,7 +1873,7 @@ fn main() -> Result<()> {
                     for j in 0..want {
                         let tok = if j + d + 1 < seq { ids[j + d + 1] } else { best };
                         embeds[j * h..(j + 1) * h]
-                            .copy_from_slice(&e_w.data[tok * h..(tok + 1) * h]);
+                            .copy_from_slice(&embed_row_bf16(e_w, tok, t.vocab_size, h));
                     }
                     let hin: &[f32] = if d == 0 {
                         &mtp_main[..want * h]
@@ -1748,7 +1898,7 @@ fn main() -> Result<()> {
                     };
                     mtp_block_step(
                         hin,
-                        &e_w.data[best * h..(best + 1) * h],
+                        &embed_row_bf16(e_w, best, t.vocab_size, h),
                         &hw,
                         &headw.dims,
                         Some(ls),
@@ -1772,7 +1922,7 @@ fn main() -> Result<()> {
                     for i in 0..d {
                         last = mtp_block_step(
                             &prev_rows[i],
-                            &e_w.data[drafts[i] * h..(drafts[i] + 1) * h],
+                            &embed_row_bf16(e_w, drafts[i], t.vocab_size, h),
                             &hw,
                             &headw.dims,
                             Some(ls),

@@ -222,3 +222,50 @@ pub fn upload_bf16_act<R: Runtime>(
     let h = client.create_from_slice(f32::as_bytes(&padded));
     (to_bf16_launch(client, &h, m_pad * k), m_pad)
 }
+
+/// A dense `[out, in]` weight on the device, as the BF16 the pile stores.
+///
+/// Not a Burn tensor, because Burn's f32 backend cannot hold one without
+/// widening it — which is the whole thing this type exists to refuse. It is a
+/// handle over BF16 bytes, and where those bytes came from is usually the
+/// pile's own mapping with nothing copied at all.
+pub struct Bf16W {
+    pub h: Handle,
+    /// Output rows.
+    pub n: usize,
+    /// Input columns.
+    pub k: usize,
+}
+
+impl Bf16W {
+    /// Stored bytes this weight spans.
+    pub fn bytes(&self) -> usize {
+        self.n * self.k * 2
+    }
+
+    /// The shapes the `m16n8k16` instruction can tile without a remainder.
+    ///
+    /// Checked at construction rather than at launch: a weight that cannot be
+    /// tiled is a fact about the model, and finding it out on the first token
+    /// of a two-node run is finding it out in the worst place.
+    pub fn tileable(n: usize, k: usize) -> bool {
+        n % NTILE == 0 && k % KTILE == 0
+    }
+}
+
+/// `x @ Wᵀ` with `x` f32 on the device and `W` the BF16 it is stored as.
+///
+/// `x_h` is `[m_pad, k]` f32 and `m_pad` is already a multiple of [`MTILE`];
+/// the return is `[m_pad, n]` f32, the accumulator's own type. The activation
+/// is cast to BF16 on the device by [`to_bf16`], whose rounding is the
+/// hardware's round-to-nearest-even and therefore the same one
+/// `torch.Tensor.to(torch.bfloat16)` performs.
+pub fn linear_bf16<R: Runtime>(
+    client: &ComputeClient<R>,
+    x_h: &Handle,
+    w: &Bf16W,
+    m_pad: usize,
+) -> Handle {
+    let a = to_bf16_launch(client, x_h, m_pad * w.k);
+    bf16_linear_launch(client, &a, &w.h, m_pad, w.k, w.n)
+}

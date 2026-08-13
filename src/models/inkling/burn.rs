@@ -55,62 +55,6 @@ pub fn rms_norm<B: Backend>(x: Tensor<B, 2>, gain: Tensor<B, 1>, eps: f64) -> Te
     normed * gain.unsqueeze::<2>()
 }
 
-/// The dense MLP: `down(silu(gate(x)) * up(x)) * global_scale`.
-pub fn dense_mlp<B: Backend>(
-    x: Tensor<B, 2>,
-    gate: Tensor<B, 2>,
-    up: Tensor<B, 2>,
-    down: Tensor<B, 2>,
-    global_scale: f32,
-) -> Tensor<B, 2> {
-    let g = linear(x.clone(), gate);
-    let u = linear(x, up);
-    linear(silu(g) * u, down).mul_scalar(global_scale)
-}
-
-/// The shared experts, on device — every token visits all of them.
-///
-/// `gate` and `up` are `[n_shared * intermediate, hidden]`, `down` is
-/// `[n_shared * hidden, intermediate]`, and `gammas` is `[tokens, n_shared]`.
-/// The gamma multiplies the **activation**, before the down projection — not
-/// the block's output, which is algebraically the same only because `down` is
-/// linear and is a different function the moment anything else is inserted.
-///
-/// Gate and up arrive already split rather than fused, so this can be gated
-/// straight against `transformers`' own `shared_experts.gate_proj` /
-/// `up_proj` with nothing transcribed in between; the checkpoint's interleaved
-/// `shared_w13_weight` is turned into these by [`split_shared_fused`].
-pub fn shared_experts<B: Backend>(
-    x: Tensor<B, 2>,
-    gate: Tensor<B, 2>,
-    up: Tensor<B, 2>,
-    down: Tensor<B, 2>,
-    gammas: Tensor<B, 2>,
-    n_shared: usize,
-) -> Tensor<B, 2> {
-    let [tokens, hidden] = x.dims();
-    let [drows, inter] = down.dims();
-    assert_eq!(drows, n_shared * hidden, "shared w2 has {drows} rows, want {}", n_shared * hidden);
-    assert_eq!(gate.dims(), [n_shared * inter, hidden], "shared gate is {:?}", gate.dims());
-    assert_eq!(up.dims(), [n_shared * inter, hidden], "shared up is {:?}", up.dims());
-    assert_eq!(gammas.dims(), [tokens, n_shared], "gammas must be [tokens, n_shared]");
-
-    let mut acc: Option<Tensor<B, 2>> = None;
-    for s in 0..n_shared {
-        let g = gate.clone().slice([s * inter..(s + 1) * inter, 0..hidden]);
-        let u = up.clone().slice([s * inter..(s + 1) * inter, 0..hidden]);
-        let dn = down.clone().slice([s * hidden..(s + 1) * hidden, 0..inter]);
-        let gamma = gammas.clone().slice([0..tokens, s..s + 1]);
-        let act = silu(linear(x.clone(), g)) * linear(x.clone(), u) * gamma;
-        let contrib = linear(act, dn);
-        acc = Some(match acc {
-            None => contrib,
-            Some(a) => a + contrib,
-        });
-    }
-    acc.expect("a MoE layer has at least one shared expert")
-}
-
 /// The last `kernel - 1` rows of `x`, left-padded with zeros when `x` is short.
 ///
 /// This is the short convolution's whole memory: the taps reach `kernel - 1`
@@ -523,54 +467,18 @@ pub fn attention_step<B: Backend>(
     linear(out, w.wo.clone())
 }
 
-/// The SHARED experts, on the device, from weights that are ALREADY on it.
-///
-/// The host lane in [`crate::models::inkling::mlp::shared_experts`] is the
-/// reference and this has to agree with it. Two details are easy to lose in
-/// translation and each one changes every token:
-///
-/// * the gamma multiplies the ACTIVATION — between the SwiGLU and the down
-///   projection — not the block's output. Applying it after `down` is a
-///   different function whenever `down` is not the identity, which is always.
-/// * gammas arrive token-major, `[token, shared]`, so shared expert `s` takes a
-///   stride-`n_shared` column and not a contiguous block. A contiguous read is
-///   correct for `n_shared == 1` and silently wrong for 2, which is what this
-///   checkpoint has.
-///
-/// `gate` and `up` are `[inter, hidden]` per shared expert and `down` is
-/// `[hidden, inter]` — one tensor each rather than a stacked rank 3, because
-/// these are uploaded once for the whole run and never sliced again. That is
-/// the entire point: the caller holds the handles, and a token costs a matmul
-/// against memory the device already owns rather than a fresh upload.
-pub fn shared_experts_dev<B: Backend>(
-    x: Tensor<B, 2>,
-    gate: &[Tensor<B, 2>],
-    up: &[Tensor<B, 2>],
-    down: &[Tensor<B, 2>],
-    gammas: &[f32],
-    n_shared: usize,
-) -> Tensor<B, 2> {
-    assert_eq!(gate.len(), n_shared, "{} gate weights for {n_shared} shared experts", gate.len());
-    assert_eq!(up.len(), n_shared, "{} up weights for {n_shared} shared experts", up.len());
-    assert_eq!(down.len(), n_shared, "{} down weights for {n_shared} shared experts", down.len());
-    let [n, _] = x.dims();
-    assert_eq!(gammas.len(), n * n_shared, "{} gammas for {n} tokens", gammas.len());
-
-    let dev = x.device();
-    let mut out: Option<Tensor<B, 2>> = None;
-    for s in 0..n_shared {
-        let g = linear(x.clone(), gate[s].clone());
-        let u = linear(x.clone(), up[s].clone());
-        let col: Vec<f32> = (0..n).map(|t| gammas[t * n_shared + s]).collect();
-        let gam = Tensor::<B, 2>::from_data(TensorData::new(col, [n, 1]), &dev);
-        let c = linear(silu(g) * u * gam, down[s].clone());
-        out = Some(match out {
-            Some(o) => o + c,
-            None => c,
-        });
-    }
-    out.expect("a MoE layer with no shared experts")
-}
+// `dense_mlp`, `shared_experts` and `shared_experts_dev` were here and are
+// gone. They took `Tensor<B, 2>` weights, which on this backend means f32,
+// which means every BF16 leaf on the way to them was doubled -- 4.88 GiB of
+// device f32 on the 20-layer head to hold 2.44 GiB of stored weight. Their
+// replacements multiply the stored BF16 through `mma.sync...bf16`
+// (`inkling_forward::dense_mlp_bf16` / `shared_experts_bf16`), and they live
+// beside the caller because `Bf16W` is a raw cubecl handle and this file is
+// generic over `B: Backend`.
+//
+// Not kept as a control. The header of this file already says why: a slower
+// implementation you can still call is one you will call by accident, and this
+// pair had no caller left the moment the BF16 path landed.
 
 /// The KV cache against the lane it is supposed to be an optimization of.
 ///

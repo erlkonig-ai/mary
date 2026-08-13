@@ -106,6 +106,27 @@ impl Weights {
         Ok(Loaded { data, shape: leaf.shape() })
     }
 
+    /// One dense tensor's STORED bytes, in the element type the pile holds them
+    /// in, un-widened and un-copied.
+    ///
+    /// The counterpart of [`Weights::tensor`], and the one rule 3 wants: 924 of
+    /// this model's 968 dense leaves are BF16, and `tensor` turns every one of
+    /// them into twice as many bytes of f32 on its way to a device that has a
+    /// BF16 MMA. A caller that is going to multiply by the weight rather than
+    /// read it takes this instead, binds the bytes where they lie, and the
+    /// widening never happens.
+    ///
+    /// Charged through the same counters, with `host_bytes == file_bytes`,
+    /// because that identity is exactly what distinguishes this path from the
+    /// other one in the report.
+    pub fn stored(&self, name: &str) -> Result<&super::pile::Leaf> {
+        let t0 = Instant::now();
+        let leaf = self.src.leaf(name)?;
+        let n = leaf.bytes.len() as u64;
+        self.note(name, n, n, t0);
+        Ok(leaf)
+    }
+
     /// One dense weight — widened once and then KEPT, when residency is on.
     ///
     /// Off, this is [`Weights::tensor`] with an `Arc` around it and nothing

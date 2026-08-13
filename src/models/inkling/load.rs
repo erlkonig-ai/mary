@@ -557,6 +557,73 @@ pub fn deinterleave_rows(fused: &[f32], rows: usize, cols: usize) -> (Vec<f32>, 
     (a, b)
 }
 
+/// The same row de-interleave, on STORED BYTES rather than widened f32.
+///
+/// `width` is bytes per element (2 for BF16, 4 for f32). The permutation is
+/// identical — it is a row shuffle and knows nothing about arithmetic — so the
+/// two functions cannot disagree about WHICH rows go where, which is the part
+/// that is easy to get wrong and impossible to detect from a shape.
+///
+/// This copies, and that is unavoidable rather than sloppy: a de-interleave is
+/// a permutation and cannot be a view of the mapping. It happens ONCE per
+/// weight at startup, and what it copies is the stored form, so the copy is
+/// half the size the f32 twin's would be and nothing is materialised wider
+/// than it is stored.
+pub fn deinterleave_rows_bytes(
+    fused: &[u8],
+    rows: usize,
+    cols: usize,
+    width: usize,
+) -> (Vec<u8>, Vec<u8>) {
+    assert_eq!(fused.len(), rows * cols * width);
+    assert!(rows % 2 == 0, "a fused gate/up matrix must have an even row count");
+    let half = rows / 2;
+    let stride = cols * width;
+    let mut a = Vec::with_capacity(half * stride);
+    let mut b = Vec::with_capacity(half * stride);
+    for r in 0..half {
+        a.extend_from_slice(&fused[(2 * r) * stride..(2 * r + 1) * stride]);
+        b.extend_from_slice(&fused[(2 * r + 1) * stride..(2 * r + 2) * stride]);
+    }
+    (a, b)
+}
+
+/// [`split_gate_up`] on stored bytes.
+pub fn split_gate_up_bytes(fused: &[u8], hidden: usize, width: usize) -> (Vec<u8>, Vec<u8>) {
+    let stride = hidden * width;
+    assert_eq!(fused.len() % stride, 0, "fused matrix is not [rows, hidden]");
+    deinterleave_rows_bytes(fused, fused.len() / stride, hidden, width)
+}
+
+/// [`split_shared_w13`] on stored bytes. Same hazard, same two readings, same
+/// `INK_SHARED_W13_HALVED` switch deciding between them — see that function,
+/// which is where the argument lives.
+pub fn split_shared_w13_bytes(
+    fused: &[u8],
+    n_shared: usize,
+    inter: usize,
+    hidden: usize,
+    halved: bool,
+    width: usize,
+) -> (Vec<u8>, Vec<u8>) {
+    let per = 2 * inter * hidden * width;
+    assert_eq!(fused.len(), n_shared * per, "shared_w13 is not [{n_shared}, {}, {hidden}]", 2 * inter);
+    let mut gate = Vec::with_capacity(n_shared * inter * hidden * width);
+    let mut up = Vec::with_capacity(n_shared * inter * hidden * width);
+    for s in 0..n_shared {
+        let blk = &fused[s * per..(s + 1) * per];
+        if halved {
+            gate.extend_from_slice(&blk[..per / 2]);
+            up.extend_from_slice(&blk[per / 2..]);
+        } else {
+            let (g, u) = deinterleave_rows_bytes(blk, 2 * inter, hidden, width);
+            gate.extend_from_slice(&g);
+            up.extend_from_slice(&u);
+        }
+    }
+    (gate, up)
+}
+
 /// Split a fused gate-and-up matrix stored `[2 * inter, hidden]`.
 ///
 /// Authoritative source: `transformers/conversion_mapping.py`, which converts
