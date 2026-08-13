@@ -1034,6 +1034,11 @@ fn main() -> Result<()> {
     // Nine blocking device round trips for the whole run, instead of four per
     // expert. Every later slab is an offset view of one of these.
     let zerocopy_on = std::env::var("INK_ZEROCOPY").map(|v| v != "0").unwrap_or(true);
+    //
+    // Always an `Aliases` when there is a client, even when nothing can be
+    // aliased: `Aliases::disabled()` copies exactly as the old `None` arm did
+    // but COUNTS it, so `INK_ZEROCOPY=0` produces a measurement rather than a
+    // silence. An A/B with an unmeasured side is not an A/B.
     #[cfg(feature = "inkling-cuda")]
     let fp4_aliases = match &fp4_client {
         // INK_ZEROCOPY=0 forces the copying lane, so the seam can be A/B'd
@@ -1048,9 +1053,13 @@ fn main() -> Result<()> {
                 if a.is_some() { "registered" } else { "UNSUPPORTED, copying" },
                 t.elapsed().as_secs_f64() * 1e3
             );
-            a
+            Some(a.unwrap_or_else(mary::models::inkling::fp4gemm::Aliases::disabled))
         }
-        _ => None,
+        Some(_) => {
+            println!("  zero-copy mappings : OFF (INK_ZEROCOPY=0) -- every bind copies");
+            Some(mary::models::inkling::fp4gemm::Aliases::disabled())
+        }
+        None => None,
     };
     #[cfg(not(feature = "inkling-cuda"))]
     anyhow::ensure!(
@@ -1133,6 +1142,13 @@ fn main() -> Result<()> {
     let pass = Instant::now();
     let io0 = io_read_bytes();
     cp.io_reset();
+    // Same scope as the loader counters, for the same reason: the report below
+    // says "this ONE pass", and a bind total that accumulated across passes
+    // would silently make it say something else.
+    #[cfg(feature = "inkling-cuda")]
+    if let Some(al) = fp4_aliases.as_ref() {
+        al.stats_reset();
+    }
     // With a cache, every pass past the prefill feeds exactly the token the
     // previous pass produced; without one, the whole prefix goes through again.
     // `pos0` is that token's ABSOLUTE position, which is what log scaling and
@@ -1975,6 +1991,13 @@ fn main() -> Result<()> {
     println!("    disk read_bytes     {:8.2} GiB   (/proc/self/io -- page-cache hits are free)",
              (io_read_bytes() - io0) as f64 / GIB);
     println!("    resident set        {:8.2} GiB in {rn} weights  (host)", rb as f64 / GIB);
+    // What the zero-copy seam actually achieved on THIS run, at the seam every
+    // expert weight passes through. Printed unconditionally: a seam whose hit
+    // rate is only visible behind a flag is a seam nobody checks.
+    #[cfg(feature = "inkling-cuda")]
+    if let Some(al) = fp4_aliases.as_ref() {
+        print!("{}", al.stats().report());
+    }
     #[cfg(feature = "inkling-cuda")]
     if let Some(dd) = ddense.as_ref() {
         println!(

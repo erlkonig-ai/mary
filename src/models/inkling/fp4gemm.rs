@@ -446,6 +446,132 @@ pub fn upload_quantized_act<R: Runtime>(
 pub struct Aliases {
     /// `(base address, length, registered handle)` per mapping.
     maps: Vec<(usize, usize, Handle)>,
+    /// What the binds actually did. See [`BindStats`].
+    stats: BindCounters,
+}
+
+/// Why one bind did or did not become a zero-copy alias.
+///
+/// The distinction between the two copy causes is the whole value of counting:
+/// an unaligned copy is a fact about how the SOURCE lays its bytes out and is
+/// fixable by changing the source, while an unmapped one means the registration
+/// never happened and no amount of alignment will help. A single "copied"
+/// counter conflates a data-layout problem with a setup problem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bind {
+    /// Aliased in place — the GPU reads the source's own pages.
+    Alias,
+    /// Copied because the slab's ADDRESS is not 4-byte aligned. Carries the
+    /// residue, because WHICH residue says where the misalignment came from: a
+    /// safetensors shard packs tensors back to back with no padding, so a
+    /// residue of 2 is an odd number of BF16 elements sitting upstream.
+    CopyUnaligned(usize),
+    /// Copied because the slab lives in no registered mapping — a `Vec` the
+    /// caller built, or a source whose mappings were never registered.
+    CopyUnmapped,
+    /// Nothing to bind.
+    Empty,
+}
+
+/// Interior-mutable counters. `slice_or_copy` takes `&self` because every
+/// caller holds a shared reference, so the accounting has to be atomic rather
+/// than `&mut`.
+#[derive(Default)]
+struct BindCounters {
+    alias_calls: core::sync::atomic::AtomicU64,
+    alias_bytes: core::sync::atomic::AtomicU64,
+    copy_calls: core::sync::atomic::AtomicU64,
+    copy_bytes: core::sync::atomic::AtomicU64,
+    copy_nanos: core::sync::atomic::AtomicU64,
+    /// Unaligned copies by residue mod 4; index 0 is unused.
+    unaligned: [core::sync::atomic::AtomicU64; 4],
+    unmapped: core::sync::atomic::AtomicU64,
+}
+
+/// What the binds of one run cost, split by whether they aliased.
+///
+/// Not a profiler. It answers the one question the zero-copy seam exists to
+/// answer — how much of the weight traffic actually avoided a copy — and, when
+/// the answer is "not all of it", which of the two reasons was to blame.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct BindStats {
+    pub alias_calls: u64,
+    pub alias_bytes: u64,
+    pub copy_calls: u64,
+    pub copy_bytes: u64,
+    /// HOST time inside `create_from_slice`. The copy itself is posted
+    /// asynchronously, so this is the staging and enqueue, not the DMA.
+    pub copy_nanos: u64,
+    /// Unaligned copies by residue mod 4; index 0 is unused.
+    pub unaligned: [u64; 4],
+    pub unmapped: u64,
+}
+
+impl BindStats {
+    pub fn calls(&self) -> u64 {
+        self.alias_calls + self.copy_calls
+    }
+
+    /// Fraction of BINDS that aliased. `None` when nothing was bound, which is
+    /// the honest answer — a rate over zero calls is not 0% or 100%.
+    pub fn alias_fraction(&self) -> Option<f64> {
+        match self.calls() {
+            0 => None,
+            n => Some(self.alias_calls as f64 / n as f64),
+        }
+    }
+
+    /// Fraction of BYTES that aliased. Different from the call fraction
+    /// whenever the two classes are different sizes, which they are here: a
+    /// code plane is eight times a scale plane.
+    pub fn alias_byte_fraction(&self) -> Option<f64> {
+        match self.alias_bytes + self.copy_bytes {
+            0 => None,
+            n => Some(self.alias_bytes as f64 / n as f64),
+        }
+    }
+
+    pub fn report(&self) -> String {
+        let mb = |b: u64| b as f64 / (1u64 << 20) as f64;
+        let mut s = String::new();
+        s.push_str(&format!(
+            "    bind ALIAS  {:8} calls  {:10.0} MiB   0.000 s\n",
+            self.alias_calls,
+            mb(self.alias_bytes)
+        ));
+        s.push_str(&format!(
+            "    bind COPY   {:8} calls  {:10.0} MiB  {:6.3} s\n",
+            self.copy_calls,
+            mb(self.copy_bytes),
+            self.copy_nanos as f64 / 1e9
+        ));
+        match (self.alias_fraction(), self.alias_byte_fraction()) {
+            (Some(c), Some(b)) => s.push_str(&format!(
+                "    aliased     {:8.1}% of binds, {:.1}% of bytes\n",
+                c * 100.0,
+                b * 100.0
+            )),
+            _ => s.push_str("    aliased     (nothing was bound)\n"),
+        }
+        // Only printed when there is something to explain. A line of zeroes
+        // reads as a finding.
+        if self.copy_calls > 0 {
+            let residues: Vec<String> = (1..4)
+                .filter(|i| self.unaligned[*i] > 0)
+                .map(|i| format!("{} at addr%4=={i}", self.unaligned[i]))
+                .collect();
+            if !residues.is_empty() {
+                s.push_str(&format!("    copied because UNALIGNED: {}\n", residues.join(", ")));
+            }
+            if self.unmapped > 0 {
+                s.push_str(&format!(
+                    "    copied because UNMAPPED : {} (outside every registered mapping)\n",
+                    self.unmapped
+                ));
+            }
+        }
+        s
+    }
 }
 
 impl Aliases {
@@ -473,7 +599,16 @@ impl Aliases {
             };
             maps.push((base, len, h));
         }
-        Some(Aliases { maps })
+        Some(Aliases { maps, stats: BindCounters::default() })
+    }
+
+    /// An `Aliases` that aliases NOTHING, so the copying lane is still counted.
+    ///
+    /// Without this, `INK_ZEROCOPY=0` and "this device cannot alias" are both
+    /// spelled `None` at the call site and neither reports what it moved — the
+    /// A/B has a measured side and an unmeasured one, which is not an A/B.
+    pub fn disabled() -> Self {
+        Aliases { maps: Vec::new(), stats: BindCounters::default() }
     }
 
     pub fn len(&self) -> usize {
@@ -482,6 +617,63 @@ impl Aliases {
 
     pub fn is_empty(&self) -> bool {
         self.maps.is_empty()
+    }
+
+    /// The binds so far.
+    pub fn stats(&self) -> BindStats {
+        use core::sync::atomic::Ordering::Relaxed;
+        BindStats {
+            alias_calls: self.stats.alias_calls.load(Relaxed),
+            alias_bytes: self.stats.alias_bytes.load(Relaxed),
+            copy_calls: self.stats.copy_calls.load(Relaxed),
+            copy_bytes: self.stats.copy_bytes.load(Relaxed),
+            copy_nanos: self.stats.copy_nanos.load(Relaxed),
+            unaligned: [
+                0,
+                self.stats.unaligned[1].load(Relaxed),
+                self.stats.unaligned[2].load(Relaxed),
+                self.stats.unaligned[3].load(Relaxed),
+            ],
+            unmapped: self.stats.unmapped.load(Relaxed),
+        }
+    }
+
+    /// Zero the counters, so a per-token figure is a per-token figure.
+    pub fn stats_reset(&self) {
+        use core::sync::atomic::Ordering::Relaxed;
+        self.stats.alias_calls.store(0, Relaxed);
+        self.stats.alias_bytes.store(0, Relaxed);
+        self.stats.copy_calls.store(0, Relaxed);
+        self.stats.copy_bytes.store(0, Relaxed);
+        self.stats.copy_nanos.store(0, Relaxed);
+        for u in &self.stats.unaligned {
+            u.store(0, Relaxed);
+        }
+        self.stats.unmapped.store(0, Relaxed);
+    }
+
+    /// What [`Aliases::slice`] would decide, and WHY — without binding anything.
+    ///
+    /// Split out from `slice` so the decision can be audited over a whole model
+    /// without a GPU and without a `Handle` per leaf. Both `slice` and the audit
+    /// call this, so a check that says "every leaf aliases" is reading the same
+    /// predicate the runtime does rather than a second transcription of it.
+    pub fn classify(&self, data: &[u8]) -> Bind {
+        if data.is_empty() {
+            return Bind::Empty;
+        }
+        let p = data.as_ptr() as usize;
+        if p % 4 != 0 {
+            return Bind::CopyUnaligned(p % 4);
+        }
+        match self
+            .maps
+            .iter()
+            .find(|(b, l, _)| p >= *b && p + data.len() <= b + l)
+        {
+            Some(_) => Bind::Alias,
+            None => Bind::CopyUnmapped,
+        }
     }
 
     /// A borrowed slice as a zero-copy offset view of the mapping it lives in.
@@ -497,7 +689,7 @@ impl Aliases {
     /// `None` also when the slice belongs to no registered mapping, which is the
     /// honest answer for a `Vec` the caller built.
     pub fn slice(&self, data: &[u8]) -> Option<Handle> {
-        if data.is_empty() || (data.as_ptr() as usize) % 4 != 0 {
+        if !matches!(self.classify(data), Bind::Alias) {
             return None;
         }
         let p = data.as_ptr() as usize;
@@ -513,11 +705,75 @@ impl Aliases {
         )
     }
 
-    /// [`Aliases::slice`], falling back to an ordinary copy.
+    /// [`Aliases::slice`], falling back to an ordinary copy — and COUNTING
+    /// which of the two happened.
+    ///
+    /// The counting is here rather than at the call sites because this is the
+    /// seam the question is about: every weight the expert lane hands the GPU
+    /// passes through exactly this function, so a total taken here is a total
+    /// over the whole lane by construction and cannot miss a path someone
+    /// added later.
     pub fn slice_or_copy<R: Runtime>(&self, client: &ComputeClient<R>, data: &[u8]) -> Handle {
-        match self.slice(data) {
-            Some(h) => h,
-            None => client.create_from_slice(data),
+        use core::sync::atomic::Ordering::Relaxed;
+        let kind = self.classify(data);
+        match kind {
+            Bind::Alias => {
+                self.stats.alias_calls.fetch_add(1, Relaxed);
+                self.stats.alias_bytes.fetch_add(data.len() as u64, Relaxed);
+                self.slice(data).expect("classified as aliasable")
+            }
+            _ => {
+                match kind {
+                    Bind::CopyUnaligned(r) => {
+                        self.stats.unaligned[r].fetch_add(1, Relaxed);
+                    }
+                    Bind::CopyUnmapped => {
+                        self.stats.unmapped.fetch_add(1, Relaxed);
+                    }
+                    _ => {}
+                }
+                let t = std::time::Instant::now();
+                let h = client.create_from_slice(data);
+                self.stats.copy_calls.fetch_add(1, Relaxed);
+                self.stats.copy_bytes.fetch_add(data.len() as u64, Relaxed);
+                self.stats
+                    .copy_nanos
+                    .fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+                h
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::*;
+
+    /// The predicate the runtime binds on, checked without a GPU.
+    ///
+    /// `classify` is the only place the 4-byte rule lives now, so this covers
+    /// `slice`, `slice_or_copy` and the offline audit at once.
+    #[test]
+    fn classify_names_the_reason_not_just_the_verdict() {
+        let al = Aliases::disabled();
+        // Nothing is registered, so an aligned slice is UNMAPPED, not aliasable
+        // — and saying so is the point: it is a different repair.
+        let v = vec![0u8; 64];
+        let base = v.as_ptr() as usize;
+        let pad = (4 - base % 4) % 4;
+        assert_eq!(al.classify(&v[pad..pad + 16]), Bind::CopyUnmapped);
+        // and a deliberately odd offset reports its residue
+        assert_eq!(al.classify(&v[pad + 1..pad + 17]), Bind::CopyUnaligned(1));
+        assert_eq!(al.classify(&v[pad + 2..pad + 18]), Bind::CopyUnaligned(2));
+        assert_eq!(al.classify(&[]), Bind::Empty);
+    }
+
+    /// A rate over zero calls is neither 0% nor 100%, and reporting either
+    /// would be a green check over an empty measurement.
+    #[test]
+    fn an_empty_run_has_no_alias_rate() {
+        assert_eq!(BindStats::default().alias_fraction(), None);
+        let s = BindStats { alias_calls: 3, copy_calls: 1, ..Default::default() };
+        assert_eq!(s.alias_fraction(), Some(0.75));
     }
 }

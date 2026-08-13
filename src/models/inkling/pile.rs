@@ -712,6 +712,26 @@ impl PileSource {
         )])
     }
 
+    /// Every `(stacked matrix name, expert index)` this pile holds, sorted.
+    ///
+    /// The index is already built at open, so this is a rename of what is in
+    /// memory rather than a query. It exists because an AUDIT has to be driven
+    /// by what the pile actually contains — asking it for the experts a layer
+    /// range implies would make a leaf nobody indexed invisible to the audit by
+    /// construction.
+    pub fn expert_keys(&self) -> Vec<(String, i64)> {
+        let mut v: Vec<(String, i64)> = self.experts.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// Whether one expert leaf is packed NVFP4 (rather than BF16).
+    pub fn expert_is_nvfp4(&self, base: &str, e: i64) -> Option<bool> {
+        self.experts
+            .get(&(base.to_string(), e))
+            .map(|r| matches!(r.handle, ExpertHandle::Nvfp4(_)))
+    }
+
     /// One expert of a BF16 stack, as a view.
     pub fn expert_bf16(&self, base: &str, e: usize) -> Result<Leaf> {
         let h = match self.experts.get(&(base.to_string(), e as i64)).map(|r| r.handle) {

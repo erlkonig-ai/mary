@@ -372,6 +372,78 @@ impl Weights {
         }
     }
 
+    /// Visit EVERY byte range this source can hand to a device, in place.
+    ///
+    /// `f` receives `(tensor name, which plane, the borrowed bytes)`. The plane
+    /// tag is `"codes"` / `"scales"` for a packed expert, `"expert-bf16"` for one
+    /// of layer 2's, and `"dense"` for everything else — because the alignment
+    /// question is answered per PLANE, not per tensor: a leaf whose payload
+    /// starts aligned still hands the GPU a scale plane at `payload + codes_len`,
+    /// and that offset is a different fact.
+    ///
+    /// A callback rather than a `Vec`, because the ranges borrow a 159 GiB
+    /// mapping and collecting them would either copy the model or fight the
+    /// borrow checker for nothing.
+    ///
+    /// Driven by what the SOURCE contains — `expert_keys` for a pile, the
+    /// safetensors index for a checkpoint — never by what some layer range
+    /// implies. An audit that enumerates the expected set cannot see a leaf that
+    /// is there but unreachable, and cannot see one that is reachable but
+    /// unexpected.
+    pub fn for_each_bindable(
+        &self,
+        mut f: impl FnMut(&str, &'static str, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        match &self.src {
+            Src::Pile(p) => {
+                for name in p.names() {
+                    let leaf = p.leaf(&name)?;
+                    f(&name, "dense", &leaf.bytes)?;
+                }
+                for (name, e) in p.expert_keys() {
+                    if p.expert_is_nvfp4(&name, e) == Some(true) {
+                        let q = p.expert_packed(&name, e as usize)?;
+                        f(&name, "codes", &q.codes)?;
+                        f(&name, "scales", &q.scales)?;
+                    } else {
+                        let l = p.expert_bf16(&name, e as usize)?;
+                        f(&name, "expert-bf16", &l.bytes)?;
+                    }
+                }
+            }
+            Src::Ckpt(c) => {
+                let names = c.names();
+                for name in names.iter().filter(|n| !n.contains(".experts.")) {
+                    let span = c.span(name)?;
+                    f(name, "dense", span.bytes())?;
+                }
+                let mut bases: Vec<&String> = names
+                    .iter()
+                    .filter(|n| n.ends_with(".experts.w13_weight") || n.ends_with(".experts.w2_weight"))
+                    .collect();
+                bases.sort();
+                for base in bases {
+                    let count = c.expert_count(base)?;
+                    for e in 0..count {
+                        if c.is_nvfp4(base) {
+                            let q = c.expert_packed_ref(base, e)?;
+                            f(base, "codes", q.codes())?;
+                            f(base, "scales", q.scales())?;
+                        } else {
+                            // BF16 stacks have no borrowing accessor — the
+                            // checkpoint arm copies them out. Reported as such
+                            // rather than skipped: a plane the audit cannot see
+                            // is not a plane that is fine.
+                            let raw = c.expert_slice_bf16(base, e)?;
+                            f(base, "expert-bf16-copied", &raw.bytes)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     // ---- accounting ------------------------------------------------------
 
     fn note(&self, name: &str, file_bytes: u64, host_bytes: u64, t0: Instant) {
