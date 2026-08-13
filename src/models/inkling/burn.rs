@@ -584,13 +584,25 @@ mod tests {
             .collect()
     }
 
+    /// Small, but no longer arbitrary.
+    ///
+    /// These were `hidden 8, head_dim 2, d_rel 3`, which is the smallest thing
+    /// that exercises grouped KV heads. It is also a shape `m16n8k16` cannot
+    /// tile — `k` must be a multiple of 16 and `n` of 8 — and since the five
+    /// projections became [`Bf16W`] the weights here have to be shapes the
+    /// instruction can actually multiply. Doubling `hidden` and `head_dim` and
+    /// taking `d_rel` to 4 does that while keeping every structural property
+    /// the tests rely on: 4 heads over 2 KV heads is still `groups = 2`, so the
+    /// repeat-in-place indexing is still under test.
+    ///
+    ///     wq [16, 16]   wk/wv [8, 16]   wr [16, 16]   wo [16, 16]
     fn dims(kind: AttnKind, rel_extent: usize) -> AttnDims {
         AttnDims {
-            hidden: 8,
+            hidden: 16,
             heads: 4,
             kv_heads: 2,
-            head_dim: 2,
-            d_rel: 3,
+            head_dim: 4,
+            d_rel: 4,
             rel_extent,
             kernel: 4,
             rms_eps: 1e-6,
@@ -598,20 +610,33 @@ mod tests {
         }
     }
 
-    fn weights(d: &AttnDims, dev: &burn::backend::cuda::CudaDevice) -> AttnWeightsDev<B> {
+    fn weights(d: &AttnDims, dev: &burn::backend::cuda::CudaDevice) -> AttnWeightsDev {
         let m = |rows: usize, cols: usize, seed: f32| -> Tensor<B, 2> {
             Tensor::from_data(TensorData::new(fill(rows * cols, seed), [rows, cols]), dev)
         };
         let v = |n: usize, seed: f32| -> Tensor<B, 1> {
             Tensor::from_data(TensorData::new(fill(n, seed), [n]), dev)
         };
+        // The same filler, rounded to the BF16 the projections now multiply as.
+        // `bf16::from_f32` is round-to-nearest-even, which is what the device
+        // cast and `torch.Tensor.to(torch.bfloat16)` both do, so both lanes
+        // under comparison see identical operand bits.
+        let client = client_of(&m(1, 1, 0.0));
+        let w16 = |rows: usize, cols: usize, seed: f32| -> Bf16W {
+            assert!(Bf16W::tileable(rows, cols), "test weight {rows}x{cols} does not tile");
+            let mut bytes = Vec::with_capacity(rows * cols * 2);
+            for x in fill(rows * cols, seed) {
+                bytes.extend_from_slice(&half::bf16::from_f32(x).to_le_bytes());
+            }
+            Bf16W { h: client.create_from_slice(&bytes), n: rows, k: cols }
+        };
         let (q_w, kv_w) = (d.heads * d.head_dim, d.kv_heads * d.head_dim);
         AttnWeightsDev {
-            wq: m(q_w, d.hidden, 0.1),
-            wk: m(kv_w, d.hidden, 0.2),
-            wv: m(kv_w, d.hidden, 0.3),
-            wr: m(d.heads * d.d_rel, d.hidden, 0.4),
-            wo: m(d.hidden, q_w, 0.5),
+            wq: w16(q_w, d.hidden, 0.1),
+            wk: w16(kv_w, d.hidden, 0.2),
+            wv: w16(kv_w, d.hidden, 0.3),
+            wr: w16(d.heads * d.d_rel, d.hidden, 0.4),
+            wo: w16(d.hidden, q_w, 0.5),
             k_sconv: m(kv_w, d.kernel, 0.6),
             v_sconv: m(kv_w, d.kernel, 0.7),
             q_norm: v(d.head_dim, 0.8),
