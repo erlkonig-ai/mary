@@ -372,6 +372,72 @@ impl Weights {
         }
     }
 
+    // ---- what the source SAYS about itself --------------------------------
+
+    /// One of the checkpoint's JSON sidecars, by file name.
+    ///
+    /// The whole reason this is on `Weights` and not on the caller: `config.json`
+    /// is not a weight, and for as long as reading it meant reading the
+    /// checkpoint DIRECTORY, `INK_PILE` moved the 159 GiB and left the run
+    /// depending on the 40 KB. A pile that cannot answer this is not
+    /// authoritative, it is merely large.
+    ///
+    /// The pile arm answers from FACTS — one entity per JSON scalar, see
+    /// [`crate::jsonfacts`] — not from a stored copy of the file, so
+    /// `text_config.hidden_size` is reachable as a query and the document
+    /// reconstructed here is the same thing read a different way.
+    pub fn document(&self, name: &str) -> Result<serde_json::Value> {
+        match &self.src {
+            Src::Ckpt(c) => {
+                let path = c.dir().join(name);
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|e| anyhow::anyhow!("read {path:?}: {e}"))?;
+                serde_json::from_str(&text)
+                    .map_err(|e| anyhow::anyhow!("parse {path:?}: {e}"))
+            }
+            Src::Pile(p) => crate::jsonfacts::load_document(p.facts(), p.reader(), name)
+                .map_err(|e| anyhow::anyhow!("{e}")),
+        }
+    }
+
+    /// A sidecar that is TEXT rather than JSON — the chat template.
+    ///
+    /// In a pile it is a document whose root is a JSON string, so it goes
+    /// through exactly the same storage and the same query as the others; there
+    /// is no second mechanism for "files that are not JSON".
+    pub fn text_document(&self, name: &str) -> Result<String> {
+        match &self.src {
+            Src::Ckpt(c) => {
+                let path = c.dir().join(name);
+                std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("read {path:?}: {e}"))
+            }
+            Src::Pile(_) => match self.document(name)? {
+                serde_json::Value::String(s) => Ok(s),
+                other => anyhow::bail!(
+                    "{name} is stored as {} rather than a string",
+                    match other {
+                        serde_json::Value::Object(_) => "an object",
+                        serde_json::Value::Array(_) => "an array",
+                        _ => "a scalar",
+                    }
+                ),
+            },
+        }
+    }
+
+    /// Every document this source can answer for. Empty for a checkpoint, whose
+    /// directory is not enumerated — the point of the list is to say what a
+    /// PILE carries.
+    pub fn documents(&self) -> Vec<String> {
+        match &self.src {
+            Src::Ckpt(_) => Vec::new(),
+            Src::Pile(p) => crate::jsonfacts::documents(p.facts(), p.reader())
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect(),
+        }
+    }
+
     /// Visit EVERY byte range this source can hand to a device, in place.
     ///
     /// `f` receives `(tensor name, which plane, the borrowed bytes)`. The plane

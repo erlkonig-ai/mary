@@ -310,6 +310,21 @@ required-features = ["inkling"]
 name = "inkling_forward"
 required-features = ["inkling"]
 
+# Does Inkling's BPE tokenizer survive the trip through the trible graph? Both
+# sides of the comparison need the `tokenizers` executor, so this is the one
+# inkling binary gated on `tokenizer` rather than `inkling`.
+[[bin]]
+name = "inkling_tokenizer_gate"
+required-features = ["tokenizer"]
+
+# A checkpoint's JSON sidecars as facts, and the round-trip gate over them.
+# Needs `import` for nothing device-side and `tokenizer` for the pile-writing
+# half (`persist::ingest_json_documents` sits behind the same flag as the
+# tokenizer ingest it is a sibling of).
+[[bin]]
+name = "inkling_meta_gate"
+required-features = ["tokenizer", "inkling"]
+
 # How much DEVICE memory this part hands out, and what a resident set of that
 # size costs to read. Both are properties of the box, and nvidia-smi answers
 # [N/A] for both on a unified part, so they have to be measured by allocating.

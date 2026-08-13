@@ -1577,6 +1577,20 @@ pub fn ingest_spm_tokenizer(
 /// [`load_spm_tokenizer_from_pile`].
 #[cfg(feature = "tokenizer")]
 pub fn load_tokenizer_from_pile(pile_path: &Path) -> anyhow::Result<tokenizers::Tokenizer> {
+    load_tokenizer_from_pile_on(pile_path, "main")
+}
+
+/// [`load_tokenizer_from_pile`] on a NAMED branch.
+///
+/// A model pile does not have to keep its facts on `main` — Inkling's weights,
+/// and now its tokenizer, live on `inkling` — and a loader that can only read
+/// one branch name forces a second pile for the tokenizer, which is the
+/// side-file problem this module exists to remove.
+#[cfg(feature = "tokenizer")]
+pub fn load_tokenizer_from_pile_on(
+    pile_path: &Path,
+    branch: &str,
+) -> anyhow::Result<tokenizers::Tokenizer> {
     let mut pile =
         Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open pile {pile_path:?}: {e:?}"))?;
     // Read path: non-mutating load, NEVER amputate (see load_keymap_from_pile).
@@ -1594,15 +1608,15 @@ pub fn load_tokenizer_from_pile(pile_path: &Path) -> anyhow::Result<tokenizers::
     )
     .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
     let branch_id = repo
-        .lookup_branch("main")
-        .map_err(|e| anyhow::anyhow!("lookup main: {e:?}"))?
-        .ok_or_else(|| anyhow::anyhow!("no 'main' branch in pile {pile_path:?}"))?;
+        .lookup_branch(branch)
+        .map_err(|e| anyhow::anyhow!("lookup {branch}: {e:?}"))?
+        .ok_or_else(|| anyhow::anyhow!("no {branch:?} branch in pile {pile_path:?}"))?;
     let mut ws = repo
         .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull main: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("pull {branch}: {e:?}"))?;
     let head = ws
         .head()
-        .ok_or_else(|| anyhow::anyhow!("'main' has no commits"))?;
+        .ok_or_else(|| anyhow::anyhow!("{branch:?} has no commits"))?;
     let checkout = ws
         .checkout(ancestors(head))
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
@@ -1614,8 +1628,8 @@ pub fn load_tokenizer_from_pile(pile_path: &Path) -> anyhow::Result<tokenizers::
 
     let tok_id = crate::tokenizer::find_tokenizer(&tribles).ok_or_else(|| {
         anyhow::anyhow!(
-            "no tokenizer graph in pile {pile_path:?} — ingest one from its \
-             tokenizer.json (e.g. `memory ingest-tokenizer`)"
+            "no tokenizer graph on {branch:?} in pile {pile_path:?} — ingest one \
+             from its tokenizer.json (inkling_tokenizer_gate)"
         )
     })?;
     let tok = crate::tokenizer::build_tokenizer(&tribles, &reader, tok_id)
@@ -1623,6 +1637,284 @@ pub fn load_tokenizer_from_pile(pile_path: &Path) -> anyhow::Result<tokenizers::
     repo.close()
         .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
     Ok(tok)
+}
+
+/// What one tokenizer ingest cost, so the rate can be reported rather than
+/// guessed at.
+#[cfg(feature = "tokenizer")]
+#[derive(Debug, Clone, Copy)]
+pub struct TokenizerIngest {
+    pub facts: usize,
+    /// Blob puts the ingest issued. Counted at the store, not derived from the
+    /// JSON's shape.
+    pub puts: u64,
+    /// Nanoseconds spent inside those puts.
+    pub put_nanos: u64,
+    /// Nanoseconds for the whole ingest, puts included.
+    pub total_nanos: u64,
+    /// Bytes the pile file grew by. The interesting comparison is against the
+    /// ~2 MB of distinct text a tokenizer actually is: a V3 record is a
+    /// 256-byte header plus data padded to a 256-byte multiple, so a vocabulary
+    /// of short strings costs far more in framing than in content, and knowing
+    /// which of the two is the cost decides whether there is anything to fix.
+    pub file_growth: u64,
+}
+
+#[cfg(feature = "tokenizer")]
+impl TokenizerIngest {
+    /// Puts per second measured against the time actually spent putting.
+    pub fn put_rate(&self) -> Option<f64> {
+        match self.put_nanos {
+            0 => None,
+            n => Some(self.puts as f64 * 1e9 / n as f64),
+        }
+    }
+}
+
+/// Ingest a HuggingFace `tokenizer.json` into a pile as a tokenizer GRAPH — the
+/// write side of [`load_tokenizer_from_pile_on`], and the BPE/WordPiece
+/// counterpart of [`ingest_spm_tokenizer`].
+///
+/// `save_tokenizer_json` has existed and been tested since 2026-07-16 and has
+/// never had a caller that writes to disk; this is it. The gap mattered: an
+/// in-memory `MemoryBlobStore` answers a put in about the time it takes to
+/// hash, and a pile answers it by appending a record, so every performance
+/// claim about ingest made against the in-memory path was about a different
+/// operation.
+///
+/// Refuses to write a second tokenizer onto a branch that already has one: a
+/// pile is append-only, `find_tokenizer` returns a single node, and two would
+/// make which-one-you-get depend on iteration order.
+#[cfg(feature = "tokenizer")]
+pub fn ingest_hf_tokenizer(
+    pile_path: &Path,
+    tokenizer_json: &Path,
+    source_name: &str,
+    branch: &str,
+) -> anyhow::Result<TokenizerIngest> {
+    let json = std::fs::read(tokenizer_json)
+        .map_err(|e| anyhow::anyhow!("read {tokenizer_json:?}: {e}"))?;
+    let before = std::fs::metadata(pile_path).map(|m| m.len()).unwrap_or(0);
+
+    let mut pile =
+        Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open pile {pile_path:?}: {e:?}"))?;
+    pile.refresh()
+        .map_err(|e| anyhow::anyhow!("pile {pile_path:?} failed to load ({e:?})"))?;
+    let mut repo = Repository::new(
+        pile,
+        SigningKey::generate(&mut rand::rngs::OsRng),
+        TribleSet::new(),
+    )
+    .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
+    let branch_id = repo
+        .ensure_branch(branch, None)
+        .map_err(|e| anyhow::anyhow!("ensure {branch}: {e:?}"))?;
+    let mut ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow::anyhow!("pull {branch}: {e:?}"))?;
+
+    let existing = match ws.head() {
+        Some(head) => {
+            let checkout = ws
+                .checkout(ancestors(head))
+                .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+            crate::tokenizer::find_tokenizer(checkout.facts())
+        }
+        None => None,
+    };
+    if let Some(existing) = existing {
+        // Close before bailing: an early return would drop the pile unclosed.
+        repo.close()
+            .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+        anyhow::bail!(
+            "pile {pile_path:?} branch {branch:?} already contains tokenizer \
+             {existing:?}; refusing to add a second (a pile is append-only — \
+             this cannot be undone)"
+        );
+    }
+
+    let t0 = std::time::Instant::now();
+    // Straight into the pile's own store, not the workspace's staging one: the
+    // point of the measurement is the on-disk put.
+    let mut counting = crate::tokenizer::CountingBlobs::new(repo.storage_mut());
+    let frag = crate::tokenizer::save_tokenizer_json(&json, source_name, &mut counting)
+        .map_err(|e| anyhow::anyhow!("build tokenizer graph: {e}"))?;
+    let (puts, put_nanos) = (counting.puts, counting.nanos);
+    let total_nanos = t0.elapsed().as_nanos() as u64;
+
+    let facts = frag.into_facts();
+    let n = facts.len();
+    ws.commit(facts, "ingest HuggingFace BPE tokenizer graph");
+    repo.push(&mut ws)
+        .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+    repo.close()
+        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+
+    let after = std::fs::metadata(pile_path).map(|m| m.len()).unwrap_or(before);
+    Ok(TokenizerIngest {
+        facts: n,
+        puts,
+        put_nanos,
+        total_nanos,
+        file_growth: after.saturating_sub(before),
+    })
+}
+
+/// A branch's facts and a reader for the blobs they name.
+///
+/// The prologue every pile reader in this file repeats, offered once. Note the
+/// order: the repository is CLOSED before the pair is returned, because the
+/// reader holds its own mapping and outlives it — and a bail before the close
+/// leaves the pile "unclosed", which is a warning nobody reads and a habit that
+/// eventually loses a write.
+pub fn pile_facts(
+    pile_path: &Path,
+    branch: &str,
+) -> anyhow::Result<(TribleSet, triblespace::core::repo::pile::PileReader)> {
+    let mut pile =
+        Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open pile {pile_path:?}: {e:?}"))?;
+    // Read path: never amputate. A torn tail is an operator decision.
+    pile.refresh()
+        .map_err(|e| anyhow::anyhow!("pile {pile_path:?} failed to load ({e:?})"))?;
+    let mut repo = Repository::new(
+        pile,
+        SigningKey::generate(&mut rand::rngs::OsRng),
+        TribleSet::new(),
+    )
+    .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
+    let branch_id = repo
+        .lookup_branch(branch)
+        .map_err(|e| anyhow::anyhow!("lookup {branch}: {e:?}"))?
+        .ok_or_else(|| anyhow::anyhow!("no {branch:?} branch in pile {pile_path:?}"))?;
+    let mut ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow::anyhow!("pull {branch}: {e:?}"))?;
+    let head = ws
+        .head()
+        .ok_or_else(|| anyhow::anyhow!("{branch:?} has no commits"))?;
+    let facts: TribleSet = ws
+        .checkout(ancestors(head))
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
+        .facts()
+        .clone();
+    let reader = repo
+        .storage_mut()
+        .reader()
+        .map_err(|e| anyhow::anyhow!("pile reader: {e:?}"))?;
+    repo.close()
+        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+    Ok((facts, reader))
+}
+
+/// Ingest a checkpoint's JSON sidecars into a pile as facts.
+///
+/// `json_docs` are parsed; `text_docs` are stored as documents whose root is a
+/// JSON string, so there is one storage mechanism rather than two.
+///
+/// Idempotent by construction rather than by a skip list: a document node's id
+/// derives from `(tag, name, root)` and the root's from its content, so
+/// re-ingesting the same file yields the same entity and merging it is a no-op.
+/// What is NOT harmless is ingesting a DIFFERENT `config.json` under the same
+/// name — two documents, and which one a reader gets depends on iteration
+/// order — so that is refused rather than appended.
+#[cfg(feature = "tokenizer")]
+pub fn ingest_json_documents(
+    pile_path: &Path,
+    dir: &Path,
+    json_docs: &[&str],
+    text_docs: &[&str],
+    branch: &str,
+) -> anyhow::Result<usize> {
+    let mut pending: Vec<(String, serde_json::Value)> = Vec::new();
+    for name in json_docs {
+        let path = dir.join(name);
+        if !path.exists() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("read {path:?}: {e}"))?;
+        let v: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("parse {path:?}: {e}"))?;
+        pending.push((name.to_string(), v));
+    }
+    for name in text_docs {
+        let path = dir.join(name);
+        if !path.exists() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("read {path:?}: {e}"))?;
+        pending.push((name.to_string(), serde_json::Value::String(text)));
+    }
+    anyhow::ensure!(!pending.is_empty(), "no sidecars found in {dir:?}");
+
+    let mut pile =
+        Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open pile {pile_path:?}: {e:?}"))?;
+    pile.refresh()
+        .map_err(|e| anyhow::anyhow!("pile {pile_path:?} failed to load ({e:?})"))?;
+    let mut repo = Repository::new(
+        pile,
+        SigningKey::generate(&mut rand::rngs::OsRng),
+        TribleSet::new(),
+    )
+    .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
+    let branch_id = repo
+        .ensure_branch(branch, None)
+        .map_err(|e| anyhow::anyhow!("ensure {branch}: {e:?}"))?;
+    let mut ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow::anyhow!("pull {branch}: {e:?}"))?;
+
+    // What the branch already says, compared by VALUE rather than by node id.
+    // Re-ingesting the identical file is silent (the ids derive from the
+    // content, so the facts merge to nothing new); a file whose CONTENT changed
+    // is refused, because a second document under the same name makes which one
+    // a reader gets depend on iteration order.
+    let mut clash: Option<String> = None;
+    if let Some(head) = ws.head() {
+        let checkout = ws
+            .checkout(ancestors(head))
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let facts = checkout.facts().clone();
+        let reader = repo
+            .storage_mut()
+            .reader()
+            .map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
+        for (name, v) in &pending {
+            if let Ok(have) = crate::jsonfacts::load_document(&facts, &reader, name) {
+                if &have != v {
+                    clash = Some(name.clone());
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(name) = clash {
+        repo.close()
+            .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+        anyhow::bail!(
+            "pile {pile_path:?} branch {branch:?} already holds a DIFFERENT \
+             document named {name:?}; a pile is append-only, so writing a \
+             second would make which one a reader gets depend on iteration \
+             order"
+        );
+    }
+
+    let mut change = TribleSet::new();
+    for (name, v) in &pending {
+        if let Err(e) = crate::jsonfacts::save_document(name, v, repo.storage_mut(), &mut change) {
+            repo.close().map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+            anyhow::bail!("{name}: {e}");
+        }
+    }
+
+    let n = change.len();
+    ws.commit(change, "ingest checkpoint JSON sidecars as facts");
+    repo.push(&mut ws)
+        .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+    repo.close()
+        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+    Ok(n)
 }
 
 /// Stream a Gemma 4 model directly from a pile: index the blob handles (cheap),

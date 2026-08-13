@@ -16,6 +16,12 @@ pub mod format;
 /// merges, and added-tokens as tribles so the tokenizer travels with the pile
 /// instead of as a HuggingFace-cache `tokenizer.json` side-file.
 pub mod tokenizer;
+/// A checkpoint's JSON sidecars — `config.json`, `hf_quant_config.json`, the
+/// chat template — as FACTS rather than stored files, so a pile stops needing
+/// the checkpoint directory beside it. One entity per JSON scalar, nine
+/// attributes for every document; see the module docs for why that beats one
+/// minted attribute per config field.
+pub mod jsonfacts;
 /// tiktoken-style byte-level BPE (Kimi-K3): the rank table IS the merge order,
 /// so there is no merges list — the engine half of what [`tokenizer`]'s
 /// `ty::TIKTOKEN` stores as facts. Gated id-for-id against the shipped

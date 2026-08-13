@@ -19,10 +19,16 @@
 //! # Where the weights come from
 //!
 //! `<ckpt>` is a safetensors checkpoint directory. `INK_PILE=<path>` swaps the
-//! WEIGHT source for a pile on branch `INK_PILE_BRANCH` (default `inkling`) —
-//! the directory is then read only for `config.json`, which is not a weight and
-//! does not live in the pile. One environment variable is the whole A/B, which
-//! is the point: everything below this line is the same code either way.
+//! source for a pile on branch `INK_PILE_BRANCH` (default `inkling`), and it
+//! swaps ALL of it: the weights and `config.json` both come from whichever
+//! source is named, so a pile-backed run reads nothing from the directory. It
+//! used to read the config there regardless, which meant `INK_PILE` moved 159
+//! GiB out of the checkpoint and left the run depending on the 40 KB still in
+//! it. One environment variable is the whole A/B, which is the point:
+//! everything below this line is the same code either way.
+//!
+//! The argument is still a path so a checkpoint-backed run has somewhere to
+//! read from; with `INK_PILE` set it is only a label, and `--` will do.
 //!
 //!   cargo run --release --features inkling-cuda,cuda-backend --bin inkling_forward \
 //!       -- <ckpt> <ids.bin> <out.bin>
@@ -631,9 +637,6 @@ fn main() -> Result<()> {
     let ids_path = std::env::args().nth(2).map(PathBuf::from).context("usage: <ckpt> <ids> <out>")?;
     let out_path = std::env::args().nth(3).map(PathBuf::from).context("usage: <ckpt> <ids> <out>")?;
 
-    let cfg_text = std::fs::read_to_string(ckpt.join("config.json"))?;
-    let cfg = InklingConfig::from_json(&cfg_text).context("parsing config.json")?;
-    let t = &cfg.text_config;
     // The one line that decides where the weights come from. `INK_PILE` swaps
     // the source; nothing downstream of here asks which it was.
     let pile_path = std::env::var("INK_PILE").ok();
@@ -644,6 +647,35 @@ fn main() -> Result<()> {
         None => Weights::open_ckpt(&ckpt)?,
     };
     let open_secs = t_open.elapsed().as_secs_f64();
+
+    // …and the config comes from the SAME source. It used to come from the
+    // checkpoint directory unconditionally, which meant `INK_PILE` moved 159 GiB
+    // out of the directory and left the run depending on the 40 KB still in it:
+    // a pile that cannot answer this is not authoritative, only large. In a pile
+    // the config is FACTS (one entity per JSON scalar, `mary::jsonfacts`), so
+    // this is a query, not a stored file being read back.
+    //
+    // `INK_CONFIG=<file>` overrides it, LOUDLY, for one case: a pile written
+    // before the sidecars were facts. That pile still holds every weight and is
+    // still worth running, and the alternative — falling back to the checkpoint
+    // directory when the pile has no config — is exactly the silent dependency
+    // this change removes. An override you have to type is a different thing
+    // from a fallback you never see.
+    let cfg_source = std::env::var("INK_CONFIG").ok();
+    let cfg_text = match &cfg_source {
+        Some(p) => std::fs::read_to_string(p)
+            .with_context(|| format!("INK_CONFIG={p}"))?,
+        None => cp
+            .document("config.json")
+            .context(
+                "the weight source carries no config.json. For a pile, ingest \
+                 the checkpoint's sidecars as facts (inkling_meta_gate <ckpt> \
+                 <pile>), or point INK_CONFIG at the file to run without them",
+            )?
+            .to_string(),
+    };
+    let cfg = InklingConfig::from_json(&cfg_text).context("parsing config.json")?;
+    let t = &cfg.text_config;
 
     // Which layers THIS process runs. The default is the whole stack, so a
     // single-machine run is the `INK_LAYERS` unset case and not a special one.
@@ -684,7 +716,17 @@ fn main() -> Result<()> {
 
     let h = t.hidden_size;
     println!("=== forward ===");
-    println!("  config     : {}", ckpt.display());
+    println!(
+        "  config     : {}",
+        match &cfg_source {
+            Some(p) => format!("INK_CONFIG={p}  (OVERRIDE -- the source was not asked)"),
+            None => format!(
+                "config.json from the {} ({})",
+                cp.kind(),
+                pile_path.as_deref().unwrap_or(&ckpt.display().to_string())
+            ),
+        }
+    );
     println!(
         "  weights    : {} {}  (index built in {open_secs:.1}s)",
         cp.kind(),

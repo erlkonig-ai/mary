@@ -39,6 +39,53 @@ use triblespace::prelude::*;
 
 type Err = Box<dyn std::error::Error>;
 
+/// A [`BlobStorePut`] that counts and times the puts passing through it.
+///
+/// Ingesting a tokenizer is dominated by blob operations rather than by bytes —
+/// Inkling's `tokenizer.json` is 199 998 vocab entries plus 446 189 merges, and
+/// the naive shape interns each merge's two halves separately, so 2 MB of text
+/// costs over a million puts. The rate that matters is therefore puts per
+/// second on a REAL pile, and it has to be counted where the puts happen: a
+/// driver that derives the number from `vocab.len() + 2 * merges.len()` is a
+/// second transcription of the ingest's control flow and drifts the moment the
+/// ingest changes, which is exactly when the number is being looked at.
+pub struct CountingBlobs<'a, B: BlobStorePut> {
+    inner: &'a mut B,
+    pub puts: u64,
+    pub nanos: u64,
+}
+
+impl<'a, B: BlobStorePut> CountingBlobs<'a, B> {
+    pub fn new(inner: &'a mut B) -> Self {
+        CountingBlobs { inner, puts: 0, nanos: 0 }
+    }
+
+    /// Puts per second, or `None` when nothing was put.
+    pub fn rate(&self) -> Option<f64> {
+        match self.nanos {
+            0 => None,
+            n => Some(self.puts as f64 * 1e9 / n as f64),
+        }
+    }
+}
+
+impl<'a, B: BlobStorePut> BlobStorePut for CountingBlobs<'a, B> {
+    type PutError = B::PutError;
+
+    fn put<S, T>(&mut self, item: T) -> Result<Inline<inlineencodings::Handle<S>>, Self::PutError>
+    where
+        S: triblespace::core::blob::BlobEncoding + 'static,
+        T: triblespace::core::blob::IntoBlob<S>,
+        inlineencodings::Handle<S>: triblespace::core::inline::InlineEncoding,
+    {
+        let t = std::time::Instant::now();
+        let h = self.inner.put(item);
+        self.nanos += t.elapsed().as_nanos() as u64;
+        self.puts += 1;
+        h
+    }
+}
+
 // ── classification concepts, via the canonical `metadata::tag` (presence = "this
 // concept applies"). There is NO `metadata::kind` attribute — tags ARE the
 // classifier (KIND_TAG = kind discriminants, KIND_MULTI = multiple simultaneous
@@ -104,6 +151,31 @@ mod flag {
     pub const FUSE_UNK: Id = id_hex!("39F4E0AF4C309CB77AADD1EB33495967");
     pub const SPECIAL: Id = id_hex!("BBB4BCA9CA25CAB5F2ECABF787B0A638");
     pub const NORMALIZED: Id = id_hex!("266A99918C6951D5C9F2D0A961C05D4A");
+    /// A `ByteLevel` node's `use_regex`. Minted 2026-08-13.
+    ///
+    /// It was hardcoded `true` on the read side with a comment saying to
+    /// revisit it before a tokenizer that sets it false — and Inkling is that
+    /// tokenizer: its pre-tokenizer is `Split(Regex, Isolated)` followed by
+    /// `ByteLevel { use_regex: false }`. Reconstructed with `true` the
+    /// ByteLevel re-applies GPT-2's own split ON TOP of the model's, which
+    /// changes the token stream rather than erroring.
+    ///
+    /// Presence semantics, like every other flag here: a node written before
+    /// this id existed carries no tag and rebuilds with `use_regex: false`.
+    /// That is a behaviour change for tokenizer graphs already in piles
+    /// (CLIP's pre-tokenizer ByteLevel, every decoder ByteLevel) and they must
+    /// be re-ingested. A negative `NO_USE_REGEX` flag would have avoided it and
+    /// was rejected: an inverted flag makes the absent case mean two different
+    /// things depending on when the graph was written, which is the same
+    /// ambiguity one layer deeper.
+    pub const USE_REGEX: Id = id_hex!("32F9C0904E02BC40F2FF723966A88D8E");
+    /// A BPE model's `ignore_merges`: a piece that is already a vocab entry is
+    /// emitted whole rather than rebuilt from merges. Minted 2026-08-13.
+    ///
+    /// Inkling sets it true, and it is not cosmetic — with it false the merge
+    /// table re-derives pieces the vocab already names, and long tokens come
+    /// back as several short ones.
+    pub const IGNORE_MERGES: Id = id_hex!("22B7385E0FFC80CFAB80AE750557F784");
 }
 
 pub mod attrs {
@@ -229,12 +301,45 @@ pub fn save_tokenizer_json(
     let model_kind = model["type"].as_str().unwrap_or("");
     let mut facts = TribleSet::new();
 
+    // Every distinct string this tokenizer contains, put ONCE.
+    //
+    // The whole tokenizer is 199 998 distinct strings — every one of Inkling's
+    // 892 378 merge sides is already a vocab entry, and merges introduce no new
+    // ones — but the shape below asks the store for each of them separately, so
+    // 2 MB of text used to cost 1 092 438 blob operations. Nothing about the
+    // RESULT changes: a handle is derived from content, so the same string
+    // yields the same handle whether it is computed once or five times, and the
+    // facts, the blobs and the pile bytes are identical either way. What
+    // changes is how many times the store is asked, and on a pile a put is an
+    // append rather than a hash-map probe.
+    //
+    // This is NOT a change of representation. Each piece stays its own
+    // content-addressed blob, so the interning that matters — the baseline
+    // shared across tokenizers, where CLIP, nomic and Inkling overlap heavily —
+    // is exactly as it was. Packing the vocabulary into one blob would have
+    // destroyed that; a memo in front of the same puts cannot.
+    let mut memo: HashMap<String, Inline<inlineencodings::Handle<blobencodings::LongString>>> =
+        HashMap::with_capacity(1 << 18);
+    macro_rules! intern {
+        ($blobs:expr, $s:expr) => {{
+            let s: &str = $s;
+            match memo.get(s) {
+                Some(h) => *h,
+                None => {
+                    let h = $blobs.put::<blobencodings::LongString, _>(s.to_string())?;
+                    memo.insert(s.to_string(), h);
+                    h
+                }
+            }
+        }};
+    }
+
     // ── vocab: { piece, token_id } per entry ──
     let mut vocab_ids: Vec<Id> = Vec::new();
     if let Some(vocab) = model["vocab"].as_object() {
         for (tok, id) in vocab {
             let id = id.as_u64().ok_or("vocab id not an integer")?;
-            let ph = blobs.put::<blobencodings::LongString, _>(tok.clone())?;
+            let ph = intern!(blobs, tok);
             let e = entity! { _ @ attrs::piece: ph, attrs::token_id: id };
             vocab_ids.push(e.root().expect("vocab entry root"));
             facts += e.into_facts();
@@ -246,8 +351,8 @@ pub fn save_tokenizer_json(
     if let Some(merges) = model["merges"].as_array() {
         for (rank, m) in merges.iter().enumerate() {
             let (l, r) = merge_pair(m).ok_or("malformed merge entry")?;
-            let lh = blobs.put::<blobencodings::LongString, _>(l)?;
-            let rh = blobs.put::<blobencodings::LongString, _>(r)?;
+            let lh = intern!(blobs, &l);
+            let rh = intern!(blobs, &r);
             let e = entity! { _ @
                 attrs::merge_left: lh,
                 attrs::merge_right: rh,
@@ -266,7 +371,7 @@ pub fn save_tokenizer_json(
         for (order, t) in added.iter().enumerate() {
             let content = t["content"].as_str().ok_or("added token missing content")?;
             let id = t["id"].as_u64().ok_or("added token id not an integer")?;
-            let ch = blobs.put::<blobencodings::LongString, _>(content.to_string())?;
+            let ch = intern!(blobs, content);
             let e = entity! { _ @
                 attrs::piece: ch,
                 attrs::token_id: id,
@@ -278,7 +383,7 @@ pub fn save_tokenizer_json(
     }
 
     // ── the tokenizer entity (+ flat model knobs; absent ones are omitted) ──
-    let name_h = blobs.put::<blobencodings::LongString, _>(source_name.to_string())?;
+    let name_h = intern!(blobs, source_name);
     let unk = model["unk_token"].as_str();
     let csp = model["continuing_subword_prefix"]
         .as_str()
@@ -287,11 +392,14 @@ pub fn save_tokenizer_json(
         .as_str()
         .filter(|s| !s.is_empty());
     let max_chars = model["max_input_chars_per_word"].as_u64();
-    let model_type = match model_kind {
+    let mut model_tags = vec![match model_kind {
         "WordPiece" => ty::WORD_PIECE,
         "BPE" => ty::BPE,
         other => return Err(format!("unsupported tokenizer model type: {other:?}").into()),
-    };
+    }];
+    if model["ignore_merges"].as_bool() == Some(true) {
+        model_tags.push(flag::IGNORE_MERGES);
+    }
 
     // ── config tail: normalizer / pre-tokenizer / decoder subtrees. The
     //    post-processor is deliberately omitted — mary hand-frames [CLS]/[SEP]
@@ -310,7 +418,7 @@ pub fn save_tokenizer_json(
     };
 
     let tok = entity! { _ @
-        metadata::tag: model_type,
+        metadata::tag*: model_tags.iter(),
         attrs::model_name: name_h,
         attrs::normalizer?: norm_id,
         attrs::pre_tokenizer?: pretok_id,
@@ -495,6 +603,12 @@ fn save_config_node(
             }
             if v["trim_offsets"].as_bool() == Some(true) {
                 tags.push(flag::TRIM_OFFSETS);
+            }
+            // Absent means true — that is HuggingFace's default, and reading
+            // `as_bool() == Some(true)` here would silently turn every
+            // tokenizer that omits the field into a `use_regex: false` one.
+            if v["use_regex"].as_bool().unwrap_or(true) {
+                tags.push(flag::USE_REGEX);
             }
         }
         "WordPiece" => {
@@ -772,6 +886,12 @@ pub fn build_tokenizer(
     } else if tags.contains(&ty::BPE) {
         let merges = load_merges(tribles, blobs, tok_id);
         let mut b = BPE::builder().vocab_and_merges(vocab, merges);
+        // Not cosmetic: with `ignore_merges` false the merge table re-derives
+        // pieces the vocab already names, so a token the model would emit whole
+        // comes back as several. Inkling sets it true.
+        if tags.contains(&flag::IGNORE_MERGES) {
+            b = b.ignore_merges(true);
+        }
         if let Some(u) = unk {
             b = b.unk_token(u);
         }
@@ -889,13 +1009,15 @@ fn build_pre_tokenizer(
         .map_err(|e| format!("build Split pre-tokenizer: {e}"))?
         .into())
     } else if has(ty::BYTE_LEVEL) {
-        // use_regex is not yet persisted (no flag minted): default true, the
-        // HF default. Revisit before ingesting CLIP, whose pre-tok ByteLevel
-        // sits after a Split and sets use_regex=false.
+        // use_regex comes from the graph now. It used to be hardcoded true
+        // with a comment saying to revisit it, and Inkling is the tokenizer
+        // that made it matter: `Split(Regex, Isolated)` then
+        // `ByteLevel { use_regex: false }`, where a true here re-splits what
+        // the Split already split.
         Ok(p::byte_level::ByteLevel::new(
             has(flag::ADD_PREFIX_SPACE),
             has(flag::TRIM_OFFSETS),
-            true,
+            has(flag::USE_REGEX),
         )
         .into())
     } else {
@@ -920,7 +1042,7 @@ fn build_decoder(
         Ok(tokenizers::pre_tokenizers::byte_level::ByteLevel::new(
             has(flag::ADD_PREFIX_SPACE),
             has(flag::TRIM_OFFSETS),
-            true,
+            has(flag::USE_REGEX),
         )
         .into())
     } else {
