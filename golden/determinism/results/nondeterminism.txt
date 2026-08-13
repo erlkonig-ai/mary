@@ -1,0 +1,150 @@
+The run-to-run nondeterminism is not rounding. It is expert weights read out of
+pages the kernel has reclaimed.
+================================================================================
+
+WHAT REPRODUCES IT
+
+  golden/determinism/arms.sh <nruns> <hogGiB>
+
+Four cells, one variable each:
+
+                     no pressure            50 GiB anonymous pressure
+    ALIASED          canonical              WRONG, differently every run   3/3
+    COPIED           canonical (identical)  canonical                      2/2
+                                            (+1 honest CUDA OOM)
+
+"canonical" is h_after_02 = f5e68cfea497, h_after_19 = 19ebdba4ffc1 on the
+73-token arith-change prompt, INK_LAYERS=0:20.
+
+Rates, single process, INK_LAYERS=0:20, same prompt:
+
+    idle box                      25 consecutive runs, ALL BITWISE IDENTICAL
+                                  (every one of the 20 layer dumps, and top5)
+    10 passes in ONE process      identical (INK_REPEAT=1 INK_GEN=9)
+    under 50-55 GiB pressure      6/6 runs diverged, all six different
+                                  1 of the 6 panicked on a NaN
+
+So the runtime IS bitwise deterministic. It stops being deterministic exactly
+when the host is reclaiming memory, which is why it looked random: nothing in
+the model, the prompt or the kernels varies, only whether the weight was still
+in RAM when the GPU went to read it.
+
+THE MECHANISM
+
+Expert weights are never uploaded. `Aliases::register` hands the GPU the pile's
+own `mmap` and cubecl's CUDA backend does *nothing* to it -- GB10 reports
+`pageableMemoryAccessUsesHostPageTables = 1`, so a kernel dereferences the host
+address directly. The pile is 159 GiB of FILE-BACKED mapping on a 119 GiB box,
+and file-backed page-cache pages are clean, therefore reclaimable at any moment.
+When the kernel reclaims one, nothing tells the GPU. cubecl's own comment on
+`register_external_aliased` states the hazard exactly:
+
+    "a kernel reading unmapped pages does not reliably fault, it reads whatever
+     the address now holds"
+
+That is the whole bug. There is no host copy to be stale, no lifetime error in
+this tree, and no atomic anywhere in the lane -- the operand simply is not there.
+
+THE EVIDENCE THAT IT IS THAT, AND NOT REDUCTION ORDER
+
+ 1. WHERE it starts. The first divergence is always layer 2, and layers 0 and 1
+    never diverge in any condition tested. That is not a numerical boundary, it
+    is a STORAGE boundary: 0 and 1 are the dense layers, whose weights are
+    uploaded once and held device-resident. Layer 2 is the first layer whose
+    weights are read through the alias. Under pressure the device-resident
+    layers stay bitwise exact while the aliased ones do not, in the same pass.
+
+ 2. WHAT SHAPE the error is. Non-associative addition perturbs a little of
+    almost everything. These runs perturb a lot of very little, in the shape of
+    a weight:
+
+        19 of 73 rows, EXACTLY 5 columns in each
+        19 of 73 rows, EXACTLY 8 columns in each
+         6 of 73 rows, EXACTLY 1 column  in each
+
+    A fixed handful of output features, over exactly the set of tokens that
+    routed to one expert. Individual elements are off by up to 300% relative;
+    ULP gaps run to tens of thousands. Rounding does not do this.
+
+ 3. NaN. One run panicked at block.rs:219, `partial_cmp(&sa).unwrap()` in the
+    router's top-k. A comparator returning None means a NaN among the 256 routed
+    scores. Float non-associativity perturbs values; it cannot manufacture a NaN
+    out of finite weights and finite activations.
+
+ 4. The A/B itself. Under identical pressure, copying the same bytes to the
+    device gives the canonical answer BITWISE, twice out of two. And with no
+    pressure, aliased and copied agree bitwise -- so the copy arm is not a
+    different numerical lane, it is the same arithmetic on the same bytes. The
+    only thing it changes is whether the bytes are read through a HOST fault
+    (handled correctly) or by the GPU (not).
+
+ 5. The fingerprint in the timings. Every diverging run shows host enqueue 5-12x
+    slower than normal -- bind+enqueue 3.010 ms/load against 0.250, gather 1.217
+    against 0.179 -- while DEVICE time is unchanged (8.8 ms against 8.2). That is
+    direct reclaim, slowing every host allocation. The three runs that first
+    showed this bug, before anything was deliberately stressed, carry the same
+    fingerprint.
+
+WHAT WAS RULED OUT
+
+  Expert accumulation order.  `by_expert` is a BTreeMap, one launch per expert
+    on one in-order stream, and `select_assign` uses NO atomics -- one thread per
+    column looping serially over the axis, so even duplicate indices accumulate
+    in a fixed order.
+  Autotune selection.  Not because it was pinned -- see the correction below --
+    but because 25 idle-box runs, each of which autotunes from scratch in a
+    fresh process, are bitwise identical. There is no persistent autotune cache
+    on this box.
+  Split-k / atomics in the GEMMs.  fp4gemm and bf16gemm give one plane one
+    output tile, accumulate k sequentially in the MMA's own accumulator, and
+    write every element of their output exactly once.
+  Page-cache COLDNESS.  4 runs with the cache dropped immediately beforehand are
+    bitwise identical. Cold is not the trigger; RECLAIM is. (A first attempt to
+    stress this by streaming a large file did nothing, for the same reason:
+    single-touch streamed pages are reclaimed before the pile's are. The
+    stressor has to be anonymous memory.)
+  Burn fusion / deferred execution.  burn-cuda is built without the `fusion`
+    feature here, so `Bk` is a plain CubeBackend and the seam hands over a
+    handle on the same client and the same stream.
+
+A CORRECTION TO THE EARLIER AUTOTUNE PROBE
+
+`CUBECL_AUTOTUNE_LEVEL=0` does not disable autotune. In cubecl 0.10 it parses to
+`AutotuneLevel::Minimal`, which is the LEAST sampling effort -- candidate
+selection still happens, and with fewer samples it is if anything noisier. So
+results/autotune_probe.txt did not test what it says it tested. The conclusion
+it reached happens to be right, but for the reason in "what was ruled out"
+above, not because the knob was off.
+
+A SECOND DEFECT, FOUND WHILE LOOKING: NaN ROUTES SILENTLY
+
+`route_from_logits` has two paths and only one of them is loud.
+
+  * A NaN among the 256 ROUTED logits hits `partial_cmp().unwrap()` in the sort
+    and panics. Loud, and that is the crash above.
+
+  * A NaN among the n_shared (2) SHARED logits is never compared. It is appended
+    to `selected` and goes straight into the softmax, where `m` is built with
+    `fold(NEG_INFINITY, f32::max)` -- and `f32::max` RETURNS THE OTHER OPERAND
+    when one is NaN, so the NaN is silently skipped and `m` looks healthy. Then
+    `lse = m + sum((v - m).exp()).ln()` is NaN, and every weight `(v - lse).exp()`
+    is NaN: the routed experts' weights AND the shared gammas, for that token.
+    Those NaN weights multiply the expert outputs and are scatter-added into the
+    residual stream, so the token's whole row becomes NaN and propagates forward.
+
+    That is worse than the crash. Same cause, no signal.
+
+WHAT DETERMINISM COSTS
+
+Measured, 73 tokens, 20 layers, one pass:
+
+    aliased   bind + enqueue     403.0 ms
+    copied    bind + enqueue    4915.4 ms      (+4.5 s of host time per pass)
+
+and the copy arm needs device memory for what it copies: under a 50 GiB hog one
+of three runs died with CUDA_ERROR_OUT_OF_MEMORY. Copying is a correct
+diagnostic and a poor fix.
+
+Nothing here requires relaxing the architectural spec. The weights stay NVFP4,
+nothing widens, no matmul moves to the CPU, and the fix is not a slower
+reduction order -- it is making the pages the GPU reads actually be there.

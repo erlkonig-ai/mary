@@ -858,3 +858,11 @@ required-features = ["personaplex", "q4"]
 [[bin]]
 name = "spm_graph_roundtrip"
 required-features = ["personaplex"]
+
+# Reads `models::k3` but had no entry, so `--all-targets` under any feature set
+# without `k3` failed to compile its test harness -- which is the one build the
+# lib tests ride in on. Every other k3 binary declares this; this one was
+# missed.
+[[bin]]
+name = "resident_final"
+required-features = ["k3"]

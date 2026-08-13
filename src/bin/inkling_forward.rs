@@ -1213,7 +1213,18 @@ fn main() -> Result<()> {
     #[cfg(feature = "inkling-cuda")]
     let fp4_aliases = {
         let c = &fp4_client;
-        {
+        // `INK_ZEROCOPY=0` sends every weight through `create_from_slice`
+        // instead of aliasing the pile own mapped pages. It is a DIAGNOSTIC
+        // arm, not a lane: the GPU dereferences a 159 GiB FILE-BACKED mmap
+        // with nothing pinning it, and a page the kernel has reclaimed is
+        // read as whatever now lives at that address. A copy reads the same
+        // bytes through a HOST fault, which IS handled correctly -- so the
+        // two arms separate "the arithmetic is unordered" from "the operand
+        // was not there when the kernel read it".
+        if std::env::var("INK_ZEROCOPY").map(|v| v == "0").unwrap_or(false) {
+            println!("  zero-copy mappings : DISABLED (INK_ZEROCOPY=0) -- every bind copies");
+            Some(mary::models::inkling::fp4gemm::Aliases::disabled())
+        } else {
             let t = Instant::now();
             let maps = cp.mappings()?;
             let n = maps.len();
