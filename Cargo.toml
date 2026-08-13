@@ -303,6 +303,12 @@ required-features = ["inkling-cuda"]
 name = "inkling_attn_gate"
 required-features = ["inkling-cuda"]
 
+# bf16_linear at the shapes a decode step issues, timed with a sync -- the
+# access-pattern question, without a 50 s pile open in front of it.
+[[bin]]
+name = "inkling_bf16_gemm_bench"
+required-features = ["inkling-cuda"]
+
 # The attention layer with its five projections as the BF16 the pile stores,
 # against the transformers f32 reference at the real widths -- a DELTA inside a
 # stated budget, which is the check a non-bit-exact numerics change needs.
