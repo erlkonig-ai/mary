@@ -54,10 +54,16 @@
 //! # Where the weights come from
 //!
 //! `<ckpt>` is a safetensors checkpoint directory. `INK_PILE=<path>` swaps the
-//! WEIGHT source for a pile on branch `INK_PILE_BRANCH` (default `inkling`) —
-//! the directory is then read only for `config.json`, which is not a weight and
-//! does not live in the pile. One environment variable is the whole A/B, which
-//! is the point: everything below this line is the same code either way.
+//! source for a pile on branch `INK_PILE_BRANCH` (default `inkling`), and it
+//! swaps ALL of it: the weights and `config.json` both come from whichever
+//! source is named, so a pile-backed run reads nothing from the directory. It
+//! used to read the config there regardless, which meant `INK_PILE` moved 159
+//! GiB out of the checkpoint and left the run depending on the 40 KB still in
+//! it. One environment variable is the whole A/B, which is the point:
+//! everything below this line is the same code either way.
+//!
+//! The argument is still a path so a checkpoint-backed run has somewhere to
+//! read from; with `INK_PILE` set it is only a label, and `--` will do.
 //!
 //!   cargo run --release --features inkling-cuda,cuda-backend,import \
 //!       --bin inkling_forward -- <ckpt> <ids.bin> <out.bin>
@@ -564,9 +570,6 @@ fn main() -> Result<()> {
     let ids_path = std::env::args().nth(2).map(PathBuf::from).context("usage: <ckpt> <ids> <out>")?;
     let out_path = std::env::args().nth(3).map(PathBuf::from).context("usage: <ckpt> <ids> <out>")?;
 
-    let cfg_text = std::fs::read_to_string(ckpt.join("config.json"))?;
-    let cfg = InklingConfig::from_json(&cfg_text).context("parsing config.json")?;
-    let t = &cfg.text_config;
     // The one line that decides where the weights come from. `INK_PILE` swaps
     // the source; nothing downstream of here asks which it was.
     let pile_path = std::env::var("INK_PILE").ok();
@@ -577,6 +580,35 @@ fn main() -> Result<()> {
         None => Weights::open_ckpt(&ckpt)?,
     };
     let open_secs = t_open.elapsed().as_secs_f64();
+
+    // …and the config comes from the SAME source. It used to come from the
+    // checkpoint directory unconditionally, which meant `INK_PILE` moved 159 GiB
+    // out of the directory and left the run depending on the 40 KB still in it:
+    // a pile that cannot answer this is not authoritative, only large. In a pile
+    // the config is FACTS (one entity per JSON scalar, `mary::jsonfacts`), so
+    // this is a query, not a stored file being read back.
+    //
+    // `INK_CONFIG=<file>` overrides it, LOUDLY, for one case: a pile written
+    // before the sidecars were facts. That pile still holds every weight and is
+    // still worth running, and the alternative — falling back to the checkpoint
+    // directory when the pile has no config — is exactly the silent dependency
+    // this change removes. An override you have to type is a different thing
+    // from a fallback you never see.
+    let cfg_source = std::env::var("INK_CONFIG").ok();
+    let cfg_text = match &cfg_source {
+        Some(p) => std::fs::read_to_string(p)
+            .with_context(|| format!("INK_CONFIG={p}"))?,
+        None => cp
+            .document("config.json")
+            .context(
+                "the weight source carries no config.json. For a pile, ingest \
+                 the checkpoint's sidecars as facts (inkling_meta_gate <ckpt> \
+                 <pile>), or point INK_CONFIG at the file to run without them",
+            )?
+            .to_string(),
+    };
+    let cfg = InklingConfig::from_json(&cfg_text).context("parsing config.json")?;
+    let t = &cfg.text_config;
 
     // Which layers THIS process runs. REQUIRED, and a strict subrange.
     //
@@ -638,7 +670,17 @@ fn main() -> Result<()> {
 
     let h = t.hidden_size;
     println!("=== forward ===");
-    println!("  config     : {}", ckpt.display());
+    println!(
+        "  config     : {}",
+        match &cfg_source {
+            Some(p) => format!("INK_CONFIG={p}  (OVERRIDE -- the source was not asked)"),
+            None => format!(
+                "config.json from the {} ({})",
+                cp.kind(),
+                pile_path.as_deref().unwrap_or(&ckpt.display().to_string())
+            ),
+        }
+    );
     println!(
         "  weights    : {} {}  (index built in {open_secs:.1}s)",
         cp.kind(),
@@ -863,20 +905,33 @@ fn main() -> Result<()> {
         cubecl::cuda::CudaRuntime::client(&Default::default())
     };
     // Nine blocking device round trips for the whole run, instead of four per
-    // expert. Every later slab is an offset view of one of these. `INK_ZEROCOPY=0`
-    // used to force a copying lane for the A/B; the A/B is settled and a copy of
-    // a weight the device can read where it lies is a copy for nothing.
+    // expert. Every later slab is an offset view of one of these.
+    let zerocopy_on = std::env::var("INK_ZEROCOPY").map(|v| v != "0").unwrap_or(true);
+    //
+    // Always an `Aliases` when there is a client, even when nothing can be
+    // aliased: `Aliases::disabled()` copies exactly as the old `None` arm did
+    // but COUNTS it, so `INK_ZEROCOPY=0` produces a measurement rather than a
+    // silence. An A/B with an unmeasured side is not an A/B.
+    #[cfg(feature = "inkling-cuda")]
     let fp4_aliases = {
-        let t = Instant::now();
-        let maps = cp.mappings()?;
-        let nmaps = maps.len();
-        let a = mary::models::inkling::fp4gemm::Aliases::register(&fp4_client, maps);
-        println!(
-            "  zero-copy mappings : {} {nmaps} in {:.1} ms",
-            if a.is_some() { "registered" } else { "UNSUPPORTED, copying" },
-            t.elapsed().as_secs_f64() * 1e3
-        );
-        a
+        // INK_ZEROCOPY=0 forces the copying lane, so the seam can be A/B'd
+        // against it with the page cache in the same state.
+        let c = &fp4_client;
+        if zerocopy_on {
+            let t = Instant::now();
+            let maps = cp.mappings()?;
+            let n = maps.len();
+            let a = mary::models::inkling::fp4gemm::Aliases::register(c, maps);
+            println!(
+                "  zero-copy mappings : {} {n} in {:.1} ms",
+                if a.is_some() { "registered" } else { "UNSUPPORTED, copying" },
+                t.elapsed().as_secs_f64() * 1e3
+            );
+            Some(a.unwrap_or_else(mary::models::inkling::fp4gemm::Aliases::disabled))
+        } else {
+            println!("  zero-copy mappings : OFF (INK_ZEROCOPY=0) -- every bind copies");
+            Some(mary::models::inkling::fp4gemm::Aliases::disabled())
+        }
     };
 
     // The unembed table is 3.3 GB at f32 and does not change between generated
@@ -952,6 +1007,13 @@ fn main() -> Result<()> {
     let pass = Instant::now();
     let io0 = io_read_bytes();
     cp.io_reset();
+    // Same scope as the loader counters, for the same reason: the report below
+    // says "this ONE pass", and a bind total that accumulated across passes
+    // would silently make it say something else.
+    #[cfg(feature = "inkling-cuda")]
+    if let Some(al) = fp4_aliases.as_ref() {
+        al.stats_reset();
+    }
     // With a cache, every pass past the prefill feeds exactly the token the
     // previous pass produced; without one, the whole prefix goes through again.
     // `pos0` is that token's ABSOLUTE position, which is what log scaling and
@@ -1679,6 +1741,30 @@ fn main() -> Result<()> {
         dattn_bytes as f64 / GIB,
         dattn.len()
     );
+    // What the zero-copy seam actually achieved on THIS run, at the seam every
+    // expert weight passes through. Printed unconditionally: a seam whose hit
+    // rate is only visible behind a flag is a seam nobody checks.
+    #[cfg(feature = "inkling-cuda")]
+    if let Some(al) = fp4_aliases.as_ref() {
+        print!("{}", al.stats().report());
+    }
+    #[cfg(feature = "inkling-cuda")]
+    {
+        println!(
+            "    device-resident     {:8.2} GiB in {} shared + {} dense layers",
+            ddense.bytes as f64 / GIB,
+            ddense.shared.len(),
+            ddense.dense.len()
+        );
+    }
+    #[cfg(feature = "inkling-cuda")]
+    if !dattn.is_empty() {
+        println!(
+            "    device-resident     {:8.2} GiB in {} attention layers",
+            dattn_bytes as f64 / GIB,
+            dattn.len()
+        );
+    }
     if std::env::var("INK_IOSTATS").is_ok() {
         print!("{}", cp.io_table(28));
     }

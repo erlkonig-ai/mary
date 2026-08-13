@@ -354,6 +354,144 @@ impl Weights {
         }
     }
 
+    // ---- what the source SAYS about itself --------------------------------
+
+    /// One of the checkpoint's JSON sidecars, by file name.
+    ///
+    /// The whole reason this is on `Weights` and not on the caller: `config.json`
+    /// is not a weight, and for as long as reading it meant reading the
+    /// checkpoint DIRECTORY, `INK_PILE` moved the 159 GiB and left the run
+    /// depending on the 40 KB. A pile that cannot answer this is not
+    /// authoritative, it is merely large.
+    ///
+    /// The pile arm answers from FACTS — one entity per JSON scalar, see
+    /// [`crate::jsonfacts`] — not from a stored copy of the file, so
+    /// `text_config.hidden_size` is reachable as a query and the document
+    /// reconstructed here is the same thing read a different way.
+    pub fn document(&self, name: &str) -> Result<serde_json::Value> {
+        match &self.src {
+            Src::Ckpt(c) => {
+                let path = c.dir().join(name);
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|e| anyhow::anyhow!("read {path:?}: {e}"))?;
+                serde_json::from_str(&text)
+                    .map_err(|e| anyhow::anyhow!("parse {path:?}: {e}"))
+            }
+            Src::Pile(p) => crate::jsonfacts::load_document(p.facts(), p.reader(), name)
+                .map_err(|e| anyhow::anyhow!("{e}")),
+        }
+    }
+
+    /// A sidecar that is TEXT rather than JSON — the chat template.
+    ///
+    /// In a pile it is a document whose root is a JSON string, so it goes
+    /// through exactly the same storage and the same query as the others; there
+    /// is no second mechanism for "files that are not JSON".
+    pub fn text_document(&self, name: &str) -> Result<String> {
+        match &self.src {
+            Src::Ckpt(c) => {
+                let path = c.dir().join(name);
+                std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("read {path:?}: {e}"))
+            }
+            Src::Pile(_) => match self.document(name)? {
+                serde_json::Value::String(s) => Ok(s),
+                other => anyhow::bail!(
+                    "{name} is stored as {} rather than a string",
+                    match other {
+                        serde_json::Value::Object(_) => "an object",
+                        serde_json::Value::Array(_) => "an array",
+                        _ => "a scalar",
+                    }
+                ),
+            },
+        }
+    }
+
+    /// Every document this source can answer for. Empty for a checkpoint, whose
+    /// directory is not enumerated — the point of the list is to say what a
+    /// PILE carries.
+    pub fn documents(&self) -> Vec<String> {
+        match &self.src {
+            Src::Ckpt(_) => Vec::new(),
+            Src::Pile(p) => crate::jsonfacts::documents(p.facts(), p.reader())
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect(),
+        }
+    }
+
+    /// Visit EVERY byte range this source can hand to a device, in place.
+    ///
+    /// `f` receives `(tensor name, which plane, the borrowed bytes)`. The plane
+    /// tag is `"codes"` / `"scales"` for a packed expert, `"expert-bf16"` for one
+    /// of layer 2's, and `"dense"` for everything else — because the alignment
+    /// question is answered per PLANE, not per tensor: a leaf whose payload
+    /// starts aligned still hands the GPU a scale plane at `payload + codes_len`,
+    /// and that offset is a different fact.
+    ///
+    /// A callback rather than a `Vec`, because the ranges borrow a 159 GiB
+    /// mapping and collecting them would either copy the model or fight the
+    /// borrow checker for nothing.
+    ///
+    /// Driven by what the SOURCE contains — `expert_keys` for a pile, the
+    /// safetensors index for a checkpoint — never by what some layer range
+    /// implies. An audit that enumerates the expected set cannot see a leaf that
+    /// is there but unreachable, and cannot see one that is reachable but
+    /// unexpected.
+    pub fn for_each_bindable(
+        &self,
+        mut f: impl FnMut(&str, &'static str, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        match &self.src {
+            Src::Pile(p) => {
+                for name in p.names() {
+                    let leaf = p.leaf(&name)?;
+                    f(&name, "dense", &leaf.bytes)?;
+                }
+                for (name, e) in p.expert_keys() {
+                    if p.expert_is_nvfp4(&name, e) == Some(true) {
+                        let q = p.expert_packed(&name, e as usize)?;
+                        f(&name, "codes", &q.codes)?;
+                        f(&name, "scales", &q.scales)?;
+                    } else {
+                        let l = p.expert_bf16(&name, e as usize)?;
+                        f(&name, "expert-bf16", &l.bytes)?;
+                    }
+                }
+            }
+            Src::Ckpt(c) => {
+                let names = c.names();
+                for name in names.iter().filter(|n| !n.contains(".experts.")) {
+                    let span = c.span(name)?;
+                    f(name, "dense", span.bytes())?;
+                }
+                let mut bases: Vec<&String> = names
+                    .iter()
+                    .filter(|n| n.ends_with(".experts.w13_weight") || n.ends_with(".experts.w2_weight"))
+                    .collect();
+                bases.sort();
+                for base in bases {
+                    let count = c.expert_count(base)?;
+                    for e in 0..count {
+                        if c.is_nvfp4(base) {
+                            let q = c.expert_packed_ref(base, e)?;
+                            f(base, "codes", q.codes())?;
+                            f(base, "scales", q.scales())?;
+                        } else {
+                            // BF16 stacks have no borrowing accessor — the
+                            // checkpoint arm copies them out. Reported as such
+                            // rather than skipped: a plane the audit cannot see
+                            // is not a plane that is fine.
+                            let raw = c.expert_slice_bf16(base, e)?;
+                            f(base, "expert-bf16-copied", &raw.bytes)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     // ---- accounting ------------------------------------------------------
 
     fn note(&self, name: &str, file_bytes: u64, host_bytes: u64, t0: Instant) {

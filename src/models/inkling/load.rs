@@ -230,6 +230,12 @@ impl Checkpoint {
     /// A miss inserts EVERY tensor of that shard, because the parse that
     /// answers one name has already answered all of them; paying it per name
     /// would keep the cost this cache exists to remove.
+    /// The directory this checkpoint was opened from — where its JSON sidecars
+    /// live, for a source that still has some.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     pub fn span(&self, name: &str) -> Result<Span> {
         if let Some(s) = self.spans.lock().expect("span cache").get(name) {
             return Ok(s.clone());

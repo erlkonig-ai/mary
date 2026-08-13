@@ -380,6 +380,16 @@ pub struct Bf16Slab {
 /// the location.
 pub struct PileSource {
     reader: triblespace::core::repo::pile::PileReader,
+    /// Everything the branch asserts, kept rather than dropped after the index
+    /// is built.
+    ///
+    /// It costs a few MB against a 159 GiB model and it is what makes the pile
+    /// AUTHORITATIVE rather than merely sufficient for weights: the checkpoint's
+    /// `config.json` and its siblings live here as facts (see
+    /// [`crate::jsonfacts`]), and a runtime that had to reopen the pile to read
+    /// them would pay the 18-second index build twice to answer a question the
+    /// first open already had in hand.
+    facts: triblespace::prelude::TribleSet,
     /// Dense tensors, read as their type at index time. `Leaf` is a view, so
     /// holding all 968 of them costs kilobytes.
     dense: std::collections::HashMap<String, Leaf>,
@@ -535,7 +545,7 @@ impl PileSource {
         sweep_dense!(F32, 4, Elem::F32);
 
         anyhow::ensure!(!dense.is_empty(), "{path:?}: no dense leaves on {branch:?}");
-        Ok(PileSource { reader, dense, experts, stacked })
+        Ok(PileSource { reader, facts, dense, experts, stacked })
     }
 
     /// One dense tensor by checkpoint name, as a view.
@@ -689,6 +699,35 @@ impl PileSource {
         )])
     }
 
+    /// Everything the branch asserts.
+    pub fn facts(&self) -> &triblespace::prelude::TribleSet {
+        &self.facts
+    }
+
+    /// The blob reader, so a caller can resolve handles the facts name.
+    pub fn reader(&self) -> &triblespace::core::repo::pile::PileReader {
+        &self.reader
+    }
+
+    /// Every `(stacked matrix name, expert index)` this pile holds, sorted.
+    ///
+    /// The index is already built at open, so this is a rename of what is in
+    /// memory rather than a query. It exists because an AUDIT has to be driven
+    /// by what the pile actually contains — asking it for the experts a layer
+    /// range implies would make a leaf nobody indexed invisible to the audit by
+    /// construction.
+    pub fn expert_keys(&self) -> Vec<(String, i64)> {
+        let mut v: Vec<(String, i64)> = self.experts.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// Whether one expert leaf is packed NVFP4 (rather than BF16).
+    pub fn expert_is_nvfp4(&self, base: &str, e: i64) -> Option<bool> {
+        self.experts
+            .get(&(base.to_string(), e))
+            .map(|r| matches!(r.handle, ExpertHandle::Nvfp4(_)))
+    }
 }
 
 #[cfg(test)]
