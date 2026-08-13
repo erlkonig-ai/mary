@@ -57,6 +57,23 @@ pub fn handle_of<const D: usize>(t: Tensor<Bk, D>) -> Handle {
     }
 }
 
+/// The same, for an `Int` tensor.
+///
+/// A separate function rather than a generic one because Burn spells the two
+/// differently: a float tensor's primitive is the `TensorPrimitive` enum (it
+/// may be quantized), an integer tensor's is the `CubeTensor` outright. The
+/// dtype assertion is the one that matters — the routed lane's row indices are
+/// `i32` and a kernel reading them as `i64` would index somewhere else
+/// entirely.
+pub fn int_handle_of<const D: usize>(t: Tensor<Bk, D, burn::tensor::Int>) -> Handle {
+    let mut c: CubeTensor<CudaRuntime> = t.into_primitive();
+    if !c.is_contiguous() {
+        c = burn_cubecl::kernel::into_contiguous(c);
+    }
+    assert_eq!(c.dtype, DType::I32, "the inkling seam indexes with i32");
+    c.handle
+}
+
 /// The inverse: a `[rows, cols]` f32 device buffer, as a Burn tensor.
 ///
 /// `client` and `device` are asked for rather than derived, because a `Handle`

@@ -486,7 +486,10 @@ fn shared_experts_bf16(
 /// instruction's own output and not a widening.
 ///
 /// The padding rows are zeros and are sliced off, so a decode step's one row
-/// costs a 16-row tile of arithmetic against a weight read that dwarfs it.
+/// costs a 16-row tile of arithmetic against a weight read that dwarfs it. The
+/// zeros are written by the BF16 cast, which was visiting every element anyway;
+/// building them here as a `Tensor::cat` cost an allocation and two scatters on
+/// each of the 127 calls a decode step makes.
 fn lin_bf16(
     client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
     dev: &burn::backend::cuda::CudaDevice,
@@ -498,12 +501,7 @@ fn lin_bf16(
     let [m, k] = x.dims();
     assert_eq!(k, w.k, "lin_bf16: x is [_, {k}] but the weight is [_, {}]", w.k);
     let m_pad = m.div_ceil(MTILE) * MTILE;
-    let xp = if m_pad > m {
-        burn::tensor::Tensor::cat(vec![x, burn::tensor::Tensor::zeros([m_pad - m, k], dev)], 0)
-    } else {
-        x
-    };
-    let out = linear_bf16(client, &handle_of(xp), w, m_pad);
+    let out = linear_bf16(client, &handle_of(x), w, m, m_pad);
     tensor_of(client.clone(), dev.clone(), out, m_pad, w.n).slice([0..m, 0..w.n])
 }
 
@@ -584,7 +582,8 @@ fn routed_experts_fp4(
 ) -> Result<T2> {
     use mary::models::inkling::fp4gemm::{fp4_linear_launch, gate_up_silu_launch, MTILE};
     use mary::models::inkling::fp4quant::quantize_nvfp4;
-    use mary::models::inkling::seam::{handle_of, tensor_of};
+    use mary::models::inkling::pad::gather_rows_pad;
+    use mary::models::inkling::seam::{handle_of, int_handle_of, tensor_of};
 
     // Zero copy where the hardware allows it: the GPU reads the source's own
     // mapped pages in place. The mappings were registered ONCE at startup, so
@@ -597,6 +596,10 @@ fn routed_experts_fp4(
     let n13 = format!("{prefix}mlp.experts.w13_weight");
     let n2 = format!("{prefix}mlp.experts.w2_weight");
     let mut acc: T2 = burn::tensor::Tensor::zeros([n, h], dev);
+    // The residual stream's buffer, taken once: every expert gathers out of the
+    // same rows and re-deriving the handle per expert would be six clones of a
+    // refcount for nothing.
+    let hn_h = handle_of(hn.clone());
 
     for (&e, toks) in by_expert {
         let t_s = Instant::now();
@@ -608,16 +611,11 @@ fn routed_experts_fp4(
         let m = toks.len();
         let m_pad = m.div_ceil(MTILE) * MTILE;
         let (idx, wgt) = expert_rows::<Bk>(toks, dev);
-        // `select` reads the rows out of the residual stream where it already
-        // lies; the padding rows are zeros and stay zeros, so the padded output
-        // rows are exactly zero and the slice below drops them.
-        let xe = hn.clone().select(0, idx.clone());
-        let xp = if m_pad > m {
-            burn::tensor::Tensor::cat(vec![xe, burn::tensor::Tensor::zeros([m_pad - m, h], dev)], 0)
-        } else {
-            xe
-        };
-        let x_h = handle_of(xp);
+        // One kernel reads this expert's rows out of the residual stream where
+        // they already lie and writes them into the `[m_pad, hidden]` buffer the
+        // MMA wants, zeros and all. It was a `select`, a `zeros` and a `cat` —
+        // four launches to move one row on a decode step.
+        let x_h = gather_rows_pad(client, &hn_h, &int_handle_of(idx.clone()), n, m, m_pad, h);
         host.gather += t_g.elapsed().as_secs_f64();
 
         let t_w = Instant::now();
@@ -672,7 +670,8 @@ fn routed_experts_bf16(
 ) -> Result<T2> {
     use mary::models::inkling::bf16gemm::{bf16_linear_launch, to_bf16_launch, MTILE};
     use mary::models::inkling::fp4gemm::gate_up_silu_bf16_launch;
-    use mary::models::inkling::seam::{handle_of, tensor_of};
+    use mary::models::inkling::pad::gather_rows_pad;
+    use mary::models::inkling::seam::{handle_of, int_handle_of, tensor_of};
 
     let bind = |data: &[u8]| match aliases {
         Some(al) => al.slice_or_copy(client, data),
@@ -682,6 +681,7 @@ fn routed_experts_bf16(
     let n13 = format!("{prefix}mlp.experts.w13_weight");
     let n2 = format!("{prefix}mlp.experts.w2_weight");
     let mut acc: T2 = burn::tensor::Tensor::zeros([n, h], dev);
+    let hn_h = handle_of(hn.clone());
 
     for (&e, toks) in by_expert {
         let t_s = Instant::now();
@@ -693,17 +693,11 @@ fn routed_experts_bf16(
         let m = toks.len();
         let m_pad = m.div_ceil(MTILE) * MTILE;
         let (idx, wgt) = expert_rows::<Bk>(toks, dev);
-        let xe = hn.clone().select(0, idx.clone());
-        let xp = if m_pad > m {
-            burn::tensor::Tensor::cat(vec![xe, burn::tensor::Tensor::zeros([m_pad - m, h], dev)], 0)
-        } else {
-            xe
-        };
-        let x_h = handle_of(xp);
+        let x_h = gather_rows_pad(client, &hn_h, &int_handle_of(idx.clone()), n, m, m_pad, h);
         host.gather += t_g.elapsed().as_secs_f64();
 
         let t_w = Instant::now();
-        let a = to_bf16_launch(client, &x_h, m_pad * h);
+        let a = to_bf16_launch(client, &x_h, m_pad * h, m_pad * h);
         let b = bind(&w13.bytes);
         let both = bf16_linear_launch(client, &a, &b, m_pad, h, 2 * inter);
 

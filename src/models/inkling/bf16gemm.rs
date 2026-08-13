@@ -143,11 +143,22 @@ pub fn bf16_linear<AB: Scalar, NA: Size, NC: Size>(
 /// `cvt.rn.bf16.f32`, which is round-to-nearest-even — the same rounding
 /// `torch.Tensor.to(torch.bfloat16)` performs, so the oracle and the lane agree
 /// on the operand BITS and every remaining difference is the accumulation's.
+/// `n_in` is how much of `y` `x` actually covers; the rest is the MMA's M
+/// padding and is written as zero. The lane this replaces built the padded f32
+/// buffer first — `Tensor::cat(x, Tensor::zeros(…))`, an allocation and two
+/// scatters — and then cast the whole thing. A decode step feeds one token
+/// against a sixteen-row tile, so that was fifteen rows of zeros materialised
+/// in f32, cast to BF16, and multiplied, 127 times a token. The cast was
+/// already visiting every element; it may as well decide which ones exist.
 #[cube(launch)]
-pub fn to_bf16(x: &Tensor<f32>, y: &mut Tensor<bf16>) {
+pub fn to_bf16(x: &Tensor<f32>, y: &mut Tensor<bf16>, n_in: usize) {
     let idx = ABSOLUTE_POS as usize;
     if idx < y.len() {
-        y[idx] = bf16::cast_from(x[idx]);
+        let mut v = f32::new(0.0f32);
+        if idx < n_in {
+            v = x[idx];
+        }
+        y[idx] = bf16::cast_from(v);
     }
 }
 
@@ -187,18 +198,28 @@ pub fn bf16_linear_launch<R: Runtime>(
     out
 }
 
-/// Launch [`to_bf16`] over `n` f32 elements, returning the BF16 buffer.
-pub fn to_bf16_launch<R: Runtime>(client: &ComputeClient<R>, x: &Handle, n: usize) -> Handle {
-    let out = client.empty(n * core::mem::size_of::<bf16>());
+/// Launch [`to_bf16`] over `n_in` f32 elements into an `n_out`-element BF16
+/// buffer, zeroing the tail.
+///
+/// `n_out == n_in` is the unpadded case and costs the same branch.
+pub fn to_bf16_launch<R: Runtime>(
+    client: &ComputeClient<R>,
+    x: &Handle,
+    n_in: usize,
+    n_out: usize,
+) -> Handle {
+    assert!(n_in <= n_out, "{n_in} f32 do not fit in {n_out} BF16");
+    let out = client.empty(n_out * core::mem::size_of::<bf16>());
     let threads = 256u32;
-    let blocks = n.div_ceil(threads as usize) as u32;
+    let blocks = n_out.div_ceil(threads as usize) as u32;
     unsafe {
         to_bf16::launch::<R>(
             client,
             CubeCount::Static(blocks, 1, 1),
             CubeDim::new_1d(threads),
-            TensorArg::from_raw_parts(x.clone(), [1].into(), [n].into()),
-            TensorArg::from_raw_parts(out.clone(), [1].into(), [n].into()),
+            TensorArg::from_raw_parts(x.clone(), [1].into(), [n_in].into()),
+            TensorArg::from_raw_parts(out.clone(), [1].into(), [n_out].into()),
+            n_in,
         )
     };
     out
@@ -217,10 +238,8 @@ pub fn upload_bf16_act<R: Runtime>(
 ) -> (Handle, usize) {
     use cubecl::prelude::CubeElement;
     let m_pad = rows.div_ceil(MTILE) * MTILE;
-    let mut padded = vec![0f32; m_pad * k];
-    padded[..rows * k].copy_from_slice(&x[..rows * k]);
-    let h = client.create_from_slice(f32::as_bytes(&padded));
-    (to_bf16_launch(client, &h, m_pad * k), m_pad)
+    let h = client.create_from_slice(f32::as_bytes(&x[..rows * k]));
+    (to_bf16_launch(client, &h, rows * k, m_pad * k), m_pad)
 }
 
 /// A dense `[out, in]` weight on the device, as the BF16 the pile stores.
@@ -255,17 +274,19 @@ impl Bf16W {
 
 /// `x @ Wᵀ` with `x` f32 on the device and `W` the BF16 it is stored as.
 ///
-/// `x_h` is `[m_pad, k]` f32 and `m_pad` is already a multiple of [`MTILE`];
-/// the return is `[m_pad, n]` f32, the accumulator's own type. The activation
-/// is cast to BF16 on the device by [`to_bf16`], whose rounding is the
-/// hardware's round-to-nearest-even and therefore the same one
-/// `torch.Tensor.to(torch.bfloat16)` performs.
+/// `x_h` is `[m, k]` f32, `m_pad` is `m` rounded up to [`MTILE`], and the
+/// return is `[m_pad, n]` f32 — the accumulator's own type. The activation is
+/// cast to BF16 on the device by [`to_bf16`], whose rounding is the hardware's
+/// round-to-nearest-even and therefore the same one
+/// `torch.Tensor.to(torch.bfloat16)` performs, and which now writes the M
+/// padding as it goes rather than being handed a buffer somebody else padded.
 pub fn linear_bf16<R: Runtime>(
     client: &ComputeClient<R>,
     x_h: &Handle,
     w: &Bf16W,
+    m: usize,
     m_pad: usize,
 ) -> Handle {
-    let a = to_bf16_launch(client, x_h, m_pad * w.k);
+    let a = to_bf16_launch(client, x_h, m * w.k, m_pad * w.k);
     bf16_linear_launch(client, &a, &w.h, m_pad, w.k, w.n)
 }

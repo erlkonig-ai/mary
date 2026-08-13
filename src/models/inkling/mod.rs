@@ -41,6 +41,9 @@ pub mod seam;
 // ops. Four run per layer and they were a third of every launch in a decode
 // step; the arithmetic is 16384 multiply-adds.
 pub mod sconv;
+// The MMA's M padding, written by the kernel that was already producing the
+// buffer instead of by a `zeros` and a `cat` beside it.
+pub mod pad;
 // One interface over the two places a running model's weights can come from —
 // a safetensors checkpoint or a pile — plus the residency cache and the byte
 // counters, which belong to the asking rather than to either storage.
