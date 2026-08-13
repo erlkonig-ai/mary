@@ -843,6 +843,19 @@ fn main() -> Result<()> {
     // cached lane has (`INK_MTP_CHECK` compares the two in one process), so
     // deleting it would delete the check that the cache is right.
     let kv = std::env::var("INK_KV").map(|v| v == "1" || v == "on").unwrap_or(false);
+    // `INK_REPEAT=1` keeps the token loop from GROWING the sequence: every step
+    // re-runs the identical pass over the identical prompt. It exists because
+    // the only pass of a given width a process can otherwise produce is its
+    // FIRST one, which is also the one that pays for uploading every resident
+    // weight -- 34 s against 1.4 s for the next. Comparing the cost of a 1-row
+    // pass with a 2-row one therefore compared two different warm-up states,
+    // not two widths. With this set the second and later steps are warm and
+    // identical, so the widths can be compared by running the binary twice with
+    // two prompts. Measurement only: the generated token is still printed and
+    // still thrown away, so the run produces no continuation.
+    let repeat = std::env::var("INK_REPEAT").map(|v| v == "1" || v == "on").unwrap_or(false);
+    anyhow::ensure!(!repeat || !kv, "INK_REPEAT wants the uncached lane: with a KV cache a \
+         repeated pass would append the same position to the cache again");
     // Head d's first STABLE row sits at position seq-1-d, so a prompt shorter
     // than the number of heads leaves a depth with no stable row at all: every
     // position of that head would be a function of drafts and the cache would
@@ -1246,6 +1259,31 @@ fn main() -> Result<()> {
                 for (slot, &e) in r.experts.iter().enumerate() {
                     by_expert.entry(e).or_default().push((ti, r.weights[slot]));
                 }
+            }
+
+            // `INK_ROUTE_LOG=<path>` appends this layer's routing, one line per
+            // position, plus the layer's DISTINCT-expert count. The count is
+            // written so the file can be checked against `expert slabs
+            // decoded` instead of trusted: the sum of the `distinct=` lines of
+            // a pass must equal that counter, and a log that disagrees with the
+            // number the run acted on is describing a different run.
+            //
+            // Written from `routing`, the same vector the block then feeds to
+            // the experts -- not recomputed -- so the log cannot drift from
+            // what was decoded. Positions are ABSOLUTE (`pos0 + ti`), because a
+            // cached step's `ti` is always 0 and the sequence position is the
+            // whole point of an adjacency measurement.
+            if let Ok(rl) = std::env::var("INK_ROUTE_LOG") {
+                use std::io::Write as _;
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&rl)
+                    .with_context(|| format!("INK_ROUTE_LOG={rl}"))?;
+                for (ti, r) in routing.iter().enumerate() {
+                    writeln!(f, "R {step} {layer} {} {:?}", pos0 + ti, r.experts)?;
+                }
+                writeln!(f, "D {step} {layer} {}", by_expert.len())?;
             }
 
             let t_d = Instant::now();
@@ -1670,7 +1708,7 @@ fn main() -> Result<()> {
     // A tail follows the sequence by RECOMPUTING it, not by being told: it owns
     // the argmax, so pushing it here keeps its `ids` identical to the head's
     // without a second thing on the wire to get out of step.
-    if is_tail && gen_steps > 0 {
+    if is_tail && gen_steps > 0 && !repeat {
         ids.push(best);
     }
 
@@ -1678,20 +1716,20 @@ fn main() -> Result<()> {
     println!("  expert slabs decoded: {expert_loads}");
     // t_other covers the whole MLP half, so the expert buckets are inside it.
     println!("  where the time went, seconds:");
-    println!("    attention half      {t_attn:8.1}   (device)");
+    println!("    attention half      {t_attn:8.3}   (device)");
     {
-        println!("      read + widen      {t_attn_read:8.1}   (host: slice the mapping, BF16 -> f32)");
-        println!("      upload            {t_attn_up:8.1}   (host -> device, synced)");
-        println!("      device            {:8.1}   (projections, scores, sconv)",
+        println!("      read + widen      {t_attn_read:8.3}   (host: slice the mapping, BF16 -> f32)");
+        println!("      upload            {t_attn_up:8.3}   (host -> device, synced)");
+        println!("      device            {:8.3}   (projections, scores, sconv)",
                  t_attn - t_attn_read - t_attn_up);
     }
-    println!("    mlp half            {t_other:8.1}   of which:");
-    println!("      routed experts    {t_expert:8.1}   (slice + bind + native mma, device)");
-    println!("      shared experts    {t_shared:8.1}   (device)");
-    println!("      rest of the half  {:8.1}   (routing, dense layers, sconv, norms)",
+    println!("    mlp half            {t_other:8.3}   of which:");
+    println!("      routed experts    {t_expert:8.3}   (slice + bind + native mma, device)");
+    println!("      shared experts    {t_shared:8.3}   (device)");
+    println!("      rest of the half  {:8.3}   (routing, dense layers, sconv, norms)",
              t_other - t_expert - t_shared);
     println!(
-        "    {:19} {t_head:8.1}   ({})",
+        "    {:19} {t_head:8.3}   ({})",
         if best_wire.is_some() { "tail + wire" } else { "head / unembed" },
         if best_wire.is_some() {
             "BLOCKING: the other machine's layers, its head, and the round trip"
@@ -1699,19 +1737,19 @@ fn main() -> Result<()> {
             "device"
         }
     );
-    println!("    of the above, host-only tensor reads (mmap + BF16 widening): {:8.1}", t_read.get());
+    println!("    of the above, host-only tensor reads (mmap + BF16 widening): {:8.3}", t_read.get());
     {
         println!("    of the routed-expert total, the host-synchronous parts:");
-        println!("      slice from mmap   {:8.1}   ({:.3} ms x {expert_loads} loads)",
+        println!("      slice from mmap   {:8.3}   ({:.3} ms x {expert_loads} loads)",
                  host_t.0, host_t.0 * 1e3 / expert_loads.max(1) as f64);
         // NOT \"upload\": this bucket is everything after the slice -- binding
         // the weight (an offset when it aliases, a copy when it does not),
         // quantising the activation, four kernel enqueues, and the layer\u0027s one
         // blocking read. Calling it an upload sent a profiling session looking
         // for a transfer that was 4% of it.
-        println!("      bind+enqueue+sync {:8.1}   ({:.3} ms x {expert_loads} loads)",
+        println!("      bind+enqueue+sync {:8.3}   ({:.3} ms x {expert_loads} loads)",
                  host_t.1, host_t.1 * 1e3 / expert_loads.max(1) as f64);
-        println!("      remainder         {:8.1}   (whatever the two buckets above did not cover)",
+        println!("      remainder         {:8.3}   (whatever the two buckets above did not cover)",
                  t_expert - host_t.0 - host_t.1);
     }
     let (calls, hits, fileb, hostb, loader_ns) = cp.io_totals();
@@ -1794,10 +1832,10 @@ fn main() -> Result<()> {
     }
 
     if gen_steps > 0 {
-        println!("  step {step}: +{best}   [pass {:.1}s, total {:.1}s, ctx {}]",
+        println!("  step {step}: +{best}   [pass {:.3}s, total {:.1}s, ctx {}]",
                  pass.elapsed().as_secs_f32(), started.elapsed().as_secs_f32(), ids.len());
         // The tail already pushed, when it answered its peer.
-        if !is_tail {
+        if !is_tail && !repeat {
             ids.push(best);
         }
     }
