@@ -219,9 +219,22 @@ struct HostT {
 }
 
 /// One layer's shared experts, on the device, as the BF16 the pile stores.
+///
+/// `gate_up` is ONE weight, `[2 * n_shared * inter, hidden]`, holding every
+/// shared expert's gate block followed by every up block. It used to be four
+/// `Bf16W` — a gate and an up per expert — and four separate GEMMs against the
+/// same activation, which is four launches and, more to the point, four grids
+/// of 256 cubes.
+///
+/// The `m16n8k16` kernel gives one warp each `(m_tile, n_tile)`, so with M
+/// padded to one tile the grid IS `n / 8` and nothing else. 256 cubes of one
+/// warp cannot cover DRAM latency on this part: measured, those calls ran at
+/// 79 GB/s while the unembed — same kernel, same instruction, 25128 cubes —
+/// ran at 175. Concatenating along `n` is the one axis that adds cubes without
+/// touching the arithmetic: each warp still computes the same output tile by
+/// the same k-loop, so this is a scheduling change and not a numerical one.
 struct SharedOnDevice {
-    gate: Vec<Bf16W>,
-    up: Vec<Bf16W>,
+    gate_up: Bf16W,
     down: Vec<Bf16W>,
 }
 
@@ -378,18 +391,25 @@ impl DeviceDense {
             );
             let d = cp.stored(&format!("{p}mlp.shared_experts.shared_w2_weight"))?;
             anyhow::ensure!(d.elem == Elem::Bf16, "shared_w2 is {:?}", d.elem);
-            let (per_gu, per_d) = (inter * h * 2, h * inter * 2);
-            let mut sd = SharedOnDevice { gate: Vec::new(), up: Vec::new(), down: Vec::new() };
+            let per_d = h * inter * 2;
+            // Gate blocks then up blocks, one buffer. `split_shared_w13_bytes`
+            // already returns each side with every expert contiguous, so this
+            // is a concatenation and not a second de-interleave; the row order
+            // is what `shared_experts_bf16` slices the result by.
+            let mut gu = g;
+            gu.extend_from_slice(&u);
+            let mut sd = SharedOnDevice {
+                gate_up: bind_bf16(client, aliases, &gu, 2 * n_shared * inter, h),
+                down: Vec::new(),
+            };
             for e in 0..n_shared {
-                sd.gate.push(bind_bf16(client, aliases, &g[e * per_gu..(e + 1) * per_gu], inter, h));
-                sd.up.push(bind_bf16(client, aliases, &u[e * per_gu..(e + 1) * per_gu], inter, h));
                 // `w2` is NOT de-interleaved, so this one is a view of the pile
                 // and aliases outright.
                 sd.down.push(bind_bf16(
                     client, aliases, &d.bytes[e * per_d..(e + 1) * per_d], h, inter,
                 ));
             }
-            self.bytes += (n_shared * (2 * per_gu + per_d)) as u64;
+            self.bytes += (gu.len() + n_shared * per_d) as u64;
             self.shared.insert(p.to_string(), sd);
         }
         Ok(&self.shared[p])
@@ -462,10 +482,15 @@ fn shared_experts_bf16(
 ) -> T2 {
     let [n, _] = x.dims();
     assert_eq!(gammas.len(), n * n_shared, "{} gammas for {n} tokens", gammas.len());
+    // ONE projection for every gate and every up in the layer. See
+    // [`SharedOnDevice`] for why: four GEMMs against the same activation are
+    // four grids of 256 cubes, and this is one of 1024.
+    let inter = sw.gate_up.n / (2 * n_shared);
+    let gu = lin_bf16(client, dev, x, &sw.gate_up);
     let mut out: Option<T2> = None;
     for s in 0..n_shared {
-        let g = lin_bf16(client, dev, x.clone(), &sw.gate[s]);
-        let u = lin_bf16(client, dev, x.clone(), &sw.up[s]);
+        let g = gu.clone().slice([0..n, s * inter..(s + 1) * inter]);
+        let u = gu.clone().slice([0..n, (n_shared + s) * inter..(n_shared + s + 1) * inter]);
         let col: Vec<f32> = (0..n).map(|tk| gammas[tk * n_shared + s]).collect();
         let gam = BT::<Bk, 2>::from_data(BTD::new(col, [n, 1]), dev);
         let c = lin_bf16(client, dev, dev_lane::silu(g) * u * gam, &sw.down[s]);
