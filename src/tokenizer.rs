@@ -764,7 +764,7 @@ pub fn load_pre_tokenizer_pattern(
 /// carries both; weight entities have `model_name` but no kind tag, config
 /// nodes have kind tags but no name. A multi-tokenizer pile would need
 /// disambiguation BY the name; every current model pile holds one tokenizer.
-pub fn find_tokenizer(tribles: &TribleSet) -> Option<Id> {
+pub fn find_tokenizers(tribles: &TribleSet) -> impl Iterator<Item = Id> + '_ {
     find!(
         (e: Id, t: Id, n: Inline<inlineencodings::Handle<blobencodings::LongString>>),
         pattern!(tribles, [{ ?e @ metadata::tag: ?t, attrs::model_name: ?n }])
@@ -777,10 +777,18 @@ pub fn find_tokenizer(tribles: &TribleSet) -> Option<Id> {
     // no merges list; UNIGRAM because omitting it made
     // `load_spm_tokenizer_from_pile` report "no tokenizer graph" on a pile that
     // had just been written.
-    .find(|&(_, t, _)| {
+    .filter(|&(_, t, _)| {
         t == ty::WORD_PIECE || t == ty::BPE || t == ty::TIKTOKEN || t == ty::UNIGRAM
     })
     .map(|(e, _, _)| e)
+}
+
+/// The first tokenizer root in a fact set, retained for legacy callers.
+///
+/// New consolidated-graph code should use [`find_tokenizers`] together with an
+/// explicit exact-cardinality selector (see [`crate::selection`]).
+pub fn find_tokenizer(tribles: &TribleSet) -> Option<Id> {
+    find_tokenizers(tribles).next()
 }
 
 /// All `metadata::tag` discriminants on a node (type + boolean flags).
@@ -802,6 +810,38 @@ pub fn ordered_members(tribles: &TribleSet, node: Id) -> Vec<Id> {
     v.into_iter().map(|(_, m)| m).collect()
 }
 
+/// Exact-cardinality counterpart to [`ordered_members`] for tokenizer
+/// construction. Each sequence child owns one index and indices are unique;
+/// otherwise order would depend on query iteration or sort stability.
+#[cfg(feature = "tokenizer")]
+fn ordered_members_strict(tribles: &TribleSet, node: Id) -> Result<Vec<Id>, Err> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let members: BTreeSet<Id> = find!(
+        (member: Id),
+        pattern!(tribles, [{ node @ attrs::member: ?member }])
+    )
+    .map(|(member,)| member)
+    .collect();
+    let mut ordered = BTreeMap::new();
+    for member in members {
+        let index = optional_one(
+            find!(
+                (index: u64),
+                pattern!(tribles, [{ member @ attrs::index: ?index }])
+            )
+            .map(|(index,)| index),
+            member,
+            "index",
+        )?
+        .ok_or_else(|| format!("sequence child {member} has no index"))?;
+        if ordered.insert(index, member).is_some() {
+            return Err(format!("sequence node {node} has duplicate child index {index}").into());
+        }
+    }
+    Ok(ordered.into_values().collect())
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Construct-from-graph: query the graph and feed the parts into `tokenizers`'
 // programmatic builders. No JSON anywhere in this path — the `tokenizers`
@@ -810,11 +850,165 @@ pub fn ordered_members(tribles: &TribleSet, node: Id) -> Vec<Id> {
 
 /// Read a node's optional `ShortString` field.
 #[cfg(feature = "tokenizer")]
+fn optional_one<T>(
+    values: impl IntoIterator<Item = T>,
+    node: Id,
+    field: &'static str,
+) -> Result<Option<T>, Err> {
+    let mut values = values.into_iter();
+    let value = values.next();
+    if values.next().is_some() {
+        return Err(format!("node {node} has more than one {field}").into());
+    }
+    Ok(value)
+}
+
+#[cfg(feature = "tokenizer")]
+fn required_one<T>(
+    values: impl IntoIterator<Item = T>,
+    node: Id,
+    field: &'static str,
+) -> Result<T, Err> {
+    optional_one(values, node, field)?
+        .ok_or_else(|| format!("node {node} has no {field}").into())
+}
+
+#[cfg(feature = "tokenizer")]
+fn load_vocab_strict(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    tok_id: Id,
+) -> Result<HashMap<String, u64>, Err> {
+    use std::collections::{BTreeSet, HashSet};
+
+    let entries: BTreeSet<Id> = find!(
+        (entry: Id),
+        pattern!(tribles, [{ tok_id @ attrs::vocab: ?entry }])
+    )
+    .map(|(entry,)| entry)
+    .collect();
+    let mut vocab = HashMap::with_capacity(entries.len());
+    let mut ids = HashSet::with_capacity(entries.len());
+    for entry in entries {
+        let piece = required_one(
+            find!((piece), pattern!(tribles, [{ entry @ attrs::piece: ?piece }]))
+                .map(|(piece,)| read_piece(blobs, piece)),
+            entry,
+            "piece",
+        )?;
+        let token_id = required_one(
+            find!(
+                (token_id: u64),
+                pattern!(tribles, [{ entry @ attrs::token_id: ?token_id }])
+            )
+            .map(|(token_id,)| token_id),
+            entry,
+            "token_id",
+        )?;
+        if !ids.insert(token_id) {
+            return Err(format!("tokenizer {tok_id} has duplicate token id {token_id}").into());
+        }
+        if vocab.insert(piece.clone(), token_id).is_some() {
+            return Err(format!("tokenizer {tok_id} has duplicate vocab piece {piece:?}").into());
+        }
+    }
+    Ok(vocab)
+}
+
+#[cfg(feature = "tokenizer")]
+fn load_merges_strict(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    tok_id: Id,
+) -> Result<Vec<(String, String)>, Err> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let merges: BTreeSet<Id> = find!(
+        (merge: Id),
+        pattern!(tribles, [{ tok_id @ attrs::merge: ?merge }])
+    )
+    .map(|(merge,)| merge)
+    .collect();
+    let mut ranked = BTreeMap::new();
+    for merge in merges {
+        let left = required_one(
+            find!((left), pattern!(tribles, [{ merge @ attrs::merge_left: ?left }]))
+                .map(|(left,)| read_piece(blobs, left)),
+            merge,
+            "merge_left",
+        )?;
+        let right = required_one(
+            find!((right), pattern!(tribles, [{ merge @ attrs::merge_right: ?right }]))
+                .map(|(right,)| read_piece(blobs, right)),
+            merge,
+            "merge_right",
+        )?;
+        let index = required_one(
+            find!((index: u64), pattern!(tribles, [{ merge @ attrs::index: ?index }]))
+                .map(|(index,)| index),
+            merge,
+            "index",
+        )?;
+        if ranked.insert(index, (left, right)).is_some() {
+            return Err(format!("tokenizer {tok_id} has duplicate merge index {index}").into());
+        }
+    }
+    Ok(ranked.into_values().collect())
+}
+
+#[cfg(feature = "tokenizer")]
+fn load_added_strict(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    tok_id: Id,
+) -> Result<Vec<(String, u64)>, Err> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let added: BTreeSet<Id> = find!(
+        (added: Id),
+        pattern!(tribles, [{ tok_id @ attrs::added: ?added }])
+    )
+    .map(|(added,)| added)
+    .collect();
+    let mut ordered = BTreeMap::new();
+    for added in added {
+        let piece = required_one(
+            find!((piece), pattern!(tribles, [{ added @ attrs::piece: ?piece }]))
+                .map(|(piece,)| read_piece(blobs, piece)),
+            added,
+            "piece",
+        )?;
+        let token_id = required_one(
+            find!(
+                (token_id: u64),
+                pattern!(tribles, [{ added @ attrs::token_id: ?token_id }])
+            )
+            .map(|(token_id,)| token_id),
+            added,
+            "token_id",
+        )?;
+        let index = required_one(
+            find!((index: u64), pattern!(tribles, [{ added @ attrs::index: ?index }]))
+                .map(|(index,)| index),
+            added,
+            "index",
+        )?;
+        if ordered.insert(index, (piece, token_id)).is_some() {
+            return Err(format!("tokenizer {tok_id} has duplicate added-token index {index}").into());
+        }
+    }
+    Ok(ordered.into_values().collect())
+}
+
+#[cfg(feature = "tokenizer")]
 macro_rules! short_field {
     ($tribles:expr, $node:expr, $attr:path) => {
-        find!((s: String), pattern!($tribles, [{ ($node) @ $attr: ?s }]))
-            .next()
-            .map(|(s,)| s)
+        optional_one(
+            find!((s: String), pattern!($tribles, [{ ($node) @ $attr: ?s }]))
+                .map(|(s,)| s),
+            $node,
+            stringify!($attr),
+        )?
     };
 }
 
@@ -822,9 +1016,12 @@ macro_rules! short_field {
 #[cfg(feature = "tokenizer")]
 macro_rules! long_field {
     ($tribles:expr, $blobs:expr, $node:expr, $attr:path) => {
-        find!((h,), pattern!($tribles, [{ ($node) @ $attr: ?h }]))
-            .next()
-            .map(|(h,)| read_piece($blobs, h))
+        optional_one(
+            find!((h,), pattern!($tribles, [{ ($node) @ $attr: ?h }]))
+                .map(|(h,)| read_piece($blobs, h)),
+            $node,
+            stringify!($attr),
+        )?
     };
 }
 
@@ -832,9 +1029,12 @@ macro_rules! long_field {
 #[cfg(feature = "tokenizer")]
 macro_rules! edge_field {
     ($tribles:expr, $node:expr, $attr:path) => {
-        find!((e: Id), pattern!($tribles, [{ ($node) @ $attr: ?e }]))
-            .next()
-            .map(|(e,)| e)
+        optional_one(
+            find!((e: Id), pattern!($tribles, [{ ($node) @ $attr: ?e }]))
+                .map(|(e,)| e),
+            $node,
+            stringify!($attr),
+        )?
     };
 }
 
@@ -855,19 +1055,43 @@ pub fn build_tokenizer(
     use tokenizers::models::wordpiece::WordPiece;
 
     let tags = node_tags(tribles, tok_id);
-    let vocab: tokenizers::models::bpe::Vocab = load_vocab(tribles, blobs, tok_id)
+    required_one(
+        find!(
+            (name: Inline<inlineencodings::Handle<blobencodings::LongString>>),
+            pattern!(tribles, [{ tok_id @ attrs::model_name: ?name }])
+        ),
+        tok_id,
+        "model_name",
+    )?;
+
+    let vocab: tokenizers::models::bpe::Vocab = load_vocab_strict(tribles, blobs, tok_id)?
         .into_iter()
         .map(|(t, i)| (t, i as u32))
         .collect();
     let unk = short_field!(tribles, tok_id, attrs::unk_token);
     let csp = short_field!(tribles, tok_id, attrs::continuing_subword_prefix);
     let eows = short_field!(tribles, tok_id, attrs::end_of_word_suffix);
-    let max_chars = find!(
-        (m: u64),
-        pattern!(tribles, [{ tok_id @ attrs::max_input_chars: ?m }])
-    )
-    .next()
-    .map(|(m,)| m);
+    let max_chars = optional_one(
+        find!(
+            (m: u64),
+            pattern!(tribles, [{ tok_id @ attrs::max_input_chars: ?m }])
+        )
+        .map(|(m,)| m),
+        tok_id,
+        "max_input_chars",
+    )?;
+
+    let model_kinds: Vec<_> = [ty::WORD_PIECE, ty::BPE, ty::TIKTOKEN, ty::UNIGRAM]
+        .into_iter()
+        .filter(|kind| tags.contains(kind))
+        .collect();
+    if model_kinds.len() != 1 {
+        return Err(format!(
+            "tokenizer {tok_id} must carry exactly one model-kind tag; found {}",
+            model_kinds.len()
+        )
+        .into());
+    }
 
     let model: tokenizers::ModelWrapper = if tags.contains(&ty::WORD_PIECE) {
         let mut b = WordPiece::builder().vocab(vocab);
@@ -884,7 +1108,7 @@ pub fn build_tokenizer(
             .map_err(|e| format!("build WordPiece model: {e}"))?
             .into()
     } else if tags.contains(&ty::BPE) {
-        let merges = load_merges(tribles, blobs, tok_id);
+        let merges = load_merges_strict(tribles, blobs, tok_id)?;
         let mut b = BPE::builder().vocab_and_merges(vocab, merges);
         // Not cosmetic: with `ignore_merges` false the merge table re-derives
         // pieces the vocab already names, so a token the model would emit whole
@@ -924,7 +1148,7 @@ pub fn build_tokenizer(
     // sentinels, CLIP's <|startoftext|>/<|endoftext|>) is `special: true`, so
     // reconstruct them as special. Ids resolve against the vocab (all our
     // added tokens are also vocab entries), so no id drift is possible.
-    let added: Vec<tokenizers::AddedToken> = load_added(tribles, blobs, tok_id)
+    let added: Vec<tokenizers::AddedToken> = load_added_strict(tribles, blobs, tok_id)?
         .into_iter()
         .map(|(content, _id)| tokenizers::AddedToken::from(content, true))
         .collect();
@@ -954,7 +1178,7 @@ fn build_normalizer(
         )
         .into())
     } else if has(ty::SEQUENCE) {
-        let kids = ordered_members(tribles, node)
+        let kids = ordered_members_strict(tribles, node)?
             .into_iter()
             .map(|k| build_normalizer(tribles, blobs, k))
             .collect::<Result<Vec<_>, _>>()?;
@@ -991,7 +1215,7 @@ fn build_pre_tokenizer(
     if has(ty::BERT_PRE_TOKENIZER) {
         Ok(p::bert::BertPreTokenizer.into())
     } else if has(ty::SEQUENCE) {
-        let kids = ordered_members(tribles, node)
+        let kids = ordered_members_strict(tribles, node)?
             .into_iter()
             .map(|k| build_pre_tokenizer(tribles, blobs, k))
             .collect::<Result<Vec<_>, _>>()?;

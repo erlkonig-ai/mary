@@ -22,6 +22,7 @@ use crate::ingest::load_keymap;
 use crate::ingest::LeafDtype;
 #[cfg(feature = "import")]
 use crate::nn::weight_loader::read_safetensors_file;
+use anyhow::Context;
 use ed25519_dalek::SigningKey;
 use std::collections::HashMap;
 use std::path::Path;
@@ -1260,35 +1261,15 @@ pub fn load_keymap_from_mary_branch_quantized(
     quantization: &str,
 ) -> anyhow::Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
     let (tribles, reader) = checkout_mary_branch(pile_path)?;
-    // Constrain `quantization` engine-side (a ShortString value on the root),
-    // then match the projected `source` label by its blob string. `source` is a
-    // `Handle<LongString>` so its value lives in a blob, not inline — resolve it
-    // through the reader.
-    let root: Id = find!(
-        (m: Id, s: Inline<inlineencodings::Handle<blobencodings::LongString>>),
-        pattern!(&tribles, [{ ?m @
-            crate::format::attrs::quantization: quantization,
-            crate::format::attrs::source: ?s,
-        }])
+    crate::selection::load_keymap_from_graph(
+        &tribles,
+        &reader,
+        crate::selection::ModelSelector::Source {
+            source,
+            quantization,
+        },
     )
-    .filter(|&(_m, s)| {
-        let v: anybytes::View<str> = reader.get(s).expect("source blob");
-        &*v == source
-    })
-    .map(|(m, _s)| m)
-    .next()
-    .ok_or_else(|| {
-        anyhow::anyhow!(
-            "no model root (source={source:?}, quantization={quantization:?}) on the \
-             'mary' branch in pile {pile_path:?}"
-        )
-    })?;
-
-    let keymap = load_keymap(&tribles, &reader, root);
-    if keymap.is_empty() {
-        anyhow::bail!("keymap empty after materializing model root {root} from the mary branch");
-    }
-    Ok(keymap)
+    .with_context(|| format!("select model on the 'mary' branch in pile {pile_path:?}"))
 }
 
 /// Load a model's keymap from the `mary` branch by the model-root's ENTITY ID
@@ -1301,14 +1282,12 @@ pub fn load_keymap_from_mary_branch_by_root(
     root: Id,
 ) -> anyhow::Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
     let (tribles, reader) = checkout_mary_branch(pile_path)?;
-    let keymap = load_keymap(&tribles, &reader, root);
-    if keymap.is_empty() {
-        anyhow::bail!(
-            "no members under model root {root} on the 'mary' branch in pile {pile_path:?} \
-             (unknown root id, or an empty model)"
-        );
-    }
-    Ok(keymap)
+    crate::selection::load_keymap_from_graph(
+        &tribles,
+        &reader,
+        crate::selection::ModelSelector::Root(root),
+    )
+    .with_context(|| format!("select model on the 'mary' branch in pile {pile_path:?}"))
 }
 
 /// Open a pile, resolve its `mary` branch, and return `(full-history facts, blob
@@ -1474,8 +1453,12 @@ pub fn load_spm_tokenizer_from_pile(
     // pile unclosed ("data may not be persisted").
     repo.close()
         .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
-    let tok_id = crate::tokenizer::find_tokenizer(&tribles)
-        .ok_or_else(|| anyhow::anyhow!("no tokenizer graph in pile {pile_path:?}"))?;
+    let tok_id = crate::selection::select_tokenizer_root(
+        &tribles,
+        &reader,
+        crate::selection::TokenizerSelector::Only,
+    )
+    .with_context(|| format!("select SentencePiece tokenizer in pile {pile_path:?}"))?;
     let pieces = crate::tokenizer::load_spm_pieces(&tribles, &reader, tok_id);
     if pieces.is_empty() {
         anyhow::bail!("tokenizer graph in {pile_path:?} has no scored pieces — not UNIGRAM?");
@@ -1626,14 +1609,12 @@ pub fn load_tokenizer_from_pile_on(
         .reader()
         .map_err(|e| anyhow::anyhow!("pile reader: {e:?}"))?;
 
-    let tok_id = crate::tokenizer::find_tokenizer(&tribles).ok_or_else(|| {
-        anyhow::anyhow!(
-            "no tokenizer graph on {branch:?} in pile {pile_path:?} — ingest one \
-             from its tokenizer.json (inkling_tokenizer_gate)"
-        )
-    })?;
-    let tok = crate::tokenizer::build_tokenizer(&tribles, &reader, tok_id)
-        .map_err(|e| anyhow::anyhow!("build tokenizer from graph: {e}"))?;
+    let tok = crate::selection::load_tokenizer_from_graph(
+        &tribles,
+        &reader,
+        crate::selection::TokenizerSelector::Only,
+    )
+    .with_context(|| format!("select tokenizer on {branch:?} in pile {pile_path:?}"))?;
     repo.close()
         .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
     Ok(tok)

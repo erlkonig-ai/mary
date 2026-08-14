@@ -59,6 +59,10 @@ pub mod paths;
 /// family goes through here — so the module is unconditional. The
 /// safetensors → pile persist direction inside it is `import`-gated.
 pub mod persist;
+/// Deterministic selection and materialization from an already-open model
+/// graph. Storage adapters supply the facts and blob reader; this module owns
+/// only the graph semantics.
+pub mod selection;
 pub mod nn;
 pub mod models;
 /// In-process F5-TTS voice synthesis — zero-shot, cloning the speaker from a
