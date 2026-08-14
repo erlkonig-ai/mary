@@ -1,4 +1,15 @@
-//! Compatibility projection for Mary's pre-anchored model graphs.
+//! Native collection persistence and compatibility projection for Mary models.
+//!
+//! New model fragments live in one fixed, append-only `SimpleArchive` union.
+//! Publication takes an already-open [`Pile`] and a caller-supplied signing
+//! key; exact reads take complete signed commit records as their authority.
+//! The local-latest convenience deliberately makes a different, explicit
+//! admission choice: every structurally present commit for this exact model
+//! descriptor in one locally observed pile prefix is admitted to its frozen
+//! ticket, regardless of author, and then subjected to the same strict exact
+//! verification. There is no repository, mutable head, key discovery,
+//! fallback store, repair, reopen, or implicit durability flush in this
+//! surface.
 //!
 //! TribleSpace commit `6b65f278` changed `"hex" as attribute: Encoding` from a
 //! literal attribute id to an encoding-aware id derived from `(hex, Encoding)`.
@@ -8,11 +19,252 @@
 //! query declarations.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::error::Error;
+use std::fmt;
+use std::path::Path;
 
+use ed25519_dalek::SigningKey;
 use triblespace::core::attribute::Attribute;
+use triblespace::core::collection::simplearchive_union::{self, PublicationError};
+use triblespace::core::collection::{
+    CollectionCommit, CollectionMaterializationError, CollectionRecord, CollectionStore,
+    SimpleArchiveCollection,
+};
 use triblespace::core::inline::encodings::UnknownInline;
+use triblespace::core::repo::pile::{
+    CollectionInsertError, FlushError, GetBlobError, InsertError as PileInsertError, PileReader,
+    ReadError,
+};
 use triblespace::prelude::inlineencodings::{F64, U256BE};
 use triblespace::prelude::*;
+
+/// Stable scope of Mary's canonical model-graph collection.
+///
+/// Minted with `trible genid` on 2026-08-14. The canonical collection
+/// descriptor additionally fixes `SimpleArchive` as its representation and
+/// TribleSpace's version-1 trible-set union recipe as its algebra.
+pub const MARY_MODEL_GRAPH_SCOPE: Id =
+    triblespace::macros::id_hex!("F7A4634F17D8A9799FA2E5C0DD942327");
+
+/// Concrete failure produced by publishing one model fragment to a pile.
+pub type ModelFragmentPublicationError = PublicationError<PileInsertError, CollectionInsertError>;
+
+/// Concrete failure produced while exactly materializing Mary's collection
+/// from a pile.
+pub type ModelCollectionMaterializationError =
+    CollectionMaterializationError<ReadError, ReadError, Infallible, GetBlobError<Infallible>>;
+
+/// Failure while publishing one model fragment.
+#[derive(Debug)]
+pub enum PublishModelFragmentError {
+    /// The caller's open pile could not refresh its observed prefix before any
+    /// publication work began.
+    Refresh(ReadError),
+    /// Canonical fragment preparation or dependency/record publication failed.
+    Publication(ModelFragmentPublicationError),
+}
+
+impl fmt::Display for PublishModelFragmentError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Refresh(source) => {
+                write!(
+                    f,
+                    "failed to refresh model pile before publication: {source}"
+                )
+            }
+            Self::Publication(source) => source.fmt(f),
+        }
+    }
+}
+
+impl Error for PublishModelFragmentError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Refresh(source) => Some(source),
+            Self::Publication(source) => Some(source),
+        }
+    }
+}
+
+/// Failure while opening and loading a model collection snapshot from a pile
+/// path.
+#[derive(Debug)]
+pub enum LoadModelCollectionError {
+    /// The supplied pile path could not be opened.
+    Open(ReadError),
+    /// The newly opened pile could not replay one observed prefix.
+    Refresh(ReadError),
+    /// Full native-record enumeration for a local-admission ticket failed.
+    LocalTicket(ReadError),
+    /// The frozen exact ticket could not be verified or materialized.
+    Materialize(ModelCollectionMaterializationError),
+    /// The read-only pile handle could not be closed after snapshot creation.
+    Close(FlushError),
+}
+
+impl fmt::Display for LoadModelCollectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open(source) => write!(f, "failed to open model pile: {source}"),
+            Self::Refresh(source) => write!(f, "failed to refresh model pile: {source}"),
+            Self::LocalTicket(source) => {
+                write!(
+                    f,
+                    "failed to freeze the local model commit ticket: {source}"
+                )
+            }
+            Self::Materialize(source) => {
+                write!(f, "failed to materialize the model collection: {source}")
+            }
+            Self::Close(source) => write!(f, "failed to close model pile: {source}"),
+        }
+    }
+}
+
+impl Error for LoadModelCollectionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Open(source) => Some(source),
+            Self::Refresh(source) => Some(source),
+            Self::LocalTicket(source) => Some(source),
+            Self::Materialize(source) => Some(source),
+            Self::Close(source) => Some(source),
+        }
+    }
+}
+
+fn model_graph_collection() -> SimpleArchiveCollection {
+    SimpleArchiveCollection::new(MARY_MODEL_GRAPH_SCOPE)
+}
+
+/// Publish one self-contained model fragment under the supplied signer.
+///
+/// The pile is refreshed before publication. Facts, metafacts, and their
+/// shared embedded attachments are then passed directly to
+/// [`simplearchive_union::publish_fragment_commit`]. The caller retains the
+/// pile and chooses any later durability boundary; this function neither
+/// flushes nor closes it.
+pub fn publish_model_fragment(
+    pile: &mut Pile,
+    signing_key: &SigningKey,
+    fragment: Fragment,
+) -> Result<CollectionCommit, PublishModelFragmentError> {
+    pile.refresh().map_err(PublishModelFragmentError::Refresh)?;
+    simplearchive_union::publish_fragment_commit(
+        pile,
+        &model_graph_collection().descriptor(),
+        fragment,
+        signing_key,
+    )
+    .map_err(PublishModelFragmentError::Publication)
+}
+
+/// Materialize exactly the supplied set of complete signed model commits from
+/// an already-open pile.
+///
+/// Ticket members may have different authors. Commits not named by the ticket
+/// remain inert, while every selected record and dependency must pass the
+/// strict `SimpleArchiveCollection` exact-ticket checks. This function does
+/// not flush or close the caller's pile.
+pub fn snapshot_model_collection_exact(
+    pile: &mut Pile,
+    ticket: &[CollectionCommit],
+) -> Result<CollectionSnapshot<PileReader>, ModelCollectionMaterializationError> {
+    model_graph_collection().snapshot_exact(pile, ticket)
+}
+
+fn close_after_snapshot(
+    pile: Pile,
+    snapshot: Result<CollectionSnapshot<PileReader>, ModelCollectionMaterializationError>,
+) -> Result<CollectionSnapshot<PileReader>, LoadModelCollectionError> {
+    match snapshot {
+        Ok(snapshot) => {
+            pile.close().map_err(LoadModelCollectionError::Close)?;
+            Ok(snapshot)
+        }
+        Err(source) => {
+            // A path loader always consumes its pile handle, including on
+            // validation failure. This read-only handle is not dirty, so close
+            // performs no durability flush.
+            let _ = pile.close();
+            Err(LoadModelCollectionError::Materialize(source))
+        }
+    }
+}
+
+fn open_and_refresh_model_pile(path: &Path) -> Result<Pile, LoadModelCollectionError> {
+    let mut pile = Pile::open(path).map_err(LoadModelCollectionError::Open)?;
+    if let Err(source) = pile.refresh() {
+        let _ = pile.close();
+        return Err(LoadModelCollectionError::Refresh(source));
+    }
+    Ok(pile)
+}
+
+/// Open `path`, materialize the caller-supplied exact ticket, and close the
+/// pile while returning the owned reader snapshot.
+///
+/// Opening and the initial replay are explicit failure stages. No missing
+/// file is created, no damaged tail is amputated, and no alternate storage or
+/// runtime path is consulted. The returned [`PileReader`] owns its immutable
+/// mapping snapshot and remains usable after the mutable [`Pile`] is closed.
+pub fn load_model_collection_from_ticket(
+    path: impl AsRef<Path>,
+    ticket: &[CollectionCommit],
+) -> Result<CollectionSnapshot<PileReader>, LoadModelCollectionError> {
+    let mut pile = open_and_refresh_model_pile(path.as_ref())?;
+    let snapshot = snapshot_model_collection_exact(&mut pile, ticket);
+    close_after_snapshot(pile, snapshot)
+}
+
+fn local_model_ticket(pile: &mut Pile) -> Result<Vec<CollectionCommit>, ReadError> {
+    let collection = model_graph_collection().descriptor().handle();
+    let mut ticket = Vec::new();
+    for record in pile.records()? {
+        if let CollectionRecord::Commit(commit) = record? {
+            if commit.collection() == collection {
+                // Deliberately retain structurally decoded but
+                // cryptographically invalid matching commits. The exact
+                // boundary below must reject them instead of silently
+                // producing a partial local view.
+                ticket.push(commit);
+            }
+        }
+    }
+    ticket.sort_unstable_by_key(CollectionCommit::id);
+    Ok(ticket)
+}
+
+/// Load the union of every locally admitted model commit in one observed pile
+/// prefix.
+///
+/// This is an explicit *local pile admission policy*: placing a structurally
+/// valid native commit record in this pile admits it to the next frozen
+/// ticket, regardless of signer. Records naming other descriptors are inert.
+/// Matching records are not pre-filtered by signature, so one invalid matching
+/// record makes exact verification fail closed rather than disappearing from a
+/// partial result. After the full deterministic record scan, the ticket is
+/// frozen and materialized exactly; concurrent later appends cannot widen it.
+/// The pile is never repaired, reopened, or implicitly flushed.
+pub fn load_model_collection_local_latest(
+    path: impl AsRef<Path>,
+) -> Result<CollectionSnapshot<PileReader>, LoadModelCollectionError> {
+    // `Pile::records` performs the one bounded replay that defines the local
+    // admission prefix. Do not refresh separately here: a second pre-ticket
+    // replay would move that boundary for no semantic benefit.
+    let mut pile = Pile::open(path.as_ref()).map_err(LoadModelCollectionError::Open)?;
+    let ticket = match local_model_ticket(&mut pile) {
+        Ok(ticket) => ticket,
+        Err(source) => {
+            let _ = pile.close();
+            return Err(LoadModelCollectionError::LocalTicket(source));
+        }
+    };
+    let snapshot = snapshot_model_collection_exact(&mut pile, &ticket);
+    close_after_snapshot(pile, snapshot)
+}
 
 /// Number of unique pre-epoch model-graph attributes projected by this module.
 ///
@@ -443,9 +695,296 @@ pub fn project_legacy_model_attributes(facts: &TribleSet) -> ModelAttributeProje
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use anybytes::{Bytes, View};
+    use triblespace::core::collection::ExactTicketError;
+    use triblespace::core::repo::BlobStoreGet;
     use triblespace::macros::id_hex;
+    use triblespace::prelude::blobencodings::{LongString, RawBytes, SimpleArchive};
+    use triblespace::prelude::inlineencodings::Handle;
+
+    static NEXT_TEMP_PILE: AtomicU64 = AtomicU64::new(0);
+
+    struct TempPilePath {
+        path: PathBuf,
+    }
+
+    impl TempPilePath {
+        fn new(label: &str) -> Self {
+            let ordinal = NEXT_TEMP_PILE.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "mary-{label}-{}-{nanos}-{ordinal}.pile",
+                std::process::id()
+            ));
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .expect("create isolated test pile");
+            Self { path }
+        }
+
+        fn as_path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempPilePath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn fragment_fixture(
+        label: &str,
+    ) -> (
+        Fragment,
+        Inline<Handle<LongString>>,
+        Inline<Handle<RawBytes>>,
+    ) {
+        let text: Blob<LongString> = format!("model attachment {label}").to_blob();
+        let text_handle = text.get_handle();
+        let mut fragment = entity! { crate::format::attrs::model_name: text };
+
+        let payload: Blob<RawBytes> = label.as_bytes().to_vec().to_blob();
+        let payload_handle = payload.get_handle();
+        let description = entity! { crate::tokenizer::attrs::piece_bytes: payload };
+        fragment.describe_with(description);
+
+        (fragment, text_handle, payload_handle)
+    }
+
+    fn open_test_pile(path: &Path) -> Pile {
+        let mut pile = Pile::open(path).expect("open test pile");
+        pile.refresh().expect("refresh test pile");
+        pile
+    }
+
+    #[test]
+    fn model_graph_descriptor_is_stable() {
+        let collection = model_graph_collection();
+        let descriptor = collection.descriptor();
+
+        assert_eq!(
+            MARY_MODEL_GRAPH_SCOPE,
+            id_hex!("F7A4634F17D8A9799FA2E5C0DD942327")
+        );
+        assert_eq!(collection.scope(), MARY_MODEL_GRAPH_SCOPE);
+        assert_eq!(descriptor.scope(), MARY_MODEL_GRAPH_SCOPE);
+        assert_eq!(
+            descriptor,
+            simplearchive_union::descriptor(MARY_MODEL_GRAPH_SCOPE)
+        );
+        assert_eq!(
+            descriptor.representation(),
+            <SimpleArchive as MetaDescribe>::id()
+        );
+        assert_eq!(
+            descriptor.recipe(),
+            simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1
+        );
+        assert_eq!(
+            descriptor.entity_id(),
+            id_hex!("C2ABA26DCE9B507997F92F597AFD8D46")
+        );
+        assert_eq!(
+            descriptor.handle().raw,
+            [
+                0xED, 0x65, 0xD1, 0x94, 0x35, 0x20, 0x4E, 0xC4, 0x9D, 0x08, 0xB6, 0xBF, 0x92, 0x9D,
+                0xE5, 0x5C, 0xA3, 0x29, 0x08, 0x72, 0xF6, 0xA8, 0xDF, 0x3C, 0xA1, 0x38, 0x06, 0x64,
+                0x9E, 0xD0, 0x8A, 0xFE,
+            ]
+        );
+    }
+
+    #[test]
+    fn fragment_publication_roundtrips_every_channel_and_is_idempotent() {
+        let file = TempPilePath::new("fragment-roundtrip");
+        let signing_key = SigningKey::from_bytes(&[0x17; 32]);
+        let (fragment, text_handle, payload_handle) = fragment_fixture("roundtrip");
+        let expected_facts = fragment.facts().clone();
+        let expected_metafacts = fragment.metafacts().clone();
+
+        let mut pile = open_test_pile(file.as_path());
+        let first = publish_model_fragment(&mut pile, &signing_key, fragment.clone()).unwrap();
+        let repeated = publish_model_fragment(&mut pile, &signing_key, fragment).unwrap();
+        assert_eq!(first, repeated);
+        assert_eq!(
+            first.public_key().raw,
+            signing_key.verifying_key().to_bytes()
+        );
+        first.verify_strict().unwrap();
+
+        // Snapshot directly from the same still-open pile. A duplicate ticket
+        // is a mathematical set and therefore returns one canonical commit.
+        let snapshot = snapshot_model_collection_exact(&mut pile, &[repeated, first]).unwrap();
+        assert_eq!(snapshot.facts(), &expected_facts);
+        assert_eq!(snapshot.commits(), &[first]);
+
+        // The owned PileReader mapping must outlive the mutable pile handle.
+        pile.close().unwrap();
+        let metadata: TribleSet = snapshot.reader().get(first.metadata()).unwrap();
+        assert_eq!(metadata, expected_metafacts);
+        let text: View<str> = snapshot.reader().get(text_handle).unwrap();
+        let payload: Bytes = snapshot.reader().get(payload_handle).unwrap();
+        assert_eq!(&*text, "model attachment roundtrip");
+        assert_eq!(&*payload, b"roundtrip");
+
+        let loaded = load_model_collection_from_ticket(file.as_path(), &[first]).unwrap();
+        assert_eq!(loaded.facts(), &expected_facts);
+        let text_after_path_close: View<str> = loaded.reader().get(text_handle).unwrap();
+        assert_eq!(&*text_after_path_close, "model attachment roundtrip");
+    }
+
+    #[test]
+    fn exact_ticket_accepts_mixed_authors_and_keeps_unselected_commits_inert() {
+        let file = TempPilePath::new("exact-mixed-authors");
+        let mut pile = open_test_pile(file.as_path());
+        let (first_fragment, _, _) = fragment_fixture("first");
+        let first_facts = first_fragment.facts().clone();
+        let first = publish_model_fragment(
+            &mut pile,
+            &SigningKey::from_bytes(&[0x21; 32]),
+            first_fragment,
+        )
+        .unwrap();
+        let (second_fragment, _, _) = fragment_fixture("second");
+        let second_facts = second_fragment.facts().clone();
+        let second = publish_model_fragment(
+            &mut pile,
+            &SigningKey::from_bytes(&[0x22; 32]),
+            second_fragment,
+        )
+        .unwrap();
+        let (unselected, _, _) = fragment_fixture("unselected");
+        publish_model_fragment(&mut pile, &SigningKey::from_bytes(&[0x23; 32]), unselected)
+            .unwrap();
+
+        let snapshot = snapshot_model_collection_exact(&mut pile, &[second, first]).unwrap();
+        let mut expected = first_facts;
+        expected += second_facts;
+        let mut expected_commits = vec![first, second];
+        expected_commits.sort_unstable_by_key(CollectionCommit::id);
+        assert_eq!(snapshot.facts(), &expected);
+        assert_eq!(snapshot.commits(), expected_commits);
+        assert_ne!(first.public_key(), second.public_key());
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn local_latest_admits_all_matching_authors_and_ignores_foreign_records() {
+        let file = TempPilePath::new("local-latest");
+        let mut pile = open_test_pile(file.as_path());
+        let (first_fragment, _, _) = fragment_fixture("local-first");
+        let first_facts = first_fragment.facts().clone();
+        let first = publish_model_fragment(
+            &mut pile,
+            &SigningKey::from_bytes(&[0x31; 32]),
+            first_fragment,
+        )
+        .unwrap();
+        let (second_fragment, _, _) = fragment_fixture("local-second");
+        let second_facts = second_fragment.facts().clone();
+        let second = publish_model_fragment(
+            &mut pile,
+            &SigningKey::from_bytes(&[0x32; 32]),
+            second_fragment,
+        )
+        .unwrap();
+
+        let foreign_scope = Id::new([0x45; 16]).unwrap();
+        let foreign_descriptor = simplearchive_union::descriptor(foreign_scope);
+        let (foreign_fragment, _, _) = fragment_fixture("foreign");
+        let foreign = simplearchive_union::publish_fragment_commit(
+            &mut pile,
+            &foreign_descriptor,
+            foreign_fragment,
+            &SigningKey::from_bytes(&[0x33; 32]),
+        )
+        .unwrap();
+        let mut invalid_foreign_bytes = foreign.to_bytes();
+        *invalid_foreign_bytes.last_mut().unwrap() ^= 1;
+        let invalid_foreign = CollectionCommit::from_bytes(invalid_foreign_bytes);
+        assert!(invalid_foreign.verify_strict().is_err());
+        pile.insert(CollectionRecord::Commit(invalid_foreign))
+            .unwrap();
+        pile.close().unwrap();
+
+        let snapshot = load_model_collection_local_latest(file.as_path()).unwrap();
+        let mut expected = first_facts;
+        expected += second_facts;
+        let mut expected_commits = vec![first, second];
+        expected_commits.sort_unstable_by_key(CollectionCommit::id);
+        assert_eq!(snapshot.facts(), &expected);
+        assert_eq!(snapshot.commits(), expected_commits);
+        assert!(snapshot
+            .commits()
+            .iter()
+            .all(|commit| commit.collection() != foreign.collection()));
+    }
+
+    #[test]
+    fn local_latest_retains_invalid_matching_commits_so_exact_read_fails() {
+        let file = TempPilePath::new("local-invalid-matching");
+        let mut pile = open_test_pile(file.as_path());
+        let (fragment, _, _) = fragment_fixture("invalid-matching");
+        let valid =
+            publish_model_fragment(&mut pile, &SigningKey::from_bytes(&[0x41; 32]), fragment)
+                .unwrap();
+        let mut invalid_bytes = valid.to_bytes();
+        *invalid_bytes.last_mut().unwrap() ^= 1;
+        let invalid = CollectionCommit::from_bytes(invalid_bytes);
+        assert_eq!(invalid.collection(), valid.collection());
+        assert!(invalid.verify_strict().is_err());
+        pile.insert(CollectionRecord::Commit(invalid)).unwrap();
+        pile.close().unwrap();
+
+        let error = match load_model_collection_local_latest(file.as_path()) {
+            Ok(_) => panic!("invalid matching commit unexpectedly materialized"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            LoadModelCollectionError::Materialize(
+                CollectionMaterializationError::ExactTicket(
+                    ExactTicketError::MissingOrInvalidCommit { commit }
+                )
+            ) if commit == invalid.id()
+        ));
+    }
+
+    #[test]
+    fn corrupt_tail_is_reported_without_mutating_the_pile() {
+        let file = TempPilePath::new("corrupt-tail");
+        open_test_pile(file.as_path()).close().unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(file.as_path())
+            .unwrap()
+            .write_all(&[0xAA; 7])
+            .unwrap();
+        let before = std::fs::metadata(file.as_path()).unwrap().len();
+
+        let error = match load_model_collection_local_latest(file.as_path()) {
+            Ok(_) => panic!("corrupt pile unexpectedly loaded"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            LoadModelCollectionError::LocalTicket(ReadError::CorruptPile { valid_length: 0 })
+        ));
+        assert_eq!(std::fs::metadata(file.as_path()).unwrap().len(), before);
+    }
 
     fn raw_fact(entity: Id, attribute: Id, value: u8) -> Trible {
         Trible::force(

@@ -7060,6 +7060,7 @@ dependencies = [
  "libc",
  "memmap2",
  "num-rational",
+ "num-traits",
  "page_size",
  "quick_cache",
  "rand 0.8.7",
