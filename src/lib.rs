@@ -22,6 +22,11 @@ pub mod tokenizer;
 /// attributes for every document; see the module docs for why that beats one
 /// minted attribute per config field.
 pub mod jsonfacts;
+/// Compatibility projection for model graphs written before TribleSpace's
+/// encoding-aware anchored-attribute epoch. This is a migration primitive;
+/// runtime readers continue to use the canonical schemas in [`format`] and
+/// [`tokenizer`] directly.
+pub mod model_collection;
 /// tiktoken-style byte-level BPE (Kimi-K3): the rank table IS the merge order,
 /// so there is no merges list — the engine half of what [`tokenizer`]'s
 /// `ty::TIKTOKEN` stores as facts. Gated id-for-id against the shipped
