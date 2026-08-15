@@ -109,8 +109,10 @@ fn native_import_is_exact_selectable_and_byte_idempotent() {
     pile.close().unwrap();
 
     // Construct the exact expected graph through the same format-agnostic
-    // graph primitives, but in independent storage. This checks the front door
-    // adds no branch descriptor, message, or other ambient facts.
+    // graph primitives, but in independent storage. This checks that the
+    // native collection member contains no message or other ambient facts;
+    // unrelated non-collection record kinds are intentionally outside what a
+    // collection snapshot can observe.
     let mut expected_blobs = MemoryBlobStore::new();
     let (members, member_facts) = mary::ingest::ingest_tensors(
         vec![
