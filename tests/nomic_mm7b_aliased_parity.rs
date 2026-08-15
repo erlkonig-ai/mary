@@ -1,6 +1,7 @@
 //! ZERO-COPY Metal/f16 parity gate for `nomic-embed-multimodal-7b`
 //! (`BiQwen2_5`). Loads the combined Qwen2.5-VL backbone + vision tower through
-//! the **aliased-from-pile** path ([`mary::persist::load_nomic_mm7b_aliased_from_pile`]):
+//! the native snapshot aliased path
+//! ([`mary::persist::load_nomic_mm7b_aliased_from_snapshot`]):
 //! every f16 weight blob is mmap'd from the pile straight onto the Metal GPU — no
 //! copy, no f32 materialization — and the backbone then runs in f16 *compute* on
 //! the GPU. This is the production "no daemon needed" path; the NdArray gates
@@ -99,8 +100,14 @@ fn aliased_metal_embed_parity() {
 
     // --- cold aliased load (timed): mmap f16 -> Metal, zero copy ---
     let t0 = Instant::now();
-    let embedder = mary::persist::load_nomic_mm7b_aliased_from_pile(
-        &pile_path,
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile_path)
+        .expect("load native model collection snapshot");
+    let embedder = mary::persist::load_nomic_mm7b_aliased_from_snapshot(
+        snapshot,
+        mary::selection::ModelSelector::Source {
+            source: "nomic-ai/nomic-embed-multimodal-7b",
+            quantization: mary::persist::QUANTIZATION_NATIVE,
+        },
         &tok_path,
         device.clone(),
     )

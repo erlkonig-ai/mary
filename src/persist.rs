@@ -2285,18 +2285,58 @@ impl<'a, R: triblespace::prelude::BlobStoreGet>
     }
 }
 
-/// Load `nomic-embed-multimodal-7b` (Qwen2.5-VL backbone + vision tower) from a
-/// combined f16 pile with ZERO-COPY weights: every tensor's mmap'd f16 blob is
-/// aliased straight onto the Metal GPU (no copy, no f32 materialization). Each
-/// weight's GPU buffer carries the pile mmap alive (the `register_external_aliased`
-/// keepalive), so the pile/reader are dropped after the build and the mappings
-/// persist for the embedder's life. Metal only. Weights stay f16 in GPU memory
-/// (zero-copy); activations run in f32 (the model upcasts weights per-op, as this
-/// bf16-native model's activations exceed f16's range). This is the per-call
-/// "no daemon needed" path: cold mmap + one embed, no multi-GB f32 weight upload.
 #[cfg(all(feature = "gemma", target_os = "macos"))]
-pub fn load_nomic_mm7b_aliased_from_pile(
-    pile_path: &Path,
+fn select_f16_keymap_snapshot(
+    snapshot: CollectionSnapshot<triblespace::core::repo::pile::PileReader>,
+    selector: crate::selection::ModelSelector<'_>,
+) -> anyhow::Result<(
+    HashMap<String, crate::ingest::LeafHandles>,
+    triblespace::core::repo::pile::PileReader,
+)> {
+    let root = crate::selection::select_model_root(snapshot.facts(), snapshot.reader(), selector)
+        .context("select model root from native collection snapshot")?;
+    let index = crate::selection::index_keymap_for_root(snapshot.facts(), snapshot.reader(), root)
+        .with_context(|| format!("index model root {root} from native collection snapshot"))?;
+
+    // The aliased Metal ABI is f16. Reject a structurally valid but incompatible
+    // native import before model construction can turn it into a distant panic.
+    if let Some(name) = index
+        .iter()
+        .filter_map(|(name, handles)| {
+            matches!(handles, crate::ingest::LeafHandles::F32(..)).then_some(name)
+        })
+        .min()
+    {
+        anyhow::bail!(
+            "model root {root} is not an aliased-f16 model: tensor {name:?} has an f32 leaf"
+        );
+    }
+
+    // The index owns only content handles. Once selection is complete the
+    // facts and commit ticket can go; the owned reader keeps the exact mmap
+    // snapshot from which every handle below will be resolved.
+    let (_, _, reader) = snapshot.into_parts();
+    Ok((index, reader))
+}
+
+/// Load `nomic-embed-multimodal-7b` (Qwen2.5-VL backbone + vision tower) from
+/// one already-frozen native model-collection snapshot and an explicit model
+/// selector.
+///
+/// Every selected f16 tensor blob is aliased straight from the snapshot's mmap
+/// onto the Metal GPU (no copy, no f32 materialization). Each GPU buffer clones
+/// the mmap owner into `register_external_aliased`'s keepalive, so the temporary
+/// key index and [`PileReader`](triblespace::core::repo::pile::PileReader) may
+/// be dropped after construction while the mappings remain valid for the
+/// embedder's life. Weights stay f16 in GPU memory; activations run in f32.
+///
+/// Snapshot acquisition and admission policy are deliberately caller-owned.
+/// This constructor neither opens storage nor falls back to a Repository
+/// branch, and ambiguous or incompatible model selections fail closed.
+#[cfg(all(feature = "gemma", target_os = "macos"))]
+pub fn load_nomic_mm7b_aliased_from_snapshot(
+    snapshot: CollectionSnapshot<triblespace::core::repo::pile::PileReader>,
+    selector: crate::selection::ModelSelector<'_>,
     tokenizer_path: &Path,
     device: burn::backend::wgpu::WgpuDevice,
 ) -> anyhow::Result<
@@ -2305,56 +2345,7 @@ pub fn load_nomic_mm7b_aliased_from_pile(
     use crate::models::qwen2_5_vl::embedder::NomicMultimodalEmbedder;
     use crate::nn::backend::B;
 
-    let mut pile =
-        Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open pile {pile_path:?}: {e:?}"))?;
-    // Read path: non-mutating load, NEVER amputate. A corrupt tail fails
-    // loud; truncation is an explicit operator decision (`trible pile
-    // amputate`), never a side effect of loading weights.
-    pile.refresh().map_err(|e| {
-        anyhow::anyhow!(
-            "pile {pile_path:?} failed to load ({e:?}); refusing to auto-truncate on a \
-             read path — if the tail is a genuinely torn write, amputate explicitly \
-             with `trible pile amputate`"
-        )
-    })?;
-    let mut repo = Repository::new(
-        pile,
-        SigningKey::generate(&mut rand::rngs::OsRng),
-        TribleSet::new(),
-    )
-    .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
-    let branch_id = repo
-        .lookup_branch("main")
-        .map_err(|e| anyhow::anyhow!("lookup main: {e:?}"))?
-        .ok_or_else(|| anyhow::anyhow!("no 'main' branch in pile {pile_path:?}"))?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull main: {e:?}"))?;
-    let head = ws
-        .head()
-        .ok_or_else(|| anyhow::anyhow!("'main' has no commits"))?;
-    let tribles: TribleSet = ws
-        .checkout(ancestors(head))
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
-        .facts()
-        .clone();
-    let reader = repo
-        .storage_mut()
-        .reader()
-        .map_err(|e| anyhow::anyhow!("pile reader: {e:?}"))?;
-    let model_ids: Vec<Id> = find!(
-        (m: Id, n: Inline<inlineencodings::Handle<blobencodings::LongString>>),
-        pattern!(&tribles, [{ ?m @ crate::format::attrs::model_name: ?n }])
-    )
-    .map(|(m, _n)| m)
-    .collect();
-    let mut index = HashMap::new();
-    for id in model_ids {
-        index.extend(crate::ingest::index_keymap(&tribles, &reader, id));
-    }
-    if index.is_empty() {
-        anyhow::bail!("empty model index from pile");
-    }
+    let (index, reader) = select_f16_keymap_snapshot(snapshot, selector)?;
 
     let weights = AliasedQwenWeights {
         index: &index,
@@ -2363,8 +2354,193 @@ pub fn load_nomic_mm7b_aliased_from_pile(
     };
     let embedder =
         NomicMultimodalEmbedder::<B>::load_with_vision(&weights, tokenizer_path, device)?;
-    drop(weights); // release the reader borrow before closing the pile
-    repo.close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+    drop(weights);
+    // Every constructed GPU tensor owns an Arc to the mmap region it aliases;
+    // dropping this reader cannot invalidate the returned embedder.
+    drop(reader);
     Ok(embedder)
+}
+
+#[cfg(all(test, feature = "gemma", target_os = "macos"))]
+mod native_nomic_snapshot_tests {
+    use super::*;
+    use crate::format::attrs;
+    use std::fs::OpenOptions;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use triblespace::prelude::blobencodings::LongString;
+
+    static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestPile {
+        path: PathBuf,
+    }
+
+    impl TestPile {
+        fn new(label: &str) -> Self {
+            let ordinal = NEXT_TEST_PILE.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "mary-native-nomic-{label}-{}-{nanos}-{ordinal}.pile",
+                std::process::id()
+            ));
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .expect("create isolated model pile");
+            Self { path }
+        }
+    }
+
+    impl Drop for TestPile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn add_model(
+        pile: &mut Pile,
+        signing_key: &SigningKey,
+        source: &str,
+        tensor_name: &str,
+        value: f32,
+        f16: bool,
+    ) {
+        let leaf = if f16 {
+            crate::format::put_raw_f16(pile, &[value], &[1]).unwrap()
+        } else {
+            crate::format::put_raw(pile, &[value], &[1]).unwrap()
+        };
+        let leaf_id = leaf.root().unwrap();
+        let mut facts = leaf.into_facts();
+        let name = pile.put::<LongString, _>(tensor_name.to_owned()).unwrap();
+        let member = entity! { _ @ attrs::safetensor_path: name, attrs::weight: leaf_id };
+        let member_id = member.root().unwrap();
+        facts += member.into_facts();
+        let root = entity! { _ @ attrs::member: member_id };
+        let root_id = root.root().unwrap();
+        facts += root.into_facts();
+        let source = pile.put::<LongString, _>(source.to_owned()).unwrap();
+        facts += entity! { ExclusiveId::force_ref(&root_id) @
+            attrs::source: source,
+            attrs::quantization: QUANTIZATION_NATIVE,
+        }
+        .into_facts();
+        crate::model_collection::publish_model_fragment(
+            pile,
+            signing_key,
+            Fragment::rooted(root_id, facts),
+        )
+        .unwrap();
+    }
+
+    fn open_test_pile(file: &TestPile) -> Pile {
+        let mut pile = Pile::open(&file.path).unwrap();
+        pile.refresh().unwrap();
+        pile
+    }
+
+    #[test]
+    fn native_snapshot_selection_keeps_the_reader_and_rejects_ambiguity() {
+        let file = TestPile::new("selection");
+        let mut pile = open_test_pile(&file);
+        let signer = SigningKey::from_bytes(&[0xA1; 32]);
+        add_model(
+            &mut pile,
+            &signer,
+            "example/target",
+            "target.weight",
+            1.5,
+            true,
+        );
+        add_model(
+            &mut pile,
+            &signer,
+            "example/other",
+            "other.weight",
+            2.5,
+            true,
+        );
+        pile.close().unwrap();
+
+        let snapshot = crate::model_collection::load_model_collection_local_latest(&file.path)
+            .expect("native snapshot");
+        let (index, reader) = select_f16_keymap_snapshot(
+            snapshot,
+            crate::selection::ModelSelector::Source {
+                source: "example/target",
+                quantization: QUANTIZATION_NATIVE,
+            },
+        )
+        .expect("strict source selection");
+        assert_eq!(index.len(), 1);
+        let crate::ingest::LeafHandles::F16(data, shape) = index["target.weight"] else {
+            panic!("selected leaf was not f16");
+        };
+        let values: anybytes::Bytes = reader.get(data).expect("data after pile close");
+        let shape: anybytes::Bytes = reader.get(shape).expect("shape after pile close");
+        assert_eq!(values.view::<[half::f16]>().unwrap()[0].to_f32(), 1.5);
+        assert_eq!(&*shape.view::<[u64]>().unwrap(), &[1]);
+
+        let mut pile = open_test_pile(&file);
+        add_model(
+            &mut pile,
+            &signer,
+            "example/target",
+            "second.weight",
+            3.5,
+            true,
+        );
+        pile.close().unwrap();
+        let snapshot = crate::model_collection::load_model_collection_local_latest(&file.path)
+            .expect("ambiguous native snapshot");
+        let error = match select_f16_keymap_snapshot(
+            snapshot,
+            crate::selection::ModelSelector::Source {
+                source: "example/target",
+                quantization: QUANTIZATION_NATIVE,
+            },
+        ) {
+            Ok(_) => panic!("ambiguous coordinates were accepted"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(error.contains("ambiguous model root"), "{error}");
+    }
+
+    #[test]
+    fn aliased_snapshot_rejects_f32_before_model_construction() {
+        let file = TestPile::new("f32-rejection");
+        let mut pile = open_test_pile(&file);
+        add_model(
+            &mut pile,
+            &SigningKey::from_bytes(&[0xB2; 32]),
+            "example/f32",
+            "f32.weight",
+            4.0,
+            false,
+        );
+        pile.close().unwrap();
+
+        let snapshot = crate::model_collection::load_model_collection_local_latest(&file.path)
+            .expect("native snapshot");
+        let error = match select_f16_keymap_snapshot(
+            snapshot,
+            crate::selection::ModelSelector::Source {
+                source: "example/f32",
+                quantization: QUANTIZATION_NATIVE,
+            },
+        ) {
+            Ok(_) => panic!("f32 leaf was accepted by aliased constructor boundary"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains("tensor \"f32.weight\" has an f32 leaf"),
+            "{error}"
+        );
+    }
 }
