@@ -26,6 +26,8 @@ use anyhow::Context;
 use ed25519_dalek::SigningKey;
 use std::collections::HashMap;
 use std::path::Path;
+#[cfg(feature = "import")]
+use triblespace::core::collection::CollectionCommit;
 use triblespace::prelude::*;
 
 /// Resolve the sorted `*.safetensors` shards in a model directory.
@@ -84,34 +86,32 @@ pub fn persist_safetensors_files_to_pile(
     persist_files_to_pile(files, pile_path, dtype)
 }
 
-/// Import a model directory's safetensors into a SHARED model pile on the `mary`
-/// branch as ONE content-addressed model-ROOT entity — so many models coexist in
-/// one pile, each loadable by `(source [, quantization])` via
-/// [`load_keymap_from_mary_branch`] (or by the root's entity id via
-/// [`load_keymap_from_mary_branch_by_root`]). This is the consolidated-MODEL_PILE
-/// front door (`mary import`): the model becomes a proper addressable entity AT
-/// import, so no separate consolidation step exists — appending another model is
-/// just another import.
+/// Import one model directory into Mary's native append-only model collection.
 ///
-/// `source` is the model's canonical NAME — the HF id it was imported from, or a
-/// `--name` for a local-dir import. The root's id is CONTENT-DERIVED from its
-/// identity `(source, quantization, weight members)`: importing the same
-/// `(source, quantization, weights)` twice yields the SAME root id (dedup), while
-/// a different `quantization` of the same model is a DISTINCT entity. For a
-/// MULTI-shard model, the ONE root composes EVERY shard's tensor members
-/// (order-independent set), and each shard's file name is recorded as NON-core
-/// `model_name` provenance on the root.
+/// This is the library seam behind `mary import`. The caller owns the already
+/// open pile, supplies a durable signing identity, and chooses the eventual
+/// durability boundary. This function never creates, opens, flushes, or closes
+/// storage, and it never creates or advances a Repository branch.
+///
+/// `source` is the model's canonical label — the HF id it was imported from, or
+/// a `--name` for a local-dir import. The root id is content-derived from only
+/// its weight members, so byte-identical weights converge independently of
+/// source container or provenance. For a multi-shard model, the one root
+/// composes every shard's tensor members as an order-independent set; source,
+/// quantization, and shard names are queryable non-core coordinates on it.
 ///
 /// `quantization` tags the weight format ("native" for the faithful import).
-/// Returns the imported root's entity id (the content address).
+/// The return value is the imported root's entity id plus the complete signed
+/// 192-byte [`CollectionCommit`] needed by an exact collection reader.
 #[cfg(feature = "import")]
-pub fn persist_model_to_pile(
+pub fn import_model_to_collection(
+    pile: &mut Pile,
+    signing_key: &SigningKey,
     model_dir: &Path,
-    pile_path: &Path,
     dtype: LeafDtype,
     source: &str,
     quantization: &str,
-) -> anyhow::Result<Id> {
+) -> anyhow::Result<(Id, CollectionCommit)> {
     // Detect the container the directory actually ships (safetensors / gguf /
     // pytorch pickle) and gather its weight files. Every format funnels into the
     // SAME content-addressed member path below, so the model-root id stays the
@@ -133,46 +133,15 @@ pub fn persist_model_to_pile(
         files.len()
     );
 
-    // Pile::open requires the file to exist; create an empty one if needed —
-    // loudly, so a typo'd path to an existing pile is visible instead of
-    // silently persisting into a fresh file somewhere else.
-    if !pile_path.exists() {
-        eprintln!("[persist] pile {pile_path:?} does not exist — creating a NEW empty pile");
-        std::fs::File::create(pile_path)
-            .map_err(|e| anyhow::anyhow!("create pile {pile_path:?}: {e}"))?;
-    }
-    let mut pile =
-        Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open pile {pile_path:?}: {e:?}"))?;
-    // Non-mutating load; NEVER amputate here. A corrupt tail on a weights
-    // pile must fail loud — truncation is an explicit operator decision
-    // (`trible pile amputate`), not a persist side effect.
+    // Validate the caller's observed prefix before writing any imported blob.
+    // A corrupt tail must fail loud: repair remains an explicit operator act.
     pile.refresh().map_err(|e| {
         anyhow::anyhow!(
-            "pile {pile_path:?} failed to load ({e:?}); refusing to auto-truncate — \
+            "model pile failed to load ({e:?}); refusing to auto-truncate — \
              if the tail is a genuinely torn write, amputate explicitly with \
              `trible pile amputate`"
         )
     })?;
-
-    let mut repo = Repository::new(
-        pile,
-        SigningKey::generate(&mut rand::rngs::OsRng),
-        TribleSet::new(),
-    )
-    .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
-    // Reuse the mary branch if it exists (append into an existing pile), else create it.
-    let branch_id = match repo
-        .lookup_branch("mary")
-        .map_err(|e| anyhow::anyhow!("lookup mary: {e:?}"))?
-    {
-        Some(id) => id,
-        None => *repo
-            .create_branch("mary", None)
-            .map_err(|e| anyhow::anyhow!("create mary: {e:?}"))?,
-    };
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull mary: {e:?}"))?;
 
     // Ingest EVERY shard's weight blobs straight into the pile storage (no
     // in-memory carryover), gathering ALL shards' tensor members under ONE root
@@ -189,7 +158,7 @@ pub fn persist_model_to_pile(
                     "[persist] ingesting {name} ({} bytes, safetensors)...",
                     bytes.len()
                 );
-                crate::ingest::ingest_members(&bytes, repo.storage_mut(), dtype, |_| true)
+                crate::ingest::ingest_members(&bytes, pile, dtype, |_| true)
                     .map_err(|e| anyhow::anyhow!("ingest {path:?}: {e}"))?
             }
             crate::formats::WeightFormat::Gguf | crate::formats::WeightFormat::Pickle => {
@@ -199,7 +168,7 @@ pub fn persist_model_to_pile(
                     "[persist] ingesting {name} ({} tensors, {fmt:?})...",
                     tensors.len()
                 );
-                crate::ingest::ingest_tensors(tensors.into_iter(), repo.storage_mut(), dtype)
+                crate::ingest::ingest_tensors(tensors.into_iter(), pile, dtype)
                     .map_err(|e| anyhow::anyhow!("ingest {path:?}: {e}"))?
             }
         };
@@ -207,33 +176,20 @@ pub fn persist_model_to_pile(
         facts += shard_facts;
         provenance.push(name.clone());
     }
-    let root = crate::ingest::build_model_root(
-        repo.storage_mut(),
-        source,
-        quantization,
-        members,
-        facts,
-        &provenance,
-    )
-    .map_err(|e| anyhow::anyhow!("build model root: {e}"))?;
+    let root =
+        crate::ingest::build_model_root(pile, source, quantization, members, facts, &provenance)
+            .map_err(|e| anyhow::anyhow!("build model root: {e}"))?;
     let root_id = root.root().expect("model root id");
-
-    ws.commit(
-        root.into_facts(),
-        &format!("ingest model {source} ({quantization})"),
-    );
-    repo.push(&mut ws)
-        .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-    repo.close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
-    Ok(root_id)
+    let commit = crate::model_collection::publish_model_fragment(pile, signing_key, root)
+        .map_err(|error| anyhow::anyhow!("publish model collection commit: {error}"))?;
+    Ok((root_id, commit))
 }
 
 /// The engine behind [`persist_safetensors_files_to_pile`] (untagged, `main`):
 /// ingest each file's weight blobs straight into `pile_path`'s storage (no
 /// in-memory carryover) and commit ONE model entity PER file on `main`, creating
 /// the pile and branch if absent. (The content-addressed model-ROOT path is
-/// [`persist_model_to_pile`], `mary` branch.)
+/// [`import_model_to_collection`], native model collection.)
 #[cfg(feature = "import")]
 fn persist_files_to_pile(
     files: &[(std::path::PathBuf, String)],
@@ -1242,7 +1198,10 @@ pub const QUANTIZATION_NATIVE: &str = "native";
 /// `quantization="native"`, out of a pile that holds many, and materializes ALL
 /// its members. For a non-native format use
 /// [`load_keymap_from_mary_branch_quantized`]; to address a root directly by its
-/// entity id use [`load_keymap_from_mary_branch_by_root`].
+/// entity id use [`load_keymap_from_mary_branch_by_root`]. This is a retained
+/// legacy Repository reader; new callers should materialize
+/// [`crate::model_collection::load_model_collection_local_latest`] and apply
+/// [`crate::selection::ModelSelector`] directly.
 pub fn load_keymap_from_mary_branch(
     pile_path: &Path,
     source: &str,
@@ -1275,8 +1234,8 @@ pub fn load_keymap_from_mary_branch_quantized(
 /// Load a model's keymap from the `mary` branch by the model-root's ENTITY ID
 /// directly — the content address itself, no `(model_id, quantization)` lookup.
 /// The complement to [`load_keymap_from_mary_branch_quantized`]: the id is what
-/// `persist_model_to_pile` returns, so a caller that recorded it can round-trip
-/// straight back to the exact weights.
+/// the historical branch importer returned, so a caller that recorded it can
+/// round-trip straight back to the exact weights.
 pub fn load_keymap_from_mary_branch_by_root(
     pile_path: &Path,
     root: Id,

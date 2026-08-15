@@ -1,13 +1,161 @@
-//! Non-safetensors import validation: import a pytorch `.bin` (and, if cached, a
-//! GGUF) model through `mary import`'s persist path and assert the tensors load
-//! back with correct shapes and values. Gated on the model being present in the
-//! local HF cache (these are `#[ignore]` by default — run with
-//! `cargo test --features import --test formats_import -- --ignored`), since CI
-//! has no network.
+//! The `mary import` storage contract: a tiny synthetic safetensors model is
+//! published into the native collection and read through both supported
+//! selectors. Optional cached fixtures exercise non-safetensors decoders through
+//! the same collection front door.
 
 #![cfg(feature = "import")]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use ed25519_dalek::SigningKey;
+use mary::selection::ModelSelector;
+use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+use triblespace::core::blob::MemoryBlobStore;
+use triblespace::core::repo::pile::Pile;
+
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct TempFixture {
+    dir: PathBuf,
+}
+
+impl TempFixture {
+    fn new(label: &str) -> Self {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "mary-formats-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        Self { dir }
+    }
+
+    fn path(&self) -> &Path {
+        &self.dir
+    }
+}
+
+impl Drop for TempFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn f32_bytes(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+#[test]
+fn native_import_is_exact_selectable_and_byte_idempotent() {
+    let fixture = TempFixture::new("native-import");
+    let weights = fixture.path().join("weights");
+    std::fs::create_dir(&weights).unwrap();
+    let weights_file = weights.join("model.safetensors");
+
+    let weight = vec![1.0_f32, -2.0, 3.5, 0.25];
+    let bias = vec![0.5_f32, -0.5];
+    let weight_bytes = f32_bytes(&weight);
+    let bias_bytes = f32_bytes(&bias);
+    serialize_to_file(
+        [
+            (
+                "linear.bias",
+                TensorView::new(Dtype::F32, vec![2], &bias_bytes).unwrap(),
+            ),
+            (
+                "linear.weight",
+                TensorView::new(Dtype::F32, vec![2, 2], &weight_bytes).unwrap(),
+            ),
+        ],
+        &None,
+        &weights_file,
+    )
+    .unwrap();
+
+    let pile_path = fixture.path().join("models.pile");
+    std::fs::File::create(&pile_path).unwrap();
+    let signing_key = SigningKey::from_bytes(&[0x51; 32]);
+    let mut pile = Pile::open(&pile_path).unwrap();
+    let first = mary::persist::import_model_to_collection(
+        &mut pile,
+        &signing_key,
+        &weights,
+        mary::ingest::LeafDtype::F32,
+        "fixture/source",
+        "native",
+    )
+    .unwrap();
+    let bytes_after_first = std::fs::metadata(&pile_path).unwrap().len();
+    let repeated = mary::persist::import_model_to_collection(
+        &mut pile,
+        &signing_key,
+        &weights,
+        mary::ingest::LeafDtype::F32,
+        "fixture/source",
+        "native",
+    )
+    .unwrap();
+    let bytes_after_retry = std::fs::metadata(&pile_path).unwrap().len();
+    assert_eq!(repeated, first, "stable signer must reproduce the ticket");
+    assert_eq!(first.1.to_bytes().len(), 192);
+    assert_eq!(
+        bytes_after_retry, bytes_after_first,
+        "an identical retry must append no bytes"
+    );
+    pile.close().unwrap();
+
+    // Construct the exact expected graph through the same format-agnostic
+    // graph primitives, but in independent storage. This checks the front door
+    // adds no branch descriptor, message, or other ambient facts.
+    let mut expected_blobs = MemoryBlobStore::new();
+    let (members, member_facts) = mary::ingest::ingest_tensors(
+        vec![
+            ("linear.bias".to_owned(), bias.clone(), vec![2]),
+            ("linear.weight".to_owned(), weight.clone(), vec![2, 2]),
+        ]
+        .into_iter(),
+        &mut expected_blobs,
+        mary::ingest::LeafDtype::F32,
+    )
+    .unwrap();
+    let expected = mary::ingest::build_model_root(
+        &mut expected_blobs,
+        "fixture/source",
+        "native",
+        members,
+        member_facts,
+        &["model.safetensors".to_owned()],
+    )
+    .unwrap();
+    assert_eq!(expected.root(), Some(first.0));
+
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile_path).unwrap();
+    assert_eq!(snapshot.commits(), &[first.1]);
+    assert_eq!(snapshot.facts(), expected.facts());
+
+    let by_source = mary::selection::load_keymap_from_graph(
+        snapshot.facts(),
+        snapshot.reader(),
+        ModelSelector::Source {
+            source: "fixture/source",
+            quantization: "native",
+        },
+    )
+    .unwrap();
+    let by_root = mary::selection::load_keymap_from_graph(
+        snapshot.facts(),
+        snapshot.reader(),
+        ModelSelector::Root(first.0),
+    )
+    .unwrap();
+    assert_eq!(by_root, by_source);
+    assert_eq!(by_source["linear.bias"], (bias, vec![2]));
+    assert_eq!(by_source["linear.weight"], (weight, vec![2, 2]));
+}
 
 /// Locate a cached HF snapshot dir for `id`, or `None` if not downloaded.
 fn hf_snapshot(id: &str) -> Option<PathBuf> {
@@ -47,20 +195,33 @@ fn pytorch_bin_import_roundtrip() {
     );
     assert_eq!(files.len(), 1);
 
-    let tmp = std::env::temp_dir().join(format!("mary_pickle_test_{}.pile", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
-    let root = mary::persist::persist_model_to_pile(
+    let fixture = TempFixture::new("pickle-import");
+    let tmp = fixture.path().join("models.pile");
+    std::fs::File::create(&tmp).unwrap();
+    let mut pile = Pile::open(&tmp).unwrap();
+    let signing_key = SigningKey::from_bytes(&[0x52; 32]);
+    let (root, _commit) = mary::persist::import_model_to_collection(
+        &mut pile,
+        &signing_key,
         &dir,
-        &tmp,
         mary::ingest::LeafDtype::F32,
         "mistral-tiny",
         "native",
     )
     .unwrap();
+    pile.close().unwrap();
     eprintln!("imported root {root:X}");
 
-    let km = mary::persist::load_keymap_from_mary_branch_quantized(&tmp, "mistral-tiny", "native")
-        .unwrap();
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&tmp).unwrap();
+    let km = mary::selection::load_keymap_from_graph(
+        snapshot.facts(),
+        snapshot.reader(),
+        ModelSelector::Source {
+            source: "mistral-tiny",
+            quantization: "native",
+        },
+    )
+    .unwrap();
     // The tiny Mistral has these tensors with these exact shapes.
     let (embed, eshape) = &km["model.embed_tokens.weight"];
     assert_eq!(eshape, &[32000, 32], "embed shape");
@@ -77,6 +238,4 @@ fn pytorch_bin_import_roundtrip() {
     // Finite, non-degenerate weights everywhere.
     assert!(embed.iter().all(|v| v.is_finite()));
     assert!(embed.iter().any(|&v| v != 0.0));
-
-    let _ = std::fs::remove_file(&tmp);
 }

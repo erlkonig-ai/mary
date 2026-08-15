@@ -1,18 +1,18 @@
 //! `mary` — the command-line front door to mary.
 //!
-//! mary stores neural-network weights as content-addressed graphs in a
-//! TribleSpace pile: a tensor is a self-describing leaf, a module is an entity,
-//! composition is role-edges. Every mary runtime loads weights from such a
-//! pile, never from safetensors. This binary is how weights get *into* one.
+//! mary stores neural-network weights as content-addressed graphs in one native
+//! append-only TribleSpace collection: a tensor is a self-describing leaf, a
+//! module is an entity, composition is role-edges. Every mary runtime loads
+//! weights from such a pile, never from safetensors. This binary is how weights
+//! get *into* one.
 //!
 //! Bootstrap a model in one line:
 //!
 //! ```text
-//! # many models in one shared MODEL_PILE — each a content-addressed root on the
-//! # `mary` branch, its id the pure hash of its weights:
-//! mary import openai/clip-vit-base-patch32 --pile models.pile
-//! mary import HuggingFaceTB/SmolLM2-135M    --pile models.pile --dtype f16
-//! mary import ./my-model-dir --pile models.pile --name my_model   # local dir
+//! # many models in one shared MODEL_PILE — each a signed collection member:
+//! mary import openai/clip-vit-base-patch32 --pile models.pile --key model.key
+//! mary import HuggingFaceTB/SmolLM2-135M --pile models.pile --key model.key --dtype f16
+//! mary import ./my-model-dir --pile models.pile --key model.key --name my_model
 //! ```
 //!
 //! The source is either a HuggingFace model id (auto-downloaded from the hub if
@@ -23,17 +23,21 @@
 //! content-addressed member path, so the root id is the pure hash of the tensor
 //! set regardless of source format (a model imported from GGUF/f16 or from
 //! safetensors with the same weights resolves to the same root). The model
-//! becomes a content-addressed ROOT entity on the pile's `mary` branch — its id
-//! the pure content-address of its weight set — so many models coexist in one
-//! pile, each loaded back by its `source` label (the hf-id / `--name`) or by its
-//! entity id. Re-importing the same weights dedups to the same root; no separate
-//! consolidation step. The resulting pile is self-contained: no weight files
+//! becomes a content-addressed ROOT entity in Mary's model collection, so many
+//! models coexist in one pile, each loaded back by its `source` label (the hf-id
+//! / `--name`) or by its entity id. Re-importing with the same signer is
+//! byte-idempotent. The resulting pile is self-contained: no weight files are
 //! needed at load time.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use mary::ingest::LeafDtype;
+use mary::selection::ModelSelector;
+use triblespace::core::repo::pile::Pile;
+use triblespace::core::signing_key_file;
 use triblespace::prelude::Id;
 
 #[derive(Parser)]
@@ -52,9 +56,9 @@ enum Cmd {
     /// Import a model's weights into a pile (the durable weight store). Accepts
     /// safetensors, GGUF (.gguf), or pytorch pickle (pytorch_model*.bin / .pth).
     Import(ImportArgs),
-    /// Load ONE model from a pile's `mary` branch — by `--source` (+ optional
-    /// `--quantization`) or by `--root` entity id — and print its tensor count +
-    /// a sample. A round-trip check of the content-addressed store.
+    /// Load ONE model from the native model collection — by `--source` (+
+    /// optional `--quantization`) or by `--root` entity id — and print its
+    /// tensor count + a sample. A round-trip check of the content-addressed store.
     Keys(KeysArgs),
 }
 
@@ -66,15 +70,19 @@ struct ImportArgs {
     /// `state_dict` (`pytorch_model*.bin` / `.pth`).
     source: String,
     /// Output pile path. Created if absent; a model added to an existing pile
-    /// is appended on the `mary` branch (content-addressing dedups shared blobs).
+    /// is appended as a native collection commit (content addressing dedups).
     #[arg(long)]
     pile: PathBuf,
+    /// Existing private signing-key file (strict 64-hex, owner-private mode).
+    /// Import never generates or infers an author identity.
+    #[arg(long)]
+    key: PathBuf,
     /// Leaf storage dtype. `f32` is lossless (the faithful original, whatever
     /// width the source used); `f16` halves the pile for 16-bit-native weights.
     #[arg(long, value_enum, default_value_t = Dtype::F32)]
     dtype: Dtype,
-    /// The model's canonical `source` LABEL on the `mary` branch (a queryable
-    /// non-core name; the root id is the pure content-address of the weights).
+    /// The model's canonical `source` label in the model collection (a
+    /// queryable non-core name; the root id addresses only the weights).
     /// Defaults to the hf-id `source` argument; REQUIRED for a local directory,
     /// which has no hf-id to label it with.
     #[arg(long)]
@@ -90,7 +98,7 @@ struct KeysArgs {
     /// The consolidated model pile to read from.
     #[arg(long)]
     pile: PathBuf,
-    /// The `source` label to load from the pile's `mary` branch (the hf-id or the
+    /// The `source` label to load from the native collection (the hf-id or the
     /// `--name` used at import). Mutually exclusive with `--root`.
     #[arg(long, conflicts_with = "root")]
     source: Option<String>,
@@ -127,30 +135,31 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn keys(a: KeysArgs) -> anyhow::Result<()> {
-    let (km, label) = match (&a.source, &a.root) {
-        (Some(source), None) => {
-            let km = mary::persist::load_keymap_from_mary_branch_quantized(
-                &a.pile,
+    // One observed local collection prefix supplies both the facts and reader;
+    // selector policy stays explicit and no Repository branch or fallback
+    // storage participates.
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&a.pile)?;
+    let (selector, label) = match (&a.source, &a.root) {
+        (Some(source), None) => (
+            ModelSelector::Source {
                 source,
-                &a.quantization,
-            )?;
-            (
-                km,
-                format!("source={source} quantization={}", a.quantization),
-            )
-        }
+                quantization: &a.quantization,
+            },
+            format!("source={source} quantization={}", a.quantization),
+        ),
         (None, Some(hex)) => {
             let root = Id::from_hex(hex)
                 .ok_or_else(|| anyhow::anyhow!("--root {hex:?} is not a valid 32-hex entity id"))?;
-            let km = mary::persist::load_keymap_from_mary_branch_by_root(&a.pile, root)?;
-            (km, format!("root={hex}"))
+            (ModelSelector::Root(root), format!("root={hex}"))
         }
         _ => anyhow::bail!("mary keys: pass exactly one of --source or --root"),
     };
+    let km =
+        mary::selection::load_keymap_from_graph(snapshot.facts(), snapshot.reader(), selector)?;
     let mut names: Vec<&String> = km.keys().collect();
     names.sort();
     eprintln!(
-        "mary keys: {label} on the mary branch of {} -> {} tensors",
+        "mary keys: {label} in the model collection of {} -> {} tensors",
         a.pile.display(),
         km.len()
     );
@@ -182,23 +191,74 @@ fn import(a: ImportArgs) -> anyhow::Result<()> {
         }
     };
     eprintln!(
-        "mary import: {} -> {} ({dt} leaves, source={label} quantization={} on the mary branch)",
+        "mary import: {} -> {} ({dt} leaves, source={label} quantization={} in the native model collection)",
         dir.display(),
         a.pile.display(),
         a.quantization,
     );
-    let root = mary::persist::persist_model_to_pile(
+    let signing_key = signing_key_file::load_existing(&a.key)
+        .with_context(|| format!("load existing signing key {:?}", a.key))?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&a.pile)
+    {
+        Ok(_) => eprintln!("mary import: created new empty pile {:?}", a.pile),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).with_context(|| format!("create model pile {:?}", a.pile)),
+    }
+    let mut pile = Pile::open(&a.pile).with_context(|| format!("open model pile {:?}", a.pile))?;
+    let imported = mary::persist::import_model_to_collection(
+        &mut pile,
+        &signing_key,
         &dir,
-        &a.pile,
         a.dtype.into(),
         &label,
         &a.quantization,
-    )?;
-    eprintln!(
-        "mary import: done — model root {root:X} in pile {}",
-        a.pile.display()
     );
+    let close = pile.close();
+    let (root, commit) = match (imported, close) {
+        (Ok(imported), Ok(())) => imported,
+        (Ok(_), Err(error)) => return Err(anyhow::anyhow!("close model pile: {error}")),
+        (Err(error), Ok(())) => return Err(error),
+        (Err(error), Err(close_error)) => {
+            return Err(error.context(format!(
+                "import also failed to close the pile: {close_error}"
+            )))
+        }
+    };
+    eprintln!(
+        "mary import: done — model root {root:X}, native commit {} in pile {}",
+        commit.id(),
+        a.pile.display(),
+    );
+    println!("{}", lowercase_hex(&commit.to_bytes()));
     Ok(())
+}
+
+fn lowercase_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut output, "{byte:02x}").expect("writing to String is infallible");
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ticket_hex_is_exact_and_lowercase() {
+        let bytes: Vec<u8> = (0..192).map(|index| index as u8).collect();
+        let encoded = lowercase_hex(&bytes);
+        assert_eq!(encoded.len(), 384);
+        assert!(encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        assert_eq!(&encoded[..8], "00010203");
+        assert_eq!(&encoded[encoded.len() - 8..], "bcbdbebf");
+    }
 }
 
 /// Resolve the import source to a directory of importable weight files. A local
