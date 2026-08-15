@@ -8,7 +8,7 @@
 //!
 //! Prereqs (disk-gated; SKIPS cleanly if missing):
 //!   1. python3 scripts/nomic_mm7b_vision_dump.py <SCRATCH>/vision_merged/vision_tower.safetensors
-//!   2. cargo run --release --features gemma --bin gemma_persist -- <SCRATCH>/vision_merged <SCRATCH>/nomic_mm7b_vision.pile
+//!   2. cargo run --release --features import,hub --bin mary -- import <SCRATCH>/vision_merged --pile <SCRATCH>/nomic_mm7b_vision.pile --key <SCRATCH>/model.key --name nomic-ai/nomic-embed-multimodal-7b --dtype f16
 //!   3. NOMIC_MM7B_VISION_PILE=<SCRATCH>/nomic_mm7b_vision.pile cargo test --release --features gemma --test nomic_mm7b_vision_parity -- --nocapture
 
 use burn::prelude::*;
@@ -97,8 +97,15 @@ fn vision_tower_parity() {
         return;
     }
     let device = NdArrayDevice::default();
-    let map =
-        mary::persist::load_keymap_from_pile(Path::new(&pile_path)).expect("load vision pile");
+    let snapshot =
+        mary::model_collection::load_model_collection_local_latest(Path::new(&pile_path))
+            .expect("load native model collection snapshot");
+    let map = mary::selection::load_keymap_from_graph(
+        snapshot.facts(),
+        snapshot.reader(),
+        mary::selection::ModelSelector::Only,
+    )
+    .expect("select and materialize the only vision model root");
     eprintln!(
         "[vision-parity] keymap has {} tensors; building tower ...",
         map.len()
@@ -142,7 +149,15 @@ fn vision_tower_multiwindow_parity() {
         return;
     }
     let device = NdArrayDevice::default();
-    let map = mary::persist::load_keymap_from_pile(Path::new(&pile_path)).expect("load pile");
+    let snapshot =
+        mary::model_collection::load_model_collection_local_latest(Path::new(&pile_path))
+            .expect("load native model collection snapshot");
+    let map = mary::selection::load_keymap_from_graph(
+        snapshot.facts(),
+        snapshot.reader(),
+        mary::selection::ModelSelector::Only,
+    )
+    .expect("select and materialize the only vision model root");
     let w = KeymapW { map, device };
     let model = VisionTransformer::<B>::load(&w, &vision_cfg(), &device);
 
@@ -168,6 +183,8 @@ fn vision_tower_multiwindow_parity() {
         .zip(&want)
         .map(|(x, y)| (x - y).abs())
         .fold(0.0, f32::max);
-    eprintln!("[vision-parity] MULTI-WINDOW merger_out (25 tokens): cosine={cos:.7} max_abs={ma:e}  (bar 0.999)");
+    eprintln!(
+        "[vision-parity] MULTI-WINDOW merger_out (25 tokens): cosine={cos:.7} max_abs={ma:e}  (bar 0.999)"
+    );
     assert!(cos >= 0.999, "mw vision merger_out cosine={cos:.7} < 0.999");
 }

@@ -513,9 +513,16 @@ fn main() {
     let tokenizer_path = find_hf_file(&model_id, "tokenizer.json");
     let tokenizer = Tokenizer::from_file(&tokenizer_path).unwrap();
     eprintln!("Loading hearing stack from pile {pile}...");
-    let (model, _vision, tower, embedder) =
-        load_gemma4_hearing_from_pile::<B>(Path::new(&pile), config, &device)
-            .unwrap_or_else(|e| panic!("pile load: {e}"));
+    let (model, _vision, tower, embedder) = load_gemma4_hearing_from_pile::<B>(
+        Path::new(&pile),
+        mary::selection::ModelSelector::Source {
+            source: &model_id,
+            quantization: mary::persist::QUANTIZATION_NATIVE,
+        },
+        config,
+        &device,
+    )
+    .unwrap_or_else(|e| panic!("pile load: {e}"));
     let hearing = Hearing::new(model, tower, embedder, tokenizer, device);
     eprintln!("Loaded. Logging utterances to {log_path}");
 

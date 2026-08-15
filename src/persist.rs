@@ -17,9 +17,9 @@
 //! [`crate::ingest::load_keymap`]. The f32 blobs store weights exactly, so the
 //! round-trip is lossless.
 
-use crate::ingest::load_keymap;
 #[cfg(feature = "import")]
 use crate::ingest::LeafDtype;
+use crate::ingest::load_keymap;
 #[cfg(feature = "import")]
 use crate::nn::weight_loader::read_safetensors_file;
 use anyhow::Context;
@@ -978,7 +978,7 @@ pub fn load_qwen3tts_talker_folded(
     use crate::models::qwen3tts::layers::{
         Attention, DecoderLayer, Embedding, Linear, RmsNorm, RopeTable,
     };
-    use crate::models::qwen3tts::talker::{talker_attn_config, Talker};
+    use crate::models::qwen3tts::talker::{Talker, talker_attn_config};
     use crate::nn::backend::BHalf;
     use burn::prelude::*;
     use triblespace::prelude::BlobStoreGet;
@@ -1690,7 +1690,9 @@ pub fn ingest_hf_tokenizer(
     repo.close()
         .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
 
-    let after = std::fs::metadata(pile_path).map(|m| m.len()).unwrap_or(before);
+    let after = std::fs::metadata(pile_path)
+        .map(|m| m.len())
+        .unwrap_or(before);
     Ok(TokenizerIngest {
         facts: n,
         puts,
@@ -1771,10 +1773,10 @@ pub fn ingest_json_documents(
         if !path.exists() {
             continue;
         }
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| anyhow::anyhow!("read {path:?}: {e}"))?;
-        let v: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("parse {path:?}: {e}"))?;
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("read {path:?}: {e}"))?;
+        let v: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("parse {path:?}: {e}"))?;
         pending.push((name.to_string(), v));
     }
     for name in text_docs {
@@ -1782,8 +1784,8 @@ pub fn ingest_json_documents(
         if !path.exists() {
             continue;
         }
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| anyhow::anyhow!("read {path:?}: {e}"))?;
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("read {path:?}: {e}"))?;
         pending.push((name.to_string(), serde_json::Value::String(text)));
     }
     anyhow::ensure!(!pending.is_empty(), "no sidecars found in {dir:?}");
@@ -1843,7 +1845,8 @@ pub fn ingest_json_documents(
     let mut change = TribleSet::new();
     for (name, v) in &pending {
         if let Err(e) = crate::jsonfacts::save_document(name, v, repo.storage_mut(), &mut change) {
-            repo.close().map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+            repo.close()
+                .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
             anyhow::bail!("{name}: {e}");
         }
     }
@@ -1857,35 +1860,67 @@ pub fn ingest_json_documents(
     Ok(n)
 }
 
-/// Stream a Gemma 4 model directly from a pile: index the blob handles (cheap),
-/// then load each tensor on demand and drop it after upload — peak CPU is one
-/// tensor, NOT the whole f32 keymap. This is the path that scales weights-as-
-/// tribles to the dense 31B (the materialized `load_keymap_from_pile` would OOM).
-/// The pile reader is held alive across the whole build.
+#[cfg(feature = "gemma")]
+fn select_native_model_index(
+    pile_path: &Path,
+    selector: crate::selection::ModelSelector<'_>,
+) -> anyhow::Result<crate::selection::SelectedModelIndex<triblespace::core::repo::pile::PileReader>>
+{
+    let snapshot = crate::model_collection::load_model_collection_local_latest(pile_path)
+        .with_context(|| format!("load local-latest native model snapshot from {pile_path:?}"))?;
+    crate::selection::SelectedModelIndex::from_snapshot(snapshot, selector)
+        .with_context(|| format!("select one native model root in {pile_path:?}"))
+}
+
+/// Stream a Gemma 4 model from one already-selected native model index: load
+/// each tensor on demand and drop it after upload, so peak CPU is one tensor
+/// rather than the whole f32 keymap. The index owns its blob reader across the
+/// complete build.
+#[cfg(feature = "gemma")]
+pub fn load_gemma4_streaming_from_index<
+    B: burn::prelude::Backend,
+    R: triblespace::prelude::BlobStoreGet,
+>(
+    selected: crate::selection::SelectedModelIndex<R>,
+    config: crate::models::gemma::gemma4::config::Gemma4Config,
+    device: &B::Device,
+) -> (
+    crate::models::gemma::gemma4::decoder::Gemma4Model<B>,
+    Option<crate::models::gemma::gemma4::vision::Gemma4VisionEncoder<B>>,
+) {
+    let (_, index, reader) = selected.into_parts();
+    crate::models::gemma::gemma4::weights::load_gemma4_streaming::<B>(
+        config, index, &reader, device,
+    )
+}
+
+/// Local-latest path convenience for [`load_gemma4_streaming_from_index`].
+/// The caller selects exactly one model root from the native collection.
 #[cfg(feature = "gemma")]
 pub fn load_gemma4_streaming_from_pile<B: burn::prelude::Backend>(
     pile_path: &Path,
+    selector: crate::selection::ModelSelector<'_>,
     config: crate::models::gemma::gemma4::config::Gemma4Config,
     device: &B::Device,
 ) -> anyhow::Result<(
     crate::models::gemma::gemma4::decoder::Gemma4Model<B>,
     Option<crate::models::gemma::gemma4::vision::Gemma4VisionEncoder<B>>,
 )> {
-    let (index, reader) = pile_weight_index(pile_path)?;
-    Ok(
-        crate::models::gemma::gemma4::weights::load_gemma4_streaming::<B>(
-            config, index, &reader, device,
-        ),
-    )
+    Ok(load_gemma4_streaming_from_index(
+        select_native_model_index(pile_path, selector)?,
+        config,
+        device,
+    ))
 }
 
-/// The full HEARING stack from ONE pile open: text decoder (+vision when the
-/// checkpoint has one) AND the audio tower + multimodal embedder. This is
-/// `gemma_hear`'s pile seam — audio inference without any safetensors on the
-/// load path, matching the text-only `load_gemma4_streaming_from_pile`.
+/// The full HEARING stack from one selected native model index: text decoder
+/// (+vision when present), audio tower, and multimodal embedder.
 #[cfg(feature = "gemma")]
-pub fn load_gemma4_hearing_from_pile<B: burn::prelude::Backend>(
-    pile_path: &Path,
+pub fn load_gemma4_hearing_from_index<
+    B: burn::prelude::Backend,
+    R: triblespace::prelude::BlobStoreGet,
+>(
+    selected: crate::selection::SelectedModelIndex<R>,
     config: crate::models::gemma::gemma4::config::Gemma4Config,
     device: &B::Device,
 ) -> anyhow::Result<(
@@ -1897,7 +1932,7 @@ pub fn load_gemma4_hearing_from_pile<B: burn::prelude::Backend>(
     let audio_cfg = config.audio_config.clone().ok_or_else(|| {
         anyhow::anyhow!("config has no audio_config — this checkpoint has no stt")
     })?;
-    let (index, reader) = pile_weight_index(pile_path)?;
+    let (_, index, reader) = selected.into_parts();
     let fetch = |name: &str| {
         index
             .get(name)
@@ -1919,20 +1954,42 @@ pub fn load_gemma4_hearing_from_pile<B: burn::prelude::Backend>(
     Ok((model, vision, tower, embedder))
 }
 
-/// JUST the stt from a pile: audio tower + multimodal embedder, no decoder.
-/// Cheap relative to the full model (~0.75B of the E4B's ~8B parameters) —
-/// the parity gate uses this to score the pile-loaded audio path against the
-/// HF goldens without streaming in the text stack.
+/// Local-latest path convenience for [`load_gemma4_hearing_from_index`]. The
+/// caller selects exactly one model root from the native collection.
 #[cfg(feature = "gemma")]
-pub fn load_gemma4_audio_from_pile<B: burn::prelude::Backend>(
+pub fn load_gemma4_hearing_from_pile<B: burn::prelude::Backend>(
     pile_path: &Path,
-    audio_cfg: crate::models::gemma::gemma4::config::Gemma4AudioConfig,
+    selector: crate::selection::ModelSelector<'_>,
+    config: crate::models::gemma::gemma4::config::Gemma4Config,
     device: &B::Device,
 ) -> anyhow::Result<(
+    crate::models::gemma::gemma4::decoder::Gemma4Model<B>,
+    Option<crate::models::gemma::gemma4::vision::Gemma4VisionEncoder<B>>,
     crate::models::gemma::gemma4::audio::AudioModel<B>,
     crate::models::gemma::gemma4::audio::AudioEmbedder<B>,
 )> {
-    let (index, reader) = pile_weight_index(pile_path)?;
+    load_gemma4_hearing_from_index(
+        select_native_model_index(pile_path, selector)?,
+        config,
+        device,
+    )
+}
+
+/// Just the STT stack from one selected native model index: audio tower plus
+/// multimodal embedder, without the decoder.
+#[cfg(feature = "gemma")]
+pub fn load_gemma4_audio_from_index<
+    B: burn::prelude::Backend,
+    R: triblespace::prelude::BlobStoreGet,
+>(
+    selected: crate::selection::SelectedModelIndex<R>,
+    audio_cfg: crate::models::gemma::gemma4::config::Gemma4AudioConfig,
+    device: &B::Device,
+) -> (
+    crate::models::gemma::gemma4::audio::AudioModel<B>,
+    crate::models::gemma::gemma4::audio::AudioEmbedder<B>,
+) {
+    let (_, index, reader) = selected.into_parts();
     let fetch = |name: &str| {
         index
             .get(name)
@@ -1948,94 +2005,44 @@ pub fn load_gemma4_audio_from_pile<B: burn::prelude::Backend>(
         audio_cfg.rms_norm_eps,
         device,
     );
-    Ok((tower, embedder))
+    (tower, embedder)
 }
 
-/// Open a pile, resolve `main`, and index every persisted model tensor by
-/// exact name (cheap: two ~32-byte handles per tensor, no weight data read).
-/// The returned blob reader is standalone — it stays valid after the repo is
-/// closed, so callers stream leaves through it on demand.
+/// Local-latest path convenience for [`load_gemma4_audio_from_index`]. The
+/// caller selects exactly one model root from the native collection.
 #[cfg(feature = "gemma")]
-fn pile_weight_index(
+pub fn load_gemma4_audio_from_pile<B: burn::prelude::Backend>(
     pile_path: &Path,
+    selector: crate::selection::ModelSelector<'_>,
+    audio_cfg: crate::models::gemma::gemma4::config::Gemma4AudioConfig,
+    device: &B::Device,
 ) -> anyhow::Result<(
-    HashMap<String, crate::ingest::LeafHandles>,
-    triblespace::core::repo::pile::PileReader,
+    crate::models::gemma::gemma4::audio::AudioModel<B>,
+    crate::models::gemma::gemma4::audio::AudioEmbedder<B>,
 )> {
-    let mut pile =
-        Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open pile {pile_path:?}: {e:?}"))?;
-    // Read path: non-mutating load, NEVER amputate. A corrupt tail fails
-    // loud; truncation is an explicit operator decision (`trible pile
-    // amputate`), never a side effect of loading weights.
-    pile.refresh().map_err(|e| {
-        anyhow::anyhow!(
-            "pile {pile_path:?} failed to load ({e:?}); refusing to auto-truncate on a \
-             read path — if the tail is a genuinely torn write, amputate explicitly \
-             with `trible pile amputate`"
-        )
-    })?;
-    let mut repo = Repository::new(
-        pile,
-        SigningKey::generate(&mut rand::rngs::OsRng),
-        TribleSet::new(),
-    )
-    .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
-    let branch_id = repo
-        .lookup_branch("main")
-        .map_err(|e| anyhow::anyhow!("lookup main: {e:?}"))?
-        .ok_or_else(|| anyhow::anyhow!("no 'main' branch in pile {pile_path:?}"))?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull main: {e:?}"))?;
-    let head = ws
-        .head()
-        .ok_or_else(|| anyhow::anyhow!("'main' has no commits"))?;
-    let checkout = ws
-        .checkout(ancestors(head))
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let tribles: TribleSet = checkout.facts().clone();
-    let reader = repo
-        .storage_mut()
-        .reader()
-        .map_err(|e| anyhow::anyhow!("pile reader: {e:?}"))?;
-
-    let model_ids: Vec<Id> = find!(
-        (m: Id, n: Inline<inlineencodings::Handle<blobencodings::LongString>>),
-        pattern!(&tribles, [{ ?m @ crate::format::attrs::model_name: ?n }])
-    )
-    .map(|(m, _n)| m)
-    .collect();
-    if model_ids.is_empty() {
-        anyhow::bail!("no model entity (attrs::model_name) found in pile");
-    }
-
-    // Cheap: union the handle-indices across shards (no f32 data read here).
-    let mut index = HashMap::new();
-    for id in model_ids {
-        index.extend(crate::ingest::index_keymap(&tribles, &reader, id));
-    }
-    if index.is_empty() {
-        anyhow::bail!("empty model index from pile");
-    }
-
-    repo.close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
-    Ok((index, reader))
+    Ok(load_gemma4_audio_from_index(
+        select_native_model_index(pile_path, selector)?,
+        audio_cfg,
+        device,
+    ))
 }
 
-/// Load a Gemma 4 model from a pile with ZERO-COPY weights: each tensor's mmap'd
-/// f16 blob is aliased straight onto the Metal GPU — no copy, no f32
-/// materialization. Each weight's GPU buffer carries the pile mmap alive (the
-/// `register_external_aliased` keepalive), so the pile/reader are dropped after
-/// the build and the mapping persists for the model's life. Metal / `BHalf` only.
+/// Load a Gemma 4 model from one selected native model index with zero-copy
+/// weights. Each mmap-backed f16 blob is aliased onto Metal, and each GPU buffer
+/// retains its own mmap keepalive after the selected index is consumed.
+///
+/// Unlike the streaming loaders, this accepts the concrete
+/// [`PileReader`](triblespace::core::repo::pile::PileReader) capability: an
+/// arbitrary [`BlobStoreGet`] may return owned bytes that cannot be registered
+/// as an external Metal buffer.
 #[cfg(all(feature = "gemma", target_os = "macos"))]
-pub fn load_gemma4_aliased_from_pile(
-    pile_path: &Path,
+pub fn load_gemma4_aliased_from_index(
+    selected: crate::selection::SelectedModelIndex<triblespace::core::repo::pile::PileReader>,
     config: crate::models::gemma::gemma4::config::Gemma4Config,
     device: burn::backend::wgpu::WgpuDevice,
 ) -> anyhow::Result<crate::models::gemma::gemma4::decoder::Gemma4Model<crate::nn::backend::BHalf>> {
     use crate::ingest::LeafHandles;
-    use crate::models::gemma::gemma4::weights::{load_gemma4_from_source, WeightCtx};
+    use crate::models::gemma::gemma4::weights::{WeightCtx, load_gemma4_from_source};
     use crate::nn::backend::BHalf;
     use burn::backend::wgpu::{CubeTensor, WgpuDevice, WgpuRuntime};
     use burn::tensor::{DType, Tensor, TensorPrimitive};
@@ -2044,56 +2051,8 @@ pub fn load_gemma4_aliased_from_pile(
     use std::sync::Arc;
     const PAGE: u64 = 16384;
 
-    let mut pile =
-        Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open pile {pile_path:?}: {e:?}"))?;
-    // Read path: non-mutating load, NEVER amputate. A corrupt tail fails
-    // loud; truncation is an explicit operator decision (`trible pile
-    // amputate`), never a side effect of loading weights.
-    pile.refresh().map_err(|e| {
-        anyhow::anyhow!(
-            "pile {pile_path:?} failed to load ({e:?}); refusing to auto-truncate on a \
-             read path — if the tail is a genuinely torn write, amputate explicitly \
-             with `trible pile amputate`"
-        )
-    })?;
-    let mut repo = Repository::new(
-        pile,
-        SigningKey::generate(&mut rand::rngs::OsRng),
-        TribleSet::new(),
-    )
-    .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
-    let branch_id = repo
-        .lookup_branch("main")
-        .map_err(|e| anyhow::anyhow!("lookup main: {e:?}"))?
-        .ok_or_else(|| anyhow::anyhow!("no 'main' branch in pile {pile_path:?}"))?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull main: {e:?}"))?;
-    let head = ws
-        .head()
-        .ok_or_else(|| anyhow::anyhow!("'main' has no commits"))?;
-    let tribles: TribleSet = ws
-        .checkout(ancestors(head))
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
-        .facts()
-        .clone();
-    let reader = repo
-        .storage_mut()
-        .reader()
-        .map_err(|e| anyhow::anyhow!("pile reader: {e:?}"))?;
-    let model_ids: Vec<Id> = find!(
-        (m: Id, n: Inline<inlineencodings::Handle<blobencodings::LongString>>),
-        pattern!(&tribles, [{ ?m @ crate::format::attrs::model_name: ?n }])
-    )
-    .map(|(m, _n)| m)
-    .collect();
-    let mut index = HashMap::new();
-    for id in model_ids {
-        index.extend(crate::ingest::index_keymap(&tribles, &reader, id));
-    }
-    if index.is_empty() {
-        anyhow::bail!("empty model index from pile");
-    }
+    require_f16_model_index(&selected)?;
+    let (_, index, reader) = selected.into_parts();
 
     let client = WgpuRuntime::client(&device);
     let ctx = WeightCtx::<BHalf> {
@@ -2114,7 +2073,7 @@ pub fn load_gemma4_aliased_from_pile(
             let blob_ptr = bytes.as_ptr() as u64;
             let nbytes = bytes.len() as u64;
             let n = (nbytes / 2) as usize; // f16 element count
-                                           // The owner downcast = capability check (mmap?) + region bounds + keepalive.
+            // The owner downcast = capability check (mmap?) + region bounds + keepalive.
             let mmap = bytes.downcast_to_owner::<MmapRaw>().ok()?;
             let region_end = mmap.as_ptr() as u64 + mmap.len() as u64;
             let page_start = blob_ptr & !(PAGE - 1);
@@ -2148,10 +2107,24 @@ pub fn load_gemma4_aliased_from_pile(
         raw: None,
     };
     let (model, _vision) = load_gemma4_from_source::<BHalf>(config, &ctx, &device);
-    drop(ctx); // release the reader borrow before closing the pile
-    repo.close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+    drop(ctx);
     Ok(model)
+}
+
+/// Local-latest path convenience for [`load_gemma4_aliased_from_index`]. The
+/// caller selects exactly one native f16 model root from the collection.
+#[cfg(all(feature = "gemma", target_os = "macos"))]
+pub fn load_gemma4_aliased_from_pile(
+    pile_path: &Path,
+    selector: crate::selection::ModelSelector<'_>,
+    config: crate::models::gemma::gemma4::config::Gemma4Config,
+    device: burn::backend::wgpu::WgpuDevice,
+) -> anyhow::Result<crate::models::gemma::gemma4::decoder::Gemma4Model<crate::nn::backend::BHalf>> {
+    load_gemma4_aliased_from_index(
+        select_native_model_index(pile_path, selector)?,
+        config,
+        device,
+    )
 }
 
 /// Alias ONE f16 tensor leaf's mmap'd pile blob straight onto the Metal GPU —
@@ -2189,7 +2162,7 @@ fn alias_f16_leaf<R: triblespace::prelude::BlobStoreGet>(
     let blob_ptr = bytes.as_ptr() as u64;
     let nbytes = bytes.len() as u64;
     let n = (nbytes / 2) as usize; // f16 element count
-                                   // The owner downcast = capability check (mmap?) + region bounds + keepalive.
+    // The owner downcast = capability check (mmap?) + region bounds + keepalive.
     let mmap = bytes
         .downcast_to_owner::<MmapRaw>()
         .expect("aliased path requires an mmap-backed pile blob");
@@ -2352,7 +2325,7 @@ pub fn load_nomic_mm7b_aliased_from_snapshot(
 }
 
 #[cfg(all(test, feature = "gemma", target_os = "macos"))]
-mod native_nomic_snapshot_tests {
+mod native_model_snapshot_tests {
     use super::*;
     use crate::format::attrs;
     use std::fs::OpenOptions;
@@ -2375,7 +2348,7 @@ mod native_nomic_snapshot_tests {
                 .expect("system clock after Unix epoch")
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "mary-native-nomic-{label}-{}-{nanos}-{ordinal}.pile",
+                "mary-native-model-{label}-{}-{nanos}-{ordinal}.pile",
                 std::process::id()
             ));
             OpenOptions::new()
@@ -2458,6 +2431,13 @@ mod native_nomic_snapshot_tests {
         );
         pile.close().unwrap();
 
+        let error =
+            match select_native_model_index(&file.path, crate::selection::ModelSelector::Only) {
+                Ok(_) => panic!("the Gemma path frontdoor merged two native roots"),
+                Err(error) => format!("{error:#}"),
+            };
+        assert!(error.contains("ambiguous model root"), "{error}");
+
         let snapshot = crate::model_collection::load_model_collection_local_latest(&file.path)
             .expect("native snapshot");
         let selected = crate::selection::SelectedModelIndex::from_snapshot(
@@ -2518,16 +2498,8 @@ mod native_nomic_snapshot_tests {
         );
         pile.close().unwrap();
 
-        let snapshot = crate::model_collection::load_model_collection_local_latest(&file.path)
-            .expect("native snapshot");
-        let selected = crate::selection::SelectedModelIndex::from_snapshot(
-            snapshot,
-            crate::selection::ModelSelector::Source {
-                source: "example/f32",
-                quantization: QUANTIZATION_NATIVE,
-            },
-        )
-        .expect("structurally valid f32 model selection");
+        let selected = select_native_model_index(&file.path, crate::selection::ModelSelector::Only)
+            .expect("the only native model root is selected exactly");
         let error = require_f16_model_index(&selected)
             .expect_err("f32 leaf was accepted by aliased constructor boundary")
             .to_string();

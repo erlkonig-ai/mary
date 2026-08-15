@@ -77,11 +77,13 @@ impl<B: Backend> GemmaLM<B> {
     pub fn from_streaming_pile(
         config: Gemma4Config,
         pile_path: &Path,
+        selector: crate::selection::ModelSelector<'_>,
         tokenizer_path: &Path,
         device: B::Device,
     ) -> Self {
         let (model, _vision) = crate::persist::load_gemma4_streaming_from_pile::<B>(
             pile_path,
+            selector,
             config.clone(),
             &device,
         )
@@ -378,11 +380,13 @@ impl GemmaLM<crate::nn::backend::BHalf> {
     pub fn from_aliased_pile(
         config: Gemma4Config,
         pile_path: &Path,
+        selector: crate::selection::ModelSelector<'_>,
         tokenizer_path: &Path,
         device: burn::backend::wgpu::WgpuDevice,
     ) -> Self {
         let model = crate::persist::load_gemma4_aliased_from_pile(
             pile_path,
+            selector,
             config.clone(),
             device.clone(),
         )

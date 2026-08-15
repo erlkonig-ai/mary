@@ -1,15 +1,20 @@
-//! Parity gate for the STREAMING pile load: a model streamed from a pile
-//! (handles indexed once, each tensor read on demand, peak CPU = one tensor)
-//! must generate token-for-token identically to the materialized-keymap load
-//! from the same pile. This is the path that scales weights-as-tribles to the
-//! 31B; here it's proven lossless on the small E2B.
+//! Parity gate for the STREAMING native-collection load: a selected model
+//! streamed from a pile (handles indexed once, each tensor read on demand,
+//! peak CPU = one tensor) must generate token-for-token identically to the
+//! explicitly selected materialized-keymap load from the same collection.
+//! This is the path that scales weights-as-tribles to the 31B; here it's proven
+//! lossless on the small E2B.
 //!
-//!   cargo run --release --features gemma --bin gemma_stream_test
+//!   cargo run --release --features gemma,import --bin gemma_stream_test
 
+#[path = "support/native_model_fixture.rs"]
+mod native_model_fixture;
+
+use crate::native_model_fixture::import_native_model_fixture;
 use mary::models::gemma::gemma4::config::Gemma4Config;
 use mary::models::gemma::gemma4::lm::GemmaLM;
-use mary::nn::backend::{WgpuDevice, B};
-use mary::persist::{load_keymap_from_pile, persist_safetensors_to_pile};
+use mary::nn::backend::{B, WgpuDevice};
+use mary::selection::{ModelSelector, SelectedModelIndex};
 use std::path::Path;
 use std::process::Command;
 
@@ -32,9 +37,11 @@ fn main() {
     let device = WgpuDevice::default();
 
     let pile = std::env::temp_dir().join(format!("mary_gemma_stream_{}.pile", std::process::id()));
-    println!("[persist] {snapshot_dir:?} -> {pile:?}");
-    persist_safetensors_to_pile(snapshot_dir, &pile, mary::ingest::LeafDtype::F16)
-        .expect("persist");
+    let _ = std::fs::remove_file(&pile);
+    println!("[persist] {snapshot_dir:?} -> {pile:?} (native collection, f16)");
+    let imported_root =
+        import_native_model_fixture(snapshot_dir, &pile, mary::ingest::LeafDtype::F16, model_id)
+            .expect("import native model collection");
     println!(
         "[persist] pile is {} bytes",
         std::fs::metadata(&pile).map(|m| m.len()).unwrap_or(0)
@@ -42,18 +49,44 @@ fn main() {
 
     let chat = "<bos><|turn>user\nWhat is 17 times 23? Answer with just the number.<turn|>\n<|turn>model\n";
 
-    println!("[stream] loading via from_streaming_pile (peak = one tensor)...");
-    let streamed = GemmaLM::<B>::from_streaming_pile(
+    println!("[stream] selecting the native root and loading (peak = one tensor)...");
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile)
+        .expect("load native model collection snapshot for streaming");
+    let selected = SelectedModelIndex::from_snapshot(
+        snapshot,
+        ModelSelector::Source {
+            source: model_id,
+            quantization: mary::persist::QUANTIZATION_NATIVE,
+        },
+    )
+    .expect("select imported model for streaming");
+    assert_eq!(selected.root(), imported_root);
+    let (streamed_model, _vision) = mary::persist::load_gemma4_streaming_from_index::<B, _>(
+        selected,
         Gemma4Config::load(Path::new(&config_path)),
-        &pile,
+        &device,
+    );
+    let streamed = GemmaLM::<B>::from_model(
+        Gemma4Config::load(Path::new(&config_path)),
+        streamed_model,
         Path::new(&tokenizer_path),
-        device,
+        device.clone(),
     );
     let ids_stream = streamed.complete_ids(chat, 10);
     drop(streamed);
 
-    println!("[keymap] loading via materialized load_keymap_from_pile...");
-    let keymap = load_keymap_from_pile(&pile).expect("keymap");
+    println!("[keymap] materializing the explicitly selected native root...");
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile)
+        .expect("load native model collection snapshot for materialization");
+    let keymap = mary::selection::load_keymap_from_graph(
+        snapshot.facts(),
+        snapshot.reader(),
+        ModelSelector::Source {
+            source: model_id,
+            quantization: mary::persist::QUANTIZATION_NATIVE,
+        },
+    )
+    .expect("materialize selected model keymap");
     let materialized = GemmaLM::<B>::from_keymap(
         Gemma4Config::load(Path::new(&config_path)),
         keymap,
@@ -74,9 +107,9 @@ fn main() {
     );
     assert_eq!(
         ids_stream, ids_keymap,
-        "streaming pile load diverged from materialized"
+        "streaming native-collection load diverged from materialized"
     );
-    println!("=== PASS — streaming pile load is token-identical to materialized ===");
+    println!("=== PASS — streaming native load is token-identical to materialized ===");
 }
 
 fn streamed_text(lm: &GemmaLM<B>, ids: &[u32]) -> String {

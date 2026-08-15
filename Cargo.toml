@@ -474,11 +474,6 @@ required-features = ["gemma"]
 name = "gemma_gen"
 required-features = ["gemma"]
 
-# Gemma 4 pile round-trip parity gate (safetensors vs pile token-id identity).
-[[bin]]
-name = "gemma_pile_test"
-required-features = ["gemma", "import"]
-
 # Dump gemma-4-31B-it final-position logits (from pile) for the HF cross-check.
 [[bin]]
 name = "gemma31b_parity"
@@ -497,11 +492,6 @@ required-features = ["gemma"]
 # Gemma 4 E4B LoRA training smoke (overfit one sentence under Autodiff<Metal>).
 [[bin]]
 name = "gemma_train_lora"
-required-features = ["gemma", "import"]
-
-# Persist Gemma 4 weights into a real on-disk pile (shell-is-physics endpoint).
-[[bin]]
-name = "gemma_persist"
 required-features = ["gemma", "import"]
 
 # Persist the F5-TTS + Vocos checkpoints into the durable voice-origin pile

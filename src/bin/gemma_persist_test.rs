@@ -1,24 +1,28 @@
-//! Gemma 4 → REAL on-disk pile → Gemma 4 round-trip parity gate (the true
-//! shell-is-physics endpoint). Unlike `gemma_pile_test` (in-memory pile), this:
+//! Gemma 4 → REAL on-disk native model collection → Gemma 4 round-trip parity
+//! gate (the true shell-is-physics endpoint):
 //!
-//!   1. persists google/gemma-4-E2B-it's weights into a TEMP pile FILE on disk
-//!      (`persist_safetensors_to_pile` — each tensor a content-addressed f32 leaf,
-//!      committed on the `main` branch),
-//!   2. then, via a FRESH `Pile::open` of that file (no in-memory carryover),
-//!      loads the keymap back from JUST the pile (`load_keymap_from_pile`)
-//!      and builds the model (`GemmaLM::from_keymap`),
+//!   1. imports google/gemma-4-E2B-it's weights into a TEMP pile FILE on disk
+//!      (`import_model_to_collection` — each tensor a content-addressed f32 leaf
+//!      under one signed native collection member),
+//!   2. then opens a FRESH native collection snapshot (no in-memory carryover),
+//!      explicitly selects the imported source, materializes its keymap from
+//!      JUST the pile, and builds the model (`GemmaLM::from_keymap`),
 //!   3. ALSO loads E2B the normal safetensors way,
 //!   4. and asserts both generate the EXACT same token-id sequence.
 //!
 //! The f32 blobs store weights exactly, so the disk round-trip is lossless and the
 //! token streams must be identical.
 //!
-//!   cargo run --release --features gemma --bin gemma_persist_test
+//!   cargo run --release --features gemma,import --bin gemma_persist_test
 
+#[path = "support/native_model_fixture.rs"]
+mod native_model_fixture;
+
+use crate::native_model_fixture::import_native_model_fixture;
 use mary::models::gemma::gemma4::config::Gemma4Config;
 use mary::models::gemma::gemma4::lm::GemmaLM;
-use mary::nn::backend::{WgpuDevice, B};
-use mary::persist::{load_keymap_from_pile, persist_safetensors_to_pile};
+use mary::nn::backend::{B, WgpuDevice};
+use mary::selection::ModelSelector;
 use std::path::Path;
 use std::process::Command;
 
@@ -77,14 +81,19 @@ fn main() {
     let text_safe = lm_safe.decode(&ids_safe);
     drop(lm_safe);
 
-    // ── Persist to a TEMP pile FILE on disk ────────────────────────────────
+    // ── Import into a TEMP native model-collection pile on disk ───────────
     let pile_path =
         std::env::temp_dir().join(format!("mary_gemma_persist_{}.pile", std::process::id()));
     // Start clean if a stale file is lying around.
     let _ = std::fs::remove_file(&pile_path);
-    eprintln!("[persist] writing weights → {pile_path:?} ...");
-    persist_safetensors_to_pile(snapshot_dir, &pile_path, mary::ingest::LeafDtype::F16)
-        .expect("persist to pile");
+    eprintln!("[persist] importing f32 weights → {pile_path:?} ...");
+    let imported_root = import_native_model_fixture(
+        snapshot_dir,
+        &pile_path,
+        mary::ingest::LeafDtype::F32,
+        MODEL_ID,
+    )
+    .expect("import native model collection");
     let pile_size = std::fs::metadata(&pile_path).unwrap().len();
     eprintln!(
         "[persist] pile is {} bytes ({:.2} GiB) on disk.",
@@ -92,11 +101,23 @@ fn main() {
         pile_size as f64 / (1u64 << 30) as f64
     );
 
-    // ── Path 2: load from JUST the pile FILE (fresh Pile::open) ────────────
-    eprintln!("[pile] loading keymap from the pile file (no safetensors)...");
-    let keymap = load_keymap_from_pile(&pile_path).expect("load keymap from pile");
+    // ── Path 2: load from JUST the fresh native snapshot ──────────────────
+    eprintln!("[pile] selecting and materializing the native root (no safetensors)...");
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile_path)
+        .expect("load native model collection snapshot");
+    let selector = ModelSelector::Source {
+        source: MODEL_ID,
+        quantization: mary::persist::QUANTIZATION_NATIVE,
+    };
+    let selected_root =
+        mary::selection::select_model_root(snapshot.facts(), snapshot.reader(), selector)
+            .expect("select imported model root");
+    assert_eq!(selected_root, imported_root);
+    let keymap =
+        mary::selection::load_keymap_from_graph(snapshot.facts(), snapshot.reader(), selector)
+            .expect("materialize selected model keymap");
     eprintln!(
-        "[pile] materialized {} tensors from the pile file.",
+        "[pile] materialized {} tensors from the native collection.",
         keymap.len()
     );
 
@@ -124,7 +145,7 @@ fn main() {
 
     if ids_safe == ids_pile {
         println!(
-            "\nPASS — token-id sequences identical ({} tokens). Gemma 4 round-trips through a REAL on-disk pile (no safetensors at load).",
+            "\nPASS — token-id sequences identical ({} tokens). Gemma 4 round-trips through a REAL on-disk native collection (no safetensors at load).",
             ids_safe.len()
         );
     } else {

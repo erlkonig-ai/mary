@@ -136,8 +136,16 @@ fn main() {
     // Optional: the SAME components loaded from the persisted pile (runtime path).
     let pile_audio = arg(&args, "--pile").map(|p| {
         eprintln!("Loading tower + embedder from pile {p}...");
-        mary::persist::load_gemma4_audio_from_pile::<B>(Path::new(&p), audio_cfg.clone(), &device)
-            .unwrap_or_else(|e| panic!("pile audio load: {e}"))
+        mary::persist::load_gemma4_audio_from_pile::<B>(
+            Path::new(&p),
+            mary::selection::ModelSelector::Source {
+                source: "google/gemma-4-E4B-it",
+                quantization: mary::persist::QUANTIZATION_NATIVE,
+            },
+            audio_cfg.clone(),
+            &device,
+        )
+        .unwrap_or_else(|e| panic!("pile audio load: {e}"))
     });
 
     let mut wavs: Vec<String> = std::fs::read_dir(&wav_dir)

@@ -1,30 +1,37 @@
-//! Real-data proof of the zero-copy weight bridge (Phase 2): persist a tiny
-//! model to an on-disk pile as f16, then load ONE weight by ALIASING its mmap'd
-//! f16 blob straight onto the GPU — `Bytes::downcast_to_owner::<MmapRaw>` →
-//! page-aligned superset → `register_external_aliased` → `CubeTensor` → burn
-//! `Tensor<BHalf>` — and assert the tensor's values equal the pile's f16 bytes.
-//! Proves the recipe the gemma assembly will run per weight.
+//! Real-data proof of the zero-copy weight bridge (Phase 2): import a tiny
+//! model to an on-disk native collection as f16, explicitly select its only
+//! root, then load ONE weight by ALIASING its mmap'd f16 blob straight onto the
+//! GPU — `Bytes::downcast_to_owner::<MmapRaw>` → page-aligned superset →
+//! `register_external_aliased` → `CubeTensor` → burn `Tensor<BHalf>` — and
+//! assert the tensor's values equal the pile's f16 bytes. Proves the recipe the
+//! Gemma assembly will run per weight.
 //!
-//!   cargo run --release --features gemma --bin gemma_alias_probe
+//!   cargo run --release --features gemma,import --bin gemma_alias_probe
 //! macOS / Metal only.
 
+#[path = "support/native_model_fixture.rs"]
+mod native_model_fixture;
+
+use crate::native_model_fixture::import_native_model_fixture;
 use burn::backend::wgpu::{CubeTensor, WgpuDevice, WgpuRuntime};
 use burn::tensor::{DType, Tensor, TensorPrimitive};
 use cubecl::Runtime;
 use half::f16;
-use mary::ingest::{index_keymap, LeafHandles};
+use mary::ingest::LeafHandles;
 use mary::nn::backend::BHalf;
+use mary::selection::{ModelSelector, SelectedModelIndex};
 use memmap2::MmapRaw;
-use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
-use triblespace::prelude::*;
+use triblespace::prelude::BlobStoreGet;
 
 const PAGE: u64 = 16384;
+const SOURCE: &str = "fixture/gemma-alias-probe";
 
 fn main() {
     // 1. A tiny safetensors with one known tensor.
     let dir = std::env::temp_dir().join(format!("mary_alias_tiny_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let st = dir.join("model.safetensors");
     let py = format!(
@@ -33,28 +40,35 @@ fn main() {
          st.save_file({{'w': w}}, {st:?})\n",
         st = st.to_str().unwrap()
     );
-    assert!(Command::new("python3")
-        .arg("-c")
-        .arg(&py)
-        .status()
-        .unwrap()
-        .success());
+    assert!(
+        Command::new("python3")
+            .arg("-c")
+            .arg(&py)
+            .status()
+            .unwrap()
+            .success()
+    );
 
-    // 2. Persist as f16 leaves.
+    // 2. Import as f16 leaves under one signed native collection root.
     let pile = dir.join("tiny.pile");
-    mary::persist::persist_safetensors_to_pile(&dir, &pile, mary::ingest::LeafDtype::F16).unwrap();
+    let imported_root =
+        import_native_model_fixture(&dir, &pile, mary::ingest::LeafDtype::F16, SOURCE)
+            .expect("import tiny native model collection");
 
-    // 3. Open the pile read-only: tribles + reader + model id.
-    let (tribles, reader, model_id) = open_pile(&pile);
-    let index = index_keymap(&tribles, &reader, model_id);
-    let handles = index.get("w").expect("weight 'w' in pile");
+    // 3. Freeze the local native collection and select its only model root.
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile)
+        .expect("load tiny native model collection snapshot");
+    let selected = SelectedModelIndex::from_snapshot(snapshot, ModelSelector::Only)
+        .expect("select the only tiny model root");
+    assert_eq!(selected.root(), imported_root);
+    let handles = selected.handles().get("w").expect("weight 'w' in pile");
     let (dh, _sh) = match handles {
         LeafHandles::F16(d, s) => (*d, *s),
         LeafHandles::F32(..) => panic!("expected f16 leaf"),
     };
 
     // 4. The blob's Bytes (a slice into the pile mmap).
-    let bytes: anybytes::Bytes = reader.get(dh).expect("data_f16 blob");
+    let bytes: anybytes::Bytes = selected.reader().get(dh).expect("data_f16 blob");
     let blob_ptr = bytes.as_ptr() as usize;
     let expected: Vec<f16> = bytes.clone().view::<[f16]>().expect("f16 view")[..].to_vec();
     let n = expected.len();
@@ -111,29 +125,4 @@ fn main() {
         println!("=== FAIL ===");
         std::process::exit(1);
     }
-}
-
-fn open_pile(pile_path: &Path) -> (TribleSet, impl BlobStoreGet, Id) {
-    use ed25519_dalek::SigningKey;
-    let mut pile = Pile::open(pile_path).unwrap();
-    pile.refresh().unwrap();
-    let mut repo = Repository::new(
-        pile,
-        SigningKey::generate(&mut rand::rngs::OsRng),
-        TribleSet::new(),
-    )
-    .unwrap();
-    let branch_id = repo.lookup_branch("main").unwrap().unwrap();
-    let mut ws = repo.pull(branch_id).unwrap();
-    let head = ws.head().unwrap();
-    let tribles: TribleSet = ws.checkout(ancestors(head)).unwrap().facts().clone();
-    let reader = repo.storage_mut().reader().unwrap();
-    let model_id = find!(
-        (m: Id, n: Inline<inlineencodings::Handle<blobencodings::LongString>>),
-        pattern!(&tribles, [{ ?m @ mary::format::attrs::model_name: ?n }])
-    )
-    .map(|(m, _)| m)
-    .next()
-    .expect("model entity");
-    (tribles, reader, model_id)
 }

@@ -7,9 +7,9 @@
 //! [`TribleSet`], its blob reader, and an explicit selector; every selector and
 //! every functional model field has exact-cardinality semantics.
 
-use crate::format::{attrs, F32Array, U64Array};
+use crate::format::{F32Array, U64Array, attrs};
 use crate::ingest::LeafHandles;
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
 use std::collections::{BTreeSet, HashMap};
 use triblespace::core::collection::CollectionSnapshot;
 use triblespace::prelude::*;
@@ -49,7 +49,8 @@ pub enum TokenizerSelector<'a> {
 /// functional fields have been validated, the collection facts and commit
 /// ticket are no longer needed by weight loading; the reader is retained so
 /// the content handles remain resolvable without reopening storage. This is
-/// the storage-free boundary for lazy, streaming, and mmap-aliased loaders.
+/// the storage-policy-free boundary for lazy, streaming, and mmap-aliased
+/// loaders.
 pub struct SelectedModelIndex<R> {
     root: Id,
     handles: HashMap<String, LeafHandles>,

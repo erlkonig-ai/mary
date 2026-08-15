@@ -16,10 +16,10 @@ use mary::models::gemma::gemma4::preprocess::pil_resize_bicubic;
 use std::path::Path;
 use std::process::Command;
 
-#[cfg(feature = "f16gen")]
-use mary::nn::backend::BHalf as B;
 #[cfg(not(feature = "f16gen"))]
 use mary::nn::backend::B;
+#[cfg(feature = "f16gen")]
+use mary::nn::backend::BHalf as B;
 
 fn find_hf_file(model_id: &str, filename: &str) -> String {
     let o = Command::new("python3")
@@ -56,6 +56,10 @@ fn main() {
     eprintln!("[vision] streaming 31B (WITH vision tower) from {pile}...");
     let (_decoder, vision) = mary::persist::load_gemma4_streaming_from_pile::<B>(
         Path::new(&pile),
+        mary::selection::ModelSelector::Source {
+            source: "google/gemma-4-31B-it",
+            quantization: mary::persist::QUANTIZATION_NATIVE,
+        },
         config.clone(),
         &device,
     )

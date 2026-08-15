@@ -13,7 +13,7 @@
 
 use crate::models::gemma::gemma4::config::Gemma4Config;
 use crate::models::gemma::gemma4::lm::GemmaLM;
-use crate::nn::backend::{BHalf, WgpuDevice, B};
+use crate::nn::backend::{B, BHalf, WgpuDevice};
 use burn::prelude::Backend;
 use std::path::Path;
 
@@ -227,35 +227,39 @@ where
 
 /// Load a warm f32 Gemma engine from JUST a persisted on-disk pile — NO
 /// safetensors. The true shell-is-physics endpoint: the weights live as
-/// content-addressed tribles on disk, persisted once by
-/// [`crate::persist::persist_safetensors_to_pile`]. STREAMS the build
+/// content-addressed tribles on disk, imported once by
+/// [`crate::persist::import_model_to_collection`]. STREAMS the build
 /// ([`GemmaLM::from_streaming_pile`]): the blob handles are indexed once, then
-/// each tensor's f32 data is read on demand and dropped after upload — peak CPU
-/// is one tensor, NOT the whole keymap — so this scales to the dense 31B (the
-/// old materialized path would OOM at ~120 GB f32). `config.json` +
+/// each tensor leaf is read on demand, converted to the f32 backend width, and
+/// dropped after upload — peak CPU is one tensor, NOT the whole keymap — so
+/// this scales to the dense 31B (the old materialized path would OOM at ~120 GB
+/// f32). `config.json` +
 /// `tokenizer.json` stay as small files; the WEIGHTS come entirely from the pile.
 pub fn load_gemma4_from_persisted_pile(
     pile_path: &Path,
+    selector: crate::selection::ModelSelector<'_>,
     config_path: &Path,
     tokenizer_path: &Path,
     device: WgpuDevice,
 ) -> anyhow::Result<Box<dyn LocalTextEngine>> {
     let cfg = Gemma4Config::load(config_path);
-    let lm = GemmaLM::<B>::from_streaming_pile(cfg, pile_path, tokenizer_path, device);
+    let lm = GemmaLM::<B>::from_streaming_pile(cfg, pile_path, selector, tokenizer_path, device);
     Ok(Box::new(GemmaEngine { lm }))
 }
 
 /// f16 variant of [`load_gemma4_from_persisted_pile`] — halves resident weights
-/// so the dense 31B fits a 128GB M4 Max. The pile stores f32 leaves; they are
-/// down-cast to f16 as the model is streamed in.
+/// so the dense 31B fits a 128GB M4 Max. Native f16 leaves stay f16; f32 leaves
+/// are down-cast as each tensor is streamed in.
 pub fn load_gemma4_from_persisted_pile_f16(
     pile_path: &Path,
+    selector: crate::selection::ModelSelector<'_>,
     config_path: &Path,
     tokenizer_path: &Path,
     device: WgpuDevice,
 ) -> anyhow::Result<Box<dyn LocalTextEngine>> {
     let cfg = Gemma4Config::load(config_path);
-    let lm = GemmaLM::<BHalf>::from_streaming_pile(cfg, pile_path, tokenizer_path, device);
+    let lm =
+        GemmaLM::<BHalf>::from_streaming_pile(cfg, pile_path, selector, tokenizer_path, device);
     Ok(Box::new(GemmaEngine { lm }))
 }
 

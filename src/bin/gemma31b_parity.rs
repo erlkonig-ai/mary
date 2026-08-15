@@ -14,10 +14,10 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
-#[cfg(feature = "f16gen")]
-use mary::nn::backend::BHalf as B;
 #[cfg(not(feature = "f16gen"))]
 use mary::nn::backend::B;
+#[cfg(feature = "f16gen")]
+use mary::nn::backend::BHalf as B;
 
 const PROMPT: &str = "What is the capital of France? Answer in one word.";
 
@@ -78,6 +78,10 @@ fn main() {
     // Build the model directly (not via GemmaLM) so we can grab the raw logits.
     let (model, _vision) = mary::persist::load_gemma4_streaming_from_pile::<B>(
         Path::new(&pile),
+        mary::selection::ModelSelector::Source {
+            source: model_id,
+            quantization: mary::persist::QUANTIZATION_NATIVE,
+        },
         config.clone(),
         &device,
     )

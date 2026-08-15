@@ -5,7 +5,8 @@
 //! `embed_query`/`embed_document` match the reference embeddings.
 //!
 //! Tokenizer path: NOMIC_MM7B_TOKENIZER=<...>/tokenizer.json (the nomic adapter
-//! cache copy). Optional model check: NOMIC_MM7B_PILE=<merged-backbone pile>.
+//! cache copy). Optional model check:
+//! NOMIC_MM7B_PILE=<native merged-backbone model-collection pile>.
 
 use burn::prelude::*;
 use burn::tensor::TensorData;
@@ -112,7 +113,14 @@ fn embed_query_and_document_parity() {
         return;
     };
     let device = NdArrayDevice::default();
-    let map = mary::persist::load_keymap_from_pile(Path::new(&pile)).expect("load pile");
+    let snapshot = mary::model_collection::load_model_collection_local_latest(Path::new(&pile))
+        .expect("load native model collection snapshot");
+    let map = mary::selection::load_keymap_from_graph(
+        snapshot.facts(),
+        snapshot.reader(),
+        mary::selection::ModelSelector::Only,
+    )
+    .expect("select and materialize the only model root");
     let w = KeymapW { map, device };
     let model = QwenTextModel::<B>::load(&w, &Qwen2_5VlTextConfig::nomic_mm7b(), &device);
     let tokenizer = Tokenizer::from_file(&tok_path).expect("tokenizer");

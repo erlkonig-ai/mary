@@ -3,9 +3,10 @@
 //! a thin CLI over the real seam, `mary::models::gemma::gemma4::lm::GemmaLM` —
 //! the same warm handle the playground's `ModelBackend::Local` calls in-process.
 //!
-//! Weights come ONLY from a persisted pile (write one with `gemma_persist`);
-//! `config.json` + `tokenizer.json` stay small files resolved from the local
-//! HF snapshot of `--model`.
+//! Weights come ONLY from a native model-collection pile (create one with
+//! `mary import <model> --pile <path> --key <key> --dtype f16`); `config.json`
+//! + `tokenizer.json` stay small files resolved from the local HF snapshot of
+//! `--model`.
 //!
 //!   cargo run --release --features gemma --bin gemma_gen -- \
 //!     --pile /path/to/gemma.pile --prompt "Explain what a trible is." \
@@ -26,10 +27,10 @@ use std::time::Instant;
 // Half-precision (f16) weights: 31B dense becomes ~62GB instead of ~124GB f32,
 // the only way the flagship fits 128GB. f16 inference is standard; validated
 // to match f32 output on the small E2B.
-#[cfg(feature = "f16gen")]
-use mary::nn::backend::BHalf as B;
 #[cfg(not(feature = "f16gen"))]
 use mary::nn::backend::B;
+#[cfg(feature = "f16gen")]
+use mary::nn::backend::BHalf as B;
 
 /// Resolve a SMALL side-file (config.json / tokenizer.json) from the local HF
 /// snapshot. Weights never come from here — they load from the pile.
@@ -85,7 +86,7 @@ fn main() {
     let pile = arg(&args, "--pile")
         .or_else(|| std::env::var("GEMMA_PILE").ok())
         .unwrap_or_else(|| {
-            eprintln!("gemma_gen: pass --pile <gemma.pile> or set GEMMA_PILE (write one with gemma_persist)");
+            eprintln!("gemma_gen: pass --pile <gemma.pile> or set GEMMA_PILE (create one with mary import)");
             std::process::exit(2);
         });
     // Use a Metal device with the storage-buffer-binding cap raised past wgpu's
@@ -116,6 +117,10 @@ fn main() {
     let lm = GemmaLM::<B>::from_streaming_pile(
         config,
         Path::new(&pile),
+        mary::selection::ModelSelector::Source {
+            source: &model_id,
+            quantization: mary::persist::QUANTIZATION_NATIVE,
+        },
         Path::new(&tokenizer_path),
         device,
     );

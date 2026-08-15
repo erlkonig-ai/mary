@@ -16,14 +16,14 @@
 //!   1. python3 scripts/nomic_mm7b_merge.py        <SCRATCH>/combined/merged_text_backbone.safetensors
 //!   2. python3 scripts/nomic_mm7b_vision_dump.py  <SCRATCH>/combined/vision_tower.safetensors
 //!   3. python3 scripts/nomic_mm7b_image_dump.py   # dumps the image reference goldens
-//!   4. cargo run --release --features gemma --bin gemma_persist -- <SCRATCH>/combined <SCRATCH>/combined.pile
+//!   4. cargo run --release --features import,hub --bin mary -- import <SCRATCH>/combined --pile <SCRATCH>/combined.pile --key <SCRATCH>/model.key --name nomic-ai/nomic-embed-multimodal-7b --dtype f16
 //!   5. NOMIC_MM7B_PILE=<SCRATCH>/combined.pile cargo test --release --features gemma --test nomic_mm7b_image_parity -- --nocapture
 
 use burn::prelude::*;
 use burn::tensor::TensorData;
 use burn_ndarray::{NdArray, NdArrayDevice};
 use mary::models::qwen2_5_vl::config::{Qwen2_5VlTextConfig, Qwen2_5VlVisionConfig};
-use mary::models::qwen2_5_vl::layers::{get_rope_index, QwenTextModel, QwenWeights};
+use mary::models::qwen2_5_vl::layers::{QwenTextModel, QwenWeights, get_rope_index};
 use mary::models::qwen2_5_vl::vision::{VisionTransformer, VisionWeights};
 use mary::nn::npy;
 use std::collections::HashMap;
@@ -155,7 +155,15 @@ fn image_embed_parity() {
     }
     let device = NdArrayDevice::default();
     eprintln!("[image-parity] loading combined keymap from {pile_path} ...");
-    let map = mary::persist::load_keymap_from_pile(Path::new(&pile_path)).expect("load pile");
+    let snapshot =
+        mary::model_collection::load_model_collection_local_latest(Path::new(&pile_path))
+            .expect("load native model collection snapshot");
+    let map = mary::selection::load_keymap_from_graph(
+        snapshot.facts(),
+        snapshot.reader(),
+        mary::selection::ModelSelector::Only,
+    )
+    .expect("select and materialize the only combined model root");
     eprintln!(
         "[image-parity] keymap has {} tensors; building text + vision ...",
         map.len()
@@ -194,7 +202,9 @@ fn image_embed_parity() {
         .0;
     let cos_splice = cosine(&got_splice, &want_splice);
     let ma_splice = max_abs(&got_splice, &want_splice);
-    eprintln!("[image-parity] ANCHOR splice (inputs_embeds): cosine={cos_splice:.7} max_abs={ma_splice:e}");
+    eprintln!(
+        "[image-parity] ANCHOR splice (inputs_embeds): cosine={cos_splice:.7} max_abs={ma_splice:e}"
+    );
     assert!(cos_splice >= 0.999, "splice cosine {cos_splice:.7} < 0.999");
 
     // --- ANCHOR 3: backbone hidden (M-RoPE through 28 layers) vs reference ---

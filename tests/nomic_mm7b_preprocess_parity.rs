@@ -13,12 +13,13 @@
 //! The probe image matches `scripts/nomic_mm7b_image_dump.py` exactly:
 //!   `Image.new("RGB", (56, 56), (123, 200, 90))`.
 //!
-//! Anchor 3 needs the COMBINED text+vision pile (same as the image-parity gate):
+//! Anchor 3 needs the COMBINED text+vision native model-collection pile (same
+//! as the image-parity gate):
 //!   NOMIC_MM7B_PILE=<combined pile> cargo test --release --features gemma \
 //!     --test nomic_mm7b_preprocess_parity -- --nocapture
 
 use burn_ndarray::NdArray;
-use mary::models::qwen2_5_vl::preprocess::{build_image_prompt, preprocess_image, PATCH_DIM};
+use mary::models::qwen2_5_vl::preprocess::{PATCH_DIM, build_image_prompt, preprocess_image};
 use mary::nn::npy;
 use std::path::{Path, PathBuf};
 
@@ -135,7 +136,15 @@ fn embed_image_bytes_parity() {
     };
 
     let device = burn_ndarray::NdArrayDevice::default();
-    let map = mary::persist::load_keymap_from_pile(Path::new(&pile_path)).expect("load pile");
+    let snapshot =
+        mary::model_collection::load_model_collection_local_latest(Path::new(&pile_path))
+            .expect("load native model collection snapshot");
+    let map = mary::selection::load_keymap_from_graph(
+        snapshot.facts(),
+        snapshot.reader(),
+        mary::selection::ModelSelector::Only,
+    )
+    .expect("select and materialize the only combined model root");
     let w = KeymapW { map, device };
     let embedder =
         NomicMultimodalEmbedder::<B>::load_with_vision(&w, &tok_path, device).expect("embedder");

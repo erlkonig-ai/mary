@@ -89,10 +89,12 @@ mod imp {
             .map(|t| t.clone().sum().into_scalar())
             .count();
         eprintln!(
-        "[fit] PersonaPlex resident: {} tensors, {:.2} G params, {:.2} GiB f16. RSS now {:.2} GiB",
-        plex_resident.len(), plex_params as f64 / 1e9,
-        plex_bytes as f64 / (1u64 << 30) as f64, rss_gib()
-    );
+            "[fit] PersonaPlex resident: {} tensors, {:.2} G params, {:.2} GiB f16. RSS now {:.2} GiB",
+            plex_resident.len(),
+            plex_params as f64 / 1e9,
+            plex_bytes as f64 / (1u64 << 30) as f64,
+            rss_gib()
+        );
 
         // ── Gemma-4-31B: zero-copy aliased load onto the SAME GPU ─────────────────
         eprintln!("[fit] loading Gemma-4-31B ({gemma_pile}) zero-copy aliased onto GPU...");
@@ -104,6 +106,10 @@ mod imp {
         let lm = mary::models::gemma::gemma4::lm::GemmaLM::<BHalf>::from_aliased_pile(
             config,
             Path::new(&gemma_pile),
+            mary::selection::ModelSelector::Source {
+                source: "google/gemma-4-31B-it",
+                quantization: mary::persist::QUANTIZATION_NATIVE,
+            },
             Path::new(&tokenizer_path),
             device.clone(),
         );

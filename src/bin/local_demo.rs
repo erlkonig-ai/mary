@@ -3,13 +3,14 @@
 //! roles+content+params. Proves the trait, chat template, stop strings, and
 //! token counts end-to-end.
 //!
-//! Weights come ONLY from a persisted pile (write one with `gemma_persist`);
-//! pass it via GEMMA_PILE. config.json/tokenizer.json stay small HF side-files.
+//! Weights come ONLY from a native model-collection pile (create one with
+//! `mary import <model> --pile <path> --key <key> --dtype f16`); pass it via
+//! GEMMA_PILE. config.json/tokenizer.json stay small HF side-files.
 //!
 //!   GEMMA_PILE=/path/to/gemma_e2b.pile \
 //!   cargo run --release --features local-model --bin local_demo
 
-use mary::local::{load_gemma4_from_persisted_pile_f16, LocalChatTurn, LocalGenParams, LocalRole};
+use mary::local::{LocalChatTurn, LocalGenParams, LocalRole, load_gemma4_from_persisted_pile_f16};
 use mary::nn::backend::WgpuDevice;
 use std::path::Path;
 use std::process::Command;
@@ -29,11 +30,15 @@ fn main() {
     let config_path = hf(model_id, "config.json");
     let tokenizer_path = hf(model_id, "tokenizer.json");
     let pile = std::env::var("GEMMA_PILE")
-        .expect("set GEMMA_PILE to a persisted gemma pile (write one with gemma_persist)");
+        .expect("set GEMMA_PILE to a native model pile (create one with mary import)");
 
     eprintln!("loading engine from pile {pile}...");
     let mut engine = load_gemma4_from_persisted_pile_f16(
         Path::new(&pile),
+        mary::selection::ModelSelector::Source {
+            source: model_id,
+            quantization: mary::persist::QUANTIZATION_NATIVE,
+        },
         Path::new(&config_path),
         Path::new(&tokenizer_path),
         WgpuDevice::default(),

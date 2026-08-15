@@ -3,9 +3,10 @@
 //! (AudioFeatureExtractor) → Gemma 4 audio tower → embedder → text decoder →
 //! generation, all via the shared [`mary::models::gemma::gemma4::hear::Hearing`]
 //! seam (`gemma_listen` runs the same seam in a live loop). Weights come ONLY
-//! from a persisted pile (write one with `gemma_persist`); `config.json` +
-//! `tokenizer.json` stay small files resolved from the local HF snapshot of
-//! `--model` (default E4B). The audio path is parity-gated per stage against
+//! from a native model-collection pile (create one with `mary import <model>
+//! --pile <path> --key <key>`); `config.json` + `tokenizer.json` stay small
+//! files resolved from the local HF snapshot of `--model` (default E4B). The
+//! audio path is parity-gated per stage against
 //! HF goldens (`gemma_audio_parity`, cos = 1.0 features/tower/embedder/cascade,
 //! shards AND pile, 2026-07-10).
 //!
@@ -91,7 +92,7 @@ fn main() {
         .or_else(|| std::env::var("GEMMA_PILE").ok())
         .unwrap_or_else(|| {
             eprintln!(
-                "gemma_hear: pass --pile <gemma.pile> or set GEMMA_PILE (write one with gemma_persist)"
+                "gemma_hear: pass --pile <gemma.pile> or set GEMMA_PILE (create one with mary import)"
             );
             std::process::exit(2);
         });
@@ -117,9 +118,16 @@ fn main() {
 
     println!("Loading model from pile {pile}...");
     let t_load = Instant::now();
-    let (model, _vision, tower, embedder) =
-        load_gemma4_hearing_from_pile::<B>(Path::new(&pile), config, &device)
-            .unwrap_or_else(|e| panic!("pile load: {e}"));
+    let (model, _vision, tower, embedder) = load_gemma4_hearing_from_pile::<B>(
+        Path::new(&pile),
+        mary::selection::ModelSelector::Source {
+            source: &model_id,
+            quantization: mary::persist::QUANTIZATION_NATIVE,
+        },
+        config,
+        &device,
+    )
+    .unwrap_or_else(|e| panic!("pile load: {e}"));
     println!(
         "Loaded in {:.1}s. RSS {:.2} GiB",
         t_load.elapsed().as_secs_f64(),

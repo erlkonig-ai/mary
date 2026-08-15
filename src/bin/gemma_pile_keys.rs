@@ -13,9 +13,14 @@ fn main() {
     let pile = args.get(1).expect("usage: gemma_pile_keys <pile> [filter]");
     let filter = args.get(2).map(|s| s.as_str()).unwrap_or("");
 
-    let (f16, f32_, _reader) =
-        mary::persist::load_split_index_from_pile(Path::new(pile), "").expect("open pile index");
-    let mut keys: Vec<&String> = f16.keys().chain(f32_.keys()).collect();
+    let snapshot = mary::model_collection::load_model_collection_local_latest(Path::new(pile))
+        .expect("load native model snapshot");
+    let selected = mary::selection::SelectedModelIndex::from_snapshot(
+        snapshot,
+        mary::selection::ModelSelector::Only,
+    )
+    .expect("select the only native model root");
+    let mut keys: Vec<&String> = selected.handles().keys().collect();
     keys.sort();
     println!("total tensor keys: {}", keys.len());
 

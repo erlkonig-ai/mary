@@ -2,7 +2,7 @@
 //! ingest both checkpoints (talker+predictor+speaker encoder, and the codec)
 //! into a content-addressed model graph, materialize them back, and assert the
 //! reconstructed components produce identical outputs. The qwen3tts analogue of
-//! `flux_pile_test` / `gemma_pile_test`. Uses an in-memory blob store — no
+//! `flux_pile_test` / `smolvla_pile_test`. Uses an in-memory blob store — no
 //! on-disk pile is touched.
 //!
 //!   cargo run --release --features qwen3tts --bin qwen3tts_pile_test
