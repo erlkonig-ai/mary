@@ -847,6 +847,63 @@ mod tests {
     }
 
     #[test]
+    fn selected_model_index_owns_the_reader_after_snapshot_consumption() {
+        let file = TempPilePath::new("selected-model-index");
+        let signing_key = SigningKey::from_bytes(&[0x19; 32]);
+        let mut pile = open_test_pile(file.as_path());
+
+        let leaf = crate::format::put_raw(&mut pile, &[1.25], &[1]).unwrap();
+        let leaf_id = leaf.root().expect("tensor leaf root");
+        let mut facts = leaf.into_facts();
+        let name = pile
+            .put::<LongString, _>("encoder.weight".to_owned())
+            .unwrap();
+        let member = entity! { _ @
+            crate::format::attrs::safetensor_path: name,
+            crate::format::attrs::weight: leaf_id,
+        };
+        let member_id = member.root().expect("model member root");
+        facts += member.into_facts();
+        let source = pile
+            .put::<LongString, _>("example/owned-index".to_owned())
+            .unwrap();
+        let model = entity! { _ @
+            crate::format::attrs::source: source,
+            crate::format::attrs::quantization: "native",
+            crate::format::attrs::member: member_id,
+        };
+        let model_root = model.root().expect("model root");
+        facts += model.into_facts();
+
+        let commit = publish_model_fragment(
+            &mut pile,
+            &signing_key,
+            Fragment::rooted(model_root, facts),
+        )
+        .unwrap();
+        let snapshot = snapshot_model_collection_exact(&mut pile, &[commit]).unwrap();
+        pile.close().unwrap();
+
+        let selected = crate::selection::SelectedModelIndex::from_snapshot(
+            snapshot,
+            crate::selection::ModelSelector::Source {
+                source: "example/owned-index",
+                quantization: "native",
+            },
+        )
+        .unwrap();
+        assert_eq!(selected.root(), model_root);
+        let handles = selected.handles()["encoder.weight"];
+        let crate::ingest::LeafHandles::F32(data, shape) = handles else {
+            panic!("selected model did not preserve the f32 leaf");
+        };
+        let data: View<[f32]> = selected.reader().get(data).unwrap();
+        let shape: View<[u64]> = selected.reader().get(shape).unwrap();
+        assert_eq!(&*data, &[1.25]);
+        assert_eq!(&*shape, &[1]);
+    }
+
+    #[test]
     fn exact_ticket_accepts_mixed_authors_and_keeps_unselected_commits_inert() {
         let file = TempPilePath::new("exact-mixed-authors");
         let mut pile = open_test_pile(file.as_path());

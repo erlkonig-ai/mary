@@ -11,6 +11,7 @@ use crate::format::{attrs, F32Array, U64Array};
 use crate::ingest::LeafHandles;
 use anyhow::{anyhow, bail, Context};
 use std::collections::{BTreeSet, HashMap};
+use triblespace::core::collection::CollectionSnapshot;
 use triblespace::prelude::*;
 
 /// How to identify one model root in a consolidated graph.
@@ -39,6 +40,42 @@ pub enum TokenizerSelector<'a> {
     Root(Id),
     /// Select the one tokenizer carrying this exact `model_name`.
     Name(&'a str),
+}
+
+/// One explicitly selected model root, its strict tensor-handle index, and the
+/// blob reader that owns every indexed attachment.
+///
+/// Selection consumes a frozen [`CollectionSnapshot`]. Once the root and its
+/// functional fields have been validated, the collection facts and commit
+/// ticket are no longer needed by weight loading; the reader is retained so
+/// the content handles remain resolvable without reopening storage. This is
+/// the storage-free boundary for lazy, streaming, and mmap-aliased loaders.
+pub struct SelectedModelIndex<R> {
+    root: Id,
+    handles: HashMap<String, LeafHandles>,
+    reader: R,
+}
+
+impl<R> SelectedModelIndex<R> {
+    /// Exact content-addressed model root selected from the frozen graph.
+    pub fn root(&self) -> Id {
+        self.root
+    }
+
+    /// Strict `tensor name -> leaf handles` index for the selected root.
+    pub fn handles(&self) -> &HashMap<String, LeafHandles> {
+        &self.handles
+    }
+
+    /// Reader that owns the attachment snapshot named by [`Self::handles`].
+    pub fn reader(&self) -> &R {
+        &self.reader
+    }
+
+    /// Consume the selection into its root, handle index, and owned reader.
+    pub fn into_parts(self) -> (Id, HashMap<String, LeafHandles>, R) {
+        (self.root, self.handles, self.reader)
+    }
 }
 
 fn read_long_string(
@@ -275,6 +312,30 @@ pub fn index_keymap_for_root(
         }
     }
     Ok(map)
+}
+
+impl<R: BlobStoreGet> SelectedModelIndex<R> {
+    /// Resolve and strictly index one model from an already-frozen collection.
+    ///
+    /// Storage opening and admission policy remain with the caller. Ambiguous
+    /// selectors, malformed functional fields, mixed data encodings on one
+    /// leaf, and duplicate tensor names all fail before the snapshot is
+    /// consumed.
+    pub fn from_snapshot(
+        snapshot: CollectionSnapshot<R>,
+        selector: ModelSelector<'_>,
+    ) -> anyhow::Result<Self> {
+        let root = select_model_root(snapshot.facts(), snapshot.reader(), selector)
+            .context("select model root from native collection snapshot")?;
+        let handles = index_keymap_for_root(snapshot.facts(), snapshot.reader(), root)
+            .with_context(|| format!("index model root {root} from native collection snapshot"))?;
+        let (_, _, reader) = snapshot.into_parts();
+        Ok(Self {
+            root,
+            handles,
+            reader,
+        })
+    }
 }
 
 fn read_shape(

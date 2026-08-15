@@ -2286,21 +2286,13 @@ impl<'a, R: triblespace::prelude::BlobStoreGet>
 }
 
 #[cfg(all(feature = "gemma", target_os = "macos"))]
-fn select_f16_keymap_snapshot(
-    snapshot: CollectionSnapshot<triblespace::core::repo::pile::PileReader>,
-    selector: crate::selection::ModelSelector<'_>,
-) -> anyhow::Result<(
-    HashMap<String, crate::ingest::LeafHandles>,
-    triblespace::core::repo::pile::PileReader,
-)> {
-    let root = crate::selection::select_model_root(snapshot.facts(), snapshot.reader(), selector)
-        .context("select model root from native collection snapshot")?;
-    let index = crate::selection::index_keymap_for_root(snapshot.facts(), snapshot.reader(), root)
-        .with_context(|| format!("index model root {root} from native collection snapshot"))?;
-
+fn require_f16_model_index<R>(
+    selected: &crate::selection::SelectedModelIndex<R>,
+) -> anyhow::Result<()> {
     // The aliased Metal ABI is f16. Reject a structurally valid but incompatible
     // native import before model construction can turn it into a distant panic.
-    if let Some(name) = index
+    if let Some(name) = selected
+        .handles()
         .iter()
         .filter_map(|(name, handles)| {
             matches!(handles, crate::ingest::LeafHandles::F32(..)).then_some(name)
@@ -2308,15 +2300,11 @@ fn select_f16_keymap_snapshot(
         .min()
     {
         anyhow::bail!(
-            "model root {root} is not an aliased-f16 model: tensor {name:?} has an f32 leaf"
+            "model root {} is not an aliased-f16 model: tensor {name:?} has an f32 leaf",
+            selected.root()
         );
     }
-
-    // The index owns only content handles. Once selection is complete the
-    // facts and commit ticket can go; the owned reader keeps the exact mmap
-    // snapshot from which every handle below will be resolved.
-    let (_, _, reader) = snapshot.into_parts();
-    Ok((index, reader))
+    Ok(())
 }
 
 /// Load `nomic-embed-multimodal-7b` (Qwen2.5-VL backbone + vision tower) from
@@ -2345,7 +2333,9 @@ pub fn load_nomic_mm7b_aliased_from_snapshot(
     use crate::models::qwen2_5_vl::embedder::NomicMultimodalEmbedder;
     use crate::nn::backend::B;
 
-    let (index, reader) = select_f16_keymap_snapshot(snapshot, selector)?;
+    let selected = crate::selection::SelectedModelIndex::from_snapshot(snapshot, selector)?;
+    require_f16_model_index(&selected)?;
+    let (_, index, reader) = selected.into_parts();
 
     let weights = AliasedQwenWeights {
         index: &index,
@@ -2470,7 +2460,7 @@ mod native_nomic_snapshot_tests {
 
         let snapshot = crate::model_collection::load_model_collection_local_latest(&file.path)
             .expect("native snapshot");
-        let (index, reader) = select_f16_keymap_snapshot(
+        let selected = crate::selection::SelectedModelIndex::from_snapshot(
             snapshot,
             crate::selection::ModelSelector::Source {
                 source: "example/target",
@@ -2478,6 +2468,8 @@ mod native_nomic_snapshot_tests {
             },
         )
         .expect("strict source selection");
+        require_f16_model_index(&selected).expect("selected model is f16");
+        let (_, index, reader) = selected.into_parts();
         assert_eq!(index.len(), 1);
         let crate::ingest::LeafHandles::F16(data, shape) = index["target.weight"] else {
             panic!("selected leaf was not f16");
@@ -2499,7 +2491,7 @@ mod native_nomic_snapshot_tests {
         pile.close().unwrap();
         let snapshot = crate::model_collection::load_model_collection_local_latest(&file.path)
             .expect("ambiguous native snapshot");
-        let error = match select_f16_keymap_snapshot(
+        let error = match crate::selection::SelectedModelIndex::from_snapshot(
             snapshot,
             crate::selection::ModelSelector::Source {
                 source: "example/target",
@@ -2528,16 +2520,17 @@ mod native_nomic_snapshot_tests {
 
         let snapshot = crate::model_collection::load_model_collection_local_latest(&file.path)
             .expect("native snapshot");
-        let error = match select_f16_keymap_snapshot(
+        let selected = crate::selection::SelectedModelIndex::from_snapshot(
             snapshot,
             crate::selection::ModelSelector::Source {
                 source: "example/f32",
                 quantization: QUANTIZATION_NATIVE,
             },
-        ) {
-            Ok(_) => panic!("f32 leaf was accepted by aliased constructor boundary"),
-            Err(error) => format!("{error:#}"),
-        };
+        )
+        .expect("structurally valid f32 model selection");
+        let error = require_f16_model_index(&selected)
+            .expect_err("f32 leaf was accepted by aliased constructor boundary")
+            .to_string();
         assert!(
             error.contains("tensor \"f32.weight\" has an f32 leaf"),
             "{error}"
