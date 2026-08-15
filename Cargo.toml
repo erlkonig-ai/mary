@@ -34,8 +34,8 @@ gguf-rs-lib = { version = "0.2.5", default-features = false, features = ["std", 
 # backend only (torch storages are STOREd uncompressed, data.pkl may be
 # deflated) — no bzip2/zstd/aes C deps. Import-only.
 zip = { version = "0.6", default-features = false, features = ["deflate"], optional = true }
-# clap powers the `mary` CLI (the import front door); import-only, kept out of
-# lib-consumer and inference/serve builds.
+# clap powers opt-in control-plane CLIs: the import front door and the lean
+# legacy-model migration tool. It stays out of lib-consumer/runtime builds.
 clap = { version = "4", features = ["derive"], optional = true }
 # hf-hub auto-downloads models from the HuggingFace hub for `mary import`
 # (sync/ureq client, no async runtime needed). Import-only.
@@ -157,6 +157,10 @@ k3-attn-res-cuda = ["k3-attn-res", "burn/cuda"]
 # system TLS stack. That bit — a second Spark could not build the importer for
 # want of libssl-dev, to satisfy a downloader it would never call.
 import = ["dep:safetensors", "dep:clap", "dep:gguf-rs-lib", "dep:zip", "dep:memmap2"]
+# Strict legacy Repository -> native collection migration. This is a storage
+# control-plane command, so it needs clap and none of the checkpoint readers,
+# model runtimes, or Hub/TLS stack pulled by `import`/`hub`.
+model-migration-cli = ["dep:clap"]
 # Fetching weights from the HuggingFace Hub. Pulls hf-hub, which hard-wires
 # native-tls (hf-hub 0.3 offers no rustls backend), hence the system OpenSSL
 # dependency. Anything that only reads local checkpoints should not enable it.
@@ -262,6 +266,11 @@ dev-tools = ["import"]
 [[bin]]
 name = "mary"
 required-features = ["import", "hub"]
+
+[[bin]]
+name = "mary-model-migrate"
+path = "src/bin/mary_model_migrate.rs"
+required-features = ["model-migration-cli"]
 
 # Totality gate for the K3 checkpoint layout: walks the real safetensors headers
 # and asserts the tensor-name/module-slot mapping is a bijection. Header-only -
