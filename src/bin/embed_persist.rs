@@ -11,17 +11,15 @@
 //!   <out-dir> <signing-key>
 //! ```
 
+#[path = "support/native_embedding_collection.rs"]
+mod native_embedding_collection;
+
 use anyhow::Context;
 use ed25519_dalek::SigningKey;
-use mary::ingest::{LeafDtype, LeafHandles};
-use mary::selection::{ModelSelector, SelectedModelIndex, TokenizerSelector};
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Instant;
-use triblespace::core::collection::CollectionCommit;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::signing_key_file;
-use triblespace::prelude::*;
 
 const CLIP_MODEL: &str = "openai/clip-vit-base-patch32";
 const NOMIC_TEXT_MODEL: &str = "nomic-ai/nomic-embed-text-v1.5";
@@ -64,152 +62,6 @@ const MODELS: &[ModelSpec] = &[
     },
 ];
 
-fn validate_f32_model<R: BlobStoreGet>(
-    selected: &SelectedModelIndex<R>,
-    contract: &BTreeMap<String, Vec<usize>>,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !selected.handles().is_empty(),
-        "embedding model root contains no tensors"
-    );
-    let mut actual_shapes = BTreeMap::new();
-    for (name, handles) in selected.handles() {
-        let LeafHandles::F32(data, shape) = handles else {
-            anyhow::bail!("embedding tensor {name:?} is not an exact f32 leaf");
-        };
-        let data: anybytes::Bytes = selected
-            .reader()
-            .get(*data)
-            .map_err(|error| anyhow::anyhow!("read embedding tensor {name:?}: {error}"))?;
-        anyhow::ensure!(
-            (data.as_ptr() as usize).is_multiple_of(256),
-            "embedding tensor {name:?} is not 256-byte aligned"
-        );
-        let values = data
-            .view::<[f32]>()
-            .with_context(|| format!("decode embedding tensor {name:?}"))?;
-        let shape: anybytes::Bytes = selected
-            .reader()
-            .get(*shape)
-            .map_err(|error| anyhow::anyhow!("read shape for {name:?}: {error}"))?;
-        let shape = shape
-            .view::<[u64]>()
-            .with_context(|| format!("decode shape for {name:?}"))?;
-        let shape = shape
-            .iter()
-            .map(|&dimension| {
-                usize::try_from(dimension)
-                    .with_context(|| format!("shape dimension for {name:?} exceeds usize"))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let elements = shape.iter().try_fold(1_usize, |product, &dimension| {
-            product
-                .checked_mul(dimension)
-                .with_context(|| format!("shape element count for {name:?} overflows usize"))
-        })?;
-        anyhow::ensure!(
-            values.len() == elements,
-            "embedding tensor {name:?} has {} values but shape describes {elements}",
-            values.len()
-        );
-        actual_shapes.insert(name.clone(), shape);
-    }
-    for (name, expected) in contract {
-        let actual = actual_shapes
-            .get(name)
-            .with_context(|| format!("embedding model is missing required tensor {name:?}"))?;
-        anyhow::ensure!(
-            actual == expected,
-            "embedding tensor {name:?} has shape {actual:?}, expected {expected:?}"
-        );
-    }
-    if actual_shapes.len() != contract.len() {
-        let unexpected = actual_shapes
-            .keys()
-            .find(|name| !contract.contains_key(*name))
-            .expect("different exact-map lengths imply an unexpected key");
-        anyhow::bail!("embedding model contains unexpected tensor {unexpected:?}");
-    }
-    Ok(())
-}
-
-fn publish_embedding_candidate(
-    pile: &mut Pile,
-    signing_key: &SigningKey,
-    weights: &Path,
-    format: mary::formats::WeightFormat,
-    tokenizer_json: Option<&Path>,
-    source: &str,
-    architecture: mary::embed::EmbeddingArchitecture,
-    contract: &BTreeMap<String, Vec<usize>>,
-) -> anyhow::Result<(Id, CollectionCommit, usize)> {
-    let mut candidate = mary::persist::ingest_weight_file_filtered_fragment(
-        pile,
-        weights,
-        format,
-        LeafDtype::F32,
-        source,
-        mary::persist::QUANTIZATION_NATIVE,
-        |name| contract.contains_key(name),
-    )?;
-    let model_root = candidate
-        .root()
-        .context("embedding candidate has no unique model root")?;
-
-    if let Some(path) = tokenizer_json {
-        let json =
-            std::fs::read(path).with_context(|| format!("read tokenizer graph source {path:?}"))?;
-        let tokenizer = mary::tokenizer::save_tokenizer_json(&json, source, candidate.blobs_mut())
-            .map_err(|error| anyhow::anyhow!("ingest tokenizer graph for {source}: {error}"))?;
-        candidate += tokenizer;
-    }
-
-    // The prepared commit owns every in-memory tokenizer attachment. Stage all
-    // dependencies first, then validate the candidate together with the exact
-    // pre-existing authority set through the destination pile's own reader.
-    // Only `finalize` below appends the signed membership record.
-    let candidate_facts = candidate.facts().clone();
-    let prepared = mary::model_collection::prepare_model_fragment(signing_key, candidate)
-        .map_err(|error| anyhow::anyhow!("prepare embedding collection commit: {error}"))?;
-    let mut staged = prepared
-        .stage(pile)
-        .map_err(|error| anyhow::anyhow!("stage embedding commit dependencies: {error}"))?;
-
-    let snapshot =
-        mary::model_collection::snapshot_model_collection_local_latest(staged.store_mut())?;
-    let (mut facts, _, reader) = snapshot.into_parts();
-    facts += candidate_facts;
-    let selected = SelectedModelIndex::from_graph(
-        &facts,
-        reader,
-        ModelSelector::Source {
-            source,
-            quantization: mary::persist::QUANTIZATION_NATIVE,
-        },
-    )?;
-    anyhow::ensure!(
-        selected.root() == model_root,
-        "staged embedding root differs from the unique Source/native root"
-    );
-    validate_f32_model(&selected, contract)?;
-
-    if tokenizer_json.is_some() {
-        let tokenizer = mary::selection::load_tokenizer_from_graph(
-            &facts,
-            selected.reader(),
-            TokenizerSelector::Name(source),
-        )?;
-        architecture.validate_tokenizer(&tokenizer)?;
-    }
-    let tensor_count = selected.handles().len();
-    drop(selected);
-
-    let commit = staged
-        .finalize()
-        .map_err(|error| anyhow::anyhow!("publish validated embedding commit: {error}"))?;
-    Ok((model_root, commit, tensor_count))
-}
-
 fn create_pile_if_missing(path: &Path) -> anyhow::Result<()> {
     match std::fs::OpenOptions::new()
         .write(true)
@@ -251,10 +103,9 @@ fn import_one(out_dir: &Path, signing_key: &SigningKey, spec: ModelSpec) -> anyh
     create_pile_if_missing(&pile_path)?;
 
     let started = Instant::now();
-    let contract = spec.architecture.tensor_shapes();
     let mut pile = Pile::open(&pile_path)
         .map_err(|error| anyhow::anyhow!("open model pile {pile_path:?}: {error}"))?;
-    let imported = publish_embedding_candidate(
+    let imported = native_embedding_collection::publish_embedding_candidate(
         &mut pile,
         signing_key,
         &weights,
@@ -262,7 +113,6 @@ fn import_one(out_dir: &Path, signing_key: &SigningKey, spec: ModelSpec) -> anyh
         tokenizer.as_deref(),
         spec.source,
         spec.architecture,
-        &contract,
     );
     let close = pile
         .close()
@@ -305,7 +155,10 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native_embedding_collection::publish_embedding_candidate_with_contract as publish_embedding_candidate;
+    use mary::selection::{ModelSelector, TokenizerSelector};
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -474,6 +327,52 @@ mod tests {
             &contract,
         )
         .unwrap_err();
+        let snapshot =
+            mary::model_collection::snapshot_model_collection_local_latest(&mut pile).unwrap();
+        assert!(snapshot.commits().is_empty());
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn architecture_controls_whether_the_signed_cohort_has_a_tokenizer() {
+        let dir = TempDir::new().unwrap();
+        let weights = dir.path().join("model.safetensors");
+        let tokenizer = dir.path().join("tokenizer.json");
+        let pile_path = dir.path().join("cohort-shape.pile");
+        write_weights(&weights, &[1.0, 2.0, 3.0, 4.0]);
+        std::fs::write(&tokenizer, WORDPIECE).unwrap();
+        std::fs::File::create(&pile_path).unwrap();
+        let key = SigningKey::from_bytes(&[0x45; 32]);
+        let mut pile = Pile::open(&pile_path).unwrap();
+        let initial_len = std::fs::metadata(&pile_path).unwrap().len();
+
+        let missing = publish_embedding_candidate(
+            &mut pile,
+            &key,
+            &weights,
+            mary::formats::WeightFormat::Safetensors,
+            None,
+            NOMIC_TEXT_MODEL,
+            mary::embed::EmbeddingArchitecture::NomicTextV15,
+            &toy_contract(),
+        )
+        .unwrap_err();
+        assert!(format!("{missing:#}").contains("requires its tokenizer"));
+
+        let spurious = publish_embedding_candidate(
+            &mut pile,
+            &key,
+            &weights,
+            mary::formats::WeightFormat::Safetensors,
+            Some(&tokenizer),
+            NOMIC_VISION_MODEL,
+            mary::embed::EmbeddingArchitecture::NomicVisionV15,
+            &toy_contract(),
+        )
+        .unwrap_err();
+        assert!(format!("{spurious:#}").contains("rejects a tokenizer"));
+        assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), initial_len);
+
         let snapshot =
             mary::model_collection::snapshot_model_collection_local_latest(&mut pile).unwrap();
         assert!(snapshot.commits().is_empty());

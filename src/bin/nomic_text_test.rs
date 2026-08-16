@@ -1,6 +1,6 @@
 //! nomic-embed-text-v1.5 parity gate.
 //!
-//!   cargo run --release --features embed --bin nomic_text_test
+//!   cargo run --release --features embed,import --bin nomic_text_test
 //!
 //! 1. Shell out to python (sentence-transformers, or transformers AutoModel as a
 //!    fallback) to dump L2-normalized reference vectors for a short text, a
@@ -8,17 +8,22 @@
 //!    "search_document: " prefix — to /tmp/nomic_ref.json.
 //! 2. Embed the same texts via `mary::embed::NomicTextEmbedder::embed_document`.
 //! 3. Assert PARITY (cosine(rust, ref) > 0.99 per text, incl the long one).
-//! 4. Pile round-trip: persist nomic safetensors → temp pile → load from pile,
-//!    assert cosine(pile, safetensors) ~ 1.0 for one text, clean up.
+//! 4. Native collection round-trip: publish weights + tokenizer atomically,
+//!    fresh-load one frozen snapshot, and assert cosine(native, HF) ~ 1.0.
 //! 5. Print every cosine + token counts + PASS/FAIL.
 
+#[path = "support/native_embedding_collection.rs"]
+mod native_embedding_collection;
+
+use ed25519_dalek::SigningKey;
 use mary::embed::{
-    load_nomic_text_from_hf, load_nomic_text_from_pile, LocalEmbedder, NOMIC_TEXT_DIM,
+    hf_cache_main_snapshot, load_nomic_text_from_files, nomic_text_from_parts,
+    EmbeddingArchitecture, LocalEmbedder, NOMIC_TEXT_DIM,
 };
 use mary::nn::backend::WgpuDevice;
-use mary::persist::persist_safetensors_to_pile;
-use std::path::{Path, PathBuf};
+use mary::selection::{ModelSelector, TokenizerSelector};
 use std::process::Command;
+use triblespace::core::repo::pile::Pile;
 
 const MODEL_ID: &str = "nomic-ai/nomic-embed-text-v1.5";
 const REF_JSON: &str = "/tmp/nomic_ref.json";
@@ -58,22 +63,6 @@ fn mark(ok: bool) -> &'static str {
     } else {
         "<-- FAIL"
     }
-}
-
-fn hf_cache_resolve(model_id: &str, filename: &str) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let repo = format!("models--{}", model_id.replace('/', "--"));
-    let snapshots = Path::new(&home)
-        .join(".cache/huggingface/hub")
-        .join(repo)
-        .join("snapshots");
-    for snap in std::fs::read_dir(&snapshots).ok()?.flatten() {
-        let p = snap.path().join(filename);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
 }
 
 fn gib(bytes: u64) -> f64 {
@@ -148,9 +137,14 @@ fn main() {
         })
         .collect();
 
-    println!("loading NomicTextEmbedder (mary)...");
+    let source_snapshot =
+        hf_cache_main_snapshot(MODEL_ID).expect("resolve one cached Nomic text main revision");
+    let weights = source_snapshot.join("model.safetensors");
+    let tokenizer = source_snapshot.join("tokenizer.json");
+    println!("loading NomicTextEmbedder (mary) from {source_snapshot:?}...");
     let device: WgpuDevice = Default::default();
-    let nomic = load_nomic_text_from_hf(MODEL_ID, device.clone()).expect("load nomic");
+    let nomic = load_nomic_text_from_files(&weights, &tokenizer, device.clone())
+        .expect("load Nomic text baseline from pinned snapshot");
     assert_eq!(nomic.dim(), NOMIC_TEXT_DIM);
 
     let rust_texts: Vec<Vec<f32>> = texts()
@@ -172,17 +166,27 @@ fn main() {
         pass &= c > 0.99;
     }
 
-    // ---- PILE ROUND-TRIP ----
-    println!("\n=== PILE ROUND-TRIP (cosine pile-vs-safetensors, must be ~1.0) ===");
-    let weights = hf_cache_resolve(MODEL_ID, "model.safetensors").expect("nomic weights in cache");
-    let tokenizer = hf_cache_resolve(MODEL_ID, "tokenizer.json").expect("nomic tokenizer in cache");
-    let snapshot_dir = weights.parent().unwrap();
+    // ---- NATIVE COLLECTION ROUND-TRIP ----
+    println!("\n=== NATIVE ROUND-TRIP (cosine collection-vs-HF, must be ~1.0) ===");
     let pile_path =
         std::env::temp_dir().join(format!("mary_embed_nomic_{}.pile", std::process::id()));
     let _ = std::fs::remove_file(&pile_path);
-    eprintln!("[nomic] persisting {snapshot_dir:?} → {pile_path:?} ...");
-    persist_safetensors_to_pile(snapshot_dir, &pile_path, mary::ingest::LeafDtype::F32)
-        .expect("persist nomic to pile");
+    std::fs::File::create(&pile_path).expect("create fresh Nomic text collection pile");
+    eprintln!("[nomic] publishing {source_snapshot:?} → {pile_path:?} ...");
+    let mut pile = Pile::open(&pile_path).expect("open fresh Nomic text collection pile");
+    let signing_key = SigningKey::from_bytes(&[0x4e; 32]);
+    let publication = native_embedding_collection::publish_embedding_candidate(
+        &mut pile,
+        &signing_key,
+        &weights,
+        mary::formats::WeightFormat::Safetensors,
+        Some(&tokenizer),
+        MODEL_ID,
+        EmbeddingArchitecture::NomicTextV15,
+    );
+    let close = pile.close();
+    publication.expect("publish native Nomic text cohort");
+    close.expect("close native Nomic text collection pile");
     let pile_size = std::fs::metadata(&pile_path).unwrap().len();
     eprintln!(
         "[nomic] pile is {} bytes ({:.3} GiB).",
@@ -190,16 +194,36 @@ fn main() {
         gib(pile_size)
     );
 
-    let from_pile =
-        load_nomic_text_from_pile(&pile_path, &tokenizer, device.clone()).expect("load from pile");
-    let pile_vec = from_pile.embed_document(SENTENCE).expect("pile embed");
-    let c_pile = cosine(&pile_vec, &rust_texts[1]);
-    let pile_ok = c_pile > 0.999999;
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile_path)
+        .expect("fresh-load native Nomic text collection");
+    let keymap = mary::selection::load_keymap_from_graph(
+        snapshot.facts(),
+        snapshot.reader(),
+        ModelSelector::Source {
+            source: MODEL_ID,
+            quantization: mary::persist::QUANTIZATION_NATIVE,
+        },
+    )
+    .expect("select native Nomic text weights");
+    let native_tokenizer = mary::selection::load_tokenizer_from_graph(
+        snapshot.facts(),
+        snapshot.reader(),
+        TokenizerSelector::Name(MODEL_ID),
+    )
+    .expect("select native Nomic text tokenizer");
+    let from_native = nomic_text_from_parts(keymap, native_tokenizer, device.clone())
+        .expect("build Nomic text embedder from native snapshot");
+    drop(snapshot);
+    let native_vec = from_native
+        .embed_document(SENTENCE)
+        .expect("native collection embed");
+    let c_native = cosine(&native_vec, &rust_texts[1]);
+    let native_ok = c_native > 0.999999;
     println!(
-        "  cos(pile, safetensors) [sentence] = {c_pile:.8}  {}",
-        mark(pile_ok)
+        "  cos(collection, HF) [sentence] = {c_native:.8}  {}",
+        mark(native_ok)
     );
-    pass &= pile_ok;
+    pass &= native_ok;
     let _ = std::fs::remove_file(&pile_path);
 
     println!("\n=== {} ===", if pass { "PASS" } else { "FAIL" });

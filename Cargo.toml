@@ -682,12 +682,13 @@ name = "siglip_embed_test"
 required-features = ["embed", "import"]
 
 # nomic-embed-text-v1.5 parity gate (rust-vs-sentence-transformers cosine > 0.99
-# incl long-context text + pile round-trip).
+# incl long-context text + native collection round-trip).
 [[bin]]
 name = "nomic_text_test"
 required-features = ["embed", "import"]
 
-# nomic-embed-vision-v1.5 parity gate (rust-vs-HF cosine > 0.99 + pile round-trip).
+# nomic-embed-vision-v1.5 parity gate (rust-vs-HF cosine > 0.99 + native
+# collection round-trip).
 [[bin]]
 name = "nomic_vision_test"
 required-features = ["embed", "import"]

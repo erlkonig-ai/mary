@@ -1063,10 +1063,10 @@ pub fn clip_from_parts(
     })
 }
 
-/// Build a `ClipEmbedder` from a content-addressed weight keymap (the
-/// `name → (f32, shape)` map a pile materializes via
-/// [`crate::persist::load_keymap_from_pile`]) plus a `tokenizer.json` path.
-/// This is the file-substrate variant of [`clip_from_parts`].
+/// Build a `ClipEmbedder` from a content-addressed weight keymap plus a
+/// `tokenizer.json` path. This is the file-tokenizer variant of
+/// [`clip_from_parts`]; native collection callers should select both parts
+/// from one frozen snapshot instead.
 pub fn load_clip_from_keymap(
     keymap: HashMap<String, (Vec<f32>, Vec<usize>)>,
     tokenizer: &Path,
@@ -1526,10 +1526,8 @@ pub fn load_siglip_from_hf(model_id: &str, device: WgpuDevice) -> Result<SiglipE
     load_siglip_from_files(&weights, &tokenizer, device)
 }
 
-/// Build a `SiglipEmbedder` from a content-addressed weight keymap (the
-/// `name → (f32, shape)` map a pile materializes via
-/// [`crate::persist::load_keymap_from_pile`]). Same model build as
-/// [`load_siglip_from_files`] but loading the towers from a
+/// Build a `SiglipEmbedder` from a content-addressed weight keymap. Same model
+/// build as [`load_siglip_from_files`] but loading the towers from a
 /// [`WeightLoader::Pile`]. `tokenizer.json` stays a small file.
 pub fn load_siglip_from_keymap(
     keymap: HashMap<String, (Vec<f32>, Vec<usize>)>,
@@ -2108,10 +2106,10 @@ pub fn load_nomic_text_from_hf(model_id: &str, device: WgpuDevice) -> Result<Nom
     load_nomic_text_from_files(&weights, &tokenizer, device)
 }
 
-/// Assemble a `NomicTextEmbedder` from parts: a content-addressed weight
-/// keymap (via [`crate::persist::load_keymap_from_pile`]) + an already-built
-/// tokenizer — from a tokenizer GRAPH ([`crate::persist::load_tokenizer_from_pile`],
-/// the canonical source) or from a tokenizer.json.
+/// Assemble a `NomicTextEmbedder` from a content-addressed weight keymap and
+/// an already-built tokenizer. Native callers select both from the same frozen
+/// collection snapshot via [`crate::selection::load_keymap_from_graph`] and
+/// [`crate::selection::load_tokenizer_from_graph`].
 pub fn nomic_text_from_parts(
     keymap: HashMap<String, (Vec<f32>, Vec<usize>)>,
     tokenizer: tokenizers::Tokenizer,
@@ -2140,18 +2138,6 @@ pub fn load_nomic_text_from_keymap(
     let tok = tokenizers::Tokenizer::from_file(tokenizer)
         .map_err(|e| anyhow::anyhow!("load tokenizer {}: {e}", tokenizer.display()))?;
     nomic_text_from_parts(keymap, tok, device)
-}
-
-/// Load a `NomicTextEmbedder` from JUST an on-disk pile file (plus a
-/// `tokenizer.json`) — the weights live as content-addressed tribles, no
-/// safetensors at load time.
-pub fn load_nomic_text_from_pile(
-    pile_path: &Path,
-    tokenizer: &Path,
-    device: WgpuDevice,
-) -> Result<NomicTextEmbedder<B>> {
-    let keymap = crate::persist::load_keymap_from_pile(pile_path)?;
-    load_nomic_text_from_keymap(keymap, tokenizer, device)
 }
 
 // ===========================================================================
@@ -2586,9 +2572,9 @@ pub fn load_nomic_vision_from_hf(
     load_nomic_vision_from_files(&weights, device)
 }
 
-/// Build a `NomicVisionEmbedder` from a content-addressed weight keymap (the
-/// `name → (f32, shape)` map a pile materializes via
-/// [`crate::persist::load_keymap_from_pile`]).
+/// Build a `NomicVisionEmbedder` from a content-addressed weight keymap, such
+/// as one selected from a frozen native collection snapshot with
+/// [`crate::selection::load_keymap_from_graph`].
 pub fn load_nomic_vision_from_keymap(
     keymap: HashMap<String, (Vec<f32>, Vec<usize>)>,
     device: WgpuDevice,
@@ -2599,14 +2585,4 @@ pub fn load_nomic_vision_from_keymap(
         model: NomicVisionModel::load(&loader, &device),
         device,
     })
-}
-
-/// Load a `NomicVisionEmbedder` from JUST an on-disk pile file — the weights
-/// live as content-addressed tribles, no safetensors at load time.
-pub fn load_nomic_vision_from_pile(
-    pile_path: &Path,
-    device: WgpuDevice,
-) -> Result<NomicVisionEmbedder<B>> {
-    let keymap = crate::persist::load_keymap_from_pile(pile_path)?;
-    load_nomic_vision_from_keymap(keymap, device)
 }
