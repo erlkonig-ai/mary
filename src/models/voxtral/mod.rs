@@ -407,6 +407,71 @@ mod tests {
         assert!(error.to_string().contains("shape handles"), "{error:#}");
     }
 
+    #[cfg(feature = "import")]
+    #[test]
+    fn repeated_f16_derivation_is_physically_idempotent() {
+        let pile = TestPile::new();
+        publish(
+            pile.path(),
+            [component_fragment(
+                crate::persist::QUANTIZATION_NATIVE,
+                &[
+                    ("a.weight", &[1.0_f32, -2.25][..], &[2_u64][..]),
+                    ("b.weight", &[3.5_f32, 4.0][..], &[1_u64, 2][..]),
+                ],
+                false,
+            )],
+        );
+
+        let signing_key = SigningKey::from_bytes(&[0x56; 32]);
+        let mut open = Pile::open(pile.path()).expect("open exact-only Voxtral pile");
+        let derive = |open: &mut Pile| {
+            let snapshot = crate::model_collection::snapshot_model_collection_local_latest(open)
+                .expect("freeze exact Voxtral prefix");
+            let exact = crate::selection::SelectedModelIndex::from_snapshot(
+                snapshot,
+                ModelSelector::Source {
+                    source: SOURCE,
+                    quantization: crate::persist::QUANTIZATION_NATIVE,
+                },
+            )
+            .expect("select exact Voxtral root");
+            crate::persist::derive_selected_f16_to_collection(
+                open,
+                &signing_key,
+                exact,
+                SOURCE,
+                QUANTIZATION_F16,
+            )
+            .expect("derive synthetic f16 root")
+        };
+
+        let (first_root, _, first_tensors, first_elements) = derive(&mut open);
+        let len_after_first = std::fs::metadata(pile.path())
+            .expect("stat first derivation")
+            .len();
+        let (second_root, _, second_tensors, second_elements) = derive(&mut open);
+        let len_after_second = std::fs::metadata(pile.path())
+            .expect("stat repeated derivation")
+            .len();
+
+        assert_eq!(first_root, second_root);
+        assert_eq!((first_tensors, first_elements), (2, 4));
+        assert_eq!((second_tensors, second_elements), (2, 4));
+        assert_eq!(
+            len_after_first, len_after_second,
+            "repeating an identical derivation appended bytes"
+        );
+
+        let complete = crate::model_collection::snapshot_model_collection_local_latest(&mut open)
+            .expect("freeze complete repeated cohort");
+        let weights = VoxtralWeights::from_snapshot(complete).expect("select repeated cohort");
+        assert_eq!(weights.roots().1, first_root);
+        assert_eq!(weights.validate_f16_parity().unwrap(), (2, 4));
+        drop(weights);
+        open.close().expect("close repeated-derivation pile");
+    }
+
     /// Opt-in deployment gate for a full native pile without constructing the
     /// model. The ordinary test suite skips it when no artifact is configured.
     #[test]
