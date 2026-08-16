@@ -24,6 +24,8 @@ use crate::ingest::LeafDtype;
 use crate::nn::weight_loader::read_safetensors_file;
 use anyhow::Context;
 use ed25519_dalek::SigningKey;
+#[cfg(feature = "import")]
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::path::Path;
 #[cfg(feature = "import")]
@@ -86,12 +88,14 @@ pub fn persist_safetensors_files_to_pile(
     persist_files_to_pile(files, pile_path, dtype)
 }
 
-/// Import one model directory into Mary's native append-only model collection.
+/// Ingest one model directory and build its unpublished rooted fragment.
 ///
-/// This is the library seam behind `mary import`. The caller owns the already
-/// open pile, supplies a durable signing identity, and chooses the eventual
-/// durability boundary. This function never creates, opens, flushes, or closes
-/// storage, and it never creates or advances a Repository branch.
+/// Tensor and label blobs are written as content-addressed exhaust, but no
+/// [`CollectionCommit`] is published. This is the commit-last seam for callers
+/// that must validate a complete candidate against existing collection state
+/// before granting it authority. The caller owns the open pile and eventual
+/// durability boundary; this function never creates, opens, flushes, or closes
+/// storage.
 ///
 /// `source` is the model's canonical label — the HF id it was imported from, or
 /// a `--name` for a local-dir import. The root id is content-derived from only
@@ -101,17 +105,14 @@ pub fn persist_safetensors_files_to_pile(
 /// quantization, and shard names are queryable non-core coordinates on it.
 ///
 /// `quantization` tags the weight format ("native" for the faithful import).
-/// The return value is the imported root's entity id plus the complete signed
-/// 192-byte [`CollectionCommit`] needed by an exact collection reader.
 #[cfg(feature = "import")]
-pub fn import_model_to_collection(
+pub fn ingest_model_fragment(
     pile: &mut Pile,
-    signing_key: &SigningKey,
     model_dir: &Path,
     dtype: LeafDtype,
     source: &str,
     quantization: &str,
-) -> anyhow::Result<(Id, CollectionCommit)> {
+) -> anyhow::Result<Fragment> {
     // Detect the container the directory actually ships (safetensors / gguf /
     // pytorch pickle) and gather its weight files. Every format funnels into the
     // SAME content-addressed member path below, so the model-root id stays the
@@ -150,14 +151,31 @@ pub fn import_model_to_collection(
     let mut members: Vec<Id> = Vec::new();
     let mut facts = TribleSet::new();
     let mut provenance: Vec<String> = Vec::new();
+    let mut tensor_names = BTreeSet::new();
     for (path, name) in &files {
         let (mut shard_members, shard_facts) = match fmt {
             crate::formats::WeightFormat::Safetensors => {
-                let bytes = read_safetensors_file(path);
+                let bytes = std::fs::read(path)
+                    .with_context(|| format!("read safetensors file {path:?}"))?;
                 eprintln!(
                     "[persist] ingesting {name} ({} bytes, safetensors)...",
                     bytes.len()
                 );
+                let tensors = safetensors::SafeTensors::deserialize(&bytes)
+                    .with_context(|| format!("decode safetensors file {path:?}"))?;
+                for tensor_name in tensors.names() {
+                    use safetensors::Dtype;
+                    let tensor = tensors.tensor(tensor_name)?;
+                    if matches!(
+                        tensor.dtype(),
+                        Dtype::F64 | Dtype::F32 | Dtype::F16 | Dtype::BF16
+                    ) {
+                        anyhow::ensure!(
+                            tensor_names.insert(tensor_name.to_owned()),
+                            "duplicate tensor name {tensor_name:?} across model weight files"
+                        );
+                    }
+                }
                 crate::ingest::ingest_members(&bytes, pile, dtype, |_| true)
                     .map_err(|e| anyhow::anyhow!("ingest {path:?}: {e}"))?
             }
@@ -168,6 +186,12 @@ pub fn import_model_to_collection(
                     "[persist] ingesting {name} ({} tensors, {fmt:?})...",
                     tensors.len()
                 );
+                for (tensor_name, _, _) in &tensors {
+                    anyhow::ensure!(
+                        tensor_names.insert(tensor_name.clone()),
+                        "duplicate tensor name {tensor_name:?} across model weight files"
+                    );
+                }
                 crate::ingest::ingest_tensors(tensors.into_iter(), pile, dtype)
                     .map_err(|e| anyhow::anyhow!("ingest {path:?}: {e}"))?
             }
@@ -176,9 +200,27 @@ pub fn import_model_to_collection(
         facts += shard_facts;
         provenance.push(name.clone());
     }
-    let root =
-        crate::ingest::build_model_root(pile, source, quantization, members, facts, &provenance)
-            .map_err(|e| anyhow::anyhow!("build model root: {e}"))?;
+    crate::ingest::build_model_root(pile, source, quantization, members, facts, &provenance)
+        .map_err(|e| anyhow::anyhow!("build model root: {e}"))
+}
+
+/// Import one model directory into Mary's native append-only model collection.
+///
+/// This is the library seam behind `mary import`. It stages the complete model
+/// with [`ingest_model_fragment`] and immediately publishes that fragment under
+/// the caller's durable signing identity. Callers with additional domain gates
+/// should stage, validate, and call [`crate::model_collection::publish_model_fragment`]
+/// themselves so publication remains the final authority transition.
+#[cfg(feature = "import")]
+pub fn import_model_to_collection(
+    pile: &mut Pile,
+    signing_key: &SigningKey,
+    model_dir: &Path,
+    dtype: LeafDtype,
+    source: &str,
+    quantization: &str,
+) -> anyhow::Result<(Id, CollectionCommit)> {
+    let root = ingest_model_fragment(pile, model_dir, dtype, source, quantization)?;
     let root_id = root.root().expect("model root id");
     let commit = crate::model_collection::publish_model_fragment(pile, signing_key, root)
         .map_err(|error| anyhow::anyhow!("publish model collection commit: {error}"))?;
@@ -706,37 +748,23 @@ pub fn load_aliased_loader_from_pile(
     Ok(WeightLoader::Pile(keymap))
 }
 
-/// Open a weights pile as the lazy handle-indexed runtime loader
-/// ([`WeightLoader::Aliased`] — nothing materialized wholesale; tensors
-/// resolve on demand through the pile mmap, and `view_f32` serves zero-copy
-/// slices). The one loader every PersonaPlex probe and the realtime
-/// pipeline share.
-/// Non-macOS sibling of [`personaplex_loader`]. There is no Metal aliasing
-/// seam off macOS, so weights are materialized through `WeightLoader::Pile`
-/// instead: with an empty `f16_prefix` the split predicate routes every leaf to
-/// the f32 side, which is exactly the fallback the macOS path already takes
-/// when aliasing is refused. Slower to load, identical semantics.
-#[cfg(all(feature = "qwen3tts", not(target_os = "macos")))]
+/// Load the canonical exact PersonaPlex LM + Mimi root from one frozen native
+/// model-collection snapshot.
+///
+/// Source/quantization ambiguity and non-f32 leaves fail closed before the
+/// runtime loader is built. macOS keeps the established lazy mmap-backed
+/// `AliasedPile`; other platforms materialize the exact root. No Repository
+/// branch, sibling naming convention, or fallback root participates in source
+/// authority.
+#[cfg(feature = "qwen3tts")]
 pub fn personaplex_loader(
     pile_path: &Path,
 ) -> anyhow::Result<crate::nn::weight_loader::WeightLoader> {
-    load_aliased_loader_from_pile(pile_path, "")
-}
-
-#[cfg(all(feature = "qwen3tts", target_os = "macos"))]
-pub fn personaplex_loader(
-    pile_path: &Path,
-) -> anyhow::Result<crate::nn::weight_loader::WeightLoader> {
-    let (f16, f32_, reader) = load_split_index_from_pile(pile_path, "")?;
-    Ok(crate::nn::weight_loader::WeightLoader::Aliased(
-        crate::nn::weight_loader::AliasedPile::new(
-            f16,
-            f32_,
-            reader.clone(), // one union pile: both leaf families share the reader
-            reader,
-            crate::nn::backend::WgpuDevice::default(),
-        ),
-    ))
+    let snapshot = crate::model_collection::load_model_collection_local_latest(pile_path)
+        .with_context(|| format!("load local-latest PersonaPlex snapshot from {pile_path:?}"))?;
+    crate::models::personaplex::PersonaPlexWeights::from_snapshot(snapshot)
+        .with_context(|| format!("select exact PersonaPlex root from {pile_path:?}"))
+        .map(crate::models::personaplex::PersonaPlexWeights::into_loader)
 }
 
 /// The derived FOLDED half-width sibling of a qwen3tts weights pile:

@@ -93,15 +93,7 @@ fn cos_maxd(a: &[f32], b: &[f32]) -> (f64, f64) {
 
 /// Lazy handle-indexed pile loader (nothing materialized wholesale).
 fn pile_loader(pile: &str) -> WeightLoader {
-    let (f16, f32_, reader) = mary::persist::load_split_index_from_pile(Path::new(pile), "")
-        .unwrap_or_else(|e| panic!("pile load: {e}"));
-    WeightLoader::Aliased(mary::nn::weight_loader::AliasedPile::new(
-        f16,
-        f32_,
-        reader.clone(), // one union pile: both leaf families share the reader
-        reader,
-        mary::nn::backend::WgpuDevice::default(), // descriptor only — no GPU work on NdArray
-    ))
+    mary::persist::personaplex_loader(Path::new(pile)).unwrap_or_else(|e| panic!("pile load: {e}"))
 }
 
 /// One oracle prompt-flow step: what `capture_personaplex.py` fed at each of

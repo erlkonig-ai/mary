@@ -7,9 +7,9 @@
 //! [`TribleSet`], its blob reader, and an explicit selector; every selector and
 //! every functional model field has exact-cardinality semantics.
 
-use crate::format::{F32Array, U64Array, attrs};
+use crate::format::{attrs, F32Array, U64Array};
 use crate::ingest::LeafHandles;
-use anyhow::{Context, anyhow, bail};
+use anyhow::{anyhow, bail, Context};
 use std::collections::{BTreeSet, HashMap};
 use triblespace::core::collection::CollectionSnapshot;
 use triblespace::prelude::*;
@@ -316,6 +316,28 @@ pub fn index_keymap_for_root(
 }
 
 impl<R: BlobStoreGet> SelectedModelIndex<R> {
+    /// Resolve and strictly index one model from an explicit graph plus its
+    /// owning reader.
+    ///
+    /// This is the unpublished-candidate seam: callers may union staged facts
+    /// with an authorized snapshot, validate the resulting view, and only then
+    /// publish authority. Storage admission remains entirely with the caller.
+    pub fn from_graph(
+        facts: &TribleSet,
+        reader: R,
+        selector: ModelSelector<'_>,
+    ) -> anyhow::Result<Self> {
+        let root = select_model_root(facts, &reader, selector)
+            .context("select model root from explicit graph")?;
+        let handles = index_keymap_for_root(facts, &reader, root)
+            .with_context(|| format!("index model root {root} from explicit graph"))?;
+        Ok(Self {
+            root,
+            handles,
+            reader,
+        })
+    }
+
     /// Resolve and strictly index one model from an already-frozen collection.
     ///
     /// Storage opening and admission policy remain with the caller. Ambiguous
@@ -326,16 +348,9 @@ impl<R: BlobStoreGet> SelectedModelIndex<R> {
         snapshot: CollectionSnapshot<R>,
         selector: ModelSelector<'_>,
     ) -> anyhow::Result<Self> {
-        let root = select_model_root(snapshot.facts(), snapshot.reader(), selector)
-            .context("select model root from native collection snapshot")?;
-        let handles = index_keymap_for_root(snapshot.facts(), snapshot.reader(), root)
-            .with_context(|| format!("index model root {root} from native collection snapshot"))?;
-        let (_, _, reader) = snapshot.into_parts();
-        Ok(Self {
-            root,
-            handles,
-            reader,
-        })
+        let (facts, _, reader) = snapshot.into_parts();
+        Self::from_graph(&facts, reader, selector)
+            .context("select model from native collection snapshot")
     }
 }
 
@@ -350,7 +365,11 @@ fn read_shape(
     Ok(values.iter().map(|&value| value as usize).collect())
 }
 
-fn materialize_leaf(
+/// Fallibly materialize one indexed tensor leaf, one tensor at a time.
+///
+/// Unlike the legacy ingest helper this propagates missing or malformed blob
+/// errors, making it suitable for commit-last validation gates.
+pub fn materialize_leaf(
     blobs: &impl BlobStoreGet,
     handles: LeafHandles,
 ) -> anyhow::Result<(Vec<f32>, Vec<usize>)> {

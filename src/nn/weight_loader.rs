@@ -36,6 +36,10 @@ pub fn get_tensor_f32(st: &SafeTensors, name: &str) -> (Vec<f32>, Vec<usize>) {
     let data = view.data();
 
     let floats: Vec<f32> = match view.dtype() {
+        safetensors::Dtype::F64 => data
+            .chunks_exact(8)
+            .map(|b| f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32)
+            .collect(),
         safetensors::Dtype::BF16 => data
             .chunks_exact(2)
             .map(|b| bf16::from_le_bytes([b[0], b[1]]).to_f32())
@@ -654,5 +658,28 @@ impl WeightLoader {
             #[cfg(all(any(feature = "qwen3tts", feature = "voxtral"), target_os = "macos"))]
             WeightLoader::Aliased(pile) => pile.leaf(name).is_some(),
         }
+    }
+}
+
+#[cfg(all(test, feature = "import"))]
+mod tests {
+    use super::*;
+    use safetensors::tensor::{serialize, Dtype, TensorView};
+
+    #[test]
+    fn f64_is_widened_through_the_supported_float_path() {
+        let source = [1.25_f64, -2.5];
+        let raw: Vec<u8> = source
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let tensor = TensorView::new(Dtype::F64, vec![2], &raw).unwrap();
+        let bytes = serialize([("wide.weight", tensor)], &None).unwrap();
+        let tensors = SafeTensors::deserialize(&bytes).unwrap();
+
+        assert_eq!(
+            get_tensor_f32(&tensors, "wide.weight"),
+            (vec![1.25_f32, -2.5], vec![2])
+        );
     }
 }

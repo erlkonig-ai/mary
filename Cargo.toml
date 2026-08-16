@@ -482,7 +482,7 @@ required-features = ["gemma"]
 # Concurrent-fit check: PersonaPlex-7B + Gemma-4-31B resident at once (peak RSS).
 [[bin]]
 name = "gemma31b_fit"
-required-features = ["gemma"]
+required-features = ["gemma", "qwen3tts"]
 
 # Vision-encoder load + sanity-forward check for the 31B (from pile).
 [[bin]]

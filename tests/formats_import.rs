@@ -159,6 +159,55 @@ fn native_import_is_exact_selectable_and_byte_idempotent() {
     assert_eq!(by_source["linear.weight"], (weight, vec![2, 2]));
 }
 
+#[test]
+fn duplicate_tensor_names_across_files_publish_no_collection_commit() {
+    let fixture = TempFixture::new("duplicate-tensor-names");
+    let weights = fixture.path().join("weights");
+    std::fs::create_dir(&weights).unwrap();
+    let first_values = f32_bytes(&[1.0_f32]);
+    let second_values = f32_bytes(&[2.0_f32]);
+    serialize_to_file(
+        [(
+            "shared.weight",
+            TensorView::new(Dtype::F32, vec![1], &first_values).unwrap(),
+        )],
+        &None,
+        &weights.join("a.safetensors"),
+    )
+    .unwrap();
+    serialize_to_file(
+        [(
+            "shared.weight",
+            TensorView::new(Dtype::F32, vec![1], &second_values).unwrap(),
+        )],
+        &None,
+        &weights.join("b.safetensors"),
+    )
+    .unwrap();
+
+    let pile_path = fixture.path().join("models.pile");
+    std::fs::File::create(&pile_path).unwrap();
+    let mut pile = Pile::open(&pile_path).unwrap();
+    let error = mary::persist::import_model_to_collection(
+        &mut pile,
+        &SigningKey::from_bytes(&[0x53; 32]),
+        &weights,
+        mary::ingest::LeafDtype::F32,
+        "fixture/duplicate",
+        "native",
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("duplicate tensor name"),
+        "{error:#}"
+    );
+
+    let snapshot = mary::model_collection::snapshot_model_collection_local_latest(&mut pile)
+        .expect("failed import must leave the native collection readable");
+    assert!(snapshot.commits().is_empty());
+    pile.close().unwrap();
+}
+
 /// Locate a cached HF snapshot dir for `id`, or `None` if not downloaded.
 fn hf_snapshot(id: &str) -> Option<PathBuf> {
     let hf_home = std::env::var_os("HF_HOME")

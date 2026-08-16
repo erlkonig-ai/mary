@@ -5,13 +5,14 @@
 //! live together). If the 31B-dense does NOT leave safe headroom, this is where
 //! the 26B-A4B MoE fallback gets flagged.
 //!
-//!   cargo run --release --features gemma,f16gen --bin gemma31b_fit -- \
+//!   cargo run --release --features gemma,qwen3tts,f16gen --bin gemma31b_fit -- \
 //!     --gemma models/gemma_31b.pile --plex models/personaplex.pile
 //!
-//! Both weight sets load as f16 (native width): the 31B via the zero-copy
-//! aliased loader (mmap → GPU, no copy), PersonaPlex via the same aliased index
-//! then each f16 leaf uploaded to a resident GPU tensor. GPU allocations on
-//! Apple silicon are unified memory, so peak RSS is the real system footprint.
+//! The 31B loads as f16 via the zero-copy aliased loader (mmap → GPU, no
+//! copy). PersonaPlex is selected from its exact native f32 collection root,
+//! then each leaf is converted into a resident f16 GPU tensor. GPU allocations
+//! on Apple silicon are unified memory, so peak RSS is the real system
+//! footprint.
 
 #[cfg(target_os = "macos")]
 mod imp {
@@ -65,18 +66,21 @@ mod imp {
         let device = mary::models::gemma::metal_device::init_metal_device_16gb();
         eprintln!("[fit] baseline RSS: {:.2} GiB", rss_gib());
 
-        // ── PersonaPlex-7B: alias every f16 leaf onto the GPU, hold resident ──────
-        // Uses the same handle index + reader the realtime probe uses; each leaf is
-        // uploaded to a GPU tensor and kept in `plex_resident` so it stays live.
+        // ── PersonaPlex-7B: convert every exact leaf onto the GPU, hold resident ───
+        // Freeze and strictly select the same native root the realtime loader
+        // uses; each exact leaf is uploaded at f16 and kept in
+        // `plex_resident` so it stays live.
         eprintln!("[fit] loading PersonaPlex-7B weights ({plex_pile}) onto GPU...");
-        let (f16, f32_, reader) =
-            mary::persist::load_split_index_from_pile(Path::new(&plex_pile), "")
-                .expect("plex index");
+        let snapshot =
+            mary::model_collection::load_model_collection_local_latest(Path::new(&plex_pile))
+                .expect("PersonaPlex collection snapshot");
+        let plex = mary::models::personaplex::PersonaPlexWeights::from_snapshot(snapshot)
+            .expect("canonical exact PersonaPlex root");
         let mut plex_resident: Vec<Tensor<BHalf, 1>> = Vec::new();
         let mut plex_bytes: u64 = 0;
         let mut plex_params: u64 = 0;
-        for (_name, handles) in f16.iter().chain(f32_.iter()) {
-            let (data, _shape) = mary::ingest::read_leaf(&reader, *handles);
+        for handles in plex.exact().values() {
+            let (data, _shape) = mary::ingest::read_leaf(plex.reader(), *handles);
             let n = data.len();
             plex_params += n as u64;
             plex_bytes += (n * 2) as u64; // f16 resident width
