@@ -153,7 +153,8 @@ bandwidth lever) accelerate the realtime path.
 A Burn port of Voxtral-Mini-4B-Realtime (Apache-2.0): delay-conditioned
 streaming speech-to-text, one autoregressive step per 80 ms frame with the text
 held 80 ms–2.4 s behind the audio via ada-RMS-norm conditioning. Feature
-`voxtral`.
+`voxtral`. Runtime loading selects one exact-f32/full-f16 cohort from a frozen
+native model-collection snapshot; missing or ambiguous roots fail closed.
 
 ### `personaplex` — PersonaPlex-7B (full-duplex speech LM)
 

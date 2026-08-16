@@ -75,10 +75,8 @@ use crate::nn::weight_loader::WeightLoader;
 
 /// The derived sibling of a weights pile for a runtime format tag:
 /// `models/personaplex.pile` + `"q8"` → `models/personaplex_q8.pile`.
-/// Extends the `<stem>_f16` discovery convention
-/// ([`crate::persist::f16_sibling_path`]) across the whole format axis
-/// (`q4` / `q8` / `f16` for the temporal stack, `depth` for the depformer
-/// operands).
+/// Applies one local naming convention across the whole format axis (`q4` /
+/// `q8` / `f16` for the temporal stack, `depth` for depformer operands).
 pub fn derived_sibling_path(pile_path: &Path, tag: &str) -> PathBuf {
     let stem = pile_path
         .file_stem()

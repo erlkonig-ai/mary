@@ -28,13 +28,11 @@
 //! Runs on any backend; the realtime lanes are `RealtimeTranscriber<BFusedHalf>` (fusion
 //! + f16 weights, `--lane half`) and `RealtimeTranscriber<BHalf>` (raw unfused f16,
 //! `--lane rawhalf` — same folded graph, loaded ZERO-COPY: every f16 leaf
-//! aliases the mmap'd sibling pile straight onto the GPU, the fold transforms
+//! aliases the native collection mmap straight onto the GPU, the fold transforms
 //! read the pile's own pages, and the embed table stays file-backed for the
-//! process life). The f16 weights come from the derived sibling pile
-//! `<stem>_f16.pile` when present (`voxtral_persist --f16-derive`, uploaded at
-//! native width — no whole-model f32 materialization) and are otherwise cast
-//! from the f32 leaves at load; both routes are bit-identical (`f16::from_f32`
-//! either way), and the f32 pile is never written. Word-exactness gate:
+//! process life). One frozen model-collection snapshot must contain the exact
+//! f32 and full derived f16 roots with identical name/shape domains; missing or
+//! ambiguous roots fail before model construction. Word-exactness gate:
 //! `voxtral_listen` de_short@480 ms 13/13.
 
 use burn::prelude::*;

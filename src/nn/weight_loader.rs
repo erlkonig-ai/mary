@@ -276,9 +276,9 @@ pub enum WeightLoader {
 
 /// The state behind [`WeightLoader::Aliased`]: cheap handle indexes (no tensor
 /// data) for the half-width and exact leaf families, plus the pile readers
-/// whose mmaps the aliased tensors bind. The two families may live in ONE pile
-/// (the qwen3tts `talker_f16` layout — both readers are clones) or in TWO
-/// (voxtral's derived `<stem>_f16.pile` sibling next to the exact f32 pile).
+/// whose mmaps the aliased tensors bind. Native Qwen3-TTS and Voxtral cohorts
+/// pass clones of one shared snapshot reader; the two-reader low-level shape
+/// also supports callers that intentionally compose independent stores.
 /// Requests on `BFusedHalf` upload `f16` leaves at native width; requests on
 /// `BFused` upload `f32` leaves; requests on the RAW (unfused) backends
 /// (`BHalf`/`B`) alias the matching-width leaves' mmap'd pile pages straight

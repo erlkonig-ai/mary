@@ -1,7 +1,207 @@
 //! Voxtral-Mini-4B-Realtime-2602 — delay-conditioned streaming
 //! speech-to-text (one AR step per 80 ms frame, text delayed 80 ms–2.4 s
 //! behind the audio via ada-RMS-norm conditioning). Architecture + port log:
-//! `docs/VOXTRAL_ARCH.md`. Weights: `models/voxtral_mini.pile`.
+//! `docs/VOXTRAL_ARCH.md`. Runtime weights are two explicit roots in one
+//! frozen native model-collection snapshot: the exact f32 checkpoint and its
+//! full f16 derivation.
+
+use crate::ingest::LeafHandles;
+use crate::nn::weight_loader::WeightLoader;
+use crate::selection::{index_keymap_for_root, select_model_root, ModelSelector};
+use std::collections::HashMap;
+use triblespace::core::collection::CollectionSnapshot;
+use triblespace::core::repo::pile::PileReader;
+use triblespace::prelude::*;
+
+/// Canonical source coordinate shared by Voxtral's exact and derived roots.
+pub const SOURCE: &str = "mistralai/Voxtral-Mini-4B-Realtime-2602";
+
+/// Quantization coordinate of Voxtral's full half-width derivation.
+pub const QUANTIZATION_F16: &str = "f16";
+
+/// The complete live Voxtral weight cohort selected from one immutable native
+/// model-collection snapshot.
+///
+/// Both roots must describe exactly the same tensor-name/shape domain. The
+/// exact root contains only f32 leaves and the derived root only f16 leaves.
+/// Once those invariants are checked, only the two compact indexes and their
+/// one owning reader remain resident; no sibling-file naming, repository
+/// ancestry, or fallback root participates in runtime loading.
+pub struct VoxtralWeights<R> {
+    exact_root: Id,
+    f16_root: Id,
+    exact: HashMap<String, LeafHandles>,
+    f16: HashMap<String, LeafHandles>,
+    reader: R,
+}
+
+fn shape_handle(handles: LeafHandles) -> Inline<inlineencodings::Handle<crate::format::U64Array>> {
+    match handles {
+        LeafHandles::F32(_, shape) | LeafHandles::F16(_, shape) => shape,
+    }
+}
+
+impl<R: BlobStoreGet> VoxtralWeights<R> {
+    /// Select and validate the exact/f16 pair from one already-frozen snapshot.
+    pub fn from_snapshot(snapshot: CollectionSnapshot<R>) -> anyhow::Result<Self> {
+        fn select(
+            snapshot: &CollectionSnapshot<impl BlobStoreGet>,
+            quantization: &str,
+        ) -> anyhow::Result<(Id, HashMap<String, LeafHandles>)> {
+            let root = select_model_root(
+                snapshot.facts(),
+                snapshot.reader(),
+                ModelSelector::Source {
+                    source: SOURCE,
+                    quantization,
+                },
+            )?;
+            let index = index_keymap_for_root(snapshot.facts(), snapshot.reader(), root)?;
+            Ok((root, index))
+        }
+
+        let (exact_root, exact) = select(&snapshot, crate::persist::QUANTIZATION_NATIVE)?;
+        let (f16_root, f16) = select(&snapshot, QUANTIZATION_F16)?;
+
+        for (name, handles) in &exact {
+            if !matches!(handles, LeafHandles::F32(..)) {
+                anyhow::bail!("Voxtral exact tensor {name:?} is not f32");
+            }
+        }
+        for (name, handles) in &f16 {
+            if !matches!(handles, LeafHandles::F16(..)) {
+                anyhow::bail!("Voxtral derived tensor {name:?} is not f16");
+            }
+        }
+        anyhow::ensure!(
+            exact.len() == f16.len(),
+            "Voxtral cohort name-set mismatch: {} exact tensors, {} f16 tensors",
+            exact.len(),
+            f16.len()
+        );
+        for (name, exact_handles) in &exact {
+            let derived_handles = f16
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("Voxtral f16 root is missing tensor {name:?}"))?;
+            anyhow::ensure!(
+                shape_handle(*exact_handles) == shape_handle(*derived_handles),
+                "Voxtral tensor {name:?} has different exact/f16 shape handles"
+            );
+        }
+
+        let (_, _, reader) = snapshot.into_parts();
+        Ok(Self {
+            exact_root,
+            f16_root,
+            exact,
+            f16,
+            reader,
+        })
+    }
+
+    /// Content-addressed roots of the exact and f16 models.
+    pub const fn roots(&self) -> (Id, Id) {
+        (self.exact_root, self.f16_root)
+    }
+
+    /// Number of tensors in each root (equal for every valid cohort).
+    pub fn counts(&self) -> (usize, usize) {
+        (self.exact.len(), self.f16.len())
+    }
+
+    /// Exact tensor index retained for source-parity gates.
+    pub fn exact(&self) -> &HashMap<String, LeafHandles> {
+        &self.exact
+    }
+
+    /// Half-width tensor index retained for derivation-parity gates.
+    pub fn f16(&self) -> &HashMap<String, LeafHandles> {
+        &self.f16
+    }
+
+    /// Reader owning every attachment named by both indexes.
+    pub const fn reader(&self) -> &R {
+        &self.reader
+    }
+
+    /// Verify every stored f16 bit against `f16::from_f32` of the exact root.
+    /// Data is fetched and compared one tensor at a time.
+    pub fn validate_f16_parity(&self) -> anyhow::Result<(usize, usize)> {
+        let mut names: Vec<_> = self.exact.keys().collect();
+        names.sort_unstable();
+        let mut elements = 0;
+        for name in &names {
+            let (exact_data, _) = match self.exact[*name] {
+                LeafHandles::F32(data, shape) => (data, shape),
+                LeafHandles::F16(..) => unreachable!("validated exact width"),
+            };
+            let (f16_data, _) = match self.f16[*name] {
+                LeafHandles::F16(data, shape) => (data, shape),
+                LeafHandles::F32(..) => unreachable!("validated derived width"),
+            };
+            let exact_bytes: anybytes::Bytes = self
+                .reader
+                .get(exact_data)
+                .map_err(|error| anyhow::anyhow!("read exact tensor {name:?}: {error}"))?;
+            let f16_bytes: anybytes::Bytes = self
+                .reader
+                .get(f16_data)
+                .map_err(|error| anyhow::anyhow!("read f16 tensor {name:?}: {error}"))?;
+            let exact_values = exact_bytes
+                .view::<[f32]>()
+                .map_err(|error| anyhow::anyhow!("decode exact tensor {name:?}: {error}"))?;
+            let f16_values = f16_bytes
+                .view::<[half::f16]>()
+                .map_err(|error| anyhow::anyhow!("decode f16 tensor {name:?}: {error}"))?;
+            anyhow::ensure!(
+                exact_values.len() == f16_values.len(),
+                "Voxtral tensor {name:?} has {} exact elements but {} f16 elements",
+                exact_values.len(),
+                f16_values.len()
+            );
+            for (index, (&exact, &derived)) in
+                exact_values.iter().zip(f16_values.iter()).enumerate()
+            {
+                let wanted = half::f16::from_f32(exact);
+                anyhow::ensure!(
+                    wanted.to_bits() == derived.to_bits(),
+                    "Voxtral tensor {name:?}[{index}] f16 bits differ from exact cast"
+                );
+            }
+            elements += exact_values.len();
+        }
+        Ok((names.len(), elements))
+    }
+}
+
+impl VoxtralWeights<PileReader> {
+    /// Consume the validated cohort into the platform's lazy runtime loader.
+    ///
+    /// macOS uses one `AliasedPile` over the shared reader. Other platforms
+    /// materialize the exact index into the existing portable pile loader,
+    /// visiting the source mapping one tensor at a time.
+    pub fn into_loader(self) -> WeightLoader {
+        #[cfg(target_os = "macos")]
+        {
+            return WeightLoader::Aliased(crate::nn::weight_loader::AliasedPile::new(
+                self.f16,
+                self.exact,
+                self.reader.clone(),
+                self.reader,
+                crate::nn::backend::WgpuDevice::default(),
+            ));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let keymap = self
+                .exact
+                .into_iter()
+                .map(|(name, handles)| (name, crate::ingest::read_leaf(&self.reader, handles)))
+                .collect();
+            WeightLoader::Pile(keymap)
+        }
+    }
+}
 
 pub mod config;
 pub mod decoder;
@@ -11,3 +211,216 @@ pub mod layers;
 pub mod mel;
 pub mod pipeline;
 pub mod tokenizer;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::{attrs, F32Array, U64Array};
+    use ed25519_dalek::SigningKey;
+    use std::fs::OpenOptions;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use triblespace::core::repo::pile::Pile;
+    use triblespace::prelude::blobencodings::LongString;
+
+    static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestPile(PathBuf);
+
+    impl TestPile {
+        fn new() -> Self {
+            let ordinal = NEXT_TEST_PILE.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "mary-voxtral-native-{}-{nanos}-{ordinal}.pile",
+                std::process::id()
+            ));
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .expect("create synthetic Voxtral pile");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestPile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn component_fragment(
+        quantization: &str,
+        tensors: &[(&str, &[f32], &[u64])],
+        f16: bool,
+    ) -> Fragment {
+        let mut fragment = Fragment::empty();
+        let mut members = Vec::new();
+        for &(tensor, values, dims) in tensors {
+            let shape = fragment.put::<U64Array, _>(dims.to_vec());
+            let leaf = if f16 {
+                let values: Vec<_> = values.iter().copied().map(half::f16::from_f32).collect();
+                let data = fragment.put::<crate::f16enc::F16Array, _>(values);
+                entity! { _ @ attrs::data_f16: data, attrs::shape: shape }
+            } else {
+                let data = fragment.put::<F32Array, _>(values.to_vec());
+                entity! { _ @ attrs::data: data, attrs::shape: shape }
+            };
+            let leaf_id = leaf.root().expect("tensor leaf root");
+            fragment += leaf;
+            let name = fragment.put::<LongString, _>(tensor.to_owned());
+            let member = entity! { _ @ attrs::safetensor_path: name, attrs::weight: &leaf_id };
+            members.push(member.root().expect("model member root"));
+            fragment += member;
+        }
+        let source = fragment.put::<LongString, _>(SOURCE.to_owned());
+        fragment += entity! { _ @
+            attrs::source: source,
+            attrs::quantization: quantization,
+            attrs::member*: members.iter(),
+        };
+        fragment
+    }
+
+    fn publish(path: &Path, fragments: impl IntoIterator<Item = Fragment>) {
+        let mut pile = Pile::open(path).expect("open synthetic Voxtral pile");
+        for fragment in fragments {
+            crate::model_collection::publish_model_fragment(
+                &mut pile,
+                &SigningKey::from_bytes(&[0x56; 32]),
+                fragment,
+            )
+            .expect("publish native Voxtral component");
+        }
+        pile.close().expect("close synthetic Voxtral pile");
+    }
+
+    fn valid_cohort() -> [Fragment; 2] {
+        let tensors = [
+            ("a.weight", &[1.0_f32, 2.0][..], &[2_u64][..]),
+            ("b.weight", &[3.0_f32, 4.0][..], &[1_u64, 2][..]),
+        ];
+        [
+            component_fragment(crate::persist::QUANTIZATION_NATIVE, &tensors, false),
+            component_fragment(QUANTIZATION_F16, &tensors, true),
+        ]
+    }
+
+    fn load(path: &Path) -> anyhow::Result<VoxtralWeights<PileReader>> {
+        let snapshot = crate::model_collection::load_model_collection_local_latest(path)?;
+        VoxtralWeights::from_snapshot(snapshot)
+    }
+
+    #[test]
+    fn valid_cohort_is_frozen_and_later_coordinate_ambiguity_fails_fresh_loads() {
+        let pile = TestPile::new();
+        publish(pile.path(), valid_cohort());
+        let frozen = load(pile.path()).expect("valid Voxtral cohort");
+        assert_eq!(frozen.counts(), (2, 2));
+        assert_eq!(frozen.validate_f16_parity().unwrap(), (2, 4));
+
+        publish(
+            pile.path(),
+            [component_fragment(
+                QUANTIZATION_F16,
+                &[("other.weight", &[9.0], &[1])],
+                true,
+            )],
+        );
+        assert_eq!(frozen.counts(), (2, 2));
+        let error = load(pile.path()).err().expect("ambiguous f16 coordinate");
+        assert!(
+            error.to_string().contains("ambiguous model root"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn missing_or_wrong_width_roots_fail_closed() {
+        let missing = TestPile::new();
+        publish(
+            missing.path(),
+            [component_fragment(
+                crate::persist::QUANTIZATION_NATIVE,
+                &[("weight", &[1.0], &[1])],
+                false,
+            )],
+        );
+        let error = load(missing.path()).err().expect("missing f16 root");
+        assert!(error.to_string().contains("no model root"), "{error:#}");
+
+        let wrong = TestPile::new();
+        publish(
+            wrong.path(),
+            [
+                component_fragment(
+                    crate::persist::QUANTIZATION_NATIVE,
+                    &[("weight", &[1.0], &[1])],
+                    true,
+                ),
+                component_fragment(QUANTIZATION_F16, &[("weight", &[1.0], &[1])], true),
+            ],
+        );
+        let error = load(wrong.path()).err().expect("wrong exact width");
+        assert!(error.to_string().contains("exact tensor"), "{error:#}");
+    }
+
+    #[test]
+    fn tensor_name_and_shape_domains_must_match_exactly() {
+        let names = TestPile::new();
+        publish(
+            names.path(),
+            [
+                component_fragment(
+                    crate::persist::QUANTIZATION_NATIVE,
+                    &[("exact.weight", &[1.0], &[1])],
+                    false,
+                ),
+                component_fragment(QUANTIZATION_F16, &[("derived.weight", &[1.0], &[1])], true),
+            ],
+        );
+        let error = load(names.path()).err().expect("different tensor names");
+        assert!(error.to_string().contains("missing tensor"), "{error:#}");
+
+        let shapes = TestPile::new();
+        publish(
+            shapes.path(),
+            [
+                component_fragment(
+                    crate::persist::QUANTIZATION_NATIVE,
+                    &[("weight", &[1.0, 2.0], &[2])],
+                    false,
+                ),
+                component_fragment(QUANTIZATION_F16, &[("weight", &[1.0, 2.0], &[1, 2])], true),
+            ],
+        );
+        let error = load(shapes.path()).err().expect("different shape handles");
+        assert!(error.to_string().contains("shape handles"), "{error:#}");
+    }
+
+    /// Opt-in deployment gate for a full native pile without constructing the
+    /// model. The ordinary test suite skips it when no artifact is configured.
+    #[test]
+    fn configured_native_pile_has_a_bit_exact_complete_cohort() {
+        let Ok(path) = std::env::var("MARY_VOXTRAL_NATIVE_PILE") else {
+            return;
+        };
+        let weights = load(Path::new(&path)).expect("load configured native Voxtral cohort");
+        assert_eq!(weights.counts(), (711, 711));
+        let (tensors, elements) = weights
+            .validate_f16_parity()
+            .expect("validate configured exact/f16 bit parity");
+        eprintln!("validated {tensors} Voxtral tensors / {elements} elements");
+        assert_eq!(tensors, 711);
+        assert!(elements > 0);
+    }
+}

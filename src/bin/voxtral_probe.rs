@@ -15,9 +15,9 @@
 //!   cargo run --release --features voxtral --bin voxtral_probe -- \
 //!     [--pile <path>] [--gold <dir>] [--long] [--lane raw|fold|half]
 //!
-//! Weights come from `--pile`, else `$MARY_MODELS/voxtral_mini.pile` (the
-//! persist gate guarantees the pile is bit-identical to the checkpoint). There
-//! is no baked-in default path. `--long` adds the
+//! Weights come from `--pile`, else `$MARY_MODELS/voxtral_mini.pile`. The
+//! native cohort gate requires one exact/f16 pair bit-identical to the source;
+//! there is no missing-root fallback or sibling discovery. `--long` adds the
 //! en_long / denglish streams (slow).
 //!
 //! Lanes: `raw` (default) = the full oracle parity suite on the op-for-op
@@ -26,7 +26,7 @@
 //! the oracle (folds are exact math). `half` = the folded layout on fusion
 //! f16; tokens may drift by AR cascade, gate is WORD-exact transcripts.
 //! `rawhalf` = the folded layout on the RAW (unfused) Metal f16 backend,
-//! zero-copy loaded from the f16 sibling pile; same gate as `half`, and the
+//! zero-copy loaded from the native f16 root; same gate as `half`, and the
 //! printed token digest allows a cross-lane identity check against `half`.
 
 use burn::prelude::*;
@@ -80,8 +80,8 @@ fn main() {
             .position(|a| a == flag)
             .map(|i| args[i + 1].clone())
     };
-    let pile = mary::paths::model(arg("--pile").as_deref(), "voxtral_mini.pile")
-        .unwrap_or_else(|e| {
+    let pile =
+        mary::paths::model(arg("--pile").as_deref(), "voxtral_mini.pile").unwrap_or_else(|e| {
             eprintln!("{e}");
             std::process::exit(2)
         });
@@ -99,9 +99,11 @@ fn main() {
     let dev = Default::default();
     eprintln!("loading stt from {pile:?} (lane {lane}) ...");
     let t0 = std::time::Instant::now();
-    // Sibling-aware (see voxtral_listen): the half lane uploads f16 leaves
-    // from `<stem>_f16.pile` when present, else falls back to f32+cast.
-    let loader = mary::persist::load_loader_with_f16_sibling(&pile, "ears_f16").expect("pile load");
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile)
+        .expect("load native Voxtral snapshot");
+    let loader = mary::models::voxtral::VoxtralWeights::from_snapshot(snapshot)
+        .expect("select complete native Voxtral cohort")
+        .into_loader();
     match lane.as_str() {
         "raw" => {}
         "fold" => {

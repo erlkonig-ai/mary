@@ -17,9 +17,9 @@
 //! [`crate::ingest::load_keymap`]. The f32 blobs store weights exactly, so the
 //! round-trip is lossless.
 
+use crate::ingest::load_keymap;
 #[cfg(feature = "import")]
 use crate::ingest::LeafDtype;
-use crate::ingest::load_keymap;
 #[cfg(feature = "import")]
 use crate::nn::weight_loader::read_safetensors_file;
 use anyhow::Context;
@@ -183,6 +183,84 @@ pub fn import_model_to_collection(
     let commit = crate::model_collection::publish_model_fragment(pile, signing_key, root)
         .map_err(|error| anyhow::anyhow!("publish model collection commit: {error}"))?;
     Ok((root_id, commit))
+}
+
+/// Derive one complete f16 model root from an already-selected exact f32 root
+/// and publish it into the caller's same open native model collection.
+///
+/// The selected snapshot owns the immutable source reader. Tensors are visited
+/// in deterministic name order and each f32 payload is materialized, converted,
+/// and persisted before the next is read, so peak host weight memory is one
+/// tensor rather than the model. The caller supplies both the target coordinate
+/// and signing identity and retains the pile/durability boundary.
+#[cfg(feature = "import")]
+pub fn derive_selected_f16_to_collection<R: BlobStoreGet>(
+    pile: &mut Pile,
+    signing_key: &SigningKey,
+    selected: crate::selection::SelectedModelIndex<R>,
+    source: &str,
+    quantization: &str,
+) -> anyhow::Result<(Id, CollectionCommit, usize, usize)> {
+    let (_, mut index, reader) = selected.into_parts();
+    anyhow::ensure!(!index.is_empty(), "cannot derive an empty f16 model root");
+    for (name, handles) in &index {
+        anyhow::ensure!(
+            matches!(handles, crate::ingest::LeafHandles::F32(..)),
+            "{name}: f16 derivation requires an exact f32 source root"
+        );
+    }
+
+    let mut names: Vec<_> = index.keys().cloned().collect();
+    names.sort_unstable();
+    let mut members = Vec::with_capacity(names.len());
+    let mut facts = TribleSet::new();
+    let mut elements = 0;
+    for (ordinal, name) in names.into_iter().enumerate() {
+        let handles = index.remove(&name).expect("name collected from index");
+        let (data_handle, shape_handle) = match handles {
+            crate::ingest::LeafHandles::F32(data, shape) => (data, shape),
+            crate::ingest::LeafHandles::F16(..) => unreachable!("validated exact width"),
+        };
+        let data_bytes: anybytes::Bytes = reader
+            .get(data_handle)
+            .map_err(|error| anyhow::anyhow!("read exact tensor {name:?}: {error}"))?;
+        let data = data_bytes
+            .view::<[f32]>()
+            .with_context(|| format!("decode exact tensor {name:?}"))?
+            .to_vec();
+        let shape_bytes: anybytes::Bytes = reader
+            .get(shape_handle)
+            .map_err(|error| anyhow::anyhow!("read shape for exact tensor {name:?}: {error}"))?;
+        let shape = shape_bytes
+            .view::<[u64]>()
+            .with_context(|| format!("decode shape for exact tensor {name:?}"))?
+            .iter()
+            .map(|&dimension| {
+                usize::try_from(dimension).with_context(|| {
+                    format!("shape dimension {dimension} for exact tensor {name:?} exceeds usize")
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        elements += data.len();
+        let (mut tensor_members, tensor_facts) = crate::ingest::ingest_tensors(
+            std::iter::once((name, data, shape)),
+            pile,
+            crate::ingest::LeafDtype::F16,
+        )
+        .map_err(|error| anyhow::anyhow!("derive f16 tensor: {error}"))?;
+        members.append(&mut tensor_members);
+        facts += tensor_facts;
+        if (ordinal + 1) % 100 == 0 {
+            eprintln!("[persist] {} tensors derived → f16 ...", ordinal + 1);
+        }
+    }
+    let tensor_count = members.len();
+    let root = crate::ingest::build_model_root(pile, source, quantization, members, facts, &[])
+        .map_err(|error| anyhow::anyhow!("build derived f16 model root: {error}"))?;
+    let root_id = root.root().expect("derived f16 model root");
+    let commit = crate::model_collection::publish_model_fragment(pile, signing_key, root)
+        .map_err(|error| anyhow::anyhow!("publish derived f16 model root: {error}"))?;
+    Ok((root_id, commit, tensor_count, elements))
 }
 
 /// Import one safetensors file's selected float tensors into Mary's native
@@ -659,205 +737,6 @@ pub fn personaplex_loader(
             crate::nn::backend::WgpuDevice::default(),
         ),
     ))
-}
-
-/// The derived half-width SIBLING of a weights pile: `<stem>_f16.pile` next to
-/// it (`models/voxtral_mini.pile` → `models/voxtral_mini_f16.pile`). Written
-/// by `voxtral_persist --f16-derive`; auto-discovered by
-/// [`load_loader_with_f16_sibling`].
-pub fn f16_sibling_path(pile_path: &Path) -> std::path::PathBuf {
-    let stem = pile_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("weights");
-    pile_path.with_file_name(format!("{stem}_f16.pile"))
-}
-
-/// The runtime weight loader for an exact-f32 pile that MAY have a derived
-/// half-width sibling pile next to it (see [`f16_sibling_path`] /
-/// [`derive_f16_pile`]) — the two-pile variant of
-/// [`load_aliased_loader_from_pile`]. On macOS this is the fast
-/// [`WeightLoader::Aliased`]: `BFusedHalf` requests upload the sibling's f16
-/// leaves at native width (no f32 materialization, half the I/O — this is
-/// what deletes the ~2×-weights transient host spike and most of the load
-/// time), `BHalf` (raw, unfused) requests alias the sibling's f16 leaves
-/// ZERO-COPY onto the GPU (mmap'd pile pages, no upload at all — the
-/// `rawhalf` ear lane), `BFused` requests upload the exact f32 leaves, and
-/// everything else materializes lazily one tensor at a time. When the
-/// sibling pile is absent the same loader still works — f16-backend tensors
-/// materialize from the exact leaves and cast on upload (bit-identical
-/// result, just slower) — so piles without a derived sibling keep loading
-/// unchanged. Elsewhere (or under `MARY_SPEAK_MATERIALIZE=1`, the A/B
-/// switch) the exact materialized keymap.
-#[cfg(any(feature = "qwen3tts", feature = "voxtral"))]
-pub fn load_loader_with_f16_sibling(
-    pile_path: &Path,
-    f16_entity: &str,
-) -> anyhow::Result<crate::nn::weight_loader::WeightLoader> {
-    use crate::nn::weight_loader::WeightLoader;
-    let (_, f32_, f32_reader) = load_split_index_from_pile(pile_path, "")?;
-    anyhow::ensure!(
-        !f32_.is_empty(),
-        "no exact (f32) model entities in pile {pile_path:?}"
-    );
-    let sibling = f16_sibling_path(pile_path);
-    let (f16, f16_reader) = if sibling.exists() {
-        let (f16, _, r) = load_split_index_from_pile(&sibling, f16_entity)?;
-        anyhow::ensure!(
-            !f16.is_empty(),
-            "sibling pile {sibling:?} exists but has no '{f16_entity}' entity"
-        );
-        eprintln!(
-            "[mary] half-width sibling {sibling:?}: {} f16 leaves",
-            f16.len()
-        );
-        (f16, r)
-    } else {
-        eprintln!(
-            "[mary] no half-width sibling {sibling:?} — f16-backend tensors will \
-             materialize+cast (derive it with: voxtral_persist --f16-derive <pile>)"
-        );
-        (HashMap::new(), f32_reader.clone())
-    };
-    let materialize = std::env::var("MARY_SPEAK_MATERIALIZE").is_ok();
-    #[cfg(target_os = "macos")]
-    if !materialize {
-        return Ok(WeightLoader::Aliased(
-            crate::nn::weight_loader::AliasedPile::new(
-                f16,
-                f32_,
-                f16_reader,
-                f32_reader,
-                crate::nn::backend::WgpuDevice::default(),
-            ),
-        ));
-    }
-    if materialize {
-        eprintln!("[mary] MARY_SPEAK_MATERIALIZE set — using the fully materialized load");
-    }
-    let _ = (f16, f16_reader); // half-width leaves are only for aliasing
-    let keymap = f32_
-        .into_iter()
-        .map(|(k, h)| (k, crate::ingest::read_leaf(&f32_reader, h)))
-        .collect();
-    Ok(WeightLoader::Pile(keymap))
-}
-
-/// Derive a HALF-WIDTH weights pile from an existing exact-f32 pile: every
-/// f32 leaf of every model entity in `src_pile` is read back (one tensor at a
-/// time — peak host RAM is one tensor, not the model), cast host-side to f16
-/// (`f16::from_f32` — the exact rounding the materializing loader applies on
-/// an f16 backend, so fast-loaded weights stay bit-identical to the old
-/// cast-on-load path), and persisted as a `data_f16` leaf under ONE model
-/// entity named `entity_name` in `dst_pile`. The source pile is only ever
-/// read; the destination pile is created (or appended — piles only grow).
-/// Separate-pile-now / merge-later is the cheap direction: piles union by
-/// `cat` + consolidate, and the f16 sibling gets its own lifecycle (a
-/// deployment machine can carry just the half-width pile). Returns
-/// `(tensor count, element count)`.
-pub fn derive_f16_pile(
-    src_pile: &Path,
-    dst_pile: &Path,
-    entity_name: &str,
-) -> anyhow::Result<(usize, usize)> {
-    use crate::format::attrs;
-    anyhow::ensure!(
-        src_pile.canonicalize()?
-            != dst_pile
-                .canonicalize()
-                .unwrap_or_else(|_| dst_pile.to_path_buf()),
-        "src and dst are the same pile file {src_pile:?}"
-    );
-    let (_, src_idx, src_reader) = load_split_index_from_pile(src_pile, "")?;
-    anyhow::ensure!(!src_idx.is_empty(), "no model entities in {src_pile:?}");
-
-    if !dst_pile.exists() {
-        eprintln!("[persist] pile {dst_pile:?} does not exist — creating a NEW empty pile");
-        std::fs::File::create(dst_pile)
-            .map_err(|e| anyhow::anyhow!("create pile {dst_pile:?}: {e}"))?;
-    }
-    let mut pile =
-        Pile::open(dst_pile).map_err(|e| anyhow::anyhow!("open pile {dst_pile:?}: {e:?}"))?;
-    // Non-mutating load; NEVER amputate here (see persist_safetensors_files_to_pile).
-    pile.refresh().map_err(|e| {
-        anyhow::anyhow!(
-            "pile {dst_pile:?} failed to load ({e:?}); refusing to auto-truncate — \
-             if the tail is a genuinely torn write, amputate explicitly with \
-             `trible pile amputate`"
-        )
-    })?;
-    let mut repo = Repository::new(
-        pile,
-        SigningKey::generate(&mut rand::rngs::OsRng),
-        TribleSet::new(),
-    )
-    .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
-    let branch_id = match repo
-        .lookup_branch("main")
-        .map_err(|e| anyhow::anyhow!("lookup main: {e:?}"))?
-    {
-        Some(id) => id,
-        None => *repo
-            .create_branch("main", None)
-            .map_err(|e| anyhow::anyhow!("create main: {e:?}"))?,
-    };
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull main: {e:?}"))?;
-
-    // Deterministic order (the source index is a HashMap).
-    let mut names: Vec<&String> = src_idx.keys().collect();
-    names.sort();
-    let mut members: Vec<Id> = Vec::new();
-    let mut facts = TribleSet::new();
-    let (mut count, mut elems) = (0usize, 0usize);
-    for name in names {
-        let handles = src_idx[name];
-        anyhow::ensure!(
-            matches!(handles, crate::ingest::LeafHandles::F32(..)),
-            "{name}: source leaf is not f32 — derive_f16_pile expects an exact-f32 source pile"
-        );
-        let (data, shape) = crate::ingest::read_leaf(&src_reader, handles);
-        let shp: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
-        let leaf = crate::format::put_raw_f16(repo.storage_mut(), &data, &shp)
-            .map_err(|e| anyhow::anyhow!("{name}: put f16 leaf: {e}"))?;
-        let leaf_id = leaf.root().expect("leaf root");
-        facts += leaf.into_facts();
-        let kind = match shape.len() {
-            1 => "vector",
-            2 => "matrix",
-            3 => "conv",
-            _ => "tensor",
-        };
-        let name_h = repo
-            .storage_mut()
-            .put::<blobencodings::LongString, _>(name.clone())
-            .map_err(|e| anyhow::anyhow!("{name}: put name blob: {e:?}"))?;
-        let m = entity! { _ @ attrs::kind: kind, attrs::safetensor_path: name_h, attrs::weight: leaf_id };
-        members.push(m.root().expect("module root"));
-        facts += m.into_facts();
-        count += 1;
-        elems += data.len();
-        if count % 100 == 0 {
-            eprintln!("[persist] {count} tensors cast → f16 ...");
-        }
-    }
-    let mn = repo
-        .storage_mut()
-        .put::<blobencodings::LongString, _>(entity_name.to_string())
-        .map_err(|e| anyhow::anyhow!("put entity name blob: {e:?}"))?;
-    let model = entity! { _ @ attrs::model_name: mn, attrs::member*: members.iter() };
-    facts += model.into_facts();
-
-    ws.commit(
-        facts,
-        "derive f16 weights (host-side f32→f16) from the exact pile",
-    );
-    repo.push(&mut ws)
-        .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-    repo.close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
-    Ok((count, elems))
 }
 
 /// The derived FOLDED half-width sibling of a qwen3tts weights pile:
@@ -2221,7 +2100,7 @@ pub fn load_gemma4_aliased_from_index(
     device: burn::backend::wgpu::WgpuDevice,
 ) -> anyhow::Result<crate::models::gemma::gemma4::decoder::Gemma4Model<crate::nn::backend::BHalf>> {
     use crate::ingest::LeafHandles;
-    use crate::models::gemma::gemma4::weights::{WeightCtx, load_gemma4_from_source};
+    use crate::models::gemma::gemma4::weights::{load_gemma4_from_source, WeightCtx};
     use crate::nn::backend::BHalf;
     use burn::backend::wgpu::{CubeTensor, WgpuDevice, WgpuRuntime};
     use burn::tensor::{DType, Tensor, TensorPrimitive};
@@ -2252,7 +2131,7 @@ pub fn load_gemma4_aliased_from_index(
             let blob_ptr = bytes.as_ptr() as u64;
             let nbytes = bytes.len() as u64;
             let n = (nbytes / 2) as usize; // f16 element count
-            // The owner downcast = capability check (mmap?) + region bounds + keepalive.
+                                           // The owner downcast = capability check (mmap?) + region bounds + keepalive.
             let mmap = bytes.downcast_to_owner::<MmapRaw>().ok()?;
             let region_end = mmap.as_ptr() as u64 + mmap.len() as u64;
             let page_start = blob_ptr & !(PAGE - 1);
@@ -2341,7 +2220,7 @@ fn alias_f16_leaf<R: triblespace::prelude::BlobStoreGet>(
     let blob_ptr = bytes.as_ptr() as u64;
     let nbytes = bytes.len() as u64;
     let n = (nbytes / 2) as usize; // f16 element count
-    // The owner downcast = capability check (mmap?) + region bounds + keepalive.
+                                   // The owner downcast = capability check (mmap?) + region bounds + keepalive.
     let mmap = bytes
         .downcast_to_owner::<MmapRaw>()
         .expect("aliased path requires an mmap-backed pile blob");

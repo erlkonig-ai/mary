@@ -621,11 +621,11 @@ required-features = ["qwen3tts", "import"]
 name = "qwen3tts_persist"
 required-features = ["speak", "import"]
 
-# Voxtral-Mini-4B-Realtime: HF checkpoint → real on-disk pile
-# (models/voxtral_mini.pile), bf16→f32 exact, bit-exactness gate inline.
+# Voxtral-Mini-4B-Realtime: HF checkpoint → two-root native collection cohort
+# (exact f32 + full f16), with source and derivation bit gates inline.
 [[bin]]
 name = "voxtral_persist"
-required-features = ["import"]
+required-features = ["voxtral", "import"]
 
 # Voxtral parity gates vs the CPU-f32 oracle goldens (golden/voxtral_capture.py).
 [[bin]]

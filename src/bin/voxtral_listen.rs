@@ -3,7 +3,7 @@
 //! File mode (real-time-paced chunk feed; `--fast` = unpaced, for compute
 //! benchmarks):
 //!   cargo run --release --features voxtral --bin voxtral_listen -- \
-//!     [--pile <voxtral_mini.pile>] --wav clip.wav [--delay-ms 480] \
+//!     [--pile <voxtral_native.pile>] --wav clip.wav [--delay-ms 480] \
 //!     [--chunk-ms 80] [--fast] [--expect-text file.txt] [--lane half]
 //!
 //! Lanes (one backend per process — two fusion runtimes thrash each other):
@@ -12,7 +12,7 @@
 //!   fold     folded fast layout (wide qkv, norms in matmul rows), fusion f32
 //!   half     folded fast layout, fusion f16 (default — the realtime lane)
 //!   rawhalf  folded fast layout, RAW (unfused) Metal f16 — loads ZERO-COPY:
-//!            f16 leaves alias the mmap'd sibling pile straight onto the GPU
+//!            f16 leaves alias the native collection mmap straight onto the GPU
 //!            (fold sources + the embed table; folded results are new GPU
 //!            buffers, the embed stays file-backed for the process life)
 //!
@@ -97,11 +97,8 @@ fn main() -> anyhow::Result<()> {
         args.pile
     );
     let t0 = std::time::Instant::now();
-    // Sibling-aware: when `<stem>_f16.pile` sits next to the pile (derived by
-    // `voxtral_persist --f16-derive`), the half lane uploads its f16 leaves at
-    // native width — no whole-model f32 materialization, no cast; absent the
-    // sibling, tensors materialize lazily from the f32 leaves (bit-identical).
-    let loader = mary::persist::load_loader_with_f16_sibling(&args.pile, "ears_f16")?;
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&args.pile)?;
+    let loader = mary::models::voxtral::VoxtralWeights::from_snapshot(snapshot)?.into_loader();
     let max_tokens = 8192;
     match lane.as_str() {
         "raw" => {

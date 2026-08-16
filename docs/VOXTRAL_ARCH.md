@@ -105,9 +105,12 @@ Layer = `x + attn(norm1(x))`, then `x + mlp(norm2(x))` — standard pre-norm.
   chunk boundary state = encoder KV cache + conv pad cache + mel remainder).
 
 ## Port strategy / scope decisions
-- Persist HF `model.safetensors` names into `models/voxtral_mini.pile`
-  (bf16→f32 exact, existing `persist_safetensors_to_pile`; no new schema ids
-  needed — the mary weight schema is model-agnostic).
+- `voxtral_persist <model-dir> <pile> <signing-key>` publishes two ordinary
+  roots into Mary's native model collection: exact f32 (`native`) and its full
+  f16 derivation (`f16`), both under source
+  `mistralai/Voxtral-Mini-4B-Realtime-2602`. Runtime freezes one local-latest
+  snapshot and requires identical tensor-name/shape domains; there is no
+  Repository branch, sibling discovery, or missing-f16 fallback.
 - Oracle goldens: `golden/voxtral_capture.py` → `golden/voxtral/` (npy,
   regenerable; clips committed). Deep taps on `en_short` @480 ms; greedy
   token streams for 4 clips × {6,12,30} delay tokens.
@@ -136,8 +139,10 @@ greedy streams **token-identical, transcripts byte-equal** on all six:
 Incremental encoder (4-position KV steps) vs batch: **bit-identical**
 (max|Δ| = 0) — the streaming path is exact, not approximate.
 
-Weights: `models/voxtral_mini.pile` (16.5 GiB, 711 tensors f32,
-persist gate: bit-identical to bf16→f32 of the checkpoint, 256-aligned).
+The original exact artifact was `models/voxtral_mini.pile` (16.5 GiB, 711
+tensors f32). Its native successor retains the same bits and adds the complete
+f16 root to the same admitted collection cohort; persist gates source parity,
+f16 cast parity, full coverage, and 256-byte payload alignment.
 
 **Latency (UNOPTIMIZED parity-first layout, f32, raw Metal backend, shared
 machine): 215–345 ms/frame mean vs the 80 ms budget.** Not realtime yet —
@@ -252,38 +257,34 @@ but single uncontrolled runs on this shared machine are meaningless
 (qwen3tts measurement discipline: interleave against a fixed control);
 fusion stays wired for the proper perf pass.
 
-## Results (2026-07-11 — the derived f16 sibling pile: load fixed)
+## Results (2026-07-11 — historical sibling benchmark; native cohort now live)
 
-The load-cost follow-up, executed with sign-off (2026-07-12 authorized
-the f16 weights persist; the design landed as a SEPARATE sibling pile rather
-than an append — separate-now/merge-later is the cheap direction, piles union
-by `cat` + consolidate, and the 8.25 GiB f16 pile can deploy without the
-16.5 GiB f32).
+The load-cost follow-up originally measured separate exact/f16 legacy piles.
+Those numbers remain useful evidence for the f16 leaf layout. The live design
+now migrates or imports both roots into one native model collection and selects
+them from one frozen snapshot.
 
-**Persist:** `voxtral_persist --f16-derive models/voxtral_mini.pile` reads
-every f32 leaf back from the pile (one tensor at a time), casts host-side
+**Persist (current):** `voxtral_persist <model-dir> <pile> <signing-key>`
+imports exact f32 then reads every exact leaf back (one tensor at a time), casts host-side
 (`f16::from_f32` — the same rounding the materializing loader applies on the
-f16 backend) and persists 711 tensors / 4.43 G elements under the `ears_f16`
-entity in `models/voxtral_mini_f16.pile` (8,860,192,256 B = 8.25 GiB; 16 s
-derive + full re-read verify). Gates: every f16 leaf bit-identical to
-`f16(f32-leaf)`, full 711-tensor coverage, all 256-aligned, and the source
-pile is READ-ONLY — byte-length gated in-bin, sha256 over all 16.5 GiB
-verified unchanged externally.
+f16 backend), and publishes the full f16 root through the same open pile and
+caller-supplied signer. The historical derived payload was 711 tensors / 4.43 G
+elements / 8.25 GiB and took 16 s plus verification. Current gates admit the
+same local-latest prefix as runtime, verify source and cast bits, and reject
+coordinate ambiguity.
 
-**Load:** `load_loader_with_f16_sibling` auto-discovers `<stem>_f16.pile`
-next to the given pile (CLIs unchanged): `BFusedHalf` tensors upload the f16
-leaves at native width — no whole-model f32 keymap, no cast loop — `BFused`
-uploads the exact f32 leaves, everything else materializes lazily one tensor
-at a time. Sibling absent → f16 tensors materialize+cast from the f32 leaves
-(bit-identical, gated below); `MARY_SPEAK_MATERIALIZE=1` still forces the old
-fully-materialized load (the A/B switch).
+**Load (current):** `VoxtralWeights::from_snapshot` selects both roots and
+passes their indexes plus one shared reader into `AliasedPile` on macOS.
+`BFusedHalf` uploads native-width f16, `BFused` uploads exact f32, and the raw
+backends alias matching mmap pages. Missing, ambiguous, wrong-width, or
+name/shape-divergent roots fail before model construction.
 
 **Measured** (voxtral_listen de_short@480 half, same machine, back-to-back):
 load **14.4 s → 5.5 s**, peak RSS **35.45 GB → 13.0 GB** (the f32 host
 keymap is gone; what remains is the mmap'd f16 pile + the fold/GPU working
 set). en_long run: 5.5 s / 12.9 GB.
 
-**Identity gates:** listen stdout BYTE-IDENTICAL old-path↔new-path on
+**Historical identity gates:** listen stdout BYTE-IDENTICAL old-path↔new-path on
 de_short@480 (13/13 words) and en_long (66/66); the sibling-absent fallback
 also byte-identical. `voxtral_probe --lane half --long` A/B'd between the
 f16-sibling load and `MARY_SPEAK_MATERIALIZE=1`: token counts identical on
@@ -300,7 +301,7 @@ The raw-backend reopening condition from the deleted fused-alias attempt is
 now exercised. `--lane rawhalf` (voxtral_listen + voxtral_probe) runs the
 SAME folded graph (`fast.rs`, unchanged) as `half`, but on the RAW unfused
 Metal f16 backend (`RealtimeTranscriber<BHalf>`), and loads it TRUE zero-copy: every
-f16 leaf of `models/voxtral_mini_f16.pile` aliases its mmap'd pile pages
+f16 leaf of the native f16 root aliases its mmap'd pile pages
 straight onto the GPU via the cubecl fork's `register_external_aliased`
 seam — the gemma production recipe (`persist.rs`), no host staging at all.
 The fused lanes keep their upload path: the fusion-import miscompile
@@ -331,14 +332,11 @@ rows, so the folded weights (~9.3 GiB f16) are larger than the stored pile
 other ~7.5 GiB of leaves are aliased as fold SOURCES — the transform
 kernels read the pile's own pages (zero host staging, no upload pass, no
 host cast loop) and write the folded results into normal GPU buffers.
-A FOLDED sibling pile (`wide_t`/`gate_up_t`/`head_t`/… stored post-fold,
-~10 GiB) would make the whole model file-backed with near-instant load —
-that is option (a), it needs a new derived pile and maintainer sign-off; the
-hybrid is what ships without one. The derive MECHANISM now exists on the
-qwen3tts side (`qwen3tts_persist --fold-derive <src-pile>` →
-`<stem>_folded_f16.pile`, loaded by `persist::load_qwen3tts_talker_folded`
-with a readback identity gate); a voxtral `_folded_f16` derive is the
-mechanical follow-up — the derive itself still needs maintainer sign-off.
+A folded native root (`wide_t`/`gate_up_t`/`head_t`/… stored post-fold,
+~10 GiB) would make the whole model file-backed with near-instant load. It
+would be another explicit collection coordinate selected from the same frozen
+snapshot; no sibling-filename relationship is needed. The hybrid is what ships
+without that extra derivation.
 
 **Incident (fixed in the cubecl fork, f299aed): in-place elementwise into
 read-only mmap.** First aliased run was word-perfect on en_short d6 but
@@ -406,10 +404,9 @@ as the ear's default lane.
 4. Wire into the runtime: `hear` seam next to `mary::say`/`speak` (mic →
    tokens → runtime events), VAD/endpointing policy, delay setting as a
    per-context knob (480 ms conversational, 2.4 s dictation).
-5. ~~Pile: an f16 weights entity (the qwen3tts `talker_f16` pattern) to cut
-   the ~25–60 s load to seconds~~ — DONE 2026-07-11 as the derived sibling
-   pile `models/voxtral_mini_f16.pile` (authorized; see Results above:
-   load 5.5 s, peak RSS 13 GB, everything token-identical).
+5. ~~Full f16 root to cut the ~25–60 s load to seconds~~ — DONE initially as
+   a legacy sibling (load 5.5 s, peak RSS 13 GB, token-identical), now selected
+   together with the exact root from one native collection snapshot.
 6. Upstream: minimal repro + report for the burn 0.21 fused-reduce f16
    batch-shape panic (see Results).
 7. The denglish f16-lane greedy drift (96/152 vs the oracle, word 20/21) —
@@ -417,8 +414,8 @@ as the ear's default lane.
    stream or whether the lane wants an fp32 logits head; it is NOT a
    load-path issue (identical under both loaders), and NOT a backend issue
    (the rawhalf lane reproduces the identical divergent stream, 2026-07-12).
-8. The FOLDED sibling pile (option (a) of the zero-copy analysis, ~10 GiB:
+8. A folded native derived root (option (a) of the zero-copy analysis, ~10 GiB:
    `wide_t`/`gate_up_t`/`head_t`/… persisted post-fold) — would make the
    whole folded model file-backed: near-instant load, page-in lazily on
-   first frames, minimal anonymous RSS. Needs a new derive
-   (`voxtral_persist --fold-derive`?) and maintainer sign-off for the pile write.
+   first frames, minimal anonymous RSS. It would be another explicit native
+   coordinate, not a filename-related sidecar.

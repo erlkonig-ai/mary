@@ -1,241 +1,221 @@
-//! Persist the Voxtral-Mini-4B-Realtime-2602 checkpoint (HF `model.safetensors`,
-//! 711 tensors, bf16) into a REAL on-disk TribleSpace pile as exact f32 leaves
-//! (bf16 → f32 is lossless). After this runs, the pile file is the durable,
-//! self-contained weight store the Burn transcriber loads from — the HF cache is no
-//! longer needed at runtime.
+//! Import one complete Voxtral-Mini-4B-Realtime-2602 cohort into Mary's native
+//! append-only model collection.
 //!
-//!   cargo run --release --features import --bin voxtral_persist -- \
-//!     <model-dir> <pile-path>
+//! The result is two ordinary model roots in one pile, distinguished only by
+//! their quantization coordinate:
 //!
-//! `<model-dir>` is the HF snapshot dir holding `model.safetensors` (e.g.
-//! `~/.cache/huggingface/hub/models--mistralai--Voxtral-Mini-4B-Realtime-2602/
-//! snapshots/<sha>/`). The pile gains one model entity named
-//! `model.safetensors` — the tensor names inside are the HF names
-//! (`audio_tower.*`, `language_model.model.*`, `multi_modal_projector.*`).
+//! - `native`: the exact f32 checkpoint (bf16 → f32 is lossless);
+//! - `f16`: the full `f16::from_f32` derivation used by the realtime lanes.
 //!
-//! Gate (always runs): every persisted leaf is re-read from the pile and
-//! compared BIT-EXACT against the bf16→f32 cast of the source safetensors,
-//! and every leaf's payload must sit 256-aligned in the mmap (the V3
-//! payload-alignment invariant fast mmap views rely on).
+//! The derivation reads the frozen exact root and writes back through the same
+//! open pile one tensor at a time. Runtime selection uses one immutable native
+//! collection snapshot; there is no Repository branch, sibling pile, random
+//! signer, fallback root, or filename discovery.
 //!
-//! ── `--f16-derive` mode ──
+//! Rerunning the same source with the same signing key is content-idempotent.
+//! Changing bytes under either existing source coordinate makes the final
+//! local-latest gate ambiguous and fails closed.
 //!
-//!   cargo run --release --features import --bin voxtral_persist -- \
-//!     --f16-derive <f32-pile> [<f16-pile>]
-//!
-//! Derives the HALF-WIDTH sibling pile (default `<stem>_f16.pile` next to the
-//! source — the path `load_loader_with_f16_sibling` auto-discovers): every
-//! f32 leaf is read from the source pile, cast host-side to f16
-//! (`f16::from_f32`, the same double-rounding the materializing loader
-//! applies at load time on the f16 backend, so the fast-loaded transcriber is
-//! bit-identical to the old cast-on-load path) and persisted under the
-//! `ears_f16` entity. The SOURCE pile is strictly read-only in this mode —
-//! its byte length is recorded before and re-checked after as a hard gate.
-//! The qwen3tts `talker_f16` precedent, in the separate-pile layout: piles
-//! union by `cat` + consolidate if we ever want them merged, and the ~8 GiB
-//! f16 pile can deploy without the 16.5 GiB f32.
-//!
-//! Gate (always runs): every f16 leaf is re-read from the sibling pile and
-//! compared BIT-EXACT against `f16::from_f32` of the source's f32 leaf, with
-//! shape equality, full 711-tensor coverage, and 256-alignment.
+//! ```text
+//! cargo run --release --features voxtral,import --bin voxtral_persist -- \
+//!   <model-dir> <pile-path> <signing-key>
+//! ```
 
-use mary::ingest::{read_leaf, read_shape, LeafDtype, LeafHandles};
-use mary::persist::{
-    derive_f16_pile, f16_sibling_path, load_split_index_from_pile, persist_safetensors_to_pile,
-};
+use mary::ingest::{read_shape, LeafDtype, LeafHandles};
+use mary::models::voxtral::{VoxtralWeights, QUANTIZATION_F16, SOURCE};
+use mary::selection::{ModelSelector, SelectedModelIndex};
+use safetensors::{Dtype, SafeTensors};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Instant;
+use triblespace::core::repo::pile::Pile;
+use triblespace::core::signing_key_file;
 use triblespace::prelude::BlobStoreGet;
 
-fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let f16_derive = args.iter().any(|a| a == "--f16-derive");
-    let pos: Vec<&String> = args[1..].iter().filter(|a| !a.starts_with("--")).collect();
-    if f16_derive {
-        if pos.is_empty() {
-            eprintln!("usage: voxtral_persist --f16-derive <f32-pile> [<f16-pile>]");
-            std::process::exit(2);
-        }
-        let src = Path::new(pos[0]);
-        let dst = pos
-            .get(1)
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| f16_sibling_path(src));
-        return f16_derive_mode(src, &dst);
-    }
-    if pos.len() < 2 {
-        eprintln!("usage: voxtral_persist <model-dir> <pile-path>");
-        eprintln!("       voxtral_persist --f16-derive <f32-pile> [<f16-pile>]");
-        std::process::exit(2);
-    }
-    let model_dir = Path::new(pos[0]);
-    let pile_path = Path::new(pos[1]);
-
-    let t = Instant::now();
-    eprintln!("Persisting Voxtral checkpoint from {model_dir:?} → {pile_path:?} ...");
-    persist_safetensors_to_pile(model_dir, pile_path, LeafDtype::F32)?;
-    let secs = t.elapsed().as_secs_f64();
-
-    // ── gate: pile round-trip bit-exactness vs the source safetensors ──
-    eprintln!("Verifying pile leaves against the safetensors (bf16→f32) ...");
-    let (_, index, reader) = load_split_index_from_pile(pile_path, "")?;
-    anyhow::ensure!(!index.is_empty(), "no leaves found after persist");
-
-    use mary::nn::weight_loader::{get_tensor_f32, read_safetensors_file};
-    use safetensors::SafeTensors;
-    let bytes = read_safetensors_file(&model_dir.join("model.safetensors"));
-    let st = SafeTensors::deserialize(&bytes)?;
-    let expected: usize = st
+fn verify_exact_source(
+    model_dir: &Path,
+    weights: &VoxtralWeights<triblespace::core::repo::pile::PileReader>,
+) -> anyhow::Result<(usize, usize)> {
+    let path = model_dir.join("model.safetensors");
+    let file = std::fs::File::open(&path)?;
+    // Keep the multi-gigabyte source out of a second host allocation during
+    // the gate. Each tensor is decoded/materialized independently below.
+    let mapped = unsafe { memmap2::Mmap::map(&file)? };
+    let source = SafeTensors::deserialize(&mapped)?;
+    let expected: BTreeSet<_> = source
         .names()
-        .iter()
-        .filter(|k| {
-            use safetensors::Dtype;
+        .into_iter()
+        .filter(|name| {
             matches!(
-                st.tensor(k).map(|v| v.dtype()),
+                source.tensor(name).map(|tensor| tensor.dtype()),
                 Ok(Dtype::F64 | Dtype::F32 | Dtype::F16 | Dtype::BF16)
             )
         })
-        .count();
+        .collect();
     anyhow::ensure!(
-        index.len() == expected,
-        "pile holds {} leaves, safetensors has {expected} float tensors",
-        index.len()
+        expected.len() == weights.exact().len(),
+        "native root has {} tensors but source safetensors has {} float tensors",
+        weights.exact().len(),
+        expected.len()
     );
 
-    let (mut checked, mut elems, mut misaligned) = (0usize, 0usize, 0usize);
-    for (name, handles) in &index {
-        let LeafHandles::F32(dh, _) = handles else {
-            anyhow::bail!("{name}: expected an f32 leaf");
+    let mut elements = 0;
+    for name in &expected {
+        let handles = weights
+            .exact()
+            .get(*name)
+            .ok_or_else(|| anyhow::anyhow!("native root is missing source tensor {name:?}"))?;
+        let (data, shape) = match handles {
+            LeafHandles::F32(data, shape) => (*data, *shape),
+            LeafHandles::F16(..) => anyhow::bail!("native tensor {name:?} is not f32"),
         };
-        let raw: anybytes::Bytes = reader
-            .get(*dh)
-            .map_err(|e| anyhow::anyhow!("{name}: {e:?}"))?;
-        if !(raw.as_ptr() as usize).is_multiple_of(256) {
-            eprintln!("  MISALIGNED (ptr % 256 != 0): {name}");
-            misaligned += 1;
-        }
-        let (stored, shape) = read_leaf(&reader, *handles);
-        let (want, want_shape) = get_tensor_f32(&st, name);
+        let stored: anybytes::Bytes = weights
+            .reader()
+            .get(data)
+            .map_err(|error| anyhow::anyhow!("read native tensor {name:?}: {error}"))?;
         anyhow::ensure!(
-            shape == want_shape,
-            "{name}: shape {shape:?} != {want_shape:?}"
+            (stored.as_ptr() as usize).is_multiple_of(256),
+            "native tensor {name:?} is not 256-byte aligned"
         );
-        anyhow::ensure!(stored.len() == want.len(), "{name}: len mismatch");
-        for (i, (&a, &b)) in stored.iter().zip(want.iter()).enumerate() {
+        let stored = stored
+            .view::<[f32]>()
+            .map_err(|error| anyhow::anyhow!("decode native tensor {name:?}: {error}"))?;
+        let (wanted, wanted_shape) = mary::nn::weight_loader::get_tensor_f32(&source, name);
+        anyhow::ensure!(
+            read_shape(weights.reader(), shape) == wanted_shape,
+            "native tensor {name:?} shape differs from source"
+        );
+        anyhow::ensure!(
+            stored.len() == wanted.len(),
+            "native tensor {name:?} length differs from source"
+        );
+        for (index, (&stored, &wanted)) in stored.iter().zip(wanted.iter()).enumerate() {
             anyhow::ensure!(
-                a.to_bits() == b.to_bits(),
-                "{name}[{i}]: pile {a} != source {b}"
+                stored.to_bits() == wanted.to_bits(),
+                "native tensor {name:?}[{index}] differs from source"
             );
         }
-        checked += 1;
-        elems += stored.len();
+        elements += stored.len();
     }
-    anyhow::ensure!(
-        misaligned == 0,
-        "{misaligned} leaves misaligned — V3 alignment invariant violated"
-    );
+    Ok((expected.len(), elements))
+}
+
+fn verify_alignment(
+    weights: &VoxtralWeights<triblespace::core::repo::pile::PileReader>,
+) -> anyhow::Result<()> {
+    for (name, handles) in weights.exact().iter().chain(weights.f16()) {
+        let bytes: anybytes::Bytes = match handles {
+            LeafHandles::F32(data, _) => weights.reader().get(*data),
+            LeafHandles::F16(data, _) => weights.reader().get(*data),
+        }
+        .map_err(|error| anyhow::anyhow!("read tensor {name:?} for alignment: {error}"))?;
+        anyhow::ensure!(
+            (bytes.as_ptr() as usize).is_multiple_of(256),
+            "tensor {name:?} is not 256-byte aligned"
+        );
+    }
+    Ok(())
+}
+
+fn run() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() != 4 {
+        eprintln!("usage: voxtral_persist <model-dir> <pile-path> <signing-key>");
+        std::process::exit(2);
+    }
+    let model_dir = Path::new(&args[1]);
+    let pile_path = Path::new(&args[2]);
+    let signing_key = signing_key_file::load_existing(Path::new(&args[3]))?;
+
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(pile_path)
+    {
+        Ok(_) => eprintln!("voxtral_persist: created new empty pile {pile_path:?}"),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let started = Instant::now();
+    let mut pile = Pile::open(pile_path)
+        .map_err(|error| anyhow::anyhow!("open model pile {pile_path:?}: {error}"))?;
+    let imported = (|| -> anyhow::Result<_> {
+        eprintln!("[voxtral] importing exact checkpoint {SOURCE}");
+        let (exact_root, exact_commit) = mary::persist::import_model_to_collection(
+            &mut pile,
+            &signing_key,
+            model_dir,
+            LeafDtype::F32,
+            SOURCE,
+            mary::persist::QUANTIZATION_NATIVE,
+        )?;
+
+        // Freeze the exact commit before deriving: later appends cannot move
+        // the source root or reader under the conversion.
+        let exact_snapshot =
+            mary::model_collection::snapshot_model_collection_exact(&mut pile, &[exact_commit])?;
+        let exact = SelectedModelIndex::from_snapshot(
+            exact_snapshot,
+            ModelSelector::Source {
+                source: SOURCE,
+                quantization: mary::persist::QUANTIZATION_NATIVE,
+            },
+        )?;
+        eprintln!("[voxtral] deriving full f16 root in the same pile");
+        let (f16_root, _f16_commit, derived_count, derived_elements) =
+            mary::persist::derive_selected_f16_to_collection(
+                &mut pile,
+                &signing_key,
+                exact,
+                SOURCE,
+                QUANTIZATION_F16,
+            )?;
+
+        // Gate the exact local prefix the live runtime admits, including any
+        // previously published coordinate conflicts or invalid native records.
+        let complete = mary::model_collection::snapshot_model_collection_local_latest(&mut pile)?;
+        let weights = VoxtralWeights::from_snapshot(complete)?;
+        anyhow::ensure!(
+            weights.roots() == (exact_root, f16_root),
+            "locally admitted Voxtral roots differ from this import"
+        );
+        let source_gate = verify_exact_source(model_dir, &weights)?;
+        let f16_gate = weights.validate_f16_parity()?;
+        verify_alignment(&weights)?;
+        anyhow::ensure!(source_gate == f16_gate, "source and f16 gates disagree");
+        anyhow::ensure!(
+            f16_gate == (derived_count, derived_elements),
+            "derived counters disagree with the admitted cohort"
+        );
+        Ok((exact_root, f16_root, f16_gate))
+    })();
+
+    // `close` is the sole durability boundary, on success and on an import
+    // error. No helper above flushes, reopens, repairs, or truncates the pile.
+    let close = pile
+        .close()
+        .map_err(|error| anyhow::anyhow!("close model pile {pile_path:?}: {error}"));
+    let (exact_root, f16_root, (tensors, elements)) = match (imported, close) {
+        (Ok(result), Ok(())) => result,
+        (Err(error), Ok(())) => return Err(error),
+        (Ok(_), Err(error)) => return Err(error),
+        (Err(error), Err(close_error)) => {
+            return Err(error.context(format!("import also failed to close pile: {close_error}")));
+        }
+    };
 
     let size = std::fs::metadata(pile_path)?.len();
     println!(
-        "voxtral persist gate PASSED: {checked} tensors / {elems} elements bit-identical \
-         to bf16→f32(source); all 256-aligned. pile {:.2} GiB, persisted in {secs:.1}s.",
-        size as f64 / (1u64 << 30) as f64
+        "Voxtral native cohort valid: exact={exact_root}, f16={f16_root}; \
+         {tensors} tensors / {elements} elements source- and f16-bit-identical; \
+         all payloads 256-aligned; pile {:.2} GiB in {:.1}s",
+        size as f64 / (1_u64 << 30) as f64,
+        started.elapsed().as_secs_f64(),
     );
     Ok(())
 }
 
-/// `--f16-derive`: f32 pile → half-width sibling pile, with the source
-/// strictly read-only (hard-gated on its byte length) and a full bit-exact
-/// re-read gate on the result.
-fn f16_derive_mode(src: &Path, dst: &Path) -> anyhow::Result<()> {
-    const ENTITY: &str = "ears_f16";
-    let src_len_before = std::fs::metadata(src)?.len();
-    eprintln!("Deriving f16 sibling {dst:?} from {src:?} ({src_len_before} bytes, READ-ONLY) ...");
-    let t = Instant::now();
-    let (count, elems) = derive_f16_pile(src, dst, ENTITY)?;
-    let secs = t.elapsed().as_secs_f64();
-    eprintln!("Derived {count} tensors / {elems} elements in {secs:.1}s.");
-
-    // ── hard gate: the source pile may not have changed by a single byte ──
-    let src_len_after = std::fs::metadata(src)?.len();
-    anyhow::ensure!(
-        src_len_after == src_len_before,
-        "SOURCE PILE LENGTH CHANGED ({src_len_before} → {src_len_after} bytes) — \
-         the f32 pile is read-only in --f16-derive mode; STOP and investigate"
-    );
-
-    // ── gate: sibling round-trip parity for the f16 entity ──
-    // Every f16 leaf must equal the runtime cast of the exact f32 leaf
-    // (f16::from_f32 — the same rounding the materializing loader applies),
-    // cover every source tensor, and sit 256-aligned in the mmap (the V3
-    // payload-alignment invariant the fast loader's mmap views rely on).
-    eprintln!("Verifying {ENTITY} against the f32 leaves ...");
-    let (f16, rest, f16_reader) = load_split_index_from_pile(dst, ENTITY)?;
-    anyhow::ensure!(!f16.is_empty(), "no {ENTITY} leaves found after derive");
-    anyhow::ensure!(
-        rest.is_empty(),
-        "sibling pile holds {} non-{ENTITY} leaves — unexpected",
-        rest.len()
-    );
-    let (_, f32_, src_reader) = load_split_index_from_pile(src, "")?;
-    anyhow::ensure!(
-        f16.len() == f32_.len(),
-        "{} f16 leaves vs {} f32 leaves — incomplete coverage",
-        f16.len(),
-        f32_.len()
-    );
-    let (mut checked, mut elems, mut misaligned) = (0usize, 0usize, 0usize);
-    for (name, handles) in &f16 {
-        let (dh, sh) = match handles {
-            LeafHandles::F16(d, s) => (*d, *s),
-            LeafHandles::F32(..) => anyhow::bail!("{name}: {ENTITY} entity holds an f32 leaf"),
-        };
-        let bytes: anybytes::Bytes = f16_reader
-            .get(dh)
-            .map_err(|e| anyhow::anyhow!("{name}: {e:?}"))?;
-        if !(bytes.as_ptr() as usize).is_multiple_of(256) {
-            eprintln!("  MISALIGNED (ptr % 256 != 0): {name}");
-            misaligned += 1;
-        }
-        let stored = bytes
-            .view::<[half::f16]>()
-            .map_err(|e| anyhow::anyhow!("{name}: {e:?}"))?;
-        let shape = read_shape(&f16_reader, sh);
-        let f32_handles = f32_
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("{name}: no matching f32 leaf in source"))?;
-        let (exact, exact_shape) = read_leaf(&src_reader, *f32_handles);
-        anyhow::ensure!(
-            shape == exact_shape,
-            "{name}: shape mismatch {shape:?} vs {exact_shape:?}"
-        );
-        anyhow::ensure!(
-            stored.len() == exact.len(),
-            "{name}: length mismatch {} vs {}",
-            stored.len(),
-            exact.len()
-        );
-        for (i, (&h, &x)) in stored.iter().zip(exact.iter()).enumerate() {
-            let want = half::f16::from_f32(x);
-            anyhow::ensure!(
-                h.to_bits() == want.to_bits(),
-                "{name}[{i}]: stored {h:?} != cast {want:?} (from f32 {x})"
-            );
-        }
-        checked += 1;
-        elems += stored.len();
-    }
-    anyhow::ensure!(
-        misaligned == 0,
-        "{misaligned} f16 leaves misaligned — V3 alignment invariant violated"
-    );
-
-    let dst_size = std::fs::metadata(dst)?.len();
-    println!(
-        "{ENTITY} derive gate PASSED: {checked} tensors / {elems} elements bit-identical to \
-         f16(f32-leaf); all 256-aligned; source pile untouched ({src_len_before} bytes). \
-         Sibling {dst:?} is {dst_size} bytes ({:.2} GiB).",
-        dst_size as f64 / (1u64 << 30) as f64
-    );
-    Ok(())
+fn main() -> anyhow::Result<()> {
+    run()
 }
