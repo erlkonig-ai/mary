@@ -3,15 +3,16 @@
 //! (callers use [`synthesize_stream`] / [`synthesize`] in-process); the F5
 //! seam in [`crate::say`] remains as the voice-origin/reference lineage.
 //!
-//! Weights load from a durable standalone pile (see the `qwen3tts_persist`
-//! bin). The talker runs on the RAW (non-fusion) Metal backends — the ONLY
+//! Weights load from four ordinary roots in one frozen native model-collection
+//! snapshot (see the `qwen3tts_persist` bin): exact base, shared exact codec,
+//! filtered f16 talker, and versioned folded f16 talker. The talker runs on the
+//! RAW (non-fusion) Metal backends — the ONLY
 //! talker lane since 2026-07-12: the fused lane was removed after an ear
 //! A/B picked raw ("better tempo") at measured perf parity (~28 ms/frame
 //! talker GPU — see PORT_NOTES.md, "raw is the ONLY talker lane"). On macOS
-//! every talker GPU tensor is a ZERO-COPY alias of the mmap'd pile pages:
-//! the fold-transformed weights from the derived `<stem>_folded_f16.pile`
-//! sibling when it exists (no fold math at load, no weight copies), or
-//! leaf-aliased with fold-at-load when it is absent. The f32 codec (still
+//! every talker GPU tensor is a ZERO-COPY alias of the snapshot's mmap'd pile
+//! pages: the fold-transformed root supplies final-layout tensors while the
+//! filtered root supplies the untransformed embeddings. The f32 codec (still
 //! fused — its decode loop is launch-bound and never aliases) uploads
 //! straight from its pile blobs; the CPU code predictor and the ECAPA
 //! speaker encoder read the exact f32 leaves. `MARY_SPEAK_MATERIALIZE=1`
@@ -32,9 +33,10 @@
 //!
 //! The reference kit is three files: a 24 kHz mono PCM16 clip (the x-vector is
 //! computed in-process by the ported ECAPA speaker encoder), its EXACT
-//! transcript, and the clip's codec frames as an f32 npy `(T, 16)` — captured
-//! once via the reference codec encoder (a Mimi model, not ported; porting it
-//! makes arbitrary-reference cloning self-contained — the known follow-up).
+//! transcript, and the clip's codec frames as an f32 npy `(T, 16)`. The codec
+//! encoder is ported for standalone paths; production Voice deliberately keeps
+//! using the precomputed frames until arbitrary-reference selection is part of
+//! this API.
 //!
 //! Long text is split into sentence-sized passes (same splitter as `say`;
 //! each pass stays far below the 2048-frame generation cap and re-clones the
@@ -42,13 +44,18 @@
 //! emitted between passes. The Qwen2 BPE builds from the tokenizer files
 //! committed under `<mary>/assets/qwen3tts/`.
 
+use std::collections::{hash_map::Entry, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Instant;
 
 use burn::prelude::Backend;
 use rand::SeedableRng;
+use triblespace::core::collection::CollectionSnapshot;
+use triblespace::core::repo::pile::PileReader;
+use triblespace::prelude::BlobStoreGet;
 
+use crate::ingest::LeafHandles;
 use crate::models::f5::wav;
 use crate::models::qwen3tts::codec::CodecDecoder;
 use crate::models::qwen3tts::config::{
@@ -62,6 +69,7 @@ use crate::models::qwen3tts::tokenizer::TextTokenizer;
 use crate::nn::backend::{BFused, WgpuDevice};
 use crate::nn::npy;
 use crate::nn::weight_loader::WeightLoader;
+use crate::selection::ModelSelector;
 
 /// Keep each pass comfortably under the 2048-frame (~164 s) generation cap
 /// while giving the talker whole paragraphs of prosodic context.
@@ -75,10 +83,220 @@ const MAX_CHARS: usize = 500;
 const STREAM_HOP: usize = 8;
 const STREAM_CTX: usize = 25;
 
-/// The name of the half-width talker entity the fast load uploads at native
-/// width (appended by `qwen3tts_persist --f16-talker-only`). The exact f32
-/// entities keep their original shard-file names.
-const TALKER_F16_ENTITY: &str = "talker_f16";
+const BASE: &str = "base";
+const TALKER_F16: &str = "talker-f16";
+const TALKER_FOLDED_F16: &str = "talker-folded-f16-v1";
+const CODEC_SOURCE: &str = "Qwen/Qwen3-TTS-12Hz#codec";
+
+/// Native-width weight label used by the filtered and folded talker roots.
+pub const QUANTIZATION_F16: &str = "f16";
+
+/// The two Qwen3-TTS checkpoints supported by the shared runtime graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Qwen3TtsVariant {
+    Base1_7B,
+    Base0_6B,
+}
+
+impl Qwen3TtsVariant {
+    /// Preserve the public runtime switch while making it select roots in one
+    /// frozen graph instead of a sibling file by convention.
+    pub fn from_env() -> Self {
+        match std::env::var("MARY_SPEAK_MODEL").ok().as_deref() {
+            Some("0.6b") => Self::Base0_6B,
+            _ => Self::Base1_7B,
+        }
+    }
+
+    pub const fn source(self) -> &'static str {
+        match self {
+            Self::Base1_7B => "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+            Self::Base0_6B => "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+        }
+    }
+
+    pub fn component_source(self, component: &str) -> String {
+        format!("{}#{component}", self.source())
+    }
+}
+
+/// The complete Qwen3-TTS runtime cohort selected from one immutable native
+/// model-collection snapshot.
+///
+/// Four ordinary model roots exhaust the live tensors: the variant's exact
+/// base, one codec shared by both variants, a filtered f16 talker, and its
+/// pre-folded f16 GPU layout. Only compact handle indexes and one owning reader
+/// remain resident; no Repository ancestry or sibling-file naming participates
+/// in runtime selection.
+pub struct Qwen3TtsWeights<R> {
+    variant: Qwen3TtsVariant,
+    exact: HashMap<String, LeafHandles>,
+    talker_f16: HashMap<String, LeafHandles>,
+    folded_f16: HashMap<String, LeafHandles>,
+    reader: R,
+}
+
+impl<R: BlobStoreGet> Qwen3TtsWeights<R> {
+    pub fn from_snapshot(
+        snapshot: CollectionSnapshot<R>,
+        variant: Qwen3TtsVariant,
+    ) -> anyhow::Result<Self> {
+        fn select(
+            facts: &triblespace::prelude::TribleSet,
+            reader: &impl BlobStoreGet,
+            source: &str,
+            quantization: &str,
+        ) -> anyhow::Result<HashMap<String, LeafHandles>> {
+            let root = crate::selection::select_model_root(
+                facts,
+                reader,
+                ModelSelector::Source {
+                    source,
+                    quantization,
+                },
+            )?;
+            crate::selection::index_keymap_for_root(facts, reader, root)
+        }
+        fn require_width(
+            component: &str,
+            handles: &HashMap<String, LeafHandles>,
+            f16: bool,
+        ) -> anyhow::Result<()> {
+            for (name, handles) in handles {
+                let matches = matches!(handles, LeafHandles::F16(..)) == f16;
+                if !matches {
+                    anyhow::bail!(
+                        "Qwen3-TTS {component} tensor {name:?} is {}, expected {}",
+                        match handles {
+                            LeafHandles::F32(..) => "f32",
+                            LeafHandles::F16(..) => "f16",
+                        },
+                        if f16 { "f16" } else { "f32" }
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        let base_source = variant.component_source(BASE);
+        let talker_source = variant.component_source(TALKER_F16);
+        let folded_source = variant.component_source(TALKER_FOLDED_F16);
+        let mut exact = select(
+            snapshot.facts(),
+            snapshot.reader(),
+            &base_source,
+            crate::persist::QUANTIZATION_NATIVE,
+        )?;
+        let codec = select(
+            snapshot.facts(),
+            snapshot.reader(),
+            CODEC_SOURCE,
+            crate::persist::QUANTIZATION_NATIVE,
+        )?;
+        require_width("base", &exact, false)?;
+        require_width("codec", &codec, false)?;
+        for (name, handles) in codec {
+            match exact.entry(name) {
+                Entry::Vacant(entry) => {
+                    entry.insert(handles);
+                }
+                Entry::Occupied(entry) => {
+                    anyhow::bail!(
+                        "tensor {:?} occurs in both Qwen3-TTS base and codec roots",
+                        entry.key()
+                    );
+                }
+            }
+        }
+        let talker_f16 = select(
+            snapshot.facts(),
+            snapshot.reader(),
+            &talker_source,
+            QUANTIZATION_F16,
+        )?;
+        let folded_f16 = select(
+            snapshot.facts(),
+            snapshot.reader(),
+            &folded_source,
+            QUANTIZATION_F16,
+        )?;
+        require_width("talker-f16", &talker_f16, true)?;
+        require_width("talker-folded-f16", &folded_f16, true)?;
+        let (_, _, reader) = snapshot.into_parts();
+        Ok(Self {
+            variant,
+            exact,
+            talker_f16,
+            folded_f16,
+            reader,
+        })
+    }
+
+    pub const fn variant(&self) -> Qwen3TtsVariant {
+        self.variant
+    }
+
+    pub fn counts(&self) -> (usize, usize, usize) {
+        (
+            self.exact.len(),
+            self.talker_f16.len(),
+            self.folded_f16.len(),
+        )
+    }
+}
+
+impl Qwen3TtsWeights<PileReader> {
+    #[cfg(target_os = "macos")]
+    fn folded_talker<B: Backend + 'static>(&self) -> anyhow::Result<Option<Talker<B>>> {
+        use crate::nn::backend::BHalf;
+        use std::any::TypeId;
+
+        if TypeId::of::<B>() != TypeId::of::<BHalf>()
+            || std::env::var("MARY_SPEAK_MATERIALIZE").is_ok()
+        {
+            return Ok(None);
+        }
+        let talker = crate::persist::load_qwen3tts_talker_folded_from_indexes(
+            &self.talker_f16,
+            &self.exact,
+            &self.reader,
+            &self.folded_f16,
+            &self.reader,
+        )?;
+        Ok(Some(crate::nn::weight_loader::same_type::<
+            Talker<BHalf>,
+            Talker<B>,
+        >(talker)))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn folded_talker<B: Backend + 'static>(&self) -> anyhow::Result<Option<Talker<B>>> {
+        Ok(None)
+    }
+
+    fn into_loader(self) -> WeightLoader {
+        let materialize = std::env::var("MARY_SPEAK_MATERIALIZE").is_ok();
+        #[cfg(target_os = "macos")]
+        if !materialize {
+            return WeightLoader::Aliased(crate::nn::weight_loader::AliasedPile::new(
+                self.talker_f16,
+                self.exact,
+                self.reader.clone(),
+                self.reader,
+                WgpuDevice::default(),
+            ));
+        }
+        if materialize {
+            eprintln!("[mary] MARY_SPEAK_MATERIALIZE set — using the fully materialized load");
+        }
+        let keymap = self
+            .exact
+            .into_iter()
+            .map(|(name, handles)| (name, crate::ingest::read_leaf(&self.reader, handles)))
+            .collect();
+        WeightLoader::Pile(keymap)
+    }
+}
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -92,72 +310,6 @@ fn env_f64(name: &str, default: f64) -> f64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
-}
-
-/// Build the runtime weight loader for the speak pile: the fast handle-indexed
-/// loader on macOS (raw-backend talker tensors alias the mmap'd pile blobs
-/// zero-copy; the fused codec uploads its f32 leaves straight from them), the
-/// exact materialized keymap elsewhere or under `MARY_SPEAK_MATERIALIZE=1`.
-/// See [`crate::persist::load_aliased_loader_from_pile`].
-fn load_loader(weights_pile: &Path) -> anyhow::Result<WeightLoader> {
-    crate::persist::load_aliased_loader_from_pile(weights_pile, TALKER_F16_ENTITY)
-}
-
-/// Load the talker for backend `B` — a raw backend, always: raw/zero-copy is
-/// the ONLY talker lane (fused removed 2026-07-12 after an ear A/B). On
-/// macOS, when `B` is the raw f16 backend (the default) and the derived
-/// folded sibling pile exists next to the weights pile (see
-/// [`crate::persist::qwen3tts_folded_sibling_path`]), every GPU tensor is a
-/// ZERO-COPY alias of the mmap'd pile pages — no fold math at load, no
-/// weight copies. Otherwise the ordinary loader path — leaf-alias + fold at
-/// load — the surviving fallback for piles without the folded sibling.
-fn load_talker<B: Backend>(
-    loader: &WeightLoader,
-    weights_pile: &Path,
-    dev: &B::Device,
-) -> Talker<B> {
-    #[cfg(target_os = "macos")]
-    {
-        use crate::nn::backend::BHalf;
-        use std::any::TypeId;
-        if TypeId::of::<B>() == TypeId::of::<BHalf>() {
-            let folded = crate::persist::qwen3tts_folded_sibling_path(weights_pile);
-            // MARY_SPEAK_MATERIALIZE is the lane's A/B switch back to the old
-            // load everywhere — it skips the folded sibling too.
-            if folded.exists() && std::env::var("MARY_SPEAK_MATERIALIZE").is_err() {
-                match crate::persist::load_qwen3tts_talker_folded(weights_pile, &folded) {
-                    Ok(t) => {
-                        eprintln!("[mary] folded sibling {folded:?}: talker aliased zero-copy");
-                        return crate::nn::weight_loader::same_type::<Talker<BHalf>, Talker<B>>(t);
-                    }
-                    Err(e) => eprintln!(
-                        "[mary] folded sibling {folded:?} failed ({e}); falling back to the \
-                         ordinary load"
-                    ),
-                }
-            } else {
-                eprintln!(
-                    "[mary] no folded sibling {folded:?} — raw talker loads leaf-aliased \
-                     (fold math at load; derive the sibling with: qwen3tts_persist \
-                     --fold-derive {weights_pile:?})"
-                );
-            }
-        }
-    }
-    Talker::load(loader, dev)
-}
-
-/// `MARY_SPEAK_MODEL=0.6b` redirects to the sibling `qwen3tts_0.6b.pile`
-/// next to the caller's pile (written by `qwen3tts_persist` from the
-/// Qwen3-TTS-12Hz-0.6B-Base checkpoint; byte-identical codec, same reference
-/// kit — the talker/predictor/speaker geometry is read from the checkpoint
-/// shapes at load). Anything else (or unset) keeps the caller's pile: the
-/// 1.7B default path is untouched.
-fn resolve_pile(weights_pile: &Path) -> PathBuf {
-    match std::env::var("MARY_SPEAK_MODEL").ok().as_deref() {
-        Some("0.6b") => weights_pile.with_file_name("qwen3tts_0.6b.pile"),
-        _ => weights_pile.to_path_buf(),
-    }
 }
 
 // NOTE on JIT warmup: the codec self-warms on its own thread at the streaming
@@ -210,14 +362,12 @@ impl SpeakStream {
 /// Model load runs on the generation thread, so this returns immediately; the
 /// codec runs on its own thread (self-warming) and overlaps generation.
 ///
-/// - `weights_pile` — durable pile holding the checkpoints (talker + predictor
-///   + speaker encoder, the codec, and optionally the `talker_f16` fast-load
-///   variant), written by `qwen3tts_persist`.
+/// - `weights` — four roots selected from one frozen native model snapshot.
 /// - `ref_wav` — 24 kHz mono PCM16 reference clip (the conditioning identity).
 /// - `ref_text` — the clip's exact transcript.
 /// - `ref_codes` — f32 npy `(T, 16)`: the clip's codec frames.
 pub fn synthesize_stream(
-    weights_pile: &Path,
+    weights: Qwen3TtsWeights<PileReader>,
     ref_wav: &Path,
     ref_text: &str,
     ref_codes: &Path,
@@ -234,19 +384,11 @@ pub fn synthesize_stream(
     // codec are unaffected by the switch.
     if std::env::var("MARY_SPEAK_F32").is_ok() {
         synthesize_stream_impl::<crate::nn::backend::B>(
-            weights_pile,
-            ref_wav,
-            ref_text,
-            ref_codes,
-            gen_text,
+            weights, ref_wav, ref_text, ref_codes, gen_text,
         )
     } else {
         synthesize_stream_impl::<crate::nn::backend::BHalf>(
-            weights_pile,
-            ref_wav,
-            ref_text,
-            ref_codes,
-            gen_text,
+            weights, ref_wav, ref_text, ref_codes, gen_text,
         )
     }
 }
@@ -255,13 +397,13 @@ pub fn synthesize_stream(
 /// audio in `[-1, 1]`. This is the batch view of the ONE streaming generation
 /// path: [`synthesize_stream`] drained and concatenated.
 pub fn synthesize(
-    weights_pile: &Path,
+    weights: Qwen3TtsWeights<PileReader>,
     ref_wav: &Path,
     ref_text: &str,
     ref_codes: &Path,
     gen_text: &str,
 ) -> anyhow::Result<Vec<f32>> {
-    let mut stream = synthesize_stream(weights_pile, ref_wav, ref_text, ref_codes, gen_text)?;
+    let mut stream = synthesize_stream(weights, ref_wav, ref_text, ref_codes, gen_text)?;
     let mut audio: Vec<f32> = Vec::new();
     for chunk in stream.by_ref() {
         audio.extend_from_slice(&chunk);
@@ -281,13 +423,12 @@ enum CodecMsg {
 }
 
 fn synthesize_stream_impl<B: Backend + 'static>(
-    weights_pile: &Path,
+    weights: Qwen3TtsWeights<PileReader>,
     ref_wav: &Path,
     ref_text: &str,
     ref_codes: &Path,
     gen_text: &str,
 ) -> anyhow::Result<SpeakStream> {
-    let weights_pile = resolve_pile(weights_pile);
     let ref_wav = ref_wav.to_path_buf();
     let ref_text = ref_text.to_string();
     let ref_codes = ref_codes.to_path_buf();
@@ -304,8 +445,9 @@ fn synthesize_stream_impl<B: Backend + 'static>(
             let dev: B::Device = Default::default();
 
             let t_load = Instant::now();
-            let loader = load_loader(&weights_pile)?;
-            let talker = load_talker::<B>(&loader, &weights_pile, &dev);
+            let folded_talker = weights.folded_talker::<B>()?;
+            let loader = weights.into_loader();
+            let talker = folded_talker.unwrap_or_else(|| Talker::load(&loader, &dev));
             let predictor = CodePredictor::load(&loader);
             let spk_enc = SpeakerEncoder::<B>::load(&loader, &dev);
             let tok = TextTokenizer::load(
@@ -529,14 +671,182 @@ fn synthesize_stream_impl<B: Backend + 'static>(
 /// Convenience: [`synthesize`] then write the result to `out_path` as a 24 kHz
 /// mono PCM16 WAV. Returns the number of samples written.
 pub fn synthesize_to_wav(
-    weights_pile: &Path,
+    weights: Qwen3TtsWeights<PileReader>,
     ref_wav: &Path,
     ref_text: &str,
     ref_codes: &Path,
     gen_text: &str,
     out_path: &Path,
 ) -> anyhow::Result<usize> {
-    let audio = synthesize(weights_pile, ref_wav, ref_text, ref_codes, gen_text)?;
+    let audio = synthesize(weights, ref_wav, ref_text, ref_codes, gen_text)?;
     wav::write_pcm16_mono(out_path, &audio, SAMPLE_RATE);
     Ok(audio.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::{F32Array, U64Array, attrs};
+    use ed25519_dalek::SigningKey;
+    use std::fs::OpenOptions;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use triblespace::core::repo::pile::Pile;
+    use triblespace::prelude::blobencodings::LongString;
+    use triblespace::prelude::*;
+
+    static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestPile(PathBuf);
+
+    impl TestPile {
+        fn new() -> Self {
+            let ordinal = NEXT_TEST_PILE.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "mary-qwen3tts-native-{}-{nanos}-{ordinal}.pile",
+                std::process::id()
+            ));
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .expect("create synthetic Qwen3-TTS pile");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestPile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn component_fragment(
+        source: &str,
+        quantization: &str,
+        tensor: &str,
+        value: f32,
+        f16: bool,
+    ) -> Fragment {
+        let mut fragment = Fragment::empty();
+        let shape = fragment.put::<U64Array, _>(vec![1_u64]);
+        let leaf = if f16 {
+            let data = fragment.put::<crate::f16enc::F16Array, _>(vec![
+                half::f16::from_f32(value),
+            ]);
+            entity! { _ @ attrs::data_f16: data, attrs::shape: shape }
+        } else {
+            let data = fragment.put::<F32Array, _>(vec![value]);
+            entity! { _ @ attrs::data: data, attrs::shape: shape }
+        };
+        let leaf_id = leaf.root().expect("tensor leaf root");
+        fragment += leaf;
+
+        let name = fragment.put::<LongString, _>(tensor.to_owned());
+        let member = entity! { _ @ attrs::safetensor_path: name, attrs::weight: &leaf_id };
+        let member_id = member.root().expect("model member root");
+        fragment += member;
+
+        let source = fragment.put::<LongString, _>(source.to_owned());
+        fragment += entity! { _ @
+            attrs::source: source,
+            attrs::quantization: quantization,
+            attrs::member: &member_id,
+        };
+        fragment
+    }
+
+    fn publish(path: &Path, fragments: impl IntoIterator<Item = Fragment>) {
+        let mut pile = Pile::open(path).expect("open synthetic Qwen3-TTS pile");
+        for fragment in fragments {
+            crate::model_collection::publish_model_fragment(
+                &mut pile,
+                &SigningKey::from_bytes(&[0x51; 32]),
+                fragment,
+            )
+            .expect("publish native Qwen3-TTS component");
+        }
+        pile.close().expect("close synthetic Qwen3-TTS pile");
+    }
+
+    fn cohort(variant: Qwen3TtsVariant) -> [Fragment; 4] {
+        [
+            component_fragment(
+                &variant.component_source(BASE),
+                crate::persist::QUANTIZATION_NATIVE,
+                "base.weight",
+                1.0,
+                false,
+            ),
+            component_fragment(
+                CODEC_SOURCE,
+                crate::persist::QUANTIZATION_NATIVE,
+                "codec.weight",
+                2.0,
+                false,
+            ),
+            component_fragment(
+                &variant.component_source(TALKER_F16),
+                QUANTIZATION_F16,
+                "talker.weight",
+                3.0,
+                true,
+            ),
+            component_fragment(
+                &variant.component_source(TALKER_FOLDED_F16),
+                QUANTIZATION_F16,
+                "talker.folded.weight",
+                4.0,
+                true,
+            ),
+        ]
+    }
+
+    #[test]
+    fn one_snapshot_owns_four_explicit_qwen3tts_components() {
+        let file = TestPile::new();
+        let variant = Qwen3TtsVariant::Base1_7B;
+        publish(file.path(), cohort(variant));
+
+        let snapshot = crate::model_collection::load_model_collection_local_latest(file.path())
+            .expect("freeze native Qwen3-TTS snapshot");
+        let weights = Qwen3TtsWeights::from_snapshot(snapshot, variant)
+            .expect("select complete native Qwen3-TTS cohort");
+        assert_eq!(weights.variant(), variant);
+        assert_eq!(weights.counts(), (2, 1, 1));
+        assert!(weights.exact.contains_key("base.weight"));
+        assert!(weights.exact.contains_key("codec.weight"));
+
+        // The owned view stays frozen, while a fresh widened view fails closed
+        // when a second root claims the codec coordinate.
+        publish(
+            file.path(),
+            [component_fragment(
+                CODEC_SOURCE,
+                crate::persist::QUANTIZATION_NATIVE,
+                "other-codec.weight",
+                9.0,
+                false,
+            )],
+        );
+        assert_eq!(weights.counts(), (2, 1, 1));
+
+        let widened = crate::model_collection::load_model_collection_local_latest(file.path())
+            .expect("load widened native Qwen3-TTS snapshot");
+        let error = Qwen3TtsWeights::from_snapshot(widened, variant)
+            .err()
+            .expect("same-coordinate codec roots must fail closed");
+        assert!(
+            error.to_string().contains("ambiguous model root"),
+            "unexpected ambiguity diagnostic: {error:#}"
+        );
+    }
 }

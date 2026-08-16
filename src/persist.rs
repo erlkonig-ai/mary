@@ -972,18 +972,6 @@ pub fn load_qwen3tts_talker_folded(
     src_pile: &Path,
     folded_pile: &Path,
 ) -> anyhow::Result<crate::models::qwen3tts::talker::Talker<crate::nn::backend::BHalf>> {
-    use crate::models::qwen3tts::config::{
-        TALKER_EPS, TALKER_HEAD_DIM, TALKER_LAYERS, TALKER_ROPE_THETA,
-    };
-    use crate::models::qwen3tts::layers::{
-        Attention, DecoderLayer, Embedding, Linear, RmsNorm, RopeTable,
-    };
-    use crate::models::qwen3tts::talker::{Talker, talker_attn_config};
-    use crate::nn::backend::BHalf;
-    use burn::prelude::*;
-    use triblespace::prelude::BlobStoreGet;
-
-    let dev = crate::nn::backend::WgpuDevice::default();
     let (f16, f32_, reader) = load_split_index_from_pile(src_pile, "talker_f16")?;
     anyhow::ensure!(
         !f16.is_empty(),
@@ -994,11 +982,37 @@ pub fn load_qwen3tts_talker_folded(
         !folded.is_empty(),
         "no leaves in folded pile {folded_pile:?}"
     );
+    load_qwen3tts_talker_folded_from_indexes(&f16, &f32_, &reader, &folded, &folded_reader)
+}
 
-    let alias = |idx: &HashMap<String, crate::ingest::LeafHandles>,
-                 rd: &triblespace::core::repo::pile::PileReader,
-                 name: &str|
-     -> anyhow::Result<(Tensor<BHalf, 1>, Vec<usize>)> {
+/// Construct the raw f16 Qwen3-TTS talker from already-selected native model
+/// indexes. Both readers may be the same frozen collection reader: the split is
+/// semantic (base/talker/folded roots), not a storage or file boundary.
+#[cfg(all(feature = "qwen3tts", target_os = "macos"))]
+pub fn load_qwen3tts_talker_folded_from_indexes<R: BlobStoreGet, F: BlobStoreGet>(
+    f16: &HashMap<String, crate::ingest::LeafHandles>,
+    f32_: &HashMap<String, crate::ingest::LeafHandles>,
+    reader: &R,
+    folded: &HashMap<String, crate::ingest::LeafHandles>,
+    folded_reader: &F,
+) -> anyhow::Result<crate::models::qwen3tts::talker::Talker<crate::nn::backend::BHalf>> {
+    use crate::models::qwen3tts::config::{
+        TALKER_EPS, TALKER_HEAD_DIM, TALKER_LAYERS, TALKER_ROPE_THETA,
+    };
+    use crate::models::qwen3tts::layers::{
+        Attention, DecoderLayer, Embedding, Linear, RmsNorm, RopeTable,
+    };
+    use crate::models::qwen3tts::talker::{talker_attn_config, Talker};
+    use crate::nn::backend::BHalf;
+    use burn::prelude::*;
+
+    let dev = crate::nn::backend::WgpuDevice::default();
+    fn alias<R: BlobStoreGet>(
+        idx: &HashMap<String, crate::ingest::LeafHandles>,
+        rd: &R,
+        name: &str,
+        dev: &crate::nn::backend::WgpuDevice,
+    ) -> anyhow::Result<(Tensor<BHalf, 1>, Vec<usize>)> {
         let (dh, sh) = match idx.get(name) {
             Some(crate::ingest::LeafHandles::F16(d, s)) => (*d, *s),
             Some(crate::ingest::LeafHandles::F32(..)) => {
@@ -1010,29 +1024,29 @@ pub fn load_qwen3tts_talker_folded(
             .get(dh)
             .map_err(|e| anyhow::anyhow!("{name}: data blob: {e:?}"))?;
         let shape = crate::ingest::read_shape(rd, sh);
-        let t = crate::nn::alias::alias_flat_raw::<half::f16>(bytes, &dev)
+        let t = crate::nn::alias::alias_flat_raw::<half::f16>(bytes, dev)
             .map_err(|e| anyhow::anyhow!("{name}: zero-copy alias failed: {e}"))?;
         Ok((t, shape))
-    };
+    }
     let f3 = |name: &str| -> anyhow::Result<Tensor<BHalf, 3>> {
-        let (t, s) = alias(&folded, &folded_reader, name)?;
+        let (t, s) = alias(folded, folded_reader, name, &dev)?;
         anyhow::ensure!(s.len() == 3, "{name}: rank {} != 3", s.len());
         Ok(t.reshape([s[0], s[1], s[2]]))
     };
     let f4 = |name: &str| -> anyhow::Result<Tensor<BHalf, 4>> {
-        let (t, s) = alias(&folded, &folded_reader, name)?;
+        let (t, s) = alias(folded, folded_reader, name, &dev)?;
         anyhow::ensure!(s.len() == 4, "{name}: rank {} != 4", s.len());
         Ok(t.reshape([s[0], s[1], s[2], s[3]]))
     };
 
     let cfg = talker_attn_config();
-    let (ce, ce_shape) = alias(&f16, &reader, "talker.model.codec_embedding.weight")?;
+    let (ce, ce_shape) = alias(f16, reader, "talker.model.codec_embedding.weight", &dev)?;
     anyhow::ensure!(ce_shape.len() == 2, "codec_embedding rank != 2");
     let codec_embedding = Embedding {
         weight: ce.reshape([ce_shape[0], ce_shape[1]]),
     };
     let hidden = ce_shape[1];
-    let (te, te_shape) = alias(&f16, &reader, "talker.model.text_embedding.weight")?;
+    let (te, te_shape) = alias(f16, reader, "talker.model.text_embedding.weight", &dev)?;
     anyhow::ensure!(te_shape.len() == 2, "text_embedding rank != 2");
     let text_embedding = Embedding {
         weight: te.reshape([te_shape[0], te_shape[1]]),
@@ -1070,7 +1084,7 @@ pub fn load_qwen3tts_talker_folded(
             TALKER_EPS,
         ));
     }
-    let (nw, nw_shape) = alias(&folded, &folded_reader, "talker.folded.norm.weight")?;
+    let (nw, nw_shape) = alias(folded, folded_reader, "talker.folded.norm.weight", &dev)?;
     anyhow::ensure!(nw_shape.len() == 1, "norm.weight rank != 1");
     let norm = RmsNorm {
         weight: nw,
@@ -1082,12 +1096,12 @@ pub fn load_qwen3tts_talker_folded(
         .get("talker.model.codec_embedding.weight")
         .copied()
         .ok_or_else(|| anyhow::anyhow!("talker.model.codec_embedding.weight: missing f32 leaf"))?;
-    let codec_embedding_cpu = crate::ingest::read_leaf(&reader, ce_cpu).0;
+    let codec_embedding_cpu = crate::ingest::read_leaf(reader, ce_cpu).0;
     let ch = f32_
         .get("talker.codec_head.weight")
         .copied()
         .ok_or_else(|| anyhow::anyhow!("talker.codec_head.weight: missing f32 leaf"))?;
-    let codec_head = crate::ingest::read_leaf(&reader, ch).0;
+    let codec_head = crate::ingest::read_leaf(reader, ch).0;
 
     Ok(Talker {
         hidden,

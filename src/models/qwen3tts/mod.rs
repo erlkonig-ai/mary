@@ -13,9 +13,9 @@
 //!   - [`codec`]   — the 12 Hz tokenizer-v2 **decoder**: split-RVQ →
 //!     sliding-window transformer → ConvNeXt ×4 → SnakeBeta SEANet ×480.
 //!
-//! The codec *encoder* (a Mimi model) is not ported yet: reference codes for
-//! `ref_voice.wav` are a captured artifact (`golden/ref_code.npy`). Porting it
-//! makes arbitrary-reference cloning self-contained — the known follow-up.
+//! The codec encoder is ported in [`encoder`] and used by the standalone Qwen
+//! paths. Production `mary::speak` still consumes a captured reference-code
+//! artifact so its selected voice profile remains explicit and reproducible.
 
 pub mod codec;
 pub mod config;
