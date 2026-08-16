@@ -1,8 +1,12 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use burn::prelude::*;
 use burn::tensor::TensorData;
+use triblespace::core::collection::CollectionSnapshot;
+use triblespace::prelude::BlobStoreGet;
 
+use crate::ingest::LeafHandles;
 use crate::models::flux::mistral_encoder::config::Mistral3Config;
 use crate::models::flux::mistral_encoder::Mistral3Model;
 use crate::models::flux::scheduler::FlowMatchEulerDiscreteScheduler;
@@ -16,9 +20,14 @@ use crate::models::flux::vae::config::VaeConfig;
 use crate::models::flux::vae::AutoencoderKLFlux2;
 use crate::nn::backend::{BHalf, WgpuDevice, B};
 use crate::nn::weight_loader::WeightLoader;
+use crate::selection::ModelSelector;
+
+const TEXT_ENCODER: &str = "text_encoder";
+const TRANSFORMER: &str = "transformer";
+const VAE: &str = "vae";
 
 /// Model variant auto-detected from directory contents.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelVariant {
     /// FLUX.2-klein-4B: Qwen3 text encoder, no guidance, step-distilled
     Klein,
@@ -26,40 +35,141 @@ pub enum ModelVariant {
     Dev,
 }
 
+impl ModelVariant {
+    /// Detect the variant from the text-encoder config shipped beside the
+    /// durable weight collection.
+    pub fn detect(model_dir: &Path) -> anyhow::Result<Self> {
+        let path = model_dir.join(TEXT_ENCODER).join("config.json");
+        let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+        Ok(
+            match json.get("model_type").and_then(|value| value.as_str()) {
+                Some("mistral3") => Self::Dev,
+                _ => Self::Klein,
+            },
+        )
+    }
+
+    /// Canonical source coordinate shared by all components of this variant.
+    pub const fn source(self) -> &'static str {
+        match self {
+            Self::Klein => "black-forest-labs/FLUX.2-klein-4B",
+            Self::Dev => "black-forest-labs/FLUX.2-dev",
+        }
+    }
+
+    /// Source coordinate of one independently imported component.
+    pub fn component_source(self, component: &str) -> String {
+        format!("{}#{component}", self.source())
+    }
+}
+
+/// The three FLUX weight components selected from one frozen native model
+/// collection snapshot.
+///
+/// Only the compact tensor-handle indexes stay resident. Each phase
+/// materializes its component from the same owned reader, then drops the
+/// resulting keymap before the next phase. Construction validates all three
+/// source coordinates up front, so a mixed, missing, or ambiguous local model
+/// cohort fails before GPU execution starts.
+pub struct FluxWeights<R> {
+    variant: ModelVariant,
+    text_encoder: HashMap<String, LeafHandles>,
+    transformer: HashMap<String, LeafHandles>,
+    vae: HashMap<String, LeafHandles>,
+    reader: R,
+}
+
+impl<R: BlobStoreGet> FluxWeights<R> {
+    /// Select the text encoder, transformer, and VAE roots from one immutable
+    /// native model-collection snapshot.
+    pub fn from_snapshot(
+        snapshot: CollectionSnapshot<R>,
+        variant: ModelVariant,
+    ) -> anyhow::Result<Self> {
+        fn select_component(
+            facts: &triblespace::prelude::TribleSet,
+            reader: &impl BlobStoreGet,
+            variant: ModelVariant,
+            component: &str,
+        ) -> anyhow::Result<HashMap<String, LeafHandles>> {
+            let source = variant.component_source(component);
+            let root = crate::selection::select_model_root(
+                facts,
+                reader,
+                ModelSelector::Source {
+                    source: &source,
+                    quantization: crate::persist::QUANTIZATION_NATIVE,
+                },
+            )?;
+            crate::selection::index_keymap_for_root(facts, reader, root)
+        }
+
+        let text_encoder =
+            select_component(snapshot.facts(), snapshot.reader(), variant, TEXT_ENCODER)?;
+        let transformer =
+            select_component(snapshot.facts(), snapshot.reader(), variant, TRANSFORMER)?;
+        let vae = select_component(snapshot.facts(), snapshot.reader(), variant, VAE)?;
+        let (_, _, reader) = snapshot.into_parts();
+        Ok(Self {
+            variant,
+            text_encoder,
+            transformer,
+            vae,
+            reader,
+        })
+    }
+
+    pub const fn variant(&self) -> ModelVariant {
+        self.variant
+    }
+
+    fn materialize(
+        &self,
+        index: &HashMap<String, LeafHandles>,
+    ) -> HashMap<String, (Vec<f32>, Vec<usize>)> {
+        index
+            .iter()
+            .map(|(name, handles)| {
+                (
+                    name.clone(),
+                    crate::ingest::read_leaf(&self.reader, *handles),
+                )
+            })
+            .collect()
+    }
+
+    fn text_encoder(&self) -> HashMap<String, (Vec<f32>, Vec<usize>)> {
+        self.materialize(&self.text_encoder)
+    }
+
+    fn transformer(&self) -> HashMap<String, (Vec<f32>, Vec<usize>)> {
+        self.materialize(&self.transformer)
+    }
+
+    fn vae(&self) -> HashMap<String, (Vec<f32>, Vec<usize>)> {
+        self.materialize(&self.vae)
+    }
+}
+
 /// Unified FLUX.2 inference pipeline (supports both Klein and Dev).
 pub struct Flux2Pipeline;
 
 impl Flux2Pipeline {
-    /// Auto-detect model variant from text encoder config.
-    fn detect_variant(model_dir: &Path) -> ModelVariant {
-        let te_config_path = model_dir.join("text_encoder").join("config.json");
-        let json: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(&te_config_path)
-                .unwrap_or_else(|e| panic!("Failed to read text_encoder config: {}", e)),
-        )
-        .unwrap();
-        match json.get("model_type").and_then(|v| v.as_str()) {
-            Some("mistral3") => ModelVariant::Dev,
-            _ => ModelVariant::Klein,
-        }
-    }
-
     /// Generate an image from a text prompt.
     ///
-    /// WEIGHTS load per-component from `pile` (write one with `flux_persist`;
-    /// entities are `text_encoder/…`, `transformer/…`, `vae/…`). `model_dir`
-    /// supplies only the small side-files: configs + tokenizer. NOTE: the Dev
-    /// streaming path materializes the transformer keymap in host RAM before
-    /// streaming blocks to the GPU — a lazy pile-backed loader is the known
-    /// follow-up before Dev-scale (60GB) piles are practical.
+    /// WEIGHTS load per-component from one frozen [`FluxWeights`] snapshot.
+    /// `model_dir` supplies only the small side-files: configs + tokenizer.
+    /// NOTE: the Dev streaming path materializes the transformer keymap in host
+    /// RAM before streaming blocks to the GPU — a lazy handle-backed loader is
+    /// the known follow-up before Dev-scale (60GB) models are practical.
     ///
     /// Loads models sequentially to minimize memory usage:
     /// 1. Tokenize + text encode → drop text encoder
     /// 2. Load transformer → denoise → drop transformer
     /// 3. Load VAE → decode → output image
     ///
-    /// Auto-detects Klein vs Dev from the transformer config.
-    pub fn generate<B: Backend>(
+    /// Auto-detects Klein vs Dev from the text-encoder config.
+    pub fn generate<B: Backend, R: BlobStoreGet>(
         prompt: &str,
         height: usize,
         width: usize,
@@ -67,7 +177,7 @@ impl Flux2Pipeline {
         guidance_scale: f32,
         seed: u64,
         model_dir: &Path,
-        pile: &Path,
+        weights: &FluxWeights<R>,
         lora_path: Option<&Path>,
         device: &B::Device,
     ) -> image::RgbImage {
@@ -77,7 +187,13 @@ impl Flux2Pipeline {
         let latent_h = 2 * (height / (vae_scale_factor * 2));
         let latent_w = 2 * (width / (vae_scale_factor * 2));
 
-        let variant = Self::detect_variant(model_dir);
+        let variant = ModelVariant::detect(model_dir)
+            .unwrap_or_else(|error| panic!("detect FLUX model variant: {error:#}"));
+        assert_eq!(
+            variant,
+            weights.variant(),
+            "FLUX config variant and selected native weights disagree"
+        );
         let transformer_config_path = model_dir.join("transformer").join("config.json");
         let mut transformer_config = Flux2TransformerConfig::load(&transformer_config_path);
         // Dev config may be missing guidance_embeds field; override from variant detection
@@ -94,8 +210,10 @@ impl Flux2Pipeline {
         eprintln!("Phase 1: Text encoding...");
 
         let (prompt_embeds, seq_len) = match variant {
-            ModelVariant::Klein => Self::encode_text_klein::<B>(prompt, model_dir, pile, device),
-            ModelVariant::Dev => Self::encode_text_dev::<B>(prompt, model_dir, pile, device),
+            ModelVariant::Klein => {
+                Self::encode_text_klein::<B, R>(prompt, model_dir, weights, device)
+            }
+            ModelVariant::Dev => Self::encode_text_dev::<B, R>(prompt, model_dir, weights, device),
         };
 
         // Prepare text position IDs (for full sequence)
@@ -125,10 +243,7 @@ impl Flux2Pipeline {
         // ========== Phase 3: Denoising ==========
         eprintln!("Phase 3: Loading transformer and denoising...");
 
-        let transformer_loader = WeightLoader::Pile(
-            crate::persist::load_keymap_from_pile_prefixed(pile, "transformer/")
-                .unwrap_or_else(|e| panic!("load transformer from pile {pile:?}: {e:?}")),
-        );
+        let transformer_loader = WeightLoader::Pile(weights.transformer());
 
         let transformer =
             Flux2Transformer2DModel::<B>::load(&transformer_loader, transformer_config, device);
@@ -182,10 +297,7 @@ impl Flux2Pipeline {
 
         let vae_config_path = model_dir.join("vae").join("config.json");
         let vae_config = VaeConfig::load(&vae_config_path);
-        let vae_loader = WeightLoader::Pile(
-            crate::persist::load_keymap_from_pile_prefixed(pile, "vae/")
-                .unwrap_or_else(|e| panic!("load vae from pile {pile:?}: {e:?}")),
-        );
+        let vae_loader = WeightLoader::Pile(weights.vae());
 
         let vae = AutoencoderKLFlux2::<B>::load(&vae_loader, vae_config, device);
 
@@ -213,10 +325,10 @@ impl Flux2Pipeline {
     }
 
     /// Text encoding for Klein: Qwen2Tokenizer + Qwen3Model, extract layers [9, 18, 27].
-    fn encode_text_klein<B: Backend>(
+    fn encode_text_klein<B: Backend, R: BlobStoreGet>(
         prompt: &str,
         model_dir: &Path,
-        pile: &Path,
+        weights: &FluxWeights<R>,
         device: &B::Device,
     ) -> (Tensor<B, 3>, usize) {
         let tokenizer_path = model_dir.join("tokenizer").join("tokenizer.json");
@@ -226,10 +338,7 @@ impl Flux2Pipeline {
 
         let te_config_path = model_dir.join("text_encoder").join("config.json");
         let te_config = Qwen3Config::load(&te_config_path);
-        let te_loader = WeightLoader::Pile(
-            crate::persist::load_keymap_from_pile_prefixed(pile, "text_encoder/")
-                .unwrap_or_else(|e| panic!("load text_encoder from pile {pile:?}: {e:?}")),
-        );
+        let te_loader = WeightLoader::Pile(weights.text_encoder());
 
         let text_encoder = Qwen3Model::<B>::load(&te_loader, te_config, device);
 
@@ -261,10 +370,10 @@ impl Flux2Pipeline {
     }
 
     /// Text encoding for Dev: MistralTokenizer + Mistral3Model, extract layers [10, 20, 30].
-    fn encode_text_dev<B: Backend>(
+    fn encode_text_dev<B: Backend, R: BlobStoreGet>(
         prompt: &str,
         model_dir: &Path,
-        pile: &Path,
+        weights: &FluxWeights<R>,
         device: &B::Device,
     ) -> (Tensor<B, 3>, usize) {
         let tokenizer_path = model_dir.join("tokenizer").join("tokenizer.json");
@@ -274,10 +383,7 @@ impl Flux2Pipeline {
 
         let te_config_path = model_dir.join("text_encoder").join("config.json");
         let te_config = Mistral3Config::load(&te_config_path);
-        let te_loader = WeightLoader::Pile(
-            crate::persist::load_keymap_from_pile_prefixed(pile, "text_encoder/")
-                .unwrap_or_else(|e| panic!("load text_encoder from pile {pile:?}: {e:?}")),
-        );
+        let te_loader = WeightLoader::Pile(weights.text_encoder());
 
         let extract_layers = [10, 20, 30];
         let text_encoder = Mistral3Model::<B>::load(&te_loader, te_config, &extract_layers, device);
@@ -313,7 +419,7 @@ impl Flux2Pipeline {
     /// - Klein: f16 text encoder only, f32 transformer (fits in memory, better precision)
     /// - Dev: f16 text encoder + transformer (60GB transformer doesn't fit in f32)
     /// - VAE always runs in f32.
-    pub fn generate_f16(
+    pub fn generate_f16<R: BlobStoreGet>(
         prompt: &str,
         height: usize,
         width: usize,
@@ -321,7 +427,7 @@ impl Flux2Pipeline {
         guidance_scale: f32,
         seed: u64,
         model_dir: &Path,
-        pile: &Path,
+        weights: &FluxWeights<R>,
         lora_path: Option<&Path>,
         device: &WgpuDevice,
     ) -> image::RgbImage {
@@ -329,7 +435,13 @@ impl Flux2Pipeline {
         let latent_h = 2 * (height / (vae_scale_factor * 2));
         let latent_w = 2 * (width / (vae_scale_factor * 2));
 
-        let variant = Self::detect_variant(model_dir);
+        let variant = ModelVariant::detect(model_dir)
+            .unwrap_or_else(|error| panic!("detect FLUX model variant: {error:#}"));
+        assert_eq!(
+            variant,
+            weights.variant(),
+            "FLUX config variant and selected native weights disagree"
+        );
         let transformer_config_path = model_dir.join("transformer").join("config.json");
         let mut transformer_config = Flux2TransformerConfig::load(&transformer_config_path);
         if matches!(variant, ModelVariant::Dev) {
@@ -357,12 +469,12 @@ impl Flux2Pipeline {
         let (prompt_embeds, seq_len) = match variant {
             ModelVariant::Klein => {
                 eprintln!("Phase 1: Text encoding (f32)...");
-                Self::encode_text_klein::<B>(prompt, model_dir, pile, device)
+                Self::encode_text_klein::<B, R>(prompt, model_dir, weights, device)
             }
             ModelVariant::Dev => {
                 eprintln!("Phase 1: Text encoding (f16)...");
                 let (embeds_half, seq_len) =
-                    Self::encode_text_dev::<BHalf>(prompt, model_dir, pile, device);
+                    Self::encode_text_dev::<BHalf, R>(prompt, model_dir, weights, device);
                 let embeds: Tensor<B, 3> = Tensor::from_data(embeds_half.into_data(), device);
                 (embeds, seq_len)
             }
@@ -381,7 +493,7 @@ impl Flux2Pipeline {
                 guidance_scale,
                 seed,
                 model_dir,
-                pile,
+                weights,
                 lora_path,
                 device,
             )
@@ -398,7 +510,7 @@ impl Flux2Pipeline {
                 guidance_scale,
                 seed,
                 model_dir,
-                pile,
+                weights,
                 lora_path,
                 device,
             )
@@ -406,7 +518,7 @@ impl Flux2Pipeline {
     }
 
     /// Denoise in f32 + VAE decode (used for Klein --f16 where only text encoder is f16).
-    fn denoise_and_decode_f32(
+    fn denoise_and_decode_f32<R: BlobStoreGet>(
         prompt_embeds: Tensor<B, 3>,
         seq_len: usize,
         variant: ModelVariant,
@@ -417,7 +529,7 @@ impl Flux2Pipeline {
         guidance_scale: f32,
         seed: u64,
         model_dir: &Path,
-        pile: &Path,
+        weights: &FluxWeights<R>,
         lora_path: Option<&Path>,
         device: &WgpuDevice,
     ) -> image::RgbImage {
@@ -438,10 +550,7 @@ impl Flux2Pipeline {
         );
 
         eprintln!("Phase 3: Loading transformer and denoising (f32)...");
-        let transformer_loader = WeightLoader::Pile(
-            crate::persist::load_keymap_from_pile_prefixed(pile, "transformer/")
-                .unwrap_or_else(|e| panic!("load transformer from pile {pile:?}: {e:?}")),
-        );
+        let transformer_loader = WeightLoader::Pile(weights.transformer());
         let transformer =
             Flux2Transformer2DModel::<B>::load(&transformer_loader, transformer_config, device);
 
@@ -478,13 +587,20 @@ impl Flux2Pipeline {
         drop(transformer);
         eprintln!("  Transformer freed from memory");
 
-        Self::vae_decode(latents, img_ids, latent_channels, model_dir, pile, device)
+        Self::vae_decode(
+            latents,
+            img_ids,
+            latent_channels,
+            model_dir,
+            weights,
+            device,
+        )
     }
 
     /// Denoise with streaming f32 transformer (blocks loaded one-at-a-time) + VAE decode.
     /// Used for Dev where the 60GB transformer doesn't fit in memory all at once.
     /// Peak memory: ~7GB for transformer (header + 1 block) instead of ~120GB.
-    fn denoise_streaming_and_decode(
+    fn denoise_streaming_and_decode<R: BlobStoreGet>(
         prompt_embeds: Tensor<B, 3>,
         seq_len: usize,
         variant: ModelVariant,
@@ -495,7 +611,7 @@ impl Flux2Pipeline {
         guidance_scale: f32,
         seed: u64,
         model_dir: &Path,
-        pile: &Path,
+        weights: &FluxWeights<R>,
         lora_path: Option<&Path>,
         device: &WgpuDevice,
     ) -> image::RgbImage {
@@ -519,10 +635,7 @@ impl Flux2Pipeline {
             eprintln!("Warning: LoRA is not yet supported with streaming transformer (Dev). LoRA will be ignored.");
         }
         eprintln!("Phase 3: Loading transformer header and denoising (streaming f32)...");
-        let transformer_loader = WeightLoader::Pile(
-            crate::persist::load_keymap_from_pile_prefixed(pile, "transformer/")
-                .unwrap_or_else(|e| panic!("load transformer from pile {pile:?}: {e:?}")),
-        );
+        let transformer_loader = WeightLoader::Pile(weights.transformer());
         let transformer = Flux2Transformer2DModel::<B>::load_header_only(
             &transformer_loader,
             transformer_config,
@@ -560,26 +673,30 @@ impl Flux2Pipeline {
         drop(transformer);
         eprintln!("  Transformer freed from memory");
 
-        Self::vae_decode(latents, img_ids, latent_channels, model_dir, pile, device)
+        Self::vae_decode(
+            latents,
+            img_ids,
+            latent_channels,
+            model_dir,
+            weights,
+            device,
+        )
     }
 
     /// VAE decode: unpack latents, denormalize, decode, convert to image. Always f32.
-    fn vae_decode(
+    fn vae_decode<R: BlobStoreGet>(
         latents: Tensor<B, 3>,
         img_ids: Tensor<B, 3>,
         latent_channels: usize,
         model_dir: &Path,
-        pile: &Path,
+        weights: &FluxWeights<R>,
         device: &WgpuDevice,
     ) -> image::RgbImage {
         eprintln!("Phase 4: VAE decoding...");
 
         let vae_config_path = model_dir.join("vae").join("config.json");
         let vae_config = VaeConfig::load(&vae_config_path);
-        let vae_loader = WeightLoader::Pile(
-            crate::persist::load_keymap_from_pile_prefixed(pile, "vae/")
-                .unwrap_or_else(|e| panic!("load vae from pile {pile:?}: {e:?}")),
-        );
+        let vae_loader = WeightLoader::Pile(weights.vae());
 
         let vae = AutoencoderKLFlux2::<B>::load(&vae_loader, vae_config, device);
 
@@ -601,9 +718,6 @@ impl Flux2Pipeline {
         utils::tensor_to_image(image)
     }
 }
-
-/// For backward compatibility.
-pub type Flux2KleinPipeline = Flux2Pipeline;
 
 /// Generate random noise tensor using a simple seeded RNG.
 fn generate_noise<B: Backend>(
@@ -636,4 +750,134 @@ fn generate_noise<B: Backend>(
         TensorData::new(data, [batch, channels, height, width]),
         device,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::{attrs, F32Array, U64Array};
+    use ed25519_dalek::SigningKey;
+    use std::fs::OpenOptions;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use triblespace::core::repo::pile::Pile;
+    use triblespace::prelude::blobencodings::LongString;
+    use triblespace::prelude::*;
+
+    static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestPile(PathBuf);
+
+    impl TestPile {
+        fn new() -> Self {
+            let ordinal = NEXT_TEST_PILE.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "mary-native-flux-{}-{nanos}-{ordinal}.pile",
+                std::process::id()
+            ));
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .expect("create synthetic FLUX pile");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestPile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn component_fragment(
+        variant: ModelVariant,
+        component: &str,
+        tensor: &str,
+        value: f32,
+    ) -> Fragment {
+        let mut fragment = Fragment::empty();
+        let data = fragment.put::<F32Array, _>(vec![value]);
+        let shape = fragment.put::<U64Array, _>(vec![1_u64]);
+        let leaf = entity! { _ @ attrs::data: data, attrs::shape: shape };
+        let leaf_id = leaf.root().expect("tensor leaf root");
+        fragment += leaf;
+
+        let name = fragment.put::<LongString, _>(tensor.to_owned());
+        let member = entity! { _ @ attrs::safetensor_path: name, attrs::weight: &leaf_id };
+        let member_id = member.root().expect("model member root");
+        fragment += member;
+
+        let source = fragment.put::<LongString, _>(variant.component_source(component));
+        fragment += entity! { _ @
+            attrs::source: source,
+            attrs::quantization: crate::persist::QUANTIZATION_NATIVE,
+            attrs::member: &member_id,
+        };
+        fragment
+    }
+
+    fn publish(path: &Path, fragments: impl IntoIterator<Item = Fragment>) {
+        let mut pile = Pile::open(path).expect("open synthetic FLUX pile");
+        for fragment in fragments {
+            crate::model_collection::publish_model_fragment(
+                &mut pile,
+                &SigningKey::from_bytes(&[0x46; 32]),
+                fragment,
+            )
+            .expect("publish native FLUX component");
+        }
+        pile.close().expect("close synthetic FLUX pile");
+    }
+
+    #[test]
+    fn one_snapshot_owns_three_explicit_flux_components() {
+        let file = TestPile::new();
+        publish(
+            file.path(),
+            [
+                component_fragment(ModelVariant::Klein, TEXT_ENCODER, "te.weight", 1.0),
+                component_fragment(ModelVariant::Klein, TRANSFORMER, "tr.weight", 2.0),
+                component_fragment(ModelVariant::Klein, VAE, "vae.weight", 3.0),
+            ],
+        );
+
+        let snapshot = crate::model_collection::load_model_collection_local_latest(file.path())
+            .expect("freeze native FLUX snapshot");
+        let weights = FluxWeights::from_snapshot(snapshot, ModelVariant::Klein)
+            .expect("index all FLUX components");
+
+        // A conflicting later root cannot change the already-owned snapshot.
+        publish(
+            file.path(),
+            [component_fragment(
+                ModelVariant::Klein,
+                TEXT_ENCODER,
+                "conflict.weight",
+                9.0,
+            )],
+        );
+        assert_eq!(weights.text_encoder()["te.weight"], (vec![1.0], vec![1]));
+        assert_eq!(weights.transformer()["tr.weight"], (vec![2.0], vec![1]));
+        assert_eq!(weights.vae()["vae.weight"], (vec![3.0], vec![1]));
+
+        let widened = crate::model_collection::load_model_collection_local_latest(file.path())
+            .expect("load widened native FLUX snapshot");
+        let error = FluxWeights::from_snapshot(widened, ModelVariant::Klein)
+            .err()
+            .expect("same-coordinate component roots must fail closed");
+        assert!(
+            error.to_string().contains("ambiguous model root"),
+            "unexpected ambiguity diagnostic: {error:#}"
+        );
+    }
 }

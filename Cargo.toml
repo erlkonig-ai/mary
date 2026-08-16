@@ -511,11 +511,11 @@ required-features = ["import"]
 name = "embed_persist"
 required-features = ["embed", "import"]
 
-# Persist a FLUX.2 model dir (text_encoder + transformer + vae) into one pile,
-# component-prefixed so the pipeline loads each phase separately.
+# Import a FLUX.2 model dir as three native collection roots selected from one
+# frozen snapshot while the pipeline still loads each phase separately.
 [[bin]]
 name = "flux_persist"
-required-features = ["import"]
+required-features = ["flux", "import"]
 
 # Persist → fresh-pile-load → parity gate (no safetensors at load time).
 [[bin]]

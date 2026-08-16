@@ -1,66 +1,83 @@
-//! Persist a FLUX.2 model directory (text_encoder + transformer + vae) into
-//! ONE on-disk TribleSpace pile — the durable imagination weight store the
-//! `Flux2Pipeline` loads from. Model-entity names are component-prefixed
-//! (`text_encoder/…`, `transformer/…`, `vae/…`) so the pipeline materializes
-//! one component's keymap per phase (`load_keymap_from_pile_prefixed`) and
-//! keeps peak RAM at a single component. f16 leaves — the checkpoints are
-//! bf16-native and the pipeline builds f32/f16 tensors from the leaves either
-//! way; f16 halves the pile.
+//! Import a FLUX.2 model directory into Mary's native model collection.
 //!
-//!   cargo run --release --features import --bin flux_persist -- \
-//!     <model-dir> <pile-path>
+//! The text encoder, transformer, and VAE become three ordinary model roots
+//! under stable component source coordinates. Runtime freezes one collection
+//! snapshot, indexes all three roots, and still materializes only one component
+//! per inference phase.
 //!
-//! `<model-dir>` is the HF snapshot dir (klein or dev layout) with
-//! `text_encoder/`, `transformer/`, and `vae/` subdirectories.
+//! ```text
+//! cargo run --release --features flux,import --bin flux_persist -- \
+//!   <model-dir> <pile-path> <signing-key>
+//! ```
 
 use mary::ingest::LeafDtype;
-use mary::persist::persist_safetensors_files_to_pile;
-use std::path::{Path, PathBuf};
-use std::time::Instant;
+use mary::models::flux::pipeline::ModelVariant;
+use std::path::Path;
+use triblespace::core::repo::pile::Pile;
+use triblespace::core::signing_key_file;
 
-/// The pipeline's three weight-bearing components (tokenizer/scheduler configs
-/// stay small files next to the pile).
 const COMPONENTS: &[&str] = &["text_encoder", "transformer", "vae"];
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("usage: flux_persist <model-dir> <pile-path>");
+    if args.len() != 4 {
+        eprintln!("usage: flux_persist <model-dir> <pile-path> <signing-key>");
         std::process::exit(2);
     }
     let model_dir = Path::new(&args[1]);
     let pile_path = Path::new(&args[2]);
+    let key_path = Path::new(&args[3]);
+    let variant = ModelVariant::detect(model_dir)?;
+    let signing_key = signing_key_file::load_existing(key_path)?;
 
-    for component in COMPONENTS {
-        let dir = model_dir.join(component);
-        let mut shards: Vec<PathBuf> = std::fs::read_dir(&dir)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().map(|x| x == "safetensors").unwrap_or(false))
-            .collect();
-        shards.sort();
-        anyhow::ensure!(!shards.is_empty(), "no .safetensors shards in {dir:?}");
-        let files: Vec<(PathBuf, String)> = shards
-            .into_iter()
-            .map(|p| {
-                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("model");
-                let name = format!("{component}/{name}");
-                (p, name)
-            })
-            .collect();
-        let t = Instant::now();
-        eprintln!(
-            "Persisting {component} ({} file(s)) → {pile_path:?} ...",
-            files.len()
-        );
-        persist_safetensors_files_to_pile(&files, pile_path, LeafDtype::F16)?;
-        eprintln!("  {component}: {:.1}s", t.elapsed().as_secs_f64());
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(pile_path)
+    {
+        Ok(_) => eprintln!("flux_persist: created new empty pile {pile_path:?}"),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let mut pile = Pile::open(pile_path)
+        .map_err(|error| anyhow::anyhow!("open model pile {pile_path:?}: {error}"))?;
+    let imported = (|| -> anyhow::Result<()> {
+        for component in COMPONENTS {
+            let directory = model_dir.join(component);
+            anyhow::ensure!(directory.is_dir(), "missing FLUX component {directory:?}");
+            let source = variant.component_source(component);
+            eprintln!("flux_persist: importing {source} from {directory:?}");
+            let (root, commit) = mary::persist::import_model_to_collection(
+                &mut pile,
+                &signing_key,
+                &directory,
+                LeafDtype::F16,
+                &source,
+                mary::persist::QUANTIZATION_NATIVE,
+            )?;
+            eprintln!(
+                "flux_persist: {component} root {root:X}, native commit {}",
+                commit.id()
+            );
+        }
+        Ok(())
+    })();
+    let close = pile
+        .close()
+        .map_err(|error| anyhow::anyhow!("close model pile {pile_path:?}: {error}"));
+    match (imported, close) {
+        (Ok(()), Ok(())) => {}
+        (Err(error), Ok(())) => return Err(error),
+        (Ok(()), Err(error)) => return Err(error),
+        (Err(error), Err(close_error)) => {
+            return Err(error.context(format!("import also failed to close pile: {close_error}")))
+        }
     }
 
     let size = std::fs::metadata(pile_path)?.len();
     println!(
-        "Pile file {pile_path:?} is {} bytes ({:.2} GiB).",
-        size,
+        "Pile file {pile_path:?} is {size} bytes ({:.2} GiB).",
         size as f64 / (1u64 << 30) as f64
     );
     Ok(())
