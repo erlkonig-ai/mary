@@ -185,6 +185,171 @@ pub fn import_model_to_collection(
     Ok((root_id, commit))
 }
 
+/// Import one safetensors file's selected float tensors into Mary's native
+/// append-only model collection.
+///
+/// This is the component-sized counterpart to [`import_model_to_collection`]:
+/// `keep` chooses tensors by their safetensors key, while `source` and
+/// `quantization` label the resulting content-derived root. The file name is
+/// retained as non-core provenance. An empty selection is rejected rather than
+/// publishing the otherwise-valid empty-set root.
+///
+/// The caller owns both the already-open pile and the durable signing identity,
+/// and chooses the eventual durability boundary. This function never opens,
+/// flushes, or closes storage and never creates or advances a Repository branch.
+#[cfg(feature = "import")]
+pub fn import_safetensors_file_filtered_to_collection(
+    pile: &mut Pile,
+    signing_key: &SigningKey,
+    file: &Path,
+    dtype: LeafDtype,
+    source: &str,
+    quantization: &str,
+    keep: impl Fn(&str) -> bool,
+) -> anyhow::Result<(Id, CollectionCommit)> {
+    // Validate the caller's observed prefix before writing imported blobs. A
+    // corrupt tail must remain an explicit operator repair, never an importer
+    // side effect.
+    pile.refresh().map_err(|e| {
+        anyhow::anyhow!(
+            "model pile failed to load ({e:?}); refusing to auto-truncate — \
+             if the tail is a genuinely torn write, amputate explicitly with \
+             `trible pile amputate`"
+        )
+    })?;
+
+    let bytes = std::fs::read(file).with_context(|| format!("read safetensors file {file:?}"))?;
+    let (members, facts) = crate::ingest::ingest_members(&bytes, pile, dtype, keep)
+        .map_err(|e| anyhow::anyhow!("ingest {file:?}: {e}"))?;
+    anyhow::ensure!(
+        !members.is_empty(),
+        "filtered safetensors import selected no supported float tensors from {file:?}"
+    );
+
+    let provenance = file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("model.safetensors")
+        .to_owned();
+    let root =
+        crate::ingest::build_model_root(pile, source, quantization, members, facts, &[provenance])
+            .map_err(|e| anyhow::anyhow!("build model root: {e}"))?;
+    let root_id = root.root().expect("model root id");
+    let commit = crate::model_collection::publish_model_fragment(pile, signing_key, root)
+        .map_err(|error| anyhow::anyhow!("publish model collection commit: {error}"))?;
+    Ok((root_id, commit))
+}
+
+#[cfg(all(test, feature = "import"))]
+mod filtered_native_import_tests {
+    use super::*;
+    use crate::selection::ModelSelector;
+    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TempFixture {
+        dir: std::path::PathBuf,
+    }
+
+    impl TempFixture {
+        fn new() -> Self {
+            let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "mary-filtered-native-import-{}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            Self { dir }
+        }
+    }
+
+    impl Drop for TempFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn f32_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn filtered_import_publishes_only_selected_tensors_and_rejects_empty_roots() {
+        let fixture = TempFixture::new();
+        let weights_file = fixture.dir.join("components.safetensors");
+        let kept = vec![1.0_f32, 2.0, 3.0, 4.0];
+        let dropped = vec![-1.0_f32, -2.0];
+        let kept_bytes = f32_bytes(&kept);
+        let dropped_bytes = f32_bytes(&dropped);
+        serialize_to_file(
+            [
+                (
+                    "talker.layer.weight",
+                    TensorView::new(Dtype::F32, vec![2, 2], &kept_bytes).unwrap(),
+                ),
+                (
+                    "codec.layer.bias",
+                    TensorView::new(Dtype::F32, vec![2], &dropped_bytes).unwrap(),
+                ),
+            ],
+            &None,
+            &weights_file,
+        )
+        .unwrap();
+
+        let pile_path = fixture.dir.join("models.pile");
+        std::fs::File::create(&pile_path).unwrap();
+        let signing_key = SigningKey::from_bytes(&[0x59; 32]);
+        let mut pile = Pile::open(&pile_path).unwrap();
+        let (root, commit) = import_safetensors_file_filtered_to_collection(
+            &mut pile,
+            &signing_key,
+            &weights_file,
+            LeafDtype::F32,
+            "fixture/talker",
+            "native",
+            |name| name.starts_with("talker."),
+        )
+        .unwrap();
+
+        let snapshot =
+            crate::model_collection::snapshot_model_collection_exact(&mut pile, &[commit]).unwrap();
+        let keymap = crate::selection::load_keymap_from_graph(
+            snapshot.facts(),
+            snapshot.reader(),
+            ModelSelector::Root(root),
+        )
+        .unwrap();
+        assert_eq!(keymap.len(), 1);
+        assert_eq!(keymap["talker.layer.weight"], (kept, vec![2, 2]));
+        assert!(!keymap.contains_key("codec.layer.bias"));
+
+        let empty = import_safetensors_file_filtered_to_collection(
+            &mut pile,
+            &signing_key,
+            &weights_file,
+            LeafDtype::F32,
+            "fixture/empty",
+            "native",
+            |_| false,
+        )
+        .unwrap_err();
+        assert!(empty
+            .to_string()
+            .contains("selected no supported float tensors"));
+        pile.close().unwrap();
+
+        let latest =
+            crate::model_collection::load_model_collection_local_latest(&pile_path).unwrap();
+        assert_eq!(latest.commits(), &[commit]);
+    }
+}
+
 /// The engine behind [`persist_safetensors_files_to_pile`] (untagged, `main`):
 /// ingest each file's weight blobs straight into `pile_path`'s storage (no
 /// in-memory carryover) and commit ONE model entity PER file on `main`, creating
