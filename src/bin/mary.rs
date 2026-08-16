@@ -266,7 +266,7 @@ mod tests {
 /// we locate (or download) its snapshot directory in the local HF cache. Any of
 /// the three supported formats counts — safetensors, GGUF, or a pytorch pickle
 /// `state_dict` — since `mary::formats::detect_format` picks the decoder at
-/// import time. Kept inline (rather than via `mary::embed::hf_cache_resolve`) so
+/// import time. Kept inline (rather than via the embedding cache helper) so
 /// `mary import` stays behind the lean `import` feature and never drags in the
 /// `embed` stack.
 fn resolve_source(source: &str) -> anyhow::Result<PathBuf> {

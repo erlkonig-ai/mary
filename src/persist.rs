@@ -327,6 +327,58 @@ pub fn import_safetensors_file_filtered_to_collection(
     quantization: &str,
     keep: impl Fn(&str) -> bool,
 ) -> anyhow::Result<(Id, CollectionCommit)> {
+    let root =
+        ingest_safetensors_file_filtered_fragment(pile, file, dtype, source, quantization, keep)?;
+    let root_id = root.root().expect("model root id");
+    let commit = crate::model_collection::publish_model_fragment(pile, signing_key, root)
+        .map_err(|error| anyhow::anyhow!("publish model collection commit: {error}"))?;
+    Ok((root_id, commit))
+}
+
+/// Ingest one explicit safetensors file into an unpublished native model root.
+///
+/// This is the commit-last counterpart to
+/// [`import_safetensors_file_filtered_to_collection`]. The explicit path is
+/// intentional: callers importing a known checkpoint file do not accidentally
+/// absorb adapters or unrelated safetensors found beside it. Tensor blobs are
+/// written as inert content-addressed exhaust, while the returned fragment
+/// remains unpublished until its caller has completed every domain gate.
+#[cfg(feature = "import")]
+pub fn ingest_safetensors_file_filtered_fragment(
+    pile: &mut Pile,
+    file: &Path,
+    dtype: LeafDtype,
+    source: &str,
+    quantization: &str,
+    keep: impl Fn(&str) -> bool,
+) -> anyhow::Result<Fragment> {
+    ingest_weight_file_filtered_fragment(
+        pile,
+        file,
+        crate::formats::WeightFormat::Safetensors,
+        dtype,
+        source,
+        quantization,
+        keep,
+    )
+}
+
+/// Ingest one explicit supported weight file into an unpublished model root.
+///
+/// Safetensors and PyTorch-pickle inputs converge through the same canonical
+/// `(name, f32 bytes, shape)` member representation. The caller supplies the
+/// detected format explicitly, so a signed cohort never changes decoder merely
+/// because another artifact later appears beside the chosen file.
+#[cfg(feature = "import")]
+pub fn ingest_weight_file_filtered_fragment(
+    pile: &mut Pile,
+    file: &Path,
+    format: crate::formats::WeightFormat,
+    dtype: LeafDtype,
+    source: &str,
+    quantization: &str,
+    keep: impl Fn(&str) -> bool,
+) -> anyhow::Result<Fragment> {
     // Validate the caller's observed prefix before writing imported blobs. A
     // corrupt tail must remain an explicit operator repair, never an importer
     // side effect.
@@ -338,26 +390,40 @@ pub fn import_safetensors_file_filtered_to_collection(
         )
     })?;
 
-    let bytes = std::fs::read(file).with_context(|| format!("read safetensors file {file:?}"))?;
-    let (members, facts) = crate::ingest::ingest_members(&bytes, pile, dtype, keep)
-        .map_err(|e| anyhow::anyhow!("ingest {file:?}: {e}"))?;
+    let (members, facts) = match format {
+        crate::formats::WeightFormat::Safetensors => {
+            let bytes =
+                std::fs::read(file).with_context(|| format!("read safetensors file {file:?}"))?;
+            crate::ingest::ingest_members(&bytes, pile, dtype, keep)
+                .map_err(|error| anyhow::anyhow!("ingest {file:?}: {error}"))?
+        }
+        crate::formats::WeightFormat::Gguf | crate::formats::WeightFormat::Pickle => {
+            let tensors = crate::formats::extract_tensors(format, file)
+                .with_context(|| format!("extract {format:?} tensors from {file:?}"))?;
+            crate::ingest::ingest_tensors(
+                tensors
+                    .into_iter()
+                    .filter(|(name, _, _)| keep(name.as_str())),
+                pile,
+                dtype,
+            )
+            .map_err(|error| anyhow::anyhow!("ingest {file:?}: {error}"))?
+        }
+    };
     anyhow::ensure!(
         !members.is_empty(),
-        "filtered safetensors import selected no supported float tensors from {file:?}"
+        "filtered {format:?} import selected no supported float tensors from {file:?}"
     );
 
     let provenance = file
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("model.safetensors")
+        .unwrap_or("model.weights")
         .to_owned();
     let root =
         crate::ingest::build_model_root(pile, source, quantization, members, facts, &[provenance])
             .map_err(|e| anyhow::anyhow!("build model root: {e}"))?;
-    let root_id = root.root().expect("model root id");
-    let commit = crate::model_collection::publish_model_fragment(pile, signing_key, root)
-        .map_err(|error| anyhow::anyhow!("publish model collection commit: {error}"))?;
-    Ok((root_id, commit))
+    Ok(root)
 }
 
 #[cfg(all(test, feature = "import"))]
@@ -365,6 +431,7 @@ mod filtered_native_import_tests {
     use super::*;
     use crate::selection::ModelSelector;
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+    use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -396,6 +463,99 @@ mod filtered_native_import_tests {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect()
+    }
+
+    fn pickle_binunicode(out: &mut Vec<u8>, value: &str) {
+        out.push(b'X');
+        out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        out.extend_from_slice(value.as_bytes());
+    }
+
+    fn pickle_global(out: &mut Vec<u8>, module: &str, name: &str) {
+        out.push(b'c');
+        out.extend_from_slice(module.as_bytes());
+        out.push(b'\n');
+        out.extend_from_slice(name.as_bytes());
+        out.push(b'\n');
+    }
+
+    fn pickle_binint1(out: &mut Vec<u8>, value: usize) {
+        assert!(value <= u8::MAX as usize);
+        out.extend_from_slice(&[b'K', value as u8]);
+    }
+
+    /// Emit the protocol-2 value produced by torch's
+    /// `_rebuild_tensor_v2(storage, offset, shape, stride, ...)` reduction.
+    fn pickle_tensor(
+        out: &mut Vec<u8>,
+        storage_key: &str,
+        numel: usize,
+        shape: &[usize],
+        stride: &[usize],
+    ) {
+        pickle_global(out, "torch._utils", "_rebuild_tensor_v2");
+        out.push(b'('); // MARK: reduction arguments
+
+        out.push(b'('); // MARK: persistent storage id
+        pickle_binunicode(out, "storage");
+        pickle_global(out, "torch", "FloatStorage");
+        pickle_binunicode(out, storage_key);
+        pickle_binunicode(out, "cpu");
+        pickle_binint1(out, numel);
+        out.push(b't'); // TUPLE
+        out.push(b'Q'); // BINPERSID
+
+        pickle_binint1(out, 0); // storage offset
+        out.push(b'(');
+        for &dimension in shape {
+            pickle_binint1(out, dimension);
+        }
+        out.push(b't'); // shape tuple
+        out.push(b'(');
+        for &dimension in stride {
+            pickle_binint1(out, dimension);
+        }
+        out.push(b't'); // stride tuple
+        out.push(b'\x89'); // NEWFALSE: requires_grad
+        out.push(b'N'); // NONE: backward hooks
+        out.push(b't'); // TUPLE: reduction arguments
+        out.push(b'R'); // REDUCE
+    }
+
+    fn write_torch_pickle_fixture(path: &Path, tensors: &[(&str, &[f32], &[usize], &[usize])]) {
+        let mut data_pickle = vec![b'\x80', 2]; // PROTO 2
+        pickle_global(&mut data_pickle, "collections", "OrderedDict");
+        data_pickle.extend_from_slice(&[b')', b'R', b'(']); // OrderedDict(), SETITEMS mark
+        for (index, (name, values, shape, stride)) in tensors.iter().enumerate() {
+            assert_eq!(values.len(), shape.iter().product::<usize>());
+            pickle_binunicode(&mut data_pickle, name);
+            pickle_tensor(
+                &mut data_pickle,
+                &index.to_string(),
+                values.len(),
+                shape,
+                stride,
+            );
+        }
+        data_pickle.extend_from_slice(&[b'u', b'.']); // SETITEMS, STOP
+
+        let file = std::fs::File::create(path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        let options =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        archive.start_file("archive/data.pkl", options).unwrap();
+        archive.write_all(&data_pickle).unwrap();
+        archive.start_file("archive/byteorder", options).unwrap();
+        archive.write_all(b"little").unwrap();
+        for (index, (_, values, _, _)) in tensors.iter().enumerate() {
+            archive
+                .start_file(format!("archive/data/{index}"), options)
+                .unwrap();
+            archive.write_all(&f32_bytes(values)).unwrap();
+        }
+        archive.start_file("archive/version", options).unwrap();
+        archive.write_all(b"3\n").unwrap();
+        archive.finish().unwrap();
     }
 
     #[test]
@@ -467,6 +627,48 @@ mod filtered_native_import_tests {
         let latest =
             crate::model_collection::load_model_collection_local_latest(&pile_path).unwrap();
         assert_eq!(latest.commits(), &[commit]);
+    }
+
+    #[test]
+    fn filtered_ordered_dict_pickle_ingest_builds_only_selected_tensors() {
+        let fixture = TempFixture::new();
+        let weights_file = fixture.dir.join("pytorch_model.bin");
+        let kept = [1.25_f32, -2.5, 3.75, 4.5];
+        let dropped = [-8.0_f32, 9.0];
+        write_torch_pickle_fixture(
+            &weights_file,
+            &[
+                ("encoder.layer.weight", &kept, &[2, 2], &[2, 1]),
+                ("decoder.layer.bias", &dropped, &[2], &[1]),
+            ],
+        );
+
+        let pile_path = fixture.dir.join("models.pile");
+        std::fs::File::create(&pile_path).unwrap();
+        let mut pile = Pile::open(&pile_path).unwrap();
+        let fragment = ingest_weight_file_filtered_fragment(
+            &mut pile,
+            &weights_file,
+            crate::formats::WeightFormat::Pickle,
+            LeafDtype::F32,
+            "fixture/pickle",
+            "native",
+            |name| name.starts_with("encoder."),
+        )
+        .unwrap();
+
+        let root = fragment.root().expect("filtered model root");
+        let reader = pile.reader().unwrap();
+        let keymap = crate::selection::load_keymap_from_graph(
+            fragment.facts(),
+            &reader,
+            ModelSelector::Root(root),
+        )
+        .unwrap();
+        assert_eq!(keymap.len(), 1);
+        assert_eq!(keymap["encoder.layer.weight"], (kept.to_vec(), vec![2, 2]));
+        assert!(!keymap.contains_key("decoder.layer.bias"));
+        pile.close().unwrap();
     }
 }
 

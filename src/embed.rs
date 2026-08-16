@@ -24,13 +24,13 @@
 //!   - Image preprocessing must be PIL-bicubic resize (shortest side 224) +
 //!     center-crop 224 + the exact CLIP mean/std normalization.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use burn::prelude::*;
 use burn::tensor::activation::{silu, softmax};
 use burn::tensor::module::conv2d;
 use burn::tensor::ops::ConvOptions;
 use burn::tensor::TensorData;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use crate::nn::backend::{WgpuDevice, B};
@@ -43,6 +43,403 @@ pub const CLIP_DIM: usize = 512;
 
 /// siglip2-so400m-patch14-384 shared contrastive space dimension.
 pub const SIGLIP_DIM: usize = 1152;
+
+/// The exact tensor inventory consumed by one live embedding architecture.
+///
+/// These contracts are deliberately runtime-shaped: checkpoint tensors that
+/// inference never reads (for example CLIP's scalar `logit_scale`) are not part
+/// of the canonical native model. Importers and native constructors validate
+/// against the same inventory before an infallible Burn loader sees it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmbeddingArchitecture {
+    ClipVitBasePatch32,
+    NomicTextV15,
+    NomicVisionV15,
+}
+
+impl EmbeddingArchitecture {
+    /// Required `tensor name -> exact shape` map for this fixed architecture.
+    pub fn tensor_shapes(self) -> BTreeMap<String, Vec<usize>> {
+        match self {
+            Self::ClipVitBasePatch32 => clip_vit_b32_tensor_shapes(),
+            Self::NomicTextV15 => nomic_text_v15_tensor_shapes(),
+            Self::NomicVisionV15 => nomic_vision_v15_tensor_shapes(),
+        }
+    }
+
+    /// Reject missing, unexpected, or dimensionally incompatible tensors.
+    pub fn validate_tensor_shapes(self, actual: &BTreeMap<String, Vec<usize>>) -> Result<()> {
+        let expected = self.tensor_shapes();
+        for (name, shape) in &expected {
+            let found = actual
+                .get(name)
+                .with_context(|| format!("{self:?} is missing required tensor {name:?}"))?;
+            anyhow::ensure!(
+                found == shape,
+                "{self:?} tensor {name:?} has shape {found:?}, expected {shape:?}"
+            );
+        }
+        if actual.len() != expected.len() {
+            let unexpected = actual
+                .keys()
+                .find(|name| !expected.contains_key(*name))
+                .expect("different exact-map lengths imply an unexpected key");
+            anyhow::bail!("{self:?} contains unexpected tensor {unexpected:?}");
+        }
+        Ok(())
+    }
+
+    fn validate_keymap(self, keymap: &HashMap<String, (Vec<f32>, Vec<usize>)>) -> Result<()> {
+        for (name, (values, shape)) in keymap {
+            let elements = shape.iter().try_fold(1_usize, |product, &dimension| {
+                product.checked_mul(dimension).with_context(|| {
+                    format!("{self:?} tensor {name:?} shape element count overflows usize")
+                })
+            })?;
+            anyhow::ensure!(
+                values.len() == elements,
+                "{self:?} tensor {name:?} has {} values but shape {shape:?} describes {elements}",
+                values.len()
+            );
+        }
+        let actual = keymap
+            .iter()
+            .map(|(name, (_, shape))| (name.clone(), shape.clone()))
+            .collect();
+        self.validate_tensor_shapes(&actual)
+    }
+
+    /// Validate every tokenizer id that the fixed embedding table may receive.
+    pub fn validate_tokenizer(self, tokenizer: &tokenizers::Tokenizer) -> Result<()> {
+        let (label, rows) = match self {
+            Self::ClipVitBasePatch32 => ("CLIP", 49_408_u32),
+            Self::NomicTextV15 => ("Nomic text", 30_528_u32),
+            Self::NomicVisionV15 => anyhow::bail!("Nomic vision has no tokenizer"),
+        };
+        let max_id = tokenizer
+            .get_vocab(true)
+            .into_values()
+            .max()
+            .with_context(|| format!("{label} tokenizer vocabulary is empty"))?;
+        anyhow::ensure!(
+            max_id < rows,
+            "{label} tokenizer can produce id {max_id}, outside its {rows}-row embedding table"
+        );
+
+        match self {
+            Self::ClipVitBasePatch32 => {
+                let bos = tokenizer
+                    .token_to_id("<|startoftext|>")
+                    .context("CLIP tokenizer has no start-of-text token")?;
+                let eos = tokenizer
+                    .token_to_id("<|endoftext|>")
+                    .context("CLIP tokenizer has no end-of-text token")?;
+                anyhow::ensure!(
+                    bos == 49_406 && eos == 49_407,
+                    "CLIP tokenizer sentinel ids are ({bos}, {eos}), expected (49406, 49407)"
+                );
+            }
+            Self::NomicTextV15 => {
+                let cls = tokenizer
+                    .token_to_id("[CLS]")
+                    .context("Nomic tokenizer has no [CLS] token")?;
+                let sep = tokenizer
+                    .token_to_id("[SEP]")
+                    .context("Nomic tokenizer has no [SEP] token")?;
+                anyhow::ensure!(cls != sep, "Nomic [CLS] and [SEP] ids collide");
+            }
+            Self::NomicVisionV15 => unreachable!("rejected before vocabulary validation"),
+        }
+        Ok(())
+    }
+}
+
+fn tensor(
+    tensors: &mut BTreeMap<String, Vec<usize>>,
+    name: impl Into<String>,
+    shape: impl Into<Vec<usize>>,
+) {
+    let name = name.into();
+    assert!(
+        tensors.insert(name.clone(), shape.into()).is_none(),
+        "duplicate embedding tensor contract entry {name}"
+    );
+}
+
+fn layer_norm(tensors: &mut BTreeMap<String, Vec<usize>>, prefix: &str, width: usize) {
+    tensor(tensors, format!("{prefix}.weight"), [width]);
+    tensor(tensors, format!("{prefix}.bias"), [width]);
+}
+
+fn linear(
+    tensors: &mut BTreeMap<String, Vec<usize>>,
+    prefix: &str,
+    output: usize,
+    input: usize,
+    bias: bool,
+) {
+    tensor(tensors, format!("{prefix}.weight"), [output, input]);
+    if bias {
+        tensor(tensors, format!("{prefix}.bias"), [output]);
+    }
+}
+
+fn clip_block(
+    tensors: &mut BTreeMap<String, Vec<usize>>,
+    prefix: &str,
+    width: usize,
+    inner: usize,
+) {
+    layer_norm(tensors, &format!("{prefix}.layer_norm1"), width);
+    for projection in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+        linear(
+            tensors,
+            &format!("{prefix}.self_attn.{projection}"),
+            width,
+            width,
+            true,
+        );
+    }
+    layer_norm(tensors, &format!("{prefix}.layer_norm2"), width);
+    linear(tensors, &format!("{prefix}.mlp.fc1"), inner, width, true);
+    linear(tensors, &format!("{prefix}.mlp.fc2"), width, inner, true);
+}
+
+fn clip_vit_b32_tensor_shapes() -> BTreeMap<String, Vec<usize>> {
+    let mut tensors = BTreeMap::new();
+    tensor(
+        &mut tensors,
+        "vision_model.embeddings.class_embedding",
+        [768],
+    );
+    tensor(
+        &mut tensors,
+        "vision_model.embeddings.patch_embedding.weight",
+        [768, 3, 32, 32],
+    );
+    tensor(
+        &mut tensors,
+        "vision_model.embeddings.position_embedding.weight",
+        [50, 768],
+    );
+    layer_norm(&mut tensors, "vision_model.pre_layrnorm", 768);
+    for layer in 0..12 {
+        clip_block(
+            &mut tensors,
+            &format!("vision_model.encoder.layers.{layer}"),
+            768,
+            3072,
+        );
+    }
+    layer_norm(&mut tensors, "vision_model.post_layernorm", 768);
+    linear(&mut tensors, "visual_projection", 512, 768, false);
+
+    tensor(
+        &mut tensors,
+        "text_model.embeddings.token_embedding.weight",
+        [49_408, 512],
+    );
+    tensor(
+        &mut tensors,
+        "text_model.embeddings.position_embedding.weight",
+        [77, 512],
+    );
+    for layer in 0..12 {
+        clip_block(
+            &mut tensors,
+            &format!("text_model.encoder.layers.{layer}"),
+            512,
+            2048,
+        );
+    }
+    layer_norm(&mut tensors, "text_model.final_layer_norm", 512);
+    linear(&mut tensors, "text_projection", 512, 512, false);
+    tensors
+}
+
+fn nomic_text_v15_tensor_shapes() -> BTreeMap<String, Vec<usize>> {
+    let mut tensors = BTreeMap::new();
+    tensor(
+        &mut tensors,
+        "embeddings.word_embeddings.weight",
+        [30_528, 768],
+    );
+    tensor(
+        &mut tensors,
+        "embeddings.token_type_embeddings.weight",
+        [2, 768],
+    );
+    layer_norm(&mut tensors, "emb_ln", 768);
+    for layer in 0..12 {
+        let prefix = format!("encoder.layers.{layer}");
+        linear(
+            &mut tensors,
+            &format!("{prefix}.attn.Wqkv"),
+            2304,
+            768,
+            false,
+        );
+        linear(
+            &mut tensors,
+            &format!("{prefix}.attn.out_proj"),
+            768,
+            768,
+            false,
+        );
+        layer_norm(&mut tensors, &format!("{prefix}.norm1"), 768);
+        linear(
+            &mut tensors,
+            &format!("{prefix}.mlp.fc11"),
+            3072,
+            768,
+            false,
+        );
+        linear(
+            &mut tensors,
+            &format!("{prefix}.mlp.fc12"),
+            3072,
+            768,
+            false,
+        );
+        linear(&mut tensors, &format!("{prefix}.mlp.fc2"), 768, 3072, false);
+        layer_norm(&mut tensors, &format!("{prefix}.norm2"), 768);
+    }
+    tensors
+}
+
+fn nomic_vision_mlp(tensors: &mut BTreeMap<String, Vec<usize>>, prefix: &str, inner_norm: bool) {
+    linear(tensors, &format!("{prefix}.fc11"), 2048, 768, true);
+    linear(tensors, &format!("{prefix}.fc12"), 2048, 768, true);
+    if inner_norm {
+        layer_norm(tensors, &format!("{prefix}.norm"), 2048);
+    }
+    linear(tensors, &format!("{prefix}.fc2"), 768, 2048, true);
+}
+
+fn nomic_vision_v15_tensor_shapes() -> BTreeMap<String, Vec<usize>> {
+    let mut tensors = BTreeMap::new();
+    tensor(&mut tensors, "embeddings.cls_token", [1, 1, 768]);
+    tensor(&mut tensors, "embeddings.pos_embed", [1, 197, 768]);
+    linear(&mut tensors, "embeddings.proj", 768, 768, true);
+    for layer in 0..12 {
+        let prefix = format!("layers.{layer}");
+        linear(
+            &mut tensors,
+            &format!("{prefix}.attn.Wqkv"),
+            2304,
+            768,
+            true,
+        );
+        linear(
+            &mut tensors,
+            &format!("{prefix}.attn.out_proj"),
+            768,
+            768,
+            true,
+        );
+        layer_norm(&mut tensors, &format!("{prefix}.norm1"), 768);
+        nomic_vision_mlp(&mut tensors, &format!("{prefix}.mlp"), true);
+        layer_norm(&mut tensors, &format!("{prefix}.norm2"), 768);
+    }
+    tensor(&mut tensors, "selector.attn.latent", [1, 1, 768]);
+    linear(&mut tensors, "selector.attn.Wq", 768, 768, true);
+    linear(&mut tensors, "selector.attn.Wkv", 1536, 768, true);
+    linear(&mut tensors, "selector.attn.out_proj", 768, 768, true);
+    layer_norm(&mut tensors, "selector.norm1", 768);
+    nomic_vision_mlp(&mut tensors, "selector.mlp", false);
+    tensors
+}
+
+#[cfg(test)]
+mod embedding_contract_tests {
+    use super::*;
+
+    #[test]
+    fn fixed_architecture_contracts_have_expected_inventories() {
+        let clip = EmbeddingArchitecture::ClipVitBasePatch32.tensor_shapes();
+        assert_eq!(clip.len(), 397);
+        assert_eq!(
+            clip["vision_model.embeddings.patch_embedding.weight"],
+            [768, 3, 32, 32]
+        );
+        assert_eq!(clip["text_projection.weight"], [512, 512]);
+        assert!(!clip.contains_key("logit_scale"));
+
+        let text = EmbeddingArchitecture::NomicTextV15.tensor_shapes();
+        assert_eq!(text.len(), 112);
+        assert_eq!(text["encoder.layers.11.mlp.fc2.weight"], [768, 3072]);
+
+        let vision = EmbeddingArchitecture::NomicVisionV15.tensor_shapes();
+        assert_eq!(vision.len(), 211);
+        assert_eq!(vision["layers.11.mlp.norm.weight"], [2048]);
+        assert_eq!(vision["selector.attn.Wkv.weight"], [1536, 768]);
+    }
+
+    #[test]
+    fn architecture_contract_rejects_missing_extra_and_wrong_shape() {
+        let architecture = EmbeddingArchitecture::NomicTextV15;
+        let complete = architecture.tensor_shapes();
+        architecture.validate_tensor_shapes(&complete).unwrap();
+
+        let mut missing = complete.clone();
+        missing.remove("emb_ln.bias");
+        assert!(architecture
+            .validate_tensor_shapes(&missing)
+            .unwrap_err()
+            .to_string()
+            .contains("missing required tensor"));
+
+        let mut extra = complete.clone();
+        extra.insert("unused.weight".to_owned(), vec![1]);
+        assert!(architecture
+            .validate_tensor_shapes(&extra)
+            .unwrap_err()
+            .to_string()
+            .contains("unexpected tensor"));
+
+        let mut wrong = complete;
+        wrong.insert("emb_ln.bias".to_owned(), vec![767]);
+        assert!(architecture
+            .validate_tensor_shapes(&wrong)
+            .unwrap_err()
+            .to_string()
+            .contains("expected [768]"));
+    }
+
+    #[test]
+    fn tokenizer_contract_rejects_ids_beyond_the_embedding_table() {
+        let vocab = [
+            ("[UNK]".to_owned(), 0_u32),
+            ("[CLS]".to_owned(), 1_u32),
+            ("[SEP]".to_owned(), 2_u32),
+            ("outside".to_owned(), 30_528_u32),
+        ];
+        let model = tokenizers::models::wordpiece::WordPiece::builder()
+            .vocab(vocab)
+            .unk_token("[UNK]".to_owned())
+            .build()
+            .unwrap();
+        let tokenizer = tokenizers::Tokenizer::new(model);
+        let error = EmbeddingArchitecture::NomicTextV15
+            .validate_tokenizer(&tokenizer)
+            .unwrap_err();
+        assert!(error.to_string().contains("outside its 30528-row"));
+    }
+
+    #[test]
+    fn native_keymap_contract_rejects_payload_shape_mismatches() {
+        let keymap = HashMap::from([("emb_ln.bias".to_owned(), (vec![0.0; 767], vec![768]))]);
+        let error = EmbeddingArchitecture::NomicTextV15
+            .validate_keymap(&keymap)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("has 767 values but shape [768] describes 768"),
+            "{error}"
+        );
+    }
+}
 
 /// A warm, content-addressed multi-modal embedder: image and text land in one
 /// L2-normalized space (cosine == dot). Load once, embed many.
@@ -454,45 +851,222 @@ pub fn load_clip_from_dir(dir: &Path, device: WgpuDevice) -> Result<ClipEmbedder
     )
 }
 
-/// Find a file in any snapshot of a cached HF model — robust to HF's
-/// split-snapshot layout (config/tokenizer and weights can land in different
-/// snapshot dirs). Pure cache lookup, no download.
-pub fn hf_cache_resolve(model_id: &str, filename: &str) -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let repo = format!("models--{}", model_id.replace('/', "--"));
-    let snapshots = std::path::Path::new(&home)
-        .join(".cache/huggingface/hub")
-        .join(repo)
-        .join("snapshots");
-    for snap in std::fs::read_dir(&snapshots).ok()?.flatten() {
-        let p = snap.path().join(filename);
-        if p.exists() {
-            return Some(p);
+/// Resolve the exact snapshot named by a cached Hugging Face `refs/main`.
+///
+/// Returning the directory, rather than resolving files independently, makes
+/// it impossible for a caller to combine weights from one revision with a
+/// tokenizer from another. This is a pure cache lookup; it never downloads.
+pub fn hf_cache_main_snapshot(model_id: &str) -> Result<std::path::PathBuf> {
+    let hub_cache = std::env::var_os("HF_HUB_CACHE")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HF_HOME")
+                .map(std::path::PathBuf::from)
+                .map(|home| home.join("hub"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .map(|home| home.join(".cache/huggingface/hub"))
+        })
+        .context("none of HF_HUB_CACHE, HF_HOME, or HOME is set")?;
+    hf_cache_main_snapshot_at(&hub_cache, model_id)
+}
+
+fn hf_cache_main_snapshot_at(hub_cache: &Path, model_id: &str) -> Result<std::path::PathBuf> {
+    anyhow::ensure!(
+        !model_id.is_empty()
+            && !model_id.contains('\\')
+            && model_id
+                .split('/')
+                .all(|part| !part.is_empty() && part != "." && part != ".."),
+        "invalid Hugging Face model id {model_id:?}"
+    );
+    let repo = hub_cache.join(format!("models--{}", model_id.replace('/', "--")));
+    let reference = repo.join("refs/main");
+    let revision = std::fs::read_to_string(&reference)
+        .with_context(|| format!("read cached Hugging Face ref {}", reference.display()))?;
+    let revision = revision.trim();
+    anyhow::ensure!(
+        revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "cached Hugging Face ref {} contains an invalid revision {revision:?}",
+        reference.display()
+    );
+
+    let snapshots = repo.join("snapshots");
+    let snapshots = snapshots.canonicalize().with_context(|| {
+        format!(
+            "canonicalize Hugging Face snapshot directory {}",
+            snapshots.display()
+        )
+    })?;
+    let snapshot = snapshots
+        .join(revision)
+        .canonicalize()
+        .with_context(|| format!("resolve Hugging Face main revision {revision} for {model_id}"))?;
+    anyhow::ensure!(
+        snapshot.parent() == Some(snapshots.as_path()) && snapshot.is_dir(),
+        "Hugging Face main revision for {model_id} escapes its snapshot directory"
+    );
+    Ok(snapshot)
+}
+
+#[cfg(test)]
+mod hf_cache_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    const REVISION_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const REVISION_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("mary-hf-cache-{}-{sequence}", std::process::id()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
         }
     }
-    None
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn repo(temp: &TempDir) -> std::path::PathBuf {
+        temp.0.join("models--org--model")
+    }
+
+    #[test]
+    fn main_ref_selects_one_snapshot_without_cross_revision_fallback() {
+        let temp = TempDir::new();
+        let repo = repo(&temp);
+        let first = repo.join("snapshots").join(REVISION_A);
+        let second = repo.join("snapshots").join(REVISION_B);
+        std::fs::create_dir_all(repo.join("refs")).unwrap();
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(repo.join("refs/main"), format!("{REVISION_A}\n")).unwrap();
+        std::fs::write(first.join("model.safetensors"), b"weights-a").unwrap();
+        std::fs::write(second.join("tokenizer.json"), b"tokenizer-b").unwrap();
+
+        let selected = hf_cache_main_snapshot_at(&temp.0, "org/model").unwrap();
+        assert_eq!(selected, first.canonicalize().unwrap());
+        assert!(selected.join("model.safetensors").is_file());
+        assert!(!selected.join("tokenizer.json").exists());
+
+        std::fs::write(repo.join("refs/main"), REVISION_B).unwrap();
+        assert_eq!(selected, first.canonicalize().unwrap());
+        assert_eq!(
+            hf_cache_main_snapshot_at(&temp.0, "org/model").unwrap(),
+            second.canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_invalid_refs_and_snapshot_escape_but_allows_blob_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new();
+        let repo = repo(&temp);
+        let snapshots = repo.join("snapshots");
+        let valid = snapshots.join(REVISION_A);
+        std::fs::create_dir_all(repo.join("refs")).unwrap();
+        std::fs::create_dir_all(&valid).unwrap();
+        std::fs::create_dir_all(repo.join("blobs")).unwrap();
+        std::fs::write(repo.join("blobs/tokenizer"), b"{}").unwrap();
+        symlink("../../blobs/tokenizer", valid.join("tokenizer.json")).unwrap();
+        std::fs::write(repo.join("refs/main"), REVISION_A).unwrap();
+        let selected = hf_cache_main_snapshot_at(&temp.0, "org/model").unwrap();
+        assert!(selected.join("tokenizer.json").is_file());
+
+        std::fs::write(repo.join("refs/main"), "../../outside").unwrap();
+        assert!(hf_cache_main_snapshot_at(&temp.0, "org/model").is_err());
+        assert!(hf_cache_main_snapshot_at(&temp.0, "org\\model").is_err());
+
+        let outside = temp.0.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let escaping_revision = "cccccccccccccccccccccccccccccccccccccccc";
+        symlink(&outside, snapshots.join(escaping_revision)).unwrap();
+        std::fs::write(repo.join("refs/main"), escaping_revision).unwrap();
+        assert!(hf_cache_main_snapshot_at(&temp.0, "org/model").is_err());
+    }
 }
 
 /// Load a `ClipEmbedder` by HF model id (e.g. `"openai/clip-vit-base-patch32"`),
-/// resolving `model.safetensors` + `tokenizer.json` from the local HF cache —
-/// across snapshots, so the split-snapshot layout is handled. The model must
-/// already be in the cache (fetch once with `huggingface-cli download <id>` or
-/// `hf_hub_download`). Keeps the HF plumbing in mary so callers pass only the id.
+/// resolving the official `pytorch_model.bin` + `tokenizer.json` pair from one
+/// cached `main` revision. The model must already be in the cache (fetch once
+/// with `huggingface-cli download <id>` or `hf_hub_download`).
 #[cfg(feature = "import")]
 pub fn load_clip_from_hf(model_id: &str, device: WgpuDevice) -> Result<ClipEmbedder<B>> {
-    let weights = hf_cache_resolve(model_id, "model.safetensors")
-        .ok_or_else(|| anyhow::anyhow!("model.safetensors not in HF cache for {model_id} — fetch it first (huggingface-cli download {model_id})"))?;
-    let tokenizer = hf_cache_resolve(model_id, "tokenizer.json")
-        .ok_or_else(|| anyhow::anyhow!("tokenizer.json not in HF cache for {model_id}"))?;
-    load_clip_from_files(&weights, &tokenizer, device)
+    let snapshot = hf_cache_main_snapshot(model_id)?;
+    let weights = snapshot.join("pytorch_model.bin");
+    anyhow::ensure!(
+        weights.is_file(),
+        "cached main revision for {model_id} has no pytorch_model.bin"
+    );
+    let tokenizer_path = snapshot.join("tokenizer.json");
+    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|error| {
+        anyhow::anyhow!(
+            "load tokenizer {} from cached main revision: {error}",
+            tokenizer_path.display()
+        )
+    })?;
+
+    let contract = EmbeddingArchitecture::ClipVitBasePatch32.tensor_shapes();
+    let mut keymap = HashMap::with_capacity(contract.len());
+    for (name, values, shape) in
+        crate::formats::extract_tensors(crate::formats::WeightFormat::Pickle, &weights)?
+    {
+        if contract.contains_key(&name) {
+            anyhow::ensure!(
+                keymap.insert(name.clone(), (values, shape)).is_none(),
+                "duplicate CLIP tensor {name:?} in {}",
+                weights.display()
+            );
+        }
+    }
+    clip_from_parts(keymap, tokenizer, device)
+}
+
+/// Assemble a `ClipEmbedder` from parts: a content-addressed weight keymap and
+/// an already-built tokenizer. Both parts can therefore come from one frozen
+/// model-collection snapshot without a tokenizer side-file.
+pub fn clip_from_parts(
+    keymap: HashMap<String, (Vec<f32>, Vec<usize>)>,
+    tokenizer: tokenizers::Tokenizer,
+    device: WgpuDevice,
+) -> Result<ClipEmbedder<B>> {
+    let architecture = EmbeddingArchitecture::ClipVitBasePatch32;
+    architecture.validate_tokenizer(&tokenizer)?;
+    architecture.validate_keymap(&keymap)?;
+    let bos = tokenizer
+        .token_to_id("<|startoftext|>")
+        .expect("validated CLIP start-of-text token");
+    let eos = tokenizer
+        .token_to_id("<|endoftext|>")
+        .expect("validated CLIP end-of-text token");
+    let loader = WeightLoader::Pile(keymap);
+    Ok(ClipEmbedder {
+        vision: VisionTower::load(&loader, &device),
+        text: TextTower::load(&loader, &device),
+        tokenizer,
+        bos,
+        eos,
+        device,
+    })
 }
 
 /// Build a `ClipEmbedder` from a content-addressed weight keymap (the
 /// `name → (f32, shape)` map a pile materializes via
-/// [`crate::persist::load_keymap_from_pile`]). The towers load from a
-/// [`WeightLoader::Pile`], so this is the exact same model build as
-/// [`load_clip_from_files`] with the weights coming from tribles instead of
-/// safetensors. `tokenizer.json` stays a small file.
+/// [`crate::persist::load_keymap_from_pile`]) plus a `tokenizer.json` path.
+/// This is the file-substrate variant of [`clip_from_parts`].
 pub fn load_clip_from_keymap(
     keymap: HashMap<String, (Vec<f32>, Vec<usize>)>,
     tokenizer: &Path,
@@ -500,15 +1074,7 @@ pub fn load_clip_from_keymap(
 ) -> Result<ClipEmbedder<B>> {
     let tok = tokenizers::Tokenizer::from_file(tokenizer)
         .map_err(|e| anyhow::anyhow!("load tokenizer {}: {e}", tokenizer.display()))?;
-    let loader = WeightLoader::Pile(keymap);
-    Ok(ClipEmbedder {
-        vision: VisionTower::load(&loader, &device),
-        text: TextTower::load(&loader, &device),
-        tokenizer: tok,
-        bos: 49406, // <|startoftext|>
-        eos: 49407, // <|endoftext|>
-        device,
-    })
+    clip_from_parts(keymap, tok, device)
 }
 
 /// Load a `ClipEmbedder` from JUST an on-disk pile file (plus a `tokenizer.json`)
@@ -521,6 +1087,31 @@ pub fn load_clip_from_pile(
 ) -> Result<ClipEmbedder<B>> {
     let keymap = crate::persist::load_keymap_from_pile(pile_path)?;
     load_clip_from_keymap(keymap, tokenizer, device)
+}
+
+#[cfg(test)]
+mod clip_parts_tests {
+    use super::*;
+
+    #[test]
+    fn native_parts_reject_wrong_sentinel_ids_before_loading_weights() {
+        let vocab = [
+            ("[UNK]".to_owned(), 0_u32),
+            ("<|startoftext|>".to_owned(), 1_u32),
+            ("<|endoftext|>".to_owned(), 2_u32),
+        ];
+        let model = tokenizers::models::wordpiece::WordPiece::builder()
+            .vocab(vocab)
+            .unk_token("[UNK]".to_owned())
+            .build()
+            .unwrap();
+        let tokenizer = tokenizers::Tokenizer::new(model);
+        let error = match clip_from_parts(HashMap::new(), tokenizer, WgpuDevice::default()) {
+            Ok(_) => panic!("wrong CLIP sentinel ids must fail before weight loading"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("sentinel ids"), "{error}");
+    }
 }
 
 // ===========================================================================
@@ -937,14 +1528,13 @@ pub fn load_siglip_from_dir(dir: &Path, device: WgpuDevice) -> Result<SiglipEmbe
 
 /// Load a `SiglipEmbedder` by HF model id
 /// (e.g. `"google/siglip2-so400m-patch14-384"`), resolving `model.safetensors` +
-/// `tokenizer.json` from the local HF cache (across snapshots). Must already be
-/// cached (`huggingface-cli download <id>`).
+/// `tokenizer.json` from one cached `main` revision. Must already be cached
+/// (`huggingface-cli download <id>`).
 #[cfg(feature = "import")]
 pub fn load_siglip_from_hf(model_id: &str, device: WgpuDevice) -> Result<SiglipEmbedder<B>> {
-    let weights = hf_cache_resolve(model_id, "model.safetensors")
-        .ok_or_else(|| anyhow::anyhow!("model.safetensors not in HF cache for {model_id} — fetch it first (huggingface-cli download {model_id})"))?;
-    let tokenizer = hf_cache_resolve(model_id, "tokenizer.json")
-        .ok_or_else(|| anyhow::anyhow!("tokenizer.json not in HF cache for {model_id}"))?;
+    let snapshot = hf_cache_main_snapshot(model_id)?;
+    let weights = snapshot.join("model.safetensors");
+    let tokenizer = snapshot.join("tokenizer.json");
     load_siglip_from_files(&weights, &tokenizer, device)
 }
 
@@ -1436,12 +2026,13 @@ pub struct NomicTextEmbedder<B: Backend> {
 
 /// Resolve the BERT sentinels a `NomicTextEmbedder` frames with.
 fn nomic_sentinel_ids(tokenizer: &tokenizers::Tokenizer) -> Result<(u32, u32)> {
+    EmbeddingArchitecture::NomicTextV15.validate_tokenizer(tokenizer)?;
     let cls = tokenizer
         .token_to_id("[CLS]")
-        .ok_or_else(|| anyhow::anyhow!("nomic tokenizer has no [CLS] token"))?;
+        .expect("validated Nomic [CLS] token");
     let sep = tokenizer
         .token_to_id("[SEP]")
-        .ok_or_else(|| anyhow::anyhow!("nomic tokenizer has no [SEP] token"))?;
+        .expect("validated Nomic [SEP] token");
     Ok((cls, sep))
 }
 
@@ -1531,14 +2122,13 @@ pub fn load_nomic_text_from_files(
 
 /// Load a `NomicTextEmbedder` by HF model id
 /// (e.g. `"nomic-ai/nomic-embed-text-v1.5"`), resolving `model.safetensors` +
-/// `tokenizer.json` from the local HF cache (across snapshots). Must already be
-/// cached (`huggingface-cli download <id>`).
+/// `tokenizer.json` from one cached `main` revision. Must already be cached
+/// (`huggingface-cli download <id>`).
 #[cfg(feature = "import")]
 pub fn load_nomic_text_from_hf(model_id: &str, device: WgpuDevice) -> Result<NomicTextEmbedder<B>> {
-    let weights = hf_cache_resolve(model_id, "model.safetensors")
-        .ok_or_else(|| anyhow::anyhow!("model.safetensors not in HF cache for {model_id} — fetch it first (huggingface-cli download {model_id})"))?;
-    let tokenizer = hf_cache_resolve(model_id, "tokenizer.json")
-        .ok_or_else(|| anyhow::anyhow!("tokenizer.json not in HF cache for {model_id}"))?;
+    let snapshot = hf_cache_main_snapshot(model_id)?;
+    let weights = snapshot.join("model.safetensors");
+    let tokenizer = snapshot.join("tokenizer.json");
     load_nomic_text_from_files(&weights, &tokenizer, device)
 }
 
@@ -1552,6 +2142,7 @@ pub fn nomic_text_from_parts(
     device: WgpuDevice,
 ) -> Result<NomicTextEmbedder<B>> {
     let (cls_id, sep_id) = nomic_sentinel_ids(&tokenizer)?;
+    EmbeddingArchitecture::NomicTextV15.validate_keymap(&keymap)?;
     let loader = WeightLoader::Pile(keymap);
     Ok(NomicTextEmbedder {
         model: NomicTextModel::load(&loader, &device),
@@ -2020,14 +2611,14 @@ pub fn load_nomic_vision_from_files(
 
 /// Load a `NomicVisionEmbedder` by HF model id
 /// (e.g. `"nomic-ai/nomic-embed-vision-v1.5"`), resolving `model.safetensors`
-/// from the local HF cache (across snapshots). Must already be cached.
+/// from one cached `main` revision. Must already be cached.
 #[cfg(feature = "import")]
 pub fn load_nomic_vision_from_hf(
     model_id: &str,
     device: WgpuDevice,
 ) -> Result<NomicVisionEmbedder<B>> {
-    let weights = hf_cache_resolve(model_id, "model.safetensors")
-        .ok_or_else(|| anyhow::anyhow!("model.safetensors not in HF cache for {model_id} — fetch it first (huggingface-cli download {model_id})"))?;
+    let snapshot = hf_cache_main_snapshot(model_id)?;
+    let weights = snapshot.join("model.safetensors");
     load_nomic_vision_from_files(&weights, device)
 }
 
@@ -2038,6 +2629,7 @@ pub fn load_nomic_vision_from_keymap(
     keymap: HashMap<String, (Vec<f32>, Vec<usize>)>,
     device: WgpuDevice,
 ) -> Result<NomicVisionEmbedder<B>> {
+    EmbeddingArchitecture::NomicVisionV15.validate_keymap(&keymap)?;
     let loader = WeightLoader::Pile(keymap);
     Ok(NomicVisionEmbedder {
         model: NomicVisionModel::load(&loader, &device),

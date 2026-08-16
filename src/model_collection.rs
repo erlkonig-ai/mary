@@ -26,7 +26,9 @@ use std::path::Path;
 
 use ed25519_dalek::SigningKey;
 use triblespace::core::attribute::Attribute;
-use triblespace::core::collection::simplearchive_union::{self, PublicationError};
+use triblespace::core::collection::simplearchive_union::{
+    self, PreparationError, PreparedCollectionCommit, PublicationError,
+};
 use triblespace::core::collection::{
     CollectionCommit, CollectionMaterializationError, CollectionRecord, CollectionStore,
     SimpleArchiveCollection,
@@ -172,6 +174,24 @@ impl Error for LoadModelCollectionError {
 
 fn model_graph_collection() -> SimpleArchiveCollection {
     SimpleArchiveCollection::new(MARY_MODEL_GRAPH_SCOPE)
+}
+
+/// Prepare one canonical model commit entirely in memory.
+///
+/// Preparation validates the descriptor, archives, signature, and every blob
+/// embedded in `fragment`, but touches no destination storage. A commit-last
+/// importer can stage the returned value's dependencies, validate them through
+/// the destination's own reader, and expose authority only by calling
+/// `finalize` after those gates succeed.
+pub fn prepare_model_fragment(
+    signing_key: &SigningKey,
+    fragment: Fragment,
+) -> Result<PreparedCollectionCommit, PreparationError> {
+    simplearchive_union::prepare_fragment_commit(
+        &model_graph_collection().descriptor(),
+        fragment,
+        signing_key,
+    )
 }
 
 /// Publish one self-contained model fragment under the supplied signer.

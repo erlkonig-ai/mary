@@ -80,7 +80,7 @@ print("ref written")
 }
 
 fn main() {
-    // load_clip_from_hf resolves weights+tokenizer across snapshots — no symlink needed.
+    // load_clip_from_hf resolves weights+tokenizer from one cached main snapshot.
 
     println!("generating HF reference (python transformers)...");
     gen_reference();

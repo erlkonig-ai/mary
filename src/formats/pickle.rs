@@ -450,7 +450,19 @@ fn parse_state_dict(buf: &[u8]) -> Result<Vec<TorchTensor>> {
                     Val::Tuple(v) => v,
                     other => vec![other],
                 };
-                stack.push(Val::Reduce(Box::new(callable), argv));
+                // `torch.save(state_dict)` uses a zero-argument
+                // `collections.OrderedDict()` as the mutable toplevel mapping,
+                // then fills it with SETITEMS. Normalize exactly that known
+                // reduction into our dict representation; other reductions
+                // retain their callable and arguments for tensor recognition.
+                if argv.is_empty()
+                    && matches!(&callable, Val::Global(module, name)
+                        if module == "collections" && name == "OrderedDict")
+                {
+                    stack.push(Val::Dict(Vec::new()));
+                } else {
+                    stack.push(Val::Reduce(Box::new(callable), argv));
+                }
             }
             b'\x81' => {
                 // NEWOBJ: cls + argtuple -> object (model as Reduce for our purposes)

@@ -505,8 +505,8 @@ required-features = ["import"]
 name = "smolvla_persist"
 required-features = ["import"]
 
-# Persist the four embedders (CLIP, SigLIP2, nomic text, nomic vision) from the
-# local HF cache into their standalone piles.
+# Publish the three live direct-HF embedders (CLIP, Nomic text, Nomic vision)
+# from the local cache into signed native model collections.
 [[bin]]
 name = "embed_persist"
 required-features = ["embed", "import"]
@@ -679,12 +679,6 @@ required-features = ["personaplex", "q4"]
 # SigLIP2 so400m embedder parity gate (rust-vs-HF cosine > 0.99 + semantic).
 [[bin]]
 name = "siglip_embed_test"
-required-features = ["embed", "import"]
-
-# Embedder pile round-trip parity gate: persist CLIP + SigLIP safetensors into a
-# temp pile, load from pile vs from safetensors, assert cosine > 0.999999.
-[[bin]]
-name = "embed_pile_test"
 required-features = ["embed", "import"]
 
 # nomic-embed-text-v1.5 parity gate (rust-vs-sentence-transformers cosine > 0.99
