@@ -1077,18 +1077,6 @@ pub fn load_clip_from_keymap(
     clip_from_parts(keymap, tok, device)
 }
 
-/// Load a `ClipEmbedder` from JUST an on-disk pile file (plus a `tokenizer.json`)
-/// — the weights live as content-addressed tribles, no safetensors at load time.
-/// Mirrors gemma's `load_gemma4_from_persisted_pile`.
-pub fn load_clip_from_pile(
-    pile_path: &Path,
-    tokenizer: &Path,
-    device: WgpuDevice,
-) -> Result<ClipEmbedder<B>> {
-    let keymap = crate::persist::load_keymap_from_pile(pile_path)?;
-    load_clip_from_keymap(keymap, tokenizer, device)
-}
-
 #[cfg(test)]
 mod clip_parts_tests {
     use super::*;
@@ -1556,18 +1544,6 @@ pub fn load_siglip_from_keymap(
         text: SiglipTextTower::load(&loader, &device),
         tokenizer: tok,
     })
-}
-
-/// Load a `SiglipEmbedder` from JUST an on-disk pile file (plus a
-/// `tokenizer.json`) — the weights live as content-addressed tribles, no
-/// safetensors at load time.
-pub fn load_siglip_from_pile(
-    pile_path: &Path,
-    tokenizer: &Path,
-    device: WgpuDevice,
-) -> Result<SiglipEmbedder<B>> {
-    let keymap = crate::persist::load_keymap_from_pile(pile_path)?;
-    load_siglip_from_keymap(keymap, tokenizer, device)
 }
 
 /// Decode PNG/JPEG, resize to 384×384 (PIL bicubic, no crop), normalize
@@ -2176,18 +2152,6 @@ pub fn load_nomic_text_from_pile(
 ) -> Result<NomicTextEmbedder<B>> {
     let keymap = crate::persist::load_keymap_from_pile(pile_path)?;
     load_nomic_text_from_keymap(keymap, tokenizer, device)
-}
-
-/// Load a `NomicTextEmbedder` ENTIRELY from one pile: weight graph AND
-/// tokenizer graph. The fully self-contained path — no tokenizer.json, no HF
-/// cache, no side-files of any kind.
-pub fn load_nomic_text_from_pile_graph(
-    pile_path: &Path,
-    device: WgpuDevice,
-) -> Result<NomicTextEmbedder<B>> {
-    let keymap = crate::persist::load_keymap_from_pile(pile_path)?;
-    let tok = crate::persist::load_tokenizer_from_pile(pile_path)?;
-    nomic_text_from_parts(keymap, tok, device)
 }
 
 // ===========================================================================
