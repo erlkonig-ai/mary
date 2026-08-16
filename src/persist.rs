@@ -22,6 +22,12 @@ use crate::ingest::load_keymap;
 use crate::ingest::LeafDtype;
 #[cfg(feature = "import")]
 use crate::nn::weight_loader::read_safetensors_file;
+#[cfg(any(
+    feature = "import",
+    feature = "qwen3tts",
+    feature = "tokenizer",
+    feature = "gemma"
+))]
 use anyhow::Context;
 use ed25519_dalek::SigningKey;
 #[cfg(feature = "import")]
@@ -1479,109 +1485,6 @@ pub fn load_keymap_from_pile_prefixed(
 
 /// The default weight-format tag: the faithful import (no derived quantization).
 pub const QUANTIZATION_NATIVE: &str = "native";
-
-/// Load a model's keymap from the shared `mary` branch of a consolidated model
-/// pile — the mary-branch twin of [`load_keymap_from_pile`]. Resolves the ONE
-/// content-addressed model-ROOT labelled with `source` at
-/// `quantization="native"`, out of a pile that holds many, and materializes ALL
-/// its members. For a non-native format use
-/// [`load_keymap_from_mary_branch_quantized`]; to address a root directly by its
-/// entity id use [`load_keymap_from_mary_branch_by_root`]. This is a retained
-/// legacy Repository reader; new callers should materialize
-/// [`crate::model_collection::load_model_collection_local_latest`] and apply
-/// [`crate::selection::ModelSelector`] directly.
-pub fn load_keymap_from_mary_branch(
-    pile_path: &Path,
-    source: &str,
-) -> anyhow::Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
-    load_keymap_from_mary_branch_quantized(pile_path, source, QUANTIZATION_NATIVE)
-}
-
-/// Like [`load_keymap_from_mary_branch`], but selects the root by BOTH `source`
-/// AND `quantization`. `quantization` is a CORE identity coordinate; `source` is
-/// a non-core label — together they name one root (a given `(source,
-/// quantization)` pair maps to a single import). `native` and `fp4` of the same
-/// model are distinct roots; this picks the requested one.
-pub fn load_keymap_from_mary_branch_quantized(
-    pile_path: &Path,
-    source: &str,
-    quantization: &str,
-) -> anyhow::Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
-    let (tribles, reader) = checkout_mary_branch(pile_path)?;
-    crate::selection::load_keymap_from_graph(
-        &tribles,
-        &reader,
-        crate::selection::ModelSelector::Source {
-            source,
-            quantization,
-        },
-    )
-    .with_context(|| format!("select model on the 'mary' branch in pile {pile_path:?}"))
-}
-
-/// Load a model's keymap from the `mary` branch by the model-root's ENTITY ID
-/// directly — the content address itself, no `(model_id, quantization)` lookup.
-/// The complement to [`load_keymap_from_mary_branch_quantized`]: the id is what
-/// the historical branch importer returned, so a caller that recorded it can
-/// round-trip straight back to the exact weights.
-pub fn load_keymap_from_mary_branch_by_root(
-    pile_path: &Path,
-    root: Id,
-) -> anyhow::Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
-    let (tribles, reader) = checkout_mary_branch(pile_path)?;
-    crate::selection::load_keymap_from_graph(
-        &tribles,
-        &reader,
-        crate::selection::ModelSelector::Root(root),
-    )
-    .with_context(|| format!("select model on the 'mary' branch in pile {pile_path:?}"))
-}
-
-/// Open a pile, resolve its `mary` branch, and return `(full-history facts, blob
-/// reader)` — the shared read-side plumbing behind the mary-branch loaders. The
-/// repo is closed before returning; the reader's mmap stays valid afterward (each
-/// blob keeps the mapping alive, as in [`load_split_index_from_pile`]). NEVER
-/// amputates: a corrupt tail fails loud (see [`load_keymap_from_pile`]).
-fn checkout_mary_branch(
-    pile_path: &Path,
-) -> anyhow::Result<(TribleSet, triblespace::core::repo::pile::PileReader)> {
-    let mut pile =
-        Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open pile {pile_path:?}: {e:?}"))?;
-    // Read path: non-mutating load, NEVER amputate (see load_keymap_from_pile).
-    pile.refresh().map_err(|e| {
-        anyhow::anyhow!(
-            "pile {pile_path:?} failed to load ({e:?}); refusing to auto-truncate on a \
-             read path — amputate explicitly with `trible pile amputate` if the tail is torn"
-        )
-    })?;
-    let mut repo = Repository::new(
-        pile,
-        SigningKey::generate(&mut rand::rngs::OsRng),
-        TribleSet::new(),
-    )
-    .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
-    let branch_id = repo
-        .lookup_branch("mary")
-        .map_err(|e| anyhow::anyhow!("lookup mary: {e:?}"))?
-        .ok_or_else(|| anyhow::anyhow!("no 'mary' branch in pile {pile_path:?}"))?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull mary: {e:?}"))?;
-    let head = ws
-        .head()
-        .ok_or_else(|| anyhow::anyhow!("'mary' branch has no commits"))?;
-    let checkout = ws
-        .checkout(ancestors(head))
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let tribles: TribleSet = checkout.facts().clone();
-    let reader = repo
-        .storage_mut()
-        .reader()
-        .map_err(|e| anyhow::anyhow!("pile reader: {e:?}"))?;
-    repo.close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
-    Ok((tribles, reader))
-}
 
 /// Open a pile and return `(branch name, facts, blob reader)` from whichever
 /// branch holds the model — `mary` if present, else `main`.
