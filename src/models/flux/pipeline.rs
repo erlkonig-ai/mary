@@ -290,6 +290,7 @@ impl Flux2Pipeline {
 
         // Drop transformer
         drop(transformer);
+        drop(transformer_loader);
         eprintln!("  Transformer freed from memory");
 
         // ========== Phase 4: VAE Decode ==========
@@ -585,6 +586,7 @@ impl Flux2Pipeline {
             latents = scheduler.step(noise_pred, latents);
         }
         drop(transformer);
+        drop(transformer_loader);
         eprintln!("  Transformer freed from memory");
 
         Self::vae_decode(
@@ -597,9 +599,10 @@ impl Flux2Pipeline {
         )
     }
 
-    /// Denoise with streaming f32 transformer (blocks loaded one-at-a-time) + VAE decode.
-    /// Used for Dev where the 60GB transformer doesn't fit in memory all at once.
-    /// Peak memory: ~7GB for transformer (header + 1 block) instead of ~120GB.
+    /// Denoise with streaming f32 transformer (device blocks loaded one-at-a-time) + VAE decode.
+    /// Used for Dev where the 60GB transformer doesn't fit in device memory all at once.
+    /// The native snapshot loader currently still materializes the complete transformer on the
+    /// host; streaming here bounds device residency, not total process memory.
     fn denoise_streaming_and_decode<R: BlobStoreGet>(
         prompt_embeds: Tensor<B, 3>,
         seq_len: usize,
@@ -671,6 +674,7 @@ impl Flux2Pipeline {
             latents = scheduler.step(noise_pred, latents);
         }
         drop(transformer);
+        drop(transformer_loader);
         eprintln!("  Transformer freed from memory");
 
         Self::vae_decode(
