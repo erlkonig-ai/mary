@@ -55,6 +55,41 @@ pub type ModelFragmentPublicationError = PublicationError<PileInsertError, Colle
 pub type ModelCollectionMaterializationError =
     CollectionMaterializationError<ReadError, ReadError, Infallible, GetBlobError<Infallible>>;
 
+/// Failure while freezing the locally admitted model commits from an already
+/// open pile.
+#[derive(Debug)]
+pub enum SnapshotLocalModelCollectionError {
+    /// Full native-record enumeration for the local ticket failed.
+    LocalTicket(ReadError),
+    /// The frozen exact ticket could not be verified or materialized.
+    Materialize(ModelCollectionMaterializationError),
+}
+
+impl fmt::Display for SnapshotLocalModelCollectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LocalTicket(source) => {
+                write!(
+                    f,
+                    "failed to freeze the local model commit ticket: {source}"
+                )
+            }
+            Self::Materialize(source) => {
+                write!(f, "failed to materialize the model collection: {source}")
+            }
+        }
+    }
+}
+
+impl Error for SnapshotLocalModelCollectionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::LocalTicket(source) => Some(source),
+            Self::Materialize(source) => Some(source),
+        }
+    }
+}
+
 /// Failure while publishing one model fragment.
 #[derive(Debug)]
 pub enum PublishModelFragmentError {
@@ -237,6 +272,22 @@ fn local_model_ticket(pile: &mut Pile) -> Result<Vec<CollectionCommit>, ReadErro
     Ok(ticket)
 }
 
+/// Freeze and materialize every locally admitted model commit from an already
+/// open pile.
+///
+/// This is the in-place form of [`load_model_collection_local_latest`]. The
+/// native-record scan defines one observed prefix and the returned snapshot
+/// owns its immutable reader; the caller keeps responsibility for closing or
+/// further appending to `pile`. No flush, close, reopen, or repair occurs.
+pub fn snapshot_model_collection_local_latest(
+    pile: &mut Pile,
+) -> Result<CollectionSnapshot<PileReader>, SnapshotLocalModelCollectionError> {
+    let ticket =
+        local_model_ticket(pile).map_err(SnapshotLocalModelCollectionError::LocalTicket)?;
+    snapshot_model_collection_exact(pile, &ticket)
+        .map_err(SnapshotLocalModelCollectionError::Materialize)
+}
+
 /// Load the union of every locally admitted model commit in one observed pile
 /// prefix.
 ///
@@ -255,14 +306,14 @@ pub fn load_model_collection_local_latest(
     // admission prefix. Do not refresh separately here: a second pre-ticket
     // replay would move that boundary for no semantic benefit.
     let mut pile = Pile::open(path.as_ref()).map_err(LoadModelCollectionError::Open)?;
-    let ticket = match local_model_ticket(&mut pile) {
-        Ok(ticket) => ticket,
-        Err(source) => {
+    let snapshot = match snapshot_model_collection_local_latest(&mut pile) {
+        Ok(snapshot) => Ok(snapshot),
+        Err(SnapshotLocalModelCollectionError::LocalTicket(source)) => {
             let _ = pile.close();
             return Err(LoadModelCollectionError::LocalTicket(source));
         }
+        Err(SnapshotLocalModelCollectionError::Materialize(source)) => Err(source),
     };
-    let snapshot = snapshot_model_collection_exact(&mut pile, &ticket);
     close_after_snapshot(pile, snapshot)
 }
 
@@ -875,12 +926,9 @@ mod tests {
         let model_root = model.root().expect("model root");
         facts += model.into_facts();
 
-        let commit = publish_model_fragment(
-            &mut pile,
-            &signing_key,
-            Fragment::rooted(model_root, facts),
-        )
-        .unwrap();
+        let commit =
+            publish_model_fragment(&mut pile, &signing_key, Fragment::rooted(model_root, facts))
+                .unwrap();
         let snapshot = snapshot_model_collection_exact(&mut pile, &[commit]).unwrap();
         pile.close().unwrap();
 
@@ -975,13 +1023,17 @@ mod tests {
         assert!(invalid_foreign.verify_strict().is_err());
         pile.insert(CollectionRecord::Commit(invalid_foreign))
             .unwrap();
+
+        let in_place = snapshot_model_collection_local_latest(&mut pile).unwrap();
+        let mut expected = first_facts.clone();
+        expected += second_facts.clone();
+        let mut expected_commits = vec![first, second];
+        expected_commits.sort_unstable_by_key(CollectionCommit::id);
+        assert_eq!(in_place.facts(), &expected);
+        assert_eq!(in_place.commits(), expected_commits);
         pile.close().unwrap();
 
         let snapshot = load_model_collection_local_latest(file.as_path()).unwrap();
-        let mut expected = first_facts;
-        expected += second_facts;
-        let mut expected_commits = vec![first, second];
-        expected_commits.sort_unstable_by_key(CollectionCommit::id);
         assert_eq!(snapshot.facts(), &expected);
         assert_eq!(snapshot.commits(), expected_commits);
         assert!(snapshot

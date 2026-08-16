@@ -118,6 +118,43 @@ impl Qwen3TtsVariant {
     pub fn component_source(self, component: &str) -> String {
         format!("{}#{component}", self.source())
     }
+
+    pub fn base_source(self) -> String {
+        self.component_source(BASE)
+    }
+
+    pub fn talker_f16_source(self) -> String {
+        self.component_source(TALKER_F16)
+    }
+
+    pub fn folded_f16_source(self) -> String {
+        self.component_source(TALKER_FOLDED_F16)
+    }
+
+    pub const fn codec_source() -> &'static str {
+        CODEC_SOURCE
+    }
+
+    /// Detect the checkpoint size from the talker's codec embedding width.
+    #[cfg(feature = "import")]
+    pub fn detect(model_dir: &Path) -> anyhow::Result<Self> {
+        let path = model_dir.join("model.safetensors");
+        let file = std::fs::File::open(&path)?;
+        // Mapping makes the safetensors header query constant-memory. Only the
+        // header pages are touched; detecting a variant must not reread its
+        // multi-gigabyte weight payload before import.
+        let bytes = unsafe { memmap2::Mmap::map(&file)? };
+        let tensors = safetensors::SafeTensors::deserialize(&bytes)?;
+        let codec_embedding = tensors.tensor("talker.model.codec_embedding.weight")?;
+        let shape = codec_embedding.shape();
+        match shape.get(1).copied() {
+            Some(2048) => Ok(Self::Base1_7B),
+            Some(1024) => Ok(Self::Base0_6B),
+            width => anyhow::bail!(
+                "unsupported Qwen3-TTS talker codec-embedding shape {shape:?} (hidden {width:?})"
+            ),
+        }
+    }
 }
 
 /// The complete Qwen3-TTS runtime cohort selected from one immutable native
@@ -178,9 +215,9 @@ impl<R: BlobStoreGet> Qwen3TtsWeights<R> {
             Ok(())
         }
 
-        let base_source = variant.component_source(BASE);
-        let talker_source = variant.component_source(TALKER_F16);
-        let folded_source = variant.component_source(TALKER_FOLDED_F16);
+        let base_source = variant.base_source();
+        let talker_source = variant.talker_f16_source();
+        let folded_source = variant.folded_f16_source();
         let mut exact = select(
             snapshot.facts(),
             snapshot.reader(),
@@ -190,7 +227,7 @@ impl<R: BlobStoreGet> Qwen3TtsWeights<R> {
         let codec = select(
             snapshot.facts(),
             snapshot.reader(),
-            CODEC_SOURCE,
+            Qwen3TtsVariant::codec_source(),
             crate::persist::QUANTIZATION_NATIVE,
         )?;
         require_width("base", &exact, false)?;
@@ -246,6 +283,59 @@ impl<R: BlobStoreGet> Qwen3TtsWeights<R> {
 }
 
 impl Qwen3TtsWeights<PileReader> {
+    /// Exercise every production model constructor without running inference.
+    ///
+    /// This is intentionally expensive and exists for the native importer:
+    /// it proves that the selected folded talker, CPU predictor, speaker
+    /// encoder, and codec decoder are all tensor-complete before the importer
+    /// reports a cohort as deployable. Ordinary Voice calls construct the same
+    /// components lazily on their synthesis threads instead.
+    #[cfg(target_os = "macos")]
+    pub fn validate_runtime_cohort(self) -> anyhow::Result<()> {
+        use crate::nn::backend::BHalf;
+        use std::any::Any;
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        fn panic_text(payload: &(dyn Any + Send)) -> &str {
+            payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("non-string panic")
+        }
+
+        fn construct<T>(component: &str, build: impl FnOnce() -> T) -> anyhow::Result<T> {
+            catch_unwind(AssertUnwindSafe(build)).map_err(|payload| {
+                anyhow::anyhow!(
+                    "Qwen3-TTS {component} construction panicked: {}",
+                    panic_text(&*payload)
+                )
+            })
+        }
+
+        let folded = crate::persist::load_qwen3tts_talker_folded_from_indexes(
+            &self.talker_f16,
+            &self.exact,
+            &self.reader,
+            &self.folded_f16,
+            &self.reader,
+        )?;
+        drop(folded);
+
+        let loader = self.into_loader();
+        drop(construct("code predictor", || {
+            CodePredictor::load(&loader)
+        })?);
+        let device = WgpuDevice::default();
+        drop(construct("speaker encoder", || {
+            SpeakerEncoder::<BHalf>::load(&loader, &device)
+        })?);
+        drop(construct("codec decoder", || {
+            CodecDecoder::<BFused>::load(&loader, &device)
+        })?);
+        Ok(())
+    }
+
     #[cfg(target_os = "macos")]
     fn folded_talker<B: Backend + 'static>(&self) -> anyhow::Result<Option<Talker<B>>> {
         use crate::nn::backend::BHalf;
@@ -463,6 +553,7 @@ fn synthesize_stream_impl<B: Backend + 'static>(
             );
             let spk_embedding =
                 spk_enc.forward(SpeakerMel::<B>::new(&dev).forward(&samples, &dev));
+            drop(spk_enc);
             let (rc, rcs) = npy::load_npy(&ref_codes)?;
             anyhow::ensure!(
                 rcs.len() == 2 && rcs[1] == NUM_CODE_GROUPS,
@@ -686,7 +777,7 @@ pub fn synthesize_to_wav(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{F32Array, U64Array, attrs};
+    use crate::format::{attrs, F32Array, U64Array};
     use ed25519_dalek::SigningKey;
     use std::fs::OpenOptions;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -739,9 +830,7 @@ mod tests {
         let mut fragment = Fragment::empty();
         let shape = fragment.put::<U64Array, _>(vec![1_u64]);
         let leaf = if f16 {
-            let data = fragment.put::<crate::f16enc::F16Array, _>(vec![
-                half::f16::from_f32(value),
-            ]);
+            let data = fragment.put::<crate::f16enc::F16Array, _>(vec![half::f16::from_f32(value)]);
             entity! { _ @ attrs::data_f16: data, attrs::shape: shape }
         } else {
             let data = fragment.put::<F32Array, _>(vec![value]);

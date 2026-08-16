@@ -1,178 +1,232 @@
-//! Persist BOTH Qwen3-TTS checkpoints into a REAL on-disk TribleSpace pile:
-//! the base model (talker + code predictor + speaker encoder,
-//! `model.safetensors`, bf16 → f32 leaves — exact) and the codec
-//! (`speech_tokenizer/model.safetensors`, f32) — PLUS the half-width
-//! `talker_f16` entity: the talker's GPU tensors re-persisted as f16 leaves
-//! (`data_f16`), the dtype the production f16 talker runs at, which the fast
-//! load in `mary::speak` uploads to the Metal GPU at native width.
-//! f32→f16 is the exact same double-rounding the materializing loader performs
-//! at load time (bf16 → f32 → f16), so the fast-loaded talker is bit-identical
-//! to the old cast-on-load path — gated below by re-reading both entities.
+//! Import one Qwen3-TTS checkpoint cohort into Mary's native model collection.
 //!
-//! After this runs, the pile file is the durable, self-contained weight store
-//! `mary::speak` loads from — the `/tmp` safetensors are no longer needed.
-//! Tensor names don't collide across the two f32 checkpoints
-//! (`talker.*`/`speaker_encoder.*` vs `decoder.*`/`encoder.*`), so the union
-//! keymap serves all four components; the f16 variant lives under its OWN entity
-//! name and is excluded from f32 loads. The f32 round-trip is bit-identical
-//! (see `qwen3tts_pile_test`).
+//! The result is four ordinary model roots in one append-only pile:
 //!
-//!   cargo run --release --features speak,import --bin qwen3tts_persist -- \
-//!     <model-dir> <pile-path> [--f16-talker-only]
+//! - the variant's exact base checkpoint;
+//! - the exact codec checkpoint shared by both Qwen sizes;
+//! - the variant's filtered f16 talker tensors;
+//! - the variant's versioned, pre-folded f16 talker tensors.
 //!
-//! `<model-dir>` is the checkpoint dir holding `model.safetensors` with the
-//! codec under `speech_tokenizer/`. `--f16-talker-only` skips the (already
-//! persisted) f32 checkpoints and just APPENDS the `talker_f16` entity — the
-//! pile is append-only, so upgrading an existing pile is exactly this.
+//! The folded root is derived through the same production `Talker` load and
+//! readback used by the zero-copy lane, then published with the same tensor-leaf
+//! schema as every other model. There is no Repository branch, sibling pile, or
+//! filename-based runtime relationship.
+//!
+//! Every publication is content-derived and signer-stable. If derivation is
+//! interrupted, rerunning with the same checkpoint and key resumes
+//! idempotently from the partial append-only cohort; changing the bytes under
+//! an existing source coordinate is deliberately rejected as ambiguity.
+//!
+//! ```text
+//! cargo run --release --features speak,import --bin qwen3tts_persist -- \
+//!   <model-dir> <pile-path> <signing-key>
+//! ```
 
 #[cfg(target_os = "macos")]
 mod imp {
-
-    use mary::ingest::{read_leaf, LeafDtype, LeafHandles};
-    use mary::persist::{
-        load_split_index_from_pile, persist_safetensors_file_filtered_to_pile,
-        persist_safetensors_to_pile,
-    };
+    use mary::ingest::LeafDtype;
+    use mary::models::qwen3tts::talker::Talker;
+    use mary::nn::backend::{BFusedHalf, WgpuDevice};
+    use mary::nn::weight_loader::{AliasedPile, WeightLoader};
+    use mary::selection::ModelSelector;
+    use mary::speak::{Qwen3TtsVariant, Qwen3TtsWeights, QUANTIZATION_F16};
     use std::path::Path;
     use std::time::Instant;
-    use triblespace::prelude::BlobStoreGet;
+    use triblespace::core::repo::pile::Pile;
+    use triblespace::core::signing_key_file;
 
-    /// The talker tensors the GPU loads (everything under `talker.` EXCEPT the
-    /// code predictor, which runs on the CPU from the exact f32 leaves).
+    /// Everything the GPU talker loads, excluding the code predictor and
+    /// codec-head CPU stages which deliberately remain exact f32.
     fn is_gpu_talker_tensor(name: &str) -> bool {
-        name.starts_with("talker.") && !name.starts_with("talker.code_predictor.")
+        name.starts_with("talker.")
+            && !name.starts_with("talker.code_predictor.")
+            && name != "talker.codec_head.weight"
+    }
+
+    fn select_index(
+        snapshot: &triblespace::core::collection::CollectionSnapshot<
+            triblespace::core::repo::pile::PileReader,
+        >,
+        source: &str,
+        quantization: &str,
+    ) -> anyhow::Result<std::collections::HashMap<String, mary::ingest::LeafHandles>> {
+        let root = mary::selection::select_model_root(
+            snapshot.facts(),
+            snapshot.reader(),
+            ModelSelector::Source {
+                source,
+                quantization,
+            },
+        )?;
+        mary::selection::index_keymap_for_root(snapshot.facts(), snapshot.reader(), root)
+    }
+
+    fn import_cohort(
+        pile: &mut Pile,
+        signing_key: &ed25519_dalek::SigningKey,
+        model_dir: &Path,
+        variant: Qwen3TtsVariant,
+    ) -> anyhow::Result<()> {
+        let base_source = variant.base_source();
+        let talker_source = variant.talker_f16_source();
+        let folded_source = variant.folded_f16_source();
+
+        eprintln!("[qwen3tts] importing exact base {base_source}");
+        let (base_root, base_commit) = mary::persist::import_model_to_collection(
+            pile,
+            signing_key,
+            model_dir,
+            LeafDtype::F32,
+            &base_source,
+            mary::persist::QUANTIZATION_NATIVE,
+        )?;
+
+        eprintln!(
+            "[qwen3tts] importing shared exact codec {}",
+            Qwen3TtsVariant::codec_source()
+        );
+        let (codec_root, _codec_commit) = mary::persist::import_model_to_collection(
+            pile,
+            signing_key,
+            &model_dir.join("speech_tokenizer"),
+            LeafDtype::F32,
+            Qwen3TtsVariant::codec_source(),
+            mary::persist::QUANTIZATION_NATIVE,
+        )?;
+
+        eprintln!("[qwen3tts] importing filtered f16 talker {talker_source}");
+        let (talker_root, talker_commit) =
+            mary::persist::import_safetensors_file_filtered_to_collection(
+                pile,
+                signing_key,
+                &model_dir.join("model.safetensors"),
+                LeafDtype::F16,
+                &talker_source,
+                QUANTIZATION_F16,
+                is_gpu_talker_tensor,
+            )?;
+
+        // Freeze exactly the two roots needed to compute the fold. The shared
+        // codec is deliberately absent: Talker construction needs only the
+        // base's exact CPU stages and the filtered f16 GPU tensors.
+        let source_snapshot = mary::model_collection::snapshot_model_collection_exact(
+            pile,
+            &[base_commit, talker_commit],
+        )?;
+        let exact = select_index(
+            &source_snapshot,
+            &base_source,
+            mary::persist::QUANTIZATION_NATIVE,
+        )?;
+        let talker_f16 = select_index(&source_snapshot, &talker_source, QUANTIZATION_F16)?;
+        let (_, _, reader) = source_snapshot.into_parts();
+
+        eprintln!("[qwen3tts] deriving versioned folded f16 talker {folded_source}");
+        let loader = WeightLoader::Aliased(AliasedPile::new(
+            talker_f16,
+            exact,
+            reader.clone(),
+            reader,
+            WgpuDevice::default(),
+        ));
+        let talker = Talker::<BFusedHalf>::load(&loader, &WgpuDevice::default());
+        drop(loader);
+        let tensors = mary::persist::qwen3tts_folded_readback(&talker);
+        drop(talker);
+        let tensor_count = tensors.len();
+        let tensor_bytes: usize = tensors.iter().map(|(_, bits, _)| bits.len() * 2).sum();
+
+        let (members, facts) = mary::ingest::ingest_tensors(
+            tensors.into_iter().map(|(name, bits, dims)| {
+                (
+                    name,
+                    bits.into_iter().map(|value| value.to_f32()).collect(),
+                    dims.into_iter().map(|dim| dim as usize).collect(),
+                )
+            }),
+            pile,
+            LeafDtype::F16,
+        )
+        .map_err(|error| anyhow::anyhow!("ingest folded talker: {error}"))?;
+        let folded = mary::ingest::build_model_root(
+            pile,
+            &folded_source,
+            QUANTIZATION_F16,
+            members,
+            facts,
+            &[],
+        )
+        .map_err(|error| anyhow::anyhow!("build folded model root: {error}"))?;
+        let folded_root = folded.root().expect("folded model root");
+        let _folded_commit =
+            mary::model_collection::publish_model_fragment(pile, signing_key, folded)
+                .map_err(|error| anyhow::anyhow!("publish folded model root: {error}"))?;
+
+        // Gate the same locally admitted prefix Voice will observe, not merely
+        // the four commits returned by this invocation. Stale coordinate
+        // conflicts and invalid matching records therefore fail here too.
+        let complete = mary::model_collection::snapshot_model_collection_local_latest(pile)?;
+        let weights = Qwen3TtsWeights::from_snapshot(complete, variant)?;
+        let (exact_count, f16_count, folded_count) = weights.counts();
+        weights.validate_runtime_cohort()?;
+
+        eprintln!(
+            "[qwen3tts] native cohort valid: base={base_root}, codec={codec_root}, \
+             talker-f16={talker_root}, folded={folded_root}"
+        );
+        eprintln!(
+            "[qwen3tts] indexes: {exact_count} exact, {f16_count} talker f16, \
+             {folded_count} folded f16; folded {:.2} GiB ({tensor_count} tensors)",
+            tensor_bytes as f64 / (1_u64 << 30) as f64,
+        );
+        Ok(())
     }
 
     pub fn run() -> anyhow::Result<()> {
         let args: Vec<String> = std::env::args().collect();
-        let f16_only = args.iter().any(|a| a == "--f16-talker-only");
-        let fold_derive = args.iter().any(|a| a == "--fold-derive");
-        let pos: Vec<&String> = args[1..].iter().filter(|a| !a.starts_with("--")).collect();
-
-        // ── `--fold-derive <src-pile> [<dst-pile>]`: derive the FOLDED zero-copy
-        // sibling (`<stem>_folded_f16.pile`) for the raw talker lane. Loads the
-        // production fused-f16 talker, reads back its fold-transformed GPU
-        // tensors, writes them to a NEW sibling pile, and gates the result
-        // bit-for-bit through the zero-copy alias. The source pile is read-only.
-        #[cfg(target_os = "macos")]
-        if fold_derive {
-            if pos.is_empty() {
-                eprintln!("usage: qwen3tts_persist --fold-derive <src-pile> [<dst-pile>]");
-                std::process::exit(2);
-            }
-            let src = Path::new(pos[0]);
-            let dst = pos
-                .get(1)
-                .map(|p| std::path::PathBuf::from(p.as_str()))
-                .unwrap_or_else(|| mary::persist::qwen3tts_folded_sibling_path(src));
-            let t = Instant::now();
-            let (count, bytes) = mary::persist::derive_qwen3tts_folded_pile(src, &dst)?;
-            eprintln!(
-                "fold-derive done: {count} tensors / {:.2} GiB → {dst:?} in {:.1}s",
-                bytes as f64 / (1u64 << 30) as f64,
-                t.elapsed().as_secs_f64()
-            );
-            return Ok(());
-        }
-        #[cfg(not(target_os = "macos"))]
-        if fold_derive {
-            anyhow::bail!("--fold-derive requires macOS (Metal zero-copy alias)");
-        }
-
-        if pos.len() < 2 {
-            eprintln!(
-                "usage: qwen3tts_persist <model-dir> <pile-path> [--f16-talker-only]\n       \
-             qwen3tts_persist --fold-derive <src-pile> [<dst-pile>]"
-            );
+        if args.len() != 4 {
+            eprintln!("usage: qwen3tts_persist <model-dir> <pile-path> <signing-key>");
             std::process::exit(2);
         }
-        let model_dir = Path::new(pos[0]);
-        let pile_path = Path::new(pos[1]);
+        let model_dir = Path::new(&args[1]);
+        let pile_path = Path::new(&args[2]);
+        let key_path = Path::new(&args[3]);
+        let variant = Qwen3TtsVariant::detect(model_dir)?;
+        let signing_key = signing_key_file::load_existing(key_path)?;
 
-        let t = Instant::now();
-        if !f16_only {
-            eprintln!("Persisting base checkpoint from {model_dir:?} → {pile_path:?} ...");
-            persist_safetensors_to_pile(model_dir, pile_path, LeafDtype::F32)?;
-            let codec_dir = model_dir.join("speech_tokenizer");
-            eprintln!("Persisting codec checkpoint from {codec_dir:?} → {pile_path:?} ...");
-            persist_safetensors_to_pile(&codec_dir, pile_path, LeafDtype::F32)?;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(pile_path)
+        {
+            Ok(_) => eprintln!("qwen3tts_persist: created new empty pile {pile_path:?}"),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
         }
-        eprintln!("Persisting f16 talker variant (entity 'talker_f16') → {pile_path:?} ...");
-        persist_safetensors_file_filtered_to_pile(
-            &model_dir.join("model.safetensors"),
-            "talker_f16",
-            pile_path,
-            LeafDtype::F16,
-            is_gpu_talker_tensor,
-        )?;
-        let secs = t.elapsed().as_secs_f64();
 
-        // ── gate: pile round-trip parity for the f16 entity ──
-        // Every f16 leaf must equal the runtime cast of the exact f32 leaf
-        // (f16::from_f32 — the same rounding the materializing loader applies),
-        // and must sit 256-aligned in the mmap (the V3 payload-alignment
-        // invariant the fast loader's mmap views rely on).
-        eprintln!("Verifying talker_f16 against the f32 leaves ...");
-        let (f16, f32_, reader) = load_split_index_from_pile(pile_path, "talker_f16")?;
-        anyhow::ensure!(!f16.is_empty(), "no talker_f16 leaves found after persist");
-        let (mut checked, mut elems, mut misaligned) = (0usize, 0usize, 0usize);
-        for (name, handles) in &f16 {
-            let (dh, sh) = match handles {
-                LeafHandles::F16(d, s) => (*d, *s),
-                LeafHandles::F32(..) => {
-                    anyhow::bail!("{name}: talker_f16 entity holds an f32 leaf")
-                }
-            };
-            let bytes: anybytes::Bytes = reader
-                .get(dh)
-                .map_err(|e| anyhow::anyhow!("{name}: {e:?}"))?;
-            if bytes.as_ptr() as usize % 256 != 0 {
-                eprintln!("  MISALIGNED (ptr % 256 != 0): {name}");
-                misaligned += 1;
+        let started = Instant::now();
+        let mut pile = Pile::open(pile_path)
+            .map_err(|error| anyhow::anyhow!("open model pile {pile_path:?}: {error}"))?;
+        let imported = import_cohort(&mut pile, &signing_key, model_dir, variant);
+        let close = pile
+            .close()
+            .map_err(|error| anyhow::anyhow!("close model pile {pile_path:?}: {error}"));
+        match (imported, close) {
+            (Ok(()), Ok(())) => {}
+            (Err(error), Ok(())) => return Err(error),
+            (Ok(()), Err(error)) => return Err(error),
+            (Err(error), Err(close_error)) => {
+                return Err(
+                    error.context(format!("import also failed to close pile: {close_error}"))
+                )
             }
-            let stored = bytes
-                .view::<[half::f16]>()
-                .map_err(|e| anyhow::anyhow!("{name}: {e:?}"))?;
-            let f32_handles = f32_
-                .get(name)
-                .ok_or_else(|| anyhow::anyhow!("{name}: no matching f32 leaf"))?;
-            let (exact, shape) = read_leaf(&reader, *f32_handles);
-            let (_, f16_shape) = read_leaf(&reader, LeafHandles::F16(dh, sh));
-            anyhow::ensure!(
-                shape == f16_shape,
-                "{name}: shape mismatch {shape:?} vs {f16_shape:?}"
-            );
-            anyhow::ensure!(
-                stored.len() == exact.len(),
-                "{name}: length mismatch {} vs {}",
-                stored.len(),
-                exact.len()
-            );
-            for (i, (&h, &x)) in stored.iter().zip(exact.iter()).enumerate() {
-                let want = half::f16::from_f32(x);
-                anyhow::ensure!(
-                    h.to_bits() == want.to_bits(),
-                    "{name}[{i}]: stored {h:?} != cast {want:?} (from f32 {x})"
-                );
-            }
-            checked += 1;
-            elems += stored.len();
         }
-        anyhow::ensure!(
-            misaligned == 0,
-            "{misaligned} f16 leaves misaligned — V3 alignment invariant violated"
-        );
-        println!(
-            "talker_f16 parity gate PASSED: {checked} tensors / {elems} elements bit-identical to \
-         f16(f32-leaf); all 256-aligned."
-        );
 
         let size = std::fs::metadata(pile_path)?.len();
         println!(
-            "Persisted in {:.1}s. Pile file {pile_path:?} is {} bytes ({:.2} GiB).",
-            secs,
-            size,
-            size as f64 / (1u64 << 30) as f64
+            "Qwen3-TTS {variant:?} native pile {pile_path:?}: {:.2} GiB in {:.1}s",
+            size as f64 / (1_u64 << 30) as f64,
+            started.elapsed().as_secs_f64(),
         );
         Ok(())
     }
@@ -185,6 +239,6 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
-    eprintln!("qwen3tts_persist: macOS-only lane (folded-sibling derivation).");
+    eprintln!("qwen3tts_persist requires macOS to derive the production folded Metal layout");
     std::process::exit(2);
 }
