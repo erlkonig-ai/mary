@@ -778,7 +778,7 @@ fn main() -> Result<()> {
     // directory to fall back to.
     let pile_branch = std::env::var("INK_PILE_BRANCH").unwrap_or_else(|_| "inkling".to_string());
     let t_open = Instant::now();
-    let cp = Weights::open(&pile_path, &pile_branch)
+    let mut cp = Weights::open(&pile_path, &pile_branch)
         .with_context(|| format!("opening {} on branch {pile_branch}", pile_path.display()))?;
     let open_secs = t_open.elapsed().as_secs_f64();
 
@@ -962,6 +962,28 @@ fn main() -> Result<()> {
     let want_embed = !is_tail || mtp_k > 0;
     let want_embed_norm = !is_tail;
     let want_head = !is_head;
+    // The supported lane copies every weight this process can alias into one
+    // anonymous allocation before registration. `INK_STARTUP_COPY=0` exists
+    // only for the pressure reproducer: it deliberately restores the unsafe
+    // file-backed alias so the gate can prove that pressure was present.
+    if std::env::var("INK_STARTUP_COPY").map(|v| v == "0").unwrap_or(false) {
+        println!("  startup weight copy: DISABLED (INK_STARTUP_COPY=0) -- UNSAFE diagnostic arm");
+    } else {
+        let mut globals = Vec::new();
+        if want_embed {
+            globals.push("model.llm.embed.weight");
+        }
+        if want_head {
+            globals.push("model.llm.unembed.weight");
+        }
+        let t0 = Instant::now();
+        let (experts, dense, bytes) = cp.copy_share(lo..hi, &globals)?;
+        println!(
+            "  startup weight copy: {experts} expert + {dense} dense views, {:.2} GiB anonymous in {:.1}s",
+            bytes as f64 / GIB,
+            t0.elapsed().as_secs_f64(),
+        );
+    }
     // The embedding table, as the BF16 the pile stores. `cp.held` turned 2.40
     // GiB of stored weight into 4.81 GB of host f32 and pinned it for the run,
     // on a box chosen because the working set only just fits -- and every token
@@ -1175,7 +1197,10 @@ fn main() -> Result<()> {
     // Nine blocking device round trips for the whole run, instead of four per
     // expert. Every later slab is an offset view of one of these.
     //
-    // Always an `Aliases`, even when nothing can be aliased:
+    // Always an `Aliases`, even when nothing can be aliased. In the supported
+    // lane its one registered mapping is the anonymous startup allocation, not
+    // the pile file. The unsafe reproducer arm deliberately registers the pile.
+    //
     // `Aliases::disabled()` copies exactly as the old `None` arm did but COUNTS
     // it, so a source whose bytes cannot be aliased reports that rather than
     // going quiet. The registration is unconditional — on a unified-memory part
@@ -1185,13 +1210,9 @@ fn main() -> Result<()> {
     let fp4_aliases = {
         let c = &fp4_client;
         // `INK_ZEROCOPY=0` sends every weight through `create_from_slice`
-        // instead of aliasing the pile own mapped pages. It is a DIAGNOSTIC
-        // arm, not a lane: the GPU dereferences a 159 GiB FILE-BACKED mmap
-        // with nothing pinning it, and a page the kernel has reclaimed is
-        // read as whatever now lives at that address. A copy reads the same
-        // bytes through a HOST fault, which IS handled correctly -- so the
-        // two arms separate "the arithmetic is unordered" from "the operand
-        // was not there when the kernel read it".
+        // instead of aliasing the startup allocation. It remains a diagnostic
+        // arm, not a lane: the supported path aliases anonymous memory and
+        // does not need a per-bind device copy.
         if std::env::var("INK_ZEROCOPY").map(|v| v == "0").unwrap_or(false) {
             println!("  zero-copy mappings : DISABLED (INK_ZEROCOPY=0) -- every bind copies");
             Some(mary::models::inkling::fp4gemm::Aliases::disabled())

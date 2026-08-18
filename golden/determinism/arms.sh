@@ -36,7 +36,8 @@ need PILE_PATH
 # So the failure needs memory pressure, which is why it looked random: on an
 # idle box the pages stay resident and the runtime is bitwise deterministic.
 #
-# Requires: INK_ZEROCOPY=0 (the diagnostic arm in inkling_forward).
+# `INK_STARTUP_COPY=0` is the deliberately unsafe diagnostic arm. The fixed
+# lane is the default and aliases the anonymous startup copy.
 set -u
 N=${1:-3}
 HOG=${2:-50}
@@ -49,9 +50,9 @@ BASE=${OUT_DIR:-/tmp/ink_determinism}
 cleanup() { [ -n "${HP:-}" ] && kill $HP 2>/dev/null; }
 trap cleanup EXIT INT TERM
 
-# run_one <dir> <zerocopy 0|1> <hog GiB, or 0 for none>
+# run_one <dir> <file alias 0|1> <hog GiB, or 0 for none>
 run_one() {
-    local D=$1 ZC=$2 HG=$3
+    local D=$1 FILE_ALIAS=$2 HG=$3
     mkdir -p "$D"
     HP=
     if [ "$HG" != "0" ]; then
@@ -62,11 +63,11 @@ run_one() {
         # box and call it a pressured one.
         for _ in $(seq 1 300); do grep -q held "$D/hog.log" 2>/dev/null && break; sleep 1; done
     fi
-    local zc_env=()
-    [ "$ZC" = "0" ] && zc_env=(INK_ZEROCOPY=0)
+    local copy_env=()
+    [ "$FILE_ALIAS" = "1" ] && copy_env=(INK_STARTUP_COPY=0)
     # A timeout on the run itself: under pressure this can OOM, and an OOM that
     # hangs is indistinguishable from one that is merely slow.
-    env "${zc_env[@]}" INK_LAYERS=0:20 INK_DUMP_DIR="$D" timeout 800 \
+    env "${copy_env[@]}" INK_LAYERS=${INK_LAYERS:-0:20} INK_DUMP_DIR="$D" timeout 800 \
         "$BIN" "$PILE" "$IDS" "$D/top5.bin" > "$D/log" 2>&1
     local rc=$?
     [ -n "$HP" ] && { kill $HP 2>/dev/null; wait $HP 2>/dev/null; HP=; }
@@ -82,9 +83,9 @@ run_one() {
 rm -rf "$BASE"; mkdir -p "$BASE"
 echo "=== CONTROL: no pressure, ALIASED ==="
 run_one "$BASE/ctl_alias" 1 0
-echo "=== CONTROL: no pressure, COPIED ==="
+echo "=== CONTROL: no pressure, STARTUP COPY ==="
 run_one "$BASE/ctl_copy" 0 0
 echo "=== ARM A: ${HOG} GiB pressure, ALIASED (zero-copy out of the mmap) ==="
 for i in $(seq 1 "$N"); do run_one "$BASE/a_alias_$i" 1 "$HOG"; done
-echo "=== ARM B: ${HOG} GiB pressure, COPIED (INK_ZEROCOPY=0) ==="
+echo "=== ARM B: ${HOG} GiB pressure, STARTUP COPY (anonymous alias) ==="
 for i in $(seq 1 "$N"); do run_one "$BASE/b_copy_$i" 0 "$HOG"; done

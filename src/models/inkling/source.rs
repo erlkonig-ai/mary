@@ -278,6 +278,16 @@ impl Weights {
         self.src.mappings()
     }
 
+    /// Move this node's layer share and role-specific global tables into one
+    /// anonymous startup allocation before any GPU handle can alias them.
+    pub fn copy_share(
+        &mut self,
+        layers: std::ops::Range<usize>,
+        global_dense: &[&str],
+    ) -> Result<(usize, usize, u64)> {
+        self.src.copy_share(layers, global_dense)
+    }
+
     // ---- what the source SAYS about itself --------------------------------
 
     /// One of the model's JSON sidecars, by the file name it had in the

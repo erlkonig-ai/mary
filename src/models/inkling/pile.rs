@@ -28,7 +28,7 @@
 //! records the boundaries: `codes` is `elems / 2`, `scales` is `elems / 16`,
 //! and the global scale is the trailing four bytes.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use anybytes::Bytes;
 use triblespace::core::blob::encodings::tensor::{
     elements::{BF16, F32, NVFP4, NVFP4_BLOCK},
@@ -38,6 +38,35 @@ use triblespace::core::blob::{Blob, TryFromBlob};
 use triblespace::prelude::BlobStoreGet;
 
 use super::load::PackedExpert;
+
+fn mem_available_bytes() -> Result<u64> {
+    let status = std::fs::read_to_string("/proc/meminfo").context("reading /proc/meminfo")?;
+    let kb = status
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|v| v.parse::<u64>().ok())
+        .context("/proc/meminfo has no numeric MemAvailable")?;
+    let host = kb.checked_mul(1024).context("MemAvailable overflow")?;
+    let cgroup = match (
+        std::fs::read_to_string("/sys/fs/cgroup/memory.max"),
+        std::fs::read_to_string("/sys/fs/cgroup/memory.current"),
+    ) {
+        (Ok(max), Ok(current)) if max.trim() != "max" => {
+            let max = max
+                .trim()
+                .parse::<u64>()
+                .context("parsing cgroup memory.max")?;
+            let current = current
+                .trim()
+                .parse::<u64>()
+                .context("parsing cgroup memory.current")?;
+            max.saturating_sub(current)
+        }
+        _ => u64::MAX,
+    };
+    Ok(host.min(cgroup))
+}
 
 /// One expert, packed, as a single self-contained blob.
 ///
@@ -399,6 +428,19 @@ pub struct PileSource {
     /// How many experts each stacked matrix name has — from the facts, so a
     /// caller never infers a count from an error.
     stacked: std::collections::HashMap<String, usize>,
+    /// Anonymous startup copy of the share this process owns. Once present,
+    /// every byte a device handle can alias is a view into this allocation,
+    /// never into the reclaimable pile mapping.
+    copied: Option<anybytes::Bytes>,
+    copied_experts: std::collections::HashMap<(String, i64), CopiedExpert>,
+}
+
+#[derive(Clone)]
+struct CopiedExpert {
+    payload: anybytes::Bytes,
+    rows: usize,
+    logical: usize,
+    nvfp4: bool,
 }
 
 impl PileSource {
@@ -545,7 +587,15 @@ impl PileSource {
         sweep_dense!(F32, 4, Elem::F32);
 
         anyhow::ensure!(!dense.is_empty(), "{path:?}: no dense leaves on {branch:?}");
-        Ok(PileSource { reader, facts, dense, experts, stacked })
+        Ok(PileSource {
+            reader,
+            facts,
+            dense,
+            experts,
+            stacked,
+            copied: None,
+            copied_experts: std::collections::HashMap::new(),
+        })
     }
 
     /// One dense tensor by checkpoint name, as a view.
@@ -604,6 +654,20 @@ impl PileSource {
 
     /// One expert's NVFP4 planes, read out of the pile and **not decoded**.
     pub fn expert_packed(&self, base: &str, e: usize) -> Result<PackedSlab> {
+        if let Some(c) = self.copied_experts.get(&(base.to_string(), e as i64)) {
+            anyhow::ensure!(c.nvfp4, "{base}[{e}] is BF16, not packed NVFP4");
+            let elems = c.rows * c.logical;
+            let codes_len = elems / 2;
+            let scales_len = elems / NVFP4_BLOCK;
+            let (_, _, scale2) = split_payload(&c.payload, elems)?;
+            return Ok(PackedSlab {
+                codes: c.payload.slice(..codes_len),
+                scales: c.payload.slice(codes_len..codes_len + scales_len),
+                scale2,
+                rows: c.rows,
+                cols: c.logical / 2,
+            });
+        }
         let h = match self.experts.get(&(base.to_string(), e as i64)).map(|r| r.handle) {
             Some(ExpertHandle::Nvfp4(h)) => h,
             Some(ExpertHandle::Bf16(_)) => {
@@ -644,6 +708,21 @@ impl PileSource {
     /// is part of its identity here, so asking for the wrong one is an error
     /// and never a reinterpretation.
     pub fn expert_bf16(&self, base: &str, e: usize) -> Result<Bf16Slab> {
+        if let Some(c) = self.copied_experts.get(&(base.to_string(), e as i64)) {
+            anyhow::ensure!(!c.nvfp4, "{base}[{e}] is packed NVFP4, not BF16");
+            anyhow::ensure!(
+                c.payload.len() == c.rows * c.logical * 2,
+                "{base}[{e}]: {} bytes for {}x{} BF16",
+                c.payload.len(),
+                c.rows,
+                c.logical
+            );
+            return Ok(Bf16Slab {
+                bytes: c.payload.clone(),
+                rows: c.rows,
+                cols: c.logical,
+            });
+        }
         let h = match self.experts.get(&(base.to_string(), e as i64)).map(|r| r.handle) {
             Some(ExpertHandle::Bf16(h)) => h,
             Some(ExpertHandle::Nvfp4(_)) => {
@@ -682,6 +761,20 @@ impl PileSource {
     /// second `mmap` of the same file would be a different address range and
     /// every offset computed against it would be silently wrong.
     pub fn mappings(&self) -> Result<Vec<(usize, usize, std::sync::Arc<dyn std::any::Any + Send + Sync>)>> {
+        if let Some(bytes) = &self.copied {
+            let view: anybytes::View<[u8]> = bytes
+                .clone()
+                .view()
+                .map_err(|e| anyhow::anyhow!("viewing the anonymous weight allocation: {e}"))?;
+            let owner: std::sync::Arc<Vec<u8>> = view
+                .downcast_to_owner()
+                .map_err(|_| anyhow::anyhow!("anonymous weight allocation lost its Vec owner"))?;
+            return Ok(vec![(
+                bytes.as_ptr() as usize,
+                bytes.len(),
+                owner as std::sync::Arc<dyn std::any::Any + Send + Sync>,
+            )]);
+        }
         let any = self
             .dense
             .values()
@@ -726,6 +819,140 @@ impl PileSource {
             .collect();
         v.sort();
         v
+    }
+
+    /// Copy exactly one node's share out of the file-backed pile mapping into
+    /// one anonymous allocation. The GPU may safely alias this allocation:
+    /// anonymous pages have no backing store the kernel can silently re-read
+    /// them from, so they cannot be reclaimed while this process owns them.
+    pub fn copy_share(
+        &mut self,
+        layers: std::ops::Range<usize>,
+        global_dense: &[&str],
+    ) -> Result<(usize, usize, u64)> {
+        anyhow::ensure!(self.copied.is_none(), "the weight share was already copied");
+
+        struct Pending {
+            key: (String, i64),
+            bytes: anybytes::Bytes,
+            rows: usize,
+            logical: usize,
+            nvfp4: bool,
+        }
+
+        let keys = self.expert_keys_in(layers.clone());
+        let mut pending = Vec::with_capacity(keys.len());
+        let mut total = 0usize;
+        for key in keys {
+            let r = &self.experts[&key];
+            let (bytes, rows, logical, nvfp4) = match r.handle {
+                ExpertHandle::Nvfp4(h) => {
+                    let blob: Blob<Tensor<NVFP4, 2>> = self
+                        .reader
+                        .get(h)
+                        .map_err(|e| anyhow::anyhow!("{}[{}]: {e:?}", key.0, key.1))?;
+                    let view = TensorView::try_from_blob(blob)
+                        .map_err(|e| anyhow::anyhow!("{}[{}]: decode: {e}", key.0, key.1))?;
+                    (view.payload().clone(), view.dims()[0] as usize, view.dims()[1] as usize, true)
+                }
+                ExpertHandle::Bf16(h) => {
+                    let blob: Blob<Tensor<BF16, 2>> = self
+                        .reader
+                        .get(h)
+                        .map_err(|e| anyhow::anyhow!("{}[{}]: {e:?}", key.0, key.1))?;
+                    let view = TensorView::try_from_blob(blob)
+                        .map_err(|e| anyhow::anyhow!("{}[{}]: decode: {e}", key.0, key.1))?;
+                    (view.payload().clone(), view.dims()[0] as usize, view.dims()[1] as usize, false)
+                }
+            };
+            total = total
+                .checked_add(bytes.len())
+                .context("weight share byte count overflow")?;
+            total = total
+                .checked_add((4 - total % 4) % 4)
+                .context("weight share padding overflow")?;
+            pending.push(Pending { key, bytes, rows, logical, nvfp4 });
+        }
+
+        let globals: std::collections::HashSet<&str> = global_dense.iter().copied().collect();
+        for name in &globals {
+            anyhow::ensure!(
+                self.dense.contains_key(*name),
+                "startup-copy table {name} is not in the pile"
+            );
+        }
+        let mut dense_names: Vec<String> = self
+            .dense
+            .iter()
+            .filter(|(name, leaf)| {
+                leaf.layer.map(|l| layers.contains(&(l as usize))).unwrap_or(false)
+                    || globals.contains(name.as_str())
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        dense_names.sort();
+        for name in &dense_names {
+            total = total.checked_add(self.dense[name].bytes.len())
+                .context("weight share byte count overflow")?;
+            total = total.checked_add((4 - total % 4) % 4)
+                .context("weight share padding overflow")?;
+        }
+
+        let available = mem_available_bytes()?;
+        anyhow::ensure!(
+            total as u64 <= available,
+            "this node's INK_LAYERS share needs {:.2} GiB of anonymous startup-copy RAM, but only {:.2} GiB is available; refusing to start because file-backed aliases can be reclaimed underneath the GPU. Give this node a smaller INK_LAYERS range or more RAM",
+            total as f64 / (1u64 << 30) as f64,
+            available as f64 / (1u64 << 30) as f64,
+        );
+
+        let mut arena = Vec::new();
+        arena.try_reserve_exact(total).map_err(|e| anyhow::anyhow!(
+            "cannot allocate {:.2} GiB for this node's startup weight copy: {e}",
+            total as f64 / (1u64 << 30) as f64,
+        ))?;
+        let mut expert_offsets = Vec::with_capacity(pending.len());
+        for p in &pending {
+            let start = arena.len();
+            arena.extend_from_slice(&p.bytes);
+            let end = arena.len();
+            arena.resize(end + (4 - end % 4) % 4, 0);
+            expert_offsets.push((start, end));
+        }
+        let mut dense_offsets = Vec::with_capacity(dense_names.len());
+        for name in &dense_names {
+            let start = arena.len();
+            arena.extend_from_slice(&self.dense[name].bytes);
+            let end = arena.len();
+            arena.resize(end + (4 - end % 4) % 4, 0);
+            dense_offsets.push((start, end));
+        }
+        anyhow::ensure!(arena.len() == total, "startup copy sized {total} bytes but wrote {}", arena.len());
+
+        // `Bytes` owns the allocator's Vec; `View` proves and retains the new
+        // anonymous backing before subviews replace every mmap-backed payload.
+        let bytes = anybytes::Bytes::from_source(arena);
+        let view: anybytes::View<[u8]> = bytes
+            .clone()
+            .view()
+            .map_err(|e| anyhow::anyhow!("viewing the anonymous weight allocation: {e}"))?;
+        let bytes = view.bytes();
+        for (p, (start, end)) in pending.into_iter().zip(expert_offsets) {
+            self.copied_experts.insert(p.key, CopiedExpert {
+                payload: bytes.slice(start..end),
+                rows: p.rows,
+                logical: p.logical,
+                nvfp4: p.nvfp4,
+            });
+        }
+        for (name, (start, end)) in dense_names.iter().zip(dense_offsets) {
+            self.dense
+                .get_mut(name)
+                .expect("selected dense leaf")
+                .bytes = bytes.slice(start..end);
+        }
+        self.copied = Some(bytes);
+        Ok((self.copied_experts.len(), dense_names.len(), total as u64))
     }
 
     /// Every `(stacked matrix name, expert index)` this pile holds, sorted.
