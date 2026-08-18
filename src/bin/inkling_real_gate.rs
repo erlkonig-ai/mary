@@ -116,6 +116,44 @@ fn check_fp(man: &str, key: &str, v: &[f32], checks: &mut usize, fails: &mut usi
     }
 }
 
+/// The same fingerprint check as [`check_fp`], for a tensor too large to hold.
+///
+/// A sum is a fold, so it does not need the whole tensor in memory at once --
+/// which matters here because the tensor in question is every expert in a layer
+/// and the f32 it is being folded over is 8.6 GB of it. The caller streams.
+///
+/// What this can and cannot catch is unchanged from `check_fp` and worth
+/// restating: a sum is permutation-invariant, so it pins the DEQUANTISATION of
+/// every plane in the layer against torch's own and cannot see a de-interleave
+/// or a transpose. Those are `inkling_fp4_expert_gate`'s job, over one expert,
+/// against an f64 arbiter.
+fn check_fp_streamed(
+    man: &str,
+    key: &str,
+    sum: f64,
+    n: usize,
+    checks: &mut usize,
+    fails: &mut usize,
+) {
+    let want = match fingerprint(man, key, "sum") {
+        Ok(w) => w,
+        Err(e) => {
+            println!("  FAIL  {key}: {e}");
+            *fails += 1;
+            return;
+        }
+    };
+    *checks += 1;
+    let denom = want.abs().max(1.0);
+    let rel = (sum - want).abs() / denom;
+    if rel > 1e-4 {
+        println!("  FAIL  {key}: sum {sum:+.6e}, reference {want:+.6e} (rel {rel:e})");
+        *fails += 1;
+    } else {
+        println!("  ok    {:-42} sum {:+.6e}  n={}", key, sum, n);
+    }
+}
+
 /// Which of the two readings of `shared_w13_weight` does the ORACLE agree with?
 ///
 /// The block is square, so a wrong split is shape-legal, loads without
@@ -337,12 +375,52 @@ fn main() -> Result<()> {
         check_fp(&man, "mlp.shared_experts.up_proj", &sup, &mut checks, &mut fails);
         check_fp(&man, "mlp.shared_experts.down_proj", &sdown, &mut checks, &mut fails);
 
-        println!("\n=== 3. the expert slabs are NOT read, and what that costs ===");
-        println!("  {n_routed} experts widened to f32 is ~13 GB of Vec<f32> for one layer,");
-        println!("  and the only thing that consumed it was the host f32 MoE. Gone with it.");
-        println!("  What gates a routed expert now is inkling_fp4_expert_gate (NVFP4) and");
-        println!("  inkling_bf16_expert_gate (layer 2), each against a Python bundle at the");
-        println!("  precision the checkpoint is actually in.");
+        // ---- the expert slabs, STREAMED ------------------------------------
+        //
+        // These used to be accumulated into two `Vec<f32>` -- 8.6 GB of gate_up
+        // and 4.3 GB of down for one layer -- because the host f32 MoE was going
+        // to multiply them. Nothing multiplies them here any more, and the only
+        // thing this ever asked of them was a sum, which is a fold. So the slabs
+        // are decoded one expert at a time and dropped, and what was 13 GB of
+        // resident f32 is now one 33.6 MB buffer at a time.
+        //
+        // The two checks are the same two checks. The layer's OUTPUT comparison
+        // that used to sit downstream of them is gone with the MoE lane, and
+        // `inkling_fp4_expert_gate` is what stands in its place: one whole real
+        // expert against an f64 arbiter over the same quantised operands, at the
+        // precision the checkpoint is in rather than at f32.
+        println!("\n=== 3. expert slabs, streamed and dropped ===");
+        println!("  which experts a layer uses is not knowable before its attention runs,");
+        println!("  so all {n_routed} are fetched, one slab at a time out of the mapping.");
+        let mut gu_sum = 0f64;
+        let mut dn_sum = 0f64;
+        let mut gu_n = 0usize;
+        let mut dn_n = 0usize;
+        let mut shape_bad = 0usize;
+        for e in 0..n_routed {
+            let raw = cp.expert_slice(&format!("{pfx}mlp.experts.w13_weight"), e)?.data;
+            if raw.len() != 2 * mi * h {
+                shape_bad += 1;
+            }
+            gu_n += raw.len();
+            gu_sum += raw.iter().map(|&x| x as f64).sum::<f64>();
+            drop(raw);
+            let raw = cp.expert_slice(&format!("{pfx}mlp.experts.w2_weight"), e)?.data;
+            if raw.len() != h * mi {
+                shape_bad += 1;
+            }
+            dn_n += raw.len();
+            dn_sum += raw.iter().map(|&x| x as f64).sum::<f64>();
+        }
+        checks += 1;
+        if shape_bad != 0 {
+            println!("  FAIL  {shape_bad} expert planes are not the shape the config implies");
+            fails += 1;
+        } else {
+            println!("  gate_up {gu_n} floats, down {dn_n} floats, every plane the right shape");
+        }
+        check_fp_streamed(&man, "mlp.experts.gate_up_proj", gu_sum, gu_n, &mut checks, &mut fails);
+        check_fp_streamed(&man, "mlp.experts.down_proj", dn_sum, dn_n, &mut checks, &mut fails);
         None
     };
 
