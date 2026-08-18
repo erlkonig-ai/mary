@@ -265,16 +265,15 @@ pub struct Bf16W {
     /// server down with it, so the alignment has to be known BEFORE the launch
     /// and it is only knowable at the bind.
     ///
-    /// **Where the 4 comes from, measured.** Not the pile: with
-    /// `INK_STARTUP_COPY=0`, which aliases the mmap directly, all 71 weights of
-    /// an 8-layer node are 16-aligned and so are all 178/199 of a 20/22-layer
-    /// split. The misalignment is created by the startup weight copy, which
-    /// packs its views back to back with `cursor = end + (4 - end % 4) % 4`
-    /// (`pile::…`, twice, plus the same expression sizing the arena). Sixteen
-    /// there instead of four costs at most 15 bytes per view — about 18 KB
-    /// across the whole share — and it is worth 442.7 -> 327.5 ms on a
-    /// 512-token prefill, which is what `INK_ALIGN_COPY=1` currently buys for
-    /// 908 MiB of duplicated weight instead.
+    /// **Where the 4 comes from.** Not the pile: the startup weight copy packs
+    /// its views back to back with `cursor = end + (4 - end % 4) % 4`, twice,
+    /// in its layout pass. Sixteen there instead of four costs at most 15 bytes
+    /// per view — about 14 KB across an 8-layer share — and it makes every
+    /// weight reachable by the tuned lanes. Measured with the startup copy ON,
+    /// layers 0:8, 512-token prefill, p50 over 24 warm passes: 438.3 ms at 4,
+    /// 332.3 ms at 16, against the 330.1 ms `INK_ALIGN_COPY=1` buys by
+    /// duplicating 908 MiB of weight. The change belongs in the startup copy,
+    /// not here.
     pub align: usize,
 }
 
