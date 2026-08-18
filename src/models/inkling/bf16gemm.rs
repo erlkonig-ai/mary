@@ -296,10 +296,10 @@ pub fn linear_bf16<R: Runtime>(
     x_h: &Handle,
     w: &Bf16W,
     m: usize,
-    m_pad: usize,
 ) -> Handle {
-    let a = to_bf16_launch(client, x_h, m * w.k, m_pad * w.k);
-    bf16_gemm(client, &a, &w.h, m_pad, w.k, w.n, w.align)
+    let rows = rows_for(w.align, m);
+    let a = to_bf16_launch(client, x_h, m * w.k, rows * w.k);
+    bf16_gemm(client, &a, &w.h, rows, w.k, w.n, w.align)
 }
 
 // ---------------------------------------------------------------------------
@@ -563,15 +563,51 @@ pub fn try_bf16_linear_cubek_launch<R: Runtime>(
 /// and retried -- the alignment has to be decided before the launch. With
 /// `Bf16W::align` deciding it, a weight the TMA lane would fault on never
 /// reaches this list at all, and the lane is safe on both bind arms.
+/// It opens with a GEMV, and that is the decode step's whole story: a decode
+/// step feeds ONE row, `gemv plane par` is the only routine here that reaches
+/// this part's memory roofline on one row (219 GB/s on `attn wq` against 121
+/// for the best tiled lane, 252 GB/s on the 134 MB `dense w13` against 120),
+/// and it DECLINES the shape as soon as m grows, so it costs a prefill pass
+/// one failed setup per shape and nothing else. `simple vecmat` is deliberately
+/// NOT on the list: it is a hair slower than the gemv at m=1 and it ACCEPTS
+/// m=16, where it is four times slower than the tiled lanes -- a lane that
+/// takes a shape it should refuse is worse than one that refuses a shape it
+/// could take.
+///
+/// It ends with `simple unit`, not the hand kernel. The hand kernel needs m
+/// padded to 16 and the tuned lanes do not, so once [`rows_for`] stops padding
+/// there is no unpadded fallback to the hand lane -- `simple unit` is the
+/// routine `cubek`'s own `Auto` falls back to and it takes every shape.
 const PREFERENCE: &[Lane] = &[
+    Lane::GemvPlaneParallel,
     Lane::DoubleTmaMma,
     Lane::SimpleTmaMma,
     Lane::DoubleCyclicMma,
     Lane::SimpleCyclicMma,
     Lane::SpecializedCyclicCmma,
     Lane::SimpleCyclicCmma,
-    Lane::Hand,
+    Lane::SimpleUnit,
 ];
+
+/// The alignment a weight needs before the tuned lanes may touch it.
+pub const MIN_TUNED_ALIGN: usize = 16;
+
+/// How many rows the lane will compute for an `m`-row activation.
+///
+/// The hand kernel's grid IS its tiling, so it needs `m` rounded up to
+/// [`MTILE`] and the caller slices the padding off afterwards. The tuned lanes
+/// bounds-check their own tiles and take `m` as it stands — which is not a
+/// tidiness point. A decode step feeds ONE row, and padding it to sixteen both
+/// multiplied fifteen rows of zeros by every weight in the model and, far worse,
+/// HID `m = 1` from the gemv routines: they decline m=16, so the padding was
+/// the reason the fastest decode kernel on this box was never reachable.
+pub fn rows_for(align: usize, m: usize) -> usize {
+    if align >= MIN_TUNED_ALIGN {
+        m
+    } else {
+        m.div_ceil(MTILE) * MTILE
+    }
+}
 
 impl Lane {
     /// The inverse of [`Lane::name`], for `INK_GEMM`.
@@ -647,7 +683,7 @@ pub fn bf16_gemm<R: Runtime>(
     // loads 4 bytes at a time and takes any 4-aligned address. This is a
     // per-WEIGHT decision and not a per-shape one: two `[4096, 4096]`
     // projections in the same layer land at different offsets in the mapping.
-    if align < 16 {
+    if align < MIN_TUNED_ALIGN {
         return bf16_linear_launch(client, a, b, m, k, n);
     }
     if let Some(lane) = forced_lane() {

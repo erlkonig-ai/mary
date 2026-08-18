@@ -52,7 +52,10 @@ fn main() -> Result<()> {
     let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(30);
     let m: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(MTILE);
     let client = Rt::client(&Default::default());
-    assert_eq!(m % MTILE, 0, "the hand lane needs m a multiple of {MTILE}");
+    // The hand lane's grid IS its tiling, so it needs m a multiple of 16. The
+    // tuned lanes bounds-check their own tiles, so `m = 1` -- what a decode step
+    // actually feeds -- is a shape they can be asked about and it was not.
+    let hand_ok = m % MTILE == 0;
 
     // Every BF16 GEMM a 20-layer node issues, by shape. `calls` is how many of
     // each one pass makes, so the last column is what the pass pays.
@@ -83,13 +86,16 @@ fn main() -> Result<()> {
         let b = client.create_from_slice(&slab(n * k, 1.7));
 
         println!("  {name} k {k:>5} n {n:>7}   ({:.1} MB of weight)", (n * k * 2) as f64 / 1e6);
-        // The hand lane's answer, to check the others against. Row 0 only: the
-        // rest of the tile is padding on a decode shape.
+        // The first lane that runs is the reference the rest are checked against,
+        // over row 0 only.
         let mut reference: Option<Vec<f32>> = None;
 
         for (slot, &lane) in Lane::ALL.iter().enumerate() {
             let launch = |lane: Lane| -> Option<cubecl::server::Handle> {
                 if lane == Lane::Hand {
+                    if !hand_ok {
+                        return None;
+                    }
                     Some(bf16_linear_launch(&client, &a, &b, m, k, n))
                 } else {
                     try_bf16_linear_cubek_launch(&client, &a, &b, m, k, n, lane).ok()
