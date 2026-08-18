@@ -843,6 +843,12 @@ impl PileSource {
         let keys = self.expert_keys_in(layers.clone());
         let mut pending = Vec::with_capacity(keys.len());
         let mut total = 0usize;
+        // The copy has two halves and they are NOT the same kind of work: this
+        // loop asks the store for each blob (which is where the BLAKE3 over the
+        // payload is paid) and the loop further down memcpys the bytes into the
+        // arena. One timer over both said "48.5s" and could not say which half
+        // to attack, so each half has its own now.
+        let t_fetch = std::time::Instant::now();
         for key in keys {
             let r = &self.experts[&key];
             let (bytes, rows, logical, nvfp4) = match r.handle {
@@ -873,6 +879,8 @@ impl PileSource {
                 .context("weight share padding overflow")?;
             pending.push(Pending { key, bytes, rows, logical, nvfp4 });
         }
+
+        let fetch_secs = t_fetch.elapsed().as_secs_f64();
 
         let globals: std::collections::HashSet<&str> = global_dense.iter().copied().collect();
         for name in &globals {
@@ -911,23 +919,111 @@ impl PileSource {
             "cannot allocate {:.2} GiB for this node's startup weight copy: {e}",
             total as f64 / (1u64 << 30) as f64,
         ))?;
+        // The DESTINATION of every leaf, computed before anything is written.
+        //
+        // This used to be `extend_from_slice` in a loop, which is the same
+        // arithmetic done implicitly by `Vec::len` -- and doing it implicitly is
+        // what forced the copy to be sequential: each leaf's offset was only
+        // known once the leaf before it had been written. Naming the offsets up
+        // front makes the writes disjoint, and disjoint writes can be split
+        // across threads. The layout is byte-for-byte the one the sequential
+        // loop produced: same order, same 4-byte alignment padding, same total.
+        let mut cursor = 0usize;
         let mut expert_offsets = Vec::with_capacity(pending.len());
         for p in &pending {
-            let start = arena.len();
-            arena.extend_from_slice(&p.bytes);
-            let end = arena.len();
-            arena.resize(end + (4 - end % 4) % 4, 0);
+            let start = cursor;
+            let end = start + p.bytes.len();
+            cursor = end + (4 - end % 4) % 4;
             expert_offsets.push((start, end));
         }
         let mut dense_offsets = Vec::with_capacity(dense_names.len());
         for name in &dense_names {
-            let start = arena.len();
-            arena.extend_from_slice(&self.dense[name].bytes);
-            let end = arena.len();
-            arena.resize(end + (4 - end % 4) % 4, 0);
+            let start = cursor;
+            let end = start + self.dense[name].bytes.len();
+            cursor = end + (4 - end % 4) % 4;
             dense_offsets.push((start, end));
         }
-        anyhow::ensure!(arena.len() == total, "startup copy sized {total} bytes but wrote {}", arena.len());
+        anyhow::ensure!(cursor == total, "startup copy sized {total} bytes but laid out {cursor}");
+        arena.resize(total, 0);
+
+        // How many threads memcpy. `INK_COPY_THREADS=1` is the sequential lane
+        // this replaced, kept selectable so the two can be run back to back out
+        // of ONE binary; anything else is a thread count, and unset means one
+        // per available core capped at 16 (past that the copy is bound by
+        // memory bandwidth, not by cores).
+        let threads: usize = std::env::var("INK_COPY_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(16)
+            });
+        let t_copy = std::time::Instant::now();
+        {
+            // One `&mut [u8]` per thread over a DISJOINT span of the arena, and
+            // the leaves assigned to that span. `chunks_mut` is what makes the
+            // aliasing argument the compiler's rather than mine.
+            let mut jobs: Vec<(usize, usize, &[u8])> = Vec::with_capacity(pending.len() + dense_names.len());
+            for (p, &(start, end)) in pending.iter().zip(expert_offsets.iter()) {
+                jobs.push((start, end, &p.bytes));
+            }
+            for (name, &(start, end)) in dense_names.iter().zip(dense_offsets.iter()) {
+                jobs.push((start, end, &self.dense[name].bytes));
+            }
+            let dst = arena.as_mut_slice();
+            if threads <= 1 {
+                for (start, end, src) in &jobs {
+                    dst[*start..*end].copy_from_slice(src);
+                }
+            } else {
+                // Split by BYTES, not by leaf count: the leaves are not the same
+                // size (a dense leaf is 537 MB and an expert plane is 14 MB), so
+                // an even split of the list is an uneven split of the work.
+                let per = total.div_ceil(threads);
+                let mut bounds: Vec<usize> = Vec::with_capacity(threads + 1);
+                let mut j = 0usize;
+                bounds.push(0);
+                for t in 1..threads {
+                    let target = per * t;
+                    while j < jobs.len() && jobs[j].0 < target {
+                        j += 1;
+                    }
+                    bounds.push(j);
+                }
+                bounds.push(jobs.len());
+                // Each shard's arena span runs from its first job's start to its
+                // last job's padded end, so the spans tile the arena exactly.
+                let mut rest = dst;
+                let mut shards: Vec<(&mut [u8], usize, &[(usize, usize, &[u8])])> = Vec::new();
+                let mut base = 0usize;
+                for w in bounds.windows(2) {
+                    let (a, b) = (w[0], w[1]);
+                    let span_end = if b == jobs.len() { total } else { jobs[b].0 };
+                    let (head, tail) = rest.split_at_mut(span_end - base);
+                    shards.push((head, base, &jobs[a..b]));
+                    rest = tail;
+                    base = span_end;
+                }
+                std::thread::scope(|sc| {
+                    for (buf, base, mine) in shards {
+                        sc.spawn(move || {
+                            for (start, end, src) in mine {
+                                buf[start - base..end - base].copy_from_slice(src);
+                            }
+                        });
+                    }
+                });
+            }
+        }
+        let copy_secs = t_copy.elapsed().as_secs_f64();
+        println!(
+            "    startup copy: fetch+verify {:.1}s ({:.2} GiB/s), memcpy {:.1}s ({:.2} GiB/s, {threads} thread{})",
+            fetch_secs,
+            total as f64 / (1u64 << 30) as f64 / fetch_secs.max(1e-9),
+            copy_secs,
+            total as f64 / (1u64 << 30) as f64 / copy_secs.max(1e-9),
+            if threads == 1 { "" } else { "s" },
+        );
 
         // `Bytes` owns the allocator's Vec; `View` proves and retains the new
         // anonymous backing before subviews replace every mmap-backed payload.
