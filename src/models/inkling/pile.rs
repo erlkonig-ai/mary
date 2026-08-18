@@ -39,6 +39,173 @@ use triblespace::prelude::BlobStoreGet;
 
 use super::load::PackedExpert;
 
+/// One line of the kernel's memory accounting, for a startup that competes with
+/// the GPU for ONE pool.
+///
+/// On a unified-memory part the anonymous startup copy, the pile's page cache
+/// and everything CUDA reserves are the same 121 GiB. A timer cannot say which
+/// of them ran out, and `MemAvailable` alone cannot either: clean page cache
+/// counts as available right up to the moment something needs it and the
+/// reclaim has to happen synchronously. So print all four.
+pub fn mem_line(label: &str) -> String {
+    let mut free = 0u64;
+    let mut avail = 0u64;
+    let mut cached = 0u64;
+    let mut anon = 0u64;
+    let mut swapfree = 0u64;
+    let mut swaptotal = 0u64;
+    if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+        let kb = |l: &str| -> u64 {
+            l.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0)
+        };
+        for l in s.lines() {
+            if l.starts_with("MemFree:") {
+                free = kb(l);
+            } else if l.starts_with("MemAvailable:") {
+                avail = kb(l);
+            } else if l.starts_with("Cached:") {
+                cached = kb(l);
+            } else if l.starts_with("AnonPages:") {
+                anon = kb(l);
+            } else if l.starts_with("SwapFree:") {
+                swapfree = kb(l);
+            } else if l.starts_with("SwapTotal:") {
+                swaptotal = kb(l);
+            }
+        }
+    }
+    let mut rss = 0u64;
+    if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+        for l in s.lines() {
+            if l.starts_with("VmRSS:") {
+                rss = l.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+            }
+        }
+    }
+    let g = |kb: u64| kb as f64 / (1u64 << 20) as f64;
+    format!(
+        "    mem[{label}]: rss {:.1} GiB, anon {:.1}, free {:.1}, available {:.1}, cached {:.1}, swap used {:.1}",
+        g(rss),
+        g(anon),
+        g(free),
+        g(avail),
+        g(cached),
+        g(swaptotal.saturating_sub(swapfree)),
+    )
+}
+
+/// Hands each leaf's source pages back to the kernel once it has been copied
+/// into the anonymous arena.
+///
+/// Two calls, and both are needed, because they undo different things.
+/// `madvise(MADV_DONTNEED)` zaps this process's page-table entries, which takes
+/// the pages out of RSS but leaves them in the page cache; `posix_fadvise(...,
+/// POSIX_FADV_DONTNEED)` drops the cache pages themselves, and it only works on
+/// pages nobody has mapped -- which is why the madvise has to come first. The
+/// pile is mapped shared and read-only, so neither is destructive: a later read
+/// of the same bytes re-faults them from the file.
+///
+/// What this buys is the thing the startup copy is actually fighting for. On a
+/// unified-memory part the source page cache, the anonymous arena and
+/// everything CUDA reserves are ONE 121 GiB pool, and reclaim gets to choose
+/// between them. At `INK_LAYERS=0:20` it chose wrong twice over: without the
+/// madvise it held 36 GiB of source pages in RSS and paged 16 GiB of freshly
+/// written arena out to swap instead; with the madvise but without the fadvise
+/// it still kept the unmapped cache and started swapping again as soon as the
+/// share passed ~85 GiB. Handing the pages back as each leaf lands takes the
+/// choice away.
+///
+/// `INK_RELEASE_SOURCE=0` keeps the pages, as the A/B arm.
+struct SourceRelease {
+    /// The pile file, reopened read-only for `posix_fadvise` alone. The mapping
+    /// does not keep an fd and the advice needs one.
+    file: Option<std::fs::File>,
+    /// Base address of the pile's mapping, so a payload pointer becomes a file
+    /// offset by subtraction. `None` when the mapping is not the whole file, in
+    /// which case that subtraction would be a guess.
+    map_base: Option<usize>,
+    /// The file's length, so the advice never names a range past its end.
+    file_len: usize,
+    page: usize,
+    on: bool,
+}
+
+impl SourceRelease {
+    #[cfg(target_os = "linux")]
+    fn new(path: &std::path::Path, map_base: usize, map_len: usize) -> Self {
+        let on = !std::env::var("INK_RELEASE_SOURCE").map(|v| v == "0").unwrap_or(false);
+        // SAFETY: `sysconf` reads a static system parameter.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let page = if page > 0 { page as usize } else { 4096 };
+        let file = std::fs::File::open(path).ok();
+        // The mapping starts at file offset 0, so a payload pointer minus the
+        // base IS the file offset -- but the pile RESERVES address space it has
+        // not filled (256 GiB of mapping over a 171 GiB file, so appends need no
+        // remap), and the reservation is exactly why this cannot be an equality
+        // test. What has to hold is that the file is no LONGER than the map,
+        // and that the advice never runs past the file's end.
+        let file_len = file
+            .as_ref()
+            .and_then(|f| f.metadata().ok())
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+        let whole = file_len > 0 && file_len <= map_len;
+        println!(
+            "    source release: {}, map {} bytes, file {} bytes, offsets {}",
+            if on { "on" } else { "OFF" },
+            map_len,
+            file_len,
+            if whole { "usable" } else { "UNUSABLE (page cache will not be dropped)" },
+        );
+        Self { file, map_base: whole.then_some(map_base), file_len, page, on }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn new(_path: &std::path::Path, _map_base: usize, _map_len: usize) -> Self {
+        Self { file: None, map_base: None, file_len: 0, page: 4096, on: false }
+    }
+
+    /// Rounded INWARD to whole pages, so a leaf never releases a page its
+    /// neighbour is still reading.
+    #[cfg(target_os = "linux")]
+    fn release(&self, src: &Bytes) {
+        use std::os::fd::AsRawFd;
+        if !self.on {
+            return;
+        }
+        let lo = src.as_ptr() as usize;
+        let hi = (lo + src.len()) / self.page * self.page;
+        let lo = lo.next_multiple_of(self.page);
+        if hi <= lo {
+            return;
+        }
+        // SAFETY: the range lies inside the pile's live mapping, which outlives
+        // this call; `MADV_DONTNEED` on a shared file mapping only zaps
+        // page-table entries, so the bytes are still readable and unchanged.
+        unsafe {
+            libc::madvise(lo as *mut libc::c_void, hi - lo, libc::MADV_DONTNEED);
+        }
+        if let (Some(base), Some(f)) = (self.map_base, self.file.as_ref()) {
+            if hi - base > self.file_len {
+                return;
+            }
+            // SAFETY: `f` is open for the duration of the call; the advice is
+            // a hint and cannot invalidate anything.
+            unsafe {
+                libc::posix_fadvise(
+                    f.as_raw_fd(),
+                    (lo - base) as libc::off_t,
+                    (hi - lo) as libc::off_t,
+                    libc::POSIX_FADV_DONTNEED,
+                );
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn release(&self, _src: &Bytes) {}
+}
+
 fn mem_available_bytes() -> Result<u64> {
     let status = std::fs::read_to_string("/proc/meminfo").context("reading /proc/meminfo")?;
     let kb = status
@@ -408,6 +575,9 @@ pub struct Bf16Slab {
 /// header parsed yet — do not exist for a content-addressed store. A handle IS
 /// the location.
 pub struct PileSource {
+    /// Where the pile is, kept only so the startup copy can reopen it: the
+    /// mapping does not carry an fd and `posix_fadvise` needs one.
+    path: std::path::PathBuf,
     reader: triblespace::core::repo::pile::PileReader,
     /// Everything the branch asserts, kept rather than dropped after the index
     /// is built.
@@ -455,6 +625,7 @@ impl PileSource {
         use triblespace::macros::{find, pattern};
         use triblespace::prelude::*;
 
+        let t_open = std::time::Instant::now();
         let mut pile = Pile::open(path).map_err(|e| anyhow::anyhow!("open {path:?}: {e:?}"))?;
         // Read path: never amputate. A torn tail is an operator decision.
         pile.refresh()
@@ -485,6 +656,8 @@ impl PileSource {
             .reader()
             .map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
         repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
+        let open_secs = t_open.elapsed().as_secs_f64();
+        let t_experts = std::time::Instant::now();
 
         // ── the experts, as handles ─────────────────────────────────────────
         // First, because what it produces is also what tells the dense sweep
@@ -527,51 +700,95 @@ impl PileSource {
         sweep_experts!(NVFP4, attrs::weight_nvfp4_2, ExpertHandle::Nvfp4);
         sweep_experts!(BF16, attrs::weight::<BF16, 2>(), ExpertHandle::Bf16);
 
+        let experts_secs = t_experts.elapsed().as_secs_f64();
+        let t_dense = std::time::Instant::now();
         // ── the dense tensors, by name ──────────────────────────────────────
         // One query per (element, rank) — ten, not one — because that is what
         // typing the attribute means, and each hit is read AS its type. Nothing
         // is interpreted without one, so a BF16 matrix cannot arrive where f32
         // was asked for.
         let mut dense = std::collections::HashMap::new();
+        // How many threads read the dense leaves. Each `get` is a BLAKE3 over
+        // the payload and the payloads are the big ones -- the embedding table
+        // is 2.40 GiB and the unembedding 1.61 -- so this sweep was 15.0 s of a
+        // 23.6 s index build, on one core, for 968 leaves the queries had
+        // already located. The reads are independent: `PileReader::get` takes
+        // `&self` and its validation cache hashes outside its lock.
+        let index_threads: usize = std::env::var("INK_INDEX_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n: &usize| *n >= 1)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+            });
         macro_rules! sweep_dense {
             ($ty:ty, $rank:literal, $tag:expr) => {{
-                for (e, n, h) in find!(
+                // Located first, read second. The `find!` iterator borrows
+                // `facts` and is not something to hand to a thread; the handles
+                // it yields are plain `Copy` values that are.
+                let hits: Vec<_> = find!(
                     (e: Id,
                      n: Inline<Handle<blobencodings::LongString>>,
                      h: Inline<Handle<Tensor<$ty, $rank>>>),
                     pattern!(&facts, [
                         { ?e @ metadata::name: ?n, attrs::weight::<$ty, $rank>(): ?h },
                     ])
-                ) {
-                    if expert_ids.contains(&e) {
-                        continue;
+                )
+                .filter(|(e, _, _)| !expert_ids.contains(e))
+                .collect();
+                if !hits.is_empty() {
+                    let chunk = hits.len().div_ceil(index_threads).max(1);
+                    let reader = &reader;
+                    let facts = &facts;
+                    let parts: Vec<Result<Vec<(String, Leaf)>>> = std::thread::scope(|sc| {
+                        let handles: Vec<_> = hits
+                            .chunks(chunk)
+                            .map(|c| {
+                                sc.spawn(move || -> Result<Vec<(String, Leaf)>> {
+                                    let mut out = Vec::with_capacity(c.len());
+                                    for (e, n, h) in c {
+                                        let name: anybytes::View<str> = reader
+                                            .get(*n)
+                                            .map_err(|err| anyhow::anyhow!("name blob: {err:?}"))?;
+                                        let blob: Blob<Tensor<$ty, $rank>> =
+                                            reader.get(*h).map_err(|err| {
+                                                anyhow::anyhow!("{}: leaf blob: {err:?}", &*name)
+                                            })?;
+                                        let view: TensorView = TensorView::try_from_blob(blob)
+                                            .map_err(|err| {
+                                                anyhow::anyhow!("{}: decode: {err}", &*name)
+                                            })?;
+                                        // The layer is optional in the graph, so it is
+                                        // optional here: an `exists!` rather than a second
+                                        // required clause, which would silently drop the
+                                        // embedding and the head.
+                                        let layer = find!(
+                                            (l: i64),
+                                            pattern!(facts, [{ (*e) @ attrs::layer: ?l }])
+                                        )
+                                        .next()
+                                        .map(|(l,)| l);
+                                        out.push((
+                                            name.to_string(),
+                                            Leaf {
+                                                elem: $tag,
+                                                dims: view.dims().to_vec(),
+                                                bytes: view.payload().clone(),
+                                                layer,
+                                            },
+                                        ));
+                                    }
+                                    Ok(out)
+                                })
+                            })
+                            .collect();
+                        handles.into_iter().map(|h| h.join().unwrap()).collect()
+                    });
+                    for part in parts {
+                        for (name, leaf) in part? {
+                            dense.insert(name, leaf);
+                        }
                     }
-                    let name: anybytes::View<str> = reader
-                        .get(n)
-                        .map_err(|err| anyhow::anyhow!("name blob: {err:?}"))?;
-                    let blob: Blob<Tensor<$ty, $rank>> = reader
-                        .get(h)
-                        .map_err(|err| anyhow::anyhow!("{}: leaf blob: {err:?}", &*name))?;
-                    let view: TensorView = TensorView::try_from_blob(blob)
-                        .map_err(|err| anyhow::anyhow!("{}: decode: {err}", &*name))?;
-                    // The layer is optional in the graph, so it is optional
-                    // here: an `exists!` rather than a second required clause,
-                    // which would silently drop the embedding and the head.
-                    let layer = find!(
-                        (l: i64),
-                        pattern!(&facts, [{ (e) @ attrs::layer: ?l }])
-                    )
-                    .next()
-                    .map(|(l,)| l);
-                    dense.insert(
-                        name.to_string(),
-                        Leaf {
-                            elem: $tag,
-                            dims: view.dims().to_vec(),
-                            bytes: view.payload().clone(),
-                            layer,
-                        },
-                    );
                 }
             }};
         }
@@ -587,7 +804,14 @@ impl PileSource {
         sweep_dense!(F32, 4, Elem::F32);
 
         anyhow::ensure!(!dense.is_empty(), "{path:?}: no dense leaves on {branch:?}");
+        println!(
+            "    index build: pile open + checkout {open_secs:.1}s, {} expert handles {experts_secs:.1}s, {} dense leaves {:.1}s",
+            experts.len(),
+            dense.len(),
+            t_dense.elapsed().as_secs_f64(),
+        );
         Ok(PileSource {
+            path: path.to_path_buf(),
             reader,
             facts,
             dense,
@@ -825,6 +1049,31 @@ impl PileSource {
     /// one anonymous allocation. The GPU may safely alias this allocation:
     /// anonymous pages have no backing store the kernel can silently re-read
     /// them from, so they cannot be reclaimed while this process owns them.
+    ///
+    /// # One pass, not two, and why that is a memory question
+    ///
+    /// This used to be a sequential `fetch+verify` loop that read and BLAKE3'd
+    /// every leaf, followed by a threaded `memcpy` loop that copied what the
+    /// first loop had faulted in. On a discrete-memory box that is merely two
+    /// loops; on a unified-memory one it is the whole problem. Between the two
+    /// loops the process holds the share TWICE — once as the pile's mapped page
+    /// cache, once as the anonymous arena — and this node's share is 80.72 GiB
+    /// against 119-121 GiB of RAM that the GPU also lives in. Measured at
+    /// `INK_LAYERS=0:20`: 117.4 GiB resident, 0.7 GiB free, and the entire
+    /// 16 GiB swap consumed, because the kernel chose to page out the arena we
+    /// had just written rather than evict the mapped file pages we were done
+    /// with. The second loop then ran at 3.0 GiB/s instead of 50 — it was
+    /// re-reading its own source off the SSD — and on a box with 2 GiB less
+    /// (spark has 119.6 GiB to spark2's 121.6) the CUDA context that comes
+    /// afterwards could not be created at all.
+    ///
+    /// So: the shapes are probed ONCE PER STACKED MATRIX rather than once per
+    /// expert (every expert of one stack is the same matrix, and the copy
+    /// asserts that), the layout is computed from those, the arena is allocated
+    /// zeroed-by-the-kernel rather than written with 80 GiB of zeros nobody
+    /// reads, and then one threaded pass fetches, verifies, copies and releases
+    /// each leaf's source pages. Peak residency becomes the arena plus a
+    /// working window instead of the arena plus the whole share.
     pub fn copy_share(
         &mut self,
         layers: std::ops::Range<usize>,
@@ -832,55 +1081,63 @@ impl PileSource {
     ) -> Result<(usize, usize, u64)> {
         anyhow::ensure!(self.copied.is_none(), "the weight share was already copied");
 
-        struct Pending {
-            key: (String, i64),
-            bytes: anybytes::Bytes,
+        /// The shape every expert of one stacked matrix has.
+        #[derive(Clone, Copy)]
+        struct Shape {
             rows: usize,
             logical: usize,
             nvfp4: bool,
+            payload: usize,
         }
 
         let keys = self.expert_keys_in(layers.clone());
-        let mut pending = Vec::with_capacity(keys.len());
-        let mut total = 0usize;
-        // The copy has two halves and they are NOT the same kind of work: this
-        // loop asks the store for each blob (which is where the BLAKE3 over the
-        // payload is paid) and the loop further down memcpys the bytes into the
-        // arena. One timer over both said "48.5s" and could not say which half
-        // to attack, so each half has its own now.
-        let t_fetch = std::time::Instant::now();
-        for key in keys {
-            let r = &self.experts[&key];
-            let (bytes, rows, logical, nvfp4) = match r.handle {
+
+        // One probe per stacked matrix, not per expert. A stack is 256 slices
+        // of ONE matrix, so its element format and its dimensions are a
+        // property of the stack; reading all 9 216 headers to discover 40
+        // identical answers is 80 GiB of BLAKE3 paid to learn a layout. The
+        // assumption is not silent: the copy below refuses any leaf whose
+        // payload is not the length this shape implies.
+        let t_probe = std::time::Instant::now();
+        let mut shapes: std::collections::HashMap<String, Shape> = Default::default();
+        for (name, e) in &keys {
+            if shapes.contains_key(name) {
+                continue;
+            }
+            let r = &self.experts[&(name.clone(), *e)];
+            let shape = match r.handle {
                 ExpertHandle::Nvfp4(h) => {
                     let blob: Blob<Tensor<NVFP4, 2>> = self
                         .reader
                         .get(h)
-                        .map_err(|e| anyhow::anyhow!("{}[{}]: {e:?}", key.0, key.1))?;
+                        .map_err(|err| anyhow::anyhow!("{name}[{e}]: {err:?}"))?;
                     let view = TensorView::try_from_blob(blob)
-                        .map_err(|e| anyhow::anyhow!("{}[{}]: decode: {e}", key.0, key.1))?;
-                    (view.payload().clone(), view.dims()[0] as usize, view.dims()[1] as usize, true)
+                        .map_err(|err| anyhow::anyhow!("{name}[{e}]: decode: {err}"))?;
+                    Shape {
+                        rows: view.dims()[0] as usize,
+                        logical: view.dims()[1] as usize,
+                        nvfp4: true,
+                        payload: view.payload().len(),
+                    }
                 }
                 ExpertHandle::Bf16(h) => {
                     let blob: Blob<Tensor<BF16, 2>> = self
                         .reader
                         .get(h)
-                        .map_err(|e| anyhow::anyhow!("{}[{}]: {e:?}", key.0, key.1))?;
+                        .map_err(|err| anyhow::anyhow!("{name}[{e}]: {err:?}"))?;
                     let view = TensorView::try_from_blob(blob)
-                        .map_err(|e| anyhow::anyhow!("{}[{}]: decode: {e}", key.0, key.1))?;
-                    (view.payload().clone(), view.dims()[0] as usize, view.dims()[1] as usize, false)
+                        .map_err(|err| anyhow::anyhow!("{name}[{e}]: decode: {err}"))?;
+                    Shape {
+                        rows: view.dims()[0] as usize,
+                        logical: view.dims()[1] as usize,
+                        nvfp4: false,
+                        payload: view.payload().len(),
+                    }
                 }
             };
-            total = total
-                .checked_add(bytes.len())
-                .context("weight share byte count overflow")?;
-            total = total
-                .checked_add((4 - total % 4) % 4)
-                .context("weight share padding overflow")?;
-            pending.push(Pending { key, bytes, rows, logical, nvfp4 });
+            shapes.insert(name.clone(), shape);
         }
-
-        let fetch_secs = t_fetch.elapsed().as_secs_f64();
+        let probe_secs = t_probe.elapsed().as_secs_f64();
 
         let globals: std::collections::HashSet<&str> = global_dense.iter().copied().collect();
         for name in &globals {
@@ -899,12 +1156,32 @@ impl PileSource {
             .map(|(name, _)| name.clone())
             .collect();
         dense_names.sort();
-        for name in &dense_names {
-            total = total.checked_add(self.dense[name].bytes.len())
+
+        // The DESTINATION of every leaf, computed before anything is read.
+        // Disjoint destinations are what let the pass below be threaded; the
+        // layout is byte-for-byte the one the old sequential loop produced —
+        // experts in `expert_keys_in` order, then dense leaves by name, each
+        // padded to a 4-byte boundary.
+        let mut cursor = 0usize;
+        let mut expert_offsets = Vec::with_capacity(keys.len());
+        for (name, _) in &keys {
+            let start = cursor;
+            let end = start
+                .checked_add(shapes[name].payload)
                 .context("weight share byte count overflow")?;
-            total = total.checked_add((4 - total % 4) % 4)
-                .context("weight share padding overflow")?;
+            cursor = end + (4 - end % 4) % 4;
+            expert_offsets.push((start, end));
         }
+        let mut dense_offsets = Vec::with_capacity(dense_names.len());
+        for name in &dense_names {
+            let start = cursor;
+            let end = start
+                .checked_add(self.dense[name].bytes.len())
+                .context("weight share byte count overflow")?;
+            cursor = end + (4 - end % 4) % 4;
+            dense_offsets.push((start, end));
+        }
+        let total = cursor;
 
         let available = mem_available_bytes()?;
         anyhow::ensure!(
@@ -914,116 +1191,192 @@ impl PileSource {
             available as f64 / (1u64 << 30) as f64,
         );
 
-        let mut arena = Vec::new();
-        arena.try_reserve_exact(total).map_err(|e| anyhow::anyhow!(
-            "cannot allocate {:.2} GiB for this node's startup weight copy: {e}",
-            total as f64 / (1u64 << 30) as f64,
-        ))?;
-        // The DESTINATION of every leaf, computed before anything is written.
-        //
-        // This used to be `extend_from_slice` in a loop, which is the same
-        // arithmetic done implicitly by `Vec::len` -- and doing it implicitly is
-        // what forced the copy to be sequential: each leaf's offset was only
-        // known once the leaf before it had been written. Naming the offsets up
-        // front makes the writes disjoint, and disjoint writes can be split
-        // across threads. The layout is byte-for-byte the one the sequential
-        // loop produced: same order, same 4-byte alignment padding, same total.
-        let mut cursor = 0usize;
-        let mut expert_offsets = Vec::with_capacity(pending.len());
-        for p in &pending {
-            let start = cursor;
-            let end = start + p.bytes.len();
-            cursor = end + (4 - end % 4) % 4;
-            expert_offsets.push((start, end));
-        }
-        let mut dense_offsets = Vec::with_capacity(dense_names.len());
-        for name in &dense_names {
-            let start = cursor;
-            let end = start + self.dense[name].bytes.len();
-            cursor = end + (4 - end % 4) % 4;
-            dense_offsets.push((start, end));
-        }
-        anyhow::ensure!(cursor == total, "startup copy sized {total} bytes but laid out {cursor}");
-        arena.resize(total, 0);
+        // Zeroed by the KERNEL, not by us. `Vec::resize(total, 0)` wrote 80.72
+        // GiB of zeros that the copy immediately overwrote — 25 s of pure waste
+        // whose real cost was not the time but the residency: it faulted the
+        // whole arena in before a single weight had been copied, which is what
+        // forced the source page cache out to make room. `alloc_zeroed` is
+        // `calloc`, and for an allocation this size glibc hands back a fresh
+        // anonymous mapping whose pages are already zero and not yet resident,
+        // so each page arrives exactly once, when the copy writes it.
+        let arena: Vec<u8> = {
+            let layout = std::alloc::Layout::from_size_align(total, 1)
+                .map_err(|e| anyhow::anyhow!("startup-copy layout for {total} bytes: {e}"))?;
+            // SAFETY: `total > 0` (the share always has leaves), the layout is
+            // the one `Vec<u8>` itself uses (align 1), and the pointer is
+            // handed to exactly one `Vec` which owns and frees it.
+            let p = unsafe { std::alloc::alloc_zeroed(layout) };
+            anyhow::ensure!(
+                !p.is_null(),
+                "cannot allocate {:.2} GiB for this node's startup weight copy",
+                total as f64 / (1u64 << 30) as f64,
+            );
+            unsafe { Vec::from_raw_parts(p, total, total) }
+        };
+        let mut arena = arena;
 
-        // How many threads memcpy. `INK_COPY_THREADS=1` is the sequential lane
-        // this replaced, kept selectable so the two can be run back to back out
-        // of ONE binary; anything else is a thread count, and unset means one
-        // per available core capped at 16 (past that the copy is bound by
-        // memory bandwidth, not by cores).
+        // How many threads fetch, verify and copy. Unset means one per core.
+        // `INK_COPY_THREADS=1` is the sequential lane this replaced, kept
+        // selectable so the two can be run back to back out of ONE binary.
         let threads: usize = std::env::var("INK_COPY_THREADS")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|n| *n >= 1)
             .unwrap_or_else(|| {
-                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(16)
+                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
             });
+
+        enum Job<'a> {
+            Expert(&'a (String, i64), Shape),
+            Dense(&'a str),
+        }
+        let mut jobs: Vec<(usize, usize, Job)> = Vec::with_capacity(keys.len() + dense_names.len());
+        for (k, &(start, end)) in keys.iter().zip(expert_offsets.iter()) {
+            jobs.push((start, end, Job::Expert(k, shapes[&k.0])));
+        }
+        for (name, &(start, end)) in dense_names.iter().zip(dense_offsets.iter()) {
+            jobs.push((start, end, Job::Dense(name.as_str())));
+        }
+
+        // Split by BYTES, not by leaf count: the leaves are not the same size
+        // (a dense leaf is 537 MB and an expert plane is 14 MB), so an even
+        // split of the list is an uneven split of the work.
+        let per = total.div_ceil(threads);
+        let mut bounds: Vec<usize> = Vec::with_capacity(threads + 1);
+        let mut j = 0usize;
+        bounds.push(0);
+        for t in 1..threads {
+            let target = per * t;
+            while j < jobs.len() && jobs[j].0 < target {
+                j += 1;
+            }
+            bounds.push(j);
+        }
+        bounds.push(jobs.len());
+
+        let mut rest: &mut [u8] = arena.as_mut_slice();
+        let mut shards: Vec<(&mut [u8], usize, &[(usize, usize, Job)])> = Vec::new();
+        let mut base = 0usize;
+        for w in bounds.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let span_end = if b == jobs.len() { total } else { jobs[b].0 };
+            let (head, tail) = rest.split_at_mut(span_end - base);
+            shards.push((head, base, &jobs[a..b]));
+            rest = tail;
+            base = span_end;
+        }
+
+        let (map_base, map_len, _keep) = {
+            let m = self.mappings()?;
+            let (b, l, k) = m.into_iter().next().context("the pile has no mapping")?;
+            (b, l, k)
+        };
+        let release = SourceRelease::new(&self.path, map_base, map_len);
+        let release = &release;
+        let reader = &self.reader;
+        let experts = &self.experts;
+        let dense = &self.dense;
         let t_copy = std::time::Instant::now();
-        {
-            // One `&mut [u8]` per thread over a DISJOINT span of the arena, and
-            // the leaves assigned to that span. `chunks_mut` is what makes the
-            // aliasing argument the compiler's rather than mine.
-            let mut jobs: Vec<(usize, usize, &[u8])> = Vec::with_capacity(pending.len() + dense_names.len());
-            for (p, &(start, end)) in pending.iter().zip(expert_offsets.iter()) {
-                jobs.push((start, end, &p.bytes));
-            }
-            for (name, &(start, end)) in dense_names.iter().zip(dense_offsets.iter()) {
-                jobs.push((start, end, &self.dense[name].bytes));
-            }
-            let dst = arena.as_mut_slice();
-            if threads <= 1 {
-                for (start, end, src) in &jobs {
-                    dst[*start..*end].copy_from_slice(src);
-                }
-            } else {
-                // Split by BYTES, not by leaf count: the leaves are not the same
-                // size (a dense leaf is 537 MB and an expert plane is 14 MB), so
-                // an even split of the list is an uneven split of the work.
-                let per = total.div_ceil(threads);
-                let mut bounds: Vec<usize> = Vec::with_capacity(threads + 1);
-                let mut j = 0usize;
-                bounds.push(0);
-                for t in 1..threads {
-                    let target = per * t;
-                    while j < jobs.len() && jobs[j].0 < target {
-                        j += 1;
-                    }
-                    bounds.push(j);
-                }
-                bounds.push(jobs.len());
-                // Each shard's arena span runs from its first job's start to its
-                // last job's padded end, so the spans tile the arena exactly.
-                let mut rest = dst;
-                let mut shards: Vec<(&mut [u8], usize, &[(usize, usize, &[u8])])> = Vec::new();
-                let mut base = 0usize;
-                for w in bounds.windows(2) {
-                    let (a, b) = (w[0], w[1]);
-                    let span_end = if b == jobs.len() { total } else { jobs[b].0 };
-                    let (head, tail) = rest.split_at_mut(span_end - base);
-                    shards.push((head, base, &jobs[a..b]));
-                    rest = tail;
-                    base = span_end;
-                }
-                std::thread::scope(|sc| {
-                    for (buf, base, mine) in shards {
-                        sc.spawn(move || {
-                            for (start, end, src) in mine {
-                                buf[start - base..end - base].copy_from_slice(src);
-                            }
-                        });
-                    }
-                });
-            }
+        let results: Vec<Result<()>> = std::thread::scope(|sc| {
+            let handles: Vec<_> = shards
+                .into_iter()
+                .map(|(buf, base, mine)| {
+                    sc.spawn(move || -> Result<()> {
+                        for (start, end, job) in mine {
+                            let src: Bytes = match job {
+                                Job::Expert(k, shape) => {
+                                    let r = &experts[*k];
+                                    let payload = match r.handle {
+                                        ExpertHandle::Nvfp4(h) => {
+                                            let blob: Blob<Tensor<NVFP4, 2>> =
+                                                reader.get(h).map_err(|err| {
+                                                    anyhow::anyhow!("{}[{}]: {err:?}", k.0, k.1)
+                                                })?;
+                                            let view = TensorView::try_from_blob(blob).map_err(
+                                                |err| {
+                                                    anyhow::anyhow!(
+                                                        "{}[{}]: decode: {err}",
+                                                        k.0,
+                                                        k.1
+                                                    )
+                                                },
+                                            )?;
+                                            anyhow::ensure!(
+                                                shape.nvfp4
+                                                    && view.dims()[0] as usize == shape.rows
+                                                    && view.dims()[1] as usize == shape.logical,
+                                                "{}[{}] is {:?}, but its stack is {}x{}",
+                                                k.0,
+                                                k.1,
+                                                view.dims(),
+                                                shape.rows,
+                                                shape.logical,
+                                            );
+                                            view.payload().clone()
+                                        }
+                                        ExpertHandle::Bf16(h) => {
+                                            let blob: Blob<Tensor<BF16, 2>> =
+                                                reader.get(h).map_err(|err| {
+                                                    anyhow::anyhow!("{}[{}]: {err:?}", k.0, k.1)
+                                                })?;
+                                            let view = TensorView::try_from_blob(blob).map_err(
+                                                |err| {
+                                                    anyhow::anyhow!(
+                                                        "{}[{}]: decode: {err}",
+                                                        k.0,
+                                                        k.1
+                                                    )
+                                                },
+                                            )?;
+                                            anyhow::ensure!(
+                                                !shape.nvfp4
+                                                    && view.dims()[0] as usize == shape.rows
+                                                    && view.dims()[1] as usize == shape.logical,
+                                                "{}[{}] is {:?}, but its stack is {}x{}",
+                                                k.0,
+                                                k.1,
+                                                view.dims(),
+                                                shape.rows,
+                                                shape.logical,
+                                            );
+                                            view.payload().clone()
+                                        }
+                                    };
+                                    anyhow::ensure!(
+                                        payload.len() == end - start,
+                                        "{}[{}] is {} bytes where its stack implies {}",
+                                        k.0,
+                                        k.1,
+                                        payload.len(),
+                                        end - start,
+                                    );
+                                    payload
+                                }
+                                Job::Dense(name) => dense[*name].bytes.clone(),
+                            };
+                            buf[start - base..end - base].copy_from_slice(&src);
+                            release.release(&src);
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for r in results {
+            r?;
         }
         let copy_secs = t_copy.elapsed().as_secs_f64();
         println!(
-            "    startup copy: fetch+verify {:.1}s ({:.2} GiB/s), memcpy {:.1}s ({:.2} GiB/s, {threads} thread{})",
-            fetch_secs,
-            total as f64 / (1u64 << 30) as f64 / fetch_secs.max(1e-9),
+            "    startup copy: {} shape probe{} {:.1}s, fetch+verify+copy {:.1}s ({:.2} GiB/s, {threads} thread{})",
+            shapes.len(),
+            if shapes.len() == 1 { "" } else { "s" },
+            probe_secs,
             copy_secs,
             total as f64 / (1u64 << 30) as f64 / copy_secs.max(1e-9),
             if threads == 1 { "" } else { "s" },
         );
+        println!("{}", mem_line("after fetch+verify+copy"));
 
         // `Bytes` owns the allocator's Vec; `View` proves and retains the new
         // anonymous backing before subviews replace every mmap-backed payload.
@@ -1033,12 +1386,16 @@ impl PileSource {
             .view()
             .map_err(|e| anyhow::anyhow!("viewing the anonymous weight allocation: {e}"))?;
         let bytes = view.bytes();
-        for (p, (start, end)) in pending.into_iter().zip(expert_offsets) {
-            self.copied_experts.insert(p.key, CopiedExpert {
+        for ((key, shape), (start, end)) in keys
+            .iter()
+            .map(|k| (k, shapes[&k.0]))
+            .zip(expert_offsets)
+        {
+            self.copied_experts.insert(key.clone(), CopiedExpert {
                 payload: bytes.slice(start..end),
-                rows: p.rows,
-                logical: p.logical,
-                nvfp4: p.nvfp4,
+                rows: shape.rows,
+                logical: shape.logical,
+                nvfp4: shape.nvfp4,
             });
         }
         for (name, (start, end)) in dense_names.iter().zip(dense_offsets) {

@@ -1545,6 +1545,7 @@ fn main() -> Result<()> {
     // granularity a layer split can partition and a deduplicating store can
     // address.
     println!("  {}", cp.inventory());
+    println!("{}", mary::models::inkling::pile::mem_line("index built"));
 
     // How many tokens to generate past the prompt. 0 reproduces the original
     // single-forward behaviour exactly.
@@ -1848,6 +1849,7 @@ fn main() -> Result<()> {
     let fp4_client = mary::models::inkling::seam::client_of(
         &BT::<Bk, 2>::zeros([1, 1], &dev),
     );
+    println!("{}", mary::models::inkling::pile::mem_line("after CUDA context"));
     // Nine blocking device round trips for the whole run, instead of four per
     // expert. Every later slab is an offset view of one of these.
     //
