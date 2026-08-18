@@ -119,8 +119,10 @@ impl<B: Backend> Talker<B> {
             .unwrap()
     }
 
-    /// Codebook-0 logits from a read-back hidden state (CPU gemv,
-    /// row-split across the pool — [3072×2048] is bit-exactness-verified).
+    /// Codebook-0 logits from a read-back hidden state (CPU gemv, row-split
+    /// across the pool — [3072×2048], and a row split reassociates nothing, so
+    /// the serial bytes come back unchanged). That property is a consequence of
+    /// the split axis, not an admission condition: see `cpu::sgemv_mt`.
     pub fn logits_from(&self, hidden: &[f32]) -> Vec<f32> {
         let mut y = vec![0f32; CODEC_VOCAB];
         super::cpu::sgemv_mt(&self.codec_head, CODEC_VOCAB, self.hidden, hidden, &mut y);

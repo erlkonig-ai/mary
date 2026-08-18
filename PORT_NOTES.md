@@ -436,6 +436,16 @@ behind generation. Prefill submit 80–460 ms/pass + frame-0 JIT drain ~45 ms.
 
 ### Phase 2a — row-parallel predictor gemvs (`cpu::sgemv_mt`)
 
+> **Correction, 2026-08-18.** "Bit-exactness first" is retired as a design
+> priority (JP: kill the bit-perfection rule; it is dead against a previous
+> implementation *and* run-to-run — wiki:f5dcc88988bb28e472e50fa030332adb). The
+> row-block result below stands and is worth keeping, but read it as a
+> *consequence* of splitting along the row axis — which reassociates nothing —
+> not as the admission test. In particular the `down` exclusion at the end of
+> this paragraph is no longer a correctness argument: a column-blocked
+> reduction is the better-conditioned one, so refusing it to preserve the
+> serial lane's bytes preserved the worse numerics. Reopen it on measurement.
+
 Bit-exactness first: a row-block `cblas_sgemv` computes each row identically
 to the full-matrix call — verified standalone for every routed shape
 (qkv [4096×1024], o/proj [1024×2048], gate_up [6144×1024], lm_head
@@ -1259,8 +1269,12 @@ exact f32 leaves.
   change): the ordinary-loader raw talker and the folded-alias raw talker
   produce BYTE-IDENTICAL hidden states over a 154-token prefill + 32
   teacher-forced decode steps — compared across two separate processes, so
-  this simultaneously proves the raw backend's run-to-run determinism for
-  this graph (fixed kernel selection, no autotune jitter at these shapes).
+  this simultaneously observed the raw backend reproducing itself for this
+  graph (fixed kernel selection, no autotune jitter at these shapes).
+  *(2026-08-18: that observation is a diagnostic, not a property the lane owes
+  anyone. Run-to-run determinism is not a gate — wiki:f5dcc88988bb28e472e50fa030332adb.
+  The gate this bullet describes is a LOAD-PATH gate, and bit equality is right
+  there because neither lane computes anything the other does not.)*
   Codebook-0 argmax streams identical. The zero-copy load cannot change
   the voice relative to the raw lane.
 - Cross-backend identity (raw vs fused) is NOT bit-level and cannot be:
@@ -1668,7 +1682,10 @@ removed the last reason to keep it.
   at 5d93a95). The gate now proves raw-fold ≡ folded-alias (weights sha,
   bit-exact hidden, identical argmax) across separate processes; the E2E
   determinism gate rides `speak_check` (seeded render twice,
-  byte-identical wav).
+  byte-identical wav). *(2026-08-18: the E2E "determinism gate" is
+  downgraded to a tripwire — a differing wav is something to look at, not a
+  failure. See wiki:f5dcc88988bb28e472e50fa030332adb. The load-path gate above
+  is unaffected.)*
 
 **Verified shared — kept:**
 - `BFused`/`BFusedHalf` backend types: the codec decode loop
