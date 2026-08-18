@@ -1132,7 +1132,7 @@ fn grouped_experts_fp4(
 
     let t_c = Instant::now();
     let acc_h = scatter_weighted(
-        client, &y_h, &h_rowwgt, &h_tokrows, &h_tokcnt, m_total, n, h, plan.kmax,
+        client, &y_h, &h_rowwgt, &h_tokrows, &h_tokcnt, &h_rowtok, m_total, n, h, plan.kmax,
     );
     let acc = tensor_of(client.clone(), dev.clone(), acc_h, n, h);
     host.accum += t_c.elapsed().as_secs_f64();
@@ -1375,7 +1375,7 @@ fn grouped_experts_bf16(
 
     let t_c = Instant::now();
     let acc_h = scatter_weighted(
-        client, &y_h, &h_rowwgt, &h_tokrows, &h_tokcnt, m_total, n, h, plan.kmax,
+        client, &y_h, &h_rowwgt, &h_tokrows, &h_tokcnt, &h_rowtok, m_total, n, h, plan.kmax,
     );
     let acc = tensor_of(client.clone(), dev.clone(), acc_h, n, h);
     host.accum += t_c.elapsed().as_secs_f64();
