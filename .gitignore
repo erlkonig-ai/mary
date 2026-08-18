@@ -11,3 +11,4 @@
 golden/voxtral/deep_*.npy
 # voxtral clip fixtures: regenerate locally from any TTS (see docs/VOXTRAL_ARCH.md)
 golden/voxtral/clips/
+/model-migration/target

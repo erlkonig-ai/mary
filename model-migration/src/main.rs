@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::Parser;
-use mary::model_migration::{migrate_legacy_model_main, LegacyModelMigration};
+use mary_model_migration::{migrate_legacy_model_main, LegacyModelMigration};
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::signing_key_file;
 

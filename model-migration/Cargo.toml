@@ -1,0 +1,80 @@
+[package]
+name = "mary-model-migration"
+version = "0.1.0"
+edition = "2021"
+description = "One-way, strictly additive migration of Mary's legacy Repository model piles into the native model collection. Split out of the mary library because it is a bridge across the Repository -> Collection cutover: it has to keep speaking the legacy API, and the library does not."
+license = "MIT OR Apache-2.0"
+
+# Deliberately its OWN workspace root, not a member of anything in ../. That is
+# the whole point of the split: a workspace shares one lockfile and one
+# `[patch.crates-io]` table, so a member could never pin a different
+# triblespace than mary. Standing alone, this crate can — once Repository and
+# PinStore are removed from triblespace's main line, the pins below move to an
+# older checkout here and legacy piles stay migratable, with no drag on the
+# library. Nothing is pinned back yet; the ability just is not foreclosed.
+[workspace]
+
+[dependencies]
+# mary supplies the model-graph schema this migration projects INTO: the
+# canonical attributes (format::attrs), the legacy-alias projection and the
+# native publish/snapshot seam (model_collection), and the exact selectors
+# (selection). The dependency points one way only — mary knows nothing of this
+# crate.
+mary = { path = ".." }
+triblespace = { version = "0.47.0", path = "../../triblespace-rs", default-features = false }
+anybytes = "0.20"
+anyhow = "1"
+# A migration signs the native commit it publishes, so the key type is not
+# optional here the way it is for a pure reader.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# This crate IS the control-plane command, so clap is unconditional rather than
+# behind the `model-migration-cli` feature mary used to carry.
+clap = { version = "4", features = ["derive"] }
+
+[[bin]]
+name = "mary-model-migrate"
+path = "src/main.rs"
+
+# Mirrors mary's patch table, because patches only apply from the workspace
+# root of the build being run and this crate is now its own root. Paths gain
+# one `../` for the extra directory level. Keep in sync with ../Cargo.toml
+# until this crate deliberately diverges onto an older lineage.
+[patch.crates-io]
+
+# burn, forked for a matmul defect: launch_matmul bound the non-quantized
+# rhs with the LHS dtype, so mixed-dtype matmul silently returned about half
+# the correct value (f32 x BF16) or NaN (BF16 x f32). See
+# ../../burn-fork branch fix/matmul-rhs-dtype. All members are patched together
+# because the burn workspace uses path+version deps: patching a subset yields
+# two copies of burn-tensor in one binary.
+burn = { path = "../../burn-fork/crates/burn" }
+burn-autodiff = { path = "../../burn-fork/crates/burn-autodiff" }
+burn-backend = { path = "../../burn-fork/crates/burn-backend" }
+burn-core = { path = "../../burn-fork/crates/burn-core" }
+burn-cubecl = { path = "../../burn-fork/crates/burn-cubecl" }
+burn-cubecl-fusion = { path = "../../burn-fork/crates/burn-cubecl-fusion" }
+burn-cuda = { path = "../../burn-fork/crates/burn-cuda" }
+burn-dataset = { path = "../../burn-fork/crates/burn-dataset" }
+burn-derive = { path = "../../burn-fork/crates/burn-derive" }
+burn-dispatch = { path = "../../burn-fork/crates/burn-dispatch" }
+burn-flex = { path = "../../burn-fork/crates/burn-flex" }
+burn-fusion = { path = "../../burn-fork/crates/burn-fusion" }
+burn-ir = { path = "../../burn-fork/crates/burn-ir" }
+burn-ndarray = { path = "../../burn-fork/crates/burn-ndarray" }
+burn-nn = { path = "../../burn-fork/crates/burn-nn" }
+burn-optim = { path = "../../burn-fork/crates/burn-optim" }
+burn-rl = { path = "../../burn-fork/crates/burn-rl" }
+burn-std = { path = "../../burn-fork/crates/burn-std" }
+burn-tensor = { path = "../../burn-fork/crates/burn-tensor" }
+burn-train = { path = "../../burn-fork/crates/burn-train" }
+burn-vision = { path = "../../burn-fork/crates/burn-vision" }
+burn-wgpu = { path = "../../burn-fork/crates/burn-wgpu" }
+# Forked to add a zero-copy "register an externally-created GPU buffer as a
+# tensor handle" seam (mmap'd f16 pile pages -> Metal newBufferWithBytesNoCopy ->
+# wgpu buffer -> cubecl handle). Unmodified baseline first; patched below.
+cubecl-runtime = { path = "../../cubecl-fork/cubecl-runtime" }
+cubecl-cuda = { path = "../../cubecl-fork/cubecl-cuda" }
+cubecl-wgpu = { path = "../../cubecl-fork/cubecl-wgpu" }
+# Local triblespace-core: V3 uniform 256-byte headers — every record 256-aligned,
+# so mmap'd blobs sit at GPU-ready offsets for zero-copy aliasing (cat-merge safe).
+triblespace-core = { path = "../../triblespace-rs/triblespace-core" }

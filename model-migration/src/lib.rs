@@ -7,9 +7,20 @@
 //! root, and publishes the resulting union as one native model-collection
 //! commit. It never pushes, creates, deletes, or otherwise advances a branch.
 //!
-//! Storage policy stays with the caller: this module takes an already-open
+//! Storage policy stays with the caller: this crate takes an already-open
 //! [`Pile`], never reopens it, and neither flushes nor closes it. The caller
 //! supplies the signing key and chooses the explicit durability boundary.
+//!
+//! # Why this is a crate and not a `mary` module
+//!
+//! The migration is a bridge across the `Repository` -> `Collection` cutover,
+//! so it is the one place that must still speak the legacy `Repository` API.
+//! `mary` itself is past that cutover. Living outside the library — a separate
+//! package with its own lockfile and its own `[patch.crates-io]` table, not a
+//! workspace member sharing mary's — is what lets this crate later pin an
+//! older `triblespace` (and an older `mary`) once `Repository`/`PinStore` are
+//! dropped from the main line, so legacy piles stay migratable without the
+//! library carrying a shape that exists only for them.
 
 use anyhow::{anyhow, bail, Context};
 use ed25519_dalek::SigningKey;
@@ -20,9 +31,9 @@ use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::inlineencodings::{Handle, ShortString};
 use triblespace::prelude::*;
 
-use crate::format::attrs;
-use crate::model_collection::{project_legacy_model_attributes, publish_model_fragment};
-use crate::selection::{
+use mary::format::attrs;
+use mary::model_collection::{project_legacy_model_attributes, publish_model_fragment};
+use mary::selection::{
     select_model_root, select_tokenizer_root, ModelSelector, TokenizerSelector,
 };
 
@@ -264,7 +275,7 @@ mod tests {
     use triblespace::core::repo::pile::PileReader;
 
     use super::*;
-    use crate::model_collection::snapshot_model_collection_exact;
+    use mary::model_collection::snapshot_model_collection_exact;
 
     static NEXT_TEMP_PILE: AtomicU64 = AtomicU64::new(0);
     const LEGACY_MODEL_NAME: &str = "legacy-weights.safetensors";
@@ -324,7 +335,7 @@ mod tests {
     }
 
     fn historical_attribute(label: &str) -> Id {
-        crate::model_collection::legacy_model_attribute_aliases()
+        mary::model_collection::legacy_model_attribute_aliases()
             .into_iter()
             .find(|alias| alias.label == label)
             .unwrap_or_else(|| panic!("missing legacy alias {label}"))
@@ -332,7 +343,7 @@ mod tests {
     }
 
     fn replace_canonical_attributes_with_historical(facts: &TribleSet) -> TribleSet {
-        let reverse: HashMap<Id, Id> = crate::model_collection::legacy_model_attribute_aliases()
+        let reverse: HashMap<Id, Id> = mary::model_collection::legacy_model_attribute_aliases()
             .into_iter()
             .map(|alias| (alias.canonical, alias.historical))
             .collect();
@@ -348,7 +359,7 @@ mod tests {
     fn legacy_fixture(label: &str, duplicate_model_name: bool) -> LegacyFixture {
         let pile = TempPilePath::new(label);
         let mut blobs = MemoryBlobStore::new();
-        let tokenizer = crate::tokenizer::save_tokenizer_json(
+        let tokenizer = mary::tokenizer::save_tokenizer_json(
             br###"{
                 "model": {
                     "type": "WordPiece",

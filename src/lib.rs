@@ -27,10 +27,6 @@ pub mod jsonfacts;
 /// runtime readers continue to use the canonical schemas in [`format`] and
 /// [`tokenizer`] directly.
 pub mod model_collection;
-/// One-way migration of a frozen legacy Repository `main` snapshot into
-/// Mary's native model collection. The migration is strictly additive and
-/// leaves the legacy branch as read-only evidence.
-pub mod model_migration;
 /// tiktoken-style byte-level BPE (Kimi-K3): the rank table IS the merge order,
 /// so there is no merges list — the engine half of what [`tokenizer`]'s
 /// `ty::TIKTOKEN` stores as facts. Gated id-for-id against the shipped
