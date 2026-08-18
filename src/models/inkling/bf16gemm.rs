@@ -259,11 +259,22 @@ pub struct Bf16W {
     /// Load-bearing, not bookkeeping. The tuned lane picks its load width from
     /// the SHAPE and never from the pointer, so a `[4096, 4096]` operand gets
     /// 16-byte loads at whatever address it sits at — and this runtime's
-    /// weights are ALIASED out of the pile mapping, which only promises 4 (the
-    /// checkpoint packs tensors back to back). A 4-aligned weight on a 16-byte
+    /// weights are ALIASED out of an arena that only promises 4. A 4-aligned
+    /// weight on a 16-byte
     /// load is `CUDA_ERROR_MISALIGNED_ADDRESS`, an async fault that takes the
     /// server down with it, so the alignment has to be known BEFORE the launch
     /// and it is only knowable at the bind.
+    ///
+    /// **Where the 4 comes from, measured.** Not the pile: with
+    /// `INK_STARTUP_COPY=0`, which aliases the mmap directly, all 71 weights of
+    /// an 8-layer node are 16-aligned and so are all 178/199 of a 20/22-layer
+    /// split. The misalignment is created by the startup weight copy, which
+    /// packs its views back to back with `cursor = end + (4 - end % 4) % 4`
+    /// (`pile::…`, twice, plus the same expression sizing the arena). Sixteen
+    /// there instead of four costs at most 15 bytes per view — about 18 KB
+    /// across the whole share — and it is worth 442.7 -> 327.5 ms on a
+    /// 512-token prefill, which is what `INK_ALIGN_COPY=1` currently buys for
+    /// 908 MiB of duplicated weight instead.
     pub align: usize,
 }
 
@@ -602,7 +613,12 @@ pub const MIN_TUNED_ALIGN: usize = 16;
 /// HID `m = 1` from the gemv routines: they decline m=16, so the padding was
 /// the reason the fastest decode kernel on this box was never reachable.
 pub fn rows_for(align: usize, m: usize) -> usize {
-    if align >= MIN_TUNED_ALIGN {
+    // `INK_GEMM=hand mma` is an A/B arm and it has to get its padding, or the
+    // one thing it exists to be compared against cannot run. Asking
+    // [`forced_lane`] here rather than assuming is the same discipline the
+    // alignment check is: the padding is the LANE's requirement, so the lane
+    // decides it.
+    if align >= MIN_TUNED_ALIGN && forced_lane() != Some(Lane::Hand) {
         m
     } else {
         m.div_ceil(MTILE) * MTILE
