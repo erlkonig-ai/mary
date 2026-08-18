@@ -899,15 +899,23 @@ fn routed_experts_fp4(
     per_expert_fp4(src, aliases, client, dev, prefix, by_expert, hn, n, h, inter, host)
 }
 
-/// What the two lanes disagree about, in the only terms that settle it.
+/// Where the two lanes' accumulators differ, and by how much.
 ///
-/// Not a tolerance check. It counts how many of the accumulator's elements
-/// differ AT ALL -- compared as BITS, so a `-0.0` against a `0.0` is a
-/// difference and a NaN is not silently equal to itself -- and reports the
-/// largest absolute and relative gap and where the first one is. A tolerance
-/// would answer "is this close enough", which is not the question the grouped
-/// lane has to pass; the question is whether it is the same number, and when it
-/// is not, which element to go and look at.
+/// A MEASUREMENT, not a verdict, and that distinction is the whole point. The
+/// grouped lane fuses the routing-weight multiply into the accumulating add and
+/// the per-expert lane does not, so the two round in different PLACES and a gap
+/// of order an ulp is EXPECTED here -- see
+/// [`mary::models::inkling::moegroup`], and `91f81b4` for the time this tree
+/// mistook that expectation for a defect and paid a launch to hide it.
+///
+/// What the number is for is the SIZE and SHAPE of the gap. An ulp-scale
+/// difference on a fraction of the elements is the fused multiply. Anything
+/// larger, anything structured, or any difference at all in the routing, the
+/// gather, the operand order or the accumulation order is a real defect --
+/// those are bit-exact and stay that way.
+///
+/// Compared as BITS, so a `-0.0` against a `0.0` counts and a NaN is not
+/// silently equal to itself.
 fn report_ab(prefix: &str, a: &T2, b: &T2, h: usize) {
     let av = down(a.clone());
     let bv = down(b.clone());
@@ -932,7 +940,7 @@ fn report_ab(prefix: &str, a: &T2, b: &T2, h: usize) {
     match first {
         None => println!("  [A/B] {ln}: {} elements, ALL BITS EQUAL", av.len()),
         Some((r, c, x, y)) => println!(
-            "  [A/B] {ln}: {differ} of {} differ, max abs {worst:.3e} rel {worst_rel:.3e},              first row {r} col {c}: grouped {x:.9e} per-expert {y:.9e}",
+            "  [A/B] {ln}: rounding gap on {differ} of {}, max abs {worst:.3e} rel {worst_rel:.3e}, first row {r} col {c}: grouped {x:.9e} per-expert {y:.9e}",
             av.len()
         ),
     }
@@ -975,7 +983,7 @@ fn grouped_experts_fp4(
     use mary::models::inkling::fp4gemm::gate_up_silu_launch;
     use mary::models::inkling::fp4quant::quantize_nvfp4;
     use mary::models::inkling::moegroup::{
-        fp4_linear_grouped_launch, gather_grouped, scale_rows, scatter_rows, RowPlan,
+        fp4_linear_grouped_launch, gather_grouped, scatter_weighted, RowPlan,
     };
     use mary::models::inkling::seam::{handle_of, tensor_of};
 
@@ -1067,10 +1075,9 @@ fn grouped_experts_fp4(
     host.enqueue += t_w.elapsed().as_secs_f64();
 
     let t_c = Instant::now();
-    // The weight lands FIRST, in its own launch, so the product is rounded to
-    // f32 before anything sums it -- see `moegroup`'s note on the FMA.
-    let yw_h = scale_rows(client, &y_h, &h_rowwgt, m_total, h);
-    let acc_h = scatter_rows(client, &yw_h, &h_tokrows, &h_tokcnt, m_total, n, h, plan.kmax);
+    let acc_h = scatter_weighted(
+        client, &y_h, &h_rowwgt, &h_tokrows, &h_tokcnt, m_total, n, h, plan.kmax,
+    );
     let acc = tensor_of(client.clone(), dev.clone(), acc_h, n, h);
     host.accum += t_c.elapsed().as_secs_f64();
 
@@ -1236,7 +1243,7 @@ fn grouped_experts_bf16(
     use mary::models::inkling::bf16gemm::to_bf16_launch;
     use mary::models::inkling::fp4gemm::gate_up_silu_bf16_launch;
     use mary::models::inkling::moegroup::{
-        bf16_linear_grouped_launch, gather_grouped, scale_rows, scatter_rows, RowPlan,
+        bf16_linear_grouped_launch, gather_grouped, scatter_weighted, RowPlan,
     };
     use mary::models::inkling::seam::{handle_of, tensor_of};
 
@@ -1311,8 +1318,9 @@ fn grouped_experts_bf16(
     host.enqueue += t_w.elapsed().as_secs_f64();
 
     let t_c = Instant::now();
-    let yw_h = scale_rows(client, &y_h, &h_rowwgt, m_total, h);
-    let acc_h = scatter_rows(client, &yw_h, &h_tokrows, &h_tokcnt, m_total, n, h, plan.kmax);
+    let acc_h = scatter_weighted(
+        client, &y_h, &h_rowwgt, &h_tokrows, &h_tokcnt, m_total, n, h, plan.kmax,
+    );
     let acc = tensor_of(client.clone(), dev.clone(), acc_h, n, h);
     host.accum += t_c.elapsed().as_secs_f64();
 

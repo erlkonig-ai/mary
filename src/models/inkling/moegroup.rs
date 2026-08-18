@@ -39,21 +39,41 @@
 //! kernel so the order was the enqueue order.
 //!
 //! An atomic scatter would break exactly that and would break it
-//! nondeterministically, so [`scatter_rows`] does not use one. It gives one
+//! nondeterministically, so [`scatter_weighted`] does not use one. It gives one
 //! thread each `(token, column)` and has it walk that token's contributing rows
 //! in ASCENDING row order — and rows are laid out in `BTreeMap` order, so
 //! ascending row order IS ascending expert order.
 //!
-//! The routing weight is applied in a launch of its OWN ([`scale_rows`]) rather
-//! than inside that sum, and the reason is the whole difficulty in miniature.
-//! `sum += y[r] * wgt[r]` is the same two operations the per-expert lane does,
-//! but not the same arithmetic: nvcc contracts a multiply feeding an add into
-//! an FMA, so the product never gets rounded to f32. The lane this replaces
-//! materialises `y * wgt` as a tensor before `select_assign(Add)` reads it, so
-//! there the rounding happens. Fused, the two lanes disagreed on 8-9k of each
-//! layer's 20480 accumulator elements by about an ulp; split, they agree on
-//! every bit. Same operands, same order, same rounding — which is the only
-//! acceptable outcome for a change that is supposed to be about scheduling.
+//! # The weight multiply stays INSIDE the sum
+//!
+//! `sum += y[r] * wgt[r]` contracts to `fma.rn.f32` — NVRTC compiles with
+//! `--fmad=true` — which rounds ONCE per term. The per-expert lane materialises
+//! `y * wgt` as a Burn tensor and only then adds it: `mul.rn.f32` followed by
+//! `add.rn.f32`, TWICE per term. So the two lanes do NOT agree bit for bit
+//! here, and the fused one is the one with strictly fewer roundings.
+//!
+//! This module briefly did the opposite: a `scale_rows` launch whose only
+//! purpose was to force the second rounding, so that the accumulator would
+//! match the per-expert lane's bits. That is the same mistake `91f81b4` had
+//! already found and removed from the short convolution, and its message states
+//! the principle — *bit equality against a previous implementation cannot say
+//! which of two lanes is right, only which one was written first.* It bought a
+//! worse number and an extra launch, in a lane whose entire problem was launch
+//! count.
+//!
+//! There is deliberately no new numerical gate for this. That one rounding
+//! beats two is arithmetic, not an open question; and the magnitude is beneath
+//! the floor that matters here, because these operands come out of FOUR-BIT
+//! weights. `e27384e` measured this runtime disagreeing with ITSELF on
+//! 43/503 = 8.55% of argmax positions between two runs of the same binary,
+//! median |Δ top-1 logit| 0.34. `6854e9b` is why that is the yardstick: the
+//! numerical delta is not the gate, capability is.
+//!
+//! Everything else in this lane IS bit-exact against the per-expert one, and
+//! there bit equality is exactly the right gate — the routing, the expert
+//! selection, the gather, the GEMM operand order and the accumulation ORDER are
+//! not approximations of anything, so a difference in any of them would be a
+//! defect. Only WHERE the two lanes round is exempt, and only by argument.
 
 use cubecl::ir::MatrixIdent;
 use cubecl::prelude::*;
@@ -442,64 +462,24 @@ pub fn bf16_linear_grouped_launch<R: Runtime>(
 // Scatter
 // ---------------------------------------------------------------------------
 
-/// `out[r, c] = y[r, c] * wgt[r]`, in place of the tensor multiply.
-///
-/// Its own launch on purpose. The lane this replaces computes `y * wgt` as a
-/// Burn expression, which lands in memory as f32 before anything sums it; doing
-/// the same multiply inside [`scatter_rows_kernel`] would let nvcc fold it into
-/// the accumulating add as an FMA and skip that rounding. One kernel is the
-/// price of the two lanes producing the same bits, and it is a cheap one — this
-/// is `[M, hidden]` of pure elementwise work, once per layer.
-#[cube(launch_unchecked)]
-fn scale_rows_kernel(y: &Array<f32>, wgt: &Array<f32>, out: &mut Array<f32>, h: usize, total: usize) {
-    let p = ABSOLUTE_POS as usize;
-    if p < total {
-        out[p] = y[p] * wgt[p / h];
-    }
-}
-
-/// Launch [`scale_rows_kernel`] over the `[m_total, h]` GEMM result.
-pub fn scale_rows<R: Runtime>(
-    client: &ComputeClient<R>,
-    y: &Handle,
-    wgt: &Handle,
-    m_total: usize,
-    h: usize,
-) -> Handle {
-    let total = m_total * h;
-    let out = client.empty(total * core::mem::size_of::<f32>());
-    let cubes = total.div_ceil(CUBE_SIZE as usize) as u32;
-    unsafe {
-        scale_rows_kernel::launch_unchecked::<R>(
-            client,
-            CubeCount::new_1d(cubes),
-            CubeDim::new_1d(CUBE_SIZE),
-            ArrayArg::from_raw_parts(y.clone(), total),
-            ArrayArg::from_raw_parts(wgt.clone(), m_total),
-            ArrayArg::from_raw_parts(out.clone(), total),
-            h,
-            total,
-        );
-    }
-    out
-}
-
-/// `out[t, :] = sum over t's rows of yw[r, :]`, in ascending `r`.
+/// `out[t, :] = sum over t's rows of y[r, :] * wgt[r]`, in ascending `r`.
 ///
 /// One thread per output element, walking that token's contributing rows. NOT
-/// an atomic scatter: the sum has to be the same sum in the same order the
+/// an atomic scatter: the sum has to be the same sum in the same ORDER the
 /// per-expert lane's chain of `select_assign(Add)` made, and an atomic add
 /// gives neither. `tok_rows` is `[n, kmax]` row-major with `tok_cnt[t]` valid
 /// entries in each row, ascending — which is `BTreeMap` expert order, because
 /// that is the order the rows were laid out in.
 ///
-/// `yw` is already weighted ([`scale_rows`]), so the only arithmetic here is
-/// addition. That is not tidiness: it is what keeps a multiply from contracting
-/// into the accumulator and changing the rounding.
+/// The multiply is inside the accumulation, so it contracts to `fma.rn.f32`:
+/// one rounding per term where the lane this replaces takes two. That is the
+/// module doc's subject and it is not an accident of codegen — a `scale_rows`
+/// launch that forced the second rounding was written, measured, and reverted.
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
-fn scatter_rows_kernel(
-    yw: &Array<f32>,
+fn scatter_weighted_kernel(
+    y: &Array<f32>,
+    wgt: &Array<f32>,
     tok_rows: &Array<u32>,
     tok_cnt: &Array<u32>,
     out: &mut Array<f32>,
@@ -516,18 +496,19 @@ fn scatter_rows_kernel(
         for j in 0..kmax {
             if j < cnt {
                 let r = tok_rows[t * kmax + j] as usize;
-                sum += yw[r * h + c];
+                sum += y[r * h + c] * wgt[r];
             }
         }
         out[p] = sum;
     }
 }
 
-/// Launch [`scatter_rows_kernel`], returning the `[n, h]` accumulator.
+/// Launch [`scatter_weighted_kernel`], returning the `[n, h]` accumulator.
 #[allow(clippy::too_many_arguments)]
-pub fn scatter_rows<R: Runtime>(
+pub fn scatter_weighted<R: Runtime>(
     client: &ComputeClient<R>,
-    yw: &Handle,
+    y: &Handle,
+    wgt: &Handle,
     tok_rows: &Handle,
     tok_cnt: &Handle,
     m_total: usize,
@@ -539,11 +520,12 @@ pub fn scatter_rows<R: Runtime>(
     let out = client.empty(total * core::mem::size_of::<f32>());
     let cubes = total.div_ceil(CUBE_SIZE as usize) as u32;
     unsafe {
-        scatter_rows_kernel::launch_unchecked::<R>(
+        scatter_weighted_kernel::launch_unchecked::<R>(
             client,
             CubeCount::new_1d(cubes),
             CubeDim::new_1d(CUBE_SIZE),
-            ArrayArg::from_raw_parts(yw.clone(), m_total * h),
+            ArrayArg::from_raw_parts(y.clone(), m_total * h),
+            ArrayArg::from_raw_parts(wgt.clone(), m_total),
             ArrayArg::from_raw_parts(tok_rows.clone(), n * kmax),
             ArrayArg::from_raw_parts(tok_cnt.clone(), n),
             ArrayArg::from_raw_parts(out.clone(), total),
