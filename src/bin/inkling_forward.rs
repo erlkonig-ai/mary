@@ -538,15 +538,78 @@ fn shared_experts_bf16(
 
 /// One layer's router, on the device except for the part that is a decision.
 ///
-/// `w` is the projection, `[n_routed + n_shared, hidden]`, and it is a matmul
-/// so it lives on the device. `bias` and `global_scale` never multiply an
+/// `proj` is the projection, `[n_routed + n_shared, hidden]` however it is
+/// oriented, and it is a matmul so it lives on the device. `bias` and
+/// `global_scale` never multiply an
 /// activation: the bias shifts the 256 scores used to PICK the top-k and takes
 /// no part in the weights, and the global scale scales the weights themselves.
 /// They are control plane, so they stay host, where the decision is made.
 struct RouterDev {
-    w: T2,
+    proj: RouterProj,
     bias: Vec<f32>,
     global_scale: f32,
+}
+
+/// `[rows, cols]` row-major to `[cols, rows]` row-major.
+///
+/// The router's projection is uploaded once per layer and multiplied once per
+/// token per layer for the whole run, so the orientation the matmul wants is
+/// the orientation to store it in. This is that permutation, paid once on the
+/// host at upload, where the device lane paid it on every call.
+fn transpose_rows(v: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    assert_eq!(v.len(), rows * cols, "{} values are not [{rows}, {cols}]", v.len());
+    let mut out = vec![0f32; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows + r] = v[r * cols + c];
+        }
+    }
+    out
+}
+
+/// Which router lane `INK_ROUTER` selected.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RouterArm {
+    /// `[rows, hidden]` f32, `.transpose()` on the device per call.
+    Transpose,
+    /// `[hidden, rows]` f32, transposed once on the host at upload.
+    Pre,
+}
+
+impl RouterArm {
+    /// `INK_ROUTER=transpose|pre`, defaulting to the lane this change makes
+    /// default. The old lane stays REACHABLE because a change with no arm to
+    /// measure against is a claim, and both arms have to come out of one binary
+    /// for the comparison to mean anything.
+    fn from_env() -> Self {
+        match std::env::var("INK_ROUTER").as_deref() {
+            Ok("transpose") => RouterArm::Transpose,
+            Ok("pre") | Err(_) => RouterArm::Pre,
+            Ok(other) => panic!("INK_ROUTER={other:?} is not one of: transpose, pre"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            RouterArm::Transpose => "f32 [rows,hidden], transposed on the device PER CALL",
+            RouterArm::Pre => "f32 [hidden,rows], transposed ONCE on the host at upload",
+        }
+    }
+}
+
+/// The router projection, in the orientation this run multiplies it in.
+///
+/// One enum rather than a flag because the two arms hold DIFFERENT TENSORS, not
+/// the same tensor used differently: only the arm the run selected is uploaded,
+/// so switching arms cannot leave a second copy of every layer's projection on
+/// the device unnoticed.
+enum RouterProj {
+    /// `[rows, hidden]`, the checkpoint's own orientation, transposed on the
+    /// device on EVERY call. `INK_ROUTER=transpose`, and what every run before
+    /// this one did.
+    PerCall(T2),
+    /// `[hidden, rows]`, transposed ONCE on the host at upload. The default.
+    Pre(T2),
 }
 
 /// Everything one layer multiplies by, in DEVICE memory, for the whole run.
@@ -1156,6 +1219,8 @@ fn main() -> Result<()> {
     println!("  shared + dense MLP : device, uploaded once and held");
     println!("  routed experts     : device, NATIVE tensor cores -- NVFP4 where packed, BF16 at layer 2");
     println!("  head (unembed)     : device");
+    let router_arm = RouterArm::from_env();
+    println!("  router projection  : {}", router_arm.label());
     println!("  kv cache           : {}", if kv { "on" } else { "off (prefix recomputed each step)" });
     // The SHARED experts' w13 is square, so nothing but a forward can tell the
     // two readings apart. INK_SHARED_W13_HALVED=1 selects the other one.
@@ -1578,8 +1643,15 @@ fn main() -> Result<()> {
                 None
             } else {
                 let rows = t.n_routed_experts + t.n_shared_experts;
+                let w = gv("mlp.gate.weight")?;
+                let proj = match router_arm {
+                    RouterArm::Transpose => RouterProj::PerCall(up2(w, rows, h, &dev)),
+                    // Transposed HERE, on the host, once per layer for the run,
+                    // instead of on the device once per token per layer.
+                    RouterArm::Pre => RouterProj::Pre(up2(transpose_rows(&w, rows, h), h, rows, &dev)),
+                };
                 Some(RouterDev {
-                    w: up2(gv("mlp.gate.weight")?, rows, h, &dev),
+                    proj,
                     bias: gv("mlp.gate.bias")?,
                     global_scale: gv("mlp.gate.global_scale")?[0],
                 })
@@ -1681,7 +1753,10 @@ fn main() -> Result<()> {
             // scheduling, because which weights to read next is a function of
             // the number that just came back.
             let t_rt = Instant::now();
-            let lg = dev_lane::linear(hn.clone(), r.w.clone());
+            let lg = match &r.proj {
+                RouterProj::PerCall(w) => dev_lane::linear(hn.clone(), w.clone()),
+                RouterProj::Pre(wt) => dev_lane::linear_pre_t(hn.clone(), wt.clone()),
+            };
             t_rt_mm += t_rt.elapsed().as_secs_f64();
             stage_sync!(d_router);
             let t_rr = Instant::now();

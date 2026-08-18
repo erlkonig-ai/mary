@@ -43,6 +43,24 @@ pub fn linear<B: Backend>(x: Tensor<B, 2>, w: Tensor<B, 2>) -> Tensor<B, 2> {
     x.matmul(w.transpose())
 }
 
+/// The same product against a weight ALREADY in `[in, out]`, transposed once.
+///
+/// [`linear`] transposes on every call, which is a kernel and a full copy of
+/// the weight per call for a permutation whose result never changes. A weight
+/// the run multiplies by every token can be stored in the orientation the
+/// matmul wants, and then this is the matmul with nothing in front of it.
+///
+/// The two are NOT interchangeable at the call site and are not meant to be:
+/// this one asserts on `w`'s FIRST dimension where [`linear`] asserts on its
+/// second, so handing either the other's weight is a shape error at the
+/// assertion rather than a plausible wrong answer further down.
+pub fn linear_pre_t<B: Backend>(x: Tensor<B, 2>, w: Tensor<B, 2>) -> Tensor<B, 2> {
+    let [_, k] = x.dims();
+    let [kw, _] = w.dims();
+    assert_eq!(k, kw, "linear_pre_t: x is [_, {k}] but the weight is [{kw}, _]");
+    x.matmul(w)
+}
+
 /// The same product, against the BF16 the checkpoint actually stores.
 ///
 /// [`linear`] takes a `Tensor<B, 2>`, and on this backend that means f32 — so
