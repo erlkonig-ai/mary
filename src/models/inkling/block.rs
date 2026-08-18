@@ -210,6 +210,14 @@ pub fn route_from_logits(
     let mut out = Vec::with_capacity(tokens);
     for t in 0..tokens {
         let logits = &logits[t * rows..(t + 1) * rows];
+        if let Some((row, value)) = logits
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, v)| !v.is_finite())
+        {
+            panic!("router logit is non-finite at token {t}, row {row}: {value}");
+        }
 
         // Selection uses sigmoid(logit) + bias; the weights below do not.
         let mut order: Vec<usize> = (0..n_routed).collect();
@@ -247,5 +255,33 @@ fn sigmoid(x: f32) -> f32 {
     } else {
         let e = x.exp();
         e / (1.0 + e)
+    }
+}
+
+#[cfg(test)]
+mod route_finite_tests {
+    use super::route_from_logits;
+
+    #[test]
+    #[should_panic(expected = "router logit is non-finite at token 0, row 3")]
+    fn shared_nan_is_loud_before_softmax() {
+        let logits = [0.25, -0.5, 1.0, f32::NAN];
+        let _ = route_from_logits(&logits, &[0.0, 0.0], 1.0, 1.0, 1, 2, 2, 1);
+    }
+
+    #[test]
+    fn finite_logits_produce_only_finite_weights() {
+        let logits = [0.25, -0.5, 1.0, -2.0, 0.75, 0.125, -0.25, 0.5];
+        let routes = route_from_logits(&logits, &[0.0, 0.0], 1.0, 1.0, 2, 2, 2, 1);
+        let examined = routes
+            .iter()
+            .map(|r| r.weights.len() + r.shared_gammas.len())
+            .sum::<usize>();
+        println!("examined {examined} routing weights");
+        assert_eq!(examined, 6);
+        assert!(routes
+            .iter()
+            .flat_map(|r| r.weights.iter().chain(&r.shared_gammas))
+            .all(|v| v.is_finite()));
     }
 }
