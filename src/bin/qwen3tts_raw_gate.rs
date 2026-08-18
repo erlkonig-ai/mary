@@ -11,9 +11,14 @@
 //! merged at 5d93a95).)
 //!
 //! Each lane runs in its OWN process and a compare pass reads the dumps.
-//! One-process-per-lane is kept deliberately: bit-equality across two
-//! processes is simultaneously a run-to-run determinism receipt for the raw
-//! backend, not just a load receipt.
+//! One-process-per-lane is kept deliberately, because it isolates the two load
+//! paths. It also happens to observe that the raw backend reproduced itself
+//! across processes on this graph — record that as a DIAGNOSTIC, never as a
+//! requirement. Run-to-run determinism was killed as a gate on 2026-08-18
+//! along with bit-equality against a previous lane
+//! (wiki:f5dcc88988bb28e472e50fa030332adb): concurrency is nondeterministic by
+//! definition, so demanding it of a parallel lane is incoherent, and demanding
+//! it here would forbid ever retiling or reassociating the talker's GEMMs.
 //!
 //!   qwen3tts_raw_gate --lane raw|folded --out <dir> [<pile>] \
 //!       [--prefill 154] [--steps 32]
@@ -29,17 +34,27 @@
 //! synthetic prefill + teacher-forced decode steps (`<lane>_hidden.npy`),
 //! and each step's codebook-0 argmax (`<lane>_argmax.txt`).
 //!
-//! Compare gates:
+//! Compare gates. Both are LOAD-PATH gates, and that is exactly why bit
+//! equality is the right bar for them: neither lane computes anything the
+//! other does not, in a different order. Same weights, same kernels, same
+//! accumulation — one of them just arrives by an mmap alias instead of a
+//! transform at load. Nothing here licenses bit-equality for a change that
+//! moves arithmetic.
+//!
 //!   1. weights — both lanes BIT-IDENTICAL per tensor (the sibling holds
 //!      exactly the weights the fold-at-load path computes).
 //!   2. raw ≡ folded hidden BIT-EXACT per step, argmax streams identical
 //!      (the zero-copy load may not change the voice relative to the
 //!      ordinary load).
 //!
-//! The E2E determinism gate rides `speak_check`, not this bin: render the
-//! seeded fixture twice (`MARY_SPEAK_SEED=7`) and require byte-identical
-//! wavs (the banked raw render receipt lives in PORT_NOTES.md, "the
-//! zero-copy RAW talker lane").
+//! The E2E render receipt (`speak_check` on the seeded fixture,
+//! `MARY_SPEAK_SEED=7`, run twice by hand) was banked as an "E2E determinism
+//! gate" — see PORT_NOTES.md, "the zero-copy RAW talker lane". It never was a
+//! gate in code and as of 2026-08-18 it must not become one: treat a differing
+//! wav as a TRIPWIRE, an unclassified event worth looking at (it is how a
+//! corruption bug would announce itself), never a build failure. The voice's
+//! real bar is capability — the ear A/B that picked this lane in the first
+//! place.
 
 #[cfg(target_os = "macos")]
 mod imp {

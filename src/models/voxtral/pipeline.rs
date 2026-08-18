@@ -156,8 +156,13 @@ impl<B: Backend> Transcriber<B> {
     /// Offline transcription of a full 16 kHz clip at the given delay.
     /// `incremental_encoder`: false = one batch encoder pass (the oracle's
     /// own semantic, cheapest for files); true = advance the encoder 4
-    /// positions per frame through its KV cache (the streaming path — must
-    /// produce identical output; gated in the probe).
+    /// positions per frame through its KV cache (the streaming path — gated
+    /// in the probe). "Identical output" there means the TRANSCRIPT: streaming
+    /// must not change what the ears hear. It measured bit-identical because
+    /// the KV cache re-derives the same attention over the same prefix, but
+    /// that is an observation, not the bar — retiling the encoder is allowed to
+    /// move the tensors and must be judged on the transcript
+    /// (wiki:f5dcc88988bb28e472e50fa030332adb).
     pub fn transcribe(
         &self,
         audio: &[f32],

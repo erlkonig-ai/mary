@@ -171,11 +171,27 @@ pub fn sgemm_nt(a: &[f32], b: &[f32], m: usize, k: usize, n: usize, c: &mut [f32
 // threads multiplies effective bandwidth without touching the math: row i's
 // dot product is computed by the same cblas kernel whether it arrives in a
 // full-matrix call or a row-block call — verified BIT-IDENTICAL for every
-// shape this pool serves at every split 2..=8 (see PORT_NOTES). The one
-// exception is the predictor's `down` [1024×3072]: at n=3072 the full-matrix
-// call selects a different (column-blocked) kernel than any row-block call,
-// so `down` must NOT go through the pool — it stays a plain `sgemv`, keeping
-// the threaded path byte-identical to the serial one.
+// shape this pool serves at every split 2..=8 (see PORT_NOTES).
+//
+// WHY BIT-IDENTITY IS THE RIGHT CLAIM *HERE*, and nowhere by default: a row
+// block does not reassociate anything. Each output row is one independent dot
+// product and the split runs along the row axis, so no accumulation order
+// changes — this is the same class as aliasing weights or hoisting a read, and
+// there exact equality really is the bar. It is NOT a general licence. Do not
+// carry it to a change that fuses, splits, retiles or reassociates arithmetic:
+// see wiki:f5dcc88988bb28e472e50fa030332adb, "Don't gate GPU kernels on
+// bit-exactness" (JP, 2026-08-18 — the rule is dead in both forms, against a
+// previous implementation and run-to-run).
+//
+// The predictor's `down` [1024×3072] stays a plain serial `sgemv`: at n=3072
+// the full-matrix call selects a different (column-blocked) kernel than any
+// row-block call, so routing it through the pool moves it off the accumulation
+// order the serial lane happens to use (~1e-6 diffs). NOTE, 2026-08-18: that is
+// no longer a correctness argument, and it never adjudicated anything — a
+// column-blocked reduction is if anything the more accurate one, O(log n·eps)
+// against O(n·eps). Keeping `down` serial is now purely an unmeasured perf
+// question, not a gate. Parallelise it if it pays; gate the result on the ear
+// A/B, not on reproducing these bytes.
 //
 // Pool shape: `MARY_PRED_THREADS` ways total (0/1 disables), WORK-STEALING
 // over a fixed chunk grid: rows are cut into ~4·ways equal chunks (min 64
@@ -183,8 +199,9 @@ pub fn sgemm_nt(a: &[f32], b: &[f32], m: usize, k: usize, n: usize, c: &mut [f32
 // atomic counter. A preempted thread therefore delays only its current chunk,
 // not an m/ways slice: on this shared machine the straggler tail is the
 // entire cost of wider splits (measured: fixed slices at 4/6 ways ran SLOWER
-// than serial under ambient load; chunk-grids at 64..512 rows are in the
-// bit-exactness-verified set). Per-dispatch cost is one atomic bump + a
+// than serial under ambient load; chunk-grids at 64..512 rows were all
+// measured bit-identical, which for a row split is expected rather than
+// required). Per-dispatch cost is one atomic bump + a
 // (usually uncontended) notify. Workers spin briefly between jobs (the gaps
 // inside a frame are µs-scale) and park on a condvar when the burst ends, so
 // they cost nothing while the GPU talker runs.
@@ -315,7 +332,10 @@ fn pool() -> Option<&'static Pool> {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(2)
-            .min(8); // splits 2..=8 are the bit-exactness-verified range
+            // Clamped at 8 because that is where the perf sweep stopped, not
+            // because wider splits would be wrong — a row split reassociates
+            // nothing at any width. Widen it if a measurement asks for it.
+            .min(8);
         if ways < 2 {
             return None;
         }
@@ -348,9 +368,15 @@ fn pool() -> Option<&'static Pool> {
 
 /// `y = W·x` like [`sgemv`], work-stealing row chunks across the pool.
 /// Bit-identical to the serial call for the shapes it serves (row blocks at
-/// every split 2..=8 AND chunk grids at 64..512 rows verified); do NOT route
-/// matrices with n ≥ 3072 here without re-running the split test — wide-n
-/// full-matrix calls can select a different cblas kernel.
+/// every split 2..=8 AND chunk grids at 64..512 rows verified) — expected,
+/// because a row split reassociates nothing.
+///
+/// Wide-n full-matrix calls (n ≥ 3072) can select a different, column-blocked
+/// cblas kernel, so routing those here will NOT reproduce the serial bytes.
+/// That is a difference, not a defect, and it is not a reason to refuse the
+/// route: a column-blocked reduction is the better-conditioned one. Decide it
+/// on measurement and on the ear A/B, not on byte-equality with whichever lane
+/// existed first (wiki:f5dcc88988bb28e472e50fa030332adb).
 pub fn sgemv_mt(w: &[f32], m: usize, n: usize, x: &[f32], y: &mut [f32]) {
     debug_assert_eq!(w.len(), m * n);
     debug_assert_eq!(x.len(), n);
