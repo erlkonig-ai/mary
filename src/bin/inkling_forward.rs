@@ -1846,7 +1846,6 @@ fn main() -> Result<()> {
     // device pointer on: `seam::handle_of` hands a Burn allocation to a raw
     // kernel launched on this client, and if they were two clients that would
     // be a wrong answer rather than an error.
-    println!("{}", mary::models::inkling::pile::mem_line("before CUDA context"));
     let fp4_client = mary::models::inkling::seam::client_of(
         &BT::<Bk, 2>::zeros([1, 1], &dev),
     );

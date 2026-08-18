@@ -1080,7 +1080,6 @@ impl PileSource {
         global_dense: &[&str],
     ) -> Result<(usize, usize, u64)> {
         anyhow::ensure!(self.copied.is_none(), "the weight share was already copied");
-        println!("{}", mem_line("copy_share entry"));
 
         /// The shape every expert of one stacked matrix has.
         #[derive(Clone, Copy)]
