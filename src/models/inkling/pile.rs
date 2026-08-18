@@ -94,54 +94,117 @@ pub fn mem_line(label: &str) -> String {
     )
 }
 
-/// Drop the page-table entries for a leaf's SOURCE pages once it has been
-/// copied into the anonymous arena.
+/// Hands each leaf's source pages back to the kernel once it has been copied
+/// into the anonymous arena.
 ///
-/// The pile is mapped shared and read-only, so this is non-destructive: a later
-/// read of the same bytes re-faults them from the file. What it buys is the
-/// thing the startup copy is actually fighting for. Reclaim has to choose
-/// between the anonymous arena we are filling and the mapped file pages we are
-/// finished with, and at `INK_LAYERS=0:20` it chose wrong — it paged 14 GiB of
-/// freshly written arena out to swap while holding 36 GiB of source pages
-/// nothing would look at again, and the copy then ran at 3.0 GiB/s because it
-/// was re-reading its own source off the SSD. Unmapping each leaf as it lands
-/// takes the choice away.
+/// Two calls, and both are needed, because they undo different things.
+/// `madvise(MADV_DONTNEED)` zaps this process's page-table entries, which takes
+/// the pages out of RSS but leaves them in the page cache; `posix_fadvise(...,
+/// POSIX_FADV_DONTNEED)` drops the cache pages themselves, and it only works on
+/// pages nobody has mapped -- which is why the madvise has to come first. The
+/// pile is mapped shared and read-only, so neither is destructive: a later read
+/// of the same bytes re-faults them from the file.
 ///
-/// Rounded INWARD to whole pages, so a leaf never unmaps a page its neighbour
-/// is still reading. `INK_RELEASE_SOURCE=0` keeps the pages, as the A/B arm.
-#[cfg(target_os = "linux")]
-fn release_source_pages(src: &Bytes) {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let on = *ON.get_or_init(|| {
-        !std::env::var("INK_RELEASE_SOURCE").map(|v| v == "0").unwrap_or(false)
-    });
-    if !on {
-        return;
-    }
-    static PAGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let page = *PAGE.get_or_init(|| {
-        // SAFETY: `sysconf` reads a static system parameter.
-        let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        if n > 0 { n as usize } else { 4096 }
-    });
-    let lo = src.as_ptr() as usize;
-    let hi = lo + src.len();
-    let lo = lo.next_multiple_of(page);
-    let hi = hi - hi % page;
-    if hi <= lo {
-        return;
-    }
-    // SAFETY: the range lies inside the pile's live mapping, which outlives
-    // this call; `MADV_DONTNEED` on a shared file mapping only zaps page-table
-    // entries, so the bytes are still readable and still the same bytes.
-    unsafe {
-        libc::madvise(lo as *mut libc::c_void, hi - lo, libc::MADV_DONTNEED);
-    }
+/// What this buys is the thing the startup copy is actually fighting for. On a
+/// unified-memory part the source page cache, the anonymous arena and
+/// everything CUDA reserves are ONE 121 GiB pool, and reclaim gets to choose
+/// between them. At `INK_LAYERS=0:20` it chose wrong twice over: without the
+/// madvise it held 36 GiB of source pages in RSS and paged 16 GiB of freshly
+/// written arena out to swap instead; with the madvise but without the fadvise
+/// it still kept the unmapped cache and started swapping again as soon as the
+/// share passed ~85 GiB. Handing the pages back as each leaf lands takes the
+/// choice away.
+///
+/// `INK_RELEASE_SOURCE=0` keeps the pages, as the A/B arm.
+struct SourceRelease {
+    /// The pile file, reopened read-only for `posix_fadvise` alone. The mapping
+    /// does not keep an fd and the advice needs one.
+    file: Option<std::fs::File>,
+    /// Base address of the pile's mapping, so a payload pointer becomes a file
+    /// offset by subtraction. `None` when the mapping is not the whole file, in
+    /// which case that subtraction would be a guess.
+    map_base: Option<usize>,
+    /// The file's length, so the advice never names a range past its end.
+    file_len: usize,
+    page: usize,
+    on: bool,
 }
 
-/// Nothing to do where the copy is not competing with a GPU for one pool.
-#[cfg(not(target_os = "linux"))]
-fn release_source_pages(_src: &Bytes) {}
+impl SourceRelease {
+    #[cfg(target_os = "linux")]
+    fn new(path: &std::path::Path, map_base: usize, map_len: usize) -> Self {
+        let on = !std::env::var("INK_RELEASE_SOURCE").map(|v| v == "0").unwrap_or(false);
+        // SAFETY: `sysconf` reads a static system parameter.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let page = if page > 0 { page as usize } else { 4096 };
+        let file = std::fs::File::open(path).ok();
+        // The mapping starts at file offset 0, so a payload pointer minus the
+        // base IS the file offset -- but the pile RESERVES address space it has
+        // not filled (256 GiB of mapping over a 171 GiB file, so appends need no
+        // remap), and the reservation is exactly why this cannot be an equality
+        // test. What has to hold is that the file is no LONGER than the map,
+        // and that the advice never runs past the file's end.
+        let file_len = file
+            .as_ref()
+            .and_then(|f| f.metadata().ok())
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+        let whole = file_len > 0 && file_len <= map_len;
+        println!(
+            "    source release: {}, map {} bytes, file {} bytes, offsets {}",
+            if on { "on" } else { "OFF" },
+            map_len,
+            file_len,
+            if whole { "usable" } else { "UNUSABLE (page cache will not be dropped)" },
+        );
+        Self { file, map_base: whole.then_some(map_base), file_len, page, on }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn new(_path: &std::path::Path, _map_base: usize, _map_len: usize) -> Self {
+        Self { file: None, map_base: None, file_len: 0, page: 4096, on: false }
+    }
+
+    /// Rounded INWARD to whole pages, so a leaf never releases a page its
+    /// neighbour is still reading.
+    #[cfg(target_os = "linux")]
+    fn release(&self, src: &Bytes) {
+        use std::os::fd::AsRawFd;
+        if !self.on {
+            return;
+        }
+        let lo = src.as_ptr() as usize;
+        let hi = (lo + src.len()) / self.page * self.page;
+        let lo = lo.next_multiple_of(self.page);
+        if hi <= lo {
+            return;
+        }
+        // SAFETY: the range lies inside the pile's live mapping, which outlives
+        // this call; `MADV_DONTNEED` on a shared file mapping only zaps
+        // page-table entries, so the bytes are still readable and unchanged.
+        unsafe {
+            libc::madvise(lo as *mut libc::c_void, hi - lo, libc::MADV_DONTNEED);
+        }
+        if let (Some(base), Some(f)) = (self.map_base, self.file.as_ref()) {
+            if hi - base > self.file_len {
+                return;
+            }
+            // SAFETY: `f` is open for the duration of the call; the advice is
+            // a hint and cannot invalidate anything.
+            unsafe {
+                libc::posix_fadvise(
+                    f.as_raw_fd(),
+                    (lo - base) as libc::off_t,
+                    (hi - lo) as libc::off_t,
+                    libc::POSIX_FADV_DONTNEED,
+                );
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn release(&self, _src: &Bytes) {}
+}
 
 fn mem_available_bytes() -> Result<u64> {
     let status = std::fs::read_to_string("/proc/meminfo").context("reading /proc/meminfo")?;
@@ -512,6 +575,9 @@ pub struct Bf16Slab {
 /// header parsed yet — do not exist for a content-addressed store. A handle IS
 /// the location.
 pub struct PileSource {
+    /// Where the pile is, kept only so the startup copy can reopen it: the
+    /// mapping does not carry an fd and `posix_fadvise` needs one.
+    path: std::path::PathBuf,
     reader: triblespace::core::repo::pile::PileReader,
     /// Everything the branch asserts, kept rather than dropped after the index
     /// is built.
@@ -692,6 +758,7 @@ impl PileSource {
 
         anyhow::ensure!(!dense.is_empty(), "{path:?}: no dense leaves on {branch:?}");
         Ok(PileSource {
+            path: path.to_path_buf(),
             reader,
             facts,
             dense,
@@ -1147,6 +1214,13 @@ impl PileSource {
             base = span_end;
         }
 
+        let (map_base, map_len, _keep) = {
+            let m = self.mappings()?;
+            let (b, l, k) = m.into_iter().next().context("the pile has no mapping")?;
+            (b, l, k)
+        };
+        let release = SourceRelease::new(&self.path, map_base, map_len);
+        let release = &release;
         let reader = &self.reader;
         let experts = &self.experts;
         let dense = &self.dense;
@@ -1229,7 +1303,7 @@ impl PileSource {
                                 Job::Dense(name) => dense[*name].bytes.clone(),
                             };
                             buf[start - base..end - base].copy_from_slice(&src);
-                            release_source_pages(&src);
+                            release.release(&src);
                         }
                         Ok(())
                     })
