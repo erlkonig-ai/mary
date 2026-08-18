@@ -662,29 +662,38 @@ enum RouterArm {
     Transpose,
     /// `[hidden, rows]` f32, transposed once on the host at upload.
     Pre,
-    /// The BF16 the pile stores, into `mma.sync…bf16`. NOT the default, and
-    /// the reason is measured rather than cautious: see `from_env`.
+    /// The BF16 the pile stores, into `mma.sync…bf16`. THE DEFAULT: it is the
+    /// precision the model is in and the precision the reference computes in.
     Bf16,
 }
 
 impl RouterArm {
     /// `INK_ROUTER=transpose|pre|bf16`.
     ///
-    /// `pre` is the default and `bf16` is not, which is the OPPOSITE of what
-    /// this change set out to do. The behavioural gate for the BF16 arm was
-    /// "same emitted tokens over a real prompt set", and it did not pass: on
-    /// all eight `fp4_rep2` prompts the greedy continuation diverges, as early
-    /// as the first generated token. 0.46% of 5048 router selections chose a
-    /// different SET of six experts. That is a finding, not a failure -- no
-    /// crash, no non-finite logit, no empty or degenerate generation -- and
-    /// which precision this lane should claim is a decision for a human, not
-    /// for the arm that happens to be listed first. Making `bf16` the default
-    /// is one word here.
+    /// `bf16` is the default, and the reason is precision rather than speed.
+    /// Inkling is a bfloat16 model with NVFP4 experts, and the official
+    /// implementation multiplies the router in bf16 on the tensor cores. The
+    /// f32 the other two arms multiply in was never the model's: `gv` widened
+    /// the pile's stored BF16 on the way out of the mapping, and that widening
+    /// was OUR addition. So the arm that agrees with the reference is this one,
+    /// and the f32 arms are the deviation.
+    ///
+    /// The previous round gated this arm on bitwise agreement with the widened
+    /// f32 arm and the gate did not pass: on all eight `fp4_rep2` prompts the
+    /// greedy continuation diverges, and 0.46% of 5048 router selections chose
+    /// a different SET of six experts. Those numbers still stand and are still
+    /// worth having -- they are a measured property of NVFP4 routing, which is
+    /// how close the 6th and 7th expert scores sit -- but they are not evidence
+    /// against this arm. Demanding that a bf16 model reproduce an f32 lane's
+    /// exact top-k demands a precision the model does not have, which is the
+    /// same error the deleted f32 CPU reference made.
+    ///
+    /// Both f32 arms stay reachable so the comparison stays runnable.
     fn from_env() -> Self {
         match std::env::var("INK_ROUTER").as_deref() {
             Ok("transpose") => RouterArm::Transpose,
-            Ok("pre") | Err(_) => RouterArm::Pre,
-            Ok("bf16") => RouterArm::Bf16,
+            Ok("pre") => RouterArm::Pre,
+            Ok("bf16") | Err(_) => RouterArm::Bf16,
             Ok(other) => panic!("INK_ROUTER={other:?} is not one of: transpose, pre, bf16"),
         }
     }
