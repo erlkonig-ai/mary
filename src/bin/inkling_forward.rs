@@ -546,8 +546,96 @@ fn shared_experts_bf16(
 /// They are control plane, so they stay host, where the decision is made.
 struct RouterDev {
     proj: RouterProj,
+    /// `INK_ROUTER_DIFF=1` only: the f32 `[rows, hidden]` lane, held BESIDE the
+    /// active one so the two selections can be compared on the same activation.
+    /// It is `None` otherwise, so the ordinary run carries neither the weight
+    /// nor the second matmul.
+    reference: Option<T2>,
     bias: Vec<f32>,
     global_scale: f32,
+}
+
+/// What `INK_ROUTER_DIFF=1` counted for one layer, comparing the arm the run
+/// ACTED ON against the f32 `[rows, hidden]` lane every earlier run shipped.
+///
+/// Top-k is discrete, so a changed logit CAN flip an expert, and that is a
+/// behavioural change rather than a rounding one. Neither assuming it happens
+/// nor assuming it does not is a measurement, so this counts it: per layer, per
+/// token, with the examined count printed beside every other number so a zero
+/// says how much was looked at.
+///
+/// The reference is computed, compared and DISCARDED. It never reaches
+/// `by_expert`, so the run this instruments is the arm's own run and the
+/// counters describe it rather than some third thing.
+#[derive(Default, Clone, Copy)]
+struct RouteDiff {
+    /// Token-positions whose selection was compared.
+    examined: usize,
+    /// ...where the SET of chosen experts differs.
+    set_differs: usize,
+    /// ...where the set agrees but the order the top-k came out in does not.
+    /// Harmless by itself -- the weights follow the experts -- but it is the
+    /// near miss that says how close the ordering is to flipping.
+    order_differs: usize,
+    /// Individual (position, slot) pairs naming a different expert.
+    slots_differ: usize,
+    /// Largest `|active - reference|` over every logit compared.
+    max_abs_logit: f32,
+    /// Largest `|active - reference|` over the weights the chosen experts got.
+    /// Only defined where the sets agree, since otherwise the weights are not
+    /// the same quantity.
+    max_abs_weight: f32,
+}
+
+impl RouteDiff {
+    /// One token-position, both selections in hand.
+    fn note(&mut self, a: &Routing, b: &Routing, la: &[f32], lb: &[f32]) {
+        self.examined += 1;
+        for (x, y) in la.iter().zip(lb) {
+            self.max_abs_logit = self.max_abs_logit.max((x - y).abs());
+        }
+        let differ = a.experts.iter().zip(&b.experts).filter(|(x, y)| x != y).count();
+        self.slots_differ += differ;
+        let mut sa = a.experts.clone();
+        let mut sb = b.experts.clone();
+        sa.sort_unstable();
+        sb.sort_unstable();
+        if sa != sb {
+            self.set_differs += 1;
+        } else if differ != 0 {
+            self.order_differs += 1;
+        } else {
+            // Slot for slot the same experts, so slot for slot the same
+            // quantity. Anywhere else the two `weights` vectors are indexed by
+            // different experts and subtracting them compares nothing.
+            for (x, y) in a.weights.iter().zip(&b.weights) {
+                self.max_abs_weight = self.max_abs_weight.max((x - y).abs());
+            }
+        }
+    }
+}
+
+/// Drop a `[n, cols]` row-major block down to its first `keep` columns.
+///
+/// The BF16 arm's weight is padded to the `mma` instruction's n tile, so the
+/// logits come back six columns wide of what the router asked for. Sliced HERE,
+/// on the host, rather than with a device `slice`: on a decode step this is one
+/// row of 264 floats and a device slice would be another kernel launch in the
+/// one stage of the layer that is already launch-bound.
+///
+/// Returns its argument untouched when there is no pad, so the f32 arms pay
+/// nothing for the BF16 arm's shape.
+fn drop_pad_cols(v: Vec<f32>, n: usize, cols: usize, keep: usize) -> Vec<f32> {
+    assert!(keep <= cols, "cannot keep {keep} of {cols} columns");
+    assert_eq!(v.len(), n * cols, "{} values are not [{n}, {cols}]", v.len());
+    if cols == keep {
+        return v;
+    }
+    let mut out = Vec::with_capacity(n * keep);
+    for t in 0..n {
+        out.extend_from_slice(&v[t * cols..t * cols + keep]);
+    }
+    out
 }
 
 /// `[rows, cols]` row-major to `[cols, rows]` row-major.
@@ -574,18 +662,30 @@ enum RouterArm {
     Transpose,
     /// `[hidden, rows]` f32, transposed once on the host at upload.
     Pre,
+    /// The BF16 the pile stores, into `mma.sync…bf16`. NOT the default, and
+    /// the reason is measured rather than cautious: see `from_env`.
+    Bf16,
 }
 
 impl RouterArm {
-    /// `INK_ROUTER=transpose|pre`, defaulting to the lane this change makes
-    /// default. The old lane stays REACHABLE because a change with no arm to
-    /// measure against is a claim, and both arms have to come out of one binary
-    /// for the comparison to mean anything.
+    /// `INK_ROUTER=transpose|pre|bf16`.
+    ///
+    /// `pre` is the default and `bf16` is not, which is the OPPOSITE of what
+    /// this change set out to do. The behavioural gate for the BF16 arm was
+    /// "same emitted tokens over a real prompt set", and it did not pass: on
+    /// all eight `fp4_rep2` prompts the greedy continuation diverges, as early
+    /// as the first generated token. 0.46% of 5048 router selections chose a
+    /// different SET of six experts. That is a finding, not a failure -- no
+    /// crash, no non-finite logit, no empty or degenerate generation -- and
+    /// which precision this lane should claim is a decision for a human, not
+    /// for the arm that happens to be listed first. Making `bf16` the default
+    /// is one word here.
     fn from_env() -> Self {
         match std::env::var("INK_ROUTER").as_deref() {
             Ok("transpose") => RouterArm::Transpose,
             Ok("pre") | Err(_) => RouterArm::Pre,
-            Ok(other) => panic!("INK_ROUTER={other:?} is not one of: transpose, pre"),
+            Ok("bf16") => RouterArm::Bf16,
+            Ok(other) => panic!("INK_ROUTER={other:?} is not one of: transpose, pre, bf16"),
         }
     }
 
@@ -593,6 +693,7 @@ impl RouterArm {
         match self {
             RouterArm::Transpose => "f32 [rows,hidden], transposed on the device PER CALL",
             RouterArm::Pre => "f32 [hidden,rows], transposed ONCE on the host at upload",
+            RouterArm::Bf16 => "the STORED BF16, into mma.sync...bf16, nothing widened",
         }
     }
 }
@@ -608,8 +709,33 @@ enum RouterProj {
     /// device on EVERY call. `INK_ROUTER=transpose`, and what every run before
     /// this one did.
     PerCall(T2),
-    /// `[hidden, rows]`, transposed ONCE on the host at upload. The default.
+    /// `[hidden, rows]`, transposed ONCE on the host at upload.
     Pre(T2),
+    /// The pile's own BF16 bytes, `[rows, hidden]`, into `mma.sync…bf16` — the
+    /// same lane 71b837b put the attention projections on, and no f32 copy of
+    /// the weight exists anywhere. The default.
+    ///
+    /// Inkling is a bfloat16 model with NVFP4 experts. The f32 the two arms
+    /// above multiply in is not the model's precision, it is ours: the widen
+    /// happened on the host on the way out of the mapping, doubled the bytes,
+    /// and bought a precision the checkpoint does not have. This arm also casts
+    /// the ACTIVATION to BF16, by the hardware's round-to-nearest-even, which is
+    /// what the official implementation's `bfloat16` linear does. So the logits
+    /// differ from the f32 arms' and are not meant not to; what has to hold is
+    /// the SELECTION, and `INK_ROUTER_DIFF=1` below counts whether it does.
+    ///
+    /// `n` is the row count PADDED to the instruction's n tile: 258 is not a
+    /// multiple of 8, so six zero rows are appended and their logits sliced off
+    /// on the host. That pad is why this arm copies rather than aliases -- a
+    /// padded buffer is not inside the pile's mapping -- but the copy is at the
+    /// STORED width. Nothing here widens; 2.16 MB a layer moves once at upload
+    /// where the f32 arms materialised 4.23 MB a layer and uploaded that. The
+    /// bind counters see it as exactly eight more `UNMAPPED` copies and 16 MiB.
+    Bf16 {
+        w: Bf16W,
+        /// Real rows, `n_routed + n_shared`, before the pad.
+        rows: usize,
+    },
 }
 
 /// Everything one layer multiplies by, in DEVICE memory, for the whole run.
@@ -1221,6 +1347,14 @@ fn main() -> Result<()> {
     println!("  head (unembed)     : device");
     let router_arm = RouterArm::from_env();
     println!("  router projection  : {}", router_arm.label());
+    // OPT-IN, and this run is slower for it: it uploads a second projection per
+    // layer and issues a second matmul and a second BLOCKING read per MoE layer
+    // per token. A timing run must not have it on, and the report says which
+    // runs did.
+    let router_diff = std::env::var("INK_ROUTER_DIFF").map(|v| v == "1").unwrap_or(false);
+    if router_diff {
+        println!("  router diff        : ON -- selection compared against the f32 [rows,hidden] lane, this pass IS slower");
+    }
     println!("  kv cache           : {}", if kv { "on" } else { "off (prefix recomputed each step)" });
     // The SHARED experts' w13 is square, so nothing but a forward can tell the
     // two readings apart. INK_SHARED_W13_HALVED=1 selects the other one.
@@ -1425,6 +1559,12 @@ fn main() -> Result<()> {
         }
         _ => None,
     };
+
+    // One per layer of the whole stack, indexed by absolute layer number, so
+    // the summary can name the layer rather than a position in this node's
+    // slice. Declared here and not in the pass because the question is what the
+    // RUN did, not what one token did.
+    let mut route_diff = vec![RouteDiff::default(); t.num_hidden_layers];
 
     let mut top_all: Vec<i64> = Vec::new();
     for step in 0..=gen_steps {
@@ -1643,15 +1783,56 @@ fn main() -> Result<()> {
                 None
             } else {
                 let rows = t.n_routed_experts + t.n_shared_experts;
-                let w = gv("mlp.gate.weight")?;
+                // `gv` widens on the way out of the mapping, so the BF16 arm
+                // must not call it for the projection at all -- that read IS the
+                // widening. It takes `stored` instead, like the five attention
+                // projections beside it.
                 let proj = match router_arm {
-                    RouterArm::Transpose => RouterProj::PerCall(up2(w, rows, h, &dev)),
+                    RouterArm::Transpose => {
+                        RouterProj::PerCall(up2(gv("mlp.gate.weight")?, rows, h, &dev))
+                    }
                     // Transposed HERE, on the host, once per layer for the run,
                     // instead of on the device once per token per layer.
-                    RouterArm::Pre => RouterProj::Pre(up2(transpose_rows(&w, rows, h), h, rows, &dev)),
+                    RouterArm::Pre => RouterProj::Pre(up2(
+                        transpose_rows(&gv("mlp.gate.weight")?, rows, h),
+                        h,
+                        rows,
+                        &dev,
+                    )),
+                    RouterArm::Bf16 => {
+                        use mary::models::inkling::bf16gemm::NTILE;
+                        let s = Instant::now();
+                        let leaf = cp.stored(&format!("{p}mlp.gate.weight"))?;
+                        anyhow::ensure!(
+                            leaf.elem == Elem::Bf16,
+                            "{p}mlp.gate.weight is {:?}; INK_ROUTER=bf16 multiplies the STORED \
+                             BF16 and will not widen to reach an element type",
+                            leaf.elem
+                        );
+                        // Six zero rows so 258 tiles as n8. They produce logits
+                        // the host slices off; they are a pad, not a widening.
+                        let pad = rows.div_ceil(NTILE) * NTILE;
+                        let mut bytes = vec![0u8; pad * h * 2];
+                        bytes[..rows * h * 2].copy_from_slice(&leaf.bytes);
+                        t_read.set(t_read.get() + s.elapsed().as_secs_f64());
+                        RouterProj::Bf16 {
+                            w: bind_bf16(&fp4_client, fp4_aliases.as_ref(), &bytes, pad, h),
+                            rows,
+                        }
+                    }
+                };
+                // Held only under the diff probe, and it is the arm every run
+                // before 969bf6f shipped -- the thing the new arm has to be
+                // compared AGAINST, not a second opinion invented for the
+                // occasion.
+                let reference = if router_diff {
+                    Some(up2(gv("mlp.gate.weight")?, rows, h, &dev))
+                } else {
+                    None
                 };
                 Some(RouterDev {
                     proj,
+                    reference,
                     bias: gv("mlp.gate.bias")?,
                     global_scale: gv("mlp.gate.global_scale")?[0],
                 })
@@ -1752,21 +1933,47 @@ fn main() -> Result<()> {
             // the only place in the layer that does; it cannot be avoided by
             // scheduling, because which weights to read next is a function of
             // the number that just came back.
+            let rows = t.n_routed_experts + t.n_shared_experts;
             let t_rt = Instant::now();
-            let lg = match &r.proj {
-                RouterProj::PerCall(w) => dev_lane::linear(hn.clone(), w.clone()),
-                RouterProj::Pre(wt) => dev_lane::linear_pre_t(hn.clone(), wt.clone()),
+            // `cols` is what comes BACK, which is `rows` except on the BF16 arm,
+            // whose weight carries the instruction's n padding.
+            let (lg, cols) = match &r.proj {
+                RouterProj::PerCall(w) => (dev_lane::linear(hn.clone(), w.clone()), rows),
+                RouterProj::Pre(wt) => (dev_lane::linear_pre_t(hn.clone(), wt.clone()), rows),
+                RouterProj::Bf16 { w, .. } => (dev_lane::linear_bf16(hn.clone(), w), w.n),
             };
             t_rt_mm += t_rt.elapsed().as_secs_f64();
             stage_sync!(d_router);
             let t_rr = Instant::now();
-            let logits = down(lg);
+            let logits = drop_pad_cols(down(lg), n, cols, rows);
             t_rt_read += t_rr.elapsed().as_secs_f64();
             let t_rh = Instant::now();
             let routing: Vec<Routing> = route_from_logits(
                 &logits, &r.bias, r.global_scale, t.route_scale as f32,
                 n, t.n_routed_experts, t.n_shared_experts, t.num_experts_per_tok,
             );
+
+            // `INK_ROUTER_DIFF=1`: the same activation through the f32 lane,
+            // the same selection rule on the result, and a count of where the
+            // two disagree. Nothing below reads `ref_routing` -- the run acts on
+            // `routing`, whichever arm produced it -- so this measures the arm
+            // rather than replacing it.
+            if let Some(rw) = r.reference.as_ref() {
+                let ref_logits = down(dev_lane::linear(hn.clone(), rw.clone()));
+                let ref_routing = route_from_logits(
+                    &ref_logits, &r.bias, r.global_scale, t.route_scale as f32,
+                    n, t.n_routed_experts, t.n_shared_experts, t.num_experts_per_tok,
+                );
+                let d = &mut route_diff[layer];
+                for ti in 0..n {
+                    d.note(
+                        &routing[ti],
+                        &ref_routing[ti],
+                        &logits[ti * rows..(ti + 1) * rows],
+                        &ref_logits[ti * rows..(ti + 1) * rows],
+                    );
+                }
+            }
 
             // Group tokens by expert, so each slab is read once.
             let mut by_expert: BTreeMap<usize, Vec<(usize, f32)>> = BTreeMap::new();
@@ -2426,6 +2633,50 @@ fn main() -> Result<()> {
     if step == gen_steps {
         break;
     }
+    }
+
+    // ---- what the router arm changed, if anything -------------------------
+    //
+    // Printed whether or not it found something, with the examined count on
+    // every line. A zero that says how many selections it looked at is a
+    // measurement; a zero on its own is a claim.
+    if router_diff {
+        println!("\n=== router selection: {} vs the f32 [rows,hidden] lane ===", router_arm.label());
+        println!("  layer   examined   set!=   order!=   slots!=   max|dlogit|   max|dweight|");
+        let (mut ex, mut sd, mut od, mut sl) = (0usize, 0usize, 0usize, 0usize);
+        let (mut ml, mut mw) = (0f32, 0f32);
+        for (layer, d) in route_diff.iter().enumerate() {
+            if d.examined == 0 {
+                continue;
+            }
+            println!(
+                "  {layer:5}   {:8}   {:5}   {:7}   {:7}   {:11.3e}   {:12.3e}",
+                d.examined, d.set_differs, d.order_differs, d.slots_differ,
+                d.max_abs_logit, d.max_abs_weight
+            );
+            ex += d.examined;
+            sd += d.set_differs;
+            od += d.order_differs;
+            sl += d.slots_differ;
+            ml = ml.max(d.max_abs_logit);
+            mw = mw.max(d.max_abs_weight);
+        }
+        if ex == 0 {
+            println!("  nothing examined: this node's slice has no MoE layer, so there was no router to compare.");
+        } else {
+            println!(
+                "  TOTAL   {ex:8}   {sd:5}   {od:7}   {sl:7}   {ml:11.3e}   {mw:12.3e}"
+            );
+            println!(
+                "  {:.4}% of {ex} selections chose a different SET of experts; {:.4}% reordered one.",
+                100.0 * sd as f64 / ex as f64,
+                100.0 * od as f64 / ex as f64,
+            );
+            println!(
+                "  {sl} of {} expert slots named a different expert.",
+                ex * t.num_experts_per_tok
+            );
+        }
     }
 
     // ---- the MTP experiment's result --------------------------------------
