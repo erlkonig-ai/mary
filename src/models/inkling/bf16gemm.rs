@@ -554,16 +554,18 @@ pub fn try_bf16_linear_cubek_launch<R: Runtime>(
 
 /// The order [`bf16_gemm`] tries lanes in, unless `INK_GEMM` names one.
 ///
-/// **The TMA lanes are not on it, and that is a finding, not an oversight.**
-/// They are the fastest on the bench by 1.4x, and they cannot run here: a
-/// `cuTensorMap` requires a 16-byte-aligned global address, and this runtime's
-/// weights are ALIASED out of the pile mapping at whatever offset the leaf
-/// lies at. The first real forward on the TMA lane died on
-/// "Tensor pointer must be 16 byte aligned" during the layer uploads, and that
-/// is an async launch error that poisons the server -- it cannot be caught and
-/// fallen back from at run time, only kept off the list. Getting them back is a
-/// question for the BINDER (align the aliased leaves to 16), not for this list.
+/// The TMA lanes head it, and they are the reason the alignment gate below is
+/// not optional. A `cuTensorMap` requires a 16-byte-aligned global address; the
+/// first attempt at this list died on "Tensor pointer must be 16 byte aligned"
+/// during the layer uploads, because the weights are ALIASED out of the pile
+/// mapping at whatever offset the leaf lies at and that seam only promises 4.
+/// It is an ASYNC launch fault that poisons the server, so it cannot be caught
+/// and retried -- the alignment has to be decided before the launch. With
+/// `Bf16W::align` deciding it, a weight the TMA lane would fault on never
+/// reaches this list at all, and the lane is safe on both bind arms.
 const PREFERENCE: &[Lane] = &[
+    Lane::DoubleTmaMma,
+    Lane::SimpleTmaMma,
     Lane::DoubleCyclicMma,
     Lane::SimpleCyclicMma,
     Lane::SpecializedCyclicCmma,
