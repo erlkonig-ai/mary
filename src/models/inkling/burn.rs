@@ -87,14 +87,17 @@ pub fn linear_pre_t<B: Backend>(x: Tensor<B, 2>, w: Tensor<B, 2>) -> Tensor<B, 2
 /// as zeros by the cast that was visiting every element anyway, then sliced off
 /// here.
 pub fn linear_bf16(x: Tensor<Bk, 2>, w: &Bf16W) -> Tensor<Bk, 2> {
-    use crate::models::inkling::bf16gemm::MTILE;
+    use crate::models::inkling::bf16gemm::rows_for;
     let [m, k] = x.dims();
     assert_eq!(k, w.k, "linear_bf16: x is [_, {k}] but the weight is [_, {}]", w.k);
-    let m_pad = m.div_ceil(MTILE) * MTILE;
+    // Only the hand lane pads, and only because its grid is its tiling; ask
+    // rather than assume, or a decode step slices fifteen rows that were never
+    // computed.
+    let rows = rows_for(w.align, m);
     let client = client_of(&x);
     let dev = x.device();
-    let out = crate::models::inkling::bf16gemm::linear_bf16(&client, &handle_of(x), w, m, m_pad);
-    tensor_of(client, dev, out, m_pad, w.n).slice([0..m, 0..w.n])
+    let out = crate::models::inkling::bf16gemm::linear_bf16(&client, &handle_of(x), w, m);
+    tensor_of(client, dev, out, rows, w.n).slice([0..m, 0..w.n])
 }
 
 /// RMS normalization with a per-feature gain.
@@ -654,7 +657,7 @@ mod tests {
             for x in fill(rows * cols, seed) {
                 bytes.extend_from_slice(&half::bf16::from_f32(x).to_le_bytes());
             }
-            Bf16W { h: client.create_from_slice(&bytes), n: rows, k: cols }
+            Bf16W { h: client.create_from_slice(&bytes), n: rows, k: cols, align: 16 }
         };
         let (q_w, kv_w) = (d.heads * d.head_dim, d.kv_heads * d.head_dim);
         AttnWeightsDev {

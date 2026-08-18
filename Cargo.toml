@@ -71,6 +71,13 @@ libm = { version = "0.2", optional = true }
 burn-train = { version = "0.21.0", optional = true }
 burn-ndarray = { version = "0.21.0", optional = true }
 cubecl = { version = "0.10.0", default-features = false, features = ["wgpu", "std"], optional = true }
+# The tuned matmul kernels burn itself dispatches to, reached DIRECTLY. The
+# inkling lane holds raw cubecl handles rather than Burn tensors (the weights
+# are the pile's own BF16 mapping), so it cannot call `Tensor::matmul`; but
+# `cubek::matmul::launch::launch_ref` takes bindings, which is exactly what a
+# handle is. Already in the graph via burn-cubecl -- naming it here adds no
+# crate, only the ability to call it.
+cubek = { version = "0.2", default-features = false, features = ["std", "stdlib", "matmul"], optional = true }
 wgpu = { version = "29", optional = true }
 pollster = { version = "0.4", optional = true }
 memmap2 = { version = "0.9", optional = true }
@@ -130,6 +137,7 @@ inkling-cuda = [
     "burn/cuda",
     "dep:cubecl",
     "cubecl?/cuda",
+    "dep:cubek",
     # `burn-cubecl` is here for ONE type: `CubeTensor`, which is what a Burn
     # tensor on the CUDA backend already is underneath. Naming it is how
     # `models::inkling::seam` gets at the device buffer behind a Burn tensor

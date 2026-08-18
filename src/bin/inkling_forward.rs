@@ -414,11 +414,67 @@ fn bind_bf16(
         "{rows}x{cols} does not tile as m16n8k16; this lane multiplies BF16 by BF16 and \
          widening to reach a shape is what rule 3 forbids"
     );
+    let align = note_align(bytes, rows, cols);
+    // `INK_ALIGN_COPY=1`: pay a COPY for a weight the alias seam can only place
+    // at 4 or 8, and buy the tuned GEMM lane for it. The trade is device bytes
+    // against kernel throughput and it is measured both ways rather than
+    // assumed; the default is to alias and take the hand kernel on those.
+    let copy_to_align = align < 16
+        && std::env::var("INK_ALIGN_COPY").map(|v| v == "1").unwrap_or(false);
     let h = match aliases {
-        Some(al) => al.slice_or_copy(client, bytes),
-        None => client.create_from_slice(bytes),
+        Some(al) if !copy_to_align => al.slice_or_copy(client, bytes),
+        _ => client.create_from_slice(bytes),
     };
-    Bf16W { h, n: rows, k: cols }
+    Bf16W { h, n: rows, k: cols, align: if copy_to_align { 16 } else { align } }
+}
+
+/// How every plain-BF16 weight is aligned, and how much of the model that is.
+///
+/// The tuned matmul picks its load width from the SHAPE and never from the
+/// pointer, so a `[4096, 4096]` operand gets 16-byte loads whatever address it
+/// sits at. The aliasing seam only promises 4 (the checkpoint packs tensors
+/// back to back and puts the expert slabs at 4 mod 16), so this counts what the
+/// dense lane actually gets before anything is decided on the strength of it.
+static ALIGN: [core::sync::atomic::AtomicU64; 8] = [const { core::sync::atomic::AtomicU64::new(0) }; 8];
+
+fn note_align(bytes: &[u8], rows: usize, cols: usize) -> usize {
+    use core::sync::atomic::Ordering::Relaxed;
+    let p = bytes.as_ptr() as usize;
+    let (slot, align) = if p % 16 == 0 {
+        (0, 16)
+    } else if p % 8 == 0 {
+        (1, 8)
+    } else if p % 4 == 0 {
+        (2, 4)
+    } else {
+        (3, 1)
+    };
+    ALIGN[slot].fetch_add(1, Relaxed);
+    ALIGN[4 + slot].fetch_add((rows * cols * 2) as u64, Relaxed);
+    align
+}
+
+/// Print the alignment census gathered by [`note_align`].
+fn report_align() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let a: Vec<u64> = ALIGN.iter().map(|c| c.load(Relaxed)).collect();
+    let n = a[0] + a[1] + a[2] + a[3];
+    if n == 0 {
+        return;
+    }
+    println!(
+        "  plain-BF16 weight binds: {n} weights, {:.2} GiB -- 16B {} ({:.2} GiB), 8B {} ({:.2} GiB), \
+         4B {} ({:.2} GiB), worse {} ({:.2} GiB)",
+        (a[4] + a[5] + a[6] + a[7]) as f64 / GIB,
+        a[0],
+        a[4] as f64 / GIB,
+        a[1],
+        a[5] as f64 / GIB,
+        a[2],
+        a[6] as f64 / GIB,
+        a[3],
+        a[7] as f64 / GIB
+    );
 }
 
 impl DeviceDense {
@@ -1076,7 +1132,7 @@ fn grouped_experts_fp4(
 
     let t_c = Instant::now();
     let acc_h = scatter_weighted(
-        client, &y_h, &h_rowwgt, &h_tokrows, &h_tokcnt, m_total, n, h, plan.kmax,
+        client, &y_h, &h_rowwgt, &h_tokrows, &h_tokcnt, &h_rowtok, m_total, n, h, plan.kmax,
     );
     let acc = tensor_of(client.clone(), dev.clone(), acc_h, n, h);
     host.accum += t_c.elapsed().as_secs_f64();
@@ -1319,7 +1375,7 @@ fn grouped_experts_bf16(
 
     let t_c = Instant::now();
     let acc_h = scatter_weighted(
-        client, &y_h, &h_rowwgt, &h_tokrows, &h_tokcnt, m_total, n, h, plan.kmax,
+        client, &y_h, &h_rowwgt, &h_tokrows, &h_tokcnt, &h_rowtok, m_total, n, h, plan.kmax,
     );
     let acc = tensor_of(client.clone(), dev.clone(), acc_h, n, h);
     host.accum += t_c.elapsed().as_secs_f64();
@@ -1922,9 +1978,12 @@ fn main() -> Result<()> {
             Bf16W::tileable(rows, cols),
             "unembed {rows}x{cols} does not tile as m16n8k16"
         );
+        let align = note_align(&leaf.bytes, rows, cols);
+        let copy_to_align = align < 16
+            && std::env::var("INK_ALIGN_COPY").map(|v| v == "1").unwrap_or(false);
         let hnd = match fp4_aliases.as_ref() {
-            Some(al) => al.slice_or_copy(&fp4_client, &leaf.bytes),
-            None => fp4_client.create_from_slice(&leaf.bytes),
+            Some(al) if !copy_to_align => al.slice_or_copy(&fp4_client, &leaf.bytes),
+            _ => fp4_client.create_from_slice(&leaf.bytes),
         };
         println!(
             "  unembed BOUND as BF16, {rows} x {cols} = {:.2} GiB stored (the f32 lane it \
@@ -1932,7 +1991,7 @@ fn main() -> Result<()> {
             leaf.bytes.len() as f64 / GIB,
             2.0 * leaf.bytes.len() as f64 / GIB
         );
-        Some(Bf16W { h: hnd, n: rows, k: cols })
+        Some(Bf16W { h: hnd, n: rows, k: cols, align: if copy_to_align { 16 } else { align } })
     } else {
         None
     };
@@ -2598,6 +2657,18 @@ fn main() -> Result<()> {
     let want_host_x = is_head || mtp_k > 0 || dump_dir.is_some();
     let x: Vec<f32> = if want_host_x { down(xd.clone()) } else { Vec::new() };
 
+    // Does anything downstream need a logit row that is NOT the last one?
+    //
+    // The argmax reads exactly one row -- the last -- and that is the whole of
+    // what a forward produces. Every other row of the head exists for the
+    // REPORT: the per-position top-5 table and the `INK_DUMP_DIR` capture. On a
+    // 512-token prefill those rows are 512 x 200058 f32 = 410 MB read back
+    // across the bus, on top of a 4096-wide GEMM over 512 rows instead of 16.
+    // So they are computed when a reader has asked for them and not otherwise.
+    // `INK_ALL_LOGITS=1` is that ask; a dump implies it.
+    let all_logits =
+        dump_dir.is_some() || std::env::var("INK_ALL_LOGITS").map(|val| val == "1").unwrap_or(false);
+
     // ---- head, or the wire in its place ------------------------------------
     let v = t.effective_vocab();
     let t_h = Instant::now();
@@ -2607,6 +2678,10 @@ fn main() -> Result<()> {
     // slot the head/unembed occupies on a whole-stack run — which is what makes
     // the two reports read against each other line for line.
     let mut best_wire = None;
+    // Which position `logits[0]` is. The head computes `logit_row0..n`, so this
+    // is 0 when everything was asked for and `n - 1` when only the argmax's row
+    // was. A head computes nothing and the value is unread there.
+    let logit_row0 = if all_logits { 0 } else { n - 1 };
     let logits = if let Some(Pipe::Head(s)) = pipe.as_mut() {
         send_stream(s, n, pos0, &x)?;
         let mut back = [0u8; 8];
@@ -2620,14 +2695,25 @@ fn main() -> Result<()> {
         // not a reference, it is an afternoon. The muP divisor divides BEFORE
         // the projection, matching the reference: doing it after is
         // algebraically equal and numerically not.
+        //
+        // The rows: `logit_row0..n`, which is the last row alone unless a
+        // reporter asked for all of them. The unembedding is the widest matmul
+        // in the stack (n x 4096 x 200058) and the only consumer of all but its
+        // final row is a print, so the slice happens on the INPUT -- before the
+        // GEMM and before the readback -- rather than after both.
+        let hx = if all_logits {
+            xd.clone()
+        } else {
+            xd.clone().slice([logit_row0..n, 0..h])
+        };
         let hs = dev_lane::rms_norm(
-            xd.clone(),
+            hx,
             fnorm_dev.clone().expect("the tail owns the final norm"),
             t.rms_norm_eps,
         )
         .div_scalar(t.logits_mup_width_multiplier as f32);
         let uw = unembed_w.as_ref().expect("the tail binds the unembed table");
-        down(dev_lane::linear_bf16(hs, uw).slice([0..n, 0..v]))
+        down(dev_lane::linear_bf16(hs, uw).slice([0..n - logit_row0, 0..v]))
     };
     let t_head = t_h.elapsed().as_secs_f64();
 
@@ -2638,7 +2724,7 @@ fn main() -> Result<()> {
     let best = match best_wire {
         Some(b) => b,
         None => {
-            let last = &logits[(n - 1) * v..n * v];
+            let last = &logits[(n - 1 - logit_row0) * v..(n - logit_row0) * v];
             let mut best = 0usize;
             for (i, &val) in last.iter().enumerate() {
                 if val > last[best] {
@@ -3055,6 +3141,7 @@ fn main() -> Result<()> {
     if std::env::var("INK_IOSTATS").is_ok() {
         print!("{}", cp.io_table(28));
     }
+    report_align();
     println!("  elapsed: {:.1}s", started.elapsed().as_secs_f32());
 
 
@@ -3069,9 +3156,9 @@ fn main() -> Result<()> {
     }
     // A head has no logits to rank -- the tail owns the table, and writes it.
     if (kv || step == gen_steps) && best_wire.is_none() {
-        for ti in 0..n {
+        for ti in logit_row0..n {
             let pos = pos0 + ti;
-            let row = &logits[ti * v..(ti + 1) * v];
+            let row = &logits[(ti - logit_row0) * v..(ti - logit_row0 + 1) * v];
             let mut idx: Vec<usize> = (0..v).collect();
             idx.sort_unstable_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap());
             let top: Vec<usize> = idx[..5].to_vec();

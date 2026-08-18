@@ -31,18 +31,24 @@
 //! the one price of the design and it is paid in the index arithmetic, not in
 //! traffic.
 //!
-//! # The accumulation order is the same order, deliberately
+//! # How the scatter sums
 //!
-//! The per-expert lane scattered with `select_assign(Add)` once per expert, in
-//! `BTreeMap` order, into a zeroed accumulator. A token's contributions were
-//! therefore summed smallest-expert-first, and each `select_assign` was its own
-//! kernel so the order was the enqueue order.
+//! [`scatter_weighted`] gives one thread each `(token, column)` and has it walk
+//! that token's contributing rows in ascending row order, accumulating in a
+//! register. Rows are laid out in `BTreeMap` expert order, so ascending row
+//! order is ascending expert order — the same order the per-expert lane's chain
+//! of `select_assign(Add)` produced, which is why the two lanes agreed exactly
+//! when this replaced that one.
 //!
-//! An atomic scatter would break exactly that and would break it
-//! nondeterministically, so [`scatter_weighted`] does not use one. It gives one
-//! thread each `(token, column)` and has it walk that token's contributing rows
-//! in ASCENDING row order — and rows are laid out in `BTreeMap` order, so
-//! ascending row order IS ascending expert order.
+//! That agreement was a convenient property of the port, not a requirement on
+//! it. **This is not a prohibition on an atomic scatter.** An atomic float add
+//! reassociates the sum and gives up run-to-run reproducibility, and neither of
+//! those is a gate here (see the yardstick two sections down: this runtime
+//! already disagrees with itself on 8.55% of argmax positions between two runs
+//! of the same binary). The one-thread-per-output-element walk is where this
+//! started because it needs no atomics and no extra pass; whether an atomic
+//! scatter beats it is a measurement, and `INK_SCATTER=atomic` is the arm that
+//! takes it.
 //!
 //! # The weight multiply stays INSIDE the sum
 //!
@@ -464,12 +470,16 @@ pub fn bf16_linear_grouped_launch<R: Runtime>(
 
 /// `out[t, :] = sum over t's rows of y[r, :] * wgt[r]`, in ascending `r`.
 ///
-/// One thread per output element, walking that token's contributing rows. NOT
-/// an atomic scatter: the sum has to be the same sum in the same ORDER the
-/// per-expert lane's chain of `select_assign(Add)` made, and an atomic add
-/// gives neither. `tok_rows` is `[n, kmax]` row-major with `tok_cnt[t]` valid
+/// One thread per output element, walking that token's contributing rows and
+/// accumulating in a register: no atomics, no second pass, and one write per
+/// output element. `tok_rows` is `[n, kmax]` row-major with `tok_cnt[t]` valid
 /// entries in each row, ascending — which is `BTreeMap` expert order, because
 /// that is the order the rows were laid out in.
+///
+/// The gather side of this is a `k`-deep strided read per output element, so
+/// the alternative shape — one thread per INPUT row, atomically adding into the
+/// output — is a real candidate and not a forbidden one; see
+/// [`scatter_weighted_atomic_kernel`] and the measurement in its doc.
 ///
 /// The multiply is inside the accumulation, so it contracts to `fma.rn.f32`:
 /// one rounding per term where the lane this replaces takes two. That is the
@@ -511,11 +521,15 @@ pub fn scatter_weighted<R: Runtime>(
     wgt: &Handle,
     tok_rows: &Handle,
     tok_cnt: &Handle,
+    row_tok: &Handle,
     m_total: usize,
     n: usize,
     h: usize,
     kmax: usize,
 ) -> Handle {
+    if std::env::var("INK_SCATTER").map(|v| v == "atomic").unwrap_or(false) {
+        return scatter_weighted_atomic(client, y, wgt, row_tok, m_total, n, h);
+    }
     let total = n * h;
     let out = client.empty(total * core::mem::size_of::<f32>());
     let cubes = total.div_ceil(CUBE_SIZE as usize) as u32;
@@ -532,6 +546,103 @@ pub fn scatter_weighted<R: Runtime>(
             kmax,
             h,
             total,
+        );
+    }
+    out
+}
+
+/// Zero an `[n]` f32 buffer. The atomic scatter accumulates INTO its output, so
+/// the output has to start at zero, and `client.empty` does not promise that.
+#[cube(launch_unchecked)]
+fn zero_f32_kernel(out: &mut Array<f32>, total: usize) {
+    let p = ABSOLUTE_POS as usize;
+    if p < total {
+        out[p] = f32::new(0.0f32);
+    }
+}
+
+/// The same product as [`scatter_weighted_kernel`], shaped the other way round:
+/// one thread per INPUT element, adding its weighted value into the output
+/// atomically.
+///
+/// The two differ in what they make contiguous. The gather kernel writes each
+/// output element once and reads `cnt` rows `h` apart to do it; this one reads
+/// its input element once, coalesced with its whole warp, and pays an atomic
+/// per term instead. Which wins is a property of `kmax`, `h` and how many rows
+/// collide on one output element, i.e. of the routing — so it is measured, not
+/// argued. `INK_SCATTER=atomic` selects it.
+///
+/// **Measured on this box, and it does not pay.** Layers 0:8, `INK_ALIGN_COPY=1`,
+/// p50 of `pass_ms` over 24 warm passes:
+///
+///   512-token prefill    gather 339.8 ms   atomic 339.7 ms
+///   decode, INK_KV=1     gather  46.4 ms   atomic  46.9 ms
+///
+/// Both differences are far inside the 2-3 ms run-to-run drift of one binary.
+/// The arm stays because a negative with a number is worth keeping and because
+/// the routing that makes it negative is not a constant of the model — a
+/// heavier `kmax` or a narrower `h` moves the balance — but the gather kernel
+/// stays the default.
+///
+/// An atomic float add reassociates the sum, so the two arms produce different
+/// argmaxes on some positions. That is allowed and it is not what decides
+/// between them: see the module doc's yardstick — this runtime already
+/// disagrees with itself on 8.55% of argmax positions between two runs of the
+/// same binary.
+#[cube(launch_unchecked)]
+fn scatter_weighted_atomic_kernel(
+    y: &Array<f32>,
+    wgt: &Array<f32>,
+    row_tok: &Array<i32>,
+    out: &mut Array<Atomic<f32>>,
+    h: usize,
+    total: usize,
+) {
+    let p = ABSOLUTE_POS as usize;
+    if p < total {
+        let r = p / h;
+        let c = p % h;
+        let t = row_tok[r];
+        // `-1` is an MMA row-tile pad: a row that belongs to no token and whose
+        // output is arithmetic on zeros.
+        if t >= 0 {
+            out[t as usize * h + c].fetch_add(y[p] * wgt[r]);
+        }
+    }
+}
+
+/// Launch [`scatter_weighted_atomic_kernel`], returning the `[n, h]` accumulator.
+#[allow(clippy::too_many_arguments)]
+pub fn scatter_weighted_atomic<R: Runtime>(
+    client: &ComputeClient<R>,
+    y: &Handle,
+    wgt: &Handle,
+    row_tok: &Handle,
+    m_total: usize,
+    n: usize,
+    h: usize,
+) -> Handle {
+    let total = n * h;
+    let out = client.empty(total * core::mem::size_of::<f32>());
+    unsafe {
+        zero_f32_kernel::launch_unchecked::<R>(
+            client,
+            CubeCount::new_1d(total.div_ceil(CUBE_SIZE as usize) as u32),
+            CubeDim::new_1d(CUBE_SIZE),
+            ArrayArg::from_raw_parts(out.clone(), total),
+            total,
+        );
+        let src = m_total * h;
+        scatter_weighted_atomic_kernel::launch_unchecked::<R>(
+            client,
+            CubeCount::new_1d(src.div_ceil(CUBE_SIZE as usize) as u32),
+            CubeDim::new_1d(CUBE_SIZE),
+            ArrayArg::from_raw_parts(y.clone(), src),
+            ArrayArg::from_raw_parts(wgt.clone(), m_total),
+            ArrayArg::from_raw_parts(row_tok.clone(), m_total),
+            ArrayArg::from_raw_parts(out.clone(), total),
+            h,
+            src,
         );
     }
     out
