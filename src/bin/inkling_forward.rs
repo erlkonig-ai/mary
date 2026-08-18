@@ -1459,6 +1459,22 @@ fn main() -> Result<()> {
     // they are printed, they read zero, and a zero that is measured is worth
     // more than a claim that is asserted.
     let (t_h_norm, mut t_h_route, mut t_h_sconv, t_h_resid) = (0f64, 0f64, 0f64, 0f64);
+    // The router bucket, split three ways. It used to be one number, and one
+    // number cannot distinguish "the matmul was described" from "the host waited
+    // for every kernel this layer had already issued" from "the top-k ran on a
+    // CPU". At decode the whole bucket is the middle one, and that is only
+    // visible once the other two are subtracted out.
+    let (mut t_rt_mm, mut t_rt_read, mut t_rt_host) = (0f64, 0f64, 0f64);
+    // `INK_STAGE_SYNC=1` inserts an explicit device sync at each stage boundary
+    // in the block and charges the wait to that stage. It is OPT-IN and off by
+    // default because it SERIALISES the lane: with it on the pass is slower, and
+    // the comparison that matters is probe-on-total against probe-off-total.
+    // It changes no arithmetic -- a sync is a wait, not an operation -- so both
+    // arms emit the same tokens, which is itself checked below.
+    let stage_sync = std::env::var("INK_STAGE_SYNC").map(|v| v == "1").unwrap_or(false);
+    let (mut d_attn, mut d_router, mut d_expert, mut d_shared, mut d_tail) =
+        (0f64, 0f64, 0f64, 0f64, 0f64);
+    let mut stage_syncs = 0usize;
 
     // Per-layer diagnostics, COLLECTED rather than printed inside the loop.
     //
@@ -1485,6 +1501,20 @@ fn main() -> Result<()> {
             Some(up2::<Bk>(mask_global.clone(), n, n, &dev)),
         )
     };
+
+    // One sync, charged to one stage. Written as a macro rather than a closure
+    // because every call site names a different accumulator and a closure would
+    // have to borrow all five of them mutably at once.
+    macro_rules! stage_sync {
+        ($acc:expr) => {
+            if stage_sync {
+                let s = Instant::now();
+                <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("stage sync");
+                $acc += s.elapsed().as_secs_f64();
+                stage_syncs += 1;
+            }
+        };
+    }
 
     for layer in lo..hi {
         // Cache slot, not layer number. A tail running 20..42 keeps 22 caches
@@ -1625,6 +1655,7 @@ fn main() -> Result<()> {
         };
         xd = xd + a;
 
+        stage_sync!(d_attn);
         // ---- MLP ----------------------------------------------------------
         t_attn += t_a.elapsed().as_secs_f64();
         let t_o = Instant::now();
@@ -1650,7 +1681,13 @@ fn main() -> Result<()> {
             // scheduling, because which weights to read next is a function of
             // the number that just came back.
             let t_rt = Instant::now();
-            let logits = down(dev_lane::linear(hn.clone(), r.w.clone()));
+            let lg = dev_lane::linear(hn.clone(), r.w.clone());
+            t_rt_mm += t_rt.elapsed().as_secs_f64();
+            stage_sync!(d_router);
+            let t_rr = Instant::now();
+            let logits = down(lg);
+            t_rt_read += t_rr.elapsed().as_secs_f64();
+            let t_rh = Instant::now();
             let routing: Vec<Routing> = route_from_logits(
                 &logits, &r.bias, r.global_scale, t.route_scale as f32,
                 n, t.n_routed_experts, t.n_shared_experts, t.num_experts_per_tok,
@@ -1663,6 +1700,7 @@ fn main() -> Result<()> {
                     by_expert.entry(e).or_default().push((ti, rt.weights[slot]));
                 }
             }
+            t_rt_host += t_rh.elapsed().as_secs_f64();
             t_h_route += t_rt.elapsed().as_secs_f64();
 
             // `INK_ROUTE_LOG=<path>` appends this layer's routing, one line per
@@ -1719,6 +1757,7 @@ fn main() -> Result<()> {
             // stack, which is where it belongs and where it cannot be
             // misattributed to whichever bucket happened to hold the readback.
             t_expert += t_d.elapsed().as_secs_f64();
+            stage_sync!(d_expert);
 
             let ns = t.n_shared_experts;
             let gammas: Vec<f32> = routing.iter().flat_map(|rt| rt.shared_gammas.clone()).collect();
@@ -1733,6 +1772,7 @@ fn main() -> Result<()> {
                 )?;
                 shared_experts_bf16(&dev, hn, sw, &gammas, ns)
             };
+            stage_sync!(d_shared);
             t_shared += t_s.elapsed().as_secs_f64();
             acc + sh
         };
@@ -1759,6 +1799,7 @@ fn main() -> Result<()> {
         };
         t_h_sconv += t_sc.elapsed().as_secs_f64();
         xd = xd + y;
+        stage_sync!(d_tail);
 
         // A debug dump is a SYNC, and it is the one place left in the loop that
         // costs one. That is the trade: this path exists to compare against a
@@ -2165,10 +2206,21 @@ fn main() -> Result<()> {
              ms(t_other - t_expert - t_shared - t_h_route - t_h_sconv));
     println!("      router + group  {:9.1}   BLOCKS: [n,{}] logits back, then top-k on the host",
              ms(t_h_route), t.n_routed_experts + t.n_shared_experts);
+    println!("        of which: matmul enqueue {:7.1}, BLOCKING read {:7.1}, top-k + group {:7.1}",
+             ms(t_rt_mm), ms(t_rt_read), ms(t_rt_host));
     println!("      mlp short_conv  {:9.1}", ms(t_h_sconv));
     println!("      first-touch uploads: read+widen {:9.1}, transfer {:9.1}   (once per layer, not per token)",
              ms(t_attn_read), ms(t_attn_up));
     println!("    DEVICE, one sync for this node's whole stack: {:9.1}", ms(t_stack_sync));
+    if stage_sync {
+        println!("    DEVICE per stage (INK_STAGE_SYNC=1 -- {stage_syncs} extra syncs, this pass IS slower for them):");
+        println!("      attention half  {:9.1}", ms(d_attn));
+        println!("      router matmul   {:9.1}", ms(d_router));
+        println!("      routed experts  {:9.1}", ms(d_expert));
+        println!("      shared experts  {:9.1}", ms(d_shared));
+        println!("      sconv + resid   {:9.1}", ms(d_tail));
+        println!("      staged total    {:9.1}", ms(d_attn + d_router + d_expert + d_shared + d_tail));
+    }
     println!(
         "    {:17} {:9.1}   ({})",
         if best_wire.is_some() { "tail + wire" } else { "head / unembed" },
