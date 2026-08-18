@@ -198,7 +198,7 @@ pub fn mtp_block_prefill(
 ) -> (Vec<f32>, MtpCache) {
     let x = mtp_input(hidden, embeds, head, dims, tokens, order);
     let mask = causal_mask(tokens, window);
-    let (y, _, cache) = decoder_layer_prefill(
+    let (y, cache) = decoder_layer_prefill(
         &x,
         &head.lw,
         &head.aw,
@@ -230,7 +230,7 @@ pub fn mtp_block_step(
     order: Concat,
 ) -> Vec<f32> {
     let x = mtp_input(hidden, embeds, head, dims, 1, order);
-    let (y, _) = decoder_layer_step(
+    decoder_layer_step(
         &x,
         &head.lw,
         &head.aw,
@@ -240,6 +240,5 @@ pub fn mtp_block_step(
         pos,
         window,
         cache,
-    );
-    y
+    )
 }

@@ -59,6 +59,18 @@
 //! lane nobody tests; a host lane you CAN select is one you will run by
 //! accident, which is how a 401 s forward happened.
 //!
+//! The host lane is now gone from the LIBRARY as well, not just from the
+//! switches here. `mlp::routed_experts`, `mlp::shared_experts`, `mlp::moe` and
+//! `mlp::expert_ffn_one` were unreachable from this file and still cost real
+//! work: they were the readable transcription of the routed algorithm, so an
+//! agent asked to make the experts faster found THEM, and twice in one day
+//! someone analysed how to parallelise a function no forward calls. Legibility
+//! attracts effort, which means the legible version has to be the live one.
+//! [`routed_experts_fp4`]'s doc comment is where that statement of the
+//! algorithm lives now. What survives on the host is `mlp::dense_mlp` and
+//! `layer::decoder_layer`, and neither is a fallback: they are the only
+//! implementation the MTP heads have.
+//!
 //! Mixed precision is not a second lane either. Layer 2's experts are BF16 and
 //! the other 41 layers' are NVFP4, so the routed block picks the instruction the
 //! stored format calls for — `mma.sync…bf16` or the block-scaled
@@ -367,7 +379,7 @@ impl MtpOwned {
                 k_norm: &self.k_norm.data,
                 rel_proj: &self.rel_proj.data,
             },
-            mlp: LayerMlp::Dense {
+            mlp: LayerMlp {
                 gate: &self.gate,
                 up: &self.up,
                 down: &self.down.data,
@@ -768,13 +780,56 @@ struct LayerDev {
 
 /// Every routed expert for one layer, on the NATIVE NVFP4 tensor-core path.
 ///
+/// # What a routed MoE block computes
+///
+/// This is written out because it used to be written out somewhere else. A
+/// scalar f32 host transcription (`mlp::routed_experts`, over
+/// `mlp::expert_ffn_one`) served as the readable statement of the algorithm and
+/// was deleted; it had no caller in the data plane, and being the legible
+/// version of a hot function is exactly what made people optimise it instead of
+/// this. So the legibility moves here, to the code that runs.
+///
+/// The router has already chosen, per token, `top_k` experts and a weight for
+/// each. `by_expert` is that decision INVERTED — keyed by expert, listing
+/// `(token row, routing weight)` — because a weight is 12.6 MB and a token row
+/// is 16 KB, so the loop that must not be repeated is the one over weights.
+/// Each expert then computes, for every token routed to it:
+///
+/// ```text
+/// both = x  · w13ᵀ            w13 is [2 * intermediate, hidden], GATE rows first
+/// act  = silu(both[..I]) * both[I..]                       I = intermediate
+/// y    = act · w2ᵀ            w2  is [hidden, intermediate]
+/// out[token] += y * weight
+/// ```
+///
+/// Four things in that are easy to get wrong and are each pinned somewhere:
+///
+/// * the gate half comes FIRST in `w13`, and the checkpoint stores the two
+///   halves INTERLEAVED (`g0, u0, g1, u1, …`). `2 * intermediate == hidden` in
+///   both releases, so the fused matrix is square and a transposed or
+///   un-deinterleaved reading loads without complaint and computes nonsense.
+///   The de-interleave happens once, at import, and `inkling_fp4_expert_gate`
+///   holds one whole real expert to an f64 arbiter over the same operands.
+/// * the routing weight multiplies the expert's OUTPUT, once, after `w2` — not
+///   the activation, and not the input.
+/// * a token's contributions from its `top_k` experts are SUMMED, so the
+///   scatter-add below is an add and not a write.
+/// * the shared experts do NOT read this function's output. They run beside it
+///   on the same normed input — see [`shared_experts_bf16`].
+///
+/// # This lane, and the two it replaced
+///
 /// The only routed lane there is. The packed bytes go straight into
-/// `mma.sync…kind::mxf4nvf4…ue4m3`. The lane this replaced (`INK_EXPERTS=gpu`)
-/// decoded each expert into a 67.1 + 33.6 MB f32 pair, multiplied THAT, and
-/// dropped it — 100 MB of device memory materialised per expert to hold a
-/// weight the pile stores in 12.6, four times a token per layer. It is gone
-/// rather than kept as a control, because the control was a widening and the
-/// whole point of an NVFP4 model is that the weight is never widened.
+/// `mma.sync…kind::mxf4nvf4…ue4m3`. The device lane this replaced
+/// (`INK_EXPERTS=gpu`) decoded each expert into a 67.1 + 33.6 MB f32 pair,
+/// multiplied THAT, and dropped it — 100 MB of device memory materialised per
+/// expert to hold a weight the pile stores in 12.6, four times a token per
+/// layer. It is gone rather than kept as a control, because the control was a
+/// widening and the whole point of an NVFP4 model is that the weight is never
+/// widened. The host lane is gone for the sibling reason: an f32 reference
+/// demands agreement at a precision a bfloat16 model with 4-bit weights does not
+/// have, so "the device matches the host" would have been a statement about
+/// which of the two was written first.
 ///
 /// Activations are quantised to E2M1 in dynamic per-16 blocks with E4M3
 /// scales, which the instruction requires and which is what the checkpoint's
@@ -874,7 +929,9 @@ fn routed_experts_fp4(
 
 /// The same lane for layer 2, whose experts are BF16.
 ///
-/// Deliberately the same shape as [`routed_experts_fp4`], line for line: the
+/// Deliberately the same shape as [`routed_experts_fp4`], line for line — and
+/// that doc comment is where the algorithm is written down, since the host
+/// transcription that used to hold it is deleted. The
 /// same `select` gather, the same pointer-containment binding, the same
 /// `select_assign` in `BTreeMap` order. What the format takes away is all that
 /// differs — no block scales to bind, no `scale2` to fold in, no activation

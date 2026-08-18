@@ -1,30 +1,49 @@
-//! Inkling MLPs — dense, routed experts, shared experts — the f32 reference lane.
+//! Inkling's DENSE MLP on the host — what the MTP heads run, and nothing else.
 //!
 //! Semantics from `transformers.models.inkling.modeling_inkling`, gated by
-//! `inkling_layer_gate`. Three things here are easy to get wrong:
+//! `inkling_layer_gate`.
 //!
-//! * The stacked expert matrix is `[experts, 2 * intermediate, hidden]`, laid
-//!   out the way `nn.Linear` stores a weight. In BOTH released checkpoints
-//!   `2 * intermediate == hidden`, so it is square and a transposed reading
-//!   loads without complaint and computes nonsense. The oracle config makes it
-//!   non-square on purpose so the gate can see the difference.
-//! * **`shared_w13_weight` is square for the same reason, and had the same
-//!   hazard with no warning attached.** `[n_shared, 2 * intermediate, hidden]`
-//!   = `[2, 4096, 4096]`, so neither its shape nor any total sum distinguishes
-//!   the INTERLEAVED reading (`g0, u0, g1, u1, …`) from the HALVED one (all
-//!   gates, then all ups) — the two splits are permutations of each other and
-//!   have the identical total. It is INTERLEAVED, settled by running both on a
-//!   real forward: ' Paris' at top-1 logit 18.69 against '<|begin_of_text|>' at
-//!   8.94, the latter emitting no English at all. `load::split_shared_w13` is
-//!   the one place that does the split, `inkling_real_gate` asserts the
-//!   orientation against the oracle, and `INK_SHARED_W13_HALVED=1` re-runs the
-//!   experiment.
-//! * The shared experts consume the MoE block's **original input**, not the
-//!   routed output — they run beside the routed path, not after it.
-//! * The dense MLP has its own `global_scale` scalar, applied to the block's
-//!   output. It is one multiply and trivially forgotten.
-
-use crate::models::inkling::block::Routing;
+//! # What was here, and why it is gone
+//!
+//! An f32 host reference for the WHOLE MoE block — `expert_ffn_one`,
+//! `routed_experts`, `shared_experts`, `moe` — sat beside these three functions
+//! and was the readable transcription of the routed lane. It is deleted, and not
+//! for tidiness. It was a lane with no caller in the data plane and a shape that
+//! invited work: it read as the algorithm, so anyone asked to make the routed
+//! experts faster found IT first and optimised a function the forward never
+//! calls. That happened twice in one day. The live routed lane is
+//! `inkling_forward::routed_experts_fp4` (NVFP4) and `routed_experts_bf16`
+//! (layer 2), and the algorithm those two implement is now documented there,
+//! where the code is.
+//!
+//! The gates that ran against it went with it: an f32 reference demands a
+//! precision this model does not have. Inkling is bfloat16 with NVFP4 experts,
+//! so "the device agrees with the f32 host lane" is a claim about which
+//! implementation was written first. `inkling_bf16_expert_gate` and
+//! `inkling_fp4_expert_gate` are what replaced it, and both hold the device
+//! kernels to something Python wrote.
+//!
+//! # Why the dense MLP stays
+//!
+//! It is not a second implementation of anything. The main stack's dense layers
+//! are on the device (`inkling_forward::dense_mlp_bf16`); this is what the MTP
+//! heads run, and the MTP heads have no device lane at all. Deleting it would
+//! delete multi-token prediction, not a fallback.
+//!
+//! One hazard survives the deletion and is recorded here because the file it was
+//! written in is the one that shrank. `shared_w13_weight` is
+//! `[n_shared, 2 * intermediate, hidden]` = `[2, 4096, 4096]` in both released
+//! checkpoints, so neither its shape nor any total sum distinguishes the
+//! INTERLEAVED reading (`g0, u0, g1, u1, …`) from the HALVED one (all gates,
+//! then all ups) — the two splits are permutations of each other and have the
+//! identical total. It is INTERLEAVED, settled by running both on a real
+//! forward: ' Paris' at top-1 logit 18.69 against '<|begin_of_text|>' at 8.94,
+//! the latter emitting no English at all. `load::split_shared_w13` is the one
+//! place that does the split and `INK_SHARED_W13_HALVED=1` re-runs the
+//! experiment.
+//!
+//! The dense MLP has its own `global_scale` scalar, applied to the block's
+//! output. It is one multiply and trivially forgotten.
 
 /// `x * sigmoid(x)` — `hidden_act` is silu in both releases.
 fn silu(x: f32) -> f32 {
@@ -65,115 +84,4 @@ pub fn dense_mlp(
         *v *= global_scale;
     }
     out
-}
-
-/// One expert's feed-forward on one token: `down(silu(gate) * up)`.
-///
-/// `gate_up` is `[2 * intermediate, hidden]` with the gate rows FIRST; the
-/// checkpoint interleaves them and `load::deinterleave_fused` puts them in this
-/// order. This is the unit the Burn lane implements, so both lanes call the
-/// same arithmetic rather than two transcriptions of it.
-pub fn expert_ffn_one(x: &[f32], gate_up: &[f32], down: &[f32], hidden: usize, inter: usize) -> Vec<f32> {
-    assert_eq!(x.len(), hidden);
-    let both = linear(x, gate_up, 1, hidden, 2 * inter);
-    let act: Vec<f32> = (0..inter).map(|i| silu(both[i]) * both[inter + i]).collect();
-    linear(&act, down, 1, inter, hidden)
-}
-
-/// Routed experts over a stacked `[experts, 2 * intermediate, hidden]` matrix.
-///
-/// Each token goes to its `top_k` experts, is weighted by that expert's routing
-/// weight, and the contributions are summed.
-pub fn routed_experts(
-    x: &[f32],
-    gate_up: &[f32],
-    down: &[f32],
-    routing: &[Routing],
-    experts: usize,
-    tokens: usize,
-    hidden: usize,
-    inter: usize,
-) -> Vec<f32> {
-    assert_eq!(gate_up.len(), experts * 2 * inter * hidden);
-    assert_eq!(down.len(), experts * hidden * inter);
-    assert_eq!(routing.len(), tokens);
-
-    let mut out = vec![0f32; tokens * hidden];
-    for (t, r) in routing.iter().enumerate() {
-        let xt = &x[t * hidden..(t + 1) * hidden];
-        for (slot, &e) in r.experts.iter().enumerate() {
-            let gu = &gate_up[e * 2 * inter * hidden..(e + 1) * 2 * inter * hidden];
-            let dn = &down[e * hidden * inter..(e + 1) * hidden * inter];
-            let contrib = expert_ffn_one(xt, gu, dn, hidden, inter);
-            let wgt = r.weights[slot];
-            for (o, c) in out[t * hidden..(t + 1) * hidden].iter_mut().zip(&contrib) {
-                *o += c * wgt;
-            }
-        }
-    }
-    out
-}
-
-/// Shared experts: every token visits all of them, weighted by its gammas.
-///
-/// `gate` and `up` are `[shared, intermediate, hidden]`, `down` is
-/// `[shared, hidden, intermediate]`. The checkpoint concatenates gate and up
-/// into one `shared_w13_weight`; splitting it is the layout's job.
-pub fn shared_experts(
-    x: &[f32],
-    gate: &[f32],
-    up: &[f32],
-    down: &[f32],
-    gammas: &[f32],
-    n_shared: usize,
-    tokens: usize,
-    hidden: usize,
-    inter: usize,
-) -> Vec<f32> {
-    assert_eq!(gate.len(), n_shared * inter * hidden);
-    assert_eq!(up.len(), n_shared * inter * hidden);
-    assert_eq!(down.len(), n_shared * hidden * inter);
-    assert_eq!(gammas.len(), tokens * n_shared);
-
-    let mut out = vec![0f32; tokens * hidden];
-    for s in 0..n_shared {
-        let g = &gate[s * inter * hidden..(s + 1) * inter * hidden];
-        let u = &up[s * inter * hidden..(s + 1) * inter * hidden];
-        let d = &down[s * hidden * inter..(s + 1) * hidden * inter];
-        let gs = linear(x, g, tokens, hidden, inter);
-        let us = linear(x, u, tokens, hidden, inter);
-        // The gamma multiplies the activation, before the down projection.
-        let act: Vec<f32> = (0..tokens * inter)
-            .map(|i| silu(gs[i]) * us[i] * gammas[(i / inter) * n_shared + s])
-            .collect();
-        let contrib = linear(&act, d, tokens, inter, hidden);
-        for (o, c) in out.iter_mut().zip(&contrib) {
-            *o += c;
-        }
-    }
-    out
-}
-
-/// The whole MoE block: routed experts plus shared experts.
-///
-/// The shared experts see `x`, the block's input — not the routed result.
-#[allow(clippy::too_many_arguments)]
-pub fn moe(
-    x: &[f32],
-    routing: &[Routing],
-    gate_up: &[f32],
-    down: &[f32],
-    shared_gate: &[f32],
-    shared_up: &[f32],
-    shared_down: &[f32],
-    experts: usize,
-    n_shared: usize,
-    tokens: usize,
-    hidden: usize,
-    inter: usize,
-) -> Vec<f32> {
-    let gammas: Vec<f32> = routing.iter().flat_map(|r| r.shared_gammas.clone()).collect();
-    let routed = routed_experts(x, gate_up, down, routing, experts, tokens, hidden, inter);
-    let shared = shared_experts(x, shared_gate, shared_up, shared_down, &gammas, n_shared, tokens, hidden, inter);
-    routed.iter().zip(&shared).map(|(a, b)| a + b).collect()
 }

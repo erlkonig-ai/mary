@@ -7,6 +7,14 @@
 //! select at run time is a host reference you can accidentally run, and it was
 //! costing 401 s a forward when it was.
 //!
+//! The switches went first and the CODE stayed, which turned out to be the
+//! wrong half of the fix: an unreachable host MoE is not run by accident, it is
+//! WORKED ON by accident, because it is the version of the algorithm a reader
+//! can follow. That is why `mlp` now holds only the dense MLP the MTP heads
+//! need, and why the routed algorithm is spelled out in
+//! `inkling_forward::routed_experts_fp4` rather than in a function nothing
+//! calls.
+//!
 //! Scope is attention with its two short convolutions and its KV cache, the
 //! shared experts, the dense MLP and RMSNorm. The routed experts are NOT here:
 //! they go through `mma.sync...kind::mxf4nvf4` in

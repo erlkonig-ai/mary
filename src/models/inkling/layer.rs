@@ -1,4 +1,8 @@
-//! One whole Inkling decoder layer — the f32 reference lane.
+//! One whole Inkling decoder layer, on the host — what an MTP head is.
+//!
+//! Not a reference lane any more, and not a fallback: the main stack runs every
+//! layer on the device, and this is what `mtp::mtp_block` composes. See
+//! [`LayerMlp`] for the arm that WAS a reference lane and is gone.
 //!
 //! From `InklingDecoderLayer.forward`:
 //!
@@ -19,60 +23,38 @@
 use crate::models::inkling::attn::{
     attention_prefill, attention_step, AttnCache, AttnDims, AttnWeights, LogScaling,
 };
-use crate::models::inkling::block::{conv_history, rms_norm, route, short_conv, short_conv_step, Routing};
-use crate::models::inkling::mlp::{dense_mlp, moe};
+use crate::models::inkling::block::{conv_history, rms_norm, short_conv, short_conv_step};
+use crate::models::inkling::mlp::dense_mlp;
 
-/// Which MLP a layer carries. `dense_mlp_idx` picks between them, and they use
-/// different checkpoint names as well as different arithmetic.
-pub enum LayerMlp<'a> {
-    Dense {
-        gate: &'a [f32],
-        up: &'a [f32],
-        down: &'a [f32],
-        global_scale: f32,
-        inter: usize,
-    },
-    Sparse {
-        router_weight: &'a [f32],
-        router_bias: &'a [f32],
-        router_global_scale: f32,
-        route_scale: f32,
-        top_k: usize,
-        gate_up: &'a [f32],
-        down: &'a [f32],
-        shared_gate: &'a [f32],
-        shared_up: &'a [f32],
-        shared_down: &'a [f32],
-        experts: usize,
-        n_shared: usize,
-        inter: usize,
-    },
+/// A decoder layer's MLP, on the host: DENSE, because that is the only kind
+/// left here.
+///
+/// This was an enum with a `Sparse` arm beside the dense one, calling the host
+/// f32 `mlp::moe`. Both are gone. Nothing in the data plane routed through them
+/// — `inkling_forward` runs every MoE layer on the device, router projection
+/// included — and the arm's only callers were the two gates that held an f32
+/// host transcription to a Python capture. A struct rather than a one-variant
+/// enum on purpose: an enum with one arm reads as an invitation to add the
+/// second one back.
+///
+/// What still calls this is the MTP heads, and every MTP head is a DENSE block
+/// by construction (`model.mtp.*` carries `mlp.w13_dn` / `mlp.w2`, never
+/// experts), so the branch it used to select on could never have gone the other
+/// way here.
+pub struct LayerMlp<'a> {
+    pub gate: &'a [f32],
+    pub up: &'a [f32],
+    pub down: &'a [f32],
+    pub global_scale: f32,
+    pub inter: usize,
 }
 
 impl LayerMlp<'_> {
-    /// Run the MLP, returning its output and — when sparse — what the router
-    /// decided, which the gate inspects separately.
-    pub fn forward(&self, x: &[f32], tokens: usize, hidden: usize) -> (Vec<f32>, Option<Vec<Routing>>) {
-        match self {
-            LayerMlp::Dense { gate, up, down, global_scale, inter } => (
-                dense_mlp(x, gate, up, down, *global_scale, tokens, hidden, *inter),
-                None,
-            ),
-            LayerMlp::Sparse {
-                router_weight, router_bias, router_global_scale, route_scale, top_k,
-                gate_up, down, shared_gate, shared_up, shared_down, experts, n_shared, inter,
-            } => {
-                let routing = route(
-                    x, router_weight, router_bias, *router_global_scale, *route_scale,
-                    tokens, hidden, *experts, *n_shared, *top_k,
-                );
-                let y = moe(
-                    x, &routing, gate_up, down, shared_gate, shared_up, shared_down,
-                    *experts, *n_shared, tokens, hidden, *inter,
-                );
-                (y, Some(routing))
-            }
-        }
+    /// Run the MLP. No second return value: the router's decision was the only
+    /// thing a caller ever wanted back out of here, and there is no router on
+    /// this lane any more.
+    pub fn forward(&self, x: &[f32], tokens: usize, hidden: usize) -> Vec<f32> {
+        dense_mlp(x, self.gate, self.up, self.down, self.global_scale, tokens, hidden, self.inter)
     }
 }
 
@@ -116,10 +98,8 @@ pub fn decoder_layer(
     mlp: &LayerMlp<'_>,
     mask: &[f32],
     tokens: usize,
-) -> (Vec<f32>, Option<Vec<Routing>>) {
-    let (y, routing, _) =
-        decoder_layer_prefill(x, lw, aw, dims, log_scaling, mlp, mask, tokens, None);
-    (y, routing)
+) -> Vec<f32> {
+    decoder_layer_prefill(x, lw, aw, dims, log_scaling, mlp, mask, tokens, None).0
 }
 
 /// The same layer, keeping what a decode step will need.
@@ -138,7 +118,7 @@ pub fn decoder_layer_prefill(
     mask: &[f32],
     tokens: usize,
     window: Option<usize>,
-) -> (Vec<f32>, Option<Vec<Routing>>, LayerCache) {
+) -> (Vec<f32>, LayerCache) {
     let hidden = dims.hidden;
     let kernel = dims.kernel;
 
@@ -152,12 +132,12 @@ pub fn decoder_layer_prefill(
     let x1: Vec<f32> = x.iter().zip(&h).map(|(a, b)| a + b).collect();
 
     let h = rms_norm(&x1, lw.mlp_norm, dims.rms_eps, tokens, hidden);
-    let (h, routing) = mlp.forward(&h, tokens, hidden);
+    let h = mlp.forward(&h, tokens, hidden);
     let mlp_sconv = conv_history(&h, tokens, hidden, kernel);
     let h = short_conv(&h, lw.mlp_sconv, tokens, hidden, kernel);
     let x2: Vec<f32> = x1.iter().zip(&h).map(|(a, b)| a + b).collect();
 
-    (x2, routing, LayerCache { attn, attn_sconv, mlp_sconv })
+    (x2, LayerCache { attn, attn_sconv, mlp_sconv })
 }
 
 /// One position through one decoder layer, reading the cache.
@@ -175,7 +155,7 @@ pub fn decoder_layer_step(
     pos: usize,
     window: Option<usize>,
     cache: &mut LayerCache,
-) -> (Vec<f32>, Option<Vec<Routing>>) {
+) -> Vec<f32> {
     let hidden = dims.hidden;
     let kernel = dims.kernel;
     assert_eq!(x.len(), hidden, "a decode step feeds exactly one token");
@@ -186,9 +166,9 @@ pub fn decoder_layer_step(
     let x1: Vec<f32> = x.iter().zip(&h).map(|(a, b)| a + b).collect();
 
     let h = rms_norm(&x1, lw.mlp_norm, dims.rms_eps, 1, hidden);
-    let (h, routing) = mlp.forward(&h, 1, hidden);
+    let h = mlp.forward(&h, 1, hidden);
     let h = short_conv_step(&mut cache.mlp_sconv, &h, lw.mlp_sconv, hidden, kernel);
     let x2: Vec<f32> = x1.iter().zip(&h).map(|(a, b)| a + b).collect();
 
-    (x2, routing)
+    x2
 }

@@ -154,9 +154,9 @@ fn main() -> Result<()> {
             attn_norm: &attn_norm, mlp_norm: &mlp_norm,
             attn_sconv: &attn_sconv, mlp_sconv: &mlp_sconv,
         };
-        let mlp = LayerMlp::Dense { gate: &gate, up: &up, down: &down, global_scale: gscale[0], inter: di };
+        let mlp = LayerMlp { gate: &gate, up: &up, down: &down, global_scale: gscale[0], inter: di };
         let mask = causal_mask(t, if is_local { Some(window) } else { None });
-        let (mine, _) = decoder_layer(&x, &lw, &aw, &dims, Some(LogScaling { n_floor, alpha }), &mlp, &mask, t);
+        let mine = decoder_layer(&x, &lw, &aw, &dims, Some(LogScaling { n_floor, alpha }), &mlp, &mask, t);
 
         let y_ref = read_f32(&oracle.join(format!("mtp_{tag}_y.bin")))?;
         anyhow::ensure!(!y_ref.is_empty(), "{tag}: no reference output — the gate would be vacuous");

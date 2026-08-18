@@ -215,8 +215,8 @@ fn main() -> Result<()> {
             attn_norm: &attn_norm, mlp_norm: &mlp_norm,
             attn_sconv: &attn_sconv, mlp_sconv: &mlp_sconv,
         };
-        let mlp = LayerMlp::Dense { gate: &gate, up: &up, down: &down, global_scale: gscale[0], inter: di };
-        let (out, _) = decoder_layer(&hstate, &lw, &aw, &dims, Some(ls), &mlp, &mask, t);
+        let mlp = LayerMlp { gate: &gate, up: &up, down: &down, global_scale: gscale[0], inter: di };
+        let out = decoder_layer(&hstate, &lw, &aw, &dims, Some(ls), &mlp, &mask, t);
         hstate = out;
         afters.push(hstate.clone());
     }

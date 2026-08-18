@@ -30,11 +30,10 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 use mary::models::inkling::attn::{causal_mask, AttnDims, AttnWeights, LogScaling};
+use mary::models::inkling::block::route;
 use mary::models::inkling::config::AttnKind;
 use mary::models::inkling::layer::{decoder_layer, LayerMlp, LayerWeights};
-use mary::models::inkling::load::{
-    deinterleave_fused, split_gate_up, split_shared_w13, Checkpoint,
-};
+use mary::models::inkling::load::{split_gate_up, split_shared_w13, Checkpoint};
 
 const BUDGET: f32 = 1e-5;
 
@@ -197,6 +196,21 @@ fn assert_shared_orientation(
     }
 }
 
+/// A sparse layer's router, kept alive past the branch that read it.
+///
+/// The expert SLABS are not read at all any more, so this is all a sparse layer
+/// contributes to the run: 258 rows of projection and the four scalars the
+/// selection rule needs.
+struct SparseRouter {
+    weight: Vec<f32>,
+    bias: Vec<f32>,
+    global_scale: f32,
+    route_scale: f32,
+    n_routed: usize,
+    n_shared: usize,
+    top_k: usize,
+}
+
 fn main() -> Result<()> {
     let ckpt = std::env::args().nth(1).map(PathBuf::from).context("usage: <ckpt> <oracle>")?;
     let oracle = std::env::args().nth(2).map(PathBuf::from).context("usage: <ckpt> <oracle>")?;
@@ -266,8 +280,18 @@ fn main() -> Result<()> {
 
     // These outlive the LayerMlp that borrows them.
     let (fused, dgate, dup, ddown, dscale);
-    let (rw, rb, rg, sgate, sup, sdown, cgu, cdn);
+    let (sgate, sup, sdown);
 
+    // On a SPARSE layer this stays `None` and the layer is not run. The reason
+    // is not that a sparse layer is uninteresting: it is that running one here
+    // needed the host f32 MoE, which needed all 256 experts widened into 8.6 GB
+    // of `Vec<f32>` gate_up plus 4.3 GB of down, to multiply a weight the pile
+    // stores in 3.55 GiB. That lane is deleted. What survives below is every
+    // check on this layer that did NOT depend on it -- the router's shape, its
+    // expert SELECTION against the capture's own top-k, and the `shared_w13`
+    // orientation -- because each of those compares against something Python
+    // wrote and none of them needs an expert to be multiplied.
+    let mut sparse_router: Option<SparseRouter> = None;
     let mlp = if is_dense {
         fused = g("mlp.w13_dn.weight")?;
         ddown = g("mlp.w2_md.weight")?;
@@ -290,7 +314,7 @@ fn main() -> Result<()> {
         } else {
             println!("  halves differ (gate {gs:+.6e} vs up {us:+.6e}), so a swap is visible");
         }
-        LayerMlp::Dense { gate: &dgate, up: &dup, down: &ddown, global_scale: dscale[0], inter: di }
+        Some(LayerMlp { gate: &dgate, up: &dup, down: &ddown, global_scale: dscale[0], inter: di })
     } else {
         let mi = num(&man, "moe_intermediate")? as usize;
         let n_routed = num(&man, "n_routed")? as usize;
@@ -303,9 +327,9 @@ fn main() -> Result<()> {
         println!("  the checkpoint's convention to [experts, out, in]; w13's squareness");
         println!("  is then not an open question but a consequence of that convention.");
 
-        rw = g("mlp.gate.weight")?;
-        rb = g("mlp.gate.bias")?;
-        rg = g("mlp.gate.global_scale")?;
+        let rw = g("mlp.gate.weight")?;
+        let rb = g("mlp.gate.bias")?;
+        let rg = g("mlp.gate.global_scale")?;
         check_fp(&man, "mlp.gate.weight", &rw, &mut checks, &mut fails);
         check_fp(&man, "mlp.gate.e_score_correction_bias", &rb, &mut checks, &mut fails);
         check_fp(&man, "mlp.gate.global_scale", &rg, &mut checks, &mut fails);
@@ -332,45 +356,20 @@ fn main() -> Result<()> {
         check_fp(&man, "mlp.shared_experts.up_proj", &sup, &mut checks, &mut fails);
         check_fp(&man, "mlp.shared_experts.down_proj", &sdown, &mut checks, &mut fails);
 
-        println!("\n=== 3. expert slabs ===");
-        println!("  which experts a layer uses is not knowable before its attention runs,");
-        println!("  so all {n_routed} are fetched, one slab at a time out of the mapping.");
-        let mut gu: Vec<f32> = Vec::with_capacity(n_routed * 2 * mi * h);
-        let mut dv: Vec<f32> = Vec::with_capacity(n_routed * h * mi);
-        for e in 0..n_routed {
-            // The checkpoint interleaves each expert's w13 rows exactly as it does
-            // the shared block, and `expert_ffn_one` wants the gate rows FIRST --
-            // so de-interleave here, the way `inkling_forward` does. The
-            // fingerprint below cannot catch a miss: it is a sum, and the two
-            // layouts are permutations of each other with the identical total.
-            let raw = cp.expert_slice(&format!("{pfx}mlp.experts.w13_weight"), e)?.data;
-            gu.extend_from_slice(&deinterleave_fused(&raw, 2 * mi, h));
-            dv.extend_from_slice(&cp.expert_slice(&format!("{pfx}mlp.experts.w2_weight"), e)?.data);
-        }
-        cgu = gu;
-        cdn = dv;
-        println!("  gate_up {} floats, down {} floats", cgu.len(), cdn.len());
-        checks += 2;
-        if cgu.len() != n_routed * 2 * mi * h {
-            println!("  FAIL  gate_up is {} floats, expected {}", cgu.len(), n_routed * 2 * mi * h);
-            fails += 1;
-        }
-        if cdn.len() != n_routed * h * mi {
-            println!("  FAIL  down is {} floats, expected {}", cdn.len(), n_routed * h * mi);
-            fails += 1;
-        }
-        check_fp(&man, "mlp.experts.gate_up_proj", &cgu, &mut checks, &mut fails);
-        check_fp(&man, "mlp.experts.down_proj", &cdn, &mut checks, &mut fails);
-
-        LayerMlp::Sparse {
-            router_weight: &rw, router_bias: &rb, router_global_scale: rg[0],
-            route_scale, top_k, gate_up: &cgu, down: &cdn,
-            shared_gate: &sgate, shared_up: &sup, shared_down: &sdown,
-            experts: n_routed, n_shared, inter: mi,
-        }
+        println!("\n=== 3. the expert slabs are NOT read, and what that costs ===");
+        println!("  {n_routed} experts widened to f32 is ~13 GB of Vec<f32> for one layer,");
+        println!("  and the only thing that consumed it was the host f32 MoE. Gone with it.");
+        println!("  What gates a routed expert now is inkling_fp4_expert_gate (NVFP4) and");
+        println!("  inkling_bf16_expert_gate (layer 2), each against a Python bundle at the");
+        println!("  precision the checkpoint is actually in.");
+        sparse_router = Some(SparseRouter {
+            weight: rw, bias: rb, global_scale: rg[0],
+            route_scale, n_routed, n_shared, top_k,
+        });
+        None
     };
 
-    println!("\n=== 3. run the layer ===");
+    println!("\n=== 4. run the layer ===");
     let x = read_f32(&oracle.join("real_x.bin"))?;
     let y_ref = read_f32(&oracle.join("real_y.bin"))?;
     anyhow::ensure!(x.len() == t * h, "input is {} not {}", x.len(), t * h);
@@ -391,10 +390,20 @@ fn main() -> Result<()> {
     };
     let mask = causal_mask(t, if is_sliding { Some(window) } else { None });
 
-    let (mine, routing) = decoder_layer(&x, &lw, &aw, &dims, Some(LogScaling { n_floor, alpha }), &mlp, &mask, t);
-
-    // Compare the routing itself, so a routing disagreement is reported as one.
-    if let Some(r) = &routing {
+    // The router's SELECTION, on a sparse layer, without running an expert.
+    //
+    // This is the one thing the deleted MoE lane was carrying that nothing else
+    // covers on REAL weights: `inkling_block_gate` gates the same `route` on
+    // seeded random ones. The projection here is 258 x 4096 and the decision is
+    // a sort of 258 scores, so it costs nothing -- it was only ever bundled with
+    // the expert arithmetic because `decoder_layer` returned both.
+    if let Some(rt) = &sparse_router {
+        println!("\n=== 4a. the router's expert SETS, against the capture ===");
+        let hn = mary::models::inkling::block::rms_norm(&x, &mlp_norm, eps, t, h);
+        let r = route(
+            &hn, &rt.weight, &rt.bias, rt.global_scale, rt.route_scale,
+            t, h, rt.n_routed, rt.n_shared, rt.top_k,
+        );
         let mut sel: Vec<usize> = r.iter().flat_map(|x| x.experts.clone()).collect();
         sel.sort_unstable();
         sel.dedup();
@@ -429,6 +438,19 @@ fn main() -> Result<()> {
             fails += bad;
         }
     }
+
+    let Some(mlp) = mlp else {
+        println!("\n=== verdict ===");
+        println!("  checks: {checks}");
+        println!("  the LAYER is not run: a sparse layer's MLP has no host implementation.");
+        if fails == 0 {
+            println!("GATE PASSED — {checks} checks on a real SPARSE layer's weights and routing");
+            return Ok(());
+        }
+        println!("GATE FAILED — {checks} checks, {fails} FAILURES");
+        std::process::exit(1);
+    };
+    let mine = decoder_layer(&x, &lw, &aw, &dims, Some(LogScaling { n_floor, alpha }), &mlp, &mask, t);
 
     let mut worst_abs = 0f32;
     let mut scale = 0f32;

@@ -29,6 +29,12 @@ pub mod fp4quant;
 pub mod layer;
 pub mod layout;
 pub mod load;
+// The DENSE MLP on the host, and only that. The f32 MoE reference that used to
+// be the bulk of this file -- `routed_experts`, `shared_experts`, `moe`,
+// `expert_ffn_one` -- is deleted: it had no caller in the data plane and it was
+// the readable version of the hottest function in the model, which is the
+// combination that gets a dead lane optimised instead of the live one. What is
+// left is what the MTP heads run.
 pub mod mlp;
 pub mod mtp;
 pub mod nvfp4;
