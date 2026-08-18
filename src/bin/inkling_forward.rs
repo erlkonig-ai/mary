@@ -414,11 +414,67 @@ fn bind_bf16(
         "{rows}x{cols} does not tile as m16n8k16; this lane multiplies BF16 by BF16 and \
          widening to reach a shape is what rule 3 forbids"
     );
+    let align = note_align(bytes, rows, cols);
+    // `INK_ALIGN_COPY=1`: pay a COPY for a weight the alias seam can only place
+    // at 4 or 8, and buy the tuned GEMM lane for it. The trade is device bytes
+    // against kernel throughput and it is measured both ways rather than
+    // assumed; the default is to alias and take the hand kernel on those.
+    let copy_to_align = align < 16
+        && std::env::var("INK_ALIGN_COPY").map(|v| v == "1").unwrap_or(false);
     let h = match aliases {
-        Some(al) => al.slice_or_copy(client, bytes),
-        None => client.create_from_slice(bytes),
+        Some(al) if !copy_to_align => al.slice_or_copy(client, bytes),
+        _ => client.create_from_slice(bytes),
     };
-    Bf16W { h, n: rows, k: cols }
+    Bf16W { h, n: rows, k: cols, align: if copy_to_align { 16 } else { align } }
+}
+
+/// How every plain-BF16 weight is aligned, and how much of the model that is.
+///
+/// The tuned matmul picks its load width from the SHAPE and never from the
+/// pointer, so a `[4096, 4096]` operand gets 16-byte loads whatever address it
+/// sits at. The aliasing seam only promises 4 (the checkpoint packs tensors
+/// back to back and puts the expert slabs at 4 mod 16), so this counts what the
+/// dense lane actually gets before anything is decided on the strength of it.
+static ALIGN: [core::sync::atomic::AtomicU64; 8] = [const { core::sync::atomic::AtomicU64::new(0) }; 8];
+
+fn note_align(bytes: &[u8], rows: usize, cols: usize) -> usize {
+    use core::sync::atomic::Ordering::Relaxed;
+    let p = bytes.as_ptr() as usize;
+    let (slot, align) = if p % 16 == 0 {
+        (0, 16)
+    } else if p % 8 == 0 {
+        (1, 8)
+    } else if p % 4 == 0 {
+        (2, 4)
+    } else {
+        (3, 1)
+    };
+    ALIGN[slot].fetch_add(1, Relaxed);
+    ALIGN[4 + slot].fetch_add((rows * cols * 2) as u64, Relaxed);
+    align
+}
+
+/// Print the alignment census gathered by [`note_align`].
+fn report_align() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let a: Vec<u64> = ALIGN.iter().map(|c| c.load(Relaxed)).collect();
+    let n = a[0] + a[1] + a[2] + a[3];
+    if n == 0 {
+        return;
+    }
+    println!(
+        "  plain-BF16 weight binds: {n} weights, {:.2} GiB -- 16B {} ({:.2} GiB), 8B {} ({:.2} GiB), \
+         4B {} ({:.2} GiB), worse {} ({:.2} GiB)",
+        (a[4] + a[5] + a[6] + a[7]) as f64 / GIB,
+        a[0],
+        a[4] as f64 / GIB,
+        a[1],
+        a[5] as f64 / GIB,
+        a[2],
+        a[6] as f64 / GIB,
+        a[3],
+        a[7] as f64 / GIB
+    );
 }
 
 impl DeviceDense {
@@ -1920,9 +1976,12 @@ fn main() -> Result<()> {
             Bf16W::tileable(rows, cols),
             "unembed {rows}x{cols} does not tile as m16n8k16"
         );
+        let align = note_align(&leaf.bytes, rows, cols);
+        let copy_to_align = align < 16
+            && std::env::var("INK_ALIGN_COPY").map(|v| v == "1").unwrap_or(false);
         let hnd = match fp4_aliases.as_ref() {
-            Some(al) => al.slice_or_copy(&fp4_client, &leaf.bytes),
-            None => fp4_client.create_from_slice(&leaf.bytes),
+            Some(al) if !copy_to_align => al.slice_or_copy(&fp4_client, &leaf.bytes),
+            _ => fp4_client.create_from_slice(&leaf.bytes),
         };
         println!(
             "  unembed BOUND as BF16, {rows} x {cols} = {:.2} GiB stored (the f32 lane it \
@@ -1930,7 +1989,7 @@ fn main() -> Result<()> {
             leaf.bytes.len() as f64 / GIB,
             2.0 * leaf.bytes.len() as f64 / GIB
         );
-        Some(Bf16W { h: hnd, n: rows, k: cols })
+        Some(Bf16W { h: hnd, n: rows, k: cols, align: if copy_to_align { 16 } else { align } })
     } else {
         None
     };
@@ -3080,6 +3139,7 @@ fn main() -> Result<()> {
     if std::env::var("INK_IOSTATS").is_ok() {
         print!("{}", cp.io_table(28));
     }
+    report_align();
     println!("  elapsed: {:.1}s", started.elapsed().as_secs_f32());
 
 

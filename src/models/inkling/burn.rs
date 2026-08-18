@@ -654,7 +654,7 @@ mod tests {
             for x in fill(rows * cols, seed) {
                 bytes.extend_from_slice(&half::bf16::from_f32(x).to_le_bytes());
             }
-            Bf16W { h: client.create_from_slice(&bytes), n: rows, k: cols }
+            Bf16W { h: client.create_from_slice(&bytes), n: rows, k: cols, align: 16 }
         };
         let (q_w, kv_w) = (d.heads * d.head_dim, d.kv_heads * d.head_dim);
         AttnWeightsDev {

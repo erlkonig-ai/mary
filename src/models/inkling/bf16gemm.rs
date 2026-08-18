@@ -254,6 +254,17 @@ pub struct Bf16W {
     pub n: usize,
     /// Input columns.
     pub k: usize,
+    /// Byte alignment of the bound buffer, capped at 16.
+    ///
+    /// Load-bearing, not bookkeeping. The tuned lane picks its load width from
+    /// the SHAPE and never from the pointer, so a `[4096, 4096]` operand gets
+    /// 16-byte loads at whatever address it sits at — and this runtime's
+    /// weights are ALIASED out of the pile mapping, which only promises 4 (the
+    /// checkpoint packs tensors back to back). A 4-aligned weight on a 16-byte
+    /// load is `CUDA_ERROR_MISALIGNED_ADDRESS`, an async fault that takes the
+    /// server down with it, so the alignment has to be known BEFORE the launch
+    /// and it is only knowable at the bind.
+    pub align: usize,
 }
 
 impl Bf16W {
@@ -288,5 +299,371 @@ pub fn linear_bf16<R: Runtime>(
     m_pad: usize,
 ) -> Handle {
     let a = to_bf16_launch(client, x_h, m * w.k, m_pad * w.k);
-    bf16_linear_launch(client, &a, &w.h, m_pad, w.k, w.n)
+    bf16_gemm(client, &a, &w.h, m_pad, w.k, w.n, w.align)
+}
+
+// ---------------------------------------------------------------------------
+// The tuned lane.
+//
+// [`bf16_linear`] above is one 32-thread warp per 16x8 output tile, reading A
+// and B straight out of global memory before every `mma`. There is no shared
+// memory in it, no `cp.async`, no double buffering and no m-tile reuse, so the
+// tile it computes is 16x8 no matter how much of the machine is idle and every
+// cube re-reads the whole activation. That is why the forward measured 2.9
+// TFLOP/s on a part that does 95.9.
+//
+// None of that has to be written here. `cubek::matmul` is the matmul burn
+// dispatches to for exactly these shapes — staged through shared memory, plane
+// (multi-warp) cubes, double-buffered and TMA variants, a gemv lane for skinny
+// m — and it takes BINDINGS, not Burn tensors. A raw `Handle` is a binding. So
+// the whole of the port is describing the three operands and picking a
+// strategy.
+//
+// The transpose is free and is the reason `b` needs no touching: the weight is
+// `[n, k]` row-major, and `[k, n]` with strides `[1, k]` is the same bytes read
+// as the column-major B this product wants.
+
+/// Which `cubek` matmul routine to launch.
+///
+/// Not an implementation detail: the right answer is different for a 512-row
+/// prefill GEMM and a 16-row decode one, and the bench binary walks this enum
+/// rather than a comment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lane {
+    /// The hand-written `mma.sync…bf16` kernel above.
+    Hand,
+    /// `cubek`'s own dispatch: simple cyclic cmma, falling back to units.
+    Auto,
+    SimpleCyclicCmma,
+    SimpleCyclicMma,
+    SimpleTmaCmma,
+    SimpleTmaMma,
+    DoubleCyclicCmma,
+    DoubleCyclicMma,
+    DoubleTmaCmma,
+    DoubleTmaMma,
+    DoubleHybridCmma,
+    DoubleHybridMma,
+    OrderedDoubleCmma,
+    OrderedDoubleMma,
+    SpecializedCyclicCmma,
+    SpecializedTmaCmma,
+    SimpleUnit,
+    DoubleUnit,
+    SimpleVecMat,
+    DoubleVecMat,
+    GemvUnitPerpendicular,
+    GemvPlaneParallel,
+}
+
+impl Lane {
+    /// Every lane, in the order the bench should report them.
+    pub const ALL: &'static [Lane] = &[
+        Lane::Hand,
+        Lane::Auto,
+        Lane::SimpleCyclicCmma,
+        Lane::SimpleCyclicMma,
+        Lane::SimpleTmaCmma,
+        Lane::SimpleTmaMma,
+        Lane::DoubleCyclicCmma,
+        Lane::DoubleCyclicMma,
+        Lane::DoubleTmaCmma,
+        Lane::DoubleTmaMma,
+        Lane::DoubleHybridCmma,
+        Lane::DoubleHybridMma,
+        Lane::OrderedDoubleCmma,
+        Lane::OrderedDoubleMma,
+        Lane::SpecializedCyclicCmma,
+        Lane::SpecializedTmaCmma,
+        Lane::SimpleUnit,
+        Lane::DoubleUnit,
+        Lane::SimpleVecMat,
+        Lane::DoubleVecMat,
+        Lane::GemvUnitPerpendicular,
+        Lane::GemvPlaneParallel,
+    ];
+
+    /// The name the bench prints.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Lane::Hand => "hand mma",
+            Lane::Auto => "cubek auto",
+            Lane::SimpleCyclicCmma => "simple cyclic cmma",
+            Lane::SimpleCyclicMma => "simple cyclic mma",
+            Lane::SimpleTmaCmma => "simple tma cmma",
+            Lane::SimpleTmaMma => "simple tma mma",
+            Lane::DoubleCyclicCmma => "double cyclic cmma",
+            Lane::DoubleCyclicMma => "double cyclic mma",
+            Lane::DoubleTmaCmma => "double tma cmma",
+            Lane::DoubleTmaMma => "double tma mma",
+            Lane::DoubleHybridCmma => "double hybrid cmma",
+            Lane::DoubleHybridMma => "double hybrid mma",
+            Lane::OrderedDoubleCmma => "ordered double cmma",
+            Lane::OrderedDoubleMma => "ordered double mma",
+            Lane::SpecializedCyclicCmma => "specialized cyclic cmma",
+            Lane::SpecializedTmaCmma => "specialized tma cmma",
+            Lane::SimpleUnit => "simple unit",
+            Lane::DoubleUnit => "double unit",
+            Lane::SimpleVecMat => "simple vecmat",
+            Lane::DoubleVecMat => "double vecmat",
+            Lane::GemvUnitPerpendicular => "gemv unit perp",
+            Lane::GemvPlaneParallel => "gemv plane par",
+        }
+    }
+
+    fn strategy(&self) -> cubek::matmul::launch::Strategy {
+        use cubek::matmul::launch::Strategy;
+        match self {
+            Lane::Hand => unreachable!("the hand lane is not a cubek strategy"),
+            Lane::Auto => Strategy::Auto,
+            Lane::SimpleCyclicCmma => Strategy::SimpleCyclicCmma(Default::default()),
+            Lane::SimpleCyclicMma => Strategy::SimpleCyclicMma(Default::default()),
+            Lane::SimpleTmaCmma => Strategy::SimpleTmaCmma(Default::default()),
+            Lane::SimpleTmaMma => Strategy::SimpleTmaMma(Default::default()),
+            Lane::DoubleCyclicCmma => Strategy::DoubleCyclicCmma(Default::default()),
+            Lane::DoubleCyclicMma => Strategy::DoubleCyclicMma(Default::default()),
+            Lane::DoubleTmaCmma => Strategy::DoubleTmaCmma(Default::default()),
+            Lane::DoubleTmaMma => Strategy::DoubleTmaMma(Default::default()),
+            Lane::DoubleHybridCmma => Strategy::DoubleHybridCmma(Default::default()),
+            Lane::DoubleHybridMma => Strategy::DoubleHybridMma(Default::default()),
+            Lane::OrderedDoubleCmma => Strategy::OrderedDoubleCmma(Default::default()),
+            Lane::OrderedDoubleMma => Strategy::OrderedDoubleMma(Default::default()),
+            Lane::SpecializedCyclicCmma => Strategy::SpecializedCyclicCmma(Default::default()),
+            Lane::SpecializedTmaCmma => Strategy::SpecializedTmaCmma(Default::default()),
+            Lane::SimpleUnit => Strategy::SimpleUnit(Default::default()),
+            Lane::DoubleUnit => Strategy::DoubleUnit(Default::default()),
+            Lane::SimpleVecMat => Strategy::SimpleVecMat(Default::default()),
+            Lane::DoubleVecMat => Strategy::DoubleVecMat(Default::default()),
+            Lane::GemvUnitPerpendicular => Strategy::GemvUnitPerpendicular(Default::default()),
+            Lane::GemvPlaneParallel => Strategy::GemvPlaneParallel(Default::default()),
+        }
+    }
+}
+
+/// A `[shape]`-shaped, `[strides]`-strided view of `h`, as the launcher wants it.
+fn binding<R: Runtime>(h: &Handle, shape: [usize; 2], strides: [usize; 2]) -> TensorBinding<R> {
+    TensorBinding {
+        handle: h.clone().binding(),
+        strides: strides.into(),
+        shape: shape.into(),
+        runtime: core::marker::PhantomData,
+    }
+}
+
+/// `out = a @ b^T` through `cubek`'s tuned matmul, with `a` and `b` BF16 and
+/// `out` f32.
+///
+/// Same contract as [`bf16_linear_launch`] and deliberately the same signature,
+/// so the two are interchangeable at every call site and the bench can A/B them
+/// by swapping a function pointer.
+///
+/// Nothing here is padded. The hand kernel needs `m` a multiple of 16 because
+/// its grid IS the tiling; this one bounds-checks its own tiles, so `m_pad` may
+/// be the true `m`. It is still accepted as `m_pad` because the caller has one.
+pub fn bf16_linear_cubek_launch<R: Runtime>(
+    client: &ComputeClient<R>,
+    a: &Handle,
+    b: &Handle,
+    m_pad: usize,
+    k: usize,
+    n: usize,
+    lane: Lane,
+) -> Handle {
+    use cubecl::ir::{ElemType, FloatKind, StorageType};
+    use cubek::matmul::definition::{MatmulElems, MatmulGlobalElems};
+    use cubek::std::InputBinding;
+
+    let bf = StorageType::Scalar(ElemType::Float(FloatKind::BF16));
+    let f32s = StorageType::Scalar(ElemType::Float(FloatKind::F32));
+
+    let out = client.empty(m_pad * n * core::mem::size_of::<f32>());
+
+    // `[k, n]` strided `[1, k]` over a `[n, k]` row-major buffer: the same
+    // bytes, read as the column-major B the product wants. No copy, no kernel.
+    let lhs = InputBinding::new(binding::<R>(a, [m_pad, k], [k, 1]), bf);
+    let rhs = InputBinding::new(binding::<R>(b, [k, n], [1, k]), bf);
+    let outb = binding::<R>(&out, [m_pad, n], [n, 1]);
+
+    let mut dtypes = MatmulElems::from_globals(&MatmulGlobalElems {
+        lhs: bf,
+        rhs: bf,
+        out: f32s,
+    });
+
+    cubek::matmul::launch::launch_ref::<R>(&lane.strategy(), client, lhs, rhs, outb, &mut dtypes)
+        .unwrap_or_else(|e| panic!("cubek matmul [{m_pad},{k}]x[{n},{k}]^T on {lane:?}: {e:?}"));
+    out
+}
+
+/// The same, returning the setup error instead of panicking on it.
+///
+/// Every `cubek` strategy declines some shapes -- a TMA lane wants alignments a
+/// 258-wide router projection does not have, a gemv lane wants a small m -- and
+/// "declines" is an answer, not a crash. The bench walks the whole enum and
+/// needs to be told which ones answered.
+#[allow(clippy::result_large_err)]
+pub fn try_bf16_linear_cubek_launch<R: Runtime>(
+    client: &ComputeClient<R>,
+    a: &Handle,
+    b: &Handle,
+    m_pad: usize,
+    k: usize,
+    n: usize,
+    lane: Lane,
+) -> Result<Handle, cubek::matmul::definition::MatmulSetupError> {
+    use cubecl::ir::{ElemType, FloatKind, StorageType};
+    use cubek::matmul::definition::{MatmulElems, MatmulGlobalElems};
+    use cubek::std::InputBinding;
+
+    let bf = StorageType::Scalar(ElemType::Float(FloatKind::BF16));
+    let f32s = StorageType::Scalar(ElemType::Float(FloatKind::F32));
+    let out = client.empty(m_pad * n * core::mem::size_of::<f32>());
+    let lhs = InputBinding::new(binding::<R>(a, [m_pad, k], [k, 1]), bf);
+    let rhs = InputBinding::new(binding::<R>(b, [k, n], [1, k]), bf);
+    let outb = binding::<R>(&out, [m_pad, n], [n, 1]);
+    let mut dtypes = MatmulElems::from_globals(&MatmulGlobalElems {
+        lhs: bf,
+        rhs: bf,
+        out: f32s,
+    });
+    cubek::matmul::launch::launch_ref::<R>(&lane.strategy(), client, lhs, rhs, outb, &mut dtypes)?;
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Which lane the forward actually runs.
+//
+// Measured on this box with `inkling_bf16_gemm_bench`, over the nine plain-BF16
+// shapes a 20-layer node issues, summed per pass (synchronised, 30 iters at
+// m=512 and 20 at m=16):
+//
+//   m = 512 (prefill)             m = 16 (decode)
+//     double tma mma      84.8      double tma mma      36.1
+//     simple tma mma      86.0      double cyclic mma   38.4
+//     double cyclic mma  119.0      simple tma mma      38.6
+//     hand mma          1176.3      hand mma            50.0
+//
+// `double tma mma` wins both ends, so it heads the preference list; the rest is
+// a FALLBACK CHAIN, not a tuning surface. A strategy declines a shape it cannot
+// tile or align, and declining is an answer -- the walk stops at the first one
+// that takes the shape and the hand kernel, which takes every shape the forward
+// issues, is the floor.
+//
+// The choice is cached per `(m, k, n)`: a probe costs a failed setup, and the
+// forward issues the same handful of shapes tens of thousands of times.
+
+/// The order [`bf16_gemm`] tries lanes in, unless `INK_GEMM` names one.
+///
+/// **The TMA lanes are not on it, and that is a finding, not an oversight.**
+/// They are the fastest on the bench by 1.4x, and they cannot run here: a
+/// `cuTensorMap` requires a 16-byte-aligned global address, and this runtime's
+/// weights are ALIASED out of the pile mapping at whatever offset the leaf
+/// lies at. The first real forward on the TMA lane died on
+/// "Tensor pointer must be 16 byte aligned" during the layer uploads, and that
+/// is an async launch error that poisons the server -- it cannot be caught and
+/// fallen back from at run time, only kept off the list. Getting them back is a
+/// question for the BINDER (align the aliased leaves to 16), not for this list.
+const PREFERENCE: &[Lane] = &[
+    Lane::DoubleCyclicMma,
+    Lane::SimpleCyclicMma,
+    Lane::SpecializedCyclicCmma,
+    Lane::SimpleCyclicCmma,
+    Lane::Hand,
+];
+
+impl Lane {
+    /// The inverse of [`Lane::name`], for `INK_GEMM`.
+    pub fn from_name(s: &str) -> Option<Lane> {
+        Lane::ALL.iter().copied().find(|l| l.name() == s)
+    }
+}
+
+/// `INK_GEMM`, parsed once. `None` means "walk [`PREFERENCE`]".
+fn forced_lane() -> Option<Lane> {
+    use std::sync::OnceLock;
+    static FORCED: OnceLock<Option<Lane>> = OnceLock::new();
+    *FORCED.get_or_init(|| {
+        let name = std::env::var("INK_GEMM").ok()?;
+        Some(Lane::from_name(&name).unwrap_or_else(|| {
+            panic!(
+                "INK_GEMM={name} names no lane; the lanes are: {}",
+                Lane::ALL.iter().map(|l| l.name()).collect::<Vec<_>>().join(", ")
+            )
+        }))
+    })
+}
+
+/// The per-shape decision, read or written through the one map that holds it.
+fn lane_cache(
+    shape: (usize, usize, usize),
+    set: Option<Lane>,
+) -> Option<Lane> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<(usize, usize, usize), Lane>>> = OnceLock::new();
+    let mut map = CACHE.get_or_init(Default::default).lock().expect("lane cache");
+    match set {
+        Some(lane) => {
+            map.insert(shape, lane);
+            Some(lane)
+        }
+        None => map.get(&shape).copied(),
+    }
+}
+
+/// Launch one lane, which must be known to accept the shape.
+fn launch_lane<R: Runtime>(
+    client: &ComputeClient<R>,
+    a: &Handle,
+    b: &Handle,
+    m: usize,
+    k: usize,
+    n: usize,
+    lane: Lane,
+) -> Handle {
+    match lane {
+        Lane::Hand => bf16_linear_launch(client, a, b, m, k, n),
+        _ => bf16_linear_cubek_launch(client, a, b, m, k, n, lane),
+    }
+}
+
+/// `out = a @ b^T` for BF16 operands and an f32 accumulator, on the fastest
+/// lane this box has for the shape.
+///
+/// `a` is `[m, k]`, `b` is `[n, k]` (the checkpoint's own orientation) and the
+/// result is `[m, n]` f32.
+pub fn bf16_gemm<R: Runtime>(
+    client: &ComputeClient<R>,
+    a: &Handle,
+    b: &Handle,
+    m: usize,
+    k: usize,
+    n: usize,
+    align: usize,
+) -> Handle {
+    // A weight the tuned lane would fault on goes to the hand kernel, which
+    // loads 4 bytes at a time and takes any 4-aligned address. This is a
+    // per-WEIGHT decision and not a per-shape one: two `[4096, 4096]`
+    // projections in the same layer land at different offsets in the mapping.
+    if align < 16 {
+        return bf16_linear_launch(client, a, b, m, k, n);
+    }
+    if let Some(lane) = forced_lane() {
+        return launch_lane(client, a, b, m, k, n, lane);
+    }
+    let shape = (m, k, n);
+    if let Some(lane) = lane_cache(shape, None) {
+        return launch_lane(client, a, b, m, k, n, lane);
+    }
+    for &lane in PREFERENCE {
+        if lane == Lane::Hand {
+            lane_cache(shape, Some(lane));
+            return bf16_linear_launch(client, a, b, m, k, n);
+        }
+        if let Ok(h) = try_bf16_linear_cubek_launch(client, a, b, m, k, n, lane) {
+            lane_cache(shape, Some(lane));
+            return h;
+        }
+    }
+    unreachable!("PREFERENCE ends with the hand lane, which takes every shape")
 }

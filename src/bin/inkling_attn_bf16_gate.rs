@@ -125,7 +125,7 @@ fn bf16w(client: &ComputeClient<CudaRuntime>, v: &[f32], n: usize, k: usize) -> 
     for &f in v {
         bytes.extend_from_slice(&bf16::from_f32(f).to_le_bytes());
     }
-    Bf16W { h: client.create_from_slice(&bytes), n, k }
+    Bf16W { h: client.create_from_slice(&bytes), n, k, align: 16 }
 }
 
 #[allow(clippy::too_many_arguments)]
