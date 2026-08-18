@@ -364,6 +364,16 @@ pub enum Lane {
     DoubleVecMat,
     GemvUnitPerpendicular,
     GemvPlaneParallel,
+    /// `double tma mma` with the specialized (producer/consumer) schedule.
+    DoubleTmaMmaSpec,
+    /// `simple tma mma` with the multi-row selection, i.e. m-tile reuse.
+    SimpleTmaMmaMulti,
+    /// `simple cyclic mma` with the multi-row selection.
+    SimpleCyclicMmaMulti,
+    /// `ordered double mma`, k partitioned two ways inside a stage.
+    OrderedDoubleMmaPk2,
+    /// ...and four.
+    OrderedDoubleMmaPk4,
 }
 
 impl Lane {
@@ -391,6 +401,11 @@ impl Lane {
         Lane::DoubleVecMat,
         Lane::GemvUnitPerpendicular,
         Lane::GemvPlaneParallel,
+        Lane::DoubleTmaMmaSpec,
+        Lane::SimpleTmaMmaMulti,
+        Lane::SimpleCyclicMmaMulti,
+        Lane::OrderedDoubleMmaPk2,
+        Lane::OrderedDoubleMmaPk4,
     ];
 
     /// The name the bench prints.
@@ -418,6 +433,11 @@ impl Lane {
             Lane::DoubleVecMat => "double vecmat",
             Lane::GemvUnitPerpendicular => "gemv unit perp",
             Lane::GemvPlaneParallel => "gemv plane par",
+            Lane::DoubleTmaMmaSpec => "double tma mma spec",
+            Lane::SimpleTmaMmaMulti => "simple tma mma multi",
+            Lane::SimpleCyclicMmaMulti => "simple cyclic mma multi",
+            Lane::OrderedDoubleMmaPk2 => "ordered double mma pk2",
+            Lane::OrderedDoubleMmaPk4 => "ordered double mma pk4",
         }
     }
 
@@ -446,6 +466,40 @@ impl Lane {
             Lane::DoubleVecMat => Strategy::DoubleVecMat(Default::default()),
             Lane::GemvUnitPerpendicular => Strategy::GemvUnitPerpendicular(Default::default()),
             Lane::GemvPlaneParallel => Strategy::GemvPlaneParallel(Default::default()),
+            Lane::DoubleTmaMmaSpec => {
+                use cubek::matmul::routines::{double_buffering::DoubleBufferingArgs, BlueprintStrategy};
+                use cubek::matmul::components::tile::TileMatmulKind;
+                Strategy::DoubleTmaMma(BlueprintStrategy::Inferred(DoubleBufferingArgs {
+                    tile_matmul: TileMatmulKind::Mma,
+                    specialized: true,
+                }))
+            }
+            Lane::SimpleTmaMmaMulti => {
+                use cubek::matmul::routines::{simple::SimpleArgs, BlueprintStrategy};
+                use cubek::matmul::components::tile::TileMatmulKind;
+                Strategy::SimpleTmaMma(BlueprintStrategy::Inferred(SimpleArgs {
+                    tile_matmul: TileMatmulKind::Mma,
+                    multi_rows: true,
+                }))
+            }
+            Lane::SimpleCyclicMmaMulti => {
+                use cubek::matmul::routines::{simple::SimpleArgs, BlueprintStrategy};
+                use cubek::matmul::components::tile::TileMatmulKind;
+                Strategy::SimpleCyclicMma(BlueprintStrategy::Inferred(SimpleArgs {
+                    tile_matmul: TileMatmulKind::Mma,
+                    multi_rows: true,
+                }))
+            }
+            Lane::OrderedDoubleMmaPk2 | Lane::OrderedDoubleMmaPk4 => {
+                use cubek::matmul::routines::{ordered_double_buffering::OrderedSelectionArgs, BlueprintStrategy};
+                use cubek::matmul::components::tile::TileMatmulKind;
+                Strategy::OrderedDoubleMma(BlueprintStrategy::Inferred(OrderedSelectionArgs {
+                    tile_matmul: TileMatmulKind::Mma,
+                    partition_k: Some(if *self == Lane::OrderedDoubleMmaPk2 { 2 } else { 4 }),
+                    row_count: None,
+                    rows_per_plane: None,
+                }))
+            }
         }
     }
 }
@@ -590,6 +644,7 @@ pub fn try_bf16_linear_cubek_launch<R: Runtime>(
 /// routine `cubek`'s own `Auto` falls back to and it takes every shape.
 const PREFERENCE: &[Lane] = &[
     Lane::GemvPlaneParallel,
+    Lane::DoubleTmaMmaSpec,
     Lane::DoubleTmaMma,
     Lane::SimpleTmaMma,
     Lane::DoubleCyclicMma,
