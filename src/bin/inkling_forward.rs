@@ -2596,6 +2596,18 @@ fn main() -> Result<()> {
     let want_host_x = is_head || mtp_k > 0 || dump_dir.is_some();
     let x: Vec<f32> = if want_host_x { down(xd.clone()) } else { Vec::new() };
 
+    // Does anything downstream need a logit row that is NOT the last one?
+    //
+    // The argmax reads exactly one row -- the last -- and that is the whole of
+    // what a forward produces. Every other row of the head exists for the
+    // REPORT: the per-position top-5 table and the `INK_DUMP_DIR` capture. On a
+    // 512-token prefill those rows are 512 x 200058 f32 = 410 MB read back
+    // across the bus, on top of a 4096-wide GEMM over 512 rows instead of 16.
+    // So they are computed when a reader has asked for them and not otherwise.
+    // `INK_ALL_LOGITS=1` is that ask; a dump implies it.
+    let all_logits =
+        dump_dir.is_some() || std::env::var("INK_ALL_LOGITS").map(|val| val == "1").unwrap_or(false);
+
     // ---- head, or the wire in its place ------------------------------------
     let v = t.effective_vocab();
     let t_h = Instant::now();
@@ -2605,6 +2617,10 @@ fn main() -> Result<()> {
     // slot the head/unembed occupies on a whole-stack run — which is what makes
     // the two reports read against each other line for line.
     let mut best_wire = None;
+    // Which position `logits[0]` is. The head computes `logit_row0..n`, so this
+    // is 0 when everything was asked for and `n - 1` when only the argmax's row
+    // was. A head computes nothing and the value is unread there.
+    let logit_row0 = if all_logits { 0 } else { n - 1 };
     let logits = if let Some(Pipe::Head(s)) = pipe.as_mut() {
         send_stream(s, n, pos0, &x)?;
         let mut back = [0u8; 8];
@@ -2618,14 +2634,25 @@ fn main() -> Result<()> {
         // not a reference, it is an afternoon. The muP divisor divides BEFORE
         // the projection, matching the reference: doing it after is
         // algebraically equal and numerically not.
+        //
+        // The rows: `logit_row0..n`, which is the last row alone unless a
+        // reporter asked for all of them. The unembedding is the widest matmul
+        // in the stack (n x 4096 x 200058) and the only consumer of all but its
+        // final row is a print, so the slice happens on the INPUT -- before the
+        // GEMM and before the readback -- rather than after both.
+        let hx = if all_logits {
+            xd.clone()
+        } else {
+            xd.clone().slice([logit_row0..n, 0..h])
+        };
         let hs = dev_lane::rms_norm(
-            xd.clone(),
+            hx,
             fnorm_dev.clone().expect("the tail owns the final norm"),
             t.rms_norm_eps,
         )
         .div_scalar(t.logits_mup_width_multiplier as f32);
         let uw = unembed_w.as_ref().expect("the tail binds the unembed table");
-        down(dev_lane::linear_bf16(hs, uw).slice([0..n, 0..v]))
+        down(dev_lane::linear_bf16(hs, uw).slice([0..n - logit_row0, 0..v]))
     };
     let t_head = t_h.elapsed().as_secs_f64();
 
@@ -2636,7 +2663,7 @@ fn main() -> Result<()> {
     let best = match best_wire {
         Some(b) => b,
         None => {
-            let last = &logits[(n - 1) * v..n * v];
+            let last = &logits[(n - 1 - logit_row0) * v..(n - logit_row0) * v];
             let mut best = 0usize;
             for (i, &val) in last.iter().enumerate() {
                 if val > last[best] {
@@ -3067,9 +3094,9 @@ fn main() -> Result<()> {
     }
     // A head has no logits to rank -- the tail owns the table, and writes it.
     if (kv || step == gen_steps) && best_wire.is_none() {
-        for ti in 0..n {
+        for ti in logit_row0..n {
             let pos = pos0 + ti;
-            let row = &logits[ti * v..(ti + 1) * v];
+            let row = &logits[(ti - logit_row0) * v..(ti - logit_row0 + 1) * v];
             let mut idx: Vec<usize> = (0..v).collect();
             idx.sort_unstable_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap());
             let top: Vec<usize> = idx[..5].to_vec();
