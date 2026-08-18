@@ -30,7 +30,6 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 use mary::models::inkling::attn::{causal_mask, AttnDims, AttnWeights, LogScaling};
-use mary::models::inkling::block::route;
 use mary::models::inkling::config::AttnKind;
 use mary::models::inkling::layer::{decoder_layer, LayerMlp, LayerWeights};
 use mary::models::inkling::load::{split_gate_up, split_shared_w13, Checkpoint};
@@ -196,21 +195,6 @@ fn assert_shared_orientation(
     }
 }
 
-/// A sparse layer's router, kept alive past the branch that read it.
-///
-/// The expert SLABS are not read at all any more, so this is all a sparse layer
-/// contributes to the run: 258 rows of projection and the four scalars the
-/// selection rule needs.
-struct SparseRouter {
-    weight: Vec<f32>,
-    bias: Vec<f32>,
-    global_scale: f32,
-    route_scale: f32,
-    n_routed: usize,
-    n_shared: usize,
-    top_k: usize,
-}
-
 fn main() -> Result<()> {
     let ckpt = std::env::args().nth(1).map(PathBuf::from).context("usage: <ckpt> <oracle>")?;
     let oracle = std::env::args().nth(2).map(PathBuf::from).context("usage: <ckpt> <oracle>")?;
@@ -291,7 +275,6 @@ fn main() -> Result<()> {
     // expert SELECTION against the capture's own top-k, and the `shared_w13`
     // orientation -- because each of those compares against something Python
     // wrote and none of them needs an expert to be multiplied.
-    let mut sparse_router: Option<SparseRouter> = None;
     let mlp = if is_dense {
         fused = g("mlp.w13_dn.weight")?;
         ddown = g("mlp.w2_md.weight")?;
@@ -319,8 +302,6 @@ fn main() -> Result<()> {
         let mi = num(&man, "moe_intermediate")? as usize;
         let n_routed = num(&man, "n_routed")? as usize;
         let n_shared = num(&man, "n_shared")? as usize;
-        let top_k = num(&man, "top_k")? as usize;
-        let route_scale = num(&man, "route_scale")? as f32;
         println!("\n=== 2. router, shared experts, and the orientation argument ===");
         println!("  moe_intermediate {mi}: note 2*{mi} = {} vs hidden {h}", 2 * mi);
         println!("  w2 is [experts, hidden, intermediate] and NON-square, which pins");
@@ -362,10 +343,6 @@ fn main() -> Result<()> {
         println!("  What gates a routed expert now is inkling_fp4_expert_gate (NVFP4) and");
         println!("  inkling_bf16_expert_gate (layer 2), each against a Python bundle at the");
         println!("  precision the checkpoint is actually in.");
-        sparse_router = Some(SparseRouter {
-            weight: rw, bias: rb, global_scale: rg[0],
-            route_scale, n_routed, n_shared, top_k,
-        });
         None
     };
 
@@ -390,61 +367,33 @@ fn main() -> Result<()> {
     };
     let mask = causal_mask(t, if is_sliding { Some(window) } else { None });
 
-    // The router's SELECTION, on a sparse layer, without running an expert.
+    // There is NO router check on a sparse layer here, and the reason is a
+    // property of the capture rather than a decision.
     //
-    // This is the one thing the deleted MoE lane was carrying that nothing else
-    // covers on REAL weights: `inkling_block_gate` gates the same `route` on
-    // seeded random ones. The projection here is 258 x 4096 and the decision is
-    // a sort of 258 scores, so it costs nothing -- it was only ever bundled with
-    // the expert arithmetic because `decoder_layer` returned both.
-    if let Some(rt) = &sparse_router {
-        println!("\n=== 4a. the router's expert SETS, against the capture ===");
-        let hn = mary::models::inkling::block::rms_norm(&x, &mlp_norm, eps, t, h);
-        let r = route(
-            &hn, &rt.weight, &rt.bias, rt.global_scale, rt.route_scale,
-            t, h, rt.n_routed, rt.n_shared, rt.top_k,
-        );
-        let mut sel: Vec<usize> = r.iter().flat_map(|x| x.experts.clone()).collect();
-        sel.sort_unstable();
-        sel.dedup();
-        println!("  the layer routed through {} distinct experts", sel.len());
-        checks += 1;
-        if sel.len() < 2 {
-            println!("  FAIL  fewer than two experts used — per-expert indexing barely exercised");
-            fails += 1;
-        }
-        if let Ok(bytes) = std::fs::read(oracle.join("real_topk_idx.bin")) {
-            let refidx: Vec<i64> = bytes
-                .chunks_exact(8)
-                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
-                .collect();
-            let k = refidx.len() / t;
-            let mut bad = 0usize;
-            for ti in 0..t {
-                checks += 1;
-                let mut a: Vec<usize> = r[ti].experts.clone();
-                let mut b: Vec<usize> =
-                    refidx[ti * k..(ti + 1) * k].iter().map(|&v| v as usize).collect();
-                a.sort_unstable();
-                b.sort_unstable();
-                if a != b {
-                    if bad < 3 {
-                        println!("  FAIL  token {ti} routed to {a:?}, reference {b:?}");
-                    }
-                    bad += 1;
-                }
-            }
-            println!("  expert-set mismatches vs the reference: {bad} of {t} tokens");
-            fails += bad;
-        }
-    }
+    // The routing this used to compare came out of `decoder_layer`, which routed
+    // on `rms_norm(x1)` -- the residual stream AFTER attention and its short
+    // convolution. `capture_inkling_real.py` hooks `layer.mlp.gate` and writes
+    // its OUTPUT (`real_topk_idx.bin`, `real_topk_w.bin`, `real_gammas.bin`); it
+    // never writes that input. So routing on `real_x.bin` instead is routing on
+    // the wrong tensor, and it fails 8 of 8 tokens for that reason alone -- it
+    // was tried, and it is a false failure, not a finding. Reconstructing `x1`
+    // means re-transcribing `decoder_layer`'s attention half inside a gate,
+    // which is the second-transcription hazard this tree names everywhere else.
+    //
+    // What that costs, stated rather than absorbed: nothing compares mary's
+    // expert SETS against a Python capture on REAL weights any more.
+    // `inkling_block_gate` compares the same `route` against a capture on seeded
+    // random weights, and `INK_ROUTER_DIFF=1` in the forward counts selection
+    // flips on real weights but between two of mary's own arms. A capture that
+    // wrote the router's input would restore the check; those three files are
+    // unread until it does.
 
     let Some(mlp) = mlp else {
         println!("\n=== verdict ===");
         println!("  checks: {checks}");
         println!("  the LAYER is not run: a sparse layer's MLP has no host implementation.");
         if fails == 0 {
-            println!("GATE PASSED — {checks} checks on a real SPARSE layer's weights and routing");
+            println!("GATE PASSED — {checks} checks on a real SPARSE layer's weights");
             return Ok(());
         }
         println!("GATE FAILED — {checks} checks, {fails} FAILURES");
