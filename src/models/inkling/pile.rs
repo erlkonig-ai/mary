@@ -625,6 +625,7 @@ impl PileSource {
         use triblespace::macros::{find, pattern};
         use triblespace::prelude::*;
 
+        let t_open = std::time::Instant::now();
         let mut pile = Pile::open(path).map_err(|e| anyhow::anyhow!("open {path:?}: {e:?}"))?;
         // Read path: never amputate. A torn tail is an operator decision.
         pile.refresh()
@@ -655,6 +656,8 @@ impl PileSource {
             .reader()
             .map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
         repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
+        let open_secs = t_open.elapsed().as_secs_f64();
+        let t_experts = std::time::Instant::now();
 
         // ── the experts, as handles ─────────────────────────────────────────
         // First, because what it produces is also what tells the dense sweep
@@ -697,51 +700,95 @@ impl PileSource {
         sweep_experts!(NVFP4, attrs::weight_nvfp4_2, ExpertHandle::Nvfp4);
         sweep_experts!(BF16, attrs::weight::<BF16, 2>(), ExpertHandle::Bf16);
 
+        let experts_secs = t_experts.elapsed().as_secs_f64();
+        let t_dense = std::time::Instant::now();
         // ── the dense tensors, by name ──────────────────────────────────────
         // One query per (element, rank) — ten, not one — because that is what
         // typing the attribute means, and each hit is read AS its type. Nothing
         // is interpreted without one, so a BF16 matrix cannot arrive where f32
         // was asked for.
         let mut dense = std::collections::HashMap::new();
+        // How many threads read the dense leaves. Each `get` is a BLAKE3 over
+        // the payload and the payloads are the big ones -- the embedding table
+        // is 2.40 GiB and the unembedding 1.61 -- so this sweep was 15.0 s of a
+        // 23.6 s index build, on one core, for 968 leaves the queries had
+        // already located. The reads are independent: `PileReader::get` takes
+        // `&self` and its validation cache hashes outside its lock.
+        let index_threads: usize = std::env::var("INK_INDEX_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n: &usize| *n >= 1)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+            });
         macro_rules! sweep_dense {
             ($ty:ty, $rank:literal, $tag:expr) => {{
-                for (e, n, h) in find!(
+                // Located first, read second. The `find!` iterator borrows
+                // `facts` and is not something to hand to a thread; the handles
+                // it yields are plain `Copy` values that are.
+                let hits: Vec<_> = find!(
                     (e: Id,
                      n: Inline<Handle<blobencodings::LongString>>,
                      h: Inline<Handle<Tensor<$ty, $rank>>>),
                     pattern!(&facts, [
                         { ?e @ metadata::name: ?n, attrs::weight::<$ty, $rank>(): ?h },
                     ])
-                ) {
-                    if expert_ids.contains(&e) {
-                        continue;
+                )
+                .filter(|(e, _, _)| !expert_ids.contains(e))
+                .collect();
+                if !hits.is_empty() {
+                    let chunk = hits.len().div_ceil(index_threads).max(1);
+                    let reader = &reader;
+                    let facts = &facts;
+                    let parts: Vec<Result<Vec<(String, Leaf)>>> = std::thread::scope(|sc| {
+                        let handles: Vec<_> = hits
+                            .chunks(chunk)
+                            .map(|c| {
+                                sc.spawn(move || -> Result<Vec<(String, Leaf)>> {
+                                    let mut out = Vec::with_capacity(c.len());
+                                    for (e, n, h) in c {
+                                        let name: anybytes::View<str> = reader
+                                            .get(*n)
+                                            .map_err(|err| anyhow::anyhow!("name blob: {err:?}"))?;
+                                        let blob: Blob<Tensor<$ty, $rank>> =
+                                            reader.get(*h).map_err(|err| {
+                                                anyhow::anyhow!("{}: leaf blob: {err:?}", &*name)
+                                            })?;
+                                        let view: TensorView = TensorView::try_from_blob(blob)
+                                            .map_err(|err| {
+                                                anyhow::anyhow!("{}: decode: {err}", &*name)
+                                            })?;
+                                        // The layer is optional in the graph, so it is
+                                        // optional here: an `exists!` rather than a second
+                                        // required clause, which would silently drop the
+                                        // embedding and the head.
+                                        let layer = find!(
+                                            (l: i64),
+                                            pattern!(facts, [{ (*e) @ attrs::layer: ?l }])
+                                        )
+                                        .next()
+                                        .map(|(l,)| l);
+                                        out.push((
+                                            name.to_string(),
+                                            Leaf {
+                                                elem: $tag,
+                                                dims: view.dims().to_vec(),
+                                                bytes: view.payload().clone(),
+                                                layer,
+                                            },
+                                        ));
+                                    }
+                                    Ok(out)
+                                })
+                            })
+                            .collect();
+                        handles.into_iter().map(|h| h.join().unwrap()).collect()
+                    });
+                    for part in parts {
+                        for (name, leaf) in part? {
+                            dense.insert(name, leaf);
+                        }
                     }
-                    let name: anybytes::View<str> = reader
-                        .get(n)
-                        .map_err(|err| anyhow::anyhow!("name blob: {err:?}"))?;
-                    let blob: Blob<Tensor<$ty, $rank>> = reader
-                        .get(h)
-                        .map_err(|err| anyhow::anyhow!("{}: leaf blob: {err:?}", &*name))?;
-                    let view: TensorView = TensorView::try_from_blob(blob)
-                        .map_err(|err| anyhow::anyhow!("{}: decode: {err}", &*name))?;
-                    // The layer is optional in the graph, so it is optional
-                    // here: an `exists!` rather than a second required clause,
-                    // which would silently drop the embedding and the head.
-                    let layer = find!(
-                        (l: i64),
-                        pattern!(&facts, [{ (e) @ attrs::layer: ?l }])
-                    )
-                    .next()
-                    .map(|(l,)| l);
-                    dense.insert(
-                        name.to_string(),
-                        Leaf {
-                            elem: $tag,
-                            dims: view.dims().to_vec(),
-                            bytes: view.payload().clone(),
-                            layer,
-                        },
-                    );
                 }
             }};
         }
@@ -757,6 +804,12 @@ impl PileSource {
         sweep_dense!(F32, 4, Elem::F32);
 
         anyhow::ensure!(!dense.is_empty(), "{path:?}: no dense leaves on {branch:?}");
+        println!(
+            "    index build: pile open + checkout {open_secs:.1}s, {} expert handles {experts_secs:.1}s, {} dense leaves {:.1}s",
+            experts.len(),
+            dense.len(),
+            t_dense.elapsed().as_secs_f64(),
+        );
         Ok(PileSource {
             path: path.to_path_buf(),
             reader,
