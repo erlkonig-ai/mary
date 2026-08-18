@@ -62,3 +62,7 @@ pub use config::InklingConfig;
 // device residency, the unscaled sibling of the instruction.
 pub mod bf16gemm;
 pub mod fp4gemm;
+// The same lane as `fp4gemm`, but the loop over a layer's active experts moved
+// off the host and into the grid: one launch per stage per layer, with the
+// block index selecting the expert. Same kernels, same order, same bits.
+pub mod moegroup;

@@ -735,6 +735,53 @@ impl Aliases {
         )
     }
 
+    /// WHERE a borrowed slice lives: `(mapping index, byte offset)`.
+    ///
+    /// The same pointer-containment lookup [`Aliases::slice`] does, stopping
+    /// one step short of building a `Handle`. The grouped routed-expert lane
+    /// ([`super::moegroup`]) needs the offsets and not the handles: it binds
+    /// the mapping ONCE for the whole layer and lets the kernel pick an
+    /// expert's planes out of it, so a per-expert `Handle` would be twenty-odd
+    /// clones of the same pointer for the privilege of throwing them away.
+    ///
+    /// `None` for the same two reasons `slice` returns `None` — unaligned, or
+    /// in no registered mapping — and deliberately WITHOUT counting a bind,
+    /// because the caller is still deciding whether it can take this lane at
+    /// all. It counts with [`Aliases::note_alias`] once it has committed.
+    pub fn locate(&self, data: &[u8]) -> Option<(usize, u64)> {
+        if !matches!(self.classify(data), Bind::Alias) {
+            return None;
+        }
+        let p = data.as_ptr() as usize;
+        let (i, (base, _, _)) = self
+            .maps
+            .iter()
+            .enumerate()
+            .find(|(_, (b, l, _))| p >= *b && p + data.len() <= b + l)?;
+        Some((i, (p - base) as u64))
+    }
+
+    /// The registered handle for a whole mapping, and its length in bytes.
+    ///
+    /// Not a slice of it: this is the buffer the grouped GEMM binds, with the
+    /// per-expert offsets travelling separately as device data.
+    pub fn map(&self, i: usize) -> Option<(Handle, usize)> {
+        self.maps.get(i).map(|(_, l, h)| (h.clone(), *l))
+    }
+
+    /// Charge `bytes` to the alias counters for a bind that went through
+    /// [`Aliases::locate`] rather than [`Aliases::slice_or_copy`].
+    ///
+    /// The seam moved but the accounting must not: the report's "100% of binds
+    /// aliased" line is only worth reading if every weight the device sees is
+    /// still counted somewhere, and a lane that quietly stopped reporting would
+    /// look like a lane that stopped moving bytes.
+    pub fn note_alias(&self, bytes: usize) {
+        use core::sync::atomic::Ordering::Relaxed;
+        self.stats.alias_calls.fetch_add(1, Relaxed);
+        self.stats.alias_bytes.fetch_add(bytes as u64, Relaxed);
+    }
+
     /// [`Aliases::slice`], falling back to an ordinary copy — and COUNTING
     /// which of the two happened.
     ///

@@ -263,6 +263,11 @@ struct HostT {
     drain: f64,
     /// Scattering each expert's rows back into the accumulator, weighted.
     accum: f64,
+    /// Layers the GROUPED lane took: one launch per stage for the whole layer.
+    grouped: usize,
+    /// Layers that fell back to the per-expert loop, because their weights are
+    /// not offsets into one registered mapping.
+    per_expert: usize,
 }
 
 /// One layer's shared experts, on the device, as the BF16 the pile stores.
@@ -864,6 +869,235 @@ fn routed_experts_fp4(
     inter: usize,
     host: &mut HostT,
 ) -> Result<T2> {
+    // Which of the two lanes runs the layer. The grouped one computes the same
+    // thing with one launch per STAGE instead of one sequence per EXPERT, and
+    // it returns `None` exactly when its premise -- every active expert's
+    // weight is an offset into one registered mapping -- does not hold.
+    //
+    // `INK_GROUPED=0` takes the per-expert loop, which is how the two are held
+    // to the same bits over a whole run; `INK_GROUPED=2` runs BOTH per layer
+    // and prints where they part company, which is how a disagreement gets
+    // located instead of argued about.
+    let mode = std::env::var("INK_GROUPED").unwrap_or_else(|_| "1".to_string());
+    if mode != "0" {
+        if let Some(al) = aliases {
+            if let Some(acc) =
+                grouped_experts_fp4(src, al, client, dev, prefix, by_expert, hn, n, h, inter, host)?
+            {
+                if mode == "2" {
+                    let reference = per_expert_fp4(
+                        src, aliases, client, dev, prefix, by_expert, hn, n, h, inter, host,
+                    )?;
+                    report_ab(prefix, &acc, &reference, h);
+                }
+                host.grouped += 1;
+                return Ok(acc);
+            }
+        }
+    }
+    host.per_expert += 1;
+    per_expert_fp4(src, aliases, client, dev, prefix, by_expert, hn, n, h, inter, host)
+}
+
+/// What the two lanes disagree about, in the only terms that settle it.
+///
+/// Not a tolerance check. It counts how many of the accumulator's elements
+/// differ AT ALL -- compared as BITS, so a `-0.0` against a `0.0` is a
+/// difference and a NaN is not silently equal to itself -- and reports the
+/// largest absolute and relative gap and where the first one is. A tolerance
+/// would answer "is this close enough", which is not the question the grouped
+/// lane has to pass; the question is whether it is the same number, and when it
+/// is not, which element to go and look at.
+fn report_ab(prefix: &str, a: &T2, b: &T2, h: usize) {
+    let av = down(a.clone());
+    let bv = down(b.clone());
+    let mut differ = 0usize;
+    let mut worst = 0.0f32;
+    let mut worst_rel = 0.0f32;
+    let mut first: Option<(usize, usize, f32, f32)> = None;
+    for i in 0..av.len() {
+        if av[i].to_bits() == bv[i].to_bits() {
+            continue;
+        }
+        differ += 1;
+        let d = (av[i] - bv[i]).abs();
+        worst = worst.max(d);
+        let scale = av[i].abs().max(bv[i].abs()).max(f32::MIN_POSITIVE);
+        worst_rel = worst_rel.max(d / scale);
+        if first.is_none() {
+            first = Some((i / h, i % h, av[i], bv[i]));
+        }
+    }
+    let ln = prefix.trim_end_matches('.');
+    match first {
+        None => println!("  [A/B] {ln}: {} elements, ALL BITS EQUAL", av.len()),
+        Some((r, c, x, y)) => println!(
+            "  [A/B] {ln}: {differ} of {} differ, max abs {worst:.3e} rel {worst_rel:.3e},              first row {r} col {c}: grouped {x:.9e} per-expert {y:.9e}",
+            av.len()
+        ),
+    }
+}
+
+/// Every routed expert for one layer in a handful of launches, or `None` if
+/// this lane cannot take the layer.
+///
+/// Same weights, same kernels, same arithmetic and -- by construction rather
+/// than by hope -- the same accumulation order as [`per_expert_fp4`]. See
+/// [`mary::models::inkling::moegroup`] for why the last of those had to be
+/// designed for. What differs is who walks the expert list: the host did, and
+/// now `CUBE_POS_Y` does.
+///
+/// # What makes it possible, and when it is not
+///
+/// The kernel reaches every active expert's weight through ONE bound buffer
+/// plus a table of byte offsets, so the whole layer's weights have to live in a
+/// single registered mapping. A pile is one file and the zero-copy seam
+/// registers it once, so that is the ordinary case. `INK_ZEROCOPY=0`, a device
+/// that cannot address host memory, or a slab whose offset does not land on the
+/// 4-byte vector the packed plane is read in -- each of those is `None`, and
+/// the per-expert loop runs the layer instead. That is not a comfort blanket
+/// kept beside a better lane: it is the only lane there is when this one's
+/// premise fails, and the per-pass report counts which ran.
+#[allow(clippy::too_many_arguments)]
+fn grouped_experts_fp4(
+    src: &Weights,
+    al: &mary::models::inkling::fp4gemm::Aliases,
+    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+    dev: &burn::backend::cuda::CudaDevice,
+    prefix: &str,
+    by_expert: &BTreeMap<usize, Vec<(usize, f32)>>,
+    hn: &T2,
+    n: usize,
+    h: usize,
+    inter: usize,
+    host: &mut HostT,
+) -> Result<Option<T2>> {
+    use mary::models::inkling::fp4gemm::gate_up_silu_launch;
+    use mary::models::inkling::fp4quant::quantize_nvfp4;
+    use mary::models::inkling::moegroup::{
+        fp4_linear_grouped_launch, gather_grouped, scale_rows, scatter_rows, RowPlan,
+    };
+    use mary::models::inkling::seam::{handle_of, tensor_of};
+
+    let n13 = format!("{prefix}mlp.experts.w13_weight");
+    let n2 = format!("{prefix}mlp.experts.w2_weight");
+    let slots = by_expert.len();
+    if slots == 0 {
+        return Ok(None);
+    }
+
+    // Where every plane of every active expert lives, as a byte offset into the
+    // one mapping they must share. This IS the bind, and it is arithmetic.
+    let t_s = Instant::now();
+    let mut off13: Vec<u64> = Vec::with_capacity(2 * slots);
+    let mut off2: Vec<u64> = Vec::with_capacity(2 * slots);
+    let mut sc13: Vec<f32> = Vec::with_capacity(slots);
+    let mut sc2: Vec<f32> = Vec::with_capacity(slots);
+    let mut plane_bytes: Vec<usize> = Vec::with_capacity(4 * slots);
+    let mut which: Option<usize> = None;
+    for &e in by_expert.keys() {
+        let w13 = src.expert_packed(&n13, e)?;
+        let w2 = src.expert_packed(&n2, e)?;
+        let planes: [&[u8]; 4] = [&w13.codes, &w13.scales, &w2.codes, &w2.scales];
+        let mut o = [0u64; 4];
+        for (i, plane) in planes.into_iter().enumerate() {
+            match al.locate(plane) {
+                Some((m, byte)) if which.map_or(true, |w| w == m) => {
+                    which = Some(m);
+                    o[i] = byte;
+                }
+                _ => return Ok(None),
+            }
+            plane_bytes.push(plane.len());
+        }
+        // The packed planes are read as 4-byte vectors out of the mapping, so
+        // an offset that does not land on one cannot be expressed as an index.
+        if o[0] % 4 != 0 || o[2] % 4 != 0 {
+            return Ok(None);
+        }
+        off13.push(o[0]);
+        off13.push(o[1]);
+        off2.push(o[2]);
+        off2.push(o[3]);
+        sc13.push(w13.scale2);
+        sc2.push(w2.scale2);
+    }
+    let (wmap, wmap_bytes) = match which.and_then(|i| al.map(i)) {
+        Some(m) => m,
+        None => return Ok(None),
+    };
+    // Charged only now that the lane is committed: a probe that turned back
+    // moved nothing and must not report that it did.
+    for b in plane_bytes {
+        al.note_alias(b);
+    }
+    host.slice += t_s.elapsed().as_secs_f64();
+
+    // The row plan, and the only host->device traffic in the layer: `[M]`
+    // indices and weights, `[M/16]` slots, `[2*slots]` offsets, `[slots]`
+    // second-level scales and the token->rows table. Nine small uploads for the
+    // whole layer, against two per expert before.
+    let t_g = Instant::now();
+    let plan = RowPlan::build(by_expert.values(), n);
+    let m_total = plan.m_total();
+    let hn_h = handle_of(hn.clone());
+    let h_rowtok = client.create_from_slice(bytes_of(&plan.row_tok));
+    let h_rowwgt = client.create_from_slice(bytes_of(&plan.row_wgt));
+    let h_tile = client.create_from_slice(bytes_of(&plan.tile_slot));
+    let h_off13 = client.create_from_slice(bytes_of(&off13));
+    let h_off2 = client.create_from_slice(bytes_of(&off2));
+    let h_sc13 = client.create_from_slice(bytes_of(&sc13));
+    let h_sc2 = client.create_from_slice(bytes_of(&sc2));
+    let h_tokrows = client.create_from_slice(bytes_of(&plan.tok_rows));
+    let h_tokcnt = client.create_from_slice(bytes_of(&plan.tok_cnt));
+    let x_h = gather_grouped(client, &hn_h, &h_rowtok, n, m_total, h);
+    host.gather += t_g.elapsed().as_secs_f64();
+
+    let t_w = Instant::now();
+    let (a, asc) = quantize_nvfp4(client, &x_h, m_total, h);
+    let both = fp4_linear_grouped_launch(
+        client, &a, &asc, &wmap, wmap_bytes, &h_tile, &h_off13, &h_sc13, slots, m_total, h,
+        2 * inter,
+    );
+    let act_h = gate_up_silu_launch(client, &both, m_total, inter);
+    let (a2, asc2) = quantize_nvfp4(client, &act_h, m_total, inter);
+    let y_h = fp4_linear_grouped_launch(
+        client, &a2, &asc2, &wmap, wmap_bytes, &h_tile, &h_off2, &h_sc2, slots, m_total, inter, h,
+    );
+    host.enqueue += t_w.elapsed().as_secs_f64();
+
+    let t_c = Instant::now();
+    // The weight lands FIRST, in its own launch, so the product is rounded to
+    // f32 before anything sums it -- see `moegroup`'s note on the FMA.
+    let yw_h = scale_rows(client, &y_h, &h_rowwgt, m_total, h);
+    let acc_h = scatter_rows(client, &yw_h, &h_tokrows, &h_tokcnt, m_total, n, h, plan.kmax);
+    let acc = tensor_of(client.clone(), dev.clone(), acc_h, n, h);
+    host.accum += t_c.elapsed().as_secs_f64();
+
+    Ok(Some(acc))
+}
+
+/// A slice of POD as the bytes `create_from_slice` uploads.
+fn bytes_of<T: cubecl::prelude::CubeElement>(v: &[T]) -> &[u8] {
+    T::as_bytes(v)
+}
+
+/// The per-expert lane: one launch sequence per active expert, in `BTreeMap`
+/// order, which is the order the accumulation is defined by.
+#[allow(clippy::too_many_arguments)]
+fn per_expert_fp4(
+    src: &Weights,
+    aliases: Option<&mary::models::inkling::fp4gemm::Aliases>,
+    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+    dev: &burn::backend::cuda::CudaDevice,
+    prefix: &str,
+    by_expert: &BTreeMap<usize, Vec<(usize, f32)>>,
+    hn: &T2,
+    n: usize,
+    h: usize,
+    inter: usize,
+    host: &mut HostT,
+) -> Result<T2> {
     use mary::models::inkling::fp4gemm::{fp4_linear_launch, gate_up_silu_launch, MTILE};
     use mary::models::inkling::fp4quant::quantize_nvfp4;
     use mary::models::inkling::pad::gather_rows_pad;
@@ -942,6 +1176,153 @@ fn routed_experts_fp4(
 /// multiplies too.
 #[allow(clippy::too_many_arguments)]
 fn routed_experts_bf16(
+    src: &Weights,
+    aliases: Option<&mary::models::inkling::fp4gemm::Aliases>,
+    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+    dev: &burn::backend::cuda::CudaDevice,
+    prefix: &str,
+    by_expert: &BTreeMap<usize, Vec<(usize, f32)>>,
+    hn: &T2,
+    n: usize,
+    h: usize,
+    inter: usize,
+    host: &mut HostT,
+) -> Result<T2> {
+    // Same dispatch as the packed lane, and it earns its keep on the same
+    // measurement: eight grouped NVFP4 layers cost the host 0.8 ms a pass and
+    // this ONE layer, still looping, cost about eight.
+    let mode = std::env::var("INK_GROUPED").unwrap_or_else(|_| "1".to_string());
+    if mode != "0" {
+        if let Some(al) = aliases {
+            if let Some(acc) = grouped_experts_bf16(
+                src, al, client, dev, prefix, by_expert, hn, n, h, inter, host,
+            )? {
+                if mode == "2" {
+                    let reference = per_expert_bf16(
+                        src, aliases, client, dev, prefix, by_expert, hn, n, h, inter, host,
+                    )?;
+                    report_ab(prefix, &acc, &reference, h);
+                }
+                host.grouped += 1;
+                return Ok(acc);
+            }
+        }
+    }
+    host.per_expert += 1;
+    per_expert_bf16(src, aliases, client, dev, prefix, by_expert, hn, n, h, inter, host)
+}
+
+/// Layer 2's routed experts in a handful of launches, or `None` if this lane
+/// cannot take the layer.
+///
+/// [`grouped_experts_fp4`] with the format's differences and no others: one
+/// weight plane per expert instead of two, no second-level scale to carry, and
+/// a cast in place of the activation quantiser. The offsets are BF16 elements
+/// because that is the unit the unscaled MMA indexes its B operand in.
+#[allow(clippy::too_many_arguments)]
+fn grouped_experts_bf16(
+    src: &Weights,
+    al: &mary::models::inkling::fp4gemm::Aliases,
+    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+    dev: &burn::backend::cuda::CudaDevice,
+    prefix: &str,
+    by_expert: &BTreeMap<usize, Vec<(usize, f32)>>,
+    hn: &T2,
+    n: usize,
+    h: usize,
+    inter: usize,
+    host: &mut HostT,
+) -> Result<Option<T2>> {
+    use mary::models::inkling::bf16gemm::to_bf16_launch;
+    use mary::models::inkling::fp4gemm::gate_up_silu_bf16_launch;
+    use mary::models::inkling::moegroup::{
+        bf16_linear_grouped_launch, gather_grouped, scale_rows, scatter_rows, RowPlan,
+    };
+    use mary::models::inkling::seam::{handle_of, tensor_of};
+
+    let n13 = format!("{prefix}mlp.experts.w13_weight");
+    let n2 = format!("{prefix}mlp.experts.w2_weight");
+    let slots = by_expert.len();
+    if slots == 0 {
+        return Ok(None);
+    }
+
+    let t_s = Instant::now();
+    let mut off13: Vec<u64> = Vec::with_capacity(slots);
+    let mut off2: Vec<u64> = Vec::with_capacity(slots);
+    let mut plane_bytes: Vec<usize> = Vec::with_capacity(2 * slots);
+    let mut which: Option<usize> = None;
+    for &e in by_expert.keys() {
+        let w13 = src.expert_bf16(&n13, e)?;
+        let w2 = src.expert_bf16(&n2, e)?;
+        let planes: [&[u8]; 2] = [&w13.bytes, &w2.bytes];
+        let mut o = [0u64; 2];
+        for (i, plane) in planes.into_iter().enumerate() {
+            match al.locate(plane) {
+                Some((m, byte)) if which.map_or(true, |w| w == m) => {
+                    which = Some(m);
+                    o[i] = byte;
+                }
+                _ => return Ok(None),
+            }
+            plane_bytes.push(plane.len());
+        }
+        // Read as two BF16 per 32-bit vector, so the offset has to be a whole
+        // number of them -- which is the same 4-byte rule the alias predicate
+        // already applies to the pointer.
+        if o[0] % 4 != 0 || o[1] % 4 != 0 {
+            return Ok(None);
+        }
+        off13.push(o[0] / 2);
+        off2.push(o[1] / 2);
+    }
+    let (wmap, wmap_bytes) = match which.and_then(|i| al.map(i)) {
+        Some(m) => m,
+        None => return Ok(None),
+    };
+    for b in plane_bytes {
+        al.note_alias(b);
+    }
+    host.slice += t_s.elapsed().as_secs_f64();
+
+    let t_g = Instant::now();
+    let plan = RowPlan::build(by_expert.values(), n);
+    let m_total = plan.m_total();
+    let hn_h = handle_of(hn.clone());
+    let h_rowtok = client.create_from_slice(bytes_of(&plan.row_tok));
+    let h_rowwgt = client.create_from_slice(bytes_of(&plan.row_wgt));
+    let h_tile = client.create_from_slice(bytes_of(&plan.tile_slot));
+    let h_off13 = client.create_from_slice(bytes_of(&off13));
+    let h_off2 = client.create_from_slice(bytes_of(&off2));
+    let h_tokrows = client.create_from_slice(bytes_of(&plan.tok_rows));
+    let h_tokcnt = client.create_from_slice(bytes_of(&plan.tok_cnt));
+    let x_h = gather_grouped(client, &hn_h, &h_rowtok, n, m_total, h);
+    host.gather += t_g.elapsed().as_secs_f64();
+
+    let t_w = Instant::now();
+    let a = to_bf16_launch(client, &x_h, m_total * h, m_total * h);
+    let both = bf16_linear_grouped_launch(
+        client, &a, &wmap, wmap_bytes, &h_tile, &h_off13, slots, m_total, h, 2 * inter,
+    );
+    let act = gate_up_silu_bf16_launch(client, &both, m_total, inter);
+    let y_h = bf16_linear_grouped_launch(
+        client, &act, &wmap, wmap_bytes, &h_tile, &h_off2, slots, m_total, inter, h,
+    );
+    host.enqueue += t_w.elapsed().as_secs_f64();
+
+    let t_c = Instant::now();
+    let yw_h = scale_rows(client, &y_h, &h_rowwgt, m_total, h);
+    let acc_h = scatter_rows(client, &yw_h, &h_tokrows, &h_tokcnt, m_total, n, h, plan.kmax);
+    let acc = tensor_of(client.clone(), dev.clone(), acc_h, n, h);
+    host.accum += t_c.elapsed().as_secs_f64();
+
+    Ok(Some(acc))
+}
+
+/// The per-expert BF16 lane: one launch sequence per active expert, in
+/// `BTreeMap` order.
+#[allow(clippy::too_many_arguments)]
+fn per_expert_bf16(
     src: &Weights,
     aliases: Option<&mary::models::inkling::fp4gemm::Aliases>,
     client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
@@ -2593,6 +2974,12 @@ fn main() -> Result<()> {
                  ms(host_t.enqueue), ms(host_t.enqueue) / expert_loads.max(1) as f64);
         println!("      scatter-add     {:9.1}   ({:.3} ms/load)   enqueue",
                  ms(host_t.accum), ms(host_t.accum) / expert_loads.max(1) as f64);
+        // WHICH lane ran, counted rather than asserted. The grouped one is a
+        // claim about launches per LAYER and the per-expert one about launches
+        // per EXPERT; a per-load average over a mixture of the two is a number
+        // about neither, so the split has to be visible beside it.
+        println!("      lanes: {} layer(s) GROUPED (one launch per stage), {} per-expert",
+                 host_t.grouped, host_t.per_expert);
         let named = host_t.slice + host_t.gather + host_t.enqueue + host_t.drain + host_t.accum;
         println!("      remainder       {:9.1}   (whatever the four above did not cover)",
                  ms(t_expert - named));
