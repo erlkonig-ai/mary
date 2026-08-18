@@ -6,6 +6,11 @@ description = "Neural-network models as content-addressed graphs in TribleSpace.
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+# `madvise(MADV_DONTNEED)` for the startup copy: on a unified-memory part the
+# source page cache and the anonymous arena are the same pool, so the copy has
+# to hand each leaf's source pages back as it goes. See
+# `models::inkling::pile::release_source_pages`.
+libc = "0.2"
 burn = { version = "0.21.0", default-features = false, features = ["wgpu", "metal", "autodiff"] }
 # Kernel fusion for the qwen3tts decode loop, WITHOUT flipping burn-wgpu's
 # global "fusion" flag: that flag rewrites the `Metal` alias to the Fusion

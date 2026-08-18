@@ -3972,6 +3972,7 @@ dependencies = [
  "half",
  "hf-hub",
  "image",
+ "libc",
  "libm",
  "memmap2",
  "pollster",
