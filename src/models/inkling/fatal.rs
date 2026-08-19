@@ -2,8 +2,16 @@
 //!
 //! # The failure this exists for
 //!
-//! Above roughly 15,600 tokens the device refuses one attention layer's
-//! `[heads, n, n]` f32 score matrix. The refusal is not a shortage of memory:
+//! The dense lane no longer materialises a whole `[heads, n, n]`, so the
+//! particular allocation below is not one any run makes now. That does not
+//! retire this module: the refusal is a property of the ALLOCATOR, it lands on
+//! whatever the largest buffer happens to be, and what made it dangerous was
+//! never the size -- it was that a refusal on a worker thread does not end the
+//! process.
+//!
+//! As it stood: above roughly 15,600 tokens the device refused one attention
+//! layer's `[heads, n, n]` f32 score matrix. The refusal is not a shortage of
+//! memory:
 //! cubecl's CUDA runtime sets its largest single allocation to
 //! `cuDeviceTotalMem / 4`, which is 29.9 GiB on a 119.6 GiB node, and
 //! `[32, 16384, 16384]` f32 is 32 GiB exactly. Every pool's `max_alloc_size` is

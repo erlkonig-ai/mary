@@ -1946,6 +1946,7 @@ fn main() -> Result<()> {
     // regardless of sequence length, which is how it admitted a run that peaked
     // at 119.5 GiB of a 119.6 GiB node.
     let attn_heads = t.heads(AttnKind::Global).0.max(t.heads(AttnKind::Local).0);
+    let attn_head_dim = t.heads(AttnKind::Global).2.max(t.heads(AttnKind::Local).2);
     let attention_bytes = budget::prefill_peak_bytes(attn_heads, n);
 
     let want_embed = !is_tail || mtp_k > 0;
@@ -2258,14 +2259,23 @@ fn main() -> Result<()> {
     // beside the admission gate because this is the first client in the
     // process, and taking `max_page_size` from a client Burn did not make would
     // be reading a different device's answer. Nothing has run a layer yet.
+    let qblock = budget::query_block(attn_heads, n);
     println!(
-        "  attention budget   : [{attn_heads}, {n}, {n}] f32 scores = {:.2} GiB per layer, \
-         largest single allocation this device allows {:.2} GiB (up to {} tokens)",
+        "  attention budget   : queries in blocks of {qblock}, so [{attn_heads}, {qblock}, {n}] \
+         f32 scores = {:.2} GiB per layer (the whole square would be {:.2} GiB) beside \
+         [{attn_heads}, {n}, {attn_head_dim}] f32 activations = {:.2} GiB; largest single \
+         allocation this device allows {:.2} GiB (up to {} tokens)",
+        budget::score_block_bytes(attn_heads, qblock, n) as f64 / GIB,
         budget::score_matrix_bytes(attn_heads, n) as f64 / GIB,
+        budget::activation_bytes(attn_heads, attn_head_dim, n) as f64 / GIB,
         budget::largest_allocation(&fp4_client) as f64 / GIB,
-        budget::longest_sequence(attn_heads, budget::largest_allocation(&fp4_client)),
+        budget::longest_sequence(
+            attn_heads,
+            attn_head_dim,
+            budget::largest_allocation(&fp4_client)
+        ),
     );
-    budget::check(&fp4_client, attn_heads, n)?;
+    budget::check(&fp4_client, attn_heads, attn_head_dim, n)?;
     // Nine blocking device round trips for the whole run, instead of four per
     // expert. Every later slab is an offset view of one of these.
     //

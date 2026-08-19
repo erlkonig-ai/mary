@@ -1,19 +1,14 @@
 //! What one attention layer asks the allocator for, and whether it will get it.
 //!
-//! Prefill attention materialises `[heads, tokens, tokens]` f32 per layer. That
-//! is 33.5 MB at 512 tokens, 1.68 GiB at 3,732, 23.8 GiB at 14,124 and 32 GiB
-//! at 16,384 -- it grows as `n^2`, so every 41% more tokens doubles it -- and
-//! it is by a wide margin the largest single thing the run allocates.
-//!
 //! # The ceiling is a per-BUFFER cap, not a shortage
 //!
 //! cubecl's CUDA runtime sets `MemoryDeviceProperties::max_page_size` to
 //! `cuDeviceTotalMem / 4`, and every memory pool it builds has a
 //! `max_alloc_size` at or below that. A request larger than the biggest pool's
 //! is refused outright, however much of the node is free: on a 119.6 GiB box
-//! the cap is 29.9 GiB, so `[32, 15600, 15616]` f32 (29.0 GB) is served and
-//! `[32, 16384, 16384]` f32 (32 GiB) is not. Adding memory does not move it;
-//! only a fourfold larger device would.
+//! the cap is 29.9 GiB, so a 29.0 GiB buffer is served and a 32 GiB one is not,
+//! and a run was refused with 60 GiB still free. Adding memory does not move
+//! it; only a fourfold larger device would.
 //!
 //! Refused is also the WORST case rather than the loudest one, because the
 //! `Result` is unwrapped on a cubecl worker thread and a worker-thread panic
@@ -21,6 +16,26 @@
 //! This module is the half that refuses BEFORE the run spends a minute
 //! copying weights: [`check`] is one comparison against a number the device
 //! already told us, and it is exact -- there is nothing fitted in it.
+//!
+//! # What used to be the binding buffer, and what is now
+//!
+//! A global layer used to materialise the whole `[heads, tokens, tokens]` f32
+//! score matrix -- 23.8 GiB at 14,124 tokens and 32 GiB at 16,384 -- so the cap
+//! landed on it and the sequence ceiling was the 15,808 tokens
+//! [`longest_sequence`] names. Thirty-five of the forty-two layers stopped
+//! building it when the local ones became a band, but a global layer really
+//! does read every key, and one falls in every range of six or more layers, so
+//! the ceiling did not move at all.
+//!
+//! The dense lane now blocks its QUERIES: it allocates `[heads, rows, tokens]`
+//! for one block at a time, with `rows` chosen by [`query_block`] against a
+//! byte budget rather than by the sequence. That term is bounded, so what binds
+//! instead is the largest term still linear in the sequence -- the
+//! `[heads, tokens, head_dim]` f32 the projections and the expansion produce,
+//! `tokens * 16 KiB` for this model. Under the same 29.9 GiB cap that is a
+//! ceiling near two million tokens, and the run will exhaust node memory long
+//! before it gets there. [`check`] therefore tests the max of the two, not the
+//! score matrix alone.
 
 use anyhow::Result;
 use cubecl::prelude::{ComputeClient, Runtime};
@@ -35,13 +50,59 @@ const MATMUL_ROW_ALIGN: usize = 64;
 
 const GIB: f64 = (1u64 << 30) as f64;
 
-/// Bytes in one layer's `[heads, tokens, tokens]` f32 score matrix, padding
-/// included.
-pub fn score_matrix_bytes(heads: usize, tokens: usize) -> u64 {
+/// Bytes in one `[heads, rows, tokens]` f32 score block, padding included.
+///
+/// `rows == tokens` is the unblocked whole-matrix figure, which is what this
+/// counted before the dense lane blocked its queries and is still what the
+/// arithmetic in [`longest_sequence`] is about.
+pub fn score_block_bytes(heads: usize, rows: usize, tokens: usize) -> u64 {
     heads as u64
-        * tokens as u64
+        * rows as u64
         * tokens.next_multiple_of(MATMUL_ROW_ALIGN) as u64
         * core::mem::size_of::<f32>() as u64
+}
+
+/// Bytes in one layer's whole `[heads, tokens, tokens]` f32 score matrix.
+///
+/// Nothing allocates this any more. It is the counterfactual the doc comments
+/// and the admission report quote, and the quantity [`longest_sequence`]
+/// inverts.
+pub fn score_matrix_bytes(heads: usize, tokens: usize) -> u64 {
+    score_block_bytes(heads, tokens, tokens)
+}
+
+/// How many bytes one query block's score matrix may occupy.
+///
+/// 4 GiB, and the number is a trade rather than a limit: bigger blocks amortise
+/// the per-block launches and the relative-table matmul over more queries,
+/// smaller ones leave more of the node for everything else. It is well under
+/// the 29.9 GiB per-buffer cap on purpose -- the block is also live alongside
+/// the softmax's output, so the peak is twice this.
+const QUERY_BLOCK_BYTES: u64 = 4 << 30;
+
+/// The smallest block worth issuing.
+///
+/// Below this the `[heads, rows, head_dim] x [heads, head_dim, tokens]` product
+/// is a GEMM too short to fill a tile, and the per-block launches stop being
+/// amortised by anything.
+const QUERY_BLOCK_MIN: usize = 128;
+
+/// How many queries one dense-attention block covers.
+///
+/// `INK_QBLOCK` overrides it, in queries, which is how the block size was swept
+/// without a rebuild.
+///
+/// Rounded to a multiple of [`MATMUL_ROW_ALIGN`] so the block's own matmul
+/// output is not itself padded into a taller allocation than it asked for.
+pub fn query_block(heads: usize, tokens: usize) -> usize {
+    if let Some(n) = std::env::var("INK_QBLOCK").ok().and_then(|v| v.parse::<usize>().ok()) {
+        return n.clamp(1, tokens.max(1));
+    }
+    let row = tokens.next_multiple_of(MATMUL_ROW_ALIGN) as u64;
+    let per_row = heads as u64 * row * core::mem::size_of::<f32>() as u64;
+    let rows = (QUERY_BLOCK_BYTES / per_row.max(1)) as usize;
+    let rows = (rows / MATMUL_ROW_ALIGN * MATMUL_ROW_ALIGN).max(QUERY_BLOCK_MIN);
+    rows.min(tokens).max(1)
 }
 
 /// How many `[heads, n, n]` score matrices prefill holds at the peak.
@@ -83,14 +144,21 @@ pub fn score_matrix_bytes(heads: usize, tokens: usize) -> u64 {
 /// 16,384 the node was 60 GiB FREE and the allocation was still refused.
 pub const LIVE_SCORE_MATRICES: u64 = 2;
 
-/// What prefill will hold in score matrices at this sequence length.
+/// What prefill will hold in score blocks at this sequence length.
 ///
-/// This is the term the admission gate did not have. It is quadratic in the
-/// sequence and flat in the layer count -- one layer's matrices are freed
-/// before the next layer allocates its own -- which is the opposite shape from
-/// the per-layer constant that stood in for it.
+/// This is the term the admission gate did not have. It is flat in the layer
+/// count -- one layer's blocks are freed before the next layer allocates its
+/// own -- which is the opposite shape from the per-layer constant that stood in
+/// for it. It used to be quadratic in the sequence as well; with the queries
+/// blocked it grows linearly until the block stops shrinking, and is flat
+/// after that.
+///
+/// It has to move with [`query_block`] or the gate refuses runs that would now
+/// succeed, which is a worse failure than the one it was built to prevent: a
+/// gate that is wrong in the permissive direction gets found by a crash, and
+/// one that is wrong in the restrictive direction gets found by nobody.
 pub fn prefill_peak_bytes(heads: usize, tokens: usize) -> u64 {
-    LIVE_SCORE_MATRICES * score_matrix_bytes(heads, tokens)
+    LIVE_SCORE_MATRICES * score_block_bytes(heads, query_block(heads, tokens), tokens)
 }
 
 /// The largest single buffer this runtime will hand out, straight from the
@@ -103,16 +171,35 @@ pub fn largest_allocation<R: Runtime>(client: &ComputeClient<R>) -> u64 {
     client.properties().memory.max_page_size
 }
 
-/// The longest sequence whose score matrix fits under `cap`.
+/// Bytes in one `[heads, tokens, head_dim]` f32 activation.
 ///
-/// Bisected rather than solved, because `score_matrix_bytes` rounds and the
-/// closed form would have to round with it. The predicate is monotone in
-/// `tokens`, so the bisection is exact.
-pub fn longest_sequence(heads: usize, cap: u64) -> usize {
+/// Q, the GQA-expanded K and V, K again transposed, and the concatenated output
+/// are all this shape, and with the score block bounded they are the largest
+/// buffers a global layer asks for. `tokens * 16 KiB` on this model.
+pub fn activation_bytes(heads: usize, head_dim: usize, tokens: usize) -> u64 {
+    heads as u64 * tokens as u64 * head_dim as u64 * core::mem::size_of::<f32>() as u64
+}
+
+/// The largest SINGLE buffer one attention layer asks for at this length.
+///
+/// The max of the two terms, not their sum: they are separate allocations and
+/// the cap is per-buffer. A sum would be the right thing to charge against node
+/// memory, which is the admission gate's question and not this one.
+pub fn largest_buffer(heads: usize, head_dim: usize, tokens: usize) -> u64 {
+    score_block_bytes(heads, query_block(heads, tokens), tokens)
+        .max(activation_bytes(heads, head_dim, tokens))
+}
+
+/// The longest sequence whose largest attention buffer fits under `cap`.
+///
+/// Bisected rather than solved, because the terms round and because
+/// [`query_block`] is a step function. Both terms are non-decreasing in
+/// `tokens`, so their max is too and the bisection is exact.
+pub fn longest_sequence(heads: usize, head_dim: usize, cap: u64) -> usize {
     let (mut lo, mut hi) = (0usize, 1usize << 24);
     while lo < hi {
         let mid = (lo + hi).div_ceil(2);
-        if score_matrix_bytes(heads, mid) <= cap {
+        if largest_buffer(heads, head_dim, mid) <= cap {
             lo = mid;
         } else {
             hi = mid - 1;
@@ -121,33 +208,51 @@ pub fn longest_sequence(heads: usize, cap: u64) -> usize {
     lo
 }
 
-/// Refuse a sequence this device cannot hold the scores for, before the first
-/// allocation rather than after the 224th.
-pub fn check<R: Runtime>(client: &ComputeClient<R>, heads: usize, tokens: usize) -> Result<()> {
-    let want = score_matrix_bytes(heads, tokens);
+/// Refuse a sequence this device cannot hold one attention layer of, before the
+/// first allocation rather than after the 224th.
+pub fn check<R: Runtime>(
+    client: &ComputeClient<R>,
+    heads: usize,
+    head_dim: usize,
+    tokens: usize,
+) -> Result<()> {
+    let rows = query_block(heads, tokens);
+    let scores = score_block_bytes(heads, rows, tokens);
+    let acts = activation_bytes(heads, head_dim, tokens);
+    let want = scores.max(acts);
     let cap = largest_allocation(client);
     anyhow::ensure!(
         want <= cap,
-        "{tokens} tokens needs a [{heads}, {tokens}, {tokens}] f32 score matrix per attention \
-         layer -- {want} bytes, {:.2} GiB -- and this device refuses any single allocation over \
-         {cap} bytes ({:.2} GiB).\n  \
+        "{tokens} tokens needs a [{heads}, {rows}, {tokens}] f32 score block ({:.2} GiB) and \
+         [{heads}, {tokens}, {head_dim}] f32 activations ({:.2} GiB) per attention layer, and \
+         this device refuses any single allocation over {cap} bytes ({:.2} GiB).\n  \
          That cap is cuDeviceTotalMem / 4 and free memory does not raise it. The longest \
-         sequence whose scores fit is {} tokens.\n  \
+         sequence whose buffers fit is {} tokens.\n  \
          Refusing here rather than at the allocator, because the allocator's refusal happens on \
          a worker thread, does not end the process, and returns a plausible answer read out of a \
          buffer nothing ever wrote.",
-        want as f64 / GIB,
+        scores as f64 / GIB,
+        acts as f64 / GIB,
         cap as f64 / GIB,
-        longest_sequence(heads, cap),
+        longest_sequence(heads, head_dim, cap),
     );
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{longest_sequence, score_matrix_bytes};
+    use super::{
+        activation_bytes, largest_buffer, longest_sequence, query_block, score_block_bytes,
+        score_matrix_bytes, QUERY_BLOCK_BYTES,
+    };
 
-    /// The two sizes the ceiling was measured at, and the padding in between.
+    /// This model, at the sizes the measurements were taken at.
+    const HEADS: usize = 32;
+    const HEAD_DIM: usize = 128;
+    /// A 119.6 GiB node: cuDeviceTotalMem / 4 is a shade under 30 GiB.
+    const CAP: u64 = 128_408_297_472u64 / 4;
+
+    /// The two sizes the old ceiling was measured at, and the padding between.
     #[test]
     fn counts_the_padding() {
         // 7000 rounds to 7040, which is the stride Burn actually reports.
@@ -157,14 +262,46 @@ mod tests {
         assert_eq!(score_matrix_bytes(32, 16384), 34_359_738_368);
     }
 
+    /// The block honours its budget at every length, which is the whole
+    /// property that makes the allocation linear rather than quadratic.
+    #[test]
+    fn a_block_stays_inside_its_budget() {
+        for n in [512, 3732, 7000, 14124, 15808, 20_000, 35_845, 100_623, 250_000] {
+            let rows = query_block(HEADS, n);
+            assert!(rows >= 1 && rows <= n, "{n} tokens gave a {rows}-query block");
+            let bytes = score_block_bytes(HEADS, rows, n);
+            // The floor is allowed to exceed the budget -- a block below
+            // QUERY_BLOCK_MIN is not worth issuing -- but only there.
+            assert!(
+                bytes <= QUERY_BLOCK_BYTES || rows <= super::QUERY_BLOCK_MIN,
+                "{n} tokens: a {rows}-query block is {bytes} bytes"
+            );
+        }
+    }
+
+    /// Past the old ceiling the score block is no longer what binds.
+    #[test]
+    fn the_activations_bind_now_not_the_scores() {
+        for n in [20_000, 35_845, 100_623] {
+            let scores = score_block_bytes(HEADS, query_block(HEADS, n), n);
+            let acts = activation_bytes(HEADS, HEAD_DIM, n);
+            assert!(
+                largest_buffer(HEADS, HEAD_DIM, n) <= CAP,
+                "{n} tokens would still be refused: scores {scores}, activations {acts}"
+            );
+        }
+        // 15,808 was the ceiling when the whole square was materialised.
+        assert!(largest_buffer(HEADS, HEAD_DIM, 15_809) <= CAP);
+    }
+
     #[test]
     fn bisects_the_boundary() {
-        // A 119.6 GiB node: cuDeviceTotalMem / 4 is a shade under 30 GiB, and
-        // the measured boundary is 15,600 served / 16,384 refused.
-        let cap = 128_408_297_472u64 / 4;
-        let n = longest_sequence(32, cap);
-        assert!(score_matrix_bytes(32, n) <= cap);
-        assert!(score_matrix_bytes(32, n + 1) > cap);
-        assert!((15_600..16_384).contains(&n), "boundary landed at {n}");
+        let n = longest_sequence(HEADS, HEAD_DIM, CAP);
+        assert!(largest_buffer(HEADS, HEAD_DIM, n) <= CAP);
+        assert!(largest_buffer(HEADS, HEAD_DIM, n + 1) > CAP);
+        // The activation term is `tokens * heads * head_dim * 4`, so the
+        // ceiling is the cap divided by 16 KiB -- near two million tokens,
+        // against the 15,808 the whole score matrix allowed.
+        assert!((1_900_000..2_100_000).contains(&n), "boundary landed at {n}");
     }
 }
