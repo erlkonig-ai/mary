@@ -152,40 +152,31 @@ fn router_topk_kernel(
     sync_cube();
 
     if u == 0 {
-        // `top_k` passes of "the next largest score", ordered by
-        // (score descending, index ascending) — the host twin's comparator.
-        // A candidate must come strictly after the previous pick in that
-        // order, which is what keeps equal scores from being taken twice.
+        // `top_k` passes of "the largest score left", masking each pick out of
+        // the shared row as it is taken. Ascending `e` with a strict `>` keeps
+        // the lowest index among equal scores, which is the tie-break the host
+        // comparator has; masking is what keeps a pick from being taken twice.
+        //
+        // The row is scratch by this point — nothing below reads a score — so
+        // the mask is written into it rather than into a second array. An
+        // earlier version carried the previous pick and admitted only scores
+        // strictly below it, which is the same rule expressed as a filter; it
+        // is not written that way any more because a filter built out of `<`
+        // and `==` also silently excludes a NaN, and a selection that drops an
+        // expert is not the failure mode a non-finite logit should have.
         let mut pick = Array::<u32>::new(comptime!(top_k as usize));
-        let mut prev_s = f32::new(0.0);
-        let mut prev_e = u32::new(0);
         for j in 0..top_k {
             let mut bs = f32::new(-3.4028235e38);
             let mut be = u32::new(0);
             for e in 0..n_routed {
                 let s = sh[e as usize];
-                let mut ok = true;
-                if j > 0 {
-                    ok = false;
-                    if s < prev_s {
-                        ok = true;
-                    }
-                    if s == prev_s {
-                        if e > prev_e {
-                            ok = true;
-                        }
-                    }
-                }
-                if ok {
-                    if s > bs {
-                        bs = s;
-                        be = e;
-                    }
+                if s > bs {
+                    bs = s;
+                    be = e;
                 }
             }
-            prev_s = bs;
-            prev_e = be;
             pick[j as usize] = be;
+            sh[be as usize] = -3.4028235e38f32;
         }
 
         // The chosen routed logits and every shared logit, through the same
