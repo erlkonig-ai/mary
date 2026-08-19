@@ -215,7 +215,7 @@ fn one(
         k_norm: Tensor::from_data(TensorData::new(kn.clone(), [head_dim]), &dev),
         rel_proj: t2(&rp, d_rel, rel_extent),
     };
-    let devy = dev_lane::attention(xt, &dw, &dims, Some(ls), maskt)
+    let devy = dev_lane::attention(xt, &dw, &dims, Some(ls), if is_local { Some(window) } else { None })
         .into_data()
         .to_vec::<f32>()
         .expect("device attention output");

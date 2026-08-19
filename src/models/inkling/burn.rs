@@ -401,9 +401,9 @@ pub fn attention(
     w: &AttnWeightsDev,
     d: &crate::models::inkling::attn::AttnDims,
     log_scaling: Option<crate::models::inkling::attn::LogScaling>,
-    mask: Tensor<Bk, 2>,
+    mask_window: Option<usize>,
 ) -> Tensor<Bk, 2> {
-    attention_prefill(x, w, d, log_scaling, mask, None).0
+    attention_prefill(x, w, d, log_scaling, mask_window, None).0
 }
 
 /// The same layer, keeping what a decode step will need.
@@ -421,14 +421,13 @@ pub fn attention_prefill(
     w: &AttnWeightsDev,
     d: &crate::models::inkling::attn::AttnDims,
     log_scaling: Option<crate::models::inkling::attn::LogScaling>,
-    mask: Tensor<Bk, 2>,
+    mask_window: Option<usize>,
     window: Option<usize>,
 ) -> (Tensor<Bk, 2>, AttnCache<Bk>) {
     use crate::models::inkling::config::AttnKind;
 
     let [tokens, hidden] = x.dims();
     assert_eq!(hidden, d.hidden, "x is [_, {hidden}] but the config says {}", d.hidden);
-    assert_eq!(mask.dims(), [tokens, tokens], "the mask must be [tokens, tokens]");
     let dev = x.device();
     let (heads, kv_heads, head_dim) = (d.heads, d.kv_heads, d.head_dim);
     let groups = d.groups();
@@ -460,28 +459,23 @@ pub fn attention_prefill(
     // Only distances that can occur are worth projecting: a distance is at most
     // `tokens - 1` and the table stops at `rel_extent`.
     let eff = d.rel_extent.min(tokens);
-    let mut idx = vec![0i32; tokens * tokens];
-    let mut valid = vec![0f32; tokens * tokens];
-    for qi in 0..tokens {
-        for ki in 0..tokens {
-            let dist = qi as isize - ki as isize;
-            if dist >= 0 && (dist as usize) < d.rel_extent {
-                idx[qi * tokens + ki] = dist as i32;
-                valid[qi * tokens + ki] = 1.0;
-            }
-        }
-    }
-    let idx: Tensor<Bk, 3, Int> =
-        Tensor::from_data(TensorData::new(idx, [1, tokens, tokens]), &dev).repeat_dim(0, heads);
-    let valid: Tensor<Bk, 3> = Tensor::from_data(TensorData::new(valid, [1, tokens, tokens]), &dev);
 
+    // `[heads, tokens, eff]`, and eff <= 1024 -- linear in the sequence, not
+    // quadratic. This is the ONLY thing the epilogue reads besides the scores
+    // themselves; the `[heads, n, n]` index, validity, bias and mask tensors
+    // that used to stand between this and the softmax are gone into
+    // `scorebias::score_epilogue_launch`, which recomputes what each of them
+    // held from `(q, k)` in a register. See that module for why.
+    //
+    // Left at `[tokens, heads, eff]` rather than swapped to `[heads, tokens,
+    // eff]`: the swap is a permuted VIEW, and every later reshape of a permuted
+    // view is a copy. The kernel takes the head stride as an argument instead,
+    // which costs an index multiply and moves no bytes.
     let rel = r
         .reshape([tokens * heads, d.d_rel])
         .matmul(w.rel_proj.clone().slice([0..d.d_rel, 0..eff]))
         .reshape([tokens, heads, eff])
-        .swap_dims(0, 1)
-        * tau.reshape([1, tokens, 1]);
-    let bias = rel.gather(2, idx) * valid;
+        * tau.reshape([tokens, 1, 1]);
 
     // [heads, tokens, head_dim]; the KV heads are repeated in place, so head h
     // reads kv head h / groups exactly as the slice lane indexes it.
@@ -496,8 +490,29 @@ pub fn attention_prefill(
     let kh = expand(k.clone());
     let vh = expand(v.clone());
 
-    let scores = qh.matmul(kh.swap_dims(1, 2)).mul_scalar(d.scaling()) + bias
-        + mask.reshape([1, tokens, tokens]);
+    // `q @ k^T` raw, then scaled, biased and masked IN PLACE by one kernel.
+    // `handle_of` consumes the tensor, so after that line there is exactly one
+    // name for the buffer and writing through it is not aliasing.
+    let scores = {
+        use crate::models::inkling::scorebias::score_epilogue_launch;
+        use crate::models::inkling::seam::{client_of, handle_of, strided_of3, tensor_strided3};
+        let raw = qh.matmul(kh.swap_dims(1, 2));
+        let client = client_of(&raw);
+        let rel_h = handle_of(rel);
+        let (s_h, st) = strided_of3(raw);
+        score_epilogue_launch(
+            &client,
+            &s_h,
+            &rel_h,
+            heads,
+            tokens,
+            eff,
+            st,
+            d.scaling(),
+            mask_window,
+        );
+        tensor_strided3(client, dev.clone(), s_h, [heads, tokens, tokens], st)
+    };
     let probs = burn::tensor::activation::softmax(scores, 2);
     let out = probs
         .matmul(vh)

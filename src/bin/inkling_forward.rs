@@ -104,7 +104,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 
-use mary::models::inkling::attn::{causal_mask, AttnDims, AttnWeights, LogScaling};
+use mary::models::inkling::attn::{AttnDims, AttnWeights, LogScaling};
 use mary::models::inkling::block::{rms_norm, route_from_logits, Routing};
 use mary::models::inkling::config::{AttnKind, InklingConfig};
 use mary::models::inkling::load::{split_gate_up, Held};
@@ -663,14 +663,13 @@ fn mtp_block_prefill_dev(
     dims: &AttnDims,
     ls: Option<LogScaling>,
     window: Option<usize>,
-    mask: T2,
     kernel: usize,
     eps: f64,
     order: MtpConcat,
 ) -> (T2, MtpDevCache) {
     let x = mtp_input_dev(hidden, embeds, w, eps, order);
     let hn = dev_lane::rms_norm(x.clone(), w.attn_norm.clone(), eps);
-    let (y, attn) = dev_lane::attention_prefill(hn, &w.attn, dims, ls, mask, window);
+    let (y, attn) = dev_lane::attention_prefill(hn, &w.attn, dims, ls, window, window);
     let ahist = dev_lane::conv_history(y.clone(), kernel);
     let x1 = x + dev_lane::short_conv(y, w.attn_sconv.clone());
     let hn = dev_lane::rms_norm(x1.clone(), w.mlp_norm.clone(), eps);
@@ -2431,8 +2430,6 @@ fn main() -> Result<()> {
         n_floor: t.log_scaling_n_floor as f32,
         alpha: t.log_scaling_alpha as f32,
     };
-    let mask_local = causal_mask(n, Some(t.sliding_window_size));
-    let mask_global = causal_mask(n, None);
     #[allow(unused_assignments)]
     let mut expert_loads = 0usize;
     let (mut t_attn, mut t_expert, mut t_other, mut t_shared) = (0f64, 0f64, 0f64, 0f64);
@@ -2489,16 +2486,6 @@ fn main() -> Result<()> {
     // enqueueing.
     let mut layer_rms: Vec<T2> = Vec::with_capacity(hi - lo);
     let mut layer_kind: Vec<(usize, bool)> = Vec::with_capacity(hi - lo);
-    // Uploaded once per pass rather than once per layer: the mask is a function
-    // of `n` and the layer's kind, and there are two kinds.
-    let (mask_l_dev, mask_g_dev) = if kv && step > 0 {
-        (None, None)
-    } else {
-        (
-            Some(up2::<Bk>(mask_local.clone(), n, n, &dev)),
-            Some(up2::<Bk>(mask_global.clone(), n, n, &dev)),
-        )
-    };
 
     // One sync, charged to one stage. Written as a macro rather than a closure
     // because every call site names a different accumulator and a closure would
@@ -2675,10 +2662,6 @@ fn main() -> Result<()> {
         // how far back a query may look, and therefore how much of the cache
         // can never be read again.
         let window = if is_local { Some(t.sliding_window_size) } else { None };
-        let mask = || {
-            let m = if is_local { &mask_l_dev } else { &mask_g_dev };
-            m.clone().expect("a pass that needs a mask uploaded one")
-        };
         let a = if kv && step > 0 {
             let y = dev_lane::attention_step(
                 hn, &ld.attn, &dims, Some(ls), pos0, window, &mut caches[slot].attn,
@@ -2689,14 +2672,14 @@ fn main() -> Result<()> {
             out
         } else if kv {
             let (y, attn) = dev_lane::attention_prefill(
-                hn, &ld.attn, &dims, Some(ls), mask(), window,
+                hn, &ld.attn, &dims, Some(ls), window, window,
             );
             let hist = dev_lane::conv_history(y.clone(), t.sconv_kernel_size);
             let out = dev_lane::short_conv(y, ld.attn_sconv.clone());
             caches.push(LayerCache { attn, attn_sconv: hist, mlp_sconv: None });
             out
         } else {
-            let y = dev_lane::attention(hn, &ld.attn, &dims, Some(ls), mask());
+            let y = dev_lane::attention(hn, &ld.attn, &dims, Some(ls), window);
             dev_lane::short_conv(y, ld.attn_sconv.clone())
         };
         xd = xd + a;
@@ -3484,7 +3467,6 @@ fn main() -> Result<()> {
                     } else {
                         row_of(&mtp_stage_dev[d - 1], 0, want)
                     };
-                    let mask = up2::<Bk>(causal_mask(want, window), want, want, &dev);
                     let (y, c) = mtp_block_prefill_dev(
                         hin,
                         ed,
@@ -3492,7 +3474,6 @@ fn main() -> Result<()> {
                         &hd,
                         Some(ls),
                         window,
-                        mask,
                         t.sconv_kernel_size,
                         t.rms_norm_eps,
                         mtp_order,

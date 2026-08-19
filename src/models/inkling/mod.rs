@@ -47,6 +47,10 @@ pub mod seam;
 // ops. Four run per layer and they were a third of every launch in a decode
 // step; the arithmetic is 16384 multiply-adds.
 pub mod sconv;
+// The attention score epilogue -- scale, relative-position bias, causal mask
+// and sliding window -- as one kernel over `[heads, n, n]` instead of five
+// materialised tensors of that shape and two host loops over `n^2`.
+pub mod scorebias;
 // The MMA's M padding, written by the kernel that was already producing the
 // buffer instead of by a `zeros` and a `cat` beside it.
 pub mod pad;
