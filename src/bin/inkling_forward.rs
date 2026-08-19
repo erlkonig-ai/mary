@@ -78,6 +78,59 @@
 //! Set `INK_MTP` on the TAIL process only. It is refused on a head, which holds
 //! neither the final hidden state nor a way to turn one into a token.
 //!
+//! # The decode baseline, and the exact configuration that produced it
+//!
+//! Two rates get quoted for this model and they are not the same number, so
+//! both are here with the run that measured them. Current main, two nodes over
+//! the direct link, layers 0..21 and 21..42, `INK_KV=1`, `INK_GEN=100`,
+//! `INK_MTP` unset, a five-token English prompt, context 5 -> 105:
+//!
+//!   round trip, one token                126.8 ms
+//!   tail node, layers 21..42 + unembed    69.3 ms   p50 of 96 warm passes
+//!   head node, layers 0..21 + embed      ~55.5 ms   derived, see below
+//!   the head's own view of one step      125.8 ms   p50, compute AND blocked
+//!
+//! The round trip is the wall clock between two consecutive tokens, taken
+//! between step 3 and step 100 so that the two cold passes -- 4.54 s and 0.55 s
+//! of kernel compilation -- fall outside the interval instead of being averaged
+//! into it. Averaged in, the same run reports 135.2 ms/step, which is why the
+//! summary block below now prints a WARM line beside the pooled one. A separate
+//! 40-step run reads 125.1 ms/step warm against 144.8 ms/step pooled, so the
+//! correction is worth more than the run-to-run spread, not less.
+//!
+//! A NODE rate is not a token rate. The two halves run strictly in sequence, so
+//! 69.3 and ~55.5 add; neither of them, and no fraction of the round trip, is a
+//! per-token figure on its own. The head does not report its compute per step
+//! (only pooled, where the cold pass is still in the average), so its ~55.5 ms
+//! is the round trip less the tail's p50 and two 16 KB wire crossings.
+//!
+//! # What the idle half is worth, and why drafting does not claim it
+//!
+//! Each end spends about half the loop waiting for the other -- head computing
+//! 46.9% and blocked 53.1%, tail computing 55.2% and blocked 44.8%. That idle
+//! half is the standing argument for speculation, and the same run prices it.
+//!
+//! `INK_MTP=4` on the tail, same prompt, same 100 steps:
+//!
+//!   round trip                           151.5 ms   against 126.8 undrafted
+//!   tail compute                         151.0 ms/step, drafting 110.5 of it
+//!   tail BLOCKED on the head               0.0 ms/step
+//!
+//! Four device MTP heads do not fit in the idle half. They fill it and then
+//! push 25 ms into the critical path: the tail goes from 44.8% idle to 0.0%.
+//!
+//! Nor are the drafts worth that. Over the 100 steps, depth-1 acceptance is
+//! 22.0% (95% CI 15.0-31.1%), and a whole four-deep draft set yields a mean
+//! 0.268 accepted tokens per verify pass. Against the measured width cost
+//! c(2) = 1.492, a k=1 loop that always speculates is (1 + 0.220) / 1.492 =
+//! 0.818x -- it LOSES 18%. Gating on the draft head's own confidence at
+//! tau = 0.2 turns it into 1.059x, a 6% gain taken on 27% of steps.
+//!
+//! So the idle half is idle, and this file does not consume a draft at all:
+//! `INK_MTP` measures what an accept-and-skip loop WOULD have kept, and no such
+//! loop is here. A change that wants that half of the machine -- a within-layer
+//! split, most obviously -- is not competing with speculation for it.
+//!
 //! # One lane, all the way down
 //!
 //! There is nothing to select. Attention, the dense and shared MLPs, the head
@@ -152,6 +205,14 @@ use mary::models::inkling::stack::{embed_and_norm_bf16, embed_row_bf16};
 
 /// One gibibyte, as the divisor every byte count here is printed against.
 const GIB: f64 = (1u64 << 30) as f64;
+
+/// How many decode steps are COLD, and excluded from the warm rate.
+///
+/// Every kernel shape a decode step reaches is compiled on first use, and the
+/// first two steps of a pipe run pay 4.54 s and 0.55 s of that against a 127 ms
+/// median. Two is not a fit: it is how many steps report a pass an order of
+/// magnitude off the median, and the third is already within 6% of it.
+const COLD_DECODE_STEPS: usize = 2;
 
 /// Bytes this process has actually pulled off the block device.
 ///
@@ -2417,6 +2478,13 @@ fn main() -> Result<()> {
     // the subtraction honest.
     let mut acc_to_reply = 0f64;
     let mut acc_steps = 0usize;
+    // The same wall, over the WARM steps only. The first two decode steps of a
+    // pipe run cost 4.54 s and 0.55 s of kernel compilation, and averaging them
+    // into a hundred 127 ms ones reports 135 ms/step -- an 6% error that lands
+    // squarely on the number people quote. Two is not fitted: it is how many
+    // steps print a pass an order of magnitude off the median.
+    let mut warm_wall = 0f64;
+    let mut warm_steps = 0usize;
     let loop_started = Instant::now();
     let mut top_all: Vec<i64> = Vec::new();
     for step in 0..=gen_steps {
@@ -3937,6 +4005,10 @@ fn main() -> Result<()> {
         acc_to_reply += t_to_reply;
         acc_steps += 1;
     }
+    if step > COLD_DECODE_STEPS {
+        warm_wall += pass.elapsed().as_secs_f64() + t_recv;
+        warm_steps += 1;
+    }
     if step == gen_steps {
         break;
     }
@@ -3949,6 +4021,14 @@ fn main() -> Result<()> {
         println!("\n=== pipe utilisation over {acc_steps} decode steps (prefill excluded) ===");
         println!("  role                 : {}", if is_head { "head" } else { "tail" });
         println!("  wall in the loop     : {:9.1} ms   ({:.1} ms/step)", ms(wall), ms(wall) / acc_steps as f64);
+        if warm_steps > 0 {
+            println!(
+                "  WARM steps only      : {:9.1} ms   ({:.1} ms/step over {warm_steps} steps, \
+                 the first {COLD_DECODE_STEPS} excluded)",
+                ms(warm_wall),
+                ms(warm_wall) / warm_steps as f64
+            );
+        }
         if is_head {
             // `pass` contains the wait, so compute is what is left of it.
             let compute = acc_pass - acc_wait_peer - acc_send;
