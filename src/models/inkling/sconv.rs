@@ -233,6 +233,112 @@ pub fn short_conv_batch<R: Runtime>(
     out
 }
 
+/// The same convolution for `slots` INDEPENDENT sequences, one position each.
+///
+/// [`short_conv_kernel`] carries one history and convolves one position;
+/// [`short_conv_batch_kernel`] convolves several CONSECUTIVE positions of one
+/// sequence out of one window. Neither is what `b` independent decode slots
+/// want: they are `b` sequences that share nothing but the weights, so each has
+/// its own `kernel - 1` history and its own new row, and a tap of slot `s` must
+/// never reach into slot `s - 1`.
+///
+/// That separation is the whole reason this is a third kernel rather than a
+/// call to the second one with `rows = b`. The batched kernel's row `i` reads
+/// `all[i ..= i + kernel - 1]`, so its rows OVERLAP by `kernel - 1` positions —
+/// exactly right for a speculative batch and exactly wrong here, where it would
+/// convolve slot `s`'s output out of slot `s - 1`'s inputs and produce fluent
+/// text with the sequences quietly bleeding into each other.
+///
+/// `hist` is `[slots, kernel - 1, dim]` oldest-first per slot, `x` is
+/// `[slots, dim]`, `w` is `[dim, kernel]` — the weights are shared, which is
+/// the point of a batch. `out` is `[slots, dim]` and `next` is the
+/// `[slots, kernel - 1, dim]` history for the position after this one.
+///
+/// One thread per `(slot, channel)`, taps accumulated in registers in ascending
+/// `j`, so `slots == 1` here is bit-identical to [`short_conv_kernel`] rather
+/// than merely close to it.
+///
+/// `slots * dim` indexes the grid: `dim` is at most `hidden` (4096) and `slots`
+/// is a batch width, so the 32-bit `usize` this runtime gives a kernel has room
+/// to spare — the largest index formed is `slots * (kernel - 1) * dim`, which
+/// is under a million at every shape this model runs.
+#[cube(launch_unchecked)]
+fn short_conv_slots_kernel(
+    hist: &Array<f32>,
+    x: &Array<f32>,
+    w: &Array<f32>,
+    out: &mut Array<f32>,
+    next: &mut Array<f32>,
+    dim: usize,
+    slots: usize,
+    #[comptime] kernel: usize,
+) {
+    let p = ABSOLUTE_POS as usize;
+    if p < slots * dim {
+        let s = p / dim;
+        let d = p % dim;
+        let taps = comptime!(kernel - 1);
+        // Slot `s`'s history block. Every read and write below is inside it,
+        // which is the invariant that keeps the slots independent.
+        let hb = s * taps * dim;
+        let xv = x[p];
+
+        let mut acc = w[d * kernel] * hist[hb + d];
+        #[unroll]
+        for j in 1..taps {
+            acc += w[d * kernel + j] * hist[hb + j * dim + d];
+        }
+        acc += w[d * kernel + taps] * xv;
+        out[p] = xv + acc;
+
+        #[unroll]
+        for j in 0..taps - 1 {
+            next[hb + j * dim + d] = hist[hb + (j + 1) * dim + d];
+        }
+        next[hb + (taps - 1) * dim + d] = xv;
+    }
+}
+
+/// Launch it, returning `(out, next)`.
+///
+/// One launch for the whole batch, not `slots` launches of
+/// [`short_conv_decode`]: this convolution is four multiply-adds a channel and
+/// the launch is the cost, so a per-slot loop would multiply the one thing that
+/// was already worth a kernel by the batch width.
+pub fn short_conv_slots<R: Runtime>(
+    client: &ComputeClient<R>,
+    hist: &Handle,
+    x: &Handle,
+    w: &Handle,
+    dim: usize,
+    slots: usize,
+    kernel: usize,
+) -> (Handle, Handle) {
+    assert!(kernel >= 2, "a short convolution with kernel {kernel} has no history to carry");
+    assert!(slots >= 1, "a slot batch has at least one slot");
+    let taps = kernel - 1;
+    let f32b = core::mem::size_of::<f32>();
+    let out = client.empty(slots * dim * f32b);
+    let next = client.empty(slots * taps * dim * f32b);
+    let cubes = (slots * dim).div_ceil(CUBE_SIZE as usize) as u32;
+    unsafe {
+        short_conv_slots_kernel::launch_unchecked::<R>(
+            client,
+            CubeCount::new_1d(cubes),
+            CubeDim::new_1d(CUBE_SIZE),
+            ArrayArg::from_raw_parts(hist.clone(), slots * taps * dim),
+            ArrayArg::from_raw_parts(x.clone(), slots * dim),
+            ArrayArg::from_raw_parts(w.clone(), dim * kernel),
+            ArrayArg::from_raw_parts(out.clone(), slots * dim),
+            ArrayArg::from_raw_parts(next.clone(), slots * taps * dim),
+            dim,
+            slots,
+            kernel,
+        );
+    }
+    (out, next)
+}
+
 /// The fused kernel against the shifted-slice lane it replaced.
 ///
 /// The oracle is [`super::burn::short_conv`] itself — the prefill form, which
