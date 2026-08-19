@@ -3278,6 +3278,7 @@ fn main() -> Result<()> {
         print!("{}", cp.io_table(28));
     }
     report_align();
+    mary::models::inkling::bf16gemm::report_hand();
     println!("  elapsed: {:.1}s", started.elapsed().as_secs_f32());
 
 

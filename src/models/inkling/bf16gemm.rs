@@ -162,6 +162,31 @@ pub fn to_bf16(x: &Tensor<f32>, y: &mut Tensor<bf16>, n_in: usize) {
     }
 }
 
+/// A census of the hand lane, so "how much still goes through it" is a number.
+///
+/// Slots: 0 = launches, 1 = summed `m*k*n` MACs, 2 = launches reached via the
+/// `align < MIN_TUNED_ALIGN` gate in [`bf16_gemm`], 3 = launches reached
+/// because `INK_GEMM=hand mma` forced it.
+pub static HAND: [core::sync::atomic::AtomicU64; 4] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Print the hand-lane census. Prints nothing when the lane never ran.
+pub fn report_hand() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let a: Vec<u64> = HAND.iter().map(|c| c.load(Relaxed)).collect();
+    if a[0] == 0 {
+        println!("  hand BF16 lane: 0 launches -- every plain-BF16 GEMM went to a tuned lane");
+        return;
+    }
+    println!(
+        "  hand BF16 lane: {} launches, {:.3} GMAC, {} via the alignment gate, {} forced",
+        a[0],
+        a[1] as f64 / 1e9,
+        a[2],
+        a[3]
+    );
+}
+
 /// Launch [`bf16_linear`] for a `[m_pad, k] x [n, k]^T` product.
 pub fn bf16_linear_launch<R: Runtime>(
     client: &ComputeClient<R>,
@@ -171,6 +196,11 @@ pub fn bf16_linear_launch<R: Runtime>(
     k: usize,
     n: usize,
 ) -> Handle {
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        HAND[0].fetch_add(1, Relaxed);
+        HAND[1].fetch_add((m_pad * k * n) as u64, Relaxed);
+    }
     assert_eq!(m_pad % MTILE, 0, "m_pad {m_pad} is not a multiple of {MTILE}");
     assert_eq!(n % NTILE, 0, "n {n} is not a multiple of {NTILE}");
     assert_eq!(k % KTILE, 0, "k {k} is not a multiple of {KTILE}");
@@ -754,9 +784,13 @@ pub fn bf16_gemm<R: Runtime>(
     // per-WEIGHT decision and not a per-shape one: two `[4096, 4096]`
     // projections in the same layer land at different offsets in the mapping.
     if align < MIN_TUNED_ALIGN {
+        HAND[2].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         return bf16_linear_launch(client, a, b, m, k, n);
     }
     if let Some(lane) = forced_lane() {
+        if lane == Lane::Hand {
+            HAND[3].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
         return launch_lane(client, a, b, m, k, n, lane);
     }
     let shape = (m, k, n);
