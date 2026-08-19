@@ -40,8 +40,44 @@
 //! of `select_assign(Add)` produced, which is why the two lanes agreed exactly
 //! when this replaced that one.
 //!
-//! That agreement was a convenient property of the port, not a requirement on
-//! it. **This is not a prohibition on an atomic scatter.** An atomic float add
+//! # Why a cube is several planes wide
+//!
+//! Both GEMMs below started as one warp per 16x8 output tile, reading A and B
+//! out of global before every `mma` — the decode schedule, where the lane is
+//! weight-streaming-bound and the tile size does not matter. At a 512-token
+//! prefill it is the wrong shape, and the reason is B.
+//!
+//! A cube reads its expert's whole `[n, k]` plane once for every 16 rows it
+//! serves, so the layer reads B `m_pad_e / 16` times per expert. With ~65
+//! tokens on each of ~47 active experts that is five times, and it is DRAM
+//! every time: cubes that share an m tile differ in `CUBE_POS_X` and run
+//! together (L2 serves A), cubes that share an n tile are `n / 8` apart in
+//! launch order and do not. At `[3456, 4096] x [4096, 4096]` that is 7.25 GB
+//! of B against 273 GB/s of memory, i.e. 26.6 ms, and the kernel measured 29.5.
+//! The arithmetic was never the limit.
+//!
+//! So the cube gets `MPLANES` planes and each plane takes one of `MPLANES`
+//! CONSECUTIVE m tiles. They read the same B addresses in the same cycle, out
+//! of one L1, so B crosses the memory bus once per cube instead of once per
+//! tile. Nothing about the fragments changes — one A register array, one B
+//! register array, one accumulator, exactly as before — which is why this is a
+//! grid change and not a rewrite.
+//!
+//! The m tiles a plane may share a cube with have to belong to the SAME expert,
+//! or they would want different B. That is what [`RowPlan`]'s block plan is:
+//! each expert's tiles are cut into runs of at most `MPLANES`, and a run is a
+//! cube. Padding stays at 16 rows — padding to `16 * MPLANES` would nearly
+//! double the arithmetic on a 65-token expert — so the last run of an expert is
+//! short and its spare planes sit out the launch.
+//!
+//! `INK_MOE_PLANES` sets `MPLANES`; it is a host-side plan parameter and the
+//! kernels read the run length out of the plan, so it is tunable without a
+//! recompile.
+//!
+//! # How the scatter sums
+//!
+//! (continued) That agreement was a convenient property of the port, not a
+//! requirement on it. **This is not a prohibition on an atomic scatter.** An atomic float add
 //! reassociates the sum and gives up run-to-run reproducibility, and neither of
 //! those is a gate here (see the yardstick two sections down: this runtime
 //! already disagrees with itself on 8.55% of argmax positions between two runs
@@ -91,6 +127,14 @@ use super::fp4gemm::{GROUP, KTILE, MTILE, NTILE};
 
 /// Threads per cube for the elementwise kernels here.
 const CUBE_SIZE: u32 = 256;
+
+/// E4M3 block scales per vector load in the FP4 GEMM.
+///
+/// Not a tuning knob: it is `MmaDefinition::scales_vector_size()`, which is the
+/// MMA register width over the scale width, 32/8. The instruction takes its
+/// scales as one 32-bit register, so this is the width the memory has to be read
+/// in for the load to be one instruction.
+const SCALE_VEC: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Gather
@@ -174,12 +218,14 @@ pub fn gather_grouped<R: Runtime>(
 /// result bit-identical rather than merely close.
 #[cube(launch, address_type = "dynamic")]
 #[allow(clippy::too_many_arguments)]
-pub fn fp4_linear_grouped<AB: Scalar, S: Scalar, NA: Size, NC: Size>(
+pub fn fp4_linear_grouped<AB: Scalar, S: Scalar, NA: Size, NC: Size, NS: Size>(
     a: &Tensor<Vector<AB, NA>>,
-    a_sc: &Tensor<S>,
+    a_sc: &Tensor<Vector<S, NS>>,
     b: &Tensor<Vector<AB, NA>>,
-    b_sc: &Tensor<S>,
-    tile_slot: &Tensor<u32>,
+    b_sc: &Tensor<Vector<S, NS>>,
+    blk_slot: &Tensor<u32>,
+    blk_tile0: &Tensor<u32>,
+    blk_cnt: &Tensor<u32>,
     off: &Tensor<u64>,
     scale2: &Tensor<f32>,
     out: &mut Tensor<Vector<f32, NC>>,
@@ -191,14 +237,21 @@ pub fn fp4_linear_grouped<AB: Scalar, S: Scalar, NA: Size, NC: Size>(
     let pack = AB::packing_factor();
 
     let n_tile = CUBE_POS_X as usize;
-    let m_tile = CUBE_POS_Y as usize;
+    let blk = CUBE_POS_Y as usize;
+    let plane = PLANE_POS;
+    // A short run leaves spare planes with nothing to do. They take the branch
+    // and exit; there is no barrier in this kernel for them to miss.
+    if plane >= blk_cnt[blk] {
+        terminate!();
+    }
+    let m_tile = blk_tile0[blk] as usize + plane as usize;
     let n_base = n_tile * NTILE;
     let m_base = m_tile * MTILE;
 
-    // Which expert this tile's sixteen rows were routed to, and where its two
-    // planes start in the mapping. Both offsets are in ELEMENTS of the plane's
-    // own type, which for E2M1 packed pairs and for E4M3 scales is bytes.
-    let slot = tile_slot[m_tile] as usize;
+    // Which expert this run of tiles was routed to, and where its two planes
+    // start in the mapping. Both offsets are in ELEMENTS of the plane's own
+    // type, which for E2M1 packed pairs and for E4M3 scales is bytes.
+    let slot = blk_slot[blk] as usize;
     let b_base = usize::cast_from(off[2 * slot]);
     let bsc_base = usize::cast_from(off[2 * slot + 1]);
     let scale = scale2[slot];
@@ -221,8 +274,18 @@ pub fn fp4_linear_grouped<AB: Scalar, S: Scalar, NA: Size, NC: Size>(
         acc[i] = Vector::<f32, NC>::cast_from(0.0f32);
     }
 
-    let scales_count = def.scales_count();
-    let size!(NS) = def.scales_vector_size();
+    // The instruction wants FOUR E4M3 block scales per operand per k tile, and
+    // they sit at four CONSECUTIVE addresses. Read as four `Tensor<S>` elements
+    // that is four one-byte loads; read as one `Vector<S, 4>` it is one 32-bit
+    // load, and 8 of the 14 loads this kernel issues per `mma` were those bytes.
+    // `scales_vector_size` is `register_size_bits / 8` = 4 here, which is the
+    // same 4 -- the vector the instruction takes IS the vector the memory holds,
+    // so there is nothing to assemble.
+    //
+    // The group of four starts at `(index) * spr + t * 4`, and `spr = k / 16` is
+    // a multiple of four at every k this model has, so the group never straddles
+    // a vector. The B side adds `bsc_base`, which the caller has already refused
+    // unless it is a multiple of four -- the same rule the packed planes carry.
     let sia = def.scales_index(lane, MatrixIdent::A) as usize;
     let sib = def.scales_index(lane, MatrixIdent::B) as usize;
     let spr = comptime!(size_k / GROUP);
@@ -245,12 +308,19 @@ pub fn fp4_linear_grouped<AB: Scalar, S: Scalar, NA: Size, NC: Size>(
             reg_b[i] = b[(b_base + gr * size_k / 2 + gc / 2) / b.vector_size()];
         }
 
+        // One 32-bit load each, then into a MUTABLE local: the MMA intrinsic
+        // takes its scale registers by non-const reference, so a value that
+        // came straight out of a load and is never written cannot be handed to
+        // it -- NVRTC rejects the generated cast. The four moves below are
+        // register traffic, not memory.
+        let va = a_sc[((sia + m_base) * spr + t * 4) / a_sc.vector_size()];
+        let vb = b_sc[(bsc_base + (sib + n_base) * spr + t * 4) / b_sc.vector_size()];
         let mut sa = Vector::<S, NS>::empty();
         let mut sb = Vector::<S, NS>::empty();
         #[unroll]
-        for i in 0..scales_count {
-            sa[i] = a_sc[(sia + m_base) * spr + t * 4 + i];
-            sb[i] = b_sc[bsc_base + (sib + n_base) * spr + t * 4 + i];
+        for i in 0..SCALE_VEC {
+            sa[i] = va[i];
+            sb[i] = vb[i];
         }
 
         let d = def.execute_scaled(&reg_a, &reg_b, &acc, sa, sb);
@@ -281,7 +351,7 @@ pub fn fp4_linear_grouped_launch<R: Runtime>(
     a_sc: &Handle,
     wmap: &Handle,
     wmap_bytes: usize,
-    tile_slot: &Handle,
+    blk: &BlockPlanDev,
     off: &Handle,
     scale2: &Handle,
     slots: usize,
@@ -292,29 +362,40 @@ pub fn fp4_linear_grouped_launch<R: Runtime>(
     assert_eq!(m_total % MTILE, 0, "m_total {m_total} is not a multiple of {MTILE}");
     assert_eq!(n % NTILE, 0, "n {n} is not a multiple of {NTILE}");
     assert_eq!(k % KTILE, 0, "k {k} is not a multiple of {KTILE}");
+    assert_eq!(
+        (k / GROUP) % SCALE_VEC,
+        0,
+        "the scale row {} is not a whole number of {SCALE_VEC}-wide vectors",
+        k / GROUP
+    );
 
     let out = client.empty(m_total * n * core::mem::size_of::<f32>());
     let vs = 32 / e2m1x2::cube_type().size_bits();
     let spr = k / GROUP;
-    let tiles = m_total / MTILE;
     // The mapping is bound as a flat plane of packed bytes; the kernel indexes
     // it in `vs`-wide vectors, so the declared length has to be a whole number
     // of them.
     let flat = wmap_bytes - wmap_bytes % vs;
+    // The scale planes are read four bytes at a time, so the bound length has
+    // to be a whole number of them too.
+    let flat_sc = wmap_bytes - wmap_bytes % SCALE_VEC;
 
     unsafe {
         fp4_linear_grouped::launch::<e2m1x2, e4m3, R>(
             client,
-            CubeCount::Static((n / NTILE) as u32, tiles as u32, 1),
-            CubeDim::new_1d(32),
+            CubeCount::Static((n / NTILE) as u32, blk.blocks as u32, 1),
+            CubeDim::new_1d(32 * blk.planes as u32),
             AddressType::U64,
             vs,
             2,
+            SCALE_VEC,
             TensorArg::from_raw_parts(a.clone(), [k / 2, 1].into(), [m_total, k / 2].into()),
             TensorArg::from_raw_parts(a_sc.clone(), [spr, 1].into(), [m_total, spr].into()),
             TensorArg::from_raw_parts(wmap.clone(), [1].into(), [flat].into()),
-            TensorArg::from_raw_parts(wmap.clone(), [1].into(), [wmap_bytes].into()),
-            TensorArg::from_raw_parts(tile_slot.clone(), [1].into(), [tiles].into()),
+            TensorArg::from_raw_parts(wmap.clone(), [1].into(), [flat_sc].into()),
+            TensorArg::from_raw_parts(blk.slot.clone(), [1].into(), [blk.blocks].into()),
+            TensorArg::from_raw_parts(blk.tile0.clone(), [1].into(), [blk.blocks].into()),
+            TensorArg::from_raw_parts(blk.cnt.clone(), [1].into(), [blk.blocks].into()),
             TensorArg::from_raw_parts(off.clone(), [1].into(), [2 * slots].into()),
             TensorArg::from_raw_parts(scale2.clone(), [1].into(), [slots].into()),
             TensorArg::from_raw_parts(out.clone(), [n, 1].into(), [m_total, n].into()),
@@ -345,7 +426,9 @@ pub fn fp4_linear_grouped_launch<R: Runtime>(
 pub fn bf16_linear_grouped<AB: Scalar, NA: Size, NC: Size>(
     a: &Tensor<Vector<AB, NA>>,
     b: &Tensor<Vector<AB, NA>>,
-    tile_slot: &Tensor<u32>,
+    blk_slot: &Tensor<u32>,
+    blk_tile0: &Tensor<u32>,
+    blk_cnt: &Tensor<u32>,
     off: &Tensor<u64>,
     out: &mut Tensor<Vector<f32, NC>>,
     #[comptime] size_k: usize,
@@ -356,11 +439,16 @@ pub fn bf16_linear_grouped<AB: Scalar, NA: Size, NC: Size>(
     let pack = AB::packing_factor();
 
     let n_tile = CUBE_POS_X as usize;
-    let m_tile = CUBE_POS_Y as usize;
+    let blk = CUBE_POS_Y as usize;
+    let plane = PLANE_POS;
+    if plane >= blk_cnt[blk] {
+        terminate!();
+    }
+    let m_tile = blk_tile0[blk] as usize + plane as usize;
     let n_base = n_tile * NTILE;
     let m_base = m_tile * MTILE;
 
-    let slot = tile_slot[m_tile] as usize;
+    let slot = blk_slot[blk] as usize;
     let b_base = usize::cast_from(off[slot]);
 
     let ec_a = def.elems_per_lane(MatrixIdent::A);
@@ -427,7 +515,7 @@ pub fn bf16_linear_grouped_launch<R: Runtime>(
     a: &Handle,
     wmap: &Handle,
     wmap_bytes: usize,
-    tile_slot: &Handle,
+    blk: &BlockPlanDev,
     off: &Handle,
     slots: usize,
     m_total: usize,
@@ -440,21 +528,22 @@ pub fn bf16_linear_grouped_launch<R: Runtime>(
 
     let out = client.empty(m_total * n * core::mem::size_of::<f32>());
     let vs = 32 / half::bf16::cube_type().size_bits();
-    let tiles = m_total / MTILE;
     let elems = wmap_bytes / 2;
     let flat = elems - elems % vs;
 
     unsafe {
         bf16_linear_grouped::launch::<half::bf16, R>(
             client,
-            CubeCount::Static((n / NTILE) as u32, tiles as u32, 1),
-            CubeDim::new_1d(32),
+            CubeCount::Static((n / NTILE) as u32, blk.blocks as u32, 1),
+            CubeDim::new_1d(32 * blk.planes as u32),
             AddressType::U64,
             vs,
             2,
             TensorArg::from_raw_parts(a.clone(), [k, 1].into(), [m_total, k].into()),
             TensorArg::from_raw_parts(wmap.clone(), [1].into(), [flat].into()),
-            TensorArg::from_raw_parts(tile_slot.clone(), [1].into(), [tiles].into()),
+            TensorArg::from_raw_parts(blk.slot.clone(), [1].into(), [blk.blocks].into()),
+            TensorArg::from_raw_parts(blk.tile0.clone(), [1].into(), [blk.blocks].into()),
+            TensorArg::from_raw_parts(blk.cnt.clone(), [1].into(), [blk.blocks].into()),
             TensorArg::from_raw_parts(off.clone(), [1].into(), [slots].into()),
             TensorArg::from_raw_parts(out.clone(), [n, 1].into(), [m_total, n].into()),
             k,
@@ -648,6 +737,26 @@ pub fn scatter_weighted_atomic<R: Runtime>(
     out
 }
 
+/// The block plan, uploaded: three `[blocks]` arrays and the launch geometry
+/// they imply.
+///
+/// One struct rather than five arguments because the three arrays, the block
+/// count and the plane count are one decision — a launch that took `blocks`
+/// from one plan and `slot` from another would read past the end of an array
+/// and the kernels are launched unchecked.
+pub struct BlockPlanDev {
+    /// `[blocks]` expert slots.
+    pub slot: Handle,
+    /// `[blocks]` first m tiles.
+    pub tile0: Handle,
+    /// `[blocks]` run lengths.
+    pub cnt: Handle,
+    /// Cubes in the y dimension.
+    pub blocks: usize,
+    /// Planes per cube.
+    pub planes: usize,
+}
+
 // ---------------------------------------------------------------------------
 // The layer's row plan, on the host
 // ---------------------------------------------------------------------------
@@ -663,8 +772,12 @@ pub struct RowPlan {
     pub row_tok: Vec<i32>,
     /// `[M]`: the routing weight each stacked row's output is multiplied by.
     pub row_wgt: Vec<f32>,
-    /// `[M / MTILE]`: which expert slot each MMA row tile belongs to.
-    pub tile_slot: Vec<u32>,
+    /// `[blocks]`: which expert slot each cube serves.
+    pub blk_slot: Vec<u32>,
+    /// `[blocks]`: the first of the cube's run of m tiles.
+    pub blk_tile0: Vec<u32>,
+    /// `[blocks]`: how many m tiles the run holds, `1..=planes`.
+    pub blk_cnt: Vec<u32>,
     /// `[n, kmax]`: each token's contributing rows, ascending.
     pub tok_rows: Vec<u32>,
     /// `[n]`: how many of each row of `tok_rows` are valid.
@@ -682,11 +795,16 @@ impl RowPlan {
     pub fn build<'a>(
         experts: impl Iterator<Item = &'a Vec<(usize, f32)>>,
         n: usize,
+        planes: usize,
     ) -> RowPlan {
+        assert!(planes >= 1, "a cube needs at least one plane");
         let mut row_tok: Vec<i32> = Vec::new();
         let mut row_wgt: Vec<f32> = Vec::new();
-        let mut tile_slot: Vec<u32> = Vec::new();
+        let mut blk_slot: Vec<u32> = Vec::new();
+        let mut blk_tile0: Vec<u32> = Vec::new();
+        let mut blk_cnt: Vec<u32> = Vec::new();
         let mut per_tok: Vec<Vec<u32>> = vec![Vec::new(); n];
+        let mut tile = 0usize;
 
         for (slot, toks) in experts.enumerate() {
             let m = toks.len();
@@ -700,9 +818,19 @@ impl RowPlan {
                 row_tok.push(-1);
                 row_wgt.push(0.0);
             }
-            for _ in 0..(m_pad / MTILE) {
-                tile_slot.push(slot as u32);
+            // The expert's tiles, cut into runs of at most `planes`. A run is a
+            // cube, and it never straddles two experts, because the planes of a
+            // cube share a B plane and that is the whole point of the shape.
+            let tiles = m_pad / MTILE;
+            let mut done = 0usize;
+            while done < tiles {
+                let cnt = (tiles - done).min(planes);
+                blk_slot.push(slot as u32);
+                blk_tile0.push((tile + done) as u32);
+                blk_cnt.push(cnt as u32);
+                done += cnt;
             }
+            tile += tiles;
         }
 
         let kmax = per_tok.iter().map(|v| v.len()).max().unwrap_or(0).max(1);
@@ -713,7 +841,24 @@ impl RowPlan {
             tok_rows[t * kmax..t * kmax + rows.len()].copy_from_slice(rows);
         }
 
-        RowPlan { row_tok, row_wgt, tile_slot, tok_rows, tok_cnt, kmax }
+        RowPlan { row_tok, row_wgt, blk_slot, blk_tile0, blk_cnt, tok_rows, tok_cnt, kmax }
+    }
+
+    /// How many planes a cube should have, from `INK_MOE_PLANES`.
+    ///
+    /// Read once and cached: it is a launch parameter, and a `getenv` per layer
+    /// per pass in a lane whose subject is per-pass cost would be a joke at its
+    /// own expense.
+    pub fn planes() -> usize {
+        use std::sync::OnceLock;
+        static P: OnceLock<usize> = OnceLock::new();
+        *P.get_or_init(|| {
+            std::env::var("INK_MOE_PLANES")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&v| v >= 1 && v <= 32)
+                .unwrap_or(4)
+        })
     }
 
     /// Rows in the stacked buffer, `M`.
@@ -734,11 +879,15 @@ mod tests {
         let e0 = vec![(1usize, 0.5f32)];
         let e1 = vec![(0usize, 0.25f32), (1usize, 0.125f32)];
         let e2 = vec![(0usize, 0.75f32)];
-        let plan = RowPlan::build([&e0, &e1, &e2].into_iter(), 2);
+        let plan = RowPlan::build([&e0, &e1, &e2].into_iter(), 2, 4);
 
         // Each expert is padded to a whole MMA row tile.
         assert_eq!(plan.m_total(), 3 * MTILE);
-        assert_eq!(plan.tile_slot, vec![0, 1, 2]);
+        // One tile each, so one block each even at four planes -- a run never
+        // crosses an expert.
+        assert_eq!(plan.blk_slot, vec![0, 1, 2]);
+        assert_eq!(plan.blk_tile0, vec![0, 1, 2]);
+        assert_eq!(plan.blk_cnt, vec![1, 1, 1]);
 
         // Row 0 is expert 0's only token; MTILE..MTILE+2 are expert 1's two.
         assert_eq!(plan.row_tok[0], 1);
@@ -763,5 +912,26 @@ mod tests {
         assert_eq!(plan.row_wgt[MTILE], 0.25);
         assert_eq!(plan.row_wgt[MTILE + 1], 0.125);
         assert_eq!(plan.row_wgt[2 * MTILE], 0.75);
+    }
+
+    /// A run stops at the expert boundary and at `planes`, whichever comes
+    /// first -- the property the shared B plane rests on.
+    #[test]
+    fn runs_never_cross_an_expert_and_never_exceed_the_plane_count() {
+        // 5 tiles, then 1, then 9: 65, 3 and 130 tokens.
+        let big: Vec<(usize, f32)> = (0..(4 * MTILE + 1)).map(|i| (i, 1.0f32)).collect();
+        let small: Vec<(usize, f32)> = (0..3).map(|i| (i, 1.0f32)).collect();
+        let huge: Vec<(usize, f32)> = (0..(8 * MTILE + 2)).map(|i| (i, 1.0f32)).collect();
+        let n = 8 * MTILE + 2;
+        let plan = RowPlan::build([&big, &small, &huge].into_iter(), n, 4);
+
+        assert_eq!(plan.blk_slot, vec![0, 0, 1, 2, 2, 2]);
+        assert_eq!(plan.blk_cnt, vec![4, 1, 1, 4, 4, 1]);
+        assert_eq!(plan.blk_tile0, vec![0, 4, 5, 6, 10, 14]);
+        // Every tile of the layer is served exactly once.
+        let served: usize = plan.blk_cnt.iter().map(|&c| c as usize).sum();
+        println!("examined {} blocks covering {served} tiles", plan.blk_slot.len());
+        assert_eq!(served, plan.m_total() / MTILE);
+        assert_eq!(served, 5 + 1 + 9);
     }
 }

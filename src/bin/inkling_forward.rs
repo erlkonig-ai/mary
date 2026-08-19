@@ -1039,7 +1039,7 @@ fn grouped_experts_fp4(
     use mary::models::inkling::fp4gemm::gate_up_silu_launch;
     use mary::models::inkling::fp4quant::quantize_nvfp4;
     use mary::models::inkling::moegroup::{
-        fp4_linear_grouped_launch, gather_grouped, scatter_weighted, RowPlan,
+        fp4_linear_grouped_launch, gather_grouped, scatter_weighted, BlockPlanDev, RowPlan,
     };
     use mary::models::inkling::seam::{handle_of, tensor_of};
 
@@ -1076,7 +1076,14 @@ fn grouped_experts_fp4(
         }
         // The packed planes are read as 4-byte vectors out of the mapping, so
         // an offset that does not land on one cannot be expressed as an index.
-        if o[0] % 4 != 0 || o[2] % 4 != 0 {
+        // The SCALE planes are read the same way now -- the instruction takes
+        // its four E4M3 block scales as one 32-bit register, so the kernel
+        // fetches them as one -- which puts `o[1]` and `o[3]` under the same
+        // rule. The startup copy packs every view to a 4-byte boundary, so this
+        // refuses nothing it did not already refuse; it is here because the
+        // kernel is launched unchecked and an unaligned scale plane would be
+        // read one vector to the left of where it starts.
+        if o.iter().any(|v| v % 4 != 0) {
             return Ok(None);
         }
         off13.push(o[0]);
@@ -1102,12 +1109,18 @@ fn grouped_experts_fp4(
     // second-level scales and the token->rows table. Nine small uploads for the
     // whole layer, against two per expert before.
     let t_g = Instant::now();
-    let plan = RowPlan::build(by_expert.values(), n);
+    let plan = RowPlan::build(by_expert.values(), n, RowPlan::planes());
     let m_total = plan.m_total();
     let hn_h = handle_of(hn.clone());
     let h_rowtok = client.create_from_slice(bytes_of(&plan.row_tok));
     let h_rowwgt = client.create_from_slice(bytes_of(&plan.row_wgt));
-    let h_tile = client.create_from_slice(bytes_of(&plan.tile_slot));
+    let blk = BlockPlanDev {
+        slot: client.create_from_slice(bytes_of(&plan.blk_slot)),
+        tile0: client.create_from_slice(bytes_of(&plan.blk_tile0)),
+        cnt: client.create_from_slice(bytes_of(&plan.blk_cnt)),
+        blocks: plan.blk_slot.len(),
+        planes: RowPlan::planes(),
+    };
     let h_off13 = client.create_from_slice(bytes_of(&off13));
     let h_off2 = client.create_from_slice(bytes_of(&off2));
     let h_sc13 = client.create_from_slice(bytes_of(&sc13));
@@ -1120,13 +1133,13 @@ fn grouped_experts_fp4(
     let t_w = Instant::now();
     let (a, asc) = quantize_nvfp4(client, &x_h, m_total, h);
     let both = fp4_linear_grouped_launch(
-        client, &a, &asc, &wmap, wmap_bytes, &h_tile, &h_off13, &h_sc13, slots, m_total, h,
+        client, &a, &asc, &wmap, wmap_bytes, &blk, &h_off13, &h_sc13, slots, m_total, h,
         2 * inter,
     );
     let act_h = gate_up_silu_launch(client, &both, m_total, inter);
     let (a2, asc2) = quantize_nvfp4(client, &act_h, m_total, inter);
     let y_h = fp4_linear_grouped_launch(
-        client, &a2, &asc2, &wmap, wmap_bytes, &h_tile, &h_off2, &h_sc2, slots, m_total, inter, h,
+        client, &a2, &asc2, &wmap, wmap_bytes, &blk, &h_off2, &h_sc2, slots, m_total, inter, h,
     );
     host.enqueue += t_w.elapsed().as_secs_f64();
 
@@ -1299,7 +1312,7 @@ fn grouped_experts_bf16(
     use mary::models::inkling::bf16gemm::to_bf16_launch;
     use mary::models::inkling::fp4gemm::gate_up_silu_bf16_launch;
     use mary::models::inkling::moegroup::{
-        bf16_linear_grouped_launch, gather_grouped, scatter_weighted, RowPlan,
+        bf16_linear_grouped_launch, gather_grouped, scatter_weighted, BlockPlanDev, RowPlan,
     };
     use mary::models::inkling::seam::{handle_of, tensor_of};
 
@@ -1349,12 +1362,18 @@ fn grouped_experts_bf16(
     host.slice += t_s.elapsed().as_secs_f64();
 
     let t_g = Instant::now();
-    let plan = RowPlan::build(by_expert.values(), n);
+    let plan = RowPlan::build(by_expert.values(), n, RowPlan::planes());
     let m_total = plan.m_total();
     let hn_h = handle_of(hn.clone());
     let h_rowtok = client.create_from_slice(bytes_of(&plan.row_tok));
     let h_rowwgt = client.create_from_slice(bytes_of(&plan.row_wgt));
-    let h_tile = client.create_from_slice(bytes_of(&plan.tile_slot));
+    let blk = BlockPlanDev {
+        slot: client.create_from_slice(bytes_of(&plan.blk_slot)),
+        tile0: client.create_from_slice(bytes_of(&plan.blk_tile0)),
+        cnt: client.create_from_slice(bytes_of(&plan.blk_cnt)),
+        blocks: plan.blk_slot.len(),
+        planes: RowPlan::planes(),
+    };
     let h_off13 = client.create_from_slice(bytes_of(&off13));
     let h_off2 = client.create_from_slice(bytes_of(&off2));
     let h_tokrows = client.create_from_slice(bytes_of(&plan.tok_rows));
@@ -1365,11 +1384,11 @@ fn grouped_experts_bf16(
     let t_w = Instant::now();
     let a = to_bf16_launch(client, &x_h, m_total * h, m_total * h);
     let both = bf16_linear_grouped_launch(
-        client, &a, &wmap, wmap_bytes, &h_tile, &h_off13, slots, m_total, h, 2 * inter,
+        client, &a, &wmap, wmap_bytes, &blk, &h_off13, slots, m_total, h, 2 * inter,
     );
     let act = gate_up_silu_bf16_launch(client, &both, m_total, inter);
     let y_h = bf16_linear_grouped_launch(
-        client, &act, &wmap, wmap_bytes, &h_tile, &h_off2, slots, m_total, inter, h,
+        client, &act, &wmap, wmap_bytes, &blk, &h_off2, slots, m_total, inter, h,
     );
     host.enqueue += t_w.elapsed().as_secs_f64();
 
