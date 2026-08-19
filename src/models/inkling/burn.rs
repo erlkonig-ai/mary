@@ -179,6 +179,42 @@ pub fn short_conv_step(
     )
 }
 
+/// SEVERAL positions of the short convolution at once, given the `kernel - 1`
+/// inputs before them.
+///
+/// The batched twin of [`short_conv_step`], and the shape a speculative verify
+/// pass convolves in: the accepted token followed by `k` drafts. It returns the
+/// output rows and the WHOLE `kernel - 1 + rows` window it convolved, because
+/// that window is what a rollback slices — the history ending at the last kept
+/// row is `all[keep .. keep + kernel - 1]`, and the pre-convolution projections
+/// it is made of are gone once the batch is over. Same reasoning as
+/// [`AttnCache`]'s `Pending`, and for the same reason: a verifier decides late.
+///
+/// Generic and slice-built rather than one kernel like [`short_conv_step`]:
+/// this runs four times a layer per VERIFY pass, not per position, and the
+/// window it convolves is `kernel - 1 + rows` rows of real input with no
+/// front-padding reached — which is exactly [`short_conv`] over the
+/// concatenation, sliced.
+pub fn short_conv_steps<B: Backend>(
+    hist: Tensor<B, 2>,
+    x: Tensor<B, 2>,
+    weight: Tensor<B, 2>,
+) -> (Tensor<B, 2>, Tensor<B, 2>) {
+    let [rows, dim] = x.dims();
+    let [wdim, kernel] = weight.dims();
+    assert_eq!(dim, wdim, "short_conv_steps: x is [_, {dim}] but the weight is [{wdim}, _]");
+    assert_eq!(
+        hist.dims(),
+        [kernel - 1, dim],
+        "the history must be the {} rows before this batch",
+        kernel - 1
+    );
+    let all = Tensor::cat(vec![hist, x], 0);
+    let h = kernel - 1;
+    let out = short_conv(all.clone(), weight).slice([h..h + rows, 0..dim]);
+    (out, all)
+}
+
 /// Depthwise causal short convolution **plus its internal residual**, on device.
 ///
 /// The device twin of [`crate::models::inkling::block::short_conv`]:
@@ -1456,6 +1492,311 @@ mod tests {
             pos += rows;
         }
         worst
+    }
+
+    /// The GEMM lane itself: row 0 of an `m == 3` product against the same row
+    /// computed alone. Nothing cached, nothing speculative — just
+    /// [`linear_bf16`] at two widths on identical operands, at the real
+    /// checkpoint's `[4096, 4096]`.
+    #[test]
+    fn linear_bf16_row0_matches_across_width() {
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let hidden = 4096usize;
+        let probe: Tensor<B, 2> =
+            Tensor::from_data(TensorData::new(vec![0f32], [1, 1]), &dev);
+        let client = client_of(&probe);
+        let mut bytes = Vec::with_capacity(hidden * hidden * 2);
+        for x in fill(hidden * hidden, 0.31) {
+            bytes.extend_from_slice(&half::bf16::from_f32(x).to_le_bytes());
+        }
+        let big = Bf16W { h: client.create_from_slice(&bytes), n: hidden, k: hidden, align: 16 };
+        let rows = 3usize;
+        let xs: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(fill(rows * hidden, 1.25), [rows, hidden]),
+            &dev,
+        );
+        let one = linear_bf16(xs.clone().slice([0..1, 0..hidden]), &big);
+        let many = linear_bf16(xs.clone(), &big).slice([0..1, 0..hidden]);
+        let scale = one.clone().abs().max().into_scalar().max(1e-6);
+        let worst = (many.clone() - one.clone()).abs().max().into_scalar() / scale;
+
+        // Which of the two is RIGHT, against the same product accumulated in
+        // f64 on the host from the same BF16 bits. Printed rather than
+        // asserted: the point is the ORDER of the two errors, and an absolute
+        // bound on either would be a claim about this filler and not about the
+        // lanes.
+        let xh = fill(rows * hidden, 1.25);
+        let wh: Vec<f32> = fill(hidden * hidden, 0.31)
+            .into_iter()
+            .map(|v| half::bf16::from_f32(v).to_f32())
+            .collect();
+        let xb: Vec<f32> =
+            xh[..hidden].iter().map(|&v| half::bf16::from_f32(v).to_f32()).collect();
+        let mut refr = vec![0f64; hidden];
+        for (o, r) in refr.iter_mut().enumerate() {
+            let mut acc = 0f64;
+            for c in 0..hidden {
+                acc += wh[o * hidden + c] as f64 * xb[c] as f64;
+            }
+            *r = acc;
+        }
+        let rmax = refr.iter().fold(0f64, |m, v| m.max(v.abs()));
+        let err = |t: Tensor<B, 2>| -> f64 {
+            let got = t.into_data().convert::<f32>().into_vec::<f32>().expect("f32 rows");
+            got.iter()
+                .zip(refr.iter())
+                .fold(0f64, |m, (g, r)| m.max((*g as f64 - r).abs()))
+                / rmax
+        };
+        println!(
+            "LANE ACCURACY vs f64 host reference: m=1 (gemv plane par) {:.3e}   m={rows} (narrow tile) {:.3e}",
+            err(one),
+            err(many),
+        );
+        // 1.4e-5 as measured: the two lanes reduce the same 4096-long dot
+        // product in different orders and BF16 operands round to 8 mantissa
+        // bits. This bound is a REGRESSION guard on that number, not a
+        // correctness claim -- what it exists to catch is the day the gap
+        // becomes structural rather than arithmetic.
+        assert!(worst < 1e-3, "linear_bf16 row 0 moves with the batch width by {worst}");
+    }
+
+    /// Diagnostic: per-position relative drift of the batched lane against the
+    /// single-row lane at real width, for batch sizes 1 and 2.
+    #[test]
+    #[ignore = "a diagnostic, not a gate: run it with --ignored --nocapture to see the per-position table"]
+    fn drift_table_at_real_width() {
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let d = AttnDims {
+            hidden: 4096, heads: 32, kv_heads: 8, head_dim: 128,
+            d_rel: 16, rel_extent: 1024, kernel: 4, rms_eps: 1e-6,
+            kind: AttnKind::Local,
+        };
+        let w = weights(&d, &dev);
+        let window = Some(512usize);
+        let (prefill, tokens) = (5usize, 25usize);
+        let xs: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(fill(tokens * d.hidden, 2.5), [tokens, d.hidden]),
+            &dev,
+        );
+        let (_, base_cache) = attention_prefill(
+            xs.clone().slice([0..prefill, 0..d.hidden]),
+            &w, &d, None,
+            window,
+            window,
+        );
+        let mut c1 = base_cache.clone();
+        let mut ones: Vec<Tensor<B, 2>> = Vec::new();
+        for pos in prefill..tokens {
+            ones.push(attention_step(
+                xs.clone().slice([pos..pos + 1, 0..d.hidden]),
+                &w, &d, None, pos, window, &mut c1,
+            ));
+        }
+        for batch in [1usize, 2] {
+            let mut c2 = base_cache.clone();
+            let mut pos = prefill;
+            let mut i = 0usize;
+            let mut line = String::new();
+            while pos < tokens {
+                let rows = batch.min(tokens - pos);
+                let got = attention_steps(
+                    xs.clone().slice([pos..pos + rows, 0..d.hidden]),
+                    &w, &d, None, pos, window, &mut c2,
+                );
+                c2.commit(rows, window);
+                for r in 0..rows {
+                    let want = ones[i + r].clone();
+                    let g = got.clone().slice([r..r + 1, 0..d.hidden]);
+                    let scale = want.clone().abs().max().into_scalar().max(1e-6);
+                    let rel = (g - want).abs().max().into_scalar() / scale;
+                    line.push_str(&format!(" {}:{:.2e}", pos + r, rel));
+                }
+                i += rows;
+                pos += rows;
+            }
+            println!("DRIFT batch={batch}{line}");
+            // Where the disagreement lives: in what the batch WROTE (K, V and
+            // the pre-convolution projections) or in what it READ them into.
+            let rel2 = |a: Tensor<B, 2>, b: Tensor<B, 2>| -> f32 {
+                let scale = b.clone().abs().max().into_scalar().max(1e-6);
+                (a - b).abs().max().into_scalar() / scale
+            };
+            println!(
+                "  cache k {:.2e}  v {:.2e}  k_pre {:.2e}  v_pre {:.2e}",
+                rel2(c2.k.clone(), c1.k.clone()),
+                rel2(c2.v.clone(), c1.v.clone()),
+                rel2(c2.k_pre.clone(), c1.k_pre.clone()),
+                rel2(c2.v_pre.clone(), c1.v_pre.clone()),
+            );
+        }
+    }
+
+    /// The BATCHED cached lane against the SINGLE-ROW cached lane, at the real
+    /// checkpoint's attention width.
+    ///
+    /// Not the same question as [`compare_batched`], which holds both against
+    /// the uncached lane at hidden 16. This one asks what a speculative loop
+    /// actually depends on: that stepping positions in batches of two writes
+    /// the same K and V as stepping them one at a time. At hidden 16 with f32
+    /// weights the two agree to 2e-5; the real layer multiplies BF16 through
+    /// `mma.sync`, and `m == 1` and `m > 1` take DIFFERENT GEMM lanes there
+    /// (`GemvPlaneParallel` against the narrow tile), so this is where a
+    /// difference between them would be visible — and it compounds, because
+    /// every row it writes is read by every position after it.
+    #[test]
+    fn batched_matches_single_step_at_real_width() {
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let d = AttnDims {
+            hidden: 4096,
+            heads: 32,
+            kv_heads: 8,
+            head_dim: 128,
+            d_rel: 16,
+            rel_extent: 1024,
+            kernel: 4,
+            rms_eps: 1e-6,
+            kind: AttnKind::Local,
+        };
+        let w = weights(&d, &dev);
+        let window = Some(512usize);
+        let (prefill, tokens) = (5usize, 45usize);
+        let xs: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(fill(tokens * d.hidden, 2.5), [tokens, d.hidden]),
+            &dev,
+        );
+        let (_, base_cache) = attention_prefill(
+            xs.clone().slice([0..prefill, 0..d.hidden]),
+            &w,
+            &d,
+            None,
+            window,
+            window,
+        );
+
+        // One at a time.
+        let mut c1 = base_cache.clone();
+        let mut ones: Vec<Tensor<B, 2>> = Vec::new();
+        for pos in prefill..tokens {
+            ones.push(attention_step(
+                xs.clone().slice([pos..pos + 1, 0..d.hidden]),
+                &w,
+                &d,
+                None,
+                pos,
+                window,
+                &mut c1,
+            ));
+        }
+
+        // Two at a time, committed whole -- no rejection, so the only thing
+        // under test is the WIDTH.
+        let mut c2 = base_cache.clone();
+        let mut worst = 0f32;
+        let mut i = 0usize;
+        let mut pos = prefill;
+        while pos < tokens {
+            let rows = 2.min(tokens - pos);
+            let got = attention_steps(
+                xs.clone().slice([pos..pos + rows, 0..d.hidden]),
+                &w,
+                &d,
+                None,
+                pos,
+                window,
+                &mut c2,
+            );
+            c2.commit(rows, window);
+            for r in 0..rows {
+                let want = ones[i + r].clone();
+                let g = got.clone().slice([r..r + 1, 0..d.hidden]);
+                let scale = want.clone().abs().max().into_scalar().max(1e-6);
+                worst = worst.max((g - want).abs().max().into_scalar() / scale);
+            }
+            i += rows;
+            pos += rows;
+        }
+        // Not bit-equality: the two lanes reduce in different orders, so some
+        // drift is the hardware and not a bug. What would NOT be the hardware
+        // is drift that grows with position, which is what a wrong K or V row
+        // does once every later query reads it.
+        // NOT bit-equality, and the gap is entirely the GEMM lane: pin one
+        // with `INK_GEMM=double cyclic mma` and this is 0.00e0 at every
+        // position. Left free-running here because that is how the runtime
+        // ships -- `m == 1` takes `gemv plane par` and `m > 1` cannot, so a
+        // speculative loop compares two lanes whether or not it wants to.
+        assert!(worst < 5e-2, "batched attention drifts from the single step by {worst} relative");
+    }
+
+    /// [`short_conv_steps`] against the whole-sequence [`short_conv`], in
+    /// batches, rolling back `reject` rows of every batch and re-running those
+    /// positions — which is exactly what a rejected draft does to the
+    /// convolution's memory.
+    ///
+    /// A separate test from the attention ones because the convolution is the
+    /// half of a speculative rollback that is NOT a truncation: the taps the
+    /// next position reads are a function of the last KEPT row and the rows
+    /// before it, and those pre-convolution inputs are gone once the batch is
+    /// over unless the batch keeps its whole window.
+    fn compare_conv_batched(tokens: usize, prefill: usize, batch: usize, reject: usize) -> f32 {
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let (dim, kernel) = (16usize, 4usize);
+        let xs: Tensor<B, 2> =
+            Tensor::from_data(TensorData::new(fill(tokens * dim, 1.5), [tokens, dim]), &dev);
+        let w: Tensor<B, 2> =
+            Tensor::from_data(TensorData::new(fill(dim * kernel, 0.25), [dim, kernel]), &dev);
+        let full = short_conv(xs.clone(), w.clone());
+        let mut hist = conv_history(xs.clone().slice([0..prefill, 0..dim]), kernel);
+
+        let mut worst = 0f32;
+        let mut pos = prefill;
+        while pos < tokens {
+            let rows = batch.min(tokens - pos);
+            if reject > 0 && rows > reject {
+                let keep = rows - reject;
+                let (_, all) = short_conv_steps(
+                    hist.clone(),
+                    xs.clone().slice([pos..pos + rows, 0..dim]),
+                    w.clone(),
+                );
+                // The rollback: the history ending at the last KEPT row.
+                hist = conv_history(all.slice([0..kernel - 1 + keep, 0..dim]), kernel);
+                let (got, all) = short_conv_steps(
+                    hist.clone(),
+                    xs.clone().slice([pos + keep..pos + rows, 0..dim]),
+                    w.clone(),
+                );
+                hist = conv_history(all.slice([0..kernel - 1 + reject, 0..dim]), kernel);
+                let want = full.clone().slice([pos + keep..pos + rows, 0..dim]);
+                worst = worst.max((got - want).abs().max().into_scalar());
+            } else {
+                let (got, all) =
+                    short_conv_steps(hist.clone(), xs.clone().slice([pos..pos + rows, 0..dim]), w.clone());
+                hist = conv_history(all.slice([0..kernel - 1 + rows, 0..dim]), kernel);
+                let want = full.clone().slice([pos..pos + rows, 0..dim]);
+                worst = worst.max((got - want).abs().max().into_scalar());
+            }
+            pos += rows;
+        }
+        worst
+    }
+
+    /// Three positions at a time, from a prefill SHORTER than the kernel — so
+    /// the batch's first rows read the zero padding the whole-sequence lane
+    /// assumes, and a window built from the wrong end would show up here.
+    #[test]
+    fn batched_short_conv_matches_full() {
+        let worst = compare_conv_batched(11, 2, 3, 0);
+        assert!(worst < 1e-6, "batched short convolution drifts by {worst}");
+    }
+
+    /// The same, rejecting two rows of every three-row batch and re-running
+    /// them. The re-run's answer is the one compared, so a history restored
+    /// from the wrong offset is a failure and not a rounding difference.
+    #[test]
+    fn batched_short_conv_survives_rejection() {
+        let worst = compare_conv_batched(13, 4, 3, 2);
+        assert!(worst < 1e-6, "short convolution rollback drifts by {worst}");
     }
 
     /// Three positions at a time against the uncached lane, on a global layer

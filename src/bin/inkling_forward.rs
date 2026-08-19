@@ -146,6 +146,61 @@
 //! wired accept-and-skip loop, which reads 0.916x at w = 1, 0.866x at w = 2 and
 //! 0.742x at w = 3 against an unspeculated 127.1 ms baseline -- a baseline that
 //! is also an independent confirmation of the 126.8 ms above.
+//! # `INK_SPEC=k`: the accept-and-skip loop, and why it does not pay HERE
+//!
+//! The loop the MTP acceptance measurement was for, wired end to end. Set it on
+//! BOTH processes and to the same value. Every answer carries `k` drafts back
+//! with it; the next pass feeds the confirmed token FOLLOWED BY those drafts,
+//! so a verify pass is `k + 1` rows wide, its rows' argmaxes are compared to
+//! the drafts they were fed, and the leading run that agrees is kept. Both ends
+//! roll back to that prefix through [`dev_lane::AttnCache::commit`] and the two
+//! short convolutions' kept windows. Acceptance is exact argmax match, which is
+//! not a concession: measured on this model it accepts MORE than a stochastic
+//! rule (49.5% against 45.6% sampled and 40.6% under 1-TV).
+//!
+//! **It is off by default because it is a 5.5% regression, and the reason is
+//! one GEMM lane.** 60-token runs on the real two-node pipe, layers 0:21 and
+//! 21:42, `INK_KV=1`, p50 of the whole cycle:
+//!
+//!     arm                       p50 ms   tok/pass   tok/s     vs base
+//!     INK_SPEC=0                 127.1      1.000    7.869      1.000
+//!     INK_SPEC=1                 208.2      1.500    7.205      0.916
+//!     INK_SPEC=1  vecmat narrow  196.9      1.463    7.432      0.945
+//!     INK_SPEC=2                 238.0      1.622    6.814      0.866
+//!     INK_SPEC=3                 277.6      1.622    5.841      0.742
+//!
+//! The drafts are fine — 50.0% of depth-1 drafts are accepted, 1.5 tokens come
+//! out of every k=1 pass, exactly as the acceptance measurement said. What is
+//! not fine is the width: a two-row pass costs 1.638x a one-row one on the
+//! CACHED lane, against the 1.332x the uncached lane predicted, and the gap is
+//! `gemv plane par`. That lane requires `m == 1`; a decode step is bound on
+//! streaming BF16 weights and it is the only lane that reaches the roofline.
+//! Pin every arm to one lane and the loop's own arithmetic pays:
+//!
+//!     INK_GEMM='double cyclic mma'   p50 ms   tok/pass   tok/s     vs base
+//!     INK_SPEC=0                      154.1      1.000    6.491      1.000
+//!     INK_SPEC=1                      209.5      1.500    7.160      1.103
+//!
+//! So the whole deficit is the lane a verify pass cannot use, and the thing to
+//! build next is a narrow lane that streams at the gemv's bandwidth — not a
+//! smaller `k`, and not a better draft head. The tail's own half costs 76.2 ms
+//! at w = 1 and 119.6 / 120.4 / 119.8 ms at w = 2, 3, 4: the penalty is a STEP
+//! at the second row and FLAT after it, which is what a lost lane looks like
+//! and not what extra work looks like.
+//!
+//! ## The same lane decides what the model SAYS
+//!
+//! A speculative run's text diverges from a `INK_SPEC=0` run's at token 38 of
+//! this prompt and degenerates into a repeat loop. That is not the loop: it is
+//! the same lane again, and `INK_SPEC=0 INK_GEMM='double cyclic mma'` — no
+//! speculation anywhere — diverges at the SAME token. Against a host `f64`
+//! reference on identical BF16 bits, `gemv plane par` is off by 1.2e-7 and the
+//! narrow tile lane by 1.36e-5, a factor of 113; over 42 layers and 40 cached
+//! positions that is enough to take the stack apart. Held to one lane the
+//! batched cached attention is BIT-IDENTICAL to the single-row lane at every
+//! position (`drift_table_at_real_width` in `burn.rs`, run with
+//! `INK_GEMM='double cyclic mma'`), so the loop preserves the text exactly and
+//! the runtime does not.
 //!
 //! # One lane, all the way down
 //!
@@ -336,6 +391,39 @@ fn recv_stream(s: &mut TcpStream, h: usize) -> Result<Option<(usize, usize, Vec<
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect();
     Ok(Some((n, pos0, x)))
+}
+
+/// The tail's answer: a length and that many token ids.
+///
+/// One shape for BOTH of the tail's messages, because they are the same kind of
+/// thing — a short list of token ids — and a second wire format would be a
+/// second thing to get out of step. Message one is what the verify pass
+/// CONFIRMED (the accepted prefix plus the token past it, so never empty);
+/// message two is what the MTP heads drafted for the next pass (empty when the
+/// run is not speculating). They are sent separately on purpose: the head can
+/// commit its caches on the first while the tail is still computing the second.
+fn send_toks(s: &mut TcpStream, toks: &[usize]) -> Result<()> {
+    let mut b = Vec::with_capacity(8 + toks.len() * 8);
+    b.extend_from_slice(&(toks.len() as u64).to_le_bytes());
+    for &tk in toks {
+        b.extend_from_slice(&(tk as i64).to_le_bytes());
+    }
+    s.write_all(&b)?;
+    s.flush()?;
+    Ok(())
+}
+
+/// The other side of [`send_toks`].
+fn recv_toks(s: &mut TcpStream) -> Result<Vec<usize>> {
+    let mut hdr = [0u8; 8];
+    s.read_exact(&mut hdr).context("the tail closed mid-step")?;
+    let n = u64::from_le_bytes(hdr) as usize;
+    let mut buf = vec![0u8; n * 8];
+    s.read_exact(&mut buf).context("the tail closed mid-answer")?;
+    Ok(buf
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as usize)
+        .collect())
 }
 
 /// The backend the device lane runs on.
@@ -2202,6 +2290,42 @@ fn main() -> Result<()> {
     let repeat = std::env::var("INK_REPEAT").map(|v| v == "1" || v == "on").unwrap_or(false);
     anyhow::ensure!(!repeat || !kv, "INK_REPEAT wants the uncached lane: with a KV cache a \
          repeated pass would append the same position to the cache again");
+    // ---- INK_SPEC=k: accept-and-skip ------------------------------------
+    //
+    // The loop the MTP measurement was for. `k` drafts ride back with every
+    // answer; the next pass feeds the confirmed token FOLLOWED BY those drafts,
+    // so a verify pass is `k + 1` rows wide and confirms between one and `k + 1`
+    // tokens. Both ends roll their caches back to the accepted prefix, which is
+    // why [`dev_lane::AttnCache::commit`] exists and why the drafts travel on
+    // the wire rather than being re-derived: only the tail can draft (it owns
+    // the final hidden state and the unembedding) and only the head can embed.
+    //
+    // Set it on BOTH processes and to the same value -- the protocol is
+    // symmetric and a mismatch shows up as a width assertion, not as bad text.
+    let spec_k: usize = std::env::var("INK_SPEC").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    anyhow::ensure!(
+        spec_k == 0 || kv,
+        "INK_SPEC={spec_k} wants INK_KV=1: speculation is about skipping sequential steps, and \
+         the uncached lane has no cache to roll back"
+    );
+    anyhow::ensure!(!repeat || spec_k == 0, "INK_REPEAT and INK_SPEC measure different things");
+    anyhow::ensure!(
+        spec_k == 0 || pipe_spec.is_some(),
+        "INK_SPEC needs the pipe: the drafts are made on the tail and fed by the head"
+    );
+    anyhow::ensure!(
+        !is_tail || spec_k == 0 || mtp_k == spec_k,
+        "INK_SPEC={spec_k} on the tail wants INK_MTP={spec_k}: the drafts it sends ARE the MTP \
+         heads' output, and mtp_k={mtp_k} would send a different number of them"
+    );
+    anyhow::ensure!(
+        !is_tail || spec_k == 0 || mtp_dev_on,
+        "INK_SPEC on the tail wants the device draft lane (INK_MTP_DEV unset or 1); the host \
+         lane drafts in 1.5 s and there is no loop that pays for that"
+    );
+    if spec_k > 0 {
+        println!("  speculation        : INK_SPEC={spec_k} -- verify pass is {} rows", spec_k + 1);
+    }
     // Head d's first STABLE row sits at position seq-1-d, so a prompt shorter
     // than the number of heads leaves a depth with no stable row at all: every
     // position of that head would be a function of drafts and the cache would
@@ -2434,6 +2558,13 @@ fn main() -> Result<()> {
         /// convolution that reads it runs on the device, and a history that
         /// lived on the host would drag the whole MLP half back across.
         mlp_sconv: Option<BT<Bk, 2>>,
+        /// What a speculative batch convolved, kept until the verifier says how
+        /// many of its rows survived. `kernel - 1` history rows followed by the
+        /// batch's own inputs, so the history after keeping `keep` of them is
+        /// the window starting at `keep` -- the same shape, and the same
+        /// argument, as [`dev_lane::AttnCache`]'s pending K/V projections.
+        attn_sconv_pending: Option<BT<Bk, 2>>,
+        mlp_sconv_pending: Option<BT<Bk, 2>>,
     }
     let mut caches: Vec<LayerCache> = Vec::new();
 
@@ -2494,6 +2625,16 @@ fn main() -> Result<()> {
     // own pass.
     let mut acc_send = 0f64;
     let mut acc_wait_peer = 0f64;
+    // What the tail drafted last pass. On the head these are the rows it will
+    // FEED; on the tail they are what its next verify pass will be judged
+    // against. Same list, one machine apart.
+    let mut drafts_in: Vec<usize> = Vec::new();
+    let mut last_drafts: Vec<usize> = Vec::new();
+    // Tokens, not passes: a speculative pass confirms between 1 and k+1 of
+    // them, so this is what the run's length and its tok/s are counted in.
+    let mut gen_tokens = 0usize;
+    let mut spec_hist = vec![0usize; spec_k + 2];
+    let mut pass_ms: Vec<f64> = Vec::new();
     let mut acc_recv = 0f64;
     let mut acc_pass = 0f64;
     let mut acc_draft = 0f64;
@@ -2511,9 +2652,16 @@ fn main() -> Result<()> {
     // steps print a pass an order of magnitude off the median.
     let mut warm_wall = 0f64;
     let mut warm_steps = 0usize;
+    let mut warm_tokens = 0usize;
     let loop_started = Instant::now();
     let mut top_all: Vec<i64> = Vec::new();
-    for step in 0..=gen_steps {
+    // A `for step in 0..=gen_steps` used to bound this, and it cannot any more:
+    // a speculative pass confirms a variable number of tokens, so counting
+    // passes would make the run's LENGTH a function of how well the drafts did.
+    // The break at the bottom counts tokens and reproduces the old count
+    // exactly when nothing is speculated.
+    let mut step = 0usize;
+    loop {
     // A tail's step BEGINS on the wire, and it waits before its own timers
     // start: a tail that charged itself for the head's half would report the
     // pipeline's latency as its own cost, and the per-machine split is the
@@ -2547,7 +2695,13 @@ fn main() -> Result<()> {
     // the relative bias are functions of -- it is only equal to zero on a pass
     // that starts from the beginning.
     let (feed, pos0): (Vec<usize>, usize) = if kv && step > 0 {
-        (vec![*ids.last().expect("a step past the prefill has produced a token")], ids.len() - 1)
+        // The verify batch: the token the last pass confirmed, then the tail's
+        // drafts for the positions after it. `drafts_in` is empty unless this
+        // is a speculating head, so the non-speculative shape is the same one
+        // row it always was.
+        let mut f = vec![*ids.last().expect("a step past the prefill has produced a token")];
+        f.extend(drafts_in.iter().copied());
+        (f, ids.len() - 1)
     } else {
         (ids.clone(), 0)
     };
@@ -2821,7 +2975,20 @@ fn main() -> Result<()> {
         // how far back a query may look, and therefore how much of the cache
         // can never be read again.
         let window = if is_local { Some(t.sliding_window_size) } else { None };
-        let a = if kv && step > 0 {
+        let a = if kv && step > 0 && n > 1 {
+            // The speculative width. `attention_steps` leaves the batch PENDING
+            // and the convolution keeps its whole window, so neither is final
+            // until the verifier below says how many rows survived. Nothing
+            // here knows that yet -- the answer is a machine away.
+            let y = dev_lane::attention_steps(
+                hn, &ld.attn, &dims, Some(ls), pos0, window, &mut caches[slot].attn,
+            );
+            let (out, all) = dev_lane::short_conv_steps(
+                caches[slot].attn_sconv.clone(), y, ld.attn_sconv.clone(),
+            );
+            caches[slot].attn_sconv_pending = Some(all);
+            out
+        } else if kv && step > 0 {
             let y = dev_lane::attention_step(
                 hn, &ld.attn, &dims, Some(ls), pos0, window, &mut caches[slot].attn,
             );
@@ -2835,7 +3002,13 @@ fn main() -> Result<()> {
             );
             let hist = dev_lane::conv_history(y.clone(), t.sconv_kernel_size);
             let out = dev_lane::short_conv(y, ld.attn_sconv.clone());
-            caches.push(LayerCache { attn, attn_sconv: hist, mlp_sconv: None });
+            caches.push(LayerCache {
+                attn,
+                attn_sconv: hist,
+                mlp_sconv: None,
+                attn_sconv_pending: None,
+                mlp_sconv_pending: None,
+            });
             out
         } else {
             let y = dev_lane::attention(hn, &ld.attn, &dims, Some(ls), window);
@@ -3108,9 +3281,15 @@ fn main() -> Result<()> {
                     .mlp_sconv
                     .clone()
                     .expect("a step past the prefill has a history");
-                let (out, next) = dev_lane::short_conv_step(hist, y, ld.mlp_sconv.clone());
-                caches[slot].mlp_sconv = Some(next);
-                out
+                if n > 1 {
+                    let (out, all) = dev_lane::short_conv_steps(hist, y, ld.mlp_sconv.clone());
+                    caches[slot].mlp_sconv_pending = Some(all);
+                    out
+                } else {
+                    let (out, next) = dev_lane::short_conv_step(hist, y, ld.mlp_sconv.clone());
+                    caches[slot].mlp_sconv = Some(next);
+                    out
+                }
             } else {
                 caches[slot].mlp_sconv =
                     Some(dev_lane::conv_history(y.clone(), t.sconv_kernel_size));
@@ -3205,17 +3384,29 @@ fn main() -> Result<()> {
     // Which position `logits[0]` is. The head computes `logit_row0..n`, so this
     // is 0 when everything was asked for and `n - 1` when only the argmax's row
     // was. A head computes nothing and the value is unread there.
-    let logit_row0 = if all_logits { 0 } else { n - 1 };
+    // How many of this pass's rows the verifier has to read an argmax off. One,
+    // normally -- a forward produces one token. A speculative pass produces one
+    // PER ROW, and every one of them is needed: the accepted prefix is the
+    // leading run where the draft and the argmax agree, so a rule that only
+    // looked at the last row could not find where the agreement stopped.
+    let verify_rows = if spec_k > 0 && kv && step > 0 { n } else { 1 };
+    let logit_row0 = if all_logits { 0 } else { n - verify_rows };
     let (mut t_send, mut t_wait_peer) = (0f64, 0f64);
+    let mut wire_toks: Vec<usize> = Vec::new();
     let logits = if let Some(Pipe::Head(s)) = pipe.as_mut() {
         let t_s = Instant::now();
         send_stream(s, n, pos0, &x)?;
         t_send = t_s.elapsed().as_secs_f64();
         let t_w = Instant::now();
-        let mut back = [0u8; 8];
-        s.read_exact(&mut back).context("the tail closed mid-step")?;
+        // The tail's FIRST message: the tokens its verify pass confirmed. Never
+        // empty -- the row fed the last confirmed token always produces one --
+        // and longer than one exactly when drafts were accepted. The drafts for
+        // the NEXT pass are a second message, read further down, so this
+        // process gets to commit its caches in between.
+        wire_toks = recv_toks(s)?;
         t_wait_peer = t_w.elapsed().as_secs_f64();
-        best_wire = Some(i64::from_le_bytes(back) as usize);
+        anyhow::ensure!(!wire_toks.is_empty(), "the tail confirmed no token at all");
+        best_wire = Some(*wire_toks.last().expect("checked non-empty"));
         Vec::new()
     } else {
         // 109 x 4096 x 200058 is 89 G multiply-adds — the single largest
@@ -3250,24 +3441,114 @@ fn main() -> Result<()> {
     // the wire instead of computing it, and either way it is decided HERE --
     // before the reporting -- so a tail can answer its peer immediately rather
     // than making the head wait on a page of printing.
+    // How many DRAFTS this pass kept, and the tokens it confirmed. Acceptance
+    // is exact argmax match and deliberately not a stochastic rule: measured on
+    // this model the exact rule accepts MORE (49.5% against 45.6% sampled and
+    // 40.6% under 1-TV), because when the draft is the argmax the target agrees
+    // strongly and when it is not the target puts little mass there either.
+    let new_toks: Vec<usize>;
     let best = match best_wire {
-        Some(b) => b,
+        Some(b) => {
+            new_toks = wire_toks.clone();
+            b
+        }
         None => {
-            let last = &logits[(n - 1 - logit_row0) * v..(n - logit_row0) * v];
-            let mut best = 0usize;
-            for (i, &val) in last.iter().enumerate() {
-                if val > last[best] {
-                    best = i;
+            let mut accepted = 0usize;
+            let rows = n - logit_row0;
+            let argmax_of = |i: usize| -> usize {
+                let row = &logits[i * v..(i + 1) * v];
+                let mut b = 0usize;
+                for (j, &val) in row.iter().enumerate() {
+                    if val > row[b] {
+                        b = j;
+                    }
                 }
+                b
+            };
+            if verify_rows > 1 {
+                debug_assert_eq!(logit_row0, 0, "a verify pass reads from row 0");
+                anyhow::ensure!(
+                    n == 1 + last_drafts.len(),
+                    "the head fed {n} rows against {} drafts -- the two ends disagree on the \
+                     speculation width",
+                    last_drafts.len()
+                );
+                let preds: Vec<usize> = (0..rows).map(argmax_of).collect();
+                // Row i was fed the token at pos0+i and predicts pos0+i+1. Row 0
+                // was fed a CONFIRMED token, so its prediction is always kept;
+                // row i>0 was fed draft i-1, so its prediction is only a fact
+                // about the sequence if every draft before it was right.
+                while accepted < last_drafts.len() && last_drafts[accepted] == preds[accepted] {
+                    accepted += 1;
+                }
+                new_toks = preds[..=accepted].to_vec();
+            } else {
+                new_toks = vec![argmax_of(rows - 1)];
             }
-            best
+            *new_toks.last().expect("at least one row is always confirmed")
         }
     };
     let mut t_to_reply = 0f64;
     if let Some(Pipe::Tail(s)) = pipe.as_mut() {
-        s.write_all(&(best as i64).to_le_bytes())?;
-        s.flush()?;
+        send_toks(s, &new_toks)?;
         t_to_reply = pass.elapsed().as_secs_f64();
+    }
+    // Everything but the LAST confirmed token goes into `ids` now; the last one
+    // is `best` and is pushed where it has always been pushed, so the MTP block
+    // below sees exactly the sequence-and-a-held-back-argmax it was written
+    // against.
+    if is_tail && gen_steps > 0 && !repeat && new_toks.len() > 1 {
+        ids.extend_from_slice(&new_toks[..new_toks.len() - 1]);
+    }
+    // ---- both ends roll back to the accepted prefix ------------------------
+    //
+    // `keep` is 1 + accepted: row 0 fed a confirmed token and rows 1..=accepted
+    // fed drafts the verifier kept, so their K, V and convolution memory are
+    // facts about the sequence the model actually chose. The rows past them
+    // were computed from tokens it did not choose, and leaving them behind does
+    // not error -- it shows up later as an acceptance rate that drifts down.
+    if verify_rows > 1 {
+        let keep = new_toks.len();
+        let hist = t.sconv_kernel_size - 1;
+        for (slot, c) in caches.iter_mut().enumerate() {
+            let window = if t.attn_kind(lo + slot) == AttnKind::Local {
+                Some(t.sliding_window_size)
+            } else {
+                None
+            };
+            c.attn.commit(keep, window);
+            if let Some(all) = c.attn_sconv_pending.take() {
+                c.attn_sconv = dev_lane::conv_history(
+                    all.slice([0..hist + keep, 0..h]),
+                    t.sconv_kernel_size,
+                );
+            }
+            if let Some(all) = c.mlp_sconv_pending.take() {
+                c.mlp_sconv = Some(dev_lane::conv_history(
+                    all.slice([0..hist + keep, 0..h]),
+                    t.sconv_kernel_size,
+                ));
+            }
+        }
+    }
+    // The tail's SECOND message, and the head's second wait: the drafts to feed
+    // next pass. Read after the commit on purpose -- that is device work this
+    // process can enqueue while the other machine is still drafting.
+    if let Some(Pipe::Head(s)) = pipe.as_mut() {
+        if spec_k > 0 {
+            let t_w = Instant::now();
+            drafts_in = recv_toks(s)?;
+            t_wait_peer += t_w.elapsed().as_secs_f64();
+            anyhow::ensure!(
+                drafts_in.len() == spec_k,
+                "the tail sent {} drafts against INK_SPEC={spec_k}",
+                drafts_in.len()
+            );
+        }
+    }
+    if step > 0 {
+        let bucket = new_toks.len().min(spec_hist.len() - 1);
+        spec_hist[bucket] += 1;
     }
 
     // ---- MTP: score the drafts that named this step, then draft afresh -----
@@ -3285,7 +3566,13 @@ fn main() -> Result<()> {
             Vec::new()
         };
         mtp_pending.retain(|&(target, depth, tok)| {
-            if target != step {
+            // Off when the loop is speculating: `step` no longer names one
+            // token, so a draft issued at step s cannot be matched to "the
+            // token step s+d+1 produced". The accept-and-skip loop verifies its
+            // own drafts against the rows they were fed into and reports the
+            // prefix histogram instead, which is the same measurement taken
+            // where it is now decidable.
+            if spec_k > 0 || target != step {
                 return true;
             }
             mtp_seen[depth] += 1;
@@ -3350,6 +3637,16 @@ fn main() -> Result<()> {
             x.clone()
         } else {
             rms_norm(&x, &fnorm_d.data, t.rms_norm_eps, n, h)
+        };
+        // ...for the rows the verifier KEPT, and no further. A speculative pass
+        // computes a hidden state for every row it fed, and the ones past the
+        // accepted prefix are functions of tokens the model did not choose. An
+        // MTP head drafting from one of those would be drafting off a state
+        // that never happened, and nothing downstream would say so.
+        let entry = if verify_rows > 1 && new_toks.len() < n {
+            entry[..new_toks.len() * h].to_vec()
+        } else {
+            entry
         };
         // RETAIN it, and that is the whole enabling change. An MTP head's input
         // at position j is (main_hidden[j], embed(token[j+1])), and
@@ -3640,31 +3937,49 @@ fn main() -> Result<()> {
                     mtp_dev_caches[d] = Some(c);
                     y
                 } else {
-                    assert_eq!(have + 1, want, "a step makes exactly one row stable");
-                    let pos = want - 1;
-                    let hin = if d == 0 {
-                        main_dev.clone().slice([pos..pos + 1, 0..h])
+                    // ONE row per CONFIRMED TOKEN, not one per pass. That used
+                    // to be the same number and an `assert_eq!(have + 1, want)`
+                    // said so; a speculative pass confirms 1 + accepted tokens
+                    // at once and every one of them makes a row of every head
+                    // stable. Head d's row at `pos` is fed the token at
+                    // pos + d + 1, which is in `ids` for all of them but the
+                    // last, where it is the argmax still being held back.
+                    let adv = want - have;
+                    assert!(adv >= 1, "a pass makes at least one row stable");
+                    let mut made: Vec<T2> = Vec::with_capacity(adv);
+                    for i in 0..adv {
+                        let pos = have + i;
+                        let hin = if d == 0 {
+                            main_dev.clone().slice([pos..pos + 1, 0..h])
+                        } else {
+                            row_of(&mtp_stage_dev[d - 1], pos, pos + 1)
+                        };
+                        let ahead = pos + d + 1;
+                        let tok = if ahead < seq { ids[ahead] } else { best };
+                        let ed = up2::<Bk>(
+                            embed_row_bf16(e_w, tok, t.vocab_size, h),
+                            1,
+                            h,
+                            &dev,
+                        );
+                        made.push(mtp_block_step_dev(
+                            hin,
+                            ed,
+                            &mtp_devs[d],
+                            &hd,
+                            Some(ls),
+                            pos,
+                            window,
+                            mtp_dev_caches[d].as_mut().expect("prefilled on the first pass"),
+                            t.rms_norm_eps,
+                            mtp_order,
+                        ));
+                    }
+                    if made.len() == 1 {
+                        made.pop().expect("one row")
                     } else {
-                        row_of(&mtp_stage_dev[d - 1], pos, pos + 1)
-                    };
-                    let ed = up2::<Bk>(
-                        embed_row_bf16(e_w, best, t.vocab_size, h),
-                        1,
-                        h,
-                        &dev,
-                    );
-                    mtp_block_step_dev(
-                        hin,
-                        ed,
-                        &mtp_devs[d],
-                        &hd,
-                        Some(ls),
-                        pos,
-                        window,
-                        mtp_dev_caches[d].as_mut().expect("prefilled on the first pass"),
-                        t.rms_norm_eps,
-                        mtp_order,
-                    )
+                        BT::cat(made, 0)
+                    }
                 };
                 mtp_stage_dev[d] = Some(match mtp_stage_dev[d].take() {
                     None => stable,
@@ -3797,18 +4112,29 @@ fn main() -> Result<()> {
         } else {
             draft_whole(&mtp_main, seq, &ids, best)
         };
-        mtp_issued.insert(step, vec![None; drafts.len()]);
-        if mtp_prob {
-            mtp_issued_q.insert(step, vec![None; drafts.len()]);
-            for (d, p) in draft_probs.borrow_mut().drain(..).enumerate() {
-                mtp_pd.insert((step + d + 1, d), p);
+        if spec_k == 0 {
+            mtp_issued.insert(step, vec![None; drafts.len()]);
+            if mtp_prob {
+                mtp_issued_q.insert(step, vec![None; drafts.len()]);
+                for (d, p) in draft_probs.borrow_mut().drain(..).enumerate() {
+                    mtp_pd.insert((step + d + 1, d), p);
+                }
+            }
+            for (d, &b) in drafts.iter().enumerate() {
+                // Head d predicts the token d+1 steps past the one just chosen.
+                mtp_pending.push((step + d + 1, d, b));
             }
         }
-        for (d, &b) in drafts.iter().enumerate() {
-            // Head d predicts the token d+1 steps past the one just chosen.
-            mtp_pending.push((step + d + 1, d, b));
-        }
         acc_draft += t_mtp.elapsed().as_secs_f64();
+        // The drafts go to the head, which is the only process that can embed
+        // them. Sent HERE and not with the answer, so the head was blocked on
+        // the verify pass alone and this drafting overlaps its commit.
+        if spec_k > 0 {
+            last_drafts = drafts.clone();
+            if let Some(Pipe::Tail(s)) = pipe.as_mut() {
+                send_toks(s, &drafts)?;
+            }
+        }
         println!(
             "  MTP drafted {} token(s) in {:.3}s: {drafts:?}",
             mtp_heads.len(),
@@ -3995,8 +4321,12 @@ fn main() -> Result<()> {
         top_all.clear();
     }
     // A head has no logits to rank -- the tail owns the table, and writes it.
-    if (kv || step == gen_steps) && best_wire.is_none() {
-        for ti in logit_row0..n {
+    if (kv || gen_tokens + new_toks.len() > gen_steps) && best_wire.is_none() {
+        // Only the rows the verifier kept. A speculative pass computes logits
+        // for rows it then throws away, and ranking those would print a top-5
+        // for a position the run never visited -- and index `ids` past its end.
+        let valid_to = if verify_rows > 1 { logit_row0 + new_toks.len() } else { n };
+        for ti in logit_row0..valid_to {
             let pos = pos0 + ti;
             let row = &logits[(ti - logit_row0) * v..(ti - logit_row0 + 1) * v];
             let mut idx: Vec<usize> = (0..v).collect();
@@ -4012,11 +4342,14 @@ fn main() -> Result<()> {
     }
 
     if gen_steps > 0 {
-        println!("  step {step}: +{best}   [pass {:.1}s, total {:.1}s, ctx {}, pass_ms {:.1}]",
+        println!("  step {step}: +{new_toks:?}   [pass {:.1}s, total {:.1}s, ctx {}, pass_ms {:.1}]",
                  pass.elapsed().as_secs_f32(), started.elapsed().as_secs_f32(), ids.len(),
                  pass.elapsed().as_secs_f64() * 1e3);
-        // The tail already pushed, when it answered its peer.
+        // The tail already pushed all but the last, when it answered its peer.
         if !is_tail && !repeat {
+            if new_toks.len() > 1 {
+                ids.extend_from_slice(&new_toks[..new_toks.len() - 1]);
+            }
             ids.push(best);
         }
     }
@@ -4030,14 +4363,20 @@ fn main() -> Result<()> {
         acc_pass += pass.elapsed().as_secs_f64();
         acc_to_reply += t_to_reply;
         acc_steps += 1;
+        pass_ms.push((pass.elapsed().as_secs_f64() + t_recv) * 1e3);
     }
     if step > COLD_DECODE_STEPS {
         warm_wall += pass.elapsed().as_secs_f64() + t_recv;
         warm_steps += 1;
+        warm_tokens += new_toks.len();
     }
-    if step == gen_steps {
+    gen_tokens += new_toks.len();
+    // Tokens, not passes -- and with nothing speculated this fires on exactly
+    // the pass the old `for step in 0..=gen_steps` fired on.
+    if gen_tokens > gen_steps {
         break;
     }
+    step += 1;
     }
 
     // ---- how much of the wall clock this node spent waiting for the other --
@@ -4054,6 +4393,13 @@ fn main() -> Result<()> {
                 ms(warm_wall),
                 ms(warm_wall) / warm_steps as f64
             );
+            if warm_tokens > 0 {
+                println!(
+                    "  WARM per TOKEN       : {:9.1} ms   ({:.3} tok/s over {warm_tokens} tokens)",
+                    ms(warm_wall) / warm_tokens as f64,
+                    warm_tokens as f64 / warm_wall
+                );
+            }
         }
         if is_head {
             // `pass` contains the wait, so compute is what is left of it.
@@ -4076,6 +4422,59 @@ fn main() -> Result<()> {
             println!("  BLOCKED on the head  : {:9.1} ms   {:5.1}%", ms(acc_recv), 100.0 * acc_recv / wall);
             println!("  per step: compute {:.1} ms, blocked {:.1} ms",
                      ms(acc_pass) / acc_steps as f64, ms(acc_recv) / acc_steps as f64);
+        }
+        // ---- THE gate ------------------------------------------------------
+        //
+        // Tokens per second, not milliseconds per pass. Speculation trades more
+        // compute for fewer sequential steps, so a per-pass figure is SUPPOSED
+        // to get worse; the only number that says whether the trade paid is how
+        // much text came out per second of wall clock.
+        let decode_toks = gen_tokens.saturating_sub(1);
+        let mut sorted = pass_ms.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in a duration"));
+        let p50 = if sorted.is_empty() { 0.0 } else { sorted[sorted.len() / 2] };
+        println!(
+            "  TOKENS/SEC           : {:.3}   ({decode_toks} tokens past the prefill in {:.1} ms \
+             of decode wall)",
+            decode_toks as f64 / wall,
+            ms(wall)
+        );
+        println!(
+            "  per pass, ms         : p50 {p50:.1}, min {:.1}, max {:.1}, mean {:.1}   over {} passes",
+            sorted.first().copied().unwrap_or(0.0),
+            sorted.last().copied().unwrap_or(0.0),
+            ms(wall) / acc_steps as f64,
+            sorted.len()
+        );
+        let tpp = decode_toks as f64 / acc_steps as f64;
+        println!("  tokens per pass      : {tpp:.3}");
+        // The same gate, taken at the MEDIAN pass instead of the mean. A decode
+        // loop pays for kernel compilation in its first few passes -- one 1.8 s
+        // outlier in a 40-pass run moves the mean by 20% and the median by
+        // nothing -- so this is the figure a short run can be compared on and
+        // the mean above is the figure a long one can.
+        println!(
+            "  TOKENS/SEC at p50    : {:.3}   (tokens/pass over the median pass)",
+            if p50 > 0.0 { tpp / (p50 / 1e3) } else { 0.0 }
+        );
+        if spec_k > 0 {
+            let sets: usize = spec_hist.iter().sum();
+            println!("  accepted prefix over {sets} verify passes (INK_SPEC={spec_k}):");
+            for (l, &c) in spec_hist.iter().enumerate().skip(1) {
+                println!(
+                    "    {} accepted: {c:5}   ({:5.1}%)",
+                    l - 1,
+                    100.0 * c as f64 / sets.max(1) as f64
+                );
+            }
+            let mean: f64 = spec_hist
+                .iter()
+                .enumerate()
+                .skip(1)
+                .map(|(l, &c)| (l - 1) as f64 * c as f64)
+                .sum::<f64>()
+                / sets.max(1) as f64;
+            println!("    mean {mean:.3} draft tokens accepted per verify pass");
         }
         println!("  loop wall (both ends see the same clock): {:.1} ms", ms(loop_started.elapsed().as_secs_f64()));
         println!("  the wire itself is the head's BLOCKED figure minus the tail's per-step compute;");
@@ -4280,12 +4679,34 @@ fn main() -> Result<()> {
             // that is worth is `(1 + P*a) / (P*c + (1 - P))` against the
             // unconditional `(1 + a_all) / c`, and both need the measured
             // width cost, which is a property of the machine and not of this
-            // run -- `INK_SPEC_C2` carries it in, defaulting to the 1.492
-            // measured on the two-node pipe.
+            // run -- `INK_SPEC_C2` carries it in.
+            //
+            // **1.638, and it is now measured where it is spent.** The old
+            // default was 1.492, taken on the UNCACHED lane with `INK_REPEAT`,
+            // because until `INK_SPEC` existed there was no cached multi-row
+            // pass to time. There is one now, and the cached lane is worse:
+            // 60-token runs on the two-node pipe, p50 of the whole cycle,
+            //
+            //     INK_SPEC=0  w=1  127.1 ms      c = 1.000
+            //     INK_SPEC=1  w=2  208.2 ms      c = 1.638
+            //     INK_SPEC=2  w=3  238.0 ms      c = 1.872
+            //     INK_SPEC=3  w=4  277.6 ms      c = 2.184
+            //
+            // against 1.000 / 1.332 / 1.434 / ~1.52 uncached. The gap is not
+            // the extra rows -- the tail's own half costs 76.2 ms at w = 1 and
+            // 119.6 / 120.4 / 119.8 ms at w = 2, 3, 4, which is FLAT once the
+            // second row exists. It is `gemv plane par`: a cached decode step
+            // is weight-streaming-bound, that lane is the only one that reaches
+            // the roofline, and it requires m == 1. Losing it costs 1.33x at
+            // m == 1 alone (70.1/73.0 ms against 96.2/93.3, measured in
+            // `bf16gemm`), and a verify pass loses it by definition. So the
+            // width penalty on this lane is a STEP, not a slope, and the number
+            // to beat is a narrow lane that streams at the gemv's bandwidth --
+            // not a smaller k.
             let c2: f64 = std::env::var("INK_SPEC_C2")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(1.492);
+                .unwrap_or(1.638);
             if !mtp_conf[0].is_empty() {
                 println!("\n=== depth-1 acceptance against the draft head's own confidence ===");
                 println!("  c(2) = {c2:.3} (INK_SPEC_C2); a k=1 loop that always speculates:");
