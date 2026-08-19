@@ -1271,7 +1271,11 @@ impl SlotCache<Bk> {
         }
         let dev = caches[0].k.device();
         let bucket = kv_pad_bucket();
-        let cap = len.next_multiple_of(bucket).max(bucket);
+        // `len + 1`, not `len`: the first decode step is going to append a row,
+        // and a cache allocated to exactly its prefill would have to grow on
+        // the very pass it was built for. It also keeps the pad below
+        // unconditional, and an unconditional path is one that gets exercised.
+        let cap = (len + 1).next_multiple_of(bucket);
 
         // `[len, kv_heads * head_dim]` -> `[kv_heads, len, head_dim]`, once,
         // here. Every later step writes and reads head-major and transposes
@@ -1279,7 +1283,7 @@ impl SlotCache<Bk> {
         let headwise = |t: Tensor<Bk, 2>| -> Tensor<Bk, 3> {
             let pad: Tensor<Bk, 3> = Tensor::zeros([kv_heads, cap - len, head_dim], &dev);
             let body = t.reshape([len, kv_heads, head_dim]).swap_dims(0, 1);
-            if cap == len { body } else { Tensor::cat(vec![body, pad], 1) }
+            Tensor::cat(vec![body, pad], 1)
         };
         let mut ks = Vec::with_capacity(slots);
         let mut vs = Vec::with_capacity(slots);
