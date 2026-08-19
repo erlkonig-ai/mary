@@ -51,6 +51,11 @@ pub mod sconv;
 // and sliding window -- as one kernel over `[heads, n, n]` instead of five
 // materialised tensors of that shape and two host loops over `n^2`.
 pub mod scorebias;
+// Sliding-window attention as a BAND: one kernel per (head, query) over the
+// <= 512 keys the window admits, with no `[heads, n, n]` anywhere. Thirty-five
+// of the forty-two attention layers are local, and they were computing the
+// full n^2 and masking it away.
+pub mod banded;
 // What one attention layer asks the allocator for, and whether this device
 // will give it: the `[heads, n, n]` score matrix against the per-buffer cap
 // cubecl sets at `cuDeviceTotalMem / 4`.

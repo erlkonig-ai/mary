@@ -425,6 +425,38 @@ pub fn attention_prefill(
     mask_window: Option<usize>,
     window: Option<usize>,
 ) -> (Tensor<Bk, 2>, AttnCache<Bk>) {
+    attention_prefill_lane(x, w, d, log_scaling, mask_window, window, true)
+}
+
+/// The same layer with the banded lane REFUSED, so a test can hold the two
+/// implementations side by side.
+///
+/// Exists because the only check that catches a band which disagrees with the
+/// dense triangle is one that runs both on the same weights: a banded kernel
+/// checked against a banded reference proves the two share an author, not that
+/// either is right.
+#[cfg(test)]
+pub(crate) fn attention_prefill_dense(
+    x: Tensor<Bk, 2>,
+    w: &AttnWeightsDev,
+    d: &crate::models::inkling::attn::AttnDims,
+    log_scaling: Option<crate::models::inkling::attn::LogScaling>,
+    mask_window: Option<usize>,
+    window: Option<usize>,
+) -> (Tensor<Bk, 2>, AttnCache<Bk>) {
+    attention_prefill_lane(x, w, d, log_scaling, mask_window, window, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attention_prefill_lane(
+    x: Tensor<Bk, 2>,
+    w: &AttnWeightsDev,
+    d: &crate::models::inkling::attn::AttnDims,
+    log_scaling: Option<crate::models::inkling::attn::LogScaling>,
+    mask_window: Option<usize>,
+    window: Option<usize>,
+    banded_ok: bool,
+) -> (Tensor<Bk, 2>, AttnCache<Bk>) {
     use crate::models::inkling::config::AttnKind;
 
     let [tokens, hidden] = x.dims();
@@ -478,47 +510,101 @@ pub fn attention_prefill(
         .reshape([tokens, heads, eff])
         * tau.reshape([tokens, 1, 1]);
 
-    // [heads, tokens, head_dim]; the KV heads are repeated in place, so head h
-    // reads kv head h / groups exactly as the slice lane indexes it.
-    let qh = q.reshape([tokens, heads, head_dim]).swap_dims(0, 1);
-    let expand = |t: Tensor<Bk, 2>| -> Tensor<Bk, 3> {
-        t.reshape([tokens, kv_heads, head_dim])
-            .swap_dims(0, 1)
-            .reshape([kv_heads, 1, tokens, head_dim])
-            .repeat_dim(1, groups)
-            .reshape([heads, tokens, head_dim])
-    };
-    let kh = expand(k.clone());
-    let vh = expand(v.clone());
+    // A local layer is a BAND, and the band is the whole of its attention:
+    // `[tokens, heads * head_dim]` out, one kernel, nothing quadratic written
+    // down at any point. Thirty-five of this model's forty-two attention layers
+    // take this arm. The dense arm below -- the GQA expansion, the two
+    // transposes and the `[heads, n, n]` scores -- is built only for the seven
+    // that are global, because a global layer really does read every key.
+    let out: Tensor<Bk, 2> = match mask_window {
+        Some(w)
+            if banded_ok
+                && crate::models::inkling::banded::applies(heads, kv_heads, head_dim, w) =>
+        {
+            use crate::models::inkling::banded::banded_attention_launch;
+            use crate::models::inkling::seam::{client_of, handle_of, tensor_of};
+            let client = client_of(&q);
+            // Q, K, V and the relative table exactly as the projections left
+            // them: `[tokens, heads * head_dim]` and `[tokens, kv_heads *
+            // head_dim]`. The kernel indexes `h / groups` for the KV head, so
+            // the repeat that used to materialise two more
+            // `heads * tokens * head_dim` tensors does not happen here.
+            let q_h = handle_of(q);
+            // K DIMENSION-MAJOR, `[kv_heads, head_dim, tokens]`: the band's
+            // score phase has one unit per key walking every dimension, and in
+            // the `[tokens, kv_heads * head_dim]` layout that is 32 memory
+            // transactions per warp instruction instead of one. `handle_of`
+            // makes the permuted view contiguous, which is the transpose --
+            // one linear pass per layer against a quadratic saving.
+            let k_h = handle_of(
+                k.clone().reshape([tokens, kv_heads, head_dim]).swap_dims(0, 1).swap_dims(1, 2),
+            );
+            let v_h = handle_of(v.clone());
+            let rel_h = handle_of(rel);
+            let o = banded_attention_launch(
+                &client,
+                &q_h,
+                &k_h,
+                &v_h,
+                &rel_h,
+                tokens,
+                heads,
+                kv_heads,
+                head_dim,
+                eff,
+                w,
+                d.scaling(),
+            );
+            tensor_of(client, dev.clone(), o, tokens, heads * head_dim)
+        }
+        _ => {
+            // [heads, tokens, head_dim]; the KV heads are repeated in place, so
+            // head h reads kv head h / groups exactly as the slice lane indexes
+            // it.
+            let qh = q.reshape([tokens, heads, head_dim]).swap_dims(0, 1);
+            let expand = |t: Tensor<Bk, 2>| -> Tensor<Bk, 3> {
+                t.reshape([tokens, kv_heads, head_dim])
+                    .swap_dims(0, 1)
+                    .reshape([kv_heads, 1, tokens, head_dim])
+                    .repeat_dim(1, groups)
+                    .reshape([heads, tokens, head_dim])
+            };
+            let kh = expand(k.clone());
+            let vh = expand(v.clone());
 
-    // `q @ k^T` raw, then scaled, biased and masked IN PLACE by one kernel.
-    // `handle_of` consumes the tensor, so after that line there is exactly one
-    // name for the buffer and writing through it is not aliasing.
-    let scores = {
-        use crate::models::inkling::scorebias::score_epilogue_launch;
-        use crate::models::inkling::seam::{client_of, handle_of, strided_of3, tensor_strided3};
-        let raw = qh.matmul(kh.swap_dims(1, 2));
-        let client = client_of(&raw);
-        let rel_h = handle_of(rel);
-        let (s_h, st) = strided_of3(raw);
-        score_epilogue_launch(
-            &client,
-            &s_h,
-            &rel_h,
-            heads,
-            tokens,
-            eff,
-            st,
-            d.scaling(),
-            mask_window,
-        );
-        tensor_strided3(client, dev.clone(), s_h, [heads, tokens, tokens], st)
+            // `q @ k^T` raw, then scaled, biased and masked IN PLACE by one
+            // kernel. `handle_of` consumes the tensor, so after that line there
+            // is exactly one name for the buffer and writing through it is not
+            // aliasing.
+            let scores = {
+                use crate::models::inkling::scorebias::score_epilogue_launch;
+                use crate::models::inkling::seam::{
+                    client_of, handle_of, strided_of3, tensor_strided3,
+                };
+                let raw = qh.matmul(kh.swap_dims(1, 2));
+                let client = client_of(&raw);
+                let rel_h = handle_of(rel);
+                let (s_h, st) = strided_of3(raw);
+                score_epilogue_launch(
+                    &client,
+                    &s_h,
+                    &rel_h,
+                    heads,
+                    tokens,
+                    eff,
+                    st,
+                    d.scaling(),
+                    mask_window,
+                );
+                tensor_strided3(client, dev.clone(), s_h, [heads, tokens, tokens], st)
+            };
+            let probs = burn::tensor::activation::softmax(scores, 2);
+            probs
+                .matmul(vh)
+                .swap_dims(0, 1)
+                .reshape([tokens, heads * head_dim])
+        }
     };
-    let probs = burn::tensor::activation::softmax(scores, 2);
-    let out = probs
-        .matmul(vh)
-        .swap_dims(0, 1)
-        .reshape([tokens, heads * head_dim]);
 
     let mut cache = AttnCache {
         k,
@@ -891,6 +977,33 @@ mod tests {
     // that it exists — and after the feature collapse exactly one does.
     type B = burn::backend::Cuda<f32>;
 
+    /// How far the cached lane may differ from the uncached one on a GLOBAL
+    /// layer, where both sides build their scores with the same Burn matmul and
+    /// the only difference is the order of the additions.
+    const CACHE_TOLERANCE_GLOBAL: f32 = 2e-5;
+
+    /// The same for a LOCAL layer, where the two sides no longer share an
+    /// implementation.
+    ///
+    /// Prefill goes through [`crate::models::inkling::banded`], which
+    /// accumulates `q . k` in f32 on the CUDA cores. A decode step goes through
+    /// Burn's matmul, which on this runtime is **TF32** -- ten mantissa bits, not
+    /// twenty-three. [`f32_matmul_is_tf32_on_this_runtime`] measures it at 9.3e-4
+    /// relative to the largest term of a 128-deep product, and through a softmax
+    /// on these deliberately small synthetic weights that reaches 2.2e-2 of the
+    /// output.
+    ///
+    /// The band is the ACCURATE side, not the tolerant one. That is not an
+    /// assumption: `banded::device_tests::the_cached_tests_shape_against_f64`
+    /// holds the kernel to 2e-5 against an f64 host reference at exactly these
+    /// shapes, and it is the dense triangle that drifts from f64 by 2.2e-2.
+    ///
+    /// 5e-2 is set against the SABOTAGE floor rather than against the noise:
+    /// [`dropping_the_conv_history_is_caught`] moves the answer by 1.156, so
+    /// what these tests exist to catch still has more than twenty times the
+    /// margin it needs.
+    const CACHE_TOLERANCE_LOCAL: f32 = 5e-2;
+
     /// Deterministic filler. A fixed pattern rather than a seeded RNG so a
     /// failure is reproducible from the source alone.
     fn fill(n: usize, seed: f32) -> Vec<f32> {
@@ -1008,6 +1121,101 @@ mod tests {
         worst
     }
 
+    /// Burn's f32 matmul on this runtime is NOT f32, and this is the tripwire.
+    ///
+    /// It compares `Tensor::matmul` against the same product accumulated in f64
+    /// on the host. TF32 carries ten mantissa bits and lands near 1e-3; true f32
+    /// carries twenty-three and lands near 1e-7. Measured here: 9.3e-4.
+    ///
+    /// The assertion is deliberately the "still imprecise" direction. It is what
+    /// [`CACHE_TOLERANCE_LOCAL`] is sized for, and if this test ever FAILS the
+    /// runtime has moved to a real f32 product and that tolerance can go back to
+    /// 2e-5. A failure here is good news, not a regression.
+    #[test]
+    fn f32_matmul_is_tf32_on_this_runtime() {
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let (m, k, n) = (32usize, 128usize, 32usize);
+        let a = fill(m * k, 1.3);
+        let b = fill(k * n, 2.1);
+        let at: Tensor<B, 2> = Tensor::from_data(TensorData::new(a.clone(), [m, k]), &dev);
+        let bt: Tensor<B, 2> = Tensor::from_data(TensorData::new(b.clone(), [k, n]), &dev);
+        let got: Vec<f32> = at.matmul(bt).into_data().to_vec().unwrap();
+        let mut worst = 0f64;
+        let mut scale = 0f64;
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0f64;
+                for t in 0..k {
+                    acc += a[i * k + t] as f64 * b[t * n + j] as f64;
+                }
+                worst = worst.max((got[i * n + j] as f64 - acc).abs());
+                scale = scale.max(acc.abs());
+            }
+        }
+        let rel = worst / scale;
+        println!("f32 matmul worst absolute error {worst:e} against a largest term of {scale:e} -> {rel:e}");
+        assert!(
+            rel > 1e-5,
+            "Burn's f32 matmul now agrees with f64 to {rel:e}: it is a real f32 product, and \
+             CACHE_TOLERANCE_LOCAL can go back to CACHE_TOLERANCE_GLOBAL"
+        );
+    }
+
+    /// The band and the dense triangle, on the same weights, over the shapes
+    /// the cached tests use.
+    ///
+    /// This is the check that was missing when the band landed: the kernel has
+    /// its own f64 reference in `banded.rs`, and a kernel agreeing with a
+    /// reference written beside it says nothing about whether it agrees with the
+    /// lane it REPLACES. It did not -- by up to 2.2e-2 -- and running this is how
+    /// the TF32 matmul was found. Prints the disagreement per configuration and
+    /// per row, so a failure names which one moved.
+    ///
+    /// The bound is [`CACHE_TOLERANCE_LOCAL`], and it is a bound on TF32, not on
+    /// the band: the tight gate on the band is in `banded.rs`, against f64.
+    #[test]
+    fn banded_and_dense_agree_to_tf32() {
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let mut worst_of_all = 0f32;
+        for (rel_extent, win, tokens) in [
+            (16usize, 16usize, 11usize), // window past the sequence: a full triangle
+            (16, 16, 4),
+            (5, 16, 11),  // triangle, table shorter than the sequence
+            (16, 5, 11),  // clipped band, table longer than the window
+            (5, 5, 11),
+            (5, 3, 11),
+            (5, 5, 4),
+            (5, 5, 2),
+            (8, 6, 20),
+        ] {
+            let d = dims(AttnKind::Local, rel_extent);
+            let w = weights(&d, &dev);
+            let xs: Tensor<B, 2> = Tensor::from_data(
+                TensorData::new(fill(tokens * d.hidden, 2.5), [tokens, d.hidden]),
+                &dev,
+            );
+            let band = attention_prefill(xs.clone(), &w, &d, None, Some(win), Some(win)).0;
+            let dense = attention_prefill_dense(xs, &w, &d, None, Some(win), Some(win)).0;
+            let per_row: Vec<f32> = (0..tokens)
+                .map(|r| {
+                    (band.clone().slice([r..r + 1, 0..d.hidden])
+                        - dense.clone().slice([r..r + 1, 0..d.hidden]))
+                    .abs()
+                    .max()
+                    .into_scalar()
+                })
+                .collect();
+            let diff = per_row.iter().cloned().fold(0f32, f32::max);
+            println!("rel_extent={rel_extent} window={win} tokens={tokens} -> {diff}  rows {per_row:?}");
+            worst_of_all = worst_of_all.max(diff);
+        }
+        assert!(
+            worst_of_all < CACHE_TOLERANCE_LOCAL,
+            "the band disagrees with the triangle by {worst_of_all}, which is more than TF32 \
+             explains"
+        );
+    }
+
     /// A global layer with log scaling that actually varies, and a relative
     /// table that runs out before the sequence does — so distances past
     /// `rel_extent` must contribute a zero bias rather than a gathered one.
@@ -1015,7 +1223,7 @@ mod tests {
     fn cached_global_matches_full() {
         let ls = Some(LogScaling { n_floor: 4.0, alpha: 0.5 });
         let worst = compare(AttnKind::Global, 5, None, ls, 11, 4, false);
-        assert!(worst < 2e-5, "cached global attention drifts by {worst}");
+        assert!(worst < CACHE_TOLERANCE_GLOBAL, "cached global attention drifts by {worst}");
     }
 
     /// A local layer whose window is shorter than the sequence, so the cache
@@ -1023,7 +1231,7 @@ mod tests {
     #[test]
     fn cached_local_matches_full_across_the_window() {
         let worst = compare(AttnKind::Local, 5, Some(5), None, 11, 4, false);
-        assert!(worst < 2e-5, "cached windowed attention drifts by {worst}");
+        assert!(worst < CACHE_TOLERANCE_LOCAL, "cached windowed attention drifts by {worst}");
     }
 
     /// The cache must survive a prefill shorter than the convolution kernel,
@@ -1031,7 +1239,10 @@ mod tests {
     #[test]
     fn cached_matches_full_from_a_two_token_prefill() {
         let worst = compare(AttnKind::Local, 5, Some(5), None, 11, 2, false);
-        assert!(worst < 2e-5, "cached attention from a short prefill drifts by {worst}");
+        assert!(
+            worst < CACHE_TOLERANCE_LOCAL,
+            "cached attention from a short prefill drifts by {worst}"
+        );
     }
 
     /// The batched cached step against the uncached lane, in batches of
@@ -1122,7 +1333,7 @@ mod tests {
     fn batched_global_matches_full() {
         let ls = Some(LogScaling { n_floor: 4.0, alpha: 0.5 });
         let worst = compare_batched(AttnKind::Global, 5, None, ls, 11, 4, 3, 0);
-        assert!(worst < 2e-5, "batched global attention drifts by {worst}");
+        assert!(worst < CACHE_TOLERANCE_GLOBAL, "batched global attention drifts by {worst}");
     }
 
     /// The same on a local layer whose window is shorter than the sequence, so
@@ -1130,7 +1341,7 @@ mod tests {
     #[test]
     fn batched_local_matches_full_across_the_window() {
         let worst = compare_batched(AttnKind::Local, 5, Some(5), None, 11, 4, 3, 0);
-        assert!(worst < 2e-5, "batched windowed attention drifts by {worst}");
+        assert!(worst < CACHE_TOLERANCE_LOCAL, "batched windowed attention drifts by {worst}");
     }
 
     /// Rejection: run three, keep one, re-run the two that were rejected. This
@@ -1140,7 +1351,7 @@ mod tests {
     fn rejected_rows_leave_no_trace() {
         let ls = Some(LogScaling { n_floor: 4.0, alpha: 0.5 });
         let worst = compare_batched(AttnKind::Global, 5, None, ls, 11, 4, 3, 2);
-        assert!(worst < 2e-5, "rolled-back batch drifts by {worst}");
+        assert!(worst < CACHE_TOLERANCE_GLOBAL, "rolled-back batch drifts by {worst}");
     }
 
     /// The same against a window, where rollback and the window's own
@@ -1148,7 +1359,7 @@ mod tests {
     #[test]
     fn rejected_rows_leave_no_trace_windowed() {
         let worst = compare_batched(AttnKind::Local, 5, Some(5), None, 11, 4, 3, 2);
-        assert!(worst < 2e-5, "rolled-back windowed batch drifts by {worst}");
+        assert!(worst < CACHE_TOLERANCE_LOCAL, "rolled-back windowed batch drifts by {worst}");
     }
 
     /// A batch of one must agree with [`attention_step`], which is the claim
@@ -1157,7 +1368,7 @@ mod tests {
     fn a_batch_of_one_matches_the_single_step() {
         let ls = Some(LogScaling { n_floor: 4.0, alpha: 0.5 });
         let worst = compare_batched(AttnKind::Global, 5, None, ls, 11, 4, 1, 0);
-        assert!(worst < 2e-5, "a one-row batch drifts by {worst}");
+        assert!(worst < CACHE_TOLERANCE_GLOBAL, "a one-row batch drifts by {worst}");
     }
 
     /// A gate that cannot fail and a gate that has never failed look identical
@@ -1167,6 +1378,14 @@ mod tests {
     #[test]
     fn dropping_the_conv_history_is_caught() {
         let worst = compare(AttnKind::Local, 5, Some(5), None, 11, 4, true);
-        assert!(worst > 1e-2, "sabotaged conv history only moved the answer by {worst}");
+        println!("sabotaged conv history moves the answer by {worst}");
+        // Against the TOLERANCE, not against a constant: what has to hold is
+        // that the bug class these tests exist for is far outside the band the
+        // tolerance admits. Measured at 1.156 against a 5e-2 tolerance.
+        assert!(
+            worst > 20.0 * CACHE_TOLERANCE_LOCAL,
+            "sabotaged conv history only moved the answer by {worst}, which is inside the \
+             tolerance the windowed tests use"
+        );
     }
 }
