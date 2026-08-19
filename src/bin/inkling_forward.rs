@@ -146,7 +146,7 @@
 //! wired accept-and-skip loop, which reads 0.916x at w = 1, 0.866x at w = 2 and
 //! 0.742x at w = 3 against an unspeculated 127.1 ms baseline -- a baseline that
 //! is also an independent confirmation of the 126.8 ms above.
-//! # `INK_SPEC=k`: the accept-and-skip loop, and why it does not pay HERE
+//! # `INK_SPEC=k`: the accept-and-skip loop, and what decides whether it pays
 //!
 //! The loop the MTP acceptance measurement was for, wired end to end. Set it on
 //! BOTH processes and to the same value. Every answer carries `k` drafts back
@@ -158,47 +158,87 @@
 //! not a concession: measured on this model it accepts MORE than a stochastic
 //! rule (49.5% against 45.6% sampled and 40.6% under 1-TV).
 //!
-//! **It is off by default because it is a 5.5% regression, and the reason is
-//! one GEMM lane.** 60-token runs on the real two-node pipe, layers 0:21 and
-//! 21:42, `INK_KV=1`, p50 of the whole cycle:
+//! **It is off by default, and the reason is no longer "it loses" -- it is that
+//! whether it wins is a property of the TEXT and not of the machine.** Two
+//! corpora, the same binary, the same pipe (layers 0:21 and 21:42 over the
+//! direct link, `INK_KV=1`, default GEMM lane), warm p50 of the whole cycle,
+//! two runs per arm and both quoted:
 //!
-//!     arm                       p50 ms   tok/pass   tok/s     vs base
-//!     INK_SPEC=0                 127.1      1.000    7.869      1.000
-//!     INK_SPEC=1                 208.2      1.500    7.205      0.916
-//!     INK_SPEC=1  vecmat narrow  196.9      1.463    7.432      0.945
-//!     INK_SPEC=2                 238.0      1.622    6.814      0.866
-//!     INK_SPEC=3                 277.6      1.622    5.841      0.742
+//!   A five-token English prompt, context 5 -> 105, `INK_GEN=100`:
 //!
-//! The drafts are fine — 50.0% of depth-1 drafts are accepted, 1.5 tokens come
-//! out of every k=1 pass, exactly as the acceptance measurement said. What is
-//! not fine is the width: a two-row pass costs 1.638x a one-row one on the
-//! CACHED lane, against the 1.332x the uncached lane predicted, and the gap is
-//! `gemv plane par`. That lane requires `m == 1`; a decode step is bound on
-//! streaming BF16 weights and it is the only lane that reaches the roofline.
-//! Pin every arm to one lane and the loop's own arithmetic pays:
+//!     arm          p50 ms   tok/pass   tok/s at p50   vs base
+//!     INK_SPEC=0    127.1      1.000       7.870       1.000
+//!     INK_SPEC=1    205.0      1.712       8.354       1.062
+//!     INK_SPEC=2    239.3      2.082       8.702       1.106
+//!     INK_SPEC=3    283.0      2.082       7.357       0.935
 //!
-//!     INK_GEMM='double cyclic mma'   p50 ms   tok/pass   tok/s     vs base
-//!     INK_SPEC=0                      154.1      1.000    6.491      1.000
-//!     INK_SPEC=1                      209.5      1.500    7.160      1.103
+//!   A 3732-token document, context 3732 -> 3792, `INK_GEN=60`:
 //!
-//! So the whole deficit is the lane a verify pass cannot use, and the thing to
-//! build next is a narrow lane that streams at the gemv's bandwidth — not a
-//! smaller `k`, and not a better draft head. The tail's own half costs 76.2 ms
-//! at w = 1 and 119.6 / 120.4 / 119.8 ms at w = 2, 3, 4: the penalty is a STEP
-//! at the second row and FLAT after it, which is what a lost lane looks like
-//! and not what extra work looks like.
+//!     arm          p50 ms   tok/pass   tok/s at p50   vs base
+//!     INK_SPEC=0    150.0      1.000       6.669       1.000
+//!     INK_SPEC=1    228.2      1.419       6.216       0.932
+//!     INK_SPEC=2    272.6      1.429       5.241       0.786
+//!
+//! The width cost is the SAME on both -- c(2) is 1.613 and 1.521, c(3) is 1.883
+//! and 1.817 -- and the acceptance is not: 71.2% of depth-1 drafts on the short
+//! prompt against 41.9% on the document. The five-token prompt's continuation
+//! is a repeating list template, and a template is easy to draft; a document's
+//! continuation is not. So the honest reading of the short-prompt column is not
+//! "speculation pays 1.1x", it is "speculation pays on text this predictable",
+//! and the corpus that is not a five-token prompt says 0.93x.
+//!
+//! Widening past `k = 2` buys nothing on either corpus: the depth-3 draft was
+//! accepted 0 times in 49 verify passes, so `k = 3` pays a wider pass for the
+//! same 2.082 tokens and lands at 0.935x.
+//!
+//! ## Three acceptance rates that are all correct
+//!
+//! This file has quoted 22.0%, 50.0% and 71.2% for depth-1 acceptance and they
+//! do not contradict each other -- they are the same measurement on three
+//! different SEQUENCES, which is the whole finding.
+//!
+//! `INK_MTP=1` and `INK_MTP=4` with no speculation both report exactly
+//! **22.0%** (95% CI 15.0-31.1) over 100 steps of the five-token prompt, so the
+//! draft depth is not what moves it. What moves it is that the unspeculated
+//! run's own continuation collapses into a single repeated token around step 38
+//! and stays there: the log reads `drafted 410, actual 58189 -- miss` for sixty
+//! consecutive steps, the draft head proposing sensible English while the stack
+//! emits one id forever. A speculative run does not go there -- a verify pass
+//! is `m > 1` and takes a different GEMM lane, and the two lanes diverge -- so
+//! its 71.2% is measured on a sequence that never degenerates.
+//!
+//! Which is to say: none of the three is a corpus-independent acceptance rate
+//! for this draft head, and the 41.9% on the document is the only one of them
+//! measured on text worth quoting.
+//!
+//! ## The width cost is a STEP, and half of it was not the GEMM lane
+//!
+//! c(2) = 1.61 on the short prompt, against 1.332 that the uncached lane
+//! predicted. The tail's own half is FLAT once the second row exists, which is
+//! what a lost lane looks like rather than what extra work looks like, and
+//! `gemv plane par` -- which requires `m == 1` and is the only lane that
+//! reaches this part's memory roofline -- is the one a verify pass cannot use.
+//!
+//! That diagnosis was right and incomplete. Timed per stage on the tail, the
+//! one-row-to-two-row step at this context is +52 ms, of which the MLP's short
+//! convolution alone is +31 and the attention half (which contains two more of
+//! them) is +18; the MoE and dense GEMMs move by 2.5 ms. The convolutions were
+//! slice-built for any width above one, and that is fixed in
+//! [`crate::models::inkling::sconv::short_conv_batch`] -- see the commit that
+//! adds it for what it recovers.
 //!
 //! ## The same lane decides what the model SAYS
 //!
-//! A speculative run's text diverges from a `INK_SPEC=0` run's at token 38 of
-//! this prompt and degenerates into a repeat loop. That is not the loop: it is
-//! the same lane again, and `INK_SPEC=0 INK_GEMM='double cyclic mma'` — no
-//! speculation anywhere — diverges at the SAME token. Against a host `f64`
-//! reference on identical BF16 bits, `gemv plane par` is off by 1.2e-7 and the
-//! narrow tile lane by 1.36e-5, a factor of 113; over 42 layers and 40 cached
-//! positions that is enough to take the stack apart. Held to one lane the
-//! batched cached attention is BIT-IDENTICAL to the single-row lane at every
-//! position (`drift_table_at_real_width` in `burn.rs`, run with
+//! A speculative run's text diverges from an `INK_SPEC=0` run's and the loop is
+//! not why: `INK_WIDTH=2`, `4` and `8` -- a cost probe with no speculation
+//! anywhere, whose extra rows carry different filler at every width -- produce
+//! text IDENTICAL to each other and diverging from `INK_WIDTH=1` at the same
+//! token. Every `m > 1` arm agrees with every other; only `m == 1` differs.
+//! Against a host `f64` reference on identical BF16 bits, `gemv plane par` is
+//! off by 1.2e-7 and the narrow tile lane by 1.36e-5, a factor of 113; over 42
+//! layers and 40 cached positions that is enough to take the stack apart. Held
+//! to one lane the batched cached attention is BIT-IDENTICAL to the single-row
+//! lane at every position (`drift_table_at_real_width` in `burn.rs`, run with
 //! `INK_GEMM='double cyclic mma'`), so the loop preserves the text exactly and
 //! the runtime does not.
 //!
@@ -4681,32 +4721,34 @@ fn main() -> Result<()> {
             // width cost, which is a property of the machine and not of this
             // run -- `INK_SPEC_C2` carries it in.
             //
-            // **1.638, and it is now measured where it is spent.** The old
+            // **1.613, and it is now measured where it is spent.** The old
             // default was 1.492, taken on the UNCACHED lane with `INK_REPEAT`,
             // because until `INK_SPEC` existed there was no cached multi-row
             // pass to time. There is one now, and the cached lane is worse:
-            // 60-token runs on the two-node pipe, p50 of the whole cycle,
+            // 100-token runs on the two-node pipe, warm p50 of the whole cycle,
+            // a five-token prompt, two runs per arm,
             //
             //     INK_SPEC=0  w=1  127.1 ms      c = 1.000
-            //     INK_SPEC=1  w=2  208.2 ms      c = 1.638
-            //     INK_SPEC=2  w=3  238.0 ms      c = 1.872
-            //     INK_SPEC=3  w=4  277.6 ms      c = 2.184
+            //     INK_SPEC=1  w=2  205.0 ms      c = 1.613
+            //     INK_SPEC=2  w=3  239.3 ms      c = 1.883
+            //     INK_SPEC=3  w=4  283.0 ms      c = 2.227
             //
-            // against 1.000 / 1.332 / 1.434 / ~1.52 uncached. The gap is not
-            // the extra rows -- the tail's own half costs 76.2 ms at w = 1 and
-            // 119.6 / 120.4 / 119.8 ms at w = 2, 3, 4, which is FLAT once the
-            // second row exists. It is `gemv plane par`: a cached decode step
-            // is weight-streaming-bound, that lane is the only one that reaches
-            // the roofline, and it requires m == 1. Losing it costs 1.33x at
-            // m == 1 alone (70.1/73.0 ms against 96.2/93.3, measured in
-            // `bf16gemm`), and a verify pass loses it by definition. So the
-            // width penalty on this lane is a STEP, not a slope, and the number
-            // to beat is a narrow lane that streams at the gemv's bandwidth --
-            // not a smaller k.
+            // against 1.000 / 1.332 / 1.434 / ~1.52 uncached, and against
+            // 1.000 / 1.521 / 1.817 on a 3732-token document, where a wider
+            // pass is a smaller fraction of a slower one.
+            //
+            // A STEP, not a slope: the penalty is nearly all at the second row
+            // and flat after it. Two things make it. `gemv plane par` requires
+            // m == 1, a cached decode step is weight-streaming-bound, and that
+            // lane is the only one reaching the roofline -- losing it costs
+            // 1.33x at m == 1 alone (70.1/73.0 ms against 96.2/93.3, measured
+            // in `bf16gemm`). And the four short convolutions a layer ran
+            // slice-built above one row, which per-stage timing puts at 49 of
+            // the 52 ms the second row added.
             let c2: f64 = std::env::var("INK_SPEC_C2")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(1.638);
+                .unwrap_or(1.613);
             if !mtp_conf[0].is_empty() {
                 println!("\n=== depth-1 acceptance against the draft head's own confidence ===");
                 println!("  c(2) = {c2:.3} (INK_SPEC_C2); a k=1 loop that always speculates:");
