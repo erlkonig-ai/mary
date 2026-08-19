@@ -284,8 +284,9 @@ impl Weights {
         &mut self,
         layers: std::ops::Range<usize>,
         global_dense: &[&str],
+        attention_bytes: u64,
     ) -> Result<(usize, usize, u64)> {
-        self.src.copy_share(layers, global_dense)
+        self.src.copy_share(layers, global_dense, attention_bytes)
     }
 
     // ---- what the source SAYS about itself --------------------------------

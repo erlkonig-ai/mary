@@ -51,6 +51,13 @@ pub mod sconv;
 // and sliding window -- as one kernel over `[heads, n, n]` instead of five
 // materialised tensors of that shape and two host loops over `n^2`.
 pub mod scorebias;
+// What one attention layer asks the allocator for, and whether this device
+// will give it: the `[heads, n, n]` score matrix against the per-buffer cap
+// cubecl sets at `cuDeviceTotalMem / 4`.
+pub mod budget;
+// A panic on any thread ends the process. Without it, a refused allocation
+// panics a cubecl worker and the run exits 0 with a plausible wrong answer.
+pub mod fatal;
 // The MMA's M padding, written by the kernel that was already producing the
 // buffer instead of by a `zeros` and a `cat` beside it.
 pub mod pad;

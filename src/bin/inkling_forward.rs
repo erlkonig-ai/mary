@@ -105,6 +105,8 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 
 use mary::models::inkling::attn::{AttnDims, AttnWeights, LogScaling};
+use mary::models::inkling::budget;
+use mary::models::inkling::fatal;
 use mary::models::inkling::block::{rms_norm, route_from_logits, Routing};
 use mary::models::inkling::config::{AttnKind, InklingConfig};
 use mary::models::inkling::load::{split_gate_up, Held};
@@ -1645,6 +1647,12 @@ fn expert_rows<B: Backend>(
 }
 
 fn main() -> Result<()> {
+    // FIRST, before anything can allocate. A refused device buffer panics a
+    // cubecl worker thread, and a worker-thread panic leaves this one running:
+    // the forward then read a buffer nothing had written, exited 0, and printed
+    // a layer-RMS ladder of 36.7..80.3 where the coherent one is 1.5..14.7.
+    fatal::arm();
+
     let pile_path = std::env::args().nth(1).map(PathBuf::from).context("usage: <pile> <ids> <out>")?;
     let ids_path = std::env::args().nth(2).map(PathBuf::from).context("usage: <pile> <ids> <out>")?;
     let out_path = std::env::args().nth(3).map(PathBuf::from).context("usage: <pile> <ids> <out>")?;
@@ -1744,6 +1752,10 @@ fn main() -> Result<()> {
         .collect();
     let n = ids.len();
     anyhow::ensure!(n > 0, "no tokens — the forward would be vacuous");
+    // So a crash can name what caused it. Set again per pass below, because a
+    // pipe tail takes its length from the wire and a cached step feeds one
+    // token, and both are the number that would appear in a refused size.
+    fatal::note_tokens(n);
 
     let h = t.hidden_size;
     println!("=== forward ===");
@@ -1836,6 +1848,14 @@ fn main() -> Result<()> {
     // nothing else changes about which end holds what. The embedding NORM stays
     // head-only: it belongs to the main stack's input, and every MTP head norms
     // its own embeddings with its own `embed_norm`.
+    // What prefill will hold in `[heads, n, n]` score matrices, which is the
+    // largest thing this run allocates and the only term that grows as `n^2`.
+    // The admission gate charged a flat per-layer figure for "activations"
+    // regardless of sequence length, which is how it admitted a run that peaked
+    // at 119.5 GiB of a 119.6 GiB node.
+    let attn_heads = t.heads(AttnKind::Global).0.max(t.heads(AttnKind::Local).0);
+    let attention_bytes = budget::prefill_peak_bytes(attn_heads, n);
+
     let want_embed = !is_tail || mtp_k > 0;
     let want_embed_norm = !is_tail;
     let want_head = !is_head;
@@ -1854,7 +1874,7 @@ fn main() -> Result<()> {
             globals.push("model.llm.unembed.weight");
         }
         let t0 = Instant::now();
-        let (experts, dense, bytes) = cp.copy_share(lo..hi, &globals)?;
+        let (experts, dense, bytes) = cp.copy_share(lo..hi, &globals, attention_bytes)?;
         println!(
             "  startup weight copy: {experts} expert + {dense} dense views, {:.2} GiB anonymous in {:.1}s",
             bytes as f64 / GIB,
@@ -2141,6 +2161,19 @@ fn main() -> Result<()> {
         &BT::<Bk, 2>::zeros([1, 1], &dev),
     );
     println!("{}", mary::models::inkling::pile::mem_line("after CUDA context"));
+    // The one number that decides whether this sequence length is runnable at
+    // all, asked of the device rather than modelled. It is checked HERE and not
+    // beside the admission gate because this is the first client in the
+    // process, and taking `max_page_size` from a client Burn did not make would
+    // be reading a different device's answer. Nothing has run a layer yet.
+    println!(
+        "  attention budget   : [{attn_heads}, {n}, {n}] f32 scores = {:.2} GiB per layer, \
+         largest single allocation this device allows {:.2} GiB (up to {} tokens)",
+        budget::score_matrix_bytes(attn_heads, n) as f64 / GIB,
+        budget::largest_allocation(&fp4_client) as f64 / GIB,
+        budget::longest_sequence(attn_heads, budget::largest_allocation(&fp4_client)),
+    );
+    budget::check(&fp4_client, attn_heads, n)?;
     // Nine blocking device round trips for the whole run, instead of four per
     // expert. Every later slab is an offset view of one of these.
     //
@@ -2406,6 +2439,7 @@ fn main() -> Result<()> {
             (n, pos0, embed_and_norm_bf16(&feed, e_w, &e_n.data, t.rms_norm_eps, t.vocab_size, h))
         }
     };
+    fatal::note_tokens(n);
 
     let dump_dir = std::env::var("INK_DUMP_DIR").ok();
     if let Some(dir) = dump_dir.as_ref() {
