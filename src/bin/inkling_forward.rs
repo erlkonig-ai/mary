@@ -2082,6 +2082,17 @@ fn main() -> Result<()> {
     // RUN did, not what one token did.
     let mut route_diff = vec![RouteDiff::default(); t.num_hidden_layers];
 
+    // SCRATCH PROBE (INK_ROUTE_PROBE=1): cache the HOST routing decision per
+    // layer across passes. With INK_REPEAT=1 (or a repeated decode step) the
+    // router logits are identical every pass, so the cached decision is the
+    // same decision -- the device work, the readback and the expert lane are
+    // all unchanged, and the only thing removed is the host top-k + grouping.
+    // This prices `t_rt_host` against wall clock. NOT FOR MAIN.
+    let route_probe = std::env::var("INK_ROUTE_PROBE").map(|v| v == "1").unwrap_or(false);
+    #[allow(clippy::type_complexity)]
+    let mut route_cache: std::collections::HashMap<usize, (Vec<Routing>, BTreeMap<usize, Vec<(usize, f32)>>)> =
+        std::collections::HashMap::new();
+
     let mut top_all: Vec<i64> = Vec::new();
     for step in 0..=gen_steps {
     // A tail's step BEGINS on the wire, and it waits before its own timers
@@ -2464,10 +2475,14 @@ fn main() -> Result<()> {
             let logits = drop_pad_cols(down(lg), n, cols, rows);
             t_rt_read += t_rr.elapsed().as_secs_f64();
             let t_rh = Instant::now();
-            let routing: Vec<Routing> = route_from_logits(
-                &logits, &r.bias, r.global_scale, t.route_scale as f32,
-                n, t.n_routed_experts, t.n_shared_experts, t.num_experts_per_tok,
-            );
+            let cached = if route_probe { route_cache.get(&layer).cloned() } else { None };
+            let routing: Vec<Routing> = match &cached {
+                Some((r, _)) => r.clone(),
+                None => route_from_logits(
+                    &logits, &r.bias, r.global_scale, t.route_scale as f32,
+                    n, t.n_routed_experts, t.n_shared_experts, t.num_experts_per_tok,
+                ),
+            };
 
             // `INK_ROUTER_DIFF=1`: the same activation through the f32 lane,
             // the same selection rule on the result, and a count of where the
@@ -2492,12 +2507,21 @@ fn main() -> Result<()> {
             }
 
             // Group tokens by expert, so each slab is read once.
-            let mut by_expert: BTreeMap<usize, Vec<(usize, f32)>> = BTreeMap::new();
-            for (ti, rt) in routing.iter().enumerate() {
-                for (slot, &e) in rt.experts.iter().enumerate() {
-                    by_expert.entry(e).or_default().push((ti, rt.weights[slot]));
+            let by_expert: BTreeMap<usize, Vec<(usize, f32)>> = match cached {
+                Some((_, g)) => g,
+                None => {
+                    let mut by_expert: BTreeMap<usize, Vec<(usize, f32)>> = BTreeMap::new();
+                    for (ti, rt) in routing.iter().enumerate() {
+                        for (slot, &e) in rt.experts.iter().enumerate() {
+                            by_expert.entry(e).or_default().push((ti, rt.weights[slot]));
+                        }
+                    }
+                    if route_probe {
+                        route_cache.insert(layer, (routing.clone(), by_expert.clone()));
+                    }
+                    by_expert
                 }
-            }
+            };
             t_rt_host += t_rh.elapsed().as_secs_f64();
             t_h_route += t_rt.elapsed().as_secs_f64();
 

@@ -66,3 +66,7 @@ pub mod fp4gemm;
 // off the host and into the grid: one launch per stage per layer, with the
 // block index selecting the expert. Same kernels, same order, same bits.
 pub mod moegroup;
+// The router DECISION -- sigmoid, top-k, log-softmax -- on the device. The
+// projection was already there; this is the 66 ms of host sort that sat between
+// the readback and the expert launch at prefill.
+pub mod routetopk;
