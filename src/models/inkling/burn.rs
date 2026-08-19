@@ -456,6 +456,23 @@ pub fn attention_prefill(
     (linear_bf16(out, &w.wo), cache)
 }
 
+/// How far a decode step rounds its context length up, from `INK_KV_PAD`.
+///
+/// 64 by default, which is what turns a 40-step generation from 81 in-loop
+/// kernel compilations into a handful; `1` is the unpadded arm, which is
+/// exactly what [`attention_step`] did before. Read once per process: this sits
+/// inside the token loop, once per attention layer per step.
+fn kv_pad_bucket() -> usize {
+    static BUCKET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BUCKET.get_or_init(|| {
+        std::env::var("INK_KV_PAD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(64)
+    })
+}
+
 /// One generated token through one attention layer, reading the cache.
 ///
 /// The whole point of the cache: `x` is the single new position, `pos` is its
@@ -512,6 +529,26 @@ pub fn attention_step(
     trim(cache, window);
     let len = cache.len();
     let base = cache.base;
+    // The context length ROUNDED UP to a bucket, and the length every shape in
+    // this function is built at.
+    //
+    // Every step of a cached generation attends over one more key than the last
+    // one, and cubecl keys its compiled kernels on the shapes it is handed: the
+    // score matmul gets a fresh tiling blueprint, and every elementwise and
+    // reduce kernel over the `[heads, 1, len]` score row gets a fresh line size
+    // as `len` walks through the residues mod 4 and the layouts flip between
+    // plain and strided. Measured on an 8-layer node with `INK_KV=1`: 81 kernel
+    // compilations inside the token loop over 40 steps, and the correlation
+    // with the step cost is exact -- every step that compiled nothing took
+    // 46.1-47.6 ms and every step that compiled anything took 54-296 ms, about
+    // 1.2 s of extra latency at the head of the generation.
+    //
+    // Rounding to a multiple of `INK_KV_PAD` collapses that: 64 lengths become
+    // one shape, and the padded keys are masked to `-inf` so the softmax gives
+    // them exactly zero weight. `INK_KV_PAD=1` is the unpadded arm, which is
+    // what this function did before.
+    let bucket = kv_pad_bucket();
+    let padded = len.next_multiple_of(bucket);
 
     let tau = match (d.kind, log_scaling) {
         (AttnKind::Global, Some(ls)) => ls.tau(pos),
@@ -523,9 +560,15 @@ pub fn attention_step(
     // backward distance to each retained key, whether the relative table
     // reaches that far, and whether the window admits it at all. Built on the
     // host because `len` is the context length, not a matrix.
-    let mut idx = vec![0i32; len];
-    let mut valid = vec![0f32; len];
-    let mut wmask = vec![0f32; len];
+    //
+    // `padded`, not `len`: the tail beyond the real keys carries index 0 (in
+    // range for the gather, and multiplied out by `valid = 0`) and `-inf` in
+    // the mask, so it contributes nothing to the softmax and nothing to the
+    // value average. There is always at least one real key, so no row is
+    // entirely `-inf`.
+    let mut idx = vec![0i32; padded];
+    let mut valid = vec![0f32; padded];
+    let mut wmask = vec![0f32; padded];
     let mut max_dist = 0usize;
     for j in 0..len {
         // Every retained key is at or before `pos`, so this cannot go negative.
@@ -539,11 +582,18 @@ pub fn attention_step(
         }
         max_dist = max_dist.max(dist);
     }
-    let eff = d.rel_extent.min(max_dist + 1);
+    for slot in wmask.iter_mut().take(padded).skip(len) {
+        *slot = f32::NEG_INFINITY;
+    }
+    // Bucketed for the same reason: `eff` grows one per step until it saturates
+    // at `rel_extent`, and it is the width of the relative-projection matmul
+    // and of the gather it feeds. Rounding up only ever admits COLUMNS the
+    // gather does not index, because every `idx` is `< max_dist + 1 <= eff`.
+    let eff = d.rel_extent.min(max_dist + 1).next_multiple_of(bucket).min(d.rel_extent);
     let idx: Tensor<Bk, 3, Int> =
-        Tensor::from_data(TensorData::new(idx, [1, 1, len]), &dev).repeat_dim(0, heads);
-    let valid: Tensor<Bk, 3> = Tensor::from_data(TensorData::new(valid, [1, 1, len]), &dev);
-    let wmask: Tensor<Bk, 3> = Tensor::from_data(TensorData::new(wmask, [1, 1, len]), &dev);
+        Tensor::from_data(TensorData::new(idx, [1, 1, padded]), &dev).repeat_dim(0, heads);
+    let valid: Tensor<Bk, 3> = Tensor::from_data(TensorData::new(valid, [1, 1, padded]), &dev);
+    let wmask: Tensor<Bk, 3> = Tensor::from_data(TensorData::new(wmask, [1, 1, padded]), &dev);
 
     let rel = r
         .reshape([heads, d.d_rel])
@@ -554,14 +604,24 @@ pub fn attention_step(
 
     let qh = q.reshape([1, heads, head_dim]).swap_dims(0, 1);
     let expand = |t: Tensor<Bk, 2>| -> Tensor<Bk, 3> {
-        t.reshape([len, kv_heads, head_dim])
+        t.reshape([padded, kv_heads, head_dim])
             .swap_dims(0, 1)
-            .reshape([kv_heads, 1, len, head_dim])
+            .reshape([kv_heads, 1, padded, head_dim])
             .repeat_dim(1, groups)
-            .reshape([heads, len, head_dim])
+            .reshape([heads, padded, head_dim])
     };
-    let kh = expand(cache.k.clone());
-    let vh = expand(cache.v.clone());
+    // Zeros, not uninitialized rows: the padded keys score 0 against any query
+    // (harmless, the mask removes them) but the padded VALUES are multiplied by
+    // a probability of exactly zero, and `0 * NaN` is NaN.
+    let pad_rows = |t: Tensor<Bk, 2>| -> Tensor<Bk, 2> {
+        if padded == len {
+            return t;
+        }
+        let dim = t.dims()[1];
+        Tensor::cat(vec![t, Tensor::zeros([padded - len, dim], &dev)], 0)
+    };
+    let kh = expand(pad_rows(cache.k.clone()));
+    let vh = expand(pad_rows(cache.v.clone()));
 
     let scores = qh.matmul(kh.swap_dims(1, 2)).mul_scalar(d.scaling()) + bias + wmask;
     let probs = burn::tensor::activation::softmax(scores, 2);
