@@ -131,6 +131,22 @@
 //! loop is here. A change that wants that half of the machine -- a within-layer
 //! split, most obviously -- is not competing with speculation for it.
 //!
+//! # How a speculative token rate gets to be three times too good
+//!
+//! A verify pass `w + 1` rows wide can yield at most `w + 1` tokens. It does
+//! not: the leading accepted run is what a loop keeps, and that run measures
+//! 1.6 tokens per pass here and saturates -- widening `w` past 2 buys nothing,
+//! because the acceptance rate falls faster than the row count rises. Dividing
+//! a pass's cost by `w + 1` rather than by the measured mean is where a
+//! 40 ms/token speculative rate comes from, and at w = 5 that is a factor of
+//! 3.7 optimistic. A 240 ms pass yielding 1.6 tokens is 150 ms a token, which
+//! is SLOWER than the 126.8 ms one row costs.
+//!
+//! This is not hypothetical arithmetic: the same conclusion falls out of a
+//! wired accept-and-skip loop, which reads 0.916x at w = 1, 0.866x at w = 2 and
+//! 0.742x at w = 3 against an unspeculated 127.1 ms baseline -- a baseline that
+//! is also an independent confirmation of the 126.8 ms above.
+//!
 //! # One lane, all the way down
 //!
 //! There is nothing to select. Attention, the dense and shared MLPs, the head
