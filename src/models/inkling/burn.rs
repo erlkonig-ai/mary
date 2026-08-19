@@ -190,16 +190,32 @@ pub fn short_conv_step(
 /// it is made of are gone once the batch is over. Same reasoning as
 /// [`AttnCache`]'s `Pending`, and for the same reason: a verifier decides late.
 ///
-/// Generic and slice-built rather than one kernel like [`short_conv_step`]:
-/// this runs four times a layer per VERIFY pass, not per position, and the
-/// window it convolves is `kernel - 1 + rows` rows of real input with no
-/// front-padding reached — which is exactly [`short_conv`] over the
-/// concatenation, sliced.
-pub fn short_conv_steps<B: Backend>(
-    hist: Tensor<B, 2>,
-    x: Tensor<B, 2>,
-    weight: Tensor<B, 2>,
-) -> (Tensor<B, 2>, Tensor<B, 2>) {
+/// ONE kernel, like [`short_conv_step`] and for the same reason.
+///
+/// This was slice-built — [`short_conv`] over the concatenation, sliced — on
+/// the reasoning that it runs four times a layer per VERIFY pass rather than
+/// per position, so the launch count this module exists to remove would not
+/// matter here. Measured on the two-node pipe it dominates: the MLP's single
+/// convolution costs 1.4 ms a pass at one row and **32.7 ms at two**, a step
+/// that is 60% of the whole one-row-to-two-row penalty and is paid again by
+/// the two convolutions inside [`attention_steps`]. A widened pass is not four
+/// calls, it is four calls times twenty-one layers, and the shifted-slice form
+/// describes each of them with a `cat`, `kernel` slices, `kernel` broadcast
+/// multiplies and `kernel` adds.
+///
+/// The window it returns is unchanged and is still the point: a rollback is a
+/// slice of it, and the pre-convolution projections it is made of are gone once
+/// the batch is over. Same reasoning as [`AttnCache`]'s `Pending`.
+///
+/// The taps now contract to `fma.rn.f32` exactly as [`short_conv_step`]'s do,
+/// so `rows == 1` through here is BIT-IDENTICAL to the one-row lane. Under the
+/// slice form it was not, and that difference was one more thing separating a
+/// widened pass's arithmetic from a narrow one's.
+pub fn short_conv_steps(
+    hist: Tensor<Bk, 2>,
+    x: Tensor<Bk, 2>,
+    weight: Tensor<Bk, 2>,
+) -> (Tensor<Bk, 2>, Tensor<Bk, 2>) {
     let [rows, dim] = x.dims();
     let [wdim, kernel] = weight.dims();
     assert_eq!(dim, wdim, "short_conv_steps: x is [_, {dim}] but the weight is [{wdim}, _]");
@@ -210,9 +226,41 @@ pub fn short_conv_steps<B: Backend>(
         kernel - 1
     );
     let all = Tensor::cat(vec![hist, x], 0);
-    let h = kernel - 1;
-    let out = short_conv(all.clone(), weight).slice([h..h + rows, 0..dim]);
-    (out, all)
+    (short_conv_window(all.clone(), weight, rows), all)
+}
+
+/// The same convolution over a window the caller already holds.
+///
+/// [`short_conv_steps`] concatenates a history onto a batch and then convolves
+/// it; [`attention_steps`] has built that concatenation for K and V already,
+/// and re-splitting it into (history, batch) so this function could re-join
+/// them would be two copies to describe an identity.
+///
+/// `all` is `[kernel - 1 + rows, dim]` and the output is its LAST `rows` rows —
+/// the front `kernel - 1` are history and every output row reads a full window
+/// of real input, so [`short_conv`]'s front zero-padding is never reached here.
+pub fn short_conv_window(
+    all: Tensor<Bk, 2>,
+    weight: Tensor<Bk, 2>,
+    rows: usize,
+) -> Tensor<Bk, 2> {
+    let [len, dim] = all.dims();
+    let [wdim, kernel] = weight.dims();
+    assert_eq!(dim, wdim, "short_conv_window: the window is [_, {dim}] but the weight is [{wdim}, _]");
+    assert_eq!(
+        len,
+        kernel - 1 + rows,
+        "a {rows}-row convolution wants {} window rows, got {len}",
+        kernel - 1 + rows
+    );
+    let client = client_of(&all);
+    let dev = all.device();
+    let h_all = handle_of(all);
+    let h_w = handle_of(weight);
+    let out = crate::models::inkling::sconv::short_conv_batch(
+        &client, &h_all, &h_w, dim, rows, kernel,
+    );
+    tensor_of(client, dev, out, rows, dim)
 }
 
 /// Depthwise causal short convolution **plus its internal residual**, on device.
@@ -943,8 +991,12 @@ pub fn attention_steps(
     let hist = d.kernel - 1;
     let kdim = k_all.dims()[1];
     let vdim = v_all.dims()[1];
-    let k_new = short_conv(k_all.clone(), w.k_sconv.clone()).slice([hist..hist + rows, 0..kdim]);
-    let v_new = short_conv(v_all.clone(), w.v_sconv.clone()).slice([hist..hist + rows, 0..vdim]);
+    // The batched kernel, not [`short_conv`] over the concatenation: this is
+    // the second and third of the four convolutions a widened pass runs per
+    // layer, and the shifted-slice form is what made a two-row pass cost 1.6x
+    // a one-row one.
+    let k_new = short_conv_window(k_all.clone(), w.k_sconv.clone(), rows);
+    let v_new = short_conv_window(v_all.clone(), w.v_sconv.clone(), rows);
     let r = linear_bf16(x, &w.wr);
 
     let q = head_rms_norm(q, w.q_norm.clone(), heads, head_dim, d.rms_eps);
