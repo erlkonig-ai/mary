@@ -1039,7 +1039,7 @@ fn grouped_experts_fp4(
     use mary::models::inkling::fp4gemm::gate_up_silu_launch;
     use mary::models::inkling::fp4quant::quantize_nvfp4;
     use mary::models::inkling::moegroup::{
-        fp4_linear_grouped_launch, gather_grouped, scatter_weighted, RowPlan,
+        fp4_linear_grouped_launch, gather_grouped, scatter_weighted, BlockPlanDev, RowPlan,
     };
     use mary::models::inkling::seam::{handle_of, tensor_of};
 
@@ -1076,7 +1076,14 @@ fn grouped_experts_fp4(
         }
         // The packed planes are read as 4-byte vectors out of the mapping, so
         // an offset that does not land on one cannot be expressed as an index.
-        if o[0] % 4 != 0 || o[2] % 4 != 0 {
+        // The SCALE planes are read the same way now -- the instruction takes
+        // its four E4M3 block scales as one 32-bit register, so the kernel
+        // fetches them as one -- which puts `o[1]` and `o[3]` under the same
+        // rule. The startup copy packs every view to a 4-byte boundary, so this
+        // refuses nothing it did not already refuse; it is here because the
+        // kernel is launched unchecked and an unaligned scale plane would be
+        // read one vector to the left of where it starts.
+        if o.iter().any(|v| v % 4 != 0) {
             return Ok(None);
         }
         off13.push(o[0]);
@@ -1102,12 +1109,18 @@ fn grouped_experts_fp4(
     // second-level scales and the token->rows table. Nine small uploads for the
     // whole layer, against two per expert before.
     let t_g = Instant::now();
-    let plan = RowPlan::build(by_expert.values(), n);
+    let plan = RowPlan::build(by_expert.values(), n, RowPlan::planes());
     let m_total = plan.m_total();
     let hn_h = handle_of(hn.clone());
     let h_rowtok = client.create_from_slice(bytes_of(&plan.row_tok));
     let h_rowwgt = client.create_from_slice(bytes_of(&plan.row_wgt));
-    let h_tile = client.create_from_slice(bytes_of(&plan.tile_slot));
+    let blk = BlockPlanDev {
+        slot: client.create_from_slice(bytes_of(&plan.blk_slot)),
+        tile0: client.create_from_slice(bytes_of(&plan.blk_tile0)),
+        cnt: client.create_from_slice(bytes_of(&plan.blk_cnt)),
+        blocks: plan.blk_slot.len(),
+        planes: RowPlan::planes(),
+    };
     let h_off13 = client.create_from_slice(bytes_of(&off13));
     let h_off2 = client.create_from_slice(bytes_of(&off2));
     let h_sc13 = client.create_from_slice(bytes_of(&sc13));
@@ -1120,13 +1133,13 @@ fn grouped_experts_fp4(
     let t_w = Instant::now();
     let (a, asc) = quantize_nvfp4(client, &x_h, m_total, h);
     let both = fp4_linear_grouped_launch(
-        client, &a, &asc, &wmap, wmap_bytes, &h_tile, &h_off13, &h_sc13, slots, m_total, h,
+        client, &a, &asc, &wmap, wmap_bytes, &blk, &h_off13, &h_sc13, slots, m_total, h,
         2 * inter,
     );
     let act_h = gate_up_silu_launch(client, &both, m_total, inter);
     let (a2, asc2) = quantize_nvfp4(client, &act_h, m_total, inter);
     let y_h = fp4_linear_grouped_launch(
-        client, &a2, &asc2, &wmap, wmap_bytes, &h_tile, &h_off2, &h_sc2, slots, m_total, inter, h,
+        client, &a2, &asc2, &wmap, wmap_bytes, &blk, &h_off2, &h_sc2, slots, m_total, inter, h,
     );
     host.enqueue += t_w.elapsed().as_secs_f64();
 
@@ -1299,7 +1312,7 @@ fn grouped_experts_bf16(
     use mary::models::inkling::bf16gemm::to_bf16_launch;
     use mary::models::inkling::fp4gemm::gate_up_silu_bf16_launch;
     use mary::models::inkling::moegroup::{
-        bf16_linear_grouped_launch, gather_grouped, scatter_weighted, RowPlan,
+        bf16_linear_grouped_launch, gather_grouped, scatter_weighted, BlockPlanDev, RowPlan,
     };
     use mary::models::inkling::seam::{handle_of, tensor_of};
 
@@ -1349,12 +1362,18 @@ fn grouped_experts_bf16(
     host.slice += t_s.elapsed().as_secs_f64();
 
     let t_g = Instant::now();
-    let plan = RowPlan::build(by_expert.values(), n);
+    let plan = RowPlan::build(by_expert.values(), n, RowPlan::planes());
     let m_total = plan.m_total();
     let hn_h = handle_of(hn.clone());
     let h_rowtok = client.create_from_slice(bytes_of(&plan.row_tok));
     let h_rowwgt = client.create_from_slice(bytes_of(&plan.row_wgt));
-    let h_tile = client.create_from_slice(bytes_of(&plan.tile_slot));
+    let blk = BlockPlanDev {
+        slot: client.create_from_slice(bytes_of(&plan.blk_slot)),
+        tile0: client.create_from_slice(bytes_of(&plan.blk_tile0)),
+        cnt: client.create_from_slice(bytes_of(&plan.blk_cnt)),
+        blocks: plan.blk_slot.len(),
+        planes: RowPlan::planes(),
+    };
     let h_off13 = client.create_from_slice(bytes_of(&off13));
     let h_off2 = client.create_from_slice(bytes_of(&off2));
     let h_tokrows = client.create_from_slice(bytes_of(&plan.tok_rows));
@@ -1365,11 +1384,11 @@ fn grouped_experts_bf16(
     let t_w = Instant::now();
     let a = to_bf16_launch(client, &x_h, m_total * h, m_total * h);
     let both = bf16_linear_grouped_launch(
-        client, &a, &wmap, wmap_bytes, &h_tile, &h_off13, slots, m_total, h, 2 * inter,
+        client, &a, &wmap, wmap_bytes, &blk, &h_off13, slots, m_total, h, 2 * inter,
     );
     let act = gate_up_silu_bf16_launch(client, &both, m_total, inter);
     let y_h = bf16_linear_grouped_launch(
-        client, &act, &wmap, wmap_bytes, &h_tile, &h_off2, slots, m_total, inter, h,
+        client, &act, &wmap, wmap_bytes, &blk, &h_off2, slots, m_total, inter, h,
     );
     host.enqueue += t_w.elapsed().as_secs_f64();
 
@@ -2082,6 +2101,18 @@ fn main() -> Result<()> {
     // RUN did, not what one token did.
     let mut route_diff = vec![RouteDiff::default(); t.num_hidden_layers];
 
+    // `INK_DEV_ROUTE=0` puts the router's DECISION back on the host. It is on
+    // by default; the flag exists so the two lanes can be interleaved from one
+    // binary, which is the only honest way to price a 15% change against a
+    // 2-3 ms pass-to-pass drift.
+    let dev_route = std::env::var("INK_DEV_ROUTE").map(|v| v != "0").unwrap_or(true);
+    // The gate bias is `[n_routed]` f32 and does not change during a run, so it
+    // is uploaded once per layer rather than once per pass. One KiB either way;
+    // it is here because a per-pass upload in a lane whose whole subject is
+    // host->device round trips would be embarrassing.
+    let mut bias_dev: std::collections::HashMap<usize, cubecl::server::Handle> =
+        std::collections::HashMap::new();
+
     let mut top_all: Vec<i64> = Vec::new();
     for step in 0..=gen_steps {
     // A tail's step BEGINS on the wire, and it waits before its own timers
@@ -2460,14 +2491,119 @@ fn main() -> Result<()> {
             };
             t_rt_mm += t_rt.elapsed().as_secs_f64();
             stage_sync!(d_router);
-            let t_rr = Instant::now();
-            let logits = drop_pad_cols(down(lg), n, cols, rows);
-            t_rt_read += t_rr.elapsed().as_secs_f64();
+            // Two lanes, and the difference is WHERE the top-k runs, not what
+            // it decides. The host lane reads `[n, rows]` f32 back and sorts;
+            // the device lane runs `routetopk` on the logits where they already
+            // are and reads back `[n, 2k + shared + 1]`, which at 512 tokens is
+            // 30 KB against 528 KB and, more to the point, is 512 rows of
+            // 256-wide selection the host no longer walks.
+            //
+            // The reference arm below wants the full host logits, so it selects
+            // the host lane: a diagnostic that changed the lane it measures
+            // would be measuring itself.
+            let host_route = !dev_route || r.reference.is_some();
+            let routing: Vec<Routing>;
+            let mut logits: Vec<f32> = Vec::new();
+            if host_route {
+                let t_rr = Instant::now();
+                logits = drop_pad_cols(down(lg), n, cols, rows);
+                t_rt_read += t_rr.elapsed().as_secs_f64();
+                let t_rh = Instant::now();
+                routing = route_from_logits(
+                    &logits, &r.bias, r.global_scale, t.route_scale as f32,
+                    n, t.n_routed_experts, t.n_shared_experts, t.num_experts_per_tok,
+                );
+                t_rt_host += t_rh.elapsed().as_secs_f64();
+            } else {
+                use mary::models::inkling::routetopk::router_topk_launch;
+                use mary::models::inkling::seam::{handle_of, tensor_of};
+                let k = t.num_experts_per_tok;
+                let ns = t.n_shared_experts;
+                let width = 2 * k + ns + 1;
+                let bias_h = bias_dev
+                    .entry(layer)
+                    .or_insert_with(|| fp4_client.create_from_slice(bytes_of(&r.bias)))
+                    .clone();
+                let t_rt2 = Instant::now();
+                let lg_h = handle_of(lg);
+                let out_h = router_topk_launch(
+                    &fp4_client, &lg_h, &bias_h, n, cols, t.n_routed_experts, ns, k,
+                    t.route_scale as f32 * r.global_scale,
+                );
+                t_rt_mm += t_rt2.elapsed().as_secs_f64();
+                let t_rr = Instant::now();
+                let flat = down(tensor_of(fp4_client.clone(), dev.clone(), out_h, n, width));
+                t_rt_read += t_rr.elapsed().as_secs_f64();
+                let t_rh = Instant::now();
+                let mut rs = Vec::with_capacity(n);
+                for ti in 0..n {
+                    let row = &flat[ti * width..(ti + 1) * width];
+                    let bad = row[width - 1] as u32;
+                    assert!(
+                        bad == 0,
+                        "router logit is non-finite at token {ti}, row {}",
+                        bad - 1
+                    );
+                    rs.push(Routing {
+                        experts: row[..k].iter().map(|&v| v as usize).collect(),
+                        weights: row[k..2 * k].to_vec(),
+                        shared_gammas: row[2 * k..2 * k + ns].to_vec(),
+                    });
+                }
+                routing = rs;
+                // `INK_ROUTE_DBG=1`: the SAME logits through the host rule, and
+                // a count of where the two lanes disagree. It reads the logits
+                // back and routes twice, so it is slower than either lane and
+                // is not a lane -- but it compares the two on ONE input, which
+                // is the thing two separate runs cannot do. A device router and
+                // a host router started from the same prompt part company after
+                // a few layers no matter how right they both are: the routing
+                // weights differ in the eighth decimal, the residual stream
+                // carries that forward, and a later layer has a near-tie at the
+                // top-k boundary that falls the other way. That is chaos, not
+                // error, and only a same-input comparison can tell them apart.
+                if std::env::var("INK_ROUTE_DBG").is_ok() {
+                    let hl = drop_pad_cols(
+                        down(tensor_of(fp4_client.clone(), dev.clone(), lg_h.clone(), n, cols)),
+                        n, cols, rows,
+                    );
+                    let hr = route_from_logits(
+                        &hl, &r.bias, r.global_scale, t.route_scale as f32,
+                        n, t.n_routed_experts, ns, k,
+                    );
+                    let mut bad = 0usize;
+                    let mut worst_w = 0f32;
+                    for ti in 0..n {
+                        for j in 0..k {
+                            let d = (routing[ti].weights[j] - hr[ti].weights[j]).abs();
+                            if d > worst_w {
+                                worst_w = d;
+                            }
+                        }
+                        for j in 0..ns {
+                            let d = (routing[ti].shared_gammas[j] - hr[ti].shared_gammas[j]).abs();
+                            if d > worst_w {
+                                worst_w = d;
+                            }
+                        }
+                        if hr[ti].experts != routing[ti].experts {
+                            bad += 1;
+                            if bad <= 4 {
+                                println!(
+                                    "ROUTEDBG layer {layer} t {ti} host {:?} dev {:?}",
+                                    hr[ti].experts, routing[ti].experts
+                                );
+                            }
+                        }
+                    }
+                    println!(
+                        "ROUTEGATE layer {layer}: {n} rows examined, {bad} selections differ, \
+                         max |dev-host| weight {worst_w:.3e}"
+                    );
+                }
+                t_rt_host += t_rh.elapsed().as_secs_f64();
+            }
             let t_rh = Instant::now();
-            let routing: Vec<Routing> = route_from_logits(
-                &logits, &r.bias, r.global_scale, t.route_scale as f32,
-                n, t.n_routed_experts, t.n_shared_experts, t.num_experts_per_tok,
-            );
 
             // `INK_ROUTER_DIFF=1`: the same activation through the f32 lane,
             // the same selection rule on the result, and a count of where the
