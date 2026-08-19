@@ -2273,7 +2273,8 @@ fn main() -> Result<()> {
             globals.push("model.llm.unembed.weight");
         }
         let t0 = Instant::now();
-        let (experts, dense, bytes) = cp.copy_share(lo..hi, &globals, attention_bytes)?;
+        let (experts, dense, bytes) =
+            cp.copy_share(lo..hi, &globals, attention_bytes + slot_kv_bytes)?;
         println!(
             "  startup weight copy: {experts} expert + {dense} dense views, {:.2} GiB anonymous in {:.1}s",
             bytes as f64 / GIB,
@@ -4756,7 +4757,13 @@ fn main() -> Result<()> {
                  pass.elapsed().as_secs_f64() * 1e3);
         // The tail already pushed all but the last, when it answered its peer.
         if !is_tail && !repeat {
-            if new_toks.len() > 1 {
+            // Not in the slot lane: `new_toks` is one token per SLOT there, not
+            // an accepted prefix of one sequence, and extending `ids` with all
+            // of them puts seven other sequences into slot 0's stream. It is
+            // only a report -- nothing computes off `ids` in that lane -- which
+            // is exactly why it read as a plausible context length (4052
+            // against 3780) instead of as a failure.
+            if new_toks.len() > 1 && !slot_lane {
                 ids.extend_from_slice(&new_toks[..new_toks.len() - 1]);
             }
             ids.push(best);
