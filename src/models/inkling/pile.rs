@@ -206,6 +206,80 @@ impl SourceRelease {
     fn release(&self, _src: &Bytes) {}
 }
 
+/// One GiB.
+const GIB: u64 = 1 << 30;
+
+/// Total RAM this machine has, capped by a cgroup limit if one is set.
+///
+/// `MemTotal`, not `MemAvailable`. The two answer different questions and the
+/// admission gate needs both: available says whether the copy can be MADE right
+/// now, total says whether the finished process can LIVE. A box whose page
+/// cache is warm reports most of it as available -- clean file pages are
+/// reclaimable, so they count -- which is exactly how a share that cannot fit
+/// gets admitted and then thrashes.
+fn mem_total_bytes() -> Result<u64> {
+    let status = std::fs::read_to_string("/proc/meminfo").context("reading /proc/meminfo")?;
+    let kb = status
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|v| v.parse::<u64>().ok())
+        .context("/proc/meminfo has no numeric MemTotal")?;
+    let host = kb.checked_mul(1024).context("MemTotal overflow")?;
+    let cgroup = match std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
+        Ok(max) if max.trim() != "max" => {
+            max.trim().parse::<u64>().context("parsing cgroup memory.max")?
+        }
+        _ => u64::MAX,
+    };
+    Ok(host.min(cgroup))
+}
+
+/// What the run needs BESIDES the weight share.
+///
+/// On a unified-memory part the CUDA context, the device-resident activations
+/// and the anonymous arena are one pool, so the share is not the footprint --
+/// it is the footprint minus everything that has not been allocated yet. The
+/// gate that only compared the share against `MemAvailable` was measuring the
+/// first of those against a number that already counts the page cache the copy
+/// is about to want back, which is why `INK_LAYERS=0:30` (116.24 GiB of
+/// weights on a 121.6 GiB box) was ADMITTED and then thrashed.
+///
+/// The three terms, measured on this part:
+///
+/// * the CUDA context is 0.2 GiB;
+/// * device-resident activations are 4.1 GiB for a 20-layer share, hence the
+///   per-layer term -- the only one that scales with the range;
+/// * 4 GiB is left for the kernel, the shell and the page-cache working window,
+///   and that number is not a guess either. It is where the measured cliff is.
+///
+/// The ladder, on a 121.63 GiB box, caches dropped and swap reset before each
+/// row, `INK_GEN=1`, at 01211be plus this change. "free" and "swap" are read
+/// straight after the startup copy, "peak" is `/usr/bin/time -v`:
+///
+/// | `INK_LAYERS` | share | peak RSS | free | swap | outcome |
+/// |---|---|---|---|---|---|
+/// | 0:20 | 80.72 GiB | 87.16 | 30.9 | 0.0 | forward 5.9 s |
+/// | 0:28 | 109.14 | 113.9 | 4.1 | 0.0 | forward 12.5 s |
+/// | 0:29 | 112.69 | 116.3 | 1.0 | 0.0 | **`CUDA_ERROR_OUT_OF_MEMORY`** |
+/// | 0:30 | 116.24 | 117.5 | 1.0 | 1.4 | forward 45.0 s -- 3.6x 0:28 |
+///
+/// 0:29 dies outright and 0:30 survives only by swapping, so 0:28 is the
+/// honest ceiling and the floor is set to put the refusal between them: this
+/// function predicts 119.08 GiB at 0:28 against a machine of 121.63 (admitted,
+/// 2.55 GiB of nominal headroom) and 122.84 at 0:29 (refused by 1.21). The
+/// 0:30 row was taken with the OLD gate, which admitted it.
+///
+/// It derives from the machine (`MemTotal`), never from a constant: spark has
+/// 119.6 GiB and spark2 121.6, and a gate hard-coded to either is wrong on the
+/// other.
+fn run_overhead_bytes(layers: usize) -> u64 {
+    const CUDA_CONTEXT: u64 = GIB / 5;
+    const ACTIVATIONS_PER_LAYER: u64 = 41 * GIB / 200;
+    const OS_FLOOR: u64 = 4 * GIB;
+    CUDA_CONTEXT + ACTIVATIONS_PER_LAYER * layers as u64 + OS_FLOOR
+}
+
 fn mem_available_bytes() -> Result<u64> {
     let status = std::fs::read_to_string("/proc/meminfo").context("reading /proc/meminfo")?;
     let kb = status
@@ -1172,14 +1246,20 @@ impl PileSource {
         // was buying by DUPLICATING 908 MiB of weight into a fresh device
         // allocation; that arm is moot now.
         const VIEW_ALIGN: usize = 16;
+        // What each layer costs, so a refusal can name the range that WOULD
+        // fit instead of leaving the operator to bisect for it. Accumulated
+        // here because this loop is the only place the byte counts exist.
+        let mut per_layer: std::collections::BTreeMap<i64, usize> = Default::default();
+        let mut fixed_bytes = 0usize;
         let mut cursor = 0usize;
         let mut expert_offsets = Vec::with_capacity(keys.len());
-        for (name, _) in &keys {
+        for key in &keys {
             let start = cursor;
             let end = start
-                .checked_add(shapes[name].payload)
+                .checked_add(shapes[&key.0].payload)
                 .context("weight share byte count overflow")?;
             cursor = end.next_multiple_of(VIEW_ALIGN);
+            *per_layer.entry(self.experts[key].layer).or_default() += cursor - start;
             expert_offsets.push((start, end));
         }
         let mut dense_offsets = Vec::with_capacity(dense_names.len());
@@ -1189,16 +1269,88 @@ impl PileSource {
                 .checked_add(self.dense[name].bytes.len())
                 .context("weight share byte count overflow")?;
             cursor = end.next_multiple_of(VIEW_ALIGN);
+            match self.dense[name].layer.filter(|l| layers.contains(&(*l as usize))) {
+                Some(l) => *per_layer.entry(l).or_default() += cursor - start,
+                // The embedding and unembedding tables belong to no layer, so
+                // they are what a shorter range still has to pay.
+                None => fixed_bytes += cursor - start,
+            }
             dense_offsets.push((start, end));
         }
         let total = cursor;
 
+        // The admission gate. Two questions, both of which have to be yes:
+        // can the copy be MADE now (`MemAvailable`), and can the finished
+        // process LIVE (`MemTotal` against the share plus everything the run
+        // allocates after it -- see `run_overhead_bytes`).
         let available = mem_available_bytes()?;
-        anyhow::ensure!(
-            total as u64 <= available,
-            "this node's INK_LAYERS share needs {:.2} GiB of anonymous startup-copy RAM, but only {:.2} GiB is available; refusing to start because file-backed aliases can be reclaimed underneath the GPU. Give this node a smaller INK_LAYERS range or more RAM",
-            total as f64 / (1u64 << 30) as f64,
-            available as f64 / (1u64 << 30) as f64,
+        let machine = mem_total_bytes()?;
+        let n_layers = layers.len();
+        let overhead = run_overhead_bytes(n_layers);
+        let need = total as u64 + overhead;
+        let gib = |b: u64| b as f64 / GIB as f64;
+        if need > machine || total as u64 > available {
+            // The largest range starting at `layers.start` that WOULD fit. Both
+            // sides of the test grow with the layer count, so the predicate is
+            // monotone and the last k that passes is the answer; the byte
+            // counts are the exact ones this layout just computed, not an
+            // average, because a refusal that makes the operator bisect for the
+            // answer is half a bug.
+            let mut acc = fixed_bytes as u64;
+            let mut fits: Option<(usize, u64)> = None;
+            for (k, bytes) in per_layer.values().enumerate() {
+                acc += *bytes as u64;
+                let k = k + 1;
+                if acc + run_overhead_bytes(k) <= machine && acc <= available {
+                    fits = Some((k, acc));
+                }
+            }
+            let advice = match fits {
+                Some((k, share)) => format!(
+                    "The largest range that fits here is INK_LAYERS={}:{} -- {:.2} GiB of weights, \
+                     {:.2} GiB with the context and activations. Give the rest to another node.",
+                    layers.start,
+                    layers.start + k,
+                    gib(share),
+                    gib(share + run_overhead_bytes(k)),
+                ),
+                None => format!(
+                    "Not even one layer fits: layer {} alone is {:.2} GiB on top of {:.2} GiB of \
+                     tables this range cannot drop. This model needs more nodes, not a smaller \
+                     range.",
+                    layers.start,
+                    gib(*per_layer.values().next().unwrap_or(&0) as u64),
+                    gib(fixed_bytes as u64),
+                ),
+            };
+            anyhow::bail!(
+                "INK_LAYERS={}:{} is {n_layers} layers = {:.2} GiB of weights; with the CUDA \
+                 context and this node's activations that is {:.2} GiB, and this machine has \
+                 {:.2} GiB ({:.2} GiB available right now). Refusing.\n  \
+                 A share this size fits only by taking memory the GPU still needs. Measured on \
+                 a 121.63 GiB box: 0:29 (112.69 GiB) was admitted by the old gate and died with \
+                 CUDA_ERROR_OUT_OF_MEMORY, and 0:30 (116.24 GiB) survived only by taking 1.4 GiB \
+                 of swap, which cost it 45.0 s of forward against 12.5 s at 0:28. Nothing here \
+                 is reclaimable -- the arena is anonymous on purpose, so the GPU can alias it -- \
+                 so the kernel pages the weights themselves.\n  \
+                 {advice}",
+                layers.start,
+                layers.end,
+                gib(total as u64),
+                gib(need),
+                gib(machine),
+                gib(available),
+            );
+        }
+        println!(
+            "    admission: {:.2} GiB of weights + {:.2} GiB context/activations = {:.2} GiB of \
+             {:.2} GiB ({:.2} GiB of headroom, {:.2} GiB available now)",
+            gib(total as u64),
+            gib(overhead),
+            gib(need),
+            gib(machine),
+            gib(machine - need),
+            gib(available),
         );
 
         // Zeroed by the KERNEL, not by us. `Vec::resize(total, 0)` wrote 80.72
