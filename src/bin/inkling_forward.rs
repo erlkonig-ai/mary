@@ -242,6 +242,80 @@
 //! `INK_GEMM='double cyclic mma'`), so the loop preserves the text exactly and
 //! the runtime does not.
 //!
+//! # `INK_WIDTH=b`: what a b-row decode step COSTS
+//!
+//! An instrument, not a feature. Batched decode -- `b` independent sequences
+//! sharing one weight stream -- is the largest untaken lever on this model, and
+//! the question that decides whether it is worth building is whether a `b`-row
+//! cached step costs `b` times a one-row one or barely more than one. A decode
+//! step is bound on streaming BF16 weights; `b` rows stream them once. Against
+//! that, every multi-row pass loses `gemv plane par`, which requires `m == 1`.
+//!
+//! `INK_WIDTH=b` prices the trade without any of the machinery a real batch
+//! needs, because the COST of a `b`-row pass barely depends on whether the rows
+//! belong to one sequence or to `b` of them: same projections, same MoE gather
+//! over `b` independent routings, same unembedding of `b` rows, same weight
+//! stream. Row 0 carries the real token, rows 1..b carry filler drawn fresh
+//! every pass so the router picks `b` independent expert sets, only row 0's
+//! argmax is taken and only row 0 is committed. Set it on the HEAD; the tail
+//! reads the width off the wire.
+//!
+//! Warm p50 of the whole cycle, two runs per arm, `INK_GEN=60`:
+//!
+//!   five-token prompt, ctx 5 -> 65        3732-token document, ctx 3732 -> 3792
+//!    b   p50 ms   c(b)   agg tok/s         b   p50 ms   c(b)   agg tok/s
+//!    1    127.4   1.000     7.85           1    150.0   1.000     6.67
+//!    2    197.5   1.550    10.13
+//!    4    221.0   1.735    18.10           4    248.5   1.657    16.10
+//!    8    263.9   2.071    30.31           8    293.6   1.957    27.25
+//!
+//! **Strongly sublinear, and that is the answer.** Eight rows cost 2.07 times
+//! one row, so eight sequences decode at 30.3 tokens a second against 7.85 for
+//! one -- 3.9x -- with no fabric work, no second box and no draft head. Nearly
+//! the whole penalty is the STEP at the second row: from b = 2 to b = 8, four
+//! times the rows cost 1.34 times the pass.
+//!
+//! ## What the probe does not charge for
+//!
+//! Its `b` rows share ONE KV cache, so attention reads `L` keys once where `b`
+//! real sequences would read `L` keys `b` times. At ctx 65 that is nothing. At
+//! ctx 3792 it is not, and the same table bounds it: one sequence's extra 3727
+//! keys cost 150.0 - 127.4 = 22.6 ms a pass, so charging `(b - 1) x 22.6` ms is
+//! an upper bound on the correction -- upper, because it charges the whole
+//! context-length delta to attention and some of it is the wider relative-bias
+//! table. Corrected, ctx 3792 reads 316 ms at b = 4 (12.6 tok/s aggregate,
+//! 1.9x) and 452 ms at b = 8 (17.7 tok/s, 2.65x). The lever survives the
+//! correction; it is 3.9x at short context and 2.7x at four thousand tokens.
+//!
+//! What it does NOT understate is the MoE: the router runs per row and the
+//! expert gather follows it, and the probe's filler is drawn fresh every pass
+//! precisely so that eight rows select eight independent expert sets. The log's
+//! own counter agrees -- 126 expert slabs decoded at b = 1 against 544-642 at
+//! b = 8 -- so expert streaming is priced at its real width and it is not what
+//! makes the curve bend.
+//!
+//! ## The probe checks itself
+//!
+//! Rows 1..b are causally invisible to row 0, so `INK_WIDTH=b` must produce the
+//! same text as `INK_WIDTH=1`. It produces the same text as every OTHER width:
+//! b = 2, 4 and 8, whose filler rows are entirely different from each other,
+//! emit token-for-token identical continuations on both corpora, and all three
+//! diverge from b = 1 at the same position. That is the `m == 1` GEMM lane and
+//! nothing else -- the same divergence a speculative run shows, reproduced with
+//! no speculation anywhere in the process.
+//!
+//! ## What batching would still need
+//!
+//! [`dev_lane::attention_steps`] takes ONE cache and `pos0`, puts row `i` at
+//! `pos0 + i`, and masks row `i` against every earlier row of the batch -- it
+//! is contiguous and causal by construction, which is what a speculative batch
+//! is and what `b` independent sequences are not. Real batching wants `b`
+//! caches, `b` positions and a block-diagonal mask instead of a causal one. The
+//! rest of the layer -- every projection, the router, the expert gather, the
+//! unembedding -- takes `[b, hidden]` unchanged, which is why the cost above is
+//! the right price for a thing that does not exist yet.
+//!
+
 //! # One lane, all the way down
 //!
 //! There is nothing to select. Attention, the dense and shared MLPs, the head
@@ -2366,6 +2440,41 @@ fn main() -> Result<()> {
     if spec_k > 0 {
         println!("  speculation        : INK_SPEC={spec_k} -- verify pass is {} rows", spec_k + 1);
     }
+
+    // ---- INK_WIDTH=b: what a b-row decode step COSTS ----------------------
+    //
+    // Not a feature: an instrument. Batched decode -- b independent sequences
+    // sharing one weight stream -- is the largest untaken lever on this model,
+    // and the question that decides whether it is worth building is whether a
+    // b-row cached step costs b times a one-row one or barely more than one.
+    // This prices exactly that without any of the machinery a real batch needs
+    // (b caches, b positions, a block-diagonal mask), because the COST of a
+    // b-row pass does not depend on whether the rows belong to one sequence or
+    // to b of them: the same projections, the same MoE gather over b routings,
+    // the same unembedding, the same weight stream.
+    //
+    // Row 0 carries the real token; rows 1..b carry filler drawn fresh every
+    // pass, so the router picks b independent expert sets rather than gathering
+    // the same eight slabs b times. Only row 0's argmax is taken and only row 0
+    // is committed, so the run produces one token per pass and the SAME text as
+    // INK_WIDTH=1 -- which is the check that the extra rows are not changing
+    // the answer, and it is a check the run makes on itself.
+    let width: usize = std::env::var("INK_WIDTH").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    anyhow::ensure!(width >= 1, "INK_WIDTH counts rows and starts at 1");
+    anyhow::ensure!(
+        width == 1 || kv,
+        "INK_WIDTH wants INK_KV=1: the uncached lane feeds the whole prefix and has no one-row \
+         step to widen"
+    );
+    anyhow::ensure!(width == 1 || spec_k == 0, "INK_WIDTH and INK_SPEC both widen the pass");
+    anyhow::ensure!(
+        width == 1 || mtp_k == 0,
+        "INK_WIDTH is a cost probe and drafting is not part of what it prices"
+    );
+    if width > 1 {
+        println!("  width probe        : INK_WIDTH={width} -- every cached step is {width} rows, \
+                  one of them real");
+    }
     // Head d's first STABLE row sits at position seq-1-d, so a prompt shorter
     // than the number of heads leaves a depth with no stable row at all: every
     // position of that head would be a function of drafts and the cache would
@@ -2741,6 +2850,15 @@ fn main() -> Result<()> {
         // row it always was.
         let mut f = vec![*ids.last().expect("a step past the prefill has produced a token")];
         f.extend(drafts_in.iter().copied());
+        // The width probe's filler. Drawn from a counter rather than from the
+        // sequence: a batch of the same token routes to the same eight experts
+        // and would price the expert stream once for the whole batch, which is
+        // the one thing the probe exists to find out.
+        let mut lcg = 0x9E3779B97F4A7C15u64 ^ (step as u64).wrapping_mul(0x100000001B3);
+        for _ in 1..width {
+            lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            f.push(((lcg >> 33) as usize) % t.vocab_size);
+        }
         (f, ids.len() - 1)
     } else {
         (ids.clone(), 0)
@@ -3430,7 +3548,15 @@ fn main() -> Result<()> {
     // leading run where the draft and the argmax agree, so a rule that only
     // looked at the last row could not find where the agreement stopped.
     let verify_rows = if spec_k > 0 && kv && step > 0 { n } else { 1 };
-    let logit_row0 = if all_logits { 0 } else { n - verify_rows };
+    // The width probe's rows, derived from the batch the head actually sent
+    // rather than from this process's environment -- so INK_WIDTH is set on the
+    // head alone and the two ends cannot disagree about it.
+    //
+    // Every row is unembedded, and that is deliberate: b independent sequences
+    // each need their own logits, so a probe that unembedded one row would
+    // leave the widest matmul in the stack out of the price.
+    let probe_rows = if spec_k == 0 && kv && step > 0 && n > 1 { n } else { 1 };
+    let logit_row0 = if all_logits || probe_rows > 1 { 0 } else { n - verify_rows };
     let (mut t_send, mut t_wait_peer) = (0f64, 0f64);
     let mut wire_toks: Vec<usize> = Vec::new();
     let logits = if let Some(Pipe::Head(s)) = pipe.as_mut() {
@@ -3522,6 +3648,11 @@ fn main() -> Result<()> {
                     accepted += 1;
                 }
                 new_toks = preds[..=accepted].to_vec();
+            } else if probe_rows > 1 {
+                // Row 0 is the sequence; rows 1.. are the probe's filler and
+                // their argmaxes are about nothing. Reading row 0 and not the
+                // last row is what keeps the text identical to INK_WIDTH=1.
+                new_toks = vec![argmax_of(0)];
             } else {
                 new_toks = vec![argmax_of(rows - 1)];
             }
@@ -3547,8 +3678,10 @@ fn main() -> Result<()> {
     // facts about the sequence the model actually chose. The rows past them
     // were computed from tokens it did not choose, and leaving them behind does
     // not error -- it shows up later as an acceptance rate that drifts down.
-    if verify_rows > 1 {
-        let keep = new_toks.len();
+    if verify_rows > 1 || probe_rows > 1 {
+        // One row for the probe -- its filler rows are not facts about any
+        // sequence and their K, V and convolution memory go away with them.
+        let keep = if verify_rows > 1 { new_toks.len() } else { 1 };
         let hist = t.sconv_kernel_size - 1;
         for (slot, c) in caches.iter_mut().enumerate() {
             let window = if t.attn_kind(lo + slot) == AttnKind::Local {
@@ -4365,7 +4498,8 @@ fn main() -> Result<()> {
         // Only the rows the verifier kept. A speculative pass computes logits
         // for rows it then throws away, and ranking those would print a top-5
         // for a position the run never visited -- and index `ids` past its end.
-        let valid_to = if verify_rows > 1 { logit_row0 + new_toks.len() } else { n };
+        let valid_to =
+            if verify_rows > 1 || probe_rows > 1 { logit_row0 + new_toks.len() } else { n };
         for ti in logit_row0..valid_to {
             let pos = pos0 + ti;
             let row = &logits[(ti - logit_row0) * v..(ti - logit_row0 + 1) * v];
