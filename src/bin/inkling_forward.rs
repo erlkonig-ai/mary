@@ -1990,6 +1990,14 @@ fn main() -> Result<()> {
     // accept-and-skip loop keeps a leading RUN, so the expected prefix is
     // sum_j prod_{i<=j} q_i and not any function of the marginals alone.
     let mut mtp_issued_q: BTreeMap<usize, Vec<Option<(f64, f64)>>> = BTreeMap::new();
+    // Per depth, every scored draft as (the DRAFT head's own top-1 probability,
+    // did it hit). The marginal acceptance rate is an average over drafts the
+    // head was sure of and drafts it was guessing at, and a loop does not have
+    // to speculate on the guesses: it can read its own confidence first and
+    // pay c(1) when it is low. Whether that is worth doing is a fact about the
+    // JOINT distribution of confidence and correctness, which no aggregate rate
+    // can answer, so the pairs are kept.
+    let mut mtp_conf: Vec<Vec<(f32, bool)>> = vec![Vec::new(); mtp_k];
     // The MTP entry hidden state for every position, retained. 16 KB a token
     // at f32, and the reason the cached lane can draft at all -- see the draft
     // block for why a row, once produced, never changes.
@@ -2321,6 +2329,12 @@ fn main() -> Result<()> {
     let mut acc_recv = 0f64;
     let mut acc_pass = 0f64;
     let mut acc_draft = 0f64;
+    // The tail's pass up to the MOMENT IT ANSWERS, which is the only part of it
+    // the head is waiting for. Its printed pass includes the report and the
+    // drafting that follow the reply, so subtracting THAT from the head's
+    // blocked time prices the wire as negative. This is the number that makes
+    // the subtraction honest.
+    let mut acc_to_reply = 0f64;
     let mut acc_steps = 0usize;
     let loop_started = Instant::now();
     let mut top_all: Vec<i64> = Vec::new();
@@ -3089,9 +3103,11 @@ fn main() -> Result<()> {
             best
         }
     };
+    let mut t_to_reply = 0f64;
     if let Some(Pipe::Tail(s)) = pipe.as_mut() {
         s.write_all(&(best as i64).to_le_bytes())?;
         s.flush()?;
+        t_to_reply = pass.elapsed().as_secs_f64();
     }
 
     // ---- MTP: score the drafts that named this step, then draft afresh -----
@@ -3126,6 +3142,9 @@ fn main() -> Result<()> {
                     mtp_b_sum[depth] += b;
                     mtp_c_sum[depth] += c;
                     mtp_prob_n[depth] += 1;
+                    // `tok` IS the draft's argmax, so this is the head's own
+                    // top-1 mass -- its confidence, not the target's.
+                    mtp_conf[depth].push((pd.get(tok).copied().unwrap_or(0.0), tok == best));
                     if let Some(slots) = mtp_issued_q.get_mut(&(target - depth - 1)) {
                         slots[depth] = Some((b, c));
                     }
@@ -3182,7 +3201,10 @@ fn main() -> Result<()> {
         // Uncached, every pass recomputes the whole prefix, so this is an
         // assignment there and an append here, and both lanes end holding the
         // same table over the same sequence.
-        if mtp_dev_on {
+        // `kv` as well as the switch: the device draft lane only runs cached,
+        // and uncached this would upload the whole recomputed prefix once a
+        // pass for a reader that does not exist.
+        if mtp_dev_on && kv {
             // Uploaded BEFORE the host table takes ownership, and appended on
             // the same rule: an append with a cache, a replacement without one,
             // so both tables end holding the same rows over the same sequence.
@@ -3847,6 +3869,7 @@ fn main() -> Result<()> {
         acc_wait_peer += t_wait_peer;
         acc_recv += t_recv;
         acc_pass += pass.elapsed().as_secs_f64();
+        acc_to_reply += t_to_reply;
         acc_steps += 1;
     }
     if step == gen_steps {
@@ -3872,6 +3895,13 @@ fn main() -> Result<()> {
         } else {
             println!("  computing            : {:9.1} ms   {:5.1}%", ms(acc_pass), 100.0 * acc_pass / wall);
             println!("    of which drafting  : {:9.1} ms   {:5.1}%", ms(acc_draft), 100.0 * acc_draft / wall);
+            println!(
+                "  ANSWERED the head at : {:9.1} ms into its pass ({:.1} ms/step) -- everything\n  \
+                 after that (report, drafting) overlaps the head's next pass and the head\n  \
+                 never waits for it. Subtract THIS from the head's blocked figure for the wire.",
+                ms(acc_to_reply),
+                ms(acc_to_reply) / acc_steps as f64
+            );
             println!("  BLOCKED on the head  : {:9.1} ms   {:5.1}%", ms(acc_recv), 100.0 * acc_recv / wall);
             println!("  per step: compute {:.1} ms, blocked {:.1} ms",
                      ms(acc_pass) / acc_steps as f64, ms(acc_recv) / acc_steps as f64);
@@ -4069,6 +4099,54 @@ fn main() -> Result<()> {
                 "  depths past 1 are CONDITIONAL on the greedy chain: head d was fed the ARGMAX\n  \
                  draft of head d-1, which a sampled loop would not always have drawn."
             );
+
+            // ---- acceptance against the draft head's OWN confidence --------
+            //
+            // A loop that speculates unconditionally pays the width premium on
+            // every step, including the ones where the head was guessing. It
+            // does not have to: the head's top-1 mass is available BEFORE the
+            // verify pass is issued, for free, so the loop can decline. What
+            // that is worth is `(1 + P*a) / (P*c + (1 - P))` against the
+            // unconditional `(1 + a_all) / c`, and both need the measured
+            // width cost, which is a property of the machine and not of this
+            // run -- `INK_SPEC_C2` carries it in, defaulting to the 1.492
+            // measured on the two-node pipe.
+            let c2: f64 = std::env::var("INK_SPEC_C2")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1.492);
+            if !mtp_conf[0].is_empty() {
+                println!("\n=== depth-1 acceptance against the draft head's own confidence ===");
+                println!("  c(2) = {c2:.3} (INK_SPEC_C2); a k=1 loop that always speculates:");
+                let all_n = mtp_conf[0].len();
+                let all_hit = mtp_conf[0].iter().filter(|(_, h)| *h).count();
+                let a_all = all_hit as f64 / all_n as f64;
+                println!(
+                    "    a = {:.3} over {all_n} events  ->  (1 + a) / c(2) = {:.3}x",
+                    a_all,
+                    (1.0 + a_all) / c2
+                );
+                println!("  gated on p_draft(top1) >= tau, paying c(1) when it declines:");
+                println!("    tau     P(spec)   a|spec    (1 + P*a) / (P*c2 + 1 - P)");
+                for tau in [0.0f32, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95] {
+                    let sel: Vec<&(f32, bool)> =
+                        mtp_conf[0].iter().filter(|(p, _)| *p >= tau).collect();
+                    if sel.is_empty() {
+                        println!("    {tau:4.2}    0        --        --");
+                        continue;
+                    }
+                    let pp = sel.len() as f64 / all_n as f64;
+                    let a = sel.iter().filter(|(_, h)| *h).count() as f64 / sel.len() as f64;
+                    println!(
+                        "    {tau:4.2}    {:.3}    {:.3}     {:.3}x",
+                        pp,
+                        a,
+                        (1.0 + pp * a) / (pp * c2 + 1.0 - pp)
+                    );
+                }
+                println!("  a threshold that beats the tau=0 row is a loop worth gating; one that");
+                println!("  does not means confidence and correctness are not linked here.");
+            }
         }
     }
 
