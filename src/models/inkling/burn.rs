@@ -279,6 +279,7 @@ pub struct AttnWeightsDev {
 /// cacheable. Row 0 is absolute position [`AttnCache::base`], not 0: a local
 /// layer drops keys that have left its window, so the row index is not the
 /// position and every distance must be computed through `base`.
+#[derive(Clone)]
 pub struct AttnCache<B: Backend> {
     k: Tensor<B, 2>,
     v: Tensor<B, 2>,

@@ -157,6 +157,28 @@ fn wilson95(hits: usize, n: usize) -> (f64, f64) {
     ((centre - half).max(0.0), (centre + half).min(1.0))
 }
 
+/// One logit row as a probability distribution.
+///
+/// The exponentials are accumulated in f64 over the max-shifted row: the row is
+/// 200 058 wide and the summands span the whole dynamic range, so an f32 sum
+/// loses the tail — and the tail is exactly what an acceptance rule reads.
+fn softmax_row(row: &[f32]) -> Vec<f32> {
+    let mut m = f32::NEG_INFINITY;
+    for &x in row {
+        if x > m {
+            m = x;
+        }
+    }
+    let mut out = Vec::with_capacity(row.len());
+    let mut sum = 0f64;
+    for &x in row {
+        let e = ((x - m) as f64).exp();
+        sum += e;
+        out.push(e);
+    }
+    out.iter().map(|e| (e / sum) as f32).collect()
+}
+
 /// Which end of a two-machine split this process is, if it is one.
 ///
 /// The head owns the embedding and the token loop; the tail owns the final norm,
@@ -565,6 +587,124 @@ fn dense_mlp_bf16(x: T2, w: &(Bf16W, Bf16W, Bf16W, f32)) -> T2 {
     let g = dev_lane::linear_bf16(x.clone(), &w.0);
     let u = dev_lane::linear_bf16(x, &w.1);
     dev_lane::linear_bf16(dev_lane::silu(g) * u, &w.2).mul_scalar(w.3)
+}
+
+/// One MTP head's weights, on the DEVICE.
+///
+/// The draft path was scalar HOST arithmetic while every other multiply in this
+/// file was on the device, and that is not a detail: measured on the two-node
+/// pipe, a warm decode round trip is 131 ms and `INK_MTP=4` drafting is 1470 ms.
+/// A draft that costs eleven forward passes is not a cheap approximation of one,
+/// so speculation could not pay at ANY acceptance rate — the arithmetic said so
+/// before the model got a vote. Nothing about the shape justified it: an MTP
+/// block's `transformer_block.*` is shape-identical to an ordinary decoder
+/// layer, so it multiplies by exactly the operators the stack already runs on
+/// the device, and the wrapper around it is two RMS norms, a concatenation and
+/// one `[hidden, 2 * hidden]` projection.
+///
+/// The host lane stays as the CONTROL and not as a fallback: `INK_MTP_DEV=0`
+/// selects it, and it is what says whether this transcription drafts the same
+/// tokens.
+struct MtpDev {
+    attn: dev_lane::AttnWeightsDev,
+    attn_sconv: T2,
+    mlp_sconv: T2,
+    attn_norm: BT<Bk, 1>,
+    mlp_norm: BT<Bk, 1>,
+    embed_norm: BT<Bk, 1>,
+    hidden_norm: BT<Bk, 1>,
+    /// `[hidden, 2 * hidden]`, which is the whole of what
+    /// `mtp_hidden_states_first` is a claim about.
+    input_proj: Bf16W,
+    dense: (Bf16W, Bf16W, Bf16W, f32),
+}
+
+/// What one device MTP head retains between draft steps.
+///
+/// The same three things a main-stack layer keeps, and for the same reasons —
+/// see [`dev_lane::AttnCache`] on why the pre-convolution projections are not
+/// optional. `Clone` is load-bearing: a SPECULATIVE row is run against a clone
+/// that is then dropped, so a rejected draft leaves nothing to undo.
+#[derive(Clone)]
+struct MtpDevCache {
+    attn: dev_lane::AttnCache<Bk>,
+    attn_sconv: T2,
+    mlp_sconv: T2,
+}
+
+/// The MTP wrapper's input: each operand normed by its OWN weight, concatenated
+/// in the order under test, projected back down to `hidden`.
+///
+/// Two norms is the tell that the operands are joined rather than summed; a
+/// residual add would want one. The concat order is the whole open question the
+/// acceptance rate answers, so it is a parameter here exactly as it is on the
+/// host.
+fn mtp_input_dev(hidden: T2, embeds: T2, w: &MtpDev, eps: f64, order: MtpConcat) -> T2 {
+    let hn = dev_lane::rms_norm(hidden, w.hidden_norm.clone(), eps);
+    let en = dev_lane::rms_norm(embeds, w.embed_norm.clone(), eps);
+    let cat = match order {
+        MtpConcat::HiddenFirst => BT::cat(vec![hn, en], 1),
+        MtpConcat::EmbedFirst => BT::cat(vec![en, hn], 1),
+    };
+    dev_lane::linear_bf16(cat, &w.input_proj)
+}
+
+/// One MTP head over a whole sequence, on the device, keeping the cache.
+///
+/// The device twin of `mtp::mtp_block_prefill`, and the same decoder layer the
+/// main stack runs: norm, attention, short convolution, residual; norm, DENSE
+/// MLP, short convolution, residual. Dense regardless of `dense_mlp_idx` —
+/// every MTP block is, and the two intermediate sizes differ by 8x.
+#[allow(clippy::too_many_arguments)]
+fn mtp_block_prefill_dev(
+    hidden: T2,
+    embeds: T2,
+    w: &MtpDev,
+    dims: &AttnDims,
+    ls: Option<LogScaling>,
+    window: Option<usize>,
+    mask: T2,
+    kernel: usize,
+    eps: f64,
+    order: MtpConcat,
+) -> (T2, MtpDevCache) {
+    let x = mtp_input_dev(hidden, embeds, w, eps, order);
+    let hn = dev_lane::rms_norm(x.clone(), w.attn_norm.clone(), eps);
+    let (y, attn) = dev_lane::attention_prefill(hn, &w.attn, dims, ls, mask, window);
+    let ahist = dev_lane::conv_history(y.clone(), kernel);
+    let x1 = x + dev_lane::short_conv(y, w.attn_sconv.clone());
+    let hn = dev_lane::rms_norm(x1.clone(), w.mlp_norm.clone(), eps);
+    let y = dense_mlp_bf16(hn, &w.dense);
+    let mhist = dev_lane::conv_history(y.clone(), kernel);
+    let out = x1 + dev_lane::short_conv(y, w.mlp_sconv.clone());
+    (out, MtpDevCache { attn, attn_sconv: ahist, mlp_sconv: mhist })
+}
+
+/// One position of one MTP head on the device, reading the cache.
+#[allow(clippy::too_many_arguments)]
+fn mtp_block_step_dev(
+    hidden: T2,
+    embeds: T2,
+    w: &MtpDev,
+    dims: &AttnDims,
+    ls: Option<LogScaling>,
+    pos: usize,
+    window: Option<usize>,
+    cache: &mut MtpDevCache,
+    eps: f64,
+    order: MtpConcat,
+) -> T2 {
+    let x = mtp_input_dev(hidden, embeds, w, eps, order);
+    let hn = dev_lane::rms_norm(x.clone(), w.attn_norm.clone(), eps);
+    let y = dev_lane::attention_step(hn, &w.attn, dims, ls, pos, window, &mut cache.attn);
+    let (a, ah) = dev_lane::short_conv_step(cache.attn_sconv.clone(), y, w.attn_sconv.clone());
+    cache.attn_sconv = ah;
+    let x1 = x + a;
+    let hn = dev_lane::rms_norm(x1.clone(), w.mlp_norm.clone(), eps);
+    let y = dense_mlp_bf16(hn, &w.dense);
+    let (m, mh) = dev_lane::short_conv_step(cache.mlp_sconv.clone(), y, w.mlp_sconv.clone());
+    cache.mlp_sconv = mh;
+    x1 + m
 }
 
 /// The shared experts, with every weight the BF16 it is stored as.
@@ -1815,6 +1955,41 @@ fn main() -> Result<()> {
     // inferring it would need the depths to be independent, and they are not,
     // because head d is fed draft d-1.
     let mut mtp_issued: BTreeMap<usize, Vec<Option<bool>>> = BTreeMap::new();
+    // `INK_MTP_PROB=1` scores THREE acceptance rules from one run, because
+    // "is the draft the argmax" is not the question a speculation loop asks.
+    //
+    //   A  exact argmax match. What greedy speculation keeps, and the strictest
+    //      rule available: a draft that was the target's second choice at
+    //      p = 0.30 is thrown away.
+    //   B  greedy draft, SAMPLED target. The draft is a point mass, so
+    //      min(1, p_t(x)/p_d(x)) is p_t(x): accept the drafted token with the
+    //      probability the target itself assigns it. Resampling from the
+    //      normalised residual on rejection preserves the target's distribution
+    //      EXACTLY (Leviathan et al. / Chen et al. 2023) -- this is not an
+    //      approximation, it is a different exact algorithm.
+    //   C  sampled draft, sampled target. Averaged over a draft sampled from
+    //      p_d, the acceptance probability is
+    //      sum_x p_d(x) min(1, p_t(x)/p_d(x)) = sum_x min(p_d(x), p_t(x)),
+    //      which is 1 - TV(p_d, p_t) and does not depend on which token was
+    //      drawn. The cleanest single number for "how close are these two
+    //      distributions, in the currency a speculation loop spends".
+    //
+    // A is a lower bound on B and C by construction (it is B at temperature
+    // zero), so a run where they coincide says the heads are weak and a run
+    // where they part says the RULE was the constraint.
+    let mtp_prob = std::env::var("INK_MTP_PROB").map(|val| val == "1").unwrap_or(false);
+    // The draft head's distribution, kept from the step that issued it until
+    // the step it names arrives with the target's. 800 KB a draft at f32 and
+    // at most k(k+1)/2 alive at once.
+    let mut mtp_pd: BTreeMap<(usize, usize), Vec<f32>> = BTreeMap::new();
+    let mut mtp_b_sum = vec![0f64; mtp_k];
+    let mut mtp_c_sum = vec![0f64; mtp_k];
+    let mut mtp_prob_n = vec![0usize; mtp_k];
+    // Per issuing step, the two acceptance PROBABILITIES per depth -- the
+    // stochastic twin of `mtp_issued`, and needed for the same reason: an
+    // accept-and-skip loop keeps a leading RUN, so the expected prefix is
+    // sum_j prod_{i<=j} q_i and not any function of the marginals alone.
+    let mut mtp_issued_q: BTreeMap<usize, Vec<Option<(f64, f64)>>> = BTreeMap::new();
     // The MTP entry hidden state for every position, retained. 16 KB a token
     // at f32, and the reason the cached lane can draft at all -- see the draft
     // block for why a row, once produced, never changes.
@@ -1824,6 +1999,22 @@ fn main() -> Result<()> {
     // stable rows stop at position seq-1-d.
     let mut mtp_stage: Vec<Vec<f32>> = vec![Vec::new(); mtp_k];
     let mut mtp_caches: Vec<Option<MtpCache>> = (0..mtp_k).map(|_| None).collect();
+    // The draft lane. ON by default, because the host one is not an
+    // implementation of drafting so much as a proof that drafting composes: at
+    // 1470 ms for four heads against a 131 ms two-node round trip it made
+    // speculation arithmetically impossible before the model was consulted.
+    // `INK_MTP_DEV=0` is the control, and `INK_MTP_CHECK=1` runs it as one.
+    let mtp_dev_on = std::env::var("INK_MTP_DEV").map(|val| val != "0").unwrap_or(true);
+    // Built on the first draft rather than at load, exactly as `layers_dev` is:
+    // a lane nobody takes should not pay for the upload.
+    let mut mtp_devs: Vec<MtpDev> = Vec::new();
+    // The device twins of `mtp_main` / `mtp_stage` / `mtp_caches`. The entry
+    // states are UPLOADED from the host `entry` rather than recomputed on the
+    // device, so a device/host draft comparison isolates the block and does not
+    // fold in a second rms_norm's rounding.
+    let mut mtp_main_dev: Option<T2> = None;
+    let mut mtp_stage_dev: Vec<Option<T2>> = (0..mtp_k).map(|_| None).collect();
+    let mut mtp_dev_caches: Vec<Option<MtpDevCache>> = (0..mtp_k).map(|_| None).collect();
 
     // Experts are read, applied and dropped. There is no decoded-expert cache:
     // it measured as no speedup, and it existed to paper over a capacity
@@ -2113,12 +2304,32 @@ fn main() -> Result<()> {
     let mut bias_dev: std::collections::HashMap<usize, cubecl::server::Handle> =
         std::collections::HashMap::new();
 
+    // ---- what the pipe costs, and what it wastes --------------------------
+    //
+    // A two-node split has one node blocked on the other for most of every
+    // token, and that idle half is the whole argument for speculation: it is
+    // already paid-for hardware doing nothing, so a draft that gets rejected
+    // costs work the machine was not going to do anyway. None of it was
+    // measured, because the head charges the ENTIRE round trip -- wire out,
+    // the tail's whole half of the stack, wire back -- to the one slot the
+    // unembed occupies on a whole-stack run. That slot cannot separate wire
+    // from peer compute, so both are timed here instead, on both ends, and the
+    // wire falls out as the difference between the head's wait and the tail's
+    // own pass.
+    let mut acc_send = 0f64;
+    let mut acc_wait_peer = 0f64;
+    let mut acc_recv = 0f64;
+    let mut acc_pass = 0f64;
+    let mut acc_draft = 0f64;
+    let mut acc_steps = 0usize;
+    let loop_started = Instant::now();
     let mut top_all: Vec<i64> = Vec::new();
     for step in 0..=gen_steps {
     // A tail's step BEGINS on the wire, and it waits before its own timers
     // start: a tail that charged itself for the head's half would report the
     // pipeline's latency as its own cost, and the per-machine split is the
     // entire question here.
+    let t_rv = Instant::now();
     let incoming = match pipe.as_mut() {
         Some(Pipe::Tail(s)) => match recv_stream(s, h)? {
             Some(v) => Some(v),
@@ -2127,6 +2338,9 @@ fn main() -> Result<()> {
         },
         _ => None,
     };
+    // Charged whether or not this process is a tail: on anything else it is
+    // zero, and a zero that is measured beats a branch that hides it.
+    let t_recv = t_rv.elapsed().as_secs_f64();
 
     let pass = Instant::now();
     let io0 = io_read_bytes();
@@ -2818,10 +3032,15 @@ fn main() -> Result<()> {
     // is 0 when everything was asked for and `n - 1` when only the argmax's row
     // was. A head computes nothing and the value is unread there.
     let logit_row0 = if all_logits { 0 } else { n - 1 };
+    let (mut t_send, mut t_wait_peer) = (0f64, 0f64);
     let logits = if let Some(Pipe::Head(s)) = pipe.as_mut() {
+        let t_s = Instant::now();
         send_stream(s, n, pos0, &x)?;
+        t_send = t_s.elapsed().as_secs_f64();
+        let t_w = Instant::now();
         let mut back = [0u8; 8];
         s.read_exact(&mut back).context("the tail closed mid-step")?;
+        t_wait_peer = t_w.elapsed().as_secs_f64();
         best_wire = Some(i64::from_le_bytes(back) as usize);
         Vec::new()
     } else {
@@ -2880,11 +3099,38 @@ fn main() -> Result<()> {
         // SCORE FIRST, against `best` -- the token the full stack just produced.
         // This is the whole experiment: a draft is right or it is not, and the
         // rate over many steps is the only oracle the composition has.
+        // The target's OWN distribution at this position, once per pass rather
+        // than once per pending draft. `logits` holds the argmax's row and only
+        // that row unless a reporter asked for more, which is exactly the row
+        // every rule below reads.
+        let p_t: Vec<f32> = if mtp_prob && !logits.is_empty() {
+            softmax_row(&logits[(n - 1 - logit_row0) * v..(n - logit_row0) * v])
+        } else {
+            Vec::new()
+        };
         mtp_pending.retain(|&(target, depth, tok)| {
             if target != step {
                 return true;
             }
             mtp_seen[depth] += 1;
+            if mtp_prob {
+                if let Some(pd) = mtp_pd.remove(&(target, depth)) {
+                    // B: the target's own probability on the token that was
+                    // drafted. C: the overlap of the two distributions.
+                    let b = p_t.get(tok).copied().unwrap_or(0.0) as f64;
+                    let c: f64 = pd
+                        .iter()
+                        .zip(p_t.iter())
+                        .map(|(a, t)| a.min(*t) as f64)
+                        .sum();
+                    mtp_b_sum[depth] += b;
+                    mtp_c_sum[depth] += c;
+                    mtp_prob_n[depth] += 1;
+                    if let Some(slots) = mtp_issued_q.get_mut(&(target - depth - 1)) {
+                        slots[depth] = Some((b, c));
+                    }
+                }
+            }
             if tok == best {
                 mtp_hits[depth] += 1;
             }
@@ -2936,6 +3182,17 @@ fn main() -> Result<()> {
         // Uncached, every pass recomputes the whole prefix, so this is an
         // assignment there and an append here, and both lanes end holding the
         // same table over the same sequence.
+        if mtp_dev_on {
+            // Uploaded BEFORE the host table takes ownership, and appended on
+            // the same rule: an append with a cache, a replacement without one,
+            // so both tables end holding the same rows over the same sequence.
+            let rows = entry.len() / h;
+            let e_dev = up2::<Bk>(entry.clone(), rows, h, &dev);
+            mtp_main_dev = Some(match (kv, mtp_main_dev.take()) {
+                (true, Some(prev)) => BT::cat(vec![prev, e_dev], 0),
+                _ => e_dev,
+            });
+        }
         if kv {
             mtp_main.extend_from_slice(&entry);
         } else {
@@ -2951,6 +3208,12 @@ fn main() -> Result<()> {
         // ONE row and not `n` of them: a draft is read off the last position and
         // the head is per-row, so unembedding the prefix was 89 G multiply-adds
         // per position thrown away.
+        // Every draft head's distribution, in the order the heads are read, for
+        // the pass that is drafting now. A side channel rather than a return
+        // value because `draft_argmax` is called from two lanes and one of them
+        // (`draft_whole`) is also the INK_MTP_CHECK control, which must not
+        // contribute.
+        let draft_probs: std::cell::RefCell<Vec<Vec<f32>>> = std::cell::RefCell::new(Vec::new());
         let draft_argmax = |row: &[f32]| -> usize {
             debug_assert_eq!(row.len(), h, "the draft head unembeds exactly one position");
             let dl = {
@@ -2968,6 +3231,9 @@ fn main() -> Result<()> {
                 if val > dl[b] {
                     b = i;
                 }
+            }
+            if mtp_prob {
+                draft_probs.borrow_mut().push(softmax_row(&dl[..v]));
             }
             b
         };
@@ -3011,8 +3277,251 @@ fn main() -> Result<()> {
             out
         };
 
+        // The same unembedding, fed a row that is already on the device. The
+        // host twin above exists for the host draft lane and reads a `&[f32]`;
+        // this one would otherwise pay a 16 KB readback and a 16 KB upload per
+        // draft for the privilege of handing the value straight back.
+        let draft_argmax_dev = |row: T2| -> usize {
+            let dl = {
+                let ud = unembed_w.as_ref().expect("drafting needs the unembed table");
+                let hs = dev_lane::rms_norm(
+                    row,
+                    fnorm_dev.clone().expect("drafting needs the final norm"),
+                    t.rms_norm_eps,
+                )
+                .div_scalar(t.logits_mup_width_multiplier as f32);
+                down(dev_lane::linear_bf16(hs, ud).slice([0..1, 0..v]))
+            };
+            let mut b = 0usize;
+            for (i, &val) in dl.iter().take(v).enumerate() {
+                if val > dl[b] {
+                    b = i;
+                }
+            }
+            if mtp_prob {
+                draft_probs.borrow_mut().push(softmax_row(&dl[..v]));
+            }
+            b
+        };
+
+        draft_probs.borrow_mut().clear();
         let t_mtp = Instant::now();
-        let drafts: Vec<usize> = if kv {
+        let drafts: Vec<usize> = if kv && mtp_dev_on {
+            // The device lane, structurally identical to the host one below --
+            // ragged stable rows, a speculative tail run against a CLONE of the
+            // cache -- so the two can be read against each other line for line.
+            if mtp_devs.is_empty() {
+                let t_up = Instant::now();
+                let mut bytes = 0u64;
+                for i in 0..mtp_k {
+                    let pre = format!("model.mtp.layers.{i}.");
+                    let p = format!("{pre}transformer_block.");
+                    let hd = &mtp_heads[i].dims;
+                    let pw = |nm: &str, rows: usize, cols: usize| -> Result<Bf16W> {
+                        let leaf = cp.stored(&format!("{p}{nm}"))?;
+                        anyhow::ensure!(
+                            leaf.elem == Elem::Bf16,
+                            "{p}{nm} is {:?}; this lane multiplies BF16 by BF16",
+                            leaf.elem
+                        );
+                        Ok(bind_bf16(&fp4_client, fp4_aliases.as_ref(), &leaf.bytes, rows, cols))
+                    };
+                    let ip = cp.stored(&format!("{pre}input_proj.weight"))?;
+                    anyhow::ensure!(ip.elem == Elem::Bf16, "input_proj is {:?}", ip.elem);
+                    let gv = |nm: &str| -> Result<Vec<f32>> { Ok(cp.tensor(nm)?.data) };
+                    // Bound here rather than through [`DeviceDense`], whose map
+                    // is keyed by LAYER prefix and whose byte counter feeds the
+                    // per-layer report: an MTP head is not one of this node's
+                    // layers and counting it there would misattribute 1 GiB.
+                    let dense = {
+                        let fused = cp.stored(&format!("{p}mlp.w13_dn.weight"))?;
+                        anyhow::ensure!(fused.elem == Elem::Bf16, "mtp w13 is {:?}", fused.elem);
+                        let (g, u) = mary::models::inkling::load::split_gate_up_bytes(
+                            &fused.bytes,
+                            h,
+                            2,
+                        );
+                        let dw = cp.stored(&format!("{p}mlp.w2_md.weight"))?;
+                        anyhow::ensure!(dw.elem == Elem::Bf16, "mtp w2 is {:?}", dw.elem);
+                        let (drows, dcols) = (dw.dims[0] as usize, dw.dims[1] as usize);
+                        let inter = g.len() / (h * 2);
+                        let gs = cp.tensor(&format!("{p}mlp.global_scale"))?.data[0];
+                        bytes += (g.len() + u.len() + dw.bytes.len()) as u64;
+                        (
+                            bind_bf16(&fp4_client, fp4_aliases.as_ref(), &g, inter, h),
+                            bind_bf16(&fp4_client, fp4_aliases.as_ref(), &u, inter, h),
+                            bind_bf16(&fp4_client, fp4_aliases.as_ref(), &dw.bytes, drows, dcols),
+                            gs,
+                        )
+                    };
+                    let built = MtpDev {
+                        attn: dev_lane::AttnWeightsDev {
+                            wq: pw("attn.wq_du.weight", hd.heads * hd.head_dim, h)?,
+                            wk: pw("attn.wk_dv.weight", hd.kv_heads * hd.head_dim, h)?,
+                            wv: pw("attn.wv_dv.weight", hd.kv_heads * hd.head_dim, h)?,
+                            wr: pw("attn.wr_du.weight", hd.heads * hd.d_rel, h)?,
+                            wo: pw("attn.wo_ud.weight", h, hd.heads * hd.head_dim)?,
+                            k_sconv: up2(
+                                gv(&format!("{p}attn.k_sconv.weight"))?,
+                                hd.kv_heads * hd.head_dim,
+                                t.sconv_kernel_size,
+                                &dev,
+                            ),
+                            v_sconv: up2(
+                                gv(&format!("{p}attn.v_sconv.weight"))?,
+                                hd.kv_heads * hd.head_dim,
+                                t.sconv_kernel_size,
+                                &dev,
+                            ),
+                            q_norm: up1(gv(&format!("{p}attn.q_norm.weight"))?, hd.head_dim, &dev),
+                            k_norm: up1(gv(&format!("{p}attn.k_norm.weight"))?, hd.head_dim, &dev),
+                            rel_proj: up2(
+                                gv(&format!("{p}attn.rel_logits_proj.proj"))?,
+                                hd.d_rel,
+                                hd.rel_extent,
+                                &dev,
+                            ),
+                        },
+                        attn_sconv: up2(
+                            gv(&format!("{p}attn_sconv.weight"))?,
+                            h,
+                            t.sconv_kernel_size,
+                            &dev,
+                        ),
+                        mlp_sconv: up2(
+                            gv(&format!("{p}mlp_sconv.weight"))?,
+                            h,
+                            t.sconv_kernel_size,
+                            &dev,
+                        ),
+                        attn_norm: up1(gv(&format!("{p}attn_norm.weight"))?, h, &dev),
+                        mlp_norm: up1(gv(&format!("{p}mlp_norm.weight"))?, h, &dev),
+                        embed_norm: up1(gv(&format!("{pre}embed_norm.weight"))?, h, &dev),
+                        hidden_norm: up1(gv(&format!("{pre}hidden_norm.weight"))?, h, &dev),
+                        input_proj: bind_bf16(
+                            &fp4_client,
+                            fp4_aliases.as_ref(),
+                            &ip.bytes,
+                            h,
+                            2 * h,
+                        ),
+                        dense,
+                    };
+                    bytes += ip.bytes.len() as u64;
+                    mtp_devs.push(built);
+                }
+                <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync after MTP upload");
+                println!(
+                    "  MTP heads on the device: {mtp_k} in {:.2}s, {:.2} GiB bound",
+                    t_up.elapsed().as_secs_f32(),
+                    bytes as f64 / GIB
+                );
+            }
+            let main_dev = mtp_main_dev.clone().expect("the entry states were uploaded above");
+            let mut prev_rows: Vec<T2> = Vec::new();
+            let mut drafts: Vec<usize> = Vec::with_capacity(mtp_k);
+            for d in 0..mtp_k {
+                let hd = mtp_heads[d].dims;
+                let window = mtp_heads[d].window(t.sliding_window_size);
+                let want = seq - d;
+                let have = mtp_stage_dev[d].as_ref().map(|x| x.dims()[0]).unwrap_or(0);
+                let row_of = |src: &Option<T2>, lo: usize, hi: usize| -> T2 {
+                    match src {
+                        Some(x) => x.clone().slice([lo..hi, 0..h]),
+                        None => unreachable!("head d-1 always has more stable rows than head d"),
+                    }
+                };
+                let stable: T2 = if have == 0 {
+                    let mut embeds = vec![0f32; want * h];
+                    for j in 0..want {
+                        let tok = if j + d + 1 < seq { ids[j + d + 1] } else { best };
+                        embeds[j * h..(j + 1) * h]
+                            .copy_from_slice(&embed_row_bf16(e_w, tok, t.vocab_size, h));
+                    }
+                    let ed = up2::<Bk>(embeds, want, h, &dev);
+                    let hin = if d == 0 {
+                        main_dev.clone().slice([0..want, 0..h])
+                    } else {
+                        row_of(&mtp_stage_dev[d - 1], 0, want)
+                    };
+                    let mask = up2::<Bk>(causal_mask(want, window), want, want, &dev);
+                    let (y, c) = mtp_block_prefill_dev(
+                        hin,
+                        ed,
+                        &mtp_devs[d],
+                        &hd,
+                        Some(ls),
+                        window,
+                        mask,
+                        t.sconv_kernel_size,
+                        t.rms_norm_eps,
+                        mtp_order,
+                    );
+                    mtp_dev_caches[d] = Some(c);
+                    y
+                } else {
+                    assert_eq!(have + 1, want, "a step makes exactly one row stable");
+                    let pos = want - 1;
+                    let hin = if d == 0 {
+                        main_dev.clone().slice([pos..pos + 1, 0..h])
+                    } else {
+                        row_of(&mtp_stage_dev[d - 1], pos, pos + 1)
+                    };
+                    let ed = up2::<Bk>(
+                        embed_row_bf16(e_w, best, t.vocab_size, h),
+                        1,
+                        h,
+                        &dev,
+                    );
+                    mtp_block_step_dev(
+                        hin,
+                        ed,
+                        &mtp_devs[d],
+                        &hd,
+                        Some(ls),
+                        pos,
+                        window,
+                        mtp_dev_caches[d].as_mut().expect("prefilled on the first pass"),
+                        t.rms_norm_eps,
+                        mtp_order,
+                    )
+                };
+                mtp_stage_dev[d] = Some(match mtp_stage_dev[d].take() {
+                    None => stable,
+                    Some(prev) => BT::cat(vec![prev, stable], 0),
+                });
+                let mut rows: Vec<T2> = vec![row_of(&mtp_stage_dev[d], want - 1, want)];
+                let mut last = rows[0].clone();
+                if d > 0 {
+                    let mut scratch =
+                        mtp_dev_caches[d].as_ref().expect("prefilled").clone();
+                    for i in 0..d {
+                        let ed = up2::<Bk>(
+                            embed_row_bf16(e_w, drafts[i], t.vocab_size, h),
+                            1,
+                            h,
+                            &dev,
+                        );
+                        last = mtp_block_step_dev(
+                            prev_rows[i].clone(),
+                            ed,
+                            &mtp_devs[d],
+                            &hd,
+                            Some(ls),
+                            want + i,
+                            window,
+                            &mut scratch,
+                            t.rms_norm_eps,
+                            mtp_order,
+                        );
+                        rows.push(last.clone());
+                    }
+                }
+                drafts.push(draft_argmax_dev(last));
+                prev_rows = rows;
+            }
+            drafts
+        } else if kv {
             // Head d's newest STABLE row is at position seq-1-d: past that, its
             // input embedding is a token the stack has not produced yet. So a
             // step appends exactly ONE row per head, and the d rows after it --
@@ -3109,12 +3618,19 @@ fn main() -> Result<()> {
             draft_whole(&mtp_main, seq, &ids, best)
         };
         mtp_issued.insert(step, vec![None; drafts.len()]);
+        if mtp_prob {
+            mtp_issued_q.insert(step, vec![None; drafts.len()]);
+            for (d, p) in draft_probs.borrow_mut().drain(..).enumerate() {
+                mtp_pd.insert((step + d + 1, d), p);
+            }
+        }
         for (d, &b) in drafts.iter().enumerate() {
             // Head d predicts the token d+1 steps past the one just chosen.
             mtp_pending.push((step + d + 1, d, b));
         }
+        acc_draft += t_mtp.elapsed().as_secs_f64();
         println!(
-            "  MTP drafted {} token(s) in {:.2}s: {drafts:?}",
+            "  MTP drafted {} token(s) in {:.3}s: {drafts:?}",
             mtp_heads.len(),
             t_mtp.elapsed().as_secs_f32(),
         );
@@ -3132,8 +3648,15 @@ fn main() -> Result<()> {
                 t_c.elapsed().as_secs_f32(),
                 if whole == drafts { "agree" } else { "DISAGREE" }
             );
+            // Asserted for the HOST cached lane, which is the same arithmetic
+            // summed in the same order and therefore has no licence to differ;
+            // REPORTED for the device one, where an argmax over a 200k row can
+            // legitimately flip on a near-tie. Asserting there would be a
+            // determinism gate wearing a correctness costume, and the honest
+            // instrument for a transcription is the acceptance rate it goes on
+            // to produce.
             anyhow::ensure!(
-                whole == drafts,
+                mtp_dev_on || whole == drafts,
                 "the MTP cache drafted {drafts:?} where the whole sequence drafts {whole:?}"
             );
         }
@@ -3316,9 +3839,46 @@ fn main() -> Result<()> {
             ids.push(best);
         }
     }
+    // The prefill is a different animal -- a 512-row pass against a 1-row one,
+    // and the only pass that pays for uploading every resident weight -- so it
+    // is excluded from the utilisation summary rather than averaged into it.
+    if step > 0 {
+        acc_send += t_send;
+        acc_wait_peer += t_wait_peer;
+        acc_recv += t_recv;
+        acc_pass += pass.elapsed().as_secs_f64();
+        acc_steps += 1;
+    }
     if step == gen_steps {
         break;
     }
+    }
+
+    // ---- how much of the wall clock this node spent waiting for the other --
+    if acc_steps > 0 && pipe.is_some() {
+        let ms = |v: f64| v * 1e3;
+        let wall = acc_pass + acc_recv;
+        println!("\n=== pipe utilisation over {acc_steps} decode steps (prefill excluded) ===");
+        println!("  role                 : {}", if is_head { "head" } else { "tail" });
+        println!("  wall in the loop     : {:9.1} ms   ({:.1} ms/step)", ms(wall), ms(wall) / acc_steps as f64);
+        if is_head {
+            // `pass` contains the wait, so compute is what is left of it.
+            let compute = acc_pass - acc_wait_peer - acc_send;
+            println!("  computing            : {:9.1} ms   {:5.1}%", ms(compute), 100.0 * compute / wall);
+            println!("  writing to the wire  : {:9.1} ms   {:5.1}%", ms(acc_send), 100.0 * acc_send / wall);
+            println!("  BLOCKED on the tail  : {:9.1} ms   {:5.1}%", ms(acc_wait_peer), 100.0 * acc_wait_peer / wall);
+            println!("  per step: compute {:.1} ms, blocked {:.1} ms",
+                     ms(compute) / acc_steps as f64, ms(acc_wait_peer) / acc_steps as f64);
+        } else {
+            println!("  computing            : {:9.1} ms   {:5.1}%", ms(acc_pass), 100.0 * acc_pass / wall);
+            println!("    of which drafting  : {:9.1} ms   {:5.1}%", ms(acc_draft), 100.0 * acc_draft / wall);
+            println!("  BLOCKED on the head  : {:9.1} ms   {:5.1}%", ms(acc_recv), 100.0 * acc_recv / wall);
+            println!("  per step: compute {:.1} ms, blocked {:.1} ms",
+                     ms(acc_pass) / acc_steps as f64, ms(acc_recv) / acc_steps as f64);
+        }
+        println!("  loop wall (both ends see the same clock): {:.1} ms", ms(loop_started.elapsed().as_secs_f64()));
+        println!("  the wire itself is the head's BLOCKED figure minus the tail's per-step compute;");
+        println!("  neither process can subtract that on its own, so the two reports are read together.");
     }
 
     // ---- what the router arm changed, if anything -------------------------
@@ -3450,6 +4010,64 @@ fn main() -> Result<()> {
                     "partial -- better than chance over a 200k vocabulary, so the composition is \
                      close to right; the shortfall is what to explain next"
                 }
+            );
+        }
+        // ---- the same drafts, under two rules that are not equality --------
+        //
+        // Reported beside the exact-match rate rather than instead of it,
+        // because they answer different questions and the gap between them IS
+        // the finding: A is "is the draft the argmax", B and C are "is the
+        // draft acceptable". A greedy loop can only spend A; a loop that
+        // samples can spend B or C, and sampling is not a quality concession --
+        // the residual-resampling step makes the output distribution exactly
+        // the target's.
+        if mtp_prob && mtp_prob_n.iter().any(|&n| n > 0) {
+            println!("\n=== MTP acceptance, three rules, same drafts ===");
+            println!("  A  exact argmax match                 -- greedy speculation");
+            println!("  B  greedy draft, sampled target       -- E[p_target(draft)]");
+            println!("  C  sampled draft, sampled target      -- E[1 - TV(p_draft, p_target)]");
+            println!("  depth      n        A        B        C");
+            for d in 0..mtp_k {
+                if mtp_prob_n[d] == 0 {
+                    println!("  {:5}      0   never scored", d + 1);
+                    continue;
+                }
+                let nn = mtp_prob_n[d] as f64;
+                println!(
+                    "  {:5}  {:5}   {:5.1}%   {:5.1}%   {:5.1}%",
+                    d + 1,
+                    mtp_prob_n[d],
+                    100.0 * mtp_hits[d] as f64 / mtp_seen[d].max(1) as f64,
+                    100.0 * mtp_b_sum[d] / nn,
+                    100.0 * mtp_c_sum[d] / nn,
+                );
+            }
+            // The expected LEADING RUN, which is what converts to tok/s. Under
+            // a stochastic rule a draft set has no realised prefix -- it has a
+            // distribution over prefixes -- so the expectation is taken
+            // directly: E[prefix] = sum_j prod_{i<=j} q_i.
+            let complete_q: Vec<&Vec<Option<(f64, f64)>>> =
+                mtp_issued_q.values().filter(|v| v.iter().all(|s| s.is_some())).collect();
+            if !complete_q.is_empty() {
+                let sets = complete_q.len();
+                let (mut eb, mut ec) = (0f64, 0f64);
+                for v in &complete_q {
+                    let (mut pb, mut pc) = (1f64, 1f64);
+                    for slot in v.iter() {
+                        let (b, c) = slot.expect("filtered to fully-scored sets");
+                        pb *= b;
+                        pc *= c;
+                        eb += pb;
+                        ec += pc;
+                    }
+                }
+                println!("  expected accepted prefix over {sets} fully-scored draft sets:");
+                println!("    rule B: {:.3} draft tokens per verify pass", eb / sets as f64);
+                println!("    rule C: {:.3} draft tokens per verify pass", ec / sets as f64);
+            }
+            println!(
+                "  depths past 1 are CONDITIONAL on the greedy chain: head d was fed the ARGMAX\n  \
+                 draft of head d-1, which a sampled loop would not always have drawn."
             );
         }
     }
