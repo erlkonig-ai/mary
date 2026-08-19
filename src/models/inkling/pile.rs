@@ -1158,10 +1158,20 @@ impl PileSource {
         dense_names.sort();
 
         // The DESTINATION of every leaf, computed before anything is read.
-        // Disjoint destinations are what let the pass below be threaded; the
-        // layout is byte-for-byte the one the old sequential loop produced —
+        // Disjoint destinations are what let the pass below be threaded:
         // experts in `expert_keys_in` order, then dense leaves by name, each
-        // padded to a 4-byte boundary.
+        // padded to a SIXTEEN-byte boundary.
+        //
+        // Sixteen, not the four this used to write. The tuned BF16 GEMM lanes
+        // pick their load width from the tensor SHAPE and never from the
+        // pointer, so a weight aliased at 4 mod 16 raises
+        // `CUDA_ERROR_MISALIGNED_ADDRESS` -- an async fault that poisons the
+        // CUDA context -- and the dense lane has to route it to the slower hand
+        // kernel instead. Sixteen costs at most 15 bytes per view, about 14 KB
+        // on a 20-layer share, and it is the whole benefit `INK_ALIGN_COPY=1`
+        // was buying by DUPLICATING 908 MiB of weight into a fresh device
+        // allocation; that arm is moot now.
+        const VIEW_ALIGN: usize = 16;
         let mut cursor = 0usize;
         let mut expert_offsets = Vec::with_capacity(keys.len());
         for (name, _) in &keys {
@@ -1169,7 +1179,7 @@ impl PileSource {
             let end = start
                 .checked_add(shapes[name].payload)
                 .context("weight share byte count overflow")?;
-            cursor = end + (4 - end % 4) % 4;
+            cursor = end.next_multiple_of(VIEW_ALIGN);
             expert_offsets.push((start, end));
         }
         let mut dense_offsets = Vec::with_capacity(dense_names.len());
@@ -1178,7 +1188,7 @@ impl PileSource {
             let end = start
                 .checked_add(self.dense[name].bytes.len())
                 .context("weight share byte count overflow")?;
-            cursor = end + (4 - end % 4) % 4;
+            cursor = end.next_multiple_of(VIEW_ALIGN);
             dense_offsets.push((start, end));
         }
         let total = cursor;
@@ -1199,21 +1209,30 @@ impl PileSource {
         // `calloc`, and for an allocation this size glibc hands back a fresh
         // anonymous mapping whose pages are already zero and not yet resident,
         // so each page arrives exactly once, when the copy writes it.
-        let arena: Vec<u8> = {
-            let layout = std::alloc::Layout::from_size_align(total, 1)
-                .map_err(|e| anyhow::anyhow!("startup-copy layout for {total} bytes: {e}"))?;
-            // SAFETY: `total > 0` (the share always has leaves), the layout is
+        //
+        // `VIEW_ALIGN - 1` bytes longer than the layout, because the offsets
+        // are only 16-aligned RELATIVE to the base and every view's real
+        // address is base + offset. glibc mmaps an allocation this size and
+        // hands back a page-aligned pointer, so `skew` is measured to be zero
+        // -- but measured, not assumed, because the whole point of the
+        // alignment is that a weight at 4 mod 16 faults the CUDA context
+        // asynchronously and there is no failure to see at the bind.
+        let (mut arena, skew) = {
+            let bytes = total + VIEW_ALIGN - 1;
+            let layout = std::alloc::Layout::from_size_align(bytes, 1)
+                .map_err(|e| anyhow::anyhow!("startup-copy layout for {bytes} bytes: {e}"))?;
+            // SAFETY: `bytes > 0` (the share always has leaves), the layout is
             // the one `Vec<u8>` itself uses (align 1), and the pointer is
             // handed to exactly one `Vec` which owns and frees it.
             let p = unsafe { std::alloc::alloc_zeroed(layout) };
             anyhow::ensure!(
                 !p.is_null(),
                 "cannot allocate {:.2} GiB for this node's startup weight copy",
-                total as f64 / (1u64 << 30) as f64,
+                bytes as f64 / (1u64 << 30) as f64,
             );
-            unsafe { Vec::from_raw_parts(p, total, total) }
+            let skew = (VIEW_ALIGN - (p as usize) % VIEW_ALIGN) % VIEW_ALIGN;
+            (unsafe { Vec::from_raw_parts(p, bytes, bytes) }, skew)
         };
-        let mut arena = arena;
 
         // How many threads fetch, verify and copy. Unset means one per core.
         // `INK_COPY_THREADS=1` is the sequential lane this replaced, kept
@@ -1254,7 +1273,7 @@ impl PileSource {
         }
         bounds.push(jobs.len());
 
-        let mut rest: &mut [u8] = arena.as_mut_slice();
+        let mut rest: &mut [u8] = &mut arena.as_mut_slice()[skew..skew + total];
         let mut shards: Vec<(&mut [u8], usize, &[(usize, usize, Job)])> = Vec::new();
         let mut base = 0usize;
         for w in bounds.windows(2) {
@@ -1392,7 +1411,7 @@ impl PileSource {
             .zip(expert_offsets)
         {
             self.copied_experts.insert(key.clone(), CopiedExpert {
-                payload: bytes.slice(start..end),
+                payload: bytes.slice(skew + start..skew + end),
                 rows: shape.rows,
                 logical: shape.logical,
                 nvfp4: shape.nvfp4,
@@ -1402,7 +1421,7 @@ impl PileSource {
             self.dense
                 .get_mut(name)
                 .expect("selected dense leaf")
-                .bytes = bytes.slice(start..end);
+                .bytes = bytes.slice(skew + start..skew + end);
         }
         self.copied = Some(bytes);
         Ok((self.copied_experts.len(), dense_names.len(), total as u64))
