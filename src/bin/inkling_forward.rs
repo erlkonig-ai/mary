@@ -1110,6 +1110,15 @@ fn grouped_experts_fp4(
     // whole layer, against two per expert before.
     let t_g = Instant::now();
     let plan = RowPlan::build(by_expert.values(), n, RowPlan::planes());
+    if std::env::var("INK_MOE_DEBUG").is_ok() {
+        eprintln!(
+            "MOEPLAN {prefix} slots={} rows={} tiles={} blocks={}",
+            by_expert.len(),
+            plan.m_total(),
+            plan.m_total() / 16,
+            plan.blk_slot.len()
+        );
+    }
     let m_total = plan.m_total();
     let hn_h = handle_of(hn.clone());
     let h_rowtok = client.create_from_slice(bytes_of(&plan.row_tok));
@@ -1363,6 +1372,15 @@ fn grouped_experts_bf16(
 
     let t_g = Instant::now();
     let plan = RowPlan::build(by_expert.values(), n, RowPlan::planes());
+    if std::env::var("INK_MOE_DEBUG").is_ok() {
+        eprintln!(
+            "MOEPLAN {prefix} slots={} rows={} tiles={} blocks={}",
+            by_expert.len(),
+            plan.m_total(),
+            plan.m_total() / 16,
+            plan.blk_slot.len()
+        );
+    }
     let m_total = plan.m_total();
     let hn_h = handle_of(hn.clone());
     let h_rowtok = client.create_from_slice(bytes_of(&plan.row_tok));
@@ -3278,6 +3296,7 @@ fn main() -> Result<()> {
         print!("{}", cp.io_table(28));
     }
     report_align();
+    mary::models::inkling::bf16gemm::report_hand();
     println!("  elapsed: {:.1}s", started.elapsed().as_secs_f32());
 
 

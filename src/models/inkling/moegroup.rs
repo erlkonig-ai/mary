@@ -231,6 +231,7 @@ pub fn fp4_linear_grouped<AB: Scalar, S: Scalar, NA: Size, NC: Size, NS: Size>(
     out: &mut Tensor<Vector<f32, NC>>,
     #[comptime] size_k: usize,
     #[comptime] size_n: usize,
+    #[comptime] nrep: usize,
 ) {
     let def = cmma::MmaDefinition::<AB, AB, f32>::new_scaled::<S>(MTILE, NTILE, KTILE, 4usize);
     let lane = UNIT_POS_PLANE;
@@ -245,7 +246,7 @@ pub fn fp4_linear_grouped<AB: Scalar, S: Scalar, NA: Size, NC: Size, NS: Size>(
         terminate!();
     }
     let m_tile = blk_tile0[blk] as usize + plane as usize;
-    let n_base = n_tile * NTILE;
+    let n_base = n_tile * NTILE * nrep;
     let m_base = m_tile * MTILE;
 
     // Which expert this run of tiles was routed to, and where its two planes
@@ -267,11 +268,21 @@ pub fn fp4_linear_grouped<AB: Scalar, S: Scalar, NA: Size, NC: Size, NS: Size>(
     let vc_c = comptime!(ec_c / vs_c);
 
     let mut reg_a = Array::<Vector<AB, NA>>::new(vc_a);
-    let mut reg_b = Array::<Vector<AB, NA>>::new(vc_b);
-    let mut acc = Array::<Vector<f32, NC>>::new(vc_c);
+    // `nrep` B fragments and `nrep` accumulators, live across the whole k
+    // loop, so one A fragment and one A scale vector feed `nrep` products.
+    // A `Sequence` because `execute_scaled` takes a WHOLE `Array` -- one wider
+    // array cannot be sliced into an operand.
+    let mut regs_b = Sequence::<Array<Vector<AB, NA>>>::new();
+    let mut accs = Sequence::<Array<Vector<f32, NC>>>::new();
     #[unroll]
-    for i in 0..vc_c {
-        acc[i] = Vector::<f32, NC>::cast_from(0.0f32);
+    for _ in 0..nrep {
+        regs_b.push(Array::<Vector<AB, NA>>::new(vc_b));
+        let mut acc = Array::<Vector<f32, NC>>::new(vc_c);
+        #[unroll]
+        for i in 0..vc_c {
+            acc[i] = Vector::<f32, NC>::cast_from(0.0f32);
+        }
+        accs.push(acc);
     }
 
     // The instruction wants FOUR E4M3 block scales per operand per k tile, and
@@ -301,42 +312,60 @@ pub fn fp4_linear_grouped<AB: Scalar, S: Scalar, NA: Size, NC: Size, NS: Size>(
             reg_a[i] = a[(gr * size_k / 2 + gc / 2) / a.vector_size()];
         }
         #[unroll]
-        for i in 0..vc_b {
-            let (row, col) = def.position_of_nth(lane, (i * vs_b * pack) as u32, MatrixIdent::B);
-            let gr = col as usize + n_base;
-            let gc = row as usize + kbase;
-            reg_b[i] = b[(b_base + gr * size_k / 2 + gc / 2) / b.vector_size()];
+        for j in 0..nrep {
+            let rb = regs_b.index_mut(j);
+            #[unroll]
+            for i in 0..vc_b {
+                let (row, col) =
+                    def.position_of_nth(lane, (i * vs_b * pack) as u32, MatrixIdent::B);
+                let gr = col as usize + n_base + j * NTILE;
+                let gc = row as usize + kbase;
+                rb[i] = b[(b_base + gr * size_k / 2 + gc / 2) / b.vector_size()];
+            }
         }
 
         // One 32-bit load each, then into a MUTABLE local: the MMA intrinsic
         // takes its scale registers by non-const reference, so a value that
         // came straight out of a load and is never written cannot be handed to
         // it -- NVRTC rejects the generated cast. The four moves below are
-        // register traffic, not memory.
+        // register traffic, not memory. The A side is loaded ONCE for all
+        // `nrep` products; only the B side moves with the N tile.
         let va = a_sc[((sia + m_base) * spr + t * 4) / a_sc.vector_size()];
-        let vb = b_sc[(bsc_base + (sib + n_base) * spr + t * 4) / b_sc.vector_size()];
         let mut sa = Vector::<S, NS>::empty();
-        let mut sb = Vector::<S, NS>::empty();
         #[unroll]
         for i in 0..SCALE_VEC {
             sa[i] = va[i];
-            sb[i] = vb[i];
         }
 
-        let d = def.execute_scaled(&reg_a, &reg_b, &acc, sa, sb);
         #[unroll]
-        for i in 0..vc_c {
-            acc[i] = d[i];
+        for j in 0..nrep {
+            let vb = b_sc
+                [(bsc_base + (sib + n_base + j * NTILE) * spr + t * 4) / b_sc.vector_size()];
+            let mut sb = Vector::<S, NS>::empty();
+            #[unroll]
+            for i in 0..SCALE_VEC {
+                sb[i] = vb[i];
+            }
+            let d = def.execute_scaled(&reg_a, regs_b.index(j), accs.index(j), sa, sb);
+            let ac = accs.index_mut(j);
+            #[unroll]
+            for i in 0..vc_c {
+                ac[i] = d[i];
+            }
         }
     }
 
     #[unroll]
-    for i in 0..vc_c {
-        let (row, col) = def.position_of_nth(lane, (i * vs_c) as u32, MatrixIdent::Accumulator);
-        let gr = row as usize + m_base;
-        let gc = col as usize + n_base;
-        out[(gr * size_n + gc) / out.vector_size()] =
-            acc[i] * Vector::<f32, NC>::cast_from(scale);
+    for j in 0..nrep {
+        let ac = accs.index(j);
+        #[unroll]
+        for i in 0..vc_c {
+            let (row, col) = def.position_of_nth(lane, (i * vs_c) as u32, MatrixIdent::Accumulator);
+            let gr = row as usize + m_base;
+            let gc = col as usize + n_base + j * NTILE;
+            out[(gr * size_n + gc) / out.vector_size()] =
+                ac[i] * Vector::<f32, NC>::cast_from(scale);
+        }
     }
 }
 
@@ -369,6 +398,10 @@ pub fn fp4_linear_grouped_launch<R: Runtime>(
         k / GROUP
     );
 
+    // How many N tiles one plane keeps in registers; see [`grouped_nrep`].
+    let nrep = grouped_nrep(n, m_total);
+    let n_cubes = n / (NTILE * nrep);
+
     let out = client.empty(m_total * n * core::mem::size_of::<f32>());
     let vs = 32 / e2m1x2::cube_type().size_bits();
     let spr = k / GROUP;
@@ -383,7 +416,7 @@ pub fn fp4_linear_grouped_launch<R: Runtime>(
     unsafe {
         fp4_linear_grouped::launch::<e2m1x2, e4m3, R>(
             client,
-            CubeCount::Static((n / NTILE) as u32, blk.blocks as u32, 1),
+            CubeCount::Static(n_cubes as u32, blk.blocks as u32, 1),
             CubeDim::new_1d(32 * blk.planes as u32),
             AddressType::U64,
             vs,
@@ -401,6 +434,7 @@ pub fn fp4_linear_grouped_launch<R: Runtime>(
             TensorArg::from_raw_parts(out.clone(), [n, 1].into(), [m_total, n].into()),
             k,
             n,
+            nrep,
         )
     };
     out
@@ -433,6 +467,7 @@ pub fn bf16_linear_grouped<AB: Scalar, NA: Size, NC: Size>(
     out: &mut Tensor<Vector<f32, NC>>,
     #[comptime] size_k: usize,
     #[comptime] size_n: usize,
+    #[comptime] nrep: usize,
 ) {
     let def = cmma::MmaDefinition::<AB, AB, f32>::new(MTILE, NTILE, BF16_KTILE);
     let lane = UNIT_POS_PLANE;
@@ -445,7 +480,7 @@ pub fn bf16_linear_grouped<AB: Scalar, NA: Size, NC: Size>(
         terminate!();
     }
     let m_tile = blk_tile0[blk] as usize + plane as usize;
-    let n_base = n_tile * NTILE;
+    let n_base = n_tile * NTILE * nrep;
     let m_base = m_tile * MTILE;
 
     let slot = blk_slot[blk] as usize;
@@ -462,11 +497,21 @@ pub fn bf16_linear_grouped<AB: Scalar, NA: Size, NC: Size>(
     let vc_c = comptime!(ec_c / vs_c);
 
     let mut reg_a = Array::<Vector<AB, NA>>::new(vc_a);
-    let mut reg_b = Array::<Vector<AB, NA>>::new(vc_b);
-    let mut acc = Array::<Vector<f32, NC>>::new(vc_c);
+    // `nrep` B fragments and `nrep` accumulators, held live across the whole k
+    // loop. A `Sequence` because `MmaDefinition::execute` takes a WHOLE
+    // `Array` -- one wider array cannot be sliced into an operand -- so the
+    // repetition has to live in the comptime container, not in the indexing.
+    let mut regs_b = Sequence::<Array<Vector<AB, NA>>>::new();
+    let mut accs = Sequence::<Array<Vector<f32, NC>>>::new();
     #[unroll]
-    for i in 0..vc_c {
-        acc[i] = Vector::<f32, NC>::cast_from(0.0f32);
+    for _ in 0..nrep {
+        regs_b.push(Array::<Vector<AB, NA>>::new(vc_b));
+        let mut acc = Array::<Vector<f32, NC>>::new(vc_c);
+        #[unroll]
+        for i in 0..vc_c {
+            acc[i] = Vector::<f32, NC>::cast_from(0.0f32);
+        }
+        accs.push(acc);
     }
 
     let k_tiles = comptime!(size_k / BF16_KTILE);
@@ -481,26 +526,44 @@ pub fn bf16_linear_grouped<AB: Scalar, NA: Size, NC: Size>(
             reg_a[i] = a[(gr * size_k + gc) / a.vector_size()];
         }
         #[unroll]
-        for i in 0..vc_b {
-            let (row, col) = def.position_of_nth(lane, (i * vs_b * pack) as u32, MatrixIdent::B);
-            let gr = col as usize + n_base;
-            let gc = row as usize + kbase;
-            reg_b[i] = b[(b_base + gr * size_k + gc) / b.vector_size()];
+        for j in 0..nrep {
+            let rb = regs_b.index_mut(j);
+            #[unroll]
+            for i in 0..vc_b {
+                let (row, col) =
+                    def.position_of_nth(lane, (i * vs_b * pack) as u32, MatrixIdent::B);
+                let gr = col as usize + n_base + j * NTILE;
+                let gc = row as usize + kbase;
+                rb[i] = b[(b_base + gr * size_k + gc) / b.vector_size()];
+            }
         }
 
-        let d = def.execute(&reg_a, &reg_b, &acc);
+        // The whole point of the repetition: ONE A fragment feeds `nrep` MMAs,
+        // so the A loads above are amortised over `nrep` products rather than
+        // being reissued for each of them. A is the larger half of this
+        // kernel global traffic and the half L2 serves, because cubes that
+        // share an m tile differ only in `CUBE_POS_X` and run together.
         #[unroll]
-        for i in 0..vc_c {
-            acc[i] = d[i];
+        for j in 0..nrep {
+            let d = def.execute(&reg_a, regs_b.index(j), accs.index(j));
+            let ac = accs.index_mut(j);
+            #[unroll]
+            for i in 0..vc_c {
+                ac[i] = d[i];
+            }
         }
     }
 
     #[unroll]
-    for i in 0..vc_c {
-        let (row, col) = def.position_of_nth(lane, (i * vs_c) as u32, MatrixIdent::Accumulator);
-        let gr = row as usize + m_base;
-        let gc = col as usize + n_base;
-        out[(gr * size_n + gc) / out.vector_size()] = acc[i];
+    for j in 0..nrep {
+        let ac = accs.index(j);
+        #[unroll]
+        for i in 0..vc_c {
+            let (row, col) = def.position_of_nth(lane, (i * vs_c) as u32, MatrixIdent::Accumulator);
+            let gr = row as usize + m_base;
+            let gc = col as usize + n_base + j * NTILE;
+            out[(gr * size_n + gc) / out.vector_size()] = ac[i];
+        }
     }
 }
 
@@ -525,6 +588,9 @@ pub fn bf16_linear_grouped_launch<R: Runtime>(
     assert_eq!(m_total % MTILE, 0, "m_total {m_total} is not a multiple of {MTILE}");
     assert_eq!(n % NTILE, 0, "n {n} is not a multiple of {NTILE}");
     assert_eq!(k % BF16_KTILE, 0, "k {k} is not a multiple of {BF16_KTILE}");
+    // How many N tiles one plane keeps in registers; see [`grouped_nrep`].
+    let nrep = grouped_nrep(n, m_total);
+    let n_cubes = n / (NTILE * nrep);
 
     let out = client.empty(m_total * n * core::mem::size_of::<f32>());
     let vs = 32 / half::bf16::cube_type().size_bits();
@@ -534,7 +600,7 @@ pub fn bf16_linear_grouped_launch<R: Runtime>(
     unsafe {
         bf16_linear_grouped::launch::<half::bf16, R>(
             client,
-            CubeCount::Static((n / NTILE) as u32, blk.blocks as u32, 1),
+            CubeCount::Static(n_cubes as u32, blk.blocks as u32, 1),
             CubeDim::new_1d(32 * blk.planes as u32),
             AddressType::U64,
             vs,
@@ -548,10 +614,75 @@ pub fn bf16_linear_grouped_launch<R: Runtime>(
             TensorArg::from_raw_parts(out.clone(), [n, 1].into(), [m_total, n].into()),
             k,
             n,
+            nrep,
         )
     };
     out
 }
+
+/// How many N tiles one plane of a grouped GEMM keeps in registers.
+///
+/// A plane holding `nrep` B fragments issues `nrep` MMAs off ONE A fragment
+/// and one A scale vector, so the A side of the inner loop is divided by
+/// `nrep`. That is a PREFILL schedule, exactly as the plane count is, and for
+/// the same reason: it is a trade of registers for loads, and it only pays
+/// when there is enough m behind it to pay with.
+///
+/// Measured on this part, layers 0:8, `INK_REPEAT=1`, p50 over 24 warm passes,
+/// two interleaved rounds at each length, `nrep` 1 against 8:
+///
+/// ```text
+///   prompt   m tiles/layer     nrep 1      nrep 8
+///     128         83           86.1 ms    97.9-106.8 ms   <- LOSES
+///     256        135          113.0 ms     103.5 ms
+///     384        176          159.2 ms     140.9 ms
+///     512        227          205.9 ms     174.5 ms       <- -31.4 ms
+///   decode        ~8           37.6 ms      38.3 ms       <- loses
+/// ```
+///
+/// So the crossover is BRACKETED between 83 and 135 tiles and is not localised
+/// further; [`NREP_TILES`] puts the step inside that bracket, at "sixteen m
+/// tiles behind each of the `nrep` products". A step there is harmless because
+/// the two arms are within a few ms of each other on either side of it -- the
+/// 128-token loss and the 256-token win are both about 10 ms, against a 31 ms
+/// win at 512 where the schedule is unambiguous.
+///
+/// The tried mechanism that is NOT the explanation: plane fill. At 128 tokens
+/// most experts contribute one m tile, so three of a four-plane cube's planes
+/// terminate, and "the register tile costs occupancy and occupancy only
+/// matters when the planes are empty" predicts `INK_MOE_PLANES=1` should
+/// rescue it. It does the opposite -- 128 tokens at one plane and `nrep` 8 is
+/// 178 ms against 105 at four planes -- so the cost is not plane fill and the
+/// threshold below is empirical, not derived.
+///
+/// `INK_MOE_NREP` overrides the width. It has to DIVIDE the N tile count, so a
+/// width that does not admit the requested repetition takes the largest one
+/// that does -- a kernel that refuses a shape the model issues is not a
+/// fallback, it is a crash.
+pub fn grouped_nrep(n: usize, m_total: usize) -> usize {
+    use std::sync::OnceLock;
+    static R: OnceLock<usize> = OnceLock::new();
+    let want = *R.get_or_init(|| {
+        std::env::var("INK_MOE_NREP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v >= 1 && v <= 64)
+            .unwrap_or(8)
+    });
+    let mut r = want;
+    if m_total / MTILE < NREP_TILES * want {
+        r = 1;
+    }
+    while r > 1 && (n / NTILE) % r != 0 {
+        r -= 1;
+    }
+    r
+}
+
+/// M tiles a layer needs per repeated N tile before the wide register tile is
+/// worth its registers. See [`grouped_nrep`] for the measurement that placed
+/// it; the bracket it sits in is 83 to 135 tiles at `nrep` 8.
+pub const NREP_TILES: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Scatter
