@@ -1,5 +1,6 @@
 //! The attention score epilogue as ONE kernel: scale, relative-position bias,
-//! causal mask and sliding window, in a single pass over `[heads, n, n]`.
+//! causal mask and sliding window, in a single pass over one QUERY BLOCK of the
+//! score matrix, `[heads, rows, n]`.
 //!
 //! # What it replaces, and why that mattered
 //!
@@ -56,10 +57,30 @@
 //! Three sizes agreeing is what a 32-bit overflow looks like from below.
 //!
 //! So the head is a launch, not a grid dimension: `Handle::offset_start` moves
-//! the base pointer by `head * n^2 * 4` bytes and the kernel indexes `0..n^2`.
-//! `rel` stays whole because `n * heads * eff` is 4.6e8 at the memory ceiling,
-//! and that is asserted rather than assumed. The extra launches are 32 per
-//! layer against a kernel that runs for tens of milliseconds.
+//! the base pointer by `head * rows * row * 4` bytes and the kernel indexes
+//! `0..rows * n`. The extra launches are 32 per query block against a kernel
+//! that runs for milliseconds.
+//!
+//! # Queries come in blocks, and the block is why the index is small again
+//!
+//! The caller no longer hands over a whole `[heads, n, n]`; it hands over the
+//! `[heads, rows, n]` slice belonging to queries `q_lo .. q_lo + rows`. That is
+//! what keeps a long sequence linear in allocation instead of quadratic, and it
+//! also puts `rows * n` back a long way under `u32::MAX` -- the block is sized
+//! against a byte budget, so `rows * n` is bounded by that budget divided by
+//! `heads * 4` no matter how long the sequence gets.
+//!
+//! `q_lo` is a parameter and not derivable here. The causal predicate, the
+//! window and the relative distance are all functions of the ABSOLUTE query
+//! position; a block that used its local row index would attend to the wrong
+//! keys in every block but the first, and would do it silently, since block
+//! zero -- the one a small test exercises -- is exactly the case where the two
+//! agree.
+//!
+//! `rel` is the block's own `[rows, heads, eff]`, not a window into a
+//! whole-sequence table. The whole-sequence version is `n * heads * eff`
+//! floats, which is 13.2 GiB at 100k tokens -- larger than the score block it
+//! feeds, and quadratic-looking in a term that is supposed to be the cheap one.
 
 use cubecl::prelude::*;
 use cubecl::server::Handle;
@@ -80,6 +101,8 @@ fn score_epilogue_kernel(
     rel: &Array<f32>,
     scaling: f32,
     tokens: u32,
+    rows: u32,
+    q_lo: u32,
     heads: u32,
     head: u32,
     eff: u32,
@@ -87,13 +110,16 @@ fn score_epilogue_kernel(
     window: u32,
 ) {
     let flat = ABSOLUTE_POS_X;
-    if flat < tokens * tokens {
-        let q = flat / tokens;
+    if flat < rows * tokens {
+        let r = flat / tokens;
         let k = flat % tokens;
+        // The block's row index is LOCAL and its query position is ABSOLUTE.
+        // Everything below the buffer index uses the absolute one.
+        let q = q_lo + r;
         // The score matrix is PADDED, not contiguous: `row` is the matmul's
         // own row stride, 7040 where `tokens` is 7000. Honouring it here is
         // what lets the caller skip a 6.3 GiB contiguity copy per layer.
-        let i = q * row + k;
+        let i = r * row + k;
 
         // Causality and the window, as the predicate the additive mask encoded.
         if k <= q {
@@ -101,7 +127,7 @@ fn score_epilogue_kernel(
             if window == 0u32 || dist < window {
                 let mut b = f32::new(0.0);
                 if dist < eff {
-                    b = rel[(q * heads * eff + head * eff + dist) as usize];
+                    b = rel[(r * heads * eff + head * eff + dist) as usize];
                 }
                 scores[i as usize] = scores[i as usize] * scaling + b;
             } else {
@@ -113,9 +139,11 @@ fn score_epilogue_kernel(
     }
 }
 
-/// Launch the epilogue over `[heads, tokens, tokens]`, in place on `scores`.
+/// Launch the epilogue over one query block, `[heads, rows, tokens]`, in place
+/// on `scores`.
 ///
-/// `rel` is `[tokens, heads, eff]`. `window` is `Some(w)` on a local layer and
+/// `q_lo` is the absolute position of the block's first query and `rel` is the
+/// block's own `[rows, heads, eff]`. `window` is `Some(w)` on a local layer and
 /// `None` on a global one -- the same distinction
 /// [`super::attn::causal_mask`] took, expressed as a predicate instead of as an
 /// `n^2` tensor of zeros and negative infinities.
@@ -125,6 +153,8 @@ pub fn score_epilogue_launch<R: Runtime>(
     scores: &Handle,
     rel: &Handle,
     heads: usize,
+    rows: usize,
+    q_lo: usize,
     tokens: usize,
     eff: usize,
     strides: [usize; 3],
@@ -132,11 +162,18 @@ pub fn score_epilogue_launch<R: Runtime>(
     window: Option<usize>,
 ) {
     assert!(tokens > 0 && heads > 0, "an empty attention has no epilogue");
+    assert!(rows > 0, "an empty query block has no epilogue");
     assert!(eff > 0, "the relative table must reach at least one distance");
-    let per_head = tokens * tokens;
+    assert!(
+        q_lo + rows <= tokens,
+        "query block {q_lo}..{} runs past a {tokens}-token sequence",
+        q_lo + rows
+    );
+    let per_head = rows * tokens;
     assert!(
         per_head <= u32::MAX as usize,
-        "{tokens} tokens is {per_head} score elements, past the 32-bit launch index"
+        "a {rows}-query block over {tokens} tokens is {per_head} score elements, past the \
+         32-bit launch index"
     );
     assert!(
         strides[0] <= u32::MAX as usize,
@@ -144,9 +181,9 @@ pub fn score_epilogue_launch<R: Runtime>(
         strides[0]
     );
     assert!(
-        tokens * heads * eff <= u32::MAX as usize,
-        "the relative table is {} elements, past the 32-bit index",
-        tokens * heads * eff
+        rows * heads * eff <= u32::MAX as usize,
+        "the block's relative table is {} elements, past the 32-bit index",
+        rows * heads * eff
     );
     assert_eq!(strides[2], 1, "the innermost stride is {}, not 1", strides[2]);
     assert!(strides[1] >= tokens, "a row stride of {} cannot hold {tokens}", strides[1]);
@@ -154,13 +191,13 @@ pub fn score_epilogue_launch<R: Runtime>(
     let cubes = (per_head as u32).div_ceil(CUBE_SIZE);
     let f32b = core::mem::size_of::<f32>();
     for head in 0..heads {
-        // The head's slice of the score matrix, as its own array. One launch
-        // per head rather than a `[cubes, heads]` grid because the flat index
-        // `head * n^2 + i` is 6.4e9 at 14124 tokens and every device-side index
-        // here is 32-bit: a single grid produced a silently WRONG answer above
-        // n = 11586 -- heads 22..31 wrapped -- while agreeing to four decimals
-        // at 512, 3732 and 7000. `offset_start` moves the base pointer instead,
-        // so the largest index a kernel forms is n^2.
+        // The head's slice of the block, as its own array. One launch per head
+        // rather than a `[cubes, heads]` grid because the flat index
+        // `head * rows * row + i` is 32-bit on this runtime: a single grid
+        // produced a silently WRONG answer above n = 11586 -- heads 22..31
+        // wrapped -- while agreeing to four decimals at 512, 3732 and 7000.
+        // `offset_start` moves the base pointer instead, so the largest index a
+        // kernel forms is one head of one block.
         let slice = scores.clone().offset_start((head * strides[0] * f32b) as u64);
         unsafe {
             score_epilogue_kernel::launch_unchecked::<R>(
@@ -168,9 +205,11 @@ pub fn score_epilogue_launch<R: Runtime>(
                 CubeCount::Static(cubes, 1, 1),
                 CubeDim::new_1d(CUBE_SIZE),
                 ArrayArg::from_raw_parts(slice, strides[0]),
-                ArrayArg::from_raw_parts(rel.clone(), heads * tokens * eff),
+                ArrayArg::from_raw_parts(rel.clone(), rows * heads * eff),
                 scaling,
                 tokens as u32,
+                rows as u32,
+                q_lo as u32,
                 heads as u32,
                 head as u32,
                 eff as u32,

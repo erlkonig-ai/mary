@@ -425,7 +425,7 @@ pub fn attention_prefill(
     mask_window: Option<usize>,
     window: Option<usize>,
 ) -> (Tensor<Bk, 2>, AttnCache<Bk>) {
-    attention_prefill_lane(x, w, d, log_scaling, mask_window, window, true)
+    attention_prefill_lane(x, w, d, log_scaling, mask_window, window, true, None)
 }
 
 /// The same layer with the banded lane REFUSED, so a test can hold the two
@@ -443,8 +443,9 @@ pub(crate) fn attention_prefill_dense(
     log_scaling: Option<crate::models::inkling::attn::LogScaling>,
     mask_window: Option<usize>,
     window: Option<usize>,
+    block: Option<usize>,
 ) -> (Tensor<Bk, 2>, AttnCache<Bk>) {
-    attention_prefill_lane(x, w, d, log_scaling, mask_window, window, false)
+    attention_prefill_lane(x, w, d, log_scaling, mask_window, window, false, block)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -456,6 +457,7 @@ fn attention_prefill_lane(
     mask_window: Option<usize>,
     window: Option<usize>,
     banded_ok: bool,
+    block: Option<usize>,
 ) -> (Tensor<Bk, 2>, AttnCache<Bk>) {
     use crate::models::inkling::config::AttnKind;
 
@@ -493,23 +495,6 @@ fn attention_prefill_lane(
     // `tokens - 1` and the table stops at `rel_extent`.
     let eff = d.rel_extent.min(tokens);
 
-    // `[heads, tokens, eff]`, and eff <= 1024 -- linear in the sequence, not
-    // quadratic. This is the ONLY thing the epilogue reads besides the scores
-    // themselves; the `[heads, n, n]` index, validity, bias and mask tensors
-    // that used to stand between this and the softmax are gone into
-    // `scorebias::score_epilogue_launch`, which recomputes what each of them
-    // held from `(q, k)` in a register. See that module for why.
-    //
-    // Left at `[tokens, heads, eff]` rather than swapped to `[heads, tokens,
-    // eff]`: the swap is a permuted VIEW, and every later reshape of a permuted
-    // view is a copy. The kernel takes the head stride as an argument instead,
-    // which costs an index multiply and moves no bytes.
-    let rel = r
-        .reshape([tokens * heads, d.d_rel])
-        .matmul(w.rel_proj.clone().slice([0..d.d_rel, 0..eff]))
-        .reshape([tokens, heads, eff])
-        * tau.reshape([tokens, 1, 1]);
-
     // A local layer is a BAND, and the band is the whole of its attention:
     // `[tokens, heads * head_dim]` out, one kernel, nothing quadratic written
     // down at any point. Thirty-five of this model's forty-two attention layers
@@ -517,12 +502,30 @@ fn attention_prefill_lane(
     // transposes and the `[heads, n, n]` scores -- is built only for the seven
     // that are global, because a global layer really does read every key.
     let out: Tensor<Bk, 2> = match mask_window {
-        Some(w)
+        // `win` and not `w`: the weights are `w` in this function, and a match
+        // binding that shadowed them would silently reach the window wherever a
+        // projection was meant.
+        Some(win)
             if banded_ok
-                && crate::models::inkling::banded::applies(heads, kv_heads, head_dim, w) =>
+                && crate::models::inkling::banded::applies(heads, kv_heads, head_dim, win) =>
         {
             use crate::models::inkling::banded::banded_attention_launch;
             use crate::models::inkling::seam::{client_of, handle_of, tensor_of};
+            // `[tokens, heads, eff]`, and eff <= 1024 -- linear in the
+            // sequence. The band reads it whole because it runs the whole
+            // sequence in one launch; the dense arm below builds it a query
+            // block at a time, for which see the loop there.
+            //
+            // Left at `[tokens, heads, eff]` rather than swapped to
+            // `[heads, tokens, eff]`: the swap is a permuted VIEW, and every
+            // later reshape of a permuted view is a copy. The kernel takes the
+            // head stride as an argument instead, which costs an index multiply
+            // and moves no bytes.
+            let rel = r
+                .reshape([tokens * heads, d.d_rel])
+                .matmul(w.rel_proj.clone().slice([0..d.d_rel, 0..eff]))
+                .reshape([tokens, heads, eff])
+                * tau.reshape([tokens, 1, 1]);
             let client = client_of(&q);
             // Q, K, V and the relative table exactly as the projections left
             // them: `[tokens, heads * head_dim]` and `[tokens, kv_heads *
@@ -552,16 +555,29 @@ fn attention_prefill_lane(
                 kv_heads,
                 head_dim,
                 eff,
-                w,
+                win,
                 d.scaling(),
             );
             tensor_of(client, dev.clone(), o, tokens, heads * head_dim)
         }
         _ => {
+            // A global layer reads every key, so there is a square to compute.
+            // It does not have to be MATERIALISED square: the queries come in
+            // blocks of `rows`, and one block holds `[heads, rows, tokens]`
+            // instead of `[heads, tokens, tokens]`. Same arithmetic, same
+            // answer, same number of multiplies -- the only thing that changes
+            // is that the largest allocation grows linearly in the sequence
+            // rather than quadratically, and the per-buffer cap this device
+            // enforces stops being what decides how long an input may be.
+            use crate::models::inkling::budget::query_block;
+            use crate::models::inkling::scorebias::score_epilogue_launch;
+            use crate::models::inkling::seam::{
+                client_of, handle_of, strided_of3, tensor_of3, tensor_strided3,
+            };
+
             // [heads, tokens, head_dim]; the KV heads are repeated in place, so
             // head h reads kv head h / groups exactly as the slice lane indexes
             // it.
-            let qh = q.reshape([tokens, heads, head_dim]).swap_dims(0, 1);
             let expand = |t: Tensor<Bk, 2>| -> Tensor<Bk, 3> {
                 t.reshape([tokens, kv_heads, head_dim])
                     .swap_dims(0, 1)
@@ -569,20 +585,63 @@ fn attention_prefill_lane(
                     .repeat_dim(1, groups)
                     .reshape([heads, tokens, head_dim])
             };
-            let kh = expand(k.clone());
-            let vh = expand(v.clone());
+            let qv = q.reshape([tokens, heads, head_dim]).swap_dims(0, 1);
+            let client = client_of(&qv);
 
-            // `q @ k^T` raw, then scaled, biased and masked IN PLACE by one
-            // kernel. `handle_of` consumes the tensor, so after that line there
-            // is exactly one name for the buffer and writing through it is not
-            // aliasing.
-            let scores = {
-                use crate::models::inkling::scorebias::score_epilogue_launch;
-                use crate::models::inkling::seam::{
-                    client_of, handle_of, strided_of3, tensor_strided3,
-                };
-                let raw = qh.matmul(kh.swap_dims(1, 2));
-                let client = client_of(&raw);
+            // Q, K^T and V made contiguous ONCE, ahead of the loop. Every query
+            // block reads all of K and V, and a permuted view handed to the
+            // matmul is made contiguous BY the matmul -- which is the whole of
+            // it, per block, instead of once per layer.
+            let qh = {
+                let h = handle_of(qv);
+                tensor_of3(client.clone(), dev.clone(), h, heads, tokens, head_dim)
+            };
+            let kt = {
+                let h = handle_of(expand(k.clone()).swap_dims(1, 2));
+                tensor_of3(client.clone(), dev.clone(), h, heads, head_dim, tokens)
+            };
+            let vh = {
+                let h = handle_of(expand(v.clone()));
+                tensor_of3(client.clone(), dev.clone(), h, heads, tokens, head_dim)
+            };
+
+            let rel_proj = w.rel_proj.clone().slice([0..d.d_rel, 0..eff]);
+            // A parameter, not just `query_block`, because the only bug this
+            // change can introduce is a block that reads its query position
+            // LOCALLY, and that bug is invisible in block zero. A test needs to
+            // force several blocks at a shape small enough to check, and a
+            // process-global env var cannot do that while other tests run.
+            let block = block.unwrap_or_else(|| query_block(heads, tokens)).clamp(1, tokens);
+            let mut parts: Vec<Tensor<Bk, 2>> = Vec::with_capacity(tokens.div_ceil(block));
+            for lo in (0..tokens).step_by(block) {
+                let hi = (lo + block).min(tokens);
+                let rows = hi - lo;
+
+                // This block's relative table, `[rows, heads, eff]`, built here
+                // rather than sliced out of a whole-sequence one. The
+                // whole-sequence version is `tokens * heads * eff` floats --
+                // 13.2 GiB at 100k tokens, LARGER than the score block it feeds,
+                // and it would have become the ceiling the moment the scores
+                // stopped being it.
+                let rel = r
+                    .clone()
+                    .slice([lo..hi, 0..heads * d.d_rel])
+                    .reshape([rows * heads, d.d_rel])
+                    .matmul(rel_proj.clone())
+                    .reshape([rows, heads, eff])
+                    * tau.clone().slice([lo..hi]).reshape([rows, 1, 1]);
+
+                // `q_block @ k^T` raw, then scaled, biased and masked IN PLACE
+                // by one kernel. `handle_of` consumes the tensor, so after that
+                // line there is exactly one name for the buffer and writing
+                // through it is not aliasing.
+                //
+                // `lo` goes to the kernel because the causal predicate, the
+                // window and the relative distance are all functions of the
+                // ABSOLUTE query position. A block that used its local row
+                // index would attend to the wrong keys everywhere except block
+                // zero -- which is exactly the block a small test exercises.
+                let raw = qh.clone().slice([0..heads, lo..hi, 0..head_dim]).matmul(kt.clone());
                 let rel_h = handle_of(rel);
                 let (s_h, st) = strided_of3(raw);
                 score_epilogue_launch(
@@ -590,19 +649,27 @@ fn attention_prefill_lane(
                     &s_h,
                     &rel_h,
                     heads,
+                    rows,
+                    lo,
                     tokens,
                     eff,
                     st,
                     d.scaling(),
                     mask_window,
                 );
-                tensor_strided3(client, dev.clone(), s_h, [heads, tokens, tokens], st)
-            };
-            let probs = burn::tensor::activation::softmax(scores, 2);
-            probs
-                .matmul(vh)
-                .swap_dims(0, 1)
-                .reshape([tokens, heads * head_dim])
+                let scores =
+                    tensor_strided3(client.clone(), dev.clone(), s_h, [heads, rows, tokens], st);
+                let probs = burn::tensor::activation::softmax(scores, 2);
+                parts.push(
+                    probs.matmul(vh.clone()).swap_dims(0, 1).reshape([rows, heads * head_dim]),
+                );
+            }
+            // One block is the whole sequence at short context, and `cat` of a
+            // single tensor is a copy of it.
+            match parts.len() {
+                1 => parts.pop().expect("one block"),
+                _ => Tensor::cat(parts, 0),
+            }
         }
     };
 
@@ -1173,6 +1240,71 @@ mod tests {
     ///
     /// The bound is [`CACHE_TOLERANCE_LOCAL`], and it is a bound on TF32, not on
     /// the band: the tight gate on the band is in `banded.rs`, against f64.
+    /// A blocked dense lane must answer what an unblocked one does.
+    ///
+    /// The one thing query blocking can get wrong is the query POSITION: the
+    /// causal predicate, the sliding window and the relative distance are all
+    /// functions of the absolute position, and a block that used its local row
+    /// index instead would attend to the wrong keys in every block but the
+    /// first. That failure is invisible at any shape small enough to fit in one
+    /// block, which is every other test in this module, so the block size is a
+    /// parameter here and the sizes below are chosen NOT to divide the
+    /// sequence -- an off-by-one in the last, short block reads the same as a
+    /// correct one when the blocks are even.
+    ///
+    /// Both arms are the same kernels on the same weights, so the tolerance is
+    /// the f64 one and not the cross-implementation `CACHE_TOLERANCE_LOCAL`:
+    /// only the matmul tiling differs, and TF32 accumulation order with it.
+    #[test]
+    fn query_blocks_agree_with_one_block() {
+        let dev = burn::backend::cuda::CudaDevice::default();
+        for (kind, rel_extent, win) in [
+            (AttnKind::Global, 16usize, None),
+            (AttnKind::Local, 8, Some(6usize)),
+        ] {
+            let d = dims(kind, rel_extent);
+            let w = weights(&d, &dev);
+            let ls = match kind {
+                AttnKind::Global => Some(LogScaling { n_floor: 8.0, alpha: 0.5 }),
+                AttnKind::Local => None,
+            };
+            for tokens in [37usize, 64, 91] {
+                let xs: Tensor<B, 2> = Tensor::from_data(
+                    TensorData::new(fill(tokens * d.hidden, 0.05), [tokens, d.hidden]),
+                    &dev,
+                );
+                let whole =
+                    attention_prefill_dense(xs.clone(), &w, &d, ls, win, win, Some(tokens))
+                        .0
+                        .into_data()
+                        .convert::<f32>()
+                        .into_vec::<f32>()
+                        .expect("f32 rows");
+                for block in [1usize, 5, 8, 13, 32] {
+                    if block >= tokens {
+                        continue;
+                    }
+                    let parts =
+                        attention_prefill_dense(xs.clone(), &w, &d, ls, win, win, Some(block))
+                            .0
+                            .into_data()
+                            .convert::<f32>()
+                            .into_vec::<f32>()
+                            .expect("f32 rows");
+                    let worst = whole
+                        .iter()
+                        .zip(&parts)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    assert!(
+                        worst < 2e-5,
+                        "{kind:?}, {tokens} tokens, block {block}: worst {worst:e}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn banded_and_dense_agree_to_tf32() {
         let dev = burn::backend::cuda::CudaDevice::default();
@@ -1195,7 +1327,7 @@ mod tests {
                 &dev,
             );
             let band = attention_prefill(xs.clone(), &w, &d, None, Some(win), Some(win)).0;
-            let dense = attention_prefill_dense(xs, &w, &d, None, Some(win), Some(win)).0;
+            let dense = attention_prefill_dense(xs, &w, &d, None, Some(win), Some(win), None).0;
             let per_row: Vec<f32> = (0..tokens)
                 .map(|r| {
                     (band.clone().slice([r..r + 1, 0..d.hidden])
