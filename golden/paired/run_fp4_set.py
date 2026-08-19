@@ -60,6 +60,13 @@ def main():
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--port", default="7654")
     ap.add_argument("--timeout", type=float, default=1800.0)
+    # Which runner. The one-box pair over loopback (run_fp4.sh) is no longer
+    # runnable for the full stack -- 42 layers in two processes on one 119 GiB
+    # box is refused by the admission gate, correctly -- so a full-stack set now
+    # names run_fp4_2node.sh and the head lives on $INK_REMOTE.
+    ap.add_argument("--script", default="",
+                    help="runner to invoke per item (default run_fp4.sh, or run_fp4_gen.sh "
+                         "with --gen); pass run_fp4_2node.sh for a two-node pair")
     ap.add_argument("--gen", type=int, default=0,
                     help="generate this many tokens per prompt (run_fp4_gen.sh) instead of "
                          "answering one")
@@ -90,9 +97,10 @@ def main():
         # repeats is a real one and is reported rather than retried away.
         for attempt in (1, 2):
             try:
-                cmd = ([os.path.join(HERE, "run_fp4_gen.sh"), idsf, rundir,
+                script = args.script or ("run_fp4_gen.sh" if args.gen else "run_fp4.sh")
+                cmd = ([os.path.join(HERE, script), idsf, rundir,
                         str(args.gen), args.port] if args.gen else
-                       [os.path.join(HERE, "run_fp4.sh"), idsf, rundir, args.port])
+                       [os.path.join(HERE, script), idsf, rundir, args.port])
                 rc = subprocess.run(cmd, timeout=args.timeout).returncode
             except subprocess.TimeoutExpired:
                 rc = -1

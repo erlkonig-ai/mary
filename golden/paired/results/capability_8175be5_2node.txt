@@ -1,0 +1,103 @@
+The paired capability harness re-run on 8175be5, two-node, 2026-08-19.
+=====================================================================
+
+Prefill went 1213.8 -> 174.3 ms over the day before this. Every step of that was
+validated by a tolerance against our own previous lane or a single "does it emit
+sensible English" check, and neither can answer whether the model is still as
+capable. This is that measurement, taken again.
+
+Four sections, in the order the questions arise:
+
+  1. REPEATS      the same binary on the same ids, four times. It is bit-
+                  identical, so a disagreement below is a property of the model
+                  and not of the run. (On 2026-08-13 this was NOT true: the flip
+                  rate at low margin was 8.55%, and one of eight scored answers
+                  changed between two runs.)
+  2. ISOLATION    the two items that disagree, across the pipeline split and
+                  across the two binaries. Today's run differs from the 08-13
+                  run in two ways -- a day of optimisations, and a 21/21 two-node
+                  split in place of a 20/22 pair over loopback -- and one
+                  comparison cannot separate them.
+  3. OLD vs NEW   both binaries in the SAME two-node configuration, 14 items,
+                  logits rather than argmax. Argmax is a step function over items
+                  whose margins are mostly several logits; it stays flat through
+                  a lot of drift.
+  4. DIRECTION    whether the drift moved the lane toward the BF16 oracle or
+                  away from it.
+
+The headline (paired_open_2node_8175be5.txt) is 38/40 agreement, 1/36 loss,
+McNemar p = 1.0000 -- against 40/40 and 0/36 on 2026-08-13.
+
+--- arith-pct  key=B  BF16 -> B  margin 0.12
+    main  -> C       margin  1.97   C:23.04  #1416:21.07  #1202:20.10  #41021:19.81
+    rep1  -> C       margin  1.97   C:23.04  #1416:21.07  #1202:20.10  #41021:19.81
+    rep2  -> C       margin  1.97   C:23.04  #1416:21.07  #1202:20.10  #41021:19.81
+    rep3  -> C       margin  1.97   C:23.04  #1416:21.07  #1202:20.10  #41021:19.81
+--- code-str  key=C  BF16 -> A  margin 1.25
+    main  -> B       margin  0.56   B:21.07  A:20.51  D:19.15  #30985:18.91
+    rep1  -> B       margin  0.56   B:21.07  A:20.51  D:19.15  #30985:18.91
+    rep2  -> B       margin  0.56   B:21.07  A:20.51  D:19.15  #30985:18.91
+    rep3  -> B       margin  0.56   B:21.07  A:20.51  D:19.15  #30985:18.91
+--- arith-divmod  key=A  BF16 -> A  margin 0.25
+    main  -> A       margin  0.34   A:21.53  B:21.19  #1202:20.62  D:20.34
+    rep1  -> A       margin  0.34   A:21.53  B:21.19  #1202:20.62  D:20.34
+    rep2  -> A       margin  0.34   A:21.53  B:21.19  #1202:20.62  D:20.34
+    rep3  -> A       margin  0.34   A:21.53  B:21.19  #1202:20.62  D:20.34
+--- arith-pct   key=B   BF16 -> B (margin 0.12)
+    08-13 loopback 20/22       -> B       (stored result, no logits kept)
+    new bin, 2node 21/21       -> C       margin  1.97   C:23.04  #1416:21.07  #1202:20.10  #41021:19.81
+    new bin, 2node 20/22       -> C       margin  1.97   C:23.04  #1416:21.07  #1202:20.10  #41021:19.81
+    08-13 bin, 2node 21/21 a   -> B       margin  2.91   B:22.62  #1416:19.71  #1202:19.22  #623:18.59
+    08-13 bin, 2node 21/21 b   -> B       margin  2.91   B:22.62  #1416:19.71  #1202:19.22  #623:18.59
+--- code-str   key=C   BF16 -> A (margin 1.25)
+    08-13 loopback 20/22       -> A       (stored result, no logits kept)
+    new bin, 2node 21/21       -> B       margin  0.56   B:21.07  A:20.51  D:19.15  #30985:18.91
+    new bin, 2node 20/22       -> B       margin  0.56   B:21.07  A:20.51  D:19.15  #30985:18.91
+    08-13 bin, 2node 21/21 a   -> A       margin  0.41   A:22.24  B:21.83  C:19.64  #1202:19.56
+    08-13 bin, 2node 21/21 b   -> A       margin  0.41   A:22.24  B:21.83  C:19.64  #1202:19.56
+NVFP4 2026-08-13 (loopback 20/22) vs today 8175be5 (two-node 21/21), 14 items
+  missing on one side: fact-o1, fact-o2, fact-o4, fact-o5, fact-o7, arith-change, arith-speed, arith-seq, arith-frac, arith-units, code-alias, code-fib, code-default, code-dict, code-str, code-int, con-words, con-nolettere, con-longest, con-notcolour, con-sumdigits, ret-pop, ret-export, ret-where, ret-founded, ret-treaty
+  argmax changed        2/14  (arith-pct, arith-divmod)
+  top-5 id SET identical 5/14
+  top-5 id ORDER identical 0/14
+  |delta| on ids both runs ranked: median 1.070  p90 3.410  max 4.770  (n=14 items)
+  |delta top-1 logit|:             median 0.490  p90 1.950  max 2.710
+
+  item             family       old   new    d top1    max|d| old marg new marg
+  arith-pct        arith          B     C     0.420     4.770     2.91     1.97
+  arith-carry      arith          D     D    -2.710     3.410     3.29     2.71
+  fact-o6          factual        C     C    -1.950     1.950     4.74     3.92
+  fact-o3          factual        D     D    -0.990     1.770     4.20     2.92
+  fact-o0          factual        A     A     0.540     1.570     3.79     3.34
+  con-vowelstart   constraint     C     C    -0.630     1.160     3.32     3.47
+  con-notprime     constraint     A     A    -0.410     1.070     4.45     4.04
+  ret-admin        retrieval      B     B    -0.160     1.070     5.52     6.43
+  code-slice       code           C     C    -0.930     0.930     6.15     5.58
+  arith-divmod     arith          B     A     0.440     0.890     0.04     0.34
+  ret-field        retrieval      A     A    -0.100     0.860     6.02     5.97
+  code-loop        code           B     B    -0.190     0.830     4.59     5.23
+NVFP4 08-13 binary vs 8175be5, BOTH two-node 21/21, against the BF16 oracle
+  items with >=2 ids ranked by all three: 15 of 15 compared
+  argmax == BF16   old 14/15   new 13/15
+  argmax old != new: arith-pct, arith-divmod, code-str
+  mean |logit - BF16| on shared ids (centred), per item:
+    old  median 0.374  mean 0.411
+    new  median 0.479  mean 0.526
+    new is CLOSER to BF16 on 6/15 items
+
+  item               old   new  bf16     old d     new d    ids
+  fact-o0              A     A     A     0.554     0.062      4
+  fact-o3              D     D     D     0.836     0.545      5
+  ret-field            A     A     A     0.474     0.291      4
+  code-slice           C     C     C     0.426     0.279      4
+  ret-largest          D     D     D     0.361     0.232      4
+  ret-admin            B     B     B     0.401     0.339      4
+  con-alpha            D     D     D     0.289     0.312      4
+  con-vowelstart       C     C     C     0.248     0.310      5
+  code-str             A     B     A     0.409     0.531      4
+  arith-divmod         B     A     A     0.374     0.502      5
+  code-loop            B     B     B     0.233     0.492      5
+  fact-o6              C     C     C     0.197     0.479      3
+  arith-carry          D     D     D     1.014     1.435      5
+  con-notprime         A     A     A     0.094     0.573      4
+  arith-pct            B     C     B     0.259     1.502      4
