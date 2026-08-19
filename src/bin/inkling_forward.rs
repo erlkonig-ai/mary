@@ -23,9 +23,40 @@
 //! `INK_LAYERS=LO:HI` runs that half-open range; `INK_PIPE=head:HOST:PORT`
 //! sends the residual stream on when the range ends, and `INK_PIPE=tail:ADDR`
 //! receives it, finishes the stack and returns the argmax. Only `[n, 4096]` f32
-//! crosses — 16 KB per token per boundary, once — which is why the split is by
-//! layer and not within one: splitting a layer needs an all-reduce per layer and
-//! 1 GbE cannot carry it.
+//! crosses — 16 KB per token per boundary, once.
+//!
+//! # The split is by layer for now, and the reason it used to give is wrong
+//!
+//! This doc used to say a within-layer split "needs an all-reduce per layer and
+//! 1 GbE cannot carry it". That measured the management NIC. The boxes are also
+//! joined by a direct-attach ConnectX pair, and on that link, measured:
+//!
+//!   ib_write_lat, 8 KB          3.68 us one way   (p99 3.78, stdev 0.01)
+//!   ib_write_bw, peak          13.02 GB/s         (saturates by 16 KB)
+//!   iperf3 TCP, 8 streams     111 Gbit/s
+//!   NCCL all-reduce, 16 KB     26.84 us           (RoCE, GPU-resident, 2 ranks)
+//!   NCCL all-reduce, large     13.78 GB/s
+//!
+//! A within-layer split wants two all-reduces per layer — one after the
+//! attention out-projection, one after the MoE down-projection — so 84 per
+//! token, each `[1, 4096]`. At the measured 26.84 us that is 2.25 ms per token
+//! against a per-token budget in the tens of ms. Bandwidth is not close to
+//! being the constraint: 84 x 16 KB is 1.3 MB per token, well under a percent
+//! of the link.
+//!
+//! The transport does matter, and it is the whole finding. The kernel network
+//! path on these boxes costs ~185 us round trip for an 8 KB ping-pong (ICMP
+//! agrees: 171 us minimum), which is 25x the RDMA number and would put the same
+//! 84 collectives at 15.5 ms per token. So a within-layer split is affordable
+//! over RDMA or NCCL and is NOT affordable over ordinary sockets — which is
+//! also why `burn-collective`, whose transport is WebSocket plus MessagePack,
+//! is the wrong tool here despite exposing exactly the right API.
+//!
+//! What a within-layer split would buy is the idle half. The layer split runs
+//! the two nodes strictly in sequence; the pipe-utilisation block below reports
+//! each end computing near 50% and blocked on the other for the rest. Splitting
+//! within a layer runs both ends on every layer at once. That is the case for
+//! doing it, and the bandwidth objection above is not a reason against it.
 //!
 //!   # tail, on the second box
 //!   INK_LAYERS=20:42 INK_PIPE=tail:0.0.0.0:7654 inkling_forward <pile> <ids> <out>
