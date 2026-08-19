@@ -388,14 +388,15 @@ fn trim<B: Backend>(c: &mut AttnCache<B>, window: Option<usize>) {
 /// against the same `transformers` capture, not against it: matching the slice
 /// lane would only prove the two agree, and they were written by the same hand.
 ///
-/// `mask` is the additive `[tokens, tokens]` mask — zero where a key is visible
-/// and `-inf` where it is not — because a local layer's mask carries the sliding
-/// window and a global layer's does not.
+/// `mask_window` is the sliding window a local layer masks with, and `None` on a
+/// global layer. It is a predicate on `q - k` rather than an additive
+/// `[tokens, tokens]` tensor: the epilogue kernel recomputes visibility per
+/// element, so nothing quadratic is materialised to hold it.
 ///
 /// Two things are folded together here that a careless reading separates:
 /// log scaling multiplies the query **and** the relative-position bias, and only
 /// on global layers; and the bias is zero outside `0 <= q - k < rel_extent`,
-/// while causality lives in the mask.
+/// while causality is the `k <= q` half of the same predicate.
 pub fn attention(
     x: Tensor<Bk, 2>,
     w: &AttnWeightsDev,
@@ -882,7 +883,7 @@ pub fn attention_steps(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::inkling::attn::{causal_mask, AttnDims, LogScaling};
+    use crate::models::inkling::attn::{AttnDims, LogScaling};
     use crate::models::inkling::config::AttnKind;
 
     // The only backend there is. These tests compare a cached lane against an
@@ -978,29 +979,10 @@ mod tests {
             &dev,
         );
 
-        let full = attention(
-            xs.clone(),
-            &w,
-            &d,
-            ls,
-            Tensor::from_data(
-                TensorData::new(causal_mask(tokens, window), [tokens, tokens]),
-                &dev,
-            ),
-        );
+        let full = attention(xs.clone(), &w, &d, ls, window);
 
         let head = xs.clone().slice([0..prefill, 0..d.hidden]);
-        let (_, mut cache) = attention_prefill(
-            head,
-            &w,
-            &d,
-            ls,
-            Tensor::from_data(
-                TensorData::new(causal_mask(prefill, window), [prefill, prefill]),
-                &dev,
-            ),
-            window,
-        );
+        let (_, mut cache) = attention_prefill(head, &w, &d, ls, window, window);
         if sabotage_conv_history {
             // The mutation this cache exists to avoid: keep K and V, forget
             // what the short convolution still needs to see.
@@ -1072,25 +1054,13 @@ mod tests {
             TensorData::new(fill(tokens * d.hidden, 2.5), [tokens, d.hidden]),
             &dev,
         );
-        let full = attention(
-            xs.clone(),
-            &w,
-            &d,
-            ls,
-            Tensor::from_data(
-                TensorData::new(causal_mask(tokens, window), [tokens, tokens]),
-                &dev,
-            ),
-        );
+        let full = attention(xs.clone(), &w, &d, ls, window);
         let (_, mut cache) = attention_prefill(
             xs.clone().slice([0..prefill, 0..d.hidden]),
             &w,
             &d,
             ls,
-            Tensor::from_data(
-                TensorData::new(causal_mask(prefill, window), [prefill, prefill]),
-                &dev,
-            ),
+            window,
             window,
         );
 

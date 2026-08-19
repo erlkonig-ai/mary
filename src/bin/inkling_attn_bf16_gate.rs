@@ -197,8 +197,6 @@ fn one(
     let dev = Default::default();
     let xt: Tensor<Bk, 2> =
         Tensor::from_data(TensorData::new(x.clone(), [tokens, hidden]), &dev);
-    let maskt: Tensor<Bk, 2> =
-        Tensor::from_data(TensorData::new(mask.clone(), [tokens, tokens]), &dev);
     let client = client_of(&xt);
     let t2 = |v: &[f32], r: usize, c: usize| -> Tensor<Bk, 2> {
         Tensor::from_data(TensorData::new(v.to_vec(), [r, c]), &dev)
