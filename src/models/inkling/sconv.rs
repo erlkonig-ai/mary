@@ -146,6 +146,93 @@ pub fn short_conv_decode<R: Runtime>(
     (out, next)
 }
 
+/// SEVERAL positions of the same convolution, in one kernel.
+///
+/// The decode kernel above convolves one position and slides the history; this
+/// one convolves `rows` of them from a window that already holds every input
+/// they read, and slides nothing — a caller that widens a pass keeps the whole
+/// `kernel - 1 + rows` window anyway, because a speculative rollback is a slice
+/// of it.
+///
+/// Every output row is independent: row `i` reads `all[i ..= i + kernel - 1]`
+/// and writes `out[i]`, so this is one thread per `(row, channel)` with no
+/// sequential dependence at all. The taps accumulate in ascending `j` and
+/// contract to `fma.rn.f32` exactly as the decode kernel's do, which is why
+/// `rows == 1` here is bit-identical to [`short_conv_kernel`] rather than
+/// merely close to it.
+///
+/// `all` is `[kernel - 1 + rows, dim]` row-major — the history followed by this
+/// pass's own inputs — `w` is `[dim, kernel]`, and `out` is `[rows, dim]`.
+///
+/// `rows * dim` indexes the grid and both are small here (`rows` is a
+/// speculation width or a batch size, `dim` is at most `hidden`), so the 32-bit
+/// index this runtime gives `usize` in a kernel has room to spare; a caller
+/// that grew `rows` into the millions would not.
+#[cube(launch_unchecked)]
+fn short_conv_batch_kernel(
+    all: &Array<f32>,
+    w: &Array<f32>,
+    out: &mut Array<f32>,
+    dim: usize,
+    rows: usize,
+    #[comptime] kernel: usize,
+) {
+    let p = ABSOLUTE_POS as usize;
+    if p < rows * dim {
+        let i = p / dim;
+        let d = p % dim;
+        let taps = comptime!(kernel - 1);
+        let xv = all[(i + taps) * dim + d];
+        let mut acc = w[d * kernel] * all[i * dim + d];
+        #[unroll]
+        for j in 1..taps {
+            acc += w[d * kernel + j] * all[(i + j) * dim + d];
+        }
+        acc += w[d * kernel + taps] * xv;
+        out[p] = xv + acc;
+    }
+}
+
+/// Launch it, returning the `[rows, dim]` output.
+///
+/// The window itself is the caller's — this returns only what the convolution
+/// produced, because the caller already holds the window and is going to slice
+/// a rollback out of it.
+///
+/// One launch where the shifted-slice form was a `cat`, `kernel` slices,
+/// `kernel` broadcast multiplies, `kernel - 1` adds and a residual add. That
+/// mattered enough at one row to be worth a kernel (see this module's opening);
+/// at more than one row it is the difference between a decode pass that widens
+/// cheaply and one that does not.
+pub fn short_conv_batch<R: Runtime>(
+    client: &ComputeClient<R>,
+    all: &Handle,
+    w: &Handle,
+    dim: usize,
+    rows: usize,
+    kernel: usize,
+) -> Handle {
+    assert!(kernel >= 2, "a short convolution with kernel {kernel} has no history to carry");
+    assert!(rows >= 1, "a batched convolution produces at least one row");
+    let f32b = core::mem::size_of::<f32>();
+    let out = client.empty(rows * dim * f32b);
+    let cubes = (rows * dim).div_ceil(CUBE_SIZE as usize) as u32;
+    unsafe {
+        short_conv_batch_kernel::launch_unchecked::<R>(
+            client,
+            CubeCount::new_1d(cubes),
+            CubeDim::new_1d(CUBE_SIZE),
+            ArrayArg::from_raw_parts(all.clone(), (kernel - 1 + rows) * dim),
+            ArrayArg::from_raw_parts(w.clone(), dim * kernel),
+            ArrayArg::from_raw_parts(out.clone(), rows * dim),
+            dim,
+            rows,
+            kernel,
+        );
+    }
+    out
+}
+
 /// The fused kernel against the shifted-slice lane it replaced.
 ///
 /// The oracle is [`super::burn::short_conv`] itself — the prefill form, which
@@ -308,6 +395,83 @@ mod tests {
             rel_err(&sl, &want, &want).0,
             dnext,
         )
+    }
+
+    /// The batched kernel against the one-row kernel, row by row.
+    ///
+    /// Bit equality is the right bar here and nowhere else in this module: the
+    /// two kernels are the SAME expression with the same taps in the same
+    /// ascending order and the same contraction, differing only in how many
+    /// rows one launch covers. If they disagree at all, an index is wrong —
+    /// there is no rounding difference available for them to disagree by.
+    ///
+    /// Run at `rows` up to 8 and `dim` at the checkpoint's 4096, because the
+    /// grid is `rows * dim` flattened and a row-major mix-up between the two
+    /// is invisible at `rows == 1` and invisible again at `dim == rows`.
+    #[test]
+    fn batched_matches_the_one_row_kernel_exactly() {
+        let dev = Default::default();
+        for (dim, kernel, rows) in
+            [(4096usize, 4usize, 1usize), (4096, 4, 2), (4096, 4, 8), (777, 3, 5), (256, 2, 3)]
+        {
+            let taps = kernel - 1;
+            let len = taps + rows;
+            let (av, wv) = (fill(len * dim, 0.3), fill(dim * kernel, 2.9));
+            let all: Tensor<Bk, 2> =
+                Tensor::from_data(TensorData::new(av.clone(), [len, dim]), &dev);
+            let w: Tensor<Bk, 2> =
+                Tensor::from_data(TensorData::new(wv.clone(), [dim, kernel]), &dev);
+            let client = client_of(&all);
+            let bh = short_conv_batch(
+                &client,
+                &handle_of(all.clone()),
+                &handle_of(w.clone()),
+                dim,
+                rows,
+                kernel,
+            );
+            let batched = tensor_of(client.clone(), dev.clone(), bh, rows, dim)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap();
+
+            // The same rows, one launch each, through the decode kernel: its
+            // window for row `i` is `all[i .. i + kernel]`.
+            for i in 0..rows {
+                let hist = all.clone().slice([i..i + taps, 0..dim]);
+                let x = all.clone().slice([i + taps..i + taps + 1, 0..dim]);
+                let (oh, _) = short_conv_decode(
+                    &client,
+                    &handle_of(hist),
+                    &handle_of(x),
+                    &handle_of(w.clone()),
+                    dim,
+                    kernel,
+                );
+                let one = tensor_of(client.clone(), Default::default(), oh, 1, dim)
+                    .into_data()
+                    .to_vec::<f32>()
+                    .unwrap();
+                for d in 0..dim {
+                    assert_eq!(
+                        batched[i * dim + d], one[d],
+                        "dim {dim} kernel {kernel} rows {rows}: row {i} channel {d} \
+                         differs between the batched and the one-row kernel"
+                    );
+                }
+            }
+
+            // ...and both against the arithmetic they approximate, so a shared
+            // index error in the two kernels cannot pass by agreeing.
+            let want = exact(&av[..taps * dim], &av[taps * dim..(taps + 1) * dim], &wv, dim, kernel);
+            let terms = cond(&av[..taps * dim], &av[taps * dim..(taps + 1) * dim], &wv, dim, kernel);
+            let (max, _) = rel_err(&batched[..dim], &want, &terms);
+            assert!(
+                max <= BUDGET,
+                "dim {dim} kernel {kernel} rows {rows}: row 0 is {max:e} from the f64 value, \
+                 past the pre-registered {BUDGET:e}"
+            );
+        }
     }
 
     /// The fused kernel is at least as accurate as the lane it replaced.

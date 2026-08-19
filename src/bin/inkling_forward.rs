@@ -167,29 +167,29 @@
 //!   A five-token English prompt, context 5 -> 105, `INK_GEN=100`:
 //!
 //!     arm          p50 ms   tok/pass   tok/s at p50   vs base
-//!     INK_SPEC=0    127.1      1.000       7.870       1.000
-//!     INK_SPEC=1    205.0      1.712       8.354       1.062
-//!     INK_SPEC=2    239.3      2.082       8.702       1.106
-//!     INK_SPEC=3    283.0      2.082       7.357       0.935
+//!     INK_SPEC=0    127.2      1.000       7.862       1.000
+//!     INK_SPEC=1    199.9      1.712       8.563       1.089
+//!     INK_SPEC=2    236.8      2.082       8.792       1.118
+//!     INK_SPEC=3    263.0      2.082       7.920       1.007
 //!
 //!   A 3732-token document, context 3732 -> 3792, `INK_GEN=60`:
 //!
 //!     arm          p50 ms   tok/pass   tok/s at p50   vs base
-//!     INK_SPEC=0    150.0      1.000       6.669       1.000
-//!     INK_SPEC=1    228.2      1.419       6.216       0.932
-//!     INK_SPEC=2    272.6      1.429       5.241       0.786
+//!     INK_SPEC=0    151.6      1.000       6.599       1.000
+//!     INK_SPEC=1    221.8      1.429       6.445       0.977
+//!     INK_SPEC=2    264.9      1.395       5.268       0.798
 //!
-//! The width cost is the SAME on both -- c(2) is 1.613 and 1.521, c(3) is 1.883
-//! and 1.817 -- and the acceptance is not: 71.2% of depth-1 drafts on the short
-//! prompt against 41.9% on the document. The five-token prompt's continuation
-//! is a repeating list template, and a template is easy to draft; a document's
-//! continuation is not. So the honest reading of the short-prompt column is not
-//! "speculation pays 1.1x", it is "speculation pays on text this predictable",
-//! and the corpus that is not a five-token prompt says 0.93x.
+//! The width cost is nearly the SAME on both -- c(2) is 1.571 and 1.463 -- and
+//! the acceptance is not: 71.2% of depth-1 drafts on the short prompt against
+//! 42.9% on the document. The five-token prompt's continuation is a repeating
+//! list template, and a template is easy to draft; a document's continuation is
+//! not. So the honest reading of the short-prompt column is not "speculation
+//! pays 1.1x", it is "speculation pays on text this predictable", and the
+//! corpus that is not a five-token prompt says 0.98x.
 //!
 //! Widening past `k = 2` buys nothing on either corpus: the depth-3 draft was
 //! accepted 0 times in 49 verify passes, so `k = 3` pays a wider pass for the
-//! same 2.082 tokens and lands at 0.935x.
+//! same 2.082 tokens and lands back at 1.007x.
 //!
 //! ## Three acceptance rates that are all correct
 //!
@@ -211,21 +211,24 @@
 //! for this draft head, and the 41.9% on the document is the only one of them
 //! measured on text worth quoting.
 //!
-//! ## The width cost is a STEP, and half of it was not the GEMM lane
+//! ## The width cost is a STEP, and half of it was never the GEMM lane
 //!
-//! c(2) = 1.61 on the short prompt, against 1.332 that the uncached lane
+//! c(2) = 1.57 on the short prompt, against 1.332 that the uncached lane
 //! predicted. The tail's own half is FLAT once the second row exists, which is
 //! what a lost lane looks like rather than what extra work looks like, and
 //! `gemv plane par` -- which requires `m == 1` and is the only lane that
 //! reaches this part's memory roofline -- is the one a verify pass cannot use.
 //!
-//! That diagnosis was right and incomplete. Timed per stage on the tail, the
-//! one-row-to-two-row step at this context is +52 ms, of which the MLP's short
-//! convolution alone is +31 and the attention half (which contains two more of
-//! them) is +18; the MoE and dense GEMMs move by 2.5 ms. The convolutions were
-//! slice-built for any width above one, and that is fixed in
-//! [`crate::models::inkling::sconv::short_conv_batch`] -- see the commit that
-//! adds it for what it recovers.
+//! That diagnosis was right and it was not the whole thing. Timed per stage on
+//! the tail, the one-row-to-two-row step used to be +52 ms, of which the MLP's
+//! short convolution alone was +31 and the attention half (which contains two
+//! more of them) +18, against 2.5 ms for the MoE and dense GEMMs. The
+//! convolutions were slice-built for any width above one;
+//! [`crate::models::inkling::sconv::short_conv_batch`] is the kernel that
+//! replaced them, and it took c(2) from 1.613 to 1.571, a two-row width probe
+//! from 197.5 ms to 172.8, and the document's k=1 arm from 0.932x to 0.977x.
+//! The residue is the GEMM lane, and a narrow lane at the gemv's bandwidth is
+//! still the thing to build -- it is just no longer the whole bill.
 //!
 //! ## The same lane decides what the model SAYS
 //!
@@ -264,28 +267,28 @@
 //!
 //!   five-token prompt, ctx 5 -> 65        3732-token document, ctx 3732 -> 3792
 //!    b   p50 ms   c(b)   agg tok/s         b   p50 ms   c(b)   agg tok/s
-//!    1    127.4   1.000     7.85           1    150.0   1.000     6.67
-//!    2    197.5   1.550    10.13
-//!    4    221.0   1.735    18.10           4    248.5   1.657    16.10
-//!    8    263.9   2.071    30.31           8    293.6   1.957    27.25
+//!    1    124.7   1.000     8.02           1    151.6   1.000     6.60
+//!    2    172.8   1.386    11.57
+//!    4    204.8   1.642    19.53           4    231.8   1.529    17.26
+//!    8    253.7   2.035    31.53           8    280.1   1.848    28.56
 //!
-//! **Strongly sublinear, and that is the answer.** Eight rows cost 2.07 times
-//! one row, so eight sequences decode at 30.3 tokens a second against 7.85 for
+//! **Strongly sublinear, and that is the answer.** Eight rows cost 2.04 times
+//! one row, so eight sequences decode at 31.5 tokens a second against 8.02 for
 //! one -- 3.9x -- with no fabric work, no second box and no draft head. Nearly
 //! the whole penalty is the STEP at the second row: from b = 2 to b = 8, four
-//! times the rows cost 1.34 times the pass.
+//! times the rows cost 1.47 times the pass.
 //!
 //! ## What the probe does not charge for
 //!
 //! Its `b` rows share ONE KV cache, so attention reads `L` keys once where `b`
 //! real sequences would read `L` keys `b` times. At ctx 65 that is nothing. At
 //! ctx 3792 it is not, and the same table bounds it: one sequence's extra 3727
-//! keys cost 150.0 - 127.4 = 22.6 ms a pass, so charging `(b - 1) x 22.6` ms is
+//! keys cost 151.6 - 124.7 = 26.9 ms a pass, so charging `(b - 1) x 26.9` ms is
 //! an upper bound on the correction -- upper, because it charges the whole
 //! context-length delta to attention and some of it is the wider relative-bias
-//! table. Corrected, ctx 3792 reads 316 ms at b = 4 (12.6 tok/s aggregate,
-//! 1.9x) and 452 ms at b = 8 (17.7 tok/s, 2.65x). The lever survives the
-//! correction; it is 3.9x at short context and 2.7x at four thousand tokens.
+//! table. Corrected, ctx 3792 reads 313 ms at b = 4 (12.8 tok/s aggregate,
+//! 1.94x) and 468 ms at b = 8 (17.1 tok/s, 2.59x). The lever survives the
+//! correction; it is 3.9x at short context and 2.6x at four thousand tokens.
 //!
 //! What it does NOT understate is the MoE: the router runs per row and the
 //! expert gather follows it, and the probe's filler is drawn fresh every pass
@@ -4855,20 +4858,20 @@ fn main() -> Result<()> {
             // width cost, which is a property of the machine and not of this
             // run -- `INK_SPEC_C2` carries it in.
             //
-            // **1.613, and it is now measured where it is spent.** The old
+            // **1.571, and it is now measured where it is spent.** The old
             // default was 1.492, taken on the UNCACHED lane with `INK_REPEAT`,
             // because until `INK_SPEC` existed there was no cached multi-row
             // pass to time. There is one now, and the cached lane is worse:
             // 100-token runs on the two-node pipe, warm p50 of the whole cycle,
             // a five-token prompt, two runs per arm,
             //
-            //     INK_SPEC=0  w=1  127.1 ms      c = 1.000
-            //     INK_SPEC=1  w=2  205.0 ms      c = 1.613
-            //     INK_SPEC=2  w=3  239.3 ms      c = 1.883
-            //     INK_SPEC=3  w=4  283.0 ms      c = 2.227
+            //     INK_SPEC=0  w=1  127.2 ms      c = 1.000
+            //     INK_SPEC=1  w=2  199.9 ms      c = 1.571
+            //     INK_SPEC=2  w=3  236.8 ms      c = 1.862
+            //     INK_SPEC=3  w=4  263.0 ms      c = 2.068
             //
             // against 1.000 / 1.332 / 1.434 / ~1.52 uncached, and against
-            // 1.000 / 1.521 / 1.817 on a 3732-token document, where a wider
+            // 1.000 / 1.463 / 1.747 on a 3732-token document, where a wider
             // pass is a smaller fraction of a slower one.
             //
             // A STEP, not a slope: the penalty is nearly all at the second row
@@ -4876,13 +4879,14 @@ fn main() -> Result<()> {
             // m == 1, a cached decode step is weight-streaming-bound, and that
             // lane is the only one reaching the roofline -- losing it costs
             // 1.33x at m == 1 alone (70.1/73.0 ms against 96.2/93.3, measured
-            // in `bf16gemm`). And the four short convolutions a layer ran
-            // slice-built above one row, which per-stage timing puts at 49 of
-            // the 52 ms the second row added.
+            // in `bf16gemm`). The four short convolutions a layer ran
+            // slice-built above one row -- 49 of the 52 ms the second row used
+            // to add -- and they now run as one kernel each, which is where
+            // 1.613 became 1.571.
             let c2: f64 = std::env::var("INK_SPEC_C2")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(1.613);
+                .unwrap_or(1.571);
             if !mtp_conf[0].is_empty() {
                 println!("\n=== depth-1 acceptance against the draft head's own confidence ===");
                 println!("  c(2) = {c2:.3} (INK_SPEC_C2); a k=1 loop that always speculates:");
