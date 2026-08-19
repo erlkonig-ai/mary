@@ -183,15 +183,40 @@ pub fn sgemm_nt(a: &[f32], b: &[f32], m: usize, k: usize, n: usize, c: &mut [f32
 // bit-exactness" (JP, 2026-08-18 — the rule is dead in both forms, against a
 // previous implementation and run-to-run).
 //
-// The predictor's `down` [1024×3072] stays a plain serial `sgemv`: at n=3072
-// the full-matrix call selects a different (column-blocked) kernel than any
-// row-block call, so routing it through the pool moves it off the accumulation
-// order the serial lane happens to use (~1e-6 diffs). NOTE, 2026-08-18: that is
-// no longer a correctness argument, and it never adjudicated anything — a
-// column-blocked reduction is if anything the more accurate one, O(log n·eps)
-// against O(n·eps). Keeping `down` serial is now purely an unmeasured perf
-// question, not a gate. Parallelise it if it pays; gate the result on the ear
-// A/B, not on reproducing these bytes.
+// The predictor's `down` [1024×3072] goes through the pool too, since
+// 2026-08-19. It used to be held out as a plain serial `sgemv` because at
+// n=3072 the full-matrix call selects a different (column-blocked) kernel than
+// any row-block call, so the pool moved it off the accumulation order the
+// serial lane happened to use (~1e-6 diffs). That was never a correctness
+// argument, and once the byte gate was retired the question was purely one of
+// perf — which nobody had measured.
+//
+// Measured 2026-08-19 on an M4 Max by `qwen3tts_pred_bench` — the real
+// `CodePredictor::predict_frame` over synthetic weights, both arms interleaved
+// round by round in one process (100 rounds; p10/p90 within ±1% of p50):
+//
+//   down serial   28.36 ms/frame,  `down` 8.36 ms  = 29.5% of the frame
+//   down pooled   24.39 ms/frame,  `down` 4.38 ms  = 18.0%   →  −14.0%
+//
+// i.e. the predictor alone goes from 2.82x to 3.28x audio-rate. NOT gated on
+// the ear: the pile that lane needs was on an unmounted volume that day, so
+// nobody has heard this change. It is a pure-bandwidth row split of one gemv,
+// but the ear A/B is still owed.
+//
+// So the hold-out was expensive, and for a reason worth writing down: the
+// wide-n kernel is not just *different*, it is *slower*. Per byte of weight
+// traffic the serial `down` ran at ~118 GB/s against ~230 GB/s for every
+// pooled gemv — i.e. it carried 20% of the traffic and 30% of the time. The
+// row-block call at n=3072 selects the ordinary kernel and gets the same 2×
+// as everything else.
+//
+// Also measured, and NOT taken: a pairwise/tree reduction over column blocks
+// of `down` (k-split, partials summed pairwise — the O(log n·eps) shape).
+// 2-way was a wash (−0.4%, inside the noise) and 4-way cost +5.5%, and the
+// accuracy claim did not survive either: against an f64 reference, serial /
+// pooled / ksplit2 / ksplit4 / ksplit8 all land at 4.5e-8 ± 0.1e-8 relative
+// L2. At n=3072 in f32 the reduction depth simply is not what bounds the
+// error, so the k-split buys a slower kernel and nothing back.
 //
 // Pool shape: `MARY_PRED_THREADS` ways total (0/1 disables), WORK-STEALING
 // over a fixed chunk grid: rows are cut into ~4·ways equal chunks (min 64
@@ -371,12 +396,13 @@ fn pool() -> Option<&'static Pool> {
 /// every split 2..=8 AND chunk grids at 64..512 rows verified) — expected,
 /// because a row split reassociates nothing.
 ///
-/// Wide-n full-matrix calls (n ≥ 3072) can select a different, column-blocked
-/// cblas kernel, so routing those here will NOT reproduce the serial bytes.
-/// That is a difference, not a defect, and it is not a reason to refuse the
-/// route: a column-blocked reduction is the better-conditioned one. Decide it
-/// on measurement and on the ear A/B, not on byte-equality with whichever lane
-/// existed first (wiki:f5dcc88988bb28e472e50fa030332adb).
+/// Wide-n full-matrix calls (n ≥ 3072) select a different, column-blocked
+/// cblas kernel, so routing those here does NOT reproduce the serial bytes.
+/// That is a difference, not a defect, and it was never a reason to refuse the
+/// route (wiki:f5dcc88988bb28e472e50fa030332adb). Measured, the wide-n kernel
+/// is also the *slower* one — ~118 GB/s against ~230 GB/s for a row-block call
+/// — so the predictor's `down` [1024×3072] is routed here, and the byte
+/// difference costs nothing that the 2× buys back many times over.
 pub fn sgemv_mt(w: &[f32], m: usize, n: usize, x: &[f32], y: &mut [f32]) {
     debug_assert_eq!(w.len(), m * n);
     debug_assert_eq!(x.len(), n);

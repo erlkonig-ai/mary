@@ -10,6 +10,7 @@
 //!
 //! Without `--out` it stops after the x-vector (cheap conditioning check).
 
+use anyhow::Context;
 use mary::models::f5::wav;
 use mary::models::qwen3tts::speaker::{SpeakerEncoder, SpeakerMel};
 use mary::nn::backend::BFused as B;
@@ -130,8 +131,16 @@ fn main() -> anyhow::Result<()> {
 
     if let Some(op) = &out {
         let line = text.unwrap_or_else(|| "The quick brown fox jumps over the lazy dog.".into());
+        // `synthesize_to_wav` takes a frozen cohort, not a path — the same
+        // two steps the `voice` faculty does, so the gate renders through the
+        // production selection rather than a second, drifting one.
+        let variant = mary::speak::Qwen3TtsVariant::from_env();
+        let snapshot = mary::model_collection::load_model_collection_local_latest(Path::new(pile))
+            .with_context(|| format!("freeze native Qwen3-TTS snapshot {pile}"))?;
+        let weights = mary::speak::Qwen3TtsWeights::from_snapshot(snapshot, variant)
+            .with_context(|| format!("select {variant:?} Qwen3-TTS cohort from {pile}"))?;
         let n = mary::speak::synthesize_to_wav(
-            Path::new(pile),
+            weights,
             Path::new(ref_wav),
             &ref_text,
             Path::new(ref_codes),

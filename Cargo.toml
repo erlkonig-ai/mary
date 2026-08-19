@@ -603,6 +603,12 @@ required-features = ["qwen3tts", "import"]
 name = "qwen3tts_say"
 required-features = ["qwen3tts"]
 
+# CPU code-predictor bench: the real CodePredictor over synthetic weights, so
+# the Accelerate lane can be measured on a machine with no Qwen3-TTS pile.
+[[bin]]
+name = "qwen3tts_pred_bench"
+required-features = ["qwen3tts"]
+
 # Mimi codec (PersonaPlex Phase 1) parity gate vs the moshi CPU-f32 oracle.
 [[bin]]
 name = "mimi_probe"
