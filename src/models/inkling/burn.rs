@@ -279,12 +279,33 @@ pub struct AttnWeightsDev {
 /// cacheable. Row 0 is absolute position [`AttnCache::base`], not 0: a local
 /// layer drops keys that have left its window, so the row index is not the
 /// position and every distance must be computed through `base`.
+#[derive(Clone)]
 pub struct AttnCache<B: Backend> {
     k: Tensor<B, 2>,
     v: Tensor<B, 2>,
     k_pre: Tensor<B, 2>,
     v_pre: Tensor<B, 2>,
     base: usize,
+    /// Set by [`attention_steps`] and cleared by [`AttnCache::commit`]: the
+    /// rows a SPECULATIVE batch appended, which may turn out not to have
+    /// happened.
+    pending: Option<Pending<B>>,
+}
+
+/// What a speculative batch must be able to undo.
+///
+/// Truncating K and V is a slice; restoring the short convolution's memory is
+/// not, because the history the next position reads is a function of the last
+/// KEPT row and the rows before it, and those pre-convolution projections are
+/// gone once the batch is over. So the batch keeps the whole
+/// `kernel - 1 + rows` window it built, and any accepted prefix is a slice of
+/// it. Rolling back to `keep` rows is then exactly as cheap as rolling back to
+/// all of them, which is the property that lets a verifier decide LATE.
+#[derive(Clone)]
+struct Pending<B: Backend> {
+    k_pre: Tensor<B, 2>,
+    v_pre: Tensor<B, 2>,
+    rows: usize,
 }
 
 impl<B: Backend> AttnCache<B> {
@@ -301,6 +322,44 @@ impl<B: Backend> AttnCache<B> {
     /// Absolute position of row 0.
     pub fn base(&self) -> usize {
         self.base
+    }
+
+    /// Keep the first `keep` of the rows the last [`attention_steps`] appended
+    /// and discard the rest.
+    ///
+    /// This is the whole of speculative rollback. A verifier accepts a PREFIX
+    /// of a drafted batch, and the positions past it were computed against
+    /// tokens the model did not choose; leaving their K and V behind does not
+    /// error, it shows up months later as an acceptance rate that drifts down.
+    ///
+    /// The window trim is deferred to here rather than done inside
+    /// [`attention_steps`], and that is not tidiness: trimming to the last
+    /// `window` keys of a batch that is then rolled BACK would have dropped
+    /// keys the shorter sequence still needs. A speculative batch may not
+    /// forget until it knows how long it was.
+    ///
+    /// Idempotent and safe with no batch outstanding — it still trims, which is
+    /// what makes it correct to call after every verify pass.
+    pub fn commit(&mut self, keep: usize, window: Option<usize>) {
+        if let Some(p) = self.pending.take() {
+            assert!(keep <= p.rows, "kept {keep} of a {}-row batch", p.rows);
+            let drop = p.rows - keep;
+            if drop > 0 {
+                let [len, dim] = self.k.dims();
+                self.k = self.k.clone().slice([0..len - drop, 0..dim]);
+                let [vlen, vdim] = self.v.dims();
+                self.v = self.v.clone().slice([0..vlen - drop, 0..vdim]);
+            }
+            // `k_pre` holds `kernel - 1` history rows followed by the batch's
+            // own pre-convolution projections, so the history ending at the
+            // last kept row is the window starting at `keep`.
+            let hist = p.k_pre.dims()[0] - p.rows;
+            let dim = p.k_pre.dims()[1];
+            self.k_pre = p.k_pre.slice([keep..keep + hist, 0..dim]);
+            let vdim = p.v_pre.dims()[1];
+            self.v_pre = p.v_pre.slice([keep..keep + hist, 0..vdim]);
+        }
+        trim(self, window);
     }
 }
 
@@ -451,6 +510,7 @@ pub fn attention_prefill(
         k_pre: conv_history(k_pre, d.kernel),
         v_pre: conv_history(v_pre, d.kernel),
         base: 0,
+        pending: None,
     };
     trim(&mut cache, window);
     (linear_bf16(out, &w.wo), cache)
@@ -626,6 +686,156 @@ pub fn attention_step(
     let scores = qh.matmul(kh.swap_dims(1, 2)).mul_scalar(d.scaling()) + bias + wmask;
     let probs = burn::tensor::activation::softmax(scores, 2);
     let out = probs.matmul(vh).swap_dims(0, 1).reshape([1, heads * head_dim]);
+    linear_bf16(out, &w.wo)
+}
+
+/// SEVERAL generated positions through one attention layer, reading the cache.
+///
+/// [`attention_step`] with `rows > 1`, which is the shape speculative decoding
+/// verifies in: the accepted token followed by `k` drafts, all attending to a
+/// prefix the cache already holds and to each other causally. It is a separate
+/// function rather than a relaxed assertion on that one because everything
+/// per-position becomes per-ROW — the log-scaling factor, the relative
+/// distance, the visibility of every other new row — and a one-row function
+/// that happens to work for two is a function whose mask nobody checked.
+///
+/// `pos0` is the ABSOLUTE position of row 0; row `i` sits at `pos0 + i`.
+///
+/// The batch is left PENDING: nothing is trimmed and nothing is final until
+/// [`AttnCache::commit`] says how many of these rows the verifier kept. A
+/// caller that forgets to commit gets a cache that grows past its window, which
+/// the next call's `pending` assertion turns into a failure rather than a slow
+/// leak.
+pub fn attention_steps(
+    x: Tensor<Bk, 2>,
+    w: &AttnWeightsDev,
+    d: &crate::models::inkling::attn::AttnDims,
+    log_scaling: Option<crate::models::inkling::attn::LogScaling>,
+    pos0: usize,
+    window: Option<usize>,
+    cache: &mut AttnCache<Bk>,
+) -> Tensor<Bk, 2> {
+    use crate::models::inkling::config::AttnKind;
+
+    let [rows, hidden] = x.dims();
+    assert!(rows >= 1, "a batched step feeds at least one token");
+    assert_eq!(hidden, d.hidden, "x is [_, {hidden}] but the config says {}", d.hidden);
+    assert!(pos0 >= cache.base + cache.len(), "position {pos0} is already cached");
+    assert!(cache.pending.is_none(), "a speculative batch is still uncommitted");
+    let dev = x.device();
+    let (heads, kv_heads, head_dim) = (d.heads, d.kv_heads, d.head_dim);
+    let groups = d.groups();
+    assert_eq!(groups * kv_heads, heads, "{heads} heads do not divide into {kv_heads} kv heads");
+
+    let q = linear_bf16(x.clone(), &w.wq);
+    // The convolution over the batch, taps and all: the `kernel - 1` history
+    // rows the cache carries, then this batch's own projections. Rows
+    // `kernel - 1 ..` of that see a full window of real inputs, which is
+    // exactly the rows this batch is asking for — the front-padding
+    // [`short_conv`] applies is never reached.
+    let k_all = Tensor::cat(vec![cache.k_pre.clone(), linear_bf16(x.clone(), &w.wk)], 0);
+    let v_all = Tensor::cat(vec![cache.v_pre.clone(), linear_bf16(x.clone(), &w.wv)], 0);
+    let hist = d.kernel - 1;
+    let kdim = k_all.dims()[1];
+    let vdim = v_all.dims()[1];
+    let k_new = short_conv(k_all.clone(), w.k_sconv.clone()).slice([hist..hist + rows, 0..kdim]);
+    let v_new = short_conv(v_all.clone(), w.v_sconv.clone()).slice([hist..hist + rows, 0..vdim]);
+    let r = linear_bf16(x, &w.wr);
+
+    let q = head_rms_norm(q, w.q_norm.clone(), heads, head_dim, d.rms_eps);
+    let k_new = head_rms_norm(k_new, w.k_norm.clone(), kv_heads, head_dim, d.rms_eps);
+
+    cache.k = Tensor::cat(vec![cache.k.clone(), k_new], 0);
+    cache.v = Tensor::cat(vec![cache.v.clone(), v_new], 0);
+    cache.k_pre = k_all.clone().slice([rows..rows + hist, 0..kdim]);
+    cache.v_pre = v_all.clone().slice([rows..rows + hist, 0..vdim]);
+    cache.pending = Some(Pending { k_pre: k_all, v_pre: v_all, rows });
+
+    let len = cache.len();
+    let base = cache.base;
+    let bucket = kv_pad_bucket();
+    let padded = len.next_multiple_of(bucket);
+
+    let taus: Vec<f32> = (0..rows)
+        .map(|i| match (d.kind, log_scaling) {
+            (AttnKind::Global, Some(ls)) => ls.tau(pos0 + i),
+            _ => 1.0,
+        })
+        .collect();
+    let tau: Tensor<Bk, 1> = Tensor::from_data(TensorData::new(taus, [rows]), &dev);
+    let q = q * tau.clone().reshape([rows, 1]);
+
+    // One row of [`attention_step`]'s tables per new position. Three things at
+    // once, and all three are per (row, key): whether the relative table
+    // reaches that far, whether the window admits it, and — new here, because a
+    // one-row step could not need it — whether the key is in the row's FUTURE.
+    // Causality inside the batch is not structural the way it is for a single
+    // position, and the drafts are exactly the keys a wrong sign would leak.
+    let mut idx = vec![0i32; rows * padded];
+    let mut valid = vec![0f32; rows * padded];
+    let mut wmask = vec![0f32; rows * padded];
+    let mut max_dist = 0usize;
+    for i in 0..rows {
+        let pos = pos0 + i;
+        for j in 0..padded {
+            let cell = i * padded + j;
+            if j >= len {
+                wmask[cell] = f32::NEG_INFINITY;
+                continue;
+            }
+            let abs = base + j;
+            if abs > pos {
+                wmask[cell] = f32::NEG_INFINITY;
+                continue;
+            }
+            let dist = pos - abs;
+            if dist < d.rel_extent {
+                idx[cell] = dist as i32;
+                valid[cell] = 1.0;
+            }
+            if window.is_some_and(|wnd| dist >= wnd) {
+                wmask[cell] = f32::NEG_INFINITY;
+            }
+            max_dist = max_dist.max(dist);
+        }
+    }
+    let eff = d.rel_extent.min(max_dist + 1).next_multiple_of(bucket).min(d.rel_extent);
+    let idx: Tensor<Bk, 3, Int> =
+        Tensor::from_data(TensorData::new(idx, [1, rows, padded]), &dev).repeat_dim(0, heads);
+    let valid: Tensor<Bk, 3> =
+        Tensor::from_data(TensorData::new(valid, [1, rows, padded]), &dev);
+    let wmask: Tensor<Bk, 3> =
+        Tensor::from_data(TensorData::new(wmask, [1, rows, padded]), &dev);
+
+    let rel = (r
+        .reshape([rows * heads, d.d_rel])
+        .matmul(w.rel_proj.clone().slice([0..d.d_rel, 0..eff]))
+        .reshape([rows, heads, eff])
+        .swap_dims(0, 1))
+        * tau.reshape([1, rows, 1]);
+    let bias = rel.gather(2, idx) * valid;
+
+    let qh = q.reshape([rows, heads, head_dim]).swap_dims(0, 1);
+    let expand = |t: Tensor<Bk, 2>| -> Tensor<Bk, 3> {
+        t.reshape([padded, kv_heads, head_dim])
+            .swap_dims(0, 1)
+            .reshape([kv_heads, 1, padded, head_dim])
+            .repeat_dim(1, groups)
+            .reshape([heads, padded, head_dim])
+    };
+    let pad_rows = |t: Tensor<Bk, 2>| -> Tensor<Bk, 2> {
+        if padded == len {
+            return t;
+        }
+        let dim = t.dims()[1];
+        Tensor::cat(vec![t, Tensor::zeros([padded - len, dim], &dev)], 0)
+    };
+    let kh = expand(pad_rows(cache.k.clone()));
+    let vh = expand(pad_rows(cache.v.clone()));
+
+    let scores = qh.matmul(kh.swap_dims(1, 2)).mul_scalar(d.scaling()) + bias + wmask;
+    let probs = burn::tensor::activation::softmax(scores, 2);
+    let out = probs.matmul(vh).swap_dims(0, 1).reshape([rows, heads * head_dim]);
     linear_bf16(out, &w.wo)
 }
 
@@ -825,6 +1035,144 @@ mod tests {
     fn cached_matches_full_from_a_two_token_prefill() {
         let worst = compare(AttnKind::Local, 5, Some(5), None, 11, 2, false);
         assert!(worst < 2e-5, "cached attention from a short prefill drifts by {worst}");
+    }
+
+    /// The batched cached step against the uncached lane, in batches of
+    /// `batch`, optionally rolling back `reject` rows of every batch and
+    /// re-running them — which is what a rejected draft does.
+    fn compare_batched(
+        kind: AttnKind,
+        rel_extent: usize,
+        window: Option<usize>,
+        ls: Option<LogScaling>,
+        tokens: usize,
+        prefill: usize,
+        batch: usize,
+        reject: usize,
+    ) -> f32 {
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let d = dims(kind, rel_extent);
+        let w = weights(&d, &dev);
+        let xs: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(fill(tokens * d.hidden, 2.5), [tokens, d.hidden]),
+            &dev,
+        );
+        let full = attention(
+            xs.clone(),
+            &w,
+            &d,
+            ls,
+            Tensor::from_data(
+                TensorData::new(causal_mask(tokens, window), [tokens, tokens]),
+                &dev,
+            ),
+        );
+        let (_, mut cache) = attention_prefill(
+            xs.clone().slice([0..prefill, 0..d.hidden]),
+            &w,
+            &d,
+            ls,
+            Tensor::from_data(
+                TensorData::new(causal_mask(prefill, window), [prefill, prefill]),
+                &dev,
+            ),
+            window,
+        );
+
+        let mut worst = 0f32;
+        let mut pos = prefill;
+        while pos < tokens {
+            let rows = batch.min(tokens - pos);
+            // The rejection arm: run the batch, keep only what a verifier
+            // would have kept, then run the SAME positions again. A cache that
+            // rolled back wrongly answers differently the second time, and the
+            // second answer is the one compared.
+            if reject > 0 && rows > reject {
+                let _ = attention_steps(
+                    xs.clone().slice([pos..pos + rows, 0..d.hidden]),
+                    &w,
+                    &d,
+                    ls,
+                    pos,
+                    window,
+                    &mut cache,
+                );
+                cache.commit(rows - reject, window);
+                let redo = rows - reject;
+                let got = attention_steps(
+                    xs.clone().slice([pos + redo..pos + rows, 0..d.hidden]),
+                    &w,
+                    &d,
+                    ls,
+                    pos + redo,
+                    window,
+                    &mut cache,
+                );
+                cache.commit(rows - redo, window);
+                let want = full.clone().slice([pos + redo..pos + rows, 0..d.hidden]);
+                worst = worst.max((got - want).abs().max().into_scalar());
+            } else {
+                let got = attention_steps(
+                    xs.clone().slice([pos..pos + rows, 0..d.hidden]),
+                    &w,
+                    &d,
+                    ls,
+                    pos,
+                    window,
+                    &mut cache,
+                );
+                cache.commit(rows, window);
+                let want = full.clone().slice([pos..pos + rows, 0..d.hidden]);
+                worst = worst.max((got - want).abs().max().into_scalar());
+            }
+            pos += rows;
+        }
+        worst
+    }
+
+    /// Three positions at a time against the uncached lane, on a global layer
+    /// with log scaling that varies per row — so a batch that used one `tau`
+    /// for all of its rows would show up here.
+    #[test]
+    fn batched_global_matches_full() {
+        let ls = Some(LogScaling { n_floor: 4.0, alpha: 0.5 });
+        let worst = compare_batched(AttnKind::Global, 5, None, ls, 11, 4, 3, 0);
+        assert!(worst < 2e-5, "batched global attention drifts by {worst}");
+    }
+
+    /// The same on a local layer whose window is shorter than the sequence, so
+    /// the batch must not forget a key until it knows how long it was.
+    #[test]
+    fn batched_local_matches_full_across_the_window() {
+        let worst = compare_batched(AttnKind::Local, 5, Some(5), None, 11, 4, 3, 0);
+        assert!(worst < 2e-5, "batched windowed attention drifts by {worst}");
+    }
+
+    /// Rejection: run three, keep one, re-run the two that were rejected. This
+    /// is the speculative path, and it passes only if `commit` restored the
+    /// short convolution's memory as well as truncating K and V.
+    #[test]
+    fn rejected_rows_leave_no_trace() {
+        let ls = Some(LogScaling { n_floor: 4.0, alpha: 0.5 });
+        let worst = compare_batched(AttnKind::Global, 5, None, ls, 11, 4, 3, 2);
+        assert!(worst < 2e-5, "rolled-back batch drifts by {worst}");
+    }
+
+    /// The same against a window, where rollback and the window's own
+    /// forgetting interact.
+    #[test]
+    fn rejected_rows_leave_no_trace_windowed() {
+        let worst = compare_batched(AttnKind::Local, 5, Some(5), None, 11, 4, 3, 2);
+        assert!(worst < 2e-5, "rolled-back windowed batch drifts by {worst}");
+    }
+
+    /// A batch of one must agree with [`attention_step`], which is the claim
+    /// that makes the two functions one algorithm rather than two.
+    #[test]
+    fn a_batch_of_one_matches_the_single_step() {
+        let ls = Some(LogScaling { n_floor: 4.0, alpha: 0.5 });
+        let worst = compare_batched(AttnKind::Global, 5, None, ls, 11, 4, 1, 0);
+        assert!(worst < 2e-5, "a one-row batch drifts by {worst}");
     }
 
     /// A gate that cannot fail and a gate that has never failed look identical
