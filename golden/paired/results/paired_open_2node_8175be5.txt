@@ -1,0 +1,44 @@
+==============================================================================
+PAIRED CAPABILITY: BF16 reference vs NVFP4 runtime   (40 items, split=open)
+==============================================================================
+  BF16 accuracy      36/40 = 90.0%  [95% CI 76.9–96.0]
+  NVFP4 accuracy     35/40 = 87.5%  [95% CI 73.9–94.5]
+  chance             25.0%  (four options, key balanced 25/25/25/25)
+
+  AGREEMENT          38/40 = 95.0%  [95% CI 83.5–98.6]   (same greedy token, no key needed)
+
+  contingency (rows BF16, cols NVFP4)
+      right/right  35   right/wrong   1
+      wrong/right   0   wrong/wrong   4
+
+  LOSS   of the items BF16 gets right, NVFP4 loses 1/36 = 2.8%  [95% CI 0.5–14.2]
+  GAIN   0 item(s) NVFP4 gets right that BF16 does not
+  McNemar exact two-sided p = 1.0000 on 1 discordant pair(s)   -> not distinguishable from noise
+
+  off-menu argmax    BF16 0/40, NVFP4 0/40   (answered with a token that is not A/B/C/D at all)
+
+  reference wobble   0.875 logits, measured (same item alone vs in the batch)
+  fragile items      4/40 have a BF16 top1-top2 margin below that, so their own answer is rounding
+    dropping them:   AGREEMENT 35/36, LOSS 0/33, GAIN 0, McNemar p = 1.0000
+    they are:        arith-change (0.50), arith-pct (0.12), arith-divmod (0.25), con-sumdigits (0.12)
+
+  per family
+    family        n    BF16   NVFP4   agree   lost  gained
+    arith         8       8       7       7      1       0
+    code          8       6       6       7      0       0
+    constraint    8       6       6       8      0       0
+    factual       8       8       8       8      0       0
+    retrieval     8       8       8       8      0       0
+
+  clustering of LOSSES across families    permutation p = 1.000 (chi2-like statistic 3.50, 1 loss(es) over 36 eligible)
+  clustering of DISAGREEMENTS             permutation p = 1.000 (statistic 3.00, 2 disagreement(s) over 40)
+
+  every disagreement, in full
+    arith-pct        arith      key=B   BF16 margin 0.12  (FRAGILE)
+      BF16  -> B   B:20.75  #1416:20.62  #1202:19.50  #41021:19.38  D:19.25
+      NVFP4 -> C   C:23.04  #1416:21.07  #1202:20.10  #41021:19.81  #623:19.81
+    code-str         code       key=C   BF16 margin 1.25
+      BF16  -> A   A:22.25  B:21.00  D:19.88  C:19.25  #1202:19.00
+      NVFP4 -> B   B:21.07  A:20.51  D:19.15  #30985:18.91  C:18.84
+
+wrote /tmp/paired_open_8175be5.json
