@@ -251,10 +251,11 @@ pub fn derive_selected_f16_to_collection<R: BlobStoreGet>(
     quantization: &str,
 ) -> anyhow::Result<(Id, CollectionCommit, usize, usize)> {
     let (_, mut index, reader) = selected.into_parts();
+    let _ = &reader;
     anyhow::ensure!(!index.is_empty(), "cannot derive an empty f16 model root");
-    for (name, handles) in &index {
+    for (name, leaf) in &index {
         anyhow::ensure!(
-            matches!(handles, crate::ingest::LeafHandles::F32(..)),
+            leaf.elem() == crate::leaf::Elem::F32,
             "{name}: f16 derivation requires an exact f32 source root"
         );
     }
@@ -265,31 +266,11 @@ pub fn derive_selected_f16_to_collection<R: BlobStoreGet>(
     let mut facts = TribleSet::new();
     let mut elements = 0;
     for (ordinal, name) in names.into_iter().enumerate() {
-        let handles = index.remove(&name).expect("name collected from index");
-        let (data_handle, shape_handle) = match handles {
-            crate::ingest::LeafHandles::F32(data, shape) => (data, shape),
-            crate::ingest::LeafHandles::F16(..) => unreachable!("validated exact width"),
-        };
-        let data_bytes: anybytes::Bytes = reader
-            .get(data_handle)
-            .map_err(|error| anyhow::anyhow!("read exact tensor {name:?}: {error}"))?;
-        let data = data_bytes
-            .view::<[f32]>()
-            .with_context(|| format!("decode exact tensor {name:?}"))?
-            .to_vec();
-        let shape_bytes: anybytes::Bytes = reader
-            .get(shape_handle)
-            .map_err(|error| anyhow::anyhow!("read shape for exact tensor {name:?}: {error}"))?;
-        let shape = shape_bytes
-            .view::<[u64]>()
-            .with_context(|| format!("decode shape for exact tensor {name:?}"))?
-            .iter()
-            .map(|&dimension| {
-                usize::try_from(dimension).with_context(|| {
-                    format!("shape dimension {dimension} for exact tensor {name:?} exceeds usize")
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let leaf = index.remove(&name).expect("name collected from index");
+        // The leaf states its own width and shape, so there is nothing to
+        // cross-check here: `elem()` already decided the branch above.
+        let data = leaf.to_f32();
+        let shape = leaf.shape();
         elements += data.len();
         let (mut tensor_members, tensor_facts) = crate::ingest::ingest_tensors(
             std::iter::once((name, data, shape)),
@@ -567,6 +548,64 @@ mod filtered_native_import_tests {
         archive.finish().unwrap();
     }
 
+    /// The Repository/workspace write path, end to end on a real pile file:
+    /// tensors go into the pile's blob store as typed leaves, only the small
+    /// fact set rides through the commit, and a cold reopen reads every tensor
+    /// back with its shape.
+    ///
+    /// It is the seam the collection tests do not cover — blobs written
+    /// straight to storage rather than staged through a prepared commit — and
+    /// it is the one every `*_persist` binary uses.
+    #[test]
+    fn a_typed_pile_written_through_a_workspace_reads_back_cold() {
+        let fixture = TempFixture::new();
+        let weights_file = fixture.dir.join("model.safetensors");
+        let matrix = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let vector = vec![-0.5_f32, 0.5];
+        let matrix_bytes = f32_bytes(&matrix);
+        let vector_bytes = f32_bytes(&vector);
+        serialize_to_file(
+            [
+                (
+                    "block.weight",
+                    TensorView::new(Dtype::F32, vec![3, 2], &matrix_bytes).unwrap(),
+                ),
+                (
+                    "block.bias",
+                    TensorView::new(Dtype::F32, vec![2], &vector_bytes).unwrap(),
+                ),
+            ],
+            &None,
+            &weights_file,
+        )
+        .unwrap();
+
+        let pile_path = fixture.dir.join("weights.pile");
+        persist_safetensors_files_to_pile(
+            &[(weights_file, "model.safetensors".to_owned())],
+            &pile_path,
+            LeafDtype::F32,
+        )
+        .unwrap();
+
+        // Cold reopen through the ordinary runtime loader.
+        let keymap = load_keymap_from_pile(&pile_path).unwrap();
+        assert_eq!(keymap.len(), 2);
+        assert_eq!(keymap["block.weight"], (matrix.clone(), vec![3, 2]));
+        assert_eq!(keymap["block.bias"], (vector.clone(), vec![2]));
+
+        // And through the lazy index the aliasing loaders use: no data is
+        // materialized to build it, and an f32 leaf serves a view rather than
+        // a copy.
+        let (f16, exact, _reader) = load_split_index_from_pile(&pile_path, "half_").unwrap();
+        assert!(f16.is_empty(), "no half-width entity was written");
+        assert_eq!(exact.len(), 2);
+        let leaf = &exact["block.weight"];
+        assert_eq!(leaf.elem(), crate::leaf::Elem::F32);
+        assert_eq!(leaf.dims(), &[3, 2]);
+        assert_eq!(&leaf.view_f32().expect("zero-copy f32 view")[..], &matrix[..]);
+    }
+
     #[test]
     fn filtered_import_publishes_only_selected_tensors_and_rejects_empty_roots() {
         let fixture = TempFixture::new();
@@ -837,21 +876,25 @@ pub fn persist_safetensors_file_filtered_to_pile(
     Ok(())
 }
 
-/// Open a pile and build the CHEAP handle indexes for two families of model
-/// entities — the ones whose name starts with `f16_prefix` (half-width leaves
-/// for the fast native-width GPU load) and ALL OTHERS (the exact leaves) —
-/// plus a long-lived
-/// [`PileReader`](triblespace::core::repo::pile::PileReader) to resolve them
-/// through. No tensor data is read here; the fast loader uploads straight
-/// from the reader's mmap'd blobs, and the mmap stays valid after the
-/// repository is closed (each blob keeps the mapping alive). The first index
-/// comes back empty if no entity matches the prefix.
+/// Open a pile and build the leaf indexes for two families of model entities —
+/// the ones whose name starts with `f16_prefix` (half-width leaves for the fast
+/// native-width GPU load) and ALL OTHERS (the exact leaves) — plus a
+/// [`PileReader`](triblespace::core::repo::pile::PileReader) the caller may keep.
+/// The first index comes back empty if no entity matches the prefix.
+///
+/// No tensor bytes are COPIED: each leaf's payload is a slice of the pile's
+/// mapping, which stays valid after the repository is closed because every blob
+/// keeps the mapping alive. Building the index does, however, resolve every
+/// leaf, and a pile validates a record's hash the first time it hands it out —
+/// so the integrity check that used to happen at first touch now happens here,
+/// for the whole family at once. Same total work for the ordinary case (a model
+/// whose tensors all get loaded), front-loaded rather than interleaved.
 pub fn load_split_index_from_pile(
     pile_path: &Path,
     f16_prefix: &str,
 ) -> anyhow::Result<(
-    HashMap<String, crate::ingest::LeafHandles>,
-    HashMap<String, crate::ingest::LeafHandles>,
+    HashMap<String, crate::leaf::Leaf>,
+    HashMap<String, crate::leaf::Leaf>,
     triblespace::core::repo::pile::PileReader,
 )> {
     let mut pile =
@@ -926,7 +969,7 @@ pub fn load_aliased_loader_from_pile(
     f16_prefix: &str,
 ) -> anyhow::Result<crate::nn::weight_loader::WeightLoader> {
     use crate::nn::weight_loader::WeightLoader;
-    let (f16, f32_, reader) = load_split_index_from_pile(pile_path, f16_prefix)?;
+    let (f16, f32_, _reader) = load_split_index_from_pile(pile_path, f16_prefix)?;
     anyhow::ensure!(
         !f32_.is_empty(),
         "no exact (f32) model entities in pile {pile_path:?}"
@@ -944,8 +987,6 @@ pub fn load_aliased_loader_from_pile(
             crate::nn::weight_loader::AliasedPile::new(
                 f16,
                 f32_,
-                reader.clone(),
-                reader,
                 crate::nn::backend::WgpuDevice::default(),
             ),
         ));
@@ -956,7 +997,7 @@ pub fn load_aliased_loader_from_pile(
     let _ = f16; // half-width leaves are only for aliasing; exact leaves feed the keymap
     let keymap = f32_
         .into_iter()
-        .map(|(k, h)| (k, crate::ingest::read_leaf(&reader, h)))
+        .map(|(k, leaf)| (k, leaf.to_f32_shape()))
         .collect();
     Ok(WeightLoader::Pile(keymap))
 }
@@ -1202,29 +1243,22 @@ pub fn derive_qwen3tts_folded_pile(
 
     // ── gate: re-open the sibling, alias every leaf, compare bit-for-bit ──
     eprintln!("[fold-derive] gate: aliasing every leaf back and comparing bits ...");
-    let (_, folded, folded_reader) = load_split_index_from_pile(dst_pile, "")?;
-    use triblespace::prelude::BlobStoreGet;
+    let (_, folded, _folded_reader) = load_split_index_from_pile(dst_pile, "")?;
     for (name, bits, dims) in &tensors {
-        let (dh, sh) = match folded.get(name.as_str()) {
-            Some(crate::ingest::LeafHandles::F16(d, s)) => (*d, *s),
+        let leaf = match folded.get(name.as_str()) {
+            Some(leaf) if leaf.elem() == crate::leaf::Elem::F16 => leaf,
             other => anyhow::bail!(
                 "{name}: bad folded leaf after derive ({})",
                 if other.is_none() { "missing" } else { "f32" }
             ),
         };
-        let got_dims: Vec<u64> = crate::ingest::read_shape(&folded_reader, sh)
-            .iter()
-            .map(|&d| d as u64)
-            .collect();
         anyhow::ensure!(
-            &got_dims == dims,
-            "{name}: shape mismatch {got_dims:?} vs {dims:?}"
+            leaf.dims() == &dims[..],
+            "{name}: shape mismatch {:?} vs {dims:?}",
+            leaf.dims()
         );
-        let blob: anybytes::Bytes = folded_reader
-            .get(dh)
-            .map_err(|e| anyhow::anyhow!("{name}: data blob: {e:?}"))?;
         let t = crate::nn::alias::alias_flat_raw::<half::f16>(
-            blob,
+            leaf.payload().clone(),
             &crate::nn::backend::WgpuDevice::default(),
         )
         .map_err(|e| anyhow::anyhow!("{name}: alias failed: {e}"))?;
@@ -1261,29 +1295,30 @@ pub fn load_qwen3tts_talker_folded(
     src_pile: &Path,
     folded_pile: &Path,
 ) -> anyhow::Result<crate::models::qwen3tts::talker::Talker<crate::nn::backend::BHalf>> {
-    let (f16, f32_, reader) = load_split_index_from_pile(src_pile, "talker_f16")?;
+    let (f16, f32_, _reader) = load_split_index_from_pile(src_pile, "talker_f16")?;
     anyhow::ensure!(
         !f16.is_empty(),
         "no 'talker_f16' leaves in {src_pile:?} (append with qwen3tts_persist --f16-talker-only)"
     );
-    let (_, folded, folded_reader) = load_split_index_from_pile(folded_pile, "")?;
+    let (_, folded, _folded_reader) = load_split_index_from_pile(folded_pile, "")?;
     anyhow::ensure!(
         !folded.is_empty(),
         "no leaves in folded pile {folded_pile:?}"
     );
-    load_qwen3tts_talker_folded_from_indexes(&f16, &f32_, &reader, &folded, &folded_reader)
+    load_qwen3tts_talker_folded_from_indexes(&f16, &f32_, &folded)
 }
 
 /// Construct the raw f16 Qwen3-TTS talker from already-selected native model
-/// indexes. Both readers may be the same frozen collection reader: the split is
+/// indexes. The three may all come from one frozen collection: the split is
 /// semantic (base/talker/folded roots), not a storage or file boundary.
+///
+/// No blob reader: a leaf already holds its bytes as a view over the pile's
+/// mapping, so aliasing one onto the GPU needs nothing but the leaf.
 #[cfg(all(feature = "qwen3tts", target_os = "macos"))]
-pub fn load_qwen3tts_talker_folded_from_indexes<R: BlobStoreGet, F: BlobStoreGet>(
-    f16: &HashMap<String, crate::ingest::LeafHandles>,
-    f32_: &HashMap<String, crate::ingest::LeafHandles>,
-    reader: &R,
-    folded: &HashMap<String, crate::ingest::LeafHandles>,
-    folded_reader: &F,
+pub fn load_qwen3tts_talker_folded_from_indexes(
+    f16: &HashMap<String, crate::leaf::Leaf>,
+    f32_: &HashMap<String, crate::leaf::Leaf>,
+    folded: &HashMap<String, crate::leaf::Leaf>,
 ) -> anyhow::Result<crate::models::qwen3tts::talker::Talker<crate::nn::backend::BHalf>> {
     use crate::models::qwen3tts::config::{
         TALKER_EPS, TALKER_HEAD_DIM, TALKER_LAYERS, TALKER_ROPE_THETA,
@@ -1296,46 +1331,39 @@ pub fn load_qwen3tts_talker_folded_from_indexes<R: BlobStoreGet, F: BlobStoreGet
     use burn::prelude::*;
 
     let dev = crate::nn::backend::WgpuDevice::default();
-    fn alias<R: BlobStoreGet>(
-        idx: &HashMap<String, crate::ingest::LeafHandles>,
-        rd: &R,
+    fn alias(
+        idx: &HashMap<String, crate::leaf::Leaf>,
         name: &str,
         dev: &crate::nn::backend::WgpuDevice,
     ) -> anyhow::Result<(Tensor<BHalf, 1>, Vec<usize>)> {
-        let (dh, sh) = match idx.get(name) {
-            Some(crate::ingest::LeafHandles::F16(d, s)) => (*d, *s),
-            Some(crate::ingest::LeafHandles::F32(..)) => {
-                anyhow::bail!("{name}: expected an f16 leaf, found f32")
-            }
+        let leaf = match idx.get(name) {
+            Some(leaf) if leaf.elem() == crate::leaf::Elem::F16 => leaf,
+            Some(_) => anyhow::bail!("{name}: expected an f16 leaf, found f32"),
             None => anyhow::bail!("{name}: missing from pile index"),
         };
-        let bytes: anybytes::Bytes = rd
-            .get(dh)
-            .map_err(|e| anyhow::anyhow!("{name}: data blob: {e:?}"))?;
-        let shape = crate::ingest::read_shape(rd, sh);
-        let t = crate::nn::alias::alias_flat_raw::<half::f16>(bytes, dev)
+        let t = crate::nn::alias::alias_flat_raw::<half::f16>(leaf.payload().clone(), dev)
             .map_err(|e| anyhow::anyhow!("{name}: zero-copy alias failed: {e}"))?;
-        Ok((t, shape))
+        Ok((t, leaf.shape()))
     }
     let f3 = |name: &str| -> anyhow::Result<Tensor<BHalf, 3>> {
-        let (t, s) = alias(folded, folded_reader, name, &dev)?;
+        let (t, s) = alias(folded, name, &dev)?;
         anyhow::ensure!(s.len() == 3, "{name}: rank {} != 3", s.len());
         Ok(t.reshape([s[0], s[1], s[2]]))
     };
     let f4 = |name: &str| -> anyhow::Result<Tensor<BHalf, 4>> {
-        let (t, s) = alias(folded, folded_reader, name, &dev)?;
+        let (t, s) = alias(folded, name, &dev)?;
         anyhow::ensure!(s.len() == 4, "{name}: rank {} != 4", s.len());
         Ok(t.reshape([s[0], s[1], s[2], s[3]]))
     };
 
     let cfg = talker_attn_config();
-    let (ce, ce_shape) = alias(f16, reader, "talker.model.codec_embedding.weight", &dev)?;
+    let (ce, ce_shape) = alias(f16, "talker.model.codec_embedding.weight", &dev)?;
     anyhow::ensure!(ce_shape.len() == 2, "codec_embedding rank != 2");
     let codec_embedding = Embedding {
         weight: ce.reshape([ce_shape[0], ce_shape[1]]),
     };
     let hidden = ce_shape[1];
-    let (te, te_shape) = alias(f16, reader, "talker.model.text_embedding.weight", &dev)?;
+    let (te, te_shape) = alias(f16, "talker.model.text_embedding.weight", &dev)?;
     anyhow::ensure!(te_shape.len() == 2, "text_embedding rank != 2");
     let text_embedding = Embedding {
         weight: te.reshape([te_shape[0], te_shape[1]]),
@@ -1373,7 +1401,7 @@ pub fn load_qwen3tts_talker_folded_from_indexes<R: BlobStoreGet, F: BlobStoreGet
             TALKER_EPS,
         ));
     }
-    let (nw, nw_shape) = alias(folded, folded_reader, "talker.folded.norm.weight", &dev)?;
+    let (nw, nw_shape) = alias(folded, "talker.folded.norm.weight", &dev)?;
     anyhow::ensure!(nw_shape.len() == 1, "norm.weight rank != 1");
     let norm = RmsNorm {
         weight: nw,
@@ -1381,16 +1409,14 @@ pub fn load_qwen3tts_talker_folded_from_indexes<R: BlobStoreGet, F: BlobStoreGet
     };
 
     // CPU stages: exact f32 leaves from the canonical pile, as in every lane.
-    let ce_cpu = f32_
+    let codec_embedding_cpu = f32_
         .get("talker.model.codec_embedding.weight")
-        .copied()
-        .ok_or_else(|| anyhow::anyhow!("talker.model.codec_embedding.weight: missing f32 leaf"))?;
-    let codec_embedding_cpu = crate::ingest::read_leaf(reader, ce_cpu).0;
-    let ch = f32_
+        .ok_or_else(|| anyhow::anyhow!("talker.model.codec_embedding.weight: missing f32 leaf"))?
+        .to_f32();
+    let codec_head = f32_
         .get("talker.codec_head.weight")
-        .copied()
-        .ok_or_else(|| anyhow::anyhow!("talker.codec_head.weight: missing f32 leaf"))?;
-    let codec_head = crate::ingest::read_leaf(reader, ch).0;
+        .ok_or_else(|| anyhow::anyhow!("talker.codec_head.weight: missing f32 leaf"))?
+        .to_f32();
 
     Ok(Talker {
         hidden,
@@ -1562,9 +1588,9 @@ pub fn checkout_any_branch(
 /// converted); callers should treat empty as "not a typed pile" and fall back.
 pub fn load_typed_keymap_from_pile(
     pile_path: &Path,
-) -> anyhow::Result<std::collections::HashMap<String, crate::leaf::TypedLeaf>> {
+) -> anyhow::Result<std::collections::HashMap<String, crate::leaf::Leaf>> {
     let (_, tribles, reader) = checkout_any_branch(pile_path)?;
-    Ok(crate::leaf::index_typed_by_name(&tribles, &reader))
+    crate::leaf::index_by_name(&tribles, &reader)
 }
 
 /// Reconstruct a SentencePiece UNIGRAM tokenizer from a pile's tokenizer graph.
@@ -2075,8 +2101,8 @@ fn select_native_model_index(
 
 /// Stream a Gemma 4 model from one already-selected native model index: load
 /// each tensor on demand and drop it after upload, so peak CPU is one tensor
-/// rather than the whole f32 keymap. The index owns its blob reader across the
-/// complete build.
+/// rather than the whole f32 keymap. Each leaf keeps the pile's mapping alive
+/// for as long as the index holds it, so the build needs no separate reader.
 #[cfg(feature = "gemma")]
 pub fn load_gemma4_streaming_from_index<
     B: burn::prelude::Backend,
@@ -2089,10 +2115,8 @@ pub fn load_gemma4_streaming_from_index<
     crate::models::gemma::gemma4::decoder::Gemma4Model<B>,
     Option<crate::models::gemma::gemma4::vision::Gemma4VisionEncoder<B>>,
 ) {
-    let (_, index, reader) = selected.into_parts();
-    crate::models::gemma::gemma4::weights::load_gemma4_streaming::<B>(
-        config, index, &reader, device,
-    )
+    let (_, index, _reader) = selected.into_parts();
+    crate::models::gemma::gemma4::weights::load_gemma4_streaming::<B>(config, index, device)
 }
 
 /// Local-latest path convenience for [`load_gemma4_streaming_from_index`].
@@ -2133,12 +2157,8 @@ pub fn load_gemma4_hearing_from_index<
     let audio_cfg = config.audio_config.clone().ok_or_else(|| {
         anyhow::anyhow!("config has no audio_config — this checkpoint has no stt")
     })?;
-    let (_, index, reader) = selected.into_parts();
-    let fetch = |name: &str| {
-        index
-            .get(name)
-            .map(|&h| crate::ingest::read_leaf(&reader, h))
-    };
+    let (_, index, _reader) = selected.into_parts();
+    let fetch = |name: &str| index.get(name).map(crate::leaf::Leaf::to_f32_shape);
     let tower = crate::models::gemma::gemma4::audio::AudioModel::<B>::load_with(
         audio_cfg.clone(),
         &fetch,
@@ -2149,9 +2169,8 @@ pub fn load_gemma4_hearing_from_index<
         audio_cfg.rms_norm_eps,
         device,
     );
-    let (model, vision) = crate::models::gemma::gemma4::weights::load_gemma4_streaming::<B>(
-        config, index, &reader, device,
-    );
+    let (model, vision) =
+        crate::models::gemma::gemma4::weights::load_gemma4_streaming::<B>(config, index, device);
     Ok((model, vision, tower, embedder))
 }
 
@@ -2190,12 +2209,8 @@ pub fn load_gemma4_audio_from_index<
     crate::models::gemma::gemma4::audio::AudioModel<B>,
     crate::models::gemma::gemma4::audio::AudioEmbedder<B>,
 ) {
-    let (_, index, reader) = selected.into_parts();
-    let fetch = |name: &str| {
-        index
-            .get(name)
-            .map(|&h| crate::ingest::read_leaf(&reader, h))
-    };
+    let (_, index, _reader) = selected.into_parts();
+    let fetch = |name: &str| index.get(name).map(crate::leaf::Leaf::to_f32_shape);
     let tower = crate::models::gemma::gemma4::audio::AudioModel::<B>::load_with(
         audio_cfg.clone(),
         &fetch,
@@ -2242,7 +2257,6 @@ pub fn load_gemma4_aliased_from_index(
     config: crate::models::gemma::gemma4::config::Gemma4Config,
     device: burn::backend::wgpu::WgpuDevice,
 ) -> anyhow::Result<crate::models::gemma::gemma4::decoder::Gemma4Model<crate::nn::backend::BHalf>> {
-    use crate::ingest::LeafHandles;
     use crate::models::gemma::gemma4::weights::{load_gemma4_from_source, WeightCtx};
     use crate::nn::backend::BHalf;
     use burn::backend::wgpu::{CubeTensor, WgpuDevice, WgpuRuntime};
@@ -2253,24 +2267,18 @@ pub fn load_gemma4_aliased_from_index(
     const PAGE: u64 = 16384;
 
     require_f16_model_index(&selected)?;
-    let (_, index, reader) = selected.into_parts();
+    let (_, index, _reader) = selected.into_parts();
 
     let client = WgpuRuntime::client(&device);
     let ctx = WeightCtx::<BHalf> {
         has: Box::new(|name: &str| index.contains_key(name)),
         get: Box::new(|name: &str, device: &WgpuDevice| {
-            let (dh, sh) = match index.get(name)? {
-                LeafHandles::F16(d, s) => (*d, *s),
-                LeafHandles::F32(..) => return None,
-            };
-            let sh_bytes: anybytes::Bytes = reader.get(sh).ok()?;
-            let shape: Vec<usize> = sh_bytes
-                .view::<[u64]>()
-                .ok()?
-                .iter()
-                .map(|&x| x as usize)
-                .collect();
-            let bytes: anybytes::Bytes = reader.get(dh).ok()?;
+            let leaf = index.get(name)?;
+            if leaf.elem() != crate::leaf::Elem::F16 {
+                return None;
+            }
+            let shape = leaf.shape();
+            let bytes: anybytes::Bytes = leaf.payload().clone();
             let blob_ptr = bytes.as_ptr() as u64;
             let nbytes = bytes.len() as u64;
             let n = (nbytes / 2) as usize; // f16 element count
@@ -2334,12 +2342,10 @@ pub fn load_gemma4_aliased_from_pile(
 /// per-tensor body of [`load_gemma4_aliased_from_pile`]; factored out so the
 /// Qwen2.5-VL `QwenWeights`/`VisionWeights` aliasing source can reuse it.
 #[cfg(all(feature = "gemma", target_os = "macos"))]
-fn alias_f16_leaf<R: triblespace::prelude::BlobStoreGet>(
-    reader: &R,
-    handles: crate::ingest::LeafHandles,
+fn alias_f16_leaf(
+    leaf: &crate::leaf::Leaf,
     device: &burn::backend::wgpu::WgpuDevice,
 ) -> (burn::tensor::Tensor<crate::nn::backend::B, 1>, Vec<usize>) {
-    use crate::ingest::LeafHandles;
     use crate::nn::backend::B;
     use burn::backend::wgpu::{CubeTensor, WgpuRuntime};
     use burn::tensor::{DType, Tensor, TensorPrimitive};
@@ -2348,18 +2354,12 @@ fn alias_f16_leaf<R: triblespace::prelude::BlobStoreGet>(
     use std::sync::Arc;
     const PAGE: u64 = 16384;
 
-    let (dh, sh) = match handles {
-        LeafHandles::F16(d, s) => (d, s),
-        LeafHandles::F32(..) => panic!("aliased path requires f16 leaves; found f32"),
-    };
-    let sh_bytes: anybytes::Bytes = reader.get(sh).expect("shape blob");
-    let shape: Vec<usize> = sh_bytes
-        .view::<[u64]>()
-        .expect("shape view")
-        .iter()
-        .map(|&x| x as usize)
-        .collect();
-    let bytes: anybytes::Bytes = reader.get(dh).expect("data_f16 blob");
+    assert!(
+        leaf.elem() == crate::leaf::Elem::F16,
+        "aliased path requires f16 leaves; found f32"
+    );
+    let shape = leaf.shape();
+    let bytes: anybytes::Bytes = leaf.payload().clone();
     let blob_ptr = bytes.as_ptr() as u64;
     let nbytes = bytes.len() as u64;
     let n = (nbytes / 2) as usize; // f16 element count
@@ -2406,27 +2406,25 @@ fn alias_f16_leaf<R: triblespace::prelude::BlobStoreGet>(
 /// `QwenRmsNorm`/`Linear`). Names resolve EXACTLY (the merge scripts already
 /// strip the `model.` prefix to QwenTextModel naming), so no prefix munging.
 #[cfg(all(feature = "gemma", target_os = "macos"))]
-struct AliasedQwenWeights<'a, R: triblespace::prelude::BlobStoreGet> {
-    index: &'a HashMap<String, crate::ingest::LeafHandles>,
-    reader: &'a R,
+struct AliasedQwenWeights<'a> {
+    index: &'a HashMap<String, crate::leaf::Leaf>,
     device: burn::backend::wgpu::WgpuDevice,
 }
 
 #[cfg(all(feature = "gemma", target_os = "macos"))]
-impl<'a, R: triblespace::prelude::BlobStoreGet> AliasedQwenWeights<'a, R> {
+impl<'a> AliasedQwenWeights<'a> {
     fn flat(&self, name: &str) -> (burn::tensor::Tensor<crate::nn::backend::B, 1>, Vec<usize>) {
-        let handles = *self
+        let leaf = self
             .index
             .get(name)
             .unwrap_or_else(|| panic!("missing weight {name} in pile index"));
-        alias_f16_leaf(self.reader, handles, &self.device)
+        alias_f16_leaf(leaf, &self.device)
     }
 }
 
 #[cfg(all(feature = "gemma", target_os = "macos"))]
-impl<'a, R: triblespace::prelude::BlobStoreGet>
-    crate::models::qwen2_5_vl::layers::QwenWeights<crate::nn::backend::B>
-    for AliasedQwenWeights<'a, R>
+impl<'a> crate::models::qwen2_5_vl::layers::QwenWeights<crate::nn::backend::B>
+    for AliasedQwenWeights<'a>
 {
     fn t1(&self, name: &str) -> burn::tensor::Tensor<crate::nn::backend::B, 1> {
         self.flat(name).0
@@ -2438,9 +2436,8 @@ impl<'a, R: triblespace::prelude::BlobStoreGet>
 }
 
 #[cfg(all(feature = "gemma", target_os = "macos"))]
-impl<'a, R: triblespace::prelude::BlobStoreGet>
-    crate::models::qwen2_5_vl::vision::VisionWeights<crate::nn::backend::B>
-    for AliasedQwenWeights<'a, R>
+impl<'a> crate::models::qwen2_5_vl::vision::VisionWeights<crate::nn::backend::B>
+    for AliasedQwenWeights<'a>
 {
     fn t1(&self, name: &str) -> burn::tensor::Tensor<crate::nn::backend::B, 1> {
         self.flat(name).0
@@ -2468,9 +2465,7 @@ fn require_f16_model_index<R>(
     if let Some(name) = selected
         .handles()
         .iter()
-        .filter_map(|(name, handles)| {
-            matches!(handles, crate::ingest::LeafHandles::F32(..)).then_some(name)
-        })
+        .filter_map(|(name, leaf)| (leaf.elem() == crate::leaf::Elem::F32).then_some(name))
         .min()
     {
         anyhow::bail!(
@@ -2513,7 +2508,6 @@ pub fn load_nomic_mm7b_aliased_from_snapshot(
 
     let weights = AliasedQwenWeights {
         index: &index,
-        reader: &reader,
         device: device.clone(),
     };
     let embedder =
@@ -2595,8 +2589,10 @@ mod native_model_snapshot_tests {
             attrs::quantization: QUANTIZATION_NATIVE,
         }
         .into_facts();
+        let team = signing_key.verifying_key();
         crate::model_collection::publish_model_fragment(
             pile,
+            team,
             signing_key,
             Fragment::rooted(root_id, facts),
         )
@@ -2639,8 +2635,11 @@ mod native_model_snapshot_tests {
             };
         assert!(error.contains("ambiguous model root"), "{error}");
 
-        let snapshot = crate::model_collection::load_model_collection_local_latest(&file.path)
-            .expect("native snapshot");
+        let snapshot = crate::model_collection::load_model_collection_local_latest(
+            &file.path,
+            signer.verifying_key(),
+        )
+        .expect("native snapshot");
         let selected = crate::selection::SelectedModelIndex::from_snapshot(
             snapshot,
             crate::selection::ModelSelector::Source {
@@ -2650,15 +2649,14 @@ mod native_model_snapshot_tests {
         )
         .expect("strict source selection");
         require_f16_model_index(&selected).expect("selected model is f16");
-        let (_, index, reader) = selected.into_parts();
+        let (_, index, _reader) = selected.into_parts();
         assert_eq!(index.len(), 1);
-        let crate::ingest::LeafHandles::F16(data, shape) = index["target.weight"] else {
-            panic!("selected leaf was not f16");
-        };
-        let values: anybytes::Bytes = reader.get(data).expect("data after pile close");
-        let shape: anybytes::Bytes = reader.get(shape).expect("shape after pile close");
-        assert_eq!(values.view::<[half::f16]>().unwrap()[0].to_f32(), 1.5);
-        assert_eq!(&*shape.view::<[u64]>().unwrap(), &[1]);
+        let leaf = &index["target.weight"];
+        assert_eq!(leaf.elem(), crate::leaf::Elem::F16);
+        // The leaf's bytes outlive the pile handle: its payload is a view over
+        // the mapping and keeps it alive.
+        assert_eq!(leaf.view_f16().expect("f16 view")[0].to_f32(), 1.5);
+        assert_eq!(leaf.dims(), &[1]);
 
         let mut pile = open_test_pile(&file);
         add_model(
@@ -2670,8 +2668,11 @@ mod native_model_snapshot_tests {
             true,
         );
         pile.close().unwrap();
-        let snapshot = crate::model_collection::load_model_collection_local_latest(&file.path)
-            .expect("ambiguous native snapshot");
+        let snapshot = crate::model_collection::load_model_collection_local_latest(
+            &file.path,
+            signer.verifying_key(),
+        )
+        .expect("ambiguous native snapshot");
         let error = match crate::selection::SelectedModelIndex::from_snapshot(
             snapshot,
             crate::selection::ModelSelector::Source {

@@ -7,8 +7,8 @@
 //! [`TribleSet`], its blob reader, and an explicit selector; every selector and
 //! every functional model field has exact-cardinality semantics.
 
-use crate::format::{attrs, F32Array, U64Array};
-use crate::ingest::LeafHandles;
+use crate::format::attrs;
+use crate::leaf::Leaf;
 use anyhow::{anyhow, bail, Context};
 use std::collections::{BTreeSet, HashMap};
 use triblespace::core::collection::CollectionSnapshot;
@@ -53,7 +53,7 @@ pub enum TokenizerSelector<'a> {
 /// loaders.
 pub struct SelectedModelIndex<R> {
     root: Id,
-    handles: HashMap<String, LeafHandles>,
+    handles: HashMap<String, Leaf>,
     reader: R,
 }
 
@@ -63,8 +63,8 @@ impl<R> SelectedModelIndex<R> {
         self.root
     }
 
-    /// Strict `tensor name -> leaf handles` index for the selected root.
-    pub fn handles(&self) -> &HashMap<String, LeafHandles> {
+    /// Strict `tensor name -> leaf` index for the selected root.
+    pub fn handles(&self) -> &HashMap<String, Leaf> {
         &self.handles
     }
 
@@ -73,8 +73,8 @@ impl<R> SelectedModelIndex<R> {
         &self.reader
     }
 
-    /// Consume the selection into its root, handle index, and owned reader.
-    pub fn into_parts(self) -> (Id, HashMap<String, LeafHandles>, R) {
+    /// Consume the selection into its root, leaf index, and owned reader.
+    pub fn into_parts(self) -> (Id, HashMap<String, Leaf>, R) {
         (self.root, self.handles, self.reader)
     }
 }
@@ -246,17 +246,21 @@ fn model_members(tribles: &TribleSet, root: Id) -> anyhow::Result<BTreeSet<Id>> 
     Ok(members)
 }
 
-/// Build a strict `name -> leaf handles` index for one model root.
+/// Build a strict `name -> leaf` index for one model root.
 ///
-/// Every module must have exactly one name and weight edge; every tensor leaf
-/// exactly one shape and exactly one of `data`/`data_f16`; tensor names must be
+/// Every module must have exactly one name and weight edge, every weight entity
+/// must carry exactly one readable tensor leaf, and tensor names must be
 /// globally unique within the model. Violations are errors rather than
 /// iteration-order-dependent `HashMap` overwrites.
+///
+/// A leaf's element format and shape come out of the leaf itself — the
+/// attribute's id names the element and rank, and the blob header names the
+/// dims — so there is nothing here that pairs a payload with a shape and hopes.
 pub fn index_keymap_for_root(
     tribles: &TribleSet,
     blobs: &impl BlobStoreGet,
     root: Id,
-) -> anyhow::Result<HashMap<String, LeafHandles>> {
+) -> anyhow::Result<HashMap<String, Leaf>> {
     let mut map = HashMap::new();
     for member in model_members(tribles, root)? {
         let name_handle = exactly_one(
@@ -275,37 +279,9 @@ pub fn index_keymap_for_root(
             .map(|(weight,)| weight),
             format_args!("weight edge on model member {member}"),
         )?;
-        let shape = exactly_one(
-            find!(
-                (shape: Inline<inlineencodings::Handle<U64Array>>),
-                pattern!(tribles, [{ weight @ attrs::shape: ?shape }])
-            )
-            .map(|(shape,)| shape),
-            format_args!("shape on tensor leaf {weight}"),
-        )?;
-
-        let f32_data: Vec<_> = find!(
-            (data: Inline<inlineencodings::Handle<F32Array>>),
-            pattern!(tribles, [{ weight @ attrs::data: ?data }])
-        )
-        .map(|(data,)| data)
-        .collect();
-        let f16_data: Vec<_> = find!(
-            (data: Inline<inlineencodings::Handle<crate::f16enc::F16Array>>),
-            pattern!(tribles, [{ weight @ attrs::data_f16: ?data }])
-        )
-        .map(|(data,)| data)
-        .collect();
-        let handles = match (f32_data.as_slice(), f16_data.as_slice()) {
-            ([data], []) => LeafHandles::F32(*data, shape),
-            ([], [data]) => LeafHandles::F16(*data, shape),
-            ([], []) => bail!("tensor leaf {weight} has neither data nor data_f16"),
-            _ => bail!(
-                "tensor leaf {weight} must have exactly one of data/data_f16 (found {} f32, {} f16)",
-                f32_data.len(),
-                f16_data.len()
-            ),
-        };
+        let handles = crate::leaf::resolve(tribles, blobs, weight)
+            .with_context(|| format!("read tensor leaf {weight}"))?
+            .ok_or_else(|| anyhow!("tensor leaf {weight} carries no readable tensor"))?;
 
         let name = read_long_string(blobs, name_handle, "safetensor_path")?;
         if map.insert(name.clone(), handles).is_some() {
@@ -354,48 +330,6 @@ impl<R: BlobStoreGet> SelectedModelIndex<R> {
     }
 }
 
-fn read_shape(
-    blobs: &impl BlobStoreGet,
-    handle: Inline<inlineencodings::Handle<U64Array>>,
-) -> anyhow::Result<Vec<usize>> {
-    let bytes: anybytes::Bytes = blobs
-        .get(handle)
-        .map_err(|error| anyhow!("read shape blob: {error}"))?;
-    let values = bytes.view::<[u64]>().context("decode shape blob")?;
-    Ok(values.iter().map(|&value| value as usize).collect())
-}
-
-/// Fallibly materialize one indexed tensor leaf, one tensor at a time.
-///
-/// Unlike the legacy ingest helper this propagates missing or malformed blob
-/// errors, making it suitable for commit-last validation gates.
-pub fn materialize_leaf(
-    blobs: &impl BlobStoreGet,
-    handles: LeafHandles,
-) -> anyhow::Result<(Vec<f32>, Vec<usize>)> {
-    match handles {
-        LeafHandles::F32(data, shape) => {
-            let bytes: anybytes::Bytes = blobs
-                .get(data)
-                .map_err(|error| anyhow!("read f32 tensor blob: {error}"))?;
-            let values = bytes.view::<[f32]>().context("decode f32 tensor blob")?;
-            Ok((values.to_vec(), read_shape(blobs, shape)?))
-        }
-        LeafHandles::F16(data, shape) => {
-            let bytes: anybytes::Bytes = blobs
-                .get(data)
-                .map_err(|error| anyhow!("read f16 tensor blob: {error}"))?;
-            let values = bytes
-                .view::<[half::f16]>()
-                .context("decode f16 tensor blob")?;
-            Ok((
-                values.iter().map(|value| value.to_f32()).collect(),
-                read_shape(blobs, shape)?,
-            ))
-        }
-    }
-}
-
 /// Select one model and materialize its tensor keymap from an already-open
 /// graph and blob reader.
 pub fn load_keymap_from_graph(
@@ -404,10 +338,10 @@ pub fn load_keymap_from_graph(
     selector: ModelSelector<'_>,
 ) -> anyhow::Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
     let root = select_model_root(tribles, blobs, selector)?;
-    index_keymap_for_root(tribles, blobs, root)?
+    Ok(index_keymap_for_root(tribles, blobs, root)?
         .into_iter()
-        .map(|(name, handles)| Ok((name, materialize_leaf(blobs, handles)?)))
-        .collect()
+        .map(|(name, leaf)| (name, leaf.to_f32_shape()))
+        .collect())
 }
 
 fn tokenizer_roots(tribles: &TribleSet) -> BTreeSet<Id> {
@@ -491,11 +425,40 @@ pub fn load_tokenizer_from_graph(
 mod tests {
     use super::*;
     use triblespace::core::blob::MemoryBlobStore;
+    #[cfg(feature = "tokenizer")]
     use triblespace::core::metadata;
 
     struct ModelFixture {
         root: Id,
         members: Vec<Id>,
+    }
+
+    /// How a fixture writes its leaves. Both forms are in the wild: the typed
+    /// tensor every importer writes now, and the two-blob pair every existing
+    /// model pile holds. Selection has to work on both, so the tests say which.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum LeafForm {
+        Typed,
+        TwoBlob,
+    }
+
+    fn add_leaf(
+        facts: &mut TribleSet,
+        blobs: &mut MemoryBlobStore,
+        form: LeafForm,
+        value: f32,
+    ) -> Id {
+        let leaf = match form {
+            LeafForm::Typed => crate::format::put_raw(blobs, &[value], &[1]).unwrap(),
+            LeafForm::TwoBlob => {
+                let data = blobs.put::<crate::format::F32Array, _>(vec![value]).unwrap();
+                let shape = blobs.put::<crate::format::U64Array, _>(vec![1]).unwrap();
+                entity! { _ @ attrs::data: data, attrs::shape: shape }
+            }
+        };
+        let leaf_id = leaf.root().unwrap();
+        *facts += leaf.into_facts();
+        leaf_id
     }
 
     fn add_model(
@@ -506,13 +469,30 @@ mod tests {
         quantization: &str,
         tensors: &[(&str, f32)],
     ) -> ModelFixture {
+        add_model_as(
+            facts,
+            blobs,
+            LeafForm::Typed,
+            name,
+            source,
+            quantization,
+            tensors,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_model_as(
+        facts: &mut TribleSet,
+        blobs: &mut MemoryBlobStore,
+        form: LeafForm,
+        name: &str,
+        source: &str,
+        quantization: &str,
+        tensors: &[(&str, f32)],
+    ) -> ModelFixture {
         let mut members = Vec::new();
         for &(tensor_name, value) in tensors {
-            let data = blobs.put::<F32Array, _>(vec![value]).unwrap();
-            let shape = blobs.put::<U64Array, _>(vec![1]).unwrap();
-            let leaf = entity! { _ @ attrs::data: data, attrs::shape: shape };
-            let leaf_id = leaf.root().unwrap();
-            *facts += leaf.into_facts();
+            let leaf_id = add_leaf(facts, blobs, form, value);
 
             let name = blobs
                 .put::<blobencodings::LongString, _>(tensor_name.to_string())
@@ -620,11 +600,7 @@ mod tests {
         let reader = BlobStore::reader(&mut blobs).unwrap();
         assert!(select_model_root(&facts, &reader, ModelSelector::Name("same")).is_err());
 
-        let extra_data = blobs.put::<F32Array, _>(vec![3.0]).unwrap();
-        let extra_shape = blobs.put::<U64Array, _>(vec![1]).unwrap();
-        let extra_leaf = entity! { _ @ attrs::data: extra_data, attrs::shape: extra_shape };
-        let extra_leaf_id = extra_leaf.root().unwrap();
-        facts += extra_leaf.into_facts();
+        let extra_leaf_id = add_leaf(&mut facts, &mut blobs, LeafForm::Typed, 3.0);
         let member = first.members[0];
         facts += entity! { ExclusiveId::force_ref(&member) @ attrs::weight: &extra_leaf_id }
             .into_facts();
@@ -679,6 +655,49 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("ambiguous model_name field"), "{error}");
+    }
+
+    /// The model piles that exist today hold the two-blob form, and selection
+    /// must keep reading them. Same graph, same keymap, one leaf form apart.
+    #[test]
+    fn a_two_blob_pile_indexes_the_same_as_a_typed_one() {
+        let mut typed_facts = TribleSet::new();
+        let mut typed_blobs = MemoryBlobStore::new();
+        let typed = add_model_as(
+            &mut typed_facts,
+            &mut typed_blobs,
+            LeafForm::Typed,
+            "m",
+            "org/m",
+            "native",
+            &[("a.weight", 1.5), ("b.weight", -2.5)],
+        );
+        let typed_reader = BlobStore::reader(&mut typed_blobs).unwrap();
+
+        let mut old_facts = TribleSet::new();
+        let mut old_blobs = MemoryBlobStore::new();
+        let old = add_model_as(
+            &mut old_facts,
+            &mut old_blobs,
+            LeafForm::TwoBlob,
+            "m",
+            "org/m",
+            "native",
+            &[("a.weight", 1.5), ("b.weight", -2.5)],
+        );
+        let old_reader = BlobStore::reader(&mut old_blobs).unwrap();
+
+        let typed_map = index_keymap_for_root(&typed_facts, &typed_reader, typed.root).unwrap();
+        let old_map = index_keymap_for_root(&old_facts, &old_reader, old.root).unwrap();
+        assert_eq!(typed_map.len(), 2);
+        assert_eq!(old_map.len(), 2);
+        for name in ["a.weight", "b.weight"] {
+            assert_eq!(typed_map[name].to_f32_shape(), old_map[name].to_f32_shape());
+            assert_eq!(typed_map[name].elem(), old_map[name].elem());
+        }
+        // The roots differ, and that is correct: the two forms are different
+        // bytes, so they are different content addresses.
+        assert_ne!(typed.root, old.root);
     }
 
     #[cfg(feature = "tokenizer")]

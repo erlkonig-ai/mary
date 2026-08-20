@@ -19,7 +19,7 @@
 //! stays the parity default) and the `reset_session` seam on the [`lmgen`] /
 //! [`pipeline`] step machines (a new conversation without a weight reload).
 
-use crate::ingest::LeafHandles;
+use crate::leaf::{Elem, Leaf};
 use crate::nn::weight_loader::WeightLoader;
 use crate::selection::{ModelSelector, SelectedModelIndex};
 use triblespace::core::collection::CollectionSnapshot;
@@ -45,7 +45,7 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
         if let Some(name) = selected
             .handles()
             .iter()
-            .filter_map(|(name, handles)| matches!(handles, LeafHandles::F16(..)).then_some(name))
+            .filter_map(|(name, leaf)| (leaf.elem() == Elem::F16).then_some(name))
             .min()
         {
             anyhow::bail!("PersonaPlex exact tensor {name:?} is not f32");
@@ -90,7 +90,7 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
     }
 
     /// Exact tensor index retained for source-parity gates.
-    pub fn exact(&self) -> &std::collections::HashMap<String, LeafHandles> {
+    pub fn exact(&self) -> &std::collections::HashMap<String, Leaf> {
         self.selected.handles()
     }
 
@@ -103,14 +103,12 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
 impl PersonaPlexWeights<PileReader> {
     /// Consume the exact model into the platform's established lazy loader.
     pub fn into_loader(self) -> WeightLoader {
-        let (_, exact, reader) = self.selected.into_parts();
+        let (_, exact, _reader) = self.selected.into_parts();
         #[cfg(target_os = "macos")]
         {
             return WeightLoader::Aliased(crate::nn::weight_loader::AliasedPile::new(
                 std::collections::HashMap::new(),
                 exact,
-                reader.clone(),
-                reader,
                 crate::nn::backend::WgpuDevice::default(),
             ));
         }
@@ -118,7 +116,7 @@ impl PersonaPlexWeights<PileReader> {
         {
             let keymap = exact
                 .into_iter()
-                .map(|(name, handles)| (name, crate::ingest::read_leaf(&reader, handles)))
+                .map(|(name, leaf)| (name, leaf.to_f32_shape()))
                 .collect();
             WeightLoader::Pile(keymap)
         }

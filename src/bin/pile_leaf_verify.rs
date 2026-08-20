@@ -229,13 +229,13 @@ fn main() -> Result<()> {
             t.shape()
         );
         anyhow::ensure!(
-            &t.view.payload()[..] == &src_bytes[..],
+            &t.payload()[..] == &src_bytes[..],
             "{leaf_id}: payload differs ({} vs {} bytes)",
             src_bytes.len(),
-            t.view.payload().len()
+            t.payload().len()
         );
 
-        if t.elem == leaf::Elem::F32 {
+        if t.elem() == leaf::Elem::F32 {
             let v = t
                 .view_f32()
                 .ok_or_else(|| anyhow::anyhow!("{leaf_id}: f32 leaf served no zero-copy view"))?;

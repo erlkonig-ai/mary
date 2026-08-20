@@ -1,6 +1,6 @@
 use anyhow::Context;
 use ed25519_dalek::SigningKey;
-use mary::ingest::{LeafDtype, LeafHandles};
+use mary::ingest::LeafDtype;
 use mary::selection::{ModelSelector, SelectedModelIndex, TokenizerSelector};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -8,6 +8,23 @@ use triblespace::core::collection::CollectionCommit;
 use triblespace::core::repo::pile::Pile;
 use triblespace::prelude::*;
 
+/// Check the things the encoding cannot: that the root is a model at all, that
+/// every leaf is exact f32, and that the tensor names and shapes are the ones
+/// this architecture contracts for.
+///
+/// What is NOT here any more is the shape check. A tensor leaf is one
+/// `Tensor<F32, RANK>` blob whose header states its dims, and decoding refuses
+/// a payload that is not the length those dims imply — so "does this shape
+/// describe this data" is settled before a `Leaf` exists, for every reader, not
+/// just this one. Comparing a shape blob against a data blob here was the only
+/// way to know that under the two-blob form; under this one it would be
+/// re-deriving a fact the leaf already carries.
+///
+/// The element check survives because it is about the leaf, not its shape: an
+/// f16 leaf resolves perfectly well and is simply not what an exact embedding
+/// root may contain. The rest survives because it is about the GRAPH — which
+/// tensors this root reaches, under which names — which no tensor encoding
+/// speaks to.
 fn validate_f32_model<R: BlobStoreGet>(
     selected: &SelectedModelIndex<R>,
     contract: &BTreeMap<String, Vec<usize>>,
@@ -17,46 +34,18 @@ fn validate_f32_model<R: BlobStoreGet>(
         "embedding model root contains no tensors"
     );
     let mut actual_shapes = BTreeMap::new();
-    for (name, handles) in selected.handles() {
-        let LeafHandles::F32(data, shape) = handles else {
-            anyhow::bail!("embedding tensor {name:?} is not an exact f32 leaf");
-        };
-        let data: anybytes::Bytes = selected
-            .reader()
-            .get(*data)
-            .map_err(|error| anyhow::anyhow!("read embedding tensor {name:?}: {error}"))?;
+    for (name, leaf) in selected.handles() {
         anyhow::ensure!(
-            (data.as_ptr() as usize).is_multiple_of(256),
+            leaf.elem() == mary::leaf::Elem::F32,
+            "embedding tensor {name:?} is not an exact f32 leaf"
+        );
+        anyhow::ensure!(
+            (leaf.payload().as_ptr() as usize).is_multiple_of(256),
             "embedding tensor {name:?} is not 256-byte aligned"
         );
-        let values = data
-            .view::<[f32]>()
+        leaf.view_f32()
             .with_context(|| format!("decode embedding tensor {name:?}"))?;
-        let shape: anybytes::Bytes = selected
-            .reader()
-            .get(*shape)
-            .map_err(|error| anyhow::anyhow!("read shape for {name:?}: {error}"))?;
-        let shape = shape
-            .view::<[u64]>()
-            .with_context(|| format!("decode shape for {name:?}"))?;
-        let shape = shape
-            .iter()
-            .map(|&dimension| {
-                usize::try_from(dimension)
-                    .with_context(|| format!("shape dimension for {name:?} exceeds usize"))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let elements = shape.iter().try_fold(1_usize, |product, &dimension| {
-            product
-                .checked_mul(dimension)
-                .with_context(|| format!("shape element count for {name:?} overflows usize"))
-        })?;
-        anyhow::ensure!(
-            values.len() == elements,
-            "embedding tensor {name:?} has {} values but shape describes {elements}",
-            values.len()
-        );
-        actual_shapes.insert(name.clone(), shape);
+        actual_shapes.insert(name.clone(), leaf.shape());
     }
     for (name, expected) in contract {
         let actual = actual_shapes

@@ -1,8 +1,12 @@
 //! mary — neural-network models as content-addressed graphs in TribleSpace.
 //!
 //! The format, in three primitives:
-//!   - a **tensor** is a self-describing leaf: a content-addressed `Array<F32>`
-//!     data blob + an `Array<U64>` shape blob. Identical tensors dedup.
+//!   - a **tensor** is a self-describing leaf: ONE content-addressed
+//!     `Tensor<Elem, RANK>` blob, whose fixed header carries the logical
+//!     dimensions ([`crate::leaf`]). Identical tensors dedup. Piles written
+//!     before that encoding hold a data blob plus a separate shape blob, and
+//!     the attributes for it (`data`, `data_f16`, `shape`) are still declared
+//!     below so those piles keep loading.
 //!   - a **module** is an entity. Its parameters are tensor leaves reached by
 //!     role-edges; `weight` and `bias` are the universal ones. A Linear is
 //!     `{weight, bias?}`; a LayerNorm, Conv, Embedding are the same shape of
@@ -36,15 +40,24 @@ pub mod attrs {
     use triblespace::prelude::*;
 
     attributes! {
-        // ── tensor leaf ──
-        /// Flat f32 data of a tensor leaf.
+        // ── tensor leaf, the two-blob form: READ ONLY ──
+        // Nothing writes these any more. A tensor leaf is one
+        // `Tensor<Elem, RANK>` blob (see [`crate::leaf`]) whose header carries
+        // the dims, which is what makes "this shape describes this data" an
+        // invariant of the encoding rather than of every reader. These three
+        // remain declared because every model pile written before that holds
+        // them, and `crate::leaf::resolve` still reads them; `pile_leaf_migrate`
+        // converts a pile, and they retire with the last unconverted one.
+        /// Flat f32 data of a two-blob tensor leaf. Legacy: read, never written.
         "572B45D52A47608F283D0F778597137A" as data: Handle<F32Array>;
-        /// Flat f16 (half) data of a tensor leaf — the half-width alternative to
-        /// `data`, used for weights whose native dtype is 16-bit (halves the pile
-        /// and matches the GPU dtype for zero-copy load). A leaf carries `data`
-        /// XOR `data_f16`, plus `shape`.
+        /// Flat f16 (half) data of a two-blob tensor leaf — the half-width
+        /// alternative to `data`. Such a leaf carries `data` XOR `data_f16`,
+        /// plus `shape`. Legacy: read, never written.
         "467CCF3FDCCCCE599F6C1B933EACD933" as data_f16: Handle<F16Array>;
-        /// Row-major shape (u64 dims) of a tensor leaf.
+        /// Row-major shape (u64 dims) of a two-blob tensor leaf, stated apart
+        /// from the data it claims to describe. Legacy: read, never written —
+        /// except by the quantized leaves below, which are still a multi-blob
+        /// form and still carry their shape this way.
         "D09A91FC3F04C40AE4A42CD6628A9E38" as shape: Handle<U64Array>;
 
         // ── quantized tensor leaf (derived runtime formats) ──
@@ -122,32 +135,45 @@ fn tensor_f32<B: Backend, const D: usize>(t: &Tensor<B, D>) -> Vec<f32> {
 }
 
 /// Store a flat f32 buffer + its shape as a self-describing leaf. Content-addressed.
+///
+/// ONE blob: the dims go in the tensor header, so there is no second handle
+/// that could name a shape belonging to a different tensor.
 pub fn put_raw(
     blobs: &mut impl BlobStorePut,
     data: &[f32],
     shape: &[u64],
 ) -> Result<Fragment, BlobErr> {
-    let d = blobs.put::<F32Array, _>(data.to_vec())?;
-    let s = blobs.put::<U64Array, _>(shape.to_vec())?;
-    Ok(entity! { _ @ attrs::data: d, attrs::shape: s })
+    let payload = anybytes::Bytes::from_source(data.to_vec());
+    Ok(crate::leaf::put_leaf(
+        blobs,
+        crate::leaf::Elem::F32,
+        shape,
+        payload,
+        "f32 leaf",
+    )?)
 }
 
-/// Store a flat f32 buffer DOWN-CAST to f16 + its shape as a half-width leaf
-/// (`data_f16`). Halves the pile for 16-bit-native weights and stores them in the
-/// GPU's dtype, so the load needs no conversion. f32→f16 is lossless for weights
-/// that originated as bf16 (f16's 10-bit mantissa covers bf16's 7).
+/// Store a flat f32 buffer DOWN-CAST to f16 as a half-width leaf. Halves the
+/// pile for 16-bit-native weights and stores them in the GPU's dtype, so the
+/// load needs no conversion. f32→f16 is lossless for weights that originated
+/// as bf16 (f16's 10-bit mantissa covers bf16's 7).
+///
+/// Under the V3 pile every record is 256-aligned and the tensor header is
+/// exactly 256 wide, so the payload lands GPU-ready for zero-copy aliasing.
 pub fn put_raw_f16(
     blobs: &mut impl BlobStorePut,
     data: &[f32],
     shape: &[u64],
 ) -> Result<Fragment, BlobErr> {
     let halves: Vec<half::f16> = data.iter().map(|&x| half::f16::from_f32(x)).collect();
-    // Plain `put`: under the V3 pile every record is already 256-aligned, so the
-    // f16 data lands GPU-ready for zero-copy aliasing with no special path (the
-    // old `put_aligned` was the V2-era shim for exactly this and is now redundant).
-    let d = blobs.put::<crate::f16enc::F16Array, _>(halves)?;
-    let s = blobs.put::<U64Array, _>(shape.to_vec())?;
-    Ok(entity! { _ @ attrs::data_f16: d, attrs::shape: s })
+    let payload = anybytes::Bytes::from_source(halves);
+    Ok(crate::leaf::put_leaf(
+        blobs,
+        crate::leaf::Elem::F16,
+        shape,
+        payload,
+        "f16 leaf",
+    )?)
 }
 
 /// Store a PACKED-Q4 weight (`nn::q4::quantize_q4` output: nibble words +
@@ -199,22 +225,14 @@ pub fn load_tensor<B: Backend, const D: usize>(
     id: Id,
     device: &B::Device,
 ) -> Tensor<B, D> {
-    let (dh, sh) = find!(
-        (d, s),
-        pattern!(tribles, [{ id @ attrs::data: ?d, attrs::shape: ?s }])
-    )
-    .next()
-    .expect("tensor leaf not found");
-    let data: anybytes::Bytes = blobs.get(dh).expect("data blob");
-    let data: anybytes::View<[f32]> = data.view().expect("data view");
-    let shp: anybytes::Bytes = blobs.get(sh).expect("shape blob");
-    let shp: anybytes::View<[u64]> = shp.view().expect("shape view");
-    assert_eq!(shp.len(), D, "tensor rank mismatch");
+    let leaf = crate::leaf::resolve(tribles, blobs, id)
+        .expect("tensor leaf")
+        .expect("tensor leaf not found");
+    let shape = leaf.shape();
+    assert_eq!(shape.len(), D, "tensor rank mismatch");
     let mut dims = [0usize; D];
-    for (i, d) in shp.iter().enumerate() {
-        dims[i] = *d as usize;
-    }
-    Tensor::<B, 1>::from_floats(&data[..], device).reshape(dims)
+    dims.copy_from_slice(&shape[..D]);
+    Tensor::<B, 1>::from_floats(&leaf.to_f32()[..], device).reshape(dims)
 }
 
 /// Store a Linear (`weight` [out,in], optional `bias` [out]) as a module entity.

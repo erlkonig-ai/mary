@@ -206,7 +206,7 @@ fn duplicate_tensor_names_across_files_publish_no_collection_commit() {
 
     let snapshot = mary::model_collection::snapshot_model_collection_local_latest(
         &mut pile,
-        signing_key.verifying_key(),
+        SigningKey::from_bytes(&[0x53; 32]).verifying_key(),
     )
     .expect("failed import must leave the native collection readable");
     assert!(snapshot.commits().is_empty());

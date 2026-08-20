@@ -52,10 +52,9 @@ use std::time::Instant;
 use burn::prelude::Backend;
 use rand::SeedableRng;
 use triblespace::core::collection::CollectionSnapshot;
-use triblespace::core::repo::pile::PileReader;
 use triblespace::prelude::BlobStoreGet;
 
-use crate::ingest::LeafHandles;
+use crate::leaf::{Elem, Leaf};
 use crate::models::f5::wav;
 use crate::models::qwen3tts::codec::CodecDecoder;
 use crate::models::qwen3tts::config::{
@@ -162,19 +161,19 @@ impl Qwen3TtsVariant {
 ///
 /// Four ordinary model roots exhaust the live tensors: the variant's exact
 /// base, one codec shared by both variants, a filtered f16 talker, and its
-/// pre-folded f16 GPU layout. Only compact handle indexes and one owning reader
-/// remain resident; no Repository ancestry or sibling-file naming participates
-/// in runtime selection.
-pub struct Qwen3TtsWeights<R> {
+/// pre-folded f16 GPU layout. Only the compact leaf indexes remain resident —
+/// each leaf holds its bytes as a view over the pile's mapping and keeps that
+/// mapping alive, so no reader is retained. No Repository ancestry or
+/// sibling-file naming participates in runtime selection.
+pub struct Qwen3TtsWeights {
     variant: Qwen3TtsVariant,
-    exact: HashMap<String, LeafHandles>,
-    talker_f16: HashMap<String, LeafHandles>,
-    folded_f16: HashMap<String, LeafHandles>,
-    reader: R,
+    exact: HashMap<String, Leaf>,
+    talker_f16: HashMap<String, Leaf>,
+    folded_f16: HashMap<String, Leaf>,
 }
 
-impl<R: BlobStoreGet> Qwen3TtsWeights<R> {
-    pub fn from_snapshot(
+impl Qwen3TtsWeights {
+    pub fn from_snapshot<R: BlobStoreGet>(
         snapshot: CollectionSnapshot<R>,
         variant: Qwen3TtsVariant,
     ) -> anyhow::Result<Self> {
@@ -183,7 +182,7 @@ impl<R: BlobStoreGet> Qwen3TtsWeights<R> {
             reader: &impl BlobStoreGet,
             source: &str,
             quantization: &str,
-        ) -> anyhow::Result<HashMap<String, LeafHandles>> {
+        ) -> anyhow::Result<HashMap<String, Leaf>> {
             let root = crate::selection::select_model_root(
                 facts,
                 reader,
@@ -196,17 +195,16 @@ impl<R: BlobStoreGet> Qwen3TtsWeights<R> {
         }
         fn require_width(
             component: &str,
-            handles: &HashMap<String, LeafHandles>,
+            leaves: &HashMap<String, Leaf>,
             f16: bool,
         ) -> anyhow::Result<()> {
-            for (name, handles) in handles {
-                let matches = matches!(handles, LeafHandles::F16(..)) == f16;
-                if !matches {
+            for (name, leaf) in leaves {
+                if (leaf.elem() == Elem::F16) != f16 {
                     anyhow::bail!(
                         "Qwen3-TTS {component} tensor {name:?} is {}, expected {}",
-                        match handles {
-                            LeafHandles::F32(..) => "f32",
-                            LeafHandles::F16(..) => "f16",
+                        match leaf.elem() {
+                            Elem::F32 => "f32",
+                            Elem::F16 => "f16",
                         },
                         if f16 { "f16" } else { "f32" }
                     );
@@ -259,13 +257,12 @@ impl<R: BlobStoreGet> Qwen3TtsWeights<R> {
         )?;
         require_width("talker-f16", &talker_f16, true)?;
         require_width("talker-folded-f16", &folded_f16, true)?;
-        let (_, _, reader) = snapshot.into_parts();
+        drop(snapshot);
         Ok(Self {
             variant,
             exact,
             talker_f16,
             folded_f16,
-            reader,
         })
     }
 
@@ -282,7 +279,7 @@ impl<R: BlobStoreGet> Qwen3TtsWeights<R> {
     }
 }
 
-impl Qwen3TtsWeights<PileReader> {
+impl Qwen3TtsWeights {
     /// Exercise every production model constructor without running inference.
     ///
     /// This is intentionally expensive and exists for the native importer:
@@ -316,9 +313,7 @@ impl Qwen3TtsWeights<PileReader> {
         let folded = crate::persist::load_qwen3tts_talker_folded_from_indexes(
             &self.talker_f16,
             &self.exact,
-            &self.reader,
             &self.folded_f16,
-            &self.reader,
         )?;
         drop(folded);
 
@@ -349,9 +344,7 @@ impl Qwen3TtsWeights<PileReader> {
         let talker = crate::persist::load_qwen3tts_talker_folded_from_indexes(
             &self.talker_f16,
             &self.exact,
-            &self.reader,
             &self.folded_f16,
-            &self.reader,
         )?;
         Ok(Some(crate::nn::weight_loader::same_type::<
             Talker<BHalf>,
@@ -371,8 +364,6 @@ impl Qwen3TtsWeights<PileReader> {
             return WeightLoader::Aliased(crate::nn::weight_loader::AliasedPile::new(
                 self.talker_f16,
                 self.exact,
-                self.reader.clone(),
-                self.reader,
                 WgpuDevice::default(),
             ));
         }
@@ -382,7 +373,7 @@ impl Qwen3TtsWeights<PileReader> {
         let keymap = self
             .exact
             .into_iter()
-            .map(|(name, handles)| (name, crate::ingest::read_leaf(&self.reader, handles)))
+            .map(|(name, leaf)| (name, leaf.to_f32_shape()))
             .collect();
         WeightLoader::Pile(keymap)
     }
@@ -457,7 +448,7 @@ impl SpeakStream {
 /// - `ref_text` — the clip's exact transcript.
 /// - `ref_codes` — f32 npy `(T, 16)`: the clip's codec frames.
 pub fn synthesize_stream(
-    weights: Qwen3TtsWeights<PileReader>,
+    weights: Qwen3TtsWeights,
     ref_wav: &Path,
     ref_text: &str,
     ref_codes: &Path,
@@ -487,7 +478,7 @@ pub fn synthesize_stream(
 /// audio in `[-1, 1]`. This is the batch view of the ONE streaming generation
 /// path: [`synthesize_stream`] drained and concatenated.
 pub fn synthesize(
-    weights: Qwen3TtsWeights<PileReader>,
+    weights: Qwen3TtsWeights,
     ref_wav: &Path,
     ref_text: &str,
     ref_codes: &Path,
@@ -513,7 +504,7 @@ enum CodecMsg {
 }
 
 fn synthesize_stream_impl<B: Backend + 'static>(
-    weights: Qwen3TtsWeights<PileReader>,
+    weights: Qwen3TtsWeights,
     ref_wav: &Path,
     ref_text: &str,
     ref_codes: &Path,
@@ -762,7 +753,7 @@ fn synthesize_stream_impl<B: Backend + 'static>(
 /// Convenience: [`synthesize`] then write the result to `out_path` as a 24 kHz
 /// mono PCM16 WAV. Returns the number of samples written.
 pub fn synthesize_to_wav(
-    weights: Qwen3TtsWeights<PileReader>,
+    weights: Qwen3TtsWeights,
     ref_wav: &Path,
     ref_text: &str,
     ref_codes: &Path,

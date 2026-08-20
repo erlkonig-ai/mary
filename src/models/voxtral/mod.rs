@@ -5,7 +5,7 @@
 //! frozen native model-collection snapshot: the exact f32 checkpoint and its
 //! full f16 derivation.
 
-use crate::ingest::LeafHandles;
+use crate::leaf::{Elem, Leaf};
 use crate::nn::weight_loader::WeightLoader;
 use crate::selection::{index_keymap_for_root, select_model_root, ModelSelector};
 use std::collections::HashMap;
@@ -30,15 +30,9 @@ pub const QUANTIZATION_F16: &str = "f16";
 pub struct VoxtralWeights<R> {
     exact_root: Id,
     f16_root: Id,
-    exact: HashMap<String, LeafHandles>,
-    f16: HashMap<String, LeafHandles>,
+    exact: HashMap<String, Leaf>,
+    f16: HashMap<String, Leaf>,
     reader: R,
-}
-
-fn shape_handle(handles: LeafHandles) -> Inline<inlineencodings::Handle<crate::format::U64Array>> {
-    match handles {
-        LeafHandles::F32(_, shape) | LeafHandles::F16(_, shape) => shape,
-    }
 }
 
 impl<R: BlobStoreGet> VoxtralWeights<R> {
@@ -47,7 +41,7 @@ impl<R: BlobStoreGet> VoxtralWeights<R> {
         fn select(
             snapshot: &CollectionSnapshot<impl BlobStoreGet>,
             quantization: &str,
-        ) -> anyhow::Result<(Id, HashMap<String, LeafHandles>)> {
+        ) -> anyhow::Result<(Id, HashMap<String, Leaf>)> {
             let root = select_model_root(
                 snapshot.facts(),
                 snapshot.reader(),
@@ -63,13 +57,13 @@ impl<R: BlobStoreGet> VoxtralWeights<R> {
         let (exact_root, exact) = select(&snapshot, crate::persist::QUANTIZATION_NATIVE)?;
         let (f16_root, f16) = select(&snapshot, QUANTIZATION_F16)?;
 
-        for (name, handles) in &exact {
-            if !matches!(handles, LeafHandles::F32(..)) {
+        for (name, leaf) in &exact {
+            if leaf.elem() != Elem::F32 {
                 anyhow::bail!("Voxtral exact tensor {name:?} is not f32");
             }
         }
-        for (name, handles) in &f16 {
-            if !matches!(handles, LeafHandles::F16(..)) {
+        for (name, leaf) in &f16 {
+            if leaf.elem() != Elem::F16 {
                 anyhow::bail!("Voxtral derived tensor {name:?} is not f16");
             }
         }
@@ -79,13 +73,18 @@ impl<R: BlobStoreGet> VoxtralWeights<R> {
             exact.len(),
             f16.len()
         );
-        for (name, exact_handles) in &exact {
-            let derived_handles = f16
+        // Two different tensors agreeing on a shape is a cross-tensor fact, so
+        // it is still checked here — but on the dims themselves rather than on
+        // whether the two happened to share one content-addressed shape blob.
+        for (name, exact_leaf) in &exact {
+            let derived = f16
                 .get(name)
                 .ok_or_else(|| anyhow::anyhow!("Voxtral f16 root is missing tensor {name:?}"))?;
             anyhow::ensure!(
-                shape_handle(*exact_handles) == shape_handle(*derived_handles),
-                "Voxtral tensor {name:?} has different exact/f16 shape handles"
+                exact_leaf.dims() == derived.dims(),
+                "Voxtral tensor {name:?} is {:?} exact but {:?} derived",
+                exact_leaf.dims(),
+                derived.dims()
             );
         }
 
@@ -110,12 +109,12 @@ impl<R: BlobStoreGet> VoxtralWeights<R> {
     }
 
     /// Exact tensor index retained for source-parity gates.
-    pub fn exact(&self) -> &HashMap<String, LeafHandles> {
+    pub fn exact(&self) -> &HashMap<String, Leaf> {
         &self.exact
     }
 
     /// Half-width tensor index retained for derivation-parity gates.
-    pub fn f16(&self) -> &HashMap<String, LeafHandles> {
+    pub fn f16(&self) -> &HashMap<String, Leaf> {
         &self.f16
     }
 
@@ -131,28 +130,12 @@ impl<R: BlobStoreGet> VoxtralWeights<R> {
         names.sort_unstable();
         let mut elements = 0;
         for name in &names {
-            let (exact_data, _) = match self.exact[*name] {
-                LeafHandles::F32(data, shape) => (data, shape),
-                LeafHandles::F16(..) => unreachable!("validated exact width"),
-            };
-            let (f16_data, _) = match self.f16[*name] {
-                LeafHandles::F16(data, shape) => (data, shape),
-                LeafHandles::F32(..) => unreachable!("validated derived width"),
-            };
-            let exact_bytes: anybytes::Bytes = self
-                .reader
-                .get(exact_data)
-                .map_err(|error| anyhow::anyhow!("read exact tensor {name:?}: {error}"))?;
-            let f16_bytes: anybytes::Bytes = self
-                .reader
-                .get(f16_data)
-                .map_err(|error| anyhow::anyhow!("read f16 tensor {name:?}: {error}"))?;
-            let exact_values = exact_bytes
-                .view::<[f32]>()
-                .map_err(|error| anyhow::anyhow!("decode exact tensor {name:?}: {error}"))?;
-            let f16_values = f16_bytes
-                .view::<[half::f16]>()
-                .map_err(|error| anyhow::anyhow!("decode f16 tensor {name:?}: {error}"))?;
+            let exact_values = self.exact[*name]
+                .view_f32()
+                .ok_or_else(|| anyhow::anyhow!("decode exact tensor {name:?}"))?;
+            let f16_values = self.f16[*name]
+                .view_f16()
+                .ok_or_else(|| anyhow::anyhow!("decode f16 tensor {name:?}"))?;
             anyhow::ensure!(
                 exact_values.len() == f16_values.len(),
                 "Voxtral tensor {name:?} has {} exact elements but {} f16 elements",
@@ -186,8 +169,6 @@ impl VoxtralWeights<PileReader> {
             return WeightLoader::Aliased(crate::nn::weight_loader::AliasedPile::new(
                 self.f16,
                 self.exact,
-                self.reader.clone(),
-                self.reader,
                 crate::nn::backend::WgpuDevice::default(),
             ));
         }
@@ -196,7 +177,7 @@ impl VoxtralWeights<PileReader> {
             let keymap = self
                 .exact
                 .into_iter()
-                .map(|(name, handles)| (name, crate::ingest::read_leaf(&self.reader, handles)))
+                .map(|(name, leaf)| (name, leaf.to_f32_shape()))
                 .collect();
             WeightLoader::Pile(keymap)
         }
@@ -411,8 +392,11 @@ mod tests {
                 component_fragment(QUANTIZATION_F16, &[("weight", &[1.0, 2.0], &[1, 2])], true),
             ],
         );
-        let error = load(shapes.path()).err().expect("different shape handles");
-        assert!(error.to_string().contains("shape handles"), "{error:#}");
+        let error = load(shapes.path()).err().expect("different shapes");
+        assert!(
+            format!("{error:#}").contains("[2] exact but [1, 2] derived"),
+            "{error:#}"
+        );
     }
 
     #[cfg(feature = "import")]

@@ -282,7 +282,8 @@ mod tests {
         );
 
         let snapshot =
-            mary::model_collection::snapshot_model_collection_local_latest(&mut pile).unwrap();
+            mary::model_collection::snapshot_model_collection_local_latest(&mut pile, key.verifying_key())
+                .unwrap();
         assert_eq!(snapshot.commits(), &[first]);
         mary::selection::load_keymap_from_graph(
             snapshot.facts(),
@@ -328,7 +329,8 @@ mod tests {
         )
         .unwrap_err();
         let snapshot =
-            mary::model_collection::snapshot_model_collection_local_latest(&mut pile).unwrap();
+            mary::model_collection::snapshot_model_collection_local_latest(&mut pile, key.verifying_key())
+                .unwrap();
         assert!(snapshot.commits().is_empty());
         pile.close().unwrap();
     }
@@ -374,7 +376,8 @@ mod tests {
         assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), initial_len);
 
         let snapshot =
-            mary::model_collection::snapshot_model_collection_local_latest(&mut pile).unwrap();
+            mary::model_collection::snapshot_model_collection_local_latest(&mut pile, key.verifying_key())
+                .unwrap();
         assert!(snapshot.commits().is_empty());
         pile.close().unwrap();
     }
@@ -421,7 +424,8 @@ mod tests {
         assert!(format!("{error:#}").contains("has shape [4], expected [2, 2]"));
 
         let snapshot =
-            mary::model_collection::snapshot_model_collection_local_latest(&mut pile).unwrap();
+            mary::model_collection::snapshot_model_collection_local_latest(&mut pile, key.verifying_key())
+                .unwrap();
         assert!(snapshot.commits().is_empty());
         pile.close().unwrap();
     }

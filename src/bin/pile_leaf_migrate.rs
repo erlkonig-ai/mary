@@ -30,6 +30,14 @@
 //! references all still resolve. The weights are bit-identical, so the model an
 //! id names is the same model; only how its bytes are framed has changed.
 //!
+//! It does mean a converted pile and a FRESH import of the same checkpoint hold
+//! different ids for the same weights, because a leaf id is the content address
+//! of its facts and the two forms are different facts. That is content
+//! addressing behaving correctly rather than a defect, and preservation is the
+//! right side to take: an id already written down in another pile, a commit, or
+//! a note has to keep resolving, whereas an id nobody has yet is free. Two
+//! piles converge again once both are on the typed form and reimported.
+//!
 //! # What is verified
 //!
 //! Byte-identity is established twice, and neither half is assumed: each
@@ -41,6 +49,11 @@
 //! The conversion never materialises a tensor — no `view::<[f32]>()`, no `Vec`,
 //! no cast. The source blob's bytes go into the tensor payload as they are.
 //!
+//! Writing goes through `mary::leaf::put_leaf_as`, the same writer every
+//! importer uses — so the rank dispatch, the length check and the read-back
+//! comparison are shared with the write path rather than restated here, and a
+//! converted leaf is byte-for-byte what a fresh import would have written.
+//!
 //!   pile_leaf_migrate <src.pile> <dst.pile>
 
 use anyhow::{Context, Result};
@@ -49,80 +62,12 @@ use mary::format::attrs;
 use mary::leaf;
 use std::collections::HashSet;
 use std::path::Path;
-use triblespace::core::blob::encodings::tensor::elements::{F16, F32};
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::Blob;
 use triblespace::core::id::ExclusiveId;
 use triblespace::core::repo::{ancestors, BlobStoreList, Repository};
-use triblespace::macros::{entity, find, pattern};
+use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
-
-/// Build the typed blob, verify it against the source bytes, and attach it to
-/// the leaf's OWN entity id.
-///
-/// The rank dispatch is the price of rank-in-the-type, paid once here rather
-/// than by every reader — and worth being precise about, because it replaces a
-/// check rather than adding one: `format::load_tensor` already carried
-/// `assert_eq!(shp.len(), D)`, so consumers were already passing the rank
-/// statically and paying for it at runtime.
-macro_rules! typed_leaf {
-    ($elem:ty, $rank:literal, $ws:expr, $id:expr, $dims:expr, $payload:expr, $name:expr) => {{
-        let dims: [u64; $rank] = $dims.as_slice().try_into().expect("rank checked by caller");
-        let src_bytes = $payload;
-        let blob = leaf::leaf_blob::<$elem, $rank>(dims, src_bytes.clone())?;
-
-        // Verified where both halves are in hand: decode what was just built
-        // and compare. A view, not a copy.
-        let view = leaf::read_leaf::<$elem, $rank>(blob.clone())?;
-        anyhow::ensure!(
-            view.dims() == dims,
-            "{}: dims changed in conversion: {:?} -> {:?}",
-            $name,
-            dims,
-            view.dims()
-        );
-        anyhow::ensure!(
-            &view.payload()[..] == &src_bytes[..],
-            "{}: payload changed in conversion ({} src bytes vs {} stored)",
-            $name,
-            src_bytes.len(),
-            view.payload().len()
-        );
-
-        let handle = $ws.put(blob);
-        entity! { $id @ leaf::leaf::<$elem, $rank>(): handle }
-    }};
-}
-
-/// Dispatch over the ranks models actually use.
-///
-/// Both ends of the range are real cases found in the piles, not defensive
-/// padding: `clip`'s `logit_scale` is a rank-0 scalar, and `nomic_mm7b` holds a
-/// rank-5 tensor. Both were found by this dispatch REFUSING them — which is the
-/// argument for refusing rather than flattening. A converter that reshaped the
-/// rank-5 tensor to fit would have reported success and written a model whose
-/// weights are silently misframed.
-///
-/// Beyond rank 6 it still refuses. The encoding allows up to 32; the arms stop
-/// where the evidence stops.
-macro_rules! by_rank {
-    ($elem:ty, $ws:expr, $id:expr, $dims:expr, $payload:expr, $name:expr) => {
-        match $dims.len() {
-            0 => typed_leaf!($elem, 0, $ws, $id, $dims, $payload, $name),
-            1 => typed_leaf!($elem, 1, $ws, $id, $dims, $payload, $name),
-            2 => typed_leaf!($elem, 2, $ws, $id, $dims, $payload, $name),
-            3 => typed_leaf!($elem, 3, $ws, $id, $dims, $payload, $name),
-            4 => typed_leaf!($elem, 4, $ws, $id, $dims, $payload, $name),
-            5 => typed_leaf!($elem, 5, $ws, $id, $dims, $payload, $name),
-            6 => typed_leaf!($elem, 6, $ws, $id, $dims, $payload, $name),
-            r => anyhow::bail!(
-                "{}: rank {r} exceeds the ranks this converter dispatches (0..=6); \
-                 add an arm rather than flattening",
-                $name
-            ),
-        }
-    };
-}
 
 /// Read a pile's facts from whichever branch holds them.
 ///
@@ -306,13 +251,23 @@ fn main() -> Result<()> {
         total += bytes.len();
 
         let name = format!("{leaf_id}");
-        let e = if *is_f16 {
+        let elem = if *is_f16 {
             f16n += 1;
-            by_rank!(F16, ws, ExclusiveId::force_ref(&leaf_id), dims, bytes, name)
+            leaf::Elem::F16
         } else {
             f32n += 1;
-            by_rank!(F32, ws, ExclusiveId::force_ref(&leaf_id), dims, bytes, name)
+            leaf::Elem::F32
         };
+        // `put_leaf_as` is the same writer every importer uses, so the rank
+        // dispatch and the round-trip check exist once rather than twice.
+        let e = leaf::put_leaf_as(
+            repo.storage_mut(),
+            &ExclusiveId::force_ref(&leaf_id),
+            elem,
+            &dims,
+            bytes,
+            &name,
+        )?;
         facts += e.into_facts();
 
         if (f32n + f16n) % 200 == 0 {

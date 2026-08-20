@@ -6,7 +6,7 @@ use burn::tensor::TensorData;
 use triblespace::core::collection::CollectionSnapshot;
 use triblespace::prelude::BlobStoreGet;
 
-use crate::ingest::LeafHandles;
+use crate::leaf::Leaf;
 use crate::models::flux::mistral_encoder::config::Mistral3Config;
 use crate::models::flux::mistral_encoder::Mistral3Model;
 use crate::models::flux::scheduler::FlowMatchEulerDiscreteScheduler;
@@ -66,23 +66,24 @@ impl ModelVariant {
 /// The three FLUX weight components selected from one frozen native model
 /// collection snapshot.
 ///
-/// Only the compact tensor-handle indexes stay resident. Each phase
-/// materializes its component from the same owned reader, then drops the
-/// resulting keymap before the next phase. Construction validates all three
-/// source coordinates up front, so a mixed, missing, or ambiguous local model
-/// cohort fails before GPU execution starts.
-pub struct FluxWeights<R> {
+/// Only the compact tensor indexes stay resident. Each phase materializes its
+/// component, then drops the resulting keymap before the next phase.
+/// Construction validates all three source coordinates up front, so a mixed,
+/// missing, or ambiguous local model cohort fails before GPU execution starts.
+///
+/// No reader is retained: a leaf holds its bytes as a view over the pile's
+/// mapping and keeps that mapping alive by itself.
+pub struct FluxWeights {
     variant: ModelVariant,
-    text_encoder: HashMap<String, LeafHandles>,
-    transformer: HashMap<String, LeafHandles>,
-    vae: HashMap<String, LeafHandles>,
-    reader: R,
+    text_encoder: HashMap<String, Leaf>,
+    transformer: HashMap<String, Leaf>,
+    vae: HashMap<String, Leaf>,
 }
 
-impl<R: BlobStoreGet> FluxWeights<R> {
+impl FluxWeights {
     /// Select the text encoder, transformer, and VAE roots from one immutable
     /// native model-collection snapshot.
-    pub fn from_snapshot(
+    pub fn from_snapshot<R: BlobStoreGet>(
         snapshot: CollectionSnapshot<R>,
         variant: ModelVariant,
     ) -> anyhow::Result<Self> {
@@ -91,7 +92,7 @@ impl<R: BlobStoreGet> FluxWeights<R> {
             reader: &impl BlobStoreGet,
             variant: ModelVariant,
             component: &str,
-        ) -> anyhow::Result<HashMap<String, LeafHandles>> {
+        ) -> anyhow::Result<HashMap<String, Leaf>> {
             let source = variant.component_source(component);
             let root = crate::selection::select_model_root(
                 facts,
@@ -109,13 +110,12 @@ impl<R: BlobStoreGet> FluxWeights<R> {
         let transformer =
             select_component(snapshot.facts(), snapshot.reader(), variant, TRANSFORMER)?;
         let vae = select_component(snapshot.facts(), snapshot.reader(), variant, VAE)?;
-        let (_, _, reader) = snapshot.into_parts();
+        drop(snapshot);
         Ok(Self {
             variant,
             text_encoder,
             transformer,
             vae,
-            reader,
         })
     }
 
@@ -123,18 +123,10 @@ impl<R: BlobStoreGet> FluxWeights<R> {
         self.variant
     }
 
-    fn materialize(
-        &self,
-        index: &HashMap<String, LeafHandles>,
-    ) -> HashMap<String, (Vec<f32>, Vec<usize>)> {
+    fn materialize(&self, index: &HashMap<String, Leaf>) -> HashMap<String, (Vec<f32>, Vec<usize>)> {
         index
             .iter()
-            .map(|(name, handles)| {
-                (
-                    name.clone(),
-                    crate::ingest::read_leaf(&self.reader, *handles),
-                )
-            })
+            .map(|(name, leaf)| (name.clone(), leaf.to_f32_shape()))
             .collect()
     }
 
@@ -169,7 +161,7 @@ impl Flux2Pipeline {
     /// 3. Load VAE → decode → output image
     ///
     /// Auto-detects Klein vs Dev from the text-encoder config.
-    pub fn generate<B: Backend, R: BlobStoreGet>(
+    pub fn generate<B: Backend>(
         prompt: &str,
         height: usize,
         width: usize,
@@ -177,7 +169,7 @@ impl Flux2Pipeline {
         guidance_scale: f32,
         seed: u64,
         model_dir: &Path,
-        weights: &FluxWeights<R>,
+        weights: &FluxWeights,
         lora_path: Option<&Path>,
         device: &B::Device,
     ) -> image::RgbImage {
@@ -211,9 +203,9 @@ impl Flux2Pipeline {
 
         let (prompt_embeds, seq_len) = match variant {
             ModelVariant::Klein => {
-                Self::encode_text_klein::<B, R>(prompt, model_dir, weights, device)
+                Self::encode_text_klein::<B>(prompt, model_dir, weights, device)
             }
-            ModelVariant::Dev => Self::encode_text_dev::<B, R>(prompt, model_dir, weights, device),
+            ModelVariant::Dev => Self::encode_text_dev::<B>(prompt, model_dir, weights, device),
         };
 
         // Prepare text position IDs (for full sequence)
@@ -326,10 +318,10 @@ impl Flux2Pipeline {
     }
 
     /// Text encoding for Klein: Qwen2Tokenizer + Qwen3Model, extract layers [9, 18, 27].
-    fn encode_text_klein<B: Backend, R: BlobStoreGet>(
+    fn encode_text_klein<B: Backend>(
         prompt: &str,
         model_dir: &Path,
-        weights: &FluxWeights<R>,
+        weights: &FluxWeights,
         device: &B::Device,
     ) -> (Tensor<B, 3>, usize) {
         let tokenizer_path = model_dir.join("tokenizer").join("tokenizer.json");
@@ -371,10 +363,10 @@ impl Flux2Pipeline {
     }
 
     /// Text encoding for Dev: MistralTokenizer + Mistral3Model, extract layers [10, 20, 30].
-    fn encode_text_dev<B: Backend, R: BlobStoreGet>(
+    fn encode_text_dev<B: Backend>(
         prompt: &str,
         model_dir: &Path,
-        weights: &FluxWeights<R>,
+        weights: &FluxWeights,
         device: &B::Device,
     ) -> (Tensor<B, 3>, usize) {
         let tokenizer_path = model_dir.join("tokenizer").join("tokenizer.json");
@@ -420,7 +412,7 @@ impl Flux2Pipeline {
     /// - Klein: f16 text encoder only, f32 transformer (fits in memory, better precision)
     /// - Dev: f16 text encoder + transformer (60GB transformer doesn't fit in f32)
     /// - VAE always runs in f32.
-    pub fn generate_f16<R: BlobStoreGet>(
+    pub fn generate_f16(
         prompt: &str,
         height: usize,
         width: usize,
@@ -428,7 +420,7 @@ impl Flux2Pipeline {
         guidance_scale: f32,
         seed: u64,
         model_dir: &Path,
-        weights: &FluxWeights<R>,
+        weights: &FluxWeights,
         lora_path: Option<&Path>,
         device: &WgpuDevice,
     ) -> image::RgbImage {
@@ -470,12 +462,12 @@ impl Flux2Pipeline {
         let (prompt_embeds, seq_len) = match variant {
             ModelVariant::Klein => {
                 eprintln!("Phase 1: Text encoding (f32)...");
-                Self::encode_text_klein::<B, R>(prompt, model_dir, weights, device)
+                Self::encode_text_klein::<B>(prompt, model_dir, weights, device)
             }
             ModelVariant::Dev => {
                 eprintln!("Phase 1: Text encoding (f16)...");
                 let (embeds_half, seq_len) =
-                    Self::encode_text_dev::<BHalf, R>(prompt, model_dir, weights, device);
+                    Self::encode_text_dev::<BHalf>(prompt, model_dir, weights, device);
                 let embeds: Tensor<B, 3> = Tensor::from_data(embeds_half.into_data(), device);
                 (embeds, seq_len)
             }
@@ -519,7 +511,7 @@ impl Flux2Pipeline {
     }
 
     /// Denoise in f32 + VAE decode (used for Klein --f16 where only text encoder is f16).
-    fn denoise_and_decode_f32<R: BlobStoreGet>(
+    fn denoise_and_decode_f32(
         prompt_embeds: Tensor<B, 3>,
         seq_len: usize,
         variant: ModelVariant,
@@ -530,7 +522,7 @@ impl Flux2Pipeline {
         guidance_scale: f32,
         seed: u64,
         model_dir: &Path,
-        weights: &FluxWeights<R>,
+        weights: &FluxWeights,
         lora_path: Option<&Path>,
         device: &WgpuDevice,
     ) -> image::RgbImage {
@@ -603,7 +595,7 @@ impl Flux2Pipeline {
     /// Used for Dev where the 60GB transformer doesn't fit in device memory all at once.
     /// The native snapshot loader currently still materializes the complete transformer on the
     /// host; streaming here bounds device residency, not total process memory.
-    fn denoise_streaming_and_decode<R: BlobStoreGet>(
+    fn denoise_streaming_and_decode(
         prompt_embeds: Tensor<B, 3>,
         seq_len: usize,
         variant: ModelVariant,
@@ -614,7 +606,7 @@ impl Flux2Pipeline {
         guidance_scale: f32,
         seed: u64,
         model_dir: &Path,
-        weights: &FluxWeights<R>,
+        weights: &FluxWeights,
         lora_path: Option<&Path>,
         device: &WgpuDevice,
     ) -> image::RgbImage {
@@ -688,12 +680,12 @@ impl Flux2Pipeline {
     }
 
     /// VAE decode: unpack latents, denormalize, decode, convert to image. Always f32.
-    fn vae_decode<R: BlobStoreGet>(
+    fn vae_decode(
         latents: Tensor<B, 3>,
         img_ids: Tensor<B, 3>,
         latent_channels: usize,
         model_dir: &Path,
-        weights: &FluxWeights<R>,
+        weights: &FluxWeights,
         device: &WgpuDevice,
     ) -> image::RgbImage {
         eprintln!("Phase 4: VAE decoding...");

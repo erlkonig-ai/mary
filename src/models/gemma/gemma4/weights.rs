@@ -468,15 +468,17 @@ pub fn load_gemma4_from_keymap<B: Backend>(
     load_gemma4_from_source(config, &ctx, device)
 }
 
-/// Build the model by STREAMING tensors from a pile: given a precomputed index of
-/// cheap blob handles (`crate::ingest::index_keymap`, unioned across shards), each
-/// tensor's f32 data is fetched on demand and dropped after upload — peak CPU is
-/// one tensor, not the whole ~120 GB f32 keymap. This is what makes weights-as-
-/// tribles scale to the dense 31B. `blobs` must outlive the build.
-pub fn load_gemma4_streaming<'a, B: Backend>(
+/// Build the model by STREAMING tensors from a pile: given a precomputed index
+/// of leaves (`crate::ingest::index_keymap`, unioned across shards), each
+/// tensor's f32 data is materialized on demand and dropped after upload — peak
+/// CPU is one tensor, not the whole ~120 GB f32 keymap. This is what makes
+/// weights-as-tribles scale to the dense 31B.
+///
+/// The index costs handles and tensor headers, not weights: a leaf's payload is
+/// a view over the pile's mapping.
+pub fn load_gemma4_streaming<B: Backend>(
     config: Gemma4Config,
-    index: HashMap<String, crate::ingest::LeafHandles>,
-    blobs: &'a (impl triblespace::prelude::BlobStoreGet + 'a),
+    index: HashMap<String, crate::leaf::Leaf>,
     device: &B::Device,
 ) -> (
     Gemma4Model<B>,
@@ -484,9 +486,7 @@ pub fn load_gemma4_streaming<'a, B: Backend>(
 ) {
     let names: std::collections::HashSet<String> = index.keys().cloned().collect();
     let source = TensorSource::Stream {
-        get: Box::new(move |name: &str| {
-            index.get(name).map(|&h| crate::ingest::read_leaf(blobs, h))
-        }),
+        get: Box::new(move |name: &str| index.get(name).map(crate::leaf::Leaf::to_f32_shape)),
         names,
     };
     let ctx = f32_ctx::<B>(&source);

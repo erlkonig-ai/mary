@@ -1,7 +1,7 @@
 //! Bridge between weight files and the `mary::format` graph. Ingest tensors into
-//! the pile — each a content-addressed leaf inside a named module, gathered under
-//! a model entity — and materialize them back into a `key → (data, shape)` map
-//! for the `WeightLoader::Pile` reconstruction path. Generic over model AND over
+//! the pile — each a content-addressed [`crate::leaf`] inside a named module,
+//! gathered under a model entity — and index them back by name for the
+//! `WeightLoader` reconstruction paths. Generic over model AND over
 //! source format: safetensors decode here ([`ingest_members`]); GGUF and pytorch
 //! pickle decode in [`crate::formats`] and feed the same format-agnostic core
 //! ([`ingest_tensors`]), so every format lands in one content-addressed graph.
@@ -75,7 +75,7 @@ pub fn save_safetensors_filtered(
 /// ([`save_safetensors_filtered`]) and the content-addressed model ROOT
 /// ([`build_model_root`]). No model/root entity is created here: the caller
 /// decides how the members are grouped (per-file, or ONE root composing every
-/// shard's members). Each tensor is a `{data|data_f16, shape}` leaf reached by a
+/// shard's members). Each tensor is a typed tensor leaf reached by a
 /// `{kind, safetensor_path, weight}` module; identical tensors dedup by content.
 ///
 /// This is the safetensors extractor: it decodes the container to
@@ -117,10 +117,10 @@ pub fn ingest_members(
 /// Ingest a stream of already-decoded `(name, f32-data, shape)` tensors into
 /// content-addressed member MODULES — the FORMAT-AGNOSTIC core shared by every
 /// importer (safetensors, GGUF, pytorch pickle). Each tensor becomes a
-/// `{data|data_f16, shape}` leaf reached by a `{kind, safetensor_path, weight}`
+/// typed tensor leaf reached by a `{kind, safetensor_path, weight}`
 /// module; identical tensors dedup by content. Returns `(member module ids,
-/// facts)`. Because the member id is derived purely from the tensor's f32 bytes +
-/// shape + name (never the source format), the SAME weights imported from two
+/// facts)`. Because the member id is derived purely from the tensor's bytes and
+/// shape and name (never the source format), the SAME weights imported from two
 /// different container formats produce the SAME members — and hence the same
 /// content-addressed model root.
 #[cfg(feature = "import")]
@@ -212,70 +212,21 @@ pub fn read_string(
     v.to_string()
 }
 
-/// A pile-resident tensor leaf addressed by its content handles (cheap to hold:
-/// two ~32-byte handles, no data). [`read_leaf`] fetches the data on demand.
-/// A leaf is stored either as f32 (`data`) or half-width f16 (`data_f16`).
-#[derive(Clone, Copy)]
-pub enum LeafHandles {
-    F32(
-        Inline<inlineencodings::Handle<crate::format::F32Array>>,
-        Inline<inlineencodings::Handle<crate::format::U64Array>>,
-    ),
-    F16(
-        Inline<inlineencodings::Handle<crate::f16enc::F16Array>>,
-        Inline<inlineencodings::Handle<crate::format::U64Array>>,
-    ),
-}
-
-/// Read one tensor leaf's `(f32 data, shape)` from its blob handles — the
-/// expensive part (the data blob) happens here, lazily, one tensor at a time.
-/// f16 leaves are up-cast to f32 here for the f32-centric model loaders; the
-/// fast pile load instead uploads the f16 bytes to the GPU at native width.
-pub fn read_leaf(blobs: &impl BlobStoreGet, handles: LeafHandles) -> (Vec<f32>, Vec<usize>) {
-    match handles {
-        LeafHandles::F32(dh, sh) => {
-            let db: anybytes::Bytes = blobs.get(dh).expect("data blob");
-            let data: Vec<f32> = db.view::<[f32]>().expect("data view")[..].to_vec();
-            (data, read_shape(blobs, sh))
-        }
-        LeafHandles::F16(dh, sh) => {
-            let db: anybytes::Bytes = blobs.get(dh).expect("data_f16 blob");
-            let data: Vec<f32> = db
-                .view::<[half::f16]>()
-                .expect("f16 data view")
-                .iter()
-                .map(|h| h.to_f32())
-                .collect();
-            (data, read_shape(blobs, sh))
-        }
-    }
-}
-
-/// Read just a leaf's shape blob — the cheap half of [`read_leaf`], for gates
-/// and loaders that want dims without materializing the data.
-pub fn read_shape(
-    blobs: &impl BlobStoreGet,
-    sh: Inline<inlineencodings::Handle<crate::format::U64Array>>,
-) -> Vec<usize> {
-    let sbb: anybytes::Bytes = blobs.get(sh).expect("shape blob");
-    sbb.view::<[u64]>()
-        .expect("shape view")
-        .iter()
-        .map(|&d| d as usize)
-        .collect()
-}
-
-/// Build a `name → handle-pair` INDEX of a model graph — reads only the small
-/// tensor-NAME blobs, never the data. The index is tiny (two handles per
-/// tensor); [`read_leaf`] fetches each tensor's data lazily. This is what lets a
-/// large model (the 31B) load from a pile without materializing its whole f32
-/// keymap in RAM at once — peak CPU is one tensor, not the full set. Each leaf is
-/// resolved as f16 (`data_f16`) if present, else f32 (`data`).
+/// Index a model graph's leaves by tensor name.
+///
+/// The index costs handles, tensor headers and names — never a copy of a
+/// weight: a [`crate::leaf::Leaf`] holds a view over the pile's mapping. That
+/// is what lets a large model load from a pile without materializing its whole
+/// f32 keymap in RAM at once; the caller decides per tensor whether it ever
+/// wants a copy.
+///
+/// Typed leaves resolve first; a pile still holding the two-blob form resolves
+/// through the legacy adapter.
 pub fn index_keymap(
     tribles: &TribleSet,
     blobs: &impl BlobStoreGet,
     model_id: Id,
-) -> HashMap<String, LeafHandles> {
+) -> HashMap<String, crate::leaf::Leaf> {
     let mut map = HashMap::new();
     let members: Vec<_> =
         find!((m: Id), pattern!(tribles, [{ model_id @ attrs::member: ?m }])).collect();
@@ -287,30 +238,18 @@ pub fn index_keymap(
         .next()
         .expect("module name/weight");
         let key = read_string(blobs, name_h);
-        let f16 = find!(
-            (d, s),
-            pattern!(tribles, [{ w_id @ attrs::data_f16: ?d, attrs::shape: ?s }])
-        )
-        .next();
-        if let Some((dh, sh)) = f16 {
-            map.insert(key, LeafHandles::F16(dh, sh));
-        } else {
-            let (dh, sh) = find!(
-                (d, s),
-                pattern!(tribles, [{ w_id @ attrs::data: ?d, attrs::shape: ?s }])
-            )
-            .next()
-            .expect("leaf data/shape");
-            map.insert(key, LeafHandles::F32(dh, sh));
-        }
+        let leaf = crate::leaf::resolve(tribles, blobs, w_id)
+            .expect("resolve tensor leaf")
+            .expect("tensor leaf");
+        map.insert(key, leaf);
     }
     map
 }
 
-/// Materialize a model graph back into a `key → (data, shape)` map by walking its
-/// member modules. Feeds `WeightLoader::Pile`. Reads every tensor's f32 data into
-/// RAM — fine for small models; large models stream via [`index_keymap`] +
-/// [`read_leaf`] instead.
+/// Materialize a model graph back into a `key → (data, shape)` map by walking
+/// its member modules. Feeds `WeightLoader::Pile`. Reads every tensor's f32
+/// data into RAM — fine for small models; large models stream via
+/// [`index_keymap`] and materialize one leaf at a time instead.
 pub fn load_keymap(
     tribles: &TribleSet,
     blobs: &impl BlobStoreGet,
@@ -318,6 +257,23 @@ pub fn load_keymap(
 ) -> HashMap<String, (Vec<f32>, Vec<usize>)> {
     index_keymap(tribles, blobs, model_id)
         .into_iter()
-        .map(|(k, handles)| (k, read_leaf(blobs, handles)))
+        .map(|(k, leaf)| (k, leaf.to_f32_shape()))
+        .collect()
+}
+
+/// Read just a legacy leaf's shape blob.
+///
+/// Only the pile converter still needs this: it reads the two-blob form's
+/// dimensions in order to write them into a tensor header. Nothing on a load
+/// path calls it — a typed leaf's dims come out of its own blob.
+pub fn read_shape(
+    blobs: &impl BlobStoreGet,
+    sh: Inline<inlineencodings::Handle<crate::format::U64Array>>,
+) -> Vec<usize> {
+    let sbb: anybytes::Bytes = blobs.get(sh).expect("shape blob");
+    sbb.view::<[u64]>()
+        .expect("shape view")
+        .iter()
+        .map(|&d| d as usize)
         .collect()
 }

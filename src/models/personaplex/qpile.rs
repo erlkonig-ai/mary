@@ -67,7 +67,7 @@ use super::depth_fast::{self, DepthFast};
 use super::temporal_metal::{self, TemporalMetal, WeightFmt};
 use crate::f16enc::F16Array;
 use crate::format::{
-    attrs, put_raw, put_raw_f16, put_raw_q4, put_raw_q8, F32Array, U32Array, U64Array,
+    attrs, put_raw, put_raw_f16, put_raw_q4, put_raw_q8, U32Array, U64Array,
 };
 use crate::ingest::read_shape;
 use crate::nn::q4::quantize_q4;
@@ -117,8 +117,15 @@ pub fn depth_marker() -> Id {
     id_hex!("81418AFBE0F880593E44750E1D318C41")
 }
 
-/// A leaf of a derived pile, addressed by its content handles (no data).
-#[derive(Clone, Copy)]
+/// A leaf of a derived pile.
+///
+/// The two quantized arms are still THREE handles bound by nothing — packed
+/// words, group scales, and a shape stated apart from both — which is the
+/// arrangement the dense leaves have left. They keep it until a block-scaled
+/// `TensorElement` exists for q4_0/q8_0, at which point the scales travel
+/// inside the payload they scale and the shape inside the header, exactly as
+/// they do for the dense ones here.
+#[derive(Clone)]
 pub enum QLeaf {
     /// Packed q4_0 nibble words + f16 group scales + logical shape.
     Q4(
@@ -132,21 +139,13 @@ pub enum QLeaf {
         Inline<inlineencodings::Handle<F16Array>>,
         Inline<inlineencodings::Handle<U64Array>>,
     ),
-    /// Raw f16 rows + shape.
-    F16(
-        Inline<inlineencodings::Handle<F16Array>>,
-        Inline<inlineencodings::Handle<U64Array>>,
-    ),
-    /// Exact f32 + shape.
-    F32(
-        Inline<inlineencodings::Handle<F32Array>>,
-        Inline<inlineencodings::Handle<U64Array>>,
-    ),
+    /// An unquantized leaf, f16 or f32, carrying its own shape.
+    Dense(crate::leaf::Leaf),
 }
 
-/// An OPENED derived sibling: the cheap handle index (two/three ~32-byte
-/// handles per leaf, no data read) plus the long-lived pile reader whose
-/// mmap the zero-copy tensors bind, plus the entity's format marker.
+/// An OPENED derived sibling: the leaf index plus the long-lived pile reader
+/// whose mmap the zero-copy tensors bind, plus the entity's format marker. No
+/// weight is copied — every payload is a view over that mapping.
 pub struct QPile {
     pub index: HashMap<String, QLeaf>,
     pub reader: triblespace::core::repo::pile::PileReader,
@@ -154,11 +153,22 @@ pub struct QPile {
 }
 
 impl QPile {
-    fn leaf(&self, name: &str) -> anyhow::Result<QLeaf> {
+    fn leaf(&self, name: &str) -> anyhow::Result<&QLeaf> {
         self.index
             .get(name)
-            .copied()
             .ok_or_else(|| anyhow::anyhow!("derived pile missing leaf {name}"))
+    }
+
+    /// An unquantized leaf of the requested width, or a diagnostic.
+    fn dense(&self, name: &str, want: crate::leaf::Elem) -> anyhow::Result<&crate::leaf::Leaf> {
+        match self.leaf(name)? {
+            QLeaf::Dense(leaf) if leaf.elem() == want => Ok(leaf),
+            QLeaf::Dense(leaf) => anyhow::bail!(
+                "{name}: expected a {want:?} leaf, found {:?}",
+                leaf.elem()
+            ),
+            _ => anyhow::bail!("{name}: not a {want:?} leaf"),
+        }
     }
 
     fn get_bytes<T: blobencodings::ArrayElement>(
@@ -178,9 +188,9 @@ impl QPile {
     ) -> anyhow::Result<(anybytes::Bytes, anybytes::Bytes, Vec<usize>)> {
         match self.leaf(name)? {
             QLeaf::Q4(d, sc, sh) => {
-                let shape = read_shape(&self.reader, sh);
+                let shape = read_shape(&self.reader, *sh);
                 anyhow::ensure!(shape.len() == 2, "{name}: q4 leaf is not a matrix");
-                Ok((self.get_bytes(d, name)?, self.get_bytes(sc, name)?, shape))
+                Ok((self.get_bytes(*d, name)?, self.get_bytes(*sc, name)?, shape))
             }
             _ => anyhow::bail!("{name}: not a q4 leaf"),
         }
@@ -193,9 +203,9 @@ impl QPile {
     ) -> anyhow::Result<(anybytes::Bytes, anybytes::Bytes, Vec<usize>)> {
         match self.leaf(name)? {
             QLeaf::Q8(d, sc, sh) => {
-                let shape = read_shape(&self.reader, sh);
+                let shape = read_shape(&self.reader, *sh);
                 anyhow::ensure!(shape.len() == 2, "{name}: q8 leaf is not a matrix");
-                Ok((self.get_bytes(d, name)?, self.get_bytes(sc, name)?, shape))
+                Ok((self.get_bytes(*d, name)?, self.get_bytes(*sc, name)?, shape))
             }
             _ => anyhow::bail!("{name}: not a q8 leaf"),
         }
@@ -203,18 +213,14 @@ impl QPile {
 
     /// Raw f16 leaf → (bytes, shape).
     pub fn bytes_f16(&self, name: &str) -> anyhow::Result<(anybytes::Bytes, Vec<usize>)> {
-        match self.leaf(name)? {
-            QLeaf::F16(d, sh) => Ok((self.get_bytes(d, name)?, read_shape(&self.reader, sh))),
-            _ => anyhow::bail!("{name}: not an f16 leaf"),
-        }
+        let leaf = self.dense(name, crate::leaf::Elem::F16)?;
+        Ok((leaf.payload().clone(), leaf.shape()))
     }
 
     /// Exact f32 leaf → (bytes, shape).
     pub fn bytes_f32(&self, name: &str) -> anyhow::Result<(anybytes::Bytes, Vec<usize>)> {
-        match self.leaf(name)? {
-            QLeaf::F32(d, sh) => Ok((self.get_bytes(d, name)?, read_shape(&self.reader, sh))),
-            _ => anyhow::bail!("{name}: not an f32 leaf"),
-        }
+        let leaf = self.dense(name, crate::leaf::Elem::F32)?;
+        Ok((leaf.payload().clone(), leaf.shape()))
     }
 
     /// Zero-copy typed view of an f32 leaf (CPU consumption).
@@ -326,20 +332,11 @@ impl QPile {
             .next()
             {
                 QLeaf::Q8(d, sc, s)
-            } else if let Some((d, s)) = find!(
-                (d, s),
-                pattern!(&tribles, [{ w_id @ attrs::data_f16: ?d, attrs::shape: ?s }])
-            )
-            .next()
-            {
-                QLeaf::F16(d, s)
-            } else if let Some((d, s)) = find!(
-                (d, s),
-                pattern!(&tribles, [{ w_id @ attrs::data: ?d, attrs::shape: ?s }])
-            )
-            .next()
-            {
-                QLeaf::F32(d, s)
+            } else if let Some(dense) = crate::leaf::resolve(&tribles, &reader, w_id)? {
+                // Typed first, two-blob second — one seam for both, so a
+                // derived pile written before the typed encoding and one
+                // written after both load.
+                QLeaf::Dense(dense)
             } else {
                 anyhow::bail!("leaf {} carries no known data attribute", &*name);
             };

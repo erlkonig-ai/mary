@@ -890,3 +890,58 @@ required-features = ["personaplex"]
 [[bin]]
 name = "resident_final"
 required-features = ["k3"]
+
+# Twelve Blackwell/CUDA binaries that had no entry at all. Each reaches
+# `models::inkling` or `cubecl`, so under any feature set without
+# `inkling-cuda` they failed to compile -- and because `cargo test` builds
+# every bin target before it runs an integration test, that made
+# `cargo test --features import` (and every other feature set) unrunnable
+# rather than merely noisy. The gates themselves are unchanged; only their
+# admission is now declared.
+[[bin]]
+name = "nvfp4_mma_probe"
+required-features = ["inkling-cuda"]
+
+[[bin]]
+name = "bf16_mma_probe"
+required-features = ["inkling-cuda"]
+
+[[bin]]
+name = "fp4quant_gate"
+required-features = ["inkling-cuda"]
+
+[[bin]]
+name = "inkling_zerocopy_gate"
+required-features = ["inkling-cuda"]
+
+[[bin]]
+name = "inkling_fp4_expert_gate"
+required-features = ["inkling-cuda"]
+
+[[bin]]
+name = "inkling_bf16_expert_gate"
+required-features = ["inkling-cuda"]
+
+[[bin]]
+name = "inkling_align_gate"
+required-features = ["inkling-cuda"]
+
+[[bin]]
+name = "inkling_quant_levels"
+required-features = ["inkling-cuda"]
+
+[[bin]]
+name = "inkling_pile_import"
+required-features = ["inkling-cuda"]
+
+[[bin]]
+name = "inkling_expert_import"
+required-features = ["inkling-cuda"]
+
+[[bin]]
+name = "inkling_dense_import"
+required-features = ["inkling-cuda"]
+
+[[bin]]
+name = "inkling_pile_names"
+required-features = ["inkling-cuda"]

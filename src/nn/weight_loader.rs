@@ -269,7 +269,7 @@ pub enum WeightLoader {
     /// every load materialized. A typed leaf carries its shape in the blob
     /// header, so serving an aligned `[f32]` view is a slice — no platform
     /// check, no per-model feature, no alias preconditions to fail.
-    Typed(HashMap<String, crate::leaf::TypedLeaf>),
+    Typed(HashMap<String, crate::leaf::Leaf>),
     /// ZERO-COPY pile loader: tensor requests on the fused Metal backends alias
     /// the mmap'd pile blobs straight onto the GPU (no host materialization);
     /// everything else (CPU stages via [`WeightLoader::load_f32`], non-fused
@@ -291,29 +291,24 @@ pub enum WeightLoader {
 /// materializes through [`crate::ingest::read_leaf`].
 #[cfg(all(any(feature = "qwen3tts", feature = "voxtral"), target_os = "macos"))]
 pub struct AliasedPile {
-    f16: HashMap<String, crate::ingest::LeafHandles>,
-    f32: HashMap<String, crate::ingest::LeafHandles>,
-    f16_reader: triblespace::core::repo::pile::PileReader,
-    f32_reader: triblespace::core::repo::pile::PileReader,
+    f16: HashMap<String, crate::leaf::Leaf>,
+    f32: HashMap<String, crate::leaf::Leaf>,
     device: burn::backend::wgpu::WgpuDevice,
 }
 
 #[cfg(all(any(feature = "qwen3tts", feature = "voxtral"), target_os = "macos"))]
 impl AliasedPile {
+    /// The two indexes and the device they load onto.
+    ///
+    /// No reader: a leaf's payload is `Bytes` over the pile's mapping and keeps
+    /// that mapping alive by itself, so the index outlives the repository it
+    /// came from without holding a handle to it.
     pub fn new(
-        f16: HashMap<String, crate::ingest::LeafHandles>,
-        f32: HashMap<String, crate::ingest::LeafHandles>,
-        f16_reader: triblespace::core::repo::pile::PileReader,
-        f32_reader: triblespace::core::repo::pile::PileReader,
+        f16: HashMap<String, crate::leaf::Leaf>,
+        f32: HashMap<String, crate::leaf::Leaf>,
         device: burn::backend::wgpu::WgpuDevice,
     ) -> Self {
-        Self {
-            f16,
-            f32,
-            f16_reader,
-            f32_reader,
-            device,
-        }
+        Self { f16, f32, device }
     }
 
     /// Number of half-width / exact leaves indexed.
@@ -337,11 +332,10 @@ impl AliasedPile {
     /// bf92171 — see PORT_NOTES.md "Zero-copy alias probe"). The raw
     /// backends have no fusion graph; gemma runs the same seam at 31B scale.
     fn gpu_tensor<B: Backend, const D: usize>(&self, name: &str) -> Option<Tensor<B, D>> {
-        use crate::ingest::LeafHandles;
+        use crate::leaf::Elem;
         use crate::nn::backend::{BFused, BFusedHalf};
         use burn::tensor::TensorData;
         use std::any::TypeId;
-        use triblespace::prelude::BlobStoreGet;
 
         let want_f16 = TypeId::of::<B>() == TypeId::of::<BFusedHalf>();
         let want_f32 = TypeId::of::<B>() == TypeId::of::<BFused>();
@@ -349,22 +343,17 @@ impl AliasedPile {
         let want_raw_f32 = TypeId::of::<B>() == TypeId::of::<crate::nn::backend::B>();
 
         let dev = &self.device; // concretely WgpuDevice, the device of all four backends
+        // Each arm picks its index, insists on the width that index is for,
+        // and takes the leaf's own bytes. There is no shape blob to fetch:
+        // the dims came out of the tensor header the payload is attached to.
         let (flat, shape): (Tensor<B, 1>, Vec<usize>) = if want_f16 {
-            let (dh, sh) = match self.f16.get(name)? {
-                LeafHandles::F16(d, s) => (*d, *s),
-                LeafHandles::F32(..) => return None,
-            };
-            let bytes: anybytes::Bytes = self.f16_reader.get(dh).ok()?;
-            let shape = crate::ingest::read_shape(&self.f16_reader, sh);
+            let leaf = self.f16.get(name)?;
+            let bytes = (leaf.elem() == Elem::F16).then(|| leaf.payload().clone())?;
             let concrete: Tensor<BFusedHalf, 1> = upload_f16::<BFusedHalf>(bytes, dev);
-            (same_type::<_, Tensor<B, 1>>(concrete), shape)
+            (same_type::<_, Tensor<B, 1>>(concrete), leaf.shape())
         } else if want_raw_f16 {
-            let (dh, sh) = match self.f16.get(name)? {
-                LeafHandles::F16(d, s) => (*d, *s),
-                LeafHandles::F32(..) => return None,
-            };
-            let bytes: anybytes::Bytes = self.f16_reader.get(dh).ok()?;
-            let shape = crate::ingest::read_shape(&self.f16_reader, sh);
+            let leaf = self.f16.get(name)?;
+            let bytes = (leaf.elem() == Elem::F16).then(|| leaf.payload().clone())?;
             let concrete: Tensor<crate::nn::backend::BHalf, 1> =
                 match crate::nn::alias::alias_flat_raw::<half::f16>(bytes.clone(), dev) {
                     Ok(t) => t,
@@ -373,37 +362,31 @@ impl AliasedPile {
                         upload_f16::<crate::nn::backend::BHalf>(bytes, dev)
                     }
                 };
-            (same_type::<_, Tensor<B, 1>>(concrete), shape)
+            (same_type::<_, Tensor<B, 1>>(concrete), leaf.shape())
         } else if want_raw_f32 {
-            let (dh, sh) = match self.f32.get(name)? {
-                LeafHandles::F32(d, s) => (*d, *s),
-                LeafHandles::F16(..) => return None,
-            };
-            let bytes: anybytes::Bytes = self.f32_reader.get(dh).ok()?;
-            let shape = crate::ingest::read_shape(&self.f32_reader, sh);
+            let leaf = self.f32.get(name)?;
+            let bytes = (leaf.elem() == Elem::F32).then(|| leaf.payload().clone())?;
             let concrete: Tensor<crate::nn::backend::B, 1> =
-                match crate::nn::alias::alias_flat_raw::<f32>(bytes.clone(), dev) {
+                match crate::nn::alias::alias_flat_raw::<f32>(bytes, dev) {
                     Ok(t) => t,
                     Err(e) => {
                         eprintln!("[mary] {name}: zero-copy alias failed ({e}); uploading");
-                        let n: usize = shape.iter().product();
-                        let data: Vec<f32> = bytes.view::<[f32]>().ok()?[..].to_vec();
+                        let data = leaf.to_f32();
+                        let n = data.len();
                         Tensor::from_data(TensorData::new(data, [n]), dev)
                     }
                 };
-            (same_type::<_, Tensor<B, 1>>(concrete), shape)
+            (same_type::<_, Tensor<B, 1>>(concrete), leaf.shape())
         } else if want_f32 {
-            let (dh, sh) = match self.f32.get(name)? {
-                LeafHandles::F32(d, s) => (*d, *s),
-                LeafHandles::F16(..) => return None,
-            };
-            let bytes: anybytes::Bytes = self.f32_reader.get(dh).ok()?;
-            let shape = crate::ingest::read_shape(&self.f32_reader, sh);
-            let n: usize = shape.iter().product();
-            let data: Vec<f32> = bytes.view::<[f32]>().ok()?[..].to_vec();
+            let leaf = self.f32.get(name)?;
+            if leaf.elem() != Elem::F32 {
+                return None;
+            }
+            let data = leaf.to_f32();
+            let n = data.len();
             let concrete: Tensor<BFused, 1> =
                 Tensor::<BFused, 1>::from_data(TensorData::new(data, [n]), dev);
-            (same_type::<_, Tensor<B, 1>>(concrete), shape)
+            (same_type::<_, Tensor<B, 1>>(concrete), leaf.shape())
         } else {
             return None;
         };
@@ -413,19 +396,10 @@ impl AliasedPile {
         Some(flat.reshape(dims))
     }
 
-    /// The leaf handles for `name` plus the reader that resolves them, exact
-    /// leaves preferred (for the materializing fallback and the CPU stages).
-    fn leaf(
-        &self,
-        name: &str,
-    ) -> Option<(
-        crate::ingest::LeafHandles,
-        &triblespace::core::repo::pile::PileReader,
-    )> {
-        self.f32
-            .get(name)
-            .map(|h| (*h, &self.f32_reader))
-            .or_else(|| self.f16.get(name).map(|h| (*h, &self.f16_reader)))
+    /// The leaf for `name`, exact leaves preferred (for the materializing
+    /// fallback and the CPU stages).
+    fn leaf(&self, name: &str) -> Option<&crate::leaf::Leaf> {
+        self.f32.get(name).or_else(|| self.f16.get(name))
     }
 }
 
@@ -559,10 +533,10 @@ impl WeightLoader {
                 if let Some(t) = pile.gpu_tensor::<B, D>(name) {
                     return t;
                 }
-                let (handles, reader) = pile
+                let leaf = pile
                     .leaf(name)
                     .unwrap_or_else(|| panic!("pile missing tensor {name}"));
-                let (data, shape) = crate::ingest::read_leaf(reader, handles);
+                let (data, shape) = leaf.to_f32_shape();
                 assert_eq!(shape.len(), D, "rank mismatch for {name}");
                 let mut dims = [0usize; D];
                 dims[..D].copy_from_slice(&shape[..D]);
@@ -601,10 +575,10 @@ impl WeightLoader {
             }
             #[cfg(all(any(feature = "qwen3tts", feature = "voxtral"), target_os = "macos"))]
             WeightLoader::Aliased(pile) => {
-                let (handles, reader) = pile
+                let leaf = pile
                     .leaf(name)
                     .unwrap_or_else(|| panic!("pile missing tensor {name}"));
-                crate::ingest::read_leaf(reader, handles)
+                leaf.to_f32_shape()
             }
         }
     }
@@ -622,15 +596,8 @@ impl WeightLoader {
             }
             #[cfg(all(any(feature = "qwen3tts", feature = "voxtral"), target_os = "macos"))]
             WeightLoader::Aliased(pile) => {
-                use triblespace::prelude::BlobStoreGet;
-                let (handles, reader) = pile.leaf(name)?;
-                match handles {
-                    crate::ingest::LeafHandles::F32(dh, sh) => {
-                        let v: anybytes::View<[f32]> = reader.get(dh).ok()?;
-                        Some((v, crate::ingest::read_shape(reader, sh)))
-                    }
-                    crate::ingest::LeafHandles::F16(..) => None,
-                }
+                let leaf = pile.leaf(name)?;
+                Some((leaf.view_f32()?, leaf.shape()))
             }
             _ => None,
         }

@@ -1129,14 +1129,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selected.root(), model_root);
-        let handles = selected.handles()["encoder.weight"];
-        let crate::ingest::LeafHandles::F32(data, shape) = handles else {
-            panic!("selected model did not preserve the f32 leaf");
-        };
-        let data: View<[f32]> = selected.reader().get(data).unwrap();
-        let shape: View<[u64]> = selected.reader().get(shape).unwrap();
+        let leaf = &selected.handles()["encoder.weight"];
+        assert_eq!(leaf.elem(), crate::leaf::Elem::F32);
+        let data: View<[f32]> = leaf.view_f32().expect("f32 leaves serve a view");
         assert_eq!(&*data, &[1.25]);
-        assert_eq!(&*shape, &[1]);
+        assert_eq!(leaf.dims(), &[1]);
     }
 
     #[test]
