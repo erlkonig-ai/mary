@@ -839,6 +839,154 @@
 //! is more than one, and the same eight slots on the pre-interleave binary and
 //! on this one emit identical streams.
 //!
+//! # The KV cache is BF16, and `INK_ATTN_BF16=0` is the wide arm
+//!
+//! The attention matmuls are 14.1% of a decode pass at 152 GB/s against a
+//! measured 236 GB/s bus, so they are bandwidth-bound, and what they read is
+//! almost entirely the KV cache: 6.0 GB a pass at 32 slots against 5.4 GB of
+//! slot KV. Halving the width of the cache halves what the lane moves. It also
+//! halves what the run HOLDS, and on this part that is the ceiling.
+//!
+//! **Every table above this section was measured on the WIDE cache**, which is
+//! `INK_ATTN_BF16=0` now and was the only lane when they were taken. They are
+//! left as they were rather than re-measured: what they are about is the batch
+//! and the pipe, and re-running forty arms to move each of them a few percent
+//! would price the cache twice and the interleave not at all. The row-by-row
+//! effect of the narrow cache is the table at the end of this section.
+//!
+//! Held narrow, not cast per pass -- casting would ADD a full-width read to
+//! save a half-width one. So [`dev_lane::SlotCache`] and [`dev_lane::AttnCache`]
+//! allocate, append, merge and trim in BF16, and `q @ k^T` and `p @ v` run
+//! there; the scores come back to f32 before the relative bias, the mask and
+//! the softmax, which are untouched. `[slots * kv_heads, groups, cap]` is 16 MB
+//! at 32 slots against gigabytes of cache, so keeping the reduction's OUTPUT
+//! wide costs nothing. A PREFILL computes its scores from keys it has just
+//! projected and never round-trips them, so it has nothing to save and is left
+//! alone.
+//!
+//! ## The precision argument is not the one it looks like
+//!
+//! Burn's f32 matmul on this runtime is TF32 -- about ten mantissa bits, not
+//! twenty-three, pinned by `f32_matmul_is_tf32_on_this_runtime` at 9.3e-4
+//! relative on a 128-deep product. The four-byte load was paying for
+//! twenty-three bits that the tensor cores round away before they multiply.
+//! BF16 carries eight, which is genuinely fewer.
+//!
+//! **How much fewer is not a question an f64 reference can answer**, and this
+//! file no longer contains one to ask. The weights are four bits; an f64 sum of
+//! the same values is a more expensive computation of the model, not the
+//! model's ground truth, and the reference implementation this port is held to
+//! does not compute attention that way either. So the acceptance criterion is
+//! `golden/paired/` -- the same prompts through the BF16 reference and through
+//! each arm, reported as agreement rather than as distance.
+//!
+//! A layer-RMS ladder is still worth a glance, as a smoke check and not as a
+//! bound: on the FIRST decode pass, where both arms are on identical inputs,
+//! the ladder moves 5.3e-3 across the head's 21 layers and 2.5e-2 across the
+//! tail's -- the same order as `CACHE_TOLERANCE_LOCAL`, which is what the f32
+//! cached lane already sits at against the uncached one. Later passes move far
+//! more (30% by the twentieth) and that number means nothing: by then the two
+//! arms are decoding different text.
+//!
+//! Token agreement means little here for the same reason. Held to eight slots
+//! of 512-token prompts, the two arms agree on 51% of 160 slot-steps and
+//! diverge from the first cached step, which is what greedy decoding does the
+//! moment any position flips -- the same lane already shows `INK_WIDTH=1` and
+//! `INK_WIDTH=2` taking the stack apart over forty positions with no
+//! speculation anywhere. That is why the gate is capability and not agreement.
+//!
+//! ## The gate: `golden/paired/`, and it does not move
+//!
+//! Eight generation prompts, 48 tokens each, decoded through the pipe with the
+//! cache on; then the prompt AND that continuation through the unquantised BF16
+//! reference as one sequence, which is asked at every position what IT would
+//! have emitted. 384 scored positions an arm. `INK_ATTN_BF16=0` and `=1` on the
+//! same binary, same prompts, same reference procedure.
+//!
+//! ```text
+//!                                                      wide cache   narrow cache
+//!   reference vs the runtime's own cached generation   362/384 94.3%  363/384 94.5%
+//!   reference vs the runtime, both teacher-forced      359/384 93.5%  361/384 94.0%
+//!   the runtime UNCACHED vs its own cached generation  365/384 95.1%  363/384 94.5%
+//! ```
+//!
+//! Every 95% interval on those six numbers spans four points and every pair
+//! overlaps almost entirely; the largest gap between the arms is TWO positions
+//! out of 384, and it points in a different direction on the second line than
+//! on the third. **The narrow cache is not distinguishable from the wide one
+//! here**, and the third line is the one that isolates the cache: it compares
+//! each arm's cached lane against its OWN uncached forward on the same ids, so
+//! the model and the reference cancel and what is left is the cache.
+//!
+//! Said with its limit rather than without: eight sequences is what this
+//! detects, and the harness's own `--flip` calibration on the multiple-choice
+//! set says a small regression is not detectable at that size. What this run
+//! rules out is a regression large enough to matter at the width the change was
+//! made for, and it does not rule out a small one.
+//!
+//! The 40-item multiple-choice set is NOT the instrument here and was not run
+//! as one: those items answer with the FIRST token, which is a prefill, and a
+//! prefill reads no cache -- it would have scored a run in which this change
+//! never executed. That property is checked rather than asserted: the same
+//! uncached forward over the same eight sequences, with the flag on and with it
+//! off, writes byte-identical top-5 tables, all eight for all eight.
+//!
+//! ## What the unit tests can and cannot say about it
+//!
+//! The cached-lane tests in `burn.rs` assert that feeding one token at a time
+//! reproduces feeding all of them, at a tolerance sized for two implementations
+//! of the SAME arithmetic. A narrow cache is not that -- it stores less -- so
+//! those tests take the wide lane explicitly rather than being loosened until
+//! the narrow one fits, which would be inventing a bound to match the answer.
+//! What the narrow lane is held to instead is the property that holds exactly
+//! at any dtype and is the one batching can get wrong:
+//! `narrow_slots_are_still_independent` runs slot 0 beside three different
+//! sequences and beside three copies of itself and requires the two answers to
+//! be **bit-identical** -- 0e0, measured -- while the four slots of the
+//! heterogeneous batch stay 4.1e-1 apart.
+//!
+//! ## What it costs and what it buys
+//!
+//! Warm p50 over 40 passes, `/tmp/mix_891k.ids`, 3732-token prompts, two-node
+//! pipe, layers 0:21 and 21:42, `INK_KV=1`. `pool live`, `slot KV` and the
+//! `MemAvailable` floor are the head's.
+//!
+//! ```text
+//!   slots  cohorts  lane   p50 ms        agg tok/s     pool live  slot KV  MemAvail  swap
+//!     32      1     f32    585.7 585.3   54.6          7.82 GiB   5.01 GiB   15.8     0
+//!     32      1     bf16   556.4 555.0   57.5  57.7    4.84       2.51       16.8     0
+//!     96      1     f32   1081.4         88.8         19.88      15.04        1.4  5.50 GiB
+//!     96      1     bf16   968.7         99.1         10.95       7.52       10.2     0
+//!     96      2     f32    371.8        129.1         19.88      15.04        0.4  4.25 GiB
+//!     96      2     bf16   344.8        139.2         10.95       7.52       12.4     0
+//! ```
+//!
+//! **5.4% on the pass at 32 slots and 11.6% at 96**, and the two are different
+//! numbers for a reason. At 32 the saving is exactly what the bandwidth share
+//! predicts: the attention products are ~13.6% of the round trip across the two
+//! nodes and halving their bytes takes about half of that. At 96 the f32 arm is
+//! ALSO paying for memory pressure -- 19.88 GiB live, `MemAvailable` at
+//! 1.4 GiB, 5.50 GiB of the head swapped -- and the BF16 arm is not, because
+//! 7.52 GiB of slot KV against 15.04 is what takes the run off the wall.
+//!
+//! The cache is 50% narrower and the POOL is 38-45% smaller, which is more than
+//! the cache alone: the pass's transient score and probability tensors follow
+//! the dtype of what they are built from.
+//!
+//! **With the interleave, ninety-six sequences decode at 139.2 aggregate tok/s
+//! against 88.8 before either change** -- 1.57x, at a 3732-token context each,
+//! on a pair of nodes where the single-cohort f32 arm was swapping.
+//!
+//! ## What this does to the ceiling, which was the point
+//!
+//! The last section's ceiling was host RAM and nothing else. `b = 128` was over
+//! it at 25.91 GiB live and its prefills went to 56, 139, 72 and 59 seconds;
+//! `b = 96` ran but swapped 5.50 GiB, and the two-cohort arm at the same width
+//! bottomed at 0.43 GiB of `MemAvailable`. Narrow, the same 96 slots hold
+//! 10.95 GiB and never touch swap, with 12.4 GiB of headroom left on the head.
+//! That headroom is the change worth having; the 5% on the pass is the smaller
+//! half of what this buys.
+//!
 //! # One lane, all the way down
 //!
 //! There is nothing to select. Attention, the dense and shared MLPs, the head
@@ -2799,7 +2947,12 @@ fn main() -> Result<()> {
                     AttnKind::Local => t.sliding_window_size.min(n + gen_steps),
                     AttnKind::Global => n + gen_steps,
                 };
-                2 * total_slots as u64 * keep as u64 * (kv_heads * head_dim) as u64 * 4
+                // Four bytes a value, or two where the cache is held narrow.
+                // The admission gate reads this, and a gate that priced a BF16
+                // cache at f32 would refuse ranges that fit -- which is the
+                // safe direction and still the wrong number.
+                let w = if dev_lane::attn_bf16() { 2 } else { 4 };
+                2 * total_slots as u64 * keep as u64 * (kv_heads * head_dim) as u64 * w
             })
             .sum()
     } else {
@@ -2807,8 +2960,9 @@ fn main() -> Result<()> {
     };
     if slot_lane {
         println!(
-            "  slot KV            : {:.2} GiB for {total_slots} slots over layers {lo}..{hi}",
-            slot_kv_bytes as f64 / GIB
+            "  slot KV            : {:.2} GiB for {total_slots} slots over layers {lo}..{hi}{}",
+            slot_kv_bytes as f64 / GIB,
+            if dev_lane::attn_bf16() { "  (BF16)" } else { "" }
         );
     }
 
