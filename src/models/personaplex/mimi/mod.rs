@@ -14,4 +14,4 @@ pub mod decoder;
 pub mod encoder;
 
 pub use decoder::MimiDecoder;
-pub use encoder::MimiEncoder;
+pub use encoder::{MimiEncoder, MimiEncoderState};

@@ -630,6 +630,47 @@ fn pipeline_gate(pile: &str) {
         n_codes - enc_mism
     );
 
+    // The production encoder consumes one 80 ms frame per LM step. Gate that
+    // stateful path against both the established full-clip path and the
+    // NVIDIA streaming oracle captured in `user_codes.npy`.
+    let mut encoder_state = p.encoder.stream_state();
+    let streaming_codes: Vec<_> = samples
+        .chunks_exact(mimi_cfg::SAMPLES_PER_FRAME)
+        .map(|frame| {
+            p.encoder.encode_stream_frame(
+                &mut encoder_state,
+                frame.try_into().expect("exact Mimi input frame"),
+            )
+        })
+        .collect();
+    let ok_stream = streaming_codes == codes;
+    println!(
+        "  {} mimi stream   {}/{} frames exact (batch + user_codes)",
+        if ok_stream { "OK" } else { "XX" },
+        streaming_codes
+            .iter()
+            .zip(&codes)
+            .filter(|(stream, batch)| stream == batch)
+            .count(),
+        n_gen
+    );
+
+    encoder_state.reset();
+    let reset_codes: Vec<_> = samples
+        .chunks_exact(mimi_cfg::SAMPLES_PER_FRAME)
+        .map(|frame| {
+            p.encoder.encode_stream_frame(
+                &mut encoder_state,
+                frame.try_into().expect("exact Mimi input frame"),
+            )
+        })
+        .collect();
+    let ok_reset = reset_codes == streaming_codes;
+    println!(
+        "  {} mimi reset    deterministic streaming replay",
+        if ok_reset { "OK" } else { "XX" }
+    );
+
     // 2. Prompt phases (oracle flow: voice → silence → text → silence).
     let t0 = Instant::now();
     p.prompt_voice(&vp, &g.vp_cache, &device);
@@ -692,7 +733,10 @@ fn pipeline_gate(pile: &str) {
     wav::write_pcm16_mono(Path::new(OUT_WAV), &pcm, mimi_cfg::SAMPLE_RATE);
     println!("wrote {OUT_WAV}");
 
-    verdict("PERSONAPLEX PIPELINE PARITY", ok_enc && ok_out && ok_audio);
+    verdict(
+        "PERSONAPLEX PIPELINE PARITY",
+        ok_enc && ok_stream && ok_reset && ok_out && ok_audio,
+    );
 }
 
 // ────────────────────────────── prompt gate ──────────────────────────────
