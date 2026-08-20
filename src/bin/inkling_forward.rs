@@ -744,8 +744,9 @@
 //! single-cohort table has been measured, so there is no width at which this is
 //! worth much more or much less than a half.
 //!
-//! **129.1 aggregate tok/s** is where this lane now peaks, at ninety-six
-//! sequences of a 3732-token context each.
+//! **129.1 aggregate tok/s** is where this lane peaks on the wide cache, at
+//! ninety-six sequences of a 3732-token context each. The narrow cache carries
+//! it to 162.1 at a hundred and twenty-eight; see the section after next.
 //!
 //! Reproducibility below the memory wall: the two `2 x 32` runs read 289.9 and
 //! 290.3 ms, a 0.1% spread; the two `2 x 16` runs 200.8 and 203.3, 1.2%.
@@ -959,6 +960,9 @@
 //!     96      1     bf16   968.7         99.1         10.95       7.52       10.2     0
 //!     96      2     f32    371.8        129.1         19.88      15.04        0.4  4.25 GiB
 //!     96      2     bf16   344.8        139.2         10.95       7.52       12.4     0
+//!    128      1     f32       --  did not run: 25.91 GiB live, prefills 56/139/72/59 s
+//!    128      1     bf16  1091.5        117.3         14.00      10.03        4.4  4.63 GiB
+//!    128      2     bf16   394.7        162.1         14.00      10.03        6.7     0
 //! ```
 //!
 //! **5.4% on the pass at 32 slots and 11.6% at 96**, and the two are different
@@ -980,12 +984,22 @@
 //! ## What this does to the ceiling, which was the point
 //!
 //! The last section's ceiling was host RAM and nothing else. `b = 128` was over
-//! it at 25.91 GiB live and its prefills went to 56, 139, 72 and 59 seconds;
-//! `b = 96` ran but swapped 5.50 GiB, and the two-cohort arm at the same width
-//! bottomed at 0.43 GiB of `MemAvailable`. Narrow, the same 96 slots hold
-//! 10.95 GiB and never touch swap, with 12.4 GiB of headroom left on the head.
-//! That headroom is the change worth having; the 5% on the pass is the smaller
-//! half of what this buys.
+//! it at 25.91 GiB live, and that arm was stopped after five of its hundred and
+//! twenty-eight prefills -- 56, 139, 72 and 59 seconds each -- rather than left
+//! two hours to say so a sixth time. `b = 96` ran but swapped 5.50 GiB, and the
+//! two-cohort arm at the same width bottomed at 0.43 GiB of `MemAvailable`.
+//!
+//! Narrow, **`b = 128` runs**: 14.00 GiB live against 25.91, prefills at their
+//! floor, and 117.3 aggregate tok/s single-cohort. Interleaved it is
+//! **162.1 aggregate tok/s** -- and the interleaved arm is the one that stays
+//! OFF swap at that width, because two 64-slot batches reserve 15.65 GiB to hold
+//! 14.00 where one 128-slot batch reserves 17.61, and 1.96 GiB of stranded
+//! reservation is the whole margin at this point on the curve.
+//!
+//! So the two changes compose the way they were argued to: **88.8 aggregate
+//! tok/s before either, 162.1 with both**, at a 3732-token context on every one
+//! of a hundred and twenty-eight sequences. The interleave stops each node
+//! waiting; the narrow cache is what buys the width to wait for.
 //!
 //! # One lane, all the way down
 //!
