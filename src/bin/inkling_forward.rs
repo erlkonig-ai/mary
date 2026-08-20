@@ -470,6 +470,173 @@
 //! 25.77 GiB headroom, so this is not the ceiling either -- it is where the
 //! corpus ran out of disjoint chunks.
 //!
+//! ## Where the ceiling actually is, on a corpus that does not run out
+//!
+//! `/tmp/mix_891k.ids` is 891,510 tokens: the 100,623-token file above followed
+//! by 790,887 tokens encoded from 3.2 MB of ordinary English prose -- 320 KB
+//! from each of ten public-domain novels, front matter stripped. Slot `s` still
+//! takes `[s * L, (s + 1) * L)`, so slots 0..26 carry exactly the tokens the
+//! shorter file gave them and the arms remain comparable to every row above:
+//! `b = 16` reads 404.8 ms here against 399.7 there. It admits 238 disjoint
+//! 3732-token chunks.
+//!
+//! Real prose and not synthesis, because a 256-expert MoE routes pathologically
+//! on a low-vocabulary prompt and a decode that degenerates into one repeated
+//! token measures the text rather than the machine. Checked rather than
+//! asserted: each 3732-token chunk carries 1106-1632 DISTINCT ids, and slot 0's
+//! continuation is English at every `b`.
+//!
+//! Warm p50 over 40 passes, both columns on the same corpus and the same pipe;
+//! "before" is the schedule this file shipped with and "after" is the fill gate
+//! in [`crate::models::inkling::moegroup::grouped_nrep`]:
+//!
+//! ```text
+//!    b   before p50   after p50   tok/s before -> after  pool live  MemAvail  swap
+//!    8      289.0          -            27.7              3.29 GiB  21.7 GiB    0
+//!   12      351.3          -            34.2              4.05      20.0        0
+//!   16      399.7          -            40.0              4.80      19.2        0
+//!          404.8
+//!   24      496.0          -            48.4              6.31      16.6        0
+//!   32      585.3        585.7          54.7 -> 54.6      7.82      15.8        0
+//!          586.7
+//!          586.4
+//!   40      927.3          -            43.1              9.32      10.7        0
+//!   48     1113.3        744.6          43.1 -> 64.5     10.83      10.1        0
+//!                        741.5
+//!   64     1459.5        866.3          43.9 -> 73.9     13.85       8.3        0
+//!                        865.5
+//!   96         -        1081.4                  88.8     19.88       1.4   5.50 GiB
+//!                       1091.0
+//!  128         -            -                      -     25.91         -      -
+//! ```
+//!
+//! The `pool live` and `MemAvail` columns are the head's and are read off the
+//! post-fix arm where there is one. `b = 40`'s p50 is not a description of that
+//! run and the next section says why.
+//!
+//! **The old peak was 32 and it was a bug, not a limit.** Everything from 40 up
+//! was paying for a grouped-GEMM schedule that reads the padded tile count as a
+//! measure of work; `b = 40` is bimodal for the same reason, 648-691 ms or
+//! 900-993 ms and nothing between. That is its own commit and its own header.
+//!
+//! ## Which resource binds, which is none of the three that were expected
+//!
+//! Not the device pool as a device: 19.88 GiB live at `b = 96` against the
+//! 25.77 GiB the admission gate allows. Not the per-pass arithmetic: it is
+//! still sublinear at 96, where 3x the slots of `b = 32` cost 1.85x the pass.
+//! It is HOST memory, and the pool is what spends it, because on this part the
+//! pool IS host memory. At `b = 96` the pool RESERVES 27.94 GiB to hold 19.88 --
+//! 8.06 GiB stranded over 440 slices -- and `MemAvailable` bottoms at 1.38 GiB
+//! with 5.50 GiB of the head swapped out. It still runs, at **88.8 aggregate
+//! tok/s**, because what got swapped is the reservation nothing reads. The
+//! DECODE is what survives, not the whole run: a second  reads 1091.0 ms
+//! against 1081.4 while its prefill phase goes from 7.7 s a slot to 13.8, so at
+//! ninety-six the thing memory pressure moves first is the part that runs once.
+//!
+//! `b = 128` is over it: 25.91 GiB live, and a prefill goes from 6.8 s a slot to
+//! 56, 139, 72 and 59, so that arm was stopped after five of its hundred and
+//! twenty-eight rather than left two hours to say the same thing a sixth time.
+//! So the wall is between 96 and 128, it is the host's RAM, and
+//! a third of what the batch spends there at 96 is allocator reservation rather
+//! than cache. A pool that returned its stranded slices would be worth more of
+//! this ceiling than anything in the model.
+//!
+//! For scale rather than for a claim: an independent vLLM TP2 setup on two of
+//! these boxes reports 61.97 aggregate tok/s at five concurrent streams. This is
+//! 88.8 at ninety-six, which is a different point on a different curve -- more
+//! sequences, a 3.7k context each -- and the two are not a like-for-like
+//! comparison in either direction.
+//!
+//! # Where a decode pass goes, measured on the device rather than at the host
+//!
+//! `nsys -t cuda` on the HEAD at `INK_SLOTS=32`, a 20 s window covering 34 warm
+//! passes. The profiled run's own p50 is 586.7 ms against 585.3 unprofiled, so
+//! nothing below is paying for the instrument.
+//!
+//! GPU kernel time totals **9538 ms of the 20 000 ms window, 47.7%**. The head's
+//! own half of the pass is 51.3-51.6% of the wall, so **the head's GPU is busy
+//! 93% of the time the head is not blocked on the tail**, and launch gaps are
+//! the other 7%. This lane is not enqueue-bound, which is what the host-side
+//! table above cannot tell you: with nothing synchronising in the loop, a
+//! stage's device cost surfaces at whichever later call blocks, and `router +
+//! group`'s BLOCKING read and `mlp short_conv` are mostly where it lands.
+//!
+//! Per pass, with the bytes each kernel reads and the rate that implies against
+//! a 273 GB/s bus (236 measured by `inkling_bf16_gemm_bench`):
+//!
+//! ```text
+//!   kernel                 ms/pass  share   reads    achieved
+//!   fp4_linear_grouped      147.9   52.7%  25.4 GB   171 GB/s  18 NVFP4 MoE layers
+//!   matmul_entry f32         39.7   14.1%   6.0 GB   152 GB/s  attention scores + values
+//!   matmul_entry bf16        37.8   13.5%   3.8 GB   100 GB/s  q/k/v/r/o, router, shared
+//!   bf16_linear_grouped      34.9   12.4%   5.7 GB   163 GB/s  layer 2, BF16 experts
+//!   the other eighteen       20.2    7.3%
+//! ```
+//!
+//! 41 GB in 302 ms is 138 GB/s, 58% of the bus, and the shape of the shortfall
+//! is 187 small BF16 GEMMs at 100 GB/s rather than one lane in the wrong gear.
+//!
+//! Two things the table is honest about. The kernel times are a SUM and a sum
+//! over-counts if anything overlaps; it does not here, and the check is that
+//! 9538 ms fits inside the 10 260 ms the head was not blocked, which a lane
+//! running two streams would not have done. And the `reads` column for the two
+//! grouped rows is DERIVED, not measured per kernel: the pass's own
+//! `stored bytes` counter gives 28.91 GiB for all nineteen routed layers
+//! together, and it is split between them by expert size -- 48 MiB where they
+//! are BF16 and 13.5 MiB where they are NVFP4, which the startup line's
+//! 72.8 GiB over 9728 planes fixes. That puts ~113 active experts at layer 2,
+//! and 113 is also what the next section's threshold story needs, so the two
+//! agree without having been fitted to each other.
+//!
+//! ## What that rules out, said explicitly because each was a standing suspect
+//!
+//! * **The narrow GEMM lane.** `gemv plane par` requires `m == 1` and every
+//!   wide pass loses it, and that was the largest named suspect for a batched
+//!   decode. It is 13.5% of the head's GPU time. A lane that recovered ALL of
+//!   it -- not the shortfall, the whole 37.8 ms -- is 6% of a 586 ms pass.
+//! * **Attention at a long context.** 14.1%, at 152 GB/s, with 35 of 42 layers
+//!   banded to a 512 window. It is already near the roofline and it is not the
+//!   term that grows.
+//! * **The routed-expert lane itself.** 52.7% of the time and 73% of the bus.
+//!   There is nothing in it to win except fewer bytes, and fewer bytes per TOKEN
+//!   is exactly what raising `b` already buys: 1.39 GiB a token at 8 slots,
+//!   0.90 at 32, 0.48 at 96, because the expert set saturates while the tokens
+//!   do not.
+//!
+//! ## What is left, and what it is worth
+//!
+//! The largest number in the profile is not a kernel. It is the **48% of the
+//! wall on which this node's GPU has nothing to do**, and batching did not fill
+//! it and cannot: head computing 51.3% / blocked 48.7% at `b = 32` and
+//! 49.6 / 50.4 at 48, against 46.9 / 53.1 at one row. The two halves of one
+//! token are strictly ordered, so widening the batch scales both halves and
+//! leaves the ratio where it was. Two ways to take it, priced rather than
+//! assumed:
+//!
+//! * **A within-layer split.** 84 all-reduces a token at the measured 26.84 us
+//!   is 2.25 ms, **0.26% of an 866 ms pass** at `b = 64`; bandwidth is four
+//!   orders of magnitude clear. It halves the bytes each node reads AND runs
+//!   both GPUs on the same token, so the bound is 2x -- ~148 aggregate tok/s at
+//!   64 -- and it halves per-node weight residency, which is the thing that ran
+//!   out at 96. It needs every weight resharded, NCCL inside the loop, and the
+//!   KV cache split by head.
+//! * **A two-cohort pipeline interleave.** The slots are independent already, so
+//!   cohort B's layers 0:21 can run on the head while cohort A's 21:42 run on
+//!   the tail. A round advances both cohorts and costs `2 * max(H, T)`, which is
+//!   `p50(c)` for `2c` tokens, so at a fixed slot budget it is worth
+//!   `p50(2c) / p50(c)`: **866.3 / 585.7 = 1.48x** at 64 slots (109 aggregate
+//!   tok/s) and 1.45x at 96 (129). No collective, no resharding, no new kernel --
+//!   the change is the pipe loop's send/receive order and a second
+//!   [`dev_lane::SlotCache`]. It costs nothing in memory over the single-cohort
+//!   arm of the same total width, and it doubles the prefill phase before the
+//!   first token, which is already the startup cost.
+//!
+//! The interleave is the one to build first. It is a fraction of the work, it
+//! composes with the split rather than competing for the same half, and it is
+//! the only one of the two whose correctness question this lane has already
+//! answered -- `b` independent sequences that share nothing but the weights is
+//! what `INK_SLOTS` is, and two cohorts of them is the same statement twice.
+//!
 //! ## Batching the prefills, priced rather than built
 //!
 //! The `b` prefills are still sequential and are now the startup cost: eight of
@@ -482,6 +649,16 @@
 //! tokens and a batch does not make it cheaper.
 //!
 //! ## The contamination test, which is the one this can fail
+//!
+//! Re-run on the fill gate, whole stack, 512-token prompts, 20 decode passes:
+//! slot 0 beside seven different chunks and slot 0 beside seven copies of
+//! itself emit the identical 20-token stream; the heterogeneous run's eight
+//! slots emit eight DISTINCT continuations; the homogeneous run emits eight
+//! identical tokens on every step. `slots_stay_independent_on_a_global_layer`
+//! reads 0e0 and `..._on_a_local_layer` 1.15356445e-2, both unmoved. And the
+//! schedule change is visible nowhere in the output: at `INK_SLOTS=32` and 48,
+//! the old lane, `INK_MOE_NREP=1` and the gate emit token-for-token identical
+//! streams over every pass and every slot.
 //!
 //! Batch contamination -- slot `s` reading slot `s'`'s keys -- produces fluent
 //! text and no error, so it has to be looked for deliberately, and it cannot be
