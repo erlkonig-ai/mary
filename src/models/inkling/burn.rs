@@ -2319,7 +2319,7 @@ mod tests {
         // f64 sum is a more expensive computation of a four-bit model, not its
         // ground truth. What decides which lane a run should take is
         // `golden/paired/`. What this test still answers is narrower and is a
-        // property of the LANE rather than of the arithmetic -- whether row 0.s
+        // property of the LANE rather than of the arithmetic -- whether row 0's
         // answer depends on how many other rows were in the batch with it.
         // 1.4e-5 as measured: the two lanes reduce the same 4096-long dot
         // product in different orders and BF16 operands round to 8 mantissa
