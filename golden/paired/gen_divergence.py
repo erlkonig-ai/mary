@@ -46,7 +46,10 @@ import sys
 # box. Safe path, explicit import.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-STEP = re.compile(r"^\s*step \d+: \+(\d+)", re.M)
+# The generated tokens of one pass. A list since the runtime learned to confirm
+# more than one token in a pass; one element in every run this file scores,
+# because speculation is off. See run_fp4_set.py for what the stale form cost.
+STEP = re.compile(r"^\s*step \d+(?: cohort \d+)?: \+\[([0-9, ]*)\]", re.M)
 
 
 def build(items_path, gendir, out_path):
@@ -56,7 +59,12 @@ def build(items_path, gendir, out_path):
         log = os.path.join(gendir, it["key"], "tail.log")
         if not os.path.exists(log):
             continue
-        gen = [int(m.group(1)) for m in STEP.finditer(open(log, errors="replace").read())]
+        gen = [
+            int(x)
+            for m in STEP.finditer(open(log, errors="replace").read())
+            for x in m.group(1).split(",")
+            if x.strip()
+        ]
         if not gen:
             continue
         # The last step emits a token that is never fed back, so the reference

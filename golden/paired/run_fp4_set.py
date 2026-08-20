@@ -28,7 +28,13 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LINE = re.compile(r"after token (\d+) \(id \d+\): top5")
-STEP = re.compile(r"^\s*step (\d+): \+\d+", re.M)
+# `step N: +[id, id, ...]`. It was `step N: +id` when this was written, and the
+# runtime started printing a LIST when a pass began confirming more than one
+# token; the cohort tag after the index appears only when INK_COHORTS > 1. A
+# stale pattern here does not fail loudly -- it makes every finished run look
+# unfinished, so the driver runs each item a second time and then reports it
+# INCOMPLETE, which is exactly what it did.
+STEP = re.compile(r"^\s*step (\d+)(?: cohort \d+)?: \+\[", re.M)
 
 
 def done(rundir, ids, gen=0):

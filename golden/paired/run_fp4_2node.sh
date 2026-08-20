@@ -23,6 +23,12 @@
 # BY PID when the head fails.
 #
 #   run_fp4_2node.sh <ids.bin> <outdir> [port]
+#
+# $INK_EXTRA is passed to BOTH halves verbatim, so an arm of a comparison can be
+# selected without a second copy of this script. It has to reach both ends: the
+# lanes this selects between are symmetric, and a mismatch shows up as a shape
+# assertion rather than as a wrong number, which is the good failure but still a
+# failure.
 set -u
 IDS=$1
 OUT=$2
@@ -34,6 +40,7 @@ REMOTE=${INK_REMOTE:-}
 RBIN=${INK_REMOTE_BIN:-}
 RPILE=${INK_REMOTE_PILE:-$PILE}
 TADDR=${INK_TAIL_ADDR:-}
+EXTRA=${INK_EXTRA:-}
 [ -n "$PILE" ]   || { echo "no model pile: set PILE_PATH to the .pile itself, or MARY_MODELS to the directory holding inkling-small-complete.pile" >&2; exit 2; }
 [ -e "$PILE" ]   || { echo "model pile not found: $PILE" >&2; exit 2; }
 [ -n "$BIN" ]    || { echo "no runtime binary: set FWD_BIN to the inkling_forward this measurement should use" >&2; exit 2; }
@@ -74,7 +81,7 @@ for _ in $(seq 1 60); do
 done
 echo "MemAvailable ${AV} GiB before start (wanted >= $NEED)" >> "$OUT/tail.log"
 
-timeout $TMO env INK_LAYERS=$SPLIT:$NL INK_PIPE=tail:0.0.0.0:$PORT \
+timeout $TMO env $EXTRA INK_LAYERS=$SPLIT:$NL INK_PIPE=tail:0.0.0.0:$PORT \
     "$BIN" "$PILE" "$IDS" "$OUT/top5.bin" >> "$OUT/tail.log" 2>&1 &
 TAIL_PID=$!
 
@@ -84,7 +91,7 @@ for _ in $(seq 1 3000); do
     sleep 1
 done
 
-$SSH "$REMOTE" "timeout $TMO env INK_LAYERS=0:$SPLIT INK_PIPE=head:$TADDR:$PORT '$RBIN' '$RPILE' '$RIDS' /tmp/ink2n_${SUM}.head.bin" > "$OUT/head.log" 2>&1 &
+$SSH "$REMOTE" "timeout $TMO env $EXTRA INK_LAYERS=0:$SPLIT INK_PIPE=head:$TADDR:$PORT '$RBIN' '$RPILE' '$RIDS' /tmp/ink2n_${SUM}.head.bin" > "$OUT/head.log" 2>&1 &
 HEAD_PID=$!
 
 wait $HEAD_PID; HEAD_RC=$?
