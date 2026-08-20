@@ -4105,8 +4105,10 @@ fn main() -> Result<()> {
     // that is not drafting never materialises it -- the head reads `xd`.
     let want_host_x = is_head || mtp_k > 0 || dump_dir.is_some();
     // Timed, and it is the head's alone: a tail never materialises the stream.
-    // Untimed, this read was the largest single entry in a report that claims
-    // to say where a pass went, and at 48 slots it was two thirds of one.
+    // That asymmetry is why it was the first suspect when the head's report
+    // summed to two thirds of its pass at 48 slots and the tail's summed to
+    // 95% -- and it reads 0.3 ms, so it is a suspect that has been RULED OUT
+    // rather than the untimed thing anything could be blamed on.
     let t_dn = Instant::now();
     let x: Vec<f32> = if want_host_x { down(xd.clone()) } else { Vec::new() };
     let t_x_down = t_dn.elapsed().as_secs_f64();
