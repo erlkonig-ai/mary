@@ -351,15 +351,19 @@
 //!    -   133.3 135.2    -    7.5 7.4   -   150.5 150.1          -    6.65 6.66
 //!    1   125.5 134.1  1.000  8.0 7.5   1   135.6 130.5        1.000  7.38 7.67
 //!    2   178.5 168.6  1.337  11.2 11.9 2   184.1 183.7        1.382  10.87 10.89
-//!    4   207.6 212.0  1.617  19.3 18.9 4   219.5 219.8 222.0  1.657  18.2 18.2 18.0
-//!    8   277.8 273.6  2.124  28.8 29.2 6   282.9 296.1        2.176  21.2 20.3
-//!                                      8   311.4 325.2 373.0  2.529  25.7 24.6 21.4
+//!    4   207.6 212.0  1.617  19.3 18.9 4   219.5 219.8 217.9  1.650  18.2 18.2 18.4
+//!    8   277.8 273.6  2.124  28.8 29.2 6   254.9 248.5 255.6  1.902  23.5 24.1 23.5
+//!                                      8   282.7 286.9 289.9  2.153  28.3 27.9 27.6
+//!
+//! The `b = 6` and `b = 8` rows of the 3732 column are three runs each and are
+//! post-fix; see "Where the b = 8 irreproducibility actually was" below for the
+//! numbers they replace (283-657 and 311-1465) and what was wrong with them.
 //!
 //! **Eight independent sequences decode at 3.7x one**, and at a 3.7k context
 //! each of them still carries its own 3792-key cache and reads it in full on
 //! every pass. Nearly the whole penalty is the step at the SECOND row, exactly
 //! as the probe found: from `b = 2` to `b = 8`, four times the sequences cost
-//! 1.83 times the pass.
+//! 1.56 times the pass.
 //!
 //! **The layout change is worth its own line.** At `b = 1` the slot lane is
 //! 130-136 ms where the one-row lane is 150 ms at a 3.7k context, and 125-134
@@ -388,47 +392,64 @@
 //! the probe's own UNCORRECTED number (231.8 ms, 17.26 tok/s), which is the
 //! shape of a correction that was measuring the wrong thing.
 //!
-//! ## Above four slots at a 3.7k context the node, not the arithmetic, decides
+//! ## Where the b = 8 irreproducibility actually was
 //!
-//! `b` up to 4 is reproducible to a millisecond. At 6 and 8 the pass time is
-//! BIMODAL: the machine reaches 243-280 ms and holds it for stretches, and then
-//! spends passes at five, ten, thirty times that. The p50 over 120 passes has
-//! come out anywhere from 283 to 657 ms at `b = 6` and 311 to 1465 at `b = 8`
-//! across runs of the same binary on the same prompts, and the maxima are
-//! multi-SECOND passes. The tail node is stable throughout -- its own decode
-//! passes settle at ~145 ms and stay there. The head is not, and it is the
-//! constrained end because it carries 82.73 GiB of weights and the embedding
-//! table against the tail's 76.14 GiB and no embedding: 27 GiB of headroom
-//! against 31.
+//! `b` up to 4 was reproducible to a millisecond and 6 and 8 were not: the p50
+//! over 120 passes came out anywhere from 283 to 657 ms at `b = 6` and 311 to
+//! 1465 at `b = 8` across runs of the same binary on the same prompts, with
+//! multi-SECOND maxima. Read as a decode problem that looks bimodal, and the
+//! page ladder below was a plausible account of it. It is neither bimodal nor
+//! a decode problem.
 //!
-//! It is not the KV cache, which is 1.26 GiB for eight slots over the head's 21
-//! layers. Part of it is cubecl's page ladder: a layer's frozen K at eight slots
-//! and 3.8k keys is `[64, 3776, 128]` f32 = **124 MB**, the rungs are
-//! `max_page_size / 4^k` = 478 MB, 117 MB, ..., and 124 is just over 117, so
-//! each of the 42 buffers takes a 478 MB page and the set occupies ~20 GiB
-//! instead of 3.9. That is a plausible account of the step at `b = 8` and it
-//! does NOT account for `b = 6` and `b = 7`, whose buffers are 93 and 108 MB and
-//! stay a rung down. So the honest statement is that four slots is where
-//! reproducibility ends on THIS split, and that the eight-slot figures above are
-//! the good runs and are reported as such.
+//! The per-pass sequence says so on its own. Every one of those runs settles at
+//! ~250 ms (`b = 6`) or ~285 ms (`b = 8`) and stays there; what varies is how
+//! many passes it takes to GET there -- one run reached the floor on its second
+//! decode pass and another was still at 1.5 s a hundred passes in. A p50 that
+//! ranges 5x over a floor that does not move is not a bimodal steady state. It
+//! is one transient of variable length, and the transient is the node climbing
+//! back out of the swap that the `b` PREFILLS put it into.
 //!
-//! Three ways past it, none of them tuning: chunk the frozen half so no buffer
-//! crosses a rung, which is a paged KV cache and is also what a real slot
-//! scheduler wants; hold K and V as BF16, which halves both the buffer and the
-//! bandwidth; or move a layer off the head, which the split is free to do
-//! because the two ends are already asymmetric in weight.
+//! ## The prefill sequence held 30.49 GiB of a 25.77 GiB headroom
 //!
-//! ## The prefill is a second, separate memory event
+//! The `b` prefills run one after another, and every finished one used to be
+//! KEPT until all `b` were in, because the batch was assembled on the first
+//! decode pass. That is the whole of it. `seam::pool_line`
+//! (`memory_usage().bytes_in_use`) across the eight prefills of a 3732-token
+//! run on the 21-layer head, 25.77 GiB of headroom by the admission gate:
 //!
-//! `b` prefills run one after another and each peaks on a
-//! `[heads, query_block, tokens]` score matrix -- 1.68 GiB at 3.7k, served out
-//! of a whole 1.87 GiB page that the pool then keeps. Across eight of them the
-//! node goes into swap: prefills five through seven took 175 s, 85 s and 26 s
-//! against 3.2 s for the first five. The loop now syncs and calls
-//! `memory_cleanup` after each slot's prefill and again once the batch is
-//! assembled, which took those three to 13 s, 17 s and 41 s. It is a hint and
-//! the allocator decides; between prefills there is nothing else in flight for
-//! it to decide against.
+//!   after prefill   1     2     3     4     5     6     7     8   | batch
+//!   pool live GiB   5.37  8.96 12.55 16.14 19.73 23.31 26.90 30.49|  3.24
+//!   that pass, s    20.9   7.0   7.1   6.8   6.9 118.4 246.4  47.2|
+//!
+//! **+3.59 GiB per slot, against 0.16 GiB of keys and values.** A prefilled
+//! [`dev_lane::AttnCache`] costs twenty times the keys it holds, and the `cat`
+//! in the batch assembly is what collapsed it -- 30.49 GiB of per-slot caches
+//! became a 3.24 GiB batch in one step. The sixth prefill is where the headroom
+//! runs out and it is exactly where the pass times explode; the
+//! reserved-minus-live column stayed under 1.1 GiB throughout, so page
+//! stranding -- the thing `memory_cleanup` was added for, and the thing the
+//! ladder was blamed for -- was never more than 4% of it.
+//!
+//! Slots are seated as they are prefilled now ([`dev_lane::SlotCache::seeded`],
+//! [`dev_lane::SlotCache::seat`]), so the batch is the only long-lived
+//! allocation and it is made once, from slot 0, before any of the churn:
+//!
+//!   after prefill   1     2     3     4     5     6     7     8
+//!   pool live GiB   3.29  3.29  3.29  3.29  3.29  3.29  3.29  3.29
+//!   that pass, s    20.9   6.8   6.8   6.9   6.8   6.9   6.9   6.9
+//!
+//! The whole prefill phase goes from 460 s to 69 s, the head's floor on
+//! `MemAvailable` from 0.6 GiB to 21.4 and the tail's from 6.6 to 25.7, neither
+//! node takes a page of swap where the tail took 5.2 GiB, and the decode is at
+//! its floor on the second pass. Three independent runs of the same binary at
+//! `b = 8` and a 3.7k context: **p50 282.7, 286.9, 289.9 ms** -- a 2.5% spread
+//! where it was 4.7x.
+//!
+//! Three things that were proposed for the bimodality and are not the fix, said
+//! plainly because each of them costs real work: rebalancing the layer split
+//! moves ~3.5 GiB between two nodes that were both ~25 GiB short; a BF16 KV
+//! cache halves 1.3 GiB of a 28 GiB overshoot; a paged KV cache addresses the
+//! stranding term, and the stranding term measured 1.0 GiB.
 //!
 //! ## The contamination test, which is the one this can fail
 //!
@@ -2975,11 +2996,11 @@ fn main() -> Result<()> {
         attn_sconv: BT<Bk, 3>,
         mlp_sconv: Option<BT<Bk, 3>>,
     }
-    // One `Vec<LayerCache>` per slot, filled by that slot's prefill pass, and
-    // consumed once when the first decode pass stacks them. A prefill is
-    // compute-bound and gains nothing from a batch, so the b of them run one at
-    // a time and the batch begins where the decoding does.
-    let mut slot_prefills: Vec<Vec<LayerCache>> = Vec::new();
+    // The slot batch, built one slot at a time as the b prefills land. A
+    // prefill is compute-bound and gains nothing from a batch, so the b of them
+    // run one at a time; each one is SEATED the moment it finishes rather than
+    // kept until all b are in. See `SlotCache::seeded` for what keeping them
+    // cost.
     let mut slots_dev: Vec<SlotLayerCache> = Vec::new();
 
     // The wire, opened AFTER the weights so a connection is never left hanging
@@ -3148,44 +3169,6 @@ fn main() -> Result<()> {
     } else {
         (ids.clone(), 0)
     };
-    // The b prefilled caches become one slot batch, once, on the first pass
-    // that decodes. Layer by layer, because a layer's KV width is a function of
-    // its kind and a local layer's is not a global one's.
-    if slot_lane && is_decode && slots_dev.is_empty() {
-        assert_eq!(slot_prefills.len(), nslots, "a slot did not prefill");
-        for l in 0..(hi - lo) {
-            let kind = t.attn_kind(lo + l);
-            let (_, kv_heads, head_dim) = t.heads(kind);
-            let mut attn = Vec::with_capacity(nslots);
-            let mut asc = Vec::with_capacity(nslots);
-            let mut msc = Vec::with_capacity(nslots);
-            for per_slot in slot_prefills.iter() {
-                let c = &per_slot[l];
-                attn.push(c.attn.clone());
-                asc.push(c.attn_sconv.clone().reshape([1, t.sconv_kernel_size - 1, h]));
-                msc.push(
-                    c.mlp_sconv
-                        .clone()
-                        .expect("a prefill seeds the MLP convolution")
-                        .reshape([1, t.sconv_kernel_size - 1, h]),
-                );
-            }
-            slots_dev.push(SlotLayerCache {
-                attn: dev_lane::SlotCache::from_prefills(attn, kv_heads, head_dim),
-                attn_sconv: BT::cat(asc, 0),
-                mlp_sconv: Some(BT::cat(msc, 0)),
-            });
-        }
-        slot_prefills.clear();
-        // And the pages the b per-slot caches were living in. They are gone as
-        // Rust values the moment `slot_prefills` clears, and the pool keeps
-        // their pages: 336 buffers of 15.5 MB at eight slots over 21 layers,
-        // each rounded up to a rung of the ladder, is several GiB held for
-        // tensors that no longer exist -- on the node with 27 GiB of headroom,
-        // which is about to allocate the batched cache out of it.
-        <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync after the slot batch");
-        fp4_client.memory_cleanup();
-    }
     // The tail is handed the stream the head already embedded and ran; it takes
     // `n` and `pos0` from the wire rather than from `ids`, because those are
     // facts about the pass and only the head owns the token loop.
@@ -3824,23 +3807,55 @@ fn main() -> Result<()> {
         layer_kind.push((layer, is_local));
     }
 
-    // This slot is prefilled; the next one starts from an empty `caches` and
-    // the batch is assembled once all b are in.
+    // This slot is prefilled; seat it in the batch and let go of it. The next
+    // slot starts from an empty `caches`.
     //
-    // And the pool is handed back, which is not tidiness. A prefill's peak is a
-    // [heads, query_block, tokens] score matrix -- 1.68 GiB at a 3.7k context,
-    // which cubecl serves out of a whole 1.87 GiB page and then KEEPS, because
-    // keeping it is the right policy inside a loop. Across b prefills on a node
-    // with 24 GiB of headroom it is not: measured at eight slots, prefills five
-    // through seven took 175 s, 85 s and 26 s against 3.2 s for the first five,
-    // the box went into swap, and the decode that followed spent a hundred
-    // passes climbing back out of it. `memory_cleanup` is a hint and the
-    // allocator decides, but between prefills there is nothing else in flight
-    // for it to decide against.
+    // Seated HERE and not once all b are in, which is what this used to do, and
+    // the difference is the largest memory event in the lane. A prefilled
+    // `AttnCache` costs far more than the keys it holds -- 3.59 GiB against
+    // 0.16 GiB on the 21-layer head at a 3732-token prompt -- and the batch
+    // assembly is what collapsed it. Keeping b of them meant the sixth prefill
+    // ran a 25.8 GiB headroom out of memory. See `dev_lane::SlotCache::seeded`.
+    //
+    // The pool is handed back afterwards, which is not tidiness either: a
+    // prefill's peak is a [heads, query_block, tokens] score matrix, 1.68 GiB
+    // at a 3.7k context, and cubecl keeps the page it was served from because
+    // keeping it is the right policy inside a loop. With nothing of this slot
+    // left alive there is a whole page to hand back, which is exactly what
+    // `memory_cleanup` could not do while the b caches were pinning it.
     if slot_lane && !is_decode {
-        slot_prefills.push(std::mem::take(&mut caches));
+        for (l, c) in caches.drain(..).enumerate() {
+            let kind = t.attn_kind(lo + l);
+            let (_, kv_heads, head_dim) = t.heads(kind);
+            let asc = c.attn_sconv.reshape([1, t.sconv_kernel_size - 1, h]);
+            let msc = c
+                .mlp_sconv
+                .expect("a prefill seeds the MLP convolution")
+                .reshape([1, t.sconv_kernel_size - 1, h]);
+            if step == 0 {
+                slots_dev.push(SlotLayerCache {
+                    attn: dev_lane::SlotCache::seeded(nslots, c.attn, kv_heads, head_dim),
+                    attn_sconv: dev_lane::seat_first3(nslots, asc),
+                    mlp_sconv: Some(dev_lane::seat_first3(nslots, msc)),
+                });
+            } else {
+                slots_dev[l].attn.seat(step, c.attn);
+                dev_lane::seat_row3(&mut slots_dev[l].attn_sconv, step, asc);
+                let mut m = slots_dev[l].mlp_sconv.take().expect("seeded by slot 0");
+                dev_lane::seat_row3(&mut m, step, msc);
+                slots_dev[l].mlp_sconv = Some(m);
+            }
+        }
+        assert_eq!(slots_dev.len(), hi - lo, "the slot batch is missing layers");
         <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync after a slot prefill");
         fp4_client.memory_cleanup();
+        println!(
+            "{}",
+            mary::models::inkling::seam::pool_line(
+                &fp4_client,
+                &format!("prefill {}/{nslots}", step + 1)
+            )
+        );
     }
 
     // ---- the one sync for this node's whole stack --------------------------

@@ -1261,73 +1261,78 @@ fn take3<B: Backend>(slot: &mut Tensor<B, 3>, dev: &B::Device) -> Tensor<B, 3> {
     std::mem::replace(slot, Tensor::empty([1, 1, 1], dev))
 }
 
+/// Write one slot's row into a `[slots, ..]` batch, in place.
+///
+/// `take3` first, because `dst.clone().slice_assign(..)` leaves two live
+/// references to the same buffer and Burn answers that by copying the whole
+/// batch to write one row of it.
+pub fn seat_row3(dst: &mut Tensor<Bk, 3>, s: usize, src: Tensor<Bk, 3>) {
+    let [slots, a, b] = dst.dims();
+    assert!(s < slots, "slot {s} of a {slots}-slot batch");
+    assert_eq!(src.dims(), [1, a, b], "a seated row is one slot of [{a}, {b}]");
+    let dev = src.device();
+    let d = take3(dst, &dev);
+    *dst = d.slice_assign([s..s + 1, 0..a, 0..b], src);
+}
+
+/// A `[slots, ..]` batch with slot 0's row in it and the rest zero.
+pub fn seat_first3(slots: usize, src: Tensor<Bk, 3>) -> Tensor<Bk, 3> {
+    let [one, a, b] = src.dims();
+    assert_eq!(one, 1, "a seated row is one slot");
+    let mut dst: Tensor<Bk, 3> = Tensor::zeros([slots, a, b], &src.device());
+    seat_row3(&mut dst, 0, src);
+    dst
+}
+
 impl SlotCache<Bk> {
-    /// `b` prefilled single-sequence caches, stacked into one slot batch.
+    /// An empty `slots`-wide batch shaped by the FIRST prefilled slot, with
+    /// that slot already seated.
     ///
     /// The prefills run one at a time — a prefill is compute-bound and gains
     /// nothing from a batch — and this is the seam where they become a batch.
     /// Every slot must hold the same number of keys and start at the same
     /// absolute position: that is what makes the rectangular layout legal, and
-    /// it is guaranteed by prompts of equal length rather than assumed.
-    pub fn from_prefills(
-        caches: Vec<AttnCache<Bk>>,
+    /// it is guaranteed by prompts of equal length rather than assumed, one
+    /// slot at a time in [`SlotCache::seat`].
+    ///
+    /// # Why the batch is built now and not when the b-th prefill lands
+    ///
+    /// It used to take all `b` finished caches at once, and holding them was
+    /// the most expensive thing this lane did. A prefilled `AttnCache` is not
+    /// the `keep * kv_width * 4` bytes its contents come to — measured on the
+    /// 21-layer head at eight slots and a 3732-token prompt, each one held
+    /// **3.59 GiB**, against 0.16 GiB of keys and values, and the `cat` in here
+    /// is what collapsed it. Eight of those is 28.7 GiB on a node with 25.8 GiB
+    /// of headroom, so the sixth prefill ran the machine out of memory: the
+    /// first five took 6.7 s each and the sixth through eighth took 118 s,
+    /// 244 s and 57 s, the box swapped, and the decode that followed spent
+    /// dozens of passes climbing back out.
+    ///
+    /// Seating each slot the moment it is prefilled makes the batch the ONLY
+    /// long-lived allocation, and it is made once, from slot 0, before any of
+    /// the churn. Every later prefill leaves nothing behind.
+    pub fn seeded(
+        slots: usize,
+        first: AttnCache<Bk>,
         kv_heads: usize,
         head_dim: usize,
     ) -> SlotCache<Bk> {
-        assert!(!caches.is_empty(), "a slot batch has at least one slot");
-        let slots = caches.len();
+        assert!(slots >= 1, "a slot batch has at least one slot");
+        let len = first.len();
+        let base = first.base();
+        let kernel_hist = first.k_pre.dims()[0];
         let kv_width = kv_heads * head_dim;
-        let len = caches[0].len();
-        let base = caches[0].base();
-        let kernel_hist = caches[0].k_pre.dims()[0];
-        for (s, c) in caches.iter().enumerate() {
-            assert_eq!(c.len(), len, "slot {s} holds {} keys against slot 0's {len}", c.len());
-            assert_eq!(c.base(), base, "slot {s} starts at {} against slot 0's {base}", c.base());
-            assert_eq!(c.k.dims()[1], kv_width, "slot {s} was built at a different layer shape");
-        }
-        let dev = caches[0].k.device();
+        let dev = first.k.device();
         let rows = slots * kv_heads;
         let rec = recent_rows();
-        let bucket = kv_pad_bucket();
-
-        // `[len, kv_heads * head_dim]` -> `[kv_heads, len, head_dim]`, once,
-        // here. Every later step writes and reads head-major and transposes
-        // nothing. The `cat` is what makes the permuted view real: `swap_dims`
-        // returns strides, and a consumer handed strides where it expects a
-        // layout is a launch failure rather than a wrong number.
-        //
-        // The pad is not optional and not for the mask's benefit. `swap_dims`
-        // returns a permuted VIEW; concatenating those views along dim 0 --
-        // which is how the slots become a batch -- produces a tensor this
-        // runtime then fails to `slice_assign` into, with
-        // CUDA_ERROR_INVALID_VALUE and no other symptom. Concatenating along
-        // dim 1 first materialises the permutation, so every per-slot tensor
-        // that reaches the dim-0 concatenation is a real layout. The tell was
-        // that only prefill lengths which were a multiple of the KV pad bucket
-        // died -- those are exactly the ones with nothing to pad.
-        let kcap = (len + 1).next_multiple_of(bucket);
-        let headwise = |t: Tensor<Bk, 2>| -> Tensor<Bk, 3> {
-            let pad: Tensor<Bk, 3> = Tensor::zeros([kv_heads, kcap - len, head_dim], &dev);
-            let body = t.reshape([len, kv_heads, head_dim]).swap_dims(0, 1);
-            Tensor::cat(vec![body, pad], 1)
-        };
-        let mut ks = Vec::with_capacity(slots);
-        let mut vs = Vec::with_capacity(slots);
-        let mut kp = Vec::with_capacity(slots);
-        let mut vp = Vec::with_capacity(slots);
-        for c in caches {
-            ks.push(headwise(c.k));
-            vs.push(headwise(c.v));
-            kp.push(c.k_pre.reshape([1, kernel_hist, kv_width]));
-            vp.push(c.v_pre.reshape([1, kernel_hist, kv_width]));
-        }
-        SlotCache {
-            k: Tensor::cat(ks, 0),
-            v: Tensor::cat(vs, 0),
+        let kcap = (len + 1).next_multiple_of(kv_pad_bucket());
+        let mut c = SlotCache {
+            k: Tensor::zeros([rows, kcap, head_dim], &dev),
+            v: Tensor::zeros([rows, kcap, head_dim], &dev),
             kr: Tensor::zeros([rows, rec, head_dim], &dev),
             vr: Tensor::zeros([rows, rec, head_dim], &dev),
-            k_pre: Tensor::cat(kp, 0),
-            v_pre: Tensor::cat(vp, 0),
+            k_pre: Tensor::zeros([slots, kernel_hist, kv_width], &dev),
+            v_pre: Tensor::zeros([slots, kernel_hist, kv_width], &dev),
             slots,
             kv_heads,
             head_dim,
@@ -1335,7 +1340,73 @@ impl SlotCache<Bk> {
             kcap,
             recent: 0,
             base,
+        };
+        c.seat(0, first);
+        c
+    }
+
+    /// Seat one prefilled slot.
+    ///
+    /// The shape agreement the rectangular layout needs, checked against the
+    /// slot that defined it rather than across a batch that is all present at
+    /// once.
+    pub fn seat(&mut self, s: usize, c: AttnCache<Bk>) {
+        assert!(s < self.slots, "slot {s} of a {}-slot batch", self.slots);
+        assert_eq!(c.len(), self.frozen, "slot {s} holds {} keys against slot 0's {}",
+                   c.len(), self.frozen);
+        assert_eq!(c.base(), self.base, "slot {s} starts at {} against slot 0's {}",
+                   c.base(), self.base);
+        let (kv_heads, head_dim, kcap, len) =
+            (self.kv_heads, self.head_dim, self.kcap, self.frozen);
+        let kv_width = kv_heads * head_dim;
+        assert_eq!(c.k.dims()[1], kv_width, "slot {s} was built at a different layer shape");
+        let dev = c.k.device();
+        let kernel_hist = c.k_pre.dims()[0];
+
+        // `[len, kv_heads * head_dim]` -> `[kv_heads, kcap, head_dim]`. Every
+        // later step writes and reads head-major and transposes nothing.
+        //
+        // The pad is not optional and not for the mask's benefit. `swap_dims`
+        // returns a permuted VIEW, and this runtime fails to `slice_assign` one
+        // — CUDA_ERROR_INVALID_VALUE and no other symptom. Concatenating the
+        // pad along dim 1 materialises the permutation, so what reaches the
+        // batch is a real layout. The tell was that only prefill lengths which
+        // were a multiple of the KV pad bucket died — exactly the ones with
+        // nothing to pad.
+        let headwise = |t: Tensor<Bk, 2>| -> Tensor<Bk, 3> {
+            let pad: Tensor<Bk, 3> = Tensor::zeros([kv_heads, kcap - len, head_dim], &dev);
+            let body = t.reshape([len, kv_heads, head_dim]).swap_dims(0, 1);
+            Tensor::cat(vec![body, pad], 1)
+        };
+        let r0 = s * kv_heads;
+        let k = take3(&mut self.k, &dev);
+        self.k = k.slice_assign([r0..r0 + kv_heads, 0..kcap, 0..head_dim], headwise(c.k));
+        let v = take3(&mut self.v, &dev);
+        self.v = v.slice_assign([r0..r0 + kv_heads, 0..kcap, 0..head_dim], headwise(c.v));
+        seat_row3(&mut self.k_pre, s, c.k_pre.reshape([1, kernel_hist, kv_width]));
+        seat_row3(&mut self.v_pre, s, c.v_pre.reshape([1, kernel_hist, kv_width]));
+    }
+
+    /// `b` prefilled single-sequence caches, stacked into one slot batch.
+    ///
+    /// What [`SlotCache::seeded`] and [`SlotCache::seat`] do over the b prefill
+    /// passes, done at once. Only the tests use it: it is the shortest way to
+    /// say "these b caches, as a batch" when all b are already in hand, and the
+    /// run cannot afford to hold all b.
+    pub fn from_prefills(
+        caches: Vec<AttnCache<Bk>>,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> SlotCache<Bk> {
+        assert!(!caches.is_empty(), "a slot batch has at least one slot");
+        let slots = caches.len();
+        let mut it = caches.into_iter();
+        let first = it.next().expect("a slot batch has at least one slot");
+        let mut batch = SlotCache::seeded(slots, first, kv_heads, head_dim);
+        for (s, c) in it.enumerate() {
+            batch.seat(s + 1, c);
         }
+        batch
     }
 
     /// Append one key and value per slot.
