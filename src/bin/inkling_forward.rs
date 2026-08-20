@@ -2788,6 +2788,7 @@ fn main() -> Result<()> {
         &BT::<Bk, 2>::zeros([1, 1], &dev),
     );
     println!("{}", mary::models::inkling::pile::mem_line("after CUDA context"));
+    println!("{}", mary::models::inkling::seam::pool_line(&fp4_client, "cold"));
     // The one number that decides whether this sequence length is runnable at
     // all, asked of the device rather than modelled. It is checked HERE and not
     // beside the admission gate because this is the first client in the

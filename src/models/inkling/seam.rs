@@ -186,3 +186,31 @@ pub fn client_of<const D: usize>(t: &Tensor<Bk, D>) -> ComputeClient<CudaRuntime
         TensorPrimitive::QFloat(_) => panic!("quantized"),
     }
 }
+
+/// What the device pool has RESERVED against what the run is holding.
+///
+/// The gap between those two is not padding. cubecl's sliced pools hand back a
+/// page only when it is ENTIRELY free (`SlicedPool::cleanup`), so one surviving
+/// slice keeps its whole page, and a long-lived tensor born in the middle of a
+/// burst of transient ones strands everything that shared its page.
+/// `memory_cleanup` cannot help with that — it is the call that just tried.
+///
+/// Worth printing because the growth is invisible in every other number the run
+/// reports. `cuMemAlloc` is driver memory on this part, so a pool that has grown
+/// tens of GiB shows up as a machine with no memory left and a process whose
+/// resident size did not move at all.
+pub fn pool_line(client: &ComputeClient<CudaRuntime>, at: &str) -> String {
+    const GIB: f64 = (1u64 << 30) as f64;
+    match client.memory_usage() {
+        Ok(u) => format!(
+            "    pool[{at}]: {:.2} GiB reserved, {:.2} live, {:.2} padding, {:.2} GiB STRANDED \
+             over {} slices",
+            u.bytes_reserved as f64 / GIB,
+            u.bytes_in_use as f64 / GIB,
+            u.bytes_padding as f64 / GIB,
+            u.bytes_reserved.saturating_sub(u.bytes_in_use + u.bytes_padding) as f64 / GIB,
+            u.number_allocs,
+        ),
+        Err(e) => format!("    pool[{at}]: unavailable ({e:?})"),
+    }
+}
