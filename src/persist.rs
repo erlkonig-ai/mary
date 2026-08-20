@@ -968,7 +968,11 @@ pub fn load_aliased_loader_from_pile(
 pub fn personaplex_loader(
     pile_path: &Path,
 ) -> anyhow::Result<crate::nn::weight_loader::WeightLoader> {
-    let snapshot = crate::model_collection::load_model_collection_local_latest(pile_path)
+    // Which team's model graph? The pile says. Discovering it by name beats
+    // taking it as a parameter here: every caller is a probe binary holding
+    // only a path, so a parameter would just move the guess up one level.
+    let team = crate::model_collection::model_graph_team_at(pile_path)?;
+    let snapshot = crate::model_collection::load_model_collection_local_latest(pile_path, team)
         .with_context(|| format!("load local-latest PersonaPlex snapshot from {pile_path:?}"))?;
     crate::models::personaplex::PersonaPlexWeights::from_snapshot(snapshot)
         .with_context(|| format!("select exact PersonaPlex root from {pile_path:?}"))

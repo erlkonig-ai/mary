@@ -18,7 +18,7 @@
 //! it does not choose a repository/collection migration policy or alter runtime
 //! query declarations.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
@@ -26,7 +26,11 @@ use std::path::Path;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::blob::IntoBlob;
+use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
+use triblespace::core::collection::records::{collection_name, collection_team};
+use triblespace::core::inline::encodings::ed25519::ED25519PublicKey;
+use triblespace::core::inline::encodings::shortstring::ShortString;
+use triblespace::core::trible::TribleSet;
 use triblespace::core::attribute::Attribute;
 use triblespace::core::collection::simplearchive_union::{
     self, PreparationError, PreparedCollectionCommit, PublicationError,
@@ -191,11 +195,12 @@ fn model_graph_collection(team: VerifyingKey) -> SimpleArchiveCollection {
 /// the destination's own reader, and expose authority only by calling
 /// `finalize` after those gates succeed.
 pub fn prepare_model_fragment(
+    team: VerifyingKey,
     signing_key: &SigningKey,
     fragment: Fragment,
 ) -> Result<PreparedCollectionCommit, PreparationError> {
     simplearchive_union::prepare_fragment_commit(
-        &model_graph_collection(signing_key.verifying_key()).descriptor(),
+        &model_graph_collection(team).descriptor(),
         fragment,
         signing_key,
     )
@@ -210,13 +215,14 @@ pub fn prepare_model_fragment(
 /// flushes nor closes it.
 pub fn publish_model_fragment(
     pile: &mut Pile,
+    team: VerifyingKey,
     signing_key: &SigningKey,
     fragment: Fragment,
 ) -> Result<CollectionCommit, PublishModelFragmentError> {
     pile.refresh().map_err(PublishModelFragmentError::Refresh)?;
     simplearchive_union::publish_fragment_commit(
         pile,
-        &model_graph_collection(signing_key.verifying_key()).descriptor(),
+        &model_graph_collection(team).descriptor(),
         fragment,
         signing_key,
     )
@@ -281,6 +287,130 @@ pub fn load_model_collection_from_ticket(
     let mut pile = open_and_refresh_model_pile(path.as_ref())?;
     let snapshot = snapshot_model_collection_exact(&mut pile, team, ticket);
     close_after_snapshot(pile, snapshot)
+}
+
+/// Which teams publish a `mary-model-graph` collection in this pile.
+///
+/// A reader does not have to be told whose collection it wants. The pile is
+/// self-describing: every commit names its collection by descriptor handle,
+/// the descriptor blob is in the pile, and the descriptor states both the name
+/// and the team. So "load the model graph" is a lookup by name, not a fact the
+/// caller has to carry in from somewhere.
+///
+/// Returns every distinct team, not the first one found. One team is the
+/// ordinary case and callers can take it; more than one is a real ambiguity
+/// -- two parties publishing under the same name -- and defaulting to whichever
+/// the record scan happened to reach first would resolve it by accident. The
+/// caller is made to decide because there is no answer here to give it.
+pub fn model_graph_teams(pile: &mut Pile) -> Result<Vec<VerifyingKey>, ReadError> {
+    let wanted = mary_model_graph_name();
+    let mut seen = BTreeSet::new();
+    let mut teams = Vec::new();
+    let mut descriptors = BTreeSet::new();
+    for record in pile.records()? {
+        if let CollectionRecord::Commit(commit) = record? {
+            descriptors.insert(commit.collection());
+        }
+    }
+    let reader = pile.reader()?;
+    for handle in descriptors {
+        let Ok(blob) = reader.get::<Blob<SimpleArchive>, _>(handle.transmute()) else {
+            // A commit naming a descriptor this pile does not hold is a
+            // phantom collection. It is not this function's business to
+            // report, but it must not be mistaken for a match either.
+            continue;
+        };
+        let Ok(facts) = <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(blob) else {
+            continue;
+        };
+        let mut name = None;
+        let mut team = None;
+        for fact in facts.iter() {
+            if *fact.a() == collection_name.id() {
+                name = fact.v::<ShortString>().try_from_inline::<String>().ok();
+            } else if *fact.a() == collection_team.id() {
+                team = VerifyingKey::from_bytes(&fact.v::<ED25519PublicKey>().raw).ok();
+            }
+        }
+        if name.as_deref() == Some(wanted.as_str()) {
+            if let Some(team) = team {
+                if seen.insert(team.to_bytes()) {
+                    teams.push(team);
+                }
+            }
+        }
+    }
+    Ok(teams)
+}
+
+/// The single team publishing a model graph here, or an error naming the
+/// ambiguity.
+///
+/// The convenience form of [`model_graph_teams`] for the ordinary pile, which
+/// has exactly one. It refuses rather than guesses in both directions: no
+/// model graph at all, and more than one, are different failures and say so.
+pub fn sole_model_graph_team(pile: &mut Pile) -> Result<VerifyingKey, SoleModelGraphTeamError> {
+    let teams = model_graph_teams(pile).map_err(SoleModelGraphTeamError::Read)?;
+    match teams.len() {
+        1 => Ok(teams[0]),
+        0 => Err(SoleModelGraphTeamError::None),
+        _ => Err(SoleModelGraphTeamError::Several {
+            teams: teams.iter().map(|team| team.to_bytes()).collect(),
+        }),
+    }
+}
+
+/// The single team publishing a model graph in the pile at `path`.
+///
+/// The path-taking form, for the common caller that holds a path and nothing
+/// else. It opens, asks, and closes; nothing is left open on either outcome.
+pub fn model_graph_team_at(path: impl AsRef<Path>) -> Result<VerifyingKey, SoleModelGraphTeamError> {
+    let mut pile = open_and_refresh_model_pile(path.as_ref())
+        .map_err(|source| SoleModelGraphTeamError::Open(Box::new(source)))?;
+    let team = sole_model_graph_team(&mut pile);
+    let _ = pile.close();
+    team
+}
+
+/// Why a pile does not have exactly one model-graph team.
+#[derive(Debug)]
+pub enum SoleModelGraphTeamError {
+    /// The pile could not be opened.
+    Open(Box<LoadModelCollectionError>),
+    /// The pile could not be read.
+    Read(ReadError),
+    /// No collection in this pile is named `mary-model-graph`.
+    None,
+    /// Several teams publish that name here; the caller must choose.
+    Several {
+        /// Every team found, in discovery order.
+        teams: Vec<[u8; 32]>,
+    },
+}
+
+impl fmt::Display for SoleModelGraphTeamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open(source) => write!(f, "open the pile: {source}"),
+            Self::Read(source) => write!(f, "read the pile's records: {source}"),
+            Self::None => write!(f, "no collection named `mary-model-graph` in this pile"),
+            Self::Several { teams } => write!(
+                f,
+                "{} teams publish `mary-model-graph` here; name the one you mean",
+                teams.len()
+            ),
+        }
+    }
+}
+
+impl Error for SoleModelGraphTeamError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Open(source) => Some(source.as_ref()),
+            Self::Read(source) => Some(source),
+            Self::None | Self::Several { .. } => None,
+        }
+    }
 }
 
 fn local_model_ticket(pile: &mut Pile, team: VerifyingKey) -> Result<Vec<CollectionCommit>, ReadError> {
@@ -854,45 +984,46 @@ mod tests {
         (fragment, text_handle, payload_handle)
     }
 
+    /// One team for every test in this module.
+    ///
+    /// Authors vary between tests on purpose -- mixed-author admission is a
+    /// property worth testing -- but they all publish into the same
+    /// collection, which is exactly what having a team distinct from the
+    /// signer is for.
+    fn test_team() -> VerifyingKey {
+        SigningKey::from_bytes(&[0x11; 32]).verifying_key()
+    }
+
     fn open_test_pile(path: &Path) -> Pile {
         let mut pile = Pile::open(path).expect("open test pile");
         pile.refresh().expect("refresh test pile");
         pile
     }
 
+    /// The identity of the model-graph collection must not drift silently.
+    ///
+    /// It is now a function of the team as well as the name, so the pinned
+    /// bytes are pinned *for a stated team*. A fixed test key makes that
+    /// explicit rather than leaving the reader to wonder whose collection the
+    /// constant describes.
     #[test]
     fn model_graph_descriptor_is_stable() {
-        let collection = model_graph_collection();
+        let team = SigningKey::from_bytes(&[0x11; 32]).verifying_key();
+        let collection = model_graph_collection(team);
         let descriptor = collection.descriptor();
 
+        assert_eq!(mary_model_graph_name().as_str(), "mary-model-graph");
+        assert_eq!(collection.name(), &mary_model_graph_name());
+        assert_eq!(collection.team(), team);
+
+        let handle = IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()).get_handle();
         assert_eq!(
-            MARY_MODEL_GRAPH_SCOPE,
-            id_hex!("F7A4634F17D8A9799FA2E5C0DD942327")
-        );
-        assert_eq!(collection.scope(), MARY_MODEL_GRAPH_SCOPE);
-        assert_eq!(descriptor.scope(), MARY_MODEL_GRAPH_SCOPE);
-        assert_eq!(
-            descriptor,
-            simplearchive_union::descriptor(MARY_MODEL_GRAPH_SCOPE)
-        );
-        assert_eq!(
-            descriptor.representation(),
-            <SimpleArchive as MetaDescribe>::id()
-        );
-        assert_eq!(
-            descriptor.recipe(),
-            simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1
-        );
-        assert_eq!(
-            descriptor.entity_id(),
-            id_hex!("C2ABA26DCE9B507997F92F597AFD8D46")
-        );
-        assert_eq!(
-            descriptor.handle().raw,
+            handle.raw,
             [
-                0xED, 0x65, 0xD1, 0x94, 0x35, 0x20, 0x4E, 0xC4, 0x9D, 0x08, 0xB6, 0xBF, 0x92, 0x9D,
-                0xE5, 0x5C, 0xA3, 0x29, 0x08, 0x72, 0xF6, 0xA8, 0xDF, 0x3C, 0xA1, 0x38, 0x06, 0x64,
-                0x9E, 0xD0, 0x8A, 0xFE,
+                0x75, 0x8B, 0xBA, 0x4A, 0x8C, 0x01, 0x2B, 0x3B,
+                0xD9, 0xFB, 0xAF, 0xCA, 0x42, 0x0B, 0xA2, 0xD0,
+                0x04, 0xED, 0x7D, 0x7B, 0xAC, 0x3C, 0x23, 0x93,
+                0xBF, 0x32, 0x32, 0x7E, 0x32, 0x95, 0xFC, 0xDF,
             ]
         );
     }
@@ -906,8 +1037,8 @@ mod tests {
         let expected_metafacts = fragment.metafacts().clone();
 
         let mut pile = open_test_pile(file.as_path());
-        let first = publish_model_fragment(&mut pile, &signing_key, fragment.clone()).unwrap();
-        let repeated = publish_model_fragment(&mut pile, &signing_key, fragment).unwrap();
+        let first = publish_model_fragment(&mut pile, test_team(), &signing_key, fragment.clone()).unwrap();
+        let repeated = publish_model_fragment(&mut pile, test_team(), &signing_key, fragment).unwrap();
         assert_eq!(first, repeated);
         assert_eq!(
             first.public_key().raw,
@@ -917,7 +1048,7 @@ mod tests {
 
         // Snapshot directly from the same still-open pile. A duplicate ticket
         // is a mathematical set and therefore returns one canonical commit.
-        let snapshot = snapshot_model_collection_exact(&mut pile, &[repeated, first]).unwrap();
+        let snapshot = snapshot_model_collection_exact(&mut pile, test_team(), &[repeated, first]).unwrap();
         assert_eq!(snapshot.facts(), &expected_facts);
         assert_eq!(snapshot.commits(), &[first]);
 
@@ -930,7 +1061,7 @@ mod tests {
         assert_eq!(&*text, "model attachment roundtrip");
         assert_eq!(&*payload, b"roundtrip");
 
-        let loaded = load_model_collection_from_ticket(file.as_path(), &[first]).unwrap();
+        let loaded = load_model_collection_from_ticket(file.as_path(), test_team(), &[first]).unwrap();
         assert_eq!(loaded.facts(), &expected_facts);
         let text_after_path_close: View<str> = loaded.reader().get(text_handle).unwrap();
         assert_eq!(&*text_after_path_close, "model attachment roundtrip");
@@ -966,9 +1097,9 @@ mod tests {
         facts += model.into_facts();
 
         let commit =
-            publish_model_fragment(&mut pile, &signing_key, Fragment::rooted(model_root, facts))
+            publish_model_fragment(&mut pile, test_team(), &signing_key, Fragment::rooted(model_root, facts))
                 .unwrap();
-        let snapshot = snapshot_model_collection_exact(&mut pile, &[commit]).unwrap();
+        let snapshot = snapshot_model_collection_exact(&mut pile, test_team(), &[commit]).unwrap();
         pile.close().unwrap();
 
         let selected = crate::selection::SelectedModelIndex::from_snapshot(
@@ -998,6 +1129,7 @@ mod tests {
         let first_facts = first_fragment.facts().clone();
         let first = publish_model_fragment(
             &mut pile,
+            test_team(),
             &SigningKey::from_bytes(&[0x21; 32]),
             first_fragment,
         )
@@ -1006,15 +1138,16 @@ mod tests {
         let second_facts = second_fragment.facts().clone();
         let second = publish_model_fragment(
             &mut pile,
+            test_team(),
             &SigningKey::from_bytes(&[0x22; 32]),
             second_fragment,
         )
         .unwrap();
         let (unselected, _, _) = fragment_fixture("unselected");
-        publish_model_fragment(&mut pile, &SigningKey::from_bytes(&[0x23; 32]), unselected)
+        publish_model_fragment(&mut pile, test_team(), &SigningKey::from_bytes(&[0x23; 32]), unselected)
             .unwrap();
 
-        let snapshot = snapshot_model_collection_exact(&mut pile, &[second, first]).unwrap();
+        let snapshot = snapshot_model_collection_exact(&mut pile, test_team(), &[second, first]).unwrap();
         let mut expected = first_facts;
         expected += second_facts;
         let mut expected_commits = vec![first, second];
@@ -1033,6 +1166,7 @@ mod tests {
         let first_facts = first_fragment.facts().clone();
         let first = publish_model_fragment(
             &mut pile,
+            test_team(),
             &SigningKey::from_bytes(&[0x31; 32]),
             first_fragment,
         )
@@ -1041,13 +1175,16 @@ mod tests {
         let second_facts = second_fragment.facts().clone();
         let second = publish_model_fragment(
             &mut pile,
+            test_team(),
             &SigningKey::from_bytes(&[0x32; 32]),
             second_fragment,
         )
         .unwrap();
 
-        let foreign_scope = Id::new([0x45; 16]).unwrap();
-        let foreign_descriptor = simplearchive_union::descriptor(foreign_scope);
+        // "Foreign" now means a different name under the same team, which is
+        // the shape a real unrelated collection takes.
+        let foreign_name = CollectionName::new("not-the-model-graph").unwrap();
+        let foreign_descriptor = simplearchive_union::descriptor(&foreign_name, test_team());
         let (foreign_fragment, _, _) = fragment_fixture("foreign");
         let foreign = simplearchive_union::publish_fragment_commit(
             &mut pile,
@@ -1063,7 +1200,7 @@ mod tests {
         pile.insert(CollectionRecord::Commit(invalid_foreign))
             .unwrap();
 
-        let in_place = snapshot_model_collection_local_latest(&mut pile).unwrap();
+        let in_place = snapshot_model_collection_local_latest(&mut pile, test_team()).unwrap();
         let mut expected = first_facts.clone();
         expected += second_facts.clone();
         let mut expected_commits = vec![first, second];
@@ -1072,7 +1209,7 @@ mod tests {
         assert_eq!(in_place.commits(), expected_commits);
         pile.close().unwrap();
 
-        let snapshot = load_model_collection_local_latest(file.as_path()).unwrap();
+        let snapshot = load_model_collection_local_latest(file.as_path(), test_team()).unwrap();
         assert_eq!(snapshot.facts(), &expected);
         assert_eq!(snapshot.commits(), expected_commits);
         assert!(snapshot
@@ -1087,7 +1224,7 @@ mod tests {
         let mut pile = open_test_pile(file.as_path());
         let (fragment, _, _) = fragment_fixture("invalid-matching");
         let valid =
-            publish_model_fragment(&mut pile, &SigningKey::from_bytes(&[0x41; 32]), fragment)
+            publish_model_fragment(&mut pile, test_team(), &SigningKey::from_bytes(&[0x41; 32]), fragment)
                 .unwrap();
         let mut invalid_bytes = valid.to_bytes();
         *invalid_bytes.last_mut().unwrap() ^= 1;
@@ -1097,7 +1234,7 @@ mod tests {
         pile.insert(CollectionRecord::Commit(invalid)).unwrap();
         pile.close().unwrap();
 
-        let error = match load_model_collection_local_latest(file.as_path()) {
+        let error = match load_model_collection_local_latest(file.as_path(), test_team()) {
             Ok(_) => panic!("invalid matching commit unexpectedly materialized"),
             Err(error) => error,
         };
@@ -1123,7 +1260,7 @@ mod tests {
             .unwrap();
         let before = std::fs::metadata(file.as_path()).unwrap().len();
 
-        let error = match load_model_collection_local_latest(file.as_path()) {
+        let error = match load_model_collection_local_latest(file.as_path(), test_team()) {
             Ok(_) => panic!("corrupt pile unexpectedly loaded"),
             Err(error) => error,
         };
