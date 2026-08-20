@@ -3927,7 +3927,12 @@ fn main() -> Result<()> {
     // scalar host arithmetic), and a debug dump. A whole-stack or tail process
     // that is not drafting never materialises it -- the head reads `xd`.
     let want_host_x = is_head || mtp_k > 0 || dump_dir.is_some();
+    // Timed, and it is the head's alone: a tail never materialises the stream.
+    // Untimed, this read was the largest single entry in a report that claims
+    // to say where a pass went, and at 48 slots it was two thirds of one.
+    let t_dn = Instant::now();
     let x: Vec<f32> = if want_host_x { down(xd.clone()) } else { Vec::new() };
+    let t_x_down = t_dn.elapsed().as_secs_f64();
 
     // Does anything downstream need a logit row that is NOT the last one?
     //
@@ -4833,6 +4838,17 @@ fn main() -> Result<()> {
             "device"
         }
     );
+    println!("    residual to the host{:9.1}   (the [n, hidden] the wire and the draft path read)",
+             ms(t_x_down));
+    // The report is a partition or it is decoration. Everything above is a
+    // stage; this is the pass MINUS the stages, and a run that grows it is a
+    // run doing work no line here names.
+    {
+        let named = t_embed + t_attn + t_other + t_stack_sync + t_head + t_x_down;
+        let whole = pass.elapsed().as_secs_f64();
+        println!("    UNATTRIBUTED    {:9.1}   (this pass, {:.1} ms, less every stage above)",
+                 ms(whole - named), ms(whole));
+    }
     println!("    of the above, host-only tensor reads (mmap + BF16 widening): {:9.1}", ms(t_read.get()));
     {
         // What the HOST did in the routed-expert lane, one bucket per kind of
