@@ -307,18 +307,156 @@
 //! nothing else -- the same divergence a speculative run shows, reproduced with
 //! no speculation anywhere in the process.
 //!
-//! ## What batching would still need
+//! ## What batching needed, and what it turned out to cost
 //!
 //! [`dev_lane::attention_steps`] takes ONE cache and `pos0`, puts row `i` at
 //! `pos0 + i`, and masks row `i` against every earlier row of the batch -- it
 //! is contiguous and causal by construction, which is what a speculative batch
-//! is and what `b` independent sequences are not. Real batching wants `b`
-//! caches, `b` positions and a block-diagonal mask instead of a causal one. The
-//! rest of the layer -- every projection, the router, the expert gather, the
-//! unembedding -- takes `[b, hidden]` unchanged, which is why the cost above is
-//! the right price for a thing that does not exist yet.
+//! is and what `b` independent sequences are not. That is what `INK_SLOTS`
+//! below builds, and the answer is in the next section: a real b-slot pass came
+//! out CHEAPER than this probe's, because the layout the slots needed was
+//! cheaper than the one the single-row lane had.
 //!
-
+//! # `INK_SLOTS=b`: b independent sequences, one pass, b tokens
+//!
+//! The feature the probe above was an instrument for. `b` slots, each with its
+//! own KV cache and its own token stream; one pass advances all of them by one
+//! token. [`dev_lane::SlotCache`] and [`dev_lane::attention_slots`] are the
+//! whole of it, and the "block-diagonal mask" the probe said this would need
+//! does not exist: K and V are held `[slots * kv_heads, cap, head_dim]` and the
+//! scores are a batched matmul over that leading axis, so slot `s`'s query
+//! multiplies slot `s`'s keys and there is no mask element whose sign could be
+//! wrong.
+//!
+//! The `b` prompts are `b` DISJOINT chunks of one token file, `INK_SLOT_LEN`
+//! apart, and `INK_SLOT_OFFSETS` names the chunk per slot. Slot 0's text
+//! therefore does not move when `b` changes, which is what makes the arms
+//! comparable and what makes the contamination test possible. A prefill is
+//! compute-bound and gains nothing from a batch, so the `b` of them run one at
+//! a time and the batch begins where the decoding does.
+//!
+//! ## What it costs
+//!
+//! Warm p50 of the whole cycle, at least two runs per arm, two-node pipe,
+//! layers 0:21 and 21:42, `INK_KV=1`, `/tmp/cover_150000.ids` (35,845 tokens of
+//! prose; slot `s` takes `[s*L, (s+1)*L)`). "one-row" is the same binary with
+//! `INK_SLOTS` unset -- [`dev_lane::attention_step`], which is what every
+//! measurement before this one was taken on. `c(b)` is against the mean of the
+//! `b = 1` SLOT-lane runs, not against the one-row lane: those are two
+//! implementations of the same function, and mixing them into one ratio would
+//! charge batching for a layout change.
+//!
+//!   L = 512, ctx 512 -> 612           L = 3732, ctx 3732 -> 3852
+//!    b   p50 ms       c(b)   tok/s     b   p50 ms             c(b)   tok/s
+//!    -   133.3 135.2    -    7.5 7.4   -   150.5 150.1          -    6.65 6.66
+//!    1   125.5 134.1  1.000  8.0 7.5   1   135.6 130.5        1.000  7.38 7.67
+//!    2   178.5 168.6  1.337  11.2 11.9 2   184.1 183.7        1.382  10.87 10.89
+//!    4   207.6 212.0  1.617  19.3 18.9 4   219.5 219.8 222.0  1.657  18.2 18.2 18.0
+//!    8   277.8 273.6  2.124  28.8 29.2 6   282.9 296.1        2.176  21.2 20.3
+//!                                      8   311.4 325.2 373.0  2.529  25.7 24.6 21.4
+//!
+//! **Eight independent sequences decode at 3.7x one**, and at a 3.7k context
+//! each of them still carries its own 3792-key cache and reads it in full on
+//! every pass. Nearly the whole penalty is the step at the SECOND row, exactly
+//! as the probe found: from `b = 2` to `b = 8`, four times the sequences cost
+//! 1.83 times the pass.
+//!
+//! **The layout change is worth its own line.** At `b = 1` the slot lane is
+//! 130-136 ms where the one-row lane is 150 ms at a 3.7k context, and 125-134
+//! against 133-135 at 512. [`dev_lane::attention_step`] holds K as
+//! `[len, kv_heads * head_dim]` and expands it per step to
+//! `[heads, len, head_dim]`, repeating each KV head `groups` times so the score
+//! matmul is one GEMM over `heads`: 63 MB a layer at 3.8k keys, twice, on every
+//! layer of every step. The slot cache is head-major and moves the repetition to
+//! the QUERY side, where the `groups` queries sharing a KV head become the `m`
+//! rows of that head's GEMM and cost nothing. One sequence gets that for free.
+//!
+//! ## What the probe overcharged, and by how much
+//!
+//! The probe bounded the b-th cache read at `(b - 1) x 26.9` ms, on the
+//! reasoning that one sequence's extra 3727 keys cost the one-row lane
+//! 151.6 - 124.7 ms a pass. Measured with `b` real caches each read in full, the
+//! whole 512 -> 3732 context step costs **3.3 ms at b = 1, 10.3 ms at b = 2 and
+//! 9.9 ms at b = 4 -- for the entire batch**, not per sequence. The bound was
+//! five to ten times too pessimistic, and the reason is the expansion above:
+//! most of the one-row lane's context delta was a copy that grows with the
+//! context, not the attention it was attributed to.
+//!
+//! So the probe's corrected figures are wrong in the safe direction. It
+//! predicted 313 ms and 12.8 aggregate tok/s at `b = 4` and ctx 3792; measured,
+//! with four independent caches, it is **220 ms and 18.2 tok/s** -- better than
+//! the probe's own UNCORRECTED number (231.8 ms, 17.26 tok/s), which is the
+//! shape of a correction that was measuring the wrong thing.
+//!
+//! ## Above four slots at a 3.7k context the node, not the arithmetic, decides
+//!
+//! `b` up to 4 is reproducible to a millisecond. At 6 and 8 the pass time is
+//! BIMODAL: the machine reaches 243-280 ms and holds it for stretches, and then
+//! spends passes at five, ten, thirty times that. The p50 over 120 passes has
+//! come out anywhere from 283 to 657 ms at `b = 6` and 311 to 1465 at `b = 8`
+//! across runs of the same binary on the same prompts, and the maxima are
+//! multi-SECOND passes. The tail node is stable throughout -- its own decode
+//! passes settle at ~145 ms and stay there. The head is not, and it is the
+//! constrained end because it carries 82.73 GiB of weights and the embedding
+//! table against the tail's 76.14 GiB and no embedding: 27 GiB of headroom
+//! against 31.
+//!
+//! It is not the KV cache, which is 1.26 GiB for eight slots over the head's 21
+//! layers. Part of it is cubecl's page ladder: a layer's frozen K at eight slots
+//! and 3.8k keys is `[64, 3776, 128]` f32 = **124 MB**, the rungs are
+//! `max_page_size / 4^k` = 478 MB, 117 MB, ..., and 124 is just over 117, so
+//! each of the 42 buffers takes a 478 MB page and the set occupies ~20 GiB
+//! instead of 3.9. That is a plausible account of the step at `b = 8` and it
+//! does NOT account for `b = 6` and `b = 7`, whose buffers are 93 and 108 MB and
+//! stay a rung down. So the honest statement is that four slots is where
+//! reproducibility ends on THIS split, and that the eight-slot figures above are
+//! the good runs and are reported as such.
+//!
+//! Three ways past it, none of them tuning: chunk the frozen half so no buffer
+//! crosses a rung, which is a paged KV cache and is also what a real slot
+//! scheduler wants; hold K and V as BF16, which halves both the buffer and the
+//! bandwidth; or move a layer off the head, which the split is free to do
+//! because the two ends are already asymmetric in weight.
+//!
+//! ## The prefill is a second, separate memory event
+//!
+//! `b` prefills run one after another and each peaks on a
+//! `[heads, query_block, tokens]` score matrix -- 1.68 GiB at 3.7k, served out
+//! of a whole 1.87 GiB page that the pool then keeps. Across eight of them the
+//! node goes into swap: prefills five through seven took 175 s, 85 s and 26 s
+//! against 3.2 s for the first five. The loop now syncs and calls
+//! `memory_cleanup` after each slot's prefill and again once the batch is
+//! assembled, which took those three to 13 s, 17 s and 41 s. It is a hint and
+//! the allocator decides; between prefills there is nothing else in flight for
+//! it to decide against.
+//!
+//! ## The contamination test, which is the one this can fail
+//!
+//! Batch contamination -- slot `s` reading slot `s'`'s keys -- produces fluent
+//! text and no error, so it has to be looked for deliberately, and it cannot be
+//! looked for by comparing `b = 8` against `b = 1`: those already disagree on
+//! this model because `gemv plane par` requires `m == 1` and a wider pass loses
+//! it. So the test holds `b` FIXED at 8 and changes only the neighbours.
+//!
+//! Whole stack, 512-token prompts, 20 decode passes:
+//!
+//! * slot 0 beside seven DIFFERENT chunks and slot 0 beside seven copies of
+//!   itself emit the **identical** 20-token stream, token for token;
+//! * the eight slots in the first of those emit eight distinct continuations,
+//!   so the agreement is not a batch that collapsed into one sequence;
+//! * the second emits eight identical tokens on every step, which is the
+//!   symmetry the batch has to have and does not get for free;
+//! * held to one GEMM lane (`INK_GEMM='double cyclic mma'`), `b = 8` with eight
+//!   identical slots reproduces `b = 1` on the layer-RMS ladder -- 0.0000 on ten
+//!   of twelve passes and one unit in the last printed decimal on the other two
+//!   -- and the two token streams are identical.
+//!
+//! At the layer level the same question is asked against the UNCACHED lane:
+//! eight slots carrying eight different sequences, each held to its own
+//! whole-sequence run, is BIT-IDENTICAL on a global layer and 1.15e-2 on a local
+//! one, which is the TF32-against-banded-prefill gap the existing cached-local
+//! test already sits at (`slots_stay_independent_on_a_*_layer` in `burn.rs`).
+//!
 //! # One lane, all the way down
 //!
 //! There is nothing to select. Attention, the dense and shared MLPs, the head
@@ -2059,12 +2197,65 @@ fn main() -> Result<()> {
     );
     anyhow::ensure!(!is_tail || lo > 0, "a tail that starts at layer 0 has nothing to receive");
 
-    let mut ids: Vec<usize> = std::fs::read(&ids_path)?
+    let corpus: Vec<usize> = std::fs::read(&ids_path)?
         .chunks_exact(8)
         .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as usize)
         .collect();
+    anyhow::ensure!(!corpus.is_empty(), "no tokens — the forward would be vacuous");
+
+    // ---- INK_SLOTS=b: b INDEPENDENT sequences, decoded together ------------
+    //
+    // Not `INK_WIDTH=b`, which is the cost probe this is the thing it priced:
+    // that one widens the pass with filler and commits row 0, so its rows are
+    // one sequence's and its cache is one cache. These rows are b sequences
+    // with b caches, and the only thing they share is the weight stream -- see
+    // [`dev_lane::SlotCache`], which is where the sharing actually pays.
+    //
+    // The b prompts are b DISJOINT chunks of one token file, `slot_len` apart:
+    // one corpus, b different pieces of real prose, and slot 0's piece does not
+    // move when b changes. That last property is what makes the arms
+    // comparable and what makes the contamination test possible, because
+    // `INK_SLOT_OFFSETS` can then put slot 0 beside seven different neighbours
+    // at the SAME b -- holding the GEMM lane fixed while the neighbours change,
+    // which is the only way to tell contamination from the m == 1 width effect
+    // that already makes b = 1 and b > 1 disagree.
+    let slot_lane = std::env::var("INK_SLOTS").is_ok();
+    let nslots: usize =
+        std::env::var("INK_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    anyhow::ensure!(nslots >= 1, "INK_SLOTS counts sequences and starts at 1");
+    let slot_len: usize = std::env::var("INK_SLOT_LEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if slot_lane { corpus.len() / nslots } else { corpus.len() });
+    anyhow::ensure!(slot_len > 0, "INK_SLOT_LEN is a prompt length and starts at 1");
+    let slot_at: Vec<usize> = match std::env::var("INK_SLOT_OFFSETS") {
+        Ok(v) => v
+            .split(',')
+            .map(|c| c.trim().parse::<usize>())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("INK_SLOT_OFFSETS is a comma-separated list of chunk indices")?,
+        Err(_) => (0..nslots).collect(),
+    };
+    anyhow::ensure!(
+        slot_at.len() == nslots,
+        "INK_SLOT_OFFSETS names {} chunks against INK_SLOTS={nslots}",
+        slot_at.len()
+    );
+    for &c in &slot_at {
+        anyhow::ensure!(
+            (c + 1) * slot_len <= corpus.len(),
+            "chunk {c} of {slot_len} tokens runs past a {}-token file",
+            corpus.len()
+        );
+    }
+    let mut slot_ids: Vec<Vec<usize>> =
+        slot_at.iter().map(|&c| corpus[c * slot_len..(c + 1) * slot_len].to_vec()).collect();
+    // `ids` is slot 0's stream. Every report that indexes a position -- the
+    // per-position top-5, the MTP scoring, the final dump -- reads it, and one
+    // sequence is what those were written about; the other slots keep their own
+    // streams and are reported as a batch.
+    let mut ids: Vec<usize> = slot_ids[0].clone();
     let n = ids.len();
-    anyhow::ensure!(n > 0, "no tokens — the forward would be vacuous");
     // So a crash can name what caused it. Set again per pass below, because a
     // pipe tail takes its length from the wire and a cached step feeds one
     // token, and both are the number that would appear in a refused size.
@@ -2084,6 +2275,13 @@ fn main() -> Result<()> {
         pile_path.display(),
     );
     println!("  tokens     : {n}  {ids:?}");
+    if slot_lane {
+        println!(
+            "  slots      : INK_SLOTS={nslots} -- {nslots} independent sequences of {slot_len} \
+             tokens, chunks {slot_at:?} of a {}-token file",
+            corpus.len()
+        );
+    }
     println!("  layers     : {}  hidden {h}  experts {}+{} shared",
              t.num_hidden_layers, t.n_routed_experts, t.n_shared_experts);
     println!(
@@ -2169,6 +2367,31 @@ fn main() -> Result<()> {
     let attn_heads = t.heads(AttnKind::Global).0.max(t.heads(AttnKind::Local).0);
     let attn_head_dim = t.heads(AttnKind::Global).2.max(t.heads(AttnKind::Local).2);
     let attention_bytes = budget::prefill_peak_bytes(attn_heads, n);
+    // What b slots hold in K and V once they are all prefilled. A global
+    // layer keeps the whole context, a local one keeps its window, and both
+    // keep K and V -- so this is the term that multiplies with the batch and
+    // the one an admission gate written for a single sequence does not have.
+    let slot_kv_bytes: u64 = if slot_lane {
+        (lo..hi)
+            .map(|layer| {
+                let kind = t.attn_kind(layer);
+                let (_, kv_heads, head_dim) = t.heads(kind);
+                let keep = match kind {
+                    AttnKind::Local => t.sliding_window_size.min(n + gen_steps),
+                    AttnKind::Global => n + gen_steps,
+                };
+                2 * nslots as u64 * keep as u64 * (kv_heads * head_dim) as u64 * 4
+            })
+            .sum()
+    } else {
+        0
+    };
+    if slot_lane {
+        println!(
+            "  slot KV            : {:.2} GiB for {nslots} slots over layers {lo}..{hi}",
+            slot_kv_bytes as f64 / GIB
+        );
+    }
 
     let want_embed = !is_tail || mtp_k > 0;
     let want_embed_norm = !is_tail;
@@ -2188,7 +2411,8 @@ fn main() -> Result<()> {
             globals.push("model.llm.unembed.weight");
         }
         let t0 = Instant::now();
-        let (experts, dense, bytes) = cp.copy_share(lo..hi, &globals, attention_bytes)?;
+        let (experts, dense, bytes) =
+            cp.copy_share(lo..hi, &globals, attention_bytes + slot_kv_bytes)?;
         println!(
             "  startup weight copy: {experts} expert + {dense} dense views, {:.2} GiB anonymous in {:.1}s",
             bytes as f64 / GIB,
@@ -2478,6 +2702,24 @@ fn main() -> Result<()> {
         println!("  width probe        : INK_WIDTH={width} -- every cached step is {width} rows, \
                   one of them real");
     }
+    anyhow::ensure!(!slot_lane || kv, "INK_SLOTS wants INK_KV=1: a slot IS a cache");
+    anyhow::ensure!(
+        !slot_lane || width == 1,
+        "INK_WIDTH prices a b-row pass with filler; INK_SLOTS runs one with b sequences in it, \
+         and setting both would put filler rows in a batch that already has real ones"
+    );
+    anyhow::ensure!(!slot_lane || spec_k == 0, "INK_SLOTS and INK_SPEC both widen the pass");
+    anyhow::ensure!(
+        !slot_lane || mtp_k == 0,
+        "INK_SLOTS and INK_MTP: drafting follows one sequence and there are {nslots} here"
+    );
+    anyhow::ensure!(!slot_lane || !repeat, "INK_REPEAT and INK_SLOTS measure different things");
+    if slot_lane {
+        println!(
+            "  batched decode     : INK_SLOTS={nslots} -- {nslots} caches, one pass, {nslots} \
+             tokens a pass"
+        );
+    }
     // Head d's first STABLE row sits at position seq-1-d, so a prompt shorter
     // than the number of heads leaves a depth with no stable row at all: every
     // position of that head would be a function of drafts and the cache would
@@ -2720,6 +2962,25 @@ fn main() -> Result<()> {
     }
     let mut caches: Vec<LayerCache> = Vec::new();
 
+    // The same, for b slots. Every field is its single-sequence twin with a
+    // leading slot dimension, and the reason there is a second struct rather
+    // than a generalised one is that they are not two settings of a thing:
+    // `LayerCache` can be rolled back to an accepted prefix (that is what the
+    // `_pending` fields are for) and a slot batch has nothing to roll back,
+    // because every row of it is a token the model chose for its own sequence.
+    struct SlotLayerCache {
+        attn: dev_lane::SlotCache<Bk>,
+        /// `[slots, kernel - 1, hidden]`.
+        attn_sconv: BT<Bk, 3>,
+        mlp_sconv: Option<BT<Bk, 3>>,
+    }
+    // One `Vec<LayerCache>` per slot, filled by that slot's prefill pass, and
+    // consumed once when the first decode pass stacks them. A prefill is
+    // compute-bound and gains nothing from a batch, so the b of them run one at
+    // a time and the batch begins where the decoding does.
+    let mut slot_prefills: Vec<Vec<LayerCache>> = Vec::new();
+    let mut slots_dev: Vec<SlotLayerCache> = Vec::new();
+
     // The wire, opened AFTER the weights so a connection is never left hanging
     // while the other end spends a minute building its index. The tail binds and
     // waits; the head connects, so the tail must be started first.
@@ -2831,6 +3092,12 @@ fn main() -> Result<()> {
     // zero, and a zero that is measured beats a branch that hides it.
     let t_recv = t_rv.elapsed().as_secs_f64();
 
+    // A prefill per slot, then one decode pass per token per slot. With no
+    // slot lane `prefill_passes` is 1 and `is_decode` is the `step > 0` this
+    // replaces, character for character.
+    let prefill_passes = if slot_lane { nslots } else { 1 };
+    let is_decode = step >= prefill_passes;
+
     let pass = Instant::now();
     let io0 = io_read_bytes();
     cp.io_reset();
@@ -2846,7 +3113,21 @@ fn main() -> Result<()> {
     // `pos0` is that token's ABSOLUTE position, which is what log scaling and
     // the relative bias are functions of -- it is only equal to zero on a pass
     // that starts from the beginning.
-    let (feed, pos0): (Vec<usize>, usize) = if kv && step > 0 {
+    let (feed, pos0): (Vec<usize>, usize) = if slot_lane && is_decode {
+        // One row per slot: the token that slot's own previous pass produced.
+        // Every slot stands at the same absolute position because they were
+        // prefilled with prompts of the same length and have advanced together
+        // ever since -- see [`dev_lane::SlotCache`] for what that buys.
+        (
+            slot_ids
+                .iter()
+                .map(|q| *q.last().expect("every slot's prefill produced a token"))
+                .collect(),
+            slot_ids[0].len() - 1,
+        )
+    } else if slot_lane {
+        (slot_ids[step].clone(), 0)
+    } else if kv && step > 0 {
         // The verify batch: the token the last pass confirmed, then the tail's
         // drafts for the positions after it. `drafts_in` is empty unless this
         // is a speculating head, so the non-speculative shape is the same one
@@ -2866,6 +3147,44 @@ fn main() -> Result<()> {
     } else {
         (ids.clone(), 0)
     };
+    // The b prefilled caches become one slot batch, once, on the first pass
+    // that decodes. Layer by layer, because a layer's KV width is a function of
+    // its kind and a local layer's is not a global one's.
+    if slot_lane && is_decode && slots_dev.is_empty() {
+        assert_eq!(slot_prefills.len(), nslots, "a slot did not prefill");
+        for l in 0..(hi - lo) {
+            let kind = t.attn_kind(lo + l);
+            let (_, kv_heads, head_dim) = t.heads(kind);
+            let mut attn = Vec::with_capacity(nslots);
+            let mut asc = Vec::with_capacity(nslots);
+            let mut msc = Vec::with_capacity(nslots);
+            for per_slot in slot_prefills.iter() {
+                let c = &per_slot[l];
+                attn.push(c.attn.clone());
+                asc.push(c.attn_sconv.clone().reshape([1, t.sconv_kernel_size - 1, h]));
+                msc.push(
+                    c.mlp_sconv
+                        .clone()
+                        .expect("a prefill seeds the MLP convolution")
+                        .reshape([1, t.sconv_kernel_size - 1, h]),
+                );
+            }
+            slots_dev.push(SlotLayerCache {
+                attn: dev_lane::SlotCache::from_prefills(attn, kv_heads, head_dim),
+                attn_sconv: BT::cat(asc, 0),
+                mlp_sconv: Some(BT::cat(msc, 0)),
+            });
+        }
+        slot_prefills.clear();
+        // And the pages the b per-slot caches were living in. They are gone as
+        // Rust values the moment `slot_prefills` clears, and the pool keeps
+        // their pages: 336 buffers of 15.5 MB at eight slots over 21 layers,
+        // each rounded up to a rung of the ladder, is several GiB held for
+        // tensors that no longer exist -- on the node with 27 GiB of headroom,
+        // which is about to allocate the batched cache out of it.
+        <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync after the slot batch");
+        fp4_client.memory_cleanup();
+    }
     // The tail is handed the stream the head already embedded and ran; it takes
     // `n` and `pos0` from the wire rather than from `ids`, because those are
     // facts about the pass and only the head owns the token loop.
@@ -3136,7 +3455,21 @@ fn main() -> Result<()> {
         // how far back a query may look, and therefore how much of the cache
         // can never be read again.
         let window = if is_local { Some(t.sliding_window_size) } else { None };
-        let a = if kv && step > 0 && n > 1 {
+        let a = if slot_lane && is_decode {
+            // b sequences, one position each, one pass. `attention_steps` is
+            // the wrong function here and not by a little: its rows are
+            // consecutive positions of ONE sequence and its mask admits every
+            // earlier row of the batch, which for independent slots is exactly
+            // the contamination this lane exists to make impossible.
+            let y = dev_lane::attention_slots(
+                hn, &ld.attn, &dims, Some(ls), pos0, window, &mut slots_dev[slot].attn,
+            );
+            let (out, hist) = dev_lane::short_conv_slot_step(
+                slots_dev[slot].attn_sconv.clone(), y, ld.attn_sconv.clone(),
+            );
+            slots_dev[slot].attn_sconv = hist;
+            out
+        } else if kv && is_decode && n > 1 {
             // The speculative width. `attention_steps` leaves the batch PENDING
             // and the convolution keeps its whole window, so neither is final
             // until the verifier below says how many rows survived. Nothing
@@ -3149,7 +3482,7 @@ fn main() -> Result<()> {
             );
             caches[slot].attn_sconv_pending = Some(all);
             out
-        } else if kv && step > 0 {
+        } else if kv && is_decode {
             let y = dev_lane::attention_step(
                 hn, &ld.attn, &dims, Some(ls), pos0, window, &mut caches[slot].attn,
             );
@@ -3436,8 +3769,16 @@ fn main() -> Result<()> {
         // The MLP half's own short convolution carries state across generated
         // tokens exactly as attention's do.
         let t_sc = Instant::now();
-        let y = if kv {
-            if step > 0 {
+        let y = if slot_lane && is_decode {
+            let hist = slots_dev[slot]
+                .mlp_sconv
+                .clone()
+                .expect("a slot batch carries its own convolution memory");
+            let (out, next) = dev_lane::short_conv_slot_step(hist, y, ld.mlp_sconv.clone());
+            slots_dev[slot].mlp_sconv = Some(next);
+            out
+        } else if kv {
+            if is_decode {
                 let hist = caches[slot]
                     .mlp_sconv
                     .clone()
@@ -3480,6 +3821,25 @@ fn main() -> Result<()> {
         // sqrt(mean(x^2)) over the whole [n, h] stream. Read after the stack.
         layer_rms.push(xd.clone().powf_scalar(2.0).mean().reshape([1, 1]));
         layer_kind.push((layer, is_local));
+    }
+
+    // This slot is prefilled; the next one starts from an empty `caches` and
+    // the batch is assembled once all b are in.
+    //
+    // And the pool is handed back, which is not tidiness. A prefill's peak is a
+    // [heads, query_block, tokens] score matrix -- 1.68 GiB at a 3.7k context,
+    // which cubecl serves out of a whole 1.87 GiB page and then KEEPS, because
+    // keeping it is the right policy inside a loop. Across b prefills on a node
+    // with 24 GiB of headroom it is not: measured at eight slots, prefills five
+    // through seven took 175 s, 85 s and 26 s against 3.2 s for the first five,
+    // the box went into swap, and the decode that followed spent a hundred
+    // passes climbing back out of it. `memory_cleanup` is a hint and the
+    // allocator decides, but between prefills there is nothing else in flight
+    // for it to decide against.
+    if slot_lane && !is_decode {
+        slot_prefills.push(std::mem::take(&mut caches));
+        <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync after a slot prefill");
+        fp4_client.memory_cleanup();
     }
 
     // ---- the one sync for this node's whole stack --------------------------
@@ -3558,8 +3918,14 @@ fn main() -> Result<()> {
     // Every row is unembedded, and that is deliberate: b independent sequences
     // each need their own logits, so a probe that unembedded one row would
     // leave the widest matmul in the stack out of the price.
-    let probe_rows = if spec_k == 0 && kv && step > 0 && n > 1 { n } else { 1 };
-    let logit_row0 = if all_logits || probe_rows > 1 { 0 } else { n - verify_rows };
+    let probe_rows = if spec_k == 0 && kv && is_decode && n > 1 && !slot_lane { n } else { 1 };
+    // The rows a slot batch reads an argmax off: all of them, because each one
+    // is a different sequence and each one's next token is a fact about it.
+    // This is the widest matmul in the stack run at its real width, which is
+    // the half of batched decode the width probe was already honest about.
+    let slot_rows = if slot_lane && is_decode { n } else { 1 };
+    let logit_row0 =
+        if all_logits || probe_rows > 1 || slot_rows > 1 { 0 } else { n - verify_rows };
     let (mut t_send, mut t_wait_peer) = (0f64, 0f64);
     let mut wire_toks: Vec<usize> = Vec::new();
     let logits = if let Some(Pipe::Head(s)) = pipe.as_mut() {
@@ -3651,6 +4017,11 @@ fn main() -> Result<()> {
                     accepted += 1;
                 }
                 new_toks = preds[..=accepted].to_vec();
+            } else if slot_rows > 1 {
+                // One argmax per SLOT. Nothing is accepted or rejected here --
+                // a slot batch has no drafts, every row was fed a token its own
+                // sequence confirmed, and every row's prediction is kept.
+                new_toks = (0..rows).map(argmax_of).collect();
             } else if probe_rows > 1 {
                 // Row 0 is the sequence; rows 1.. are the probe's filler and
                 // their argmaxes are about nothing. Reading row 0 and not the
@@ -3662,6 +4033,10 @@ fn main() -> Result<()> {
             *new_toks.last().expect("at least one row is always confirmed")
         }
     };
+    // `ids`, the MTP scoring and the per-position report were all written about
+    // ONE sequence, and slot 0 is the one they follow. `best` is therefore slot
+    // 0's token and not the last row's, which is what it means everywhere else.
+    let best = if slot_lane && is_decode { new_toks[0] } else { best };
     let mut t_to_reply = 0f64;
     if let Some(Pipe::Tail(s)) = pipe.as_mut() {
         send_toks(s, &new_toks)?;
@@ -3671,8 +4046,21 @@ fn main() -> Result<()> {
     // is `best` and is pushed where it has always been pushed, so the MTP block
     // below sees exactly the sequence-and-a-held-back-argmax it was written
     // against.
-    if is_tail && gen_steps > 0 && !repeat && new_toks.len() > 1 {
+    if is_tail && gen_steps > 0 && !repeat && new_toks.len() > 1 && !slot_lane {
         ids.extend_from_slice(&new_toks[..new_toks.len() - 1]);
+    }
+    // Each slot's own stream. A prefill pass produced the first generated token
+    // of the slot it prefilled; a decode pass produces one for every slot. Both
+    // ends run this -- the head off the wire, the tail off its own argmax --
+    // for the same reason `ids` is recomputed rather than sent.
+    if slot_lane && gen_steps > 0 && !repeat {
+        if is_decode {
+            for (q, tok) in slot_ids.iter_mut().zip(new_toks.iter()) {
+                q.push(*tok);
+            }
+        } else {
+            slot_ids[step].push(best);
+        }
     }
     // ---- both ends roll back to the accepted prefix ------------------------
     //
@@ -3722,7 +4110,7 @@ fn main() -> Result<()> {
             );
         }
     }
-    if step > 0 {
+    if is_decode && !slot_lane {
         let bucket = new_toks.len().min(spec_hist.len() - 1);
         spec_hist[bucket] += 1;
     }
@@ -4497,7 +4885,11 @@ fn main() -> Result<()> {
         top_all.clear();
     }
     // A head has no logits to rank -- the tail owns the table, and writes it.
-    if (kv || gen_tokens + new_toks.len() > gen_steps) && best_wire.is_none() {
+    // Not in the slot lane: this table is indexed by POSITION in one sequence,
+    // and a slot batch's rows are b sequences at the same position. Reporting
+    // them here would print b top-5 rows against b consecutive positions of
+    // slot 0, which is not a thing that happened.
+    if (kv || gen_tokens + new_toks.len() > gen_steps) && best_wire.is_none() && !slot_lane {
         // Only the rows the verifier kept. A speculative pass computes logits
         // for rows it then throws away, and ranking those would print a top-5
         // for a position the run never visited -- and index `ids` past its end.
@@ -4524,7 +4916,13 @@ fn main() -> Result<()> {
                  pass.elapsed().as_secs_f64() * 1e3);
         // The tail already pushed all but the last, when it answered its peer.
         if !is_tail && !repeat {
-            if new_toks.len() > 1 {
+            // Not in the slot lane: `new_toks` is one token per SLOT there, not
+            // an accepted prefix of one sequence, and extending `ids` with all
+            // of them puts seven other sequences into slot 0's stream. It is
+            // only a report -- nothing computes off `ids` in that lane -- which
+            // is exactly why it read as a plausible context length (4052
+            // against 3780) instead of as a failure.
+            if new_toks.len() > 1 && !slot_lane {
                 ids.extend_from_slice(&new_toks[..new_toks.len() - 1]);
             }
             ids.push(best);
@@ -4533,7 +4931,7 @@ fn main() -> Result<()> {
     // The prefill is a different animal -- a 512-row pass against a 1-row one,
     // and the only pass that pays for uploading every resident weight -- so it
     // is excluded from the utilisation summary rather than averaged into it.
-    if step > 0 {
+    if is_decode {
         acc_send += t_send;
         acc_wait_peer += t_wait_peer;
         acc_recv += t_recv;
@@ -4542,15 +4940,23 @@ fn main() -> Result<()> {
         acc_steps += 1;
         pass_ms.push((pass.elapsed().as_secs_f64() + t_recv) * 1e3);
     }
-    if step > COLD_DECODE_STEPS {
+    if is_decode && step - prefill_passes >= COLD_DECODE_STEPS {
         warm_wall += pass.elapsed().as_secs_f64() + t_recv;
         warm_steps += 1;
         warm_tokens += new_toks.len();
     }
-    gen_tokens += new_toks.len();
+    // A slot lane's prefill passes produce a token each and they are not decode
+    // tokens: counting them would put b of them in the numerator of a rate
+    // whose denominator is decode passes only.
+    gen_tokens += if slot_lane && !is_decode { 0 } else { new_toks.len() };
     // Tokens, not passes -- and with nothing speculated this fires on exactly
     // the pass the old `for step in 0..=gen_steps` fired on.
-    if gen_tokens > gen_steps {
+    // Passes, in the slot lane. Every arm has to run the same number of decode
+    // passes for the per-pass cost to be comparable across b, and a token count
+    // would make the run b times shorter at b times the width.
+    let done =
+        if slot_lane { is_decode && step + 1 - prefill_passes >= gen_steps } else { gen_tokens > gen_steps };
+    if done {
         break;
     }
     step += 1;
@@ -4606,7 +5012,9 @@ fn main() -> Result<()> {
         // compute for fewer sequential steps, so a per-pass figure is SUPPOSED
         // to get worse; the only number that says whether the trade paid is how
         // much text came out per second of wall clock.
-        let decode_toks = gen_tokens.saturating_sub(1);
+        // The prefill's own token is in `gen_tokens` on the single-sequence
+        // lane and is not a decode token; the slot lane never counted it.
+        let decode_toks = if slot_lane { gen_tokens } else { gen_tokens.saturating_sub(1) };
         let mut sorted = pass_ms.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in a duration"));
         let p50 = if sorted.is_empty() { 0.0 } else { sorted[sorted.len() / 2] };
