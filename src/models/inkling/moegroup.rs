@@ -399,7 +399,7 @@ pub fn fp4_linear_grouped_launch<R: Runtime>(
     );
 
     // How many N tiles one plane keeps in registers; see [`grouped_nrep`].
-    let nrep = grouped_nrep(n, m_total);
+    let nrep = grouped_nrep(n, m_total, blk.rows_real);
     let n_cubes = n / (NTILE * nrep);
 
     let out = client.empty(m_total * n * core::mem::size_of::<f32>());
@@ -589,7 +589,7 @@ pub fn bf16_linear_grouped_launch<R: Runtime>(
     assert_eq!(n % NTILE, 0, "n {n} is not a multiple of {NTILE}");
     assert_eq!(k % BF16_KTILE, 0, "k {k} is not a multiple of {BF16_KTILE}");
     // How many N tiles one plane keeps in registers; see [`grouped_nrep`].
-    let nrep = grouped_nrep(n, m_total);
+    let nrep = grouped_nrep(n, m_total, blk.rows_real);
     let n_cubes = n / (NTILE * nrep);
 
     let out = client.empty(m_total * n * core::mem::size_of::<f32>());
@@ -655,11 +655,47 @@ pub fn bf16_linear_grouped_launch<R: Runtime>(
 /// 178 ms against 105 at four planes -- so the cost is not plane fill and the
 /// threshold below is empirical, not derived.
 ///
+/// ## FILL: why the tile count alone was the wrong gate
+///
+/// The threshold above reads `m_total / MTILE` as "how much m is behind each
+/// product", and at a prefill it is: m_total grows because every expert has
+/// more real rows. At a batched decode it grows for the other reason. `b`
+/// slots pick `b * 6` expert rows spread over as many DISTINCT experts as the
+/// routing allows, each of which is padded to a whole 16-row tile, so at
+/// `INK_SLOTS=40` a layer stacks ~128 tiles holding ~240 real rows -- 1.9 rows
+/// a tile, against 13.5 at a 512-token prefill. The tile count crosses
+/// `NREP_TILES * want` while the work behind each product stays at a fifteenth
+/// of what the register tile was chosen for.
+///
+/// Measured, and it is not a small effect. Two nodes, layers 0:21 and 21:42,
+/// `INK_KV=1`, 3732-token prompts, warm p50 over 40 passes:
+///
+/// ```text
+///   INK_SLOTS   as written   INK_MOE_NREP=1   aggregate tok/s
+///      32         585.3 ms      (unchanged)     54.7
+///      40         927.3            -            43.1   <- bimodal, see below
+///      48        1113.3          740.6 ms       43.1 -> 64.8
+///      64        1459.5             -           43.9
+/// ```
+///
+/// `INK_SLOTS=40` is the diagnosis on its own: its forty passes come out at
+/// 648-691 ms or at 900-993 ms and nothing in between, because the layer's
+/// active-expert count wanders across 128 from pass to pass and takes a
+/// different schedule on each side of it. A knob that changes which arm a pass
+/// lands in, on input that differs only in which experts the router picked, is
+/// a predicate reading the wrong variable.
+///
+/// So the gate below asks for FILL as well as size: at least half of `m_total`
+/// has to be real. That leaves every measurement in the table above untouched
+/// -- a 512-token prefill is 3072 real rows in 3632 padded ones and a 128-token
+/// one is 768 in 1328, both over half -- and takes every decode width, at any
+/// `b`, to `nrep = 1`, which is where the measurements say a decode belongs.
+///
 /// `INK_MOE_NREP` overrides the width. It has to DIVIDE the N tile count, so a
 /// width that does not admit the requested repetition takes the largest one
 /// that does -- a kernel that refuses a shape the model issues is not a
 /// fallback, it is a crash.
-pub fn grouped_nrep(n: usize, m_total: usize) -> usize {
+pub fn grouped_nrep(n: usize, m_total: usize, rows_real: usize) -> usize {
     use std::sync::OnceLock;
     static R: OnceLock<usize> = OnceLock::new();
     let want = *R.get_or_init(|| {
@@ -671,6 +707,11 @@ pub fn grouped_nrep(n: usize, m_total: usize) -> usize {
     });
     let mut r = want;
     if m_total / MTILE < NREP_TILES * want {
+        r = 1;
+    }
+    // Half the padded rows have to be real, or the tile count above is counting
+    // padding. See the FILL section of this function's header.
+    if rows_real * 2 < m_total {
         r = 1;
     }
     while r > 1 && (n / NTILE) % r != 0 {
@@ -886,6 +927,13 @@ pub struct BlockPlanDev {
     pub blocks: usize,
     /// Planes per cube.
     pub planes: usize,
+    /// Rows of `m_total` that carry a token rather than an expert's padding.
+    ///
+    /// `m_total` is the padded height and it is NOT a measure of how much work
+    /// the layer has: an expert with two rows occupies sixteen. The two numbers
+    /// agree at a prefill and disagree by an order of magnitude at a batched
+    /// decode, which is why [`grouped_nrep`] reads this one.
+    pub rows_real: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -995,6 +1043,13 @@ impl RowPlan {
     /// Rows in the stacked buffer, `M`.
     pub fn m_total(&self) -> usize {
         self.row_tok.len()
+    }
+
+    /// Rows of `m_total` that carry a token; the rest are an expert's padding
+    /// up to a whole [`MTILE`]-row tile. See [`grouped_nrep`] on why the
+    /// difference decides a schedule.
+    pub fn rows_real(&self) -> usize {
+        self.row_tok.iter().filter(|&&t| t >= 0).count()
     }
 }
 

@@ -1772,6 +1772,7 @@ fn grouped_experts_fp4(
         cnt: client.create_from_slice(bytes_of(&plan.blk_cnt)),
         blocks: plan.blk_slot.len(),
         planes: RowPlan::planes(),
+        rows_real: plan.rows_real(),
     };
     let h_off13 = client.create_from_slice(bytes_of(&off13));
     let h_off2 = client.create_from_slice(bytes_of(&off2));
@@ -2034,6 +2035,7 @@ fn grouped_experts_bf16(
         cnt: client.create_from_slice(bytes_of(&plan.blk_cnt)),
         blocks: plan.blk_slot.len(),
         planes: RowPlan::planes(),
+        rows_real: plan.rows_real(),
     };
     let h_off13 = client.create_from_slice(bytes_of(&off13));
     let h_off2 = client.create_from_slice(bytes_of(&off2));
