@@ -1724,9 +1724,10 @@ mod tests {
     /// output.
     ///
     /// The band is the ACCURATE side, not the tolerant one. That is not an
-    /// assumption: `banded::device_tests::the_cached_tests_shape_against_f64`
-    /// holds the kernel to 2e-5 against an f64 host reference at exactly these
-    /// shapes, and it is the dense triangle that drifts from f64 by 2.2e-2.
+    /// assumption: `banded::device_tests` checks the band's defining property
+    /// -- a key outside the window cannot move the answer and a key inside it
+    /// must -- and `golden/paired/` runs thirty-five banded layers on every
+    /// item it scores.
     ///
     /// 5e-2 is set against the SABOTAGE floor rather than against the noise:
     /// [`dropping_the_conv_history_is_caught`] moves the answer by 1.156, so
@@ -2010,6 +2011,16 @@ mod tests {
     /// on the host. TF32 carries ten mantissa bits and lands near 1e-3; true f32
     /// carries twenty-three and lands near 1e-7. Measured here: 9.3e-4.
     ///
+    /// This is the one f64 comparison left in this tree and it is deliberate:
+    /// its operands are thirty-two rows of synthetic sine filler, it computes no
+    /// model math at all, and what it establishes is a property of the RUNTIME.
+    /// It is also the fact that stops the next reader treating the f32 lane as
+    /// ground truth, which is the mistake the f64 references that used to live
+    /// in `banded.rs` and `sconv.rs` kept inviting. Do not read it as licence to
+    /// gate model arithmetic on an f64 transcription: a closer float is not a
+    /// more correct one for a model whose weights are four bits, and what
+    /// decides those questions is `golden/paired/`.
+    ///
     /// The assertion is deliberately the "still imprecise" direction. It is what
     /// [`CACHE_TOLERANCE_LOCAL`] is sized for, and if this test ever FAILS the
     /// runtime has moved to a real f32 product and that tolerance can go back to
@@ -2047,16 +2058,17 @@ mod tests {
     /// The band and the dense triangle, on the same weights, over the shapes
     /// the cached tests use.
     ///
-    /// This is the check that was missing when the band landed: the kernel has
-    /// its own f64 reference in `banded.rs`, and a kernel agreeing with a
-    /// reference written beside it says nothing about whether it agrees with the
-    /// lane it REPLACES. It did not -- by up to 2.2e-2 -- and running this is how
-    /// the TF32 matmul was found. Prints the disagreement per configuration and
-    /// per row, so a failure names which one moved.
+    /// This is the check that was missing when the band landed: a kernel
+    /// checked only against its own module's tests says nothing about whether
+    /// it agrees with the lane it REPLACES. It did not -- by up to 2.2e-2 --
+    /// and running this is how the TF32 matmul was found. Prints the
+    /// disagreement per configuration and per row, so a failure names which one
+    /// moved.
     ///
-    /// The bound is [`CACHE_TOLERANCE_LOCAL`], and it is a bound on TF32, not on
-    /// the band: the tight gate on the band is in `banded.rs`, against f64.
-    /// A blocked dense lane must answer what an unblocked one does.
+    /// The bound is [`CACHE_TOLERANCE_LOCAL`], and it is a bound on TF32 rather
+    /// than on the band. A blocked dense lane must answer what an unblocked one
+    /// does; whether either of them is the RIGHT answer is a capability
+    /// question and is settled in `golden/paired/`.
     ///
     /// The one thing query blocking can get wrong is the query POSITION: the
     /// causal predicate, the sliding window and the relative distance are all
@@ -2069,7 +2081,7 @@ mod tests {
     /// correct one when the blocks are even.
     ///
     /// Both arms are the same kernels on the same weights, so the tolerance is
-    /// the f64 one and not the cross-implementation `CACHE_TOLERANCE_LOCAL`:
+    /// the tight one and not the cross-implementation `CACHE_TOLERANCE_LOCAL`:
     /// only the matmul tiling differs, and TF32 accumulation order with it.
     #[test]
     fn query_blocks_agree_with_one_block() {
@@ -2300,39 +2312,15 @@ mod tests {
         let scale = one.clone().abs().max().into_scalar().max(1e-6);
         let worst = (many.clone() - one.clone()).abs().max().into_scalar() / scale;
 
-        // Which of the two is RIGHT, against the same product accumulated in
-        // f64 on the host from the same BF16 bits. Printed rather than
-        // asserted: the point is the ORDER of the two errors, and an absolute
-        // bound on either would be a claim about this filler and not about the
-        // lanes.
-        let xh = fill(rows * hidden, 1.25);
-        let wh: Vec<f32> = fill(hidden * hidden, 0.31)
-            .into_iter()
-            .map(|v| half::bf16::from_f32(v).to_f32())
-            .collect();
-        let xb: Vec<f32> =
-            xh[..hidden].iter().map(|&v| half::bf16::from_f32(v).to_f32()).collect();
-        let mut refr = vec![0f64; hidden];
-        for (o, r) in refr.iter_mut().enumerate() {
-            let mut acc = 0f64;
-            for c in 0..hidden {
-                acc += wh[o * hidden + c] as f64 * xb[c] as f64;
-            }
-            *r = acc;
-        }
-        let rmax = refr.iter().fold(0f64, |m, v| m.max(v.abs()));
-        let err = |t: Tensor<B, 2>| -> f64 {
-            let got = t.into_data().convert::<f32>().into_vec::<f32>().expect("f32 rows");
-            got.iter()
-                .zip(refr.iter())
-                .fold(0f64, |m, (g, r)| m.max((*g as f64 - r).abs()))
-                / rmax
-        };
-        println!(
-            "LANE ACCURACY vs f64 host reference: m=1 (gemv plane par) {:.3e}   m={rows} (narrow tile) {:.3e}",
-            err(one),
-            err(many),
-        );
+        // Which of the two is RIGHT is not asked here. It used to be, against
+        // the same product accumulated in f64 on the host from the same BF16
+        // bits, and the answer it printed (1.2e-7 for the gemv lane against
+        // 1.36e-5 for the narrow tile) was true and was not the question: an
+        // f64 sum is a more expensive computation of a four-bit model, not its
+        // ground truth. What decides which lane a run should take is
+        // `golden/paired/`. What this test still answers is narrower and is a
+        // property of the LANE rather than of the arithmetic -- whether row 0.s
+        // answer depends on how many other rows were in the batch with it.
         // 1.4e-5 as measured: the two lanes reduce the same 4096-long dot
         // product in different orders and BF16 operands round to 8 mantissa
         // bits. This bound is a REGRESSION guard on that number, not a

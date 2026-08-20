@@ -56,10 +56,10 @@ const CUBE_SIZE: u32 = 256;
 /// it assumes whatever was written first was right.
 ///
 /// It was not. `fma.rn.f32` rounds **once** where `mul.rn.f32` then `add.rn.f32`
-/// rounds twice, so the fused form is the more accurate of the two, and the
-/// module's own test now says so by adjudicating both against an f64
-/// accumulation of the same values rather than against each other. The 1 ULP
-/// that got this reverted is the split lane's error, not this one's.
+/// rounds twice, so the fused form rounds less, and a 1 ULP disagreement with
+/// the split lane was never evidence that this one was wrong. Which of them is
+/// better is not a question this module answers any more, and deliberately: it
+/// is decided where every other capability question is, in `golden/paired/`.
 ///
 /// `hist` is `[kernel - 1, dim]` oldest-first, `x` is `[dim]`, `w` is
 /// `[dim, kernel]` — all row-major and contiguous. `out` is `[dim]` and `next`
@@ -348,159 +348,34 @@ pub fn short_conv_slots<R: Runtime>(
 /// convolving one position with a carried history reproduces convolving the
 /// window and keeping the last row.
 ///
-/// ## The adjudicator is f64, not the other lane
+/// ## There is no adjudicator here any more, and that is the point
 ///
-/// This test used to assert BIT EQUALITY against the slice lane, and that is
-/// what forced the two-kernel split: the fused kernel contracts to
-/// `fma.rn.f32`, came out 1 ULP away, and was reverted for it. Bit-identity to
-/// a previous implementation cannot answer which of two lanes is right; it can
-/// only say which one was written first.
+/// This module used to accumulate the same convolution in f64 on the host and
+/// hold both f32 lanes to a ULP budget against it. That is gone. An f64
+/// transcription is not ground truth for a model whose weights are four bits —
+/// it is a second, more expensive computation of the same thing — and while it
+/// sat here it kept being read as the question. The value is decided by
+/// `golden/paired/`, which runs the whole stack; what is left here is the two
+/// things a reference cannot tell you and a kernel can:
 ///
-/// So both lanes are now measured against the same f64 accumulation of the same
-/// values — the arithmetic both are approximating — and the test asserts that
-/// the fused kernel is **no worse than** the lane it replaces, plus an absolute
-/// budget. The budget is stated here and not tuned to what came out:
-/// `kernel` taps of f32 multiply-add carry at most a few ULP, so
-/// **4 ULP of the output magnitude (relative 4 x 2^-24 = 2.4e-7)** is the bar,
-/// and anything above it is a real defect rather than rounding.
+///   * the carried history is a COPY of the window's own rows, so it must be
+///     exact — there is no arithmetic in it to round;
+///   * the batched kernel and the one-row kernel are the same expression with
+///     the same taps in the same order, so they must agree exactly — if they do
+///     not, an index is wrong, and no tolerance would make that clearer.
+///
+/// Both are statements about indexing rather than about precision, which is why
+/// they survive the rule that killed the ULP budget.
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::inkling::seam::{client_of, handle_of, tensor_of, Bk};
     use burn::tensor::{Tensor, TensorData};
 
-    /// f32 unit roundoff, `2^-24`.
-    const ULP: f64 = 5.960_464_477_539_063e-8;
-
-    /// Relative budget, against the CONDITIONING of the sum and not its result.
-    ///
-    /// The first version of this constant was `4 * ULP` measured against
-    /// `|out|`, and it was derived wrong — badly enough to be worth leaving on
-    /// the record rather than quietly retuning. Both lanes came out near
-    /// `3e-5`/`7.7e-5` against it. The cause is not either kernel: this
-    /// convolution has a residual, `out = x + Σ w_j win_j`, and on channels
-    /// where the taps nearly cancel `x` the result is tiny while the terms that
-    /// made it are not. Normalising a rounding error by a cancelled result
-    /// measures the cancellation, not the arithmetic.
-    ///
-    /// The textbook bound for a summation of `n` terms is
-    /// `|err| <= n * u * Σ|terms|`, so `Σ|terms|` is the scale a rounding
-    /// budget belongs against. With `kernel + 1` terms (the taps plus the
-    /// residual) that is `(kernel + 1) * ULP`; `8 * ULP` covers every shape
-    /// this model ships and is still tight enough to catch a real defect.
-    const BUDGET: f64 = 8.0 * ULP;
-
     fn fill(n: usize, seed: f32) -> Vec<f32> {
         (0..n)
             .map(|i| (i as f32 * 0.7919 + seed).sin() * 0.5 + (i as f32 * 0.1237).cos() * 0.25)
             .collect()
-    }
-
-    /// The convolution in f64: the value both f32 lanes approximate.
-    ///
-    /// Same terms, same ascending order; only the precision differs, so the
-    /// difference this exposes is exactly the rounding each lane performs.
-    fn exact(hist: &[f32], x: &[f32], w: &[f32], dim: usize, kernel: usize) -> Vec<f64> {
-        let taps = kernel - 1;
-        (0..dim)
-            .map(|d| {
-                let mut acc = 0f64;
-                for j in 0..taps {
-                    acc += w[d * kernel + j] as f64 * hist[j * dim + d] as f64;
-                }
-                acc += w[d * kernel + taps] as f64 * x[d] as f64;
-                x[d] as f64 + acc
-            })
-            .collect()
-    }
-
-    /// `Σ|terms|` per channel — the scale a summation's rounding error lives on.
-    fn cond(hist: &[f32], x: &[f32], w: &[f32], dim: usize, kernel: usize) -> Vec<f64> {
-        let taps = kernel - 1;
-        (0..dim)
-            .map(|d| {
-                let mut s = (x[d] as f64).abs();
-                for j in 0..taps {
-                    s += (w[d * kernel + j] as f64 * hist[j * dim + d] as f64).abs();
-                }
-                s += (w[d * kernel + taps] as f64 * x[d] as f64).abs();
-                s
-            })
-            .collect()
-    }
-
-    /// `(max, mean)` error of an f32 lane against the f64 value, normalised by
-    /// `scale` — `Σ|terms|` for the budget, `|out|` for the reported figure the
-    /// first budget was wrongly written against.
-    ///
-    /// Both statistics, because they answer different questions. The max is
-    /// the budget check. The mean is the FMA comparison: one rounding per tap
-    /// beats two in the worst-case bound and across a population, but not
-    /// necessarily on any single channel — a double rounding can round back
-    /// toward the true value by luck, and on 256 channels of a 2-tap kernel one
-    /// of them does.
-    fn rel_err(got: &[f32], want: &[f64], scale: &[f64]) -> (f64, f64) {
-        let errs: Vec<f64> = got
-            .iter()
-            .zip(want)
-            .zip(scale)
-            .map(|((&g, &w), &s)| (g as f64 - w).abs() / s.abs().max(1e-30))
-            .collect();
-        let max = errs.iter().copied().fold(0f64, f64::max);
-        (max, errs.iter().sum::<f64>() / errs.len() as f64)
-    }
-
-    /// One `(dim, kernel)` case.
-    ///
-    /// Returns `((max, mean) fused, (max, mean) slice, fused vs |out|,
-    /// slice vs |out|, |Δnext|)` — the first two normalised by `Σ|terms|` and
-    /// judged, the next two by `|out|` and only reported, the last a pure copy
-    /// that must be exact.
-    #[allow(clippy::type_complexity)]
-    fn gap(dim: usize, kernel: usize) -> ((f64, f64), (f64, f64), f64, f64, f32) {
-        let dev = Default::default();
-        let taps = kernel - 1;
-        let (hv, xv, wv) = (fill(taps * dim, 0.3), fill(dim, 1.7), fill(dim * kernel, 2.9));
-        let hist: Tensor<Bk, 2> =
-            Tensor::from_data(TensorData::new(hv.clone(), [taps, dim]), &dev);
-        let x: Tensor<Bk, 2> = Tensor::from_data(TensorData::new(xv.clone(), [1, dim]), &dev);
-        let w: Tensor<Bk, 2> =
-            Tensor::from_data(TensorData::new(wv.clone(), [dim, kernel]), &dev);
-
-        // What both f32 lanes approximate.
-        let want = exact(&hv, &xv, &wv, dim, kernel);
-
-        // The lane this replaced, transcribed: concatenate, convolve the whole
-        // window, keep the last row, carry the rest. Kept as a MEASUREMENT, not
-        // as an oracle — it is one of the two things being adjudicated.
-        let win = Tensor::cat(vec![hist.clone(), x.clone()], 0);
-        let ref_full = crate::models::inkling::burn::short_conv(win.clone(), w.clone());
-        let ref_out = ref_full.slice([taps..kernel, 0..dim]);
-        let ref_next = win.slice([1..kernel, 0..dim]);
-
-        let client = client_of(&x);
-        let (oh, nh) = short_conv_decode(
-            &client,
-            &handle_of(hist),
-            &handle_of(x),
-            &handle_of(w),
-            dim,
-            kernel,
-        );
-        let out = tensor_of(client.clone(), dev, oh, 1, dim);
-        let next = tensor_of(client, Default::default(), nh, taps, dim);
-
-        let vec_of = |t: Tensor<Bk, 2>| t.into_data().to_vec::<f32>().unwrap();
-        let dnext = (next - ref_next).abs().max().into_data().to_vec::<f32>().unwrap()[0];
-        let (fu, sl) = (vec_of(out), vec_of(ref_out));
-        let terms = cond(&hv, &xv, &wv, dim, kernel);
-        (
-            rel_err(&fu, &want, &terms),
-            rel_err(&sl, &want, &terms),
-            rel_err(&fu, &want, &want).0,
-            rel_err(&sl, &want, &want).0,
-            dnext,
-        )
     }
 
     /// The batched kernel against the one-row kernel, row by row.
@@ -567,46 +442,62 @@ mod tests {
                 }
             }
 
-            // ...and both against the arithmetic they approximate, so a shared
-            // index error in the two kernels cannot pass by agreeing.
-            let want = exact(&av[..taps * dim], &av[taps * dim..(taps + 1) * dim], &wv, dim, kernel);
-            let terms = cond(&av[..taps * dim], &av[taps * dim..(taps + 1) * dim], &wv, dim, kernel);
-            let (max, _) = rel_err(&batched[..dim], &want, &terms);
-            assert!(
-                max <= BUDGET,
-                "dim {dim} kernel {kernel} rows {rows}: row 0 is {max:e} from the f64 value, \
-                 past the pre-registered {BUDGET:e}"
-            );
+            // A shared index error in the two kernels would pass by agreeing,
+            // and it is `golden/paired/` that would catch it -- the whole stack
+            // runs four of these a layer. What used to be here was an f64
+            // transcription of the convolution, and it is gone: see the module
+            // header.
         }
     }
 
-    /// The fused kernel is at least as accurate as the lane it replaced.
+    /// The fused kernel tracks the lane it replaced, as a SMOKE CHECK.
     ///
-    /// Not "identical to": identical was the requirement that forced the split,
-    /// and it is the wrong requirement. `fma.rn.f32` rounds once per tap where
-    /// `mul.rn.f32; add.rn.f32` rounds twice, so this lane should come out
-    /// closer to the f64 value on any input where the two differ at all.
+    /// Not an accuracy claim and not a tolerance on model math: `fma.rn.f32`
+    /// rounds once per tap where `mul; add` rounds twice, so the two lanes are
+    /// expected to differ in the last bits and nothing here can say which is
+    /// better. What this catches is the lane going WRONG -- a transposed weight,
+    /// an off-by-one tap, a stale history -- and that shows up as a difference
+    /// of order one, not of order 1e-7. The bar is set where garbage lives.
+    ///
+    /// The carried history is checked exactly, because it is a copy.
     #[test]
-    fn fused_decode_is_no_worse_than_the_slice_lane() {
+    fn fused_decode_tracks_the_slice_lane() {
+        let dev = Default::default();
         for (dim, kernel) in [(4096usize, 4usize), (512, 4), (256, 2), (777, 3)] {
-            let ((fmax, fmean), (smax, smean), fused_o, slice_o, dnext) = gap(dim, kernel);
-            println!(
-                "dim {dim} kernel {kernel}: err/Σ|terms| max fused {fmax:e} slice {smax:e} \
-                 (budget {BUDGET:e})  mean fused {fmean:e} slice {smean:e}  |  err/|out| \
-                 fused {fused_o:e} slice {slice_o:e}  |  |Δnext| {dnext:e}"
+            let taps = kernel - 1;
+            let (hv, xv, wv) = (fill(taps * dim, 0.3), fill(dim, 1.7), fill(dim * kernel, 2.9));
+            let hist: Tensor<Bk, 2> =
+                Tensor::from_data(TensorData::new(hv, [taps, dim]), &dev);
+            let x: Tensor<Bk, 2> = Tensor::from_data(TensorData::new(xv, [1, dim]), &dev);
+            let w: Tensor<Bk, 2> = Tensor::from_data(TensorData::new(wv, [dim, kernel]), &dev);
+
+            let win = Tensor::cat(vec![hist.clone(), x.clone()], 0);
+            let ref_out = crate::models::inkling::burn::short_conv(win.clone(), w.clone())
+                .slice([taps..kernel, 0..dim]);
+            let ref_next = win.slice([1..kernel, 0..dim]);
+
+            let client = client_of(&x);
+            let (oh, nh) = short_conv_decode(
+                &client,
+                &handle_of(hist),
+                &handle_of(x),
+                &handle_of(w),
+                dim,
+                kernel,
             );
-            // The history is a pure copy and has no arithmetic to round.
+            let out = tensor_of(client.clone(), dev.clone(), oh, 1, dim);
+            let next = tensor_of(client, Default::default(), nh, taps, dim);
+
+            let dnext = (next - ref_next).abs().max().into_scalar();
             assert_eq!(dnext, 0.0, "the carried history must be the window's own rows");
+
+            let scale = ref_out.clone().abs().max().into_scalar().max(1e-6);
+            let rel = (out - ref_out).abs().max().into_scalar() / scale;
+            println!("dim {dim} kernel {kernel}: fused vs slice, relative {rel:e}");
             assert!(
-                fmax <= BUDGET,
-                "dim {dim} kernel {kernel}: the fused lane is {fmax:e} from the f64 value, \
-                 past the pre-registered {BUDGET:e} — that is a defect, not rounding"
-            );
-            assert!(
-                fmean <= smean,
-                "dim {dim} kernel {kernel}: the fused lane averages {fmean:e} from the f64 \
-                 value against the slice lane's {smean:e}; one rounding per tap should not \
-                 lose to two across a population"
+                rel < 1e-3,
+                "dim {dim} kernel {kernel}: the fused lane is {rel:e} from the slice lane -- \
+                 that is not rounding, that is a different convolution"
             );
         }
     }

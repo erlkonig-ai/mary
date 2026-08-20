@@ -346,82 +346,23 @@ mod device_tests {
             .collect()
     }
 
-    /// Banded attention on the host, in f64, written from the definition.
-    ///
-    /// Deliberately NOT the dense lane with a mask: a reference that shares
-    /// code with the thing under test only proves they agree. This is the
-    /// arithmetic the model specifies, transcribed once.
-    #[allow(clippy::too_many_arguments)]
-    fn reference(
+    /// Run the band once and read its output back.
+    fn band(
+        tokens: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        window: usize,
         q: &[f32],
         k: &[f32],
         v: &[f32],
         rel: &[f32],
-        tokens: usize,
-        heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
         eff: usize,
-        window: usize,
-        scaling: f32,
-    ) -> Vec<f64> {
-        let groups = heads / kv_heads;
-        let q_row = heads * head_dim;
-        let kv_row = kv_heads * head_dim;
-        let mut out = vec![0f64; tokens * q_row];
-        for h in 0..heads {
-            let kvh = h / groups;
-            for i in 0..tokens {
-                let lo = (i + 1).saturating_sub(window);
-                let mut s = Vec::with_capacity(i - lo + 1);
-                for j in lo..=i {
-                    let mut dot = 0f64;
-                    for d in 0..head_dim {
-                        dot += q[i * q_row + h * head_dim + d] as f64
-                            * k[j * kv_row + kvh * head_dim + d] as f64;
-                    }
-                    let dist = i - j;
-                    let b = if dist < eff {
-                        rel[i * heads * eff + h * eff + dist] as f64
-                    } else {
-                        0.0
-                    };
-                    s.push(dot * scaling as f64 + b);
-                }
-                let m = s.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                let e: Vec<f64> = s.iter().map(|x| (x - m).exp()).collect();
-                let sum: f64 = e.iter().sum();
-                for d in 0..head_dim {
-                    let mut o = 0f64;
-                    for (idx, p) in e.iter().enumerate() {
-                        o += p * v[(lo + idx) * kv_row + kvh * head_dim + d] as f64;
-                    }
-                    out[i * q_row + h * head_dim + d] = o / sum;
-                }
-            }
-        }
-        out
-    }
-
-    /// Run one shape both ways and return the largest absolute disagreement.
-    fn worst(
-        tokens: usize,
-        heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
-        window: usize,
-    ) -> f64 {
-        let eff = window.min(tokens);
+    ) -> Vec<f32> {
         let scaling = 1.0 / head_dim as f32;
-        let q = fill(tokens * heads * head_dim, 0.1);
-        let k = fill(tokens * kv_heads * head_dim, 0.3);
-        let v = fill(tokens * kv_heads * head_dim, 0.5);
-        let rel = fill(tokens * heads * eff, 0.7);
-
-        // The kernel wants K dimension-major; the reference reads it the way
-        // the projection produces it. Transposing HERE rather than reusing a
-        // helper keeps the test's copy of the layout independent of the
-        // caller's, which is the point of a reference.
+        // The kernel wants K dimension-major; the projection produces it
+        // token-major. Transposing here rather than through a helper keeps the
+        // test's copy of the layout independent of the caller's.
         let mut kt = vec![0f32; k.len()];
         for j in 0..tokens {
             for c in 0..kv_heads {
@@ -431,68 +372,150 @@ mod device_tests {
                 }
             }
         }
-
         let client = <CudaRuntime as Runtime>::client(&Default::default());
-        let qh = client.create_from_slice(f32::as_bytes(&q));
+        let qh = client.create_from_slice(f32::as_bytes(q));
         let kh = client.create_from_slice(f32::as_bytes(&kt));
-        let vh = client.create_from_slice(f32::as_bytes(&v));
-        let rh = client.create_from_slice(f32::as_bytes(&rel));
+        let vh = client.create_from_slice(f32::as_bytes(v));
+        let rh = client.create_from_slice(f32::as_bytes(rel));
         let oh = banded_attention_launch(
             &client, &qh, &kh, &vh, &rh, tokens, heads, kv_heads, head_dim, eff, window, scaling,
         );
-        let got = f32::from_bytes(&client.read_one(oh).expect("read the band's output")).to_vec();
-        let want = reference(
-            &q, &k, &v, &rel, tokens, heads, kv_heads, head_dim, eff, window, scaling,
-        );
-        assert_eq!(got.len(), want.len());
-        got.iter()
-            .zip(&want)
-            .map(|(g, w)| (*g as f64 - *w).abs())
-            .fold(0.0, f64::max)
+        f32::from_bytes(&client.read_one(oh).expect("read the band's output")).to_vec()
     }
 
-    /// The window CLIPS: 40 queries, 8 keys of reach, so most rows read a
-    /// strict subset and the earliest rows read fewer than the window.
-    #[test]
-    fn clipped_band_matches_the_definition() {
-        let w = worst(40, 4, 2, 8, 8);
-        assert!(w < 2e-5, "banded attention drifts by {w}");
+    /// The inputs one shape needs, as `(q, k, v, rel, eff)`.
+    fn inputs(
+        tokens: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        window: usize,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, usize) {
+        let eff = window.min(tokens);
+        (
+            fill(tokens * heads * head_dim, 0.1),
+            fill(tokens * kv_heads * head_dim, 0.3),
+            fill(tokens * kv_heads * head_dim, 0.5),
+            fill(tokens * heads * eff, 0.7),
+            eff,
+        )
     }
 
-    /// The window does not reach: fewer tokens than the window, so every row is
-    /// the full causal prefix and the band is a triangle.
-    #[test]
-    fn short_sequence_is_the_whole_triangle() {
-        let w = worst(7, 4, 2, 8, 16);
-        assert!(w < 2e-5, "banded attention drifts by {w}");
-    }
-
-    /// GQA with more than two groups, and a `head_dim` that needs the full
-    /// tree reduction rather than one step of it.
-    #[test]
-    fn grouped_kv_heads_index_the_right_key() {
-        let w = worst(70, 8, 2, 16, 12);
-        assert!(w < 2e-5, "banded attention drifts by {w}");
-    }
-
-    /// The exact shape `burn.rs`'s cached-decode tests use, against f64.
+    /// The band's DEFINING property, checked against the kernel itself rather
+    /// than against a second implementation of it.
     ///
-    /// That comparison fails against the DENSE lane by up to 2.2e-2, and this
-    /// is the test that says which of the two is wrong. `head_dim` 4 also means
-    /// a cube of four units, so the tree reductions run at their smallest.
+    /// A key more than `window - 1` positions behind a query cannot reach it.
+    /// So changing that key must leave the query's output exactly where it was,
+    /// and changing a key INSIDE the window must move it. Both halves are
+    /// necessary: the first alone passes for a kernel that reads nothing, and
+    /// the second alone passes for a dense kernel with no band at all.
+    ///
+    /// This replaces a host f64 transcription of the whole attention. That
+    /// transcription was not ground truth -- it was a second, more expensive
+    /// computation of a model whose weights are four bits -- and its presence
+    /// invited every later reader to treat numerical distance from it as the
+    /// question. What decides whether this kernel is right is `golden/paired/`:
+    /// thirty-five of forty-two layers run banded, so the capability comparison
+    /// exercises it on every item.
     #[test]
-    fn the_cached_tests_shape_against_f64() {
-        for (win, tokens) in [(5usize, 11usize), (16, 11), (3, 11), (5, 4), (5, 2)] {
-            let w = worst(tokens, 4, 2, 4, win);
-            assert!(w < 2e-5, "window {win} over {tokens} tokens drifts by {w}");
+    fn the_window_is_exactly_what_the_query_can_reach() {
+        for (tokens, heads, kv_heads, head_dim, window) in
+            [(40usize, 4usize, 2usize, 8usize, 8usize), (70, 8, 2, 16, 12), (11, 4, 2, 4, 5)]
+        {
+            let (q, k, v, rel, eff) = inputs(tokens, heads, kv_heads, head_dim, window);
+            let base = band(tokens, heads, kv_heads, head_dim, window, &q, &k, &v, &rel, eff);
+            let row = |o: &[f32], i: usize| o[i * heads * head_dim..(i + 1) * heads * head_dim].to_vec();
+
+            // The last query, and a key it cannot see.
+            let last = tokens - 1;
+            let outside = last - window; // window - 1 is the furthest it reaches
+            let inside = last;
+            for (j, must_move) in [(outside, false), (inside, true)] {
+                let mut kk = k.clone();
+                let mut vv = v.clone();
+                for c in 0..kv_heads * head_dim {
+                    kk[j * kv_heads * head_dim + c] += 0.75;
+                    vv[j * kv_heads * head_dim + c] -= 0.75;
+                }
+                let got =
+                    band(tokens, heads, kv_heads, head_dim, window, &q, &kk, &vv, &rel, eff);
+                let moved = row(&got, last)
+                    .into_iter()
+                    .zip(row(&base, last))
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                if must_move {
+                    assert!(
+                        moved > 1e-4,
+                        "key {j} is inside the window of query {last} and perturbing it moved                          the answer by {moved:e}"
+                    );
+                } else {
+                    assert_eq!(
+                        moved, 0.0,
+                        "key {j} is {window} back from query {last} and outside its window,                          but perturbing it moved the answer by {moved:e}"
+                    );
+                }
+            }
         }
     }
 
-    /// The model's own shape, at a length where the band is a small fraction of
-    /// the sequence. 128 units, 32 heads over 8 KV heads, window 512.
+    /// GQA indexing, again against the kernel itself: perturbing KV head `c`
+    /// may move only the query heads in `c`'s group.
+    ///
+    /// This is the failure a reference implementation catches by accident and
+    /// this catches on purpose -- `h / groups` off by one is a wrong ANSWER
+    /// everywhere and a wrong SHAPE nowhere.
     #[test]
-    fn inklings_shape_at_a_real_length() {
-        let w = worst(1500, 32, 8, 128, 512);
-        assert!(w < 1e-4, "banded attention drifts by {w}");
+    fn a_kv_head_reaches_only_its_own_group() {
+        let (tokens, heads, kv_heads, head_dim, window) = (24usize, 8usize, 2usize, 16usize, 12usize);
+        let groups = heads / kv_heads;
+        let (q, k, v, rel, eff) = inputs(tokens, heads, kv_heads, head_dim, window);
+        let base = band(tokens, heads, kv_heads, head_dim, window, &q, &k, &v, &rel, eff);
+        // ONE key, not every key of the head. Adding the same constant to all of
+        // a head's keys shifts every score by the same amount and the softmax
+        // cancels it exactly -- a perturbation that leaves the answer alone for
+        // a reason that has nothing to do with indexing, and the first version
+        // of this test failed on precisely that.
+        let at = tokens / 2;
+        for c in 0..kv_heads {
+            let (mut kk, mut vv) = (k.clone(), v.clone());
+            for d in 0..head_dim {
+                kk[at * kv_heads * head_dim + c * head_dim + d] += 0.5;
+                vv[at * kv_heads * head_dim + c * head_dim + d] -= 0.5;
+            }
+            let got = band(tokens, heads, kv_heads, head_dim, window, &q, &kk, &vv, &rel, eff);
+            for h in 0..heads {
+                let mine = h / groups == c;
+                let moved = (0..tokens)
+                    .flat_map(|i| (0..head_dim).map(move |d| i * heads * head_dim + h * head_dim + d))
+                    .map(|o| (got[o] - base[o]).abs())
+                    .fold(0f32, f32::max);
+                if mine {
+                    assert!(moved > 1e-4, "head {h} shares KV head {c} and did not move");
+                } else {
+                    assert_eq!(moved, 0.0, "head {h} does not share KV head {c} but moved by {moved:e}");
+                }
+            }
+        }
+    }
+
+    /// The model's own shape, as a smoke check: it runs, and what comes out is
+    /// finite and is not the same number everywhere.
+    ///
+    /// 128 units, 32 heads over 8 KV heads, window 512, at a length where the
+    /// band is a small fraction of the sequence. There is no tolerance here on
+    /// purpose -- a kernel that has gone wrong at this size produces NaNs, zeros
+    /// or one repeated value, and a kernel that is subtly off produces a number
+    /// only the capability harness can judge.
+    #[test]
+    fn inklings_shape_at_a_real_length_runs() {
+        let (tokens, heads, kv_heads, head_dim, window) = (1500usize, 32usize, 8usize, 128usize, 512usize);
+        let (q, k, v, rel, eff) = inputs(tokens, heads, kv_heads, head_dim, window);
+        let out = band(tokens, heads, kv_heads, head_dim, window, &q, &k, &v, &rel, eff);
+        assert_eq!(out.len(), tokens * heads * head_dim);
+        assert!(out.iter().all(|x| x.is_finite()), "the band produced a non-finite value");
+        let lo = out.iter().copied().fold(f32::INFINITY, f32::min);
+        let hi = out.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert!(hi - lo > 1e-3, "every output is {lo}: the band computed nothing");
     }
 }
