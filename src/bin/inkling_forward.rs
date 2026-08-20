@@ -451,6 +451,36 @@
 //! cache halves 1.3 GiB of a 28 GiB overshoot; a paged KV cache addresses the
 //! stranding term, and the stranding term measured 1.0 GiB.
 //!
+//! ## What the wall was actually capping, which was not eight
+//!
+//! Eight slots was where the old lane stopped being reproducible, so eight is
+//! where the measurements stopped. It was never a property of the batch: the
+//! batch costs 0.19 GiB a slot and the node has 25.77 GiB, and what ran out was
+//! the b UNASSEMBLED prefills. With them gone the same `INK_SLOTS` goes
+//! straight past it. Same pipe, 3732-token prompts, `/tmp/cover_400000.ids`
+//! (100,623 tokens, so sixteen disjoint chunks fit), warm p50 over 40 passes:
+//!
+//!    b    p50 ms   aggregate tok/s   pool live (head)   MemAvailable floor
+//!    8    289.0        27.7              3.29 GiB          21.7 / 26.1 GiB
+//!   12    351.3        34.2              4.05             20.0 / 24.3
+//!   16    399.7        40.0              4.80             19.6 / 24.0
+//!
+//! `b = 16` holds 388-415 ms over its forty passes and neither node takes a
+//! page of swap. **40.0 aggregate tok/s**, and the pool is 4.80 GiB of a
+//! 25.77 GiB headroom, so this is not the ceiling either -- it is where the
+//! corpus ran out of disjoint chunks.
+//!
+//! ## Batching the prefills, priced rather than built
+//!
+//! The `b` prefills are still sequential and are now the startup cost: eight of
+//! them at 6.86 s is 55 s before the first decoded token. Sharing the batch
+//! machinery would amortise the per-prefill FIXED part over `b`, and that part
+//! is measurable -- a 512-token prefill is 1.42 s and a 3732-token one 6.86 s,
+//! which is 1.69 ms a token plus **0.56 s** that does not depend on the length.
+//! Eight of those is 4.5 s of the 55, so a batched prefill is worth at most 8%
+//! of the phase it would restructure. The rest is arithmetic over `b * n`
+//! tokens and a batch does not make it cheaper.
+//!
 //! ## The contamination test, which is the one this can fail
 //!
 //! Batch contamination -- slot `s` reading slot `s'`'s keys -- produces fluent
