@@ -758,8 +758,8 @@ fn attention_prefill_lane(
     };
 
     let mut cache = AttnCache {
-        k,
-        v,
+        k: as_kv(k),
+        v: as_kv(v),
         k_pre: conv_history(k_pre, d.kernel),
         v_pre: conv_history(v_pre, d.kernel),
         base: 0,
@@ -784,6 +784,130 @@ fn kv_pad_bucket() -> usize {
             .filter(|n| *n >= 1)
             .unwrap_or(64)
     })
+}
+
+/// Whether a KV cache HOLDS its keys and values as BF16, and multiplies them
+/// there.
+///
+/// **On by default; `INK_ATTN_BF16=0` is the wide arm.** It is a switch and not
+/// an unconditional change for one reason -- what it trades is precision, and
+/// the only honest way to price precision is to run both arms of the same
+/// binary against the same harness. It is on by default because it won that
+/// comparison, and because a default is what the unit tests below exercise.
+///
+/// Both caches, and only the CACHED reads. A prefill computes its scores from
+/// the keys it has just projected and never round-trips them through memory, so
+/// it has nothing to save and is left alone; every decode step reads its whole
+/// retained context back, and that read is what this narrows.
+///
+/// The argument is that the four bytes were never buying twenty-four mantissa
+/// bits. Burn's f32 matmul on this runtime is TF32
+/// ([`f32_matmul_is_tf32_on_this_runtime`], 9.3e-4 relative on a 128-deep
+/// product), so the PRODUCT already carries about ten; the four-byte load pays
+/// for twenty-three that the tensor cores then round away.
+///
+/// **A closer float is not a more correct one, and that is why there is no
+/// tolerance here.** The weights are 4-bit NVFP4; an f64 reference is not what
+/// anyone is trying to match, and a gate on numerical distance from one would
+/// measure a theorem rather than an outcome. What decides this lane is
+/// `golden/paired/`: the same prompts through the BF16 reference and through
+/// each arm of this runtime, reported as AGREEMENT and as LOSS with McNemar on
+/// the discordant pairs. A layer-RMS ladder is still worth a look as a smoke
+/// check -- a lane that has gone wrong emits garbage, not a moved fourth
+/// decimal -- but it is not the acceptance criterion.
+///
+/// The switch is a process-global `OnceLock`, so a test binary would get ONE
+/// lane and never exercise the other -- the wrong shape for a change whose
+/// whole subject is a comparison. [`CacheLane`] is the per-thread override that
+/// fixes it: the cached-lane tests below take `CacheLane::wide()` explicitly,
+/// because their tolerances are statements about two implementations of the
+/// same arithmetic and a narrow cache is not that, and
+/// `narrow_slots_are_still_independent` takes `CacheLane::narrow()` and asserts
+/// the one thing that holds exactly at any dtype.
+///
+/// What the two bytes buy is the term itself. The attention matmuls read the
+/// KV cache and almost nothing else: 6.0 GB a pass at 32 slots against 5.4 GB
+/// of slot KV, at 152 GB/s of a measured 236 GB/s bus, which is a
+/// bandwidth-bound lane and not an arithmetic one. Storing the cache narrow --
+/// rather than casting it per pass, which would ADD a full-width read -- halves
+/// what the lane moves AND halves what the run holds, and on this part the
+/// second of those is the ceiling: the slot KV is 15.04 GiB of the head at 96
+/// slots, on a node whose `MemAvailable` bottoms at 1.38 GiB there.
+pub fn attn_bf16() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INK_ATTN_BF16").map(|v| v != "0").unwrap_or(true))
+}
+
+thread_local! {
+    /// A per-thread override of [`attn_bf16`], for tests only.
+    ///
+    /// The env switch is a process-global `OnceLock`, which means a test binary
+    /// gets ONE lane and the other is never exercised. That is the wrong shape
+    /// for a change whose whole subject is a comparison between two lanes, and
+    /// it bites immediately: the cached-lane tests below assert that feeding one
+    /// token at a time reproduces feeding all of them, to a tolerance sized for
+    /// two implementations of the SAME arithmetic. A narrow cache is not the
+    /// same arithmetic -- it stores less -- so those tolerances are statements
+    /// about the wide lane and have to be able to say so.
+    ///
+    /// Rust runs each test on its own thread, so a thread-local is exactly the
+    /// scope: [`with_narrow`] wraps a test body and nothing outside it moves.
+    /// Production never sets it.
+    static NARROW: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether THIS thread's caches are narrow: the override if one is set, the
+/// process default otherwise.
+fn narrow_now() -> bool {
+    NARROW.with(|c| c.get()).unwrap_or_else(attn_bf16)
+}
+
+/// Force a cache dtype for as long as this value lives. Tests only.
+///
+/// A guard rather than a closure because it is a one-line addition at the top
+/// of a function body, where wrapping a body would reindent it and hide the
+/// change in the diff.
+#[cfg(test)]
+pub(crate) struct CacheLane(Option<bool>);
+
+#[cfg(test)]
+impl CacheLane {
+    /// The wide cache: what every tolerance in this module's cached tests was
+    /// written against.
+    pub(crate) fn wide() -> Self {
+        CacheLane(NARROW.with(|c| c.replace(Some(false))))
+    }
+
+    /// The narrow one.
+    pub(crate) fn narrow() -> Self {
+        CacheLane(NARROW.with(|c| c.replace(Some(true))))
+    }
+}
+
+#[cfg(test)]
+impl Drop for CacheLane {
+    fn drop(&mut self) {
+        NARROW.with(|c| c.set(self.0));
+    }
+}
+
+/// `t` in the dtype the KV cache is held in. The identity on the wide lane.
+fn as_kv<const D: usize>(t: Tensor<Bk, D>) -> Tensor<Bk, D> {
+    if narrow_now() {
+        t.cast(burn::tensor::FloatDType::BF16)
+    } else {
+        t
+    }
+}
+
+/// Back to f32, for the softmax and the residual stream. The identity on the
+/// wide lane.
+fn from_kv<const D: usize>(t: Tensor<Bk, D>) -> Tensor<Bk, D> {
+    if narrow_now() {
+        t.cast(burn::tensor::FloatDType::F32)
+    } else {
+        t
+    }
 }
 
 /// One generated token through one attention layer, reading the cache.
@@ -837,8 +961,8 @@ pub fn attention_step(
     let q = head_rms_norm(q, w.q_norm.clone(), heads, head_dim, d.rms_eps);
     let k_new = head_rms_norm(k_new, w.k_norm.clone(), kv_heads, head_dim, d.rms_eps);
 
-    cache.k = Tensor::cat(vec![cache.k.clone(), k_new], 0);
-    cache.v = Tensor::cat(vec![cache.v.clone(), v_new], 0);
+    cache.k = Tensor::cat(vec![cache.k.clone(), as_kv(k_new)], 0);
+    cache.v = Tensor::cat(vec![cache.v.clone(), as_kv(v_new)], 0);
     trim(cache, window);
     let len = cache.len();
     let base = cache.base;
@@ -931,14 +1055,19 @@ pub fn attention_step(
             return t;
         }
         let dim = t.dims()[1];
-        Tensor::cat(vec![t, Tensor::zeros([padded - len, dim], &dev)], 0)
+        Tensor::cat(vec![t, as_kv(Tensor::zeros([padded - len, dim], &dev))], 0)
     };
     let kh = expand(pad_rows(cache.k.clone()));
     let vh = expand(pad_rows(cache.v.clone()));
 
-    let scores = qh.matmul(kh.swap_dims(1, 2)).mul_scalar(d.scaling()) + bias + wmask;
+    // Narrow on both sides of each product and wide again immediately after, so
+    // the bias, the mask and the softmax are the same arithmetic the f32 lane
+    // runs. The scores are `[heads, 1, padded]`; the cache is the megabytes.
+    let scores =
+        from_kv(as_kv(qh).matmul(kh.swap_dims(1, 2))).mul_scalar(d.scaling()) + bias + wmask;
     let probs = burn::tensor::activation::softmax(scores, 2);
-    let out = probs.matmul(vh).swap_dims(0, 1).reshape([1, heads * head_dim]);
+    let out =
+        from_kv(as_kv(probs).matmul(vh)).swap_dims(0, 1).reshape([1, heads * head_dim]);
     linear_bf16(out, &w.wo)
 }
 
@@ -1002,8 +1131,8 @@ pub fn attention_steps(
     let q = head_rms_norm(q, w.q_norm.clone(), heads, head_dim, d.rms_eps);
     let k_new = head_rms_norm(k_new, w.k_norm.clone(), kv_heads, head_dim, d.rms_eps);
 
-    cache.k = Tensor::cat(vec![cache.k.clone(), k_new], 0);
-    cache.v = Tensor::cat(vec![cache.v.clone(), v_new], 0);
+    cache.k = Tensor::cat(vec![cache.k.clone(), as_kv(k_new)], 0);
+    cache.v = Tensor::cat(vec![cache.v.clone(), as_kv(v_new)], 0);
     cache.k_pre = k_all.clone().slice([rows..rows + hist, 0..kdim]);
     cache.v_pre = v_all.clone().slice([rows..rows + hist, 0..vdim]);
     cache.pending = Some(Pending { k_pre: k_all, v_pre: v_all, rows });
@@ -1085,14 +1214,16 @@ pub fn attention_steps(
             return t;
         }
         let dim = t.dims()[1];
-        Tensor::cat(vec![t, Tensor::zeros([padded - len, dim], &dev)], 0)
+        Tensor::cat(vec![t, as_kv(Tensor::zeros([padded - len, dim], &dev))], 0)
     };
     let kh = expand(pad_rows(cache.k.clone()));
     let vh = expand(pad_rows(cache.v.clone()));
 
-    let scores = qh.matmul(kh.swap_dims(1, 2)).mul_scalar(d.scaling()) + bias + wmask;
+    let scores =
+        from_kv(as_kv(qh).matmul(kh.swap_dims(1, 2))).mul_scalar(d.scaling()) + bias + wmask;
     let probs = burn::tensor::activation::softmax(scores, 2);
-    let out = probs.matmul(vh).swap_dims(0, 1).reshape([rows, heads * head_dim]);
+    let out =
+        from_kv(as_kv(probs).matmul(vh)).swap_dims(0, 1).reshape([rows, heads * head_dim]);
     linear_bf16(out, &w.wo)
 }
 
@@ -1327,10 +1458,14 @@ impl SlotCache<Bk> {
         let rec = recent_rows();
         let kcap = (len + 1).next_multiple_of(kv_pad_bucket());
         let mut c = SlotCache {
-            k: Tensor::zeros([rows, kcap, head_dim], &dev),
-            v: Tensor::zeros([rows, kcap, head_dim], &dev),
-            kr: Tensor::zeros([rows, rec, head_dim], &dev),
-            vr: Tensor::zeros([rows, rec, head_dim], &dev),
+            // K and V are the bytes this lane moves and the bytes it holds;
+            // `k_pre`/`v_pre` are `kernel - 1` rows and stay f32, because they
+            // feed a convolution whose output is normed and would pay the
+            // rounding twice.
+            k: as_kv(Tensor::zeros([rows, kcap, head_dim], &dev)),
+            v: as_kv(Tensor::zeros([rows, kcap, head_dim], &dev)),
+            kr: as_kv(Tensor::zeros([rows, rec, head_dim], &dev)),
+            vr: as_kv(Tensor::zeros([rows, rec, head_dim], &dev)),
             k_pre: Tensor::zeros([slots, kernel_hist, kv_width], &dev),
             v_pre: Tensor::zeros([slots, kernel_hist, kv_width], &dev),
             slots,
@@ -1374,8 +1509,12 @@ impl SlotCache<Bk> {
         // were a multiple of the KV pad bucket died — exactly the ones with
         // nothing to pad.
         let headwise = |t: Tensor<Bk, 2>| -> Tensor<Bk, 3> {
-            let pad: Tensor<Bk, 3> = Tensor::zeros([kv_heads, kcap - len, head_dim], &dev);
-            let body = t.reshape([len, kv_heads, head_dim]).swap_dims(0, 1);
+            // The pad is narrowed with the body rather than after it: `cat`
+            // over two dtypes is a promotion nobody asked for, and the seam
+            // between a BF16 cache and an f32 zero block is exactly where one
+            // would happen unnoticed.
+            let pad: Tensor<Bk, 3> = as_kv(Tensor::zeros([kv_heads, kcap - len, head_dim], &dev));
+            let body = as_kv(t.reshape([len, kv_heads, head_dim]).swap_dims(0, 1));
             Tensor::cat(vec![body, pad], 1)
         };
         let r0 = s * kv_heads;
@@ -1428,8 +1567,8 @@ impl SlotCache<Bk> {
             self.merge();
         }
         let r = self.recent;
-        let kn = k_new.reshape([rows, 1, hd]);
-        let vn = v_new.reshape([rows, 1, hd]);
+        let kn = as_kv(k_new.reshape([rows, 1, hd]));
+        let vn = as_kv(v_new.reshape([rows, 1, hd]));
         let kr = take3(&mut self.kr, &dev);
         let vr = take3(&mut self.vr, &dev);
         self.kr = kr.slice_assign([0..rows, r..r + 1, 0..hd], kn);
@@ -1459,8 +1598,8 @@ impl SlotCache<Bk> {
         let real = |t: Tensor<Bk, 3>| t.slice([0..rows, 0..frozen, 0..hd]);
         self.k = Tensor::cat(vec![real(k), kr], 1);
         self.v = Tensor::cat(vec![real(v), vr], 1);
-        self.kr = Tensor::zeros([rows, rec, hd], &dev);
-        self.vr = Tensor::zeros([rows, rec, hd], &dev);
+        self.kr = as_kv(Tensor::zeros([rows, rec, hd], &dev));
+        self.vr = as_kv(Tensor::zeros([rows, rec, hd], &dev));
         self.frozen = frozen + rec;
         self.kcap = self.frozen;
         self.recent = 0;
@@ -1645,10 +1784,20 @@ pub fn attention_slots(
     // head `kv_h` are the `m` rows of its GEMM. `[slots, heads * head_dim]` is
     // already `[slots][kv_h][g][head_dim]` in memory, so this is a reshape and
     // not a permutation.
-    let qh = q.mul_scalar(tau).reshape([rows, groups, head_dim]);
+    // Narrowed on the QUERY side too, so both operands of the score matmul are
+    // the same dtype: a mixed-dtype product is a supported thing on this fork
+    // and is also a second lane to reason about, and `q` is `[rows, groups,
+    // head_dim]` -- kilobytes against the cache's megabytes -- so nothing is
+    // saved by leaving it wide.
+    let qh = as_kv(q.mul_scalar(tau).reshape([rows, groups, head_dim]));
     let scores = |keys: Tensor<Bk, 3>, from: usize, to: usize| -> Tensor<Bk, 3> {
         let (bias, m) = table(from, to);
-        qh.clone().matmul(keys.swap_dims(1, 2)).mul_scalar(d.scaling()) + bias + m
+        // Back to f32 BEFORE the bias, the mask and the softmax. The scores are
+        // `[slots * kv_heads, groups, cap]` -- 16 MB at 32 slots and a 3.8k
+        // context, against 5.4 GB of cache -- so keeping the reduction's OUTPUT
+        // wide costs nothing and keeps every op downstream of it, the softmax
+        // included, exactly the arithmetic the f32 lane runs.
+        from_kv(qh.clone().matmul(keys.swap_dims(1, 2))).mul_scalar(d.scaling()) + bias + m
     };
     let sf = scores(cache.k.clone(), 0, kcap);
     let sr = scores(cache.kr.clone(), kcap, cap);
@@ -1667,7 +1816,12 @@ pub fn attention_slots(
     let probs = burn::tensor::activation::softmax(Tensor::cat(vec![sf, sr], 2), 2);
     let pf = probs.clone().slice([0..rows, 0..groups, 0..kcap]);
     let pr = probs.slice([0..rows, 0..groups, kcap..cap]);
-    let out = pf.matmul(cache.v.clone()) + pr.matmul(cache.vr.clone());
+    // The probabilities are in [0, 1] and sum to one across the two halves, so
+    // narrowing them costs a relative 2^-9 on each weight and nothing on their
+    // sum; the values they weight are the other half of the cache and are the
+    // bytes this is here for.
+    let out = from_kv(as_kv(pf).matmul(cache.v.clone()))
+        + from_kv(as_kv(pr).matmul(cache.vr.clone()));
     linear_bf16(out.reshape([slots, heads * head_dim]), &w.wo)
 }
 
@@ -1815,6 +1969,12 @@ mod tests {
         prefill: usize,
         sabotage_conv_history: bool,
     ) -> f32 {
+        // The WIDE cache, explicitly. What follows compares the cached lane
+        // against recomputing, at a tolerance sized for two implementations of
+        // the SAME arithmetic -- which they are only while the cache is f32. A
+        // narrow cache stores less; holding it to this bar would be asking the
+        // wrong question, and `golden/paired/` is where it is asked instead.
+        let _lane = CacheLane::wide();
         let dev = burn::backend::cuda::CudaDevice::default();
         let d = dims(kind, rel_extent);
         let w = weights(&d, &dev);
@@ -1876,6 +2036,12 @@ mod tests {
         prefill: usize,
         slots: usize,
     ) -> (f32, f32) {
+        // The WIDE cache, explicitly. What follows compares the cached lane
+        // against recomputing, at a tolerance sized for two implementations of
+        // the SAME arithmetic -- which they are only while the cache is f32. A
+        // narrow cache stores less; holding it to this bar would be asking the
+        // wrong question, and `golden/paired/` is where it is asked instead.
+        let _lane = CacheLane::wide();
         let dev = burn::backend::cuda::CudaDevice::default();
         let d = dims(kind, rel_extent);
         let w = weights(&d, &dev);
@@ -1928,6 +2094,97 @@ mod tests {
         (worst, closest)
     }
 
+    /// The NARROW cache, checked the only way a narrower float can be checked
+    /// without an adjudicator: structurally.
+    ///
+    /// The tests above hold the cached lane to recomputing, at a tolerance that
+    /// is a statement about two implementations of the same arithmetic. A BF16
+    /// cache stores less and cannot meet that bar, and loosening it until it
+    /// could would be inventing a tolerance to fit the answer. Whether the
+    /// narrow lane is good ENOUGH is a capability question and is settled in
+    /// `golden/paired/`.
+    ///
+    /// What can still be asserted exactly is the property batching can actually
+    /// get wrong, and it holds at any dtype: slot 0's answer is a function of
+    /// slot 0's tokens and of nothing else. So run the same slot beside three
+    /// DIFFERENT sequences and beside three copies of ITSELF, and require the
+    /// two to be bit-identical -- not close, identical, because contamination
+    /// is fluent output and no error at all.
+    ///
+    /// The second assertion is what keeps the first honest: in the
+    /// heterogeneous batch the four slots must DISAGREE, or a batch that had
+    /// collapsed into one sequence would pass.
+    #[test]
+    fn narrow_slots_are_still_independent() {
+        let _lane = CacheLane::narrow();
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let (kind, rel_extent, window) = (AttnKind::Global, 8usize, None);
+        let d = dims(kind, rel_extent);
+        let w = weights(&d, &dev);
+        let (tokens, prefill, slots) = (11usize, 6usize, 4usize);
+
+        // `seeds[0]` is slot 0 in both batches; the rest differ between them.
+        let run = |seeds: Vec<f32>| -> Vec<Tensor<B, 2>> {
+            let xs: Vec<Tensor<B, 2>> = seeds
+                .iter()
+                .map(|&sd| {
+                    Tensor::from_data(
+                        TensorData::new(fill(tokens * d.hidden, sd), [tokens, d.hidden]),
+                        &dev,
+                    )
+                })
+                .collect();
+            let prefills = xs
+                .iter()
+                .map(|x| {
+                    attention_prefill(
+                        x.clone().slice([0..prefill, 0..d.hidden]),
+                        &w,
+                        &d,
+                        None,
+                        window,
+                        window,
+                    )
+                    .1
+                })
+                .collect();
+            let mut cache = SlotCache::from_prefills(prefills, d.kv_heads, d.head_dim);
+            let mut out = Vec::new();
+            for pos in prefill..tokens {
+                let rows = Tensor::cat(
+                    xs.iter().map(|x| x.clone().slice([pos..pos + 1, 0..d.hidden])).collect(),
+                    0,
+                );
+                out.push(attention_slots(rows, &w, &d, None, pos, window, &mut cache));
+            }
+            out
+        };
+
+        let het = run(vec![2.5, 9.5, 16.5, 23.5]);
+        let hom = run(vec![2.5; slots]);
+        assert_eq!(het.len(), hom.len());
+
+        let (mut moved, mut closest) = (0f32, f32::INFINITY);
+        for (a, b) in het.iter().zip(hom.iter()) {
+            let mine = a.clone().slice([0..1, 0..d.hidden]);
+            let same = b.clone().slice([0..1, 0..d.hidden]);
+            moved = moved.max((mine.clone() - same).abs().max().into_scalar());
+            for other in 1..slots {
+                let theirs = a.clone().slice([other..other + 1, 0..d.hidden]);
+                closest = closest.min((mine.clone() - theirs).abs().max().into_scalar());
+            }
+        }
+        println!("narrow slots: slot 0 moved {moved:e} between neighbours, closest pair {closest:e}");
+        assert_eq!(
+            moved, 0.0,
+            "slot 0's answer moved by {moved:e} when its NEIGHBOURS changed: the narrow batch is              reading keys that are not its own"
+        );
+        assert!(
+            closest > 1e-3,
+            "the four slots produced nearly the same answer ({closest:e}): the batch collapsed              into one sequence and the assertion above proves nothing"
+        );
+    }
+
     /// Eight independent slots on a GLOBAL layer, none of them the same text.
     #[test]
     fn slots_stay_independent_on_a_global_layer() {
@@ -1978,6 +2235,12 @@ mod tests {
     /// bar is rounding rather than tolerance.
     #[test]
     fn one_slot_is_the_one_row_lane() {
+        // The WIDE cache, explicitly. What follows compares the cached lane
+        // against recomputing, at a tolerance sized for two implementations of
+        // the SAME arithmetic -- which they are only while the cache is f32. A
+        // narrow cache stores less; holding it to this bar would be asking the
+        // wrong question, and `golden/paired/` is where it is asked instead.
+        let _lane = CacheLane::wide();
         let dev = burn::backend::cuda::CudaDevice::default();
         let (kind, rel_extent, window) = (AttnKind::Global, 8usize, None);
         let d = dims(kind, rel_extent);
@@ -2218,6 +2481,12 @@ mod tests {
         batch: usize,
         reject: usize,
     ) -> f32 {
+        // The WIDE cache, explicitly. What follows compares the cached lane
+        // against recomputing, at a tolerance sized for two implementations of
+        // the SAME arithmetic -- which they are only while the cache is f32. A
+        // narrow cache stores less; holding it to this bar would be asking the
+        // wrong question, and `golden/paired/` is where it is asked instead.
+        let _lane = CacheLane::wide();
         let dev = burn::backend::cuda::CudaDevice::default();
         let d = dims(kind, rel_extent);
         let w = weights(&d, &dev);
@@ -2507,6 +2776,12 @@ mod tests {
     /// before it, and those pre-convolution inputs are gone once the batch is
     /// over unless the batch keeps its whole window.
     fn compare_conv_batched(tokens: usize, prefill: usize, batch: usize, reject: usize) -> f32 {
+        // The WIDE cache, explicitly. What follows compares the cached lane
+        // against recomputing, at a tolerance sized for two implementations of
+        // the SAME arithmetic -- which they are only while the cache is f32. A
+        // narrow cache stores less; holding it to this bar would be asking the
+        // wrong question, and `golden/paired/` is where it is asked instead.
+        let _lane = CacheLane::wide();
         let dev = burn::backend::cuda::CudaDevice::default();
         let (dim, kernel) = (16usize, 4usize);
         let xs: Tensor<B, 2> =
