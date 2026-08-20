@@ -484,6 +484,55 @@ wall/audio for the whole utterance including load, JIT and prefill;
 binary in a busier window (load 6–8): pool-off 0.92–0.93, default 0.84.
 Target ≤1.0 met with margin; stretch ≤0.8 met on calm windows.
 
+### Phase 2c — `down` joins the pool (2026-08-19, `perf/voice-predictor`)
+
+Phase 2a excluded `down` [1024x3072] from the pool to keep the pool
+byte-transparent, and the 08-18 correction above said to reopen it on
+measurement. Nobody had. Measured now, the exclusion was the most expensive
+thing in the predictor.
+
+Method: `qwen3tts_pred_bench`, a new bin that runs the **real**
+`CodePredictor::predict_frame` over synthetic weights at the checkpoint's
+shapes — Accelerate's sgemv timing is data-independent, so shapes, traffic and
+dispatch pattern are what a bench of this lane has to get right, and those come
+from `CodePredictor::load`. It exists because the canonical `qwen3tts.pile` was
+on an unmounted volume that day. Both arms (`MARY_PRED_DOWN_SERIAL`, flippable
+in process via `predictor::set_down_serial`) interleave round by round, so an
+ambient-load change hits both equally. 100 rounds, p10/p90 within +/-1% of p50,
+and the harness reproduces Phase 2a's own endpoints (35.6 ms at ways=1 vs its
+"serial 36"; 28.8 ms at ways=2 vs its 30.0).
+
+| ms/frame (ways=2) | frame | proj | qkv | o | gate_up | **down** | scalar | head |
+|---|---|---|---|---|---|---|---|---|
+| `down` serial | 28.36 | 0.6 | 5.67 | 2.89 | 8.38 | **8.36** | 1.3 | 1.1 |
+| `down` pooled | 24.39 | 0.6 | 5.70 | 2.90 | 8.42 | **4.38** | 1.3 | 1.1 |
+
+`down` was **29.5% of the whole predictor frame** while carrying 20% of the
+weight traffic; pooling it costs -14.0% off the frame, 2.82x -> 3.28x audio-rate
+for the predictor alone. The reason it was disproportionate is worth keeping:
+the wide-n kernel Phase 2a noticed is not merely *different*, it is *slower* —
+~118 GB/s of weight traffic against ~230 GB/s for every pooled gemv, i.e.
+exactly one AMX stream's worth. A row block at n=3072 selects the ordinary
+kernel and picks up the same 2x as everything else. `down` was never special;
+it was just serial.
+
+**Tree reduction: measured, not taken.** A k-split of `down` into column blocks
+summed pairwise (the O(log n * eps) shape) was a wash at 2 ways (-0.4%, inside
+the noise) and cost +5.5% at 4. The accuracy half of the conjecture did not
+survive either: against an f64 reference, serial / pooled / ksplit at 2, 4, 8
+all land at 4.5e-8 +/- 0.1e-8 relative L2. At n=3072 in f32 the reduction depth
+is not what bounds the error.
+
+**Pool width.** In this harness (predictor alone, nothing else on the machine)
+even widths beat odd and 8 ways edged 2 by ~4%. NOT acted on: Phase 2a's ways=2
+was chosen in situ, against a live GPU talker submit thread, which is the
+condition that decides it. Default stays 2.
+
+**NOT ear-gated.** No local pile could load the cohort (only the 173-tensor f16
+talker fold was on this machine), so nothing has been listened to. The change is
+a pure row split of one gemv onto the pool that already carries the other three,
+but the A/B is owed.
+
 ### Phase 2b — 0.6B talker sibling (`MARY_SPEAK_MODEL=0.6b`)
 
 Qwen3-TTS-12Hz-0.6B-Base: hidden 1024 (vs 2048), mlp 3072 (vs 6144), same

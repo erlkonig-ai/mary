@@ -38,12 +38,36 @@ fn bench_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("QWEN3TTS_BENCH").is_ok())
 }
+
+/// A/B arm for the `down` gemv, the sibling of `MARY_PRED_THREADS`: set
+/// `MARY_PRED_DOWN_SERIAL` to put `down` [1024×3072] back on the plain serial
+/// full-matrix cblas call it used before 2026-08-19. It exists because the
+/// measurement that retired the serial call could only be taken off the pile
+/// (see `qwen3tts_pred_bench`), and re-taking it in situ needs both arms in
+/// one process — hence [`set_down_serial`], which lets a bench interleave
+/// them instead of comparing two separately-loaded runs. Off by default; one
+/// relaxed atomic load against a ~100 µs gemv.
+fn down_flag() -> &'static std::sync::atomic::AtomicBool {
+    static F: OnceLock<std::sync::atomic::AtomicBool> = OnceLock::new();
+    F.get_or_init(|| {
+        std::sync::atomic::AtomicBool::new(std::env::var("MARY_PRED_DOWN_SERIAL").is_ok())
+    })
+}
+fn down_serial() -> bool {
+    down_flag().load(std::sync::atomic::Ordering::Relaxed)
+}
+/// Flip the `down` A/B arm for subsequent calls. See [`down_flag`].
+pub fn set_down_serial(v: bool) {
+    down_flag().store(v, std::sync::atomic::Ordering::Relaxed);
+}
 thread_local! {
     static T_PROJ: Cell<f64> = const { Cell::new(0.0) };
     static T_STACK: Cell<f64> = const { Cell::new(0.0) };
     static T_STACK_GEMV: Cell<f64> = const { Cell::new(0.0) };
     static T_HEAD: Cell<f64> = const { Cell::new(0.0) };
     static N_FRAMES: Cell<u64> = const { Cell::new(0) };
+    /// Per-gemv split of T_STACK_GEMV: qkv, o, gate_up, down.
+    static T_GEMV_PARTS: Cell<[f64; 4]> = const { Cell::new([0.0; 4]) };
 }
 fn add(cell: &'static std::thread::LocalKey<Cell<f64>>, dt: f64) {
     cell.with(|c| c.set(c.get() + dt));
@@ -178,11 +202,15 @@ impl CodePredictor {
         let bench = bench_enabled();
         let t_all = std::time::Instant::now();
         let mut gemv_s = 0f64;
-        let mut tg = |f: &mut dyn FnMut()| {
+        // per-gemv split: 0 = qkv, 1 = o, 2 = gate_up, 3 = down
+        let mut parts = [0f64; 4];
+        let mut tg = |slot: usize, f: &mut dyn FnMut()| {
             if bench {
                 let t = std::time::Instant::now();
                 f();
-                gemv_s += t.elapsed().as_secs_f64();
+                let d = t.elapsed().as_secs_f64();
+                gemv_s += d;
+                parts[slot] += d;
             } else {
                 f();
             }
@@ -198,7 +226,7 @@ impl CodePredictor {
         let mut act = vec![0f32; INTER];
         for (li, l) in self.layers.iter().enumerate() {
             rms_norm(x, &l.in_norm, TALKER_EPS, &mut xin);
-            tg(&mut || sgemv_mt(&l.qkv, Q_DIM + 2 * KV_DIM, hd, &xin, &mut qkv));
+            tg(0, &mut || sgemv_mt(&l.qkv, Q_DIM + 2 * KV_DIM, hd, &xin, &mut qkv));
             let (q, rest) = qkv.split_at_mut(Q_DIM);
             let (k, v) = rest.split_at_mut(KV_DIM);
             for h in 0..PRED_HEADS {
@@ -229,21 +257,34 @@ impl CodePredictor {
                     }
                 }
             }
-            tg(&mut || sgemv_mt(&l.o, hd, Q_DIM, &attn, &mut proj));
+            tg(1, &mut || sgemv_mt(&l.o, hd, Q_DIM, &attn, &mut proj));
             for (xi, &p) in x.iter_mut().zip(&proj) {
                 *xi += p;
             }
 
             rms_norm(x, &l.post_norm, TALKER_EPS, &mut xin);
-            tg(&mut || sgemv_mt(&l.gate_up, 2 * INTER, hd, &xin, &mut gu));
+            tg(2, &mut || sgemv_mt(&l.gate_up, 2 * INTER, hd, &xin, &mut gu));
             for i in 0..INTER {
                 let g = gu[i];
                 act[i] = g / (1.0 + (-g).exp()) * gu[INTER + i];
             }
-            // `down` [1024×3072] must stay a SERIAL full-matrix call: at n=3072
-            // cblas selects a different kernel for the full call than for any
-            // row block, so the pool would change bits (see cpu::sgemv_mt).
-            tg(&mut || sgemv(&l.down, hd, INTER, &act, &mut proj));
+            // `down` [1024×3072] goes through the pool like the other three.
+            // It was held out as a serial full-matrix call to keep the bytes
+            // the serial lane produced; that gate is retired, and the serial
+            // call turned out to be the single most expensive gemv in the
+            // predictor — the wide-n cblas kernel it selects runs at about
+            // half the bandwidth of a row-block call (~118 vs ~230 GB/s
+            // measured), so it cost 8.4 ms of a 28.4 ms frame while carrying
+            // 20% of the weight traffic. Pooling it: 8.4 → 4.4 ms, −14% on
+            // the whole predictor frame (`qwen3tts_pred_bench`; the numbers
+            // and the one thing NOT checked are in cpu::sgemv_mt's block).
+            tg(3, &mut || {
+                if down_serial() {
+                    sgemv(&l.down, hd, INTER, &act, &mut proj)
+                } else {
+                    sgemv_mt(&l.down, hd, INTER, &act, &mut proj)
+                }
+            });
             for (xi, &p) in x.iter_mut().zip(&proj) {
                 *xi += p;
             }
@@ -251,6 +292,13 @@ impl CodePredictor {
         if bench {
             add(&T_STACK, t_all.elapsed().as_secs_f64());
             add(&T_STACK_GEMV, gemv_s);
+            T_GEMV_PARTS.with(|c| {
+                let mut v = c.get();
+                for (a, b) in v.iter_mut().zip(parts) {
+                    *a += b;
+                }
+                c.set(v);
+            });
         }
     }
 
@@ -285,12 +333,24 @@ impl CodePredictor {
             T_STACK_GEMV.with(|c| c.replace(0.0)),
             T_HEAD.with(|c| c.replace(0.0)),
         );
+        let p = T_GEMV_PARTS.with(|c| c.replace([0.0; 4]));
         Some(format!(
-            "{:.1}ms proj + {:.1}ms stack (gemv {:.1}ms, scalar attn/norm {:.1}ms) + {:.1}ms \
-             lm_head+sample per frame",
+            "{:.1}ms proj + {:.1}ms stack (gemv {:.1}ms [qkv {:.2} | o {:.2} | gate_up {:.2} | \
+             down {:.2} = {:.1}% of gemv, {:.1}% of predictor], scalar attn/norm {:.1}ms) + \
+             {:.1}ms lm_head+sample per frame",
             proj / n * 1e3,
             stack / n * 1e3,
             gemv / n * 1e3,
+            p[0] / n * 1e3,
+            p[1] / n * 1e3,
+            p[2] / n * 1e3,
+            p[3] / n * 1e3,
+            if gemv > 0.0 { p[3] / gemv * 100.0 } else { 0.0 },
+            if proj + stack + head > 0.0 {
+                p[3] / (proj + stack + head) * 100.0
+            } else {
+                0.0
+            },
             (stack - gemv) / n * 1e3,
             head / n * 1e3
         ))
