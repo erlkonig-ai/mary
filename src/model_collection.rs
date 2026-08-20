@@ -189,20 +189,19 @@ fn model_graph_collection(team: VerifyingKey) -> SimpleArchiveCollection {
 
 /// Prepare one canonical model commit entirely in memory.
 ///
-/// Preparation validates the descriptor, archives, signature, and every blob
-/// embedded in `fragment`, but touches no destination storage. A commit-last
-/// importer can stage the returned value's dependencies, validate them through
-/// the destination's own reader, and expose authority only by calling
-/// `finalize` after those gates succeed.
+/// Preparation validates the descriptor, archives, and every blob embedded in
+/// `fragment`, but touches no destination storage and needs no key: the commit
+/// is signed by `stage`, over the handles the store itself returns. A
+/// commit-last importer can stage the returned value's dependencies, validate
+/// them through the destination's own reader, and expose authority only by
+/// calling `finalize` after those gates succeed.
 pub fn prepare_model_fragment(
     team: VerifyingKey,
-    signing_key: &SigningKey,
     fragment: Fragment,
 ) -> Result<PreparedCollectionCommit, PreparationError> {
     simplearchive_union::prepare_fragment_commit(
         &model_graph_collection(team).descriptor(),
         fragment,
-        signing_key,
     )
 }
 
@@ -357,6 +356,25 @@ pub fn sole_model_graph_team(pile: &mut Pile) -> Result<VerifyingKey, SoleModelG
         _ => Err(SoleModelGraphTeamError::Several {
             teams: teams.iter().map(|team| team.to_bytes()).collect(),
         }),
+    }
+}
+
+/// The team already publishing a model graph here, or the writer's own.
+///
+/// A publisher holds a signing key and a pile, and those two do not settle the
+/// question by themselves: the team owns the collection, the key only signs one
+/// commit into it. So join the collection that is already here, and found one
+/// under your own identity only when there is none. Ambiguity is still refused
+/// — picking a team out of several is exactly the guess `sole_model_graph_team`
+/// exists to refuse.
+pub fn model_graph_team_or_own(
+    pile: &mut Pile,
+    signing_key: &SigningKey,
+) -> Result<VerifyingKey, SoleModelGraphTeamError> {
+    match sole_model_graph_team(pile) {
+        Ok(team) => Ok(team),
+        Err(SoleModelGraphTeamError::None) => Ok(signing_key.verifying_key()),
+        Err(error) => Err(error),
     }
 }
 

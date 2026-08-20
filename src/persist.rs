@@ -228,7 +228,8 @@ pub fn import_model_to_collection(
 ) -> anyhow::Result<(Id, CollectionCommit)> {
     let root = ingest_model_fragment(pile, model_dir, dtype, source, quantization)?;
     let root_id = root.root().expect("model root id");
-    let commit = crate::model_collection::publish_model_fragment(pile, signing_key, root)
+    let team = crate::model_collection::model_graph_team_or_own(pile, signing_key)?;
+    let commit = crate::model_collection::publish_model_fragment(pile, team, signing_key, root)
         .map_err(|error| anyhow::anyhow!("publish model collection commit: {error}"))?;
     Ok((root_id, commit))
 }
@@ -306,7 +307,8 @@ pub fn derive_selected_f16_to_collection<R: BlobStoreGet>(
     let root = crate::ingest::build_model_root(pile, source, quantization, members, facts, &[])
         .map_err(|error| anyhow::anyhow!("build derived f16 model root: {error}"))?;
     let root_id = root.root().expect("derived f16 model root");
-    let commit = crate::model_collection::publish_model_fragment(pile, signing_key, root)
+    let team = crate::model_collection::model_graph_team_or_own(pile, signing_key)?;
+    let commit = crate::model_collection::publish_model_fragment(pile, team, signing_key, root)
         .map_err(|error| anyhow::anyhow!("publish derived f16 model root: {error}"))?;
     Ok((root_id, commit, tensor_count, elements))
 }
@@ -336,7 +338,8 @@ pub fn import_safetensors_file_filtered_to_collection(
     let root =
         ingest_safetensors_file_filtered_fragment(pile, file, dtype, source, quantization, keep)?;
     let root_id = root.root().expect("model root id");
-    let commit = crate::model_collection::publish_model_fragment(pile, signing_key, root)
+    let team = crate::model_collection::model_graph_team_or_own(pile, signing_key)?;
+    let commit = crate::model_collection::publish_model_fragment(pile, team, signing_key, root)
         .map_err(|error| anyhow::anyhow!("publish model collection commit: {error}"))?;
     Ok((root_id, commit))
 }
@@ -603,8 +606,10 @@ mod filtered_native_import_tests {
         )
         .unwrap();
 
+        let team = signing_key.verifying_key();
         let snapshot =
-            crate::model_collection::snapshot_model_collection_exact(&mut pile, &[commit]).unwrap();
+            crate::model_collection::snapshot_model_collection_exact(&mut pile, team, &[commit])
+                .unwrap();
         let keymap = crate::selection::load_keymap_from_graph(
             snapshot.facts(),
             snapshot.reader(),
@@ -631,7 +636,7 @@ mod filtered_native_import_tests {
         pile.close().unwrap();
 
         let latest =
-            crate::model_collection::load_model_collection_local_latest(&pile_path).unwrap();
+            crate::model_collection::load_model_collection_local_latest(&pile_path, team).unwrap();
         assert_eq!(latest.commits(), &[commit]);
     }
 
@@ -2061,7 +2066,8 @@ fn select_native_model_index(
     selector: crate::selection::ModelSelector<'_>,
 ) -> anyhow::Result<crate::selection::SelectedModelIndex<triblespace::core::repo::pile::PileReader>>
 {
-    let snapshot = crate::model_collection::load_model_collection_local_latest(pile_path)
+    let team = crate::model_collection::model_graph_team_at(pile_path)?;
+    let snapshot = crate::model_collection::load_model_collection_local_latest(pile_path, team)
         .with_context(|| format!("load local-latest native model snapshot from {pile_path:?}"))?;
     crate::selection::SelectedModelIndex::from_snapshot(snapshot, selector)
         .with_context(|| format!("select one native model root in {pile_path:?}"))

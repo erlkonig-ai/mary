@@ -291,11 +291,18 @@ mod tests {
         fragment
     }
 
+    /// The one team these fixtures publish under; a snapshot has to name the
+    /// same team the commits were published to.
+    fn test_team() -> ed25519_dalek::VerifyingKey {
+        SigningKey::from_bytes(&[0x56; 32]).verifying_key()
+    }
+
     fn publish(path: &Path, fragments: impl IntoIterator<Item = Fragment>) {
         let mut pile = Pile::open(path).expect("open synthetic Voxtral pile");
         for fragment in fragments {
             crate::model_collection::publish_model_fragment(
                 &mut pile,
+                test_team(),
                 &SigningKey::from_bytes(&[0x56; 32]),
                 fragment,
             )
@@ -316,7 +323,8 @@ mod tests {
     }
 
     fn load(path: &Path) -> anyhow::Result<VoxtralWeights<PileReader>> {
-        let snapshot = crate::model_collection::load_model_collection_local_latest(path)?;
+        let snapshot =
+            crate::model_collection::load_model_collection_local_latest(path, test_team())?;
         VoxtralWeights::from_snapshot(snapshot)
     }
 

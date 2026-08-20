@@ -97,7 +97,8 @@ fn main() -> anyhow::Result<()> {
         args.pile
     );
     let t0 = std::time::Instant::now();
-    let snapshot = mary::model_collection::load_model_collection_local_latest(&args.pile)?;
+    let team = mary::model_collection::model_graph_team_at(&args.pile)?;
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&args.pile, team)?;
     let loader = mary::models::voxtral::VoxtralWeights::from_snapshot(snapshot)?.into_loader();
     let max_tokens = 8192;
     match lane.as_str() {

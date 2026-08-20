@@ -124,14 +124,17 @@ fn publish_embedding_candidate_with_contract_impl(
     // destination's own reader, then append the signed commit as the final
     // publication step.
     let candidate_facts = candidate.facts().clone();
-    let prepared = mary::model_collection::prepare_model_fragment(signing_key, candidate)
+    let team = mary::model_collection::model_graph_team_or_own(pile, signing_key)?;
+    let prepared = mary::model_collection::prepare_model_fragment(team, candidate)
         .map_err(|error| anyhow::anyhow!("prepare embedding collection commit: {error}"))?;
     let mut staged = prepared
-        .stage(pile)
+        .stage(pile, signing_key)
         .map_err(|error| anyhow::anyhow!("stage embedding commit dependencies: {error}"))?;
 
-    let snapshot =
-        mary::model_collection::snapshot_model_collection_local_latest(staged.store_mut())?;
+    let snapshot = mary::model_collection::snapshot_model_collection_local_latest(
+        staged.store_mut(),
+        team,
+    )?;
     let (mut facts, _, reader) = snapshot.into_parts();
     facts += candidate_facts;
     let selected = SelectedModelIndex::from_graph(

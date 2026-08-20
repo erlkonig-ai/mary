@@ -830,11 +830,18 @@ mod tests {
         fragment
     }
 
+    /// The one team these fixtures publish under; a snapshot has to name the
+    /// same team the commits were published to.
+    fn test_team() -> ed25519_dalek::VerifyingKey {
+        SigningKey::from_bytes(&[0x46; 32]).verifying_key()
+    }
+
     fn publish(path: &Path, fragments: impl IntoIterator<Item = Fragment>) {
         let mut pile = Pile::open(path).expect("open synthetic FLUX pile");
         for fragment in fragments {
             crate::model_collection::publish_model_fragment(
                 &mut pile,
+                test_team(),
                 &SigningKey::from_bytes(&[0x46; 32]),
                 fragment,
             )
@@ -855,7 +862,7 @@ mod tests {
             ],
         );
 
-        let snapshot = crate::model_collection::load_model_collection_local_latest(file.path())
+        let snapshot = crate::model_collection::load_model_collection_local_latest(file.path(), test_team())
             .expect("freeze native FLUX snapshot");
         let weights = FluxWeights::from_snapshot(snapshot, ModelVariant::Klein)
             .expect("index all FLUX components");
@@ -874,7 +881,7 @@ mod tests {
         assert_eq!(weights.transformer()["tr.weight"], (vec![2.0], vec![1]));
         assert_eq!(weights.vae()["vae.weight"], (vec![3.0], vec![1]));
 
-        let widened = crate::model_collection::load_model_collection_local_latest(file.path())
+        let widened = crate::model_collection::load_model_collection_local_latest(file.path(), test_team())
             .expect("load widened native FLUX snapshot");
         let error = FluxWeights::from_snapshot(widened, ModelVariant::Klein)
             .err()

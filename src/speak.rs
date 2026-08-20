@@ -853,11 +853,18 @@ mod tests {
         fragment
     }
 
+    /// The one team these fixtures publish under; a snapshot has to name the
+    /// same team the commits were published to.
+    fn test_team() -> ed25519_dalek::VerifyingKey {
+        SigningKey::from_bytes(&[0x51; 32]).verifying_key()
+    }
+
     fn publish(path: &Path, fragments: impl IntoIterator<Item = Fragment>) {
         let mut pile = Pile::open(path).expect("open synthetic Qwen3-TTS pile");
         for fragment in fragments {
             crate::model_collection::publish_model_fragment(
                 &mut pile,
+                test_team(),
                 &SigningKey::from_bytes(&[0x51; 32]),
                 fragment,
             )
@@ -905,7 +912,7 @@ mod tests {
         let variant = Qwen3TtsVariant::Base1_7B;
         publish(file.path(), cohort(variant));
 
-        let snapshot = crate::model_collection::load_model_collection_local_latest(file.path())
+        let snapshot = crate::model_collection::load_model_collection_local_latest(file.path(), test_team())
             .expect("freeze native Qwen3-TTS snapshot");
         let weights = Qwen3TtsWeights::from_snapshot(snapshot, variant)
             .expect("select complete native Qwen3-TTS cohort");
@@ -928,7 +935,7 @@ mod tests {
         );
         assert_eq!(weights.counts(), (2, 1, 1));
 
-        let widened = crate::model_collection::load_model_collection_local_latest(file.path())
+        let widened = crate::model_collection::load_model_collection_local_latest(file.path(), test_team())
             .expect("load widened native Qwen3-TTS snapshot");
         let error = Qwen3TtsWeights::from_snapshot(widened, variant)
             .err()

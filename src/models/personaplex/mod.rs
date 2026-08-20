@@ -158,6 +158,12 @@ mod native_authority_tests {
 
     static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
 
+    /// The one team these fixtures publish under. Fixed, because a snapshot
+    /// must name the same team the commit was published to.
+    fn test_team() -> ed25519_dalek::VerifyingKey {
+        SigningKey::from_bytes(&[0x50; 32]).verifying_key()
+    }
+
     struct TestPile(PathBuf);
 
     impl TestPile {
@@ -265,19 +271,24 @@ mod native_authority_tests {
         let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
         let first = crate::model_collection::publish_model_fragment(
             &mut pile,
+            test_team(),
             &signing_key,
             fragment.clone(),
         )
         .expect("publish exact PersonaPlex root");
         let len_after_first = std::fs::metadata(file.path()).unwrap().len();
-        let repeated =
-            crate::model_collection::publish_model_fragment(&mut pile, &signing_key, fragment)
-                .expect("repeat exact PersonaPlex publication");
+        let repeated = crate::model_collection::publish_model_fragment(
+            &mut pile,
+            test_team(),
+            &signing_key,
+            fragment,
+        )
+        .expect("repeat exact PersonaPlex publication");
         let len_after_retry = std::fs::metadata(file.path()).unwrap().len();
         assert_eq!(first, repeated);
         assert_eq!(len_after_first, len_after_retry);
 
-        let snapshot = crate::model_collection::snapshot_model_collection_local_latest(&mut pile)
+        let snapshot = crate::model_collection::snapshot_model_collection_local_latest(&mut pile, test_team())
             .expect("freeze exact PersonaPlex prefix");
         let weights =
             PersonaPlexWeights::from_snapshot(snapshot).expect("select exact PersonaPlex root");
@@ -295,11 +306,12 @@ mod native_authority_tests {
         let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
         crate::model_collection::publish_model_fragment(
             &mut pile,
+            test_team(),
             &SigningKey::from_bytes(&[0x50; 32]),
             model_fragment(&[("weight", &[1.0], &[1])], true),
         )
         .expect("publish incompatible PersonaPlex root");
-        let snapshot = crate::model_collection::snapshot_model_collection_local_latest(&mut pile)
+        let snapshot = crate::model_collection::snapshot_model_collection_local_latest(&mut pile, test_team())
             .expect("freeze incompatible PersonaPlex prefix");
         let error = PersonaPlexWeights::from_snapshot(snapshot)
             .err()
@@ -315,13 +327,14 @@ mod native_authority_tests {
         let existing = pile_model_fragment(&mut pile, &[("weight", &[1.0], &[1])]);
         let existing_commit = crate::model_collection::publish_model_fragment(
             &mut pile,
+            test_team(),
             &SigningKey::from_bytes(&[0x51; 32]),
             existing,
         )
         .expect("publish existing PersonaPlex authority");
 
         let candidate = pile_model_fragment(&mut pile, &[("weight", &[2.0], &[1])]);
-        let snapshot = crate::model_collection::snapshot_model_collection_local_latest(&mut pile)
+        let snapshot = crate::model_collection::snapshot_model_collection_local_latest(&mut pile, test_team())
             .expect("freeze preexisting authority after staging candidate blobs");
         assert_eq!(snapshot.commits(), &[existing_commit]);
         let (mut candidate_view, _, reader) = snapshot.into_parts();
@@ -331,7 +344,7 @@ mod native_authority_tests {
             .expect("conflicting Source/native roots must fail closed");
         assert!(format!("{error:#}").contains("ambiguous"), "{error:#}");
 
-        let unchanged = crate::model_collection::snapshot_model_collection_local_latest(&mut pile)
+        let unchanged = crate::model_collection::snapshot_model_collection_local_latest(&mut pile, test_team())
             .expect("re-read authority after rejected candidate");
         assert_eq!(unchanged.commits(), &[existing_commit]);
         drop(unchanged);

@@ -194,7 +194,9 @@ fn main() {
         gib(pile_size)
     );
 
-    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile_path)
+    let team = mary::model_collection::model_graph_team_at(&pile_path)
+        .expect("sole model-graph team in the Nomic pile");
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile_path, team)
         .expect("fresh-load native Nomic text collection");
     let keymap = mary::selection::load_keymap_from_graph(
         snapshot.facts(),
