@@ -620,22 +620,18 @@
 //!   64 -- and it halves per-node weight residency, which is the thing that ran
 //!   out at 96. It needs every weight resharded, NCCL inside the loop, and the
 //!   KV cache split by head.
-//! * **A two-cohort pipeline interleave.** The slots are independent already, so
-//!   cohort B's layers 0:21 can run on the head while cohort A's 21:42 run on
-//!   the tail. A round advances both cohorts and costs `2 * max(H, T)`, which is
-//!   `p50(c)` for `2c` tokens, so at a fixed slot budget it is worth
-//!   `p50(2c) / p50(c)`: **866.3 / 585.7 = 1.48x** at 64 slots (109 aggregate
-//!   tok/s) and 1.45x at 96 (129). No collective, no resharding, no new kernel --
-//!   the change is the pipe loop's send/receive order and a second
-//!   [`dev_lane::SlotCache`]. It costs nothing in memory over the single-cohort
-//!   arm of the same total width, and it doubles the prefill phase before the
-//!   first token, which is already the startup cost.
+//! * **A two-cohort pipeline interleave.** BUILT -- `INK_COHORTS`, the section
+//!   after next. It predicted `p50(2c) / p50(c)` at a fixed slot budget:
+//!   866.3 / 585.7 = 1.48x at 64 slots, 1.45x at 96. Measured, **1.49x at 64
+//!   and 1.46x at 32**, and the head's idle half went from 48.7% to 16.6%.
 //!
-//! The interleave is the one to build first. It is a fraction of the work, it
-//! composes with the split rather than competing for the same half, and it is
-//! the only one of the two whose correctness question this lane has already
-//! answered -- `b` independent sequences that share nothing but the weights is
-//! what `INK_SLOTS` is, and two cohorts of them is the same statement twice.
+//! The interleave was the one to build first, and it stays the cheaper half of
+//! the answer: it is a `VecDeque` and an index against every weight resharded,
+//! and the two COMPOSE rather than competing -- the split halves what each node
+//! reads, the interleave stops each node waiting, and neither takes the other's
+//! win. What the interleave does NOT do is reduce per-node weight residency,
+//! which is the thing that ran out at 96 slots, so the split is still the lever
+//! for the ceiling and the interleave is the lever for the idle half.
 //!
 //! ## Batching the prefills, priced rather than built
 //!
@@ -684,6 +680,164 @@
 //! whole-sequence run, is BIT-IDENTICAL on a global layer and 1.15e-2 on a local
 //! one, which is the TF32-against-banded-prefill gap the existing cached-local
 //! test already sits at (`slots_stay_independent_on_a_*_layer` in `burn.rs`).
+//!
+//! # `INK_COHORTS=c`: c cohorts, offset so neither node is half idle
+//!
+//! The largest number in the profile above is not a kernel. It is the 48% of
+//! the wall on which a node's GPU has nothing to do, and the section before it
+//! is the argument that batching cannot fill that: the two halves of one token
+//! are strictly ordered, so widening scales both and leaves the ratio where it
+//! was. Two cohorts can fill it. The slots are already independent -- that is
+//! what `INK_SLOTS` establishes -- so nothing stops cohort B's layers 0:21
+//! running on the head while cohort A's 21:42 run on the tail. A round is `c`
+//! passes, advances every cohort by one token, and costs `c * max(H, T)` where
+//! the same total width in one cohort costs `H' + T'` at `c` times the per-node
+//! batch.
+//!
+//! ## It is a queue and an index
+//!
+//! The head pushes the cohort it just sent onto a `VecDeque` and then reads the
+//! answer to the OLDEST outstanding one rather than to the one it just sent,
+//! leaving `c - 1` in flight. That is the whole interleave. Around it:
+//! `slots_dev` grows a leading cohort axis so `slots_dev[c][layer]` is one
+//! cohort's [`dev_lane::SlotCache`] and the two indices are never mixed; the
+//! answer is committed to the cohort it belongs to and not to the one this pass
+//! computed; and the wire grows one `u64`.
+//!
+//! That `u64` is the cohort id and it is not redundant. Both ends derive the
+//! cohort from the same step counter and would normally agree by arithmetic; a
+//! pair that ever disagreed would run one cohort's residual against another
+//! cohort's keys, which is fluent text and no error at all. Eight bytes a pass
+//! buys a loud failure instead of a silent one.
+//!
+//! No collective, no resharding, no new kernel, and no change to any lane's
+//! arithmetic: a cohort's pass is byte-for-byte the pass it would have run
+//! alone, which the gate below checks rather than assumes.
+//!
+//! The PREFILLS stay strict whatever `c` is. A prefill's answer seeds the slot
+//! it just filled and there is nothing to overlap it with, so the only thing
+//! `INK_COHORTS` changes before the first decoded token is that there are
+//! `c * b` prefills instead of `b`.
+//!
+//! ## What it costs and what it buys
+//!
+//! Warm p50 over 40 passes, `/tmp/mix_891k.ids` (891,510 tokens of ordinary
+//! English prose), 3732-token prompts, two-node pipe over the direct link,
+//! layers 0:21 and 21:42, `INK_KV=1`. Every row is compared against the
+//! SINGLE-cohort arm of the same TOTAL slot count, because that is the arm it
+//! replaces -- `2 x 32` and `1 x 64` hold sixty-four sequences either way.
+//!
+//! ```text
+//!   total   ONE cohort           TWO cohorts                        gain
+//!   slots   p50 ms  agg tok/s    b    p50 ms       agg tok/s
+//!     32     585.7     54.6      16   200.8 203.3  79.7  78.7      1.46x
+//!     64     866.3     73.9      32   289.9 290.3  110.4 110.2     1.49x
+//!     96    1081.4     88.8      48   371.8        129.1           1.45x
+//! ```
+//!
+//! **1.46x, 1.49x and 1.45x, against predictions of 1.46, 1.48 and 1.45.** The
+//! prediction was not fitted to anything: it is `p50(2c) / p50(c)` read off the
+//! single-cohort table above, which is the batch's own sublinearity, and that
+//! is precisely what the interleave converts into throughput. It follows that
+//! the gain is bounded by how sublinear the batch is at that width and by
+//! nothing else -- the ratio sits between 1.38 and 1.50 everywhere the
+//! single-cohort table has been measured, so there is no width at which this is
+//! worth much more or much less than a half.
+//!
+//! **129.1 aggregate tok/s** is where this lane now peaks, at ninety-six
+//! sequences of a 3732-token context each.
+//!
+//! Reproducibility below the memory wall: the two `2 x 32` runs read 289.9 and
+//! 290.3 ms, a 0.1% spread; the two `2 x 16` runs 200.8 and 203.3, 1.2%.
+//!
+//! ## The idle half is two thirds gone, and what is left is not idle
+//!
+//! The head's own accounting, `2 x 32` against `1 x 64`: **computing 83.4%,
+//! blocked 16.6%**, against 49.1% and 50.9%. At `2 x 48` against `1 x 96` it is
+//! 82.2 / 17.8 against 47.2 / 52.8. Writing to the wire is 6.7 ms over forty
+//! passes at 32 and 10.0 ms at 48 -- a fifth of a millisecond a pass -- so
+//! nothing here is the socket, and the head never blocks in `send_stream`: a
+//! 48-row residual is 768 KB and the kernel buffers it while the tail is busy.
+//! That was the one way this could have failed quietly, by serialising the
+//! pipeline on a socket write and still producing correct text.
+//!
+//! The residual 16.6% is not structural idle. It is JITTER between two stages
+//! that are within 1% of each other: the head's pass p50 is 289.9 ms and the
+//! tail's 287.7, so whichever end happens to be slower on a given pass makes
+//! the other wait, and over forty passes that averages to a real 60-odd ms. A
+//! deeper queue would absorb it -- with `c - 1` answers outstanding the head can
+//! run ahead -- and that is the one thing a third cohort would buy.
+//!
+//! ## Depth past two, and why it is not measured here
+//!
+//! It cannot pay, and the argument is short enough to make instead of running
+//! it. A round costs `max(H, T)` a pass at ANY depth above one -- the second
+//! cohort is what stops a node waiting, and a third finds nothing left to fill.
+//! What a third cohort does take is WIDTH: at a fixed slot budget it makes each
+//! cohort smaller, and width is where the sublinearity that the interleave
+//! converts actually lives. `3 x 16` and `2 x 24` are both forty-eight
+//! sequences; the first emits 16 tokens on a pass the measured table puts near
+//! 201 ms and the second 24 on one near 248, which is the same machine and a
+//! fifth less throughput, plus one more cohort of caches to hold on the
+//! resource that is already the ceiling.
+//!
+//! The one thing a deeper queue WOULD buy is the jitter above -- with two
+//! answers outstanding the head never waits for the slower end. That is worth
+//! at most the 17% and it costs width, so it is a trade to make only if the two
+//! halves are ever left badly unbalanced.
+//!
+//! ## Memory: the same caches, and the same wall
+//!
+//! Two cohorts of `b` hold exactly what one cohort of `2b` holds -- `2b` caches
+//! -- and the measurement says so to the hundredth of a gibibyte: `pool live`
+//! is 13.85 GiB at `2 x 32` and 13.85 GiB at `1 x 64`, and 19.88 GiB at both
+//! `2 x 48` and `1 x 96`. **The interleave buys throughput and it does not buy
+//! headroom**, which matters because host RAM is what this part runs out of.
+//!
+//! Below the wall the reservation differs slightly in the interleave's favour:
+//! at 64 slots 15.98 GiB reserved against 17.40, so 2.13 GiB stranded over 608
+//! slices against 3.55 over 440, and `MemAvailable` on the head bottoms at
+//! 10.42 GiB against 8.27.
+//!
+//! At 96 it does not. Both arms meet the SAME bound, and it is the host's RAM
+//! and not the device pool or the arithmetic: `2 x 48` reserves 28.68 GiB to
+//! hold 19.88, `MemAvailable` bottoms at **0.43 GiB** and the head swaps
+//! 4.25 GiB, against 1.38 GiB and 5.50 for `1 x 96`. What it costs is the
+//! PREFILL and not the decode: prefills that run at 7 s a slot while only
+//! cohort 0's batch exists go to 45 s a slot from the moment cohort 1's batch
+//! is allocated -- forty-two minutes for the phase -- while the decode that
+//! follows holds 354-372 ms over its forty passes and reads its predicted rate.
+//! That is the same shape the single-cohort arm shows at 96 and for the same
+//! reason: what gets swapped is reservation nothing reads.
+//!
+//! The 96-slot row is ONE run, not two, and it is quoted that way on purpose:
+//! its arm costs forty-two minutes of prefill under swap, and repeating it
+//! would price the allocator rather than the interleave. The two arms below the
+//! wall are two runs each and agree to 0.1% and 1.2%.
+//!
+//! ## The gate, and the one thing this could have got wrong
+//!
+//! Two cohorts sharing one pipe is exactly the shape that could cross-
+//! contaminate, and cross-contamination is fluent text and no error. So the
+//! check holds the cohort's own contents FIXED and changes only whether a
+//! second cohort is in the pipe beside it. Whole stack, eight slots of
+//! 512-token prompts, 20 decode passes:
+//!
+//! * cohort 0 of a `2 x 8` run and the same eight slots as a `1 x 8` run emit
+//!   the **identical** 20-token stream, token for token, on every slot;
+//! * the eight slots of that cohort emit eight DISTINCT continuations, so the
+//!   agreement is not a batch that collapsed into one sequence;
+//! * with cohort 0 homogeneous -- slot 0 beside seven copies of itself, and a
+//!   heterogeneous cohort 1 in the pipe beside it -- all eight slots emit the
+//!   same token on every step, and it is the same token slot 0 emits in the
+//!   heterogeneous run;
+//! * `slots_stay_independent_on_a_global_layer` and `..._on_a_local_layer` are
+//!   unmoved at 0e0 and 1.15e-2.
+//!
+//! And at `INK_COHORTS=1` the transcript is character for character the one
+//! every arm above was measured on: the cohort tag is only printed when there
+//! is more than one, and the same eight slots on the pre-interleave binary and
+//! on this one emit identical streams.
 //!
 //! # One lane, all the way down
 //!
@@ -844,10 +998,11 @@ enum Pipe {
 /// cannot derive it: with a KV cache a decode step feeds ONE token whose
 /// absolute position is what log scaling and the relative bias are functions of,
 /// and the tail has never seen the sequence it belongs to.
-fn send_stream(s: &mut TcpStream, n: usize, pos0: usize, x: &[f32]) -> Result<()> {
-    let mut b = Vec::with_capacity(16 + x.len() * 4);
+fn send_stream(s: &mut TcpStream, n: usize, pos0: usize, coh: usize, x: &[f32]) -> Result<()> {
+    let mut b = Vec::with_capacity(24 + x.len() * 4);
     b.extend_from_slice(&(n as u64).to_le_bytes());
     b.extend_from_slice(&(pos0 as u64).to_le_bytes());
+    b.extend_from_slice(&(coh as u64).to_le_bytes());
     for v in x {
         b.extend_from_slice(&v.to_le_bytes());
     }
@@ -857,13 +1012,17 @@ fn send_stream(s: &mut TcpStream, n: usize, pos0: usize, x: &[f32]) -> Result<()
 }
 
 /// The other side of [`send_stream`]. `None` when the peer is done.
-fn recv_stream(s: &mut TcpStream, h: usize) -> Result<Option<(usize, usize, Vec<f32>)>> {
-    let mut hdr = [0u8; 16];
+fn recv_stream(
+    s: &mut TcpStream,
+    h: usize,
+) -> Result<Option<(usize, usize, usize, Vec<f32>)>> {
+    let mut hdr = [0u8; 24];
     if s.read_exact(&mut hdr).is_err() {
         return Ok(None);
     }
     let n = u64::from_le_bytes(hdr[..8].try_into().unwrap()) as usize;
-    let pos0 = u64::from_le_bytes(hdr[8..].try_into().unwrap()) as usize;
+    let pos0 = u64::from_le_bytes(hdr[8..16].try_into().unwrap()) as usize;
+    let coh = u64::from_le_bytes(hdr[16..].try_into().unwrap()) as usize;
     if n == 0 {
         return Ok(None);
     }
@@ -873,7 +1032,7 @@ fn recv_stream(s: &mut TcpStream, h: usize) -> Result<Option<(usize, usize, Vec<
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    Ok(Some((n, pos0, x)))
+    Ok(Some((n, pos0, coh, x)))
 }
 
 /// The tail's answer: a length and that many token ids.
@@ -2453,10 +2612,40 @@ fn main() -> Result<()> {
     let nslots: usize =
         std::env::var("INK_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
     anyhow::ensure!(nslots >= 1, "INK_SLOTS counts sequences and starts at 1");
+    // ---- INK_COHORTS=c: c cohorts of b slots, offset by half a round -------
+    //
+    // The layer split runs the two nodes strictly in sequence: the head's half
+    // of a token has to finish before the tail's can start, so each end is idle
+    // for about half of every pass and widening the batch does not change that
+    // -- it scales both halves. `INK_SLOTS` proved the slots are independent of
+    // each other; `INK_COHORTS` uses that a second time, at the granularity of
+    // the pipe rather than of the batch. Cohort B's layers 0:21 run on the head
+    // while cohort A's 21:42 run on the tail, so a round advances BOTH cohorts
+    // and costs `2 * max(H, T)` rather than `2 * (H + T)`.
+    //
+    // Nothing about the arithmetic changes. Two cohorts of b slots hold the
+    // same caches as one cohort of 2b and read the same weights; what changes
+    // is the send/receive ORDER, which is the whole of the interleave and is
+    // the `want` line below.
+    let ncohorts: usize =
+        std::env::var("INK_COHORTS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    anyhow::ensure!(ncohorts >= 1, "INK_COHORTS counts cohorts and starts at 1");
+    anyhow::ensure!(
+        ncohorts == 1 || slot_lane,
+        "INK_COHORTS interleaves cohorts of SLOTS -- set INK_SLOTS as well"
+    );
+    anyhow::ensure!(
+        ncohorts == 1 || pipe_spec.is_some(),
+        "INK_COHORTS fills the half of a PIPE that is blocked on its peer, and a run on one \
+         node has no such half"
+    );
+    // Every cohort is `nslots` sequences with their own caches, so this is how
+    // many prompts the corpus has to supply and how many caches the node holds.
+    let total_slots = nslots * ncohorts;
     let slot_len: usize = std::env::var("INK_SLOT_LEN")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(if slot_lane { corpus.len() / nslots } else { corpus.len() });
+        .unwrap_or(if slot_lane { corpus.len() / total_slots } else { corpus.len() });
     anyhow::ensure!(slot_len > 0, "INK_SLOT_LEN is a prompt length and starts at 1");
     let slot_at: Vec<usize> = match std::env::var("INK_SLOT_OFFSETS") {
         Ok(v) => v
@@ -2464,11 +2653,11 @@ fn main() -> Result<()> {
             .map(|c| c.trim().parse::<usize>())
             .collect::<std::result::Result<Vec<_>, _>>()
             .context("INK_SLOT_OFFSETS is a comma-separated list of chunk indices")?,
-        Err(_) => (0..nslots).collect(),
+        Err(_) => (0..total_slots).collect(),
     };
     anyhow::ensure!(
-        slot_at.len() == nslots,
-        "INK_SLOT_OFFSETS names {} chunks against INK_SLOTS={nslots}",
+        slot_at.len() == total_slots,
+        "INK_SLOT_OFFSETS names {} chunks against INK_SLOTS={nslots} x INK_COHORTS={ncohorts}",
         slot_at.len()
     );
     for &c in &slot_at {
@@ -2507,8 +2696,8 @@ fn main() -> Result<()> {
     println!("  tokens     : {n}  {ids:?}");
     if slot_lane {
         println!(
-            "  slots      : INK_SLOTS={nslots} -- {nslots} independent sequences of {slot_len} \
-             tokens, chunks {slot_at:?} of a {}-token file",
+            "  slots      : INK_SLOTS={nslots} x INK_COHORTS={ncohorts} -- {total_slots} \
+             independent sequences of {slot_len} tokens, chunks {slot_at:?} of a {}-token file",
             corpus.len()
         );
     }
@@ -2610,7 +2799,7 @@ fn main() -> Result<()> {
                     AttnKind::Local => t.sliding_window_size.min(n + gen_steps),
                     AttnKind::Global => n + gen_steps,
                 };
-                2 * nslots as u64 * keep as u64 * (kv_heads * head_dim) as u64 * 4
+                2 * total_slots as u64 * keep as u64 * (kv_heads * head_dim) as u64 * 4
             })
             .sum()
     } else {
@@ -2618,7 +2807,7 @@ fn main() -> Result<()> {
     };
     if slot_lane {
         println!(
-            "  slot KV            : {:.2} GiB for {nslots} slots over layers {lo}..{hi}",
+            "  slot KV            : {:.2} GiB for {total_slots} slots over layers {lo}..{hi}",
             slot_kv_bytes as f64 / GIB
         );
     }
@@ -2949,6 +3138,13 @@ fn main() -> Result<()> {
             "  batched decode     : INK_SLOTS={nslots} -- {nslots} caches, one pass, {nslots} \
              tokens a pass"
         );
+        if ncohorts > 1 {
+            println!(
+                "  pipeline interleave: INK_COHORTS={ncohorts} -- {ncohorts} cohorts of \
+                 {nslots}, offset so this node computes one cohort while its peer computes \
+                 another. A round is {ncohorts} passes and advances every cohort by a token."
+            );
+        }
     }
     // Head d's first STABLE row sits at position seq-1-d, so a prompt shorter
     // than the number of heads leaves a depth with no stable row at all: every
@@ -3210,7 +3406,10 @@ fn main() -> Result<()> {
     // run one at a time; each one is SEATED the moment it finishes rather than
     // kept until all b are in. See `SlotCache::seeded` for what keeping them
     // cost.
-    let mut slots_dev: Vec<SlotLayerCache> = Vec::new();
+    // One batch per COHORT. `slots_dev[c][l]` is cohort `c`'s layer-`l` state,
+    // and the two indices are never mixed: a pass names its cohort once, at the
+    // top, and every cache access below goes through that name.
+    let mut slots_dev: Vec<Vec<SlotLayerCache>> = (0..ncohorts).map(|_| Vec::new()).collect();
 
     // The wire, opened AFTER the weights so a connection is never left hanging
     // while the other end spends a minute building its index. The tail binds and
@@ -3273,6 +3472,12 @@ fn main() -> Result<()> {
     // FEED; on the tail they are what its next verify pass will be judged
     // against. Same list, one machine apart.
     let mut drafts_in: Vec<usize> = Vec::new();
+    // The cohorts this head has sent and not yet read an answer for, oldest
+    // first. A single-cohort head empties it on the same pass it fills it and
+    // the queue is a formality; an interleaved head keeps `ncohorts - 1` in it,
+    // and THAT is the pipeline -- the tail is working on those while this pass
+    // runs. A tail never uses it: it answers the pass it is on.
+    let mut in_flight: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
     let mut last_drafts: Vec<usize> = Vec::new();
     // Tokens, not passes: a speculative pass confirms between 1 and k+1 of
     // them, so this is what the run's length and its tok/s are counted in.
@@ -3326,8 +3531,26 @@ fn main() -> Result<()> {
     // A prefill per slot, then one decode pass per token per slot. With no
     // slot lane `prefill_passes` is 1 and `is_decode` is the `step > 0` this
     // replaces, character for character.
-    let prefill_passes = if slot_lane { nslots } else { 1 };
+    let prefill_passes = if slot_lane { total_slots } else { 1 };
     let is_decode = step >= prefill_passes;
+    // Which cohort this pass advances. Over the prefills it is the cohort the
+    // slot being seated belongs to -- they are filled cohort by cohort -- and
+    // over the decode the cohorts take turns, which IS the interleave. Both
+    // ends derive it from the same step counter, and the head puts it on the
+    // wire as well so a pair that ever disagreed says so.
+    let coh = if !slot_lane {
+        0
+    } else if is_decode {
+        (step - prefill_passes) % ncohorts
+    } else {
+        step / nslots
+    };
+    if let Some((_, _, wc, _)) = incoming.as_ref() {
+        anyhow::ensure!(
+            *wc == coh,
+            "the head sent cohort {wc} where this tail was about to read cohort {coh}'s keys"
+        );
+    }
 
     let pass = Instant::now();
     let io0 = io_read_bytes();
@@ -3349,12 +3572,16 @@ fn main() -> Result<()> {
         // Every slot stands at the same absolute position because they were
         // prefilled with prompts of the same length and have advanced together
         // ever since -- see [`dev_lane::SlotCache`] for what that buys.
+        // This cohort's slots and no other's. Every slot of a cohort stands at
+        // the same absolute position; two cohorts do NOT, because they take
+        // turns, so `pos0` is read off this cohort's own slot 0.
+        let base = coh * nslots;
         (
-            slot_ids
+            slot_ids[base..base + nslots]
                 .iter()
                 .map(|q| *q.last().expect("every slot's prefill produced a token"))
                 .collect(),
-            slot_ids[0].len() - 1,
+            slot_ids[base].len() - 1,
         )
     } else if slot_lane {
         (slot_ids[step].clone(), 0)
@@ -3383,7 +3610,7 @@ fn main() -> Result<()> {
     // facts about the pass and only the head owns the token loop.
     let t_emb = Instant::now();
     let (n, pos0, x_in) = match incoming {
-        Some((n, p, x)) => (n, p, x),
+        Some((n, p, _c, x)) => (n, p, x),
         None => {
             let n = feed.len();
             let e_w = embed_w.as_ref().expect("the head owns the embedding table");
@@ -3655,12 +3882,12 @@ fn main() -> Result<()> {
             // earlier row of the batch, which for independent slots is exactly
             // the contamination this lane exists to make impossible.
             let y = dev_lane::attention_slots(
-                hn, &ld.attn, &dims, Some(ls), pos0, window, &mut slots_dev[slot].attn,
+                hn, &ld.attn, &dims, Some(ls), pos0, window, &mut slots_dev[coh][slot].attn,
             );
             let (out, hist) = dev_lane::short_conv_slot_step(
-                slots_dev[slot].attn_sconv.clone(), y, ld.attn_sconv.clone(),
+                slots_dev[coh][slot].attn_sconv.clone(), y, ld.attn_sconv.clone(),
             );
-            slots_dev[slot].attn_sconv = hist;
+            slots_dev[coh][slot].attn_sconv = hist;
             out
         } else if kv && is_decode && n > 1 {
             // The speculative width. `attention_steps` leaves the batch PENDING
@@ -3963,12 +4190,12 @@ fn main() -> Result<()> {
         // tokens exactly as attention's do.
         let t_sc = Instant::now();
         let y = if slot_lane && is_decode {
-            let hist = slots_dev[slot]
+            let hist = slots_dev[coh][slot]
                 .mlp_sconv
                 .clone()
                 .expect("a slot batch carries its own convolution memory");
             let (out, next) = dev_lane::short_conv_slot_step(hist, y, ld.mlp_sconv.clone());
-            slots_dev[slot].mlp_sconv = Some(next);
+            slots_dev[coh][slot].mlp_sconv = Some(next);
             out
         } else if kv {
             if is_decode {
@@ -4033,6 +4260,10 @@ fn main() -> Result<()> {
     // left alive there is a whole page to hand back, which is exactly what
     // `memory_cleanup` could not do while the b caches were pinning it.
     if slot_lane && !is_decode {
+        // Which row of THIS cohort's batch is being seated. Cohort `coh` was
+        // prefilled by steps `coh * nslots .. (coh + 1) * nslots`, so row zero
+        // is the one that seeds the batch and the rest seat into it.
+        let row = step % nslots;
         for (l, c) in caches.drain(..).enumerate() {
             let kind = t.attn_kind(lo + l);
             let (_, kv_heads, head_dim) = t.heads(kind);
@@ -4041,28 +4272,28 @@ fn main() -> Result<()> {
                 .mlp_sconv
                 .expect("a prefill seeds the MLP convolution")
                 .reshape([1, t.sconv_kernel_size - 1, h]);
-            if step == 0 {
-                slots_dev.push(SlotLayerCache {
+            if row == 0 {
+                slots_dev[coh].push(SlotLayerCache {
                     attn: dev_lane::SlotCache::seeded(nslots, c.attn, kv_heads, head_dim),
                     attn_sconv: dev_lane::seat_first3(nslots, asc),
                     mlp_sconv: Some(dev_lane::seat_first3(nslots, msc)),
                 });
             } else {
-                slots_dev[l].attn.seat(step, c.attn);
-                dev_lane::seat_row3(&mut slots_dev[l].attn_sconv, step, asc);
-                let mut m = slots_dev[l].mlp_sconv.take().expect("seeded by slot 0");
-                dev_lane::seat_row3(&mut m, step, msc);
-                slots_dev[l].mlp_sconv = Some(m);
+                slots_dev[coh][l].attn.seat(row, c.attn);
+                dev_lane::seat_row3(&mut slots_dev[coh][l].attn_sconv, row, asc);
+                let mut m = slots_dev[coh][l].mlp_sconv.take().expect("seeded by slot 0");
+                dev_lane::seat_row3(&mut m, row, msc);
+                slots_dev[coh][l].mlp_sconv = Some(m);
             }
         }
-        assert_eq!(slots_dev.len(), hi - lo, "the slot batch is missing layers");
+        assert_eq!(slots_dev[coh].len(), hi - lo, "the slot batch is missing layers");
         <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync after a slot prefill");
         fp4_client.memory_cleanup();
         println!(
             "{}",
             mary::models::inkling::seam::pool_line(
                 &fp4_client,
-                &format!("prefill {}/{nslots}", step + 1)
+                &format!("prefill {}/{total_slots}", step + 1)
             )
         );
     }
@@ -4160,20 +4391,45 @@ fn main() -> Result<()> {
         if all_logits || probe_rows > 1 || slot_rows > 1 { 0 } else { n - verify_rows };
     let (mut t_send, mut t_wait_peer) = (0f64, 0f64);
     let mut wire_toks: Vec<usize> = Vec::new();
+    // Which cohort the answer read on THIS pass belongs to. The pass's own
+    // cohort everywhere except an interleaved head, where it is the cohort sent
+    // a pass earlier -- so the tokens land in that cohort's streams and not in
+    // the one this pass just computed.
+    let mut answer_coh = coh;
+    // False on exactly the passes an interleaved head starts a cohort it has
+    // not yet heard back about: the first `ncohorts - 1` decode passes. Nothing
+    // was confirmed, so nothing is committed.
+    let mut answered = true;
     let logits = if let Some(Pipe::Head(s)) = pipe.as_mut() {
         let t_s = Instant::now();
-        send_stream(s, n, pos0, &x)?;
+        send_stream(s, n, pos0, coh, &x)?;
         t_send = t_s.elapsed().as_secs_f64();
+        in_flight.push_back(coh);
+        // THE interleave, and it is this line. `want` is how many answers the
+        // head is content to leave outstanding once this pass is over: zero
+        // with one cohort, which is the strict send-then-block loop this file
+        // has always run, and `ncohorts - 1` while decoding with more, which
+        // leaves the tail exactly one round of work to do while the head starts
+        // the next cohort. The prefills stay strict whatever `ncohorts` is --
+        // a prefill's answer seeds the slot it just filled, and there is
+        // nothing to overlap it with.
+        let want = if is_decode { ncohorts - 1 } else { 0 };
         let t_w = Instant::now();
-        // The tail's FIRST message: the tokens its verify pass confirmed. Never
-        // empty -- the row fed the last confirmed token always produces one --
-        // and longer than one exactly when drafts were accepted. The drafts for
-        // the NEXT pass are a second message, read further down, so this
-        // process gets to commit its caches in between.
-        wire_toks = recv_toks(s)?;
+        if in_flight.len() > want {
+            // The tail's FIRST message: the tokens its verify pass confirmed.
+            // Never empty -- the row fed the last confirmed token always
+            // produces one -- and longer than one exactly when drafts were
+            // accepted. The drafts for the NEXT pass are a second message, read
+            // further down, so this process gets to commit its caches in
+            // between.
+            answer_coh = in_flight.pop_front().expect("just pushed one");
+            wire_toks = recv_toks(s)?;
+            anyhow::ensure!(!wire_toks.is_empty(), "the tail confirmed no token at all");
+            best_wire = Some(*wire_toks.last().expect("checked non-empty"));
+        } else {
+            answered = false;
+        }
         t_wait_peer = t_w.elapsed().as_secs_f64();
-        anyhow::ensure!(!wire_toks.is_empty(), "the tail confirmed no token at all");
-        best_wire = Some(*wire_toks.last().expect("checked non-empty"));
         Vec::new()
     } else {
         // 109 x 4096 x 200058 is 89 G multiply-adds — the single largest
@@ -4214,61 +4470,63 @@ fn main() -> Result<()> {
     // 40.6% under 1-TV), because when the draft is the argmax the target agrees
     // strongly and when it is not the target puts little mass there either.
     let new_toks: Vec<usize>;
-    let best = match best_wire {
-        Some(b) => {
-            new_toks = wire_toks.clone();
-            b
-        }
-        None => {
-            let mut accepted = 0usize;
-            let rows = n - logit_row0;
-            let argmax_of = |i: usize| -> usize {
-                let row = &logits[i * v..(i + 1) * v];
-                let mut b = 0usize;
-                for (j, &val) in row.iter().enumerate() {
-                    if val > row[b] {
-                        b = j;
-                    }
+    let best = if !answered {
+        // An interleaved head, on the pass that opened a cohort. The answer is
+        // still on the tail; it is read one pass later and committed there.
+        new_toks = Vec::new();
+        0
+    } else if let Some(b) = best_wire {
+        new_toks = wire_toks.clone();
+        b
+    } else {
+        let mut accepted = 0usize;
+        let rows = n - logit_row0;
+        let argmax_of = |i: usize| -> usize {
+            let row = &logits[i * v..(i + 1) * v];
+            let mut b = 0usize;
+            for (j, &val) in row.iter().enumerate() {
+                if val > row[b] {
+                    b = j;
                 }
-                b
-            };
-            if verify_rows > 1 {
-                debug_assert_eq!(logit_row0, 0, "a verify pass reads from row 0");
-                anyhow::ensure!(
-                    n == 1 + last_drafts.len(),
-                    "the head fed {n} rows against {} drafts -- the two ends disagree on the \
-                     speculation width",
-                    last_drafts.len()
-                );
-                let preds: Vec<usize> = (0..rows).map(argmax_of).collect();
-                // Row i was fed the token at pos0+i and predicts pos0+i+1. Row 0
-                // was fed a CONFIRMED token, so its prediction is always kept;
-                // row i>0 was fed draft i-1, so its prediction is only a fact
-                // about the sequence if every draft before it was right.
-                while accepted < last_drafts.len() && last_drafts[accepted] == preds[accepted] {
-                    accepted += 1;
-                }
-                new_toks = preds[..=accepted].to_vec();
-            } else if slot_rows > 1 {
-                // One argmax per SLOT. Nothing is accepted or rejected here --
-                // a slot batch has no drafts, every row was fed a token its own
-                // sequence confirmed, and every row's prediction is kept.
-                new_toks = (0..rows).map(argmax_of).collect();
-            } else if probe_rows > 1 {
-                // Row 0 is the sequence; rows 1.. are the probe's filler and
-                // their argmaxes are about nothing. Reading row 0 and not the
-                // last row is what keeps the text identical to INK_WIDTH=1.
-                new_toks = vec![argmax_of(0)];
-            } else {
-                new_toks = vec![argmax_of(rows - 1)];
             }
-            *new_toks.last().expect("at least one row is always confirmed")
+            b
+        };
+        if verify_rows > 1 {
+            debug_assert_eq!(logit_row0, 0, "a verify pass reads from row 0");
+            anyhow::ensure!(
+                n == 1 + last_drafts.len(),
+                "the head fed {n} rows against {} drafts -- the two ends disagree on the \
+                 speculation width",
+                last_drafts.len()
+            );
+            let preds: Vec<usize> = (0..rows).map(argmax_of).collect();
+            // Row i was fed the token at pos0+i and predicts pos0+i+1. Row 0
+            // was fed a CONFIRMED token, so its prediction is always kept;
+            // row i>0 was fed draft i-1, so its prediction is only a fact
+            // about the sequence if every draft before it was right.
+            while accepted < last_drafts.len() && last_drafts[accepted] == preds[accepted] {
+                accepted += 1;
+            }
+            new_toks = preds[..=accepted].to_vec();
+        } else if slot_rows > 1 {
+            // One argmax per SLOT. Nothing is accepted or rejected here --
+            // a slot batch has no drafts, every row was fed a token its own
+            // sequence confirmed, and every row's prediction is kept.
+            new_toks = (0..rows).map(argmax_of).collect();
+        } else if probe_rows > 1 {
+            // Row 0 is the sequence; rows 1.. are the probe's filler and
+            // their argmaxes are about nothing. Reading row 0 and not the
+            // last row is what keeps the text identical to INK_WIDTH=1.
+            new_toks = vec![argmax_of(0)];
+        } else {
+            new_toks = vec![argmax_of(rows - 1)];
         }
+        *new_toks.last().expect("at least one row is always confirmed")
     };
     // `ids`, the MTP scoring and the per-position report were all written about
     // ONE sequence, and slot 0 is the one they follow. `best` is therefore slot
     // 0's token and not the last row's, which is what it means everywhere else.
-    let best = if slot_lane && is_decode { new_toks[0] } else { best };
+    let best = if slot_lane && is_decode && answered { new_toks[0] } else { best };
     let mut t_to_reply = 0f64;
     if let Some(Pipe::Tail(s)) = pipe.as_mut() {
         send_toks(s, &new_toks)?;
@@ -4287,8 +4545,11 @@ fn main() -> Result<()> {
     // for the same reason `ids` is recomputed rather than sent.
     if slot_lane && gen_steps > 0 && !repeat {
         if is_decode {
-            for (q, tok) in slot_ids.iter_mut().zip(new_toks.iter()) {
-                q.push(*tok);
+            if answered {
+                let base = answer_coh * nslots;
+                for (q, tok) in slot_ids[base..base + nslots].iter_mut().zip(new_toks.iter()) {
+                    q.push(*tok);
+                }
             }
         } else {
             slot_ids[step].push(best);
@@ -5154,7 +5415,12 @@ fn main() -> Result<()> {
     }
 
     if gen_steps > 0 {
-        println!("  step {step}: +{new_toks:?}   [pass {:.1}s, total {:.1}s, ctx {}, pass_ms {:.1}]",
+        // The cohort is named only when there is more than one, so a
+        // single-cohort run's transcript is character for character the one
+        // every arm above was compared on.
+        let coh_tag =
+            if ncohorts > 1 { format!(" cohort {answer_coh}") } else { String::new() };
+        println!("  step {step}{coh_tag}: +{new_toks:?}   [pass {:.1}s, total {:.1}s, ctx {}, pass_ms {:.1}]",
                  pass.elapsed().as_secs_f32(), started.elapsed().as_secs_f32(), ids.len(),
                  pass.elapsed().as_secs_f64() * 1e3);
         // The tail already pushed all but the last, when it answered its peer.
@@ -5168,7 +5434,14 @@ fn main() -> Result<()> {
             if new_toks.len() > 1 && !slot_lane {
                 ids.extend_from_slice(&new_toks[..new_toks.len() - 1]);
             }
-            ids.push(best);
+            // `ids` is ONE sequence's -- cohort 0's slot 0 -- because every
+            // report that indexes a position reads it. Appending a second
+            // cohort's token would interleave two sequences into one stream and
+            // read as a plausible context length rather than as a failure,
+            // which is the same trap the slot batch already sprang once.
+            if !slot_lane || (answered && (ncohorts == 1 || answer_coh == 0)) {
+                ids.push(best);
+            }
         }
     }
     // The prefill is a different animal -- a 512-row pass against a 1-row one,
@@ -5186,12 +5459,22 @@ fn main() -> Result<()> {
     if is_decode && step - prefill_passes >= COLD_DECODE_STEPS {
         warm_wall += pass.elapsed().as_secs_f64() + t_recv;
         warm_steps += 1;
-        warm_tokens += new_toks.len();
+        warm_tokens += if slot_lane && is_decode { n } else { new_toks.len() };
     }
     // A slot lane's prefill passes produce a token each and they are not decode
     // tokens: counting them would put b of them in the numerator of a rate
     // whose denominator is decode passes only.
-    gen_tokens += if slot_lane && !is_decode { 0 } else { new_toks.len() };
+    // By the pass this node COMPUTED, not by the answer it happened to read.
+    // The two are the same pass on a tail and on a single-cohort head; on an
+    // interleaved head the answer is a pass behind, and counting answers would
+    // make the two ends disagree about how many tokens one run produced.
+    gen_tokens += if slot_lane && !is_decode {
+        0
+    } else if slot_lane {
+        n
+    } else {
+        new_toks.len()
+    };
     // Tokens, not passes -- and with nothing speculated this fires on exactly
     // the pass the old `for step in 0..=gen_steps` fired on.
     // Passes, in the slot lane. Every arm has to run the same number of decode
@@ -5203,6 +5486,27 @@ fn main() -> Result<()> {
         break;
     }
     step += 1;
+    }
+
+    // ---- the answers still on the wire ------------------------------------
+    //
+    // An interleaved head finishes `ncohorts - 1` passes ahead of the tail, so
+    // that many answers are still coming. They are read rather than dropped:
+    // each is one token per slot of a real cohort, and a run that discarded
+    // them would report every cohort but the last a token short -- which is
+    // exactly the sort of missing row a contamination check reads as a
+    // difference between neighbours.
+    if let Some(Pipe::Head(s)) = pipe.as_mut() {
+        while let Some(c) = in_flight.pop_front() {
+            let toks = recv_toks(s)?;
+            if slot_lane && gen_steps > 0 && !repeat {
+                let base = c * nslots;
+                for (q, tok) in slot_ids[base..base + nslots].iter_mut().zip(toks.iter()) {
+                    q.push(*tok);
+                }
+            }
+            println!("  drain cohort {c}: +{toks:?}");
+        }
     }
 
     // ---- how much of the wall clock this node spent waiting for the other --
@@ -5576,7 +5880,7 @@ fn main() -> Result<()> {
     // A zero-length batch is the head saying it is done, so the tail's loop
     // ends on a read rather than blocking forever on a peer that has exited.
     if let Some(Pipe::Head(s)) = pipe.as_mut() {
-        let _ = send_stream(s, 0, 0, &[]);
+        let _ = send_stream(s, 0, 0, 0, &[]);
     }
 
     // The head has no top-5 table -- the tail computed the logits and wrote it.
