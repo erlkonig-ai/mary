@@ -4,7 +4,7 @@
 `inkling_forward` answers one ids file per process and there is no batch mode,
 so an item set is N sequential pairs and the per-item cost is dominated by
 process start: each half warms its share of the expert slabs through the page
-cache before it computes anything. Measured on spark, 41 tokens: 4m14s wall,
+cache before it computes anything. Measured on one node, 41 tokens: 4m14s wall,
 of which about 2m20s is the tail warming before it will even accept the head's
 connection.
 

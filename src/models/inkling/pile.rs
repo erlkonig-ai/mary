@@ -276,9 +276,9 @@ fn mem_total_bytes() -> Result<u64> {
 /// 2.55 GiB of nominal headroom) and 122.84 at 0:29 (refused by 1.21). The
 /// 0:30 row was taken with the OLD gate, which admitted it.
 ///
-/// It derives from the machine (`MemTotal`), never from a constant: spark has
-/// 119.6 GiB and spark2 121.6, and a gate hard-coded to either is wrong on the
-/// other.
+/// It derives from the machine (`MemTotal`), never from a constant: the two
+/// nodes this runs on differ by 2 GiB, and a gate hard-coded to either figure
+/// is wrong on the other.
 fn run_overhead_bytes(layers: usize, attention_bytes: u64) -> u64 {
     const CUDA_CONTEXT: u64 = GIB / 5;
     const ACTIVATIONS_PER_LAYER: u64 = 41 * GIB / 200;
@@ -1143,9 +1143,9 @@ impl PileSource {
     /// 16 GiB swap consumed, because the kernel chose to page out the arena we
     /// had just written rather than evict the mapped file pages we were done
     /// with. The second loop then ran at 3.0 GiB/s instead of 50 — it was
-    /// re-reading its own source off the SSD — and on a box with 2 GiB less
-    /// (spark has 119.6 GiB to spark2's 121.6) the CUDA context that comes
-    /// afterwards could not be created at all.
+    /// re-reading its own source off the SSD — and on the node with 2 GiB less
+    /// of the two this runs on, the CUDA context that comes afterwards could
+    /// not be created at all.
     ///
     /// So: the shapes are probed ONCE PER STACKED MATRIX rather than once per
     /// expert (every expert of one stack is the same matrix, and the copy
