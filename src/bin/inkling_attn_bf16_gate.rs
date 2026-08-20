@@ -197,8 +197,6 @@ fn one(
     let dev = Default::default();
     let xt: Tensor<Bk, 2> =
         Tensor::from_data(TensorData::new(x.clone(), [tokens, hidden]), &dev);
-    let maskt: Tensor<Bk, 2> =
-        Tensor::from_data(TensorData::new(mask.clone(), [tokens, tokens]), &dev);
     let client = client_of(&xt);
     let t2 = |v: &[f32], r: usize, c: usize| -> Tensor<Bk, 2> {
         Tensor::from_data(TensorData::new(v.to_vec(), [r, c]), &dev)
@@ -215,7 +213,7 @@ fn one(
         k_norm: Tensor::from_data(TensorData::new(kn.clone(), [head_dim]), &dev),
         rel_proj: t2(&rp, d_rel, rel_extent),
     };
-    let devy = dev_lane::attention(xt, &dw, &dims, Some(ls), maskt)
+    let devy = dev_lane::attention(xt, &dw, &dims, Some(ls), if is_local { Some(window) } else { None })
         .into_data()
         .to_vec::<f32>()
         .expect("device attention output");

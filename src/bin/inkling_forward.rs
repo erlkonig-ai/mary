@@ -23,9 +23,40 @@
 //! `INK_LAYERS=LO:HI` runs that half-open range; `INK_PIPE=head:HOST:PORT`
 //! sends the residual stream on when the range ends, and `INK_PIPE=tail:ADDR`
 //! receives it, finishes the stack and returns the argmax. Only `[n, 4096]` f32
-//! crosses — 16 KB per token per boundary, once — which is why the split is by
-//! layer and not within one: splitting a layer needs an all-reduce per layer and
-//! 1 GbE cannot carry it.
+//! crosses — 16 KB per token per boundary, once.
+//!
+//! # The split is by layer for now, and the reason it used to give is wrong
+//!
+//! This doc used to say a within-layer split "needs an all-reduce per layer and
+//! 1 GbE cannot carry it". That measured the management NIC. The boxes are also
+//! joined by a direct-attach ConnectX pair, and on that link, measured:
+//!
+//!   ib_write_lat, 8 KB          3.68 us one way   (p99 3.78, stdev 0.01)
+//!   ib_write_bw, peak          13.02 GB/s         (saturates by 16 KB)
+//!   iperf3 TCP, 8 streams     111 Gbit/s
+//!   NCCL all-reduce, 16 KB     26.84 us           (RoCE, GPU-resident, 2 ranks)
+//!   NCCL all-reduce, large     13.78 GB/s
+//!
+//! A within-layer split wants two all-reduces per layer — one after the
+//! attention out-projection, one after the MoE down-projection — so 84 per
+//! token, each `[1, 4096]`. At the measured 26.84 us that is 2.25 ms per token
+//! against a per-token budget in the tens of ms. Bandwidth is not close to
+//! being the constraint: 84 x 16 KB is 1.3 MB per token, well under a percent
+//! of the link.
+//!
+//! The transport does matter, and it is the whole finding. The kernel network
+//! path on these boxes costs ~185 us round trip for an 8 KB ping-pong (ICMP
+//! agrees: 171 us minimum), which is 25x the RDMA number and would put the same
+//! 84 collectives at 15.5 ms per token. So a within-layer split is affordable
+//! over RDMA or NCCL and is NOT affordable over ordinary sockets — which is
+//! also why `burn-collective`, whose transport is WebSocket plus MessagePack,
+//! is the wrong tool here despite exposing exactly the right API.
+//!
+//! What a within-layer split would buy is the idle half. The layer split runs
+//! the two nodes strictly in sequence; the pipe-utilisation block below reports
+//! each end computing near 50% and blocked on the other for the rest. Splitting
+//! within a layer runs both ends on every layer at once. That is the case for
+//! doing it, and the bandwidth objection above is not a reason against it.
 //!
 //!   # tail, on the second box
 //!   INK_LAYERS=20:42 INK_PIPE=tail:0.0.0.0:7654 inkling_forward <pile> <ids> <out>
@@ -46,6 +77,929 @@
 //!
 //! Set `INK_MTP` on the TAIL process only. It is refused on a head, which holds
 //! neither the final hidden state nor a way to turn one into a token.
+//!
+//! # The decode baseline, and the exact configuration that produced it
+//!
+//! Two rates get quoted for this model and they are not the same number, so
+//! both are here with the run that measured them. Current main, two nodes over
+//! the direct link, layers 0..21 and 21..42, `INK_KV=1`, `INK_GEN=100`,
+//! `INK_MTP` unset, a five-token English prompt, context 5 -> 105:
+//!
+//!   round trip, one token                126.8 ms
+//!   tail node, layers 21..42 + unembed    69.3 ms   p50 of 96 warm passes
+//!   head node, layers 0..21 + embed      ~55.5 ms   derived, see below
+//!   the head's own view of one step      125.8 ms   p50, compute AND blocked
+//!
+//! The round trip is the wall clock between two consecutive tokens, taken
+//! between step 3 and step 100 so that the two cold passes -- 4.54 s and 0.55 s
+//! of kernel compilation -- fall outside the interval instead of being averaged
+//! into it. Averaged in, the same run reports 135.2 ms/step, which is why the
+//! summary block below now prints a WARM line beside the pooled one. A separate
+//! 40-step run reads 125.1 ms/step warm against 144.8 ms/step pooled, so the
+//! correction is worth more than the run-to-run spread, not less.
+//!
+//! A NODE rate is not a token rate. The two halves run strictly in sequence, so
+//! 69.3 and ~55.5 add; neither of them, and no fraction of the round trip, is a
+//! per-token figure on its own. The head does not report its compute per step
+//! (only pooled, where the cold pass is still in the average), so its ~55.5 ms
+//! is the round trip less the tail's p50 and two 16 KB wire crossings.
+//!
+//! # What the idle half is worth, and why drafting does not claim it
+//!
+//! Each end spends about half the loop waiting for the other -- head computing
+//! 46.9% and blocked 53.1%, tail computing 55.2% and blocked 44.8%. That idle
+//! half is the standing argument for speculation, and the same run prices it.
+//!
+//! `INK_MTP=4` on the tail, same prompt, same 100 steps:
+//!
+//!   round trip                           151.5 ms   against 126.8 undrafted
+//!   tail compute                         151.0 ms/step, drafting 110.5 of it
+//!   tail BLOCKED on the head               0.0 ms/step
+//!
+//! Four device MTP heads do not fit in the idle half. They fill it and then
+//! push 25 ms into the critical path: the tail goes from 44.8% idle to 0.0%.
+//!
+//! Nor are the drafts worth that. Over the 100 steps, depth-1 acceptance is
+//! 22.0% (95% CI 15.0-31.1%), and a whole four-deep draft set yields a mean
+//! 0.268 accepted tokens per verify pass. Against the measured width cost
+//! c(2) = 1.492, a k=1 loop that always speculates is (1 + 0.220) / 1.492 =
+//! 0.818x -- it LOSES 18%. Gating on the draft head's own confidence at
+//! tau = 0.2 turns it into 1.059x, a 6% gain taken on 27% of steps.
+//!
+//! So the idle half is idle, and this file does not consume a draft at all:
+//! `INK_MTP` measures what an accept-and-skip loop WOULD have kept, and no such
+//! loop is here. A change that wants that half of the machine -- a within-layer
+//! split, most obviously -- is not competing with speculation for it.
+//!
+//! # How a speculative token rate gets to be three times too good
+//!
+//! A verify pass `w + 1` rows wide can yield at most `w + 1` tokens. It does
+//! not: the leading accepted run is what a loop keeps, and that run measures
+//! 1.6 tokens per pass here and saturates -- widening `w` past 2 buys nothing,
+//! because the acceptance rate falls faster than the row count rises. Dividing
+//! a pass's cost by `w + 1` rather than by the measured mean is where a
+//! 40 ms/token speculative rate comes from, and at w = 5 that is a factor of
+//! 3.7 optimistic. A 240 ms pass yielding 1.6 tokens is 150 ms a token, which
+//! is SLOWER than the 126.8 ms one row costs.
+//!
+//! This is not hypothetical arithmetic: the same conclusion falls out of a
+//! wired accept-and-skip loop, which reads 0.916x at w = 1, 0.866x at w = 2 and
+//! 0.742x at w = 3 against an unspeculated 127.1 ms baseline -- a baseline that
+//! is also an independent confirmation of the 126.8 ms above.
+//! # `INK_SPEC=k`: the accept-and-skip loop, and what decides whether it pays
+//!
+//! The loop the MTP acceptance measurement was for, wired end to end. Set it on
+//! BOTH processes and to the same value. Every answer carries `k` drafts back
+//! with it; the next pass feeds the confirmed token FOLLOWED BY those drafts,
+//! so a verify pass is `k + 1` rows wide, its rows' argmaxes are compared to
+//! the drafts they were fed, and the leading run that agrees is kept. Both ends
+//! roll back to that prefix through [`dev_lane::AttnCache::commit`] and the two
+//! short convolutions' kept windows. Acceptance is exact argmax match, which is
+//! not a concession: measured on this model it accepts MORE than a stochastic
+//! rule (49.5% against 45.6% sampled and 40.6% under 1-TV).
+//!
+//! **It is off by default, and the reason is no longer "it loses" -- it is that
+//! whether it wins is a property of the TEXT and not of the machine.** Two
+//! corpora, the same binary, the same pipe (layers 0:21 and 21:42 over the
+//! direct link, `INK_KV=1`, default GEMM lane), warm p50 of the whole cycle,
+//! two runs per arm and both quoted:
+//!
+//!   A five-token English prompt, context 5 -> 105, `INK_GEN=100`:
+//!
+//!     arm          p50 ms   tok/pass   tok/s at p50   vs base
+//!     INK_SPEC=0    127.2      1.000       7.862       1.000
+//!     INK_SPEC=1    199.9      1.712       8.563       1.089
+//!     INK_SPEC=2    236.8      2.082       8.792       1.118
+//!     INK_SPEC=3    263.0      2.082       7.920       1.007
+//!
+//!   A 3732-token document, context 3732 -> 3792, `INK_GEN=60`:
+//!
+//!     arm          p50 ms   tok/pass   tok/s at p50   vs base
+//!     INK_SPEC=0    151.6      1.000       6.599       1.000
+//!     INK_SPEC=1    221.8      1.429       6.445       0.977
+//!     INK_SPEC=2    264.9      1.395       5.268       0.798
+//!
+//! The width cost is nearly the SAME on both -- c(2) is 1.571 and 1.463 -- and
+//! the acceptance is not: 71.2% of depth-1 drafts on the short prompt against
+//! 42.9% on the document. The five-token prompt's continuation is a repeating
+//! list template, and a template is easy to draft; a document's continuation is
+//! not. So the honest reading of the short-prompt column is not "speculation
+//! pays 1.1x", it is "speculation pays on text this predictable", and the
+//! corpus that is not a five-token prompt says 0.98x.
+//!
+//! Widening past `k = 2` buys nothing on either corpus: the depth-3 draft was
+//! accepted 0 times in 49 verify passes, so `k = 3` pays a wider pass for the
+//! same 2.082 tokens and lands back at 1.007x.
+//!
+//! ## Three acceptance rates that are all correct
+//!
+//! This file has quoted 22.0%, 50.0% and 71.2% for depth-1 acceptance and they
+//! do not contradict each other -- they are the same measurement on three
+//! different SEQUENCES, which is the whole finding.
+//!
+//! `INK_MTP=1` and `INK_MTP=4` with no speculation both report exactly
+//! **22.0%** (95% CI 15.0-31.1) over 100 steps of the five-token prompt, so the
+//! draft depth is not what moves it. What moves it is that the unspeculated
+//! run's own continuation collapses into a single repeated token around step 38
+//! and stays there: the log reads `drafted 410, actual 58189 -- miss` for sixty
+//! consecutive steps, the draft head proposing sensible English while the stack
+//! emits one id forever. A speculative run does not go there -- a verify pass
+//! is `m > 1` and takes a different GEMM lane, and the two lanes diverge -- so
+//! its 71.2% is measured on a sequence that never degenerates.
+//!
+//! Which is to say: none of the three is a corpus-independent acceptance rate
+//! for this draft head, and the 41.9% on the document is the only one of them
+//! measured on text worth quoting.
+//!
+//! ## The width cost is a STEP, and half of it was never the GEMM lane
+//!
+//! c(2) = 1.57 on the short prompt, against 1.332 that the uncached lane
+//! predicted. The tail's own half is FLAT once the second row exists, which is
+//! what a lost lane looks like rather than what extra work looks like, and
+//! `gemv plane par` -- which requires `m == 1` and is the only lane that
+//! reaches this part's memory roofline -- is the one a verify pass cannot use.
+//!
+//! That diagnosis was right and it was not the whole thing. Timed per stage on
+//! the tail, the one-row-to-two-row step used to be +52 ms, of which the MLP's
+//! short convolution alone was +31 and the attention half (which contains two
+//! more of them) +18, against 2.5 ms for the MoE and dense GEMMs. The
+//! convolutions were slice-built for any width above one;
+//! [`crate::models::inkling::sconv::short_conv_batch`] is the kernel that
+//! replaced them, and it took c(2) from 1.613 to 1.571, a two-row width probe
+//! from 197.5 ms to 172.8, and the document's k=1 arm from 0.932x to 0.977x.
+//! The residue is the GEMM lane, and a narrow lane at the gemv's bandwidth is
+//! still the thing to build -- it is just no longer the whole bill.
+//!
+//! ## The same lane decides what the model SAYS
+//!
+//! A speculative run's text diverges from an `INK_SPEC=0` run's and the loop is
+//! not why: `INK_WIDTH=2`, `4` and `8` -- a cost probe with no speculation
+//! anywhere, whose extra rows carry different filler at every width -- produce
+//! text IDENTICAL to each other and diverging from `INK_WIDTH=1` at the same
+//! token. Every `m > 1` arm agrees with every other; only `m == 1` differs.
+//! Against a host `f64` reference on identical BF16 bits, `gemv plane par` is
+//! off by 1.2e-7 and the narrow tile lane by 1.36e-5, a factor of 113; over 42
+//! layers and 40 cached positions that is enough to take the stack apart. Held
+//! to one lane the batched cached attention is BIT-IDENTICAL to the single-row
+//! lane at every position (`drift_table_at_real_width` in `burn.rs`, run with
+//! `INK_GEMM='double cyclic mma'`), so the loop preserves the text exactly and
+//! the runtime does not.
+//!
+//! # `INK_WIDTH=b`: what a b-row decode step COSTS
+//!
+//! An instrument, not a feature. Batched decode -- `b` independent sequences
+//! sharing one weight stream -- is the largest untaken lever on this model, and
+//! the question that decides whether it is worth building is whether a `b`-row
+//! cached step costs `b` times a one-row one or barely more than one. A decode
+//! step is bound on streaming BF16 weights; `b` rows stream them once. Against
+//! that, every multi-row pass loses `gemv plane par`, which requires `m == 1`.
+//!
+//! `INK_WIDTH=b` prices the trade without any of the machinery a real batch
+//! needs, because the COST of a `b`-row pass barely depends on whether the rows
+//! belong to one sequence or to `b` of them: same projections, same MoE gather
+//! over `b` independent routings, same unembedding of `b` rows, same weight
+//! stream. Row 0 carries the real token, rows 1..b carry filler drawn fresh
+//! every pass so the router picks `b` independent expert sets, only row 0's
+//! argmax is taken and only row 0 is committed. Set it on the HEAD; the tail
+//! reads the width off the wire.
+//!
+//! Warm p50 of the whole cycle, two runs per arm, `INK_GEN=60`:
+//!
+//!   five-token prompt, ctx 5 -> 65        3732-token document, ctx 3732 -> 3792
+//!    b   p50 ms   c(b)   agg tok/s         b   p50 ms   c(b)   agg tok/s
+//!    1    124.7   1.000     8.02           1    151.6   1.000     6.60
+//!    2    172.8   1.386    11.57
+//!    4    204.8   1.642    19.53           4    231.8   1.529    17.26
+//!    8    253.7   2.035    31.53           8    280.1   1.848    28.56
+//!
+//! **Strongly sublinear, and that is the answer.** Eight rows cost 2.04 times
+//! one row, so eight sequences decode at 31.5 tokens a second against 8.02 for
+//! one -- 3.9x -- with no fabric work, no second box and no draft head. Nearly
+//! the whole penalty is the STEP at the second row: from b = 2 to b = 8, four
+//! times the rows cost 1.47 times the pass.
+//!
+//! ## What the probe does not charge for
+//!
+//! Its `b` rows share ONE KV cache, so attention reads `L` keys once where `b`
+//! real sequences would read `L` keys `b` times. At ctx 65 that is nothing. At
+//! ctx 3792 it is not, and the same table bounds it: one sequence's extra 3727
+//! keys cost 151.6 - 124.7 = 26.9 ms a pass, so charging `(b - 1) x 26.9` ms is
+//! an upper bound on the correction -- upper, because it charges the whole
+//! context-length delta to attention and some of it is the wider relative-bias
+//! table. Corrected, ctx 3792 reads 313 ms at b = 4 (12.8 tok/s aggregate,
+//! 1.94x) and 468 ms at b = 8 (17.1 tok/s, 2.59x). The lever survives the
+//! correction; it is 3.9x at short context and 2.6x at four thousand tokens.
+//!
+//! What it does NOT understate is the MoE: the router runs per row and the
+//! expert gather follows it, and the probe's filler is drawn fresh every pass
+//! precisely so that eight rows select eight independent expert sets. The log's
+//! own counter agrees -- 126 expert slabs decoded at b = 1 against 544-642 at
+//! b = 8 -- so expert streaming is priced at its real width and it is not what
+//! makes the curve bend.
+//!
+//! ## The probe checks itself
+//!
+//! Rows 1..b are causally invisible to row 0, so `INK_WIDTH=b` must produce the
+//! same text as `INK_WIDTH=1`. It produces the same text as every OTHER width:
+//! b = 2, 4 and 8, whose filler rows are entirely different from each other,
+//! emit token-for-token identical continuations on both corpora, and all three
+//! diverge from b = 1 at the same position. That is the `m == 1` GEMM lane and
+//! nothing else -- the same divergence a speculative run shows, reproduced with
+//! no speculation anywhere in the process.
+//!
+//! ## What batching needed, and what it turned out to cost
+//!
+//! [`dev_lane::attention_steps`] takes ONE cache and `pos0`, puts row `i` at
+//! `pos0 + i`, and masks row `i` against every earlier row of the batch -- it
+//! is contiguous and causal by construction, which is what a speculative batch
+//! is and what `b` independent sequences are not. That is what `INK_SLOTS`
+//! below builds, and the answer is in the next section: a real b-slot pass came
+//! out CHEAPER than this probe's, because the layout the slots needed was
+//! cheaper than the one the single-row lane had.
+//!
+//! # `INK_SLOTS=b`: b independent sequences, one pass, b tokens
+//!
+//! The feature the probe above was an instrument for. `b` slots, each with its
+//! own KV cache and its own token stream; one pass advances all of them by one
+//! token. [`dev_lane::SlotCache`] and [`dev_lane::attention_slots`] are the
+//! whole of it, and the "block-diagonal mask" the probe said this would need
+//! does not exist: K and V are held `[slots * kv_heads, cap, head_dim]` and the
+//! scores are a batched matmul over that leading axis, so slot `s`'s query
+//! multiplies slot `s`'s keys and there is no mask element whose sign could be
+//! wrong.
+//!
+//! The `b` prompts are `b` DISJOINT chunks of one token file, `INK_SLOT_LEN`
+//! apart, and `INK_SLOT_OFFSETS` names the chunk per slot. Slot 0's text
+//! therefore does not move when `b` changes, which is what makes the arms
+//! comparable and what makes the contamination test possible. A prefill is
+//! compute-bound and gains nothing from a batch, so the `b` of them run one at
+//! a time and the batch begins where the decoding does.
+//!
+//! ## What it costs
+//!
+//! Warm p50 of the whole cycle, at least two runs per arm, two-node pipe,
+//! layers 0:21 and 21:42, `INK_KV=1`, `/tmp/cover_150000.ids` (35,845 tokens of
+//! prose; slot `s` takes `[s*L, (s+1)*L)`). "one-row" is the same binary with
+//! `INK_SLOTS` unset -- [`dev_lane::attention_step`], which is what every
+//! measurement before this one was taken on. `c(b)` is against the mean of the
+//! `b = 1` SLOT-lane runs, not against the one-row lane: those are two
+//! implementations of the same function, and mixing them into one ratio would
+//! charge batching for a layout change.
+//!
+//!   L = 512, ctx 512 -> 612           L = 3732, ctx 3732 -> 3852
+//!    b   p50 ms       c(b)   tok/s     b   p50 ms             c(b)   tok/s
+//!    -   133.3 135.2    -    7.5 7.4   -   150.5 150.1          -    6.65 6.66
+//!    1   125.5 134.1  1.000  8.0 7.5   1   135.6 130.5        1.000  7.38 7.67
+//!    2   178.5 168.6  1.337  11.2 11.9 2   184.1 183.7        1.382  10.87 10.89
+//!    4   207.6 212.0  1.617  19.3 18.9 4   219.5 219.8 217.9  1.650  18.2 18.2 18.4
+//!    8   277.8 273.6  2.124  28.8 29.2 6   254.9 248.5 255.6  1.902  23.5 24.1 23.5
+//!                                      8   282.7 286.9 289.9  2.153  28.3 27.9 27.6
+//!
+//! The `b = 6` and `b = 8` rows of the 3732 column are three runs each and are
+//! post-fix; see "Where the b = 8 irreproducibility actually was" below for the
+//! numbers they replace (283-657 and 311-1465) and what was wrong with them.
+//!
+//! **Eight independent sequences decode at 3.7x one**, and at a 3.7k context
+//! each of them still carries its own 3792-key cache and reads it in full on
+//! every pass. Nearly the whole penalty is the step at the SECOND row, exactly
+//! as the probe found: from `b = 2` to `b = 8`, four times the sequences cost
+//! 1.56 times the pass.
+//!
+//! **The layout change is worth its own line.** At `b = 1` the slot lane is
+//! 130-136 ms where the one-row lane is 150 ms at a 3.7k context, and 125-134
+//! against 133-135 at 512. [`dev_lane::attention_step`] holds K as
+//! `[len, kv_heads * head_dim]` and expands it per step to
+//! `[heads, len, head_dim]`, repeating each KV head `groups` times so the score
+//! matmul is one GEMM over `heads`: 63 MB a layer at 3.8k keys, twice, on every
+//! layer of every step. The slot cache is head-major and moves the repetition to
+//! the QUERY side, where the `groups` queries sharing a KV head become the `m`
+//! rows of that head's GEMM and cost nothing. One sequence gets that for free.
+//!
+//! ## What the probe overcharged, and by how much
+//!
+//! The probe bounded the b-th cache read at `(b - 1) x 26.9` ms, on the
+//! reasoning that one sequence's extra 3727 keys cost the one-row lane
+//! 151.6 - 124.7 ms a pass. Measured with `b` real caches each read in full, the
+//! whole 512 -> 3732 context step costs **3.3 ms at b = 1, 10.3 ms at b = 2 and
+//! 9.9 ms at b = 4 -- for the entire batch**, not per sequence. The bound was
+//! five to ten times too pessimistic, and the reason is the expansion above:
+//! most of the one-row lane's context delta was a copy that grows with the
+//! context, not the attention it was attributed to.
+//!
+//! So the probe's corrected figures are wrong in the safe direction. It
+//! predicted 313 ms and 12.8 aggregate tok/s at `b = 4` and ctx 3792; measured,
+//! with four independent caches, it is **220 ms and 18.2 tok/s** -- better than
+//! the probe's own UNCORRECTED number (231.8 ms, 17.26 tok/s), which is the
+//! shape of a correction that was measuring the wrong thing.
+//!
+//! ## Where the b = 8 irreproducibility actually was
+//!
+//! `b` up to 4 was reproducible to a millisecond and 6 and 8 were not: the p50
+//! over 120 passes came out anywhere from 283 to 657 ms at `b = 6` and 311 to
+//! 1465 at `b = 8` across runs of the same binary on the same prompts, with
+//! multi-SECOND maxima. Read as a decode problem that looks bimodal, and the
+//! page ladder below was a plausible account of it. It is neither bimodal nor
+//! a decode problem.
+//!
+//! The per-pass sequence says so on its own. Every one of those runs settles at
+//! ~250 ms (`b = 6`) or ~285 ms (`b = 8`) and stays there; what varies is how
+//! many passes it takes to GET there -- one run reached the floor on its second
+//! decode pass and another was still at 1.5 s a hundred passes in. A p50 that
+//! ranges 5x over a floor that does not move is not a bimodal steady state. It
+//! is one transient of variable length, and the transient is the node climbing
+//! back out of the swap that the `b` PREFILLS put it into.
+//!
+//! ## The prefill sequence held 30.49 GiB of a 25.77 GiB headroom
+//!
+//! The `b` prefills run one after another, and every finished one used to be
+//! KEPT until all `b` were in, because the batch was assembled on the first
+//! decode pass. That is the whole of it. `seam::pool_line`
+//! (`memory_usage().bytes_in_use`) across the eight prefills of a 3732-token
+//! run on the 21-layer head, 25.77 GiB of headroom by the admission gate:
+//!
+//!   after prefill   1     2     3     4     5     6     7     8   | batch
+//!   pool live GiB   5.37  8.96 12.55 16.14 19.73 23.31 26.90 30.49|  3.24
+//!   that pass, s    20.9   7.0   7.1   6.8   6.9 118.4 246.4  47.2|
+//!
+//! **+3.59 GiB per slot, against 0.16 GiB of keys and values.** A prefilled
+//! [`dev_lane::AttnCache`] costs twenty times the keys it holds, and the `cat`
+//! in the batch assembly is what collapsed it -- 30.49 GiB of per-slot caches
+//! became a 3.24 GiB batch in one step. The sixth prefill is where the headroom
+//! runs out and it is exactly where the pass times explode; the
+//! reserved-minus-live column stayed under 1.1 GiB throughout, so page
+//! stranding -- the thing `memory_cleanup` was added for, and the thing the
+//! ladder was blamed for -- was never more than 4% of it.
+//!
+//! Slots are seated as they are prefilled now ([`dev_lane::SlotCache::seeded`],
+//! [`dev_lane::SlotCache::seat`]), so the batch is the only long-lived
+//! allocation and it is made once, from slot 0, before any of the churn:
+//!
+//!   after prefill   1     2     3     4     5     6     7     8
+//!   pool live GiB   3.29  3.29  3.29  3.29  3.29  3.29  3.29  3.29
+//!   that pass, s    20.9   6.8   6.8   6.9   6.8   6.9   6.9   6.9
+//!
+//! The whole prefill phase goes from 460 s to 69 s, the head's floor on
+//! `MemAvailable` from 0.6 GiB to 21.4 and the tail's from 6.6 to 25.7, neither
+//! node takes a page of swap where the tail took 5.2 GiB, and the decode is at
+//! its floor on the second pass. Three independent runs of the same binary at
+//! `b = 8` and a 3.7k context: **p50 282.7, 286.9, 289.9 ms** -- a 2.5% spread
+//! where it was 4.7x.
+//!
+//! Three things that were proposed for the bimodality and are not the fix, said
+//! plainly because each of them costs real work: rebalancing the layer split
+//! moves ~3.5 GiB between two nodes that were both ~25 GiB short; a BF16 KV
+//! cache halves 1.3 GiB of a 28 GiB overshoot; a paged KV cache addresses the
+//! stranding term, and the stranding term measured 1.0 GiB.
+//!
+//! ## What the wall was actually capping, which was not eight
+//!
+//! Eight slots was where the old lane stopped being reproducible, so eight is
+//! where the measurements stopped. It was never a property of the batch: the
+//! batch costs 0.19 GiB a slot and the node has 25.77 GiB, and what ran out was
+//! the b UNASSEMBLED prefills. With them gone the same `INK_SLOTS` goes
+//! straight past it. Same pipe, 3732-token prompts, `/tmp/cover_400000.ids`
+//! (100,623 tokens, so sixteen disjoint chunks fit), warm p50 over 40 passes:
+//!
+//!    b    p50 ms   aggregate tok/s   pool live (head)   MemAvailable floor
+//!    8    289.0        27.7              3.29 GiB          21.7 / 26.1 GiB
+//!   12    351.3        34.2              4.05             20.0 / 24.3
+//!   16    399.7        40.0              4.80             19.6 / 24.0
+//!
+//! `b = 16` holds 388-415 ms over its forty passes and neither node takes a
+//! page of swap. **40.0 aggregate tok/s**, and the pool is 4.80 GiB of a
+//! 25.77 GiB headroom, so this is not the ceiling either -- it is where the
+//! corpus ran out of disjoint chunks.
+//!
+//! ## Where the ceiling actually is, on a corpus that does not run out
+//!
+//! `/tmp/mix_891k.ids` is 891,510 tokens: the 100,623-token file above followed
+//! by 790,887 tokens encoded from 3.2 MB of ordinary English prose -- 320 KB
+//! from each of ten public-domain novels, front matter stripped. Slot `s` still
+//! takes `[s * L, (s + 1) * L)`, so slots 0..26 carry exactly the tokens the
+//! shorter file gave them and the arms remain comparable to every row above:
+//! `b = 16` reads 404.8 ms here against 399.7 there. It admits 238 disjoint
+//! 3732-token chunks.
+//!
+//! Real prose and not synthesis, because a 256-expert MoE routes pathologically
+//! on a low-vocabulary prompt and a decode that degenerates into one repeated
+//! token measures the text rather than the machine. Checked rather than
+//! asserted: each 3732-token chunk carries 1106-1632 DISTINCT ids, and slot 0's
+//! continuation is English at every `b`.
+//!
+//! Warm p50 over 40 passes, both columns on the same corpus and the same pipe;
+//! "before" is the schedule this file shipped with and "after" is the fill gate
+//! in [`crate::models::inkling::moegroup::grouped_nrep`]:
+//!
+//! ```text
+//!    b   before p50   after p50   tok/s before -> after  pool live  MemAvail  swap
+//!    8      289.0          -            27.7              3.29 GiB  21.7 GiB    0
+//!   12      351.3          -            34.2              4.05      20.0        0
+//!   16      399.7          -            40.0              4.80      19.2        0
+//!          404.8
+//!   24      496.0          -            48.4              6.31      16.6        0
+//!   32      585.3        585.7          54.7 -> 54.6      7.82      15.8        0
+//!          586.7
+//!          586.4
+//!   40      927.3          -            43.1              9.32      10.7        0
+//!   48     1113.3        744.6          43.1 -> 64.5     10.83      10.1        0
+//!                        741.5
+//!   64     1459.5        866.3          43.9 -> 73.9     13.85       8.3        0
+//!                        865.5
+//!   96         -        1081.4                  88.8     19.88       1.4   5.50 GiB
+//!                       1091.0
+//!  128         -            -                      -     25.91         -      -
+//! ```
+//!
+//! The `pool live` and `MemAvail` columns are the head's and are read off the
+//! post-fix arm where there is one. `b = 40`'s p50 is not a description of that
+//! run and the next section says why.
+//!
+//! **The old peak was 32 and it was a bug, not a limit.** Everything from 40 up
+//! was paying for a grouped-GEMM schedule that reads the padded tile count as a
+//! measure of work; `b = 40` is bimodal for the same reason, 648-691 ms or
+//! 900-993 ms and nothing between. That is its own commit and its own header.
+//!
+//! ## Which resource binds, which is none of the three that were expected
+//!
+//! Not the device pool as a device: 19.88 GiB live at `b = 96` against the
+//! 25.77 GiB the admission gate allows. Not the per-pass arithmetic: it is
+//! still sublinear at 96, where 3x the slots of `b = 32` cost 1.85x the pass.
+//! It is HOST memory, and the pool is what spends it, because on this part the
+//! pool IS host memory. At `b = 96` the pool RESERVES 27.94 GiB to hold 19.88 --
+//! 8.06 GiB stranded over 440 slices -- and `MemAvailable` bottoms at 1.38 GiB
+//! with 5.50 GiB of the head swapped out. It still runs, at **88.8 aggregate
+//! tok/s**, because what got swapped is the reservation nothing reads. The
+//! DECODE is what survives, not the whole run: a second  reads 1091.0 ms
+//! against 1081.4 while its prefill phase goes from 7.7 s a slot to 13.8, so at
+//! ninety-six the thing memory pressure moves first is the part that runs once.
+//!
+//! `b = 128` is over it: 25.91 GiB live, and a prefill goes from 6.8 s a slot to
+//! 56, 139, 72 and 59, so that arm was stopped after five of its hundred and
+//! twenty-eight rather than left two hours to say the same thing a sixth time.
+//! So the wall is between 96 and 128, it is the host's RAM, and
+//! a third of what the batch spends there at 96 is allocator reservation rather
+//! than cache. A pool that returned its stranded slices would be worth more of
+//! this ceiling than anything in the model.
+//!
+//! For scale rather than for a claim: an independent vLLM TP2 setup on two of
+//! these boxes reports 61.97 aggregate tok/s at five concurrent streams. This is
+//! 88.8 at ninety-six, which is a different point on a different curve -- more
+//! sequences, a 3.7k context each -- and the two are not a like-for-like
+//! comparison in either direction.
+//!
+//! # Where a decode pass goes, measured on the device rather than at the host
+//!
+//! `nsys -t cuda` on the HEAD at `INK_SLOTS=32`, a 20 s window covering 34 warm
+//! passes. The profiled run's own p50 is 586.7 ms against 585.3 unprofiled, so
+//! nothing below is paying for the instrument.
+//!
+//! GPU kernel time totals **9538 ms of the 20 000 ms window, 47.7%**. The head's
+//! own half of the pass is 51.3-51.6% of the wall, so **the head's GPU is busy
+//! 93% of the time the head is not blocked on the tail**, and launch gaps are
+//! the other 7%. This lane is not enqueue-bound, which is what the host-side
+//! table above cannot tell you: with nothing synchronising in the loop, a
+//! stage's device cost surfaces at whichever later call blocks, and `router +
+//! group`'s BLOCKING read and `mlp short_conv` are mostly where it lands.
+//!
+//! Per pass, with the bytes each kernel reads and the rate that implies against
+//! a 273 GB/s bus (236 measured by `inkling_bf16_gemm_bench`):
+//!
+//! ```text
+//!   kernel                 ms/pass  share   reads    achieved
+//!   fp4_linear_grouped      147.9   52.7%  25.4 GB   171 GB/s  18 NVFP4 MoE layers
+//!   matmul_entry f32         39.7   14.1%   6.0 GB   152 GB/s  attention scores + values
+//!   matmul_entry bf16        37.8   13.5%   3.8 GB   100 GB/s  q/k/v/r/o, router, shared
+//!   bf16_linear_grouped      34.9   12.4%   5.7 GB   163 GB/s  layer 2, BF16 experts
+//!   the other eighteen       20.2    7.3%
+//! ```
+//!
+//! 41 GB in 302 ms is 138 GB/s, 58% of the bus, and the shape of the shortfall
+//! is 187 small BF16 GEMMs at 100 GB/s rather than one lane in the wrong gear.
+//!
+//! Two things the table is honest about. The kernel times are a SUM and a sum
+//! over-counts if anything overlaps; it does not here, and the check is that
+//! 9538 ms fits inside the 10 260 ms the head was not blocked, which a lane
+//! running two streams would not have done. And the `reads` column for the two
+//! grouped rows is DERIVED, not measured per kernel: the pass's own
+//! `stored bytes` counter gives 28.91 GiB for all nineteen routed layers
+//! together, and it is split between them by expert size -- 48 MiB where they
+//! are BF16 and 13.5 MiB where they are NVFP4, which the startup line's
+//! 72.8 GiB over 9728 planes fixes. That puts ~113 active experts at layer 2,
+//! and 113 is also what the next section's threshold story needs, so the two
+//! agree without having been fitted to each other.
+//!
+//! ## What that rules out, said explicitly because each was a standing suspect
+//!
+//! * **The narrow GEMM lane.** `gemv plane par` requires `m == 1` and every
+//!   wide pass loses it, and that was the largest named suspect for a batched
+//!   decode. It is 13.5% of the head's GPU time. A lane that recovered ALL of
+//!   it -- not the shortfall, the whole 37.8 ms -- is 6% of a 586 ms pass.
+//! * **Attention at a long context.** 14.1%, at 152 GB/s, with 35 of 42 layers
+//!   banded to a 512 window. It is already near the roofline and it is not the
+//!   term that grows.
+//! * **The routed-expert lane itself.** 52.7% of the time and 73% of the bus.
+//!   There is nothing in it to win except fewer bytes, and fewer bytes per TOKEN
+//!   is exactly what raising `b` already buys: 1.39 GiB a token at 8 slots,
+//!   0.90 at 32, 0.48 at 96, because the expert set saturates while the tokens
+//!   do not.
+//!
+//! ## What is left, and what it is worth
+//!
+//! The largest number in the profile is not a kernel. It is the **48% of the
+//! wall on which this node's GPU has nothing to do**, and batching did not fill
+//! it and cannot: head computing 51.3% / blocked 48.7% at `b = 32` and
+//! 49.6 / 50.4 at 48, against 46.9 / 53.1 at one row. The two halves of one
+//! token are strictly ordered, so widening the batch scales both halves and
+//! leaves the ratio where it was. Two ways to take it, priced rather than
+//! assumed:
+//!
+//! * **A within-layer split.** 84 all-reduces a token at the measured 26.84 us
+//!   is 2.25 ms, **0.26% of an 866 ms pass** at `b = 64`; bandwidth is four
+//!   orders of magnitude clear. It halves the bytes each node reads AND runs
+//!   both GPUs on the same token, so the bound is 2x -- ~148 aggregate tok/s at
+//!   64 -- and it halves per-node weight residency, which is the thing that ran
+//!   out at 96. It needs every weight resharded, NCCL inside the loop, and the
+//!   KV cache split by head.
+//! * **A two-cohort pipeline interleave.** BUILT -- `INK_COHORTS`, the section
+//!   after next. It predicted `p50(2c) / p50(c)` at a fixed slot budget:
+//!   866.3 / 585.7 = 1.48x at 64 slots, 1.45x at 96. Measured, **1.49x at 64
+//!   and 1.46x at 32**, and the head's idle half went from 48.7% to 16.6%.
+//!
+//! The interleave was the one to build first, and it stays the cheaper half of
+//! the answer: it is a `VecDeque` and an index against every weight resharded,
+//! and the two COMPOSE rather than competing -- the split halves what each node
+//! reads, the interleave stops each node waiting, and neither takes the other's
+//! win. What the interleave does NOT do is reduce per-node weight residency,
+//! which is the thing that ran out at 96 slots, so the split is still the lever
+//! for the ceiling and the interleave is the lever for the idle half.
+//!
+//! ## Batching the prefills, priced rather than built
+//!
+//! The `b` prefills are still sequential and are now the startup cost: eight of
+//! them at 6.86 s is 55 s before the first decoded token. Sharing the batch
+//! machinery would amortise the per-prefill FIXED part over `b`, and that part
+//! is measurable -- a 512-token prefill is 1.42 s and a 3732-token one 6.86 s,
+//! which is 1.69 ms a token plus **0.56 s** that does not depend on the length.
+//! Eight of those is 4.5 s of the 55, so a batched prefill is worth at most 8%
+//! of the phase it would restructure. The rest is arithmetic over `b * n`
+//! tokens and a batch does not make it cheaper.
+//!
+//! ## The contamination test, which is the one this can fail
+//!
+//! Re-run on the fill gate, whole stack, 512-token prompts, 20 decode passes:
+//! slot 0 beside seven different chunks and slot 0 beside seven copies of
+//! itself emit the identical 20-token stream; the heterogeneous run's eight
+//! slots emit eight DISTINCT continuations; the homogeneous run emits eight
+//! identical tokens on every step. `slots_stay_independent_on_a_global_layer`
+//! reads 0e0 and `..._on_a_local_layer` 1.15356445e-2, both unmoved. And the
+//! schedule change is visible nowhere in the output: at `INK_SLOTS=32` and 48,
+//! the old lane, `INK_MOE_NREP=1` and the gate emit token-for-token identical
+//! streams over every pass and every slot.
+//!
+//! Batch contamination -- slot `s` reading slot `s'`'s keys -- produces fluent
+//! text and no error, so it has to be looked for deliberately, and it cannot be
+//! looked for by comparing `b = 8` against `b = 1`: those already disagree on
+//! this model because `gemv plane par` requires `m == 1` and a wider pass loses
+//! it. So the test holds `b` FIXED at 8 and changes only the neighbours.
+//!
+//! Whole stack, 512-token prompts, 20 decode passes:
+//!
+//! * slot 0 beside seven DIFFERENT chunks and slot 0 beside seven copies of
+//!   itself emit the **identical** 20-token stream, token for token;
+//! * the eight slots in the first of those emit eight distinct continuations,
+//!   so the agreement is not a batch that collapsed into one sequence;
+//! * the second emits eight identical tokens on every step, which is the
+//!   symmetry the batch has to have and does not get for free;
+//! * held to one GEMM lane (`INK_GEMM='double cyclic mma'`), `b = 8` with eight
+//!   identical slots reproduces `b = 1` on the layer-RMS ladder -- 0.0000 on ten
+//!   of twelve passes and one unit in the last printed decimal on the other two
+//!   -- and the two token streams are identical.
+//!
+//! At the layer level the same question is asked against the UNCACHED lane:
+//! eight slots carrying eight different sequences, each held to its own
+//! whole-sequence run, is BIT-IDENTICAL on a global layer and 1.15e-2 on a local
+//! one, which is the TF32-against-banded-prefill gap the existing cached-local
+//! test already sits at (`slots_stay_independent_on_a_*_layer` in `burn.rs`).
+//!
+//! # `INK_COHORTS=c`: c cohorts, offset so neither node is half idle
+//!
+//! The largest number in the profile above is not a kernel. It is the 48% of
+//! the wall on which a node's GPU has nothing to do, and the section before it
+//! is the argument that batching cannot fill that: the two halves of one token
+//! are strictly ordered, so widening scales both and leaves the ratio where it
+//! was. Two cohorts can fill it. The slots are already independent -- that is
+//! what `INK_SLOTS` establishes -- so nothing stops cohort B's layers 0:21
+//! running on the head while cohort A's 21:42 run on the tail. A round is `c`
+//! passes, advances every cohort by one token, and costs `c * max(H, T)` where
+//! the same total width in one cohort costs `H' + T'` at `c` times the per-node
+//! batch.
+//!
+//! ## It is a queue and an index
+//!
+//! The head pushes the cohort it just sent onto a `VecDeque` and then reads the
+//! answer to the OLDEST outstanding one rather than to the one it just sent,
+//! leaving `c - 1` in flight. That is the whole interleave. Around it:
+//! `slots_dev` grows a leading cohort axis so `slots_dev[c][layer]` is one
+//! cohort's [`dev_lane::SlotCache`] and the two indices are never mixed; the
+//! answer is committed to the cohort it belongs to and not to the one this pass
+//! computed; and the wire grows one `u64`.
+//!
+//! That `u64` is the cohort id and it is not redundant. Both ends derive the
+//! cohort from the same step counter and would normally agree by arithmetic; a
+//! pair that ever disagreed would run one cohort's residual against another
+//! cohort's keys, which is fluent text and no error at all. Eight bytes a pass
+//! buys a loud failure instead of a silent one.
+//!
+//! No collective, no resharding, no new kernel, and no change to any lane's
+//! arithmetic: a cohort's pass is byte-for-byte the pass it would have run
+//! alone, which the gate below checks rather than assumes.
+//!
+//! The PREFILLS stay strict whatever `c` is. A prefill's answer seeds the slot
+//! it just filled and there is nothing to overlap it with, so the only thing
+//! `INK_COHORTS` changes before the first decoded token is that there are
+//! `c * b` prefills instead of `b`.
+//!
+//! ## What it costs and what it buys
+//!
+//! Warm p50 over 40 passes, `/tmp/mix_891k.ids` (891,510 tokens of ordinary
+//! English prose), 3732-token prompts, two-node pipe over the direct link,
+//! layers 0:21 and 21:42, `INK_KV=1`. Every row is compared against the
+//! SINGLE-cohort arm of the same TOTAL slot count, because that is the arm it
+//! replaces -- `2 x 32` and `1 x 64` hold sixty-four sequences either way.
+//!
+//! ```text
+//!   total   ONE cohort           TWO cohorts                        gain
+//!   slots   p50 ms  agg tok/s    b    p50 ms       agg tok/s
+//!     32     585.7     54.6      16   200.8 203.3  79.7  78.7      1.46x
+//!     64     866.3     73.9      32   289.9 290.3  110.4 110.2     1.49x
+//!     96    1081.4     88.8      48   371.8        129.1           1.45x
+//! ```
+//!
+//! **1.46x, 1.49x and 1.45x, against predictions of 1.46, 1.48 and 1.45.** The
+//! prediction was not fitted to anything: it is `p50(2c) / p50(c)` read off the
+//! single-cohort table above, which is the batch's own sublinearity, and that
+//! is precisely what the interleave converts into throughput. It follows that
+//! the gain is bounded by how sublinear the batch is at that width and by
+//! nothing else -- the ratio sits between 1.38 and 1.50 everywhere the
+//! single-cohort table has been measured, so there is no width at which this is
+//! worth much more or much less than a half.
+//!
+//! **129.1 aggregate tok/s** is where this lane peaks on the wide cache, at
+//! ninety-six sequences of a 3732-token context each. The narrow cache carries
+//! it to 162.1 at a hundred and twenty-eight; see the section after next.
+//!
+//! Reproducibility below the memory wall: the two `2 x 32` runs read 289.9 and
+//! 290.3 ms, a 0.1% spread; the two `2 x 16` runs 200.8 and 203.3, 1.2%.
+//!
+//! ## The idle half is two thirds gone, and what is left is not idle
+//!
+//! The head's own accounting, `2 x 32` against `1 x 64`: **computing 83.4%,
+//! blocked 16.6%**, against 49.1% and 50.9%. At `2 x 48` against `1 x 96` it is
+//! 82.2 / 17.8 against 47.2 / 52.8. Writing to the wire is 6.7 ms over forty
+//! passes at 32 and 10.0 ms at 48 -- a fifth of a millisecond a pass -- so
+//! nothing here is the socket, and the head never blocks in `send_stream`: a
+//! 48-row residual is 768 KB and the kernel buffers it while the tail is busy.
+//! That was the one way this could have failed quietly, by serialising the
+//! pipeline on a socket write and still producing correct text.
+//!
+//! The residual 16.6% is not structural idle. It is JITTER between two stages
+//! that are within 1% of each other: the head's pass p50 is 289.9 ms and the
+//! tail's 287.7, so whichever end happens to be slower on a given pass makes
+//! the other wait, and over forty passes that averages to a real 60-odd ms. A
+//! deeper queue would absorb it -- with `c - 1` answers outstanding the head can
+//! run ahead -- and that is the one thing a third cohort would buy.
+//!
+//! ## Depth past two, and why it is not measured here
+//!
+//! It cannot pay, and the argument is short enough to make instead of running
+//! it. A round costs `max(H, T)` a pass at ANY depth above one -- the second
+//! cohort is what stops a node waiting, and a third finds nothing left to fill.
+//! What a third cohort does take is WIDTH: at a fixed slot budget it makes each
+//! cohort smaller, and width is where the sublinearity that the interleave
+//! converts actually lives. `3 x 16` and `2 x 24` are both forty-eight
+//! sequences; the first emits 16 tokens on a pass the measured table puts near
+//! 201 ms and the second 24 on one near 248, which is the same machine and a
+//! fifth less throughput, plus one more cohort of caches to hold on the
+//! resource that is already the ceiling.
+//!
+//! The one thing a deeper queue WOULD buy is the jitter above -- with two
+//! answers outstanding the head never waits for the slower end. That is worth
+//! at most the 17% and it costs width, so it is a trade to make only if the two
+//! halves are ever left badly unbalanced.
+//!
+//! ## Memory: the same caches, and the same wall
+//!
+//! Two cohorts of `b` hold exactly what one cohort of `2b` holds -- `2b` caches
+//! -- and the measurement says so to the hundredth of a gibibyte: `pool live`
+//! is 13.85 GiB at `2 x 32` and 13.85 GiB at `1 x 64`, and 19.88 GiB at both
+//! `2 x 48` and `1 x 96`. **The interleave buys throughput and it does not buy
+//! headroom**, which matters because host RAM is what this part runs out of.
+//!
+//! Below the wall the reservation differs slightly in the interleave's favour:
+//! at 64 slots 15.98 GiB reserved against 17.40, so 2.13 GiB stranded over 608
+//! slices against 3.55 over 440, and `MemAvailable` on the head bottoms at
+//! 10.42 GiB against 8.27.
+//!
+//! At 96 it does not. Both arms meet the SAME bound, and it is the host's RAM
+//! and not the device pool or the arithmetic: `2 x 48` reserves 28.68 GiB to
+//! hold 19.88, `MemAvailable` bottoms at **0.43 GiB** and the head swaps
+//! 4.25 GiB, against 1.38 GiB and 5.50 for `1 x 96`. What it costs is the
+//! PREFILL and not the decode: prefills that run at 7 s a slot while only
+//! cohort 0's batch exists go to 45 s a slot from the moment cohort 1's batch
+//! is allocated -- forty-two minutes for the phase -- while the decode that
+//! follows holds 354-372 ms over its forty passes and reads its predicted rate.
+//! That is the same shape the single-cohort arm shows at 96 and for the same
+//! reason: what gets swapped is reservation nothing reads.
+//!
+//! The 96-slot row is ONE run, not two, and it is quoted that way on purpose:
+//! its arm costs forty-two minutes of prefill under swap, and repeating it
+//! would price the allocator rather than the interleave. The two arms below the
+//! wall are two runs each and agree to 0.1% and 1.2%.
+//!
+//! ## The gate, and the one thing this could have got wrong
+//!
+//! Two cohorts sharing one pipe is exactly the shape that could cross-
+//! contaminate, and cross-contamination is fluent text and no error. So the
+//! check holds the cohort's own contents FIXED and changes only whether a
+//! second cohort is in the pipe beside it. Whole stack, eight slots of
+//! 512-token prompts, 20 decode passes:
+//!
+//! * cohort 0 of a `2 x 8` run and the same eight slots as a `1 x 8` run emit
+//!   the **identical** 20-token stream, token for token, on every slot;
+//! * the eight slots of that cohort emit eight DISTINCT continuations, so the
+//!   agreement is not a batch that collapsed into one sequence;
+//! * with cohort 0 homogeneous -- slot 0 beside seven copies of itself, and a
+//!   heterogeneous cohort 1 in the pipe beside it -- all eight slots emit the
+//!   same token on every step, and it is the same token slot 0 emits in the
+//!   heterogeneous run;
+//! * `slots_stay_independent_on_a_global_layer` and `..._on_a_local_layer` are
+//!   unmoved at 0e0 and 1.15e-2.
+//!
+//! And at `INK_COHORTS=1` the transcript is character for character the one
+//! every arm above was measured on: the cohort tag is only printed when there
+//! is more than one, and the same eight slots on the pre-interleave binary and
+//! on this one emit identical streams.
+//!
+//! # The KV cache is BF16, and `INK_ATTN_BF16=0` is the wide arm
+//!
+//! The attention matmuls are 14.1% of a decode pass at 152 GB/s against a
+//! measured 236 GB/s bus, so they are bandwidth-bound, and what they read is
+//! almost entirely the KV cache: 6.0 GB a pass at 32 slots against 5.4 GB of
+//! slot KV. Halving the width of the cache halves what the lane moves. It also
+//! halves what the run HOLDS, and on this part that is the ceiling.
+//!
+//! **Every table above this section was measured on the WIDE cache**, which is
+//! `INK_ATTN_BF16=0` now and was the only lane when they were taken. They are
+//! left as they were rather than re-measured: what they are about is the batch
+//! and the pipe, and re-running forty arms to move each of them a few percent
+//! would price the cache twice and the interleave not at all. The row-by-row
+//! effect of the narrow cache is the table at the end of this section.
+//!
+//! Held narrow, not cast per pass -- casting would ADD a full-width read to
+//! save a half-width one. So [`dev_lane::SlotCache`] and [`dev_lane::AttnCache`]
+//! allocate, append, merge and trim in BF16, and `q @ k^T` and `p @ v` run
+//! there; the scores come back to f32 before the relative bias, the mask and
+//! the softmax, which are untouched. `[slots * kv_heads, groups, cap]` is 16 MB
+//! at 32 slots against gigabytes of cache, so keeping the reduction's OUTPUT
+//! wide costs nothing. A PREFILL computes its scores from keys it has just
+//! projected and never round-trips them, so it has nothing to save and is left
+//! alone.
+//!
+//! ## The precision argument is not the one it looks like
+//!
+//! Burn's f32 matmul on this runtime is TF32 -- about ten mantissa bits, not
+//! twenty-three, pinned by `f32_matmul_is_tf32_on_this_runtime` at 9.3e-4
+//! relative on a 128-deep product. The four-byte load was paying for
+//! twenty-three bits that the tensor cores round away before they multiply.
+//! BF16 carries eight, which is genuinely fewer.
+//!
+//! **How much fewer is not a question an f64 reference can answer**, and this
+//! file no longer contains one to ask. The weights are four bits; an f64 sum of
+//! the same values is a more expensive computation of the model, not the
+//! model's ground truth, and the reference implementation this port is held to
+//! does not compute attention that way either. So the acceptance criterion is
+//! `golden/paired/` -- the same prompts through the BF16 reference and through
+//! each arm, reported as agreement rather than as distance.
+//!
+//! A layer-RMS ladder is still worth a glance, as a smoke check and not as a
+//! bound: on the FIRST decode pass, where both arms are on identical inputs,
+//! the ladder moves 5.3e-3 across the head's 21 layers and 2.5e-2 across the
+//! tail's -- the same order as `CACHE_TOLERANCE_LOCAL`, which is what the f32
+//! cached lane already sits at against the uncached one. Later passes move far
+//! more (30% by the twentieth) and that number means nothing: by then the two
+//! arms are decoding different text.
+//!
+//! Token agreement means little here for the same reason. Held to eight slots
+//! of 512-token prompts, the two arms agree on 51% of 160 slot-steps and
+//! diverge from the first cached step, which is what greedy decoding does the
+//! moment any position flips -- the same lane already shows `INK_WIDTH=1` and
+//! `INK_WIDTH=2` taking the stack apart over forty positions with no
+//! speculation anywhere. That is why the gate is capability and not agreement.
+//!
+//! ## The gate: `golden/paired/`, and it does not move
+//!
+//! Eight generation prompts, 48 tokens each, decoded through the pipe with the
+//! cache on; then the prompt AND that continuation through the unquantised BF16
+//! reference as one sequence, which is asked at every position what IT would
+//! have emitted. 384 scored positions an arm. `INK_ATTN_BF16=0` and `=1` on the
+//! same binary, same prompts, same reference procedure.
+//!
+//! ```text
+//!                                                      wide cache   narrow cache
+//!   reference vs the runtime's own cached generation   362/384 94.3%  363/384 94.5%
+//!   reference vs the runtime, both teacher-forced      359/384 93.5%  361/384 94.0%
+//!   the runtime UNCACHED vs its own cached generation  365/384 95.1%  363/384 94.5%
+//! ```
+//!
+//! Every 95% interval on those six numbers spans four points and every pair
+//! overlaps almost entirely; the largest gap between the arms is TWO positions
+//! out of 384, and it points in a different direction on the second line than
+//! on the third. **The narrow cache is not distinguishable from the wide one
+//! here**, and the third line is the one that isolates the cache: it compares
+//! each arm's cached lane against its OWN uncached forward on the same ids, so
+//! the model and the reference cancel and what is left is the cache.
+//!
+//! Said with its limit rather than without: eight sequences is what this
+//! detects, and the harness's own `--flip` calibration on the multiple-choice
+//! set says a small regression is not detectable at that size. What this run
+//! rules out is a regression large enough to matter at the width the change was
+//! made for, and it does not rule out a small one.
+//!
+//! The 40-item multiple-choice set is NOT the instrument here and was not run
+//! as one: those items answer with the FIRST token, which is a prefill, and a
+//! prefill reads no cache -- it would have scored a run in which this change
+//! never executed. That property is checked rather than asserted: the same
+//! uncached forward over the same eight sequences, with the flag on and with it
+//! off, writes byte-identical top-5 tables, all eight for all eight.
+//!
+//! ## What the unit tests can and cannot say about it
+//!
+//! The cached-lane tests in `burn.rs` assert that feeding one token at a time
+//! reproduces feeding all of them, at a tolerance sized for two implementations
+//! of the SAME arithmetic. A narrow cache is not that -- it stores less -- so
+//! those tests take the wide lane explicitly rather than being loosened until
+//! the narrow one fits, which would be inventing a bound to match the answer.
+//! What the narrow lane is held to instead is the property that holds exactly
+//! at any dtype and is the one batching can get wrong:
+//! `narrow_slots_are_still_independent` runs slot 0 beside three different
+//! sequences and beside three copies of itself and requires the two answers to
+//! be **bit-identical** -- 0e0, measured -- while the four slots of the
+//! heterogeneous batch stay 4.1e-1 apart.
+//!
+//! ## What it costs and what it buys
+//!
+//! Warm p50 over 40 passes, `/tmp/mix_891k.ids`, 3732-token prompts, two-node
+//! pipe, layers 0:21 and 21:42, `INK_KV=1`. `pool live`, `slot KV` and the
+//! `MemAvailable` floor are the head's.
+//!
+//! ```text
+//!   slots  cohorts  lane   p50 ms        agg tok/s     pool live  slot KV  MemAvail  swap
+//!     32      1     f32    585.7 585.3   54.6          7.82 GiB   5.01 GiB   15.8     0
+//!     32      1     bf16   556.4 555.0   57.5  57.7    4.84       2.51       16.8     0
+//!     96      1     f32   1081.4         88.8         19.88      15.04        1.4  5.50 GiB
+//!     96      1     bf16   968.7         99.1         10.95       7.52       10.2     0
+//!     96      2     f32    371.8        129.1         19.88      15.04        0.4  4.25 GiB
+//!     96      2     bf16   344.8        139.2         10.95       7.52       12.4     0
+//!    128      1     f32       --  did not run: 25.91 GiB live, prefills 56/139/72/59 s
+//!    128      1     bf16  1091.5        117.3         14.00      10.03        4.4  4.63 GiB
+//!    128      2     bf16   394.7        162.1         14.00      10.03        6.7     0
+//! ```
+//!
+//! **5.4% on the pass at 32 slots and 11.6% at 96**, and the two are different
+//! numbers for a reason. At 32 the saving is exactly what the bandwidth share
+//! predicts: the attention products are ~13.6% of the round trip across the two
+//! nodes and halving their bytes takes about half of that. At 96 the f32 arm is
+//! ALSO paying for memory pressure -- 19.88 GiB live, `MemAvailable` at
+//! 1.4 GiB, 5.50 GiB of the head swapped -- and the BF16 arm is not, because
+//! 7.52 GiB of slot KV against 15.04 is what takes the run off the wall.
+//!
+//! The cache is 50% narrower and the POOL is 38-45% smaller, which is more than
+//! the cache alone: the pass's transient score and probability tensors follow
+//! the dtype of what they are built from.
+//!
+//! **With the interleave, ninety-six sequences decode at 139.2 aggregate tok/s
+//! against 88.8 before either change** -- 1.57x, at a 3732-token context each,
+//! on a pair of nodes where the single-cohort f32 arm was swapping.
+//!
+//! ## What this does to the ceiling, which was the point
+//!
+//! The last section's ceiling was host RAM and nothing else. `b = 128` was over
+//! it at 25.91 GiB live, and that arm was stopped after five of its hundred and
+//! twenty-eight prefills -- 56, 139, 72 and 59 seconds each -- rather than left
+//! two hours to say so a sixth time. `b = 96` ran but swapped 5.50 GiB, and the
+//! two-cohort arm at the same width bottomed at 0.43 GiB of `MemAvailable`.
+//!
+//! Narrow, **`b = 128` runs**: 14.00 GiB live against 25.91, prefills at their
+//! floor, and 117.3 aggregate tok/s single-cohort. Interleaved it is
+//! **162.1 aggregate tok/s** -- and the interleaved arm is the one that stays
+//! OFF swap at that width, because two 64-slot batches reserve 15.65 GiB to hold
+//! 14.00 where one 128-slot batch reserves 17.61, and 1.96 GiB of stranded
+//! reservation is the whole margin at this point on the curve.
+//!
+//! So the two changes compose the way they were argued to: **88.8 aggregate
+//! tok/s before either, 162.1 with both**, at a 3732-token context on every one
+//! of a hundred and twenty-eight sequences. The interleave stops each node
+//! waiting; the narrow cache is what buys the width to wait for.
 //!
 //! # One lane, all the way down
 //!
@@ -104,7 +1058,9 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 
-use mary::models::inkling::attn::{causal_mask, AttnDims, AttnWeights, LogScaling};
+use mary::models::inkling::attn::{AttnDims, AttnWeights, LogScaling};
+use mary::models::inkling::budget;
+use mary::models::inkling::fatal;
 use mary::models::inkling::block::{rms_norm, route_from_logits, Routing};
 use mary::models::inkling::config::{AttnKind, InklingConfig};
 use mary::models::inkling::load::{split_gate_up, Held};
@@ -119,6 +1075,14 @@ use mary::models::inkling::stack::{embed_and_norm_bf16, embed_row_bf16};
 
 /// One gibibyte, as the divisor every byte count here is printed against.
 const GIB: f64 = (1u64 << 30) as f64;
+
+/// How many decode steps are COLD, and excluded from the warm rate.
+///
+/// Every kernel shape a decode step reaches is compiled on first use, and the
+/// first two steps of a pipe run pay 4.54 s and 0.55 s of that against a 127 ms
+/// median. Two is not a fit: it is how many steps report a pass an order of
+/// magnitude off the median, and the third is already within 6% of it.
+const COLD_DECODE_STEPS: usize = 2;
 
 /// Bytes this process has actually pulled off the block device.
 ///
@@ -157,6 +1121,28 @@ fn wilson95(hits: usize, n: usize) -> (f64, f64) {
     ((centre - half).max(0.0), (centre + half).min(1.0))
 }
 
+/// One logit row as a probability distribution.
+///
+/// The exponentials are accumulated in f64 over the max-shifted row: the row is
+/// 200 058 wide and the summands span the whole dynamic range, so an f32 sum
+/// loses the tail — and the tail is exactly what an acceptance rule reads.
+fn softmax_row(row: &[f32]) -> Vec<f32> {
+    let mut m = f32::NEG_INFINITY;
+    for &x in row {
+        if x > m {
+            m = x;
+        }
+    }
+    let mut out = Vec::with_capacity(row.len());
+    let mut sum = 0f64;
+    for &x in row {
+        let e = ((x - m) as f64).exp();
+        sum += e;
+        out.push(e);
+    }
+    out.iter().map(|e| (e / sum) as f32).collect()
+}
+
 /// Which end of a two-machine split this process is, if it is one.
 ///
 /// The head owns the embedding and the token loop; the tail owns the final norm,
@@ -174,10 +1160,11 @@ enum Pipe {
 /// cannot derive it: with a KV cache a decode step feeds ONE token whose
 /// absolute position is what log scaling and the relative bias are functions of,
 /// and the tail has never seen the sequence it belongs to.
-fn send_stream(s: &mut TcpStream, n: usize, pos0: usize, x: &[f32]) -> Result<()> {
-    let mut b = Vec::with_capacity(16 + x.len() * 4);
+fn send_stream(s: &mut TcpStream, n: usize, pos0: usize, coh: usize, x: &[f32]) -> Result<()> {
+    let mut b = Vec::with_capacity(24 + x.len() * 4);
     b.extend_from_slice(&(n as u64).to_le_bytes());
     b.extend_from_slice(&(pos0 as u64).to_le_bytes());
+    b.extend_from_slice(&(coh as u64).to_le_bytes());
     for v in x {
         b.extend_from_slice(&v.to_le_bytes());
     }
@@ -187,13 +1174,17 @@ fn send_stream(s: &mut TcpStream, n: usize, pos0: usize, x: &[f32]) -> Result<()
 }
 
 /// The other side of [`send_stream`]. `None` when the peer is done.
-fn recv_stream(s: &mut TcpStream, h: usize) -> Result<Option<(usize, usize, Vec<f32>)>> {
-    let mut hdr = [0u8; 16];
+fn recv_stream(
+    s: &mut TcpStream,
+    h: usize,
+) -> Result<Option<(usize, usize, usize, Vec<f32>)>> {
+    let mut hdr = [0u8; 24];
     if s.read_exact(&mut hdr).is_err() {
         return Ok(None);
     }
     let n = u64::from_le_bytes(hdr[..8].try_into().unwrap()) as usize;
-    let pos0 = u64::from_le_bytes(hdr[8..].try_into().unwrap()) as usize;
+    let pos0 = u64::from_le_bytes(hdr[8..16].try_into().unwrap()) as usize;
+    let coh = u64::from_le_bytes(hdr[16..].try_into().unwrap()) as usize;
     if n == 0 {
         return Ok(None);
     }
@@ -203,7 +1194,40 @@ fn recv_stream(s: &mut TcpStream, h: usize) -> Result<Option<(usize, usize, Vec<
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    Ok(Some((n, pos0, x)))
+    Ok(Some((n, pos0, coh, x)))
+}
+
+/// The tail's answer: a length and that many token ids.
+///
+/// One shape for BOTH of the tail's messages, because they are the same kind of
+/// thing — a short list of token ids — and a second wire format would be a
+/// second thing to get out of step. Message one is what the verify pass
+/// CONFIRMED (the accepted prefix plus the token past it, so never empty);
+/// message two is what the MTP heads drafted for the next pass (empty when the
+/// run is not speculating). They are sent separately on purpose: the head can
+/// commit its caches on the first while the tail is still computing the second.
+fn send_toks(s: &mut TcpStream, toks: &[usize]) -> Result<()> {
+    let mut b = Vec::with_capacity(8 + toks.len() * 8);
+    b.extend_from_slice(&(toks.len() as u64).to_le_bytes());
+    for &tk in toks {
+        b.extend_from_slice(&(tk as i64).to_le_bytes());
+    }
+    s.write_all(&b)?;
+    s.flush()?;
+    Ok(())
+}
+
+/// The other side of [`send_toks`].
+fn recv_toks(s: &mut TcpStream) -> Result<Vec<usize>> {
+    let mut hdr = [0u8; 8];
+    s.read_exact(&mut hdr).context("the tail closed mid-step")?;
+    let n = u64::from_le_bytes(hdr) as usize;
+    let mut buf = vec![0u8; n * 8];
+    s.read_exact(&mut buf).context("the tail closed mid-answer")?;
+    Ok(buf
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as usize)
+        .collect())
 }
 
 /// The backend the device lane runs on.
@@ -565,6 +1589,123 @@ fn dense_mlp_bf16(x: T2, w: &(Bf16W, Bf16W, Bf16W, f32)) -> T2 {
     let g = dev_lane::linear_bf16(x.clone(), &w.0);
     let u = dev_lane::linear_bf16(x, &w.1);
     dev_lane::linear_bf16(dev_lane::silu(g) * u, &w.2).mul_scalar(w.3)
+}
+
+/// One MTP head's weights, on the DEVICE.
+///
+/// The draft path was scalar HOST arithmetic while every other multiply in this
+/// file was on the device, and that is not a detail: measured on the two-node
+/// pipe, a warm decode round trip is 131 ms and `INK_MTP=4` drafting is 1470 ms.
+/// A draft that costs eleven forward passes is not a cheap approximation of one,
+/// so speculation could not pay at ANY acceptance rate — the arithmetic said so
+/// before the model got a vote. Nothing about the shape justified it: an MTP
+/// block's `transformer_block.*` is shape-identical to an ordinary decoder
+/// layer, so it multiplies by exactly the operators the stack already runs on
+/// the device, and the wrapper around it is two RMS norms, a concatenation and
+/// one `[hidden, 2 * hidden]` projection.
+///
+/// The host lane stays as the CONTROL and not as a fallback: `INK_MTP_DEV=0`
+/// selects it, and it is what says whether this transcription drafts the same
+/// tokens.
+struct MtpDev {
+    attn: dev_lane::AttnWeightsDev,
+    attn_sconv: T2,
+    mlp_sconv: T2,
+    attn_norm: BT<Bk, 1>,
+    mlp_norm: BT<Bk, 1>,
+    embed_norm: BT<Bk, 1>,
+    hidden_norm: BT<Bk, 1>,
+    /// `[hidden, 2 * hidden]`, which is the whole of what
+    /// `mtp_hidden_states_first` is a claim about.
+    input_proj: Bf16W,
+    dense: (Bf16W, Bf16W, Bf16W, f32),
+}
+
+/// What one device MTP head retains between draft steps.
+///
+/// The same three things a main-stack layer keeps, and for the same reasons —
+/// see [`dev_lane::AttnCache`] on why the pre-convolution projections are not
+/// optional. `Clone` is load-bearing: a SPECULATIVE row is run against a clone
+/// that is then dropped, so a rejected draft leaves nothing to undo.
+#[derive(Clone)]
+struct MtpDevCache {
+    attn: dev_lane::AttnCache<Bk>,
+    attn_sconv: T2,
+    mlp_sconv: T2,
+}
+
+/// The MTP wrapper's input: each operand normed by its OWN weight, concatenated
+/// in the order under test, projected back down to `hidden`.
+///
+/// Two norms is the tell that the operands are joined rather than summed; a
+/// residual add would want one. The concat order is the whole open question the
+/// acceptance rate answers, so it is a parameter here exactly as it is on the
+/// host.
+fn mtp_input_dev(hidden: T2, embeds: T2, w: &MtpDev, eps: f64, order: MtpConcat) -> T2 {
+    let hn = dev_lane::rms_norm(hidden, w.hidden_norm.clone(), eps);
+    let en = dev_lane::rms_norm(embeds, w.embed_norm.clone(), eps);
+    let cat = match order {
+        MtpConcat::HiddenFirst => BT::cat(vec![hn, en], 1),
+        MtpConcat::EmbedFirst => BT::cat(vec![en, hn], 1),
+    };
+    dev_lane::linear_bf16(cat, &w.input_proj)
+}
+
+/// One MTP head over a whole sequence, on the device, keeping the cache.
+///
+/// The device twin of `mtp::mtp_block_prefill`, and the same decoder layer the
+/// main stack runs: norm, attention, short convolution, residual; norm, DENSE
+/// MLP, short convolution, residual. Dense regardless of `dense_mlp_idx` —
+/// every MTP block is, and the two intermediate sizes differ by 8x.
+#[allow(clippy::too_many_arguments)]
+fn mtp_block_prefill_dev(
+    hidden: T2,
+    embeds: T2,
+    w: &MtpDev,
+    dims: &AttnDims,
+    ls: Option<LogScaling>,
+    window: Option<usize>,
+    kernel: usize,
+    eps: f64,
+    order: MtpConcat,
+) -> (T2, MtpDevCache) {
+    let x = mtp_input_dev(hidden, embeds, w, eps, order);
+    let hn = dev_lane::rms_norm(x.clone(), w.attn_norm.clone(), eps);
+    let (y, attn) = dev_lane::attention_prefill(hn, &w.attn, dims, ls, window, window);
+    let ahist = dev_lane::conv_history(y.clone(), kernel);
+    let x1 = x + dev_lane::short_conv(y, w.attn_sconv.clone());
+    let hn = dev_lane::rms_norm(x1.clone(), w.mlp_norm.clone(), eps);
+    let y = dense_mlp_bf16(hn, &w.dense);
+    let mhist = dev_lane::conv_history(y.clone(), kernel);
+    let out = x1 + dev_lane::short_conv(y, w.mlp_sconv.clone());
+    (out, MtpDevCache { attn, attn_sconv: ahist, mlp_sconv: mhist })
+}
+
+/// One position of one MTP head on the device, reading the cache.
+#[allow(clippy::too_many_arguments)]
+fn mtp_block_step_dev(
+    hidden: T2,
+    embeds: T2,
+    w: &MtpDev,
+    dims: &AttnDims,
+    ls: Option<LogScaling>,
+    pos: usize,
+    window: Option<usize>,
+    cache: &mut MtpDevCache,
+    eps: f64,
+    order: MtpConcat,
+) -> T2 {
+    let x = mtp_input_dev(hidden, embeds, w, eps, order);
+    let hn = dev_lane::rms_norm(x.clone(), w.attn_norm.clone(), eps);
+    let y = dev_lane::attention_step(hn, &w.attn, dims, ls, pos, window, &mut cache.attn);
+    let (a, ah) = dev_lane::short_conv_step(cache.attn_sconv.clone(), y, w.attn_sconv.clone());
+    cache.attn_sconv = ah;
+    let x1 = x + a;
+    let hn = dev_lane::rms_norm(x1.clone(), w.mlp_norm.clone(), eps);
+    let y = dense_mlp_bf16(hn, &w.dense);
+    let (m, mh) = dev_lane::short_conv_step(cache.mlp_sconv.clone(), y, w.mlp_sconv.clone());
+    cache.mlp_sconv = mh;
+    x1 + m
 }
 
 /// The shared experts, with every weight the BF16 it is stored as.
@@ -1110,6 +2251,15 @@ fn grouped_experts_fp4(
     // whole layer, against two per expert before.
     let t_g = Instant::now();
     let plan = RowPlan::build(by_expert.values(), n, RowPlan::planes());
+    if std::env::var("INK_MOE_DEBUG").is_ok() {
+        eprintln!(
+            "MOEPLAN {prefix} slots={} rows={} tiles={} blocks={}",
+            by_expert.len(),
+            plan.m_total(),
+            plan.m_total() / 16,
+            plan.blk_slot.len()
+        );
+    }
     let m_total = plan.m_total();
     let hn_h = handle_of(hn.clone());
     let h_rowtok = client.create_from_slice(bytes_of(&plan.row_tok));
@@ -1120,6 +2270,7 @@ fn grouped_experts_fp4(
         cnt: client.create_from_slice(bytes_of(&plan.blk_cnt)),
         blocks: plan.blk_slot.len(),
         planes: RowPlan::planes(),
+        rows_real: plan.rows_real(),
     };
     let h_off13 = client.create_from_slice(bytes_of(&off13));
     let h_off2 = client.create_from_slice(bytes_of(&off2));
@@ -1363,6 +2514,15 @@ fn grouped_experts_bf16(
 
     let t_g = Instant::now();
     let plan = RowPlan::build(by_expert.values(), n, RowPlan::planes());
+    if std::env::var("INK_MOE_DEBUG").is_ok() {
+        eprintln!(
+            "MOEPLAN {prefix} slots={} rows={} tiles={} blocks={}",
+            by_expert.len(),
+            plan.m_total(),
+            plan.m_total() / 16,
+            plan.blk_slot.len()
+        );
+    }
     let m_total = plan.m_total();
     let hn_h = handle_of(hn.clone());
     let h_rowtok = client.create_from_slice(bytes_of(&plan.row_tok));
@@ -1373,6 +2533,7 @@ fn grouped_experts_bf16(
         cnt: client.create_from_slice(bytes_of(&plan.blk_cnt)),
         blocks: plan.blk_slot.len(),
         planes: RowPlan::planes(),
+        rows_real: plan.rows_real(),
     };
     let h_off13 = client.create_from_slice(bytes_of(&off13));
     let h_off2 = client.create_from_slice(bytes_of(&off2));
@@ -1488,6 +2649,12 @@ fn expert_rows<B: Backend>(
 }
 
 fn main() -> Result<()> {
+    // FIRST, before anything can allocate. A refused device buffer panics a
+    // cubecl worker thread, and a worker-thread panic leaves this one running:
+    // the forward then read a buffer nothing had written, exited 0, and printed
+    // a layer-RMS ladder of 36.7..80.3 where the coherent one is 1.5..14.7.
+    fatal::arm();
+
     let pile_path = std::env::args().nth(1).map(PathBuf::from).context("usage: <pile> <ids> <out>")?;
     let ids_path = std::env::args().nth(2).map(PathBuf::from).context("usage: <pile> <ids> <out>")?;
     let out_path = std::env::args().nth(3).map(PathBuf::from).context("usage: <pile> <ids> <out>")?;
@@ -1581,12 +2748,99 @@ fn main() -> Result<()> {
     );
     anyhow::ensure!(!is_tail || lo > 0, "a tail that starts at layer 0 has nothing to receive");
 
-    let mut ids: Vec<usize> = std::fs::read(&ids_path)?
+    let corpus: Vec<usize> = std::fs::read(&ids_path)?
         .chunks_exact(8)
         .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as usize)
         .collect();
+    anyhow::ensure!(!corpus.is_empty(), "no tokens — the forward would be vacuous");
+
+    // ---- INK_SLOTS=b: b INDEPENDENT sequences, decoded together ------------
+    //
+    // Not `INK_WIDTH=b`, which is the cost probe this is the thing it priced:
+    // that one widens the pass with filler and commits row 0, so its rows are
+    // one sequence's and its cache is one cache. These rows are b sequences
+    // with b caches, and the only thing they share is the weight stream -- see
+    // [`dev_lane::SlotCache`], which is where the sharing actually pays.
+    //
+    // The b prompts are b DISJOINT chunks of one token file, `slot_len` apart:
+    // one corpus, b different pieces of real prose, and slot 0's piece does not
+    // move when b changes. That last property is what makes the arms
+    // comparable and what makes the contamination test possible, because
+    // `INK_SLOT_OFFSETS` can then put slot 0 beside seven different neighbours
+    // at the SAME b -- holding the GEMM lane fixed while the neighbours change,
+    // which is the only way to tell contamination from the m == 1 width effect
+    // that already makes b = 1 and b > 1 disagree.
+    let slot_lane = std::env::var("INK_SLOTS").is_ok();
+    let nslots: usize =
+        std::env::var("INK_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    anyhow::ensure!(nslots >= 1, "INK_SLOTS counts sequences and starts at 1");
+    // ---- INK_COHORTS=c: c cohorts of b slots, offset by half a round -------
+    //
+    // The layer split runs the two nodes strictly in sequence: the head's half
+    // of a token has to finish before the tail's can start, so each end is idle
+    // for about half of every pass and widening the batch does not change that
+    // -- it scales both halves. `INK_SLOTS` proved the slots are independent of
+    // each other; `INK_COHORTS` uses that a second time, at the granularity of
+    // the pipe rather than of the batch. Cohort B's layers 0:21 run on the head
+    // while cohort A's 21:42 run on the tail, so a round advances BOTH cohorts
+    // and costs `2 * max(H, T)` rather than `2 * (H + T)`.
+    //
+    // Nothing about the arithmetic changes. Two cohorts of b slots hold the
+    // same caches as one cohort of 2b and read the same weights; what changes
+    // is the send/receive ORDER, which is the whole of the interleave and is
+    // the `want` line below.
+    let ncohorts: usize =
+        std::env::var("INK_COHORTS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    anyhow::ensure!(ncohorts >= 1, "INK_COHORTS counts cohorts and starts at 1");
+    anyhow::ensure!(
+        ncohorts == 1 || slot_lane,
+        "INK_COHORTS interleaves cohorts of SLOTS -- set INK_SLOTS as well"
+    );
+    anyhow::ensure!(
+        ncohorts == 1 || pipe_spec.is_some(),
+        "INK_COHORTS fills the half of a PIPE that is blocked on its peer, and a run on one \
+         node has no such half"
+    );
+    // Every cohort is `nslots` sequences with their own caches, so this is how
+    // many prompts the corpus has to supply and how many caches the node holds.
+    let total_slots = nslots * ncohorts;
+    let slot_len: usize = std::env::var("INK_SLOT_LEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if slot_lane { corpus.len() / total_slots } else { corpus.len() });
+    anyhow::ensure!(slot_len > 0, "INK_SLOT_LEN is a prompt length and starts at 1");
+    let slot_at: Vec<usize> = match std::env::var("INK_SLOT_OFFSETS") {
+        Ok(v) => v
+            .split(',')
+            .map(|c| c.trim().parse::<usize>())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("INK_SLOT_OFFSETS is a comma-separated list of chunk indices")?,
+        Err(_) => (0..total_slots).collect(),
+    };
+    anyhow::ensure!(
+        slot_at.len() == total_slots,
+        "INK_SLOT_OFFSETS names {} chunks against INK_SLOTS={nslots} x INK_COHORTS={ncohorts}",
+        slot_at.len()
+    );
+    for &c in &slot_at {
+        anyhow::ensure!(
+            (c + 1) * slot_len <= corpus.len(),
+            "chunk {c} of {slot_len} tokens runs past a {}-token file",
+            corpus.len()
+        );
+    }
+    let mut slot_ids: Vec<Vec<usize>> =
+        slot_at.iter().map(|&c| corpus[c * slot_len..(c + 1) * slot_len].to_vec()).collect();
+    // `ids` is slot 0's stream. Every report that indexes a position -- the
+    // per-position top-5, the MTP scoring, the final dump -- reads it, and one
+    // sequence is what those were written about; the other slots keep their own
+    // streams and are reported as a batch.
+    let mut ids: Vec<usize> = slot_ids[0].clone();
     let n = ids.len();
-    anyhow::ensure!(n > 0, "no tokens — the forward would be vacuous");
+    // So a crash can name what caused it. Set again per pass below, because a
+    // pipe tail takes its length from the wire and a cached step feeds one
+    // token, and both are the number that would appear in a refused size.
+    fatal::note_tokens(n);
 
     let h = t.hidden_size;
     println!("=== forward ===");
@@ -1602,6 +2856,13 @@ fn main() -> Result<()> {
         pile_path.display(),
     );
     println!("  tokens     : {n}  {ids:?}");
+    if slot_lane {
+        println!(
+            "  slots      : INK_SLOTS={nslots} x INK_COHORTS={ncohorts} -- {total_slots} \
+             independent sequences of {slot_len} tokens, chunks {slot_at:?} of a {}-token file",
+            corpus.len()
+        );
+    }
     println!("  layers     : {}  hidden {h}  experts {}+{} shared",
              t.num_hidden_layers, t.n_routed_experts, t.n_shared_experts);
     println!(
@@ -1679,6 +2940,46 @@ fn main() -> Result<()> {
     // nothing else changes about which end holds what. The embedding NORM stays
     // head-only: it belongs to the main stack's input, and every MTP head norms
     // its own embeddings with its own `embed_norm`.
+    // What prefill will hold in `[heads, n, n]` score matrices, which is the
+    // largest thing this run allocates and the only term that grows as `n^2`.
+    // The admission gate charged a flat per-layer figure for "activations"
+    // regardless of sequence length, which is how it admitted a run that peaked
+    // at 119.5 GiB of a 119.6 GiB node.
+    let attn_heads = t.heads(AttnKind::Global).0.max(t.heads(AttnKind::Local).0);
+    let attn_head_dim = t.heads(AttnKind::Global).2.max(t.heads(AttnKind::Local).2);
+    let attention_bytes = budget::prefill_peak_bytes(attn_heads, n);
+    // What b slots hold in K and V once they are all prefilled. A global
+    // layer keeps the whole context, a local one keeps its window, and both
+    // keep K and V -- so this is the term that multiplies with the batch and
+    // the one an admission gate written for a single sequence does not have.
+    let slot_kv_bytes: u64 = if slot_lane {
+        (lo..hi)
+            .map(|layer| {
+                let kind = t.attn_kind(layer);
+                let (_, kv_heads, head_dim) = t.heads(kind);
+                let keep = match kind {
+                    AttnKind::Local => t.sliding_window_size.min(n + gen_steps),
+                    AttnKind::Global => n + gen_steps,
+                };
+                // Four bytes a value, or two where the cache is held narrow.
+                // The admission gate reads this, and a gate that priced a BF16
+                // cache at f32 would refuse ranges that fit -- which is the
+                // safe direction and still the wrong number.
+                let w = if dev_lane::attn_bf16() { 2 } else { 4 };
+                2 * total_slots as u64 * keep as u64 * (kv_heads * head_dim) as u64 * w
+            })
+            .sum()
+    } else {
+        0
+    };
+    if slot_lane {
+        println!(
+            "  slot KV            : {:.2} GiB for {total_slots} slots over layers {lo}..{hi}{}",
+            slot_kv_bytes as f64 / GIB,
+            if dev_lane::attn_bf16() { "  (BF16)" } else { "" }
+        );
+    }
+
     let want_embed = !is_tail || mtp_k > 0;
     let want_embed_norm = !is_tail;
     let want_head = !is_head;
@@ -1697,7 +2998,8 @@ fn main() -> Result<()> {
             globals.push("model.llm.unembed.weight");
         }
         let t0 = Instant::now();
-        let (experts, dense, bytes) = cp.copy_share(lo..hi, &globals)?;
+        let (experts, dense, bytes) =
+            cp.copy_share(lo..hi, &globals, attention_bytes + slot_kv_bytes)?;
         println!(
             "  startup weight copy: {experts} expert + {dense} dense views, {:.2} GiB anonymous in {:.1}s",
             bytes as f64 / GIB,
@@ -1815,6 +3117,49 @@ fn main() -> Result<()> {
     // inferring it would need the depths to be independent, and they are not,
     // because head d is fed draft d-1.
     let mut mtp_issued: BTreeMap<usize, Vec<Option<bool>>> = BTreeMap::new();
+    // `INK_MTP_PROB=1` scores THREE acceptance rules from one run, because
+    // "is the draft the argmax" is not the question a speculation loop asks.
+    //
+    //   A  exact argmax match. What greedy speculation keeps, and the strictest
+    //      rule available: a draft that was the target's second choice at
+    //      p = 0.30 is thrown away.
+    //   B  greedy draft, SAMPLED target. The draft is a point mass, so
+    //      min(1, p_t(x)/p_d(x)) is p_t(x): accept the drafted token with the
+    //      probability the target itself assigns it. Resampling from the
+    //      normalised residual on rejection preserves the target's distribution
+    //      EXACTLY (Leviathan et al. / Chen et al. 2023) -- this is not an
+    //      approximation, it is a different exact algorithm.
+    //   C  sampled draft, sampled target. Averaged over a draft sampled from
+    //      p_d, the acceptance probability is
+    //      sum_x p_d(x) min(1, p_t(x)/p_d(x)) = sum_x min(p_d(x), p_t(x)),
+    //      which is 1 - TV(p_d, p_t) and does not depend on which token was
+    //      drawn. The cleanest single number for "how close are these two
+    //      distributions, in the currency a speculation loop spends".
+    //
+    // A is a lower bound on B and C by construction (it is B at temperature
+    // zero), so a run where they coincide says the heads are weak and a run
+    // where they part says the RULE was the constraint.
+    let mtp_prob = std::env::var("INK_MTP_PROB").map(|val| val == "1").unwrap_or(false);
+    // The draft head's distribution, kept from the step that issued it until
+    // the step it names arrives with the target's. 800 KB a draft at f32 and
+    // at most k(k+1)/2 alive at once.
+    let mut mtp_pd: BTreeMap<(usize, usize), Vec<f32>> = BTreeMap::new();
+    let mut mtp_b_sum = vec![0f64; mtp_k];
+    let mut mtp_c_sum = vec![0f64; mtp_k];
+    let mut mtp_prob_n = vec![0usize; mtp_k];
+    // Per issuing step, the two acceptance PROBABILITIES per depth -- the
+    // stochastic twin of `mtp_issued`, and needed for the same reason: an
+    // accept-and-skip loop keeps a leading RUN, so the expected prefix is
+    // sum_j prod_{i<=j} q_i and not any function of the marginals alone.
+    let mut mtp_issued_q: BTreeMap<usize, Vec<Option<(f64, f64)>>> = BTreeMap::new();
+    // Per depth, every scored draft as (the DRAFT head's own top-1 probability,
+    // did it hit). The marginal acceptance rate is an average over drafts the
+    // head was sure of and drafts it was guessing at, and a loop does not have
+    // to speculate on the guesses: it can read its own confidence first and
+    // pay c(1) when it is low. Whether that is worth doing is a fact about the
+    // JOINT distribution of confidence and correctness, which no aggregate rate
+    // can answer, so the pairs are kept.
+    let mut mtp_conf: Vec<Vec<(f32, bool)>> = vec![Vec::new(); mtp_k];
     // The MTP entry hidden state for every position, retained. 16 KB a token
     // at f32, and the reason the cached lane can draft at all -- see the draft
     // block for why a row, once produced, never changes.
@@ -1824,6 +3169,22 @@ fn main() -> Result<()> {
     // stable rows stop at position seq-1-d.
     let mut mtp_stage: Vec<Vec<f32>> = vec![Vec::new(); mtp_k];
     let mut mtp_caches: Vec<Option<MtpCache>> = (0..mtp_k).map(|_| None).collect();
+    // The draft lane. ON by default, because the host one is not an
+    // implementation of drafting so much as a proof that drafting composes: at
+    // 1470 ms for four heads against a 131 ms two-node round trip it made
+    // speculation arithmetically impossible before the model was consulted.
+    // `INK_MTP_DEV=0` is the control, and `INK_MTP_CHECK=1` runs it as one.
+    let mtp_dev_on = std::env::var("INK_MTP_DEV").map(|val| val != "0").unwrap_or(true);
+    // Built on the first draft rather than at load, exactly as `layers_dev` is:
+    // a lane nobody takes should not pay for the upload.
+    let mut mtp_devs: Vec<MtpDev> = Vec::new();
+    // The device twins of `mtp_main` / `mtp_stage` / `mtp_caches`. The entry
+    // states are UPLOADED from the host `entry` rather than recomputed on the
+    // device, so a device/host draft comparison isolates the block and does not
+    // fold in a second rms_norm's rounding.
+    let mut mtp_main_dev: Option<T2> = None;
+    let mut mtp_stage_dev: Vec<Option<T2>> = (0..mtp_k).map(|_| None).collect();
+    let mut mtp_dev_caches: Vec<Option<MtpDevCache>> = (0..mtp_k).map(|_| None).collect();
 
     // Experts are read, applied and dropped. There is no decoded-expert cache:
     // it measured as no speedup, and it existed to paper over a capacity
@@ -1857,6 +3218,102 @@ fn main() -> Result<()> {
     let repeat = std::env::var("INK_REPEAT").map(|v| v == "1" || v == "on").unwrap_or(false);
     anyhow::ensure!(!repeat || !kv, "INK_REPEAT wants the uncached lane: with a KV cache a \
          repeated pass would append the same position to the cache again");
+    // ---- INK_SPEC=k: accept-and-skip ------------------------------------
+    //
+    // The loop the MTP measurement was for. `k` drafts ride back with every
+    // answer; the next pass feeds the confirmed token FOLLOWED BY those drafts,
+    // so a verify pass is `k + 1` rows wide and confirms between one and `k + 1`
+    // tokens. Both ends roll their caches back to the accepted prefix, which is
+    // why [`dev_lane::AttnCache::commit`] exists and why the drafts travel on
+    // the wire rather than being re-derived: only the tail can draft (it owns
+    // the final hidden state and the unembedding) and only the head can embed.
+    //
+    // Set it on BOTH processes and to the same value -- the protocol is
+    // symmetric and a mismatch shows up as a width assertion, not as bad text.
+    let spec_k: usize = std::env::var("INK_SPEC").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    anyhow::ensure!(
+        spec_k == 0 || kv,
+        "INK_SPEC={spec_k} wants INK_KV=1: speculation is about skipping sequential steps, and \
+         the uncached lane has no cache to roll back"
+    );
+    anyhow::ensure!(!repeat || spec_k == 0, "INK_REPEAT and INK_SPEC measure different things");
+    anyhow::ensure!(
+        spec_k == 0 || pipe_spec.is_some(),
+        "INK_SPEC needs the pipe: the drafts are made on the tail and fed by the head"
+    );
+    anyhow::ensure!(
+        !is_tail || spec_k == 0 || mtp_k == spec_k,
+        "INK_SPEC={spec_k} on the tail wants INK_MTP={spec_k}: the drafts it sends ARE the MTP \
+         heads' output, and mtp_k={mtp_k} would send a different number of them"
+    );
+    anyhow::ensure!(
+        !is_tail || spec_k == 0 || mtp_dev_on,
+        "INK_SPEC on the tail wants the device draft lane (INK_MTP_DEV unset or 1); the host \
+         lane drafts in 1.5 s and there is no loop that pays for that"
+    );
+    if spec_k > 0 {
+        println!("  speculation        : INK_SPEC={spec_k} -- verify pass is {} rows", spec_k + 1);
+    }
+
+    // ---- INK_WIDTH=b: what a b-row decode step COSTS ----------------------
+    //
+    // Not a feature: an instrument. Batched decode -- b independent sequences
+    // sharing one weight stream -- is the largest untaken lever on this model,
+    // and the question that decides whether it is worth building is whether a
+    // b-row cached step costs b times a one-row one or barely more than one.
+    // This prices exactly that without any of the machinery a real batch needs
+    // (b caches, b positions, a block-diagonal mask), because the COST of a
+    // b-row pass does not depend on whether the rows belong to one sequence or
+    // to b of them: the same projections, the same MoE gather over b routings,
+    // the same unembedding, the same weight stream.
+    //
+    // Row 0 carries the real token; rows 1..b carry filler drawn fresh every
+    // pass, so the router picks b independent expert sets rather than gathering
+    // the same eight slabs b times. Only row 0's argmax is taken and only row 0
+    // is committed, so the run produces one token per pass and the SAME text as
+    // INK_WIDTH=1 -- which is the check that the extra rows are not changing
+    // the answer, and it is a check the run makes on itself.
+    let width: usize = std::env::var("INK_WIDTH").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    anyhow::ensure!(width >= 1, "INK_WIDTH counts rows and starts at 1");
+    anyhow::ensure!(
+        width == 1 || kv,
+        "INK_WIDTH wants INK_KV=1: the uncached lane feeds the whole prefix and has no one-row \
+         step to widen"
+    );
+    anyhow::ensure!(width == 1 || spec_k == 0, "INK_WIDTH and INK_SPEC both widen the pass");
+    anyhow::ensure!(
+        width == 1 || mtp_k == 0,
+        "INK_WIDTH is a cost probe and drafting is not part of what it prices"
+    );
+    if width > 1 {
+        println!("  width probe        : INK_WIDTH={width} -- every cached step is {width} rows, \
+                  one of them real");
+    }
+    anyhow::ensure!(!slot_lane || kv, "INK_SLOTS wants INK_KV=1: a slot IS a cache");
+    anyhow::ensure!(
+        !slot_lane || width == 1,
+        "INK_WIDTH prices a b-row pass with filler; INK_SLOTS runs one with b sequences in it, \
+         and setting both would put filler rows in a batch that already has real ones"
+    );
+    anyhow::ensure!(!slot_lane || spec_k == 0, "INK_SLOTS and INK_SPEC both widen the pass");
+    anyhow::ensure!(
+        !slot_lane || mtp_k == 0,
+        "INK_SLOTS and INK_MTP: drafting follows one sequence and there are {nslots} here"
+    );
+    anyhow::ensure!(!slot_lane || !repeat, "INK_REPEAT and INK_SLOTS measure different things");
+    if slot_lane {
+        println!(
+            "  batched decode     : INK_SLOTS={nslots} -- {nslots} caches, one pass, {nslots} \
+             tokens a pass"
+        );
+        if ncohorts > 1 {
+            println!(
+                "  pipeline interleave: INK_COHORTS={ncohorts} -- {ncohorts} cohorts of \
+                 {nslots}, offset so this node computes one cohort while its peer computes \
+                 another. A round is {ncohorts} passes and advances every cohort by a token."
+            );
+        }
+    }
     // Head d's first STABLE row sits at position seq-1-d, so a prompt shorter
     // than the number of heads leaves a depth with no stable row at all: every
     // position of that head would be a function of drafts and the cache would
@@ -1925,6 +3382,29 @@ fn main() -> Result<()> {
         &BT::<Bk, 2>::zeros([1, 1], &dev),
     );
     println!("{}", mary::models::inkling::pile::mem_line("after CUDA context"));
+    println!("{}", mary::models::inkling::seam::pool_line(&fp4_client, "cold"));
+    // The one number that decides whether this sequence length is runnable at
+    // all, asked of the device rather than modelled. It is checked HERE and not
+    // beside the admission gate because this is the first client in the
+    // process, and taking `max_page_size` from a client Burn did not make would
+    // be reading a different device's answer. Nothing has run a layer yet.
+    let qblock = budget::query_block(attn_heads, n);
+    println!(
+        "  attention budget   : queries in blocks of {qblock}, so [{attn_heads}, {qblock}, {n}] \
+         f32 scores = {:.2} GiB per layer (the whole square would be {:.2} GiB) beside \
+         [{attn_heads}, {n}, {attn_head_dim}] f32 activations = {:.2} GiB; largest single \
+         allocation this device allows {:.2} GiB (up to {} tokens)",
+        budget::score_block_bytes(attn_heads, qblock, n) as f64 / GIB,
+        budget::score_matrix_bytes(attn_heads, n) as f64 / GIB,
+        budget::activation_bytes(attn_heads, attn_head_dim, n) as f64 / GIB,
+        budget::largest_allocation(&fp4_client) as f64 / GIB,
+        budget::longest_sequence(
+            attn_heads,
+            attn_head_dim,
+            budget::largest_allocation(&fp4_client)
+        ),
+    );
+    budget::check(&fp4_client, attn_heads, attn_head_dim, n)?;
     // Nine blocking device round trips for the whole run, instead of four per
     // expert. Every later slab is an offset view of one of these.
     //
@@ -2067,8 +3547,37 @@ fn main() -> Result<()> {
         /// convolution that reads it runs on the device, and a history that
         /// lived on the host would drag the whole MLP half back across.
         mlp_sconv: Option<BT<Bk, 2>>,
+        /// What a speculative batch convolved, kept until the verifier says how
+        /// many of its rows survived. `kernel - 1` history rows followed by the
+        /// batch's own inputs, so the history after keeping `keep` of them is
+        /// the window starting at `keep` -- the same shape, and the same
+        /// argument, as [`dev_lane::AttnCache`]'s pending K/V projections.
+        attn_sconv_pending: Option<BT<Bk, 2>>,
+        mlp_sconv_pending: Option<BT<Bk, 2>>,
     }
     let mut caches: Vec<LayerCache> = Vec::new();
+
+    // The same, for b slots. Every field is its single-sequence twin with a
+    // leading slot dimension, and the reason there is a second struct rather
+    // than a generalised one is that they are not two settings of a thing:
+    // `LayerCache` can be rolled back to an accepted prefix (that is what the
+    // `_pending` fields are for) and a slot batch has nothing to roll back,
+    // because every row of it is a token the model chose for its own sequence.
+    struct SlotLayerCache {
+        attn: dev_lane::SlotCache<Bk>,
+        /// `[slots, kernel - 1, hidden]`.
+        attn_sconv: BT<Bk, 3>,
+        mlp_sconv: Option<BT<Bk, 3>>,
+    }
+    // The slot batch, built one slot at a time as the b prefills land. A
+    // prefill is compute-bound and gains nothing from a batch, so the b of them
+    // run one at a time; each one is SEATED the moment it finishes rather than
+    // kept until all b are in. See `SlotCache::seeded` for what keeping them
+    // cost.
+    // One batch per COHORT. `slots_dev[c][l]` is cohort `c`'s layer-`l` state,
+    // and the two indices are never mixed: a pass names its cohort once, at the
+    // top, and every cache access below goes through that name.
+    let mut slots_dev: Vec<Vec<SlotLayerCache>> = (0..ncohorts).map(|_| Vec::new()).collect();
 
     // The wire, opened AFTER the weights so a connection is never left hanging
     // while the other end spends a minute building its index. The tail binds and
@@ -2113,12 +3622,68 @@ fn main() -> Result<()> {
     let mut bias_dev: std::collections::HashMap<usize, cubecl::server::Handle> =
         std::collections::HashMap::new();
 
+    // ---- what the pipe costs, and what it wastes --------------------------
+    //
+    // A two-node split has one node blocked on the other for most of every
+    // token, and that idle half is the whole argument for speculation: it is
+    // already paid-for hardware doing nothing, so a draft that gets rejected
+    // costs work the machine was not going to do anyway. None of it was
+    // measured, because the head charges the ENTIRE round trip -- wire out,
+    // the tail's whole half of the stack, wire back -- to the one slot the
+    // unembed occupies on a whole-stack run. That slot cannot separate wire
+    // from peer compute, so both are timed here instead, on both ends, and the
+    // wire falls out as the difference between the head's wait and the tail's
+    // own pass.
+    let mut acc_send = 0f64;
+    let mut acc_wait_peer = 0f64;
+    // What the tail drafted last pass. On the head these are the rows it will
+    // FEED; on the tail they are what its next verify pass will be judged
+    // against. Same list, one machine apart.
+    let mut drafts_in: Vec<usize> = Vec::new();
+    // The cohorts this head has sent and not yet read an answer for, oldest
+    // first. A single-cohort head empties it on the same pass it fills it and
+    // the queue is a formality; an interleaved head keeps `ncohorts - 1` in it,
+    // and THAT is the pipeline -- the tail is working on those while this pass
+    // runs. A tail never uses it: it answers the pass it is on.
+    let mut in_flight: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    let mut last_drafts: Vec<usize> = Vec::new();
+    // Tokens, not passes: a speculative pass confirms between 1 and k+1 of
+    // them, so this is what the run's length and its tok/s are counted in.
+    let mut gen_tokens = 0usize;
+    let mut spec_hist = vec![0usize; spec_k + 2];
+    let mut pass_ms: Vec<f64> = Vec::new();
+    let mut acc_recv = 0f64;
+    let mut acc_pass = 0f64;
+    let mut acc_draft = 0f64;
+    // The tail's pass up to the MOMENT IT ANSWERS, which is the only part of it
+    // the head is waiting for. Its printed pass includes the report and the
+    // drafting that follow the reply, so subtracting THAT from the head's
+    // blocked time prices the wire as negative. This is the number that makes
+    // the subtraction honest.
+    let mut acc_to_reply = 0f64;
+    let mut acc_steps = 0usize;
+    // The same wall, over the WARM steps only. The first two decode steps of a
+    // pipe run cost 4.54 s and 0.55 s of kernel compilation, and averaging them
+    // into a hundred 127 ms ones reports 135 ms/step -- an 6% error that lands
+    // squarely on the number people quote. Two is not fitted: it is how many
+    // steps print a pass an order of magnitude off the median.
+    let mut warm_wall = 0f64;
+    let mut warm_steps = 0usize;
+    let mut warm_tokens = 0usize;
+    let loop_started = Instant::now();
     let mut top_all: Vec<i64> = Vec::new();
-    for step in 0..=gen_steps {
+    // A `for step in 0..=gen_steps` used to bound this, and it cannot any more:
+    // a speculative pass confirms a variable number of tokens, so counting
+    // passes would make the run's LENGTH a function of how well the drafts did.
+    // The break at the bottom counts tokens and reproduces the old count
+    // exactly when nothing is speculated.
+    let mut step = 0usize;
+    loop {
     // A tail's step BEGINS on the wire, and it waits before its own timers
     // start: a tail that charged itself for the head's half would report the
     // pipeline's latency as its own cost, and the per-machine split is the
     // entire question here.
+    let t_rv = Instant::now();
     let incoming = match pipe.as_mut() {
         Some(Pipe::Tail(s)) => match recv_stream(s, h)? {
             Some(v) => Some(v),
@@ -2127,6 +3692,33 @@ fn main() -> Result<()> {
         },
         _ => None,
     };
+    // Charged whether or not this process is a tail: on anything else it is
+    // zero, and a zero that is measured beats a branch that hides it.
+    let t_recv = t_rv.elapsed().as_secs_f64();
+
+    // A prefill per slot, then one decode pass per token per slot. With no
+    // slot lane `prefill_passes` is 1 and `is_decode` is the `step > 0` this
+    // replaces, character for character.
+    let prefill_passes = if slot_lane { total_slots } else { 1 };
+    let is_decode = step >= prefill_passes;
+    // Which cohort this pass advances. Over the prefills it is the cohort the
+    // slot being seated belongs to -- they are filled cohort by cohort -- and
+    // over the decode the cohorts take turns, which IS the interleave. Both
+    // ends derive it from the same step counter, and the head puts it on the
+    // wire as well so a pair that ever disagreed says so.
+    let coh = if !slot_lane {
+        0
+    } else if is_decode {
+        (step - prefill_passes) % ncohorts
+    } else {
+        step / nslots
+    };
+    if let Some((_, _, wc, _)) = incoming.as_ref() {
+        anyhow::ensure!(
+            *wc == coh,
+            "the head sent cohort {wc} where this tail was about to read cohort {coh}'s keys"
+        );
+    }
 
     let pass = Instant::now();
     let io0 = io_read_bytes();
@@ -2143,8 +3735,41 @@ fn main() -> Result<()> {
     // `pos0` is that token's ABSOLUTE position, which is what log scaling and
     // the relative bias are functions of -- it is only equal to zero on a pass
     // that starts from the beginning.
-    let (feed, pos0): (Vec<usize>, usize) = if kv && step > 0 {
-        (vec![*ids.last().expect("a step past the prefill has produced a token")], ids.len() - 1)
+    let (feed, pos0): (Vec<usize>, usize) = if slot_lane && is_decode {
+        // One row per slot: the token that slot's own previous pass produced.
+        // Every slot stands at the same absolute position because they were
+        // prefilled with prompts of the same length and have advanced together
+        // ever since -- see [`dev_lane::SlotCache`] for what that buys.
+        // This cohort's slots and no other's. Every slot of a cohort stands at
+        // the same absolute position; two cohorts do NOT, because they take
+        // turns, so `pos0` is read off this cohort's own slot 0.
+        let base = coh * nslots;
+        (
+            slot_ids[base..base + nslots]
+                .iter()
+                .map(|q| *q.last().expect("every slot's prefill produced a token"))
+                .collect(),
+            slot_ids[base].len() - 1,
+        )
+    } else if slot_lane {
+        (slot_ids[step].clone(), 0)
+    } else if kv && step > 0 {
+        // The verify batch: the token the last pass confirmed, then the tail's
+        // drafts for the positions after it. `drafts_in` is empty unless this
+        // is a speculating head, so the non-speculative shape is the same one
+        // row it always was.
+        let mut f = vec![*ids.last().expect("a step past the prefill has produced a token")];
+        f.extend(drafts_in.iter().copied());
+        // The width probe's filler. Drawn from a counter rather than from the
+        // sequence: a batch of the same token routes to the same eight experts
+        // and would price the expert stream once for the whole batch, which is
+        // the one thing the probe exists to find out.
+        let mut lcg = 0x9E3779B97F4A7C15u64 ^ (step as u64).wrapping_mul(0x100000001B3);
+        for _ in 1..width {
+            lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            f.push(((lcg >> 33) as usize) % t.vocab_size);
+        }
+        (f, ids.len() - 1)
     } else {
         (ids.clone(), 0)
     };
@@ -2153,7 +3778,7 @@ fn main() -> Result<()> {
     // facts about the pass and only the head owns the token loop.
     let t_emb = Instant::now();
     let (n, pos0, x_in) = match incoming {
-        Some((n, p, x)) => (n, p, x),
+        Some((n, p, _c, x)) => (n, p, x),
         None => {
             let n = feed.len();
             let e_w = embed_w.as_ref().expect("the head owns the embedding table");
@@ -2161,6 +3786,7 @@ fn main() -> Result<()> {
             (n, pos0, embed_and_norm_bf16(&feed, e_w, &e_n.data, t.rms_norm_eps, t.vocab_size, h))
         }
     };
+    fatal::note_tokens(n);
 
     let dump_dir = std::env::var("INK_DUMP_DIR").ok();
     if let Some(dir) = dump_dir.as_ref() {
@@ -2185,8 +3811,6 @@ fn main() -> Result<()> {
         n_floor: t.log_scaling_n_floor as f32,
         alpha: t.log_scaling_alpha as f32,
     };
-    let mask_local = causal_mask(n, Some(t.sliding_window_size));
-    let mask_global = causal_mask(n, None);
     #[allow(unused_assignments)]
     let mut expert_loads = 0usize;
     let (mut t_attn, mut t_expert, mut t_other, mut t_shared) = (0f64, 0f64, 0f64, 0f64);
@@ -2243,16 +3867,6 @@ fn main() -> Result<()> {
     // enqueueing.
     let mut layer_rms: Vec<T2> = Vec::with_capacity(hi - lo);
     let mut layer_kind: Vec<(usize, bool)> = Vec::with_capacity(hi - lo);
-    // Uploaded once per pass rather than once per layer: the mask is a function
-    // of `n` and the layer's kind, and there are two kinds.
-    let (mask_l_dev, mask_g_dev) = if kv && step > 0 {
-        (None, None)
-    } else {
-        (
-            Some(up2::<Bk>(mask_local.clone(), n, n, &dev)),
-            Some(up2::<Bk>(mask_global.clone(), n, n, &dev)),
-        )
-    };
 
     // One sync, charged to one stage. Written as a macro rather than a closure
     // because every call site names a different accumulator and a closure would
@@ -2429,11 +4043,34 @@ fn main() -> Result<()> {
         // how far back a query may look, and therefore how much of the cache
         // can never be read again.
         let window = if is_local { Some(t.sliding_window_size) } else { None };
-        let mask = || {
-            let m = if is_local { &mask_l_dev } else { &mask_g_dev };
-            m.clone().expect("a pass that needs a mask uploaded one")
-        };
-        let a = if kv && step > 0 {
+        let a = if slot_lane && is_decode {
+            // b sequences, one position each, one pass. `attention_steps` is
+            // the wrong function here and not by a little: its rows are
+            // consecutive positions of ONE sequence and its mask admits every
+            // earlier row of the batch, which for independent slots is exactly
+            // the contamination this lane exists to make impossible.
+            let y = dev_lane::attention_slots(
+                hn, &ld.attn, &dims, Some(ls), pos0, window, &mut slots_dev[coh][slot].attn,
+            );
+            let (out, hist) = dev_lane::short_conv_slot_step(
+                slots_dev[coh][slot].attn_sconv.clone(), y, ld.attn_sconv.clone(),
+            );
+            slots_dev[coh][slot].attn_sconv = hist;
+            out
+        } else if kv && is_decode && n > 1 {
+            // The speculative width. `attention_steps` leaves the batch PENDING
+            // and the convolution keeps its whole window, so neither is final
+            // until the verifier below says how many rows survived. Nothing
+            // here knows that yet -- the answer is a machine away.
+            let y = dev_lane::attention_steps(
+                hn, &ld.attn, &dims, Some(ls), pos0, window, &mut caches[slot].attn,
+            );
+            let (out, all) = dev_lane::short_conv_steps(
+                caches[slot].attn_sconv.clone(), y, ld.attn_sconv.clone(),
+            );
+            caches[slot].attn_sconv_pending = Some(all);
+            out
+        } else if kv && is_decode {
             let y = dev_lane::attention_step(
                 hn, &ld.attn, &dims, Some(ls), pos0, window, &mut caches[slot].attn,
             );
@@ -2443,14 +4080,20 @@ fn main() -> Result<()> {
             out
         } else if kv {
             let (y, attn) = dev_lane::attention_prefill(
-                hn, &ld.attn, &dims, Some(ls), mask(), window,
+                hn, &ld.attn, &dims, Some(ls), window, window,
             );
             let hist = dev_lane::conv_history(y.clone(), t.sconv_kernel_size);
             let out = dev_lane::short_conv(y, ld.attn_sconv.clone());
-            caches.push(LayerCache { attn, attn_sconv: hist, mlp_sconv: None });
+            caches.push(LayerCache {
+                attn,
+                attn_sconv: hist,
+                mlp_sconv: None,
+                attn_sconv_pending: None,
+                mlp_sconv_pending: None,
+            });
             out
         } else {
-            let y = dev_lane::attention(hn, &ld.attn, &dims, Some(ls), mask());
+            let y = dev_lane::attention(hn, &ld.attn, &dims, Some(ls), window);
             dev_lane::short_conv(y, ld.attn_sconv.clone())
         };
         xd = xd + a;
@@ -2714,15 +4357,29 @@ fn main() -> Result<()> {
         // The MLP half's own short convolution carries state across generated
         // tokens exactly as attention's do.
         let t_sc = Instant::now();
-        let y = if kv {
-            if step > 0 {
+        let y = if slot_lane && is_decode {
+            let hist = slots_dev[coh][slot]
+                .mlp_sconv
+                .clone()
+                .expect("a slot batch carries its own convolution memory");
+            let (out, next) = dev_lane::short_conv_slot_step(hist, y, ld.mlp_sconv.clone());
+            slots_dev[coh][slot].mlp_sconv = Some(next);
+            out
+        } else if kv {
+            if is_decode {
                 let hist = caches[slot]
                     .mlp_sconv
                     .clone()
                     .expect("a step past the prefill has a history");
-                let (out, next) = dev_lane::short_conv_step(hist, y, ld.mlp_sconv.clone());
-                caches[slot].mlp_sconv = Some(next);
-                out
+                if n > 1 {
+                    let (out, all) = dev_lane::short_conv_steps(hist, y, ld.mlp_sconv.clone());
+                    caches[slot].mlp_sconv_pending = Some(all);
+                    out
+                } else {
+                    let (out, next) = dev_lane::short_conv_step(hist, y, ld.mlp_sconv.clone());
+                    caches[slot].mlp_sconv = Some(next);
+                    out
+                }
             } else {
                 caches[slot].mlp_sconv =
                     Some(dev_lane::conv_history(y.clone(), t.sconv_kernel_size));
@@ -2752,6 +4409,61 @@ fn main() -> Result<()> {
         // sqrt(mean(x^2)) over the whole [n, h] stream. Read after the stack.
         layer_rms.push(xd.clone().powf_scalar(2.0).mean().reshape([1, 1]));
         layer_kind.push((layer, is_local));
+    }
+
+    // This slot is prefilled; seat it in the batch and let go of it. The next
+    // slot starts from an empty `caches`.
+    //
+    // Seated HERE and not once all b are in, which is what this used to do, and
+    // the difference is the largest memory event in the lane. A prefilled
+    // `AttnCache` costs far more than the keys it holds -- 3.59 GiB against
+    // 0.16 GiB on the 21-layer head at a 3732-token prompt -- and the batch
+    // assembly is what collapsed it. Keeping b of them meant the sixth prefill
+    // ran a 25.8 GiB headroom out of memory. See `dev_lane::SlotCache::seeded`.
+    //
+    // The pool is handed back afterwards, which is not tidiness either: a
+    // prefill's peak is a [heads, query_block, tokens] score matrix, 1.68 GiB
+    // at a 3.7k context, and cubecl keeps the page it was served from because
+    // keeping it is the right policy inside a loop. With nothing of this slot
+    // left alive there is a whole page to hand back, which is exactly what
+    // `memory_cleanup` could not do while the b caches were pinning it.
+    if slot_lane && !is_decode {
+        // Which row of THIS cohort's batch is being seated. Cohort `coh` was
+        // prefilled by steps `coh * nslots .. (coh + 1) * nslots`, so row zero
+        // is the one that seeds the batch and the rest seat into it.
+        let row = step % nslots;
+        for (l, c) in caches.drain(..).enumerate() {
+            let kind = t.attn_kind(lo + l);
+            let (_, kv_heads, head_dim) = t.heads(kind);
+            let asc = c.attn_sconv.reshape([1, t.sconv_kernel_size - 1, h]);
+            let msc = c
+                .mlp_sconv
+                .expect("a prefill seeds the MLP convolution")
+                .reshape([1, t.sconv_kernel_size - 1, h]);
+            if row == 0 {
+                slots_dev[coh].push(SlotLayerCache {
+                    attn: dev_lane::SlotCache::seeded(nslots, c.attn, kv_heads, head_dim),
+                    attn_sconv: dev_lane::seat_first3(nslots, asc),
+                    mlp_sconv: Some(dev_lane::seat_first3(nslots, msc)),
+                });
+            } else {
+                slots_dev[coh][l].attn.seat(row, c.attn);
+                dev_lane::seat_row3(&mut slots_dev[coh][l].attn_sconv, row, asc);
+                let mut m = slots_dev[coh][l].mlp_sconv.take().expect("seeded by slot 0");
+                dev_lane::seat_row3(&mut m, row, msc);
+                slots_dev[coh][l].mlp_sconv = Some(m);
+            }
+        }
+        assert_eq!(slots_dev[coh].len(), hi - lo, "the slot batch is missing layers");
+        <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync after a slot prefill");
+        fp4_client.memory_cleanup();
+        println!(
+            "{}",
+            mary::models::inkling::seam::pool_line(
+                &fp4_client,
+                &format!("prefill {}/{total_slots}", step + 1)
+            )
+        );
     }
 
     // ---- the one sync for this node's whole stack --------------------------
@@ -2791,7 +4503,14 @@ fn main() -> Result<()> {
     // scalar host arithmetic), and a debug dump. A whole-stack or tail process
     // that is not drafting never materialises it -- the head reads `xd`.
     let want_host_x = is_head || mtp_k > 0 || dump_dir.is_some();
+    // Timed, and it is the head's alone: a tail never materialises the stream.
+    // That asymmetry is why it was the first suspect when the head's report
+    // summed to two thirds of its pass at 48 slots and the tail's summed to
+    // 95% -- and it reads 0.3 ms, so it is a suspect that has been RULED OUT
+    // rather than the untimed thing anything could be blamed on.
+    let t_dn = Instant::now();
     let x: Vec<f32> = if want_host_x { down(xd.clone()) } else { Vec::new() };
+    let t_x_down = t_dn.elapsed().as_secs_f64();
 
     // Does anything downstream need a logit row that is NOT the last one?
     //
@@ -2817,12 +4536,68 @@ fn main() -> Result<()> {
     // Which position `logits[0]` is. The head computes `logit_row0..n`, so this
     // is 0 when everything was asked for and `n - 1` when only the argmax's row
     // was. A head computes nothing and the value is unread there.
-    let logit_row0 = if all_logits { 0 } else { n - 1 };
+    // How many of this pass's rows the verifier has to read an argmax off. One,
+    // normally -- a forward produces one token. A speculative pass produces one
+    // PER ROW, and every one of them is needed: the accepted prefix is the
+    // leading run where the draft and the argmax agree, so a rule that only
+    // looked at the last row could not find where the agreement stopped.
+    let verify_rows = if spec_k > 0 && kv && step > 0 { n } else { 1 };
+    // The width probe's rows, derived from the batch the head actually sent
+    // rather than from this process's environment -- so INK_WIDTH is set on the
+    // head alone and the two ends cannot disagree about it.
+    //
+    // Every row is unembedded, and that is deliberate: b independent sequences
+    // each need their own logits, so a probe that unembedded one row would
+    // leave the widest matmul in the stack out of the price.
+    let probe_rows = if spec_k == 0 && kv && is_decode && n > 1 && !slot_lane { n } else { 1 };
+    // The rows a slot batch reads an argmax off: all of them, because each one
+    // is a different sequence and each one's next token is a fact about it.
+    // This is the widest matmul in the stack run at its real width, which is
+    // the half of batched decode the width probe was already honest about.
+    let slot_rows = if slot_lane && is_decode { n } else { 1 };
+    let logit_row0 =
+        if all_logits || probe_rows > 1 || slot_rows > 1 { 0 } else { n - verify_rows };
+    let (mut t_send, mut t_wait_peer) = (0f64, 0f64);
+    let mut wire_toks: Vec<usize> = Vec::new();
+    // Which cohort the answer read on THIS pass belongs to. The pass's own
+    // cohort everywhere except an interleaved head, where it is the cohort sent
+    // a pass earlier -- so the tokens land in that cohort's streams and not in
+    // the one this pass just computed.
+    let mut answer_coh = coh;
+    // False on exactly the passes an interleaved head starts a cohort it has
+    // not yet heard back about: the first `ncohorts - 1` decode passes. Nothing
+    // was confirmed, so nothing is committed.
+    let mut answered = true;
     let logits = if let Some(Pipe::Head(s)) = pipe.as_mut() {
-        send_stream(s, n, pos0, &x)?;
-        let mut back = [0u8; 8];
-        s.read_exact(&mut back).context("the tail closed mid-step")?;
-        best_wire = Some(i64::from_le_bytes(back) as usize);
+        let t_s = Instant::now();
+        send_stream(s, n, pos0, coh, &x)?;
+        t_send = t_s.elapsed().as_secs_f64();
+        in_flight.push_back(coh);
+        // THE interleave, and it is this line. `want` is how many answers the
+        // head is content to leave outstanding once this pass is over: zero
+        // with one cohort, which is the strict send-then-block loop this file
+        // has always run, and `ncohorts - 1` while decoding with more, which
+        // leaves the tail exactly one round of work to do while the head starts
+        // the next cohort. The prefills stay strict whatever `ncohorts` is --
+        // a prefill's answer seeds the slot it just filled, and there is
+        // nothing to overlap it with.
+        let want = if is_decode { ncohorts - 1 } else { 0 };
+        let t_w = Instant::now();
+        if in_flight.len() > want {
+            // The tail's FIRST message: the tokens its verify pass confirmed.
+            // Never empty -- the row fed the last confirmed token always
+            // produces one -- and longer than one exactly when drafts were
+            // accepted. The drafts for the NEXT pass are a second message, read
+            // further down, so this process gets to commit its caches in
+            // between.
+            answer_coh = in_flight.pop_front().expect("just pushed one");
+            wire_toks = recv_toks(s)?;
+            anyhow::ensure!(!wire_toks.is_empty(), "the tail confirmed no token at all");
+            best_wire = Some(*wire_toks.last().expect("checked non-empty"));
+        } else {
+            answered = false;
+        }
+        t_wait_peer = t_w.elapsed().as_secs_f64();
         Vec::new()
     } else {
         // 109 x 4096 x 200058 is 89 G multiply-adds — the single largest
@@ -2857,22 +4632,148 @@ fn main() -> Result<()> {
     // the wire instead of computing it, and either way it is decided HERE --
     // before the reporting -- so a tail can answer its peer immediately rather
     // than making the head wait on a page of printing.
-    let best = match best_wire {
-        Some(b) => b,
-        None => {
-            let last = &logits[(n - 1 - logit_row0) * v..(n - logit_row0) * v];
-            let mut best = 0usize;
-            for (i, &val) in last.iter().enumerate() {
-                if val > last[best] {
-                    best = i;
+    // How many DRAFTS this pass kept, and the tokens it confirmed. Acceptance
+    // is exact argmax match and deliberately not a stochastic rule: measured on
+    // this model the exact rule accepts MORE (49.5% against 45.6% sampled and
+    // 40.6% under 1-TV), because when the draft is the argmax the target agrees
+    // strongly and when it is not the target puts little mass there either.
+    let new_toks: Vec<usize>;
+    let best = if !answered {
+        // An interleaved head, on the pass that opened a cohort. The answer is
+        // still on the tail; it is read one pass later and committed there.
+        new_toks = Vec::new();
+        0
+    } else if let Some(b) = best_wire {
+        new_toks = wire_toks.clone();
+        b
+    } else {
+        let mut accepted = 0usize;
+        let rows = n - logit_row0;
+        let argmax_of = |i: usize| -> usize {
+            let row = &logits[i * v..(i + 1) * v];
+            let mut b = 0usize;
+            for (j, &val) in row.iter().enumerate() {
+                if val > row[b] {
+                    b = j;
                 }
             }
-            best
+            b
+        };
+        if verify_rows > 1 {
+            debug_assert_eq!(logit_row0, 0, "a verify pass reads from row 0");
+            anyhow::ensure!(
+                n == 1 + last_drafts.len(),
+                "the head fed {n} rows against {} drafts -- the two ends disagree on the \
+                 speculation width",
+                last_drafts.len()
+            );
+            let preds: Vec<usize> = (0..rows).map(argmax_of).collect();
+            // Row i was fed the token at pos0+i and predicts pos0+i+1. Row 0
+            // was fed a CONFIRMED token, so its prediction is always kept;
+            // row i>0 was fed draft i-1, so its prediction is only a fact
+            // about the sequence if every draft before it was right.
+            while accepted < last_drafts.len() && last_drafts[accepted] == preds[accepted] {
+                accepted += 1;
+            }
+            new_toks = preds[..=accepted].to_vec();
+        } else if slot_rows > 1 {
+            // One argmax per SLOT. Nothing is accepted or rejected here --
+            // a slot batch has no drafts, every row was fed a token its own
+            // sequence confirmed, and every row's prediction is kept.
+            new_toks = (0..rows).map(argmax_of).collect();
+        } else if probe_rows > 1 {
+            // Row 0 is the sequence; rows 1.. are the probe's filler and
+            // their argmaxes are about nothing. Reading row 0 and not the
+            // last row is what keeps the text identical to INK_WIDTH=1.
+            new_toks = vec![argmax_of(0)];
+        } else {
+            new_toks = vec![argmax_of(rows - 1)];
         }
+        *new_toks.last().expect("at least one row is always confirmed")
     };
+    // `ids`, the MTP scoring and the per-position report were all written about
+    // ONE sequence, and slot 0 is the one they follow. `best` is therefore slot
+    // 0's token and not the last row's, which is what it means everywhere else.
+    let best = if slot_lane && is_decode && answered { new_toks[0] } else { best };
+    let mut t_to_reply = 0f64;
     if let Some(Pipe::Tail(s)) = pipe.as_mut() {
-        s.write_all(&(best as i64).to_le_bytes())?;
-        s.flush()?;
+        send_toks(s, &new_toks)?;
+        t_to_reply = pass.elapsed().as_secs_f64();
+    }
+    // Everything but the LAST confirmed token goes into `ids` now; the last one
+    // is `best` and is pushed where it has always been pushed, so the MTP block
+    // below sees exactly the sequence-and-a-held-back-argmax it was written
+    // against.
+    if is_tail && gen_steps > 0 && !repeat && new_toks.len() > 1 && !slot_lane {
+        ids.extend_from_slice(&new_toks[..new_toks.len() - 1]);
+    }
+    // Each slot's own stream. A prefill pass produced the first generated token
+    // of the slot it prefilled; a decode pass produces one for every slot. Both
+    // ends run this -- the head off the wire, the tail off its own argmax --
+    // for the same reason `ids` is recomputed rather than sent.
+    if slot_lane && gen_steps > 0 && !repeat {
+        if is_decode {
+            if answered {
+                let base = answer_coh * nslots;
+                for (q, tok) in slot_ids[base..base + nslots].iter_mut().zip(new_toks.iter()) {
+                    q.push(*tok);
+                }
+            }
+        } else {
+            slot_ids[step].push(best);
+        }
+    }
+    // ---- both ends roll back to the accepted prefix ------------------------
+    //
+    // `keep` is 1 + accepted: row 0 fed a confirmed token and rows 1..=accepted
+    // fed drafts the verifier kept, so their K, V and convolution memory are
+    // facts about the sequence the model actually chose. The rows past them
+    // were computed from tokens it did not choose, and leaving them behind does
+    // not error -- it shows up later as an acceptance rate that drifts down.
+    if verify_rows > 1 || probe_rows > 1 {
+        // One row for the probe -- its filler rows are not facts about any
+        // sequence and their K, V and convolution memory go away with them.
+        let keep = if verify_rows > 1 { new_toks.len() } else { 1 };
+        let hist = t.sconv_kernel_size - 1;
+        for (slot, c) in caches.iter_mut().enumerate() {
+            let window = if t.attn_kind(lo + slot) == AttnKind::Local {
+                Some(t.sliding_window_size)
+            } else {
+                None
+            };
+            c.attn.commit(keep, window);
+            if let Some(all) = c.attn_sconv_pending.take() {
+                c.attn_sconv = dev_lane::conv_history(
+                    all.slice([0..hist + keep, 0..h]),
+                    t.sconv_kernel_size,
+                );
+            }
+            if let Some(all) = c.mlp_sconv_pending.take() {
+                c.mlp_sconv = Some(dev_lane::conv_history(
+                    all.slice([0..hist + keep, 0..h]),
+                    t.sconv_kernel_size,
+                ));
+            }
+        }
+    }
+    // The tail's SECOND message, and the head's second wait: the drafts to feed
+    // next pass. Read after the commit on purpose -- that is device work this
+    // process can enqueue while the other machine is still drafting.
+    if let Some(Pipe::Head(s)) = pipe.as_mut() {
+        if spec_k > 0 {
+            let t_w = Instant::now();
+            drafts_in = recv_toks(s)?;
+            t_wait_peer += t_w.elapsed().as_secs_f64();
+            anyhow::ensure!(
+                drafts_in.len() == spec_k,
+                "the tail sent {} drafts against INK_SPEC={spec_k}",
+                drafts_in.len()
+            );
+        }
+    }
+    if is_decode && !slot_lane {
+        let bucket = new_toks.len().min(spec_hist.len() - 1);
+        spec_hist[bucket] += 1;
     }
 
     // ---- MTP: score the drafts that named this step, then draft afresh -----
@@ -2880,11 +4781,47 @@ fn main() -> Result<()> {
         // SCORE FIRST, against `best` -- the token the full stack just produced.
         // This is the whole experiment: a draft is right or it is not, and the
         // rate over many steps is the only oracle the composition has.
+        // The target's OWN distribution at this position, once per pass rather
+        // than once per pending draft. `logits` holds the argmax's row and only
+        // that row unless a reporter asked for more, which is exactly the row
+        // every rule below reads.
+        let p_t: Vec<f32> = if mtp_prob && !logits.is_empty() {
+            softmax_row(&logits[(n - 1 - logit_row0) * v..(n - logit_row0) * v])
+        } else {
+            Vec::new()
+        };
         mtp_pending.retain(|&(target, depth, tok)| {
-            if target != step {
+            // Off when the loop is speculating: `step` no longer names one
+            // token, so a draft issued at step s cannot be matched to "the
+            // token step s+d+1 produced". The accept-and-skip loop verifies its
+            // own drafts against the rows they were fed into and reports the
+            // prefix histogram instead, which is the same measurement taken
+            // where it is now decidable.
+            if spec_k > 0 || target != step {
                 return true;
             }
             mtp_seen[depth] += 1;
+            if mtp_prob {
+                if let Some(pd) = mtp_pd.remove(&(target, depth)) {
+                    // B: the target's own probability on the token that was
+                    // drafted. C: the overlap of the two distributions.
+                    let b = p_t.get(tok).copied().unwrap_or(0.0) as f64;
+                    let c: f64 = pd
+                        .iter()
+                        .zip(p_t.iter())
+                        .map(|(a, t)| a.min(*t) as f64)
+                        .sum();
+                    mtp_b_sum[depth] += b;
+                    mtp_c_sum[depth] += c;
+                    mtp_prob_n[depth] += 1;
+                    // `tok` IS the draft's argmax, so this is the head's own
+                    // top-1 mass -- its confidence, not the target's.
+                    mtp_conf[depth].push((pd.get(tok).copied().unwrap_or(0.0), tok == best));
+                    if let Some(slots) = mtp_issued_q.get_mut(&(target - depth - 1)) {
+                        slots[depth] = Some((b, c));
+                    }
+                }
+            }
             if tok == best {
                 mtp_hits[depth] += 1;
             }
@@ -2926,6 +4863,16 @@ fn main() -> Result<()> {
         } else {
             rms_norm(&x, &fnorm_d.data, t.rms_norm_eps, n, h)
         };
+        // ...for the rows the verifier KEPT, and no further. A speculative pass
+        // computes a hidden state for every row it fed, and the ones past the
+        // accepted prefix are functions of tokens the model did not choose. An
+        // MTP head drafting from one of those would be drafting off a state
+        // that never happened, and nothing downstream would say so.
+        let entry = if verify_rows > 1 && new_toks.len() < n {
+            entry[..new_toks.len() * h].to_vec()
+        } else {
+            entry
+        };
         // RETAIN it, and that is the whole enabling change. An MTP head's input
         // at position j is (main_hidden[j], embed(token[j+1])), and
         // main_hidden[j] never changes once produced -- attention is causal, so
@@ -2936,6 +4883,20 @@ fn main() -> Result<()> {
         // Uncached, every pass recomputes the whole prefix, so this is an
         // assignment there and an append here, and both lanes end holding the
         // same table over the same sequence.
+        // `kv` as well as the switch: the device draft lane only runs cached,
+        // and uncached this would upload the whole recomputed prefix once a
+        // pass for a reader that does not exist.
+        if mtp_dev_on && kv {
+            // Uploaded BEFORE the host table takes ownership, and appended on
+            // the same rule: an append with a cache, a replacement without one,
+            // so both tables end holding the same rows over the same sequence.
+            let rows = entry.len() / h;
+            let e_dev = up2::<Bk>(entry.clone(), rows, h, &dev);
+            mtp_main_dev = Some(match (kv, mtp_main_dev.take()) {
+                (true, Some(prev)) => BT::cat(vec![prev, e_dev], 0),
+                _ => e_dev,
+            });
+        }
         if kv {
             mtp_main.extend_from_slice(&entry);
         } else {
@@ -2951,6 +4912,12 @@ fn main() -> Result<()> {
         // ONE row and not `n` of them: a draft is read off the last position and
         // the head is per-row, so unembedding the prefix was 89 G multiply-adds
         // per position thrown away.
+        // Every draft head's distribution, in the order the heads are read, for
+        // the pass that is drafting now. A side channel rather than a return
+        // value because `draft_argmax` is called from two lanes and one of them
+        // (`draft_whole`) is also the INK_MTP_CHECK control, which must not
+        // contribute.
+        let draft_probs: std::cell::RefCell<Vec<Vec<f32>>> = std::cell::RefCell::new(Vec::new());
         let draft_argmax = |row: &[f32]| -> usize {
             debug_assert_eq!(row.len(), h, "the draft head unembeds exactly one position");
             let dl = {
@@ -2968,6 +4935,9 @@ fn main() -> Result<()> {
                 if val > dl[b] {
                     b = i;
                 }
+            }
+            if mtp_prob {
+                draft_probs.borrow_mut().push(softmax_row(&dl[..v]));
             }
             b
         };
@@ -3011,8 +4981,267 @@ fn main() -> Result<()> {
             out
         };
 
+        // The same unembedding, fed a row that is already on the device. The
+        // host twin above exists for the host draft lane and reads a `&[f32]`;
+        // this one would otherwise pay a 16 KB readback and a 16 KB upload per
+        // draft for the privilege of handing the value straight back.
+        let draft_argmax_dev = |row: T2| -> usize {
+            let dl = {
+                let ud = unembed_w.as_ref().expect("drafting needs the unembed table");
+                let hs = dev_lane::rms_norm(
+                    row,
+                    fnorm_dev.clone().expect("drafting needs the final norm"),
+                    t.rms_norm_eps,
+                )
+                .div_scalar(t.logits_mup_width_multiplier as f32);
+                down(dev_lane::linear_bf16(hs, ud).slice([0..1, 0..v]))
+            };
+            let mut b = 0usize;
+            for (i, &val) in dl.iter().take(v).enumerate() {
+                if val > dl[b] {
+                    b = i;
+                }
+            }
+            if mtp_prob {
+                draft_probs.borrow_mut().push(softmax_row(&dl[..v]));
+            }
+            b
+        };
+
+        draft_probs.borrow_mut().clear();
         let t_mtp = Instant::now();
-        let drafts: Vec<usize> = if kv {
+        let drafts: Vec<usize> = if kv && mtp_dev_on {
+            // The device lane, structurally identical to the host one below --
+            // ragged stable rows, a speculative tail run against a CLONE of the
+            // cache -- so the two can be read against each other line for line.
+            if mtp_devs.is_empty() {
+                let t_up = Instant::now();
+                let mut bytes = 0u64;
+                for i in 0..mtp_k {
+                    let pre = format!("model.mtp.layers.{i}.");
+                    let p = format!("{pre}transformer_block.");
+                    let hd = &mtp_heads[i].dims;
+                    let pw = |nm: &str, rows: usize, cols: usize| -> Result<Bf16W> {
+                        let leaf = cp.stored(&format!("{p}{nm}"))?;
+                        anyhow::ensure!(
+                            leaf.elem == Elem::Bf16,
+                            "{p}{nm} is {:?}; this lane multiplies BF16 by BF16",
+                            leaf.elem
+                        );
+                        Ok(bind_bf16(&fp4_client, fp4_aliases.as_ref(), &leaf.bytes, rows, cols))
+                    };
+                    let ip = cp.stored(&format!("{pre}input_proj.weight"))?;
+                    anyhow::ensure!(ip.elem == Elem::Bf16, "input_proj is {:?}", ip.elem);
+                    let gv = |nm: &str| -> Result<Vec<f32>> { Ok(cp.tensor(nm)?.data) };
+                    // Bound here rather than through [`DeviceDense`], whose map
+                    // is keyed by LAYER prefix and whose byte counter feeds the
+                    // per-layer report: an MTP head is not one of this node's
+                    // layers and counting it there would misattribute 1 GiB.
+                    let dense = {
+                        let fused = cp.stored(&format!("{p}mlp.w13_dn.weight"))?;
+                        anyhow::ensure!(fused.elem == Elem::Bf16, "mtp w13 is {:?}", fused.elem);
+                        let (g, u) = mary::models::inkling::load::split_gate_up_bytes(
+                            &fused.bytes,
+                            h,
+                            2,
+                        );
+                        let dw = cp.stored(&format!("{p}mlp.w2_md.weight"))?;
+                        anyhow::ensure!(dw.elem == Elem::Bf16, "mtp w2 is {:?}", dw.elem);
+                        let (drows, dcols) = (dw.dims[0] as usize, dw.dims[1] as usize);
+                        let inter = g.len() / (h * 2);
+                        let gs = cp.tensor(&format!("{p}mlp.global_scale"))?.data[0];
+                        bytes += (g.len() + u.len() + dw.bytes.len()) as u64;
+                        (
+                            bind_bf16(&fp4_client, fp4_aliases.as_ref(), &g, inter, h),
+                            bind_bf16(&fp4_client, fp4_aliases.as_ref(), &u, inter, h),
+                            bind_bf16(&fp4_client, fp4_aliases.as_ref(), &dw.bytes, drows, dcols),
+                            gs,
+                        )
+                    };
+                    let built = MtpDev {
+                        attn: dev_lane::AttnWeightsDev {
+                            wq: pw("attn.wq_du.weight", hd.heads * hd.head_dim, h)?,
+                            wk: pw("attn.wk_dv.weight", hd.kv_heads * hd.head_dim, h)?,
+                            wv: pw("attn.wv_dv.weight", hd.kv_heads * hd.head_dim, h)?,
+                            wr: pw("attn.wr_du.weight", hd.heads * hd.d_rel, h)?,
+                            wo: pw("attn.wo_ud.weight", h, hd.heads * hd.head_dim)?,
+                            k_sconv: up2(
+                                gv(&format!("{p}attn.k_sconv.weight"))?,
+                                hd.kv_heads * hd.head_dim,
+                                t.sconv_kernel_size,
+                                &dev,
+                            ),
+                            v_sconv: up2(
+                                gv(&format!("{p}attn.v_sconv.weight"))?,
+                                hd.kv_heads * hd.head_dim,
+                                t.sconv_kernel_size,
+                                &dev,
+                            ),
+                            q_norm: up1(gv(&format!("{p}attn.q_norm.weight"))?, hd.head_dim, &dev),
+                            k_norm: up1(gv(&format!("{p}attn.k_norm.weight"))?, hd.head_dim, &dev),
+                            rel_proj: up2(
+                                gv(&format!("{p}attn.rel_logits_proj.proj"))?,
+                                hd.d_rel,
+                                hd.rel_extent,
+                                &dev,
+                            ),
+                        },
+                        attn_sconv: up2(
+                            gv(&format!("{p}attn_sconv.weight"))?,
+                            h,
+                            t.sconv_kernel_size,
+                            &dev,
+                        ),
+                        mlp_sconv: up2(
+                            gv(&format!("{p}mlp_sconv.weight"))?,
+                            h,
+                            t.sconv_kernel_size,
+                            &dev,
+                        ),
+                        attn_norm: up1(gv(&format!("{p}attn_norm.weight"))?, h, &dev),
+                        mlp_norm: up1(gv(&format!("{p}mlp_norm.weight"))?, h, &dev),
+                        embed_norm: up1(gv(&format!("{pre}embed_norm.weight"))?, h, &dev),
+                        hidden_norm: up1(gv(&format!("{pre}hidden_norm.weight"))?, h, &dev),
+                        input_proj: bind_bf16(
+                            &fp4_client,
+                            fp4_aliases.as_ref(),
+                            &ip.bytes,
+                            h,
+                            2 * h,
+                        ),
+                        dense,
+                    };
+                    bytes += ip.bytes.len() as u64;
+                    mtp_devs.push(built);
+                }
+                <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync after MTP upload");
+                println!(
+                    "  MTP heads on the device: {mtp_k} in {:.2}s, {:.2} GiB bound",
+                    t_up.elapsed().as_secs_f32(),
+                    bytes as f64 / GIB
+                );
+            }
+            let main_dev = mtp_main_dev.clone().expect("the entry states were uploaded above");
+            let mut prev_rows: Vec<T2> = Vec::new();
+            let mut drafts: Vec<usize> = Vec::with_capacity(mtp_k);
+            for d in 0..mtp_k {
+                let hd = mtp_heads[d].dims;
+                let window = mtp_heads[d].window(t.sliding_window_size);
+                let want = seq - d;
+                let have = mtp_stage_dev[d].as_ref().map(|x| x.dims()[0]).unwrap_or(0);
+                let row_of = |src: &Option<T2>, lo: usize, hi: usize| -> T2 {
+                    match src {
+                        Some(x) => x.clone().slice([lo..hi, 0..h]),
+                        None => unreachable!("head d-1 always has more stable rows than head d"),
+                    }
+                };
+                let stable: T2 = if have == 0 {
+                    let mut embeds = vec![0f32; want * h];
+                    for j in 0..want {
+                        let tok = if j + d + 1 < seq { ids[j + d + 1] } else { best };
+                        embeds[j * h..(j + 1) * h]
+                            .copy_from_slice(&embed_row_bf16(e_w, tok, t.vocab_size, h));
+                    }
+                    let ed = up2::<Bk>(embeds, want, h, &dev);
+                    let hin = if d == 0 {
+                        main_dev.clone().slice([0..want, 0..h])
+                    } else {
+                        row_of(&mtp_stage_dev[d - 1], 0, want)
+                    };
+                    let (y, c) = mtp_block_prefill_dev(
+                        hin,
+                        ed,
+                        &mtp_devs[d],
+                        &hd,
+                        Some(ls),
+                        window,
+                        t.sconv_kernel_size,
+                        t.rms_norm_eps,
+                        mtp_order,
+                    );
+                    mtp_dev_caches[d] = Some(c);
+                    y
+                } else {
+                    // ONE row per CONFIRMED TOKEN, not one per pass. That used
+                    // to be the same number and an `assert_eq!(have + 1, want)`
+                    // said so; a speculative pass confirms 1 + accepted tokens
+                    // at once and every one of them makes a row of every head
+                    // stable. Head d's row at `pos` is fed the token at
+                    // pos + d + 1, which is in `ids` for all of them but the
+                    // last, where it is the argmax still being held back.
+                    let adv = want - have;
+                    assert!(adv >= 1, "a pass makes at least one row stable");
+                    let mut made: Vec<T2> = Vec::with_capacity(adv);
+                    for i in 0..adv {
+                        let pos = have + i;
+                        let hin = if d == 0 {
+                            main_dev.clone().slice([pos..pos + 1, 0..h])
+                        } else {
+                            row_of(&mtp_stage_dev[d - 1], pos, pos + 1)
+                        };
+                        let ahead = pos + d + 1;
+                        let tok = if ahead < seq { ids[ahead] } else { best };
+                        let ed = up2::<Bk>(
+                            embed_row_bf16(e_w, tok, t.vocab_size, h),
+                            1,
+                            h,
+                            &dev,
+                        );
+                        made.push(mtp_block_step_dev(
+                            hin,
+                            ed,
+                            &mtp_devs[d],
+                            &hd,
+                            Some(ls),
+                            pos,
+                            window,
+                            mtp_dev_caches[d].as_mut().expect("prefilled on the first pass"),
+                            t.rms_norm_eps,
+                            mtp_order,
+                        ));
+                    }
+                    if made.len() == 1 {
+                        made.pop().expect("one row")
+                    } else {
+                        BT::cat(made, 0)
+                    }
+                };
+                mtp_stage_dev[d] = Some(match mtp_stage_dev[d].take() {
+                    None => stable,
+                    Some(prev) => BT::cat(vec![prev, stable], 0),
+                });
+                let mut rows: Vec<T2> = vec![row_of(&mtp_stage_dev[d], want - 1, want)];
+                let mut last = rows[0].clone();
+                if d > 0 {
+                    let mut scratch =
+                        mtp_dev_caches[d].as_ref().expect("prefilled").clone();
+                    for i in 0..d {
+                        let ed = up2::<Bk>(
+                            embed_row_bf16(e_w, drafts[i], t.vocab_size, h),
+                            1,
+                            h,
+                            &dev,
+                        );
+                        last = mtp_block_step_dev(
+                            prev_rows[i].clone(),
+                            ed,
+                            &mtp_devs[d],
+                            &hd,
+                            Some(ls),
+                            want + i,
+                            window,
+                            &mut scratch,
+                            t.rms_norm_eps,
+                            mtp_order,
+                        );
+                        rows.push(last.clone());
+                    }
+                }
+                drafts.push(draft_argmax_dev(last));
+                prev_rows = rows;
+            }
+            drafts
+        } else if kv {
             // Head d's newest STABLE row is at position seq-1-d: past that, its
             // input embedding is a token the stack has not produced yet. So a
             // step appends exactly ONE row per head, and the d rows after it --
@@ -3108,13 +5337,31 @@ fn main() -> Result<()> {
         } else {
             draft_whole(&mtp_main, seq, &ids, best)
         };
-        mtp_issued.insert(step, vec![None; drafts.len()]);
-        for (d, &b) in drafts.iter().enumerate() {
-            // Head d predicts the token d+1 steps past the one just chosen.
-            mtp_pending.push((step + d + 1, d, b));
+        if spec_k == 0 {
+            mtp_issued.insert(step, vec![None; drafts.len()]);
+            if mtp_prob {
+                mtp_issued_q.insert(step, vec![None; drafts.len()]);
+                for (d, p) in draft_probs.borrow_mut().drain(..).enumerate() {
+                    mtp_pd.insert((step + d + 1, d), p);
+                }
+            }
+            for (d, &b) in drafts.iter().enumerate() {
+                // Head d predicts the token d+1 steps past the one just chosen.
+                mtp_pending.push((step + d + 1, d, b));
+            }
+        }
+        acc_draft += t_mtp.elapsed().as_secs_f64();
+        // The drafts go to the head, which is the only process that can embed
+        // them. Sent HERE and not with the answer, so the head was blocked on
+        // the verify pass alone and this drafting overlaps its commit.
+        if spec_k > 0 {
+            last_drafts = drafts.clone();
+            if let Some(Pipe::Tail(s)) = pipe.as_mut() {
+                send_toks(s, &drafts)?;
+            }
         }
         println!(
-            "  MTP drafted {} token(s) in {:.2}s: {drafts:?}",
+            "  MTP drafted {} token(s) in {:.3}s: {drafts:?}",
             mtp_heads.len(),
             t_mtp.elapsed().as_secs_f32(),
         );
@@ -3132,8 +5379,15 @@ fn main() -> Result<()> {
                 t_c.elapsed().as_secs_f32(),
                 if whole == drafts { "agree" } else { "DISAGREE" }
             );
+            // Asserted for the HOST cached lane, which is the same arithmetic
+            // summed in the same order and therefore has no licence to differ;
+            // REPORTED for the device one, where an argmax over a 200k row can
+            // legitimately flip on a near-tie. Asserting there would be a
+            // determinism gate wearing a correctness costume, and the honest
+            // instrument for a transcription is the acceptance rate it goes on
+            // to produce.
             anyhow::ensure!(
-                whole == drafts,
+                mtp_dev_on || whole == drafts,
                 "the MTP cache drafted {drafts:?} where the whole sequence drafts {whole:?}"
             );
         }
@@ -3192,6 +5446,17 @@ fn main() -> Result<()> {
             "device"
         }
     );
+    println!("    residual to the host{:9.1}   (the [n, hidden] the wire and the draft path read)",
+             ms(t_x_down));
+    // The report is a partition or it is decoration. Everything above is a
+    // stage; this is the pass MINUS the stages, and a run that grows it is a
+    // run doing work no line here names.
+    {
+        let named = t_embed + t_attn + t_other + t_stack_sync + t_head + t_x_down;
+        let whole = pass.elapsed().as_secs_f64();
+        println!("    UNATTRIBUTED    {:9.1}   (this pass, {:.1} ms, less every stage above)",
+                 ms(whole - named), ms(whole));
+    }
     println!("    of the above, host-only tensor reads (mmap + BF16 widening): {:9.1}", ms(t_read.get()));
     {
         // What the HOST did in the routed-expert lane, one bucket per kind of
@@ -3278,6 +5543,7 @@ fn main() -> Result<()> {
         print!("{}", cp.io_table(28));
     }
     report_align();
+    mary::models::inkling::bf16gemm::report_hand();
     println!("  elapsed: {:.1}s", started.elapsed().as_secs_f32());
 
 
@@ -3291,8 +5557,17 @@ fn main() -> Result<()> {
         top_all.clear();
     }
     // A head has no logits to rank -- the tail owns the table, and writes it.
-    if (kv || step == gen_steps) && best_wire.is_none() {
-        for ti in logit_row0..n {
+    // Not in the slot lane: this table is indexed by POSITION in one sequence,
+    // and a slot batch's rows are b sequences at the same position. Reporting
+    // them here would print b top-5 rows against b consecutive positions of
+    // slot 0, which is not a thing that happened.
+    if (kv || gen_tokens + new_toks.len() > gen_steps) && best_wire.is_none() && !slot_lane {
+        // Only the rows the verifier kept. A speculative pass computes logits
+        // for rows it then throws away, and ranking those would print a top-5
+        // for a position the run never visited -- and index `ids` past its end.
+        let valid_to =
+            if verify_rows > 1 || probe_rows > 1 { logit_row0 + new_toks.len() } else { n };
+        for ti in logit_row0..valid_to {
             let pos = pos0 + ti;
             let row = &logits[(ti - logit_row0) * v..(ti - logit_row0 + 1) * v];
             let mut idx: Vec<usize> = (0..v).collect();
@@ -3308,17 +5583,202 @@ fn main() -> Result<()> {
     }
 
     if gen_steps > 0 {
-        println!("  step {step}: +{best}   [pass {:.1}s, total {:.1}s, ctx {}, pass_ms {:.1}]",
+        // The cohort is named only when there is more than one, so a
+        // single-cohort run's transcript is character for character the one
+        // every arm above was compared on.
+        let coh_tag =
+            if ncohorts > 1 { format!(" cohort {answer_coh}") } else { String::new() };
+        println!("  step {step}{coh_tag}: +{new_toks:?}   [pass {:.1}s, total {:.1}s, ctx {}, pass_ms {:.1}]",
                  pass.elapsed().as_secs_f32(), started.elapsed().as_secs_f32(), ids.len(),
                  pass.elapsed().as_secs_f64() * 1e3);
-        // The tail already pushed, when it answered its peer.
+        // The tail already pushed all but the last, when it answered its peer.
         if !is_tail && !repeat {
-            ids.push(best);
+            // Not in the slot lane: `new_toks` is one token per SLOT there, not
+            // an accepted prefix of one sequence, and extending `ids` with all
+            // of them puts seven other sequences into slot 0's stream. It is
+            // only a report -- nothing computes off `ids` in that lane -- which
+            // is exactly why it read as a plausible context length (4052
+            // against 3780) instead of as a failure.
+            if new_toks.len() > 1 && !slot_lane {
+                ids.extend_from_slice(&new_toks[..new_toks.len() - 1]);
+            }
+            // `ids` is ONE sequence's -- cohort 0's slot 0 -- because every
+            // report that indexes a position reads it. Appending a second
+            // cohort's token would interleave two sequences into one stream and
+            // read as a plausible context length rather than as a failure,
+            // which is the same trap the slot batch already sprang once.
+            if !slot_lane || (answered && (ncohorts == 1 || answer_coh == 0)) {
+                ids.push(best);
+            }
         }
     }
-    if step == gen_steps {
+    // The prefill is a different animal -- a 512-row pass against a 1-row one,
+    // and the only pass that pays for uploading every resident weight -- so it
+    // is excluded from the utilisation summary rather than averaged into it.
+    if is_decode {
+        acc_send += t_send;
+        acc_wait_peer += t_wait_peer;
+        acc_recv += t_recv;
+        acc_pass += pass.elapsed().as_secs_f64();
+        acc_to_reply += t_to_reply;
+        acc_steps += 1;
+        pass_ms.push((pass.elapsed().as_secs_f64() + t_recv) * 1e3);
+    }
+    if is_decode && step - prefill_passes >= COLD_DECODE_STEPS {
+        warm_wall += pass.elapsed().as_secs_f64() + t_recv;
+        warm_steps += 1;
+        warm_tokens += if slot_lane && is_decode { n } else { new_toks.len() };
+    }
+    // A slot lane's prefill passes produce a token each and they are not decode
+    // tokens: counting them would put b of them in the numerator of a rate
+    // whose denominator is decode passes only.
+    // By the pass this node COMPUTED, not by the answer it happened to read.
+    // The two are the same pass on a tail and on a single-cohort head; on an
+    // interleaved head the answer is a pass behind, and counting answers would
+    // make the two ends disagree about how many tokens one run produced.
+    gen_tokens += if slot_lane && !is_decode {
+        0
+    } else if slot_lane {
+        n
+    } else {
+        new_toks.len()
+    };
+    // Tokens, not passes -- and with nothing speculated this fires on exactly
+    // the pass the old `for step in 0..=gen_steps` fired on.
+    // Passes, in the slot lane. Every arm has to run the same number of decode
+    // passes for the per-pass cost to be comparable across b, and a token count
+    // would make the run b times shorter at b times the width.
+    let done =
+        if slot_lane { is_decode && step + 1 - prefill_passes >= gen_steps } else { gen_tokens > gen_steps };
+    if done {
         break;
     }
+    step += 1;
+    }
+
+    // ---- the answers still on the wire ------------------------------------
+    //
+    // An interleaved head finishes `ncohorts - 1` passes ahead of the tail, so
+    // that many answers are still coming. They are read rather than dropped:
+    // each is one token per slot of a real cohort, and a run that discarded
+    // them would report every cohort but the last a token short -- which is
+    // exactly the sort of missing row a contamination check reads as a
+    // difference between neighbours.
+    if let Some(Pipe::Head(s)) = pipe.as_mut() {
+        while let Some(c) = in_flight.pop_front() {
+            let toks = recv_toks(s)?;
+            if slot_lane && gen_steps > 0 && !repeat {
+                let base = c * nslots;
+                for (q, tok) in slot_ids[base..base + nslots].iter_mut().zip(toks.iter()) {
+                    q.push(*tok);
+                }
+            }
+            println!("  drain cohort {c}: +{toks:?}");
+        }
+    }
+
+    // ---- how much of the wall clock this node spent waiting for the other --
+    if acc_steps > 0 && pipe.is_some() {
+        let ms = |v: f64| v * 1e3;
+        let wall = acc_pass + acc_recv;
+        println!("\n=== pipe utilisation over {acc_steps} decode steps (prefill excluded) ===");
+        println!("  role                 : {}", if is_head { "head" } else { "tail" });
+        println!("  wall in the loop     : {:9.1} ms   ({:.1} ms/step)", ms(wall), ms(wall) / acc_steps as f64);
+        if warm_steps > 0 {
+            println!(
+                "  WARM steps only      : {:9.1} ms   ({:.1} ms/step over {warm_steps} steps, \
+                 the first {COLD_DECODE_STEPS} excluded)",
+                ms(warm_wall),
+                ms(warm_wall) / warm_steps as f64
+            );
+            if warm_tokens > 0 {
+                println!(
+                    "  WARM per TOKEN       : {:9.1} ms   ({:.3} tok/s over {warm_tokens} tokens)",
+                    ms(warm_wall) / warm_tokens as f64,
+                    warm_tokens as f64 / warm_wall
+                );
+            }
+        }
+        if is_head {
+            // `pass` contains the wait, so compute is what is left of it.
+            let compute = acc_pass - acc_wait_peer - acc_send;
+            println!("  computing            : {:9.1} ms   {:5.1}%", ms(compute), 100.0 * compute / wall);
+            println!("  writing to the wire  : {:9.1} ms   {:5.1}%", ms(acc_send), 100.0 * acc_send / wall);
+            println!("  BLOCKED on the tail  : {:9.1} ms   {:5.1}%", ms(acc_wait_peer), 100.0 * acc_wait_peer / wall);
+            println!("  per step: compute {:.1} ms, blocked {:.1} ms",
+                     ms(compute) / acc_steps as f64, ms(acc_wait_peer) / acc_steps as f64);
+        } else {
+            println!("  computing            : {:9.1} ms   {:5.1}%", ms(acc_pass), 100.0 * acc_pass / wall);
+            println!("    of which drafting  : {:9.1} ms   {:5.1}%", ms(acc_draft), 100.0 * acc_draft / wall);
+            println!(
+                "  ANSWERED the head at : {:9.1} ms into its pass ({:.1} ms/step) -- everything\n  \
+                 after that (report, drafting) overlaps the head's next pass and the head\n  \
+                 never waits for it. Subtract THIS from the head's blocked figure for the wire.",
+                ms(acc_to_reply),
+                ms(acc_to_reply) / acc_steps as f64
+            );
+            println!("  BLOCKED on the head  : {:9.1} ms   {:5.1}%", ms(acc_recv), 100.0 * acc_recv / wall);
+            println!("  per step: compute {:.1} ms, blocked {:.1} ms",
+                     ms(acc_pass) / acc_steps as f64, ms(acc_recv) / acc_steps as f64);
+        }
+        // ---- THE gate ------------------------------------------------------
+        //
+        // Tokens per second, not milliseconds per pass. Speculation trades more
+        // compute for fewer sequential steps, so a per-pass figure is SUPPOSED
+        // to get worse; the only number that says whether the trade paid is how
+        // much text came out per second of wall clock.
+        // The prefill's own token is in `gen_tokens` on the single-sequence
+        // lane and is not a decode token; the slot lane never counted it.
+        let decode_toks = if slot_lane { gen_tokens } else { gen_tokens.saturating_sub(1) };
+        let mut sorted = pass_ms.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in a duration"));
+        let p50 = if sorted.is_empty() { 0.0 } else { sorted[sorted.len() / 2] };
+        println!(
+            "  TOKENS/SEC           : {:.3}   ({decode_toks} tokens past the prefill in {:.1} ms \
+             of decode wall)",
+            decode_toks as f64 / wall,
+            ms(wall)
+        );
+        println!(
+            "  per pass, ms         : p50 {p50:.1}, min {:.1}, max {:.1}, mean {:.1}   over {} passes",
+            sorted.first().copied().unwrap_or(0.0),
+            sorted.last().copied().unwrap_or(0.0),
+            ms(wall) / acc_steps as f64,
+            sorted.len()
+        );
+        let tpp = decode_toks as f64 / acc_steps as f64;
+        println!("  tokens per pass      : {tpp:.3}");
+        // The same gate, taken at the MEDIAN pass instead of the mean. A decode
+        // loop pays for kernel compilation in its first few passes -- one 1.8 s
+        // outlier in a 40-pass run moves the mean by 20% and the median by
+        // nothing -- so this is the figure a short run can be compared on and
+        // the mean above is the figure a long one can.
+        println!(
+            "  TOKENS/SEC at p50    : {:.3}   (tokens/pass over the median pass)",
+            if p50 > 0.0 { tpp / (p50 / 1e3) } else { 0.0 }
+        );
+        if spec_k > 0 {
+            let sets: usize = spec_hist.iter().sum();
+            println!("  accepted prefix over {sets} verify passes (INK_SPEC={spec_k}):");
+            for (l, &c) in spec_hist.iter().enumerate().skip(1) {
+                println!(
+                    "    {} accepted: {c:5}   ({:5.1}%)",
+                    l - 1,
+                    100.0 * c as f64 / sets.max(1) as f64
+                );
+            }
+            let mean: f64 = spec_hist
+                .iter()
+                .enumerate()
+                .skip(1)
+                .map(|(l, &c)| (l - 1) as f64 * c as f64)
+                .sum::<f64>()
+                / sets.max(1) as f64;
+            println!("    mean {mean:.3} draft tokens accepted per verify pass");
+        }
+        println!("  loop wall (both ends see the same clock): {:.1} ms", ms(loop_started.elapsed().as_secs_f64()));
+        println!("  the wire itself is the head's BLOCKED figure minus the tail's per-step compute;");
+        println!("  neither process can subtract that on its own, so the two reports are read together.");
     }
 
     // ---- what the router arm changed, if anything -------------------------
@@ -3452,12 +5912,143 @@ fn main() -> Result<()> {
                 }
             );
         }
+        // ---- the same drafts, under two rules that are not equality --------
+        //
+        // Reported beside the exact-match rate rather than instead of it,
+        // because they answer different questions and the gap between them IS
+        // the finding: A is "is the draft the argmax", B and C are "is the
+        // draft acceptable". A greedy loop can only spend A; a loop that
+        // samples can spend B or C, and sampling is not a quality concession --
+        // the residual-resampling step makes the output distribution exactly
+        // the target's.
+        if mtp_prob && mtp_prob_n.iter().any(|&n| n > 0) {
+            println!("\n=== MTP acceptance, three rules, same drafts ===");
+            println!("  A  exact argmax match                 -- greedy speculation");
+            println!("  B  greedy draft, sampled target       -- E[p_target(draft)]");
+            println!("  C  sampled draft, sampled target      -- E[1 - TV(p_draft, p_target)]");
+            println!("  depth      n        A        B        C");
+            for d in 0..mtp_k {
+                if mtp_prob_n[d] == 0 {
+                    println!("  {:5}      0   never scored", d + 1);
+                    continue;
+                }
+                let nn = mtp_prob_n[d] as f64;
+                println!(
+                    "  {:5}  {:5}   {:5.1}%   {:5.1}%   {:5.1}%",
+                    d + 1,
+                    mtp_prob_n[d],
+                    100.0 * mtp_hits[d] as f64 / mtp_seen[d].max(1) as f64,
+                    100.0 * mtp_b_sum[d] / nn,
+                    100.0 * mtp_c_sum[d] / nn,
+                );
+            }
+            // The expected LEADING RUN, which is what converts to tok/s. Under
+            // a stochastic rule a draft set has no realised prefix -- it has a
+            // distribution over prefixes -- so the expectation is taken
+            // directly: E[prefix] = sum_j prod_{i<=j} q_i.
+            let complete_q: Vec<&Vec<Option<(f64, f64)>>> =
+                mtp_issued_q.values().filter(|v| v.iter().all(|s| s.is_some())).collect();
+            if !complete_q.is_empty() {
+                let sets = complete_q.len();
+                let (mut eb, mut ec) = (0f64, 0f64);
+                for v in &complete_q {
+                    let (mut pb, mut pc) = (1f64, 1f64);
+                    for slot in v.iter() {
+                        let (b, c) = slot.expect("filtered to fully-scored sets");
+                        pb *= b;
+                        pc *= c;
+                        eb += pb;
+                        ec += pc;
+                    }
+                }
+                println!("  expected accepted prefix over {sets} fully-scored draft sets:");
+                println!("    rule B: {:.3} draft tokens per verify pass", eb / sets as f64);
+                println!("    rule C: {:.3} draft tokens per verify pass", ec / sets as f64);
+            }
+            println!(
+                "  depths past 1 are CONDITIONAL on the greedy chain: head d was fed the ARGMAX\n  \
+                 draft of head d-1, which a sampled loop would not always have drawn."
+            );
+
+            // ---- acceptance against the draft head's OWN confidence --------
+            //
+            // A loop that speculates unconditionally pays the width premium on
+            // every step, including the ones where the head was guessing. It
+            // does not have to: the head's top-1 mass is available BEFORE the
+            // verify pass is issued, for free, so the loop can decline. What
+            // that is worth is `(1 + P*a) / (P*c + (1 - P))` against the
+            // unconditional `(1 + a_all) / c`, and both need the measured
+            // width cost, which is a property of the machine and not of this
+            // run -- `INK_SPEC_C2` carries it in.
+            //
+            // **1.571, and it is now measured where it is spent.** The old
+            // default was 1.492, taken on the UNCACHED lane with `INK_REPEAT`,
+            // because until `INK_SPEC` existed there was no cached multi-row
+            // pass to time. There is one now, and the cached lane is worse:
+            // 100-token runs on the two-node pipe, warm p50 of the whole cycle,
+            // a five-token prompt, two runs per arm,
+            //
+            //     INK_SPEC=0  w=1  127.2 ms      c = 1.000
+            //     INK_SPEC=1  w=2  199.9 ms      c = 1.571
+            //     INK_SPEC=2  w=3  236.8 ms      c = 1.862
+            //     INK_SPEC=3  w=4  263.0 ms      c = 2.068
+            //
+            // against 1.000 / 1.332 / 1.434 / ~1.52 uncached, and against
+            // 1.000 / 1.463 / 1.747 on a 3732-token document, where a wider
+            // pass is a smaller fraction of a slower one.
+            //
+            // A STEP, not a slope: the penalty is nearly all at the second row
+            // and flat after it. Two things make it. `gemv plane par` requires
+            // m == 1, a cached decode step is weight-streaming-bound, and that
+            // lane is the only one reaching the roofline -- losing it costs
+            // 1.33x at m == 1 alone (70.1/73.0 ms against 96.2/93.3, measured
+            // in `bf16gemm`). The four short convolutions a layer ran
+            // slice-built above one row -- 49 of the 52 ms the second row used
+            // to add -- and they now run as one kernel each, which is where
+            // 1.613 became 1.571.
+            let c2: f64 = std::env::var("INK_SPEC_C2")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1.571);
+            if !mtp_conf[0].is_empty() {
+                println!("\n=== depth-1 acceptance against the draft head's own confidence ===");
+                println!("  c(2) = {c2:.3} (INK_SPEC_C2); a k=1 loop that always speculates:");
+                let all_n = mtp_conf[0].len();
+                let all_hit = mtp_conf[0].iter().filter(|(_, h)| *h).count();
+                let a_all = all_hit as f64 / all_n as f64;
+                println!(
+                    "    a = {:.3} over {all_n} events  ->  (1 + a) / c(2) = {:.3}x",
+                    a_all,
+                    (1.0 + a_all) / c2
+                );
+                println!("  gated on p_draft(top1) >= tau, paying c(1) when it declines:");
+                println!("    tau     P(spec)   a|spec    (1 + P*a) / (P*c2 + 1 - P)");
+                for tau in [0.0f32, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95] {
+                    let sel: Vec<&(f32, bool)> =
+                        mtp_conf[0].iter().filter(|(p, _)| *p >= tau).collect();
+                    if sel.is_empty() {
+                        println!("    {tau:4.2}    0        --        --");
+                        continue;
+                    }
+                    let pp = sel.len() as f64 / all_n as f64;
+                    let a = sel.iter().filter(|(_, h)| *h).count() as f64 / sel.len() as f64;
+                    println!(
+                        "    {tau:4.2}    {:.3}    {:.3}     {:.3}x",
+                        pp,
+                        a,
+                        (1.0 + pp * a) / (pp * c2 + 1.0 - pp)
+                    );
+                }
+                println!("  a threshold that beats the tau=0 row is a loop worth gating; one that");
+                println!("  does not means confidence and correctness are not linked here.");
+            }
+        }
     }
 
     // A zero-length batch is the head saying it is done, so the tail's loop
     // ends on a read rather than blocking forever on a peer that has exited.
     if let Some(Pipe::Head(s)) = pipe.as_mut() {
-        let _ = send_stream(s, 0, 0, &[]);
+        let _ = send_stream(s, 0, 0, 0, &[]);
     }
 
     // The head has no top-5 table -- the tail computed the logits and wrote it.

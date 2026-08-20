@@ -96,6 +96,83 @@ pub fn tensor_of(
     Tensor::from_primitive(TensorPrimitive::Float(c))
 }
 
+/// A rank-3 f32 tensor as `(handle, strides)`, WITHOUT making it contiguous.
+///
+/// [`handle_of`] copies when a tensor is not contiguous, and it is right to: a
+/// kernel that indexes `[row * k + col]` cannot read a strided buffer. But
+/// Burn's f32 matmul does not return a contiguous tensor -- it returns a PADDED
+/// one, `[32, 7000, 7000]` with strides `[49_280_000, 7040, 1]`, the row
+/// rounded up to a multiple of 64 -- and copying 6.3 GiB per layer to remove
+/// forty columns of padding cost 504 ms of a 5.47 s pass at 7000 tokens, 9.2%
+/// of it, for nothing. A kernel that is told the row stride does not need the
+/// copy, which is why this exists beside `handle_of` rather than inside it:
+/// only a caller knows whether its kernel can honour a stride.
+///
+/// The innermost stride must be 1. Anything else is a permutation rather than
+/// padding, and this is not the function for it.
+pub fn strided_of3(t: Tensor<Bk, 3>) -> (Handle, [usize; 3]) {
+    match t.into_primitive() {
+        TensorPrimitive::Float(c) => {
+            let c: CubeTensor<CudaRuntime> = c;
+            assert_eq!(c.dtype, DType::F32, "the inkling seam is f32 on both sides");
+            let st = c.meta.strides.clone();
+            assert_eq!(st.rank(), 3, "strided_of3 wants rank 3");
+            assert_eq!(st[2], 1, "the innermost stride is {}, not 1", st[2]);
+            let strides = [st[0], st[1], st[2]];
+            (c.handle, strides)
+        }
+        TensorPrimitive::QFloat(_) => panic!("a quantized Burn tensor has no plain f32 buffer"),
+    }
+}
+
+/// The inverse of [`strided_of3`]: the same buffer and the same strides, as a
+/// Burn tensor again.
+pub fn tensor_strided3(
+    client: ComputeClient<CudaRuntime>,
+    device: burn::backend::cuda::CudaDevice,
+    handle: Handle,
+    shape: [usize; 3],
+    strides: [usize; 3],
+) -> Tensor<Bk, 3> {
+    // Built contiguous and then told the truth about its strides. Naming
+    // `Metadata` here would mean depending on `burn-std` for one type; the
+    // field is public and this is the same two words.
+    let mut c = CubeTensor::<CudaRuntime>::new_contiguous(
+        client,
+        device,
+        shape.into(),
+        handle,
+        DType::F32,
+    );
+    c.meta.strides = strides.into();
+    Tensor::from_primitive(TensorPrimitive::Float(c))
+}
+
+/// The same, for a rank-3 buffer.
+///
+/// Not `tensor_of(...).reshape([d0, d1, d2])`: Burn's `reshape` decides between
+/// rewriting the strides and COPYING, and on a `[heads * n, n]` score matrix it
+/// chose the copy -- 6.3 GiB read and written per layer per pass at 7000
+/// tokens, 480 ms of a 5.5 s pass, for a shape change that moves no bytes.
+/// Building the tensor at the rank it is wanted at asks the question once.
+pub fn tensor_of3(
+    client: ComputeClient<CudaRuntime>,
+    device: burn::backend::cuda::CudaDevice,
+    handle: Handle,
+    d0: usize,
+    d1: usize,
+    d2: usize,
+) -> Tensor<Bk, 3> {
+    let c = CubeTensor::<CudaRuntime>::new_contiguous(
+        client,
+        device,
+        [d0, d1, d2].into(),
+        handle,
+        DType::F32,
+    );
+    Tensor::from_primitive(TensorPrimitive::Float(c))
+}
+
 /// The compute client a Burn tensor was allocated on.
 ///
 /// The forward needs one to launch the raw kernels with, and taking it from a
@@ -107,5 +184,33 @@ pub fn client_of<const D: usize>(t: &Tensor<Bk, D>) -> ComputeClient<CudaRuntime
     match t.clone().into_primitive() {
         TensorPrimitive::Float(c) => c.client,
         TensorPrimitive::QFloat(_) => panic!("quantized"),
+    }
+}
+
+/// What the device pool has RESERVED against what the run is holding.
+///
+/// The gap between those two is not padding. cubecl's sliced pools hand back a
+/// page only when it is ENTIRELY free (`SlicedPool::cleanup`), so one surviving
+/// slice keeps its whole page, and a long-lived tensor born in the middle of a
+/// burst of transient ones strands everything that shared its page.
+/// `memory_cleanup` cannot help with that — it is the call that just tried.
+///
+/// Worth printing because the growth is invisible in every other number the run
+/// reports. `cuMemAlloc` is driver memory on this part, so a pool that has grown
+/// tens of GiB shows up as a machine with no memory left and a process whose
+/// resident size did not move at all.
+pub fn pool_line(client: &ComputeClient<CudaRuntime>, at: &str) -> String {
+    const GIB: f64 = (1u64 << 30) as f64;
+    match client.memory_usage() {
+        Ok(u) => format!(
+            "    pool[{at}]: {:.2} GiB reserved, {:.2} live, {:.2} padding, {:.2} GiB STRANDED \
+             over {} slices",
+            u.bytes_reserved as f64 / GIB,
+            u.bytes_in_use as f64 / GIB,
+            u.bytes_padding as f64 / GIB,
+            u.bytes_reserved.saturating_sub(u.bytes_in_use + u.bytes_padding) as f64 / GIB,
+            u.number_allocs,
+        ),
+        Err(e) => format!("    pool[{at}]: unavailable ({e:?})"),
     }
 }

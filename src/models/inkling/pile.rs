@@ -248,10 +248,16 @@ fn mem_total_bytes() -> Result<u64> {
 /// The three terms, measured on this part:
 ///
 /// * the CUDA context is 0.2 GiB;
-/// * device-resident activations are 4.1 GiB for a 20-layer share, hence the
-///   per-layer term -- the only one that scales with the range;
+/// * the per-layer resident activations are 4.1 GiB for a 20-layer share --
+///   the KV-adjacent and MLP intermediates, which scale with the RANGE and
+///   barely with the sequence;
 /// * 4 GiB is left for the kernel, the shell and the page-cache working window,
-///   and that number is not a guess either. It is where the measured cliff is.
+///   and that number is not a guess either. It is where the measured cliff is;
+/// * `attention_bytes` is everything that scales with `n^2`, and it is the
+///   term this function did not have. See [`super::budget`]: prefill holds
+///   two `[heads, n, n]` f32 score matrices at the peak, which is 67 MB at 512
+///   tokens and 47.6 GiB at 14,124. Charging a flat per-layer figure for that
+///   is what admitted a run that peaked at 119.5 GiB of a 119.6 GiB node.
 ///
 /// The ladder, on a 121.63 GiB box, caches dropped and swap reset before each
 /// row, `INK_GEN=1`, at 01211be plus this change. "free" and "swap" are read
@@ -270,14 +276,14 @@ fn mem_total_bytes() -> Result<u64> {
 /// 2.55 GiB of nominal headroom) and 122.84 at 0:29 (refused by 1.21). The
 /// 0:30 row was taken with the OLD gate, which admitted it.
 ///
-/// It derives from the machine (`MemTotal`), never from a constant: spark has
-/// 119.6 GiB and spark2 121.6, and a gate hard-coded to either is wrong on the
-/// other.
-fn run_overhead_bytes(layers: usize) -> u64 {
+/// It derives from the machine (`MemTotal`), never from a constant: the two
+/// nodes this runs on differ by 2 GiB, and a gate hard-coded to either figure
+/// is wrong on the other.
+fn run_overhead_bytes(layers: usize, attention_bytes: u64) -> u64 {
     const CUDA_CONTEXT: u64 = GIB / 5;
     const ACTIVATIONS_PER_LAYER: u64 = 41 * GIB / 200;
     const OS_FLOOR: u64 = 4 * GIB;
-    CUDA_CONTEXT + ACTIVATIONS_PER_LAYER * layers as u64 + OS_FLOOR
+    CUDA_CONTEXT + ACTIVATIONS_PER_LAYER * layers as u64 + OS_FLOOR + attention_bytes
 }
 
 fn mem_available_bytes() -> Result<u64> {
@@ -1137,9 +1143,9 @@ impl PileSource {
     /// 16 GiB swap consumed, because the kernel chose to page out the arena we
     /// had just written rather than evict the mapped file pages we were done
     /// with. The second loop then ran at 3.0 GiB/s instead of 50 — it was
-    /// re-reading its own source off the SSD — and on a box with 2 GiB less
-    /// (spark has 119.6 GiB to spark2's 121.6) the CUDA context that comes
-    /// afterwards could not be created at all.
+    /// re-reading its own source off the SSD — and on the node with 2 GiB less
+    /// of the two this runs on, the CUDA context that comes afterwards could
+    /// not be created at all.
     ///
     /// So: the shapes are probed ONCE PER STACKED MATRIX rather than once per
     /// expert (every expert of one stack is the same matrix, and the copy
@@ -1148,10 +1154,18 @@ impl PileSource {
     /// reads, and then one threaded pass fetches, verifies, copies and releases
     /// each leaf's source pages. Peak residency becomes the arena plus a
     /// working window instead of the arena plus the whole share.
+    ///
+    /// `attention_bytes` is what prefill will hold in `[heads, n, n]` score
+    /// matrices at this sequence length, from [`super::budget::prefill_peak_bytes`].
+    /// It is a parameter rather than something this module derives because the
+    /// sequence length is a fact about the RUN and the weight share is a fact
+    /// about the checkpoint, and folding one into the other is how the gate
+    /// came to charge a constant for a quadratic.
     pub fn copy_share(
         &mut self,
         layers: std::ops::Range<usize>,
         global_dense: &[&str],
+        attention_bytes: u64,
     ) -> Result<(usize, usize, u64)> {
         anyhow::ensure!(self.copied.is_none(), "the weight share was already copied");
 
@@ -1286,7 +1300,7 @@ impl PileSource {
         let available = mem_available_bytes()?;
         let machine = mem_total_bytes()?;
         let n_layers = layers.len();
-        let overhead = run_overhead_bytes(n_layers);
+        let overhead = run_overhead_bytes(n_layers, attention_bytes);
         let need = total as u64 + overhead;
         let gib = |b: u64| b as f64 / GIB as f64;
         if need > machine || total as u64 > available {
@@ -1301,7 +1315,7 @@ impl PileSource {
             for (k, bytes) in per_layer.values().enumerate() {
                 acc += *bytes as u64;
                 let k = k + 1;
-                if acc + run_overhead_bytes(k) <= machine && acc <= available {
+                if acc + run_overhead_bytes(k, attention_bytes) <= machine && acc <= available {
                     fits = Some((k, acc));
                 }
             }
@@ -1312,7 +1326,7 @@ impl PileSource {
                     layers.start,
                     layers.start + k,
                     gib(share),
-                    gib(share + run_overhead_bytes(k)),
+                    gib(share + run_overhead_bytes(k, attention_bytes)),
                 ),
                 None => format!(
                     "Not even one layer fits: layer {} alone is {:.2} GiB on top of {:.2} GiB of \
@@ -1323,10 +1337,27 @@ impl PileSource {
                     gib(fixed_bytes as u64),
                 ),
             };
+            // Which half of the sum is the problem. A refusal that only ever
+            // says "use fewer layers" sends the operator to buy nodes when the
+            // fix is a shorter input: at 20,000 tokens the score matrices are
+            // 95.5 GiB of a 139.4 GiB estimate, and no layer split touches
+            // them, because every node runs attention over the whole sequence.
+            let cause = if attention_bytes > total as u64 {
+                format!(
+                    "\n  THE SEQUENCE, NOT THE SPLIT: {:.2} GiB of that is the attention score \
+                     matrices at this input length, against {:.2} GiB of weights. Splitting the \
+                     stack across more nodes does not help -- every node attends over the whole \
+                     sequence. Shorten the input.",
+                    gib(attention_bytes),
+                    gib(total as u64),
+                )
+            } else {
+                String::new()
+            };
             anyhow::bail!(
                 "INK_LAYERS={}:{} is {n_layers} layers = {:.2} GiB of weights; with the CUDA \
                  context and this node's activations that is {:.2} GiB, and this machine has \
-                 {:.2} GiB ({:.2} GiB available right now). Refusing.\n  \
+                 {:.2} GiB ({:.2} GiB available right now). Refusing.{cause}\n  \
                  A share this size fits only by taking memory the GPU still needs. Measured on \
                  a 121.63 GiB box: 0:29 (112.69 GiB) was admitted by the old gate and died with \
                  CUDA_ERROR_OUT_OF_MEMORY, and 0:30 (116.24 GiB) survived only by taking 1.4 GiB \

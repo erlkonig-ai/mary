@@ -32,7 +32,7 @@ use burn::prelude::*;
 use burn::tensor::{Int, Tensor, TensorData};
 
 use crate::models::inkling::bf16gemm::Bf16W;
-use crate::models::inkling::seam::{client_of, handle_of, tensor_of, Bk};
+use crate::models::inkling::seam::{client_of, handle_of, tensor_of, tensor_of3, Bk};
 
 /// `x * sigmoid(x)`, elementwise.
 pub fn silu<B: Backend>(x: Tensor<B, 2>) -> Tensor<B, 2> {
@@ -179,6 +179,90 @@ pub fn short_conv_step(
     )
 }
 
+/// SEVERAL positions of the short convolution at once, given the `kernel - 1`
+/// inputs before them.
+///
+/// The batched twin of [`short_conv_step`], and the shape a speculative verify
+/// pass convolves in: the accepted token followed by `k` drafts. It returns the
+/// output rows and the WHOLE `kernel - 1 + rows` window it convolved, because
+/// that window is what a rollback slices — the history ending at the last kept
+/// row is `all[keep .. keep + kernel - 1]`, and the pre-convolution projections
+/// it is made of are gone once the batch is over. Same reasoning as
+/// [`AttnCache`]'s `Pending`, and for the same reason: a verifier decides late.
+///
+/// ONE kernel, like [`short_conv_step`] and for the same reason.
+///
+/// This was slice-built — [`short_conv`] over the concatenation, sliced — on
+/// the reasoning that it runs four times a layer per VERIFY pass rather than
+/// per position, so the launch count this module exists to remove would not
+/// matter here. Measured on the two-node pipe it dominates: the MLP's single
+/// convolution costs 1.4 ms a pass at one row and **32.7 ms at two**, a step
+/// that is 60% of the whole one-row-to-two-row penalty and is paid again by
+/// the two convolutions inside [`attention_steps`]. A widened pass is not four
+/// calls, it is four calls times twenty-one layers, and the shifted-slice form
+/// describes each of them with a `cat`, `kernel` slices, `kernel` broadcast
+/// multiplies and `kernel` adds.
+///
+/// The window it returns is unchanged and is still the point: a rollback is a
+/// slice of it, and the pre-convolution projections it is made of are gone once
+/// the batch is over. Same reasoning as [`AttnCache`]'s `Pending`.
+///
+/// The taps now contract to `fma.rn.f32` exactly as [`short_conv_step`]'s do,
+/// so `rows == 1` through here is BIT-IDENTICAL to the one-row lane. Under the
+/// slice form it was not, and that difference was one more thing separating a
+/// widened pass's arithmetic from a narrow one's.
+pub fn short_conv_steps(
+    hist: Tensor<Bk, 2>,
+    x: Tensor<Bk, 2>,
+    weight: Tensor<Bk, 2>,
+) -> (Tensor<Bk, 2>, Tensor<Bk, 2>) {
+    let [rows, dim] = x.dims();
+    let [wdim, kernel] = weight.dims();
+    assert_eq!(dim, wdim, "short_conv_steps: x is [_, {dim}] but the weight is [{wdim}, _]");
+    assert_eq!(
+        hist.dims(),
+        [kernel - 1, dim],
+        "the history must be the {} rows before this batch",
+        kernel - 1
+    );
+    let all = Tensor::cat(vec![hist, x], 0);
+    (short_conv_window(all.clone(), weight, rows), all)
+}
+
+/// The same convolution over a window the caller already holds.
+///
+/// [`short_conv_steps`] concatenates a history onto a batch and then convolves
+/// it; [`attention_steps`] has built that concatenation for K and V already,
+/// and re-splitting it into (history, batch) so this function could re-join
+/// them would be two copies to describe an identity.
+///
+/// `all` is `[kernel - 1 + rows, dim]` and the output is its LAST `rows` rows —
+/// the front `kernel - 1` are history and every output row reads a full window
+/// of real input, so [`short_conv`]'s front zero-padding is never reached here.
+pub fn short_conv_window(
+    all: Tensor<Bk, 2>,
+    weight: Tensor<Bk, 2>,
+    rows: usize,
+) -> Tensor<Bk, 2> {
+    let [len, dim] = all.dims();
+    let [wdim, kernel] = weight.dims();
+    assert_eq!(dim, wdim, "short_conv_window: the window is [_, {dim}] but the weight is [{wdim}, _]");
+    assert_eq!(
+        len,
+        kernel - 1 + rows,
+        "a {rows}-row convolution wants {} window rows, got {len}",
+        kernel - 1 + rows
+    );
+    let client = client_of(&all);
+    let dev = all.device();
+    let h_all = handle_of(all);
+    let h_w = handle_of(weight);
+    let out = crate::models::inkling::sconv::short_conv_batch(
+        &client, &h_all, &h_w, dim, rows, kernel,
+    );
+    tensor_of(client, dev, out, rows, dim)
+}
+
 /// Depthwise causal short convolution **plus its internal residual**, on device.
 ///
 /// The device twin of [`crate::models::inkling::block::short_conv`]:
@@ -279,12 +363,33 @@ pub struct AttnWeightsDev {
 /// cacheable. Row 0 is absolute position [`AttnCache::base`], not 0: a local
 /// layer drops keys that have left its window, so the row index is not the
 /// position and every distance must be computed through `base`.
+#[derive(Clone)]
 pub struct AttnCache<B: Backend> {
     k: Tensor<B, 2>,
     v: Tensor<B, 2>,
     k_pre: Tensor<B, 2>,
     v_pre: Tensor<B, 2>,
     base: usize,
+    /// Set by [`attention_steps`] and cleared by [`AttnCache::commit`]: the
+    /// rows a SPECULATIVE batch appended, which may turn out not to have
+    /// happened.
+    pending: Option<Pending<B>>,
+}
+
+/// What a speculative batch must be able to undo.
+///
+/// Truncating K and V is a slice; restoring the short convolution's memory is
+/// not, because the history the next position reads is a function of the last
+/// KEPT row and the rows before it, and those pre-convolution projections are
+/// gone once the batch is over. So the batch keeps the whole
+/// `kernel - 1 + rows` window it built, and any accepted prefix is a slice of
+/// it. Rolling back to `keep` rows is then exactly as cheap as rolling back to
+/// all of them, which is the property that lets a verifier decide LATE.
+#[derive(Clone)]
+struct Pending<B: Backend> {
+    k_pre: Tensor<B, 2>,
+    v_pre: Tensor<B, 2>,
+    rows: usize,
 }
 
 impl<B: Backend> AttnCache<B> {
@@ -301,6 +406,44 @@ impl<B: Backend> AttnCache<B> {
     /// Absolute position of row 0.
     pub fn base(&self) -> usize {
         self.base
+    }
+
+    /// Keep the first `keep` of the rows the last [`attention_steps`] appended
+    /// and discard the rest.
+    ///
+    /// This is the whole of speculative rollback. A verifier accepts a PREFIX
+    /// of a drafted batch, and the positions past it were computed against
+    /// tokens the model did not choose; leaving their K and V behind does not
+    /// error, it shows up months later as an acceptance rate that drifts down.
+    ///
+    /// The window trim is deferred to here rather than done inside
+    /// [`attention_steps`], and that is not tidiness: trimming to the last
+    /// `window` keys of a batch that is then rolled BACK would have dropped
+    /// keys the shorter sequence still needs. A speculative batch may not
+    /// forget until it knows how long it was.
+    ///
+    /// Idempotent and safe with no batch outstanding — it still trims, which is
+    /// what makes it correct to call after every verify pass.
+    pub fn commit(&mut self, keep: usize, window: Option<usize>) {
+        if let Some(p) = self.pending.take() {
+            assert!(keep <= p.rows, "kept {keep} of a {}-row batch", p.rows);
+            let drop = p.rows - keep;
+            if drop > 0 {
+                let [len, dim] = self.k.dims();
+                self.k = self.k.clone().slice([0..len - drop, 0..dim]);
+                let [vlen, vdim] = self.v.dims();
+                self.v = self.v.clone().slice([0..vlen - drop, 0..vdim]);
+            }
+            // `k_pre` holds `kernel - 1` history rows followed by the batch's
+            // own pre-convolution projections, so the history ending at the
+            // last kept row is the window starting at `keep`.
+            let hist = p.k_pre.dims()[0] - p.rows;
+            let dim = p.k_pre.dims()[1];
+            self.k_pre = p.k_pre.slice([keep..keep + hist, 0..dim]);
+            let vdim = p.v_pre.dims()[1];
+            self.v_pre = p.v_pre.slice([keep..keep + hist, 0..vdim]);
+        }
+        trim(self, window);
     }
 }
 
@@ -329,22 +472,23 @@ fn trim<B: Backend>(c: &mut AttnCache<B>, window: Option<usize>) {
 /// against the same `transformers` capture, not against it: matching the slice
 /// lane would only prove the two agree, and they were written by the same hand.
 ///
-/// `mask` is the additive `[tokens, tokens]` mask — zero where a key is visible
-/// and `-inf` where it is not — because a local layer's mask carries the sliding
-/// window and a global layer's does not.
+/// `mask_window` is the sliding window a local layer masks with, and `None` on a
+/// global layer. It is a predicate on `q - k` rather than an additive
+/// `[tokens, tokens]` tensor: the epilogue kernel recomputes visibility per
+/// element, so nothing quadratic is materialised to hold it.
 ///
 /// Two things are folded together here that a careless reading separates:
 /// log scaling multiplies the query **and** the relative-position bias, and only
 /// on global layers; and the bias is zero outside `0 <= q - k < rel_extent`,
-/// while causality lives in the mask.
+/// while causality is the `k <= q` half of the same predicate.
 pub fn attention(
     x: Tensor<Bk, 2>,
     w: &AttnWeightsDev,
     d: &crate::models::inkling::attn::AttnDims,
     log_scaling: Option<crate::models::inkling::attn::LogScaling>,
-    mask: Tensor<Bk, 2>,
+    mask_window: Option<usize>,
 ) -> Tensor<Bk, 2> {
-    attention_prefill(x, w, d, log_scaling, mask, None).0
+    attention_prefill(x, w, d, log_scaling, mask_window, None).0
 }
 
 /// The same layer, keeping what a decode step will need.
@@ -362,14 +506,47 @@ pub fn attention_prefill(
     w: &AttnWeightsDev,
     d: &crate::models::inkling::attn::AttnDims,
     log_scaling: Option<crate::models::inkling::attn::LogScaling>,
-    mask: Tensor<Bk, 2>,
+    mask_window: Option<usize>,
     window: Option<usize>,
+) -> (Tensor<Bk, 2>, AttnCache<Bk>) {
+    attention_prefill_lane(x, w, d, log_scaling, mask_window, window, true, None)
+}
+
+/// The same layer with the banded lane REFUSED, so a test can hold the two
+/// implementations side by side.
+///
+/// Exists because the only check that catches a band which disagrees with the
+/// dense triangle is one that runs both on the same weights: a banded kernel
+/// checked against a banded reference proves the two share an author, not that
+/// either is right.
+#[cfg(test)]
+pub(crate) fn attention_prefill_dense(
+    x: Tensor<Bk, 2>,
+    w: &AttnWeightsDev,
+    d: &crate::models::inkling::attn::AttnDims,
+    log_scaling: Option<crate::models::inkling::attn::LogScaling>,
+    mask_window: Option<usize>,
+    window: Option<usize>,
+    block: Option<usize>,
+) -> (Tensor<Bk, 2>, AttnCache<Bk>) {
+    attention_prefill_lane(x, w, d, log_scaling, mask_window, window, false, block)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attention_prefill_lane(
+    x: Tensor<Bk, 2>,
+    w: &AttnWeightsDev,
+    d: &crate::models::inkling::attn::AttnDims,
+    log_scaling: Option<crate::models::inkling::attn::LogScaling>,
+    mask_window: Option<usize>,
+    window: Option<usize>,
+    banded_ok: bool,
+    block: Option<usize>,
 ) -> (Tensor<Bk, 2>, AttnCache<Bk>) {
     use crate::models::inkling::config::AttnKind;
 
     let [tokens, hidden] = x.dims();
     assert_eq!(hidden, d.hidden, "x is [_, {hidden}] but the config says {}", d.hidden);
-    assert_eq!(mask.dims(), [tokens, tokens], "the mask must be [tokens, tokens]");
     let dev = x.device();
     let (heads, kv_heads, head_dim) = (d.heads, d.kv_heads, d.head_dim);
     let groups = d.groups();
@@ -401,56 +578,192 @@ pub fn attention_prefill(
     // Only distances that can occur are worth projecting: a distance is at most
     // `tokens - 1` and the table stops at `rel_extent`.
     let eff = d.rel_extent.min(tokens);
-    let mut idx = vec![0i32; tokens * tokens];
-    let mut valid = vec![0f32; tokens * tokens];
-    for qi in 0..tokens {
-        for ki in 0..tokens {
-            let dist = qi as isize - ki as isize;
-            if dist >= 0 && (dist as usize) < d.rel_extent {
-                idx[qi * tokens + ki] = dist as i32;
-                valid[qi * tokens + ki] = 1.0;
+
+    // A local layer is a BAND, and the band is the whole of its attention:
+    // `[tokens, heads * head_dim]` out, one kernel, nothing quadratic written
+    // down at any point. Thirty-five of this model's forty-two attention layers
+    // take this arm. The dense arm below -- the GQA expansion, the two
+    // transposes and the `[heads, n, n]` scores -- is built only for the seven
+    // that are global, because a global layer really does read every key.
+    let out: Tensor<Bk, 2> = match mask_window {
+        // `win` and not `w`: the weights are `w` in this function, and a match
+        // binding that shadowed them would silently reach the window wherever a
+        // projection was meant.
+        Some(win)
+            if banded_ok
+                && crate::models::inkling::banded::applies(heads, kv_heads, head_dim, win) =>
+        {
+            use crate::models::inkling::banded::banded_attention_launch;
+            use crate::models::inkling::seam::{client_of, handle_of, tensor_of};
+            // `[tokens, heads, eff]`, and eff <= 1024 -- linear in the
+            // sequence. The band reads it whole because it runs the whole
+            // sequence in one launch; the dense arm below builds it a query
+            // block at a time, for which see the loop there.
+            //
+            // Left at `[tokens, heads, eff]` rather than swapped to
+            // `[heads, tokens, eff]`: the swap is a permuted VIEW, and every
+            // later reshape of a permuted view is a copy. The kernel takes the
+            // head stride as an argument instead, which costs an index multiply
+            // and moves no bytes.
+            let rel = r
+                .reshape([tokens * heads, d.d_rel])
+                .matmul(w.rel_proj.clone().slice([0..d.d_rel, 0..eff]))
+                .reshape([tokens, heads, eff])
+                * tau.reshape([tokens, 1, 1]);
+            let client = client_of(&q);
+            // Q, K, V and the relative table exactly as the projections left
+            // them: `[tokens, heads * head_dim]` and `[tokens, kv_heads *
+            // head_dim]`. The kernel indexes `h / groups` for the KV head, so
+            // the repeat that used to materialise two more
+            // `heads * tokens * head_dim` tensors does not happen here.
+            let q_h = handle_of(q);
+            // K DIMENSION-MAJOR, `[kv_heads, head_dim, tokens]`: the band's
+            // score phase has one unit per key walking every dimension, and in
+            // the `[tokens, kv_heads * head_dim]` layout that is 32 memory
+            // transactions per warp instruction instead of one. `handle_of`
+            // makes the permuted view contiguous, which is the transpose --
+            // one linear pass per layer against a quadratic saving.
+            let k_h = handle_of(
+                k.clone().reshape([tokens, kv_heads, head_dim]).swap_dims(0, 1).swap_dims(1, 2),
+            );
+            let v_h = handle_of(v.clone());
+            let rel_h = handle_of(rel);
+            let o = banded_attention_launch(
+                &client,
+                &q_h,
+                &k_h,
+                &v_h,
+                &rel_h,
+                tokens,
+                heads,
+                kv_heads,
+                head_dim,
+                eff,
+                win,
+                d.scaling(),
+            );
+            tensor_of(client, dev.clone(), o, tokens, heads * head_dim)
+        }
+        _ => {
+            // A global layer reads every key, so there is a square to compute.
+            // It does not have to be MATERIALISED square: the queries come in
+            // blocks of `rows`, and one block holds `[heads, rows, tokens]`
+            // instead of `[heads, tokens, tokens]`. Same arithmetic, same
+            // answer, same number of multiplies -- the only thing that changes
+            // is that the largest allocation grows linearly in the sequence
+            // rather than quadratically, and the per-buffer cap this device
+            // enforces stops being what decides how long an input may be.
+            use crate::models::inkling::budget::query_block;
+            use crate::models::inkling::scorebias::score_epilogue_launch;
+            use crate::models::inkling::seam::{
+                client_of, handle_of, strided_of3, tensor_of3, tensor_strided3,
+            };
+
+            // [heads, tokens, head_dim]; the KV heads are repeated in place, so
+            // head h reads kv head h / groups exactly as the slice lane indexes
+            // it.
+            let expand = |t: Tensor<Bk, 2>| -> Tensor<Bk, 3> {
+                t.reshape([tokens, kv_heads, head_dim])
+                    .swap_dims(0, 1)
+                    .reshape([kv_heads, 1, tokens, head_dim])
+                    .repeat_dim(1, groups)
+                    .reshape([heads, tokens, head_dim])
+            };
+            let qv = q.reshape([tokens, heads, head_dim]).swap_dims(0, 1);
+            let client = client_of(&qv);
+
+            // Q, K^T and V made contiguous ONCE, ahead of the loop. Every query
+            // block reads all of K and V, and a permuted view handed to the
+            // matmul is made contiguous BY the matmul -- which is the whole of
+            // it, per block, instead of once per layer.
+            let qh = {
+                let h = handle_of(qv);
+                tensor_of3(client.clone(), dev.clone(), h, heads, tokens, head_dim)
+            };
+            let kt = {
+                let h = handle_of(expand(k.clone()).swap_dims(1, 2));
+                tensor_of3(client.clone(), dev.clone(), h, heads, head_dim, tokens)
+            };
+            let vh = {
+                let h = handle_of(expand(v.clone()));
+                tensor_of3(client.clone(), dev.clone(), h, heads, tokens, head_dim)
+            };
+
+            let rel_proj = w.rel_proj.clone().slice([0..d.d_rel, 0..eff]);
+            // A parameter, not just `query_block`, because the only bug this
+            // change can introduce is a block that reads its query position
+            // LOCALLY, and that bug is invisible in block zero. A test needs to
+            // force several blocks at a shape small enough to check, and a
+            // process-global env var cannot do that while other tests run.
+            let block = block.unwrap_or_else(|| query_block(heads, tokens)).clamp(1, tokens);
+            let mut parts: Vec<Tensor<Bk, 2>> = Vec::with_capacity(tokens.div_ceil(block));
+            for lo in (0..tokens).step_by(block) {
+                let hi = (lo + block).min(tokens);
+                let rows = hi - lo;
+
+                // This block's relative table, `[rows, heads, eff]`, built here
+                // rather than sliced out of a whole-sequence one. The
+                // whole-sequence version is `tokens * heads * eff` floats --
+                // 13.2 GiB at 100k tokens, LARGER than the score block it feeds,
+                // and it would have become the ceiling the moment the scores
+                // stopped being it.
+                let rel = r
+                    .clone()
+                    .slice([lo..hi, 0..heads * d.d_rel])
+                    .reshape([rows * heads, d.d_rel])
+                    .matmul(rel_proj.clone())
+                    .reshape([rows, heads, eff])
+                    * tau.clone().slice([lo..hi]).reshape([rows, 1, 1]);
+
+                // `q_block @ k^T` raw, then scaled, biased and masked IN PLACE
+                // by one kernel. `handle_of` consumes the tensor, so after that
+                // line there is exactly one name for the buffer and writing
+                // through it is not aliasing.
+                //
+                // `lo` goes to the kernel because the causal predicate, the
+                // window and the relative distance are all functions of the
+                // ABSOLUTE query position. A block that used its local row
+                // index would attend to the wrong keys everywhere except block
+                // zero -- which is exactly the block a small test exercises.
+                let raw = qh.clone().slice([0..heads, lo..hi, 0..head_dim]).matmul(kt.clone());
+                let rel_h = handle_of(rel);
+                let (s_h, st) = strided_of3(raw);
+                score_epilogue_launch(
+                    &client,
+                    &s_h,
+                    &rel_h,
+                    heads,
+                    rows,
+                    lo,
+                    tokens,
+                    eff,
+                    st,
+                    d.scaling(),
+                    mask_window,
+                );
+                let scores =
+                    tensor_strided3(client.clone(), dev.clone(), s_h, [heads, rows, tokens], st);
+                let probs = burn::tensor::activation::softmax(scores, 2);
+                parts.push(
+                    probs.matmul(vh.clone()).swap_dims(0, 1).reshape([rows, heads * head_dim]),
+                );
+            }
+            // One block is the whole sequence at short context, and `cat` of a
+            // single tensor is a copy of it.
+            match parts.len() {
+                1 => parts.pop().expect("one block"),
+                _ => Tensor::cat(parts, 0),
             }
         }
-    }
-    let idx: Tensor<Bk, 3, Int> =
-        Tensor::from_data(TensorData::new(idx, [1, tokens, tokens]), &dev).repeat_dim(0, heads);
-    let valid: Tensor<Bk, 3> = Tensor::from_data(TensorData::new(valid, [1, tokens, tokens]), &dev);
-
-    let rel = r
-        .reshape([tokens * heads, d.d_rel])
-        .matmul(w.rel_proj.clone().slice([0..d.d_rel, 0..eff]))
-        .reshape([tokens, heads, eff])
-        .swap_dims(0, 1)
-        * tau.reshape([1, tokens, 1]);
-    let bias = rel.gather(2, idx) * valid;
-
-    // [heads, tokens, head_dim]; the KV heads are repeated in place, so head h
-    // reads kv head h / groups exactly as the slice lane indexes it.
-    let qh = q.reshape([tokens, heads, head_dim]).swap_dims(0, 1);
-    let expand = |t: Tensor<Bk, 2>| -> Tensor<Bk, 3> {
-        t.reshape([tokens, kv_heads, head_dim])
-            .swap_dims(0, 1)
-            .reshape([kv_heads, 1, tokens, head_dim])
-            .repeat_dim(1, groups)
-            .reshape([heads, tokens, head_dim])
     };
-    let kh = expand(k.clone());
-    let vh = expand(v.clone());
-
-    let scores = qh.matmul(kh.swap_dims(1, 2)).mul_scalar(d.scaling()) + bias
-        + mask.reshape([1, tokens, tokens]);
-    let probs = burn::tensor::activation::softmax(scores, 2);
-    let out = probs
-        .matmul(vh)
-        .swap_dims(0, 1)
-        .reshape([tokens, heads * head_dim]);
 
     let mut cache = AttnCache {
-        k,
-        v,
+        k: as_kv(k),
+        v: as_kv(v),
         k_pre: conv_history(k_pre, d.kernel),
         v_pre: conv_history(v_pre, d.kernel),
         base: 0,
+        pending: None,
     };
     trim(&mut cache, window);
     (linear_bf16(out, &w.wo), cache)
@@ -471,6 +784,130 @@ fn kv_pad_bucket() -> usize {
             .filter(|n| *n >= 1)
             .unwrap_or(64)
     })
+}
+
+/// Whether a KV cache HOLDS its keys and values as BF16, and multiplies them
+/// there.
+///
+/// **On by default; `INK_ATTN_BF16=0` is the wide arm.** It is a switch and not
+/// an unconditional change for one reason -- what it trades is precision, and
+/// the only honest way to price precision is to run both arms of the same
+/// binary against the same harness. It is on by default because it won that
+/// comparison, and because a default is what the unit tests below exercise.
+///
+/// Both caches, and only the CACHED reads. A prefill computes its scores from
+/// the keys it has just projected and never round-trips them through memory, so
+/// it has nothing to save and is left alone; every decode step reads its whole
+/// retained context back, and that read is what this narrows.
+///
+/// The argument is that the four bytes were never buying twenty-four mantissa
+/// bits. Burn's f32 matmul on this runtime is TF32
+/// ([`f32_matmul_is_tf32_on_this_runtime`], 9.3e-4 relative on a 128-deep
+/// product), so the PRODUCT already carries about ten; the four-byte load pays
+/// for twenty-three that the tensor cores then round away.
+///
+/// **A closer float is not a more correct one, and that is why there is no
+/// tolerance here.** The weights are 4-bit NVFP4; an f64 reference is not what
+/// anyone is trying to match, and a gate on numerical distance from one would
+/// measure a theorem rather than an outcome. What decides this lane is
+/// `golden/paired/`: the same prompts through the BF16 reference and through
+/// each arm of this runtime, reported as AGREEMENT and as LOSS with McNemar on
+/// the discordant pairs. A layer-RMS ladder is still worth a look as a smoke
+/// check -- a lane that has gone wrong emits garbage, not a moved fourth
+/// decimal -- but it is not the acceptance criterion.
+///
+/// The switch is a process-global `OnceLock`, so a test binary would get ONE
+/// lane and never exercise the other -- the wrong shape for a change whose
+/// whole subject is a comparison. [`CacheLane`] is the per-thread override that
+/// fixes it: the cached-lane tests below take `CacheLane::wide()` explicitly,
+/// because their tolerances are statements about two implementations of the
+/// same arithmetic and a narrow cache is not that, and
+/// `narrow_slots_are_still_independent` takes `CacheLane::narrow()` and asserts
+/// the one thing that holds exactly at any dtype.
+///
+/// What the two bytes buy is the term itself. The attention matmuls read the
+/// KV cache and almost nothing else: 6.0 GB a pass at 32 slots against 5.4 GB
+/// of slot KV, at 152 GB/s of a measured 236 GB/s bus, which is a
+/// bandwidth-bound lane and not an arithmetic one. Storing the cache narrow --
+/// rather than casting it per pass, which would ADD a full-width read -- halves
+/// what the lane moves AND halves what the run holds, and on this part the
+/// second of those is the ceiling: the slot KV is 15.04 GiB of the head at 96
+/// slots, on a node whose `MemAvailable` bottoms at 1.38 GiB there.
+pub fn attn_bf16() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INK_ATTN_BF16").map(|v| v != "0").unwrap_or(true))
+}
+
+thread_local! {
+    /// A per-thread override of [`attn_bf16`], for tests only.
+    ///
+    /// The env switch is a process-global `OnceLock`, which means a test binary
+    /// gets ONE lane and the other is never exercised. That is the wrong shape
+    /// for a change whose whole subject is a comparison between two lanes, and
+    /// it bites immediately: the cached-lane tests below assert that feeding one
+    /// token at a time reproduces feeding all of them, to a tolerance sized for
+    /// two implementations of the SAME arithmetic. A narrow cache is not the
+    /// same arithmetic -- it stores less -- so those tolerances are statements
+    /// about the wide lane and have to be able to say so.
+    ///
+    /// Rust runs each test on its own thread, so a thread-local is exactly the
+    /// scope: [`with_narrow`] wraps a test body and nothing outside it moves.
+    /// Production never sets it.
+    static NARROW: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether THIS thread's caches are narrow: the override if one is set, the
+/// process default otherwise.
+fn narrow_now() -> bool {
+    NARROW.with(|c| c.get()).unwrap_or_else(attn_bf16)
+}
+
+/// Force a cache dtype for as long as this value lives. Tests only.
+///
+/// A guard rather than a closure because it is a one-line addition at the top
+/// of a function body, where wrapping a body would reindent it and hide the
+/// change in the diff.
+#[cfg(test)]
+pub(crate) struct CacheLane(Option<bool>);
+
+#[cfg(test)]
+impl CacheLane {
+    /// The wide cache: what every tolerance in this module's cached tests was
+    /// written against.
+    pub(crate) fn wide() -> Self {
+        CacheLane(NARROW.with(|c| c.replace(Some(false))))
+    }
+
+    /// The narrow one.
+    pub(crate) fn narrow() -> Self {
+        CacheLane(NARROW.with(|c| c.replace(Some(true))))
+    }
+}
+
+#[cfg(test)]
+impl Drop for CacheLane {
+    fn drop(&mut self) {
+        NARROW.with(|c| c.set(self.0));
+    }
+}
+
+/// `t` in the dtype the KV cache is held in. The identity on the wide lane.
+fn as_kv<const D: usize>(t: Tensor<Bk, D>) -> Tensor<Bk, D> {
+    if narrow_now() {
+        t.cast(burn::tensor::FloatDType::BF16)
+    } else {
+        t
+    }
+}
+
+/// Back to f32, for the softmax and the residual stream. The identity on the
+/// wide lane.
+fn from_kv<const D: usize>(t: Tensor<Bk, D>) -> Tensor<Bk, D> {
+    if narrow_now() {
+        t.cast(burn::tensor::FloatDType::F32)
+    } else {
+        t
+    }
 }
 
 /// One generated token through one attention layer, reading the cache.
@@ -524,8 +961,8 @@ pub fn attention_step(
     let q = head_rms_norm(q, w.q_norm.clone(), heads, head_dim, d.rms_eps);
     let k_new = head_rms_norm(k_new, w.k_norm.clone(), kv_heads, head_dim, d.rms_eps);
 
-    cache.k = Tensor::cat(vec![cache.k.clone(), k_new], 0);
-    cache.v = Tensor::cat(vec![cache.v.clone(), v_new], 0);
+    cache.k = Tensor::cat(vec![cache.k.clone(), as_kv(k_new)], 0);
+    cache.v = Tensor::cat(vec![cache.v.clone(), as_kv(v_new)], 0);
     trim(cache, window);
     let len = cache.len();
     let base = cache.base;
@@ -618,15 +1055,774 @@ pub fn attention_step(
             return t;
         }
         let dim = t.dims()[1];
-        Tensor::cat(vec![t, Tensor::zeros([padded - len, dim], &dev)], 0)
+        Tensor::cat(vec![t, as_kv(Tensor::zeros([padded - len, dim], &dev))], 0)
     };
     let kh = expand(pad_rows(cache.k.clone()));
     let vh = expand(pad_rows(cache.v.clone()));
 
-    let scores = qh.matmul(kh.swap_dims(1, 2)).mul_scalar(d.scaling()) + bias + wmask;
+    // Narrow on both sides of each product and wide again immediately after, so
+    // the bias, the mask and the softmax are the same arithmetic the f32 lane
+    // runs. The scores are `[heads, 1, padded]`; the cache is the megabytes.
+    let scores =
+        from_kv(as_kv(qh).matmul(kh.swap_dims(1, 2))).mul_scalar(d.scaling()) + bias + wmask;
     let probs = burn::tensor::activation::softmax(scores, 2);
-    let out = probs.matmul(vh).swap_dims(0, 1).reshape([1, heads * head_dim]);
+    let out =
+        from_kv(as_kv(probs).matmul(vh)).swap_dims(0, 1).reshape([1, heads * head_dim]);
     linear_bf16(out, &w.wo)
+}
+
+/// SEVERAL generated positions through one attention layer, reading the cache.
+///
+/// [`attention_step`] with `rows > 1`, which is the shape speculative decoding
+/// verifies in: the accepted token followed by `k` drafts, all attending to a
+/// prefix the cache already holds and to each other causally. It is a separate
+/// function rather than a relaxed assertion on that one because everything
+/// per-position becomes per-ROW — the log-scaling factor, the relative
+/// distance, the visibility of every other new row — and a one-row function
+/// that happens to work for two is a function whose mask nobody checked.
+///
+/// `pos0` is the ABSOLUTE position of row 0; row `i` sits at `pos0 + i`.
+///
+/// The batch is left PENDING: nothing is trimmed and nothing is final until
+/// [`AttnCache::commit`] says how many of these rows the verifier kept. A
+/// caller that forgets to commit gets a cache that grows past its window, which
+/// the next call's `pending` assertion turns into a failure rather than a slow
+/// leak.
+pub fn attention_steps(
+    x: Tensor<Bk, 2>,
+    w: &AttnWeightsDev,
+    d: &crate::models::inkling::attn::AttnDims,
+    log_scaling: Option<crate::models::inkling::attn::LogScaling>,
+    pos0: usize,
+    window: Option<usize>,
+    cache: &mut AttnCache<Bk>,
+) -> Tensor<Bk, 2> {
+    use crate::models::inkling::config::AttnKind;
+
+    let [rows, hidden] = x.dims();
+    assert!(rows >= 1, "a batched step feeds at least one token");
+    assert_eq!(hidden, d.hidden, "x is [_, {hidden}] but the config says {}", d.hidden);
+    assert!(pos0 >= cache.base + cache.len(), "position {pos0} is already cached");
+    assert!(cache.pending.is_none(), "a speculative batch is still uncommitted");
+    let dev = x.device();
+    let (heads, kv_heads, head_dim) = (d.heads, d.kv_heads, d.head_dim);
+    let groups = d.groups();
+    assert_eq!(groups * kv_heads, heads, "{heads} heads do not divide into {kv_heads} kv heads");
+
+    let q = linear_bf16(x.clone(), &w.wq);
+    // The convolution over the batch, taps and all: the `kernel - 1` history
+    // rows the cache carries, then this batch's own projections. Rows
+    // `kernel - 1 ..` of that see a full window of real inputs, which is
+    // exactly the rows this batch is asking for — the front-padding
+    // [`short_conv`] applies is never reached.
+    let k_all = Tensor::cat(vec![cache.k_pre.clone(), linear_bf16(x.clone(), &w.wk)], 0);
+    let v_all = Tensor::cat(vec![cache.v_pre.clone(), linear_bf16(x.clone(), &w.wv)], 0);
+    let hist = d.kernel - 1;
+    let kdim = k_all.dims()[1];
+    let vdim = v_all.dims()[1];
+    // The batched kernel, not [`short_conv`] over the concatenation: this is
+    // the second and third of the four convolutions a widened pass runs per
+    // layer, and the shifted-slice form is what made a two-row pass cost 1.6x
+    // a one-row one.
+    let k_new = short_conv_window(k_all.clone(), w.k_sconv.clone(), rows);
+    let v_new = short_conv_window(v_all.clone(), w.v_sconv.clone(), rows);
+    let r = linear_bf16(x, &w.wr);
+
+    let q = head_rms_norm(q, w.q_norm.clone(), heads, head_dim, d.rms_eps);
+    let k_new = head_rms_norm(k_new, w.k_norm.clone(), kv_heads, head_dim, d.rms_eps);
+
+    cache.k = Tensor::cat(vec![cache.k.clone(), as_kv(k_new)], 0);
+    cache.v = Tensor::cat(vec![cache.v.clone(), as_kv(v_new)], 0);
+    cache.k_pre = k_all.clone().slice([rows..rows + hist, 0..kdim]);
+    cache.v_pre = v_all.clone().slice([rows..rows + hist, 0..vdim]);
+    cache.pending = Some(Pending { k_pre: k_all, v_pre: v_all, rows });
+
+    let len = cache.len();
+    let base = cache.base;
+    let bucket = kv_pad_bucket();
+    let padded = len.next_multiple_of(bucket);
+
+    let taus: Vec<f32> = (0..rows)
+        .map(|i| match (d.kind, log_scaling) {
+            (AttnKind::Global, Some(ls)) => ls.tau(pos0 + i),
+            _ => 1.0,
+        })
+        .collect();
+    let tau: Tensor<Bk, 1> = Tensor::from_data(TensorData::new(taus, [rows]), &dev);
+    let q = q * tau.clone().reshape([rows, 1]);
+
+    // One row of [`attention_step`]'s tables per new position. Three things at
+    // once, and all three are per (row, key): whether the relative table
+    // reaches that far, whether the window admits it, and — new here, because a
+    // one-row step could not need it — whether the key is in the row's FUTURE.
+    // Causality inside the batch is not structural the way it is for a single
+    // position, and the drafts are exactly the keys a wrong sign would leak.
+    let mut idx = vec![0i32; rows * padded];
+    let mut valid = vec![0f32; rows * padded];
+    let mut wmask = vec![0f32; rows * padded];
+    let mut max_dist = 0usize;
+    for i in 0..rows {
+        let pos = pos0 + i;
+        for j in 0..padded {
+            let cell = i * padded + j;
+            if j >= len {
+                wmask[cell] = f32::NEG_INFINITY;
+                continue;
+            }
+            let abs = base + j;
+            if abs > pos {
+                wmask[cell] = f32::NEG_INFINITY;
+                continue;
+            }
+            let dist = pos - abs;
+            if dist < d.rel_extent {
+                idx[cell] = dist as i32;
+                valid[cell] = 1.0;
+            }
+            if window.is_some_and(|wnd| dist >= wnd) {
+                wmask[cell] = f32::NEG_INFINITY;
+            }
+            max_dist = max_dist.max(dist);
+        }
+    }
+    let eff = d.rel_extent.min(max_dist + 1).next_multiple_of(bucket).min(d.rel_extent);
+    let idx: Tensor<Bk, 3, Int> =
+        Tensor::from_data(TensorData::new(idx, [1, rows, padded]), &dev).repeat_dim(0, heads);
+    let valid: Tensor<Bk, 3> =
+        Tensor::from_data(TensorData::new(valid, [1, rows, padded]), &dev);
+    let wmask: Tensor<Bk, 3> =
+        Tensor::from_data(TensorData::new(wmask, [1, rows, padded]), &dev);
+
+    let rel = (r
+        .reshape([rows * heads, d.d_rel])
+        .matmul(w.rel_proj.clone().slice([0..d.d_rel, 0..eff]))
+        .reshape([rows, heads, eff])
+        .swap_dims(0, 1))
+        * tau.reshape([1, rows, 1]);
+    let bias = rel.gather(2, idx) * valid;
+
+    let qh = q.reshape([rows, heads, head_dim]).swap_dims(0, 1);
+    let expand = |t: Tensor<Bk, 2>| -> Tensor<Bk, 3> {
+        t.reshape([padded, kv_heads, head_dim])
+            .swap_dims(0, 1)
+            .reshape([kv_heads, 1, padded, head_dim])
+            .repeat_dim(1, groups)
+            .reshape([heads, padded, head_dim])
+    };
+    let pad_rows = |t: Tensor<Bk, 2>| -> Tensor<Bk, 2> {
+        if padded == len {
+            return t;
+        }
+        let dim = t.dims()[1];
+        Tensor::cat(vec![t, as_kv(Tensor::zeros([padded - len, dim], &dev))], 0)
+    };
+    let kh = expand(pad_rows(cache.k.clone()));
+    let vh = expand(pad_rows(cache.v.clone()));
+
+    let scores =
+        from_kv(as_kv(qh).matmul(kh.swap_dims(1, 2))).mul_scalar(d.scaling()) + bias + wmask;
+    let probs = burn::tensor::activation::softmax(scores, 2);
+    let out =
+        from_kv(as_kv(probs).matmul(vh)).swap_dims(0, 1).reshape([rows, heads * head_dim]);
+    linear_bf16(out, &w.wo)
+}
+
+/// One position of the short convolution for `slots` INDEPENDENT sequences.
+///
+/// [`short_conv_step`] with a slot dimension. `hist` is
+/// `[slots, kernel - 1, dim]` and `x` is `[slots, dim]`; the returned history
+/// is the one to carry into the next position of each slot.
+///
+/// Not [`short_conv_steps`] with `rows = slots`: that function's rows are
+/// CONSECUTIVE positions of one sequence and overlap by `kernel - 1`, so it
+/// would convolve slot `s`'s output out of slot `s - 1`'s inputs. The result
+/// still reads as fluent text, which is exactly why the two shapes need
+/// different functions rather than one function and a comment.
+pub fn short_conv_slot_step(
+    hist: Tensor<Bk, 3>,
+    x: Tensor<Bk, 2>,
+    weight: Tensor<Bk, 2>,
+) -> (Tensor<Bk, 2>, Tensor<Bk, 3>) {
+    let [slots, dim] = x.dims();
+    let [wdim, kernel] = weight.dims();
+    assert_eq!(dim, wdim, "short_conv_slot_step: x is [_, {dim}] but the weight is [{wdim}, _]");
+    assert_eq!(
+        hist.dims(),
+        [slots, kernel - 1, dim],
+        "each of the {slots} slots needs its own {} history rows",
+        kernel - 1
+    );
+    let client = client_of(&x);
+    let dev = x.device();
+    let (h_hist, h_x, h_w) = (handle_of(hist), handle_of(x), handle_of(weight));
+    let (out, next) = crate::models::inkling::sconv::short_conv_slots(
+        &client, &h_hist, &h_x, &h_w, dim, slots, kernel,
+    );
+    (
+        tensor_of(client.clone(), dev.clone(), out, slots, dim),
+        tensor_of3(client, dev, next, slots, kernel - 1, dim),
+    )
+}
+
+/// The attention state of `b` INDEPENDENT decode slots, advancing in lockstep.
+///
+/// [`AttnCache`] is one sequence's keys and values; this is `b` of them, and
+/// the difference from [`attention_steps`] — which also takes several rows — is
+/// the whole point. That function's rows are consecutive positions of ONE
+/// sequence: they share a cache, row `i` sits at `pos0 + i`, and its mask
+/// admits every earlier row of the batch. These rows are `b` sequences that
+/// share nothing but the weights.
+///
+/// ## The block-diagonal mask is the batch dimension
+///
+/// Batched decode is usually described as wanting "a block-diagonal mask
+/// instead of a causal one", and that is true of a layout that concatenates the
+/// slots along the KEY axis. This one does not: K and V are held
+/// `[slots * kv_heads, cap, head_dim]` and the scores are a BATCHED matmul over
+/// that leading axis, so slot `s`'s query multiplies slot `s`'s keys and no
+/// others. The separation is structural — there is no mask element whose sign
+/// could be wrong, and no way to write one that leaks — and what is left for
+/// the mask to say is exactly what a single-row step's mask says: how far the
+/// relative table reaches, and what the sliding window admits.
+///
+/// ## Head-major, and why the layout is not [`AttnCache`]'s
+///
+/// [`AttnCache`] holds K as `[len, kv_heads * head_dim]` and expands it to
+/// `[heads, len, head_dim]` per step, repeating each KV head `groups` times so
+/// the score matmul can be one batched GEMM over `heads`. At one row that
+/// materialises 63 MB a layer at a 3.8k context; at eight slots it would be
+/// 500 MB a layer, twice (K and V), on every layer of every step — about 12 GB
+/// of pure copy per pass, which would have priced the b-th cache read at
+/// something that was never about the cache.
+///
+/// So the slot cache is head-major from the start, `[slots * kv_heads, cap,
+/// head_dim]`, and the GQA repetition moves to the QUERY side where it is free:
+/// the `groups` queries that share a KV head become the `m` rows of that head's
+/// GEMM instead of `groups` copies of its keys. `q` reshapes to
+/// `[slots * kv_heads, groups, head_dim]` with no transpose at all, because
+/// head `h` is `kv_h * groups + g` and that is exactly the order a `[slots,
+/// heads * head_dim]` projection is already in.
+///
+/// ## `cap` against `len`
+///
+/// The tensors are allocated to `cap`, a multiple of the KV pad bucket, and
+/// only `len` of those rows are real. Appending is then a `slice_assign` of one
+/// row rather than a `cat` that copies the whole cache, and the bucket-sized
+/// growth keeps cubecl's compiled-kernel cache keyed on a handful of shapes for
+/// the same reason [`attention_step`] rounds its context length up. The rows
+/// between `len` and `cap` are ZERO, not uninitialised: they score nothing
+/// against any query, but they are also multiplied by a probability of exactly
+/// zero, and `0 * NaN` is NaN.
+///
+/// ## What is deliberately not here
+///
+/// A slot scheduler. Every slot holds the same number of keys and stands at the
+/// same absolute position, because they were prefilled with prompts of the same
+/// length and advance one token per pass together. Admission, eviction and
+/// ragged lengths are a layer above this and would want a per-slot `len` and a
+/// key-axis mask to go with it; nothing here would have to change shape for
+/// that, which is why it is worth building the rectangular case first.
+pub struct SlotCache<B: Backend> {
+    /// `[slots * kv_heads, kcap, head_dim]`, post-convolution and
+    /// post-QK-norm. The first `frozen` rows are real; the rest are the pad the
+    /// prefill was widened by and are masked.
+    k: Tensor<B, 3>,
+    v: Tensor<B, 3>,
+    /// `[slots * kv_heads, recent_rows(), head_dim]`: the rows written since
+    /// the last merge. The first `recent` are real and the rest are zero.
+    kr: Tensor<B, 3>,
+    vr: Tensor<B, 3>,
+    /// `[slots, kernel - 1, kv_heads * head_dim]` — the short convolution's
+    /// memory, per slot, PRE-convolution. Same reason [`AttnCache`] keeps it:
+    /// the next position's taps reach back into projections the cached K and V
+    /// cannot reconstruct.
+    k_pre: Tensor<B, 3>,
+    v_pre: Tensor<B, 3>,
+    slots: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    /// Real rows at the front of `k`/`v`.
+    frozen: usize,
+    /// Rows allocated in `k`/`v`. Equal to `frozen` after any merge; larger
+    /// only between [`SlotCache::from_prefills`] and the first one.
+    kcap: usize,
+    /// Real rows in `kr`/`vr`, at most [`recent_rows`].
+    recent: usize,
+    /// Absolute position of frozen row 0.
+    base: usize,
+}
+
+/// Rows the recent half holds before it is merged into the frozen half.
+///
+/// Two KV pad buckets. It is the amortisation constant of the whole layout: a
+/// step rewrites one of these rows and a merge rewrites the context, so the
+/// copy per step is `L / recent_rows()` rows rather than `L`.
+fn recent_rows() -> usize {
+    2 * kv_pad_bucket()
+}
+
+impl<B: Backend> SlotCache<B> {
+    /// Keys retained per slot — *not* the sequence length, because a windowed
+    /// layer forgets.
+    pub fn len(&self) -> usize {
+        self.frozen + self.recent
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Absolute position of row 0.
+    pub fn base(&self) -> usize {
+        self.base
+    }
+
+    pub fn slots(&self) -> usize {
+        self.slots
+    }
+}
+
+/// Move a tensor out of a field so the op that consumes it can do so IN PLACE.
+///
+/// `t.clone().slice_assign(..)` leaves two live references to the same buffer,
+/// and Burn answers that by copying the whole tensor before writing one row of
+/// it. The placeholder is `Tensor::empty`, an allocation and no kernel, and it
+/// is overwritten before anything can read it.
+fn take3<B: Backend>(slot: &mut Tensor<B, 3>, dev: &B::Device) -> Tensor<B, 3> {
+    std::mem::replace(slot, Tensor::empty([1, 1, 1], dev))
+}
+
+/// Write one slot's row into a `[slots, ..]` batch, in place.
+///
+/// `take3` first, because `dst.clone().slice_assign(..)` leaves two live
+/// references to the same buffer and Burn answers that by copying the whole
+/// batch to write one row of it.
+pub fn seat_row3(dst: &mut Tensor<Bk, 3>, s: usize, src: Tensor<Bk, 3>) {
+    let [slots, a, b] = dst.dims();
+    assert!(s < slots, "slot {s} of a {slots}-slot batch");
+    assert_eq!(src.dims(), [1, a, b], "a seated row is one slot of [{a}, {b}]");
+    let dev = src.device();
+    let d = take3(dst, &dev);
+    *dst = d.slice_assign([s..s + 1, 0..a, 0..b], src);
+}
+
+/// A `[slots, ..]` batch with slot 0's row in it and the rest zero.
+pub fn seat_first3(slots: usize, src: Tensor<Bk, 3>) -> Tensor<Bk, 3> {
+    let [one, a, b] = src.dims();
+    assert_eq!(one, 1, "a seated row is one slot");
+    let mut dst: Tensor<Bk, 3> = Tensor::zeros([slots, a, b], &src.device());
+    seat_row3(&mut dst, 0, src);
+    dst
+}
+
+impl SlotCache<Bk> {
+    /// An empty `slots`-wide batch shaped by the FIRST prefilled slot, with
+    /// that slot already seated.
+    ///
+    /// The prefills run one at a time — a prefill is compute-bound and gains
+    /// nothing from a batch — and this is the seam where they become a batch.
+    /// Every slot must hold the same number of keys and start at the same
+    /// absolute position: that is what makes the rectangular layout legal, and
+    /// it is guaranteed by prompts of equal length rather than assumed, one
+    /// slot at a time in [`SlotCache::seat`].
+    ///
+    /// # Why the batch is built now and not when the b-th prefill lands
+    ///
+    /// It used to take all `b` finished caches at once, and holding them was
+    /// the most expensive thing this lane did. A prefilled `AttnCache` is not
+    /// the `keep * kv_width * 4` bytes its contents come to — measured on the
+    /// 21-layer head at eight slots and a 3732-token prompt, each one held
+    /// **3.59 GiB**, against 0.16 GiB of keys and values, and the `cat` in here
+    /// is what collapsed it. Eight of those is 28.7 GiB on a node with 25.8 GiB
+    /// of headroom, so the sixth prefill ran the machine out of memory: the
+    /// first five took 6.7 s each and the sixth through eighth took 118 s,
+    /// 244 s and 57 s, the box swapped, and the decode that followed spent
+    /// dozens of passes climbing back out.
+    ///
+    /// Seating each slot the moment it is prefilled makes the batch the ONLY
+    /// long-lived allocation, and it is made once, from slot 0, before any of
+    /// the churn. Every later prefill leaves nothing behind.
+    pub fn seeded(
+        slots: usize,
+        first: AttnCache<Bk>,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> SlotCache<Bk> {
+        assert!(slots >= 1, "a slot batch has at least one slot");
+        let len = first.len();
+        let base = first.base();
+        let kernel_hist = first.k_pre.dims()[0];
+        let kv_width = kv_heads * head_dim;
+        let dev = first.k.device();
+        let rows = slots * kv_heads;
+        let rec = recent_rows();
+        let kcap = (len + 1).next_multiple_of(kv_pad_bucket());
+        let mut c = SlotCache {
+            // K and V are the bytes this lane moves and the bytes it holds;
+            // `k_pre`/`v_pre` are `kernel - 1` rows and stay f32, because they
+            // feed a convolution whose output is normed and would pay the
+            // rounding twice.
+            k: as_kv(Tensor::zeros([rows, kcap, head_dim], &dev)),
+            v: as_kv(Tensor::zeros([rows, kcap, head_dim], &dev)),
+            kr: as_kv(Tensor::zeros([rows, rec, head_dim], &dev)),
+            vr: as_kv(Tensor::zeros([rows, rec, head_dim], &dev)),
+            k_pre: Tensor::zeros([slots, kernel_hist, kv_width], &dev),
+            v_pre: Tensor::zeros([slots, kernel_hist, kv_width], &dev),
+            slots,
+            kv_heads,
+            head_dim,
+            frozen: len,
+            kcap,
+            recent: 0,
+            base,
+        };
+        c.seat(0, first);
+        c
+    }
+
+    /// Seat one prefilled slot.
+    ///
+    /// The shape agreement the rectangular layout needs, checked against the
+    /// slot that defined it rather than across a batch that is all present at
+    /// once.
+    pub fn seat(&mut self, s: usize, c: AttnCache<Bk>) {
+        assert!(s < self.slots, "slot {s} of a {}-slot batch", self.slots);
+        assert_eq!(c.len(), self.frozen, "slot {s} holds {} keys against slot 0's {}",
+                   c.len(), self.frozen);
+        assert_eq!(c.base(), self.base, "slot {s} starts at {} against slot 0's {}",
+                   c.base(), self.base);
+        let (kv_heads, head_dim, kcap, len) =
+            (self.kv_heads, self.head_dim, self.kcap, self.frozen);
+        let kv_width = kv_heads * head_dim;
+        assert_eq!(c.k.dims()[1], kv_width, "slot {s} was built at a different layer shape");
+        let dev = c.k.device();
+        let kernel_hist = c.k_pre.dims()[0];
+
+        // `[len, kv_heads * head_dim]` -> `[kv_heads, kcap, head_dim]`. Every
+        // later step writes and reads head-major and transposes nothing.
+        //
+        // The pad is not optional and not for the mask's benefit. `swap_dims`
+        // returns a permuted VIEW, and this runtime fails to `slice_assign` one
+        // — CUDA_ERROR_INVALID_VALUE and no other symptom. Concatenating the
+        // pad along dim 1 materialises the permutation, so what reaches the
+        // batch is a real layout. The tell was that only prefill lengths which
+        // were a multiple of the KV pad bucket died — exactly the ones with
+        // nothing to pad.
+        let headwise = |t: Tensor<Bk, 2>| -> Tensor<Bk, 3> {
+            // The pad is narrowed with the body rather than after it: `cat`
+            // over two dtypes is a promotion nobody asked for, and the seam
+            // between a BF16 cache and an f32 zero block is exactly where one
+            // would happen unnoticed.
+            let pad: Tensor<Bk, 3> = as_kv(Tensor::zeros([kv_heads, kcap - len, head_dim], &dev));
+            let body = as_kv(t.reshape([len, kv_heads, head_dim]).swap_dims(0, 1));
+            Tensor::cat(vec![body, pad], 1)
+        };
+        let r0 = s * kv_heads;
+        let k = take3(&mut self.k, &dev);
+        self.k = k.slice_assign([r0..r0 + kv_heads, 0..kcap, 0..head_dim], headwise(c.k));
+        let v = take3(&mut self.v, &dev);
+        self.v = v.slice_assign([r0..r0 + kv_heads, 0..kcap, 0..head_dim], headwise(c.v));
+        seat_row3(&mut self.k_pre, s, c.k_pre.reshape([1, kernel_hist, kv_width]));
+        seat_row3(&mut self.v_pre, s, c.v_pre.reshape([1, kernel_hist, kv_width]));
+    }
+
+    /// `b` prefilled single-sequence caches, stacked into one slot batch.
+    ///
+    /// What [`SlotCache::seeded`] and [`SlotCache::seat`] do over the b prefill
+    /// passes, done at once. Only the tests use it: it is the shortest way to
+    /// say "these b caches, as a batch" when all b are already in hand, and the
+    /// run cannot afford to hold all b.
+    pub fn from_prefills(
+        caches: Vec<AttnCache<Bk>>,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> SlotCache<Bk> {
+        assert!(!caches.is_empty(), "a slot batch has at least one slot");
+        let slots = caches.len();
+        let mut it = caches.into_iter();
+        let first = it.next().expect("a slot batch has at least one slot");
+        let mut batch = SlotCache::seeded(slots, first, kv_heads, head_dim);
+        for (s, c) in it.enumerate() {
+            batch.seat(s + 1, c);
+        }
+        batch
+    }
+
+    /// Append one key and value per slot.
+    ///
+    /// Into the recent half, which is [`recent_rows`] wide however long the
+    /// context is. That is the point of the split: `slice_assign` copies the
+    /// tensor it writes into whenever anything else still holds a reference to
+    /// it, and at eight slots and a 3.8k context the whole cache is 126 MB a
+    /// tensor — 5.3 GB of copy a pass over 21 layers, and 20 GiB of allocator
+    /// pages to hold it, on a node with 24 GiB of headroom. Written this way a
+    /// step touches 4 MB and the context is copied once every
+    /// [`recent_rows`] steps.
+    fn push(&mut self, k_new: Tensor<Bk, 2>, v_new: Tensor<Bk, 2>) {
+        let rows = self.slots * self.kv_heads;
+        let hd = self.head_dim;
+        let rec = recent_rows();
+        let dev = k_new.device();
+        if self.recent == rec {
+            self.merge();
+        }
+        let r = self.recent;
+        let kn = as_kv(k_new.reshape([rows, 1, hd]));
+        let vn = as_kv(v_new.reshape([rows, 1, hd]));
+        let kr = take3(&mut self.kr, &dev);
+        let vr = take3(&mut self.vr, &dev);
+        self.kr = kr.slice_assign([0..rows, r..r + 1, 0..hd], kn);
+        self.vr = vr.slice_assign([0..rows, r..r + 1, 0..hd], vn);
+        self.recent += 1;
+    }
+
+    /// Fold the recent half into the frozen one.
+    ///
+    /// The one place the whole context is copied, and it happens once every
+    /// [`recent_rows`] steps. The recent half is FULL here — a partial merge
+    /// would put a zero row inside the frozen half, where no mask covers it.
+    fn merge(&mut self) {
+        let rec = recent_rows();
+        assert_eq!(self.recent, rec, "a partial recent half has zero rows in it");
+        let rows = self.slots * self.kv_heads;
+        let hd = self.head_dim;
+        let dev = self.k.device();
+        let frozen = self.frozen;
+        let k = take3(&mut self.k, &dev);
+        let v = take3(&mut self.v, &dev);
+        let kr = take3(&mut self.kr, &dev);
+        let vr = take3(&mut self.vr, &dev);
+        // The pad the prefill was widened by, and anything a trim left behind,
+        // go here: the frozen half is sliced to its real rows on the way in, so
+        // after a merge `kcap` is `frozen` and every column is a key.
+        let real = |t: Tensor<Bk, 3>| t.slice([0..rows, 0..frozen, 0..hd]);
+        self.k = Tensor::cat(vec![real(k), kr], 1);
+        self.v = Tensor::cat(vec![real(v), vr], 1);
+        self.kr = as_kv(Tensor::zeros([rows, rec, hd], &dev));
+        self.vr = as_kv(Tensor::zeros([rows, rec, hd], &dev));
+        self.frozen = frozen + rec;
+        self.kcap = self.frozen;
+        self.recent = 0;
+    }
+
+    /// Drop the keys no future query can reach — in whole [`recent_rows`]
+    /// chunks.
+    ///
+    /// [`trim`] drops down to exactly `window` rows every step, which is a copy
+    /// of the whole cache per layer per step; here the extra rows past the
+    /// window are masked to `-inf` anyway, so the trim waits until it has a
+    /// chunk's worth to move and rides the same amortisation as the merge. The
+    /// cost of the delay is that `len` may exceed `window`, which is why the
+    /// window predicate below is on the DISTANCE and not on the row count.
+    fn trim(&mut self, window: Option<usize>) {
+        let Some(w) = window else { return };
+        let len = self.len();
+        if len <= w {
+            return;
+        }
+        let rec = recent_rows();
+        let drop = ((len - w) / rec * rec).min(self.frozen);
+        if drop == 0 {
+            return;
+        }
+        let rows = self.slots * self.kv_heads;
+        let (kcap, hd) = (self.kcap, self.head_dim);
+        let dev = self.k.device();
+        let k = take3(&mut self.k, &dev);
+        let v = take3(&mut self.v, &dev);
+        self.k = k.slice([0..rows, drop..kcap, 0..hd]);
+        self.v = v.slice([0..rows, drop..kcap, 0..hd]);
+        self.frozen -= drop;
+        self.kcap -= drop;
+        self.base += drop;
+    }
+}
+
+/// `b` INDEPENDENT sequences, one generated position each, through one
+/// attention layer.
+///
+/// The batched-decode twin of [`attention_step`], and everything that separates
+/// it from [`attention_steps`] is in [`SlotCache`]'s header: these rows do not
+/// see each other, at all, because they are not in each other's key axis.
+///
+/// `pos` is the absolute position of the row every slot is about to write, and
+/// it is one number rather than `b` of them because the slots advance in
+/// lockstep from prompts of equal length — see [`SlotCache`]. Log scaling and
+/// the relative bias are functions of that position, so they are the same
+/// scalar for every slot, which is the only place the uniformity is used.
+///
+/// ## The softmax is split because the cache is
+///
+/// The keys arrive in two tensors, the frozen context and the last `RECENT`
+/// rows, and joining them to run one softmax would copy the context every step
+/// — which is the copy the split exists to remove. So the softmax is taken
+/// across both halves without joining them: one max, one denominator, and the
+/// two value products added. That is the same arithmetic a single softmax
+/// performs, in the same stable form, and it is the reason the split costs a
+/// second matmul rather than a second pass over the context.
+pub fn attention_slots(
+    x: Tensor<Bk, 2>,
+    w: &AttnWeightsDev,
+    d: &crate::models::inkling::attn::AttnDims,
+    log_scaling: Option<crate::models::inkling::attn::LogScaling>,
+    pos: usize,
+    window: Option<usize>,
+    cache: &mut SlotCache<Bk>,
+) -> Tensor<Bk, 2> {
+    use crate::models::inkling::config::AttnKind;
+
+    let [slots, hidden] = x.dims();
+    assert_eq!(slots, cache.slots, "x has {slots} rows against a {}-slot cache", cache.slots);
+    assert_eq!(hidden, d.hidden, "x is [_, {hidden}] but the config says {}", d.hidden);
+    assert!(pos >= cache.base + cache.len(), "position {pos} is already cached");
+    let dev = x.device();
+    let (heads, kv_heads, head_dim) = (d.heads, d.kv_heads, d.head_dim);
+    let groups = d.groups();
+    assert_eq!(groups * kv_heads, heads, "{heads} heads do not divide into {kv_heads} kv heads");
+    assert_eq!(kv_heads, cache.kv_heads, "this cache was built at a different layer shape");
+
+    let q = linear_bf16(x.clone(), &w.wq);
+    let (k_new, k_hist) = short_conv_slot_step(
+        cache.k_pre.clone(),
+        linear_bf16(x.clone(), &w.wk),
+        w.k_sconv.clone(),
+    );
+    let (v_new, v_hist) = short_conv_slot_step(
+        cache.v_pre.clone(),
+        linear_bf16(x.clone(), &w.wv),
+        w.v_sconv.clone(),
+    );
+    cache.k_pre = k_hist;
+    cache.v_pre = v_hist;
+    let r = linear_bf16(x, &w.wr);
+
+    let q = head_rms_norm(q, w.q_norm.clone(), heads, head_dim, d.rms_eps);
+    let k_new = head_rms_norm(k_new, w.k_norm.clone(), kv_heads, head_dim, d.rms_eps);
+
+    cache.trim(window);
+    cache.push(k_new, v_new);
+    let (frozen, kcap, base) = (cache.frozen, cache.kcap, cache.base);
+    let rec = recent_rows();
+    let cap = kcap + rec;
+    let rows = slots * kv_heads;
+
+    let tau = match (d.kind, log_scaling) {
+        (AttnKind::Global, Some(ls)) => ls.tau(pos),
+        _ => 1.0,
+    };
+
+    // One row of what the prefill lane builds as a [tokens, tokens] table, and
+    // it is one row for every slot: the backward distance to each retained key,
+    // whether the relative table reaches that far, and whether the window
+    // admits it. The slots share it because they share `pos` and `base`.
+    //
+    // Built over `cap` — the frozen rows followed by the WHOLE recent half —
+    // because column `j` of the concatenation is at absolute position
+    // `base + j` for every j below `len`, and the rows above it are the recent
+    // half's unwritten tail. Those carry index 0 (in range for the gather,
+    // multiplied out by `valid = 0`) and `-inf` in the mask.
+    let mut idx = vec![0i32; cap];
+    let mut valid = vec![0f32; cap];
+    let mut wmask = vec![0f32; cap];
+    let mut max_dist = 0usize;
+    for (j, cell) in wmask.iter_mut().enumerate() {
+        // Column `j` of the frozen half is at `base + j` while `j < frozen`;
+        // column `kcap + i` of the recent half is at `base + frozen + i`. The
+        // gap between them is the prefill's pad and is not a key.
+        let at = if j < kcap {
+            if j >= frozen {
+                *cell = f32::NEG_INFINITY;
+                continue;
+            }
+            j
+        } else if j - kcap < cache.recent {
+            frozen + (j - kcap)
+        } else {
+            *cell = f32::NEG_INFINITY;
+            continue;
+        };
+        let dist = pos - (base + at);
+        // Rows the chunked trim has not got around to dropping yet. They are
+        // masked exactly as a key that left the window mid-batch would be, and
+        // they are excluded from `max_dist` so the relative table stays the
+        // width the single-row lane would have built.
+        if window.is_some_and(|wnd| dist >= wnd) {
+            *cell = f32::NEG_INFINITY;
+            continue;
+        }
+        if dist < d.rel_extent {
+            idx[j] = dist as i32;
+            valid[j] = 1.0;
+        }
+        max_dist = max_dist.max(dist);
+    }
+    let bucket = kv_pad_bucket();
+    let eff = d.rel_extent.min(max_dist + 1).next_multiple_of(bucket).min(d.rel_extent);
+
+    let rel = r
+        .reshape([slots * heads, d.d_rel])
+        .matmul(w.rel_proj.clone().slice([0..d.d_rel, 0..eff]))
+        .reshape([rows, groups, eff])
+        .mul_scalar(tau);
+
+    // The two halves of every per-key table, so neither half of the scores has
+    // to be joined to the other.
+    let table = |from: usize, to: usize| -> (Tensor<Bk, 3>, Tensor<Bk, 3>) {
+        let n = to - from;
+        let i: Tensor<Bk, 3, Int> =
+            Tensor::from_data(TensorData::new(idx[from..to].to_vec(), [1, 1, n]), &dev)
+                .repeat_dim(0, rows)
+                .repeat_dim(1, groups);
+        let vt: Tensor<Bk, 3> =
+            Tensor::from_data(TensorData::new(valid[from..to].to_vec(), [1, 1, n]), &dev);
+        let m: Tensor<Bk, 3> =
+            Tensor::from_data(TensorData::new(wmask[from..to].to_vec(), [1, 1, n]), &dev);
+        (rel.clone().gather(2, i) * vt, m)
+    };
+
+    // The GQA repetition, on the query side: the `groups` heads that share KV
+    // head `kv_h` are the `m` rows of its GEMM. `[slots, heads * head_dim]` is
+    // already `[slots][kv_h][g][head_dim]` in memory, so this is a reshape and
+    // not a permutation.
+    // Narrowed on the QUERY side too, so both operands of the score matmul are
+    // the same dtype: a mixed-dtype product is a supported thing on this fork
+    // and is also a second lane to reason about, and `q` is `[rows, groups,
+    // head_dim]` -- kilobytes against the cache's megabytes -- so nothing is
+    // saved by leaving it wide.
+    let qh = as_kv(q.mul_scalar(tau).reshape([rows, groups, head_dim]));
+    let scores = |keys: Tensor<Bk, 3>, from: usize, to: usize| -> Tensor<Bk, 3> {
+        let (bias, m) = table(from, to);
+        // Back to f32 BEFORE the bias, the mask and the softmax. The scores are
+        // `[slots * kv_heads, groups, cap]` -- 16 MB at 32 slots and a 3.8k
+        // context, against 5.4 GB of cache -- so keeping the reduction's OUTPUT
+        // wide costs nothing and keeps every op downstream of it, the softmax
+        // included, exactly the arithmetic the f32 lane runs.
+        from_kv(qh.clone().matmul(keys.swap_dims(1, 2))).mul_scalar(d.scaling()) + bias + m
+    };
+    let sf = scores(cache.k.clone(), 0, kcap);
+    let sr = scores(cache.kr.clone(), kcap, cap);
+
+    // The SCORES are joined and the keys are not, and that asymmetry is the
+    // whole trade. `[slots * kv_heads, groups, cap]` is 4 MB at eight slots and
+    // a 3.8k context, against 126 MB for one of K or V; joining the small thing
+    // keeps ONE softmax over the row — the same op, in the same order, that
+    // every other lane in this file uses — and joining the large one is the
+    // copy the split exists to remove.
+    //
+    // A hand-written split softmax was tried here first and is not what this
+    // is: taking the max, the exponentials and the denominator across two
+    // tensors is the same arithmetic on paper and measured 2.1e-2 away from
+    // the uncached lane where a joined softmax is BIT-IDENTICAL to it.
+    let probs = burn::tensor::activation::softmax(Tensor::cat(vec![sf, sr], 2), 2);
+    let pf = probs.clone().slice([0..rows, 0..groups, 0..kcap]);
+    let pr = probs.slice([0..rows, 0..groups, kcap..cap]);
+    // The probabilities are in [0, 1] and sum to one across the two halves, so
+    // narrowing them costs a relative 2^-9 on each weight and nothing on their
+    // sum; the values they weight are the other half of the cache and are the
+    // bytes this is here for.
+    let out = from_kv(as_kv(pf).matmul(cache.v.clone()))
+        + from_kv(as_kv(pr).matmul(cache.vr.clone()));
+    linear_bf16(out.reshape([slots, heads * head_dim]), &w.wo)
 }
 
 // `dense_mlp`, `shared_experts` and `shared_experts_dev` were here and are
@@ -657,13 +1853,41 @@ pub fn attention_step(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::inkling::attn::{causal_mask, AttnDims, LogScaling};
+    use crate::models::inkling::attn::{AttnDims, LogScaling};
     use crate::models::inkling::config::AttnKind;
 
     // The only backend there is. These tests compare a cached lane against an
     // uncached one on the SAME device, so what they need from a backend is
     // that it exists — and after the feature collapse exactly one does.
     type B = burn::backend::Cuda<f32>;
+
+    /// How far the cached lane may differ from the uncached one on a GLOBAL
+    /// layer, where both sides build their scores with the same Burn matmul and
+    /// the only difference is the order of the additions.
+    const CACHE_TOLERANCE_GLOBAL: f32 = 2e-5;
+
+    /// The same for a LOCAL layer, where the two sides no longer share an
+    /// implementation.
+    ///
+    /// Prefill goes through [`crate::models::inkling::banded`], which
+    /// accumulates `q . k` in f32 on the CUDA cores. A decode step goes through
+    /// Burn's matmul, which on this runtime is **TF32** -- ten mantissa bits, not
+    /// twenty-three. [`f32_matmul_is_tf32_on_this_runtime`] measures it at 9.3e-4
+    /// relative to the largest term of a 128-deep product, and through a softmax
+    /// on these deliberately small synthetic weights that reaches 2.2e-2 of the
+    /// output.
+    ///
+    /// The band is the ACCURATE side, not the tolerant one. That is not an
+    /// assumption: `banded::device_tests` checks the band's defining property
+    /// -- a key outside the window cannot move the answer and a key inside it
+    /// must -- and `golden/paired/` runs thirty-five banded layers on every
+    /// item it scores.
+    ///
+    /// 5e-2 is set against the SABOTAGE floor rather than against the noise:
+    /// [`dropping_the_conv_history_is_caught`] moves the answer by 1.156, so
+    /// what these tests exist to catch still has more than twenty times the
+    /// margin it needs.
+    const CACHE_TOLERANCE_LOCAL: f32 = 5e-2;
 
     /// Deterministic filler. A fixed pattern rather than a seeded RNG so a
     /// failure is reproducible from the source alone.
@@ -745,6 +1969,12 @@ mod tests {
         prefill: usize,
         sabotage_conv_history: bool,
     ) -> f32 {
+        // The WIDE cache, explicitly. What follows compares the cached lane
+        // against recomputing, at a tolerance sized for two implementations of
+        // the SAME arithmetic -- which they are only while the cache is f32. A
+        // narrow cache stores less; holding it to this bar would be asking the
+        // wrong question, and `golden/paired/` is where it is asked instead.
+        let _lane = CacheLane::wide();
         let dev = burn::backend::cuda::CudaDevice::default();
         let d = dims(kind, rel_extent);
         let w = weights(&d, &dev);
@@ -753,29 +1983,10 @@ mod tests {
             &dev,
         );
 
-        let full = attention(
-            xs.clone(),
-            &w,
-            &d,
-            ls,
-            Tensor::from_data(
-                TensorData::new(causal_mask(tokens, window), [tokens, tokens]),
-                &dev,
-            ),
-        );
+        let full = attention(xs.clone(), &w, &d, ls, window);
 
         let head = xs.clone().slice([0..prefill, 0..d.hidden]);
-        let (_, mut cache) = attention_prefill(
-            head,
-            &w,
-            &d,
-            ls,
-            Tensor::from_data(
-                TensorData::new(causal_mask(prefill, window), [prefill, prefill]),
-                &dev,
-            ),
-            window,
-        );
+        let (_, mut cache) = attention_prefill(head, &w, &d, ls, window, window);
         if sabotage_conv_history {
             // The mutation this cache exists to avoid: keep K and V, forget
             // what the short convolution still needs to see.
@@ -801,6 +2012,433 @@ mod tests {
         worst
     }
 
+    /// `slots` independent sequences through [`attention_slots`], each compared
+    /// against its OWN uncached whole-sequence run.
+    ///
+    /// This is the contamination test and the equivalence test at once, and it
+    /// is one function because they are one question. Every slot carries
+    /// different filler, so if slot `s`'s query reached any key of slot `s'`
+    /// the softmax would mix in values from a sequence that has nothing to do
+    /// with it — and the oracle each slot is measured against is the whole-
+    /// sequence lane run on that slot's tokens ALONE, which cannot contain the
+    /// contamination by construction.
+    ///
+    /// Returns `(worst disagreement, smallest gap between two slots)`. The
+    /// second number is what keeps the first honest: if the slots' outputs were
+    /// all nearly equal the first assertion would pass on a batch that had
+    /// collapsed to one sequence.
+    fn slot_compare(
+        kind: AttnKind,
+        rel_extent: usize,
+        window: Option<usize>,
+        ls: Option<LogScaling>,
+        tokens: usize,
+        prefill: usize,
+        slots: usize,
+    ) -> (f32, f32) {
+        // The WIDE cache, explicitly. What follows compares the cached lane
+        // against recomputing, at a tolerance sized for two implementations of
+        // the SAME arithmetic -- which they are only while the cache is f32. A
+        // narrow cache stores less; holding it to this bar would be asking the
+        // wrong question, and `golden/paired/` is where it is asked instead.
+        let _lane = CacheLane::wide();
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let d = dims(kind, rel_extent);
+        let w = weights(&d, &dev);
+        let xs: Vec<Tensor<B, 2>> = (0..slots)
+            .map(|s| {
+                Tensor::from_data(
+                    TensorData::new(
+                        fill(tokens * d.hidden, 2.5 + s as f32 * 7.0),
+                        [tokens, d.hidden],
+                    ),
+                    &dev,
+                )
+            })
+            .collect();
+        let full: Vec<Tensor<B, 2>> =
+            xs.iter().map(|x| attention(x.clone(), &w, &d, ls, window)).collect();
+        let prefills: Vec<AttnCache<Bk>> = xs
+            .iter()
+            .map(|x| {
+                attention_prefill(
+                    x.clone().slice([0..prefill, 0..d.hidden]),
+                    &w,
+                    &d,
+                    ls,
+                    window,
+                    window,
+                )
+                .1
+            })
+            .collect();
+        let mut cache = SlotCache::from_prefills(prefills, d.kv_heads, d.head_dim);
+
+        let (mut worst, mut closest) = (0f32, f32::INFINITY);
+        for pos in prefill..tokens {
+            let rows = Tensor::cat(
+                xs.iter().map(|x| x.clone().slice([pos..pos + 1, 0..d.hidden])).collect(),
+                0,
+            );
+            let got = attention_slots(rows, &w, &d, ls, pos, window, &mut cache);
+            for s in 0..slots {
+                let mine = got.clone().slice([s..s + 1, 0..d.hidden]);
+                let want = full[s].clone().slice([pos..pos + 1, 0..d.hidden]);
+                worst = worst.max((mine.clone() - want).abs().max().into_scalar());
+                for other in (s + 1)..slots {
+                    let theirs = got.clone().slice([other..other + 1, 0..d.hidden]);
+                    closest = closest.min((mine.clone() - theirs).abs().max().into_scalar());
+                }
+            }
+        }
+        (worst, closest)
+    }
+
+    /// The NARROW cache, checked the only way a narrower float can be checked
+    /// without an adjudicator: structurally.
+    ///
+    /// The tests above hold the cached lane to recomputing, at a tolerance that
+    /// is a statement about two implementations of the same arithmetic. A BF16
+    /// cache stores less and cannot meet that bar, and loosening it until it
+    /// could would be inventing a tolerance to fit the answer. Whether the
+    /// narrow lane is good ENOUGH is a capability question and is settled in
+    /// `golden/paired/`.
+    ///
+    /// What can still be asserted exactly is the property batching can actually
+    /// get wrong, and it holds at any dtype: slot 0's answer is a function of
+    /// slot 0's tokens and of nothing else. So run the same slot beside three
+    /// DIFFERENT sequences and beside three copies of ITSELF, and require the
+    /// two to be bit-identical -- not close, identical, because contamination
+    /// is fluent output and no error at all.
+    ///
+    /// The second assertion is what keeps the first honest: in the
+    /// heterogeneous batch the four slots must DISAGREE, or a batch that had
+    /// collapsed into one sequence would pass.
+    #[test]
+    fn narrow_slots_are_still_independent() {
+        let _lane = CacheLane::narrow();
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let (kind, rel_extent, window) = (AttnKind::Global, 8usize, None);
+        let d = dims(kind, rel_extent);
+        let w = weights(&d, &dev);
+        let (tokens, prefill, slots) = (11usize, 6usize, 4usize);
+
+        // `seeds[0]` is slot 0 in both batches; the rest differ between them.
+        let run = |seeds: Vec<f32>| -> Vec<Tensor<B, 2>> {
+            let xs: Vec<Tensor<B, 2>> = seeds
+                .iter()
+                .map(|&sd| {
+                    Tensor::from_data(
+                        TensorData::new(fill(tokens * d.hidden, sd), [tokens, d.hidden]),
+                        &dev,
+                    )
+                })
+                .collect();
+            let prefills = xs
+                .iter()
+                .map(|x| {
+                    attention_prefill(
+                        x.clone().slice([0..prefill, 0..d.hidden]),
+                        &w,
+                        &d,
+                        None,
+                        window,
+                        window,
+                    )
+                    .1
+                })
+                .collect();
+            let mut cache = SlotCache::from_prefills(prefills, d.kv_heads, d.head_dim);
+            let mut out = Vec::new();
+            for pos in prefill..tokens {
+                let rows = Tensor::cat(
+                    xs.iter().map(|x| x.clone().slice([pos..pos + 1, 0..d.hidden])).collect(),
+                    0,
+                );
+                out.push(attention_slots(rows, &w, &d, None, pos, window, &mut cache));
+            }
+            out
+        };
+
+        let het = run(vec![2.5, 9.5, 16.5, 23.5]);
+        let hom = run(vec![2.5; slots]);
+        assert_eq!(het.len(), hom.len());
+
+        let (mut moved, mut closest) = (0f32, f32::INFINITY);
+        for (a, b) in het.iter().zip(hom.iter()) {
+            let mine = a.clone().slice([0..1, 0..d.hidden]);
+            let same = b.clone().slice([0..1, 0..d.hidden]);
+            moved = moved.max((mine.clone() - same).abs().max().into_scalar());
+            for other in 1..slots {
+                let theirs = a.clone().slice([other..other + 1, 0..d.hidden]);
+                closest = closest.min((mine.clone() - theirs).abs().max().into_scalar());
+            }
+        }
+        println!("narrow slots: slot 0 moved {moved:e} between neighbours, closest pair {closest:e}");
+        assert_eq!(
+            moved, 0.0,
+            "slot 0's answer moved by {moved:e} when its NEIGHBOURS changed: the narrow batch is              reading keys that are not its own"
+        );
+        assert!(
+            closest > 1e-3,
+            "the four slots produced nearly the same answer ({closest:e}): the batch collapsed              into one sequence and the assertion above proves nothing"
+        );
+    }
+
+    /// Eight independent slots on a GLOBAL layer, none of them the same text.
+    #[test]
+    fn slots_stay_independent_on_a_global_layer() {
+        let (worst, closest) = slot_compare(AttnKind::Global, 8, None, None, 11, 6, 8);
+        println!("8 slots, global: worst {worst:e}, closest pair {closest:e}");
+        assert!(
+            worst < CACHE_TOLERANCE_GLOBAL,
+            "a slot disagreed with its own uncached run by {worst:e}"
+        );
+        assert!(
+            closest > 1e-3,
+            "the slots produced nearly the same answer ({closest:e}): the batch is not carrying \
+             eight different sequences and the assertion above proves nothing"
+        );
+    }
+
+    /// The same on a LOCAL layer, where the window drops keys and the cache
+    /// trims — so the slots forget together as well as remember together.
+    #[test]
+    fn slots_stay_independent_on_a_local_layer() {
+        let (worst, closest) = slot_compare(AttnKind::Local, 5, Some(5), None, 11, 6, 8);
+        println!("8 slots, local: worst {worst:e}, closest pair {closest:e}");
+        assert!(
+            worst < CACHE_TOLERANCE_LOCAL,
+            "a slot disagreed with its own uncached run by {worst:e}"
+        );
+        assert!(closest > 1e-3, "the slots produced nearly the same answer ({closest:e})");
+    }
+
+    /// Log scaling is a function of the absolute position, which every slot
+    /// shares — so it is the one place the batch is allowed to be uniform, and
+    /// the one place a wrong position would be invisible at short context.
+    #[test]
+    fn slots_carry_log_scaling() {
+        let ls = Some(LogScaling { n_floor: 4.0, alpha: 0.1 });
+        let (worst, closest) = slot_compare(AttnKind::Global, 8, None, ls, 11, 6, 4);
+        println!("4 slots, global + log scaling: worst {worst:e}, closest pair {closest:e}");
+        assert!(worst < CACHE_TOLERANCE_GLOBAL, "worst {worst:e}");
+        assert!(closest > 1e-3, "closest {closest:e}");
+    }
+
+    /// One slot through the batched lane against [`attention_step`] itself.
+    ///
+    /// The tests above hold the slot lane to the UNCACHED lane, which is the
+    /// right oracle for "did the cache work" and a loose one — the two build
+    /// their scores differently. This one holds it to the lane it is a batch
+    /// of, where the only difference is a leading dimension of size one, so the
+    /// bar is rounding rather than tolerance.
+    #[test]
+    fn one_slot_is_the_one_row_lane() {
+        // The WIDE cache, explicitly. What follows compares the cached lane
+        // against recomputing, at a tolerance sized for two implementations of
+        // the SAME arithmetic -- which they are only while the cache is f32. A
+        // narrow cache stores less; holding it to this bar would be asking the
+        // wrong question, and `golden/paired/` is where it is asked instead.
+        let _lane = CacheLane::wide();
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let (kind, rel_extent, window) = (AttnKind::Global, 8usize, None);
+        let d = dims(kind, rel_extent);
+        let w = weights(&d, &dev);
+        let (tokens, prefill) = (11usize, 6usize);
+        let xs: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(fill(tokens * d.hidden, 2.5), [tokens, d.hidden]),
+            &dev,
+        );
+        let head = xs.clone().slice([0..prefill, 0..d.hidden]);
+        let mut one = attention_prefill(head.clone(), &w, &d, None, window, window).1;
+        let mut batch = SlotCache::from_prefills(
+            vec![attention_prefill(head, &w, &d, None, window, window).1],
+            d.kv_heads,
+            d.head_dim,
+        );
+        let mut worst = 0f32;
+        for pos in prefill..tokens {
+            let row = xs.clone().slice([pos..pos + 1, 0..d.hidden]);
+            let a = attention_step(row.clone(), &w, &d, None, pos, window, &mut one);
+            let b = attention_slots(row, &w, &d, None, pos, window, &mut batch);
+            worst = worst.max((a - b).abs().max().into_scalar());
+        }
+        println!("one slot against the one-row lane: worst {worst:e}");
+        assert!(worst < 1e-5, "a one-slot batch is not the one-row lane: {worst:e}");
+    }
+
+    /// Burn's f32 matmul on this runtime is NOT f32, and this is the tripwire.
+    ///
+    /// It compares `Tensor::matmul` against the same product accumulated in f64
+    /// on the host. TF32 carries ten mantissa bits and lands near 1e-3; true f32
+    /// carries twenty-three and lands near 1e-7. Measured here: 9.3e-4.
+    ///
+    /// This is the one f64 comparison left in this tree and it is deliberate:
+    /// its operands are thirty-two rows of synthetic sine filler, it computes no
+    /// model math at all, and what it establishes is a property of the RUNTIME.
+    /// It is also the fact that stops the next reader treating the f32 lane as
+    /// ground truth, which is the mistake the f64 references that used to live
+    /// in `banded.rs` and `sconv.rs` kept inviting. Do not read it as licence to
+    /// gate model arithmetic on an f64 transcription: a closer float is not a
+    /// more correct one for a model whose weights are four bits, and what
+    /// decides those questions is `golden/paired/`.
+    ///
+    /// The assertion is deliberately the "still imprecise" direction. It is what
+    /// [`CACHE_TOLERANCE_LOCAL`] is sized for, and if this test ever FAILS the
+    /// runtime has moved to a real f32 product and that tolerance can go back to
+    /// 2e-5. A failure here is good news, not a regression.
+    #[test]
+    fn f32_matmul_is_tf32_on_this_runtime() {
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let (m, k, n) = (32usize, 128usize, 32usize);
+        let a = fill(m * k, 1.3);
+        let b = fill(k * n, 2.1);
+        let at: Tensor<B, 2> = Tensor::from_data(TensorData::new(a.clone(), [m, k]), &dev);
+        let bt: Tensor<B, 2> = Tensor::from_data(TensorData::new(b.clone(), [k, n]), &dev);
+        let got: Vec<f32> = at.matmul(bt).into_data().to_vec().unwrap();
+        let mut worst = 0f64;
+        let mut scale = 0f64;
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0f64;
+                for t in 0..k {
+                    acc += a[i * k + t] as f64 * b[t * n + j] as f64;
+                }
+                worst = worst.max((got[i * n + j] as f64 - acc).abs());
+                scale = scale.max(acc.abs());
+            }
+        }
+        let rel = worst / scale;
+        println!("f32 matmul worst absolute error {worst:e} against a largest term of {scale:e} -> {rel:e}");
+        assert!(
+            rel > 1e-5,
+            "Burn's f32 matmul now agrees with f64 to {rel:e}: it is a real f32 product, and \
+             CACHE_TOLERANCE_LOCAL can go back to CACHE_TOLERANCE_GLOBAL"
+        );
+    }
+
+    /// The band and the dense triangle, on the same weights, over the shapes
+    /// the cached tests use.
+    ///
+    /// This is the check that was missing when the band landed: a kernel
+    /// checked only against its own module's tests says nothing about whether
+    /// it agrees with the lane it REPLACES. It did not -- by up to 2.2e-2 --
+    /// and running this is how the TF32 matmul was found. Prints the
+    /// disagreement per configuration and per row, so a failure names which one
+    /// moved.
+    ///
+    /// The bound is [`CACHE_TOLERANCE_LOCAL`], and it is a bound on TF32 rather
+    /// than on the band. A blocked dense lane must answer what an unblocked one
+    /// does; whether either of them is the RIGHT answer is a capability
+    /// question and is settled in `golden/paired/`.
+    ///
+    /// The one thing query blocking can get wrong is the query POSITION: the
+    /// causal predicate, the sliding window and the relative distance are all
+    /// functions of the absolute position, and a block that used its local row
+    /// index instead would attend to the wrong keys in every block but the
+    /// first. That failure is invisible at any shape small enough to fit in one
+    /// block, which is every other test in this module, so the block size is a
+    /// parameter here and the sizes below are chosen NOT to divide the
+    /// sequence -- an off-by-one in the last, short block reads the same as a
+    /// correct one when the blocks are even.
+    ///
+    /// Both arms are the same kernels on the same weights, so the tolerance is
+    /// the tight one and not the cross-implementation `CACHE_TOLERANCE_LOCAL`:
+    /// only the matmul tiling differs, and TF32 accumulation order with it.
+    #[test]
+    fn query_blocks_agree_with_one_block() {
+        let dev = burn::backend::cuda::CudaDevice::default();
+        for (kind, rel_extent, win) in [
+            (AttnKind::Global, 16usize, None),
+            (AttnKind::Local, 8, Some(6usize)),
+        ] {
+            let d = dims(kind, rel_extent);
+            let w = weights(&d, &dev);
+            let ls = match kind {
+                AttnKind::Global => Some(LogScaling { n_floor: 8.0, alpha: 0.5 }),
+                AttnKind::Local => None,
+            };
+            for tokens in [37usize, 64, 91] {
+                let xs: Tensor<B, 2> = Tensor::from_data(
+                    TensorData::new(fill(tokens * d.hidden, 0.05), [tokens, d.hidden]),
+                    &dev,
+                );
+                let whole =
+                    attention_prefill_dense(xs.clone(), &w, &d, ls, win, win, Some(tokens))
+                        .0
+                        .into_data()
+                        .convert::<f32>()
+                        .into_vec::<f32>()
+                        .expect("f32 rows");
+                for block in [1usize, 5, 8, 13, 32] {
+                    if block >= tokens {
+                        continue;
+                    }
+                    let parts =
+                        attention_prefill_dense(xs.clone(), &w, &d, ls, win, win, Some(block))
+                            .0
+                            .into_data()
+                            .convert::<f32>()
+                            .into_vec::<f32>()
+                            .expect("f32 rows");
+                    let worst = whole
+                        .iter()
+                        .zip(&parts)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    assert!(
+                        worst < 2e-5,
+                        "{kind:?}, {tokens} tokens, block {block}: worst {worst:e}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn banded_and_dense_agree_to_tf32() {
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let mut worst_of_all = 0f32;
+        for (rel_extent, win, tokens) in [
+            (16usize, 16usize, 11usize), // window past the sequence: a full triangle
+            (16, 16, 4),
+            (5, 16, 11),  // triangle, table shorter than the sequence
+            (16, 5, 11),  // clipped band, table longer than the window
+            (5, 5, 11),
+            (5, 3, 11),
+            (5, 5, 4),
+            (5, 5, 2),
+            (8, 6, 20),
+        ] {
+            let d = dims(AttnKind::Local, rel_extent);
+            let w = weights(&d, &dev);
+            let xs: Tensor<B, 2> = Tensor::from_data(
+                TensorData::new(fill(tokens * d.hidden, 2.5), [tokens, d.hidden]),
+                &dev,
+            );
+            let band = attention_prefill(xs.clone(), &w, &d, None, Some(win), Some(win)).0;
+            let dense = attention_prefill_dense(xs, &w, &d, None, Some(win), Some(win), None).0;
+            let per_row: Vec<f32> = (0..tokens)
+                .map(|r| {
+                    (band.clone().slice([r..r + 1, 0..d.hidden])
+                        - dense.clone().slice([r..r + 1, 0..d.hidden]))
+                    .abs()
+                    .max()
+                    .into_scalar()
+                })
+                .collect();
+            let diff = per_row.iter().cloned().fold(0f32, f32::max);
+            println!("rel_extent={rel_extent} window={win} tokens={tokens} -> {diff}  rows {per_row:?}");
+            worst_of_all = worst_of_all.max(diff);
+        }
+        assert!(
+            worst_of_all < CACHE_TOLERANCE_LOCAL,
+            "the band disagrees with the triangle by {worst_of_all}, which is more than TF32 \
+             explains"
+        );
+    }
+
     /// A global layer with log scaling that actually varies, and a relative
     /// table that runs out before the sequence does — so distances past
     /// `rel_extent` must contribute a zero bias rather than a gathered one.
@@ -808,7 +2446,7 @@ mod tests {
     fn cached_global_matches_full() {
         let ls = Some(LogScaling { n_floor: 4.0, alpha: 0.5 });
         let worst = compare(AttnKind::Global, 5, None, ls, 11, 4, false);
-        assert!(worst < 2e-5, "cached global attention drifts by {worst}");
+        assert!(worst < CACHE_TOLERANCE_GLOBAL, "cached global attention drifts by {worst}");
     }
 
     /// A local layer whose window is shorter than the sequence, so the cache
@@ -816,7 +2454,7 @@ mod tests {
     #[test]
     fn cached_local_matches_full_across_the_window() {
         let worst = compare(AttnKind::Local, 5, Some(5), None, 11, 4, false);
-        assert!(worst < 2e-5, "cached windowed attention drifts by {worst}");
+        assert!(worst < CACHE_TOLERANCE_LOCAL, "cached windowed attention drifts by {worst}");
     }
 
     /// The cache must survive a prefill shorter than the convolution kernel,
@@ -824,7 +2462,429 @@ mod tests {
     #[test]
     fn cached_matches_full_from_a_two_token_prefill() {
         let worst = compare(AttnKind::Local, 5, Some(5), None, 11, 2, false);
-        assert!(worst < 2e-5, "cached attention from a short prefill drifts by {worst}");
+        assert!(
+            worst < CACHE_TOLERANCE_LOCAL,
+            "cached attention from a short prefill drifts by {worst}"
+        );
+    }
+
+    /// The batched cached step against the uncached lane, in batches of
+    /// `batch`, optionally rolling back `reject` rows of every batch and
+    /// re-running them — which is what a rejected draft does.
+    fn compare_batched(
+        kind: AttnKind,
+        rel_extent: usize,
+        window: Option<usize>,
+        ls: Option<LogScaling>,
+        tokens: usize,
+        prefill: usize,
+        batch: usize,
+        reject: usize,
+    ) -> f32 {
+        // The WIDE cache, explicitly. What follows compares the cached lane
+        // against recomputing, at a tolerance sized for two implementations of
+        // the SAME arithmetic -- which they are only while the cache is f32. A
+        // narrow cache stores less; holding it to this bar would be asking the
+        // wrong question, and `golden/paired/` is where it is asked instead.
+        let _lane = CacheLane::wide();
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let d = dims(kind, rel_extent);
+        let w = weights(&d, &dev);
+        let xs: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(fill(tokens * d.hidden, 2.5), [tokens, d.hidden]),
+            &dev,
+        );
+        let full = attention(xs.clone(), &w, &d, ls, window);
+        let (_, mut cache) = attention_prefill(
+            xs.clone().slice([0..prefill, 0..d.hidden]),
+            &w,
+            &d,
+            ls,
+            window,
+            window,
+        );
+
+        let mut worst = 0f32;
+        let mut pos = prefill;
+        while pos < tokens {
+            let rows = batch.min(tokens - pos);
+            // The rejection arm: run the batch, keep only what a verifier
+            // would have kept, then run the SAME positions again. A cache that
+            // rolled back wrongly answers differently the second time, and the
+            // second answer is the one compared.
+            if reject > 0 && rows > reject {
+                let _ = attention_steps(
+                    xs.clone().slice([pos..pos + rows, 0..d.hidden]),
+                    &w,
+                    &d,
+                    ls,
+                    pos,
+                    window,
+                    &mut cache,
+                );
+                cache.commit(rows - reject, window);
+                let redo = rows - reject;
+                let got = attention_steps(
+                    xs.clone().slice([pos + redo..pos + rows, 0..d.hidden]),
+                    &w,
+                    &d,
+                    ls,
+                    pos + redo,
+                    window,
+                    &mut cache,
+                );
+                cache.commit(rows - redo, window);
+                let want = full.clone().slice([pos + redo..pos + rows, 0..d.hidden]);
+                worst = worst.max((got - want).abs().max().into_scalar());
+            } else {
+                let got = attention_steps(
+                    xs.clone().slice([pos..pos + rows, 0..d.hidden]),
+                    &w,
+                    &d,
+                    ls,
+                    pos,
+                    window,
+                    &mut cache,
+                );
+                cache.commit(rows, window);
+                let want = full.clone().slice([pos..pos + rows, 0..d.hidden]);
+                worst = worst.max((got - want).abs().max().into_scalar());
+            }
+            pos += rows;
+        }
+        worst
+    }
+
+    /// The GEMM lane itself: row 0 of an `m == 3` product against the same row
+    /// computed alone. Nothing cached, nothing speculative — just
+    /// [`linear_bf16`] at two widths on identical operands, at the real
+    /// checkpoint's `[4096, 4096]`.
+    #[test]
+    fn linear_bf16_row0_matches_across_width() {
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let hidden = 4096usize;
+        let probe: Tensor<B, 2> =
+            Tensor::from_data(TensorData::new(vec![0f32], [1, 1]), &dev);
+        let client = client_of(&probe);
+        let mut bytes = Vec::with_capacity(hidden * hidden * 2);
+        for x in fill(hidden * hidden, 0.31) {
+            bytes.extend_from_slice(&half::bf16::from_f32(x).to_le_bytes());
+        }
+        let big = Bf16W { h: client.create_from_slice(&bytes), n: hidden, k: hidden, align: 16 };
+        let rows = 3usize;
+        let xs: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(fill(rows * hidden, 1.25), [rows, hidden]),
+            &dev,
+        );
+        let one = linear_bf16(xs.clone().slice([0..1, 0..hidden]), &big);
+        let many = linear_bf16(xs.clone(), &big).slice([0..1, 0..hidden]);
+        let scale = one.clone().abs().max().into_scalar().max(1e-6);
+        let worst = (many.clone() - one.clone()).abs().max().into_scalar() / scale;
+
+        // Which of the two is RIGHT is not asked here. It used to be, against
+        // the same product accumulated in f64 on the host from the same BF16
+        // bits, and the answer it printed (1.2e-7 for the gemv lane against
+        // 1.36e-5 for the narrow tile) was true and was not the question: an
+        // f64 sum is a more expensive computation of a four-bit model, not its
+        // ground truth. What decides which lane a run should take is
+        // `golden/paired/`. What this test still answers is narrower and is a
+        // property of the LANE rather than of the arithmetic -- whether row 0's
+        // answer depends on how many other rows were in the batch with it.
+        // 1.4e-5 as measured: the two lanes reduce the same 4096-long dot
+        // product in different orders and BF16 operands round to 8 mantissa
+        // bits. This bound is a REGRESSION guard on that number, not a
+        // correctness claim -- what it exists to catch is the day the gap
+        // becomes structural rather than arithmetic.
+        assert!(worst < 1e-3, "linear_bf16 row 0 moves with the batch width by {worst}");
+    }
+
+    /// Diagnostic: per-position relative drift of the batched lane against the
+    /// single-row lane at real width, for batch sizes 1 and 2.
+    #[test]
+    #[ignore = "a diagnostic, not a gate: run it with --ignored --nocapture to see the per-position table"]
+    fn drift_table_at_real_width() {
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let d = AttnDims {
+            hidden: 4096, heads: 32, kv_heads: 8, head_dim: 128,
+            d_rel: 16, rel_extent: 1024, kernel: 4, rms_eps: 1e-6,
+            kind: AttnKind::Local,
+        };
+        let w = weights(&d, &dev);
+        let window = Some(512usize);
+        let (prefill, tokens) = (5usize, 25usize);
+        let xs: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(fill(tokens * d.hidden, 2.5), [tokens, d.hidden]),
+            &dev,
+        );
+        let (_, base_cache) = attention_prefill(
+            xs.clone().slice([0..prefill, 0..d.hidden]),
+            &w, &d, None,
+            window,
+            window,
+        );
+        let mut c1 = base_cache.clone();
+        let mut ones: Vec<Tensor<B, 2>> = Vec::new();
+        for pos in prefill..tokens {
+            ones.push(attention_step(
+                xs.clone().slice([pos..pos + 1, 0..d.hidden]),
+                &w, &d, None, pos, window, &mut c1,
+            ));
+        }
+        for batch in [1usize, 2] {
+            let mut c2 = base_cache.clone();
+            let mut pos = prefill;
+            let mut i = 0usize;
+            let mut line = String::new();
+            while pos < tokens {
+                let rows = batch.min(tokens - pos);
+                let got = attention_steps(
+                    xs.clone().slice([pos..pos + rows, 0..d.hidden]),
+                    &w, &d, None, pos, window, &mut c2,
+                );
+                c2.commit(rows, window);
+                for r in 0..rows {
+                    let want = ones[i + r].clone();
+                    let g = got.clone().slice([r..r + 1, 0..d.hidden]);
+                    let scale = want.clone().abs().max().into_scalar().max(1e-6);
+                    let rel = (g - want).abs().max().into_scalar() / scale;
+                    line.push_str(&format!(" {}:{:.2e}", pos + r, rel));
+                }
+                i += rows;
+                pos += rows;
+            }
+            println!("DRIFT batch={batch}{line}");
+            // Where the disagreement lives: in what the batch WROTE (K, V and
+            // the pre-convolution projections) or in what it READ them into.
+            let rel2 = |a: Tensor<B, 2>, b: Tensor<B, 2>| -> f32 {
+                let scale = b.clone().abs().max().into_scalar().max(1e-6);
+                (a - b).abs().max().into_scalar() / scale
+            };
+            println!(
+                "  cache k {:.2e}  v {:.2e}  k_pre {:.2e}  v_pre {:.2e}",
+                rel2(c2.k.clone(), c1.k.clone()),
+                rel2(c2.v.clone(), c1.v.clone()),
+                rel2(c2.k_pre.clone(), c1.k_pre.clone()),
+                rel2(c2.v_pre.clone(), c1.v_pre.clone()),
+            );
+        }
+    }
+
+    /// The BATCHED cached lane against the SINGLE-ROW cached lane, at the real
+    /// checkpoint's attention width.
+    ///
+    /// Not the same question as [`compare_batched`], which holds both against
+    /// the uncached lane at hidden 16. This one asks what a speculative loop
+    /// actually depends on: that stepping positions in batches of two writes
+    /// the same K and V as stepping them one at a time. At hidden 16 with f32
+    /// weights the two agree to 2e-5; the real layer multiplies BF16 through
+    /// `mma.sync`, and `m == 1` and `m > 1` take DIFFERENT GEMM lanes there
+    /// (`GemvPlaneParallel` against the narrow tile), so this is where a
+    /// difference between them would be visible — and it compounds, because
+    /// every row it writes is read by every position after it.
+    #[test]
+    fn batched_matches_single_step_at_real_width() {
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let d = AttnDims {
+            hidden: 4096,
+            heads: 32,
+            kv_heads: 8,
+            head_dim: 128,
+            d_rel: 16,
+            rel_extent: 1024,
+            kernel: 4,
+            rms_eps: 1e-6,
+            kind: AttnKind::Local,
+        };
+        let w = weights(&d, &dev);
+        let window = Some(512usize);
+        let (prefill, tokens) = (5usize, 45usize);
+        let xs: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(fill(tokens * d.hidden, 2.5), [tokens, d.hidden]),
+            &dev,
+        );
+        let (_, base_cache) = attention_prefill(
+            xs.clone().slice([0..prefill, 0..d.hidden]),
+            &w,
+            &d,
+            None,
+            window,
+            window,
+        );
+
+        // One at a time.
+        let mut c1 = base_cache.clone();
+        let mut ones: Vec<Tensor<B, 2>> = Vec::new();
+        for pos in prefill..tokens {
+            ones.push(attention_step(
+                xs.clone().slice([pos..pos + 1, 0..d.hidden]),
+                &w,
+                &d,
+                None,
+                pos,
+                window,
+                &mut c1,
+            ));
+        }
+
+        // Two at a time, committed whole -- no rejection, so the only thing
+        // under test is the WIDTH.
+        let mut c2 = base_cache.clone();
+        let mut worst = 0f32;
+        let mut i = 0usize;
+        let mut pos = prefill;
+        while pos < tokens {
+            let rows = 2.min(tokens - pos);
+            let got = attention_steps(
+                xs.clone().slice([pos..pos + rows, 0..d.hidden]),
+                &w,
+                &d,
+                None,
+                pos,
+                window,
+                &mut c2,
+            );
+            c2.commit(rows, window);
+            for r in 0..rows {
+                let want = ones[i + r].clone();
+                let g = got.clone().slice([r..r + 1, 0..d.hidden]);
+                let scale = want.clone().abs().max().into_scalar().max(1e-6);
+                worst = worst.max((g - want).abs().max().into_scalar() / scale);
+            }
+            i += rows;
+            pos += rows;
+        }
+        // Not bit-equality: the two lanes reduce in different orders, so some
+        // drift is the hardware and not a bug. What would NOT be the hardware
+        // is drift that grows with position, which is what a wrong K or V row
+        // does once every later query reads it.
+        // NOT bit-equality, and the gap is entirely the GEMM lane: pin one
+        // with `INK_GEMM=double cyclic mma` and this is 0.00e0 at every
+        // position. Left free-running here because that is how the runtime
+        // ships -- `m == 1` takes `gemv plane par` and `m > 1` cannot, so a
+        // speculative loop compares two lanes whether or not it wants to.
+        assert!(worst < 5e-2, "batched attention drifts from the single step by {worst} relative");
+    }
+
+    /// [`short_conv_steps`] against the whole-sequence [`short_conv`], in
+    /// batches, rolling back `reject` rows of every batch and re-running those
+    /// positions — which is exactly what a rejected draft does to the
+    /// convolution's memory.
+    ///
+    /// A separate test from the attention ones because the convolution is the
+    /// half of a speculative rollback that is NOT a truncation: the taps the
+    /// next position reads are a function of the last KEPT row and the rows
+    /// before it, and those pre-convolution inputs are gone once the batch is
+    /// over unless the batch keeps its whole window.
+    fn compare_conv_batched(tokens: usize, prefill: usize, batch: usize, reject: usize) -> f32 {
+        // The WIDE cache, explicitly. What follows compares the cached lane
+        // against recomputing, at a tolerance sized for two implementations of
+        // the SAME arithmetic -- which they are only while the cache is f32. A
+        // narrow cache stores less; holding it to this bar would be asking the
+        // wrong question, and `golden/paired/` is where it is asked instead.
+        let _lane = CacheLane::wide();
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let (dim, kernel) = (16usize, 4usize);
+        let xs: Tensor<B, 2> =
+            Tensor::from_data(TensorData::new(fill(tokens * dim, 1.5), [tokens, dim]), &dev);
+        let w: Tensor<B, 2> =
+            Tensor::from_data(TensorData::new(fill(dim * kernel, 0.25), [dim, kernel]), &dev);
+        let full = short_conv(xs.clone(), w.clone());
+        let mut hist = conv_history(xs.clone().slice([0..prefill, 0..dim]), kernel);
+
+        let mut worst = 0f32;
+        let mut pos = prefill;
+        while pos < tokens {
+            let rows = batch.min(tokens - pos);
+            if reject > 0 && rows > reject {
+                let keep = rows - reject;
+                let (_, all) = short_conv_steps(
+                    hist.clone(),
+                    xs.clone().slice([pos..pos + rows, 0..dim]),
+                    w.clone(),
+                );
+                // The rollback: the history ending at the last KEPT row.
+                hist = conv_history(all.slice([0..kernel - 1 + keep, 0..dim]), kernel);
+                let (got, all) = short_conv_steps(
+                    hist.clone(),
+                    xs.clone().slice([pos + keep..pos + rows, 0..dim]),
+                    w.clone(),
+                );
+                hist = conv_history(all.slice([0..kernel - 1 + reject, 0..dim]), kernel);
+                let want = full.clone().slice([pos + keep..pos + rows, 0..dim]);
+                worst = worst.max((got - want).abs().max().into_scalar());
+            } else {
+                let (got, all) =
+                    short_conv_steps(hist.clone(), xs.clone().slice([pos..pos + rows, 0..dim]), w.clone());
+                hist = conv_history(all.slice([0..kernel - 1 + rows, 0..dim]), kernel);
+                let want = full.clone().slice([pos..pos + rows, 0..dim]);
+                worst = worst.max((got - want).abs().max().into_scalar());
+            }
+            pos += rows;
+        }
+        worst
+    }
+
+    /// Three positions at a time, from a prefill SHORTER than the kernel — so
+    /// the batch's first rows read the zero padding the whole-sequence lane
+    /// assumes, and a window built from the wrong end would show up here.
+    #[test]
+    fn batched_short_conv_matches_full() {
+        let worst = compare_conv_batched(11, 2, 3, 0);
+        assert!(worst < 1e-6, "batched short convolution drifts by {worst}");
+    }
+
+    /// The same, rejecting two rows of every three-row batch and re-running
+    /// them. The re-run's answer is the one compared, so a history restored
+    /// from the wrong offset is a failure and not a rounding difference.
+    #[test]
+    fn batched_short_conv_survives_rejection() {
+        let worst = compare_conv_batched(13, 4, 3, 2);
+        assert!(worst < 1e-6, "short convolution rollback drifts by {worst}");
+    }
+
+    /// Three positions at a time against the uncached lane, on a global layer
+    /// with log scaling that varies per row — so a batch that used one `tau`
+    /// for all of its rows would show up here.
+    #[test]
+    fn batched_global_matches_full() {
+        let ls = Some(LogScaling { n_floor: 4.0, alpha: 0.5 });
+        let worst = compare_batched(AttnKind::Global, 5, None, ls, 11, 4, 3, 0);
+        assert!(worst < CACHE_TOLERANCE_GLOBAL, "batched global attention drifts by {worst}");
+    }
+
+    /// The same on a local layer whose window is shorter than the sequence, so
+    /// the batch must not forget a key until it knows how long it was.
+    #[test]
+    fn batched_local_matches_full_across_the_window() {
+        let worst = compare_batched(AttnKind::Local, 5, Some(5), None, 11, 4, 3, 0);
+        assert!(worst < CACHE_TOLERANCE_LOCAL, "batched windowed attention drifts by {worst}");
+    }
+
+    /// Rejection: run three, keep one, re-run the two that were rejected. This
+    /// is the speculative path, and it passes only if `commit` restored the
+    /// short convolution's memory as well as truncating K and V.
+    #[test]
+    fn rejected_rows_leave_no_trace() {
+        let ls = Some(LogScaling { n_floor: 4.0, alpha: 0.5 });
+        let worst = compare_batched(AttnKind::Global, 5, None, ls, 11, 4, 3, 2);
+        assert!(worst < CACHE_TOLERANCE_GLOBAL, "rolled-back batch drifts by {worst}");
+    }
+
+    /// The same against a window, where rollback and the window's own
+    /// forgetting interact.
+    #[test]
+    fn rejected_rows_leave_no_trace_windowed() {
+        let worst = compare_batched(AttnKind::Local, 5, Some(5), None, 11, 4, 3, 2);
+        assert!(worst < CACHE_TOLERANCE_LOCAL, "rolled-back windowed batch drifts by {worst}");
+    }
+
+    /// A batch of one must agree with [`attention_step`], which is the claim
+    /// that makes the two functions one algorithm rather than two.
+    #[test]
+    fn a_batch_of_one_matches_the_single_step() {
+        let ls = Some(LogScaling { n_floor: 4.0, alpha: 0.5 });
+        let worst = compare_batched(AttnKind::Global, 5, None, ls, 11, 4, 1, 0);
+        assert!(worst < CACHE_TOLERANCE_GLOBAL, "a one-row batch drifts by {worst}");
     }
 
     /// A gate that cannot fail and a gate that has never failed look identical
@@ -834,6 +2894,14 @@ mod tests {
     #[test]
     fn dropping_the_conv_history_is_caught() {
         let worst = compare(AttnKind::Local, 5, Some(5), None, 11, 4, true);
-        assert!(worst > 1e-2, "sabotaged conv history only moved the answer by {worst}");
+        println!("sabotaged conv history moves the answer by {worst}");
+        // Against the TOLERANCE, not against a constant: what has to hold is
+        // that the bug class these tests exist for is far outside the band the
+        // tolerance admits. Measured at 1.156 against a 5e-2 tolerance.
+        assert!(
+            worst > 20.0 * CACHE_TOLERANCE_LOCAL,
+            "sabotaged conv history only moved the answer by {worst}, which is inside the \
+             tolerance the windowed tests use"
+        );
     }
 }

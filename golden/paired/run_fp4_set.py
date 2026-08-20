@@ -4,7 +4,7 @@
 `inkling_forward` answers one ids file per process and there is no batch mode,
 so an item set is N sequential pairs and the per-item cost is dominated by
 process start: each half warms its share of the expert slabs through the page
-cache before it computes anything. Measured on spark, 41 tokens: 4m14s wall,
+cache before it computes anything. Measured on one node, 41 tokens: 4m14s wall,
 of which about 2m20s is the tail warming before it will even accept the head's
 connection.
 
@@ -28,7 +28,13 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LINE = re.compile(r"after token (\d+) \(id \d+\): top5")
-STEP = re.compile(r"^\s*step (\d+): \+\d+", re.M)
+# `step N: +[id, id, ...]`. It was `step N: +id` when this was written, and the
+# runtime started printing a LIST when a pass began confirming more than one
+# token; the cohort tag after the index appears only when INK_COHORTS > 1. A
+# stale pattern here does not fail loudly -- it makes every finished run look
+# unfinished, so the driver runs each item a second time and then reports it
+# INCOMPLETE, which is exactly what it did.
+STEP = re.compile(r"^\s*step (\d+)(?: cohort \d+)?: \+\[", re.M)
 
 
 def done(rundir, ids, gen=0):
@@ -60,6 +66,13 @@ def main():
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--port", default="7654")
     ap.add_argument("--timeout", type=float, default=1800.0)
+    # Which runner. The one-box pair over loopback (run_fp4.sh) is no longer
+    # runnable for the full stack -- 42 layers in two processes on one 119 GiB
+    # box is refused by the admission gate, correctly -- so a full-stack set now
+    # names run_fp4_2node.sh and the head lives on $INK_REMOTE.
+    ap.add_argument("--script", default="",
+                    help="runner to invoke per item (default run_fp4.sh, or run_fp4_gen.sh "
+                         "with --gen); pass run_fp4_2node.sh for a two-node pair")
     ap.add_argument("--gen", type=int, default=0,
                     help="generate this many tokens per prompt (run_fp4_gen.sh) instead of "
                          "answering one")
@@ -90,9 +103,10 @@ def main():
         # repeats is a real one and is reported rather than retried away.
         for attempt in (1, 2):
             try:
-                cmd = ([os.path.join(HERE, "run_fp4_gen.sh"), idsf, rundir,
+                script = args.script or ("run_fp4_gen.sh" if args.gen else "run_fp4.sh")
+                cmd = ([os.path.join(HERE, script), idsf, rundir,
                         str(args.gen), args.port] if args.gen else
-                       [os.path.join(HERE, "run_fp4.sh"), idsf, rundir, args.port])
+                       [os.path.join(HERE, script), idsf, rundir, args.port])
                 rc = subprocess.run(cmd, timeout=args.timeout).returncode
             except subprocess.TimeoutExpired:
                 rc = -1

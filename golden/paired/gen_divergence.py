@@ -46,7 +46,10 @@ import sys
 # box. Safe path, explicit import.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-STEP = re.compile(r"^\s*step \d+: \+(\d+)", re.M)
+# The generated tokens of one pass. A list since the runtime learned to confirm
+# more than one token in a pass; one element in every run this file scores,
+# because speculation is off. See run_fp4_set.py for what the stale form cost.
+STEP = re.compile(r"^\s*step \d+(?: cohort \d+)?: \+\[([0-9, ]*)\]", re.M)
 
 
 def build(items_path, gendir, out_path):
@@ -56,7 +59,12 @@ def build(items_path, gendir, out_path):
         log = os.path.join(gendir, it["key"], "tail.log")
         if not os.path.exists(log):
             continue
-        gen = [int(m.group(1)) for m in STEP.finditer(open(log, errors="replace").read())]
+        gen = [
+            int(x)
+            for m in STEP.finditer(open(log, errors="replace").read())
+            for x in m.group(1).split(",")
+            if x.strip()
+        ]
         if not gen:
             continue
         # The last step emits a token that is never fed back, so the reference
@@ -129,6 +137,14 @@ def compare(built_path, ref_path, tfdir):
     It also gives the cached-versus-uncached number for free, by comparing the
     runtime's own two lanes on the same sequence -- which is a property of our
     implementation and nothing to do with BF16.
+
+    **The teacher-forced runs need `INK_ALL_LOGITS=1`.** A forward unembeds ONE
+    row unless a reader asks for the rest, because on a 512-token prefill the
+    others are 410 MB of readback for a report; this function reads the report.
+    Without it every item contributes a single position, `n` is zero for all of
+    them, and the whole comparison exits with "nothing to compare" -- which is
+    what it did, silently, for as long as that optimisation has been in the
+    runtime. Pass it through `$INK_EXTRA` on `run_fp4_2node.sh`.
     """
     built = {it["key"]: it for it in json.load(open(built_path))["items"]}
     ref = json.load(open(ref_path))["results"]
