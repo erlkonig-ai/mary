@@ -24,7 +24,9 @@ use std::error::Error;
 use std::fmt;
 use std::path::Path;
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::IntoBlob;
 use triblespace::core::attribute::Attribute;
 use triblespace::core::collection::simplearchive_union::{
     self, PreparationError, PreparedCollectionCommit, PublicationError,
@@ -41,13 +43,18 @@ use triblespace::core::repo::pile::{
 use triblespace::prelude::inlineencodings::{F64, U256BE};
 use triblespace::prelude::*;
 
-/// Stable scope of Mary's canonical model-graph collection.
+/// The name Mary's canonical model-graph collection is known by.
 ///
-/// Minted with `trible genid` on 2026-08-14. The canonical collection
-/// descriptor additionally fixes `SimpleArchive` as its representation and
-/// TribleSpace's version-1 trible-set union recipe as its algebra.
-pub const MARY_MODEL_GRAPH_SCOPE: Id =
-    triblespace::macros::id_hex!("F7A4634F17D8A9799FA2E5C0DD942327");
+/// This replaces a minted scope id. A root collection is anchored by a name
+/// within a team rather than by an opaque anchor, so the pile now says what
+/// this collection is instead of that being answerable only by someone
+/// holding this source file. The descriptor additionally fixes
+/// `SimpleArchive` as its representation and TribleSpace's version-1
+/// trible-set union recipe as its algebra.
+pub fn mary_model_graph_name() -> CollectionName {
+    CollectionName::new("mary-model-graph")
+        .expect("`mary-model-graph` is a legal collection name")
+}
 
 /// Concrete failure produced by publishing one model fragment to a pile.
 pub type ModelFragmentPublicationError = PublicationError<PileInsertError, CollectionInsertError>;
@@ -172,8 +179,8 @@ impl Error for LoadModelCollectionError {
     }
 }
 
-fn model_graph_collection() -> SimpleArchiveCollection {
-    SimpleArchiveCollection::new(MARY_MODEL_GRAPH_SCOPE)
+fn model_graph_collection(team: VerifyingKey) -> SimpleArchiveCollection {
+    SimpleArchiveCollection::new(mary_model_graph_name(), team)
 }
 
 /// Prepare one canonical model commit entirely in memory.
@@ -188,7 +195,7 @@ pub fn prepare_model_fragment(
     fragment: Fragment,
 ) -> Result<PreparedCollectionCommit, PreparationError> {
     simplearchive_union::prepare_fragment_commit(
-        &model_graph_collection().descriptor(),
+        &model_graph_collection(signing_key.verifying_key()).descriptor(),
         fragment,
         signing_key,
     )
@@ -209,7 +216,7 @@ pub fn publish_model_fragment(
     pile.refresh().map_err(PublishModelFragmentError::Refresh)?;
     simplearchive_union::publish_fragment_commit(
         pile,
-        &model_graph_collection().descriptor(),
+        &model_graph_collection(signing_key.verifying_key()).descriptor(),
         fragment,
         signing_key,
     )
@@ -225,9 +232,10 @@ pub fn publish_model_fragment(
 /// not flush or close the caller's pile.
 pub fn snapshot_model_collection_exact(
     pile: &mut Pile,
+    team: VerifyingKey,
     ticket: &[CollectionCommit],
 ) -> Result<CollectionSnapshot<PileReader>, ModelCollectionMaterializationError> {
-    model_graph_collection().snapshot_exact(pile, ticket)
+    model_graph_collection(team).snapshot_exact(pile, ticket)
 }
 
 fn close_after_snapshot(
@@ -267,15 +275,24 @@ fn open_and_refresh_model_pile(path: &Path) -> Result<Pile, LoadModelCollectionE
 /// mapping snapshot and remains usable after the mutable [`Pile`] is closed.
 pub fn load_model_collection_from_ticket(
     path: impl AsRef<Path>,
+    team: VerifyingKey,
     ticket: &[CollectionCommit],
 ) -> Result<CollectionSnapshot<PileReader>, LoadModelCollectionError> {
     let mut pile = open_and_refresh_model_pile(path.as_ref())?;
-    let snapshot = snapshot_model_collection_exact(&mut pile, ticket);
+    let snapshot = snapshot_model_collection_exact(&mut pile, team, ticket);
     close_after_snapshot(pile, snapshot)
 }
 
-fn local_model_ticket(pile: &mut Pile) -> Result<Vec<CollectionCommit>, ReadError> {
-    let collection = model_graph_collection().descriptor().handle();
+fn local_model_ticket(pile: &mut Pile, team: VerifyingKey) -> Result<Vec<CollectionCommit>, ReadError> {
+    // Hashing a descriptor without storing it is only safe on a read path.
+    // A write that did this could name a collection whose descriptor is not
+    // in the pile -- records referencing something nothing can decode -- so
+    // there is deliberately no helper for it and the write paths take the
+    // handle that `put` hands back instead.
+    let collection = IntoBlob::<SimpleArchive>::to_blob(
+        model_graph_collection(team).descriptor().facts().clone(),
+    )
+    .get_handle();
     let mut ticket = Vec::new();
     for record in pile.records()? {
         if let CollectionRecord::Commit(commit) = record? {
@@ -301,10 +318,11 @@ fn local_model_ticket(pile: &mut Pile) -> Result<Vec<CollectionCommit>, ReadErro
 /// further appending to `pile`. No flush, close, reopen, or repair occurs.
 pub fn snapshot_model_collection_local_latest(
     pile: &mut Pile,
+    team: VerifyingKey,
 ) -> Result<CollectionSnapshot<PileReader>, SnapshotLocalModelCollectionError> {
     let ticket =
-        local_model_ticket(pile).map_err(SnapshotLocalModelCollectionError::LocalTicket)?;
-    snapshot_model_collection_exact(pile, &ticket)
+        local_model_ticket(pile, team).map_err(SnapshotLocalModelCollectionError::LocalTicket)?;
+    snapshot_model_collection_exact(pile, team, &ticket)
         .map_err(SnapshotLocalModelCollectionError::Materialize)
 }
 
@@ -321,12 +339,13 @@ pub fn snapshot_model_collection_local_latest(
 /// The pile is never repaired, reopened, or implicitly flushed.
 pub fn load_model_collection_local_latest(
     path: impl AsRef<Path>,
+    team: VerifyingKey,
 ) -> Result<CollectionSnapshot<PileReader>, LoadModelCollectionError> {
     // `Pile::records` performs the one bounded replay that defines the local
     // admission prefix. Do not refresh separately here: a second pre-ticket
     // replay would move that boundary for no semantic benefit.
     let mut pile = Pile::open(path.as_ref()).map_err(LoadModelCollectionError::Open)?;
-    let snapshot = match snapshot_model_collection_local_latest(&mut pile) {
+    let snapshot = match snapshot_model_collection_local_latest(&mut pile, team) {
         Ok(snapshot) => Ok(snapshot),
         Err(SnapshotLocalModelCollectionError::LocalTicket(source)) => {
             let _ = pile.close();
