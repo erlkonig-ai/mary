@@ -307,18 +307,156 @@
 //! nothing else -- the same divergence a speculative run shows, reproduced with
 //! no speculation anywhere in the process.
 //!
-//! ## What batching would still need
+//! ## What batching needed, and what it turned out to cost
 //!
 //! [`dev_lane::attention_steps`] takes ONE cache and `pos0`, puts row `i` at
 //! `pos0 + i`, and masks row `i` against every earlier row of the batch -- it
 //! is contiguous and causal by construction, which is what a speculative batch
-//! is and what `b` independent sequences are not. Real batching wants `b`
-//! caches, `b` positions and a block-diagonal mask instead of a causal one. The
-//! rest of the layer -- every projection, the router, the expert gather, the
-//! unembedding -- takes `[b, hidden]` unchanged, which is why the cost above is
-//! the right price for a thing that does not exist yet.
+//! is and what `b` independent sequences are not. That is what `INK_SLOTS`
+//! below builds, and the answer is in the next section: a real b-slot pass came
+//! out CHEAPER than this probe's, because the layout the slots needed was
+//! cheaper than the one the single-row lane had.
 //!
-
+//! # `INK_SLOTS=b`: b independent sequences, one pass, b tokens
+//!
+//! The feature the probe above was an instrument for. `b` slots, each with its
+//! own KV cache and its own token stream; one pass advances all of them by one
+//! token. [`dev_lane::SlotCache`] and [`dev_lane::attention_slots`] are the
+//! whole of it, and the "block-diagonal mask" the probe said this would need
+//! does not exist: K and V are held `[slots * kv_heads, cap, head_dim]` and the
+//! scores are a batched matmul over that leading axis, so slot `s`'s query
+//! multiplies slot `s`'s keys and there is no mask element whose sign could be
+//! wrong.
+//!
+//! The `b` prompts are `b` DISJOINT chunks of one token file, `INK_SLOT_LEN`
+//! apart, and `INK_SLOT_OFFSETS` names the chunk per slot. Slot 0's text
+//! therefore does not move when `b` changes, which is what makes the arms
+//! comparable and what makes the contamination test possible. A prefill is
+//! compute-bound and gains nothing from a batch, so the `b` of them run one at
+//! a time and the batch begins where the decoding does.
+//!
+//! ## What it costs
+//!
+//! Warm p50 of the whole cycle, at least two runs per arm, two-node pipe,
+//! layers 0:21 and 21:42, `INK_KV=1`, `/tmp/cover_150000.ids` (35,845 tokens of
+//! prose; slot `s` takes `[s*L, (s+1)*L)`). "one-row" is the same binary with
+//! `INK_SLOTS` unset -- [`dev_lane::attention_step`], which is what every
+//! measurement before this one was taken on. `c(b)` is against the mean of the
+//! `b = 1` SLOT-lane runs, not against the one-row lane: those are two
+//! implementations of the same function, and mixing them into one ratio would
+//! charge batching for a layout change.
+//!
+//!   L = 512, ctx 512 -> 612           L = 3732, ctx 3732 -> 3852
+//!    b   p50 ms       c(b)   tok/s     b   p50 ms             c(b)   tok/s
+//!    -   133.3 135.2    -    7.5 7.4   -   150.5 150.1          -    6.65 6.66
+//!    1   125.5 134.1  1.000  8.0 7.5   1   135.6 130.5        1.000  7.38 7.67
+//!    2   178.5 168.6  1.337  11.2 11.9 2   184.1 183.7        1.382  10.87 10.89
+//!    4   207.6 212.0  1.617  19.3 18.9 4   219.5 219.8 222.0  1.657  18.2 18.2 18.0
+//!    8   277.8 273.6  2.124  28.8 29.2 6   282.9 296.1        2.176  21.2 20.3
+//!                                      8   311.4 325.2 373.0  2.529  25.7 24.6 21.4
+//!
+//! **Eight independent sequences decode at 3.7x one**, and at a 3.7k context
+//! each of them still carries its own 3792-key cache and reads it in full on
+//! every pass. Nearly the whole penalty is the step at the SECOND row, exactly
+//! as the probe found: from `b = 2` to `b = 8`, four times the sequences cost
+//! 1.83 times the pass.
+//!
+//! **The layout change is worth its own line.** At `b = 1` the slot lane is
+//! 130-136 ms where the one-row lane is 150 ms at a 3.7k context, and 125-134
+//! against 133-135 at 512. [`dev_lane::attention_step`] holds K as
+//! `[len, kv_heads * head_dim]` and expands it per step to
+//! `[heads, len, head_dim]`, repeating each KV head `groups` times so the score
+//! matmul is one GEMM over `heads`: 63 MB a layer at 3.8k keys, twice, on every
+//! layer of every step. The slot cache is head-major and moves the repetition to
+//! the QUERY side, where the `groups` queries sharing a KV head become the `m`
+//! rows of that head's GEMM and cost nothing. One sequence gets that for free.
+//!
+//! ## What the probe overcharged, and by how much
+//!
+//! The probe bounded the b-th cache read at `(b - 1) x 26.9` ms, on the
+//! reasoning that one sequence's extra 3727 keys cost the one-row lane
+//! 151.6 - 124.7 ms a pass. Measured with `b` real caches each read in full, the
+//! whole 512 -> 3732 context step costs **3.3 ms at b = 1, 10.3 ms at b = 2 and
+//! 9.9 ms at b = 4 -- for the entire batch**, not per sequence. The bound was
+//! five to ten times too pessimistic, and the reason is the expansion above:
+//! most of the one-row lane's context delta was a copy that grows with the
+//! context, not the attention it was attributed to.
+//!
+//! So the probe's corrected figures are wrong in the safe direction. It
+//! predicted 313 ms and 12.8 aggregate tok/s at `b = 4` and ctx 3792; measured,
+//! with four independent caches, it is **220 ms and 18.2 tok/s** -- better than
+//! the probe's own UNCORRECTED number (231.8 ms, 17.26 tok/s), which is the
+//! shape of a correction that was measuring the wrong thing.
+//!
+//! ## Above four slots at a 3.7k context the node, not the arithmetic, decides
+//!
+//! `b` up to 4 is reproducible to a millisecond. At 6 and 8 the pass time is
+//! BIMODAL: the machine reaches 243-280 ms and holds it for stretches, and then
+//! spends passes at five, ten, thirty times that. The p50 over 120 passes has
+//! come out anywhere from 283 to 657 ms at `b = 6` and 311 to 1465 at `b = 8`
+//! across runs of the same binary on the same prompts, and the maxima are
+//! multi-SECOND passes. The tail node is stable throughout -- its own decode
+//! passes settle at ~145 ms and stay there. The head is not, and it is the
+//! constrained end because it carries 82.73 GiB of weights and the embedding
+//! table against the tail's 76.14 GiB and no embedding: 27 GiB of headroom
+//! against 31.
+//!
+//! It is not the KV cache, which is 1.26 GiB for eight slots over the head's 21
+//! layers. Part of it is cubecl's page ladder: a layer's frozen K at eight slots
+//! and 3.8k keys is `[64, 3776, 128]` f32 = **124 MB**, the rungs are
+//! `max_page_size / 4^k` = 478 MB, 117 MB, ..., and 124 is just over 117, so
+//! each of the 42 buffers takes a 478 MB page and the set occupies ~20 GiB
+//! instead of 3.9. That is a plausible account of the step at `b = 8` and it
+//! does NOT account for `b = 6` and `b = 7`, whose buffers are 93 and 108 MB and
+//! stay a rung down. So the honest statement is that four slots is where
+//! reproducibility ends on THIS split, and that the eight-slot figures above are
+//! the good runs and are reported as such.
+//!
+//! Three ways past it, none of them tuning: chunk the frozen half so no buffer
+//! crosses a rung, which is a paged KV cache and is also what a real slot
+//! scheduler wants; hold K and V as BF16, which halves both the buffer and the
+//! bandwidth; or move a layer off the head, which the split is free to do
+//! because the two ends are already asymmetric in weight.
+//!
+//! ## The prefill is a second, separate memory event
+//!
+//! `b` prefills run one after another and each peaks on a
+//! `[heads, query_block, tokens]` score matrix -- 1.68 GiB at 3.7k, served out
+//! of a whole 1.87 GiB page that the pool then keeps. Across eight of them the
+//! node goes into swap: prefills five through seven took 175 s, 85 s and 26 s
+//! against 3.2 s for the first five. The loop now syncs and calls
+//! `memory_cleanup` after each slot's prefill and again once the batch is
+//! assembled, which took those three to 13 s, 17 s and 41 s. It is a hint and
+//! the allocator decides; between prefills there is nothing else in flight for
+//! it to decide against.
+//!
+//! ## The contamination test, which is the one this can fail
+//!
+//! Batch contamination -- slot `s` reading slot `s'`'s keys -- produces fluent
+//! text and no error, so it has to be looked for deliberately, and it cannot be
+//! looked for by comparing `b = 8` against `b = 1`: those already disagree on
+//! this model because `gemv plane par` requires `m == 1` and a wider pass loses
+//! it. So the test holds `b` FIXED at 8 and changes only the neighbours.
+//!
+//! Whole stack, 512-token prompts, 20 decode passes:
+//!
+//! * slot 0 beside seven DIFFERENT chunks and slot 0 beside seven copies of
+//!   itself emit the **identical** 20-token stream, token for token;
+//! * the eight slots in the first of those emit eight distinct continuations,
+//!   so the agreement is not a batch that collapsed into one sequence;
+//! * the second emits eight identical tokens on every step, which is the
+//!   symmetry the batch has to have and does not get for free;
+//! * held to one GEMM lane (`INK_GEMM='double cyclic mma'`), `b = 8` with eight
+//!   identical slots reproduces `b = 1` on the layer-RMS ladder -- 0.0000 on ten
+//!   of twelve passes and one unit in the last printed decimal on the other two
+//!   -- and the two token streams are identical.
+//!
+//! At the layer level the same question is asked against the UNCACHED lane:
+//! eight slots carrying eight different sequences, each held to its own
+//! whole-sequence run, is BIT-IDENTICAL on a global layer and 1.15e-2 on a local
+//! one, which is the TF32-against-banded-prefill gap the existing cached-local
+//! test already sits at (`slots_stay_independent_on_a_*_layer` in `burn.rs`).
+//!
 //! # One lane, all the way down
 //!
 //! There is nothing to select. Attention, the dense and shared MLPs, the head
@@ -3038,6 +3176,14 @@ fn main() -> Result<()> {
             });
         }
         slot_prefills.clear();
+        // And the pages the b per-slot caches were living in. They are gone as
+        // Rust values the moment `slot_prefills` clears, and the pool keeps
+        // their pages: 336 buffers of 15.5 MB at eight slots over 21 layers,
+        // each rounded up to a rung of the ladder, is several GiB held for
+        // tensors that no longer exist -- on the node with 27 GiB of headroom,
+        // which is about to allocate the batched cache out of it.
+        <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync after the slot batch");
+        fp4_client.memory_cleanup();
     }
     // The tail is handed the stream the head already embedded and ran; it takes
     // `n` and `pos0` from the wire rather than from `ids`, because those are
@@ -3679,8 +3825,21 @@ fn main() -> Result<()> {
 
     // This slot is prefilled; the next one starts from an empty `caches` and
     // the batch is assembled once all b are in.
+    //
+    // And the pool is handed back, which is not tidiness. A prefill's peak is a
+    // [heads, query_block, tokens] score matrix -- 1.68 GiB at a 3.7k context,
+    // which cubecl serves out of a whole 1.87 GiB page and then KEEPS, because
+    // keeping it is the right policy inside a loop. Across b prefills on a node
+    // with 24 GiB of headroom it is not: measured at eight slots, prefills five
+    // through seven took 175 s, 85 s and 26 s against 3.2 s for the first five,
+    // the box went into swap, and the decode that followed spent a hundred
+    // passes climbing back out of it. `memory_cleanup` is a hint and the
+    // allocator decides, but between prefills there is nothing else in flight
+    // for it to decide against.
     if slot_lane && !is_decode {
         slot_prefills.push(std::mem::take(&mut caches));
+        <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync after a slot prefill");
+        fp4_client.memory_cleanup();
     }
 
     // ---- the one sync for this node's whole stack --------------------------

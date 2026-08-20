@@ -1197,8 +1197,8 @@ pub struct SlotCache<B: Backend> {
     /// prefill was widened by and are masked.
     k: Tensor<B, 3>,
     v: Tensor<B, 3>,
-    /// `[slots * kv_heads, RECENT, head_dim]`: the rows written since the last
-    /// merge. The first `recent` are real and the rest are zero.
+    /// `[slots * kv_heads, recent_rows(), head_dim]`: the rows written since
+    /// the last merge. The first `recent` are real and the rest are zero.
     kr: Tensor<B, 3>,
     vr: Tensor<B, 3>,
     /// `[slots, kernel - 1, kv_heads * head_dim]` — the short convolution's
@@ -1215,7 +1215,7 @@ pub struct SlotCache<B: Backend> {
     /// Rows allocated in `k`/`v`. Equal to `frozen` after any merge; larger
     /// only between [`SlotCache::from_prefills`] and the first one.
     kcap: usize,
-    /// Real rows in `kr`/`vr`, at most [`RECENT`].
+    /// Real rows in `kr`/`vr`, at most [`recent_rows`].
     recent: usize,
     /// Absolute position of frozen row 0.
     base: usize,
@@ -1223,9 +1223,9 @@ pub struct SlotCache<B: Backend> {
 
 /// Rows the recent half holds before it is merged into the frozen half.
 ///
-/// Two KV pad buckets. It is the amortisation constant of the whole layout:
-/// a step rewrites `RECENT` rows and a merge rewrites the context, so the copy
-/// per step is `L / RECENT` rows rather than `L`.
+/// Two KV pad buckets. It is the amortisation constant of the whole layout: a
+/// step rewrites one of these rows and a merge rewrites the context, so the
+/// copy per step is `L / recent_rows()` rows rather than `L`.
 fn recent_rows() -> usize {
     2 * kv_pad_bucket()
 }
@@ -1340,13 +1340,14 @@ impl SlotCache<Bk> {
 
     /// Append one key and value per slot.
     ///
-    /// Into the RECENT half, which is `RECENT` rows wide however long the
+    /// Into the recent half, which is [`recent_rows`] wide however long the
     /// context is. That is the point of the split: `slice_assign` copies the
     /// tensor it writes into whenever anything else still holds a reference to
     /// it, and at eight slots and a 3.8k context the whole cache is 126 MB a
     /// tensor — 5.3 GB of copy a pass over 21 layers, and 20 GiB of allocator
     /// pages to hold it, on a node with 24 GiB of headroom. Written this way a
-    /// step touches 4 MB and the context is copied once every `RECENT` steps.
+    /// step touches 4 MB and the context is copied once every
+    /// [`recent_rows`] steps.
     fn push(&mut self, k_new: Tensor<Bk, 2>, v_new: Tensor<Bk, 2>) {
         let rows = self.slots * self.kv_heads;
         let hd = self.head_dim;
@@ -1368,15 +1369,15 @@ impl SlotCache<Bk> {
     /// Fold the recent half into the frozen one.
     ///
     /// The one place the whole context is copied, and it happens once every
-    /// `RECENT` steps. `recent` is `RECENT` here — a partial merge would put a
-    /// zero row inside the frozen half, where no mask covers it.
+    /// [`recent_rows`] steps. The recent half is FULL here — a partial merge
+    /// would put a zero row inside the frozen half, where no mask covers it.
     fn merge(&mut self) {
         let rec = recent_rows();
         assert_eq!(self.recent, rec, "a partial recent half has zero rows in it");
         let rows = self.slots * self.kv_heads;
         let hd = self.head_dim;
         let dev = self.k.device();
-        let (frozen, kcap) = (self.frozen, self.kcap);
+        let frozen = self.frozen;
         let k = take3(&mut self.k, &dev);
         let v = take3(&mut self.v, &dev);
         let kr = take3(&mut self.kr, &dev);
@@ -1391,11 +1392,11 @@ impl SlotCache<Bk> {
         self.vr = Tensor::zeros([rows, rec, hd], &dev);
         self.frozen = frozen + rec;
         self.kcap = self.frozen;
-        let _ = kcap;
         self.recent = 0;
     }
 
-    /// Drop the keys no future query can reach — in whole `RECENT` chunks.
+    /// Drop the keys no future query can reach — in whole [`recent_rows`]
+    /// chunks.
     ///
     /// [`trim`] drops down to exactly `window` rows every step, which is a copy
     /// of the whole cache per layer per step; here the extra rows past the
