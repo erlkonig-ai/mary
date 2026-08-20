@@ -1,0 +1,86 @@
+The BF16 KV cache against the wide one, paired capability comparison.
+
+Eight generation prompts, 48 tokens each, two-node pipe (layers 0:21 and
+21:42), INK_KV=1, the same binary with INK_ATTN_BF16 unset and set. The
+reference is golden/inkling_bf16_stream.py over each arms own continuation.
+
+Produced by run_fp4_gen_2node.sh + gen_divergence.py; the teacher-forced arms
+were run with INK_ALL_LOGITS=1, without which compare has nothing to compare.
+
+=== the reports (11:14:52) ===
+################ f32 attention ################
+item              gen   agree   first divergence
+gen-prose          48  45/48          at token 5
+gen-explain        48  45/48         at token 12
+gen-arith          48  44/48          at token 2
+gen-code           48  47/48         at token 27
+gen-list           48  47/48          at token 4
+gen-dialogue       48  45/48          at token 8
+gen-defn           48  45/48         at token 23
+gen-recipe         48  44/48          at token 7
+
+teacher-forced per-token agreement: 362/384 = 94.3% [95% CI 91.5–96.2]
+sequences identical all the way through: 0/8
+first divergence, when it happens: median token 8, range 2..27
+
+item                n   BF16 vs NVFP4   NVFP4 cached vs not
+gen-prose          48      42/48                 44/48     
+gen-explain        48      44/48                 44/48     
+gen-arith          48      44/48                 45/48     
+gen-code           48      48/48                 47/48     
+gen-list           48      47/48                 46/48     
+gen-dialogue       48      45/48                 45/48     
+gen-defn           48      44/48                 47/48     
+gen-recipe         48      45/48                 47/48     
+
+BF16 vs NVFP4, both teacher-forced on the same ids: 359/384 = 93.5% [95% CI 90.6–95.6]
+NVFP4 uncached vs its own KV-cached generation:     365/384 = 95.1% [95% CI 92.4–96.8]
+
+The second line is OUR two lanes on one model and has nothing to do with BF16.
+Whatever it costs is a floor under the first line, in the same way the
+run-to-run flip rate is a floor under the multiple-choice result.
+
+################ bf16 attention ################
+item              gen   agree   first divergence
+gen-prose          48  44/48          at token 4
+gen-explain        48  47/48         at token 27
+gen-arith          48  41/48          at token 5
+gen-code           48  48/48                none
+gen-list           48  47/48          at token 4
+gen-dialogue       48  44/48          at token 8
+gen-defn           48  45/48         at token 12
+gen-recipe         48  47/48         at token 17
+
+teacher-forced per-token agreement: 363/384 = 94.5% [95% CI 91.8–96.4]
+sequences identical all the way through: 1/8
+first divergence, when it happens: median token 8, range 4..27
+
+item                n   BF16 vs NVFP4   NVFP4 cached vs not
+gen-prose          48      43/48                 47/48     
+gen-explain        48      45/48                 44/48     
+gen-arith          48      44/48                 42/48     
+gen-code           48      48/48                 48/48     
+gen-list           48      47/48                 46/48     
+gen-dialogue       48      42/48                 45/48     
+gen-defn           48      46/48                 46/48     
+gen-recipe         48      46/48                 45/48     
+
+BF16 vs NVFP4, both teacher-forced on the same ids: 361/384 = 94.0% [95% CI 91.2–96.0]
+NVFP4 uncached vs its own KV-cached generation:     363/384 = 94.5% [95% CI 91.8–96.4]
+
+The second line is OUR two lanes on one model and has nothing to do with BF16.
+Whatever it costs is a floor under the first line, in the same way the
+run-to-run flip rate is a floor under the multiple-choice result.
+
+FINAL-DONE 11:14:52
+
+The check that the switch stays where it belongs -- the same uncached forward
+with the flag on and off, over the same eight sequences:
+  gen-prose: prefill identical
+  gen-explain: prefill identical
+  gen-arith: prefill identical
+  gen-code: prefill identical
+  gen-list: prefill identical
+  gen-dialogue: prefill identical
+  gen-defn: prefill identical
+  gen-recipe: prefill identical

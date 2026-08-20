@@ -137,6 +137,14 @@ def compare(built_path, ref_path, tfdir):
     It also gives the cached-versus-uncached number for free, by comparing the
     runtime's own two lanes on the same sequence -- which is a property of our
     implementation and nothing to do with BF16.
+
+    **The teacher-forced runs need `INK_ALL_LOGITS=1`.** A forward unembeds ONE
+    row unless a reader asks for the rest, because on a 512-token prefill the
+    others are 410 MB of readback for a report; this function reads the report.
+    Without it every item contributes a single position, `n` is zero for all of
+    them, and the whole comparison exits with "nothing to compare" -- which is
+    what it did, silently, for as long as that optimisation has been in the
+    runtime. Pass it through `$INK_EXTRA` on `run_fp4_2node.sh`.
     """
     built = {it["key"]: it for it in json.load(open(built_path))["items"]}
     ref = json.load(open(ref_path))["results"]
