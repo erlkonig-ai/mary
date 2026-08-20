@@ -108,6 +108,50 @@ fn main() {
         }
     }
 
+    // The production path consumes one 80 ms frame at a time.  Gate it both
+    // against the existing full-clip implementation and, transitively, the
+    // exact upstream integer oracle above.
+    assert_eq!(samples.len() % SAMPLES_PER_FRAME, 0);
+    let mut stream_state = enc.stream_state();
+    let stream_codes: Vec<_> = samples
+        .chunks_exact(SAMPLES_PER_FRAME)
+        .map(|frame| {
+            enc.encode_stream_frame(
+                &mut stream_state,
+                frame.try_into().expect("exact Mimi input frame"),
+            )
+        })
+        .collect();
+    let stream_exact = stream_codes == codes;
+    ok &= stream_exact;
+    println!(
+        "  {} streaming encode      {}/{} frames exact vs batch/oracle",
+        if stream_exact { "OK" } else { "XX" },
+        stream_codes
+            .iter()
+            .zip(&codes)
+            .filter(|(stream, batch)| stream == batch)
+            .count(),
+        codes.len()
+    );
+
+    stream_state.reset();
+    let reset_codes: Vec<_> = samples
+        .chunks_exact(SAMPLES_PER_FRAME)
+        .map(|frame| {
+            enc.encode_stream_frame(
+                &mut stream_state,
+                frame.try_into().expect("exact Mimi input frame"),
+            )
+        })
+        .collect();
+    let reset_exact = reset_codes == stream_codes;
+    ok &= reset_exact;
+    println!(
+        "  {} streaming reset       deterministic replay",
+        if reset_exact { "OK" } else { "XX" }
+    );
+
     // ---- DECODER ----
     println!("loading decoder…");
     let dec = MimiDecoder::load(&loader);

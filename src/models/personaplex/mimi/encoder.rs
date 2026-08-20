@@ -41,6 +41,22 @@ struct CpuConv {
     replicate_pad: bool,
 }
 
+/// The exact causal history needed to resume one [`CpuConv`].  All Mimi
+/// convolutions use dilation one, so `kernel - stride` samples per input
+/// channel are sufficient; keeping more would only duplicate already-consumed
+/// input.
+struct ConvStreamState {
+    previous: Vec<f32>,
+    first: bool,
+}
+
+impl ConvStreamState {
+    fn reset(&mut self) {
+        self.previous.fill(0.0);
+        self.first = true;
+    }
+}
+
 impl CpuConv {
     fn load(
         loader: &WeightLoader,
@@ -99,6 +115,86 @@ impl CpuConv {
         }
         (y, t)
     }
+
+    fn stream_state(&self) -> ConvStreamState {
+        ConvStreamState {
+            previous: vec![0.0; self.inc * (self.k - self.stride)],
+            first: true,
+        }
+    }
+
+    /// Resume this causal convolution over a stride-aligned input chunk.
+    ///
+    /// Unlike [`CpuConv::forward`], this performs no synthetic right padding:
+    /// each output is backed only by samples that have actually arrived.  The
+    /// fixed left history makes concatenated calls exactly equivalent to one
+    /// full causal convolution over their concatenated input.
+    fn forward_stream(
+        &self,
+        x: &[f32],
+        l: usize,
+        state: &mut ConvStreamState,
+    ) -> (Vec<f32>, usize) {
+        assert!(l > 0, "streaming convolution requires a non-empty chunk");
+        assert_eq!(x.len(), self.inc * l, "streaming convolution shape");
+        assert_eq!(l % self.stride, 0, "streaming chunk must align to stride");
+
+        let history = self.k - self.stride;
+        assert_eq!(state.previous.len(), self.inc * history);
+        if state.first {
+            if self.replicate_pad {
+                for c in 0..self.inc {
+                    state.previous[c * history..(c + 1) * history].fill(x[c * l]);
+                }
+            }
+            state.first = false;
+        }
+
+        let t = l / self.stride;
+        let mut col = vec![0f32; self.inc * self.k * t];
+        for c in 0..self.inc {
+            let prior = &state.previous[c * history..(c + 1) * history];
+            let row = &x[c * l..(c + 1) * l];
+            for j in 0..self.k {
+                let dst = &mut col[(c * self.k + j) * t..(c * self.k + j + 1) * t];
+                for (ti, d) in dst.iter_mut().enumerate() {
+                    let source = ti * self.stride + j;
+                    *d = if source < history {
+                        prior[source]
+                    } else {
+                        row[source - history]
+                    };
+                }
+            }
+        }
+
+        let mut y = vec![0f32; self.out * t];
+        sgemm(&self.w, &col, self.out, self.inc * self.k, t, &mut y);
+        if let Some(b) = &self.b {
+            for (o, bo) in b.iter().enumerate() {
+                for v in &mut y[o * t..(o + 1) * t] {
+                    *v += bo;
+                }
+            }
+        }
+
+        // Retain the suffix of `[previous | row]` without allocating a
+        // conceptual concatenation.  Mimi's production chunks are all longer
+        // than their histories, but the first branch keeps the primitive exact
+        // for any stride-aligned chunk.
+        for c in 0..self.inc {
+            let prior = &mut state.previous[c * history..(c + 1) * history];
+            let row = &x[c * l..(c + 1) * l];
+            if l >= history {
+                prior.copy_from_slice(&row[l - history..]);
+            } else {
+                prior.copy_within(l..history, 0);
+                prior[history - l..].copy_from_slice(row);
+            }
+        }
+
+        (y, t)
+    }
 }
 
 fn elu(x: &mut [f32]) {
@@ -134,6 +230,109 @@ pub(super) struct TrLayer {
     fc2: HostF32,      // [512, 2048]
     ls1: HostF32,
     ls2: HostF32,
+}
+
+/// A chronological fixed-capacity cache for one transformer's already-rotated
+/// keys and projected values.  Rows live in a ring so its allocation is fixed
+/// for the lifetime of a stream.
+struct KvRing {
+    keys: Vec<f32>,
+    values: Vec<f32>,
+    start: usize,
+    len: usize,
+}
+
+impl KvRing {
+    fn new() -> Self {
+        Self {
+            keys: vec![0.0; TR_WINDOW * HIDDEN],
+            values: vec![0.0; TR_WINDOW * HIDDEN],
+            start: 0,
+            len: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.start = 0;
+        self.len = 0;
+    }
+
+    fn row(&self, logical: usize) -> (&[f32], &[f32]) {
+        assert!(logical < self.len);
+        let physical = (self.start + logical) % TR_WINDOW;
+        let range = physical * HIDDEN..(physical + 1) * HIDDEN;
+        (&self.keys[range.clone()], &self.values[range])
+    }
+
+    fn push(&mut self, key: &[f32], value: &[f32]) {
+        assert_eq!(key.len(), HIDDEN);
+        assert_eq!(value.len(), HIDDEN);
+        let physical = if self.len < TR_WINDOW {
+            let physical = (self.start + self.len) % TR_WINDOW;
+            self.len += 1;
+            physical
+        } else {
+            let physical = self.start;
+            self.start = (self.start + 1) % TR_WINDOW;
+            physical
+        };
+        self.keys[physical * HIDDEN..(physical + 1) * HIDDEN].copy_from_slice(key);
+        self.values[physical * HIDDEN..(physical + 1) * HIDDEN].copy_from_slice(value);
+    }
+}
+
+struct TransformerStreamState {
+    layers: Vec<KvRing>,
+    position: usize,
+}
+
+impl TransformerStreamState {
+    fn new() -> Self {
+        Self {
+            layers: (0..TR_LAYERS).map(|_| KvRing::new()).collect(),
+            position: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.position = 0;
+        for layer in &mut self.layers {
+            layer.reset();
+        }
+    }
+}
+
+struct EncBlockStreamState {
+    res1: ConvStreamState,
+    down: ConvStreamState,
+}
+
+/// Mutable causal state for [`MimiEncoder::encode_stream_frame`].
+///
+/// It owns only bounded convolution histories and the eight transformer
+/// layers' 250-position K/V rings. Model weights remain shared by
+/// [`MimiEncoder`].
+pub struct MimiEncoderState {
+    stem: ConvStreamState,
+    blocks: Vec<EncBlockStreamState>,
+    final_conv: ConvStreamState,
+    transformer: TransformerStreamState,
+    downsample: ConvStreamState,
+}
+
+impl MimiEncoderState {
+    /// Return this state to the exact beginning-of-stream condition without
+    /// reallocating its K/V buffers.
+    pub fn reset(&mut self) {
+        self.stem.reset();
+        for block in &mut self.blocks {
+            block.res1.reset();
+            block.down.reset();
+        }
+        self.final_conv.reset();
+        self.transformer.reset();
+        self.downsample.reset();
+    }
 }
 
 /// One RVQ bank's encode side: input_proj + pre-divided codebooks (+ squared
@@ -333,6 +532,103 @@ impl MimiEncoder {
         transformer_forward(&self.tr_layers, h, t);
     }
 
+    /// Allocate the bounded causal state for one independent encoder stream.
+    /// A state may be reset and reused, but must not be shared concurrently
+    /// between streams.
+    pub fn stream_state(&self) -> MimiEncoderState {
+        MimiEncoderState {
+            stem: self.stem.stream_state(),
+            blocks: self
+                .blocks
+                .iter()
+                .map(|block| EncBlockStreamState {
+                    res1: block.res1.stream_state(),
+                    down: block.down.stream_state(),
+                })
+                .collect(),
+            final_conv: self.final_conv.stream_state(),
+            transformer: TransformerStreamState::new(),
+            downsample: self.downsample.stream_state(),
+        }
+    }
+
+    /// Encode exactly one 80 ms, 24 kHz mono frame while carrying the causal
+    /// SEANet, transformer, and learned-downsample histories in `state`.
+    ///
+    /// Repeated calls are numerically the same computation as batch encoding
+    /// the concatenated frames, but emit one 12.5 Hz code frame immediately.
+    pub fn encode_stream_frame(
+        &self,
+        state: &mut MimiEncoderState,
+        samples: &[f32; SAMPLES_PER_FRAME],
+    ) -> [u32; NUM_CODEBOOKS] {
+        let (mut x, mut l) = self
+            .stem
+            .forward_stream(samples, SAMPLES_PER_FRAME, &mut state.stem);
+        for (block, block_state) in self.blocks.iter().zip(&mut state.blocks) {
+            let mut residual = x.clone();
+            elu(&mut residual);
+            let (mut residual, residual_len) =
+                block
+                    .res1
+                    .forward_stream(&residual, l, &mut block_state.res1);
+            elu(&mut residual);
+            let (residual, residual_len_2) = block.res2.forward(&residual, residual_len);
+            assert_eq!(residual_len_2, l);
+            for (xv, rv) in x.iter_mut().zip(&residual) {
+                *xv += rv;
+            }
+            elu(&mut x);
+            (x, l) = block.down.forward_stream(&x, l, &mut block_state.down);
+        }
+        elu(&mut x);
+        let (seanet, latent_len) = self.final_conv.forward_stream(&x, l, &mut state.final_conv);
+        assert_eq!(
+            latent_len, 2,
+            "one audio frame must produce two 25 Hz latents"
+        );
+
+        // Convolutions are channel-major; the transformer and RVQ operate on
+        // row-major time positions.
+        let mut hidden = vec![0.0; latent_len * HIDDEN];
+        for channel in 0..HIDDEN {
+            for time in 0..latent_len {
+                hidden[time * HIDDEN + channel] = seanet[channel * latent_len + time];
+            }
+        }
+        transformer_stream_forward(
+            &self.tr_layers,
+            &mut hidden,
+            latent_len,
+            &mut state.transformer,
+        );
+
+        let mut channel_major = vec![0.0; HIDDEN * latent_len];
+        for channel in 0..HIDDEN {
+            for time in 0..latent_len {
+                channel_major[channel * latent_len + time] = hidden[time * HIDDEN + channel];
+            }
+        }
+        let (downsampled, code_len) =
+            self.downsample
+                .forward_stream(&channel_major, latent_len, &mut state.downsample);
+        assert_eq!(
+            code_len, 1,
+            "one audio frame must produce one 12.5 Hz latent"
+        );
+        // With one time position `[channel, 1]` and `[1, channel]` have the
+        // same flat order, so the RVQ can consume the convolution result
+        // directly.
+        let semantic = self.rvq_first.encode(&downsampled, 1);
+        let acoustic = self.rvq_rest.encode(&downsampled, 1);
+        let mut frame = [0; NUM_CODEBOOKS];
+        frame[0] = semantic[0][0];
+        for (quantizer, codes) in acoustic.iter().enumerate() {
+            frame[quantizer + 1] = codes[0];
+        }
+        frame
+    }
+
     /// Encode a 24 kHz mono waveform into `T×8` codes (codebook 0 = semantic).
     pub fn encode(&self, samples: &[f32]) -> Vec<[u32; NUM_CODEBOOKS]> {
         self.encode_stages(samples).3
@@ -404,6 +700,185 @@ impl MimiEncoder {
             .collect();
         (seanet, tr, ds, codes)
     }
+}
+
+/// Streaming form of [`transformer_forward`].  Current positions are computed
+/// together (two per 80 ms audio frame), while each layer's older keys and
+/// values remain in a fixed 250-position ring.  RoPE uses absolute positions,
+/// so evicting an old key never changes the phase of later keys.
+fn transformer_stream_forward(
+    layers: &[TrLayer],
+    hidden: &mut [f32],
+    time: usize,
+    state: &mut TransformerStreamState,
+) {
+    assert_eq!(layers.len(), state.layers.len());
+    assert_eq!(hidden.len(), time * HIDDEN);
+    let head_scale = ((TR_HEAD_DIM as f64).powf(-0.5)) as f32;
+    let half_head = TR_HEAD_DIM / 2;
+    let base_position = state.position;
+
+    let mut cos = vec![0.0; time * half_head];
+    let mut sin = vec![0.0; time * half_head];
+    for local_position in 0..time {
+        let absolute_position = base_position + local_position;
+        for pair in 0..half_head {
+            let radians = absolute_position as f64
+                * TR_ROPE_THETA.powf(-2.0 * pair as f64 / TR_HEAD_DIM as f64);
+            cos[local_position * half_head + pair] = radians.cos() as f32;
+            sin[local_position * half_head + pair] = radians.sin() as f32;
+        }
+    }
+
+    let mut normalized = vec![0.0; time * HIDDEN];
+    let mut qkv = vec![0.0; time * 3 * HIDDEN];
+    let mut attention = vec![0.0; time * HIDDEN];
+    let mut projected = vec![0.0; time * HIDDEN];
+    let mut feed_forward = vec![0.0; time * TR_INTER];
+    let mut scores = [0.0; TR_WINDOW];
+
+    for (layer, ring) in layers.iter().zip(&mut state.layers) {
+        MimiEncoder::layer_norm(hidden, &layer.ln1_w, &layer.ln1_b, &mut normalized);
+        sgemm_nt(
+            &normalized,
+            &layer.in_proj,
+            time,
+            HIDDEN,
+            3 * HIDDEN,
+            &mut qkv,
+        );
+
+        // Moshi uses interleaved RoPE pairs `(2i, 2i+1)`.
+        for position in 0..time {
+            for head in 0..TR_HEADS {
+                for section in 0..2 {
+                    let offset = position * 3 * HIDDEN + section * HIDDEN + head * TR_HEAD_DIM;
+                    let row = &mut qkv[offset..offset + TR_HEAD_DIM];
+                    for pair in 0..half_head {
+                        let cosine = cos[position * half_head + pair];
+                        let sine = sin[position * half_head + pair];
+                        let (a, b) = (row[2 * pair], row[2 * pair + 1]);
+                        row[2 * pair] = a * cosine - b * sine;
+                        row[2 * pair + 1] = a * sine + b * cosine;
+                    }
+                }
+            }
+        }
+
+        attention.fill(0.0);
+        let history_position = base_position - ring.len;
+        for head in 0..TR_HEADS {
+            for query_position in 0..time {
+                let absolute_query = base_position + query_position;
+                let query_offset = query_position * 3 * HIDDEN + head * TR_HEAD_DIM;
+                let query = &qkv[query_offset..query_offset + TR_HEAD_DIM];
+                let mut count = 0;
+
+                // Cached rows are visited in chronological order, matching the
+                // summation order of batch attention.
+                for logical in 0..ring.len {
+                    let absolute_key = history_position + logical;
+                    if absolute_query - absolute_key >= TR_WINDOW {
+                        continue;
+                    }
+                    let (key, _) = ring.row(logical);
+                    scores[count] = query
+                        .iter()
+                        .zip(&key[head * TR_HEAD_DIM..(head + 1) * TR_HEAD_DIM])
+                        .map(|(&a, &b)| a * b)
+                        .sum::<f32>()
+                        * head_scale;
+                    count += 1;
+                }
+                for current_key in 0..=query_position {
+                    let key_offset = current_key * 3 * HIDDEN + HIDDEN + head * TR_HEAD_DIM;
+                    let key = &qkv[key_offset..key_offset + TR_HEAD_DIM];
+                    scores[count] =
+                        query.iter().zip(key).map(|(&a, &b)| a * b).sum::<f32>() * head_scale;
+                    count += 1;
+                }
+                debug_assert!(count <= TR_WINDOW);
+                softmax(&mut scores[..count]);
+
+                let output = &mut attention[query_position * HIDDEN + head * TR_HEAD_DIM
+                    ..query_position * HIDDEN + (head + 1) * TR_HEAD_DIM];
+                let mut score_index = 0;
+                for logical in 0..ring.len {
+                    let absolute_key = history_position + logical;
+                    if absolute_query - absolute_key >= TR_WINDOW {
+                        continue;
+                    }
+                    let (_, value) = ring.row(logical);
+                    let probability = scores[score_index];
+                    for (out, &v) in output
+                        .iter_mut()
+                        .zip(&value[head * TR_HEAD_DIM..(head + 1) * TR_HEAD_DIM])
+                    {
+                        *out += probability * v;
+                    }
+                    score_index += 1;
+                }
+                for current_value in 0..=query_position {
+                    let value_offset = current_value * 3 * HIDDEN + 2 * HIDDEN + head * TR_HEAD_DIM;
+                    let value = &qkv[value_offset..value_offset + TR_HEAD_DIM];
+                    let probability = scores[score_index];
+                    for (out, &v) in output.iter_mut().zip(value) {
+                        *out += probability * v;
+                    }
+                    score_index += 1;
+                }
+                debug_assert_eq!(score_index, count);
+            }
+        }
+
+        // Cache this layer's pre-attention K/V only after all current queries
+        // have consumed them, then continue the current hidden rows through
+        // the residual and feed-forward branches.
+        for position in 0..time {
+            let row = &qkv[position * 3 * HIDDEN..(position + 1) * 3 * HIDDEN];
+            ring.push(&row[HIDDEN..2 * HIDDEN], &row[2 * HIDDEN..3 * HIDDEN]);
+        }
+        sgemm_nt(
+            &attention,
+            &layer.out_proj,
+            time,
+            HIDDEN,
+            HIDDEN,
+            &mut projected,
+        );
+        for position in 0..time {
+            for channel in 0..HIDDEN {
+                hidden[position * HIDDEN + channel] +=
+                    projected[position * HIDDEN + channel] * layer.ls1[channel];
+            }
+        }
+        MimiEncoder::layer_norm(hidden, &layer.ln2_w, &layer.ln2_b, &mut normalized);
+        sgemm_nt(
+            &normalized,
+            &layer.fc1,
+            time,
+            HIDDEN,
+            TR_INTER,
+            &mut feed_forward,
+        );
+        gelu(&mut feed_forward);
+        sgemm_nt(
+            &feed_forward,
+            &layer.fc2,
+            time,
+            TR_INTER,
+            HIDDEN,
+            &mut projected,
+        );
+        for position in 0..time {
+            for channel in 0..HIDDEN {
+                hidden[position * HIDDEN + channel] +=
+                    projected[position * HIDDEN + channel] * layer.ls2[channel];
+            }
+        }
+    }
+
+    state.position += time;
 }
 
 /// Mimi transformer bottleneck (shared enc/dec): 8 layers, fused qkv `in_proj`,
@@ -503,5 +978,142 @@ impl MimiEncoder {
         (0..TR_LAYERS)
             .map(|i| Self::load_layer(loader, prefix, i))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_conv(replicate_pad: bool) -> CpuConv {
+        let (out, inc, kernel, stride) = (3, 2, 5, 2);
+        CpuConv {
+            w: HostF32::Owned(
+                (0..out * inc * kernel)
+                    .map(|i| (i as f32 - 11.0) / 17.0)
+                    .collect(),
+            ),
+            b: Some(HostF32::Owned(vec![0.25, -0.5, 0.75])),
+            out,
+            inc,
+            k: kernel,
+            stride,
+            replicate_pad,
+        }
+    }
+
+    fn input(channels: usize, length: usize) -> Vec<f32> {
+        (0..channels)
+            .flat_map(|channel| {
+                (0..length).map(move |time| {
+                    ((channel * length + time) as f32 * 0.17).sin() + channel as f32
+                })
+            })
+            .collect()
+    }
+
+    fn channel_chunk(
+        input: &[f32],
+        channels: usize,
+        full_length: usize,
+        start: usize,
+        length: usize,
+    ) -> Vec<f32> {
+        (0..channels)
+            .flat_map(|channel| {
+                input[channel * full_length + start..channel * full_length + start + length]
+                    .iter()
+                    .copied()
+            })
+            .collect()
+    }
+
+    fn append_channel_major(
+        destination: &mut [Vec<f32>],
+        output: &[f32],
+        channels: usize,
+        length: usize,
+    ) {
+        for channel in 0..channels {
+            destination[channel]
+                .extend_from_slice(&output[channel * length..channel * length + length]);
+        }
+    }
+
+    fn assert_close(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1e-5,
+                "element {index}: {actual} != {expected}"
+            );
+        }
+    }
+
+    fn streaming_conv_matches_batch(replicate_pad: bool) {
+        let conv = test_conv(replicate_pad);
+        let lengths = [6, 8, 4];
+        let full_length = lengths.iter().sum();
+        let x = input(conv.inc, full_length);
+        let (batch, batch_length) = conv.forward(&x, full_length);
+
+        let mut state = conv.stream_state();
+        let mut streamed = vec![Vec::new(); conv.out];
+        let mut start = 0;
+        for length in lengths {
+            let chunk = channel_chunk(&x, conv.inc, full_length, start, length);
+            let (output, output_length) = conv.forward_stream(&chunk, length, &mut state);
+            append_channel_major(&mut streamed, &output, conv.out, output_length);
+            start += length;
+        }
+        assert_eq!(batch_length, streamed[0].len());
+        assert_eq!(
+            state.previous.len(),
+            conv.inc * (conv.k - conv.stride),
+            "causal history must stay fixed while the stream grows"
+        );
+        let streamed: Vec<f32> = streamed.into_iter().flatten().collect();
+        assert_close(&streamed, &batch);
+
+        state.reset();
+        let first = channel_chunk(&x, conv.inc, full_length, 0, lengths[0]);
+        let (after_reset, _) = conv.forward_stream(&first, lengths[0], &mut state);
+        let mut fresh = conv.stream_state();
+        let (from_fresh, _) = conv.forward_stream(&first, lengths[0], &mut fresh);
+        assert_eq!(after_reset, from_fresh);
+    }
+
+    #[test]
+    fn zero_padded_causal_conv_stream_matches_batch_and_resets() {
+        streaming_conv_matches_batch(false);
+    }
+
+    #[test]
+    fn replicate_padded_causal_conv_stream_matches_batch_and_resets() {
+        streaming_conv_matches_batch(true);
+    }
+
+    #[test]
+    fn kv_ring_is_chronological_bounded_and_resettable() {
+        let mut ring = KvRing::new();
+        let mut key = vec![0.0; HIDDEN];
+        let mut value = vec![0.0; HIDDEN];
+        for position in 0..TR_WINDOW + 3 {
+            key[0] = position as f32;
+            value[0] = -(position as f32);
+            ring.push(&key, &value);
+        }
+        assert_eq!(ring.len, TR_WINDOW);
+        assert_eq!(ring.keys.len(), TR_WINDOW * HIDDEN);
+        assert_eq!(ring.values.len(), TR_WINDOW * HIDDEN);
+        assert_eq!(ring.row(0).0[0], 3.0);
+        assert_eq!(ring.row(TR_WINDOW - 1).0[0], (TR_WINDOW + 2) as f32);
+        assert_eq!(ring.row(0).1[0], -3.0);
+
+        ring.reset();
+        assert_eq!(ring.len, 0);
+        assert_eq!(ring.start, 0);
+        assert_eq!(ring.keys.len(), TR_WINDOW * HIDDEN);
+        assert_eq!(ring.values.len(), TR_WINDOW * HIDDEN);
     }
 }
