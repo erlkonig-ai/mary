@@ -236,10 +236,17 @@ pub struct RealtimePipeline {
 
 #[cfg(feature = "q4")]
 impl RealtimePipeline {
-    /// Load all components from the one union weight pile. `fmt` picks the
-    /// temporal stack's weight format (q4/q8/f16); `depth_f16` stores the
-    /// depformer weights as f16 (f32 accumulate) instead of f32.
-    pub fn load(loader: &WeightLoader, fmt: WeightFmt, depth_f16: bool) -> Self {
+    /// Load all components from one bundle-bound runtime source. `fmt` picks
+    /// the temporal stack's weight format (q4/q8/f16); `depth_f16` stores the
+    /// depformer weights as f16 (f32 accumulate) instead of f32. Accepting the
+    /// authority/loader pair prevents a future native cache from being checked
+    /// against one bundle while its unchanged weights come from another.
+    pub fn load(
+        source: &super::PersonaPlexRuntimeSource,
+        fmt: WeightFmt,
+        depth_f16: bool,
+    ) -> Self {
+        let loader = source.loader();
         Self {
             temporal: TemporalMetal::load(loader, fmt),
             depth: DepthFast::load(loader, depth_f16),
@@ -251,29 +258,18 @@ impl RealtimePipeline {
         }
     }
 
-    /// [`Self::load`] with derived-sibling AUTO-DISCOVERY (see
-    /// [`super::qpile`]): the temporal stack zero-copy-mmaps
-    /// `<stem>_<fmt>.pile` and the depformer `<stem>_depth.pile` when they
-    /// exist and carry the current format marker; each component falls back to
-    /// its transform-at-load path independently otherwise
-    /// (`MARY_PPLX_MATERIALIZE=1` forces both fallbacks — the A/B switch).
-    /// Identical outputs on every path; only load time / RSS differ.
-    #[cfg(target_os = "macos")]
+    /// Authority-safe automatic load.
+    ///
+    /// The legacy filename-discovered cache could not prove that transformed
+    /// bytes belonged to this source. Automatic loading therefore recomputes
+    /// from the verified bundle while preserving the authority/loader binding
+    /// needed by any future cache design.
     pub fn load_auto(
-        pile_path: &std::path::Path,
-        loader: &WeightLoader,
+        source: &super::PersonaPlexRuntimeSource,
         fmt: WeightFmt,
         depth_f16: bool,
     ) -> Self {
-        Self {
-            temporal: super::qpile::temporal_auto(pile_path, loader, fmt),
-            depth: super::qpile::depth_auto(pile_path, loader, depth_f16),
-            stream: StreamCache::new(),
-            encoder: MimiEncoder::load(loader),
-            decoder: MimiDecoder::load(loader),
-            head: Head::F16,
-            sampler: None,
-        }
+        Self::load(source, fmt, depth_f16)
     }
 
     /// Switch the realtime step machine onto seeded sampling (`cfg` + `seed`)

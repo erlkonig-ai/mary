@@ -55,7 +55,6 @@ use mary::models::personaplex::sampling::SamplingConfig;
 use mary::models::personaplex::spm::SpmTokenizer;
 use mary::models::personaplex::temporal_metal::WeightFmt;
 use mary::nn::npy;
-use mary::nn::weight_loader::WeightLoader;
 use std::path::Path;
 use std::time::Instant;
 
@@ -70,10 +69,6 @@ fn golden_f32(name: &str) -> (Vec<f32>, Vec<usize>) {
 fn golden_i64(name: &str) -> (Vec<i64>, Vec<usize>) {
     npy::load_npy_i64(&Path::new(GOLD).join(format!("{name}.npy")))
         .unwrap_or_else(|e| panic!("golden {name}: {e}"))
-}
-
-fn pile_loader(pile: &str) -> WeightLoader {
-    mary::persist::personaplex_loader(Path::new(pile)).unwrap_or_else(|e| panic!("pile load: {e}"))
 }
 
 /// RMS of a PCM chunk (a coarse "is it making sound" meter).
@@ -195,8 +190,10 @@ fn main() {
     println!("prompt: {n_vp} voice-replay + {n_silence} silence + {} text + {n_silence} silence = {} steps", text.len(), sched.len());
 
     let t0 = Instant::now();
-    let loader = pile_loader(&pile);
-    let mut p = RealtimePipeline::load_auto(Path::new(&pile), &loader, fmt, false);
+    let source = mary::persist::personaplex_bundle(Path::new(&pile))
+        .unwrap_or_else(|e| panic!("pile load: {e}"))
+        .into_runtime_source();
+    let mut p = RealtimePipeline::load_auto(&source, fmt, false);
     if sampling {
         p.set_sampling(
             SamplingConfig {

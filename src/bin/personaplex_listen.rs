@@ -97,11 +97,12 @@ fn main() {
     println!("frames : {frames}  ({:.1} s at 12.5 Hz)", frames as f64 / 12.5);
 
     let t0 = Instant::now();
-    let loader = mary::persist::personaplex_loader(Path::new(&pile))
-        .unwrap_or_else(|e| panic!("pile: {e}"));
-    // load_auto picks up the sibling <stem>_<fmt>.pile when it exists, so this
-    // is the REAL quantised path, not a simulated round-trip.
-    let mut pipe = RealtimePipeline::load_auto(Path::new(&pile), &loader, fmt, true);
+    let source = mary::persist::personaplex_bundle(Path::new(&pile))
+        .unwrap_or_else(|e| panic!("pile: {e}"))
+        .into_runtime_source();
+    // `load_auto` deliberately recomputes the quantized runtime form from the
+    // bundle-bound source.
+    let mut pipe = RealtimePipeline::load_auto(&source, fmt, true);
     // GREEDY vs SAMPLING. Greedy is attractive because it makes two runs differ
     // only by weight format — but greedy decoding collapses audio LMs to a
     // near-constant code, which is exactly what a first attempt produced (agent

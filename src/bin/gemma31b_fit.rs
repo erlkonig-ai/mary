@@ -9,8 +9,8 @@
 //!     --gemma models/gemma_31b.pile --plex models/personaplex.pile
 //!
 //! The 31B loads as f16 via the zero-copy aliased loader (mmap → GPU, no
-//! copy). PersonaPlex is selected from its exact native f32 collection root,
-//! then each leaf is converted into a resident f16 GPU tensor. GPU allocations
+//! copy). PersonaPlex is selected from its exact signed model bundle, then each
+//! f32 leaf is converted into a resident f16 GPU tensor. GPU allocations
 //! on Apple silicon are unified memory, so peak RSS is the real system
 //! footprint.
 
@@ -67,20 +67,20 @@ mod imp {
         eprintln!("[fit] baseline RSS: {:.2} GiB", rss_gib());
 
         // ── PersonaPlex-7B: convert every exact leaf onto the GPU, hold resident ───
-        // Freeze and strictly select the same native root the realtime loader
+        // Freeze and strictly select the same signed bundle the realtime loader
         // uses; each exact leaf is uploaded at f16 and kept in
         // `plex_resident` so it stays live.
         eprintln!("[fit] loading PersonaPlex-7B weights ({plex_pile}) onto GPU...");
-        let snapshot =
-            mary::model_collection::load_model_collection_local_latest(Path::new(&plex_pile))
-                .expect("PersonaPlex collection snapshot");
-        let plex = mary::models::personaplex::PersonaPlexWeights::from_snapshot(snapshot)
-            .expect("canonical exact PersonaPlex root");
+        let plex_bundle = mary::persist::personaplex_bundle(Path::new(&plex_pile))
+            .expect("canonical signed PersonaPlex bundle");
+        let plex = plex_bundle.weights();
         let mut plex_resident: Vec<Tensor<BHalf, 1>> = Vec::new();
         let mut plex_bytes: u64 = 0;
         let mut plex_params: u64 = 0;
-        for handles in plex.exact().values() {
-            let (data, _shape) = mary::ingest::read_leaf(plex.reader(), *handles);
+        for leaf in plex.exact().values() {
+            let data = leaf
+                .view_f32()
+                .expect("PersonaPlex bundle admission rejects non-f32 leaves");
             let n = data.len();
             plex_params += n as u64;
             plex_bytes += (n * 2) as u64; // f16 resident width
