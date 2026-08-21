@@ -19,8 +19,9 @@ license = "MIT OR Apache-2.0"
 # canonical attributes (format::attrs), the legacy-alias projection and the
 # native publish/snapshot seam (model_collection), and the exact selectors
 # (selection). The dependency points one way only — mary knows nothing of this
-# crate.
-mary = { path = ".." }
+# crate. PersonaPlex currently shares Mary's lean `qwen3tts` module gate; using
+# that gate avoids pulling the runtime-only Accelerate oracle dependencies.
+mary = { path = "..", features = ["qwen3tts"] }
 triblespace = { version = "0.47.0", path = "../../triblespace-rs", default-features = false }
 anybytes = "0.20"
 anyhow = "1"

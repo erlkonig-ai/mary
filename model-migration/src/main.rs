@@ -1,44 +1,138 @@
 //! Lean one-shot migration of a legacy Mary model pile.
 //!
-//! This binary deliberately has no checkpoint reader, HuggingFace client, or
-//! model-family policy. Its inputs are the coordinates to add to one exact
-//! legacy `main` snapshot; its stdout is the full signed native collection
-//! ticket needed for an exact read.
+//! This binary deliberately has no checkpoint reader or HuggingFace client.
+//! Each subcommand names an existing pile, key, and complete legacy authority;
+//! stdout is the full signed native collection ticket needed for an exact read.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use anyhow::Context;
-use clap::Parser;
-use mary_model_migration::{migrate_legacy_model_main, LegacyModelMigration};
+use clap::{Parser, Subcommand};
+use mary_model_migration::{
+    adopt_legacy_personaplex_bundle, migrate_legacy_model_main, LegacyModelMigration,
+};
+use triblespace::core::inline::encodings::hash::{Blake3, Hash};
 use triblespace::core::repo::pile::Pile;
+use triblespace::core::repo::CommitHandle;
 use triblespace::core::signing_key_file;
+use triblespace::prelude::blobencodings::SimpleArchive;
+use triblespace::prelude::inlineencodings::Handle;
+use triblespace::prelude::{Inline, TryToInline};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "mary-model-migrate",
-    about = "Publish a frozen legacy Mary 'main' branch as one native model-collection commit",
+    about = "Adopt exact legacy Mary model graphs into native collections",
     version
 )]
 struct Args {
-    /// Existing legacy model pile. It is never created, repaired, or amputated.
-    #[arg(long)]
-    pile: PathBuf,
-    /// Existing private signing-key file (strict 64-hex, owner-private mode).
-    #[arg(long)]
-    key: PathBuf,
-    /// Existing model_name on the unique legacy weight root (name + member).
-    #[arg(long)]
-    model_name: String,
-    /// Canonical source coordinate for native model selection.
-    #[arg(long)]
-    source: String,
-    /// Canonical quantization/weight-format coordinate.
-    #[arg(long)]
-    quantization: String,
-    /// Optional existing tokenizer name to validate exactly after projection.
-    #[arg(long)]
-    tokenizer_name: Option<String>,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Publish one generic legacy model root into `mary-model-graph`.
+    Model {
+        /// Existing legacy model pile. It is never created, repaired, or amputated.
+        #[arg(long)]
+        pile: PathBuf,
+        /// Existing private signing-key file (strict 64-hex, owner-private mode).
+        #[arg(long)]
+        key: PathBuf,
+        /// Existing model_name on the unique legacy weight root (name + member).
+        #[arg(long)]
+        model_name: String,
+        /// Canonical source coordinate for native model selection.
+        #[arg(long)]
+        source: String,
+        /// Canonical quantization/weight-format coordinate.
+        #[arg(long)]
+        quantization: String,
+        /// Optional existing tokenizer name to validate exactly after projection.
+        #[arg(long)]
+        tokenizer_name: Option<String>,
+    },
+    /// Adopt an exact legacy PersonaPlex weight commit into `mary-model-bundles`.
+    Personaplex {
+        /// Existing legacy PersonaPlex pile. It is never created or repaired.
+        #[arg(long)]
+        pile: PathBuf,
+        /// Existing private signing-key file (strict 64-hex, owner-private mode).
+        #[arg(long)]
+        key: PathBuf,
+        /// Exact legacy weight COMMIT (`blake3:<64 hex>` or bare 64 hex).
+        #[arg(long, value_parser = parse_commit_handle)]
+        legacy_commit: CommitHandle,
+    },
+}
+
+enum MigrationOutput {
+    Model(mary_model_migration::LegacyModelMigrationResult),
+    PersonaPlex(mary_model_migration::PersonaPlexLegacyAdoptionResult),
+}
+
+fn parse_commit_handle(value: &str) -> Result<CommitHandle, String> {
+    let trimmed = value.trim();
+    let owned;
+    let normalized = if trimmed.contains(':') {
+        trimmed
+    } else {
+        owned = format!("blake3:{trimmed}");
+        &owned
+    };
+    let hash: Inline<Hash<Blake3>> = normalized.try_to_inline().map_err(|error| {
+        format!(
+            "invalid legacy commit {value:?}: {error:?} (expected `blake3:<64 hex>` or bare hex)"
+        )
+    })?;
+    Ok(Handle::<SimpleArchive>::from_hash(hash))
+}
+
+fn run(command: Command) -> anyhow::Result<MigrationOutput> {
+    let (pile_path, key_path) = match &command {
+        Command::Model { pile, key, .. } | Command::Personaplex { pile, key, .. } => (pile, key),
+    };
+    // No path inference, environment fallback, initialization, or generated
+    // key: the durable path is a required CLI argument.
+    let signing_key = signing_key_file::load_existing(key_path)
+        .with_context(|| format!("load existing signing key {key_path:?}"))?;
+    let mut pile = Pile::open(pile_path)
+        .with_context(|| format!("open existing legacy model pile {pile_path:?}"))?;
+
+    let migration = match command {
+        Command::Model {
+            model_name,
+            source,
+            quantization,
+            tokenizer_name,
+            ..
+        } => migrate_legacy_model_main(
+            &mut pile,
+            &signing_key,
+            LegacyModelMigration {
+                legacy_model_name: &model_name,
+                source: &source,
+                quantization: &quantization,
+                tokenizer_name: tokenizer_name.as_deref(),
+            },
+        )
+        .map(MigrationOutput::Model),
+        Command::Personaplex { legacy_commit, .. } => {
+            adopt_legacy_personaplex_bundle(&mut pile, &signing_key, legacy_commit)
+                .map(MigrationOutput::PersonaPlex)
+        }
+    };
+    let close = pile.close();
+    match (migration, close) {
+        (Ok(output), Ok(())) => Ok(output),
+        (Ok(_), Err(error)) => Err(anyhow::anyhow!("close migrated pile: {error}")),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(close_error)) => Err(error.context(format!(
+            "migration also failed to close the pile: {close_error}"
+        ))),
+    }
 }
 
 fn lowercase_hex(bytes: &[u8]) -> String {
@@ -51,56 +145,46 @@ fn lowercase_hex(bytes: &[u8]) -> String {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    // No path inference, environment fallback, initialization, or generated
-    // key: the durable path is a required CLI argument.
-    let signing_key = signing_key_file::load_existing(&args.key)
-        .with_context(|| format!("load existing signing key {:?}", args.key))?;
-    let mut pile = Pile::open(&args.pile)
-        .with_context(|| format!("open existing legacy model pile {:?}", args.pile))?;
+    let migration = run(args.command)?;
 
-    let migration = migrate_legacy_model_main(
-        &mut pile,
-        &signing_key,
-        LegacyModelMigration {
-            legacy_model_name: &args.model_name,
-            source: &args.source,
-            quantization: &args.quantization,
-            tokenizer_name: args.tokenizer_name.as_deref(),
-        },
-    );
-
-    // The core API has no durability policy. This one-shot command owns one
-    // explicit close boundary on every post-open path, including validation
-    // failure (where Repository's content-addressed reads normally left the
-    // pile clean).
-    let close = pile.close();
-    let result = match (migration, close) {
-        (Ok(result), Ok(())) => result,
-        (Ok(_), Err(error)) => return Err(anyhow::anyhow!("close migrated pile: {error}")),
-        (Err(error), Ok(())) => return Err(error),
-        (Err(error), Err(close_error)) => {
-            return Err(error.context(format!(
-                "migration also failed to close the pile: {close_error}"
-            )))
+    let commit = match migration {
+        MigrationOutput::Model(result) => {
+            eprintln!(
+                "migrated legacy main branch {} head {:?}: model {}, tokenizer {:?}, {} legacy facts + {} aliases + {} selector facts; team {}, native commit {}",
+                result.legacy_branch,
+                result.legacy_head,
+                result.model_root,
+                result.tokenizer_root,
+                result.legacy_facts,
+                result.aliases_added,
+                result.selector_facts_added,
+                lowercase_hex(&result.team.to_bytes()),
+                result.commit.id(),
+            );
+            result.commit
+        }
+        MigrationOutput::PersonaPlex(result) => {
+            eprintln!(
+                "{} exact legacy PersonaPlex commit {:?}: LM {}, Mimi {}, unified root {}, H {:?}, {} legacy facts + {} aliases; team {}, bundle commit {}",
+                if result.published { "adopted" } else { "already adopted" },
+                result.legacy_commit,
+                result.legacy_lm_root,
+                result.legacy_mimi_root,
+                result.model_root,
+                result.model_archive_data,
+                result.legacy_facts,
+                result.aliases_added,
+                lowercase_hex(&result.team.to_bytes()),
+                result.commit.id(),
+            );
+            result.commit
         }
     };
-
-    eprintln!(
-        "migrated legacy main branch {} head {:?}: model {}, tokenizer {:?}, {} legacy facts + {} aliases + {} selector facts; native commit {}",
-        result.legacy_branch,
-        result.legacy_head,
-        result.model_root,
-        result.tokenizer_root,
-        result.legacy_facts,
-        result.aliases_added,
-        result.selector_facts_added,
-        result.commit.id(),
-    );
 
     // Machine-readable stdout: exactly the complete 192-byte signed ticket,
     // lowercase hex plus the conventional trailing newline. An exact reader
     // can reconstruct CollectionCommit::from_bytes from these 384 digits.
-    println!("{}", lowercase_hex(&result.commit.to_bytes()));
+    println!("{}", lowercase_hex(&commit.to_bytes()));
     Ok(())
 }
 
@@ -118,5 +202,45 @@ mod tests {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
         assert_eq!(&encoded[..8], "00010203");
         assert_eq!(&encoded[encoded.len() - 8..], "bcbdbebf");
+    }
+
+    #[test]
+    fn personaplex_cli_accepts_only_an_explicit_pile_key_and_commit() {
+        let hash = "01".repeat(32);
+        let args = Args::try_parse_from([
+            "mary-model-migrate",
+            "personaplex",
+            "--pile",
+            "/models/personaplex.pile",
+            "--key",
+            "/keys/migration.key",
+            "--legacy-commit",
+            hash.as_str(),
+        ])
+        .expect("parse explicit PersonaPlex migration coordinates");
+        let Command::Personaplex {
+            pile,
+            key,
+            legacy_commit,
+        } = args.command
+        else {
+            panic!("wrong subcommand")
+        };
+        assert_eq!(pile, PathBuf::from("/models/personaplex.pile"));
+        assert_eq!(key, PathBuf::from("/keys/migration.key"));
+        assert_eq!(
+            legacy_commit,
+            parse_commit_handle(&format!("blake3:{hash}")).unwrap()
+        );
+
+        assert!(Args::try_parse_from([
+            "mary-model-migrate",
+            "personaplex",
+            "--pile",
+            "/models/personaplex.pile",
+            "--key",
+            "/keys/migration.key",
+        ])
+        .is_err());
     }
 }
