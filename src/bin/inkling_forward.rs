@@ -2940,14 +2940,17 @@ fn main() -> Result<()> {
     // nothing else changes about which end holds what. The embedding NORM stays
     // head-only: it belongs to the main stack's input, and every MTP head norms
     // its own embeddings with its own `embed_norm`.
-    // What prefill will hold in `[heads, n, n]` score matrices, which is the
-    // largest thing this run allocates and the only term that grows as `n^2`.
-    // The admission gate charged a flat per-layer figure for "activations"
-    // regardless of sequence length, which is how it admitted a run that peaked
-    // at 119.5 GiB of a 119.6 GiB node.
+    // What prefill will hold in ACTIVATIONS at this sequence length: the
+    // residual stream, every layer's kept keys and values, and the widest
+    // layer's own working set. The gate charged a flat per-layer figure for
+    // this, which is how it admitted a run that peaked at 119.5 GiB of a 119.6
+    // GiB node; it then charged the score blocks, which stopped growing as soon
+    // as the dense lane blocked its queries and left the estimate flat again --
+    // 13.84 GiB at 16,384 tokens and 13.52 at 100,623. What actually scales is
+    // the routed-expert lane, six rows a token through hidden-width buffers.
     let attn_heads = t.heads(AttnKind::Global).0.max(t.heads(AttnKind::Local).0);
     let attn_head_dim = t.heads(AttnKind::Global).2.max(t.heads(AttnKind::Local).2);
-    let attention_bytes = budget::prefill_peak_bytes(attn_heads, n);
+    let attention_bytes = budget::prefill_activation_bytes(t, lo..hi, n);
     // What b slots hold in K and V once they are all prefilled. A global
     // layer keeps the whole context, a local one keeps its window, and both
     // keep K and V -- so this is the term that multiplies with the batch and
@@ -3392,19 +3395,17 @@ fn main() -> Result<()> {
     println!(
         "  attention budget   : queries in blocks of {qblock}, so [{attn_heads}, {qblock}, {n}] \
          f32 scores = {:.2} GiB per layer (the whole square would be {:.2} GiB) beside \
-         [{attn_heads}, {n}, {attn_head_dim}] f32 activations = {:.2} GiB; largest single \
-         allocation this device allows {:.2} GiB (up to {} tokens)",
+         [{attn_heads}, {n}, {attn_head_dim}] f32 activations = {:.2} GiB; the widest single \
+         buffer this range asks for is {:.2} GiB and this device allows {:.2} GiB \
+         (up to {} tokens)",
         budget::score_block_bytes(attn_heads, qblock, n) as f64 / GIB,
         budget::score_matrix_bytes(attn_heads, n) as f64 / GIB,
         budget::activation_bytes(attn_heads, attn_head_dim, n) as f64 / GIB,
+        budget::largest_buffer(t, lo..hi, n) as f64 / GIB,
         budget::largest_allocation(&fp4_client) as f64 / GIB,
-        budget::longest_sequence(
-            attn_heads,
-            attn_head_dim,
-            budget::largest_allocation(&fp4_client)
-        ),
+        budget::longest_sequence(t, lo..hi, budget::largest_allocation(&fp4_client)),
     );
-    budget::check(&fp4_client, attn_heads, attn_head_dim, n)?;
+    budget::check(&fp4_client, t, lo..hi, n)?;
     // Nine blocking device round trips for the whole run, instead of four per
     // expert. Every later slab is an offset view of one of these.
     //
@@ -4484,6 +4485,30 @@ fn main() -> Result<()> {
     // and it makes `t_stack_sync` the stack's device time and `t_head` the
     // head's, rather than one number smeared over both.
     <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync after the stack");
+    // What the device pool has RESERVED once the whole stack has run, which is
+    // the quantity the admission gate exists to predict. On a unified-memory
+    // part the pool is node memory, so everything in it beyond the weight arena
+    // IS the activation working set at this sequence length -- and unlike
+    // `MemAvailable` it is not polluted by whatever else the box is doing.
+    println!("{}", mary::models::inkling::seam::pool_line(&fp4_client, "after stack"));
+    // The admission gate's prediction beside what the run actually reserved, on
+    // the same line, every pass. The gate is the only thing standing between a
+    // long input and a node in swap, and the way it failed before was not that
+    // it was noisy -- it was FLAT, charging 13.5 GiB whether the input was
+    // 16,384 tokens or 100,623, and nothing printed by the run said otherwise.
+    // Printing the outcome next to the estimate makes every run a measurement
+    // of its own gate: a reserved figure above the charge is a run that was
+    // admitted and should not have been.
+    let reserved = mary::models::inkling::seam::pool_reserved(&fp4_client);
+    if reserved > 0 {
+        println!(
+            "    activations: {:.2} GiB charged at admission, {:.2} GiB reserved by the pool \
+             ({:+.0}%)",
+            attention_bytes as f64 / GIB,
+            reserved as f64 / GIB,
+            100.0 * (reserved as f64 / attention_bytes.max(1) as f64 - 1.0),
+        );
+    }
     let rms_col: Vec<f32> = if layer_rms.is_empty() {
         Vec::new()
     } else {

@@ -187,6 +187,19 @@ pub fn client_of<const D: usize>(t: &Tensor<Bk, D>) -> ComputeClient<CudaRuntime
     }
 }
 
+/// What the device pool has RESERVED, in bytes.
+///
+/// The one number the admission gate is trying to predict. On a unified-memory
+/// part `cuMemAlloc` is node memory, so the pool's reservation IS the run's
+/// activation footprint -- and unlike `MemAvailable` it belongs to this process
+/// alone, so a box with something else running on it does not move it.
+///
+/// Zero when the runtime will not answer, which reads as "nothing to compare
+/// against" wherever it is printed rather than as a suspiciously small run.
+pub fn pool_reserved(client: &ComputeClient<CudaRuntime>) -> u64 {
+    client.memory_usage().map(|u| u.bytes_reserved).unwrap_or(0)
+}
+
 /// What the device pool has RESERVED against what the run is holding.
 ///
 /// The gap between those two is not padding. cubecl's sliced pools hand back a
