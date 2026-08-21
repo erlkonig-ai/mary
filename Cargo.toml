@@ -613,6 +613,12 @@ required-features = ["qwen3tts"]
 name = "mimi_probe"
 required-features = ["qwen3tts", "import"]
 
+# Mimi encoder CPU-vs-GPU bench + statistical parity. The streaming encoder is
+# a realtime-critical-path stage; this measures both lanes on one input.
+[[bin]]
+name = "mimi_gpu_probe"
+required-features = ["qwen3tts", "q4"]
+
 # Mimi codec round-trip: WAV -> encode -> decode -> WAV. Measures what the
 # codec alone preserves (sung vs spoken input), independent of any LM.
 [[bin]]
