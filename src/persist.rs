@@ -891,6 +891,49 @@ fn pre_epoch_aliased(facts: &TribleSet) -> TribleSet {
     crate::model_collection::project_legacy_model_attributes(facts).facts
 }
 
+/// Drop every pre-epoch attribute spelling whose canonical alias is already
+/// stated, and report how many went.
+///
+/// The exact inverse of [`pre_epoch_aliased`], and the reason it exists is that
+/// the projection is a READ-side convenience which becomes a WRITE-side defect
+/// the moment its output is persisted. A pile-to-pile conversion reads through
+/// the projection and would otherwise carry both spellings of every fact into
+/// the new file — a converted model pile stating `kind` 173 times AND its
+/// historical literal 173 times, for a fact set exactly twice the size it
+/// means. (Both spellings are already on disk in the qwen3tts collections,
+/// which were published from projected facts for the same reason.)
+///
+/// A drop happens only where the canonical twin is present, so nothing this
+/// removes is information: the fact survives under the name every current
+/// reader actually queries. A historical id with no canonical twin in the set
+/// is an error rather than a silent drop — that would mean the projection
+/// table and the pile disagree, which is exactly the case where guessing loses
+/// data. Attributes absent from the table are untouched, historical or not.
+pub fn strip_projected_legacy_attributes(facts: &TribleSet) -> anyhow::Result<(TribleSet, usize)> {
+    let aliases = crate::model_collection::legacy_model_attribute_aliases();
+    let canonical_of: std::collections::HashMap<Id, Id> = aliases
+        .iter()
+        .map(|alias| (alias.historical, alias.canonical))
+        .collect();
+    let mut out = TribleSet::new();
+    let mut dropped = 0usize;
+    for fact in facts.iter() {
+        if let Some(canonical) = canonical_of.get(fact.a()) {
+            let twin = Trible::force(fact.e(), canonical, fact.v::<UnknownInline>());
+            anyhow::ensure!(
+                facts.contains(&twin),
+                "pre-epoch fact {} on {} has no canonical twin — refusing to drop it",
+                fact.a(),
+                fact.e()
+            );
+            dropped += 1;
+            continue;
+        }
+        out.insert(fact);
+    }
+    Ok((out, dropped))
+}
+
 /// Open a pile and build the leaf indexes for two families of model entities —
 /// the ones whose name starts with `f16_prefix` (half-width leaves for the fast
 /// native-width GPU load) and ALL OTHERS (the exact leaves) — plus a
@@ -1558,6 +1601,172 @@ pub fn load_keymap_from_pile_prefixed(
 
 /// The default weight-format tag: the faithful import (no derived quantization).
 pub const QUANTIZATION_NATIVE: &str = "native";
+
+#[cfg(test)]
+mod legacy_spelling_tests {
+    use super::*;
+    use crate::model_collection::{
+        legacy_model_attribute_aliases, project_legacy_model_attributes, ModelAttributeAlias,
+    };
+    use triblespace::core::id_hex;
+
+    fn raw_fact(entity: Id, attribute: Id, value: u8) -> Trible {
+        Trible::force(
+            &entity,
+            &attribute,
+            &Inline::<UnknownInline>::new([value; 32]),
+        )
+    }
+
+    fn mapping(label: &str) -> ModelAttributeAlias {
+        legacy_model_attribute_aliases()
+            .into_iter()
+            .find(|mapping| mapping.label == label)
+            .unwrap_or_else(|| panic!("missing mapping {label}"))
+    }
+
+    /// Projecting then stripping is the identity on the canonical facts, and
+    /// leaves nothing pre-epoch behind.
+    ///
+    /// This is the round trip a conversion actually performs: it reads a
+    /// pre-epoch pile through the projection and writes what comes out. Without
+    /// the strip it writes both spellings — which is what the qwen3tts
+    /// collections on disk hold, 17208 facts stating 8604.
+    #[test]
+    fn projecting_then_stripping_leaves_exactly_one_spelling() {
+        let model = id_hex!("A4C3D3D77C7C63A0E9CE1A45A1F3B4B5");
+        let leaf = id_hex!("2A0DE5F9E2A56AB6D5A21A3E9BB2F0C1");
+        let legacy = [
+            raw_fact(model, mapping("format.member").historical, 0x11),
+            raw_fact(model, mapping("format.model_name").historical, 0x12),
+            raw_fact(leaf, mapping("format.shape").historical, 0x22),
+            raw_fact(leaf, mapping("format.weight").historical, 0x23),
+        ];
+        // One attribute with no mapping at all, which must survive untouched.
+        let unmapped = raw_fact(leaf, id_hex!("0B51DA3E67216213871743E045590DBC"), 0x44);
+        let input: TribleSet = legacy.iter().copied().chain([unmapped]).collect();
+
+        let projected = project_legacy_model_attributes(&input).facts;
+        assert_eq!(projected.len(), 9, "four aliases added beside five facts");
+
+        let (stripped, dropped) = strip_projected_legacy_attributes(&projected).unwrap();
+        assert_eq!(dropped, legacy.len());
+        assert_eq!(stripped.len(), 5);
+        assert!(stripped.contains(&unmapped));
+        for source in legacy {
+            let alias_mapping = legacy_model_attribute_aliases()
+                .into_iter()
+                .find(|mapping| mapping.historical == *source.a())
+                .expect("audited mapping");
+            let canonical = Trible::force(
+                source.e(),
+                &alias_mapping.canonical,
+                source.v::<UnknownInline>(),
+            );
+            assert!(!stripped.contains(&source), "pre-epoch spelling survived");
+            assert!(stripped.contains(&canonical), "canonical spelling lost");
+        }
+
+        // Idempotent: nothing pre-epoch is left to drop.
+        let (again, dropped_again) = strip_projected_legacy_attributes(&stripped).unwrap();
+        assert_eq!(dropped_again, 0);
+        assert_eq!(again, stripped);
+    }
+
+    /// A pre-epoch fact whose canonical twin is missing is an error, not a
+    /// silent drop.
+    ///
+    /// The whole safety of the strip rests on the twin existing. If the
+    /// projection table and the pile ever disagree, the difference between
+    /// refusing and shrugging is the difference between a loud failure and a
+    /// converted model quietly missing a fact.
+    #[test]
+    fn an_unprojected_pre_epoch_fact_is_refused_rather_than_dropped() {
+        let leaf = id_hex!("2A0DE5F9E2A56AB6D5A21A3E9BB2F0C1");
+        let orphan: TribleSet = [raw_fact(leaf, mapping("format.shape").historical, 0x22)]
+            .into_iter()
+            .collect();
+        let error = strip_projected_legacy_attributes(&orphan)
+            .err()
+            .expect("an unprojected pre-epoch fact must not be dropped");
+        assert!(
+            error.to_string().contains("no canonical twin"),
+            "unexpected diagnostic: {error}"
+        );
+    }
+}
+
+/// A model pile's complete facts, read through whichever reader it actually
+/// has, plus the identity of the collection that authorized them.
+///
+/// `collection` is `Some((team, handle))` exactly when the pile publishes a
+/// `mary-model-graph` collection, and the handle is taken from the pile's OWN
+/// commits rather than recomputed from the team — so a conversion comparing
+/// source and destination compares what is on disk, not one function against
+/// itself.
+pub struct ModelPileSource {
+    /// Every fact the model is stated by, canonical aliases projected in.
+    pub facts: TribleSet,
+    /// Reader over the source's immutable mapping; valid after the pile closes.
+    pub reader: triblespace::core::repo::pile::PileReader,
+    /// `(team, collection handle)`, absent for a pre-collection pile.
+    pub collection: Option<(
+        ed25519_dalek::VerifyingKey,
+        triblespace::core::collection::CollectionHandle,
+    )>,
+    /// Which reader answered: `"collection"`, or the branch name.
+    pub via: &'static str,
+}
+
+/// Read a model pile's complete facts, PREFERRING its signed collection.
+///
+/// The two readers a model pile has do not agree, and the collection is the
+/// one that is right. `qwen3tts.pile` carries two pins both named `main`;
+/// `lookup_branch` picks one, and that one states 1292 of the model's 1465
+/// weight entities. The collection states all 1465 — the pins are fragments of
+/// a history, the collection is the model. Anything deciding what a pile
+/// contains (a converter, a verifier) has to ask the collection or it is
+/// deciding about a fraction.
+///
+/// The branch fallback is for the pre-collection piles only (f5, smolvla,
+/// siglip). It is never consulted when a collection is present.
+pub fn read_model_pile(path: &Path) -> anyhow::Result<ModelPileSource> {
+    let mut pile = Pile::open(path).map_err(|e| anyhow::anyhow!("open {path:?}: {e:?}"))?;
+    let team = match crate::model_collection::sole_model_graph_team(&mut pile) {
+        Ok(team) => Some(team),
+        Err(crate::model_collection::SoleModelGraphTeamError::None) => None,
+        Err(e) => {
+            let _ = pile.close();
+            anyhow::bail!("{path:?}: model-graph team: {e}");
+        }
+    };
+    let Some(team) = team else {
+        let _ = pile.close();
+        let (branch, facts, reader) = checkout_any_branch(path)?;
+        return Ok(ModelPileSource {
+            facts,
+            reader,
+            collection: None,
+            via: branch,
+        });
+    };
+
+    let snapshot = crate::model_collection::snapshot_model_collection_local_latest(&mut pile, team)
+        .map_err(|e| anyhow::anyhow!("{path:?}: snapshot model collection: {e}"))?;
+    let facts = pre_epoch_aliased(snapshot.facts());
+    let (_, commits, reader) = snapshot.into_parts();
+    let handle = commits
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("{path:?}: a model collection with no commits"))?
+        .collection();
+    let _ = pile.close();
+    Ok(ModelPileSource {
+        facts,
+        reader,
+        collection: Some((team, handle)),
+        via: "collection",
+    })
+}
 
 /// Open a pile and return `(branch name, facts, blob reader)` from whichever
 /// branch holds the model — `mary` if present, else `main`.

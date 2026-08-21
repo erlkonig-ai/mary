@@ -23,6 +23,50 @@ use triblespace::core::repo::{ancestors, Repository};
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
+/// One fact set's attribute histogram, labelled from mary's own schema.
+///
+/// Shared by the branch walk and the collection view deliberately: the whole
+/// point of printing both readers is that their fact sets can DIFFER, and a
+/// difference is only visible when the same census is applied to each. It also
+/// makes the epoch legible — a pre-epoch fact set shows bare `Id(...)` where a
+/// post-epoch one shows `data`/`shape`/`weight`, because the historical
+/// literal ids have no current declaration to be named by.
+fn print_attribute_census(
+    set: &TribleSet,
+    leaf_names: &std::collections::HashMap<Id, String>,
+) {
+    let mut counts: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for t in set.iter() {
+        let a = t.a();
+        let label = match a {
+            x if *x == mary::format::attrs::data.id() => "data".to_string(),
+            x if *x == mary::format::attrs::data_f16.id() => "data_f16".to_string(),
+            x if *x == mary::format::attrs::shape.id() => "shape".to_string(),
+            x if *x == mary::format::attrs::data_q4.id() => "data_q4".to_string(),
+            x if *x == mary::format::attrs::data_q8.id() => "data_q8".to_string(),
+            x if *x == mary::format::attrs::q_scales.id() => "q_scales".to_string(),
+            x if *x == mary::format::attrs::weight.id() => "weight".to_string(),
+            x if *x == mary::format::attrs::bias.id() => "bias".to_string(),
+            x if *x == mary::format::attrs::kind.id() => "kind".to_string(),
+            x if *x == mary::format::attrs::safetensor_path.id() => "safetensor_path".to_string(),
+            x if *x == mary::format::attrs::member.id() => "member".to_string(),
+            x if *x == mary::format::attrs::model_name.id() => "model_name".to_string(),
+            x if *x == mary::format::attrs::source.id() => "source".to_string(),
+            x if *x == mary::format::attrs::quantization.id() => "quantization".to_string(),
+            x if *x == mary::format::attrs::index.id() => "index".to_string(),
+            other => leaf_names
+                .get(other)
+                .cloned()
+                .unwrap_or_else(|| format!("{other}")),
+        };
+        *counts.entry(label).or_default() += 1;
+    }
+    for (k, v) in counts {
+        println!("      {v:6}  {k}");
+    }
+}
+
 fn main() -> Result<()> {
     let path = std::env::args().nth(1).context("usage: pile_branches <pile>")?;
     let path = std::path::Path::new(&path);
@@ -126,38 +170,7 @@ fn main() -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
                 .facts()
                 .clone();
-            let mut counts: std::collections::BTreeMap<String, usize> =
-                std::collections::BTreeMap::new();
-            for t in set.iter() {
-                let a = t.a();
-                let label = match a {
-                    x if *x == mary::format::attrs::data.id() => "data".to_string(),
-                    x if *x == mary::format::attrs::data_f16.id() => "data_f16".to_string(),
-                    x if *x == mary::format::attrs::shape.id() => "shape".to_string(),
-                    x if *x == mary::format::attrs::data_q4.id() => "data_q4".to_string(),
-                    x if *x == mary::format::attrs::data_q8.id() => "data_q8".to_string(),
-                    x if *x == mary::format::attrs::q_scales.id() => "q_scales".to_string(),
-                    x if *x == mary::format::attrs::weight.id() => "weight".to_string(),
-                    x if *x == mary::format::attrs::bias.id() => "bias".to_string(),
-                    x if *x == mary::format::attrs::kind.id() => "kind".to_string(),
-                    x if *x == mary::format::attrs::safetensor_path.id() => {
-                        "safetensor_path".to_string()
-                    }
-                    x if *x == mary::format::attrs::member.id() => "member".to_string(),
-                    x if *x == mary::format::attrs::model_name.id() => "model_name".to_string(),
-                    x if *x == mary::format::attrs::source.id() => "source".to_string(),
-                    x if *x == mary::format::attrs::quantization.id() => "quantization".to_string(),
-                    x if *x == mary::format::attrs::index.id() => "index".to_string(),
-                    other => leaf_names
-                        .get(other)
-                        .cloned()
-                        .unwrap_or_else(|| format!("{other}")),
-                };
-                *counts.entry(label).or_default() += 1;
-            }
-            for (k, v) in counts {
-                println!("      {v:6}  {k}");
-            }
+            print_attribute_census(&set, &leaf_names);
         }
     }
 
@@ -188,6 +201,7 @@ fn main() -> Result<()> {
                     println!("\nmodel collection: {} facts", facts.len());
                     println!("  typed leaves      {typed}");
                     println!("  two-blob leaves   {two_blob}");
+                    print_attribute_census(facts, &leaf_names);
                 }
             }
         }

@@ -17,6 +17,20 @@
 //! so identity is checkable directly rather than through a naming convention
 //! that could itself be wrong.
 //!
+//! Both sides are read through the SIGNED COLLECTION where there is one, which
+//! is the seam `mary::speak` selects from — a converted pile that verifies
+//! through the deprecated branch pins and cannot be opened by the production
+//! loader has passed the wrong exam. It also settles what "every fact" means:
+//! `qwen3tts.pile` has two pins both named `main`, so a branch-side comparison
+//! is between one fragment of the source and the whole of the destination.
+//!
+//! And both sides are CANONICALIZED before comparison — projected into the
+//! current attribute spellings, then de-duplicated back down to one spelling
+//! each. The source states its facts under pre-epoch literal ids and the
+//! conversion writes canonical ones; comparing the raw sets would report every
+//! surviving fact as both lost and gained. Canonicalizing both is what makes
+//! "nothing was lost" a statement about facts rather than about spellings.
+//!
 //!   pile_leaf_verify <src.pile> <dst.pile>
 
 use anyhow::{Context, Result};
@@ -49,6 +63,24 @@ fn src_leaves_ids(tribles: &TribleSet) -> HashSet<Id> {
     ids
 }
 
+/// A collection handle as its bare hex, which is how one is compared by eye.
+///
+/// `Debug` on the handle prints its full generic path around the 32 bytes that
+/// actually distinguish it, and this line exists to be read.
+fn handle_hex(handle: &triblespace::core::collection::CollectionHandle) -> String {
+    handle.raw.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// One spelling per fact: project the canonical aliases in, then drop the
+/// pre-epoch literals they cover.
+///
+/// Idempotent, and that is what makes it usable on both sides of a comparison
+/// between a pre-epoch source and a post-epoch conversion.
+fn canonical_facts(facts: &TribleSet) -> Result<TribleSet> {
+    let projected = mary::model_collection::project_legacy_model_attributes(facts).facts;
+    Ok(mary::persist::strip_projected_legacy_attributes(&projected)?.0)
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let src = args
@@ -59,13 +91,39 @@ fn main() -> Result<()> {
         .context("usage: pile_leaf_verify <src.pile> <dst.pile>")?;
     let (src, dst) = (Path::new(&src), Path::new(&dst));
 
-    let (src_branch, src_tribles, src_reader) = mary::persist::checkout_any_branch(src)?;
-    let (dst_branch, dst_tribles, dst_reader) = mary::persist::checkout_any_branch(dst)?;
-    anyhow::ensure!(
-        src_branch == dst_branch,
-        "branch differs: source '{src_branch}', converted '{dst_branch}'"
+    let source = mary::persist::read_model_pile(src)?;
+    let converted = mary::persist::read_model_pile(dst)?;
+    println!(
+        "read via    source '{}', converted '{}'",
+        source.via, converted.via
     );
-    println!("branch      '{src_branch}'");
+
+    // The collection is the thing a converted model pile is FOR. Its identity
+    // must be the source's, byte for byte: model piles resolve by content
+    // address, and a moved descriptor is not a rename, it is every existing
+    // reference silently failing to find a model.
+    match (source.collection, converted.collection) {
+        (Some((_, src_handle)), Some((_, dst_handle))) => {
+            anyhow::ensure!(
+                src_handle == dst_handle,
+                "collection identity moved: source {}, converted {}",
+                handle_hex(&src_handle),
+                handle_hex(&dst_handle)
+            );
+            println!("collection  identity unchanged: {}", handle_hex(&src_handle));
+        }
+        (Some(_), None) => anyhow::bail!(
+            "the source publishes a model collection and the converted pile does not — \
+             `mary::speak` cannot open it"
+        ),
+        (None, Some(_)) => anyhow::bail!(
+            "the converted pile publishes a collection the source never had"
+        ),
+        (None, None) => println!("collection  neither pile has one (pre-collection source)"),
+    }
+
+    let (src_tribles, src_reader) = (canonical_facts(&source.facts)?, source.reader);
+    let (dst_tribles, dst_reader) = (canonical_facts(&converted.facts)?, converted.reader);
 
     // ── 1. every non-replaced fact survived, unchanged ──────────────────────
     //
