@@ -837,18 +837,16 @@ mod tests {
         tensor: &str,
         value: f32,
         f16: bool,
+        form: crate::leaf::Form,
     ) -> Fragment {
         let mut fragment = Fragment::empty();
-        let shape = fragment.put::<U64Array, _>(vec![1_u64]);
-        let leaf = if f16 {
-            let data = fragment.put::<crate::f16enc::F16Array, _>(vec![half::f16::from_f32(value)]);
-            entity! { _ @ attrs::data_f16: data, attrs::shape: shape }
-        } else {
-            let data = fragment.put::<F32Array, _>(vec![value]);
-            entity! { _ @ attrs::data: data, attrs::shape: shape }
-        };
-        let leaf_id = leaf.root().expect("tensor leaf root");
-        fragment += leaf;
+        let leaf_id = crate::leaf::fixture_leaf(
+            &mut fragment,
+            form,
+            if f16 { Elem::F16 } else { Elem::F32 },
+            &[1_u64],
+            &[value],
+        );
 
         let name = fragment.put::<LongString, _>(tensor.to_owned());
         let member = entity! { _ @ attrs::safetensor_path: name, attrs::weight: &leaf_id };
@@ -884,7 +882,7 @@ mod tests {
         pile.close().expect("close synthetic Qwen3-TTS pile");
     }
 
-    fn cohort(variant: Qwen3TtsVariant) -> [Fragment; 4] {
+    fn cohort(variant: Qwen3TtsVariant, form: crate::leaf::Form) -> [Fragment; 4] {
         [
             component_fragment(
                 &variant.component_source(BASE),
@@ -892,6 +890,7 @@ mod tests {
                 "base.weight",
                 1.0,
                 false,
+                form,
             ),
             component_fragment(
                 CODEC_SOURCE,
@@ -899,6 +898,7 @@ mod tests {
                 "codec.weight",
                 2.0,
                 false,
+                form,
             ),
             component_fragment(
                 &variant.component_source(TALKER_F16),
@@ -906,6 +906,7 @@ mod tests {
                 "talker.weight",
                 3.0,
                 true,
+                form,
             ),
             component_fragment(
                 &variant.component_source(TALKER_FOLDED_F16),
@@ -913,15 +914,80 @@ mod tests {
                 "talker.folded.weight",
                 4.0,
                 true,
+                form,
             ),
         ]
+    }
+
+    /// The cohort selects, and the four components keep their widths, whether
+    /// the leaves are one typed blob or the two-blob pair the piles still
+    /// hold. Both, because the migration to typed leaves has not happened on
+    /// disk yet: the two-blob arm is what `models/qwen3tts.pile` is TODAY and
+    /// the typed arm is what a conversion of it would be, and this seam has to
+    /// survive the change rather than be adjusted after it.
+    #[test]
+    fn qwen3tts_cohort_selects_in_either_leaf_form() {
+        for form in crate::leaf::FORMS {
+            let file = TestPile::new();
+            let variant = Qwen3TtsVariant::Base1_7B;
+            let fragments = cohort(variant, form);
+
+            // The arm did what it says. Without this the typed pass would
+            // still be green if `fixture_leaf` quietly built two-blob leaves
+            // for both forms — a test that checks the reader by way of a
+            // writer it never checked.
+            let two_blob: usize = fragments
+                .iter()
+                .map(|f| {
+                    find!((e: Id), pattern!(f.facts(), [{ ?e @ attrs::data: _?d }])).count()
+                        + find!((e: Id), pattern!(f.facts(), [{ ?e @ attrs::data_f16: _?d }]))
+                            .count()
+                })
+                .sum();
+            match form {
+                crate::leaf::Form::Typed => {
+                    assert_eq!(two_blob, 0, "typed cohort must state no two-blob leaf")
+                }
+                crate::leaf::Form::TwoBlob => {
+                    assert_eq!(two_blob, 4, "two-blob cohort must state four of them")
+                }
+            }
+            publish(file.path(), fragments);
+
+            let snapshot = crate::model_collection::load_model_collection_local_latest(
+                file.path(),
+                test_team(),
+            )
+            .expect("freeze native Qwen3-TTS snapshot");
+            let weights = Qwen3TtsWeights::from_snapshot(snapshot, variant)
+                .unwrap_or_else(|e| panic!("{} cohort must select: {e:#}", form.label()));
+            assert_eq!(weights.counts(), (2, 1, 1), "{}", form.label());
+            assert_eq!(
+                weights.exact["base.weight"].elem(),
+                Elem::F32,
+                "{}",
+                form.label()
+            );
+            assert_eq!(
+                weights.talker_f16["talker.weight"].elem(),
+                Elem::F16,
+                "{}",
+                form.label()
+            );
+            assert_eq!(
+                weights.folded_f16["talker.folded.weight"].shape(),
+                vec![1],
+                "{}",
+                form.label()
+            );
+        }
     }
 
     #[test]
     fn one_snapshot_owns_four_explicit_qwen3tts_components() {
         let file = TestPile::new();
         let variant = Qwen3TtsVariant::Base1_7B;
-        publish(file.path(), cohort(variant));
+        publish(file.path(), cohort(variant, crate::leaf::Form::TwoBlob));
 
         let snapshot = crate::model_collection::load_model_collection_local_latest(file.path(), test_team())
             .expect("freeze native Qwen3-TTS snapshot");
@@ -942,6 +1008,7 @@ mod tests {
                 "other-codec.weight",
                 9.0,
                 false,
+                crate::leaf::Form::TwoBlob,
             )],
         );
         assert_eq!(weights.counts(), (2, 1, 1));

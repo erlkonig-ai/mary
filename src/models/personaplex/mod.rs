@@ -395,21 +395,25 @@ mod native_authority_tests {
         }
     }
 
-    fn model_fragment(tensors: &[(&str, &[f32], &[u64])], f16: bool) -> Fragment {
+    fn model_fragment(
+        tensors: &[(&str, &[f32], &[u64])],
+        f16: bool,
+        form: crate::leaf::Form,
+    ) -> Fragment {
         let mut fragment = Fragment::empty();
         let mut members = Vec::new();
         for &(tensor, values, dimensions) in tensors {
-            let shape = fragment.put::<U64Array, _>(dimensions.to_vec());
-            let leaf = if f16 {
-                let values: Vec<_> = values.iter().copied().map(half::f16::from_f32).collect();
-                let data = fragment.put::<crate::f16enc::F16Array, _>(values);
-                entity! { _ @ attrs::data_f16: data, attrs::shape: shape }
-            } else {
-                let data = fragment.put::<F32Array, _>(values.to_vec());
-                entity! { _ @ attrs::data: data, attrs::shape: shape }
-            };
-            let leaf_id = leaf.root().expect("tensor leaf root");
-            fragment += leaf;
+            let leaf_id = crate::leaf::fixture_leaf(
+                &mut fragment,
+                form,
+                if f16 {
+                    crate::leaf::Elem::F16
+                } else {
+                    crate::leaf::Elem::F32
+                },
+                dimensions,
+                values,
+            );
             let name = fragment.put::<LongString, _>(tensor.to_owned());
             let member = entity! { _ @ attrs::safetensor_path: name, attrs::weight: leaf_id };
             members.push(member.root().expect("model member root"));
@@ -436,6 +440,7 @@ mod native_authority_tests {
                 ("encoder.weight", &[3.0, 4.0], &[1, 2]),
             ],
             false,
+            crate::leaf::Form::TwoBlob,
         );
         let root = fragment.root().expect("PersonaPlex model root");
         let signing_key = SigningKey::from_bytes(&[0x50; 32]);
@@ -482,7 +487,7 @@ mod native_authority_tests {
     fn bundle_snapshot_cannot_be_relabelled_as_another_team() {
         let file = TestPile::new();
         let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
-        let fragment = model_fragment(&[("weight", &[1.0], &[1])], false);
+        let fragment = model_fragment(&[("weight", &[1.0], &[1])], false, crate::leaf::Form::TwoBlob);
         let root = fragment.root().unwrap();
         crate::model_collection::publish_model_bundle_fragment(
             &mut pile,
@@ -513,7 +518,7 @@ mod native_authority_tests {
     fn non_f32_exact_coordinate_fails_closed() {
         let file = TestPile::new();
         let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
-        let fragment = model_fragment(&[("weight", &[1.0], &[1])], true);
+        let fragment = model_fragment(&[("weight", &[1.0], &[1])], true, crate::leaf::Form::TwoBlob);
         let root = fragment.root().unwrap();
         crate::model_collection::publish_model_bundle_fragment(
             &mut pile,
@@ -536,7 +541,7 @@ mod native_authority_tests {
     fn conflicting_bundle_roots_fail_closed() {
         let file = TestPile::new();
         let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
-        let existing = model_fragment(&[("weight", &[1.0], &[1])], false);
+        let existing = model_fragment(&[("weight", &[1.0], &[1])], false, crate::leaf::Form::TwoBlob);
         let existing_root = existing.root().unwrap();
         let existing_commit = crate::model_collection::publish_model_bundle_fragment(
             &mut pile,
@@ -547,7 +552,7 @@ mod native_authority_tests {
         )
         .expect("publish existing PersonaPlex authority");
 
-        let candidate = model_fragment(&[("weight", &[2.0], &[1])], false);
+        let candidate = model_fragment(&[("weight", &[2.0], &[1])], false, crate::leaf::Form::TwoBlob);
         let candidate_root = candidate.root().unwrap();
         let candidate_commit = crate::model_collection::publish_model_bundle_fragment(
             &mut pile,
@@ -565,5 +570,50 @@ mod native_authority_tests {
         assert!(format!("{error:#}").contains("ambiguous"), "{error:#}");
         assert_ne!(existing_commit.data(), candidate_commit.data());
         pile.close().expect("close synthetic PersonaPlex pile");
+    }
+
+    /// The bundle selects and the exact coordinate keeps its shape and width
+    /// under either leaf form. `models/personaplex.pile` is two-blob today; a
+    /// typed conversion of it must land on the same weights, and this is where
+    /// that stops being an assumption.
+    #[test]
+    fn personaplex_bundle_selects_in_either_leaf_form() {
+        for form in crate::leaf::FORMS {
+            let file = TestPile::new();
+            let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
+            let fragment = model_fragment(
+                &[
+                    ("transformer.weight", &[1.0, 2.0], &[2]),
+                    ("encoder.weight", &[3.0, 4.0], &[1, 2]),
+                ],
+                false,
+                form,
+            );
+            let root = fragment.root().expect("PersonaPlex model root");
+            crate::model_collection::publish_model_bundle_fragment(
+                &mut pile,
+                test_team(),
+                &SigningKey::from_bytes(&[0x50; 32]),
+                root,
+                fragment,
+            )
+            .expect("publish PersonaPlex root");
+            let snapshot =
+                crate::model_collection::snapshot_model_bundle_collection_local_latest(
+                    &mut pile,
+                    test_team(),
+                )
+                .expect("freeze PersonaPlex prefix");
+            let bundle = PersonaPlexWeights::from_bundle_snapshot(test_team(), snapshot)
+                .unwrap_or_else(|e| panic!("{} bundle must select: {e:#}", form.label()));
+            let weights = bundle.weights();
+            assert_eq!(weights.root(), root, "{}", form.label());
+            assert_eq!(weights.count(), 2, "{}", form.label());
+            let encoder = &weights.exact()["encoder.weight"];
+            assert_eq!(encoder.shape(), vec![1, 2], "{}", form.label());
+            assert_eq!(encoder.to_f32(), vec![3.0, 4.0], "{}", form.label());
+            drop(bundle);
+            pile.close().expect("close synthetic PersonaPlex pile");
+        }
     }
 }

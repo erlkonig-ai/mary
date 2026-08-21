@@ -1,7 +1,21 @@
-//! List a pile's branches — name, id, and how many facts its history holds.
+//! List what a pile actually holds: its branches, and its signed model
+//! collection.
 //!
 //! Written because a converter guessed at a pile's branch layout twice and was
 //! wrong twice. The pile is the authority on its own shape; ask it.
+//!
+//! BOTH readers, because a model pile now has two and they do not agree. The
+//! deprecated branch reader is what `pile_leaf_migrate` and `qwen3tts_say`
+//! use; the COLLECTION is what `mary::speak` — the production voice — selects
+//! from. A pile can be perfectly readable through one and absent through the
+//! other, and reading only the branch pins reports a pile as fine when the
+//! seam that matters cannot open it at all.
+//!
+//! The leaf census answers the question those two readers exist to settle:
+//! is this pile on the typed `Tensor<T, RANK>` encoding, or still on the
+//! two-blob `{data|data_f16, shape}` form? The typed attribute ids are
+//! DERIVED from (anchor, encoding), so they are asked of `mary::leaf` rather
+//! than restated here — a table copied into a tool is a table that drifts.
 
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
@@ -30,6 +44,12 @@ fn main() -> Result<()> {
     println!("  data            {}", mary::format::attrs::data.id());
     println!("  data_f16        {}", mary::format::attrs::data_f16.id());
     println!("  shape           {}", mary::format::attrs::shape.id());
+    println!("  data_q4         {}", mary::format::attrs::data_q4.id());
+    println!("  data_q8         {}", mary::format::attrs::data_q8.id());
+    println!("  q_scales        {}", mary::format::attrs::q_scales.id());
+    for (name, id) in mary::leaf::typed_leaf_attrs() {
+        println!("  {name:15} {id}");
+    }
     println!("  weight          {}", mary::format::attrs::weight.id());
     println!("  kind            {}", mary::format::attrs::kind.id());
     println!("  safetensor_path {}", mary::format::attrs::safetensor_path.id());
@@ -38,6 +58,11 @@ fn main() -> Result<()> {
     println!("  source          {}", mary::format::attrs::source.id());
     println!("  quantization    {}", mary::format::attrs::quantization.id());
     println!();
+
+    let leaf_names: std::collections::HashMap<Id, String> = mary::leaf::typed_leaf_attrs()
+        .into_iter()
+        .map(|(n, id)| (id, n))
+        .collect();
 
     let pins: Vec<Id> = repo
         .storage_mut()
@@ -109,6 +134,9 @@ fn main() -> Result<()> {
                     x if *x == mary::format::attrs::data.id() => "data".to_string(),
                     x if *x == mary::format::attrs::data_f16.id() => "data_f16".to_string(),
                     x if *x == mary::format::attrs::shape.id() => "shape".to_string(),
+                    x if *x == mary::format::attrs::data_q4.id() => "data_q4".to_string(),
+                    x if *x == mary::format::attrs::data_q8.id() => "data_q8".to_string(),
+                    x if *x == mary::format::attrs::q_scales.id() => "q_scales".to_string(),
                     x if *x == mary::format::attrs::weight.id() => "weight".to_string(),
                     x if *x == mary::format::attrs::bias.id() => "bias".to_string(),
                     x if *x == mary::format::attrs::kind.id() => "kind".to_string(),
@@ -120,7 +148,10 @@ fn main() -> Result<()> {
                     x if *x == mary::format::attrs::source.id() => "source".to_string(),
                     x if *x == mary::format::attrs::quantization.id() => "quantization".to_string(),
                     x if *x == mary::format::attrs::index.id() => "index".to_string(),
-                    other => format!("{other}"),
+                    other => leaf_names
+                        .get(other)
+                        .cloned()
+                        .unwrap_or_else(|| format!("{other}")),
                 };
                 *counts.entry(label).or_default() += 1;
             }
@@ -131,5 +162,36 @@ fn main() -> Result<()> {
     }
 
     repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
+
+    // ── the collection, and the leaf census through it ──────────────────────
+    // Separate open: the collection reader takes the pile by value, and the
+    // branch walk above has just finished with it.
+    let mut pile = Pile::open(path).map_err(|e| anyhow::anyhow!("reopen {path:?}: {e:?}"))?;
+    match mary::model_collection::sole_model_graph_team(&mut pile) {
+        Err(e) => println!("\nmodel collection: none ({e:?}) — `mary::speak` cannot open this pile"),
+        Ok(team) => {
+            match mary::model_collection::snapshot_model_collection_local_latest(&mut pile, team) {
+                Err(e) => println!("\nmodel collection: snapshot failed: {e}"),
+                Ok(snapshot) => {
+                    let facts = snapshot.facts();
+                    let typed = mary::leaf::index_typed_all(facts, snapshot.reader()).len();
+                    let two_blob = find!(
+                        (e: Id),
+                        pattern!(facts, [{ ?e @ mary::format::attrs::data: _?d }])
+                    )
+                    .count()
+                        + find!(
+                            (e: Id),
+                            pattern!(facts, [{ ?e @ mary::format::attrs::data_f16: _?d }])
+                        )
+                        .count();
+                    println!("\nmodel collection: {} facts", facts.len());
+                    println!("  typed leaves      {typed}");
+                    println!("  two-blob leaves   {two_blob}");
+                }
+            }
+        }
+    }
+    let _ = pile.close();
     Ok(())
 }

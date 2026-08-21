@@ -541,6 +541,146 @@ pub fn index_typed_all(
     map
 }
 
+/// Every typed leaf attribute this build dispatches, as `(label, id)`.
+///
+/// The ids are DERIVED from (anchor, encoding), so they cannot be read off the
+/// source — a census tool that wants to name them has to ask the same code the
+/// readers ask, rather than restating a table that would drift the first time
+/// an arm is added.
+pub fn typed_leaf_attrs() -> Vec<(String, Id)> {
+    let mut out = Vec::new();
+
+    macro_rules! name_all {
+        ($elem:ty, $rank:literal, $tag:expr) => {{
+            out.push((format!("leaf.{}.{}", $tag, $rank), leaf::<$elem, $rank>().id()));
+        }};
+    }
+
+    name_all!(F32, 0, "f32");
+    name_all!(F32, 1, "f32");
+    name_all!(F32, 2, "f32");
+    name_all!(F32, 3, "f32");
+    name_all!(F32, 4, "f32");
+    name_all!(F32, 5, "f32");
+    name_all!(F32, 6, "f32");
+    name_all!(F16, 0, "f16");
+    name_all!(F16, 1, "f16");
+    name_all!(F16, 2, "f16");
+    name_all!(F16, 3, "f16");
+    name_all!(F16, 4, "f16");
+    name_all!(F16, 5, "f16");
+    name_all!(F16, 6, "f16");
+
+    out
+}
+
+/// Which storage form a fixture builds its leaves in.
+///
+/// Test-only, and it exists because the two are not interchangeable in
+/// practice: every importer WRITES [`Form::Typed`], while every model pile on
+/// disk still HOLDS [`Form::TwoBlob`]. A fixture pinned to either one tests a
+/// path half the world is not on. Running a model's selection tests over both
+/// is what makes "this loader survives the conversion" a checked claim rather
+/// than a plan.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Form {
+    /// One `Tensor<T, RANK>` blob, shape in its header.
+    Typed,
+    /// `{data|data_f16, shape}`: two blobs, and the pairing is a convention.
+    TwoBlob,
+}
+
+/// Both forms, for a test that should hold under either.
+#[cfg(test)]
+pub(crate) const FORMS: [Form; 2] = [Form::Typed, Form::TwoBlob];
+
+#[cfg(test)]
+impl Form {
+    /// Short label for a test's failure message.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Form::Typed => "typed",
+            Form::TwoBlob => "two-blob",
+        }
+    }
+}
+
+/// Put one tensor leaf into `fragment` in `form`; returns its entity id.
+///
+/// `values` are f32 whatever the element format; an [`Elem::F16`] leaf is
+/// down-cast here, exactly as [`crate::format::put_raw_f16`] does on the real
+/// import path.
+#[cfg(test)]
+pub(crate) fn fixture_leaf(
+    fragment: &mut Fragment,
+    form: Form,
+    elem: Elem,
+    dims: &[u64],
+    values: &[f32],
+) -> Id {
+    use crate::format::attrs;
+    let payload = || -> anybytes::Bytes {
+        match elem {
+            Elem::F32 => anybytes::Bytes::from_source(values.to_vec()),
+            Elem::F16 => anybytes::Bytes::from_source(
+                values
+                    .iter()
+                    .map(|&v| half::f16::from_f32(v))
+                    .collect::<Vec<half::f16>>(),
+            ),
+        }
+    };
+
+    // A fragment is not a blob STORE — it carries its own blobs — so the typed
+    // arm builds the blob and hands it to `Fragment::put` rather than going
+    // through `put_leaf`. Same encoding, same header, same bytes; only the
+    // sink differs.
+    macro_rules! typed {
+        ($elem:ty, $rank:literal) => {{
+            let d: [u64; $rank] = dims.try_into().expect("fixture rank matches its dims");
+            let blob = leaf_blob::<$elem, $rank>(d, payload()).expect("fixture typed leaf");
+            let h = fragment.put::<Tensor<$elem, $rank>, _>(blob);
+            triblespace::macros::entity! { _ @ leaf::<$elem, $rank>(): h }
+        }};
+    }
+
+    let leaf = match form {
+        Form::Typed => match (elem, dims.len()) {
+            (Elem::F32, 0) => typed!(F32, 0),
+            (Elem::F32, 1) => typed!(F32, 1),
+            (Elem::F32, 2) => typed!(F32, 2),
+            (Elem::F32, 3) => typed!(F32, 3),
+            (Elem::F16, 0) => typed!(F16, 0),
+            (Elem::F16, 1) => typed!(F16, 1),
+            (Elem::F16, 2) => typed!(F16, 2),
+            (Elem::F16, 3) => typed!(F16, 3),
+            (_, r) => panic!("fixture leaf rank {r} has no arm; add one"),
+        },
+        Form::TwoBlob => {
+            let shape = fragment.put::<crate::format::U64Array, _>(dims.to_vec());
+            match elem {
+                Elem::F32 => {
+                    let data = fragment.put::<crate::format::F32Array, _>(values.to_vec());
+                    triblespace::macros::entity! { _ @ attrs::data: data, attrs::shape: shape }
+                }
+                Elem::F16 => {
+                    let data = fragment.put::<crate::f16enc::F16Array, _>(
+                        values
+                            .iter()
+                            .map(|&v| half::f16::from_f32(v))
+                            .collect::<Vec<half::f16>>(),
+                    );
+                    triblespace::macros::entity! { _ @ attrs::data_f16: data, attrs::shape: shape }
+                }
+            }
+        }
+    };
+    let id = leaf.root().expect("fixture leaf root");
+    *fragment += leaf;
+    id
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

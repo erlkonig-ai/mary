@@ -1853,7 +1853,11 @@ mod tests {
         // "Foreign" now means a different name under the same team, which is
         // the shape a real unrelated collection takes.
         let foreign_name = CollectionName::new("not-the-model-graph").unwrap();
-        let foreign_descriptor = simplearchive_union::descriptor(&foreign_name, test_team());
+        // Private, like both production descriptors: reach participates in a
+        // descriptor's identity, so a public foreign one would differ from the
+        // model graph by two things and stop isolating the one under test.
+        let foreign_descriptor =
+            simplearchive_union::descriptor(&foreign_name, test_team(), Reach::Private);
         let (foreign_fragment, _, _) = fragment_fixture("foreign");
         let foreign = simplearchive_union::publish_fragment_commit(
             &mut pile,
