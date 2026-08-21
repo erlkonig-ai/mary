@@ -28,6 +28,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace::core::metadata;
+use triblespace::core::collection::descriptor::Reach;
 use triblespace::core::collection::records::{collection_name, collection_team};
 use triblespace::core::inline::encodings::ed25519::ED25519PublicKey;
 use triblespace::core::inline::encodings::shortstring::ShortString;
@@ -313,12 +314,18 @@ impl Error for LoadModelCollectionError {
     }
 }
 
+// `Reach::Private` on both, and it is the only value that keeps these
+// working: a private descriptor is byte-identical to one built before reach
+// existed, so the collection keeps the identity it already had. Runtime
+// loading is bound to the model-bundle collection by content address, so a
+// descriptor that gained a declared reach would be a different collection and
+// every already-persisted model pile would stop resolving.
 fn model_graph_collection(team: VerifyingKey) -> SimpleArchiveCollection {
-    SimpleArchiveCollection::new(mary_model_graph_name(), team)
+    SimpleArchiveCollection::new(mary_model_graph_name(), team, Reach::Private)
 }
 
 fn model_bundle_collection(team: VerifyingKey) -> SimpleArchiveCollection {
-    SimpleArchiveCollection::new(mary_model_bundle_name(), team)
+    SimpleArchiveCollection::new(mary_model_bundle_name(), team, Reach::Private)
 }
 
 /// Content identity of one team's PersonaPlex bundle source collection.
