@@ -876,6 +876,21 @@ pub fn persist_safetensors_file_filtered_to_pile(
     Ok(())
 }
 
+/// Add the audited pre-epoch attribute aliases to a checked-out fact set.
+///
+/// TribleSpace commit `6b65f278` changed `"hex" as attribute: Encoding` from a
+/// literal attribute id to one derived from `(hex, Encoding)`. Every pile
+/// written before that carries the literal ids, so the declarations in
+/// [`crate::format::attrs`] name nothing in it and every query returns empty.
+/// [`crate::model_collection::project_legacy_model_attributes`] is the audited
+/// historical-to-canonical table; applying it here makes those piles readable
+/// where they lie. The projection is additive and purely in memory - the pile
+/// on disk is never written, and a post-epoch pile gains nothing and loses
+/// nothing.
+fn pre_epoch_aliased(facts: &TribleSet) -> TribleSet {
+    crate::model_collection::project_legacy_model_attributes(facts).facts
+}
+
 /// Open a pile and build the leaf indexes for two families of model entities —
 /// the ones whose name starts with `f16_prefix` (half-width leaves for the fast
 /// native-width GPU load) and ALL OTHERS (the exact leaves) — plus a
@@ -925,11 +940,11 @@ pub fn load_split_index_from_pile(
     let head = ws
         .head()
         .ok_or_else(|| anyhow::anyhow!("'main' has no commits"))?;
-    let tribles: TribleSet = ws
-        .checkout(ancestors(head))
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
-        .facts()
-        .clone();
+    let tribles: TribleSet = pre_epoch_aliased(
+        ws.checkout(ancestors(head))
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
+            .facts(),
+    );
     let reader = repo
         .storage_mut()
         .reader()
@@ -1483,7 +1498,7 @@ pub fn load_keymap_from_pile_prefixed(
     let checkout = ws
         .checkout(ancestors(head))
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let tribles: TribleSet = checkout.facts().clone();
+    let tribles: TribleSet = pre_epoch_aliased(checkout.facts());
 
     // A reader over the pile blobs (where the weights live).
     let reader = repo
@@ -1560,11 +1575,11 @@ pub fn checkout_any_branch(
             repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
             continue;
         };
-        let tribles: TribleSet = ws
-            .checkout(ancestors(head))
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
-            .facts()
-            .clone();
+        let tribles: TribleSet = pre_epoch_aliased(
+            ws.checkout(ancestors(head))
+                .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
+                .facts(),
+        );
         let reader = repo
             .storage_mut()
             .reader()
@@ -1628,7 +1643,7 @@ pub fn load_spm_tokenizer_from_pile(
     let checkout = ws
         .checkout(ancestors(head))
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let tribles: TribleSet = checkout.facts().clone();
+    let tribles: TribleSet = pre_epoch_aliased(checkout.facts());
     let reader = repo
         .storage_mut()
         .reader()
@@ -1788,7 +1803,7 @@ pub fn load_tokenizer_from_pile_on(
     let checkout = ws
         .checkout(ancestors(head))
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let tribles: TribleSet = checkout.facts().clone();
+    let tribles: TribleSet = pre_epoch_aliased(checkout.facts());
     let reader = repo
         .storage_mut()
         .reader()
