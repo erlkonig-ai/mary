@@ -39,13 +39,17 @@ use mary::selection::{
 
 /// Data needed to turn one legacy model graph into a selectable native graph.
 ///
-/// `legacy_model_name` selects exactly one entity carrying both that canonical
-/// (possibly projected) name and at least one `member` edge. No first-match or
-/// root-id override exists: absent and ambiguous source graphs fail closed.
+/// `model` resolves to exactly one entity carrying at least one `member` edge,
+/// through the same exact-cardinality selectors the native runtime already
+/// uses. [`ModelSelector::Name`] matches the canonical (possibly projected)
+/// name and still fails closed when one pile holds two roots under one name;
+/// [`ModelSelector::Root`] names the content address itself, which is how such
+/// a pile states an unambiguous choice instead of being unmigratable. Neither
+/// direction has a first-match fallback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LegacyModelMigration<'a> {
-    /// Existing `model_name` value on the legacy weight root.
-    pub legacy_model_name: &'a str,
+    /// Which existing legacy weight root this migration publishes.
+    pub model: ModelSelector<'a>,
     /// Canonical model-source coordinate to add or verify.
     pub source: &'a str,
     /// Canonical weight-format coordinate to add or verify.
@@ -202,17 +206,13 @@ pub fn migrate_legacy_model_main(
     let projection = project_legacy_model_attributes(&legacy);
     let aliases_added = projection.aliases_added;
 
-    let model_root = select_model_root(
-        &projection.facts,
-        &reader,
-        ModelSelector::Name(request.legacy_model_name),
-    )
-    .with_context(|| {
-        format!(
-            "select exactly one legacy weight root named {:?}",
-            request.legacy_model_name
-        )
-    })?;
+    let model_root = select_model_root(&projection.facts, &reader, request.model)
+        .with_context(|| {
+            format!(
+                "select exactly one legacy weight root matching {:?}",
+                request.model
+            )
+        })?;
 
     let tokenizer_root = request
         .tokenizer_name
@@ -326,6 +326,9 @@ mod tests {
         branch: Id,
         head: CommitHandle,
         model_root: Id,
+        /// The second root sharing `model_root`'s name, when the fixture was
+        /// asked for the ambiguous shape.
+        duplicate_root: Option<Id>,
         tokenizer_root: Id,
         attachment: Inline<Handle<LongString>>,
         unknown_fact: Trible,
@@ -414,8 +417,10 @@ mod tests {
         let unknown_fact = Trible::force(&member, &test_id(0x7f), &attachment);
         facts.insert(&unknown_fact);
 
+        let mut duplicate_root = None;
         if duplicate_model_name {
             let other_root = test_id(0x21);
+            duplicate_root = Some(other_root);
             let other_member = inlineencodings::GenId::inline_from(test_id(0x22));
             facts.insert(&Trible::force(
                 &other_root,
@@ -447,6 +452,7 @@ mod tests {
             branch,
             head,
             model_root,
+            duplicate_root,
             tokenizer_root,
             attachment,
             unknown_fact,
@@ -493,7 +499,7 @@ mod tests {
         let before = std::fs::read(fixture.pile.path()).expect("read legacy prefix");
         let migration_key = key(9);
         let request = LegacyModelMigration {
-            legacy_model_name: LEGACY_MODEL_NAME,
+            model: ModelSelector::Name(LEGACY_MODEL_NAME),
             source: CANONICAL_SOURCE,
             quantization: QUANTIZATION,
             tokenizer_name: Some(CANONICAL_TOKENIZER),
@@ -581,6 +587,57 @@ mod tests {
         );
     }
 
+    /// A legacy pile can hold two weight roots under one `model_name`, which is
+    /// exactly what the name selector must refuse. Naming the content address
+    /// is how such a pile still migrates. The root selected here is the SECOND
+    /// of the two, so a first-match implementation cannot pass by accident.
+    #[test]
+    fn root_selection_migrates_one_root_of_an_ambiguous_name() {
+        let fixture = legacy_fixture("by-root", true);
+        let wanted = fixture.duplicate_root.expect("ambiguous fixture");
+        assert_ne!(wanted, fixture.model_root);
+
+        let mut pile = Pile::open(fixture.pile.path()).expect("open ambiguous fixture");
+        let result = migrate_legacy_model_main(
+            &mut pile,
+            &key(9),
+            LegacyModelMigration {
+                model: ModelSelector::Root(wanted),
+                source: CANONICAL_SOURCE,
+                quantization: QUANTIZATION,
+                tokenizer_name: None,
+            },
+        )
+        .expect("the content address resolves what the shared name cannot");
+        pile.close().expect("close migrated pile");
+        assert_eq!(result.model_root, wanted);
+        assert_eq!(result.selector_facts_added, 2);
+
+        // The coordinates must land on the requested root and nowhere else, and
+        // the shared name must still fail closed afterwards.
+        let snapshot = exact_snapshot(fixture.pile.path(), result.commit);
+        assert_eq!(
+            select_model_root(
+                snapshot.facts(),
+                snapshot.reader(),
+                ModelSelector::Source {
+                    source: CANONICAL_SOURCE,
+                    quantization: QUANTIZATION,
+                },
+            )
+            .expect("the migrated root is selectable by its new coordinates"),
+            wanted
+        );
+        let error = select_model_root(
+            snapshot.facts(),
+            snapshot.reader(),
+            ModelSelector::Name(LEGACY_MODEL_NAME),
+        )
+        .expect_err("the shared name is still ambiguous after migration")
+        .to_string();
+        assert!(error.contains("ambiguous"), "{error}");
+    }
+
     #[test]
     fn ambiguous_legacy_weight_roots_fail_before_publication() {
         let fixture = legacy_fixture("ambiguous", true);
@@ -590,7 +647,7 @@ mod tests {
             &mut pile,
             &key(9),
             LegacyModelMigration {
-                legacy_model_name: LEGACY_MODEL_NAME,
+                model: ModelSelector::Name(LEGACY_MODEL_NAME),
                 source: CANONICAL_SOURCE,
                 quantization: QUANTIZATION,
                 tokenizer_name: None,

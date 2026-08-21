@@ -10,9 +10,11 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::Parser;
+use mary::selection::ModelSelector;
 use mary_model_migration::{migrate_legacy_model_main, LegacyModelMigration};
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::signing_key_file;
+use triblespace::prelude::Id;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -28,8 +30,9 @@ struct Args {
     #[arg(long)]
     key: PathBuf,
     /// Existing model_name on the unique legacy weight root (name + member).
-    #[arg(long)]
-    model_name: String,
+    /// Mutually exclusive with `--root`.
+    #[arg(long, conflicts_with = "root")]
+    model_name: Option<String>,
     /// Canonical source coordinate for native model selection.
     #[arg(long)]
     source: String,
@@ -39,6 +42,12 @@ struct Args {
     /// Optional existing tokenizer name to validate exactly after projection.
     #[arg(long)]
     tokenizer_name: Option<String>,
+    /// Migrate the weight root at this exact entity id (32-hex). This is how a
+    /// legacy pile that holds several roots under one `model_name` still names
+    /// one of them; the name selector deliberately keeps refusing that pile.
+    /// Mutually exclusive with `--model-name`.
+    #[arg(long, conflicts_with = "model_name")]
+    root: Option<String>,
 }
 
 fn lowercase_hex(bytes: &[u8]) -> String {
@@ -51,6 +60,16 @@ fn lowercase_hex(bytes: &[u8]) -> String {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    // Exactly one selector, resolved before anything is opened. clap enforces
+    // that the two are not combined; this rejects supplying neither.
+    let model = match (&args.model_name, &args.root) {
+        (Some(name), None) => ModelSelector::Name(name),
+        (None, Some(hex)) => ModelSelector::Root(
+            Id::from_hex(hex)
+                .ok_or_else(|| anyhow::anyhow!("--root {hex:?} is not a valid 32-hex entity id"))?,
+        ),
+        _ => anyhow::bail!("pass exactly one of --model-name or --root"),
+    };
     // No path inference, environment fallback, initialization, or generated
     // key: the durable path is a required CLI argument.
     let signing_key = signing_key_file::load_existing(&args.key)
@@ -62,7 +81,7 @@ fn main() -> anyhow::Result<()> {
         &mut pile,
         &signing_key,
         LegacyModelMigration {
-            legacy_model_name: &args.model_name,
+            model,
             source: &args.source,
             quantization: &args.quantization,
             tokenizer_name: args.tokenizer_name.as_deref(),

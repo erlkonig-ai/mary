@@ -2981,6 +2981,7 @@ dependencies = [
  "burn",
  "ed25519-dalek",
  "half",
+ "libc",
  "rand 0.8.7",
  "serde",
  "serde_json",
