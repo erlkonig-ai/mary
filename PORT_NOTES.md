@@ -1639,3 +1639,96 @@ removed the last reason to keep it.
   surviving fallback for piles without the folded sibling (`--fold-derive`
   not yet run): leaf-alias zero-copy + fold math at load, byte-identical
   output (gate 2).
+
+## Code predictor on the GPU (2026-08-21, `predictor_gpu`)
+
+The last host-side stage of the voice lane. Per 80 ms frame the sub-talker
+runs 16 strictly sequential positions through a 5x1024 Qwen3 decoder — 1.26 G
+weight reads, ~5 GB at f32 — and on the CPU that is the frame's largest
+single term. `qwen3tts::predictor_gpu` is the cubecl port; it is the sibling
+of `megakernel` (the talker's fused decode step), not a new design.
+
+**Shape.** Weights stay row-major `[out, in]` and ride `nn::q4`'s single-token
+matvec thread shape (32 lanes per output row, 8 rows per 256-thread cube,
+vec4 loads both sides). Three foldings happen once at load so no dispatch
+exists purely to normalize: `input_layernorm` into the qkv columns,
+`post_attention_layernorm` into gate‖up, `model.norm` into all 15 `lm_head`s,
+leaving each kernel a weightless rms. gate/up rows interleave so SwiGLU is the
+matvec's epilogue; `1/sqrt(d)` folds into the RoPE chain.
+
+Unlike the talker's megakernel, the q/k-norm + RoPE chain is its **own**
+dispatch rather than folded into a widened qkv matmul. That fold duplicates
+the qk columns (`wide_out` 7168 vs a plain qkv's 4096) — +20% on the layer's
+weight traffic to save one ~2 us dispatch out of 34 per position. At f32
+aliased talker shapes the trade pays; at these it does not.
+
+**The chain stays on the device.** Each of the 15 steps samples a token that
+indexes the next step's input embedding; reading it back would cost 15 syncs
+per frame. Sampling runs on the GPU (`gumbel_argmax_kernel`) into a device
+slot `embed_gather_kernel` consumes, and a frame syncs **once**, on one
+`[2048+15]` buffer carrying the embedding sum and the codes. Sampling had to
+be handled, not avoided — production runs `subtalker_do_sample: true`. The
+gumbel noise is drawn on the host from the caller's rng in the CPU path's
+exact order and count (15 x 2048 draws), so the shared rng advances
+identically whichever engine runs and the talker's own sampling is untouched.
+
+**Cost model.** Two formats at 541 dispatches/frame give a two-point fit:
+~1.2 ms of dispatch overhead (~2.3 us each) and ~152 GB/s effective
+bandwidth. So this stage is **bandwidth**-bound, not dispatch-bound — the
+opposite of the depth port, and the reason narrower weights buy time here.
+152 GB/s is well under the ~400 the same kernel skeleton reaches on Moshi's
+4096-wide rows; at 1024-3072 each lane sweeps only 4-12 iterations and the
+memory latency is not hidden. That headroom is unclaimed, and is the next
+lever if this stage ever matters again.
+
+**Numbers** (`qwen3tts_pred_bench 60 --gpu`, all arms interleaved round by
+round in ONE process — the only honest form on a machine this loaded; ms per
+predictor frame):
+
+| arm | M4 Max (Metal, load ~18) | GB10 Spark (CUDA, load 1.2) |
+|---|---|---|
+| cpu down=pooled | 26.85 (p10 25.86, p90 30.57) | 320.14 |
+| gpu f16, 32 lanes | **17.83** (p10 15.77, p90 19.87) | **14.08** |
+| gpu q8, 32 lanes | 10.06 (p10 9.14, p90 10.65) | 9.31 |
+| gpu q8, 16 lanes | 9.11 | 9.67 |
+| gpu q8, 8 lanes | 11.64 | 11.11 |
+
+Do NOT read the two columns against each other — the Mac carried other
+agents' builds all session and the Spark was idle. What they jointly show is
+that the same kernels run on both backends and rank the lane width the same
+way (32 > 16 > 8 at f16 shapes), which is why 32 is the default.
+
+The Spark row is worth its own sentence: the CPU predictor costs 320 ms/frame
+there (no Accelerate on aarch64 Linux), i.e. 4x slower than audio-rate, so
+corpus generation on a Spark was not viable at all before this port and is
+~23x faster now.
+
+**Parity.** No bit-exactness gate; judged by per-codebook token agreement
+against the CPU f32 oracle, dual-run on the real generation path
+(`MARY_PRED_GATE=1`, which runs both engines on every frame's real inputs
+with a cloned rng, so a disagreement is numerics and not luck):
+
+- **f16: 1275/1275 = 100.00%**, max |delta embed_sum| exactly 0, over an
+  85-frame utterance — and the rendered WAVs are **byte-identical** to the CPU
+  path's at the same seed. That is the control the format choice hangs on: it
+  says the kernels are right, so any disagreement elsewhere is quantization.
+- q8: 1148/1350 = 85.04%.
+
+f16 is therefore the default and the ~8 ms q8 would save is deliberately left
+on the table: the talker ahead of this stage costs ~28 ms/frame against an
+80 ms budget, so the faster format buys throughput nobody is short of while
+giving up the exactness that makes the port trustworthy. `MARY_PRED_W=q8`
+opts in where throughput is worth more than agreement.
+
+The negative result is worth carrying: "q8 is free on an M4 because the path
+is dispatch-bound" (true on the depth port) does **not** transfer here. This
+stage is bandwidth-bound, so q8 really is ~1.8x faster — it just pays for it
+in fidelity, because the acoustic codebooks' logits sit close enough together
+that 8-bit weights reorder the top of a 2048-way argmax one time in seven.
+
+**Not a CPU stage after all: the ECAPA speaker encoder.** The `speak.rs`
+header's "the CPU code predictor and the ECAPA speaker encoder read the exact
+f32 leaves" reads like two host stages. It is a statement about which
+*weights* they load. `qwen3tts::speaker` is ordinary Burn (`Tensor<B, 3>`,
+`conv1d`) and has always run on the GPU, once per voice rather than per frame.
+There was no CPU speaker encoder to port. Header corrected.

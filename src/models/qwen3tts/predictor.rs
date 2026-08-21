@@ -110,6 +110,25 @@ pub struct CodePredictor {
     /// RoPE tables [MAX_POS × HALF] (θ = 1e6).
     cos: Vec<f32>,
     sin: Vec<f32>,
+    /// The device engine, once [`use_gpu`](Self::use_gpu) has built it. While
+    /// it is present [`predict_frame`](Self::predict_frame) runs there and
+    /// the f32 host weights below stay resident only as the parity oracle.
+    #[cfg(feature = "predictor-gpu")]
+    gpu: Option<super::predictor_gpu::PredictorEngine>,
+}
+
+/// Borrowed view of one layer's weights, for a consumer that lays them
+/// out differently — see [`super::predictor_gpu`], which folds the two
+/// layernorms into the projections they precede and rounds to f16.
+pub struct LayerView<'a> {
+    pub in_norm: &'a [f32],
+    pub post_norm: &'a [f32],
+    pub q_norm: &'a [f32],
+    pub k_norm: &'a [f32],
+    pub qkv: &'a [f32],
+    pub o: &'a [f32],
+    pub gate_up: &'a [f32],
+    pub down: &'a [f32],
 }
 
 impl CodePredictor {
@@ -166,7 +185,77 @@ impl CodePredictor {
                 .collect(),
             cos,
             sin,
+            #[cfg(feature = "predictor-gpu")]
+            gpu: None,
         }
+    }
+
+    /// Move the frame loop onto the GPU: fold the layernorms, round the stack
+    /// to f16 and upload (see [`super::predictor_gpu`]). Idempotent.
+    ///
+    /// The host f32 weights are deliberately kept. They are what
+    /// [`predict_frame_cpu`](Self::predict_frame_cpu) — the parity oracle, and
+    /// the `MARY_PRED_GATE` dual-run — reads, and they cost RAM, not frame
+    /// time.
+    #[cfg(feature = "predictor-gpu")]
+    pub fn use_gpu(&mut self) {
+        if self.gpu.is_none() {
+            let client = crate::nn::q4::client_for_default_device();
+            self.gpu = Some(super::predictor_gpu::PredictorEngine::new(client, self));
+        }
+    }
+
+    /// Whether the frame loop is on the device.
+    pub fn on_gpu(&self) -> bool {
+        #[cfg(feature = "predictor-gpu")]
+        {
+            self.gpu.is_some()
+        }
+        #[cfg(not(feature = "predictor-gpu"))]
+        {
+            false
+        }
+    }
+
+
+    /// Talker hidden width, as measured from the checkpoint's embedding rows.
+    pub fn talker_width(&self) -> usize {
+        self.talker_width
+    }
+
+    /// The 5 layers' weights, in stack order.
+    pub fn layer_weights(&self) -> impl Iterator<Item = LayerView<'_>> {
+        self.layers.iter().map(|l| LayerView {
+            in_norm: &l.in_norm,
+            post_norm: &l.post_norm,
+            q_norm: &l.q_norm,
+            k_norm: &l.k_norm,
+            qkv: &l.qkv,
+            o: &l.o,
+            gate_up: &l.gate_up,
+            down: &l.down,
+        })
+    }
+
+    /// The 15 `lm_head` matrices `[2048 × 1024]`, in step order.
+    pub fn lm_head_weights(&self) -> impl Iterator<Item = &[f32]> {
+        self.lm_heads.iter().map(|w| w.as_slice())
+    }
+
+    /// The 15 codec embedding tables `[2048 × talker_width]`, in step order.
+    pub fn embedding_tables(&self) -> impl Iterator<Item = &[f32]> {
+        self.embeddings.iter().map(|w| w.as_slice())
+    }
+
+    /// The final `model.norm` weight `[1024]`.
+    pub fn norm_weight(&self) -> &[f32] {
+        &self.norm_w
+    }
+
+    /// small_to_mtp_projection `(weight [1024 × talker_width], bias [1024])`,
+    /// absent on the 0.6B checkpoint (`nn.Identity()` there).
+    pub fn proj_weights(&self) -> Option<(&[f32], &[f32])> {
+        self.proj.as_ref().map(|(w, b)| (w.as_slice(), b.as_slice()))
     }
 
     /// Σ of the 15 non-codebook-0 embedding rows for a full frame, added into
@@ -360,7 +449,7 @@ impl CodePredictor {
     /// `code0_embed` are talker-width `[2048]` slices; returns the 15 codes
     /// plus Σ of their talker-width embeddings (the predictor's share of the
     /// talker's next-frame input).
-    pub fn predict_frame(
+    pub fn predict_frame_cpu(
         &self,
         talker_hidden: &[f32],
         code0_embed: &[f32],
@@ -429,5 +518,28 @@ impl CodePredictor {
             }
         }
         (codes, embed_sum)
+    }
+}
+
+impl CodePredictor {
+    /// Predict codebooks 1..15 for one frame — on the device when
+    /// [`use_gpu`](Self::use_gpu) has been called, on the host otherwise.
+    ///
+    /// Both engines consume `rng` identically (15 × 2048 draws per sampled
+    /// frame, in the same order), so switching engines does not shift the
+    /// talker's own sampling stream.
+    pub fn predict_frame(
+        &self,
+        talker_hidden: &[f32],
+        code0_embed: &[f32],
+        do_sample: bool,
+        temperature: f64,
+        rng: &mut impl rand::Rng,
+    ) -> ([u32; NUM_CODE_GROUPS - 1], Vec<f32>) {
+        #[cfg(feature = "predictor-gpu")]
+        if let Some(g) = &self.gpu {
+            return g.predict_frame(talker_hidden, code0_embed, do_sample, temperature, rng);
+        }
+        self.predict_frame_cpu(talker_hidden, code0_embed, do_sample, temperature, rng)
     }
 }

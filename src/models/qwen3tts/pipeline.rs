@@ -255,6 +255,14 @@ pub fn generate_streaming<B: Backend>(
     mut on_frame: impl FnMut(&[u32; NUM_CODE_GROUPS]),
 ) -> Vec<[u32; NUM_CODE_GROUPS]> {
     let bench = std::env::var("QWEN3TTS_BENCH").is_ok();
+    // Parity gate: run BOTH predictor engines on every frame's real inputs and
+    // count per-codebook token agreement. The two draw the same gumbel noise
+    // (the rng is cloned, not shared), so a disagreement is numerics, not luck.
+    // The GPU's frame is the one that feeds the talker, so what gets measured
+    // is the lane that would actually ship.
+    let gate = std::env::var("MARY_PRED_GATE").is_ok() && predictor.on_gpu();
+    let (mut gate_hit, mut gate_tot) = (0usize, 0usize);
+    let mut gate_embed_err = 0f32;
     let mut caches = talker.new_caches();
     let prefill_len = prefill.dims()[1];
     let tp0 = std::time::Instant::now();
@@ -301,6 +309,16 @@ pub fn generate_streaming<B: Backend>(
         // fill codebooks 1..15 for this frame (CPU)
         let tp = std::time::Instant::now();
         let code0_row = talker.codec_row(code0);
+        let oracle = gate.then(|| {
+            let mut r = rng.clone();
+            predictor.predict_frame_cpu(
+                &h,
+                code0_row,
+                params.subtalker_do_sample,
+                params.subtalker_temperature,
+                &mut r,
+            )
+        });
         let (rest, mut embed_sum) = predictor.predict_frame(
             &h,
             code0_row,
@@ -308,6 +326,13 @@ pub fn generate_streaming<B: Backend>(
             params.subtalker_temperature,
             rng,
         );
+        if let Some((oc, oe)) = oracle {
+            gate_hit += oc.iter().zip(&rest).filter(|(a, b)| a == b).count();
+            gate_tot += oc.len();
+            for (a, b) in oe.iter().zip(&embed_sum) {
+                gate_embed_err = gate_embed_err.max((a - b).abs());
+            }
+        }
         t_pred += tp.elapsed().as_secs_f64();
         let mut frame = [0u32; NUM_CODE_GROUPS];
         frame[0] = code0;
@@ -361,6 +386,16 @@ pub fn generate_streaming<B: Backend>(
         if let Some(line) = predictor.take_bench() {
             eprintln!("bench: predictor internals: {line}");
         }
+    }
+    if gate {
+        eprintln!(
+            "gate: predictor token agreement {}/{} ({:.2}%) over {} frames; max |Δembed_sum|              {:.3e}",
+            gate_hit,
+            gate_tot,
+            gate_hit as f64 / gate_tot.max(1) as f64 * 100.0,
+            frames.len(),
+            gate_embed_err
+        );
     }
     frames
 }

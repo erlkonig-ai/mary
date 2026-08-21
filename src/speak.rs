@@ -14,8 +14,13 @@
 //! pages: the fold-transformed root supplies final-layout tensors while the
 //! filtered root supplies the untransformed embeddings. The f32 codec (still
 //! fused — its decode loop is launch-bound and never aliases) uploads
-//! straight from its pile blobs; the CPU code predictor and the ECAPA
-//! speaker encoder read the exact f32 leaves. `MARY_SPEAK_MATERIALIZE=1`
+//! straight from its pile blobs; the code predictor and the ECAPA speaker
+//! encoder read the exact f32 leaves — "exact f32 *leaves*" is a statement
+//! about which weights they load, not about where they run: the speaker
+//! encoder has always been Burn/GPU (and runs once per voice, not per frame),
+//! and since 2026-08-21 the predictor's frame loop is cubecl too
+//! (`qwen3tts::predictor_gpu`, `MARY_PRED_CPU=1` to hold it on the host).
+//! `MARY_SPEAK_MATERIALIZE=1`
 //! forces the old fully materialized load for A/B measurement.
 //!
 //! (History: a zero-copy path THROUGH the fusion wrapper was probed and
@@ -529,7 +534,22 @@ fn synthesize_stream_impl<B: Backend + 'static>(
             let folded_talker = weights.folded_talker::<B>()?;
             let loader = weights.into_loader();
             let talker = folded_talker.unwrap_or_else(|| Talker::load(&loader, &dev));
-            let predictor = CodePredictor::load(&loader);
+            let mut predictor = CodePredictor::load(&loader);
+            // The predictor's frame loop moves to the GPU unless explicitly
+            // held back: on the host it cost ~50 ms of an 80 ms frame and
+            // synthesis ran below realtime. `MARY_PRED_CPU=1` restores the
+            // Accelerate path, which is also what `MARY_PRED_GATE=1` compares
+            // against frame by frame.
+            #[cfg(feature = "predictor-gpu")]
+            if std::env::var("MARY_PRED_CPU").is_err() {
+                let t = Instant::now();
+                predictor.use_gpu();
+                eprintln!(
+                    "[timing] predictor → GPU: {:.2}s",
+                    t.elapsed().as_secs_f32()
+                );
+            }
+            let predictor = predictor;
             let spk_enc = SpeakerEncoder::<B>::load(&loader, &dev);
             let tok = TextTokenizer::load(
                 &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/qwen3tts"),

@@ -6,9 +6,10 @@
 //! Four components (dims measured from the checkpoint — see PORT_NOTES.md):
 //!   - [`talker`]  — 28×2048 Qwen3-style GQA decoder over 12.5 Hz codec
 //!     frames, text interleaved into the frame stream (dual-track streaming).
-//!   - [`predictor`] — 5×1024 sub-talker: codebooks 1..15 per frame. Runs on
-//!     the **CPU** (Accelerate, [`cpu`]) — its 15 sequential single-token
-//!     steps are dominated by per-op GPU submission overhead, not math.
+//!   - [`predictor`] — 5×1024 sub-talker: codebooks 1..15 per frame. The
+//!     reference CPU implementation (Accelerate, [`cpu`]) and, behind
+//!     `predictor-gpu`, the hand-fused cubecl engine that replaced it in the
+//!     realtime lane ([`predictor_gpu`]).
 //!   - [`speaker`] — ECAPA-TDNN x-vector (2048) + slaney-mel front end.
 //!   - [`codec`]   — the 12 Hz tokenizer-v2 **decoder**: split-RVQ →
 //!     sliding-window transformer → ConvNeXt ×4 → SnakeBeta SEANet ×480.
@@ -26,6 +27,8 @@ pub mod layers;
 pub mod megakernel;
 pub mod pipeline;
 pub mod predictor;
+#[cfg(feature = "predictor-gpu")]
+pub mod predictor_gpu;
 pub mod speaker;
 pub mod talker;
 pub mod tokenizer;

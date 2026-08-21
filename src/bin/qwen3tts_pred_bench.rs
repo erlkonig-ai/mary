@@ -17,6 +17,13 @@
 //! It is NOT an output check: random weights say nothing about how the voice
 //! sounds. Ear gates ride `speak_check` on a real pile.
 //!
+//! `--gpu` adds the cubecl engine (`predictor_gpu`) as a THIRD interleaved
+//! arm, which is what the CPU arms are now a baseline for. Same
+//! `predict_frame` contract, same rng consumption, so the three are directly
+//! comparable frame for frame — and interleaving them is the only way to get
+//! an honest ratio on a machine this loaded (the talker lane, other agents'
+//! builds and WindowServer all move the floor by more than the effect).
+//!
 //! Arms are interleaved round by round (`MARY_PRED_DOWN_SERIAL`'s two states,
 //! flipped in process), so a change in ambient load hits both equally instead
 //! of only whichever ran last — this machine's background daemons swing a
@@ -25,6 +32,8 @@
 
 use mary::models::qwen3tts::config::*;
 use mary::models::qwen3tts::predictor::{set_down_serial, CodePredictor};
+#[cfg(feature = "predictor-gpu")]
+use mary::models::qwen3tts::predictor_gpu::{PredictorEngine, WeightMode};
 use mary::nn::weight_loader::WeightLoader;
 use std::collections::HashMap;
 use std::time::Instant;
@@ -116,32 +125,91 @@ fn main() {
         std::env::var("MARY_PRED_THREADS").unwrap_or_else(|_| "2 (default)".into())
     );
     let predictor = CodePredictor::load(&WeightLoader::Pile(m));
+    let want_gpu = std::env::args().any(|a| a == "--gpu");
+    // Both device formats live in ONE process so they interleave with the CPU
+    // arms and with each other. Two separately-loaded runs cannot be compared
+    // on this machine: the ambient load moves the floor by more than the
+    // format does.
+    #[cfg(feature = "predictor-gpu")]
+    let engines: Vec<(&str, PredictorEngine)> = if want_gpu {
+        let client = mary::nn::q4::client_for_default_device();
+        [
+            ("f16 l32", WeightMode::F16, 32),
+            ("q8 l32", WeightMode::Q8, 32),
+            ("q8 l16", WeightMode::Q8, 16),
+            ("q8 l8", WeightMode::Q8, 8),
+        ]
+        .into_iter()
+        .map(|(name, mode, lanes)| {
+            let t = Instant::now();
+            let e = PredictorEngine::with_shape(client.clone(), &predictor, mode, lanes);
+            println!(
+                "  gpu {name}: {:.2} MiB weights/frame, {} dispatches/frame, built in {:.1}s",
+                e.bytes_per_frame as f64 / (1 << 20) as f64,
+                e.dispatches,
+                t.elapsed().as_secs_f32()
+            );
+            (name, e)
+        })
+        .collect()
+    } else {
+        Vec::new()
+    };
 
     let talker_hidden = rng.vec(TALKER_W);
     let code0 = rng.vec(TALKER_W);
     let mut r = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(7);
-    let mut run = |serial: bool, rng: &mut rand::rngs::StdRng| -> f64 {
-        set_down_serial(serial);
+    // arm 0/1 = the CPU path's two `down` arms; arms 2.. = the device engines.
+    let mut run = |arm: usize, rng: &mut rand::rngs::StdRng| -> f64 {
+        set_down_serial(arm == 0);
         let t = Instant::now();
-        let _ = predictor.predict_frame(&talker_hidden, &code0, true, 0.9, rng);
+        if arm >= 2 {
+            #[cfg(feature = "predictor-gpu")]
+            let _ = engines[arm - 2]
+                .1
+                .predict_frame(&talker_hidden, &code0, true, 0.9, rng);
+        } else {
+            let _ = predictor.predict_frame_cpu(&talker_hidden, &code0, true, 0.9, rng);
+        }
         t.elapsed().as_secs_f64() * 1e3
     };
 
+    #[cfg(feature = "predictor-gpu")]
+    let arms: Vec<usize> = (0..2 + engines.len()).collect();
+    #[cfg(not(feature = "predictor-gpu"))]
+    let arms: Vec<usize> = vec![0, 1];
+    let arms = &arms[..];
+    // discard the cold passes: first-touch page faults on 5 GB of weights, and
+    // on the device arm the shader compile of every distinct kernel shape.
     for _ in 0..3 {
-        run(true, &mut r);
-        run(false, &mut r);
+        for &a in arms {
+            run(a, &mut r);
+        }
     }
-    let (mut ser, mut pooled) = (Vec::new(), Vec::new());
+    let mut samples: Vec<Vec<f64>> = vec![Vec::new(); 8];
     for _ in 0..rounds {
-        ser.push(run(true, &mut r));
-        pooled.push(run(false, &mut r));
+        for &a in arms {
+            let v = run(a, &mut r);
+            samples[a].push(v);
+        }
     }
+    let mut ser = std::mem::take(&mut samples[0]);
+    let mut pooled = std::mem::take(&mut samples[1]);
+    let mut dev: Vec<Vec<f64>> = samples.drain(2..).collect();
     let _ = predictor.take_bench(); // drain whatever the interleaved rounds put there
 
     println!("\n{rounds} interleaved rounds, ms per predictor frame:");
-    for (name, v) in [("down=serial", &mut ser), ("down=pooled", &mut pooled)] {
+    let mut rows: Vec<(&str, &mut Vec<f64>)> =
+        vec![("cpu down=serial", &mut ser), ("cpu down=pooled", &mut pooled)];
+    #[cfg(feature = "predictor-gpu")]
+    for (i, v) in dev.iter_mut().enumerate() {
+        if !v.is_empty() {
+            rows.push((engines[i].0, v));
+        }
+    }
+    for (name, v) in rows {
         println!(
-            "  {name:<12} p10 {:6.2} | p50 {:6.2} | p90 {:6.2} | min {:6.2}",
+            "  {name:<15} p10 {:6.2} | p50 {:6.2} | p90 {:6.2} | min {:6.2}",
             pct(v, 0.10),
             pct(v, 0.50),
             pct(v, 0.90),
@@ -153,9 +221,9 @@ fn main() {
     // be attributed round by round.
     if std::env::var("QWEN3TTS_BENCH").is_ok() {
         println!();
-        for (name, serial) in [("down=serial", true), ("down=pooled", false)] {
+        for (name, arm) in [("down=serial", 0), ("down=pooled", 1)] {
             for _ in 0..20 {
-                run(serial, &mut r);
+                run(arm, &mut r);
             }
             if let Some(line) = predictor.take_bench() {
                 println!("  {name}: {line}");
