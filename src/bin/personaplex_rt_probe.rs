@@ -101,6 +101,12 @@ fn pile_loader(pile: &str) -> WeightLoader {
     mary::persist::personaplex_loader(Path::new(pile)).unwrap_or_else(|e| panic!("pile load: {e}"))
 }
 
+fn runtime_source(pile: &str) -> mary::models::personaplex::PersonaPlexRuntimeSource {
+    mary::persist::personaplex_bundle(Path::new(pile))
+        .unwrap_or_else(|e| panic!("bundle load: {e}"))
+        .into_runtime_source()
+}
+
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     v[v.len() / 2]
@@ -110,10 +116,9 @@ fn load_model(pile: &str, fmt: WeightFmt) -> TemporalMetal {
     println!("loading ({fmt:?}) temporal transformer from {pile} …");
     let t0 = Instant::now();
     let loader = pile_loader(pile);
-    // Sibling auto-discovery: zero-copy mmap when `<stem>_<fmt>.pile` exists
-    // (byte-identical to quantize-at-load; MARY_PPLX_MATERIALIZE=1 forces the
-    // old path for the A/B).
-    let tm = mary::models::personaplex::qpile::temporal_auto(Path::new(pile), &loader, fmt);
+    // Unsigned transformed caches are not numerical authority. Use the
+    // deterministic transform path until signed-equation admission lands.
+    let tm = TemporalMetal::load(&loader, fmt);
     println!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
     tm
 }
@@ -456,8 +461,8 @@ fn framebench(pile: &str, fmt: WeightFmt, depth_f16: bool) {
         "(desktop machine — ambient contention inflates; min-of-medians + raw best/worst reported)"
     );
     let t0 = Instant::now();
-    let loader = pile_loader(pile);
-    let mut p = RealtimePipeline::load_auto(Path::new(pile), &loader, fmt, depth_f16);
+    let source = runtime_source(pile);
+    let mut p = RealtimePipeline::load_auto(&source, fmt, depth_f16);
     println!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
 
     // ── mimi decode scaling (stateless CPU decode of t frames): the 1-frame
@@ -795,8 +800,8 @@ fn pipeline_gate(pile: &str, fmt: WeightFmt, depth_f16: bool) {
         if depth_f16 { "f16" } else { "f32" }
     );
     let t0 = Instant::now();
-    let loader = pile_loader(pile);
-    let mut p = RealtimePipeline::load_auto(Path::new(pile), &loader, fmt, depth_f16);
+    let source = runtime_source(pile);
+    let mut p = RealtimePipeline::load_auto(&source, fmt, depth_f16);
     println!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
 
     // ── 1. Mimi encode (CPU stage, unchanged from the parity pipeline):
@@ -1181,8 +1186,8 @@ fn reset_gate(pile: &str, fmt: WeightFmt, depth_f16: bool) {
     use mary::models::personaplex::sampling::SamplingConfig;
     let (sched, vp, vp_cache, n_vp, codes) = reset_schedule();
     println!("loading realtime pipeline ({fmt:?}) from {pile} …");
-    let loader = pile_loader(pile);
-    let mut p = RealtimePipeline::load_auto(Path::new(pile), &loader, fmt, depth_f16);
+    let source = runtime_source(pile);
+    let mut p = RealtimePipeline::load_auto(&source, fmt, depth_f16);
 
     let mut ok = true;
     // Two modes: greedy (parity) and seeded sampling (the quality path).
@@ -1226,7 +1231,7 @@ fn reset_gate(pile: &str, fmt: WeightFmt, depth_f16: bool) {
         );
 
         // Fresh reload — reset must equal reload.
-        let mut q = RealtimePipeline::load_auto(Path::new(pile), &loader, fmt, depth_f16);
+        let mut q = RealtimePipeline::load_auto(&source, fmt, depth_f16);
         apply(&mut q);
         let (t3, o3) = reset_run(&mut q, &sched, &vp, &vp_cache, n_vp, &codes);
         let reload_ok = t1 == t3 && o1 == o3;

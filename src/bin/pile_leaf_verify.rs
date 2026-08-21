@@ -20,62 +20,12 @@
 //!   pile_leaf_verify <src.pile> <dst.pile>
 
 use anyhow::{Context, Result};
-use ed25519_dalek::SigningKey;
 use mary::format::attrs;
 use mary::leaf;
 use std::collections::HashSet;
 use std::path::Path;
-use triblespace::core::repo::{ancestors, Repository};
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
-
-fn checkout_any(
-    pile_path: &Path,
-) -> Result<(
-    &'static str,
-    TribleSet,
-    triblespace::core::repo::pile::PileReader,
-)> {
-    for branch in ["mary", "main"] {
-        let mut pile =
-            Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open {pile_path:?}: {e:?}"))?;
-        pile.refresh()
-            .map_err(|e| anyhow::anyhow!("{pile_path:?} failed to load ({e:?})"))?;
-        let mut repo = Repository::new(
-            pile,
-            SigningKey::generate(&mut rand::rngs::OsRng),
-            TribleSet::new(),
-        )
-        .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
-        let found = repo
-            .lookup_branch(branch)
-            .map_err(|e| anyhow::anyhow!("lookup {branch}: {e:?}"))?;
-        let Some(branch_id) = found else {
-            repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
-            continue;
-        };
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull {branch}: {e:?}"))?;
-        let Some(head) = ws.head() else {
-            repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
-            continue;
-        };
-        let tribles: TribleSet = ws
-            .checkout(ancestors(head))
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
-            .facts()
-            .clone();
-        let reader = repo
-            .storage_mut()
-            .reader()
-            .map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
-        repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
-        return Ok((branch, tribles, reader));
-    }
-    anyhow::bail!("no 'mary' or 'main' branch with commits in {pile_path:?}")
-}
-
 
 /// Entity ids of the leaves a conversion would convert: those carrying
 /// `data` or `data_f16` alongside `shape`.
@@ -109,8 +59,8 @@ fn main() -> Result<()> {
         .context("usage: pile_leaf_verify <src.pile> <dst.pile>")?;
     let (src, dst) = (Path::new(&src), Path::new(&dst));
 
-    let (src_branch, src_tribles, src_reader) = checkout_any(src)?;
-    let (dst_branch, dst_tribles, dst_reader) = checkout_any(dst)?;
+    let (src_branch, src_tribles, src_reader) = mary::persist::checkout_any_branch(src)?;
+    let (dst_branch, dst_tribles, dst_reader) = mary::persist::checkout_any_branch(dst)?;
     anyhow::ensure!(
         src_branch == dst_branch,
         "branch differs: source '{src_branch}', converted '{dst_branch}'"
@@ -128,7 +78,26 @@ fn main() -> Result<()> {
     //
     // A comparison that filters both sides by the same rule can only ever
     // confirm that rule was applied.
-    let replaced = [attrs::data.id(), attrs::data_f16.id(), attrs::shape.id()];
+    //
+    // Both spellings of the three, for the same reason the converter drops
+    // both: a pre-epoch pile states them under the literal attribute ids and
+    // the checkout projects the canonical aliases in beside them.
+    let canonical = [attrs::data.id(), attrs::data_f16.id(), attrs::shape.id()];
+    let mut replaced: HashSet<Id> = canonical.into_iter().collect();
+    for alias in mary::model_collection::legacy_model_attribute_aliases() {
+        if canonical.contains(&alias.canonical) {
+            replaced.insert(alias.historical);
+        }
+    }
+    let mut shape_attrs: HashSet<Id> = [attrs::shape.id()].into_iter().collect();
+    for alias in mary::model_collection::legacy_model_attribute_aliases() {
+        if alias.canonical == attrs::shape.id() {
+            shape_attrs.insert(alias.historical);
+        }
+    }
+    // The data attributes alone: a quantized leaf legitimately keeps its
+    // `shape`, so only `data`/`data_f16` mark the old representation.
+    let data_attrs: HashSet<Id> = replaced.difference(&shape_attrs).copied().collect();
     let converted_src: HashSet<Id> = src_leaves_ids(&src_tribles);
     let carried: TribleSet = src_tribles
         .iter()
@@ -156,7 +125,7 @@ fn main() -> Result<()> {
     anyhow::ensure!(
         !dst_tribles
             .iter()
-            .any(|t| t.a() == &attrs::data.id() || t.a() == &attrs::data_f16.id()),
+            .any(|t| data_attrs.contains(t.a())),
         "the converted pile still holds old-format leaf facts"
     );
 

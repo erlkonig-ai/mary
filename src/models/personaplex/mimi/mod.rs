@@ -12,6 +12,10 @@
 pub mod config;
 pub mod decoder;
 pub mod encoder;
+#[cfg(feature = "q4")]
+pub mod encoder_gpu;
 
 pub use decoder::MimiDecoder;
 pub use encoder::{MimiEncoder, MimiEncoderState};
+#[cfg(feature = "q4")]
+pub use encoder_gpu::MimiEncoderGpu;

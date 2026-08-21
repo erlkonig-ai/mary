@@ -65,62 +65,9 @@ use std::path::Path;
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::Blob;
 use triblespace::core::id::ExclusiveId;
-use triblespace::core::repo::{ancestors, BlobStoreList, Repository};
+use triblespace::core::repo::{BlobStoreList, Repository};
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
-
-/// Read a pile's facts from whichever branch holds them.
-///
-/// Two layouts exist in the wild: the current `mary` branch and the older
-/// `main`. Detected, not assumed — and the branch NAME is carried out so the
-/// destination lands on the same one.
-fn checkout_any(
-    pile_path: &Path,
-) -> Result<(
-    &'static str,
-    TribleSet,
-    triblespace::core::repo::pile::PileReader,
-)> {
-    for branch in ["mary", "main"] {
-        let mut pile =
-            Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open {pile_path:?}: {e:?}"))?;
-        pile.refresh().map_err(|e| {
-            anyhow::anyhow!("{pile_path:?} failed to load ({e:?}); refusing to auto-truncate")
-        })?;
-        let mut repo = Repository::new(
-            pile,
-            SigningKey::generate(&mut rand::rngs::OsRng),
-            TribleSet::new(),
-        )
-        .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
-        let found = repo
-            .lookup_branch(branch)
-            .map_err(|e| anyhow::anyhow!("lookup {branch}: {e:?}"))?;
-        let Some(branch_id) = found else {
-            repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
-            continue;
-        };
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull {branch}: {e:?}"))?;
-        let Some(head) = ws.head() else {
-            repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
-            continue;
-        };
-        let tribles: TribleSet = ws
-            .checkout(ancestors(head))
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
-            .facts()
-            .clone();
-        let reader = repo
-            .storage_mut()
-            .reader()
-            .map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
-        repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
-        return Ok((branch, tribles, reader));
-    }
-    anyhow::bail!("no 'mary' or 'main' branch with commits in {pile_path:?}")
-}
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -136,7 +83,7 @@ fn main() -> Result<()> {
         "src and dst are the same pile file — refusing to write into the source"
     );
 
-    let (branch, tribles, reader) = checkout_any(src)?;
+    let (branch, tribles, reader) = mary::persist::checkout_any_branch(src)?;
     eprintln!(
         "[migrate] {src:?}: branch '{branch}', {} facts",
         tribles.len()
@@ -199,8 +146,20 @@ fn main() -> Result<()> {
     // success. Found by auditing this tool against the very failure it was
     // written to avoid — the docs above claimed copy-and-substitute "cannot
     // lose data it has no schema for", and for `shape` that was false.
+    //
+    // Both spellings of the three go. A pre-epoch pile states them under the
+    // literal attribute ids, and the checkout projects the canonical aliases
+    // in beside them; carrying the literal copy forward would leave the
+    // converted pile still holding the representation this tool exists to
+    // retire, which `pile_leaf_verify` rightly rejects.
     let converted: HashSet<Id> = leaves.iter().map(|(e, _)| *e).collect();
-    let replaced = [attrs::data.id(), attrs::data_f16.id(), attrs::shape.id()];
+    let canonical = [attrs::data.id(), attrs::data_f16.id(), attrs::shape.id()];
+    let mut replaced: HashSet<Id> = canonical.into_iter().collect();
+    for alias in mary::model_collection::legacy_model_attribute_aliases() {
+        if canonical.contains(&alias.canonical) {
+            replaced.insert(alias.historical);
+        }
+    }
     let mut facts: TribleSet = tribles
         .iter()
         .filter(|t| !(replaced.contains(t.a()) && converted.contains(t.e())))

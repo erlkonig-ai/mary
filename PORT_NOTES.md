@@ -1563,138 +1563,26 @@ traffic; QoS/core-pinning against sibling load), not the temporal step.
    CUBECL_WGPU_MAX_TASKS sweep remain unexplored — at 1.7 ms flat submit
    there is little left to win there.
 
-## PersonaPlex-7B — zero-copy runtime piles (2026-07-12, `personaplex-zerocopy`)
+## PersonaPlex-7B — signed source bundles (2026-08-21)
 
-Design directive: "mary shouldn't have any non-zero-copy implementations —
-integrating with the zero-copy nature of triblespace is one of its main
-points." The realtime lane's load path was not a copy but a TRANSFORM pass
-("encoded layer N/32"): ~26 GB of f32 read + host quantize/fold/convert on
-every start. The fix: run that pass ONCE (`personaplex_persist
---derive-fmt <q4|q8|f16>` / `--derive-depth`), persist the exact bytes the
-kernels consume as 256-aligned (V3) leaves in DERIVED SIBLING PILES, then
-mmap them at load — `register_external_aliased` (the cubecl-fork seam,
-same as the gemma/nomic aliased loads) for every GPU buffer, direct
-mmap'd slices for the CPU depformer/embedding operands. The canonical
-`models/personaplex.pile` stays the single source of truth, strictly
-read-only; the siblings are regenerable exhaust. Module:
-`src/models/personaplex/qpile.rs`.
+The old runtime path treated a broad union of model facts plus
+filename-discovered sibling piles as authority. It has been replaced by one
+signed model-bundle token per COMMIT:
 
-### The file format IS the kernel ABI (marker-pinned)
+`τ = (model_root, metadata::archive, H)`
 
-Discovery convention (extends voxtral's `<stem>_f16.pile`):
-`models/personaplex_q4.pile` / `_q8.pile` / `_f16.pile` (temporal stack,
-one per `WeightFmt`) and `models/personaplex_depth.pile` (depformer CPU
-operands, both storage widths). Each derived model entity carries
-`attrs::format_marker` (attr id `2CC4D16369C4980BCB512937DA204FF5`), a
-minted id naming the exact layout; loaders accept a sibling only when it
-equals their compiled-in constant and fall back to transform-at-load
-otherwise. Any layout change mints a NEW id (`trible genid`) and
-re-derives. Current markers (minted 2026-07-12):
+`H` is a canonical, self-contained archive of the exact model facts. Loading
+freezes an exact bundle ticket, validates every one-row token and its canonical
+archive independently, selects the sole Source/native PersonaPlex root, and
+keeps `(team, root, H, τ, ticket)` bound to the weight loader. A snapshot
+cannot be relabelled as another team's authority, and a broad graph union
+cannot fill missing facts in a candidate bundle.
 
-- temporal q4 v2: `2178B37C4ED9201B73A753C43A991547`
-- temporal q8 v2: `EBA20BF70DF03F8704AA1F9BCFB0C837`
-- temporal f16 v2: `81E9D1853AB8EC327DEFE33C13B1B3B4`
-- depth v1: `81418AFBE0F880593E44750E1D318C41`
-
-(The temporal v2 layouts are the frametax fused kernels' — v2 landed the
-same day v1 was minted, before any v1 sibling shipped beyond this desk;
-the v1 ids `982B18242F107702A9ECC86C6B74502C` /
-`B8F70AA23223E6F7D111F543D2AB08A3` / `5E916E4D41D72BF7CEA505B9D20B859F`
-named the 7-split-matrix layout and stay burned, never reused.)
-
-New leaf attributes (format.rs): `data_q4`
-(`2ADC6462A7F70E230558C5D681E38768`, Handle<U32Array>), `data_q8`
-(`23178058559C762BB4B1FEAA36B3566D`, Handle<U32Array>), `q_scales`
-(`F9EA2FB90DC094D42A4845B013950032`, Handle<F16Array>). A quantized leaf
-= `{data_q4 XOR data_q8, q_scales, shape}` with `shape` the logical
-row-major `[out, in]`.
-
-### Temporal sibling layout (entity `personaplex_<fmt>`, marker v2)
-
-Per layer `i` in 0..32, leaves `t.{i}.{qkv|o|gateup|down}` — the 4 matvec
-weights in the frametax lane's FUSED kernel layouts, AFTER the load-time
-convention transforms:
-
-- `qkv` `[3·4096, 4096]`: q‖k‖v rows concatenated (the moshi
-  `in_proj_weight` block order) with the interleaved→split-half RoPE
-  de-interleave applied to the q and k row blocks;
-- `gateup` `[2·11264, 4096]`: gate/up rows pair-INTERLEAVED (row 2j =
-  gate_j, row 2j+1 = up_j) so each 8-row cube owns whole pairs — the
-  in-kernel SwiGLU epilogue's layout;
-- `o` `[4096, 4096]` and `down` `[4096, 11264]` as shipped.
-
-Row concatenation/permutation is quantization-transparent (groups run
-along the input dim of each row), so fused derivation is bit-exact vs
-fusing split-quantized blocks. Packed per fmt:
-
-- **q4** (GGUF-Q4_0, `nn::q4::quantize_q4`): 32-weight groups along the
-  input dim; per group one f16 scale `d = w[argmax|w|]/−8` (f16-rounded
-  BEFORE quantizing), nibbles `q = clamp(round(w/d)+8, 0, 15)`. Packed
-  words `[out, in/8]` u32 row-major, nibble `k%8` of word `k/8` at bits
-  `4·(k%8)` (little-nibble-endian). Scales `[out, in/32]` f16 row-major.
-  4.5 bits/weight.
-- **q8** (q8_0-style biased bytes, `temporal_metal::quantize_q8`):
-  32-weight groups, f16 scale `d = max|w|/127` (f16-rounded first), bytes
-  `clamp(round(w/d), −127, 127) + 128` (bias 128 ⇒ unpack is
-  `cast(byte)−128`, no sign-extension). Packed words `[out, in/4]` u32,
-  byte `k%4` at bits `8·(k%4)`. Scales `[out, in/32]` f16. 8.5 bits/weight.
-- **f16**: raw `[out, in]` f16 rows (`f16::from_f32`, the exact cast the
-  load path applies).
-
-Plus `t.{i}.norm1` / `t.{i}.norm2` / `t.out_norm` (squeezed `[4096]` f32
-alphas — explicit, NOT folded, per the quantcheck decision), `t.head_f16`
-(raw f16 `[32000, 4096]`) and `t.head_q4` (packed q4) — both logit heads
-persist in EVERY fmt sibling so the production f16-head choice and the
-probe's A/B stay serviceable. Embeddings (`text_emb`, `emb.{0..15}`) are
-NOT duplicated: the runtime maps them zero-copy from the canonical pile's
-exact-f32 leaves (`WeightLoader::view_f32` → `HostF32::Mapped`). RoPE
-tables stay computed (1.5 MB, cheap). KV caches are runtime state.
-
-### Depth sibling layout (entity `personaplex_depth`)
-
-The depformer's per-step CPU gemv operands, step-fused so each step is a
-contiguous row-slice of one leaf (offset arithmetic, no per-step blobs):
-
-- `d.f32.{l}.qkv` `[16·3·1024, 1024]` — norm1-alpha fold + exact 2⁻³ on
-  the q rows applied (`depth_fast::fold_qkv_step`), step-major.
-- `d.f32.{l}.gate_up` `[16·2·2816, 1024]` — norm2-alpha fold
-  (`fold_gate_up`), step-major.
-- `d.f32.dep_in` `[16·1024, 4096]` — the 16 conditioning projections
-  FUSED (the one-gemv-per-frame trick needs contiguity the canonical
-  per-step leaves can't give).
-- `d.f16.{l}.{qkv|o|gate_up|down}`, `d.f16.heads`, `d.f16.dep_in` — the
-  COMPLETE f16-storage operand set (same folds, then the exact
-  `f16::from_f32` conversion `Mat::new` applies).
-
-f32-mode operands the runtime consumes UNMODIFIED — `o` row-slices,
-`down`, `linears.{t}` heads, both embedding families — are NOT duplicated;
-they map the canonical pile directly (`Mat::F32Map` over
-`WeightLoader::view_f32`). CPU alignment: the pile's V3 256-byte record
-alignment over-satisfies both Accelerate sgemv (natural f32) and the NEON
-`ldp` kernel (unaligned-capable); `hdot`'s `n % 32 == 0` holds for every
-operand width (1024/2816/4096).
-
-### Identity contract + auto-discovery
-
-The derive SHARES the transform code with the load path
-(`temporal_metal::layer_mats_f32` + the quantizers,
-`depth_fast::fold_qkv_step`/`fold_gate_up` + the f16 cast), so a
-sibling-loaded model is BYTE-IDENTICAL to a transform-at-load one: all rt
-gates must produce identical numbers with and without the sibling. Any
-difference is a derive bug, not acceptable drift. `MARY_PPLX_MATERIALIZE=1`
-forces the transform-at-load path (the A/B switch, mirroring
-`MARY_SPEAK_MATERIALIZE`); each component also falls back independently when
-its sibling is absent, marker-stale, or non-aliasable (logged). Loaders:
-`qpile::temporal_auto` / `qpile::depth_auto` /
-`RealtimePipeline::load_auto`; `personaplex_rt_probe` and
-`personaplex_surface_probe` discover automatically. `moshi_depth_probe`
-(feature `personaplex`, no `q4`) intentionally stays on fold-at-load — it
-is the lane-B parity oracle.
-
-Derive safety: the source pile's byte length + sha256 and every sibling
-pile's byte length are recorded before and verified unchanged after every
-derive run (`personaplex_persist` gates on it) — only the new sibling file
-is ever created.
+Legacy qpile derivation, filename/sibling discovery, and model-name runtime
+identity are removed. `RealtimePipeline::load_auto` currently recomputes the
+runtime transforms from the verified bundle. Any future cached representation
+must preserve this authority/loader binding rather than introducing a second,
+caller-supplied identity.
 
 ## Qwen3-TTS — raw is the ONLY talker lane (2026-07-12, `talker-raw-only`)
 

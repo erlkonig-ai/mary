@@ -554,13 +554,9 @@ pub(crate) fn load_alpha(loader: &WeightLoader, name: &str) -> Vec<f32> {
     a
 }
 
-/// The 4 per-layer matvec weight names, in launch order — the leaf-name
-/// suffixes of the derived sibling pile (`t.{layer}.{name}`).
-pub(crate) const MAT_NAMES: [&str; 4] = ["qkv", "o", "gateup", "down"];
-
 /// Fetch temporal layer `i`'s 4 runtime matvec weights as row-major f32 in
-/// the FUSED kernel layouts, in [`MAT_NAMES`] order with their `[out, in]`
-/// dims:
+/// the FUSED kernel layouts, in qkv/o/gateup/down launch order with their
+/// `[out, in]` dims:
 ///
 /// - `qkv` `[3·DIM, DIM]`: q‖k‖v rows concatenated (the moshi
 ///   `in_proj_weight` block order), q/k rows de-interleaved (RoPE
@@ -570,10 +566,8 @@ pub(crate) const MAT_NAMES: [&str; 4] = ["qkv", "o", "gateup", "down"];
 ///   in-kernel SwiGLU epilogue.
 ///
 /// Row concatenation/permutation is quantization-transparent (groups run
-/// along the input dim of each row). SHARED by the quantize-at-load path
-/// ([`TemporalMetal::load`]) and the sibling derive
-/// (`qpile::derive_temporal_pile`) — one code path is what guarantees the
-/// persisted packed bytes are IDENTICAL to the ones quantized at load.
+/// along the input dim of each row). Keeping the transform named and shared
+/// makes a future derived format able to reuse the exact load-time recipe.
 pub(crate) fn layer_mats_f32(
     loader: &WeightLoader,
     i: usize,
@@ -795,8 +789,7 @@ impl QLinear {
 /// Encode a batch of row-major f32 weights in parallel (the layer load is
 /// pile-read-bound otherwise). Jobs split into row chunks so the wide fused
 /// matrices (q‖k‖v, gate/up) don't serialize the encode — every encoding is
-/// per-row, so row-major chunks concatenate bit-exactly. `pub(crate)` for
-/// the sibling derive (`qpile`), which persists the SAME encoded bytes.
+/// per-row, so row-major chunks concatenate bit-exactly.
 pub(crate) fn encode_batch(jobs: Vec<(Vec<f32>, usize, usize)>, fmt: WeightFmt) -> Vec<Encoded> {
     const CHUNK_ROWS: usize = 4096;
     std::thread::scope(|sc| {
@@ -887,8 +880,7 @@ pub struct TemporalMetal {
     head_f16: Handle,   // [32000, 4096] f16 rows
     head_q4: Q4Linear,
     /// `text_emb [32001, 4096]` host f32 (row 32000 = text BOS-of-stream).
-    /// Owned by the quantize-at-load path; a zero-copy mmap view of the
-    /// exact-f32 pile leaf on the sibling path (same bytes either way).
+    /// Owned by the quantize-at-load path.
     text_emb: HostF32,
     /// `emb.{0..15} [2049, 4096]` host f32 (row 2048 = audio initial token).
     audio_emb: Vec<HostF32>,
@@ -1027,129 +1019,6 @@ impl TemporalMetal {
             client,
             len: 0,
         }
-    }
-
-    /// ZERO-COPY load from a derived sibling pile (`qpile`): every GPU weight
-    /// buffer — the packed q4/q8 words + f16 scales (or raw f16 rows), the
-    /// norm alphas, both logit heads — ALIASES its mmap'd pile blob via
-    /// `register_external_aliased` (no read, no quantize pass, no upload
-    /// copy; pages fault in on first kernel touch). The host embeddings map
-    /// the canonical pile's exact-f32 leaves the same way. Byte-identical to
-    /// [`Self::load`] with the same `fmt` — the sibling stores exactly the
-    /// bytes the quantize-at-load pass produces (`derive_temporal_pile`
-    /// shares `layer_mats_f32` + the quantizers with `load`), so the gates
-    /// must agree BIT-EXACTLY; any difference is a derive bug.
-    ///
-    /// Errors (marker mismatch, missing leaf, non-mmap blob) are the
-    /// caller's cue to fall back to [`Self::load`].
-    #[cfg(target_os = "macos")]
-    pub fn load_zero_copy(
-        sib: &super::qpile::QPile,
-        loader: &WeightLoader,
-        fmt: WeightFmt,
-    ) -> anyhow::Result<Self> {
-        use super::qpile;
-        let want = qpile::temporal_marker(fmt);
-        anyhow::ensure!(
-            sib.marker == Some(want),
-            "format marker mismatch: sibling has {:?}, this build wants {want:?} ({fmt:?}) — \
-             re-derive with personaplex_persist --derive-fmt",
-            sib.marker
-        );
-        let client = q4::client_for_default_device();
-        let alias = |b: &anybytes::Bytes| -> anyhow::Result<Handle> {
-            q4::alias_pile_blob(&client, b)
-                .ok_or_else(|| anyhow::anyhow!("pile blob not mmap-backed — cannot alias"))
-        };
-
-        let d = DIM;
-        let mut layers = Vec::with_capacity(cfg::NUM_LAYERS);
-        for i in 0..cfg::NUM_LAYERS {
-            let mut mats = Vec::with_capacity(MAT_NAMES.len());
-            for name in MAT_NAMES {
-                let key = format!("t.{i}.{name}");
-                let q = match fmt {
-                    WeightFmt::Q4 => {
-                        let (wq, sc, shape) = sib.bytes_q4(&key)?;
-                        QLinear::Q4(Q4Linear {
-                            wq: alias(&wq)?,
-                            scales: alias(&sc)?,
-                            out_dim: shape[0],
-                            in_dim: shape[1],
-                        })
-                    }
-                    WeightFmt::Q8 => {
-                        let (wq, sc, shape) = sib.bytes_q8(&key)?;
-                        QLinear::Q8 {
-                            wq: alias(&wq)?,
-                            scales: alias(&sc)?,
-                            out_dim: shape[0],
-                            in_dim: shape[1],
-                        }
-                    }
-                    WeightFmt::F16 => {
-                        let (w, shape) = sib.bytes_f16(&key)?;
-                        anyhow::ensure!(
-                            w.len() == shape[0] * shape[1] * 2,
-                            "{key}: f16 byte count vs shape"
-                        );
-                        QLinear::F16 {
-                            w: alias(&w)?,
-                            out_dim: shape[0],
-                            in_dim: shape[1],
-                        }
-                    }
-                };
-                mats.push(q);
-            }
-            let (a1, s) = sib.bytes_f32(&format!("t.{i}.norm1"))?;
-            anyhow::ensure!(s == vec![d], "t.{i}.norm1 shape");
-            let (a2, s) = sib.bytes_f32(&format!("t.{i}.norm2"))?;
-            anyhow::ensure!(s == vec![d], "t.{i}.norm2 shape");
-            let mut it = mats.into_iter();
-            let mut next = || it.next().unwrap();
-            layers.push(MetalLayer {
-                qkv: next(),
-                o: next(),
-                gateup: next(),
-                down: next(),
-                norm1: alias(&a1)?,
-                norm2: alias(&a2)?,
-                kcache: client.empty(d * MAX_SEQ * 2),
-                vcache: client.empty(MAX_SEQ * d * 2),
-            });
-        }
-
-        let (onw, s) = sib.bytes_f32("t.out_norm")?;
-        anyhow::ensure!(s == vec![d], "t.out_norm shape");
-        let out_norm_w = alias(&onw)?;
-        let (hf, s) = sib.bytes_f16("t.head_f16")?;
-        anyhow::ensure!(s == vec![cfg::TEXT_LOGITS, d], "t.head_f16 shape");
-        let head_f16 = alias(&hf)?;
-        let (hwq, hsc, s) = sib.bytes_q4("t.head_q4")?;
-        anyhow::ensure!(s == vec![cfg::TEXT_LOGITS, d], "t.head_q4 shape");
-        let head_q4 = Q4Linear {
-            wq: alias(&hwq)?,
-            scales: alias(&hsc)?,
-            out_dim: cfg::TEXT_LOGITS,
-            in_dim: d,
-        };
-
-        // Host embeddings: zero-copy mmap views of the CANONICAL pile's
-        // exact-f32 leaves (they are consumed row-wise on the CPU as-is).
-        let (text_emb, s) = loader.load_host_f32("text_emb.weight");
-        assert_eq!(s, vec![cfg::TEXT_VOCAB, d], "text_emb shape");
-        let audio_emb = (0..cfg::N_Q)
-            .map(|cb| {
-                let (w, s) = loader.load_host_f32(&format!("emb.{cb}.weight"));
-                assert_eq!(s, vec![cfg::AUDIO_VOCAB, d], "emb.{cb} shape");
-                w
-            })
-            .collect();
-
-        Ok(Self::assemble(
-            client, layers, out_norm_w, head_f16, head_q4, text_emb, audio_emb,
-        ))
     }
 
     /// moshi `embed_codes` on the host: one step's 17 tokens (delays already

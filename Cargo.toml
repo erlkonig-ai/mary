@@ -196,8 +196,7 @@ personaplex = ["qwen3tts", "dep:burn-ndarray", "burn-ndarray/blas-accelerate"]
 # dequant-in-kernel matvec (mary::nn::q4) — the bandwidth lever that turns the
 # Moshi temporal transformer's 17.2 GB/step f16 stream into ~4.8 GB. Additive:
 # a cubecl kernel + host wrapper + the moshi_q4_probe spike; no model changes.
-# memmap2 backs the zero-copy load seam (mmap'd derived-sibling blobs aliased
-# onto the GPU via register_external_aliased — models/personaplex/qpile.rs).
+# memmap2 backs zero-copy aliased weight loads on supported paths.
 q4 = ["dep:cubecl", "dep:memmap2"]
 # MXFP4 (microscaling FP4) decode + the bit-exact MXFP4 -> NVFP4 transcode
 # gate (`mxfp4_gate`). The codec itself (mary::nn::mxfp4) is dependency-free
@@ -614,19 +613,23 @@ required-features = ["qwen3tts"]
 name = "mimi_probe"
 required-features = ["qwen3tts", "import"]
 
+# Mimi encoder CPU-vs-GPU bench + statistical parity. The streaming encoder is
+# a realtime-critical-path stage; this measures both lanes on one input.
+[[bin]]
+name = "mimi_gpu_probe"
+required-features = ["qwen3tts", "q4"]
+
 # Mimi codec round-trip: WAV -> encode -> decode -> WAV. Measures what the
 # codec alone preserves (sung vs spoken input), independent of any LM.
 [[bin]]
 name = "mimi_roundtrip"
 required-features = ["qwen3tts", "import"]
 
-# PersonaPlex-7B checkpoint → shelf pile (LM + Mimi codec), with the
-# bit-exact round-trip gate and config-truth shape assertions. Also the
-# derive step for the runtime-format sibling piles (--derive-fmt /
-# --derive-depth — the zero-copy load seam, needs q4 for the quantizers).
+# PersonaPlex-7B checkpoint → signed model bundle (LM + Mimi codec), with the
+# bit-exact round-trip gate and config-truth shape assertions.
 [[bin]]
 name = "personaplex_persist"
-required-features = ["personaplex", "q4", "import"]
+required-features = ["personaplex", "import"]
 
 # PersonaPlex-7B temporal transformer (LM part 1) CPU-f32 parity gate vs the
 # moshi oracle goldens. Loads weights from the shelf pile only — no safetensors.
