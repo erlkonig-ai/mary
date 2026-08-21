@@ -1703,6 +1703,21 @@ there (no Accelerate on aarch64 Linux), i.e. 4x slower than audio-rate, so
 corpus generation on a Spark was not viable at all before this port and is
 ~23x faster now.
 
+**In situ** — the number that decides whether it rebuffers. Same quiet window
+(load ~4), same 687-char two-pass fixture, seed 7, `MARY_PRED_CPU=1` for the
+control, per frame against an 80 ms budget:
+
+| | talker submit | sync | logits | **predictor** | total | wall/audio |
+|---|---|---|---|---|---|---|
+| cpu | 15.2 | 7.7 | 0.2 | **25.9** | 49.2 | 0.62x |
+| gpu f16 | 17.3 | 7.3 | 0.2 | **10.9** | 35.7 | 0.45x |
+
+464 and 450 frames respectively. The predictor is 2.4x faster in place —
+better than the 1.5x the synthetic bench shows, because in the real loop the
+predictor's dispatches are encoded while the talker's previous GPU work is
+still draining, and only the residue lands on the critical path. The frame
+now spends 36 ms of its 80, and the talker is once again the largest term.
+
 **Parity.** No bit-exactness gate; judged by per-codebook token agreement
 against the CPU f32 oracle, dual-run on the real generation path
 (`MARY_PRED_GATE=1`, which runs both engines on every frame's real inputs
@@ -1713,6 +1728,12 @@ with a cloned rng, so a disagreement is numerics and not luck):
   path's at the same seed. That is the control the format choice hangs on: it
   says the kernels are right, so any disagreement elsewhere is quantization.
 - q8: 1148/1350 = 85.04%.
+
+Across three fixtures f16 agrees 7262/7275 = 99.82%; the residue is near-ties
+in a 2048-way gumbel argmax, and because the stage is autoregressive a single
+flip re-rolls the rest of the utterance (the 464-vs-450-frame difference in
+the table above is exactly that, not a defect). On the shorter fixtures where
+no token flips, the rendered WAV is byte-identical.
 
 f16 is therefore the default and the ~8 ms q8 would save is deliberately left
 on the table: the talker ahead of this stage costs ~28 ms/frame against an
