@@ -246,7 +246,13 @@ pub fn migrate_legacy_model_main(
         };
     }
 
-    let commit = publish_model_fragment(pile, signing_key, fragment)
+    // Whose collection the migrated graph joins: the pile's existing
+    // model-graph team if it already has one, else this signer owns it. Same
+    // rule every other publisher in mary follows, so a migrated root and an
+    // imported one land in one collection rather than two.
+    let team = mary::model_collection::model_graph_team_or_own(pile, signing_key)
+        .context("determine the model-graph team for the migrated collection")?;
+    let commit = publish_model_fragment(pile, team, signing_key, fragment)
         .context("publish migrated model graph to Mary's native collection")?;
 
     Ok(LegacyModelMigrationResult {
@@ -470,7 +476,12 @@ mod tests {
         commit: CollectionCommit,
     ) -> triblespace::core::collection::CollectionSnapshot<PileReader> {
         let mut pile = Pile::open(path).expect("open pile for exact native read");
-        let snapshot = snapshot_model_collection_exact(&mut pile, &[commit])
+        // Read the team back out of the pile rather than restating it here, so
+        // the test cannot pass against a collection published under a team the
+        // migration did not actually choose.
+        let team = mary::model_collection::sole_model_graph_team(&mut pile)
+            .expect("the migrated pile publishes exactly one model-graph team");
+        let snapshot = snapshot_model_collection_exact(&mut pile, team, &[commit])
             .expect("materialize exact migration ticket");
         pile.close().expect("close exact-read pile");
         snapshot
