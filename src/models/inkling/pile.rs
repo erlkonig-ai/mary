@@ -253,11 +253,22 @@ fn mem_total_bytes() -> Result<u64> {
 ///   barely with the sequence;
 /// * 4 GiB is left for the kernel, the shell and the page-cache working window,
 ///   and that number is not a guess either. It is where the measured cliff is;
-/// * `attention_bytes` is everything that scales with `n^2`, and it is the
-///   term this function did not have. See [`super::budget`]: prefill holds
-///   two `[heads, n, n]` f32 score matrices at the peak, which is 67 MB at 512
-///   tokens and 47.6 GiB at 14,124. Charging a flat per-layer figure for that
-///   is what admitted a run that peaked at 119.5 GiB of a 119.6 GiB node.
+/// * cubecl's two largest pool PAGES, from
+///   [`super::budget::pool_page_floor`]. The pool reserves 41.74 GiB to hold
+///   1.14 GiB of live tensors at 16,384 tokens, because a page is allocated
+///   whole and returned only when every slice of it is free -- so the space
+///   between what the tensors are and what the device has handed out is the
+///   largest single term in this function, and it was missing;
+/// * `attention_bytes` is everything that scales with the SEQUENCE, and it is
+///   the term this function did not have. See
+///   [`super::budget::prefill_activation_bytes`]. It was briefly the score
+///   matrices alone, which was not enough by itself: once the dense lane
+///   blocked its queries that term stopped growing -- 13.84 GiB at 16,384
+///   tokens, 13.34 at 81,920, 13.52 at 100,623 -- and the gate went back to
+///   being flat in the one variable it was added to track. What actually
+///   scales is the routed-expert lane, whose every stage is
+///   `num_experts_per_tok` rows a token: 372 KiB a token against the score
+///   blocks' bounded 8 GiB.
 ///
 /// The ladder, on a 121.63 GiB box, caches dropped and swap reset before each
 /// row, `INK_GEN=1`, at 01211be plus this change. "free" and "swap" are read
@@ -279,11 +290,15 @@ fn mem_total_bytes() -> Result<u64> {
 /// It derives from the machine (`MemTotal`), never from a constant: the two
 /// nodes this runs on differ by 2 GiB, and a gate hard-coded to either figure
 /// is wrong on the other.
-fn run_overhead_bytes(layers: usize, attention_bytes: u64) -> u64 {
+fn run_overhead_bytes(layers: usize, attention_bytes: u64, machine: u64) -> u64 {
     const CUDA_CONTEXT: u64 = GIB / 5;
     const ACTIVATIONS_PER_LAYER: u64 = 41 * GIB / 200;
     const OS_FLOOR: u64 = 4 * GIB;
-    CUDA_CONTEXT + ACTIVATIONS_PER_LAYER * layers as u64 + OS_FLOOR + attention_bytes
+    CUDA_CONTEXT
+        + ACTIVATIONS_PER_LAYER * layers as u64
+        + OS_FLOOR
+        + super::budget::pool_page_floor(machine)
+        + attention_bytes
 }
 
 fn mem_available_bytes() -> Result<u64> {
@@ -1155,12 +1170,15 @@ impl PileSource {
     /// each leaf's source pages. Peak residency becomes the arena plus a
     /// working window instead of the arena plus the whole share.
     ///
-    /// `attention_bytes` is what prefill will hold in `[heads, n, n]` score
-    /// matrices at this sequence length, from [`super::budget::prefill_peak_bytes`].
+    /// `attention_bytes` is what prefill will hold in ACTIVATIONS at this
+    /// sequence length, from [`super::budget::prefill_activation_bytes`]: the
+    /// residual stream, every layer's kept keys and values, and the widest
+    /// single layer's working set -- which on this model is the routed-expert
+    /// lane, six rows a token through buffers as wide as the hidden size.
     /// It is a parameter rather than something this module derives because the
     /// sequence length is a fact about the RUN and the weight share is a fact
     /// about the checkpoint, and folding one into the other is how the gate
-    /// came to charge a constant for a quadratic.
+    /// came to charge a constant for something linear in the sequence.
     pub fn copy_share(
         &mut self,
         layers: std::ops::Range<usize>,
@@ -1300,7 +1318,7 @@ impl PileSource {
         let available = mem_available_bytes()?;
         let machine = mem_total_bytes()?;
         let n_layers = layers.len();
-        let overhead = run_overhead_bytes(n_layers, attention_bytes);
+        let overhead = run_overhead_bytes(n_layers, attention_bytes, machine);
         let need = total as u64 + overhead;
         let gib = |b: u64| b as f64 / GIB as f64;
         if need > machine || total as u64 > available {
@@ -1315,7 +1333,8 @@ impl PileSource {
             for (k, bytes) in per_layer.values().enumerate() {
                 acc += *bytes as u64;
                 let k = k + 1;
-                if acc + run_overhead_bytes(k, attention_bytes) <= machine && acc <= available {
+                let fits_here = acc + run_overhead_bytes(k, attention_bytes, machine);
+                if fits_here <= machine && acc <= available {
                     fits = Some((k, acc));
                 }
             }
@@ -1326,7 +1345,7 @@ impl PileSource {
                     layers.start,
                     layers.start + k,
                     gib(share),
-                    gib(share + run_overhead_bytes(k, attention_bytes)),
+                    gib(share + run_overhead_bytes(k, attention_bytes, machine)),
                 ),
                 None => format!(
                     "Not even one layer fits: layer {} alone is {:.2} GiB on top of {:.2} GiB of \
@@ -1339,15 +1358,16 @@ impl PileSource {
             };
             // Which half of the sum is the problem. A refusal that only ever
             // says "use fewer layers" sends the operator to buy nodes when the
-            // fix is a shorter input: at 20,000 tokens the score matrices are
-            // 95.5 GiB of a 139.4 GiB estimate, and no layer split touches
-            // them, because every node runs attention over the whole sequence.
+            // fix is a shorter input: the activation working set is linear in
+            // the sequence and very nearly FLAT in the range, because layers
+            // run one at a time and each frees its own before the next
+            // allocates. No layer split touches it.
             let cause = if attention_bytes > total as u64 {
                 format!(
-                    "\n  THE SEQUENCE, NOT THE SPLIT: {:.2} GiB of that is the attention score \
-                     matrices at this input length, against {:.2} GiB of weights. Splitting the \
-                     stack across more nodes does not help -- every node attends over the whole \
-                     sequence. Shorten the input.",
+                    "\n  THE SEQUENCE, NOT THE SPLIT: {:.2} GiB of that is activations at this \
+                     input length, against {:.2} GiB of weights. Splitting the stack across more \
+                     nodes does not help -- the widest layer is as wide on every node, and every \
+                     node attends over the whole sequence. Shorten the input.",
                     gib(attention_bytes),
                     gib(total as u64),
                 )
