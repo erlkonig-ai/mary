@@ -304,14 +304,27 @@ impl RealtimePipeline {
         x: &[f32],
         p: Prepared,
         input: Option<[i64; cfg::NUM_STREAMS]>,
+        arbiter: Option<&mut dyn FnMut(&[f32], i64) -> i64>,
     ) -> RtStepTrace {
         self.temporal.step_submit(x, self.head);
         let (hidden, text_logits) = self.temporal.read_hidden_logits();
         // Text first, then audio — one RNG threaded per frame (reproducible).
-        let sampled_text = match self.sampler.as_mut() {
+        let mut sampled_text = match self.sampler.as_mut() {
             Some(smp) => smp.token(&text_logits) as i64,
             None => argmax(&text_logits) as i64,
         };
+        // The arbitration point (see [`Self::step_arbitrated`]). It sits HERE,
+        // between reading the row and conditioning the depformer, because
+        // those happen inside one call: a caller that watched
+        // `RtStepTrace.text_logits` and reacted next frame would be steering
+        // the audio one frame after the audio was generated. Bypassed when the
+        // caller provided stream 0 outright — an explicit force is already a
+        // decision and must not be second-guessed.
+        if !p.provided[0] {
+            if let Some(decide) = arbiter {
+                sampled_text = decide(&text_logits, sampled_text);
+            }
+        }
         let next_text = if p.provided[0] {
             p.target[0]
         } else {
@@ -320,6 +333,10 @@ impl RealtimePipeline {
         let dep_tokens =
             self.depth
                 .frame(&hidden, next_text, &p.forced(), None, self.sampler.as_mut());
+        // `sampled_text` — post-arbitration — is what `commit` writes into the
+        // ring, so the substituted token enters the model's own history as if
+        // it had chosen it. That is the whole basis of the no-garble property:
+        // on release it continues from a prefix it owns.
         let out = self.stream.commit(&p, sampled_text, &dep_tokens);
         RtStepTrace {
             input,
@@ -349,7 +366,42 @@ impl RealtimePipeline {
         };
         let input = p.input;
         let x = self.temporal.embed_codes(&input);
-        self.forward(&x, p, Some(input))
+        self.forward(&x, p, Some(input), None)
+    }
+
+    /// Step with stream 0 decided AT THE SAMPLING BOUNDARY: the model samples
+    /// its own text token, `decide` sees that token and the row it came from,
+    /// and whatever `decide` returns is what conditions the depformer for this
+    /// same frame and what enters the token ring.
+    ///
+    /// This is a different division of labour from [`Self::step`]'s
+    /// `text_token`. Forcing a token supplies BOTH what is said and when —
+    /// the caller has to invent a rhythm, and every rhythm it can invent is a
+    /// schedule the model was not trained on. Arbitrating instead lets the
+    /// model keep the timing it does know — where pauses fall, how long they
+    /// run, where a word boundary is marked — while the caller substitutes
+    /// only the content of the tokens that are actually words.
+    ///
+    /// `decide` returning its second argument unchanged is exactly
+    /// [`Self::step`] with `text_token: None`.
+    pub fn step_arbitrated(
+        &mut self,
+        input_tokens: Option<&[i64; 8]>,
+        moshi_tokens: Option<&[i64; 8]>,
+        decide: &mut dyn FnMut(&[f32], i64) -> i64,
+    ) -> RtStepTrace {
+        let Some(p) = self.stream.prepare(input_tokens, moshi_tokens, None) else {
+            return RtStepTrace {
+                input: None,
+                next_text: -1,
+                dep_tokens: [0; cfg::DEP_Q],
+                out: None,
+                text_logits: Vec::new(),
+            };
+        };
+        let input = p.input;
+        let x = self.temporal.embed_codes(&input);
+        self.forward(&x, p, Some(input), Some(decide))
     }
 
     /// Voice-prompt replay step: the cache advances with dummy initial
@@ -365,7 +417,7 @@ impl RealtimePipeline {
                 break p;
             }
         };
-        self.forward(x, p, None)
+        self.forward(x, p, None, None)
     }
 
     /// Voice-prompt replay (moshi `_step_voice_prompt`): feed the packaged
