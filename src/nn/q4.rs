@@ -374,28 +374,32 @@ impl Q4Linear {
     /// Submit `y = Wq · x` (`x`: `in_dim` f32, `y`: `out_dim` f32, both device
     /// buffers). Non-blocking; sync via a readback on `y` (or later).
     pub fn forward(&self, client: &Client, x: &Handle, y: &Handle) {
-        self.launch(client, x, y, false);
+        self.launch(client, x, y, self.out_dim, false);
+    }
+
+    /// Like [`Self::forward`] but computing only the first `rows` output rows
+    /// (`rows % ROWS_PER_CUBE == 0`). The weights are row-major, so a row
+    /// prefix is a byte prefix: a shorter launch streams strictly fewer bytes.
+    pub fn forward_rows(&self, client: &Client, x: &Handle, y: &Handle, rows: usize) {
+        self.launch(client, x, y, rows, false);
     }
 
     /// Fused gate‖up + SwiGLU: the weight rows are interleaved
     /// (even = gate_j, odd = up_j) and `y` receives `silu(g)·u` per pair
     /// (`out_dim/2` f32). One dispatch replaces gate + up + swiglu.
     pub fn forward_swiglu(&self, client: &Client, x: &Handle, y: &Handle) {
-        self.launch(client, x, y, true);
+        self.launch(client, x, y, self.out_dim, true);
     }
 
-    fn launch(&self, client: &Client, x: &Handle, y: &Handle, swiglu_pairs: bool) {
-        assert_eq!(self.out_dim as u32 % ROWS_PER_CUBE, 0);
+    fn launch(&self, client: &Client, x: &Handle, y: &Handle, rows: usize, swiglu_pairs: bool) {
+        assert_eq!(rows as u32 % ROWS_PER_CUBE, 0);
+        assert!(rows <= self.out_dim);
         assert_eq!(self.in_dim % GROUP, 0);
-        let y_len = if swiglu_pairs {
-            self.out_dim / 2
-        } else {
-            self.out_dim
-        };
+        let y_len = if swiglu_pairs { self.out_dim / 2 } else { rows };
         unsafe {
             q4_matvec_kernel::launch_unchecked::<Rt>(
                 client,
-                CubeCount::new_1d(self.out_dim as u32 / ROWS_PER_CUBE),
+                CubeCount::new_1d(rows as u32 / ROWS_PER_CUBE),
                 CubeDim::new_1d(ROWS_PER_CUBE * THREADS_PER_ROW),
                 ArrayArg::from_raw_parts(x.clone(), self.in_dim / 4),
                 ArrayArg::from_raw_parts(self.wq.clone(), self.out_dim * self.in_dim / 8),

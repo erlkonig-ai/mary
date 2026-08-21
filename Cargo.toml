@@ -685,6 +685,13 @@ required-features = ["qwen3tts"]
 name = "moshi_depth_probe"
 required-features = ["personaplex"]
 
+# Realtime lane B, on the GPU: the depth transformer ported to cubecl
+# (depth_gpu) — the device dispatch-cost floor the kernel layout is designed
+# against, the parity gate vs the CPU predictor, and the per-frame bench.
+[[bin]]
+name = "depth_gpu_probe"
+required-features = ["qwen3tts", "q4"]
+
 # The q4 weight-quant follow-up spike: does dequant-in-kernel 4-bit matvec
 # deliver the ~3.5x bandwidth win at Moshi decode shapes? Correctness gate +
 # decode-step-shaped benchmark + frame projection.

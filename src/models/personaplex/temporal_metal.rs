@@ -612,7 +612,7 @@ pub(crate) fn layer_mats_f32(
     ]
 }
 
-fn as_bytes<T>(v: &[T]) -> &[u8] {
+pub(crate) fn as_bytes<T>(v: &[T]) -> &[u8] {
     unsafe { core::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
@@ -667,8 +667,10 @@ impl WeightFmt {
 }
 
 /// One matvec weight in the chosen format, dispatching to the matching
-/// kernel (q4/f16 from `nn::q4`, q8 above).
-enum QLinear {
+/// kernel (q4/f16 from `nn::q4`, q8 above). `pub(crate)` because the depth
+/// transformer's GPU lane ([`super::depth_gpu`]) is the same matvec problem at
+/// different shapes — one format-dispatch, one q8 kernel, both lanes.
+pub(crate) enum QLinear {
     Q4(Q4Linear),
     Q8 {
         wq: Handle,
@@ -690,7 +692,7 @@ pub(crate) enum Encoded {
     Half(Vec<f16>),
 }
 
-fn encode(w: &[f32], out_dim: usize, in_dim: usize, fmt: WeightFmt) -> Encoded {
+pub(crate) fn encode(w: &[f32], out_dim: usize, in_dim: usize, fmt: WeightFmt) -> Encoded {
     match fmt {
         WeightFmt::Q4 => {
             let (wq, sc) = quantize_q4(w, out_dim, in_dim);
@@ -705,7 +707,7 @@ fn encode(w: &[f32], out_dim: usize, in_dim: usize, fmt: WeightFmt) -> Encoded {
 }
 
 impl QLinear {
-    fn upload(
+    pub(crate) fn upload(
         client: &q4::Client,
         enc: &Encoded,
         out_dim: usize,
@@ -731,23 +733,65 @@ impl QLinear {
         }
     }
 
-    fn forward(&self, client: &q4::Client, x: &Handle, y: &Handle) {
-        self.launch(client, x, y, false);
+    pub(crate) fn forward(&self, client: &q4::Client, x: &Handle, y: &Handle) {
+        self.launch(client, x, y, self.out_dim(), false);
+    }
+
+    /// Like [`Self::forward`] but computing only the FIRST `rows` output rows
+    /// (`rows % 8 == 0`). Row-major weights make a row prefix a byte prefix, so
+    /// a shorter launch streams strictly fewer bytes — this is what makes the
+    /// depth lane's 16-step-stacked `depformer_in` matvec cost proportional to
+    /// the codebook depth actually generated.
+    pub(crate) fn forward_rows(&self, client: &q4::Client, x: &Handle, y: &Handle, rows: usize) {
+        self.launch(client, x, y, rows, false);
+    }
+
+    pub(crate) fn out_dim(&self) -> usize {
+        match self {
+            Self::Q4(l) => l.out_dim,
+            Self::Q8 { out_dim, .. } | Self::F16 { out_dim, .. } => *out_dim,
+        }
+    }
+
+    pub(crate) fn in_dim(&self) -> usize {
+        match self {
+            Self::Q4(l) => l.in_dim,
+            Self::Q8 { in_dim, .. } | Self::F16 { in_dim, .. } => *in_dim,
+        }
+    }
+
+    /// Weight bytes this matvec streams (packed words + scales, or raw f16).
+    pub(crate) fn bytes(&self) -> usize {
+        match self {
+            Self::Q4(l) => l.bytes(),
+            Self::Q8 { out_dim, in_dim, .. } => out_dim * in_dim + out_dim * in_dim / 32 * 2,
+            Self::F16 { out_dim, in_dim, .. } => out_dim * in_dim * 2,
+        }
     }
 
     /// Fused gate‖up + SwiGLU (interleaved rows, `y` = `out_dim/2` f32) —
     /// one dispatch replaces gate + up + swiglu (same arithmetic).
-    fn forward_swiglu(&self, client: &q4::Client, x: &Handle, y: &Handle) {
-        self.launch(client, x, y, true);
+    pub(crate) fn forward_swiglu(&self, client: &q4::Client, x: &Handle, y: &Handle) {
+        self.launch(client, x, y, self.out_dim(), true);
     }
 
-    fn launch(&self, client: &q4::Client, x: &Handle, y: &Handle, swiglu_pairs: bool) {
+    fn launch(
+        &self,
+        client: &q4::Client,
+        x: &Handle,
+        y: &Handle,
+        rows: usize,
+        swiglu_pairs: bool,
+    ) {
+        assert!(rows <= self.out_dim() && rows % 8 == 0, "row prefix {rows}");
         match self {
             Self::Q4(l) => {
                 if swiglu_pairs {
                     l.forward_swiglu(client, x, y)
-                } else {
+                } else if rows == l.out_dim {
                     l.forward(client, x, y)
+                } else {
+                    l.forward_rows(client, x, y, rows)
                 }
             }
             Self::Q8 {
@@ -758,11 +802,11 @@ impl QLinear {
             } => {
                 assert_eq!(*out_dim % 8, 0);
                 assert_eq!(*in_dim % 32, 0);
-                let y_len = if swiglu_pairs { *out_dim / 2 } else { *out_dim };
+                let y_len = if swiglu_pairs { *out_dim / 2 } else { rows };
                 unsafe {
                     q8_matvec_kernel::launch_unchecked::<Rt>(
                         client,
-                        CubeCount::new_1d(*out_dim as u32 / 8),
+                        CubeCount::new_1d(rows as u32 / 8),
                         CubeDim::new_1d(8 * 32),
                         ArrayArg::from_raw_parts(x.clone(), *in_dim / 4),
                         ArrayArg::from_raw_parts(wq.clone(), *out_dim * *in_dim / 4),
@@ -779,7 +823,7 @@ impl QLinear {
                 if swiglu_pairs {
                     q4::f16_matvec_swiglu(client, x, w, y, *out_dim, *in_dim)
                 } else {
-                    f16_matvec(client, x, w, y, *out_dim, *in_dim)
+                    f16_matvec(client, x, w, y, rows, *in_dim)
                 }
             }
         }

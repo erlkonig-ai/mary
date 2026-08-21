@@ -331,6 +331,8 @@ impl PersonaPlexBundle<PileReader> {
 pub mod config;
 pub mod depth;
 pub mod depth_fast;
+#[cfg(feature = "q4")]
+pub mod depth_gpu;
 pub mod lmgen;
 pub mod mimi;
 pub mod pipeline;
