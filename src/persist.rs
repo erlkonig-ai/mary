@@ -1017,27 +1017,50 @@ pub fn load_aliased_loader_from_pile(
     Ok(WeightLoader::Pile(keymap))
 }
 
-/// Load the canonical exact PersonaPlex LM + Mimi root from one frozen native
-/// model-collection snapshot.
+/// Load the canonical PersonaPlex bundle with its exact signed authority.
 ///
-/// Source/quantization ambiguity and non-f32 leaves fail closed before the
-/// runtime loader is built. macOS keeps the established lazy mmap-backed
-/// `AliasedPile`; other platforms materialize the exact root. No Repository
-/// branch, sibling naming convention, or fallback root participates in source
-/// authority.
+/// Each admitted COMMIT must contain one atomic `(root, archive, H)` token;
+/// `H` is decoded and validated independently rather than reconstructed from
+/// a broad graph union. The returned bundle retains the frozen ticket and
+/// `(root, H, τ)` identity alongside the exact loader.
+#[cfg(feature = "qwen3tts")]
+pub fn personaplex_bundle(
+    pile_path: &Path,
+) -> anyhow::Result<
+    crate::models::personaplex::PersonaPlexBundle<
+        triblespace::core::repo::pile::PileReader,
+    >,
+> {
+    // Team discovery and ticket selection share one observed record prefix.
+    // The 32 GiB model also stays under one open pile, avoiding a second
+    // validate/close/reopen cycle merely to learn the publishing team.
+    let mut pile = Pile::open(pile_path)
+        .with_context(|| format!("open PersonaPlex bundle pile {pile_path:?}"))?;
+    let (team, snapshot) = match
+        crate::model_collection::snapshot_sole_model_bundle_collection_local_latest(&mut pile)
+    {
+        Ok(observation) => observation,
+        Err(error) => {
+            let _ = pile.close();
+            return Err(error).with_context(|| {
+                format!("freeze the sole PersonaPlex bundle snapshot in {pile_path:?}")
+            });
+        }
+    };
+    pile.close()
+        .with_context(|| format!("close PersonaPlex bundle pile {pile_path:?}"))?;
+    crate::models::personaplex::PersonaPlexWeights::from_bundle_snapshot(team, snapshot)
+        .with_context(|| format!("select exact PersonaPlex bundle from {pile_path:?}"))
+}
+
+/// Convenience weight-loader projection backed exclusively by bundle authority.
+/// Runtime consumers should use [`personaplex_bundle`] when the exact ticket
+/// and identity must stay paired with the loader.
 #[cfg(feature = "qwen3tts")]
 pub fn personaplex_loader(
     pile_path: &Path,
 ) -> anyhow::Result<crate::nn::weight_loader::WeightLoader> {
-    // Which team's model graph? The pile says. Discovering it by name beats
-    // taking it as a parameter here: every caller is a probe binary holding
-    // only a path, so a parameter would just move the guess up one level.
-    let team = crate::model_collection::model_graph_team_at(pile_path)?;
-    let snapshot = crate::model_collection::load_model_collection_local_latest(pile_path, team)
-        .with_context(|| format!("load local-latest PersonaPlex snapshot from {pile_path:?}"))?;
-    crate::models::personaplex::PersonaPlexWeights::from_snapshot(snapshot)
-        .with_context(|| format!("select exact PersonaPlex root from {pile_path:?}"))
-        .map(crate::models::personaplex::PersonaPlexWeights::into_loader)
+    personaplex_bundle(pile_path).map(|bundle| bundle.into_parts().1)
 }
 
 /// The derived FOLDED half-width sibling of a qwen3tts weights pile:

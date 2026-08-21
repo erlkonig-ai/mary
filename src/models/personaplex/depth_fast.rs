@@ -319,18 +319,11 @@ fn hgemv_mt(w: &[u16], m: usize, n: usize, x: &[f32], y: &mut [f32]) {
 
 // ─────────────────────────── weights + scalar math ──────────────────────────
 
-/// One weight matrix in the chosen storage: OWNED buffers (the
-/// materialize-at-load path) or zero-copy mmap VIEWS of pile blobs (the
-/// derived-sibling path — `(view, offset, len)` in elements, since per-step
-/// operands are contiguous slices of one fused per-layer leaf; the `View`
-/// keeps the pile mmap alive, cloning it is an Arc bump). Same bytes reach
-/// the same kernels either way.
+/// One weight matrix in the selected in-memory storage width.
 enum Mat {
     F32(Vec<f32>),
     /// f16 bit patterns (`half::f16::to_bits`), f32-accumulate NEON kernel.
     F16(Vec<u16>),
-    F32Map(anybytes::View<[f32]>, usize, usize),
-    F16Map(anybytes::View<[u16]>, usize, usize),
 }
 
 impl Mat {
@@ -359,15 +352,13 @@ impl Mat {
         match self {
             Mat::F32(w) => sgemv_mt(w, m, n, x, y),
             Mat::F16(w) => hgemv_mt(w, m, n, x, y),
-            Mat::F32Map(v, off, len) => sgemv_mt(&v[*off..*off + *len], m, n, x, y),
-            Mat::F16Map(v, off, len) => hgemv_mt(&v[*off..*off + *len], m, n, x, y),
         }
     }
 
     fn bytes_per_elem(&self) -> usize {
         match self {
-            Mat::F32(_) | Mat::F32Map(..) => 4,
-            Mat::F16(_) | Mat::F16Map(..) => 2,
+            Mat::F32(_) => 4,
+            Mat::F16(_) => 2,
         }
     }
 }
@@ -375,9 +366,8 @@ impl Mat {
 /// The per-step qkv row-block of a depformer layer with the load-time folds
 /// applied: rows `[t·3D, (t+1)·3D)` of `in_proj [16·3D, D]`, `norm1.alpha`
 /// folded into the columns, the exact 2⁻³ attention scale onto the q rows.
-/// SHARED by [`DepthFast::load`] and the sibling derive
-/// (`qpile::derive_depth_pile`) so the persisted operand bytes are IDENTICAL
-/// to the fold-at-load ones.
+/// Kept as one named transform so future derived formats can reuse exactly the
+/// same computation as [`DepthFast::load`].
 pub(crate) fn fold_qkv_step(in_proj: &[f32], a1: &[f32], t: usize) -> Vec<f32> {
     let mut qkv = in_proj[t * 3 * D * D..(t + 1) * 3 * D * D].to_vec();
     for (r, row) in qkv.chunks_exact_mut(D).enumerate() {
@@ -448,8 +438,7 @@ pub struct DepthFast {
     dep_in: Mat,
     /// `depformer_text_emb [32001, 1024]` — row lookups, kept f32 (16 rows of
     /// 4 KB per frame; storage width is irrelevant here). Owned on the
-    /// materialize path; a zero-copy mmap view of the exact-f32 pile leaf on
-    /// the sibling path.
+    /// materialize path.
     text_emb: HostF32,
     /// `depformer_emb.{0..14} [2049, 1024]`.
     audio_emb: Vec<HostF32>,
@@ -544,116 +533,6 @@ impl DepthFast {
             HostF32::Owned(text_emb),
             audio_emb,
         )
-    }
-
-    /// ZERO-COPY load from the derived depth sibling pile (`qpile`): every
-    /// per-step CPU gemv operand is an mmap'd slice handed directly to the
-    /// Accelerate/NEON kernels — no read pass, no fold pass, no f16 convert
-    /// pass (pages fault in on first gemv touch). The transformed operands
-    /// (alpha-folded qkv / gate‖up, the fused `dep_in` stack, and — in f16
-    /// mode — every converted matrix) come from the sibling; operands the
-    /// runtime consumes UNMODIFIED in f32 mode (o / down / heads row-slices,
-    /// the embeddings) map the canonical pile's exact-f32 leaves directly.
-    /// Byte-identical to [`Self::load`] with the same `f16` flag (the derive
-    /// shares [`fold_qkv_step`]/[`fold_gate_up`] and the f16 conversion), so
-    /// the depth gates must agree BIT-EXACTLY.
-    #[cfg(all(feature = "q4", target_os = "macos"))]
-    pub fn load_zero_copy(
-        sib: &super::qpile::QPile,
-        loader: &WeightLoader,
-        f16: bool,
-    ) -> anyhow::Result<Self> {
-        use super::qpile;
-        anyhow::ensure!(
-            sib.marker == Some(qpile::depth_marker()),
-            "depth format marker mismatch: sibling has {:?} — re-derive with \
-             personaplex_persist --derive-depth",
-            sib.marker
-        );
-        let n = cfg::WEIGHTS_PER_STEP;
-        let mut steps: Vec<StepW> = (0..n)
-            .map(|_| StepW {
-                layers: Vec::with_capacity(LAYERS),
-                head: Mat::F32(Vec::new()),
-            })
-            .collect();
-        let canon_f32 = |name: &str, want: &[usize]| -> anyhow::Result<anybytes::View<[f32]>> {
-            let (v, s) = loader.view_f32(name).ok_or_else(|| {
-                anyhow::anyhow!("{name}: no zero-copy f32 view from the canonical pile")
-            })?;
-            anyhow::ensure!(s == want, "{name}: shape {s:?} != {want:?}");
-            Ok(v)
-        };
-
-        for l in 0..LAYERS {
-            if f16 {
-                let (qkv_v, s) = sib.view_u16(&format!("d.f16.{l}.qkv"))?;
-                anyhow::ensure!(s == vec![n * 3 * D, D], "d.f16.{l}.qkv shape");
-                let (o_v, s) = sib.view_u16(&format!("d.f16.{l}.o"))?;
-                anyhow::ensure!(s == vec![n * D, D], "d.f16.{l}.o shape");
-                let (gu_v, s) = sib.view_u16(&format!("d.f16.{l}.gate_up"))?;
-                anyhow::ensure!(s == vec![n * 2 * FH, D], "d.f16.{l}.gate_up shape");
-                let (down_v, s) = sib.view_u16(&format!("d.f16.{l}.down"))?;
-                anyhow::ensure!(s == vec![n * D, FH], "d.f16.{l}.down shape");
-                for (t, step) in steps.iter_mut().enumerate() {
-                    step.layers.push(LayerW {
-                        qkv: Mat::F16Map(qkv_v.clone(), t * 3 * D * D, 3 * D * D),
-                        o: Mat::F16Map(o_v.clone(), t * D * D, D * D),
-                        gate_up: Mat::F16Map(gu_v.clone(), t * 2 * FH * D, 2 * FH * D),
-                        down: Mat::F16Map(down_v.clone(), t * D * FH, D * FH),
-                    });
-                }
-            } else {
-                let (qkv_v, s) = sib.view_f32(&format!("d.f32.{l}.qkv"))?;
-                anyhow::ensure!(s == vec![n * 3 * D, D], "d.f32.{l}.qkv shape");
-                let (gu_v, s) = sib.view_f32(&format!("d.f32.{l}.gate_up"))?;
-                anyhow::ensure!(s == vec![n * 2 * FH, D], "d.f32.{l}.gate_up shape");
-                let src = format!("depformer.layers.{l}");
-                let o_v = canon_f32(&format!("{src}.self_attn.out_proj.weight"), &[n * D, D])?;
-                for (t, step) in steps.iter_mut().enumerate() {
-                    let down_v =
-                        canon_f32(&format!("{src}.gating.{t}.linear_out.weight"), &[D, FH])?;
-                    step.layers.push(LayerW {
-                        qkv: Mat::F32Map(qkv_v.clone(), t * 3 * D * D, 3 * D * D),
-                        o: Mat::F32Map(o_v.clone(), t * D * D, D * D),
-                        gate_up: Mat::F32Map(gu_v.clone(), t * 2 * FH * D, 2 * FH * D),
-                        down: Mat::F32Map(down_v, 0, D * FH),
-                    });
-                }
-            }
-        }
-
-        let dep_in = if f16 {
-            let (h_v, s) = sib.view_u16("d.f16.heads")?;
-            anyhow::ensure!(s == vec![n * cfg::CARD, D], "d.f16.heads shape");
-            for (t, step) in steps.iter_mut().enumerate() {
-                step.head = Mat::F16Map(h_v.clone(), t * cfg::CARD * D, cfg::CARD * D);
-            }
-            let (di_v, s) = sib.view_u16("d.f16.dep_in")?;
-            anyhow::ensure!(s == vec![n * D, cfg::DIM], "d.f16.dep_in shape");
-            Mat::F16Map(di_v, 0, n * D * cfg::DIM)
-        } else {
-            for (t, step) in steps.iter_mut().enumerate() {
-                let h_v = canon_f32(&format!("linears.{t}.weight"), &[cfg::CARD, D])?;
-                step.head = Mat::F32Map(h_v, 0, cfg::CARD * D);
-            }
-            let (di_v, s) = sib.view_f32("d.f32.dep_in")?;
-            anyhow::ensure!(s == vec![n * D, cfg::DIM], "d.f32.dep_in shape");
-            Mat::F32Map(di_v, 0, n * D * cfg::DIM)
-        };
-
-        // Embeddings: zero-copy mmap views of the canonical exact-f32 leaves.
-        let (text_emb, s) = loader.load_host_f32("depformer_text_emb.weight");
-        anyhow::ensure!(s == vec![cfg::TEXT_VOCAB, D], "depformer_text_emb shape");
-        let audio_emb: Vec<HostF32> = (0..n - 1)
-            .map(|t| {
-                let (w, s) = loader.load_host_f32(&format!("depformer_emb.{t}.weight"));
-                assert_eq!(s, vec![cfg::AUDIO_VOCAB, D], "depformer_emb.{t} shape");
-                w
-            })
-            .collect();
-
-        Ok(Self::assemble(steps, dep_in, text_emb, audio_emb))
     }
 
     /// Deterministic synthetic weights at the real shapes — pure-timing

@@ -65,7 +65,7 @@ const DUMP: usize = 8;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let pile = mary::paths::model(args.get(1).map(String::as_str), "personaplex_q4.pile")
+    let pile = mary::paths::model(args.get(1).map(String::as_str), "personaplex.pile")
         .unwrap_or_else(|e| {
             eprintln!("{e}");
             std::process::exit(2)
@@ -97,9 +97,8 @@ fn main() {
     println!("loader ready   : {:.2}s", t0.elapsed().as_secs_f64());
 
     let t1 = Instant::now();
-    // TemporalMetal::load directly rather than qpile::temporal_auto -- qpile is
-    // #[cfg(target_os = "macos")] (it IS the Metal zero-copy sibling seam), and
-    // on CUDA materializing through the loader is the faster path anyway.
+    // Recompute the temporal transform from the signed source bundle on this
+    // CUDA probe path.
     let mut tm = TemporalMetal::load(&loader, fmt);
     println!("model loaded   : {:.2}s", t1.elapsed().as_secs_f64());
 

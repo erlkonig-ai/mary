@@ -10,32 +10,18 @@
 //!     gated against; persisted here so the pile is the SELF-CONTAINED voice
 //!     stack: codec encoder + decoder + LM).
 //!
-//! After this runs, the pile file and its signed native collection commit are
-//! the durable weight authority; the HF download is no longer needed. Tensor
+//! After this runs, the pile file and its signed one-row model-bundle COMMIT
+//! are the durable weight authority; the HF download is no longer needed. Tensor
 //! names don't collide across the two checkpoints
 //! (`transformer.*`/`depformer.*`/`emb.*`… vs
 //! `encoder.*`/`decoder.*`/`quantizer.*`…), so one strict root serves both
 //! components.
 //!
-//!   cargo run --release --features personaplex,q4,import --bin personaplex_persist -- \
+//!   cargo run --release --features personaplex,import --bin personaplex_persist -- \
 //!     <ckpt-dir> <pile-path> <signing-key>
 //!
 //! `<ckpt-dir>` holds `model.safetensors` and
 //! `tokenizer-e351c8d8-checkpoint125.safetensors` (the HF snapshot layout).
-//!
-//! ── derive modes (canonical pile → runtime-format sibling; src READ-ONLY) ──
-//!
-//!   personaplex_persist --derive-fmt <q4|q8|f16> <src-pile> [dst-pile]
-//!   personaplex_persist --derive-depth <src-pile> [dst-pile]
-//!
-//! Runs the load-time transform pass ONCE (quantize/convert the temporal
-//! stack, fold+slice the depformer operands) and persists the exact runtime
-//! bytes as a derived sibling pile (`<stem>_<fmt>.pile` / `<stem>_depth.pile`,
-//! auto-discovered by the realtime loaders — see
-//! `mary::models::personaplex::qpile`). SAFETY GATE: the source pile's byte
-//! length + sha256 and every other `*.pile` in its directory's byte length
-//! are recorded before and verified unchanged after — the canonical piles
-//! are never written, only the new sibling file is created.
 //!
 //! ── gate (always runs): pile round-trip bit-exactness ──
 //! Every float tensor of both source files is re-read from the pile and
@@ -56,7 +42,7 @@ use std::path::Path;
 use std::time::Instant;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::signing_key_file;
-use triblespace::prelude::BlobStoreGet;
+use triblespace::prelude::BlobStore;
 
 const LM_FILE: &str = "model.safetensors";
 const MIMI_FILE: &str = "tokenizer-e351c8d8-checkpoint125.safetensors";
@@ -129,128 +115,10 @@ fn tensor_f32(view: &TensorView<'_>) -> anyhow::Result<(Vec<f32>, Vec<usize>)> {
     Ok((data, shape))
 }
 
-/// sha256 of a file via the system `shasum` (streamed — no crate dep for a
-/// one-shot integrity check in a persist tool).
-fn sha256_file(path: &Path) -> anyhow::Result<String> {
-    let out = std::process::Command::new("shasum")
-        .args(["-a", "256"])
-        .arg(path)
-        .output()
-        .map_err(|e| anyhow::anyhow!("spawn shasum: {e}"))?;
-    anyhow::ensure!(out.status.success(), "shasum failed on {path:?}");
-    let s = String::from_utf8_lossy(&out.stdout);
-    Ok(s.split_whitespace().next().unwrap_or_default().to_string())
-}
-
-/// Byte lengths of every `*.pile` in `dir` EXCEPT `skip` (the destination
-/// sibling being created) — the "nothing else changed" half of the safety
-/// gate.
-fn pile_lengths(dir: &Path, skip: &Path) -> anyhow::Result<Vec<(std::path::PathBuf, u64)>> {
-    let mut v = Vec::new();
-    for e in std::fs::read_dir(dir)? {
-        let p = e?.path();
-        if p.extension().map(|x| x == "pile").unwrap_or(false)
-            && p.canonicalize().ok() != skip.canonicalize().ok()
-        {
-            v.push((p.clone(), std::fs::metadata(&p)?.len()));
-        }
-    }
-    v.sort();
-    Ok(v)
-}
-
-/// The derive entry: transform-once → sibling pile, with the read-only
-/// safety gate around the source directory.
-#[cfg(all(feature = "q4", target_os = "macos"))]
-fn run_derive(mode: &str, args: &[String]) -> anyhow::Result<()> {
-    use mary::models::personaplex::qpile;
-    use mary::models::personaplex::temporal_metal::WeightFmt;
-
-    let (fmt, src_i) = match mode {
-        "--derive-fmt" => {
-            let f = args
-                .first()
-                .and_then(|s| WeightFmt::parse(s))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "usage: personaplex_persist --derive-fmt <q4|q8|f16> <src-pile> [dst-pile]"
-                    )
-                })?;
-            (Some(f), 1)
-        }
-        "--derive-depth" => (None, 0),
-        _ => unreachable!(),
-    };
-    let src = Path::new(
-        args.get(src_i)
-            .ok_or_else(|| anyhow::anyhow!("missing <src-pile>"))?,
-    );
-    anyhow::ensure!(src.exists(), "source pile missing: {src:?}");
-    let tag = fmt.map(qpile::fmt_tag).unwrap_or("depth");
-    let dst = args
-        .get(src_i + 1)
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| qpile::derived_sibling_path(src, tag));
-
-    // ── safety gate: record the source's identity + every sibling's length ──
-    let src_len = std::fs::metadata(src)?.len();
-    eprintln!("[derive] hashing source pile {src:?} ({src_len} bytes) ...");
-    let src_sha = sha256_file(src)?;
-    let dir = src.parent().unwrap_or(Path::new("."));
-    let before = pile_lengths(dir, &dst)?;
-    eprintln!(
-        "[derive] source sha256 {src_sha}; {} sibling pile(s) length-recorded",
-        before.len()
-    );
-
-    let t = Instant::now();
-    let (count, bytes) = match fmt {
-        Some(f) => qpile::derive_temporal_pile(src, &dst, f)?,
-        None => qpile::derive_depth_pile(src, &dst)?,
-    };
-    let secs = t.elapsed().as_secs_f64();
-
-    // ── verify: source (and every other pile) byte-identical/unchanged ──
-    anyhow::ensure!(
-        std::fs::metadata(src)?.len() == src_len,
-        "SOURCE PILE LENGTH CHANGED — investigate immediately"
-    );
-    let src_sha_after = sha256_file(src)?;
-    anyhow::ensure!(
-        src_sha_after == src_sha,
-        "SOURCE PILE HASH CHANGED ({src_sha} → {src_sha_after}) — investigate immediately"
-    );
-    let after = pile_lengths(dir, &dst)?;
-    anyhow::ensure!(
-        before == after,
-        "a sibling pile changed length during derive — before {before:?} after {after:?}"
-    );
-
-    let dst_len = std::fs::metadata(&dst)?.len();
-    println!(
-        "derive {tag} DONE in {secs:.1}s: {count} leaves / {bytes} payload bytes → {dst:?} \
-         ({dst_len} bytes, {:.2} GiB). Source pile verified unchanged (len {src_len}, sha256 {src_sha}).",
-        dst_len as f64 / (1u64 << 30) as f64
-    );
-    Ok(())
-}
-
-#[cfg(not(all(feature = "q4", target_os = "macos")))]
-fn run_derive(_mode: &str, _args: &[String]) -> anyhow::Result<()> {
-    anyhow::bail!("--derive-* requires the q4 feature on macOS (the realtime lane's target)")
-}
-
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() >= 2 && (args[1] == "--derive-fmt" || args[1] == "--derive-depth") {
-        return run_derive(&args[1], &args[2..]);
-    }
     if args.len() != 4 {
-        eprintln!(
-            "usage: personaplex_persist <ckpt-dir> <pile-path> <signing-key>\n       \
-             personaplex_persist --derive-fmt <q4|q8|f16> <src-pile> [dst-pile]\n       \
-             personaplex_persist --derive-depth <src-pile> [dst-pile]"
-        );
+        eprintln!("usage: personaplex_persist <ckpt-dir> <pile-path> <signing-key>");
         std::process::exit(2);
     }
     let ckpt_dir = Path::new(&args[1]);
@@ -316,19 +184,33 @@ fn main() -> anyhow::Result<()> {
         let root = candidate
             .root()
             .ok_or_else(|| anyhow::anyhow!("PersonaPlex candidate has no unique model root"))?;
+        let team = mary::model_collection::model_bundle_team_or_own(&mut pile, &signing_key)?;
 
-        // Freeze the preexisting authority only after staged blobs exist, so
-        // its reader covers both the authorized graph and candidate handles.
-        // Candidate facts are visible solely to validation: no signed record
-        // is published until every gate below succeeds.
-        let snapshot = mary::model_collection::snapshot_model_collection_local_latest(&mut pile)?;
-        let (mut candidate_view, _, reader) = snapshot.into_parts();
-        candidate_view += candidate.facts().clone();
-        let weights = PersonaPlexWeights::from_graph(&candidate_view, reader)?;
+        // H must be independently complete. Validate only the candidate facts
+        // against the already-staged attachment prefix; an old broad graph
+        // union is not allowed to fill holes in this bundle.
+        let reader = pile.reader()?;
+        let weights = PersonaPlexWeights::from_graph(candidate.facts(), reader)?;
         anyhow::ensure!(
             weights.root() == root,
-            "staged PersonaPlex root differs from the uniquely admitted Source/native root"
+            "staged PersonaPlex root differs from the candidate's exact Source/native root"
         );
+        let prepared =
+            mary::model_collection::prepare_model_bundle_fragment(team, root, candidate)?;
+        let existing = mary::model_collection::snapshot_model_bundle_collection_local_latest(
+            &mut pile,
+            team,
+        )?;
+        if let Some(existing) =
+            PersonaPlexWeights::find_in_bundle_snapshot(team, existing)?
+        {
+            anyhow::ensure!(
+                existing.authority().model_root() == root
+                    && existing.authority().model_archive_data()
+                        == prepared.model_archive_data(),
+                "a different PersonaPlex bundle is already authoritative in this pile"
+            );
+        }
         eprintln!(
             "Native root holds {} tensors; verifying both safetensors sources ...",
             weights.count()
@@ -442,26 +324,23 @@ fn main() -> anyhow::Result<()> {
                     lm_count += 1;
                 }
                 let (want, want_shape) = tensor_f32(&view)?;
-                let handles = weights
+                let leaf = weights
                     .exact()
                     .get(name)
                     .ok_or_else(|| anyhow::anyhow!("{entity}/{name}: no native root leaf"))?;
-                // Alignment: the raw data blob must sit 256-aligned in the mmap.
-                if let mary::ingest::LeafHandles::F32(data, _) = handles {
-                    let bytes: anybytes::Bytes = weights
-                        .reader()
-                        .get(*data)
-                        .map_err(|error| anyhow::anyhow!("{name}: {error}"))?;
-                    if !(bytes.as_ptr() as usize).is_multiple_of(256) {
-                        eprintln!("  MISALIGNED (ptr % 256 != 0): {name}");
-                        misaligned += 1;
-                    }
-                } else {
-                    anyhow::bail!("{entity}/{name}: expected an f32 leaf");
+                anyhow::ensure!(
+                    leaf.elem() == mary::leaf::Elem::F32,
+                    "{entity}/{name}: expected an f32 leaf"
+                );
+                // The typed tensor payload must sit 256-aligned in the mmap.
+                if !(leaf.payload().as_ptr() as usize).is_multiple_of(256) {
+                    eprintln!("  MISALIGNED (ptr % 256 != 0): {name}");
+                    misaligned += 1;
                 }
-                let (got, got_shape) =
-                    mary::selection::materialize_leaf(weights.reader(), *handles)
-                        .map_err(|error| anyhow::anyhow!("{entity}/{name}: {error}"))?;
+                let got_shape = leaf.shape();
+                let got = leaf
+                    .view_f32()
+                    .ok_or_else(|| anyhow::anyhow!("{entity}/{name}: invalid f32 payload"))?;
                 anyhow::ensure!(
                     got_shape == want_shape,
                     "{name}: shape {got_shape:?} != {want_shape:?}"
@@ -499,8 +378,13 @@ fn main() -> anyhow::Result<()> {
             cfg::CHECKPOINT_TENSORS
         );
         drop(weights);
-        mary::model_collection::publish_model_fragment(&mut pile, &signing_key, candidate)
-            .map_err(|error| anyhow::anyhow!("publish validated PersonaPlex root: {error}"))?;
+        let staged = prepared
+            .into_prepared_commit()
+            .stage(&mut pile, &signing_key)
+            .map_err(|error| anyhow::anyhow!("stage validated PersonaPlex bundle: {error}"))?;
+        staged
+            .finalize()
+            .map_err(|error| anyhow::anyhow!("finalize validated PersonaPlex bundle: {error}"))?;
         Ok((root, checked, elems, lm_count))
     })();
 
