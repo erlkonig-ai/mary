@@ -152,8 +152,8 @@ pub fn fp4_linear<AB: Scalar, S: Scalar, NA: Size, NC: Size>(
 /// the de-interleave here, on the `[m, 2*inter]` result, moves it off the
 /// `[2*inter, hidden]` weight — 16x2048 elements touched instead of 4096x4096.
 #[cube(launch)]
-pub fn gate_up_silu<O: Scalar + Cast>(
-    both: &Tensor<f32>,
+pub fn gate_up_silu<I: Scalar + Cast, O: Scalar + Cast>(
+    both: &Tensor<I>,
     act: &mut Tensor<O>,
     #[comptime] inter: usize,
     #[comptime] halved: bool,
@@ -168,9 +168,15 @@ pub fn gate_up_silu<O: Scalar + Cast>(
         // of thing that passes every parity gate built on the same assumption.
         // `halved` exists so the question can be settled by running it.
         let (g, u) = if comptime!(halved) {
-            (both[r * 2 * inter + i], both[r * 2 * inter + inter + i])
+            (
+                f32::cast_from(both[r * 2 * inter + i]),
+                f32::cast_from(both[r * 2 * inter + inter + i]),
+            )
         } else {
-            (both[r * 2 * inter + 2 * i], both[r * 2 * inter + 2 * i + 1])
+            (
+                f32::cast_from(both[r * 2 * inter + 2 * i]),
+                f32::cast_from(both[r * 2 * inter + 2 * i + 1]),
+            )
         };
         // The output type is the NEXT matmul's operand type: f32 for the NVFP4
         // lane, whose second GEMM re-quantises from f32 anyway, and bf16 for
@@ -230,7 +236,18 @@ pub fn gate_up_silu_launch<R: Runtime>(
     m_pad: usize,
     inter: usize,
 ) -> Handle {
-    gate_up_silu_launch_as::<f32, R>(client, both, m_pad, inter)
+    gate_up_silu_launch_as::<f32, f32, R>(client, both, m_pad, inter)
+}
+
+/// The same, BF16 on BOTH sides: a narrow gate-and-up in, a narrow activation
+/// out. The gate and the SiLU are computed in f32 regardless.
+pub fn gate_up_silu_narrow_launch<R: Runtime>(
+    client: &ComputeClient<R>,
+    both: &Handle,
+    m_pad: usize,
+    inter: usize,
+) -> Handle {
+    gate_up_silu_launch_as::<half::bf16, half::bf16, R>(client, both, m_pad, inter)
 }
 
 /// The same, BF16 out — what the layer-2 lane feeds straight back into the MMA.
@@ -244,10 +261,10 @@ pub fn gate_up_silu_bf16_launch<R: Runtime>(
     m_pad: usize,
     inter: usize,
 ) -> Handle {
-    gate_up_silu_launch_as::<half::bf16, R>(client, both, m_pad, inter)
+    gate_up_silu_launch_as::<f32, half::bf16, R>(client, both, m_pad, inter)
 }
 
-fn gate_up_silu_launch_as<O: Scalar + Cast + CubeElement, R: Runtime>(
+fn gate_up_silu_launch_as<I: Scalar + Cast, O: Scalar + Cast + CubeElement, R: Runtime>(
     client: &ComputeClient<R>,
     both: &Handle,
     m_pad: usize,
@@ -260,7 +277,7 @@ fn gate_up_silu_launch_as<O: Scalar + Cast + CubeElement, R: Runtime>(
     let threads = 256u32;
     let blocks = n.div_ceil(threads as usize) as u32;
     unsafe {
-        gate_up_silu::launch::<O, R>(
+        gate_up_silu::launch::<I, O, R>(
             client,
             CubeCount::Static(blocks, 1, 1),
             CubeDim::new_1d(threads),

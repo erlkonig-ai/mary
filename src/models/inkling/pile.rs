@@ -253,12 +253,13 @@ fn mem_total_bytes() -> Result<u64> {
 ///   barely with the sequence;
 /// * 4 GiB is left for the kernel, the shell and the page-cache working window,
 ///   and that number is not a guess either. It is where the measured cliff is;
-/// * cubecl's two largest pool PAGES, from
-///   [`super::budget::pool_page_floor`]. The pool reserves 41.74 GiB to hold
-///   1.14 GiB of live tensors at 16,384 tokens, because a page is allocated
-///   whole and returned only when every slice of it is free -- so the space
-///   between what the tensors are and what the device has handed out is the
-///   largest single term in this function, and it was missing;
+/// * when SubSlices is selected, cubecl's two largest pool PAGES, from
+///   [`super::budget::pool_page_floor`]. That allocator reserves 41.74 GiB to
+///   hold 1.14 GiB of live tensors at 16,384 tokens, because a page is allocated
+///   whole and returned only when every slice of it is free. ExclusivePages
+///   sizes pages to requests, but its retained pages are request-history
+///   dependent; until admission carries that trace it keeps the same safe
+///   floor rather than treating a smaller measured high-water mark as a bound;
 /// * `attention_bytes` is everything that scales with the SEQUENCE, and it is
 ///   the term this function did not have. See
 ///   [`super::budget::prefill_activation_bytes`]. It was briefly the score
@@ -290,18 +291,27 @@ fn mem_total_bytes() -> Result<u64> {
 /// It derives from the machine (`MemTotal`), never from a constant: the two
 /// nodes this runs on differ by 2 GiB, and a gate hard-coded to either figure
 /// is wrong on the other.
-fn run_overhead_bytes(layers: usize, attention_bytes: u64, machine: u64) -> u64 {
+fn run_overhead_bytes(
+    layers: usize,
+    attention_bytes: u64,
+    machine: u64,
+    policy: super::budget::AdmissionPolicy,
+) -> u64 {
     const CUDA_CONTEXT: u64 = GIB / 5;
     const ACTIVATIONS_PER_LAYER: u64 = 41 * GIB / 200;
     const OS_FLOOR: u64 = 4 * GIB;
     CUDA_CONTEXT
         + ACTIVATIONS_PER_LAYER * layers as u64
         + OS_FLOOR
-        + super::budget::pool_page_floor(machine)
+        + super::budget::pool_page_floor(policy, machine)
         + attention_bytes
 }
 
-fn mem_available_bytes() -> Result<u64> {
+/// What the node has spare, respecting both host and cgroup limits.
+///
+/// Public so the pool cleanup policy can compare spare node memory with pages
+/// the device allocator is currently stranding.
+pub fn mem_available_bytes() -> Result<u64> {
     let status = std::fs::read_to_string("/proc/meminfo").context("reading /proc/meminfo")?;
     let kb = status
         .lines()
@@ -1184,6 +1194,7 @@ impl PileSource {
         layers: std::ops::Range<usize>,
         global_dense: &[&str],
         attention_bytes: u64,
+        policy: super::budget::AdmissionPolicy,
     ) -> Result<(usize, usize, u64)> {
         anyhow::ensure!(self.copied.is_none(), "the weight share was already copied");
 
@@ -1318,7 +1329,7 @@ impl PileSource {
         let available = mem_available_bytes()?;
         let machine = mem_total_bytes()?;
         let n_layers = layers.len();
-        let overhead = run_overhead_bytes(n_layers, attention_bytes, machine);
+        let overhead = run_overhead_bytes(n_layers, attention_bytes, machine, policy);
         let need = total as u64 + overhead;
         let gib = |b: u64| b as f64 / GIB as f64;
         if need > machine || total as u64 > available {
@@ -1333,7 +1344,7 @@ impl PileSource {
             for (k, bytes) in per_layer.values().enumerate() {
                 acc += *bytes as u64;
                 let k = k + 1;
-                let fits_here = acc + run_overhead_bytes(k, attention_bytes, machine);
+                let fits_here = acc + run_overhead_bytes(k, attention_bytes, machine, policy);
                 if fits_here <= machine && acc <= available {
                     fits = Some((k, acc));
                 }
@@ -1345,7 +1356,7 @@ impl PileSource {
                     layers.start,
                     layers.start + k,
                     gib(share),
-                    gib(share + run_overhead_bytes(k, attention_bytes, machine)),
+                    gib(share + run_overhead_bytes(k, attention_bytes, machine, policy)),
                 ),
                 None => format!(
                     "Not even one layer fits: layer {} alone is {:.2} GiB on top of {:.2} GiB of \
@@ -1677,6 +1688,8 @@ mod anchor_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::inkling::budget::{AdmissionPolicy, StorageDType};
+    use crate::models::inkling::pool::AllocatorConfig;
     use triblespace::core::blob::TryFromBlob;
     use triblespace::core::blob::encodings::tensor::TensorView;
 
@@ -1691,6 +1704,28 @@ mod tests {
             rows,
             cols: logical / 2,
         }
+    }
+
+    #[test]
+    fn admission_overhead_preserves_the_conservative_allocator_floor() {
+        let machine = 128 * GIB;
+        let attention = 7 * GIB;
+        let storage = (StorageDType::F32, StorageDType::F32, StorageDType::Bf16);
+        let subslices = AdmissionPolicy::new(
+            AllocatorConfig::SubSlices,
+            storage.0,
+            storage.1,
+            storage.2,
+        );
+        let exclusive = AdmissionPolicy::new(
+            AllocatorConfig::ExclusivePages,
+            storage.0,
+            storage.1,
+            storage.2,
+        );
+        let base = GIB / 5 + 41 * GIB / 200 * 8 + 4 * GIB + attention;
+        assert_eq!(run_overhead_bytes(8, attention, machine, subslices), base + 40 * GIB);
+        assert_eq!(run_overhead_bytes(8, attention, machine, exclusive), base + 40 * GIB);
     }
 
     /// The blob states the LOGICAL width, so nothing downstream needs an

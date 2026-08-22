@@ -17,8 +17,48 @@
 //!
 //! Not "exactly two". Two is what THIS model needs (byte-balanced at layer 20:
 //! layer 2 carries BF16 experts, 12.7 GiB against 3.55 GiB for an NVFP4 layer,
-//! so an even 21/21 split is a lopsided 85/71 GiB one). The 66-layer sibling
-//! wants five to seven. The rule is that no node runs the whole stack.
+//! so an even 21/21 split is a lopsided 82.73/76.14 GiB one). The 66-layer
+//! sibling wants five to seven. The rule is that no node runs the whole stack.
+//!
+//! ## And the split really is 20, which was said here and not done
+//!
+//! Every perf run used 0:21 / 21:42 while this paragraph named layer 20. Four
+//! runs at 130,000 tokens, one binary, everything else equal.
+//!
+//! Read DEMAND -- `used + swap` -- and not either column alone. The kernel
+//! decides how much of a working set to keep resident and how much to page, and
+//! that decision moves several gibibytes between the two columns from run to
+//! run: the two 20/22 rows below differ by 12.6 GiB of swap on the tail and by
+//! 1.3 GiB of demand. Demand is the quantity that reproduces; swap is the
+//! quantity that is easy to quote and does not.
+//!
+//! Capacity is 121.63 + 16 GiB of swap on the head's box, 119.63 + 16 on the
+//! tail's. `margin` is capacity less demand on whichever box is worse -- which
+//! is the only number that says how much further this pair could go.
+//!
+//! | split | head demand | tail demand | margin on the worse box |
+//! |---|---|---|---|
+//! | 21/21 | 131.72 GiB | 117.88 GiB | **5.91 GiB** (head) |
+//! | 20/22 | 127.51 | 122.18 | 10.12 (head) |
+//! | 20/22, repeat | 128.04 | 123.50 | 9.59 (head) |
+//! | 19/23 | 124.48 | 125.81 | 9.82 (tail) |
+//!
+//! So 21/21 is measurably wrong -- it leaves under six gibibytes on the head
+//! while the tail sits on nineteen -- and 20/22 and 19/23 are both about four
+//! gibibytes better and are NOT distinguishable from each other: 9.59, 9.82 and
+//! 10.12 span less than the repeat spans. Wall time is 1820, 1828, 1832 and
+//! 1855 s, a 1.9% spread that orders nothing either.
+//!
+//! 20 is the one to take, and the reason is not that it measured highest. It is
+//! byte-balanced, so it is the split that does not depend on `n`; 19 wins its
+//! half a gibibyte by over-correcting for a term that grows.
+//!
+//! That term is why the head is the heavier end at every split. Layers 0 and 1
+//! are the DENSE ones and their `[n, 16384]` gate and up are 3.97 GiB EACH at
+//! 130,000 tokens -- about 8 GiB the tail never carries, proportional to `n`,
+//! and the head's by definition. So the true balance point sits slightly left
+//! of byte-balance and drifts further left as the sequence grows. At 130,000 it
+//! has not drifted a whole layer yet.
 //!
 //! `INK_LAYERS=LO:HI` runs that half-open range; `INK_PIPE=head:HOST:PORT`
 //! sends the residual stream on when the range ends, and `INK_PIPE=tail:ADDR`
@@ -1235,6 +1275,7 @@ type Bk = burn::backend::Cuda<f32>;
 use burn::prelude::Backend;
 use burn::tensor::{Tensor as BT, TensorData as BTD};
 use mary::models::inkling::burn as dev_lane;
+use mary::models::inkling::resid as dev_lane_resid;
 
 /// Move a host `[rows, cols]` matrix to the device, consuming it.
 ///
@@ -1586,8 +1627,18 @@ impl DeviceDense {
 /// `dev_lane::dense_mlp`'s twin: `down(silu(gate(x)) * up(x)) * global_scale`,
 /// with the elementwise half still in Burn.
 fn dense_mlp_bf16(x: T2, w: &(Bf16W, Bf16W, Bf16W, f32)) -> T2 {
-    let g = dev_lane::linear_bf16(x.clone(), &w.0);
-    let u = dev_lane::linear_bf16(x, &w.1);
+    // `dense_intermediate_size` is 16384 against the residual stream's 4096, so
+    // each of these is FOUR TIMES the stream per token -- 64 KiB a token at f32
+    // -- and the wide form holds four of them at once: the gate, the up, the
+    // gated gate and their product. That is 256 KiB a token in the two dense
+    // layers, which on a 21-layer head is the same order as the whole routed
+    // MoE, from two layers out of forty-two.
+    //
+    // Narrowed the moment each is produced. `linear_bf16` accepts the product
+    // in that same BF16 storage, so there is no f32 copy between the
+    // elementwise half and the down projection.
+    let g = dev_lane::as_act(dev_lane::linear_bf16(x.clone(), &w.0));
+    let u = dev_lane::as_act(dev_lane::linear_bf16(x, &w.1));
     dev_lane::linear_bf16(dev_lane::silu(g) * u, &w.2).mul_scalar(w.3)
 }
 
@@ -1954,11 +2005,7 @@ enum RouterProj {
     /// STORED width. Nothing here widens; 2.16 MB a layer moves once at upload
     /// where the f32 arms materialised 4.23 MB a layer and uploaded that. The
     /// bind counters see it as exactly eight more `UNMAPPED` copies and 16 MiB.
-    Bf16 {
-        w: Bf16W,
-        /// Real rows, `n_routed + n_shared`, before the pad.
-        rows: usize,
-    },
+    Bf16 { w: Bf16W },
 }
 
 /// Everything one layer multiplies by, in DEVICE memory, for the whole run.
@@ -2064,6 +2111,7 @@ fn routed_experts_fp4(
     n: usize,
     h: usize,
     inter: usize,
+    admitted_narrow: bool,
     host: &mut HostT,
 ) -> Result<T2> {
     // Which of the two lanes runs the layer. The grouped one computes the same
@@ -2091,6 +2139,18 @@ fn routed_experts_fp4(
                 return Ok(acc);
             }
         }
+        // Narrow admission is a contract with this implementation, not a
+        // preference. A missing/unaligned mapping or any other grouped-lane
+        // premise failure would otherwise fall through to the f32 per-expert
+        // buffers after the startup-copy gate had priced BF16. Diagnostic and
+        // explicit copying modes are admitted wide and may still fall back.
+        anyhow::ensure!(
+            !admitted_narrow,
+            "the packed grouped expert lane could not bind its source after this layer was \
+             admitted with BF16 staging buffers. Refusing instead of silently falling back to \
+             the f32 per-expert lane; set INK_GROUPED=0 or INK_ZEROCOPY=0 before launch so \
+             admission prices that lane."
+        );
     }
     host.per_expert += 1;
     per_expert_fp4(src, aliases, client, dev, prefix, by_expert, hn, n, h, inter, host)
@@ -2177,12 +2237,15 @@ fn grouped_experts_fp4(
     inter: usize,
     host: &mut HostT,
 ) -> Result<Option<T2>> {
-    use mary::models::inkling::fp4gemm::gate_up_silu_launch;
-    use mary::models::inkling::fp4quant::quantize_nvfp4;
+    use mary::models::inkling::burn::act_bf16;
+    use mary::models::inkling::fp4gemm::{gate_up_silu_launch, gate_up_silu_narrow_launch};
+    use mary::models::inkling::fp4quant::{quantize_nvfp4, quantize_nvfp4_bf16};
     use mary::models::inkling::moegroup::{
-        fp4_linear_grouped_launch, gather_grouped, scatter_weighted, BlockPlanDev, RowPlan,
+        fp4_linear_grouped_bf16_launch, fp4_linear_grouped_launch, gather_grouped,
+        gather_grouped_bf16, gather_grouped_bf16_from_bf16, scatter_weighted, scatter_weighted_bf16,
+        BlockPlanDev, RowPlan,
     };
-    use mary::models::inkling::seam::{handle_of, tensor_of};
+    use mary::models::inkling::seam::{handle_of_any, tensor_of};
 
     let n13 = format!("{prefix}mlp.experts.w13_weight");
     let n2 = format!("{prefix}mlp.experts.w2_weight");
@@ -2261,7 +2324,7 @@ fn grouped_experts_fp4(
         );
     }
     let m_total = plan.m_total();
-    let hn_h = handle_of(hn.clone());
+    let (hn_h, hn_dt) = handle_of_any(hn.clone());
     let h_rowtok = client.create_from_slice(bytes_of(&plan.row_tok));
     let h_rowwgt = client.create_from_slice(bytes_of(&plan.row_wgt));
     let blk = BlockPlanDev {
@@ -2278,30 +2341,108 @@ fn grouped_experts_fp4(
     let h_sc2 = client.create_from_slice(bytes_of(&sc2));
     let h_tokrows = client.create_from_slice(bytes_of(&plan.tok_rows));
     let h_tokcnt = client.create_from_slice(bytes_of(&plan.tok_cnt));
-    let x_h = gather_grouped(client, &hn_h, &h_rowtok, n, m_total, h);
+    // The two staging buffers this lane owns, at the dtype
+    // [`act_bf16`] names. Both are `[m_total, _]` and `m_total` is about
+    // `experts_per_token * n`, so at prefill they are the largest allocations
+    // in the layer -- larger than anything attention holds -- and each is read
+    // exactly once, by a quantizer that turns it into four bits.
+    let narrow = act_bf16();
+    // Three combinations and not four: the gather's OUTPUT is what `act_bf16`
+    // decides, its SOURCE is whatever dtype the normed residual stream arrived
+    // in, and a narrow stream feeding a wide gather is not a lane anybody asks
+    // for -- `resid_bf16` defaults to `act_bf16`, so the stream is only BF16
+    // when the gather is too.
+    let x_h = match (narrow, hn_dt) {
+        (true, burn::tensor::DType::BF16) => {
+            gather_grouped_bf16_from_bf16(client, &hn_h, &h_rowtok, n, m_total, h)
+        }
+        (true, _) => gather_grouped_bf16(client, &hn_h, &h_rowtok, n, m_total, h),
+        (false, burn::tensor::DType::BF16) => {
+            panic!("a BF16 residual stream with INK_ACT_BF16=0: set INK_RESID_BF16=0 for the wide lane")
+        }
+        (false, _) => gather_grouped(client, &hn_h, &h_rowtok, n, m_total, h),
+    };
     host.gather += t_g.elapsed().as_secs_f64();
 
     let t_w = Instant::now();
-    let (a, asc) = quantize_nvfp4(client, &x_h, m_total, h);
-    let both = fp4_linear_grouped_launch(
-        client, &a, &asc, &wmap, wmap_bytes, &blk, &h_off13, &h_sc13, slots, m_total, h,
-        2 * inter,
-    );
-    let act_h = gate_up_silu_launch(client, &both, m_total, inter);
-    let (a2, asc2) = quantize_nvfp4(client, &act_h, m_total, inter);
-    let y_h = fp4_linear_grouped_launch(
-        client, &a2, &asc2, &wmap, wmap_bytes, &blk, &h_off2, &h_sc2, slots, m_total, inter, h,
-    );
+    let (a, asc) = if narrow {
+        quantize_nvfp4_bf16(client, &x_h, m_total, h)
+    } else {
+        quantize_nvfp4(client, &x_h, m_total, h)
+    };
+    let both = if narrow {
+        fp4_linear_grouped_bf16_launch(
+            client, &a, &asc, &wmap, wmap_bytes, &blk, &h_off13, &h_sc13, slots, m_total, h,
+            2 * inter,
+        )
+    } else {
+        fp4_linear_grouped_launch(
+            client, &a, &asc, &wmap, wmap_bytes, &blk, &h_off13, &h_sc13, slots, m_total, h,
+            2 * inter,
+        )
+    };
+    // Retain the activation handle until both quantization launches have been
+    // enqueued; its name starts with `_` because lifetime, not a Rust read, is
+    // the reason it remains in scope.
+    let (_act_h, a2, asc2) = if narrow {
+        let act_h = gate_up_silu_narrow_launch(client, &both, m_total, inter);
+        let (a2, asc2) = quantize_nvfp4_bf16(client, &act_h, m_total, inter);
+        (act_h, a2, asc2)
+    } else {
+        let act_h = gate_up_silu_launch(client, &both, m_total, inter);
+        let (a2, asc2) = quantize_nvfp4(client, &act_h, m_total, inter);
+        (act_h, a2, asc2)
+    };
+    let y_h = if narrow {
+        fp4_linear_grouped_bf16_launch(
+            client, &a2, &asc2, &wmap, wmap_bytes, &blk, &h_off2, &h_sc2, slots, m_total, inter, h,
+        )
+    } else {
+        fp4_linear_grouped_launch(
+            client, &a2, &asc2, &wmap, wmap_bytes, &blk, &h_off2, &h_sc2, slots, m_total, inter, h,
+        )
+    };
     host.enqueue += t_w.elapsed().as_secs_f64();
 
+    // Every buffer this lane allocated is still live on this line -- the gather,
+    // its NVFP4 codes, the `[m_total, 2 * inter]` gate-and-up, the activation,
+    // its codes and the `[m_total, h]` result. That is the point of reading the
+    // pool HERE and not after the return: `m_total` is about `k * n`, so these
+    // are the largest buffers a prefill layer holds and they are gone by the
+    // time the caller could ask.
+    if mem_trace() {
+        <Bk as burn::tensor::backend::Backend>::sync(dev).expect("sync before pool trace");
+        println!(
+            "{}",
+            mary::models::inkling::seam::pool_line(
+                client,
+                &format!("{prefix}experts m={m_total}")
+            )
+        );
+    }
+
     let t_c = Instant::now();
-    let acc_h = scatter_weighted(
-        client, &y_h, &h_rowwgt, &h_tokrows, &h_tokcnt, &h_rowtok, m_total, n, h, plan.kmax,
-    );
+    let acc_h = if narrow {
+        scatter_weighted_bf16(
+            client, &y_h, &h_rowwgt, &h_tokrows, &h_tokcnt, m_total, n, h, plan.kmax,
+        )
+    } else {
+        scatter_weighted(
+            client, &y_h, &h_rowwgt, &h_tokrows, &h_tokcnt, m_total, n, h, plan.kmax,
+        )
+    };
     let acc = tensor_of(client.clone(), dev.clone(), acc_h, n, h);
     host.accum += t_c.elapsed().as_secs_f64();
 
     Ok(Some(acc))
+}
+
+/// Whether the routed-expert lane reports what it is holding. `INK_MEM_TRACE=1`.
+///
+/// Read once: this sits inside the per-layer path.
+fn mem_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INK_MEM_TRACE").map(|v| v == "1").unwrap_or(false))
 }
 
 /// A slice of POD as the bytes `create_from_slice` uploads.
@@ -2344,7 +2485,10 @@ fn per_expert_fp4(
     // The residual stream's buffer, taken once: every expert gathers out of the
     // same rows and re-deriving the handle per expert would be six clones of a
     // refcount for nothing.
-    let hn_h = handle_of(hn.clone());
+    // A lane that is not the default one, reading through kernels that index
+    // f32 bytes: widen the normed stream here rather than teach four fallback
+    // gathers a dtype they will never see on the lane that runs.
+    let hn_h = handle_of(mary::models::inkling::resid::from_resid(hn.clone()));
 
     for (&e, toks) in by_expert {
         let t_s = Instant::now();
@@ -2524,7 +2668,10 @@ fn grouped_experts_bf16(
         );
     }
     let m_total = plan.m_total();
-    let hn_h = handle_of(hn.clone());
+    // A lane that is not the default one, reading through kernels that index
+    // f32 bytes: widen the normed stream here rather than teach four fallback
+    // gathers a dtype they will never see on the lane that runs.
+    let hn_h = handle_of(mary::models::inkling::resid::from_resid(hn.clone()));
     let h_rowtok = client.create_from_slice(bytes_of(&plan.row_tok));
     let h_rowwgt = client.create_from_slice(bytes_of(&plan.row_wgt));
     let blk = BlockPlanDev {
@@ -2555,7 +2702,7 @@ fn grouped_experts_bf16(
 
     let t_c = Instant::now();
     let acc_h = scatter_weighted(
-        client, &y_h, &h_rowwgt, &h_tokrows, &h_tokcnt, &h_rowtok, m_total, n, h, plan.kmax,
+        client, &y_h, &h_rowwgt, &h_tokrows, &h_tokcnt, m_total, n, h, plan.kmax,
     );
     let acc = tensor_of(client.clone(), dev.clone(), acc_h, n, h);
     host.accum += t_c.elapsed().as_secs_f64();
@@ -2592,7 +2739,10 @@ fn per_expert_bf16(
     let n13 = format!("{prefix}mlp.experts.w13_weight");
     let n2 = format!("{prefix}mlp.experts.w2_weight");
     let mut acc: T2 = burn::tensor::Tensor::zeros([n, h], dev);
-    let hn_h = handle_of(hn.clone());
+    // A lane that is not the default one, reading through kernels that index
+    // f32 bytes: widen the normed stream here rather than teach four fallback
+    // gathers a dtype they will never see on the lane that runs.
+    let hn_h = handle_of(mary::models::inkling::resid::from_resid(hn.clone()));
 
     for (&e, toks) in by_expert {
         let t_s = Instant::now();
@@ -2654,6 +2804,8 @@ fn main() -> Result<()> {
     // the forward then read a buffer nothing had written, exited 0, and printed
     // a layer-RMS ladder of 36.7..80.3 where the coherent one is 1.5..14.7.
     fatal::arm();
+    let allocator = mary::models::inkling::pool::choose_memory_config();
+    let cleanup = mary::models::inkling::pool::CleanupPolicy::choose();
 
     let pile_path = std::env::args().nth(1).map(PathBuf::from).context("usage: <pile> <ids> <out>")?;
     let ids_path = std::env::args().nth(2).map(PathBuf::from).context("usage: <pile> <ids> <out>")?;
@@ -2948,9 +3100,31 @@ fn main() -> Result<()> {
     // as the dense lane blocked its queries and left the estimate flat again --
     // 13.84 GiB at 16,384 tokens and 13.52 at 100,623. What actually scales is
     // the routed-expert lane, six rows a token through hidden-width buffers.
+    //
+    // The source decides which routed implementation each layer takes. Packed
+    // NVFP4 experts can use the grouped BF16-storage lane; plain-BF16 experts
+    // and the diagnostic per-expert arms retain their f32 gather and outputs.
+    // Price that exact split before the startup copy rather than assuming the
+    // model is uniformly packed. Whether this GPU can register the anonymous
+    // mapping is learned only after the CUDA context exists; unsupported
+    // registration is therefore a target-hardware gate, while the two explicit
+    // fallback switches are conservatively priced here.
+    let grouped_narrow = std::env::var("INK_GROUPED").unwrap_or_else(|_| "1".into()) == "1"
+        && !std::env::var("INK_ZEROCOPY").map(|v| v == "0").unwrap_or(false);
+    let mut admission = budget::AdmissionPolicy::runtime(allocator);
+    for layer in lo..hi {
+        if !t.is_dense(layer) {
+            let experts = format!("model.llm.layers.{layer}.mlp.experts.w13_weight");
+            if !cp.is_nvfp4(&experts) {
+                admission = admission.with_plain_bf16_layer(layer);
+            } else if !grouped_narrow {
+                admission = admission.with_wide_routed_layer(layer);
+            }
+        }
+    }
     let attn_heads = t.heads(AttnKind::Global).0.max(t.heads(AttnKind::Local).0);
     let attn_head_dim = t.heads(AttnKind::Global).2.max(t.heads(AttnKind::Local).2);
-    let attention_bytes = budget::prefill_activation_bytes(t, lo..hi, n);
+    let attention_bytes = budget::prefill_activation_bytes(t, lo..hi, n, admission);
     // What b slots hold in K and V once they are all prefilled. A global
     // layer keeps the whole context, a local one keeps its window, and both
     // keep K and V -- so this is the term that multiplies with the batch and
@@ -2968,7 +3142,7 @@ fn main() -> Result<()> {
                 // The admission gate reads this, and a gate that priced a BF16
                 // cache at f32 would refuse ranges that fit -- which is the
                 // safe direction and still the wrong number.
-                let w = if dev_lane::attn_bf16() { 2 } else { 4 };
+                let w = admission.cache.bytes();
                 2 * total_slots as u64 * keep as u64 * (kv_heads * head_dim) as u64 * w
             })
             .sum()
@@ -2979,7 +3153,11 @@ fn main() -> Result<()> {
         println!(
             "  slot KV            : {:.2} GiB for {total_slots} slots over layers {lo}..{hi}{}",
             slot_kv_bytes as f64 / GIB,
-            if dev_lane::attn_bf16() { "  (BF16)" } else { "" }
+            if admission.cache == budget::StorageDType::Bf16 {
+                "  (BF16)"
+            } else {
+                ""
+            }
         );
     }
 
@@ -3001,8 +3179,12 @@ fn main() -> Result<()> {
             globals.push("model.llm.unembed.weight");
         }
         let t0 = Instant::now();
-        let (experts, dense, bytes) =
-            cp.copy_share(lo..hi, &globals, attention_bytes + slot_kv_bytes)?;
+        let (experts, dense, bytes) = cp.copy_share(
+            lo..hi,
+            &globals,
+            attention_bytes + slot_kv_bytes,
+            admission,
+        )?;
         println!(
             "  startup weight copy: {experts} expert + {dense} dense views, {:.2} GiB anonymous in {:.1}s",
             bytes as f64 / GIB,
@@ -3333,6 +3515,16 @@ fn main() -> Result<()> {
         cfg.mtp_config.num_nextn_predict_layers
     );
     println!("  attention          : device, weights DEVICE-RESIDENT");
+    let routed_layers = (lo..hi).filter(|&layer| !t.is_dense(layer)).count();
+    let routed_f32 = (lo..hi)
+        .filter(|&layer| !t.is_dense(layer) && admission.routed(layer) == budget::StorageDType::F32)
+        .count();
+    println!(
+        "  activations        : {} operands, {} residual stream; {routed_f32} of \
+         {routed_layers} routed layers priced f32",
+        admission.activation.name(),
+        admission.residual.name(),
+    );
     println!("  shared + dense MLP : device, uploaded once and held");
     println!("  routed experts     : device, NATIVE tensor cores -- NVFP4 where packed, BF16 at layer 2");
     println!("  head (unembed)     : device");
@@ -3386,6 +3578,11 @@ fn main() -> Result<()> {
     );
     println!("{}", mary::models::inkling::pile::mem_line("after CUDA context"));
     println!("{}", mary::models::inkling::seam::pool_line(&fp4_client, "cold"));
+    println!(
+        "  memory pool        : {} pages, cleanup {}",
+        allocator.env_value(),
+        cleanup.name(),
+    );
     // The one number that decides whether this sequence length is runnable at
     // all, asked of the device rather than modelled. It is checked HERE and not
     // beside the admission gate because this is the first client in the
@@ -3395,17 +3592,23 @@ fn main() -> Result<()> {
     println!(
         "  attention budget   : queries in blocks of {qblock}, so [{attn_heads}, {qblock}, {n}] \
          f32 scores = {:.2} GiB per layer (the whole square would be {:.2} GiB) beside \
-         [{attn_heads}, {n}, {attn_head_dim}] f32 activations = {:.2} GiB; the widest single \
+         [{attn_heads}, {n}, {attn_head_dim}] {} activations = {:.2} GiB; the widest single \
          buffer this range asks for is {:.2} GiB and this device allows {:.2} GiB \
          (up to {} tokens)",
         budget::score_block_bytes(attn_heads, qblock, n) as f64 / GIB,
         budget::score_matrix_bytes(attn_heads, n) as f64 / GIB,
-        budget::activation_bytes(attn_heads, attn_head_dim, n) as f64 / GIB,
-        budget::largest_buffer(t, lo..hi, n) as f64 / GIB,
+        admission.activation.name(),
+        budget::activation_bytes(attn_heads, attn_head_dim, n, admission.activation) as f64 / GIB,
+        budget::largest_buffer(t, lo..hi, n, admission) as f64 / GIB,
         budget::largest_allocation(&fp4_client) as f64 / GIB,
-        budget::longest_sequence(t, lo..hi, budget::largest_allocation(&fp4_client)),
+        budget::longest_sequence(
+            t,
+            lo..hi,
+            budget::largest_allocation(&fp4_client),
+            admission,
+        ),
     );
-    budget::check(&fp4_client, t, lo..hi, n)?;
+    budget::check(&fp4_client, t, lo..hi, n, admission)?;
     // Nine blocking device round trips for the whole run, instead of four per
     // expert. Every later slab is an offset view of one of these.
     //
@@ -3429,14 +3632,32 @@ fn main() -> Result<()> {
             println!("  zero-copy mappings : DISABLED (INK_ZEROCOPY=0) -- every bind copies");
             Some(mary::models::inkling::fp4gemm::Aliases::disabled())
         } else {
-            let t = Instant::now();
+            let alias_started = Instant::now();
             let maps = cp.mappings()?;
             let n = maps.len();
             let a = mary::models::inkling::fp4gemm::Aliases::register(c, maps);
             println!(
                 "  zero-copy mappings : {} {n} in {:.1} ms",
-                if a.is_some() { "registered" } else { "UNSUPPORTED, copying" },
-                t.elapsed().as_secs_f64() * 1e3
+                if a.is_some() { "registered" } else { "UNSUPPORTED" },
+                alias_started.elapsed().as_secs_f64() * 1e3
+            );
+            // Packed grouped layers were admitted at their BF16 activation
+            // width only on the premise that the mapping-backed grouped lane
+            // can run. Falling through to the per-expert copying lane here
+            // would silently switch those layers to f32 after the startup-copy
+            // gate has already used the narrow figure. Make the documented
+            // target-hardware gate real. Explicit diagnostic/copying modes are
+            // priced wide before the copy and therefore remain runnable.
+            anyhow::ensure!(
+                a.is_some()
+                    || (lo..hi).all(|layer| {
+                        t.is_dense(layer)
+                            || admission.routed(layer) == budget::StorageDType::F32
+                    }),
+                "this CUDA target cannot register host mappings, but pre-copy admission priced \
+                 one or more packed routed layers for the BF16 grouped lane. Refusing instead \
+                 of silently falling back to its f32 per-expert buffers. Set INK_GROUPED=0 or \
+                 INK_ZEROCOPY=0 before launch so admission prices the copying lane."
             );
             Some(a.unwrap_or_else(mary::models::inkling::fp4gemm::Aliases::disabled))
         }
@@ -3805,7 +4026,10 @@ fn main() -> Result<()> {
     // A head embeds and uploads; a tail uploads what came off the wire. Both
     // are the same 16 KB, which is why the pipe crosses BETWEEN layers and not
     // inside one.
-    let mut xd: T2 = up2::<Bk>(x_in, n, h, &dev);
+    // At the dtype the residual stream is held in. On the narrow lane the
+    // upload is still f32 -- the embedding is host work and the wire is f32 --
+    // and this is the one cast that pays for the whole stack staying narrow.
+    let mut xd: T2 = dev_lane_resid::as_resid(up2::<Bk>(x_in, n, h, &dev));
     let t_embed = t_emb.elapsed().as_secs_f64();
 
     let ls = LogScaling {
@@ -3849,6 +4073,30 @@ fn main() -> Result<()> {
     // It changes no arithmetic -- a sync is a wait, not an operation -- so both
     // arms emit the same tokens, which is itself checked below.
     let stage_sync = std::env::var("INK_STAGE_SYNC").map(|v| v == "1").unwrap_or(false);
+    // `INK_MEM_TRACE=1`: the device pool's live bytes after each stage of each
+    // layer, which is the only way to find out WHICH stage holds the peak
+    // rather than to model it.
+    //
+    // It exists because the model was wrong. A prefill's largest buffers were
+    // taken to be attention's `[heads, n, head_dim]` activations, and the
+    // routed-expert lane -- which gathers `k * n` rows of the residual stream
+    // and runs them through two `[k * n, 4096]` intermediates -- is several
+    // times larger at every length. A number that has to be inferred from the
+    // source is a number nobody checks; this one is read off the allocator.
+    //
+    // It SYNCS, so a traced pass is slower than an untraced one and the timings
+    // beside it are not the pass's. It reports memory, not time.
+    let mem_trace = mem_trace();
+    // Between-layer cleanup is a POLICY now, not an off switch. It was chosen
+    // once before any context or worker existed, and the same value is printed
+    // in the header above. See
+    // `super::pool` for why the argument that kept it off -- a decode step pays
+    // an allocation per layer per token for a reservation that is already small
+    // -- is an argument for asking what the pass is, which the pass knows.
+    // How many of this pass's layers actually handed pages back. Printed, so
+    // that "the policy took the cheap branch" is a number in the log rather
+    // than an inference from the absence of one.
+    let mut cleanups = 0usize;
     let (mut d_attn, mut d_router, mut d_expert, mut d_shared, mut d_tail) =
         (0f64, 0f64, 0f64, 0f64, 0f64);
     let mut stage_syncs = 0usize;
@@ -3873,12 +4121,30 @@ fn main() -> Result<()> {
     // because every call site names a different accumulator and a closure would
     // have to borrow all five of them mutably at once.
     macro_rules! stage_sync {
-        ($acc:expr) => {
+        ($acc:expr, $lay:expr, $tag:expr) => {
             if stage_sync {
                 let s = Instant::now();
                 <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("stage sync");
                 $acc += s.elapsed().as_secs_f64();
                 stage_syncs += 1;
+            }
+            // `INK_POOL_CLEANUP=stage`: four internal hand-backs here, then
+            // the tail boundary below after its always-on RMS diagnostic has
+            // released its full-width temporary. That is five syncs on a
+            // routed layer, not five here plus a duplicate sixth at the end.
+            if cleanup.at_stage() && $tag != "tail" {
+                <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("stage cleanup sync");
+                fp4_client.memory_cleanup();
+            }
+            if mem_trace {
+                <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("mem trace sync");
+                println!(
+                    "{}",
+                    mary::models::inkling::seam::pool_line(
+                        &fp4_client,
+                        &format!("L{} {}", $lay, $tag)
+                    )
+                );
             }
         };
     }
@@ -3979,7 +4245,6 @@ fn main() -> Result<()> {
                         t_read.set(t_read.get() + s.elapsed().as_secs_f64());
                         RouterProj::Bf16 {
                             w: bind_bf16(&fp4_client, fp4_aliases.as_ref(), &bytes, pad, h),
-                            rows,
                         }
                     }
                 };
@@ -4031,7 +4296,7 @@ fn main() -> Result<()> {
 
         // ---- attention ----------------------------------------------------
         let t_a = Instant::now();
-        let hn = dev_lane::rms_norm(xd.clone(), ld.attn_norm.clone(), t.rms_norm_eps);
+        let hn = dev_lane_resid::rms_norm(xd.clone(), ld.attn_norm.clone(), t.rms_norm_eps);
         let dims = AttnDims {
             hidden: h, heads, kv_heads, head_dim,
             d_rel: t.d_rel,
@@ -4097,13 +4362,13 @@ fn main() -> Result<()> {
             let y = dev_lane::attention(hn, &ld.attn, &dims, Some(ls), window);
             dev_lane::short_conv(y, ld.attn_sconv.clone())
         };
-        xd = xd + a;
+        xd = dev_lane_resid::add_resid(xd, a);
 
-        stage_sync!(d_attn);
+        stage_sync!(d_attn, layer, "attn");
         // ---- MLP ----------------------------------------------------------
         t_attn += t_a.elapsed().as_secs_f64();
         let t_o = Instant::now();
-        let hn = dev_lane::rms_norm(xd.clone(), ld.mlp_norm.clone(), t.rms_norm_eps);
+        let hn = dev_lane_resid::rms_norm(xd.clone(), ld.mlp_norm.clone(), t.rms_norm_eps);
 
         let y = if t.is_dense(layer) {
             // Device-resident: uploaded on the first token that reaches this
@@ -4129,12 +4394,23 @@ fn main() -> Result<()> {
             // `cols` is what comes BACK, which is `rows` except on the BF16 arm,
             // whose weight carries the instruction's n padding.
             let (lg, cols) = match &r.proj {
-                RouterProj::PerCall(w) => (dev_lane::linear(hn.clone(), w.clone()), rows),
-                RouterProj::Pre(wt) => (dev_lane::linear_pre_t(hn.clone(), wt.clone()), rows),
+                // Two A/B arms whose weight is an f32 Burn tensor, so their
+                // matmul wants an f32 activation. `Bf16` is the lane that runs
+                // and it takes the narrow stream as it lies; these widen, and
+                // the temporary is the price of keeping an arm comparable
+                // rather than of anything on the path.
+                RouterProj::PerCall(w) => (
+                    dev_lane::linear(dev_lane_resid::from_resid(hn.clone()), w.clone()),
+                    rows,
+                ),
+                RouterProj::Pre(wt) => (
+                    dev_lane::linear_pre_t(dev_lane_resid::from_resid(hn.clone()), wt.clone()),
+                    rows,
+                ),
                 RouterProj::Bf16 { w, .. } => (dev_lane::linear_bf16(hn.clone(), w), w.n),
             };
             t_rt_mm += t_rt.elapsed().as_secs_f64();
-            stage_sync!(d_router);
+            stage_sync!(d_router, layer, "router");
             // Two lanes, and the difference is WHERE the top-k runs, not what
             // it decides. The host lane reads `[n, rows]` f32 back and sorts;
             // the device lane runs `routetopk` on the logits where they already
@@ -4255,7 +4531,11 @@ fn main() -> Result<()> {
             // `routing`, whichever arm produced it -- so this measures the arm
             // rather than replacing it.
             if let Some(rw) = r.reference.as_ref() {
-                let ref_logits = down(dev_lane::linear(hn.clone(), rw.clone()));
+                // `INK_ROUTER_DIFF=1` only, and widened for the same reason
+                // the two f32 router arms above are: this lane's weight is an
+                // f32 Burn tensor.
+                let ref_logits =
+                    down(dev_lane::linear(dev_lane_resid::from_resid(hn.clone()), rw.clone()));
                 let ref_routing = route_from_logits(
                     &ref_logits, &r.bias, r.global_scale, t.route_scale as f32,
                     n, t.n_routed_experts, t.n_shared_experts, t.num_experts_per_tok,
@@ -4319,7 +4599,9 @@ fn main() -> Result<()> {
                 let a = if cp.is_nvfp4(&format!("{p}mlp.experts.w13_weight")) {
                     routed_experts_fp4(
                         &cp, fp4_aliases.as_ref(), &fp4_client, &dev,
-                        &p, &by_expert, &hn, n, h, inter, &mut host_t,
+                        &p, &by_expert, &hn, n, h, inter,
+                        admission.routed(layer) == budget::StorageDType::Bf16,
+                        &mut host_t,
                     )?
                 } else {
                     routed_experts_bf16(
@@ -4335,7 +4617,7 @@ fn main() -> Result<()> {
             // stack, which is where it belongs and where it cannot be
             // misattributed to whichever bucket happened to hold the readback.
             t_expert += t_d.elapsed().as_secs_f64();
-            stage_sync!(d_expert);
+            stage_sync!(d_expert, layer, "expert");
 
             let ns = t.n_shared_experts;
             let gammas: Vec<f32> = routing.iter().flat_map(|rt| rt.shared_gammas.clone()).collect();
@@ -4350,7 +4632,7 @@ fn main() -> Result<()> {
                 )?;
                 shared_experts_bf16(&dev, hn, sw, &gammas, ns)
             };
-            stage_sync!(d_shared);
+            stage_sync!(d_shared, layer, "shared");
             t_shared += t_s.elapsed().as_secs_f64();
             acc + sh
         };
@@ -4390,8 +4672,8 @@ fn main() -> Result<()> {
             dev_lane::short_conv(y, ld.mlp_sconv.clone())
         };
         t_h_sconv += t_sc.elapsed().as_secs_f64();
-        xd = xd + y;
-        stage_sync!(d_tail);
+        xd = dev_lane_resid::add_resid(xd, y);
+        stage_sync!(d_tail, layer, "tail");
 
         // A debug dump is a SYNC, and it is the one place left in the loop that
         // costs one. That is the trade: this path exists to compare against a
@@ -4408,8 +4690,45 @@ fn main() -> Result<()> {
         t_other += t_o.elapsed().as_secs_f64();
         // The same reduction the host loop did, enqueued rather than run:
         // sqrt(mean(x^2)) over the whole [n, h] stream. Read after the stack.
-        layer_rms.push(xd.clone().powf_scalar(2.0).mean().reshape([1, 1]));
+        // Widened first, and deliberately: `mean` over `n * 4096` terms is the
+        // one reduction in this loop whose accumulator is not already f32, and
+        // a diagnostic that reads wrong because it was measured narrow is worse
+        // than no diagnostic. It is one cast of a buffer that is about to be
+        // reduced to a scalar, and the fusion collapses it into the reduce.
+        layer_rms.push(
+            dev_lane_resid::from_resid(xd.clone()).powf_scalar(2.0).mean().reshape([1, 1]),
+        );
         layer_kind.push((layer, is_local));
+        // Hand the pool's unused pages back between layers, when
+        // `CleanupPolicy` says this pass is the kind that wants it.
+        //
+        // Every layer's activations are freed before the next one allocates its
+        // own, so between two layers the pool holds almost nothing and RESERVES
+        // almost everything: 12.56 GiB reserved against 1.19 live at the end of
+        // a layer, on eight layers at 20,000 tokens with `INK_MEM_TRACE=1`. On
+        // this part the pool is host memory, so what the node runs out of is
+        // the reserved figure, not the live one.
+        //
+        // What it trades is ALLOCATION: the next layer asks for the same
+        // pages again, and a page this runtime hands back is a `cudaFree` it
+        // will pay a `cudaMalloc` for. That cost is per layer, so a prefill --
+        // few layers, enormous reservation -- pays it once a layer and a decode
+        // step would pay it once a layer PER TOKEN for nothing. Which is why
+        // the policy asks how many positions the pass computes rather than
+        // asking an operator to remember a variable.
+        // `memory_usage` is the pool's own host-side bookkeeping and needs no
+        // sync to read; the sync below belongs to the cleanup.
+        let stranded = match fp4_client.memory_usage() {
+            Ok(u) => mary::models::inkling::pool::stranded_bytes(
+                u.bytes_reserved, u.bytes_in_use, u.bytes_padding,
+            ),
+            Err(_) => 0,
+        };
+        if cleanup.at_layer(stranded) {
+            <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync before cleanup");
+            fp4_client.memory_cleanup();
+            cleanups += 1;
+        }
     }
 
     // This slot is prefilled; seat it in the batch and let go of it. The next
@@ -4534,7 +4853,12 @@ fn main() -> Result<()> {
     // 95% -- and it reads 0.3 ms, so it is a suspect that has been RULED OUT
     // rather than the untimed thing anything could be blamed on.
     let t_dn = Instant::now();
-    let x: Vec<f32> = if want_host_x { down(xd.clone()) } else { Vec::new() };
+    // Widened on the DEVICE before the readback, not on the host after it. The
+    // wire is f32 and `down` would happily convert a BF16 `TensorData` for it --
+    // in a host loop over `n * 4096` elements, which at 100,000 tokens is four
+    // hundred million of them on one core. The cast is a kernel; let it be one.
+    let x: Vec<f32> =
+        if want_host_x { down(dev_lane_resid::from_resid(xd.clone())) } else { Vec::new() };
     let t_x_down = t_dn.elapsed().as_secs_f64();
 
     // Does anything downstream need a logit row that is NOT the last one?
@@ -4642,7 +4966,7 @@ fn main() -> Result<()> {
         } else {
             xd.clone().slice([logit_row0..n, 0..h])
         };
-        let hs = dev_lane::rms_norm(
+        let hs = dev_lane_resid::rms_norm(
             hx,
             fnorm_dev.clone().expect("the tail owns the final norm"),
             t.rms_norm_eps,
@@ -5426,6 +5750,9 @@ fn main() -> Result<()> {
 
     println!("\n=== predictions ===");
     println!("  expert slabs decoded: {expert_loads}");
+    // Which branch the cleanup policy took, as a count and not as an inference
+    // from the absence of a line. Zero on a pass the node had room for.
+    println!("  pool cleanups: {cleanups} of {} layers", hi - lo);
     // t_other covers the whole MLP half, so the expert buckets are inside it.
     // MILLISECONDS. At 0.1 s resolution a decode pass of this stack prints as
     // "0.4 0.4 0.0" and every question worth asking of it is unanswerable.

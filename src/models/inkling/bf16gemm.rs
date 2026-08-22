@@ -342,6 +342,74 @@ pub fn linear_bf16<R: Runtime>(
     bf16_gemm(client, &a, &w.h, rows, w.k, w.n, w.align)
 }
 
+/// A BF16-to-BF16 copy into an `n_out`-element buffer, zeroing the tail.
+///
+/// [`to_bf16`] is this kernel with a cast in the middle; this is the same
+/// padding for an activation that is BF16 already. It exists only for the M
+/// padding — when a lane needs none, [`linear_bf16_narrow`] does not call it at
+/// all and the activation is handed to the MMA where it lies.
+#[cube(launch)]
+pub fn pad_bf16(x: &Tensor<bf16>, y: &mut Tensor<bf16>, n_in: usize) {
+    let idx = ABSOLUTE_POS as usize;
+    if idx < y.len() {
+        let mut v = bf16::cast_from(0.0f32);
+        if idx < n_in {
+            v = x[idx];
+        }
+        y[idx] = v;
+    }
+}
+
+/// Launch [`pad_bf16`].
+pub fn pad_bf16_launch<R: Runtime>(
+    client: &ComputeClient<R>,
+    x: &Handle,
+    n_in: usize,
+    n_out: usize,
+) -> Handle {
+    assert!(n_in <= n_out, "{n_in} BF16 do not fit in {n_out}");
+    let out = client.empty(n_out * core::mem::size_of::<bf16>());
+    let threads = 256u32;
+    let blocks = n_out.div_ceil(threads as usize) as u32;
+    unsafe {
+        pad_bf16::launch::<R>(
+            client,
+            CubeCount::Static(blocks, 1, 1),
+            CubeDim::new_1d(threads),
+            TensorArg::from_raw_parts(x.clone(), [1].into(), [n_in].into()),
+            TensorArg::from_raw_parts(out.clone(), [1].into(), [n_out].into()),
+            n_in,
+        )
+    };
+    out
+}
+
+/// [`linear_bf16`] for an activation that is **already** BF16.
+///
+/// The narrow lane's normed residual stream is BF16 when it reaches here, and
+/// [`linear_bf16`] would then be handed an f32 buffer that only exists to be
+/// cast straight back — `[n, 4096]`, 16 KiB a token, allocated, written, read
+/// once and freed, several times a layer.
+///
+/// So this skips the cast. And when the weight's alignment lets the tuned lane
+/// take `m` rows unpadded — which [`rows_for`] reports and which is the common
+/// case for a prefill — it skips the COPY as well and hands the MMA the
+/// residual stream's own buffer. Nothing writes through it: `bf16_gemm` reads A
+/// and writes a fresh accumulator.
+pub fn linear_bf16_narrow<R: Runtime>(
+    client: &ComputeClient<R>,
+    x_h: &Handle,
+    w: &Bf16W,
+    m: usize,
+) -> Handle {
+    let rows = rows_for(w.align, m);
+    if rows == m {
+        return bf16_gemm(client, x_h, &w.h, rows, w.k, w.n, w.align);
+    }
+    let a = pad_bf16_launch(client, x_h, m * w.k, rows * w.k);
+    bf16_gemm(client, &a, &w.h, rows, w.k, w.n, w.align)
+}
+
 // ---------------------------------------------------------------------------
 // The tuned lane.
 //

@@ -35,7 +35,7 @@ EXTRA=${INK_EXTRA:-}
 [ -n "$REMOTE" ] || { echo "no head box: set INK_REMOTE to the ssh target that runs layers 0:SPLIT" >&2; exit 2; }
 [ -n "$RBIN" ]   || { echo "no remote binary: set INK_REMOTE_BIN to the SAME build on \$INK_REMOTE" >&2; exit 2; }
 [ -n "$TADDR" ]  || { echo "no tail address: set INK_TAIL_ADDR to the interface the head should dial (the direct link)" >&2; exit 2; }
-SPLIT=${INK_SPLIT:-21}
+SPLIT=${INK_SPLIT:-20}
 NL=${INK_NLAYERS:-42}
 TMO=${INK_TIMEOUT:-1800}
 SSH="ssh -n -o BatchMode=yes -o ServerAliveInterval=20 -o ServerAliveCountMax=3"

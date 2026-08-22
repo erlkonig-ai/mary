@@ -76,15 +76,10 @@
 //!
 //! # How the scatter sums
 //!
-//! (continued) That agreement was a convenient property of the port, not a
-//! requirement on it. **This is not a prohibition on an atomic scatter.** An atomic float add
-//! reassociates the sum and gives up run-to-run reproducibility, and neither of
-//! those is a gate here (see the yardstick two sections down: this runtime
-//! already disagrees with itself on 8.55% of argmax positions between two runs
-//! of the same binary). The one-thread-per-output-element walk is where this
-//! started because it needs no atomics and no extra pass; whether an atomic
-//! scatter beats it is a measurement, and `INK_SCATTER=atomic` is the arm that
-//! takes it.
+//! (continued) An atomic arm was measured and removed: it was indistinguishable
+//! at a 512-token prefill and slightly slower at decode, then became unsafe when
+//! `y` gained a BF16 storage lane because that kernel still indexed it as f32.
+//! The gather-shaped kernel below is the one implementation for both dtypes.
 //!
 //! # The weight multiply stays INSIDE the sum
 //!
@@ -149,10 +144,10 @@ const SCALE_VEC: usize = 4;
 /// thing from a comparison; a sentinel is what lets one launch serve experts
 /// with different row counts.
 #[cube(launch_unchecked)]
-fn gather_grouped_kernel(
-    src: &Array<f32>,
+fn gather_grouped_kernel<I: Scalar + Cast, O: Scalar + Cast>(
+    src: &Array<I>,
     idx: &Array<i32>,
-    out: &mut Array<f32>,
+    out: &mut Array<O>,
     h: usize,
     total: usize,
 ) {
@@ -162,13 +157,13 @@ fn gather_grouped_kernel(
         let t = idx[r];
         let mut v = f32::new(0.0f32);
         if t >= 0i32 {
-            v = src[u32::cast_from(t) as usize * h + p % h];
+            v = f32::cast_from(src[u32::cast_from(t) as usize * h + p % h]);
         }
-        out[p] = v;
+        out[p] = O::cast_from(v);
     }
 }
 
-/// Launch [`gather_grouped_kernel`], returning the `[m_total, h]` buffer.
+/// Launch [`gather_grouped_kernel`], returning the `[m_total, h]` f32 buffer.
 pub fn gather_grouped<R: Runtime>(
     client: &ComputeClient<R>,
     src: &Handle,
@@ -177,11 +172,60 @@ pub fn gather_grouped<R: Runtime>(
     m_total: usize,
     h: usize,
 ) -> Handle {
+    gather_grouped_as::<f32, f32, R>(client, src, idx, src_rows, m_total, h)
+}
+
+/// The gather from a residual stream that is BF16 already, landing in BF16.
+///
+/// The `src` side of this is what changes when the residual stream narrows: the
+/// gather reads `k * n` rows of it, six copies on this model, so the source is
+/// read six times per layer and halving the element halves that traffic as well
+/// as the buffer the norm wrote.
+pub fn gather_grouped_bf16_from_bf16<R: Runtime>(
+    client: &ComputeClient<R>,
+    src: &Handle,
+    idx: &Handle,
+    src_rows: usize,
+    m_total: usize,
+    h: usize,
+) -> Handle {
+    gather_grouped_as::<half::bf16, half::bf16, R>(client, src, idx, src_rows, m_total, h)
+}
+
+/// The same gather, landing in BF16.
+///
+/// `m_total` is about `k * n` on a prefill -- six copies of the residual stream
+/// for this model's six experts a token -- so this buffer is the largest single
+/// thing a routed-expert layer allocates, 98 KiB a token at f32 against the
+/// residual stream's own 16. Its ONLY consumer is
+/// [`super::fp4quant::quantize_nvfp4_bf16`], which reads it back and rounds it
+/// to four bits, so the four-byte copy of a value that is already BF16 in the
+/// residual stream is bytes moved twice and stored once for nothing.
+pub fn gather_grouped_bf16<R: Runtime>(
+    client: &ComputeClient<R>,
+    src: &Handle,
+    idx: &Handle,
+    src_rows: usize,
+    m_total: usize,
+    h: usize,
+) -> Handle {
+    gather_grouped_as::<f32, half::bf16, R>(client, src, idx, src_rows, m_total, h)
+}
+
+/// [`gather_grouped`] at named source and output element types.
+fn gather_grouped_as<I: Scalar + Cast, O: Scalar + Cast, R: Runtime>(
+    client: &ComputeClient<R>,
+    src: &Handle,
+    idx: &Handle,
+    src_rows: usize,
+    m_total: usize,
+    h: usize,
+) -> Handle {
     let total = m_total * h;
-    let out = client.empty(total * core::mem::size_of::<f32>());
+    let out = client.empty(total * core::mem::size_of::<O>());
     let cubes = total.div_ceil(CUBE_SIZE as usize) as u32;
     unsafe {
-        gather_grouped_kernel::launch_unchecked::<R>(
+        gather_grouped_kernel::launch_unchecked::<I, O, R>(
             client,
             CubeCount::new_1d(cubes),
             CubeDim::new_1d(CUBE_SIZE),
@@ -218,7 +262,7 @@ pub fn gather_grouped<R: Runtime>(
 /// result bit-identical rather than merely close.
 #[cube(launch, address_type = "dynamic")]
 #[allow(clippy::too_many_arguments)]
-pub fn fp4_linear_grouped<AB: Scalar, S: Scalar, NA: Size, NC: Size, NS: Size>(
+pub fn fp4_linear_grouped<AB: Scalar, S: Scalar, O: Scalar + Cast, NA: Size, NC: Size, NS: Size>(
     a: &Tensor<Vector<AB, NA>>,
     a_sc: &Tensor<Vector<S, NS>>,
     b: &Tensor<Vector<AB, NA>>,
@@ -228,7 +272,7 @@ pub fn fp4_linear_grouped<AB: Scalar, S: Scalar, NA: Size, NC: Size, NS: Size>(
     blk_cnt: &Tensor<u32>,
     off: &Tensor<u64>,
     scale2: &Tensor<f32>,
-    out: &mut Tensor<Vector<f32, NC>>,
+    out: &mut Tensor<Vector<O, NC>>,
     #[comptime] size_k: usize,
     #[comptime] size_n: usize,
     #[comptime] nrep: usize,
@@ -363,8 +407,12 @@ pub fn fp4_linear_grouped<AB: Scalar, S: Scalar, NA: Size, NC: Size, NS: Size>(
             let (row, col) = def.position_of_nth(lane, (i * vs_c) as u32, MatrixIdent::Accumulator);
             let gr = row as usize + m_base;
             let gc = col as usize + n_base + j * NTILE;
+            // The accumulator is the instruction's own f32 and the
+            // second-level scale multiplies there. Only the STORE is `O`:
+            // narrowing the destination narrows what the next stage has to
+            // read back, and does not touch a single multiply-add.
             out[(gr * size_n + gc) / out.vector_size()] =
-                ac[i] * Vector::<f32, NC>::cast_from(scale);
+                Vector::<O, NC>::cast_from(ac[i] * Vector::<f32, NC>::cast_from(scale));
         }
     }
 }
@@ -375,6 +423,56 @@ pub fn fp4_linear_grouped<AB: Scalar, S: Scalar, NA: Size, NC: Size, NS: Size>(
 /// offsets in `off` are byte offsets into it.
 #[allow(clippy::too_many_arguments)]
 pub fn fp4_linear_grouped_launch<R: Runtime>(
+    client: &ComputeClient<R>,
+    a: &Handle,
+    a_sc: &Handle,
+    wmap: &Handle,
+    wmap_bytes: usize,
+    blk: &BlockPlanDev,
+    off: &Handle,
+    scale2: &Handle,
+    slots: usize,
+    m_total: usize,
+    k: usize,
+    n: usize,
+) -> Handle {
+    fp4_linear_grouped_launch_as::<f32, R>(
+        client, a, a_sc, wmap, wmap_bytes, blk, off, scale2, slots, m_total, k, n,
+    )
+}
+
+/// The same product, landing in BF16.
+///
+/// `[m_total, 2 * inter]` for the gate-and-up and `[m_total, hidden]` for the
+/// result, which on this model is 98 KiB a token EACH at f32. The consumer of
+/// the first is a SiLU whose own arithmetic is f32 either way; the consumer of
+/// the second is the weighted scatter back into the residual stream, which
+/// widens on the read and accumulates in f32 as it did before. Nothing here
+/// accumulates narrow -- the MMA's accumulator is f32 by construction, and this
+/// changes only what it is rounded to on the way out.
+#[allow(clippy::too_many_arguments)]
+pub fn fp4_linear_grouped_bf16_launch<R: Runtime>(
+    client: &ComputeClient<R>,
+    a: &Handle,
+    a_sc: &Handle,
+    wmap: &Handle,
+    wmap_bytes: usize,
+    blk: &BlockPlanDev,
+    off: &Handle,
+    scale2: &Handle,
+    slots: usize,
+    m_total: usize,
+    k: usize,
+    n: usize,
+) -> Handle {
+    fp4_linear_grouped_launch_as::<half::bf16, R>(
+        client, a, a_sc, wmap, wmap_bytes, blk, off, scale2, slots, m_total, k, n,
+    )
+}
+
+/// [`fp4_linear_grouped_launch`] at a named output element type.
+#[allow(clippy::too_many_arguments)]
+fn fp4_linear_grouped_launch_as<O: Scalar + Cast + CubeElement, R: Runtime>(
     client: &ComputeClient<R>,
     a: &Handle,
     a_sc: &Handle,
@@ -402,7 +500,7 @@ pub fn fp4_linear_grouped_launch<R: Runtime>(
     let nrep = grouped_nrep(n, m_total, blk.rows_real);
     let n_cubes = n / (NTILE * nrep);
 
-    let out = client.empty(m_total * n * core::mem::size_of::<f32>());
+    let out = client.empty(m_total * n * core::mem::size_of::<O>());
     let vs = 32 / e2m1x2::cube_type().size_bits();
     let spr = k / GROUP;
     // The mapping is bound as a flat plane of packed bytes; the kernel indexes
@@ -414,7 +512,7 @@ pub fn fp4_linear_grouped_launch<R: Runtime>(
     let flat_sc = wmap_bytes - wmap_bytes % SCALE_VEC;
 
     unsafe {
-        fp4_linear_grouped::launch::<e2m1x2, e4m3, R>(
+        fp4_linear_grouped::launch::<e2m1x2, e4m3, O, R>(
             client,
             CubeCount::Static(n_cubes as u32, blk.blocks as u32, 1),
             CubeDim::new_1d(32 * blk.planes as u32),
@@ -736,20 +834,14 @@ pub const NREP_TILES: usize = 16;
 /// output element. `tok_rows` is `[n, kmax]` row-major with `tok_cnt[t]` valid
 /// entries in each row, ascending — which is `BTreeMap` expert order, because
 /// that is the order the rows were laid out in.
-///
-/// The gather side of this is a `k`-deep strided read per output element, so
-/// the alternative shape — one thread per INPUT row, atomically adding into the
-/// output — is a real candidate and not a forbidden one; see
-/// [`scatter_weighted_atomic_kernel`] and the measurement in its doc.
-///
 /// The multiply is inside the accumulation, so it contracts to `fma.rn.f32`:
 /// one rounding per term where the lane this replaces takes two. That is the
 /// module doc's subject and it is not an accident of codegen — a `scale_rows`
 /// launch that forced the second rounding was written, measured, and reverted.
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
-fn scatter_weighted_kernel(
-    y: &Array<f32>,
+fn scatter_weighted_kernel<E: Scalar + Cast>(
+    y: &Array<E>,
     wgt: &Array<f32>,
     tok_rows: &Array<u32>,
     tok_cnt: &Array<u32>,
@@ -767,7 +859,7 @@ fn scatter_weighted_kernel(
         for j in 0..kmax {
             if j < cnt {
                 let r = tok_rows[t * kmax + j] as usize;
-                sum += y[r * h + c] * wgt[r];
+                sum += f32::cast_from(y[r * h + c]) * wgt[r];
             }
         }
         out[p] = sum;
@@ -782,20 +874,54 @@ pub fn scatter_weighted<R: Runtime>(
     wgt: &Handle,
     tok_rows: &Handle,
     tok_cnt: &Handle,
-    row_tok: &Handle,
     m_total: usize,
     n: usize,
     h: usize,
     kmax: usize,
 ) -> Handle {
-    if std::env::var("INK_SCATTER").map(|v| v == "atomic").unwrap_or(false) {
-        return scatter_weighted_atomic(client, y, wgt, row_tok, m_total, n, h);
-    }
+    scatter_weighted_as::<f32, R>(client, y, wgt, tok_rows, tok_cnt, m_total, n, h, kmax)
+}
+
+/// The same accumulation over a BF16 `y`.
+///
+/// Widened on the read, so the `sum += y * wgt` that contracts to `fma.rn.f32`
+/// still does. This kernel's output accumulator stays f32; the later residual
+/// add may round the combined stream to its configured storage dtype.
+#[allow(clippy::too_many_arguments)]
+pub fn scatter_weighted_bf16<R: Runtime>(
+    client: &ComputeClient<R>,
+    y: &Handle,
+    wgt: &Handle,
+    tok_rows: &Handle,
+    tok_cnt: &Handle,
+    m_total: usize,
+    n: usize,
+    h: usize,
+    kmax: usize,
+) -> Handle {
+    scatter_weighted_as::<half::bf16, R>(
+        client, y, wgt, tok_rows, tok_cnt, m_total, n, h, kmax,
+    )
+}
+
+/// [`scatter_weighted`] at a named input element type.
+#[allow(clippy::too_many_arguments)]
+fn scatter_weighted_as<E: Scalar + Cast, R: Runtime>(
+    client: &ComputeClient<R>,
+    y: &Handle,
+    wgt: &Handle,
+    tok_rows: &Handle,
+    tok_cnt: &Handle,
+    m_total: usize,
+    n: usize,
+    h: usize,
+    kmax: usize,
+) -> Handle {
     let total = n * h;
     let out = client.empty(total * core::mem::size_of::<f32>());
     let cubes = total.div_ceil(CUBE_SIZE as usize) as u32;
     unsafe {
-        scatter_weighted_kernel::launch_unchecked::<R>(
+        scatter_weighted_kernel::launch_unchecked::<E, R>(
             client,
             CubeCount::new_1d(cubes),
             CubeDim::new_1d(CUBE_SIZE),
@@ -807,103 +933,6 @@ pub fn scatter_weighted<R: Runtime>(
             kmax,
             h,
             total,
-        );
-    }
-    out
-}
-
-/// Zero an `[n]` f32 buffer. The atomic scatter accumulates INTO its output, so
-/// the output has to start at zero, and `client.empty` does not promise that.
-#[cube(launch_unchecked)]
-fn zero_f32_kernel(out: &mut Array<f32>, total: usize) {
-    let p = ABSOLUTE_POS as usize;
-    if p < total {
-        out[p] = f32::new(0.0f32);
-    }
-}
-
-/// The same product as [`scatter_weighted_kernel`], shaped the other way round:
-/// one thread per INPUT element, adding its weighted value into the output
-/// atomically.
-///
-/// The two differ in what they make contiguous. The gather kernel writes each
-/// output element once and reads `cnt` rows `h` apart to do it; this one reads
-/// its input element once, coalesced with its whole warp, and pays an atomic
-/// per term instead. Which wins is a property of `kmax`, `h` and how many rows
-/// collide on one output element, i.e. of the routing — so it is measured, not
-/// argued. `INK_SCATTER=atomic` selects it.
-///
-/// **Measured on this box, and it does not pay.** Layers 0:8, `INK_ALIGN_COPY=1`,
-/// p50 of `pass_ms` over 24 warm passes:
-///
-///   512-token prefill    gather 339.8 ms   atomic 339.7 ms
-///   decode, INK_KV=1     gather  46.4 ms   atomic  46.9 ms
-///
-/// Both differences are far inside the 2-3 ms run-to-run drift of one binary.
-/// The arm stays because a negative with a number is worth keeping and because
-/// the routing that makes it negative is not a constant of the model — a
-/// heavier `kmax` or a narrower `h` moves the balance — but the gather kernel
-/// stays the default.
-///
-/// An atomic float add reassociates the sum, so the two arms produce different
-/// argmaxes on some positions. That is allowed and it is not what decides
-/// between them: see the module doc's yardstick — this runtime already
-/// disagrees with itself on 8.55% of argmax positions between two runs of the
-/// same binary.
-#[cube(launch_unchecked)]
-fn scatter_weighted_atomic_kernel(
-    y: &Array<f32>,
-    wgt: &Array<f32>,
-    row_tok: &Array<i32>,
-    out: &mut Array<Atomic<f32>>,
-    h: usize,
-    total: usize,
-) {
-    let p = ABSOLUTE_POS as usize;
-    if p < total {
-        let r = p / h;
-        let c = p % h;
-        let t = row_tok[r];
-        // `-1` is an MMA row-tile pad: a row that belongs to no token and whose
-        // output is arithmetic on zeros.
-        if t >= 0 {
-            out[t as usize * h + c].fetch_add(y[p] * wgt[r]);
-        }
-    }
-}
-
-/// Launch [`scatter_weighted_atomic_kernel`], returning the `[n, h]` accumulator.
-#[allow(clippy::too_many_arguments)]
-pub fn scatter_weighted_atomic<R: Runtime>(
-    client: &ComputeClient<R>,
-    y: &Handle,
-    wgt: &Handle,
-    row_tok: &Handle,
-    m_total: usize,
-    n: usize,
-    h: usize,
-) -> Handle {
-    let total = n * h;
-    let out = client.empty(total * core::mem::size_of::<f32>());
-    unsafe {
-        zero_f32_kernel::launch_unchecked::<R>(
-            client,
-            CubeCount::new_1d(total.div_ceil(CUBE_SIZE as usize) as u32),
-            CubeDim::new_1d(CUBE_SIZE),
-            ArrayArg::from_raw_parts(out.clone(), total),
-            total,
-        );
-        let src = m_total * h;
-        scatter_weighted_atomic_kernel::launch_unchecked::<R>(
-            client,
-            CubeCount::new_1d(src.div_ceil(CUBE_SIZE as usize) as u32),
-            CubeDim::new_1d(CUBE_SIZE),
-            ArrayArg::from_raw_parts(y.clone(), src),
-            ArrayArg::from_raw_parts(wgt.clone(), m_total),
-            ArrayArg::from_raw_parts(row_tok.clone(), m_total),
-            ArrayArg::from_raw_parts(out.clone(), total),
-            h,
-            src,
         );
     }
     out

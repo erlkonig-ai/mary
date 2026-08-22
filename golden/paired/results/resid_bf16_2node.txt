@@ -1,0 +1,125 @@
+A BF16 residual stream against an f32 one, and BOTH against the BF16 reference.
+
+Recorded on the archived perf/prefill-resid-pool lineage through 4d6d15f8 and
+retained here as historical evidence. The current integration did not rerun
+this GPU experiment.
+
+Eight generation prompts, 48 tokens each, two-node pipe (layers 0:21 and
+21:42), one binary, three arms:
+
+  wide          INK_ACT_BF16=0 INK_RESID_BF16=0   f32 operands, f32 residual
+  narrow-1      INK_ACT_BF16=1 INK_RESID_BF16=0   BF16 operands, f32 residual
+  narrow-2      INK_ACT_BF16=1                    BF16 operands, BF16 residual
+
+narrow-1 is the lane act_bf16_2node.txt scored. narrow-2 is this change.
+
+=== the reference row that was missing is here ===
+
+act_bf16_2node.txt said, correctly, that its BF16 reference row was absent
+because `inkling_bf16_stream.py` wants torch and neither box had it. It does
+now, and the row costs one stream: 42 layers in 514.5 s, 487.1 GiB off the SSD
+at 0.95 GiB/s, one pass for all eight sequences because a stream is per FORWARD
+and not per prompt.
+
+So the comparison below is no longer only "the two arms against each other".
+Every arm is scored against the unquantised model, on the same ids, in the same
+lane, at the same positions.
+
+=== teacher-forced against the BF16 reference ===
+
+The wide arm's prompt-plus-continuation, run through each arm as one uncached
+forward with INK_ALL_LOGITS=1, and through the reference as one batched stream.
+Every column is an argmax at the same position of the same sequence.
+
+item              n   ref vs wide   ref vs narrow-1   ref vs narrow-2
+gen-prose        48      43/48           45/48             44/48
+gen-explain      48      45/48           43/48             45/48
+gen-arith        48      44/48           43/48             45/48
+gen-code         48      48/48           48/48             47/48
+gen-list         48      47/48           47/48             48/48
+gen-dialogue     48      42/48           45/48             42/48
+gen-defn         48      46/48           45/48             45/48
+gen-recipe       48      46/48           46/48             47/48
+
+  BF16 reference vs wide      361/384 = 94.0%  [95% CI 91.2-96.0]
+  BF16 reference vs narrow-1  362/384 = 94.3%  [95% CI 91.5-96.2]
+  BF16 reference vs narrow-2  363/384 = 94.5%  [95% CI 91.8-96.4]
+
+  floor: the wide arm's own uncached forward against its own cached
+  generation  363/384 = 94.5%  [95% CI 91.8-96.4]
+
+The three arms are 361, 362 and 363 of 384. Their intervals lie almost exactly
+on top of each other, and the widest gap between them is two positions. What
+this says is that NONE of the three is measurably further from the unquantised
+model than the others, and that all three are as far from it as our own two
+lanes are from each other.
+
+It does NOT say the BF16 residual stream is the best of the three because it
+scored highest. Two positions out of 384 is noise, and reading an ordering out
+of it would be exactly the overclaim the floor line exists to prevent.
+
+=== the two narrow arms against the wide one, same lane, same ids ===
+
+item              n   narrow-2 vs wide   narrow-2 vs narrow-1
+gen-prose        49        48/49                47/49
+gen-explain      49        47/49                45/49
+gen-arith        49        48/49                47/49
+gen-code         49        48/49                48/49
+gen-list         49        48/49                48/49
+gen-dialogue     49        44/49                43/49
+gen-defn         49        47/49                48/49
+gen-recipe       49        48/49                48/49
+
+  narrow-2 vs wide      378/392 = 96.4%  [95% CI 94.1-97.9]
+  narrow-2 vs narrow-1  374/392 = 95.4%  [95% CI 92.9-97.1]
+
+(392 and not 384: this table scores the last PROMPT position as well, whose
+argmax is the first generated token. The reference table above starts one
+position later because that is where `gen_divergence.compare` starts.)
+
+96.4% is the number the bar was set at. act_bf16_2node.txt accepted narrow-1
+at 94.3% against a 94.5% floor -- i.e. the change moved the model no further
+than our two lanes already move each other. narrow-2 against wide is 96.4%,
+which is ABOVE that floor rather than merely inside it: the BF16 residual
+stream disagrees with f32 less often than our cached lane disagrees with our
+uncached one.
+
+=== free generation, arm against arm ===
+
+item              n   agree   first divergence
+gen-prose        48  12/48         at token 12
+gen-explain      48  39/48         at token 31
+gen-arith        48   5/48          at token 5
+gen-code         48  48/48                none
+gen-list         48   4/48          at token 4
+gen-dialogue     48   7/48          at token 6
+gen-defn         48  12/48         at token 12
+gen-recipe       48  48/48                none
+
+  per-token agreement: 175/384 = 45.6%  [95% CI 40.7-50.6]
+  sequences identical all the way through: 2/8
+  first divergence, when it happens: median token 12, range 4..31
+
+The 45.6% is not a capability number and is not offered as one: after the first
+flip the two continuations are conditioned on different text and the comparison
+stops being about the model. The columns worth reading are the last two, and
+they are better than narrow-1's were -- median first divergence 12 against 5,
+two sequences identical against one -- against a BF16 KV cache that was accepted
+at median token 8.
+
+Eight sequences is a small sample for a median, so this is a "not worse",
+not a "better".
+
+=== what this does not say ===
+
+Eight sequences and 384 positions will not detect a small regression. Three
+intervals that overlap this completely cannot order the arms; they can only say
+that no arm is distinguishable from the others at this sample size, and that
+every arm sits at the distance from the reference that our own implementation's
+two lanes already sit from each other.
+
+The reference is BF16, not f64, and there is deliberately no f64 lane to
+compare against: the host f64 references were removed, and numerical delta is
+not the bar here. What the reference gives is the model's own answer at each
+position, which is a capability question, and it is the only question this
+directory asks.

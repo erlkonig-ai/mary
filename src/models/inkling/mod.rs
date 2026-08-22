@@ -43,6 +43,15 @@ pub mod pile;
 // bytes. Two functions; it is what lets the residual stream stay on the device
 // across a lane boundary that is a dialect boundary and nothing more.
 pub mod seam;
+// Which memory pool a prefill wants, and when to hand its pages back. The
+// per-buffer cap is `budget`; this is the other thing the allocator does, which
+// is to reserve three to five times what the prefill holds.
+pub mod pool;
+// The residual stream: the switch that decides its dtype, and the two kernels
+// -- the residual add and RMS normalization -- that let it be BF16 without
+// widening back at every seam. It was the last wide storage in an otherwise
+// narrow layer: 48 KiB a token across its three f32 buffers, halved at BF16.
+pub mod resid;
 // The short convolution's decode step, as one kernel instead of nineteen Burn
 // ops. Four run per layer and they were a third of every launch in a decode
 // step; the arithmetic is 16384 multiply-adds.

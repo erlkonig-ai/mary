@@ -30,14 +30,14 @@
 //! The dense lane now blocks its QUERIES: it allocates `[heads, rows, tokens]`
 //! for one block at a time, with `rows` chosen by [`query_block`] against a
 //! byte budget rather than by the sequence. That term is bounded, so what binds
-//! instead is the largest term still linear in the sequence -- the
-//! `[heads, tokens, head_dim]` f32 the projections and the expansion produce,
-//! `tokens * 16 KiB` for this model. Under the same 29.9 GiB cap that is a
-//! ceiling near two million tokens, and the run will exhaust node memory long
-//! before it gets there. [`check`] therefore tests the max of the two, not the
-//! score matrix alone.
+//! instead is the largest term still linear in the sequence. The routed lane's
+//! grouped buffers are `top_k * hidden` elements per token; they are 96 KiB a
+//! token at f32 on this model and half that on its BF16 storage lane. A local
+//! layer's relative table remains f32 at 64 KiB a token. [`check`] tests every
+//! configured candidate rather than naming one historical dtype as universal.
 
 use crate::models::inkling::config::{AttnKind, InklingTextConfig};
+use crate::models::inkling::pool::AllocatorConfig;
 use anyhow::Result;
 use cubecl::prelude::{ComputeClient, Runtime};
 
@@ -50,6 +50,134 @@ use cubecl::prelude::{ComputeClient, Runtime};
 const MATMUL_ROW_ALIGN: usize = 64;
 
 const GIB: f64 = (1u64 << 30) as f64;
+
+/// Width of one stored floating-point activation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageDType {
+    F32,
+    Bf16,
+}
+
+/// The routed implementation whose live set admission must price.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutedLane {
+    /// Packed NVFP4 weights through the grouped lane (or its wide diagnostic
+    /// form), with staging buffers stored at the named width.
+    Packed(StorageDType),
+    /// The checkpoint's plain-BF16 expert layer. Its MMA inputs are BF16, but
+    /// its gather and three accumulator outputs are f32 and its live set is not
+    /// the packed lane's with a different element width.
+    PlainBf16,
+}
+
+impl StorageDType {
+    pub const fn bytes(self) -> u64 {
+        match self {
+            Self::F32 => 4,
+            Self::Bf16 => 2,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::Bf16 => "BF16",
+        }
+    }
+
+    const fn from_bf16(on: bool) -> Self {
+        if on {
+            Self::Bf16
+        } else {
+            Self::F32
+        }
+    }
+}
+
+/// Every run-time choice that changes admission arithmetic.
+///
+/// Passed as a value so the startup-copy gate, per-buffer check and tests all
+/// price one configuration. None of the pure accounting below reads an env
+/// switch or a process-global `OnceLock`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmissionPolicy {
+    pub allocator: AllocatorConfig,
+    pub activation: StorageDType,
+    pub residual: StorageDType,
+    pub cache: StorageDType,
+    wide_routed_layers: u128,
+    plain_bf16_layers: u128,
+}
+
+impl AdmissionPolicy {
+    pub const fn new(
+        allocator: AllocatorConfig,
+        activation: StorageDType,
+        residual: StorageDType,
+        cache: StorageDType,
+    ) -> Self {
+        Self {
+            allocator,
+            activation,
+            residual,
+            cache,
+            wide_routed_layers: 0,
+            plain_bf16_layers: 0,
+        }
+    }
+
+    /// Capture all process-global lane switches once, before admission.
+    pub fn runtime(allocator: AllocatorConfig) -> Self {
+        Self::new(
+            allocator,
+            StorageDType::from_bf16(super::burn::act_bf16()),
+            StorageDType::from_bf16(super::resid::resid_bf16()),
+            StorageDType::from_bf16(super::burn::attn_bf16()),
+        )
+    }
+
+    /// Record a packed routed layer forced onto its f32 diagnostic/fallback
+    /// storage. The ordinary grouped NVFP4 lane uses the configured activation
+    /// width instead.
+    pub fn with_wide_routed_layer(mut self, layer: usize) -> Self {
+        assert!(
+            layer < u128::BITS as usize,
+            "layer {layer} exceeds the admission mask"
+        );
+        self.wide_routed_layers |= 1u128 << layer;
+        self.plain_bf16_layers &= !(1u128 << layer);
+        self
+    }
+
+    /// Record the source-selected plain-BF16 expert implementation.
+    pub fn with_plain_bf16_layer(mut self, layer: usize) -> Self {
+        assert!(
+            layer < u128::BITS as usize,
+            "layer {layer} exceeds the admission mask"
+        );
+        self.plain_bf16_layers |= 1u128 << layer;
+        self.wide_routed_layers &= !(1u128 << layer);
+        self
+    }
+
+    pub const fn routed_lane(self, layer: usize) -> RoutedLane {
+        if layer < u128::BITS as usize && self.plain_bf16_layers & (1u128 << layer) != 0 {
+            RoutedLane::PlainBf16
+        } else {
+            RoutedLane::Packed(self.routed(layer))
+        }
+    }
+
+    pub const fn routed(self, layer: usize) -> StorageDType {
+        if layer < u128::BITS as usize
+            && (self.wide_routed_layers | self.plain_bf16_layers) & (1u128 << layer) != 0
+        {
+            StorageDType::F32
+        } else {
+            self.activation
+        }
+    }
+}
 
 /// Bytes in one `[heads, rows, tokens]` f32 score block, padding included.
 ///
@@ -172,16 +300,30 @@ pub fn largest_allocation<R: Runtime>(client: &ComputeClient<R>) -> u64 {
     client.properties().memory.max_page_size
 }
 
-/// Bytes in one `[heads, tokens, head_dim]` f32 activation.
+/// Bytes in one stored `[heads, tokens, head_dim]` activation.
 ///
 /// Q, the GQA-expanded K and V, K again transposed, and the concatenated output
 /// are all this shape, and with the score block bounded they are the largest
-/// buffers a global layer asks for. `tokens * 16 KiB` on this model.
-pub fn activation_bytes(heads: usize, head_dim: usize, tokens: usize) -> u64 {
-    heads as u64 * tokens as u64 * head_dim as u64 * core::mem::size_of::<f32>() as u64
+/// buffers a global layer asks for. At f32 that is `tokens * 16 KiB` on this
+/// model; the BF16 storage lane halves it.
+pub fn activation_bytes(
+    heads: usize,
+    head_dim: usize,
+    tokens: usize,
+    dtype: StorageDType,
+) -> u64 {
+    heads as u64 * tokens as u64 * head_dim as u64 * dtype.bytes()
 }
 
-/// The floor cubecl's page ladder puts under any run that allocates at all.
+/// The floor cubecl's SubSlices page ladder puts under this workload.
+///
+/// SubSlices derives this charge directly from its two largest page-ladder
+/// rungs. ExclusivePages has no fixed ladder, but its reservation is
+/// path-dependent and the aggregate model here does not carry the ordered
+/// request trace needed to prove a smaller bound, so admission conservatively
+/// retains the same charge. The measurements below are historical SubSlices
+/// evidence; [`super::pool`] records the smaller ExclusivePages measurements
+/// and why they are not yet a safe bound.
 ///
 /// # A pool hands out slices of a WHOLE page, and keeps the page
 ///
@@ -234,21 +376,8 @@ pub fn activation_bytes(heads: usize, head_dim: usize, tokens: usize) -> u64 {
 /// runtime derives from the device, which is why it is a fraction of the
 /// machine and not a constant: the two nodes this runs on differ by 2 GiB and
 /// their page ladders differ with them.
-pub fn pool_page_floor(machine: u64) -> u64 {
-    machine / 4 + machine / 16
-}
-
-/// One element of a KV cache, in bytes.
-///
-/// Read from [`super::burn::attn_bf16`] rather than assumed, because the cache
-/// dtype is an env switch and a gate that priced a BF16 cache at f32 would
-/// refuse ranges that fit.
-fn cache_elem_bytes() -> u64 {
-    if super::burn::attn_bf16() {
-        2
-    } else {
-        4
-    }
+pub fn pool_page_floor(policy: AdmissionPolicy, machine: u64) -> u64 {
+    policy.allocator.admission_floor(machine)
 }
 
 /// What ONE attention layer holds in activations at this sequence length.
@@ -265,19 +394,22 @@ fn cache_elem_bytes() -> u64 {
 ///   a token on this model, four times Q and the largest single activation
 ///   outside the MoE lane. It is what the band reads instead of a square.
 /// * a GLOBAL layer materialises Q, K^T and V contiguously ahead of its block
-///   loop -- three `[heads, tokens, head_dim]` f32 -- and accumulates the
-///   blocks' outputs before concatenating them. Its score blocks are
+///   loop -- three `[heads, tokens, head_dim]` buffers in the activation
+///   storage dtype -- and accumulates the blocks' outputs before concatenating
+///   them. Its score blocks are
 ///   [`prefill_peak_bytes`], counted here because they are live inside this
 ///   layer and nowhere else.
 pub fn attention_activation_bytes(
     t: &InklingTextConfig,
     kind: AttnKind,
     tokens: usize,
+    policy: AdmissionPolicy,
 ) -> u64 {
     let (heads, kv_heads, head_dim) = t.heads(kind);
     let n = tokens as u64;
     let f32b = core::mem::size_of::<f32>() as u64;
     let q = n * (heads * head_dim) as u64 * f32b;
+    let q_stored = n * (heads * head_dim) as u64 * policy.activation.bytes();
     let kv = n * (kv_heads * head_dim) as u64 * f32b;
     let rel_proj = n * (heads * t.d_rel) as u64 * f32b;
     let hidden = n * t.hidden_size as u64 * f32b;
@@ -298,9 +430,23 @@ pub fn attention_activation_bytes(
             // Q, K^T and V made contiguous once ahead of the loop; the blocks'
             // outputs, which together are one whole sequence; their
             // concatenation; and `w_o`'s output.
-            projections + 3 * q + 2 * q + hidden + prefill_peak_bytes(heads, tokens)
+            projections + 3 * q_stored + 2 * q + hidden + prefill_peak_bytes(heads, tokens)
         }
     }
+}
+
+/// Upper bound on the grouped row plan after its per-expert M-tile padding.
+///
+/// Routing has not run at admission time, so the exact number of active
+/// experts is unknown. There can be at most one active expert per routed row
+/// and at most `n_routed_experts` of them; each may contribute fifteen padding
+/// rows to the 16-row MMA tile. Packed accounting predates this bound and stays
+/// byte-identical for the wide/SubSlices control, while the new source-specific
+/// plain-BF16 live set uses the honest padded maximum.
+fn max_padded_routed_rows(t: &InklingTextConfig, tokens: usize) -> u64 {
+    let rows = tokens as u64 * t.num_experts_per_tok as u64;
+    let active = rows.min(t.n_routed_experts as u64);
+    rows + (super::fp4gemm::MTILE as u64 - 1) * active
 }
 
 /// What ONE MLP holds in activations at this sequence length.
@@ -318,23 +464,55 @@ pub fn attention_activation_bytes(
 /// `2 * n_shared * intermediate_size` against the routed lane's
 /// `top_k * 2 * intermediate_size` -- so the routed lane is the peak and this
 /// does not count them twice.
-pub fn mlp_activation_bytes(t: &InklingTextConfig, layer: usize, tokens: usize) -> u64 {
+///
+/// The checkpoint's one plain-BF16 expert layer is a separate live set rather
+/// than a packed layer spelled at f32: it widens a narrow residual for its f32
+/// gather, casts that gather to the BF16 MMA input, retains f32 accumulator
+/// outputs around one BF16 activation, and has no NVFP4 code/scale buffers.
+pub fn mlp_activation_bytes(
+    t: &InklingTextConfig,
+    layer: usize,
+    tokens: usize,
+    policy: AdmissionPolicy,
+) -> u64 {
     let n = tokens as u64;
     let f32b = core::mem::size_of::<f32>() as u64;
+    let actb = policy.activation.bytes();
     let hidden = t.hidden_size as u64;
     if t.is_dense(layer) {
         let i = t.dense_intermediate_size as u64;
         // The gate and the up projection, the activation and the gated
         // product, then the down projection's output and its scaling.
-        n * (4 * i + 2 * hidden) * f32b
+        n * (4 * i * actb + 2 * hidden * f32b)
+    } else if policy.routed_lane(layer) == RoutedLane::PlainBf16 {
+        let i = t.intermediate_size as u64;
+        let m = max_padded_routed_rows(t, tokens);
+        // `grouped_experts_bf16`: a narrow normed residual is widened for the
+        // f32 gather; that gathered input is cast to the BF16 MMA operand; the
+        // fused gate/up and down projection are f32 accumulators, with one
+        // BF16 gated activation between them; scatter accumulates into f32.
+        // Every named handle remains in the function's scope together.
+        let widened = if policy.residual == StorageDType::Bf16 {
+            n * hidden * f32b
+        } else {
+            0
+        };
+        let gathered = m * hidden * f32b;
+        let mma_input = m * hidden * StorageDType::Bf16.bytes();
+        let w13 = m * 2 * i * f32b;
+        let act = m * i * StorageDType::Bf16.bytes();
+        let down = m * hidden * f32b;
+        let scattered = n * hidden * f32b;
+        widened + gathered + mma_input + w13 + act + down + scattered
     } else {
+        let actb = policy.routed(layer).bytes();
         let i = t.intermediate_size as u64;
         let m = n * t.num_experts_per_tok as u64;
-        let gathered = m * hidden * f32b;
+        let gathered = m * hidden * actb;
         // Gate and up arrive in one buffer, so `2 * i` wide.
-        let w13 = m * 2 * i * f32b;
-        let act = m * i * f32b;
-        let down = m * hidden * f32b;
+        let w13 = m * 2 * i * actb;
+        let act = m * i * actb;
+        let down = m * hidden * actb;
         // NVFP4 is a nibble a value plus one E4M3 scale per group of sixteen,
         // and both GEMM inputs are quantised.
         let packed = (m * hidden + m * i) / 2 + (m * hidden + m * i) / 16;
@@ -367,11 +545,11 @@ pub fn prefill_activation_bytes(
     t: &InklingTextConfig,
     layers: core::ops::Range<usize>,
     tokens: usize,
+    policy: AdmissionPolicy,
 ) -> u64 {
     let n = tokens as u64;
-    let f32b = core::mem::size_of::<f32>() as u64;
-    let carried = 2 * n * t.hidden_size as u64 * f32b;
-    let elem = cache_elem_bytes();
+    let carried = 2 * n * t.hidden_size as u64 * policy.residual.bytes();
+    let elem = policy.cache.bytes();
     let caches: u64 = layers
         .clone()
         .map(|l| {
@@ -386,8 +564,8 @@ pub fn prefill_activation_bytes(
         .sum();
     let widest = layers
         .map(|l| {
-            attention_activation_bytes(t, t.attn_kind(l), tokens)
-                .max(mlp_activation_bytes(t, l, tokens))
+            attention_activation_bytes(t, t.attn_kind(l), tokens, policy)
+                .max(mlp_activation_bytes(t, l, tokens, policy))
         })
         .max()
         .unwrap_or(0);
@@ -409,8 +587,10 @@ pub fn prefill_activation_bytes(
 ///
 /// * the routed-expert lane stacks every token's `num_experts_per_tok` rows
 ///   into ONE buffer per stage, so its gather and both its GEMM outputs are
-///   `top_k * hidden` f32 a token: 96 KiB here, six times the activation this
-///   used to call the largest;
+///   `top_k * hidden` elements a token: 96 KiB at f32 here, six times the
+///   activation this used to call the largest. Packed grouped layers use the
+///   configured activation width; source-selected BF16 and fallback layers
+///   remain f32;
 /// * a local layer builds its relative-position table for the whole sequence,
 ///   `[tokens, heads, sliding_window_size]` f32, 64 KiB a token.
 ///
@@ -422,6 +602,7 @@ pub fn largest_buffer(
     t: &InklingTextConfig,
     layers: core::ops::Range<usize>,
     tokens: usize,
+    policy: AdmissionPolicy,
 ) -> u64 {
     let n = tokens as u64;
     let f32b = core::mem::size_of::<f32>() as u64;
@@ -429,7 +610,7 @@ pub fn largest_buffer(
         .map(|l| {
             let kind = t.attn_kind(l);
             let (heads, _, head_dim) = t.heads(kind);
-            let act = activation_bytes(heads, head_dim, tokens);
+            let act = activation_bytes(heads, head_dim, tokens, policy.activation);
             let attn = match kind {
                 AttnKind::Local => {
                     let eff = t.rel_span(kind).min(tokens) as u64;
@@ -441,11 +622,18 @@ pub fn largest_buffer(
             };
             let mlp = if t.is_dense(l) {
                 // The gate and the up projection are separate linears.
-                n * t.dense_intermediate_size as u64 * f32b
+                n * t.dense_intermediate_size as u64 * policy.activation.bytes()
             } else {
-                let m = n * t.num_experts_per_tok as u64;
-                (m * t.hidden_size as u64 * f32b)
-                    .max(m * 2 * t.intermediate_size as u64 * f32b)
+                let (m, routed) = match policy.routed_lane(l) {
+                    RoutedLane::PlainBf16 => {
+                        (max_padded_routed_rows(t, tokens), StorageDType::F32.bytes())
+                    }
+                    RoutedLane::Packed(dtype) => {
+                        (n * t.num_experts_per_tok as u64, dtype.bytes())
+                    }
+                };
+                (m * t.hidden_size as u64 * routed)
+                    .max(m * 2 * t.intermediate_size as u64 * routed)
             };
             attn.max(mlp)
         })
@@ -462,11 +650,12 @@ pub fn longest_sequence(
     t: &InklingTextConfig,
     layers: core::ops::Range<usize>,
     cap: u64,
+    policy: AdmissionPolicy,
 ) -> usize {
     let (mut lo, mut hi) = (0usize, 1usize << 24);
     while lo < hi {
         let mid = (lo + hi).div_ceil(2);
-        if largest_buffer(t, layers.clone(), mid) <= cap {
+        if largest_buffer(t, layers.clone(), mid, policy) <= cap {
             lo = mid;
         } else {
             hi = mid - 1;
@@ -482,19 +671,26 @@ pub fn check<R: Runtime>(
     t: &InklingTextConfig,
     layers: core::ops::Range<usize>,
     tokens: usize,
+    policy: AdmissionPolicy,
 ) -> Result<()> {
     let (first, last) = (layers.start, layers.end);
     let heads = t.heads(AttnKind::Global).0.max(t.heads(AttnKind::Local).0);
     let rows = query_block(heads, tokens);
     let scores = score_block_bytes(heads, rows, tokens);
-    let want = largest_buffer(t, layers.clone(), tokens);
+    let routed_dtype = layers
+        .clone()
+        .filter(|&layer| !t.is_dense(layer))
+        .map(|layer| policy.routed(layer))
+        .max_by_key(|dtype| dtype.bytes())
+        .unwrap_or(policy.activation);
+    let want = largest_buffer(t, layers.clone(), tokens, policy);
     let cap = largest_allocation(client);
     anyhow::ensure!(
         want <= cap,
         "{tokens} tokens over layers {}..{} needs a single {:.2} GiB buffer -- the widest of a \
          [{heads}, {rows}, {tokens}] f32 score block ({:.2} GiB), a local layer's \
          [{tokens}, {heads}, {}] f32 relative table and the routed lane's \
-         [{tokens} x {}, {}] f32 stack -- and this device refuses any single allocation over \
+         [{tokens} x {}, {}] {} stack -- and this device refuses any single allocation over \
          {cap} bytes ({:.2} GiB).\n  \
          That cap is cuDeviceTotalMem / 4 and free memory does not raise it. The longest \
          sequence whose buffers fit is {} tokens.\n  \
@@ -508,8 +704,9 @@ pub fn check<R: Runtime>(
         t.sliding_window_size,
         t.num_experts_per_tok,
         t.hidden_size,
+        routed_dtype.name(),
         cap as f64 / GIB,
-        longest_sequence(t, layers, cap),
+        longest_sequence(t, layers, cap, policy),
     );
     Ok(())
 }
@@ -519,9 +716,29 @@ mod tests {
     use super::{
         activation_bytes, attention_activation_bytes, largest_buffer, longest_sequence,
         mlp_activation_bytes, prefill_activation_bytes, prefill_peak_bytes, query_block,
-        score_block_bytes, score_matrix_bytes, QUERY_BLOCK_BYTES,
+        score_block_bytes, score_matrix_bytes, AdmissionPolicy, RoutedLane, StorageDType,
+        QUERY_BLOCK_BYTES,
     };
     use crate::models::inkling::config::{AttnKind, InklingTextConfig};
+    use crate::models::inkling::pool::AllocatorConfig;
+
+    fn wide() -> AdmissionPolicy {
+        AdmissionPolicy::new(
+            AllocatorConfig::SubSlices,
+            StorageDType::F32,
+            StorageDType::F32,
+            StorageDType::Bf16,
+        )
+    }
+
+    fn narrow() -> AdmissionPolicy {
+        AdmissionPolicy::new(
+            AllocatorConfig::ExclusivePages,
+            StorageDType::Bf16,
+            StorageDType::Bf16,
+            StorageDType::Bf16,
+        )
+    }
 
     /// The 42-layer release, from its own `config.json`.
     ///
@@ -576,7 +793,7 @@ mod tests {
         let spread = (a.max(b) - a.min(b)) as f64 / a as f64;
         assert!(spread < 0.05, "the old term moved {spread:.3} across the ladder");
 
-        let new = |n| prefill_activation_bytes(&t, 0..8, n);
+        let new = |n| prefill_activation_bytes(&t, 0..8, n, wide());
         let ratio = new(100_623) as f64 / new(16_384) as f64;
         // Not 6.14x, and the shortfall is not sloppiness: at 16,384 tokens the
         // widest layer is still the GLOBAL one, whose two score blocks are 8
@@ -610,10 +827,10 @@ mod tests {
     fn the_moe_lane_is_the_widest_layer() {
         let t = small();
         let n = 81_920;
-        let moe = mlp_activation_bytes(&t, 5, n);
-        let dense = mlp_activation_bytes(&t, 0, n);
-        let local = attention_activation_bytes(&t, AttnKind::Local, n);
-        let global = attention_activation_bytes(&t, AttnKind::Global, n);
+        let moe = mlp_activation_bytes(&t, 5, n, wide());
+        let dense = mlp_activation_bytes(&t, 0, n, wide());
+        let local = attention_activation_bytes(&t, AttnKind::Local, n, wide());
+        let global = attention_activation_bytes(&t, AttnKind::Global, n, wide());
         assert!(moe > dense, "MoE {moe} vs dense MLP {dense}");
         assert!(moe > global, "MoE {moe} vs global attention {global}");
         assert!(moe > local, "MoE {moe} vs local attention {local}");
@@ -634,13 +851,15 @@ mod tests {
     fn a_local_layer_pays_for_its_whole_relative_table() {
         let t = small();
         let n = 65_536;
-        let local = attention_activation_bytes(&t, AttnKind::Local, n);
+        let local = attention_activation_bytes(&t, AttnKind::Local, n, wide());
         let rel = n as u64 * 32 * 512 * 4;
         assert!(local > rel, "a local layer charges {local}, under its {rel}-byte table");
         // A sequence shorter than the window cannot reach past it, so the table
         // is `tokens` wide and not `sliding_window_size` wide -- which shows up
         // as a lower charge PER TOKEN, the total being linear either way.
-        let rate = |n: usize| attention_activation_bytes(&t, AttnKind::Local, n) as f64 / n as f64;
+        let rate = |n: usize| {
+            attention_activation_bytes(&t, AttnKind::Local, n, wide()) as f64 / n as f64
+        };
         assert!(
             rate(128) < rate(n) * 0.7,
             "128 tokens cost {:.0} a token against {:.0} at {n}; the table did not shrink",
@@ -655,16 +874,187 @@ mod tests {
     fn the_range_moves_the_caches_and_not_the_working_set() {
         let t = small();
         let n = 32_768;
-        let eight = prefill_activation_bytes(&t, 0..8, n);
-        let twenty = prefill_activation_bytes(&t, 0..20, n);
+        let eight = prefill_activation_bytes(&t, 0..8, n, wide());
+        let twenty = prefill_activation_bytes(&t, 0..20, n, wide());
         assert!(twenty > eight, "a longer range charged less");
         // Twelve more layers, two of them global, so what grows is the caches
         // and nothing else -- far under twelve working sets.
-        let widest = mlp_activation_bytes(&t, 5, n);
+        let widest = mlp_activation_bytes(&t, 5, n, wide());
         assert!(
             twenty - eight < widest,
             "twelve more layers added {} bytes, more than one whole layer's working set",
             twenty - eight
+        );
+    }
+
+    #[test]
+    fn wide_policy_is_the_previous_f32_accounting_byte_for_byte() {
+        let t = small();
+        let n = 32_768usize;
+        let nu = n as u64;
+        let f32b = 4u64;
+        let (heads, kv_heads, head_dim) = t.heads(AttnKind::Global);
+        let q = nu * (heads * head_dim) as u64 * f32b;
+        let kv = nu * (kv_heads * head_dim) as u64 * f32b;
+        let rel_proj = nu * (heads * t.d_rel) as u64 * f32b;
+        let hidden = nu * t.hidden_size as u64 * f32b;
+        let old_global = q
+            + 4 * kv
+            + rel_proj
+            + 3 * q
+            + 2 * q
+            + hidden
+            + prefill_peak_bytes(heads, n);
+        assert_eq!(
+            attention_activation_bytes(&t, AttnKind::Global, n, wide()),
+            old_global
+        );
+
+        let i = t.dense_intermediate_size as u64;
+        assert_eq!(
+            mlp_activation_bytes(&t, 0, n, wide()),
+            nu * (4 * i + 2 * t.hidden_size as u64) * f32b
+        );
+        let old_dense = nu * (4 * i + 2 * t.hidden_size as u64) * f32b;
+
+        let m = nu * t.num_experts_per_tok as u64;
+        let i = t.intermediate_size as u64;
+        let h = t.hidden_size as u64;
+        let packed = (m * h + m * i) / 2 + (m * h + m * i) / 16;
+        let old_moe = m * h * f32b
+            + m * 2 * i * f32b
+            + m * i * f32b
+            + m * h * f32b
+            + packed
+            + nu * h * f32b;
+        assert_eq!(mlp_activation_bytes(&t, 5, n, wide()), old_moe);
+
+        let local_rel = nu * heads as u64 * t.sliding_window_size as u64 * f32b;
+        let old_local = q + 4 * kv + rel_proj + local_rel + kv + q + hidden;
+        let old_widest = old_global.max(old_local).max(old_dense).max(old_moe);
+        let old_caches: u64 = (0..8)
+            .map(|layer| {
+                let kind = t.attn_kind(layer);
+                let (_, kv_heads, head_dim) = t.heads(kind);
+                let keep = match kind {
+                    AttnKind::Local => t.sliding_window_size.min(n),
+                    AttnKind::Global => n,
+                } as u64;
+                2 * keep * (kv_heads * head_dim) as u64 * 2
+            })
+            .sum();
+        let old_prefill = 2 * nu * h * f32b + old_caches + old_widest;
+        assert_eq!(prefill_activation_bytes(&t, 0..8, n, wide()), old_prefill);
+
+        let old_largest = q
+            .max(local_rel)
+            .max(score_block_bytes(heads, query_block(heads, n), n))
+            .max(nu * t.dense_intermediate_size as u64 * f32b)
+            .max(m * h * f32b)
+            .max(m * 2 * i * f32b);
+        assert_eq!(largest_buffer(&t, 0..8, n, wide()), old_largest);
+
+        let machine = 128 << 30;
+        assert_eq!(super::pool_page_floor(wide(), machine), machine / 4 + machine / 16);
+    }
+
+    #[test]
+    fn narrow_policy_only_halves_buffers_the_lane_stores_narrow() {
+        let t = small();
+        let n = 32_768usize;
+        let (heads, _, head_dim) = t.heads(AttnKind::Global);
+        let q_elements = heads as u64 * n as u64 * head_dim as u64;
+        let global_wide = attention_activation_bytes(&t, AttnKind::Global, n, wide());
+        let global_narrow = attention_activation_bytes(&t, AttnKind::Global, n, narrow());
+        assert_eq!(global_wide - global_narrow, 3 * q_elements * 2);
+
+        // The local raw kernels still index f32 buffers; the activation switch
+        // does not narrow any term in that arm.
+        assert_eq!(
+            attention_activation_bytes(&t, AttnKind::Local, n, wide()),
+            attention_activation_bytes(&t, AttnKind::Local, n, narrow())
+        );
+
+        assert!(mlp_activation_bytes(&t, 0, n, narrow()) < mlp_activation_bytes(&t, 0, n, wide()));
+        assert!(mlp_activation_bytes(&t, 5, n, narrow()) < mlp_activation_bytes(&t, 5, n, wide()));
+        assert!(
+            prefill_activation_bytes(&t, 0..8, n, narrow())
+                < prefill_activation_bytes(&t, 0..8, n, wide())
+        );
+        assert_eq!(super::pool_page_floor(narrow(), 128 << 30), 40 << 30);
+    }
+
+    #[test]
+    fn packed_fallback_widens_only_the_selected_routed_layer() {
+        let t = small();
+        let n = 81_920usize;
+        let fallback_wide = narrow().with_wide_routed_layer(5);
+
+        assert_eq!(
+            mlp_activation_bytes(&t, 5, n, fallback_wide),
+            mlp_activation_bytes(&t, 5, n, wide()),
+        );
+        assert_eq!(
+            largest_buffer(&t, 5..6, n, fallback_wide),
+            largest_buffer(&t, 5..6, n, wide()),
+        );
+        assert_eq!(
+            mlp_activation_bytes(&t, 6, n, fallback_wide),
+            mlp_activation_bytes(&t, 6, n, narrow()),
+            "marking one source-selected layer must not widen its neighbours",
+        );
+    }
+
+    #[test]
+    fn plain_bf16_source_prices_its_own_live_set() {
+        let t = small();
+        let n = 42_000usize;
+        let nu = n as u64;
+        let rows = nu * t.num_experts_per_tok as u64;
+        let active = rows.min(t.n_routed_experts as u64);
+        let m = rows + 15 * active;
+        let h = t.hidden_size as u64;
+        let i = t.intermediate_size as u64;
+        let policy = narrow().with_plain_bf16_layer(5);
+        assert_eq!(policy.routed_lane(5), RoutedLane::PlainBf16);
+
+        let actual = nu * h * 4
+            + m * h * 4
+            + m * h * 2
+            + m * 2 * i * 4
+            + m * i * 2
+            + m * h * 4
+            + nu * h * 4;
+        assert_eq!(mlp_activation_bytes(&t, 5, n, policy), actual);
+        assert_eq!(
+            largest_buffer(&t, 5..6, n, policy),
+            m * 2 * i * 4,
+            "the f32 fused accumulator includes every expert's possible M-tile pad",
+        );
+        assert!(
+            largest_buffer(&t, 5..6, n, policy) > largest_buffer(&t, 5..6, n, wide()),
+            "the source-specific formula must not inherit packed accounting's old unpadded rows",
+        );
+        assert!(
+            actual > mlp_activation_bytes(&t, 5, n, narrow().with_wide_routed_layer(5)),
+            "plain BF16's extra widened residual and MMA input were omitted"
+        );
+        let wide_residual = AdmissionPolicy::new(
+            AllocatorConfig::ExclusivePages,
+            StorageDType::Bf16,
+            StorageDType::F32,
+            StorageDType::Bf16,
+        )
+        .with_plain_bf16_layer(5);
+        assert_eq!(
+            mlp_activation_bytes(&t, 5, n, wide_residual),
+            actual - nu * h * 4,
+            "an already-f32 residual shares its normed buffer with the gather",
+        );
+        assert_eq!(
+            mlp_activation_bytes(&t, 6, n, policy),
+            mlp_activation_bytes(&t, 6, n, narrow()),
+            "marking the source layer must not change its packed neighbour",
         );
     }
 
@@ -700,14 +1090,14 @@ mod tests {
         let t = small();
         for n in [20_000, 35_845, 100_623] {
             let scores = score_block_bytes(HEADS, query_block(HEADS, n), n);
-            let acts = activation_bytes(HEADS, HEAD_DIM, n);
+            let acts = activation_bytes(HEADS, HEAD_DIM, n, StorageDType::F32);
             assert!(
-                largest_buffer(&t, 0..8, n) <= CAP,
+                largest_buffer(&t, 0..8, n, wide()) <= CAP,
                 "{n} tokens would still be refused: scores {scores}, activations {acts}"
             );
         }
         // 15,808 was the ceiling when the whole square was materialised.
-        assert!(largest_buffer(&t, 0..8, 15_809) <= CAP);
+        assert!(largest_buffer(&t, 0..8, 15_809, wide()) <= CAP);
     }
 
     /// The per-buffer ceiling is the MoE lane's, not attention's.
@@ -719,13 +1109,13 @@ mod tests {
     #[test]
     fn bisects_the_boundary() {
         let t = small();
-        let n = longest_sequence(&t, 0..8, CAP);
-        assert!(largest_buffer(&t, 0..8, n) <= CAP);
-        assert!(largest_buffer(&t, 0..8, n + 1) > CAP);
+        let n = longest_sequence(&t, 0..8, CAP, wide());
+        assert!(largest_buffer(&t, 0..8, n, wide()) <= CAP);
+        assert!(largest_buffer(&t, 0..8, n + 1, wide()) > CAP);
         assert!((300_000..350_000).contains(&n), "boundary landed at {n}");
         // A range with no MoE layer in it is bound by something else and its
         // ceiling is genuinely higher, so this is a property of the RANGE.
-        let dense_only = longest_sequence(&t, 0..2, CAP);
+        let dense_only = longest_sequence(&t, 0..2, CAP, wide());
         assert!(dense_only > n, "a dense-only range bisected to {dense_only}, under {n}");
     }
 }

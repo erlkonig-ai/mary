@@ -285,8 +285,9 @@ impl Weights {
         layers: std::ops::Range<usize>,
         global_dense: &[&str],
         attention_bytes: u64,
+        policy: super::budget::AdmissionPolicy,
     ) -> Result<(usize, usize, u64)> {
-        self.src.copy_share(layers, global_dense, attention_bytes)
+        self.src.copy_share(layers, global_dense, attention_bytes, policy)
     }
 
     // ---- what the source SAYS about itself --------------------------------

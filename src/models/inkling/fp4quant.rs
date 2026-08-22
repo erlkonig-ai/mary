@@ -120,8 +120,8 @@ fn e2m1_code(v: f32, s: f32) -> u32 {
 /// A block is exactly two output words, so no two threads ever touch the same
 /// word — the pack needs no atomics and no shared memory.
 #[cube(launch_unchecked)]
-fn quantize_nvfp4_kernel(
-    x: &Array<f32>,
+fn quantize_nvfp4_kernel<E: Scalar + Cast>(
+    x: &Array<E>,
     codes: &mut Array<u32>,
     scales: &mut Array<e4m3>,
     blocks: usize,
@@ -133,7 +133,7 @@ fn quantize_nvfp4_kernel(
         let mut amax = f32::new(0.0f32);
         #[unroll]
         for i in 0..16usize {
-            let v = x[base + i];
+            let v = f32::cast_from(x[base + i]);
             let mut a = v;
             if v < 0.0 {
                 a = -v;
@@ -157,12 +157,12 @@ fn quantize_nvfp4_kernel(
         let mut w0 = u32::new(0);
         #[unroll]
         for i in 0..8usize {
-            w0 |= e2m1_code(x[base + i], s) << (4 * i) as u32;
+            w0 |= e2m1_code(f32::cast_from(x[base + i]), s) << (4 * i) as u32;
         }
         let mut w1 = u32::new(0);
         #[unroll]
         for i in 0..8usize {
-            w1 |= e2m1_code(x[base + 8 + i], s) << (4 * i) as u32;
+            w1 |= e2m1_code(f32::cast_from(x[base + 8 + i]), s) << (4 * i) as u32;
         }
         codes[blk * 2] = w0;
         codes[blk * 2 + 1] = w1;
@@ -184,6 +184,39 @@ pub fn quantize_nvfp4<R: Runtime>(
     rows: usize,
     k: usize,
 ) -> (Handle, Handle) {
+    quantize_nvfp4_as::<f32, R>(client, x, rows, k)
+}
+
+/// The same, reading a BF16 activation.
+///
+/// The quantizer's own arithmetic does not move: every element is widened to
+/// f32 on the way in and the block amax, the E4M3 scale and the seven midpoint
+/// comparisons are the f32 ones they were. What changes is the buffer the
+/// producer had to write, and on a prefill that is the whole point -- the
+/// stacked `[k * n, hidden]` activation this reads is the largest thing a
+/// routed-expert layer holds.
+///
+/// It costs nothing in accuracy that the lane was not already paying: the
+/// destination is FOUR BITS with one E4M3 scale per sixteen elements, so the
+/// question is whether BF16's eight mantissa bits can miss an E2M1 code the f32
+/// would have hit, and the codes are seven comparisons against midpoints two
+/// orders of magnitude coarser than that.
+pub fn quantize_nvfp4_bf16<R: Runtime>(
+    client: &ComputeClient<R>,
+    x: &Handle,
+    rows: usize,
+    k: usize,
+) -> (Handle, Handle) {
+    quantize_nvfp4_as::<half::bf16, R>(client, x, rows, k)
+}
+
+/// [`quantize_nvfp4`] at a named input element type.
+fn quantize_nvfp4_as<E: Scalar + Cast, R: Runtime>(
+    client: &ComputeClient<R>,
+    x: &Handle,
+    rows: usize,
+    k: usize,
+) -> (Handle, Handle) {
     assert!(k > 0 && k % 64 == 0, "k must be a positive multiple of 64, got {k}");
     assert!(rows > 0, "rows must be non-zero");
 
@@ -196,7 +229,7 @@ pub fn quantize_nvfp4<R: Runtime>(
 
     let cubes = blocks.div_ceil(CUBE_SIZE as usize) as u32;
     unsafe {
-        quantize_nvfp4_kernel::launch_unchecked::<R>(
+        quantize_nvfp4_kernel::launch_unchecked::<E, R>(
             client,
             CubeCount::new_1d(cubes),
             CubeDim::new_1d(CUBE_SIZE),

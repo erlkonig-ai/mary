@@ -96,7 +96,21 @@ pub fn linear_bf16(x: Tensor<Bk, 2>, w: &Bf16W) -> Tensor<Bk, 2> {
     let rows = rows_for(w.align, m);
     let client = client_of(&x);
     let dev = x.device();
-    let out = crate::models::inkling::bf16gemm::linear_bf16(&client, &handle_of(x), w, m);
+    // The activation may arrive f32 or BF16 -- the narrow lane's normed
+    // residual stream is BF16 by the time it reaches a projection -- and the
+    // difference is a whole `[m, k]` f32 buffer that would exist only to be
+    // cast back. `handle_of_any` reports which it is instead of asserting one
+    // of them.
+    let (xh, xdt) = crate::models::inkling::seam::handle_of_any(x);
+    let out = match xdt {
+        burn::tensor::DType::BF16 => {
+            crate::models::inkling::bf16gemm::linear_bf16_narrow(&client, &xh, w, m)
+        }
+        burn::tensor::DType::F32 => {
+            crate::models::inkling::bf16gemm::linear_bf16(&client, &xh, w, m)
+        }
+        other => panic!("linear_bf16: no lane for a {other:?} activation"),
+    };
     tensor_of(client, dev, out, rows, w.n).slice([0..m, 0..w.n])
 }
 
@@ -656,7 +670,7 @@ fn attention_prefill_lane(
             use crate::models::inkling::budget::query_block;
             use crate::models::inkling::scorebias::score_epilogue_launch;
             use crate::models::inkling::seam::{
-                client_of, handle_of, strided_of3, tensor_of3, tensor_strided3,
+                client_of, contiguous, handle_of, strided_of3, tensor_strided3,
             };
 
             // [heads, tokens, head_dim]; the KV heads are repeated in place, so
@@ -669,25 +683,29 @@ fn attention_prefill_lane(
                     .repeat_dim(1, groups)
                     .reshape([heads, tokens, head_dim])
             };
-            let qv = q.reshape([tokens, heads, head_dim]).swap_dims(0, 1);
-            let client = client_of(&qv);
+            let client = client_of(&q);
 
             // Q, K^T and V made contiguous ONCE, ahead of the loop. Every query
             // block reads all of K and V, and a permuted view handed to the
             // matmul is made contiguous BY the matmul -- which is the whole of
             // it, per block, instead of once per layer.
-            let qh = {
-                let h = handle_of(qv);
-                tensor_of3(client.clone(), dev.clone(), h, heads, tokens, head_dim)
-            };
-            let kt = {
-                let h = handle_of(expand(k.clone()).swap_dims(1, 2));
-                tensor_of3(client.clone(), dev.clone(), h, heads, head_dim, tokens)
-            };
-            let vh = {
-                let h = handle_of(expand(v.clone()));
-                tensor_of3(client.clone(), dev.clone(), h, heads, tokens, head_dim)
-            };
+            //
+            // Narrowed BEFORE the expansion, not after: `expand` repeats each
+            // KV head `groups` times and that repeat is a materialised write of
+            // the whole `[heads, tokens, head_dim]`. Casting first halves what
+            // that write moves as well as what it leaves behind. These three
+            // are 16 KiB a token each on this model at f32, they are linear in
+            // the sequence, and `INK_QBLOCK` -- which bounds the score block --
+            // does not reach them.
+            //
+            // `contiguous` rather than the `handle_of`/`tensor_of3` round trip
+            // that used to be here: that pair asserts f32 on the way through,
+            // for the good reason that the kernels behind it index bytes, and
+            // nothing here is going to a kernel. It is the same
+            // `into_contiguous` either way.
+            let qh = contiguous(as_act(q.reshape([tokens, heads, head_dim]).swap_dims(0, 1)));
+            let kt = contiguous(expand(as_act(k.clone())).swap_dims(1, 2));
+            let vh = contiguous(expand(as_act(v.clone())));
 
             let rel_proj = w.rel_proj.clone().slice([0..d.d_rel, 0..eff]);
             // A parameter, not just `query_block`, because the only bug this
@@ -725,7 +743,12 @@ fn attention_prefill_lane(
                 // ABSOLUTE query position. A block that used its local row
                 // index would attend to the wrong keys everywhere except block
                 // zero -- which is exactly the block a small test exercises.
-                let raw = qh.clone().slice([0..heads, lo..hi, 0..head_dim]).matmul(kt.clone());
+                // Wide again for the epilogue: the scale, the bias, the mask
+                // and the softmax below are the arithmetic the reference also
+                // keeps in f32, and the narrow lane's saving is in the
+                // OPERANDS, which are already spent by this line.
+                let raw =
+                    from_act(qh.clone().slice([0..heads, lo..hi, 0..head_dim]).matmul(kt.clone()));
                 let rel_h = handle_of(rel);
                 let (s_h, st) = strided_of3(raw);
                 score_epilogue_launch(
@@ -744,8 +767,12 @@ fn attention_prefill_lane(
                 let scores =
                     tensor_strided3(client.clone(), dev.clone(), s_h, [heads, rows, tokens], st);
                 let probs = burn::tensor::activation::softmax(scores, 2);
+                // The probabilities go back down to the operand dtype for
+                // `p @ v`, which is what the reference does at this point too.
                 parts.push(
-                    probs.matmul(vh.clone()).swap_dims(0, 1).reshape([rows, heads * head_dim]),
+                    from_act(as_act(probs).matmul(vh.clone()))
+                        .swap_dims(0, 1)
+                        .reshape([rows, heads * head_dim]),
                 );
             }
             // One block is the whole sequence at short context, and `cat` of a
@@ -904,6 +931,69 @@ fn as_kv<const D: usize>(t: Tensor<Bk, D>) -> Tensor<Bk, D> {
 /// wide lane.
 fn from_kv<const D: usize>(t: Tensor<Bk, D>) -> Tensor<Bk, D> {
     if narrow_now() {
+        t.cast(burn::tensor::FloatDType::F32)
+    } else {
+        t
+    }
+}
+
+/// Whether a PREFILL holds its `[heads, tokens, head_dim]` attention operands
+/// as BF16, and multiplies them there.
+///
+/// **On by default; `INK_ACT_BF16=0` is the wide arm.** A switch for the same
+/// reason [`attn_bf16`] is one: what it trades is precision, and the only
+/// honest way to price precision is to run both arms of the same binary against
+/// the same harness.
+///
+/// [`attn_bf16`] narrows the CACHE, which is a decode-step term and does
+/// nothing for a prefill -- a prefill computes its scores from keys it has just
+/// projected. This narrows what a prefill actually holds. On a global layer
+/// that is Q, the GQA-expanded K transposed, and the GQA-expanded V: three
+/// `[32, n, 128]` buffers, `16 KiB` a token EACH on this model, and they are
+/// linear in the sequence with no knob on them. `INK_QBLOCK` bounds the score
+/// block and cannot touch these.
+///
+/// ## What the reference does here
+///
+/// BF16, at every one of these points. The upstream implementation keeps its
+/// whole residual stream, its projections, its attention operands and its
+/// attention output in BF16 and reserves f32 for accumulation: the RMSNorm
+/// variance, the short convolution's four taps, the softmax running max and
+/// sum, and the two matmul accumulators. The probabilities are cast BACK to the
+/// query dtype before `p @ v` there, which is exactly what this does.
+///
+/// So the bias, the mask and the softmax stay f32 here -- those are the
+/// accumulations the reference also keeps wide -- and the operands do not.
+///
+/// ## What it costs that the reference does not pay
+///
+/// A fused attention kernel keeps the score in an f32 accumulator from the MMA
+/// straight into the softmax and never writes it out. This lane materialises
+/// the score block, so a BF16 `q @ k^T` rounds the f32 accumulator to BF16 on
+/// the store and the epilogue reads it back. That rounding is real and it is
+/// not one the reference takes. It IS the one [`attention_step`] has taken on
+/// the cached lane since the BF16 cache landed, priced there against
+/// `golden/paired/` rather than against a tolerance, and this is the same
+/// arithmetic on the other lane.
+pub fn act_bf16() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INK_ACT_BF16").map(|v| v != "0").unwrap_or(true))
+}
+
+/// `t` in the dtype a prefill holds its attention operands in. The identity on
+/// the wide lane.
+pub fn as_act<const D: usize>(t: Tensor<Bk, D>) -> Tensor<Bk, D> {
+    if act_bf16() {
+        t.cast(burn::tensor::FloatDType::BF16)
+    } else {
+        t
+    }
+}
+
+/// Back to f32, for the epilogue and the residual stream. The identity on the
+/// wide lane.
+pub fn from_act<const D: usize>(t: Tensor<Bk, D>) -> Tensor<Bk, D> {
+    if act_bf16() {
         t.cast(burn::tensor::FloatDType::F32)
     } else {
         t

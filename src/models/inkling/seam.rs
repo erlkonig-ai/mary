@@ -57,6 +57,48 @@ pub fn handle_of<const D: usize>(t: Tensor<Bk, D>) -> Handle {
     }
 }
 
+/// The device buffer behind a Burn float tensor, and the dtype it is in.
+///
+/// [`handle_of`] asserts f32 because the kernels on its far side index bytes at
+/// a fixed width, and for as long as every one of them did, "the inkling seam
+/// is f32 on both sides" was a true sentence and a useful guard. It is not true
+/// any more: the residual stream is BF16 on the narrow lane, and the kernels
+/// that read it are generic over their element type precisely so that they can.
+///
+/// So this is the same seam with the assertion turned into a RETURN VALUE. A
+/// caller that gets the dtype back has to decide what to do with it — which is
+/// the point, because the decision is exactly the one the assertion used to
+/// make on everybody's behalf, and the two lanes want different answers.
+/// [`handle_of`] stays where it is for every caller that genuinely only has an
+/// f32 kernel.
+pub fn handle_of_any<const D: usize>(t: Tensor<Bk, D>) -> (Handle, DType) {
+    match t.into_primitive() {
+        TensorPrimitive::Float(c) => {
+            let mut c: CubeTensor<CudaRuntime> = c;
+            if !c.is_contiguous() {
+                c = burn_cubecl::kernel::into_contiguous(c);
+            }
+            let dt = c.dtype;
+            (c.handle, dt)
+        }
+        TensorPrimitive::QFloat(_) => {
+            panic!("a quantized Burn tensor has no plain float buffer to hand over")
+        }
+    }
+}
+
+/// The dtype of a Burn float tensor, without consuming it.
+///
+/// The narrow lane branches on this in a dozen places and every one of them
+/// still needs the tensor afterwards, so the borrowing form is the one that
+/// gets used.
+pub fn dtype_of<const D: usize>(t: &Tensor<Bk, D>) -> DType {
+    match &t.clone().into_primitive() {
+        TensorPrimitive::Float(c) => c.dtype,
+        TensorPrimitive::QFloat(_) => panic!("a quantized Burn tensor has no plain float dtype"),
+    }
+}
+
 /// The same, for an `Int` tensor.
 ///
 /// A separate function rather than a generic one because Burn spells the two
@@ -86,12 +128,29 @@ pub fn tensor_of(
     rows: usize,
     cols: usize,
 ) -> Tensor<Bk, 2> {
+    tensor_of_dt(client, device, handle, rows, cols, DType::F32)
+}
+
+/// [`tensor_of`] at a named dtype.
+///
+/// The dtype is the caller's because it is the KERNEL's: a buffer is whatever
+/// the kernel that wrote it stored, and nothing about the handle records that.
+/// Getting it wrong is not a type error, it is a tensor that reads two BF16
+/// values as one f32 and keeps going.
+pub fn tensor_of_dt(
+    client: ComputeClient<CudaRuntime>,
+    device: burn::backend::cuda::CudaDevice,
+    handle: Handle,
+    rows: usize,
+    cols: usize,
+    dtype: DType,
+) -> Tensor<Bk, 2> {
     let c = CubeTensor::<CudaRuntime>::new_contiguous(
         client,
         device,
         [rows, cols].into(),
         handle,
-        DType::F32,
+        dtype,
     );
     Tensor::from_primitive(TensorPrimitive::Float(c))
 }
@@ -225,5 +284,33 @@ pub fn pool_line(client: &ComputeClient<CudaRuntime>, at: &str) -> String {
             u.number_allocs,
         ),
         Err(e) => format!("    pool[{at}]: unavailable ({e:?})"),
+    }
+}
+
+/// `t` with a unit-stride layout, at whatever float dtype it already carries.
+///
+/// [`handle_of`] does this on the way out to a raw kernel, and it is the only
+/// way the Burn lane had to ask for it — but it also asserts f32, because the
+/// kernels on the far side index bytes. A tensor that stays in Burn has no such
+/// obligation: it can be BF16, and the reason to make it contiguous is the
+/// reason the attention lane already had, which is that `matmul` makes its
+/// operands contiguous itself and doing it once per LAYER is cheaper than once
+/// per query block.
+///
+/// So this is `handle_of`'s copy without `handle_of`'s dtype: same
+/// `into_contiguous`, same no-op when the layout is already unit-stride, and
+/// the tensor comes back as a tensor rather than as a pointer.
+pub fn contiguous<const D: usize>(t: Tensor<Bk, D>) -> Tensor<Bk, D> {
+    match t.into_primitive() {
+        TensorPrimitive::Float(c) => {
+            let mut c: CubeTensor<CudaRuntime> = c;
+            if !c.is_contiguous() {
+                c = burn_cubecl::kernel::into_contiguous(c);
+            }
+            Tensor::from_primitive(TensorPrimitive::Float(c))
+        }
+        TensorPrimitive::QFloat(_) => {
+            panic!("a quantized Burn tensor has no plain float buffer to lay out")
+        }
     }
 }
