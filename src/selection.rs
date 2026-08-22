@@ -291,6 +291,59 @@ pub fn index_keymap_for_root(
     Ok(map)
 }
 
+/// Index one component whose tensors are split across several roots.
+///
+/// A sharded checkpoint writes one root per `model-0000N-of-0000M.safetensors`
+/// file, and those roots are not alternatives: together they are one component,
+/// and no single one of them can load. [`index_keymap_for_root`] cannot express
+/// that, and [`select_model_root`] actively refuses it, since a coordinate
+/// naming two roots fails `exactly_one`.
+///
+/// The merge is by TENSOR NAME rather than by any structural split, because the
+/// files do not divide structurally. In the gemma-3-1b checkpoint layer 17 has
+/// tensors in *both* shards while layers 22, 24 and 25 sit in the first, so a
+/// merge that assigned a layer range per shard would work on a clean two-way
+/// boundary and silently drop tensors here.
+///
+/// DISJOINTNESS IS THE INVARIANT, and it is checked rather than assumed. Two
+/// shards of one component cannot legitimately name the same tensor: the writer
+/// split a single namespace across files. So a collision is not a case to
+/// resolve by preferring a shard -- it means the roots are not shards of one
+/// thing, and quietly taking either one would hide that. Roots are visited in
+/// sorted order so the collision reported does not depend on the caller's
+/// argument order.
+///
+/// This composes with component multiplicity rather than replacing it: a model
+/// like FLUX has three components of which one is itself sharded, so its loader
+/// holds three indexes and builds one of them from two roots.
+pub fn index_keymap_for_roots(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    roots: &[Id],
+) -> anyhow::Result<HashMap<String, Leaf>> {
+    if roots.is_empty() {
+        bail!("cannot index a component from zero roots");
+    }
+
+    let mut ordered: Vec<Id> = roots.to_vec();
+    ordered.sort();
+    ordered.dedup();
+
+    let mut merged: HashMap<String, Leaf> = HashMap::new();
+    let mut owner: HashMap<String, Id> = HashMap::new();
+    for root in ordered {
+        for (name, leaf) in index_keymap_for_root(tribles, blobs, root)? {
+            if let Some(previous) = owner.insert(name.clone(), root) {
+                bail!(
+                    "tensor {name:?} appears in both root {previous} and root {root};                      these are not shards of one component"
+                );
+            }
+            merged.insert(name, leaf);
+        }
+    }
+    Ok(merged)
+}
+
 impl<R: BlobStoreGet> SelectedModelIndex<R> {
     /// Resolve and strictly index one model from an explicit graph plus its
     /// owning reader.
@@ -610,6 +663,162 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("ambiguous weight edge"), "{error}");
+    }
+
+    /// The gemma-3-1b shape: one component, two files, layers INTERLEAVED
+    /// rather than split at a boundary. Layer 17 has tensors in both shards
+    /// while layer 22 sits only in the first — which is exactly the case a
+    /// merge keyed on layer ranges would get wrong.
+    #[test]
+    fn interleaved_shards_of_one_component_merge_by_tensor_name() {
+        let mut facts = TribleSet::new();
+        let mut blobs = MemoryBlobStore::new();
+        let first = add_model(
+            &mut facts,
+            &mut blobs,
+            "model-00001-of-00002.safetensors",
+            "google/gemma-3-1b",
+            "native",
+            &[
+                ("model.layers.17.self_attn.q_proj.weight", 1.0),
+                ("model.layers.22.mlp.up_proj.weight", 2.0),
+            ],
+        );
+        let second = add_model(
+            &mut facts,
+            &mut blobs,
+            "model-00002-of-00002.safetensors",
+            "google/gemma-3-1b",
+            "native",
+            &[
+                ("model.layers.17.post_attention_layernorm.weight", 3.0),
+                ("model.layers.59.mlp.down_proj.weight", 4.0),
+            ],
+        );
+
+        let reader = BlobStore::reader(&mut blobs).unwrap();
+
+        // Neither shard alone is the component.
+        assert_eq!(
+            index_keymap_for_root(&facts, &reader, first.root)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let merged =
+            index_keymap_for_roots(&facts, &reader, &[first.root, second.root]).unwrap();
+        let mut names: Vec<&String> = merged.keys().collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "model.layers.17.post_attention_layernorm.weight",
+                "model.layers.17.self_attn.q_proj.weight",
+                "model.layers.22.mlp.up_proj.weight",
+                "model.layers.59.mlp.down_proj.weight",
+            ]
+        );
+        // The values follow their own shard, so the merge is not silently
+        // taking one root's leaf for a name the other owns.
+        assert_eq!(
+            merged["model.layers.17.self_attn.q_proj.weight"].to_f32(),
+            vec![1.0]
+        );
+        assert_eq!(
+            merged["model.layers.17.post_attention_layernorm.weight"].to_f32(),
+            vec![3.0]
+        );
+
+        // Argument order is not observable.
+        let reversed =
+            index_keymap_for_roots(&facts, &reader, &[second.root, first.root]).unwrap();
+        assert_eq!(merged.len(), reversed.len());
+        for (name, leaf) in &merged {
+            assert_eq!(reversed[name].to_f32(), leaf.to_f32());
+        }
+    }
+
+    /// A name in two roots means they are not shards of one component. Taking
+    /// either leaf would hide that, so it is an error naming both roots.
+    #[test]
+    fn roots_sharing_a_tensor_name_are_not_shards() {
+        let mut facts = TribleSet::new();
+        let mut blobs = MemoryBlobStore::new();
+        let first = add_model(
+            &mut facts,
+            &mut blobs,
+            "shard-a",
+            "vendor/model",
+            "native",
+            &[("model.layers.0.weight", 1.0)],
+        );
+        let second = add_model(
+            &mut facts,
+            &mut blobs,
+            "shard-b",
+            "vendor/model",
+            "native",
+            &[("model.layers.0.weight", 2.0)],
+        );
+
+        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let error = index_keymap_for_roots(&facts, &reader, &[first.root, second.root])
+            .expect_err("a shared tensor name must not merge");
+        let message = error.to_string();
+        assert!(
+            message.contains("model.layers.0.weight"),
+            "error names the colliding tensor: {message}"
+        );
+        assert!(
+            message.contains("not shards of one component"),
+            "error says what the collision means: {message}"
+        );
+
+        // The report is deterministic: roots are visited in sorted order, so
+        // the same two roots produce the same message whichever way the caller
+        // passes them. Without that, a collision would be reported differently
+        // run to run and would look like two distinct problems.
+        let reversed = index_keymap_for_roots(&facts, &reader, &[second.root, first.root])
+            .expect_err("a shared tensor name must not merge either way");
+        assert_eq!(message, reversed.to_string());
+
+        let (low, high) = if first.root < second.root {
+            (first.root, second.root)
+        } else {
+            (second.root, first.root)
+        };
+        assert!(
+            message.contains(&format!("root {low} and root {high}")),
+            "error names the roots in sorted order: {message}"
+        );
+    }
+
+    #[test]
+    fn indexing_a_component_from_zero_roots_is_an_error() {
+        let facts = TribleSet::new();
+        let mut blobs = MemoryBlobStore::new();
+        let reader = BlobStore::reader(&mut blobs).unwrap();
+        assert!(index_keymap_for_roots(&facts, &reader, &[]).is_err());
+    }
+
+    /// One root passed twice is one root, not a self-collision.
+    #[test]
+    fn a_repeated_root_is_deduplicated_rather_than_colliding() {
+        let mut facts = TribleSet::new();
+        let mut blobs = MemoryBlobStore::new();
+        let only = add_model(
+            &mut facts,
+            &mut blobs,
+            "solo",
+            "vendor/model",
+            "native",
+            &[("model.layers.0.weight", 1.0)],
+        );
+        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let merged =
+            index_keymap_for_roots(&facts, &reader, &[only.root, only.root]).unwrap();
+        assert_eq!(merged.len(), 1);
     }
 
     #[test]
