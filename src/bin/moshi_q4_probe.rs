@@ -345,6 +345,18 @@ fn alloc_custom_layers(client: &q4::Client, is_q4: bool) -> Vec<Vec<Q4Linear>> {
 // 3. main
 // ---------------------------------------------------------------------------
 
+/// Which burn backend the `burn f16 matmul` row runs on. `BHalf` is
+/// `burn::backend::Metal`, which is an alias for `Wgpu`, so this is wgpu on
+/// every host — it does NOT follow `cuda-backend`.
+const BURN_BACKEND: &str = "burn-wgpu";
+
+/// Which cubecl runtime the hand-written matvec rows run on. This one DOES
+/// follow `cuda-backend` (see `mary::nn::q4::Rt`).
+#[cfg(feature = "cuda-backend")]
+const LANE_BACKEND: &str = "cubecl-cuda";
+#[cfg(not(feature = "cuda-backend"))]
+const LANE_BACKEND: &str = "cubecl-wgpu";
+
 fn main() {
     let rounds: usize = std::env::var("Q4_ROUNDS")
         .ok()
@@ -382,12 +394,20 @@ fn main() {
     println!("  control matmul (256^2, f16): {c0:.2} ms");
 
     // burn f16 Tensor matmul (production baseline) — scoped so its 17 GB drop
+    //
+    // NAME THE BACKEND. This row runs `mary::nn::backend::BHalf`, which is
+    // `burn::backend::Metal<f16>`, and burn's `Metal` is a plain alias for
+    // `Wgpu` (burn-wgpu/src/lib.rs:110). `cuda-backend` swaps only the cubecl
+    // q4 lane below and deliberately does not touch the burn dep, so on a CUDA
+    // host this row is wgpu/Vulkan while the rows under it are cubecl-CUDA.
+    // Unlabelled, that reads as a burn-CUDA-vs-hand-kernel comparison and is
+    // not one — it cost exactly that misreading on 2026-08-22.
     let (burn_sub, burn_full) = {
         println!("  building burn f16 stack ({f16_gb:.1} GB on device)...");
         let r = bench_burn_f16(&device, rounds, steps);
         let c = control_op(&device);
         println!(
-            "  burn f16 matmul : submit {:7.2} ms  full {:7.2} ms   {:6.1} GB/s   (control {c:.2} ms)",
+            "  burn f16 matmul [{BURN_BACKEND}] : submit {:7.2} ms  full {:7.2} ms   {:6.1} GB/s   (control {c:.2} ms)",
             r.0,
             r.1,
             f16_gb / (r.1 / 1e3)
@@ -410,7 +430,7 @@ fn main() {
         );
         let c = control_op(&device);
         println!(
-            "  f16 matvec kern : submit {:7.2} ms  full {:7.2} ms   {:6.1} GB/s   (control {c:.2} ms)",
+            "  f16 matvec kern [{LANE_BACKEND}] : submit {:7.2} ms  full {:7.2} ms   {:6.1} GB/s   (control {c:.2} ms)",
             r.0,
             r.1,
             f16_gb / (r.1 / 1e3)
@@ -433,7 +453,7 @@ fn main() {
         );
         let c = control_op(&device);
         println!(
-            "  q4 matvec kern  : submit {:7.2} ms  full {:7.2} ms   {:6.1} GB/s effective ({:6.1} GB/s f16-equiv)   (control {c:.2} ms)",
+            "  q4 matvec kern  [{LANE_BACKEND}] : submit {:7.2} ms  full {:7.2} ms   {:6.1} GB/s effective ({:6.1} GB/s f16-equiv)   (control {c:.2} ms)",
             r.0,
             r.1,
             q4_gb / (r.1 / 1e3),

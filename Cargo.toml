@@ -99,6 +99,8 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 # the realtime lane never instantiates a burn backend (RealtimePipeline has no
 # B: Backend generic, TemporalMetal is raw cubecl, DepthFast/Mimi are CPU).
 cuda-backend = ["q4", "cubecl?/cuda"]
+# Investigation-only: burn's REAL Cuda backend, for backend_matmul_probe.
+burn-cuda-bench = ["burn/cuda"]
 # Kimi-K3 (mary::models::k3) - the 2.78 T-param MoE vision-language model.
 # Currently the loading skeleton only: config parsing plus the checkpoint
 # name->module-slot layout. serde/serde_json are unconditional deps, so this
@@ -960,3 +962,7 @@ required-features = ["inkling-cuda"]
 [[bin]]
 name = "inkling_pile_names"
 required-features = ["inkling-cuda"]
+
+[[bin]]
+name = "backend_matmul_probe"
+required-features = ["burn-cuda-bench"]
