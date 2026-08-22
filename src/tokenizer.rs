@@ -1628,6 +1628,56 @@ mod tests {
     }
 
     #[cfg(feature = "tokenizer")]
+    fn project_current_model_attributes_to_historical(facts: &TribleSet) -> TribleSet {
+        let aliases = crate::model_collection::legacy_model_attribute_aliases();
+        facts
+            .iter()
+            .map(|fact| {
+                let Some(alias) = aliases.iter().find(|alias| &alias.canonical == fact.a()) else {
+                    return *fact;
+                };
+                Trible::force(fact.e(), &alias.historical, fact.v::<UnknownInline>())
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "tokenizer")]
+    #[test]
+    fn projected_historical_wordpiece_graph_preserves_encoding() {
+        let mut blobs = MemoryBlobStore::new();
+        let fragment = save_tokenizer_json(WP.as_bytes(), "test/legacy-wp", &mut blobs).unwrap();
+        let root = fragment.root().expect("root");
+        let current = fragment.into_facts();
+        let historical = project_current_model_attributes_to_historical(&current);
+        let reader = BlobStore::reader(&mut blobs).unwrap();
+
+        assert_eq!(find_tokenizer(&historical), None);
+        let projection = crate::model_collection::project_legacy_model_attributes(&historical);
+        assert!(historical
+            .iter()
+            .all(|fact| projection.facts.contains(fact)));
+        assert_eq!(find_tokenizer(&projection.facts), Some(root));
+
+        let graph = build_tokenizer(&projection.facts, &reader, root)
+            .expect("build projected historical tokenizer");
+        let json = tokenizers::Tokenizer::from_bytes(WP.as_bytes()).expect("build JSON tokenizer");
+        for text in [
+            "hello telecommunications",
+            "HELLO Hello hello",
+            "telecommunicationsing",
+            "[CLS] hello [PAD]",
+        ] {
+            let graph_ids = graph.encode(text, false).expect("graph encode");
+            let json_ids = json.encode(text, false).expect("JSON encode");
+            assert_eq!(
+                graph_ids.get_ids(),
+                json_ids.get_ids(),
+                "projected graph/JSON encode diverged on {text:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "tokenizer")]
     #[test]
     fn graph_built_wordpiece_encodes_like_json_built() {
         assert_encode_parity(
