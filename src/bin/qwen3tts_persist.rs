@@ -49,7 +49,7 @@ mod imp {
         >,
         source: &str,
         quantization: &str,
-    ) -> anyhow::Result<std::collections::HashMap<String, mary::ingest::LeafHandles>> {
+    ) -> anyhow::Result<std::collections::HashMap<String, mary::leaf::Leaf>> {
         let root = mary::selection::select_model_root(
             snapshot.facts(),
             snapshot.reader(),
@@ -109,8 +109,12 @@ mod imp {
         // Freeze exactly the two roots needed to compute the fold. The shared
         // codec is deliberately absent: Talker construction needs only the
         // base's exact CPU stages and the filtered f16 GPU tensors.
+        // The same team the imports above published under: an existing model
+        // graph's team, or this key as a team of one on a fresh pile.
+        let team = mary::model_collection::model_graph_team_or_own(pile, signing_key)?;
         let source_snapshot = mary::model_collection::snapshot_model_collection_exact(
             pile,
+            team,
             &[base_commit, talker_commit],
         )?;
         let exact = select_index(
@@ -119,16 +123,11 @@ mod imp {
             mary::persist::QUANTIZATION_NATIVE,
         )?;
         let talker_f16 = select_index(&source_snapshot, &talker_source, QUANTIZATION_F16)?;
-        let (_, _, reader) = source_snapshot.into_parts();
+        drop(source_snapshot);
 
         eprintln!("[qwen3tts] deriving versioned folded f16 talker {folded_source}");
-        let loader = WeightLoader::Aliased(AliasedPile::new(
-            talker_f16,
-            exact,
-            reader.clone(),
-            reader,
-            WgpuDevice::default(),
-        ));
+        let loader =
+            WeightLoader::Aliased(AliasedPile::new(talker_f16, exact, WgpuDevice::default()));
         let talker = Talker::<BFusedHalf>::load(&loader, &WgpuDevice::default());
         drop(loader);
         let tensors = mary::persist::qwen3tts_folded_readback(&talker);
@@ -159,13 +158,13 @@ mod imp {
         .map_err(|error| anyhow::anyhow!("build folded model root: {error}"))?;
         let folded_root = folded.root().expect("folded model root");
         let _folded_commit =
-            mary::model_collection::publish_model_fragment(pile, signing_key, folded)
+            mary::model_collection::publish_model_fragment(pile, team, signing_key, folded)
                 .map_err(|error| anyhow::anyhow!("publish folded model root: {error}"))?;
 
         // Gate the same locally admitted prefix Voice will observe, not merely
         // the four commits returned by this invocation. Stale coordinate
         // conflicts and invalid matching records therefore fail here too.
-        let complete = mary::model_collection::snapshot_model_collection_local_latest(pile)?;
+        let complete = mary::model_collection::snapshot_model_collection_local_latest(pile, team)?;
         let weights = Qwen3TtsWeights::from_snapshot(complete, variant)?;
         let (exact_count, f16_count, folded_count) = weights.counts();
         weights.validate_runtime_cohort()?;

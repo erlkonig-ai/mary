@@ -17,13 +17,12 @@ use burn::backend::wgpu::{CubeTensor, WgpuDevice, WgpuRuntime};
 use burn::tensor::{DType, Tensor, TensorPrimitive};
 use cubecl::Runtime;
 use half::f16;
-use mary::ingest::LeafHandles;
+use mary::leaf::Elem;
 use mary::nn::backend::BHalf;
 use mary::selection::{ModelSelector, SelectedModelIndex};
 use memmap2::MmapRaw;
 use std::process::Command;
 use std::sync::Arc;
-use triblespace::prelude::BlobStoreGet;
 
 const PAGE: u64 = 16384;
 const SOURCE: &str = "fixture/gemma-alias-probe";
@@ -56,19 +55,20 @@ fn main() {
             .expect("import tiny native model collection");
 
     // 3. Freeze the local native collection and select its only model root.
-    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile)
+    let team = mary::model_collection::model_graph_team_at(&pile)
+        .expect("sole model-graph team in the tiny fixture pile");
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile, team)
         .expect("load tiny native model collection snapshot");
     let selected = SelectedModelIndex::from_snapshot(snapshot, ModelSelector::Only)
         .expect("select the only tiny model root");
     assert_eq!(selected.root(), imported_root);
-    let handles = selected.handles().get("w").expect("weight 'w' in pile");
-    let (dh, _sh) = match handles {
-        LeafHandles::F16(d, s) => (*d, *s),
-        LeafHandles::F32(..) => panic!("expected f16 leaf"),
-    };
+    let leaf = selected.handles().get("w").expect("weight 'w' in pile");
+    assert_eq!(leaf.elem(), Elem::F16, "expected f16 leaf");
 
-    // 4. The blob's Bytes (a slice into the pile mmap).
-    let bytes: anybytes::Bytes = selected.reader().get(dh).expect("data_f16 blob");
+    // 4. The leaf's payload Bytes — already a slice into the pile mmap, so no
+    //    reader fetch. A typed leaf's payload starts one 256-byte header into a
+    //    256-aligned record, which keeps the page math below exact.
+    let bytes: anybytes::Bytes = leaf.payload().clone();
     let blob_ptr = bytes.as_ptr() as usize;
     let expected: Vec<f16> = bytes.clone().view::<[f16]>().expect("f16 view")[..].to_vec();
     let n = expected.len();

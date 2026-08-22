@@ -21,7 +21,8 @@
 //!   <model-dir> <pile-path> <signing-key>
 //! ```
 
-use mary::ingest::{read_shape, LeafDtype, LeafHandles};
+use mary::ingest::LeafDtype;
+use mary::leaf::Elem;
 use mary::models::voxtral::{VoxtralWeights, QUANTIZATION_F16, SOURCE};
 use mary::selection::{ModelSelector, SelectedModelIndex};
 use safetensors::{Dtype, SafeTensors};
@@ -30,7 +31,6 @@ use std::path::Path;
 use std::time::Instant;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::signing_key_file;
-use triblespace::prelude::BlobStoreGet;
 
 fn verify_exact_source(
     model_dir: &Path,
@@ -65,14 +65,13 @@ fn verify_exact_source(
             .exact()
             .get(*name)
             .ok_or_else(|| anyhow::anyhow!("native root is missing source tensor {name:?}"))?;
-        let (data, shape) = match handles {
-            LeafHandles::F32(data, shape) => (*data, *shape),
-            LeafHandles::F16(..) => anyhow::bail!("native tensor {name:?} is not f32"),
-        };
-        let stored: anybytes::Bytes = weights
-            .reader()
-            .get(data)
-            .map_err(|error| anyhow::anyhow!("read native tensor {name:?}: {error}"))?;
+        anyhow::ensure!(
+            handles.elem() == Elem::F32,
+            "native tensor {name:?} is not f32"
+        );
+        // A typed leaf carries its own dims and its payload is the tensor data
+        // itself, so neither the shape blob nor the reader fetch survives.
+        let stored: anybytes::Bytes = handles.payload().clone();
         anyhow::ensure!(
             (stored.as_ptr() as usize).is_multiple_of(256),
             "native tensor {name:?} is not 256-byte aligned"
@@ -82,7 +81,7 @@ fn verify_exact_source(
             .map_err(|error| anyhow::anyhow!("decode native tensor {name:?}: {error}"))?;
         let (wanted, wanted_shape) = mary::nn::weight_loader::get_tensor_f32(&source, name);
         anyhow::ensure!(
-            read_shape(weights.reader(), shape) == wanted_shape,
+            handles.shape() == wanted_shape,
             "native tensor {name:?} shape differs from source"
         );
         anyhow::ensure!(
@@ -104,11 +103,10 @@ fn verify_alignment(
     weights: &VoxtralWeights<triblespace::core::repo::pile::PileReader>,
 ) -> anyhow::Result<()> {
     for (name, handles) in weights.exact().iter().chain(weights.f16()) {
-        let bytes: anybytes::Bytes = match handles {
-            LeafHandles::F32(data, _) => weights.reader().get(*data),
-            LeafHandles::F16(data, _) => weights.reader().get(*data),
-        }
-        .map_err(|error| anyhow::anyhow!("read tensor {name:?} for alignment: {error}"))?;
+        // Alignment is a property of the payload, which is where the tensor
+        // data actually starts — one 256-byte header into a 256-aligned record
+        // for a typed leaf, and at the record itself for a legacy one.
+        let bytes: anybytes::Bytes = handles.payload().clone();
         anyhow::ensure!(
             (bytes.as_ptr() as usize).is_multiple_of(256),
             "tensor {name:?} is not 256-byte aligned"
@@ -151,10 +149,17 @@ fn run() -> anyhow::Result<()> {
             mary::persist::QUANTIZATION_NATIVE,
         )?;
 
+        // The same team the import above published under: an existing model
+        // graph's team, or this key as a team of one on a fresh pile.
+        let team = mary::model_collection::model_graph_team_or_own(&mut pile, &signing_key)?;
+
         // Freeze the exact commit before deriving: later appends cannot move
         // the source root or reader under the conversion.
-        let exact_snapshot =
-            mary::model_collection::snapshot_model_collection_exact(&mut pile, &[exact_commit])?;
+        let exact_snapshot = mary::model_collection::snapshot_model_collection_exact(
+            &mut pile,
+            team,
+            &[exact_commit],
+        )?;
         let exact = SelectedModelIndex::from_snapshot(
             exact_snapshot,
             ModelSelector::Source {
@@ -174,7 +179,8 @@ fn run() -> anyhow::Result<()> {
 
         // Gate the exact local prefix the live runtime admits, including any
         // previously published coordinate conflicts or invalid native records.
-        let complete = mary::model_collection::snapshot_model_collection_local_latest(&mut pile)?;
+        let complete =
+            mary::model_collection::snapshot_model_collection_local_latest(&mut pile, team)?;
         let weights = VoxtralWeights::from_snapshot(complete)?;
         anyhow::ensure!(
             weights.roots() == (exact_root, f16_root),

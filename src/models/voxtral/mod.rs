@@ -418,8 +418,11 @@ mod tests {
         let signing_key = SigningKey::from_bytes(&[0x56; 32]);
         let mut open = Pile::open(pile.path()).expect("open exact-only Voxtral pile");
         let derive = |open: &mut Pile| {
-            let snapshot = crate::model_collection::snapshot_model_collection_local_latest(open)
-                .expect("freeze exact Voxtral prefix");
+            let team = crate::model_collection::model_graph_team_or_own(open, &signing_key)
+                .expect("exact Voxtral prefix names one team");
+            let snapshot =
+                crate::model_collection::snapshot_model_collection_local_latest(open, team)
+                    .expect("freeze exact Voxtral prefix");
             let exact = crate::selection::SelectedModelIndex::from_snapshot(
                 snapshot,
                 ModelSelector::Source {
@@ -455,8 +458,11 @@ mod tests {
             "repeating an identical derivation appended bytes"
         );
 
-        let complete = crate::model_collection::snapshot_model_collection_local_latest(&mut open)
-            .expect("freeze complete repeated cohort");
+        let team = crate::model_collection::model_graph_team_or_own(&mut open, &signing_key)
+            .expect("repeated cohort names one team");
+        let complete =
+            crate::model_collection::snapshot_model_collection_local_latest(&mut open, team)
+                .expect("freeze complete repeated cohort");
         let weights = VoxtralWeights::from_snapshot(complete).expect("select repeated cohort");
         assert_eq!(weights.roots().1, first_root);
         assert_eq!(weights.validate_f16_parity().unwrap(), (2, 4));

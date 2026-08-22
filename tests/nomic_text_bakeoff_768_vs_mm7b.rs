@@ -151,8 +151,11 @@ fn text_retrieval_bakeoff() {
         pile_path.display()
     );
     let t0 = Instant::now();
-    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile_path)
-        .expect("load native model collection snapshot");
+    let snapshot = mary::model_collection::load_model_collection_local_latest(
+        &pile_path,
+        mary::model_collection::model_graph_team_at(&pile_path).expect("sole model-graph team"),
+    )
+    .expect("load native model collection snapshot");
     let nomic7b = mary::persist::load_nomic_mm7b_aliased_from_snapshot(
         snapshot,
         mary::selection::ModelSelector::Source {

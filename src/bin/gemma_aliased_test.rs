@@ -52,8 +52,11 @@ mod imp {
         let chat = "<bos><|turn>user\nWhat is 17 times 23? Answer with just the number.<turn|>\n<|turn>model\n";
 
         println!("[stream f16] selecting the native root and loading...");
-        let stream_snapshot = mary::model_collection::load_model_collection_local_latest(&pile)
-            .expect("load native model collection snapshot for streaming");
+        let stream_snapshot = mary::model_collection::load_model_collection_local_latest(
+            &pile,
+            mary::model_collection::model_graph_team_at(&pile).expect("sole model-graph team"),
+        )
+        .expect("load native model collection snapshot for streaming");
         let stream_selected = SelectedModelIndex::from_snapshot(
             stream_snapshot,
             ModelSelector::Source {
@@ -78,8 +81,11 @@ mod imp {
         drop(streamed);
 
         println!("[aliased] selecting and loading ZERO-COPY from the pile mmap...");
-        let alias_snapshot = mary::model_collection::load_model_collection_local_latest(&pile)
-            .expect("load native model collection snapshot for aliasing");
+        let alias_snapshot = mary::model_collection::load_model_collection_local_latest(
+            &pile,
+            mary::model_collection::model_graph_team_at(&pile).expect("sole model-graph team"),
+        )
+        .expect("load native model collection snapshot for aliasing");
         let alias_selected = SelectedModelIndex::from_snapshot(
             alias_snapshot,
             ModelSelector::Source {

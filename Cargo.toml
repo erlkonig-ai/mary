@@ -855,7 +855,7 @@ required-features = ["k3"]
 # needs the k3 feature in full.
 [[bin]]
 name = "k3_layer_gate"
-required-features = ["k3"]
+required-features = ["k3", "cuda-backend"]
 
 [[bin]]
 name = "mxfp4_gate"
@@ -903,7 +903,7 @@ required-features = ["personaplex"]
 # missed.
 [[bin]]
 name = "resident_final"
-required-features = ["k3"]
+required-features = ["k3", "cuda-backend"]
 
 # Twelve Blackwell/CUDA binaries that had no entry at all. Each reaches
 # `models::inkling` or `cubecl`, so under any feature set without
