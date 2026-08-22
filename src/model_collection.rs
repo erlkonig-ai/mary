@@ -28,7 +28,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace::core::metadata;
-use triblespace::core::collection::descriptor::Reach;
+use triblespace::core::collection::reach;
 use triblespace::core::collection::records::{collection_name, collection_team};
 use triblespace::core::inline::encodings::ed25519::ED25519PublicKey;
 use triblespace::core::inline::encodings::shortstring::ShortString;
@@ -314,18 +314,18 @@ impl Error for LoadModelCollectionError {
     }
 }
 
-// `Reach::Private` on both, and it is the only value that keeps these
+// `reach::private()` on both, and it is the only value that keeps these
 // working: a private descriptor is byte-identical to one built before reach
 // existed, so the collection keeps the identity it already had. Runtime
 // loading is bound to the model-bundle collection by content address, so a
 // descriptor that gained a declared reach would be a different collection and
 // every already-persisted model pile would stop resolving.
 fn model_graph_collection(team: VerifyingKey) -> SimpleArchiveCollection {
-    SimpleArchiveCollection::new(mary_model_graph_name(), team, Reach::Private)
+    SimpleArchiveCollection::new(mary_model_graph_name(), team, reach::private())
 }
 
 fn model_bundle_collection(team: VerifyingKey) -> SimpleArchiveCollection {
-    SimpleArchiveCollection::new(mary_model_bundle_name(), team, Reach::Private)
+    SimpleArchiveCollection::new(mary_model_bundle_name(), team, reach::private())
 }
 
 /// Content identity of one team's PersonaPlex bundle source collection.
@@ -1857,7 +1857,7 @@ mod tests {
         // descriptor's identity, so a public foreign one would differ from the
         // model graph by two things and stop isolating the one under test.
         let foreign_descriptor =
-            simplearchive_union::descriptor(&foreign_name, test_team(), Reach::Private);
+            simplearchive_union::descriptor(&foreign_name, test_team(), reach::private());
         let (foreign_fragment, _, _) = fragment_fixture("foreign");
         let foreign = simplearchive_union::publish_fragment_commit(
             &mut pile,
