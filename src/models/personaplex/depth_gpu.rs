@@ -211,9 +211,10 @@ fn add_rms_kernel(
 /// visible range is `lo..=step` (the effective window 15, see module docs) and
 /// `q_scale` is the exact 2⁻³ attention scale.
 ///
-/// Race-freedom: cube `h` writes and reads only head `h`'s slice of the KV
-/// slots, and the write is separated from the reads by the `sync_cube` that
-/// publishes `q`.
+/// The current slot is read directly from `qkv`, not back through `kc`/`vc`.
+/// `sync_cube` lowers to a workgroup-memory barrier on WGSL and does not make
+/// one thread's storage write visible to another. Cache writes are therefore
+/// pure output here and are consumed only by later dispatches.
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 fn dep_attn_kernel(
@@ -243,10 +244,18 @@ fn dep_attn_kernel(
 
     let n = step + 1 - lo;
     if i < n {
-        let kb = (layer * steps + lo + i) * hidden + h * hd;
+        let key_step = lo + i;
+        let kb = (layer * steps + key_step) * hidden + h * hd;
+        let live_kb = hidden + h * hd;
         let mut s = f32::new(0.0);
-        for j in 0..hd {
-            s += qsh[j as usize] * kc[(kb + j) as usize];
+        if key_step < step {
+            for j in 0..hd {
+                s += qsh[j as usize] * kc[(kb + j) as usize];
+            }
+        } else {
+            for j in 0..hd {
+                s += qsh[j as usize] * qkv[(live_kb + j) as usize];
+            }
         }
         sc[i as usize] = s;
     }
@@ -280,10 +289,11 @@ fn dep_attn_kernel(
 
     let mut acc = f32::new(0.0);
     let mut t = u32::new(0);
-    while t < n {
+    while t + 1 < n {
         acc += sc[t as usize] * vc[((layer * steps + lo + t) * hidden + h * hd + i) as usize];
         t += 1;
     }
+    acc += sc[(n - 1) as usize] * qkv[(2 * hidden + dim) as usize];
     out[dim as usize] = acc;
 }
 
