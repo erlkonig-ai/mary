@@ -231,9 +231,7 @@ fn run<B: Backend>(args: &Args) {
         &params,
         &mut rng,
         &dev,
-        |f| {
-            let _ = tx.send(*f);
-        },
+        |f| tx.send(*f).is_ok(),
     );
     drop(tx);
     let t_gen = t_start.elapsed().as_secs_f64();

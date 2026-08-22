@@ -236,12 +236,13 @@ pub fn generate<B: Backend>(
         params,
         rng,
         device,
-        |_| {},
+        |_| true,
     )
 }
 
 /// [`generate`] with a per-frame sink — the streaming path hands each frame
-/// to the codec thread the moment it is sampled.
+/// to the codec thread the moment it is sampled. Returning `false` from the
+/// sink stops generation without retaining the rejected frame.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_streaming<B: Backend>(
     talker: &Talker<B>,
@@ -252,7 +253,7 @@ pub fn generate_streaming<B: Backend>(
     params: &SamplingParams,
     rng: &mut StdRng,
     device: &B::Device,
-    mut on_frame: impl FnMut(&[u32; NUM_CODE_GROUPS]),
+    mut on_frame: impl FnMut(&[u32; NUM_CODE_GROUPS]) -> bool,
 ) -> Vec<[u32; NUM_CODE_GROUPS]> {
     let bench = std::env::var("QWEN3TTS_BENCH").is_ok();
     // Parity gate: run BOTH predictor engines on every frame's real inputs and
@@ -337,7 +338,9 @@ pub fn generate_streaming<B: Backend>(
         let mut frame = [0u32; NUM_CODE_GROUPS];
         frame[0] = code0;
         frame[1..].copy_from_slice(&rest);
-        on_frame(&frame);
+        if !on_frame(&frame) {
+            break;
+        }
         frames.push(frame);
 
         // next talker input: Σ₁₆ codebook embeds (assembled host-side, one

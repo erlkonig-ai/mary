@@ -412,8 +412,8 @@ fn env_f64(name: &str, default: f64) -> f64 {
 /// A live synthesis: iterate it for 24 kHz mono PCM chunks in `[-1, 1]` as
 /// they become ready (the first chunk arrives after prefill + `HOP` frames —
 /// seconds, not the whole utterance), then call [`finish`](Self::finish) to
-/// propagate any synthesis error. Dropping it early lets the running
-/// generation complete in the background (frames are cheaply drained).
+/// propagate any synthesis error. Dropping it early cancels the remaining
+/// generation once the codec next tries to emit a PCM chunk.
 pub struct SpeakStream {
     rx: mpsc::Receiver<Vec<f32>>,
     gen: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
@@ -619,7 +619,7 @@ fn synthesize_stream_impl<B: Backend + 'static>(
                                      from: usize,
                                      to: usize,
                                      emitted: &mut usize,
-                                     ttfa: &mut f64| {
+                                     ttfa: &mut f64| -> bool {
                         let c = ctx.min(from);
                         let td = Instant::now();
                         let wav = codec.decode(&history[from - c..to], &cdev);
@@ -636,32 +636,38 @@ fn synthesize_stream_impl<B: Backend + 'static>(
                             );
                         }
                         *emitted += pcm.len();
-                        // receiver gone = caller dropped the stream; keep
-                        // draining frames so generation can finish.
-                        let _ = tx_pcm.send(pcm);
+                        tx_pcm.send(pcm).is_ok()
                     };
 
+                    // A failed PCM send ends this loop and drops `rx_c`; the
+                    // generation sink then sees its frame send fail and stops.
                     while let Ok(msg) = rx_c.recv() {
                         match msg {
                             CodecMsg::Frame(f) => {
                                 history.push(f);
                                 if history.len() - decoded_upto >= hop {
                                     let (from, to) = (decoded_upto, history.len());
-                                    flush(&history, from, to, &mut emitted, &mut ttfa);
+                                    if !flush(&history, from, to, &mut emitted, &mut ttfa) {
+                                        break;
+                                    }
                                     decoded_upto = to;
                                 }
                             }
                             CodecMsg::PassEnd { gap } => {
                                 if history.len() > decoded_upto {
                                     let (from, to) = (decoded_upto, history.len());
-                                    flush(&history, from, to, &mut emitted, &mut ttfa);
+                                    if !flush(&history, from, to, &mut emitted, &mut ttfa) {
+                                        break;
+                                    }
                                 }
                                 history.truncate(ref_len);
                                 decoded_upto = ref_len;
                                 if gap {
                                     let silence = vec![0.0f32; SAMPLE_RATE as usize / 6]; // ~167 ms
                                     emitted += silence.len();
-                                    let _ = tx_pcm.send(silence);
+                                    if tx_pcm.send(silence).is_err() {
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -733,12 +739,12 @@ fn synthesize_stream_impl<B: Backend + 'static>(
                     &params,
                     &mut rng,
                     &dev,
-                    |f| {
-                        let _ = tx_c.send(CodecMsg::Frame(*f));
-                    },
+                    |f| tx_c.send(CodecMsg::Frame(*f)).is_ok(),
                 );
                 total_frames += frames.len();
-                let _ = tx_c.send(CodecMsg::PassEnd { gap: i + 1 < chunks.len() });
+                if tx_c.send(CodecMsg::PassEnd { gap: i + 1 < chunks.len() }).is_err() {
+                    break;
+                }
                 eprintln!(
                     "  pass {}/{}: {} chars → {} frames",
                     i + 1,
