@@ -4,9 +4,11 @@
 //!   cargo run --release --features personaplex,q4 --bin depth_gpu_probe -- \
 //!     dispatch
 //!   cargo run --release --features personaplex,q4 --bin depth_gpu_probe -- \
-//!     bench [--fmt q4|q8|f16] [--nq N] [--synth] [pile-path]
+//!     bench <pile-path> [--fmt q4|q8|f16] [--nq N]
 //!   cargo run --release --features personaplex,q4 --bin depth_gpu_probe -- \
-//!     gate  [--fmt q4|q8|f16] [--frames N] [pile-path]
+//!     bench --synth [--fmt q4|q8|f16] [--nq N]
+//!   cargo run --release --features personaplex,q4 --bin depth_gpu_probe -- \
+//!     gate <pile-path> [--fmt q4|q8|f16] [--frames N]
 //!
 //! `dispatch` measures the per-dispatch floor of the device — the number the
 //! depth port's kernel layout is designed against (its matvecs are small
@@ -42,8 +44,34 @@ use mary::nn::weight_loader::WeightLoader;
 use std::path::Path;
 use std::time::Instant;
 
-const DEFAULT_PILE: &str =
-    "/Volumes/pile_backup/models/personaplex.pile.rehearsal-20260821T123950Z";
+fn pile_arg(args: &[String]) -> Option<&str> {
+    let mut pile = None;
+    let mut i = 1; // mode
+    while i < args.len() {
+        match args[i].as_str() {
+            "--fmt" | "--nq" | "--frames" | "--rounds" => {
+                assert!(i + 1 < args.len(), "{} requires a value", args[i]);
+                i += 2;
+            }
+            "--synth" | "--skip-cpu" => i += 1,
+            flag if flag.starts_with("--") => panic!("unknown flag {flag}"),
+            path => {
+                assert!(
+                    pile.replace(path).is_none(),
+                    "more than one pile path supplied"
+                );
+                i += 1;
+            }
+        }
+    }
+    pile
+}
+
+fn require_pile<'a>(mode: &str, pile: Option<&'a str>) -> &'a str {
+    pile.unwrap_or_else(|| {
+        panic!("{mode} requires an explicit PersonaPlex pile path (or use bench --synth)")
+    })
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -58,20 +86,26 @@ fn main() {
     let fmt = val("--fmt")
         .map(|s| WeightFmt::parse(&s).unwrap_or_else(|| panic!("bad --fmt {s}")))
         .unwrap_or(WeightFmt::Q8);
-    let pile = args
-        .iter()
-        .skip(1)
-        .find(|a| !a.starts_with("--") && Path::new(a).exists())
-        .cloned()
-        .unwrap_or_else(|| DEFAULT_PILE.into());
-    let nq: usize = val("--nq").map(|s| s.parse().unwrap()).unwrap_or(cfg::DEP_Q);
+    let pile = pile_arg(&args);
+    let nq: usize = val("--nq")
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(cfg::DEP_Q);
     let frames: usize = val("--frames").map(|s| s.parse().unwrap()).unwrap_or(25);
     let rounds: usize = val("--rounds").map(|s| s.parse().unwrap()).unwrap_or(8);
+    let synth = flag("--synth");
 
     match mode.as_str() {
-        "dispatch" => dispatch(),
-        "bench" => bench(fmt, nq, frames, rounds, flag("--synth"), &pile, flag("--skip-cpu")),
-        "gate" => gate(fmt, frames, &pile),
+        "dispatch" => {
+            assert!(pile.is_none(), "dispatch does not accept a pile path");
+            dispatch();
+        }
+        "bench" => {
+            if synth {
+                assert!(pile.is_none(), "bench --synth does not accept a pile path");
+            }
+            bench(fmt, nq, frames, rounds, synth, pile, flag("--skip-cpu"));
+        }
+        "gate" => gate(fmt, frames, require_pile("gate", pile)),
         m => panic!("unknown mode {m} (dispatch | bench | gate)"),
     }
 }
@@ -107,7 +141,10 @@ fn dispatch() {
                 total / n as f64 * 1e6
             );
         }
-        println!("RESULT dispatch [{out}x{inn}] best {:.2} us/dispatch", best * 1e6);
+        println!(
+            "RESULT dispatch [{out}x{inn}] best {:.2} us/dispatch",
+            best * 1e6
+        );
     }
 }
 
@@ -171,7 +208,7 @@ fn bench(
     frames: usize,
     rounds: usize,
     synth: bool,
-    pile: &str,
+    pile: Option<&str>,
     skip_cpu: bool,
 ) {
     let t0 = Instant::now();
@@ -179,6 +216,7 @@ fn bench(
         eprintln!("building synthetic depth_gpu ({}) …", fmt_name(fmt));
         (DepthGpu::synthetic(fmt), None, None)
     } else {
+        let pile = require_pile("bench", pile);
         eprintln!("loading depth_gpu ({}) from {pile} …", fmt_name(fmt));
         let loader = pile_loader(pile);
         let alpha = out_norm_alpha(&loader);
@@ -247,7 +285,10 @@ fn bench(
             "RESULT depth_fast cpu-f16 n_q=16 : p50 {c50:.2} ms/frame  (min {clo:.2}, max {chi:.2}, n={})",
             per_frame.len()
         );
-        println!("RESULT speedup : {:.2}x  ({c50:.2} ms CPU -> {p50:.2} ms GPU)", c50 / p50);
+        println!(
+            "RESULT speedup : {:.2}x  ({c50:.2} ms CPU -> {p50:.2} ms GPU)",
+            c50 / p50
+        );
     }
 }
 
@@ -268,7 +309,10 @@ fn cos_maxd(a: &[f32], b: &[f32]) -> (f64, f64) {
 }
 
 fn gate(fmt: WeightFmt, frames: usize, pile: &str) {
-    eprintln!("loading depth_gpu ({}) + depth_fast (f32) from {pile} …", fmt_name(fmt));
+    eprintln!(
+        "loading depth_gpu ({}) + depth_fast (f32) from {pile} …",
+        fmt_name(fmt)
+    );
     let loader = pile_loader(pile);
     let alpha = out_norm_alpha(&loader);
     let mut gpu = DepthGpu::load(&loader, fmt);
@@ -352,4 +396,39 @@ fn gate(fmt: WeightFmt, frames: usize, pile: &str) {
         fmt_name(fmt),
         100.0 * free_agree as f64 / free_total as f64
     );
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn pile_path_is_explicit_and_flags_do_not_become_positionals() {
+        let values = args(&[
+            "gate",
+            "--fmt",
+            "q8",
+            "/models/personaplex.pile",
+            "--frames",
+            "2",
+        ]);
+        assert_eq!(pile_arg(&values), Some("/models/personaplex.pile"));
+    }
+
+    #[test]
+    fn synthetic_bench_needs_no_pile() {
+        let values = args(&["bench", "--synth", "--fmt", "f16"]);
+        assert_eq!(pile_arg(&values), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "gate requires an explicit PersonaPlex pile path")]
+    fn gate_without_pile_is_rejected() {
+        let values = args(&["gate", "--frames", "2"]);
+        let _ = require_pile("gate", pile_arg(&values));
+    }
 }
