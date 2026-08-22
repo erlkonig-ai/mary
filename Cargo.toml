@@ -748,31 +748,32 @@ burn-ndarray = "0.21.0"
 # burn, forked for a matmul defect: launch_matmul bound the non-quantized
 # rhs with the LHS dtype, so mixed-dtype matmul silently returned about half
 # the correct value (f32 x BF16) or NaN (BF16 x f32). See
-# ../burn-fork branch fix/matmul-rhs-dtype. All members are patched together
-# because the burn workspace uses path+version deps: patching a subset yields
-# two copies of burn-tensor in one binary.
-burn = { path = "../burn-fork/crates/burn" }
-burn-autodiff = { path = "../burn-fork/crates/burn-autodiff" }
-burn-backend = { path = "../burn-fork/crates/burn-backend" }
-burn-core = { path = "../burn-fork/crates/burn-core" }
-burn-cubecl = { path = "../burn-fork/crates/burn-cubecl" }
-burn-cubecl-fusion = { path = "../burn-fork/crates/burn-cubecl-fusion" }
-burn-cuda = { path = "../burn-fork/crates/burn-cuda" }
-burn-dataset = { path = "../burn-fork/crates/burn-dataset" }
-burn-derive = { path = "../burn-fork/crates/burn-derive" }
-burn-dispatch = { path = "../burn-fork/crates/burn-dispatch" }
-burn-flex = { path = "../burn-fork/crates/burn-flex" }
-burn-fusion = { path = "../burn-fork/crates/burn-fusion" }
-burn-ir = { path = "../burn-fork/crates/burn-ir" }
-burn-ndarray = { path = "../burn-fork/crates/burn-ndarray" }
-burn-nn = { path = "../burn-fork/crates/burn-nn" }
-burn-optim = { path = "../burn-fork/crates/burn-optim" }
-burn-rl = { path = "../burn-fork/crates/burn-rl" }
-burn-std = { path = "../burn-fork/crates/burn-std" }
-burn-tensor = { path = "../burn-fork/crates/burn-tensor" }
-burn-train = { path = "../burn-fork/crates/burn-train" }
-burn-vision = { path = "../burn-fork/crates/burn-vision" }
-burn-wgpu = { path = "../burn-fork/crates/burn-wgpu" }
+# erlkonig-ai/burn branch fix/matmul-rhs-dtype. Pin the exact revision so a
+# Mary checkout is self-contained instead of depending on an adjacent clone.
+# All members are patched together because the Burn workspace uses
+# path+version deps: patching a subset yields two copies of burn-tensor.
+burn = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-autodiff = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-backend = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-core = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-cubecl = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-cubecl-fusion = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-cuda = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-dataset = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-derive = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-dispatch = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-flex = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-fusion = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-ir = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-ndarray = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-nn = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-optim = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-rl = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-std = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-tensor = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-train = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-vision = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-wgpu = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
 # Forked to add a zero-copy "register an externally-created GPU buffer as a
 # tensor handle" seam (mmap'd f16 pile pages -> Metal newBufferWithBytesNoCopy ->
 # wgpu buffer -> cubecl handle). Unmodified baseline first; patched below.
