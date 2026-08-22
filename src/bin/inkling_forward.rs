@@ -2806,6 +2806,11 @@ fn main() -> Result<()> {
     fatal::arm();
     let allocator = mary::models::inkling::pool::choose_memory_config();
     let cleanup = mary::models::inkling::pool::CleanupPolicy::choose();
+    anyhow::ensure!(
+        dev_lane::act_bf16() || !dev_lane_resid::resid_bf16(),
+        "INK_RESID_BF16=1 requires the narrow activation lane; either leave \
+         INK_ACT_BF16 enabled or set INK_RESID_BF16=0 for the fully wide lane"
+    );
 
     let pile_path = std::env::args().nth(1).map(PathBuf::from).context("usage: <pile> <ids> <out>")?;
     let ids_path = std::env::args().nth(2).map(PathBuf::from).context("usage: <pile> <ids> <out>")?;

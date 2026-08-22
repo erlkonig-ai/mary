@@ -610,7 +610,15 @@ pub fn largest_buffer(
         .map(|l| {
             let kind = t.attn_kind(l);
             let (heads, _, head_dim) = t.heads(kind);
-            let act = activation_bytes(heads, head_dim, tokens, policy.activation);
+            // Only the global prefill lane narrows Q/K/V. The local raw
+            // kernels still index f32 buffers, so pricing their Q at the
+            // configurable activation width would make this supposedly exact
+            // cap check permissive for another model whose Q is the maximum.
+            let attention_dtype = match kind {
+                AttnKind::Local => StorageDType::F32,
+                AttnKind::Global => policy.activation,
+            };
+            let act = activation_bytes(heads, head_dim, tokens, attention_dtype);
             let attn = match kind {
                 AttnKind::Local => {
                     let eff = t.rel_span(kind).min(tokens) as u64;

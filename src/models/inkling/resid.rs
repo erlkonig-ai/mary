@@ -115,10 +115,12 @@ const ADD_UNITS: u32 = 256;
 /// in BF16.
 ///
 /// **Defaults to [`super::burn::act_bf16`]** — the narrow lane is one lane —
-/// and `INK_RESID_BF16=0` or `=1` overrides it either way. The override exists
-/// so the two halves of the narrow lane can be priced apart: `INK_ACT_BF16=1
+/// and `INK_RESID_BF16=0` keeps the residual wide while the activations narrow.
+/// That override lets the two halves be priced apart: `INK_ACT_BF16=1
 /// INK_RESID_BF16=0` is exactly the lane that shipped before this, and the
-/// difference between it and the default is this file.
+/// difference between it and the default is this file. The opposite mix is not
+/// a lane: a narrow residual feeding deliberately wide activations is rejected
+/// at startup by `inkling_forward`.
 ///
 /// ## What the reference does here
 ///
