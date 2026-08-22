@@ -233,6 +233,108 @@ pub fn select_model_root(
     }
 }
 
+/// Resolve every model root matching `selector`, for a component that may be
+/// sharded across several of them.
+///
+/// [`select_model_root`] answers "which root is this?" and is right whenever a
+/// coordinate names exactly one. This answers "which roots make this up?", and
+/// is the entry point [`index_keymap_for_roots`] needs: a sharded checkpoint
+/// gives every one of its files the same coordinate, so the singular selector
+/// fails `exactly_one` on precisely the models that need selecting.
+///
+/// More than one root coming back is a CLAIM that they are shards of one
+/// component, not a verified fact — this only knows they share a coordinate.
+/// [`index_keymap_for_roots`] is what tests the claim, by requiring their
+/// tensor names to be disjoint. Keeping those two steps apart is deliberate:
+/// selection reads coordinates, and the merge is where a wrong grouping is
+/// caught, so a mislabelled root fails loudly at load rather than quietly
+/// shadowing a tensor.
+///
+/// `Only` returns every root in the graph, which is what "this graph holds one
+/// model" means once that model can span roots. `Root` returns just the one
+/// named, since an exact content address is never a group.
+///
+/// The result is sorted and duplicate-free, so callers see one deterministic
+/// order regardless of query iteration.
+pub fn select_model_roots(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    selector: ModelSelector<'_>,
+) -> anyhow::Result<Vec<Id>> {
+    let roots: BTreeSet<Id> = match selector {
+        ModelSelector::Only => model_roots(tribles),
+        ModelSelector::Root(root) => {
+            if !model_roots(tribles).contains(&root) {
+                bail!("model root {root} is absent or has no members");
+            }
+            BTreeSet::from([root])
+        }
+        ModelSelector::Name(wanted) => {
+            let matches: BTreeSet<Id> = find!(
+                (model: Id, name: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
+                pattern!(tribles, [{ ?model @ attrs::model_name: ?name, attrs::member: _?member }])
+            )
+            .filter_map(
+                |(model, name)| match read_long_string(blobs, name, "model_name") {
+                    Ok(name) if name == wanted => Some(Ok(model)),
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                },
+            )
+            .collect::<anyhow::Result<BTreeSet<_>>>()?;
+            for &root in &matches {
+                validate_model_name(tribles, blobs, root, wanted)?;
+            }
+            matches
+        }
+        ModelSelector::Source {
+            source: wanted_source,
+            quantization,
+        } => {
+            let matches: BTreeSet<Id> = find!(
+                (model: Id, source: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
+                pattern!(tribles, [{ ?model @
+                    attrs::source: ?source,
+                    attrs::quantization: quantization,
+                    attrs::member: _?member,
+                }])
+            )
+            .filter_map(
+                |(model, source)| match read_long_string(blobs, source, "source") {
+                    Ok(source) if source == wanted_source => Some(Ok(model)),
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                },
+            )
+            .collect::<anyhow::Result<BTreeSet<_>>>()?;
+            for &root in &matches {
+                validate_source_coordinates(tribles, blobs, root, wanted_source, quantization)?;
+            }
+            matches
+        }
+    };
+
+    if roots.is_empty() {
+        bail!("no model root matches {selector:?}");
+    }
+    Ok(roots.into_iter().collect())
+}
+
+/// Index a component named by `selector`, however many roots carry it.
+///
+/// The pair of [`select_model_roots`] and [`index_keymap_for_roots`], which is
+/// how a caller should normally reach a sharded component: one coordinate in,
+/// one strict `name -> leaf` index out, whether the writer split the weights
+/// across one file or four.
+pub fn index_keymap_for_selector(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    selector: ModelSelector<'_>,
+) -> anyhow::Result<HashMap<String, Leaf>> {
+    let roots = select_model_roots(tribles, blobs, selector)?;
+    index_keymap_for_roots(tribles, blobs, &roots)
+}
+
 fn model_members(tribles: &TribleSet, root: Id) -> anyhow::Result<BTreeSet<Id>> {
     let members: BTreeSet<_> = find!(
         (member: Id),
@@ -663,6 +765,117 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("ambiguous weight edge"), "{error}");
+    }
+
+    /// One coordinate, two shard roots. The singular selector refuses this
+    /// graph, which is the whole reason the plural one exists.
+    #[test]
+    fn a_coordinate_naming_two_shards_selects_both_and_indexes_as_one() {
+        let mut facts = TribleSet::new();
+        let mut blobs = MemoryBlobStore::new();
+        let first = add_model(
+            &mut facts,
+            &mut blobs,
+            "model-00001-of-00002.safetensors",
+            "google/gemma-3-1b",
+            "native",
+            &[("model.layers.0.weight", 1.0)],
+        );
+        let second = add_model(
+            &mut facts,
+            &mut blobs,
+            "model-00002-of-00002.safetensors",
+            "google/gemma-3-1b",
+            "native",
+            &[("model.layers.1.weight", 2.0)],
+        );
+        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let selector = ModelSelector::Source {
+            source: "google/gemma-3-1b",
+            quantization: "native",
+        };
+
+        // The singular selector cannot express a sharded component.
+        assert!(select_model_root(&facts, &reader, selector).is_err());
+
+        let mut expected = vec![first.root, second.root];
+        expected.sort();
+        assert_eq!(select_model_roots(&facts, &reader, selector).unwrap(), expected);
+
+        let index = index_keymap_for_selector(&facts, &reader, selector).unwrap();
+        let mut names: Vec<&String> = index.keys().collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["model.layers.0.weight", "model.layers.1.weight"]
+        );
+        assert_eq!(index["model.layers.0.weight"].to_f32(), vec![1.0]);
+        assert_eq!(index["model.layers.1.weight"].to_f32(), vec![2.0]);
+    }
+
+    /// Sharing a coordinate is a claim, not proof. Selection groups the roots;
+    /// the merge is what rejects a grouping that cannot be shards.
+    #[test]
+    fn a_mislabelled_root_is_caught_by_the_merge_not_by_selection() {
+        let mut facts = TribleSet::new();
+        let mut blobs = MemoryBlobStore::new();
+        add_model(
+            &mut facts,
+            &mut blobs,
+            "shard-a",
+            "vendor/model",
+            "native",
+            &[("model.layers.0.weight", 1.0)],
+        );
+        add_model(
+            &mut facts,
+            &mut blobs,
+            "mislabelled",
+            "vendor/model",
+            "native",
+            &[("model.layers.0.weight", 2.0)],
+        );
+        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let selector = ModelSelector::Source {
+            source: "vendor/model",
+            quantization: "native",
+        };
+
+        // Selection is happy — it only knows they share a coordinate.
+        assert_eq!(select_model_roots(&facts, &reader, selector).unwrap().len(), 2);
+        // The merge is where the wrong grouping fails, loudly.
+        let error = index_keymap_for_selector(&facts, &reader, selector)
+            .expect_err("a shadowed tensor must not load");
+        assert!(error.to_string().contains("not shards of one component"));
+    }
+
+    #[test]
+    fn an_exact_root_is_never_a_group_and_a_missing_coordinate_is_an_error() {
+        let mut facts = TribleSet::new();
+        let mut blobs = MemoryBlobStore::new();
+        let only = add_model(
+            &mut facts,
+            &mut blobs,
+            "solo",
+            "vendor/model",
+            "native",
+            &[("model.layers.0.weight", 1.0)],
+        );
+        let reader = BlobStore::reader(&mut blobs).unwrap();
+
+        assert_eq!(
+            select_model_roots(&facts, &reader, ModelSelector::Root(only.root)).unwrap(),
+            vec![only.root]
+        );
+        assert!(select_model_roots(
+            &facts,
+            &reader,
+            ModelSelector::Source {
+                source: "vendor/absent",
+                quantization: "native",
+            }
+        )
+        .is_err());
     }
 
     /// The gemma-3-1b shape: one component, two files, layers INTERLEAVED
