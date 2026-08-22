@@ -544,11 +544,13 @@ source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61
 dependencies = [
  "burn-autodiff",
  "burn-core",
+ "burn-cpu",
  "burn-cuda",
  "burn-dispatch",
  "burn-ndarray",
  "burn-nn",
  "burn-optim",
+ "burn-rocm",
  "burn-std",
  "burn-train",
  "burn-vision",
@@ -617,6 +619,16 @@ dependencies = [
  "serde_json",
  "spin",
  "uuid",
+]
+
+[[package]]
+name = "burn-cpu"
+version = "0.21.0"
+source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
+dependencies = [
+ "burn-backend",
+ "burn-cubecl",
+ "cubecl",
 ]
 
 [[package]]
@@ -811,6 +823,16 @@ dependencies = [
  "derive-new",
  "log",
  "rand 0.10.2",
+]
+
+[[package]]
+name = "burn-rocm"
+version = "0.21.0"
+source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
+dependencies = [
+ "burn-backend",
+ "burn-cubecl",
+ "cubecl",
 ]
 
 [[package]]

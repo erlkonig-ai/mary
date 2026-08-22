@@ -100,7 +100,21 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 # B: Backend generic, TemporalMetal is raw cubecl, DepthFast/Mimi are CPU).
 cuda-backend = ["q4", "cubecl?/cuda"]
 # Investigation-only: burn's REAL Cuda backend, for backend_matmul_probe.
-burn-cuda-bench = ["burn/cuda"]
+burn-cuda-bench = ["burn/cuda", "burn/autotune"]
+
+# Why `burn/autotune` rides along with every `burn/cuda` feature instead of
+# sitting on the top-level `burn` dep: it is worth 146-177 -> 187-194 GB/s on
+# burn's own CUDA matmul at M=1, and it costs the hand-written cubecl kernels
+# nothing on CUDA -- 3+3 interleaved moshi_q4_probe runs on the Spark with
+# burn's Cuda backend autotuning on the SAME cubecl client measured f16 matvec
+# 229.0-229.4 -> 228.8-229.6 GB/s and q4 matvec 214.9-216.5 -> 215.8-216.6,
+# control op unmoved. On burn-wgpu the same switch measured those same hand
+# kernels 1.7-1.8x SLOWER, so it must never be on for a Metal build. burn
+# exposes autotune as one flag that lands in burn-cubecl (shared by both
+# backends), so "CUDA yes, WGPU no" is not expressible per-backend; gating it
+# on the CUDA-only features is the closest safe approximation, since none of
+# them is selectable without the CUDA toolkit and a macOS build therefore
+# cannot turn it on.
 # Kimi-K3 (mary::models::k3) - the 2.78 T-param MoE vision-language model.
 # Currently the loading skeleton only: config parsing plus the checkpoint
 # name->module-slot layout. serde/serde_json are unconditional deps, so this
@@ -117,7 +131,7 @@ burn-cuda-bench = ["burn/cuda"]
 k3 = ["import", "mxfp4", "burn/ndarray", "dep:safetensors", "dep:memmap2", "dep:sha2", "dep:burn-ndarray"]
 # ...and the GB10/sm_121 lane on top, so the layer is also checked on the
 # backend it will actually run on here. Needs the CUDA toolkit present.
-k3-cuda = ["k3", "burn/cuda"]
+k3-cuda = ["k3", "burn/cuda", "burn/autotune"]
 
 # Inkling (Thinking Machines) - the 42-layer (276 B / 12 B active) MoE, on the
 # only hardware it runs on. ONE feature, where there were three.
@@ -137,6 +151,7 @@ inkling-cuda = [
     "dep:safetensors",
     "dep:memmap2",
     "burn/cuda",
+    "burn/autotune",
     "dep:cubecl",
     "cubecl?/cuda",
     "dep:cubek",
@@ -158,7 +173,7 @@ inkling-cuda = [
 k3-attn-res = ["k3", "import", "burn/ndarray", "dep:burn-ndarray"]
 # ...and the GB10/sm_121 lane on top, so the primitive is also checked on the
 # backend it will actually run on here. Needs the CUDA toolkit present.
-k3-attn-res-cuda = ["k3-attn-res", "burn/cuda"]
+k3-attn-res-cuda = ["k3-attn-res", "burn/cuda", "burn/autotune"]
 # Safetensors → pile IMPORT support. The ONLY feature that compiles a
 # safetensors reader (`WeightLoader::SingleFile`/`MultiShard`,
 # `ingest::save_safetensors`, `persist::persist_safetensors_to_pile`, the
