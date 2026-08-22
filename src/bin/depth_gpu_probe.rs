@@ -4,11 +4,18 @@
 //!   cargo run --release --features personaplex,q4 --bin depth_gpu_probe -- \
 //!     dispatch
 //!   cargo run --release --features personaplex,q4 --bin depth_gpu_probe -- \
-//!     bench <pile-path> [--fmt q4|q8|f16] [--nq N]
+//!     bench <pile-path> [--fmt SPEC] [--nq N]
 //!   cargo run --release --features personaplex,q4 --bin depth_gpu_probe -- \
-//!     bench --synth [--fmt q4|q8|f16] [--nq N]
+//!     bench --synth [--fmt SPEC] [--nq N]
 //!   cargo run --release --features personaplex,q4 --bin depth_gpu_probe -- \
-//!     gate <pile-path> [--fmt q4|q8|f16] [--frames N]
+//!     gate <pile-path> [--fmt SPEC] [--frames N]
+//!
+//! `--fmt SPEC` is a [`DepthFmt`] spec: a uniform `q4` / `q8` / `f16`, or a
+//! base with per-tensor overrides — `q8:mlp=q4`, `q8:gate_up=q4,down=q4`,
+//! `q8:qkv=f16`. Fields are `qkv`, `o`, `gate_up`, `down`, `head`, `dep_in`
+//! and the alias `mlp`. Default `q8`, which is the only format that gates
+//! (see [`DepthFmt`] for the measured mixed-format table — the tolerant-MLP
+//! idea is refuted there, so check it before re-running that experiment).
 //!
 //! `dispatch` measures the per-dispatch floor of the device — the number the
 //! depth port's kernel layout is designed against (its matvecs are small
@@ -37,7 +44,7 @@
 
 use mary::models::personaplex::config as cfg;
 use mary::models::personaplex::depth_fast::DepthFast;
-use mary::models::personaplex::depth_gpu::{DepthGpu, NO_FORCE};
+use mary::models::personaplex::depth_gpu::{DepthFmt, DepthGpu, NO_FORCE};
 use mary::models::personaplex::temporal_metal::WeightFmt;
 use mary::nn::q4;
 use mary::nn::weight_loader::WeightLoader;
@@ -84,8 +91,8 @@ fn main() {
             .cloned()
     };
     let fmt = val("--fmt")
-        .map(|s| WeightFmt::parse(&s).unwrap_or_else(|| panic!("bad --fmt {s}")))
-        .unwrap_or(WeightFmt::Q8);
+        .map(|s| DepthFmt::parse(&s).unwrap_or_else(|| panic!("bad --fmt {s}")))
+        .unwrap_or(DepthFmt::uniform(WeightFmt::Q8));
     let pile = pile_arg(&args);
     let nq: usize = val("--nq")
         .map(|s| s.parse().unwrap())
@@ -186,14 +193,6 @@ fn out_norm_alpha(loader: &WeightLoader) -> Vec<f32> {
     a
 }
 
-fn fmt_name(fmt: WeightFmt) -> &'static str {
-    match fmt {
-        WeightFmt::Q4 => "q4",
-        WeightFmt::Q8 => "q8",
-        WeightFmt::F16 => "f16",
-    }
-}
-
 fn stats(mut v: Vec<f64>) -> (f64, f64, f64) {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     (v[v.len() / 2], v[0], v[v.len() - 1])
@@ -203,7 +202,7 @@ fn stats(mut v: Vec<f64>) -> (f64, f64, f64) {
 
 #[allow(clippy::too_many_arguments)]
 fn bench(
-    fmt: WeightFmt,
+    fmt: DepthFmt,
     nq: usize,
     frames: usize,
     rounds: usize,
@@ -213,11 +212,11 @@ fn bench(
 ) {
     let t0 = Instant::now();
     let (mut gpu, mut cpu, alpha) = if synth {
-        eprintln!("building synthetic depth_gpu ({}) …", fmt_name(fmt));
+        eprintln!("building synthetic depth_gpu ({}) …", fmt.label());
         (DepthGpu::synthetic(fmt), None, None)
     } else {
         let pile = require_pile("bench", pile);
-        eprintln!("loading depth_gpu ({}) from {pile} …", fmt_name(fmt));
+        eprintln!("loading depth_gpu ({}) from {pile} …", fmt.label());
         let loader = pile_loader(pile);
         let alpha = out_norm_alpha(&loader);
         let g = DepthGpu::load(&loader, fmt);
@@ -259,7 +258,7 @@ fn bench(
     println!(
         "RESULT depth_gpu {} n_q={nq} : p50 {p50:.2} ms/frame  (min {lo:.2}, max {hi:.2}, n={})  \
          {:.2} GB/frame, {:.0} GB/s effective",
-        fmt_name(fmt),
+        fmt.label(),
         per_frame.len(),
         bytes / 1e9,
         bytes / (p50 * 1e-3) / 1e9,
@@ -308,10 +307,10 @@ fn cos_maxd(a: &[f32], b: &[f32]) -> (f64, f64) {
     (dot / (na.sqrt() * nb.sqrt()), maxd)
 }
 
-fn gate(fmt: WeightFmt, frames: usize, pile: &str) {
+fn gate(fmt: DepthFmt, frames: usize, pile: &str) {
     eprintln!(
         "loading depth_gpu ({}) + depth_fast (f32) from {pile} …",
-        fmt_name(fmt)
+        fmt.label()
     );
     let loader = pile_loader(pile);
     let alpha = out_norm_alpha(&loader);
@@ -379,12 +378,12 @@ fn gate(fmt: WeightFmt, frames: usize, pile: &str) {
 
     println!(
         "RESULT gate {} : teacher-forced logits cos min {cos_min:.6} mean {:.6}, max|Δ| {maxd_all:.4}",
-        fmt_name(fmt),
+        fmt.label(),
         cos_sum / cos_n as f64
     );
     println!(
         "RESULT gate {} : codebook-token agreement teacher-forced {tf_agree}/{tf_total} ({:.2}%){}",
-        fmt_name(fmt),
+        fmt.label(),
         100.0 * tf_agree as f64 / tf_total as f64,
         match first_div {
             Some((f, s)) => format!(", first divergence frame {f} step {s}"),
@@ -393,7 +392,7 @@ fn gate(fmt: WeightFmt, frames: usize, pile: &str) {
     );
     println!(
         "RESULT gate {} : codebook-token agreement free-running {free_agree}/{free_total} ({:.2}%)",
-        fmt_name(fmt),
+        fmt.label(),
         100.0 * free_agree as f64 / free_total as f64
     );
 }

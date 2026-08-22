@@ -664,6 +664,15 @@ impl WeightFmt {
             _ => None,
         }
     }
+
+    /// The inverse of [`Self::parse`].
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Q4 => "q4",
+            Self::Q8 => "q8",
+            Self::F16 => "f16",
+        }
+    }
 }
 
 /// One matvec weight in the chosen format, dispatching to the matching
