@@ -138,7 +138,8 @@ fn keys(a: KeysArgs) -> anyhow::Result<()> {
     // One observed local collection prefix supplies both the facts and reader;
     // selector policy stays explicit and no Repository branch or fallback
     // storage participates.
-    let snapshot = mary::model_collection::load_model_collection_local_latest(&a.pile)?;
+    let team = mary::model_collection::model_graph_team_at(&a.pile)?;
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&a.pile, team)?;
     let (selector, label) = match (&a.source, &a.root) {
         (Some(source), None) => (
             ModelSelector::Source {
