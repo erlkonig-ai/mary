@@ -71,7 +71,7 @@ macro_rules! dense_leaf {
             // put() returns the handle the facts then name, so the blob and the
             // fact about it cannot refer to different bytes.
             let handle = ws.put(blob);
-            let name_h = ws.put::<blobencodings::LongString, _>($name.to_string());
+            let name_h = ws.put::<blobencodings::UTF8String, _>($name.to_string());
             let mut facts = entity! { &ufoid() @
                 attrs::weight::<$elem, $rank>(): handle,
                 metadata::name: name_h,
@@ -151,7 +151,7 @@ fn verify_pile(dir: &str, pile_path: &str, limit: usize) -> Result<()> {
     macro_rules! sweep {
         ($elem:ty, $rank:literal) => {{
             for (n, h) in triblespace::macros::find!(
-                (n: Inline<inlineencodings::Handle<blobencodings::LongString>>,
+                (n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
                  h: Inline<inlineencodings::Handle<
                      triblespace::core::blob::encodings::tensor::Tensor<$elem, $rank>>>),
                 triblespace::macros::pattern!(&tribles, [
@@ -311,7 +311,7 @@ fn main() -> Result<()> {
                 macro_rules! seen {
                     ($elem:ty, $rank:literal) => {{
                         for (n, _h) in triblespace::macros::find!(
-                            (n: Inline<inlineencodings::Handle<blobencodings::LongString>>,
+                            (n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
                              h: Inline<inlineencodings::Handle<
                                  triblespace::core::blob::encodings::tensor::Tensor<$elem, $rank>>>),
                             triblespace::macros::pattern!(&facts, [

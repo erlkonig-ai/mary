@@ -192,7 +192,7 @@ pub mod attrs {
         "B4B6EC08A0CD70DE63A690168EE78F0F" as member: GenId;
         /// The tokenizer's source id (e.g. "nomic-ai/nomic-embed-text-v1.5").
         /// Reused from `format::attrs::model_name`.
-        "4C1CD1611863E7854C59C7DC706DF77A" as model_name: Handle<blobencodings::LongString>;
+        "4C1CD1611863E7854C59C7DC706DF77A" as model_name: Handle<blobencodings::UTF8String>;
 
         // ── minted 2026-07-16 (compass 67b09f72) — structural edges ──
         /// A model root → its tokenizer entity.
@@ -214,17 +214,17 @@ pub mod attrs {
 
         // ── minted 2026-07-16 — bulk leaves ──
         /// A token/subword string (vocab entry, added-token content). A
-        /// `LongString` blob, NOT `ShortString`: CLIP has 27 tokens over the
+        /// `UTF8String` blob, NOT `ShortString`: CLIP has 27 tokens over the
         /// 32-byte inline ceiling (byte-level BPE emoji clusters, up to 64 B).
         /// Content-addressed, so identical pieces (incl. merge halves) dedup.
-        "AE7FE29F2F38153F58C542D5CA4A9356" as piece: Handle<blobencodings::LongString>;
+        "AE7FE29F2F38153F58C542D5CA4A9356" as piece: Handle<blobencodings::UTF8String>;
         /// A token's vocab id (vocab entry, added token). Small int in a U256BE.
         "F0E2E782F7BB62F52B1186DDE0EB5388" as token_id: U256BE;
 
         // ── minted 2026-08-05 — the tiktoken lane ──
         /// A token's RAW BYTES. The byte-level sibling of `piece`, and the
         /// reason it had to be minted rather than reused: `piece` is a
-        /// `LongString`, and a tiktoken vocab is not UTF-8 — 1,172 of Kimi-K3's
+        /// `UTF8String`, and a tiktoken vocab is not UTF-8 — 1,172 of Kimi-K3's
         /// 163,584 base tokens are mid-codepoint merge fragments that no
         /// `String` can hold. (A HuggingFace `tokenizer.json` sidesteps this by
         /// storing GPT-2 byte-level-unicode *strings*; `tiktoken.model` stores
@@ -232,10 +232,10 @@ pub mod attrs {
         /// source file never mentions would be inventing a representation.)
         /// Content-addressed like `piece`, so shared tokens still dedup.
         "714AE13F801202EB27C83E3AB2290669" as piece_bytes: Handle<blobencodings::RawBytes>;
-        /// A BPE merge's left piece (`LongString`, dedups against `piece`).
-        "5723ECE1FF426C58879B79D5669A7CF1" as merge_left: Handle<blobencodings::LongString>;
-        /// A BPE merge's right piece (`LongString`, dedups against `piece`).
-        "5C78FEB151F35A2C5D07BEC92E860752" as merge_right: Handle<blobencodings::LongString>;
+        /// A BPE merge's left piece (`UTF8String`, dedups against `piece`).
+        "5723ECE1FF426C58879B79D5669A7CF1" as merge_left: Handle<blobencodings::UTF8String>;
+        /// A BPE merge's right piece (`UTF8String`, dedups against `piece`).
+        "5C78FEB151F35A2C5D07BEC92E860752" as merge_right: Handle<blobencodings::UTF8String>;
 
         // ── minted 2026-07-16 — config-tail model knobs (flat scalars) ──
         /// The unknown-token string (WordPiece "[UNK]", BPE "<|endoftext|>").
@@ -260,7 +260,7 @@ pub mod attrs {
         // ── minted 2026-07-16 — config-node flat fields ──
         /// A Replace/Split node's regex pattern string (stored raw; both our
         /// tokenizers use the Regex variant, reconstructed as Regex).
-        "C8262D5668B8A1F541B3C35D54201BEC" as pattern: Handle<blobencodings::LongString>;
+        "C8262D5668B8A1F541B3C35D54201BEC" as pattern: Handle<blobencodings::UTF8String>;
         /// A Replace node's replacement content (e.g. " ").
         "3AC7574C07D02D389B4E7AD3B3B084D9" as replace_content: ShortString;
         /// A Split node's SplitDelimiterBehavior name ("Removed"/"Isolated"/…).
@@ -318,7 +318,7 @@ pub fn save_tokenizer_json(
     // shared across tokenizers, where CLIP, nomic and Inkling overlap heavily —
     // is exactly as it was. Packing the vocabulary into one blob would have
     // destroyed that; a memo in front of the same puts cannot.
-    let mut memo: HashMap<String, Inline<inlineencodings::Handle<blobencodings::LongString>>> =
+    let mut memo: HashMap<String, Inline<inlineencodings::Handle<blobencodings::UTF8String>>> =
         HashMap::with_capacity(1 << 18);
     macro_rules! intern {
         ($blobs:expr, $s:expr) => {{
@@ -326,7 +326,7 @@ pub fn save_tokenizer_json(
             match memo.get(s) {
                 Some(h) => *h,
                 None => {
-                    let h = $blobs.put::<blobencodings::LongString, _>(s.to_string())?;
+                    let h = $blobs.put::<blobencodings::UTF8String, _>(s.to_string())?;
                     memo.insert(s.to_string(), h);
                     h
                 }
@@ -490,7 +490,7 @@ pub fn save_tiktoken(
         if entry.map(|e| e["special"].as_bool() == Some(true)).unwrap_or(false) {
             tags.push(flag::SPECIAL);
         }
-        let ch = blobs.put::<blobencodings::LongString, _>(content)?;
+        let ch = blobs.put::<blobencodings::UTF8String, _>(content)?;
         let e = entity! { _ @
             attrs::piece: ch,
             attrs::token_id: id,
@@ -503,7 +503,7 @@ pub fn save_tiktoken(
 
     // ── the pre-tokenizer node: the pattern, and the fact that it is applied
     //    by find_iter rather than as a Split (see ty::TIKTOKEN_PRE_TOKENIZER) ──
-    let pat_h = blobs.put::<blobencodings::LongString, _>(pat_str.to_string())?;
+    let pat_h = blobs.put::<blobencodings::UTF8String, _>(pat_str.to_string())?;
     let pretok = entity! { _ @
         metadata::tag: ty::TIKTOKEN_PRE_TOKENIZER,
         attrs::pattern: pat_h,
@@ -511,7 +511,7 @@ pub fn save_tiktoken(
     let pretok_id = pretok.root().expect("pre-tokenizer root");
     facts += pretok.into_facts();
 
-    let name_h = blobs.put::<blobencodings::LongString, _>(source_name.to_string())?;
+    let name_h = blobs.put::<blobencodings::UTF8String, _>(source_name.to_string())?;
     let tok = entity! { _ @
         metadata::tag: ty::TIKTOKEN,
         attrs::model_name: name_h,
@@ -584,13 +584,13 @@ fn save_config_node(
         "Replace" => {
             tags.push(ty::REPLACE);
             let pat = pattern_str().ok_or("Replace node missing pattern")?;
-            pattern_h = Some(blobs.put::<blobencodings::LongString, _>(pat.to_string())?);
+            pattern_h = Some(blobs.put::<blobencodings::UTF8String, _>(pat.to_string())?);
             replace_content = v["content"].as_str();
         }
         "Split" => {
             tags.push(ty::SPLIT);
             let pat = pattern_str().ok_or("Split node missing pattern")?;
-            pattern_h = Some(blobs.put::<blobencodings::LongString, _>(pat.to_string())?);
+            pattern_h = Some(blobs.put::<blobencodings::UTF8String, _>(pat.to_string())?);
             behavior = v["behavior"].as_str();
             if v["invert"].as_bool() == Some(true) {
                 tags.push(flag::INVERT);
@@ -636,10 +636,10 @@ fn save_config_node(
     Ok(id)
 }
 
-/// Read a `LongString` blob handle back to an owned `String`.
+/// Read a `UTF8String` blob handle back to an owned `String`.
 fn read_piece(
     blobs: &impl BlobStoreGet,
-    h: Inline<inlineencodings::Handle<blobencodings::LongString>>,
+    h: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
 ) -> String {
     let v: anybytes::View<str> = blobs.get(h).expect("piece blob");
     v.to_string()
@@ -766,7 +766,7 @@ pub fn load_pre_tokenizer_pattern(
 /// disambiguation BY the name; every current model pile holds one tokenizer.
 pub fn find_tokenizers(tribles: &TribleSet) -> impl Iterator<Item = Id> + '_ {
     find!(
-        (e: Id, t: Id, n: Inline<inlineencodings::Handle<blobencodings::LongString>>),
+        (e: Id, t: Id, n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
         pattern!(tribles, [{ ?e @ metadata::tag: ?t, attrs::model_name: ?n }])
     )
     // The model-type tags, and ONLY those: a tokenizer node also carries flag
@@ -1012,7 +1012,7 @@ macro_rules! short_field {
     };
 }
 
-/// Read a node's optional `LongString`-handle field back to a `String`.
+/// Read a node's optional `UTF8String`-handle field back to a `String`.
 #[cfg(feature = "tokenizer")]
 macro_rules! long_field {
     ($tribles:expr, $blobs:expr, $node:expr, $attr:path) => {
@@ -1057,7 +1057,7 @@ pub fn build_tokenizer(
     let tags = node_tags(tribles, tok_id);
     required_one(
         find!(
-            (name: Inline<inlineencodings::Handle<blobencodings::LongString>>),
+            (name: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
             pattern!(tribles, [{ tok_id @ attrs::model_name: ?name }])
         ),
         tok_id,
@@ -1409,7 +1409,7 @@ mod tests {
             vocab.len(),
             merges.len()
         );
-        // prove an over-inline-ceiling token survived the LongString round-trip
+        // prove an over-inline-ceiling token survived the UTF8String round-trip
         if let Some((tok, id)) = vocab.iter().find(|(t, _)| t.len() > 32) {
             eprintln!("[real]   >32-byte token round-tripped: {tok:?} = {id}");
         }
@@ -1547,7 +1547,7 @@ mod tests {
     #[cfg(feature = "k3tok")]
     #[test]
     fn tiktoken_ranks_and_specials_round_trip() {
-        // 0xff is not valid UTF-8 on its own — exactly the case a `LongString`
+        // 0xff is not valid UTF-8 on its own — exactly the case a `UTF8String`
         // `piece` could not hold.
         let model = "YQ== 0\nYg== 1\nYWI= 2\n/w== 3\n";
         let config = r#"{"added_tokens_decoder": {"5": {"content": "[BOS]", "special": true}},
@@ -1756,7 +1756,7 @@ pub fn save_spm_unigram(
         // `▁`-escaped), BYTE pieces are the literal "<0xAB>" surface.
         let text = String::from_utf8(bytes.clone())
             .map_err(|e| format!("spm piece {id} is not utf8: {e}"))?;
-        let ph = blobs.put::<blobencodings::LongString, _>(text)?;
+        let ph = blobs.put::<blobencodings::UTF8String, _>(text)?;
         let e = entity! { _ @
             metadata::tag: spm_type_tag(*typ),
             attrs::piece: ph,
@@ -1767,7 +1767,7 @@ pub fn save_spm_unigram(
         facts += e.into_facts();
     }
 
-    let name_h = blobs.put::<blobencodings::LongString, _>(source_name.to_string())?;
+    let name_h = blobs.put::<blobencodings::UTF8String, _>(source_name.to_string())?;
     let mut tags: Vec<Id> = vec![ty::UNIGRAM];
     if add_dummy_prefix {
         tags.push(flag::ADD_PREFIX_SPACE);

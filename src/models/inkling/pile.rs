@@ -437,7 +437,7 @@ pub mod attrs {
         /// id no reader would have asked for. The invariant is asserted below.
         "0B51DA3E67216213871743E045590DBC" as weight_nvfp4_2:
             inlineencodings::Handle<Tensor<NVFP4, 2>>;
-        // The checkpoint tensor name lives in `metadata::name` as a LongString
+        // The checkpoint tensor name lives in `metadata::name` as a UTF8String
         // handle, not here. It was a ShortString attribute until a real name —
         // `model.llm.layers.10.mlp.experts.w13_weight`, 42 characters — panicked
         // the encoder, which answers a too-long value with unwrap() rather than
@@ -769,7 +769,7 @@ impl PileSource {
             ($ty:ty, $attr:expr, $wrap:expr) => {{
                 for (e, n, i, l, h) in find!(
                     (e: Id,
-                     n: Inline<Handle<blobencodings::LongString>>,
+                     n: Inline<Handle<blobencodings::UTF8String>>,
                      i: i64,
                      l: i64,
                      h: Inline<Handle<Tensor<$ty, 2>>>),
@@ -823,7 +823,7 @@ impl PileSource {
                 // it yields are plain `Copy` values that are.
                 let hits: Vec<_> = find!(
                     (e: Id,
-                     n: Inline<Handle<blobencodings::LongString>>,
+                     n: Inline<Handle<blobencodings::UTF8String>>,
                      h: Inline<Handle<Tensor<$ty, $rank>>>),
                     pattern!(&facts, [
                         { ?e @ metadata::name: ?n, attrs::weight::<$ty, $rank>(): ?h },

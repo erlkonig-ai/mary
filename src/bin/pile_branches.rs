@@ -139,7 +139,7 @@ fn main() -> Result<()> {
             .ok()
             .and_then(|be| {
                 find!(
-                    n: Inline<inlineencodings::Handle<blobencodings::LongString>>,
+                    n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
                     pattern!(&meta, [{ be @ triblespace::core::metadata::name: ?n }])
                 )
                 .next()

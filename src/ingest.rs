@@ -14,7 +14,7 @@ use crate::nn::weight_loader::get_tensor_f32;
 #[cfg(feature = "import")]
 use safetensors::SafeTensors;
 use std::collections::HashMap;
-use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::*;
 
 #[cfg(feature = "import")]
@@ -62,7 +62,7 @@ pub fn save_safetensors_filtered(
     keep: impl Fn(&str) -> bool,
 ) -> Result<Fragment, Err> {
     let (members, mut facts) = ingest_members(bytes, blobs, dtype, keep)?;
-    let mn = blobs.put::<LongString, _>(model_name.to_string())?;
+    let mn = blobs.put::<UTF8String, _>(model_name.to_string())?;
     let model = entity! { _ @ attrs::model_name: mn, attrs::member*: members.iter() };
     let model_root_id = model.root().expect("model root");
     facts += model.into_facts();
@@ -145,7 +145,7 @@ pub fn ingest_tensors(
             3 => "conv",
             _ => "tensor",
         };
-        let name_h = blobs.put::<LongString, _>(name)?;
+        let name_h = blobs.put::<UTF8String, _>(name)?;
         let m = entity! { _ @ attrs::kind: kind, attrs::safetensor_path: name_h, attrs::weight: leaf_id };
         members.push(m.root().expect("module root"));
         facts += m.into_facts();
@@ -191,14 +191,14 @@ pub fn build_model_root(
     // NON-core labels on the (content-derived) root id — queryable, no id
     // influence: the weight-format tag, the `source` it was imported from, and
     // which files it came from.
-    let source_h = blobs.put::<LongString, _>(source.to_string())?;
+    let source_h = blobs.put::<UTF8String, _>(source.to_string())?;
     facts += entity! { ExclusiveId::force_ref(&root_id) @
         attrs::quantization: quantization,
         attrs::source: source_h,
     }
     .into_facts();
     for name in provenance {
-        let mn = blobs.put::<LongString, _>(name.clone())?;
+        let mn = blobs.put::<UTF8String, _>(name.clone())?;
         facts += entity! { ExclusiveId::force_ref(&root_id) @ attrs::model_name: mn }.into_facts();
     }
     Ok(Fragment::rooted(root_id, facts))
@@ -206,7 +206,7 @@ pub fn build_model_root(
 
 pub fn read_string(
     blobs: &impl BlobStoreGet,
-    h: Inline<inlineencodings::Handle<LongString>>,
+    h: Inline<inlineencodings::Handle<UTF8String>>,
 ) -> String {
     let v: anybytes::View<str> = blobs.get(h).expect("string blob");
     v.to_string()

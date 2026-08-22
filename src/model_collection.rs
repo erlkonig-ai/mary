@@ -946,7 +946,7 @@ pub struct ModelAttributeProjection {
 mod historical {
     use crate::f16enc::F16Array;
     use crate::format::{F32Array, U32Array, U64Array};
-    use triblespace::prelude::blobencodings::{LongString, RawBytes};
+    use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
     use triblespace::prelude::inlineencodings::{Boolean, GenId, Handle, ShortString, F64, U256BE};
     use triblespace::prelude::*;
 
@@ -962,12 +962,12 @@ mod historical {
         "4629D277AD6B52B50DA78DEF63440AF1" unsafe as weight: GenId;
         "18E898172078C843A0351C3D880CC238" unsafe as bias: GenId;
         "52C4A211D2A08BA25C27FFD79FF24C93" unsafe as kind: ShortString;
-        "09EA2F7BCF9B0C9714EE39CF269DF2D5" unsafe as safetensor_path: Handle<LongString>;
+        "09EA2F7BCF9B0C9714EE39CF269DF2D5" unsafe as safetensor_path: Handle<UTF8String>;
         "33CE12B1B940B13E48D8E5B0ADFD2421" unsafe as index: U256BE;
         "3F46CDE630964D78D62DA32F4A8558C1" unsafe as model_root: GenId;
         "B4B6EC08A0CD70DE63A690168EE78F0F" unsafe as member: GenId;
-        "4C1CD1611863E7854C59C7DC706DF77A" unsafe as model_name: Handle<LongString>;
-        "D20B8E3556C35FF6D18D104C3443D6CF" unsafe as source: Handle<LongString>;
+        "4C1CD1611863E7854C59C7DC706DF77A" unsafe as model_name: Handle<UTF8String>;
+        "D20B8E3556C35FF6D18D104C3443D6CF" unsafe as source: Handle<UTF8String>;
         "7AF87320C144AA29C29FE2A5EE7C7EB2" unsafe as quantization: ShortString;
 
         // Gemma LoRA, also present before 6b65f278. `model_name` is shared
@@ -990,18 +990,18 @@ mod historical {
         "6EEBF39CADD11B7CFBB624019AE21585" unsafe as pre_tokenizer: GenId;
         "98EC58B28F4D0BB43965DF7C5FF22713" unsafe as post_processor: GenId;
         "F3AAA4CD8EE04E5592059564A21FE953" unsafe as decoder: GenId;
-        "AE7FE29F2F38153F58C542D5CA4A9356" unsafe as piece: Handle<LongString>;
+        "AE7FE29F2F38153F58C542D5CA4A9356" unsafe as piece: Handle<UTF8String>;
         "F0E2E782F7BB62F52B1186DDE0EB5388" unsafe as token_id: U256BE;
         "714AE13F801202EB27C83E3AB2290669" unsafe as piece_bytes: Handle<RawBytes>;
-        "5723ECE1FF426C58879B79D5669A7CF1" unsafe as merge_left: Handle<LongString>;
-        "5C78FEB151F35A2C5D07BEC92E860752" unsafe as merge_right: Handle<LongString>;
+        "5723ECE1FF426C58879B79D5669A7CF1" unsafe as merge_left: Handle<UTF8String>;
+        "5C78FEB151F35A2C5D07BEC92E860752" unsafe as merge_right: Handle<UTF8String>;
         "68F1A9E6ED735E7C3ADCCA076AFF1742" unsafe as unk_token: ShortString;
         "11F76A2C0856C16CB030C4327D5A3B93" unsafe as continuing_subword_prefix: ShortString;
         "6FB969E8A3EDD1A657C721DD5A7D42EA" unsafe as end_of_word_suffix: ShortString;
         "DF3F88DBFA2B44A7783169C9640014AF" unsafe as max_input_chars: U256BE;
         "3BCB70478942DB710ED2A4FB023F3457" unsafe as piece_score: F64;
         "EE4C6647619A836326196F0DBF84FA98" unsafe as byte_fallback: Boolean;
-        "C8262D5668B8A1F541B3C35D54201BEC" unsafe as pattern: Handle<LongString>;
+        "C8262D5668B8A1F541B3C35D54201BEC" unsafe as pattern: Handle<UTF8String>;
         "3AC7574C07D02D389B4E7AD3B3B084D9" unsafe as replace_content: ShortString;
         "964B4FCF7477E7E4436F0325F89B7CB5" unsafe as behavior: ShortString;
     }
@@ -1335,7 +1335,7 @@ mod tests {
     use triblespace::core::repo::{BlobStoreGet, RetentionRoots};
     use triblespace::core::repo::pile::WantRewritePolicy;
     use triblespace::macros::id_hex;
-    use triblespace::prelude::blobencodings::{LongString, RawBytes, SimpleArchive};
+    use triblespace::prelude::blobencodings::{UTF8String, RawBytes, SimpleArchive};
     use triblespace::prelude::inlineencodings::Handle;
 
     static NEXT_TEMP_PILE: AtomicU64 = AtomicU64::new(0);
@@ -1378,10 +1378,10 @@ mod tests {
         label: &str,
     ) -> (
         Fragment,
-        Inline<Handle<LongString>>,
+        Inline<Handle<UTF8String>>,
         Inline<Handle<RawBytes>>,
     ) {
-        let text: Blob<LongString> = format!("model attachment {label}").to_blob();
+        let text: Blob<UTF8String> = format!("model attachment {label}").to_blob();
         let text_handle = text.get_handle();
         let mut fragment = entity! { crate::format::attrs::model_name: text };
 
@@ -1749,7 +1749,7 @@ mod tests {
         let leaf_id = leaf.root().expect("tensor leaf root");
         let mut facts = leaf.into_facts();
         let name = pile
-            .put::<LongString, _>("encoder.weight".to_owned())
+            .put::<UTF8String, _>("encoder.weight".to_owned())
             .unwrap();
         let member = entity! { _ @
             crate::format::attrs::safetensor_path: name,
@@ -1758,7 +1758,7 @@ mod tests {
         let member_id = member.root().expect("model member root");
         facts += member.into_facts();
         let source = pile
-            .put::<LongString, _>("example/owned-index".to_owned())
+            .put::<UTF8String, _>("example/owned-index".to_owned())
             .unwrap();
         let model = entity! { _ @
             crate::format::attrs::source: source,

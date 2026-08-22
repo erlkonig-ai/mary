@@ -996,7 +996,7 @@ pub fn load_split_index_from_pile(
     let mut f16 = HashMap::new();
     let mut f32_ = HashMap::new();
     for (m, n) in find!(
-        (m: Id, n: Inline<inlineencodings::Handle<blobencodings::LongString>>),
+        (m: Id, n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
         pattern!(&tribles, [{ ?m @ crate::format::attrs::model_name: ?n }])
     ) {
         let name: anybytes::View<str> = reader
@@ -1292,7 +1292,7 @@ pub fn derive_qwen3tts_folded_pile(
         };
         let name_h = repo
             .storage_mut()
-            .put::<blobencodings::LongString, _>(name.clone())
+            .put::<blobencodings::UTF8String, _>(name.clone())
             .map_err(|e| anyhow::anyhow!("{name}: put name blob: {e:?}"))?;
         let m = entity! { _ @ attrs::kind: kind, attrs::safetensor_path: name_h, attrs::weight: leaf_id };
         members.push(m.root().expect("module root"));
@@ -1302,7 +1302,7 @@ pub fn derive_qwen3tts_folded_pile(
     }
     let mn = repo
         .storage_mut()
-        .put::<blobencodings::LongString, _>("talker_folded_f16".to_string())
+        .put::<blobencodings::UTF8String, _>("talker_folded_f16".to_string())
         .map_err(|e| anyhow::anyhow!("put entity name blob: {e:?}"))?;
     let model = entity! { _ @ attrs::model_name: mn, attrs::member*: members.iter() };
     facts += model.into_facts();
@@ -1574,7 +1574,7 @@ pub fn load_keymap_from_pile_prefixed(
 
     // Every model entity (one per persisted shard) carries `attrs::model_name`.
     let model_ids: Vec<Id> = find!(
-        (m: Id, n: Inline<inlineencodings::Handle<blobencodings::LongString>>),
+        (m: Id, n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
         pattern!(&tribles, [{ ?m @ crate::format::attrs::model_name: ?n }])
     )
     .filter(|&(_m, n)| {
@@ -2774,7 +2774,7 @@ mod native_model_snapshot_tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use triblespace::prelude::blobencodings::LongString;
+    use triblespace::prelude::blobencodings::UTF8String;
 
     static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
 
@@ -2823,14 +2823,14 @@ mod native_model_snapshot_tests {
         };
         let leaf_id = leaf.root().unwrap();
         let mut facts = leaf.into_facts();
-        let name = pile.put::<LongString, _>(tensor_name.to_owned()).unwrap();
+        let name = pile.put::<UTF8String, _>(tensor_name.to_owned()).unwrap();
         let member = entity! { _ @ attrs::safetensor_path: name, attrs::weight: leaf_id };
         let member_id = member.root().unwrap();
         facts += member.into_facts();
         let root = entity! { _ @ attrs::member: member_id };
         let root_id = root.root().unwrap();
         facts += root.into_facts();
-        let source = pile.put::<LongString, _>(source.to_owned()).unwrap();
+        let source = pile.put::<UTF8String, _>(source.to_owned()).unwrap();
         facts += entity! { ExclusiveId::force_ref(&root_id) @
             attrs::source: source,
             attrs::quantization: QUANTIZATION_NATIVE,

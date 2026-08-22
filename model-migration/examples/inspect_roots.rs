@@ -46,7 +46,7 @@ fn main() -> Result<()> {
     );
     let facts = projection.facts;
 
-    let read_ls = |h: Inline<inlineencodings::Handle<blobencodings::LongString>>| -> String {
+    let read_ls = |h: Inline<inlineencodings::Handle<blobencodings::UTF8String>>| -> String {
         reader
             .get::<anybytes::View<str>, _>(h)
             .map(|v| v.to_string())
@@ -72,13 +72,13 @@ fn main() -> Result<()> {
     for root in &roots {
         let root = *root;
         let names: Vec<String> = find!(
-            (n: Inline<inlineencodings::Handle<blobencodings::LongString>>),
+            (n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
             pattern!(&facts, [{ root @ attrs::model_name: ?n }])
         )
         .map(|(n,)| read_ls(n))
         .collect();
         let sources: Vec<String> = find!(
-            (n: Inline<inlineencodings::Handle<blobencodings::LongString>>),
+            (n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
             pattern!(&facts, [{ root @ attrs::source: ?n }])
         )
         .map(|(n,)| read_ls(n))
@@ -102,7 +102,7 @@ fn main() -> Result<()> {
         for member in &members {
             let member = *member;
             for (p,) in find!(
-                (p: Inline<inlineencodings::Handle<blobencodings::LongString>>),
+                (p: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
                 pattern!(&facts, [{ member @ attrs::safetensor_path: ?p }])
             ) {
                 let p = read_ls(p);
@@ -141,7 +141,7 @@ fn main() -> Result<()> {
     for t in &real_toks {
         let t = *t;
         let names: Vec<String> = find!(
-            (n: Inline<inlineencodings::Handle<blobencodings::LongString>>),
+            (n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
             pattern!(&facts, [{ t @ mary::tokenizer::attrs::model_name: ?n }])
         )
         .map(|(n,)| read_ls(n))
@@ -159,7 +159,7 @@ fn main() -> Result<()> {
     println!("\n{} tokenizer root(s):", toks.len());
     for t in toks {
         let names: Vec<String> = find!(
-            (n: Inline<inlineencodings::Handle<blobencodings::LongString>>),
+            (n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
             pattern!(&facts, [{ t @ mary::tokenizer::attrs::model_name: ?n }])
         )
         .map(|(n,)| read_ls(n))

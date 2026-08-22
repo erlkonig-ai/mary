@@ -758,7 +758,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use triblespace::core::repo::pile::Pile;
-    use triblespace::prelude::blobencodings::LongString;
+    use triblespace::prelude::blobencodings::UTF8String;
     use triblespace::prelude::*;
 
     static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
@@ -808,12 +808,12 @@ mod tests {
         let leaf_id = leaf.root().expect("tensor leaf root");
         fragment += leaf;
 
-        let name = fragment.put::<LongString, _>(tensor.to_owned());
+        let name = fragment.put::<UTF8String, _>(tensor.to_owned());
         let member = entity! { _ @ attrs::safetensor_path: name, attrs::weight: &leaf_id };
         let member_id = member.root().expect("model member root");
         fragment += member;
 
-        let source = fragment.put::<LongString, _>(variant.component_source(component));
+        let source = fragment.put::<UTF8String, _>(variant.component_source(component));
         fragment += entity! { _ @
             attrs::source: source,
             attrs::quantization: crate::persist::QUANTIZATION_NATIVE,

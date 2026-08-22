@@ -211,7 +211,7 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
             }
             let mut source_matches = false;
             for (handle,) in triblespace::prelude::find!(
-                (source: Inline<inlineencodings::Handle<blobencodings::LongString>>),
+                (source: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
                 triblespace::prelude::pattern!(&facts, [{ root @ crate::format::attrs::source: ?source }])
             ) {
                 let value: anybytes::View<str> = reader
@@ -352,7 +352,7 @@ mod native_authority_tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use triblespace::core::repo::pile::Pile;
-    use triblespace::prelude::blobencodings::LongString;
+    use triblespace::prelude::blobencodings::UTF8String;
     use triblespace::prelude::*;
 
     static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
@@ -414,7 +414,7 @@ mod native_authority_tests {
                 dimensions,
                 values,
             );
-            let name = fragment.put::<LongString, _>(tensor.to_owned());
+            let name = fragment.put::<UTF8String, _>(tensor.to_owned());
             let member = entity! { _ @ attrs::safetensor_path: name, attrs::weight: leaf_id };
             members.push(member.root().expect("model member root"));
             fragment += member;
@@ -422,7 +422,7 @@ mod native_authority_tests {
         let root = entity! { _ @ attrs::member*: members.iter() };
         let root_id = root.root().expect("model root");
         fragment += root;
-        let source = fragment.put::<LongString, _>(SOURCE.to_owned());
+        let source = fragment.put::<UTF8String, _>(SOURCE.to_owned());
         fragment += entity! { ExclusiveId::force_ref(&root_id) @
             attrs::source: source,
             attrs::quantization: crate::persist::QUANTIZATION_NATIVE,

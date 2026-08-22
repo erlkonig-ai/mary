@@ -98,7 +98,7 @@ fn verify_share(
     let mut packed_ix: std::collections::HashMap<(String, i64), anybytes::Bytes> =
         Default::default();
     for (n, i, h) in triblespace::macros::find!(
-        (n: Inline<inlineencodings::Handle<blobencodings::LongString>>,
+        (n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
          i: i64,
          h: Inline<inlineencodings::Handle<
              triblespace::core::blob::encodings::tensor::Tensor<
@@ -119,7 +119,7 @@ fn verify_share(
     }
     let mut bf16_ix: std::collections::HashMap<(String, i64), anybytes::Bytes> = Default::default();
     for (n, i, h) in triblespace::macros::find!(
-        (n: Inline<inlineencodings::Handle<blobencodings::LongString>>,
+        (n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
          i: i64,
          h: Inline<inlineencodings::Handle<
              triblespace::core::blob::encodings::tensor::Tensor<
@@ -372,7 +372,7 @@ fn main() -> Result<()> {
         // weight beside them is not an imported expert, and reading 144 GiB
         // back to find out what is missing would defeat the point.
         for (nh, i, _h) in triblespace::macros::find!(
-            (n: Inline<inlineencodings::Handle<blobencodings::LongString>>,
+            (n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
              i: i64,
              h: Inline<inlineencodings::Handle<
                  triblespace::core::blob::encodings::tensor::Tensor<
@@ -386,7 +386,7 @@ fn main() -> Result<()> {
             present.insert((name.to_string(), i));
         }
         for (nh, i, _h) in triblespace::macros::find!(
-            (n: Inline<inlineencodings::Handle<blobencodings::LongString>>,
+            (n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
              i: i64,
              h: Inline<inlineencodings::Handle<
                  triblespace::core::blob::encodings::tensor::Tensor<
@@ -482,7 +482,7 @@ fn main() -> Result<()> {
 
             let bytes = blob.bytes.len();
             let handle = ws.put(blob);
-            let name_h = ws.put::<blobencodings::LongString, _>(base.to_string());
+            let name_h = ws.put::<blobencodings::UTF8String, _>(base.to_string());
             let mut facts = entity! { &ufoid() @
                 attrs::weight_nvfp4_2: handle,
                 attrs::expert_index: e as i64,
@@ -551,7 +551,7 @@ fn main() -> Result<()> {
 
             let bytes = blob.bytes.len();
             let handle = ws.put(blob);
-            let name_h = ws.put::<blobencodings::LongString, _>(base.to_string());
+            let name_h = ws.put::<blobencodings::UTF8String, _>(base.to_string());
             let mut facts = entity! { &ufoid() @
                 attrs::weight::<triblespace::core::blob::encodings::tensor::elements::BF16, 2>(): handle,
                 attrs::expert_index: e as i64,

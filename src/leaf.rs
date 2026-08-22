@@ -465,10 +465,10 @@ fn resolve_legacy(
 /// Joins module to leaf directly rather than walking `member` edges from a
 /// model root, so a pile holding several models (or one whose root layout
 /// differs) indexes the same way.
-fn named_weights(tribles: &TribleSet) -> Vec<(Inline<inlineencodings::Handle<blobencodings::LongString>>, Id)> {
+fn named_weights(tribles: &TribleSet) -> Vec<(Inline<inlineencodings::Handle<blobencodings::UTF8String>>, Id)> {
     use crate::format::attrs;
     triblespace::macros::find!(
-        (n: Inline<inlineencodings::Handle<blobencodings::LongString>>, w: Id),
+        (n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>, w: Id),
         triblespace::macros::pattern!(tribles, [
             { _?m @ attrs::safetensor_path: ?n, attrs::weight: ?w },
         ])

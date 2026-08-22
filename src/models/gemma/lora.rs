@@ -33,7 +33,7 @@ use crate::format::F32Array;
 
 pub mod attrs {
     use crate::format::F32Array;
-    use triblespace::prelude::blobencodings::LongString;
+    use triblespace::prelude::blobencodings::UTF8String;
     use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString, F64, U256BE};
     use triblespace::prelude::*;
 
@@ -52,7 +52,7 @@ pub mod attrs {
         /// LoRA B matrix blob [out_features, rank].
         "1F21DAE68652A4D8CAD973400F04124D" as lora_b: Handle<F32Array>;
         /// Model name (same shared id as `crate::format::attrs::model_name`).
-        "4C1CD1611863E7854C59C7DC706DF77A" as model_name: Handle<LongString>;
+        "4C1CD1611863E7854C59C7DC706DF77A" as model_name: Handle<UTF8String>;
     }
 }
 
@@ -323,7 +323,7 @@ impl<B: Backend> LoraWeights<B> {
         let set_ent = entity! { _ @
             attrs::lora_rank: self.rank as u32,
             attrs::lora_alpha: self.alpha as f64,
-            attrs::model_name: blobs.put::<blobencodings::LongString, _>(name.to_string())?,
+            attrs::model_name: blobs.put::<blobencodings::UTF8String, _>(name.to_string())?,
             attrs::lora_adapter*: adapter_ids.iter(),
         };
         let root = set_ent.root().expect("lora set entity has root");

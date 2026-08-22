@@ -30,7 +30,7 @@
 //! schema means a consumer extends the model by minting its own typed attributes,
 //! never by forking this library.
 
-use triblespace::prelude::blobencodings::{LongString, RawBytes};
+use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
 use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString, F64};
 use triblespace::prelude::*;
 
@@ -48,9 +48,9 @@ attributes! {
     /// is the dataset's concern, not the schema's). Minted 2026-06-30.
     "58659FC179EED13E9385B82F1FDF95FE" as pub image: Handle<RawBytes>;
     /// The text payload of a sample (a prompt, caption, transcript, document…).
-    /// `LongString` blob: text routinely exceeds the 32-byte inline ceiling.
+    /// `UTF8String` blob: text routinely exceeds the 32-byte inline ceiling.
     /// Minted 2026-06-30.
-    "806AF895E3D21D3147908D36D542F367" as pub text: Handle<LongString>;
+    "806AF895E3D21D3147908D36D542F367" as pub text: Handle<UTF8String>;
     /// The audio payload of a sample (raw encoded bytes — WAV/FLAC/MP3/…). No
     /// audio-specific blob schema exists in the substrate and none is warranted:
     /// `RawBytes` carries the encoded stream and the container format is implied
@@ -73,12 +73,12 @@ attributes! {
     /// own model blob; the mary model-graph format is a separate, finer-grained
     /// representation). Minted 2026-06-30.
     "779F9D64D1783D0BDB19EF8E192C3798" as pub run_model: Handle<RawBytes>;
-    /// A run's hyperparameters as a JSON document (`LongString` blob).
+    /// A run's hyperparameters as a JSON document (`UTF8String` blob).
     /// Minted 2026-06-30.
-    "A8FE4B4E92F2819827553C462E41C013" as pub run_hyperparams: Handle<LongString>;
-    /// A run's final metrics as a JSON document (`LongString` blob).
+    "A8FE4B4E92F2819827553C462E41C013" as pub run_hyperparams: Handle<UTF8String>;
+    /// A run's final metrics as a JSON document (`UTF8String` blob).
     /// Minted 2026-06-30.
-    "CEA456D63AE1F5ABC84292C511EA27EA" as pub run_metrics: Handle<LongString>;
+    "CEA456D63AE1F5ABC84292C511EA27EA" as pub run_metrics: Handle<UTF8String>;
 
     // ── Preference (DPO / RLHF / self-curation) ──────────────────────────
     /// A preference → the Sample that was chosen (preferred). Minted 2026-06-30.
@@ -112,7 +112,7 @@ mod tests {
         let dataset = ufoid();
         let dataset_id: Id = *dataset;
         tribles += entity! { &dataset @
-            metadata::name: blobs.put::<LongString, _>("portraits".to_string()).unwrap(),
+            metadata::name: blobs.put::<UTF8String, _>("portraits".to_string()).unwrap(),
             dataset_version: "v1",
         };
 
@@ -122,7 +122,7 @@ mod tests {
         let sample_a_id: Id = *sample_a;
         tribles += entity! { &sample_a @
             image: blobs.put::<RawBytes, _>(png.to_vec()).unwrap(),
-            text: blobs.put::<LongString, _>("a soft portrait in warm light".to_string()).unwrap(),
+            text: blobs.put::<UTF8String, _>("a soft portrait in warm light".to_string()).unwrap(),
             split: "train",
             sample_dataset: &dataset,
         };
@@ -131,7 +131,7 @@ mod tests {
         let sample_b = ufoid();
         let sample_b_id: Id = *sample_b;
         tribles += entity! { &sample_b @
-            text: blobs.put::<LongString, _>("a harsh portrait in flat light".to_string()).unwrap(),
+            text: blobs.put::<UTF8String, _>("a harsh portrait in flat light".to_string()).unwrap(),
             split: "train",
             sample_dataset: &dataset,
         };
@@ -142,8 +142,8 @@ mod tests {
         tribles += entity! { &run @
             run_dataset: &dataset,
             run_model: blobs.put::<RawBytes, _>(vec![1u8, 2, 3, 4]).unwrap(),
-            run_hyperparams: blobs.put::<LongString, _>(r#"{"lr":3e-4,"epochs":3}"#.to_string()).unwrap(),
-            run_metrics: blobs.put::<LongString, _>(r#"{"loss":0.12,"acc":0.94}"#.to_string()).unwrap(),
+            run_hyperparams: blobs.put::<UTF8String, _>(r#"{"lr":3e-4,"epochs":3}"#.to_string()).unwrap(),
+            run_metrics: blobs.put::<UTF8String, _>(r#"{"loss":0.12,"acc":0.94}"#.to_string()).unwrap(),
         };
 
         // ── a Preference between the two samples ──────────────────────────
@@ -177,7 +177,7 @@ mod tests {
 
         // ── query: the multimodal sample (has BOTH image and text) ────────
         let multimodal: Vec<Id> = find!(
-            (s: Id, img: Inline<Handle<RawBytes>>, txt: Inline<Handle<LongString>>),
+            (s: Id, img: Inline<Handle<RawBytes>>, txt: Inline<Handle<UTF8String>>),
             pattern!(&tribles, [{
                 ?s @
                     sample_dataset: dataset_id,
@@ -215,7 +215,7 @@ mod tests {
         // blobs really landed (the multimodal sample's text resolves).
         let reader = BlobStore::reader(&mut blobs).unwrap();
         let (txt_handle,) = find!(
-            (t: Inline<Handle<LongString>>),
+            (t: Inline<Handle<UTF8String>>),
             pattern!(&tribles, [{ sample_a_id @ text: ?t }])
         )
         .next()

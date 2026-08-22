@@ -81,15 +81,15 @@ pub mod attrs {
         "33CE12B1B940B13E48D8E5B0ADFD2421" as index: U256BE;
 
         // ── minted 2026-08-13 ──
-        /// An OBJECT member's key. A `LongString` handle rather than a
+        /// An OBJECT member's key. A `UTF8String` handle rather than a
         /// `ShortString`: `logits_mup_width_multiplier` is 27 bytes and
         /// `num_nextn_predict_layers` 24, which fit, but the encoder answers a
         /// too-long value with `unwrap()` rather than an error, and a config
         /// key longer than 32 bytes is not a hypothetical.
-        "051B238236962081B98F5D44BD9FA999" as json_key: Handle<blobencodings::LongString>;
+        "051B238236962081B98F5D44BD9FA999" as json_key: Handle<blobencodings::UTF8String>;
         /// A JSON string's content. Content-addressed, so a value repeated
         /// across documents is stored once.
-        "65D08DFB670E7E3729BE6BC2C0073CAD" as json_string: Handle<blobencodings::LongString>;
+        "65D08DFB670E7E3729BE6BC2C0073CAD" as json_string: Handle<blobencodings::UTF8String>;
         /// A JSON number that is an INTEGER. Separate from `json_float` so the
         /// round trip is exact: stored as `f64`, `4096` comes back as `4096.0`
         /// and every re-serialised config differs from its source.
@@ -153,7 +153,7 @@ fn save_node(
             }
         }
         Value::String(s) => {
-            s_h = Some(blobs.put::<blobencodings::LongString, _>(s.clone())?);
+            s_h = Some(blobs.put::<blobencodings::UTF8String, _>(s.clone())?);
         }
         Value::Array(a) => {
             tags.push(ty::JSON_ARRAY);
@@ -170,7 +170,7 @@ fn save_node(
     }
 
     let key_h = match pos {
-        Pos::Key(k) => Some(blobs.put::<blobencodings::LongString, _>(k.to_string())?),
+        Pos::Key(k) => Some(blobs.put::<blobencodings::UTF8String, _>(k.to_string())?),
         _ => None,
     };
     let idx: Option<u64> = match pos {
@@ -204,7 +204,7 @@ pub fn save_document(
     facts: &mut TribleSet,
 ) -> Result<Id, Err> {
     let root = save_json(v, blobs, facts)?;
-    let name_h = blobs.put::<blobencodings::LongString, _>(name.to_string())?;
+    let name_h = blobs.put::<blobencodings::UTF8String, _>(name.to_string())?;
     let doc = entity! { _ @
         metadata::tag: ty::JSON_DOCUMENT,
         metadata::name: name_h,
@@ -219,7 +219,7 @@ pub fn save_document(
 pub fn documents(tribles: &TribleSet, blobs: &impl BlobStoreGet) -> Vec<(String, Id)> {
     let mut out = Vec::new();
     for (n, r) in find!(
-        (n: Inline<inlineencodings::Handle<blobencodings::LongString>>, r: Id),
+        (n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>, r: Id),
         pattern!(tribles, [
             { _?d @ metadata::tag: (ty::JSON_DOCUMENT),
                     metadata::name: ?n,
@@ -251,18 +251,18 @@ pub fn load_document(
     load_json(tribles, blobs, root)
 }
 
-/// Read a `LongString` handle back to an owned `String`, as
+/// Read a `UTF8String` handle back to an owned `String`, as
 /// `tokenizer::read_piece` does — a view over the store's bytes, materialised
 /// once here because a `serde_json::Value` owns its strings.
 fn read_string(
     blobs: &impl BlobStoreGet,
-    h: Inline<inlineencodings::Handle<blobencodings::LongString>>,
+    h: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
 ) -> Option<String> {
     let v: anybytes::View<str> = blobs.get(h).ok()?;
     Some(v.to_string())
 }
 
-/// A node's optional `LongString`-handle field.
+/// A node's optional `UTF8String`-handle field.
 ///
 /// A macro rather than a function because `pattern!` takes an attribute PATH,
 /// not an `Attribute` value — the same reason `tokenizer.rs` spells its field
@@ -270,7 +270,7 @@ fn read_string(
 macro_rules! long_field {
     ($tribles:expr, $blobs:expr, $node:expr, $attr:path) => {
         find!(
-            (h: Inline<inlineencodings::Handle<blobencodings::LongString>>),
+            (h: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
             pattern!($tribles, [{ ($node) @ $attr: ?h }])
         )
         .next()

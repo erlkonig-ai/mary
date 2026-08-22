@@ -81,7 +81,7 @@ impl<R> SelectedModelIndex<R> {
 
 fn read_long_string(
     blobs: &impl BlobStoreGet,
-    handle: Inline<inlineencodings::Handle<blobencodings::LongString>>,
+    handle: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
     field: &str,
 ) -> anyhow::Result<String> {
     let value: anybytes::View<str> = blobs
@@ -125,7 +125,7 @@ fn validate_source_coordinates(
 ) -> anyhow::Result<()> {
     let source_handle = exactly_one(
         find!(
-            (source: Inline<inlineencodings::Handle<blobencodings::LongString>>),
+            (source: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
             pattern!(tribles, [{ root @ attrs::source: ?source }])
         )
         .map(|(source,)| source),
@@ -156,7 +156,7 @@ fn validate_model_name(
 ) -> anyhow::Result<()> {
     let handle = exactly_one(
         find!(
-            (name: Inline<inlineencodings::Handle<blobencodings::LongString>>),
+            (name: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
             pattern!(tribles, [{ root @ attrs::model_name: ?name }])
         )
         .map(|(name,)| name),
@@ -186,7 +186,7 @@ pub fn select_model_root(
         }
         ModelSelector::Name(wanted) => {
             let matches = find!(
-                (model: Id, name: Inline<inlineencodings::Handle<blobencodings::LongString>>),
+                (model: Id, name: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
                 pattern!(tribles, [{ ?model @ attrs::model_name: ?name, attrs::member: _?member }])
             )
             .filter_map(
@@ -206,7 +206,7 @@ pub fn select_model_root(
             quantization,
         } => {
             let matches = find!(
-                (model: Id, source: Inline<inlineencodings::Handle<blobencodings::LongString>>),
+                (model: Id, source: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
                 pattern!(tribles, [{ ?model @
                     attrs::source: ?source,
                     attrs::quantization: quantization,
@@ -265,7 +265,7 @@ pub fn index_keymap_for_root(
     for member in model_members(tribles, root)? {
         let name_handle = exactly_one(
             find!(
-                (name: Inline<inlineencodings::Handle<blobencodings::LongString>>),
+                (name: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
                 pattern!(tribles, [{ member @ attrs::safetensor_path: ?name }])
             )
             .map(|(name,)| name),
@@ -355,7 +355,7 @@ fn tokenizer_name(
 ) -> anyhow::Result<String> {
     let handle = exactly_one(
         find!(
-            (name: Inline<inlineencodings::Handle<blobencodings::LongString>>),
+            (name: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
             pattern!(tribles, [{ root @ crate::tokenizer::attrs::model_name: ?name }])
         )
         .map(|(name,)| name),
@@ -387,7 +387,7 @@ pub fn select_tokenizer_root(
         TokenizerSelector::Name(wanted) => {
             let roots = tokenizer_roots(tribles);
             let matches = find!(
-                (tokenizer: Id, name: Inline<inlineencodings::Handle<blobencodings::LongString>>),
+                (tokenizer: Id, name: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
                 pattern!(tribles, [{ ?tokenizer @ crate::tokenizer::attrs::model_name: ?name }])
             )
             .filter(|(tokenizer, _)| roots.contains(tokenizer))
@@ -495,7 +495,7 @@ mod tests {
             let leaf_id = add_leaf(facts, blobs, form, value);
 
             let name = blobs
-                .put::<blobencodings::LongString, _>(tensor_name.to_string())
+                .put::<blobencodings::UTF8String, _>(tensor_name.to_string())
                 .unwrap();
             let member = entity! { _ @ attrs::safetensor_path: name, attrs::weight: &leaf_id };
             let member_id = member.root().unwrap();
@@ -504,10 +504,10 @@ mod tests {
         }
 
         let name = blobs
-            .put::<blobencodings::LongString, _>(name.to_string())
+            .put::<blobencodings::UTF8String, _>(name.to_string())
             .unwrap();
         let source = blobs
-            .put::<blobencodings::LongString, _>(source.to_string())
+            .put::<blobencodings::UTF8String, _>(source.to_string())
             .unwrap();
         let model = entity! { _ @
             attrs::model_name: name,
@@ -645,7 +645,7 @@ mod tests {
             &[("weight", 1.0)],
         );
         let alias = blobs
-            .put::<blobencodings::LongString, _>("alias".to_string())
+            .put::<blobencodings::UTF8String, _>("alias".to_string())
             .unwrap();
         facts +=
             entity! { ExclusiveId::force_ref(&model.root) @ attrs::model_name: alias }.into_facts();

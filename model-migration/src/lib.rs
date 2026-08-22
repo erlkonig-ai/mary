@@ -30,7 +30,7 @@ use triblespace::core::blob::{Blob, TryFromBlob};
 use triblespace::core::collection::{CollectionCommit, CollectionData};
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{ancestors, content, parent, BlobStore, CommitHandle, Repository};
-use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::{Handle, ShortString};
 use triblespace::prelude::*;
 
@@ -335,7 +335,7 @@ fn prepare_legacy_personaplex_candidate(
     let model_root = root.root().expect("non-empty member set yields one root");
     fragment += root;
 
-    let source = fragment.put::<LongString, _>(PERSONAPLEX_SOURCE.to_owned());
+    let source = fragment.put::<UTF8String, _>(PERSONAPLEX_SOURCE.to_owned());
     fragment += entity! { ExclusiveId::force_ref(&model_root) @
         attrs::source: source,
         attrs::quantization: mary::persist::QUANTIZATION_NATIVE,
@@ -433,7 +433,7 @@ fn adopt_legacy_personaplex_bundle_with_policy(
         .stage(pile, signing_key)
         .map_err(|error| anyhow!("stage PersonaPlex bundle dependencies: {error}"))?;
 
-    // The source LongString is one of the just-staged dependencies, while the
+    // The source UTF8String is one of the just-staged dependencies, while the
     // legacy tensor blobs were already resident. Validate that exact combined
     // view through the same zero-copy resolver used by runtime loading before
     // the signed COMMIT becomes visible. Dropping `staged` on failure leaves
@@ -487,11 +487,11 @@ fn source_coordinate_is_missing(
     root: Id,
     wanted: &str,
 ) -> anyhow::Result<bool> {
-    let handles: Vec<Inline<Handle<LongString>>> = fragment
+    let handles: Vec<Inline<Handle<UTF8String>>> = fragment
         .facts()
         .iter()
         .filter(|fact| fact.e() == &root && fact.a() == &attrs::source.id())
-        .map(|fact| *fact.v::<Handle<LongString>>())
+        .map(|fact| *fact.v::<Handle<UTF8String>>())
         .collect();
 
     match handles.as_slice() {
@@ -597,7 +597,7 @@ pub fn migrate_legacy_model_main(
     // subject prevents intrinsic-id recomputation while the returned Fragment
     // carries the attributes' metafacts into the native commit metadata.
     if selector_facts_added != 0 {
-        let source = add_source.then(|| fragment.put::<LongString, _>(request.source.to_owned()));
+        let source = add_source.then(|| fragment.put::<UTF8String, _>(request.source.to_owned()));
         let quantization = add_quantization.then_some(request.quantization);
         fragment += entity! { ExclusiveId::force_ref(&model_root) @
             attrs::source?: source,
@@ -697,7 +697,7 @@ mod tests {
         /// asked for the ambiguous shape.
         duplicate_root: Option<Id>,
         tokenizer_root: Id,
-        attachment: Inline<Handle<LongString>>,
+        attachment: Inline<Handle<UTF8String>>,
         unknown_fact: Trible,
         facts: TribleSet,
     }
@@ -771,10 +771,10 @@ mod tests {
         let model_root = test_id(0x11);
         let member = test_id(0x12);
         let name = blobs
-            .put::<LongString, _>(LEGACY_MODEL_NAME.to_owned())
+            .put::<UTF8String, _>(LEGACY_MODEL_NAME.to_owned())
             .expect("put legacy model name");
         let attachment = blobs
-            .put::<LongString, _>("resident legacy attachment".to_owned())
+            .put::<UTF8String, _>("resident legacy attachment".to_owned())
             .expect("put resident attachment");
         let member_value = inlineencodings::GenId::inline_from(member);
         let tokenizer_value = inlineencodings::GenId::inline_from(tokenizer_root);
@@ -795,7 +795,7 @@ mod tests {
         ));
 
         // This attribute is deliberately outside the audited mapping. Its
-        // exact row and LongString handle must survive the native migration.
+        // exact row and UTF8String handle must survive the native migration.
         let unknown_fact = Trible::force(&member, &test_id(0x7f), &attachment);
         facts.insert(&unknown_fact);
 
@@ -858,7 +858,7 @@ mod tests {
             .put::<U64Array, _>(vec![1_u64])
             .expect("put legacy tensor shape");
         let path = blobs
-            .put::<LongString, _>(tensor_name.to_owned())
+            .put::<UTF8String, _>(tensor_name.to_owned())
             .expect("put legacy tensor path");
 
         facts.insert(&Trible::force(
@@ -900,10 +900,10 @@ mod tests {
         let mut facts = TribleSet::new();
         let mut blobs = MemoryBlobStore::new();
         let lm_name = blobs
-            .put::<LongString, _>(PERSONAPLEX_LM_FILE.to_owned())
+            .put::<UTF8String, _>(PERSONAPLEX_LM_FILE.to_owned())
             .expect("put legacy LM name");
         let mimi_name = blobs
-            .put::<LongString, _>(PERSONAPLEX_MIMI_FILE.to_owned())
+            .put::<UTF8String, _>(PERSONAPLEX_MIMI_FILE.to_owned())
             .expect("put legacy Mimi name");
         facts.insert(&Trible::force(
             &lm_root,
@@ -1033,14 +1033,14 @@ mod tests {
         let leaf = entity! { _ @ attrs::data: data, attrs::shape: shape };
         let leaf_id = leaf.root().expect("conflicting tensor leaf");
         fragment += leaf;
-        let name = fragment.put::<LongString, _>("other.weight".to_owned());
+        let name = fragment.put::<UTF8String, _>("other.weight".to_owned());
         let member = entity! { _ @ attrs::safetensor_path: name, attrs::weight: leaf_id };
         let member_id = member.root().expect("conflicting tensor member");
         fragment += member;
         let root = entity! { _ @ attrs::member: member_id };
         let root_id = root.root().expect("conflicting PersonaPlex root");
         fragment += root;
-        let source = fragment.put::<LongString, _>(PERSONAPLEX_SOURCE.to_owned());
+        let source = fragment.put::<UTF8String, _>(PERSONAPLEX_SOURCE.to_owned());
         fragment += entity! { ExclusiveId::force_ref(&root_id) @
             attrs::source: source,
             attrs::quantization: mary::persist::QUANTIZATION_NATIVE,
@@ -1133,7 +1133,7 @@ mod tests {
         let mut expected = projection.facts;
         let mut expected_blobs = MemoryBlobStore::new();
         let source = expected_blobs
-            .put::<LongString, _>(CANONICAL_SOURCE.to_owned())
+            .put::<UTF8String, _>(CANONICAL_SOURCE.to_owned())
             .expect("derive expected source handle");
         expected += entity! { ExclusiveId::force_ref(&fixture.model_root) @
             attrs::source: source,

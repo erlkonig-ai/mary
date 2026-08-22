@@ -96,7 +96,7 @@ pub mod attrs {
         /// Module kind tag ("linear", "layernorm", "conv", "embedding", …).
         "52C4A211D2A08BA25C27FFD79FF24C93" as kind: ShortString;
         /// Provenance: the tensor's original safetensors key (e.g. "…grn.gamma").
-        "09EA2F7BCF9B0C9714EE39CF269DF2D5" as safetensor_path: Handle<blobencodings::LongString>;
+        "09EA2F7BCF9B0C9714EE39CF269DF2D5" as safetensor_path: Handle<blobencodings::UTF8String>;
         /// Ordered position among siblings (for layer sequences).
         "33CE12B1B940B13E48D8E5B0ADFD2421" as index: U256BE;
 
@@ -106,16 +106,16 @@ pub mod attrs {
         /// A model's module (repeated edge model → module entities).
         "B4B6EC08A0CD70DE63A690168EE78F0F" as member: GenId;
         /// Model name / HuggingFace id (shared id with avatar/gaze).
-        "4C1CD1611863E7854C59C7DC706DF77A" as model_name: Handle<blobencodings::LongString>;
+        "4C1CD1611863E7854C59C7DC706DF77A" as model_name: Handle<blobencodings::UTF8String>;
         /// SOURCE of a content-addressed model-root entity — the model's canonical
         /// name: the HuggingFace id it was imported from (e.g.
         /// "openai/clip-vit-base-patch32"), or a `--name` for a local-dir import.
         /// NON-core: a queryable LABEL attached to the (content-derived) root id,
         /// NOT part of the identity — the id is the content-address of
-        /// `(quantization, weights)` alone. A `Handle<LongString>` because HF ids
+        /// `(quantization, weights)` alone. A `Handle<UTF8String>` because HF ids
         /// routinely exceed 32 bytes. Minted 2026-07-24.
         /// (`trible genid` → D20B8E3556C35FF6D18D104C3443D6CF)
-        "D20B8E3556C35FF6D18D104C3443D6CF" as source: Handle<blobencodings::LongString>;
+        "D20B8E3556C35FF6D18D104C3443D6CF" as source: Handle<blobencodings::UTF8String>;
         /// Weight FORMAT tag of a content-addressed model-root entity (e.g.
         /// "native", "fp4", "q8"). NON-core: a queryable LABEL on the
         /// (content-derived) root id, NOT part of the identity — the id is the
@@ -301,7 +301,7 @@ pub fn put_module<B: Backend, const DW: usize>(
         }
         None => None,
     };
-    let name_h = blobs.put::<blobencodings::LongString, _>(name.to_string())?;
+    let name_h = blobs.put::<blobencodings::UTF8String, _>(name.to_string())?;
     let m = entity! { _ @ attrs::kind: kind, attrs::safetensor_path: name_h, attrs::weight: w_id, attrs::bias?: bias_id };
     let mid = m.root().expect("module root");
     facts += m.into_facts();
