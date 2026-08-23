@@ -830,6 +830,41 @@ mod tests {
     /// It is the reason the charge is the size it is: every stage of it is
     /// `num_experts_per_tok` rows per token rather than one, so six sequences'
     /// worth of rows pass through buffers as wide as the residual stream.
+    /// The charge, against what the RUNNING gate printed on the node.
+    ///
+    /// A report of 2026-08-22 said the activation term did not move with the
+    /// sequence at all -- that a 2048-token prompt and a 5-token one were both
+    /// charged 44.89 GiB of context. They were not; two 5-token logs had been
+    /// compared with each other. The runs' own `activations: N GiB charged at
+    /// admission` lines, `INK_LAYERS=0:16` on the 42-layer release with the
+    /// default BF16 activation/residual/cache lanes and layer 2 on its
+    /// plain-BF16 expert implementation, read 0.03 GiB at 5 tokens and 1.28 at
+    /// 2048. Pinned here so the next such claim is checkable in a second
+    /// instead of an afternoon on the node.
+    ///
+    /// The two figures also disagree about which term is the peak, which is
+    /// why the ratio is not 410x: at 5 tokens the widest layer is the
+    /// plain-BF16 expert lane, whose 15-row M-tile padding per active expert
+    /// dominates a sequence this short, and by 2048 it is global attention's
+    /// score blocks.
+    #[test]
+    fn the_charge_matches_what_the_gate_printed_on_the_node() {
+        let t = small();
+        let policy = narrow().with_plain_bf16_layer(2);
+        let two_dp = |b: u64| (b as f64 / super::GIB * 100.0).round() / 100.0;
+        assert_eq!(two_dp(prefill_activation_bytes(&t, 0..16, 5, policy)), 0.03);
+        assert_eq!(two_dp(prefill_activation_bytes(&t, 0..16, 2_048, policy)), 1.28);
+        // Strictly increasing across the ladder, which is the property the
+        // report denied. 16,384 tokens is already 10 GiB, which is what makes
+        // this range refusable on a 119.63 GiB node at long inputs.
+        let ladder: Vec<u64> = [5, 512, 2_048, 16_384, 81_920]
+            .iter()
+            .map(|&n| prefill_activation_bytes(&t, 0..16, n, policy))
+            .collect();
+        assert!(ladder.windows(2).all(|w| w[1] > w[0]), "not monotone: {ladder:?}");
+        assert_eq!(two_dp(ladder[3]), 10.06, "16,384 tokens");
+    }
+
     /// Anything that made attention the peak would mean this had been mis-read.
     #[test]
     fn the_moe_lane_is_the_widest_layer() {

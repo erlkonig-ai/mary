@@ -307,6 +307,61 @@ fn run_overhead_bytes(
         + attention_bytes
 }
 
+/// Whether a run of a known size may start on a node in a known state.
+///
+/// Two ways of not fitting, kept apart because they take opposite fixes: one
+/// says split the stack across more nodes, the other says leave the stack alone
+/// and wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admission {
+    Fits,
+    /// Larger than the node, whatever else is or is not running on it.
+    OverMachine,
+    /// Fits the node, but not beside what is already resident on it.
+    NodeBusy,
+}
+
+/// The whole requirement against both of the node's numbers.
+///
+/// # The half that was missing, and what it cost
+///
+/// This used to be `need > machine || share > available`: the WHOLE
+/// requirement was compared against `MemTotal` and only the raw weight SHARE
+/// against `MemAvailable`. Nothing ever asked whether the run fit what the box
+/// had free, so every run was priced against an EMPTY machine and whatever else
+/// was resident was charged to nobody.
+///
+/// Measured on spark (119.63 GiB) 2026-08-23, `INK_LAYERS=0:16` at 2048
+/// tokens, from the two runs' own logs:
+///
+/// | run | share | need | available at admission | copy | swap |
+/// |---|---|---|---|---|---|
+/// | idle node | 66.50 GiB | 111.40 | 114.75 | 15.3 s (4.35 GiB/s) | 0.3 GiB |
+/// | 43.9 GiB of AnonPages already held | 66.50 | 112.65 | 69.93 | **1384.5 s (0.05 GiB/s)** | **15.1** |
+///
+/// The second was ADMITTED, because 66.50 <= 69.93 and 112.65 <= 119.63, and
+/// then spent twenty-three minutes writing one anonymous 66.50 GiB arena
+/// against a node that did not have it. sshd could not complete a banner
+/// exchange for the whole of it -- ICMP answered throughout, so the box looked
+/// alive while userspace was starved. The run itself was never the problem: it
+/// finished, its pool reserved 4.61 GiB against the 1.28 GiB admission charged,
+/// and its forward passes cost 0.1 s each.
+///
+/// So the failure is not in any per-token coefficient. `MemTotal` cannot see
+/// pressure by construction, and this is the number that can.
+///
+/// `need >= share` always, so testing `need` against `available` subsumes the
+/// old share test rather than dropping it.
+fn admit(need: u64, machine: u64, available: u64) -> Admission {
+    if need > machine {
+        Admission::OverMachine
+    } else if need > available {
+        Admission::NodeBusy
+    } else {
+        Admission::Fits
+    }
+}
+
 /// What the node has spare, respecting both host and cgroup limits.
 ///
 /// Public so the pool cleanup policy can compare spare node memory with pages
@@ -1322,17 +1377,19 @@ impl PileSource {
         }
         let total = cursor;
 
-        // The admission gate. Two questions, both of which have to be yes:
-        // can the copy be MADE now (`MemAvailable`), and can the finished
-        // process LIVE (`MemTotal` against the share plus everything the run
-        // allocates after it -- see `run_overhead_bytes`).
+        // The admission gate. ONE requirement -- the share plus everything the
+        // run allocates after it, see `run_overhead_bytes` -- asked of two
+        // numbers, and both have to say yes: does it fit the MACHINE
+        // (`MemTotal`, could this box ever hold it) and does it fit what the
+        // box has free RIGHT NOW (`MemAvailable`). See [`Admission`].
         let available = mem_available_bytes()?;
         let machine = mem_total_bytes()?;
         let n_layers = layers.len();
         let overhead = run_overhead_bytes(n_layers, attention_bytes, machine, policy);
         let need = total as u64 + overhead;
         let gib = |b: u64| b as f64 / GIB as f64;
-        if need > machine || total as u64 > available {
+        let verdict = admit(need, machine, available);
+        if verdict != Admission::Fits {
             // The largest range starting at `layers.start` that WOULD fit. Both
             // sides of the test grow with the layer count, so the predicate is
             // monotone and the last k that passes is the answer; the byte
@@ -1345,7 +1402,12 @@ impl PileSource {
                 acc += *bytes as u64;
                 let k = k + 1;
                 let fits_here = acc + run_overhead_bytes(k, attention_bytes, machine, policy);
-                if fits_here <= machine && acc <= available {
+                // The WHOLE requirement against both numbers, exactly as the
+                // gate above tests it. Comparing the bare share against
+                // `available` here is the same half-measurement that admitted
+                // the run being refused, and it would name a range that then
+                // failed the same way.
+                if admit(fits_here, machine, available) == Admission::Fits {
                     fits = Some((k, acc));
                 }
             }
@@ -1373,7 +1435,7 @@ impl PileSource {
             // the sequence and very nearly FLAT in the range, because layers
             // run one at a time and each frees its own before the next
             // allocates. No layer split touches it.
-            let cause = if attention_bytes > total as u64 {
+            let mut cause = if attention_bytes > total as u64 {
                 format!(
                     "\n  THE SEQUENCE, NOT THE SPLIT: {:.2} GiB of that is activations at this \
                      input length, against {:.2} GiB of weights. Splitting the stack across more \
@@ -1385,6 +1447,24 @@ impl PileSource {
             } else {
                 String::new()
             };
+            // ...and whether the run is the problem at all. A merely BUSY node
+            // refuses the same range it will admit once the memory comes back,
+            // and an operator told to split a stack when the answer was to wait
+            // sixty seconds splits one that never needed splitting.
+            if verdict == Admission::NodeBusy {
+                cause.push_str(&format!(
+                    "\n  THE NODE, NOT THE RUN: this fits a {:.2} GiB machine with {:.2} GiB to \
+                     spare -- but only {:.2} GiB is free right now, because {:.2} GiB of this node \
+                     is already spoken for. Neither the range nor the input length is wrong. Free \
+                     that memory or wait for it: a preceding run of this size does not return its \
+                     anonymous arena the instant it exits, and a gate that reads only MemTotal \
+                     prices every run against an EMPTY machine.",
+                    gib(machine),
+                    gib(machine - need),
+                    gib(available),
+                    gib(machine.saturating_sub(available)),
+                ));
+            }
             anyhow::bail!(
                 "INK_LAYERS={}:{} is {n_layers} layers = {:.2} GiB of weights; with the CUDA \
                  context and this node's activations that is {:.2} GiB, and this machine has \
@@ -1406,12 +1486,19 @@ impl PileSource {
         }
         println!(
             "    admission: {:.2} GiB of weights + {:.2} GiB context/activations = {:.2} GiB of \
-             {:.2} GiB ({:.2} GiB of headroom, {:.2} GiB available now)",
+             {:.2} GiB ({:.2} GiB of headroom against the {:.2} GiB free right now)",
             gib(total as u64),
             gib(overhead),
             gib(need),
             gib(machine),
-            gib(machine - need),
+            // The BINDING margin, not the one against an empty machine. This
+            // reported `machine - need`, so the idle 2026-08-23 run read 8.23
+            // GiB of headroom where it had 3.35, and the run that went on to
+            // swap for twenty-three minutes read 6.98 where it was 42.72 GiB
+            // SHORT. A refusal now catches that case, and the line says which
+            // number the margin is against so a thin one is visible before it
+            // becomes a refusal.
+            gib(machine.min(available) - need),
             gib(available),
         );
 
@@ -1726,6 +1813,40 @@ mod tests {
         let base = GIB / 5 + 41 * GIB / 200 * 8 + 4 * GIB + attention;
         assert_eq!(run_overhead_bytes(8, attention, machine, subslices), base + 40 * GIB);
         assert_eq!(run_overhead_bytes(8, attention, machine, exclusive), base + 40 * GIB);
+    }
+
+    /// The 2026-08-23 spark incident, in the numbers its own logs printed.
+    ///
+    /// `INK_LAYERS=0:16` at 2048 tokens needs 112.65 GiB and the node is 119.63,
+    /// so it fits the machine -- but 43.9 GiB of AnonPages was already held and
+    /// only 69.93 GiB was free. The old gate compared the 66.50 GiB weight
+    /// SHARE against those 69.93, found room, and admitted it; the startup copy
+    /// then ran 1384.5 s at 0.05 GiB/s and took all 15.1 GiB of swap, with sshd
+    /// unable to answer for the whole of it. The identical run on the idle node
+    /// copies in 15.3 s.
+    ///
+    /// Both directions are asserted, because the failure the fix must not
+    /// introduce is refusing a run that would have fit.
+    #[test]
+    fn a_run_that_fits_the_machine_is_refused_when_the_machine_is_busy() {
+        let gib = |g: f64| (g * GIB as f64) as u64;
+        let (machine, need, share) = (gib(119.63), gib(112.65), gib(66.50));
+        // The comparison the old gate made, and passed: the share alone really
+        // does fit the busy node. That is why reading it was not enough.
+        assert!(share < gib(69.93), "the old test found room and was still wrong");
+        assert_eq!(admit(need, machine, gib(69.93)), Admission::NodeBusy);
+        // ...and the same run on the idle node is still admitted, so this is
+        // not a blanket tightening that costs work which would have run.
+        assert_eq!(admit(need, machine, gib(114.75)), Admission::Fits);
+        // The 5-token arm of the same A/B, which ran twelve times cleanly.
+        assert_eq!(admit(gib(111.40), machine, gib(114.75)), Admission::Fits);
+        // Too big for the node at all is a different verdict because it takes a
+        // different fix: more nodes, not more patience.
+        assert_eq!(admit(gib(130.0), machine, gib(119.0)), Admission::OverMachine);
+        // An exactly-full node is admitted -- the floors inside
+        // `run_overhead_bytes` are what leaves the kernel its room, and
+        // subtracting a second margin here would double-charge it.
+        assert_eq!(admit(machine, machine, machine), Admission::Fits);
     }
 
     /// The blob states the LOGICAL width, so nothing downstream needs an
