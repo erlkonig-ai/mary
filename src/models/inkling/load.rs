@@ -169,8 +169,8 @@ impl Checkpoint {
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         let idx = dir.join("model.safetensors.index.json");
-        let text = std::fs::read_to_string(&idx)
-            .with_context(|| format!("reading {}", idx.display()))?;
+        let text =
+            std::fs::read_to_string(&idx).with_context(|| format!("reading {}", idx.display()))?;
         let v: serde_json::Value = serde_json::from_str(&text).context("parsing the index")?;
         let map = v
             .get("weight_map")
@@ -194,16 +194,18 @@ impl Checkpoint {
     /// What a zero-copy lane registers with the GPU, once. Maps every shard
     /// named by the index — including ones no tensor has been read from yet —
     /// because a registration that arrives after the kernel does is no use.
-    pub fn mappings(
-        &self,
-    ) -> Result<Vec<(usize, usize, Arc<dyn std::any::Any + Send + Sync>)>> {
+    pub fn mappings(&self) -> Result<Vec<(usize, usize, Arc<dyn std::any::Any + Send + Sync>)>> {
         let mut shards: Vec<String> = self.shard_of.values().cloned().collect();
         shards.sort();
         shards.dedup();
         let mut out = Vec::with_capacity(shards.len());
         for s in shards {
             let m = self.map_of(&s)?;
-            out.push((m.as_ptr() as usize, m.len(), m as Arc<dyn std::any::Any + Send + Sync>));
+            out.push((
+                m.as_ptr() as usize,
+                m.len(),
+                m as Arc<dyn std::any::Any + Send + Sync>,
+            ));
         }
         Ok(out)
     }
@@ -214,8 +216,8 @@ impl Checkpoint {
             return Ok(m.clone());
         }
         let path = self.dir.join(shard);
-        let file = std::fs::File::open(&path)
-            .with_context(|| format!("opening {}", path.display()))?;
+        let file =
+            std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
         // SAFETY: the checkpoint is read-only and nothing else writes it.
         let map = Arc::new(unsafe { Mmap::map(&file) }?);
         self.maps
@@ -398,7 +400,10 @@ impl Checkpoint {
             "{base} has shape {shape:?}; a stacked expert matrix is rank 3"
         );
         let (experts, rows, cols) = (shape[0], shape[1], shape[2]);
-        anyhow::ensure!(e < experts, "{base} stacks {experts} experts; {e} is out of range");
+        anyhow::ensure!(
+            e < experts,
+            "{base} stacks {experts} experts; {e} is out of range"
+        );
         let per = rows * cols * 2;
         anyhow::ensure!(
             slab.len == experts * per,
@@ -406,7 +411,13 @@ impl Checkpoint {
             slab.len,
             experts * per
         );
-        Ok(Bf16ExpertRef { slab, off: e * per, len: per, rows, cols })
+        Ok(Bf16ExpertRef {
+            slab,
+            off: e * per,
+            len: per,
+            rows,
+            cols,
+        })
     }
 
     /// How many experts a stacked matrix holds.
@@ -439,13 +450,20 @@ impl Checkpoint {
             // whole stack: it is 8 GB and this wants 33 MB of it.
             let per = rows * cols;
             let data = self.with_bytes(base, |raw| {
-                anyhow::ensure!(raw.len() == experts * per * 2, "{base} is {} bytes", raw.len());
+                anyhow::ensure!(
+                    raw.len() == experts * per * 2,
+                    "{base} is {} bytes",
+                    raw.len()
+                );
                 Ok(raw[e * per * 2..(e + 1) * per * 2]
                     .chunks_exact(2)
                     .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
                     .collect::<Vec<f32>>())
             })?;
-            return Ok(Loaded { data, shape: vec![rows, cols] });
+            return Ok(Loaded {
+                data,
+                shape: vec![rows, cols],
+            });
         }
 
         // Slice once, here, and decode on top -- so the device path and this
@@ -454,10 +472,19 @@ impl Checkpoint {
         let logical = q.cols * 2;
         let mut out = vec![0f32; q.rows * logical];
         let n = decode_stacked(
-            &q.codes, &q.scales, &[q.scale2], 1, q.rows, q.cols, &mut out,
+            &q.codes,
+            &q.scales,
+            &[q.scale2],
+            1,
+            q.rows,
+            q.cols,
+            &mut out,
         );
         anyhow::ensure!(n == out.len(), "decoded {n} of {}", out.len());
-        Ok(Loaded { data: out, shape: vec![q.rows, logical] })
+        Ok(Loaded {
+            data: out,
+            shape: vec![q.rows, logical],
+        })
     }
 
     /// Hand the tensor's raw bytes to `f` without copying them.
@@ -508,10 +535,17 @@ impl Checkpoint {
         );
 
         let logical = cols * 2;
-        anyhow::ensure!(logical % GROUP == 0, "{logical} logical is not a multiple of {GROUP}");
+        anyhow::ensure!(
+            logical % GROUP == 0,
+            "{logical} logical is not a multiple of {GROUP}"
+        );
         let scales_per_row = logical / GROUP;
         let scale2 = self.tensor(&format!("{base}.scale2"))?;
-        anyhow::ensure!(scale2.data.len() == experts, "scale2 is {}", scale2.data.len());
+        anyhow::ensure!(
+            scale2.data.len() == experts,
+            "scale2 is {}",
+            scale2.data.len()
+        );
         anyhow::ensure!(
             codes_span.len == experts * rows * cols,
             "{base} is {} bytes",
@@ -535,9 +569,7 @@ impl Checkpoint {
             cols,
         })
     }
-
 }
-
 
 /// De-interleave a fused matrix along its OUTPUT axis.
 ///
@@ -546,7 +578,10 @@ impl Checkpoint {
 /// them as two contiguous blocks, which is what every consumer here expects.
 pub fn deinterleave_rows(fused: &[f32], rows: usize, cols: usize) -> (Vec<f32>, Vec<f32>) {
     assert_eq!(fused.len(), rows * cols);
-    assert!(rows % 2 == 0, "a fused gate/up matrix must have an even row count");
+    assert!(
+        rows % 2 == 0,
+        "a fused gate/up matrix must have an even row count"
+    );
     let half = rows / 2;
     let mut a = Vec::with_capacity(half * cols);
     let mut b = Vec::with_capacity(half * cols);
@@ -576,7 +611,10 @@ pub fn deinterleave_rows_bytes(
     width: usize,
 ) -> (Vec<u8>, Vec<u8>) {
     assert_eq!(fused.len(), rows * cols * width);
-    assert!(rows % 2 == 0, "a fused gate/up matrix must have an even row count");
+    assert!(
+        rows % 2 == 0,
+        "a fused gate/up matrix must have an even row count"
+    );
     let half = rows / 2;
     let stride = cols * width;
     let mut a = Vec::with_capacity(half * stride);
@@ -591,7 +629,11 @@ pub fn deinterleave_rows_bytes(
 /// [`split_gate_up`] on stored bytes.
 pub fn split_gate_up_bytes(fused: &[u8], hidden: usize, width: usize) -> (Vec<u8>, Vec<u8>) {
     let stride = hidden * width;
-    assert_eq!(fused.len() % stride, 0, "fused matrix is not [rows, hidden]");
+    assert_eq!(
+        fused.len() % stride,
+        0,
+        "fused matrix is not [rows, hidden]"
+    );
     deinterleave_rows_bytes(fused, fused.len() / stride, hidden, width)
 }
 
@@ -607,7 +649,12 @@ pub fn split_shared_w13_bytes(
     width: usize,
 ) -> (Vec<u8>, Vec<u8>) {
     let per = 2 * inter * hidden * width;
-    assert_eq!(fused.len(), n_shared * per, "shared_w13 is not [{n_shared}, {}, {hidden}]", 2 * inter);
+    assert_eq!(
+        fused.len(),
+        n_shared * per,
+        "shared_w13 is not [{n_shared}, {}, {hidden}]",
+        2 * inter
+    );
     let mut gate = Vec::with_capacity(n_shared * inter * hidden * width);
     let mut up = Vec::with_capacity(n_shared * inter * hidden * width);
     for s in 0..n_shared {
@@ -632,7 +679,11 @@ pub fn split_shared_w13_bytes(
 /// A contiguous split is shape-identical and numerically wrong, and no
 /// comparison against a reference that makes the same split can detect it.
 pub fn split_gate_up(fused: &[f32], hidden: usize) -> (Vec<f32>, Vec<f32>) {
-    assert_eq!(fused.len() % hidden, 0, "fused matrix is not [rows, hidden]");
+    assert_eq!(
+        fused.len() % hidden,
+        0,
+        "fused matrix is not [rows, hidden]"
+    );
     deinterleave_rows(fused, fused.len() / hidden, hidden)
 }
 
@@ -655,7 +706,9 @@ pub fn deinterleave_fused(fused: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 /// contiguous reading, so the question can be settled by running it rather than
 /// by argument. See [`split_shared_w13`].
 pub fn shared_w13_halved() -> bool {
-    std::env::var("INK_SHARED_W13_HALVED").map(|v| v == "1").unwrap_or(false)
+    std::env::var("INK_SHARED_W13_HALVED")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 /// Split the shared experts' `shared_w13_weight`, `[n_shared, 2 * inter, hidden]`,

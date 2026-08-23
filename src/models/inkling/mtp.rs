@@ -178,7 +178,17 @@ pub fn mtp_block(
     tokens: usize,
     order: Concat,
 ) -> Vec<f32> {
-    mtp_block_prefill(hidden, embeds, head, dims, log_scaling, window, tokens, order).0
+    mtp_block_prefill(
+        hidden,
+        embeds,
+        head,
+        dims,
+        log_scaling,
+        window,
+        tokens,
+        order,
+    )
+    .0
 }
 
 /// The same, keeping what a single-position draft will need.

@@ -117,8 +117,10 @@ fn main() -> Result<()> {
             fp4_linear_launch(&client, &a, &asc, bc, bs, m_pad, k, n, w13.scale2)
         };
 
-        let ya = f32::from_bytes(&client.read_one(run(&alias_codes, &alias_scales)).unwrap()).to_vec();
-        let yc = f32::from_bytes(&client.read_one(run(&copy_codes, &copy_scales)).unwrap()).to_vec();
+        let ya =
+            f32::from_bytes(&client.read_one(run(&alias_codes, &alias_scales)).unwrap()).to_vec();
+        let yc =
+            f32::from_bytes(&client.read_one(run(&copy_codes, &copy_scales)).unwrap()).to_vec();
         let bitmatch = ya.iter().zip(&yc).all(|(p, q)| p.to_bits() == q.to_bits());
 
         // f64 reference, so "they agree" cannot mean "both wrong the same way".

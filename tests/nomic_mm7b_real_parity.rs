@@ -113,10 +113,9 @@ fn real_text_embed_parity() {
 
     let device = NdArrayDevice::default();
     eprintln!("[real-parity] loading merged backbone keymap from pile {pile_path} ...");
-    let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(Path::new(
-        &pile_path,
-    ))
-    .expect("load native model collection snapshot");
+    let (_, snapshot) =
+        mary::model_collection::load_sole_model_collection_local_latest(Path::new(&pile_path))
+            .expect("load native model collection snapshot");
     let map = mary::selection::load_keymap_from_graph(
         snapshot.facts(),
         snapshot.reader(),

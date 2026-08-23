@@ -82,11 +82,7 @@ fn main() -> Result<()> {
                 .zip(&b)
                 .position(|(x, y)| x != y)
                 .expect("lengths equal and slices differ");
-            anyhow::bail!(
-                "{name}: value differs at index {i}: {} vs {}",
-                a[i],
-                b[i]
-            );
+            anyhow::bail!("{name}: value differs at index {i}: {} vs {}", a[i], b[i]);
         }
 
         // The typed side should also serve this without a copy.

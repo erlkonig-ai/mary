@@ -77,7 +77,10 @@ fn main() {
     // root-based check passed while every real read said "no tokenizer graph".
     let tok_id = mary::tokenizer::find_tokenizer(&tribles)
         .expect("find_tokenizer must discover the node the loader will look for");
-    assert_eq!(tok_id, root_id, "find_tokenizer found a different node than the fragment root");
+    assert_eq!(
+        tok_id, root_id,
+        "find_tokenizer found a different node than the fragment root"
+    );
 
     // ── 3. read it back out ──
     let reader = blobs.reader().expect("reader");
@@ -168,6 +171,9 @@ fn main() {
         PROBES.len() - bad,
         PROBES.len()
     );
-    assert_eq!(bad, 0, "{bad} probe strings encode differently from the pile");
+    assert_eq!(
+        bad, 0,
+        "{bad} probe strings encode differently from the pile"
+    );
     println!("\nPASS (on disk) — PersonaPlex no longer needs the .model file.");
 }

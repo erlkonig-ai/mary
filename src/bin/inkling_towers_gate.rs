@@ -27,9 +27,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 use mary::models::inkling::load::Checkpoint;
-use mary::models::inkling::vision::{
-    audio_embed, plan_out_scales, vision_stage, vision_stages,
-};
+use mary::models::inkling::vision::{audio_embed, plan_out_scales, vision_stage, vision_stages};
 
 const BUDGET: f32 = 1e-5;
 
@@ -49,7 +47,9 @@ fn read_i64(p: &std::path::Path) -> Result<Vec<i64>> {
 
 fn num(text: &str, key: &str) -> Result<f64> {
     let pat = format!("\"{key}\"");
-    let at = text.find(&pat).with_context(|| format!("manifest has no {key}"))?;
+    let at = text
+        .find(&pat)
+        .with_context(|| format!("manifest has no {key}"))?;
     let rest = &text[at + pat.len()..];
     let colon = rest.find(':').context("malformed manifest")?;
     let s: String = rest[colon + 1..]
@@ -57,7 +57,8 @@ fn num(text: &str, key: &str) -> Result<f64> {
         .skip_while(|c| c.is_whitespace())
         .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == 'e')
         .collect();
-    s.parse().with_context(|| format!("{key} is not a number: {s:?}"))
+    s.parse()
+        .with_context(|| format!("{key} is not a number: {s:?}"))
 }
 
 fn report(label: &str, mine: &[f32], theirs: &[f32], checks: &mut usize, fails: &mut usize) {
@@ -73,9 +74,15 @@ fn report(label: &str, mine: &[f32], theirs: &[f32], checks: &mut usize, fails: 
     let n = mine.len().min(theirs.len());
     *checks += n;
     let scaled = abs / scale.max(f32::MIN_POSITIVE);
-    println!("  {label}: {n} values, worst abs {abs:e} / scale {scale:e} = {scaled:e}, rel {rel:e}");
+    println!(
+        "  {label}: {n} values, worst abs {abs:e} / scale {scale:e} = {scaled:e}, rel {rel:e}"
+    );
     if mine.len() != theirs.len() {
-        println!("    FAIL  lengths differ: {} vs {}", mine.len(), theirs.len());
+        println!(
+            "    FAIL  lengths differ: {} vs {}",
+            mine.len(),
+            theirs.len()
+        );
         *fails += 1;
     }
     if scaled > BUDGET {
@@ -85,8 +92,14 @@ fn report(label: &str, mine: &[f32], theirs: &[f32], checks: &mut usize, fails: 
 }
 
 fn main() -> Result<()> {
-    let ckpt = std::env::args().nth(1).map(PathBuf::from).context("usage: <ckpt> <oracle>")?;
-    let oracle = std::env::args().nth(2).map(PathBuf::from).context("usage: <ckpt> <oracle>")?;
+    let ckpt = std::env::args()
+        .nth(1)
+        .map(PathBuf::from)
+        .context("usage: <ckpt> <oracle>")?;
+    let oracle = std::env::args()
+        .nth(2)
+        .map(PathBuf::from)
+        .context("usage: <ckpt> <oracle>")?;
     let man = String::from_utf8(std::fs::read(oracle.join("tow_manifest.json"))?)?;
 
     let patch = num(&man, "patch_size")? as usize;
@@ -115,9 +128,16 @@ fn main() -> Result<()> {
     // ---- 1. the derived plan, against scipy's assignment -------------------
     println!("\n=== 1. plan_out_scales, derived here vs scipy in the reference ===");
     let ref_scales = read_i64(&oracle.join("tow_scales.bin"))?;
-    anyhow::ensure!(!ref_scales.is_empty(), "no reference scales — the gate would be vacuous");
+    anyhow::ensure!(
+        !ref_scales.is_empty(),
+        "no reference scales — the gate would be vacuous"
+    );
     let mine = plan_out_scales(tpatch, patch, n_layers, n_ch);
-    println!("  reference rows: {}, mine: {}", ref_scales.len() / 4, mine.len());
+    println!(
+        "  reference rows: {}, mine: {}",
+        ref_scales.len() / 4,
+        mine.len()
+    );
     checks += 1;
     if mine.len() * 4 != ref_scales.len() {
         println!("  FAIL  {} rows vs {}", mine.len(), ref_scales.len() / 4);
@@ -147,21 +167,32 @@ fn main() -> Result<()> {
     checks += 1;
     anyhow::ensure!(
         stages.len() * 5 == ref_stages.len(),
-        "{} stages vs {}", stages.len(), ref_stages.len() / 5
+        "{} stages vs {}",
+        stages.len(),
+        ref_stages.len() / 5
     );
     let mut bad = 0usize;
     for (i, s) in stages.iter().enumerate() {
         checks += 5;
         let r = &ref_stages[i * 5..i * 5 + 5];
         let got = [
-            s.t_fold as i64, s.hw_fold as i64,
-            s.input_dim as i64, s.output_dim as i64, s.add_norm as i64,
+            s.t_fold as i64,
+            s.hw_fold as i64,
+            s.input_dim as i64,
+            s.output_dim as i64,
+            s.add_norm as i64,
         ];
         let want = [r[0], r[1], r[2], r[3], r[4]];
         let ok = got == want;
-        println!("  stage {i}: fold t={} hw={}, {} -> {}, norm={}  {}",
-                 s.t_fold, s.hw_fold, s.input_dim, s.output_dim, s.add_norm,
-                 if ok { "ok" } else { "FAIL" });
+        println!(
+            "  stage {i}: fold t={} hw={}, {} -> {}, norm={}  {}",
+            s.t_fold,
+            s.hw_fold,
+            s.input_dim,
+            s.output_dim,
+            s.add_norm,
+            if ok { "ok" } else { "FAIL" }
+        );
         if !ok {
             println!("    reference: {want:?}");
             bad += 1;
@@ -189,14 +220,25 @@ fn main() -> Result<()> {
     let vref = read_f32(&oracle.join("tow_vision_y.bin"))?;
     anyhow::ensure!(!vref.is_empty(), "no vision reference");
     let per_patch = tpatch * patch * patch * n_ch;
-    anyhow::ensure!(px.len() == patches * per_patch, "pixels are {} not {}", px.len(), patches * per_patch);
+    anyhow::ensure!(
+        px.len() == patches * per_patch,
+        "pixels are {} not {}",
+        px.len(),
+        patches * per_patch
+    );
 
     let mut projs = Vec::new();
     let mut norms: Vec<Option<Vec<f32>>> = Vec::new();
     for (i, s) in stages.iter().enumerate() {
-        projs.push(cp.tensor(&format!("model.visual.layers.linear_{i}.weight"))?.data);
+        projs.push(
+            cp.tensor(&format!("model.visual.layers.linear_{i}.weight"))?
+                .data,
+        );
         norms.push(if s.add_norm {
-            Some(cp.tensor(&format!("model.visual.layers.norm_{i}.weight"))?.data)
+            Some(
+                cp.tensor(&format!("model.visual.layers.norm_{i}.weight"))?
+                    .data,
+            )
         } else {
             None
         });
@@ -226,10 +268,20 @@ fn main() -> Result<()> {
         .collect();
     let aref = read_f32(&oracle.join("tow_audio_y.bin"))?;
     anyhow::ensure!(!aref.is_empty(), "no audio reference");
-    anyhow::ensure!(ids.len() == frames * bins, "ids are {} not {}", ids.len(), frames * bins);
+    anyhow::ensure!(
+        ids.len() == frames * bins,
+        "ids are {} not {}",
+        ids.len(),
+        frames * bins
+    );
     let table = cp.tensor("model.audio.encoder.weight")?.data;
     let anorm = cp.tensor("model.audio.final_norm.weight")?.data;
-    println!("  codebook table is {} floats = [{}x{}, {text_h}]", table.len(), bins, levels);
+    println!(
+        "  codebook table is {} floats = [{}x{}, {text_h}]",
+        table.len(),
+        bins,
+        levels
+    );
     checks += 1;
     if table.len() != bins * levels * text_h {
         println!("  FAIL  table is the wrong size");

@@ -11,9 +11,9 @@
 pub mod alias;
 pub mod backend;
 pub mod mxfp4;
+pub mod norm;
 pub mod npy;
 pub mod npz;
-pub mod norm;
 #[cfg(feature = "q4")]
 pub mod q4;
 pub mod weight_loader;

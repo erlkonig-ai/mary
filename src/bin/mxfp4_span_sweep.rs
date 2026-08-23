@@ -62,7 +62,10 @@ fn read_header(path: &Path) -> (u64, serde_json::Value) {
     let header_len = u64::from_le_bytes(len);
     let mut buf = vec![0u8; header_len as usize];
     f.read_exact(&mut buf).expect("header bytes");
-    (header_len, serde_json::from_slice(&buf).expect("header json"))
+    (
+        header_len,
+        serde_json::from_slice(&buf).expect("header json"),
+    )
 }
 
 /// `language_model.model.layers.{L}.block_sparse_moe.experts.{E}.{w}.weight_scale`
@@ -71,7 +74,9 @@ fn parse_scale_name(name: &str) -> Option<(u32, u32, String)> {
     let rest = name.strip_suffix(".weight_scale")?;
     let (head, which) = rest.rsplit_once('.')?;
     let (head, expert) = head.rsplit_once(".experts.")?;
-    let (_, layer) = head.strip_suffix(".block_sparse_moe")?.rsplit_once(".layers.")?;
+    let (_, layer) = head
+        .strip_suffix(".block_sparse_moe")?
+        .rsplit_once(".layers.")?;
     Some((layer.parse().ok()?, expert.parse().ok()?, which.to_string()))
 }
 
@@ -92,8 +97,9 @@ fn measure(model_dir: &Path, planes: &[Plane]) -> Vec<(i32, i32)> {
             buf.resize(p.nbytes, 0);
             f.seek(SeekFrom::Start(p.abs_start)).expect("seek");
             f.read_exact(&mut buf).expect("read scale plane");
-            out[i] = scale_exponent_range(&buf)
-                .unwrap_or_else(|e| panic!("layer {} expert {} {}: {e}", p.layer, p.expert, p.which));
+            out[i] = scale_exponent_range(&buf).unwrap_or_else(|e| {
+                panic!("layer {} expert {} {}: {e}", p.layer, p.expert, p.which)
+            });
         }
     }
     out
@@ -101,17 +107,20 @@ fn measure(model_dir: &Path, planes: &[Plane]) -> Vec<(i32, i32)> {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let model_dir: PathBuf = args.next().expect("usage: mxfp4_span_sweep <MODEL_DIR> [ORACLE_DIR] [N|all]").into();
-    let oracle_dir = mary::paths::model(args.next().as_deref(), "k3-oracle")
-        .unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(2)
-        });
+    let model_dir: PathBuf = args
+        .next()
+        .expect("usage: mxfp4_span_sweep <MODEL_DIR> [ORACLE_DIR] [N|all]")
+        .into();
+    let oracle_dir = mary::paths::model(args.next().as_deref(), "k3-oracle").unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
     let per_layer = args.next().unwrap_or_else(|| "16".to_string());
 
-    let index: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(model_dir.join("model.safetensors.index.json")).expect("index"))
-            .expect("parse index");
+    let index: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(model_dir.join("model.safetensors.index.json")).expect("index"),
+    )
+    .expect("parse index");
     let weight_map = index["weight_map"].as_object().expect("weight_map");
 
     // Every scale plane in the checkpoint, keyed by (layer, expert, which),
@@ -134,7 +143,9 @@ fn main() {
 
     let plane_of = |layer: u32, expert: u32, which: &str| -> Plane {
         let key = (layer, expert, which.to_string());
-        let shard = *catalog.get(&key).unwrap_or_else(|| panic!("no {key:?} in index"));
+        let shard = *catalog
+            .get(&key)
+            .unwrap_or_else(|| panic!("no {key:?} in index"));
         let name = format!(
             "language_model.model.layers.{layer}.block_sparse_moe.experts.{expert}.{which}.weight_scale"
         );
@@ -154,18 +165,23 @@ fn main() {
     };
 
     // ---------------------------------------------------------------- gate
-    let stats: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(oracle_dir.join("_decode_stats.json")).expect("decode stats"))
-            .expect("parse decode stats");
-    let extract: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(oracle_dir.join("_extract_meta.json")).expect("extract meta"))
-            .expect("parse extract meta");
+    let stats: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(oracle_dir.join("_decode_stats.json")).expect("decode stats"),
+    )
+    .expect("parse decode stats");
+    let extract: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(oracle_dir.join("_extract_meta.json")).expect("extract meta"),
+    )
+    .expect("parse extract meta");
     // The oracle's abs_start for every tensor it pulled, keyed by name.
     let mut oracle_abs: BTreeMap<String, u64> = BTreeMap::new();
     fn collect_abs(v: &serde_json::Value, out: &mut BTreeMap<String, u64>) {
         match v {
             serde_json::Value::Object(m) => {
-                if let (Some(n), Some(a)) = (m.get("name").and_then(|x| x.as_str()), m.get("abs_start").and_then(|x| x.as_u64())) {
+                if let (Some(n), Some(a)) = (
+                    m.get("name").and_then(|x| x.as_str()),
+                    m.get("abs_start").and_then(|x| x.as_u64()),
+                ) {
                     out.insert(n.to_string(), a);
                 }
                 for x in m.values() {
@@ -200,18 +216,26 @@ fn main() {
         );
         match oracle_abs.get(&name) {
             Some(&want) if want == p.abs_start => {}
-            Some(&want) => failures.push(format!("{name}: abs_start {} != oracle {want}", p.abs_start)),
+            Some(&want) => failures.push(format!(
+                "{name}: abs_start {} != oracle {want}",
+                p.abs_start
+            )),
             None => failures.push(format!("{name}: not in the oracle's extract meta")),
         }
     }
     let got = measure(&model_dir, &gate_planes);
     for ((tag, want_min, want_max), (e_min, e_max)) in gate_want.iter().zip(&got) {
         if (e_min, e_max) != (want_min, want_max) {
-            failures.push(format!("{tag}: exponents {e_min}..{e_max} != oracle {want_min}..{want_max}"));
+            failures.push(format!(
+                "{tag}: exponents {e_min}..{e_max} != oracle {want_min}..{want_max}"
+            ));
         }
     }
     if !failures.is_empty() {
-        eprintln!("GATE FAILED — {} problem(s); no span reported:", failures.len());
+        eprintln!(
+            "GATE FAILED — {} problem(s); no span reported:",
+            failures.len()
+        );
         for f in &failures {
             eprintln!("  {f}");
         }
@@ -232,11 +256,21 @@ fn main() {
     let sampled: BTreeMap<u32, Vec<u32>> = layers
         .iter()
         .map(|(layer, experts)| {
-            let n: usize = if per_layer == "all" { experts.len() } else { per_layer.parse().expect("N") };
+            let n: usize = if per_layer == "all" {
+                experts.len()
+            } else {
+                per_layer.parse().expect("N")
+            };
             let n = n.min(experts.len()).max(1);
             // Even stride across the expert index, endpoints included.
             let picks = (0..n)
-                .map(|i| experts[if n == 1 { 0 } else { i * (experts.len() - 1) / (n - 1) }])
+                .map(|i| {
+                    experts[if n == 1 {
+                        0
+                    } else {
+                        i * (experts.len() - 1) / (n - 1)
+                    }]
+                })
                 .collect::<Vec<_>>();
             (*layer, picks)
         })
@@ -251,7 +285,11 @@ fn main() {
         }
     }
     let gib = planes.iter().map(|p| p.nbytes).sum::<usize>() as f64 / (1 << 30) as f64;
-    println!("sweeping {} tensors over {} layers ({gib:.2} GiB of scale planes)", planes.len(), sampled.len());
+    println!(
+        "sweeping {} tensors over {} layers ({gib:.2} GiB of scale planes)",
+        planes.len(),
+        sampled.len()
+    );
 
     let t0 = std::time::Instant::now();
     let ranges = measure(&model_dir, &planes);
@@ -280,9 +318,15 @@ fn main() {
     }
 
     println!("\nworst per-tensor octave span, by layer:");
-    println!("{:<7} {:>6} {:>8} {:>4} {:>12}", "layer", "span", "expert", "t", "exponents");
+    println!(
+        "{:<7} {:>6} {:>8} {:>4} {:>12}",
+        "layer", "span", "expert", "t", "exponents"
+    );
     for (layer, (span, expert, which, e_min, e_max)) in &worst {
-        println!("{layer:<7} {span:>6} {expert:>8} {which:>4} {:>12}", format!("{e_min}..{e_max}"));
+        println!(
+            "{layer:<7} {span:>6} {expert:>8} {which:>4} {:>12}",
+            format!("{e_min}..{e_max}")
+        );
     }
 
     println!("\nspan histogram (tensors per octave span):");

@@ -21,7 +21,9 @@ use triblespace::prelude::*;
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let dir = args.next().context("usage: inkling_pile_import <dir> [base] [experts]")?;
+    let dir = args
+        .next()
+        .context("usage: inkling_pile_import <dir> [base] [experts]")?;
     let base = args
         .next()
         .unwrap_or_else(|| "model.llm.layers.10.mlp.experts.w13_weight".to_string());
@@ -45,7 +47,8 @@ fn main() -> Result<()> {
                 std::fs::File::create(path)?;
             }
             let mut pile = Pile::open(path).map_err(|e| anyhow::anyhow!("open pile: {e:?}"))?;
-            pile.refresh().map_err(|e| anyhow::anyhow!("load pile: {e:?}"))?;
+            pile.refresh()
+                .map_err(|e| anyhow::anyhow!("load pile: {e:?}"))?;
             let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
             let team = mary::model_collection::model_graph_team_or_own(&mut pile, &signing_key)
                 .map_err(|e| anyhow::anyhow!("model collection: {e}"))?;
@@ -64,7 +67,9 @@ fn main() -> Result<()> {
         let blob2 = expert_blob(&q)?;
         let bytes = blob.bytes.len();
         let handle = blob.get_handle();
-        let view: TensorView = blob.try_from_blob().context("decoding the blob just built")?;
+        let view: TensorView = blob
+            .try_from_blob()
+            .context("decoding the blob just built")?;
 
         // The claims worth checking against real bytes rather than a fixture.
         anyhow::ensure!(
@@ -75,7 +80,10 @@ fn main() -> Result<()> {
             logical
         );
         let (codes, scales, scale2) = split_payload(view.payload(), view.elems())?;
-        anyhow::ensure!(codes == &q.codes[..], "expert {e}: codes differ after a round trip");
+        anyhow::ensure!(
+            codes == &q.codes[..],
+            "expert {e}: codes differ after a round trip"
+        );
         anyhow::ensure!(scales == &q.scales[..], "expert {e}: scales differ");
         anyhow::ensure!(scale2 == q.scale2, "expert {e}: global scale differs");
 
@@ -106,22 +114,15 @@ fn main() -> Result<()> {
 
     if let Some((mut pile, signing_key, team, change)) = writing {
         if !change.facts().is_empty() {
-            mary::model_collection::publish_model_fragment(
-                &mut pile,
-                team,
-                &signing_key,
-                change,
-            )
-            .map_err(|e| anyhow::anyhow!("publish model collection: {e}"))?;
+            mary::model_collection::publish_model_fragment(&mut pile, team, &signing_key, change)
+                .map_err(|e| anyhow::anyhow!("publish model collection: {e}"))?;
         }
         println!("wrote {count} expert(s) to {}", pile_path.clone().unwrap());
 
         // Query the collection we just wrote, by layer.
-        let snapshot = mary::model_collection::snapshot_model_collection_local_latest(
-            &mut pile,
-            team,
-        )
-        .map_err(|e| anyhow::anyhow!("snapshot model collection: {e}"))?;
+        let snapshot =
+            mary::model_collection::snapshot_model_collection_local_latest(&mut pile, team)
+                .map_err(|e| anyhow::anyhow!("snapshot model collection: {e}"))?;
         let held = experts_in_layers(snapshot.facts(), 0..=20);
         let all = experts_in_layers(snapshot.facts(), i64::MIN..=i64::MAX);
         println!(
@@ -130,10 +131,14 @@ fn main() -> Result<()> {
             all.len()
         );
         for r in all.iter().take(3) {
-            println!("  layer {:>3}  expert {:>3}  {:?}", r.layer, r.expert, r.handle);
+            println!(
+                "  layer {:>3}  expert {:>3}  {:?}",
+                r.layer, r.expert, r.handle
+            );
         }
         drop(snapshot);
-        pile.close().map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+        pile.close()
+            .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
     }
 
     println!(

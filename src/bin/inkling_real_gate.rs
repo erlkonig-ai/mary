@@ -65,7 +65,9 @@ fn read_f32(p: &std::path::Path) -> Result<Vec<f32>> {
 
 fn num(text: &str, key: &str) -> Result<f64> {
     let pat = format!("\"{key}\"");
-    let at = text.find(&pat).with_context(|| format!("manifest has no {key}"))?;
+    let at = text
+        .find(&pat)
+        .with_context(|| format!("manifest has no {key}"))?;
     let rest = &text[at + pat.len()..];
     let colon = rest.find(':').context("malformed manifest")?;
     let s: String = rest[colon + 1..]
@@ -73,7 +75,8 @@ fn num(text: &str, key: &str) -> Result<f64> {
         .skip_while(|c| c.is_whitespace())
         .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == 'e')
         .collect();
-    s.parse().with_context(|| format!("{key} is not a number: {s:?}"))
+    s.parse()
+        .with_context(|| format!("{key} is not a number: {s:?}"))
 }
 
 /// The fingerprint block for one tensor, located by its module name.
@@ -82,7 +85,9 @@ fn fingerprint(man: &str, key: &str, field: &str) -> Result<f64> {
         .find(&format!("\"{key}\""))
         .with_context(|| format!("no fingerprint for {key}"))?;
     let pat = format!("\"{field}\"");
-    let rel = man[at..].find(&pat).with_context(|| format!("{key} has no {field}"))?;
+    let rel = man[at..]
+        .find(&pat)
+        .with_context(|| format!("{key} has no {field}"))?;
     let rest = &man[at + rel + pat.len()..];
     let colon = rest.find(':').context("malformed fingerprint")?;
     let s: String = rest[colon + 1..]
@@ -90,7 +95,8 @@ fn fingerprint(man: &str, key: &str, field: &str) -> Result<f64> {
         .skip_while(|c| c.is_whitespace())
         .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == 'e')
         .collect();
-    s.parse().with_context(|| format!("{key}.{field} is not a number: {s:?}"))
+    s.parse()
+        .with_context(|| format!("{key}.{field} is not a number: {s:?}"))
 }
 
 fn check_fp(man: &str, key: &str, v: &[f32], checks: &mut usize, fails: &mut usize) {
@@ -213,7 +219,11 @@ fn assert_shared_orientation(
             if oracle_halved == SHARED_W13_HALVED {
                 println!(
                     "  ok    oracle was captured {}, which is the reading a real forward settled",
-                    if oracle_halved { "HALVED" } else { "INTERLEAVED" }
+                    if oracle_halved {
+                        "HALVED"
+                    } else {
+                        "INTERLEAVED"
+                    }
                 );
             } else {
                 println!(
@@ -224,8 +234,16 @@ fn assert_shared_orientation(
                      manifest's \"w13_split\" string that still say halved. Re-run it to \
                      regenerate this oracle; until then this gate cannot certify the layer, \
                      because its reference layer was built with a swapped gate/up half.",
-                    if oracle_halved { "HALVED" } else { "INTERLEAVED" },
-                    if SHARED_W13_HALVED { "HALVED" } else { "INTERLEAVED" }
+                    if oracle_halved {
+                        "HALVED"
+                    } else {
+                        "INTERLEAVED"
+                    },
+                    if SHARED_W13_HALVED {
+                        "HALVED"
+                    } else {
+                        "INTERLEAVED"
+                    }
                 );
                 *fails += 1;
             }
@@ -234,8 +252,14 @@ fn assert_shared_orientation(
 }
 
 fn main() -> Result<()> {
-    let ckpt = std::env::args().nth(1).map(PathBuf::from).context("usage: <ckpt> <oracle>")?;
-    let oracle = std::env::args().nth(2).map(PathBuf::from).context("usage: <ckpt> <oracle>")?;
+    let ckpt = std::env::args()
+        .nth(1)
+        .map(PathBuf::from)
+        .context("usage: <ckpt> <oracle>")?;
+    let oracle = std::env::args()
+        .nth(2)
+        .map(PathBuf::from)
+        .context("usage: <ckpt> <oracle>")?;
     let man = String::from_utf8(std::fs::read(oracle.join("real_manifest.json"))?)?;
 
     let layer = num(&man, "layer")? as usize;
@@ -258,8 +282,10 @@ fn main() -> Result<()> {
     println!("=== checkpoint ===");
     println!("  dir              : {}", ckpt.display());
     println!("  tensors in index : {}", cp.len());
-    println!("  layer {layer}: hidden {h}, heads {heads}/{kv_heads}x{head_dim}, {}",
-             if is_sliding { "sliding" } else { "global" });
+    println!(
+        "  layer {layer}: hidden {h}, heads {heads}/{kv_heads}x{head_dim}, {}",
+        if is_sliding { "sliding" } else { "global" }
+    );
     anyhow::ensure!(cp.len() > 0, "empty index — the gate would be vacuous");
 
     let mut fails = 0usize;
@@ -284,20 +310,104 @@ fn main() -> Result<()> {
     let vs = g("attn.v_sconv.weight")?;
     let rp = g("attn.rel_logits_proj.proj")?;
 
-    check_fp(&man, "input_layernorm.weight", &attn_norm, &mut checks, &mut fails);
-    check_fp(&man, "post_attention_layernorm.weight", &mlp_norm, &mut checks, &mut fails);
-    check_fp(&man, "attn_sconv.conv1d.weight", &attn_sconv, &mut checks, &mut fails);
-    check_fp(&man, "mlp_sconv.conv1d.weight", &mlp_sconv, &mut checks, &mut fails);
-    check_fp(&man, "self_attn.q_proj.weight", &wq, &mut checks, &mut fails);
-    check_fp(&man, "self_attn.k_proj.weight", &wk, &mut checks, &mut fails);
-    check_fp(&man, "self_attn.v_proj.weight", &wv, &mut checks, &mut fails);
-    check_fp(&man, "self_attn.r_proj.weight", &wr, &mut checks, &mut fails);
-    check_fp(&man, "self_attn.o_proj.weight", &wo, &mut checks, &mut fails);
-    check_fp(&man, "self_attn.q_norm.weight", &qn, &mut checks, &mut fails);
-    check_fp(&man, "self_attn.k_norm.weight", &kn, &mut checks, &mut fails);
-    check_fp(&man, "self_attn.k_sconv.conv1d.weight", &ks, &mut checks, &mut fails);
-    check_fp(&man, "self_attn.v_sconv.conv1d.weight", &vs, &mut checks, &mut fails);
-    check_fp(&man, "self_attn.rel_logits_proj.proj", &rp, &mut checks, &mut fails);
+    check_fp(
+        &man,
+        "input_layernorm.weight",
+        &attn_norm,
+        &mut checks,
+        &mut fails,
+    );
+    check_fp(
+        &man,
+        "post_attention_layernorm.weight",
+        &mlp_norm,
+        &mut checks,
+        &mut fails,
+    );
+    check_fp(
+        &man,
+        "attn_sconv.conv1d.weight",
+        &attn_sconv,
+        &mut checks,
+        &mut fails,
+    );
+    check_fp(
+        &man,
+        "mlp_sconv.conv1d.weight",
+        &mlp_sconv,
+        &mut checks,
+        &mut fails,
+    );
+    check_fp(
+        &man,
+        "self_attn.q_proj.weight",
+        &wq,
+        &mut checks,
+        &mut fails,
+    );
+    check_fp(
+        &man,
+        "self_attn.k_proj.weight",
+        &wk,
+        &mut checks,
+        &mut fails,
+    );
+    check_fp(
+        &man,
+        "self_attn.v_proj.weight",
+        &wv,
+        &mut checks,
+        &mut fails,
+    );
+    check_fp(
+        &man,
+        "self_attn.r_proj.weight",
+        &wr,
+        &mut checks,
+        &mut fails,
+    );
+    check_fp(
+        &man,
+        "self_attn.o_proj.weight",
+        &wo,
+        &mut checks,
+        &mut fails,
+    );
+    check_fp(
+        &man,
+        "self_attn.q_norm.weight",
+        &qn,
+        &mut checks,
+        &mut fails,
+    );
+    check_fp(
+        &man,
+        "self_attn.k_norm.weight",
+        &kn,
+        &mut checks,
+        &mut fails,
+    );
+    check_fp(
+        &man,
+        "self_attn.k_sconv.conv1d.weight",
+        &ks,
+        &mut checks,
+        &mut fails,
+    );
+    check_fp(
+        &man,
+        "self_attn.v_sconv.conv1d.weight",
+        &vs,
+        &mut checks,
+        &mut fails,
+    );
+    check_fp(
+        &man,
+        "self_attn.rel_logits_proj.proj",
+        &rp,
+        &mut checks,
+        &mut fails,
+    );
     let is_dense = man.contains("\"is_dense\": true");
 
     // These outlive the LayerMlp that borrows them.
@@ -317,14 +427,26 @@ fn main() -> Result<()> {
         fused = g("mlp.w13_dn.weight")?;
         ddown = g("mlp.w2_md.weight")?;
         dscale = g("mlp.global_scale")?;
-        check_fp(&man, "mlp.down_proj.weight", &ddown, &mut checks, &mut fails);
+        check_fp(
+            &man,
+            "mlp.down_proj.weight",
+            &ddown,
+            &mut checks,
+            &mut fails,
+        );
         check_fp(&man, "mlp.global_scale", &dscale, &mut checks, &mut fails);
 
         println!("\n=== 2. the fused w13 split ===");
         let (a, b) = split_gate_up(&fused, h);
         dgate = a;
         dup = b;
-        check_fp(&man, "mlp.gate_proj.weight", &dgate, &mut checks, &mut fails);
+        check_fp(
+            &man,
+            "mlp.gate_proj.weight",
+            &dgate,
+            &mut checks,
+            &mut fails,
+        );
         check_fp(&man, "mlp.up_proj.weight", &dup, &mut checks, &mut fails);
         checks += 1;
         let gs: f64 = dgate.iter().map(|&x| x as f64).sum();
@@ -335,13 +457,22 @@ fn main() -> Result<()> {
         } else {
             println!("  halves differ (gate {gs:+.6e} vs up {us:+.6e}), so a swap is visible");
         }
-        Some(LayerMlp { gate: &dgate, up: &dup, down: &ddown, global_scale: dscale[0], inter: di })
+        Some(LayerMlp {
+            gate: &dgate,
+            up: &dup,
+            down: &ddown,
+            global_scale: dscale[0],
+            inter: di,
+        })
     } else {
         let mi = num(&man, "moe_intermediate")? as usize;
         let n_routed = num(&man, "n_routed")? as usize;
         let n_shared = num(&man, "n_shared")? as usize;
         println!("\n=== 2. router, shared experts, and the orientation argument ===");
-        println!("  moe_intermediate {mi}: note 2*{mi} = {} vs hidden {h}", 2 * mi);
+        println!(
+            "  moe_intermediate {mi}: note 2*{mi} = {} vs hidden {h}",
+            2 * mi
+        );
         println!("  w2 is [experts, hidden, intermediate] and NON-square, which pins");
         println!("  the checkpoint's convention to [experts, out, in]; w13's squareness");
         println!("  is then not an open question but a consequence of that convention.");
@@ -350,15 +481,27 @@ fn main() -> Result<()> {
         let rb = g("mlp.gate.bias")?;
         let rg = g("mlp.gate.global_scale")?;
         check_fp(&man, "mlp.gate.weight", &rw, &mut checks, &mut fails);
-        check_fp(&man, "mlp.gate.e_score_correction_bias", &rb, &mut checks, &mut fails);
+        check_fp(
+            &man,
+            "mlp.gate.e_score_correction_bias",
+            &rb,
+            &mut checks,
+            &mut fails,
+        );
         check_fp(&man, "mlp.gate.global_scale", &rg, &mut checks, &mut fails);
         checks += 1;
         if rw.len() != (n_routed + n_shared) * h {
-            println!("  FAIL  router is {} floats, expected {}", rw.len(), (n_routed + n_shared) * h);
+            println!(
+                "  FAIL  router is {} floats, expected {}",
+                rw.len(),
+                (n_routed + n_shared) * h
+            );
             fails += 1;
         } else {
-            println!("  router is [{}+{}, {h}] — the shared experts have their own rows",
-                     n_routed, n_shared);
+            println!(
+                "  router is [{}+{}, {h}] — the shared experts have their own rows",
+                n_routed, n_shared
+            );
         }
 
         // shared_w13 is [n_shared, 2*inter, hidden]; split each expert's block
@@ -371,9 +514,27 @@ fn main() -> Result<()> {
         assert_shared_orientation(&man, &sfused, n_shared, mi, h, &mut checks, &mut fails);
         drop(sfused);
         sdown = g("mlp.shared_experts.shared_w2_weight")?;
-        check_fp(&man, "mlp.shared_experts.gate_proj", &sgate, &mut checks, &mut fails);
-        check_fp(&man, "mlp.shared_experts.up_proj", &sup, &mut checks, &mut fails);
-        check_fp(&man, "mlp.shared_experts.down_proj", &sdown, &mut checks, &mut fails);
+        check_fp(
+            &man,
+            "mlp.shared_experts.gate_proj",
+            &sgate,
+            &mut checks,
+            &mut fails,
+        );
+        check_fp(
+            &man,
+            "mlp.shared_experts.up_proj",
+            &sup,
+            &mut checks,
+            &mut fails,
+        );
+        check_fp(
+            &man,
+            "mlp.shared_experts.down_proj",
+            &sdown,
+            &mut checks,
+            &mut fails,
+        );
 
         // ---- the expert slabs, STREAMED ------------------------------------
         //
@@ -398,14 +559,18 @@ fn main() -> Result<()> {
         let mut dn_n = 0usize;
         let mut shape_bad = 0usize;
         for e in 0..n_routed {
-            let raw = cp.expert_slice(&format!("{pfx}mlp.experts.w13_weight"), e)?.data;
+            let raw = cp
+                .expert_slice(&format!("{pfx}mlp.experts.w13_weight"), e)?
+                .data;
             if raw.len() != 2 * mi * h {
                 shape_bad += 1;
             }
             gu_n += raw.len();
             gu_sum += raw.iter().map(|&x| x as f64).sum::<f64>();
             drop(raw);
-            let raw = cp.expert_slice(&format!("{pfx}mlp.experts.w2_weight"), e)?.data;
+            let raw = cp
+                .expert_slice(&format!("{pfx}mlp.experts.w2_weight"), e)?
+                .data;
             if raw.len() != h * mi {
                 shape_bad += 1;
             }
@@ -419,8 +584,22 @@ fn main() -> Result<()> {
         } else {
             println!("  gate_up {gu_n} floats, down {dn_n} floats, every plane the right shape");
         }
-        check_fp_streamed(&man, "mlp.experts.gate_up_proj", gu_sum, gu_n, &mut checks, &mut fails);
-        check_fp_streamed(&man, "mlp.experts.down_proj", dn_sum, dn_n, &mut checks, &mut fails);
+        check_fp_streamed(
+            &man,
+            "mlp.experts.gate_up_proj",
+            gu_sum,
+            gu_n,
+            &mut checks,
+            &mut fails,
+        );
+        check_fp_streamed(
+            &man,
+            "mlp.experts.down_proj",
+            dn_sum,
+            dn_n,
+            &mut checks,
+            &mut fails,
+        );
         None
     };
 
@@ -428,20 +607,43 @@ fn main() -> Result<()> {
     let x = read_f32(&oracle.join("real_x.bin"))?;
     let y_ref = read_f32(&oracle.join("real_y.bin"))?;
     anyhow::ensure!(x.len() == t * h, "input is {} not {}", x.len(), t * h);
-    anyhow::ensure!(!y_ref.is_empty(), "no reference output — the gate would be vacuous");
+    anyhow::ensure!(
+        !y_ref.is_empty(),
+        "no reference output — the gate would be vacuous"
+    );
 
     let dims = AttnDims {
-        hidden: h, heads, kv_heads, head_dim, d_rel, rel_extent, kernel,
+        hidden: h,
+        heads,
+        kv_heads,
+        head_dim,
+        d_rel,
+        rel_extent,
+        kernel,
         rms_eps: eps,
-        kind: if is_sliding { AttnKind::Local } else { AttnKind::Global },
+        kind: if is_sliding {
+            AttnKind::Local
+        } else {
+            AttnKind::Global
+        },
     };
     let aw = AttnWeights {
-        wq: &wq, wk: &wk, wv: &wv, wr: &wr, wo: &wo,
-        k_sconv: &ks, v_sconv: &vs, q_norm: &qn, k_norm: &kn, rel_proj: &rp,
+        wq: &wq,
+        wk: &wk,
+        wv: &wv,
+        wr: &wr,
+        wo: &wo,
+        k_sconv: &ks,
+        v_sconv: &vs,
+        q_norm: &qn,
+        k_norm: &kn,
+        rel_proj: &rp,
     };
     let lw = LayerWeights {
-        attn_norm: &attn_norm, mlp_norm: &mlp_norm,
-        attn_sconv: &attn_sconv, mlp_sconv: &mlp_sconv,
+        attn_norm: &attn_norm,
+        mlp_norm: &mlp_norm,
+        attn_sconv: &attn_sconv,
+        mlp_sconv: &mlp_sconv,
     };
     let mask = causal_mask(t, if is_sliding { Some(window) } else { None });
 
@@ -477,7 +679,16 @@ fn main() -> Result<()> {
         println!("GATE FAILED — {checks} checks, {fails} FAILURES");
         std::process::exit(1);
     };
-    let mine = decoder_layer(&x, &lw, &aw, &dims, Some(LogScaling { n_floor, alpha }), &mlp, &mask, t);
+    let mine = decoder_layer(
+        &x,
+        &lw,
+        &aw,
+        &dims,
+        Some(LogScaling { n_floor, alpha }),
+        &mlp,
+        &mask,
+        t,
+    );
 
     let mut worst_abs = 0f32;
     let mut scale = 0f32;
@@ -508,7 +719,9 @@ fn main() -> Result<()> {
     println!("\n=== verdict ===");
     println!("  checks: {checks}");
     if fails == 0 {
-        println!("GATE PASSED — {checks} checks, a real layer runs in mary and matches transformers");
+        println!(
+            "GATE PASSED — {checks} checks, a real layer runs in mary and matches transformers"
+        );
         Ok(())
     } else {
         println!("GATE FAILED — {checks} checks, {fails} FAILURES");

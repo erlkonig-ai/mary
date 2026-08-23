@@ -73,7 +73,10 @@ impl Shape {
         assert!(dims.len() <= 4, "K3 has no tensors above rank 4");
         let mut d = [0usize; 4];
         d[..dims.len()].copy_from_slice(dims);
-        Shape { dims: d, rank: dims.len() as u8 }
+        Shape {
+            dims: d,
+            rank: dims.len() as u8,
+        }
     }
 
     /// The dimensions, outermost first.
@@ -429,16 +432,26 @@ impl Slot {
         match self {
             Slot::EmbedTokens => "language_model.model.embed_tokens.weight".to_string(),
             Slot::FinalNorm => "language_model.model.norm.weight".to_string(),
-            Slot::OutputAttnResNorm => "language_model.model.output_attn_res_norm.weight".to_string(),
-            Slot::OutputAttnResProj => "language_model.model.output_attn_res_proj.weight".to_string(),
+            Slot::OutputAttnResNorm => {
+                "language_model.model.output_attn_res_norm.weight".to_string()
+            }
+            Slot::OutputAttnResProj => {
+                "language_model.model.output_attn_res_proj.weight".to_string()
+            }
             Slot::LmHead => "language_model.lm_head.weight".to_string(),
             Slot::Layer { layer, part } => {
                 let head = format!("language_model.model.layers.{layer}");
                 match part {
                     LayerPart::InputLayernorm => format!("{head}.input_layernorm.weight"),
-                    LayerPart::PostAttentionLayernorm => format!("{head}.post_attention_layernorm.weight"),
-                    LayerPart::SelfAttentionResNorm => format!("{head}.self_attention_res_norm.weight"),
-                    LayerPart::SelfAttentionResProj => format!("{head}.self_attention_res_proj.weight"),
+                    LayerPart::PostAttentionLayernorm => {
+                        format!("{head}.post_attention_layernorm.weight")
+                    }
+                    LayerPart::SelfAttentionResNorm => {
+                        format!("{head}.self_attention_res_norm.weight")
+                    }
+                    LayerPart::SelfAttentionResProj => {
+                        format!("{head}.self_attention_res_proj.weight")
+                    }
                     LayerPart::MlpResNorm => format!("{head}.mlp_res_norm.weight"),
                     LayerPart::MlpResProj => format!("{head}.mlp_res_proj.weight"),
                     LayerPart::Attn(p) => format!("{head}.self_attn.{}", attn_leaf(*p)),
@@ -450,8 +463,12 @@ impl Slot {
                             MoePart::GateScoreCorrectionBias => {
                                 format!("{moe}.gate.e_score_correction_bias")
                             }
-                            MoePart::RoutedExpertDownProj => format!("{moe}.routed_expert_down_proj.weight"),
-                            MoePart::RoutedExpertUpProj => format!("{moe}.routed_expert_up_proj.weight"),
+                            MoePart::RoutedExpertDownProj => {
+                                format!("{moe}.routed_expert_down_proj.weight")
+                            }
+                            MoePart::RoutedExpertUpProj => {
+                                format!("{moe}.routed_expert_up_proj.weight")
+                            }
                             MoePart::RoutedExpertNorm => format!("{moe}.routed_expert_norm.weight"),
                             MoePart::Shared(p) => format!("{moe}.shared_experts.{}", mlp_leaf(*p)),
                             MoePart::Expert { expert, mat, part } => {
@@ -472,10 +489,17 @@ impl Slot {
             }
             Slot::Vision(v) => match v {
                 VisionPart::PatchEmbedProj => "vision_tower.patch_embed.proj.weight".to_string(),
-                VisionPart::PatchEmbedPosEmb => "vision_tower.patch_embed.pos_emb.weight".to_string(),
-                VisionPart::FinalLayernorm => "vision_tower.encoder.final_layernorm.weight".to_string(),
+                VisionPart::PatchEmbedPosEmb => {
+                    "vision_tower.patch_embed.pos_emb.weight".to_string()
+                }
+                VisionPart::FinalLayernorm => {
+                    "vision_tower.encoder.final_layernorm.weight".to_string()
+                }
                 VisionPart::Block { block, part } => {
-                    format!("vision_tower.encoder.blocks.{block}.{}", vision_block_leaf(*part))
+                    format!(
+                        "vision_tower.encoder.blocks.{block}.{}",
+                        vision_block_leaf(*part)
+                    )
                 }
             },
             Slot::MmProjector(p) => match p {
@@ -705,9 +729,10 @@ pub fn describe(cfg: &K3Config, slot: Slot) -> Option<(Shape, Dtype)> {
         Slot::Vision(p) => {
             let vh = v.vt_hidden_size;
             match p {
-                VisionPart::PatchEmbedProj => {
-                    (Shape::new(&[vh, 3, v.patch_size, v.patch_size]), Dtype::Bf16)
-                }
+                VisionPart::PatchEmbedProj => (
+                    Shape::new(&[vh, 3, v.patch_size, v.patch_size]),
+                    Dtype::Bf16,
+                ),
                 VisionPart::PatchEmbedPosEmb => (
                     Shape::new(&[v.init_pos_emb_height, v.init_pos_emb_width, vh]),
                     Dtype::Bf16,
@@ -859,7 +884,12 @@ fn emit(cfg: &K3Config, slot: Slot, f: &mut impl FnMut(TensorSlot)) {
     // checkpoint, so it is an assertion rather than a gate finding.
     let (shape, dtype) = describe(cfg, slot)
         .unwrap_or_else(|| panic!("layout enumerated a slot describe() rejects: {slot:?}"));
-    f(TensorSlot { slot, name: slot.tensor_name(), shape, dtype });
+    f(TensorSlot {
+        slot,
+        name: slot.tensor_name(),
+        shape,
+        dtype,
+    });
 }
 
 /// Walk every slot the model needs, in load order.

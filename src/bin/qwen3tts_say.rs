@@ -47,11 +47,14 @@ fn run<B: Backend>(args: &Args) {
     mary::models::qwen3tts::cpu::set_interactive_qos();
     let dev: B::Device = Default::default();
     let t0 = Instant::now();
-    let pile = mary::paths::model(std::env::var("QWEN3TTS_PILE").ok().as_deref(), "qwen3tts.pile")
-        .unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(2)
-        });
+    let pile = mary::paths::model(
+        std::env::var("QWEN3TTS_PILE").ok().as_deref(),
+        "qwen3tts.pile",
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
     let loader = mary::persist::load_aliased_loader_from_pile(&pile, "talker_f16")
         .unwrap_or_else(|e| panic!("load qwen3tts pile {}: {e:?}", pile.display()));
     let talker = Talker::<B>::load(&loader, &dev);

@@ -36,9 +36,7 @@
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use mary::models::inkling::load::Checkpoint;
-use mary::models::inkling::pile::{
-    attrs, expert_blob, experts_in_layers, layer_of, split_payload,
-};
+use mary::models::inkling::pile::{attrs, expert_blob, experts_in_layers, layer_of, split_payload};
 use triblespace::core::blob::encodings::tensor::TensorView;
 use triblespace::core::blob::TryFromBlob;
 use triblespace::core::metadata;
@@ -67,14 +65,12 @@ fn verify_share(
     let mut pile = Pile::open(path).map_err(|e| anyhow::anyhow!("open {path:?}: {e:?}"))?;
     let team = mary::model_collection::sole_model_graph_team(&mut pile)
         .map_err(|e| anyhow::anyhow!("{path:?}: model collection: {e}"))?;
-    let snapshot = mary::model_collection::snapshot_model_collection_local_latest(
-        &mut pile,
-        team,
-    )
-    .map_err(|e| anyhow::anyhow!("{path:?}: model collection snapshot: {e}"))?;
+    let snapshot = mary::model_collection::snapshot_model_collection_local_latest(&mut pile, team)
+        .map_err(|e| anyhow::anyhow!("{path:?}: model collection snapshot: {e}"))?;
     let facts = mary::model_collection::project_legacy_model_attributes(snapshot.facts()).facts;
     let (_, _, reader) = snapshot.into_parts();
-    pile.close().map_err(|e| anyhow::anyhow!("close {path:?}: {e:?}"))?;
+    pile.close()
+        .map_err(|e| anyhow::anyhow!("close {path:?}: {e:?}"))?;
 
     // (name, expert index) -> payload, read AS its type.
     let mut packed_ix: std::collections::HashMap<(String, i64), anybytes::Bytes> =
@@ -93,10 +89,12 @@ fn verify_share(
             reader.get(n).map_err(|e| anyhow::anyhow!("name: {e:?}"))?;
         let blob: triblespace::core::blob::Blob<
             triblespace::core::blob::encodings::tensor::Tensor<
-                triblespace::core::blob::encodings::tensor::elements::NVFP4, 2>> =
-            reader.get(h).map_err(|e| anyhow::anyhow!("blob: {e:?}"))?;
-        let view: TensorView = TryFromBlob::try_from_blob(blob)
-            .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+                triblespace::core::blob::encodings::tensor::elements::NVFP4,
+                2,
+            >,
+        > = reader.get(h).map_err(|e| anyhow::anyhow!("blob: {e:?}"))?;
+        let view: TensorView =
+            TryFromBlob::try_from_blob(blob).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
         packed_ix.insert((name.to_string(), i), view.payload().clone());
     }
     let mut bf16_ix: std::collections::HashMap<(String, i64), anybytes::Bytes> = Default::default();
@@ -115,13 +113,19 @@ fn verify_share(
             reader.get(n).map_err(|e| anyhow::anyhow!("name: {e:?}"))?;
         let blob: triblespace::core::blob::Blob<
             triblespace::core::blob::encodings::tensor::Tensor<
-                triblespace::core::blob::encodings::tensor::elements::BF16, 2>> =
-            reader.get(h).map_err(|e| anyhow::anyhow!("blob: {e:?}"))?;
-        let view: TensorView = TryFromBlob::try_from_blob(blob)
-            .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+                triblespace::core::blob::encodings::tensor::elements::BF16,
+                2,
+            >,
+        > = reader.get(h).map_err(|e| anyhow::anyhow!("blob: {e:?}"))?;
+        let view: TensorView =
+            TryFromBlob::try_from_blob(blob).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
         bf16_ix.insert((name.to_string(), i), view.payload().clone());
     }
-    println!("pile       {} NVFP4 + {} BF16 expert leaves", packed_ix.len(), bf16_ix.len());
+    println!(
+        "pile       {} NVFP4 + {} BF16 expert leaves",
+        packed_ix.len(),
+        bf16_ix.len()
+    );
 
     let mut bases: Vec<String> = ck
         .names()
@@ -197,23 +201,22 @@ fn have_len(
     b: &std::collections::HashMap<(String, i64), anybytes::Bytes>,
     k: &(String, i64),
 ) -> usize {
-    a.get(k).map(|v| v.len()).or_else(|| b.get(k).map(|v| v.len())).unwrap_or(0)
+    a.get(k)
+        .map(|v| v.len())
+        .or_else(|| b.get(k).map(|v| v.len()))
+        .unwrap_or(0)
 }
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let dir = args
-        .next()
-        .context(
-            "usage: inkling_expert_import <ckpt-dir> <pile> --layers A-B \
+    let dir = args.next().context(
+        "usage: inkling_expert_import <ckpt-dir> <pile> --layers A-B \
              [--experts N] [--verify] [--repair]",
-        )?;
-    let pile_path = args
-        .next()
-        .context(
-            "usage: inkling_expert_import <ckpt-dir> <pile> --layers A-B \
+    )?;
+    let pile_path = args.next().context(
+        "usage: inkling_expert_import <ckpt-dir> <pile> --layers A-B \
              [--experts N] [--verify] [--repair]",
-        )?;
+    )?;
     let mut layers: Option<(i64, i64)> = None;
     let mut experts_cap = usize::MAX;
     let mut verify = false;
@@ -257,8 +260,7 @@ fn main() -> Result<()> {
     // decides. Both are imported, each through its own path; neither is guessed
     // at, because the packed path on a BF16 stack would read sidecars that do
     // not exist and produce plausible noise.
-    let (packed, dense): (Vec<&String>, Vec<&String>) =
-        bases.iter().partition(|b| ck.is_nvfp4(b));
+    let (packed, dense): (Vec<&String>, Vec<&String>) = bases.iter().partition(|b| ck.is_nvfp4(b));
     println!("           {} NVFP4, {} BF16", packed.len(), dense.len());
     if !dense.is_empty() {
         println!("           BF16: {dense:?}");
@@ -327,13 +329,11 @@ fn main() -> Result<()> {
     let mut present: std::collections::HashSet<(String, i64)> = Default::default();
     let team = match mary::model_collection::sole_model_graph_team(&mut store) {
         Ok(team) => {
-            let snapshot = mary::model_collection::snapshot_model_collection_local_latest(
-                &mut store,
-                team,
-            )
-            .map_err(|e| anyhow::anyhow!("model collection snapshot: {e}"))?;
-            let facts = mary::model_collection::project_legacy_model_attributes(snapshot.facts())
-                .facts;
+            let snapshot =
+                mary::model_collection::snapshot_model_collection_local_latest(&mut store, team)
+                    .map_err(|e| anyhow::anyhow!("model collection snapshot: {e}"))?;
+            let facts =
+                mary::model_collection::project_legacy_model_attributes(snapshot.facts()).facts;
             let reader = snapshot.reader();
             // Both element types, because this binary writes both. The weight
             // handle is matched but never fetched: a name and an index with no
@@ -350,9 +350,8 @@ fn main() -> Result<()> {
                       attrs::weight_nvfp4_2: ?h },
                 ])
             ) {
-                let name: anybytes::View<str> = reader
-                    .get(nh)
-                    .map_err(|e| anyhow::anyhow!("name: {e:?}"))?;
+                let name: anybytes::View<str> =
+                    reader.get(nh).map_err(|e| anyhow::anyhow!("name: {e:?}"))?;
                 present.insert((name.to_string(), i));
             }
             for (nh, i, _h) in triblespace::macros::find!(
@@ -366,17 +365,14 @@ fn main() -> Result<()> {
                       attrs::weight::<triblespace::core::blob::encodings::tensor::elements::BF16, 2>(): ?h },
                 ])
             ) {
-                let name: anybytes::View<str> = reader
-                    .get(nh)
-                    .map_err(|e| anyhow::anyhow!("name: {e:?}"))?;
+                let name: anybytes::View<str> =
+                    reader.get(nh).map_err(|e| anyhow::anyhow!("name: {e:?}"))?;
                 present.insert((name.to_string(), i));
             }
             println!("resuming   {} experts already in the pile", present.len());
             team
         }
-        Err(mary::model_collection::SoleModelGraphTeamError::None) => {
-            signing_key.verifying_key()
-        }
+        Err(mary::model_collection::SoleModelGraphTeamError::None) => signing_key.verifying_key(),
         Err(e) => return Err(anyhow::anyhow!("model collection: {e}")),
     };
 
@@ -446,7 +442,10 @@ fn main() -> Result<()> {
                 view.dims()
             );
             let (codes, scales, scale2) = split_payload(view.payload(), view.elems())?;
-            anyhow::ensure!(codes == &q.codes[..], "{base}[{e}]: codes differ after a round trip");
+            anyhow::ensure!(
+                codes == &q.codes[..],
+                "{base}[{e}]: codes differ after a round trip"
+            );
             anyhow::ensure!(scales == &q.scales[..], "{base}[{e}]: scales differ");
             anyhow::ensure!(scale2 == q.scale2, "{base}[{e}]: global scale differs");
 
@@ -478,7 +477,10 @@ fn main() -> Result<()> {
             }
         }
         flush!();
-        println!("  {base}: {wrote} written, {} already present", take - wrote);
+        println!(
+            "  {base}: {wrote} written, {} already present",
+            take - wrote
+        );
     }
 
     // ── the BF16 stacks ─────────────────────────────────────────────────────
@@ -546,7 +548,10 @@ fn main() -> Result<()> {
             }
         }
         flush!();
-        println!("  {base}: {wrote} BF16 written, {} already present", take - wrote);
+        println!(
+            "  {base}: {wrote} BF16 written, {} already present",
+            take - wrote
+        );
     }
     n += bf16_n;
 

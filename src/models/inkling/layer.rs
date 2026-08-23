@@ -54,7 +54,16 @@ impl LayerMlp<'_> {
     /// thing a caller ever wanted back out of here, and there is no router on
     /// this lane any more.
     pub fn forward(&self, x: &[f32], tokens: usize, hidden: usize) -> Vec<f32> {
-        dense_mlp(x, self.gate, self.up, self.down, self.global_scale, tokens, hidden, self.inter)
+        dense_mlp(
+            x,
+            self.gate,
+            self.up,
+            self.down,
+            self.global_scale,
+            tokens,
+            hidden,
+            self.inter,
+        )
     }
 }
 
@@ -137,7 +146,14 @@ pub fn decoder_layer_prefill(
     let h = short_conv(&h, lw.mlp_sconv, tokens, hidden, kernel);
     let x2: Vec<f32> = x1.iter().zip(&h).map(|(a, b)| a + b).collect();
 
-    (x2, LayerCache { attn, attn_sconv, mlp_sconv })
+    (
+        x2,
+        LayerCache {
+            attn,
+            attn_sconv,
+            mlp_sconv,
+        },
+    )
 }
 
 /// One position through one decoder layer, reading the cache.

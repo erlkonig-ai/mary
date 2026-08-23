@@ -56,11 +56,14 @@ fn main() {
     let noise = Tensor::<B, 3>::random([1, 50, 32], Distribution::Normal(0.0, 1.0), &dev);
 
     // perceive → act — weights from the durable pile
-    let pile = mary::paths::model(std::env::var("SMOLVLA_PILE").ok().as_deref(), "smolvla.pile")
-        .unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(2)
-        });
+    let pile = mary::paths::model(
+        std::env::var("SMOLVLA_PILE").ok().as_deref(),
+        "smolvla.pile",
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
     let loader = WeightLoader::from_pile(&pile)
         .unwrap_or_else(|e| panic!("load smolvla pile {}: {e:?}", pile.display()));
     let model = SmolVla::<B>::load(&loader, &dev);

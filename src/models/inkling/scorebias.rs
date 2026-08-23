@@ -161,9 +161,15 @@ pub fn score_epilogue_launch<R: Runtime>(
     scaling: f32,
     window: Option<usize>,
 ) {
-    assert!(tokens > 0 && heads > 0, "an empty attention has no epilogue");
+    assert!(
+        tokens > 0 && heads > 0,
+        "an empty attention has no epilogue"
+    );
     assert!(rows > 0, "an empty query block has no epilogue");
-    assert!(eff > 0, "the relative table must reach at least one distance");
+    assert!(
+        eff > 0,
+        "the relative table must reach at least one distance"
+    );
     assert!(
         q_lo + rows <= tokens,
         "query block {q_lo}..{} runs past a {tokens}-token sequence",
@@ -185,8 +191,16 @@ pub fn score_epilogue_launch<R: Runtime>(
         "the block's relative table is {} elements, past the 32-bit index",
         rows * heads * eff
     );
-    assert_eq!(strides[2], 1, "the innermost stride is {}, not 1", strides[2]);
-    assert!(strides[1] >= tokens, "a row stride of {} cannot hold {tokens}", strides[1]);
+    assert_eq!(
+        strides[2], 1,
+        "the innermost stride is {}, not 1",
+        strides[2]
+    );
+    assert!(
+        strides[1] >= tokens,
+        "a row stride of {} cannot hold {tokens}",
+        strides[1]
+    );
     let w = window.unwrap_or(0);
     let cubes = (per_head as u32).div_ceil(CUBE_SIZE);
     let f32b = core::mem::size_of::<f32>();
@@ -198,7 +212,9 @@ pub fn score_epilogue_launch<R: Runtime>(
         // wrapped -- while agreeing to four decimals at 512, 3732 and 7000.
         // `offset_start` moves the base pointer instead, so the largest index a
         // kernel forms is one head of one block.
-        let slice = scores.clone().offset_start((head * strides[0] * f32b) as u64);
+        let slice = scores
+            .clone()
+            .offset_start((head * strides[0] * f32b) as u64);
         unsafe {
             score_epilogue_kernel::launch_unchecked::<R>(
                 client,

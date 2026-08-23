@@ -138,8 +138,16 @@ fn verify_pile(dir: &str, pile_path: &str, limit: usize) -> Result<()> {
             }
         }};
     }
-    sweep!(BF16, 0); sweep!(BF16, 1); sweep!(BF16, 2); sweep!(BF16, 3); sweep!(BF16, 4);
-    sweep!(F32, 0); sweep!(F32, 1); sweep!(F32, 2); sweep!(F32, 3); sweep!(F32, 4);
+    sweep!(BF16, 0);
+    sweep!(BF16, 1);
+    sweep!(BF16, 2);
+    sweep!(BF16, 3);
+    sweep!(BF16, 4);
+    sweep!(F32, 0);
+    sweep!(F32, 1);
+    sweep!(F32, 2);
+    sweep!(F32, 3);
+    sweep!(F32, 4);
     println!("pile       {} typed dense leaves", index.len());
 
     let names = ck.names();
@@ -151,7 +159,10 @@ fn verify_pile(dir: &str, pile_path: &str, limit: usize) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("{name}: absent from the pile"))?;
         let raw = ck.tensor_raw(name)?;
         let want: Vec<u64> = raw.shape.iter().map(|&d| d as u64).collect();
-        anyhow::ensure!(dims == &want, "{name}: dims {dims:?} != checkpoint {want:?}");
+        anyhow::ensure!(
+            dims == &want,
+            "{name}: dims {dims:?} != checkpoint {want:?}"
+        );
         anyhow::ensure!(
             &payload[..] == &raw.bytes[..],
             "{name}: payload differs from the checkpoint"
@@ -252,16 +263,13 @@ fn main() -> Result<()> {
             let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
             let team = match mary::model_collection::sole_model_graph_team(&mut store) {
                 Ok(team) => {
-                    let snapshot =
-                        mary::model_collection::snapshot_model_collection_local_latest(
-                            &mut store,
-                            team,
-                        )
-                        .map_err(|e| anyhow::anyhow!("model collection snapshot: {e}"))?;
-                    let facts = mary::model_collection::project_legacy_model_attributes(
-                        snapshot.facts(),
+                    let snapshot = mary::model_collection::snapshot_model_collection_local_latest(
+                        &mut store, team,
                     )
-                    .facts;
+                    .map_err(|e| anyhow::anyhow!("model collection snapshot: {e}"))?;
+                    let facts =
+                        mary::model_collection::project_legacy_model_attributes(snapshot.facts())
+                            .facts;
                     let reader = snapshot.reader();
                     // One sweep per (dtype, rank), matching the weight handle
                     // but never fetching it — a name with no weight beside it
@@ -330,9 +338,9 @@ fn main() -> Result<()> {
         let bytes = match raw.dtype.as_str() {
             "BF16" => by_rank!(BF16, writing, dims, raw.bytes, name),
             "F32" => by_rank!(F32, writing, dims, raw.bytes, name),
-            other => anyhow::bail!(
-                "{name} holds {other}; add an element type rather than widening it"
-            ),
+            other => {
+                anyhow::bail!("{name} holds {other}; add an element type rather than widening it")
+            }
         };
 
         total_bytes += bytes;
@@ -341,13 +349,8 @@ fn main() -> Result<()> {
         if let Some((pile, signing_key, team, change)) = writing.as_mut() {
             if pending >= FLUSH_EVERY {
                 let batch = std::mem::replace(change, Fragment::empty());
-                mary::model_collection::publish_model_fragment(
-                    pile,
-                    *team,
-                    signing_key,
-                    batch,
-                )
-                .map_err(|e| anyhow::anyhow!("publish model collection: {e}"))?;
+                mary::model_collection::publish_model_fragment(pile, *team, signing_key, batch)
+                    .map_err(|e| anyhow::anyhow!("publish model collection: {e}"))?;
                 commits += 1;
                 pending = 0;
             }
@@ -368,13 +371,8 @@ fn main() -> Result<()> {
     println!("skipped    {skipped} tensors already present");
     if let Some((mut pile, signing_key, team, change)) = writing {
         if pending > 0 {
-            mary::model_collection::publish_model_fragment(
-                &mut pile,
-                team,
-                &signing_key,
-                change,
-            )
-            .map_err(|e| anyhow::anyhow!("publish model collection: {e}"))?;
+            mary::model_collection::publish_model_fragment(&mut pile, team, &signing_key, change)
+                .map_err(|e| anyhow::anyhow!("publish model collection: {e}"))?;
             commits += 1;
         }
         pile.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;

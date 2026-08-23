@@ -47,7 +47,6 @@ use cubecl::prelude::*;
 use cubecl::server::Handle;
 use half::f16;
 
-
 // Backend selection. `cuda-backend` swaps the whole q4 lane onto CUDA; the
 // default stays wgpu/Metal. burn re-exports the same WgpuRuntime type
 // (burn-wgpu lib.rs:17), so naming cubecl directly drops burn out of this

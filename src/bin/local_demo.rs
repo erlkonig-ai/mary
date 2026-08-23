@@ -10,7 +10,7 @@
 //!   GEMMA_PILE=/path/to/gemma_e2b.pile \
 //!   cargo run --release --features local-model --bin local_demo
 
-use mary::local::{LocalChatTurn, LocalGenParams, LocalRole, load_gemma4_from_persisted_pile_f16};
+use mary::local::{load_gemma4_from_persisted_pile_f16, LocalChatTurn, LocalGenParams, LocalRole};
 use mary::nn::backend::WgpuDevice;
 use std::path::Path;
 use std::process::Command;

@@ -201,7 +201,11 @@ pub fn bf16_linear_launch<R: Runtime>(
         HAND[0].fetch_add(1, Relaxed);
         HAND[1].fetch_add((m_pad * k * n) as u64, Relaxed);
     }
-    assert_eq!(m_pad % MTILE, 0, "m_pad {m_pad} is not a multiple of {MTILE}");
+    assert_eq!(
+        m_pad % MTILE,
+        0,
+        "m_pad {m_pad} is not a multiple of {MTILE}"
+    );
     assert_eq!(n % NTILE, 0, "n {n} is not a multiple of {NTILE}");
     assert_eq!(k % KTILE, 0, "k {k} is not a multiple of {KTILE}");
 
@@ -565,35 +569,43 @@ impl Lane {
             Lane::GemvUnitPerpendicular => Strategy::GemvUnitPerpendicular(Default::default()),
             Lane::GemvPlaneParallel => Strategy::GemvPlaneParallel(Default::default()),
             Lane::DoubleTmaMmaSpec => {
-                use cubek::matmul::routines::{double_buffering::DoubleBufferingArgs, BlueprintStrategy};
                 use cubek::matmul::components::tile::TileMatmulKind;
+                use cubek::matmul::routines::{
+                    double_buffering::DoubleBufferingArgs, BlueprintStrategy,
+                };
                 Strategy::DoubleTmaMma(BlueprintStrategy::Inferred(DoubleBufferingArgs {
                     tile_matmul: TileMatmulKind::Mma,
                     specialized: true,
                 }))
             }
             Lane::SimpleTmaMmaMulti => {
-                use cubek::matmul::routines::{simple::SimpleArgs, BlueprintStrategy};
                 use cubek::matmul::components::tile::TileMatmulKind;
+                use cubek::matmul::routines::{simple::SimpleArgs, BlueprintStrategy};
                 Strategy::SimpleTmaMma(BlueprintStrategy::Inferred(SimpleArgs {
                     tile_matmul: TileMatmulKind::Mma,
                     multi_rows: true,
                 }))
             }
             Lane::SimpleCyclicMmaMulti => {
-                use cubek::matmul::routines::{simple::SimpleArgs, BlueprintStrategy};
                 use cubek::matmul::components::tile::TileMatmulKind;
+                use cubek::matmul::routines::{simple::SimpleArgs, BlueprintStrategy};
                 Strategy::SimpleCyclicMma(BlueprintStrategy::Inferred(SimpleArgs {
                     tile_matmul: TileMatmulKind::Mma,
                     multi_rows: true,
                 }))
             }
             Lane::OrderedDoubleMmaPk2 | Lane::OrderedDoubleMmaPk4 => {
-                use cubek::matmul::routines::{ordered_double_buffering::OrderedSelectionArgs, BlueprintStrategy};
                 use cubek::matmul::components::tile::TileMatmulKind;
+                use cubek::matmul::routines::{
+                    ordered_double_buffering::OrderedSelectionArgs, BlueprintStrategy,
+                };
                 Strategy::OrderedDoubleMma(BlueprintStrategy::Inferred(OrderedSelectionArgs {
                     tile_matmul: TileMatmulKind::Mma,
-                    partition_k: Some(if *self == Lane::OrderedDoubleMmaPk2 { 2 } else { 4 }),
+                    partition_k: Some(if *self == Lane::OrderedDoubleMmaPk2 {
+                        2
+                    } else {
+                        4
+                    }),
                     row_count: None,
                     rows_per_plane: None,
                 }))
@@ -847,7 +859,11 @@ fn narrow_head() -> Option<Lane> {
         Some(Lane::from_name(&name).unwrap_or_else(|| {
             panic!(
                 "INK_GEMM_NARROW={name} names no lane; the lanes are: {}",
-                Lane::ALL.iter().map(|l| l.name()).collect::<Vec<_>>().join(", ")
+                Lane::ALL
+                    .iter()
+                    .map(|l| l.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )
         }))
     })
@@ -912,21 +928,25 @@ fn forced_lane() -> Option<Lane> {
         Some(Lane::from_name(&name).unwrap_or_else(|| {
             panic!(
                 "INK_GEMM={name} names no lane; the lanes are: {}",
-                Lane::ALL.iter().map(|l| l.name()).collect::<Vec<_>>().join(", ")
+                Lane::ALL
+                    .iter()
+                    .map(|l| l.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )
         }))
     })
 }
 
 /// The per-shape decision, read or written through the one map that holds it.
-fn lane_cache(
-    shape: (usize, usize, usize),
-    set: Option<Lane>,
-) -> Option<Lane> {
+fn lane_cache(shape: (usize, usize, usize), set: Option<Lane>) -> Option<Lane> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     static CACHE: OnceLock<Mutex<HashMap<(usize, usize, usize), Lane>>> = OnceLock::new();
-    let mut map = CACHE.get_or_init(Default::default).lock().expect("lane cache");
+    let mut map = CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .expect("lane cache");
     match set {
         Some(lane) => {
             map.insert(shape, lane);

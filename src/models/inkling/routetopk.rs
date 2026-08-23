@@ -232,8 +232,14 @@ pub fn router_topk_launch<R: Runtime>(
     top_k: usize,
     scale: f32,
 ) -> Handle {
-    assert!(n_routed <= 1024, "one unit per routed expert, and {n_routed} is past a cube");
-    assert!(top_k <= n_routed, "cannot pick {top_k} of {n_routed} experts");
+    assert!(
+        n_routed <= 1024,
+        "one unit per routed expert, and {n_routed} is past a cube"
+    );
+    assert!(
+        top_k <= n_routed,
+        "cannot pick {top_k} of {n_routed} experts"
+    );
     assert!(
         n_routed + n_shared <= stride,
         "the row holds {stride}, the model wants {}",

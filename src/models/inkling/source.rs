@@ -103,7 +103,10 @@ impl Weights {
         let leaf = self.src.leaf(name)?;
         let data = leaf.to_f32();
         self.note(name, leaf.bytes.len() as u64, (data.len() * 4) as u64, t0);
-        Ok(Loaded { data, shape: leaf.shape() })
+        Ok(Loaded {
+            data,
+            shape: leaf.shape(),
+        })
     }
 
     /// One dense tensor's STORED bytes, in the element type the pile holds them
@@ -287,7 +290,8 @@ impl Weights {
         attention_bytes: u64,
         policy: super::budget::AdmissionPolicy,
     ) -> Result<(usize, usize, u64, u64)> {
-        self.src.copy_share(layers, global_dense, attention_bytes, policy)
+        self.src
+            .copy_share(layers, global_dense, attention_bytes, policy)
     }
 
     // ---- what the source SAYS about itself --------------------------------
@@ -395,7 +399,13 @@ impl Weights {
     pub fn io_totals(&self) -> (u64, u64, u64, u64, u64) {
         let io = self.io.lock().expect("io stats");
         io.values().fold((0, 0, 0, 0, 0), |a, e| {
-            (a.0 + e.calls, a.1 + e.hits, a.2 + e.file_bytes, a.3 + e.host_bytes, a.4 + e.nanos)
+            (
+                a.0 + e.calls,
+                a.1 + e.hits,
+                a.2 + e.file_bytes,
+                a.3 + e.host_bytes,
+                a.4 + e.nanos,
+            )
         })
     }
 

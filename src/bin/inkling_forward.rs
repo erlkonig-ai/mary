@@ -1099,18 +1099,18 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 
 use mary::models::inkling::attn::{AttnDims, AttnWeights, LogScaling};
-use mary::models::inkling::budget;
-use mary::models::inkling::fatal;
-use mary::models::inkling::block::{rms_norm, route_from_logits, Routing};
-use mary::models::inkling::config::{AttnKind, InklingConfig};
-use mary::models::inkling::load::{split_gate_up, Held};
 use mary::models::inkling::bf16gemm::Bf16W;
-use mary::models::inkling::pile::Elem;
-use mary::models::inkling::source::Weights;
+use mary::models::inkling::block::{rms_norm, route_from_logits, Routing};
+use mary::models::inkling::budget;
+use mary::models::inkling::config::{AttnKind, InklingConfig};
+use mary::models::inkling::fatal;
+use mary::models::inkling::layer::{LayerMlp, LayerWeights};
+use mary::models::inkling::load::{split_gate_up, Held};
 use mary::models::inkling::mtp::{
     mtp_block, mtp_block_prefill, mtp_block_step, Concat as MtpConcat, MtpCache, MtpHead,
 };
-use mary::models::inkling::layer::{LayerMlp, LayerWeights};
+use mary::models::inkling::pile::Elem;
+use mary::models::inkling::source::Weights;
 use mary::models::inkling::stack::{embed_and_norm_bf16, embed_row_bf16};
 
 /// One gibibyte, as the divisor every byte count here is printed against.
@@ -1214,10 +1214,7 @@ fn send_stream(s: &mut TcpStream, n: usize, pos0: usize, coh: usize, x: &[f32]) 
 }
 
 /// The other side of [`send_stream`]. `None` when the peer is done.
-fn recv_stream(
-    s: &mut TcpStream,
-    h: usize,
-) -> Result<Option<(usize, usize, usize, Vec<f32>)>> {
+fn recv_stream(s: &mut TcpStream, h: usize) -> Result<Option<(usize, usize, usize, Vec<f32>)>> {
     let mut hdr = [0u8; 24];
     if s.read_exact(&mut hdr).is_err() {
         return Ok(None);
@@ -1263,7 +1260,8 @@ fn recv_toks(s: &mut TcpStream) -> Result<Vec<usize>> {
     s.read_exact(&mut hdr).context("the tail closed mid-step")?;
     let n = u64::from_le_bytes(hdr) as usize;
     let mut buf = vec![0u8; n * 8];
-    s.read_exact(&mut buf).context("the tail closed mid-answer")?;
+    s.read_exact(&mut buf)
+        .context("the tail closed mid-answer")?;
     Ok(buf
         .chunks_exact(8)
         .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as usize)
@@ -1282,7 +1280,12 @@ use mary::models::inkling::resid as dev_lane_resid;
 /// Takes the `Vec` by value on purpose: the dense `w13` is 537 MB at f32 and a
 /// borrowing helper would hold two copies of it at once.
 fn up2<B: Backend>(v: Vec<f32>, rows: usize, cols: usize, dev: &B::Device) -> BT<B, 2> {
-    assert_eq!(v.len(), rows * cols, "{} values are not [{rows}, {cols}]", v.len());
+    assert_eq!(
+        v.len(),
+        rows * cols,
+        "{} values are not [{rows}, {cols}]",
+        v.len()
+    );
     BT::from_data(BTD::new(v, [rows, cols]), dev)
 }
 
@@ -1299,7 +1302,10 @@ fn up1<B: Backend>(v: Vec<f32>, len: usize, dev: &B::Device) -> BT<B, 1> {
 /// Read a `[rows, cols]` device tensor back to the host. This is also the sync,
 /// so a timer around the call measures work rather than enqueueing.
 fn down<B: Backend>(t: BT<B, 2>) -> Vec<f32> {
-    t.into_data().convert::<f32>().to_vec::<f32>().expect("device readback")
+    t.into_data()
+        .convert::<f32>()
+        .to_vec::<f32>()
+        .expect("device readback")
 }
 
 /// A device tensor of this run's backend, named once so the residency types
@@ -1486,7 +1492,12 @@ fn bind_bf16(
     rows: usize,
     cols: usize,
 ) -> Bf16W {
-    assert_eq!(bytes.len(), rows * cols * 2, "{rows}x{cols} BF16 is not {} bytes", bytes.len());
+    assert_eq!(
+        bytes.len(),
+        rows * cols * 2,
+        "{rows}x{cols} BF16 is not {} bytes",
+        bytes.len()
+    );
     assert!(
         Bf16W::tileable(rows, cols),
         "{rows}x{cols} does not tile as m16n8k16; this lane multiplies BF16 by BF16 and \
@@ -1498,7 +1509,9 @@ fn bind_bf16(
     // against kernel throughput and it is measured both ways rather than
     // assumed; the default is to alias and take the hand kernel on those.
     let copy_to_align = align < 16
-        && std::env::var("INK_ALIGN_COPY").map(|v| v == "1").unwrap_or(false);
+        && std::env::var("INK_ALIGN_COPY")
+            .map(|v| v == "1")
+            .unwrap_or(false);
     // `INK_DENSE_WEIGHTS=device`: take the pool copy and read the weight at
     // device rate rather than over the host page tables. 179.0 -> 226.8 GB/s
     // achieved and 18.4 -> 20.2 tok/s, for a second residency that
@@ -1509,7 +1522,12 @@ fn bind_bf16(
         Some(al) if !copy_to_align && !device => al.slice_or_copy(client, bytes),
         _ => client.create_from_slice(bytes),
     };
-    Bf16W { h, n: rows, k: cols, align: if copy_to_align { 16 } else { align } }
+    Bf16W {
+        h,
+        n: rows,
+        k: cols,
+        align: if copy_to_align { 16 } else { align },
+    }
 }
 
 /// How every plain-BF16 weight is aligned, and how much of the model that is.
@@ -1519,7 +1537,8 @@ fn bind_bf16(
 /// sits at. The aliasing seam only promises 4 (the checkpoint packs tensors
 /// back to back and puts the expert slabs at 4 mod 16), so this counts what the
 /// dense lane actually gets before anything is decided on the strength of it.
-static ALIGN: [core::sync::atomic::AtomicU64; 8] = [const { core::sync::atomic::AtomicU64::new(0) }; 8];
+static ALIGN: [core::sync::atomic::AtomicU64; 8] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 8];
 
 fn note_align(bytes: &[u8], rows: usize, cols: usize) -> usize {
     use core::sync::atomic::Ordering::Relaxed;
@@ -1606,7 +1625,12 @@ impl DeviceDense {
             let fused = cp.stored(&format!("{p}mlp.shared_experts.shared_w13_weight"))?;
             anyhow::ensure!(fused.elem == Elem::Bf16, "shared_w13 is {:?}", fused.elem);
             let (g, u) = mary::models::inkling::load::split_shared_w13_bytes(
-                &fused.bytes, n_shared, inter, h, halved, 2,
+                &fused.bytes,
+                n_shared,
+                inter,
+                h,
+                halved,
+                2,
             );
             let d = cp.stored(&format!("{p}mlp.shared_experts.shared_w2_weight"))?;
             anyhow::ensure!(d.elem == Elem::Bf16, "shared_w2 is {:?}", d.elem);
@@ -1625,7 +1649,11 @@ impl DeviceDense {
                 // `w2` is NOT de-interleaved, so this one is a view of the pile
                 // and aliases outright.
                 sd.down.push(bind_bf16(
-                    client, aliases, &d.bytes[e * per_d..(e + 1) * per_d], h, inter,
+                    client,
+                    aliases,
+                    &d.bytes[e * per_d..(e + 1) * per_d],
+                    h,
+                    inter,
                 ));
             }
             self.bytes += (gu.len() + n_shared * per_d) as u64;
@@ -1775,7 +1803,14 @@ fn mtp_block_prefill_dev(
     let y = dense_mlp_bf16(hn, &w.dense);
     let mhist = dev_lane::conv_history(y.clone(), kernel);
     let out = x1 + dev_lane::short_conv(y, w.mlp_sconv.clone());
-    (out, MtpDevCache { attn, attn_sconv: ahist, mlp_sconv: mhist })
+    (
+        out,
+        MtpDevCache {
+            attn,
+            attn_sconv: ahist,
+            mlp_sconv: mhist,
+        },
+    )
 }
 
 /// One position of one MTP head on the device, reading the cache.
@@ -1819,7 +1854,12 @@ fn shared_experts_bf16(
     n_shared: usize,
 ) -> T2 {
     let [n, _] = x.dims();
-    assert_eq!(gammas.len(), n * n_shared, "{} gammas for {n} tokens", gammas.len());
+    assert_eq!(
+        gammas.len(),
+        n * n_shared,
+        "{} gammas for {n} tokens",
+        gammas.len()
+    );
     // ONE projection for every gate and every up in the layer. See
     // [`SharedOnDevice`] for why: four GEMMs against the same activation are
     // four grids of 256 cubes, and this is one of 1024.
@@ -1828,7 +1868,9 @@ fn shared_experts_bf16(
     let mut out: Option<T2> = None;
     for s in 0..n_shared {
         let g = gu.clone().slice([0..n, s * inter..(s + 1) * inter]);
-        let u = gu.clone().slice([0..n, (n_shared + s) * inter..(n_shared + s + 1) * inter]);
+        let u = gu
+            .clone()
+            .slice([0..n, (n_shared + s) * inter..(n_shared + s + 1) * inter]);
         let col: Vec<f32> = (0..n).map(|tk| gammas[tk * n_shared + s]).collect();
         let gam = BT::<Bk, 2>::from_data(BTD::new(col, [n, 1]), dev);
         let c = dev_lane::linear_bf16(dev_lane::silu(g) * u * gam, &sw.down[s]);
@@ -1905,7 +1947,12 @@ impl RouteDiff {
         for (x, y) in la.iter().zip(lb) {
             self.max_abs_logit = self.max_abs_logit.max((x - y).abs());
         }
-        let differ = a.experts.iter().zip(&b.experts).filter(|(x, y)| x != y).count();
+        let differ = a
+            .experts
+            .iter()
+            .zip(&b.experts)
+            .filter(|(x, y)| x != y)
+            .count();
         self.slots_differ += differ;
         let mut sa = a.experts.clone();
         let mut sb = b.experts.clone();
@@ -1938,7 +1985,12 @@ impl RouteDiff {
 /// nothing for the BF16 arm's shape.
 fn drop_pad_cols(v: Vec<f32>, n: usize, cols: usize, keep: usize) -> Vec<f32> {
     assert!(keep <= cols, "cannot keep {keep} of {cols} columns");
-    assert_eq!(v.len(), n * cols, "{} values are not [{n}, {cols}]", v.len());
+    assert_eq!(
+        v.len(),
+        n * cols,
+        "{} values are not [{n}, {cols}]",
+        v.len()
+    );
     if cols == keep {
         return v;
     }
@@ -1956,7 +2008,12 @@ fn drop_pad_cols(v: Vec<f32>, n: usize, cols: usize, keep: usize) -> Vec<f32> {
 /// the orientation to store it in. This is that permutation, paid once on the
 /// host at upload, where the device lane paid it on every call.
 fn transpose_rows(v: &[f32], rows: usize, cols: usize) -> Vec<f32> {
-    assert_eq!(v.len(), rows * cols, "{} values are not [{rows}, {cols}]", v.len());
+    assert_eq!(
+        v.len(),
+        rows * cols,
+        "{} values are not [{rows}, {cols}]",
+        v.len()
+    );
     let mut out = vec![0f32; rows * cols];
     for r in 0..rows {
         for c in 0..cols {
@@ -2172,9 +2229,9 @@ fn routed_experts_fp4(
     let mode = std::env::var("INK_GROUPED").unwrap_or_else(|_| "1".to_string());
     if mode != "0" {
         if let Some(al) = aliases {
-            if let Some(acc) =
-                grouped_experts_fp4(src, al, client, dev, prefix, by_expert, hn, n, h, inter, host)?
-            {
+            if let Some(acc) = grouped_experts_fp4(
+                src, al, client, dev, prefix, by_expert, hn, n, h, inter, host,
+            )? {
                 if mode == "2" {
                     let reference = per_expert_fp4(
                         src, aliases, client, dev, prefix, by_expert, hn, n, h, inter, host,
@@ -2199,7 +2256,9 @@ fn routed_experts_fp4(
         );
     }
     host.per_expert += 1;
-    per_expert_fp4(src, aliases, client, dev, prefix, by_expert, hn, n, h, inter, host)
+    per_expert_fp4(
+        src, aliases, client, dev, prefix, by_expert, hn, n, h, inter, host,
+    )
 }
 
 /// Where the two lanes' accumulators differ, and by how much.
@@ -2288,8 +2347,8 @@ fn grouped_experts_fp4(
     use mary::models::inkling::fp4quant::{quantize_nvfp4, quantize_nvfp4_bf16};
     use mary::models::inkling::moegroup::{
         fp4_linear_grouped_bf16_launch, fp4_linear_grouped_launch, gather_grouped,
-        gather_grouped_bf16, gather_grouped_bf16_from_bf16, scatter_weighted, scatter_weighted_bf16,
-        BlockPlanDev, RowPlan,
+        gather_grouped_bf16, gather_grouped_bf16_from_bf16, scatter_weighted,
+        scatter_weighted_bf16, BlockPlanDev, RowPlan,
     };
     use mary::models::inkling::seam::{handle_of_any, tensor_of};
 
@@ -2425,12 +2484,32 @@ fn grouped_experts_fp4(
     };
     let both = if narrow {
         fp4_linear_grouped_bf16_launch(
-            client, &a, &asc, &wmap, wmap_bytes, &blk, &h_off13, &h_sc13, slots, m_total, h,
+            client,
+            &a,
+            &asc,
+            &wmap,
+            wmap_bytes,
+            &blk,
+            &h_off13,
+            &h_sc13,
+            slots,
+            m_total,
+            h,
             2 * inter,
         )
     } else {
         fp4_linear_grouped_launch(
-            client, &a, &asc, &wmap, wmap_bytes, &blk, &h_off13, &h_sc13, slots, m_total, h,
+            client,
+            &a,
+            &asc,
+            &wmap,
+            wmap_bytes,
+            &blk,
+            &h_off13,
+            &h_sc13,
+            slots,
+            m_total,
+            h,
             2 * inter,
         )
     };
@@ -2467,10 +2546,7 @@ fn grouped_experts_fp4(
         <Bk as burn::tensor::backend::Backend>::sync(dev).expect("sync before pool trace");
         println!(
             "{}",
-            mary::models::inkling::seam::pool_line(
-                client,
-                &format!("{prefix}experts m={m_total}")
-            )
+            mary::models::inkling::seam::pool_line(client, &format!("{prefix}experts m={m_total}"))
         );
     }
 
@@ -2495,7 +2571,11 @@ fn grouped_experts_fp4(
 /// Read once: this sits inside the per-layer path.
 fn mem_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("INK_MEM_TRACE").map(|v| v == "1").unwrap_or(false))
+    *ON.get_or_init(|| {
+        std::env::var("INK_MEM_TRACE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
 }
 
 /// A slice of POD as the bytes `create_from_slice` uploads.
@@ -2633,7 +2713,9 @@ fn routed_experts_bf16(
         }
     }
     host.per_expert += 1;
-    per_expert_bf16(src, aliases, client, dev, prefix, by_expert, hn, n, h, inter, host)
+    per_expert_bf16(
+        src, aliases, client, dev, prefix, by_expert, hn, n, h, inter, host,
+    )
 }
 
 /// Layer 2's routed experts in a handful of launches, or `None` if this lane
@@ -2745,7 +2827,16 @@ fn grouped_experts_bf16(
     let t_w = Instant::now();
     let a = to_bf16_launch(client, &x_h, m_total * h, m_total * h);
     let both = bf16_linear_grouped_launch(
-        client, &a, &wmap, wmap_bytes, &blk, &h_off13, slots, m_total, h, 2 * inter,
+        client,
+        &a,
+        &wmap,
+        wmap_bytes,
+        &blk,
+        &h_off13,
+        slots,
+        m_total,
+        h,
+        2 * inter,
     );
     let act = gate_up_silu_bf16_launch(client, &both, m_total, inter);
     let y_h = bf16_linear_grouped_launch(
@@ -2865,9 +2956,18 @@ fn main() -> Result<()> {
          INK_ACT_BF16 enabled or set INK_RESID_BF16=0 for the fully wide lane"
     );
 
-    let pile_path = std::env::args().nth(1).map(PathBuf::from).context("usage: <pile> <ids> <out>")?;
-    let ids_path = std::env::args().nth(2).map(PathBuf::from).context("usage: <pile> <ids> <out>")?;
-    let out_path = std::env::args().nth(3).map(PathBuf::from).context("usage: <pile> <ids> <out>")?;
+    let pile_path = std::env::args()
+        .nth(1)
+        .map(PathBuf::from)
+        .context("usage: <pile> <ids> <out>")?;
+    let ids_path = std::env::args()
+        .nth(2)
+        .map(PathBuf::from)
+        .context("usage: <pile> <ids> <out>")?;
+    let out_path = std::env::args()
+        .nth(3)
+        .map(PathBuf::from)
+        .context("usage: <pile> <ids> <out>")?;
 
     // The weights, and everything else the run needs to know about the model.
     // There is no second arm: no `INK_PILE` to opt into, and no checkpoint
@@ -2892,8 +2992,7 @@ fn main() -> Result<()> {
     // from a fallback you never see.
     let cfg_source = std::env::var("INK_CONFIG").ok();
     let cfg_text = match &cfg_source {
-        Some(p) => std::fs::read_to_string(p)
-            .with_context(|| format!("INK_CONFIG={p}"))?,
+        Some(p) => std::fs::read_to_string(p).with_context(|| format!("INK_CONFIG={p}"))?,
         None => cp
             .document("config.json")
             .context(
@@ -2945,8 +3044,14 @@ fn main() -> Result<()> {
     // A pipe end is only a pipe end if it is not the whole stack; refusing the
     // contradiction here is cheaper than debugging a head that also unembeds.
     let pipe_spec = std::env::var("INK_PIPE").ok();
-    let is_head = pipe_spec.as_deref().map(|s| s.starts_with("head:")).unwrap_or(false);
-    let is_tail = pipe_spec.as_deref().map(|s| s.starts_with("tail:")).unwrap_or(false);
+    let is_head = pipe_spec
+        .as_deref()
+        .map(|s| s.starts_with("head:"))
+        .unwrap_or(false);
+    let is_tail = pipe_spec
+        .as_deref()
+        .map(|s| s.starts_with("tail:"))
+        .unwrap_or(false);
     anyhow::ensure!(
         pipe_spec.is_none() || is_head || is_tail,
         "INK_PIPE wants head:HOST:PORT or tail:ADDR:PORT"
@@ -2955,13 +3060,19 @@ fn main() -> Result<()> {
         !is_head || hi < t.num_hidden_layers,
         "a head that runs to the last layer has nothing to send; set INK_LAYERS"
     );
-    anyhow::ensure!(!is_tail || lo > 0, "a tail that starts at layer 0 has nothing to receive");
+    anyhow::ensure!(
+        !is_tail || lo > 0,
+        "a tail that starts at layer 0 has nothing to receive"
+    );
 
     let corpus: Vec<usize> = std::fs::read(&ids_path)?
         .chunks_exact(8)
         .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as usize)
         .collect();
-    anyhow::ensure!(!corpus.is_empty(), "no tokens — the forward would be vacuous");
+    anyhow::ensure!(
+        !corpus.is_empty(),
+        "no tokens — the forward would be vacuous"
+    );
 
     // ---- INK_SLOTS=b: b INDEPENDENT sequences, decoded together ------------
     //
@@ -2980,8 +3091,10 @@ fn main() -> Result<()> {
     // which is the only way to tell contamination from the m == 1 width effect
     // that already makes b = 1 and b > 1 disagree.
     let slot_lane = std::env::var("INK_SLOTS").is_ok();
-    let nslots: usize =
-        std::env::var("INK_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let nslots: usize = std::env::var("INK_SLOTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
     anyhow::ensure!(nslots >= 1, "INK_SLOTS counts sequences and starts at 1");
     // ---- INK_COHORTS=c: c cohorts of b slots, offset by half a round -------
     //
@@ -2998,8 +3111,10 @@ fn main() -> Result<()> {
     // same caches as one cohort of 2b and read the same weights; what changes
     // is the send/receive ORDER, which is the whole of the interleave and is
     // the `want` line below.
-    let ncohorts: usize =
-        std::env::var("INK_COHORTS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let ncohorts: usize = std::env::var("INK_COHORTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
     anyhow::ensure!(ncohorts >= 1, "INK_COHORTS counts cohorts and starts at 1");
     anyhow::ensure!(
         ncohorts == 1 || slot_lane,
@@ -3016,8 +3131,15 @@ fn main() -> Result<()> {
     let slot_len: usize = std::env::var("INK_SLOT_LEN")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(if slot_lane { corpus.len() / total_slots } else { corpus.len() });
-    anyhow::ensure!(slot_len > 0, "INK_SLOT_LEN is a prompt length and starts at 1");
+        .unwrap_or(if slot_lane {
+            corpus.len() / total_slots
+        } else {
+            corpus.len()
+        });
+    anyhow::ensure!(
+        slot_len > 0,
+        "INK_SLOT_LEN is a prompt length and starts at 1"
+    );
     let slot_at: Vec<usize> = match std::env::var("INK_SLOT_OFFSETS") {
         Ok(v) => v
             .split(',')
@@ -3038,8 +3160,10 @@ fn main() -> Result<()> {
             corpus.len()
         );
     }
-    let mut slot_ids: Vec<Vec<usize>> =
-        slot_at.iter().map(|&c| corpus[c * slot_len..(c + 1) * slot_len].to_vec()).collect();
+    let mut slot_ids: Vec<Vec<usize>> = slot_at
+        .iter()
+        .map(|&c| corpus[c * slot_len..(c + 1) * slot_len].to_vec())
+        .collect();
     // `ids` is slot 0's stream. Every report that indexes a position -- the
     // per-position top-5, the MTP scoring, the final dump -- reads it, and one
     // sequence is what those were written about; the other slots keep their own
@@ -3072,8 +3196,10 @@ fn main() -> Result<()> {
             corpus.len()
         );
     }
-    println!("  layers     : {}  hidden {h}  experts {}+{} shared",
-             t.num_hidden_layers, t.n_routed_experts, t.n_shared_experts);
+    println!(
+        "  layers     : {}  hidden {h}  experts {}+{} shared",
+        t.num_hidden_layers, t.n_routed_experts, t.n_shared_experts
+    );
     println!(
         "  this process: layers {lo}..{hi} ({} of {}){}",
         hi - lo,
@@ -3099,7 +3225,6 @@ fn main() -> Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
-
     // Drafting runs on the TAIL, and only there. This used to refuse a pipe
     // outright -- "neither end can draft alone" -- which was true of the head
     // and false of the tail, and once INK_LAYERS became required it left NO
@@ -3117,7 +3242,11 @@ fn main() -> Result<()> {
     // WHICH TABLES THIS PROCESS LOADS: drafting is the one configuration in
     // which a tail needs the embedding table, and the switch has to precede its
     // use.
-    let mtp_k: usize = std::env::var("INK_MTP").ok().map(|v| v.parse()).transpose()?.unwrap_or(0);
+    let mtp_k: usize = std::env::var("INK_MTP")
+        .ok()
+        .map(|v| v.parse())
+        .transpose()?
+        .unwrap_or(0);
     let mtp_order = match std::env::var("INK_MTP_ORDER") {
         Ok(v) => MtpConcat::parse(&v)
             .with_context(|| format!("INK_MTP_ORDER wants hidden|embed, got {v:?}"))?,
@@ -3167,7 +3296,9 @@ fn main() -> Result<()> {
     // registration is therefore a target-hardware gate, while the two explicit
     // fallback switches are conservatively priced here.
     let grouped_narrow = std::env::var("INK_GROUPED").unwrap_or_else(|_| "1".into()) == "1"
-        && !std::env::var("INK_ZEROCOPY").map(|v| v == "0").unwrap_or(false);
+        && !std::env::var("INK_ZEROCOPY")
+            .map(|v| v == "0")
+            .unwrap_or(false);
     // The router arm and drafting decide WHICH weights the BF16 lane binds, so
     // admission has to know both before it prices the pool copy. `from_env` is
     // pure and is the same call the lane itself makes further down; reading it
@@ -3237,7 +3368,10 @@ fn main() -> Result<()> {
     // on its own. Zero means nothing was charged, which the report says in
     // those words.
     let mut charged_device_weights = 0u64;
-    if std::env::var("INK_STARTUP_COPY").map(|v| v == "0").unwrap_or(false) {
+    if std::env::var("INK_STARTUP_COPY")
+        .map(|v| v == "0")
+        .unwrap_or(false)
+    {
         println!("  startup weight copy: DISABLED (INK_STARTUP_COPY=0) -- UNSAFE diagnostic arm");
     } else {
         let mut globals = Vec::new();
@@ -3248,12 +3382,8 @@ fn main() -> Result<()> {
             globals.push("model.llm.unembed.weight");
         }
         let t0 = Instant::now();
-        let (experts, dense, bytes, device_weights) = cp.copy_share(
-            lo..hi,
-            &globals,
-            attention_bytes + slot_kv_bytes,
-            admission,
-        )?;
+        let (experts, dense, bytes, device_weights) =
+            cp.copy_share(lo..hi, &globals, attention_bytes + slot_kv_bytes, admission)?;
         println!(
             "  startup weight copy: {experts} expert + {dense} dense views, {:.2} GiB anonymous in {:.1}s",
             bytes as f64 / GIB,
@@ -3268,7 +3398,11 @@ fn main() -> Result<()> {
     // widening is now per LOOKUP, 16 KB a token, which is where it belongs.
     let embed_w = if want_embed {
         let leaf = cp.stored("model.llm.embed.weight")?;
-        anyhow::ensure!(leaf.elem == Elem::Bf16, "the embedding table is {:?}", leaf.elem);
+        anyhow::ensure!(
+            leaf.elem == Elem::Bf16,
+            "the embedding table is {:?}",
+            leaf.elem
+        );
         Some(leaf.bytes.clone())
     } else {
         None
@@ -3276,8 +3410,16 @@ fn main() -> Result<()> {
     // `want_embed_norm`, NOT `want_embed`: a drafting tail takes the embedding
     // table and leaves the norm behind, because every MTP head norms its own
     // embeddings with its own `embed_norm`.
-    let embed_n = if want_embed_norm { Some(cp.held("model.llm.embed_norm.weight")?) } else { None };
-    let fnorm = if want_head { Some(cp.held("model.llm.norm.weight")?) } else { None };
+    let embed_n = if want_embed_norm {
+        Some(cp.held("model.llm.embed_norm.weight")?)
+    } else {
+        None
+    };
+    let fnorm = if want_head {
+        Some(cp.held("model.llm.norm.weight")?)
+    } else {
+        None
+    };
     // The unembed table is NOT read here any more, and not widened anywhere.
     // It used to be `cp.held(...)`, which turned 1.6 GiB of stored BF16 into
     // 3.3 GB of host f32, uploaded THAT, and dropped the host copy. Now the
@@ -3335,10 +3477,18 @@ fn main() -> Result<()> {
                     // The same span rule the LLM's layers use, asked of the
                     // config rather than restated -- an MTP block's kind comes
                     // from mtp_config, but what a kind REACHES is one fact.
-                    rel_extent: t.rel_span(if local { AttnKind::Local } else { AttnKind::Global }),
+                    rel_extent: t.rel_span(if local {
+                        AttnKind::Local
+                    } else {
+                        AttnKind::Global
+                    }),
                     kernel: t.sconv_kernel_size,
                     rms_eps: t.rms_norm_eps,
-                    kind: if local { AttnKind::Local } else { AttnKind::Global },
+                    kind: if local {
+                        AttnKind::Local
+                    } else {
+                        AttnKind::Global
+                    },
                 },
                 local,
             });
@@ -3394,7 +3544,9 @@ fn main() -> Result<()> {
     // A is a lower bound on B and C by construction (it is B at temperature
     // zero), so a run where they coincide says the heads are weak and a run
     // where they part says the RULE was the constraint.
-    let mtp_prob = std::env::var("INK_MTP_PROB").map(|val| val == "1").unwrap_or(false);
+    let mtp_prob = std::env::var("INK_MTP_PROB")
+        .map(|val| val == "1")
+        .unwrap_or(false);
     // The draft head's distribution, kept from the step that issued it until
     // the step it names arrives with the target's. 800 KB a draft at f32 and
     // at most k(k+1)/2 alive at once.
@@ -3429,7 +3581,9 @@ fn main() -> Result<()> {
     // 1470 ms for four heads against a 131 ms two-node round trip it made
     // speculation arithmetically impossible before the model was consulted.
     // `INK_MTP_DEV=0` is the control, and `INK_MTP_CHECK=1` runs it as one.
-    let mtp_dev_on = std::env::var("INK_MTP_DEV").map(|val| val != "0").unwrap_or(true);
+    let mtp_dev_on = std::env::var("INK_MTP_DEV")
+        .map(|val| val != "0")
+        .unwrap_or(true);
     // Built on the first draft rather than at load, exactly as `layers_dev` is:
     // a lane nobody takes should not pay for the upload.
     let mut mtp_devs: Vec<MtpDev> = Vec::new();
@@ -3459,7 +3613,9 @@ fn main() -> Result<()> {
     // choice: `INK_KV=0` is the uncached lane, which is the ONLY oracle the
     // cached lane has (`INK_MTP_CHECK` compares the two in one process), so
     // deleting it would delete the check that the cache is right.
-    let kv = std::env::var("INK_KV").map(|v| v == "1" || v == "on").unwrap_or(false);
+    let kv = std::env::var("INK_KV")
+        .map(|v| v == "1" || v == "on")
+        .unwrap_or(false);
     // `INK_REPEAT=1` keeps the token loop from GROWING the sequence: every step
     // re-runs the identical pass over the identical prompt. It exists because
     // the only pass of a given width a process can otherwise produce is its
@@ -3470,9 +3626,14 @@ fn main() -> Result<()> {
     // identical, so the widths can be compared by running the binary twice with
     // two prompts. Measurement only: the generated token is still printed and
     // still thrown away, so the run produces no continuation.
-    let repeat = std::env::var("INK_REPEAT").map(|v| v == "1" || v == "on").unwrap_or(false);
-    anyhow::ensure!(!repeat || !kv, "INK_REPEAT wants the uncached lane: with a KV cache a \
-         repeated pass would append the same position to the cache again");
+    let repeat = std::env::var("INK_REPEAT")
+        .map(|v| v == "1" || v == "on")
+        .unwrap_or(false);
+    anyhow::ensure!(
+        !repeat || !kv,
+        "INK_REPEAT wants the uncached lane: with a KV cache a \
+         repeated pass would append the same position to the cache again"
+    );
     // ---- INK_SPEC=k: accept-and-skip ------------------------------------
     //
     // The loop the MTP measurement was for. `k` drafts ride back with every
@@ -3485,13 +3646,19 @@ fn main() -> Result<()> {
     //
     // Set it on BOTH processes and to the same value -- the protocol is
     // symmetric and a mismatch shows up as a width assertion, not as bad text.
-    let spec_k: usize = std::env::var("INK_SPEC").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let spec_k: usize = std::env::var("INK_SPEC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     anyhow::ensure!(
         spec_k == 0 || kv,
         "INK_SPEC={spec_k} wants INK_KV=1: speculation is about skipping sequential steps, and \
          the uncached lane has no cache to roll back"
     );
-    anyhow::ensure!(!repeat || spec_k == 0, "INK_REPEAT and INK_SPEC measure different things");
+    anyhow::ensure!(
+        !repeat || spec_k == 0,
+        "INK_REPEAT and INK_SPEC measure different things"
+    );
     anyhow::ensure!(
         spec_k == 0 || pipe_spec.is_some(),
         "INK_SPEC needs the pipe: the drafts are made on the tail and fed by the head"
@@ -3507,7 +3674,10 @@ fn main() -> Result<()> {
          lane drafts in 1.5 s and there is no loop that pays for that"
     );
     if spec_k > 0 {
-        println!("  speculation        : INK_SPEC={spec_k} -- verify pass is {} rows", spec_k + 1);
+        println!(
+            "  speculation        : INK_SPEC={spec_k} -- verify pass is {} rows",
+            spec_k + 1
+        );
     }
 
     // ---- INK_WIDTH=b: what a b-row decode step COSTS ----------------------
@@ -3528,34 +3698,51 @@ fn main() -> Result<()> {
     // is committed, so the run produces one token per pass and the SAME text as
     // INK_WIDTH=1 -- which is the check that the extra rows are not changing
     // the answer, and it is a check the run makes on itself.
-    let width: usize = std::env::var("INK_WIDTH").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let width: usize = std::env::var("INK_WIDTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
     anyhow::ensure!(width >= 1, "INK_WIDTH counts rows and starts at 1");
     anyhow::ensure!(
         width == 1 || kv,
         "INK_WIDTH wants INK_KV=1: the uncached lane feeds the whole prefix and has no one-row \
          step to widen"
     );
-    anyhow::ensure!(width == 1 || spec_k == 0, "INK_WIDTH and INK_SPEC both widen the pass");
+    anyhow::ensure!(
+        width == 1 || spec_k == 0,
+        "INK_WIDTH and INK_SPEC both widen the pass"
+    );
     anyhow::ensure!(
         width == 1 || mtp_k == 0,
         "INK_WIDTH is a cost probe and drafting is not part of what it prices"
     );
     if width > 1 {
-        println!("  width probe        : INK_WIDTH={width} -- every cached step is {width} rows, \
-                  one of them real");
+        println!(
+            "  width probe        : INK_WIDTH={width} -- every cached step is {width} rows, \
+                  one of them real"
+        );
     }
-    anyhow::ensure!(!slot_lane || kv, "INK_SLOTS wants INK_KV=1: a slot IS a cache");
+    anyhow::ensure!(
+        !slot_lane || kv,
+        "INK_SLOTS wants INK_KV=1: a slot IS a cache"
+    );
     anyhow::ensure!(
         !slot_lane || width == 1,
         "INK_WIDTH prices a b-row pass with filler; INK_SLOTS runs one with b sequences in it, \
          and setting both would put filler rows in a batch that already has real ones"
     );
-    anyhow::ensure!(!slot_lane || spec_k == 0, "INK_SLOTS and INK_SPEC both widen the pass");
+    anyhow::ensure!(
+        !slot_lane || spec_k == 0,
+        "INK_SLOTS and INK_SPEC both widen the pass"
+    );
     anyhow::ensure!(
         !slot_lane || mtp_k == 0,
         "INK_SLOTS and INK_MTP: drafting follows one sequence and there are {nslots} here"
     );
-    anyhow::ensure!(!slot_lane || !repeat, "INK_REPEAT and INK_SLOTS measure different things");
+    anyhow::ensure!(
+        !slot_lane || !repeat,
+        "INK_REPEAT and INK_SLOTS measure different things"
+    );
     if slot_lane {
         println!(
             "  batched decode     : INK_SLOTS={nslots} -- {nslots} caches, one pass, {nslots} \
@@ -3596,7 +3783,9 @@ fn main() -> Result<()> {
         admission.residual.name(),
     );
     println!("  shared + dense MLP : device, uploaded once and held");
-    println!("  routed experts     : device, NATIVE tensor cores -- NVFP4 where packed, BF16 at layer 2");
+    println!(
+        "  routed experts     : device, NATIVE tensor cores -- NVFP4 where packed, BF16 at layer 2"
+    );
     println!("  head (unembed)     : device");
     let router_arm = RouterArm::from_env();
     println!("  router projection  : {}", router_arm.label());
@@ -3604,17 +3793,30 @@ fn main() -> Result<()> {
     // layer and issues a second matmul and a second BLOCKING read per MoE layer
     // per token. A timing run must not have it on, and the report says which
     // runs did.
-    let router_diff = std::env::var("INK_ROUTER_DIFF").map(|v| v == "1").unwrap_or(false);
+    let router_diff = std::env::var("INK_ROUTER_DIFF")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     if router_diff {
         println!("  router diff        : ON -- selection compared against the f32 [rows,hidden] lane, this pass IS slower");
     }
-    println!("  kv cache           : {}", if kv { "on" } else { "off (prefix recomputed each step)" });
+    println!(
+        "  kv cache           : {}",
+        if kv {
+            "on"
+        } else {
+            "off (prefix recomputed each step)"
+        }
+    );
     // The SHARED experts' w13 is square, so nothing but a forward can tell the
     // two readings apart. INK_SHARED_W13_HALVED=1 selects the other one.
     let shared_halved = mary::models::inkling::load::shared_w13_halved();
     println!(
         "  shared w13 split   : {}",
-        if shared_halved { "HALVED (contiguous)" } else { "INTERLEAVED" }
+        if shared_halved {
+            "HALVED (contiguous)"
+        } else {
+            "INTERLEAVED"
+        }
     );
     let dev = burn::backend::cuda::CudaDevice::default();
     let mut ddense = DeviceDense::default();
@@ -3643,11 +3845,15 @@ fn main() -> Result<()> {
     // device pointer on: `seam::handle_of` hands a Burn allocation to a raw
     // kernel launched on this client, and if they were two clients that would
     // be a wrong answer rather than an error.
-    let fp4_client = mary::models::inkling::seam::client_of(
-        &BT::<Bk, 2>::zeros([1, 1], &dev),
+    let fp4_client = mary::models::inkling::seam::client_of(&BT::<Bk, 2>::zeros([1, 1], &dev));
+    println!(
+        "{}",
+        mary::models::inkling::pile::mem_line("after CUDA context")
     );
-    println!("{}", mary::models::inkling::pile::mem_line("after CUDA context"));
-    println!("{}", mary::models::inkling::seam::pool_line(&fp4_client, "cold"));
+    println!(
+        "{}",
+        mary::models::inkling::seam::pool_line(&fp4_client, "cold")
+    );
     println!(
         "  memory pool        : {} pages, cleanup {}",
         allocator.env_value(),
@@ -3698,7 +3904,10 @@ fn main() -> Result<()> {
         // instead of aliasing the startup allocation. It remains a diagnostic
         // arm, not a lane: the supported path aliases anonymous memory and
         // does not need a per-bind device copy.
-        if std::env::var("INK_ZEROCOPY").map(|v| v == "0").unwrap_or(false) {
+        if std::env::var("INK_ZEROCOPY")
+            .map(|v| v == "0")
+            .unwrap_or(false)
+        {
             println!("  zero-copy mappings : DISABLED (INK_ZEROCOPY=0) -- every bind copies");
             Some(mary::models::inkling::fp4gemm::Aliases::disabled())
         } else {
@@ -3708,7 +3917,11 @@ fn main() -> Result<()> {
             let a = mary::models::inkling::fp4gemm::Aliases::register(c, maps);
             println!(
                 "  zero-copy mappings : {} {n} in {:.1} ms",
-                if a.is_some() { "registered" } else { "UNSUPPORTED" },
+                if a.is_some() {
+                    "registered"
+                } else {
+                    "UNSUPPORTED"
+                },
                 alias_started.elapsed().as_secs_f64() * 1e3
             );
             // Packed grouped layers were admitted at their BF16 activation
@@ -3721,8 +3934,7 @@ fn main() -> Result<()> {
             anyhow::ensure!(
                 a.is_some()
                     || (lo..hi).all(|layer| {
-                        t.is_dense(layer)
-                            || admission.routed(layer) == budget::StorageDType::F32
+                        t.is_dense(layer) || admission.routed(layer) == budget::StorageDType::F32
                     }),
                 "this CUDA target cannot register host mappings, but pre-copy admission priced \
                  one or more packed routed layers for the BF16 grouped lane. Refusing instead \
@@ -3764,14 +3976,19 @@ fn main() -> Result<()> {
             leaf.elem
         );
         let (rows, cols) = (leaf.dims[0] as usize, leaf.dims[1] as usize);
-        anyhow::ensure!(rows == t.vocab_size && cols == h, "unembed is {rows}x{cols}");
+        anyhow::ensure!(
+            rows == t.vocab_size && cols == h,
+            "unembed is {rows}x{cols}"
+        );
         anyhow::ensure!(
             Bf16W::tileable(rows, cols),
             "unembed {rows}x{cols} does not tile as m16n8k16"
         );
         let align = note_align(&leaf.bytes, rows, cols);
         let copy_to_align = align < 16
-            && std::env::var("INK_ALIGN_COPY").map(|v| v == "1").unwrap_or(false);
+            && std::env::var("INK_ALIGN_COPY")
+                .map(|v| v == "1")
+                .unwrap_or(false);
         // The same placement `bind_bf16` takes, on the largest single weight in
         // the process -- 1.53 GiB of the 4.94 the device arm holds.
         let device = budget::dense_weights() == budget::DenseWeights::DevicePool;
@@ -3785,15 +4002,18 @@ fn main() -> Result<()> {
             leaf.bytes.len() as f64 / GIB,
             2.0 * leaf.bytes.len() as f64 / GIB
         );
-        Some(Bf16W { h: hnd, n: rows, k: cols, align: if copy_to_align { 16 } else { align } })
+        Some(Bf16W {
+            h: hnd,
+            n: rows,
+            k: cols,
+            align: if copy_to_align { 16 } else { align },
+        })
     } else {
         None
     };
     // The final norm's gain, uploaded once for the same reason -- it used to be
     // re-uploaded from the host copy on every pass, and on every MTP draft.
-    let fnorm_dev = fnorm
-        .as_ref()
-        .map(|f| up1r::<Bk>(&f.data, h, &dev));
+    let fnorm_dev = fnorm.as_ref().map(|f| up1r::<Bk>(&f.data, h, &dev));
 
     // Pay the storage layer's BLAKE3 for this node's experts HERE, once, rather
     // than in whichever decode step first routes to each of them.
@@ -3884,7 +4104,10 @@ fn main() -> Result<()> {
             let sock = TcpStream::connect(addr)
                 .with_context(|| format!("connecting to the tail at {addr}"))?;
             sock.set_nodelay(true)?;
-            println!("  pipe: connected to the tail at {addr} in {:.1}s", t0.elapsed().as_secs_f32());
+            println!(
+                "  pipe: connected to the tail at {addr} in {:.1}s",
+                t0.elapsed().as_secs_f32()
+            );
             Some(Pipe::Head(sock))
         }
         Some(s) if is_tail => {
@@ -3909,7 +4132,9 @@ fn main() -> Result<()> {
     // by default; the flag exists so the two lanes can be interleaved from one
     // binary, which is the only honest way to price a 15% change against a
     // 2-3 ms pass-to-pass drift.
-    let dev_route = std::env::var("INK_DEV_ROUTE").map(|v| v != "0").unwrap_or(true);
+    let dev_route = std::env::var("INK_DEV_ROUTE")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     // `INK_ROUTE_STALE=1` is a TIMING PROBE and NOT A LANE: it reuses the
     // PREVIOUS pass's routing decision for a layer instead of reading this
     // pass's back, so the router projection is still enqueued, the device still
@@ -3919,7 +4144,9 @@ fn main() -> Result<()> {
     // wall clock difference against an interleaved control IS the price of the
     // per-layer sync. The generated TEXT is wrong under it, deliberately and
     // always: the decision it acts on belongs to a different activation.
-    let route_stale = std::env::var("INK_ROUTE_STALE").map(|v| v == "1").unwrap_or(false);
+    let route_stale = std::env::var("INK_ROUTE_STALE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     // The gate bias is `[n_routed]` f32 and does not change during a run, so it
     // is uploaded once per layer rather than once per pass. One KiB either way;
     // it is here because a per-pass upload in a lane whose whole subject is
@@ -3987,2148 +4214,2470 @@ fn main() -> Result<()> {
     // exactly when nothing is speculated.
     let mut step = 0usize;
     loop {
-    // A tail's step BEGINS on the wire, and it waits before its own timers
-    // start: a tail that charged itself for the head's half would report the
-    // pipeline's latency as its own cost, and the per-machine split is the
-    // entire question here.
-    let t_rv = Instant::now();
-    let incoming = match pipe.as_mut() {
-        Some(Pipe::Tail(s)) => match recv_stream(s, h)? {
-            Some(v) => Some(v),
-            // The head closed. Not an error -- it is how a finished run ends.
-            None => break,
-        },
-        _ => None,
-    };
-    // Charged whether or not this process is a tail: on anything else it is
-    // zero, and a zero that is measured beats a branch that hides it.
-    let t_recv = t_rv.elapsed().as_secs_f64();
+        // A tail's step BEGINS on the wire, and it waits before its own timers
+        // start: a tail that charged itself for the head's half would report the
+        // pipeline's latency as its own cost, and the per-machine split is the
+        // entire question here.
+        let t_rv = Instant::now();
+        let incoming = match pipe.as_mut() {
+            Some(Pipe::Tail(s)) => match recv_stream(s, h)? {
+                Some(v) => Some(v),
+                // The head closed. Not an error -- it is how a finished run ends.
+                None => break,
+            },
+            _ => None,
+        };
+        // Charged whether or not this process is a tail: on anything else it is
+        // zero, and a zero that is measured beats a branch that hides it.
+        let t_recv = t_rv.elapsed().as_secs_f64();
 
-    // A prefill per slot, then one decode pass per token per slot. With no
-    // slot lane `prefill_passes` is 1 and `is_decode` is the `step > 0` this
-    // replaces, character for character.
-    let prefill_passes = if slot_lane { total_slots } else { 1 };
-    let is_decode = step >= prefill_passes;
-    // Which cohort this pass advances. Over the prefills it is the cohort the
-    // slot being seated belongs to -- they are filled cohort by cohort -- and
-    // over the decode the cohorts take turns, which IS the interleave. Both
-    // ends derive it from the same step counter, and the head puts it on the
-    // wire as well so a pair that ever disagreed says so.
-    let coh = if !slot_lane {
-        0
-    } else if is_decode {
-        (step - prefill_passes) % ncohorts
-    } else {
-        step / nslots
-    };
-    if let Some((_, _, wc, _)) = incoming.as_ref() {
-        anyhow::ensure!(
-            *wc == coh,
-            "the head sent cohort {wc} where this tail was about to read cohort {coh}'s keys"
-        );
-    }
-
-    let pass = Instant::now();
-    let io0 = io_read_bytes();
-    cp.io_reset();
-    // Same scope as the loader counters, for the same reason: the report below
-    // says "this ONE pass", and a bind total that accumulated across passes
-    // would silently make it say something else.
-    #[cfg(feature = "inkling-cuda")]
-    if let Some(al) = fp4_aliases.as_ref() {
-        al.stats_reset();
-    }
-    // With a cache, every pass past the prefill feeds exactly the token the
-    // previous pass produced; without one, the whole prefix goes through again.
-    // `pos0` is that token's ABSOLUTE position, which is what log scaling and
-    // the relative bias are functions of -- it is only equal to zero on a pass
-    // that starts from the beginning.
-    let (feed, pos0): (Vec<usize>, usize) = if slot_lane && is_decode {
-        // One row per slot: the token that slot's own previous pass produced.
-        // Every slot stands at the same absolute position because they were
-        // prefilled with prompts of the same length and have advanced together
-        // ever since -- see [`dev_lane::SlotCache`] for what that buys.
-        // This cohort's slots and no other's. Every slot of a cohort stands at
-        // the same absolute position; two cohorts do NOT, because they take
-        // turns, so `pos0` is read off this cohort's own slot 0.
-        let base = coh * nslots;
-        (
-            slot_ids[base..base + nslots]
-                .iter()
-                .map(|q| *q.last().expect("every slot's prefill produced a token"))
-                .collect(),
-            slot_ids[base].len() - 1,
-        )
-    } else if slot_lane {
-        (slot_ids[step].clone(), 0)
-    } else if kv && step > 0 {
-        // The verify batch: the token the last pass confirmed, then the tail's
-        // drafts for the positions after it. `drafts_in` is empty unless this
-        // is a speculating head, so the non-speculative shape is the same one
-        // row it always was.
-        let mut f = vec![*ids.last().expect("a step past the prefill has produced a token")];
-        f.extend(drafts_in.iter().copied());
-        // The width probe's filler. Drawn from a counter rather than from the
-        // sequence: a batch of the same token routes to the same eight experts
-        // and would price the expert stream once for the whole batch, which is
-        // the one thing the probe exists to find out.
-        let mut lcg = 0x9E3779B97F4A7C15u64 ^ (step as u64).wrapping_mul(0x100000001B3);
-        for _ in 1..width {
-            lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            f.push(((lcg >> 33) as usize) % t.vocab_size);
+        // A prefill per slot, then one decode pass per token per slot. With no
+        // slot lane `prefill_passes` is 1 and `is_decode` is the `step > 0` this
+        // replaces, character for character.
+        let prefill_passes = if slot_lane { total_slots } else { 1 };
+        let is_decode = step >= prefill_passes;
+        // Which cohort this pass advances. Over the prefills it is the cohort the
+        // slot being seated belongs to -- they are filled cohort by cohort -- and
+        // over the decode the cohorts take turns, which IS the interleave. Both
+        // ends derive it from the same step counter, and the head puts it on the
+        // wire as well so a pair that ever disagreed says so.
+        let coh = if !slot_lane {
+            0
+        } else if is_decode {
+            (step - prefill_passes) % ncohorts
+        } else {
+            step / nslots
+        };
+        if let Some((_, _, wc, _)) = incoming.as_ref() {
+            anyhow::ensure!(
+                *wc == coh,
+                "the head sent cohort {wc} where this tail was about to read cohort {coh}'s keys"
+            );
         }
-        (f, ids.len() - 1)
-    } else {
-        (ids.clone(), 0)
-    };
-    // The tail is handed the stream the head already embedded and ran; it takes
-    // `n` and `pos0` from the wire rather than from `ids`, because those are
-    // facts about the pass and only the head owns the token loop.
-    let t_emb = Instant::now();
-    let (n, pos0, x_in) = match incoming {
-        Some((n, p, _c, x)) => (n, p, x),
-        None => {
-            let n = feed.len();
-            let e_w = embed_w.as_ref().expect("the head owns the embedding table");
-            let e_n = embed_n.as_ref().expect("the head owns the embedding norm");
-            (n, pos0, embed_and_norm_bf16(&feed, e_w, &e_n.data, t.rms_norm_eps, t.vocab_size, h))
+
+        let pass = Instant::now();
+        let io0 = io_read_bytes();
+        cp.io_reset();
+        // Same scope as the loader counters, for the same reason: the report below
+        // says "this ONE pass", and a bind total that accumulated across passes
+        // would silently make it say something else.
+        #[cfg(feature = "inkling-cuda")]
+        if let Some(al) = fp4_aliases.as_ref() {
+            al.stats_reset();
         }
-    };
-    fatal::note_tokens(n);
-
-    let dump_dir = std::env::var("INK_DUMP_DIR").ok();
-    if let Some(dir) = dump_dir.as_ref() {
-        std::fs::create_dir_all(dir)?;
-        let mut bytes = Vec::with_capacity(x_in.len() * 4);
-        for v in &x_in {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        std::fs::write(format!("{dir}/h_embed.bin"), &bytes)?;
-    }
-
-    // THE upload. One per pass -- 16 KB a token -- and from here to the end of
-    // this node's layers the residual stream does not touch the host again.
-    //
-    // A head embeds and uploads; a tail uploads what came off the wire. Both
-    // are the same 16 KB, which is why the pipe crosses BETWEEN layers and not
-    // inside one.
-    // At the dtype the residual stream is held in. On the narrow lane the
-    // upload is still f32 -- the embedding is host work and the wire is f32 --
-    // and this is the one cast that pays for the whole stack staying narrow.
-    let mut xd: T2 = dev_lane_resid::as_resid(up2::<Bk>(x_in, n, h, &dev));
-    let t_embed = t_emb.elapsed().as_secs_f64();
-
-    let ls = LogScaling {
-        n_floor: t.log_scaling_n_floor as f32,
-        alpha: t.log_scaling_alpha as f32,
-    };
-    #[allow(unused_assignments)]
-    let mut expert_loads = 0usize;
-    let (mut t_attn, mut t_expert, mut t_other, mut t_shared) = (0f64, 0f64, 0f64, 0f64);
-    // The attention half at its two host-side seams: reading+widening the ten
-    // projections out of the source, and getting them onto the device. What is
-    // left over is device work. The sync after the uploads is what makes the
-    // second number a TRANSFER rather than an enqueue.
-    #[allow(unused_mut)]
-    let (mut t_attn_read, mut t_attn_up) = (0f64, 0f64);
-    // Reading a tensor out of the mapping and widening BF16 to f32 is host work
-    // no lane can move, so it is counted once, separately, rather than being
-    // smeared across whichever bucket happened to ask for the weight.
-    let t_read = std::cell::Cell::new(0f64);
-    // Host-side and therefore honestly attributable, unlike anything downstream
-    // of an enqueued device call.
-    let mut host_t = HostT::default();
-    // The scalar host arithmetic in the block itself, which no timer above
-    // covers because it is not "the attention half" or "the expert lane" -- it
-    // is the connective tissue between them, and connective tissue that runs on
-    // a CPU is a host path in the data plane.
-    // `t_h_norm` and `t_h_resid` have no writer any more and that is the point:
-    // they are printed, they read zero, and a zero that is measured is worth
-    // more than a claim that is asserted.
-    let (t_h_norm, mut t_h_route, mut t_h_sconv, t_h_resid) = (0f64, 0f64, 0f64, 0f64);
-    // The router bucket, split three ways. It used to be one number, and one
-    // number cannot distinguish "the matmul was described" from "the host waited
-    // for every kernel this layer had already issued" from "the top-k ran on a
-    // CPU". At decode the whole bucket is the middle one, and that is only
-    // visible once the other two are subtracted out.
-    let (mut t_rt_mm, mut t_rt_read, mut t_rt_host) = (0f64, 0f64, 0f64);
-    // `INK_STAGE_SYNC=1` inserts an explicit device sync at each stage boundary
-    // in the block and charges the wait to that stage. It is OPT-IN and off by
-    // default because it SERIALISES the lane: with it on the pass is slower, and
-    // the comparison that matters is probe-on-total against probe-off-total.
-    // It changes no arithmetic -- a sync is a wait, not an operation -- so both
-    // arms emit the same tokens, which is itself checked below.
-    let stage_sync = std::env::var("INK_STAGE_SYNC").map(|v| v == "1").unwrap_or(false);
-    // `INK_MEM_TRACE=1`: the device pool's live bytes after each stage of each
-    // layer, which is the only way to find out WHICH stage holds the peak
-    // rather than to model it.
-    //
-    // It exists because the model was wrong. A prefill's largest buffers were
-    // taken to be attention's `[heads, n, head_dim]` activations, and the
-    // routed-expert lane -- which gathers `k * n` rows of the residual stream
-    // and runs them through two `[k * n, 4096]` intermediates -- is several
-    // times larger at every length. A number that has to be inferred from the
-    // source is a number nobody checks; this one is read off the allocator.
-    //
-    // It SYNCS, so a traced pass is slower than an untraced one and the timings
-    // beside it are not the pass's. It reports memory, not time.
-    let mem_trace = mem_trace();
-    // Between-layer cleanup is a POLICY now, not an off switch. It was chosen
-    // once before any context or worker existed, and the same value is printed
-    // in the header above. See
-    // `super::pool` for why the argument that kept it off -- a decode step pays
-    // an allocation per layer per token for a reservation that is already small
-    // -- is an argument for asking what the pass is, which the pass knows.
-    // How many of this pass's layers actually handed pages back. Printed, so
-    // that "the policy took the cheap branch" is a number in the log rather
-    // than an inference from the absence of one.
-    let mut cleanups = 0usize;
-    let (mut d_attn, mut d_router, mut d_expert, mut d_shared, mut d_tail) =
-        (0f64, 0f64, 0f64, 0f64, 0f64);
-    let mut stage_syncs = 0usize;
-
-    // Per-layer diagnostics, COLLECTED rather than printed inside the loop.
-    //
-    // The RMS of the residual stream after each layer used to be computed on
-    // the host, from a `Vec<f32>` the loop had anyway. It does not have one any
-    // more, and reading `x` back per layer to print a number would reintroduce
-    // exactly the round trip this change removes -- forty of them a token, to
-    // produce a log line. So each layer enqueues its own reduction and the
-    // whole column is read once, after the stack, in a single `cat`.
-    //
-    // The per-layer WALL TIME went with it, and its absence is the honest
-    // report: with nothing synchronising inside the loop, "how long did layer
-    // 17 take" is not a question the host can answer. It would have measured
-    // enqueueing.
-    let mut layer_rms: Vec<T2> = Vec::with_capacity(hi - lo);
-    let mut layer_kind: Vec<(usize, bool)> = Vec::with_capacity(hi - lo);
-
-    // One sync, charged to one stage. Written as a macro rather than a closure
-    // because every call site names a different accumulator and a closure would
-    // have to borrow all five of them mutably at once.
-    macro_rules! stage_sync {
-        ($acc:expr, $lay:expr, $tag:expr) => {
-            if stage_sync {
-                let s = Instant::now();
-                <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("stage sync");
-                $acc += s.elapsed().as_secs_f64();
-                stage_syncs += 1;
+        // With a cache, every pass past the prefill feeds exactly the token the
+        // previous pass produced; without one, the whole prefix goes through again.
+        // `pos0` is that token's ABSOLUTE position, which is what log scaling and
+        // the relative bias are functions of -- it is only equal to zero on a pass
+        // that starts from the beginning.
+        let (feed, pos0): (Vec<usize>, usize) = if slot_lane && is_decode {
+            // One row per slot: the token that slot's own previous pass produced.
+            // Every slot stands at the same absolute position because they were
+            // prefilled with prompts of the same length and have advanced together
+            // ever since -- see [`dev_lane::SlotCache`] for what that buys.
+            // This cohort's slots and no other's. Every slot of a cohort stands at
+            // the same absolute position; two cohorts do NOT, because they take
+            // turns, so `pos0` is read off this cohort's own slot 0.
+            let base = coh * nslots;
+            (
+                slot_ids[base..base + nslots]
+                    .iter()
+                    .map(|q| *q.last().expect("every slot's prefill produced a token"))
+                    .collect(),
+                slot_ids[base].len() - 1,
+            )
+        } else if slot_lane {
+            (slot_ids[step].clone(), 0)
+        } else if kv && step > 0 {
+            // The verify batch: the token the last pass confirmed, then the tail's
+            // drafts for the positions after it. `drafts_in` is empty unless this
+            // is a speculating head, so the non-speculative shape is the same one
+            // row it always was.
+            let mut f = vec![*ids
+                .last()
+                .expect("a step past the prefill has produced a token")];
+            f.extend(drafts_in.iter().copied());
+            // The width probe's filler. Drawn from a counter rather than from the
+            // sequence: a batch of the same token routes to the same eight experts
+            // and would price the expert stream once for the whole batch, which is
+            // the one thing the probe exists to find out.
+            let mut lcg = 0x9E3779B97F4A7C15u64 ^ (step as u64).wrapping_mul(0x100000001B3);
+            for _ in 1..width {
+                lcg = lcg
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                f.push(((lcg >> 33) as usize) % t.vocab_size);
             }
-            // `INK_POOL_CLEANUP=stage`: four internal hand-backs here, then
-            // the tail boundary below after its always-on RMS diagnostic has
-            // released its full-width temporary. That is five syncs on a
-            // routed layer, not five here plus a duplicate sixth at the end.
-            if cleanup.at_stage() && $tag != "tail" {
-                <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("stage cleanup sync");
-                fp4_client.memory_cleanup();
-            }
-            if mem_trace {
-                <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("mem trace sync");
-                println!(
-                    "{}",
-                    mary::models::inkling::seam::pool_line(
-                        &fp4_client,
-                        &format!("L{} {}", $lay, $tag)
-                    )
-                );
+            (f, ids.len() - 1)
+        } else {
+            (ids.clone(), 0)
+        };
+        // The tail is handed the stream the head already embedded and ran; it takes
+        // `n` and `pos0` from the wire rather than from `ids`, because those are
+        // facts about the pass and only the head owns the token loop.
+        let t_emb = Instant::now();
+        let (n, pos0, x_in) = match incoming {
+            Some((n, p, _c, x)) => (n, p, x),
+            None => {
+                let n = feed.len();
+                let e_w = embed_w.as_ref().expect("the head owns the embedding table");
+                let e_n = embed_n.as_ref().expect("the head owns the embedding norm");
+                (
+                    n,
+                    pos0,
+                    embed_and_norm_bf16(&feed, e_w, &e_n.data, t.rms_norm_eps, t.vocab_size, h),
+                )
             }
         };
-    }
+        fatal::note_tokens(n);
 
-    for layer in lo..hi {
-        // Cache slot, not layer number. A tail running 20..42 keeps 22 caches
-        // and its first layer is its slot 0 — indexing by the absolute layer
-        // would walk off the end of a Vec that only ever holds this node's half.
-        let slot = layer - lo;
-        let kind = t.attn_kind(layer);
-        let is_local = kind == AttnKind::Local;
-        let (heads, kv_heads, head_dim) = t.heads(kind);
-        let p = format!("model.llm.layers.{layer}.");
-        // ONE accessor now. `g` used to exist beside it, holding an f32 copy on
-        // the host for the host lanes to read; there are no host lanes left in
-        // this loop, so every weight is read once, uploaded, and the host copy
-        // dropped.
-        let gv = |nm: &str| -> Result<Vec<f32>> {
-            let s = Instant::now();
-            let r = cp.tensor(&format!("{p}{nm}"))?.data;
-            t_read.set(t_read.get() + s.elapsed().as_secs_f64());
-            Ok(r)
-        };
+        let dump_dir = std::env::var("INK_DUMP_DIR").ok();
+        if let Some(dir) = dump_dir.as_ref() {
+            std::fs::create_dir_all(dir)?;
+            let mut bytes = Vec::with_capacity(x_in.len() * 4);
+            for v in &x_in {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            std::fs::write(format!("{dir}/h_embed.bin"), &bytes)?;
+        }
 
-        // ---- this layer's weights, on the device, built once ---------------
+        // THE upload. One per pass -- 16 KB a token -- and from here to the end of
+        // this node's layers the residual stream does not touch the host again.
         //
-        // Everything the block multiplies by: the ten attention projections,
-        // BOTH short convolutions, BOTH norm gains and the router matrix. The
-        // norms and the mlp short convolution used to be read per token as
-        // host `Vec<f32>` because the operations that consumed them were host
-        // operations. They are not any more, so they join the rest.
-        if !layers_dev.contains_key(&p) {
-            let r0 = t_read.get();
-            let t_w0 = Instant::now();
-            // The five projections bind as the BF16 the pile stores. `gv`
-            // widens to f32 on the way out of the mapping and would double
-            // every one of them on the device for nothing: `mma.sync…bf16`
-            // takes the stored bytes, and where those bytes are inside a
-            // registered mapping `bind_bf16` aliases them instead of copying.
-            let pw = |nm: &str, rows: usize, cols: usize| -> Result<Bf16W> {
+        // A head embeds and uploads; a tail uploads what came off the wire. Both
+        // are the same 16 KB, which is why the pipe crosses BETWEEN layers and not
+        // inside one.
+        // At the dtype the residual stream is held in. On the narrow lane the
+        // upload is still f32 -- the embedding is host work and the wire is f32 --
+        // and this is the one cast that pays for the whole stack staying narrow.
+        let mut xd: T2 = dev_lane_resid::as_resid(up2::<Bk>(x_in, n, h, &dev));
+        let t_embed = t_emb.elapsed().as_secs_f64();
+
+        let ls = LogScaling {
+            n_floor: t.log_scaling_n_floor as f32,
+            alpha: t.log_scaling_alpha as f32,
+        };
+        #[allow(unused_assignments)]
+        let mut expert_loads = 0usize;
+        let (mut t_attn, mut t_expert, mut t_other, mut t_shared) = (0f64, 0f64, 0f64, 0f64);
+        // The attention half at its two host-side seams: reading+widening the ten
+        // projections out of the source, and getting them onto the device. What is
+        // left over is device work. The sync after the uploads is what makes the
+        // second number a TRANSFER rather than an enqueue.
+        #[allow(unused_mut)]
+        let (mut t_attn_read, mut t_attn_up) = (0f64, 0f64);
+        // Reading a tensor out of the mapping and widening BF16 to f32 is host work
+        // no lane can move, so it is counted once, separately, rather than being
+        // smeared across whichever bucket happened to ask for the weight.
+        let t_read = std::cell::Cell::new(0f64);
+        // Host-side and therefore honestly attributable, unlike anything downstream
+        // of an enqueued device call.
+        let mut host_t = HostT::default();
+        // The scalar host arithmetic in the block itself, which no timer above
+        // covers because it is not "the attention half" or "the expert lane" -- it
+        // is the connective tissue between them, and connective tissue that runs on
+        // a CPU is a host path in the data plane.
+        // `t_h_norm` and `t_h_resid` have no writer any more and that is the point:
+        // they are printed, they read zero, and a zero that is measured is worth
+        // more than a claim that is asserted.
+        let (t_h_norm, mut t_h_route, mut t_h_sconv, t_h_resid) = (0f64, 0f64, 0f64, 0f64);
+        // The router bucket, split three ways. It used to be one number, and one
+        // number cannot distinguish "the matmul was described" from "the host waited
+        // for every kernel this layer had already issued" from "the top-k ran on a
+        // CPU". At decode the whole bucket is the middle one, and that is only
+        // visible once the other two are subtracted out.
+        let (mut t_rt_mm, mut t_rt_read, mut t_rt_host) = (0f64, 0f64, 0f64);
+        // `INK_STAGE_SYNC=1` inserts an explicit device sync at each stage boundary
+        // in the block and charges the wait to that stage. It is OPT-IN and off by
+        // default because it SERIALISES the lane: with it on the pass is slower, and
+        // the comparison that matters is probe-on-total against probe-off-total.
+        // It changes no arithmetic -- a sync is a wait, not an operation -- so both
+        // arms emit the same tokens, which is itself checked below.
+        let stage_sync = std::env::var("INK_STAGE_SYNC")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        // `INK_MEM_TRACE=1`: the device pool's live bytes after each stage of each
+        // layer, which is the only way to find out WHICH stage holds the peak
+        // rather than to model it.
+        //
+        // It exists because the model was wrong. A prefill's largest buffers were
+        // taken to be attention's `[heads, n, head_dim]` activations, and the
+        // routed-expert lane -- which gathers `k * n` rows of the residual stream
+        // and runs them through two `[k * n, 4096]` intermediates -- is several
+        // times larger at every length. A number that has to be inferred from the
+        // source is a number nobody checks; this one is read off the allocator.
+        //
+        // It SYNCS, so a traced pass is slower than an untraced one and the timings
+        // beside it are not the pass's. It reports memory, not time.
+        let mem_trace = mem_trace();
+        // Between-layer cleanup is a POLICY now, not an off switch. It was chosen
+        // once before any context or worker existed, and the same value is printed
+        // in the header above. See
+        // `super::pool` for why the argument that kept it off -- a decode step pays
+        // an allocation per layer per token for a reservation that is already small
+        // -- is an argument for asking what the pass is, which the pass knows.
+        // How many of this pass's layers actually handed pages back. Printed, so
+        // that "the policy took the cheap branch" is a number in the log rather
+        // than an inference from the absence of one.
+        let mut cleanups = 0usize;
+        let (mut d_attn, mut d_router, mut d_expert, mut d_shared, mut d_tail) =
+            (0f64, 0f64, 0f64, 0f64, 0f64);
+        let mut stage_syncs = 0usize;
+
+        // Per-layer diagnostics, COLLECTED rather than printed inside the loop.
+        //
+        // The RMS of the residual stream after each layer used to be computed on
+        // the host, from a `Vec<f32>` the loop had anyway. It does not have one any
+        // more, and reading `x` back per layer to print a number would reintroduce
+        // exactly the round trip this change removes -- forty of them a token, to
+        // produce a log line. So each layer enqueues its own reduction and the
+        // whole column is read once, after the stack, in a single `cat`.
+        //
+        // The per-layer WALL TIME went with it, and its absence is the honest
+        // report: with nothing synchronising inside the loop, "how long did layer
+        // 17 take" is not a question the host can answer. It would have measured
+        // enqueueing.
+        let mut layer_rms: Vec<T2> = Vec::with_capacity(hi - lo);
+        let mut layer_kind: Vec<(usize, bool)> = Vec::with_capacity(hi - lo);
+
+        // One sync, charged to one stage. Written as a macro rather than a closure
+        // because every call site names a different accumulator and a closure would
+        // have to borrow all five of them mutably at once.
+        macro_rules! stage_sync {
+            ($acc:expr, $lay:expr, $tag:expr) => {
+                if stage_sync {
+                    let s = Instant::now();
+                    <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("stage sync");
+                    $acc += s.elapsed().as_secs_f64();
+                    stage_syncs += 1;
+                }
+                // `INK_POOL_CLEANUP=stage`: four internal hand-backs here, then
+                // the tail boundary below after its always-on RMS diagnostic has
+                // released its full-width temporary. That is five syncs on a
+                // routed layer, not five here plus a duplicate sixth at the end.
+                if cleanup.at_stage() && $tag != "tail" {
+                    <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("stage cleanup sync");
+                    fp4_client.memory_cleanup();
+                }
+                if mem_trace {
+                    <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("mem trace sync");
+                    println!(
+                        "{}",
+                        mary::models::inkling::seam::pool_line(
+                            &fp4_client,
+                            &format!("L{} {}", $lay, $tag)
+                        )
+                    );
+                }
+            };
+        }
+
+        for layer in lo..hi {
+            // Cache slot, not layer number. A tail running 20..42 keeps 22 caches
+            // and its first layer is its slot 0 — indexing by the absolute layer
+            // would walk off the end of a Vec that only ever holds this node's half.
+            let slot = layer - lo;
+            let kind = t.attn_kind(layer);
+            let is_local = kind == AttnKind::Local;
+            let (heads, kv_heads, head_dim) = t.heads(kind);
+            let p = format!("model.llm.layers.{layer}.");
+            // ONE accessor now. `g` used to exist beside it, holding an f32 copy on
+            // the host for the host lanes to read; there are no host lanes left in
+            // this loop, so every weight is read once, uploaded, and the host copy
+            // dropped.
+            let gv = |nm: &str| -> Result<Vec<f32>> {
                 let s = Instant::now();
-                let leaf = cp.stored(&format!("{p}{nm}"))?;
-                anyhow::ensure!(
-                    leaf.elem == Elem::Bf16,
-                    "{p}{nm} is {:?}; this lane multiplies BF16 by BF16",
-                    leaf.elem
-                );
+                let r = cp.tensor(&format!("{p}{nm}"))?.data;
                 t_read.set(t_read.get() + s.elapsed().as_secs_f64());
-                Ok(bind_bf16(&fp4_client, fp4_aliases.as_ref(), &leaf.bytes, rows, cols))
+                Ok(r)
             };
-            let attn = dev_lane::AttnWeightsDev {
-                wq: pw("attn.wq_du.weight", heads * head_dim, h)?,
-                wk: pw("attn.wk_dv.weight", kv_heads * head_dim, h)?,
-                wv: pw("attn.wv_dv.weight", kv_heads * head_dim, h)?,
-                wr: pw("attn.wr_du.weight", heads * t.d_rel, h)?,
-                wo: pw("attn.wo_ud.weight", h, heads * head_dim)?,
-                k_sconv: up2(gv("attn.k_sconv.weight")?, kv_heads * head_dim, t.sconv_kernel_size, &dev),
-                v_sconv: up2(gv("attn.v_sconv.weight")?, kv_heads * head_dim, t.sconv_kernel_size, &dev),
-                q_norm: up1(gv("attn.q_norm.weight")?, head_dim, &dev),
-                k_norm: up1(gv("attn.k_norm.weight")?, head_dim, &dev),
-                rel_proj: up2(gv("attn.rel_logits_proj.proj")?, t.d_rel, t.rel_span(kind), &dev),
-            };
-            let router = if t.is_dense(layer) {
-                None
-            } else {
-                let rows = t.n_routed_experts + t.n_shared_experts;
-                // `gv` widens on the way out of the mapping, so the BF16 arm
-                // must not call it for the projection at all -- that read IS the
-                // widening. It takes `stored` instead, like the five attention
-                // projections beside it.
-                let proj = match router_arm {
-                    RouterArm::Transpose => {
-                        RouterProj::PerCall(up2(gv("mlp.gate.weight")?, rows, h, &dev))
-                    }
-                    // Transposed HERE, on the host, once per layer for the run,
-                    // instead of on the device once per token per layer.
-                    RouterArm::Pre => RouterProj::Pre(up2(
-                        transpose_rows(&gv("mlp.gate.weight")?, rows, h),
-                        h,
+
+            // ---- this layer's weights, on the device, built once ---------------
+            //
+            // Everything the block multiplies by: the ten attention projections,
+            // BOTH short convolutions, BOTH norm gains and the router matrix. The
+            // norms and the mlp short convolution used to be read per token as
+            // host `Vec<f32>` because the operations that consumed them were host
+            // operations. They are not any more, so they join the rest.
+            if !layers_dev.contains_key(&p) {
+                let r0 = t_read.get();
+                let t_w0 = Instant::now();
+                // The five projections bind as the BF16 the pile stores. `gv`
+                // widens to f32 on the way out of the mapping and would double
+                // every one of them on the device for nothing: `mma.sync…bf16`
+                // takes the stored bytes, and where those bytes are inside a
+                // registered mapping `bind_bf16` aliases them instead of copying.
+                let pw = |nm: &str, rows: usize, cols: usize| -> Result<Bf16W> {
+                    let s = Instant::now();
+                    let leaf = cp.stored(&format!("{p}{nm}"))?;
+                    anyhow::ensure!(
+                        leaf.elem == Elem::Bf16,
+                        "{p}{nm} is {:?}; this lane multiplies BF16 by BF16",
+                        leaf.elem
+                    );
+                    t_read.set(t_read.get() + s.elapsed().as_secs_f64());
+                    Ok(bind_bf16(
+                        &fp4_client,
+                        fp4_aliases.as_ref(),
+                        &leaf.bytes,
                         rows,
+                        cols,
+                    ))
+                };
+                let attn = dev_lane::AttnWeightsDev {
+                    wq: pw("attn.wq_du.weight", heads * head_dim, h)?,
+                    wk: pw("attn.wk_dv.weight", kv_heads * head_dim, h)?,
+                    wv: pw("attn.wv_dv.weight", kv_heads * head_dim, h)?,
+                    wr: pw("attn.wr_du.weight", heads * t.d_rel, h)?,
+                    wo: pw("attn.wo_ud.weight", h, heads * head_dim)?,
+                    k_sconv: up2(
+                        gv("attn.k_sconv.weight")?,
+                        kv_heads * head_dim,
+                        t.sconv_kernel_size,
                         &dev,
-                    )),
-                    RouterArm::Bf16 => {
-                        use mary::models::inkling::bf16gemm::NTILE;
-                        let s = Instant::now();
-                        let leaf = cp.stored(&format!("{p}mlp.gate.weight"))?;
-                        anyhow::ensure!(
+                    ),
+                    v_sconv: up2(
+                        gv("attn.v_sconv.weight")?,
+                        kv_heads * head_dim,
+                        t.sconv_kernel_size,
+                        &dev,
+                    ),
+                    q_norm: up1(gv("attn.q_norm.weight")?, head_dim, &dev),
+                    k_norm: up1(gv("attn.k_norm.weight")?, head_dim, &dev),
+                    rel_proj: up2(
+                        gv("attn.rel_logits_proj.proj")?,
+                        t.d_rel,
+                        t.rel_span(kind),
+                        &dev,
+                    ),
+                };
+                let router = if t.is_dense(layer) {
+                    None
+                } else {
+                    let rows = t.n_routed_experts + t.n_shared_experts;
+                    // `gv` widens on the way out of the mapping, so the BF16 arm
+                    // must not call it for the projection at all -- that read IS the
+                    // widening. It takes `stored` instead, like the five attention
+                    // projections beside it.
+                    let proj = match router_arm {
+                        RouterArm::Transpose => {
+                            RouterProj::PerCall(up2(gv("mlp.gate.weight")?, rows, h, &dev))
+                        }
+                        // Transposed HERE, on the host, once per layer for the run,
+                        // instead of on the device once per token per layer.
+                        RouterArm::Pre => RouterProj::Pre(up2(
+                            transpose_rows(&gv("mlp.gate.weight")?, rows, h),
+                            h,
+                            rows,
+                            &dev,
+                        )),
+                        RouterArm::Bf16 => {
+                            use mary::models::inkling::bf16gemm::NTILE;
+                            let s = Instant::now();
+                            let leaf = cp.stored(&format!("{p}mlp.gate.weight"))?;
+                            anyhow::ensure!(
                             leaf.elem == Elem::Bf16,
                             "{p}mlp.gate.weight is {:?}; INK_ROUTER=bf16 multiplies the STORED \
                              BF16 and will not widen to reach an element type",
                             leaf.elem
                         );
-                        // Six zero rows so 258 tiles as n8. They produce logits
-                        // the host slices off; they are a pad, not a widening.
-                        let pad = rows.div_ceil(NTILE) * NTILE;
-                        let mut bytes = vec![0u8; pad * h * 2];
-                        bytes[..rows * h * 2].copy_from_slice(&leaf.bytes);
-                        t_read.set(t_read.get() + s.elapsed().as_secs_f64());
-                        RouterProj::Bf16 {
-                            w: bind_bf16(&fp4_client, fp4_aliases.as_ref(), &bytes, pad, h),
-                        }
-                    }
-                };
-                // Held only under the diff probe, and it is the arm every run
-                // before 969bf6f shipped -- the thing the new arm has to be
-                // compared AGAINST, not a second opinion invented for the
-                // occasion.
-                let reference = if router_diff {
-                    Some(up2(gv("mlp.gate.weight")?, rows, h, &dev))
-                } else {
-                    None
-                };
-                Some(RouterDev {
-                    proj,
-                    reference,
-                    bias: gv("mlp.gate.bias")?,
-                    global_scale: gv("mlp.gate.global_scale")?[0],
-                })
-            };
-            let built = LayerDev {
-                attn,
-                attn_sconv: up2(gv("attn_sconv.weight")?, h, t.sconv_kernel_size, &dev),
-                mlp_sconv: up2(gv("mlp_sconv.weight")?, h, t.sconv_kernel_size, &dev),
-                attn_norm: up1(gv("attn_norm.weight")?, h, &dev),
-                mlp_norm: up1(gv("mlp_norm.weight")?, h, &dev),
-                router,
-            };
-            <Bk as burn::tensor::backend::Backend>::sync(&dev)
-                .expect("sync after the layer uploads");
-            let span = t_w0.elapsed().as_secs_f64();
-            let rd = t_read.get() - r0;
-            t_attn_read += rd;
-            t_attn_up += span - rd;
-            // Two bytes for the projections and four for the rest, because that
-            // is now what is on the device. Counting the projections at four
-            // would report the widening this commit removed.
-            dattn_bytes += (2 * (heads * head_dim * h
-                + 2 * kv_heads * head_dim * h
-                + heads * t.d_rel * h
-                + h * heads * head_dim)
-                + 4 * (2 * kv_heads * head_dim * t.sconv_kernel_size
-                    + 2 * head_dim
-                    + t.d_rel * t.rel_span(kind)
-                    + 2 * h * t.sconv_kernel_size
-                    + 2 * h)) as u64;
-            layers_dev.insert(p.clone(), built);
-        }
-        let ld = layers_dev.get(&p).expect("inserted directly above");
-
-        // ---- attention ----------------------------------------------------
-        let t_a = Instant::now();
-        let hn = dev_lane_resid::rms_norm(xd.clone(), ld.attn_norm.clone(), t.rms_norm_eps);
-        let dims = AttnDims {
-            hidden: h, heads, kv_heads, head_dim,
-            d_rel: t.d_rel,
-            rel_extent: t.rel_span(kind),
-            kernel: t.sconv_kernel_size,
-            rms_eps: t.rms_norm_eps,
-            kind,
-        };
-        // The same distinction the mask carries, in the form the cache needs:
-        // how far back a query may look, and therefore how much of the cache
-        // can never be read again.
-        let window = if is_local { Some(t.sliding_window_size) } else { None };
-        let a = if slot_lane && is_decode {
-            // b sequences, one position each, one pass. `attention_steps` is
-            // the wrong function here and not by a little: its rows are
-            // consecutive positions of ONE sequence and its mask admits every
-            // earlier row of the batch, which for independent slots is exactly
-            // the contamination this lane exists to make impossible.
-            let y = dev_lane::attention_slots(
-                hn, &ld.attn, &dims, Some(ls), pos0, window, &mut slots_dev[coh][slot].attn,
-            );
-            let (out, hist) = dev_lane::short_conv_slot_step(
-                slots_dev[coh][slot].attn_sconv.clone(), y, ld.attn_sconv.clone(),
-            );
-            slots_dev[coh][slot].attn_sconv = hist;
-            out
-        } else if kv && is_decode && n > 1 {
-            // The speculative width. `attention_steps` leaves the batch PENDING
-            // and the convolution keeps its whole window, so neither is final
-            // until the verifier below says how many rows survived. Nothing
-            // here knows that yet -- the answer is a machine away.
-            let y = dev_lane::attention_steps(
-                hn, &ld.attn, &dims, Some(ls), pos0, window, &mut caches[slot].attn,
-            );
-            let (out, all) = dev_lane::short_conv_steps(
-                caches[slot].attn_sconv.clone(), y, ld.attn_sconv.clone(),
-            );
-            caches[slot].attn_sconv_pending = Some(all);
-            out
-        } else if kv && is_decode {
-            let y = dev_lane::attention_step(
-                hn, &ld.attn, &dims, Some(ls), pos0, window, &mut caches[slot].attn,
-            );
-            let (out, hist) =
-                dev_lane::short_conv_step(caches[slot].attn_sconv.clone(), y, ld.attn_sconv.clone());
-            caches[slot].attn_sconv = hist;
-            out
-        } else if kv {
-            let (y, attn) = dev_lane::attention_prefill(
-                hn, &ld.attn, &dims, Some(ls), window, window,
-            );
-            let hist = dev_lane::conv_history(y.clone(), t.sconv_kernel_size);
-            let out = dev_lane::short_conv(y, ld.attn_sconv.clone());
-            caches.push(LayerCache {
-                attn,
-                attn_sconv: hist,
-                mlp_sconv: None,
-                attn_sconv_pending: None,
-                mlp_sconv_pending: None,
-            });
-            out
-        } else {
-            let y = dev_lane::attention(hn, &ld.attn, &dims, Some(ls), window);
-            dev_lane::short_conv(y, ld.attn_sconv.clone())
-        };
-        xd = dev_lane_resid::add_resid(xd, a);
-
-        stage_sync!(d_attn, layer, "attn");
-        // ---- MLP ----------------------------------------------------------
-        t_attn += t_a.elapsed().as_secs_f64();
-        let t_o = Instant::now();
-        let hn = dev_lane_resid::rms_norm(xd.clone(), ld.mlp_norm.clone(), t.rms_norm_eps);
-
-        let y = if t.is_dense(layer) {
-            // Device-resident: uploaded on the first token that reaches this
-            // layer and held for the run. The host reference that used to sit
-            // beside it (`host_dense`, selected by leaving `INK_DENSE` unset)
-            // was a scalar f32 lane over a 537 MB weight; it is not a lane a
-            // 276 B model has any use for, and being selectable is how it got
-            // run by accident.
-            let w = ddense.dense_for(&cp, &fp4_client, fp4_aliases.as_ref(), &p, h)?;
-            dense_mlp_bf16(hn, w)
-        } else {
-            let inter = t.intermediate_size;
-            let r = ld.router.as_ref().expect("a MoE layer has a router");
-            // The router's PROJECTION is a matmul and runs on the device; its
-            // DECISION is control plane and runs here. What crosses is one row
-            // of the chosen ids and weights on the default lane and the whole
-            // [n, 258] f32 on `INK_DEV_ROUTE=0` -- 60 bytes against 1 KB, and
-            // neither is the cost. The cost is that this read BLOCKS, and it is
-            // the only place in the layer that does.
-            //
-            // What it is worth, measured 2026-08-23 on spark-zt at
-            // `INK_KV=1 INK_LAYERS=0:16`, nine interleaved rounds of the
-            // `INK_ROUTE_STALE=1` probe against the same binary with the probe
-            // off: 55.7 -> 51.2 ms p50, i.e. 4.5 ms a token and 17.95 -> 19.53
-            // tok/s. The per-layer `BLOCKING read` bucket is 19.3 ms of that
-            // pass and only 4.5 of it is serialisation -- the rest is device
-            // time that resurfaces at the one sync (1.3 -> 5.1 ms) and host
-            // work that gets dearer once the queue runs deep. `nsys -t cuda`
-            // over the same two arms puts GPU kernel time at 41.2 ms of the
-            // pass, so the device is busy 74% of a blocking pass and 80% of a
-            // probe pass, and 41 ms is the floor either way.
-            let rows = t.n_routed_experts + t.n_shared_experts;
-            let t_rt = Instant::now();
-            // `cols` is what comes BACK, which is `rows` except on the BF16 arm,
-            // whose weight carries the instruction's n padding.
-            let (lg, cols) = match &r.proj {
-                // Two A/B arms whose weight is an f32 Burn tensor, so their
-                // matmul wants an f32 activation. `Bf16` is the lane that runs
-                // and it takes the narrow stream as it lies; these widen, and
-                // the temporary is the price of keeping an arm comparable
-                // rather than of anything on the path.
-                RouterProj::PerCall(w) => (
-                    dev_lane::linear(dev_lane_resid::from_resid(hn.clone()), w.clone()),
-                    rows,
-                ),
-                RouterProj::Pre(wt) => (
-                    dev_lane::linear_pre_t(dev_lane_resid::from_resid(hn.clone()), wt.clone()),
-                    rows,
-                ),
-                RouterProj::Bf16 { w, .. } => (dev_lane::linear_bf16(hn.clone(), w), w.n),
-            };
-            t_rt_mm += t_rt.elapsed().as_secs_f64();
-            stage_sync!(d_router, layer, "router");
-            // Two lanes, and the difference is WHERE the top-k runs, not what
-            // it decides. The host lane reads `[n, rows]` f32 back and sorts;
-            // the device lane runs `routetopk` on the logits where they already
-            // are and reads back `[n, 2k + shared + 1]`, which at 512 tokens is
-            // 30 KB against 528 KB and, more to the point, is 512 rows of
-            // 256-wide selection the host no longer walks.
-            //
-            // The reference arm below wants the full host logits, so it selects
-            // the host lane: a diagnostic that changed the lane it measures
-            // would be measuring itself.
-            let host_route = !dev_route || r.reference.is_some();
-            let routing: Vec<Routing>;
-            let mut logits: Vec<f32> = Vec::new();
-            // The probe only stands in for a decision of the same SHAPE, and it
-            // never stands in for the reference arm, which wants this pass's
-            // logits and would otherwise be handed an empty vector.
-            let stale_hit = route_stale
-                && r.reference.is_none()
-                && route_cache.get(&layer).is_some_and(|v| v.len() == n);
-            if stale_hit {
-                routing = route_cache[&layer].clone();
-            } else if host_route {
-                let t_rr = Instant::now();
-                logits = drop_pad_cols(down(lg), n, cols, rows);
-                t_rt_read += t_rr.elapsed().as_secs_f64();
-                let t_rh = Instant::now();
-                routing = route_from_logits(
-                    &logits, &r.bias, r.global_scale, t.route_scale as f32,
-                    n, t.n_routed_experts, t.n_shared_experts, t.num_experts_per_tok,
-                );
-                t_rt_host += t_rh.elapsed().as_secs_f64();
-            } else {
-                use mary::models::inkling::routetopk::router_topk_launch;
-                use mary::models::inkling::seam::{handle_of, tensor_of};
-                let k = t.num_experts_per_tok;
-                let ns = t.n_shared_experts;
-                let width = 2 * k + ns + 1;
-                let bias_h = bias_dev
-                    .entry(layer)
-                    .or_insert_with(|| fp4_client.create_from_slice(bytes_of(&r.bias)))
-                    .clone();
-                let t_rt2 = Instant::now();
-                let lg_h = handle_of(lg);
-                let out_h = router_topk_launch(
-                    &fp4_client, &lg_h, &bias_h, n, cols, t.n_routed_experts, ns, k,
-                    t.route_scale as f32 * r.global_scale,
-                );
-                t_rt_mm += t_rt2.elapsed().as_secs_f64();
-                let t_rr = Instant::now();
-                let flat = down(tensor_of(fp4_client.clone(), dev.clone(), out_h, n, width));
-                t_rt_read += t_rr.elapsed().as_secs_f64();
-                let t_rh = Instant::now();
-                let mut rs = Vec::with_capacity(n);
-                for ti in 0..n {
-                    let row = &flat[ti * width..(ti + 1) * width];
-                    let bad = row[width - 1] as u32;
-                    assert!(
-                        bad == 0,
-                        "router logit is non-finite at token {ti}, row {}",
-                        bad - 1
-                    );
-                    rs.push(Routing {
-                        experts: row[..k].iter().map(|&v| v as usize).collect(),
-                        weights: row[k..2 * k].to_vec(),
-                        shared_gammas: row[2 * k..2 * k + ns].to_vec(),
-                    });
-                }
-                routing = rs;
-                // `INK_ROUTE_DBG=1`: the SAME logits through the host rule, and
-                // a count of where the two lanes disagree. It reads the logits
-                // back and routes twice, so it is slower than either lane and
-                // is not a lane -- but it compares the two on ONE input, which
-                // is the thing two separate runs cannot do. A device router and
-                // a host router started from the same prompt part company after
-                // a few layers no matter how right they both are: the routing
-                // weights differ in the eighth decimal, the residual stream
-                // carries that forward, and a later layer has a near-tie at the
-                // top-k boundary that falls the other way. That is chaos, not
-                // error, and only a same-input comparison can tell them apart.
-                if std::env::var("INK_ROUTE_DBG").is_ok() {
-                    let hl = drop_pad_cols(
-                        down(tensor_of(fp4_client.clone(), dev.clone(), lg_h.clone(), n, cols)),
-                        n, cols, rows,
-                    );
-                    let hr = route_from_logits(
-                        &hl, &r.bias, r.global_scale, t.route_scale as f32,
-                        n, t.n_routed_experts, ns, k,
-                    );
-                    let mut bad = 0usize;
-                    let mut worst_w = 0f32;
-                    for ti in 0..n {
-                        for j in 0..k {
-                            let d = (routing[ti].weights[j] - hr[ti].weights[j]).abs();
-                            if d > worst_w {
-                                worst_w = d;
+                            // Six zero rows so 258 tiles as n8. They produce logits
+                            // the host slices off; they are a pad, not a widening.
+                            let pad = rows.div_ceil(NTILE) * NTILE;
+                            let mut bytes = vec![0u8; pad * h * 2];
+                            bytes[..rows * h * 2].copy_from_slice(&leaf.bytes);
+                            t_read.set(t_read.get() + s.elapsed().as_secs_f64());
+                            RouterProj::Bf16 {
+                                w: bind_bf16(&fp4_client, fp4_aliases.as_ref(), &bytes, pad, h),
                             }
                         }
-                        for j in 0..ns {
-                            let d = (routing[ti].shared_gammas[j] - hr[ti].shared_gammas[j]).abs();
-                            if d > worst_w {
-                                worst_w = d;
-                            }
-                        }
-                        if hr[ti].experts != routing[ti].experts {
-                            bad += 1;
-                            if bad <= 4 {
-                                println!(
-                                    "ROUTEDBG layer {layer} t {ti} host {:?} dev {:?}",
-                                    hr[ti].experts, routing[ti].experts
-                                );
-                            }
-                        }
-                    }
-                    println!(
-                        "ROUTEGATE layer {layer}: {n} rows examined, {bad} selections differ, \
-                         max |dev-host| weight {worst_w:.3e}"
-                    );
-                }
-                t_rt_host += t_rh.elapsed().as_secs_f64();
-            }
-            if route_stale && !stale_hit {
-                route_cache.insert(layer, routing.clone());
-            }
-            let t_rh = Instant::now();
-
-            // `INK_ROUTER_DIFF=1`: the same activation through the f32 lane,
-            // the same selection rule on the result, and a count of where the
-            // two disagree. Nothing below reads `ref_routing` -- the run acts on
-            // `routing`, whichever arm produced it -- so this measures the arm
-            // rather than replacing it.
-            if let Some(rw) = r.reference.as_ref() {
-                // `INK_ROUTER_DIFF=1` only, and widened for the same reason
-                // the two f32 router arms above are: this lane's weight is an
-                // f32 Burn tensor.
-                let ref_logits =
-                    down(dev_lane::linear(dev_lane_resid::from_resid(hn.clone()), rw.clone()));
-                let ref_routing = route_from_logits(
-                    &ref_logits, &r.bias, r.global_scale, t.route_scale as f32,
-                    n, t.n_routed_experts, t.n_shared_experts, t.num_experts_per_tok,
-                );
-                let d = &mut route_diff[layer];
-                for ti in 0..n {
-                    d.note(
-                        &routing[ti],
-                        &ref_routing[ti],
-                        &logits[ti * rows..(ti + 1) * rows],
-                        &ref_logits[ti * rows..(ti + 1) * rows],
-                    );
-                }
-            }
-
-            // Group tokens by expert, so each slab is read once.
-            let mut by_expert: BTreeMap<usize, Vec<(usize, f32)>> = BTreeMap::new();
-            for (ti, rt) in routing.iter().enumerate() {
-                for (slot, &e) in rt.experts.iter().enumerate() {
-                    by_expert.entry(e).or_default().push((ti, rt.weights[slot]));
-                }
-            }
-            t_rt_host += t_rh.elapsed().as_secs_f64();
-            t_h_route += t_rt.elapsed().as_secs_f64();
-
-            // `INK_ROUTE_LOG=<path>` appends this layer's routing, one line per
-            // position, plus the layer's DISTINCT-expert count. The count is
-            // written so the file can be checked against `expert slabs
-            // decoded` instead of trusted: the sum of the `distinct=` lines of
-            // a pass must equal that counter, and a log that disagrees with the
-            // number the run acted on is describing a different run.
-            //
-            // Written from `routing`, the same vector the block then feeds to
-            // the experts -- not recomputed -- so the log cannot drift from
-            // what was decoded. Positions are ABSOLUTE (`pos0 + ti`), because a
-            // cached step's `ti` is always 0 and the sequence position is the
-            // whole point of an adjacency measurement.
-            if let Ok(rl) = std::env::var("INK_ROUTE_LOG") {
-                use std::io::Write as _;
-                let mut f = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&rl)
-                    .with_context(|| format!("INK_ROUTE_LOG={rl}"))?;
-                for (ti, r) in routing.iter().enumerate() {
-                    writeln!(f, "R {step} {layer} {} {:?}", pos0 + ti, r.experts)?;
-                }
-                writeln!(f, "D {step} {layer} {}", by_expert.len())?;
-            }
-
-            let t_d = Instant::now();
-            // Two formats, two instructions, one lane. 41 of the 42 layers
-            // carry NVFP4 experts and go through the block-scaled MMA; layer 2
-            // carries plain BF16 ones -- no `.scale` sidecar, because nothing
-            // quantised them -- and goes through the unscaled BF16 MMA
-            // (`mma.sync...bf16`, f32 accumulator, which is the instruction's
-            // own output type and not a widening).
-            //
-            // Which one is decided by the pile, not by a flag.
-            let acc = {
-                let a = if cp.is_nvfp4(&format!("{p}mlp.experts.w13_weight")) {
-                    routed_experts_fp4(
-                        &cp, fp4_aliases.as_ref(), &fp4_client, &dev,
-                        &p, &by_expert, &hn, n, h, inter,
-                        admission.routed(layer) == budget::StorageDType::Bf16,
-                        &mut host_t,
-                    )?
-                } else {
-                    routed_experts_bf16(
-                        &cp, fp4_aliases.as_ref(), &fp4_client, &dev,
-                        &p, &by_expert, &hn, n, h, inter, &mut host_t,
-                    )?
+                    };
+                    // Held only under the diff probe, and it is the arm every run
+                    // before 969bf6f shipped -- the thing the new arm has to be
+                    // compared AGAINST, not a second opinion invented for the
+                    // occasion.
+                    let reference = if router_diff {
+                        Some(up2(gv("mlp.gate.weight")?, rows, h, &dev))
+                    } else {
+                        None
+                    };
+                    Some(RouterDev {
+                        proj,
+                        reference,
+                        bias: gv("mlp.gate.bias")?,
+                        global_scale: gv("mlp.gate.global_scale")?[0],
+                    })
                 };
-                expert_loads += by_expert.len();
-                a
+                let built = LayerDev {
+                    attn,
+                    attn_sconv: up2(gv("attn_sconv.weight")?, h, t.sconv_kernel_size, &dev),
+                    mlp_sconv: up2(gv("mlp_sconv.weight")?, h, t.sconv_kernel_size, &dev),
+                    attn_norm: up1(gv("attn_norm.weight")?, h, &dev),
+                    mlp_norm: up1(gv("mlp_norm.weight")?, h, &dev),
+                    router,
+                };
+                <Bk as burn::tensor::backend::Backend>::sync(&dev)
+                    .expect("sync after the layer uploads");
+                let span = t_w0.elapsed().as_secs_f64();
+                let rd = t_read.get() - r0;
+                t_attn_read += rd;
+                t_attn_up += span - rd;
+                // Two bytes for the projections and four for the rest, because that
+                // is now what is on the device. Counting the projections at four
+                // would report the widening this commit removed.
+                dattn_bytes += (2
+                    * (heads * head_dim * h
+                        + 2 * kv_heads * head_dim * h
+                        + heads * t.d_rel * h
+                        + h * heads * head_dim)
+                    + 4 * (2 * kv_heads * head_dim * t.sconv_kernel_size
+                        + 2 * head_dim
+                        + t.d_rel * t.rel_span(kind)
+                        + 2 * h * t.sconv_kernel_size
+                        + 2 * h)) as u64;
+                layers_dev.insert(p.clone(), built);
+            }
+            let ld = layers_dev.get(&p).expect("inserted directly above");
+
+            // ---- attention ----------------------------------------------------
+            let t_a = Instant::now();
+            let hn = dev_lane_resid::rms_norm(xd.clone(), ld.attn_norm.clone(), t.rms_norm_eps);
+            let dims = AttnDims {
+                hidden: h,
+                heads,
+                kv_heads,
+                head_dim,
+                d_rel: t.d_rel,
+                rel_extent: t.rel_span(kind),
+                kernel: t.sconv_kernel_size,
+                rms_eps: t.rms_norm_eps,
+                kind,
             };
-            // ENQUEUE time, not work: nothing in this lane synchronises any
-            // more. The layer's device time shows up in the one sync after the
-            // stack, which is where it belongs and where it cannot be
-            // misattributed to whichever bucket happened to hold the readback.
-            t_expert += t_d.elapsed().as_secs_f64();
-            stage_sync!(d_expert, layer, "expert");
-
-            let ns = t.n_shared_experts;
-            let gammas: Vec<f32> = routing.iter().flat_map(|rt| rt.shared_gammas.clone()).collect();
-            let t_s = Instant::now();
-            // Device-resident, uploaded once. `split_shared_w13` is the
-            // settled reading — this used to be an open `deinterleave_rows`
-            // here and a halved split in the gate, which is the contradiction
-            // the INTERLEAVED result closed.
-            let sh = {
-                let sw = ddense.shared_for(
-                    &cp, &fp4_client, fp4_aliases.as_ref(), &p, ns, inter, h, shared_halved,
-                )?;
-                shared_experts_bf16(&dev, hn, sw, &gammas, ns)
-            };
-            stage_sync!(d_shared, layer, "shared");
-            t_shared += t_s.elapsed().as_secs_f64();
-            acc + sh
-        };
-
-        // The MLP half's own short convolution carries state across generated
-        // tokens exactly as attention's do.
-        let t_sc = Instant::now();
-        let y = if slot_lane && is_decode {
-            let hist = slots_dev[coh][slot]
-                .mlp_sconv
-                .clone()
-                .expect("a slot batch carries its own convolution memory");
-            let (out, next) = dev_lane::short_conv_slot_step(hist, y, ld.mlp_sconv.clone());
-            slots_dev[coh][slot].mlp_sconv = Some(next);
-            out
-        } else if kv {
-            if is_decode {
-                let hist = caches[slot]
-                    .mlp_sconv
-                    .clone()
-                    .expect("a step past the prefill has a history");
-                if n > 1 {
-                    let (out, all) = dev_lane::short_conv_steps(hist, y, ld.mlp_sconv.clone());
-                    caches[slot].mlp_sconv_pending = Some(all);
-                    out
-                } else {
-                    let (out, next) = dev_lane::short_conv_step(hist, y, ld.mlp_sconv.clone());
-                    caches[slot].mlp_sconv = Some(next);
-                    out
-                }
-            } else {
-                caches[slot].mlp_sconv =
-                    Some(dev_lane::conv_history(y.clone(), t.sconv_kernel_size));
-                dev_lane::short_conv(y, ld.mlp_sconv.clone())
-            }
-        } else {
-            dev_lane::short_conv(y, ld.mlp_sconv.clone())
-        };
-        t_h_sconv += t_sc.elapsed().as_secs_f64();
-        xd = dev_lane_resid::add_resid(xd, y);
-        stage_sync!(d_tail, layer, "tail");
-
-        // A debug dump is a SYNC, and it is the one place left in the loop that
-        // costs one. That is the trade: this path exists to compare against a
-        // Python capture layer by layer, and it cannot do that without the
-        // numbers.
-        if let Some(dir) = dump_dir.as_ref() {
-            let hx = down(xd.clone());
-            let mut bytes = Vec::with_capacity(hx.len() * 4);
-            for v in &hx {
-                bytes.extend_from_slice(&v.to_le_bytes());
-            }
-            std::fs::write(format!("{dir}/h_after_{layer:02}.bin"), &bytes)?;
-        }
-        t_other += t_o.elapsed().as_secs_f64();
-        // The same reduction the host loop did, enqueued rather than run:
-        // sqrt(mean(x^2)) over the whole [n, h] stream. Read after the stack.
-        // Widened first, and deliberately: `mean` over `n * 4096` terms is the
-        // one reduction in this loop whose accumulator is not already f32, and
-        // a diagnostic that reads wrong because it was measured narrow is worse
-        // than no diagnostic. It is one cast of a buffer that is about to be
-        // reduced to a scalar, and the fusion collapses it into the reduce.
-        layer_rms.push(
-            dev_lane_resid::from_resid(xd.clone()).powf_scalar(2.0).mean().reshape([1, 1]),
-        );
-        layer_kind.push((layer, is_local));
-        // Hand the pool's unused pages back between layers, when
-        // `CleanupPolicy` says this pass is the kind that wants it.
-        //
-        // Every layer's activations are freed before the next one allocates its
-        // own, so between two layers the pool holds almost nothing and RESERVES
-        // almost everything: 12.56 GiB reserved against 1.19 live at the end of
-        // a layer, on eight layers at 20,000 tokens with `INK_MEM_TRACE=1`. On
-        // this part the pool is host memory, so what the node runs out of is
-        // the reserved figure, not the live one.
-        //
-        // What it trades is ALLOCATION: the next layer asks for the same
-        // pages again, and a page this runtime hands back is a `cudaFree` it
-        // will pay a `cudaMalloc` for. That cost is per layer, so a prefill --
-        // few layers, enormous reservation -- pays it once a layer and a decode
-        // step would pay it once a layer PER TOKEN for nothing. Which is why
-        // the policy asks how many positions the pass computes rather than
-        // asking an operator to remember a variable.
-        // `memory_usage` is the pool's own host-side bookkeeping and needs no
-        // sync to read; the sync below belongs to the cleanup.
-        let stranded = match fp4_client.memory_usage() {
-            Ok(u) => mary::models::inkling::pool::stranded_bytes(
-                u.bytes_reserved, u.bytes_in_use, u.bytes_padding,
-            ),
-            Err(_) => 0,
-        };
-        if cleanup.at_layer(stranded) {
-            <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync before cleanup");
-            fp4_client.memory_cleanup();
-            cleanups += 1;
-        }
-    }
-
-    // This slot is prefilled; seat it in the batch and let go of it. The next
-    // slot starts from an empty `caches`.
-    //
-    // Seated HERE and not once all b are in, which is what this used to do, and
-    // the difference is the largest memory event in the lane. A prefilled
-    // `AttnCache` costs far more than the keys it holds -- 3.59 GiB against
-    // 0.16 GiB on the 21-layer head at a 3732-token prompt -- and the batch
-    // assembly is what collapsed it. Keeping b of them meant the sixth prefill
-    // ran a 25.8 GiB headroom out of memory. See `dev_lane::SlotCache::seeded`.
-    //
-    // The pool is handed back afterwards, which is not tidiness either: a
-    // prefill's peak is a [heads, query_block, tokens] score matrix, 1.68 GiB
-    // at a 3.7k context, and cubecl keeps the page it was served from because
-    // keeping it is the right policy inside a loop. With nothing of this slot
-    // left alive there is a whole page to hand back, which is exactly what
-    // `memory_cleanup` could not do while the b caches were pinning it.
-    if slot_lane && !is_decode {
-        // Which row of THIS cohort's batch is being seated. Cohort `coh` was
-        // prefilled by steps `coh * nslots .. (coh + 1) * nslots`, so row zero
-        // is the one that seeds the batch and the rest seat into it.
-        let row = step % nslots;
-        for (l, c) in caches.drain(..).enumerate() {
-            let kind = t.attn_kind(lo + l);
-            let (_, kv_heads, head_dim) = t.heads(kind);
-            let asc = c.attn_sconv.reshape([1, t.sconv_kernel_size - 1, h]);
-            let msc = c
-                .mlp_sconv
-                .expect("a prefill seeds the MLP convolution")
-                .reshape([1, t.sconv_kernel_size - 1, h]);
-            if row == 0 {
-                slots_dev[coh].push(SlotLayerCache {
-                    attn: dev_lane::SlotCache::seeded(nslots, c.attn, kv_heads, head_dim),
-                    attn_sconv: dev_lane::seat_first3(nslots, asc),
-                    mlp_sconv: Some(dev_lane::seat_first3(nslots, msc)),
-                });
-            } else {
-                slots_dev[coh][l].attn.seat(row, c.attn);
-                dev_lane::seat_row3(&mut slots_dev[coh][l].attn_sconv, row, asc);
-                let mut m = slots_dev[coh][l].mlp_sconv.take().expect("seeded by slot 0");
-                dev_lane::seat_row3(&mut m, row, msc);
-                slots_dev[coh][l].mlp_sconv = Some(m);
-            }
-        }
-        assert_eq!(slots_dev[coh].len(), hi - lo, "the slot batch is missing layers");
-        <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync after a slot prefill");
-        fp4_client.memory_cleanup();
-        println!(
-            "{}",
-            mary::models::inkling::seam::pool_line(
-                &fp4_client,
-                &format!("prefill {}/{total_slots}", step + 1)
-            )
-        );
-    }
-
-    // ---- the one sync for this node's whole stack --------------------------
-    //
-    // Everything above is enqueued. THIS is where the device time is, and
-    // putting the timer here rather than around each stage is the only honest
-    // place for it: with no readbacks inside the loop, a per-stage number would
-    // measure how long the host took to describe the work, not how long the
-    // work took.
-    //
-    // The forty-two per-layer RMS reductions come back in one read rather than
-    // forty-two, which is the same trick one level up.
-    let t_sy = Instant::now();
-    // An EXPLICIT sync, not an implicit one. Reading the RMS column would drain
-    // the queue anyway -- it depends on every layer's output -- but "would
-    // anyway" is how a timer ends up measuring something other than its label.
-    // This one costs nothing (the head cannot start before the stack finishes)
-    // and it makes `t_stack_sync` the stack's device time and `t_head` the
-    // head's, rather than one number smeared over both.
-    <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync after the stack");
-    // What the device pool has RESERVED once the whole stack has run, which is
-    // the quantity the admission gate exists to predict. On a unified-memory
-    // part the pool is node memory, so everything in it beyond the weight arena
-    // IS the activation working set at this sequence length -- and unlike
-    // `MemAvailable` it is not polluted by whatever else the box is doing.
-    println!("{}", mary::models::inkling::seam::pool_line(&fp4_client, "after stack"));
-    // The admission gate's prediction beside what the run actually reserved, on
-    // the same line, every pass. The gate is the only thing standing between a
-    // long input and a node in swap, and the way it failed before was not that
-    // it was noisy -- it was FLAT, charging 13.5 GiB whether the input was
-    // 16,384 tokens or 100,623, and nothing printed by the run said otherwise.
-    // Printing the outcome next to the estimate makes every run a measurement
-    // of its own gate: a reserved figure above the charge is a run that was
-    // admitted and should not have been.
-    let reserved = mary::models::inkling::seam::pool_reserved(&fp4_client);
-    if reserved > 0 {
-        println!(
-            "    activations: {:.2} GiB charged at admission, {:.2} GiB reserved by the pool \
-             ({:+.0}%)",
-            attention_bytes as f64 / GIB,
-            reserved as f64 / GIB,
-            100.0 * (reserved as f64 / attention_bytes.max(1) as f64 - 1.0),
-        );
-    }
-    let rms_col: Vec<f32> = if layer_rms.is_empty() {
-        Vec::new()
-    } else {
-        down(BT::cat(std::mem::take(&mut layer_rms), 0))
-    };
-    let t_stack_sync = t_sy.elapsed().as_secs_f64();
-    for (i, &(layer, is_local)) in layer_kind.iter().enumerate() {
-        println!(
-            "  layer {layer:2} [{}] rms {:.4}",
-            if is_local { "local " } else { "global" },
-            rms_col[i].sqrt()
-        );
-    }
-
-    // The residual stream on the HOST, and only for the readers that genuinely
-    // need it there: the wire (16 KB to the tail), the MTP draft path (all
-    // scalar host arithmetic), and a debug dump. A whole-stack or tail process
-    // that is not drafting never materialises it -- the head reads `xd`.
-    let want_host_x = is_head || mtp_k > 0 || dump_dir.is_some();
-    // Timed, and it is the head's alone: a tail never materialises the stream.
-    // That asymmetry is why it was the first suspect when the head's report
-    // summed to two thirds of its pass at 48 slots and the tail's summed to
-    // 95% -- and it reads 0.3 ms, so it is a suspect that has been RULED OUT
-    // rather than the untimed thing anything could be blamed on.
-    let t_dn = Instant::now();
-    // Widened on the DEVICE before the readback, not on the host after it. The
-    // wire is f32 and `down` would happily convert a BF16 `TensorData` for it --
-    // in a host loop over `n * 4096` elements, which at 100,000 tokens is four
-    // hundred million of them on one core. The cast is a kernel; let it be one.
-    let x: Vec<f32> =
-        if want_host_x { down(dev_lane_resid::from_resid(xd.clone())) } else { Vec::new() };
-    let t_x_down = t_dn.elapsed().as_secs_f64();
-
-    // Does anything downstream need a logit row that is NOT the last one?
-    //
-    // The argmax reads exactly one row -- the last -- and that is the whole of
-    // what a forward produces. Every other row of the head exists for the
-    // REPORT: the per-position top-5 table and the `INK_DUMP_DIR` capture. On a
-    // 512-token prefill those rows are 512 x 200058 f32 = 410 MB read back
-    // across the bus, on top of a 4096-wide GEMM over 512 rows instead of 16.
-    // So they are computed when a reader has asked for them and not otherwise.
-    // `INK_ALL_LOGITS=1` is that ask; a dump implies it.
-    let all_logits =
-        dump_dir.is_some() || std::env::var("INK_ALL_LOGITS").map(|val| val == "1").unwrap_or(false);
-
-    // ---- head, or the wire in its place ------------------------------------
-    let v = t.effective_vocab();
-    let t_h = Instant::now();
-    // A head has no logits and never will: the rest of the stack and the
-    // unembedding both live on the other machine. So it hands the stream over
-    // and takes the argmax back, and that blocking call is charged to the same
-    // slot the head/unembed occupies on a whole-stack run — which is what makes
-    // the two reports read against each other line for line.
-    let mut best_wire = None;
-    // Which position `logits[0]` is. The head computes `logit_row0..n`, so this
-    // is 0 when everything was asked for and `n - 1` when only the argmax's row
-    // was. A head computes nothing and the value is unread there.
-    // How many of this pass's rows the verifier has to read an argmax off. One,
-    // normally -- a forward produces one token. A speculative pass produces one
-    // PER ROW, and every one of them is needed: the accepted prefix is the
-    // leading run where the draft and the argmax agree, so a rule that only
-    // looked at the last row could not find where the agreement stopped.
-    let verify_rows = if spec_k > 0 && kv && step > 0 { n } else { 1 };
-    // The width probe's rows, derived from the batch the head actually sent
-    // rather than from this process's environment -- so INK_WIDTH is set on the
-    // head alone and the two ends cannot disagree about it.
-    //
-    // Every row is unembedded, and that is deliberate: b independent sequences
-    // each need their own logits, so a probe that unembedded one row would
-    // leave the widest matmul in the stack out of the price.
-    let probe_rows = if spec_k == 0 && kv && is_decode && n > 1 && !slot_lane { n } else { 1 };
-    // The rows a slot batch reads an argmax off: all of them, because each one
-    // is a different sequence and each one's next token is a fact about it.
-    // This is the widest matmul in the stack run at its real width, which is
-    // the half of batched decode the width probe was already honest about.
-    let slot_rows = if slot_lane && is_decode { n } else { 1 };
-    let logit_row0 =
-        if all_logits || probe_rows > 1 || slot_rows > 1 { 0 } else { n - verify_rows };
-    let (mut t_send, mut t_wait_peer) = (0f64, 0f64);
-    let mut wire_toks: Vec<usize> = Vec::new();
-    // Which cohort the answer read on THIS pass belongs to. The pass's own
-    // cohort everywhere except an interleaved head, where it is the cohort sent
-    // a pass earlier -- so the tokens land in that cohort's streams and not in
-    // the one this pass just computed.
-    let mut answer_coh = coh;
-    // False on exactly the passes an interleaved head starts a cohort it has
-    // not yet heard back about: the first `ncohorts - 1` decode passes. Nothing
-    // was confirmed, so nothing is committed.
-    let mut answered = true;
-    let logits = if let Some(Pipe::Head(s)) = pipe.as_mut() {
-        let t_s = Instant::now();
-        send_stream(s, n, pos0, coh, &x)?;
-        t_send = t_s.elapsed().as_secs_f64();
-        in_flight.push_back(coh);
-        // THE interleave, and it is this line. `want` is how many answers the
-        // head is content to leave outstanding once this pass is over: zero
-        // with one cohort, which is the strict send-then-block loop this file
-        // has always run, and `ncohorts - 1` while decoding with more, which
-        // leaves the tail exactly one round of work to do while the head starts
-        // the next cohort. The prefills stay strict whatever `ncohorts` is --
-        // a prefill's answer seeds the slot it just filled, and there is
-        // nothing to overlap it with.
-        let want = if is_decode { ncohorts - 1 } else { 0 };
-        let t_w = Instant::now();
-        if in_flight.len() > want {
-            // The tail's FIRST message: the tokens its verify pass confirmed.
-            // Never empty -- the row fed the last confirmed token always
-            // produces one -- and longer than one exactly when drafts were
-            // accepted. The drafts for the NEXT pass are a second message, read
-            // further down, so this process gets to commit its caches in
-            // between.
-            answer_coh = in_flight.pop_front().expect("just pushed one");
-            wire_toks = recv_toks(s)?;
-            anyhow::ensure!(!wire_toks.is_empty(), "the tail confirmed no token at all");
-            best_wire = Some(*wire_toks.last().expect("checked non-empty"));
-        } else {
-            answered = false;
-        }
-        t_wait_peer = t_w.elapsed().as_secs_f64();
-        Vec::new()
-    } else {
-        // 109 x 4096 x 200058 is 89 G multiply-adds — the single largest
-        // matmul in the forward, and the one left standing once attention and
-        // the MLPs move. There is no host twin: 89 G scalar multiply-adds is
-        // not a reference, it is an afternoon. The muP divisor divides BEFORE
-        // the projection, matching the reference: doing it after is
-        // algebraically equal and numerically not.
-        //
-        // The rows: `logit_row0..n`, which is the last row alone unless a
-        // reporter asked for all of them. The unembedding is the widest matmul
-        // in the stack (n x 4096 x 200058) and the only consumer of all but its
-        // final row is a print, so the slice happens on the INPUT -- before the
-        // GEMM and before the readback -- rather than after both.
-        let hx = if all_logits {
-            xd.clone()
-        } else {
-            xd.clone().slice([logit_row0..n, 0..h])
-        };
-        let hs = dev_lane_resid::rms_norm(
-            hx,
-            fnorm_dev.clone().expect("the tail owns the final norm"),
-            t.rms_norm_eps,
-        )
-        .div_scalar(t.logits_mup_width_multiplier as f32);
-        let uw = unembed_w.as_ref().expect("the tail binds the unembed table");
-        down(dev_lane::linear_bf16(hs, uw).slice([0..n - logit_row0, 0..v]))
-    };
-    let t_head = t_h.elapsed().as_secs_f64();
-
-    // Greedy: the last position's argmax is the next token. A head took it off
-    // the wire instead of computing it, and either way it is decided HERE --
-    // before the reporting -- so a tail can answer its peer immediately rather
-    // than making the head wait on a page of printing.
-    // How many DRAFTS this pass kept, and the tokens it confirmed. Acceptance
-    // is exact argmax match and deliberately not a stochastic rule: measured on
-    // this model the exact rule accepts MORE (49.5% against 45.6% sampled and
-    // 40.6% under 1-TV), because when the draft is the argmax the target agrees
-    // strongly and when it is not the target puts little mass there either.
-    let new_toks: Vec<usize>;
-    let best = if !answered {
-        // An interleaved head, on the pass that opened a cohort. The answer is
-        // still on the tail; it is read one pass later and committed there.
-        new_toks = Vec::new();
-        0
-    } else if let Some(b) = best_wire {
-        new_toks = wire_toks.clone();
-        b
-    } else {
-        let mut accepted = 0usize;
-        let rows = n - logit_row0;
-        let argmax_of = |i: usize| -> usize {
-            let row = &logits[i * v..(i + 1) * v];
-            let mut b = 0usize;
-            for (j, &val) in row.iter().enumerate() {
-                if val > row[b] {
-                    b = j;
-                }
-            }
-            b
-        };
-        if verify_rows > 1 {
-            debug_assert_eq!(logit_row0, 0, "a verify pass reads from row 0");
-            anyhow::ensure!(
-                n == 1 + last_drafts.len(),
-                "the head fed {n} rows against {} drafts -- the two ends disagree on the \
-                 speculation width",
-                last_drafts.len()
-            );
-            let preds: Vec<usize> = (0..rows).map(argmax_of).collect();
-            // Row i was fed the token at pos0+i and predicts pos0+i+1. Row 0
-            // was fed a CONFIRMED token, so its prediction is always kept;
-            // row i>0 was fed draft i-1, so its prediction is only a fact
-            // about the sequence if every draft before it was right.
-            while accepted < last_drafts.len() && last_drafts[accepted] == preds[accepted] {
-                accepted += 1;
-            }
-            new_toks = preds[..=accepted].to_vec();
-        } else if slot_rows > 1 {
-            // One argmax per SLOT. Nothing is accepted or rejected here --
-            // a slot batch has no drafts, every row was fed a token its own
-            // sequence confirmed, and every row's prediction is kept.
-            new_toks = (0..rows).map(argmax_of).collect();
-        } else if probe_rows > 1 {
-            // Row 0 is the sequence; rows 1.. are the probe's filler and
-            // their argmaxes are about nothing. Reading row 0 and not the
-            // last row is what keeps the text identical to INK_WIDTH=1.
-            new_toks = vec![argmax_of(0)];
-        } else {
-            new_toks = vec![argmax_of(rows - 1)];
-        }
-        *new_toks.last().expect("at least one row is always confirmed")
-    };
-    // `ids`, the MTP scoring and the per-position report were all written about
-    // ONE sequence, and slot 0 is the one they follow. `best` is therefore slot
-    // 0's token and not the last row's, which is what it means everywhere else.
-    let best = if slot_lane && is_decode && answered { new_toks[0] } else { best };
-    let mut t_to_reply = 0f64;
-    if let Some(Pipe::Tail(s)) = pipe.as_mut() {
-        send_toks(s, &new_toks)?;
-        t_to_reply = pass.elapsed().as_secs_f64();
-    }
-    // Everything but the LAST confirmed token goes into `ids` now; the last one
-    // is `best` and is pushed where it has always been pushed, so the MTP block
-    // below sees exactly the sequence-and-a-held-back-argmax it was written
-    // against.
-    if is_tail && gen_steps > 0 && !repeat && new_toks.len() > 1 && !slot_lane {
-        ids.extend_from_slice(&new_toks[..new_toks.len() - 1]);
-    }
-    // Each slot's own stream. A prefill pass produced the first generated token
-    // of the slot it prefilled; a decode pass produces one for every slot. Both
-    // ends run this -- the head off the wire, the tail off its own argmax --
-    // for the same reason `ids` is recomputed rather than sent.
-    if slot_lane && gen_steps > 0 && !repeat {
-        if is_decode {
-            if answered {
-                let base = answer_coh * nslots;
-                for (q, tok) in slot_ids[base..base + nslots].iter_mut().zip(new_toks.iter()) {
-                    q.push(*tok);
-                }
-            }
-        } else {
-            slot_ids[step].push(best);
-        }
-    }
-    // ---- both ends roll back to the accepted prefix ------------------------
-    //
-    // `keep` is 1 + accepted: row 0 fed a confirmed token and rows 1..=accepted
-    // fed drafts the verifier kept, so their K, V and convolution memory are
-    // facts about the sequence the model actually chose. The rows past them
-    // were computed from tokens it did not choose, and leaving them behind does
-    // not error -- it shows up later as an acceptance rate that drifts down.
-    if verify_rows > 1 || probe_rows > 1 {
-        // One row for the probe -- its filler rows are not facts about any
-        // sequence and their K, V and convolution memory go away with them.
-        let keep = if verify_rows > 1 { new_toks.len() } else { 1 };
-        let hist = t.sconv_kernel_size - 1;
-        for (slot, c) in caches.iter_mut().enumerate() {
-            let window = if t.attn_kind(lo + slot) == AttnKind::Local {
+            // The same distinction the mask carries, in the form the cache needs:
+            // how far back a query may look, and therefore how much of the cache
+            // can never be read again.
+            let window = if is_local {
                 Some(t.sliding_window_size)
             } else {
                 None
             };
-            c.attn.commit(keep, window);
-            if let Some(all) = c.attn_sconv_pending.take() {
-                c.attn_sconv = dev_lane::conv_history(
-                    all.slice([0..hist + keep, 0..h]),
-                    t.sconv_kernel_size,
+            let a = if slot_lane && is_decode {
+                // b sequences, one position each, one pass. `attention_steps` is
+                // the wrong function here and not by a little: its rows are
+                // consecutive positions of ONE sequence and its mask admits every
+                // earlier row of the batch, which for independent slots is exactly
+                // the contamination this lane exists to make impossible.
+                let y = dev_lane::attention_slots(
+                    hn,
+                    &ld.attn,
+                    &dims,
+                    Some(ls),
+                    pos0,
+                    window,
+                    &mut slots_dev[coh][slot].attn,
                 );
+                let (out, hist) = dev_lane::short_conv_slot_step(
+                    slots_dev[coh][slot].attn_sconv.clone(),
+                    y,
+                    ld.attn_sconv.clone(),
+                );
+                slots_dev[coh][slot].attn_sconv = hist;
+                out
+            } else if kv && is_decode && n > 1 {
+                // The speculative width. `attention_steps` leaves the batch PENDING
+                // and the convolution keeps its whole window, so neither is final
+                // until the verifier below says how many rows survived. Nothing
+                // here knows that yet -- the answer is a machine away.
+                let y = dev_lane::attention_steps(
+                    hn,
+                    &ld.attn,
+                    &dims,
+                    Some(ls),
+                    pos0,
+                    window,
+                    &mut caches[slot].attn,
+                );
+                let (out, all) = dev_lane::short_conv_steps(
+                    caches[slot].attn_sconv.clone(),
+                    y,
+                    ld.attn_sconv.clone(),
+                );
+                caches[slot].attn_sconv_pending = Some(all);
+                out
+            } else if kv && is_decode {
+                let y = dev_lane::attention_step(
+                    hn,
+                    &ld.attn,
+                    &dims,
+                    Some(ls),
+                    pos0,
+                    window,
+                    &mut caches[slot].attn,
+                );
+                let (out, hist) = dev_lane::short_conv_step(
+                    caches[slot].attn_sconv.clone(),
+                    y,
+                    ld.attn_sconv.clone(),
+                );
+                caches[slot].attn_sconv = hist;
+                out
+            } else if kv {
+                let (y, attn) =
+                    dev_lane::attention_prefill(hn, &ld.attn, &dims, Some(ls), window, window);
+                let hist = dev_lane::conv_history(y.clone(), t.sconv_kernel_size);
+                let out = dev_lane::short_conv(y, ld.attn_sconv.clone());
+                caches.push(LayerCache {
+                    attn,
+                    attn_sconv: hist,
+                    mlp_sconv: None,
+                    attn_sconv_pending: None,
+                    mlp_sconv_pending: None,
+                });
+                out
+            } else {
+                let y = dev_lane::attention(hn, &ld.attn, &dims, Some(ls), window);
+                dev_lane::short_conv(y, ld.attn_sconv.clone())
+            };
+            xd = dev_lane_resid::add_resid(xd, a);
+
+            stage_sync!(d_attn, layer, "attn");
+            // ---- MLP ----------------------------------------------------------
+            t_attn += t_a.elapsed().as_secs_f64();
+            let t_o = Instant::now();
+            let hn = dev_lane_resid::rms_norm(xd.clone(), ld.mlp_norm.clone(), t.rms_norm_eps);
+
+            let y = if t.is_dense(layer) {
+                // Device-resident: uploaded on the first token that reaches this
+                // layer and held for the run. The host reference that used to sit
+                // beside it (`host_dense`, selected by leaving `INK_DENSE` unset)
+                // was a scalar f32 lane over a 537 MB weight; it is not a lane a
+                // 276 B model has any use for, and being selectable is how it got
+                // run by accident.
+                let w = ddense.dense_for(&cp, &fp4_client, fp4_aliases.as_ref(), &p, h)?;
+                dense_mlp_bf16(hn, w)
+            } else {
+                let inter = t.intermediate_size;
+                let r = ld.router.as_ref().expect("a MoE layer has a router");
+                // The router's PROJECTION is a matmul and runs on the device; its
+                // DECISION is control plane and runs here. What crosses is one row
+                // of the chosen ids and weights on the default lane and the whole
+                // [n, 258] f32 on `INK_DEV_ROUTE=0` -- 60 bytes against 1 KB, and
+                // neither is the cost. The cost is that this read BLOCKS, and it is
+                // the only place in the layer that does.
+                //
+                // What it is worth, measured 2026-08-23 on spark-zt at
+                // `INK_KV=1 INK_LAYERS=0:16`, nine interleaved rounds of the
+                // `INK_ROUTE_STALE=1` probe against the same binary with the probe
+                // off: 55.7 -> 51.2 ms p50, i.e. 4.5 ms a token and 17.95 -> 19.53
+                // tok/s. The per-layer `BLOCKING read` bucket is 19.3 ms of that
+                // pass and only 4.5 of it is serialisation -- the rest is device
+                // time that resurfaces at the one sync (1.3 -> 5.1 ms) and host
+                // work that gets dearer once the queue runs deep. `nsys -t cuda`
+                // over the same two arms puts GPU kernel time at 41.2 ms of the
+                // pass, so the device is busy 74% of a blocking pass and 80% of a
+                // probe pass, and 41 ms is the floor either way.
+                let rows = t.n_routed_experts + t.n_shared_experts;
+                let t_rt = Instant::now();
+                // `cols` is what comes BACK, which is `rows` except on the BF16 arm,
+                // whose weight carries the instruction's n padding.
+                let (lg, cols) = match &r.proj {
+                    // Two A/B arms whose weight is an f32 Burn tensor, so their
+                    // matmul wants an f32 activation. `Bf16` is the lane that runs
+                    // and it takes the narrow stream as it lies; these widen, and
+                    // the temporary is the price of keeping an arm comparable
+                    // rather than of anything on the path.
+                    RouterProj::PerCall(w) => (
+                        dev_lane::linear(dev_lane_resid::from_resid(hn.clone()), w.clone()),
+                        rows,
+                    ),
+                    RouterProj::Pre(wt) => (
+                        dev_lane::linear_pre_t(dev_lane_resid::from_resid(hn.clone()), wt.clone()),
+                        rows,
+                    ),
+                    RouterProj::Bf16 { w, .. } => (dev_lane::linear_bf16(hn.clone(), w), w.n),
+                };
+                t_rt_mm += t_rt.elapsed().as_secs_f64();
+                stage_sync!(d_router, layer, "router");
+                // Two lanes, and the difference is WHERE the top-k runs, not what
+                // it decides. The host lane reads `[n, rows]` f32 back and sorts;
+                // the device lane runs `routetopk` on the logits where they already
+                // are and reads back `[n, 2k + shared + 1]`, which at 512 tokens is
+                // 30 KB against 528 KB and, more to the point, is 512 rows of
+                // 256-wide selection the host no longer walks.
+                //
+                // The reference arm below wants the full host logits, so it selects
+                // the host lane: a diagnostic that changed the lane it measures
+                // would be measuring itself.
+                let host_route = !dev_route || r.reference.is_some();
+                let routing: Vec<Routing>;
+                let mut logits: Vec<f32> = Vec::new();
+                // The probe only stands in for a decision of the same SHAPE, and it
+                // never stands in for the reference arm, which wants this pass's
+                // logits and would otherwise be handed an empty vector.
+                let stale_hit = route_stale
+                    && r.reference.is_none()
+                    && route_cache.get(&layer).is_some_and(|v| v.len() == n);
+                if stale_hit {
+                    routing = route_cache[&layer].clone();
+                } else if host_route {
+                    let t_rr = Instant::now();
+                    logits = drop_pad_cols(down(lg), n, cols, rows);
+                    t_rt_read += t_rr.elapsed().as_secs_f64();
+                    let t_rh = Instant::now();
+                    routing = route_from_logits(
+                        &logits,
+                        &r.bias,
+                        r.global_scale,
+                        t.route_scale as f32,
+                        n,
+                        t.n_routed_experts,
+                        t.n_shared_experts,
+                        t.num_experts_per_tok,
+                    );
+                    t_rt_host += t_rh.elapsed().as_secs_f64();
+                } else {
+                    use mary::models::inkling::routetopk::router_topk_launch;
+                    use mary::models::inkling::seam::{handle_of, tensor_of};
+                    let k = t.num_experts_per_tok;
+                    let ns = t.n_shared_experts;
+                    let width = 2 * k + ns + 1;
+                    let bias_h = bias_dev
+                        .entry(layer)
+                        .or_insert_with(|| fp4_client.create_from_slice(bytes_of(&r.bias)))
+                        .clone();
+                    let t_rt2 = Instant::now();
+                    let lg_h = handle_of(lg);
+                    let out_h = router_topk_launch(
+                        &fp4_client,
+                        &lg_h,
+                        &bias_h,
+                        n,
+                        cols,
+                        t.n_routed_experts,
+                        ns,
+                        k,
+                        t.route_scale as f32 * r.global_scale,
+                    );
+                    t_rt_mm += t_rt2.elapsed().as_secs_f64();
+                    let t_rr = Instant::now();
+                    let flat = down(tensor_of(fp4_client.clone(), dev.clone(), out_h, n, width));
+                    t_rt_read += t_rr.elapsed().as_secs_f64();
+                    let t_rh = Instant::now();
+                    let mut rs = Vec::with_capacity(n);
+                    for ti in 0..n {
+                        let row = &flat[ti * width..(ti + 1) * width];
+                        let bad = row[width - 1] as u32;
+                        assert!(
+                            bad == 0,
+                            "router logit is non-finite at token {ti}, row {}",
+                            bad - 1
+                        );
+                        rs.push(Routing {
+                            experts: row[..k].iter().map(|&v| v as usize).collect(),
+                            weights: row[k..2 * k].to_vec(),
+                            shared_gammas: row[2 * k..2 * k + ns].to_vec(),
+                        });
+                    }
+                    routing = rs;
+                    // `INK_ROUTE_DBG=1`: the SAME logits through the host rule, and
+                    // a count of where the two lanes disagree. It reads the logits
+                    // back and routes twice, so it is slower than either lane and
+                    // is not a lane -- but it compares the two on ONE input, which
+                    // is the thing two separate runs cannot do. A device router and
+                    // a host router started from the same prompt part company after
+                    // a few layers no matter how right they both are: the routing
+                    // weights differ in the eighth decimal, the residual stream
+                    // carries that forward, and a later layer has a near-tie at the
+                    // top-k boundary that falls the other way. That is chaos, not
+                    // error, and only a same-input comparison can tell them apart.
+                    if std::env::var("INK_ROUTE_DBG").is_ok() {
+                        let hl = drop_pad_cols(
+                            down(tensor_of(
+                                fp4_client.clone(),
+                                dev.clone(),
+                                lg_h.clone(),
+                                n,
+                                cols,
+                            )),
+                            n,
+                            cols,
+                            rows,
+                        );
+                        let hr = route_from_logits(
+                            &hl,
+                            &r.bias,
+                            r.global_scale,
+                            t.route_scale as f32,
+                            n,
+                            t.n_routed_experts,
+                            ns,
+                            k,
+                        );
+                        let mut bad = 0usize;
+                        let mut worst_w = 0f32;
+                        for ti in 0..n {
+                            for j in 0..k {
+                                let d = (routing[ti].weights[j] - hr[ti].weights[j]).abs();
+                                if d > worst_w {
+                                    worst_w = d;
+                                }
+                            }
+                            for j in 0..ns {
+                                let d =
+                                    (routing[ti].shared_gammas[j] - hr[ti].shared_gammas[j]).abs();
+                                if d > worst_w {
+                                    worst_w = d;
+                                }
+                            }
+                            if hr[ti].experts != routing[ti].experts {
+                                bad += 1;
+                                if bad <= 4 {
+                                    println!(
+                                        "ROUTEDBG layer {layer} t {ti} host {:?} dev {:?}",
+                                        hr[ti].experts, routing[ti].experts
+                                    );
+                                }
+                            }
+                        }
+                        println!(
+                            "ROUTEGATE layer {layer}: {n} rows examined, {bad} selections differ, \
+                         max |dev-host| weight {worst_w:.3e}"
+                        );
+                    }
+                    t_rt_host += t_rh.elapsed().as_secs_f64();
+                }
+                if route_stale && !stale_hit {
+                    route_cache.insert(layer, routing.clone());
+                }
+                let t_rh = Instant::now();
+
+                // `INK_ROUTER_DIFF=1`: the same activation through the f32 lane,
+                // the same selection rule on the result, and a count of where the
+                // two disagree. Nothing below reads `ref_routing` -- the run acts on
+                // `routing`, whichever arm produced it -- so this measures the arm
+                // rather than replacing it.
+                if let Some(rw) = r.reference.as_ref() {
+                    // `INK_ROUTER_DIFF=1` only, and widened for the same reason
+                    // the two f32 router arms above are: this lane's weight is an
+                    // f32 Burn tensor.
+                    let ref_logits = down(dev_lane::linear(
+                        dev_lane_resid::from_resid(hn.clone()),
+                        rw.clone(),
+                    ));
+                    let ref_routing = route_from_logits(
+                        &ref_logits,
+                        &r.bias,
+                        r.global_scale,
+                        t.route_scale as f32,
+                        n,
+                        t.n_routed_experts,
+                        t.n_shared_experts,
+                        t.num_experts_per_tok,
+                    );
+                    let d = &mut route_diff[layer];
+                    for ti in 0..n {
+                        d.note(
+                            &routing[ti],
+                            &ref_routing[ti],
+                            &logits[ti * rows..(ti + 1) * rows],
+                            &ref_logits[ti * rows..(ti + 1) * rows],
+                        );
+                    }
+                }
+
+                // Group tokens by expert, so each slab is read once.
+                let mut by_expert: BTreeMap<usize, Vec<(usize, f32)>> = BTreeMap::new();
+                for (ti, rt) in routing.iter().enumerate() {
+                    for (slot, &e) in rt.experts.iter().enumerate() {
+                        by_expert.entry(e).or_default().push((ti, rt.weights[slot]));
+                    }
+                }
+                t_rt_host += t_rh.elapsed().as_secs_f64();
+                t_h_route += t_rt.elapsed().as_secs_f64();
+
+                // `INK_ROUTE_LOG=<path>` appends this layer's routing, one line per
+                // position, plus the layer's DISTINCT-expert count. The count is
+                // written so the file can be checked against `expert slabs
+                // decoded` instead of trusted: the sum of the `distinct=` lines of
+                // a pass must equal that counter, and a log that disagrees with the
+                // number the run acted on is describing a different run.
+                //
+                // Written from `routing`, the same vector the block then feeds to
+                // the experts -- not recomputed -- so the log cannot drift from
+                // what was decoded. Positions are ABSOLUTE (`pos0 + ti`), because a
+                // cached step's `ti` is always 0 and the sequence position is the
+                // whole point of an adjacency measurement.
+                if let Ok(rl) = std::env::var("INK_ROUTE_LOG") {
+                    use std::io::Write as _;
+                    let mut f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&rl)
+                        .with_context(|| format!("INK_ROUTE_LOG={rl}"))?;
+                    for (ti, r) in routing.iter().enumerate() {
+                        writeln!(f, "R {step} {layer} {} {:?}", pos0 + ti, r.experts)?;
+                    }
+                    writeln!(f, "D {step} {layer} {}", by_expert.len())?;
+                }
+
+                let t_d = Instant::now();
+                // Two formats, two instructions, one lane. 41 of the 42 layers
+                // carry NVFP4 experts and go through the block-scaled MMA; layer 2
+                // carries plain BF16 ones -- no `.scale` sidecar, because nothing
+                // quantised them -- and goes through the unscaled BF16 MMA
+                // (`mma.sync...bf16`, f32 accumulator, which is the instruction's
+                // own output type and not a widening).
+                //
+                // Which one is decided by the pile, not by a flag.
+                let acc = {
+                    let a = if cp.is_nvfp4(&format!("{p}mlp.experts.w13_weight")) {
+                        routed_experts_fp4(
+                            &cp,
+                            fp4_aliases.as_ref(),
+                            &fp4_client,
+                            &dev,
+                            &p,
+                            &by_expert,
+                            &hn,
+                            n,
+                            h,
+                            inter,
+                            admission.routed(layer) == budget::StorageDType::Bf16,
+                            &mut host_t,
+                        )?
+                    } else {
+                        routed_experts_bf16(
+                            &cp,
+                            fp4_aliases.as_ref(),
+                            &fp4_client,
+                            &dev,
+                            &p,
+                            &by_expert,
+                            &hn,
+                            n,
+                            h,
+                            inter,
+                            &mut host_t,
+                        )?
+                    };
+                    expert_loads += by_expert.len();
+                    a
+                };
+                // ENQUEUE time, not work: nothing in this lane synchronises any
+                // more. The layer's device time shows up in the one sync after the
+                // stack, which is where it belongs and where it cannot be
+                // misattributed to whichever bucket happened to hold the readback.
+                t_expert += t_d.elapsed().as_secs_f64();
+                stage_sync!(d_expert, layer, "expert");
+
+                let ns = t.n_shared_experts;
+                let gammas: Vec<f32> = routing
+                    .iter()
+                    .flat_map(|rt| rt.shared_gammas.clone())
+                    .collect();
+                let t_s = Instant::now();
+                // Device-resident, uploaded once. `split_shared_w13` is the
+                // settled reading — this used to be an open `deinterleave_rows`
+                // here and a halved split in the gate, which is the contradiction
+                // the INTERLEAVED result closed.
+                let sh = {
+                    let sw = ddense.shared_for(
+                        &cp,
+                        &fp4_client,
+                        fp4_aliases.as_ref(),
+                        &p,
+                        ns,
+                        inter,
+                        h,
+                        shared_halved,
+                    )?;
+                    shared_experts_bf16(&dev, hn, sw, &gammas, ns)
+                };
+                stage_sync!(d_shared, layer, "shared");
+                t_shared += t_s.elapsed().as_secs_f64();
+                acc + sh
+            };
+
+            // The MLP half's own short convolution carries state across generated
+            // tokens exactly as attention's do.
+            let t_sc = Instant::now();
+            let y = if slot_lane && is_decode {
+                let hist = slots_dev[coh][slot]
+                    .mlp_sconv
+                    .clone()
+                    .expect("a slot batch carries its own convolution memory");
+                let (out, next) = dev_lane::short_conv_slot_step(hist, y, ld.mlp_sconv.clone());
+                slots_dev[coh][slot].mlp_sconv = Some(next);
+                out
+            } else if kv {
+                if is_decode {
+                    let hist = caches[slot]
+                        .mlp_sconv
+                        .clone()
+                        .expect("a step past the prefill has a history");
+                    if n > 1 {
+                        let (out, all) = dev_lane::short_conv_steps(hist, y, ld.mlp_sconv.clone());
+                        caches[slot].mlp_sconv_pending = Some(all);
+                        out
+                    } else {
+                        let (out, next) = dev_lane::short_conv_step(hist, y, ld.mlp_sconv.clone());
+                        caches[slot].mlp_sconv = Some(next);
+                        out
+                    }
+                } else {
+                    caches[slot].mlp_sconv =
+                        Some(dev_lane::conv_history(y.clone(), t.sconv_kernel_size));
+                    dev_lane::short_conv(y, ld.mlp_sconv.clone())
+                }
+            } else {
+                dev_lane::short_conv(y, ld.mlp_sconv.clone())
+            };
+            t_h_sconv += t_sc.elapsed().as_secs_f64();
+            xd = dev_lane_resid::add_resid(xd, y);
+            stage_sync!(d_tail, layer, "tail");
+
+            // A debug dump is a SYNC, and it is the one place left in the loop that
+            // costs one. That is the trade: this path exists to compare against a
+            // Python capture layer by layer, and it cannot do that without the
+            // numbers.
+            if let Some(dir) = dump_dir.as_ref() {
+                let hx = down(xd.clone());
+                let mut bytes = Vec::with_capacity(hx.len() * 4);
+                for v in &hx {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                std::fs::write(format!("{dir}/h_after_{layer:02}.bin"), &bytes)?;
             }
-            if let Some(all) = c.mlp_sconv_pending.take() {
-                c.mlp_sconv = Some(dev_lane::conv_history(
-                    all.slice([0..hist + keep, 0..h]),
-                    t.sconv_kernel_size,
-                ));
+            t_other += t_o.elapsed().as_secs_f64();
+            // The same reduction the host loop did, enqueued rather than run:
+            // sqrt(mean(x^2)) over the whole [n, h] stream. Read after the stack.
+            // Widened first, and deliberately: `mean` over `n * 4096` terms is the
+            // one reduction in this loop whose accumulator is not already f32, and
+            // a diagnostic that reads wrong because it was measured narrow is worse
+            // than no diagnostic. It is one cast of a buffer that is about to be
+            // reduced to a scalar, and the fusion collapses it into the reduce.
+            layer_rms.push(
+                dev_lane_resid::from_resid(xd.clone())
+                    .powf_scalar(2.0)
+                    .mean()
+                    .reshape([1, 1]),
+            );
+            layer_kind.push((layer, is_local));
+            // Hand the pool's unused pages back between layers, when
+            // `CleanupPolicy` says this pass is the kind that wants it.
+            //
+            // Every layer's activations are freed before the next one allocates its
+            // own, so between two layers the pool holds almost nothing and RESERVES
+            // almost everything: 12.56 GiB reserved against 1.19 live at the end of
+            // a layer, on eight layers at 20,000 tokens with `INK_MEM_TRACE=1`. On
+            // this part the pool is host memory, so what the node runs out of is
+            // the reserved figure, not the live one.
+            //
+            // What it trades is ALLOCATION: the next layer asks for the same
+            // pages again, and a page this runtime hands back is a `cudaFree` it
+            // will pay a `cudaMalloc` for. That cost is per layer, so a prefill --
+            // few layers, enormous reservation -- pays it once a layer and a decode
+            // step would pay it once a layer PER TOKEN for nothing. Which is why
+            // the policy asks how many positions the pass computes rather than
+            // asking an operator to remember a variable.
+            // `memory_usage` is the pool's own host-side bookkeeping and needs no
+            // sync to read; the sync below belongs to the cleanup.
+            let stranded = match fp4_client.memory_usage() {
+                Ok(u) => mary::models::inkling::pool::stranded_bytes(
+                    u.bytes_reserved,
+                    u.bytes_in_use,
+                    u.bytes_padding,
+                ),
+                Err(_) => 0,
+            };
+            if cleanup.at_layer(stranded) {
+                <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync before cleanup");
+                fp4_client.memory_cleanup();
+                cleanups += 1;
             }
         }
-    }
-    // The tail's SECOND message, and the head's second wait: the drafts to feed
-    // next pass. Read after the commit on purpose -- that is device work this
-    // process can enqueue while the other machine is still drafting.
-    if let Some(Pipe::Head(s)) = pipe.as_mut() {
-        if spec_k > 0 {
-            let t_w = Instant::now();
-            drafts_in = recv_toks(s)?;
-            t_wait_peer += t_w.elapsed().as_secs_f64();
-            anyhow::ensure!(
-                drafts_in.len() == spec_k,
-                "the tail sent {} drafts against INK_SPEC={spec_k}",
-                drafts_in.len()
+
+        // This slot is prefilled; seat it in the batch and let go of it. The next
+        // slot starts from an empty `caches`.
+        //
+        // Seated HERE and not once all b are in, which is what this used to do, and
+        // the difference is the largest memory event in the lane. A prefilled
+        // `AttnCache` costs far more than the keys it holds -- 3.59 GiB against
+        // 0.16 GiB on the 21-layer head at a 3732-token prompt -- and the batch
+        // assembly is what collapsed it. Keeping b of them meant the sixth prefill
+        // ran a 25.8 GiB headroom out of memory. See `dev_lane::SlotCache::seeded`.
+        //
+        // The pool is handed back afterwards, which is not tidiness either: a
+        // prefill's peak is a [heads, query_block, tokens] score matrix, 1.68 GiB
+        // at a 3.7k context, and cubecl keeps the page it was served from because
+        // keeping it is the right policy inside a loop. With nothing of this slot
+        // left alive there is a whole page to hand back, which is exactly what
+        // `memory_cleanup` could not do while the b caches were pinning it.
+        if slot_lane && !is_decode {
+            // Which row of THIS cohort's batch is being seated. Cohort `coh` was
+            // prefilled by steps `coh * nslots .. (coh + 1) * nslots`, so row zero
+            // is the one that seeds the batch and the rest seat into it.
+            let row = step % nslots;
+            for (l, c) in caches.drain(..).enumerate() {
+                let kind = t.attn_kind(lo + l);
+                let (_, kv_heads, head_dim) = t.heads(kind);
+                let asc = c.attn_sconv.reshape([1, t.sconv_kernel_size - 1, h]);
+                let msc = c
+                    .mlp_sconv
+                    .expect("a prefill seeds the MLP convolution")
+                    .reshape([1, t.sconv_kernel_size - 1, h]);
+                if row == 0 {
+                    slots_dev[coh].push(SlotLayerCache {
+                        attn: dev_lane::SlotCache::seeded(nslots, c.attn, kv_heads, head_dim),
+                        attn_sconv: dev_lane::seat_first3(nslots, asc),
+                        mlp_sconv: Some(dev_lane::seat_first3(nslots, msc)),
+                    });
+                } else {
+                    slots_dev[coh][l].attn.seat(row, c.attn);
+                    dev_lane::seat_row3(&mut slots_dev[coh][l].attn_sconv, row, asc);
+                    let mut m = slots_dev[coh][l]
+                        .mlp_sconv
+                        .take()
+                        .expect("seeded by slot 0");
+                    dev_lane::seat_row3(&mut m, row, msc);
+                    slots_dev[coh][l].mlp_sconv = Some(m);
+                }
+            }
+            assert_eq!(
+                slots_dev[coh].len(),
+                hi - lo,
+                "the slot batch is missing layers"
+            );
+            <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync after a slot prefill");
+            fp4_client.memory_cleanup();
+            println!(
+                "{}",
+                mary::models::inkling::seam::pool_line(
+                    &fp4_client,
+                    &format!("prefill {}/{total_slots}", step + 1)
+                )
             );
         }
-    }
-    if is_decode && !slot_lane {
-        let bucket = new_toks.len().min(spec_hist.len() - 1);
-        spec_hist[bucket] += 1;
-    }
 
-    // ---- MTP: score the drafts that named this step, then draft afresh -----
-    if mtp_k > 0 {
-        // SCORE FIRST, against `best` -- the token the full stack just produced.
-        // This is the whole experiment: a draft is right or it is not, and the
-        // rate over many steps is the only oracle the composition has.
-        // The target's OWN distribution at this position, once per pass rather
-        // than once per pending draft. `logits` holds the argmax's row and only
-        // that row unless a reporter asked for more, which is exactly the row
-        // every rule below reads.
-        let p_t: Vec<f32> = if mtp_prob && !logits.is_empty() {
-            softmax_row(&logits[(n - 1 - logit_row0) * v..(n - logit_row0) * v])
+        // ---- the one sync for this node's whole stack --------------------------
+        //
+        // Everything above is enqueued. THIS is where the device time is, and
+        // putting the timer here rather than around each stage is the only honest
+        // place for it: with no readbacks inside the loop, a per-stage number would
+        // measure how long the host took to describe the work, not how long the
+        // work took.
+        //
+        // The forty-two per-layer RMS reductions come back in one read rather than
+        // forty-two, which is the same trick one level up.
+        let t_sy = Instant::now();
+        // An EXPLICIT sync, not an implicit one. Reading the RMS column would drain
+        // the queue anyway -- it depends on every layer's output -- but "would
+        // anyway" is how a timer ends up measuring something other than its label.
+        // This one costs nothing (the head cannot start before the stack finishes)
+        // and it makes `t_stack_sync` the stack's device time and `t_head` the
+        // head's, rather than one number smeared over both.
+        <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync after the stack");
+        // What the device pool has RESERVED once the whole stack has run, which is
+        // the quantity the admission gate exists to predict. On a unified-memory
+        // part the pool is node memory, so everything in it beyond the weight arena
+        // IS the activation working set at this sequence length -- and unlike
+        // `MemAvailable` it is not polluted by whatever else the box is doing.
+        println!(
+            "{}",
+            mary::models::inkling::seam::pool_line(&fp4_client, "after stack")
+        );
+        // The admission gate's prediction beside what the run actually reserved, on
+        // the same line, every pass. The gate is the only thing standing between a
+        // long input and a node in swap, and the way it failed before was not that
+        // it was noisy -- it was FLAT, charging 13.5 GiB whether the input was
+        // 16,384 tokens or 100,623, and nothing printed by the run said otherwise.
+        // Printing the outcome next to the estimate makes every run a measurement
+        // of its own gate: a reserved figure above the charge is a run that was
+        // admitted and should not have been.
+        let reserved = mary::models::inkling::seam::pool_reserved(&fp4_client);
+        if reserved > 0 {
+            println!(
+                "    activations: {:.2} GiB charged at admission, {:.2} GiB reserved by the pool \
+             ({:+.0}%)",
+                attention_bytes as f64 / GIB,
+                reserved as f64 / GIB,
+                100.0 * (reserved as f64 / attention_bytes.max(1) as f64 - 1.0),
+            );
+        }
+        let rms_col: Vec<f32> = if layer_rms.is_empty() {
+            Vec::new()
+        } else {
+            down(BT::cat(std::mem::take(&mut layer_rms), 0))
+        };
+        let t_stack_sync = t_sy.elapsed().as_secs_f64();
+        for (i, &(layer, is_local)) in layer_kind.iter().enumerate() {
+            println!(
+                "  layer {layer:2} [{}] rms {:.4}",
+                if is_local { "local " } else { "global" },
+                rms_col[i].sqrt()
+            );
+        }
+
+        // The residual stream on the HOST, and only for the readers that genuinely
+        // need it there: the wire (16 KB to the tail), the MTP draft path (all
+        // scalar host arithmetic), and a debug dump. A whole-stack or tail process
+        // that is not drafting never materialises it -- the head reads `xd`.
+        let want_host_x = is_head || mtp_k > 0 || dump_dir.is_some();
+        // Timed, and it is the head's alone: a tail never materialises the stream.
+        // That asymmetry is why it was the first suspect when the head's report
+        // summed to two thirds of its pass at 48 slots and the tail's summed to
+        // 95% -- and it reads 0.3 ms, so it is a suspect that has been RULED OUT
+        // rather than the untimed thing anything could be blamed on.
+        let t_dn = Instant::now();
+        // Widened on the DEVICE before the readback, not on the host after it. The
+        // wire is f32 and `down` would happily convert a BF16 `TensorData` for it --
+        // in a host loop over `n * 4096` elements, which at 100,000 tokens is four
+        // hundred million of them on one core. The cast is a kernel; let it be one.
+        let x: Vec<f32> = if want_host_x {
+            down(dev_lane_resid::from_resid(xd.clone()))
         } else {
             Vec::new()
         };
-        mtp_pending.retain(|&(target, depth, tok)| {
-            // Off when the loop is speculating: `step` no longer names one
-            // token, so a draft issued at step s cannot be matched to "the
-            // token step s+d+1 produced". The accept-and-skip loop verifies its
-            // own drafts against the rows they were fed into and reports the
-            // prefix histogram instead, which is the same measurement taken
-            // where it is now decidable.
-            if spec_k > 0 || target != step {
-                return true;
-            }
-            mtp_seen[depth] += 1;
-            if mtp_prob {
-                if let Some(pd) = mtp_pd.remove(&(target, depth)) {
-                    // B: the target's own probability on the token that was
-                    // drafted. C: the overlap of the two distributions.
-                    let b = p_t.get(tok).copied().unwrap_or(0.0) as f64;
-                    let c: f64 = pd
-                        .iter()
-                        .zip(p_t.iter())
-                        .map(|(a, t)| a.min(*t) as f64)
-                        .sum();
-                    mtp_b_sum[depth] += b;
-                    mtp_c_sum[depth] += c;
-                    mtp_prob_n[depth] += 1;
-                    // `tok` IS the draft's argmax, so this is the head's own
-                    // top-1 mass -- its confidence, not the target's.
-                    mtp_conf[depth].push((pd.get(tok).copied().unwrap_or(0.0), tok == best));
-                    if let Some(slots) = mtp_issued_q.get_mut(&(target - depth - 1)) {
-                        slots[depth] = Some((b, c));
-                    }
-                }
-            }
-            if tok == best {
-                mtp_hits[depth] += 1;
-            }
-            // The step this draft was ISSUED at: head d drafted the token d+1
-            // steps ahead, so the issuer is target - depth - 1.
-            if let Some(slots) = mtp_issued.get_mut(&(target - depth - 1)) {
-                slots[depth] = Some(tok == best);
-            }
-            println!(
-                "  MTP depth {}: drafted {tok}, actual {best} -- {}",
-                depth + 1,
-                if tok == best { "HIT" } else { "miss" }
-            );
-            false
-        });
+        let t_x_down = t_dn.elapsed().as_secs_f64();
 
-        // DRAFT. Head d is fed the previous stage's hidden states and the
-        // embeddings of the tokens shifted one further along, so head 0 sees
-        // the token the stack just chose and head d sees draft d-1.
-        let e_w = embed_w.as_ref().expect("drafting needs the embedding table");
-        let fnorm_d = fnorm.as_ref().expect("drafting needs the final norm");
-        // Which hidden state head 0 is fed. `x` is the stack's RAW output, which
-        // `head` norms on its way to logits. Feeding the FINAL-NORMED one
-        // measured twice as well (25% -> 50% on a matched 20-token run), so it
-        // is the default; `INK_MTP_RAW=1` is the control that established it.
+        // Does anything downstream need a logit row that is NOT the last one?
         //
-        // Why it is not merely a scale fix: RMS norm is scale-invariant, so the
-        // two differ ONLY by the final norm's learned weight vector applied in
-        // between. That the weights help says the heads were trained on
-        // post-final-norm hidden states.
-        //
-        // It also makes `chain_hidden_post_norm: false` coherent, which the raw
-        // reading did not. That flag governs the CHAIN — whether a head's output
-        // is normed before the next head sees it — and it is off, so stages 1..k
-        // stay raw. The ENTRY from the main stack is a separate question and the
-        // flag never spoke to it.
-        let entry = if std::env::var("INK_MTP_RAW").map(|val| val == "1").unwrap_or(false) {
-            x.clone()
-        } else {
-            rms_norm(&x, &fnorm_d.data, t.rms_norm_eps, n, h)
-        };
-        // ...for the rows the verifier KEPT, and no further. A speculative pass
-        // computes a hidden state for every row it fed, and the ones past the
-        // accepted prefix are functions of tokens the model did not choose. An
-        // MTP head drafting from one of those would be drafting off a state
-        // that never happened, and nothing downstream would say so.
-        let entry = if verify_rows > 1 && new_toks.len() < n {
-            entry[..new_toks.len() * h].to_vec()
-        } else {
-            entry
-        };
-        // RETAIN it, and that is the whole enabling change. An MTP head's input
-        // at position j is (main_hidden[j], embed(token[j+1])), and
-        // main_hidden[j] never changes once produced -- attention is causal, so
-        // nothing later reaches back and alters it. What stopped the cached lane
-        // from drafting was never that the values move; it was that the loop
-        // DISCARDED them. 16 KB a token at f32, against a 144 GiB working set.
-        //
-        // Uncached, every pass recomputes the whole prefix, so this is an
-        // assignment there and an append here, and both lanes end holding the
-        // same table over the same sequence.
-        // `kv` as well as the switch: the device draft lane only runs cached,
-        // and uncached this would upload the whole recomputed prefix once a
-        // pass for a reader that does not exist.
-        if mtp_dev_on && kv {
-            // Uploaded BEFORE the host table takes ownership, and appended on
-            // the same rule: an append with a cache, a replacement without one,
-            // so both tables end holding the same rows over the same sequence.
-            let rows = entry.len() / h;
-            let e_dev = up2::<Bk>(entry.clone(), rows, h, &dev);
-            mtp_main_dev = Some(match (kv, mtp_main_dev.take()) {
-                (true, Some(prev)) => BT::cat(vec![prev, e_dev], 0),
-                _ => e_dev,
-            });
-        }
-        if kv {
-            mtp_main.extend_from_slice(&entry);
-        } else {
-            mtp_main = entry;
-        }
-        let seq = ids.len();
-        debug_assert_eq!(mtp_main.len(), seq * h, "one retained hidden row per token");
+        // The argmax reads exactly one row -- the last -- and that is the whole of
+        // what a forward produces. Every other row of the head exists for the
+        // REPORT: the per-position top-5 table and the `INK_DUMP_DIR` capture. On a
+        // 512-token prefill those rows are 512 x 200058 f32 = 410 MB read back
+        // across the bus, on top of a 4096-wide GEMM over 512 rows instead of 16.
+        // So they are computed when a reader has asked for them and not otherwise.
+        // `INK_ALL_LOGITS=1` is that ask; a dump implies it.
+        let all_logits = dump_dir.is_some()
+            || std::env::var("INK_ALL_LOGITS")
+                .map(|val| val == "1")
+                .unwrap_or(false);
 
-        // One row of logits, argmaxed. The device head returns the FULL vocab
-        // width, so index by what came back rather than by whichever constant
-        // happens to match, or the argmax silently reads the wrong row.
+        // ---- head, or the wire in its place ------------------------------------
+        let v = t.effective_vocab();
+        let t_h = Instant::now();
+        // A head has no logits and never will: the rest of the stack and the
+        // unembedding both live on the other machine. So it hands the stream over
+        // and takes the argmax back, and that blocking call is charged to the same
+        // slot the head/unembed occupies on a whole-stack run — which is what makes
+        // the two reports read against each other line for line.
+        let mut best_wire = None;
+        // Which position `logits[0]` is. The head computes `logit_row0..n`, so this
+        // is 0 when everything was asked for and `n - 1` when only the argmax's row
+        // was. A head computes nothing and the value is unread there.
+        // How many of this pass's rows the verifier has to read an argmax off. One,
+        // normally -- a forward produces one token. A speculative pass produces one
+        // PER ROW, and every one of them is needed: the accepted prefix is the
+        // leading run where the draft and the argmax agree, so a rule that only
+        // looked at the last row could not find where the agreement stopped.
+        let verify_rows = if spec_k > 0 && kv && step > 0 { n } else { 1 };
+        // The width probe's rows, derived from the batch the head actually sent
+        // rather than from this process's environment -- so INK_WIDTH is set on the
+        // head alone and the two ends cannot disagree about it.
         //
-        // ONE row and not `n` of them: a draft is read off the last position and
-        // the head is per-row, so unembedding the prefix was 89 G multiply-adds
-        // per position thrown away.
-        // Every draft head's distribution, in the order the heads are read, for
-        // the pass that is drafting now. A side channel rather than a return
-        // value because `draft_argmax` is called from two lanes and one of them
-        // (`draft_whole`) is also the INK_MTP_CHECK control, which must not
-        // contribute.
-        let draft_probs: std::cell::RefCell<Vec<Vec<f32>>> = std::cell::RefCell::new(Vec::new());
-        let draft_argmax = |row: &[f32]| -> usize {
-            debug_assert_eq!(row.len(), h, "the draft head unembeds exactly one position");
-            let dl = {
-                let ud = unembed_w.as_ref().expect("drafting needs the unembed table");
-                let hs = dev_lane::rms_norm(
-                    up2::<Bk>(row.to_vec(), 1, h, &dev),
-                    fnorm_dev.clone().expect("drafting needs the final norm"),
-                    t.rms_norm_eps,
-                )
-                .div_scalar(t.logits_mup_width_multiplier as f32);
-                down(dev_lane::linear_bf16(hs, ud).slice([0..1, 0..v]))
+        // Every row is unembedded, and that is deliberate: b independent sequences
+        // each need their own logits, so a probe that unembedded one row would
+        // leave the widest matmul in the stack out of the price.
+        let probe_rows = if spec_k == 0 && kv && is_decode && n > 1 && !slot_lane {
+            n
+        } else {
+            1
+        };
+        // The rows a slot batch reads an argmax off: all of them, because each one
+        // is a different sequence and each one's next token is a fact about it.
+        // This is the widest matmul in the stack run at its real width, which is
+        // the half of batched decode the width probe was already honest about.
+        let slot_rows = if slot_lane && is_decode { n } else { 1 };
+        let logit_row0 = if all_logits || probe_rows > 1 || slot_rows > 1 {
+            0
+        } else {
+            n - verify_rows
+        };
+        let (mut t_send, mut t_wait_peer) = (0f64, 0f64);
+        let mut wire_toks: Vec<usize> = Vec::new();
+        // Which cohort the answer read on THIS pass belongs to. The pass's own
+        // cohort everywhere except an interleaved head, where it is the cohort sent
+        // a pass earlier -- so the tokens land in that cohort's streams and not in
+        // the one this pass just computed.
+        let mut answer_coh = coh;
+        // False on exactly the passes an interleaved head starts a cohort it has
+        // not yet heard back about: the first `ncohorts - 1` decode passes. Nothing
+        // was confirmed, so nothing is committed.
+        let mut answered = true;
+        let logits = if let Some(Pipe::Head(s)) = pipe.as_mut() {
+            let t_s = Instant::now();
+            send_stream(s, n, pos0, coh, &x)?;
+            t_send = t_s.elapsed().as_secs_f64();
+            in_flight.push_back(coh);
+            // THE interleave, and it is this line. `want` is how many answers the
+            // head is content to leave outstanding once this pass is over: zero
+            // with one cohort, which is the strict send-then-block loop this file
+            // has always run, and `ncohorts - 1` while decoding with more, which
+            // leaves the tail exactly one round of work to do while the head starts
+            // the next cohort. The prefills stay strict whatever `ncohorts` is --
+            // a prefill's answer seeds the slot it just filled, and there is
+            // nothing to overlap it with.
+            let want = if is_decode { ncohorts - 1 } else { 0 };
+            let t_w = Instant::now();
+            if in_flight.len() > want {
+                // The tail's FIRST message: the tokens its verify pass confirmed.
+                // Never empty -- the row fed the last confirmed token always
+                // produces one -- and longer than one exactly when drafts were
+                // accepted. The drafts for the NEXT pass are a second message, read
+                // further down, so this process gets to commit its caches in
+                // between.
+                answer_coh = in_flight.pop_front().expect("just pushed one");
+                wire_toks = recv_toks(s)?;
+                anyhow::ensure!(!wire_toks.is_empty(), "the tail confirmed no token at all");
+                best_wire = Some(*wire_toks.last().expect("checked non-empty"));
+            } else {
+                answered = false;
+            }
+            t_wait_peer = t_w.elapsed().as_secs_f64();
+            Vec::new()
+        } else {
+            // 109 x 4096 x 200058 is 89 G multiply-adds — the single largest
+            // matmul in the forward, and the one left standing once attention and
+            // the MLPs move. There is no host twin: 89 G scalar multiply-adds is
+            // not a reference, it is an afternoon. The muP divisor divides BEFORE
+            // the projection, matching the reference: doing it after is
+            // algebraically equal and numerically not.
+            //
+            // The rows: `logit_row0..n`, which is the last row alone unless a
+            // reporter asked for all of them. The unembedding is the widest matmul
+            // in the stack (n x 4096 x 200058) and the only consumer of all but its
+            // final row is a print, so the slice happens on the INPUT -- before the
+            // GEMM and before the readback -- rather than after both.
+            let hx = if all_logits {
+                xd.clone()
+            } else {
+                xd.clone().slice([logit_row0..n, 0..h])
             };
-            let mut b = 0usize;
-            for (i, &val) in dl.iter().take(v).enumerate() {
-                if val > dl[b] {
-                    b = i;
-                }
-            }
-            if mtp_prob {
-                draft_probs.borrow_mut().push(softmax_row(&dl[..v]));
-            }
+            let hs = dev_lane_resid::rms_norm(
+                hx,
+                fnorm_dev.clone().expect("the tail owns the final norm"),
+                t.rms_norm_eps,
+            )
+            .div_scalar(t.logits_mup_width_multiplier as f32);
+            let uw = unembed_w
+                .as_ref()
+                .expect("the tail binds the unembed table");
+            down(dev_lane::linear_bf16(hs, uw).slice([0..n - logit_row0, 0..v]))
+        };
+        let t_head = t_h.elapsed().as_secs_f64();
+
+        // Greedy: the last position's argmax is the next token. A head took it off
+        // the wire instead of computing it, and either way it is decided HERE --
+        // before the reporting -- so a tail can answer its peer immediately rather
+        // than making the head wait on a page of printing.
+        // How many DRAFTS this pass kept, and the tokens it confirmed. Acceptance
+        // is exact argmax match and deliberately not a stochastic rule: measured on
+        // this model the exact rule accepts MORE (49.5% against 45.6% sampled and
+        // 40.6% under 1-TV), because when the draft is the argmax the target agrees
+        // strongly and when it is not the target puts little mass there either.
+        let new_toks: Vec<usize>;
+        let best = if !answered {
+            // An interleaved head, on the pass that opened a cohort. The answer is
+            // still on the tail; it is read one pass later and committed there.
+            new_toks = Vec::new();
+            0
+        } else if let Some(b) = best_wire {
+            new_toks = wire_toks.clone();
             b
-        };
-
-        // The whole-sequence draft: every head over every position. This is what
-        // the uncached lane runs, and what `INK_MTP_CHECK` gates the cached lane
-        // against. `hidden` is the ENTRY state for the WHOLE sequence, which is
-        // precisely the thing the cache exists so as not to need.
-        let draft_whole = |hidden: &[f32], seq: usize, ids: &[usize], best: usize| -> Vec<usize> {
-            let mut stage = hidden.to_vec();
-            // The token at each position, one step ahead: position j predicts
-            // ids[j+1], and the LAST position predicts `best`.
-            let mut ahead: Vec<usize> = ids[1..].to_vec();
-            ahead.push(best);
-            let mut out = Vec::with_capacity(mtp_heads.len());
-            for headw in mtp_heads.iter() {
-                debug_assert_eq!(ahead.len(), seq, "one shifted token per position");
-                let mut embeds = vec![0f32; seq * h];
-                for (j, &tok) in ahead.iter().enumerate() {
-                    embeds[j * h..(j + 1) * h]
-                        .copy_from_slice(&embed_row_bf16(e_w, tok, t.vocab_size, h));
+        } else {
+            let mut accepted = 0usize;
+            let rows = n - logit_row0;
+            let argmax_of = |i: usize| -> usize {
+                let row = &logits[i * v..(i + 1) * v];
+                let mut b = 0usize;
+                for (j, &val) in row.iter().enumerate() {
+                    if val > row[b] {
+                        b = j;
+                    }
                 }
-                stage = mtp_block(
-                    &stage,
-                    &embeds,
-                    // DENSE intermediate, not the routed experts' -- every MTP
-                    // block is dense regardless of dense_mlp_idx, and the two
-                    // sizes differ by 8x (16384 against 2048).
-                    &headw.borrow(t.dense_intermediate_size),
-                    &headw.dims,
-                    Some(ls),
-                    headw.window(t.sliding_window_size),
-                    seq,
-                    mtp_order,
-                );
-                let b = draft_argmax(&stage[(seq - 1) * h..seq * h]);
-                out.push(b);
-                ahead.remove(0);
-                ahead.push(b);
-            }
-            out
-        };
-
-        // The same unembedding, fed a row that is already on the device. The
-        // host twin above exists for the host draft lane and reads a `&[f32]`;
-        // this one would otherwise pay a 16 KB readback and a 16 KB upload per
-        // draft for the privilege of handing the value straight back.
-        let draft_argmax_dev = |row: T2| -> usize {
-            let dl = {
-                let ud = unembed_w.as_ref().expect("drafting needs the unembed table");
-                let hs = dev_lane::rms_norm(
-                    row,
-                    fnorm_dev.clone().expect("drafting needs the final norm"),
-                    t.rms_norm_eps,
-                )
-                .div_scalar(t.logits_mup_width_multiplier as f32);
-                down(dev_lane::linear_bf16(hs, ud).slice([0..1, 0..v]))
+                b
             };
-            let mut b = 0usize;
-            for (i, &val) in dl.iter().take(v).enumerate() {
-                if val > dl[b] {
-                    b = i;
-                }
-            }
-            if mtp_prob {
-                draft_probs.borrow_mut().push(softmax_row(&dl[..v]));
-            }
-            b
-        };
-
-        draft_probs.borrow_mut().clear();
-        let t_mtp = Instant::now();
-        let drafts: Vec<usize> = if kv && mtp_dev_on {
-            // The device lane, structurally identical to the host one below --
-            // ragged stable rows, a speculative tail run against a CLONE of the
-            // cache -- so the two can be read against each other line for line.
-            if mtp_devs.is_empty() {
-                let t_up = Instant::now();
-                let mut bytes = 0u64;
-                for i in 0..mtp_k {
-                    let pre = format!("model.mtp.layers.{i}.");
-                    let p = format!("{pre}transformer_block.");
-                    let hd = &mtp_heads[i].dims;
-                    let pw = |nm: &str, rows: usize, cols: usize| -> Result<Bf16W> {
-                        let leaf = cp.stored(&format!("{p}{nm}"))?;
-                        anyhow::ensure!(
-                            leaf.elem == Elem::Bf16,
-                            "{p}{nm} is {:?}; this lane multiplies BF16 by BF16",
-                            leaf.elem
-                        );
-                        Ok(bind_bf16(&fp4_client, fp4_aliases.as_ref(), &leaf.bytes, rows, cols))
-                    };
-                    let ip = cp.stored(&format!("{pre}input_proj.weight"))?;
-                    anyhow::ensure!(ip.elem == Elem::Bf16, "input_proj is {:?}", ip.elem);
-                    let gv = |nm: &str| -> Result<Vec<f32>> { Ok(cp.tensor(nm)?.data) };
-                    // Bound here rather than through [`DeviceDense`], whose map
-                    // is keyed by LAYER prefix and whose byte counter feeds the
-                    // per-layer report: an MTP head is not one of this node's
-                    // layers and counting it there would misattribute 1 GiB.
-                    let dense = {
-                        let fused = cp.stored(&format!("{p}mlp.w13_dn.weight"))?;
-                        anyhow::ensure!(fused.elem == Elem::Bf16, "mtp w13 is {:?}", fused.elem);
-                        let (g, u) = mary::models::inkling::load::split_gate_up_bytes(
-                            &fused.bytes,
-                            h,
-                            2,
-                        );
-                        let dw = cp.stored(&format!("{p}mlp.w2_md.weight"))?;
-                        anyhow::ensure!(dw.elem == Elem::Bf16, "mtp w2 is {:?}", dw.elem);
-                        let (drows, dcols) = (dw.dims[0] as usize, dw.dims[1] as usize);
-                        let inter = g.len() / (h * 2);
-                        let gs = cp.tensor(&format!("{p}mlp.global_scale"))?.data[0];
-                        bytes += (g.len() + u.len() + dw.bytes.len()) as u64;
-                        (
-                            bind_bf16(&fp4_client, fp4_aliases.as_ref(), &g, inter, h),
-                            bind_bf16(&fp4_client, fp4_aliases.as_ref(), &u, inter, h),
-                            bind_bf16(&fp4_client, fp4_aliases.as_ref(), &dw.bytes, drows, dcols),
-                            gs,
-                        )
-                    };
-                    let built = MtpDev {
-                        attn: dev_lane::AttnWeightsDev {
-                            wq: pw("attn.wq_du.weight", hd.heads * hd.head_dim, h)?,
-                            wk: pw("attn.wk_dv.weight", hd.kv_heads * hd.head_dim, h)?,
-                            wv: pw("attn.wv_dv.weight", hd.kv_heads * hd.head_dim, h)?,
-                            wr: pw("attn.wr_du.weight", hd.heads * hd.d_rel, h)?,
-                            wo: pw("attn.wo_ud.weight", h, hd.heads * hd.head_dim)?,
-                            k_sconv: up2(
-                                gv(&format!("{p}attn.k_sconv.weight"))?,
-                                hd.kv_heads * hd.head_dim,
-                                t.sconv_kernel_size,
-                                &dev,
-                            ),
-                            v_sconv: up2(
-                                gv(&format!("{p}attn.v_sconv.weight"))?,
-                                hd.kv_heads * hd.head_dim,
-                                t.sconv_kernel_size,
-                                &dev,
-                            ),
-                            q_norm: up1(gv(&format!("{p}attn.q_norm.weight"))?, hd.head_dim, &dev),
-                            k_norm: up1(gv(&format!("{p}attn.k_norm.weight"))?, hd.head_dim, &dev),
-                            rel_proj: up2(
-                                gv(&format!("{p}attn.rel_logits_proj.proj"))?,
-                                hd.d_rel,
-                                hd.rel_extent,
-                                &dev,
-                            ),
-                        },
-                        attn_sconv: up2(
-                            gv(&format!("{p}attn_sconv.weight"))?,
-                            h,
-                            t.sconv_kernel_size,
-                            &dev,
-                        ),
-                        mlp_sconv: up2(
-                            gv(&format!("{p}mlp_sconv.weight"))?,
-                            h,
-                            t.sconv_kernel_size,
-                            &dev,
-                        ),
-                        attn_norm: up1(gv(&format!("{p}attn_norm.weight"))?, h, &dev),
-                        mlp_norm: up1(gv(&format!("{p}mlp_norm.weight"))?, h, &dev),
-                        embed_norm: up1(gv(&format!("{pre}embed_norm.weight"))?, h, &dev),
-                        hidden_norm: up1(gv(&format!("{pre}hidden_norm.weight"))?, h, &dev),
-                        input_proj: bind_bf16(
-                            &fp4_client,
-                            fp4_aliases.as_ref(),
-                            &ip.bytes,
-                            h,
-                            2 * h,
-                        ),
-                        dense,
-                    };
-                    bytes += ip.bytes.len() as u64;
-                    mtp_devs.push(built);
-                }
-                <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync after MTP upload");
-                println!(
-                    "  MTP heads on the device: {mtp_k} in {:.2}s, {:.2} GiB bound",
-                    t_up.elapsed().as_secs_f32(),
-                    bytes as f64 / GIB
+            if verify_rows > 1 {
+                debug_assert_eq!(logit_row0, 0, "a verify pass reads from row 0");
+                anyhow::ensure!(
+                    n == 1 + last_drafts.len(),
+                    "the head fed {n} rows against {} drafts -- the two ends disagree on the \
+                 speculation width",
+                    last_drafts.len()
                 );
+                let preds: Vec<usize> = (0..rows).map(argmax_of).collect();
+                // Row i was fed the token at pos0+i and predicts pos0+i+1. Row 0
+                // was fed a CONFIRMED token, so its prediction is always kept;
+                // row i>0 was fed draft i-1, so its prediction is only a fact
+                // about the sequence if every draft before it was right.
+                while accepted < last_drafts.len() && last_drafts[accepted] == preds[accepted] {
+                    accepted += 1;
+                }
+                new_toks = preds[..=accepted].to_vec();
+            } else if slot_rows > 1 {
+                // One argmax per SLOT. Nothing is accepted or rejected here --
+                // a slot batch has no drafts, every row was fed a token its own
+                // sequence confirmed, and every row's prediction is kept.
+                new_toks = (0..rows).map(argmax_of).collect();
+            } else if probe_rows > 1 {
+                // Row 0 is the sequence; rows 1.. are the probe's filler and
+                // their argmaxes are about nothing. Reading row 0 and not the
+                // last row is what keeps the text identical to INK_WIDTH=1.
+                new_toks = vec![argmax_of(0)];
+            } else {
+                new_toks = vec![argmax_of(rows - 1)];
             }
-            let main_dev = mtp_main_dev.clone().expect("the entry states were uploaded above");
-            let mut prev_rows: Vec<T2> = Vec::new();
-            let mut drafts: Vec<usize> = Vec::with_capacity(mtp_k);
-            for d in 0..mtp_k {
-                let hd = mtp_heads[d].dims;
-                let window = mtp_heads[d].window(t.sliding_window_size);
-                let want = seq - d;
-                let have = mtp_stage_dev[d].as_ref().map(|x| x.dims()[0]).unwrap_or(0);
-                let row_of = |src: &Option<T2>, lo: usize, hi: usize| -> T2 {
-                    match src {
-                        Some(x) => x.clone().slice([lo..hi, 0..h]),
-                        None => unreachable!("head d-1 always has more stable rows than head d"),
+            *new_toks
+                .last()
+                .expect("at least one row is always confirmed")
+        };
+        // `ids`, the MTP scoring and the per-position report were all written about
+        // ONE sequence, and slot 0 is the one they follow. `best` is therefore slot
+        // 0's token and not the last row's, which is what it means everywhere else.
+        let best = if slot_lane && is_decode && answered {
+            new_toks[0]
+        } else {
+            best
+        };
+        let mut t_to_reply = 0f64;
+        if let Some(Pipe::Tail(s)) = pipe.as_mut() {
+            send_toks(s, &new_toks)?;
+            t_to_reply = pass.elapsed().as_secs_f64();
+        }
+        // Everything but the LAST confirmed token goes into `ids` now; the last one
+        // is `best` and is pushed where it has always been pushed, so the MTP block
+        // below sees exactly the sequence-and-a-held-back-argmax it was written
+        // against.
+        if is_tail && gen_steps > 0 && !repeat && new_toks.len() > 1 && !slot_lane {
+            ids.extend_from_slice(&new_toks[..new_toks.len() - 1]);
+        }
+        // Each slot's own stream. A prefill pass produced the first generated token
+        // of the slot it prefilled; a decode pass produces one for every slot. Both
+        // ends run this -- the head off the wire, the tail off its own argmax --
+        // for the same reason `ids` is recomputed rather than sent.
+        if slot_lane && gen_steps > 0 && !repeat {
+            if is_decode {
+                if answered {
+                    let base = answer_coh * nslots;
+                    for (q, tok) in slot_ids[base..base + nslots]
+                        .iter_mut()
+                        .zip(new_toks.iter())
+                    {
+                        q.push(*tok);
                     }
-                };
-                let stable: T2 = if have == 0 {
-                    let mut embeds = vec![0f32; want * h];
-                    for j in 0..want {
-                        let tok = if j + d + 1 < seq { ids[j + d + 1] } else { best };
-                        embeds[j * h..(j + 1) * h]
-                            .copy_from_slice(&embed_row_bf16(e_w, tok, t.vocab_size, h));
-                    }
-                    let ed = up2::<Bk>(embeds, want, h, &dev);
-                    let hin = if d == 0 {
-                        main_dev.clone().slice([0..want, 0..h])
-                    } else {
-                        row_of(&mtp_stage_dev[d - 1], 0, want)
-                    };
-                    let (y, c) = mtp_block_prefill_dev(
-                        hin,
-                        ed,
-                        &mtp_devs[d],
-                        &hd,
-                        Some(ls),
-                        window,
-                        t.sconv_kernel_size,
-                        t.rms_norm_eps,
-                        mtp_order,
-                    );
-                    mtp_dev_caches[d] = Some(c);
-                    y
+                }
+            } else {
+                slot_ids[step].push(best);
+            }
+        }
+        // ---- both ends roll back to the accepted prefix ------------------------
+        //
+        // `keep` is 1 + accepted: row 0 fed a confirmed token and rows 1..=accepted
+        // fed drafts the verifier kept, so their K, V and convolution memory are
+        // facts about the sequence the model actually chose. The rows past them
+        // were computed from tokens it did not choose, and leaving them behind does
+        // not error -- it shows up later as an acceptance rate that drifts down.
+        if verify_rows > 1 || probe_rows > 1 {
+            // One row for the probe -- its filler rows are not facts about any
+            // sequence and their K, V and convolution memory go away with them.
+            let keep = if verify_rows > 1 { new_toks.len() } else { 1 };
+            let hist = t.sconv_kernel_size - 1;
+            for (slot, c) in caches.iter_mut().enumerate() {
+                let window = if t.attn_kind(lo + slot) == AttnKind::Local {
+                    Some(t.sliding_window_size)
                 } else {
-                    // ONE row per CONFIRMED TOKEN, not one per pass. That used
-                    // to be the same number and an `assert_eq!(have + 1, want)`
-                    // said so; a speculative pass confirms 1 + accepted tokens
-                    // at once and every one of them makes a row of every head
-                    // stable. Head d's row at `pos` is fed the token at
-                    // pos + d + 1, which is in `ids` for all of them but the
-                    // last, where it is the argmax still being held back.
-                    let adv = want - have;
-                    assert!(adv >= 1, "a pass makes at least one row stable");
-                    let mut made: Vec<T2> = Vec::with_capacity(adv);
-                    for i in 0..adv {
-                        let pos = have + i;
-                        let hin = if d == 0 {
-                            main_dev.clone().slice([pos..pos + 1, 0..h])
-                        } else {
-                            row_of(&mtp_stage_dev[d - 1], pos, pos + 1)
-                        };
-                        let ahead = pos + d + 1;
-                        let tok = if ahead < seq { ids[ahead] } else { best };
-                        let ed = up2::<Bk>(
-                            embed_row_bf16(e_w, tok, t.vocab_size, h),
-                            1,
-                            h,
-                            &dev,
+                    None
+                };
+                c.attn.commit(keep, window);
+                if let Some(all) = c.attn_sconv_pending.take() {
+                    c.attn_sconv = dev_lane::conv_history(
+                        all.slice([0..hist + keep, 0..h]),
+                        t.sconv_kernel_size,
+                    );
+                }
+                if let Some(all) = c.mlp_sconv_pending.take() {
+                    c.mlp_sconv = Some(dev_lane::conv_history(
+                        all.slice([0..hist + keep, 0..h]),
+                        t.sconv_kernel_size,
+                    ));
+                }
+            }
+        }
+        // The tail's SECOND message, and the head's second wait: the drafts to feed
+        // next pass. Read after the commit on purpose -- that is device work this
+        // process can enqueue while the other machine is still drafting.
+        if let Some(Pipe::Head(s)) = pipe.as_mut() {
+            if spec_k > 0 {
+                let t_w = Instant::now();
+                drafts_in = recv_toks(s)?;
+                t_wait_peer += t_w.elapsed().as_secs_f64();
+                anyhow::ensure!(
+                    drafts_in.len() == spec_k,
+                    "the tail sent {} drafts against INK_SPEC={spec_k}",
+                    drafts_in.len()
+                );
+            }
+        }
+        if is_decode && !slot_lane {
+            let bucket = new_toks.len().min(spec_hist.len() - 1);
+            spec_hist[bucket] += 1;
+        }
+
+        // ---- MTP: score the drafts that named this step, then draft afresh -----
+        if mtp_k > 0 {
+            // SCORE FIRST, against `best` -- the token the full stack just produced.
+            // This is the whole experiment: a draft is right or it is not, and the
+            // rate over many steps is the only oracle the composition has.
+            // The target's OWN distribution at this position, once per pass rather
+            // than once per pending draft. `logits` holds the argmax's row and only
+            // that row unless a reporter asked for more, which is exactly the row
+            // every rule below reads.
+            let p_t: Vec<f32> = if mtp_prob && !logits.is_empty() {
+                softmax_row(&logits[(n - 1 - logit_row0) * v..(n - logit_row0) * v])
+            } else {
+                Vec::new()
+            };
+            mtp_pending.retain(|&(target, depth, tok)| {
+                // Off when the loop is speculating: `step` no longer names one
+                // token, so a draft issued at step s cannot be matched to "the
+                // token step s+d+1 produced". The accept-and-skip loop verifies its
+                // own drafts against the rows they were fed into and reports the
+                // prefix histogram instead, which is the same measurement taken
+                // where it is now decidable.
+                if spec_k > 0 || target != step {
+                    return true;
+                }
+                mtp_seen[depth] += 1;
+                if mtp_prob {
+                    if let Some(pd) = mtp_pd.remove(&(target, depth)) {
+                        // B: the target's own probability on the token that was
+                        // drafted. C: the overlap of the two distributions.
+                        let b = p_t.get(tok).copied().unwrap_or(0.0) as f64;
+                        let c: f64 = pd
+                            .iter()
+                            .zip(p_t.iter())
+                            .map(|(a, t)| a.min(*t) as f64)
+                            .sum();
+                        mtp_b_sum[depth] += b;
+                        mtp_c_sum[depth] += c;
+                        mtp_prob_n[depth] += 1;
+                        // `tok` IS the draft's argmax, so this is the head's own
+                        // top-1 mass -- its confidence, not the target's.
+                        mtp_conf[depth].push((pd.get(tok).copied().unwrap_or(0.0), tok == best));
+                        if let Some(slots) = mtp_issued_q.get_mut(&(target - depth - 1)) {
+                            slots[depth] = Some((b, c));
+                        }
+                    }
+                }
+                if tok == best {
+                    mtp_hits[depth] += 1;
+                }
+                // The step this draft was ISSUED at: head d drafted the token d+1
+                // steps ahead, so the issuer is target - depth - 1.
+                if let Some(slots) = mtp_issued.get_mut(&(target - depth - 1)) {
+                    slots[depth] = Some(tok == best);
+                }
+                println!(
+                    "  MTP depth {}: drafted {tok}, actual {best} -- {}",
+                    depth + 1,
+                    if tok == best { "HIT" } else { "miss" }
+                );
+                false
+            });
+
+            // DRAFT. Head d is fed the previous stage's hidden states and the
+            // embeddings of the tokens shifted one further along, so head 0 sees
+            // the token the stack just chose and head d sees draft d-1.
+            let e_w = embed_w
+                .as_ref()
+                .expect("drafting needs the embedding table");
+            let fnorm_d = fnorm.as_ref().expect("drafting needs the final norm");
+            // Which hidden state head 0 is fed. `x` is the stack's RAW output, which
+            // `head` norms on its way to logits. Feeding the FINAL-NORMED one
+            // measured twice as well (25% -> 50% on a matched 20-token run), so it
+            // is the default; `INK_MTP_RAW=1` is the control that established it.
+            //
+            // Why it is not merely a scale fix: RMS norm is scale-invariant, so the
+            // two differ ONLY by the final norm's learned weight vector applied in
+            // between. That the weights help says the heads were trained on
+            // post-final-norm hidden states.
+            //
+            // It also makes `chain_hidden_post_norm: false` coherent, which the raw
+            // reading did not. That flag governs the CHAIN — whether a head's output
+            // is normed before the next head sees it — and it is off, so stages 1..k
+            // stay raw. The ENTRY from the main stack is a separate question and the
+            // flag never spoke to it.
+            let entry = if std::env::var("INK_MTP_RAW")
+                .map(|val| val == "1")
+                .unwrap_or(false)
+            {
+                x.clone()
+            } else {
+                rms_norm(&x, &fnorm_d.data, t.rms_norm_eps, n, h)
+            };
+            // ...for the rows the verifier KEPT, and no further. A speculative pass
+            // computes a hidden state for every row it fed, and the ones past the
+            // accepted prefix are functions of tokens the model did not choose. An
+            // MTP head drafting from one of those would be drafting off a state
+            // that never happened, and nothing downstream would say so.
+            let entry = if verify_rows > 1 && new_toks.len() < n {
+                entry[..new_toks.len() * h].to_vec()
+            } else {
+                entry
+            };
+            // RETAIN it, and that is the whole enabling change. An MTP head's input
+            // at position j is (main_hidden[j], embed(token[j+1])), and
+            // main_hidden[j] never changes once produced -- attention is causal, so
+            // nothing later reaches back and alters it. What stopped the cached lane
+            // from drafting was never that the values move; it was that the loop
+            // DISCARDED them. 16 KB a token at f32, against a 144 GiB working set.
+            //
+            // Uncached, every pass recomputes the whole prefix, so this is an
+            // assignment there and an append here, and both lanes end holding the
+            // same table over the same sequence.
+            // `kv` as well as the switch: the device draft lane only runs cached,
+            // and uncached this would upload the whole recomputed prefix once a
+            // pass for a reader that does not exist.
+            if mtp_dev_on && kv {
+                // Uploaded BEFORE the host table takes ownership, and appended on
+                // the same rule: an append with a cache, a replacement without one,
+                // so both tables end holding the same rows over the same sequence.
+                let rows = entry.len() / h;
+                let e_dev = up2::<Bk>(entry.clone(), rows, h, &dev);
+                mtp_main_dev = Some(match (kv, mtp_main_dev.take()) {
+                    (true, Some(prev)) => BT::cat(vec![prev, e_dev], 0),
+                    _ => e_dev,
+                });
+            }
+            if kv {
+                mtp_main.extend_from_slice(&entry);
+            } else {
+                mtp_main = entry;
+            }
+            let seq = ids.len();
+            debug_assert_eq!(mtp_main.len(), seq * h, "one retained hidden row per token");
+
+            // One row of logits, argmaxed. The device head returns the FULL vocab
+            // width, so index by what came back rather than by whichever constant
+            // happens to match, or the argmax silently reads the wrong row.
+            //
+            // ONE row and not `n` of them: a draft is read off the last position and
+            // the head is per-row, so unembedding the prefix was 89 G multiply-adds
+            // per position thrown away.
+            // Every draft head's distribution, in the order the heads are read, for
+            // the pass that is drafting now. A side channel rather than a return
+            // value because `draft_argmax` is called from two lanes and one of them
+            // (`draft_whole`) is also the INK_MTP_CHECK control, which must not
+            // contribute.
+            let draft_probs: std::cell::RefCell<Vec<Vec<f32>>> =
+                std::cell::RefCell::new(Vec::new());
+            let draft_argmax = |row: &[f32]| -> usize {
+                debug_assert_eq!(row.len(), h, "the draft head unembeds exactly one position");
+                let dl = {
+                    let ud = unembed_w
+                        .as_ref()
+                        .expect("drafting needs the unembed table");
+                    let hs = dev_lane::rms_norm(
+                        up2::<Bk>(row.to_vec(), 1, h, &dev),
+                        fnorm_dev.clone().expect("drafting needs the final norm"),
+                        t.rms_norm_eps,
+                    )
+                    .div_scalar(t.logits_mup_width_multiplier as f32);
+                    down(dev_lane::linear_bf16(hs, ud).slice([0..1, 0..v]))
+                };
+                let mut b = 0usize;
+                for (i, &val) in dl.iter().take(v).enumerate() {
+                    if val > dl[b] {
+                        b = i;
+                    }
+                }
+                if mtp_prob {
+                    draft_probs.borrow_mut().push(softmax_row(&dl[..v]));
+                }
+                b
+            };
+
+            // The whole-sequence draft: every head over every position. This is what
+            // the uncached lane runs, and what `INK_MTP_CHECK` gates the cached lane
+            // against. `hidden` is the ENTRY state for the WHOLE sequence, which is
+            // precisely the thing the cache exists so as not to need.
+            let draft_whole =
+                |hidden: &[f32], seq: usize, ids: &[usize], best: usize| -> Vec<usize> {
+                    let mut stage = hidden.to_vec();
+                    // The token at each position, one step ahead: position j predicts
+                    // ids[j+1], and the LAST position predicts `best`.
+                    let mut ahead: Vec<usize> = ids[1..].to_vec();
+                    ahead.push(best);
+                    let mut out = Vec::with_capacity(mtp_heads.len());
+                    for headw in mtp_heads.iter() {
+                        debug_assert_eq!(ahead.len(), seq, "one shifted token per position");
+                        let mut embeds = vec![0f32; seq * h];
+                        for (j, &tok) in ahead.iter().enumerate() {
+                            embeds[j * h..(j + 1) * h].copy_from_slice(&embed_row_bf16(
+                                e_w,
+                                tok,
+                                t.vocab_size,
+                                h,
+                            ));
+                        }
+                        stage = mtp_block(
+                            &stage,
+                            &embeds,
+                            // DENSE intermediate, not the routed experts' -- every MTP
+                            // block is dense regardless of dense_mlp_idx, and the two
+                            // sizes differ by 8x (16384 against 2048).
+                            &headw.borrow(t.dense_intermediate_size),
+                            &headw.dims,
+                            Some(ls),
+                            headw.window(t.sliding_window_size),
+                            seq,
+                            mtp_order,
                         );
-                        made.push(mtp_block_step_dev(
+                        let b = draft_argmax(&stage[(seq - 1) * h..seq * h]);
+                        out.push(b);
+                        ahead.remove(0);
+                        ahead.push(b);
+                    }
+                    out
+                };
+
+            // The same unembedding, fed a row that is already on the device. The
+            // host twin above exists for the host draft lane and reads a `&[f32]`;
+            // this one would otherwise pay a 16 KB readback and a 16 KB upload per
+            // draft for the privilege of handing the value straight back.
+            let draft_argmax_dev = |row: T2| -> usize {
+                let dl = {
+                    let ud = unembed_w
+                        .as_ref()
+                        .expect("drafting needs the unembed table");
+                    let hs = dev_lane::rms_norm(
+                        row,
+                        fnorm_dev.clone().expect("drafting needs the final norm"),
+                        t.rms_norm_eps,
+                    )
+                    .div_scalar(t.logits_mup_width_multiplier as f32);
+                    down(dev_lane::linear_bf16(hs, ud).slice([0..1, 0..v]))
+                };
+                let mut b = 0usize;
+                for (i, &val) in dl.iter().take(v).enumerate() {
+                    if val > dl[b] {
+                        b = i;
+                    }
+                }
+                if mtp_prob {
+                    draft_probs.borrow_mut().push(softmax_row(&dl[..v]));
+                }
+                b
+            };
+
+            draft_probs.borrow_mut().clear();
+            let t_mtp = Instant::now();
+            let drafts: Vec<usize> = if kv && mtp_dev_on {
+                // The device lane, structurally identical to the host one below --
+                // ragged stable rows, a speculative tail run against a CLONE of the
+                // cache -- so the two can be read against each other line for line.
+                if mtp_devs.is_empty() {
+                    let t_up = Instant::now();
+                    let mut bytes = 0u64;
+                    for i in 0..mtp_k {
+                        let pre = format!("model.mtp.layers.{i}.");
+                        let p = format!("{pre}transformer_block.");
+                        let hd = &mtp_heads[i].dims;
+                        let pw = |nm: &str, rows: usize, cols: usize| -> Result<Bf16W> {
+                            let leaf = cp.stored(&format!("{p}{nm}"))?;
+                            anyhow::ensure!(
+                                leaf.elem == Elem::Bf16,
+                                "{p}{nm} is {:?}; this lane multiplies BF16 by BF16",
+                                leaf.elem
+                            );
+                            Ok(bind_bf16(
+                                &fp4_client,
+                                fp4_aliases.as_ref(),
+                                &leaf.bytes,
+                                rows,
+                                cols,
+                            ))
+                        };
+                        let ip = cp.stored(&format!("{pre}input_proj.weight"))?;
+                        anyhow::ensure!(ip.elem == Elem::Bf16, "input_proj is {:?}", ip.elem);
+                        let gv = |nm: &str| -> Result<Vec<f32>> { Ok(cp.tensor(nm)?.data) };
+                        // Bound here rather than through [`DeviceDense`], whose map
+                        // is keyed by LAYER prefix and whose byte counter feeds the
+                        // per-layer report: an MTP head is not one of this node's
+                        // layers and counting it there would misattribute 1 GiB.
+                        let dense = {
+                            let fused = cp.stored(&format!("{p}mlp.w13_dn.weight"))?;
+                            anyhow::ensure!(
+                                fused.elem == Elem::Bf16,
+                                "mtp w13 is {:?}",
+                                fused.elem
+                            );
+                            let (g, u) = mary::models::inkling::load::split_gate_up_bytes(
+                                &fused.bytes,
+                                h,
+                                2,
+                            );
+                            let dw = cp.stored(&format!("{p}mlp.w2_md.weight"))?;
+                            anyhow::ensure!(dw.elem == Elem::Bf16, "mtp w2 is {:?}", dw.elem);
+                            let (drows, dcols) = (dw.dims[0] as usize, dw.dims[1] as usize);
+                            let inter = g.len() / (h * 2);
+                            let gs = cp.tensor(&format!("{p}mlp.global_scale"))?.data[0];
+                            bytes += (g.len() + u.len() + dw.bytes.len()) as u64;
+                            (
+                                bind_bf16(&fp4_client, fp4_aliases.as_ref(), &g, inter, h),
+                                bind_bf16(&fp4_client, fp4_aliases.as_ref(), &u, inter, h),
+                                bind_bf16(
+                                    &fp4_client,
+                                    fp4_aliases.as_ref(),
+                                    &dw.bytes,
+                                    drows,
+                                    dcols,
+                                ),
+                                gs,
+                            )
+                        };
+                        let built = MtpDev {
+                            attn: dev_lane::AttnWeightsDev {
+                                wq: pw("attn.wq_du.weight", hd.heads * hd.head_dim, h)?,
+                                wk: pw("attn.wk_dv.weight", hd.kv_heads * hd.head_dim, h)?,
+                                wv: pw("attn.wv_dv.weight", hd.kv_heads * hd.head_dim, h)?,
+                                wr: pw("attn.wr_du.weight", hd.heads * hd.d_rel, h)?,
+                                wo: pw("attn.wo_ud.weight", h, hd.heads * hd.head_dim)?,
+                                k_sconv: up2(
+                                    gv(&format!("{p}attn.k_sconv.weight"))?,
+                                    hd.kv_heads * hd.head_dim,
+                                    t.sconv_kernel_size,
+                                    &dev,
+                                ),
+                                v_sconv: up2(
+                                    gv(&format!("{p}attn.v_sconv.weight"))?,
+                                    hd.kv_heads * hd.head_dim,
+                                    t.sconv_kernel_size,
+                                    &dev,
+                                ),
+                                q_norm: up1(
+                                    gv(&format!("{p}attn.q_norm.weight"))?,
+                                    hd.head_dim,
+                                    &dev,
+                                ),
+                                k_norm: up1(
+                                    gv(&format!("{p}attn.k_norm.weight"))?,
+                                    hd.head_dim,
+                                    &dev,
+                                ),
+                                rel_proj: up2(
+                                    gv(&format!("{p}attn.rel_logits_proj.proj"))?,
+                                    hd.d_rel,
+                                    hd.rel_extent,
+                                    &dev,
+                                ),
+                            },
+                            attn_sconv: up2(
+                                gv(&format!("{p}attn_sconv.weight"))?,
+                                h,
+                                t.sconv_kernel_size,
+                                &dev,
+                            ),
+                            mlp_sconv: up2(
+                                gv(&format!("{p}mlp_sconv.weight"))?,
+                                h,
+                                t.sconv_kernel_size,
+                                &dev,
+                            ),
+                            attn_norm: up1(gv(&format!("{p}attn_norm.weight"))?, h, &dev),
+                            mlp_norm: up1(gv(&format!("{p}mlp_norm.weight"))?, h, &dev),
+                            embed_norm: up1(gv(&format!("{pre}embed_norm.weight"))?, h, &dev),
+                            hidden_norm: up1(gv(&format!("{pre}hidden_norm.weight"))?, h, &dev),
+                            input_proj: bind_bf16(
+                                &fp4_client,
+                                fp4_aliases.as_ref(),
+                                &ip.bytes,
+                                h,
+                                2 * h,
+                            ),
+                            dense,
+                        };
+                        bytes += ip.bytes.len() as u64;
+                        mtp_devs.push(built);
+                    }
+                    <Bk as burn::tensor::backend::Backend>::sync(&dev)
+                        .expect("sync after MTP upload");
+                    println!(
+                        "  MTP heads on the device: {mtp_k} in {:.2}s, {:.2} GiB bound",
+                        t_up.elapsed().as_secs_f32(),
+                        bytes as f64 / GIB
+                    );
+                }
+                let main_dev = mtp_main_dev
+                    .clone()
+                    .expect("the entry states were uploaded above");
+                let mut prev_rows: Vec<T2> = Vec::new();
+                let mut drafts: Vec<usize> = Vec::with_capacity(mtp_k);
+                for d in 0..mtp_k {
+                    let hd = mtp_heads[d].dims;
+                    let window = mtp_heads[d].window(t.sliding_window_size);
+                    let want = seq - d;
+                    let have = mtp_stage_dev[d].as_ref().map(|x| x.dims()[0]).unwrap_or(0);
+                    let row_of = |src: &Option<T2>, lo: usize, hi: usize| -> T2 {
+                        match src {
+                            Some(x) => x.clone().slice([lo..hi, 0..h]),
+                            None => {
+                                unreachable!("head d-1 always has more stable rows than head d")
+                            }
+                        }
+                    };
+                    let stable: T2 = if have == 0 {
+                        let mut embeds = vec![0f32; want * h];
+                        for j in 0..want {
+                            let tok = if j + d + 1 < seq {
+                                ids[j + d + 1]
+                            } else {
+                                best
+                            };
+                            embeds[j * h..(j + 1) * h].copy_from_slice(&embed_row_bf16(
+                                e_w,
+                                tok,
+                                t.vocab_size,
+                                h,
+                            ));
+                        }
+                        let ed = up2::<Bk>(embeds, want, h, &dev);
+                        let hin = if d == 0 {
+                            main_dev.clone().slice([0..want, 0..h])
+                        } else {
+                            row_of(&mtp_stage_dev[d - 1], 0, want)
+                        };
+                        let (y, c) = mtp_block_prefill_dev(
                             hin,
                             ed,
                             &mtp_devs[d],
                             &hd,
                             Some(ls),
-                            pos,
                             window,
-                            mtp_dev_caches[d].as_mut().expect("prefilled on the first pass"),
+                            t.sconv_kernel_size,
                             t.rms_norm_eps,
                             mtp_order,
-                        ));
-                    }
-                    if made.len() == 1 {
-                        made.pop().expect("one row")
+                        );
+                        mtp_dev_caches[d] = Some(c);
+                        y
                     } else {
-                        BT::cat(made, 0)
+                        // ONE row per CONFIRMED TOKEN, not one per pass. That used
+                        // to be the same number and an `assert_eq!(have + 1, want)`
+                        // said so; a speculative pass confirms 1 + accepted tokens
+                        // at once and every one of them makes a row of every head
+                        // stable. Head d's row at `pos` is fed the token at
+                        // pos + d + 1, which is in `ids` for all of them but the
+                        // last, where it is the argmax still being held back.
+                        let adv = want - have;
+                        assert!(adv >= 1, "a pass makes at least one row stable");
+                        let mut made: Vec<T2> = Vec::with_capacity(adv);
+                        for i in 0..adv {
+                            let pos = have + i;
+                            let hin = if d == 0 {
+                                main_dev.clone().slice([pos..pos + 1, 0..h])
+                            } else {
+                                row_of(&mtp_stage_dev[d - 1], pos, pos + 1)
+                            };
+                            let ahead = pos + d + 1;
+                            let tok = if ahead < seq { ids[ahead] } else { best };
+                            let ed =
+                                up2::<Bk>(embed_row_bf16(e_w, tok, t.vocab_size, h), 1, h, &dev);
+                            made.push(mtp_block_step_dev(
+                                hin,
+                                ed,
+                                &mtp_devs[d],
+                                &hd,
+                                Some(ls),
+                                pos,
+                                window,
+                                mtp_dev_caches[d]
+                                    .as_mut()
+                                    .expect("prefilled on the first pass"),
+                                t.rms_norm_eps,
+                                mtp_order,
+                            ));
+                        }
+                        if made.len() == 1 {
+                            made.pop().expect("one row")
+                        } else {
+                            BT::cat(made, 0)
+                        }
+                    };
+                    mtp_stage_dev[d] = Some(match mtp_stage_dev[d].take() {
+                        None => stable,
+                        Some(prev) => BT::cat(vec![prev, stable], 0),
+                    });
+                    let mut rows: Vec<T2> = vec![row_of(&mtp_stage_dev[d], want - 1, want)];
+                    let mut last = rows[0].clone();
+                    if d > 0 {
+                        let mut scratch = mtp_dev_caches[d].as_ref().expect("prefilled").clone();
+                        for i in 0..d {
+                            let ed = up2::<Bk>(
+                                embed_row_bf16(e_w, drafts[i], t.vocab_size, h),
+                                1,
+                                h,
+                                &dev,
+                            );
+                            last = mtp_block_step_dev(
+                                prev_rows[i].clone(),
+                                ed,
+                                &mtp_devs[d],
+                                &hd,
+                                Some(ls),
+                                want + i,
+                                window,
+                                &mut scratch,
+                                t.rms_norm_eps,
+                                mtp_order,
+                            );
+                            rows.push(last.clone());
+                        }
                     }
-                };
-                mtp_stage_dev[d] = Some(match mtp_stage_dev[d].take() {
-                    None => stable,
-                    Some(prev) => BT::cat(vec![prev, stable], 0),
-                });
-                let mut rows: Vec<T2> = vec![row_of(&mtp_stage_dev[d], want - 1, want)];
-                let mut last = rows[0].clone();
-                if d > 0 {
-                    let mut scratch =
-                        mtp_dev_caches[d].as_ref().expect("prefilled").clone();
-                    for i in 0..d {
-                        let ed = up2::<Bk>(
-                            embed_row_bf16(e_w, drafts[i], t.vocab_size, h),
-                            1,
-                            h,
-                            &dev,
-                        );
-                        last = mtp_block_step_dev(
-                            prev_rows[i].clone(),
-                            ed,
-                            &mtp_devs[d],
-                            &hd,
-                            Some(ls),
-                            want + i,
-                            window,
-                            &mut scratch,
-                            t.rms_norm_eps,
-                            mtp_order,
-                        );
-                        rows.push(last.clone());
-                    }
+                    drafts.push(draft_argmax_dev(last));
+                    prev_rows = rows;
                 }
-                drafts.push(draft_argmax_dev(last));
-                prev_rows = rows;
-            }
-            drafts
-        } else if kv {
-            // Head d's newest STABLE row is at position seq-1-d: past that, its
-            // input embedding is a token the stack has not produced yet. So a
-            // step appends exactly ONE row per head, and the d rows after it --
-            // the ones the draft is actually read off -- are functions of drafts
-            // and run against a CLONE of the cache that is then dropped.
-            // Rollback is the default and there is no commit path to forget,
-            // which matters because a speculative K/V left behind does not
-            // error: it shows up months later as an acceptance rate that drifts
-            // down.
-            let mut prev_rows: Vec<Vec<f32>> = Vec::new();
-            let mut drafts: Vec<usize> = Vec::with_capacity(mtp_heads.len());
-            for (d, headw) in mtp_heads.iter().enumerate() {
-                let window = headw.window(t.sliding_window_size);
-                let hw = headw.borrow(t.dense_intermediate_size);
-                let want = seq - d;
-                let have = mtp_stage[d].len() / h;
-                let stable: Vec<f32> = if have == 0 {
-                    // The prefill: every stable row this head has, in one
-                    // whole-sequence pass -- the same call the uncached lane
-                    // makes, so the same arithmetic seeds the cache.
-                    let mut embeds = vec![0f32; want * h];
-                    for j in 0..want {
-                        let tok = if j + d + 1 < seq { ids[j + d + 1] } else { best };
-                        embeds[j * h..(j + 1) * h]
-                            .copy_from_slice(&embed_row_bf16(e_w, tok, t.vocab_size, h));
-                    }
-                    let hin: &[f32] = if d == 0 {
-                        &mtp_main[..want * h]
-                    } else {
-                        &mtp_stage[d - 1][..want * h]
-                    };
-                    let (y, cache) = mtp_block_prefill(
-                        hin, &embeds, &hw, &headw.dims, Some(ls), window, want, mtp_order,
-                    );
-                    mtp_caches[d] = Some(cache);
-                    y
-                } else {
-                    // One row, at the position the token just produced made
-                    // stable. Its embedding is `best` for EVERY head: head d's
-                    // row seq-1-d wants the token at seq, whatever d is.
-                    assert_eq!(have + 1, want, "a step makes exactly one row stable");
-                    let p = want - 1;
-                    let hin: &[f32] = if d == 0 {
-                        &mtp_main[p * h..(p + 1) * h]
-                    } else {
-                        &mtp_stage[d - 1][p * h..(p + 1) * h]
-                    };
-                    mtp_block_step(
-                        hin,
-                        &embed_row_bf16(e_w, best, t.vocab_size, h),
-                        &hw,
-                        &headw.dims,
-                        Some(ls),
-                        p,
-                        window,
-                        mtp_caches[d].as_mut().expect("prefilled on the first pass"),
-                        mtp_order,
-                    )
-                };
-                mtp_stage[d].extend_from_slice(&stable);
-                debug_assert_eq!(mtp_stage[d].len(), want * h);
-
-                // The speculative tail: positions want..seq-1, one per draft
-                // already made, each attending to the ones before it. `rows` is
-                // what head d+1 reads -- the input to its own stable row, then
-                // the inputs to its speculative ones.
-                let mut rows: Vec<Vec<f32>> = vec![mtp_stage[d][(want - 1) * h..want * h].to_vec()];
-                let mut last = rows[0].clone();
-                if d > 0 {
-                    let mut scratch = mtp_caches[d].as_ref().expect("prefilled").clone();
-                    for i in 0..d {
-                        last = mtp_block_step(
-                            &prev_rows[i],
-                            &embed_row_bf16(e_w, drafts[i], t.vocab_size, h),
+                drafts
+            } else if kv {
+                // Head d's newest STABLE row is at position seq-1-d: past that, its
+                // input embedding is a token the stack has not produced yet. So a
+                // step appends exactly ONE row per head, and the d rows after it --
+                // the ones the draft is actually read off -- are functions of drafts
+                // and run against a CLONE of the cache that is then dropped.
+                // Rollback is the default and there is no commit path to forget,
+                // which matters because a speculative K/V left behind does not
+                // error: it shows up months later as an acceptance rate that drifts
+                // down.
+                let mut prev_rows: Vec<Vec<f32>> = Vec::new();
+                let mut drafts: Vec<usize> = Vec::with_capacity(mtp_heads.len());
+                for (d, headw) in mtp_heads.iter().enumerate() {
+                    let window = headw.window(t.sliding_window_size);
+                    let hw = headw.borrow(t.dense_intermediate_size);
+                    let want = seq - d;
+                    let have = mtp_stage[d].len() / h;
+                    let stable: Vec<f32> = if have == 0 {
+                        // The prefill: every stable row this head has, in one
+                        // whole-sequence pass -- the same call the uncached lane
+                        // makes, so the same arithmetic seeds the cache.
+                        let mut embeds = vec![0f32; want * h];
+                        for j in 0..want {
+                            let tok = if j + d + 1 < seq {
+                                ids[j + d + 1]
+                            } else {
+                                best
+                            };
+                            embeds[j * h..(j + 1) * h].copy_from_slice(&embed_row_bf16(
+                                e_w,
+                                tok,
+                                t.vocab_size,
+                                h,
+                            ));
+                        }
+                        let hin: &[f32] = if d == 0 {
+                            &mtp_main[..want * h]
+                        } else {
+                            &mtp_stage[d - 1][..want * h]
+                        };
+                        let (y, cache) = mtp_block_prefill(
+                            hin,
+                            &embeds,
                             &hw,
                             &headw.dims,
                             Some(ls),
-                            want + i,
                             window,
-                            &mut scratch,
+                            want,
                             mtp_order,
                         );
-                        rows.push(last.clone());
+                        mtp_caches[d] = Some(cache);
+                        y
+                    } else {
+                        // One row, at the position the token just produced made
+                        // stable. Its embedding is `best` for EVERY head: head d's
+                        // row seq-1-d wants the token at seq, whatever d is.
+                        assert_eq!(have + 1, want, "a step makes exactly one row stable");
+                        let p = want - 1;
+                        let hin: &[f32] = if d == 0 {
+                            &mtp_main[p * h..(p + 1) * h]
+                        } else {
+                            &mtp_stage[d - 1][p * h..(p + 1) * h]
+                        };
+                        mtp_block_step(
+                            hin,
+                            &embed_row_bf16(e_w, best, t.vocab_size, h),
+                            &hw,
+                            &headw.dims,
+                            Some(ls),
+                            p,
+                            window,
+                            mtp_caches[d].as_mut().expect("prefilled on the first pass"),
+                            mtp_order,
+                        )
+                    };
+                    mtp_stage[d].extend_from_slice(&stable);
+                    debug_assert_eq!(mtp_stage[d].len(), want * h);
+
+                    // The speculative tail: positions want..seq-1, one per draft
+                    // already made, each attending to the ones before it. `rows` is
+                    // what head d+1 reads -- the input to its own stable row, then
+                    // the inputs to its speculative ones.
+                    let mut rows: Vec<Vec<f32>> =
+                        vec![mtp_stage[d][(want - 1) * h..want * h].to_vec()];
+                    let mut last = rows[0].clone();
+                    if d > 0 {
+                        let mut scratch = mtp_caches[d].as_ref().expect("prefilled").clone();
+                        for i in 0..d {
+                            last = mtp_block_step(
+                                &prev_rows[i],
+                                &embed_row_bf16(e_w, drafts[i], t.vocab_size, h),
+                                &hw,
+                                &headw.dims,
+                                Some(ls),
+                                want + i,
+                                window,
+                                &mut scratch,
+                                mtp_order,
+                            );
+                            rows.push(last.clone());
+                        }
+                    }
+                    // `scratch` is gone with the block: the speculative K and V
+                    // never reached the cache, so a wrong draft leaves nothing to
+                    // undo.
+                    drafts.push(draft_argmax(&last));
+                    prev_rows = rows;
+                }
+                drafts
+            } else {
+                draft_whole(&mtp_main, seq, &ids, best)
+            };
+            if spec_k == 0 {
+                mtp_issued.insert(step, vec![None; drafts.len()]);
+                if mtp_prob {
+                    mtp_issued_q.insert(step, vec![None; drafts.len()]);
+                    for (d, p) in draft_probs.borrow_mut().drain(..).enumerate() {
+                        mtp_pd.insert((step + d + 1, d), p);
                     }
                 }
-                // `scratch` is gone with the block: the speculative K and V
-                // never reached the cache, so a wrong draft leaves nothing to
-                // undo.
-                drafts.push(draft_argmax(&last));
-                prev_rows = rows;
-            }
-            drafts
-        } else {
-            draft_whole(&mtp_main, seq, &ids, best)
-        };
-        if spec_k == 0 {
-            mtp_issued.insert(step, vec![None; drafts.len()]);
-            if mtp_prob {
-                mtp_issued_q.insert(step, vec![None; drafts.len()]);
-                for (d, p) in draft_probs.borrow_mut().drain(..).enumerate() {
-                    mtp_pd.insert((step + d + 1, d), p);
+                for (d, &b) in drafts.iter().enumerate() {
+                    // Head d predicts the token d+1 steps past the one just chosen.
+                    mtp_pending.push((step + d + 1, d, b));
                 }
             }
-            for (d, &b) in drafts.iter().enumerate() {
-                // Head d predicts the token d+1 steps past the one just chosen.
-                mtp_pending.push((step + d + 1, d, b));
+            acc_draft += t_mtp.elapsed().as_secs_f64();
+            // The drafts go to the head, which is the only process that can embed
+            // them. Sent HERE and not with the answer, so the head was blocked on
+            // the verify pass alone and this drafting overlaps its commit.
+            if spec_k > 0 {
+                last_drafts = drafts.clone();
+                if let Some(Pipe::Tail(s)) = pipe.as_mut() {
+                    send_toks(s, &drafts)?;
+                }
             }
-        }
-        acc_draft += t_mtp.elapsed().as_secs_f64();
-        // The drafts go to the head, which is the only process that can embed
-        // them. Sent HERE and not with the answer, so the head was blocked on
-        // the verify pass alone and this drafting overlaps its commit.
-        if spec_k > 0 {
-            last_drafts = drafts.clone();
-            if let Some(Pipe::Tail(s)) = pipe.as_mut() {
-                send_toks(s, &drafts)?;
-            }
-        }
-        println!(
-            "  MTP drafted {} token(s) in {:.3}s: {drafts:?}",
-            mtp_heads.len(),
-            t_mtp.elapsed().as_secs_f32(),
-        );
-        // The cached lane against the whole-sequence one, on the SAME retained
-        // hidden states -- so a disagreement is about the CACHE and nothing
-        // else. Both lanes are scalar host arithmetic summed in the same order,
-        // so the drafts should agree EXACTLY; anything less is a bug and not
-        // rounding, which is what makes this worth asserting rather than
-        // reporting.
-        if kv && std::env::var("INK_MTP_CHECK").map(|val| val == "1").unwrap_or(false) {
-            let t_c = Instant::now();
-            let whole = draft_whole(&mtp_main, seq, &ids, best);
             println!(
+                "  MTP drafted {} token(s) in {:.3}s: {drafts:?}",
+                mtp_heads.len(),
+                t_mtp.elapsed().as_secs_f32(),
+            );
+            // The cached lane against the whole-sequence one, on the SAME retained
+            // hidden states -- so a disagreement is about the CACHE and nothing
+            // else. Both lanes are scalar host arithmetic summed in the same order,
+            // so the drafts should agree EXACTLY; anything less is a bug and not
+            // rounding, which is what makes this worth asserting rather than
+            // reporting.
+            if kv
+                && std::env::var("INK_MTP_CHECK")
+                    .map(|val| val == "1")
+                    .unwrap_or(false)
+            {
+                let t_c = Instant::now();
+                let whole = draft_whole(&mtp_main, seq, &ids, best);
+                println!(
                 "  MTP cache check ({:.2}s): cached {drafts:?} vs whole-sequence {whole:?} -- {}",
                 t_c.elapsed().as_secs_f32(),
                 if whole == drafts { "agree" } else { "DISAGREE" }
             );
-            // Asserted for the HOST cached lane, which is the same arithmetic
-            // summed in the same order and therefore has no licence to differ;
-            // REPORTED for the device one, where an argmax over a 200k row can
-            // legitimately flip on a near-tie. Asserting there would be a
-            // determinism gate wearing a correctness costume, and the honest
-            // instrument for a transcription is the acceptance rate it goes on
-            // to produce.
-            anyhow::ensure!(
-                mtp_dev_on || whole == drafts,
-                "the MTP cache drafted {drafts:?} where the whole sequence drafts {whole:?}"
+                // Asserted for the HOST cached lane, which is the same arithmetic
+                // summed in the same order and therefore has no licence to differ;
+                // REPORTED for the device one, where an argmax over a 200k row can
+                // legitimately flip on a near-tie. Asserting there would be a
+                // determinism gate wearing a correctness costume, and the honest
+                // instrument for a transcription is the acceptance rate it goes on
+                // to produce.
+                anyhow::ensure!(
+                    mtp_dev_on || whole == drafts,
+                    "the MTP cache drafted {drafts:?} where the whole sequence drafts {whole:?}"
+                );
+            }
+        }
+        // A tail follows the sequence by RECOMPUTING it, not by being told: it owns
+        // the argmax, so pushing it here keeps its `ids` identical to the head's
+        // without a second thing on the wire to get out of step.
+        if is_tail && gen_steps > 0 && !repeat {
+            ids.push(best);
+        }
+
+        println!("\n=== predictions ===");
+        println!("  expert slabs decoded: {expert_loads}");
+        // Which branch the cleanup policy took, as a count and not as an inference
+        // from the absence of a line. Zero on a pass the node had room for.
+        println!("  pool cleanups: {cleanups} of {} layers", hi - lo);
+        // t_other covers the whole MLP half, so the expert buckets are inside it.
+        // MILLISECONDS. At 0.1 s resolution a decode pass of this stack prints as
+        // "0.4 0.4 0.0" and every question worth asking of it is unanswerable.
+        let ms = |v: f64| v * 1e3;
+        // Two kinds of number, kept apart, because with the residual stream on the
+        // device they no longer measure the same thing. Everything above the sync
+        // line is the HOST describing work; the device time is the sync line. A
+        // per-stage "seconds" column would now report how fast the CPU can enqueue,
+        // and it would look wonderful.
+        println!("  where the time went, ms:");
+        println!("    HOST, enqueue only (nothing in the loop synchronises):");
+        println!(
+            "      embed + upload  {:9.1}   (the one host->device crossing per pass)",
+            ms(t_embed)
+        );
+        println!("      attention half  {:9.1}", ms(t_attn));
+        println!("      mlp half        {:9.1}   of which:", ms(t_other));
+        println!(
+            "        routed experts{:9.1}   (slice + bind + issue)",
+            ms(t_expert)
+        );
+        println!("        shared experts{:9.1}", ms(t_shared));
+        println!(
+            "        rest of half  {:9.1}   (dense layers, sconv)",
+            ms(t_other - t_expert - t_shared - t_h_route - t_h_sconv)
+        );
+        // WHICH lane blocked, not which one used to. `INK_DEV_ROUTE` has defaulted
+        // on for a while and the device lane reads back the DECISION -- 2k + shared
+        // + 1 f32, 60 bytes at decode -- not the logits. The line said `[n, 258]`
+        // and "top-k on the host" either way, and a reader who priced the sync as a
+        // 1 KB transfer was reading a label for a lane that had stopped running.
+        // The cost is the SYNC and it is the same either way; the bytes are not.
+        println!(
+            "      router + group  {:9.1}   BLOCKS: [n,{}] {} back",
+            ms(t_h_route),
+            if dev_route {
+                2 * t.num_experts_per_tok + t.n_shared_experts + 1
+            } else {
+                t.n_routed_experts + t.n_shared_experts
+            },
+            if dev_route {
+                "top-k DECISION (device top-k)"
+            } else {
+                "logits, then top-k on the host"
+            }
+        );
+        println!(
+            "        of which: matmul enqueue {:7.1}, BLOCKING read {:7.1}, top-k + group {:7.1}",
+            ms(t_rt_mm),
+            ms(t_rt_read),
+            ms(t_rt_host)
+        );
+        println!("      mlp short_conv  {:9.1}", ms(t_h_sconv));
+        println!("      first-touch uploads: read+widen {:9.1}, transfer {:9.1}   (once per layer, not per token)",
+             ms(t_attn_read), ms(t_attn_up));
+        println!(
+            "    DEVICE, one sync for this node's whole stack: {:9.1}",
+            ms(t_stack_sync)
+        );
+        if stage_sync {
+            println!("    DEVICE per stage (INK_STAGE_SYNC=1 -- {stage_syncs} extra syncs, this pass IS slower for them):");
+            println!("      attention half  {:9.1}", ms(d_attn));
+            println!("      router matmul   {:9.1}", ms(d_router));
+            println!("      routed experts  {:9.1}", ms(d_expert));
+            println!("      shared experts  {:9.1}", ms(d_shared));
+            println!("      sconv + resid   {:9.1}", ms(d_tail));
+            println!(
+                "      staged total    {:9.1}",
+                ms(d_attn + d_router + d_expert + d_shared + d_tail)
             );
         }
-    }
-    // A tail follows the sequence by RECOMPUTING it, not by being told: it owns
-    // the argmax, so pushing it here keeps its `ids` identical to the head's
-    // without a second thing on the wire to get out of step.
-    if is_tail && gen_steps > 0 && !repeat {
-        ids.push(best);
-    }
-
-    println!("\n=== predictions ===");
-    println!("  expert slabs decoded: {expert_loads}");
-    // Which branch the cleanup policy took, as a count and not as an inference
-    // from the absence of a line. Zero on a pass the node had room for.
-    println!("  pool cleanups: {cleanups} of {} layers", hi - lo);
-    // t_other covers the whole MLP half, so the expert buckets are inside it.
-    // MILLISECONDS. At 0.1 s resolution a decode pass of this stack prints as
-    // "0.4 0.4 0.0" and every question worth asking of it is unanswerable.
-    let ms = |v: f64| v * 1e3;
-    // Two kinds of number, kept apart, because with the residual stream on the
-    // device they no longer measure the same thing. Everything above the sync
-    // line is the HOST describing work; the device time is the sync line. A
-    // per-stage "seconds" column would now report how fast the CPU can enqueue,
-    // and it would look wonderful.
-    println!("  where the time went, ms:");
-    println!("    HOST, enqueue only (nothing in the loop synchronises):");
-    println!("      embed + upload  {:9.1}   (the one host->device crossing per pass)", ms(t_embed));
-    println!("      attention half  {:9.1}", ms(t_attn));
-    println!("      mlp half        {:9.1}   of which:", ms(t_other));
-    println!("        routed experts{:9.1}   (slice + bind + issue)", ms(t_expert));
-    println!("        shared experts{:9.1}", ms(t_shared));
-    println!("        rest of half  {:9.1}   (dense layers, sconv)",
-             ms(t_other - t_expert - t_shared - t_h_route - t_h_sconv));
-    // WHICH lane blocked, not which one used to. `INK_DEV_ROUTE` has defaulted
-    // on for a while and the device lane reads back the DECISION -- 2k + shared
-    // + 1 f32, 60 bytes at decode -- not the logits. The line said `[n, 258]`
-    // and "top-k on the host" either way, and a reader who priced the sync as a
-    // 1 KB transfer was reading a label for a lane that had stopped running.
-    // The cost is the SYNC and it is the same either way; the bytes are not.
-    println!("      router + group  {:9.1}   BLOCKS: [n,{}] {} back",
-             ms(t_h_route),
-             if dev_route { 2 * t.num_experts_per_tok + t.n_shared_experts + 1 }
-             else { t.n_routed_experts + t.n_shared_experts },
-             if dev_route { "top-k DECISION (device top-k)" }
-             else { "logits, then top-k on the host" });
-    println!("        of which: matmul enqueue {:7.1}, BLOCKING read {:7.1}, top-k + group {:7.1}",
-             ms(t_rt_mm), ms(t_rt_read), ms(t_rt_host));
-    println!("      mlp short_conv  {:9.1}", ms(t_h_sconv));
-    println!("      first-touch uploads: read+widen {:9.1}, transfer {:9.1}   (once per layer, not per token)",
-             ms(t_attn_read), ms(t_attn_up));
-    println!("    DEVICE, one sync for this node's whole stack: {:9.1}", ms(t_stack_sync));
-    if stage_sync {
-        println!("    DEVICE per stage (INK_STAGE_SYNC=1 -- {stage_syncs} extra syncs, this pass IS slower for them):");
-        println!("      attention half  {:9.1}", ms(d_attn));
-        println!("      router matmul   {:9.1}", ms(d_router));
-        println!("      routed experts  {:9.1}", ms(d_expert));
-        println!("      shared experts  {:9.1}", ms(d_shared));
-        println!("      sconv + resid   {:9.1}", ms(d_tail));
-        println!("      staged total    {:9.1}", ms(d_attn + d_router + d_expert + d_shared + d_tail));
-    }
-    println!(
-        "    {:17} {:9.1}   ({})",
-        if best_wire.is_some() { "tail + wire" } else { "head / unembed" },
-        ms(t_head),
-        if best_wire.is_some() {
-            "BLOCKING: the other machine's layers, its head, and the round trip"
-        } else {
-            "device"
+        println!(
+            "    {:17} {:9.1}   ({})",
+            if best_wire.is_some() {
+                "tail + wire"
+            } else {
+                "head / unembed"
+            },
+            ms(t_head),
+            if best_wire.is_some() {
+                "BLOCKING: the other machine's layers, its head, and the round trip"
+            } else {
+                "device"
+            }
+        );
+        println!(
+            "    residual to the host{:9.1}   (the [n, hidden] the wire and the draft path read)",
+            ms(t_x_down)
+        );
+        // The report is a partition or it is decoration. Everything above is a
+        // stage; this is the pass MINUS the stages, and a run that grows it is a
+        // run doing work no line here names.
+        {
+            let named = t_embed + t_attn + t_other + t_stack_sync + t_head + t_x_down;
+            let whole = pass.elapsed().as_secs_f64();
+            println!(
+                "    UNATTRIBUTED    {:9.1}   (this pass, {:.1} ms, less every stage above)",
+                ms(whole - named),
+                ms(whole)
+            );
         }
-    );
-    println!("    residual to the host{:9.1}   (the [n, hidden] the wire and the draft path read)",
-             ms(t_x_down));
-    // The report is a partition or it is decoration. Everything above is a
-    // stage; this is the pass MINUS the stages, and a run that grows it is a
-    // run doing work no line here names.
-    {
-        let named = t_embed + t_attn + t_other + t_stack_sync + t_head + t_x_down;
-        let whole = pass.elapsed().as_secs_f64();
-        println!("    UNATTRIBUTED    {:9.1}   (this pass, {:.1} ms, less every stage above)",
-                 ms(whole - named), ms(whole));
-    }
-    println!("    of the above, host-only tensor reads (mmap + BF16 widening): {:9.1}", ms(t_read.get()));
-    {
-        // What the HOST did in the routed-expert lane, one bucket per kind of
-        // work. `read (BLOCKS)` is gone from this list because the read is
-        // gone: the accumulator is a device tensor and nothing waits for it.
-        println!("    of the routed-expert total, what the host did ({expert_loads} loads):");
-        println!("      slice from pile {:9.1}   ({:.3} ms/load)   BLAKE3 on first touch",
-                 ms(host_t.slice), ms(host_t.slice) / expert_loads.max(1) as f64);
-        println!("      gather (select) {:9.1}   ({:.3} ms/load)   enqueue",
-                 ms(host_t.gather), ms(host_t.gather) / expert_loads.max(1) as f64);
-        // Sub-buckets of the line above, not extra time: the plan uploads happen
-        // inside the gather's timer. Split because only one of the two halves
-        // is a consequence of the routing decision living on the host.
-        println!("        of which plan uploads: routing-dependent {:6.1}, static at n=1 {:6.1}",
-                 ms(host_t.plan_up_routed), ms(host_t.plan_up_static));
-        println!("      bind + enqueue  {:9.1}   ({:.3} ms/load)",
-                 ms(host_t.enqueue), ms(host_t.enqueue) / expert_loads.max(1) as f64);
-        println!("      scatter-add     {:9.1}   ({:.3} ms/load)   enqueue",
-                 ms(host_t.accum), ms(host_t.accum) / expert_loads.max(1) as f64);
-        // WHICH lane ran, counted rather than asserted. The grouped one is a
-        // claim about launches per LAYER and the per-expert one about launches
-        // per EXPERT; a per-load average over a mixture of the two is a number
-        // about neither, so the split has to be visible beside it.
-        println!("      lanes: {} layer(s) GROUPED (one launch per stage), {} per-expert",
-                 host_t.grouped, host_t.per_expert);
-        let named = host_t.slice + host_t.gather + host_t.enqueue + host_t.drain + host_t.accum;
-        println!("      remainder       {:9.1}   (whatever the four above did not cover)",
-                 ms(t_expert - named));
-    }
-    // Rule 2, as a number that should be zero and is. Every one of these was
-    // scalar f32 arithmetic over the residual stream, on a CPU, between device
-    // calls; none of it was control plane. The line stays in the report BECAUSE
-    // it reads zero -- a claim of "no host path in the data plane" that nothing
-    // measures is a claim that rots.
-    println!("    HOST DATA PLANE in the block itself, ms (want: zero):");
-    println!("      rms_norm        {:9.1}", ms(t_h_norm));
-    println!("      residual adds   {:9.1}", ms(t_h_resid));
-    println!("      expert gather   {:9.1}   (a `select` on the device now)", 0.0);
-    println!("      expert accum    {:9.1}   (a `select_assign` on the device now)", 0.0);
-    println!("      TOTAL           {:9.1}", ms(t_h_norm + t_h_resid));
-    let (calls, hits, fileb, hostb, loader_ns) = cp.io_totals();
-    let (rb, rn) = cp.resident_bytes();
-    println!("  what this ONE pass moved:");
-    println!("    loader reads        {calls:8}   answered from RAM {hits:8}");
-    println!("    stored bytes        {:8.2} GiB   (what the reads touched, stored precision)",
-             fileb as f64 / GIB);
-    println!("    host f32 bytes      {:8.2} GiB   (what they became after widening)",
-             hostb as f64 / GIB);
-    println!("    seconds in loader   {:8.1}", loader_ns as f64 / 1e9);
-    println!("    disk read_bytes     {:8.2} GiB   (/proc/self/io -- page-cache hits are free)",
-             (io_read_bytes() - io0) as f64 / GIB);
-    println!("    resident set        {:8.2} GiB in {rn} weights  (host)", rb as f64 / GIB);
-    println!(
-        "    device-resident     {:8.2} GiB in {} shared + {} dense layers",
-        ddense.bytes as f64 / GIB,
-        ddense.shared.len(),
-        ddense.dense.len()
-    );
-    println!(
-        "    device-resident     {:8.2} GiB in {} attention layers",
-        dattn_bytes as f64 / GIB,
-        layers_dev.len()
-    );
-    // What the zero-copy seam actually achieved on THIS run, at the seam every
-    // expert weight passes through. Printed unconditionally: a seam whose hit
-    // rate is only visible behind a flag is a seam nobody checks.
-    #[cfg(feature = "inkling-cuda")]
-    if let Some(al) = fp4_aliases.as_ref() {
-        print!("{}", al.stats().report());
-    }
-    #[cfg(feature = "inkling-cuda")]
-    {
+        println!(
+            "    of the above, host-only tensor reads (mmap + BF16 widening): {:9.1}",
+            ms(t_read.get())
+        );
+        {
+            // What the HOST did in the routed-expert lane, one bucket per kind of
+            // work. `read (BLOCKS)` is gone from this list because the read is
+            // gone: the accumulator is a device tensor and nothing waits for it.
+            println!("    of the routed-expert total, what the host did ({expert_loads} loads):");
+            println!(
+                "      slice from pile {:9.1}   ({:.3} ms/load)   BLAKE3 on first touch",
+                ms(host_t.slice),
+                ms(host_t.slice) / expert_loads.max(1) as f64
+            );
+            println!(
+                "      gather (select) {:9.1}   ({:.3} ms/load)   enqueue",
+                ms(host_t.gather),
+                ms(host_t.gather) / expert_loads.max(1) as f64
+            );
+            // Sub-buckets of the line above, not extra time: the plan uploads happen
+            // inside the gather's timer. Split because only one of the two halves
+            // is a consequence of the routing decision living on the host.
+            println!(
+                "        of which plan uploads: routing-dependent {:6.1}, static at n=1 {:6.1}",
+                ms(host_t.plan_up_routed),
+                ms(host_t.plan_up_static)
+            );
+            println!(
+                "      bind + enqueue  {:9.1}   ({:.3} ms/load)",
+                ms(host_t.enqueue),
+                ms(host_t.enqueue) / expert_loads.max(1) as f64
+            );
+            println!(
+                "      scatter-add     {:9.1}   ({:.3} ms/load)   enqueue",
+                ms(host_t.accum),
+                ms(host_t.accum) / expert_loads.max(1) as f64
+            );
+            // WHICH lane ran, counted rather than asserted. The grouped one is a
+            // claim about launches per LAYER and the per-expert one about launches
+            // per EXPERT; a per-load average over a mixture of the two is a number
+            // about neither, so the split has to be visible beside it.
+            println!(
+                "      lanes: {} layer(s) GROUPED (one launch per stage), {} per-expert",
+                host_t.grouped, host_t.per_expert
+            );
+            let named = host_t.slice + host_t.gather + host_t.enqueue + host_t.drain + host_t.accum;
+            println!(
+                "      remainder       {:9.1}   (whatever the four above did not cover)",
+                ms(t_expert - named)
+            );
+        }
+        // Rule 2, as a number that should be zero and is. Every one of these was
+        // scalar f32 arithmetic over the residual stream, on a CPU, between device
+        // calls; none of it was control plane. The line stays in the report BECAUSE
+        // it reads zero -- a claim of "no host path in the data plane" that nothing
+        // measures is a claim that rots.
+        println!("    HOST DATA PLANE in the block itself, ms (want: zero):");
+        println!("      rms_norm        {:9.1}", ms(t_h_norm));
+        println!("      residual adds   {:9.1}", ms(t_h_resid));
+        println!(
+            "      expert gather   {:9.1}   (a `select` on the device now)",
+            0.0
+        );
+        println!(
+            "      expert accum    {:9.1}   (a `select_assign` on the device now)",
+            0.0
+        );
+        println!("      TOTAL           {:9.1}", ms(t_h_norm + t_h_resid));
+        let (calls, hits, fileb, hostb, loader_ns) = cp.io_totals();
+        let (rb, rn) = cp.resident_bytes();
+        println!("  what this ONE pass moved:");
+        println!("    loader reads        {calls:8}   answered from RAM {hits:8}");
+        println!(
+            "    stored bytes        {:8.2} GiB   (what the reads touched, stored precision)",
+            fileb as f64 / GIB
+        );
+        println!(
+            "    host f32 bytes      {:8.2} GiB   (what they became after widening)",
+            hostb as f64 / GIB
+        );
+        println!("    seconds in loader   {:8.1}", loader_ns as f64 / 1e9);
+        println!(
+            "    disk read_bytes     {:8.2} GiB   (/proc/self/io -- page-cache hits are free)",
+            (io_read_bytes() - io0) as f64 / GIB
+        );
+        println!(
+            "    resident set        {:8.2} GiB in {rn} weights  (host)",
+            rb as f64 / GIB
+        );
         println!(
             "    device-resident     {:8.2} GiB in {} shared + {} dense layers",
             ddense.bytes as f64 / GIB,
             ddense.shared.len(),
             ddense.dense.len()
         );
-    }
-    #[cfg(feature = "inkling-cuda")]
-    if !layers_dev.is_empty() {
         println!(
             "    device-resident     {:8.2} GiB in {} attention layers",
             dattn_bytes as f64 / GIB,
             layers_dev.len()
         );
-    }
-    if std::env::var("INK_IOSTATS").is_ok() {
-        print!("{}", cp.io_table(28));
-    }
-    report_align(charged_device_weights);
-    mary::models::inkling::bf16gemm::report_hand();
-    println!("  elapsed: {:.1}s", started.elapsed().as_secs_f32());
+        // What the zero-copy seam actually achieved on THIS run, at the seam every
+        // expert weight passes through. Printed unconditionally: a seam whose hit
+        // rate is only visible behind a flag is a seam nobody checks.
+        #[cfg(feature = "inkling-cuda")]
+        if let Some(al) = fp4_aliases.as_ref() {
+            print!("{}", al.stats().report());
+        }
+        #[cfg(feature = "inkling-cuda")]
+        {
+            println!(
+                "    device-resident     {:8.2} GiB in {} shared + {} dense layers",
+                ddense.bytes as f64 / GIB,
+                ddense.shared.len(),
+                ddense.dense.len()
+            );
+        }
+        #[cfg(feature = "inkling-cuda")]
+        if !layers_dev.is_empty() {
+            println!(
+                "    device-resident     {:8.2} GiB in {} attention layers",
+                dattn_bytes as f64 / GIB,
+                layers_dev.len()
+            );
+        }
+        if std::env::var("INK_IOSTATS").is_ok() {
+            print!("{}", cp.io_table(28));
+        }
+        report_align(charged_device_weights);
+        mary::models::inkling::bf16gemm::report_hand();
+        println!("  elapsed: {:.1}s", started.elapsed().as_secs_f32());
 
-
-    // Per-position top-5. Uncached, the final pass has recomputed every
-    // position, so it reports all of them and earlier passes report nothing.
-    // Cached, each pass computes only the positions it was handed and they
-    // accumulate -- prefill contributes the prompt, every step one more -- so
-    // the two lanes end with the same table over the same sequence, which is
-    // what makes the outputs comparable.
-    if !kv {
-        top_all.clear();
-    }
-    // A head has no logits to rank -- the tail owns the table, and writes it.
-    // Not in the slot lane: this table is indexed by POSITION in one sequence,
-    // and a slot batch's rows are b sequences at the same position. Reporting
-    // them here would print b top-5 rows against b consecutive positions of
-    // slot 0, which is not a thing that happened.
-    if (kv || gen_tokens + new_toks.len() > gen_steps) && best_wire.is_none() && !slot_lane {
-        // Only the rows the verifier kept. A speculative pass computes logits
-        // for rows it then throws away, and ranking those would print a top-5
-        // for a position the run never visited -- and index `ids` past its end.
-        let valid_to =
-            if verify_rows > 1 || probe_rows > 1 { logit_row0 + new_toks.len() } else { n };
-        for ti in logit_row0..valid_to {
-            let pos = pos0 + ti;
-            let row = &logits[(ti - logit_row0) * v..(ti - logit_row0 + 1) * v];
-            let mut idx: Vec<usize> = (0..v).collect();
-            idx.sort_unstable_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap());
-            let top: Vec<usize> = idx[..5].to_vec();
-            println!("  after token {pos} (id {}): top5 {:?}  logits {:?}",
-                     ids[pos], top,
-                     top.iter().map(|&i| (row[i] * 100.0).round() / 100.0).collect::<Vec<_>>());
-            for &i in &top {
-                top_all.push(i as i64);
+        // Per-position top-5. Uncached, the final pass has recomputed every
+        // position, so it reports all of them and earlier passes report nothing.
+        // Cached, each pass computes only the positions it was handed and they
+        // accumulate -- prefill contributes the prompt, every step one more -- so
+        // the two lanes end with the same table over the same sequence, which is
+        // what makes the outputs comparable.
+        if !kv {
+            top_all.clear();
+        }
+        // A head has no logits to rank -- the tail owns the table, and writes it.
+        // Not in the slot lane: this table is indexed by POSITION in one sequence,
+        // and a slot batch's rows are b sequences at the same position. Reporting
+        // them here would print b top-5 rows against b consecutive positions of
+        // slot 0, which is not a thing that happened.
+        if (kv || gen_tokens + new_toks.len() > gen_steps) && best_wire.is_none() && !slot_lane {
+            // Only the rows the verifier kept. A speculative pass computes logits
+            // for rows it then throws away, and ranking those would print a top-5
+            // for a position the run never visited -- and index `ids` past its end.
+            let valid_to = if verify_rows > 1 || probe_rows > 1 {
+                logit_row0 + new_toks.len()
+            } else {
+                n
+            };
+            for ti in logit_row0..valid_to {
+                let pos = pos0 + ti;
+                let row = &logits[(ti - logit_row0) * v..(ti - logit_row0 + 1) * v];
+                let mut idx: Vec<usize> = (0..v).collect();
+                idx.sort_unstable_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap());
+                let top: Vec<usize> = idx[..5].to_vec();
+                println!(
+                    "  after token {pos} (id {}): top5 {:?}  logits {:?}",
+                    ids[pos],
+                    top,
+                    top.iter()
+                        .map(|&i| (row[i] * 100.0).round() / 100.0)
+                        .collect::<Vec<_>>()
+                );
+                for &i in &top {
+                    top_all.push(i as i64);
+                }
             }
         }
-    }
 
-    if gen_steps > 0 {
-        // The cohort is named only when there is more than one, so a
-        // single-cohort run's transcript is character for character the one
-        // every arm above was compared on.
-        let coh_tag =
-            if ncohorts > 1 { format!(" cohort {answer_coh}") } else { String::new() };
-        println!("  step {step}{coh_tag}: +{new_toks:?}   [pass {:.1}s, total {:.1}s, ctx {}, pass_ms {:.1}]",
+        if gen_steps > 0 {
+            // The cohort is named only when there is more than one, so a
+            // single-cohort run's transcript is character for character the one
+            // every arm above was compared on.
+            let coh_tag = if ncohorts > 1 {
+                format!(" cohort {answer_coh}")
+            } else {
+                String::new()
+            };
+            println!("  step {step}{coh_tag}: +{new_toks:?}   [pass {:.1}s, total {:.1}s, ctx {}, pass_ms {:.1}]",
                  pass.elapsed().as_secs_f32(), started.elapsed().as_secs_f32(), ids.len(),
                  pass.elapsed().as_secs_f64() * 1e3);
-        // The tail already pushed all but the last, when it answered its peer.
-        if !is_tail && !repeat {
-            // Not in the slot lane: `new_toks` is one token per SLOT there, not
-            // an accepted prefix of one sequence, and extending `ids` with all
-            // of them puts seven other sequences into slot 0's stream. It is
-            // only a report -- nothing computes off `ids` in that lane -- which
-            // is exactly why it read as a plausible context length (4052
-            // against 3780) instead of as a failure.
-            if new_toks.len() > 1 && !slot_lane {
-                ids.extend_from_slice(&new_toks[..new_toks.len() - 1]);
-            }
-            // `ids` is ONE sequence's -- cohort 0's slot 0 -- because every
-            // report that indexes a position reads it. Appending a second
-            // cohort's token would interleave two sequences into one stream and
-            // read as a plausible context length rather than as a failure,
-            // which is the same trap the slot batch already sprang once.
-            if !slot_lane || (answered && (ncohorts == 1 || answer_coh == 0)) {
-                ids.push(best);
+            // The tail already pushed all but the last, when it answered its peer.
+            if !is_tail && !repeat {
+                // Not in the slot lane: `new_toks` is one token per SLOT there, not
+                // an accepted prefix of one sequence, and extending `ids` with all
+                // of them puts seven other sequences into slot 0's stream. It is
+                // only a report -- nothing computes off `ids` in that lane -- which
+                // is exactly why it read as a plausible context length (4052
+                // against 3780) instead of as a failure.
+                if new_toks.len() > 1 && !slot_lane {
+                    ids.extend_from_slice(&new_toks[..new_toks.len() - 1]);
+                }
+                // `ids` is ONE sequence's -- cohort 0's slot 0 -- because every
+                // report that indexes a position reads it. Appending a second
+                // cohort's token would interleave two sequences into one stream and
+                // read as a plausible context length rather than as a failure,
+                // which is the same trap the slot batch already sprang once.
+                if !slot_lane || (answered && (ncohorts == 1 || answer_coh == 0)) {
+                    ids.push(best);
+                }
             }
         }
-    }
-    // The prefill is a different animal -- a 512-row pass against a 1-row one,
-    // and the only pass that pays for uploading every resident weight -- so it
-    // is excluded from the utilisation summary rather than averaged into it.
-    if is_decode {
-        acc_send += t_send;
-        acc_wait_peer += t_wait_peer;
-        acc_recv += t_recv;
-        acc_pass += pass.elapsed().as_secs_f64();
-        acc_to_reply += t_to_reply;
-        acc_steps += 1;
-        pass_ms.push((pass.elapsed().as_secs_f64() + t_recv) * 1e3);
-    }
-    if is_decode && step - prefill_passes >= COLD_DECODE_STEPS {
-        warm_wall += pass.elapsed().as_secs_f64() + t_recv;
-        warm_steps += 1;
-        warm_tokens += if slot_lane && is_decode { n } else { new_toks.len() };
-    }
-    // A slot lane's prefill passes produce a token each and they are not decode
-    // tokens: counting them would put b of them in the numerator of a rate
-    // whose denominator is decode passes only.
-    // By the pass this node COMPUTED, not by the answer it happened to read.
-    // The two are the same pass on a tail and on a single-cohort head; on an
-    // interleaved head the answer is a pass behind, and counting answers would
-    // make the two ends disagree about how many tokens one run produced.
-    gen_tokens += if slot_lane && !is_decode {
-        0
-    } else if slot_lane {
-        n
-    } else {
-        new_toks.len()
-    };
-    // Tokens, not passes -- and with nothing speculated this fires on exactly
-    // the pass the old `for step in 0..=gen_steps` fired on.
-    // Passes, in the slot lane. Every arm has to run the same number of decode
-    // passes for the per-pass cost to be comparable across b, and a token count
-    // would make the run b times shorter at b times the width.
-    let done =
-        if slot_lane { is_decode && step + 1 - prefill_passes >= gen_steps } else { gen_tokens > gen_steps };
-    if done {
-        break;
-    }
-    step += 1;
+        // The prefill is a different animal -- a 512-row pass against a 1-row one,
+        // and the only pass that pays for uploading every resident weight -- so it
+        // is excluded from the utilisation summary rather than averaged into it.
+        if is_decode {
+            acc_send += t_send;
+            acc_wait_peer += t_wait_peer;
+            acc_recv += t_recv;
+            acc_pass += pass.elapsed().as_secs_f64();
+            acc_to_reply += t_to_reply;
+            acc_steps += 1;
+            pass_ms.push((pass.elapsed().as_secs_f64() + t_recv) * 1e3);
+        }
+        if is_decode && step - prefill_passes >= COLD_DECODE_STEPS {
+            warm_wall += pass.elapsed().as_secs_f64() + t_recv;
+            warm_steps += 1;
+            warm_tokens += if slot_lane && is_decode {
+                n
+            } else {
+                new_toks.len()
+            };
+        }
+        // A slot lane's prefill passes produce a token each and they are not decode
+        // tokens: counting them would put b of them in the numerator of a rate
+        // whose denominator is decode passes only.
+        // By the pass this node COMPUTED, not by the answer it happened to read.
+        // The two are the same pass on a tail and on a single-cohort head; on an
+        // interleaved head the answer is a pass behind, and counting answers would
+        // make the two ends disagree about how many tokens one run produced.
+        gen_tokens += if slot_lane && !is_decode {
+            0
+        } else if slot_lane {
+            n
+        } else {
+            new_toks.len()
+        };
+        // Tokens, not passes -- and with nothing speculated this fires on exactly
+        // the pass the old `for step in 0..=gen_steps` fired on.
+        // Passes, in the slot lane. Every arm has to run the same number of decode
+        // passes for the per-pass cost to be comparable across b, and a token count
+        // would make the run b times shorter at b times the width.
+        let done = if slot_lane {
+            is_decode && step + 1 - prefill_passes >= gen_steps
+        } else {
+            gen_tokens > gen_steps
+        };
+        if done {
+            break;
+        }
+        step += 1;
     }
 
     // ---- the answers still on the wire ------------------------------------
@@ -6157,8 +6706,15 @@ fn main() -> Result<()> {
         let ms = |v: f64| v * 1e3;
         let wall = acc_pass + acc_recv;
         println!("\n=== pipe utilisation over {acc_steps} decode steps (prefill excluded) ===");
-        println!("  role                 : {}", if is_head { "head" } else { "tail" });
-        println!("  wall in the loop     : {:9.1} ms   ({:.1} ms/step)", ms(wall), ms(wall) / acc_steps as f64);
+        println!(
+            "  role                 : {}",
+            if is_head { "head" } else { "tail" }
+        );
+        println!(
+            "  wall in the loop     : {:9.1} ms   ({:.1} ms/step)",
+            ms(wall),
+            ms(wall) / acc_steps as f64
+        );
         if warm_steps > 0 {
             println!(
                 "  WARM steps only      : {:9.1} ms   ({:.1} ms/step over {warm_steps} steps, \
@@ -6177,14 +6733,37 @@ fn main() -> Result<()> {
         if is_head {
             // `pass` contains the wait, so compute is what is left of it.
             let compute = acc_pass - acc_wait_peer - acc_send;
-            println!("  computing            : {:9.1} ms   {:5.1}%", ms(compute), 100.0 * compute / wall);
-            println!("  writing to the wire  : {:9.1} ms   {:5.1}%", ms(acc_send), 100.0 * acc_send / wall);
-            println!("  BLOCKED on the tail  : {:9.1} ms   {:5.1}%", ms(acc_wait_peer), 100.0 * acc_wait_peer / wall);
-            println!("  per step: compute {:.1} ms, blocked {:.1} ms",
-                     ms(compute) / acc_steps as f64, ms(acc_wait_peer) / acc_steps as f64);
+            println!(
+                "  computing            : {:9.1} ms   {:5.1}%",
+                ms(compute),
+                100.0 * compute / wall
+            );
+            println!(
+                "  writing to the wire  : {:9.1} ms   {:5.1}%",
+                ms(acc_send),
+                100.0 * acc_send / wall
+            );
+            println!(
+                "  BLOCKED on the tail  : {:9.1} ms   {:5.1}%",
+                ms(acc_wait_peer),
+                100.0 * acc_wait_peer / wall
+            );
+            println!(
+                "  per step: compute {:.1} ms, blocked {:.1} ms",
+                ms(compute) / acc_steps as f64,
+                ms(acc_wait_peer) / acc_steps as f64
+            );
         } else {
-            println!("  computing            : {:9.1} ms   {:5.1}%", ms(acc_pass), 100.0 * acc_pass / wall);
-            println!("    of which drafting  : {:9.1} ms   {:5.1}%", ms(acc_draft), 100.0 * acc_draft / wall);
+            println!(
+                "  computing            : {:9.1} ms   {:5.1}%",
+                ms(acc_pass),
+                100.0 * acc_pass / wall
+            );
+            println!(
+                "    of which drafting  : {:9.1} ms   {:5.1}%",
+                ms(acc_draft),
+                100.0 * acc_draft / wall
+            );
             println!(
                 "  ANSWERED the head at : {:9.1} ms into its pass ({:.1} ms/step) -- everything\n  \
                  after that (report, drafting) overlaps the head's next pass and the head\n  \
@@ -6192,9 +6771,16 @@ fn main() -> Result<()> {
                 ms(acc_to_reply),
                 ms(acc_to_reply) / acc_steps as f64
             );
-            println!("  BLOCKED on the head  : {:9.1} ms   {:5.1}%", ms(acc_recv), 100.0 * acc_recv / wall);
-            println!("  per step: compute {:.1} ms, blocked {:.1} ms",
-                     ms(acc_pass) / acc_steps as f64, ms(acc_recv) / acc_steps as f64);
+            println!(
+                "  BLOCKED on the head  : {:9.1} ms   {:5.1}%",
+                ms(acc_recv),
+                100.0 * acc_recv / wall
+            );
+            println!(
+                "  per step: compute {:.1} ms, blocked {:.1} ms",
+                ms(acc_pass) / acc_steps as f64,
+                ms(acc_recv) / acc_steps as f64
+            );
         }
         // ---- THE gate ------------------------------------------------------
         //
@@ -6204,10 +6790,18 @@ fn main() -> Result<()> {
         // much text came out per second of wall clock.
         // The prefill's own token is in `gen_tokens` on the single-sequence
         // lane and is not a decode token; the slot lane never counted it.
-        let decode_toks = if slot_lane { gen_tokens } else { gen_tokens.saturating_sub(1) };
+        let decode_toks = if slot_lane {
+            gen_tokens
+        } else {
+            gen_tokens.saturating_sub(1)
+        };
         let mut sorted = pass_ms.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in a duration"));
-        let p50 = if sorted.is_empty() { 0.0 } else { sorted[sorted.len() / 2] };
+        let p50 = if sorted.is_empty() {
+            0.0
+        } else {
+            sorted[sorted.len() / 2]
+        };
         println!(
             "  TOKENS/SEC           : {:.3}   ({decode_toks} tokens past the prefill in {:.1} ms \
              of decode wall)",
@@ -6251,9 +6845,16 @@ fn main() -> Result<()> {
                 / sets.max(1) as f64;
             println!("    mean {mean:.3} draft tokens accepted per verify pass");
         }
-        println!("  loop wall (both ends see the same clock): {:.1} ms", ms(loop_started.elapsed().as_secs_f64()));
-        println!("  the wire itself is the head's BLOCKED figure minus the tail's per-step compute;");
-        println!("  neither process can subtract that on its own, so the two reports are read together.");
+        println!(
+            "  loop wall (both ends see the same clock): {:.1} ms",
+            ms(loop_started.elapsed().as_secs_f64())
+        );
+        println!(
+            "  the wire itself is the head's BLOCKED figure minus the tail's per-step compute;"
+        );
+        println!(
+            "  neither process can subtract that on its own, so the two reports are read together."
+        );
     }
 
     // ---- what the router arm changed, if anything -------------------------
@@ -6262,7 +6863,10 @@ fn main() -> Result<()> {
     // every line. A zero that says how many selections it looked at is a
     // measurement; a zero on its own is a claim.
     if router_diff {
-        println!("\n=== router selection: {} vs the f32 [rows,hidden] lane ===", router_arm.label());
+        println!(
+            "\n=== router selection: {} vs the f32 [rows,hidden] lane ===",
+            router_arm.label()
+        );
         println!("  layer   examined   set!=   order!=   slots!=   max|dlogit|   max|dweight|");
         let (mut ex, mut sd, mut od, mut sl) = (0usize, 0usize, 0usize, 0usize);
         let (mut ml, mut mw) = (0f32, 0f32);
@@ -6272,8 +6876,12 @@ fn main() -> Result<()> {
             }
             println!(
                 "  {layer:5}   {:8}   {:5}   {:7}   {:7}   {:11.3e}   {:12.3e}",
-                d.examined, d.set_differs, d.order_differs, d.slots_differ,
-                d.max_abs_logit, d.max_abs_weight
+                d.examined,
+                d.set_differs,
+                d.order_differs,
+                d.slots_differ,
+                d.max_abs_logit,
+                d.max_abs_weight
             );
             ex += d.examined;
             sd += d.set_differs;
@@ -6285,9 +6893,7 @@ fn main() -> Result<()> {
         if ex == 0 {
             println!("  nothing examined: this node's slice has no MoE layer, so there was no router to compare.");
         } else {
-            println!(
-                "  TOTAL   {ex:8}   {sd:5}   {od:7}   {sl:7}   {ml:11.3e}   {mw:12.3e}"
-            );
+            println!("  TOTAL   {ex:8}   {sd:5}   {od:7}   {sl:7}   {ml:11.3e}   {mw:12.3e}");
             println!(
                 "  {:.4}% of {ex} selections chose a different SET of experts; {:.4}% reordered one.",
                 100.0 * sd as f64 / ex as f64,
@@ -6346,8 +6952,10 @@ fn main() -> Result<()> {
             // named steps past the end of the run has no prefix length yet, and
             // counting it as "prefix ended here" would bias the mean down by
             // exactly the runs that ran out of tokens.
-            let complete: Vec<&Vec<Option<bool>>> =
-                mtp_issued.values().filter(|v| v.iter().all(|s| s.is_some())).collect();
+            let complete: Vec<&Vec<Option<bool>>> = mtp_issued
+                .values()
+                .filter(|v| v.iter().all(|s| s.is_some()))
+                .collect();
             if !complete.is_empty() {
                 let sets = complete.len();
                 let mut hist = vec![0usize; mtp_k + 1];
@@ -6366,7 +6974,10 @@ fn main() -> Result<()> {
                     / sets as f64;
                 println!("  accepted prefix, over {sets} fully-scored draft sets:");
                 for (l, &c) in hist.iter().enumerate() {
-                    println!("    {l} accepted: {c:5}   ({:5.1}%)", 100.0 * c as f64 / sets as f64);
+                    println!(
+                        "    {l} accepted: {c:5}   ({:5.1}%)",
+                        100.0 * c as f64 / sets as f64
+                    );
                 }
                 println!("    mean {mean:.3} draft tokens accepted per verify pass");
             }
@@ -6421,8 +7032,10 @@ fn main() -> Result<()> {
             // a stochastic rule a draft set has no realised prefix -- it has a
             // distribution over prefixes -- so the expectation is taken
             // directly: E[prefix] = sum_j prod_{i<=j} q_i.
-            let complete_q: Vec<&Vec<Option<(f64, f64)>>> =
-                mtp_issued_q.values().filter(|v| v.iter().all(|s| s.is_some())).collect();
+            let complete_q: Vec<&Vec<Option<(f64, f64)>>> = mtp_issued_q
+                .values()
+                .filter(|v| v.iter().all(|s| s.is_some()))
+                .collect();
             if !complete_q.is_empty() {
                 let sets = complete_q.len();
                 let (mut eb, mut ec) = (0f64, 0f64);
@@ -6437,8 +7050,14 @@ fn main() -> Result<()> {
                     }
                 }
                 println!("  expected accepted prefix over {sets} fully-scored draft sets:");
-                println!("    rule B: {:.3} draft tokens per verify pass", eb / sets as f64);
-                println!("    rule C: {:.3} draft tokens per verify pass", ec / sets as f64);
+                println!(
+                    "    rule B: {:.3} draft tokens per verify pass",
+                    eb / sets as f64
+                );
+                println!(
+                    "    rule C: {:.3} draft tokens per verify pass",
+                    ec / sets as f64
+                );
             }
             println!(
                 "  depths past 1 are CONDITIONAL on the greedy chain: head d was fed the ARGMAX\n  \

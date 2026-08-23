@@ -50,8 +50,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use burn::tensor::{Tensor, TensorData};
-use cubecl::prelude::ComputeClient;
 use cubecl::cuda::CudaRuntime;
+use cubecl::prelude::ComputeClient;
 use half::bf16;
 
 use mary::models::inkling::attn::{attention, causal_mask, AttnDims, AttnWeights, LogScaling};
@@ -82,24 +82,49 @@ const BUDGET: f64 = 5e-3;
 
 fn read_f32(dir: &Path, name: &str) -> Result<Vec<f32>> {
     let b = std::fs::read(dir.join(name)).with_context(|| format!("reading {name}"))?;
-    anyhow::ensure!(b.len() % 4 == 0, "{name} is {} bytes, not a whole f32 count", b.len());
-    Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+    anyhow::ensure!(
+        b.len() % 4 == 0,
+        "{name} is {} bytes, not a whole f32 count",
+        b.len()
+    );
+    Ok(b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect())
 }
 
 /// One top-level number out of the manifest.
 fn num(man: &str, key: &str) -> Result<f64> {
     let pat = format!("\"{key}\":");
-    let i = man.find(&pat).with_context(|| format!("{key} missing from the manifest"))?;
+    let i = man
+        .find(&pat)
+        .with_context(|| format!("{key} missing from the manifest"))?;
     let rest = &man[i + pat.len()..];
     let end = rest
-        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E' || c.is_whitespace()))
+        .find(|c: char| {
+            !(c.is_ascii_digit()
+                || c == '.'
+                || c == '-'
+                || c == '+'
+                || c == 'e'
+                || c == 'E'
+                || c.is_whitespace())
+        })
         .unwrap_or(rest.len());
-    rest[..end].trim().parse().with_context(|| format!("{key} is not a number"))
+    rest[..end]
+        .trim()
+        .parse()
+        .with_context(|| format!("{key} is not a number"))
 }
 
 /// Relative L2 and worst absolute of `got` against `want`.
 fn err(got: &[f32], want: &[f32]) -> (f64, f64, f64) {
-    assert_eq!(got.len(), want.len(), "{} values against {}", got.len(), want.len());
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "{} values against {}",
+        got.len(),
+        want.len()
+    );
     let mut num = 0f64;
     let mut den = 0f64;
     let mut worst = 0f64;
@@ -125,7 +150,12 @@ fn bf16w(client: &ComputeClient<CudaRuntime>, v: &[f32], n: usize, k: usize) -> 
     for &f in v {
         bytes.extend_from_slice(&bf16::from_f32(f).to_le_bytes());
     }
-    Bf16W { h: client.create_from_slice(&bytes), n, k, align: 16 }
+    Bf16W {
+        h: client.create_from_slice(&bytes),
+        n,
+        k,
+        align: 16,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -167,8 +197,16 @@ fn one(
     let rel_extent = rp.len() / d_rel;
     anyhow::ensure!(x.len() == tokens * hidden, "x is not [{tokens}, {hidden}]");
     anyhow::ensure!(y.len() == tokens * hidden, "y is not [{tokens}, {hidden}]");
-    anyhow::ensure!(wo.len() == hidden * heads * head_dim, "wo is not [{hidden}, {}]", heads * head_dim);
-    anyhow::ensure!(ks.len() == kv_heads * head_dim * kernel, "k_sconv is not [{}, {kernel}]", kv_heads * head_dim);
+    anyhow::ensure!(
+        wo.len() == hidden * heads * head_dim,
+        "wo is not [{hidden}, {}]",
+        heads * head_dim
+    );
+    anyhow::ensure!(
+        ks.len() == kv_heads * head_dim * kernel,
+        "k_sconv is not [{}, {kernel}]",
+        kv_heads * head_dim
+    );
 
     println!("\n=== {tag} : heads {heads} kv {kv_heads} head_dim {head_dim} d_rel {d_rel} rel_extent {rel_extent} ===");
 
@@ -181,22 +219,33 @@ fn one(
         rel_extent,
         kernel,
         rms_eps: eps,
-        kind: if is_local { AttnKind::Local } else { AttnKind::Global },
+        kind: if is_local {
+            AttnKind::Local
+        } else {
+            AttnKind::Global
+        },
     };
     let mask = causal_mask(tokens, if is_local { Some(window) } else { None });
 
     // ---- control: the f32 host lane, which this change does not touch ----
     let hw = AttnWeights {
-        wq: &wq, wk: &wk, wv: &wv, wr: &wr, wo: &wo,
-        k_sconv: &ks, v_sconv: &vs, q_norm: &qn, k_norm: &kn, rel_proj: &rp,
+        wq: &wq,
+        wk: &wk,
+        wv: &wv,
+        wr: &wr,
+        wo: &wo,
+        k_sconv: &ks,
+        v_sconv: &vs,
+        q_norm: &qn,
+        k_norm: &kn,
+        rel_proj: &rp,
     };
     let host = attention(&x, &hw, &dims, Some(ls), &mask, tokens);
     let (h_l2, h_worst, scale) = err(&host, &y);
 
     // ---- the arm under test: the device lane, projections in BF16 --------
     let dev = Default::default();
-    let xt: Tensor<Bk, 2> =
-        Tensor::from_data(TensorData::new(x.clone(), [tokens, hidden]), &dev);
+    let xt: Tensor<Bk, 2> = Tensor::from_data(TensorData::new(x.clone(), [tokens, hidden]), &dev);
     let client = client_of(&xt);
     let t2 = |v: &[f32], r: usize, c: usize| -> Tensor<Bk, 2> {
         Tensor::from_data(TensorData::new(v.to_vec(), [r, c]), &dev)
@@ -213,15 +262,23 @@ fn one(
         k_norm: Tensor::from_data(TensorData::new(kn.clone(), [head_dim]), &dev),
         rel_proj: t2(&rp, d_rel, rel_extent),
     };
-    let devy = dev_lane::attention(xt, &dw, &dims, Some(ls), if is_local { Some(window) } else { None })
-        .into_data()
-        .to_vec::<f32>()
-        .expect("device attention output");
+    let devy = dev_lane::attention(
+        xt,
+        &dw,
+        &dims,
+        Some(ls),
+        if is_local { Some(window) } else { None },
+    )
+    .into_data()
+    .to_vec::<f32>()
+    .expect("device attention output");
     let (d_l2, d_worst, _) = err(&devy, &y);
     let (gap_l2, _, _) = err(&devy, &host);
 
     println!("  |y| (L2)                       : {scale:e}");
-    println!("  f32 host lane   vs reference   : rel L2 {h_l2:e}   worst abs {h_worst:e}   <- control");
+    println!(
+        "  f32 host lane   vs reference   : rel L2 {h_l2:e}   worst abs {h_worst:e}   <- control"
+    );
     println!("  BF16 device lane vs reference  : rel L2 {d_l2:e}   worst abs {d_worst:e}   <- the criterion");
     println!("  BF16 device lane vs f32 host   : rel L2 {gap_l2:e}   (what the change moved)");
     println!("  budget                         : {BUDGET:e}");
@@ -262,11 +319,25 @@ fn main() -> Result<()> {
     println!("  oracle    : {}", dir.display());
     println!("  corpus    : {tokens} tokens, hidden {hidden}, kernel {kernel}, window {window}");
     println!("  provenance: RANDOM weights at the checkpoint's SHAPES (see the module docs)");
-    println!("  inert here: log scaling (n_floor {}) and the out-of-range relative branch", ls.n_floor);
+    println!(
+        "  inert here: log scaling (n_floor {}) and the out-of-range relative branch",
+        ls.n_floor
+    );
 
     let (mut checks, mut fails) = (0usize, 0usize);
     for tag in ["local", "global"] {
-        one(&dir, tag, tokens, hidden, kernel, eps, ls, window, &mut checks, &mut fails)?;
+        one(
+            &dir,
+            tag,
+            tokens,
+            hidden,
+            kernel,
+            eps,
+            ls,
+            window,
+            &mut checks,
+            &mut fails,
+        )?;
     }
 
     println!("\n=== {checks} checks, {fails} failures ===");

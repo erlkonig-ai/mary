@@ -59,7 +59,8 @@ fn num_after(text: &str, key: &str, from: usize) -> Result<f64> {
         .skip_while(|c| c.is_whitespace())
         .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == 'e')
         .collect();
-    s.parse().with_context(|| format!("{key} is not a number: {s:?}"))
+    s.parse()
+        .with_context(|| format!("{key} is not a number: {s:?}"))
 }
 
 fn num(text: &str, key: &str) -> Result<f64> {
@@ -80,7 +81,12 @@ impl Diff {
 }
 
 fn compare(mine: &[f32], theirs: &[f32]) -> Diff {
-    let mut d = Diff { worst_abs: 0.0, scale: 0.0, worst_rel: 0.0, n: mine.len().min(theirs.len()) };
+    let mut d = Diff {
+        worst_abs: 0.0,
+        scale: 0.0,
+        worst_rel: 0.0,
+        n: mine.len().min(theirs.len()),
+    };
     for (&a, &b) in mine.iter().zip(theirs) {
         let abs = (a - b).abs();
         d.worst_abs = d.worst_abs.max(abs);
@@ -102,7 +108,9 @@ fn run_layer(
     checks: &mut usize,
 ) -> Result<()> {
     // The per-layer block starts at the tag, so read its fields from there.
-    let at = man.find(&format!("\"{tag}\"")).context("manifest lacks the layer")?;
+    let at = man
+        .find(&format!("\"{tag}\""))
+        .context("manifest lacks the layer")?;
     let heads = num_after(man, "num_heads", at)? as usize;
     let kv_heads = num_after(man, "num_kv_heads", at)? as usize;
     let head_dim = num_after(man, "head_dim", at)? as usize;
@@ -132,11 +140,19 @@ fn run_layer(
     let rp = read_f32(dir, &p("rel_proj.bin"))?;
     let ref_mask = read_f32(dir, &p("mask.bin"))?;
     let y = read_f32(dir, &p("y.bin"))?;
-    anyhow::ensure!(!y.is_empty(), "{tag}: no reference output — the gate would be vacuous");
+    anyhow::ensure!(
+        !y.is_empty(),
+        "{tag}: no reference output — the gate would be vacuous"
+    );
 
     // ---- check 1: our mask must match theirs ------------------------------
     let mask = causal_mask(tokens, if is_local { Some(window) } else { None });
-    anyhow::ensure!(ref_mask.len() == tokens * tokens, "{tag}: mask is {} not {}", ref_mask.len(), tokens * tokens);
+    anyhow::ensure!(
+        ref_mask.len() == tokens * tokens,
+        "{tag}: mask is {} not {}",
+        ref_mask.len(),
+        tokens * tokens
+    );
     let mut mask_bad = 0usize;
     let mut visible = 0usize;
     for i in 0..tokens * tokens {
@@ -149,22 +165,37 @@ fn run_layer(
         }
         if mine_vis != theirs_vis {
             if mask_bad < 4 {
-                println!("  FAIL  mask[{}][{}]: mine {}, reference {}", i / tokens, i % tokens, mask[i], ref_mask[i]);
+                println!(
+                    "  FAIL  mask[{}][{}]: mine {}, reference {}",
+                    i / tokens,
+                    i % tokens,
+                    mask[i],
+                    ref_mask[i]
+                );
             }
             mask_bad += 1;
         }
     }
-    println!("  mask cells {} , visible {visible}, disagreements {mask_bad}", tokens * tokens);
+    println!(
+        "  mask cells {} , visible {visible}, disagreements {mask_bad}",
+        tokens * tokens
+    );
     *fails += mask_bad;
     // Non-vacuity: a window mask must actually hide more than a causal one.
     if is_local {
-        let causal_only = causal_mask(tokens, None).iter().filter(|&&v| v == 0.0).count();
+        let causal_only = causal_mask(tokens, None)
+            .iter()
+            .filter(|&&v| v == 0.0)
+            .count();
         *checks += 1;
         if causal_only == visible {
             println!("  FAIL  the window hides nothing here — the local mask is untested");
             *fails += 1;
         } else {
-            println!("  window hides {} cells a causal mask would show", causal_only - visible);
+            println!(
+                "  window hides {} cells a causal mask would show",
+                causal_only - visible
+            );
         }
     }
 
@@ -177,19 +208,37 @@ fn run_layer(
         rel_extent,
         kernel,
         rms_eps: eps,
-        kind: if is_local { AttnKind::Local } else { AttnKind::Global },
+        kind: if is_local {
+            AttnKind::Local
+        } else {
+            AttnKind::Global
+        },
     };
     *checks += 1;
     if (dims.scaling() - ref_scaling).abs() > 1e-9 {
-        println!("  FAIL  scaling {} != reference {ref_scaling}", dims.scaling());
+        println!(
+            "  FAIL  scaling {} != reference {ref_scaling}",
+            dims.scaling()
+        );
         *fails += 1;
     } else {
-        println!("  scaling {} matches (1/head_dim, not 1/sqrt(head_dim))", dims.scaling());
+        println!(
+            "  scaling {} matches (1/head_dim, not 1/sqrt(head_dim))",
+            dims.scaling()
+        );
     }
 
     let w = AttnWeights {
-        wq: &wq, wk: &wk, wv: &wv, wr: &wr, wo: &wo,
-        k_sconv: &ks, v_sconv: &vs, q_norm: &qn, k_norm: &kn, rel_proj: &rp,
+        wq: &wq,
+        wk: &wk,
+        wv: &wv,
+        wr: &wr,
+        wo: &wo,
+        k_sconv: &ks,
+        v_sconv: &vs,
+        q_norm: &qn,
+        k_norm: &kn,
+        rel_proj: &rp,
     };
     let ls = LogScaling { n_floor, alpha };
     let mine = attention(x, &w, &dims, Some(ls), &mask, tokens);
@@ -197,9 +246,15 @@ fn run_layer(
     let d = compare(&mine, &y);
     *checks += d.n;
     println!("  values compared   : {}", d.n);
-    println!("  worst absolute    : {:e}  (scale {:e})", d.worst_abs, d.scale);
+    println!(
+        "  worst absolute    : {:e}  (scale {:e})",
+        d.worst_abs, d.scale
+    );
     println!("  worst abs / scale : {:e}   <- the criterion", d.scaled());
-    println!("  worst relative    : {:e}   (reported, not gated)", d.worst_rel);
+    println!(
+        "  worst relative    : {:e}   (reported, not gated)",
+        d.worst_rel
+    );
     if d.scaled() > BUDGET {
         println!("  FAIL  over budget");
         *fails += 1;
@@ -211,20 +266,30 @@ fn run_layer(
         println!("  FAIL  tokens {tokens} <= rel_extent {rel_extent}: the out-of-range bias branch never fires");
         *fails += 1;
     } else {
-        println!("  {} of {} distances exceed rel_extent, so the zeroing branch fires",
-                 tokens - rel_extent, tokens);
+        println!(
+            "  {} of {} distances exceed rel_extent, so the zeroing branch fires",
+            tokens - rel_extent,
+            tokens
+        );
     }
 
     // ---- check 4: the other configuration must disagree -------------------
     let other = AttnDims {
-        kind: if is_local { AttnKind::Global } else { AttnKind::Local },
+        kind: if is_local {
+            AttnKind::Global
+        } else {
+            AttnKind::Local
+        },
         ..dims
     };
     let other_mask = causal_mask(tokens, if is_local { None } else { Some(window) });
     let flipped = attention(x, &w, &other, Some(ls), &other_mask, tokens);
     let fd = compare(&flipped, &y);
     *checks += 1;
-    println!("  same weights under the OTHER kind: worst abs/scale {:e}", fd.scaled());
+    println!(
+        "  same weights under the OTHER kind: worst abs/scale {:e}",
+        fd.scaled()
+    );
     if fd.scaled() <= BUDGET {
         println!("  FAIL  local and global are indistinguishable here — the kind is untested");
         *fails += 1;
@@ -244,7 +309,12 @@ fn main() -> Result<()> {
     println!("=== oracle ===");
     println!("  dir    : {}", dir.display());
     println!("  tokens {tokens}  hidden {hidden}");
-    anyhow::ensure!(x.len() == tokens * hidden, "input is {} not {}", x.len(), tokens * hidden);
+    anyhow::ensure!(
+        x.len() == tokens * hidden,
+        "input is {} not {}",
+        x.len(),
+        tokens * hidden
+    );
 
     let mut fails = 0usize;
     let mut checks = 0usize;
@@ -268,7 +338,9 @@ fn main() -> Result<()> {
     println!("\n=== verdict ===");
     println!("  checks: {checks}");
     if fails == 0 {
-        println!("GATE PASSED — {checks} checks, attention matches transformers on both layer kinds");
+        println!(
+            "GATE PASSED — {checks} checks, attention matches transformers on both layer kinds"
+        );
         Ok(())
     } else {
         println!("GATE FAILED — {checks} checks, {fails} FAILURES");

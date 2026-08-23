@@ -57,12 +57,30 @@ const GOLDEN: &str = "/tmp/mary-k3tok/golden/k3_tokenizer_battery.json";
 /// The deliberate breakages. Each one is a real, plausible porting mistake; the
 /// gate is only worth anything if it catches every one of them.
 const MUTANTS: &[(&str, &str)] = &[
-    ("swap_ranks", "swap two COLD tokens' ranks in tiktoken.model before ingest"),
-    ("swap_ranks_hot", "swap two HOT tokens' ranks after the fingerprint check"),
-    ("drop_han_branch", "drop the leading [\\p{Han}]+ branch from pat_str"),
-    ("drop_lookahead_branch", "drop the \\s+(?!\\S) branch from pat_str"),
-    ("digits_unbounded", "\\p{N}{1,3} -> \\p{N}+ (numbers as one token)"),
-    ("merge_highest_first", "merge the HIGHEST-rank pair instead of the lowest"),
+    (
+        "swap_ranks",
+        "swap two COLD tokens' ranks in tiktoken.model before ingest",
+    ),
+    (
+        "swap_ranks_hot",
+        "swap two HOT tokens' ranks after the fingerprint check",
+    ),
+    (
+        "drop_han_branch",
+        "drop the leading [\\p{Han}]+ branch from pat_str",
+    ),
+    (
+        "drop_lookahead_branch",
+        "drop the \\s+(?!\\S) branch from pat_str",
+    ),
+    (
+        "digits_unbounded",
+        "\\p{N}{1,3} -> \\p{N}+ (numbers as one token)",
+    ),
+    (
+        "merge_highest_first",
+        "merge the HIGHEST-rank pair instead of the lowest",
+    ),
     ("special_off_by_one", "shift every special token id by +1"),
     ("no_specials", "encode with allow_special always false"),
     ("skip_chunking", "drop the shipped 25k-char chunking"),
@@ -142,16 +160,17 @@ fn main() {
     let mutate = mutate.as_deref();
 
     // ── goldens ──────────────────────────────────────────────────────────────
-    let gold: Value = serde_json::from_slice(
-        &std::fs::read(GOLDEN)
-            .unwrap_or_else(|e| panic!("{GOLDEN}: {e} — run golden/capture_k3_tokenizer.py first")),
-    )
-    .expect("golden json");
+    let gold: Value =
+        serde_json::from_slice(&std::fs::read(GOLDEN).unwrap_or_else(|e| {
+            panic!("{GOLDEN}: {e} — run golden/capture_k3_tokenizer.py first")
+        }))
+        .expect("golden json");
 
     // ── ingest into the graph, then read the tokenizer back OUT of it ───────
     let dir = PathBuf::from(model_dir());
     let mut model_file = std::fs::read(dir.join("tiktoken.model")).expect("tiktoken.model");
-    let config_json = std::fs::read(dir.join("tokenizer_config.json")).expect("tokenizer_config.json");
+    let config_json =
+        std::fs::read(dir.join("tokenizer_config.json")).expect("tokenizer_config.json");
 
     // Corrupt the SOURCE FILE, which is where a real "ranks got mis-paired with
     // bytes" bug would live — not the in-memory table after it has been
@@ -171,8 +190,14 @@ fn main() {
 
     let t0 = std::time::Instant::now();
     let mut blobs = MemoryBlobStore::new();
-    let frag = tokenizer::save_tiktoken(&model_file, &config_json, &pat_str, "moonshotai/Kimi-K3", &mut blobs)
-        .expect("save_tiktoken");
+    let frag = tokenizer::save_tiktoken(
+        &model_file,
+        &config_json,
+        &pat_str,
+        "moonshotai/Kimi-K3",
+        &mut blobs,
+    )
+    .expect("save_tiktoken");
     let tok_id = frag.root().expect("tokenizer root");
     let tribles: TribleSet = frag.into();
     let blobs = BlobStore::reader(&mut blobs).expect("blob reader");
@@ -223,7 +248,11 @@ fn main() {
     let fp = format!("{:016x}", fnv1a64(&refs));
     let want_fp = gold["vocab_fnv1a64"].as_str().unwrap();
     let want_n = gold["n_base"].as_u64().unwrap() as usize;
-    check!(ranks.len() == want_n, "base vocab size {} (want {want_n})", ranks.len());
+    check!(
+        ranks.len() == want_n,
+        "base vocab size {} (want {want_n})",
+        ranks.len()
+    );
     check!(fp == want_fp, "vocab fingerprint {fp} (want {want_fp})");
 
     // ── 2. pre-tokenizer pattern ────────────────────────────────────────────
@@ -232,14 +261,22 @@ fn main() {
         KIMI_K3_PAT_STR == want_pat,
         "KIMI_K3_PAT_STR matches the shipped pat_str"
     );
-    check!(graph_pat == pat_str, "pattern survives the graph round trip");
+    check!(
+        graph_pat == pat_str,
+        "pattern survives the graph round trip"
+    );
 
     // ── 3. special tokens ───────────────────────────────────────────────────
     let want_specials: Vec<(String, u64)> = gold["special_tokens"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|v| (v["name"].as_str().unwrap().to_string(), v["id"].as_u64().unwrap()))
+        .map(|v| {
+            (
+                v["name"].as_str().unwrap().to_string(),
+                v["id"].as_u64().unwrap(),
+            )
+        })
         .collect();
     assert!(!want_specials.is_empty(), "golden has no special tokens");
     let mut specials: Vec<(String, u64)> = specials_graph.clone();
@@ -264,7 +301,11 @@ fn main() {
         .filter(|(a, b)| a != b)
         .take(4)
         .collect();
-    check!(got == want, "all {} special (name, id) pairs; first diffs: {bad:?}", want.len());
+    check!(
+        got == want,
+        "all {} special (name, id) pairs; first diffs: {bad:?}",
+        want.len()
+    );
 
     // ── build the tokenizer from what the graph gave back ───────────────────
     if mutate == Some("swap_ranks_hot") {
@@ -302,7 +343,10 @@ fn main() {
     };
 
     // ── 4/5. the named battery: full id sequences, then decode ──────────────
-    println!("\n── battery ({} cases) ──", gold["cases"].as_array().unwrap().len());
+    println!(
+        "\n── battery ({} cases) ──",
+        gold["cases"].as_array().unwrap().len()
+    );
     let empty: Vec<Value> = Vec::new();
     let cases = if mutate == Some("empty_battery") {
         &empty
@@ -368,8 +412,16 @@ fn main() {
         tokens_compared > 0,
         "battery compared {tokens_compared} tokens (must be > 0)"
     );
-    check!(enc_fail.is_empty(), "battery encode: {} failing case(s) {enc_fail:?}", enc_fail.len());
-    check!(dec_fail.is_empty(), "battery decode: {} failing case(s) {dec_fail:?}", dec_fail.len());
+    check!(
+        enc_fail.is_empty(),
+        "battery encode: {} failing case(s) {enc_fail:?}",
+        enc_fail.len()
+    );
+    check!(
+        dec_fail.is_empty(),
+        "battery decode: {} failing case(s) {dec_fail:?}",
+        dec_fail.len()
+    );
 
     // ── the fuzz corpus ─────────────────────────────────────────────────────
     let fuzz = gold["fuzz"].as_array().unwrap();
@@ -392,7 +444,10 @@ fn main() {
             fuzz_fail.push((text, got, want));
         }
     }
-    println!("\n── fuzz ({} strings, {fuzz_tokens} reference tokens) ──", fuzz.len());
+    println!(
+        "\n── fuzz ({} strings, {fuzz_tokens} reference tokens) ──",
+        fuzz.len()
+    );
     for (t, got, want) in fuzz_fail.iter().take(5) {
         println!(
             "  FAIL  {:?}\n           got  {:?}\n           want {:?}",
@@ -401,7 +456,10 @@ fn main() {
             &want[..want.len().min(20)]
         );
     }
-    check!(fuzz_tokens > 0, "fuzz compared {fuzz_tokens} tokens (must be > 0)");
+    check!(
+        fuzz_tokens > 0,
+        "fuzz compared {fuzz_tokens} tokens (must be > 0)"
+    );
     check!(
         fuzz_fail.is_empty(),
         "fuzz: {}/{} strings differ",

@@ -72,7 +72,11 @@ pub fn split_byte(b: u8) -> (u8, u8) {
 /// can check it rather than assume it.
 pub fn decode_row(codes: &[u8], scales: &[u8], scale2: f32, out: &mut [f32]) -> usize {
     let logical = codes.len() * 2;
-    assert_eq!(out.len(), logical, "output must hold two values per code byte");
+    assert_eq!(
+        out.len(),
+        logical,
+        "output must hold two values per code byte"
+    );
     assert_eq!(
         scales.len() * GROUP,
         logical,

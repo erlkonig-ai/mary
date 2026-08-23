@@ -68,7 +68,11 @@ fn main() -> Result<()> {
     });
     println!(
         "CubeCL reports the BF16 combination (bf16 x bf16 -> f32, m{m}n{n}k{KTILE}): {}",
-        if registered { "REGISTERED" } else { "NOT registered" }
+        if registered {
+            "REGISTERED"
+        } else {
+            "NOT registered"
+        }
     );
     if !registered {
         bail!(

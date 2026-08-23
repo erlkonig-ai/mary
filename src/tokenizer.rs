@@ -57,7 +57,11 @@ pub struct CountingBlobs<'a, B: BlobStorePut> {
 
 impl<'a, B: BlobStorePut> CountingBlobs<'a, B> {
     pub fn new(inner: &'a mut B) -> Self {
-        CountingBlobs { inner, puts: 0, nanos: 0 }
+        CountingBlobs {
+            inner,
+            puts: 0,
+            nanos: 0,
+        }
     }
 
     /// Puts per second, or `None` when nothing was put.
@@ -179,7 +183,7 @@ mod flag {
 }
 
 pub mod attrs {
-    use triblespace::prelude::inlineencodings::{Boolean, F64, GenId, Handle, ShortString, U256BE};
+    use triblespace::prelude::inlineencodings::{Boolean, GenId, Handle, ShortString, F64, U256BE};
     use triblespace::prelude::*;
 
     attributes! {
@@ -487,7 +491,10 @@ pub fn save_tiktoken(
             None => format!("<|reserved_token_{id}|>"),
         };
         let mut tags: Vec<Id> = Vec::new();
-        if entry.map(|e| e["special"].as_bool() == Some(true)).unwrap_or(false) {
+        if entry
+            .map(|e| e["special"].as_bool() == Some(true))
+            .unwrap_or(false)
+        {
             tags.push(flag::SPECIAL);
         }
         let ch = blobs.put::<blobencodings::UTF8String, _>(content)?;
@@ -869,8 +876,7 @@ fn required_one<T>(
     node: Id,
     field: &'static str,
 ) -> Result<T, Err> {
-    optional_one(values, node, field)?
-        .ok_or_else(|| format!("node {node} has no {field}").into())
+    optional_one(values, node, field)?.ok_or_else(|| format!("node {node} has no {field}").into())
 }
 
 #[cfg(feature = "tokenizer")]
@@ -891,8 +897,11 @@ fn load_vocab_strict(
     let mut ids = HashSet::with_capacity(entries.len());
     for entry in entries {
         let piece = required_one(
-            find!((piece), pattern!(tribles, [{ entry @ attrs::piece: ?piece }]))
-                .map(|(piece,)| read_piece(blobs, piece)),
+            find!(
+                (piece),
+                pattern!(tribles, [{ entry @ attrs::piece: ?piece }])
+            )
+            .map(|(piece,)| read_piece(blobs, piece)),
             entry,
             "piece",
         )?;
@@ -932,14 +941,20 @@ fn load_merges_strict(
     let mut ranked = BTreeMap::new();
     for merge in merges {
         let left = required_one(
-            find!((left), pattern!(tribles, [{ merge @ attrs::merge_left: ?left }]))
-                .map(|(left,)| read_piece(blobs, left)),
+            find!(
+                (left),
+                pattern!(tribles, [{ merge @ attrs::merge_left: ?left }])
+            )
+            .map(|(left,)| read_piece(blobs, left)),
             merge,
             "merge_left",
         )?;
         let right = required_one(
-            find!((right), pattern!(tribles, [{ merge @ attrs::merge_right: ?right }]))
-                .map(|(right,)| read_piece(blobs, right)),
+            find!(
+                (right),
+                pattern!(tribles, [{ merge @ attrs::merge_right: ?right }])
+            )
+            .map(|(right,)| read_piece(blobs, right)),
             merge,
             "merge_right",
         )?;
@@ -973,8 +988,11 @@ fn load_added_strict(
     let mut ordered = BTreeMap::new();
     for added in added {
         let piece = required_one(
-            find!((piece), pattern!(tribles, [{ added @ attrs::piece: ?piece }]))
-                .map(|(piece,)| read_piece(blobs, piece)),
+            find!(
+                (piece),
+                pattern!(tribles, [{ added @ attrs::piece: ?piece }])
+            )
+            .map(|(piece,)| read_piece(blobs, piece)),
             added,
             "piece",
         )?;
@@ -994,7 +1012,9 @@ fn load_added_strict(
             "index",
         )?;
         if ordered.insert(index, (piece, token_id)).is_some() {
-            return Err(format!("tokenizer {tok_id} has duplicate added-token index {index}").into());
+            return Err(
+                format!("tokenizer {tok_id} has duplicate added-token index {index}").into(),
+            );
         }
     }
     Ok(ordered.into_values().collect())
@@ -1553,8 +1573,14 @@ mod tests {
         let config = r#"{"added_tokens_decoder": {"5": {"content": "[BOS]", "special": true}},
                          "unk_token": "[UNK]"}"#;
         let mut blobs = MemoryBlobStore::new();
-        let frag =
-            save_tiktoken(model.as_bytes(), config.as_bytes(), "PAT", "test/tik", &mut blobs).unwrap();
+        let frag = save_tiktoken(
+            model.as_bytes(),
+            config.as_bytes(),
+            "PAT",
+            "test/tik",
+            &mut blobs,
+        )
+        .unwrap();
         let root = frag.root().expect("root");
         let tribles: TribleSet = frag.into();
         let reader = BlobStore::reader(&mut blobs).unwrap();
@@ -1849,7 +1875,14 @@ pub fn load_spm_pieces(
                         attrs::piece_score: ?sc, metadata::tag: ?t }
         ])
     )
-    .map(|(ph, i, sc, t)| (i, read_piece(blobs, ph).into_bytes(), sc as f32, spm_tag_type(t)))
+    .map(|(ph, i, sc, t)| {
+        (
+            i,
+            read_piece(blobs, ph).into_bytes(),
+            sc as f32,
+            spm_tag_type(t),
+        )
+    })
     .collect();
     rows.sort_by_key(|r| r.0);
     rows.into_iter().map(|(_, b, s, t)| (b, s, t)).collect()

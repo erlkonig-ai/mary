@@ -106,7 +106,10 @@ fn main() -> Result<()> {
         handle_hex(&src_handle),
         handle_hex(&dst_handle)
     );
-    println!("collection  identity unchanged: {}", handle_hex(&src_handle));
+    println!(
+        "collection  identity unchanged: {}",
+        handle_hex(&src_handle)
+    );
 
     let (src_tribles, src_reader) = (canonical_facts(&source.facts)?, source.reader);
     let (dst_tribles, dst_reader) = (canonical_facts(&converted.facts)?, converted.reader);
@@ -162,14 +165,9 @@ fn main() -> Result<()> {
         "{} source facts did not survive the conversion",
         src_set.difference(&dst_set).count()
     );
-    println!(
-        "facts       {} carried verbatim, none lost",
-        src_set.len()
-    );
+    println!("facts       {} carried verbatim, none lost", src_set.len());
     anyhow::ensure!(
-        !dst_tribles
-            .iter()
-            .any(|t| data_attrs.contains(t.a())),
+        !dst_tribles.iter().any(|t| data_attrs.contains(t.a())),
         "the converted pile still holds old-format leaf facts"
     );
 
@@ -229,8 +227,7 @@ fn main() -> Result<()> {
             .context("f32 handles")?
         };
         let src_shape = mary::ingest::read_shape(&src_reader, sh);
-        let handle: Inline<inlineencodings::Handle<blobencodings::RawBytes>> =
-            Inline::new(dh_raw);
+        let handle: Inline<inlineencodings::Handle<blobencodings::RawBytes>> = Inline::new(dh_raw);
         let src_bytes: anybytes::Bytes = src_reader
             .get(handle)
             .map_err(|e| anyhow::anyhow!("{leaf_id}: source data blob: {e:?}"))?;

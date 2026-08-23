@@ -123,7 +123,10 @@ pub fn short_conv_decode<R: Runtime>(
     dim: usize,
     kernel: usize,
 ) -> (Handle, Handle) {
-    assert!(kernel >= 2, "a short convolution with kernel {kernel} has no history to carry");
+    assert!(
+        kernel >= 2,
+        "a short convolution with kernel {kernel} has no history to carry"
+    );
     let taps = kernel - 1;
     let f32b = core::mem::size_of::<f32>();
     let out = client.empty(dim * f32b);
@@ -212,7 +215,10 @@ pub fn short_conv_batch<R: Runtime>(
     rows: usize,
     kernel: usize,
 ) -> Handle {
-    assert!(kernel >= 2, "a short convolution with kernel {kernel} has no history to carry");
+    assert!(
+        kernel >= 2,
+        "a short convolution with kernel {kernel} has no history to carry"
+    );
     assert!(rows >= 1, "a batched convolution produces at least one row");
     let f32b = core::mem::size_of::<f32>();
     let out = client.empty(rows * dim * f32b);
@@ -314,7 +320,10 @@ pub fn short_conv_slots<R: Runtime>(
     slots: usize,
     kernel: usize,
 ) -> (Handle, Handle) {
-    assert!(kernel >= 2, "a short convolution with kernel {kernel} has no history to carry");
+    assert!(
+        kernel >= 2,
+        "a short convolution with kernel {kernel} has no history to carry"
+    );
     assert!(slots >= 1, "a slot batch has at least one slot");
     let taps = kernel - 1;
     let f32b = core::mem::size_of::<f32>();
@@ -392,9 +401,13 @@ mod tests {
     #[test]
     fn batched_matches_the_one_row_kernel_exactly() {
         let dev = Default::default();
-        for (dim, kernel, rows) in
-            [(4096usize, 4usize, 1usize), (4096, 4, 2), (4096, 4, 8), (777, 3, 5), (256, 2, 3)]
-        {
+        for (dim, kernel, rows) in [
+            (4096usize, 4usize, 1usize),
+            (4096, 4, 2),
+            (4096, 4, 8),
+            (777, 3, 5),
+            (256, 2, 3),
+        ] {
             let taps = kernel - 1;
             let len = taps + rows;
             let (av, wv) = (fill(len * dim, 0.3), fill(dim * kernel, 2.9));
@@ -435,7 +448,8 @@ mod tests {
                     .unwrap();
                 for d in 0..dim {
                     assert_eq!(
-                        batched[i * dim + d], one[d],
+                        batched[i * dim + d],
+                        one[d],
                         "dim {dim} kernel {kernel} rows {rows}: row {i} channel {d} \
                          differs between the batched and the one-row kernel"
                     );
@@ -465,9 +479,12 @@ mod tests {
         let dev = Default::default();
         for (dim, kernel) in [(4096usize, 4usize), (512, 4), (256, 2), (777, 3)] {
             let taps = kernel - 1;
-            let (hv, xv, wv) = (fill(taps * dim, 0.3), fill(dim, 1.7), fill(dim * kernel, 2.9));
-            let hist: Tensor<Bk, 2> =
-                Tensor::from_data(TensorData::new(hv, [taps, dim]), &dev);
+            let (hv, xv, wv) = (
+                fill(taps * dim, 0.3),
+                fill(dim, 1.7),
+                fill(dim * kernel, 2.9),
+            );
+            let hist: Tensor<Bk, 2> = Tensor::from_data(TensorData::new(hv, [taps, dim]), &dev);
             let x: Tensor<Bk, 2> = Tensor::from_data(TensorData::new(xv, [1, dim]), &dev);
             let w: Tensor<Bk, 2> = Tensor::from_data(TensorData::new(wv, [dim, kernel]), &dev);
 
@@ -489,7 +506,10 @@ mod tests {
             let next = tensor_of(client, Default::default(), nh, taps, dim);
 
             let dnext = (next - ref_next).abs().max().into_scalar();
-            assert_eq!(dnext, 0.0, "the carried history must be the window's own rows");
+            assert_eq!(
+                dnext, 0.0,
+                "the carried history must be the window's own rows"
+            );
 
             let scale = ref_out.clone().abs().max().into_scalar().max(1e-6);
             let rel = (out - ref_out).abs().max().into_scalar() / scale;

@@ -434,7 +434,10 @@ fn main() {
     let skip_burn = args.iter().any(|a| a == "--skip-burn");
     let synth = args.iter().any(|a| a == "--synth");
     let pile = mary::paths::model(
-        args.iter().skip(2).find(|a| !a.starts_with("--")).map(String::as_str),
+        args.iter()
+            .skip(2)
+            .find(|a| !a.starts_with("--"))
+            .map(String::as_str),
         "personaplex.pile",
     )
     .unwrap_or_else(|e| {

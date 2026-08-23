@@ -30,7 +30,7 @@
 //! schema means a consumer extends the model by minting its own typed attributes,
 //! never by forking this library.
 
-use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
+use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString, F64};
 use triblespace::prelude::*;
 

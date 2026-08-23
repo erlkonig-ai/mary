@@ -89,9 +89,10 @@ impl Tally {
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let path = args.next().map(PathBuf::from).context(
-        "usage: inkling_align_gate <pile> [--mutate N] [--limit N]",
-    )?;
+    let path = args
+        .next()
+        .map(PathBuf::from)
+        .context("usage: inkling_align_gate <pile> [--mutate N] [--limit N]")?;
     let (mut mutate, mut limit) = (0usize, usize::MAX);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -137,8 +138,15 @@ fn main() -> Result<()> {
         // The mutation is applied to the SLICE, so it moves the pointer — which
         // is the thing classified. Shortening from the front is exactly how a
         // one-byte layout slip would present.
-        let data = if mutate > 0 && data.len() > mutate { &data[mutate..] } else { data };
-        by_kind.entry(kind).or_default().note(name, data, al.classify(data));
+        let data = if mutate > 0 && data.len() > mutate {
+            &data[mutate..]
+        } else {
+            data
+        };
+        by_kind
+            .entry(kind)
+            .or_default()
+            .note(name, data, al.classify(data));
         Ok(())
     });
     match r {
@@ -162,7 +170,11 @@ fn main() -> Result<()> {
             kind,
             t.planes,
             t.bytes as f64 / (1u64 << 30) as f64,
-            if t.planes == 0 { f64::NAN } else { t.alias as f64 * 100.0 / t.planes as f64 },
+            if t.planes == 0 {
+                f64::NAN
+            } else {
+                t.alias as f64 * 100.0 / t.planes as f64
+            },
             aligns.join(" ")
         );
         planes += t.planes;
@@ -172,7 +184,11 @@ fn main() -> Result<()> {
     println!();
     println!(
         "  TOTAL      : {aliased} of {planes} planes alias ({:.2}%), {:.2} GiB",
-        if planes == 0 { f64::NAN } else { aliased as f64 * 100.0 / planes as f64 },
+        if planes == 0 {
+            f64::NAN
+        } else {
+            aliased as f64 * 100.0 / planes as f64
+        },
         bytes as f64 / (1u64 << 30) as f64
     );
 

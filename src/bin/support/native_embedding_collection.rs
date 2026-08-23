@@ -120,10 +120,8 @@ fn publish_embedding_candidate_with_contract_impl(
         .stage(pile, signing_key)
         .map_err(|error| anyhow::anyhow!("stage embedding commit dependencies: {error}"))?;
 
-    let snapshot = mary::model_collection::snapshot_model_collection_local_latest(
-        staged.store_mut(),
-        team,
-    )?;
+    let snapshot =
+        mary::model_collection::snapshot_model_collection_local_latest(staged.store_mut(), team)?;
     let (mut facts, _, reader) = snapshot.into_parts();
     facts += candidate_facts;
     let selected = SelectedModelIndex::from_graph(

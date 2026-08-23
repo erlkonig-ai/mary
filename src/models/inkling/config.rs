@@ -116,9 +116,11 @@ impl InklingTextConfig {
     /// omits them.
     pub fn heads(&self, kind: AttnKind) -> (usize, usize, usize) {
         match kind {
-            AttnKind::Global => {
-                (self.num_attention_heads, self.num_key_value_heads, self.head_dim)
-            }
+            AttnKind::Global => (
+                self.num_attention_heads,
+                self.num_key_value_heads,
+                self.head_dim,
+            ),
             AttnKind::Local => (
                 if self.swa_num_attention_heads > 0 {
                     self.swa_num_attention_heads
@@ -130,7 +132,11 @@ impl InklingTextConfig {
                 } else {
                     self.num_key_value_heads
                 },
-                if self.swa_head_dim > 0 { self.swa_head_dim } else { self.head_dim },
+                if self.swa_head_dim > 0 {
+                    self.swa_head_dim
+                } else {
+                    self.head_dim
+                },
             ),
         }
     }

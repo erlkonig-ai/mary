@@ -36,7 +36,9 @@ fn collapse(name: &str) -> String {
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let pile = args.next().context("usage: inkling_pile_names <pile> [--grep S] [--raw]")?;
+    let pile = args
+        .next()
+        .context("usage: inkling_pile_names <pile> [--grep S] [--raw]")?;
     let mut grep: Option<String> = None;
     let mut raw = false;
     let mut dims = false;
@@ -53,8 +55,12 @@ fn main() -> Result<()> {
         .with_context(|| format!("opening model collection in {pile}"))?;
 
     println!("pile     {pile}");
-    println!("leaves   {} total = {} dense + {} expert",
-             src.len(), src.dense_len(), src.expert_len());
+    println!(
+        "leaves   {} total = {} dense + {} expert",
+        src.len(),
+        src.dense_len(),
+        src.expert_len()
+    );
 
     let names = src.names();
     let kept: Vec<&String> = match &grep {
@@ -72,7 +78,11 @@ fn main() -> Result<()> {
             match src.leaf(n) {
                 Ok(l) => println!(
                     "  {:?}\t{:?}\t{}\tlayer={:?}\t{}",
-                    l.elem, l.dims, l.bytes.len(), l.layer, n
+                    l.elem,
+                    l.dims,
+                    l.bytes.len(),
+                    l.layer,
+                    n
                 ),
                 Err(e) => println!("  ERR\t{n}\t{e}"),
             }

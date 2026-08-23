@@ -93,7 +93,9 @@ fn sha256_f32_le(data: &[f32]) -> String {
 /// First index where two f32 slices differ in *bit pattern* (so +0.0 and −0.0
 /// count as different, which is the whole point here).
 fn first_bit_diff(a: &[f32], b: &[f32]) -> Option<usize> {
-    a.iter().zip(b).position(|(x, y)| x.to_bits() != y.to_bits())
+    a.iter()
+        .zip(b)
+        .position(|(x, y)| x.to_bits() != y.to_bits())
 }
 
 /// `2^e` as an f64, built from the exponent field so the reference the E4M3
@@ -108,12 +110,22 @@ fn pow2_f64(e: i32) -> f64 {
 /// everything that is wrong.
 fn check_code_tables(dir: &Path, failures: &mut Vec<String>) {
     let csv = std::fs::read_to_string(dir.join("e2m1_code_table.csv")).expect("e2m1 table");
-    let rows: Vec<&str> = csv.lines().skip(1).filter(|l| !l.trim().is_empty()).collect();
+    let rows: Vec<&str> = csv
+        .lines()
+        .skip(1)
+        .filter(|l| !l.trim().is_empty())
+        .collect();
     if rows.len() != 16 {
         failures.push(format!("E2M1 table has {} rows, expected 16", rows.len()));
     }
     for (code, line) in rows.iter().enumerate() {
-        let want: f32 = line.rsplit(',').next().expect("value column").trim().parse().expect("f32");
+        let want: f32 = line
+            .rsplit(',')
+            .next()
+            .expect("value column")
+            .trim()
+            .parse()
+            .expect("f32");
         if want.to_bits() != E2M1[code].to_bits() {
             failures.push(format!(
                 "E2M1[{code:#x}] = {} ({:08x}) != oracle {want} ({:08x})",
@@ -148,9 +160,10 @@ fn check_code_tables(dir: &Path, failures: &mut Vec<String>) {
         failures.push(format!("E8M0 table has {seen} rows, expected 256"));
     }
 
-    let verification: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(dir.join("_verification.json")).expect("read _verification.json"))
-            .expect("parse _verification.json");
+    let verification: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dir.join("_verification.json")).expect("read _verification.json"),
+    )
+    .expect("parse _verification.json");
     let want: Vec<i32> = verification["e4m3fn_exact_pow2_exponents"]
         .as_array()
         .expect("e4m3fn_exact_pow2_exponents")
@@ -163,7 +176,9 @@ fn check_code_tables(dir: &Path, failures: &mut Vec<String>) {
         .filter(|&e| e4m3_from_pow2(e).is_some_and(|b| e4m3_to_f32(b) as f64 == pow2_f64(e)))
         .collect();
     if mine != want {
-        failures.push(format!("E4M3 exact power-of-two exponents {mine:?} != oracle {want:?}"));
+        failures.push(format!(
+            "E4M3 exact power-of-two exponents {mine:?} != oracle {want:?}"
+        ));
     }
     if (E4M3_POW2_MIN, E4M3_POW2_MAX) != (want[0], want[want.len() - 1]) {
         failures.push(format!(
@@ -197,38 +212,63 @@ fn decode_nibble_swapped(packed: &[u8], scale: &[u8], rows: usize, cols: usize) 
 }
 
 fn main() {
-    let dir = mary::paths::model(std::env::args().nth(1).as_deref(), "k3-oracle")
-        .unwrap_or_else(|e| {
+    let dir =
+        mary::paths::model(std::env::args().nth(1).as_deref(), "k3-oracle").unwrap_or_else(|e| {
             eprintln!("{e}");
             std::process::exit(2)
         });
-    let stats: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(dir.join("_decode_stats.json")).expect("read _decode_stats.json"))
-            .expect("parse _decode_stats.json");
+    let stats: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dir.join("_decode_stats.json")).expect("read _decode_stats.json"),
+    )
+    .expect("parse _decode_stats.json");
 
     // The oracle's own wrong-nibble-order fractions, keyed by (expert,
     // tensor) — control A reproduces these rather than inventing a threshold.
-    let cross: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(dir.join("_crosscheck.json")).expect("read _crosscheck.json"))
-            .expect("parse _crosscheck.json");
-    let mut control: std::collections::HashMap<(&str, &str), f64> = std::collections::HashMap::new();
-    for row in cross["real_byte_agreement"].as_array().expect("real_byte_agreement") {
+    let cross: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dir.join("_crosscheck.json")).expect("read _crosscheck.json"),
+    )
+    .expect("parse _crosscheck.json");
+    let mut control: std::collections::HashMap<(&str, &str), f64> =
+        std::collections::HashMap::new();
+    for row in cross["real_byte_agreement"]
+        .as_array()
+        .expect("real_byte_agreement")
+    {
         let tag = row["tag"].as_str().expect("tag");
         let tensor = row["tensor"].as_str().expect("tensor");
         let expert = EXPERTS.iter().find(|e| **e == tag).expect("known expert");
-        let tensor = TENSORS.iter().find(|t| **t == tensor).expect("known tensor");
+        let tensor = TENSORS
+            .iter()
+            .find(|t| **t == tensor)
+            .expect("known tensor");
         control.insert(
             (expert, tensor),
-            row["hf_vs_WRONG_order_frac_differing"].as_f64().expect("wrong-order fraction"),
+            row["hf_vs_WRONG_order_frac_differing"]
+                .as_f64()
+                .expect("wrong-order fraction"),
         );
     }
 
     println!("mxfp4_gate — oracle {}", dir.display());
-    println!("E4M3FN exact power-of-two window: 2^{E4M3_POW2_MIN} .. 2^{E4M3_POW2_MAX} ({} octaves)\n",
-             E4M3_POW2_MAX - E4M3_POW2_MIN + 1);
-    println!("{:<10} {:<3} {:>10} {:>4} {:>6} {:>4} {:>6} {:>9} {:>10} {:>6} {:>9} {:>9}",
-             "expert", "t", "elements", "oct", "global", "sub", "decode", "transcode", "vs-npy",
-             "f16", "ctlA-val", "ctlA-bit");
+    println!(
+        "E4M3FN exact power-of-two window: 2^{E4M3_POW2_MIN} .. 2^{E4M3_POW2_MAX} ({} octaves)\n",
+        E4M3_POW2_MAX - E4M3_POW2_MIN + 1
+    );
+    println!(
+        "{:<10} {:<3} {:>10} {:>4} {:>6} {:>4} {:>6} {:>9} {:>10} {:>6} {:>9} {:>9}",
+        "expert",
+        "t",
+        "elements",
+        "oct",
+        "global",
+        "sub",
+        "decode",
+        "transcode",
+        "vs-npy",
+        "f16",
+        "ctlA-val",
+        "ctlA-bit"
+    );
 
     let mut failures: Vec<String> = Vec::new();
     check_code_tables(&dir, &mut failures);
@@ -241,7 +281,10 @@ fn main() {
             let meta = &stats[expert]["tensors"][t];
             let rows = meta["logical_shape"][0].as_u64().expect("logical_shape") as usize;
             let cols = meta["logical_shape"][1].as_u64().expect("logical_shape") as usize;
-            let want_sha = meta["sha256_decoded_f32_full"].as_str().expect("sha256").to_string();
+            let want_sha = meta["sha256_decoded_f32_full"]
+                .as_str()
+                .expect("sha256")
+                .to_string();
             let want_emin = meta["e8m0_exp_min"].as_i64().expect("e8m0_exp_min") as i32;
             let want_emax = meta["e8m0_exp_max"].as_i64().expect("e8m0_exp_max") as i32;
             let tag = format!("{expert}/{t}");
@@ -259,7 +302,9 @@ fn main() {
 
             let got_sha = sha256_f32_le(&mx);
             if got_sha != want_sha {
-                failures.push(format!("{tag}: decode sha256 {got_sha} != oracle {want_sha}"));
+                failures.push(format!(
+                    "{tag}: decode sha256 {got_sha} != oracle {want_sha}"
+                ));
             }
 
             // The oracle stores one tensor's decode in full; where it exists,
@@ -271,9 +316,12 @@ fn main() {
             } else {
                 (dir.join(format!("{expert}_{t}_dec_head64.f32.npy")), 64)
             };
-            let (reference, ref_shape) = mary::nn::npy::load_npy(&ref_path).expect("load reference npy");
+            let (reference, ref_shape) =
+                mary::nn::npy::load_npy(&ref_path).expect("load reference npy");
             if ref_shape != vec![ref_rows, cols] {
-                failures.push(format!("{tag}: {ref_shape:?} != [{ref_rows}, {cols}] in {ref_path:?}"));
+                failures.push(format!(
+                    "{tag}: {ref_shape:?} != [{ref_rows}, {cols}] in {ref_path:?}"
+                ));
             } else if let Some(i) = first_bit_diff(&reference, &mx[..reference.len()]) {
                 failures.push(format!(
                     "{tag}: {ref_path:?} differs at {i}: oracle {:08x} vs mary {:08x}",
@@ -310,7 +358,9 @@ fn main() {
             transcode_secs += t0.elapsed().as_secs_f64();
 
             if nv.packed.as_ptr() != packed.as_ptr() || nv.packed.len() != packed.len() {
-                failures.push(format!("{tag}: transcode did not borrow the packed nibbles"));
+                failures.push(format!(
+                    "{tag}: transcode did not borrow the packed nibbles"
+                ));
             }
             if nv.block_scale.len() != scale.len() * 2 {
                 failures.push(format!(
@@ -330,7 +380,9 @@ fn main() {
             }
             let back_sha = sha256_f32_le(&back);
             if back_sha != want_sha {
-                failures.push(format!("{tag}: NVFP4 sha256 {back_sha} != oracle {want_sha}"));
+                failures.push(format!(
+                    "{tag}: NVFP4 sha256 {back_sha} != oracle {want_sha}"
+                ));
             }
 
             // --- control A: wrong nibble order ------------------------------
@@ -341,8 +393,11 @@ fn main() {
             let swapped = decode_nibble_swapped(&packed, &scale, rows, cols);
             #[allow(clippy::float_cmp)]
             let swap_val_diff = mx.iter().zip(&swapped).filter(|(a, b)| a != b).count();
-            let swap_bit_diff =
-                mx.iter().zip(&swapped).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            let swap_bit_diff = mx
+                .iter()
+                .zip(&swapped)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
             let swap_frac = swap_val_diff as f64 / mx.len() as f64;
             // Compare the element COUNT the oracle's fraction encodes, not the
             // fraction. The denominator is 11,010,048 = 21·2^19, so the ratio
@@ -398,7 +453,11 @@ fn main() {
             // Not a gate: how much of this tensor survives a trip through f16,
             // reported so the f16 decode path is never assumed exact.
             let h = decode_mxfp4_f16(&packed, &scale, rows, cols);
-            let f16_lossy = h.iter().zip(&mx).filter(|(a, b)| a.to_f32().to_bits() != b.to_bits()).count();
+            let f16_lossy = h
+                .iter()
+                .zip(&mx)
+                .filter(|(a, b)| a.to_f32().to_bits() != b.to_bits())
+                .count();
 
             println!(
                 "{:<10} {:<3} {:>10} {:>4} {:>6} {:>4} {:>6} {:>9} {:>10} {:>6} {:>9} {:>9}",
@@ -407,11 +466,23 @@ fn main() {
                 mx.len(),
                 octaves,
                 format!("2^{}", nv.global_exp),
-                if nv.subnormal_block_scales { "yes" } else { "no" },
+                if nv.subnormal_block_scales {
+                    "yes"
+                } else {
+                    "no"
+                },
                 if got_sha == want_sha { "exact" } else { "DIFF" },
-                if back_sha == want_sha { "exact" } else { "DIFF" },
+                if back_sha == want_sha {
+                    "exact"
+                } else {
+                    "DIFF"
+                },
                 ref_elems,
-                if f16_lossy == 0 { "exact".to_string() } else { format!("{f16_lossy}") },
+                if f16_lossy == 0 {
+                    "exact".to_string()
+                } else {
+                    format!("{f16_lossy}")
+                },
                 format!("{swap_frac:.6}"),
                 format!("{:.6}", swap_bit_diff as f64 / mx.len() as f64),
             );

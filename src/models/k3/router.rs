@@ -192,7 +192,10 @@ impl ScoresForChoice {
     /// See [`Scores::from_raw`].
     pub fn from_raw(v: Vec<f32>, tokens: usize, experts: usize) -> Self {
         assert_eq!(v.len(), tokens * experts, "ScoresForChoice::from_raw shape");
-        assert!(tokens > 0 && experts > 0, "ScoresForChoice::from_raw is empty");
+        assert!(
+            tokens > 0 && experts > 0,
+            "ScoresForChoice::from_raw is empty"
+        );
         Self { v, tokens, experts }
     }
     pub fn row(&self, t: usize) -> &[f32] {
@@ -488,7 +491,9 @@ impl Router {
 /// Widen a bfloat16 bit pattern to f32: the 16 bits are the *top* half of the
 /// f32, so this is a shift, not a numeric cast.
 pub fn bf16_bits_to_f32(bits: &[u16]) -> Vec<f32> {
-    bits.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect()
+    bits.iter()
+        .map(|&b| f32::from_bits((b as u32) << 16))
+        .collect()
 }
 
 #[cfg(test)]

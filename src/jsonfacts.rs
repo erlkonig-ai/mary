@@ -68,7 +68,7 @@ pub mod ty {
 }
 
 pub mod attrs {
-    use triblespace::prelude::inlineencodings::{Boolean, GenId, Handle, I256BE, F64, U256BE};
+    use triblespace::prelude::inlineencodings::{Boolean, GenId, Handle, F64, I256BE, U256BE};
     use triblespace::prelude::*;
 
     attributes! {
@@ -245,7 +245,10 @@ pub fn load_document(
         .find(|(n, _)| n == name)
         .map(|(_, r)| r)
         .ok_or_else(|| {
-            let have: Vec<String> = documents(tribles, blobs).into_iter().map(|(n, _)| n).collect();
+            let have: Vec<String> = documents(tribles, blobs)
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect();
             format!("no document named {name:?} in this pile; it has {have:?}")
         })?;
     load_json(tribles, blobs, root)
@@ -279,11 +282,7 @@ macro_rules! long_field {
 }
 
 /// Rebuild a `serde_json::Value` from a node.
-pub fn load_json(
-    tribles: &TribleSet,
-    blobs: &impl BlobStoreGet,
-    node: Id,
-) -> Result<Value, Err> {
+pub fn load_json(tribles: &TribleSet, blobs: &impl BlobStoreGet, node: Id) -> Result<Value, Err> {
     let tags = crate::tokenizer::node_tags(tribles, node);
     if tags.contains(&ty::JSON_NULL) {
         return Ok(Value::Null);
@@ -312,7 +311,9 @@ pub fn load_json(
         // corruption this encoding could actually suffer.
         for (want, (got, _)) in kids.iter().enumerate() {
             if *got != want as u64 {
-                return Err(format!("array indices are not 0..n: saw {got} at position {want}").into());
+                return Err(
+                    format!("array indices are not 0..n: saw {got} at position {want}").into(),
+                );
             }
         }
         let mut out = Vec::with_capacity(kids.len());
@@ -324,7 +325,8 @@ pub fn load_json(
     if let Some(s) = long_field!(tribles, blobs, node, attrs::json_string) {
         return Ok(Value::String(s));
     }
-    if let Some((i,)) = find!((i: i64), pattern!(tribles, [{ (node) @ attrs::json_int: ?i }])).next()
+    if let Some((i,)) =
+        find!((i: i64), pattern!(tribles, [{ (node) @ attrs::json_int: ?i }])).next()
     {
         return Ok(Value::Number(i.into()));
     }
@@ -386,8 +388,14 @@ mod tests {
     /// from the file it came from.
     #[test]
     fn an_integer_does_not_come_back_as_a_float() {
-        assert_eq!(roundtrip(r#"{"hidden_size":4096}"#), r#"{"hidden_size":4096}"#);
-        assert_eq!(roundtrip(r#"{"eps":1e-06}"#), r#"{"eps":1e-6}"#.replace("1e-6", "1e-6"));
+        assert_eq!(
+            roundtrip(r#"{"hidden_size":4096}"#),
+            r#"{"hidden_size":4096}"#
+        );
+        assert_eq!(
+            roundtrip(r#"{"eps":1e-06}"#),
+            r#"{"eps":1e-6}"#.replace("1e-6", "1e-6")
+        );
         // and a float that happens to be integral stays a float
         assert_eq!(roundtrip(r#"{"mup":16.0}"#), r#"{"mup":16.0}"#);
     }
@@ -421,7 +429,10 @@ mod tests {
         .expect("save");
         let reader = blobs.reader().expect("reader");
         assert_eq!(
-            documents(&facts, &reader).into_iter().map(|(n, _)| n).collect::<Vec<_>>(),
+            documents(&facts, &reader)
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect::<Vec<_>>(),
             vec!["config.json".to_string()]
         );
         let v = load_document(&facts, &reader, "config.json").expect("load");

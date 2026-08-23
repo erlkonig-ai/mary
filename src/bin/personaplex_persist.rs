@@ -197,17 +197,12 @@ fn main() -> anyhow::Result<()> {
         );
         let prepared =
             mary::model_collection::prepare_model_bundle_fragment(team, root, candidate)?;
-        let existing = mary::model_collection::snapshot_model_bundle_collection_local_latest(
-            &mut pile,
-            team,
-        )?;
-        if let Some(existing) =
-            PersonaPlexWeights::find_in_bundle_snapshot(team, existing)?
-        {
+        let existing =
+            mary::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile, team)?;
+        if let Some(existing) = PersonaPlexWeights::find_in_bundle_snapshot(team, existing)? {
             anyhow::ensure!(
                 existing.authority().model_root() == root
-                    && existing.authority().model_archive_data()
-                        == prepared.model_archive_data(),
+                    && existing.authority().model_archive_data() == prepared.model_archive_data(),
                 "a different PersonaPlex bundle is already authoritative in this pile"
             );
         }

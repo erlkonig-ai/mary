@@ -217,7 +217,10 @@ fn quantize_nvfp4_as<E: Scalar + Cast, R: Runtime>(
     rows: usize,
     k: usize,
 ) -> (Handle, Handle) {
-    assert!(k > 0 && k % 64 == 0, "k must be a positive multiple of 64, got {k}");
+    assert!(
+        k > 0 && k % 64 == 0,
+        "k must be a positive multiple of 64, got {k}"
+    );
     assert!(rows > 0, "rows must be non-zero");
 
     let n = rows * k;

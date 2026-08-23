@@ -169,7 +169,10 @@ impl DenseWeights {
 pub fn dense_weights() -> DenseWeights {
     static CHOSEN: std::sync::OnceLock<DenseWeights> = std::sync::OnceLock::new();
     *CHOSEN.get_or_init(|| {
-        if std::env::var("INK_ZEROCOPY").map(|v| v == "0").unwrap_or(false) {
+        if std::env::var("INK_ZEROCOPY")
+            .map(|v| v == "0")
+            .unwrap_or(false)
+        {
             return DenseWeights::DevicePool;
         }
         match std::env::var("INK_DENSE_WEIGHTS").as_deref() {
@@ -350,7 +353,10 @@ const QUERY_BLOCK_MIN: usize = 128;
 /// Rounded to a multiple of [`MATMUL_ROW_ALIGN`] so the block's own matmul
 /// output is not itself padded into a taller allocation than it asked for.
 pub fn query_block(heads: usize, tokens: usize) -> usize {
-    if let Some(n) = std::env::var("INK_QBLOCK").ok().and_then(|v| v.parse::<usize>().ok()) {
+    if let Some(n) = std::env::var("INK_QBLOCK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
         return n.clamp(1, tokens.max(1));
     }
     let row = tokens.next_multiple_of(MATMUL_ROW_ALIGN) as u64;
@@ -432,12 +438,7 @@ pub fn largest_allocation<R: Runtime>(client: &ComputeClient<R>) -> u64 {
 /// are all this shape, and with the score block bounded they are the largest
 /// buffers a global layer asks for. At f32 that is `tokens * 16 KiB` on this
 /// model; the BF16 storage lane halves it.
-pub fn activation_bytes(
-    heads: usize,
-    head_dim: usize,
-    tokens: usize,
-    dtype: StorageDType,
-) -> u64 {
+pub fn activation_bytes(heads: usize, head_dim: usize, tokens: usize, dtype: StorageDType) -> u64 {
     heads as u64 * tokens as u64 * head_dim as u64 * dtype.bytes()
 }
 
@@ -762,12 +763,9 @@ pub fn largest_buffer(
                     RoutedLane::PlainBf16 => {
                         (max_padded_routed_rows(t, tokens), StorageDType::F32.bytes())
                     }
-                    RoutedLane::Packed(dtype) => {
-                        (n * t.num_experts_per_tok as u64, dtype.bytes())
-                    }
+                    RoutedLane::Packed(dtype) => (n * t.num_experts_per_tok as u64, dtype.bytes()),
                 };
-                (m * t.hidden_size as u64 * routed)
-                    .max(m * 2 * t.intermediate_size as u64 * routed)
+                (m * t.hidden_size as u64 * routed).max(m * 2 * t.intermediate_size as u64 * routed)
             };
             attn.max(mlp)
         })
@@ -923,9 +921,15 @@ mod tests {
         let t = small();
         // The counterfactual, so the regression names what it defends against
         // rather than trusting a comment about it.
-        let (a, b) = (prefill_peak_bytes(32, 16_384), prefill_peak_bytes(32, 100_623));
+        let (a, b) = (
+            prefill_peak_bytes(32, 16_384),
+            prefill_peak_bytes(32, 100_623),
+        );
         let spread = (a.max(b) - a.min(b)) as f64 / a as f64;
-        assert!(spread < 0.05, "the old term moved {spread:.3} across the ladder");
+        assert!(
+            spread < 0.05,
+            "the old term moved {spread:.3} across the ladder"
+        );
 
         let new = |n| prefill_activation_bytes(&t, 0..8, n, wide());
         let ratio = new(100_623) as f64 / new(16_384) as f64;
@@ -940,9 +944,7 @@ mod tests {
         );
         // Past the crossing it IS linear, which is the half of the range a long
         // input lives in.
-        let slope = |a: usize, b: usize| {
-            (new(b) - new(a)) as f64 / (b - a) as f64
-        };
+        let slope = |a: usize, b: usize| (new(b) - new(a)) as f64 / (b - a) as f64;
         let far = slope(65_536, 100_623);
         assert!(
             (380_000.0..420_000.0).contains(&far),
@@ -979,7 +981,10 @@ mod tests {
         let policy = narrow().with_plain_bf16_layer(2);
         let two_dp = |b: u64| (b as f64 / super::GIB * 100.0).round() / 100.0;
         assert_eq!(two_dp(prefill_activation_bytes(&t, 0..16, 5, policy)), 0.03);
-        assert_eq!(two_dp(prefill_activation_bytes(&t, 0..16, 2_048, policy)), 1.28);
+        assert_eq!(
+            two_dp(prefill_activation_bytes(&t, 0..16, 2_048, policy)),
+            1.28
+        );
         // Strictly increasing across the ladder, which is the property the
         // report denied. 16,384 tokens is already 10 GiB, which is what makes
         // this range refusable on a 119.63 GiB node at long inputs.
@@ -987,7 +992,10 @@ mod tests {
             .iter()
             .map(|&n| prefill_activation_bytes(&t, 0..16, n, policy))
             .collect();
-        assert!(ladder.windows(2).all(|w| w[1] > w[0]), "not monotone: {ladder:?}");
+        assert!(
+            ladder.windows(2).all(|w| w[1] > w[0]),
+            "not monotone: {ladder:?}"
+        );
         assert_eq!(two_dp(ladder[3]), 10.06, "16,384 tokens");
     }
 
@@ -1007,8 +1015,14 @@ mod tests {
         // the lane holds the gather, both GEMM outputs, the gated activation
         // and two quantised copies at once -- close to four of them.
         let gather = n as u64 * 6 * 4096 * 4;
-        assert!(moe > 3 * gather, "the MoE charge {moe} is under three gathers");
-        assert!(moe < 5 * gather, "the MoE charge {moe} is over five gathers");
+        assert!(
+            moe > 3 * gather,
+            "the MoE charge {moe} is under three gathers"
+        );
+        assert!(
+            moe < 5 * gather,
+            "the MoE charge {moe} is over five gathers"
+        );
     }
 
     /// A local layer's relative table is built for the WHOLE sequence.
@@ -1022,13 +1036,15 @@ mod tests {
         let n = 65_536;
         let local = attention_activation_bytes(&t, AttnKind::Local, n, wide());
         let rel = n as u64 * 32 * 512 * 4;
-        assert!(local > rel, "a local layer charges {local}, under its {rel}-byte table");
+        assert!(
+            local > rel,
+            "a local layer charges {local}, under its {rel}-byte table"
+        );
         // A sequence shorter than the window cannot reach past it, so the table
         // is `tokens` wide and not `sliding_window_size` wide -- which shows up
         // as a lower charge PER TOKEN, the total being linear either way.
-        let rate = |n: usize| {
-            attention_activation_bytes(&t, AttnKind::Local, n, wide()) as f64 / n as f64
-        };
+        let rate =
+            |n: usize| attention_activation_bytes(&t, AttnKind::Local, n, wide()) as f64 / n as f64;
         assert!(
             rate(128) < rate(n) * 0.7,
             "128 tokens cost {:.0} a token against {:.0} at {n}; the table did not shrink",
@@ -1067,13 +1083,8 @@ mod tests {
         let kv = nu * (kv_heads * head_dim) as u64 * f32b;
         let rel_proj = nu * (heads * t.d_rel) as u64 * f32b;
         let hidden = nu * t.hidden_size as u64 * f32b;
-        let old_global = q
-            + 4 * kv
-            + rel_proj
-            + 3 * q
-            + 2 * q
-            + hidden
-            + prefill_peak_bytes(heads, n);
+        let old_global =
+            q + 4 * kv + rel_proj + 3 * q + 2 * q + hidden + prefill_peak_bytes(heads, n);
         assert_eq!(
             attention_activation_bytes(&t, AttnKind::Global, n, wide()),
             old_global
@@ -1090,12 +1101,8 @@ mod tests {
         let i = t.intermediate_size as u64;
         let h = t.hidden_size as u64;
         let packed = (m * h + m * i) / 2 + (m * h + m * i) / 16;
-        let old_moe = m * h * f32b
-            + m * 2 * i * f32b
-            + m * i * f32b
-            + m * h * f32b
-            + packed
-            + nu * h * f32b;
+        let old_moe =
+            m * h * f32b + m * 2 * i * f32b + m * i * f32b + m * h * f32b + packed + nu * h * f32b;
         assert_eq!(mlp_activation_bytes(&t, 5, n, wide()), old_moe);
 
         let local_rel = nu * heads as u64 * t.sliding_window_size as u64 * f32b;
@@ -1124,7 +1131,10 @@ mod tests {
         assert_eq!(largest_buffer(&t, 0..8, n, wide()), old_largest);
 
         let machine = 128 << 30;
-        assert_eq!(super::pool_page_floor(wide(), machine), machine / 4 + machine / 16);
+        assert_eq!(
+            super::pool_page_floor(wide(), machine),
+            machine / 4 + machine / 16
+        );
     }
 
     #[test]
@@ -1187,13 +1197,8 @@ mod tests {
         let policy = narrow().with_plain_bf16_layer(5);
         assert_eq!(policy.routed_lane(5), RoutedLane::PlainBf16);
 
-        let actual = nu * h * 4
-            + m * h * 4
-            + m * h * 2
-            + m * 2 * i * 4
-            + m * i * 2
-            + m * h * 4
-            + nu * h * 4;
+        let actual =
+            nu * h * 4 + m * h * 4 + m * h * 2 + m * 2 * i * 4 + m * i * 2 + m * h * 4 + nu * h * 4;
         assert_eq!(mlp_activation_bytes(&t, 5, n, policy), actual);
         assert_eq!(
             largest_buffer(&t, 5..6, n, policy),
@@ -1240,9 +1245,14 @@ mod tests {
     /// property that makes the allocation linear rather than quadratic.
     #[test]
     fn a_block_stays_inside_its_budget() {
-        for n in [512, 3732, 7000, 14124, 15808, 20_000, 35_845, 100_623, 250_000] {
+        for n in [
+            512, 3732, 7000, 14124, 15808, 20_000, 35_845, 100_623, 250_000,
+        ] {
             let rows = query_block(HEADS, n);
-            assert!(rows >= 1 && rows <= n, "{n} tokens gave a {rows}-query block");
+            assert!(
+                rows >= 1 && rows <= n,
+                "{n} tokens gave a {rows}-query block"
+            );
             let bytes = score_block_bytes(HEADS, rows, n);
             // The floor is allowed to exceed the budget -- a block below
             // QUERY_BLOCK_MIN is not worth issuing -- but only there.
@@ -1285,6 +1295,9 @@ mod tests {
         // A range with no MoE layer in it is bound by something else and its
         // ceiling is genuinely higher, so this is a property of the RANGE.
         let dense_only = longest_sequence(&t, 0..2, CAP, wide());
-        assert!(dense_only > n, "a dense-only range bisected to {dense_only}, under {n}");
+        assert!(
+            dense_only > n,
+            "a dense-only range bisected to {dense_only}, under {n}"
+        );
     }
 }

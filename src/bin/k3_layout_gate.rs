@@ -68,7 +68,11 @@ fn read_headers(dir: &Path) -> Result<HashMap<String, HeaderEntry>> {
         })
         .collect();
     shards.sort();
-    anyhow::ensure!(!shards.is_empty(), "no model-*.safetensors in {}", dir.display());
+    anyhow::ensure!(
+        !shards.is_empty(),
+        "no model-*.safetensors in {}",
+        dir.display()
+    );
 
     let mut out: HashMap<String, HeaderEntry> = HashMap::new();
     for path in &shards {
@@ -97,7 +101,8 @@ fn read_headers(dir: &Path) -> Result<HashMap<String, HeaderEntry>> {
 /// Cross-check the headers against `model.safetensors.index.json`.
 fn check_index(dir: &Path, headers: &HashMap<String, HeaderEntry>) -> Result<Vec<String>> {
     let path = dir.join("model.safetensors.index.json");
-    let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let index: serde_json::Value = serde_json::from_str(&text)?;
     let map = index["weight_map"]
         .as_object()
@@ -128,7 +133,9 @@ fn check_index(dir: &Path, headers: &HashMap<String, HeaderEntry>) -> Result<Vec
     println!("index weight_map entries: {}", map.len());
     println!("tensor bytes: {actual} (index total_size {claimed})");
     if claimed != 0 && claimed != actual {
-        problems.push(format!("index total_size {claimed} != summed tensor bytes {actual}"));
+        problems.push(format!(
+            "index total_size {claimed} != summed tensor bytes {actual}"
+        ));
     }
     Ok(problems)
 }
@@ -140,7 +147,11 @@ fn check_layer_kinds(cfg: &K3Config, headers: &HashMap<String, HeaderEntry>) -> 
     let t = &cfg.text_config;
     let mut from_weights: BTreeMap<usize, AttnKind> = BTreeMap::new();
     for name in headers.keys() {
-        let Some(Slot::Layer { layer, part: LayerPart::Attn(p) }) = Slot::parse(name) else {
+        let Some(Slot::Layer {
+            layer,
+            part: LayerPart::Attn(p),
+        }) = Slot::parse(name)
+        else {
             continue;
         };
         // Only the kind-exclusive tensors vote; g_proj and o_proj are on both.
@@ -155,10 +166,12 @@ fn check_layer_kinds(cfg: &K3Config, headers: &HashMap<String, HeaderEntry>) -> 
     for layer in 0..t.num_hidden_layers {
         let want = t.attn_kind(layer);
         match from_weights.get(&layer) {
-            None => problems.push(format!("layer {layer} carries no kind-exclusive attention tensor")),
-            Some(&got) if got != want => {
-                problems.push(format!("layer {layer}: config says {want:?}, weights say {got:?}"))
-            }
+            None => problems.push(format!(
+                "layer {layer} carries no kind-exclusive attention tensor"
+            )),
+            Some(&got) if got != want => problems.push(format!(
+                "layer {layer}: config says {want:?}, weights say {got:?}"
+            )),
             Some(_) => {}
         }
         match want {
@@ -187,12 +200,20 @@ fn check_layer_kinds(cfg: &K3Config, headers: &HashMap<String, HeaderEntry>) -> 
     // What the same lists would say if they were read as 0-based. Printed
     // because "off by one" understates it: the wrong reading is wrong about a
     // specific, countable number of layers, and it is not a small number.
-    let zero_based: BTreeSet<usize> = t.linear_attn_config.full_attn_layers.iter().copied().collect();
+    let zero_based: BTreeSet<usize> = t
+        .linear_attn_config
+        .full_attn_layers
+        .iter()
+        .copied()
+        .collect();
     let one_based: BTreeSet<usize> = mla_layers.iter().copied().collect();
     let wrong = (0..t.num_hidden_layers)
         .filter(|l| zero_based.contains(l) != one_based.contains(l))
         .count();
-    let out_of_range = zero_based.iter().filter(|&&l| l >= t.num_hidden_layers).count();
+    let out_of_range = zero_based
+        .iter()
+        .filter(|&&l| l >= t.num_hidden_layers)
+        .count();
     println!(
         "  a 0-based reading of full_attn_layers would misclassify {wrong} of {} layers \
          and name {out_of_range} layer(s) that do not exist",
@@ -241,14 +262,22 @@ fn negative_control(cfg: &K3Config, headers: &HashMap<String, HeaderEntry>) -> u
 }
 
 fn plural(n: usize) -> &'static str {
-    if n == 1 { "" } else { "s" }
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
 }
 
 fn report(label: &str, problems: &[String]) -> usize {
     if problems.is_empty() {
         println!("  {label}: none");
     } else {
-        println!("  {label}: {} problem{}", problems.len(), plural(problems.len()));
+        println!(
+            "  {label}: {} problem{}",
+            problems.len(),
+            plural(problems.len())
+        );
         for p in problems.iter().take(10) {
             println!("      {p}");
         }
@@ -306,17 +335,41 @@ fn check_config_fields_are_consulted(cfg: &K3Config) -> Vec<String> {
         f(&mut c);
         out.push((name, c));
     };
-    push("text.hidden_size", |c| c.text_config.hidden_size += 8, &mut cases);
-    push("text.num_hidden_layers", |c| c.text_config.num_hidden_layers += 1, &mut cases);
-    push("text.vocab_size", |c| c.text_config.vocab_size += 1, &mut cases);
-    push("linear_attn.num_heads", |c| c.text_config.linear_attn_config.num_heads += 1, &mut cases);
-    push("linear_attn.head_dim", |c| c.text_config.linear_attn_config.head_dim += 1, &mut cases);
+    push(
+        "text.hidden_size",
+        |c| c.text_config.hidden_size += 8,
+        &mut cases,
+    );
+    push(
+        "text.num_hidden_layers",
+        |c| c.text_config.num_hidden_layers += 1,
+        &mut cases,
+    );
+    push(
+        "text.vocab_size",
+        |c| c.text_config.vocab_size += 1,
+        &mut cases,
+    );
+    push(
+        "linear_attn.num_heads",
+        |c| c.text_config.linear_attn_config.num_heads += 1,
+        &mut cases,
+    );
+    push(
+        "linear_attn.head_dim",
+        |c| c.text_config.linear_attn_config.head_dim += 1,
+        &mut cases,
+    );
     push(
         "linear_attn.short_conv_kernel_size",
         |c| c.text_config.linear_attn_config.short_conv_kernel_size += 1,
         &mut cases,
     );
-    push("vision.vt_hidden_size", |c| c.vision_config.vt_hidden_size += 8, &mut cases);
+    push(
+        "vision.vt_hidden_size",
+        |c| c.vision_config.vt_hidden_size += 8,
+        &mut cases,
+    );
     // The three adversarial review showed were parsed, documented and never
     // read. Included deliberately: if the layout genuinely does not depend on
     // them, this test must SAY so rather than let a clean bijection imply a
@@ -383,7 +436,9 @@ fn check_config_fields_are_consulted(cfg: &K3Config) -> Vec<String> {
         if fingerprint(mutated).as_deref() == Some(base.as_str()) {
             if unmodelled.contains(name) {
                 // Known-unmodelled and pinned above; report, do not fail twice.
-                println!("  note: {name} is not modelled by the layout (pinned to its assumed value)");
+                println!(
+                    "  note: {name} is not modelled by the layout (pinned to its assumed value)"
+                );
             } else {
                 problems.push(format!(
                     "config field {name} is NEVER CONSULTED — perturbing it changes no derived \
@@ -406,7 +461,8 @@ fn main() -> Result<()> {
     let dir = dir.as_path();
     println!("checkpoint: {}", dir.display());
 
-    let cfg_text = std::fs::read_to_string(dir.join("config.json")).context("reading config.json")?;
+    let cfg_text =
+        std::fs::read_to_string(dir.join("config.json")).context("reading config.json")?;
     let cfg = K3Config::from_json(&cfg_text).map_err(anyhow::Error::msg)?;
     let t = &cfg.text_config;
     println!(
@@ -429,8 +485,12 @@ fn main() -> Result<()> {
     let mut expected: HashMap<String, (Slot, Shape, Dtype)> = HashMap::new();
     let mut collisions = Vec::new();
     for_each_slot(&cfg, |ts| {
-        if let Some((prev, _, _)) = expected.insert(ts.name.clone(), (ts.slot, ts.shape, ts.dtype)) {
-            collisions.push(format!("{} is claimed by both {prev:?} and {:?}", ts.name, ts.slot));
+        if let Some((prev, _, _)) = expected.insert(ts.name.clone(), (ts.slot, ts.shape, ts.dtype))
+        {
+            collisions.push(format!(
+                "{} is claimed by both {prev:?} and {:?}",
+                ts.name, ts.slot
+            ));
         }
     });
     println!("slots in layout:    {}", expected.len());
@@ -440,7 +500,9 @@ fn main() -> Result<()> {
     let mut mismatched = Vec::new();
     for (name, (slot, shape, dtype)) in &expected {
         match headers.get(name) {
-            None => unfilled.push(format!("{slot:?} wants {name}, checkpoint has no such tensor")),
+            None => unfilled.push(format!(
+                "{slot:?} wants {name}, checkpoint has no such tensor"
+            )),
             Some(h) => {
                 if h.shape != *shape || h.dtype != *dtype {
                     mismatched.push(format!(
@@ -460,7 +522,9 @@ fn main() -> Result<()> {
             None => unmapped.push(format!("{name} parses to no slot")),
             Some(slot) => {
                 if mary::models::k3::layout::describe(&cfg, slot).is_none() {
-                    unmapped.push(format!("{name} parses to {slot:?}, which this config has no room for"));
+                    unmapped.push(format!(
+                        "{name} parses to {slot:?}, which this config has no room for"
+                    ));
                     continue;
                 }
                 let back = slot.tensor_name();
@@ -468,7 +532,9 @@ fn main() -> Result<()> {
                     roundtrip.push(format!("{name} -> {slot:?} -> {back}"));
                 }
                 match expected.get(name) {
-                    None => unmapped.push(format!("{name} parses to {slot:?} but no slot was enumerated for it")),
+                    None => unmapped.push(format!(
+                        "{name} parses to {slot:?} but no slot was enumerated for it"
+                    )),
                     Some((s, _, _)) if *s != slot => {
                         roundtrip.push(format!("{name}: enumerated as {s:?}, parsed as {slot:?}"))
                     }
@@ -489,13 +555,22 @@ fn main() -> Result<()> {
         let bucket = match slot {
             Slot::Vision(_) => "vision tower",
             Slot::MmProjector(_) => "mm projector",
-            Slot::Layer { part: LayerPart::Attn(p), .. } => match p.kind() {
+            Slot::Layer {
+                part: LayerPart::Attn(p),
+                ..
+            } => match p.kind() {
                 Some(AttnKind::Kda) => "decoder: KDA attention",
                 Some(AttnKind::Mla) => "decoder: MLA attention",
                 None => "decoder: attention out/gate",
             },
-            Slot::Layer { part: LayerPart::DenseMlp(_), .. } => "decoder: dense MLP",
-            Slot::Layer { part: LayerPart::Moe(m), .. } => {
+            Slot::Layer {
+                part: LayerPart::DenseMlp(_),
+                ..
+            } => "decoder: dense MLP",
+            Slot::Layer {
+                part: LayerPart::Moe(m),
+                ..
+            } => {
                 if matches!(m, MoePart::Expert { .. }) {
                     "decoder: routed experts"
                 } else {
@@ -520,7 +595,10 @@ fn main() -> Result<()> {
     }
     println!("\ncensus (tensors / bytes):");
     for (bucket, (n, bytes)) in &census {
-        println!("  {n:>7}  {:>7.2} GiB  {bucket}", *bytes as f64 / (1u64 << 30) as f64);
+        println!(
+            "  {n:>7}  {:>7.2} GiB  {bucket}",
+            *bytes as f64 / (1u64 << 30) as f64
+        );
     }
     println!(
         "  parameters: {params} ({:.4} T), plus {scale_bytes} MXFP4 scale bytes",
@@ -569,7 +647,9 @@ fn main() -> Result<()> {
          entries zero-padded to the next power of two. TAKING THE FIRST {} IS CORRECT; using \
          all {} is the error, because exp(0) = 1 makes the padding decay-rate 1 rather than a \
          no-op. This line previously asserted the opposite.",
-        a_log.map(|s| s.to_string()).unwrap_or_else(|| "absent".into()),
+        a_log
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "absent".into()),
         t.linear_attn_config.num_heads,
         t.linear_attn_config.num_heads,
         t.linear_attn_config.num_heads,

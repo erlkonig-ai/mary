@@ -41,9 +41,10 @@ fn loadavg() -> f64 {
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|s| {
-            s.rsplit("average")
-                .next()
-                .map(|t| t.trim_start_matches(|c: char| !c.is_ascii_digit()).to_string())
+            s.rsplit("average").next().map(|t| {
+                t.trim_start_matches(|c: char| !c.is_ascii_digit())
+                    .to_string()
+            })
         })
         .and_then(|t| t.split(|c| c == ',' || c == ' ').next().map(str::to_string))
         .and_then(|t| t.parse().ok())
@@ -73,7 +74,10 @@ fn main() {
         .to_string_lossy()
         .into_owned();
     let steps: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8);
-    let out = args.get(3).cloned().unwrap_or_else(|| "xdev.bin".to_string());
+    let out = args
+        .get(3)
+        .cloned()
+        .unwrap_or_else(|| "xdev.bin".to_string());
     let fmt = match args.get(4).map(|s| s.as_str()) {
         Some("f16") => WeightFmt::F16,
         Some("q8") => WeightFmt::Q8,
@@ -84,11 +88,19 @@ fn main() {
         _ => Head::Q4,
     };
 
-    let backend = if cfg!(feature = "cuda-backend") { "cuda" } else { "wgpu/metal" };
+    let backend = if cfg!(feature = "cuda-backend") {
+        "cuda"
+    } else {
+        "wgpu/metal"
+    };
     println!("backend        : {backend}");
     println!("pile           : {pile}");
     println!("steps          : {steps}");
-    let headname = if matches!(head, Head::F16) { "F16" } else { "Q4" };
+    let headname = if matches!(head, Head::F16) {
+        "F16"
+    } else {
+        "Q4"
+    };
     println!("format         : {fmt:?} / head {headname}");
 
     let t0 = Instant::now();
@@ -122,8 +134,14 @@ fn main() {
 
     let (hm, hs, ha) = stats(&all_h);
     let (lm, ls, la) = stats(&all_l);
-    println!("\nhidden  mean={hm:+.6} sd={hs:.6} amax={ha:.6}  ({} values)", all_h.len());
-    println!("logits  mean={lm:+.6} sd={ls:.6} amax={la:.6}  ({} values)", all_l.len());
+    println!(
+        "\nhidden  mean={hm:+.6} sd={hs:.6} amax={ha:.6}  ({} values)",
+        all_h.len()
+    );
+    println!(
+        "logits  mean={lm:+.6} sd={ls:.6} amax={la:.6}  ({} values)",
+        all_l.len()
+    );
 
     // CONTEXT CURVE: step time as a function of accumulated KV, which is the
     // question. A flat curve means weight-streaming dominates; a rising one
@@ -132,13 +150,18 @@ fn main() {
     println!("\nctx window     median ms   % of 80ms budget");
     let mut marks: Vec<usize> = vec![];
     let mut w = 64usize;
-    while w < raw.len() { marks.push(w); w *= 2; }
+    while w < raw.len() {
+        marks.push(w);
+        w *= 2;
+    }
     marks.push(raw.len());
     let mut prev = 0usize;
     for m in marks {
         let lo = prev.max(m.saturating_sub(128));
         let mut win: Vec<f64> = raw[lo..m].to_vec();
-        if win.is_empty() { continue; }
+        if win.is_empty() {
+            continue;
+        }
         win.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let md = win[win.len() / 2];
         println!("  {:>5}..{:<6} {:>9.2}   {:>6.1}%", lo, m, md, md / 0.8);
@@ -148,9 +171,14 @@ fn main() {
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let med = sorted[sorted.len() / 2];
     // first-step cost is kernel compilation, report it apart from steady state
-    println!("\nfirst step {:.1}ms (kernel compile)   overall median {:.2}ms   total {:.2}s",
-             raw[0], med, total);
-    println!("12.5Hz frame budget is 80ms -> overall median is {:.1}% of budget", med / 0.8);
+    println!(
+        "\nfirst step {:.1}ms (kernel compile)   overall median {:.2}ms   total {:.2}s",
+        raw[0], med, total
+    );
+    println!(
+        "12.5Hz frame budget is 80ms -> overall median is {:.1}% of budget",
+        med / 0.8
+    );
     println!("machine load: {load_start:.2} at start -> {load_end:.2} at end");
     if load_start > 2.0 || load_end > 2.0 || (load_end - load_start).abs() > 1.0 {
         println!("  !! LOADED OR RAMPING -- these timings are not a measurement of the engine");
@@ -162,5 +190,9 @@ fn main() {
         bytes.extend_from_slice(&v.to_le_bytes());
     }
     std::fs::write(&out, &bytes).unwrap_or_else(|e| panic!("write {out}: {e}"));
-    println!("\nwrote {} ({} bytes) -- diff this against the other machine", out, bytes.len());
+    println!(
+        "\nwrote {} ({} bytes) -- diff this against the other machine",
+        out,
+        bytes.len()
+    );
 }

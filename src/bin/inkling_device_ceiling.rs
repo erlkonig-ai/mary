@@ -41,7 +41,11 @@ fn meminfo(key: &str) -> f64 {
     let s = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     for line in s.lines() {
         if let Some(v) = line.strip_prefix(key) {
-            if let Some(kb) = v.split_whitespace().next().and_then(|x| x.parse::<f64>().ok()) {
+            if let Some(kb) = v
+                .split_whitespace()
+                .next()
+                .and_then(|x| x.parse::<f64>().ok())
+            {
                 return kb * 1024.0;
             }
         }
@@ -57,13 +61,20 @@ fn meminfo(key: &str) -> f64 {
 fn rss() -> f64 {
     std::fs::read_to_string("/proc/self/statm")
         .ok()
-        .and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse::<f64>().ok()))
+        .and_then(|s| {
+            s.split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<f64>().ok())
+        })
         .map(|pages| pages * 4096.0)
         .unwrap_or(0.0)
 }
 
 fn env_f64(k: &str, d: f64) -> f64 {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 /// Read every byte of `held` on the device and return the elapsed seconds.
@@ -99,8 +110,14 @@ fn main() {
     let total = meminfo("MemTotal:");
     println!("=== device-allocation ceiling, GB10 ===");
     println!("  MemTotal        {:8.1} GiB", total / GIB);
-    println!("  MemAvailable    {:8.1} GiB  at start", meminfo("MemAvailable:") / GIB);
-    println!("  chunk           {:8.2} GiB f32 ({elems} elements)", chunk_bytes / GIB);
+    println!(
+        "  MemAvailable    {:8.1} GiB  at start",
+        meminfo("MemAvailable:") / GIB
+    );
+    println!(
+        "  chunk           {:8.2} GiB f32 ({elems} elements)",
+        chunk_bytes / GIB
+    );
     println!("  cap {cap_gib:.0} GiB, stop at {floor_gib:.0} GiB MemAvailable\n");
 
     // Warm the reduction kernel so the first timed read is not a compile.
@@ -166,8 +183,15 @@ fn main() {
 
     let bytes = held.len() as f64 * chunk_bytes;
     println!("\n  stopped: {stopped}");
-    println!("  held {:.1} GiB of DEVICE-allocated f32 in {} tensors", bytes / GIB, held.len());
-    println!("  MemAvailable {:8.1} GiB at the end", meminfo("MemAvailable:") / GIB);
+    println!(
+        "  held {:.1} GiB of DEVICE-allocated f32 in {} tensors",
+        bytes / GIB,
+        held.len()
+    );
+    println!(
+        "  MemAvailable {:8.1} GiB at the end",
+        meminfo("MemAvailable:") / GIB
+    );
     // What the whole set costs to read once, which is the per-token figure a
     // resident dense set would pay.
     if !held.is_empty() {

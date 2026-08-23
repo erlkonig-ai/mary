@@ -57,7 +57,11 @@ fn read_at(path: &Path, off: u64, len: usize) -> Vec<u8> {
 }
 
 fn t2<B: Backend>(v: Vec<f32>, shape: [usize; 2], dev: &B::Device) -> Tensor<B, 2> {
-    assert_eq!(v.len(), shape[0] * shape[1], "tensor data length vs {shape:?}");
+    assert_eq!(
+        v.len(),
+        shape[0] * shape[1],
+        "tensor data length vs {shape:?}"
+    );
     Tensor::<B, 2>::from_data(TensorData::new(v, shape), dev)
 }
 
@@ -198,7 +202,11 @@ impl Ckpt {
             let (r, c, v) = self.mxfp4_plane(&format!("{p}.{suffix}"));
             t2::<B>(v, [r, c], dev)
         };
-        ExpertWeights { w1: mk("w1"), w2: mk("w2"), w3: mk("w3") }
+        ExpertWeights {
+            w1: mk("w1"),
+            w2: mk("w2"),
+            w3: mk("w3"),
+        }
     }
 
     /// Everything in the MoE block except the routed experts.
@@ -218,7 +226,10 @@ impl Ckpt {
         let (gw_s, gw) = self.bf16(&format!("{p}.gate.weight"));
         let (_, bias_f32) = self.f32(&format!("{p}.gate.e_score_correction_bias"));
         let bias: Vec<f32> = if bias_bf16 {
-            bias_f32.iter().map(|&v| half::bf16::from_f32(v).to_f32()).collect()
+            bias_f32
+                .iter()
+                .map(|&v| half::bf16::from_f32(v).to_f32())
+                .collect()
         } else {
             bias_f32
         };

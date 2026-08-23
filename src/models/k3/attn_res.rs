@@ -126,7 +126,10 @@ pub fn round_bf16<B: Backend, const D: usize>(x: Tensor<B, D>) -> Tensor<B, D> {
 /// comparison of outputs can catch it being wrong. What it changes is the
 /// bank: the next snapshot is appended after the existing entries, and every
 /// later layer sees that ordering.
-pub fn stack_candidates<B: Backend>(bank: &[Tensor<B, 2>], accumulator: Tensor<B, 2>) -> Tensor<B, 3> {
+pub fn stack_candidates<B: Backend>(
+    bank: &[Tensor<B, 2>],
+    accumulator: Tensor<B, 2>,
+) -> Tensor<B, 3> {
     let [tokens, hidden] = accumulator.dims();
     let mut slots: Vec<Tensor<B, 3>> = Vec::with_capacity(bank.len() + 1);
     for entry in bank {
@@ -216,7 +219,10 @@ impl<B: Backend> AttnResParams<B> {
             "AttnRes projection is {cols} wide but the norm gain is {hidden} — \
              they must both be the hidden size"
         );
-        assert!(eps > 0.0, "AttnRes RMSNorm epsilon must be positive, got {eps}");
+        assert!(
+            eps > 0.0,
+            "AttnRes RMSNorm epsilon must be positive, got {eps}"
+        );
         Self {
             score_weight: norm_weight * proj_weight.reshape([hidden]),
             eps,
@@ -299,7 +305,11 @@ impl<B: Backend> AttnResParams<B> {
             .sum_dim(1)
             .reshape([tokens, hidden]);
 
-        AttnResMix { scores, probs, out: round_bf16(out) }
+        AttnResMix {
+            scores,
+            probs,
+            out: round_bf16(out),
+        }
     }
 }
 
@@ -360,7 +370,13 @@ impl<B: Backend> DepthMixer<B> {
              every block size — a schedule that misses it starts the first \
              mixture with an empty bank forever"
         );
-        Self { schedule, bank: Vec::new(), accumulator: None, layer: 0, stage: Stage::Entry }
+        Self {
+            schedule,
+            bank: Vec::new(),
+            accumulator: None,
+            layer: 0,
+            stage: Stage::Entry,
+        }
     }
 
     /// Resume a mixer at layer `layer` with a bank someone else built.
@@ -407,7 +423,13 @@ impl<B: Backend> DepthMixer<B> {
                 assert_eq!(e.dims(), d, "resumed bank entry {i} has a different shape");
             }
         }
-        Self { schedule, bank, accumulator: None, layer, stage: Stage::Entry }
+        Self {
+            schedule,
+            bank,
+            accumulator: None,
+            layer,
+            stage: Stage::Entry,
+        }
     }
 
     /// Build the schedule from the model config. `None` when the config has no
@@ -415,7 +437,9 @@ impl<B: Backend> DepthMixer<B> {
     pub fn from_config(cfg: &K3TextConfig) -> Option<Self> {
         cfg.attn_res_block_size?;
         Some(Self::new(
-            (0..cfg.num_hidden_layers).map(|l| cfg.is_attn_res_checkpoint(l)).collect(),
+            (0..cfg.num_hidden_layers)
+                .map(|l| cfg.is_attn_res_checkpoint(l))
+                .collect(),
         ))
     }
 
@@ -458,7 +482,12 @@ impl<B: Backend> DepthMixer<B> {
     /// `block_residual.shape[1] > 0` — so `mix` is `None` and the layer input
     /// passes through untouched. That happens exactly once, at layer 0.
     pub fn enter_layer(&mut self, layer_in: Tensor<B, 2>, sa: &AttnResParams<B>) -> LayerEntry<B> {
-        assert_eq!(self.stage, Stage::Entry, "enter_layer out of order at layer {}", self.layer);
+        assert_eq!(
+            self.stage,
+            Stage::Entry,
+            "enter_layer out of order at layer {}",
+            self.layer
+        );
         assert!(
             self.layer < self.schedule.len(),
             "entering layer {} but the schedule covers {} layers",
@@ -494,7 +523,11 @@ impl<B: Backend> DepthMixer<B> {
     /// On a checkpoint layer the accumulator was just reset, so this *replaces*
     /// it with the attention output instead of adding to it. That single
     /// branch is the reset: it is why nothing accumulates across a boundary.
-    pub fn after_attention(&mut self, attn_out: Tensor<B, 2>, mlp: &AttnResParams<B>) -> AttnResMix<B> {
+    pub fn after_attention(
+        &mut self,
+        attn_out: Tensor<B, 2>,
+        mlp: &AttnResParams<B>,
+    ) -> AttnResMix<B> {
         assert_eq!(
             self.stage,
             Stage::Attention,
@@ -509,16 +542,28 @@ impl<B: Backend> DepthMixer<B> {
         self.stage = Stage::Mlp;
         // Unconditional: layer 0 is always a checkpoint layer (`0 % n == 0`),
         // so the bank is never empty by the time control reaches here.
-        assert!(!self.bank.is_empty(), "MLP mixture with an empty bank at layer {}", self.layer);
+        assert!(
+            !self.bank.is_empty(),
+            "MLP mixture with an empty bank at layer {}",
+            self.layer
+        );
         mlp.mix(stack_candidates(&self.bank, accumulator))
     }
 
     /// Fold the MLP output in and close the layer. Returns the layer output —
     /// the accumulator, which is what the next layer receives as `layer_in`.
     pub fn after_mlp(&mut self, mlp_out: Tensor<B, 2>) -> Tensor<B, 2> {
-        assert_eq!(self.stage, Stage::Mlp, "after_mlp out of order at layer {}", self.layer);
+        assert_eq!(
+            self.stage,
+            Stage::Mlp,
+            "after_mlp out of order at layer {}",
+            self.layer
+        );
         let accumulator = round_bf16(
-            self.accumulator.take().expect("accumulator missing after attention") + mlp_out,
+            self.accumulator
+                .take()
+                .expect("accumulator missing after attention")
+                + mlp_out,
         );
         self.accumulator = Some(accumulator.clone());
         self.layer += 1;

@@ -17,8 +17,8 @@
 use std::time::Instant;
 
 use mary::models::personaplex::mimi::config::*;
-use mary::nn::weight_loader::WeightLoader;
 use mary::models::personaplex::mimi::{MimiEncoder, MimiEncoderGpu};
+use mary::nn::weight_loader::WeightLoader;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -42,7 +42,11 @@ fn synthetic_weights() -> WeightLoader {
         ((rng >> 40) as f32 / 8388608.0) - 1.0
     };
     let mut m: HashMap<String, (Vec<f32>, Vec<usize>)> = HashMap::new();
-    let mut put = |m: &mut HashMap<_, _>, name: String, shape: Vec<usize>, gain: f32, next: &mut dyn FnMut() -> f32| {
+    let mut put = |m: &mut HashMap<_, _>,
+                   name: String,
+                   shape: Vec<usize>,
+                   gain: f32,
+                   next: &mut dyn FnMut() -> f32| {
         let n: usize = shape.iter().product();
         let v: Vec<f32> = (0..n).map(|_| next() * gain).collect();
         m.insert(name, (v, shape));
@@ -50,19 +54,79 @@ fn synthetic_weights() -> WeightLoader {
     let g = |fan: usize| (3.0f32 / fan as f32).sqrt();
 
     let p = "encoder.model";
-    put(&mut m, format!("{p}.0.conv.conv.weight"), vec![64, 1, 7], g(7), &mut next);
-    put(&mut m, format!("{p}.0.conv.conv.bias"), vec![64], 0.01, &mut next);
+    put(
+        &mut m,
+        format!("{p}.0.conv.conv.weight"),
+        vec![64, 1, 7],
+        g(7),
+        &mut next,
+    );
+    put(
+        &mut m,
+        format!("{p}.0.conv.conv.bias"),
+        vec![64],
+        0.01,
+        &mut next,
+    );
     for (i, &r) in ENC_RATIOS.iter().enumerate() {
         let dim = 64usize << i;
-        put(&mut m, format!("{p}.{}.block.1.conv.conv.weight", 3 * i + 1), vec![dim / 2, dim, 3], g(dim * 3), &mut next);
-        put(&mut m, format!("{p}.{}.block.1.conv.conv.bias", 3 * i + 1), vec![dim / 2], 0.01, &mut next);
-        put(&mut m, format!("{p}.{}.block.3.conv.conv.weight", 3 * i + 1), vec![dim, dim / 2, 1], g(dim / 2), &mut next);
-        put(&mut m, format!("{p}.{}.block.3.conv.conv.bias", 3 * i + 1), vec![dim], 0.01, &mut next);
-        put(&mut m, format!("{p}.{}.conv.conv.weight", 3 * i + 3), vec![2 * dim, dim, 2 * r], g(dim * 2 * r), &mut next);
-        put(&mut m, format!("{p}.{}.conv.conv.bias", 3 * i + 3), vec![2 * dim], 0.01, &mut next);
+        put(
+            &mut m,
+            format!("{p}.{}.block.1.conv.conv.weight", 3 * i + 1),
+            vec![dim / 2, dim, 3],
+            g(dim * 3),
+            &mut next,
+        );
+        put(
+            &mut m,
+            format!("{p}.{}.block.1.conv.conv.bias", 3 * i + 1),
+            vec![dim / 2],
+            0.01,
+            &mut next,
+        );
+        put(
+            &mut m,
+            format!("{p}.{}.block.3.conv.conv.weight", 3 * i + 1),
+            vec![dim, dim / 2, 1],
+            g(dim / 2),
+            &mut next,
+        );
+        put(
+            &mut m,
+            format!("{p}.{}.block.3.conv.conv.bias", 3 * i + 1),
+            vec![dim],
+            0.01,
+            &mut next,
+        );
+        put(
+            &mut m,
+            format!("{p}.{}.conv.conv.weight", 3 * i + 3),
+            vec![2 * dim, dim, 2 * r],
+            g(dim * 2 * r),
+            &mut next,
+        );
+        put(
+            &mut m,
+            format!("{p}.{}.conv.conv.bias", 3 * i + 3),
+            vec![2 * dim],
+            0.01,
+            &mut next,
+        );
     }
-    put(&mut m, format!("{p}.14.conv.conv.weight"), vec![HIDDEN, 1024, 3], g(1024 * 3), &mut next);
-    put(&mut m, format!("{p}.14.conv.conv.bias"), vec![HIDDEN], 0.01, &mut next);
+    put(
+        &mut m,
+        format!("{p}.14.conv.conv.weight"),
+        vec![HIDDEN, 1024, 3],
+        g(1024 * 3),
+        &mut next,
+    );
+    put(
+        &mut m,
+        format!("{p}.14.conv.conv.bias"),
+        vec![HIDDEN],
+        0.01,
+        &mut next,
+    );
 
     let t = "encoder_transformer.transformer.layers";
     for i in 0..TR_LAYERS {
@@ -71,30 +135,70 @@ fn synthetic_weights() -> WeightLoader {
             (format!("{t}.{i}.norm1.bias"), vec![HIDDEN], 0.01),
             (format!("{t}.{i}.norm2.weight"), vec![HIDDEN], 0.0),
             (format!("{t}.{i}.norm2.bias"), vec![HIDDEN], 0.01),
-            (format!("{t}.{i}.self_attn.in_proj_weight"), vec![3 * HIDDEN, HIDDEN], g(HIDDEN)),
-            (format!("{t}.{i}.self_attn.out_proj.weight"), vec![HIDDEN, HIDDEN], g(HIDDEN)),
-            (format!("{t}.{i}.linear1.weight"), vec![TR_INTER, HIDDEN], g(HIDDEN)),
-            (format!("{t}.{i}.linear2.weight"), vec![HIDDEN, TR_INTER], g(TR_INTER)),
+            (
+                format!("{t}.{i}.self_attn.in_proj_weight"),
+                vec![3 * HIDDEN, HIDDEN],
+                g(HIDDEN),
+            ),
+            (
+                format!("{t}.{i}.self_attn.out_proj.weight"),
+                vec![HIDDEN, HIDDEN],
+                g(HIDDEN),
+            ),
+            (
+                format!("{t}.{i}.linear1.weight"),
+                vec![TR_INTER, HIDDEN],
+                g(HIDDEN),
+            ),
+            (
+                format!("{t}.{i}.linear2.weight"),
+                vec![HIDDEN, TR_INTER],
+                g(TR_INTER),
+            ),
             (format!("{t}.{i}.layer_scale_1.scale"), vec![HIDDEN], 0.02),
             (format!("{t}.{i}.layer_scale_2.scale"), vec![HIDDEN], 0.02),
         ] {
             put(&mut m, n, sh, gg, &mut next);
         }
         // LayerNorm gains sit at 1 + noise, not at noise.
-        for n in [format!("{t}.{i}.norm1.weight"), format!("{t}.{i}.norm2.weight")] {
+        for n in [
+            format!("{t}.{i}.norm1.weight"),
+            format!("{t}.{i}.norm2.weight"),
+        ] {
             let e = m.get_mut(&n).unwrap();
             for v in e.0.iter_mut() {
                 *v = 1.0 + 0.05 * next();
             }
         }
     }
-    put(&mut m, "downsample.conv.conv.conv.weight".into(), vec![HIDDEN, HIDDEN, 4], g(HIDDEN * 4), &mut next);
-    for (bank, nq) in [("quantizer.rvq_first", 1usize), ("quantizer.rvq_rest", N_ACOUSTIC)] {
-        put(&mut m, format!("{bank}.input_proj.weight"), vec![CODE_DIM, HIDDEN, 1], g(HIDDEN), &mut next);
+    put(
+        &mut m,
+        "downsample.conv.conv.conv.weight".into(),
+        vec![HIDDEN, HIDDEN, 4],
+        g(HIDDEN * 4),
+        &mut next,
+    );
+    for (bank, nq) in [
+        ("quantizer.rvq_first", 1usize),
+        ("quantizer.rvq_rest", N_ACOUSTIC),
+    ] {
+        put(
+            &mut m,
+            format!("{bank}.input_proj.weight"),
+            vec![CODE_DIM, HIDDEN, 1],
+            g(HIDDEN),
+            &mut next,
+        );
         for q in 0..nq {
-            put(&mut m, format!("{bank}.vq.layers.{q}._codebook.embedding_sum"), vec![CODEBOOK_SIZE, CODE_DIM], 1.0, &mut next);
+            put(
+                &mut m,
+                format!("{bank}.vq.layers.{q}._codebook.embedding_sum"),
+                vec![CODEBOOK_SIZE, CODE_DIM],
+                1.0,
+                &mut next,
+            );
             let n = format!("{bank}.vq.layers.{q}._codebook.cluster_usage");
-            let v: Vec<f32> = (0..CODEBOOK_SIZE).map(|_| 1.0 + 0.2 * next()) .collect();
+            let v: Vec<f32> = (0..CODEBOOK_SIZE).map(|_| 1.0 + 0.2 * next()).collect();
             m.insert(n, (v, vec![CODEBOOK_SIZE]));
         }
     }
@@ -142,10 +246,7 @@ fn main() {
         .get(1)
         .cloned()
         .unwrap_or_else(|| "/Volumes/pile_backup/models/personaplex.pile".to_string());
-    let frames: usize = args
-        .get(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(200usize);
+    let frames: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(200usize);
 
     let t0 = Instant::now();
     let loader = if pile == "--synthetic" {
@@ -237,10 +338,15 @@ fn main() {
         gpu_ms.len() - warm
     );
     let (aglo, agmed, aghi) = stats(gpu_ms.clone());
-    println!("  all frames incl. warmup: p50 {agmed:.2} (min {aglo:.2}, max {aghi:.2}, n={frames})");
+    println!(
+        "  all frames incl. warmup: p50 {agmed:.2} (min {aglo:.2}, max {aghi:.2}, n={frames})"
+    );
     println!("  first frame (shader compile): {:.2} ms", gpu_ms[0]);
     let (slo, smed, shi) = stats(gpu_submit_ms[warm..].to_vec());
-    println!("  of which host submit: p50 {smed:.2} ms (min {slo:.2}, max {shi:.2}); drain {:.2} ms", gmed - smed);
+    println!(
+        "  of which host submit: p50 {smed:.2} ms (min {slo:.2}, max {shi:.2}); drain {:.2} ms",
+        gmed - smed
+    );
     println!("  speedup vs CPU (p50, steady state): {:.2}x", med / gmed);
 
     // ── parity, judged statistically ──
@@ -286,7 +392,11 @@ fn main() {
     let mut burst = Vec::new();
     for rep in 0..6 {
         let t = Instant::now();
-        for chunk in samples.chunks_exact(SAMPLES_PER_FRAME).skip(rep * 8).take(8) {
+        for chunk in samples
+            .chunks_exact(SAMPLES_PER_FRAME)
+            .skip(rep * 8)
+            .take(8)
+        {
             gpu.submit_frame(chunk.try_into().unwrap());
         }
         let _ = gpu.read_codes();
@@ -304,6 +414,10 @@ fn main() {
         .take(20)
         .map(|c| gpu.encode_frame(c.try_into().unwrap()))
         .collect();
-    let same = replay.iter().zip(&gpu_codes).filter(|(a, b)| a == b).count();
+    let same = replay
+        .iter()
+        .zip(&gpu_codes)
+        .filter(|(a, b)| a == b)
+        .count();
     println!("  reset replay: {same}/20 frames identical");
 }

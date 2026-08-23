@@ -50,8 +50,13 @@ pub fn model_opt(arg: Option<&str>, name: &str) -> Option<PathBuf> {
 /// the same way and always names the fix.
 pub fn skip_reason(name: &str) -> String {
     match models_dir() {
-        Ok(d) => format!("no {name} under {} (set MARY_MODELS or pass a path)", d.display()),
-        Err(_) => format!("MARY_MODELS unset, so {name} cannot be located (set it, or pass a path)"),
+        Ok(d) => format!(
+            "no {name} under {} (set MARY_MODELS or pass a path)",
+            d.display()
+        ),
+        Err(_) => {
+            format!("MARY_MODELS unset, so {name} cannot be located (set it, or pass a path)")
+        }
     }
 }
 

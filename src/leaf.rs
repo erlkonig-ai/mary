@@ -40,9 +40,7 @@
 use anyhow::{Context, Result};
 use triblespace::core::attribute::Attribute;
 use triblespace::core::blob::encodings::tensor::elements::{F16, F32};
-use triblespace::core::blob::encodings::tensor::{
-    tensor_blob, Tensor, TensorElement, TensorView,
-};
+use triblespace::core::blob::encodings::tensor::{tensor_blob, Tensor, TensorElement, TensorView};
 use triblespace::core::blob::{Blob, TryFromBlob};
 use triblespace::core::id_hex;
 use triblespace::core::inline::encodings::hash::Handle;
@@ -333,11 +331,7 @@ pub fn put_leaf_as(
 /// that the encoding has nothing to say about — an entity with both an f32 and
 /// an f16 leaf is malformed however well each of them decodes. Asking is
 /// sixteen point probes; only the one that answers is fetched.
-pub fn resolve(
-    tribles: &TribleSet,
-    blobs: &impl BlobStoreGet,
-    weight: Id,
-) -> Result<Option<Leaf>> {
+pub fn resolve(tribles: &TribleSet, blobs: &impl BlobStoreGet, weight: Id) -> Result<Option<Leaf>> {
     let mut hits = 0usize;
     let mut found: Option<Leaf> = None;
 
@@ -465,7 +459,12 @@ fn resolve_legacy(
 /// Joins module to leaf directly rather than walking `member` edges from a
 /// model root, so a pile holding several models (or one whose root layout
 /// differs) indexes the same way.
-fn named_weights(tribles: &TribleSet) -> Vec<(Inline<inlineencodings::Handle<blobencodings::UTF8String>>, Id)> {
+fn named_weights(
+    tribles: &TribleSet,
+) -> Vec<(
+    Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
+    Id,
+)> {
     use crate::format::attrs;
     triblespace::macros::find!(
         (n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>, w: Id),
@@ -552,7 +551,10 @@ pub fn typed_leaf_attrs() -> Vec<(String, Id)> {
 
     macro_rules! name_all {
         ($elem:ty, $rank:literal, $tag:expr) => {{
-            out.push((format!("leaf.{}.{}", $tag, $rank), leaf::<$elem, $rank>().id()));
+            out.push((
+                format!("leaf.{}.{}", $tag, $rank),
+                leaf::<$elem, $rank>().id(),
+            ));
         }};
     }
 
@@ -766,7 +768,10 @@ mod tests {
         assert_eq!(leaf.elem(), Elem::F32);
         assert_eq!(leaf.shape(), vec![2, 3]);
         assert_eq!(leaf.to_f32(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        assert!(leaf.view_f32().is_some(), "an f32 leaf views without a copy");
+        assert!(
+            leaf.view_f32().is_some(),
+            "an f32 leaf views without a copy"
+        );
     }
 
     /// "A leaf carries one payload" is a fact about the graph, not about any
@@ -836,8 +841,7 @@ mod tests {
         let good_id = good.root().expect("root");
 
         let lying_shape = blobs.put::<U64Array, _>(vec![2u64, 3]).expect("shape");
-        let bad =
-            triblespace::macros::entity! { _ @ attrs::data: data, attrs::shape: lying_shape };
+        let bad = triblespace::macros::entity! { _ @ attrs::data: data, attrs::shape: lying_shape };
         let bad_id = bad.root().expect("root");
 
         let mut facts = good.into_facts();
@@ -858,4 +862,3 @@ mod tests {
         assert!(error.contains("implies"), "{error}");
     }
 }
-

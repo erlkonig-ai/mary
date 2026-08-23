@@ -35,7 +35,11 @@ fn meminfo() -> (f64, f64) {
     let get = |k: &str| -> f64 {
         for line in s.lines() {
             if let Some(v) = line.strip_prefix(k) {
-                if let Some(kb) = v.split_whitespace().next().and_then(|x| x.parse::<f64>().ok()) {
+                if let Some(kb) = v
+                    .split_whitespace()
+                    .next()
+                    .and_then(|x| x.parse::<f64>().ok())
+                {
                     return kb * 1024.0;
                 }
             }
@@ -111,7 +115,10 @@ fn main() {
             // Force materialisation with max: touches every element, cannot
             // saturate the way a sum of many values would.
             let m: f32 = tt.clone().max().into_scalar().elem();
-            assert!(m.is_finite(), "{name}: max is not finite — tensor did not materialise");
+            assert!(
+                m.is_finite(),
+                "{name}: max is not finite — tensor did not materialise"
+            );
             held.push(tt);
             elems += n as u64;
         }
@@ -134,11 +141,18 @@ fn main() {
     println!("\n  tensors held    : {}", held.len());
     println!("  elements        : {elems}");
     println!("  disk (BF16)     : {:.2} GiB", disk as f64 / GIB);
-    println!("  anonymous mem   : {:.2} GiB  (MemFree drop minus Cached growth)", anon / GIB);
+    println!(
+        "  anonymous mem   : {:.2} GiB  (MemFree drop minus Cached growth)",
+        anon / GIB
+    );
     println!("  measured        : {per:.3} B/elem");
 
     // Verdict computed, never asserted.
-    let verdict = if per < 3.0 { "NARROW (~2 B/elem)" } else { "WIDE (~4 B/elem)" };
+    let verdict = if per < 3.0 {
+        "NARROW (~2 B/elem)"
+    } else {
+        "WIDE (~4 B/elem)"
+    };
     println!("  VERDICT         : {verdict}");
     println!(
         "  => 106.55 GiB of resident weights would cost {:.1} GiB against 119 GiB",

@@ -202,7 +202,11 @@ impl K3TextConfig {
         let one_based = layer + 1;
         if self.linear_attn_config.kda_layers.contains(&one_based) {
             AttnKind::Kda
-        } else if self.linear_attn_config.full_attn_layers.contains(&one_based) {
+        } else if self
+            .linear_attn_config
+            .full_attn_layers
+            .contains(&one_based)
+        {
             AttnKind::Mla
         } else {
             panic!("layer {layer} is in neither kda_layers nor full_attn_layers");
@@ -258,7 +262,10 @@ impl K3TextConfig {
         let la = &self.linear_attn_config;
 
         let mut seen = vec![0u32; n];
-        for (list, name) in [(&la.kda_layers, "kda_layers"), (&la.full_attn_layers, "full_attn_layers")] {
+        for (list, name) in [
+            (&la.kda_layers, "kda_layers"),
+            (&la.full_attn_layers, "full_attn_layers"),
+        ] {
             for &one_based in list {
                 if one_based == 0 || one_based > n {
                     return Err(format!(

@@ -142,7 +142,10 @@ fn main() -> Result<()> {
     let source = mary::persist::read_model_pile(src)?;
     let (team, expected) = source.collection;
     let (tribles, reader) = (source.facts, source.reader);
-    eprintln!("[migrate] {src:?}: native collection, {} facts", tribles.len());
+    eprintln!(
+        "[migrate] {src:?}: native collection, {} facts",
+        tribles.len()
+    );
 
     // Every leaf, by its own entity id. `data` XOR `data_f16`, plus `shape`.
     let mut leaves: Vec<(Id, bool)> = Vec::new();

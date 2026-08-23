@@ -134,7 +134,10 @@ fn read_npy(path: &Path) -> Arr {
     };
     let header = std::str::from_utf8(&buf[hstart..hstart + hlen]).expect("npy header utf8");
     let field = |k: &str| -> String {
-        let i = header.find(k).unwrap_or_else(|| panic!("no {k} in {header}")) + k.len();
+        let i = header
+            .find(k)
+            .unwrap_or_else(|| panic!("no {k} in {header}"))
+            + k.len();
         let rest = &header[i..];
         let start = rest.find(|c: char| c != ':' && c != ' ').unwrap();
         let rest = &rest[start..];
@@ -232,14 +235,27 @@ fn verify_against_index(dir: &Path, loaded: &HashMap<String, Arr>) {
         let want: Vec<usize> = spec
             .get("shape")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64().map(|n| n as usize))
+                    .collect()
+            })
             .unwrap_or_default();
         if want != got.shape {
-            problems.push(format!("{name}: shape {:?} declared, {:?} loaded", want, got.shape));
+            problems.push(format!(
+                "{name}: shape {:?} declared, {:?} loaded",
+                want, got.shape
+            ));
         }
-        let n: usize = want.iter().product::<usize>().max(if want.is_empty() { 1 } else { 0 });
+        let n: usize = want
+            .iter()
+            .product::<usize>()
+            .max(if want.is_empty() { 1 } else { 0 });
         if got.len() != n {
-            problems.push(format!("{name}: {n} elements declared, {} loaded", got.len()));
+            problems.push(format!(
+                "{name}: {n} elements declared, {} loaded",
+                got.len()
+            ));
         }
     }
     for name in loaded.keys() {
@@ -439,7 +455,9 @@ fn run_lane<B: Backend>(name: &str, dev: &Device<B>, o: &HashMap<String, Arr>) -
     // The formula's own consequences, checked without the oracle. Saturation
     // must be *exact*: tanh(±7.5e37) is ±1.0 to the last bit in f32, so the
     // branches must land on the betas themselves, not merely near them.
-    let probe = [3e38f32, 1e30, 1e12, 100.0, 40.0, -40.0, -100.0, -1e30, -3e38];
+    let probe = [
+        3e38f32, 1e30, 1e12, 100.0, 40.0, -40.0, -100.0, -1e30, -3e38,
+    ];
     let g = host(situ.gate_branch(t1::<B>(&probe, dev)));
     let u = host(situ.up_branch(t1::<B>(&probe, dev)));
     let sat_ok = g[0] == 4.0 && g[1] == 4.0 && u[0] == 25.0 && *u.last().unwrap() == -25.0;
@@ -509,7 +527,10 @@ fn run_lane<B: Backend>(name: &str, dev: &Device<B>, o: &HashMap<String, Arr>) -
         "diag forward vs shipped f32",
         &compare(&dy, &get("diag_y_f32").data, rtol),
     );
-    ok &= report("diag forward vs f64", &compare(&dy, &get("diag_y_f64").data, rtol));
+    ok &= report(
+        "diag forward vs f64",
+        &compare(&dy, &get("diag_y_f64").data, rtol),
+    );
 
     // (c) the 34×34 sign-quadrant grid through `forward_pair` — the API a
     //     fused expert path uses, and the only case covering gate<0/up>0.
@@ -520,7 +541,10 @@ fn run_lane<B: Backend>(name: &str, dev: &Device<B>, o: &HashMap<String, Arr>) -
         "grid pair vs shipped f32",
         &compare(&gy, &get("grid_y_f32").data, rtol),
     );
-    ok &= report("grid pair vs f64", &compare(&gy, &get("grid_y_f64").data, rtol));
+    ok &= report(
+        "grid pair vs f64",
+        &compare(&gy, &get("grid_y_f64").data, rtol),
+    );
 
     // (d) a realistic MoE-shaped block: 8 tokens × 2·3072, sd 6 so most of it
     //     sits past the beta=4 knee.
@@ -531,7 +555,10 @@ fn run_lane<B: Backend>(name: &str, dev: &Device<B>, o: &HashMap<String, Arr>) -
         "rand block vs shipped f32",
         &compare(&ry, &get("rand_y_f32").data, rtol),
     );
-    ok &= report("rand block vs f64", &compare(&ry, &get("rand_y_f64").data, rtol));
+    ok &= report(
+        "rand block vs f64",
+        &compare(&ry, &get("rand_y_f64").data, rtol),
+    );
 
     // (e) bf16 in / bf16 out — the storage dtype of a real forward pass. The
     //     shipped module rounds only at the two ends, so this is the f32 path
@@ -542,7 +569,11 @@ fn run_lane<B: Backend>(name: &str, dev: &Device<B>, o: &HashMap<String, Arr>) -
     //     rounds somewhere the reference does not.
     for (xk, yk, rows) in [
         ("diag_x_bf16_bits", "diag_y_bf16_bits", n),
-        ("grid_x_bf16_bits", "grid_y_bf16_bits", get("grid_x_bf16_bits").shape[0]),
+        (
+            "grid_x_bf16_bits",
+            "grid_y_bf16_bits",
+            get("grid_x_bf16_bits").shape[0],
+        ),
         ("rand_x_bf16_bits", "rand_y_bf16_bits", rr),
     ] {
         let xa = get(xk);
@@ -693,12 +724,13 @@ where
 }
 
 fn main() {
-    let dir_arg = std::env::args().nth(1).or_else(|| std::env::var("SITU_ORACLE_DIR").ok());
-    let dir = mary::paths::model(dir_arg.as_deref(), "k3-situ/oracle_npy")
-        .unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(2)
-        });
+    let dir_arg = std::env::args()
+        .nth(1)
+        .or_else(|| std::env::var("SITU_ORACLE_DIR").ok());
+    let dir = mary::paths::model(dir_arg.as_deref(), "k3-situ/oracle_npy").unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
     println!("kimi_situ_gate — mary::models::k3::situ vs the shipped SituAndMul");
     println!("oracle: {}", dir.display());
     println!("criterion: |got-want| <= {ATOL:e} + rtol·|want|, rtol per lane (>= {RTOL_FLOOR:e})");
@@ -706,7 +738,10 @@ fn main() {
     let situ = Situ::k3();
     // The betas are the whole activation; assert the port's constants are the
     // config's before anything else is measured.
-    assert_eq!(situ.beta, o["beta"].data[0], "beta disagrees with the oracle");
+    assert_eq!(
+        situ.beta, o["beta"].data[0],
+        "beta disagrees with the oracle"
+    );
     assert_eq!(
         situ.linear_beta.unwrap(),
         o["linear_beta"].data[0],
@@ -775,9 +810,7 @@ fn main() {
             dropped.len()
         );
     }
-    let pass = ran_any
-        && lanes.iter().all(|(_, r)| *r)
-        && (dropped.is_empty() || allow_missing);
+    let pass = ran_any && lanes.iter().all(|(_, r)| *r) && (dropped.is_empty() || allow_missing);
     println!(
         "\nGATE: {}  ({} lane(s) ran, {} dropped)",
         if pass { "PASS" } else { "FAIL" },

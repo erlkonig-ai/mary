@@ -773,8 +773,12 @@ impl QLinear {
     pub(crate) fn bytes(&self) -> usize {
         match self {
             Self::Q4(l) => l.bytes(),
-            Self::Q8 { out_dim, in_dim, .. } => out_dim * in_dim + out_dim * in_dim / 32 * 2,
-            Self::F16 { out_dim, in_dim, .. } => out_dim * in_dim * 2,
+            Self::Q8 {
+                out_dim, in_dim, ..
+            } => out_dim * in_dim + out_dim * in_dim / 32 * 2,
+            Self::F16 {
+                out_dim, in_dim, ..
+            } => out_dim * in_dim * 2,
         }
     }
 
@@ -784,14 +788,7 @@ impl QLinear {
         self.launch(client, x, y, self.out_dim(), true);
     }
 
-    fn launch(
-        &self,
-        client: &q4::Client,
-        x: &Handle,
-        y: &Handle,
-        rows: usize,
-        swiglu_pairs: bool,
-    ) {
+    fn launch(&self, client: &q4::Client, x: &Handle, y: &Handle, rows: usize, swiglu_pairs: bool) {
         assert!(rows <= self.out_dim() && rows % 8 == 0, "row prefix {rows}");
         match self {
             Self::Q4(l) => {

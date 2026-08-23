@@ -210,7 +210,6 @@ fn matvec_kernel(
     }
 }
 
-
 /// q8 twin of [`matvec_kernel`]: same thread shape, same epilogues, weights
 /// read as GGUF-Q8_0-style groups instead of raw f16.
 ///
@@ -396,7 +395,11 @@ fn qk_norm_rope_kernel(
         sync_cube();
 
         // normalized value at this lane, and at its rotate partner
-        let w = if h < heads { qn[i as usize] } else { kn[i as usize] };
+        let w = if h < heads {
+            qn[i as usize]
+        } else {
+            kn[i as usize]
+        };
         red[i as usize] = v * s * w;
         sync_cube();
         let lo = i % half; // index into the cos/sin tables
@@ -405,7 +408,11 @@ fn qk_norm_rope_kernel(
         let b = red[(lo + half) as usize];
         let c = rope[(pos * d + lo) as usize];
         let sn = rope[(pos * d + half + lo) as usize];
-        let out = if upper { b * c + a * sn } else { a * c - b * sn };
+        let out = if upper {
+            b * c + a * sn
+        } else {
+            a * c - b * sn
+        };
 
         if h < heads {
             q_out[(h * d + i) as usize] = out * scale;
@@ -734,12 +741,12 @@ pub struct PredictorEngine {
     rope: Handle,
     dummy: Handle,
     // activations, all persistent
-    x: Handle,      // [1024] residual stream
-    xin: Handle,    // [talker_width] next position's input
-    qkv: Handle,    // [4096]
-    q: Handle,      // [2048]
-    attn: Handle,   // [2048]
-    act: Handle,    // [3072]
+    x: Handle,        // [1024] residual stream
+    xin: Handle,      // [talker_width] next position's input
+    qkv: Handle,      // [4096]
+    q: Handle,        // [2048]
+    attn: Handle,     // [2048]
+    act: Handle,      // [3072]
     logits: Handle,   // [2048]
     code_dev: Handle, // [15] the sampled ids, device-side, never read back
     talker_width: usize,
@@ -848,14 +855,12 @@ impl PredictorEngine {
             .embedding_tables()
             .map(|e| client.create_from_slice(as_bytes(e)))
             .collect();
-        let proj = p
-            .proj_weights()
-            .map(|(w, b)| {
-                (
-                    upload(&client, mode, w, h, tw),
-                    client.create_from_slice(as_bytes(b)),
-                )
-            });
+        let proj = p.proj_weights().map(|(w, b)| {
+            (
+                upload(&client, mode, w, h, tw),
+                client.create_from_slice(as_bytes(b)),
+            )
+        });
 
         Self {
             rope: client.create_from_slice(as_bytes(&rope)),
@@ -991,7 +996,16 @@ impl PredictorEngine {
         let scale = ((D as f64).powf(-0.5)) as f32;
         for l in &self.layers {
             self.matvec(
-                &self.x, &l.qkv, &self.dummy, &self.qkv, HID, QKV_OUT, true, false, false, false,
+                &self.x,
+                &l.qkv,
+                &self.dummy,
+                &self.qkv,
+                HID,
+                QKV_OUT,
+                true,
+                false,
+                false,
+                false,
             );
             unsafe {
                 qk_norm_rope_kernel::launch_unchecked::<Rt>(
@@ -1028,7 +1042,16 @@ impl PredictorEngine {
                 );
             }
             self.matvec(
-                &self.attn, &l.o, &self.dummy, &self.x, Q_DIM, HID, false, false, true, false,
+                &self.attn,
+                &l.o,
+                &self.dummy,
+                &self.x,
+                Q_DIM,
+                HID,
+                false,
+                false,
+                true,
+                false,
             );
             self.matvec(
                 &self.x,
@@ -1043,7 +1066,16 @@ impl PredictorEngine {
                 false,
             );
             self.matvec(
-                &self.act, &l.down, &self.dummy, &self.x, INTER, HID, false, false, true, false,
+                &self.act,
+                &l.down,
+                &self.dummy,
+                &self.x,
+                INTER,
+                HID,
+                false,
+                false,
+                true,
+                false,
             );
         }
     }
@@ -1081,7 +1113,9 @@ impl PredictorEngine {
         };
         let noise = self.client.create_from_slice(as_bytes(&noise));
         // `out` = embedding sum ‖ the 15 sampled ids; created zeroed, read once.
-        let out = self.client.create_from_slice(as_bytes(&vec![0f32; tw + STEPS]));
+        let out = self
+            .client
+            .create_from_slice(as_bytes(&vec![0f32; tw + STEPS]));
 
         let h0 = self.client.create_from_slice(as_bytes(talker_hidden));
         self.project(&h0);

@@ -189,7 +189,10 @@ impl Oracle {
     fn open(path: &Path) -> Oracle {
         let npz = Npz::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
         assert!(!npz.is_empty(), "oracle npz is empty: {}", path.display());
-        Oracle { npz, used: RefCell::new(BTreeSet::new()) }
+        Oracle {
+            npz,
+            used: RefCell::new(BTreeSet::new()),
+        }
     }
 
     fn mark(&self, key: &str) {
@@ -287,7 +290,13 @@ struct Cmp {
 fn compare(got: &[f32], want: &[f32]) -> Cmp {
     assert!(!got.is_empty(), "comparison against an EMPTY result");
     assert!(!want.is_empty(), "comparison against an EMPTY reference");
-    assert_eq!(got.len(), want.len(), "length mismatch {} vs {}", got.len(), want.len());
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "length mismatch {} vs {}",
+        got.len(),
+        want.len()
+    );
     let mut max_abs = 0f64;
     let mut ref_absmax = 0f64;
     let mut exact = 0usize;
@@ -309,7 +318,13 @@ fn compare(got: &[f32], want: &[f32]) -> Cmp {
             exact += 1;
         }
     }
-    Cmp { n: got.len(), max_abs, ref_absmax, exact_frac: exact as f64 / got.len() as f64, nonfinite }
+    Cmp {
+        n: got.len(),
+        max_abs,
+        ref_absmax,
+        exact_frac: exact as f64 / got.len() as f64,
+        nonfinite,
+    }
 }
 
 struct Report {
@@ -319,12 +334,18 @@ struct Report {
 
 impl Report {
     fn new() -> Report {
-        Report { checks: Vec::new(), quiet: false }
+        Report {
+            checks: Vec::new(),
+            quiet: false,
+        }
     }
 
     fn push(&mut self, id: &str, what: &str, ok: bool, detail: String) {
         if !self.quiet {
-            println!("  [{}] {id}  {what}\n         {detail}", if ok { "PASS" } else { "FAIL" });
+            println!(
+                "  [{}] {id}  {what}\n         {detail}",
+                if ok { "PASS" } else { "FAIL" }
+            );
         }
         self.checks.push(Check {
             id: id.to_string(),
@@ -359,7 +380,11 @@ impl Report {
         let ok = within && exact_ok && c.nonfinite == 0;
         let extra = match exact_min {
             Some(m) => {
-                format!(", bit-exact {:.4}% (min {:.2}%)", c.exact_frac * 100.0, m * 100.0)
+                format!(
+                    ", bit-exact {:.4}% (min {:.2}%)",
+                    c.exact_frac * 100.0,
+                    m * 100.0
+                )
             }
             None => format!(", bit-exact {:.4}%", c.exact_frac * 100.0),
         };
@@ -373,7 +398,11 @@ impl Report {
                 c.max_abs,
                 budget,
                 c.ref_absmax,
-                if c.nonfinite > 0 { format!(", NON-FINITE {}", c.nonfinite) } else { String::new() }
+                if c.nonfinite > 0 {
+                    format!(", NON-FINITE {}", c.nonfinite)
+                } else {
+                    String::new()
+                }
             ),
         );
         c.max_abs
@@ -405,7 +434,12 @@ impl Report {
             id,
             what,
             ok,
-            format!("n={} bit-exact {:.6}% max|d|={:.3e}", c.n, c.exact_frac * 100.0, c.max_abs),
+            format!(
+                "n={} bit-exact {:.6}% max|d|={:.3e}",
+                c.n,
+                c.exact_frac * 100.0,
+                c.max_abs
+            ),
         );
     }
 
@@ -463,11 +497,19 @@ impl Report {
                 c.n,
                 c.max_abs,
                 budget,
-                if clears_budget { "exceeded" } else { "NOT EXCEEDED" },
+                if clears_budget {
+                    "exceeded"
+                } else {
+                    "NOT EXCEEDED"
+                },
                 correct_dev,
                 c.max_abs / correct_dev,
                 CONTROL_MARGIN,
-                if separated { "separated" } else { "NOT SEPARATED" },
+                if separated {
+                    "separated"
+                } else {
+                    "NOT SEPARATED"
+                },
                 c.exact_frac * 100.0
             ),
         );
@@ -483,7 +525,12 @@ fn absmax(v: &[f32]) -> f64 {
 }
 
 fn t2v(v: Vec<f32>, rows: usize, cols: usize, dev: &Dev) -> Tensor<B, 2> {
-    assert_eq!(v.len(), rows * cols, "t2v: {} values into [{rows}, {cols}]", v.len());
+    assert_eq!(
+        v.len(),
+        rows * cols,
+        "t2v: {} values into [{rows}, {cols}]",
+        v.len()
+    );
     Tensor::from_data(TensorData::new(v, [rows, cols]), dev)
 }
 
@@ -496,7 +543,10 @@ fn t1v(v: Vec<f32>, dev: &Dev) -> Tensor<B, 1> {
 fn vec_of<const D: usize>(t: Tensor<B, D>) -> Vec<f32> {
     // The backend element is bf16; widening to f32 is exact, so the oracle
     // comparisons below keep their meaning and their budgets.
-    t.into_data().convert::<f32>().to_vec().expect("tensor -> f32")
+    t.into_data()
+        .convert::<f32>()
+        .to_vec()
+        .expect("tensor -> f32")
 }
 
 fn bf(x: f32) -> f32 {
@@ -617,7 +667,6 @@ fn lane_selftest(r: &mut Report) {
     probe.exact("_", "_", &base, &base);
     let s6b = probe.checks.pop().unwrap().ok;
     {
-
         // S5b: must_reject's two arms, each shown failing ALONE. An arm that is
 
         // never exercised is not a control, and this comparator has two.
@@ -632,11 +681,25 @@ fn lane_selftest(r: &mut Report) {
 
         // clears a tiny budget, but the correct implementation is just as far off
 
-        s.must_reject("probe", "budget cleared, separation absent", &far, &base, 1e-6, 1.0);
+        s.must_reject(
+            "probe",
+            "budget cleared, separation absent",
+            &far,
+            &base,
+            1e-6,
+            1.0,
+        );
 
         // stands clear of a tiny correct error, but never reaches the budget
 
-        s.must_reject("probe", "separated, budget not reached", &far, &base, 1e9, 1e-9);
+        s.must_reject(
+            "probe",
+            "separated, budget not reached",
+            &far,
+            &base,
+            1e9,
+            1e-9,
+        );
 
         // and both together pass
 
@@ -645,9 +708,7 @@ fn lane_selftest(r: &mut Report) {
         let v: Vec<bool> = s.checks.iter().map(|c| c.ok).collect();
 
         r.boolean(
-
             "S5b",
-
             "must_reject() FAILS when EITHER arm fails — a wrong variant that clears the \
 
              budget but sits where the correct implementation does is not a control, and \
@@ -655,16 +716,12 @@ fn lane_selftest(r: &mut Report) {
              neither is one that is well separated but never reaches the rejection \
 
              threshold. Both arms shown failing alone, then passing together",
-
             v == vec![false, false, true],
-
             format!("[budget-only, separation-only, both] ok = {v:?}"),
-
         );
+    }
 
-        }
-
-        r.boolean(
+    r.boolean(
         "S6",
         "exact() FAILS on a one-ulp difference in one element of 64 and PASSES on an \
          identical array",
@@ -690,7 +747,10 @@ fn lane_selftest(r: &mut Report) {
         format!("absmax_where {am}, plain absmax {:.3e}", absmax(&scores)),
     );
 
-    assert!(probe.checks.is_empty(), "self-test probe left checks behind");
+    assert!(
+        probe.checks.is_empty(),
+        "self-test probe left checks behind"
+    );
 }
 
 // ===========================================================================
@@ -733,11 +793,15 @@ fn lane_premises(r: &mut Report, ck: &Ckpt, cfg: &K3Config, oracle_dir: &Path) {
          A_log (KDA) — the two readings are disjoint and total, so the tensor names alone \
          determine the layer kind",
         both == 0 && neither == 0 && measured.len() == 93,
-        format!("{} layers, {both} carry both, {neither} carry neither", measured.len()),
+        format!(
+            "{} layers, {both} carry both, {neither} carry neither",
+            measured.len()
+        ),
     );
 
-    let mla_idx: Vec<usize> =
-        (0..measured.len()).filter(|&l| measured[l] == AttnKind::Mla).collect();
+    let mla_idx: Vec<usize> = (0..measured.len())
+        .filter(|&l| measured[l] == AttnKind::Mla)
+        .collect();
     r.boolean(
         "P2",
         "the MEASURED MLA positions are `full_attn_layers - 1`, NOT `full_attn_layers` — \
@@ -810,11 +874,13 @@ fn lane_premises(r: &mut Report, ck: &Ckpt, cfg: &K3Config, oracle_dir: &Path) {
          taking the first 96 is right and taking the last 96 is the bug (exp(0)=1 makes a \
          padded head's decay rate 1)",
         pad_ok && live_nonzero == 3 * nh,
-        format!("3 layers checked, {live_nonzero} of {} live entries non-zero", 3 * nh),
+        format!(
+            "3 layers checked, {live_nonzero} of {} live entries non-zero",
+            3 * nh
+        ),
     );
 
-    const SHA_PREFIX: &str =
-        "fdb3b897f0bb43e8506d27dd283defee87910006dd1038c131687a1b48e61d7c";
+    const SHA_PREFIX: &str = "fdb3b897f0bb43e8506d27dd283defee87910006dd1038c131687a1b48e61d7c";
     const SHA_INV: &str = "af853091814e9627cd61c20f1c55a4acfab978c928b304715819a4a0f7d067eb";
     let hp = sha256_file(&oracle_dir.join("layer_oracle_prefix13_bf16.npz"));
     let hi = sha256_file(&oracle_dir.join("layer_oracle_prefix13_bf16_inventory.json"));
@@ -844,8 +910,11 @@ struct LayerResult {
 /// Build a [`MoeRouting`] from the oracle's captured `topk_idx`/`topk_weight`,
 /// so the MoE can be run with the *shipped* selection instead of its own.
 fn pinned_routing(p: &Oracle, tag: &str, tokens: usize, top_k: usize, dev: &Dev) -> MoeRouting<B> {
-    let idx: Vec<usize> =
-        p.i64(&format!("{tag}_moe_gate_out_topk_idx")).into_iter().map(|v| v as usize).collect();
+    let idx: Vec<usize> = p
+        .i64(&format!("{tag}_moe_gate_out_topk_idx"))
+        .into_iter()
+        .map(|v| v as usize)
+        .collect();
     let w = p.f32(&format!("{tag}_moe_gate_out_topk_weight"));
     let pre = p.f32(&format!("{tag}_moe_router_topk_weight_prerenorm"));
     assert_eq!(idx.len(), tokens * top_k, "pinned routing idx length");
@@ -854,7 +923,12 @@ fn pinned_routing(p: &Oracle, tag: &str, tokens: usize, top_k: usize, dev: &Dev)
     MoeRouting {
         logits: t2v(p.f32(&format!("{tag}_moe_router_logits")), tokens, e, dev),
         scores: t2v(p.f32(&format!("{tag}_moe_router_scores")), tokens, e, dev),
-        scores_for_choice: t2v(p.f32(&format!("{tag}_moe_router_scores_for_choice")), tokens, e, dev),
+        scores_for_choice: t2v(
+            p.f32(&format!("{tag}_moe_router_scores_for_choice")),
+            tokens,
+            e,
+            dev,
+        ),
         topk_idx: idx,
         topk_weight_prerenorm: pre,
         topk_weight: w,
@@ -921,7 +995,11 @@ fn check_moe_stages(
         let want = p.bf16(&key);
         let am = absmax(&want);
         // The shared experts never see the router, so no routing term for them.
-        let rt = if name == "shared" || name == "latent_down" { 0.0 } else { routing_term };
+        let rt = if name == "shared" || name == "latent_down" {
+            0.0
+        } else {
+            routing_term
+        };
         let budget = bf16_budget(n + n_extra, am) + rt * am;
         let id = format!("{tag}/{lane}.moe.{name}");
         let what = format!("{lane}: {stage}");
@@ -937,7 +1015,16 @@ fn check_moe_stages(
     let id = format!("{tag}/{lane}.moe.out");
     let what = format!("{lane}: the whole MoE block, moe_in -> moe_out");
     if table {
-        r.stage(&id, tag, "7 MoE block", &what, &vec_of(bt.out.clone()), &out_ref, budget, None);
+        r.stage(
+            &id,
+            tag,
+            "7 MoE block",
+            &what,
+            &vec_of(bt.out.clone()),
+            &out_ref,
+            budget,
+            None,
+        );
     } else {
         r.close(&id, &what, &vec_of(bt.out.clone()), &out_ref, budget, None);
     }
@@ -956,9 +1043,14 @@ fn routing_divergence(
     let mut flipped: Vec<usize> = Vec::new();
     let mut wmax = 0f64;
     for tk in 0..tokens {
-        let mine: BTreeSet<usize> = routing.topk_idx[tk * k..(tk + 1) * k].iter().copied().collect();
-        let theirs: BTreeSet<usize> =
-            ref_idx[tk * k..(tk + 1) * k].iter().map(|&x| x as usize).collect();
+        let mine: BTreeSet<usize> = routing.topk_idx[tk * k..(tk + 1) * k]
+            .iter()
+            .copied()
+            .collect();
+        let theirs: BTreeSet<usize> = ref_idx[tk * k..(tk + 1) * k]
+            .iter()
+            .map(|&x| x as usize)
+            .collect();
         assert_eq!(mine.len(), k, "duplicate expert in this port's selection");
         assert_eq!(theirs.len(), k, "duplicate expert in the shipped selection");
         if mine != theirs {
@@ -966,8 +1058,9 @@ fn routing_divergence(
         }
         for j in 0..k {
             let id = routing.topk_idx[tk * k + j];
-            if let Some(pos) =
-                ref_idx[tk * k..(tk + 1) * k].iter().position(|&x| x as usize == id)
+            if let Some(pos) = ref_idx[tk * k..(tk + 1) * k]
+                .iter()
+                .position(|&x| x as usize == id)
             {
                 let d = (routing.topk_weight[tk * k + j] as f64 - ref_w[tk * k + pos] as f64).abs();
                 if d > wmax {
@@ -1003,12 +1096,17 @@ fn run_layer(
     assert_eq!(shape[2], hidden, "{tag}_layer_in width");
 
     // ---- the resumed depth bank ---------------------------------------
-    let schedule: Vec<bool> =
-        (0..t.num_hidden_layers).map(|l| t.is_attn_res_checkpoint(l)).collect();
+    let schedule: Vec<bool> = (0..t.num_hidden_layers)
+        .map(|l| t.is_attn_res_checkpoint(l))
+        .collect();
     let bank_flat = p.bf16(&format!("{tag}_blockres_in_bf16bits"));
     let bshape = p.shape(&format!("{tag}_blockres_in_bf16bits"));
     let nblocks = bshape[1];
-    assert_eq!(bshape, vec![tokens, nblocks, hidden], "{tag}_blockres_in shape");
+    assert_eq!(
+        bshape,
+        vec![tokens, nblocks, hidden],
+        "{tag}_blockres_in shape"
+    );
     let bank: Vec<Tensor<B, 2>> = (0..nblocks)
         .map(|s| {
             let mut v = Vec::with_capacity(tokens * hidden);
@@ -1050,7 +1148,10 @@ fn run_layer(
             K3Attn::Kda(Box::new(KdaAttention::new(kc, w, ActRound::Bf16)))
         }
     };
-    assert!(t.is_moe_layer(layer), "layer {layer} must be a MoE layer for this gate");
+    assert!(
+        t.is_moe_layer(layer),
+        "layer {layer} must be a MoE layer for this gate"
+    );
     let dec = K3DecoderLayer::new(
         layer,
         dims.clone(),
@@ -1197,8 +1298,11 @@ fn run_layer(
         bf16_budget(2, absmax(&ln2_out_ref)),
         Some(EXACT_FRAC_ELEMENTWISE),
     );
-    let last: Vec<f32> =
-        mlp_prefix_ref.iter().zip(moe_out_ref.iter()).map(|(&a, &b)| bf(a + b)).collect();
+    let last: Vec<f32> = mlp_prefix_ref
+        .iter()
+        .zip(moe_out_ref.iter())
+        .map(|(&a, &b)| bf(a + b))
+        .collect();
     r.exact(
         &format!("{tag}/tf.layer_out_add"),
         "the layer's final residual add, driven from two captured tensors, is bit-exactly \
@@ -1217,11 +1321,9 @@ fn run_layer(
     println!("\n  -- {tag} MoE, teacher-forced from moe_in --");
     let moe = LatentMoe::new(dims.clone());
     let t_moe = Instant::now();
-    let tf_bt = moe.forward_traced(
-        t2v(moe_in_ref.clone(), tokens, hidden, dev),
-        &moe_w,
-        |id| ck.expert::<B>(layer, id, dev),
-    );
+    let tf_bt = moe.forward_traced(t2v(moe_in_ref.clone(), tokens, hidden, dev), &moe_w, |id| {
+        ck.expert::<B>(layer, id, dev)
+    });
     let ref_idx = p.i64(&format!("{tag}_moe_gate_out_topk_idx"));
     let ref_w = p.f32(&format!("{tag}_moe_gate_out_topk_weight"));
     let (flipped, wmax) = routing_divergence(&tf_bt.routing, &ref_idx, &ref_w, tokens, dims.top_k);
@@ -1230,7 +1332,11 @@ fn run_layer(
         "driven from the oracle's own moe_in, the routed-expert SET is the shipped one \
          for EVERY token and the combining weights agree through the index pairing",
         flipped.is_empty() && !(wmax > 1e-6),
-        format!("{tokens} tokens x top-{}, 0 set flips required, {} seen, max |dw| = {wmax:.3e}", dims.top_k, flipped.len()),
+        format!(
+            "{tokens} tokens x top-{}, 0 set flips required, {} seen, max |dw| = {wmax:.3e}",
+            dims.top_k,
+            flipped.len()
+        ),
     );
     r.close(
         &format!("{tag}/tf.moe.scores"),
@@ -1241,7 +1347,10 @@ fn run_layer(
         None,
     );
     check_moe_stages(r, p, &tag, "tf", &tf_bt, dims, 0, 0.0, false);
-    println!("         (teacher-forced MoE: {:.1} s)", t_moe.elapsed().as_secs_f64());
+    println!(
+        "         (teacher-forced MoE: {:.1} s)",
+        t_moe.elapsed().as_secs_f64()
+    );
 
     // =====================================================================
     // CASCADE lane
@@ -1262,7 +1371,10 @@ fn run_layer(
     );
     let elapsed = t0.elapsed();
 
-    let entry = tr.entry_mix.as_ref().expect("this layer's bank is non-empty");
+    let entry = tr
+        .entry_mix
+        .as_ref()
+        .expect("this layer's bank is non-empty");
     r.stage(
         &format!("{tag}/casc.attnres_sa"),
         &tag,
@@ -1334,7 +1446,10 @@ fn run_layer(
     // ---- the routing instability, measured ------------------------------
     //
     // This is the finding that decides how tight a whole-layer cascade can be.
-    let drift = compare(&vec_of(tr.post_attention_layernorm_out.clone()), &moe_in_ref);
+    let drift = compare(
+        &vec_of(tr.post_attention_layernorm_out.clone()),
+        &moe_in_ref,
+    );
     let sref = p.f32(&format!("{tag}_moe_router_scores"));
     let sc = compare(&vec_of(bt.routing.scores.clone()), &sref);
     let sfc = p.f32(&format!("{tag}_moe_router_scores_for_choice"));
@@ -1390,12 +1505,17 @@ fn run_layer(
         srt.sort_by(|a, b| b.partial_cmp(a).expect("finite router scores"));
         let thr = srt[dims.top_k - 1] as f64;
         // the witness: experts this token's window puts out of reach
-        excluded += row.iter().filter(|&&s| ((s as f64) - thr).abs() > window).count();
+        excluded += row
+            .iter()
+            .filter(|&&s| ((s as f64) - thr).abs() > window)
+            .count();
         if !c_flipped.contains(&tk) {
             continue;
         }
-        let mine_t: BTreeSet<usize> =
-            bt.routing.topk_idx[tk * dims.top_k..(tk + 1) * dims.top_k].iter().copied().collect();
+        let mine_t: BTreeSet<usize> = bt.routing.topk_idx[tk * dims.top_k..(tk + 1) * dims.top_k]
+            .iter()
+            .copied()
+            .collect();
         let theirs_t: BTreeSet<usize> = ref_idx[tk * dims.top_k..(tk + 1) * dims.top_k]
             .iter()
             .map(|&x| x as usize)
@@ -1433,11 +1553,18 @@ fn run_layer(
     // and a swap can only ever involve the smallest — is at most 1/k of the
     // total; allowing for both members of the pair and for the expert output
     // exceeding the block's own scale, 4/k relative is the bound.
-    let routing_term = if c_flips > 0 { 4.0 / dims.top_k as f64 } else { 0.0 };
+    let routing_term = if c_flips > 0 {
+        4.0 / dims.top_k as f64
+    } else {
+        0.0
+    };
     check_moe_stages(r, p, &tag, "casc", bt, dims, 2, routing_term, true);
 
-    let meta: BTreeSet<usize> =
-        p.i64(&format!("meta_expert_ids_{tag}")).into_iter().map(|v| v as usize).collect();
+    let meta: BTreeSet<usize> = p
+        .i64(&format!("meta_expert_ids_{tag}"))
+        .into_iter()
+        .map(|v| v as usize)
+        .collect();
     let mine: BTreeSet<usize> = fetched.iter().copied().collect();
     // What is left here is only what a broken port could actually violate.
     // The previous version asserted every "extra" expert traces to a flipped
@@ -1452,8 +1579,10 @@ fn run_layer(
     // run plus what the flipped tokens' set differences can introduce.
     let mut symdiff_total = 0usize;
     for &tk in &c_flipped {
-        let mine_t: BTreeSet<usize> =
-            bt.routing.topk_idx[tk * dims.top_k..(tk + 1) * dims.top_k].iter().copied().collect();
+        let mine_t: BTreeSet<usize> = bt.routing.topk_idx[tk * dims.top_k..(tk + 1) * dims.top_k]
+            .iter()
+            .copied()
+            .collect();
         let theirs_t: BTreeSet<usize> = ref_idx[tk * dims.top_k..(tk + 1) * dims.top_k]
             .iter()
             .map(|&x| x as usize)
@@ -1486,8 +1615,7 @@ fn run_layer(
         "cascade: THE WHOLE LAYER, layer_in -> layer_out",
         &vec_of(tr.out.clone()),
         &layer_out_ref,
-        bf16_budget(attn_n + 8, absmax(&layer_out_ref))
-            + routing_term * absmax(&moe_out_ref),
+        bf16_budget(attn_n + 8, absmax(&layer_out_ref)) + routing_term * absmax(&moe_out_ref),
         None,
     );
     // A boundary layer PUSHES a snapshot; a non-boundary one must not. Checking
@@ -1514,7 +1642,11 @@ fn run_layer(
         // snapshot last.
         let out_flat = p.bf16(&format!("{tag}_blockres_out_bf16bits"));
         let oshape = p.shape(&format!("{tag}_blockres_out_bf16bits"));
-        assert_eq!(oshape, vec![tokens, want_len, hidden], "{tag}_blockres_out shape");
+        assert_eq!(
+            oshape,
+            vec![tokens, want_len, hidden],
+            "{tag}_blockres_out shape"
+        );
         let last = want_len - 1;
         let mut want_snap = Vec::with_capacity(tokens * hidden);
         for tok in 0..tokens {
@@ -1529,10 +1661,19 @@ fn run_layer(
              is the raw layer input and nothing in this layer reads it back, so a wrong \
              snapshot stays invisible until the next boundary twelve layers on",
             c.max_abs == 0.0,
-            format!("max|d| {:.4e}, {:.4}% bit-exact over {} elems", c.max_abs, c.exact_frac * 100.0, c.n),
+            format!(
+                "max|d| {:.4e}, {:.4}% bit-exact over {} elems",
+                c.max_abs,
+                c.exact_frac * 100.0,
+                c.n
+            ),
         );
     }
-    println!("         (cascade forward: {:.1} s, {} experts)", elapsed.as_secs_f64(), fetched.len());
+    println!(
+        "         (cascade forward: {:.1} s, {} experts)",
+        elapsed.as_secs_f64(),
+        fetched.len()
+    );
 
     // ---- the same cascade with the SHIPPED routing pinned ----------------
     //
@@ -1580,7 +1721,10 @@ fn run_layer(
         bf16_budget(attn_n + 10, absmax(&layer_out_ref)),
         None,
     );
-    println!("         (pinned-routing MoE: {:.1} s)", t_pin.elapsed().as_secs_f64());
+    println!(
+        "         (pinned-routing MoE: {:.1} s)",
+        t_pin.elapsed().as_secs_f64()
+    );
 
     // =====================================================================
     // NEGATIVE CONTROLS and INVARIANCES
@@ -1590,14 +1734,18 @@ fn run_layer(
         &format!("{tag}/neg.attnres_sa_normalised"),
         "NEGATIVE: combining the NORMALISED candidates instead of the raw ones must not \
          reproduce the mixture",
-        &p.bf16(&format!("{tag}_attnres_sa_ALT_out_combine_normalized_bf16bits")),
+        &p.bf16(&format!(
+            "{tag}_attnres_sa_ALT_out_combine_normalized_bf16bits"
+        )),
         &sa_out_ref,
         CONTROL_MARGIN * bf16_budget(2, absmax(&sa_out_ref)),
     );
     r.must_differ(
         &format!("{tag}/neg.attnres_mlp_normalised"),
         "NEGATIVE: same for the MLP-side mixture",
-        &p.bf16(&format!("{tag}_attnres_mlp_ALT_out_combine_normalized_bf16bits")),
+        &p.bf16(&format!(
+            "{tag}_attnres_mlp_ALT_out_combine_normalized_bf16bits"
+        )),
         &mlp_out_ref,
         CONTROL_MARGIN * bf16_budget(2, absmax(&mlp_out_ref)),
     );
@@ -1613,7 +1761,10 @@ fn run_layer(
         bf16_budget(2, absmax(&sa_out_ref)),
         None,
     );
-    let v_first = stack_candidates(&[t2v(layer_in.clone(), tokens, hidden, dev)], bank[0].clone());
+    let v_first = stack_candidates(
+        &[t2v(layer_in.clone(), tokens, hidden, dev)],
+        bank[0].clone(),
+    );
     r.must_differ(
         &format!("{tag}/neg.stack_order"),
         "NEGATIVE: the candidate STACK with the accumulator first is measurably not the \
@@ -1626,7 +1777,9 @@ fn run_layer(
         &format!("{tag}/neg.router_weight_source"),
         "NEGATIVE: taking the combining weight from the BIASED score must not reproduce \
          the shipped topk_weight",
-        &p.f32(&format!("{tag}_moe_router_ALT_topk_weight_from_scores_for_choice")),
+        &p.f32(&format!(
+            "{tag}_moe_router_ALT_topk_weight_from_scores_for_choice"
+        )),
         &ref_w,
         1e-4,
     );
@@ -1686,7 +1839,11 @@ fn run_layer(
         &format!("{tag}/neg.wrong_layer_attnres"),
         "NEGATIVE: the AttnRes site of the OTHER gated layer must not reproduce this \
          layer's mixture — the score weight is a per-layer weight and it is checked as one",
-        &vec_of(wrong_res.mix(stack_candidates(&bank, t2v(layer_in, tokens, hidden, dev))).out),
+        &vec_of(
+            wrong_res
+                .mix(stack_candidates(&bank, t2v(layer_in, tokens, hidden, dev)))
+                .out,
+        ),
         &sa_out_ref,
         CONTROL_MARGIN * bf16_budget(2, absmax(&sa_out_ref)),
     );
@@ -1706,7 +1863,10 @@ fn run_layer(
 /// exactly that mistake; `S7` now shows the fix failing on the bug.
 fn absmax_where(v: &[f32], allowed: &[bool]) -> f64 {
     assert_eq!(v.len(), allowed.len(), "absmax_where: length mismatch");
-    assert!(allowed.iter().any(|&a| a), "absmax_where: nothing is allowed");
+    assert!(
+        allowed.iter().any(|&a| a),
+        "absmax_where: nothing is allowed"
+    );
     v.iter()
         .zip(allowed)
         .filter(|(_, &a)| a)
@@ -1795,7 +1955,10 @@ fn run_mla_tf(
         2,
         Some(EXACT_FRAC_WIDE_GEMM),
     );
-    let q_a_ln_in = t3(p.bf16(&format!("{tag}_attn_q_a_layernorm_in_bf16bits")), c.q_lora_rank.unwrap());
+    let q_a_ln_in = t3(
+        p.bf16(&format!("{tag}_attn_q_a_layernorm_in_bf16bits")),
+        c.q_lora_rank.unwrap(),
+    );
     one(
         r,
         p,
@@ -1807,7 +1970,10 @@ fn run_mla_tf(
         2,
         Some(EXACT_FRAC_REDUCTION),
     );
-    let q_b_in = t3(p.bf16(&format!("{tag}_attn_q_b_proj_in_bf16bits")), c.q_lora_rank.unwrap());
+    let q_b_in = t3(
+        p.bf16(&format!("{tag}_attn_q_b_proj_in_bf16bits")),
+        c.q_lora_rank.unwrap(),
+    );
     let q_b_out_ref = p.bf16(&format!("{tag}_attn_q_b_proj_out_bf16bits"));
     one(
         r,
@@ -1838,7 +2004,10 @@ fn run_mla_tf(
         &vec_of(m.kv_latent(kv_a_out_t.clone())),
         &p.bf16(&format!("{tag}_attn_kv_a_layernorm_in_bf16bits")),
     );
-    let kv_a_ln_in = t3(p.bf16(&format!("{tag}_attn_kv_a_layernorm_in_bf16bits")), c.kv_lora_rank);
+    let kv_a_ln_in = t3(
+        p.bf16(&format!("{tag}_attn_kv_a_layernorm_in_bf16bits")),
+        c.kv_lora_rank,
+    );
     one(
         r,
         p,
@@ -1849,7 +2018,10 @@ fn run_mla_tf(
         2,
         Some(EXACT_FRAC_REDUCTION),
     );
-    let kv_b_in = t3(p.bf16(&format!("{tag}_attn_kv_b_proj_in_bf16bits")), c.kv_lora_rank);
+    let kv_b_in = t3(
+        p.bf16(&format!("{tag}_attn_kv_b_proj_in_bf16bits")),
+        c.kv_lora_rank,
+    );
     let kv_b_out_ref = p.bf16(&format!("{tag}_attn_kv_b_proj_out_bf16bits"));
     one(
         r,
@@ -1892,15 +2064,33 @@ fn run_mla_tf(
 
     // Scores, from the captured query/key states. Compared only where the mask
     // allows; the masked positions must be exactly the sentinel.
-    let q_ref = t4(p.bf16(&format!("{tag}_mla_query_states_bf16bits")), h, seq, qh);
-    let k_ref = t4(p.bf16(&format!("{tag}_mla_key_states_bf16bits")), h, seq, qh);
+    let q_ref = t4(
+        p.bf16(&format!("{tag}_mla_query_states_bf16bits")),
+        h,
+        seq,
+        qh,
+    );
+    let k_ref = t4(
+        p.bf16(&format!("{tag}_mla_key_states_bf16bits")),
+        h,
+        seq,
+        qh,
+    );
     let scores = vec_of(m.attn_scores(q_ref, k_ref, Some(mask.clone())));
     let scores_ref = p.bf16(&format!("{tag}_mla_attn_scores_precast_bf16bits"));
     let score_scale = absmax_where(&scores_ref, &allowed);
-    let s_allowed: Vec<f32> =
-        scores.iter().zip(&allowed).filter(|(_, &a)| a).map(|(&x, _)| x).collect();
-    let s_ref_allowed: Vec<f32> =
-        scores_ref.iter().zip(&allowed).filter(|(_, &a)| a).map(|(&x, _)| x).collect();
+    let s_allowed: Vec<f32> = scores
+        .iter()
+        .zip(&allowed)
+        .filter(|(_, &a)| a)
+        .map(|(&x, _)| x)
+        .collect();
+    let s_ref_allowed: Vec<f32> = scores_ref
+        .iter()
+        .zip(&allowed)
+        .filter(|(_, &a)| a)
+        .map(|(&x, _)| x)
+        .collect();
     let score_budget = bf16_budget(3, score_scale);
     r.close(
         &format!("{tag}/tf.mla.scores"),
@@ -1911,10 +2101,18 @@ fn run_mla_tf(
         score_budget,
         None,
     );
-    let s_masked: Vec<f32> =
-        scores.iter().zip(&allowed).filter(|(_, &a)| !a).map(|(&x, _)| x).collect();
-    let s_ref_masked: Vec<f32> =
-        scores_ref.iter().zip(&allowed).filter(|(_, &a)| !a).map(|(&x, _)| x).collect();
+    let s_masked: Vec<f32> = scores
+        .iter()
+        .zip(&allowed)
+        .filter(|(_, &a)| !a)
+        .map(|(&x, _)| x)
+        .collect();
+    let s_ref_masked: Vec<f32> = scores_ref
+        .iter()
+        .zip(&allowed)
+        .filter(|(_, &a)| !a)
+        .map(|(&x, _)| x)
+        .collect();
     r.exact(
         &format!("{tag}/tf.mla.scores_masked"),
         "at the DISALLOWED positions the score is bit-exactly the shipped sentinel — \
@@ -1948,8 +2146,18 @@ fn run_mla_tf(
         1,
         Some(EXACT_FRAC_ELEMENTWISE),
     );
-    let probs_ref = t4(p.bf16(&format!("{tag}_mla_attn_probs_bf16bits")), h, seq, seq);
-    let v_ref = t4(p.bf16(&format!("{tag}_mla_value_states_bf16bits")), h, seq, dv);
+    let probs_ref = t4(
+        p.bf16(&format!("{tag}_mla_attn_probs_bf16bits")),
+        h,
+        seq,
+        seq,
+    );
+    let v_ref = t4(
+        p.bf16(&format!("{tag}_mla_value_states_bf16bits")),
+        h,
+        seq,
+        dv,
+    );
     one(
         r,
         p,
@@ -1970,7 +2178,12 @@ fn run_mla_tf(
         2,
         Some(EXACT_FRAC_WIDE_GEMM),
     );
-    let heads_ref = t4(p.bf16(&format!("{tag}_mla_attn_out_heads_bf16bits")), seq, h, dv);
+    let heads_ref = t4(
+        p.bf16(&format!("{tag}_mla_attn_out_heads_bf16bits")),
+        seq,
+        h,
+        dv,
+    );
     let g_ref = t3(p.bf16(&format!("{tag}_attn_g_proj_out_bf16bits")), h * dv);
     one(
         r,
@@ -1996,7 +2209,10 @@ fn run_mla_tf(
     );
 
     // ---- and the whole block, composed -----------------------------------
-    let x3b = t3(p.bf16(&format!("{tag}_input_layernorm_out_bf16bits")), hidden);
+    let x3b = t3(
+        p.bf16(&format!("{tag}_input_layernorm_out_bf16bits")),
+        hidden,
+    );
     let tr = m.forward(x3b, Some(mask), None);
     one(
         r,
@@ -2055,12 +2271,42 @@ fn run_kda_tf(
 
     // ---- the projections, from input_layernorm's captured output ---------
     for (name, w, key, ex) in [
-        ("q_proj", &k.w.q_proj, "attn_q_proj_out_bf16bits", EXACT_FRAC_WIDE_GEMM),
-        ("k_proj", &k.w.k_proj, "attn_k_proj_out_bf16bits", EXACT_FRAC_WIDE_GEMM),
-        ("v_proj", &k.w.v_proj, "attn_v_proj_out_bf16bits", EXACT_FRAC_WIDE_GEMM),
-        ("f_a_proj", &k.w.f_a_proj, "attn_f_a_proj_out_bf16bits", EXACT_FRAC_WIDE_GEMM),
-        ("b_proj", &k.w.b_proj, "attn_b_proj_out_bf16bits", EXACT_FRAC_WIDE_GEMM),
-        ("g_proj", &k.w.g_proj, "attn_g_proj_out_bf16bits", EXACT_FRAC_WIDE_GEMM),
+        (
+            "q_proj",
+            &k.w.q_proj,
+            "attn_q_proj_out_bf16bits",
+            EXACT_FRAC_WIDE_GEMM,
+        ),
+        (
+            "k_proj",
+            &k.w.k_proj,
+            "attn_k_proj_out_bf16bits",
+            EXACT_FRAC_WIDE_GEMM,
+        ),
+        (
+            "v_proj",
+            &k.w.v_proj,
+            "attn_v_proj_out_bf16bits",
+            EXACT_FRAC_WIDE_GEMM,
+        ),
+        (
+            "f_a_proj",
+            &k.w.f_a_proj,
+            "attn_f_a_proj_out_bf16bits",
+            EXACT_FRAC_WIDE_GEMM,
+        ),
+        (
+            "b_proj",
+            &k.w.b_proj,
+            "attn_b_proj_out_bf16bits",
+            EXACT_FRAC_WIDE_GEMM,
+        ),
+        (
+            "g_proj",
+            &k.w.g_proj,
+            "attn_g_proj_out_bf16bits",
+            EXACT_FRAC_WIDE_GEMM,
+        ),
     ] {
         one(
             r,
@@ -2090,7 +2336,9 @@ fn run_kda_tf(
     );
 
     // ---- the weights the recurrence needs, from the checkpoint bytes -----
-    let (_, a_full) = ck.f32(&format!("language_model.model.layers.{layer}.self_attn.A_log"));
+    let (_, a_full) = ck.f32(&format!(
+        "language_model.model.layers.{layer}.self_attn.A_log"
+    ));
     let a_live = a_full[..cfg.num_heads].to_vec();
     r.exact(
         &format!("{tag}/w.a_log"),
@@ -2099,7 +2347,9 @@ fn run_kda_tf(
         &a_live,
         &p.f32(&format!("{tag}_kda_in_A_log")),
     );
-    let (_, dt_bias) = ck.f32(&format!("language_model.model.layers.{layer}.self_attn.dt_bias"));
+    let (_, dt_bias) = ck.f32(&format!(
+        "language_model.model.layers.{layer}.self_attn.dt_bias"
+    ));
     r.exact(
         &format!("{tag}/w.dt_bias"),
         "dt_bias read from the checkpoint bytes equals the shipped kernel's, bit for bit",
@@ -2181,7 +2431,8 @@ fn run_kda_tf(
         "the shipped chunk_kda call fuses the q/k L2-norm, the gate and the beta sigmoid, \
          with a safe gate at lower_bound -5.0 — which is why this port performs all three \
          inside its own step and why KdaConfig carries gate_lower_bound",
-        flags.iter().all(|&f| f == 1) && flags.len() == 6
+        flags.iter().all(|&f| f == 1)
+            && flags.len() == 6
             && (lb - cfg.gate_lower_bound.expect("K3 bounds its gate")).abs() < 1e-12,
         format!("flags {flags:?}, lower_bound {lb}"),
     );
@@ -2190,9 +2441,21 @@ fn run_kda_tf(
     let mut cache = KdaCache::zeros(k, batch);
     let tr = k.forward(hidden_in, &mut cache);
     for (name, got, key) in [
-        ("q_conv1d", tr.q_conv_out.clone(), "attn_q_conv1d_out0_bf16bits"),
-        ("k_conv1d", tr.k_conv_out.clone(), "attn_k_conv1d_out0_bf16bits"),
-        ("v_conv1d", tr.v_conv_out.clone(), "attn_v_conv1d_out0_bf16bits"),
+        (
+            "q_conv1d",
+            tr.q_conv_out.clone(),
+            "attn_q_conv1d_out0_bf16bits",
+        ),
+        (
+            "k_conv1d",
+            tr.k_conv_out.clone(),
+            "attn_k_conv1d_out0_bf16bits",
+        ),
+        (
+            "v_conv1d",
+            tr.v_conv_out.clone(),
+            "attn_v_conv1d_out0_bf16bits",
+        ),
     ] {
         one(
             r,
@@ -2290,18 +2553,27 @@ fn lane_cross(r: &mut Report, p: &Oracle, ck: &Ckpt, dims: &MoeDims, dev: &Dev, 
     rc.top_k = dims.top_k;
     rc.renormalize = dims.moe_renormalize;
     rc.routed_scaling_factor = dims.routed_scaling_factor as f32;
-    let slice_router =
-        Router::new(rc, vec_of(w.router.weight.clone()), vec_of(w.router.bias.clone()))
-            .expect("Router::new");
+    let slice_router = Router::new(
+        rc,
+        vec_of(w.router.weight.clone()),
+        vec_of(w.router.bias.clone()),
+    )
+    .expect("Router::new");
     let slice_routing = slice_router.route(&hin, tokens, Accum::F32);
 
     let k = dims.top_k;
     let mut same = true;
     let mut wmax = 0f64;
     for tk in 0..tokens {
-        let a: BTreeSet<usize> =
-            burn_routing.topk_idx[tk * k..(tk + 1) * k].iter().copied().collect();
-        let b: BTreeSet<usize> = slice_routing.idx_row(tk).iter().map(|&x| x as usize).collect();
+        let a: BTreeSet<usize> = burn_routing.topk_idx[tk * k..(tk + 1) * k]
+            .iter()
+            .copied()
+            .collect();
+        let b: BTreeSet<usize> = slice_routing
+            .idx_row(tk)
+            .iter()
+            .map(|&x| x as usize)
+            .collect();
         same &= a == b && a.len() == k;
         for j in 0..k {
             let id = burn_routing.topk_idx[tk * k + j] as u32;
@@ -2326,13 +2598,18 @@ fn lane_cross(r: &mut Report, p: &Oracle, ck: &Ckpt, dims: &MoeDims, dev: &Dev, 
         format!("{tokens} tokens x top-{k}, max |dw| = {wmax:.3e}"),
     );
 
-    let (ws, wv) =
-        ck.bf16(&format!("language_model.model.layers.{layer}.self_attn.g_proj.weight"));
+    let (ws, wv) = ck.bf16(&format!(
+        "language_model.model.layers.{layer}.self_attn.g_proj.weight"
+    ));
     let cols = 8usize;
     let x = &hin[..4 * dims.hidden_size];
     let want = host_f64_matmul(x, 4, dims.hidden_size, &wv, cols);
     let sub = t2v(wv[..cols * ws[1]].to_vec(), cols, ws[1], dev);
-    let got = vec_of(linear(t2v(x.to_vec(), 4, dims.hidden_size, dev), &sub, ActRound::None));
+    let got = vec_of(linear(
+        t2v(x.to_vec(), 4, dims.hidden_size, dev),
+        &sub,
+        ActRound::None,
+    ));
     let wantf: Vec<f32> = want.iter().map(|&v| v as f32).collect();
     r.close(
         "X2",
@@ -2344,7 +2621,9 @@ fn lane_cross(r: &mut Report, p: &Oracle, ck: &Ckpt, dims: &MoeDims, dev: &Dev, 
         None,
     );
 
-    let gain: Vec<f32> = (0..dims.hidden_size).map(|i| 0.5 + (i % 7) as f32 * 0.1).collect();
+    let gain: Vec<f32> = (0..dims.hidden_size)
+        .map(|i| 0.5 + (i % 7) as f32 * 0.1)
+        .collect();
     let mut want_n = vec![0f32; 4 * dims.hidden_size];
     for row in 0..4 {
         let s = &x[row * dims.hidden_size..(row + 1) * dims.hidden_size];
@@ -2421,8 +2700,10 @@ fn lane_model(
     let hidden = t.hidden_size;
     assert_eq!(ids.len(), tokens, "model_input_ids length");
 
-    println!("
-== M: the whole {n_layers}-layer prefix, token ids -> hidden ==");
+    println!(
+        "
+== M: the whole {n_layers}-layer prefix, token ids -> hidden =="
+    );
 
     // ---- embed_tokens ---------------------------------------------------
     //
@@ -2472,11 +2753,19 @@ fn lane_model(
         let attn = match t.attn_kind(layer) {
             AttnKind::Mla => {
                 let mc = MlaConfig::from_text_config(t).expect("MlaConfig");
-                K3Attn::Mla(Box::new(MlaBlock::new(mc.clone(), ck.mla_weights::<B>(layer, &mc, dev), Precision::Bf16)))
+                K3Attn::Mla(Box::new(MlaBlock::new(
+                    mc.clone(),
+                    ck.mla_weights::<B>(layer, &mc, dev),
+                    Precision::Bf16,
+                )))
             }
             AttnKind::Kda => {
                 let kc = KdaAttnConfig::from_text_config(t).expect("KdaAttnConfig");
-                K3Attn::Kda(Box::new(KdaAttention::new(kc.clone(), ck.kda_weights::<B>(layer, &kc, dev), ActRound::Bf16)))
+                K3Attn::Kda(Box::new(KdaAttention::new(
+                    kc.clone(),
+                    ck.kda_weights::<B>(layer, &kc, dev),
+                    ActRound::Bf16,
+                )))
             }
         };
         let ffn = if t.is_moe_layer(layer) {
@@ -2510,14 +2799,21 @@ fn lane_model(
             "the depth bank holds exactly the snapshots the schedule takes through this \
              layer — a snapshot on the wrong layer is structural and shows here",
             mixer.bank().len() == want_bank,
-            format!("{} snapshots, schedule takes {want_bank} through layer {layer}", mixer.bank().len()),
+            format!(
+                "{} snapshots, schedule takes {want_bank} through layer {layer}",
+                mixer.bank().len()
+            ),
         );
 
         let want = p.bf16(&format!("L{layer:02}_layer_out_bf16bits"));
         let got = vec_of(hs.clone());
         let c = compare(&got, &want);
         let scale = absmax(&want);
-        rel.push(if scale > 0.0 { c.max_abs / scale } else { f64::INFINITY });
+        rel.push(if scale > 0.0 {
+            c.max_abs / scale
+        } else {
+            f64::INFINITY
+        });
         // 8 ulps per layer, accumulated. Stated up front rather than fitted to
         // what the run produced; if the real accumulation does not fit, that is
         // a measurement worth having and not a number to widen.
@@ -2564,7 +2860,11 @@ fn lane_model(
     let mut worst = (0usize, 1.0f64);
     for l in 1..rel.len() {
         let prev = rel[l - 1];
-        let ratio = if prev > 0.0 { rel[l] / prev } else { f64::INFINITY };
+        let ratio = if prev > 0.0 {
+            rel[l] / prev
+        } else {
+            f64::INFINITY
+        };
         if ratio > worst.1 {
             worst = (l, ratio);
         }
@@ -2611,8 +2911,10 @@ fn lane_decode(
 ) -> usize {
     let before = r.checks.len();
     let t = &cfg.text_config;
-    println!("
-== D: chunked decode against a single pass ==");
+    println!(
+        "
+== D: chunked decode against a single pass =="
+    );
 
     for &layer in layers {
         let tag = format!("L{layer:02}");
@@ -2631,7 +2933,10 @@ fn lane_decode(
                 let blk = KdaAttention::new(kc, w, ActRound::Bf16);
 
                 let mut c_all = KdaCache::zeros(&blk, batch);
-                let whole = vec_of(blk.forward(t2v(x.clone(), tokens, hidden, dev), &mut c_all).out);
+                let whole = vec_of(
+                    blk.forward(t2v(x.clone(), tokens, hidden, dev), &mut c_all)
+                        .out,
+                );
 
                 // one token at a time, state carried across `seq` calls
                 let mut c_step = KdaCache::zeros(&blk, batch);
@@ -2647,8 +2952,7 @@ fn lane_decode(
                 for (ti, s) in stepped.iter().enumerate() {
                     for b in 0..batch {
                         let dst = (b * seq + ti) * hidden;
-                        got[dst..dst + hidden]
-                            .copy_from_slice(&s[b * hidden..(b + 1) * hidden]);
+                        got[dst..dst + hidden].copy_from_slice(&s[b * hidden..(b + 1) * hidden]);
                     }
                 }
                 r.exact(
@@ -2725,18 +3029,22 @@ fn lane_decode(
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let oracle_arg = args.get(1).cloned().or_else(|| std::env::var("K3_ORACLE_DIR").ok());
-    let oracle_dir = mary::paths::model(oracle_arg.as_deref(), "k3-oracle")
-        .unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(2)
-        });
-    let model_arg = args.get(2).cloned().or_else(|| std::env::var("K3_MODEL_DIR").ok());
-    let model_dir = mary::paths::model(model_arg.as_deref(), "kimi-k3")
-        .unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(2)
-        });
+    let oracle_arg = args
+        .get(1)
+        .cloned()
+        .or_else(|| std::env::var("K3_ORACLE_DIR").ok());
+    let oracle_dir = mary::paths::model(oracle_arg.as_deref(), "k3-oracle").unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
+    let model_arg = args
+        .get(2)
+        .cloned()
+        .or_else(|| std::env::var("K3_MODEL_DIR").ok());
+    let model_dir = mary::paths::model(model_arg.as_deref(), "kimi-k3").unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
     let dev: Dev = Default::default();
     let t_start = Instant::now();
 
@@ -2764,7 +3072,11 @@ fn main() {
 
     let before = r.checks.len();
     lane_premises(&mut r, &ck, &cfg, &oracle_dir);
-    assert_eq!(r.checks.len() - before, N_PREMISES, "the P lane changed size");
+    assert_eq!(
+        r.checks.len() - before,
+        N_PREMISES,
+        "the P lane changed size"
+    );
 
     println!("\n== O: the oracle bundle ==");
     r.boolean(
@@ -2799,13 +3111,17 @@ fn main() {
     let n_model = if std::env::var("K3_MODEL_LANE").is_ok() {
         lane_model(&mut r, &p, &ck, &cfg, &dims, &dev)
     } else {
-        println!("
-== M: skipped (set K3_MODEL_LANE=1 for the whole-prefix chain) ==");
+        println!(
+            "
+== M: skipped (set K3_MODEL_LANE=1 for the whole-prefix chain) =="
+        );
         0
     };
 
-    println!("
-== X: cross-implementation, no oracle involved ==");
+    println!(
+        "
+== X: cross-implementation, no oracle involved =="
+    );
     let before = r.checks.len();
     lane_cross(&mut r, &p, &ck, &dims, &dev, 4);
     assert_eq!(r.checks.len() - before, N_CROSS, "the X lane changed size");
@@ -2820,10 +3136,16 @@ fn main() {
     });
     let per_layer_desc: Vec<String> = per_layer
         .iter()
-        .map(|(l, res)| format!("L{l:02}:{}({}+{})", res.checks, res.checks - res.attn_checks, res.attn_checks))
+        .map(|(l, res)| {
+            format!(
+                "L{l:02}:{}({}+{})",
+                res.checks,
+                res.checks - res.attn_checks,
+                res.attn_checks
+            )
+        })
         .collect();
-    let derived =
-        N_SELFTEST + N_PREMISES + N_ORACLE + N_CROSS + sum_layers + n_model + n_decode;
+    let derived = N_SELFTEST + N_PREMISES + N_ORACLE + N_CROSS + sum_layers + n_model + n_decode;
     r.boolean(
         "Z1",
         "the check count is the sum of the lane counts, and each gated layer contributed \
@@ -2866,7 +3188,10 @@ fn main() {
         }
     }
     for (l, res) in &per_layer {
-        println!("\n  L{l:02}: {} checks, |layer_out|max = {:.4e}", res.checks, res.out_absmax);
+        println!(
+            "\n  L{l:02}: {} checks, |layer_out|max = {:.4e}",
+            res.checks, res.out_absmax
+        );
     }
 
     let fails = r.failures();
@@ -2875,7 +3200,11 @@ fn main() {
         println!("GATE PASSED — {} checks, 0 failures", r.checks.len());
         println!("wall clock: {:.1} s", t_start.elapsed().as_secs_f64());
     } else {
-        println!("GATE FAILED — {} checks, {} FAILURES", r.checks.len(), fails.len());
+        println!(
+            "GATE FAILED — {} checks, {} FAILURES",
+            r.checks.len(),
+            fails.len()
+        );
         for c in &fails {
             println!("  FAIL {}  {}\n       {}", c.id, c.what, c.detail);
         }

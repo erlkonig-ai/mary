@@ -106,7 +106,10 @@ fn time_read(
 }
 
 fn main() -> Result<()> {
-    let gib: f64 = std::env::var("INK_BW_GIB").ok().and_then(|v| v.parse().ok()).unwrap_or(8.0);
+    let gib: f64 = std::env::var("INK_BW_GIB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8.0);
     let shard = mary::paths::model(
         std::env::var("INK_BW_SHARD").ok().as_deref(),
         "thinkingmachines-inkling-small-nvfp4/model-00005-of-00009.safetensors",
@@ -120,7 +123,10 @@ fn main() -> Result<()> {
 
     let client = Rt::client(&Default::default());
     println!("=== read bandwidth, one streamed pass ===");
-    println!("  working set     {:.2} GiB  ({n_f32} f32)", bytes as f64 / GIB);
+    println!(
+        "  working set     {:.2} GiB  ({n_f32} f32)",
+        bytes as f64 / GIB
+    );
     println!("  the LPDDR5X bus here is ~273 GB/s; anything above it is cache, not memory");
     println!(
         "  device can address host memory directly : {}",
@@ -199,8 +205,11 @@ fn main() -> Result<()> {
             bytes as f64 / pf / 1e9
         );
         let c3 = time_read(&client, &h2, n_f32);
-        println!("  same region, 2nd GPU pass                  {:8.1} GB/s   {:8.1} ms",
-                 bytes as f64 / c3 / 1e9, c3 * 1e3);
+        println!(
+            "  same region, 2nd GPU pass                  {:8.1} GB/s   {:8.1} ms",
+            bytes as f64 / c3 / 1e9,
+            c3 * 1e3
+        );
     }
 
     // ---- host-mapped, WARM -------------------------------------------------

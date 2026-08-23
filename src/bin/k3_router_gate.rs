@@ -96,16 +96,14 @@ const EXPECTED_F32_BIAS_DIVERGENT_TOKENS: usize = 6;
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
-    let dir = mary::paths::model(args.next().as_deref(), "k3-oracle")
-        .unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(2)
-        });
-    let model = mary::paths::model(args.next().as_deref(), "kimi-k3")
-        .unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(2)
-        });
+    let dir = mary::paths::model(args.next().as_deref(), "k3-oracle").unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
+    let model = mary::paths::model(args.next().as_deref(), "kimi-k3").unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
     println!("Kimi K3 MoE router gate");
     println!("  oracle vectors : {}", dir.display());
     println!("  checkpoint     : {}", model.display());
@@ -252,7 +250,11 @@ fn compare(mine: &[f32], reference: &[f64]) -> Cmp {
     if first_bad != usize::MAX {
         at = first_bad;
     }
-    let rel = if refmax > 0.0 { maxabs / refmax } else { maxabs };
+    let rel = if refmax > 0.0 {
+        maxabs / refmax
+    } else {
+        maxabs
+    };
     Cmp {
         maxabs,
         refmax,
@@ -488,12 +490,19 @@ fn check_shipping_config(r: &mut Report, config_json: &Path) {
         "config: moe_router_activation_func",
         text("moe_router_activation_func") == Some("sigmoid")
             && cfg.activation == RouterActivation::Sigmoid,
-        &format!("checkpoint {:?} vs port Sigmoid", text("moe_router_activation_func")),
+        &format!(
+            "checkpoint {:?} vs port Sigmoid",
+            text("moe_router_activation_func")
+        ),
     );
     r.expect_true(
         "config: moe_renormalize",
         flag("moe_renormalize") == Some(cfg.renormalize),
-        &format!("checkpoint {:?} vs port {}", flag("moe_renormalize"), cfg.renormalize),
+        &format!(
+            "checkpoint {:?} vs port {}",
+            flag("moe_renormalize"),
+            cfg.renormalize
+        ),
     );
     // The premise this task was handed says "topk_method noaux_tc". It is in
     // the config — and the shipped gate never reads it. Assert both halves.
@@ -511,7 +520,11 @@ fn check_shipping_config(r: &mut Report, config_json: &Path) {
     r.expect_true(
         "config: first_k_dense_replace = 1, so layer 0 has no router",
         num("first_k_dense_replace") == Some(1.0) && LAYERS[0] == 1,
-        &format!("first_k_dense_replace {:?}, first gated layer {}", num("first_k_dense_replace"), LAYERS[0]),
+        &format!(
+            "first_k_dense_replace {:?}, first gated layer {}",
+            num("first_k_dense_replace"),
+            LAYERS[0]
+        ),
     );
     r.expect_true(
         "port: the grouped-routing branch is refused, not faked",
@@ -577,11 +590,18 @@ fn check_artifact(r: &mut Report, w: &Npz, manifest: &serde_json::Value, oracle:
     println!("  -- the exported bias, independently produced, must equal the oracle's --");
     for &l in LAYERS.iter() {
         let mine = u16s(w, &key(l, "gate_bias_bf16bits"));
-        let theirs = u16s(oracle, &key(l, "moe_router_e_score_correction_bias_bf16bits"));
+        let theirs = u16s(
+            oracle,
+            &key(l, "moe_router_e_score_correction_bias_bf16bits"),
+        );
         r.expect_true(
             &format!("L{l:02} exported bias == oracle-captured bias (bit-for-bit)"),
             mine == theirs && mine.len() == 896,
-            &format!("{} values, {} differ", mine.len(), mine.iter().zip(theirs).filter(|(a, b)| a != b).count()),
+            &format!(
+                "{} values, {} differ",
+                mine.len(),
+                mine.iter().zip(theirs).filter(|(a, b)| a != b).count()
+            ),
         );
     }
     println!();
@@ -704,7 +724,10 @@ fn check_stages(r: &mut Report, o: &Npz, router: &Router, l: usize) {
         ),
     );
     r.expect_true(
-        &format!("L{l:02} topk indices distinct, in range, exactly {}", cfg.top_k),
+        &format!(
+            "L{l:02} topk indices distinct, in range, exactly {}",
+            cfg.top_k
+        ),
         idx_well_formed(&my_idx, cfg.top_k, cfg.num_experts, TOKENS),
         "16 distinct experts < 896 per token",
     );
@@ -851,11 +874,8 @@ fn check_controls(r: &mut Report, o: &Npz, router: &Router, l: usize) {
         .map(|(i, &x)| x as f32 + router.bias()[i % cfg.num_experts])
         .collect();
     let alt_scores = router.scores(&logits_plus_bias, TOKENS);
-    let alt_sfc = ScoresForChoice::from_raw(
-        alt_scores.as_slice().to_vec(),
-        TOKENS,
-        cfg.num_experts,
-    );
+    let alt_sfc =
+        ScoresForChoice::from_raw(alt_scores.as_slice().to_vec(), TOKENS, cfg.num_experts);
     let alt_idx = router.select(&alt_sfc);
     let ref_alt_idx = idx_u32(o, &key(l, "moe_router_ALT_topk_idx_bias_on_logits"));
     let (same_alt, n_alt) = set_equal_rows(&alt_idx, &ref_alt_idx, cfg.top_k);
@@ -865,7 +885,10 @@ fn check_controls(r: &mut Report, o: &Npz, router: &Router, l: usize) {
         &format!("{same_alt}/{n_alt} tokens agree"),
     );
     let (same_true, _) = set_equal_rows(&alt_idx, &ref_idx, cfg.top_k);
-    let pinned = f64s(o, &key(l, "moe_router_ALT_bias_on_logits_n_tokens_same_set"))[0] as usize;
+    let pinned = f64s(
+        o,
+        &key(l, "moe_router_ALT_bias_on_logits_n_tokens_same_set"),
+    )[0] as usize;
     r.expect_true(
         &format!("L{l:02} CONTROL bias-on-logits reroutes; count matches the oracle's"),
         same_true == pinned && same_true < TOKENS,
@@ -987,7 +1010,10 @@ fn swap_count(a: &[u32], b: &[u32], k: usize, n: usize) -> usize {
     let mut c = 0;
     for t in 0..n {
         let y: std::collections::BTreeSet<u32> = b[t * k..(t + 1) * k].iter().copied().collect();
-        c += a[t * k..(t + 1) * k].iter().filter(|e| !y.contains(e)).count();
+        c += a[t * k..(t + 1) * k]
+            .iter()
+            .filter(|e| !y.contains(e))
+            .count();
     }
     c
 }

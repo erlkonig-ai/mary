@@ -19,7 +19,7 @@
 //!     --test nomic_mm7b_preprocess_parity -- --nocapture
 
 use burn_ndarray::NdArray;
-use mary::models::qwen2_5_vl::preprocess::{PATCH_DIM, build_image_prompt, preprocess_image};
+use mary::models::qwen2_5_vl::preprocess::{build_image_prompt, preprocess_image, PATCH_DIM};
 use mary::nn::npy;
 use std::path::{Path, PathBuf};
 
@@ -136,10 +136,9 @@ fn embed_image_bytes_parity() {
     };
 
     let device = burn_ndarray::NdArrayDevice::default();
-    let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(Path::new(
-        &pile_path,
-    ))
-    .expect("load native model collection snapshot");
+    let (_, snapshot) =
+        mary::model_collection::load_sole_model_collection_local_latest(Path::new(&pile_path))
+            .expect("load native model collection snapshot");
     let map = mary::persist::load_nomic_mm7b_keymap_from_snapshot(snapshot)
         .expect("select and materialize the Nomic text + vision components");
     let w = KeymapW { map, device };

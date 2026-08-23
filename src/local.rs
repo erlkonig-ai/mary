@@ -13,7 +13,7 @@
 
 use crate::models::gemma::gemma4::config::Gemma4Config;
 use crate::models::gemma::gemma4::lm::GemmaLM;
-use crate::nn::backend::{B, BHalf, WgpuDevice};
+use crate::nn::backend::{BHalf, WgpuDevice, B};
 use burn::prelude::Backend;
 use std::path::Path;
 

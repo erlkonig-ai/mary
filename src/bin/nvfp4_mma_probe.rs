@@ -86,8 +86,12 @@ pub fn nv_mma<AB: Scalar, S: Scalar, NA: Size, NC: Size>(
     #[comptime] size_n: usize,
     #[comptime] scales_factor: usize,
 ) {
-    let def =
-        cmma::MmaDefinition::<AB, AB, f32>::new_scaled::<S>(16usize, 8usize, 64usize, scales_factor);
+    let def = cmma::MmaDefinition::<AB, AB, f32>::new_scaled::<S>(
+        16usize,
+        8usize,
+        64usize,
+        scales_factor,
+    );
     let lane = UNIT_POS_PLANE;
     let pack = AB::packing_factor();
 
@@ -176,7 +180,11 @@ impl Shard {
         file.read_exact(&mut buf).context("reading header")?;
         let header: serde_json::Value =
             serde_json::from_slice(&buf).context("parsing safetensors header")?;
-        Ok(Shard { file, data_start: 8 + n, header })
+        Ok(Shard {
+            file,
+            data_start: 8 + n,
+            header,
+        })
     }
 
     fn info(&self, name: &str) -> Result<(String, Vec<usize>, u64, u64)> {
@@ -192,7 +200,12 @@ impl Shard {
             .map(|v| v.as_u64().unwrap_or(0) as usize)
             .collect();
         let off = e["data_offsets"].as_array().context("data_offsets")?;
-        Ok((dtype, shape, off[0].as_u64().unwrap(), off[1].as_u64().unwrap()))
+        Ok((
+            dtype,
+            shape,
+            off[0].as_u64().unwrap(),
+            off[1].as_u64().unwrap(),
+        ))
     }
 
     /// Read `len` bytes at `offset` bytes into the tensor's own data region.
@@ -201,7 +214,8 @@ impl Shard {
         if offset + len as u64 > end - start {
             bail!("read of {len} at {offset} runs past tensor {name}");
         }
-        self.file.seek(SeekFrom::Start(self.data_start + start + offset))?;
+        self.file
+            .seek(SeekFrom::Start(self.data_start + start + offset))?;
         let mut buf = vec![0u8; len];
         self.file.read_exact(&mut buf)?;
         Ok(buf)
@@ -239,7 +253,13 @@ impl Row {
 
 const WEIGHT: &str = "model.llm.layers.10.mlp.experts.w13_weight";
 
-fn load_rows(dir: &Path, expert: usize, first_row: usize, n: usize, k: usize) -> Result<(Vec<Row>, f32)> {
+fn load_rows(
+    dir: &Path,
+    expert: usize,
+    first_row: usize,
+    n: usize,
+    k: usize,
+) -> Result<(Vec<Row>, f32)> {
     let wp = shard_of(dir, WEIGHT)?;
     let sp = shard_of(dir, &format!("{WEIGHT}.scale"))?;
     let s2p = shard_of(dir, &format!("{WEIGHT}.scale2"))?;
@@ -252,7 +272,10 @@ fn load_rows(dir: &Path, expert: usize, first_row: usize, n: usize, k: usize) ->
     let rows_per_expert = wshape[1];
     let bytes_per_row = wshape[2];
     if bytes_per_row * 2 < k {
-        bail!("requested k={k} exceeds stored row width {}", bytes_per_row * 2);
+        bail!(
+            "requested k={k} exceeds stored row width {}",
+            bytes_per_row * 2
+        );
     }
 
     let mut ss = Shard::open(&sp)?;
@@ -309,7 +332,11 @@ fn main() -> Result<()> {
     println!(
         "CubeCL reports the NVFP4 combination (e2m1x2 x e2m1x2 -> f32, e4m3 scales, \
          m16n8k64, scales_factor 4): {}",
-        if registered { "REGISTERED" } else { "NOT registered" }
+        if registered {
+            "REGISTERED"
+        } else {
+            "NOT registered"
+        }
     );
     if !registered {
         bail!("CubeCL does not advertise the NVFP4 scaled-MMA combination on this device");
@@ -320,7 +347,9 @@ fn main() -> Result<()> {
     // NVFP4 rows with genuine E4M3 block scales.
     let (a_rows, scale2) = load_rows(&dir, 0, 0, m, k)?;
     let (b_rows, scale2_b) = load_rows(&dir, 0, 64, n, k)?;
-    println!("loaded {m}x{k} A rows and {n}x{k} B rows from {WEIGHT} (expert 0), scale2 = {scale2:e}");
+    println!(
+        "loaded {m}x{k} A rows and {n}x{k} B rows from {WEIGHT} (expert 0), scale2 = {scale2:e}"
+    );
 
     // Host-side reference in f32, from the audited decode.
     let a_ref: Vec<Vec<f32>> = a_rows.iter().map(|r| r.decode(k, scale2)).collect();
