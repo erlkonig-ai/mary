@@ -1,4 +1,4 @@
-//! Strictly additive migration from Mary's legacy Repository model piles.
+//! Strictly additive migration from Mary's legacy branch-model piles.
 //!
 //! The legacy `main` branch remains authoritative, byte-for-byte evidence. A
 //! migration captures one exact branch head, checks out only that head's
@@ -13,23 +13,23 @@
 //!
 //! # Why this is a crate and not a `mary` module
 //!
-//! The migration is a bridge across the `Repository` -> `Collection` cutover,
-//! so it is the one place that must still speak the legacy `Repository` API.
-//! `mary` itself is past that cutover. Living outside the library — a separate
-//! package with its own lockfile and its own `[patch.crates-io]` table, not a
-//! workspace member sharing mary's — is what lets this crate later pin an
-//! older `triblespace` (and an older `mary`) once `Repository`/`PinStore` are
-//! dropped from the main line, so legacy piles stay migratable without the
-//! library carrying a shape that exists only for them.
+//! The migration is a one-way bridge across the legacy branch -> Collection
+//! cutover. `mary` itself is past that cutover, while TribleSpace retains only
+//! the read-only pin snapshot and branch/commit encodings required to inspect
+//! old piles. Keeping the bridge in a standalone package prevents those
+//! migration-only concepts from becoming runtime dependencies again.
 
 use std::collections::BTreeSet;
 
 use anyhow::{anyhow, bail, Context};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use triblespace::core::blob::{Blob, TryFromBlob};
+use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace::core::collection::{CollectionCommit, CollectionData};
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{ancestors, content, parent, BlobStore, CommitHandle, Repository};
+use triblespace::core::metadata;
+use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::{
+    self, content, parent, BlobStore, BlobStoreGet, CommitHandle, PinSnapshot, PinSnapshotSource,
+};
 use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::{Handle, ShortString};
 use triblespace::prelude::*;
@@ -97,6 +97,23 @@ pub struct LegacyModelMigrationResult {
     pub selector_facts_added: usize,
 }
 
+/// One immutable read of the active legacy `main` branch.
+///
+/// The pin snapshot is consumed only to choose `branch` and `head`. `facts`
+/// is then reconstructed from that exact head's ancestor closure through the
+/// returned append-only blob reader, so a concurrent later branch advance
+/// cannot widen the snapshot.
+pub struct FrozenLegacyMain {
+    /// Unique legacy branch carrying the name `main`.
+    pub branch: Id,
+    /// Exact signed branch head captured from the pin snapshot.
+    pub head: CommitHandle,
+    /// Union of every content archive reachable from `head`.
+    pub facts: TribleSet,
+    /// Immutable blob view resolving facts' attachment handles.
+    pub reader: PileReader,
+}
+
 /// Result of adopting the exact legacy PersonaPlex weight commit as one bundle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PersonaPlexLegacyAdoptionResult {
@@ -106,7 +123,7 @@ pub struct PersonaPlexLegacyAdoptionResult {
     pub published: bool,
     /// Team whose `mary-model-bundles` collection contains the token.
     pub team: VerifyingKey,
-    /// Exact legacy Repository commit selected by the caller.
+    /// Exact legacy commit-DAG node selected by the caller.
     pub legacy_commit: CommitHandle,
     /// Existing legacy LM model root selected by its exact file name.
     pub legacy_lm_root: Id,
@@ -137,53 +154,94 @@ const PERSONAPLEX_MEMBER_POLICY: PersonaPlexMemberPolicy = PersonaPlexMemberPoli
     total: PERSONAPLEX_MEMBERS,
 };
 
-fn freeze_legacy_main(
-    pile: &mut Pile,
-    signing_key: &SigningKey,
-) -> anyhow::Result<(Id, CommitHandle, TribleSet, <Pile as BlobStore>::Reader)> {
-    pile.refresh()
-        .context("refresh legacy model pile before freezing 'main'")?;
+fn freeze_legacy_main_from_snapshot(
+    reader: PileReader,
+    pins: &PinSnapshot,
+) -> anyhow::Result<FrozenLegacyMain> {
+    let wanted_name = "main".to_owned().to_blob().get_handle();
+    let mut matches = Vec::new();
 
-    // Mary's inspected legacy writers constructed Repository with empty
-    // commit metadata, so their target piles already contain this exact
-    // content-addressed archive and the put deduplicates. Repository itself
-    // permits other metadata; this migration surface is deliberately scoped
-    // to Mary's legacy model piles. In every case Repository::new neither
-    // creates nor advances a branch.
-    let mut repo = Repository::new(&mut *pile, signing_key.clone(), TribleSet::new())
-        .map_err(|error| anyhow!("open borrowed legacy repository view: {error}"))?;
-    let branch = repo
-        .lookup_branch("main")
-        .map_err(|error| anyhow!("lookup legacy 'main' branch: {error:?}"))?
-        .ok_or_else(|| anyhow!("legacy model pile has no 'main' branch"))?;
-    let mut workspace = repo
-        .pull(branch)
-        .map_err(|error| anyhow!("pull legacy 'main' branch: {error:?}"))?;
-    let head = workspace
-        .head()
-        .ok_or_else(|| anyhow!("legacy 'main' branch has no commits"))?;
+    for raw in pins.iter_ordered() {
+        let branch = Id::new(*raw).ok_or_else(|| anyhow!("legacy pin snapshot contains nil id"))?;
+        let metadata_handle = *pins
+            .get(raw)
+            .expect("an ordered pin-snapshot key has one value");
+        let metadata: TribleSet = reader
+            .get(metadata_handle)
+            .map_err(|error| anyhow!("read legacy branch {branch} metadata: {error}"))?;
+        let Ok(subject) = repo::branch::branch_entity(&metadata, branch) else {
+            // A legacy pin was a generic mechanism. Non-branch application
+            // pins are not candidates for Mary's named `main` branch.
+            continue;
+        };
 
-    // The captured head, not a moving branch name, is the checkout authority.
-    // A concurrent later branch advance therefore cannot widen this snapshot.
-    let facts = workspace
-        .checkout(ancestors(head))
-        .map_err(|error| anyhow!("checkout frozen legacy 'main' head: {error}"))?
-        .into_facts();
-    let reader = repo
-        .storage_mut()
+        let names: Vec<Inline<Handle<UTF8String>>> = metadata
+            .iter()
+            .filter(|fact| fact.e() == &subject && fact.a() == &metadata::name.id())
+            .map(|fact| *fact.v::<Handle<UTF8String>>())
+            .collect();
+        match names.as_slice() {
+            [name] if *name == wanted_name => matches.push((branch, subject, metadata)),
+            names if names.contains(&wanted_name) => {
+                bail!("legacy branch {branch} has ambiguous names including 'main'")
+            }
+            _ => {}
+        }
+    }
+
+    let (branch, subject, metadata) = match matches.len() {
+        0 => bail!("legacy model pile has no active 'main' branch"),
+        1 => matches.pop().expect("one legacy main match"),
+        count => bail!("legacy model pile has {count} active branches named 'main'"),
+    };
+    let heads: Vec<CommitHandle> = metadata
+        .iter()
+        .filter(|fact| fact.e() == &subject && fact.a() == &repo::head.id())
+        .map(|fact| *fact.v::<Handle<blobencodings::SimpleArchive>>())
+        .collect();
+    let head = match heads.as_slice() {
+        [] => bail!("legacy 'main' branch {branch} has no commits"),
+        [head] => *head,
+        _ => bail!("legacy 'main' branch {branch} has ambiguous heads"),
+    };
+
+    let head_blob: Blob<blobencodings::SimpleArchive> = reader
+        .get(head)
+        .map_err(|error| anyhow!("read legacy 'main' head {head:?}: {error}"))?;
+    repo::branch::verify(branch, head_blob, metadata)
+        .map_err(|_| anyhow!("legacy 'main' branch {branch} has an invalid head signature"))?;
+    let facts = checkout_legacy_commit_ancestors(&reader, head)
+        .with_context(|| format!("checkout frozen legacy 'main' head {head:?}"))?;
+
+    Ok(FrozenLegacyMain {
+        branch,
+        head,
+        facts,
+        reader,
+    })
+}
+
+/// Freeze the unique active legacy `main` branch without restoring a mutable
+/// repository surface.
+pub fn freeze_legacy_model_main(pile: &mut Pile) -> anyhow::Result<FrozenLegacyMain> {
+    // Freeze names first, then open one later append-only blob view. Every
+    // handle named by the point-in-time pin snapshot must predate that reader.
+    let pins = pile
+        .snapshot_pin_heads()
+        .context("snapshot active legacy branch pins")?;
+    let reader = pile
         .reader()
         .context("open blob reader for frozen legacy model snapshot")?;
-    Ok((branch, head, facts, reader))
+    freeze_legacy_main_from_snapshot(reader, &pins)
 }
 
 /// Check out exactly `commit` and its ancestors from one immutable blob view.
 ///
-/// This is the detached equivalent of `Workspace::checkout(ancestors(commit))`:
+/// This is the detached equivalent of the retired ancestor checkout:
 /// every reachable commit contributes its optional content archive, while a
 /// merge-only commit contributes no facts. It deliberately does not construct
-/// a `Repository` or `Workspace`, because both are branch-oriented surfaces and
-/// pulling one would make an otherwise resident exact commit depend on a live,
-/// well-formed branch pin.
+/// a branch-oriented workspace, because pulling one would make an otherwise
+/// resident exact commit depend on a live, well-formed branch pin.
 fn checkout_legacy_commit_ancestors(
     reader: &impl BlobStoreGet,
     commit: CommitHandle,
@@ -355,7 +413,7 @@ fn prepare_legacy_personaplex_candidate(
     })
 }
 
-/// Adopt one exact legacy PersonaPlex Repository commit as a signed model bundle.
+/// Adopt one exact legacy PersonaPlex commit-DAG node as a signed model bundle.
 ///
 /// The commit handle supplied by the caller is the only legacy history
 /// selector. The current `main` head cannot widen the checkout. Existing facts,
@@ -560,13 +618,41 @@ pub fn migrate_legacy_model_main(
     signing_key: &SigningKey,
     request: LegacyModelMigration<'_>,
 ) -> anyhow::Result<LegacyModelMigrationResult> {
-    let (legacy_branch, legacy_head, legacy, reader) = freeze_legacy_main(pile, signing_key)?;
-    let legacy_facts = legacy.len();
-    let projection = project_legacy_model_attributes(&legacy);
+    let pins = pile
+        .snapshot_pin_heads()
+        .context("snapshot active legacy branch pins")?;
+    migrate_legacy_model_main_from_snapshot(pile, signing_key, &pins, request)
+}
+
+/// Internal seam for frozen legacy fixtures and the production pin census.
+///
+/// Supplying the whole immutable snapshot keeps tests honest without
+/// reintroducing a mutable pin writer solely to manufacture history.
+fn migrate_legacy_model_main_from_snapshot(
+    pile: &mut Pile,
+    signing_key: &SigningKey,
+    pins: &PinSnapshot,
+    request: LegacyModelMigration<'_>,
+) -> anyhow::Result<LegacyModelMigrationResult> {
+    let reader = pile
+        .reader()
+        .context("open blob reader for frozen legacy model snapshot")?;
+    let frozen = freeze_legacy_main_from_snapshot(reader, pins)?;
+    migrate_frozen_legacy_model(pile, signing_key, request, frozen)
+}
+
+fn migrate_frozen_legacy_model(
+    pile: &mut Pile,
+    signing_key: &SigningKey,
+    request: LegacyModelMigration<'_>,
+    frozen: FrozenLegacyMain,
+) -> anyhow::Result<LegacyModelMigrationResult> {
+    let legacy_facts = frozen.facts.len();
+    let projection = project_legacy_model_attributes(&frozen.facts);
     let aliases_added = projection.aliases_added;
 
-    let model_root =
-        select_model_root(&projection.facts, &reader, request.model).with_context(|| {
+    let model_root = select_model_root(&projection.facts, &frozen.reader, request.model)
+        .with_context(|| {
             format!(
                 "select exactly one legacy weight root matching {:?}",
                 request.model
@@ -576,8 +662,12 @@ pub fn migrate_legacy_model_main(
     let tokenizer_root = request
         .tokenizer_name
         .map(|name| {
-            select_tokenizer_root(&projection.facts, &reader, TokenizerSelector::Name(name))
-                .with_context(|| format!("select exactly one legacy tokenizer named {name:?}"))
+            select_tokenizer_root(
+                &projection.facts,
+                &frozen.reader,
+                TokenizerSelector::Name(name),
+            )
+            .with_context(|| format!("select exactly one legacy tokenizer named {name:?}"))
         })
         .transpose()?;
 
@@ -587,7 +677,8 @@ pub fn migrate_legacy_model_main(
         projection.facts,
         triblespace::core::blob::MemoryBlobStore::new(),
     );
-    let add_source = source_coordinate_is_missing(&fragment, &reader, model_root, request.source)?;
+    let add_source =
+        source_coordinate_is_missing(&fragment, &frozen.reader, model_root, request.source)?;
     let add_quantization =
         quantization_coordinate_is_missing(&fragment, model_root, request.quantization)?;
     let selector_facts_added = usize::from(add_source) + usize::from(add_quantization);
@@ -616,8 +707,8 @@ pub fn migrate_legacy_model_main(
     Ok(LegacyModelMigrationResult {
         commit,
         team,
-        legacy_branch,
-        legacy_head,
+        legacy_branch: frozen.branch,
+        legacy_head: frozen.head,
         model_root,
         tokenizer_root,
         legacy_facts,
@@ -635,12 +726,15 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use anybytes::{Bytes, View};
+    use ed25519_dalek::Signer;
+    use triblespace::core::blob::encodings::UnknownBlob;
     use triblespace::core::blob::MemoryBlobStore;
     use triblespace::core::inline::encodings::UnknownInline;
     use triblespace::core::metadata;
+    use triblespace::core::patch::Entry;
     use triblespace::core::repo::pile::PileReader;
     use triblespace::core::repo::pile::WantRewritePolicy;
-    use triblespace::core::repo::{PinStore, PushResult, RetentionRoots};
+    use triblespace::core::repo::{BlobStorePut, RetentionRoots};
     use triblespace::prelude::blobencodings::RawBytes;
 
     use super::*;
@@ -690,6 +784,7 @@ mod tests {
 
     struct LegacyFixture {
         pile: TempPilePath,
+        pins: PinSnapshot,
         branch: Id,
         head: CommitHandle,
         model_root: Id,
@@ -704,7 +799,6 @@ mod tests {
 
     struct LegacyPersonaPlexFixture {
         pile: TempPilePath,
-        branch: Id,
         weight_commit: CommitHandle,
         later_commit: CommitHandle,
         lm_root: Id,
@@ -745,6 +839,78 @@ mod tests {
                 None => *fact,
             })
             .collect()
+    }
+
+    /// Persist one ordinary legacy content/commit pair without manufacturing
+    /// a mutable repository merely for the test fixture.
+    fn write_legacy_commit(
+        pile: &mut Pile,
+        signer: &SigningKey,
+        fragment: Fragment,
+        parents: impl IntoIterator<Item = CommitHandle>,
+    ) -> CommitHandle {
+        let (facts, mut blobs) = fragment.into_facts_and_blobs();
+        for (_, blob) in blobs.reader().expect("read fixture attachment store") {
+            pile.put::<UnknownBlob, _>(blob)
+                .expect("persist legacy fixture attachment");
+        }
+
+        let content_blob: Blob<blobencodings::SimpleArchive> = facts.to_blob();
+        let content_handle = pile
+            .put::<blobencodings::SimpleArchive, _>(content_blob.clone())
+            .expect("persist legacy fixture content");
+        let signature = signer.sign(&content_blob.bytes);
+        let parents = parents.into_iter().collect::<Vec<_>>();
+        let wrapper = entity! {
+            repo::content: content_handle,
+            repo::parent*: parents,
+            triblespace::core::attestation::signed_by: signer.verifying_key(),
+            triblespace::core::attestation::signature_r: signature,
+            triblespace::core::attestation::signature_s: signature,
+        };
+        pile.put::<blobencodings::SimpleArchive, _>(wrapper.into_facts())
+            .expect("persist legacy fixture commit")
+    }
+
+    fn write_branch_metadata(
+        pile: &mut Pile,
+        signer: &SigningKey,
+        branch: Id,
+        names: &[&str],
+        heads: &[CommitHandle],
+    ) -> Inline<Handle<blobencodings::SimpleArchive>> {
+        let names = names
+            .iter()
+            .map(|name| {
+                pile.put::<UTF8String, _>((*name).to_owned())
+                    .expect("persist legacy branch name")
+            })
+            .collect::<Vec<_>>();
+        let signed_head = *heads.first().expect("signed branch fixture has a head");
+        let reader = pile.reader().expect("read branch fixture head");
+        let head_blob: Blob<blobencodings::SimpleArchive> = reader
+            .get(signed_head)
+            .expect("resolve branch fixture head");
+        let signature = signer.sign(&head_blob.bytes);
+        let metadata = entity! {
+            repo::branch: branch,
+            repo::head*: heads.iter().copied(),
+            metadata::name*: names,
+            triblespace::core::attestation::signed_by: signer.verifying_key(),
+            triblespace::core::attestation::signature_r: signature,
+            triblespace::core::attestation::signature_s: signature,
+        };
+        pile.put::<blobencodings::SimpleArchive, _>(metadata.into_facts())
+            .expect("persist legacy branch metadata")
+    }
+
+    fn insert_pin(
+        pins: &mut PinSnapshot,
+        branch: Id,
+        metadata: Inline<Handle<blobencodings::SimpleArchive>>,
+    ) {
+        let raw: [u8; 16] = branch.into();
+        pins.insert(&Entry::with_value(&raw, metadata));
     }
 
     fn legacy_fixture(label: &str, duplicate_model_name: bool) -> LegacyFixture {
@@ -817,20 +983,19 @@ mod tests {
         }
 
         let fragment = Fragment::from_facts_and_blobs(facts.clone(), blobs);
-        let pile_store = Pile::open(pile.path()).expect("open disposable pile");
-        let mut repo = Repository::new(pile_store, key(3), TribleSet::new())
-            .expect("create legacy repository");
-        let branch = *repo
-            .create_branch("main", None)
-            .expect("create legacy main branch");
-        let mut workspace = repo.pull(branch).expect("pull legacy main");
-        workspace.commit(fragment, "legacy model graph");
-        let head = workspace.head().expect("legacy commit head");
-        repo.push(&mut workspace).expect("push legacy main");
-        repo.close().expect("close legacy fixture pile");
+        let mut pile_store = Pile::open(pile.path()).expect("open disposable pile");
+        let legacy_signer = key(3);
+        let head = write_legacy_commit(&mut pile_store, &legacy_signer, fragment, []);
+        let branch = test_id(0x70);
+        let branch_metadata =
+            write_branch_metadata(&mut pile_store, &legacy_signer, branch, &["main"], &[head]);
+        let mut pins = PinSnapshot::new();
+        insert_pin(&mut pins, branch, branch_metadata);
+        pile_store.close().expect("close legacy fixture pile");
 
         LegacyFixture {
             pile,
+            pins,
             branch,
             head,
             model_root,
@@ -974,17 +1139,9 @@ mod tests {
         }
 
         let fragment = Fragment::from_facts_and_blobs(facts.clone(), blobs);
-        let pile_store = Pile::open(pile.path()).expect("open PersonaPlex fixture pile");
-        let mut repo = Repository::new(pile_store, key(0x33), TribleSet::new())
-            .expect("create legacy PersonaPlex repository");
-        let branch = *repo
-            .create_branch("main", None)
-            .expect("create legacy PersonaPlex main branch");
-        let mut workspace = repo.pull(branch).expect("pull PersonaPlex main");
-        workspace.commit(fragment, "legacy PersonaPlex weights");
-        let weight_commit = workspace.head().expect("legacy weight commit");
-        repo.push(&mut workspace)
-            .expect("push legacy PersonaPlex weights");
+        let mut pile_store = Pile::open(pile.path()).expect("open PersonaPlex fixture pile");
+        let legacy_signer = key(0x33);
+        let weight_commit = write_legacy_commit(&mut pile_store, &legacy_signer, fragment, []);
 
         let mut later_blobs = MemoryBlobStore::new();
         let orphan = later_blobs
@@ -992,18 +1149,16 @@ mod tests {
             .expect("put later unrelated attachment");
         let later_fact = Trible::force(&test_id(0x61), &test_id(0x62), &orphan);
         let later_facts = std::iter::once(later_fact).collect();
-        workspace.commit(
+        let later_commit = write_legacy_commit(
+            &mut pile_store,
+            &legacy_signer,
             Fragment::from_facts_and_blobs(later_facts, later_blobs),
-            "later unrelated graph",
+            [weight_commit],
         );
-        let later_commit = workspace.head().expect("later unrelated commit");
-        repo.push(&mut workspace)
-            .expect("push later unrelated commit");
-        repo.close().expect("close PersonaPlex fixture pile");
+        pile_store.close().expect("close PersonaPlex fixture pile");
 
         LegacyPersonaPlexFixture {
             pile,
-            branch,
             weight_commit,
             later_commit,
             lm_root,
@@ -1049,21 +1204,14 @@ mod tests {
         Fragment::rooted_from_parts(root_id, facts, metafacts, blobs)
     }
 
-    fn read_main_identity(path: &Path) -> (Id, CommitHandle) {
-        let pile = Pile::open(path).expect("open pile to inspect main");
-        let mut repo =
-            Repository::new(pile, key(4), TribleSet::new()).expect("open repository view");
-        let branch = repo
-            .lookup_branch("main")
-            .expect("lookup main")
-            .expect("main exists");
-        let head = repo
-            .pull(branch)
-            .expect("pull main")
-            .head()
-            .expect("main head");
-        repo.close().expect("close inspected pile");
-        (branch, head)
+    fn read_main_identity(path: &Path, pins: &PinSnapshot) -> (Id, CommitHandle) {
+        let mut pile = Pile::open(path).expect("open pile to inspect main");
+        let reader = pile.reader().expect("snapshot inspected pile");
+        let frozen = freeze_legacy_main_from_snapshot(reader, pins).expect("freeze legacy main");
+        let identity = (frozen.branch, frozen.head);
+        drop(frozen);
+        pile.close().expect("close inspected pile");
+        identity
     }
 
     fn exact_snapshot(
@@ -1105,8 +1253,13 @@ mod tests {
         };
 
         let mut pile = Pile::open(fixture.pile.path()).expect("open migration pile");
-        let first = migrate_legacy_model_main(&mut pile, &migration_key, request)
-            .expect("migrate legacy graph");
+        let first = migrate_legacy_model_main_from_snapshot(
+            &mut pile,
+            &migration_key,
+            &fixture.pins,
+            request,
+        )
+        .expect("migrate legacy graph");
         pile.close().expect("durably close migrated pile");
 
         assert_eq!(first.legacy_branch, fixture.branch);
@@ -1122,7 +1275,7 @@ mod tests {
             "legacy byte prefix changed"
         );
         assert_eq!(
-            read_main_identity(fixture.pile.path()),
+            read_main_identity(fixture.pile.path(), &fixture.pins),
             (fixture.branch, fixture.head),
             "legacy branch identity/head changed"
         );
@@ -1175,8 +1328,13 @@ mod tests {
         assert_eq!(&*attachment, "resident legacy attachment");
 
         let mut pile = Pile::open(fixture.pile.path()).expect("reopen for idempotence run");
-        let second =
-            migrate_legacy_model_main(&mut pile, &migration_key, request).expect("rerun migration");
+        let second = migrate_legacy_model_main_from_snapshot(
+            &mut pile,
+            &migration_key,
+            &fixture.pins,
+            request,
+        )
+        .expect("rerun migration");
         pile.close().expect("close idempotence run");
         assert_eq!(second.commit, first.commit, "rerun changed exact ticket");
         assert_eq!(
@@ -1197,9 +1355,10 @@ mod tests {
         assert_ne!(wanted, fixture.model_root);
 
         let mut pile = Pile::open(fixture.pile.path()).expect("open ambiguous fixture");
-        let result = migrate_legacy_model_main(
+        let result = migrate_legacy_model_main_from_snapshot(
             &mut pile,
             &key(9),
+            &fixture.pins,
             LegacyModelMigration {
                 model: ModelSelector::Root(wanted),
                 source: CANONICAL_SOURCE,
@@ -1242,9 +1401,10 @@ mod tests {
         let fixture = legacy_fixture("ambiguous", true);
         let before = std::fs::read(fixture.pile.path()).expect("read ambiguous fixture");
         let mut pile = Pile::open(fixture.pile.path()).expect("open ambiguous fixture");
-        let error = migrate_legacy_model_main(
+        let error = migrate_legacy_model_main_from_snapshot(
             &mut pile,
             &key(9),
+            &fixture.pins,
             LegacyModelMigration {
                 model: ModelSelector::Name(LEGACY_MODEL_NAME),
                 source: CANONICAL_SOURCE,
@@ -1263,8 +1423,90 @@ mod tests {
             "failed validation mutated the legacy pile"
         );
         assert_eq!(
-            read_main_identity(fixture.pile.path()),
+            read_main_identity(fixture.pile.path(), &fixture.pins),
             (fixture.branch, fixture.head)
+        );
+    }
+
+    #[test]
+    fn duplicate_main_branch_names_fail_before_publication() {
+        let fixture = legacy_fixture("duplicate-main", false);
+        let mut pile = Pile::open(fixture.pile.path()).expect("open duplicate-main fixture");
+        let second_branch = test_id(0x71);
+        let second_metadata = write_branch_metadata(
+            &mut pile,
+            &key(3),
+            second_branch,
+            &["main"],
+            &[fixture.head],
+        );
+        let mut pins = fixture.pins.clone();
+        insert_pin(&mut pins, second_branch, second_metadata);
+        let before = std::fs::read(fixture.pile.path()).expect("read ambiguous branch fixture");
+
+        let error = migrate_legacy_model_main_from_snapshot(
+            &mut pile,
+            &key(9),
+            &pins,
+            LegacyModelMigration {
+                model: ModelSelector::Name(LEGACY_MODEL_NAME),
+                source: CANONICAL_SOURCE,
+                quantization: QUANTIZATION,
+                tokenizer_name: None,
+            },
+        )
+        .expect_err("two active main branches must fail closed");
+        assert!(
+            error.to_string().contains("2 active branches named 'main'"),
+            "{error}"
+        );
+        pile.close().expect("close duplicate-main fixture");
+        assert_eq!(
+            std::fs::read(fixture.pile.path()).expect("reread duplicate-main fixture"),
+            before,
+            "ambiguous branch discovery published native state"
+        );
+    }
+
+    #[test]
+    fn ambiguous_main_head_fails_before_publication() {
+        let fixture = legacy_fixture("ambiguous-head", false);
+        let mut pile = Pile::open(fixture.pile.path()).expect("open ambiguous-head fixture");
+        let second_head = write_legacy_commit(
+            &mut pile,
+            &key(3),
+            Fragment::from_facts_and_blobs(TribleSet::new(), MemoryBlobStore::new()),
+            [fixture.head],
+        );
+        let metadata = write_branch_metadata(
+            &mut pile,
+            &key(3),
+            fixture.branch,
+            &["main"],
+            &[fixture.head, second_head],
+        );
+        let mut pins = PinSnapshot::new();
+        insert_pin(&mut pins, fixture.branch, metadata);
+        let before = std::fs::read(fixture.pile.path()).expect("read ambiguous-head fixture");
+
+        let error = migrate_legacy_model_main_from_snapshot(
+            &mut pile,
+            &key(9),
+            &pins,
+            LegacyModelMigration {
+                model: ModelSelector::Name(LEGACY_MODEL_NAME),
+                source: CANONICAL_SOURCE,
+                quantization: QUANTIZATION,
+                tokenizer_name: None,
+            },
+        )
+        .expect_err("a branch with two heads must fail closed");
+        assert!(error.to_string().contains("ambiguous heads"), "{error}");
+        pile.close().expect("close ambiguous-head fixture");
+        assert_eq!(
+            std::fs::read(fixture.pile.path()).expect("reread ambiguous-head fixture"),
+            before,
+            "ambiguous head discovery published native state"
         );
     }
 
@@ -1414,17 +1656,14 @@ mod tests {
         let migration_key = key(0x76);
         let mut pile = Pile::open(fixture.pile.path()).unwrap();
 
-        let branch_metadata = pile
-            .head(fixture.branch)
-            .unwrap()
-            .expect("live legacy main pin");
-        assert!(matches!(
-            pile.update(fixture.branch, Some(branch_metadata), None)
-                .unwrap(),
-            PushResult::Success()
-        ));
-        assert_eq!(pile.head(fixture.branch).unwrap(), None);
-        assert_eq!(pile.pins().unwrap().count(), 0);
+        assert!(
+            pile.snapshot_pin_heads()
+                .unwrap()
+                .iter_ordered()
+                .next()
+                .is_none(),
+            "exact-commit fixture must not manufacture a branch pin"
+        );
 
         let adopted = adopt_legacy_personaplex_bundle_with_policy(
             &mut pile,
@@ -1648,28 +1887,10 @@ mod tests {
         )
         .expect("adopt bundle before retained rewrite");
 
-        // Remove the legacy Repository as an independent ownership path. If
-        // the test left `main` active, its commit chain would retain every old
-        // attachment even if COMMIT -> T -> H traversal were broken.
-        let branch_metadata = source
-            .head(fixture.branch)
-            .unwrap()
-            .expect("live legacy main pin");
-        assert_ne!(
-            branch_metadata, fixture.later_commit,
-            "the strong pin names branch metadata, not the content commit"
-        );
-        assert!(matches!(
-            source
-                .update(fixture.branch, Some(branch_metadata), None)
-                .unwrap(),
-            PushResult::Success()
-        ));
-        assert_eq!(source.head(fixture.branch).unwrap(), None);
         assert_eq!(
-            source.pins().unwrap().count(),
+            source.snapshot_pin_heads().unwrap().iter_ordered().count(),
             0,
-            "an active strong pin confounds retention"
+            "a legacy pin would confound native bundle-retention coverage"
         );
 
         let mut retained = Pile::open(destination.path()).unwrap();

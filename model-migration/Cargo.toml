@@ -2,16 +2,14 @@
 name = "mary-model-migration"
 version = "0.1.0"
 edition = "2021"
-description = "One-way, strictly additive migration of Mary's legacy Repository model piles into the native model collection. Split out of the mary library because it is a bridge across the Repository -> Collection cutover: it has to keep speaking the legacy API, and the library does not."
+description = "One-way, strictly additive migration of Mary's legacy branch-model piles into native model collections."
 license = "MIT OR Apache-2.0"
 
-# Deliberately its OWN workspace root, not a member of anything in ../. That is
-# the whole point of the split: a workspace shares one lockfile and one
-# `[patch.crates-io]` table, so a member could never pin a different
-# triblespace than mary. Standing alone, this crate can — once Repository and
-# PinStore are removed from triblespace's main line, the pins below move to an
-# older checkout here and legacy piles stay migratable, with no drag on the
-# library. Nothing is pinned back yet; the ability just is not foreclosed.
+# Deliberately its OWN workspace root, not a member of anything in ../. The
+# bridge has migration-only feature and dependency needs, while Mary's runtime
+# remains collection-only. TribleSpace main retains the read-only pin snapshot
+# and historical branch/commit encodings needed here; no mutable legacy API or
+# old TribleSpace checkout is part of the migration.
 [workspace]
 
 [dependencies]
