@@ -2004,6 +2004,29 @@ mod tokenizer_collection_tests {
             .ok()
         );
     }
+
+    #[test]
+    fn checkpoint_documents_join_the_same_collection_and_conflicts_fail_closed() {
+        let fixture = Fixture::new();
+        let pile_path = fixture.0.join("model.pile");
+        let config_path = fixture.0.join("config.json");
+        std::fs::File::create(&pile_path).unwrap();
+        std::fs::write(&config_path, r#"{"layers": 4}"#).unwrap();
+
+        let written =
+            ingest_json_documents(&pile_path, &fixture.0, &["config.json"], &[]).unwrap();
+        assert!(written > 0);
+        let (facts, reader) = pile_facts(&pile_path).unwrap();
+        assert_eq!(
+            crate::jsonfacts::load_document(&facts, &reader, "config.json").unwrap(),
+            serde_json::json!({"layers": 4})
+        );
+
+        std::fs::write(&config_path, r#"{"layers": 5}"#).unwrap();
+        let error =
+            ingest_json_documents(&pile_path, &fixture.0, &["config.json"], &[]).unwrap_err();
+        assert!(error.to_string().contains("DIFFERENT document"));
+    }
 }
 
 #[cfg(feature = "gemma")]
