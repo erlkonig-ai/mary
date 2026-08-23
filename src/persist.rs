@@ -2031,8 +2031,7 @@ fn select_native_model_index(
     selector: crate::selection::ModelSelector<'_>,
 ) -> anyhow::Result<crate::selection::SelectedModelIndex<triblespace::core::repo::pile::PileReader>>
 {
-    let team = crate::model_collection::model_graph_team_at(pile_path)?;
-    let snapshot = crate::model_collection::load_model_collection_local_latest(pile_path, team)
+    let (_, snapshot) = crate::model_collection::load_sole_model_collection_local_latest(pile_path)
         .with_context(|| format!("load local-latest native model snapshot from {pile_path:?}"))?;
     crate::selection::SelectedModelIndex::from_snapshot(snapshot, selector)
         .with_context(|| format!("select one native model component in {pile_path:?}"))

@@ -103,11 +103,8 @@ fn main() {
 
     // ── Path 2: load from JUST the fresh native snapshot ──────────────────
     eprintln!("[pile] selecting and materializing the native root (no safetensors)...");
-    let snapshot = mary::model_collection::load_model_collection_local_latest(
-        &pile_path,
-        mary::model_collection::model_graph_team_at(&pile_path).expect("sole model-graph team"),
-    )
-    .expect("load native model collection snapshot");
+    let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(&pile_path)
+        .expect("load native model collection snapshot");
     let selector = ModelSelector::Source {
         source: MODEL_ID,
         quantization: mary::persist::QUANTIZATION_NATIVE,

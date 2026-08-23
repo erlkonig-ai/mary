@@ -99,9 +99,7 @@ fn main() {
     let dev = Default::default();
     eprintln!("loading stt from {pile:?} (lane {lane}) ...");
     let t0 = std::time::Instant::now();
-    let team = mary::model_collection::model_graph_team_at(&pile)
-        .expect("sole model-graph team in the Voxtral pile");
-    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile, team)
+    let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(&pile)
         .expect("load native Voxtral snapshot");
     let loader = mary::models::voxtral::VoxtralWeights::from_snapshot(snapshot)
         .expect("select complete native Voxtral cohort")

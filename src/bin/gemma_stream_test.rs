@@ -50,11 +50,8 @@ fn main() {
     let chat = "<bos><|turn>user\nWhat is 17 times 23? Answer with just the number.<turn|>\n<|turn>model\n";
 
     println!("[stream] selecting the native root and loading (peak = one tensor)...");
-    let snapshot = mary::model_collection::load_model_collection_local_latest(
-        &pile,
-        mary::model_collection::model_graph_team_at(&pile).expect("sole model-graph team"),
-    )
-    .expect("load native model collection snapshot for streaming");
+    let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(&pile)
+        .expect("load native model collection snapshot for streaming");
     let selected = SelectedModelIndex::from_snapshot(
         snapshot,
         ModelSelector::Source {
@@ -79,11 +76,8 @@ fn main() {
     drop(streamed);
 
     println!("[keymap] materializing the explicitly selected native root...");
-    let snapshot = mary::model_collection::load_model_collection_local_latest(
-        &pile,
-        mary::model_collection::model_graph_team_at(&pile).expect("sole model-graph team"),
-    )
-    .expect("load native model collection snapshot for materialization");
+    let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(&pile)
+        .expect("load native model collection snapshot for materialization");
     let keymap = mary::selection::load_keymap_from_graph(
         snapshot.facts(),
         snapshot.reader(),

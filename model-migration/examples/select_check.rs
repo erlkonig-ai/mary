@@ -16,9 +16,7 @@ fn main() -> Result<()> {
     let tokenizer = args.next();
     let pile = std::path::PathBuf::from(pile);
 
-    let team = mary::model_collection::model_graph_team_at(&pile)
-        .context("read the sole model-graph team")?;
-    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile, team)
+    let (team, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(&pile)
         .context("load locally admitted native collection")?;
     println!("pile {}", pile.display());
     println!("team {}", hex(&team.to_bytes()));

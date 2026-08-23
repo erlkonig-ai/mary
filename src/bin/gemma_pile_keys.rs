@@ -18,10 +18,9 @@ fn main() {
         .expect("usage: gemma_pile_keys <pile> <source> [filter]");
     let filter = args.get(3).map(|s| s.as_str()).unwrap_or("");
 
-    let team = mary::model_collection::model_graph_team_at(Path::new(pile))
-        .expect("sole model-graph team in the pile");
-    let snapshot = mary::model_collection::load_model_collection_local_latest(Path::new(pile), team)
-        .expect("load native model snapshot");
+    let (_, snapshot) =
+        mary::model_collection::load_sole_model_collection_local_latest(Path::new(pile))
+            .expect("load native model snapshot");
     let selected = mary::selection::SelectedModelIndex::from_snapshot(
         snapshot,
         mary::selection::ModelSelector::Source {

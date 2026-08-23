@@ -132,12 +132,11 @@ fn main() -> anyhow::Result<()> {
     if let Some(op) = &out {
         let line = text.unwrap_or_else(|| "The quick brown fox jumps over the lazy dog.".into());
         // `synthesize_to_wav` takes a frozen cohort, not a path — the same
-        // two steps the `voice` faculty does, so the gate renders through the
-        // production selection rather than a second, drifting one.
+        // atomic sole-team snapshot the `voice` faculty uses, so the gate
+        // renders through the production selection rather than a drifting one.
         let variant = mary::speak::Qwen3TtsVariant::from_env();
-        let team = mary::model_collection::model_graph_team_at(Path::new(pile))?;
-        let snapshot =
-            mary::model_collection::load_model_collection_local_latest(Path::new(pile), team)
+        let (_, snapshot) =
+            mary::model_collection::load_sole_model_collection_local_latest(Path::new(pile))
                 .with_context(|| format!("freeze native Qwen3-TTS snapshot {pile}"))?;
         let weights = mary::speak::Qwen3TtsWeights::from_snapshot(snapshot, variant)
             .with_context(|| format!("select {variant:?} Qwen3-TTS cohort from {pile}"))?;

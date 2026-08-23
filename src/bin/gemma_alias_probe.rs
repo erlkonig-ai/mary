@@ -55,9 +55,7 @@ fn main() {
             .expect("import tiny native model collection");
 
     // 3. Freeze the local native collection and select its only model root.
-    let team = mary::model_collection::model_graph_team_at(&pile)
-        .expect("sole model-graph team in the tiny fixture pile");
-    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile, team)
+    let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(&pile)
         .expect("load tiny native model collection snapshot");
     let selected = SelectedModelIndex::from_snapshot(snapshot, ModelSelector::Only)
         .expect("select the only tiny model root");

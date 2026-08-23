@@ -97,11 +97,10 @@ fn vision_tower_parity() {
         return;
     }
     let device = NdArrayDevice::default();
-    let team = mary::model_collection::model_graph_team_at(Path::new(&pile_path))
-        .expect("sole model-graph team in the pile");
-    let snapshot =
-        mary::model_collection::load_model_collection_local_latest(Path::new(&pile_path), team)
-            .expect("load native model collection snapshot");
+    let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(Path::new(
+        &pile_path,
+    ))
+    .expect("load native model collection snapshot");
     let map = mary::selection::load_keymap_from_graph(
         snapshot.facts(),
         snapshot.reader(),
@@ -154,11 +153,10 @@ fn vision_tower_multiwindow_parity() {
         return;
     }
     let device = NdArrayDevice::default();
-    let team = mary::model_collection::model_graph_team_at(Path::new(&pile_path))
-        .expect("sole model-graph team in the pile");
-    let snapshot =
-        mary::model_collection::load_model_collection_local_latest(Path::new(&pile_path), team)
-            .expect("load native model collection snapshot");
+    let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(Path::new(
+        &pile_path,
+    ))
+    .expect("load native model collection snapshot");
     let map = mary::selection::load_keymap_from_graph(
         snapshot.facts(),
         snapshot.reader(),

@@ -157,11 +157,10 @@ fn image_embed_parity() {
     }
     let device = NdArrayDevice::default();
     eprintln!("[image-parity] loading combined keymap from {pile_path} ...");
-    let team = mary::model_collection::model_graph_team_at(Path::new(&pile_path))
-        .expect("sole model-graph team in the pile");
-    let snapshot =
-        mary::model_collection::load_model_collection_local_latest(Path::new(&pile_path), team)
-            .expect("load native model collection snapshot");
+    let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(Path::new(
+        &pile_path,
+    ))
+    .expect("load native model collection snapshot");
     let map = mary::persist::load_nomic_mm7b_keymap_from_snapshot(snapshot)
         .expect("select and materialize the Nomic text + vision components");
     eprintln!(
