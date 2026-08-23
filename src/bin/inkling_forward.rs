@@ -1333,6 +1333,19 @@ struct HostT {
     /// Layers that fell back to the per-expert loop, because their weights are
     /// not offsets into one registered mapping.
     per_expert: usize,
+    /// The grouped lane's small plan uploads that DEPEND on the routing
+    /// decision: the two offset tables, the two second-level scale vectors and
+    /// the per-row weights. A device-resident router deletes exactly these --
+    /// they become a gather out of a per-layer `[n_routed]` table by ids the
+    /// device already holds -- so they are timed apart from the ones it does
+    /// not.
+    plan_up_routed: f64,
+    /// The grouped lane's small plan uploads that are a function of `n` and
+    /// `top_k` ALONE: the row->token map, the three block-plan vectors and the
+    /// token->rows table. At `n == 1` every one of them is the same bytes on
+    /// every layer of every pass, so this is what a hoist out of the loop is
+    /// worth, independently of where the routing decision lives.
+    plan_up_static: f64,
 }
 
 /// One layer's shared experts, on the device, as the BF16 the pile stores.
@@ -2325,8 +2338,11 @@ fn grouped_experts_fp4(
     }
     let m_total = plan.m_total();
     let (hn_h, hn_dt) = handle_of_any(hn.clone());
+    // Split in two on purpose: see `HostT::plan_up_routed`. The `_static` half
+    // is the same bytes every layer of every decode pass; the `_routed` half is
+    // the only part a device-resident routing decision would have to produce.
+    let t_us = Instant::now();
     let h_rowtok = client.create_from_slice(bytes_of(&plan.row_tok));
-    let h_rowwgt = client.create_from_slice(bytes_of(&plan.row_wgt));
     let blk = BlockPlanDev {
         slot: client.create_from_slice(bytes_of(&plan.blk_slot)),
         tile0: client.create_from_slice(bytes_of(&plan.blk_tile0)),
@@ -2335,12 +2351,16 @@ fn grouped_experts_fp4(
         planes: RowPlan::planes(),
         rows_real: plan.rows_real(),
     };
+    let h_tokrows = client.create_from_slice(bytes_of(&plan.tok_rows));
+    let h_tokcnt = client.create_from_slice(bytes_of(&plan.tok_cnt));
+    host.plan_up_static += t_us.elapsed().as_secs_f64();
+    let t_ur = Instant::now();
+    let h_rowwgt = client.create_from_slice(bytes_of(&plan.row_wgt));
     let h_off13 = client.create_from_slice(bytes_of(&off13));
     let h_off2 = client.create_from_slice(bytes_of(&off2));
     let h_sc13 = client.create_from_slice(bytes_of(&sc13));
     let h_sc2 = client.create_from_slice(bytes_of(&sc2));
-    let h_tokrows = client.create_from_slice(bytes_of(&plan.tok_rows));
-    let h_tokcnt = client.create_from_slice(bytes_of(&plan.tok_cnt));
+    host.plan_up_routed += t_ur.elapsed().as_secs_f64();
     // The two staging buffers this lane owns, at the dtype
     // [`act_bf16`] names. Both are `[m_total, _]` and `m_total` is about
     // `experts_per_token * n`, so at prefill they are the largest allocations
@@ -3842,11 +3862,24 @@ fn main() -> Result<()> {
     // binary, which is the only honest way to price a 15% change against a
     // 2-3 ms pass-to-pass drift.
     let dev_route = std::env::var("INK_DEV_ROUTE").map(|v| v != "0").unwrap_or(true);
+    // `INK_ROUTE_STALE=1` is a TIMING PROBE and NOT A LANE: it reuses the
+    // PREVIOUS pass's routing decision for a layer instead of reading this
+    // pass's back, so the router projection is still enqueued, the device still
+    // computes the logits, and the only thing that goes away is the BLOCKING
+    // read. Every kernel, every shape and every other piece of host work is
+    // unchanged -- `top_k` distinct experts, one token each at decode -- so the
+    // wall clock difference against an interleaved control IS the price of the
+    // per-layer sync. The generated TEXT is wrong under it, deliberately and
+    // always: the decision it acts on belongs to a different activation.
+    let route_stale = std::env::var("INK_ROUTE_STALE").map(|v| v == "1").unwrap_or(false);
     // The gate bias is `[n_routed]` f32 and does not change during a run, so it
     // is uploaded once per layer rather than once per pass. One KiB either way;
     // it is here because a per-pass upload in a lane whose whole subject is
     // host->device round trips would be embarrassing.
     let mut bias_dev: std::collections::HashMap<usize, cubecl::server::Handle> =
+        std::collections::HashMap::new();
+    // `INK_ROUTE_STALE=1` only: last pass's decision per layer.
+    let mut route_cache: std::collections::HashMap<usize, Vec<Routing>> =
         std::collections::HashMap::new();
 
     // ---- what the pipe costs, and what it wastes --------------------------
@@ -4388,12 +4421,23 @@ fn main() -> Result<()> {
             let inter = t.intermediate_size;
             let r = ld.router.as_ref().expect("a MoE layer has a router");
             // The router's PROJECTION is a matmul and runs on the device; its
-            // DECISION is control plane and runs here. What crosses is
-            // [n, 258] f32 -- 1 KB on a decode step -- against the 14.2 MB of
-            // expert weight the decision selects. This read BLOCKS, and it is
-            // the only place in the layer that does; it cannot be avoided by
-            // scheduling, because which weights to read next is a function of
-            // the number that just came back.
+            // DECISION is control plane and runs here. What crosses is one row
+            // of the chosen ids and weights on the default lane and the whole
+            // [n, 258] f32 on `INK_DEV_ROUTE=0` -- 60 bytes against 1 KB, and
+            // neither is the cost. The cost is that this read BLOCKS, and it is
+            // the only place in the layer that does.
+            //
+            // What it is worth, measured 2026-08-23 on spark-zt at
+            // `INK_KV=1 INK_LAYERS=0:16`, nine interleaved rounds of the
+            // `INK_ROUTE_STALE=1` probe against the same binary with the probe
+            // off: 55.7 -> 51.2 ms p50, i.e. 4.5 ms a token and 17.95 -> 19.53
+            // tok/s. The per-layer `BLOCKING read` bucket is 19.3 ms of that
+            // pass and only 4.5 of it is serialisation -- the rest is device
+            // time that resurfaces at the one sync (1.3 -> 5.1 ms) and host
+            // work that gets dearer once the queue runs deep. `nsys -t cuda`
+            // over the same two arms puts GPU kernel time at 41.2 ms of the
+            // pass, so the device is busy 74% of a blocking pass and 80% of a
+            // probe pass, and 41 ms is the floor either way.
             let rows = t.n_routed_experts + t.n_shared_experts;
             let t_rt = Instant::now();
             // `cols` is what comes BACK, which is `rows` except on the BF16 arm,
@@ -4429,7 +4473,15 @@ fn main() -> Result<()> {
             let host_route = !dev_route || r.reference.is_some();
             let routing: Vec<Routing>;
             let mut logits: Vec<f32> = Vec::new();
-            if host_route {
+            // The probe only stands in for a decision of the same SHAPE, and it
+            // never stands in for the reference arm, which wants this pass's
+            // logits and would otherwise be handed an empty vector.
+            let stale_hit = route_stale
+                && r.reference.is_none()
+                && route_cache.get(&layer).is_some_and(|v| v.len() == n);
+            if stale_hit {
+                routing = route_cache[&layer].clone();
+            } else if host_route {
                 let t_rr = Instant::now();
                 logits = drop_pad_cols(down(lg), n, cols, rows);
                 t_rt_read += t_rr.elapsed().as_secs_f64();
@@ -4527,6 +4579,9 @@ fn main() -> Result<()> {
                     );
                 }
                 t_rt_host += t_rh.elapsed().as_secs_f64();
+            }
+            if route_stale && !stale_hit {
+                route_cache.insert(layer, routing.clone());
             }
             let t_rh = Instant::now();
 
@@ -5776,8 +5831,18 @@ fn main() -> Result<()> {
     println!("        shared experts{:9.1}", ms(t_shared));
     println!("        rest of half  {:9.1}   (dense layers, sconv)",
              ms(t_other - t_expert - t_shared - t_h_route - t_h_sconv));
-    println!("      router + group  {:9.1}   BLOCKS: [n,{}] logits back, then top-k on the host",
-             ms(t_h_route), t.n_routed_experts + t.n_shared_experts);
+    // WHICH lane blocked, not which one used to. `INK_DEV_ROUTE` has defaulted
+    // on for a while and the device lane reads back the DECISION -- 2k + shared
+    // + 1 f32, 60 bytes at decode -- not the logits. The line said `[n, 258]`
+    // and "top-k on the host" either way, and a reader who priced the sync as a
+    // 1 KB transfer was reading a label for a lane that had stopped running.
+    // The cost is the SYNC and it is the same either way; the bytes are not.
+    println!("      router + group  {:9.1}   BLOCKS: [n,{}] {} back",
+             ms(t_h_route),
+             if dev_route { 2 * t.num_experts_per_tok + t.n_shared_experts + 1 }
+             else { t.n_routed_experts + t.n_shared_experts },
+             if dev_route { "top-k DECISION (device top-k)" }
+             else { "logits, then top-k on the host" });
     println!("        of which: matmul enqueue {:7.1}, BLOCKING read {:7.1}, top-k + group {:7.1}",
              ms(t_rt_mm), ms(t_rt_read), ms(t_rt_host));
     println!("      mlp short_conv  {:9.1}", ms(t_h_sconv));
@@ -5824,6 +5889,11 @@ fn main() -> Result<()> {
                  ms(host_t.slice), ms(host_t.slice) / expert_loads.max(1) as f64);
         println!("      gather (select) {:9.1}   ({:.3} ms/load)   enqueue",
                  ms(host_t.gather), ms(host_t.gather) / expert_loads.max(1) as f64);
+        // Sub-buckets of the line above, not extra time: the plan uploads happen
+        // inside the gather's timer. Split because only one of the two halves
+        // is a consequence of the routing decision living on the host.
+        println!("        of which plan uploads: routing-dependent {:6.1}, static at n=1 {:6.1}",
+                 ms(host_t.plan_up_routed), ms(host_t.plan_up_static));
         println!("      bind + enqueue  {:9.1}   ({:.3} ms/load)",
                  ms(host_t.enqueue), ms(host_t.enqueue) / expert_loads.max(1) as f64);
         println!("      scatter-add     {:9.1}   ({:.3} ms/load)   enqueue",
