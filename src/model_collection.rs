@@ -700,18 +700,6 @@ pub fn model_graph_team_or_own(
     }
 }
 
-/// The single team publishing a model graph in the pile at `path`.
-///
-/// The path-taking form, for the common caller that holds a path and nothing
-/// else. It opens, asks, and closes; nothing is left open on either outcome.
-pub fn model_graph_team_at(path: impl AsRef<Path>) -> Result<VerifyingKey, SoleModelGraphTeamError> {
-    let mut pile = open_and_refresh_model_pile(path.as_ref())
-        .map_err(|source| SoleModelGraphTeamError::Open(Box::new(source)))?;
-    let team = sole_model_graph_team(&mut pile);
-    let _ = pile.close();
-    team
-}
-
 /// The single team publishing model bundles here, or an explicit ambiguity.
 pub fn sole_model_bundle_team(
     pile: &mut Pile,
@@ -747,8 +735,6 @@ pub fn model_bundle_team_or_own(
 /// Why a pile does not have exactly one model-graph team.
 #[derive(Debug)]
 pub enum SoleModelGraphTeamError {
-    /// The pile could not be opened.
-    Open(Box<LoadModelCollectionError>),
     /// The pile could not be read.
     Read(ReadError),
     /// No collection in this pile is named `mary-model-graph`.
@@ -763,7 +749,6 @@ pub enum SoleModelGraphTeamError {
 impl fmt::Display for SoleModelGraphTeamError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Open(source) => write!(f, "open the pile: {source}"),
             Self::Read(source) => write!(f, "read the pile's records: {source}"),
             Self::None => write!(f, "no collection named `mary-model-graph` in this pile"),
             Self::Several { teams } => write!(
@@ -778,7 +763,6 @@ impl fmt::Display for SoleModelGraphTeamError {
 impl Error for SoleModelGraphTeamError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Open(source) => Some(source.as_ref()),
             Self::Read(source) => Some(source),
             Self::None | Self::Several { .. } => None,
         }
@@ -992,11 +976,10 @@ pub fn load_model_collection_local_latest(
 /// Open `path`, choose the sole model-graph team, and freeze its exact local
 /// ticket from one observed record prefix.
 ///
-/// This is deliberately one operation rather than
-/// [`model_graph_team_at`] followed by [`load_model_collection_local_latest`]:
-/// two independent opens can observe different prefixes and hide a newly
-/// ambiguous second team. The returned reader owns its immutable mapping after
-/// the read-only pile handle is closed.
+/// Team discovery and ticket selection deliberately happen in this one
+/// operation: two independent opens can observe different prefixes and hide a
+/// newly ambiguous second team. The returned reader owns its immutable mapping
+/// after the read-only pile handle is closed.
 pub fn load_sole_model_collection_local_latest(
     path: impl AsRef<Path>,
 ) -> Result<(VerifyingKey, CollectionSnapshot<PileReader>), LoadSoleModelCollectionError> {
