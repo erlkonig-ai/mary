@@ -78,7 +78,7 @@ fn main() -> Result<()> {
     }
 
     // --- real layer-2 expert rows -----------------------------------------
-    let src = mary::models::inkling::source::Weights::open(&dir, "inkling")?;
+    let src = mary::models::inkling::source::Weights::open(&dir)?;
     let base = format!("model.llm.layers.{LAYER}.mlp.experts.w13_weight");
     if src.is_nvfp4(&base) {
         bail!("{base} is packed NVFP4 -- layer {LAYER} is supposed to be the BF16 one");

@@ -25,7 +25,7 @@
 //! too. What keeps it falsifiable is `--mutate N`, not the comparison it used
 //! to be able to run.
 //!
-//!   inkling_align_gate <pile> [branch] [--mutate N] [--limit N]
+//!   inkling_align_gate <pile> [--mutate N] [--limit N]
 //!
 //! `--mutate N` shifts every plane N bytes forward before classifying it. It
 //! exists so this gate can be seen to FAIL: a check that has never failed is
@@ -90,22 +90,21 @@ impl Tally {
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let path = args.next().map(PathBuf::from).context(
-        "usage: inkling_align_gate <pile> [branch] [--mutate N] [--limit N]",
+        "usage: inkling_align_gate <pile> [--mutate N] [--limit N]",
     )?;
-    let mut branch = "inkling".to_string();
     let (mut mutate, mut limit) = (0usize, usize::MAX);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--mutate" => mutate = args.next().context("--mutate needs N")?.parse()?,
             "--limit" => limit = args.next().context("--limit needs N")?.parse()?,
-            other => branch = other.to_string(),
+            other => anyhow::bail!("unexpected argument {other:?}"),
         }
     }
 
     let t0 = std::time::Instant::now();
-    let src = Weights::open(&path, &branch)?;
+    let src = Weights::open(&path)?;
     println!("=== alignment gate ===");
-    println!("  source     : pile {} on {branch}", path.display());
+    println!("  source     : pile {}", path.display());
     println!("  {}", src.inventory());
     println!("  index built in {:.1}s", t0.elapsed().as_secs_f64());
 

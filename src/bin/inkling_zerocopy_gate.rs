@@ -19,7 +19,7 @@
 //! registration; the safetensors reader this replaced needed nine, one per
 //! shard, and that generality went away with it.
 //!
-//!   inkling_zerocopy_gate <pile> [branch]
+//!   inkling_zerocopy_gate <pile>
 //!
 //! Build: `--features cuda-backend,inkling`
 
@@ -53,14 +53,17 @@ fn main() -> Result<()> {
         std::env::args().nth(1).as_deref(),
         "thinkingmachines-inkling-small-nvfp4",
     )?;
-    let branch = std::env::args().nth(2).unwrap_or_else(|| "inkling".to_string());
+    anyhow::ensure!(
+        std::env::args().nth(2).is_none(),
+        "usage: inkling_zerocopy_gate <pile>"
+    );
     let b13 = format!("model.llm.layers.{LAYER}.mlp.experts.w13_weight");
     // Reopened per section on purpose: section 3 DESTROYS the source while a
     // handle is still alive, which is the whole point of it.
-    let open = || -> Result<Weights> { Weights::open(&dir, &branch) };
+    let open = || -> Result<Weights> { Weights::open(&dir) };
 
     let client = Rt::client(&Default::default());
-    println!("  source : pile {} on {branch}", dir.display());
+    println!("  source : pile {}", dir.display());
     println!("=== zero-copy seam ===");
     println!(
         "  device can address host memory directly : {}",

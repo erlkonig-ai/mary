@@ -13,7 +13,7 @@
 //! that is checkable, because `serde_json`'s object map is sorted and
 //! re-serialising is therefore canonical.
 //!
-//!   inkling_meta_gate <ckpt-dir> [pile] [branch] [--mutate WHAT]
+//!   inkling_meta_gate <ckpt-dir> [pile] [--mutate WHAT]
 //!
 //! `--mutate drop-key|int-to-float|reorder-array` corrupts the graph on the way
 //! in so the gate can be watched failing. `int-to-float` is the one worth
@@ -47,21 +47,18 @@ fn main() -> Result<()> {
     let dir = args
         .next()
         .map(PathBuf::from)
-        .context("usage: inkling_meta_gate <ckpt-dir> [pile] [branch] [--mutate WHAT]")?;
+        .context("usage: inkling_meta_gate <ckpt-dir> [pile] [--mutate WHAT]")?;
     let mut pile: Option<String> = None;
-    let mut branch = "inkling".to_string();
     let mut mutate: Option<String> = None;
-    let mut positional = 0;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--mutate" => mutate = Some(args.next().context("--mutate needs a name")?),
             other => {
-                if positional == 0 {
+                if pile.is_none() {
                     pile = Some(other.to_string());
                 } else {
-                    branch = other.to_string();
+                    anyhow::bail!("unexpected argument {other:?}");
                 }
-                positional += 1;
             }
         }
     }
@@ -136,7 +133,7 @@ fn main() -> Result<()> {
         return Ok(());
     };
 
-    println!("\n=== ingesting into {pile} (branch {branch}) ===");
+    println!("\n=== ingesting into {pile} ===");
     anyhow::ensure!(
         mutate.is_none(),
         "refusing to write a mutated graph into {pile}: a pile is append-only, \
@@ -144,7 +141,7 @@ fn main() -> Result<()> {
          mutation without a pile argument — the in-memory stage is where it is \
          supposed to fail."
     );
-    match mary::persist::ingest_json_documents(Path::new(&pile), &dir, DOCS, TEXT_DOCS, &branch) {
+    match mary::persist::ingest_json_documents(Path::new(&pile), &dir, DOCS, TEXT_DOCS) {
         Ok(n) => println!("committed : {n} facts"),
         Err(e) => {
             println!("ingest declined: {e}");
@@ -152,7 +149,7 @@ fn main() -> Result<()> {
         }
     }
 
-    let (pfacts, preader) = mary::persist::pile_facts(Path::new(&pile), &branch)?;
+    let (pfacts, preader) = mary::persist::pile_facts(Path::new(&pile))?;
     let names = mary::jsonfacts::documents(&pfacts, &preader);
     println!(
         "pile has  : {:?}",

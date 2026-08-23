@@ -29,6 +29,7 @@ use crate::nn::weight_loader::read_safetensors_file;
     feature = "gemma"
 ))]
 use anyhow::Context;
+#[cfg(any(feature = "import", feature = "qwen3tts", feature = "tokenizer"))]
 use ed25519_dalek::SigningKey;
 #[cfg(feature = "import")]
 use std::collections::BTreeSet;

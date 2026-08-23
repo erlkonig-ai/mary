@@ -28,13 +28,11 @@
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use mary::models::inkling::load::Checkpoint;
-use mary::models::inkling::pile::{attrs, layer_of};
+use mary::models::inkling::pile::{attrs, layer_of, PileSource};
 use triblespace::core::blob::encodings::tensor::elements::{BF16, F32};
 use triblespace::core::blob::encodings::tensor::{tensor_blob, TensorView};
 use triblespace::core::blob::TryFromBlob;
-use triblespace::core::id::ExclusiveId;
 use triblespace::core::metadata;
-use triblespace::core::repo::Repository;
 use triblespace::macros::entity;
 use triblespace::prelude::*;
 
@@ -67,21 +65,20 @@ macro_rules! dense_leaf {
         );
 
         let len = blob.bytes.len();
-        if let Some((_, ws, change)) = $writing.as_mut() {
+        if let Some((pile, _, _, change)) = $writing.as_mut() {
             // put() returns the handle the facts then name, so the blob and the
             // fact about it cannot refer to different bytes.
-            let handle = ws.put(blob);
-            let name_h = ws.put::<blobencodings::UTF8String, _>($name.to_string());
-            let mut facts = entity! { &ufoid() @
+            let handle = pile
+                .put(blob)
+                .map_err(|e| anyhow::anyhow!("{}: storing leaf: {e:?}", $name))?;
+            let name_h = pile
+                .put::<blobencodings::UTF8String, _>($name.to_string())
+                .map_err(|e| anyhow::anyhow!("{}: storing name: {e:?}", $name))?;
+            let facts = entity! { _ @
                 attrs::weight::<$elem, $rank>(): handle,
                 metadata::name: name_h,
+                attrs::layer?: layer_of($name),
             };
-            // Absent rather than zero when the name carries no layer: a tensor
-            // that silently joined layer 0 would ship to the wrong machine.
-            if let Some(l) = layer_of($name) {
-                let root = facts.root().expect("rooted");
-                facts += entity! { ExclusiveId::force_ref(&root) @ attrs::layer: l };
-            }
             *change += facts;
         }
         len
@@ -101,8 +98,6 @@ macro_rules! by_rank {
         }
     };
 }
-
-
 /// Re-read every dense tensor from the checkpoint and compare it to what the
 /// pile holds under that name.
 ///
@@ -115,35 +110,9 @@ macro_rules! by_rank {
 /// attribute ids had silently drifted, and every byte on disk was fine.
 fn verify_pile(dir: &str, pile_path: &str, limit: usize) -> Result<()> {
     let ck = Checkpoint::open(dir).with_context(|| format!("opening {dir}"))?;
-    let (tribles, reader) = {
-        let path = std::path::Path::new(pile_path);
-        let mut pile = Pile::open(path).map_err(|e| anyhow::anyhow!("open {path:?}: {e:?}"))?;
-        pile.refresh()
-            .map_err(|e| anyhow::anyhow!("load {path:?}: {e:?}"))?;
-        let mut repo = Repository::new(
-            pile,
-            SigningKey::generate(&mut rand::rngs::OsRng),
-            TribleSet::new(),
-        )
-        .map_err(|e| anyhow::anyhow!("repo: {e:?}"))?;
-        let branch = repo
-            .lookup_branch("inkling")
-            .map_err(|e| anyhow::anyhow!("lookup: {e:?}"))?
-            .context("no 'inkling' branch")?;
-        let mut ws = repo.pull(branch).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-        let head = ws.head().context("'inkling' has no commits")?;
-        let facts: TribleSet = ws
-            .checkout(triblespace::core::repo::ancestors(head))
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
-            .facts()
-            .clone();
-        let rd = repo
-            .storage_mut()
-            .reader()
-            .map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
-        repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
-        (facts, rd)
-    };
+    let source = PileSource::open(std::path::Path::new(pile_path))?;
+    let tribles = source.facts();
+    let reader = source.reader();
 
     // name -> (dims, payload), read AS its type. One sweep per (dtype, rank).
     let mut index: std::collections::HashMap<String, (Vec<u64>, anybytes::Bytes)> =
@@ -154,7 +123,7 @@ fn verify_pile(dir: &str, pile_path: &str, limit: usize) -> Result<()> {
                 (n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
                  h: Inline<inlineencodings::Handle<
                      triblespace::core::blob::encodings::tensor::Tensor<$elem, $rank>>>),
-                triblespace::macros::pattern!(&tribles, [
+                triblespace::macros::pattern!(tribles, [
                     { _?e @ metadata::name: ?n, attrs::weight::<$elem, $rank>(): ?h },
                 ])
             ) {
@@ -239,11 +208,9 @@ fn main() -> Result<()> {
         experts.len()
     );
 
-    // Names the pile already holds. Same reason as the expert importer: the
-    // entity id is a `ufoid`, so a second pass over the same checkpoint writes
-    // a second entity per tensor — identical bytes, doubled facts, and a reader
-    // that gets two answers to "what is this tensor". Asking first turns a
-    // re-run into a no-op and an interrupted run into a resume.
+    // Names the collection already holds. Entities are content-derived, but a
+    // scan still turns a re-run into a byte-identical no-op instead of adding a
+    // second author's redundant commit, and an interrupted run into a resume.
     let mut present: std::collections::HashSet<String> = Default::default();
     let mut writing = match &pile_path {
         None => {
@@ -282,53 +249,60 @@ fn main() -> Result<()> {
                     )
                 })?;
             }
-            let mut repo = Repository::new(
-                store,
-                SigningKey::generate(&mut rand::rngs::OsRng),
-                TribleSet::new(),
-            )
-            .map_err(|e| anyhow::anyhow!("repository: {e:?}"))?;
-            let branch = repo
-                .ensure_branch("inkling", None)
-                .map_err(|e| anyhow::anyhow!("branch: {e:?}"))?;
-            let mut ws = repo
-                .pull(branch)
-                .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-            if let Some(head) = ws.head() {
-                let facts: TribleSet = ws
-                    .checkout(triblespace::core::repo::ancestors(head))
-                    .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
-                    .facts()
-                    .clone();
-                let reader = repo
-                    .storage_mut()
-                    .reader()
-                    .map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
-                // One sweep per (dtype, rank), matching the weight handle but
-                // never fetching it — a name with no weight beside it is not an
-                // imported tensor, and reading the leaves back to find out what
-                // is missing would defeat the point.
-                macro_rules! seen {
-                    ($elem:ty, $rank:literal) => {{
-                        for (n, _h) in triblespace::macros::find!(
-                            (n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
-                             h: Inline<inlineencodings::Handle<
-                                 triblespace::core::blob::encodings::tensor::Tensor<$elem, $rank>>>),
-                            triblespace::macros::pattern!(&facts, [
-                                { _?e @ metadata::name: ?n, attrs::weight::<$elem, $rank>(): ?h },
-                            ])
-                        ) {
-                            let name: anybytes::View<str> =
-                                reader.get(n).map_err(|e| anyhow::anyhow!("name: {e:?}"))?;
-                            present.insert(name.to_string());
-                        }
-                    }};
+            let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+            let team = match mary::model_collection::sole_model_graph_team(&mut store) {
+                Ok(team) => {
+                    let snapshot =
+                        mary::model_collection::snapshot_model_collection_local_latest(
+                            &mut store,
+                            team,
+                        )
+                        .map_err(|e| anyhow::anyhow!("model collection snapshot: {e}"))?;
+                    let facts = mary::model_collection::project_legacy_model_attributes(
+                        snapshot.facts(),
+                    )
+                    .facts;
+                    let reader = snapshot.reader();
+                    // One sweep per (dtype, rank), matching the weight handle
+                    // but never fetching it — a name with no weight beside it
+                    // is not an imported tensor, and reading the leaves back to
+                    // find out what is missing would defeat the point.
+                    macro_rules! seen {
+                        ($elem:ty, $rank:literal) => {{
+                            for (n, _h) in triblespace::macros::find!(
+                                (n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
+                                 h: Inline<inlineencodings::Handle<
+                                     triblespace::core::blob::encodings::tensor::Tensor<$elem, $rank>>>),
+                                triblespace::macros::pattern!(&facts, [
+                                    { _?e @ metadata::name: ?n, attrs::weight::<$elem, $rank>(): ?h },
+                                ])
+                            ) {
+                                let name: anybytes::View<str> = reader
+                                    .get(n)
+                                    .map_err(|e| anyhow::anyhow!("name: {e:?}"))?;
+                                present.insert(name.to_string());
+                            }
+                        }};
+                    }
+                    seen!(BF16, 0);
+                    seen!(BF16, 1);
+                    seen!(BF16, 2);
+                    seen!(BF16, 3);
+                    seen!(BF16, 4);
+                    seen!(F32, 0);
+                    seen!(F32, 1);
+                    seen!(F32, 2);
+                    seen!(F32, 3);
+                    seen!(F32, 4);
+                    println!("resuming   {} tensors already in the pile", present.len());
+                    team
                 }
-                seen!(BF16, 0); seen!(BF16, 1); seen!(BF16, 2); seen!(BF16, 3); seen!(BF16, 4);
-                seen!(F32, 0); seen!(F32, 1); seen!(F32, 2); seen!(F32, 3); seen!(F32, 4);
-                println!("resuming   {} tensors already in the pile", present.len());
-            }
-            Some((repo, ws, TribleSet::new()))
+                Err(mary::model_collection::SoleModelGraphTeamError::None) => {
+                    signing_key.verifying_key()
+                }
+                Err(e) => return Err(anyhow::anyhow!("model collection: {e}")),
+            };
+            Some((store, signing_key, team, Fragment::empty()))
         }
     };
 
@@ -337,9 +311,8 @@ fn main() -> Result<()> {
     let (mut done, mut total_bytes) = (0usize, 0usize);
     let (mut pending, mut commits, mut skipped) = (0usize, 0usize, 0usize);
     // A commit every FLUSH_EVERY tensors rather than one at the end. The
-    // dense side is only ~15 GiB, but it shares a pile with 144 GiB of experts
-    // and the failure is the same one: blobs pile up in the workspace's
-    // MemoryBlobStore, the file stays empty, and an interrupt loses all of it.
+    // dense side is only ~15 GiB, but it shares a pile with 144 GiB of experts.
+    // Publish bounded fragments so an interrupt loses at most one batch.
     const FLUSH_EVERY: usize = 64;
 
     for name in dense.into_iter().take(limit) {
@@ -365,11 +338,16 @@ fn main() -> Result<()> {
         total_bytes += bytes;
         done += 1;
         pending += 1;
-        if let Some((repo, ws, change)) = writing.as_mut() {
+        if let Some((pile, signing_key, team, change)) = writing.as_mut() {
             if pending >= FLUSH_EVERY {
-                let batch = std::mem::replace(change, TribleSet::new());
-                ws.commit(batch, "inkling dense tensors");
-                repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+                let batch = std::mem::replace(change, Fragment::empty());
+                mary::model_collection::publish_model_fragment(
+                    pile,
+                    *team,
+                    signing_key,
+                    batch,
+                )
+                .map_err(|e| anyhow::anyhow!("publish model collection: {e}"))?;
                 commits += 1;
                 pending = 0;
             }
@@ -388,14 +366,18 @@ fn main() -> Result<()> {
     );
 
     println!("skipped    {skipped} tensors already present");
-    if let Some((mut repo, mut ws, change)) = writing {
+    if let Some((mut pile, signing_key, team, change)) = writing {
         if pending > 0 {
-            ws.commit(change, "inkling dense tensors");
-            repo.push(&mut ws)
-                .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+            mary::model_collection::publish_model_fragment(
+                &mut pile,
+                team,
+                &signing_key,
+                change,
+            )
+            .map_err(|e| anyhow::anyhow!("publish model collection: {e}"))?;
             commits += 1;
         }
-        repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
+        pile.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
         println!("committed  {commits} commits");
         println!("wrote      {}", pile_path.unwrap());
     }

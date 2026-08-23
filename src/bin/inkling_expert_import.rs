@@ -16,19 +16,19 @@
 //! exist, and inventing them is how a model comes back as plausible noise.
 //!
 //! It commits PER STACKED MATRIX rather than once at the end, and that is a
-//! correctness property rather than a progress bar. A workspace stages blobs in
-//! memory until it is pushed, so the single-commit shape held the whole share
-//! in RAM and left the pile file empty until the last expert was encoded —
-//! measured at 0 bytes after 71 GiB of experts. For a 144 GiB share that is not
-//! a slow start; it is a run that cannot be interrupted.
+//! correctness property rather than a progress bar. The single-commit shape
+//! held the whole share in RAM and left the pile file empty until the last
+//! expert was encoded — measured at 0 bytes after 71 GiB of experts. For a
+//! 144 GiB share that is not a slow start; it is a run that cannot be
+//! interrupted.
 //!
-//! Because a push uploads a matrix's blobs before it moves the branch head, an
-//! interrupted run leaves a pile whose head names only whole matrices, and the
-//! next run asks the pile what it already holds and skips it. Resuming and
-//! re-running are the same code path: a complete re-run writes nothing and
-//! leaves the file byte-identical. A run killed mid-append leaves a partial
-//! record on the end, which `--repair` truncates — see the block that does it
-//! for why that is a flag and not the open path.
+//! A model-collection commit is appended only after a matrix's blobs, so an
+//! interrupted run authorizes only whole matrices. The next run asks the
+//! collection what it already holds and skips it. Resuming and re-running are
+//! the same code path: a complete re-run writes nothing and leaves the file
+//! byte-identical. A run killed mid-append leaves a partial record on the end,
+//! which `--repair` truncates — see the block that does it for why that is a
+//! flag and not the open path.
 //!
 //!   inkling_expert_import <ckpt-dir> <pile> --layers A-B [--experts N]
 //!                                           [--verify] [--repair]
@@ -41,13 +41,9 @@ use mary::models::inkling::pile::{
 };
 use triblespace::core::blob::encodings::tensor::TensorView;
 use triblespace::core::blob::TryFromBlob;
-use triblespace::core::id::ExclusiveId;
 use triblespace::core::metadata;
-use triblespace::core::repo::Repository;
 use triblespace::macros::entity;
 use triblespace::prelude::*;
-
-
 /// Confirm a pile actually holds a node's whole share, byte for byte.
 ///
 /// The import round-trips each expert as it encodes it, which proves the
@@ -69,30 +65,16 @@ fn verify_share(
 ) -> Result<()> {
     let path = std::path::Path::new(pile_path);
     let mut pile = Pile::open(path).map_err(|e| anyhow::anyhow!("open {path:?}: {e:?}"))?;
-    pile.refresh()
-        .map_err(|e| anyhow::anyhow!("load {path:?}: {e:?}"))?;
-    let mut repo = Repository::new(
-        pile,
-        SigningKey::generate(&mut rand::rngs::OsRng),
-        TribleSet::new(),
+    let team = mary::model_collection::sole_model_graph_team(&mut pile)
+        .map_err(|e| anyhow::anyhow!("{path:?}: model collection: {e}"))?;
+    let snapshot = mary::model_collection::snapshot_model_collection_local_latest(
+        &mut pile,
+        team,
     )
-    .map_err(|e| anyhow::anyhow!("repo: {e:?}"))?;
-    let branch = repo
-        .lookup_branch("inkling")
-        .map_err(|e| anyhow::anyhow!("lookup: {e:?}"))?
-        .context("no 'inkling' branch")?;
-    let mut ws = repo.pull(branch).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-    let head = ws.head().context("'inkling' has no commits")?;
-    let facts: TribleSet = ws
-        .checkout(triblespace::core::repo::ancestors(head))
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
-        .facts()
-        .clone();
-    let reader = repo
-        .storage_mut()
-        .reader()
-        .map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
-    repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
+    .map_err(|e| anyhow::anyhow!("{path:?}: model collection snapshot: {e}"))?;
+    let facts = mary::model_collection::project_legacy_model_attributes(snapshot.facts()).facts;
+    let (_, _, reader) = snapshot.into_parts();
+    pile.close().map_err(|e| anyhow::anyhow!("close {path:?}: {e:?}"))?;
 
     // (name, expert index) -> payload, read AS its type.
     let mut packed_ix: std::collections::HashMap<(String, i64), anybytes::Bytes> =
@@ -298,9 +280,9 @@ fn main() -> Result<()> {
     // it refuses the file outright rather than guessing where the good data
     // stops.
     //
-    // Everything before that offset is intact — the push uploads a matrix's
-    // blobs BEFORE it CASes the branch head, so a torn record is always past
-    // the last head, i.e. bytes nothing references. `amputate` truncates there.
+    // Everything before that offset is intact — a matrix's blobs are appended
+    // BEFORE its collection commit, so a torn record cannot expose a partial
+    // matrix as authoritative. `amputate` truncates there.
     // It stays behind a flag anyway: it is destructive, and an older binary
     // reading a newer record format would see the same "corruption" and eat
     // real data. Loud by default, surgical on request.
@@ -325,111 +307,99 @@ fn main() -> Result<()> {
                 "{pile_path}: {e:?}\n\n\
                  A partial record on the end is what an interrupted append \
                  leaves — the one the process was writing when it died. \
-                 Everything before that offset is intact and the branch head \
-                 never points past it. Re-run with --repair to truncate there \
+                 Everything before that offset is intact and no collection \
+                 commit authorizes the partial matrix. Re-run with --repair to truncate there \
                  and resume; copy the file first if this is not a pile this \
                  importer wrote."
             )
         })?;
     }
 
-    let mut repo = Repository::new(
-        store,
-        SigningKey::generate(&mut rand::rngs::OsRng),
-        TribleSet::new(),
-    )
-    .map_err(|e| anyhow::anyhow!("repository: {e:?}"))?;
-    let branch = repo
-        .ensure_branch("inkling", None)
-        .map_err(|e| anyhow::anyhow!("branch: {e:?}"))?;
-    let mut ws = repo
-        .pull(branch)
-        .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+    let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
 
     // ── what the pile already holds ─────────────────────────────────────────
-    // Asked once, up front, and it is what makes a second run safe. An
-    // expert's entity id is a `ufoid`, so importing the same matrix twice
-    // writes a SECOND entity for every expert in it: the blobs dedupe (they
-    // are content-addressed) but the FACTS do not, and `experts_in_layers`
-    // then hands the runtime each expert twice. One question to the pile turns
-    // that into a skip — which is the resumption mechanism after an
-    // interrupted run and the reason a complete re-run is a no-op rather than
-    // a duplication. Driven by what the pile HAS, matched against what the
+    // Asked once, up front, and it is what makes a second run byte-identical.
+    // Expert entities are content-derived, so their facts would deduplicate,
+    // but a fresh signing key would still append a redundant commit. One query
+    // turns that into a skip — the same resumption path used after an
+    // interruption. Driven by what the pile HAS, matched against what the
     // checkpoint says should be there; nothing is inferred from a file size.
     let mut present: std::collections::HashSet<(String, i64)> = Default::default();
-    if let Some(head) = ws.head() {
-        let facts: TribleSet = ws
-            .checkout(triblespace::core::repo::ancestors(head))
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
-            .facts()
-            .clone();
-        let reader = repo
-            .storage_mut()
-            .reader()
-            .map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
-        // Both element types, because this binary writes both. The weight
-        // handle is matched but never fetched: a name and an index with no
-        // weight beside them is not an imported expert, and reading 144 GiB
-        // back to find out what is missing would defeat the point.
-        for (nh, i, _h) in triblespace::macros::find!(
-            (n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
-             i: i64,
-             h: Inline<inlineencodings::Handle<
-                 triblespace::core::blob::encodings::tensor::Tensor<
-                     triblespace::core::blob::encodings::tensor::elements::NVFP4, 2>>>),
-            triblespace::macros::pattern!(&facts, [
-                { _?e @ metadata::name: ?n, attrs::expert_index: ?i, attrs::weight_nvfp4_2: ?h },
-            ])
-        ) {
-            let name: anybytes::View<str> =
-                reader.get(nh).map_err(|e| anyhow::anyhow!("name: {e:?}"))?;
-            present.insert((name.to_string(), i));
+    let team = match mary::model_collection::sole_model_graph_team(&mut store) {
+        Ok(team) => {
+            let snapshot = mary::model_collection::snapshot_model_collection_local_latest(
+                &mut store,
+                team,
+            )
+            .map_err(|e| anyhow::anyhow!("model collection snapshot: {e}"))?;
+            let facts = mary::model_collection::project_legacy_model_attributes(snapshot.facts())
+                .facts;
+            let reader = snapshot.reader();
+            // Both element types, because this binary writes both. The weight
+            // handle is matched but never fetched: a name and an index with no
+            // weight beside them is not an imported expert, and reading 144
+            // GiB back to find out what is missing would defeat the point.
+            for (nh, i, _h) in triblespace::macros::find!(
+                (n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
+                 i: i64,
+                 h: Inline<inlineencodings::Handle<
+                     triblespace::core::blob::encodings::tensor::Tensor<
+                         triblespace::core::blob::encodings::tensor::elements::NVFP4, 2>>>),
+                triblespace::macros::pattern!(&facts, [
+                    { _?e @ metadata::name: ?n, attrs::expert_index: ?i,
+                      attrs::weight_nvfp4_2: ?h },
+                ])
+            ) {
+                let name: anybytes::View<str> = reader
+                    .get(nh)
+                    .map_err(|e| anyhow::anyhow!("name: {e:?}"))?;
+                present.insert((name.to_string(), i));
+            }
+            for (nh, i, _h) in triblespace::macros::find!(
+                (n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
+                 i: i64,
+                 h: Inline<inlineencodings::Handle<
+                     triblespace::core::blob::encodings::tensor::Tensor<
+                         triblespace::core::blob::encodings::tensor::elements::BF16, 2>>>),
+                triblespace::macros::pattern!(&facts, [
+                    { _?e @ metadata::name: ?n, attrs::expert_index: ?i,
+                      attrs::weight::<triblespace::core::blob::encodings::tensor::elements::BF16, 2>(): ?h },
+                ])
+            ) {
+                let name: anybytes::View<str> = reader
+                    .get(nh)
+                    .map_err(|e| anyhow::anyhow!("name: {e:?}"))?;
+                present.insert((name.to_string(), i));
+            }
+            println!("resuming   {} experts already in the pile", present.len());
+            team
         }
-        for (nh, i, _h) in triblespace::macros::find!(
-            (n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
-             i: i64,
-             h: Inline<inlineencodings::Handle<
-                 triblespace::core::blob::encodings::tensor::Tensor<
-                     triblespace::core::blob::encodings::tensor::elements::BF16, 2>>>),
-            triblespace::macros::pattern!(&facts, [
-                { _?e @ metadata::name: ?n, attrs::expert_index: ?i,
-                  attrs::weight::<triblespace::core::blob::encodings::tensor::elements::BF16, 2>(): ?h },
-            ])
-        ) {
-            let name: anybytes::View<str> =
-                reader.get(nh).map_err(|e| anyhow::anyhow!("name: {e:?}"))?;
-            present.insert((name.to_string(), i));
+        Err(mary::model_collection::SoleModelGraphTeamError::None) => {
+            signing_key.verifying_key()
         }
-        println!("resuming   {} experts already in the pile", present.len());
-    }
+        Err(e) => return Err(anyhow::anyhow!("model collection: {e}")),
+    };
 
-    let mut change = TribleSet::new();
+    let mut change = Fragment::empty();
 
     let (mut n, mut total) = (0usize, 0usize);
     let (mut pending, mut commits, mut skipped) = (0usize, 0usize, 0usize);
 
-    // ── one commit per stacked matrix, pushed the moment it is built ────────
-    // This binary used to accumulate every blob in `ws.staged` — a
-    // MemoryBlobStore — and issue a single commit and push after the last
-    // expert. Two consequences, both measured: the pile file stayed 0 bytes
-    // through 71 GiB of experts, and the resident set grew with the model. At
-    // 144 GiB that is not a slow start, it is a run that cannot be
-    // interrupted; killing it at 90% loses all of it.
-    //
-    // `try_push` uploads the staged blobs FIRST and only then CASes the branch
-    // head, so the head never names a matrix whose blobs are not already on
-    // disk. Interrupt anywhere and the pile is valid, holding whole matrices;
-    // the worst case is orphan blobs from a matrix whose CAS never landed, and
-    // a content-addressed store is exactly where an orphan blob costs nothing.
-    // The push also clears `staged`, which is what stops the resident set from
-    // tracking the model rather than the matrix.
+    // ── one commit per stacked matrix, published as it is built ─────────────
+    // Blobs land first and the signed collection commit last. Interrupt
+    // anywhere and the pile authorizes only whole matrices; the worst case is
+    // orphan blobs from a matrix whose commit never landed.
     macro_rules! flush {
-        ($msg:expr) => {
+        () => {
             if pending > 0 {
-                let batch = std::mem::replace(&mut change, TribleSet::new());
-                ws.commit(batch, $msg);
-                repo.push(&mut ws)
-                    .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+                let batch = std::mem::replace(&mut change, Fragment::empty());
+                mary::model_collection::publish_model_fragment(
+                    &mut store,
+                    team,
+                    &signing_key,
+                    batch,
+                )
+                .map_err(|e| anyhow::anyhow!("publish model collection: {e}"))?;
                 commits += 1;
                 pending = 0;
             }
@@ -481,17 +451,18 @@ fn main() -> Result<()> {
             anyhow::ensure!(scale2 == q.scale2, "{base}[{e}]: global scale differs");
 
             let bytes = blob.bytes.len();
-            let handle = ws.put(blob);
-            let name_h = ws.put::<blobencodings::UTF8String, _>(base.to_string());
-            let mut facts = entity! { &ufoid() @
+            let handle = store
+                .put(blob)
+                .map_err(|err| anyhow::anyhow!("{base}[{e}]: store expert: {err:?}"))?;
+            let name_h = store
+                .put::<blobencodings::UTF8String, _>(base.to_string())
+                .map_err(|err| anyhow::anyhow!("{base}[{e}]: store name: {err:?}"))?;
+            let facts = entity! { _ @
                 attrs::weight_nvfp4_2: handle,
                 attrs::expert_index: e as i64,
                 metadata::name: name_h,
+                attrs::layer?: layer,
             };
-            if let Some(l) = layer {
-                let root = facts.root().expect("rooted");
-                facts += entity! { ExclusiveId::force_ref(&root) @ attrs::layer: l };
-            }
             change += facts;
 
             total += bytes;
@@ -506,7 +477,7 @@ fn main() -> Result<()> {
                 );
             }
         }
-        flush!(&format!("inkling experts: {base}"));
+        flush!();
         println!("  {base}: {wrote} written, {} already present", take - wrote);
     }
 
@@ -550,17 +521,18 @@ fn main() -> Result<()> {
             );
 
             let bytes = blob.bytes.len();
-            let handle = ws.put(blob);
-            let name_h = ws.put::<blobencodings::UTF8String, _>(base.to_string());
-            let mut facts = entity! { &ufoid() @
+            let handle = store
+                .put(blob)
+                .map_err(|err| anyhow::anyhow!("{base}[{e}]: store expert: {err:?}"))?;
+            let name_h = store
+                .put::<blobencodings::UTF8String, _>(base.to_string())
+                .map_err(|err| anyhow::anyhow!("{base}[{e}]: store name: {err:?}"))?;
+            let facts = entity! { _ @
                 attrs::weight::<triblespace::core::blob::encodings::tensor::elements::BF16, 2>(): handle,
                 attrs::expert_index: e as i64,
                 metadata::name: name_h,
+                attrs::layer?: layer,
             };
-            if let Some(l) = layer {
-                let root = facts.root().expect("rooted");
-                facts += entity! { ExclusiveId::force_ref(&root) @ attrs::layer: l };
-            }
             change += facts;
             total += bytes;
             pending += 1;
@@ -573,7 +545,7 @@ fn main() -> Result<()> {
                 );
             }
         }
-        flush!(&format!("inkling experts: {base}"));
+        flush!();
         println!("  {base}: {wrote} BF16 written, {} already present", take - wrote);
     }
     n += bf16_n;
@@ -581,7 +553,7 @@ fn main() -> Result<()> {
     // Nothing is left staged: every matrix pushed as it finished, so this is
     // a close rather than the one write the whole run was building toward.
     debug_assert_eq!(pending, 0, "a matrix was built and never flushed");
-    repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
+    store.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
 
     println!(
         "imported   {n} experts in {commits} commits, {:.2} GiB, each verified \

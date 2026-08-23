@@ -739,8 +739,8 @@ pub struct PileSource {
     /// mapping does not carry an fd and `posix_fadvise` needs one.
     path: std::path::PathBuf,
     reader: triblespace::core::repo::pile::PileReader,
-    /// Everything the branch asserts, kept rather than dropped after the index
-    /// is built.
+    /// Everything the model collection asserts, kept rather than dropped after
+    /// the index is built.
     ///
     /// It costs a few MB against a 159 GiB model and it is what makes the pile
     /// AUTHORITATIVE rather than merely sufficient for weights: the checkpoint's
@@ -774,48 +774,28 @@ struct CopiedExpert {
 }
 
 impl PileSource {
-    /// Open a pile and resolve every tensor of the model on `branch`.
+    /// Open a pile and resolve every tensor in its sole model collection.
     ///
     /// Reads the dense leaves (their headers and their content hashes; the
     /// payloads stay in the mapping) and takes the experts as handles.
-    pub fn open(path: &std::path::Path, branch: &str) -> Result<Self> {
+    pub fn open(path: &std::path::Path) -> Result<Self> {
         use triblespace::core::inline::encodings::hash::Handle;
         use triblespace::core::metadata;
-        use triblespace::core::repo::{ancestors, Repository};
         use triblespace::macros::{find, pattern};
         use triblespace::prelude::*;
 
         let t_open = std::time::Instant::now();
         let mut pile = Pile::open(path).map_err(|e| anyhow::anyhow!("open {path:?}: {e:?}"))?;
-        // Read path: never amputate. A torn tail is an operator decision.
-        pile.refresh()
-            .map_err(|e| anyhow::anyhow!("load {path:?}: {e:?}"))?;
-        let mut repo = Repository::new(
-            pile,
-            ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng),
-            TribleSet::new(),
-        )
-        .map_err(|e| anyhow::anyhow!("repo: {e:?}"))?;
-        let branch_id = repo
-            .lookup_branch(branch)
-            .map_err(|e| anyhow::anyhow!("lookup {branch}: {e:?}"))?
-            .ok_or_else(|| anyhow::anyhow!("no {branch:?} branch in {path:?}"))?;
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-        let head = ws
-            .head()
-            .ok_or_else(|| anyhow::anyhow!("{branch:?} has no commits"))?;
-        let facts: TribleSet = ws
-            .checkout(ancestors(head))
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
-            .facts()
-            .clone();
-        let reader = repo
-            .storage_mut()
-            .reader()
-            .map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
-        repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
+        let team = crate::model_collection::sole_model_graph_team(&mut pile)
+            .map_err(|e| anyhow::anyhow!("{path:?}: model collection: {e}"))?;
+        let snapshot =
+            crate::model_collection::snapshot_model_collection_local_latest(&mut pile, team)
+                .map_err(|e| anyhow::anyhow!("{path:?}: model collection snapshot: {e}"))?;
+        let facts =
+            crate::model_collection::project_legacy_model_attributes(snapshot.facts()).facts;
+        let (_, _, reader) = snapshot.into_parts();
+        pile.close()
+            .map_err(|e| anyhow::anyhow!("close {path:?}: {e:?}"))?;
         let open_secs = t_open.elapsed().as_secs_f64();
         let t_experts = std::time::Instant::now();
 
@@ -963,9 +943,12 @@ impl PileSource {
         sweep_dense!(F32, 3, Elem::F32);
         sweep_dense!(F32, 4, Elem::F32);
 
-        anyhow::ensure!(!dense.is_empty(), "{path:?}: no dense leaves on {branch:?}");
+        anyhow::ensure!(
+            !dense.is_empty(),
+            "{path:?}: model collection has no dense leaves"
+        );
         println!(
-            "    index build: pile open + checkout {open_secs:.1}s, {} expert handles {experts_secs:.1}s, {} dense leaves {:.1}s",
+            "    index build: pile open + collection snapshot {open_secs:.1}s, {} expert handles {experts_secs:.1}s, {} dense leaves {:.1}s",
             experts.len(),
             dense.len(),
             t_dense.elapsed().as_secs_f64(),
@@ -1176,7 +1159,7 @@ impl PileSource {
         )])
     }
 
-    /// Everything the branch asserts.
+    /// Everything the model collection asserts.
     pub fn facts(&self) -> &triblespace::prelude::TribleSet {
         &self.facts
     }
@@ -1777,7 +1760,6 @@ mod tests {
     use super::*;
     use crate::models::inkling::budget::{AdmissionPolicy, StorageDType};
     use crate::models::inkling::pool::AllocatorConfig;
-    use triblespace::core::blob::TryFromBlob;
     use triblespace::core::blob::encodings::tensor::TensorView;
 
     /// A synthetic expert with the real checkpoint's proportions, scaled down.
