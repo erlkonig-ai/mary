@@ -61,7 +61,7 @@ fn main() {
         .expect("load tiny native model collection snapshot");
     let selected = SelectedModelIndex::from_snapshot(snapshot, ModelSelector::Only)
         .expect("select the only tiny model root");
-    assert_eq!(selected.root(), imported_root);
+    assert_eq!(selected.single_root(), Some(imported_root));
     let leaf = selected.handles().get("w").expect("weight 'w' in pile");
     assert_eq!(leaf.elem(), Elem::F16, "expected f16 leaf");
 

@@ -9,3 +9,9 @@ pub mod embedder;
 pub mod layers;
 pub mod preprocess;
 pub mod vision;
+
+/// Canonical coordinate of the independently persisted text backbone.
+pub const NOMIC_MM7B_TEXT_SOURCE: &str = "nomic-ai/nomic-embed-multimodal-7b#text";
+
+/// Canonical coordinate of the independently persisted vision tower.
+pub const NOMIC_MM7B_VISION_SOURCE: &str = "nomic-ai/nomic-embed-multimodal-7b#vision";

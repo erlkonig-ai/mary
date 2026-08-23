@@ -63,7 +63,7 @@ fn main() {
         },
     )
     .expect("select imported model for streaming");
-    assert_eq!(selected.root(), imported_root);
+    assert_eq!(selected.single_root(), Some(imported_root));
     let (streamed_model, _vision) = mary::persist::load_gemma4_streaming_from_index::<B, _>(
         selected,
         Gemma4Config::load(Path::new(&config_path)),

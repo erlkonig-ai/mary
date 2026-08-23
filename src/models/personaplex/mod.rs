@@ -116,6 +116,11 @@ impl<R> PersonaPlexBundle<R> {
 
 impl<R: BlobStoreGet> PersonaPlexWeights<R> {
     fn admit(selected: SelectedModelIndex<R>) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            selected.single_root().is_some(),
+            "PersonaPlex exact weights require one complete model root, found {}",
+            selected.roots().len()
+        );
         if let Some(name) = selected
             .handles()
             .iter()
@@ -223,8 +228,30 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
                 continue;
             }
 
-            let weights = Self::from_graph(&facts, reader.clone())
-                .with_context(|| format!("validate PersonaPlex bundle {}", commit.id()))?;
+            // Root selection binds admission to the identity in the signed
+            // token. Preserve the model schema's functional-field invariant
+            // explicitly: the asserted root must carry exactly one source and
+            // one quantization, with the PersonaPlex/native values.
+            crate::selection::validate_model_source_coordinates(
+                &facts,
+                &reader,
+                root,
+                SOURCE,
+                crate::persist::QUANTIZATION_NATIVE,
+            )
+            .with_context(|| {
+                format!("validate PersonaPlex coordinates in bundle {}", commit.id())
+            })?;
+
+            // The signed token already names the exact root. Bind selection to
+            // that identity rather than rediscovering it from an ambient
+            // source coordinate and comparing only afterwards.
+            let weights = Self::admit(SelectedModelIndex::from_graph(
+                &facts,
+                reader.clone(),
+                ModelSelector::Root(root),
+            )?)
+            .with_context(|| format!("validate PersonaPlex bundle {}", commit.id()))?;
             anyhow::ensure!(
                 weights.root() == root,
                 "bundle COMMIT {} asserts root {root}, but H selects {}",
@@ -270,7 +297,9 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
 
     /// Content-addressed root of the complete exact model.
     pub fn root(&self) -> triblespace::prelude::Id {
-        self.selected.root()
+        self.selected
+            .single_root()
+            .expect("PersonaPlex admission requires one exact root")
     }
 
     /// Number of tensors in the LM + Mimi union.
@@ -486,6 +515,50 @@ mod native_authority_tests {
     }
 
     #[test]
+    fn signed_bundle_root_is_selected_from_a_multi_root_archive() {
+        let file = TestPile::new();
+        let mut asserted = model_fragment(
+            &[("asserted.weight", &[1.0], &[1])],
+            false,
+            crate::leaf::Form::TwoBlob,
+        );
+        let root = asserted.root().expect("asserted PersonaPlex root");
+        let ambient = model_fragment(
+            &[("ambient.weight", &[2.0], &[1])],
+            false,
+            crate::leaf::Form::TwoBlob,
+        );
+        let ambient_root = ambient.root().expect("ambient PersonaPlex root");
+        asserted += ambient;
+        let (_, facts, metafacts, blobs) = asserted.into_parts();
+        let combined = Fragment::rooted_from_parts(root, facts, metafacts, blobs);
+
+        let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
+        crate::model_collection::publish_model_bundle_fragment(
+            &mut pile,
+            test_team(),
+            &SigningKey::from_bytes(&[0x50; 32]),
+            root,
+            combined,
+        )
+        .expect("publish exact root with an ambient peer");
+        let snapshot = crate::model_collection::snapshot_model_bundle_collection_local_latest(
+            &mut pile,
+            test_team(),
+        )
+        .expect("freeze multi-root PersonaPlex bundle");
+        let bundle = PersonaPlexWeights::from_bundle_snapshot(test_team(), snapshot)
+            .expect("signed token must select its asserted root exactly");
+        assert_eq!(bundle.authority().model_root(), root);
+        assert_eq!(bundle.weights().root(), root);
+        assert_ne!(bundle.weights().root(), ambient_root);
+        assert!(bundle.weights().exact().contains_key("asserted.weight"));
+        assert!(!bundle.weights().exact().contains_key("ambient.weight"));
+        drop(bundle);
+        pile.close().expect("close synthetic PersonaPlex pile");
+    }
+
+    #[test]
     fn bundle_snapshot_cannot_be_relabelled_as_another_team() {
         let file = TestPile::new();
         let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
@@ -536,6 +609,75 @@ mod native_authority_tests {
             .err()
             .expect("f16 exact coordinate must fail");
         assert!(format!("{error:#}").contains("is not f32"), "{error:#}");
+        pile.close().expect("close synthetic PersonaPlex pile");
+    }
+
+    #[test]
+    fn bundle_root_with_nonfunctional_coordinates_fails_closed() {
+        let file = TestPile::new();
+        let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
+        let mut fragment = model_fragment(
+            &[("weight", &[1.0], &[1])],
+            false,
+            crate::leaf::Form::TwoBlob,
+        );
+        let root = fragment.root().unwrap();
+        let other_source = fragment.put::<UTF8String, _>("example/other".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&root) @ attrs::source: other_source };
+        crate::model_collection::publish_model_bundle_fragment(
+            &mut pile,
+            test_team(),
+            &SigningKey::from_bytes(&[0x50; 32]),
+            root,
+            fragment,
+        )
+        .expect("publish malformed PersonaPlex root");
+        let snapshot = crate::model_collection::snapshot_model_bundle_collection_local_latest(
+            &mut pile,
+            test_team(),
+        )
+        .expect("freeze malformed PersonaPlex prefix");
+        let error = PersonaPlexWeights::from_bundle_snapshot(test_team(), snapshot)
+            .err()
+            .expect("nonfunctional source coordinate must fail");
+        assert!(
+            format!("{error:#}").contains("ambiguous source field"),
+            "{error:#}"
+        );
+        pile.close().expect("close synthetic PersonaPlex pile");
+    }
+
+    #[test]
+    fn bundle_root_with_nonfunctional_quantization_fails_closed() {
+        let file = TestPile::new();
+        let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
+        let mut fragment = model_fragment(
+            &[("weight", &[1.0], &[1])],
+            false,
+            crate::leaf::Form::TwoBlob,
+        );
+        let root = fragment.root().unwrap();
+        fragment += entity! { ExclusiveId::force_ref(&root) @ attrs::quantization: "other" };
+        crate::model_collection::publish_model_bundle_fragment(
+            &mut pile,
+            test_team(),
+            &SigningKey::from_bytes(&[0x50; 32]),
+            root,
+            fragment,
+        )
+        .expect("publish malformed PersonaPlex root");
+        let snapshot = crate::model_collection::snapshot_model_bundle_collection_local_latest(
+            &mut pile,
+            test_team(),
+        )
+        .expect("freeze malformed PersonaPlex prefix");
+        let error = PersonaPlexWeights::from_bundle_snapshot(test_team(), snapshot)
+            .err()
+            .expect("nonfunctional quantization coordinate must fail");
+        assert!(
+            format!("{error:#}").contains("ambiguous quantization field"),
+            "{error:#}"
+        );
         pile.close().expect("close synthetic PersonaPlex pile");
     }
 

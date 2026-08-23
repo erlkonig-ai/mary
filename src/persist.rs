@@ -2035,7 +2035,7 @@ fn select_native_model_index(
     let snapshot = crate::model_collection::load_model_collection_local_latest(pile_path, team)
         .with_context(|| format!("load local-latest native model snapshot from {pile_path:?}"))?;
     crate::selection::SelectedModelIndex::from_snapshot(snapshot, selector)
-        .with_context(|| format!("select one native model root in {pile_path:?}"))
+        .with_context(|| format!("select one native model component in {pile_path:?}"))
 }
 
 /// Stream a Gemma 4 model from one already-selected native model index: load
@@ -2408,16 +2408,60 @@ fn require_f16_model_index<R>(
         .min()
     {
         anyhow::bail!(
-            "model root {} is not an aliased-f16 model: tensor {name:?} has an f32 leaf",
-            selected.root()
+            "model roots {:?} are not an aliased-f16 model: tensor {name:?} has an f32 leaf",
+            selected.roots()
         );
     }
     Ok(())
 }
 
+/// Select the canonical text and vision components of
+/// `nomic-embed-multimodal-7b` from one frozen snapshot.
+///
+/// The two component coordinates are deliberately distinct. Each may itself
+/// span several real roots, while the final explicit composition checks tensor
+/// names for disjointness over the whole model and never invents a union root.
+#[cfg(feature = "gemma")]
+pub fn select_nomic_mm7b_index_from_snapshot<R: BlobStoreGet>(
+    snapshot: CollectionSnapshot<R>,
+) -> anyhow::Result<crate::selection::SelectedModelIndex<R>> {
+    let (facts, _, reader) = snapshot.into_parts();
+    let mut roots = crate::selection::select_model_roots(
+        &facts,
+        &reader,
+        crate::selection::ModelSelector::Source {
+            source: crate::models::qwen2_5_vl::NOMIC_MM7B_TEXT_SOURCE,
+            quantization: QUANTIZATION_NATIVE,
+        },
+    )?;
+    roots.extend(crate::selection::select_model_roots(
+        &facts,
+        &reader,
+        crate::selection::ModelSelector::Source {
+            source: crate::models::qwen2_5_vl::NOMIC_MM7B_VISION_SOURCE,
+            quantization: QUANTIZATION_NATIVE,
+        },
+    )?);
+    crate::selection::SelectedModelIndex::from_roots(&facts, reader, roots)
+        .context("compose Nomic MM7B text and vision roots")
+}
+
+/// Materialize the canonical text + vision Nomic MM7B index for CPU parity
+/// and non-aliased consumers.
+#[cfg(feature = "gemma")]
+pub fn load_nomic_mm7b_keymap_from_snapshot<R: BlobStoreGet>(
+    snapshot: CollectionSnapshot<R>,
+) -> anyhow::Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
+    let selected = select_nomic_mm7b_index_from_snapshot(snapshot)?;
+    Ok(selected
+        .handles()
+        .iter()
+        .map(|(name, leaf)| (name.clone(), leaf.to_f32_shape()))
+        .collect())
+}
+
 /// Load `nomic-embed-multimodal-7b` (Qwen2.5-VL backbone + vision tower) from
-/// one already-frozen native model-collection snapshot and an explicit model
-/// selector.
+/// one already-frozen native model-collection snapshot.
 ///
 /// Every selected f16 tensor blob is aliased straight from the snapshot's mmap
 /// onto the Metal GPU (no copy, no f32 materialization). Each GPU buffer clones
@@ -2432,7 +2476,6 @@ fn require_f16_model_index<R>(
 #[cfg(all(feature = "gemma", target_os = "macos"))]
 pub fn load_nomic_mm7b_aliased_from_snapshot(
     snapshot: CollectionSnapshot<triblespace::core::repo::pile::PileReader>,
-    selector: crate::selection::ModelSelector<'_>,
     tokenizer_path: &Path,
     device: burn::backend::wgpu::WgpuDevice,
 ) -> anyhow::Result<
@@ -2441,7 +2484,7 @@ pub fn load_nomic_mm7b_aliased_from_snapshot(
     use crate::models::qwen2_5_vl::embedder::NomicMultimodalEmbedder;
     use crate::nn::backend::B;
 
-    let selected = crate::selection::SelectedModelIndex::from_snapshot(snapshot, selector)?;
+    let selected = select_nomic_mm7b_index_from_snapshot(snapshot)?;
     require_f16_model_index(&selected)?;
     let (_, index, reader) = selected.into_parts();
 
@@ -2458,7 +2501,7 @@ pub fn load_nomic_mm7b_aliased_from_snapshot(
     Ok(embedder)
 }
 
-#[cfg(all(test, feature = "gemma", target_os = "macos"))]
+#[cfg(all(test, feature = "gemma"))]
 mod native_model_snapshot_tests {
     use super::*;
     use crate::format::attrs;
@@ -2507,7 +2550,7 @@ mod native_model_snapshot_tests {
         tensor_name: &str,
         value: f32,
         f16: bool,
-    ) {
+    ) -> Id {
         let leaf = if f16 {
             crate::format::put_raw_f16(pile, &[value], &[1]).unwrap()
         } else {
@@ -2536,6 +2579,7 @@ mod native_model_snapshot_tests {
             Fragment::rooted(root_id, facts),
         )
         .unwrap();
+        root_id
     }
 
     fn open_test_pile(file: &TestPile) -> Pile {
@@ -2545,7 +2589,7 @@ mod native_model_snapshot_tests {
     }
 
     #[test]
-    fn native_snapshot_selection_keeps_the_reader_and_rejects_ambiguity() {
+    fn native_snapshot_selection_keeps_the_reader_and_accepts_disjoint_shards() {
         let file = TestPile::new("selection");
         let mut pile = open_test_pile(&file);
         let signer = SigningKey::from_bytes(&[0xA1; 32]);
@@ -2587,6 +2631,7 @@ mod native_model_snapshot_tests {
             },
         )
         .expect("strict source selection");
+        #[cfg(target_os = "macos")]
         require_f16_model_index(&selected).expect("selected model is f16");
         let (_, index, _reader) = selected.into_parts();
         assert_eq!(index.len(), 1);
@@ -2611,21 +2656,50 @@ mod native_model_snapshot_tests {
             &file.path,
             signer.verifying_key(),
         )
-        .expect("ambiguous native snapshot");
-        let error = match crate::selection::SelectedModelIndex::from_snapshot(
+        .expect("sharded native snapshot");
+        let selected = crate::selection::SelectedModelIndex::from_snapshot(
             snapshot,
             crate::selection::ModelSelector::Source {
                 source: "example/target",
                 quantization: QUANTIZATION_NATIVE,
             },
-        ) {
-            Ok(_) => panic!("ambiguous coordinates were accepted"),
-            Err(error) => format!("{error:#}"),
-        };
-        assert!(error.contains("ambiguous model root"), "{error}");
+        )
+        .expect("same-coordinate disjoint roots are shards");
+        assert_eq!(selected.roots().len(), 2);
+        assert_eq!(selected.handles().len(), 2);
+        assert!(selected.handles().contains_key("target.weight"));
+        assert!(selected.handles().contains_key("second.weight"));
+
+        let mut pile = open_test_pile(&file);
+        add_model(
+            &mut pile,
+            &signer,
+            "example/target",
+            "target.weight",
+            9.5,
+            true,
+        );
+        pile.close().unwrap();
+        let snapshot = crate::model_collection::load_model_collection_local_latest(
+            &file.path,
+            signer.verifying_key(),
+        )
+        .expect("conflicting native snapshot");
+        let error = crate::selection::SelectedModelIndex::from_snapshot(
+            snapshot,
+            crate::selection::ModelSelector::Source {
+                source: "example/target",
+                quantization: QUANTIZATION_NATIVE,
+            },
+        )
+        .err()
+        .map(|error| format!("{error:#}"))
+        .expect("a shadowed tensor was accepted");
+        assert!(error.contains("not shards of one component"), "{error}");
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn aliased_snapshot_rejects_f32_before_model_construction() {
         let file = TestPile::new("f32-rejection");
         let mut pile = open_test_pile(&file);
@@ -2648,5 +2722,74 @@ mod native_model_snapshot_tests {
             error.contains("tensor \"f32.weight\" has an f32 leaf"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn nomic_mm7b_composes_explicit_text_and_vision_roots() {
+        let file = TestPile::new("nomic-components");
+        let mut pile = open_test_pile(&file);
+        let signer = SigningKey::from_bytes(&[0xC3; 32]);
+        let text_root = add_model(
+            &mut pile,
+            &signer,
+            crate::models::qwen2_5_vl::NOMIC_MM7B_TEXT_SOURCE,
+            "layers.0.weight",
+            1.0,
+            true,
+        );
+        let vision_root = add_model(
+            &mut pile,
+            &signer,
+            crate::models::qwen2_5_vl::NOMIC_MM7B_VISION_SOURCE,
+            "blocks.0.weight",
+            2.0,
+            true,
+        );
+        add_model(
+            &mut pile,
+            &signer,
+            "example/unrelated",
+            "unrelated.weight",
+            3.0,
+            true,
+        );
+        pile.close().unwrap();
+
+        let snapshot = crate::model_collection::load_model_collection_local_latest(
+            &file.path,
+            signer.verifying_key(),
+        )
+        .expect("Nomic component snapshot");
+        let selected = select_nomic_mm7b_index_from_snapshot(snapshot).unwrap_or_else(|error| {
+            panic!("compose explicit text and vision components: {error:#}")
+        });
+        let mut expected = vec![text_root, vision_root];
+        expected.sort();
+        assert_eq!(selected.roots(), expected);
+        assert_eq!(selected.single_root(), None);
+        assert!(selected.handles().contains_key("layers.0.weight"));
+        assert!(selected.handles().contains_key("blocks.0.weight"));
+        assert!(!selected.handles().contains_key("unrelated.weight"));
+
+        let mut pile = open_test_pile(&file);
+        add_model(
+            &mut pile,
+            &signer,
+            crate::models::qwen2_5_vl::NOMIC_MM7B_VISION_SOURCE,
+            "layers.0.weight",
+            4.0,
+            true,
+        );
+        pile.close().unwrap();
+        let snapshot = crate::model_collection::load_model_collection_local_latest(
+            &file.path,
+            signer.verifying_key(),
+        )
+        .expect("conflicting Nomic component snapshot");
+        let error = select_nomic_mm7b_index_from_snapshot(snapshot)
+            .err()
+            .map(|error| format!("{error:#}"))
+            .expect("cross-component tensor shadowing was accepted");
+        assert!(error.contains("not shards of one component"), "{error}");
     }
 }

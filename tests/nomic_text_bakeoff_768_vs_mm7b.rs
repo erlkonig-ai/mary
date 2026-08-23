@@ -158,10 +158,6 @@ fn text_retrieval_bakeoff() {
     .expect("load native model collection snapshot");
     let nomic7b = mary::persist::load_nomic_mm7b_aliased_from_snapshot(
         snapshot,
-        mary::selection::ModelSelector::Source {
-            source: "nomic-ai/nomic-embed-multimodal-7b",
-            quantization: mary::persist::QUANTIZATION_NATIVE,
-        },
         &tok_path,
         device.clone(),
     )

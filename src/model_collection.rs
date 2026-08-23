@@ -1902,7 +1902,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(selected.root(), model_root);
+        assert_eq!(selected.single_root(), Some(model_root));
         let leaf = &selected.handles()["encoder.weight"];
         assert_eq!(leaf.elem(), crate::leaf::Elem::F32);
         let data: View<[f32]> = leaf.view_f32().expect("f32 leaves serve a view");

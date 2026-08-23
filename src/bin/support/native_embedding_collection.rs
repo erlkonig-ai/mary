@@ -135,7 +135,7 @@ fn publish_embedding_candidate_with_contract_impl(
         },
     )?;
     anyhow::ensure!(
-        selected.root() == model_root,
+        selected.single_root() == Some(model_root),
         "staged embedding root differs from the unique Source/native root"
     );
     validate_f32_model(&selected, contract)?;

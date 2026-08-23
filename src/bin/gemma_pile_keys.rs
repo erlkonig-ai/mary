@@ -4,14 +4,19 @@
 //! built for (2026-07-11): gemma_31b.pile has ZERO model.audio_tower.* keys —
 //! google/gemma-4-31B-it ships without the audio path (it lives in the E-lineage).
 //!
-//!   cargo run --release --features gemma --bin gemma_pile_keys -- <pile> [filter]
+//!   cargo run --release --features gemma --bin gemma_pile_keys -- <pile> <source> [filter]
 
 use std::path::Path;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let pile = args.get(1).expect("usage: gemma_pile_keys <pile> [filter]");
-    let filter = args.get(2).map(|s| s.as_str()).unwrap_or("");
+    let pile = args
+        .get(1)
+        .expect("usage: gemma_pile_keys <pile> <source> [filter]");
+    let source = args
+        .get(2)
+        .expect("usage: gemma_pile_keys <pile> <source> [filter]");
+    let filter = args.get(3).map(|s| s.as_str()).unwrap_or("");
 
     let team = mary::model_collection::model_graph_team_at(Path::new(pile))
         .expect("sole model-graph team in the pile");
@@ -19,9 +24,12 @@ fn main() {
         .expect("load native model snapshot");
     let selected = mary::selection::SelectedModelIndex::from_snapshot(
         snapshot,
-        mary::selection::ModelSelector::Only,
+        mary::selection::ModelSelector::Source {
+            source,
+            quantization: mary::persist::QUANTIZATION_NATIVE,
+        },
     )
-    .expect("select the only native model root");
+    .expect("select the native model component");
     let mut keys: Vec<&String> = selected.handles().keys().collect();
     keys.sort();
     println!("total tensor keys: {}", keys.len());

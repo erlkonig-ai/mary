@@ -120,9 +120,12 @@ fn embed_query_and_document_parity() {
     let map = mary::selection::load_keymap_from_graph(
         snapshot.facts(),
         snapshot.reader(),
-        mary::selection::ModelSelector::Only,
+        mary::selection::ModelSelector::Source {
+            source: mary::models::qwen2_5_vl::NOMIC_MM7B_TEXT_SOURCE,
+            quantization: mary::persist::QUANTIZATION_NATIVE,
+        },
     )
-    .expect("select and materialize the only model root");
+    .expect("select and materialize the Nomic text component");
     let w = KeymapW { map, device };
     let model = QwenTextModel::<B>::load(&w, &Qwen2_5VlTextConfig::nomic_mm7b(), &device);
     let tokenizer = Tokenizer::from_file(&tok_path).expect("tokenizer");

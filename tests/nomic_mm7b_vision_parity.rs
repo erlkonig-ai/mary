@@ -8,7 +8,7 @@
 //!
 //! Prereqs (disk-gated; SKIPS cleanly if missing):
 //!   1. python3 scripts/nomic_mm7b_vision_dump.py <SCRATCH>/vision_merged/vision_tower.safetensors
-//!   2. cargo run --release --features import,hub --bin mary -- import <SCRATCH>/vision_merged --pile <SCRATCH>/nomic_mm7b_vision.pile --key <SCRATCH>/model.key --name nomic-ai/nomic-embed-multimodal-7b --dtype f16
+//!   2. cargo run --release --features import,hub --bin mary -- import <SCRATCH>/vision_merged --pile <SCRATCH>/nomic_mm7b_vision.pile --key <SCRATCH>/model.key --name 'nomic-ai/nomic-embed-multimodal-7b#vision' --dtype f16
 //!   3. NOMIC_MM7B_VISION_PILE=<SCRATCH>/nomic_mm7b_vision.pile cargo test --release --features gemma --test nomic_mm7b_vision_parity -- --nocapture
 
 use burn::prelude::*;
@@ -105,9 +105,12 @@ fn vision_tower_parity() {
     let map = mary::selection::load_keymap_from_graph(
         snapshot.facts(),
         snapshot.reader(),
-        mary::selection::ModelSelector::Only,
+        mary::selection::ModelSelector::Source {
+            source: mary::models::qwen2_5_vl::NOMIC_MM7B_VISION_SOURCE,
+            quantization: mary::persist::QUANTIZATION_NATIVE,
+        },
     )
-    .expect("select and materialize the only vision model root");
+    .expect("select and materialize the Nomic vision component");
     eprintln!(
         "[vision-parity] keymap has {} tensors; building tower ...",
         map.len()
@@ -159,9 +162,12 @@ fn vision_tower_multiwindow_parity() {
     let map = mary::selection::load_keymap_from_graph(
         snapshot.facts(),
         snapshot.reader(),
-        mary::selection::ModelSelector::Only,
+        mary::selection::ModelSelector::Source {
+            source: mary::models::qwen2_5_vl::NOMIC_MM7B_VISION_SOURCE,
+            quantization: mary::persist::QUANTIZATION_NATIVE,
+        },
     )
-    .expect("select and materialize the only vision model root");
+    .expect("select and materialize the Nomic vision component");
     let w = KeymapW { map, device };
     let model = VisionTransformer::<B>::load(&w, &vision_cfg(), &device);
 

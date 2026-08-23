@@ -65,7 +65,7 @@ mod imp {
             },
         )
         .expect("select imported model for streaming");
-        assert_eq!(stream_selected.root(), imported_root);
+        assert_eq!(stream_selected.single_root(), Some(imported_root));
         let (streamed_model, _vision) = mary::persist::load_gemma4_streaming_from_index::<BHalf, _>(
             stream_selected,
             config.clone(),
@@ -94,7 +94,7 @@ mod imp {
             },
         )
         .expect("select imported model for aliasing");
-        assert_eq!(alias_selected.root(), imported_root);
+        assert_eq!(alias_selected.single_root(), Some(imported_root));
         let aliased_model = mary::persist::load_gemma4_aliased_from_index(
             alias_selected,
             config.clone(),

@@ -14,7 +14,12 @@ use std::collections::{BTreeSet, HashMap};
 use triblespace::core::collection::CollectionSnapshot;
 use triblespace::prelude::*;
 
-/// How to identify one model root in a consolidated graph.
+/// How to identify one model component in a consolidated graph.
+///
+/// `Only`, `Root`, and `Name` retain singular semantics. A `Source`
+/// coordinate is the one selector that may deliberately name several roots:
+/// weight-file shards of one component carry the same source and
+/// quantization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelSelector<'a> {
     /// Succeed only when the graph contains exactly one model root.
@@ -23,8 +28,7 @@ pub enum ModelSelector<'a> {
     Root(Id),
     /// Select the one legacy/root entity carrying this exact `model_name`.
     Name(&'a str),
-    /// Select the one content-addressed root carrying this source and weight
-    /// format label.
+    /// Select every shard root carrying this source and weight-format label.
     Source {
         source: &'a str,
         quantization: &'a str,
@@ -42,28 +46,42 @@ pub enum TokenizerSelector<'a> {
     Name(&'a str),
 }
 
-/// One explicitly selected model root, its strict tensor-handle index, and the
-/// blob reader that owns every indexed attachment.
+/// One explicitly selected model component, the real roots that make it up,
+/// its strict tensor-handle index, and the blob reader that owns every indexed
+/// attachment.
 ///
-/// Selection consumes a frozen [`CollectionSnapshot`]. Once the root and its
+/// Selection consumes a frozen [`CollectionSnapshot`]. Once the roots and
 /// functional fields have been validated, the collection facts and commit
 /// ticket are no longer needed by weight loading; the reader is retained so
 /// the content handles remain resolvable without reopening storage. This is
 /// the storage-policy-free boundary for lazy, streaming, and mmap-aliased
 /// loaders.
 pub struct SelectedModelIndex<R> {
-    root: Id,
+    // Invariant: sorted, duplicate-free, and nonempty. The field stays private
+    // so every construction path has to preserve that canonical form.
+    roots: Vec<Id>,
     handles: HashMap<String, Leaf>,
     reader: R,
 }
 
 impl<R> SelectedModelIndex<R> {
-    /// Exact content-addressed model root selected from the frozen graph.
-    pub fn root(&self) -> Id {
-        self.root
+    /// Canonical real roots of the selected component.
+    pub fn roots(&self) -> &[Id] {
+        &self.roots
     }
 
-    /// Strict `tensor name -> leaf` index for the selected root.
+    /// Return the root only when this component is represented by exactly one.
+    ///
+    /// Callers whose domain contract is singular should check this at their
+    /// admission boundary. A sharded component deliberately returns `None`.
+    pub fn single_root(&self) -> Option<Id> {
+        match self.roots.as_slice() {
+            [root] => Some(*root),
+            _ => None,
+        }
+    }
+
+    /// Strict `tensor name -> leaf` index for the selected roots.
     pub fn handles(&self) -> &HashMap<String, Leaf> {
         &self.handles
     }
@@ -73,9 +91,9 @@ impl<R> SelectedModelIndex<R> {
         &self.reader
     }
 
-    /// Consume the selection into its root, leaf index, and owned reader.
-    pub fn into_parts(self) -> (Id, HashMap<String, Leaf>, R) {
-        (self.root, self.handles, self.reader)
+    /// Consume the selection into its canonical roots, leaf index, and reader.
+    pub fn into_parts(self) -> (Vec<Id>, HashMap<String, Leaf>, R) {
+        (self.roots, self.handles, self.reader)
     }
 }
 
@@ -116,7 +134,7 @@ fn model_roots(tribles: &TribleSet) -> BTreeSet<Id> {
     named.chain(sourced).map(|(model,)| model).collect()
 }
 
-fn validate_source_coordinates(
+pub(crate) fn validate_model_source_coordinates(
     tribles: &TribleSet,
     blobs: &impl BlobStoreGet,
     root: Id,
@@ -227,7 +245,7 @@ pub fn select_model_root(
                     "model root with source {wanted_source:?} and quantization {quantization:?}"
                 ),
             )?;
-            validate_source_coordinates(tribles, blobs, root, wanted_source, quantization)?;
+            validate_model_source_coordinates(tribles, blobs, root, wanted_source, quantization)?;
             Ok(root)
         }
     }
@@ -250,9 +268,11 @@ pub fn select_model_root(
 /// caught, so a mislabelled root fails loudly at load rather than quietly
 /// shadowing a tensor.
 ///
-/// `Only` returns every root in the graph, which is what "this graph holds one
-/// model" means once that model can span roots. `Root` returns just the one
-/// named, since an exact content address is never a group.
+/// `Only`, `Name`, and `Root` retain their exact-one-root semantics. Only
+/// `Source` can name a cohort: sharing `(source, quantization)` is the explicit
+/// claim that several roots are shards of one component. This prevents `Only`
+/// from silently combining unrelated components merely because their tensor
+/// names happen to be disjoint.
 ///
 /// The result is sorted and duplicate-free, so callers see one deterministic
 /// order regardless of query iteration.
@@ -262,30 +282,8 @@ pub fn select_model_roots(
     selector: ModelSelector<'_>,
 ) -> anyhow::Result<Vec<Id>> {
     let roots: BTreeSet<Id> = match selector {
-        ModelSelector::Only => model_roots(tribles),
-        ModelSelector::Root(root) => {
-            if !model_roots(tribles).contains(&root) {
-                bail!("model root {root} is absent or has no members");
-            }
-            BTreeSet::from([root])
-        }
-        ModelSelector::Name(wanted) => {
-            let matches: BTreeSet<Id> = find!(
-                (model: Id, name: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
-                pattern!(tribles, [{ ?model @ attrs::model_name: ?name, attrs::member: _?member }])
-            )
-            .filter_map(
-                |(model, name)| match read_long_string(blobs, name, "model_name") {
-                    Ok(name) if name == wanted => Some(Ok(model)),
-                    Ok(_) => None,
-                    Err(error) => Some(Err(error)),
-                },
-            )
-            .collect::<anyhow::Result<BTreeSet<_>>>()?;
-            for &root in &matches {
-                validate_model_name(tribles, blobs, root, wanted)?;
-            }
-            matches
+        ModelSelector::Only | ModelSelector::Root(_) | ModelSelector::Name(_) => {
+            return Ok(vec![select_model_root(tribles, blobs, selector)?]);
         }
         ModelSelector::Source {
             source: wanted_source,
@@ -308,7 +306,13 @@ pub fn select_model_roots(
             )
             .collect::<anyhow::Result<BTreeSet<_>>>()?;
             for &root in &matches {
-                validate_source_coordinates(tribles, blobs, root, wanted_source, quantization)?;
+                validate_model_source_coordinates(
+                    tribles,
+                    blobs,
+                    root,
+                    wanted_source,
+                    quantization,
+                )?;
             }
             matches
         }
@@ -437,7 +441,8 @@ pub fn index_keymap_for_roots(
         for (name, leaf) in index_keymap_for_root(tribles, blobs, root)? {
             if let Some(previous) = owner.insert(name.clone(), root) {
                 bail!(
-                    "tensor {name:?} appears in both root {previous} and root {root};                      these are not shards of one component"
+                    "tensor {name:?} appears in both root {previous} and root {root}; \
+                     these are not shards of one component"
                 );
             }
             merged.insert(name, leaf);
@@ -447,6 +452,32 @@ pub fn index_keymap_for_roots(
 }
 
 impl<R: BlobStoreGet> SelectedModelIndex<R> {
+    /// Strictly index an explicit set of real model roots.
+    ///
+    /// This is the domain-composition seam for a model assembled from several
+    /// independently selected components. The roots are canonicalized without
+    /// inventing an aggregate identity, and tensor names must be disjoint over
+    /// the whole set.
+    pub fn from_roots(
+        facts: &TribleSet,
+        reader: R,
+        roots: impl IntoIterator<Item = Id>,
+    ) -> anyhow::Result<Self> {
+        let mut roots: Vec<Id> = roots.into_iter().collect();
+        roots.sort();
+        roots.dedup();
+        if roots.is_empty() {
+            bail!("cannot select a model component from zero roots");
+        }
+        let handles = index_keymap_for_roots(facts, &reader, &roots)
+            .context("index explicit model roots from graph")?;
+        Ok(Self {
+            roots,
+            handles,
+            reader,
+        })
+    }
+
     /// Resolve and strictly index one model from an explicit graph plus its
     /// owning reader.
     ///
@@ -458,15 +489,9 @@ impl<R: BlobStoreGet> SelectedModelIndex<R> {
         reader: R,
         selector: ModelSelector<'_>,
     ) -> anyhow::Result<Self> {
-        let root = select_model_root(facts, &reader, selector)
-            .context("select model root from explicit graph")?;
-        let handles = index_keymap_for_root(facts, &reader, root)
-            .with_context(|| format!("index model root {root} from explicit graph"))?;
-        Ok(Self {
-            root,
-            handles,
-            reader,
-        })
+        let roots = select_model_roots(facts, &reader, selector)
+            .context("select model roots from explicit graph")?;
+        Self::from_roots(facts, reader, roots)
     }
 
     /// Resolve and strictly index one model from an already-frozen collection.
@@ -492,8 +517,7 @@ pub fn load_keymap_from_graph(
     blobs: &impl BlobStoreGet,
     selector: ModelSelector<'_>,
 ) -> anyhow::Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
-    let root = select_model_root(tribles, blobs, selector)?;
-    Ok(index_keymap_for_root(tribles, blobs, root)?
+    Ok(index_keymap_for_selector(tribles, blobs, selector)?
         .into_iter()
         .map(|(name, leaf)| (name, leaf.to_f32_shape()))
         .collect())
@@ -698,6 +722,7 @@ mod tests {
         let reader = BlobStore::reader(&mut blobs).unwrap();
 
         assert!(select_model_root(&facts, &reader, ModelSelector::Only).is_err());
+        assert!(select_model_roots(&facts, &reader, ModelSelector::Only).is_err());
         assert_eq!(
             select_model_root(&facts, &reader, ModelSelector::Name("alpha")).unwrap(),
             alpha.root
@@ -800,7 +825,10 @@ mod tests {
 
         let mut expected = vec![first.root, second.root];
         expected.sort();
-        assert_eq!(select_model_roots(&facts, &reader, selector).unwrap(), expected);
+        assert_eq!(
+            select_model_roots(&facts, &reader, selector).unwrap(),
+            expected
+        );
 
         let index = index_keymap_for_selector(&facts, &reader, selector).unwrap();
         let mut names: Vec<&String> = index.keys().collect();
@@ -811,6 +839,11 @@ mod tests {
         );
         assert_eq!(index["model.layers.0.weight"].to_f32(), vec![1.0]);
         assert_eq!(index["model.layers.1.weight"].to_f32(), vec![2.0]);
+
+        let selected = SelectedModelIndex::from_graph(&facts, reader, selector).unwrap();
+        assert_eq!(selected.roots(), expected);
+        assert_eq!(selected.single_root(), None);
+        assert_eq!(selected.handles().len(), 2);
     }
 
     /// Sharing a coordinate is a claim, not proof. Selection groups the roots;
@@ -842,7 +875,10 @@ mod tests {
         };
 
         // Selection is happy — it only knows they share a coordinate.
-        assert_eq!(select_model_roots(&facts, &reader, selector).unwrap().len(), 2);
+        assert_eq!(
+            select_model_roots(&facts, &reader, selector).unwrap().len(),
+            2
+        );
         // The merge is where the wrong grouping fails, loudly.
         let error = index_keymap_for_selector(&facts, &reader, selector)
             .expect_err("a shadowed tensor must not load");
@@ -876,6 +912,11 @@ mod tests {
             }
         )
         .is_err());
+
+        let selected =
+            SelectedModelIndex::from_graph(&facts, reader, ModelSelector::Root(only.root)).unwrap();
+        assert_eq!(selected.roots(), &[only.root]);
+        assert_eq!(selected.single_root(), Some(only.root));
     }
 
     /// The gemma-3-1b shape: one component, two files, layers INTERLEAVED
@@ -919,8 +960,7 @@ mod tests {
             2
         );
 
-        let merged =
-            index_keymap_for_roots(&facts, &reader, &[first.root, second.root]).unwrap();
+        let merged = index_keymap_for_roots(&facts, &reader, &[first.root, second.root]).unwrap();
         let mut names: Vec<&String> = merged.keys().collect();
         names.sort();
         assert_eq!(
@@ -944,12 +984,18 @@ mod tests {
         );
 
         // Argument order is not observable.
-        let reversed =
-            index_keymap_for_roots(&facts, &reader, &[second.root, first.root]).unwrap();
+        let reversed = index_keymap_for_roots(&facts, &reader, &[second.root, first.root]).unwrap();
         assert_eq!(merged.len(), reversed.len());
         for (name, leaf) in &merged {
             assert_eq!(reversed[name].to_f32(), leaf.to_f32());
         }
+
+        let selected =
+            SelectedModelIndex::from_roots(&facts, reader, [second.root, first.root, second.root])
+                .unwrap();
+        let mut expected_roots = vec![first.root, second.root];
+        expected_roots.sort();
+        assert_eq!(selected.roots(), expected_roots);
     }
 
     /// A name in two roots means they are not shards of one component. Taking
@@ -1013,6 +1059,7 @@ mod tests {
         let mut blobs = MemoryBlobStore::new();
         let reader = BlobStore::reader(&mut blobs).unwrap();
         assert!(index_keymap_for_roots(&facts, &reader, &[]).is_err());
+        assert!(SelectedModelIndex::from_roots(&facts, reader, std::iter::empty::<Id>()).is_err());
     }
 
     /// One root passed twice is one root, not a self-collision.
@@ -1029,8 +1076,7 @@ mod tests {
             &[("model.layers.0.weight", 1.0)],
         );
         let reader = BlobStore::reader(&mut blobs).unwrap();
-        let merged =
-            index_keymap_for_roots(&facts, &reader, &[only.root, only.root]).unwrap();
+        let merged = index_keymap_for_roots(&facts, &reader, &[only.root, only.root]).unwrap();
         assert_eq!(merged.len(), 1);
     }
 

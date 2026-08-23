@@ -277,7 +277,7 @@ mod tests {
         .unwrap_err();
         let diagnostic = format!("{conflict:#}");
         assert!(
-            diagnostic.contains("ambiguous model root"),
+            diagnostic.contains("not shards of one component"),
             "unexpected conflict diagnostic: {diagnostic}"
         );
 

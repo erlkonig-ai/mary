@@ -141,12 +141,8 @@ fn embed_image_bytes_parity() {
     let snapshot =
         mary::model_collection::load_model_collection_local_latest(Path::new(&pile_path), team)
             .expect("load native model collection snapshot");
-    let map = mary::selection::load_keymap_from_graph(
-        snapshot.facts(),
-        snapshot.reader(),
-        mary::selection::ModelSelector::Only,
-    )
-    .expect("select and materialize the only combined model root");
+    let map = mary::persist::load_nomic_mm7b_keymap_from_snapshot(snapshot)
+        .expect("select and materialize the Nomic text + vision components");
     let w = KeymapW { map, device };
     let embedder =
         NomicMultimodalEmbedder::<B>::load_with_vision(&w, &tok_path, device).expect("embedder");

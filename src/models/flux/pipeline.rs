@@ -81,8 +81,9 @@ pub struct FluxWeights {
 }
 
 impl FluxWeights {
-    /// Select the text encoder, transformer, and VAE roots from one immutable
-    /// native model-collection snapshot.
+    /// Select the text encoder, transformer, and VAE components from one
+    /// immutable native model-collection snapshot. A component may span
+    /// several real roots (the Klein text encoder has two weight shards).
     pub fn from_snapshot<R: BlobStoreGet>(
         snapshot: CollectionSnapshot<R>,
         variant: ModelVariant,
@@ -94,15 +95,14 @@ impl FluxWeights {
             component: &str,
         ) -> anyhow::Result<HashMap<String, Leaf>> {
             let source = variant.component_source(component);
-            let root = crate::selection::select_model_root(
+            crate::selection::index_keymap_for_selector(
                 facts,
                 reader,
                 ModelSelector::Source {
                     source: &source,
                     quantization: crate::persist::QUANTIZATION_NATIVE,
                 },
-            )?;
-            crate::selection::index_keymap_for_root(facts, reader, root)
+            )
         }
 
         let text_encoder =
@@ -843,12 +843,13 @@ mod tests {
     }
 
     #[test]
-    fn one_snapshot_owns_three_explicit_flux_components() {
+    fn one_snapshot_owns_three_explicit_flux_components_and_all_text_shards() {
         let file = TestPile::new();
         publish(
             file.path(),
             [
-                component_fragment(ModelVariant::Klein, TEXT_ENCODER, "te.weight", 1.0),
+                component_fragment(ModelVariant::Klein, TEXT_ENCODER, "te.0.weight", 1.0),
+                component_fragment(ModelVariant::Klein, TEXT_ENCODER, "te.1.weight", 1.5),
                 component_fragment(ModelVariant::Klein, TRANSFORMER, "tr.weight", 2.0),
                 component_fragment(ModelVariant::Klein, VAE, "vae.weight", 3.0),
             ],
@@ -869,18 +870,30 @@ mod tests {
                 9.0,
             )],
         );
-        assert_eq!(weights.text_encoder()["te.weight"], (vec![1.0], vec![1]));
+        assert_eq!(weights.text_encoder()["te.0.weight"], (vec![1.0], vec![1]));
+        assert_eq!(weights.text_encoder()["te.1.weight"], (vec![1.5], vec![1]));
         assert_eq!(weights.transformer()["tr.weight"], (vec![2.0], vec![1]));
         assert_eq!(weights.vae()["vae.weight"], (vec![3.0], vec![1]));
 
+        // A later root claiming the text coordinate but shadowing one tensor
+        // is not another shard. The widened snapshot fails deterministically.
+        publish(
+            file.path(),
+            [component_fragment(
+                ModelVariant::Klein,
+                TEXT_ENCODER,
+                "te.0.weight",
+                9.0,
+            )],
+        );
         let widened = crate::model_collection::load_model_collection_local_latest(file.path(), test_team())
             .expect("load widened native FLUX snapshot");
         let error = FluxWeights::from_snapshot(widened, ModelVariant::Klein)
             .err()
-            .expect("same-coordinate component roots must fail closed");
+            .expect("a shadowed tensor must fail closed");
         assert!(
-            error.to_string().contains("ambiguous model root"),
-            "unexpected ambiguity diagnostic: {error:#}"
+            error.to_string().contains("not shards of one component"),
+            "unexpected shard diagnostic: {error:#}"
         );
     }
 }

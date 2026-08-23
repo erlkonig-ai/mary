@@ -10,7 +10,7 @@
 //! Prereqs (all disk-gated; the test SKIPS cleanly if missing):
 //!   1. python3 scripts/nomic_mm7b_merge.py  <SCRATCH>/merged/merged_text_backbone.safetensors
 //!   2. python3 scripts/nomic_mm7b_probe.py   # dumps real reference goldens
-//!   3. cargo run --release --features import,hub --bin mary -- import <SCRATCH>/merged --pile <SCRATCH>/nomic_mm7b.pile --key <SCRATCH>/model.key --name nomic-ai/nomic-embed-multimodal-7b --dtype f16
+//!   3. cargo run --release --features import,hub --bin mary -- import <SCRATCH>/merged --pile <SCRATCH>/nomic_mm7b.pile --key <SCRATCH>/model.key --name 'nomic-ai/nomic-embed-multimodal-7b#text' --dtype f16
 //!   4. NOMIC_MM7B_PILE=<SCRATCH>/nomic_mm7b.pile cargo test --release --features gemma --test nomic_mm7b_real_parity -- --nocapture
 //!
 //! The reference is float32; we store/run the backbone as f16-in-pile upcast to
@@ -121,9 +121,12 @@ fn real_text_embed_parity() {
     let map = mary::selection::load_keymap_from_graph(
         snapshot.facts(),
         snapshot.reader(),
-        mary::selection::ModelSelector::Only,
+        mary::selection::ModelSelector::Source {
+            source: mary::models::qwen2_5_vl::NOMIC_MM7B_TEXT_SOURCE,
+            quantization: mary::persist::QUANTIZATION_NATIVE,
+        },
     )
-    .expect("select and materialize the only model root");
+    .expect("select and materialize the Nomic text component");
     eprintln!(
         "[real-parity] keymap has {} tensors; building model ...",
         map.len()

@@ -11,13 +11,15 @@
 //!   3. backbone hidden vs `image_last_hidden.npy`     (M-RoPE through 28 layers)
 //! then the final `image_emb` itself (bar cosine >= 0.9999).
 //!
-//! Prereqs (the embed path needs BOTH text + vision weights, so a single COMBINED
-//! pile; disk-gated, SKIPS cleanly if missing):
-//!   1. python3 scripts/nomic_mm7b_merge.py        <SCRATCH>/combined/merged_text_backbone.safetensors
-//!   2. python3 scripts/nomic_mm7b_vision_dump.py  <SCRATCH>/combined/vision_tower.safetensors
+//! Prereqs (the embed path needs BOTH text + vision weights in one collection,
+//! under their explicit component coordinates; disk-gated, SKIPS cleanly if
+//! missing):
+//!   1. python3 scripts/nomic_mm7b_merge.py        <SCRATCH>/text/merged_text_backbone.safetensors
+//!   2. python3 scripts/nomic_mm7b_vision_dump.py  <SCRATCH>/vision/vision_tower.safetensors
 //!   3. python3 scripts/nomic_mm7b_image_dump.py   # dumps the image reference goldens
-//!   4. cargo run --release --features import,hub --bin mary -- import <SCRATCH>/combined --pile <SCRATCH>/combined.pile --key <SCRATCH>/model.key --name nomic-ai/nomic-embed-multimodal-7b --dtype f16
-//!   5. NOMIC_MM7B_PILE=<SCRATCH>/combined.pile cargo test --release --features gemma --test nomic_mm7b_image_parity -- --nocapture
+//!   4. cargo run --release --features import,hub --bin mary -- import <SCRATCH>/text --pile <SCRATCH>/combined.pile --key <SCRATCH>/model.key --name 'nomic-ai/nomic-embed-multimodal-7b#text' --dtype f16
+//!   5. cargo run --release --features import,hub --bin mary -- import <SCRATCH>/vision --pile <SCRATCH>/combined.pile --key <SCRATCH>/model.key --name 'nomic-ai/nomic-embed-multimodal-7b#vision' --dtype f16
+//!   6. NOMIC_MM7B_PILE=<SCRATCH>/combined.pile cargo test --release --features gemma --test nomic_mm7b_image_parity -- --nocapture
 
 use burn::prelude::*;
 use burn::tensor::TensorData;
@@ -160,12 +162,8 @@ fn image_embed_parity() {
     let snapshot =
         mary::model_collection::load_model_collection_local_latest(Path::new(&pile_path), team)
             .expect("load native model collection snapshot");
-    let map = mary::selection::load_keymap_from_graph(
-        snapshot.facts(),
-        snapshot.reader(),
-        mary::selection::ModelSelector::Only,
-    )
-    .expect("select and materialize the only combined model root");
+    let map = mary::persist::load_nomic_mm7b_keymap_from_snapshot(snapshot)
+        .expect("select and materialize the Nomic text + vision components");
     eprintln!(
         "[image-parity] keymap has {} tensors; building text + vision ...",
         map.len()
