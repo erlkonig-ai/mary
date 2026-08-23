@@ -5,8 +5,8 @@
 //!
 //! `persist_safetensors_to_pile` ingests every `*.safetensors` shard into the pile
 //! (each tensor a content-addressed f32 leaf via [`crate::ingest::save_safetensors`]),
-//! publishing the resulting fragment into Mary's signed model collection. The weight *blobs* are
-//! written straight into the pile's storage (the `Pile` is itself a
+//! publishing the resulting fragment into Mary's signed model collection. The
+//! weight *blobs* are written straight into the pile's storage (the `Pile` is itself a
 //! `BlobStorePut`), so there is no giant in-memory buffer — only the small fact
 //! set rides through the collection commit. It is fully model-agnostic — the
 //! `gemma4` lineage in the old name was history; CLIP/SigLIP use the same path.
@@ -82,9 +82,9 @@ pub fn persist_safetensors_to_pile(
 /// `"text_encoder/model-00001.safetensors"` let a loader materialize one
 /// component at a time via [`load_keymap_from_pile_prefixed`]). Creates the
 /// pile file if it does not exist. Each tensor becomes a content-addressed
-/// leaf; the model-graph fragment is published into the native collection. After this
-/// returns, the pile file holds the full weights — no safetensors are needed
-/// to load the model again.
+/// leaf; the model-graph fragment is published into the native collection.
+/// After this returns, the pile file holds the full weights — no safetensors
+/// are needed to load the model again.
 #[cfg(feature = "import")]
 pub fn persist_safetensors_files_to_pile(
     files: &[(std::path::PathBuf, String)],
@@ -1626,11 +1626,6 @@ pub fn load_typed_keymap_from_pile(
 /// Reconstruct a SentencePiece UNIGRAM tokenizer from a pile's tokenizer graph.
 /// The `.model` file is not needed — the pieces ARE the model.
 ///
-/// NOTE: this mirrors [`load_tokenizer_from_pile`]'s pile-opening prologue
-/// rather than sharing it. Factoring the two would need a callback trait,
-/// because the blob reader is an associated type and `BlobStoreGet` is not
-/// dyn-compatible — more machinery than the ~25 duplicated lines are worth,
-/// and it would put the proven reader at risk for no behavioural gain.
 #[cfg(feature = "qwen3tts")]
 pub fn load_spm_tokenizer_from_pile(
     pile_path: &Path,
@@ -1809,8 +1804,8 @@ pub fn ingest_hf_tokenizer(
     }
 
     let t0 = std::time::Instant::now();
-    // Straight into the pile's own store, not the workspace's staging one: the
-    // point of the measurement is the on-disk put.
+    // Straight into the pile's own store: the point of the measurement is the
+    // on-disk put.
     let mut counting = crate::tokenizer::CountingBlobs::new(&mut pile);
     let frag = crate::tokenizer::save_tokenizer_json(&json, source_name, &mut counting)
         .map_err(|e| anyhow::anyhow!("build tokenizer graph: {e}"))?;
