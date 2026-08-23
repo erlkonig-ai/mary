@@ -94,6 +94,95 @@ impl StorageDType {
     }
 }
 
+/// Where the plain-BF16 weights sit once the stack is built.
+///
+/// Not a throughput knob that happens to touch memory: the two arms differ by a
+/// whole RESIDENT COPY of every weight the BF16 GEMM lane binds. The startup
+/// copy has already written those bytes into the anonymous arena, and on a
+/// unified-memory part the device pool the second copy comes from is the SAME
+/// physical memory the arena is in. So the choice is bytes against bandwidth,
+/// and admission has to see the bytes or it admits a run that does not fit.
+///
+/// Measured, one node, `INK_LAYERS=0:16`. The pool and node columns are this
+/// change's own runs; the throughput columns are the probe that motivated it.
+///
+/// | arm | pool live after the stack | peak node used | achieved | tok/s |
+/// |---|---|---|---|---|
+/// | aliased | 1.41 GiB | 75.70 GiB | 179.0 GB/s | 18.4 |
+/// | device pool | 4.94 GiB | -- | 226.8 GB/s | 20.2 |
+///
+/// The node column is empty in the second row on purpose: once the term below
+/// is charged, that configuration is REFUSED on this box, and the peak it
+/// would have had is the 0:15 pair -- 71.98 GiB aliased against 75.17 device,
+/// a difference of 3.19 GiB where the charge says 3.42.
+///
+/// The aliased arm is not free either, and that is the half that was missing
+/// for longer: two of the weights the loader binds are FUSED in the checkpoint
+/// and split on the host, so their halves are fresh host buffers that can never
+/// alias and always cost a pool copy. See [`super::pile::device_weight_bytes`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenseWeights {
+    /// Aliased where they lie in the startup arena. The device reads the host
+    /// pages; only the weights the loader has to transform on the host get a
+    /// pool copy.
+    Aliased,
+    /// Copied into the device pool. Every plain-BF16 weight is resident twice.
+    DevicePool,
+}
+
+impl DenseWeights {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Aliased => "aliased in the startup arena",
+            Self::DevicePool => "copied into the device pool",
+        }
+    }
+}
+
+/// The placement this process runs, read ONCE.
+///
+/// One reader for the switch, because the binding lane and the admission gate
+/// disagreeing about it is precisely the failure this whole term exists to
+/// stop: a gate that prices the aliased arm while the loader copies is a gate
+/// that cannot see 3.5 GiB.
+///
+/// # Why the faster arm is not the default
+///
+/// It costs 3.42 GiB at `INK_LAYERS=0:15` and 3.53 at 0:16, and on a 119.63
+/// GiB node that is the difference between admitted and refused. The estimate
+/// at 0:16 goes 112.80 -> 116.33 GiB against 115.42 available, so making this
+/// the default would REFUSE a range that runs today.
+///
+/// That refusal would not be a true one. The same run's measured peak is 75.70
+/// GiB (`MemTotal - MemAvailable`, sampled every 2 s, 0:16 aliased) and 75.17
+/// at 0:15 in this arm, so the estimate stands about 37 GiB above the truth --
+/// which is [`pool_page_floor`], flat in the sequence length and sized for a
+/// 16,384-token prefill while a decode step's pool reserves 1.43 GiB. Until
+/// that term stops being flat, the honest arithmetic and the fast arm cannot
+/// both be had at this range, and the arithmetic is the one that has to be
+/// right.
+///
+/// `INK_ZEROCOPY=0` forces the copying arm for every bind including the routed
+/// experts, so it implies this placement. It does NOT make admission correct
+/// for that arm -- the experts' duplication is 60+ GiB and is not priced
+/// anywhere -- which is why it stays what it has always been, a diagnostic.
+pub fn dense_weights() -> DenseWeights {
+    static CHOSEN: std::sync::OnceLock<DenseWeights> = std::sync::OnceLock::new();
+    *CHOSEN.get_or_init(|| {
+        if std::env::var("INK_ZEROCOPY").map(|v| v == "0").unwrap_or(false) {
+            return DenseWeights::DevicePool;
+        }
+        match std::env::var("INK_DENSE_WEIGHTS").as_deref() {
+            Ok("device") => DenseWeights::DevicePool,
+            Ok("alias") | Err(_) => DenseWeights::Aliased,
+            Ok(other) => panic!(
+                "INK_DENSE_WEIGHTS={other:?} is not recognised \
+                 (expected \"device\" or \"alias\")"
+            ),
+        }
+    })
+}
+
 /// Every run-time choice that changes admission arithmetic.
 ///
 /// Passed as a value so the startup-copy gate, per-buffer check and tests all
@@ -105,6 +194,15 @@ pub struct AdmissionPolicy {
     pub activation: StorageDType,
     pub residual: StorageDType,
     pub cache: StorageDType,
+    /// Where the plain-BF16 weights end up. See [`DenseWeights`].
+    pub dense_weights: DenseWeights,
+    /// Whether the router multiplies the STORED BF16 -- the one arm that binds
+    /// `mlp.gate.weight` at all, and binds it row-padded.
+    pub router_bf16: bool,
+    /// Whether the MTP heads are built. Their tensors sit in the same layer
+    /// range as the LLM's and are copied into the arena either way, but they
+    /// are only BOUND when drafting is on.
+    pub drafts: bool,
     wide_routed_layers: u128,
     plain_bf16_layers: u128,
 }
@@ -121,6 +219,12 @@ impl AdmissionPolicy {
             activation,
             residual,
             cache,
+            // The arm a bare `new` prices is the one that costs LESS, so a
+            // caller that forgets the lane under-charges visibly rather than
+            // refusing work silently. Every real run goes through `runtime`.
+            dense_weights: DenseWeights::Aliased,
+            router_bf16: false,
+            drafts: false,
             wide_routed_layers: 0,
             plain_bf16_layers: 0,
         }
@@ -128,12 +232,34 @@ impl AdmissionPolicy {
 
     /// Capture all process-global lane switches once, before admission.
     pub fn runtime(allocator: AllocatorConfig) -> Self {
-        Self::new(
-            allocator,
-            StorageDType::from_bf16(super::burn::act_bf16()),
-            StorageDType::from_bf16(super::resid::resid_bf16()),
-            StorageDType::from_bf16(super::burn::attn_bf16()),
-        )
+        Self {
+            dense_weights: dense_weights(),
+            ..Self::new(
+                allocator,
+                StorageDType::from_bf16(super::burn::act_bf16()),
+                StorageDType::from_bf16(super::resid::resid_bf16()),
+                StorageDType::from_bf16(super::burn::attn_bf16()),
+            )
+        }
+    }
+
+    /// Record the router arm, which decides whether `mlp.gate.weight` is bound.
+    pub const fn with_router_bf16(mut self, on: bool) -> Self {
+        self.router_bf16 = on;
+        self
+    }
+
+    /// Record whether the MTP heads are built and therefore bound.
+    pub const fn with_drafting(mut self, on: bool) -> Self {
+        self.drafts = on;
+        self
+    }
+
+    /// Price a placement explicitly. Tests and the A/B arms; `runtime` reads
+    /// the switch.
+    pub const fn with_dense_weights(mut self, w: DenseWeights) -> Self {
+        self.dense_weights = w;
+        self
     }
 
     /// Record a packed routed layer forced onto its f32 diagnostic/fallback

@@ -286,7 +286,7 @@ impl Weights {
         global_dense: &[&str],
         attention_bytes: u64,
         policy: super::budget::AdmissionPolicy,
-    ) -> Result<(usize, usize, u64)> {
+    ) -> Result<(usize, usize, u64, u64)> {
         self.src.copy_share(layers, global_dense, attention_bytes, policy)
     }
 

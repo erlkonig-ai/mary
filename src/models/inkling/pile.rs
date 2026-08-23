@@ -235,6 +235,132 @@ fn mem_total_bytes() -> Result<u64> {
     Ok(host.min(cgroup))
 }
 
+/// What ONE dense leaf costs the DEVICE POOL, on top of its place in the arena.
+///
+/// # The term that was missing
+///
+/// The startup copy writes every weight this node owns into one anonymous
+/// arena, and `total` in [`PileSource::copy_share`] is that arena. Admission
+/// charged it once and stopped there, which was right only while every weight
+/// the GPU read was ALIASED out of it. Two things break that.
+///
+/// The first has always been true and was never priced: two of the matrices the
+/// loader binds are FUSED in the checkpoint (`mlp.w13_dn.weight` is gate and up
+/// interleaved, `shared_w13_weight` likewise) and are split on the host before
+/// binding, so their halves are fresh host buffers that no mapping covers and
+/// `slice_or_copy` can only COPY. The router's projection is the same story for
+/// a different reason: the MMA tiles n by 8 and 258 rows do not divide, so the
+/// bf16 arm binds a padded copy. Those copies are a second residency and always
+/// were.
+///
+/// The second is [`super::budget::DenseWeights::DevicePool`], which copies the
+/// rest of the plain-BF16 weights too, and buys 179.0 -> 226.8 GB/s achieved
+/// and 18.4 -> 20.2 tok/s for it. That arm was measured to hold 4.94 GiB in the
+/// pool where the aliased arm holds 1.41, and admission reported the SAME
+/// 111.40 GiB estimate for both -- it could not see a 3.53 GiB difference.
+///
+/// # Why this is a shape and not a coefficient
+///
+/// Every byte here is `leaf.bytes.len()`, which is the tensor's own dims times
+/// its element width. Nothing is fitted and nothing is per-token: this is a
+/// RESIDENT set, held from the bind to the end of the run, and it is a
+/// different quantity from the 5.301 GB a decode pass READS across the same 143
+/// GEMMs. On a 16-layer share those two numbers coincide, because a decode step
+/// reads each weight exactly once -- which is a coincidence of the schedule and
+/// not an identity, and is exactly the confusion a fitted constant would have
+/// baked in.
+///
+/// Enumerated at `INK_LAYERS=0:16` on the 42-layer checkpoint, layers 0..1
+/// dense and 2..15 routed, from the pile's own dims:
+///
+/// | weight | shape | each | leaves | binds | bytes |
+/// |---|---|---|---|---|---|
+/// | `attn.w{q_du,o_ud}` | `[4096, 4096]` | 32 MiB | 32 | 32 | 1 073 741 824 |
+/// | `attn.w{k_dv,v_dv}` | `[1024, 4096]` | 8 MiB | 32 | 32 | 268 435 456 |
+/// | `attn.wr_du` | `[512, 4096]` | 4 MiB | 16 | 16 | 67 108 864 |
+/// | `mlp.w13_dn` split | `[32768, 4096]` | 256 MiB | 2 | 4 | 536 870 912 |
+/// | `mlp.w2_md` | `[4096, 16384]` | 128 MiB | 2 | 2 | 268 435 456 |
+/// | `shared_w13` split+joined | `[2, 4096, 4096]` | 64 MiB | 14 | 14 | 939 524 096 |
+/// | `shared_w2` per expert | `[2, 4096, 2048]` | 32 MiB | 14 | 28 | 469 762 048 |
+/// | `mlp.gate` padded | `[264, 4096]` | 2.06 MiB | 14 | 14 | 30 277 632 |
+/// | `unembed` | `[201024, 4096]` | 1.53 GiB | 1 | 1 | 1 646 788 608 |
+/// | **total** | | | | **143** | **5 300 944 896 = 4.94 GiB** |
+///
+/// A leaf and a bind are not the same thing -- the two fused matrices are bound
+/// as their halves and `shared_w2` once per shared expert -- but the BYTES are
+/// the leaf's either way, which is why this function can sum leaves while the
+/// run's census counts binds and the two still have to agree.
+///
+/// 143 binds and 5 300 944 896 bytes is what the run's own census prints, and
+/// `pool[after stack]` in that arm reads 4.94 GiB live. The aliased arm's four
+/// host-transformed rows alone are 1 506 672 640 bytes = 1.40 GiB against a
+/// measured 1.41, and its seam reports exactly 32 binds `copied because
+/// UNMAPPED` -- 4 + 14 + 14, the same three rows. Both arms, both directions,
+/// from the same table.
+///
+/// The count is not cross-checked here but in the run itself: the stack prints
+/// what it bound beside what admission charged, so a lane added later that this
+/// function does not know about shows up as a named discrepancy in the log
+/// rather than as an OOM kill six weeks on.
+///
+/// The MTP heads live in the same layer range as the LLM's and are copied into
+/// the arena whether or not they are used, but they are only BOUND when
+/// drafting is on -- so they are charged on `policy.drafts` and not on the
+/// range.
+fn device_weight_bytes(name: &str, leaf: &Leaf, policy: super::budget::AdmissionPolicy) -> u64 {
+    use super::budget::DenseWeights;
+
+    /// The matrices the BF16 GEMM lane binds, by the suffix that names them.
+    /// Shared with nothing: the loader constructs these names inline at its
+    /// binding sites, and the run's own bind census is what proves the two
+    /// lists agree.
+    const GEMM: [&str; 9] = [
+        "attn.wq_du.weight",
+        "attn.wk_dv.weight",
+        "attn.wv_dv.weight",
+        "attn.wr_du.weight",
+        "attn.wo_ud.weight",
+        "mlp.w13_dn.weight",
+        "mlp.w2_md.weight",
+        "mlp.shared_experts.shared_w13_weight",
+        "mlp.shared_experts.shared_w2_weight",
+    ];
+
+    if name.starts_with("model.mtp.") && !policy.drafts {
+        return 0;
+    }
+    let bytes = leaf.bytes.len() as u64;
+
+    // Bound row-padded out of a fresh host buffer, so it is a pool copy in
+    // BOTH arms -- and the pad is part of the allocation, not a rounding.
+    if name.ends_with("mlp.gate.weight") {
+        if !policy.router_bf16 || leaf.dims.len() != 2 {
+            return 0;
+        }
+        let rows = leaf.dims[0].next_multiple_of(super::bf16gemm::NTILE as u64);
+        return rows * leaf.dims[1] * 2;
+    }
+    // Fused in the checkpoint, split on the host: the halves are not in any
+    // mapping, so aliasing them is not on offer.
+    let split = name.ends_with("mlp.w13_dn.weight")
+        || name.ends_with("mlp.shared_experts.shared_w13_weight");
+    if split {
+        return bytes;
+    }
+    if policy.dense_weights == DenseWeights::Aliased {
+        return 0;
+    }
+    // The MTP head's entry projection, and the largest single weight in the
+    // process, neither of which wears a layer suffix the table above covers.
+    if name.ends_with("input_proj.weight") || name == "model.llm.unembed.weight" {
+        return bytes;
+    }
+    if GEMM.iter().any(|s| name.ends_with(s)) {
+        return bytes;
+    }
+    0
+}
+
 /// What the run needs BESIDES the weight share.
 ///
 /// On a unified-memory part the CUDA context, the device-resident activations
@@ -1233,7 +1359,7 @@ impl PileSource {
         global_dense: &[&str],
         attention_bytes: u64,
         policy: super::budget::AdmissionPolicy,
-    ) -> Result<(usize, usize, u64)> {
+    ) -> Result<(usize, usize, u64, u64)> {
         anyhow::ensure!(self.copied.is_none(), "the weight share was already copied");
 
         /// The shape every expert of one stacked matrix has.
@@ -1332,6 +1458,12 @@ impl PileSource {
         // here because this loop is the only place the byte counts exist.
         let mut per_layer: std::collections::BTreeMap<i64, usize> = Default::default();
         let mut fixed_bytes = 0usize;
+        // The SAME split, for the second residency the binding lane costs.
+        // Kept apart from `per_layer` rather than folded into it so the
+        // refusal's "N GiB of weights" stays the arena figure it names, and so
+        // the bisect below can add both without counting either twice.
+        let mut per_layer_dev: std::collections::BTreeMap<i64, u64> = Default::default();
+        let mut fixed_dev = 0u64;
         let mut cursor = 0usize;
         let mut expert_offsets = Vec::with_capacity(keys.len());
         for key in &keys {
@@ -1350,15 +1482,23 @@ impl PileSource {
                 .checked_add(self.dense[name].bytes.len())
                 .context("weight share byte count overflow")?;
             cursor = end.next_multiple_of(VIEW_ALIGN);
+            let dev = device_weight_bytes(name, &self.dense[name], policy);
             match self.dense[name].layer.filter(|l| layers.contains(&(*l as usize))) {
-                Some(l) => *per_layer.entry(l).or_default() += cursor - start,
+                Some(l) => {
+                    *per_layer.entry(l).or_default() += cursor - start;
+                    *per_layer_dev.entry(l).or_default() += dev;
+                }
                 // The embedding and unembedding tables belong to no layer, so
                 // they are what a shorter range still has to pay.
-                None => fixed_bytes += cursor - start,
+                None => {
+                    fixed_bytes += cursor - start;
+                    fixed_dev += dev;
+                }
             }
             dense_offsets.push((start, end));
         }
         let total = cursor;
+        let device_weights: u64 = fixed_dev + per_layer_dev.values().sum::<u64>();
 
         // The admission gate. ONE requirement -- the share plus everything the
         // run allocates after it, see `run_overhead_bytes` -- asked of two
@@ -1369,7 +1509,10 @@ impl PileSource {
         let machine = mem_total_bytes()?;
         let n_layers = layers.len();
         let overhead = run_overhead_bytes(n_layers, attention_bytes, machine, policy);
-        let need = total as u64 + overhead;
+        // The arena, PLUS the weights the binding lane holds a second time in
+        // the device pool. A correct comparison against a number that omits a
+        // term is still wrong; see [`device_weight_bytes`].
+        let need = total as u64 + device_weights + overhead;
         let gib = |b: u64| b as f64 / GIB as f64;
         let verdict = admit(need, machine, available);
         if verdict != Admission::Fits {
@@ -1380,28 +1523,31 @@ impl PileSource {
             // average, because a refusal that makes the operator bisect for the
             // answer is half a bug.
             let mut acc = fixed_bytes as u64;
-            let mut fits: Option<(usize, u64)> = None;
-            for (k, bytes) in per_layer.values().enumerate() {
+            let mut acc_dev = fixed_dev;
+            let mut fits: Option<(usize, u64, u64)> = None;
+            for (k, (layer, bytes)) in per_layer.iter().enumerate() {
                 acc += *bytes as u64;
+                acc_dev += per_layer_dev.get(layer).copied().unwrap_or(0);
                 let k = k + 1;
-                let fits_here = acc + run_overhead_bytes(k, attention_bytes, machine, policy);
+                let fits_here =
+                    acc + acc_dev + run_overhead_bytes(k, attention_bytes, machine, policy);
                 // The WHOLE requirement against both numbers, exactly as the
                 // gate above tests it. Comparing the bare share against
                 // `available` here is the same half-measurement that admitted
                 // the run being refused, and it would name a range that then
                 // failed the same way.
                 if admit(fits_here, machine, available) == Admission::Fits {
-                    fits = Some((k, acc));
+                    fits = Some((k, acc, fits_here));
                 }
             }
             let advice = match fits {
-                Some((k, share)) => format!(
+                Some((k, share, whole)) => format!(
                     "The largest range that fits here is INK_LAYERS={}:{} -- {:.2} GiB of weights, \
                      {:.2} GiB with the context and activations. Give the rest to another node.",
                     layers.start,
                     layers.start + k,
                     gib(share),
-                    gib(share + run_overhead_bytes(k, attention_bytes, machine, policy)),
+                    gib(whole),
                 ),
                 None => format!(
                     "Not even one layer fits: layer {} alone is {:.2} GiB on top of {:.2} GiB of \
@@ -1468,9 +1614,12 @@ impl PileSource {
             );
         }
         println!(
-            "    admission: {:.2} GiB of weights + {:.2} GiB context/activations = {:.2} GiB of \
+            "    admission: {:.2} GiB of weights + {:.2} GiB bound in the device pool ({}) \
+             + {:.2} GiB context/activations = {:.2} GiB of \
              {:.2} GiB ({:.2} GiB of headroom against the {:.2} GiB free right now)",
             gib(total as u64),
+            gib(device_weights),
+            policy.dense_weights.name(),
             gib(overhead),
             gib(need),
             gib(machine),
@@ -1708,7 +1857,7 @@ impl PileSource {
                 .bytes = bytes.slice(skew + start..skew + end);
         }
         self.copied = Some(bytes);
-        Ok((self.copied_experts.len(), dense_names.len(), total as u64))
+        Ok((self.copied_experts.len(), dense_names.len(), total as u64, device_weights))
     }
 
     /// Every `(stacked matrix name, expert index)` this pile holds, sorted.
@@ -1761,6 +1910,100 @@ mod tests {
     use crate::models::inkling::budget::{AdmissionPolicy, StorageDType};
     use crate::models::inkling::pool::AllocatorConfig;
     use triblespace::core::blob::encodings::tensor::TensorView;
+
+    /// A dense leaf with the checkpoint's real dims, as `copy_share` sees it.
+    fn leaf(dims: &[u64], layer: Option<i64>) -> Leaf {
+        let bytes: usize = dims.iter().product::<u64>() as usize * 2;
+        Leaf {
+            elem: Elem::Bf16,
+            dims: dims.to_vec(),
+            bytes: anybytes::Bytes::from_source(vec![0u8; bytes]),
+            layer,
+        }
+    }
+
+    /// The lane facts the 0:16 measurement ran with: BF16 router, no drafting.
+    fn placed(w: super::super::budget::DenseWeights) -> AdmissionPolicy {
+        AdmissionPolicy::new(
+            AllocatorConfig::ExclusivePages,
+            StorageDType::F32,
+            StorageDType::F32,
+            StorageDType::Bf16,
+        )
+        .with_dense_weights(w)
+        .with_router_bf16(true)
+    }
+
+    /// The table in [`device_weight_bytes`], summed, against what the run
+    /// measured its pool holding at `INK_LAYERS=0:16`.
+    ///
+    /// Not a restatement of the function: the shapes are the pile's and the
+    /// two totals are `pool[after stack]` live from the two arms' own logs --
+    /// 1.41 GiB aliased and 4.94 GiB device -- so this fails if the enumeration
+    /// drifts from either measurement.
+    #[test]
+    fn the_pool_charge_reproduces_both_measured_arms_at_sixteen_layers() {
+        use super::super::budget::DenseWeights;
+        // layers 0..1 dense, 2..15 routed, plus the unembedding.
+        let mut share: Vec<(String, Leaf)> = Vec::new();
+        for l in 0..16i64 {
+            let p = format!("model.llm.layers.{l}.");
+            for (nm, dims) in [
+                ("attn.wq_du.weight", vec![4096, 4096]),
+                ("attn.wk_dv.weight", vec![1024, 4096]),
+                ("attn.wv_dv.weight", vec![1024, 4096]),
+                ("attn.wr_du.weight", vec![512, 4096]),
+                ("attn.wo_ud.weight", vec![4096, 4096]),
+                // Widened to f32 and uploaded, never bound as a GEMM operand.
+                ("attn.k_norm.weight", vec![128]),
+                ("attn.k_sconv.weight", vec![1024, 1, 4]),
+                ("attn.rel_logits_proj.proj", vec![16, 512]),
+                ("attn_norm.weight", vec![4096]),
+            ] {
+                share.push((format!("{p}{nm}"), leaf(&dims, Some(l))));
+            }
+            if l < 2 {
+                share.push((format!("{p}mlp.w13_dn.weight"), leaf(&[32768, 4096], Some(l))));
+                share.push((format!("{p}mlp.w2_md.weight"), leaf(&[4096, 16384], Some(l))));
+            } else {
+                share.push((format!("{p}mlp.gate.weight"), leaf(&[258, 4096], Some(l))));
+                share.push((
+                    format!("{p}mlp.shared_experts.shared_w13_weight"),
+                    leaf(&[2, 4096, 4096], Some(l)),
+                ));
+                share.push((
+                    format!("{p}mlp.shared_experts.shared_w2_weight"),
+                    leaf(&[2, 4096, 2048], Some(l)),
+                ));
+            }
+        }
+        // In the arena on this node, and NOT bound: the embedding is a lookup.
+        share.push(("model.llm.embed.weight".into(), leaf(&[201024, 4096], None)));
+        share.push(("model.llm.unembed.weight".into(), leaf(&[201024, 4096], None)));
+        // Copied into the arena by layer number, bound only when drafting.
+        for l in 0..8i64 {
+            let p = format!("model.mtp.layers.{l}.");
+            share.push((format!("{p}input_proj.weight"), leaf(&[4096, 8192], Some(l))));
+            share.push((
+                format!("{p}transformer_block.attn.wq_du.weight"),
+                leaf(&[4096, 4096], Some(l)),
+            ));
+        }
+
+        let sum = |policy: AdmissionPolicy| -> u64 {
+            share.iter().map(|(n, l)| device_weight_bytes(n, l, policy)).sum()
+        };
+
+        let device = sum(placed(DenseWeights::DevicePool));
+        assert_eq!(device, 5_300_944_896, "the device arm's 4.94 GiB, to the byte");
+        let aliased = sum(placed(DenseWeights::Aliased));
+        assert_eq!(aliased, 1_506_672_640, "the aliased arm's 1.40 GiB, to the byte");
+        // The win's whole memory cost, which is what the gate could not see.
+        assert_eq!(device - aliased, 3_794_272_256);
+        // Drafting binds the MTP heads that the range already pays arena for.
+        let drafting = sum(placed(DenseWeights::DevicePool).with_drafting(true));
+        assert_eq!(drafting - device, 8 * (67_108_864 + 33_554_432));
+    }
 
     /// A synthetic expert with the real checkpoint's proportions, scaled down.
     /// `PackedExpert` is a plain struct, so this needs no checkpoint.

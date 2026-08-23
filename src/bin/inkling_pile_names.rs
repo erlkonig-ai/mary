@@ -39,10 +39,12 @@ fn main() -> Result<()> {
     let pile = args.next().context("usage: inkling_pile_names <pile> [--grep S] [--raw]")?;
     let mut grep: Option<String> = None;
     let mut raw = false;
+    let mut dims = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--grep" => grep = Some(args.next().context("--grep needs a substring")?),
             "--raw" => raw = true,
+            "--dims" => dims = true,
             other => anyhow::bail!("unexpected argument {other:?}"),
         }
     }
@@ -61,6 +63,21 @@ fn main() -> Result<()> {
     };
     if let Some(s) = &grep {
         println!("matching {:?}: {} of {}", s, kept.len(), names.len());
+    }
+
+    if dims {
+        let mut v: Vec<&&String> = kept.iter().collect();
+        v.sort();
+        for n in v {
+            match src.leaf(n) {
+                Ok(l) => println!(
+                    "  {:?}\t{:?}\t{}\tlayer={:?}\t{}",
+                    l.elem, l.dims, l.bytes.len(), l.layer, n
+                ),
+                Err(e) => println!("  ERR\t{n}\t{e}"),
+            }
+        }
+        return Ok(());
     }
 
     if raw {

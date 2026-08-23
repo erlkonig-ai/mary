@@ -1499,8 +1499,14 @@ fn bind_bf16(
     // assumed; the default is to alias and take the hand kernel on those.
     let copy_to_align = align < 16
         && std::env::var("INK_ALIGN_COPY").map(|v| v == "1").unwrap_or(false);
+    // `INK_DENSE_WEIGHTS=device`: take the pool copy and read the weight at
+    // device rate rather than over the host page tables. 179.0 -> 226.8 GB/s
+    // achieved and 18.4 -> 20.2 tok/s, for a second residency that
+    // `budget::dense_weights` makes admission charge -- 3.53 GiB at 0:16, which
+    // is why it is not yet the default. See `budget::dense_weights`.
+    let device = budget::dense_weights() == budget::DenseWeights::DevicePool;
     let h = match aliases {
-        Some(al) if !copy_to_align => al.slice_or_copy(client, bytes),
+        Some(al) if !copy_to_align && !device => al.slice_or_copy(client, bytes),
         _ => client.create_from_slice(bytes),
     };
     Bf16W { h, n: rows, k: cols, align: if copy_to_align { 16 } else { align } }
@@ -1533,12 +1539,39 @@ fn note_align(bytes: &[u8], rows: usize, cols: usize) -> usize {
 }
 
 /// Print the alignment census gathered by [`note_align`].
-fn report_align() {
+fn report_align(charged: u64) {
     use core::sync::atomic::Ordering::Relaxed;
     let a: Vec<u64> = ALIGN.iter().map(|c| c.load(Relaxed)).collect();
     let n = a[0] + a[1] + a[2] + a[3];
     if n == 0 {
         return;
+    }
+    // The ledger for `pile::device_weight_bytes`. That function enumerates the
+    // weights this lane binds from a list of names; this counter is what the
+    // lane ACTUALLY bound. They are two faces of one interface and the whole
+    // point of printing them together is that reading either alone proves
+    // nothing -- a lane added later that admission does not know about is
+    // invisible in the estimate and visible here, as a gap with a size.
+    let bound = a[4] + a[5] + a[6] + a[7];
+    if budget::dense_weights() == budget::DenseWeights::DevicePool {
+        let gap = bound as i64 - charged as i64;
+        println!(
+            "  device-pool weights: admission charged {:.2} GiB, the stack bound {n} weights \
+             = {:.2} GiB{}",
+            charged as f64 / GIB,
+            bound as f64 / GIB,
+            if charged == 0 {
+                "  (nothing charged: no startup copy ran)".to_string()
+            } else if gap.unsigned_abs() > bound / 100 {
+                format!(
+                    "  -- UNPRICED {:+.2} GiB, more than 1% of the bound total. \
+                     A binding lane admission does not know about.",
+                    gap as f64 / GIB
+                )
+            } else {
+                String::new()
+            },
+        );
     }
     println!(
         "  plain-BF16 weight binds: {n} weights, {:.2} GiB -- 16B {} ({:.2} GiB), 8B {} ({:.2} GiB), \
@@ -3135,7 +3168,13 @@ fn main() -> Result<()> {
     // fallback switches are conservatively priced here.
     let grouped_narrow = std::env::var("INK_GROUPED").unwrap_or_else(|_| "1".into()) == "1"
         && !std::env::var("INK_ZEROCOPY").map(|v| v == "0").unwrap_or(false);
-    let mut admission = budget::AdmissionPolicy::runtime(allocator);
+    // The router arm and drafting decide WHICH weights the BF16 lane binds, so
+    // admission has to know both before it prices the pool copy. `from_env` is
+    // pure and is the same call the lane itself makes further down; reading it
+    // twice cannot disagree, whereas a second parse of INK_ROUTER could.
+    let mut admission = budget::AdmissionPolicy::runtime(allocator)
+        .with_router_bf16(RouterArm::from_env() == RouterArm::Bf16)
+        .with_drafting(mtp_k > 0);
     for layer in lo..hi {
         if !t.is_dense(layer) {
             let experts = format!("model.llm.layers.{layer}.mlp.experts.w13_weight");
@@ -3192,6 +3231,12 @@ fn main() -> Result<()> {
     // anonymous allocation before registration. `INK_STARTUP_COPY=0` exists
     // only for the pressure reproducer: it deliberately restores the unsafe
     // file-backed alias so the gate can prove that pressure was present.
+    //
+    // `charged_device_weights` is what admission charged the device pool, so
+    // the bind census at the end of the run can be read against it rather than
+    // on its own. Zero means nothing was charged, which the report says in
+    // those words.
+    let mut charged_device_weights = 0u64;
     if std::env::var("INK_STARTUP_COPY").map(|v| v == "0").unwrap_or(false) {
         println!("  startup weight copy: DISABLED (INK_STARTUP_COPY=0) -- UNSAFE diagnostic arm");
     } else {
@@ -3203,7 +3248,7 @@ fn main() -> Result<()> {
             globals.push("model.llm.unembed.weight");
         }
         let t0 = Instant::now();
-        let (experts, dense, bytes) = cp.copy_share(
+        let (experts, dense, bytes, device_weights) = cp.copy_share(
             lo..hi,
             &globals,
             attention_bytes + slot_kv_bytes,
@@ -3214,6 +3259,7 @@ fn main() -> Result<()> {
             bytes as f64 / GIB,
             t0.elapsed().as_secs_f64(),
         );
+        charged_device_weights = device_weights;
     }
     // The embedding table, as the BF16 the pile stores. `cp.held` turned 2.40
     // GiB of stored weight into 4.81 GB of host f32 and pinned it for the run,
@@ -3726,8 +3772,11 @@ fn main() -> Result<()> {
         let align = note_align(&leaf.bytes, rows, cols);
         let copy_to_align = align < 16
             && std::env::var("INK_ALIGN_COPY").map(|v| v == "1").unwrap_or(false);
+        // The same placement `bind_bf16` takes, on the largest single weight in
+        // the process -- 1.53 GiB of the 4.94 the device arm holds.
+        let device = budget::dense_weights() == budget::DenseWeights::DevicePool;
         let hnd = match fp4_aliases.as_ref() {
-            Some(al) if !copy_to_align => al.slice_or_copy(&fp4_client, &leaf.bytes),
+            Some(al) if !copy_to_align && !device => al.slice_or_copy(&fp4_client, &leaf.bytes),
             _ => fp4_client.create_from_slice(&leaf.bytes),
         };
         println!(
@@ -5968,7 +6017,7 @@ fn main() -> Result<()> {
     if std::env::var("INK_IOSTATS").is_ok() {
         print!("{}", cp.io_table(28));
     }
-    report_align();
+    report_align(charged_device_weights);
     mary::models::inkling::bf16gemm::report_hand();
     println!("  elapsed: {:.1}s", started.elapsed().as_secs_f32());
 
