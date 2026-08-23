@@ -10,7 +10,7 @@
 //! digit runs, so 42 layers of the same tensor read as one line with a count
 //! instead of 42 lines. An optional filter substring narrows it.
 //!
-//!   inkling_pile_names <pile> [branch] [--grep SUBSTR] [--raw]
+//!   inkling_pile_names <pile> [--grep SUBSTR] [--raw]
 
 use anyhow::{Context, Result};
 use mary::models::inkling::pile::PileSource;
@@ -36,23 +36,21 @@ fn collapse(name: &str) -> String {
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let pile = args.next().context("usage: inkling_pile_names <pile> [branch] [--grep S] [--raw]")?;
-    let mut branch = "inkling".to_string();
+    let pile = args.next().context("usage: inkling_pile_names <pile> [--grep S] [--raw]")?;
     let mut grep: Option<String> = None;
     let mut raw = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--grep" => grep = Some(args.next().context("--grep needs a substring")?),
             "--raw" => raw = true,
-            other => branch = other.to_string(),
+            other => anyhow::bail!("unexpected argument {other:?}"),
         }
     }
 
-    let src = PileSource::open(std::path::Path::new(&pile), &branch)
-        .with_context(|| format!("opening {pile} on branch {branch}"))?;
+    let src = PileSource::open(std::path::Path::new(&pile))
+        .with_context(|| format!("opening model collection in {pile}"))?;
 
     println!("pile     {pile}");
-    println!("branch   {branch}");
     println!("leaves   {} total = {} dense + {} expert",
              src.len(), src.dense_len(), src.expert_len());
 

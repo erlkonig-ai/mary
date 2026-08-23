@@ -93,6 +93,34 @@ pub enum SnapshotLocalModelCollectionError {
     Materialize(ModelCollectionMaterializationError),
 }
 
+/// Failure while choosing the sole model-graph team and freezing its exact
+/// ticket from one observed pile prefix.
+#[derive(Debug)]
+pub enum SnapshotSoleModelGraphError {
+    /// Team discovery found no unique model-graph collection in the prefix.
+    Team(SoleModelGraphTeamError),
+    /// The fixed ticket could not be verified or materialized exactly.
+    Materialize(ModelCollectionMaterializationError),
+}
+
+impl fmt::Display for SnapshotSoleModelGraphError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Team(source) => source.fmt(f),
+            Self::Materialize(source) => source.fmt(f),
+        }
+    }
+}
+
+impl Error for SnapshotSoleModelGraphError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Team(source) => Some(source),
+            Self::Materialize(source) => Some(source),
+        }
+    }
+}
+
 impl fmt::Display for SnapshotLocalModelCollectionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -281,6 +309,39 @@ pub enum LoadModelCollectionError {
     Materialize(ModelCollectionMaterializationError),
     /// The read-only pile handle could not be closed after snapshot creation.
     Close(FlushError),
+}
+
+/// Failure while opening a pile and atomically choosing and materializing its
+/// sole model-graph collection from one observed prefix.
+#[derive(Debug)]
+pub enum LoadSoleModelCollectionError {
+    /// The supplied pile path could not be opened.
+    Open(ReadError),
+    /// Sole-team discovery or exact materialization failed in the frozen
+    /// prefix.
+    Snapshot(SnapshotSoleModelGraphError),
+    /// The read-only pile handle could not be closed after snapshot creation.
+    Close(FlushError),
+}
+
+impl fmt::Display for LoadSoleModelCollectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open(source) => write!(f, "failed to open model pile: {source}"),
+            Self::Snapshot(source) => source.fmt(f),
+            Self::Close(source) => write!(f, "failed to close model pile: {source}"),
+        }
+    }
+}
+
+impl Error for LoadSoleModelCollectionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Open(source) => Some(source),
+            Self::Snapshot(source) => Some(source),
+            Self::Close(source) => Some(source),
+        }
+    }
 }
 
 impl fmt::Display for LoadModelCollectionError {
@@ -605,6 +666,12 @@ pub fn model_bundle_teams(pile: &mut Pile) -> Result<Vec<VerifyingKey>, ReadErro
 /// model graph at all, and more than one, are different failures and say so.
 pub fn sole_model_graph_team(pile: &mut Pile) -> Result<VerifyingKey, SoleModelGraphTeamError> {
     let teams = model_graph_teams(pile).map_err(SoleModelGraphTeamError::Read)?;
+    sole_model_graph_team_from(teams)
+}
+
+fn sole_model_graph_team_from(
+    teams: Vec<VerifyingKey>,
+) -> Result<VerifyingKey, SoleModelGraphTeamError> {
     match teams.len() {
         1 => Ok(teams[0]),
         0 => Err(SoleModelGraphTeamError::None),
@@ -837,6 +904,34 @@ pub fn snapshot_model_bundle_collection_local_latest(
         .map_err(SnapshotLocalModelCollectionError::Materialize)
 }
 
+/// Choose the sole model-graph team and freeze its exact ticket from one record
+/// observation.
+///
+/// Team discovery and ticket selection share one [`Pile::records`] prefix.
+/// Exact materialization may inspect storage again, but commits appended after
+/// that observation remain inert because the ticket is already fixed. This is
+/// the fail-closed entry point for a caller that holds only a pile and does not
+/// already know which team it intends to trust.
+pub fn snapshot_sole_model_collection_local_latest(
+    pile: &mut Pile,
+) -> Result<(VerifyingKey, CollectionSnapshot<PileReader>), SnapshotSoleModelGraphError> {
+    let observation = observe_collection(pile, &mary_model_graph_name()).map_err(|source| {
+        SnapshotSoleModelGraphError::Team(SoleModelGraphTeamError::Read(source))
+    })?;
+    let team = sole_model_graph_team_from(observation.teams)
+        .map_err(SnapshotSoleModelGraphError::Team)?;
+    let collection = model_graph_collection(team).collection();
+    let mut ticket: Vec<_> = observation
+        .commits
+        .into_iter()
+        .filter(|commit| commit.collection() == collection)
+        .collect();
+    ticket.sort_unstable_by_key(CollectionCommit::id);
+    let snapshot = snapshot_model_collection_exact(pile, team, &ticket)
+        .map_err(SnapshotSoleModelGraphError::Materialize)?;
+    Ok((team, snapshot))
+}
+
 /// Choose the sole bundle team and freeze its exact ticket from one record
 /// observation.
 ///
@@ -892,6 +987,31 @@ pub fn load_model_collection_local_latest(
         Err(SnapshotLocalModelCollectionError::Materialize(source)) => Err(source),
     };
     close_after_snapshot(pile, snapshot)
+}
+
+/// Open `path`, choose the sole model-graph team, and freeze its exact local
+/// ticket from one observed record prefix.
+///
+/// This is deliberately one operation rather than
+/// [`model_graph_team_at`] followed by [`load_model_collection_local_latest`]:
+/// two independent opens can observe different prefixes and hide a newly
+/// ambiguous second team. The returned reader owns its immutable mapping after
+/// the read-only pile handle is closed.
+pub fn load_sole_model_collection_local_latest(
+    path: impl AsRef<Path>,
+) -> Result<(VerifyingKey, CollectionSnapshot<PileReader>), LoadSoleModelCollectionError> {
+    let mut pile = Pile::open(path.as_ref()).map_err(LoadSoleModelCollectionError::Open)?;
+    let result = snapshot_sole_model_collection_local_latest(&mut pile);
+    match result {
+        Ok((team, snapshot)) => {
+            pile.close().map_err(LoadSoleModelCollectionError::Close)?;
+            Ok((team, snapshot))
+        }
+        Err(source) => {
+            let _ = pile.close();
+            Err(LoadSoleModelCollectionError::Snapshot(source))
+        }
+    }
 }
 
 /// Number of unique pre-epoch model-graph attributes projected by this module.
@@ -1889,6 +2009,37 @@ mod tests {
             .commits()
             .iter()
             .all(|commit| commit.collection() != foreign.collection()));
+
+        let (team, sole_snapshot) =
+            load_sole_model_collection_local_latest(file.as_path()).unwrap();
+        assert_eq!(team, test_team());
+        assert_eq!(sole_snapshot.facts(), &expected);
+        assert_eq!(sole_snapshot.commits(), expected_commits);
+    }
+
+    #[test]
+    fn sole_model_snapshot_rejects_multiple_teams_in_its_frozen_prefix() {
+        let file = TempPilePath::new("model-graph-team-ambiguity");
+        let signer = SigningKey::from_bytes(&[0x34; 32]);
+        let other_team = SigningKey::from_bytes(&[0x35; 32]).verifying_key();
+        let (first, _, _) = fragment_fixture("first-team");
+        let (second, _, _) = fragment_fixture("second-team");
+        let mut pile = open_test_pile(file.as_path());
+        publish_model_fragment(&mut pile, test_team(), &signer, first).unwrap();
+        publish_model_fragment(&mut pile, other_team, &signer, second).unwrap();
+
+        let error = match snapshot_sole_model_collection_local_latest(&mut pile) {
+            Ok(_) => panic!("two model-graph teams must be ambiguous"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                SnapshotSoleModelGraphError::Team(SoleModelGraphTeamError::Several { .. })
+            ),
+            "{error}"
+        );
+        pile.close().unwrap();
     }
 
     #[test]

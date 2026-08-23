@@ -75,10 +75,6 @@
 //! a converter that holds no team key can still publish into the team's
 //! collection — which is what makes an offline re-encoding possible at all.
 //!
-//! A source with no collection (the pre-collection piles: f5, smolvla, siglip)
-//! converts to a pile with no collection. Founding one under this tool's
-//! throwaway key would fabricate an authority the source never had.
-//!
 //! # One spelling, not two
 //!
 //! Pre-epoch piles state their attributes under literal ids that current
@@ -117,7 +113,7 @@ use std::path::Path;
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::Blob;
 use triblespace::core::id::ExclusiveId;
-use triblespace::core::repo::{BlobStoreList, Repository};
+use triblespace::core::repo::BlobStoreList;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
@@ -144,19 +140,9 @@ fn main() -> Result<()> {
     );
 
     let source = mary::persist::read_model_pile(src)?;
-    let no_collection = source.collection.is_none();
+    let (team, expected) = source.collection;
     let (tribles, reader) = (source.facts, source.reader);
-    eprintln!(
-        "[migrate] {src:?}: via {}, {} facts",
-        source.via,
-        tribles.len()
-    );
-    if no_collection {
-        eprintln!(
-            "[migrate] the source publishes no model collection, so neither will the \
-             conversion — `mary::speak` can open neither"
-        );
-    }
+    eprintln!("[migrate] {src:?}: native collection, {} facts", tribles.len());
 
     // Every leaf, by its own entity id. `data` XOR `data_f16`, plus `shape`.
     let mut leaves: Vec<(Id, bool)> = Vec::new();
@@ -183,8 +169,6 @@ fn main() -> Result<()> {
     pile.refresh()
         .map_err(|e| anyhow::anyhow!("load {dst:?}: {e:?}; refusing to auto-truncate"))?;
     let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
-    let mut repo = Repository::new(pile, signing_key.clone(), TribleSet::new())
-        .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
 
     // ── the substitution ────────────────────────────────────────────────────
     // Carry every fact EXCEPT the three being replaced ON THE LEAVES ACTUALLY
@@ -278,7 +262,7 @@ fn main() -> Result<()> {
         // `put_leaf_as` is the same writer every importer uses, so the rank
         // dispatch and the round-trip check exist once rather than twice.
         let e = leaf::put_leaf_as(
-            repo.storage_mut(),
+            &mut pile,
             &ExclusiveId::force_ref(&leaf_id),
             elem,
             &dims,
@@ -308,8 +292,7 @@ fn main() -> Result<()> {
             .get(info.handle)
             .map_err(|e| anyhow::anyhow!("copy blob: {e:?}"))?;
         copied_bytes += bytes.len();
-        let out: Inline<inlineencodings::Handle<blobencodings::RawBytes>> = repo
-            .storage_mut()
+        let out: Inline<inlineencodings::Handle<blobencodings::RawBytes>> = pile
             .put(Blob::<blobencodings::RawBytes>::new(bytes))
             .map_err(|e| anyhow::anyhow!("copy blob: {e:?}"))?;
         anyhow::ensure!(
@@ -324,48 +307,31 @@ fn main() -> Result<()> {
     );
 
     // ── publish, so the production loader can open what we just wrote ───────
-    // The collection first: it is the seam `mary::speak` selects from, and a
-    // pile that only got the branch is the exact failure this seam exists to
-    // remove.
-    if let Some((team, expected)) = source.collection {
-        let commit = mary::model_collection::publish_model_fragment(
-            repo.storage_mut(),
-            team,
-            &signing_key,
-            Fragment::new(std::iter::empty(), facts.clone()),
-        )
-        .map_err(|e| anyhow::anyhow!("publish model collection commit: {e}"))?;
-        // Not a formality: if the descriptor had moved, every already-persisted
-        // reference to this model would stop resolving, and the failure would
-        // surface as a pile that simply has no model in it rather than as an
-        // error. Cheap to check, expensive to discover.
-        anyhow::ensure!(
-            commit.collection() == expected,
-            "collection identity moved during conversion — refusing to claim the source's name"
-        );
-        eprintln!(
-            "[migrate] published into the source's model collection, identity unchanged\n\
-             [migrate]   source commits name {}\n\
-             [migrate]   this commit names   {}",
-            handle_hex(&expected),
-            handle_hex(&commit.collection())
-        );
-    }
-
-    // ...and the branch too, because the deprecated reader is still what
-    // `qwen3tts_say`, `pile_leaf_verify` and the split-index loaders use. One
-    // pin, holding the collection's complete fact set — so the converted pile
-    // does not inherit the two-pins-named-main split its source has.
-    let branch_id = *repo
-        .create_branch("main", None)
-        .map_err(|e| anyhow::anyhow!("create main: {e:?}"))?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull main: {e:?}"))?;
-    ws.commit(facts, "typed tensor leaves");
-    repo.push(&mut ws)
-        .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-    repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
+    // Publish the converted graph through the same collection identity the
+    // production loader selected from the source.
+    let commit = mary::model_collection::publish_model_fragment(
+        &mut pile,
+        team,
+        &signing_key,
+        Fragment::new(std::iter::empty(), facts),
+    )
+    .map_err(|e| anyhow::anyhow!("publish model collection commit: {e}"))?;
+    // Not a formality: if the descriptor had moved, every already-persisted
+    // reference to this model would stop resolving, and the failure would
+    // surface as a pile that simply has no model in it rather than as an
+    // error. Cheap to check, expensive to discover.
+    anyhow::ensure!(
+        commit.collection() == expected,
+        "collection identity moved during conversion — refusing to claim the source's name"
+    );
+    eprintln!(
+        "[migrate] published into the source's model collection, identity unchanged\n\
+         [migrate]   source commits name {}\n\
+         [migrate]   this commit names   {}",
+        handle_hex(&expected),
+        handle_hex(&commit.collection())
+    );
+    pile.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
 
     eprintln!(
         "[migrate] {} leaves ({f32n} f32, {f16n} f16), {:.2} GiB of payload, all verified \

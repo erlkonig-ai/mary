@@ -5,19 +5,17 @@
 //! scale sits — is exactly the arithmetic a synthetic fixture can agree with
 //! while both are wrong.
 //!
-//! Read-only. It opens the checkpoint, converts, verifies, and reports. Writing
-//! a pile is a separate step and deliberately not reachable from here.
+//! Read-only by default. A fourth positional pile path publishes the verified
+//! leaves into that pile's native model collection.
 //!
-//!   inkling_pile_import <checkpoint-dir> [tensor-base] [experts]
+//!   inkling_pile_import <checkpoint-dir> [tensor-base] [experts] [pile]
 
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use mary::models::inkling::load::Checkpoint;
 use mary::models::inkling::pile::{attrs, expert_blob, experts_in_layers, layer_of, split_payload};
 use triblespace::core::blob::encodings::tensor::TensorView;
-use triblespace::core::blob::TryFromBlob;
 use triblespace::core::metadata;
-use triblespace::core::repo::Repository;
 use triblespace::macros::entity;
 use triblespace::prelude::*;
 
@@ -46,15 +44,12 @@ fn main() -> Result<()> {
                 println!("creating a new pile at {p}");
                 std::fs::File::create(path)?;
             }
-            let store = Pile::open(path).map_err(|e| anyhow::anyhow!("open pile: {e:?}"))?;
-            let mut repo =
-                Repository::new(store, SigningKey::generate(&mut rand::rngs::OsRng), TribleSet::new())
-                    .map_err(|e| anyhow::anyhow!("repository: {e:?}"))?;
-            let branch = repo
-                .ensure_branch("inkling", None)
-                .map_err(|e| anyhow::anyhow!("branch: {e:?}"))?;
-            let ws = repo.pull(branch).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-            Some((repo, ws, TribleSet::new()))
+            let mut pile = Pile::open(path).map_err(|e| anyhow::anyhow!("open pile: {e:?}"))?;
+            pile.refresh().map_err(|e| anyhow::anyhow!("load pile: {e:?}"))?;
+            let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+            let team = mary::model_collection::model_graph_team_or_own(&mut pile, &signing_key)
+                .map_err(|e| anyhow::anyhow!("model collection: {e}"))?;
+            Some((pile, signing_key, team, Fragment::empty()))
         }
     };
 
@@ -84,21 +79,21 @@ fn main() -> Result<()> {
         anyhow::ensure!(scales == &q.scales[..], "expert {e}: scales differ");
         anyhow::ensure!(scale2 == q.scale2, "expert {e}: global scale differs");
 
-        if let Some((_, ws, change)) = writing.as_mut() {
+        if let Some((pile, _, _, change)) = writing.as_mut() {
             // put() returns the handle the facts then name, so the blob and the
             // fact about it cannot refer to different bytes.
-            let handle = ws.put(blob2);
-            let mut facts = entity! { &ufoid() @
+            let handle = pile
+                .put(blob2)
+                .map_err(|err| anyhow::anyhow!("store expert {e}: {err:?}"))?;
+            let name = pile
+                .put::<blobencodings::UTF8String, _>(base.to_string())
+                .map_err(|e| anyhow::anyhow!("store expert name: {e:?}"))?;
+            let facts = entity! { _ @
                 attrs::weight_nvfp4_2: handle,
                 attrs::expert_index: e as i64,
-                metadata::name: base.to_string().to_blob().get_handle(),
+                metadata::name: name,
+                attrs::layer?: layer_of(&base),
             };
-            // Absent rather than zero when the name carries no layer: a tensor
-            // that silently joined layer 0 would ship to the wrong machine.
-            if let Some(l) = layer_of(&base) {
-                let root = facts.root().expect("rooted");
-                facts += entity! { ExclusiveId::force_ref(&root) @ attrs::layer: l };
-            }
             *change += facts;
         }
 
@@ -109,24 +104,26 @@ fn main() -> Result<()> {
         );
     }
 
-    // Read back what was written, as a QUERY over layers rather than a read of
-    // bytes. This is the split: a node asks for the layers it holds and gets
-    // handles, and nothing is materialised to answer.
-    if let Some((_, ws, _)) = writing.as_mut() {
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let _ = &space;
-    }
-
-    if let Some((mut repo, mut ws, change)) = writing {
-        ws.commit(change, "inkling experts");
-        repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-        repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
+    if let Some((mut pile, signing_key, team, change)) = writing {
+        if !change.facts().is_empty() {
+            mary::model_collection::publish_model_fragment(
+                &mut pile,
+                team,
+                &signing_key,
+                change,
+            )
+            .map_err(|e| anyhow::anyhow!("publish model collection: {e}"))?;
+        }
         println!("wrote {count} expert(s) to {}", pile_path.clone().unwrap());
 
-        // Query the pile we just wrote, by layer.
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let held = experts_in_layers(&space, 0..=20);
-        let all = experts_in_layers(&space, i64::MIN..=i64::MAX);
+        // Query the collection we just wrote, by layer.
+        let snapshot = mary::model_collection::snapshot_model_collection_local_latest(
+            &mut pile,
+            team,
+        )
+        .map_err(|e| anyhow::anyhow!("snapshot model collection: {e}"))?;
+        let held = experts_in_layers(snapshot.facts(), 0..=20);
+        let all = experts_in_layers(snapshot.facts(), i64::MIN..=i64::MAX);
         println!(
             "query layers 0..=20 -> {} expert handle(s) of {} total, nothing materialised",
             held.len(),
@@ -135,6 +132,8 @@ fn main() -> Result<()> {
         for r in all.iter().take(3) {
             println!("  layer {:>3}  expert {:>3}  {:?}", r.layer, r.expert, r.handle);
         }
+        drop(snapshot);
+        pile.close().map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
     }
 
     println!(

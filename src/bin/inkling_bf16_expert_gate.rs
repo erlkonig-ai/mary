@@ -153,7 +153,7 @@ fn main() -> Result<()> {
     anyhow::ensure!(x_f32.len() == tokens * h, "x is {} f32", x_f32.len());
     anyhow::ensure!(x_bits.len() == tokens * h, "x bits are {}", x_bits.len());
 
-    let src = mary::models::inkling::source::Weights::open(&ckpt, "inkling")?;
+    let src = mary::models::inkling::source::Weights::open(&ckpt)?;
     let n13 = format!("model.llm.layers.{layer}.mlp.experts.w13_weight");
     let n2 = format!("model.llm.layers.{layer}.mlp.experts.w2_weight");
     anyhow::ensure!(!src.is_nvfp4(&n13), "{n13} is packed NVFP4; layer {layer} should be BF16");

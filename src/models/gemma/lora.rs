@@ -440,7 +440,7 @@ mod tests {
     }
 
     /// Round-trip a small adapter set through a REAL temp on-disk pile
-    /// (commit on `main`, reopen fresh, checkout, load) and assert the
+    /// (native collection commit, cold reopen, exact snapshot, load) and assert the
     /// tensors come back bit-identical with the right shapes.
     #[test]
     fn lora_pile_roundtrip() {
@@ -481,45 +481,31 @@ mod tests {
         let _ = std::fs::remove_file(&pile_path);
         std::fs::File::create(&pile_path).unwrap();
 
-        // Save: adapter entities + set entity committed on `main`.
+        // Save: adapter entities plus set entity in Mary's model collection.
         {
             let mut pile = Pile::open(&pile_path).unwrap();
             pile.refresh().unwrap();
-            let mut repo = Repository::new(
-                pile,
-                SigningKey::generate(&mut rand::rngs::OsRng),
-                TribleSet::new(),
+            let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+            let team = crate::model_collection::model_graph_team_or_own(
+                &mut pile,
+                &signing_key,
             )
             .unwrap();
-            let branch_id = *repo.create_branch("main", None).unwrap();
-            let mut ws = repo.pull(branch_id).unwrap();
-            let frag = lora
-                .save_to_pile("gemma-4-E4B-it", repo.storage_mut())
-                .unwrap();
-            ws.commit(frag.into_facts(), "lora adapters");
-            repo.push(&mut ws).unwrap();
-            repo.close().unwrap();
+            let fragment = lora.save_to_pile("gemma-4-E4B-it", &mut pile).unwrap();
+            crate::model_collection::publish_model_fragment(
+                &mut pile,
+                team,
+                &signing_key,
+                fragment,
+            )
+            .unwrap();
+            pile.close().unwrap();
         }
 
         // Load from a FRESH open of the pile file.
         let loaded = {
-            let mut pile = Pile::open(&pile_path).unwrap();
-            pile.refresh().unwrap();
-            let mut repo = Repository::new(
-                pile,
-                SigningKey::generate(&mut rand::rngs::OsRng),
-                TribleSet::new(),
-            )
-            .unwrap();
-            let branch_id = repo.lookup_branch("main").unwrap().expect("main exists");
-            let mut ws = repo.pull(branch_id).unwrap();
-            let head = ws.head().expect("main has a commit");
-            let checkout = ws.checkout(ancestors(head)).unwrap();
-            let tribles: TribleSet = checkout.facts().clone();
-            let reader = repo.storage_mut().reader().unwrap();
-            let loaded = LoraWeights::<TB>::load_from_pile(&tribles, &reader, &device);
-            repo.close().unwrap();
-            loaded
+            let source = crate::persist::read_model_pile(&pile_path).unwrap();
+            LoraWeights::<TB>::load_from_pile(&source.facts, &source.reader, &device)
         };
 
         assert_eq!(loaded.rank, rank);

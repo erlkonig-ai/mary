@@ -28,7 +28,7 @@
 //!
 //! Build: `--features cuda-backend,inkling`
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use cubecl::prelude::*;
 
 use mary::models::inkling::fp4gemm::{
@@ -61,7 +61,7 @@ fn main() -> Result<()> {
         "inkling-small-complete.pile",
     )?;
 
-    let src = mary::models::inkling::source::Weights::open(&dir, "inkling")?;
+    let src = mary::models::inkling::source::Weights::open(&dir)?;
     let b13 = format!("model.llm.layers.{LAYER}.mlp.experts.w13_weight");
     anyhow::ensure!(src.is_nvfp4(&b13), "{b13} is not packed NVFP4");
 

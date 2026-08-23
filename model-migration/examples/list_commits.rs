@@ -6,10 +6,8 @@
 //! enumerated rather than guessed at.
 
 use anyhow::{anyhow, Context, Result};
-use ed25519_dalek::SigningKey;
 use std::collections::{BTreeSet, HashMap};
-use triblespace::core::repo::{Repository, BlobStore, BlobStoreGet};
-use triblespace::core::repo::{parent, content};
+use triblespace::core::repo::{content, parent, BlobStoreGet};
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
@@ -22,13 +20,13 @@ fn parents_and_content(
     let meta: TribleSet = reader
         .get(commit)
         .map_err(|e| anyhow!("read commit: {e:?}"))?;
-    let contents: Vec<Commit> = find!((c: Inline<_>), pattern!(&meta, [{ content: ?c }]))
-        .map(|(c,)| c)
-        .collect();
+    let mut contents = find!((c: Inline<_>), pattern!(&meta, [{ content: ?c }]));
+    let content_handle = contents.next().map(|(handle,)| handle);
+    anyhow::ensure!(contents.next().is_none(), "commit has ambiguous content");
     let parents: Vec<Commit> = find!((p: Inline<_>), pattern!(&meta, [{ parent: ?p }]))
         .map(|(p,)| p)
         .collect();
-    Ok((parents, contents.first().copied()))
+    Ok((parents, content_handle))
 }
 
 fn closure(reader: &impl BlobStoreGet, root: Commit) -> Result<(usize, usize)> {
@@ -53,20 +51,23 @@ fn closure(reader: &impl BlobStoreGet, root: Commit) -> Result<(usize, usize)> {
 }
 
 fn main() -> Result<()> {
-    let path = std::env::args().nth(1).context("usage: list_commits <pile>")?;
+    let path = std::env::args()
+        .nth(1)
+        .context("usage: list_commits <pile>")?;
     let path = std::path::Path::new(&path);
     let mut pile = Pile::open(path).map_err(|e| anyhow!("open: {e:?}"))?;
-    pile.refresh().map_err(|e| anyhow!("refresh: {e:?}"))?;
-    let key = SigningKey::from_bytes(&[0x11u8; 32]);
-    let mut repo = Repository::new(&mut pile, key, TribleSet::new())
-        .map_err(|e| anyhow!("repo: {e:?}"))?;
-    let branch = repo
-        .lookup_branch("main")
-        .map_err(|e| anyhow!("lookup: {e:?}"))?
-        .ok_or_else(|| anyhow!("no main"))?;
-    let ws = repo.pull(branch).map_err(|e| anyhow!("pull: {e:?}"))?;
-    let head = ws.head().ok_or_else(|| anyhow!("no head"))?;
-    let reader = repo.storage_mut().reader().context("reader")?;
+    let result = list(&mut pile, path);
+    let close = pile.close().map_err(|error| anyhow!("close pile: {error}"));
+    result?;
+    close
+}
+
+fn list(pile: &mut Pile, path: &std::path::Path) -> Result<()> {
+    let frozen =
+        mary_model_migration::freeze_legacy_model_main(pile).context("freeze legacy main")?;
+    let branch = frozen.branch;
+    let head = frozen.head;
+    let reader = frozen.reader;
 
     // Enumerate the DAG first, then size each node's closure.
     let mut order: Vec<Commit> = Vec::new();
@@ -83,9 +84,12 @@ fn main() -> Result<()> {
         pending.extend(parents);
     }
     println!("pile {}", path.display());
-    println!("main head {head:?}");
+    println!("main branch {branch}, head {head:?}");
     println!("{} commits reachable\n", order.len());
-    println!("  {:<66} {:>10} {:>8} {:>8}", "COMMIT", "CLOSURE", "COMMITS", "PARENTS");
+    println!(
+        "  {:<66} {:>10} {:>8} {:>8}",
+        "COMMIT", "CLOSURE", "COMMITS", "PARENTS"
+    );
     for c in &order {
         let (facts, commits) = closure(&reader, *c)?;
         let hash = inlineencodings::Handle::<blobencodings::SimpleArchive>::to_hash(*c);

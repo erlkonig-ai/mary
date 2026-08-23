@@ -7,37 +7,34 @@
 //! rather than by how many members they happen to have.
 
 use anyhow::{anyhow, Context, Result};
-use ed25519_dalek::SigningKey;
 use mary::format::attrs;
 use mary::model_collection::project_legacy_model_attributes;
 use std::collections::{BTreeMap, BTreeSet};
-use triblespace::core::repo::{ancestors, Repository};
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
 fn main() -> Result<()> {
-    let path = std::env::args().nth(1).context("usage: inspect_roots <pile>")?;
+    let path = std::env::args()
+        .nth(1)
+        .context("usage: inspect_roots <pile>")?;
     let path = std::path::Path::new(&path);
     let mut pile = Pile::open(path).map_err(|e| anyhow!("open {path:?}: {e:?}"))?;
-    pile.refresh().map_err(|e| anyhow!("refresh: {e:?}"))?;
+    let result = inspect(&mut pile, path);
+    let close = pile.close().map_err(|error| anyhow!("close pile: {error}"));
+    result?;
+    close
+}
 
-    let signing_key = SigningKey::from_bytes(&[0x11u8; 32]);
-    let mut repo = Repository::new(&mut pile, signing_key, TribleSet::new())
-        .map_err(|e| anyhow!("repo: {e:?}"))?;
-    let branch = repo
-        .lookup_branch("main")
-        .map_err(|e| anyhow!("lookup main: {e:?}"))?
-        .ok_or_else(|| anyhow!("no 'main' branch"))?;
-    let mut ws = repo.pull(branch).map_err(|e| anyhow!("pull: {e:?}"))?;
-    let head = ws.head().ok_or_else(|| anyhow!("main has no commits"))?;
-    let facts = ws
-        .checkout(ancestors(head))
-        .map_err(|e| anyhow!("checkout: {e:?}"))?
-        .into_facts();
-    let reader = repo.storage_mut().reader().context("reader")?;
+fn inspect(pile: &mut Pile, path: &std::path::Path) -> Result<()> {
+    let frozen =
+        mary_model_migration::freeze_legacy_model_main(pile).context("freeze legacy main")?;
+    let branch = frozen.branch;
+    let head = frozen.head;
+    let facts = frozen.facts;
+    let reader = frozen.reader;
 
     println!("pile {}", path.display());
-    println!("legacy main head {head:?}");
+    println!("legacy main branch {branch}, head {head:?}");
     let projection = project_legacy_model_attributes(&facts);
     println!(
         "{} legacy facts, {} aliases would be added",
@@ -137,7 +134,10 @@ fn main() -> Result<()> {
     );
 
     let real_toks: BTreeSet<Id> = mary::tokenizer::find_tokenizers(&facts).collect();
-    println!("\n{} REAL tokenizer root(s) (tagged with a tokenizer kind):", real_toks.len());
+    println!(
+        "\n{} REAL tokenizer root(s) (tagged with a tokenizer kind):",
+        real_toks.len()
+    );
     for t in &real_toks {
         let t = *t;
         let names: Vec<String> = find!(

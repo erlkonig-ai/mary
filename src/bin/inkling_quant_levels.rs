@@ -224,7 +224,7 @@ fn main() -> Result<()> {
         std::env::args().nth(1).as_deref(),
         "inkling-small-complete.pile",
     )?;
-    let src = Weights::open(&dir, "inkling")?;
+    let src = Weights::open(&dir)?;
     let b13 = format!("model.llm.layers.{LAYER}.mlp.experts.w13_weight");
 
     println!("=== activation quantiser: one level vs two ===");

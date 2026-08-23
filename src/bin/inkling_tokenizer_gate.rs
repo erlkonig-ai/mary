@@ -27,7 +27,7 @@
 //! was, so the gate can be watched failing on exactly the properties it claims
 //! to cover — a check that has never failed is not evidence.
 //!
-//!   inkling_tokenizer_gate <tokenizer.json> [pile] [branch]
+//!   inkling_tokenizer_gate <tokenizer.json> [pile]
 //!                          [--mutate ignore-merges|use-regex|drop-merge]
 //!
 //! Build: `--features tokenizer` (or any build that pulls it in).
@@ -93,21 +93,18 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let json_path = args
         .next()
-        .context("usage: inkling_tokenizer_gate <tokenizer.json> [pile] [branch] [--mutate WHAT]")?;
+        .context("usage: inkling_tokenizer_gate <tokenizer.json> [pile] [--mutate WHAT]")?;
     let mut pile: Option<String> = None;
-    let mut branch = "inkling".to_string();
     let mut mutate: Option<String> = None;
-    let mut positional = 0;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--mutate" => mutate = Some(args.next().context("--mutate needs a name")?),
             other => {
-                if positional == 0 {
+                if pile.is_none() {
                     pile = Some(other.to_string());
                 } else {
-                    branch = other.to_string();
+                    anyhow::bail!("unexpected argument {other:?}");
                 }
-                positional += 1;
             }
         }
     }
@@ -219,9 +216,10 @@ fn main() -> Result<()> {
         return Ok(());
     };
 
-    println!("\n=== ingesting into {pile} (branch {branch}) ===");
+    println!("\n=== ingesting into {pile} ===");
     // A mutation must not be written into a shared pile: the ingest refuses a
-    // second tokenizer, so a mutated one would poison the branch permanently.
+    // second tokenizer, so a mutated one would poison the collection
+    // permanently.
     if mutate.is_some() {
         let tmp = std::env::temp_dir().join("inkling_tokenizer_mutated.json");
         std::fs::write(&tmp, &ingest_bytes)?;
@@ -233,7 +231,7 @@ fn main() -> Result<()> {
         Path::new(&json_path).to_path_buf()
     };
 
-    match mary::persist::ingest_hf_tokenizer(Path::new(&pile), &src, "inkling-small", &branch) {
+    match mary::persist::ingest_hf_tokenizer(Path::new(&pile), &src, "inkling-small") {
         Ok(r) => {
             println!("committed: {} facts", r.facts);
             println!(
@@ -254,7 +252,7 @@ fn main() -> Result<()> {
         }
     }
 
-    let from_pile = mary::persist::load_tokenizer_from_pile_on(Path::new(&pile), &branch)
+    let from_pile = mary::persist::load_tokenizer_from_pile(Path::new(&pile))
         .context("read the tokenizer back out of the pile")?;
     let bad_pile = compare("pile", &from_file, &from_pile, &v)?;
 

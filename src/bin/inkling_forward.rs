@@ -1074,9 +1074,9 @@
 //!
 //! # Where the weights come from
 //!
-//! The pile, positionally, on branch `INK_PILE_BRANCH` (default `inkling`). All
-//! of it: the weights AND `config.json` AND the chat template, so a run reads
-//! nothing off a checkpoint directory and there is no path it could.
+//! The pile, positionally, through its sole native model collection. All of it:
+//! the weights AND `config.json` AND the chat template, so a run reads nothing
+//! off a checkpoint directory and there is no path it could.
 //!
 //! It used to be the other way round — a checkpoint directory positionally,
 //! with `INK_PILE=<path>` as an opt-in swap — and by the end that argument was
@@ -2839,10 +2839,9 @@ fn main() -> Result<()> {
     // The weights, and everything else the run needs to know about the model.
     // There is no second arm: no `INK_PILE` to opt into, and no checkpoint
     // directory to fall back to.
-    let pile_branch = std::env::var("INK_PILE_BRANCH").unwrap_or_else(|_| "inkling".to_string());
     let t_open = Instant::now();
-    let mut cp = Weights::open(&pile_path, &pile_branch)
-        .with_context(|| format!("opening {} on branch {pile_branch}", pile_path.display()))?;
+    let mut cp = Weights::open(&pile_path)
+        .with_context(|| format!("opening model collection in {}", pile_path.display()))?;
     let open_secs = t_open.elapsed().as_secs_f64();
 
     // …and the config comes from the SAME source. It used to come from a

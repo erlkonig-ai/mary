@@ -56,8 +56,8 @@ pub struct Weights {
 }
 
 impl Weights {
-    /// Weights out of a pile, on the named branch. The only constructor there
-    /// is.
+    /// Weights out of a pile's sole model collection. The only constructor
+    /// there is.
     ///
     /// Residency is not a choice. `INK_RESIDENT` used to default it OFF,
     /// because pinning tens of gigabytes on a 119 GiB box against a 159 GiB
@@ -65,9 +65,9 @@ impl Weights {
     /// retires. A node holds ITS share, which fits; a node that streams is a
     /// node reading the SSD in the middle of a decode step, which is the one
     /// thing this runtime must never do.
-    pub fn open(path: impl AsRef<std::path::Path>, branch: &str) -> Result<Self> {
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
         Ok(Weights {
-            src: PileSource::open(path.as_ref(), branch)?,
+            src: PileSource::open(path.as_ref())?,
             resident: Mutex::new(HashMap::new()),
             io: Mutex::new(BTreeMap::new()),
         })
