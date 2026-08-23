@@ -5,14 +5,14 @@
 //!
 //! `persist_safetensors_to_pile` ingests every `*.safetensors` shard into the pile
 //! (each tensor a content-addressed f32 leaf via [`crate::ingest::save_safetensors`]),
-//! committing the model-graph facts on the `main` branch. The weight *blobs* are
+//! publishing the resulting fragment into Mary's signed model collection. The weight *blobs* are
 //! written straight into the pile's storage (the `Pile` is itself a
 //! `BlobStorePut`), so there is no giant in-memory buffer — only the small fact
-//! set rides through the workspace commit. It is fully model-agnostic — the
+//! set rides through the collection commit. It is fully model-agnostic — the
 //! `gemma4` lineage in the old name was history; CLIP/SigLIP use the same path.
 //!
-//! `load_keymap_from_pile` opens the pile fresh, resolves `main`, checks
-//! out the full history into a `TribleSet`, finds every model entity (the ones
+//! `load_keymap_from_pile` opens the pile fresh, materializes the sole model
+//! collection, finds every model entity (the ones
 //! carrying `attrs::model_name`), and materializes the union keymap via
 //! [`crate::ingest::load_keymap`]. The f32 blobs store weights exactly, so the
 //! round-trip is lossless.
@@ -82,7 +82,7 @@ pub fn persist_safetensors_to_pile(
 /// `"text_encoder/model-00001.safetensors"` let a loader materialize one
 /// component at a time via [`load_keymap_from_pile_prefixed`]). Creates the
 /// pile file if it does not exist. Each tensor becomes a content-addressed
-/// leaf; the model-graph facts are committed on the `main` branch. After this
+/// leaf; the model-graph fragment is published into the native collection. After this
 /// returns, the pile file holds the full weights — no safetensors are needed
 /// to load the model again.
 #[cfg(feature = "import")]
@@ -548,7 +548,7 @@ mod filtered_native_import_tests {
         archive.finish().unwrap();
     }
 
-    /// The Repository/workspace write path, end to end on a real pile file:
+    /// The native collection write path, end to end on a real pile file:
     /// tensors go into the pile's blob store as typed leaves, only the small
     /// fact set rides through the commit, and a cold reopen reads every tensor
     /// back with its shape.
@@ -557,7 +557,7 @@ mod filtered_native_import_tests {
     /// straight to storage rather than staged through a prepared commit — and
     /// it is the one every `*_persist` binary uses.
     #[test]
-    fn a_typed_pile_written_through_a_workspace_reads_back_cold() {
+    fn a_typed_pile_written_through_a_collection_reads_back_cold() {
         let fixture = TempFixture::new();
         let weights_file = fixture.dir.join("model.safetensors");
         let matrix = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
@@ -722,11 +722,10 @@ mod filtered_native_import_tests {
     }
 }
 
-/// The engine behind [`persist_safetensors_files_to_pile`] (untagged, `main`):
+/// The engine behind [`persist_safetensors_files_to_pile`]:
 /// ingest each file's weight blobs straight into `pile_path`'s storage (no
-/// in-memory carryover) and commit ONE model entity PER file on `main`, creating
-/// the pile and branch if absent. (The content-addressed model-ROOT path is
-/// [`import_model_to_collection`], native model collection.)
+/// in-memory carryover) and publish one model entity per file into Mary's
+/// native model collection.
 #[cfg(feature = "import")]
 fn persist_files_to_pile(
     files: &[(std::path::PathBuf, String)],
@@ -754,47 +753,28 @@ fn persist_files_to_pile(
         )
     })?;
 
-    let mut repo = Repository::new(
-        pile,
-        SigningKey::generate(&mut rand::rngs::OsRng),
-        TribleSet::new(),
-    )
-    .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
-    // Reuse the branch if it exists (append into an existing pile), else create it.
-    let branch_id = match repo
-        .lookup_branch("main")
-        .map_err(|e| anyhow::anyhow!("lookup main: {e:?}"))?
-    {
-        Some(id) => id,
-        None => *repo
-            .create_branch("main", None)
-            .map_err(|e| anyhow::anyhow!("create main: {e:?}"))?,
-    };
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull main: {e:?}"))?;
-
     // Ingest each file's weight blobs straight into the pile storage (no
-    // in-memory carryover), accumulating only the model-graph facts.
-    let mut facts = TribleSet::new();
+    // in-memory carryover), accumulating only the model graph.
+    let mut fragment = Fragment::empty();
     for (path, name) in files {
         let bytes = read_safetensors_file(path);
         eprintln!("[persist] ingesting {name} ({} bytes)...", bytes.len());
         let frag = crate::ingest::save_safetensors_filtered(
             &bytes,
             name,
-            repo.storage_mut(),
+            &mut pile,
             dtype,
             |_| true,
         )
         .map_err(|e| anyhow::anyhow!("ingest {path:?}: {e}"))?;
-        facts += frag.into_facts();
+        fragment += frag;
     }
 
-    ws.commit(facts, "ingest model weights");
-    repo.push(&mut ws)
-        .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-    repo.close()
+    let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+    let team = crate::model_collection::model_graph_team_or_own(&mut pile, &signing_key)?;
+    crate::model_collection::publish_model_fragment(&mut pile, team, &signing_key, fragment)
+        .map_err(|e| anyhow::anyhow!("publish model collection: {e}"))?;
+    pile.close()
         .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
     Ok(())
 }
@@ -832,25 +812,6 @@ pub fn persist_safetensors_file_filtered_to_pile(
              `trible pile amputate`"
         )
     })?;
-    let mut repo = Repository::new(
-        pile,
-        SigningKey::generate(&mut rand::rngs::OsRng),
-        TribleSet::new(),
-    )
-    .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
-    let branch_id = match repo
-        .lookup_branch("main")
-        .map_err(|e| anyhow::anyhow!("lookup main: {e:?}"))?
-    {
-        Some(id) => id,
-        None => *repo
-            .create_branch("main", None)
-            .map_err(|e| anyhow::anyhow!("create main: {e:?}"))?,
-    };
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull main: {e:?}"))?;
-
     let bytes = read_safetensors_file(file);
     eprintln!(
         "[persist] ingesting {entity_name} (filtered from {} bytes)...",
@@ -859,19 +820,17 @@ pub fn persist_safetensors_file_filtered_to_pile(
     let frag = crate::ingest::save_safetensors_filtered(
         &bytes,
         entity_name,
-        repo.storage_mut(),
+        &mut pile,
         dtype,
         keep,
     )
     .map_err(|e| anyhow::anyhow!("ingest {file:?}: {e}"))?;
 
-    ws.commit(
-        frag.into_facts(),
-        "ingest model weights (filtered component)",
-    );
-    repo.push(&mut ws)
-        .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-    repo.close()
+    let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+    let team = crate::model_collection::model_graph_team_or_own(&mut pile, &signing_key)?;
+    crate::model_collection::publish_model_fragment(&mut pile, team, &signing_key, frag)
+        .map_err(|e| anyhow::anyhow!("publish model collection: {e}"))?;
+    pile.close()
         .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
     Ok(())
 }
@@ -955,43 +914,8 @@ pub fn load_split_index_from_pile(
     HashMap<String, crate::leaf::Leaf>,
     triblespace::core::repo::pile::PileReader,
 )> {
-    let mut pile =
-        Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open pile {pile_path:?}: {e:?}"))?;
-    // Read path: non-mutating load, NEVER amputate. A corrupt tail fails
-    // loud; truncation is an explicit operator decision (`trible pile
-    // amputate`), never a side effect of loading weights.
-    pile.refresh().map_err(|e| {
-        anyhow::anyhow!(
-            "pile {pile_path:?} failed to load ({e:?}); refusing to auto-truncate on a \
-             read path — if the tail is a genuinely torn write, amputate explicitly \
-             with `trible pile amputate`"
-        )
-    })?;
-    let mut repo = Repository::new(
-        pile,
-        SigningKey::generate(&mut rand::rngs::OsRng),
-        TribleSet::new(),
-    )
-    .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
-    let branch_id = repo
-        .lookup_branch("main")
-        .map_err(|e| anyhow::anyhow!("lookup main: {e:?}"))?
-        .ok_or_else(|| anyhow::anyhow!("no 'main' branch in pile {pile_path:?}"))?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull main: {e:?}"))?;
-    let head = ws
-        .head()
-        .ok_or_else(|| anyhow::anyhow!("'main' has no commits"))?;
-    let tribles: TribleSet = pre_epoch_aliased(
-        ws.checkout(ancestors(head))
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
-            .facts(),
-    );
-    let reader = repo
-        .storage_mut()
-        .reader()
-        .map_err(|e| anyhow::anyhow!("pile reader: {e:?}"))?;
+    let source = read_model_pile(pile_path)?;
+    let (tribles, reader) = (source.facts, source.reader);
 
     let mut f16 = HashMap::new();
     let mut f32_ = HashMap::new();
@@ -1008,8 +932,6 @@ pub fn load_split_index_from_pile(
             f32_.extend(crate::ingest::index_keymap(&tribles, &reader, m));
         }
     }
-    repo.close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
     Ok((f16, f32_, reader))
 }
 
@@ -1258,61 +1180,46 @@ pub fn derive_qwen3tts_folded_pile(
     eprintln!("[fold-derive] pile {dst_pile:?} does not exist — creating a NEW sibling pile");
     std::fs::File::create(dst_pile)
         .map_err(|e| anyhow::anyhow!("create pile {dst_pile:?}: {e}"))?;
-    let pile =
+    let mut pile =
         Pile::open(dst_pile).map_err(|e| anyhow::anyhow!("open pile {dst_pile:?}: {e:?}"))?;
-    let mut repo = Repository::new(
-        pile,
-        SigningKey::generate(&mut rand::rngs::OsRng),
-        TribleSet::new(),
-    )
-    .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
-    let branch_id = *repo
-        .create_branch("main", None)
-        .map_err(|e| anyhow::anyhow!("create main: {e:?}"))?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull main: {e:?}"))?;
 
     let mut members: Vec<Id> = Vec::new();
-    let mut facts = TribleSet::new();
+    let mut graph = Fragment::empty();
     let (mut count, mut bytes) = (0usize, 0usize);
     for (name, bits, dims) in &tensors {
         // put_raw_f16 re-rounds f32→f16; f16→f32→f16 round-trips bit-exactly,
         // so the stored leaf is the exact production readback.
         let data: Vec<f32> = bits.iter().map(|h| h.to_f32()).collect();
-        let leaf = crate::format::put_raw_f16(repo.storage_mut(), &data, dims)
+        let leaf = crate::format::put_raw_f16(&mut pile, &data, dims)
             .map_err(|e| anyhow::anyhow!("{name}: put f16 leaf: {e}"))?;
         let leaf_id = leaf.root().expect("leaf root");
-        facts += leaf.into_facts();
+        graph += leaf;
         let kind = match dims.len() {
             1 => "vector",
             2 => "matrix",
             3 => "conv",
             _ => "tensor",
         };
-        let name_h = repo
-            .storage_mut()
+        let name_h = pile
             .put::<blobencodings::UTF8String, _>(name.clone())
             .map_err(|e| anyhow::anyhow!("{name}: put name blob: {e:?}"))?;
         let m = entity! { _ @ attrs::kind: kind, attrs::safetensor_path: name_h, attrs::weight: leaf_id };
         members.push(m.root().expect("module root"));
-        facts += m.into_facts();
+        graph += m;
         count += 1;
         bytes += bits.len() * 2;
     }
-    let mn = repo
-        .storage_mut()
+    let mn = pile
         .put::<blobencodings::UTF8String, _>("talker_folded_f16".to_string())
         .map_err(|e| anyhow::anyhow!("put entity name blob: {e:?}"))?;
     let model = entity! { _ @ attrs::model_name: mn, attrs::member*: members.iter() };
-    facts += model.into_facts();
-    ws.commit(
-        facts,
-        "derive folded talker weights (production readback) for zero-copy alias",
-    );
-    repo.push(&mut ws)
-        .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-    repo.close()
+    graph += model;
+    let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+    let team = crate::model_collection::model_graph_team_or_own(&mut pile, &signing_key)
+        .map_err(|e| anyhow::anyhow!("select model collection: {e}"))?;
+    crate::model_collection::publish_model_fragment(&mut pile, team, &signing_key, graph)
+        .map_err(|e| anyhow::anyhow!("publish folded model fragment: {e}"))?;
+    pile.close()
         .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
 
     // ── rails: the canonical pile must be byte-length unchanged ──
@@ -1514,7 +1421,7 @@ pub fn load_qwen3tts_talker_folded_from_indexes(
 }
 
 /// Load the weight keymap from JUST the pile file — no safetensors. Opens
-/// the pile, resolves the `main` branch, checks out the full history, finds every
+/// the pile, materializes its native model collection, finds every
 /// model entity, and materializes the union `name → (f32, shape)` keymap.
 pub fn load_keymap_from_pile(
     pile_path: &Path,
@@ -1530,47 +1437,8 @@ pub fn load_keymap_from_pile_prefixed(
     pile_path: &Path,
     name_prefix: &str,
 ) -> anyhow::Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
-    let mut pile =
-        Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open pile {pile_path:?}: {e:?}"))?;
-    // Read path: non-mutating load, NEVER amputate. A corrupt tail fails
-    // loud; truncation is an explicit operator decision (`trible pile
-    // amputate`), never a side effect of loading weights.
-    pile.refresh().map_err(|e| {
-        anyhow::anyhow!(
-            "pile {pile_path:?} failed to load ({e:?}); refusing to auto-truncate on a \
-             read path — if the tail is a genuinely torn write, amputate explicitly \
-             with `trible pile amputate`"
-        )
-    })?;
-    let mut repo = Repository::new(
-        pile,
-        SigningKey::generate(&mut rand::rngs::OsRng),
-        TribleSet::new(),
-    )
-    .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
-
-    let branch_id = repo
-        .lookup_branch("main")
-        .map_err(|e| anyhow::anyhow!("lookup main: {e:?}"))?
-        .ok_or_else(|| anyhow::anyhow!("no 'main' branch in pile {pile_path:?}"))?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull main: {e:?}"))?;
-    let head = ws
-        .head()
-        .ok_or_else(|| anyhow::anyhow!("'main' has no commits"))?;
-
-    // Full history → all the model-graph facts.
-    let checkout = ws
-        .checkout(ancestors(head))
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let tribles: TribleSet = pre_epoch_aliased(checkout.facts());
-
-    // A reader over the pile blobs (where the weights live).
-    let reader = repo
-        .storage_mut()
-        .reader()
-        .map_err(|e| anyhow::anyhow!("pile reader: {e:?}"))?;
+    let source = read_model_pile(pile_path)?;
+    let (tribles, reader) = (source.facts, source.reader);
 
     // Every model entity (one per persisted shard) carries `attrs::model_name`.
     let model_ids: Vec<Id> = find!(
@@ -1591,8 +1459,6 @@ pub fn load_keymap_from_pile_prefixed(
     for id in model_ids {
         keymap.extend(load_keymap(&tribles, &reader, id));
     }
-    repo.close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
     if keymap.is_empty() {
         anyhow::bail!("keymap empty after materializing from pile");
     }
@@ -1696,59 +1562,31 @@ mod legacy_spelling_tests {
     }
 }
 
-/// A model pile's complete facts, read through whichever reader it actually
-/// has, plus the identity of the collection that authorized them.
-///
-/// `collection` is `Some((team, handle))` exactly when the pile publishes a
-/// `mary-model-graph` collection, and the handle is taken from the pile's OWN
-/// commits rather than recomputed from the team — so a conversion comparing
-/// source and destination compares what is on disk, not one function against
-/// itself.
+/// A model pile's complete collection snapshot and its authority.
 pub struct ModelPileSource {
     /// Every fact the model is stated by, canonical aliases projected in.
     pub facts: TribleSet,
     /// Reader over the source's immutable mapping; valid after the pile closes.
     pub reader: triblespace::core::repo::pile::PileReader,
-    /// `(team, collection handle)`, absent for a pre-collection pile.
-    pub collection: Option<(
+    /// `(team, collection handle)`, taken from the pile's own signed commits.
+    pub collection: (
         ed25519_dalek::VerifyingKey,
         triblespace::core::collection::CollectionHandle,
-    )>,
-    /// Which reader answered: `"collection"`, or the branch name.
-    pub via: &'static str,
+    ),
 }
 
-/// Read a model pile's complete facts, PREFERRING its signed collection.
+/// Read a model pile's complete facts from its signed collection.
 ///
-/// The two readers a model pile has do not agree, and the collection is the
-/// one that is right. `qwen3tts.pile` carries two pins both named `main`;
-/// `lookup_branch` picks one, and that one states 1292 of the model's 1465
-/// weight entities. The collection states all 1465 — the pins are fragments of
-/// a history, the collection is the model. Anything deciding what a pile
-/// contains (a converter, a verifier) has to ask the collection or it is
-/// deciding about a fraction.
-///
-/// The branch fallback is for the pre-collection piles only (f5, smolvla,
-/// siglip). It is never consulted when a collection is present.
+/// There is deliberately no branch fallback. Pre-collection piles are inputs
+/// to the standalone model migration tool, not an alternate runtime truth.
 pub fn read_model_pile(path: &Path) -> anyhow::Result<ModelPileSource> {
     let mut pile = Pile::open(path).map_err(|e| anyhow::anyhow!("open {path:?}: {e:?}"))?;
     let team = match crate::model_collection::sole_model_graph_team(&mut pile) {
-        Ok(team) => Some(team),
-        Err(crate::model_collection::SoleModelGraphTeamError::None) => None,
-        Err(e) => {
+        Ok(team) => team,
+        Err(error) => {
             let _ = pile.close();
-            anyhow::bail!("{path:?}: model-graph team: {e}");
+            anyhow::bail!("{path:?}: no unambiguous native model collection: {error}");
         }
-    };
-    let Some(team) = team else {
-        let _ = pile.close();
-        let (branch, facts, reader) = checkout_any_branch(path)?;
-        return Ok(ModelPileSource {
-            facts,
-            reader,
-            collection: None,
-            via: branch,
-        });
     };
 
     let snapshot = crate::model_collection::snapshot_model_collection_local_latest(&mut pile, team)
@@ -1763,63 +1601,8 @@ pub fn read_model_pile(path: &Path) -> anyhow::Result<ModelPileSource> {
     Ok(ModelPileSource {
         facts,
         reader,
-        collection: Some((team, handle)),
-        via: "collection",
+        collection: (team, handle),
     })
-}
-
-/// Open a pile and return `(branch name, facts, blob reader)` from whichever
-/// branch holds the model — `mary` if present, else `main`.
-///
-/// Detected, not assumed. Both layouts are in the wild, and a loader that
-/// guesses wrong reports "no model" for a pile that plainly has one.
-/// NEVER amputates: a corrupt tail fails loud.
-pub fn checkout_any_branch(
-    pile_path: &Path,
-) -> anyhow::Result<(
-    &'static str,
-    TribleSet,
-    triblespace::core::repo::pile::PileReader,
-)> {
-    for branch in ["mary", "main"] {
-        let mut pile =
-            Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open {pile_path:?}: {e:?}"))?;
-        pile.refresh().map_err(|e| {
-            anyhow::anyhow!("{pile_path:?} failed to load ({e:?}); refusing to auto-truncate")
-        })?;
-        let mut repo = Repository::new(
-            pile,
-            SigningKey::generate(&mut rand::rngs::OsRng),
-            TribleSet::new(),
-        )
-        .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
-        let found = repo
-            .lookup_branch(branch)
-            .map_err(|e| anyhow::anyhow!("lookup {branch}: {e:?}"))?;
-        let Some(branch_id) = found else {
-            repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
-            continue;
-        };
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull {branch}: {e:?}"))?;
-        let Some(head) = ws.head() else {
-            repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
-            continue;
-        };
-        let tribles: TribleSet = pre_epoch_aliased(
-            ws.checkout(ancestors(head))
-                .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
-                .facts(),
-        );
-        let reader = repo
-            .storage_mut()
-            .reader()
-            .map_err(|e| anyhow::anyhow!("pile reader: {e:?}"))?;
-        repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
-        return Ok((branch, tribles, reader));
-    }
-    anyhow::bail!("no 'mary' or 'main' branch with commits in {pile_path:?}")
 }
 
 /// Index a pile's TYPED tensor leaves by name, without materializing any of
@@ -1836,8 +1619,8 @@ pub fn checkout_any_branch(
 pub fn load_typed_keymap_from_pile(
     pile_path: &Path,
 ) -> anyhow::Result<std::collections::HashMap<String, crate::leaf::Leaf>> {
-    let (_, tribles, reader) = checkout_any_branch(pile_path)?;
-    crate::leaf::index_by_name(&tribles, &reader)
+    let source = read_model_pile(pile_path)?;
+    crate::leaf::index_by_name(&source.facts, &source.reader)
 }
 
 /// Reconstruct a SentencePiece UNIGRAM tokenizer from a pile's tokenizer graph.
@@ -1852,50 +1635,18 @@ pub fn load_typed_keymap_from_pile(
 pub fn load_spm_tokenizer_from_pile(
     pile_path: &Path,
 ) -> anyhow::Result<crate::models::personaplex::spm::SpmTokenizer> {
-    let mut pile =
-        Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open pile {pile_path:?}: {e:?}"))?;
-    pile.refresh()
-        .map_err(|e| anyhow::anyhow!("pile {pile_path:?} failed to load ({e:?})"))?;
-    let mut repo = Repository::new(
-        pile,
-        SigningKey::generate(&mut rand::rngs::OsRng),
-        TribleSet::new(),
-    )
-    .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
-    let branch_id = repo
-        .lookup_branch("main")
-        .map_err(|e| anyhow::anyhow!("lookup main: {e:?}"))?
-        .ok_or_else(|| anyhow::anyhow!("no 'main' branch in pile {pile_path:?}"))?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull main: {e:?}"))?;
-    let head = ws
-        .head()
-        .ok_or_else(|| anyhow::anyhow!("'main' has no commits"))?;
-    let checkout = ws
-        .checkout(ancestors(head))
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let tribles: TribleSet = pre_epoch_aliased(checkout.facts());
-    let reader = repo
-        .storage_mut()
-        .reader()
-        .map_err(|e| anyhow::anyhow!("pile reader: {e:?}"))?;
-    // Close BEFORE anything fallible: the reader keeps its own mmap alive, so
-    // it outlives the repository, and every bail below would otherwise drop the
-    // pile unclosed ("data may not be persisted").
-    repo.close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+    let source = read_model_pile(pile_path)?;
     let tok_id = crate::selection::select_tokenizer_root(
-        &tribles,
-        &reader,
+        &source.facts,
+        &source.reader,
         crate::selection::TokenizerSelector::Only,
     )
     .with_context(|| format!("select SentencePiece tokenizer in pile {pile_path:?}"))?;
-    let pieces = crate::tokenizer::load_spm_pieces(&tribles, &reader, tok_id);
+    let pieces = crate::tokenizer::load_spm_pieces(&source.facts, &source.reader, tok_id);
     if pieces.is_empty() {
         anyhow::bail!("tokenizer graph in {pile_path:?} has no scored pieces — not UNIGRAM?");
     }
-    let adp = crate::tokenizer::has_add_prefix_space(&tribles, tok_id);
+    let adp = crate::tokenizer::has_add_prefix_space(&source.facts, tok_id);
     Ok(crate::models::personaplex::spm::SpmTokenizer::from_pieces(
         &pieces, adp,
     ))
@@ -1930,38 +1681,18 @@ pub fn ingest_spm_tokenizer(
         Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open pile {pile_path:?}: {e:?}"))?;
     pile.refresh()
         .map_err(|e| anyhow::anyhow!("pile {pile_path:?} failed to load ({e:?})"))?;
-    let mut repo = Repository::new(
-        pile,
-        SigningKey::generate(&mut rand::rngs::OsRng),
-        TribleSet::new(),
-    )
-    .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
-    let branch_id = match repo
-        .lookup_branch("main")
-        .map_err(|e| anyhow::anyhow!("lookup main: {e:?}"))?
-    {
-        Some(id) => id,
-        None => *repo
-            .create_branch("main", None)
-            .map_err(|e| anyhow::anyhow!("create main: {e:?}"))?,
-    };
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull main: {e:?}"))?;
+    let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+    let team = crate::model_collection::model_graph_team_or_own(&mut pile, &signing_key)
+        .map_err(|e| anyhow::anyhow!("select model collection: {e}"))?;
+    let snapshot =
+        crate::model_collection::snapshot_model_collection_local_latest(&mut pile, team)
+            .map_err(|e| anyhow::anyhow!("snapshot model collection: {e}"))?;
 
     // A pile is append-only, so a duplicate tokenizer cannot be taken back.
     // Close before bailing — an early return here would drop the pile unclosed.
-    let existing = match ws.head() {
-        Some(head) => {
-            let checkout = ws
-                .checkout(ancestors(head))
-                .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-            crate::tokenizer::find_tokenizer(checkout.facts())
-        }
-        None => None,
-    };
+    let existing = crate::tokenizer::find_tokenizer(snapshot.facts());
     if let Some(existing) = existing {
-        repo.close()
+        pile.close()
             .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
         anyhow::bail!(
             "pile {pile_path:?} already contains tokenizer {existing:?}; \
@@ -1974,15 +1705,13 @@ pub fn ingest_spm_tokenizer(
         add_dummy_prefix,
         byte_fallback,
         source_name,
-        repo.storage_mut(),
+        &mut pile,
     )
     .map_err(|e| anyhow::anyhow!("build tokenizer graph: {e}"))?;
-    let facts = frag.into_facts();
-    let n = facts.len();
-    ws.commit(facts, "ingest SentencePiece UNIGRAM tokenizer graph");
-    repo.push(&mut ws)
-        .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-    repo.close()
+    let n = frag.facts().len();
+    crate::model_collection::publish_model_fragment(&mut pile, team, &signing_key, frag)
+        .map_err(|e| anyhow::anyhow!("publish tokenizer graph: {e}"))?;
+    pile.close()
         .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
     Ok(n)
 }
@@ -1992,64 +1721,13 @@ pub fn ingest_spm_tokenizer(
 /// [`load_spm_tokenizer_from_pile`].
 #[cfg(feature = "tokenizer")]
 pub fn load_tokenizer_from_pile(pile_path: &Path) -> anyhow::Result<tokenizers::Tokenizer> {
-    load_tokenizer_from_pile_on(pile_path, "main")
-}
-
-/// [`load_tokenizer_from_pile`] on a NAMED branch.
-///
-/// A model pile does not have to keep its facts on `main` — Inkling's weights,
-/// and now its tokenizer, live on `inkling` — and a loader that can only read
-/// one branch name forces a second pile for the tokenizer, which is the
-/// side-file problem this module exists to remove.
-#[cfg(feature = "tokenizer")]
-pub fn load_tokenizer_from_pile_on(
-    pile_path: &Path,
-    branch: &str,
-) -> anyhow::Result<tokenizers::Tokenizer> {
-    let mut pile =
-        Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open pile {pile_path:?}: {e:?}"))?;
-    // Read path: non-mutating load, NEVER amputate (see load_keymap_from_pile).
-    pile.refresh().map_err(|e| {
-        anyhow::anyhow!(
-            "pile {pile_path:?} failed to load ({e:?}); refusing to auto-truncate on a \
-             read path — if the tail is a genuinely torn write, amputate explicitly \
-             with `trible pile amputate`"
-        )
-    })?;
-    let mut repo = Repository::new(
-        pile,
-        SigningKey::generate(&mut rand::rngs::OsRng),
-        TribleSet::new(),
-    )
-    .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
-    let branch_id = repo
-        .lookup_branch(branch)
-        .map_err(|e| anyhow::anyhow!("lookup {branch}: {e:?}"))?
-        .ok_or_else(|| anyhow::anyhow!("no {branch:?} branch in pile {pile_path:?}"))?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull {branch}: {e:?}"))?;
-    let head = ws
-        .head()
-        .ok_or_else(|| anyhow::anyhow!("{branch:?} has no commits"))?;
-    let checkout = ws
-        .checkout(ancestors(head))
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let tribles: TribleSet = pre_epoch_aliased(checkout.facts());
-    let reader = repo
-        .storage_mut()
-        .reader()
-        .map_err(|e| anyhow::anyhow!("pile reader: {e:?}"))?;
-
-    let tok = crate::selection::load_tokenizer_from_graph(
-        &tribles,
-        &reader,
+    let source = read_model_pile(pile_path)?;
+    crate::selection::load_tokenizer_from_graph(
+        &source.facts,
+        &source.reader,
         crate::selection::TokenizerSelector::Only,
     )
-    .with_context(|| format!("select tokenizer on {branch:?} in pile {pile_path:?}"))?;
-    repo.close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
-    Ok(tok)
+    .with_context(|| format!("select tokenizer in pile {pile_path:?}"))
 }
 
 /// What one tokenizer ingest cost, so the rate can be reported rather than
@@ -2085,7 +1763,7 @@ impl TokenizerIngest {
 }
 
 /// Ingest a HuggingFace `tokenizer.json` into a pile as a tokenizer GRAPH — the
-/// write side of [`load_tokenizer_from_pile_on`], and the BPE/WordPiece
+/// write side of [`load_tokenizer_from_pile`], and the BPE/WordPiece
 /// counterpart of [`ingest_spm_tokenizer`].
 ///
 /// `save_tokenizer_json` has existed and been tested since 2026-07-16 and has
@@ -2095,7 +1773,7 @@ impl TokenizerIngest {
 /// claim about ingest made against the in-memory path was about a different
 /// operation.
 ///
-/// Refuses to write a second tokenizer onto a branch that already has one: a
+/// Refuses to write a second tokenizer into a model collection that already has one: a
 /// pile is append-only, `find_tokenizer` returns a single node, and two would
 /// make which-one-you-get depend on iteration order.
 #[cfg(feature = "tokenizer")]
@@ -2103,7 +1781,6 @@ pub fn ingest_hf_tokenizer(
     pile_path: &Path,
     tokenizer_json: &Path,
     source_name: &str,
-    branch: &str,
 ) -> anyhow::Result<TokenizerIngest> {
     let json = std::fs::read(tokenizer_json)
         .map_err(|e| anyhow::anyhow!("read {tokenizer_json:?}: {e}"))?;
@@ -2113,35 +1790,20 @@ pub fn ingest_hf_tokenizer(
         Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open pile {pile_path:?}: {e:?}"))?;
     pile.refresh()
         .map_err(|e| anyhow::anyhow!("pile {pile_path:?} failed to load ({e:?})"))?;
-    let mut repo = Repository::new(
-        pile,
-        SigningKey::generate(&mut rand::rngs::OsRng),
-        TribleSet::new(),
-    )
-    .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
-    let branch_id = repo
-        .ensure_branch(branch, None)
-        .map_err(|e| anyhow::anyhow!("ensure {branch}: {e:?}"))?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull {branch}: {e:?}"))?;
-
-    let existing = match ws.head() {
-        Some(head) => {
-            let checkout = ws
-                .checkout(ancestors(head))
-                .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-            crate::tokenizer::find_tokenizer(checkout.facts())
-        }
-        None => None,
-    };
+    let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+    let team = crate::model_collection::model_graph_team_or_own(&mut pile, &signing_key)
+        .map_err(|e| anyhow::anyhow!("select model collection: {e}"))?;
+    let snapshot =
+        crate::model_collection::snapshot_model_collection_local_latest(&mut pile, team)
+            .map_err(|e| anyhow::anyhow!("snapshot model collection: {e}"))?;
+    let existing = crate::tokenizer::find_tokenizer(snapshot.facts());
     if let Some(existing) = existing {
         // Close before bailing: an early return would drop the pile unclosed.
-        repo.close()
+        pile.close()
             .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
         anyhow::bail!(
-            "pile {pile_path:?} branch {branch:?} already contains tokenizer \
-             {existing:?}; refusing to add a second (a pile is append-only — \
+            "pile {pile_path:?} already contains tokenizer {existing:?}; \
+             refusing to add a second (a pile is append-only — \
              this cannot be undone)"
         );
     }
@@ -2149,18 +1811,17 @@ pub fn ingest_hf_tokenizer(
     let t0 = std::time::Instant::now();
     // Straight into the pile's own store, not the workspace's staging one: the
     // point of the measurement is the on-disk put.
-    let mut counting = crate::tokenizer::CountingBlobs::new(repo.storage_mut());
+    let mut counting = crate::tokenizer::CountingBlobs::new(&mut pile);
     let frag = crate::tokenizer::save_tokenizer_json(&json, source_name, &mut counting)
         .map_err(|e| anyhow::anyhow!("build tokenizer graph: {e}"))?;
     let (puts, put_nanos) = (counting.puts, counting.nanos);
+    drop(counting);
     let total_nanos = t0.elapsed().as_nanos() as u64;
 
-    let facts = frag.into_facts();
-    let n = facts.len();
-    ws.commit(facts, "ingest HuggingFace BPE tokenizer graph");
-    repo.push(&mut ws)
-        .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-    repo.close()
+    let n = frag.facts().len();
+    crate::model_collection::publish_model_fragment(&mut pile, team, &signing_key, frag)
+        .map_err(|e| anyhow::anyhow!("publish tokenizer graph: {e}"))?;
+    pile.close()
         .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
 
     let after = std::fs::metadata(pile_path)
@@ -2175,50 +1836,12 @@ pub fn ingest_hf_tokenizer(
     })
 }
 
-/// A branch's facts and a reader for the blobs they name.
-///
-/// The prologue every pile reader in this file repeats, offered once. Note the
-/// order: the repository is CLOSED before the pair is returned, because the
-/// reader holds its own mapping and outlives it — and a bail before the close
-/// leaves the pile "unclosed", which is a warning nobody reads and a habit that
-/// eventually loses a write.
+/// The locally admitted native model facts and a reader for their attachments.
 pub fn pile_facts(
     pile_path: &Path,
-    branch: &str,
 ) -> anyhow::Result<(TribleSet, triblespace::core::repo::pile::PileReader)> {
-    let mut pile =
-        Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open pile {pile_path:?}: {e:?}"))?;
-    // Read path: never amputate. A torn tail is an operator decision.
-    pile.refresh()
-        .map_err(|e| anyhow::anyhow!("pile {pile_path:?} failed to load ({e:?})"))?;
-    let mut repo = Repository::new(
-        pile,
-        SigningKey::generate(&mut rand::rngs::OsRng),
-        TribleSet::new(),
-    )
-    .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
-    let branch_id = repo
-        .lookup_branch(branch)
-        .map_err(|e| anyhow::anyhow!("lookup {branch}: {e:?}"))?
-        .ok_or_else(|| anyhow::anyhow!("no {branch:?} branch in pile {pile_path:?}"))?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull {branch}: {e:?}"))?;
-    let head = ws
-        .head()
-        .ok_or_else(|| anyhow::anyhow!("{branch:?} has no commits"))?;
-    let facts: TribleSet = ws
-        .checkout(ancestors(head))
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
-        .facts()
-        .clone();
-    let reader = repo
-        .storage_mut()
-        .reader()
-        .map_err(|e| anyhow::anyhow!("pile reader: {e:?}"))?;
-    repo.close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
-    Ok((facts, reader))
+    let source = read_model_pile(pile_path)?;
+    Ok((source.facts, source.reader))
 }
 
 /// Ingest a checkpoint's JSON sidecars into a pile as facts.
@@ -2238,7 +1861,6 @@ pub fn ingest_json_documents(
     dir: &Path,
     json_docs: &[&str],
     text_docs: &[&str],
-    branch: &str,
 ) -> anyhow::Result<usize> {
     let mut pending: Vec<(String, serde_json::Value)> = Vec::new();
     for name in json_docs {
@@ -2267,49 +1889,35 @@ pub fn ingest_json_documents(
         Pile::open(pile_path).map_err(|e| anyhow::anyhow!("open pile {pile_path:?}: {e:?}"))?;
     pile.refresh()
         .map_err(|e| anyhow::anyhow!("pile {pile_path:?} failed to load ({e:?})"))?;
-    let mut repo = Repository::new(
-        pile,
-        SigningKey::generate(&mut rand::rngs::OsRng),
-        TribleSet::new(),
-    )
-    .map_err(|e| anyhow::anyhow!("repo new: {e:?}"))?;
-    let branch_id = repo
-        .ensure_branch(branch, None)
-        .map_err(|e| anyhow::anyhow!("ensure {branch}: {e:?}"))?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull {branch}: {e:?}"))?;
+    let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+    let team = crate::model_collection::model_graph_team_or_own(&mut pile, &signing_key)
+        .map_err(|e| anyhow::anyhow!("select model collection: {e}"))?;
+    let snapshot =
+        crate::model_collection::snapshot_model_collection_local_latest(&mut pile, team)
+            .map_err(|e| anyhow::anyhow!("snapshot model collection: {e}"))?;
 
-    // What the branch already says, compared by VALUE rather than by node id.
+    // What the collection already says, compared by VALUE rather than by node id.
     // Re-ingesting the identical file is silent (the ids derive from the
     // content, so the facts merge to nothing new); a file whose CONTENT changed
     // is refused, because a second document under the same name makes which one
     // a reader gets depend on iteration order.
     let mut clash: Option<String> = None;
-    if let Some(head) = ws.head() {
-        let checkout = ws
-            .checkout(ancestors(head))
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let facts = checkout.facts().clone();
-        let reader = repo
-            .storage_mut()
-            .reader()
-            .map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
-        for (name, v) in &pending {
-            if let Ok(have) = crate::jsonfacts::load_document(&facts, &reader, name) {
-                if &have != v {
-                    clash = Some(name.clone());
-                    break;
-                }
+    for (name, v) in &pending {
+        if let Ok(have) =
+            crate::jsonfacts::load_document(snapshot.facts(), snapshot.reader(), name)
+        {
+            if &have != v {
+                clash = Some(name.clone());
+                break;
             }
         }
     }
     if let Some(name) = clash {
-        repo.close()
+        pile.close()
             .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
         anyhow::bail!(
-            "pile {pile_path:?} branch {branch:?} already holds a DIFFERENT \
-             document named {name:?}; a pile is append-only, so writing a \
+            "pile {pile_path:?} already holds a DIFFERENT document named \
+             {name:?}; a pile is append-only, so writing a \
              second would make which one a reader gets depend on iteration \
              order"
         );
@@ -2317,20 +1925,85 @@ pub fn ingest_json_documents(
 
     let mut change = TribleSet::new();
     for (name, v) in &pending {
-        if let Err(e) = crate::jsonfacts::save_document(name, v, repo.storage_mut(), &mut change) {
-            repo.close()
+        if let Err(e) = crate::jsonfacts::save_document(name, v, &mut pile, &mut change) {
+            pile.close()
                 .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
             anyhow::bail!("{name}: {e}");
         }
     }
 
     let n = change.len();
-    ws.commit(change, "ingest checkpoint JSON sidecars as facts");
-    repo.push(&mut ws)
-        .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-    repo.close()
+    let fragment = Fragment::new(std::iter::empty(), change);
+    crate::model_collection::publish_model_fragment(&mut pile, team, &signing_key, fragment)
+        .map_err(|e| anyhow::anyhow!("publish checkpoint sidecars: {e}"))?;
+    pile.close()
         .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
     Ok(n)
+}
+
+#[cfg(all(test, feature = "tokenizer"))]
+mod tokenizer_collection_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    const WORDPIECE: &str = r###"{
+      "version": "1.0",
+      "added_tokens": [],
+      "normalizer": {"type": "BertNormalizer", "clean_text": true, "handle_chinese_chars": true, "strip_accents": null, "lowercase": true},
+      "pre_tokenizer": {"type": "BertPreTokenizer"},
+      "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true},
+      "model": {"type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##", "max_input_chars_per_word": 100,
+        "vocab": {"[UNK]": 0, "hello": 1, "world": 2}}
+    }"###;
+
+    struct Fixture(std::path::PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "mary-tokenizer-collection-{}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn tokenizer_writer_and_loader_share_the_native_model_collection() {
+        let fixture = Fixture::new();
+        let tokenizer_path = fixture.0.join("tokenizer.json");
+        let pile_path = fixture.0.join("model.pile");
+        std::fs::write(&tokenizer_path, WORDPIECE).unwrap();
+        std::fs::File::create(&pile_path).unwrap();
+
+        let ingest = ingest_hf_tokenizer(&pile_path, &tokenizer_path, "fixture").unwrap();
+        assert!(ingest.facts > 0);
+
+        let tokenizer = load_tokenizer_from_pile(&pile_path).unwrap();
+        let encoded = tokenizer.encode("hello world", false).unwrap();
+        assert_eq!(encoded.get_ids(), &[1, 2]);
+
+        let source = read_model_pile(&pile_path).unwrap();
+        assert_eq!(
+            crate::tokenizer::find_tokenizer(&source.facts),
+            crate::selection::select_tokenizer_root(
+                &source.facts,
+                &source.reader,
+                crate::selection::TokenizerSelector::Only,
+            )
+            .ok()
+        );
+    }
 }
 
 #[cfg(feature = "gemma")]

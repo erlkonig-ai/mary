@@ -93,34 +93,20 @@ fn main() -> Result<()> {
 
     let source = mary::persist::read_model_pile(src)?;
     let converted = mary::persist::read_model_pile(dst)?;
-    println!(
-        "read via    source '{}', converted '{}'",
-        source.via, converted.via
-    );
 
     // The collection is the thing a converted model pile is FOR. Its identity
     // must be the source's, byte for byte: model piles resolve by content
     // address, and a moved descriptor is not a rename, it is every existing
     // reference silently failing to find a model.
-    match (source.collection, converted.collection) {
-        (Some((_, src_handle)), Some((_, dst_handle))) => {
-            anyhow::ensure!(
-                src_handle == dst_handle,
-                "collection identity moved: source {}, converted {}",
-                handle_hex(&src_handle),
-                handle_hex(&dst_handle)
-            );
-            println!("collection  identity unchanged: {}", handle_hex(&src_handle));
-        }
-        (Some(_), None) => anyhow::bail!(
-            "the source publishes a model collection and the converted pile does not — \
-             `mary::speak` cannot open it"
-        ),
-        (None, Some(_)) => anyhow::bail!(
-            "the converted pile publishes a collection the source never had"
-        ),
-        (None, None) => println!("collection  neither pile has one (pre-collection source)"),
-    }
+    let (_, src_handle) = source.collection;
+    let (_, dst_handle) = converted.collection;
+    anyhow::ensure!(
+        src_handle == dst_handle,
+        "collection identity moved: source {}, converted {}",
+        handle_hex(&src_handle),
+        handle_hex(&dst_handle)
+    );
+    println!("collection  identity unchanged: {}", handle_hex(&src_handle));
 
     let (src_tribles, src_reader) = (canonical_facts(&source.facts)?, source.reader);
     let (dst_tribles, dst_reader) = (canonical_facts(&converted.facts)?, converted.reader);
