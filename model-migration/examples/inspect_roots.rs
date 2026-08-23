@@ -19,8 +19,15 @@ fn main() -> Result<()> {
         .context("usage: inspect_roots <pile>")?;
     let path = std::path::Path::new(&path);
     let mut pile = Pile::open(path).map_err(|e| anyhow!("open {path:?}: {e:?}"))?;
+    let result = inspect(&mut pile, path);
+    let close = pile.close().map_err(|error| anyhow!("close pile: {error}"));
+    result?;
+    close
+}
+
+fn inspect(pile: &mut Pile, path: &std::path::Path) -> Result<()> {
     let frozen =
-        mary_model_migration::freeze_legacy_model_main(&mut pile).context("freeze legacy main")?;
+        mary_model_migration::freeze_legacy_model_main(pile).context("freeze legacy main")?;
     let branch = frozen.branch;
     let head = frozen.head;
     let facts = frozen.facts;
@@ -159,8 +166,5 @@ fn main() -> Result<()> {
         .collect();
         println!("  root {t}  name {names:?}");
     }
-    drop(reader);
-    pile.close()
-        .map_err(|error| anyhow!("close pile: {error}"))?;
     Ok(())
 }

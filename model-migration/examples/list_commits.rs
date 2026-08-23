@@ -20,13 +20,13 @@ fn parents_and_content(
     let meta: TribleSet = reader
         .get(commit)
         .map_err(|e| anyhow!("read commit: {e:?}"))?;
-    let contents: Vec<Commit> = find!((c: Inline<_>), pattern!(&meta, [{ content: ?c }]))
-        .map(|(c,)| c)
-        .collect();
+    let mut contents = find!((c: Inline<_>), pattern!(&meta, [{ content: ?c }]));
+    let content_handle = contents.next().map(|(handle,)| handle);
+    anyhow::ensure!(contents.next().is_none(), "commit has ambiguous content");
     let parents: Vec<Commit> = find!((p: Inline<_>), pattern!(&meta, [{ parent: ?p }]))
         .map(|(p,)| p)
         .collect();
-    Ok((parents, contents.first().copied()))
+    Ok((parents, content_handle))
 }
 
 fn closure(reader: &impl BlobStoreGet, root: Commit) -> Result<(usize, usize)> {
@@ -56,8 +56,15 @@ fn main() -> Result<()> {
         .context("usage: list_commits <pile>")?;
     let path = std::path::Path::new(&path);
     let mut pile = Pile::open(path).map_err(|e| anyhow!("open: {e:?}"))?;
+    let result = list(&mut pile, path);
+    let close = pile.close().map_err(|error| anyhow!("close pile: {error}"));
+    result?;
+    close
+}
+
+fn list(pile: &mut Pile, path: &std::path::Path) -> Result<()> {
     let frozen =
-        mary_model_migration::freeze_legacy_model_main(&mut pile).context("freeze legacy main")?;
+        mary_model_migration::freeze_legacy_model_main(pile).context("freeze legacy main")?;
     let branch = frozen.branch;
     let head = frozen.head;
     let reader = frozen.reader;
@@ -92,8 +99,5 @@ fn main() -> Result<()> {
             parent_map.get(c).map(|p| p.len()).unwrap_or(0)
         );
     }
-    drop(reader);
-    pile.close()
-        .map_err(|error| anyhow!("close pile: {error}"))?;
     Ok(())
 }
