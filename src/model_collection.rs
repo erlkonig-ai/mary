@@ -29,7 +29,7 @@ use triblespace::core::attribute::Attribute;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace::core::collection::reach;
-use triblespace::core::collection::records::{collection_name, collection_team};
+use triblespace::core::collection::records::{collection_name, collection_namespace};
 use triblespace::core::collection::simplearchive_union::{
     self, PreparationError, PreparedCollectionCommit, PublicationError,
 };
@@ -37,9 +37,9 @@ use triblespace::core::collection::{
     CollectionCommit, CollectionMaterializationError, CollectionRecord, CollectionStore,
     SimpleArchiveCollection,
 };
+use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::inline::encodings::ed25519::ED25519PublicKey;
 use triblespace::core::inline::encodings::shortstring::ShortString;
-use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{
     CollectionInsertError, FlushError, GetBlobError, InsertError as PileInsertError, PileReader,
@@ -384,11 +384,18 @@ impl Error for LoadModelCollectionError {
 // descriptor that gained a declared reach would be a different collection and
 // every already-persisted model pile would stop resolving.
 fn model_graph_collection(team: VerifyingKey) -> SimpleArchiveCollection {
-    SimpleArchiveCollection::new(mary_model_graph_name(), team, reach::private())
+    // `authority: None` is not a placeholder. It reconstructs the EXACT
+    // descriptor handle these piles were written with: a declared authority is
+    // an identity-bearing descriptor fact, so `Some(team)` would name a
+    // different, capability-anchored collection and every already-persisted
+    // model pile would stop resolving -- the same hazard the comment above
+    // states for reach. These piles declare no portable external capability
+    // root, so absence is also the honest reading.
+    SimpleArchiveCollection::new(mary_model_graph_name(), team, None, reach::private())
 }
 
 fn model_bundle_collection(team: VerifyingKey) -> SimpleArchiveCollection {
-    SimpleArchiveCollection::new(mary_model_bundle_name(), team, reach::private())
+    SimpleArchiveCollection::new(mary_model_bundle_name(), team, None, reach::private())
 }
 
 /// Content identity of one team's PersonaPlex bundle source collection.
@@ -629,7 +636,7 @@ fn observe_collection(
         for fact in facts.iter() {
             if *fact.a() == collection_name.id() {
                 name = fact.v::<ShortString>().try_from_inline::<String>().ok();
-            } else if *fact.a() == collection_team.id() {
+            } else if *fact.a() == collection_namespace.id() {
                 team = VerifyingKey::from_bytes(&fact.v::<ED25519PublicKey>().raw).ok();
             }
         }
@@ -1050,7 +1057,7 @@ mod historical {
     use crate::f16enc::F16Array;
     use crate::format::{F32Array, U32Array, U64Array};
     use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
-    use triblespace::prelude::inlineencodings::{Boolean, GenId, Handle, ShortString, F64, U256BE};
+    use triblespace::prelude::inlineencodings::{Boolean, F64, GenId, Handle, ShortString, U256BE};
     use triblespace::prelude::*;
 
     attributes! {
@@ -1526,7 +1533,7 @@ mod tests {
 
         assert_eq!(mary_model_graph_name().as_str(), "mary-model-graph");
         assert_eq!(collection.name(), &mary_model_graph_name());
-        assert_eq!(collection.team(), team);
+        assert_eq!(collection.namespace(), team);
 
         let handle = IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()).get_handle();
         assert_eq!(
@@ -1582,9 +1589,11 @@ mod tests {
                 .unwrap();
         assert_ne!(first.id(), other_author.id());
         assert_eq!(first.data(), other_author.data());
-        assert!(local_model_ticket(&mut pile, test_team())
-            .unwrap()
-            .is_empty());
+        assert!(
+            local_model_ticket(&mut pile, test_team())
+                .unwrap()
+                .is_empty()
+        );
 
         let snapshot = snapshot_model_bundle_collection_exact(
             &mut pile,
@@ -1737,9 +1746,11 @@ mod tests {
         let error = prepare_model_bundle_fragment(test_team(), false_root, fragment).unwrap_err();
         assert!(matches!(error, PrepareModelBundleError::RootAbsent(root) if root == false_root));
         assert_eq!(std::fs::metadata(file.as_path()).unwrap().len(), len_before);
-        assert!(local_model_bundle_ticket(&mut pile, test_team())
-            .unwrap()
-            .is_empty());
+        assert!(
+            local_model_bundle_ticket(&mut pile, test_team())
+                .unwrap()
+                .is_empty()
+        );
         pile.close().unwrap();
     }
 
@@ -1759,9 +1770,11 @@ mod tests {
         let withheld = *staged.commit();
         drop(staged);
 
-        assert!(local_model_bundle_ticket(&mut pile, test_team())
-            .unwrap()
-            .is_empty());
+        assert!(
+            local_model_bundle_ticket(&mut pile, test_team())
+                .unwrap()
+                .is_empty()
+        );
         let reader = pile.reader().unwrap();
         reader
             .get::<Blob<SimpleArchive>, _>(inlineencodings::Handle::<SimpleArchive>::from_hash(
@@ -1949,7 +1962,7 @@ mod tests {
         // descriptor's identity, so a public foreign one would differ from the
         // model graph by two things and stop isolating the one under test.
         let foreign_descriptor =
-            simplearchive_union::descriptor(&foreign_name, test_team(), reach::private());
+            simplearchive_union::descriptor(&foreign_name, test_team(), None, reach::private());
         let (foreign_fragment, _, _) = fragment_fixture("foreign");
         let foreign = simplearchive_union::publish_fragment_commit(
             &mut pile,
@@ -1977,10 +1990,12 @@ mod tests {
         let snapshot = load_model_collection_local_latest(file.as_path(), test_team()).unwrap();
         assert_eq!(snapshot.facts(), &expected);
         assert_eq!(snapshot.commits(), expected_commits);
-        assert!(snapshot
-            .commits()
-            .iter()
-            .all(|commit| commit.collection() != foreign.collection()));
+        assert!(
+            snapshot
+                .commits()
+                .iter()
+                .all(|commit| commit.collection() != foreign.collection())
+        );
 
         let (team, sole_snapshot) =
             load_sole_model_collection_local_latest(file.as_path()).unwrap();
@@ -2101,9 +2116,11 @@ mod tests {
             historical.is_disjoint(&canonical),
             "canonical target is also a historical source"
         );
-        assert!(mappings
-            .iter()
-            .all(|mapping| mapping.historical != mapping.canonical));
+        assert!(
+            mappings
+                .iter()
+                .all(|mapping| mapping.historical != mapping.canonical)
+        );
 
         // Exhaustively pin the audited historical side. Shared declarations
         // occur once; piece_bytes is included because d6dcbd3a predates the
