@@ -7,18 +7,18 @@ use triblespace::core::collection::CollectionSnapshot;
 use triblespace::prelude::BlobStoreGet;
 
 use crate::leaf::Leaf;
-use crate::models::flux::mistral_encoder::config::Mistral3Config;
 use crate::models::flux::mistral_encoder::Mistral3Model;
+use crate::models::flux::mistral_encoder::config::Mistral3Config;
 use crate::models::flux::scheduler::FlowMatchEulerDiscreteScheduler;
-use crate::models::flux::text_encoder::config::Qwen3Config;
 use crate::models::flux::text_encoder::Qwen3Model;
+use crate::models::flux::text_encoder::config::Qwen3Config;
 use crate::models::flux::tokenizer::{MistralTokenizer, Qwen2Tokenizer};
-use crate::models::flux::transformer::config::Flux2TransformerConfig;
 use crate::models::flux::transformer::Flux2Transformer2DModel;
+use crate::models::flux::transformer::config::Flux2TransformerConfig;
 use crate::models::flux::utils;
-use crate::models::flux::vae::config::VaeConfig;
 use crate::models::flux::vae::AutoencoderKLFlux2;
-use crate::nn::backend::{BHalf, WgpuDevice, B};
+use crate::models::flux::vae::config::VaeConfig;
+use crate::nn::backend::{B, BHalf, WgpuDevice};
 use crate::nn::weight_loader::WeightLoader;
 use crate::selection::ModelSelector;
 
@@ -628,7 +628,9 @@ impl Flux2Pipeline {
         );
 
         if lora_path.is_some() {
-            eprintln!("Warning: LoRA is not yet supported with streaming transformer (Dev). LoRA will be ignored.");
+            eprintln!(
+                "Warning: LoRA is not yet supported with streaming transformer (Dev). LoRA will be ignored."
+            );
         }
         eprintln!("Phase 3: Loading transformer header and denoising (streaming f32)...");
         let transformer_loader = WeightLoader::Pile(weights.transformer());
@@ -734,8 +736,8 @@ fn generate_noise<B: Backend>(
 
     // Box-Muller transform for normal distribution
     for _ in 0..((n + 1) / 2) {
-        let u1: f64 = rng.gen::<f64>().max(1e-10);
-        let u2: f64 = rng.gen::<f64>();
+        let u1: f64 = rng.r#gen::<f64>().max(1e-10);
+        let u2: f64 = rng.r#gen::<f64>();
         let r = (-2.0 * u1.ln()).sqrt();
         let theta = 2.0 * std::f64::consts::PI * u2;
         data.push((r * theta.cos()) as f32);
@@ -752,7 +754,7 @@ fn generate_noise<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{attrs, F32Array, U64Array};
+    use crate::format::{F32Array, U64Array, attrs};
     use ed25519_dalek::SigningKey;
     use std::fs::OpenOptions;
     use std::path::PathBuf;
