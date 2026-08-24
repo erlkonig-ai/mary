@@ -95,3 +95,8 @@ pub mod moegroup;
 // projection was already there; this is the 66 ms of host sort that sat between
 // the readback and the expert launch at prefill.
 pub mod routetopk;
+
+// The routed-expert ROW PLAN on the device, from a top-k answer that is never
+// read back. `routetopk` moved the decision; this moves everything downstream
+// of it that the host used to need the decision's VALUE for.
+pub mod devplan;

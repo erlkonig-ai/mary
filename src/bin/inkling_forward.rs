@@ -1346,6 +1346,15 @@ struct HostT {
     /// every layer of every pass, so this is what a hoist out of the loop is
     /// worth, independently of where the routing decision lives.
     plan_up_static: f64,
+    /// Layer-passes whose row plan was built ON THE DEVICE, from a decision
+    /// that was never read back. Counted because every other counter in this
+    /// struct is the same on both arms -- `grouped` and `expert_loads` cannot
+    /// tell them apart, and a lane you cannot count is a lane you cannot claim.
+    plan_dev: usize,
+    /// Layer-passes whose row plan came off a blocking read. The complement,
+    /// and printed beside it: a run where this is not zero has a sync left in
+    /// the loop, and WHICH layer it is matters more than how many.
+    plan_host: usize,
 }
 
 /// One layer's shared experts, on the device, as the BF16 the pile stores.
@@ -2283,15 +2292,8 @@ fn grouped_experts_fp4(
     inter: usize,
     host: &mut HostT,
 ) -> Result<Option<T2>> {
-    use mary::models::inkling::burn::act_bf16;
-    use mary::models::inkling::fp4gemm::{gate_up_silu_launch, gate_up_silu_narrow_launch};
-    use mary::models::inkling::fp4quant::{quantize_nvfp4, quantize_nvfp4_bf16};
-    use mary::models::inkling::moegroup::{
-        fp4_linear_grouped_bf16_launch, fp4_linear_grouped_launch, gather_grouped,
-        gather_grouped_bf16, gather_grouped_bf16_from_bf16, scatter_weighted, scatter_weighted_bf16,
-        BlockPlanDev, RowPlan,
-    };
-    use mary::models::inkling::seam::{handle_of_any, tensor_of};
+    use mary::models::inkling::moegroup::{BlockPlanDev, RowPlan};
+    use mary::models::inkling::seam::handle_of_any;
 
     let n13 = format!("{prefix}mlp.experts.w13_weight");
     let n2 = format!("{prefix}mlp.experts.w2_weight");
@@ -2369,6 +2371,9 @@ fn grouped_experts_fp4(
             plan.blk_slot.len()
         );
     }
+    if plan_check() {
+        plan_check_note(prefix, n, by_expert, &plan);
+    }
     let m_total = plan.m_total();
     let (hn_h, hn_dt) = handle_of_any(hn.clone());
     // Split in two on purpose: see `HostT::plan_up_routed`. The `_static` half
@@ -2394,6 +2399,60 @@ fn grouped_experts_fp4(
     let h_sc13 = client.create_from_slice(bytes_of(&sc13));
     let h_sc2 = client.create_from_slice(bytes_of(&sc2));
     host.plan_up_routed += t_ur.elapsed().as_secs_f64();
+    Ok(Some(grouped_experts_core(
+        client, dev, prefix, &wmap, wmap_bytes, &blk, &hn_h, hn_dt, &h_rowtok, &h_rowwgt,
+        &h_tokrows, &h_tokcnt, &h_off13, &h_off2, &h_sc13, &h_sc2, slots, m_total, plan.kmax,
+        n, h, inter, t_g, host,
+    )))
+}
+
+/// The grouped lane once its plan exists, whoever built it.
+///
+/// Everything from the gather to the scatter-add: two NVFP4 quantisations, two
+/// grouped GEMMs, the fused SiLU between them, and the weighted accumulate.
+/// None of it knows where the plan came from, which is the point — the host
+/// lane and the device one differ only in who filled these eleven buffers, so
+/// they cannot drift in the arithmetic.
+///
+/// `t_g` is the caller's gather timer, started before it began building the
+/// plan: the plan uploads are charged inside the gather bucket and the report
+/// says so, and moving the boundary would silently move the number.
+#[allow(clippy::too_many_arguments)]
+fn grouped_experts_core(
+    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+    dev: &burn::backend::cuda::CudaDevice,
+    prefix: &str,
+    wmap: &cubecl::server::Handle,
+    wmap_bytes: usize,
+    blk: &mary::models::inkling::moegroup::BlockPlanDev,
+    hn_h: &cubecl::server::Handle,
+    hn_dt: burn::tensor::DType,
+    h_rowtok: &cubecl::server::Handle,
+    h_rowwgt: &cubecl::server::Handle,
+    h_tokrows: &cubecl::server::Handle,
+    h_tokcnt: &cubecl::server::Handle,
+    h_off13: &cubecl::server::Handle,
+    h_off2: &cubecl::server::Handle,
+    h_sc13: &cubecl::server::Handle,
+    h_sc2: &cubecl::server::Handle,
+    slots: usize,
+    m_total: usize,
+    kmax: usize,
+    n: usize,
+    h: usize,
+    inter: usize,
+    t_g: Instant,
+    host: &mut HostT,
+) -> T2 {
+    use mary::models::inkling::burn::act_bf16;
+    use mary::models::inkling::fp4gemm::{gate_up_silu_launch, gate_up_silu_narrow_launch};
+    use mary::models::inkling::fp4quant::{quantize_nvfp4, quantize_nvfp4_bf16};
+    use mary::models::inkling::moegroup::{
+        fp4_linear_grouped_bf16_launch, fp4_linear_grouped_launch, gather_grouped,
+        gather_grouped_bf16, gather_grouped_bf16_from_bf16, scatter_weighted, scatter_weighted_bf16,
+    };
+    use mary::models::inkling::seam::tensor_of;
+
     // The two staging buffers this lane owns, at the dtype
     // [`act_bf16`] names. Both are `[m_total, _]` and `m_total` is about
     // `experts_per_token * n`, so at prefill they are the largest allocations
@@ -2407,13 +2466,13 @@ fn grouped_experts_fp4(
     // when the gather is too.
     let x_h = match (narrow, hn_dt) {
         (true, burn::tensor::DType::BF16) => {
-            gather_grouped_bf16_from_bf16(client, &hn_h, &h_rowtok, n, m_total, h)
+            gather_grouped_bf16_from_bf16(client, hn_h, h_rowtok, n, m_total, h)
         }
-        (true, _) => gather_grouped_bf16(client, &hn_h, &h_rowtok, n, m_total, h),
+        (true, _) => gather_grouped_bf16(client, hn_h, h_rowtok, n, m_total, h),
         (false, burn::tensor::DType::BF16) => {
             panic!("a BF16 residual stream with INK_ACT_BF16=0: set INK_RESID_BF16=0 for the wide lane")
         }
-        (false, _) => gather_grouped(client, &hn_h, &h_rowtok, n, m_total, h),
+        (false, _) => gather_grouped(client, hn_h, h_rowtok, n, m_total, h),
     };
     host.gather += t_g.elapsed().as_secs_f64();
 
@@ -2425,12 +2484,12 @@ fn grouped_experts_fp4(
     };
     let both = if narrow {
         fp4_linear_grouped_bf16_launch(
-            client, &a, &asc, &wmap, wmap_bytes, &blk, &h_off13, &h_sc13, slots, m_total, h,
+            client, &a, &asc, wmap, wmap_bytes, blk, h_off13, h_sc13, slots, m_total, h,
             2 * inter,
         )
     } else {
         fp4_linear_grouped_launch(
-            client, &a, &asc, &wmap, wmap_bytes, &blk, &h_off13, &h_sc13, slots, m_total, h,
+            client, &a, &asc, wmap, wmap_bytes, blk, h_off13, h_sc13, slots, m_total, h,
             2 * inter,
         )
     };
@@ -2448,11 +2507,11 @@ fn grouped_experts_fp4(
     };
     let y_h = if narrow {
         fp4_linear_grouped_bf16_launch(
-            client, &a2, &asc2, &wmap, wmap_bytes, &blk, &h_off2, &h_sc2, slots, m_total, inter, h,
+            client, &a2, &asc2, wmap, wmap_bytes, blk, h_off2, h_sc2, slots, m_total, inter, h,
         )
     } else {
         fp4_linear_grouped_launch(
-            client, &a2, &asc2, &wmap, wmap_bytes, &blk, &h_off2, &h_sc2, slots, m_total, inter, h,
+            client, &a2, &asc2, wmap, wmap_bytes, blk, h_off2, h_sc2, slots, m_total, inter, h,
         )
     };
     host.enqueue += t_w.elapsed().as_secs_f64();
@@ -2477,17 +2536,635 @@ fn grouped_experts_fp4(
     let t_c = Instant::now();
     let acc_h = if narrow {
         scatter_weighted_bf16(
-            client, &y_h, &h_rowwgt, &h_tokrows, &h_tokcnt, m_total, n, h, plan.kmax,
+            client, &y_h, h_rowwgt, h_tokrows, h_tokcnt, m_total, n, h, kmax,
         )
     } else {
         scatter_weighted(
-            client, &y_h, &h_rowwgt, &h_tokrows, &h_tokcnt, m_total, n, h, plan.kmax,
+            client, &y_h, h_rowwgt, h_tokrows, h_tokcnt, m_total, n, h, kmax,
         )
     };
     let acc = tensor_of(client.clone(), dev.clone(), acc_h, n, h);
     host.accum += t_c.elapsed().as_secs_f64();
 
-    Ok(Some(acc))
+    acc
+}
+
+/// `INK_PLAN_CHECK=1`: does the row plan actually DEPEND on the routing?
+///
+/// The claim this exists to refute or confirm: at `n == 1` six of
+/// [`RowPlan`]'s seven fields are a function of `n` and `top_k` alone, and only
+/// `row_wgt` carries the decision. If that holds, the six can be uploaded once
+/// for a whole run and the per-layer readback that produces them can go.
+///
+/// It is a CHECK and not an assumption: the first plan seen at a given `n` is
+/// kept, every later one is compared against it field by field, and the count
+/// of where they differ is printed. `row_wgt` is expected to differ and is
+/// counted too, because a check whose control never fires is not a check.
+fn plan_check_note(
+    prefix: &str,
+    n: usize,
+    by_expert: &std::collections::BTreeMap<usize, Vec<(usize, f32)>>,
+    plan: &mary::models::inkling::moegroup::RowPlan,
+) {
+    use std::sync::Mutex;
+    struct Snap {
+        row_tok: Vec<i32>,
+        row_wgt: Vec<f32>,
+        blk_slot: Vec<u32>,
+        blk_tile0: Vec<u32>,
+        blk_cnt: Vec<u32>,
+        tok_rows: Vec<u32>,
+        tok_cnt: Vec<u32>,
+        kmax: usize,
+        seen: usize,
+        /// row_tok, row_wgt, blk_slot, blk_tile0, blk_cnt, tok_rows, tok_cnt, kmax
+        diff: [usize; 8],
+    }
+    static S: Mutex<Option<std::collections::HashMap<usize, Snap>>> = Mutex::new(None);
+    let mut g = S.lock().expect("plan check");
+    let map = g.get_or_insert_with(std::collections::HashMap::new);
+    let first = !map.contains_key(&n);
+    let s = map.entry(n).or_insert_with(|| Snap {
+        row_tok: plan.row_tok.clone(),
+        row_wgt: plan.row_wgt.clone(),
+        blk_slot: plan.blk_slot.clone(),
+        blk_tile0: plan.blk_tile0.clone(),
+        blk_cnt: plan.blk_cnt.clone(),
+        tok_rows: plan.tok_rows.clone(),
+        tok_cnt: plan.tok_cnt.clone(),
+        kmax: plan.kmax,
+        seen: 0,
+        diff: [0; 8],
+    });
+    s.seen += 1;
+    if first {
+        println!(
+            "PLANCHECK first plan at n={n}  ({prefix}) slots={} m_total={} kmax={}",
+            by_expert.len(),
+            plan.m_total(),
+            plan.kmax
+        );
+        println!("  experts   {:?}", by_expert.keys().collect::<Vec<_>>());
+        println!("  row_tok   {:?}", plan.row_tok);
+        println!("  blk_slot  {:?}", plan.blk_slot);
+        println!("  blk_tile0 {:?}", plan.blk_tile0);
+        println!("  blk_cnt   {:?}", plan.blk_cnt);
+        println!("  tok_rows  {:?}", plan.tok_rows);
+        println!("  tok_cnt   {:?}", plan.tok_cnt);
+        println!("  row_wgt   {:?}", plan.row_wgt);
+        return;
+    }
+    // Compared as bits for `row_wgt` so a -0.0 counts, and by value for the
+    // integer fields. A LENGTH difference is a difference: a layer that routed
+    // to five distinct experts instead of six refutes the claim just as loudly
+    // as one that reordered them.
+    let names = [
+        "row_tok", "row_wgt", "blk_slot", "blk_tile0", "blk_cnt", "tok_rows", "tok_cnt", "kmax",
+    ];
+    let hit = [
+        s.row_tok != plan.row_tok,
+        s.row_wgt.len() != plan.row_wgt.len()
+            || s.row_wgt
+                .iter()
+                .zip(plan.row_wgt.iter())
+                .any(|(a, b)| a.to_bits() != b.to_bits()),
+        s.blk_slot != plan.blk_slot,
+        s.blk_tile0 != plan.blk_tile0,
+        s.blk_cnt != plan.blk_cnt,
+        s.tok_rows != plan.tok_rows,
+        s.tok_cnt != plan.tok_cnt,
+        s.kmax != plan.kmax,
+    ];
+    for (i, &h) in hit.iter().enumerate() {
+        if !h {
+            continue;
+        }
+        s.diff[i] += 1;
+        // The first four of each field, in full, because "it varied" without
+        // the value is a finding nobody can act on.
+        if s.diff[i] <= 4 && i != 1 {
+            println!(
+                "PLANCHECK VARIES n={n} {} ({prefix}) obs {}: first {:?} now {:?}",
+                names[i],
+                s.seen,
+                match i {
+                    0 => format!("{:?}", s.row_tok),
+                    2 => format!("{:?}", s.blk_slot),
+                    3 => format!("{:?}", s.blk_tile0),
+                    4 => format!("{:?}", s.blk_cnt),
+                    5 => format!("{:?}", s.tok_rows),
+                    6 => format!("{:?}", s.tok_cnt),
+                    _ => format!("{}", s.kmax),
+                },
+                match i {
+                    0 => format!("{:?}", plan.row_tok),
+                    2 => format!("{:?}", plan.blk_slot),
+                    3 => format!("{:?}", plan.blk_tile0),
+                    4 => format!("{:?}", plan.blk_cnt),
+                    5 => format!("{:?}", plan.tok_rows),
+                    6 => format!("{:?}", plan.tok_cnt),
+                    _ => format!("{}", plan.kmax),
+                },
+            );
+        }
+    }
+    if s.seen % 256 == 0 {
+        println!(
+            "PLANCHECK n={n}: {} plans, differ from the first -- row_tok {} row_wgt {} \
+             blk_slot {} blk_tile0 {} blk_cnt {} tok_rows {} tok_cnt {} kmax {}",
+            s.seen,
+            s.diff[0],
+            s.diff[1],
+            s.diff[2],
+            s.diff[3],
+            s.diff[4],
+            s.diff[5],
+            s.diff[6],
+            s.diff[7]
+        );
+    }
+}
+
+/// Whether the row plan is checked against the first one seen. `INK_PLAN_CHECK=1`.
+fn plan_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INK_PLAN_CHECK").map(|v| v == "1").unwrap_or(false))
+}
+
+/// The run-scoped half of the device row plan.
+///
+/// Six of [`RowPlan`]'s seven fields are the same bytes on every layer of every
+/// decode pass at `n == 1` — measured, not assumed; see
+/// [`mary::models::inkling::devplan`] and `INK_PLAN_CHECK=1`. So they are built
+/// once, uploaded once, and held here for the run, and the per-layer kernel
+/// produces only the seventh.
+struct DevRoute {
+    /// `[k * MTILE]` i32, `0` at every tile start and `-1` in the padding.
+    row_tok: cubecl::server::Handle,
+    /// `[k]` u32, the identity: one expert per block.
+    blk_slot: cubecl::server::Handle,
+    /// `[k]` u32, the identity.
+    blk_tile0: cubecl::server::Handle,
+    /// `[k]` u32, all ones: one M tile per expert, so `INK_MOE_PLANES` has
+    /// nothing to group at this width.
+    blk_cnt: cubecl::server::Handle,
+    /// `[1, k]` u32, `[0, 16, 32, …]`.
+    tok_rows: cubecl::server::Handle,
+    /// `[1]` u32, `[k]`.
+    tok_cnt: cubecl::server::Handle,
+    /// One u32 for the WHOLE RUN. The kernel raises it; the host reads it once,
+    /// after the last pass. A per-layer read of it would be the read this
+    /// entire lane exists to delete.
+    fault: cubecl::server::Handle,
+    /// Per absolute layer: its weight table, or `None` for a layer this lane
+    /// cannot take (BF16 experts, no registered mapping, a misaligned plane).
+    /// The `None` is cached too — a layer that refused once refuses every pass,
+    /// and re-deriving that costs 1024 lookups.
+    tabs: std::collections::HashMap<usize, Option<mary::models::inkling::devplan::ExpertTable>>,
+    /// `top_k`, which at `n == 1` is also the block count and the slot count.
+    k: usize,
+    /// `k * MTILE`.
+    m_total: usize,
+    /// What `RowPlan::planes()` said, carried so the launch shape matches the
+    /// host lane's exactly.
+    planes: usize,
+}
+
+/// Build [`DevRoute`]'s invariants — from [`RowPlan::build`] itself, at the
+/// shape a one-token pass produces.
+///
+/// Derived rather than transcribed on purpose: if the stacking rule ever
+/// changes, this follows it instead of disagreeing with it silently.
+fn devroute_new(
+    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+    k: usize,
+) -> DevRoute {
+    use mary::models::inkling::moegroup::RowPlan;
+    // `k` experts of one token each — token 0, weight irrelevant, because the
+    // weights are exactly the field this does NOT hoist.
+    let one = vec![(0usize, 0.0f32)];
+    let each: Vec<&Vec<(usize, f32)>> = (0..k).map(|_| &one).collect();
+    let plan = RowPlan::build(each.into_iter(), 1, RowPlan::planes());
+    assert_eq!(plan.kmax, k, "one token routed to {k} distinct experts has kmax {k}");
+    assert_eq!(plan.blk_slot.len(), k, "one tile an expert is one block an expert");
+    DevRoute {
+        row_tok: client.create_from_slice(bytes_of(&plan.row_tok)),
+        blk_slot: client.create_from_slice(bytes_of(&plan.blk_slot)),
+        blk_tile0: client.create_from_slice(bytes_of(&plan.blk_tile0)),
+        blk_cnt: client.create_from_slice(bytes_of(&plan.blk_cnt)),
+        tok_rows: client.create_from_slice(bytes_of(&plan.tok_rows)),
+        tok_cnt: client.create_from_slice(bytes_of(&plan.tok_cnt)),
+        fault: client.create_from_slice(&0u32.to_le_bytes()),
+        tabs: std::collections::HashMap::new(),
+        k,
+        m_total: plan.m_total(),
+        planes: RowPlan::planes(),
+    }
+}
+
+/// One layer's weight table over EVERY routed expert, or `None` if this lane
+/// cannot take the layer.
+///
+/// The same four numbers per expert the host lane derived per PASS, derived
+/// once instead — and for all `n_routed` of them rather than for the six that
+/// happened to be active, because nothing on the host knows which six any more.
+/// The refusals are the grouped lane's own, unchanged and applied to the whole
+/// layer instead of to the active slice: one mapping for every plane, and every
+/// offset on the 4-byte vector the packed planes are read in.
+fn build_expert_table(
+    src: &Weights,
+    al: &mary::models::inkling::fp4gemm::Aliases,
+    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+    prefix: &str,
+    n_routed: usize,
+) -> Result<Option<mary::models::inkling::devplan::ExpertTable>> {
+    let n13 = format!("{prefix}mlp.experts.w13_weight");
+    let n2 = format!("{prefix}mlp.experts.w2_weight");
+    let mut off13: Vec<u64> = Vec::with_capacity(2 * n_routed);
+    let mut off2: Vec<u64> = Vec::with_capacity(2 * n_routed);
+    let mut sc13: Vec<f32> = Vec::with_capacity(n_routed);
+    let mut sc2: Vec<f32> = Vec::with_capacity(n_routed);
+    let mut which: Option<usize> = None;
+    let mut expert_bytes = 0usize;
+    for e in 0..n_routed {
+        let w13 = src.expert_packed(&n13, e)?;
+        let w2 = src.expert_packed(&n2, e)?;
+        let planes: [&[u8]; 4] = [&w13.codes, &w13.scales, &w2.codes, &w2.scales];
+        let mut o = [0u64; 4];
+        let mut bytes = 0usize;
+        for (i, plane) in planes.into_iter().enumerate() {
+            match al.locate(plane) {
+                Some((m, byte)) if which.map_or(true, |w| w == m) => {
+                    which = Some(m);
+                    o[i] = byte;
+                }
+                _ => return Ok(None),
+            }
+            bytes += plane.len();
+        }
+        if o.iter().any(|v| v % 4 != 0) {
+            return Ok(None);
+        }
+        // Every expert of a layer has the same shape, so this is the exact
+        // per-expert figure the alias accounting needs and not an average. A
+        // layer where it is not constant is a layer this lane has no business
+        // charging for, so it refuses instead.
+        if e == 0 {
+            expert_bytes = bytes;
+        } else if bytes != expert_bytes {
+            return Ok(None);
+        }
+        off13.push(o[0]);
+        off13.push(o[1]);
+        off2.push(o[2]);
+        off2.push(o[3]);
+        sc13.push(w13.scale2);
+        sc2.push(w2.scale2);
+    }
+    let (wmap, wmap_bytes) = match which.and_then(|i| al.map(i)) {
+        Some(m) => m,
+        None => return Ok(None),
+    };
+    Ok(Some(mary::models::inkling::devplan::ExpertTable {
+        off13: client.create_from_slice(bytes_of(&off13)),
+        off2: client.create_from_slice(bytes_of(&off2)),
+        sc13: client.create_from_slice(bytes_of(&sc13)),
+        sc2: client.create_from_slice(bytes_of(&sc2)),
+        wmap,
+        wmap_bytes,
+        expert_bytes,
+        n_routed,
+        stride: 2,
+        scaled: true,
+    }))
+}
+
+/// [`build_expert_table`] for a layer nothing quantised.
+///
+/// One plane a matrix instead of two, an offset in BF16 ELEMENTS rather than
+/// bytes — the unit `b` is indexed in, converted here exactly as
+/// `grouped_experts_bf16` converts it — and no second-level scale at all. The
+/// scale vectors are still allocated, filled with zeros, so the plan kernel
+/// needs no second form; the GEMM this feeds never reads them.
+fn build_expert_table_bf16(
+    src: &Weights,
+    al: &mary::models::inkling::fp4gemm::Aliases,
+    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+    prefix: &str,
+    n_routed: usize,
+) -> Result<Option<mary::models::inkling::devplan::ExpertTable>> {
+    let n13 = format!("{prefix}mlp.experts.w13_weight");
+    let n2 = format!("{prefix}mlp.experts.w2_weight");
+    let mut off13: Vec<u64> = Vec::with_capacity(n_routed);
+    let mut off2: Vec<u64> = Vec::with_capacity(n_routed);
+    let mut which: Option<usize> = None;
+    let mut expert_bytes = 0usize;
+    for e in 0..n_routed {
+        let w13 = src.expert_bf16(&n13, e)?;
+        let w2 = src.expert_bf16(&n2, e)?;
+        let planes: [&[u8]; 2] = [&w13.bytes, &w2.bytes];
+        let mut o = [0u64; 2];
+        let mut bytes = 0usize;
+        for (i, plane) in planes.into_iter().enumerate() {
+            match al.locate(plane) {
+                Some((m, byte)) if which.map_or(true, |w| w == m) => {
+                    which = Some(m);
+                    o[i] = byte;
+                }
+                _ => return Ok(None),
+            }
+            bytes += plane.len();
+        }
+        if o[0] % 4 != 0 || o[1] % 4 != 0 {
+            return Ok(None);
+        }
+        if e == 0 {
+            expert_bytes = bytes;
+        } else if bytes != expert_bytes {
+            return Ok(None);
+        }
+        off13.push(o[0] / 2);
+        off2.push(o[1] / 2);
+    }
+    let (wmap, wmap_bytes) = match which.and_then(|i| al.map(i)) {
+        Some(m) => m,
+        None => return Ok(None),
+    };
+    let zeros = vec![0f32; n_routed];
+    Ok(Some(mary::models::inkling::devplan::ExpertTable {
+        off13: client.create_from_slice(bytes_of(&off13)),
+        off2: client.create_from_slice(bytes_of(&off2)),
+        sc13: client.create_from_slice(bytes_of(&zeros)),
+        sc2: client.create_from_slice(bytes_of(&zeros)),
+        wmap,
+        wmap_bytes,
+        expert_bytes,
+        n_routed,
+        stride: 1,
+        scaled: false,
+    }))
+}
+
+/// The routed experts of one layer with the plan already on the device.
+///
+/// The sibling of [`grouped_experts_fp4`] whose whole difference is upstream:
+/// eleven buffers instead of nine uploads, and no `by_expert` at all. Both end
+/// in [`grouped_experts_core`], so the arithmetic is one implementation.
+#[allow(clippy::too_many_arguments)]
+fn routed_experts_fp4_dev(
+    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+    dev: &burn::backend::cuda::CudaDevice,
+    prefix: &str,
+    tab: &mary::models::inkling::devplan::ExpertTable,
+    dp: &mary::models::inkling::devplan::DevRowPlan,
+    dr: &DevRoute,
+    hn: &T2,
+    n: usize,
+    h: usize,
+    inter: usize,
+    t_g: Instant,
+    host: &mut HostT,
+) -> T2 {
+    use mary::models::inkling::moegroup::BlockPlanDev;
+    use mary::models::inkling::seam::handle_of_any;
+    let blk = BlockPlanDev {
+        slot: dr.blk_slot.clone(),
+        tile0: dr.blk_tile0.clone(),
+        cnt: dr.blk_cnt.clone(),
+        blocks: dr.k,
+        planes: dr.planes,
+        // One token an expert, so every stacked row past the first of a tile is
+        // padding. This is what picks the schedule, and getting it wrong would
+        // pick the prefill's.
+        rows_real: dr.k,
+    };
+    let (hn_h, hn_dt) = handle_of_any(hn.clone());
+    grouped_experts_core(
+        client, dev, prefix, &tab.wmap, tab.wmap_bytes, &blk, &hn_h, hn_dt, &dr.row_tok,
+        &dp.row_wgt, &dr.tok_rows, &dr.tok_cnt, &dp.off13, &dp.off2, &dp.sc13, &dp.sc2, dr.k,
+        dr.m_total, dr.k, n, h, inter, t_g, host,
+    )
+}
+
+/// The routed experts of one BF16 layer with the plan already on the device.
+#[allow(clippy::too_many_arguments)]
+fn routed_experts_bf16_dev(
+    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+    dev: &burn::backend::cuda::CudaDevice,
+    tab: &mary::models::inkling::devplan::ExpertTable,
+    dp: &mary::models::inkling::devplan::DevRowPlan,
+    dr: &DevRoute,
+    hn: &T2,
+    n: usize,
+    h: usize,
+    inter: usize,
+    t_g: Instant,
+    host: &mut HostT,
+) -> T2 {
+    use mary::models::inkling::moegroup::BlockPlanDev;
+    use mary::models::inkling::seam::handle_of;
+    let blk = BlockPlanDev {
+        slot: dr.blk_slot.clone(),
+        tile0: dr.blk_tile0.clone(),
+        cnt: dr.blk_cnt.clone(),
+        blocks: dr.k,
+        planes: dr.planes,
+        rows_real: dr.k,
+    };
+    // Widened for the same reason the host twin widens it: this lane's gather
+    // and scatter index f32 bytes.
+    let hn_h = handle_of(mary::models::inkling::resid::from_resid(hn.clone()));
+    grouped_experts_bf16_core(
+        client, dev, &tab.wmap, tab.wmap_bytes, &blk, &hn_h, &dr.row_tok, &dp.row_wgt,
+        &dr.tok_rows, &dr.tok_cnt, &dp.off13, &dp.off2, dr.k, dr.m_total, dr.k, n, h, inter, t_g,
+        host,
+    )
+}
+
+/// [`shared_experts_bf16`] with the gammas left where the router put them.
+///
+/// The host twin takes `&[f32]` and builds an `[n, 1]` tensor per shared
+/// expert; this slices the same column out of `routetopk`'s own output. Same
+/// f32 values, same multiply, same order — the readback was the only thing
+/// between them.
+fn shared_experts_dev(
+    x: T2,
+    sw: &SharedOnDevice,
+    topk: T2,
+    top_k: usize,
+    n_shared: usize,
+) -> T2 {
+    let [n, _] = x.dims();
+    let inter = sw.gate_up.n / (2 * n_shared);
+    let gu = dev_lane::linear_bf16(x, &sw.gate_up);
+    let mut out: Option<T2> = None;
+    for s in 0..n_shared {
+        let g = gu.clone().slice([0..n, s * inter..(s + 1) * inter]);
+        let u = gu.clone().slice([0..n, (n_shared + s) * inter..(n_shared + s + 1) * inter]);
+        let gam = topk.clone().slice([0..n, 2 * top_k + s..2 * top_k + s + 1]);
+        let c = dev_lane::linear_bf16(dev_lane::silu(g) * u * gam, &sw.down[s]);
+        out = Some(match out {
+            Some(o) => o + c,
+            None => c,
+        });
+    }
+    out.expect("a MoE layer with no shared experts")
+}
+
+/// `INK_DEVPLAN_CHECK=1`: the device plan against the host plan, as BITS.
+///
+/// The sharpest instrument this lane has, and the one the ascending sort needs.
+/// A mis-sorted expert list changes the ORDER the scatter accumulates a token's
+/// six contributions in, which changes the sum in the last few ulps and nowhere
+/// else — and this runtime disagrees with itself on 8.55% of argmax positions
+/// between two runs of the same binary, so no output-level comparison could
+/// ever see it. This one compares the plan itself, where the difference is
+/// exact.
+///
+/// Reads five device buffers, so it is far slower than either lane and is a
+/// diagnostic rather than an arm.
+#[allow(clippy::too_many_arguments)]
+fn devplan_verify_layer(
+    src: &Weights,
+    al: &mary::models::inkling::fp4gemm::Aliases,
+    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+    prefix: &str,
+    by_expert: &BTreeMap<usize, Vec<(usize, f32)>>,
+    dp: &mary::models::inkling::devplan::DevRowPlan,
+    dr: &DevRoute,
+    scaled: bool,
+) -> Result<()> {
+    use mary::models::inkling::moegroup::RowPlan;
+    let n13 = format!("{prefix}mlp.experts.w13_weight");
+    let n2 = format!("{prefix}mlp.experts.w2_weight");
+    let mut off13: Vec<u64> = Vec::new();
+    let mut off2: Vec<u64> = Vec::new();
+    let mut sc13: Vec<f32> = Vec::new();
+    let mut sc2: Vec<f32> = Vec::new();
+    for &e in by_expert.keys() {
+        if scaled {
+            let w13 = src.expert_packed(&n13, e)?;
+            let w2 = src.expert_packed(&n2, e)?;
+            let planes: [&[u8]; 4] = [&w13.codes, &w13.scales, &w2.codes, &w2.scales];
+            for (i, plane) in planes.into_iter().enumerate() {
+                let (_, byte) = al.locate(plane).context("the host plan cannot locate a plane")?;
+                match i {
+                    0 | 1 => off13.push(byte),
+                    _ => off2.push(byte),
+                }
+            }
+            sc13.push(w13.scale2);
+            sc2.push(w2.scale2);
+        } else {
+            let w13 = src.expert_bf16(&n13, e)?;
+            let w2 = src.expert_bf16(&n2, e)?;
+            let (_, b13) =
+                al.locate(&w13.bytes).context("the host plan cannot locate a plane")?;
+            let (_, b2) = al.locate(&w2.bytes).context("the host plan cannot locate a plane")?;
+            off13.push(b13 / 2);
+            off2.push(b2 / 2);
+        }
+    }
+    let plan = RowPlan::build(by_expert.values(), 1, RowPlan::planes());
+    let rd = |hnd: &cubecl::server::Handle| -> Vec<u8> {
+        client.read_one(hnd.clone()).expect("read a device plan buffer").to_vec()
+    };
+    let d_wgt = rd(&dp.row_wgt);
+    let d_o13 = rd(&dp.off13);
+    let d_o2 = rd(&dp.off2);
+    let d_s13 = rd(&dp.sc13);
+    let d_s2 = rd(&dp.sc2);
+    let bad = |what: &str, host: &[u8], got: &[u8]| -> Result<()> {
+        anyhow::ensure!(
+            host == got,
+            "DEVPLAN MISMATCH at {prefix}: {what} differs between the host plan and the device \
+             plan. host {host:02x?} device {got:02x?}. The experts the host chose, ascending, \
+             were {:?}.",
+            by_expert.keys().collect::<Vec<_>>()
+        );
+        Ok(())
+    };
+    anyhow::ensure!(
+        by_expert.len() == dr.k,
+        "{prefix} routed to {} distinct experts, and the device plan is built for exactly {}",
+        by_expert.len(),
+        dr.k
+    );
+    // THE ORDER, as integers, before anything derived from it. A mis-sorted
+    // plan perturbs the accumulated sum at exactly the magnitude the fused
+    // multiply does, so no floating-point comparison downstream can tell the
+    // two apart by size -- only by how MANY elements moved, which is a
+    // statistic and not an answer. This is the answer: six ids against six
+    // keys, and a failure prints the permutation.
+    let d_ids = rd(&dp.ids);
+    let got_ids: Vec<u32> = d_ids
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().expect("four bytes")))
+        .collect();
+    let want_ids: Vec<u32> = by_expert.keys().map(|&e| e as u32).collect();
+    anyhow::ensure!(
+        got_ids == want_ids,
+        "DEVPLAN ORDER MISMATCH at {prefix}: the device plan stacked the experts as {got_ids:?} \
+         and the host's BTreeMap order is {want_ids:?}. These must be identical -- the order is \
+         the order the scatter accumulates a token's contributions in, and floating-point \
+         addition is not associative."
+    );
+    bad("row_wgt", bytes_of(&plan.row_wgt), &d_wgt)?;
+    bad("off13", bytes_of(&off13), &d_o13)?;
+    bad("off2", bytes_of(&off2), &d_o2)?;
+    if scaled {
+        bad("sc13", bytes_of(&sc13), &d_s13)?;
+        bad("sc2", bytes_of(&sc2), &d_s2)?;
+    }
+    Ok(())
+}
+
+/// Where the grouped lane's row plan is built. `INK_DEV_PLAN`.
+///
+/// `Host` is the lane that reads the router's decision back every layer;
+/// `Dev` never reads it; `Ab(r)` alternates every `r` decode passes so the two
+/// can be priced inside ONE process. The last is the only honest form of the
+/// comparison: pass-to-pass drift on this box is 2-3 ms against a difference of
+/// about four, so two separate runs cannot resolve it.
+#[derive(Clone, Copy, PartialEq)]
+enum PlanArm {
+    Host,
+    Dev,
+    Ab(usize),
+}
+
+impl PlanArm {
+    /// `INK_DEV_PLAN`: unset or `0` is the host lane, `1`/`on` the device one,
+    /// `ab:<r>` the interleave.
+    ///
+    /// Default OFF, unlike `INK_DEV_ROUTE`: this lane is newer than its
+    /// measurement and the arm that has run for months is the one a run that
+    /// says nothing should get.
+    fn from_env() -> Result<PlanArm> {
+        match std::env::var("INK_DEV_PLAN") {
+            Err(_) => Ok(PlanArm::Host),
+            Ok(v) if v == "0" => Ok(PlanArm::Host),
+            Ok(v) if v == "1" || v == "on" => Ok(PlanArm::Dev),
+            Ok(v) => match v.strip_prefix("ab:").and_then(|r| r.parse::<usize>().ok()) {
+                Some(r) if r >= 1 => Ok(PlanArm::Ab(r)),
+                _ => anyhow::bail!(
+                    "INK_DEV_PLAN={v}: expected 0, 1, or ab:<round length in decode passes>"
+                ),
+            },
+        }
+    }
+
+    /// Whether THIS decode pass builds its plan on the device.
+    fn on(&self, decode_step: usize) -> bool {
+        match self {
+            PlanArm::Host => false,
+            PlanArm::Dev => true,
+            // The host arm goes first, so the cold passes -- kernel
+            // compilation, the first touch of every weight table -- land on the
+            // lane that has to pay them anyway.
+            PlanArm::Ab(r) => (decode_step / r) % 2 == 1,
+        }
+    }
 }
 
 /// Whether the routed-expert lane reports what it is holding. `INK_MEM_TRACE=1`.
@@ -2657,12 +3334,8 @@ fn grouped_experts_bf16(
     inter: usize,
     host: &mut HostT,
 ) -> Result<Option<T2>> {
-    use mary::models::inkling::bf16gemm::to_bf16_launch;
-    use mary::models::inkling::fp4gemm::gate_up_silu_bf16_launch;
-    use mary::models::inkling::moegroup::{
-        bf16_linear_grouped_launch, gather_grouped, scatter_weighted, BlockPlanDev, RowPlan,
-    };
-    use mary::models::inkling::seam::{handle_of, tensor_of};
+    use mary::models::inkling::moegroup::{BlockPlanDev, RowPlan};
+    use mary::models::inkling::seam::handle_of;
 
     let n13 = format!("{prefix}mlp.experts.w13_weight");
     let n2 = format!("{prefix}mlp.experts.w2_weight");
@@ -2739,29 +3412,68 @@ fn grouped_experts_bf16(
     let h_off2 = client.create_from_slice(bytes_of(&off2));
     let h_tokrows = client.create_from_slice(bytes_of(&plan.tok_rows));
     let h_tokcnt = client.create_from_slice(bytes_of(&plan.tok_cnt));
-    let x_h = gather_grouped(client, &hn_h, &h_rowtok, n, m_total, h);
+    Ok(Some(grouped_experts_bf16_core(
+        client, dev, &wmap, wmap_bytes, &blk, &hn_h, &h_rowtok, &h_rowwgt, &h_tokrows, &h_tokcnt,
+        &h_off13, &h_off2, slots, m_total, plan.kmax, n, h, inter, t_g, host,
+    )))
+}
+/// The grouped BF16 lane once its plan exists, whoever built it.
+///
+/// [`grouped_experts_core`]'s unquantised sibling — layer 2 and nothing else.
+/// One offset an expert instead of two, no second-level scale, and an f32
+/// stream throughout, because nothing here reads four-bit codes.
+#[allow(clippy::too_many_arguments)]
+fn grouped_experts_bf16_core(
+    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+    dev: &burn::backend::cuda::CudaDevice,
+    wmap: &cubecl::server::Handle,
+    wmap_bytes: usize,
+    blk: &mary::models::inkling::moegroup::BlockPlanDev,
+    hn_h: &cubecl::server::Handle,
+    h_rowtok: &cubecl::server::Handle,
+    h_rowwgt: &cubecl::server::Handle,
+    h_tokrows: &cubecl::server::Handle,
+    h_tokcnt: &cubecl::server::Handle,
+    h_off13: &cubecl::server::Handle,
+    h_off2: &cubecl::server::Handle,
+    slots: usize,
+    m_total: usize,
+    kmax: usize,
+    n: usize,
+    h: usize,
+    inter: usize,
+    t_g: Instant,
+    host: &mut HostT,
+) -> T2 {
+    use mary::models::inkling::bf16gemm::to_bf16_launch;
+    use mary::models::inkling::fp4gemm::gate_up_silu_bf16_launch;
+    use mary::models::inkling::moegroup::{bf16_linear_grouped_launch, gather_grouped, scatter_weighted};
+    use mary::models::inkling::seam::tensor_of;
+
+    let x_h = gather_grouped(client, hn_h, h_rowtok, n, m_total, h);
     host.gather += t_g.elapsed().as_secs_f64();
 
     let t_w = Instant::now();
     let a = to_bf16_launch(client, &x_h, m_total * h, m_total * h);
     let both = bf16_linear_grouped_launch(
-        client, &a, &wmap, wmap_bytes, &blk, &h_off13, slots, m_total, h, 2 * inter,
+        client, &a, wmap, wmap_bytes, blk, h_off13, slots, m_total, h, 2 * inter,
     );
     let act = gate_up_silu_bf16_launch(client, &both, m_total, inter);
     let y_h = bf16_linear_grouped_launch(
-        client, &act, &wmap, wmap_bytes, &blk, &h_off2, slots, m_total, inter, h,
+        client, &act, wmap, wmap_bytes, blk, h_off2, slots, m_total, inter, h,
     );
     host.enqueue += t_w.elapsed().as_secs_f64();
 
     let t_c = Instant::now();
     let acc_h = scatter_weighted(
-        client, &y_h, &h_rowwgt, &h_tokrows, &h_tokcnt, m_total, n, h, plan.kmax,
+        client, &y_h, h_rowwgt, h_tokrows, h_tokcnt, m_total, n, h, kmax,
     );
     let acc = tensor_of(client.clone(), dev.clone(), acc_h, n, h);
     host.accum += t_c.elapsed().as_secs_f64();
 
-    Ok(Some(acc))
+    acc
 }
+
 
 /// The per-expert BF16 lane: one launch sequence per active expert, in
 /// `BTreeMap` order.
@@ -3930,6 +4642,34 @@ fn main() -> Result<()> {
     let mut route_cache: std::collections::HashMap<usize, Vec<Routing>> =
         std::collections::HashMap::new();
 
+    // ---- INK_DEV_PLAN: the row plan on the device ---------------------------
+    //
+    // `INK_DEV_ROUTE` moved the DECISION to the device and still read it back;
+    // this is what makes the readback unnecessary. See
+    // [`mary::models::inkling::devplan`] for what is invariant at `n == 1` and
+    // why none of it transfers to a prefill.
+    let plan_arm = PlanArm::from_env()?;
+    // Five diagnostics want the decision on the host, and every one of them
+    // silently stops working if this lane takes the layer instead. They are
+    // read once, here, rather than per layer per pass: a `getenv` inside the
+    // loop this lane exists to shorten would be a joke at its own expense.
+    let route_log_on = std::env::var("INK_ROUTE_LOG").is_ok();
+    let route_dbg_on = std::env::var("INK_ROUTE_DBG").is_ok();
+    let grouped_mode = std::env::var("INK_GROUPED").unwrap_or_else(|_| "1".to_string());
+    // `INK_GROUPED=2` is the surviving EQUIVALENCE instrument -- the grouped
+    // lane against the per-expert loop, on the same input, compared as bits.
+    // It needs `by_expert`, so under it this lane builds the plan on the device
+    // AND the host still reads the decision back. That makes it slower than
+    // either arm and is exactly right: it is measuring agreement, not time.
+    let grouped_ab = grouped_mode == "2";
+    let devplan_verify =
+        std::env::var("INK_DEVPLAN_CHECK").map(|v| v == "1").unwrap_or(false);
+    let mut devroute: Option<DevRoute> = None;
+    // Per decode pass: which arm it ran and what it cost. The arms are
+    // interleaved inside one process, so this is the only pairing that is not
+    // confounded by warm-up, by clocks, or by whatever else the box is doing.
+    let mut pass_ms_arm: Vec<(bool, f64)> = Vec::new();
+
     // ---- what the pipe costs, and what it wastes --------------------------
     //
     // A two-node split has one node blocked on the other for most of every
@@ -4029,6 +4769,10 @@ fn main() -> Result<()> {
     }
 
     let pass = Instant::now();
+    // Which arm THIS pass runs, fixed before the layer loop so a pass is never
+    // half of each. The prefill is always the host lane: its plan is a function
+    // of the routing and nothing hoists.
+    let dev_plan_now = is_decode && plan_arm.on(step - prefill_passes);
     let io0 = io_read_bytes();
     cp.io_reset();
     // Same scope as the loader counters, for the same reason: the report below
@@ -4519,7 +5263,68 @@ fn main() -> Result<()> {
             // the host lane: a diagnostic that changed the lane it measures
             // would be measuring itself.
             let host_route = !dev_route || r.reference.is_some();
+            // Can this layer's plan stay on the device this pass? Every clause
+            // is a separate reason and none of them is a preference:
+            //
+            // * `n == 1` is the shape the invariants hold at, and only that one.
+            // * the diagnostics below read `routing`, which this lane does not
+            //   produce -- so they select the host lane rather than being
+            //   silently wrong.
+            // * `INK_GROUPED=0` is the per-expert loop, which has no plan.
+            // * a BF16-expert layer goes through a different lane entirely.
+            let plan_dev_ok = dev_plan_now
+                && n == 1
+                && dev_route
+                && !route_stale
+                && grouped_mode != "0"
+                && !route_log_on
+                && !route_dbg_on
+                && r.reference.is_none();
+            // The layer's weight table, derived on its first device-lane pass
+            // and held for the run. A layer that cannot be tabled caches its
+            // `None` and takes the host lane every pass thereafter.
+            let plan_dev = if plan_dev_ok {
+                let dr = devroute
+                    .get_or_insert_with(|| devroute_new(&fp4_client, t.num_experts_per_tok));
+                if !dr.tabs.contains_key(&layer) {
+                    let t_s = Instant::now();
+                    // Which table the layer's own bytes ask for. Both lanes
+                    // are grouped and both take a plan; only the shape of the
+                    // weight differs, so this is the same branch the expert
+                    // dispatch below makes and it is made from the same fact.
+                    let nvfp4 = cp.is_nvfp4(&format!("{p}mlp.experts.w13_weight"));
+                    let tb = match fp4_aliases.as_ref() {
+                        Some(al) if nvfp4 => {
+                            build_expert_table(&cp, al, &fp4_client, &p, t.n_routed_experts)?
+                        }
+                        Some(al) => {
+                            build_expert_table_bf16(&cp, al, &fp4_client, &p, t.n_routed_experts)?
+                        }
+                        None => None,
+                    };
+                    host_t.slice += t_s.elapsed().as_secs_f64();
+                    if tb.is_none() {
+                        println!(
+                            "  INK_DEV_PLAN: {p} keeps the host lane (no single aligned mapping \
+                             for all {} routed experts)",
+                            t.n_routed_experts
+                        );
+                    }
+                    dr.tabs.insert(layer, tb);
+                }
+                dr.tabs[&layer].is_some()
+            } else {
+                false
+            };
+            // Two independent questions, and conflating them is how a
+            // diagnostic ends up measuring a lane that was not running: does
+            // the PLAN come from the device, and does the host still read the
+            // decision back? The second is true whenever something downstream
+            // needs `routing`, whether or not the first is.
+            let need_routing = !plan_dev || grouped_ab || devplan_verify;
             let routing: Vec<Routing>;
+            let mut topk_h: Option<cubecl::server::Handle> = None;
+            let mut topk_width = 0usize;
             let mut logits: Vec<f32> = Vec::new();
             // The probe only stands in for a decision of the same SHAPE, and it
             // never stands in for the reference arm, which wants this pass's
@@ -4556,6 +5361,15 @@ fn main() -> Result<()> {
                     t.route_scale as f32 * r.global_scale,
                 );
                 t_rt_mm += t_rt2.elapsed().as_secs_f64();
+                topk_width = width;
+                topk_h = Some(out_h.clone());
+                if !need_routing {
+                    // THE POINT OF THE WHOLE LANE. The answer stays where it
+                    // was computed; `plan_from_topk_launch` below reads it with
+                    // a kernel. Nothing on the host waits for the device in
+                    // this layer, so the queue runs as deep as the stack.
+                    routing = Vec::new();
+                } else {
                 let t_rr = Instant::now();
                 let flat = down(tensor_of(fp4_client.clone(), dev.clone(), out_h, n, width));
                 t_rt_read += t_rr.elapsed().as_secs_f64();
@@ -4627,6 +5441,7 @@ fn main() -> Result<()> {
                     );
                 }
                 t_rt_host += t_rh.elapsed().as_secs_f64();
+                }
             }
             if route_stale && !stale_hit {
                 route_cache.insert(layer, routing.clone());
@@ -4659,7 +5474,23 @@ fn main() -> Result<()> {
                 }
             }
 
-            // Group tokens by expert, so each slab is read once.
+            // One launch, one unit, and the layer's whole plan. Enqueued, so
+            // the timer is the host's description of the work and not the work.
+            let dev_plan_out = if plan_dev {
+                use mary::models::inkling::fp4gemm::MTILE;
+                let th = topk_h.clone().expect("the device route lane produced a top-k buffer");
+                let dr = devroute.as_ref().expect("a device plan implies the run state");
+                let tb = dr.tabs[&layer].as_ref().expect("a device plan implies a table");
+                Some(mary::models::inkling::devplan::plan_from_topk_launch(
+                    &fp4_client, &th, tb, &dr.fault, dr.k, MTILE, topk_width,
+                ))
+            } else {
+                None
+            };
+
+            // Group tokens by expert, so each slab is read once. Empty on the
+            // device lane -- `routing` is empty there and nothing below reads
+            // this -- which is the one-line statement of what moved.
             let mut by_expert: BTreeMap<usize, Vec<(usize, f32)>> = BTreeMap::new();
             for (ti, rt) in routing.iter().enumerate() {
                 for (slot, &e) in rt.experts.iter().enumerate() {
@@ -4694,6 +5525,20 @@ fn main() -> Result<()> {
                 writeln!(f, "D {step} {layer} {}", by_expert.len())?;
             }
 
+            // `INK_DEVPLAN_CHECK=1`: the device plan against the host plan as
+            // BITS, before either is used. This is where a wrong sort is
+            // visible; downstream it is four ulps inside a runtime that
+            // disagrees with itself by far more than that.
+            if devplan_verify {
+                if let (Some(dp), Some(al)) = (dev_plan_out.as_ref(), fp4_aliases.as_ref()) {
+                    let dr = devroute.as_ref().expect("a device plan implies the run state");
+                    let tb = dr.tabs[&layer].as_ref().expect("a device plan implies a table");
+                    devplan_verify_layer(
+                        &cp, al, &fp4_client, &p, &by_expert, dp, dr, tb.scaled,
+                    )?;
+                }
+            }
+
             let t_d = Instant::now();
             // Two formats, two instructions, one lane. 41 of the 42 layers
             // carry NVFP4 experts and go through the block-scaled MMA; layer 2
@@ -4703,7 +5548,47 @@ fn main() -> Result<()> {
             // own output type and not a widening).
             //
             // Which one is decided by the pile, not by a flag.
-            let acc = {
+            let acc = if let Some(dp) = dev_plan_out.as_ref() {
+                let t_g = Instant::now();
+                let dr = devroute.as_ref().expect("a device plan implies the run state");
+                let tb = dr.tabs[&layer].as_ref().expect("a device plan implies a table");
+                let a = if tb.scaled {
+                    routed_experts_fp4_dev(
+                        &fp4_client, &dev, &p, tb, dp, dr, &hn, n, h, inter, t_g, &mut host_t,
+                    )
+                } else {
+                    routed_experts_bf16_dev(
+                        &fp4_client, &dev, tb, dp, dr, &hn, n, h, inter, t_g, &mut host_t,
+                    )
+                };
+                // The accounting the host lane did one bind at a time. Nothing
+                // on the host sees these binds any more, and a lane that
+                // quietly stopped reporting would look like a lane that stopped
+                // moving bytes -- see `Aliases::note_alias`.
+                if let Some(al) = fp4_aliases.as_ref() {
+                    for _ in 0..dr.k {
+                        al.note_alias(tb.expert_bytes);
+                    }
+                }
+                if grouped_ab {
+                    let reference = if tb.scaled {
+                        per_expert_fp4(
+                            &cp, fp4_aliases.as_ref(), &fp4_client, &dev, &p, &by_expert, &hn, n,
+                            h, inter, &mut host_t,
+                        )?
+                    } else {
+                        per_expert_bf16(
+                            &cp, fp4_aliases.as_ref(), &fp4_client, &dev, &p, &by_expert, &hn, n,
+                            h, inter, &mut host_t,
+                        )?
+                    };
+                    report_ab(&p, &a, &reference, h);
+                }
+                host_t.grouped += 1;
+                host_t.plan_dev += 1;
+                expert_loads += dr.k;
+                a
+            } else {
                 let a = if cp.is_nvfp4(&format!("{p}mlp.experts.w13_weight")) {
                     routed_experts_fp4(
                         &cp, fp4_aliases.as_ref(), &fp4_client, &dev,
@@ -4718,6 +5603,7 @@ fn main() -> Result<()> {
                     )?
                 };
                 expert_loads += by_expert.len();
+                host_t.plan_host += 1;
                 a
             };
             // ENQUEUE time, not work: nothing in this lane synchronises any
@@ -4728,7 +5614,6 @@ fn main() -> Result<()> {
             stage_sync!(d_expert, layer, "expert");
 
             let ns = t.n_shared_experts;
-            let gammas: Vec<f32> = routing.iter().flat_map(|rt| rt.shared_gammas.clone()).collect();
             let t_s = Instant::now();
             // Device-resident, uploaded once. `split_shared_w13` is the
             // settled reading — this used to be an open `deinterleave_rows`
@@ -4738,7 +5623,23 @@ fn main() -> Result<()> {
                 let sw = ddense.shared_for(
                     &cp, &fp4_client, fp4_aliases.as_ref(), &p, ns, inter, h, shared_halved,
                 )?;
-                shared_experts_bf16(&dev, hn, sw, &gammas, ns)
+                match (dev_plan_out.as_ref(), topk_h.as_ref()) {
+                    // The shared gammas rode back in the same readback the
+                    // routed weights did, so they are the other half of what
+                    // this lane deletes. Sliced out of `routetopk`'s own
+                    // output, they are the same f32 values in the same order.
+                    (Some(_), Some(th)) => {
+                        let g = mary::models::inkling::seam::tensor_of(
+                            fp4_client.clone(), dev.clone(), th.clone(), n, topk_width,
+                        );
+                        shared_experts_dev(hn, sw, g, t.num_experts_per_tok, ns)
+                    }
+                    _ => {
+                        let gammas: Vec<f32> =
+                            routing.iter().flat_map(|rt| rt.shared_gammas.clone()).collect();
+                        shared_experts_bf16(&dev, hn, sw, &gammas, ns)
+                    }
+                }
             };
             stage_sync!(d_shared, layer, "shared");
             t_shared += t_s.elapsed().as_secs_f64();
@@ -5942,6 +6843,12 @@ fn main() -> Result<()> {
         // is a consequence of the routing decision living on the host.
         println!("        of which plan uploads: routing-dependent {:6.1}, static at n=1 {:6.1}",
                  ms(host_t.plan_up_routed), ms(host_t.plan_up_static));
+        // Which arm each MoE layer of this pass actually took. The two counters
+        // above cannot say -- both lanes are "grouped" and both load six slabs
+        // -- and a `BLOCKING read` that is not zero on the device arm is a
+        // layer this lane refused, not noise.
+        println!("        row plan: {} layer(s) on the DEVICE, {} off a blocking read",
+                 host_t.plan_dev, host_t.plan_host);
         println!("      bind + enqueue  {:9.1}   ({:.3} ms/load)",
                  ms(host_t.enqueue), ms(host_t.enqueue) / expert_loads.max(1) as f64);
         println!("      scatter-add     {:9.1}   ({:.3} ms/load)   enqueue",
@@ -6098,6 +7005,7 @@ fn main() -> Result<()> {
         acc_to_reply += t_to_reply;
         acc_steps += 1;
         pass_ms.push((pass.elapsed().as_secs_f64() + t_recv) * 1e3);
+        pass_ms_arm.push((dev_plan_now, (pass.elapsed().as_secs_f64() + t_recv) * 1e3));
     }
     if is_decode && step - prefill_passes >= COLD_DECODE_STEPS {
         warm_wall += pass.elapsed().as_secs_f64() + t_recv;
@@ -6223,15 +7131,6 @@ fn main() -> Result<()> {
         );
         let tpp = decode_toks as f64 / acc_steps as f64;
         println!("  tokens per pass      : {tpp:.3}");
-        // The same gate, taken at the MEDIAN pass instead of the mean. A decode
-        // loop pays for kernel compilation in its first few passes -- one 1.8 s
-        // outlier in a 40-pass run moves the mean by 20% and the median by
-        // nothing -- so this is the figure a short run can be compared on and
-        // the mean above is the figure a long one can.
-        println!(
-            "  TOKENS/SEC at p50    : {:.3}   (tokens/pass over the median pass)",
-            if p50 > 0.0 { tpp / (p50 / 1e3) } else { 0.0 }
-        );
         if spec_k > 0 {
             let sets: usize = spec_hist.iter().sum();
             println!("  accepted prefix over {sets} verify passes (INK_SPEC={spec_k}):");
@@ -6537,6 +7436,72 @@ fn main() -> Result<()> {
         bytes.extend_from_slice(&i.to_le_bytes());
     }
     std::fs::write(&out_path, &bytes)?;
+    // ---- the device row plan: the fault flag and the two arms --------------
+    //
+    // Outside the pipe report on purpose. Both of these are statements about
+    // the passes THIS process ran, and a single-node decode -- which is what a
+    // measurement of this lane looks like -- has no pipe at all.
+    if let Some(dr) = devroute.as_ref() {
+        // The whole run's fault flag, in one read. It is raised by the kernel
+        // and never by the host, so a run that ends with it clear is a run in
+        // which no layer saw a non-finite router logit and no layer picked one
+        // expert twice. The host lane panics at the layer instead; this trades
+        // that for not reading anything per layer.
+        let f = fp4_client.read_one(dr.fault.clone()).expect("read the device plan fault");
+        let v = u32::from_le_bytes(f[..4].try_into().expect("a u32 came back"));
+        anyhow::ensure!(
+            v == 0,
+            "INK_DEV_PLAN raised its fault flag ({v:#x}) during the run: {}. The flag is \
+             run-scoped and names the LAST fault, not the first.",
+            if v == 0xd {
+                "two of a token's top-k picks were the same expert"
+            } else {
+                "a router logit was NaN or infinite"
+            }
+        );
+    }
+    if pass_ms_arm.iter().any(|(d, _)| *d) && pass_ms_arm.iter().any(|(d, _)| !*d) {
+        let tpp = if acc_steps > 0 {
+            (if slot_lane { gen_tokens } else { gen_tokens.saturating_sub(1) }) as f64
+                / acc_steps as f64
+        } else {
+            0.0
+        };
+        // p10 and p90 beside the median and not instead of it: if the arms'
+        // spreads overlap, the medians are not a difference, and a mean over a
+        // bimodal set is not anything.
+        let q = |v: &mut Vec<f64>, f: f64| -> f64 {
+            v.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in a duration"));
+            v[((v.len() as f64 - 1.0) * f).round() as usize]
+        };
+        let mut host_p: Vec<f64> =
+            pass_ms_arm.iter().filter(|(d, _)| !*d).map(|(_, m)| *m).collect();
+        let mut dev_p: Vec<f64> = pass_ms_arm.iter().filter(|(d, _)| *d).map(|(_, m)| *m).collect();
+        let (hn_, dn_) = (host_p.len(), dev_p.len());
+        let (h50, h10, h90) = (q(&mut host_p, 0.5), q(&mut host_p, 0.1), q(&mut host_p, 0.9));
+        let (d50, d10, d90) = (q(&mut dev_p, 0.5), q(&mut dev_p, 0.1), q(&mut dev_p, 0.9));
+        println!("\n=== INK_DEV_PLAN, both arms interleaved in this ONE process ===");
+        println!(
+            "  plan on the HOST   : p50 {h50:7.1} ms   p10 {h10:7.1}  p90 {h90:7.1}   \
+             {:.3} tok/s at p50   over {hn_} decode passes",
+            if h50 > 0.0 { tpp / (h50 / 1e3) } else { 0.0 }
+        );
+        println!(
+            "  plan on the DEVICE : p50 {d50:7.1} ms   p10 {d10:7.1}  p90 {d90:7.1}   \
+             {:.3} tok/s at p50   over {dn_} decode passes",
+            if d50 > 0.0 { tpp / (d50 / 1e3) } else { 0.0 }
+        );
+        println!(
+            "  device against host: {:+.1} ms a pass at p50, {:+.1}% tok/s   (the arms {})",
+            d50 - h50,
+            100.0 * (h50 / d50 - 1.0),
+            if d90 < h10 || h90 < d10 {
+                "do not overlap between p10 and p90"
+            } else {
+                "OVERLAP between p10 and p90 -- read the medians with that in mind"
+            }
+        );
+    }
     println!("  wrote top-5 ids per position to {}", out_path.display());
     Ok(())
 }
