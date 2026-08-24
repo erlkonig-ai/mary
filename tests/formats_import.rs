@@ -268,9 +268,11 @@ fn pytorch_bin_import_roundtrip() {
     pile.close().unwrap();
     eprintln!("imported root {root:X}");
 
-    let snapshot =
-        mary::model_collection::load_model_collection_local_latest(&tmp, signing_key.verifying_key())
-            .unwrap();
+    let snapshot = mary::model_collection::load_model_collection_local_latest(
+        &tmp,
+        signing_key.verifying_key(),
+    )
+    .unwrap();
     let km = mary::selection::load_keymap_from_graph(
         snapshot.facts(),
         snapshot.reader(),

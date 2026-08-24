@@ -97,7 +97,11 @@ impl Situ {
     /// sigmoid(·)`, division before multiplication), so the f32 rounding
     /// sequence matches the reference rather than merely the algebra.
     pub fn gate_branch<B: Backend, const D: usize>(&self, gate: Tensor<B, D>) -> Tensor<B, D> {
-        let clipped = gate.clone().div_scalar(self.beta).tanh().mul_scalar(self.beta);
+        let clipped = gate
+            .clone()
+            .div_scalar(self.beta)
+            .tanh()
+            .mul_scalar(self.beta);
         clipped * sigmoid(gate)
     }
 

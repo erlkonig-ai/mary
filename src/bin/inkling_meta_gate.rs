@@ -117,7 +117,9 @@ fn main() -> Result<()> {
         facts.len(),
         t0.elapsed().as_secs_f64()
     );
-    let reader = blobs.reader().map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
+    let reader = blobs
+        .reader()
+        .map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
     let bad = compare("memory", &docs, &facts, &reader)?;
     if bad == 0 {
         println!("PASS (in memory) — every sidecar round-trips exactly.");
@@ -201,7 +203,10 @@ fn compare(
         };
         let (a, b) = (serde_json::to_string(v)?, serde_json::to_string(&got)?);
         if a == b {
-            println!("  [{label}] {name}: identical ({} bytes canonical)", a.len());
+            println!(
+                "  [{label}] {name}: identical ({} bytes canonical)",
+                a.len()
+            );
         } else {
             println!("  [{label}] {name}: DIFFERS");
             println!("      first divergence at byte {}", first_diff(&a, &b));
@@ -274,7 +279,9 @@ fn reverse_arrays(v: &serde_json::Value) -> serde_json::Value {
             Value::Array(a)
         }
         Value::Object(o) => Value::Object(
-            o.iter().map(|(k, x)| (k.clone(), reverse_arrays(x))).collect(),
+            o.iter()
+                .map(|(k, x)| (k.clone(), reverse_arrays(x)))
+                .collect(),
         ),
         other => other.clone(),
     }

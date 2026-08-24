@@ -79,7 +79,12 @@ pub fn plan_out_scales(
     let round64 = |x: f64| -> usize { (x / 64.0).ceil() as usize * 64 };
     let hlast = *h.last().expect("patch_size must have a factor");
 
-    let mut scales = vec![Scale { t: 1, h: 1, w: 1, c: n_channels }];
+    let mut scales = vec![Scale {
+        t: 1,
+        h: 1,
+        w: 1,
+        c: n_channels,
+    }];
     for &hi in &h {
         scales.push(Scale {
             t: 1,
@@ -153,7 +158,16 @@ pub fn plan_out_scales(
                 used[c] = false;
             }
         }
-        rec(0, want, scales.len(), &mut used, &mut chosen, 0.0, &cost, &mut best);
+        rec(
+            0,
+            want,
+            scales.len(),
+            &mut used,
+            &mut chosen,
+            0.0,
+            &cost,
+            &mut best,
+        );
         best.expect("no assignment found").1
     };
 
@@ -211,8 +225,7 @@ fn erf(x: f32) -> f32 {
                         + t * (-0.18628806
                             + t * (0.27886807
                                 + t * (-1.13520398
-                                    + t * (1.48851587
-                                        + t * (-0.82215223 + t * 0.17087277)))))))))
+                                    + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))))
             .exp();
     let v = 1.0 - y;
     (if z >= 0.0 { v } else { -v }) as f32

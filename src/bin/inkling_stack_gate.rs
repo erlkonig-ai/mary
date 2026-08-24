@@ -39,7 +39,9 @@ fn read_f32(p: &std::path::Path) -> Result<Vec<f32>> {
 
 fn num(text: &str, key: &str) -> Result<f64> {
     let pat = format!("\"{key}\"");
-    let at = text.find(&pat).with_context(|| format!("manifest has no {key}"))?;
+    let at = text
+        .find(&pat)
+        .with_context(|| format!("manifest has no {key}"))?;
     let rest = &text[at + pat.len()..];
     let colon = rest.find(':').context("malformed manifest")?;
     let s: String = rest[colon + 1..]
@@ -47,7 +49,8 @@ fn num(text: &str, key: &str) -> Result<f64> {
         .skip_while(|c| c.is_whitespace())
         .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == 'e')
         .collect();
-    s.parse().with_context(|| format!("{key} is not a number: {s:?}"))
+    s.parse()
+        .with_context(|| format!("{key} is not a number: {s:?}"))
 }
 
 struct D {
@@ -62,7 +65,12 @@ impl D {
     }
 }
 fn cmp(a: &[f32], b: &[f32]) -> D {
-    let mut d = D { abs: 0.0, scale: 0.0, rel: 0.0, n: a.len().min(b.len()) };
+    let mut d = D {
+        abs: 0.0,
+        scale: 0.0,
+        rel: 0.0,
+        n: a.len().min(b.len()),
+    };
     for (&x, &y) in a.iter().zip(b) {
         let e = (x - y).abs();
         d.abs = d.abs.max(e);
@@ -73,8 +81,14 @@ fn cmp(a: &[f32], b: &[f32]) -> D {
 }
 fn report(label: &str, d: &D, checks: &mut usize, fails: &mut usize) {
     *checks += d.n;
-    println!("  {label}: {} values, worst abs {:e} / scale {:e} = {:e}, rel {:e}",
-             d.n, d.abs, d.scale, d.scaled(), d.rel);
+    println!(
+        "  {label}: {} values, worst abs {:e} / scale {:e} = {:e}, rel {:e}",
+        d.n,
+        d.abs,
+        d.scale,
+        d.scaled(),
+        d.rel
+    );
     if d.scaled() > BUDGET {
         println!("    FAIL  over budget {BUDGET:e}");
         *fails += 1;
@@ -82,8 +96,14 @@ fn report(label: &str, d: &D, checks: &mut usize, fails: &mut usize) {
 }
 
 fn main() -> Result<()> {
-    let ckpt = std::env::args().nth(1).map(PathBuf::from).context("usage: <ckpt> <oracle>")?;
-    let oracle = std::env::args().nth(2).map(PathBuf::from).context("usage: <ckpt> <oracle>")?;
+    let ckpt = std::env::args()
+        .nth(1)
+        .map(PathBuf::from)
+        .context("usage: <ckpt> <oracle>")?;
+    let oracle = std::env::args()
+        .nth(2)
+        .map(PathBuf::from)
+        .context("usage: <ckpt> <oracle>")?;
     let man = String::from_utf8(std::fs::read(oracle.join("stk_manifest.json"))?)?;
 
     let t = num(&man, "tokens")? as usize;
@@ -122,16 +142,27 @@ fn main() -> Result<()> {
     let en = cp.tensor("model.llm.embed_norm.weight")?.data;
     let raw_ref = read_f32(&oracle.join("stk_raw_embed.bin"))?;
     let emb_ref = read_f32(&oracle.join("stk_inputs_embeds.bin"))?;
-    anyhow::ensure!(!emb_ref.is_empty(), "no embedding reference — gate would be vacuous");
+    anyhow::ensure!(
+        !emb_ref.is_empty(),
+        "no embedding reference — gate would be vacuous"
+    );
 
     let raw = mary::models::inkling::stack::embed(&ids, &table, vocab, h);
     report("raw lookup", &cmp(&raw, &raw_ref), &mut checks, &mut fails);
     let embedded = embed_and_norm(&ids, &table, &en, eps, vocab, h);
-    report("after embed_norm", &cmp(&embedded, &emb_ref), &mut checks, &mut fails);
+    report(
+        "after embed_norm",
+        &cmp(&embedded, &emb_ref),
+        &mut checks,
+        &mut fails,
+    );
     // Non-vacuity: the norm must do something.
     let moved = cmp(&embedded, &raw);
     checks += 1;
-    println!("  embed_norm moves the embedding by {:e} absolute", moved.abs);
+    println!(
+        "  embed_norm moves the embedding by {:e} absolute",
+        moved.abs
+    );
     if moved.abs <= 0.0 {
         println!("  FAIL  embed_norm is inert here — skipping it would pass");
         fails += 1;
@@ -153,7 +184,12 @@ fn main() -> Result<()> {
     anyhow::ensure!(!logits_ref.is_empty(), "no logits reference");
 
     let logits = head(&hin, &fnorm, &unembed, mup, vocab, unpadded, eps, t, h);
-    report("logits", &cmp(&logits, &logits_ref), &mut checks, &mut fails);
+    report(
+        "logits",
+        &cmp(&logits, &logits_ref),
+        &mut checks,
+        &mut fails,
+    );
 
     checks += 1;
     let dropped = vocab - unpadded;
@@ -164,7 +200,10 @@ fn main() -> Result<()> {
     }
     let d_nomup = cmp(&logits, &logits_nomup);
     checks += 1;
-    println!("  vs logits computed WITHOUT the muP division: {:e} scale-relative", d_nomup.scaled());
+    println!(
+        "  vs logits computed WITHOUT the muP division: {:e} scale-relative",
+        d_nomup.scaled()
+    );
     if d_nomup.scaled() <= BUDGET {
         println!("  FAIL  the muP division changes nothing — dropping it would pass");
         fails += 1;
@@ -178,8 +217,15 @@ fn main() -> Result<()> {
     let after1_ref = read_f32(&oracle.join("stk_after1.bin"))?;
     let mask = causal_mask(t, Some(window));
     let dims = AttnDims {
-        hidden: h, heads, kv_heads, head_dim, d_rel, rel_extent, kernel,
-        rms_eps: eps, kind: AttnKind::Local,
+        hidden: h,
+        heads,
+        kv_heads,
+        head_dim,
+        d_rel,
+        rel_extent,
+        kernel,
+        rms_eps: eps,
+        kind: AttnKind::Local,
     };
     let ls = LogScaling { n_floor, alpha };
 
@@ -208,21 +254,47 @@ fn main() -> Result<()> {
         let (gate, up) = split_gate_up(&fused, h);
 
         let aw = AttnWeights {
-            wq: &wq, wk: &wk, wv: &wv, wr: &wr, wo: &wo,
-            k_sconv: &ks, v_sconv: &vs, q_norm: &qn, k_norm: &kn, rel_proj: &rp,
+            wq: &wq,
+            wk: &wk,
+            wv: &wv,
+            wr: &wr,
+            wo: &wo,
+            k_sconv: &ks,
+            v_sconv: &vs,
+            q_norm: &qn,
+            k_norm: &kn,
+            rel_proj: &rp,
         };
         let lw = LayerWeights {
-            attn_norm: &attn_norm, mlp_norm: &mlp_norm,
-            attn_sconv: &attn_sconv, mlp_sconv: &mlp_sconv,
+            attn_norm: &attn_norm,
+            mlp_norm: &mlp_norm,
+            attn_sconv: &attn_sconv,
+            mlp_sconv: &mlp_sconv,
         };
-        let mlp = LayerMlp { gate: &gate, up: &up, down: &down, global_scale: gscale[0], inter: di };
+        let mlp = LayerMlp {
+            gate: &gate,
+            up: &up,
+            down: &down,
+            global_scale: gscale[0],
+            inter: di,
+        };
         let out = decoder_layer(&hstate, &lw, &aw, &dims, Some(ls), &mlp, &mask, t);
         hstate = out;
         afters.push(hstate.clone());
     }
 
-    report("after layer 0", &cmp(&afters[0], &after0_ref), &mut checks, &mut fails);
-    report("after layer 1", &cmp(&afters[1], &after1_ref), &mut checks, &mut fails);
+    report(
+        "after layer 0",
+        &cmp(&afters[0], &after0_ref),
+        &mut checks,
+        &mut fails,
+    );
+    report(
+        "after layer 1",
+        &cmp(&afters[1], &after1_ref),
+        &mut checks,
+        &mut fails,
+    );
     let moved = cmp(&afters[1], &afters[0]);
     checks += 1;
     println!("  layer 1 moves the stream by {:e} absolute", moved.abs);
@@ -240,7 +312,9 @@ fn main() -> Result<()> {
     println!("\n=== verdict ===");
     println!("  checks: {checks}");
     if fails == 0 {
-        println!("GATE PASSED — {checks} checks, the text stack's ends and two composed layers match");
+        println!(
+            "GATE PASSED — {checks} checks, the text stack's ends and two composed layers match"
+        );
         Ok(())
     } else {
         println!("GATE FAILED — {checks} checks, {fails} FAILURES");

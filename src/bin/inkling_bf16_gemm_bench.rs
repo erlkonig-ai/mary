@@ -49,8 +49,14 @@ fn slab(n: usize, seed: f32) -> Vec<u8> {
 }
 
 fn main() -> Result<()> {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(30);
-    let m: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(MTILE);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    let m: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(MTILE);
     let client = Rt::client(&Default::default());
     // The hand lane's grid IS its tiling, so it needs m a multiple of 16. The
     // tuned lanes bounds-check their own tiles, so `m = 1` -- what a decode step
@@ -85,7 +91,10 @@ fn main() -> Result<()> {
         let a = client.create_from_slice(&slab(m * k, 0.3));
         let b = client.create_from_slice(&slab(n * k, 1.7));
 
-        println!("  {name} k {k:>5} n {n:>7}   ({:.1} MB of weight)", (n * k * 2) as f64 / 1e6);
+        println!(
+            "  {name} k {k:>5} n {n:>7}   ({:.1} MB of weight)",
+            (n * k * 2) as f64 / 1e6
+        );
         // The first lane that runs is the reference the rest are checked against,
         // over row 0 only.
         let mut reference: Option<Vec<f32>> = None;
@@ -174,11 +183,18 @@ fn main() -> Result<()> {
     for (lane, ms, _) in &ranked {
         println!("    {:<24} {ms:>9.2} ms", lane.name());
     }
-    let partial: Vec<_> = totals.iter().filter(|t| t.2 > 0 && t.2 < shapes.len()).collect();
+    let partial: Vec<_> = totals
+        .iter()
+        .filter(|t| t.2 > 0 && t.2 < shapes.len())
+        .collect();
     if !partial.is_empty() {
         println!("  (ran only some shapes, not comparable:)");
         for (lane, ms, c) in partial {
-            println!("    {:<24} {ms:>9.2} ms over {c}/{} shapes", lane.name(), shapes.len());
+            println!(
+                "    {:<24} {ms:>9.2} ms over {c}/{} shapes",
+                lane.name(),
+                shapes.len()
+            );
         }
     }
     Ok(())

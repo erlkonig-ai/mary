@@ -213,7 +213,11 @@ impl<B: Backend> K3DecoderLayer<B> {
     ) -> Self {
         let h = dims.hidden_size;
         assert_eq!(input_layernorm.dims()[0], h, "input_layernorm width");
-        assert_eq!(post_attention_layernorm.dims()[0], h, "post_attention_layernorm width");
+        assert_eq!(
+            post_attention_layernorm.dims()[0],
+            h,
+            "post_attention_layernorm width"
+        );
         assert_eq!(sa_res.hidden(), h, "self_attention_res site width");
         assert_eq!(mlp_res.hidden(), h, "mlp_res site width");
         let rms_norm_eps = dims.rms_norm_eps;
@@ -274,7 +278,10 @@ impl<B: Backend> K3DecoderLayer<B> {
         let [tokens, dh] = hidden.dims();
         assert_eq!(dh, self.hidden_size, "layer input width {dh}");
         assert!(tokens > 0, "layer forward over zero tokens");
-        assert!(batch > 0 && tokens % batch == 0, "{tokens} tokens, {batch} sequences");
+        assert!(
+            batch > 0 && tokens % batch == 0,
+            "{tokens} tokens, {batch} sequences"
+        );
         assert_eq!(
             mixer.layer(),
             self.layer_idx,
@@ -305,7 +312,8 @@ impl<B: Backend> K3DecoderLayer<B> {
                     .clone()
                     .reshape([batch, seq, self.hidden_size]);
                 let offset = c.len();
-                let mask = MlaBlock::<B>::causal_mask(batch, seq, offset + seq, offset, &x3.device());
+                let mask =
+                    MlaBlock::<B>::causal_mask(batch, seq, offset + seq, offset, &x3.device());
                 K3AttnTrace::Mla(Box::new(m.forward(x3, Some(mask), Some(c))))
             }
             (a, _) => panic!(
@@ -336,7 +344,8 @@ impl<B: Backend> K3DecoderLayer<B> {
                 expert,
             ))),
             K3Ffn::Dense(w) => K3FfnTrace::Dense(Box::new(
-                self.moe.shared_traced(post_attention_layernorm_out.clone(), w),
+                self.moe
+                    .shared_traced(post_attention_layernorm_out.clone(), w),
             )),
         };
 

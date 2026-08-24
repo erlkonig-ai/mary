@@ -27,8 +27,8 @@
 use anyhow::Result;
 
 use mary::models::inkling::fp4gemm::{f32_to_e4m3, quantize_act_host, GROUP};
-use mary::models::inkling::source::Weights;
 use mary::models::inkling::nvfp4::{e4m3_to_f32, FP4_E2M1};
+use mary::models::inkling::source::Weights;
 
 const LAYER: usize = 10;
 const E4M3_MAX: f32 = 448.0;
@@ -66,13 +66,21 @@ fn e2m1_code(q: f32) -> u8 {
     } else {
         7
     };
-    if q < 0.0 { m + 8 } else { m }
+    if q < 0.0 {
+        m + 8
+    } else {
+        m
+    }
 }
 
 /// Two-level quantisation. Returns (codes, scale bytes, global).
 fn quantize_two_level(x: &[f32], k: usize) -> (Vec<u8>, Vec<u8>, f32) {
     let amax_t = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    let global = if amax_t > 0.0 { amax_t / (FP4_MAX * E4M3_MAX) } else { 1.0 };
+    let global = if amax_t > 0.0 {
+        amax_t / (FP4_MAX * E4M3_MAX)
+    } else {
+        1.0
+    };
     let nblocks = x.len() / GROUP;
     let mut codes = vec![0u8; x.len() / 2];
     let mut scales = vec![0u8; nblocks];
@@ -232,8 +240,14 @@ fn main() -> Result<()> {
     println!(" real activations have; K=4096)\n");
     println!(
         "{:<10} {:>12} {:>12} {:>12} {:>12} {:>10} {:>12} {:>12}",
-        "expert", "1-lvl mean", "1-lvl max", "2-lvl mean", "2-lvl max", "improve",
-        "exact mean", "exact max"
+        "expert",
+        "1-lvl mean",
+        "1-lvl max",
+        "2-lvl mean",
+        "2-lvl max",
+        "improve",
+        "exact mean",
+        "exact max"
     );
 
     let mut tot1 = 0.0;
@@ -259,10 +273,22 @@ fn main() -> Result<()> {
         let (m4, _w4, _) = stats(&x, &d4);
         println!(
             "{:<10} {:>12.3e} {:>12.3e} {:>12.3e} {:>12.3e} {:>9.1}x  {:>12.3e} {:>12.3e}",
-            e, m1, w1, m2, w2v, m1 / m2, m3, w3
+            e,
+            m1,
+            w1,
+            m2,
+            w2v,
+            m1 / m2,
+            m3,
+            w3
         );
-        println!("{:<10} searched-scale mean {:.3e}   ({:.2}x better than 1-level, floor is {:.3e})",
-                 "", m4, m1 / m4, m3);
+        println!(
+            "{:<10} searched-scale mean {:.3e}   ({:.2}x better than 1-level, floor is {:.3e})",
+            "",
+            m4,
+            m1 / m4,
+            m3
+        );
         tot1 += m1;
         tot2 += m2;
         n += 1;
@@ -309,15 +335,23 @@ fn main() -> Result<()> {
         if bad == 0 {
             println!("  -> HOLDS: all {nonzero} non-zero blocks peak at code 7.");
         } else {
-            println!("  -> VIOLATED: {bad} non-zero blocks do not peak at code 7 (scale too large).");
+            println!(
+                "  -> VIOLATED: {bad} non-zero blocks do not peak at code 7 (scale too large)."
+            );
         }
     }
 
     println!();
     println!("block scales that fell into E4M3 SUBNORMALS (3 bits of precision or fewer):");
-    println!("  one level : {sub1} of {} ({:.1}%), of which {zero1} rounded to exactly zero",
-             s1.len(), 100.0 * sub1 as f64 / s1.len() as f64);
-    println!("  two level : {sub2} of {} ({:.1}%), of which {zero2} rounded to exactly zero",
-             s2.len(), 100.0 * sub2 as f64 / s2.len() as f64);
+    println!(
+        "  one level : {sub1} of {} ({:.1}%), of which {zero1} rounded to exactly zero",
+        s1.len(),
+        100.0 * sub1 as f64 / s1.len() as f64
+    );
+    println!(
+        "  two level : {sub2} of {} ({:.1}%), of which {zero2} rounded to exactly zero",
+        s2.len(),
+        100.0 * sub2 as f64 / s2.len() as f64
+    );
     Ok(())
 }

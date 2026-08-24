@@ -159,8 +159,7 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
         use std::collections::BTreeSet;
 
         let (_, ticket, reader) = snapshot.into_parts();
-        let expected_collection =
-            crate::model_collection::model_bundle_collection_handle(team);
+        let expected_collection = crate::model_collection::model_bundle_collection_handle(team);
         anyhow::ensure!(
             ticket
                 .iter()
@@ -174,7 +173,9 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
                 continue;
             }
             let token_blob: Blob<SimpleArchive> = reader
-                .get(inlineencodings::Handle::<SimpleArchive>::from_hash(commit.data()))
+                .get(inlineencodings::Handle::<SimpleArchive>::from_hash(
+                    commit.data(),
+                ))
                 .map_err(|error| anyhow!("read bundle token {}: {error}", commit.id()))?;
             let token = TribleSet::try_from_blob(token_blob)
                 .with_context(|| format!("decode bundle token {}", commit.id()))?;
@@ -195,10 +196,19 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
                 *fact.v::<inlineencodings::Handle<SimpleArchive>>(),
             );
             let source_blob: Blob<SimpleArchive> = reader
-                .get(inlineencodings::Handle::<SimpleArchive>::from_hash(model_archive_data))
-                .map_err(|error| anyhow!("read model archive H for bundle {}: {error}", commit.id()))?;
+                .get(inlineencodings::Handle::<SimpleArchive>::from_hash(
+                    model_archive_data,
+                ))
+                .map_err(|error| {
+                    anyhow!("read model archive H for bundle {}: {error}", commit.id())
+                })?;
             triblespace::core::collection::simplearchive_union::validate_element(&source_blob)
-                .map_err(|error| anyhow!("model archive H for bundle {} is not canonical: {error}", commit.id()))?;
+                .map_err(|error| {
+                    anyhow!(
+                        "model archive H for bundle {} is not canonical: {error}",
+                        commit.id()
+                    )
+                })?;
             let facts = TribleSet::try_from_blob(source_blob)
                 .with_context(|| format!("decode model archive H for bundle {}", commit.id()))?;
             anyhow::ensure!(
@@ -497,8 +507,11 @@ mod native_authority_tests {
         assert_eq!(first, repeated);
         assert_eq!(len_after_first, len_after_retry);
 
-        let snapshot = crate::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile, test_team())
-            .expect("freeze exact PersonaPlex prefix");
+        let snapshot = crate::model_collection::snapshot_model_bundle_collection_local_latest(
+            &mut pile,
+            test_team(),
+        )
+        .expect("freeze exact PersonaPlex prefix");
         let bundle = PersonaPlexWeights::from_bundle_snapshot(test_team(), snapshot)
             .expect("select exact PersonaPlex bundle");
         let authority = bundle.authority();
@@ -562,7 +575,11 @@ mod native_authority_tests {
     fn bundle_snapshot_cannot_be_relabelled_as_another_team() {
         let file = TestPile::new();
         let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
-        let fragment = model_fragment(&[("weight", &[1.0], &[1])], false, crate::leaf::Form::TwoBlob);
+        let fragment = model_fragment(
+            &[("weight", &[1.0], &[1])],
+            false,
+            crate::leaf::Form::TwoBlob,
+        );
         let root = fragment.root().unwrap();
         crate::model_collection::publish_model_bundle_fragment(
             &mut pile,
@@ -572,20 +589,16 @@ mod native_authority_tests {
             fragment,
         )
         .expect("publish PersonaPlex bundle");
-        let snapshot =
-            crate::model_collection::snapshot_model_bundle_collection_local_latest(
-                &mut pile,
-                test_team(),
-            )
-            .expect("freeze PersonaPlex bundle");
+        let snapshot = crate::model_collection::snapshot_model_bundle_collection_local_latest(
+            &mut pile,
+            test_team(),
+        )
+        .expect("freeze PersonaPlex bundle");
         let foreign_team = SigningKey::from_bytes(&[0x60; 32]).verifying_key();
         let error = PersonaPlexWeights::from_bundle_snapshot(foreign_team, snapshot)
             .err()
             .expect("foreign team must not be paired with the snapshot");
-        assert!(
-            error.to_string().contains("supplied team"),
-            "{error:#}"
-        );
+        assert!(error.to_string().contains("supplied team"), "{error:#}");
         pile.close().expect("close synthetic PersonaPlex pile");
     }
 
@@ -593,7 +606,11 @@ mod native_authority_tests {
     fn non_f32_exact_coordinate_fails_closed() {
         let file = TestPile::new();
         let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
-        let fragment = model_fragment(&[("weight", &[1.0], &[1])], true, crate::leaf::Form::TwoBlob);
+        let fragment = model_fragment(
+            &[("weight", &[1.0], &[1])],
+            true,
+            crate::leaf::Form::TwoBlob,
+        );
         let root = fragment.root().unwrap();
         crate::model_collection::publish_model_bundle_fragment(
             &mut pile,
@@ -603,8 +620,11 @@ mod native_authority_tests {
             fragment,
         )
         .expect("publish incompatible PersonaPlex root");
-        let snapshot = crate::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile, test_team())
-            .expect("freeze incompatible PersonaPlex prefix");
+        let snapshot = crate::model_collection::snapshot_model_bundle_collection_local_latest(
+            &mut pile,
+            test_team(),
+        )
+        .expect("freeze incompatible PersonaPlex prefix");
         let error = PersonaPlexWeights::from_bundle_snapshot(test_team(), snapshot)
             .err()
             .expect("f16 exact coordinate must fail");
@@ -685,7 +705,11 @@ mod native_authority_tests {
     fn conflicting_bundle_roots_fail_closed() {
         let file = TestPile::new();
         let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
-        let existing = model_fragment(&[("weight", &[1.0], &[1])], false, crate::leaf::Form::TwoBlob);
+        let existing = model_fragment(
+            &[("weight", &[1.0], &[1])],
+            false,
+            crate::leaf::Form::TwoBlob,
+        );
         let existing_root = existing.root().unwrap();
         let existing_commit = crate::model_collection::publish_model_bundle_fragment(
             &mut pile,
@@ -696,7 +720,11 @@ mod native_authority_tests {
         )
         .expect("publish existing PersonaPlex authority");
 
-        let candidate = model_fragment(&[("weight", &[2.0], &[1])], false, crate::leaf::Form::TwoBlob);
+        let candidate = model_fragment(
+            &[("weight", &[2.0], &[1])],
+            false,
+            crate::leaf::Form::TwoBlob,
+        );
         let candidate_root = candidate.root().unwrap();
         let candidate_commit = crate::model_collection::publish_model_bundle_fragment(
             &mut pile,
@@ -706,8 +734,11 @@ mod native_authority_tests {
             candidate,
         )
         .expect("publish conflicting PersonaPlex authority");
-        let snapshot = crate::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile, test_team())
-            .expect("freeze conflicting bundle authority");
+        let snapshot = crate::model_collection::snapshot_model_bundle_collection_local_latest(
+            &mut pile,
+            test_team(),
+        )
+        .expect("freeze conflicting bundle authority");
         let error = PersonaPlexWeights::from_bundle_snapshot(test_team(), snapshot)
             .err()
             .expect("conflicting Source/native roots must fail closed");
@@ -742,12 +773,11 @@ mod native_authority_tests {
                 fragment,
             )
             .expect("publish PersonaPlex root");
-            let snapshot =
-                crate::model_collection::snapshot_model_bundle_collection_local_latest(
-                    &mut pile,
-                    test_team(),
-                )
-                .expect("freeze PersonaPlex prefix");
+            let snapshot = crate::model_collection::snapshot_model_bundle_collection_local_latest(
+                &mut pile,
+                test_team(),
+            )
+            .expect("freeze PersonaPlex prefix");
             let bundle = PersonaPlexWeights::from_bundle_snapshot(test_team(), snapshot)
                 .unwrap_or_else(|e| panic!("{} bundle must select: {e:#}", form.label()));
             let weights = bundle.weights();

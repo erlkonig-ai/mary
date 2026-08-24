@@ -356,10 +356,8 @@ fn add_ln_kernel(
 
         let mut c3 = i;
         while c3 < d {
-            acts[(y_off + row * d + c3) as usize] = (acts[(hb + c3) as usize] - mean)
-                * inv
-                * lnw[c3 as usize]
-                + lnb[c3 as usize];
+            acts[(y_off + row * d + c3) as usize] =
+                (acts[(hb + c3) as usize] - mean) * inv * lnw[c3 as usize] + lnb[c3 as usize];
             c3 += cube_dim;
         }
     }
@@ -836,7 +834,13 @@ struct GpuConv {
 impl GpuConv {
     /// Load one causal convolution, transposing the shipped `[out, in, k]`
     /// weight into the `[out, k, in]` order the kernel reads coalesced.
-    fn load(client: &Client, loader: &WeightLoader, prefix: &str, stride: usize, bias: bool) -> Self {
+    fn load(
+        client: &Client,
+        loader: &WeightLoader,
+        prefix: &str,
+        stride: usize,
+        bias: bool,
+    ) -> Self {
         let (w, shape) = loader.load_host_f32(&format!("{prefix}.weight"));
         let (out, inc, k) = (shape[0], shape[1], shape[2]);
         let mut t = vec![0f32; out * inc * k];
@@ -903,8 +907,10 @@ impl GpuRvq {
         let mut norms_all = Vec::new();
         let mut rows = 0usize;
         for i in 0..n_q {
-            let (sum, _) = loader.load_f32(&format!("{prefix}.vq.layers.{i}._codebook.embedding_sum"));
-            let (usage, _) = loader.load_f32(&format!("{prefix}.vq.layers.{i}._codebook.cluster_usage"));
+            let (sum, _) =
+                loader.load_f32(&format!("{prefix}.vq.layers.{i}._codebook.embedding_sum"));
+            let (usage, _) =
+                loader.load_f32(&format!("{prefix}.vq.layers.{i}._codebook.cluster_usage"));
             let mut cb = sum;
             for (r, &u) in usage.iter().enumerate() {
                 let d = u.max(1e-5);
@@ -989,9 +995,27 @@ impl MimiEncoderGpu {
             .enumerate()
             .map(|(i, &r)| {
                 [
-                    GpuConv::load(&client, loader, &format!("{p}.{}.block.1.conv.conv", 3 * i + 1), 1, true),
-                    GpuConv::load(&client, loader, &format!("{p}.{}.block.3.conv.conv", 3 * i + 1), 1, true),
-                    GpuConv::load(&client, loader, &format!("{p}.{}.conv.conv", 3 * i + 3), r, true),
+                    GpuConv::load(
+                        &client,
+                        loader,
+                        &format!("{p}.{}.block.1.conv.conv", 3 * i + 1),
+                        1,
+                        true,
+                    ),
+                    GpuConv::load(
+                        &client,
+                        loader,
+                        &format!("{p}.{}.block.3.conv.conv", 3 * i + 1),
+                        1,
+                        true,
+                    ),
+                    GpuConv::load(
+                        &client,
+                        loader,
+                        &format!("{p}.{}.conv.conv", 3 * i + 3),
+                        r,
+                        true,
+                    ),
                 ]
             })
             .collect();
@@ -1003,8 +1027,16 @@ impl MimiEncoderGpu {
                 ln1_b: vecs(&client, loader, &format!("{t}.{i}.norm1.bias")),
                 ln2_w: vecs(&client, loader, &format!("{t}.{i}.norm2.weight")),
                 ln2_b: vecs(&client, loader, &format!("{t}.{i}.norm2.bias")),
-                in_proj: GpuConv::matmul(&client, loader, &format!("{t}.{i}.self_attn.in_proj_weight")),
-                out_proj: GpuConv::matmul(&client, loader, &format!("{t}.{i}.self_attn.out_proj.weight")),
+                in_proj: GpuConv::matmul(
+                    &client,
+                    loader,
+                    &format!("{t}.{i}.self_attn.in_proj_weight"),
+                ),
+                out_proj: GpuConv::matmul(
+                    &client,
+                    loader,
+                    &format!("{t}.{i}.self_attn.out_proj.weight"),
+                ),
                 fc1: GpuConv::matmul(&client, loader, &format!("{t}.{i}.linear1.weight")),
                 fc2: GpuConv::matmul(&client, loader, &format!("{t}.{i}.linear2.weight")),
                 ls1: vecs(&client, loader, &format!("{t}.{i}.layer_scale_1.scale")),
@@ -1190,8 +1222,7 @@ impl MimiEncoderGpu {
         let mut staging = Vec::with_capacity(6 + SAMPLES_PER_FRAME);
         staging.extend_from_slice(&self.tail);
         staging.extend_from_slice(samples);
-        self.tail
-            .copy_from_slice(&samples[SAMPLES_PER_FRAME - 6..]);
+        self.tail.copy_from_slice(&samples[SAMPLES_PER_FRAME - 6..]);
         let stage = cl.create_from_slice(as_bytes(&staging));
         let n = staging.len() as u32;
         unsafe {
@@ -1231,8 +1262,30 @@ impl MimiEncoderGpu {
             let ro = reg(self.r_block[bi][2]);
             // residual unit: elu fused into each conv's read, so neither
             // `elu(x)` nor `elu(res1)` is ever materialized.
-            self.conv(c1, rx.view(2), 0, r1.write(), rx.l, 0, true, false, false, false);
-            self.conv(c2, r1.view(0), 0, r2.write(), r1.l, 0, true, false, false, false);
+            self.conv(
+                c1,
+                rx.view(2),
+                0,
+                r1.write(),
+                rx.l,
+                0,
+                true,
+                false,
+                false,
+                false,
+            );
+            self.conv(
+                c2,
+                r1.view(0),
+                0,
+                r2.write(),
+                r1.l,
+                0,
+                true,
+                false,
+                false,
+                false,
+            );
             // downsample reads elu(x + res2) directly out of the two regions.
             let hist = cd.k - cd.stride;
             self.conv(
@@ -1349,7 +1402,18 @@ impl MimiEncoderGpu {
                     CUBE,
                 );
             }
-            self.conv(&layer.out_proj, attn, 0, proj, t, 0, false, false, false, false);
+            self.conv(
+                &layer.out_proj,
+                attn,
+                0,
+                proj,
+                t,
+                0,
+                false,
+                false,
+                false,
+                false,
+            );
             unsafe {
                 add_ln_kernel::launch_unchecked::<Rt>(
                     &cl,
@@ -1441,7 +1505,18 @@ impl MimiEncoderGpu {
         let res = reg(self.r_res).off;
         let mut q = 0u32;
         for bank in [&self.rvq_first, &self.rvq_rest] {
-            self.conv(&bank.input_proj, r_ds.write(), 0, res, 1, 0, false, false, false, false);
+            self.conv(
+                &bank.input_proj,
+                r_ds.write(),
+                0,
+                res,
+                1,
+                0,
+                false,
+                false,
+                false,
+                false,
+            );
             for qi in 0..bank.n_q {
                 let cb_off = qi * bank.rows * CODE_DIM as u32;
                 unsafe {
@@ -1611,7 +1686,10 @@ mod tests {
     fn lanes_are_powers_of_two_that_divide_a_cube() {
         for outputs in [1u32, 7, 1024, 2048, 8192, 61440, 122880] {
             let l = MimiEncoderGpu::lanes_for(outputs);
-            assert!(l.is_power_of_two() && (1..=32).contains(&l), "{outputs} -> {l}");
+            assert!(
+                l.is_power_of_two() && (1..=32).contains(&l),
+                "{outputs} -> {l}"
+            );
             assert_eq!(CUBE % l, 0);
         }
         // A tall-and-thin convolution splits its reduction; a wide one does not.

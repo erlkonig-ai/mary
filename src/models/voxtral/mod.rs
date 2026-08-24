@@ -478,9 +478,8 @@ mod tests {
             return;
         };
         let path = Path::new(&path);
-        let (_, snapshot) =
-            crate::model_collection::load_sole_model_collection_local_latest(path)
-                .expect("load configured native Voxtral collection");
+        let (_, snapshot) = crate::model_collection::load_sole_model_collection_local_latest(path)
+            .expect("load configured native Voxtral collection");
         let weights =
             VoxtralWeights::from_snapshot(snapshot).expect("select configured Voxtral cohort");
         assert_eq!(weights.counts(), (711, 711));

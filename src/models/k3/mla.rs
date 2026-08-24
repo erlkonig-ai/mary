@@ -294,7 +294,10 @@ pub struct MlaKvCache<B: Backend> {
 
 impl<B: Backend> MlaKvCache<B> {
     pub fn new() -> Self {
-        Self { key: None, value: None }
+        Self {
+            key: None,
+            value: None,
+        }
     }
 
     /// Tokens already cached.
@@ -417,14 +420,18 @@ impl<B: Backend> MlaTrace<B> {
             t_new,
             kd[2]
         );
-        let q_asm = self
-            .query_states
-            .clone()
-            .slice([0..qd[0], 0..qd[1], 0..qd[2], (qd[3] - self.carried)..qd[3]]);
-        let k_asm = self
-            .key_states
-            .clone()
-            .slice([0..kd[0], 0..kd[1], (kd[2] - t_new)..kd[2], (kd[3] - self.carried)..kd[3]]);
+        let q_asm = self.query_states.clone().slice([
+            0..qd[0],
+            0..qd[1],
+            0..qd[2],
+            (qd[3] - self.carried)..qd[3],
+        ]);
+        let k_asm = self.key_states.clone().slice([
+            0..kd[0],
+            0..kd[1],
+            (kd[2] - t_new)..kd[2],
+            (kd[3] - self.carried)..kd[3],
+        ]);
         let n = bit_identical(&q_asm, &self.q_carried_source, "query_states carried lane")
             + bit_identical(&k_asm, &self.k_carried_source, "key_states carried lane");
         assert!(n > 0, "carried-lane assertion compared zero elements");
@@ -449,7 +456,8 @@ impl<B: Backend> MlaTrace<B> {
                 .slice([0..b, 0..1, 0..t, from..to])
                 .repeat_dim(1, h)
         };
-        let all = |from: usize, to: usize| self.key_states.clone().slice([0..b, 0..h, 0..t, from..to]);
+        let all =
+            |from: usize, to: usize| self.key_states.clone().slice([0..b, 0..h, 0..t, from..to]);
 
         let carried_from = d - self.carried;
         let n = bit_identical(
@@ -538,7 +546,8 @@ impl<B: Backend> MlaBlock<B> {
 
     /// `kv_a_proj_with_mqa`: hidden → `[latent | carried]`, one tensor.
     pub fn kv_a_proj(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
-        self.precision.round(linear(hidden, &self.w.kv_a_proj_with_mqa))
+        self.precision
+            .round(linear(hidden, &self.w.kv_a_proj_with_mqa))
     }
 
     /// The first `kv_lora_rank` dims of `kv_a_proj_with_mqa`'s output — the
@@ -576,7 +585,14 @@ impl<B: Backend> MlaBlock<B> {
         let c = &self.cfg;
         let (h, qh, nope) = (c.num_heads, c.q_head_dim(), c.qk_nope_head_dim);
         let [b, t, w] = q_b_out.dims();
-        assert_eq!(w, h * qh, "q_b_proj output width {} != {} heads x {}", w, h, qh);
+        assert_eq!(
+            w,
+            h * qh,
+            "q_b_proj output width {} != {} heads x {}",
+            w,
+            h,
+            qh
+        );
         let q = q_b_out.reshape([b, t, h, qh]).swap_dims(1, 2);
         let pass = q.clone().slice([0..b, 0..h, 0..t, 0..nope]);
         let carried = q.slice([0..b, 0..h, 0..t, nope..qh]);
@@ -596,11 +612,22 @@ impl<B: Backend> MlaBlock<B> {
         kv_carried: Tensor<B, 3>,
     ) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 4>) {
         let c = &self.cfg;
-        let (h, nope, dv, carried) =
-            (c.num_heads, c.qk_nope_head_dim, c.v_head_dim, c.qk_carried_head_dim);
+        let (h, nope, dv, carried) = (
+            c.num_heads,
+            c.qk_nope_head_dim,
+            c.v_head_dim,
+            c.qk_carried_head_dim,
+        );
         let kvh = c.kv_b_head_dim();
         let [b, t, w] = kv_b_out.dims();
-        assert_eq!(w, h * kvh, "kv_b_proj output width {} != {} heads x {}", w, h, kvh);
+        assert_eq!(
+            w,
+            h * kvh,
+            "kv_b_proj output width {} != {} heads x {}",
+            w,
+            h,
+            kvh
+        );
         assert_eq!(kv_carried.dims(), [b, t, carried], "carried lane shape");
         let kv4 = kv_b_out.reshape([b, t, h, kvh]).swap_dims(1, 2);
         let k_pass = kv4.clone().slice([0..b, 0..h, 0..t, 0..nope]);
@@ -682,7 +709,12 @@ impl<B: Backend> MlaBlock<B> {
         let scores = self.attn_scores(q, k, mask);
         let (probs_precast, probs) = self.attn_probs(scores.clone());
         let attn_out_heads = self.attn_apply(probs.clone(), v);
-        AttnParts { scores, probs_precast, probs, attn_out_heads }
+        AttnParts {
+            scores,
+            probs_precast,
+            probs,
+            attn_out_heads,
+        }
     }
 
     /// `g_proj`: hidden → the pre-sigmoid output gate. `None` when the block
@@ -713,7 +745,11 @@ impl<B: Backend> MlaBlock<B> {
                 p.round(flat * p.round(sigmoid(g.clone())))
             }
             (None, false) => flat,
-            (g, gate) => panic!("output gate present: {} but config says {}", g.is_some(), gate),
+            (g, gate) => panic!(
+                "output gate present: {} but config says {}",
+                g.is_some(),
+                gate
+            ),
         }
     }
 
@@ -744,7 +780,11 @@ impl<B: Backend> MlaBlock<B> {
     ) -> MlaTrace<B> {
         let c = &self.cfg;
         let [b, t, dh] = hidden.dims();
-        assert_eq!(dh, c.hidden_size, "hidden width {} != config {}", dh, c.hidden_size);
+        assert_eq!(
+            dh, c.hidden_size,
+            "hidden width {} != config {}",
+            dh, c.hidden_size
+        );
         assert!(b > 0 && t > 0, "empty input: [{}, {}, {}]", b, t, dh);
 
         let q_a_proj_out = self.q_a_proj(hidden.clone());
@@ -868,7 +908,11 @@ fn rms_norm<B: Backend>(
     p: Precision,
 ) -> Tensor<B, 3> {
     let [_b, _t, d] = x.dims();
-    assert_eq!(weight.dims()[0], d, "rms_norm: weight width != activation width");
+    assert_eq!(
+        weight.dims()[0],
+        d,
+        "rms_norm: weight width != activation width"
+    );
     let [b, t, _] = x.dims();
     // Delegated to the one shared transcription rather than repeated here.
     //
@@ -974,7 +1018,9 @@ mod tests {
         let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
         (0..n)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 ((s >> 11) as f64 / (1u64 << 53) as f64) - 0.5
             })
             .collect()
@@ -989,7 +1035,10 @@ mod tests {
         let w = MlaWeights::<TB> {
             q_a_proj: t2(cfg.q_lora_rank.unwrap(), cfg.hidden_size, 1, dev),
             q_a_layernorm: Tensor::from_data(
-                TensorData::new(fill(cfg.q_lora_rank.unwrap(), 2), [cfg.q_lora_rank.unwrap()]),
+                TensorData::new(
+                    fill(cfg.q_lora_rank.unwrap(), 2),
+                    [cfg.q_lora_rank.unwrap()],
+                ),
                 dev,
             ),
             q_b_proj: t2(h * cfg.q_head_dim(), cfg.q_lora_rank.unwrap(), 3, dev),

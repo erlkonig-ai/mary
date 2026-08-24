@@ -57,7 +57,9 @@ type Rt = cubecl::cuda::CudaRuntime;
 
 fn read_f32(p: &PathBuf) -> Result<Vec<f32>> {
     let b = std::fs::read(p).with_context(|| format!("reading {}", p.display()))?;
-    Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    Ok(b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
 }
 
 fn read_f64(p: &PathBuf) -> Result<Vec<f64>> {
@@ -69,7 +71,9 @@ fn read_f64(p: &PathBuf) -> Result<Vec<f64>> {
 
 fn read_u16(p: &PathBuf) -> Result<Vec<u16>> {
     let b = std::fs::read(p).with_context(|| format!("reading {}", p.display()))?;
-    Ok(b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect())
+    Ok(b.chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect())
 }
 
 /// Worst absolute difference over the reference tensor's own scale.
@@ -115,7 +119,9 @@ fn main() -> Result<()> {
         .collect();
     let b = &man["budgets"];
     let b_gemm1 = b["gemm1_vs_f64"].as_f64().context("budget gemm1")?;
-    let b_gemm2 = b["gemm2_isolated_vs_f64"].as_f64().context("budget gemm2")?;
+    let b_gemm2 = b["gemm2_isolated_vs_f64"]
+        .as_f64()
+        .context("budget gemm2")?;
     let b_chain = b["chain_vs_f64"].as_f64().context("budget chain")?;
     let b_act = b["act_vs_torch"].as_f64().context("budget act")?;
     let b_flip = b["act_flip_fraction"].as_f64().context("budget flip")?;
@@ -145,7 +151,9 @@ fn main() -> Result<()> {
     );
     println!(
         "          the capture measured transformers(bf16) vs its own f64 arbiter at {:.3e}\n",
-        man["transformers_vs_f64_measured"].as_f64().unwrap_or(f64::NAN)
+        man["transformers_vs_f64_measured"]
+            .as_f64()
+            .unwrap_or(f64::NAN)
     );
 
     let x_f32 = read_f32(&oracle.join("bf16_x_f32.bin"))?;
@@ -156,7 +164,10 @@ fn main() -> Result<()> {
     let src = mary::models::inkling::source::Weights::open(&ckpt)?;
     let n13 = format!("model.llm.layers.{layer}.mlp.experts.w13_weight");
     let n2 = format!("model.llm.layers.{layer}.mlp.experts.w2_weight");
-    anyhow::ensure!(!src.is_nvfp4(&n13), "{n13} is packed NVFP4; layer {layer} should be BF16");
+    anyhow::ensure!(
+        !src.is_nvfp4(&n13),
+        "{n13} is packed NVFP4; layer {layer} should be BF16"
+    );
 
     let client = Rt::client(&Default::default());
 
@@ -180,8 +191,18 @@ fn main() -> Result<()> {
         let w_e = if mutate == "expert" { e + 1 } else { e };
         let w13 = src.expert_bf16(&n13, w_e)?;
         let w2 = src.expert_bf16(&n2, w_e)?;
-        anyhow::ensure!(w13.rows == 2 * inter && w13.cols == h, "w13 is {}x{}", w13.rows, w13.cols);
-        anyhow::ensure!(w2.rows == h && w2.cols == inter, "w2 is {}x{}", w2.rows, w2.cols);
+        anyhow::ensure!(
+            w13.rows == 2 * inter && w13.cols == h,
+            "w13 is {}x{}",
+            w13.rows,
+            w13.cols
+        );
+        anyhow::ensure!(
+            w2.rows == h && w2.cols == inter,
+            "w2 is {}x{}",
+            w2.rows,
+            w2.cols
+        );
 
         let w13_h = if mutate == "transpose" {
             // Square, so a transposed w13 loads without complaint and computes
@@ -201,12 +222,27 @@ fn main() -> Result<()> {
         };
         let w2_h = client.create_from_slice(&w2.bytes);
 
-        println!("expert {e}{}:", if w_e != e { format!(" (weights from {w_e})") } else { String::new() });
+        println!(
+            "expert {e}{}:",
+            if w_e != e {
+                format!(" (weights from {w_e})")
+            } else {
+                String::new()
+            }
+        );
         if let Some(al) = aliases.as_ref() {
             println!(
                 "  zero-copy binding         : w13 {}, w2 {}",
-                if al.slice(&w13.bytes).is_some() { "aliased" } else { "COPIED (alignment)" },
-                if al.slice(&w2.bytes).is_some() { "aliased" } else { "COPIED (alignment)" },
+                if al.slice(&w13.bytes).is_some() {
+                    "aliased"
+                } else {
+                    "COPIED (alignment)"
+                },
+                if al.slice(&w2.bytes).is_some() {
+                    "aliased"
+                } else {
+                    "COPIED (alignment)"
+                },
             );
         }
 
@@ -214,8 +250,10 @@ fn main() -> Result<()> {
         let (a_h, m_pad) = upload_bf16_act(&client, &x_f32, tokens, h);
         anyhow::ensure!(m_pad == tokens.div_ceil(MTILE) * MTILE, "m_pad {m_pad}");
         let a_back = client.read_one(a_h.clone()).expect("read a");
-        let a_bits: Vec<u16> =
-            a_back.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let a_bits: Vec<u16> = a_back
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
         let cast_bad = (0..tokens * h).filter(|&i| a_bits[i] != x_bits[i]).count();
         let pad_bad = (tokens * h..m_pad * h).filter(|&i| a_bits[i] != 0).count();
         println!(
@@ -230,7 +268,11 @@ fn main() -> Result<()> {
         let both_h = bf16_linear_launch(&client, &a_h, &w13_h, m_pad, h, 2 * inter);
         let both = f32::from_bytes(&client.read_one(both_h.clone()).expect("read both")).to_vec();
         let both_ref = read_f64(&oracle.join(format!("bf16_e{e}_both_f64.bin")))?;
-        anyhow::ensure!(both_ref.len() == tokens * 2 * inter, "both ref is {}", both_ref.len());
+        anyhow::ensure!(
+            both_ref.len() == tokens * 2 * inter,
+            "both ref is {}",
+            both_ref.len()
+        );
         let (d1, s1, at1) = scaled(&both[..tokens * 2 * inter], &both_ref);
         println!(
             "  GEMM 1  x @ w13^T         : {d1:.3e}  (budget {b_gemm1:.3e}, |ref|max {s1:.4e}, worst at {at1})"
@@ -240,8 +282,10 @@ fn main() -> Result<()> {
         // ---- the intermediate, bitwise -------------------------------------
         let act_h = gate_up_silu_bf16_launch(&client, &both_h, m_pad, inter);
         let act_back = client.read_one(act_h.clone()).expect("read act");
-        let act_bits: Vec<u16> =
-            act_back.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let act_bits: Vec<u16> = act_back
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
         let act_ref = read_u16(&oracle.join(format!("bf16_e{e}_act_bf16.bin")))?;
         let mut act_diff = 0usize;
         let mut act_worst_ulp = 0i64;
@@ -320,8 +364,13 @@ fn main() -> Result<()> {
         ok &= d4 <= b_tf;
 
         // ---- the padded rows -------------------------------------------------
-        let pad_max = y[tokens * h..m_pad * h].iter().fold(0.0f32, |a, v| a.max(v.abs()));
-        println!("  padded rows ({:2})          : max |value| {pad_max:e}", m_pad - tokens);
+        let pad_max = y[tokens * h..m_pad * h]
+            .iter()
+            .fold(0.0f32, |a, v| a.max(v.abs()));
+        println!(
+            "  padded rows ({:2})          : max |value| {pad_max:e}",
+            m_pad - tokens
+        );
         ok &= pad_max == 0.0;
     }
 

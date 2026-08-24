@@ -38,10 +38,10 @@
 use std::process::ExitCode;
 
 use mary::models::k3::kda::{
-    decay_gate, l2_normalize, rms_norm_gated, sigmoid, Elem, Kda, KdaConfig, KdaParams,
-    KdaScratch, KdaState, KdaToken, ShortConv, ShortConvState,
+    decay_gate, l2_normalize, rms_norm_gated, sigmoid, Elem, Kda, KdaConfig, KdaParams, KdaScratch,
+    KdaState, KdaToken, ShortConv, ShortConvState,
 };
-use mary::nn::npz::{Npz, NpyArray};
+use mary::nn::npz::{NpyArray, Npz};
 
 /// f64 port vs the float64 oracle arrays. Two independently-written float64
 /// implementations were measured to agree at 2e-17 (outputs) / 2e-16 (states);
@@ -69,8 +69,8 @@ const TOL_CHUNK: f64 = 5e-3;
 const MIN_CONTROL_GAP: f64 = 1e-2;
 
 fn main() -> ExitCode {
-    let dir = mary::paths::model(std::env::args().nth(1).as_deref(), "k3-oracle")
-        .unwrap_or_else(|e| {
+    let dir =
+        mary::paths::model(std::env::args().nth(1).as_deref(), "k3-oracle").unwrap_or_else(|e| {
             eprintln!("{e}");
             std::process::exit(2)
         });
@@ -145,7 +145,11 @@ fn compare<E: Elem>(mine: &[E], reference: &[f64]) -> Cmp {
         }
         refmax = refmax.max(r.abs());
     }
-    let rel = if refmax > 0.0 { maxabs / refmax } else { maxabs };
+    let rel = if refmax > 0.0 {
+        maxabs / refmax
+    } else {
+        maxabs
+    };
     Cmp {
         maxabs,
         refmax,
@@ -173,7 +177,13 @@ impl Report {
     }
 
     /// The port must match `reference` to `tol` relative.
-    fn expect_match<E: Elem>(&mut self, name: &str, mine: &[E], reference: &[f64], tol: f64) -> Cmp {
+    fn expect_match<E: Elem>(
+        &mut self,
+        name: &str,
+        mine: &[E],
+        reference: &[f64],
+        tol: f64,
+    ) -> Cmp {
         let cmp = compare(mine, reference);
         let pass = cmp.rel <= tol && cmp.rel.is_finite();
         println!(
@@ -311,16 +321,22 @@ fn check_shipping_config(r: &mut Report, config_json: &std::path::Path) {
     // Deliberately not a JSON dependency: these are unambiguous scalar fields
     // and a regex keeps the gate free of a parser whose own behaviour would
     // then need gating.
-    let field = |name: &str| -> Option<f64> {
-        regex_lite_find(&raw, name)
-    };
+    let field = |name: &str| -> Option<f64> { regex_lite_find(&raw, name) };
     let cfg = mary::models::k3::kda::KdaConfig::k3();
 
     let checks: [(&str, Option<f64>, f64); 4] = [
         ("num_heads", field("\"num_heads\""), cfg.num_heads as f64),
         ("head_dim", field("\"head_dim\""), cfg.head_k_dim as f64),
-        ("short_conv_kernel_size", field("\"short_conv_kernel_size\""), cfg.conv_kernel as f64),
-        ("gate_lower_bound", field("\"gate_lower_bound\""), cfg.gate_lower_bound.unwrap_or(f64::NAN)),
+        (
+            "short_conv_kernel_size",
+            field("\"short_conv_kernel_size\""),
+            cfg.conv_kernel as f64,
+        ),
+        (
+            "gate_lower_bound",
+            field("\"gate_lower_bound\""),
+            cfg.gate_lower_bound.unwrap_or(f64::NAN),
+        ),
     ];
     for (name, found, mine) in checks {
         match found {
@@ -357,7 +373,9 @@ fn regex_lite_find(raw: &str, quoted_name: &str) -> Option<f64> {
             let rest = &hay[i + quoted_name.len()..];
             let rest = rest.trim_start().strip_prefix(':')?.trim_start();
             let end = rest
-                .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e'))
+                .find(|c: char| {
+                    !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e')
+                })
                 .unwrap_or(rest.len());
             if let Ok(v) = rest[..end].parse::<f64>() {
                 return Some(v);
@@ -541,18 +559,30 @@ fn check_gate_sweep(r: &mut Report, kda: &Npz) {
     // sweep rather than asserted: retention is floored at e^-5 and never
     // reaches it, and the two branches are nowhere near each other.
     let floor = (-5.0f64).exp();
-    let ret_min = bounded64.iter().map(|g| g.exp()).fold(f64::INFINITY, f64::min);
+    let ret_min = bounded64
+        .iter()
+        .map(|g| g.exp())
+        .fold(f64::INFINITY, f64::min);
     let ret_max = bounded64.iter().map(|g| g.exp()).fold(0.0f64, f64::max);
     r.expect_true(
         "bounded retention exp(g) stays in (e^-5, 1)",
         ret_min >= floor && ret_max <= 1.0 && (ret_min - floor).abs() / floor < 1e-9,
-        &format!("min {:.17} (e^-5 = {:.17}), max {:.6}", ret_min, floor, ret_max),
+        &format!(
+            "min {:.17} (e^-5 = {:.17}), max {:.6}",
+            ret_min, floor, ret_max
+        ),
     );
-    let unbounded_min = softplus64.iter().map(|g| g.exp()).fold(f64::INFINITY, f64::min);
+    let unbounded_min = softplus64
+        .iter()
+        .map(|g| g.exp())
+        .fold(f64::INFINITY, f64::min);
     r.expect_true(
         "softplus branch would erase a channel outright",
         unbounded_min < 1e-30,
-        &format!("its min retention is {:.3e}, vs the bounded {:.3e}", unbounded_min, ret_min),
+        &format!(
+            "its min retention is {:.3e}, vs the bounded {:.3e}",
+            unbounded_min, ret_min
+        ),
     );
     // If the branches were close, taking the wrong one would be forgivable.
     r.expect_miss(
@@ -748,10 +778,19 @@ fn report_per_step<E: Elem>(
         }
     }
     if print_every > 1 {
-        println!("      ({} of {} steps shown; every step was compared)", t_n.div_ceil(print_every), t_n);
+        println!(
+            "      ({} of {} steps shown; every step was compared)",
+            t_n.div_ceil(print_every),
+            t_n
+        );
     }
     println!("      worst step t={} at rel {:.3e}", worst.0, worst.1);
-    r.expect_match(&format!("{} (max over all steps)", label), mine, reference, tol);
+    r.expect_match(
+        &format!("{} (max over all steps)", label),
+        mine,
+        reference,
+        tol,
+    );
 }
 
 fn check_recurrence(r: &mut Report, kda: &Npz, fla64: &Npz) {
@@ -765,7 +804,10 @@ fn check_recurrence(r: &mut Report, kda: &Npz, fla64: &Npz) {
         assert_eq!(shape[2], cfg.num_heads);
         assert_eq!(shape[3], cfg.head_k_dim);
         let every = if t_n > 32 { 16 } else { 1 };
-        println!("\n  -- {p} (B={b_n}, T={t_n}, HV={}, K=V={}) --", cfg.num_heads, cfg.head_k_dim);
+        println!(
+            "\n  -- {p} (B={b_n}, T={t_n}, HV={}, K=V={}) --",
+            cfg.num_heads, cfg.head_k_dim
+        );
 
         let params64 = KdaParams::new(
             &cfg,
@@ -957,15 +999,20 @@ fn check_state_layout_trap(r: &mut Report, kda: &Npz) {
     r.expect_miss(
         "NEGATIVE CONTROL: correct h0 must not match the WRONG-layout oracle",
         &o_right,
-        &kda.get("smallst_o_chunk_f32_vfirst_WRONG_h0_layout").to_f64(),
+        &kda.get("smallst_o_chunk_f32_vfirst_WRONG_h0_layout")
+            .to_f64(),
     );
     r.expect_match(
         "wrong h0 reproduces smallst_o_chunk_f32_vfirst_WRONG_h0_layout",
         &o_wrong,
-        &kda.get("smallst_o_chunk_f32_vfirst_WRONG_h0_layout").to_f64(),
+        &kda.get("smallst_o_chunk_f32_vfirst_WRONG_h0_layout")
+            .to_f64(),
         TOL_CHUNK,
     );
-    let gap = compare(&o_wrong, &o_right.iter().map(|&x| x as f64).collect::<Vec<f64>>());
+    let gap = compare(
+        &o_wrong,
+        &o_right.iter().map(|&x| x as f64).collect::<Vec<f64>>(),
+    );
     println!(
         "    the trap costs {:.3e} absolute on |o|max {:.3e} — {:.1}% relative",
         gap.maxabs,
@@ -1002,7 +1049,12 @@ fn check_short_conv(r: &mut Report, kda: &Npz) {
         );
         fin64[b * d_n * w_n..(b + 1) * d_n * w_n].copy_from_slice(st.as_slice());
     }
-    r.expect_match("f64 output vs conv_y_f64_ref", &y64, &kda.get("conv_y_f64_ref").to_f64(), TOL_F64);
+    r.expect_match(
+        "f64 output vs conv_y_f64_ref",
+        &y64,
+        &kda.get("conv_y_f64_ref").to_f64(),
+        TOL_F64,
+    );
     r.expect_match(
         "f64 cache vs conv_final_state_f64_ref (most-recent LAST)",
         &fin64,
@@ -1028,8 +1080,18 @@ fn check_short_conv(r: &mut Report, kda: &Npz) {
         );
         fin32[b * d_n * w_n..(b + 1) * d_n * w_n].copy_from_slice(st.as_slice());
     }
-    r.expect_match("f32 output vs fla ShortConvolution", &y32, &kda.get("conv_y_f32_fla_full").to_f64(), TOL_F32);
-    r.expect_match("f32 cache vs fla's returned cache", &fin32, &kda.get("conv_final_state_f32_fla_full").to_f64(), TOL_F32);
+    r.expect_match(
+        "f32 output vs fla ShortConvolution",
+        &y32,
+        &kda.get("conv_y_f32_fla_full").to_f64(),
+        TOL_F32,
+    );
+    r.expect_match(
+        "f32 cache vs fla's returned cache",
+        &fin32,
+        &kda.get("conv_final_state_f32_fla_full").to_f64(),
+        TOL_F32,
+    );
 
     // Prefill 12 + continue 4, and 4 single-token decode steps: the streaming
     // boundary, which is where a cache-ordering mistake actually bites.
@@ -1043,7 +1105,12 @@ fn check_short_conv(r: &mut Report, kda: &Npz) {
     for b in 0..b_n {
         let xb = &x32[b * t_n * d_n..(b + 1) * t_n * d_n];
         let mut st = ShortConvState::zeros(&conv32);
-        conv32.forward(&mut st, pre, xb, &mut y_pre[b * pre * d_n..(b + 1) * pre * d_n]);
+        conv32.forward(
+            &mut st,
+            pre,
+            xb,
+            &mut y_pre[b * pre * d_n..(b + 1) * pre * d_n],
+        );
         st_pre[b * d_n * w_n..(b + 1) * d_n * w_n].copy_from_slice(st.as_slice());
         // Continue from that cache, in one call and then step by step.
         let mut st_c = st.clone();
@@ -1057,17 +1124,51 @@ fn check_short_conv(r: &mut Report, kda: &Npz) {
         let mut st_s = st;
         for j in 0..cont {
             let o = (b * cont + j) * d_n;
-            conv32.step(&mut st_s, &xb[(pre + j) * d_n..(pre + j + 1) * d_n], &mut y_step[o..o + d_n]);
+            conv32.step(
+                &mut st_s,
+                &xb[(pre + j) * d_n..(pre + j + 1) * d_n],
+                &mut y_step[o..o + d_n],
+            );
             let dst = (j * b_n + b) * d_n * w_n;
             st_step[dst..dst + d_n * w_n].copy_from_slice(st_s.as_slice());
         }
     }
-    r.expect_match("prefill(12) output vs fla", &y_pre, &kda.get("conv_y_f32_fla_prefill12").to_f64(), TOL_F32);
-    r.expect_match("prefill(12) cache vs fla", &st_pre, &kda.get("conv_state_f32_fla_prefill12").to_f64(), TOL_F32);
-    r.expect_match("continue(4) output vs fla", &y_cont, &kda.get("conv_y_f32_fla_continue4").to_f64(), TOL_F32);
-    r.expect_match("continue(4) cache vs fla", &st_cont, &kda.get("conv_final_state_f32_fla_continue4").to_f64(), TOL_F32);
-    r.expect_match("stepwise(4) output vs fla decode path", &y_step, &kda.get("conv_y_f32_fla_stepwise4").to_f64(), TOL_F32);
-    r.expect_match("stepwise(4) per-step cache vs fla", &st_step, &kda.get("conv_state_f32_fla_stepwise4").to_f64(), TOL_F32);
+    r.expect_match(
+        "prefill(12) output vs fla",
+        &y_pre,
+        &kda.get("conv_y_f32_fla_prefill12").to_f64(),
+        TOL_F32,
+    );
+    r.expect_match(
+        "prefill(12) cache vs fla",
+        &st_pre,
+        &kda.get("conv_state_f32_fla_prefill12").to_f64(),
+        TOL_F32,
+    );
+    r.expect_match(
+        "continue(4) output vs fla",
+        &y_cont,
+        &kda.get("conv_y_f32_fla_continue4").to_f64(),
+        TOL_F32,
+    );
+    r.expect_match(
+        "continue(4) cache vs fla",
+        &st_cont,
+        &kda.get("conv_final_state_f32_fla_continue4").to_f64(),
+        TOL_F32,
+    );
+    r.expect_match(
+        "stepwise(4) output vs fla decode path",
+        &y_step,
+        &kda.get("conv_y_f32_fla_stepwise4").to_f64(),
+        TOL_F32,
+    );
+    r.expect_match(
+        "stepwise(4) per-step cache vs fla",
+        &st_step,
+        &kda.get("conv_state_f32_fla_stepwise4").to_f64(),
+        TOL_F32,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,7 +1237,10 @@ fn check_state_is_o1(r: &mut Report) {
         cfg.conv_kernel,
         &vec![0.1f64; cfg.num_heads * cfg.head_k_dim * cfg.conv_kernel],
     );
-    let (hk, hv) = (cfg.num_heads * cfg.head_k_dim, cfg.num_heads * cfg.head_v_dim);
+    let (hk, hv) = (
+        cfg.num_heads * cfg.head_k_dim,
+        cfg.num_heads * cfg.head_v_dim,
+    );
 
     let mut sizes = Vec::new();
     for &t_n in &[1usize, 16, 128, 1024] {
@@ -1145,7 +1249,9 @@ fn check_state_is_o1(r: &mut Report) {
         let mut scr = KdaScratch::new(&cfg);
         let (mut out, mut cout) = (vec![0.0f64; hv], vec![0.0f64; hk]);
         for t in 0..t_n {
-            let x: Vec<f64> = (0..hk).map(|i| ((i * 31 + t * 7) as f64 * 0.013).sin()).collect();
+            let x: Vec<f64> = (0..hk)
+                .map(|i| ((i * 31 + t * 7) as f64 * 0.013).sin())
+                .collect();
             conv.step(&mut cst, &x, &mut cout);
             kda.step(
                 &mut st,
@@ -1173,6 +1279,9 @@ fn check_state_is_o1(r: &mut Report) {
     r.expect_true(
         "state bytes constant across T = 1 .. 1024",
         flat && sizes[0].0 == cfg.state_elems() * 8,
-        &format!("{} B recurrent + {} B conv, unchanged", sizes[0].0, sizes[0].1),
+        &format!(
+            "{} B recurrent + {} B conv, unchanged",
+            sizes[0].0, sizes[0].1
+        ),
     );
 }

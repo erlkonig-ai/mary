@@ -295,5 +295,12 @@ pub fn plan_from_topk_launch<R: Runtime>(
             st as u32,
         )
     };
-    DevRowPlan { row_wgt, off13, off2, sc13, sc2, ids }
+    DevRowPlan {
+        row_wgt,
+        off13,
+        off2,
+        sc13,
+        sc2,
+        ids,
+    }
 }

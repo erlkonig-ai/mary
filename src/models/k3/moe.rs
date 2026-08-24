@@ -177,11 +177,11 @@ impl MoeDims {
                 cfg.num_expert_group, cfg.topk_group
             ));
         }
-        let moe_hidden_size = cfg
-            .routed_expert_hidden_size
-            .ok_or_else(|| "routed_expert_hidden_size is absent; this port is the LATENT MoE block \
+        let moe_hidden_size = cfg.routed_expert_hidden_size.ok_or_else(|| {
+            "routed_expert_hidden_size is absent; this port is the LATENT MoE block \
                             (routed_expert_down_proj / _up_proj) and has no non-latent path"
-                .to_string())?;
+                .to_string()
+        })?;
         Ok(Self {
             hidden_size: cfg.hidden_size,
             moe_hidden_size,
@@ -419,7 +419,11 @@ impl LatentMoe {
         assert_eq!(h, self.dims.hidden_size, "router input width");
         assert_eq!(hw, self.dims.hidden_size, "router weight width");
         assert_eq!(e, self.dims.num_experts, "router weight rows");
-        assert_eq!(w.bias.dims()[0], self.dims.num_experts, "router bias length");
+        assert_eq!(
+            w.bias.dims()[0],
+            self.dims.num_experts,
+            "router bias length"
+        );
 
         let logits = hidden.matmul(w.weight.clone().transpose());
         let scores = burn::tensor::activation::sigmoid(logits.clone());
@@ -431,7 +435,12 @@ impl LatentMoe {
             .convert::<f32>()
             .to_vec()
             .expect("scores_for_choice f32");
-        let sc: Vec<f32> = scores.clone().into_data().convert::<f32>().to_vec().expect("scores -> f32");
+        let sc: Vec<f32> = scores
+            .clone()
+            .into_data()
+            .convert::<f32>()
+            .to_vec()
+            .expect("scores -> f32");
 
         let k = self.dims.top_k;
         let mut topk_idx = Vec::with_capacity(tokens * k);
@@ -563,7 +572,10 @@ impl LatentMoe {
             let (toks, ws) = routing.tokens_for(id);
             debug_assert!(!toks.is_empty(), "touched_experts yielded an empty expert");
             let sel = Tensor::<B, 1, Int>::from_data(
-                TensorData::new(toks.iter().map(|&t| t as i64).collect::<Vec<_>>(), [toks.len()]),
+                TensorData::new(
+                    toks.iter().map(|&t| t as i64).collect::<Vec<_>>(),
+                    [toks.len()],
+                ),
                 &device,
             );
             let block = latent.clone().select(0, sel.clone());

@@ -87,11 +87,14 @@ fn main() {
     let dev: <Raw as burn::tensor::backend::BackendTypes>::Device = Default::default();
     // Weights come from the durable qwen3tts pile (same source as qwen3tts_say;
     // pile-vs-safetensors is bit-identical per qwen3tts_pile_test).
-    let pile = mary::paths::model(std::env::var("QWEN3TTS_PILE").ok().as_deref(), "qwen3tts.pile")
-        .unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(2)
-        });
+    let pile = mary::paths::model(
+        std::env::var("QWEN3TTS_PILE").ok().as_deref(),
+        "qwen3tts.pile",
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
     let loader = mary::persist::load_aliased_loader_from_pile(&pile, "talker_f16")
         .unwrap_or_else(|e| panic!("load qwen3tts pile {}: {e:?}", pile.display()));
     println!("loading talker (raw f32 backend)...");

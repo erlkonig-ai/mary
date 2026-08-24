@@ -257,9 +257,18 @@ pub fn banded_attention_launch<R: Runtime>(
     window: usize,
     scaling: f32,
 ) -> Handle {
-    assert!(tokens > 0 && heads > 0 && kv_heads > 0, "an empty attention has no band");
-    assert!(applies(heads, kv_heads, head_dim, window), "this shape is not banded here");
-    assert!(eff > 0, "the relative table must reach at least one distance");
+    assert!(
+        tokens > 0 && heads > 0 && kv_heads > 0,
+        "an empty attention has no band"
+    );
+    assert!(
+        applies(heads, kv_heads, head_dim, window),
+        "this shape is not banded here"
+    );
+    assert!(
+        eff > 0,
+        "the relative table must reach at least one distance"
+    );
     let q_elems = tokens * heads * head_dim;
     let kv_elems = tokens * kv_heads * head_dim;
     assert!(
@@ -419,12 +428,17 @@ mod device_tests {
     /// exercises it on every item.
     #[test]
     fn the_window_is_exactly_what_the_query_can_reach() {
-        for (tokens, heads, kv_heads, head_dim, window) in
-            [(40usize, 4usize, 2usize, 8usize, 8usize), (70, 8, 2, 16, 12), (11, 4, 2, 4, 5)]
-        {
+        for (tokens, heads, kv_heads, head_dim, window) in [
+            (40usize, 4usize, 2usize, 8usize, 8usize),
+            (70, 8, 2, 16, 12),
+            (11, 4, 2, 4, 5),
+        ] {
             let (q, k, v, rel, eff) = inputs(tokens, heads, kv_heads, head_dim, window);
-            let base = band(tokens, heads, kv_heads, head_dim, window, &q, &k, &v, &rel, eff);
-            let row = |o: &[f32], i: usize| o[i * heads * head_dim..(i + 1) * heads * head_dim].to_vec();
+            let base = band(
+                tokens, heads, kv_heads, head_dim, window, &q, &k, &v, &rel, eff,
+            );
+            let row =
+                |o: &[f32], i: usize| o[i * heads * head_dim..(i + 1) * heads * head_dim].to_vec();
 
             // The last query, and a key it cannot see.
             let last = tokens - 1;
@@ -437,8 +451,9 @@ mod device_tests {
                     kk[j * kv_heads * head_dim + c] += 0.75;
                     vv[j * kv_heads * head_dim + c] -= 0.75;
                 }
-                let got =
-                    band(tokens, heads, kv_heads, head_dim, window, &q, &kk, &vv, &rel, eff);
+                let got = band(
+                    tokens, heads, kv_heads, head_dim, window, &q, &kk, &vv, &rel, eff,
+                );
                 let moved = row(&got, last)
                     .into_iter()
                     .zip(row(&base, last))
@@ -467,10 +482,13 @@ mod device_tests {
     /// everywhere and a wrong SHAPE nowhere.
     #[test]
     fn a_kv_head_reaches_only_its_own_group() {
-        let (tokens, heads, kv_heads, head_dim, window) = (24usize, 8usize, 2usize, 16usize, 12usize);
+        let (tokens, heads, kv_heads, head_dim, window) =
+            (24usize, 8usize, 2usize, 16usize, 12usize);
         let groups = heads / kv_heads;
         let (q, k, v, rel, eff) = inputs(tokens, heads, kv_heads, head_dim, window);
-        let base = band(tokens, heads, kv_heads, head_dim, window, &q, &k, &v, &rel, eff);
+        let base = band(
+            tokens, heads, kv_heads, head_dim, window, &q, &k, &v, &rel, eff,
+        );
         // ONE key, not every key of the head. Adding the same constant to all of
         // a head's keys shifts every score by the same amount and the softmax
         // cancels it exactly -- a perturbation that leaves the answer alone for
@@ -483,17 +501,24 @@ mod device_tests {
                 kk[at * kv_heads * head_dim + c * head_dim + d] += 0.5;
                 vv[at * kv_heads * head_dim + c * head_dim + d] -= 0.5;
             }
-            let got = band(tokens, heads, kv_heads, head_dim, window, &q, &kk, &vv, &rel, eff);
+            let got = band(
+                tokens, heads, kv_heads, head_dim, window, &q, &kk, &vv, &rel, eff,
+            );
             for h in 0..heads {
                 let mine = h / groups == c;
                 let moved = (0..tokens)
-                    .flat_map(|i| (0..head_dim).map(move |d| i * heads * head_dim + h * head_dim + d))
+                    .flat_map(|i| {
+                        (0..head_dim).map(move |d| i * heads * head_dim + h * head_dim + d)
+                    })
                     .map(|o| (got[o] - base[o]).abs())
                     .fold(0f32, f32::max);
                 if mine {
                     assert!(moved > 1e-4, "head {h} shares KV head {c} and did not move");
                 } else {
-                    assert_eq!(moved, 0.0, "head {h} does not share KV head {c} but moved by {moved:e}");
+                    assert_eq!(
+                        moved, 0.0,
+                        "head {h} does not share KV head {c} but moved by {moved:e}"
+                    );
                 }
             }
         }
@@ -509,13 +534,22 @@ mod device_tests {
     /// only the capability harness can judge.
     #[test]
     fn inklings_shape_at_a_real_length_runs() {
-        let (tokens, heads, kv_heads, head_dim, window) = (1500usize, 32usize, 8usize, 128usize, 512usize);
+        let (tokens, heads, kv_heads, head_dim, window) =
+            (1500usize, 32usize, 8usize, 128usize, 512usize);
         let (q, k, v, rel, eff) = inputs(tokens, heads, kv_heads, head_dim, window);
-        let out = band(tokens, heads, kv_heads, head_dim, window, &q, &k, &v, &rel, eff);
+        let out = band(
+            tokens, heads, kv_heads, head_dim, window, &q, &k, &v, &rel, eff,
+        );
         assert_eq!(out.len(), tokens * heads * head_dim);
-        assert!(out.iter().all(|x| x.is_finite()), "the band produced a non-finite value");
+        assert!(
+            out.iter().all(|x| x.is_finite()),
+            "the band produced a non-finite value"
+        );
         let lo = out.iter().copied().fold(f32::INFINITY, f32::min);
         let hi = out.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        assert!(hi - lo > 1e-3, "every output is {lo}: the band computed nothing");
+        assert!(
+            hi - lo > 1e-3,
+            "every output is {lo}: the band computed nothing"
+        );
     }
 }

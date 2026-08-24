@@ -70,7 +70,10 @@ fn main() {
             eprintln!("[warn] weight pile has no `{k}` — load will likely panic");
         }
     }
-    println!("[weights] index opened in {:.1}s", t.elapsed().as_secs_f32());
+    println!(
+        "[weights] index opened in {:.1}s",
+        t.elapsed().as_secs_f32()
+    );
 
     // ---- input ----
     let (samples, sr) = wav::read_pcm16_mono(Path::new(&in_path));

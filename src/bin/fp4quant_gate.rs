@@ -99,7 +99,11 @@ impl Shard {
         file.read_exact(&mut buf).context("reading header")?;
         let header: serde_json::Value =
             serde_json::from_slice(&buf).context("parsing safetensors header")?;
-        Ok(Shard { file, data_start: 8 + n, header })
+        Ok(Shard {
+            file,
+            data_start: 8 + n,
+            header,
+        })
     }
 
     fn info(&self, name: &str) -> Result<(String, Vec<usize>, u64, u64)> {
@@ -115,7 +119,12 @@ impl Shard {
             .map(|v| v.as_u64().unwrap_or(0) as usize)
             .collect();
         let off = e["data_offsets"].as_array().context("data_offsets")?;
-        Ok((dtype, shape, off[0].as_u64().unwrap(), off[1].as_u64().unwrap()))
+        Ok((
+            dtype,
+            shape,
+            off[0].as_u64().unwrap(),
+            off[1].as_u64().unwrap(),
+        ))
     }
 
     fn read_at(&mut self, name: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
@@ -123,7 +132,8 @@ impl Shard {
         if offset + len as u64 > end - start {
             bail!("read of {len} at {offset} runs past tensor {name}");
         }
-        self.file.seek(SeekFrom::Start(self.data_start + start + offset))?;
+        self.file
+            .seek(SeekFrom::Start(self.data_start + start + offset))?;
         let mut buf = vec![0u8; len];
         self.file.read_exact(&mut buf)?;
         Ok(buf)
@@ -167,7 +177,10 @@ fn load_decoded_rows(dir: &Path, expert: usize, n: usize, k: usize) -> Result<(V
     let rows_per_expert = wshape[1];
     let bytes_per_row = wshape[2];
     if bytes_per_row * 2 < k {
-        bail!("requested k={k} exceeds stored row width {}", bytes_per_row * 2);
+        bail!(
+            "requested k={k} exceeds stored row width {}",
+            bytes_per_row * 2
+        );
     }
 
     let mut ss = Shard::open(&sp)?;
@@ -195,7 +208,11 @@ fn load_decoded_rows(dir: &Path, expert: usize, n: usize, k: usize) -> Result<(V
         if written != k {
             bail!("decode_row wrote {written} of {k}");
         }
-        out.push(Row { packed, scale_bytes: scales, decoded });
+        out.push(Row {
+            packed,
+            scale_bytes: scales,
+            decoded,
+        });
     }
     Ok((out, scale2))
 }
@@ -226,7 +243,10 @@ fn e4m3_ladder() -> Vec<f64> {
 /// does), and the tie rule falls out for free — the byte's low bit *is* the
 /// significand's low bit, so "ties to even significand" is "ties to even byte".
 fn e4m3_encode(v: f64, ladder: &[f64]) -> u8 {
-    assert!(v.is_finite() && v >= 0.0, "scale must be finite and non-negative, got {v}");
+    assert!(
+        v.is_finite() && v >= 0.0,
+        "scale must be finite and non-negative, got {v}"
+    );
     let v = v.min(E4M3_MAX as f64);
     let hi = ladder.partition_point(|&t| t < v);
     if hi == 0 {
@@ -334,7 +354,13 @@ fn host_quantize(x: &[f32], ladder: &[f64]) -> HostOut {
         }
     }
 
-    HostOut { codes, scales, scale_near_ties, code_near_ties, zero_scale_blocks }
+    HostOut {
+        codes,
+        scales,
+        scale_near_ties,
+        code_near_ties,
+        zero_scale_blocks,
+    }
 }
 
 #[inline]
@@ -423,13 +449,26 @@ fn peak_code_check(x: &[f32], codes: &[u32], scales: &[u8], blocks: usize) -> Pe
         let byte = scales[b];
         let (kind, want) = if byte == 0 {
             c.zero_scale += 1;
-            ("zero-scale", if peak == 0 && amax <= ZERO_SCALE_AMAX { None } else { Some("peak 0 and amax <= 3*2^-9") })
+            (
+                "zero-scale",
+                if peak == 0 && amax <= ZERO_SCALE_AMAX {
+                    None
+                } else {
+                    Some("peak 0 and amax <= 3*2^-9")
+                },
+            )
         } else if (byte >> 3) & 0x0F == 0 {
             c.subnormal += 1;
-            ("subnormal-scale", if peak >= 5 { None } else { Some("peak >= 5") })
+            (
+                "subnormal-scale",
+                if peak >= 5 { None } else { Some("peak >= 5") },
+            )
         } else {
             c.normal += 1;
-            ("normal-scale", if peak == 7 { None } else { Some("peak == 7") })
+            (
+                "normal-scale",
+                if peak == 7 { None } else { Some("peak == 7") },
+            )
         };
         if let Some(want) = want {
             c.violations += 1;
@@ -525,7 +564,9 @@ fn mutant_check(x: &[f32], ladder: &[f64]) -> bool {
         }
     }
 
-    println!("\n=== mutation control — the same data quantized with a 3x-too-large block scale ===");
+    println!(
+        "\n=== mutation control — the same data quantized with a 3x-too-large block scale ==="
+    );
     let flagged = !report_peak_check(&peak_code_check(x, &codes, &scales, blocks), blocks);
     println!(
         "  -> {}",
@@ -579,11 +620,15 @@ fn run_case(
     let host = host_quantize(x, ladder);
 
     // --- bitwise --------------------------------------------------------
-    let scale_diff: Vec<usize> = (0..blocks).filter(|&b| dev_scales[b] != host.scales[b]).collect();
+    let scale_diff: Vec<usize> = (0..blocks)
+        .filter(|&b| dev_scales[b] != host.scales[b])
+        .collect();
     let code_diff: Vec<usize> = (0..n)
         .filter(|&i| nibble(&dev_codes, i) != nibble(&host.codes, i))
         .collect();
-    let word_diff = (0..words).filter(|&w| dev_codes[w] != host.codes[w]).count();
+    let word_diff = (0..words)
+        .filter(|&w| dev_codes[w] != host.codes[w])
+        .count();
 
     println!(
         "  bitwise: scale bytes differing {} / {blocks}   code nibbles differing {} / {n}   \
@@ -631,7 +676,8 @@ fn run_case(
     let mut x_zero = 0usize;
     for i in 0..n {
         let b = i / GROUP;
-        let deq = FP4_E2M1[nibble(&dev_codes, i) as usize] as f64 * e4m3_to_f32(dev_scales[b]) as f64;
+        let deq =
+            FP4_E2M1[nibble(&dev_codes, i) as usize] as f64 * e4m3_to_f32(dev_scales[b]) as f64;
         let xv = x[i] as f64;
         let d = deq - xv;
         num += d * d;
@@ -680,7 +726,11 @@ fn run_case(
         "  -> device vs host reference: {}",
         if bitwise { "bit-identical" } else { "MISMATCH" }
     );
-    Verdict { ok: bitwise && peak_ok, dev_code_bytes, dev_scales }
+    Verdict {
+        ok: bitwise && peak_ok,
+        dev_code_bytes,
+        dev_scales,
+    }
 }
 
 /// Bitwise host-vs-device over a range of shapes, on slices of the same real
@@ -691,11 +741,7 @@ fn run_case(
 /// cube. The main cases are all exact multiples of the 256-thread cube, so
 /// without this the `blk < blocks` guard is never the thing that stops a
 /// thread, and an out-of-range write would go unnoticed.
-fn sweep(
-    src: &[f32],
-    ladder: &[f64],
-    client: &cubecl::client::ComputeClient<CudaRuntime>,
-) -> bool {
+fn sweep(src: &[f32], ladder: &[f64], client: &cubecl::client::ComputeClient<CudaRuntime>) -> bool {
     println!("\n=== shape sweep — bitwise, exercising the partial-cube tail ===");
     let shapes: [(usize, usize); 8] = [
         (1, 64),
@@ -735,7 +781,11 @@ fn sweep(
             blocks % 256,
             if same { "bit-identical" } else { "MISMATCH" },
             peak.hist[7],
-            if peak.violations == 0 { "" } else { " — INVARIANT VIOLATED" }
+            if peak.violations == 0 {
+                ""
+            } else {
+                " — INVARIANT VIOLATED"
+            }
         );
     }
     ok
@@ -852,10 +902,14 @@ fn main() -> Result<()> {
         let v = e4m3_to_f32(b as u8) as f64;
         let back = e4m3_encode(v, &ladder);
         if back != b as u8 {
-            bail!("host E4M3 encoder is not a left inverse of the decode: 0x{b:02X} -> 0x{back:02X}");
+            bail!(
+                "host E4M3 encoder is not a left inverse of the decode: 0x{b:02X} -> 0x{back:02X}"
+            );
         }
     }
-    println!("host E4M3 round-trip: all 127 non-negative finite patterns encode back to themselves");
+    println!(
+        "host E4M3 round-trip: all 127 non-negative finite patterns encode back to themselves"
+    );
 
     let (w, scale2) = load_decoded_rows(&dir, 0, SRC, K)?;
     let amax = w
@@ -869,7 +923,9 @@ fn main() -> Result<()> {
 
     let client = CudaRuntime::client(&Default::default());
 
-    let aligned: Vec<f32> = (0..ROWS).flat_map(|i| w[i].decoded.iter().copied()).collect();
+    let aligned: Vec<f32> = (0..ROWS)
+        .flat_map(|i| w[i].decoded.iter().copied())
+        .collect();
     let mut mixed: Vec<f32> = Vec::with_capacity(ROWS * K);
     for i in 0..ROWS {
         for j in 0..K {

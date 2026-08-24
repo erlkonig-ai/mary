@@ -64,7 +64,9 @@ fn read_f32(dir: &Path, name: &str) -> Result<Vec<f32>> {
 
 fn num(text: &str, key: &str) -> Result<f64> {
     let pat = format!("\"{key}\"");
-    let at = text.find(&pat).with_context(|| format!("manifest has no {key}"))?;
+    let at = text
+        .find(&pat)
+        .with_context(|| format!("manifest has no {key}"))?;
     let rest = &text[at + pat.len()..];
     let colon = rest.find(':').context("malformed manifest")?;
     let s: String = rest[colon + 1..]
@@ -72,7 +74,8 @@ fn num(text: &str, key: &str) -> Result<f64> {
         .skip_while(|c| c.is_whitespace())
         .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == 'e')
         .collect();
-    s.parse().with_context(|| format!("{key} is not a number: {s:?}"))
+    s.parse()
+        .with_context(|| format!("{key} is not a number: {s:?}"))
 }
 
 struct Diff {
@@ -87,7 +90,12 @@ impl Diff {
     }
 }
 fn compare(mine: &[f32], theirs: &[f32]) -> Diff {
-    let mut d = Diff { worst_abs: 0.0, scale: 0.0, worst_rel: 0.0, n: mine.len().min(theirs.len()) };
+    let mut d = Diff {
+        worst_abs: 0.0,
+        scale: 0.0,
+        worst_rel: 0.0,
+        n: mine.len().min(theirs.len()),
+    };
     for (&a, &b) in mine.iter().zip(theirs) {
         let abs = (a - b).abs();
         d.worst_abs = d.worst_abs.max(abs);
@@ -99,8 +107,14 @@ fn compare(mine: &[f32], theirs: &[f32]) -> Diff {
 
 fn report(label: &str, d: &Diff, checks: &mut usize, fails: &mut usize) {
     *checks += d.n;
-    println!("  {label}: {} values, worst abs {:e} / scale {:e} = {:e}, rel {:e}",
-             d.n, d.worst_abs, d.scale, d.scaled(), d.worst_rel);
+    println!(
+        "  {label}: {} values, worst abs {:e} / scale {:e} = {:e}, rel {:e}",
+        d.n,
+        d.worst_abs,
+        d.scale,
+        d.scaled(),
+        d.worst_rel
+    );
     if d.scaled() > BUDGET {
         println!("    FAIL  over budget {BUDGET:e}");
         *fails += 1;
@@ -142,13 +156,19 @@ fn main() -> Result<()> {
     let dn = read_f32(&dir, "lyr_mlp_down_proj_weight.bin")?;
     let y = read_f32(&dir, "lyr_mlp_y.bin")?;
     let y_noscale = read_f32(&dir, "lyr_mlp_y_noscale.bin")?;
-    anyhow::ensure!(!y.is_empty(), "no dense-MLP reference — the gate would be vacuous");
+    anyhow::ensure!(
+        !y.is_empty(),
+        "no dense-MLP reference — the gate would be vacuous"
+    );
     let mine = dense_mlp(&x, &g, &u, &dn, mlp_gs, t, h, di);
     report("dense mlp", &compare(&mine, &y), &mut checks, &mut fails);
     // global_scale must matter.
     let d_ns = compare(&mine, &y_noscale);
     checks += 1;
-    println!("  vs the same answer without global_scale: {:e}", d_ns.scaled());
+    println!(
+        "  vs the same answer without global_scale: {:e}",
+        d_ns.scaled()
+    );
     if d_ns.scaled() <= BUDGET {
         println!("    FAIL  global_scale changes nothing — dropping it would pass");
         fails += 1;
@@ -159,8 +179,15 @@ fn main() -> Result<()> {
     // ---- decoder layers ----------------------------------------------------
     let mask = causal_mask(t, Some(window));
     let dims = AttnDims {
-        hidden: h, heads, kv_heads, head_dim, d_rel, rel_extent, kernel,
-        rms_eps: eps, kind: AttnKind::Local,
+        hidden: h,
+        heads,
+        kv_heads,
+        head_dim,
+        d_rel,
+        rel_extent,
+        kernel,
+        rms_eps: eps,
+        kind: AttnKind::Local,
     };
     let ls = LogScaling { n_floor, alpha };
 
@@ -188,18 +215,42 @@ fn main() -> Result<()> {
         anyhow::ensure!(!y_ref.is_empty(), "{tag}: no reference output");
 
         let aw = AttnWeights {
-            wq: &wq, wk: &wk, wv: &wv, wr: &wr, wo: &wo,
-            k_sconv: &ks, v_sconv: &vs, q_norm: &qn, k_norm: &kn, rel_proj: &rp,
+            wq: &wq,
+            wk: &wk,
+            wv: &wv,
+            wr: &wr,
+            wo: &wo,
+            k_sconv: &ks,
+            v_sconv: &vs,
+            q_norm: &qn,
+            k_norm: &kn,
+            rel_proj: &rp,
         };
-        let lw = LayerWeights { attn_norm: &attn_norm, mlp_norm: &mlp_norm, attn_sconv: &attn_sconv, mlp_sconv: &mlp_sconv };
+        let lw = LayerWeights {
+            attn_norm: &attn_norm,
+            mlp_norm: &mlp_norm,
+            attn_sconv: &attn_sconv,
+            mlp_sconv: &mlp_sconv,
+        };
 
         let lg = read_f32(&dir, &p("mlp_gate_proj_weight"))?;
         let lu = read_f32(&dir, &p("mlp_up_proj_weight"))?;
         let ld = read_f32(&dir, &p("mlp_down_proj_weight"))?;
-        let mlp = LayerMlp { gate: &lg, up: &lu, down: &ld, global_scale: dense_gs, inter: di };
+        let mlp = LayerMlp {
+            gate: &lg,
+            up: &lu,
+            down: &ld,
+            global_scale: dense_gs,
+            inter: di,
+        };
 
         let mine = decoder_layer(&x, &lw, &aw, &dims, Some(ls), &mlp, &mask, t);
-        report(&format!("{tag} layer"), &compare(&mine, &y_ref), &mut checks, &mut fails);
+        report(
+            &format!("{tag} layer"),
+            &compare(&mine, &y_ref),
+            &mut checks,
+            &mut fails,
+        );
     }
 
     println!("\n=== verdict ===");

@@ -39,7 +39,12 @@ fn params_per_step() -> usize {
     SHAPES.iter().map(|(o, i)| o * i).sum::<usize>() * LAYERS
 }
 
-fn bench(rounds: usize, steps: usize, mut submit: impl FnMut(), mut sync: impl FnMut()) -> (f64, f64) {
+fn bench(
+    rounds: usize,
+    steps: usize,
+    mut submit: impl FnMut(),
+    mut sync: impl FnMut(),
+) -> (f64, f64) {
     for _ in 0..3 {
         submit();
         sync();
@@ -66,7 +71,13 @@ fn bench(rounds: usize, steps: usize, mut submit: impl FnMut(), mut sync: impl F
 }
 
 /// The moshi_q4_probe chain, verbatim, generic over backend.
-fn chain<B: Backend>(device: &B::Device, rounds: usize, steps: usize, m: usize, transposed: bool) -> (f64, f64) {
+fn chain<B: Backend>(
+    device: &B::Device,
+    rounds: usize,
+    steps: usize,
+    m: usize,
+    transposed: bool,
+) -> (f64, f64) {
     // `transposed`: store weights [out, in] and hand `matmul` a swap_dims view,
     // so cubek sees MildlyPermuted{transposed} rhs (its "col major vecmat",
     // PRIORITY_MAX in the gemv tune group) instead of a Contiguous rhs (the
@@ -77,7 +88,8 @@ fn chain<B: Backend>(device: &B::Device, rounds: usize, steps: usize, m: usize, 
                 .iter()
                 .map(|&(o, i)| {
                     if transposed {
-                        Tensor::<B, 2>::random([o, i], Distribution::Uniform(-0.01, 0.01), device).transpose()
+                        Tensor::<B, 2>::random([o, i], Distribution::Uniform(-0.01, 0.01), device)
+                            .transpose()
                     } else {
                         Tensor::<B, 2>::random([i, o], Distribution::Uniform(-0.01, 0.01), device)
                     }
@@ -104,18 +116,35 @@ fn chain<B: Backend>(device: &B::Device, rounds: usize, steps: usize, m: usize, 
             *last.borrow_mut() = Some(x);
         },
         || {
-            let _ = last.borrow().as_ref().unwrap().clone().into_data().convert::<f32>().to_vec::<f32>().unwrap();
+            let _ = last
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .clone()
+                .into_data()
+                .convert::<f32>()
+                .to_vec::<f32>()
+                .unwrap();
         },
     )
 }
 
 /// One shape, repeated `reps` times with independent weights (so it streams
 /// `reps` distinct weight copies, not a cached one), M rows.
-fn single_shape<B: Backend>(device: &B::Device, out: usize, inn: usize, reps: usize, m: usize, rounds: usize, transposed: bool) -> f64 {
+fn single_shape<B: Backend>(
+    device: &B::Device,
+    out: usize,
+    inn: usize,
+    reps: usize,
+    m: usize,
+    rounds: usize,
+    transposed: bool,
+) -> f64 {
     let ws: Vec<Tensor<B, 2>> = (0..reps)
         .map(|_| {
             if transposed {
-                Tensor::<B, 2>::random([out, inn], Distribution::Uniform(-0.01, 0.01), device).transpose()
+                Tensor::<B, 2>::random([out, inn], Distribution::Uniform(-0.01, 0.01), device)
+                    .transpose()
             } else {
                 Tensor::<B, 2>::random([inn, out], Distribution::Uniform(-0.01, 0.01), device)
             }
@@ -138,7 +167,15 @@ fn single_shape<B: Backend>(device: &B::Device, out: usize, inn: usize, reps: us
             *last.borrow_mut() = acc;
         },
         || {
-            let _ = last.borrow().as_ref().unwrap().clone().into_data().convert::<f32>().to_vec::<f32>().unwrap();
+            let _ = last
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .clone()
+                .into_data()
+                .convert::<f32>()
+                .to_vec::<f32>()
+                .unwrap();
         },
     );
     f
@@ -176,20 +213,40 @@ fn report<B: Backend>(name: &str, device: &B::Device, rounds: usize, steps: usiz
 }
 
 fn main() {
-    let rounds: usize = std::env::var("Q4_ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
-    let steps: usize = std::env::var("Q4_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+    let rounds: usize = std::env::var("Q4_ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let steps: usize = std::env::var("Q4_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
     let which = std::env::var("BACKENDS").unwrap_or_else(|_| "wgpu,cuda".into());
     println!("backend_matmul_probe — {rounds} rounds x {steps} steps, min-of-medians");
-    println!("params/step {:.2}G, f16 {:.2} GB/step", params_per_step() as f64 / 1e9, params_per_step() as f64 * 2.0 / 1e9);
+    println!(
+        "params/step {:.2}G, f16 {:.2} GB/step",
+        params_per_step() as f64 / 1e9,
+        params_per_step() as f64 * 2.0 / 1e9
+    );
 
     if which.contains("wgpu") {
         type W = burn::backend::Metal<half::f16>;
         let d: <W as BackendTypes>::Device = Default::default();
-        report::<W>("burn Wgpu<f16>  (BHalf — what moshi_q4_probe measures)", &d, rounds, steps);
+        report::<W>(
+            "burn Wgpu<f16>  (BHalf — what moshi_q4_probe measures)",
+            &d,
+            rounds,
+            steps,
+        );
     }
     if which.contains("cuda") {
         type C = burn::backend::Cuda<half::f16>;
         let d: <C as BackendTypes>::Device = Default::default();
-        report::<C>("burn Cuda<f16>  (burn's real CUDA backend)", &d, rounds, steps);
+        report::<C>(
+            "burn Cuda<f16>  (burn's real CUDA backend)",
+            &d,
+            rounds,
+            steps,
+        );
     }
 }

@@ -196,13 +196,8 @@ pub fn tensor_strided3(
     // Built contiguous and then told the truth about its strides. Naming
     // `Metadata` here would mean depending on `burn-std` for one type; the
     // field is public and this is the same two words.
-    let mut c = CubeTensor::<CudaRuntime>::new_contiguous(
-        client,
-        device,
-        shape.into(),
-        handle,
-        DType::F32,
-    );
+    let mut c =
+        CubeTensor::<CudaRuntime>::new_contiguous(client, device, shape.into(), handle, DType::F32);
     c.meta.strides = strides.into();
     Tensor::from_primitive(TensorPrimitive::Float(c))
 }
@@ -274,7 +269,8 @@ pub fn pool_reserved(client: &ComputeClient<CudaRuntime>) -> u64 {
 pub fn pool_line(client: &ComputeClient<CudaRuntime>, at: &str) -> String {
     const GIB: f64 = (1u64 << 30) as f64;
     match client.memory_usage() {
-        Ok(u) => format!(
+        Ok(u) => {
+            format!(
             "    pool[{at}]: {:.2} GiB reserved, {:.2} live, {:.2} padding, {:.2} GiB STRANDED \
              over {} slices",
             u.bytes_reserved as f64 / GIB,
@@ -282,7 +278,8 @@ pub fn pool_line(client: &ComputeClient<CudaRuntime>, at: &str) -> String {
             u.bytes_padding as f64 / GIB,
             u.bytes_reserved.saturating_sub(u.bytes_in_use + u.bytes_padding) as f64 / GIB,
             u.number_allocs,
-        ),
+        )
+        }
         Err(e) => format!("    pool[{at}]: unavailable ({e:?})"),
     }
 }

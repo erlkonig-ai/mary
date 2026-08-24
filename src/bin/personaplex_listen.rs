@@ -41,12 +41,12 @@ use std::path::Path;
 use std::time::Instant;
 
 use mary::models::f5::wav;
+use mary::models::personaplex::config as cfg;
 use mary::models::personaplex::mimi::config as mimi_cfg;
 use mary::models::personaplex::pipeline::{agent_codes, RealtimePipeline, SILENCE};
 use mary::models::personaplex::prompt::{wrap_with_system_tags, Prompt};
 use mary::models::personaplex::sampling::SamplingConfig;
 use mary::models::personaplex::temporal_metal::WeightFmt;
-use mary::models::personaplex::config as cfg;
 
 // The model files are named, not located: positional argument, else the
 // matching environment variable, else `$MARY_MODELS/<name>`. The user clip is
@@ -60,7 +60,10 @@ const SYSTEM_TEXT: &str = "You are a helpful assistant. You speak with a warm, \
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let fmt_s = a.get(1).cloned().unwrap_or_else(|| "q4".into());
-    let out = a.get(2).cloned().unwrap_or_else(|| "/tmp/personaplex_listen.wav".into());
+    let out = a
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| "/tmp/personaplex_listen.wav".into());
     let frames: usize = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(125);
     // positional > environment > relative default
     let pick = |arg: Option<&String>, env: &str, default: &str| -> String {
@@ -94,7 +97,10 @@ fn main() {
     println!("pile   : {pile}");
     println!("voice  : {voice_pt}");
     println!("user   : {user_wav}");
-    println!("frames : {frames}  ({:.1} s at 12.5 Hz)", frames as f64 / 12.5);
+    println!(
+        "frames : {frames}  ({:.1} s at 12.5 Hz)",
+        frames as f64 / 12.5
+    );
 
     let t0 = Instant::now();
     let source = mary::persist::personaplex_bundle(Path::new(&pile))
@@ -113,7 +119,14 @@ fn main() {
         pipe.set_greedy();
         println!("decode : greedy — deterministic, so only the weights differ");
     } else {
-        pipe.set_sampling(SamplingConfig { temp: 0.8, top_k: 250, top_p: 0.95 }, 1234_5678_u64);
+        pipe.set_sampling(
+            SamplingConfig {
+                temp: 0.8,
+                top_k: 250,
+                top_p: 0.95,
+            },
+            1234_5678_u64,
+        );
         println!("decode : sampling temp 0.8 top_k 250 top_p 0.95, seed fixed");
     }
     println!("loaded : {:.1}s", t0.elapsed().as_secs_f64());
@@ -128,21 +141,43 @@ fn main() {
     // Compare against TEXT_CARD, not TEXT_VOCAB: TEXT_VOCAB = TEXT_CARD + 1,
     // the extra slot being the initial/ungenerated marker (same pattern the
     // audio streams use with 2048). The tokenizer supplies TEXT_CARD pieces.
-    println!("spm    : vocab {vs} (model TEXT_CARD {}, TEXT_VOCAB {})", cfg::TEXT_CARD, cfg::TEXT_VOCAB);
-    assert_eq!(vs, cfg::TEXT_CARD,
-               "tokenizer vocab {vs} != TEXT_CARD {} — WRONG TOKENIZER, prompts would be garbage",
-               cfg::TEXT_CARD);
+    println!(
+        "spm    : vocab {vs} (model TEXT_CARD {}, TEXT_VOCAB {})",
+        cfg::TEXT_CARD,
+        cfg::TEXT_VOCAB
+    );
+    assert_eq!(
+        vs,
+        cfg::TEXT_CARD,
+        "tokenizer vocab {vs} != TEXT_CARD {} — WRONG TOKENIZER, prompts would be garbage",
+        cfg::TEXT_CARD
+    );
 
-    let prompt = Prompt::build(Path::new(&voice_pt), &spm, &wrap_with_system_tags(SYSTEM_TEXT));
-    println!("prompt : {} voice frames + {} text tokens, {} total steps",
-             prompt.voice.n_frames, prompt.text_tokens.len(), prompt.total_steps());
+    let prompt = Prompt::build(
+        Path::new(&voice_pt),
+        &spm,
+        &wrap_with_system_tags(SYSTEM_TEXT),
+    );
+    println!(
+        "prompt : {} voice frames + {} text tokens, {} total steps",
+        prompt.voice.n_frames,
+        prompt.text_tokens.len(),
+        prompt.total_steps()
+    );
     pipe.run_prompt(&prompt);
 
     // Mimi-encode the user turn. Without this the agent has nothing to reply to.
     let (mut samples, sr) = wav::read_pcm16_mono(Path::new(&user_wav));
-    assert_eq!(sr, mimi_cfg::SAMPLE_RATE as u32, "user wav must be {} Hz", mimi_cfg::SAMPLE_RATE);
+    assert_eq!(
+        sr,
+        mimi_cfg::SAMPLE_RATE as u32,
+        "user wav must be {} Hz",
+        mimi_cfg::SAMPLE_RATE
+    );
     let need = frames * mimi_cfg::SAMPLES_PER_FRAME;
-    if samples.len() < need { samples.resize(need, 0.0); }
+    if samples.len() < need {
+        samples.resize(need, 0.0);
+    }
     samples.truncate(need);
     let user_codes = pipe.encoder.encode(&samples);
     // Hand the floor over after a short turn. Without this the model keeps
@@ -179,17 +214,29 @@ fn main() {
         let u: HashSet<_> = user_codes.iter().take(frames).map(|c| c[0]).collect();
         let a0: HashSet<_> = agent.iter().map(|c| c[0]).collect();
         let all_same = agent.windows(2).all(|w| w[0] == w[1]);
-        println!("diag   : user cb0 distinct {} | agent cb0 distinct {} | agent constant {}",
-                 u.len(), a0.len(), all_same);
-        if let Some(f) = agent.first() { println!("diag   : agent frame[0] {:?}", f); }
-        if agent.len() > 60 { println!("diag   : agent frame[60] {:?}", agent[60]); }
+        println!(
+            "diag   : user cb0 distinct {} | agent cb0 distinct {} | agent constant {}",
+            u.len(),
+            a0.len(),
+            all_same
+        );
+        if let Some(f) = agent.first() {
+            println!("diag   : agent frame[0] {:?}", f);
+        }
+        if agent.len() > 60 {
+            println!("diag   : agent frame[60] {:?}", agent[60]);
+        }
     }
     println!(
         "gen    : {:.2}s for {} frames ({:.1} ms/frame, realtime budget 80 ms){}",
         gen,
         agent.len(),
         gen / agent.len().max(1) as f64 * 1e3,
-        if skipped > 0 { format!(", {skipped} pre-horizon frames skipped") } else { String::new() }
+        if skipped > 0 {
+            format!(", {skipped} pre-horizon frames skipped")
+        } else {
+            String::new()
+        }
     );
 
     // CONTROL: decode the USER's own codes — known-good, straight from real
@@ -202,7 +249,8 @@ fn main() {
             user_codes.iter().take(frames).map(|c| *c).collect();
         let upcm = pipe.decode(&uc);
         let urms = (upcm.iter().map(|v| (*v as f64).powi(2)).sum::<f64>()
-            / upcm.len().max(1) as f64).sqrt();
+            / upcm.len().max(1) as f64)
+            .sqrt();
         let upeak = upcm.iter().fold(0f32, |m, v| m.max(v.abs()));
         println!("CONTROL: user-code round-trip rms {urms:.4} peak {upeak:.4}");
         if urms < 5e-3 {
@@ -210,15 +258,19 @@ fn main() {
         } else {
             println!("  => decoder OK (this control says nothing about the agent codes)");
         }
-        wav::write_pcm16_mono(Path::new("/tmp/listen_control_userroundtrip.wav"),
-                              &upcm, mimi_cfg::SAMPLE_RATE as u32);
+        wav::write_pcm16_mono(
+            Path::new("/tmp/listen_control_userroundtrip.wav"),
+            &upcm,
+            mimi_cfg::SAMPLE_RATE as u32,
+        );
     }
 
     let pcm = pipe.decode(&agent);
-    let rms = (pcm.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / pcm.len().max(1) as f64).sqrt();
+    let rms =
+        (pcm.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / pcm.len().max(1) as f64).sqrt();
     let peak = pcm.iter().fold(0f32, |m, v| m.max(v.abs()));
     let clipped = pcm.iter().filter(|v| v.abs() >= 0.999).count();
-    let silent = rms < 5e-3;  // -46 dB: anything below this is not speech
+    let silent = rms < 5e-3; // -46 dB: anything below this is not speech
 
     println!(
         "audio  : {} samples ({:.2} s), rms {rms:.4}, peak {peak:.4}, clipped {clipped}",

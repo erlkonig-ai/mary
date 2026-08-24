@@ -32,8 +32,7 @@ use anyhow::Result;
 use cubecl::prelude::*;
 
 use mary::models::inkling::fp4gemm::{
-    fp4_linear_launch, gate_up_silu_launch, quantize_act_host, upload_quantized_act,
-    GROUP, MTILE,
+    fp4_linear_launch, gate_up_silu_launch, quantize_act_host, upload_quantized_act, GROUP, MTILE,
 };
 use mary::models::inkling::nvfp4::{e4m3_to_f32, FP4_E2M1};
 
@@ -83,9 +82,14 @@ fn main() -> Result<()> {
     let (a_h, a_sc_h, m_pad) = upload_quantized_act(&client, &x, tokens, k);
     let b_h = client.create_from_slice(&w13.codes);
     let b_sc_h = client.create_from_slice(&w13.scales);
-    let out_h = fp4_linear_launch(&client, &a_h, &a_sc_h, &b_h, &b_sc_h, m_pad, k, n, w13.scale2);
+    let out_h = fp4_linear_launch(
+        &client, &a_h, &a_sc_h, &b_h, &b_sc_h, m_pad, k, n, w13.scale2,
+    );
     let got = f32::from_bytes(&client.read_one(out_h).expect("read")).to_vec();
-    println!("launched fp4_linear: m_pad={m_pad}  {} planes", (n / 8) * (m_pad / MTILE));
+    println!(
+        "launched fp4_linear: m_pad={m_pad}  {} planes",
+        (n / 8) * (m_pad / MTILE)
+    );
 
     // ---- f64 reference over the SAME quantised operands --------------------
     let mut padded = vec![0f32; m_pad * k];
@@ -117,7 +121,9 @@ fn main() -> Result<()> {
         }
     }
     println!("fp4_linear vs f64 over the same quantised operands:");
-    println!("  max relative error {worst:.3e} at {worst_at:?}   ({checked} dot products of K={k})");
+    println!(
+        "  max relative error {worst:.3e} at {worst_at:?}   ({checked} dot products of K={k})"
+    );
 
     // ---- what the padded rows did -----------------------------------------
     // Rows past `tokens` are zero-padding; if the kernel wrote anything but
@@ -128,13 +134,20 @@ fn main() -> Result<()> {
             pad_max = pad_max.max(got[r * n + c].abs());
         }
     }
-    println!("  max |value| in the {} zero-padded rows: {pad_max:e}", m_pad - tokens);
+    println!(
+        "  max |value| in the {} zero-padded rows: {pad_max:e}",
+        m_pad - tokens
+    );
 
     // ---- the FFN chain -----------------------------------------------------
     let b2name = format!("model.llm.layers.{LAYER}.mlp.experts.w2_weight");
     let w2 = src.expert_packed(&b2name, 0)?;
     let inter = n / 2;
-    anyhow::ensure!(w2.cols * 2 == inter, "w2 K={} but inter={inter}", w2.cols * 2);
+    anyhow::ensure!(
+        w2.cols * 2 == inter,
+        "w2 K={} but inter={inter}",
+        w2.cols * 2
+    );
 
     let act_h = gate_up_silu_launch(&client, &out_h_clone(&client, &got, m_pad, n), m_pad, inter);
     let act = f32::from_bytes(&client.read_one(act_h).expect("read")).to_vec();

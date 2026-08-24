@@ -65,7 +65,10 @@ pub fn linear<B: Backend>(x: Tensor<B, 2>, w: Tensor<B, 2>) -> Tensor<B, 2> {
 pub fn linear_pre_t<B: Backend>(x: Tensor<B, 2>, w: Tensor<B, 2>) -> Tensor<B, 2> {
     let [_, k] = x.dims();
     let [kw, _] = w.dims();
-    assert_eq!(k, kw, "linear_pre_t: x is [_, {k}] but the weight is [{kw}, _]");
+    assert_eq!(
+        k, kw,
+        "linear_pre_t: x is [_, {k}] but the weight is [{kw}, _]"
+    );
     x.matmul(w)
 }
 
@@ -89,7 +92,11 @@ pub fn linear_pre_t<B: Backend>(x: Tensor<B, 2>, w: Tensor<B, 2>) -> Tensor<B, 2
 pub fn linear_bf16(x: Tensor<Bk, 2>, w: &Bf16W) -> Tensor<Bk, 2> {
     use crate::models::inkling::bf16gemm::rows_for;
     let [m, k] = x.dims();
-    assert_eq!(k, w.k, "linear_bf16: x is [_, {k}] but the weight is [_, {}]", w.k);
+    assert_eq!(
+        k, w.k,
+        "linear_bf16: x is [_, {k}] but the weight is [_, {}]",
+        w.k
+    );
     // Only the hand lane pads, and only because its grid is its tiling; ask
     // rather than assume, or a decode step slices fifteen rows that were never
     // computed.
@@ -122,7 +129,12 @@ pub fn linear_bf16(x: Tensor<Bk, 2>, w: &Bf16W) -> Tensor<Bk, 2> {
 /// here, same avoidance.
 pub fn rms_norm<B: Backend>(x: Tensor<B, 2>, gain: Tensor<B, 1>, eps: f64) -> Tensor<B, 2> {
     let [_, w] = x.dims();
-    assert_eq!(gain.dims()[0], w, "rms_norm: gain is {} wide, input {w}", gain.dims()[0]);
+    assert_eq!(
+        gain.dims()[0],
+        w,
+        "rms_norm: gain is {} wide, input {w}",
+        gain.dims()[0]
+    );
     let mean_sq = x.clone().powf_scalar(2.0).mean_dim(1);
     let denom = mean_sq.add_scalar(eps).sqrt();
     let normed = x / denom;
@@ -175,7 +187,10 @@ pub fn short_conv_step(
     let [rows, dim] = x.dims();
     assert_eq!(rows, 1, "a decode step convolves exactly one position");
     let [wdim, kernel] = weight.dims();
-    assert_eq!(dim, wdim, "short_conv_step: x is [_, {dim}] but the weight is [{wdim}, _]");
+    assert_eq!(
+        dim, wdim,
+        "short_conv_step: x is [_, {dim}] but the weight is [{wdim}, _]"
+    );
     assert_eq!(
         hist.dims(),
         [kernel - 1, dim],
@@ -232,7 +247,10 @@ pub fn short_conv_steps(
 ) -> (Tensor<Bk, 2>, Tensor<Bk, 2>) {
     let [rows, dim] = x.dims();
     let [wdim, kernel] = weight.dims();
-    assert_eq!(dim, wdim, "short_conv_steps: x is [_, {dim}] but the weight is [{wdim}, _]");
+    assert_eq!(
+        dim, wdim,
+        "short_conv_steps: x is [_, {dim}] but the weight is [{wdim}, _]"
+    );
     assert_eq!(
         hist.dims(),
         [kernel - 1, dim],
@@ -253,14 +271,13 @@ pub fn short_conv_steps(
 /// `all` is `[kernel - 1 + rows, dim]` and the output is its LAST `rows` rows —
 /// the front `kernel - 1` are history and every output row reads a full window
 /// of real input, so [`short_conv`]'s front zero-padding is never reached here.
-pub fn short_conv_window(
-    all: Tensor<Bk, 2>,
-    weight: Tensor<Bk, 2>,
-    rows: usize,
-) -> Tensor<Bk, 2> {
+pub fn short_conv_window(all: Tensor<Bk, 2>, weight: Tensor<Bk, 2>, rows: usize) -> Tensor<Bk, 2> {
     let [len, dim] = all.dims();
     let [wdim, kernel] = weight.dims();
-    assert_eq!(dim, wdim, "short_conv_window: the window is [_, {dim}] but the weight is [{wdim}, _]");
+    assert_eq!(
+        dim, wdim,
+        "short_conv_window: the window is [_, {dim}] but the weight is [{wdim}, _]"
+    );
     assert_eq!(
         len,
         kernel - 1 + rows,
@@ -271,9 +288,8 @@ pub fn short_conv_window(
     let dev = all.device();
     let h_all = handle_of(all);
     let h_w = handle_of(weight);
-    let out = crate::models::inkling::sconv::short_conv_batch(
-        &client, &h_all, &h_w, dim, rows, kernel,
-    );
+    let out =
+        crate::models::inkling::sconv::short_conv_batch(&client, &h_all, &h_w, dim, rows, kernel);
     tensor_of(client, dev, out, rows, dim)
 }
 
@@ -293,7 +309,10 @@ pub fn short_conv_window(
 pub fn short_conv<B: Backend>(x: Tensor<B, 2>, weight: Tensor<B, 2>) -> Tensor<B, 2> {
     let [tokens, dim] = x.dims();
     let [wdim, kernel] = weight.dims();
-    assert_eq!(dim, wdim, "short_conv: x is [_, {dim}] but the weight is [{wdim}, _]");
+    assert_eq!(
+        dim, wdim,
+        "short_conv: x is [_, {dim}] but the weight is [{wdim}, _]"
+    );
     assert!(kernel > 0, "a short convolution needs a kernel");
     let dev = x.device();
     let pad: Tensor<B, 2> = Tensor::zeros([kernel - 1, dim], &dev);
@@ -322,7 +341,11 @@ fn head_rms_norm<B: Backend>(
     eps: f64,
 ) -> Tensor<B, 2> {
     let [tokens, width] = v.dims();
-    assert_eq!(width, heads * head_dim, "{width} is not {heads} x {head_dim}");
+    assert_eq!(
+        width,
+        heads * head_dim,
+        "{width} is not {heads} x {head_dim}"
+    );
     rms_norm(v.reshape([tokens * heads, head_dim]), gain, eps).reshape([tokens, width])
 }
 
@@ -560,11 +583,19 @@ fn attention_prefill_lane(
     use crate::models::inkling::config::AttnKind;
 
     let [tokens, hidden] = x.dims();
-    assert_eq!(hidden, d.hidden, "x is [_, {hidden}] but the config says {}", d.hidden);
+    assert_eq!(
+        hidden, d.hidden,
+        "x is [_, {hidden}] but the config says {}",
+        d.hidden
+    );
     let dev = x.device();
     let (heads, kv_heads, head_dim) = (d.heads, d.kv_heads, d.head_dim);
     let groups = d.groups();
-    assert_eq!(groups * kv_heads, heads, "{heads} heads do not divide into {kv_heads} kv heads");
+    assert_eq!(
+        groups * kv_heads,
+        heads,
+        "{heads} heads do not divide into {kv_heads} kv heads"
+    );
 
     // K and V pass through their short convolutions; Q does not. The
     // pre-convolution projections are kept: they are the convolution's memory,
@@ -638,7 +669,10 @@ fn attention_prefill_lane(
             // makes the permuted view contiguous, which is the transpose --
             // one linear pass per layer against a quadratic saving.
             let k_h = handle_of(
-                k.clone().reshape([tokens, kv_heads, head_dim]).swap_dims(0, 1).swap_dims(1, 2),
+                k.clone()
+                    .reshape([tokens, kv_heads, head_dim])
+                    .swap_dims(0, 1)
+                    .swap_dims(1, 2),
             );
             let v_h = handle_of(v.clone());
             let rel_h = handle_of(rel);
@@ -713,7 +747,9 @@ fn attention_prefill_lane(
             // LOCALLY, and that bug is invisible in block zero. A test needs to
             // force several blocks at a shape small enough to check, and a
             // process-global env var cannot do that while other tests run.
-            let block = block.unwrap_or_else(|| query_block(heads, tokens)).clamp(1, tokens);
+            let block = block
+                .unwrap_or_else(|| query_block(heads, tokens))
+                .clamp(1, tokens);
             let mut parts: Vec<Tensor<Bk, 2>> = Vec::with_capacity(tokens.div_ceil(block));
             for lo in (0..tokens).step_by(block) {
                 let hi = (lo + block).min(tokens);
@@ -747,8 +783,11 @@ fn attention_prefill_lane(
                 // and the softmax below are the arithmetic the reference also
                 // keeps in f32, and the narrow lane's saving is in the
                 // OPERANDS, which are already spent by this line.
-                let raw =
-                    from_act(qh.clone().slice([0..heads, lo..hi, 0..head_dim]).matmul(kt.clone()));
+                let raw = from_act(
+                    qh.clone()
+                        .slice([0..heads, lo..hi, 0..head_dim])
+                        .matmul(kt.clone()),
+                );
                 let rel_h = handle_of(rel);
                 let (s_h, st) = strided_of3(raw);
                 score_epilogue_launch(
@@ -862,7 +901,11 @@ fn kv_pad_bucket() -> usize {
 /// slots, on a node whose `MemAvailable` bottoms at 1.38 GiB there.
 pub fn attn_bf16() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("INK_ATTN_BF16").map(|v| v != "0").unwrap_or(true))
+    *ON.get_or_init(|| {
+        std::env::var("INK_ATTN_BF16")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
 }
 
 thread_local! {
@@ -977,7 +1020,11 @@ fn from_kv<const D: usize>(t: Tensor<Bk, D>) -> Tensor<Bk, D> {
 /// arithmetic on the other lane.
 pub fn act_bf16() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("INK_ACT_BF16").map(|v| v != "0").unwrap_or(true))
+    *ON.get_or_init(|| {
+        std::env::var("INK_ACT_BF16")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
 }
 
 /// `t` in the dtype a prefill holds its attention operands in. The identity on
@@ -1032,18 +1079,35 @@ pub fn attention_step(
 
     let [rows, hidden] = x.dims();
     assert_eq!(rows, 1, "a decode step feeds exactly one token, got {rows}");
-    assert_eq!(hidden, d.hidden, "x is [_, {hidden}] but the config says {}", d.hidden);
-    assert!(pos >= cache.base + cache.len(), "position {pos} is already cached");
+    assert_eq!(
+        hidden, d.hidden,
+        "x is [_, {hidden}] but the config says {}",
+        d.hidden
+    );
+    assert!(
+        pos >= cache.base + cache.len(),
+        "position {pos} is already cached"
+    );
     let dev = x.device();
     let (heads, kv_heads, head_dim) = (d.heads, d.kv_heads, d.head_dim);
     let groups = d.groups();
-    assert_eq!(groups * kv_heads, heads, "{heads} heads do not divide into {kv_heads} kv heads");
+    assert_eq!(
+        groups * kv_heads,
+        heads,
+        "{heads} heads do not divide into {kv_heads} kv heads"
+    );
 
     let q = linear_bf16(x.clone(), &w.wq);
-    let (k_new, k_hist) =
-        short_conv_step(cache.k_pre.clone(), linear_bf16(x.clone(), &w.wk), w.k_sconv.clone());
-    let (v_new, v_hist) =
-        short_conv_step(cache.v_pre.clone(), linear_bf16(x.clone(), &w.wv), w.v_sconv.clone());
+    let (k_new, k_hist) = short_conv_step(
+        cache.k_pre.clone(),
+        linear_bf16(x.clone(), &w.wk),
+        w.k_sconv.clone(),
+    );
+    let (v_new, v_hist) = short_conv_step(
+        cache.v_pre.clone(),
+        linear_bf16(x.clone(), &w.wv),
+        w.v_sconv.clone(),
+    );
     cache.k_pre = k_hist;
     cache.v_pre = v_hist;
     let r = linear_bf16(x, &w.wr);
@@ -1116,7 +1180,11 @@ pub fn attention_step(
     // at `rel_extent`, and it is the width of the relative-projection matmul
     // and of the gather it feeds. Rounding up only ever admits COLUMNS the
     // gather does not index, because every `idx` is `< max_dist + 1 <= eff`.
-    let eff = d.rel_extent.min(max_dist + 1).next_multiple_of(bucket).min(d.rel_extent);
+    let eff = d
+        .rel_extent
+        .min(max_dist + 1)
+        .next_multiple_of(bucket)
+        .min(d.rel_extent);
     let idx: Tensor<Bk, 3, Int> =
         Tensor::from_data(TensorData::new(idx, [1, 1, padded]), &dev).repeat_dim(0, heads);
     let valid: Tensor<Bk, 3> = Tensor::from_data(TensorData::new(valid, [1, 1, padded]), &dev);
@@ -1156,8 +1224,9 @@ pub fn attention_step(
     let scores =
         from_kv(as_kv(qh).matmul(kh.swap_dims(1, 2))).mul_scalar(d.scaling()) + bias + wmask;
     let probs = burn::tensor::activation::softmax(scores, 2);
-    let out =
-        from_kv(as_kv(probs).matmul(vh)).swap_dims(0, 1).reshape([1, heads * head_dim]);
+    let out = from_kv(as_kv(probs).matmul(vh))
+        .swap_dims(0, 1)
+        .reshape([1, heads * head_dim]);
     linear_bf16(out, &w.wo)
 }
 
@@ -1191,13 +1260,27 @@ pub fn attention_steps(
 
     let [rows, hidden] = x.dims();
     assert!(rows >= 1, "a batched step feeds at least one token");
-    assert_eq!(hidden, d.hidden, "x is [_, {hidden}] but the config says {}", d.hidden);
-    assert!(pos0 >= cache.base + cache.len(), "position {pos0} is already cached");
-    assert!(cache.pending.is_none(), "a speculative batch is still uncommitted");
+    assert_eq!(
+        hidden, d.hidden,
+        "x is [_, {hidden}] but the config says {}",
+        d.hidden
+    );
+    assert!(
+        pos0 >= cache.base + cache.len(),
+        "position {pos0} is already cached"
+    );
+    assert!(
+        cache.pending.is_none(),
+        "a speculative batch is still uncommitted"
+    );
     let dev = x.device();
     let (heads, kv_heads, head_dim) = (d.heads, d.kv_heads, d.head_dim);
     let groups = d.groups();
-    assert_eq!(groups * kv_heads, heads, "{heads} heads do not divide into {kv_heads} kv heads");
+    assert_eq!(
+        groups * kv_heads,
+        heads,
+        "{heads} heads do not divide into {kv_heads} kv heads"
+    );
 
     let q = linear_bf16(x.clone(), &w.wq);
     // The convolution over the batch, taps and all: the `kernel - 1` history
@@ -1225,7 +1308,11 @@ pub fn attention_steps(
     cache.v = Tensor::cat(vec![cache.v.clone(), as_kv(v_new)], 0);
     cache.k_pre = k_all.clone().slice([rows..rows + hist, 0..kdim]);
     cache.v_pre = v_all.clone().slice([rows..rows + hist, 0..vdim]);
-    cache.pending = Some(Pending { k_pre: k_all, v_pre: v_all, rows });
+    cache.pending = Some(Pending {
+        k_pre: k_all,
+        v_pre: v_all,
+        rows,
+    });
 
     let len = cache.len();
     let base = cache.base;
@@ -1275,13 +1362,15 @@ pub fn attention_steps(
             max_dist = max_dist.max(dist);
         }
     }
-    let eff = d.rel_extent.min(max_dist + 1).next_multiple_of(bucket).min(d.rel_extent);
+    let eff = d
+        .rel_extent
+        .min(max_dist + 1)
+        .next_multiple_of(bucket)
+        .min(d.rel_extent);
     let idx: Tensor<Bk, 3, Int> =
         Tensor::from_data(TensorData::new(idx, [1, rows, padded]), &dev).repeat_dim(0, heads);
-    let valid: Tensor<Bk, 3> =
-        Tensor::from_data(TensorData::new(valid, [1, rows, padded]), &dev);
-    let wmask: Tensor<Bk, 3> =
-        Tensor::from_data(TensorData::new(wmask, [1, rows, padded]), &dev);
+    let valid: Tensor<Bk, 3> = Tensor::from_data(TensorData::new(valid, [1, rows, padded]), &dev);
+    let wmask: Tensor<Bk, 3> = Tensor::from_data(TensorData::new(wmask, [1, rows, padded]), &dev);
 
     let rel = (r
         .reshape([rows * heads, d.d_rel])
@@ -1312,8 +1401,9 @@ pub fn attention_steps(
     let scores =
         from_kv(as_kv(qh).matmul(kh.swap_dims(1, 2))).mul_scalar(d.scaling()) + bias + wmask;
     let probs = burn::tensor::activation::softmax(scores, 2);
-    let out =
-        from_kv(as_kv(probs).matmul(vh)).swap_dims(0, 1).reshape([rows, heads * head_dim]);
+    let out = from_kv(as_kv(probs).matmul(vh))
+        .swap_dims(0, 1)
+        .reshape([rows, heads * head_dim]);
     linear_bf16(out, &w.wo)
 }
 
@@ -1335,7 +1425,10 @@ pub fn short_conv_slot_step(
 ) -> (Tensor<Bk, 2>, Tensor<Bk, 3>) {
     let [slots, dim] = x.dims();
     let [wdim, kernel] = weight.dims();
-    assert_eq!(dim, wdim, "short_conv_slot_step: x is [_, {dim}] but the weight is [{wdim}, _]");
+    assert_eq!(
+        dim, wdim,
+        "short_conv_slot_step: x is [_, {dim}] but the weight is [{wdim}, _]"
+    );
     assert_eq!(
         hist.dims(),
         [slots, kernel - 1, dim],
@@ -1490,7 +1583,11 @@ fn take3<B: Backend>(slot: &mut Tensor<B, 3>, dev: &B::Device) -> Tensor<B, 3> {
 pub fn seat_row3(dst: &mut Tensor<Bk, 3>, s: usize, src: Tensor<Bk, 3>) {
     let [slots, a, b] = dst.dims();
     assert!(s < slots, "slot {s} of a {slots}-slot batch");
-    assert_eq!(src.dims(), [1, a, b], "a seated row is one slot of [{a}, {b}]");
+    assert_eq!(
+        src.dims(),
+        [1, a, b],
+        "a seated row is one slot of [{a}, {b}]"
+    );
     let dev = src.device();
     let d = take3(dst, &dev);
     *dst = d.slice_assign([s..s + 1, 0..a, 0..b], src);
@@ -1577,14 +1674,28 @@ impl SlotCache<Bk> {
     /// once.
     pub fn seat(&mut self, s: usize, c: AttnCache<Bk>) {
         assert!(s < self.slots, "slot {s} of a {}-slot batch", self.slots);
-        assert_eq!(c.len(), self.frozen, "slot {s} holds {} keys against slot 0's {}",
-                   c.len(), self.frozen);
-        assert_eq!(c.base(), self.base, "slot {s} starts at {} against slot 0's {}",
-                   c.base(), self.base);
+        assert_eq!(
+            c.len(),
+            self.frozen,
+            "slot {s} holds {} keys against slot 0's {}",
+            c.len(),
+            self.frozen
+        );
+        assert_eq!(
+            c.base(),
+            self.base,
+            "slot {s} starts at {} against slot 0's {}",
+            c.base(),
+            self.base
+        );
         let (kv_heads, head_dim, kcap, len) =
             (self.kv_heads, self.head_dim, self.kcap, self.frozen);
         let kv_width = kv_heads * head_dim;
-        assert_eq!(c.k.dims()[1], kv_width, "slot {s} was built at a different layer shape");
+        assert_eq!(
+            c.k.dims()[1],
+            kv_width,
+            "slot {s} was built at a different layer shape"
+        );
         let dev = c.k.device();
         let kernel_hist = c.k_pre.dims()[0];
 
@@ -1612,8 +1723,16 @@ impl SlotCache<Bk> {
         self.k = k.slice_assign([r0..r0 + kv_heads, 0..kcap, 0..head_dim], headwise(c.k));
         let v = take3(&mut self.v, &dev);
         self.v = v.slice_assign([r0..r0 + kv_heads, 0..kcap, 0..head_dim], headwise(c.v));
-        seat_row3(&mut self.k_pre, s, c.k_pre.reshape([1, kernel_hist, kv_width]));
-        seat_row3(&mut self.v_pre, s, c.v_pre.reshape([1, kernel_hist, kv_width]));
+        seat_row3(
+            &mut self.k_pre,
+            s,
+            c.k_pre.reshape([1, kernel_hist, kv_width]),
+        );
+        seat_row3(
+            &mut self.v_pre,
+            s,
+            c.v_pre.reshape([1, kernel_hist, kv_width]),
+        );
     }
 
     /// `b` prefilled single-sequence caches, stacked into one slot batch.
@@ -1673,7 +1792,10 @@ impl SlotCache<Bk> {
     /// would put a zero row inside the frozen half, where no mask covers it.
     fn merge(&mut self) {
         let rec = recent_rows();
-        assert_eq!(self.recent, rec, "a partial recent half has zero rows in it");
+        assert_eq!(
+            self.recent, rec,
+            "a partial recent half has zero rows in it"
+        );
         let rows = self.slots * self.kv_heads;
         let hd = self.head_dim;
         let dev = self.k.device();
@@ -1762,14 +1884,32 @@ pub fn attention_slots(
     use crate::models::inkling::config::AttnKind;
 
     let [slots, hidden] = x.dims();
-    assert_eq!(slots, cache.slots, "x has {slots} rows against a {}-slot cache", cache.slots);
-    assert_eq!(hidden, d.hidden, "x is [_, {hidden}] but the config says {}", d.hidden);
-    assert!(pos >= cache.base + cache.len(), "position {pos} is already cached");
+    assert_eq!(
+        slots, cache.slots,
+        "x has {slots} rows against a {}-slot cache",
+        cache.slots
+    );
+    assert_eq!(
+        hidden, d.hidden,
+        "x is [_, {hidden}] but the config says {}",
+        d.hidden
+    );
+    assert!(
+        pos >= cache.base + cache.len(),
+        "position {pos} is already cached"
+    );
     let dev = x.device();
     let (heads, kv_heads, head_dim) = (d.heads, d.kv_heads, d.head_dim);
     let groups = d.groups();
-    assert_eq!(groups * kv_heads, heads, "{heads} heads do not divide into {kv_heads} kv heads");
-    assert_eq!(kv_heads, cache.kv_heads, "this cache was built at a different layer shape");
+    assert_eq!(
+        groups * kv_heads,
+        heads,
+        "{heads} heads do not divide into {kv_heads} kv heads"
+    );
+    assert_eq!(
+        kv_heads, cache.kv_heads,
+        "this cache was built at a different layer shape"
+    );
 
     let q = linear_bf16(x.clone(), &w.wq);
     let (k_new, k_hist) = short_conv_slot_step(
@@ -1847,7 +1987,11 @@ pub fn attention_slots(
         max_dist = max_dist.max(dist);
     }
     let bucket = kv_pad_bucket();
-    let eff = d.rel_extent.min(max_dist + 1).next_multiple_of(bucket).min(d.rel_extent);
+    let eff = d
+        .rel_extent
+        .min(max_dist + 1)
+        .next_multiple_of(bucket)
+        .min(d.rel_extent);
 
     let rel = r
         .reshape([slots * heads, d.d_rel])
@@ -1910,8 +2054,8 @@ pub fn attention_slots(
     // narrowing them costs a relative 2^-9 on each weight and nothing on their
     // sum; the values they weight are the other half of the cache and are the
     // bytes this is here for.
-    let out = from_kv(as_kv(pf).matmul(cache.v.clone()))
-        + from_kv(as_kv(pr).matmul(cache.vr.clone()));
+    let out =
+        from_kv(as_kv(pf).matmul(cache.v.clone())) + from_kv(as_kv(pr).matmul(cache.vr.clone()));
     linear_bf16(out.reshape([slots, heads * head_dim]), &w.wo)
 }
 
@@ -2026,12 +2170,20 @@ mod tests {
         // under comparison see identical operand bits.
         let client = client_of(&m(1, 1, 0.0));
         let w16 = |rows: usize, cols: usize, seed: f32| -> Bf16W {
-            assert!(Bf16W::tileable(rows, cols), "test weight {rows}x{cols} does not tile");
+            assert!(
+                Bf16W::tileable(rows, cols),
+                "test weight {rows}x{cols} does not tile"
+            );
             let mut bytes = Vec::with_capacity(rows * cols * 2);
             for x in fill(rows * cols, seed) {
                 bytes.extend_from_slice(&half::bf16::from_f32(x).to_le_bytes());
             }
-            Bf16W { h: client.create_from_slice(&bytes), n: rows, k: cols, align: 16 }
+            Bf16W {
+                h: client.create_from_slice(&bytes),
+                n: rows,
+                k: cols,
+                align: 16,
+            }
         };
         let (q_w, kv_w) = (d.heads * d.head_dim, d.kv_heads * d.head_dim);
         AttnWeightsDev {
@@ -2146,8 +2298,10 @@ mod tests {
                 )
             })
             .collect();
-        let full: Vec<Tensor<B, 2>> =
-            xs.iter().map(|x| attention(x.clone(), &w, &d, ls, window)).collect();
+        let full: Vec<Tensor<B, 2>> = xs
+            .iter()
+            .map(|x| attention(x.clone(), &w, &d, ls, window))
+            .collect();
         let prefills: Vec<AttnCache<Bk>> = xs
             .iter()
             .map(|x| {
@@ -2167,7 +2321,9 @@ mod tests {
         let (mut worst, mut closest) = (0f32, f32::INFINITY);
         for pos in prefill..tokens {
             let rows = Tensor::cat(
-                xs.iter().map(|x| x.clone().slice([pos..pos + 1, 0..d.hidden])).collect(),
+                xs.iter()
+                    .map(|x| x.clone().slice([pos..pos + 1, 0..d.hidden]))
+                    .collect(),
                 0,
             );
             let got = attention_slots(rows, &w, &d, ls, pos, window, &mut cache);
@@ -2242,7 +2398,9 @@ mod tests {
             let mut out = Vec::new();
             for pos in prefill..tokens {
                 let rows = Tensor::cat(
-                    xs.iter().map(|x| x.clone().slice([pos..pos + 1, 0..d.hidden])).collect(),
+                    xs.iter()
+                        .map(|x| x.clone().slice([pos..pos + 1, 0..d.hidden]))
+                        .collect(),
                     0,
                 );
                 out.push(attention_slots(rows, &w, &d, None, pos, window, &mut cache));
@@ -2264,7 +2422,9 @@ mod tests {
                 closest = closest.min((mine.clone() - theirs).abs().max().into_scalar());
             }
         }
-        println!("narrow slots: slot 0 moved {moved:e} between neighbours, closest pair {closest:e}");
+        println!(
+            "narrow slots: slot 0 moved {moved:e} between neighbours, closest pair {closest:e}"
+        );
         assert_eq!(
             moved, 0.0,
             "slot 0's answer moved by {moved:e} when its NEIGHBOURS changed: the narrow batch is              reading keys that are not its own"
@@ -2301,7 +2461,10 @@ mod tests {
             worst < CACHE_TOLERANCE_LOCAL,
             "a slot disagreed with its own uncached run by {worst:e}"
         );
-        assert!(closest > 1e-3, "the slots produced nearly the same answer ({closest:e})");
+        assert!(
+            closest > 1e-3,
+            "the slots produced nearly the same answer ({closest:e})"
+        );
     }
 
     /// Log scaling is a function of the absolute position, which every slot
@@ -2309,7 +2472,10 @@ mod tests {
     /// the one place a wrong position would be invisible at short context.
     #[test]
     fn slots_carry_log_scaling() {
-        let ls = Some(LogScaling { n_floor: 4.0, alpha: 0.1 });
+        let ls = Some(LogScaling {
+            n_floor: 4.0,
+            alpha: 0.1,
+        });
         let (worst, closest) = slot_compare(AttnKind::Global, 8, None, ls, 11, 6, 4);
         println!("4 slots, global + log scaling: worst {worst:e}, closest pair {closest:e}");
         assert!(worst < CACHE_TOLERANCE_GLOBAL, "worst {worst:e}");
@@ -2355,7 +2521,10 @@ mod tests {
             worst = worst.max((a - b).abs().max().into_scalar());
         }
         println!("one slot against the one-row lane: worst {worst:e}");
-        assert!(worst < 1e-5, "a one-slot batch is not the one-row lane: {worst:e}");
+        assert!(
+            worst < 1e-5,
+            "a one-slot batch is not the one-row lane: {worst:e}"
+        );
     }
 
     /// Burn's f32 matmul on this runtime is NOT f32, and this is the tripwire.
@@ -2446,7 +2615,10 @@ mod tests {
             let d = dims(kind, rel_extent);
             let w = weights(&d, &dev);
             let ls = match kind {
-                AttnKind::Global => Some(LogScaling { n_floor: 8.0, alpha: 0.5 }),
+                AttnKind::Global => Some(LogScaling {
+                    n_floor: 8.0,
+                    alpha: 0.5,
+                }),
                 AttnKind::Local => None,
             };
             for tokens in [37usize, 64, 91] {
@@ -2454,13 +2626,12 @@ mod tests {
                     TensorData::new(fill(tokens * d.hidden, 0.05), [tokens, d.hidden]),
                     &dev,
                 );
-                let whole =
-                    attention_prefill_dense(xs.clone(), &w, &d, ls, win, win, Some(tokens))
-                        .0
-                        .into_data()
-                        .convert::<f32>()
-                        .into_vec::<f32>()
-                        .expect("f32 rows");
+                let whole = attention_prefill_dense(xs.clone(), &w, &d, ls, win, win, Some(tokens))
+                    .0
+                    .into_data()
+                    .convert::<f32>()
+                    .into_vec::<f32>()
+                    .expect("f32 rows");
                 for block in [1usize, 5, 8, 13, 32] {
                     if block >= tokens {
                         continue;
@@ -2493,8 +2664,8 @@ mod tests {
         for (rel_extent, win, tokens) in [
             (16usize, 16usize, 11usize), // window past the sequence: a full triangle
             (16, 16, 4),
-            (5, 16, 11),  // triangle, table shorter than the sequence
-            (16, 5, 11),  // clipped band, table longer than the window
+            (5, 16, 11), // triangle, table shorter than the sequence
+            (16, 5, 11), // clipped band, table longer than the window
             (5, 5, 11),
             (5, 3, 11),
             (5, 5, 4),
@@ -2519,7 +2690,9 @@ mod tests {
                 })
                 .collect();
             let diff = per_row.iter().cloned().fold(0f32, f32::max);
-            println!("rel_extent={rel_extent} window={win} tokens={tokens} -> {diff}  rows {per_row:?}");
+            println!(
+                "rel_extent={rel_extent} window={win} tokens={tokens} -> {diff}  rows {per_row:?}"
+            );
             worst_of_all = worst_of_all.max(diff);
         }
         assert!(
@@ -2534,9 +2707,15 @@ mod tests {
     /// `rel_extent` must contribute a zero bias rather than a gathered one.
     #[test]
     fn cached_global_matches_full() {
-        let ls = Some(LogScaling { n_floor: 4.0, alpha: 0.5 });
+        let ls = Some(LogScaling {
+            n_floor: 4.0,
+            alpha: 0.5,
+        });
         let worst = compare(AttnKind::Global, 5, None, ls, 11, 4, false);
-        assert!(worst < CACHE_TOLERANCE_GLOBAL, "cached global attention drifts by {worst}");
+        assert!(
+            worst < CACHE_TOLERANCE_GLOBAL,
+            "cached global attention drifts by {worst}"
+        );
     }
 
     /// A local layer whose window is shorter than the sequence, so the cache
@@ -2544,7 +2723,10 @@ mod tests {
     #[test]
     fn cached_local_matches_full_across_the_window() {
         let worst = compare(AttnKind::Local, 5, Some(5), None, 11, 4, false);
-        assert!(worst < CACHE_TOLERANCE_LOCAL, "cached windowed attention drifts by {worst}");
+        assert!(
+            worst < CACHE_TOLERANCE_LOCAL,
+            "cached windowed attention drifts by {worst}"
+        );
     }
 
     /// The cache must survive a prefill shorter than the convolution kernel,
@@ -2653,14 +2835,18 @@ mod tests {
     fn linear_bf16_row0_matches_across_width() {
         let dev = burn::backend::cuda::CudaDevice::default();
         let hidden = 4096usize;
-        let probe: Tensor<B, 2> =
-            Tensor::from_data(TensorData::new(vec![0f32], [1, 1]), &dev);
+        let probe: Tensor<B, 2> = Tensor::from_data(TensorData::new(vec![0f32], [1, 1]), &dev);
         let client = client_of(&probe);
         let mut bytes = Vec::with_capacity(hidden * hidden * 2);
         for x in fill(hidden * hidden, 0.31) {
             bytes.extend_from_slice(&half::bf16::from_f32(x).to_le_bytes());
         }
-        let big = Bf16W { h: client.create_from_slice(&bytes), n: hidden, k: hidden, align: 16 };
+        let big = Bf16W {
+            h: client.create_from_slice(&bytes),
+            n: hidden,
+            k: hidden,
+            align: 16,
+        };
         let rows = 3usize;
         let xs: Tensor<B, 2> = Tensor::from_data(
             TensorData::new(fill(rows * hidden, 1.25), [rows, hidden]),
@@ -2685,7 +2871,10 @@ mod tests {
         // bits. This bound is a REGRESSION guard on that number, not a
         // correctness claim -- what it exists to catch is the day the gap
         // becomes structural rather than arithmetic.
-        assert!(worst < 1e-3, "linear_bf16 row 0 moves with the batch width by {worst}");
+        assert!(
+            worst < 1e-3,
+            "linear_bf16 row 0 moves with the batch width by {worst}"
+        );
     }
 
     /// Diagnostic: per-position relative drift of the batched lane against the
@@ -2695,8 +2884,14 @@ mod tests {
     fn drift_table_at_real_width() {
         let dev = burn::backend::cuda::CudaDevice::default();
         let d = AttnDims {
-            hidden: 4096, heads: 32, kv_heads: 8, head_dim: 128,
-            d_rel: 16, rel_extent: 1024, kernel: 4, rms_eps: 1e-6,
+            hidden: 4096,
+            heads: 32,
+            kv_heads: 8,
+            head_dim: 128,
+            d_rel: 16,
+            rel_extent: 1024,
+            kernel: 4,
+            rms_eps: 1e-6,
             kind: AttnKind::Local,
         };
         let w = weights(&d, &dev);
@@ -2708,7 +2903,9 @@ mod tests {
         );
         let (_, base_cache) = attention_prefill(
             xs.clone().slice([0..prefill, 0..d.hidden]),
-            &w, &d, None,
+            &w,
+            &d,
+            None,
             window,
             window,
         );
@@ -2717,7 +2914,12 @@ mod tests {
         for pos in prefill..tokens {
             ones.push(attention_step(
                 xs.clone().slice([pos..pos + 1, 0..d.hidden]),
-                &w, &d, None, pos, window, &mut c1,
+                &w,
+                &d,
+                None,
+                pos,
+                window,
+                &mut c1,
             ));
         }
         for batch in [1usize, 2] {
@@ -2729,7 +2931,12 @@ mod tests {
                 let rows = batch.min(tokens - pos);
                 let got = attention_steps(
                     xs.clone().slice([pos..pos + rows, 0..d.hidden]),
-                    &w, &d, None, pos, window, &mut c2,
+                    &w,
+                    &d,
+                    None,
+                    pos,
+                    window,
+                    &mut c2,
                 );
                 c2.commit(rows, window);
                 for r in 0..rows {
@@ -2852,7 +3059,10 @@ mod tests {
         // position. Left free-running here because that is how the runtime
         // ships -- `m == 1` takes `gemv plane par` and `m > 1` cannot, so a
         // speculative loop compares two lanes whether or not it wants to.
-        assert!(worst < 5e-2, "batched attention drifts from the single step by {worst} relative");
+        assert!(
+            worst < 5e-2,
+            "batched attention drifts from the single step by {worst} relative"
+        );
     }
 
     /// [`short_conv_steps`] against the whole-sequence [`short_conv`], in
@@ -2874,10 +3084,14 @@ mod tests {
         let _lane = CacheLane::wide();
         let dev = burn::backend::cuda::CudaDevice::default();
         let (dim, kernel) = (16usize, 4usize);
-        let xs: Tensor<B, 2> =
-            Tensor::from_data(TensorData::new(fill(tokens * dim, 1.5), [tokens, dim]), &dev);
-        let w: Tensor<B, 2> =
-            Tensor::from_data(TensorData::new(fill(dim * kernel, 0.25), [dim, kernel]), &dev);
+        let xs: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(fill(tokens * dim, 1.5), [tokens, dim]),
+            &dev,
+        );
+        let w: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(fill(dim * kernel, 0.25), [dim, kernel]),
+            &dev,
+        );
         let full = short_conv(xs.clone(), w.clone());
         let mut hist = conv_history(xs.clone().slice([0..prefill, 0..dim]), kernel);
 
@@ -2903,8 +3117,11 @@ mod tests {
                 let want = full.clone().slice([pos + keep..pos + rows, 0..dim]);
                 worst = worst.max((got - want).abs().max().into_scalar());
             } else {
-                let (got, all) =
-                    short_conv_steps(hist.clone(), xs.clone().slice([pos..pos + rows, 0..dim]), w.clone());
+                let (got, all) = short_conv_steps(
+                    hist.clone(),
+                    xs.clone().slice([pos..pos + rows, 0..dim]),
+                    w.clone(),
+                );
                 hist = conv_history(all.slice([0..kernel - 1 + rows, 0..dim]), kernel);
                 let want = full.clone().slice([pos..pos + rows, 0..dim]);
                 worst = worst.max((got - want).abs().max().into_scalar());
@@ -2937,9 +3154,15 @@ mod tests {
     /// for all of its rows would show up here.
     #[test]
     fn batched_global_matches_full() {
-        let ls = Some(LogScaling { n_floor: 4.0, alpha: 0.5 });
+        let ls = Some(LogScaling {
+            n_floor: 4.0,
+            alpha: 0.5,
+        });
         let worst = compare_batched(AttnKind::Global, 5, None, ls, 11, 4, 3, 0);
-        assert!(worst < CACHE_TOLERANCE_GLOBAL, "batched global attention drifts by {worst}");
+        assert!(
+            worst < CACHE_TOLERANCE_GLOBAL,
+            "batched global attention drifts by {worst}"
+        );
     }
 
     /// The same on a local layer whose window is shorter than the sequence, so
@@ -2947,7 +3170,10 @@ mod tests {
     #[test]
     fn batched_local_matches_full_across_the_window() {
         let worst = compare_batched(AttnKind::Local, 5, Some(5), None, 11, 4, 3, 0);
-        assert!(worst < CACHE_TOLERANCE_LOCAL, "batched windowed attention drifts by {worst}");
+        assert!(
+            worst < CACHE_TOLERANCE_LOCAL,
+            "batched windowed attention drifts by {worst}"
+        );
     }
 
     /// Rejection: run three, keep one, re-run the two that were rejected. This
@@ -2955,9 +3181,15 @@ mod tests {
     /// short convolution's memory as well as truncating K and V.
     #[test]
     fn rejected_rows_leave_no_trace() {
-        let ls = Some(LogScaling { n_floor: 4.0, alpha: 0.5 });
+        let ls = Some(LogScaling {
+            n_floor: 4.0,
+            alpha: 0.5,
+        });
         let worst = compare_batched(AttnKind::Global, 5, None, ls, 11, 4, 3, 2);
-        assert!(worst < CACHE_TOLERANCE_GLOBAL, "rolled-back batch drifts by {worst}");
+        assert!(
+            worst < CACHE_TOLERANCE_GLOBAL,
+            "rolled-back batch drifts by {worst}"
+        );
     }
 
     /// The same against a window, where rollback and the window's own
@@ -2965,16 +3197,25 @@ mod tests {
     #[test]
     fn rejected_rows_leave_no_trace_windowed() {
         let worst = compare_batched(AttnKind::Local, 5, Some(5), None, 11, 4, 3, 2);
-        assert!(worst < CACHE_TOLERANCE_LOCAL, "rolled-back windowed batch drifts by {worst}");
+        assert!(
+            worst < CACHE_TOLERANCE_LOCAL,
+            "rolled-back windowed batch drifts by {worst}"
+        );
     }
 
     /// A batch of one must agree with [`attention_step`], which is the claim
     /// that makes the two functions one algorithm rather than two.
     #[test]
     fn a_batch_of_one_matches_the_single_step() {
-        let ls = Some(LogScaling { n_floor: 4.0, alpha: 0.5 });
+        let ls = Some(LogScaling {
+            n_floor: 4.0,
+            alpha: 0.5,
+        });
         let worst = compare_batched(AttnKind::Global, 5, None, ls, 11, 4, 1, 0);
-        assert!(worst < CACHE_TOLERANCE_GLOBAL, "a one-row batch drifts by {worst}");
+        assert!(
+            worst < CACHE_TOLERANCE_GLOBAL,
+            "a one-row batch drifts by {worst}"
+        );
     }
 
     /// A gate that cannot fail and a gate that has never failed look identical

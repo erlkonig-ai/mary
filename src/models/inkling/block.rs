@@ -58,13 +58,7 @@ pub fn rms_norm(x: &[f32], weight: &[f32], eps: f64, tokens: usize, width: usize
 /// conv[t] = sum_{j=0}^{k-1} w[j] * x[t + j - (k - 1)]        x[<0] = 0
 /// out[t]  = x[t] + conv[t]
 /// ```
-pub fn short_conv(
-    x: &[f32],
-    weight: &[f32],
-    tokens: usize,
-    dim: usize,
-    kernel: usize,
-) -> Vec<f32> {
+pub fn short_conv(x: &[f32], weight: &[f32], tokens: usize, dim: usize, kernel: usize) -> Vec<f32> {
     assert_eq!(x.len(), tokens * dim);
     assert_eq!(weight.len(), dim * kernel);
     let mut out = vec![0f32; tokens * dim];
@@ -118,7 +112,12 @@ pub fn short_conv_step(
     kernel: usize,
 ) -> Vec<f32> {
     assert_eq!(x.len(), dim, "a decode step convolves exactly one position");
-    assert_eq!(hist.len(), (kernel - 1) * dim, "history must be the {} rows before it", kernel - 1);
+    assert_eq!(
+        hist.len(),
+        (kernel - 1) * dim,
+        "history must be the {} rows before it",
+        kernel - 1
+    );
     let mut win = std::mem::take(hist);
     win.extend_from_slice(x);
     let out = short_conv(&win, weight, kernel, dim, kernel);
@@ -174,7 +173,16 @@ pub fn route(
             logits[t * rows + e] = xt.iter().zip(w).map(|(a, b)| a * b).sum::<f32>();
         }
     }
-    route_from_logits(&logits, bias, global_scale, route_scale, tokens, n_routed, n_shared, top_k)
+    route_from_logits(
+        &logits,
+        bias,
+        global_scale,
+        route_scale,
+        tokens,
+        n_routed,
+        n_shared,
+        top_k,
+    )
 }
 
 /// [`route`] with the projection already done, wherever it was done.

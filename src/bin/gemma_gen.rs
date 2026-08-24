@@ -27,10 +27,10 @@ use std::time::Instant;
 // Half-precision (f16) weights: 31B dense becomes ~62GB instead of ~124GB f32,
 // the only way the flagship fits 128GB. f16 inference is standard; validated
 // to match f32 output on the small E2B.
-#[cfg(not(feature = "f16gen"))]
-use mary::nn::backend::B;
 #[cfg(feature = "f16gen")]
 use mary::nn::backend::BHalf as B;
+#[cfg(not(feature = "f16gen"))]
+use mary::nn::backend::B;
 
 /// Resolve a SMALL side-file (config.json / tokenizer.json) from the local HF
 /// snapshot. Weights never come from here — they load from the pile.

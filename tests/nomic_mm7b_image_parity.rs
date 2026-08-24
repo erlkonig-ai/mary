@@ -25,7 +25,7 @@ use burn::prelude::*;
 use burn::tensor::TensorData;
 use burn_ndarray::{NdArray, NdArrayDevice};
 use mary::models::qwen2_5_vl::config::{Qwen2_5VlTextConfig, Qwen2_5VlVisionConfig};
-use mary::models::qwen2_5_vl::layers::{QwenTextModel, QwenWeights, get_rope_index};
+use mary::models::qwen2_5_vl::layers::{get_rope_index, QwenTextModel, QwenWeights};
 use mary::models::qwen2_5_vl::vision::{VisionTransformer, VisionWeights};
 use mary::nn::npy;
 use std::collections::HashMap;
@@ -157,10 +157,9 @@ fn image_embed_parity() {
     }
     let device = NdArrayDevice::default();
     eprintln!("[image-parity] loading combined keymap from {pile_path} ...");
-    let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(Path::new(
-        &pile_path,
-    ))
-    .expect("load native model collection snapshot");
+    let (_, snapshot) =
+        mary::model_collection::load_sole_model_collection_local_latest(Path::new(&pile_path))
+            .expect("load native model collection snapshot");
     let map = mary::persist::load_nomic_mm7b_keymap_from_snapshot(snapshot)
         .expect("select and materialize the Nomic text + vision components");
     eprintln!(

@@ -83,7 +83,10 @@ fn aliased_metal_embed_parity() {
         std::env::var("NOMIC_MM7B_PILE").ok().as_deref(),
         "nomic_mm7b_combined.pile",
     ) else {
-        eprintln!("SKIP: {}", mary::paths::skip_reason("nomic_mm7b_combined.pile"));
+        eprintln!(
+            "SKIP: {}",
+            mary::paths::skip_reason("nomic_mm7b_combined.pile")
+        );
         return;
     };
     let dir = golden_dir();
@@ -102,12 +105,9 @@ fn aliased_metal_embed_parity() {
     let t0 = Instant::now();
     let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(&pile_path)
         .expect("load native model collection snapshot");
-    let embedder = mary::persist::load_nomic_mm7b_aliased_from_snapshot(
-        snapshot,
-        &tok_path,
-        device.clone(),
-    )
-    .expect("aliased load");
+    let embedder =
+        mary::persist::load_nomic_mm7b_aliased_from_snapshot(snapshot, &tok_path, device.clone())
+            .expect("aliased load");
     let load_ms = t0.elapsed().as_millis();
     eprintln!("[aliased] cold aliased load (mmap f16 -> Metal): {load_ms} ms");
 

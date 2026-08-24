@@ -170,7 +170,10 @@ fn main() -> Result<()> {
         t.n_routed_experts,
         t.n_shared_experts
     );
-    anyhow::ensure!(!headers.is_empty(), "zero tensors examined — the gate would be vacuous");
+    anyhow::ensure!(
+        !headers.is_empty(),
+        "zero tensors examined — the gate would be vacuous"
+    );
 
     let mut fails = 0usize;
     let mut checks = 0usize;
@@ -242,7 +245,9 @@ fn main() -> Result<()> {
                 // A parsed slot must also be one the config admits.
                 if describe(&cfg, &quantized, slot).is_none() {
                     if unmapped < 8 {
-                        println!("  FAIL  {name} parses to {slot:?}, which the config does not admit");
+                        println!(
+                            "  FAIL  {name} parses to {slot:?}, which the config does not admit"
+                        );
                     }
                     unmapped += 1;
                     fails += 1;
@@ -262,8 +267,16 @@ fn main() -> Result<()> {
     let global: Vec<usize> = (0..t.num_hidden_layers)
         .filter(|&i| t.attn_kind(i) == AttnKind::Global)
         .collect();
-    println!("  local  (window {}) : {} layers", t.sliding_window_size, local.len());
-    println!("  global             : {} layers {:?}", global.len(), global);
+    println!(
+        "  local  (window {}) : {} layers",
+        t.sliding_window_size,
+        local.len()
+    );
+    println!(
+        "  global             : {} layers {:?}",
+        global.len(),
+        global
+    );
     checks += 1;
     if local.len() + global.len() != t.num_hidden_layers {
         println!("  FAIL  the split does not cover every layer");
@@ -273,23 +286,42 @@ fn main() -> Result<()> {
     println!("\n=== 5. vision pyramid arithmetic ===");
     let vc = &cfg.vision_config;
     let per_frame = (vc.patch_size / vc.subpatch_size).pow(2);
-    println!("  sub-patch {}x{}x{} = {} elems", vc.subpatch_size, vc.subpatch_size, vc.n_channels, vc.subpatch_elems());
+    println!(
+        "  sub-patch {}x{}x{} = {} elems",
+        vc.subpatch_size,
+        vc.subpatch_size,
+        vc.n_channels,
+        vc.subpatch_elems()
+    );
     println!("  sub-patches per frame : {per_frame}");
     println!("  whole temporal patch  : {} elems", vc.patch_elems());
     checks += 1;
     if vc.patch_size % vc.subpatch_size != 0 {
-        println!("  FAIL  patch {} is not a whole number of sub-patches", vc.patch_size);
+        println!(
+            "  FAIL  patch {} is not a whole number of sub-patches",
+            vc.patch_size
+        );
         fails += 1;
     }
     // The last stage must consume exactly one temporal patch's worth.
-    let last = Slot::Vision(mary::models::inkling::layout::VisionPart::Linear(vc.n_layers - 1));
+    let last = Slot::Vision(mary::models::inkling::layout::VisionPart::Linear(
+        vc.n_layers - 1,
+    ));
     checks += 1;
     match describe(&cfg, &quantized, last) {
         Some((shape, _)) if shape.dims() == [vc.decoder_dmodel, vc.patch_elems()].as_slice() => {
-            println!("  final stage {} -> {} : closes", vc.patch_elems(), vc.decoder_dmodel);
+            println!(
+                "  final stage {} -> {} : closes",
+                vc.patch_elems(),
+                vc.decoder_dmodel
+            );
         }
         other => {
-            println!("  FAIL  final vision stage is {other:?}, expected [{}, {}]", vc.decoder_dmodel, vc.patch_elems());
+            println!(
+                "  FAIL  final vision stage is {other:?}, expected [{}, {}]",
+                vc.decoder_dmodel,
+                vc.patch_elems()
+            );
             fails += 1;
         }
     }
@@ -300,7 +332,11 @@ fn main() -> Result<()> {
         t.shared_expert_sink,
         t.gate_rows(),
         t.n_routed_experts,
-        if t.shared_expert_sink { t.n_shared_experts } else { 0 }
+        if t.shared_expert_sink {
+            t.n_shared_experts
+        } else {
+            0
+        }
     );
     checks += 1;
     let a_moe = (0..t.num_hidden_layers).find(|&i| !t.is_dense(i));
@@ -319,7 +355,12 @@ fn main() -> Result<()> {
                 println!("  {name} is {} : matches", h.shape)
             }
             Some(h) => {
-                println!("  FAIL  {name} is {}, config implies [{}, {}]", h.shape, t.gate_rows(), t.hidden_size);
+                println!(
+                    "  FAIL  {name} is {}, config implies [{}, {}]",
+                    h.shape,
+                    t.gate_rows(),
+                    t.hidden_size
+                );
                 fails += 1;
             }
             None => {
@@ -332,7 +373,11 @@ fn main() -> Result<()> {
     // A sanity check on the NVFP4 sidecar family, so the count is never zero.
     let sidecars = headers
         .keys()
-        .filter(|n| QuantPart::sidecars().iter().any(|q| n.ends_with(q.suffix())))
+        .filter(|n| {
+            QuantPart::sidecars()
+                .iter()
+                .any(|q| n.ends_with(q.suffix()))
+        })
         .count();
     let packed = headers
         .keys()

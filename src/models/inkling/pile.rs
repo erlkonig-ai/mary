@@ -28,8 +28,8 @@
 //! records the boundaries: `codes` is `elems / 2`, `scales` is `elems / 16`,
 //! and the global scale is the trailing four bytes.
 
-use anyhow::{Context, Result};
 use anybytes::Bytes;
+use anyhow::{Context, Result};
 use triblespace::core::blob::encodings::tensor::{
     elements::{BF16, F32, NVFP4, NVFP4_BLOCK},
     tensor_blob, Tensor, TensorElement, TensorView,
@@ -56,7 +56,10 @@ pub fn mem_line(label: &str) -> String {
     let mut swaptotal = 0u64;
     if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
         let kb = |l: &str| -> u64 {
-            l.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0)
+            l.split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
         };
         for l in s.lines() {
             if l.starts_with("MemFree:") {
@@ -78,7 +81,11 @@ pub fn mem_line(label: &str) -> String {
     if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
         for l in s.lines() {
             if l.starts_with("VmRSS:") {
-                rss = l.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+                rss = l
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
             }
         }
     }
@@ -133,7 +140,9 @@ struct SourceRelease {
 impl SourceRelease {
     #[cfg(target_os = "linux")]
     fn new(path: &std::path::Path, map_base: usize, map_len: usize) -> Self {
-        let on = !std::env::var("INK_RELEASE_SOURCE").map(|v| v == "0").unwrap_or(false);
+        let on = !std::env::var("INK_RELEASE_SOURCE")
+            .map(|v| v == "0")
+            .unwrap_or(false);
         // SAFETY: `sysconf` reads a static system parameter.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         let page = if page > 0 { page as usize } else { 4096 };
@@ -155,14 +164,30 @@ impl SourceRelease {
             if on { "on" } else { "OFF" },
             map_len,
             file_len,
-            if whole { "usable" } else { "UNUSABLE (page cache will not be dropped)" },
+            if whole {
+                "usable"
+            } else {
+                "UNUSABLE (page cache will not be dropped)"
+            },
         );
-        Self { file, map_base: whole.then_some(map_base), file_len, page, on }
+        Self {
+            file,
+            map_base: whole.then_some(map_base),
+            file_len,
+            page,
+            on,
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
     fn new(_path: &std::path::Path, _map_base: usize, _map_len: usize) -> Self {
-        Self { file: None, map_base: None, file_len: 0, page: 4096, on: false }
+        Self {
+            file: None,
+            map_base: None,
+            file_len: 0,
+            page: 4096,
+            on: false,
+        }
     }
 
     /// Rounded INWARD to whole pages, so a leaf never releases a page its
@@ -227,9 +252,10 @@ fn mem_total_bytes() -> Result<u64> {
         .context("/proc/meminfo has no numeric MemTotal")?;
     let host = kb.checked_mul(1024).context("MemTotal overflow")?;
     let cgroup = match std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
-        Ok(max) if max.trim() != "max" => {
-            max.trim().parse::<u64>().context("parsing cgroup memory.max")?
-        }
+        Ok(max) if max.trim() != "max" => max
+            .trim()
+            .parse::<u64>()
+            .context("parsing cgroup memory.max")?,
         _ => u64::MAX,
     };
     Ok(host.min(cgroup))
@@ -554,11 +580,8 @@ pub fn expert_blob(q: &PackedExpert) -> Result<Blob<Tensor<NVFP4, 2>>> {
     payload.extend_from_slice(&q.scales);
     payload.extend_from_slice(&q.scale2.to_le_bytes());
 
-    tensor_blob::<NVFP4, 2>(
-        [q.rows as u64, logical as u64],
-        Bytes::from_source(payload),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))
+    tensor_blob::<NVFP4, 2>([q.rows as u64, logical as u64], Bytes::from_source(payload))
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Split a blob's payload back into its three planes.
@@ -569,7 +592,11 @@ pub fn expert_blob(q: &PackedExpert) -> Result<Blob<Tensor<NVFP4, 2>>> {
 /// so they cannot disagree.
 pub fn split_payload(payload: &[u8], elems: usize) -> Result<(&[u8], &[u8], f32)> {
     let want = NVFP4::payload_len(elems);
-    anyhow::ensure!(payload.len() == want, "payload is {} bytes, expected {want}", payload.len());
+    anyhow::ensure!(
+        payload.len() == want,
+        "payload is {} bytes, expected {want}",
+        payload.len()
+    );
     let codes_len = elems / 2;
     let scales_len = elems / NVFP4_BLOCK;
     let codes = &payload[..codes_len];
@@ -604,8 +631,7 @@ pub mod attrs {
     /// exactly as `Attribute::anchored` does, so the ids are identical — and it
     /// exists because `entity!` takes an attribute PATH rather than an
     /// expression.
-    pub fn weight<T: TensorElement, const RANK: usize>(
-    ) -> Attribute<Handle<Tensor<T, RANK>>> {
+    pub fn weight<T: TensorElement, const RANK: usize>() -> Attribute<Handle<Tensor<T, RANK>>> {
         Attribute::anchored(WEIGHT_ANCHOR)
     }
 
@@ -710,7 +736,11 @@ pub fn experts_in_layers(
         }])
     ) {
         if range.contains(&layer) {
-            out.push(ExpertRef { layer, expert, handle: ExpertHandle::Nvfp4(handle) });
+            out.push(ExpertRef {
+                layer,
+                expert,
+                handle: ExpertHandle::Nvfp4(handle),
+            });
         }
     }
     for (layer, expert, handle) in triblespace::macros::find!(
@@ -722,7 +752,11 @@ pub fn experts_in_layers(
         }])
     ) {
         if range.contains(&layer) {
-            out.push(ExpertRef { layer, expert, handle: ExpertHandle::Bf16(handle) });
+            out.push(ExpertRef {
+                layer,
+                expert,
+                handle: ExpertHandle::Bf16(handle),
+            });
         }
     }
     out.sort_by_key(|r| (r.layer, r.expert));
@@ -985,7 +1019,9 @@ impl PileSource {
             .and_then(|v| v.parse().ok())
             .filter(|n: &usize| *n >= 1)
             .unwrap_or_else(|| {
-                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
             });
         macro_rules! sweep_dense {
             ($ty:ty, $rank:literal, $tag:expr) => {{
@@ -1141,7 +1177,10 @@ impl PileSource {
     pub fn is_nvfp4(&self, base: &str) -> bool {
         matches!(
             self.experts.get(&(base.to_string(), 0)),
-            Some(ExpertRef { handle: ExpertHandle::Nvfp4(_), .. })
+            Some(ExpertRef {
+                handle: ExpertHandle::Nvfp4(_),
+                ..
+            })
         )
     }
 
@@ -1161,7 +1200,11 @@ impl PileSource {
                 cols: c.logical / 2,
             });
         }
-        let h = match self.experts.get(&(base.to_string(), e as i64)).map(|r| r.handle) {
+        let h = match self
+            .experts
+            .get(&(base.to_string(), e as i64))
+            .map(|r| r.handle)
+        {
             Some(ExpertHandle::Nvfp4(h)) => h,
             Some(ExpertHandle::Bf16(_)) => {
                 anyhow::bail!("{base}[{e}] is BF16, not packed NVFP4")
@@ -1216,7 +1259,11 @@ impl PileSource {
                 cols: c.logical,
             });
         }
-        let h = match self.experts.get(&(base.to_string(), e as i64)).map(|r| r.handle) {
+        let h = match self
+            .experts
+            .get(&(base.to_string(), e as i64))
+            .map(|r| r.handle)
+        {
             Some(ExpertHandle::Bf16(h)) => h,
             Some(ExpertHandle::Nvfp4(_)) => {
                 anyhow::bail!("{base}[{e}] is packed NVFP4, not BF16")
@@ -1238,7 +1285,11 @@ impl PileSource {
             "{base}[{e}]: {} bytes for {rows}x{cols} BF16",
             payload.len()
         );
-        Ok(Bf16Slab { bytes: payload.clone(), rows, cols })
+        Ok(Bf16Slab {
+            bytes: payload.clone(),
+            rows,
+            cols,
+        })
     }
 
     /// The pile's mapping, as `(base, len, keepalive)` — a list of ONE.
@@ -1253,7 +1304,15 @@ impl PileSource {
     /// owner of every payload and asking a payload for its owner is exact. A
     /// second `mmap` of the same file would be a different address range and
     /// every offset computed against it would be silently wrong.
-    pub fn mappings(&self) -> Result<Vec<(usize, usize, std::sync::Arc<dyn std::any::Any + Send + Sync>)>> {
+    pub fn mappings(
+        &self,
+    ) -> Result<
+        Vec<(
+            usize,
+            usize,
+            std::sync::Arc<dyn std::any::Any + Send + Sync>,
+        )>,
+    > {
         if let Some(bytes) = &self.copied {
             let view: anybytes::View<[u8]> = bytes
                 .clone()
@@ -1305,9 +1364,7 @@ impl PileSource {
         let mut v: Vec<(String, i64)> = self
             .experts
             .iter()
-            .filter(|((_, _), r)| {
-                r.layer >= range.start as i64 && r.layer < range.end as i64
-            })
+            .filter(|((_, _), r)| r.layer >= range.start as i64 && r.layer < range.end as i64)
             .map(|((n, e), _)| (n.clone(), *e))
             .collect();
         v.sort();
@@ -1431,7 +1488,9 @@ impl PileSource {
             .dense
             .iter()
             .filter(|(name, leaf)| {
-                leaf.layer.map(|l| layers.contains(&(l as usize))).unwrap_or(false)
+                leaf.layer
+                    .map(|l| layers.contains(&(l as usize)))
+                    .unwrap_or(false)
                     || globals.contains(name.as_str())
             })
             .map(|(name, _)| name.clone())
@@ -1483,7 +1542,10 @@ impl PileSource {
                 .context("weight share byte count overflow")?;
             cursor = end.next_multiple_of(VIEW_ALIGN);
             let dev = device_weight_bytes(name, &self.dense[name], policy);
-            match self.dense[name].layer.filter(|l| layers.contains(&(*l as usize))) {
+            match self.dense[name]
+                .layer
+                .filter(|l| layers.contains(&(*l as usize)))
+            {
                 Some(l) => {
                     *per_layer.entry(l).or_default() += cursor - start;
                     *per_layer_dev.entry(l).or_default() += dev;
@@ -1675,7 +1737,9 @@ impl PileSource {
             .and_then(|v| v.parse().ok())
             .filter(|n| *n >= 1)
             .unwrap_or_else(|| {
-                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
             });
 
         enum Job<'a> {
@@ -1744,15 +1808,14 @@ impl PileSource {
                                                 reader.get(h).map_err(|err| {
                                                     anyhow::anyhow!("{}[{}]: {err:?}", k.0, k.1)
                                                 })?;
-                                            let view = TensorView::try_from_blob(blob).map_err(
-                                                |err| {
+                                            let view =
+                                                TensorView::try_from_blob(blob).map_err(|err| {
                                                     anyhow::anyhow!(
                                                         "{}[{}]: decode: {err}",
                                                         k.0,
                                                         k.1
                                                     )
-                                                },
-                                            )?;
+                                                })?;
                                             anyhow::ensure!(
                                                 shape.nvfp4
                                                     && view.dims()[0] as usize == shape.rows
@@ -1771,15 +1834,14 @@ impl PileSource {
                                                 reader.get(h).map_err(|err| {
                                                     anyhow::anyhow!("{}[{}]: {err:?}", k.0, k.1)
                                                 })?;
-                                            let view = TensorView::try_from_blob(blob).map_err(
-                                                |err| {
+                                            let view =
+                                                TensorView::try_from_blob(blob).map_err(|err| {
                                                     anyhow::anyhow!(
                                                         "{}[{}]: decode: {err}",
                                                         k.0,
                                                         k.1
                                                     )
-                                                },
-                                            )?;
+                                                })?;
                                             anyhow::ensure!(
                                                 !shape.nvfp4
                                                     && view.dims()[0] as usize == shape.rows
@@ -1838,26 +1900,30 @@ impl PileSource {
             .view()
             .map_err(|e| anyhow::anyhow!("viewing the anonymous weight allocation: {e}"))?;
         let bytes = view.bytes();
-        for ((key, shape), (start, end)) in keys
-            .iter()
-            .map(|k| (k, shapes[&k.0]))
-            .zip(expert_offsets)
+        for ((key, shape), (start, end)) in
+            keys.iter().map(|k| (k, shapes[&k.0])).zip(expert_offsets)
         {
-            self.copied_experts.insert(key.clone(), CopiedExpert {
-                payload: bytes.slice(skew + start..skew + end),
-                rows: shape.rows,
-                logical: shape.logical,
-                nvfp4: shape.nvfp4,
-            });
+            self.copied_experts.insert(
+                key.clone(),
+                CopiedExpert {
+                    payload: bytes.slice(skew + start..skew + end),
+                    rows: shape.rows,
+                    logical: shape.logical,
+                    nvfp4: shape.nvfp4,
+                },
+            );
         }
         for (name, (start, end)) in dense_names.iter().zip(dense_offsets) {
-            self.dense
-                .get_mut(name)
-                .expect("selected dense leaf")
-                .bytes = bytes.slice(skew + start..skew + end);
+            self.dense.get_mut(name).expect("selected dense leaf").bytes =
+                bytes.slice(skew + start..skew + end);
         }
         self.copied = Some(bytes);
-        Ok((self.copied_experts.len(), dense_names.len(), total as u64, device_weights))
+        Ok((
+            self.copied_experts.len(),
+            dense_names.len(),
+            total as u64,
+            device_weights,
+        ))
     }
 
     /// Every `(stacked matrix name, expert index)` this pile holds, sorted.
@@ -1963,8 +2029,14 @@ mod tests {
                 share.push((format!("{p}{nm}"), leaf(&dims, Some(l))));
             }
             if l < 2 {
-                share.push((format!("{p}mlp.w13_dn.weight"), leaf(&[32768, 4096], Some(l))));
-                share.push((format!("{p}mlp.w2_md.weight"), leaf(&[4096, 16384], Some(l))));
+                share.push((
+                    format!("{p}mlp.w13_dn.weight"),
+                    leaf(&[32768, 4096], Some(l)),
+                ));
+                share.push((
+                    format!("{p}mlp.w2_md.weight"),
+                    leaf(&[4096, 16384], Some(l)),
+                ));
             } else {
                 share.push((format!("{p}mlp.gate.weight"), leaf(&[258, 4096], Some(l))));
                 share.push((
@@ -1979,11 +2051,17 @@ mod tests {
         }
         // In the arena on this node, and NOT bound: the embedding is a lookup.
         share.push(("model.llm.embed.weight".into(), leaf(&[201024, 4096], None)));
-        share.push(("model.llm.unembed.weight".into(), leaf(&[201024, 4096], None)));
+        share.push((
+            "model.llm.unembed.weight".into(),
+            leaf(&[201024, 4096], None),
+        ));
         // Copied into the arena by layer number, bound only when drafting.
         for l in 0..8i64 {
             let p = format!("model.mtp.layers.{l}.");
-            share.push((format!("{p}input_proj.weight"), leaf(&[4096, 8192], Some(l))));
+            share.push((
+                format!("{p}input_proj.weight"),
+                leaf(&[4096, 8192], Some(l)),
+            ));
             share.push((
                 format!("{p}transformer_block.attn.wq_du.weight"),
                 leaf(&[4096, 4096], Some(l)),
@@ -1991,13 +2069,22 @@ mod tests {
         }
 
         let sum = |policy: AdmissionPolicy| -> u64 {
-            share.iter().map(|(n, l)| device_weight_bytes(n, l, policy)).sum()
+            share
+                .iter()
+                .map(|(n, l)| device_weight_bytes(n, l, policy))
+                .sum()
         };
 
         let device = sum(placed(DenseWeights::DevicePool));
-        assert_eq!(device, 5_300_944_896, "the device arm's 4.94 GiB, to the byte");
+        assert_eq!(
+            device, 5_300_944_896,
+            "the device arm's 4.94 GiB, to the byte"
+        );
         let aliased = sum(placed(DenseWeights::Aliased));
-        assert_eq!(aliased, 1_506_672_640, "the aliased arm's 1.40 GiB, to the byte");
+        assert_eq!(
+            aliased, 1_506_672_640,
+            "the aliased arm's 1.40 GiB, to the byte"
+        );
         // The win's whole memory cost, which is what the gate could not see.
         assert_eq!(device - aliased, 3_794_272_256);
         // Drafting binds the MTP heads that the range already pays arena for.
@@ -2023,12 +2110,8 @@ mod tests {
         let machine = 128 * GIB;
         let attention = 7 * GIB;
         let storage = (StorageDType::F32, StorageDType::F32, StorageDType::Bf16);
-        let subslices = AdmissionPolicy::new(
-            AllocatorConfig::SubSlices,
-            storage.0,
-            storage.1,
-            storage.2,
-        );
+        let subslices =
+            AdmissionPolicy::new(AllocatorConfig::SubSlices, storage.0, storage.1, storage.2);
         let exclusive = AdmissionPolicy::new(
             AllocatorConfig::ExclusivePages,
             storage.0,
@@ -2036,8 +2119,14 @@ mod tests {
             storage.2,
         );
         let base = GIB / 5 + 41 * GIB / 200 * 8 + 4 * GIB + attention;
-        assert_eq!(run_overhead_bytes(8, attention, machine, subslices), base + 40 * GIB);
-        assert_eq!(run_overhead_bytes(8, attention, machine, exclusive), base + 40 * GIB);
+        assert_eq!(
+            run_overhead_bytes(8, attention, machine, subslices),
+            base + 40 * GIB
+        );
+        assert_eq!(
+            run_overhead_bytes(8, attention, machine, exclusive),
+            base + 40 * GIB
+        );
     }
 
     /// The 2026-08-23 spark incident, in the numbers its own logs printed.
@@ -2058,7 +2147,10 @@ mod tests {
         let (machine, need, share) = (gib(119.63), gib(112.65), gib(66.50));
         // The comparison the old gate made, and passed: the share alone really
         // does fit the busy node. That is why reading it was not enough.
-        assert!(share < gib(69.93), "the old test found room and was still wrong");
+        assert!(
+            share < gib(69.93),
+            "the old test found room and was still wrong"
+        );
         assert_eq!(admit(need, machine, gib(69.93)), Admission::NodeBusy);
         // ...and the same run on the idle node is still admitted, so this is
         // not a blanket tightening that costs work which would have run.
@@ -2067,7 +2159,10 @@ mod tests {
         assert_eq!(admit(gib(111.40), machine, gib(114.75)), Admission::Fits);
         // Too big for the node at all is a different verdict because it takes a
         // different fix: more nodes, not more patience.
-        assert_eq!(admit(gib(130.0), machine, gib(119.0)), Admission::OverMachine);
+        assert_eq!(
+            admit(gib(130.0), machine, gib(119.0)),
+            Admission::OverMachine
+        );
         // An exactly-full node is admitted -- the floors inside
         // `run_overhead_bytes` are what leaves the kernel its room, and
         // subtracting a second margin here would double-charge it.
@@ -2093,8 +2188,7 @@ mod tests {
         let q = expert(64, 128);
         let blob = expert_blob(&q).expect("well formed");
         let view: TensorView = blob.try_from_blob().expect("decodes");
-        let (codes, scales, scale2) =
-            split_payload(view.payload(), view.elems()).expect("splits");
+        let (codes, scales, scale2) = split_payload(view.payload(), view.elems()).expect("splits");
         assert_eq!(codes, &q.codes[..], "codes");
         assert_eq!(scales, &q.scales[..], "block scales");
         assert_eq!(scale2, q.scale2, "global scale");
@@ -2121,7 +2215,10 @@ mod tests {
 
     #[test]
     fn a_layer_is_read_from_the_name_and_absent_when_there_is_none() {
-        assert_eq!(layer_of("model.llm.layers.10.mlp.experts.w13_weight"), Some(10));
+        assert_eq!(
+            layer_of("model.llm.layers.10.mlp.experts.w13_weight"),
+            Some(10)
+        );
         assert_eq!(layer_of("model.llm.layers.0.mlp.w13_dn"), Some(0));
         assert_eq!(layer_of("model.mtp.layers.3.attn.wq_du"), Some(3));
         // No layer at all: absent, not zero. A tensor that silently joined
@@ -2155,12 +2252,23 @@ mod tests {
 
         let held = experts_in_layers(&space, 0..=20);
         assert_eq!(held.len(), 2, "two experts in layer 3");
-        assert!(held.iter().all(|r| r.layer == 3), "layer 30 must not appear");
+        assert!(
+            held.iter().all(|r| r.layer == 3),
+            "layer 30 must not appear"
+        );
         assert_eq!(held[0].expert, 0, "and they come back ordered");
         assert_eq!(held[1].expert, 1);
 
-        assert_eq!(experts_in_layers(&space, 21..=41).len(), 1, "the other half");
-        assert_eq!(experts_in_layers(&space, 100..=200).len(), 0, "and an empty range is empty");
+        assert_eq!(
+            experts_in_layers(&space, 21..=41).len(),
+            1,
+            "the other half"
+        );
+        assert_eq!(
+            experts_in_layers(&space, 100..=200).len(),
+            0,
+            "and an empty range is empty"
+        );
     }
 
     /// Inkling's real proportions: a 4096x4096 expert packs to 4096x2048 bytes
@@ -2169,8 +2277,15 @@ mod tests {
     fn the_real_expert_proportions_line_up() {
         let (rows, logical) = (4096usize, 4096usize);
         let elems = rows * logical;
-        assert_eq!(elems / 2, 4096 * 2048, "packed width matches the checkpoint");
+        assert_eq!(
+            elems / 2,
+            4096 * 2048,
+            "packed width matches the checkpoint"
+        );
         assert_eq!(elems / NVFP4_BLOCK, 4096 * 256, "scale width matches");
-        assert_eq!(NVFP4::payload_len(elems), elems / 2 + elems / NVFP4_BLOCK + 4);
+        assert_eq!(
+            NVFP4::payload_len(elems),
+            elems / 2 + elems / NVFP4_BLOCK + 4
+        );
     }
 }

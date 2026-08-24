@@ -241,11 +241,7 @@ impl RealtimePipeline {
     /// depformer weights as f16 (f32 accumulate) instead of f32. Accepting the
     /// authority/loader pair prevents a future native cache from being checked
     /// against one bundle while its unchanged weights come from another.
-    pub fn load(
-        source: &super::PersonaPlexRuntimeSource,
-        fmt: WeightFmt,
-        depth_f16: bool,
-    ) -> Self {
+    pub fn load(source: &super::PersonaPlexRuntimeSource, fmt: WeightFmt, depth_f16: bool) -> Self {
         let loader = source.loader();
         Self {
             temporal: TemporalMetal::load(loader, fmt),

@@ -68,7 +68,10 @@ impl Shape {
         assert!(dims.len() <= 3, "Inkling has no tensors above rank 3");
         let mut d = [0usize; 3];
         d[..dims.len()].copy_from_slice(dims);
-        Shape { dims: d, rank: dims.len() as u8 }
+        Shape {
+            dims: d,
+            rank: dims.len() as u8,
+        }
     }
 
     pub fn dims(&self) -> &[usize] {
@@ -130,7 +133,12 @@ impl QuantPart {
 
     /// The four sidecars a quantized matrix carries beyond its codes.
     pub fn sidecars() -> [QuantPart; 4] {
-        [QuantPart::Scale, QuantPart::Scale2, QuantPart::InputAmax, QuantPart::OriginalShape]
+        [
+            QuantPart::Scale,
+            QuantPart::Scale2,
+            QuantPart::InputAmax,
+            QuantPart::OriginalShape,
+        ]
     }
 }
 
@@ -344,7 +352,10 @@ impl Slot {
                 MtpPart::HiddenNorm => format!("model.mtp.layers.{i}.hidden_norm.weight"),
                 MtpPart::InputProj => format!("model.mtp.layers.{i}.input_proj.weight"),
                 MtpPart::Block(b) => {
-                    format!("model.mtp.layers.{i}.transformer_block.{}", block_suffix(*b))
+                    format!(
+                        "model.mtp.layers.{i}.transformer_block.{}",
+                        block_suffix(*b)
+                    )
                 }
             },
             Slot::Vision(v) => match v {
@@ -367,9 +378,7 @@ impl Slot {
             "model.llm.embed_norm.weight" => return Some(Slot::EmbedNorm),
             "model.llm.norm.weight" => return Some(Slot::FinalNorm),
             "model.llm.unembed.weight" => return Some(Slot::Unembed),
-            "model.visual.final_norm.weight" => {
-                return Some(Slot::Vision(VisionPart::FinalNorm))
-            }
+            "model.visual.final_norm.weight" => return Some(Slot::Vision(VisionPart::FinalNorm)),
             "model.audio.encoder.weight" => return Some(Slot::Audio(AudioPart::Encoder)),
             "model.audio.final_norm.weight" => return Some(Slot::Audio(AudioPart::FinalNorm)),
             _ => {}
@@ -417,9 +426,7 @@ fn parse_block(tail: &str) -> Option<BlockPart> {
         "mlp_sconv.weight" => return Some(BlockPart::MlpSconv),
         "mlp.w13_dn.weight" => return Some(BlockPart::Mlp(MlpPart::Dense(DensePart::W13))),
         "mlp.w2_md.weight" => return Some(BlockPart::Mlp(MlpPart::Dense(DensePart::W2))),
-        "mlp.global_scale" => {
-            return Some(BlockPart::Mlp(MlpPart::Dense(DensePart::GlobalScale)))
-        }
+        "mlp.global_scale" => return Some(BlockPart::Mlp(MlpPart::Dense(DensePart::GlobalScale))),
         "mlp.gate.weight" => return Some(BlockPart::Mlp(MlpPart::Moe(MoePart::GateWeight))),
         "mlp.gate.bias" => return Some(BlockPart::Mlp(MlpPart::Moe(MoePart::GateBias))),
         "mlp.gate.global_scale" => {
@@ -514,9 +521,13 @@ pub fn describe(
         }
 
         Slot::Audio(a) => match a {
-            AudioPart::Encoder => {
-                d(&[cfg.audio_config.encoder_rows(), cfg.audio_config.decoder_dmodel], bf)
-            }
+            AudioPart::Encoder => d(
+                &[
+                    cfg.audio_config.encoder_rows(),
+                    cfg.audio_config.decoder_dmodel,
+                ],
+                bf,
+            ),
             AudioPart::FinalNorm => d(&[cfg.audio_config.decoder_dmodel], bf),
         },
 
@@ -524,7 +535,14 @@ pub fn describe(
             if i >= t.num_hidden_layers {
                 return None;
             }
-            describe_block(cfg, quantized_moe_layers, i, t.is_dense(i), t.attn_kind(i), part)
+            describe_block(
+                cfg,
+                quantized_moe_layers,
+                i,
+                t.is_dense(i),
+                t.attn_kind(i),
+                part,
+            )
         }
 
         Slot::Mtp(i, part) => {
@@ -550,7 +568,10 @@ pub fn describe(
 
 /// How many previous-stage vectors stage `i` consumes. Derived from the patch
 /// geometry so a wrong `hidden_dims` default cannot pass unnoticed.
-fn grouping_factor(vc: &crate::models::inkling::config::InklingVisionConfig, i: usize) -> Option<usize> {
+fn grouping_factor(
+    vc: &crate::models::inkling::config::InklingVisionConfig,
+    i: usize,
+) -> Option<usize> {
     // Sub-patches per frame, then the pyramid folds them in equal steps.
     let per_frame = (vc.patch_size / vc.subpatch_size).pow(2);
     let stages = vc.n_layers.checked_sub(1)?;

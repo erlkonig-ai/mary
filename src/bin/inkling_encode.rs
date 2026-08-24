@@ -41,8 +41,13 @@ fn main() -> Result<()> {
         .context("usage: inkling_encode <tokenizer.json> <out.bin>  (text on stdin)")?;
 
     let mut text = String::new();
-    std::io::stdin().read_to_string(&mut text).context("reading the prompt from stdin")?;
-    anyhow::ensure!(!text.is_empty(), "empty prompt — the forward would be vacuous");
+    std::io::stdin()
+        .read_to_string(&mut text)
+        .context("reading the prompt from stdin")?;
+    anyhow::ensure!(
+        !text.is_empty(),
+        "empty prompt — the forward would be vacuous"
+    );
 
     let tok = tokenizers::Tokenizer::from_file(Path::new(&json_path))
         .map_err(|e| anyhow::anyhow!("load {json_path}: {e}"))?;
@@ -50,7 +55,9 @@ fn main() -> Result<()> {
     // `false`: no special tokens. The existing prompt files carry none, and a
     // BOS silently prepended here would make a new prompt incomparable with them
     // while every shape check still passed.
-    let enc = tok.encode(text.as_str(), false).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+    let enc = tok
+        .encode(text.as_str(), false)
+        .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
     let ids: Vec<u32> = enc.get_ids().to_vec();
 
     let mut bytes = Vec::with_capacity(ids.len() * 8);
@@ -59,13 +66,19 @@ fn main() -> Result<()> {
     }
     std::fs::write(&out_path, &bytes).with_context(|| format!("writing {out_path}"))?;
 
-    let back = tok.decode(&ids, false).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+    let back = tok
+        .decode(&ids, false)
+        .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
     println!("  text   : {text:?}");
     println!("  ids    : {} -> {out_path}", ids.len());
     println!("           {ids:?}");
     println!(
         "  decode : {back:?}  {}",
-        if back == text { "== the input" } else { "DIFFERS from the input" }
+        if back == text {
+            "== the input"
+        } else {
+            "DIFFERS from the input"
+        }
     );
     Ok(())
 }

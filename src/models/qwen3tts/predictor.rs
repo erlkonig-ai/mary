@@ -217,7 +217,6 @@ impl CodePredictor {
         }
     }
 
-
     /// Talker hidden width, as measured from the checkpoint's embedding rows.
     pub fn talker_width(&self) -> usize {
         self.talker_width
@@ -255,7 +254,9 @@ impl CodePredictor {
     /// small_to_mtp_projection `(weight [1024 × talker_width], bias [1024])`,
     /// absent on the 0.6B checkpoint (`nn.Identity()` there).
     pub fn proj_weights(&self) -> Option<(&[f32], &[f32])> {
-        self.proj.as_ref().map(|(w, b)| (w.as_slice(), b.as_slice()))
+        self.proj
+            .as_ref()
+            .map(|(w, b)| (w.as_slice(), b.as_slice()))
     }
 
     /// Σ of the 15 non-codebook-0 embedding rows for a full frame, added into
@@ -315,7 +316,9 @@ impl CodePredictor {
         let mut act = vec![0f32; INTER];
         for (li, l) in self.layers.iter().enumerate() {
             rms_norm(x, &l.in_norm, TALKER_EPS, &mut xin);
-            tg(0, &mut || sgemv_mt(&l.qkv, Q_DIM + 2 * KV_DIM, hd, &xin, &mut qkv));
+            tg(0, &mut || {
+                sgemv_mt(&l.qkv, Q_DIM + 2 * KV_DIM, hd, &xin, &mut qkv)
+            });
             let (q, rest) = qkv.split_at_mut(Q_DIM);
             let (k, v) = rest.split_at_mut(KV_DIM);
             for h in 0..PRED_HEADS {
@@ -352,7 +355,9 @@ impl CodePredictor {
             }
 
             rms_norm(x, &l.post_norm, TALKER_EPS, &mut xin);
-            tg(2, &mut || sgemv_mt(&l.gate_up, 2 * INTER, hd, &xin, &mut gu));
+            tg(2, &mut || {
+                sgemv_mt(&l.gate_up, 2 * INTER, hd, &xin, &mut gu)
+            });
             for i in 0..INTER {
                 let g = gu[i];
                 act[i] = g / (1.0 + (-g).exp()) * gu[INTER + i];

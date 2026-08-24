@@ -564,8 +564,7 @@ fn interleave_gate_up(gu: &[f32]) -> Vec<f32> {
     let mut out = vec![0f32; 2 * FH * D];
     for j in 0..FH {
         out[(2 * j) * D..(2 * j + 1) * D].copy_from_slice(&gu[j * D..(j + 1) * D]);
-        out[(2 * j + 1) * D..(2 * j + 2) * D]
-            .copy_from_slice(&gu[(FH + j) * D..(FH + j + 1) * D]);
+        out[(2 * j + 1) * D..(2 * j + 2) * D].copy_from_slice(&gu[(FH + j) * D..(FH + j + 1) * D]);
     }
     out
 }
@@ -789,8 +788,7 @@ impl DepthGpu {
         // All n_q conditioning projections in ONE matvec: `transformer_out` is
         // constant across the in-frame steps, and the stacked weight is
         // step-major so n_q steps are a row prefix.
-        self.dep_in
-            .forward_rows(c, &x_in, &self.cond, n_q * D);
+        self.dep_in.forward_rows(c, &x_in, &self.cond, n_q * D);
 
         for s in 0..n_q {
             let emb = if s == 0 {
@@ -902,7 +900,10 @@ impl DepthGpu {
     /// greedy frame).
     pub fn tokens(&self, n_q: usize) -> Vec<i64> {
         use cubecl::CubeElement;
-        let bytes = self.client.read_one(self.tok.clone()).expect("tok readback");
+        let bytes = self
+            .client
+            .read_one(self.tok.clone())
+            .expect("tok readback");
         u32::from_bytes(&bytes)[..n_q]
             .iter()
             .map(|&t| t as i64)
@@ -934,7 +935,13 @@ impl DepthGpu {
 }
 
 /// Encode + upload one row-major `[out, in]` f32 weight in `fmt`.
-fn upload(client: &q4::Client, w: &[f32], out_dim: usize, in_dim: usize, fmt: WeightFmt) -> QLinear {
+fn upload(
+    client: &q4::Client,
+    w: &[f32],
+    out_dim: usize,
+    in_dim: usize,
+    fmt: WeightFmt,
+) -> QLinear {
     assert_eq!(w.len(), out_dim * in_dim);
     let enc = encode(w, out_dim, in_dim, fmt);
     QLinear::upload(client, &enc, out_dim, in_dim, fmt)

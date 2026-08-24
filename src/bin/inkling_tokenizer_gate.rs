@@ -115,8 +115,14 @@ fn main() -> Result<()> {
     println!(
         "parsed   : {} model, {} vocab, {} merges, {} added tokens",
         v["model"]["type"].as_str().unwrap_or("?"),
-        v["model"]["vocab"].as_object().map(|o| o.len()).unwrap_or(0),
-        v["model"]["merges"].as_array().map(|a| a.len()).unwrap_or(0),
+        v["model"]["vocab"]
+            .as_object()
+            .map(|o| o.len())
+            .unwrap_or(0),
+        v["model"]["merges"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0),
         v["added_tokens"].as_array().map(|a| a.len()).unwrap_or(0),
     );
 
@@ -195,9 +201,14 @@ fn main() -> Result<()> {
     // fragment root — these disagreed once for SPM, and the failure was silent.
     let tok_id = mary::tokenizer::find_tokenizer(&tribles)
         .context("find_tokenizer must discover the node the loader looks for")?;
-    anyhow::ensure!(tok_id == root_id, "find_tokenizer found a different node than the root");
+    anyhow::ensure!(
+        tok_id == root_id,
+        "find_tokenizer found a different node than the root"
+    );
 
-    let reader = blobs.reader().map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
+    let reader = blobs
+        .reader()
+        .map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
     let from_graph = mary::tokenizer::build_tokenizer(&tribles, &reader, tok_id)
         .map_err(|e| anyhow::anyhow!("build from graph: {e}"))?;
 
@@ -314,8 +325,12 @@ fn compare(
     // ids, and decode the same ids to the same text.
     let mut enc_bad = 0usize;
     for s in PROBES {
-        let ea = a.encode(*s, false).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
-        let eb = b.encode(*s, false).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+        let ea = a
+            .encode(*s, false)
+            .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+        let eb = b
+            .encode(*s, false)
+            .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
         if ea.get_ids() != eb.get_ids() {
             if enc_bad < 4 {
                 println!(
@@ -327,8 +342,10 @@ fn compare(
             enc_bad += 1;
         }
         let (da, db) = (
-            a.decode(ea.get_ids(), false).map_err(|e| anyhow::anyhow!("decode: {e}"))?,
-            b.decode(eb.get_ids(), false).map_err(|e| anyhow::anyhow!("decode: {e}"))?,
+            a.decode(ea.get_ids(), false)
+                .map_err(|e| anyhow::anyhow!("decode: {e}"))?,
+            b.decode(eb.get_ids(), false)
+                .map_err(|e| anyhow::anyhow!("decode: {e}"))?,
         );
         if da != db {
             println!("  [{label}] DECODE MISMATCH {s:?}: {da:?} vs {db:?}");
@@ -357,8 +374,12 @@ fn compare(
     if let Some(vocab) = src["model"]["vocab"].as_object() {
         for tok in vocab.keys() {
             vchecked += 1;
-            let ea = a.encode(tok.as_str(), false).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
-            let eb = b.encode(tok.as_str(), false).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+            let ea = a
+                .encode(tok.as_str(), false)
+                .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+            let eb = b
+                .encode(tok.as_str(), false)
+                .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
             if ea.get_ids() != eb.get_ids() {
                 if vbad < 5 {
                     println!(
@@ -391,12 +412,18 @@ fn compare(
     let mut dbad = 0usize;
     let n_ids = a.get_vocab_size(false) as u32;
     for id in 0..n_ids {
-        let Ok(text) = a.decode(&[id], false) else { continue };
+        let Ok(text) = a.decode(&[id], false) else {
+            continue;
+        };
         if text.is_empty() {
             continue;
         }
-        let ea = a.encode(text.as_str(), false).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
-        let eb = b.encode(text.as_str(), false).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+        let ea = a
+            .encode(text.as_str(), false)
+            .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+        let eb = b
+            .encode(text.as_str(), false)
+            .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
         if ea.get_ids() != eb.get_ids() {
             if dbad < 5 {
                 println!(
@@ -421,14 +448,18 @@ fn compare(
     // encode(decode(ids)) == ids would be a check about BPE rather than about
     // this graph.
     for f in ["/tmp/prompt.ids", "/tmp/chat_ids.bin"] {
-        let Ok(bytes) = std::fs::read(f) else { continue };
+        let Ok(bytes) = std::fs::read(f) else {
+            continue;
+        };
         let ids: Vec<u32> = bytes
             .chunks_exact(8)
             .map(|c| i64::from_le_bytes(c.try_into().expect("8")) as u32)
             .collect();
         let (da, db) = (
-            a.decode(&ids, false).map_err(|e| anyhow::anyhow!("decode: {e}"))?,
-            b.decode(&ids, false).map_err(|e| anyhow::anyhow!("decode: {e}"))?,
+            a.decode(&ids, false)
+                .map_err(|e| anyhow::anyhow!("decode: {e}"))?,
+            b.decode(&ids, false)
+                .map_err(|e| anyhow::anyhow!("decode: {e}"))?,
         );
         if da == db {
             println!("  [{label}] {f}: decodes identically -> {:?}", trunc(&da));

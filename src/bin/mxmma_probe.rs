@@ -8,9 +8,9 @@
 //! operands, checked against a CPU reference computed from the same decoded
 //! values.
 use cubecl::cuda::CudaRuntime;
+use cubecl::ir::MatrixIdent;
 use cubecl::prelude::*;
 use cubecl::{e2m1, e2m1x2, ue8m0};
-use cubecl::ir::MatrixIdent;
 
 #[cube(launch)]
 pub fn mx_mma<AB: Scalar, S: Scalar, NA: Size, NC: Size>(
@@ -24,8 +24,12 @@ pub fn mx_mma<AB: Scalar, S: Scalar, NA: Size, NC: Size>(
     #[comptime] scales_factor: usize,
 ) {
     // scales_factor 2 at k=64 == one scale per 32 elements == MXFP4.
-    let def =
-        cmma::MmaDefinition::<AB, AB, f32>::new_scaled::<S>(16usize, 8usize, 64usize, scales_factor);
+    let def = cmma::MmaDefinition::<AB, AB, f32>::new_scaled::<S>(
+        16usize,
+        8usize,
+        64usize,
+        scales_factor,
+    );
     let lane = UNIT_POS_PLANE;
     let pack = AB::packing_factor();
 
@@ -90,8 +94,12 @@ fn main() {
         .map(|i| e2m1::from_bits(((i % 5) + 1) as u8).to_f32())
         .collect();
     let spr = k / (64 / sf);
-    let sa: Vec<ue8m0> = (0..m * spr).map(|i| ue8m0::from_bits((127 + (i % 3)) as u8)).collect();
-    let sb: Vec<ue8m0> = (0..n * spr).map(|i| ue8m0::from_bits((127 + (i % 2)) as u8)).collect();
+    let sa: Vec<ue8m0> = (0..m * spr)
+        .map(|i| ue8m0::from_bits((127 + (i % 3)) as u8))
+        .collect();
+    let sb: Vec<ue8m0> = (0..n * spr)
+        .map(|i| ue8m0::from_bits((127 + (i % 2)) as u8))
+        .collect();
 
     let a_p = e2m1x2::from_f32_slice(&a_f);
     let b_p = e2m1x2::from_f32_slice(&b_f);
@@ -127,7 +135,10 @@ fn main() {
             let mut s = 0.0f32;
             for l in 0..k {
                 let t = l / (64 / sf);
-                s += a_f[i * k + l] * sa[i * spr + t].to_f32() * b_f[j * k + l] * sb[j * spr + t].to_f32();
+                s += a_f[i * k + l]
+                    * sa[i * spr + t].to_f32()
+                    * b_f[j * k + l]
+                    * sb[j * spr + t].to_f32();
             }
             let g = got[i * n + j];
             if !g.is_finite() {

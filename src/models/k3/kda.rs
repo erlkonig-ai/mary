@@ -313,7 +313,11 @@ impl<E: Elem> KdaState<E> {
 
     /// Adopt a cached state in the `[HV][K][V]` layout.
     pub fn from_kv(cfg: &KdaConfig, kv: &[E]) -> Self {
-        assert_eq!(kv.len(), cfg.state_elems(), "initial state must be [HV,K,V]");
+        assert_eq!(
+            kv.len(),
+            cfg.state_elems(),
+            "initial state must be [HV,K,V]"
+        );
         Self {
             s: kv.to_vec().into_boxed_slice(),
         }
@@ -328,7 +332,11 @@ impl<E: Elem> KdaState<E> {
     /// changes the output by 56% relative, silently. Any cache crossing this
     /// boundary must come through here, not through [`from_kv`](Self::from_kv).
     pub fn from_vk(cfg: &KdaConfig, vk: &[E]) -> Self {
-        assert_eq!(vk.len(), cfg.state_elems(), "initial state must be [HV,V,K]");
+        assert_eq!(
+            vk.len(),
+            cfg.state_elems(),
+            "initial state must be [HV,V,K]"
+        );
         let (k, v) = (cfg.head_k_dim, cfg.head_v_dim);
         let mut s = vec![E::ZERO; cfg.state_elems()].into_boxed_slice();
         for h in 0..cfg.num_heads {
@@ -709,7 +717,11 @@ mod tests {
                 );
             }
             sizes.push((st.byte_len(), cst.byte_len()));
-            assert!(out.iter().all(|o| o.is_finite()), "T={} produced non-finite output", t_len);
+            assert!(
+                out.iter().all(|o| o.is_finite()),
+                "T={} produced non-finite output",
+                t_len
+            );
         }
         assert_eq!(sizes[0], sizes[1], "state grew between T=1 and T=16");
         assert_eq!(sizes[1], sizes[2], "state grew between T=16 and T=128");
@@ -748,12 +760,21 @@ mod tests {
             // consequence this port turns on.
             let bounded_hi = decay_gate(a_log, 50.0, 0.0, lb);
             let unbounded_hi = decay_gate(a_log, 50.0, 0.0, None);
-            assert!((bounded_hi - (-5.0)).abs() < 1e-12, "bounded gate saturates at -5");
+            assert!(
+                (bounded_hi - (-5.0)).abs() < 1e-12,
+                "bounded gate saturates at -5"
+            );
             assert!(unbounded_hi < -49.0 * a_log.exp(), "softplus(50) ≈ 50");
             let bounded_lo = decay_gate(a_log, -50.0, 0.0, lb);
             let unbounded_lo = decay_gate(a_log, -50.0, 0.0, None);
-            assert!(bounded_lo.abs() < 1e-12 && bounded_lo <= 0.0, "retain: g ≈ 0");
-            assert!(unbounded_lo.abs() < 1e-12 && unbounded_lo <= 0.0, "retain: g ≈ 0");
+            assert!(
+                bounded_lo.abs() < 1e-12 && bounded_lo <= 0.0,
+                "retain: g ≈ 0"
+            );
+            assert!(
+                unbounded_lo.abs() < 1e-12 && unbounded_lo <= 0.0,
+                "retain: g ≈ 0"
+            );
         }
     }
 
@@ -765,7 +786,10 @@ mod tests {
         let kv: Vec<f64> = (0..n).map(|i| i as f64).collect();
         let st = KdaState::from_kv(&cfg, &kv);
         let vk = st.to_vk(&cfg);
-        assert_ne!(vk, kv, "transpose is not a no-op for K == V with distinct values");
+        assert_ne!(
+            vk, kv,
+            "transpose is not a no-op for K == V with distinct values"
+        );
         assert_eq!(KdaState::from_vk(&cfg, &vk).as_kv(), &kv[..]);
     }
 }

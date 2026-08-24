@@ -25,15 +25,11 @@ use std::fmt;
 use std::path::Path;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use triblespace::core::attribute::Attribute;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
-use triblespace::core::metadata;
 use triblespace::core::collection::reach;
 use triblespace::core::collection::records::{collection_name, collection_team};
-use triblespace::core::inline::encodings::ed25519::ED25519PublicKey;
-use triblespace::core::inline::encodings::shortstring::ShortString;
-use triblespace::core::trible::TribleSet;
-use triblespace::core::attribute::Attribute;
 use triblespace::core::collection::simplearchive_union::{
     self, PreparationError, PreparedCollectionCommit, PublicationError,
 };
@@ -41,11 +37,15 @@ use triblespace::core::collection::{
     CollectionCommit, CollectionMaterializationError, CollectionRecord, CollectionStore,
     SimpleArchiveCollection,
 };
+use triblespace::core::inline::encodings::ed25519::ED25519PublicKey;
+use triblespace::core::inline::encodings::shortstring::ShortString;
 use triblespace::core::inline::encodings::UnknownInline;
+use triblespace::core::metadata;
 use triblespace::core::repo::pile::{
     CollectionInsertError, FlushError, GetBlobError, InsertError as PileInsertError, PileReader,
     ReadError,
 };
+use triblespace::core::trible::TribleSet;
 use triblespace::prelude::inlineencodings::{F64, U256BE};
 use triblespace::prelude::*;
 
@@ -58,8 +58,7 @@ use triblespace::prelude::*;
 /// `SimpleArchive` as its representation and TribleSpace's version-1
 /// trible-set union recipe as its algebra.
 pub fn mary_model_graph_name() -> CollectionName {
-    CollectionName::new("mary-model-graph")
-        .expect("`mary-model-graph` is a legal collection name")
+    CollectionName::new("mary-model-graph").expect("`mary-model-graph` is a legal collection name")
 }
 
 /// The root collection of immutable model-bundle tokens.
@@ -197,7 +196,10 @@ impl fmt::Display for PrepareModelBundleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RootAbsent(root) => {
-                write!(f, "model bundle root {root} is absent from its model archive")
+                write!(
+                    f,
+                    "model bundle root {root} is absent from its model archive"
+                )
             }
             Self::Preparation(source) => write!(f, "prepare model bundle token: {source}"),
         }
@@ -701,9 +703,7 @@ pub fn model_graph_team_or_own(
 }
 
 /// The single team publishing model bundles here, or an explicit ambiguity.
-pub fn sole_model_bundle_team(
-    pile: &mut Pile,
-) -> Result<VerifyingKey, SoleModelBundleTeamError> {
+pub fn sole_model_bundle_team(pile: &mut Pile) -> Result<VerifyingKey, SoleModelBundleTeamError> {
     let teams = model_bundle_teams(pile).map_err(SoleModelBundleTeamError::Read)?;
     sole_model_bundle_team_from(teams)
 }
@@ -902,8 +902,8 @@ pub fn snapshot_sole_model_collection_local_latest(
     let observation = observe_collection(pile, &mary_model_graph_name()).map_err(|source| {
         SnapshotSoleModelGraphError::Team(SoleModelGraphTeamError::Read(source))
     })?;
-    let team = sole_model_graph_team_from(observation.teams)
-        .map_err(SnapshotSoleModelGraphError::Team)?;
+    let team =
+        sole_model_graph_team_from(observation.teams).map_err(SnapshotSoleModelGraphError::Team)?;
     let collection = model_graph_collection(team).collection();
     let mut ticket: Vec<_> = observation
         .commits
@@ -1049,7 +1049,7 @@ pub struct ModelAttributeProjection {
 mod historical {
     use crate::f16enc::F16Array;
     use crate::format::{F32Array, U32Array, U64Array};
-    use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
+    use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
     use triblespace::prelude::inlineencodings::{Boolean, GenId, Handle, ShortString, F64, U256BE};
     use triblespace::prelude::*;
 
@@ -1435,10 +1435,10 @@ mod tests {
     use super::*;
     use anybytes::{Bytes, View};
     use triblespace::core::collection::ExactTicketError;
-    use triblespace::core::repo::{BlobStoreGet, RetentionRoots};
     use triblespace::core::repo::pile::WantRewritePolicy;
+    use triblespace::core::repo::{BlobStoreGet, RetentionRoots};
     use triblespace::macros::id_hex;
-    use triblespace::prelude::blobencodings::{UTF8String, RawBytes, SimpleArchive};
+    use triblespace::prelude::blobencodings::{RawBytes, SimpleArchive, UTF8String};
     use triblespace::prelude::inlineencodings::Handle;
 
     static NEXT_TEMP_PILE: AtomicU64 = AtomicU64::new(0);
@@ -1532,10 +1532,9 @@ mod tests {
         assert_eq!(
             handle.raw,
             [
-                0x75, 0x8B, 0xBA, 0x4A, 0x8C, 0x01, 0x2B, 0x3B,
-                0xD9, 0xFB, 0xAF, 0xCA, 0x42, 0x0B, 0xA2, 0xD0,
-                0x04, 0xED, 0x7D, 0x7B, 0xAC, 0x3C, 0x23, 0x93,
-                0xBF, 0x32, 0x32, 0x7E, 0x32, 0x95, 0xFC, 0xDF,
+                0x75, 0x8B, 0xBA, 0x4A, 0x8C, 0x01, 0x2B, 0x3B, 0xD9, 0xFB, 0xAF, 0xCA, 0x42, 0x0B,
+                0xA2, 0xD0, 0x04, 0xED, 0x7D, 0x7B, 0xAC, 0x3C, 0x23, 0x93, 0xBF, 0x32, 0x32, 0x7E,
+                0x32, 0x95, 0xFC, 0xDF,
             ]
         );
     }
@@ -1564,15 +1563,14 @@ mod tests {
         )
         .unwrap();
         let len_after_first = std::fs::metadata(file.as_path()).unwrap().len();
-        let repeated =
-            publish_model_bundle_fragment(
-                &mut pile,
-                test_team(),
-                &signer,
-                model_root,
-                model.clone(),
-            )
-            .unwrap();
+        let repeated = publish_model_bundle_fragment(
+            &mut pile,
+            test_team(),
+            &signer,
+            model_root,
+            model.clone(),
+        )
+        .unwrap();
         assert_eq!(first, repeated);
         assert_eq!(
             std::fs::metadata(file.as_path()).unwrap().len(),
@@ -1580,17 +1578,13 @@ mod tests {
             "exact retry must append nothing"
         );
         let other_author =
-            publish_model_bundle_fragment(
-                &mut pile,
-                test_team(),
-                &other_signer,
-                model_root,
-                model,
-            )
-            .unwrap();
+            publish_model_bundle_fragment(&mut pile, test_team(), &other_signer, model_root, model)
+                .unwrap();
         assert_ne!(first.id(), other_author.id());
         assert_eq!(first.data(), other_author.data());
-        assert!(local_model_ticket(&mut pile, test_team()).unwrap().is_empty());
+        assert!(local_model_ticket(&mut pile, test_team())
+            .unwrap()
+            .is_empty());
 
         let snapshot = snapshot_model_bundle_collection_exact(
             &mut pile,
@@ -1614,7 +1608,9 @@ mod tests {
 
         let bundle_token_blob: Blob<SimpleArchive> = snapshot
             .reader()
-            .get(inlineencodings::Handle::<SimpleArchive>::from_hash(first.data()))
+            .get(inlineencodings::Handle::<SimpleArchive>::from_hash(
+                first.data(),
+            ))
             .unwrap();
         assert_eq!(
             TribleSet::try_from_blob(bundle_token_blob).unwrap(),
@@ -1654,22 +1650,9 @@ mod tests {
         let (model, _, _) = fragment_fixture("team-ambiguity");
         let model_root = model.root().unwrap();
         let mut pile = open_test_pile(file.as_path());
-        publish_model_bundle_fragment(
-            &mut pile,
-            test_team(),
-            &signer,
-            model_root,
-            model.clone(),
-        )
-        .unwrap();
-        publish_model_bundle_fragment(
-            &mut pile,
-            other_team,
-            &signer,
-            model_root,
-            model,
-        )
-        .unwrap();
+        publish_model_bundle_fragment(&mut pile, test_team(), &signer, model_root, model.clone())
+            .unwrap();
+        publish_model_bundle_fragment(&mut pile, other_team, &signer, model_root, model).unwrap();
 
         let error = match snapshot_sole_model_bundle_collection_local_latest(&mut pile) {
             Ok(_) => panic!("two bundle teams must be ambiguous"),
@@ -1697,14 +1680,9 @@ mod tests {
         let model_archive_data = prepared.model_archive_data();
 
         let mut source = open_test_pile(source_file.as_path());
-        let commit = publish_model_bundle_fragment(
-            &mut source,
-            test_team(),
-            &signer,
-            model_root,
-            model,
-        )
-        .unwrap();
+        let commit =
+            publish_model_bundle_fragment(&mut source, test_team(), &signer, model_root, model)
+                .unwrap();
         let orphan: Blob<RawBytes> = b"deliberate orphan".to_vec().to_blob();
         let orphan_handle = source.put::<RawBytes, _>(orphan).unwrap();
 
@@ -1719,12 +1697,9 @@ mod tests {
 
         // The signed COMMIT recursively owns T, T names H, and H's facts name
         // both fixture attachments. None is an explicit rewrite root.
-        let snapshot = snapshot_model_bundle_collection_exact(
-            &mut destination,
-            test_team(),
-            &[commit],
-        )
-        .unwrap();
+        let snapshot =
+            snapshot_model_bundle_collection_exact(&mut destination, test_team(), &[commit])
+                .unwrap();
         assert_eq!(snapshot.commits(), &[commit]);
         assert_eq!(snapshot.facts().len(), 1);
         let token = snapshot.facts().iter().next().unwrap();
@@ -1738,9 +1713,9 @@ mod tests {
         );
         snapshot
             .reader()
-            .get::<Blob<SimpleArchive>, _>(
-                inlineencodings::Handle::<SimpleArchive>::from_hash(model_archive_data),
-            )
+            .get::<Blob<SimpleArchive>, _>(inlineencodings::Handle::<SimpleArchive>::from_hash(
+                model_archive_data,
+            ))
             .unwrap();
         snapshot.reader().get::<View<str>, _>(text_handle).unwrap();
         snapshot.reader().get::<Bytes, _>(payload_handle).unwrap();
@@ -1789,14 +1764,14 @@ mod tests {
             .is_empty());
         let reader = pile.reader().unwrap();
         reader
-            .get::<Blob<SimpleArchive>, _>(
-                inlineencodings::Handle::<SimpleArchive>::from_hash(withheld.data()),
-            )
+            .get::<Blob<SimpleArchive>, _>(inlineencodings::Handle::<SimpleArchive>::from_hash(
+                withheld.data(),
+            ))
             .unwrap();
         reader
-            .get::<Blob<SimpleArchive>, _>(
-                inlineencodings::Handle::<SimpleArchive>::from_hash(model_archive_data),
-            )
+            .get::<Blob<SimpleArchive>, _>(inlineencodings::Handle::<SimpleArchive>::from_hash(
+                model_archive_data,
+            ))
             .unwrap();
         reader.get::<View<str>, _>(text_handle).unwrap();
         reader.get::<Bytes, _>(payload_handle).unwrap();
@@ -1812,8 +1787,10 @@ mod tests {
         let expected_metafacts = fragment.metafacts().clone();
 
         let mut pile = open_test_pile(file.as_path());
-        let first = publish_model_fragment(&mut pile, test_team(), &signing_key, fragment.clone()).unwrap();
-        let repeated = publish_model_fragment(&mut pile, test_team(), &signing_key, fragment).unwrap();
+        let first =
+            publish_model_fragment(&mut pile, test_team(), &signing_key, fragment.clone()).unwrap();
+        let repeated =
+            publish_model_fragment(&mut pile, test_team(), &signing_key, fragment).unwrap();
         assert_eq!(first, repeated);
         assert_eq!(
             first.public_key().raw,
@@ -1823,7 +1800,8 @@ mod tests {
 
         // Snapshot directly from the same still-open pile. A duplicate ticket
         // is a mathematical set and therefore returns one canonical commit.
-        let snapshot = snapshot_model_collection_exact(&mut pile, test_team(), &[repeated, first]).unwrap();
+        let snapshot =
+            snapshot_model_collection_exact(&mut pile, test_team(), &[repeated, first]).unwrap();
         assert_eq!(snapshot.facts(), &expected_facts);
         assert_eq!(snapshot.commits(), &[first]);
 
@@ -1836,7 +1814,8 @@ mod tests {
         assert_eq!(&*text, "model attachment roundtrip");
         assert_eq!(&*payload, b"roundtrip");
 
-        let loaded = load_model_collection_from_ticket(file.as_path(), test_team(), &[first]).unwrap();
+        let loaded =
+            load_model_collection_from_ticket(file.as_path(), test_team(), &[first]).unwrap();
         assert_eq!(loaded.facts(), &expected_facts);
         let text_after_path_close: View<str> = loaded.reader().get(text_handle).unwrap();
         assert_eq!(&*text_after_path_close, "model attachment roundtrip");
@@ -1871,9 +1850,13 @@ mod tests {
         let model_root = model.root().expect("model root");
         facts += model.into_facts();
 
-        let commit =
-            publish_model_fragment(&mut pile, test_team(), &signing_key, Fragment::rooted(model_root, facts))
-                .unwrap();
+        let commit = publish_model_fragment(
+            &mut pile,
+            test_team(),
+            &signing_key,
+            Fragment::rooted(model_root, facts),
+        )
+        .unwrap();
         let snapshot = snapshot_model_collection_exact(&mut pile, test_team(), &[commit]).unwrap();
         pile.close().unwrap();
 
@@ -1916,10 +1899,16 @@ mod tests {
         )
         .unwrap();
         let (unselected, _, _) = fragment_fixture("unselected");
-        publish_model_fragment(&mut pile, test_team(), &SigningKey::from_bytes(&[0x23; 32]), unselected)
-            .unwrap();
+        publish_model_fragment(
+            &mut pile,
+            test_team(),
+            &SigningKey::from_bytes(&[0x23; 32]),
+            unselected,
+        )
+        .unwrap();
 
-        let snapshot = snapshot_model_collection_exact(&mut pile, test_team(), &[second, first]).unwrap();
+        let snapshot =
+            snapshot_model_collection_exact(&mut pile, test_team(), &[second, first]).unwrap();
         let mut expected = first_facts;
         expected += second_facts;
         let mut expected_commits = vec![first, second];
@@ -2030,9 +2019,13 @@ mod tests {
         let file = TempPilePath::new("local-invalid-matching");
         let mut pile = open_test_pile(file.as_path());
         let (fragment, _, _) = fragment_fixture("invalid-matching");
-        let valid =
-            publish_model_fragment(&mut pile, test_team(), &SigningKey::from_bytes(&[0x41; 32]), fragment)
-                .unwrap();
+        let valid = publish_model_fragment(
+            &mut pile,
+            test_team(),
+            &SigningKey::from_bytes(&[0x41; 32]),
+            fragment,
+        )
+        .unwrap();
         let mut invalid_bytes = valid.to_bytes();
         *invalid_bytes.last_mut().unwrap() ^= 1;
         let invalid = CollectionCommit::from_bytes(invalid_bytes);

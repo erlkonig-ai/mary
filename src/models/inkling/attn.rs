@@ -101,7 +101,14 @@ fn linear(x: &[f32], w: &[f32], tokens: usize, in_dim: usize, out_dim: usize) ->
 }
 
 /// RMS-normalize each head slice of `[tokens, heads * head_dim]` in place.
-fn head_rms_norm(v: &mut [f32], gain: &[f32], tokens: usize, heads: usize, head_dim: usize, eps: f64) {
+fn head_rms_norm(
+    v: &mut [f32],
+    gain: &[f32],
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    eps: f64,
+) {
     assert_eq!(gain.len(), head_dim);
     for t in 0..tokens {
         for h in 0..heads {
@@ -283,8 +290,8 @@ pub fn attention_prefill(
         for qi in 0..tokens {
             let qv = &q[qi * q_width + h * d.head_dim..qi * q_width + (h + 1) * d.head_dim];
             for ki in 0..tokens {
-                let kv = &k[ki * kv_width + kv_h * d.head_dim
-                    ..ki * kv_width + (kv_h + 1) * d.head_dim];
+                let kv =
+                    &k[ki * kv_width + kv_h * d.head_dim..ki * kv_width + (kv_h + 1) * d.head_dim];
                 let dot: f32 = qv.iter().zip(kv).map(|(a, b)| a * b).sum();
                 // The bias is zero outside [0, rel_extent); causality lives in
                 // the mask, not here.
@@ -312,9 +319,10 @@ pub fn attention_prefill(
                 if p == 0.0 {
                     continue;
                 }
-                let vv = &v[ki * kv_width + kv_h * d.head_dim
-                    ..ki * kv_width + (kv_h + 1) * d.head_dim];
-                let o = &mut out[qi * q_width + h * d.head_dim..qi * q_width + (h + 1) * d.head_dim];
+                let vv =
+                    &v[ki * kv_width + kv_h * d.head_dim..ki * kv_width + (kv_h + 1) * d.head_dim];
+                let o =
+                    &mut out[qi * q_width + h * d.head_dim..qi * q_width + (h + 1) * d.head_dim];
                 for (acc, &val) in o.iter_mut().zip(vv) {
                     *acc += p * val;
                 }
@@ -361,8 +369,14 @@ pub fn attention_step(
     let q_width = d.heads * d.head_dim;
     let kv_width = d.kv_heads * d.head_dim;
     assert_eq!(x.len(), d.hidden, "a decode step feeds exactly one token");
-    assert_eq!(cache.kv_width, kv_width, "this cache was built at a different layer shape");
-    assert!(pos >= cache.base + cache.len(), "position {pos} is already cached");
+    assert_eq!(
+        cache.kv_width, kv_width,
+        "this cache was built at a different layer shape"
+    );
+    assert!(
+        pos >= cache.base + cache.len(),
+        "position {pos} is already cached"
+    );
 
     let mut q = linear(x, w.wq, 1, d.hidden, q_width);
     let mut k_new = short_conv_step(
@@ -432,7 +446,11 @@ pub fn attention_step(
             // Every retained key is at or before `pos`, so this cannot go
             // negative — which is the whole reason no causal mask is needed.
             let dist = pos - (base + j);
-            let bias = if dist < d.rel_extent { rel[h * eff + dist] * tau } else { 0.0 };
+            let bias = if dist < d.rel_extent {
+                rel[h * eff + dist] * tau
+            } else {
+                0.0
+            };
             // `trim` has usually applied the window already; keeping it here
             // makes this function right without depending on that.
             let wmask = if window.is_some_and(|wnd| dist >= wnd) {
@@ -458,8 +476,8 @@ pub fn attention_step(
             if p == 0.0 {
                 continue;
             }
-            let vv = &cache.v[j * kv_width + kv_h * d.head_dim
-                ..j * kv_width + (kv_h + 1) * d.head_dim];
+            let vv =
+                &cache.v[j * kv_width + kv_h * d.head_dim..j * kv_width + (kv_h + 1) * d.head_dim];
             let o = &mut out[h * d.head_dim..(h + 1) * d.head_dim];
             for (acc, &val) in o.iter_mut().zip(vv) {
                 *acc += p * val;

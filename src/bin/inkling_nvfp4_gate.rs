@@ -48,7 +48,9 @@ fn read_f32(dir: &Path, name: &str) -> Result<Vec<f32>> {
 /// for four numbers.
 fn manifest_usize(text: &str, key: &str) -> Result<usize> {
     let pat = format!("\"{key}\"");
-    let at = text.find(&pat).with_context(|| format!("manifest has no {key}"))?;
+    let at = text
+        .find(&pat)
+        .with_context(|| format!("manifest has no {key}"))?;
     let rest = &text[at + pat.len()..];
     let colon = rest.find(':').context("malformed manifest")?;
     let tail = &rest[colon + 1..];
@@ -57,7 +59,9 @@ fn manifest_usize(text: &str, key: &str) -> Result<usize> {
         .skip_while(|c| c.is_whitespace())
         .take_while(|c| c.is_ascii_digit())
         .collect();
-    digits.parse().with_context(|| format!("{key} is not an integer"))
+    digits
+        .parse()
+        .with_context(|| format!("{key} is not an integer"))
 }
 
 fn main() -> Result<()> {
@@ -75,7 +79,10 @@ fn main() -> Result<()> {
     println!("  dir            : {}", dir.display());
     println!("  experts {experts} x rows {rows} x {bytes_per_row} bytes -> {logical} logical");
     println!("  group          : {group} (this build assumes {GROUP})");
-    anyhow::ensure!(group == GROUP, "oracle group {group} != this build's {GROUP}");
+    anyhow::ensure!(
+        group == GROUP,
+        "oracle group {group} != this build's {GROUP}"
+    );
 
     let mut fails = 0usize;
     let mut checks = 0usize;
@@ -120,7 +127,10 @@ fn main() -> Result<()> {
     println!("  scale bytes : {}", scales.len());
     println!("  scale2      : {}", scale2.len());
     println!("  expected    : {}", expected.len());
-    anyhow::ensure!(!expected.is_empty(), "zero reference values — the gate would be vacuous");
+    anyhow::ensure!(
+        !expected.is_empty(),
+        "zero reference values — the gate would be vacuous"
+    );
     let distinct = {
         let mut s: Vec<u8> = scales.clone();
         s.sort_unstable();
@@ -133,10 +143,20 @@ fn main() -> Result<()> {
     println!("\n=== 2/3. decode parity, elementwise ===");
     let mut out = vec![0f32; experts * rows * logical];
     let written = decode_stacked(
-        &codes, &scales, &scale2, experts, rows, bytes_per_row, &mut out,
+        &codes,
+        &scales,
+        &scale2,
+        experts,
+        rows,
+        bytes_per_row,
+        &mut out,
     );
     println!("  values decoded : {written}");
-    anyhow::ensure!(written == expected.len(), "decoded {written}, reference has {}", expected.len());
+    anyhow::ensure!(
+        written == expected.len(),
+        "decoded {written}, reference has {}",
+        expected.len()
+    );
 
     let mut worst = 0f32;
     let mut mismatch = 0usize;
@@ -180,16 +200,27 @@ fn main() -> Result<()> {
             }
         }
     }
-    let swapped_matches = swapped.iter().zip(expected.iter()).filter(|(a, b)| a == b).count();
+    let swapped_matches = swapped
+        .iter()
+        .zip(expected.iter())
+        .filter(|(a, b)| a == b)
+        .count();
     checks += 1;
     println!("\n=== nibble order is actually pinned ===");
-    println!("  values where the REVERSED packing also matches: {swapped_matches} of {}", expected.len());
+    println!(
+        "  values where the REVERSED packing also matches: {swapped_matches} of {}",
+        expected.len()
+    );
     if swapped_matches == expected.len() {
-        println!("  FAIL  both orders reproduce the reference — this corpus cannot pin the packing");
+        println!(
+            "  FAIL  both orders reproduce the reference — this corpus cannot pin the packing"
+        );
         fails += 1;
     } else {
-        println!("  reversed packing disagrees on {} values, so the order is pinned",
-                 expected.len() - swapped_matches);
+        println!(
+            "  reversed packing disagrees on {} values, so the order is pinned",
+            expected.len() - swapped_matches
+        );
     }
 
     // ---- 4. representable bound -------------------------------------------

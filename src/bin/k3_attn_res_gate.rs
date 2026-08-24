@@ -164,7 +164,13 @@ fn smaller(a: f64, b: f64) -> f64 {
 /// every threshold is written `!(d <= max)` so NaN fails.
 fn max_abs_diff(what: &str, a: &[f32], b: &[f32]) -> f64 {
     assert!(!a.is_empty(), "{what}: comparison over an EMPTY array");
-    assert_eq!(a.len(), b.len(), "{what}: length {} vs {}", a.len(), b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "{what}: length {} vs {}",
+        a.len(),
+        b.len()
+    );
     let mut m = 0.0f64;
     let mut nan = false;
     for (x, y) in a.iter().zip(b) {
@@ -260,7 +266,10 @@ fn bf16_key(b: u16) -> i32 {
 /// Max distance in bfloat16 ulp, and how many elements are not bit-identical.
 /// NaN in either array poisons the distance to NaN.
 fn max_ulp_bf16(what: &str, got: &[f32], want: &[f32]) -> (f64, usize) {
-    assert!(!got.is_empty(), "{what}: ulp comparison over an EMPTY array");
+    assert!(
+        !got.is_empty(),
+        "{what}: ulp comparison over an EMPTY array"
+    );
     assert_eq!(got.len(), want.len(), "{what}: length mismatch");
     let mut top = 0i32;
     let mut differing = 0usize;
@@ -286,13 +295,20 @@ fn max_ulp_bf16(what: &str, got: &[f32], want: &[f32]) -> (f64, usize) {
 /// changes nothing. Used to assert that the port rounded at all.
 fn all_exact_bf16(a: &[f32]) -> bool {
     assert!(!a.is_empty(), "bf16-exactness over an EMPTY array");
-    a.iter().all(|x| bf16_to_f32(bf16_bits(*x)).to_bits() == x.to_bits())
+    a.iter()
+        .all(|x| bf16_to_f32(bf16_bits(*x)).to_bits() == x.to_bits())
 }
 
 /// Bit-for-bit equality of two f32 arrays.
 fn bits_equal(what: &str, a: &[f32], b: &[f32]) -> bool {
     assert!(!a.is_empty(), "{what}: bit comparison over an EMPTY array");
-    assert_eq!(a.len(), b.len(), "{what}: length {} vs {}", a.len(), b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "{what}: length {} vs {}",
+        a.len(),
+        b.len()
+    );
     a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
@@ -305,7 +321,14 @@ fn bits_equal(what: &str, a: &[f32], b: &[f32]) -> bool {
 /// the backend's here), and neither is the true value. Without it, a lane whose
 /// reduction sums 7168 terms less carefully than torch's looks exactly like a
 /// port that computes the wrong function.
-fn mix_f64(v: &[f32], sw: &[f32], eps: f64, tokens: usize, slots: usize, hidden: usize) -> (Vec<f64>, Vec<f64>, Vec<f32>) {
+fn mix_f64(
+    v: &[f32],
+    sw: &[f32],
+    eps: f64,
+    tokens: usize,
+    slots: usize,
+    hidden: usize,
+) -> (Vec<f64>, Vec<f64>, Vec<f32>) {
     assert_eq!(v.len(), tokens * slots * hidden, "mix_f64: v size");
     assert_eq!(sw.len(), hidden, "mix_f64: score weight size");
     let mut scores = vec![0.0f64; tokens * slots];
@@ -325,7 +348,9 @@ fn mix_f64(v: &[f32], sw: &[f32], eps: f64, tokens: usize, slots: usize, hidden:
             }
             scores[t * slots + s] = acc;
         }
-        let m = (0..slots).map(|s| scores[t * slots + s]).fold(f64::NEG_INFINITY, f64::max);
+        let m = (0..slots)
+            .map(|s| scores[t * slots + s])
+            .fold(f64::NEG_INFINITY, f64::max);
         let mut z = 0.0f64;
         for s in 0..slots {
             let e = (scores[t * slots + s] - m).exp();
@@ -391,7 +416,12 @@ struct Gate {
 
 impl Gate {
     fn new(lane: &str, verbose: bool) -> Self {
-        Self { lane: lane.to_string(), passed: 0, failures: Vec::new(), verbose }
+        Self {
+            lane: lane.to_string(),
+            passed: 0,
+            failures: Vec::new(),
+            verbose,
+        }
     }
 
     fn record(&mut self, id: &str, ok: bool, detail: String) {
@@ -458,7 +488,12 @@ impl Checkpoint {
             .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
             .collect();
         anyhow::ensure!(!index.is_empty(), "index.json weight_map is empty");
-        Ok(Self { dir: dir.to_path_buf(), index, maps: HashMap::new(), cfg })
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            index,
+            maps: HashMap::new(),
+            cfg,
+        })
     }
 
     fn has(&self, name: &str) -> bool {
@@ -481,7 +516,9 @@ impl Checkpoint {
         let mmap = &self.maps[&shard];
         let st = SafeTensors::deserialize(mmap)
             .with_context(|| format!("parsing the header of {shard}"))?;
-        let t = st.tensor(name).with_context(|| format!("{name} absent from {shard}"))?;
+        let t = st
+            .tensor(name)
+            .with_context(|| format!("{name} absent from {shard}"))?;
         if t.dtype() != safetensors::Dtype::BF16 {
             bail!("{name}: on-disk dtype is {:?}, expected BF16", t.dtype());
         }
@@ -509,7 +546,12 @@ struct ParamPair {
 // ---------------------------------------------------------------------------
 
 fn bf(z: &Npz, key: &str) -> Vec<f32> {
-    let v: Vec<f32> = z.get(key).bf16_to_f64().into_iter().map(|x| x as f32).collect();
+    let v: Vec<f32> = z
+        .get(key)
+        .bf16_to_f64()
+        .into_iter()
+        .map(|x| x as f32)
+        .collect();
     assert!(!v.is_empty(), "{key}: EMPTY oracle array");
     v
 }
@@ -528,7 +570,11 @@ fn scalar_usize(z: &Npz, key: &str) -> usize {
 
 /// `[tokens, slots, hidden]` -> one `[tokens, hidden]` vector per slot.
 fn split_slots(data: &[f32], tokens: usize, slots: usize, hidden: usize) -> Vec<Vec<f32>> {
-    assert_eq!(data.len(), tokens * slots * hidden, "slot split: size mismatch");
+    assert_eq!(
+        data.len(),
+        tokens * slots * hidden,
+        "slot split: size mismatch"
+    );
     (0..slots)
         .map(|s| {
             let mut out = Vec::with_capacity(tokens * hidden);
@@ -590,7 +636,9 @@ impl Oracle {
             .unwrap_or_else(|| panic!("no site {label}"))
     }
     fn param(&self, label: &str) -> &ParamPair {
-        self.params.get(label).unwrap_or_else(|| panic!("no params for {label}"))
+        self.params
+            .get(label)
+            .unwrap_or_else(|| panic!("no params for {label}"))
     }
 }
 
@@ -605,20 +653,40 @@ fn load_oracle(z: &Npz, ck: &mut Checkpoint) -> Result<Oracle> {
     // Reading it anyway is the point: the port is handed it and must decline.
     for l in 0..LAYERS {
         for (kind, np, pp) in [
-            ("sa", LayerPart::SelfAttentionResNorm, LayerPart::SelfAttentionResProj),
+            (
+                "sa",
+                LayerPart::SelfAttentionResNorm,
+                LayerPart::SelfAttentionResProj,
+            ),
             ("mlp", LayerPart::MlpResNorm, LayerPart::MlpResProj),
         ] {
             let (norm, norm_shape) =
                 ck.read_bf16(&Slot::Layer { layer: l, part: np }.tensor_name())?;
             let (proj, proj_shape) =
                 ck.read_bf16(&Slot::Layer { layer: l, part: pp }.tensor_name())?;
-            params.insert(format!("L{l:02}.{kind}"), ParamPair { norm, norm_shape, proj, proj_shape });
+            params.insert(
+                format!("L{l:02}.{kind}"),
+                ParamPair {
+                    norm,
+                    norm_shape,
+                    proj,
+                    proj_shape,
+                },
+            );
         }
     }
     {
         let (norm, norm_shape) = ck.read_bf16(&Slot::OutputAttnResNorm.tensor_name())?;
         let (proj, proj_shape) = ck.read_bf16(&Slot::OutputAttnResProj.tensor_name())?;
-        params.insert("MODEL.output".to_string(), ParamPair { norm, norm_shape, proj, proj_shape });
+        params.insert(
+            "MODEL.output".to_string(),
+            ParamPair {
+                norm,
+                norm_shape,
+                proj,
+                proj_shape,
+            },
+        );
     }
 
     for l in 0..LAYERS {
@@ -629,8 +697,12 @@ fn load_oracle(z: &Npz, ck: &mut Checkpoint) -> Result<Oracle> {
             measured_checkpoints.insert(l);
         }
         anyhow::ensure!(nb_out > 0, "{lp}: bank is empty on exit");
-        let bank_out =
-            split_slots(&bf(z, &format!("{lp}_blockres_out_bf16bits")), TOKENS, nb_out, HIDDEN);
+        let bank_out = split_slots(
+            &bf(z, &format!("{lp}_blockres_out_bf16bits")),
+            TOKENS,
+            nb_out,
+            HIDDEN,
+        );
         let has_sa_site = z.contains(&format!("{lp}_attnres_sa_out_bf16bits"));
 
         for kind in ["sa", "mlp"] {
@@ -660,10 +732,19 @@ fn load_oracle(z: &Npz, ck: &mut Checkpoint) -> Result<Oracle> {
         let t = LayerTape {
             layer_in: bf(z, &format!("{lp}_layer_in_bf16bits")),
             attn_out: bf(z, &format!("{lp}_attn_o_proj_out_bf16bits")),
-            mlp_out: bf(z, &format!("{lp}_{}_bf16bits", if l == 0 { "mlp_out" } else { "moe_out" })),
+            mlp_out: bf(
+                z,
+                &format!(
+                    "{lp}_{}_bf16bits",
+                    if l == 0 { "mlp_out" } else { "moe_out" }
+                ),
+            ),
             layer_out: bf(z, &format!("{lp}_layer_out_bf16bits")),
             input_layernorm_in: bf(z, &format!("{lp}_input_layernorm_in_bf16bits")),
-            post_attention_layernorm_in: bf(z, &format!("{lp}_post_attention_layernorm_in_bf16bits")),
+            post_attention_layernorm_in: bf(
+                z,
+                &format!("{lp}_post_attention_layernorm_in_bf16bits"),
+            ),
             mlp_prefix_sum: bf(z, &format!("{lp}_attnres_mlp_prefix_sum_bf16bits")),
             nb_in,
             nb_out,
@@ -736,7 +817,11 @@ fn host<B: Backend, const D: usize>(t: Tensor<B, D>) -> Vec<f32> {
 }
 
 fn params_of<B: Backend>(p: &ParamPair, eps: f64, dev: &Device<B>) -> AttnResParams<B> {
-    AttnResParams::new(t1::<B>(&p.norm, dev), t2::<B>(&p.proj, 1, p.norm.len(), dev), eps)
+    AttnResParams::new(
+        t1::<B>(&p.norm, dev),
+        t2::<B>(&p.proj, 1, p.norm.len(), dev),
+        eps,
+    )
 }
 
 /// One f32 ulp, relative — the unit the primitive measurements are quoted in.
@@ -778,7 +863,12 @@ fn section_primitives<B: Backend>(g: &mut Gate, dev: &Device<B>) {
     }
     // The two the port uses must be ulp-accurate...
     g.le("primitives.sqrt", e_sqrt / F32_EPS, 4.0, "f32 ulp");
-    g.le("primitives.rsqrt_by_division", e_div / F32_EPS, 4.0, "f32 ulp");
+    g.le(
+        "primitives.rsqrt_by_division",
+        e_div / F32_EPS,
+        4.0,
+        "f32 ulp",
+    );
     // ...and the one it deliberately does not use is reported, not budgeted:
     // holding a backend to an accuracy it never promised would make this gate
     // fail on a backend change that is none of the port's business.
@@ -793,7 +883,9 @@ fn section_primitives<B: Backend>(g: &mut Gate, dev: &Device<B>) {
     let mut data: Vec<f32> = Vec::with_capacity(rows * HIDDEN);
     let mut seed = 0x243F_6A88_85A3_08D3u64;
     for _ in 0..rows * HIDDEN {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u = ((seed >> 40) as f32) / (1u32 << 24) as f32 - 0.5;
         data.push(u);
     }
@@ -825,7 +917,9 @@ fn section_primitives<B: Backend>(g: &mut Gate, dev: &Device<B>) {
     let mut x: Vec<f32> = Vec::with_capacity(n * sl * m);
     let mut st = 0x9E37_79B9_7F4A_7C15u64;
     let mut next = || {
-        st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        st = st
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((st >> 40) as f32) / (1u32 << 24) as f32
     };
     for _ in 0..n {
@@ -842,7 +936,10 @@ fn section_primitives<B: Backend>(g: &mut Gate, dev: &Device<B>) {
     let wt = t2::<B>(&w, n, sl, dev);
     let xt: Tensor<B, 3> = Tensor::from_data(TensorData::new(x.clone(), [n, sl, m]), dev);
     let by_matmul = host(
-        wt.clone().reshape([n, 1, sl]).matmul(xt.clone()).reshape([n, m]),
+        wt.clone()
+            .reshape([n, 1, sl])
+            .matmul(xt.clone())
+            .reshape([n, m]),
     );
     let by_sum = host((wt.reshape([n, sl, 1]) * xt).sum_dim(1).reshape([n, m]));
     let (mut e_mm, mut e_sum) = (0.0f64, 0.0f64);
@@ -882,8 +979,16 @@ fn section_boundary(g: &mut Gate, o: &Oracle, ck: &Checkpoint) {
         cfg.attn_res_block_size == Some(12),
         format!("{:?}", cfg.attn_res_block_size),
     );
-    g.truth("cfg.num_hidden_layers", cfg.num_hidden_layers == 93, format!("{}", cfg.num_hidden_layers));
-    g.truth("cfg.hidden_size", cfg.hidden_size == HIDDEN, format!("{}", cfg.hidden_size));
+    g.truth(
+        "cfg.num_hidden_layers",
+        cfg.num_hidden_layers == 93,
+        format!("{}", cfg.num_hidden_layers),
+    );
+    g.truth(
+        "cfg.hidden_size",
+        cfg.hidden_size == HIDDEN,
+        format!("{}", cfg.hidden_size),
+    );
     g.truth(
         "cfg.rms_norm_eps",
         (cfg.rms_norm_eps - 1e-5).abs() < 1e-12,
@@ -891,10 +996,15 @@ fn section_boundary(g: &mut Gate, o: &Oracle, ck: &Checkpoint) {
     );
 
     // The schedule the port runs on, straight from the config predicate.
-    let schedule: Vec<bool> =
-        (0..cfg.num_hidden_layers).map(|l| cfg.is_attn_res_checkpoint(l)).collect();
-    let checkpoints: Vec<usize> =
-        schedule.iter().enumerate().filter(|(_, &b)| b).map(|(i, _)| i).collect();
+    let schedule: Vec<bool> = (0..cfg.num_hidden_layers)
+        .map(|l| cfg.is_attn_res_checkpoint(l))
+        .collect();
+    let checkpoints: Vec<usize> = schedule
+        .iter()
+        .enumerate()
+        .filter(|(_, &b)| b)
+        .map(|(i, _)| i)
+        .collect();
     g.truth(
         "schedule.length",
         schedule.len() == cfg.num_hidden_layers && !schedule.is_empty(),
@@ -913,7 +1023,11 @@ fn section_boundary(g: &mut Gate, o: &Oracle, ck: &Checkpoint) {
     g.truth(
         "schedule.last_layer_not_a_checkpoint",
         !schedule[cfg.num_hidden_layers - 1],
-        format!("layer {} snapshots: {}", cfg.num_hidden_layers - 1, schedule[cfg.num_hidden_layers - 1]),
+        format!(
+            "layer {} snapshots: {}",
+            cfg.num_hidden_layers - 1,
+            schedule[cfg.num_hidden_layers - 1]
+        ),
     );
     let mut longest_run = 0usize;
     let mut run = 0usize;
@@ -924,14 +1038,25 @@ fn section_boundary(g: &mut Gate, o: &Oracle, ck: &Checkpoint) {
     g.truth(
         "schedule.longest_accumulation_run",
         longest_run == 12,
-        format!("{longest_run} layers (block size {:?})", cfg.attn_res_block_size),
+        format!(
+            "{longest_run} layers (block size {:?})",
+            cfg.attn_res_block_size
+        ),
     );
 
     // MEASURED: which layers the shipped forward actually snapshotted, read off
     // the oracle's own bank-size deltas, not off any config or source file.
-    g.truth("oracle.layers_present", o.tape.len() == LAYERS, format!("{} layers of tape", o.tape.len()));
+    g.truth(
+        "oracle.layers_present",
+        o.tape.len() == LAYERS,
+        format!("{} layers of tape", o.tape.len()),
+    );
     let measured: Vec<usize> = o.measured_checkpoints.iter().copied().collect();
-    let from_cfg: Vec<usize> = checkpoints.iter().copied().filter(|&l| l < LAYERS).collect();
+    let from_cfg: Vec<usize> = checkpoints
+        .iter()
+        .copied()
+        .filter(|&l| l < LAYERS)
+        .collect();
     g.truth(
         "boundary.config_vs_measured",
         measured == from_cfg && !measured.is_empty(),
@@ -942,7 +1067,10 @@ fn section_boundary(g: &mut Gate, o: &Oracle, ck: &Checkpoint) {
         measured.len() == 2,
         format!("{} crossings in layers 0..{LAYERS}", measured.len()),
     );
-    let deltas_sane = o.tape.iter().all(|t| t.nb_out == t.nb_in || t.nb_out == t.nb_in + 1);
+    let deltas_sane = o
+        .tape
+        .iter()
+        .all(|t| t.nb_out == t.nb_in || t.nb_out == t.nb_in + 1);
     g.truth("boundary.bank_grows_by_at_most_one", deltas_sane, "");
     g.truth(
         "boundary.bank_starts_empty",
@@ -976,7 +1104,10 @@ fn section_boundary(g: &mut Gate, o: &Oracle, ck: &Checkpoint) {
         g.truth(
             &format!("boundary.offby{shift:+}_is_visible"),
             shifted != o.measured_checkpoints,
-            format!("shifted {shifted:?} vs measured {:?}", o.measured_checkpoints),
+            format!(
+                "shifted {shifted:?} vs measured {:?}",
+                o.measured_checkpoints
+            ),
         );
     }
 
@@ -1004,7 +1135,11 @@ fn section_boundary(g: &mut Gate, o: &Oracle, ck: &Checkpoint) {
     g.truth(
         "checkpoint.attn_res_tensors_complete",
         missing.is_empty(),
-        format!("{} names expected, {} missing", 4 * cfg.num_hidden_layers + 2, missing.len()),
+        format!(
+            "{} names expected, {} missing",
+            4 * cfg.num_hidden_layers + 2,
+            missing.len()
+        ),
     );
 }
 
@@ -1025,7 +1160,14 @@ fn section_rounding<B: Backend>(g: &mut Gate, o: &Oracle, dev: &Device<B>) {
             probe.push(-m * f);
         }
     }
-    probe.extend([0.0f32, -0.0, 1.0, -1.0, f32::MIN_POSITIVE, -f32::MIN_POSITIVE]);
+    probe.extend([
+        0.0f32,
+        -0.0,
+        1.0,
+        -1.0,
+        f32::MIN_POSITIVE,
+        -f32::MIN_POSITIVE,
+    ]);
     // Exact halfway cases between adjacent bfloat16 values — the ONLY inputs
     // where the round-half-to-even rule decides anything, and therefore the
     // only ones that can tell two rounding schemes apart.
@@ -1052,14 +1194,20 @@ fn section_rounding<B: Backend>(g: &mut Gate, o: &Oracle, dev: &Device<B>) {
     assert!(ties >= 2000, "tie probe is too small: {ties}");
     let real: Vec<f32> = o.sites.iter().flat_map(|s| s.out.iter().copied()).collect();
     probe.extend(real.iter().take(200_000).copied());
-    assert!(probe.len() > 1000, "rounding probe set is too small to mean anything");
+    assert!(
+        probe.len() > 1000,
+        "rounding probe set is too small to mean anything"
+    );
 
     let got = host(round_bf16(t1::<B>(&probe, dev)));
     let want: Vec<f32> = probe.iter().map(|x| bf16_to_f32(bf16_bits(*x))).collect();
     g.truth(
         "round_bf16.matches_bitlevel_rne",
         bits_equal("round_bf16", &got, &want),
-        format!("{} probe values, of which {ties} are exact bfloat16 ties", probe.len()),
+        format!(
+            "{} probe values, of which {ties} are exact bfloat16 ties",
+            probe.len()
+        ),
     );
 
     // EXHAUSTIVE over one binade. Every f32 in [1, 2) is 2^23 consecutive bit
@@ -1093,7 +1241,11 @@ fn section_rounding<B: Backend>(g: &mut Gate, o: &Oracle, dev: &Device<B>) {
 
     // Idempotence on real bfloat16 data: the oracle's arrays are already
     // bfloat16, so rounding them must be the identity.
-    let already: Vec<f32> = o.tape.iter().flat_map(|t| t.layer_out.iter().copied()).collect();
+    let already: Vec<f32> = o
+        .tape
+        .iter()
+        .flat_map(|t| t.layer_out.iter().copied())
+        .collect();
     let re = host(round_bf16(t1::<B>(&already, dev)));
     g.truth(
         "round_bf16.identity_on_bf16_data",
@@ -1110,10 +1262,24 @@ fn section_rounding<B: Backend>(g: &mut Gate, o: &Oracle, dev: &Device<B>) {
     // 10^40 overflows), 0.0 rounds correctly, no breakdown is ever found, and
     // the margin comes out as `x / 0 = inf`. That version passed. It could not
     // have done anything else.
-    let peak = o.tape.iter().map(|t| max_abs("layer_out", &t.layer_out)).fold(0.0f64, f64::max);
-    let floor = o.sites.iter().map(|s| min_nonzero_abs(&s.out)).fold(f64::INFINITY, f64::min);
-    assert!(peak.is_finite() && peak > 0.0, "no activation scale to test the band against");
-    assert!(floor.is_finite() && floor > 0.0, "no activation floor to test the band against");
+    let peak = o
+        .tape
+        .iter()
+        .map(|t| max_abs("layer_out", &t.layer_out))
+        .fold(0.0f64, f64::max);
+    let floor = o
+        .sites
+        .iter()
+        .map(|s| min_nonzero_abs(&s.out))
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        peak.is_finite() && peak > 0.0,
+        "no activation scale to test the band against"
+    );
+    assert!(
+        floor.is_finite() && floor > 0.0,
+        "no activation floor to test the band against"
+    );
     let (lo, hi) = ((floor / 1e3) as f32, (peak * 1e3) as f32);
     let steps = 4000;
     let mut band: Vec<f32> = Vec::with_capacity(2 * steps + 4);
@@ -1131,9 +1297,7 @@ fn section_rounding<B: Backend>(g: &mut Gate, o: &Oracle, dev: &Device<B>) {
     let want_band: Vec<f32> = band.iter().map(|v| bf16_to_f32(bf16_bits(*v))).collect();
     g.truth(
         "round_bf16.exact_on_the_data_band",
-        bits_equal("band", &got_band, &want_band)
-            && (lo as f64) < floor
-            && (hi as f64) > peak,
+        bits_equal("band", &got_band, &want_band) && (lo as f64) < floor && (hi as f64) > peak,
         format!(
             "{} values over [{lo:.3e}, {hi:.3e}]; activations span [{floor:.3e}, {peak:.3}] — \
              three decades of headroom each side",
@@ -1193,19 +1357,34 @@ fn section_weights<B: Backend>(g: &mut Gate, o: &Oracle, ck: &Checkpoint, dev: &
     let mut shape_ok = true;
     let mut detail = String::new();
     for (label, slots) in [
-        ("MODEL.output", (Slot::OutputAttnResNorm, Slot::OutputAttnResProj)),
+        (
+            "MODEL.output",
+            (Slot::OutputAttnResNorm, Slot::OutputAttnResProj),
+        ),
         (
             "L00.sa",
             (
-                Slot::Layer { layer: 0, part: LayerPart::SelfAttentionResNorm },
-                Slot::Layer { layer: 0, part: LayerPart::SelfAttentionResProj },
+                Slot::Layer {
+                    layer: 0,
+                    part: LayerPart::SelfAttentionResNorm,
+                },
+                Slot::Layer {
+                    layer: 0,
+                    part: LayerPart::SelfAttentionResProj,
+                },
             ),
         ),
         (
             "L00.mlp",
             (
-                Slot::Layer { layer: 0, part: LayerPart::MlpResNorm },
-                Slot::Layer { layer: 0, part: LayerPart::MlpResProj },
+                Slot::Layer {
+                    layer: 0,
+                    part: LayerPart::MlpResNorm,
+                },
+                Slot::Layer {
+                    layer: 0,
+                    part: LayerPart::MlpResProj,
+                },
             ),
         ),
     ] {
@@ -1223,7 +1402,11 @@ fn section_weights<B: Backend>(g: &mut Gate, o: &Oracle, ck: &Checkpoint, dev: &
     g.truth(
         "layout.attn_res_shapes",
         shape_ok,
-        if detail.is_empty() { "norm [7168], proj [1,7168], BF16 — layout and headers agree".to_string() } else { detail },
+        if detail.is_empty() {
+            "norm [7168], proj [1,7168], BF16 — layout and headers agree".to_string()
+        } else {
+            detail
+        },
     );
 
     let mut exact_sites = 0usize;
@@ -1243,7 +1426,11 @@ fn section_weights<B: Backend>(g: &mut Gate, o: &Oracle, ck: &Checkpoint, dev: &
     g.truth(
         "weights.score_weight_bitexact_all_sites",
         exact_sites == o.sites.len() && !o.sites.is_empty(),
-        format!("{}/{} sites bit-exact from the checkpoint's own bytes", exact_sites, o.sites.len()),
+        format!(
+            "{}/{} sites bit-exact from the checkpoint's own bytes",
+            exact_sites,
+            o.sites.len()
+        ),
     );
 
     // The cross-site control: the *other* sublayer's norm gain, same layer, in
@@ -1257,9 +1444,17 @@ fn section_weights<B: Backend>(g: &mut Gate, o: &Oracle, ck: &Checkpoint, dev: &
             t2::<B>(&o.param(&s.label).proj, 1, HIDDEN, dev),
             eps,
         );
-        min_cross = smaller(min_cross, max_rel_diff("cross", &host(p.score_weight()), &s.score_weight));
+        min_cross = smaller(
+            min_cross,
+            max_rel_diff("cross", &host(p.score_weight()), &s.score_weight),
+        );
     }
-    g.gt("weights.cross_site_control_differs", min_cross, CONTROL_MIN_REL, "rel (min over sites)");
+    g.gt(
+        "weights.cross_site_control_differs",
+        min_cross,
+        CONTROL_MIN_REL,
+        "rel (min over sites)",
+    );
 
     // The rank assertions must actually fire — BOTH of them. `[H, 1]` is
     // rejected by the width check alone, so testing only that shape leaves the
@@ -1269,7 +1464,11 @@ fn section_weights<B: Backend>(g: &mut Gate, o: &Oracle, ck: &Checkpoint, dev: &
     let wide: Vec<f32> = p0.proj.iter().chain(p0.proj.iter()).copied().collect();
     let (transposed, m1) = expect_panic_saying(
         AssertUnwindSafe(|| {
-            AttnResParams::<B>::new(t1::<B>(&p0.norm, dev), t2::<B>(&p0.proj, HIDDEN, 1, dev), eps);
+            AttnResParams::<B>::new(
+                t1::<B>(&p0.norm, dev),
+                t2::<B>(&p0.proj, HIDDEN, 1, dev),
+                eps,
+            );
         }),
         "stores exactly one",
     );
@@ -1306,7 +1505,10 @@ fn section_weights<B: Backend>(g: &mut Gate, o: &Oracle, ck: &Checkpoint, dev: &
 
 fn section_sites<B: Backend>(g: &mut Gate, o: &Oracle, eps: f64, dev: &Device<B>) {
     println!("  -- sites --");
-    assert!(!o.sites.is_empty(), "no AttnRes call sites found in the oracle");
+    assert!(
+        !o.sites.is_empty(),
+        "no AttnRes call sites found in the oracle"
+    );
 
     let mut stack_ok = true;
     let mut worst_scores = 0.0f64;
@@ -1325,16 +1527,29 @@ fn section_sites<B: Backend>(g: &mut Gate, o: &Oracle, eps: f64, dev: &Device<B>
 
     for s in &o.sites {
         let p = params_of::<B>(o.param(&s.label), eps, dev);
-        let bank: Vec<Tensor<B, 2>> = s.bank.iter().map(|b| t2::<B>(b, TOKENS, HIDDEN, dev)).collect();
+        let bank: Vec<Tensor<B, 2>> = s
+            .bank
+            .iter()
+            .map(|b| t2::<B>(b, TOKENS, HIDDEN, dev))
+            .collect();
         let acc = t2::<B>(&s.prefix_sum, TOKENS, HIDDEN, dev);
 
         // The candidate stack itself — accumulator LAST — against the array the
         // shipped module actually built.
         let v = stack_candidates(&bank, acc);
-        assert_eq!(v.dims(), [TOKENS, s.slots, HIDDEN], "{}: stack shape", s.label);
+        assert_eq!(
+            v.dims(),
+            [TOKENS, s.slots, HIDDEN],
+            "{}: stack shape",
+            s.label
+        );
         if !bits_equal(&format!("{}.v", s.label), &host(v.clone()), &s.v) {
             stack_ok = false;
-            g.truth(&format!("sites.{}.stack", s.label), false, "candidate stack differs");
+            g.truth(
+                &format!("sites.{}.stack", s.label),
+                false,
+                "candidate stack differs",
+            );
         }
 
         let m = p.mix(v);
@@ -1346,22 +1561,35 @@ fn section_sites<B: Backend>(g: &mut Gate, o: &Oracle, eps: f64, dev: &Device<B>
             mix_f64(&s.v, &s.score_weight, eps, TOKENS, s.slots, HIDDEN);
         let ref_scores32: Vec<f32> = ref_scores.iter().map(|x| *x as f32).collect();
         let ref_probs32: Vec<f32> = ref_probs.iter().map(|x| *x as f32).collect();
-        worst_port_f64_scores =
-            worse(worst_port_f64_scores, max_rel_diff("scores/f64", &scores, &ref_scores32));
-        worst_oracle_f64_scores =
-            worse(worst_oracle_f64_scores, max_rel_diff("oracle/f64", &s.scores, &ref_scores32));
-        worst_port_f64_probs =
-            worse(worst_port_f64_probs, max_abs_diff("probs/f64", &probs, &ref_probs32));
-        worst_oracle_f64_probs =
-            worse(worst_oracle_f64_probs, max_abs_diff("oracle probs/f64", &s.probs, &ref_probs32));
+        worst_port_f64_scores = worse(
+            worst_port_f64_scores,
+            max_rel_diff("scores/f64", &scores, &ref_scores32),
+        );
+        worst_oracle_f64_scores = worse(
+            worst_oracle_f64_scores,
+            max_rel_diff("oracle/f64", &s.scores, &ref_scores32),
+        );
+        worst_port_f64_probs = worse(
+            worst_port_f64_probs,
+            max_abs_diff("probs/f64", &probs, &ref_probs32),
+        );
+        worst_oracle_f64_probs = worse(
+            worst_oracle_f64_probs,
+            max_abs_diff("oracle probs/f64", &s.probs, &ref_probs32),
+        );
         worst_port_f64_ulp = worse(worst_port_f64_ulp, max_rel_diff("out/f64", &out, &ref_out));
-        worst_oracle_f64_ulp =
-            worse(worst_oracle_f64_ulp, max_rel_diff("oracle out/f64", &s.out, &ref_out));
+        worst_oracle_f64_ulp = worse(
+            worst_oracle_f64_ulp,
+            max_rel_diff("oracle out/f64", &s.out, &ref_out),
+        );
 
         worst_scores = worse(worst_scores, max_rel_diff("scores", &scores, &s.scores));
         worst_probs = worse(worst_probs, max_abs_diff("probs", &probs, &s.probs));
         for t in 0..TOKENS {
-            let sum: f64 = probs[t * s.slots..(t + 1) * s.slots].iter().map(|x| *x as f64).sum();
+            let sum: f64 = probs[t * s.slots..(t + 1) * s.slots]
+                .iter()
+                .map(|x| *x as f64)
+                .sum();
             worst_prob_sum = worse(worst_prob_sum, (sum - 1.0).abs());
         }
         let (ulp, differing) = max_ulp_bf16("out", &out, &s.out);
@@ -1379,8 +1607,16 @@ fn section_sites<B: Backend>(g: &mut Gate, o: &Oracle, eps: f64, dev: &Device<B>
          \x20      probs   port {worst_port_f64_probs:.3e} abs   oracle {worst_oracle_f64_probs:.3e} abs\n\
          \x20      out     port {worst_port_f64_ulp:.3e} rel   oracle {worst_oracle_f64_ulp:.3e} rel"
     );
-    g.truth("sites.count", o.sites.len() == 26, format!("{} call sites (12 sa + 13 mlp + 1 model)", o.sites.len()));
-    g.truth("sites.candidate_stack_bitexact", stack_ok, "accumulator LAST, all sites");
+    g.truth(
+        "sites.count",
+        o.sites.len() == 26,
+        format!("{} call sites (12 sa + 13 mlp + 1 model)", o.sites.len()),
+    );
+    g.truth(
+        "sites.candidate_stack_bitexact",
+        stack_ok,
+        "accumulator LAST, all sites",
+    );
     g.le("sites.scores", worst_scores, SCORE_RTOL, "rel");
     // ...and, separately, the port's arithmetic must be no worse than the
     // arithmetic it is a port of. A fixed budget cannot say that: this data is
@@ -1430,17 +1666,26 @@ fn section_controls<B: Backend>(g: &mut Gate, o: &Oracle, eps: f64, dev: &Device
 
     for s in &o.sites {
         let p = params_of::<B>(o.param(&s.label), eps, dev);
-        let bank: Vec<Tensor<B, 2>> = s.bank.iter().map(|b| t2::<B>(b, TOKENS, HIDDEN, dev)).collect();
+        let bank: Vec<Tensor<B, 2>> = s
+            .bank
+            .iter()
+            .map(|b| t2::<B>(b, TOKENS, HIDDEN, dev))
+            .collect();
         let acc = t2::<B>(&s.prefix_sum, TOKENS, HIDDEN, dev);
         let v = stack_candidates(&bank, acc.clone());
         let m = p.mix(v.clone());
         let out = host(m.out);
 
         // (a) The control is genuinely a different answer from the truth.
-        min_control_gap =
-            smaller(min_control_gap, max_rel_diff("control gap", &s.alt_normalized, &s.out));
+        min_control_gap = smaller(
+            min_control_gap,
+            max_rel_diff("control gap", &s.alt_normalized, &s.out),
+        );
         // (b) This port does not produce it.
-        min_port_gap = smaller(min_port_gap, max_rel_diff("port gap", &out, &s.alt_normalized));
+        min_port_gap = smaller(
+            min_port_gap,
+            max_rel_diff("port gap", &out, &s.alt_normalized),
+        );
 
         // (c) The control IS the mis-port it is named after — combine over the
         //     NORMALISED candidates instead of the raw ones. Reproducing it
@@ -1449,7 +1694,11 @@ fn section_controls<B: Backend>(g: &mut Gate, o: &Oracle, eps: f64, dev: &Device
         let variance = v.clone().powf_scalar(2.0).mean_dim(2);
         let k = v.clone() * variance.add_scalar(eps).sqrt().recip();
         let wrong = round_bf16(
-            m.probs.clone().reshape([TOKENS, 1, s.slots]).matmul(k).reshape([TOKENS, HIDDEN]),
+            m.probs
+                .clone()
+                .reshape([TOKENS, 1, s.slots])
+                .matmul(k)
+                .reshape([TOKENS, HIDDEN]),
         );
         // Both distances are taken against the SAME array's scale — the
         // control's — because a ratio of two differently-normalised relative
@@ -1462,8 +1711,10 @@ fn section_controls<B: Backend>(g: &mut Gate, o: &Oracle, eps: f64, dev: &Device
         // manifest demotes it, and the mathematics says why. Checked as a
         // property this port must share, labelled so no reader mistakes it for
         // a control that could fail.
-        worst_inv_oracle =
-            worse(worst_inv_oracle, max_rel_diff("inv oracle", &s.alt_prefix_first, &s.out));
+        worst_inv_oracle = worse(
+            worst_inv_oracle,
+            max_rel_diff("inv oracle", &s.alt_prefix_first, &s.out),
+        );
         let mut reordered: Vec<Tensor<B, 3>> = vec![acc.reshape([TOKENS, 1, HIDDEN])];
         for b in &bank {
             reordered.push(b.clone().reshape([TOKENS, 1, HIDDEN]));
@@ -1480,13 +1731,18 @@ fn section_controls<B: Backend>(g: &mut Gate, o: &Oracle, eps: f64, dev: &Device
     {
         let s = o.site("L01.sa");
         let p = params_of::<B>(o.param("L01.sa"), eps, dev);
-        let bank: Vec<Tensor<B, 2>> = s.bank.iter().map(|b| t2::<B>(b, TOKENS, HIDDEN, dev)).collect();
+        let bank: Vec<Tensor<B, 2>> = s
+            .bank
+            .iter()
+            .map(|b| t2::<B>(b, TOKENS, HIDDEN, dev))
+            .collect();
         let v = stack_candidates(&bank, t2::<B>(&s.prefix_sum, TOKENS, HIDDEN, dev));
         let (ref_scores, _, _) = mix_f64(&s.v, &s.score_weight, eps, TOKENS, s.slots, HIDDEN);
         let ref32: Vec<f32> = ref_scores.iter().map(|x| *x as f32).collect();
         let variance = v.clone().powf_scalar(2.0).mean_dim(2);
         let recip_scores = host(
-            (v.clone() * variance.add_scalar(eps).sqrt().recip()
+            (v.clone()
+                * variance.add_scalar(eps).sqrt().recip()
                 * t1::<B>(&s.score_weight, dev).reshape([1, 1, HIDDEN]))
             .sum_dim(2)
             .reshape([TOKENS, s.slots]),
@@ -1494,20 +1750,45 @@ fn section_controls<B: Backend>(g: &mut Gate, o: &Oracle, eps: f64, dev: &Device
         let port_scores = host(p.mix(v).scores);
         let e_recip = max_rel_diff("recip scores", &recip_scores, &ref32);
         let e_port = max_rel_diff("port scores", &port_scores, &ref32);
-        g.gt("controls.rsqrt_via_recip_is_worse", e_recip / e_port.max(1e-12), 10.0, "x worse");
+        g.gt(
+            "controls.rsqrt_via_recip_is_worse",
+            e_recip / e_port.max(1e-12),
+            10.0,
+            "x worse",
+        );
         println!("     rsqrt via recip {e_recip:.3e} rel vs the port's division {e_port:.3e} rel");
     }
 
-    g.gt("controls.combine_normalized_is_wrong", min_control_gap, CONTROL_MIN_REL, "rel (min)");
-    g.gt("controls.port_rejects_combine_normalized", min_port_gap, CONTROL_MIN_REL, "rel (min)");
+    g.gt(
+        "controls.combine_normalized_is_wrong",
+        min_control_gap,
+        CONTROL_MIN_REL,
+        "rel (min)",
+    );
+    g.gt(
+        "controls.port_rejects_combine_normalized",
+        min_port_gap,
+        CONTROL_MIN_REL,
+        "rel (min)",
+    );
     g.gt(
         "controls.combine_normalized_reproduced",
         worst_reproduce,
         CONTROL_REPRODUCE_RATIO,
         "x closer than the truth (min over sites)",
     );
-    g.le("invariance.slot_order_oracle", worst_inv_oracle, INVARIANCE_REL, "rel [NOT a control]");
-    g.le("invariance.slot_order_port", worst_inv_port, INVARIANCE_REL, "rel [NOT a control]");
+    g.le(
+        "invariance.slot_order_oracle",
+        worst_inv_oracle,
+        INVARIANCE_REL,
+        "rel [NOT a control]",
+    );
+    g.le(
+        "invariance.slot_order_port",
+        worst_inv_port,
+        INVARIANCE_REL,
+        "rel [NOT a control]",
+    );
 
     // The slot order DOES matter for the bank, and that is measurable: at layer
     // 12 the snapshot sits last, and the first entry is a different tensor.
@@ -1550,7 +1831,12 @@ fn section_chain<B: Backend>(g: &mut Gate, o: &Oracle, ck: &Checkpoint, dev: &De
         mixer.schedule() == &full.schedule()[..LAYERS],
         format!(
             "crossings at {:?}",
-            prefix.iter().enumerate().filter(|(_, b)| **b).map(|(i, _)| i).collect::<Vec<_>>()
+            prefix
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| **b)
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>()
         ),
     );
 
@@ -1584,7 +1870,11 @@ fn section_chain<B: Backend>(g: &mut Gate, o: &Oracle, ck: &Checkpoint, dev: &De
         }
         worst_entry_ulp = worse(
             worst_entry_ulp,
-            max_rel_diff(&format!("L{l:02} entry"), &host(entry.to_attention), &tape.input_layernorm_in),
+            max_rel_diff(
+                &format!("L{l:02} entry"),
+                &host(entry.to_attention),
+                &tape.input_layernorm_in,
+            ),
         );
 
         // THE BANK, at the crossing — not merely the layer output.
@@ -1597,7 +1887,11 @@ fn section_chain<B: Backend>(g: &mut Gate, o: &Oracle, ck: &Checkpoint, dev: &De
             );
         } else {
             for (i, e) in mixer.bank().iter().enumerate() {
-                if !bits_equal(&format!("L{l:02} bank[{i}]"), &host(e.clone()), &tape.bank_out[i]) {
+                if !bits_equal(
+                    &format!("L{l:02} bank[{i}]"),
+                    &host(e.clone()),
+                    &tape.bank_out[i],
+                ) {
                     bank_exact = false;
                     g.truth(&format!("chain.L{l:02}.bank[{i}]"), false, "differs");
                 }
@@ -1609,13 +1903,21 @@ fn section_chain<B: Backend>(g: &mut Gate, o: &Oracle, ck: &Checkpoint, dev: &De
 
         // THE RESET. The accumulator after attention is `layer_in + attn_out`
         // on an ordinary layer and `attn_out` alone on a checkpoint layer.
-        let acc = host(mixer.accumulator().expect("accumulator after attention").clone());
+        let acc = host(
+            mixer
+                .accumulator()
+                .expect("accumulator after attention")
+                .clone(),
+        );
         if !bits_equal(&format!("L{l:02} acc"), &acc, &tape.mlp_prefix_sum) {
             acc_exact = false;
             g.truth(
                 &format!("chain.L{l:02}.accumulator"),
                 false,
-                format!("max |d| {:e}", max_abs_diff("acc", &acc, &tape.mlp_prefix_sum)),
+                format!(
+                    "max |d| {:e}",
+                    max_abs_diff("acc", &acc, &tape.mlp_prefix_sum)
+                ),
             );
         }
         // ...and on a checkpoint layer the un-reset alternative must be a
@@ -1631,7 +1933,11 @@ fn section_chain<B: Backend>(g: &mut Gate, o: &Oracle, ck: &Checkpoint, dev: &De
 
         worst_mlp_ulp = worse(
             worst_mlp_ulp,
-            max_rel_diff(&format!("L{l:02} mlp"), &host(mix.out), &tape.post_attention_layernorm_in),
+            max_rel_diff(
+                &format!("L{l:02} mlp"),
+                &host(mix.out),
+                &tape.post_attention_layernorm_in,
+            ),
         );
 
         hidden = mixer.after_mlp(t2::<B>(&tape.mlp_out, TOKENS, HIDDEN, dev));
@@ -1646,12 +1952,37 @@ fn section_chain<B: Backend>(g: &mut Gate, o: &Oracle, ck: &Checkpoint, dev: &De
         }
     }
 
-    g.truth("chain.sa_mix_presence", mix_presence_ok, "mixture iff bank non-empty, all 13 layers");
-    g.truth("chain.bank_bitexact_every_layer", bank_exact, "13 layers, incl. both crossings");
-    g.truth("chain.accumulator_bitexact_every_layer", acc_exact, "the reset, at every layer");
-    g.truth("chain.reset_is_not_vacuous", reset_nonvacuous, "un-reset alternative differs");
-    g.gt("chain.reset_gap", min_reset_gap, CONTROL_MIN_REL, "rel (min over crossings)");
-    g.truth("chain.layer_out_bitexact", layer_out_exact, "13 layers chained");
+    g.truth(
+        "chain.sa_mix_presence",
+        mix_presence_ok,
+        "mixture iff bank non-empty, all 13 layers",
+    );
+    g.truth(
+        "chain.bank_bitexact_every_layer",
+        bank_exact,
+        "13 layers, incl. both crossings",
+    );
+    g.truth(
+        "chain.accumulator_bitexact_every_layer",
+        acc_exact,
+        "the reset, at every layer",
+    );
+    g.truth(
+        "chain.reset_is_not_vacuous",
+        reset_nonvacuous,
+        "un-reset alternative differs",
+    );
+    g.gt(
+        "chain.reset_gap",
+        min_reset_gap,
+        CONTROL_MIN_REL,
+        "rel (min over crossings)",
+    );
+    g.truth(
+        "chain.layer_out_bitexact",
+        layer_out_exact,
+        "13 layers chained",
+    );
     g.le("chain.entry_mix", worst_entry_ulp, OUT_REL, "rel-to-max");
     g.le("chain.mlp_mix", worst_mlp_ulp, OUT_REL, "rel-to-max");
 
@@ -1660,14 +1991,22 @@ fn section_chain<B: Backend>(g: &mut Gate, o: &Oracle, ck: &Checkpoint, dev: &De
     let out_params = params_of::<B>(o.param("MODEL.output"), eps, dev);
     g.truth(
         "chain.final_hidden_is_model_prefix_sum",
-        bits_equal("final hidden", &host(hidden.clone()), &model_site.prefix_sum),
+        bits_equal(
+            "final hidden",
+            &host(hidden.clone()),
+            &model_site.prefix_sum,
+        ),
         "the chained layer-12 output is what the output mixture accumulates",
     );
     let v = host(stack_candidates(mixer.bank(), hidden.clone()));
     g.truth(
         "chain.output_stack_bitexact",
         bits_equal("model v", &v, &model_site.v),
-        format!("{} slots (bank {} + accumulator)", model_site.slots, mixer.bank_len()),
+        format!(
+            "{} slots (bank {} + accumulator)",
+            model_site.slots,
+            mixer.bank_len()
+        ),
     );
     let fin = mixer.finish(hidden, &out_params);
     g.le(
@@ -1684,14 +2023,24 @@ fn section_chain<B: Backend>(g: &mut Gate, o: &Oracle, ck: &Checkpoint, dev: &De
         m.enter_layer(x.clone(), &out_params);
         m.enter_layer(x, &out_params); // out of order
     }));
-    g.truth("chain.call_order_guard_fires", caught, "two enter_layer in a row rejected");
+    g.truth(
+        "chain.call_order_guard_fires",
+        caught,
+        "two enter_layer in a row rejected",
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Lanes
 // ---------------------------------------------------------------------------
 
-fn run_lane<B: Backend>(lane: &str, dev: &Device<B>, o: &Oracle, ck: &Checkpoint, verbose: bool) -> bool {
+fn run_lane<B: Backend>(
+    lane: &str,
+    dev: &Device<B>,
+    o: &Oracle,
+    ck: &Checkpoint,
+    verbose: bool,
+) -> bool {
     println!("\n=== lane: {lane} ===");
     let mut g = Gate::new(lane, verbose);
     let eps = ck.cfg.text_config.rms_norm_eps;
@@ -1702,7 +2051,12 @@ fn run_lane<B: Backend>(lane: &str, dev: &Device<B>, o: &Oracle, ck: &Checkpoint
     section_sites::<B>(&mut g, o, eps, dev);
     section_controls::<B>(&mut g, o, eps, dev);
     section_chain::<B>(&mut g, o, ck, dev);
-    println!("  lane {}: {} checks passed, {} failed", g.lane, g.passed, g.failures.len());
+    println!(
+        "  lane {}: {} checks passed, {} failed",
+        g.lane,
+        g.passed,
+        g.failures.len()
+    );
     for f in &g.failures {
         println!("    - {f}");
     }
@@ -1736,7 +2090,10 @@ fn main() -> Result<()> {
     {
         type Cpu = burn::backend::NdArray;
         let dev = Device::<Cpu>::default();
-        lanes.push(("ndarray-cpu", run_lane::<Cpu>("ndarray-cpu", &dev, &o, &ck, verbose)));
+        lanes.push((
+            "ndarray-cpu",
+            run_lane::<Cpu>("ndarray-cpu", &dev, &o, &ck, verbose),
+        ));
     }
     #[cfg(feature = "k3-attn-res-cuda")]
     {
@@ -1759,7 +2116,11 @@ fn main() -> Result<()> {
     if lanes.is_empty() {
         println!("  NO LANE RAN — nothing was verified.");
     }
-    println!("\nGATE: {}  ({} lane(s))", if pass { "PASS" } else { "FAIL" }, lanes.len());
+    println!(
+        "\nGATE: {}  ({} lane(s))",
+        if pass { "PASS" } else { "FAIL" },
+        lanes.len()
+    );
     if !pass {
         std::process::exit(1);
     }

@@ -185,7 +185,11 @@ pub enum TranscodeError {
     /// The tensor's exponents span more than E4M3's 18-octave power-of-two
     /// window, so no single power-of-two global scale makes every block scale
     /// exact. Requantizing would be the only way out — this module will not.
-    ExponentSpan { e_min: i32, e_max: i32, octaves: usize },
+    ExponentSpan {
+        e_min: i32,
+        e_max: i32,
+        octaves: usize,
+    },
     /// `2^(e_max - 8)` is outside f32's normal range; the global scale itself
     /// could not be held exactly.
     GlobalScaleRange { g: i32 },
@@ -195,7 +199,11 @@ impl std::fmt::Display for TranscodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ScaleNan { index } => write!(f, "E8M0 scale[{index}] is NaN (0xFF)"),
-            Self::ExponentSpan { e_min, e_max, octaves } => write!(
+            Self::ExponentSpan {
+                e_min,
+                e_max,
+                octaves,
+            } => write!(
                 f,
                 "E8M0 exponents span {octaves} octaves ({e_min}..{e_max}); E4M3 holds {} exactly",
                 E4M3_POW2_MAX - E4M3_POW2_MIN + 1
@@ -255,9 +263,21 @@ pub fn scale_exponent_range(scale: &[u8]) -> Result<(i32, i32), TranscodeError> 
 /// `packed` is `rows · cols/2` bytes and `scale` is `rows · cols/32` bytes,
 /// both row-major.
 pub fn decode_mxfp4(packed: &[u8], scale: &[u8], rows: usize, cols: usize) -> Vec<f32> {
-    assert_eq!(cols % MX_BLOCK, 0, "cols {cols} must be a multiple of {MX_BLOCK}");
-    assert_eq!(packed.len(), rows * cols / 2, "packed plane is not [{rows}, {cols}/2]");
-    assert_eq!(scale.len(), rows * cols / MX_BLOCK, "scale plane is not [{rows}, {cols}/{MX_BLOCK}]");
+    assert_eq!(
+        cols % MX_BLOCK,
+        0,
+        "cols {cols} must be a multiple of {MX_BLOCK}"
+    );
+    assert_eq!(
+        packed.len(),
+        rows * cols / 2,
+        "packed plane is not [{rows}, {cols}/2]"
+    );
+    assert_eq!(
+        scale.len(),
+        rows * cols / MX_BLOCK,
+        "scale plane is not [{rows}, {cols}/{MX_BLOCK}]"
+    );
     let blocks_per_row = cols / MX_BLOCK;
     let mut out = vec![0f32; rows * cols];
     for r in 0..rows {
@@ -284,7 +304,10 @@ pub fn decode_mxfp4(packed: &[u8], scale: &[u8], rows: usize, cols: usize) -> Ve
 /// an E8M0 exponent below −24 or above 15 would round or flush. Use
 /// [`decode_mxfp4`] when exactness is the point.
 pub fn decode_mxfp4_f16(packed: &[u8], scale: &[u8], rows: usize, cols: usize) -> Vec<f16> {
-    decode_mxfp4(packed, scale, rows, cols).into_iter().map(f16::from_f32).collect()
+    decode_mxfp4(packed, scale, rows, cols)
+        .into_iter()
+        .map(f16::from_f32)
+        .collect()
 }
 
 /// Relabel an MXFP4 tensor as NVFP4 without touching a weight byte.
@@ -299,9 +322,21 @@ pub fn transcode_to_nvfp4<'a>(
     rows: usize,
     cols: usize,
 ) -> Result<Nvfp4<'a>, TranscodeError> {
-    assert_eq!(cols % MX_BLOCK, 0, "cols {cols} must be a multiple of {MX_BLOCK}");
-    assert_eq!(packed.len(), rows * cols / 2, "packed plane is not [{rows}, {cols}/2]");
-    assert_eq!(scale.len(), rows * cols / MX_BLOCK, "scale plane is not [{rows}, {cols}/{MX_BLOCK}]");
+    assert_eq!(
+        cols % MX_BLOCK,
+        0,
+        "cols {cols} must be a multiple of {MX_BLOCK}"
+    );
+    assert_eq!(
+        packed.len(),
+        rows * cols / 2,
+        "packed plane is not [{rows}, {cols}/2]"
+    );
+    assert_eq!(
+        scale.len(),
+        rows * cols / MX_BLOCK,
+        "scale plane is not [{rows}, {cols}/{MX_BLOCK}]"
+    );
 
     let (e_min, e_max) = scale_exponent_range(scale)?;
     let g = e_max - E4M3_POW2_MAX;
@@ -375,7 +410,11 @@ mod tests {
             let s = if code & 8 != 0 { -1.0f32 } else { 1.0 };
             let e = ((code >> 1) & 3) as i32;
             let m = (code & 1) as f32;
-            let v = if e == 0 { s * m * 0.5 } else { s * (1.0 + m * 0.5) * pow2_f32(e - 1).unwrap() };
+            let v = if e == 0 {
+                s * m * 0.5
+            } else {
+                s * (1.0 + m * 0.5) * pow2_f32(e - 1).unwrap()
+            };
             // to_bits, not ==, so the two zeros stay distinguishable.
             assert_eq!(E2M1[code as usize].to_bits(), v.to_bits(), "code {code:#x}");
         }
@@ -386,8 +425,8 @@ mod tests {
         assert_eq!(e8m0_to_f32(127), 1.0);
         assert_eq!(e8m0_to_f32(122), 0.03125); // 2^-5, the checkpoint's usual scale
         assert_eq!(e8m0_to_f32(112), 3.0517578125e-05); // 2^-15
-        // 0x01 is 2^-126 = f32's smallest normal, so 0x00 is one exact halving
-        // below it — the subnormal branch, checked without a decimal literal.
+                                                        // 0x01 is 2^-126 = f32's smallest normal, so 0x00 is one exact halving
+                                                        // below it — the subnormal branch, checked without a decimal literal.
         assert_eq!(e8m0_to_f32(1), f32::MIN_POSITIVE);
         assert_eq!(e8m0_to_f32(0) * 2.0, f32::MIN_POSITIVE);
         assert_eq!(e8m0_to_f32(254), pow2_f32(127).unwrap());
@@ -397,9 +436,7 @@ mod tests {
     #[test]
     fn e4m3_pow2_window_is_18_octaves() {
         let exact: Vec<i32> = (-30..=30)
-            .filter(|&e| {
-                e4m3_from_pow2(e).is_some_and(|b| e4m3_to_f32(b) == pow2_f32(e).unwrap())
-            })
+            .filter(|&e| e4m3_from_pow2(e).is_some_and(|b| e4m3_to_f32(b) == pow2_f32(e).unwrap()))
             .collect();
         assert_eq!(exact.first(), Some(&E4M3_POW2_MIN));
         assert_eq!(exact.last(), Some(&E4M3_POW2_MAX));
@@ -429,7 +466,11 @@ mod tests {
     fn e4m3_from_pow2_emits_known_bytes() {
         assert_eq!(e4m3_from_pow2(0), Some(0x38), "2^0 must encode as 0x38");
         assert_eq!(e4m3_from_pow2(8), Some(0x78), "2^8 must encode as 0x78");
-        assert_eq!(e4m3_from_pow2(-9), Some(0x01), "2^-9 subnormal must encode as 0x01");
+        assert_eq!(
+            e4m3_from_pow2(-9),
+            Some(0x01),
+            "2^-9 subnormal must encode as 0x01"
+        );
         assert_eq!(e4m3_from_pow2(-6), Some(0x08), "2^-6 must encode as 0x08");
         // Outside the window at both ends.
         assert_eq!(e4m3_from_pow2(9), None);
@@ -437,7 +478,11 @@ mod tests {
         // No emitted byte may carry the sign bit: block scales are magnitudes.
         for e in E4M3_POW2_MIN..=E4M3_POW2_MAX {
             let b = e4m3_from_pow2(e).expect("inside the window");
-            assert_eq!(b & 0x80, 0, "emitted byte {b:#04x} for 2^{e} has the sign bit set");
+            assert_eq!(
+                b & 0x80,
+                0,
+                "emitted byte {b:#04x} for 2^{e} has the sign bit set"
+            );
         }
     }
 
@@ -455,7 +500,9 @@ mod tests {
     /// the transcode has to stay bit-exact right up to the edge and refuse the
     /// step past it.
     fn synthetic(exps: &[i32]) -> (Vec<u8>, Vec<u8>) {
-        let packed: Vec<u8> = (0..exps.len() * MX_BLOCK / 2).map(|i| (i % 256) as u8).collect();
+        let packed: Vec<u8> = (0..exps.len() * MX_BLOCK / 2)
+            .map(|i| (i % 256) as u8)
+            .collect();
         let scale: Vec<u8> = exps.iter().map(|&e| (e + 127) as u8).collect();
         (packed, scale)
     }
@@ -469,7 +516,11 @@ mod tests {
         let nv = transcode_to_nvfp4(&packed, &scale, rows, cols).unwrap();
         assert_eq!(nv.global_exp, 0);
         assert!(nv.subnormal_block_scales);
-        assert_eq!(nv.packed.as_ptr(), packed.as_ptr(), "nibbles must be borrowed, not rebuilt");
+        assert_eq!(
+            nv.packed.as_ptr(),
+            packed.as_ptr(),
+            "nibbles must be borrowed, not rebuilt"
+        );
         let back = decode_nvfp4(&nv);
         for (i, (a, b)) in mx.iter().zip(&back).enumerate() {
             assert_eq!(a.to_bits(), b.to_bits(), "element {i}: {a} vs {b}");
@@ -481,7 +532,14 @@ mod tests {
         let exps: Vec<i32> = (-9..=9).collect();
         let (packed, scale) = synthetic(&exps);
         let err = transcode_to_nvfp4(&packed, &scale, exps.len(), MX_BLOCK).unwrap_err();
-        assert_eq!(err, TranscodeError::ExponentSpan { e_min: -9, e_max: 9, octaves: 19 });
+        assert_eq!(
+            err,
+            TranscodeError::ExponentSpan {
+                e_min: -9,
+                e_max: 9,
+                octaves: 19
+            }
+        );
     }
 
     #[test]

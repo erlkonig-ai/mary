@@ -50,14 +50,29 @@ fn shard_entries(path: &Path) -> std::io::Result<(u64, Vec<(String, u64, u64)>)>
     let mut skipped = 0usize;
     for (i, _) in txt.match_indices("\"data_offsets\"") {
         let head = &txt[..i];
-        let Some(q_end) = head.rfind("\":{") else { skipped += 1; continue };
-        let Some(q_start) = head[..q_end].rfind('"') else { skipped += 1; continue };
+        let Some(q_end) = head.rfind("\":{") else {
+            skipped += 1;
+            continue;
+        };
+        let Some(q_start) = head[..q_end].rfind('"') else {
+            skipped += 1;
+            continue;
+        };
         let name = &head[q_start + 1..q_end];
         let rest = &txt[i..];
-        let Some(lb) = rest.find('[') else { skipped += 1; continue };
-        let Some(rb_rel) = rest[lb..].find(']') else { skipped += 1; continue };
+        let Some(lb) = rest.find('[') else {
+            skipped += 1;
+            continue;
+        };
+        let Some(rb_rel) = rest[lb..].find(']') else {
+            skipped += 1;
+            continue;
+        };
         let mut it = rest[lb + 1..lb + rb_rel].split(',');
-        let (Some(a), Some(b)) = (it.next(), it.next()) else { skipped += 1; continue };
+        let (Some(a), Some(b)) = (it.next(), it.next()) else {
+            skipped += 1;
+            continue;
+        };
         let (Ok(a), Ok(b)) = (a.trim().parse::<u64>(), b.trim().parse::<u64>()) else {
             skipped += 1;
             continue;
@@ -65,7 +80,10 @@ fn shard_entries(path: &Path) -> std::io::Result<(u64, Vec<(String, u64, u64)>)>
         out.push((name.to_string(), a, b));
     }
     if skipped > 0 {
-        eprintln!("  warning: {skipped} malformed header record(s) in {}", path.display());
+        eprintln!(
+            "  warning: {skipped} malformed header record(s) in {}",
+            path.display()
+        );
     }
     Ok((8 + hlen, out))
 }
@@ -77,20 +95,17 @@ fn main() {
     let dir_arg = std::env::args()
         .nth(1)
         .or_else(|| std::env::var("K3_MODEL_DIR").ok());
-    let dir = mary::paths::model(dir_arg.as_deref(), "kimi-k3")
-        .unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(2)
-        });
+    let dir = mary::paths::model(dir_arg.as_deref(), "kimi-k3").unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
 
     let t0 = Instant::now();
     let mut book: HashMap<String, Located> = HashMap::new();
     let mut shards: Vec<PathBuf> = std::fs::read_dir(&dir)
         .expect("read model dir")
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.extension().is_some_and(|e| e == "safetensors")
-        })
+        .filter(|p| p.extension().is_some_and(|e| e == "safetensors"))
         .collect();
     shards.sort();
     for sp in &shards {
@@ -104,12 +119,21 @@ fn main() {
         for (name, a, b) in entries {
             book.insert(
                 name,
-                Located { shard: sp.clone(), offset: data_start + a, len: b - a },
+                Located {
+                    shard: sp.clone(),
+                    offset: data_start + a,
+                    len: b - a,
+                },
             );
         }
     }
     let build = t0.elapsed();
-    println!("address book: {} tensors from {} shards in {:.2}s", book.len(), shards.len(), build.as_secs_f64());
+    println!(
+        "address book: {} tensors from {} shards in {:.2}s",
+        book.len(),
+        shards.len(),
+        build.as_secs_f64()
+    );
 
     // ── correctness gate, before any bandwidth number ──
     const EXPERT_BYTES: u64 = 17_547_264;
@@ -130,19 +154,30 @@ fn main() {
         }
     }
     let n_experts = by_expert.len();
-    let wrong: Vec<(&String, &u64)> = by_expert.iter().filter(|(_, &b)| b != EXPERT_BYTES).collect();
+    let wrong: Vec<(&String, &u64)> = by_expert
+        .iter()
+        .filter(|(_, &b)| b != EXPERT_BYTES)
+        .collect();
     println!("routed experts found: {n_experts}");
-    println!("experts whose total bytes != {EXPERT_BYTES}: {}", wrong.len());
+    println!(
+        "experts whose total bytes != {EXPERT_BYTES}: {}",
+        wrong.len()
+    );
     if let Some((n, b)) = wrong.first() {
         println!("  e.g. {n} = {b}");
     }
     let mut fail = 0;
     if n_experts != 82_432 {
-        println!("GATE FAIL: expected 82,432 routed experts (92 MoE layers x 896), found {n_experts}");
+        println!(
+            "GATE FAIL: expected 82,432 routed experts (92 MoE layers x 896), found {n_experts}"
+        );
         fail += 1;
     }
     if !wrong.is_empty() {
-        println!("GATE FAIL: {} expert(s) do not total the known 17,547,264 bytes", wrong.len());
+        println!(
+            "GATE FAIL: {} expert(s) do not total the known 17,547,264 bytes",
+            wrong.len()
+        );
         fail += 1;
     }
     if fail > 0 {
@@ -216,7 +251,10 @@ fn main() {
     for (n, l) in book.iter() {
         if let Some(i) = n.find(".experts.") {
             if let Some(j) = n[i + 9..].find('.') {
-                members.entry(n[..i + 9 + j].to_string()).or_default().push(l);
+                members
+                    .entry(n[..i + 9 + j].to_string())
+                    .or_default()
+                    .push(l);
             }
         }
     }
@@ -245,8 +283,10 @@ fn main() {
         members.len()
     );
     if spans.len() != members.len() {
-        println!("GATE FAIL: {} expert(s) are split or interleaved; a single read cannot cover them",
-                 members.len() - spans.len());
+        println!(
+            "GATE FAIL: {} expert(s) are split or interleaved; a single read cannot cover them",
+            members.len() - spans.len()
+        );
         std::process::exit(1);
     }
 
@@ -300,5 +340,7 @@ fn main() {
         );
     }
     println!("  (each level reads experts no earlier level touched)");
-    println!("(page cache is NOT bypassed here — this is the warm-ish path a loader actually sees)");
+    println!(
+        "(page cache is NOT bypassed here — this is the warm-ish path a loader actually sees)"
+    );
 }

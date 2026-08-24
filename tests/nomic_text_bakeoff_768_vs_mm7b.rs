@@ -153,12 +153,9 @@ fn text_retrieval_bakeoff() {
     let t0 = Instant::now();
     let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(&pile_path)
         .expect("load native model collection snapshot");
-    let nomic7b = mary::persist::load_nomic_mm7b_aliased_from_snapshot(
-        snapshot,
-        &tok_path,
-        device.clone(),
-    )
-    .expect("7b aliased load");
+    let nomic7b =
+        mary::persist::load_nomic_mm7b_aliased_from_snapshot(snapshot, &tok_path, device.clone())
+            .expect("7b aliased load");
     let load_7b_ms = t0.elapsed().as_millis();
 
     let mut dvecs_7b: Vec<(&str, Vec<f32>)> = Vec::new();

@@ -81,17 +81,72 @@ fn main() {
     for i in 0..PRED_LAYERS {
         let lp = format!("{p}.model.layers.{i}");
         let h = PRED_HIDDEN;
-        put(&mut m, &mut rng, format!("{lp}.self_attn.q_proj.weight"), vec![Q_DIM, h]);
-        put(&mut m, &mut rng, format!("{lp}.self_attn.k_proj.weight"), vec![KV_DIM, h]);
-        put(&mut m, &mut rng, format!("{lp}.self_attn.v_proj.weight"), vec![KV_DIM, h]);
-        put(&mut m, &mut rng, format!("{lp}.self_attn.o_proj.weight"), vec![h, Q_DIM]);
-        put(&mut m, &mut rng, format!("{lp}.mlp.gate_proj.weight"), vec![INTER, h]);
-        put(&mut m, &mut rng, format!("{lp}.mlp.up_proj.weight"), vec![INTER, h]);
-        put(&mut m, &mut rng, format!("{lp}.mlp.down_proj.weight"), vec![h, INTER]);
-        put(&mut m, &mut rng, format!("{lp}.input_layernorm.weight"), vec![h]);
-        put(&mut m, &mut rng, format!("{lp}.post_attention_layernorm.weight"), vec![h]);
-        put(&mut m, &mut rng, format!("{lp}.self_attn.q_norm.weight"), vec![PRED_HEAD_DIM]);
-        put(&mut m, &mut rng, format!("{lp}.self_attn.k_norm.weight"), vec![PRED_HEAD_DIM]);
+        put(
+            &mut m,
+            &mut rng,
+            format!("{lp}.self_attn.q_proj.weight"),
+            vec![Q_DIM, h],
+        );
+        put(
+            &mut m,
+            &mut rng,
+            format!("{lp}.self_attn.k_proj.weight"),
+            vec![KV_DIM, h],
+        );
+        put(
+            &mut m,
+            &mut rng,
+            format!("{lp}.self_attn.v_proj.weight"),
+            vec![KV_DIM, h],
+        );
+        put(
+            &mut m,
+            &mut rng,
+            format!("{lp}.self_attn.o_proj.weight"),
+            vec![h, Q_DIM],
+        );
+        put(
+            &mut m,
+            &mut rng,
+            format!("{lp}.mlp.gate_proj.weight"),
+            vec![INTER, h],
+        );
+        put(
+            &mut m,
+            &mut rng,
+            format!("{lp}.mlp.up_proj.weight"),
+            vec![INTER, h],
+        );
+        put(
+            &mut m,
+            &mut rng,
+            format!("{lp}.mlp.down_proj.weight"),
+            vec![h, INTER],
+        );
+        put(
+            &mut m,
+            &mut rng,
+            format!("{lp}.input_layernorm.weight"),
+            vec![h],
+        );
+        put(
+            &mut m,
+            &mut rng,
+            format!("{lp}.post_attention_layernorm.weight"),
+            vec![h],
+        );
+        put(
+            &mut m,
+            &mut rng,
+            format!("{lp}.self_attn.q_norm.weight"),
+            vec![PRED_HEAD_DIM],
+        );
+        put(
+            &mut m,
+            &mut rng,
+            format!("{lp}.self_attn.k_norm.weight"),
+            vec![PRED_HEAD_DIM],
+        );
     }
     for i in 0..NUM_CODE_GROUPS - 1 {
         put(
@@ -114,8 +169,18 @@ fn main() {
         format!("{p}.small_to_mtp_projection.weight"),
         vec![PRED_HIDDEN, TALKER_W],
     );
-    put(&mut m, &mut rng, format!("{p}.small_to_mtp_projection.bias"), vec![PRED_HIDDEN]);
-    put(&mut m, &mut rng, format!("{p}.model.norm.weight"), vec![PRED_HIDDEN]);
+    put(
+        &mut m,
+        &mut rng,
+        format!("{p}.small_to_mtp_projection.bias"),
+        vec![PRED_HIDDEN],
+    );
+    put(
+        &mut m,
+        &mut rng,
+        format!("{p}.model.norm.weight"),
+        vec![PRED_HIDDEN],
+    );
 
     let bytes: usize = m.values().map(|(v, _)| v.len() * 4).sum();
     println!(
@@ -199,8 +264,10 @@ fn main() {
     let _ = predictor.take_bench(); // drain whatever the interleaved rounds put there
 
     println!("\n{rounds} interleaved rounds, ms per predictor frame:");
-    let mut rows: Vec<(&str, &mut Vec<f64>)> =
-        vec![("cpu down=serial", &mut ser), ("cpu down=pooled", &mut pooled)];
+    let mut rows: Vec<(&str, &mut Vec<f64>)> = vec![
+        ("cpu down=serial", &mut ser),
+        ("cpu down=pooled", &mut pooled),
+    ];
     #[cfg(feature = "predictor-gpu")]
     for (i, v) in dev.iter_mut().enumerate() {
         if !v.is_empty() {

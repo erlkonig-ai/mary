@@ -604,7 +604,10 @@ mod filtered_native_import_tests {
         let leaf = &exact["block.weight"];
         assert_eq!(leaf.elem(), crate::leaf::Elem::F32);
         assert_eq!(leaf.dims(), &[3, 2]);
-        assert_eq!(&leaf.view_f32().expect("zero-copy f32 view")[..], &matrix[..]);
+        assert_eq!(
+            &leaf.view_f32().expect("zero-copy f32 view")[..],
+            &matrix[..]
+        );
     }
 
     #[test]
@@ -760,14 +763,9 @@ fn persist_files_to_pile(
     for (path, name) in files {
         let bytes = read_safetensors_file(path);
         eprintln!("[persist] ingesting {name} ({} bytes)...", bytes.len());
-        let frag = crate::ingest::save_safetensors_filtered(
-            &bytes,
-            name,
-            &mut pile,
-            dtype,
-            |_| true,
-        )
-        .map_err(|e| anyhow::anyhow!("ingest {path:?}: {e}"))?;
+        let frag =
+            crate::ingest::save_safetensors_filtered(&bytes, name, &mut pile, dtype, |_| true)
+                .map_err(|e| anyhow::anyhow!("ingest {path:?}: {e}"))?;
         fragment += frag;
     }
 
@@ -818,14 +816,9 @@ pub fn persist_safetensors_file_filtered_to_pile(
         "[persist] ingesting {entity_name} (filtered from {} bytes)...",
         bytes.len()
     );
-    let frag = crate::ingest::save_safetensors_filtered(
-        &bytes,
-        entity_name,
-        &mut pile,
-        dtype,
-        keep,
-    )
-    .map_err(|e| anyhow::anyhow!("ingest {file:?}: {e}"))?;
+    let frag =
+        crate::ingest::save_safetensors_filtered(&bytes, entity_name, &mut pile, dtype, keep)
+            .map_err(|e| anyhow::anyhow!("ingest {file:?}: {e}"))?;
 
     let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
     let team = crate::model_collection::model_graph_team_or_own(&mut pile, &signing_key)?;
@@ -993,26 +986,24 @@ pub fn load_aliased_loader_from_pile(
 pub fn personaplex_bundle(
     pile_path: &Path,
 ) -> anyhow::Result<
-    crate::models::personaplex::PersonaPlexBundle<
-        triblespace::core::repo::pile::PileReader,
-    >,
+    crate::models::personaplex::PersonaPlexBundle<triblespace::core::repo::pile::PileReader>,
 > {
     // Team discovery and ticket selection share one observed record prefix.
     // The 32 GiB model also stays under one open pile, avoiding a second
     // validate/close/reopen cycle merely to learn the publishing team.
     let mut pile = Pile::open(pile_path)
         .with_context(|| format!("open PersonaPlex bundle pile {pile_path:?}"))?;
-    let (team, snapshot) = match
-        crate::model_collection::snapshot_sole_model_bundle_collection_local_latest(&mut pile)
-    {
-        Ok(observation) => observation,
-        Err(error) => {
-            let _ = pile.close();
-            return Err(error).with_context(|| {
-                format!("freeze the sole PersonaPlex bundle snapshot in {pile_path:?}")
-            });
-        }
-    };
+    let (team, snapshot) =
+        match crate::model_collection::snapshot_sole_model_bundle_collection_local_latest(&mut pile)
+        {
+            Ok(observation) => observation,
+            Err(error) => {
+                let _ = pile.close();
+                return Err(error).with_context(|| {
+                    format!("freeze the sole PersonaPlex bundle snapshot in {pile_path:?}")
+                });
+            }
+        };
     pile.close()
         .with_context(|| format!("close PersonaPlex bundle pile {pile_path:?}"))?;
     crate::models::personaplex::PersonaPlexWeights::from_bundle_snapshot(team, snapshot)
@@ -1680,9 +1671,8 @@ pub fn ingest_spm_tokenizer(
     let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
     let team = crate::model_collection::model_graph_team_or_own(&mut pile, &signing_key)
         .map_err(|e| anyhow::anyhow!("select model collection: {e}"))?;
-    let snapshot =
-        crate::model_collection::snapshot_model_collection_local_latest(&mut pile, team)
-            .map_err(|e| anyhow::anyhow!("snapshot model collection: {e}"))?;
+    let snapshot = crate::model_collection::snapshot_model_collection_local_latest(&mut pile, team)
+        .map_err(|e| anyhow::anyhow!("snapshot model collection: {e}"))?;
 
     // A pile is append-only, so a duplicate tokenizer cannot be taken back.
     // Close before bailing — an early return here would drop the pile unclosed.
@@ -1789,9 +1779,8 @@ pub fn ingest_hf_tokenizer(
     let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
     let team = crate::model_collection::model_graph_team_or_own(&mut pile, &signing_key)
         .map_err(|e| anyhow::anyhow!("select model collection: {e}"))?;
-    let snapshot =
-        crate::model_collection::snapshot_model_collection_local_latest(&mut pile, team)
-            .map_err(|e| anyhow::anyhow!("snapshot model collection: {e}"))?;
+    let snapshot = crate::model_collection::snapshot_model_collection_local_latest(&mut pile, team)
+        .map_err(|e| anyhow::anyhow!("snapshot model collection: {e}"))?;
     let existing = crate::tokenizer::find_tokenizer(snapshot.facts());
     if let Some(existing) = existing {
         // Close before bailing: an early return would drop the pile unclosed.
@@ -1888,9 +1877,8 @@ pub fn ingest_json_documents(
     let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
     let team = crate::model_collection::model_graph_team_or_own(&mut pile, &signing_key)
         .map_err(|e| anyhow::anyhow!("select model collection: {e}"))?;
-    let snapshot =
-        crate::model_collection::snapshot_model_collection_local_latest(&mut pile, team)
-            .map_err(|e| anyhow::anyhow!("snapshot model collection: {e}"))?;
+    let snapshot = crate::model_collection::snapshot_model_collection_local_latest(&mut pile, team)
+        .map_err(|e| anyhow::anyhow!("snapshot model collection: {e}"))?;
 
     // What the collection already says, compared by VALUE rather than by node id.
     // Re-ingesting the identical file is silent (the ids derive from the
@@ -1899,8 +1887,7 @@ pub fn ingest_json_documents(
     // a reader gets depend on iteration order.
     let mut clash: Option<String> = None;
     for (name, v) in &pending {
-        if let Ok(have) =
-            crate::jsonfacts::load_document(snapshot.facts(), snapshot.reader(), name)
+        if let Ok(have) = crate::jsonfacts::load_document(snapshot.facts(), snapshot.reader(), name)
         {
             if &have != v {
                 clash = Some(name.clone());
@@ -2009,8 +1996,7 @@ mod tokenizer_collection_tests {
         std::fs::File::create(&pile_path).unwrap();
         std::fs::write(&config_path, r#"{"layers": 4}"#).unwrap();
 
-        let written =
-            ingest_json_documents(&pile_path, &fixture.0, &["config.json"], &[]).unwrap();
+        let written = ingest_json_documents(&pile_path, &fixture.0, &["config.json"], &[]).unwrap();
         assert!(written > 0);
         let (facts, reader) = pile_facts(&pile_path).unwrap();
         assert_eq!(

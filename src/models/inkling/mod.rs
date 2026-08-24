@@ -18,9 +18,9 @@
 // `inkling-cuda` for the device one — and the gating was already a fiction:
 // `fp4gemm` below sat outside all of it and needs cubecl, so the header-only
 // build had not compiled in some time. One feature, one lane, no cfg.
-pub mod burn;
 pub mod attn;
 pub mod block;
+pub mod burn;
 pub mod config;
 // The NVFP4 ACTIVATION quantiser, on the device. The routed-expert lane calls
 // it twice per expert; there is no host twin in the data plane to select

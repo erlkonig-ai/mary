@@ -57,7 +57,9 @@ fn read_i64(dir: &Path, name: &str) -> Result<Vec<i64>> {
 
 fn manifest_num(text: &str, key: &str) -> Result<f64> {
     let pat = format!("\"{key}\"");
-    let at = text.find(&pat).with_context(|| format!("manifest has no {key}"))?;
+    let at = text
+        .find(&pat)
+        .with_context(|| format!("manifest has no {key}"))?;
     let rest = &text[at + pat.len()..];
     let colon = rest.find(':').context("malformed manifest")?;
     let s: String = rest[colon + 1..]
@@ -65,7 +67,8 @@ fn manifest_num(text: &str, key: &str) -> Result<f64> {
         .skip_while(|c| c.is_whitespace())
         .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == 'e')
         .collect();
-    s.parse().with_context(|| format!("{key} is not a number: {s:?}"))
+    s.parse()
+        .with_context(|| format!("{key} is not a number: {s:?}"))
 }
 
 /// How two tensors differ.
@@ -94,8 +97,13 @@ impl Diff {
 
 fn compare(mine: &[f32], theirs: &[f32]) -> Diff {
     let mut d = Diff {
-        worst_rel: 0.0, worst_abs: 0.0, ref_scale: 0.0,
-        n: mine.len().min(theirs.len()), at: 0, mine_at: 0.0, ref_at: 0.0,
+        worst_rel: 0.0,
+        worst_abs: 0.0,
+        ref_scale: 0.0,
+        n: mine.len().min(theirs.len()),
+        at: 0,
+        mine_at: 0.0,
+        ref_at: 0.0,
     };
     for (i, (&a, &b)) in mine.iter().zip(theirs).enumerate() {
         let abs = (a - b).abs();
@@ -134,7 +142,9 @@ fn main() -> Result<()> {
     println!("=== oracle ===");
     println!("  dir     : {}", dir.display());
     println!("  hidden {h}  kernel {k}  tokens {t}  eps {eps:e}");
-    println!("  experts {n_routed} routed + {n_shared} shared, top_k {top_k}, route_scale {route_scale}");
+    println!(
+        "  experts {n_routed} routed + {n_shared} shared, top_k {top_k}, route_scale {route_scale}"
+    );
 
     let mut fails = 0usize;
     let mut checks = 0usize;
@@ -144,7 +154,10 @@ fn main() -> Result<()> {
     let x = read_f32(&dir, "blk_rms_x.bin")?;
     let w = read_f32(&dir, "blk_rms_w.bin")?;
     let y = read_f32(&dir, "blk_rms_y.bin")?;
-    anyhow::ensure!(!y.is_empty(), "no RMSNorm reference values — gate would be vacuous");
+    anyhow::ensure!(
+        !y.is_empty(),
+        "no RMSNorm reference values — gate would be vacuous"
+    );
     let mine = rms_norm(&x, &w, eps, t, h);
     let (worst, n) = worst_rel(&mine, &y);
     checks += n;
@@ -165,10 +178,15 @@ fn main() -> Result<()> {
     let d = compare(&mine, &ys);
     checks += d.n;
     println!("  values compared : {}", d.n);
-    println!("  worst absolute  : {:e}   (tensor scale {:e})", d.worst_abs, d.ref_scale);
+    println!(
+        "  worst absolute  : {:e}   (tensor scale {:e})",
+        d.worst_abs, d.ref_scale
+    );
     println!("  worst abs / scale : {:e}  <- the criterion", d.scaled());
-    println!("  worst RELATIVE  : {:e} at [{}], mine {:e} vs ref {:e}",
-             d.worst_rel, d.at, d.mine_at, d.ref_at);
+    println!(
+        "  worst RELATIVE  : {:e} at [{}], mine {:e} vs ref {:e}",
+        d.worst_rel, d.at, d.mine_at, d.ref_at
+    );
     println!("    (a near-zero reference makes relative error meaningless there;\n     x + conv(x) cancels, so this is reported, not gated on)");
     if d.scaled() > BUDGET_SCONV {
         println!("  FAIL  over budget");
@@ -205,10 +223,23 @@ fn main() -> Result<()> {
     let ref_g = read_f32(&dir, "blk_router_gammas.bin")?;
 
     let routing = route(
-        &xr, &wr, &br, gs[0], route_scale, t, h, n_routed, n_shared, top_k,
+        &xr,
+        &wr,
+        &br,
+        gs[0],
+        route_scale,
+        t,
+        h,
+        n_routed,
+        n_shared,
+        top_k,
     );
     println!("  tokens routed   : {}", routing.len());
-    anyhow::ensure!(routing.len() == t, "routed {} tokens, expected {t}", routing.len());
+    anyhow::ensure!(
+        routing.len() == t,
+        "routed {} tokens, expected {t}",
+        routing.len()
+    );
 
     let mut set_bad = 0usize;
     let mut worst_w = 0f32;
@@ -272,7 +303,9 @@ fn main() -> Result<()> {
         let s: f32 = r.weights.iter().chain(&r.shared_gammas).sum();
         worst_sum = worst_sum.max((s - route_scale).abs());
     }
-    println!("  worst |sum - route_scale| : {worst_sum:e}  (shared experts share the normalization)");
+    println!(
+        "  worst |sum - route_scale| : {worst_sum:e}  (shared experts share the normalization)"
+    );
     if worst_sum > 1e-4 {
         println!("  FAIL  weights do not sum to route_scale");
         fails += 1;
@@ -283,7 +316,16 @@ fn main() -> Result<()> {
     println!("\n=== 4. is the score-correction bias under test? ===");
     let zero = vec![0f32; br.len()];
     let unbiased = route(
-        &xr, &wr, &zero, gs[0], route_scale, t, h, n_routed, n_shared, top_k,
+        &xr,
+        &wr,
+        &zero,
+        gs[0],
+        route_scale,
+        t,
+        h,
+        n_routed,
+        n_shared,
+        top_k,
     );
     let differing = routing
         .iter()

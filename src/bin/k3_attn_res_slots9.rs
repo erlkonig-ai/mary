@@ -96,7 +96,10 @@ fn bits_equal(a: &[f32], b: &[f32]) -> bool {
 }
 
 fn differing_bf16(got: &[f32], want: &[f32]) -> usize {
-    got.iter().zip(want).filter(|(g, w)| bf16_bits(**g) != bf16_bits(**w)).count()
+    got.iter()
+        .zip(want)
+        .filter(|(g, w)| bf16_bits(**g) != bf16_bits(**w))
+        .count()
 }
 
 /// float64 transcription of the same formula — attribution, not a second opinion.
@@ -180,19 +183,31 @@ impl G {
 }
 
 fn bfarr(z: &Npz, key: &str) -> Vec<f32> {
-    let v: Vec<f32> = z.get(key).bf16_to_f64().into_iter().map(|x| x as f32).collect();
+    let v: Vec<f32> = z
+        .get(key)
+        .bf16_to_f64()
+        .into_iter()
+        .map(|x| x as f32)
+        .collect();
     assert!(!v.is_empty(), "{key}: EMPTY");
     v
 }
 
 fn run_lane<B: Backend>(lane: &str, dev: &Device<B>, z: &Npz, cfg: &K3Config) -> bool {
     println!("\n=== lane: {lane} ===");
-    let mut g = G { fails: Vec::new(), passed: 0 };
+    let mut g = G {
+        fails: Vec::new(),
+        passed: 0,
+    };
     let eps = cfg.text_config.rms_norm_eps;
 
     for tag in ["L84_mlp", "L92_sa", "MODEL_output"] {
         let slots = z.get(&format!("{tag}_nslots")).scalar() as usize;
-        g.truth(&format!("{tag}.slots"), slots == SLOTS, format!("{slots} slots"));
+        g.truth(
+            &format!("{tag}.slots"),
+            slots == SLOTS,
+            format!("{slots} slots"),
+        );
 
         let v_ref = bfarr(z, &format!("{tag}_v_bf16bits"));
         let bank_flat = bfarr(z, &format!("{tag}_block_residual_bf16bits"));
@@ -240,15 +255,38 @@ fn run_lane<B: Backend>(lane: &str, dev: &Device<B>, z: &Npz, cfg: &K3Config) ->
 
         let (f64_scores, f64_probs, f64_out) = mix_f64(&v_ref, &sw, eps, SLOTS);
 
-        g.le(&format!("{tag}.scores"), max_rel_diff("sc", &scores, &ref_scores), SCORE_RTOL, "rel");
-        g.le(&format!("{tag}.probs"), max_abs_diff("pr", &probs, &ref_probs), PROB_ATOL, "abs");
+        g.le(
+            &format!("{tag}.scores"),
+            max_rel_diff("sc", &scores, &ref_scores),
+            SCORE_RTOL,
+            "rel",
+        );
+        g.le(
+            &format!("{tag}.probs"),
+            max_abs_diff("pr", &probs, &ref_probs),
+            PROB_ATOL,
+            "abs",
+        );
         let mut sum_err = 0.0f64;
         for t in 0..TOKENS {
-            let s: f64 = probs[t * SLOTS..(t + 1) * SLOTS].iter().map(|x| *x as f64).sum();
+            let s: f64 = probs[t * SLOTS..(t + 1) * SLOTS]
+                .iter()
+                .map(|x| *x as f64)
+                .sum();
             sum_err = worse(sum_err, (s - 1.0).abs());
         }
-        g.le(&format!("{tag}.probs_sum_to_one"), sum_err, PROB_ATOL, "abs");
-        g.le(&format!("{tag}.out"), max_rel_diff("out", &out, &ref_out), OUT_REL, "rel-to-max");
+        g.le(
+            &format!("{tag}.probs_sum_to_one"),
+            sum_err,
+            PROB_ATOL,
+            "abs",
+        );
+        g.le(
+            &format!("{tag}.out"),
+            max_rel_diff("out", &out, &ref_out),
+            OUT_REL,
+            "rel-to-max",
+        );
 
         // Attribution: the port vs a float64 transcription, next to torch's own f32.
         let e_port = max_rel_diff("sc/f64", &scores, &f64_scores);
@@ -288,7 +326,9 @@ fn run_lane<B: Backend>(lane: &str, dev: &Device<B>, z: &Npz, cfg: &K3Config) ->
     // synthetic but bf16-exact activations, deterministic
     let mut seed = 0x51ED_270B_7A2Fu64;
     let mut next = || {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u = ((seed >> 40) as f32) / (1u32 << 24) as f32 - 0.5;
         bf16_to_f32(bf16_bits(u * 4.0))
     };
@@ -342,17 +382,38 @@ fn run_lane<B: Backend>(lane: &str, dev: &Device<B>, z: &Npz, cfg: &K3Config) ->
         }
     }
     let fin = mixer.finish(hidden.clone(), &params);
-    g.truth("drive.crossings", crossings == vec![0, 12, 24, 36, 48, 60, 72, 84], format!("{crossings:?}"));
+    g.truth(
+        "drive.crossings",
+        crossings == vec![0, 12, 24, 36, 48, 60, 72, 84],
+        format!("{crossings:?}"),
+    );
     g.truth("drive.max_bank", max_bank == 8, format!("{max_bank}"));
-    g.truth("drive.max_slots", max_slots == 9, format!("{max_slots} (production width)"));
-    g.truth("drive.longest_run", longest_run == 12, format!("{longest_run}"));
-    g.truth("drive.output_slots", fin.probs.dims() == [TOKENS, 9], format!("{:?}", fin.probs.dims()));
+    g.truth(
+        "drive.max_slots",
+        max_slots == 9,
+        format!("{max_slots} (production width)"),
+    );
+    g.truth(
+        "drive.longest_run",
+        longest_run == 12,
+        format!("{longest_run}"),
+    );
+    g.truth(
+        "drive.output_slots",
+        fin.probs.dims() == [TOKENS, 9],
+        format!("{:?}", fin.probs.dims()),
+    );
     let fo = host(fin.out);
-    g.truth("drive.finite", finite && fo.iter().all(|x| x.is_finite()), "no NaN/inf across 93 layers");
+    g.truth(
+        "drive.finite",
+        finite && fo.iter().all(|x| x.is_finite()),
+        "no NaN/inf across 93 layers",
+    );
     let ho = host(hidden);
     g.truth(
         "drive.bf16_exact",
-        ho.iter().all(|x| bf16_to_f32(bf16_bits(*x)).to_bits() == x.to_bits()),
+        ho.iter()
+            .all(|x| bf16_to_f32(bf16_bits(*x)).to_bits() == x.to_bits()),
         "layer-92 output is exactly bfloat16",
     );
     let pv = host(fin.probs.clone());
@@ -366,12 +427,17 @@ fn run_lane<B: Backend>(lane: &str, dev: &Device<B>, z: &Npz, cfg: &K3Config) ->
     // the mixture output is rounded to bf16 even at 9 slots
     g.truth(
         "drive.output_rounded",
-        fo.iter().all(|x| bf16_to_f32(bf16_bits(*x)).to_bits() == x.to_bits()),
+        fo.iter()
+            .all(|x| bf16_to_f32(bf16_bits(*x)).to_bits() == x.to_bits()),
         "9-slot mixture output is exactly bfloat16",
     );
     let _ = round_bf16(t1::<B>(&[1.0f32], dev));
 
-    println!("  lane {lane}: {} passed, {} failed", g.passed, g.fails.len());
+    println!(
+        "  lane {lane}: {} passed, {} failed",
+        g.passed,
+        g.fails.len()
+    );
     for f in &g.fails {
         println!("    - {f}");
     }
@@ -397,7 +463,11 @@ fn section_sm93<B: Backend>(g: &mut G, cfg: &K3Config, dev: &Device<B>) {
     let z = Npz::open(&path).expect("opening sm93 oracle");
     let nl = z.get("meta_layers").scalar() as usize;
     let eps = cfg.text_config.rms_norm_eps;
-    g.truth("sm93.layers", nl == cfg.text_config.num_hidden_layers, format!("{nl}"));
+    g.truth(
+        "sm93.layers",
+        nl == cfg.text_config.num_hidden_layers,
+        format!("{nl}"),
+    );
 
     let mut mixer = DepthMixer::<B>::from_config(&cfg.text_config).expect("schedule");
     let mut hidden = t2::<B>(&bfarr(&z, "L00_layer_in_bf16bits"), TOKENS, HIDDEN, dev);
@@ -445,7 +515,11 @@ fn section_sm93<B: Backend>(g: &mut G, cfg: &K3Config, dev: &Device<B>) {
         }
         if mixer.bank_len() != nb_out {
             bank_exact = false;
-            g.truth(&format!("sm93.{lp}.bank_len"), false, format!("port {} shipped {nb_out}", mixer.bank_len()));
+            g.truth(
+                &format!("sm93.{lp}.bank_len"),
+                false,
+                format!("port {} shipped {nb_out}", mixer.bank_len()),
+            );
         } else {
             let flat = bfarr(&z, &format!("{lp}_blockres_out_bf16bits"));
             assert_eq!(flat.len(), TOKENS * nb_out * HIDDEN, "{lp}: bank size");
@@ -463,7 +537,12 @@ fn section_sm93<B: Backend>(g: &mut G, cfg: &K3Config, dev: &Device<B>) {
         }
 
         let m = mixer.after_attention(
-            t2::<B>(&bfarr(&z, &format!("{lp}_attn_out_bf16bits")), TOKENS, HIDDEN, dev),
+            t2::<B>(
+                &bfarr(&z, &format!("{lp}_attn_out_bf16bits")),
+                TOKENS,
+                HIDDEN,
+                dev,
+            ),
             &mlp,
         );
         max_slots = max_slots.max(m.probs.dims()[1]);
@@ -472,28 +551,51 @@ fn section_sm93<B: Backend>(g: &mut G, cfg: &K3Config, dev: &Device<B>) {
         worst_mlp = worse(worst_mlp, max_rel_diff("mlp", &got_mlp, &want_mlp));
         mlp_bitdiffs += differing_bf16(&got_mlp, &want_mlp);
 
-        hidden = mixer
-            .after_mlp(t2::<B>(&bfarr(&z, &format!("{lp}_mlp_out_bf16bits")), TOKENS, HIDDEN, dev));
+        hidden = mixer.after_mlp(t2::<B>(
+            &bfarr(&z, &format!("{lp}_mlp_out_bf16bits")),
+            TOKENS,
+            HIDDEN,
+            dev,
+        ));
         let want_out = bfarr(&z, &format!("{lp}_layer_out_bf16bits"));
         if !bits_equal(&host(hidden.clone()), &want_out) {
             layer_out_exact = false;
             g.truth(
                 &format!("sm93.{lp}.layer_out"),
                 false,
-                format!("max |d| {:e}", max_abs_diff("out", &host(hidden.clone()), &want_out)),
+                format!(
+                    "max |d| {:e}",
+                    max_abs_diff("out", &host(hidden.clone()), &want_out)
+                ),
             );
         }
     }
 
-    g.truth("sm93.mix_presence", mix_presence_ok, "mixture iff the shipped bank was non-empty");
+    g.truth(
+        "sm93.mix_presence",
+        mix_presence_ok,
+        "mixture iff the shipped bank was non-empty",
+    );
     g.truth(
         "sm93.crossings",
         crossings == vec![0, 12, 24, 36, 48, 60, 72, 84],
         format!("{crossings:?} — measured against the SHIPPED forward, all 8"),
     );
-    g.truth("sm93.max_slots", max_slots == 9, format!("{max_slots} (production mixture width)"));
-    g.truth("sm93.bank_bitexact_all_93_layers", bank_exact, "every snapshot, every layer");
-    g.truth("sm93.layer_out_bitexact_all_93_layers", layer_out_exact, "93 layers chained on the depth axis");
+    g.truth(
+        "sm93.max_slots",
+        max_slots == 9,
+        format!("{max_slots} (production mixture width)"),
+    );
+    g.truth(
+        "sm93.bank_bitexact_all_93_layers",
+        bank_exact,
+        "every snapshot, every layer",
+    );
+    g.truth(
+        "sm93.layer_out_bitexact_all_93_layers",
+        layer_out_exact,
+        "93 layers chained on the depth axis",
+    );
     g.le("sm93.entry_mix", worst_entry, OUT_REL, "rel-to-max");
     g.le("sm93.mlp_mix", worst_mlp, OUT_REL, "rel-to-max");
     println!(
@@ -510,15 +612,27 @@ fn section_sm93<B: Backend>(g: &mut G, cfg: &K3Config, dev: &Device<B>) {
     );
     g.truth(
         "sm93.final_hidden_matches",
-        bits_equal(&host(hidden.clone()), &bfarr(&z, "MODEL_output_prefix_sum_bf16bits")),
+        bits_equal(
+            &host(hidden.clone()),
+            &bfarr(&z, "MODEL_output_prefix_sum_bf16bits"),
+        ),
         "the port's layer-92 output is what the shipped output mixture accumulates",
     );
     let fin = mixer.finish(hidden, &out_p);
     let nslots = z.get("MODEL_output_nslots").scalar() as usize;
-    g.truth("sm93.output_slots", fin.probs.dims() == [TOKENS, nslots] && nslots == 9, format!("{nslots}"));
+    g.truth(
+        "sm93.output_slots",
+        fin.probs.dims() == [TOKENS, nslots] && nslots == 9,
+        format!("{nslots}"),
+    );
     let want_fin = bfarr(&z, "MODEL_output_out_bf16bits");
     let got_fin = host(fin.out);
-    g.le("sm93.output_attn_res", max_rel_diff("fin", &got_fin, &want_fin), OUT_REL, "rel-to-max");
+    g.le(
+        "sm93.output_attn_res",
+        max_rel_diff("fin", &got_fin, &want_fin),
+        OUT_REL,
+        "rel-to-max",
+    );
     println!(
         "         model-level 9-slot mixture: {} of {} bf16 elements differ",
         differing_bf16(&got_fin, &want_fin),
@@ -541,19 +655,29 @@ fn main() -> Result<()> {
     let mut lanes = Vec::new();
     {
         type Cpu = burn::backend::NdArray;
-        lanes.push(("ndarray-cpu", run_lane::<Cpu>("ndarray-cpu", &Device::<Cpu>::default(), &z, &cfg)));
+        lanes.push((
+            "ndarray-cpu",
+            run_lane::<Cpu>("ndarray-cpu", &Device::<Cpu>::default(), &z, &cfg),
+        ));
     }
     #[cfg(feature = "k3-attn-res-cuda")]
     {
         type Gpu = burn::backend::Cuda;
-        lanes.push(("cuda", run_lane::<Gpu>("cuda", &Device::<Gpu>::default(), &z, &cfg)));
+        lanes.push((
+            "cuda",
+            run_lane::<Gpu>("cuda", &Device::<Gpu>::default(), &z, &cfg),
+        ));
     }
     println!("\n=== summary ===");
     for (n, r) in &lanes {
         println!("  {n:<14} {}", if *r { "PASS" } else { "FAIL" });
     }
     let pass = !lanes.is_empty() && lanes.iter().all(|(_, r)| *r);
-    println!("\nSLOTS9: {}  ({} lane(s))", if pass { "PASS" } else { "FAIL" }, lanes.len());
+    println!(
+        "\nSLOTS9: {}  ({} lane(s))",
+        if pass { "PASS" } else { "FAIL" },
+        lanes.len()
+    );
     if !pass {
         std::process::exit(1);
     }

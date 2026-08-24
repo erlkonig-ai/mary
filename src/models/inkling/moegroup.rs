@@ -383,8 +383,8 @@ pub fn fp4_linear_grouped<AB: Scalar, S: Scalar, O: Scalar + Cast, NA: Size, NC:
 
         #[unroll]
         for j in 0..nrep {
-            let vb = b_sc
-                [(bsc_base + (sib + n_base + j * NTILE) * spr + t * 4) / b_sc.vector_size()];
+            let vb =
+                b_sc[(bsc_base + (sib + n_base + j * NTILE) * spr + t * 4) / b_sc.vector_size()];
             let mut sb = Vector::<S, NS>::empty();
             #[unroll]
             for i in 0..SCALE_VEC {
@@ -486,7 +486,11 @@ fn fp4_linear_grouped_launch_as<O: Scalar + Cast + CubeElement, R: Runtime>(
     k: usize,
     n: usize,
 ) -> Handle {
-    assert_eq!(m_total % MTILE, 0, "m_total {m_total} is not a multiple of {MTILE}");
+    assert_eq!(
+        m_total % MTILE,
+        0,
+        "m_total {m_total} is not a multiple of {MTILE}"
+    );
     assert_eq!(n % NTILE, 0, "n {n} is not a multiple of {NTILE}");
     assert_eq!(k % KTILE, 0, "k {k} is not a multiple of {KTILE}");
     assert_eq!(
@@ -683,7 +687,11 @@ pub fn bf16_linear_grouped_launch<R: Runtime>(
     k: usize,
     n: usize,
 ) -> Handle {
-    assert_eq!(m_total % MTILE, 0, "m_total {m_total} is not a multiple of {MTILE}");
+    assert_eq!(
+        m_total % MTILE,
+        0,
+        "m_total {m_total} is not a multiple of {MTILE}"
+    );
     assert_eq!(n % NTILE, 0, "n {n} is not a multiple of {NTILE}");
     assert_eq!(k % BF16_KTILE, 0, "k {k} is not a multiple of {BF16_KTILE}");
     // How many N tiles one plane keeps in registers; see [`grouped_nrep`].
@@ -899,9 +907,7 @@ pub fn scatter_weighted_bf16<R: Runtime>(
     h: usize,
     kmax: usize,
 ) -> Handle {
-    scatter_weighted_as::<half::bf16, R>(
-        client, y, wgt, tok_rows, tok_cnt, m_total, n, h, kmax,
-    )
+    scatter_weighted_as::<half::bf16, R>(client, y, wgt, tok_rows, tok_cnt, m_total, n, h, kmax)
 }
 
 /// [`scatter_weighted`] at a named input element type.
@@ -1049,7 +1055,16 @@ impl RowPlan {
             tok_rows[t * kmax..t * kmax + rows.len()].copy_from_slice(rows);
         }
 
-        RowPlan { row_tok, row_wgt, blk_slot, blk_tile0, blk_cnt, tok_rows, tok_cnt, kmax }
+        RowPlan {
+            row_tok,
+            row_wgt,
+            blk_slot,
+            blk_tile0,
+            blk_cnt,
+            tok_rows,
+            tok_cnt,
+            kmax,
+        }
     }
 
     /// How many planes a cube should have, from `INK_MOE_PLANES`.
@@ -1115,10 +1130,7 @@ mod tests {
         // and both lists are ASCENDING in row, i.e. in expert order.
         assert_eq!(plan.kmax, 2);
         assert_eq!(plan.tok_cnt, vec![2, 2]);
-        assert_eq!(
-            &plan.tok_rows[0..2],
-            &[MTILE as u32, 2 * MTILE as u32]
-        );
+        assert_eq!(&plan.tok_rows[0..2], &[MTILE as u32, 2 * MTILE as u32]);
         assert_eq!(&plan.tok_rows[2..4], &[0u32, MTILE as u32 + 1]);
 
         // Pad rows weigh nothing, and every real row carries its expert's weight.
@@ -1145,7 +1157,10 @@ mod tests {
         assert_eq!(plan.blk_tile0, vec![0, 4, 5, 6, 10, 14]);
         // Every tile of the layer is served exactly once.
         let served: usize = plan.blk_cnt.iter().map(|&c| c as usize).sum();
-        println!("examined {} blocks covering {served} tiles", plan.blk_slot.len());
+        println!(
+            "examined {} blocks covering {served} tiles",
+            plan.blk_slot.len()
+        );
         assert_eq!(served, plan.m_total() / MTILE);
         assert_eq!(served, 5 + 1 + 9);
     }

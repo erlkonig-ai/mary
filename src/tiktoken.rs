@@ -130,8 +130,7 @@ pub fn parse_tiktoken_model(bytes: &[u8]) -> Result<Vec<(Vec<u8>, Rank)>, Err> {
             .iter()
             .position(|&b| b == b' ')
             .ok_or_else(|| format!("line {}: no space separator", lineno + 1))?;
-        let tok = b64_decode(&line[..sp])
-            .map_err(|e| format!("line {}: {e}", lineno + 1))?;
+        let tok = b64_decode(&line[..sp]).map_err(|e| format!("line {}: {e}", lineno + 1))?;
         let rank: Rank = std::str::from_utf8(&line[sp + 1..])?
             .trim()
             .parse()
@@ -174,14 +173,15 @@ impl Tiktoken {
                 return Err(format!("rank table has no single-byte token for {b:#04x}").into());
             }
         }
-        let decoder: HashMap<Rank, Vec<u8>> =
-            ranks.iter().map(|(k, &v)| (v, k.clone())).collect();
+        let decoder: HashMap<Rank, Vec<u8>> = ranks.iter().map(|(k, &v)| (v, k.clone())).collect();
         if decoder.len() != ranks.len() {
             return Err("rank table has duplicate ranks".into());
         }
         let special_encoder: HashMap<String, Rank> = specials.into_iter().collect();
-        let special_decoder: HashMap<Rank, String> =
-            special_encoder.iter().map(|(k, &v)| (v, k.clone())).collect();
+        let special_decoder: HashMap<Rank, String> = special_encoder
+            .iter()
+            .map(|(k, &v)| (v, k.clone()))
+            .collect();
 
         // Longest-first so that, at a given start position, the longest special
         // token wins even under fancy-regex's leftmost-*first* alternation.
@@ -190,7 +190,11 @@ impl Tiktoken {
         let special_pat = if names.is_empty() {
             None
         } else {
-            let alt = names.iter().map(|s| regex_escape(s)).collect::<Vec<_>>().join("|");
+            let alt = names
+                .iter()
+                .map(|s| regex_escape(s))
+                .collect::<Vec<_>>()
+                .join("|");
             Some(Regex::new(&alt)?)
         };
 
@@ -324,9 +328,8 @@ fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<Rank> {
     if piece.len() == 1 {
         return vec![ranks[piece]];
     }
-    let rank_of = |lo: usize, hi: usize| -> Rank {
-        ranks.get(&piece[lo..hi]).copied().unwrap_or(NO_MERGE)
-    };
+    let rank_of =
+        |lo: usize, hi: usize| -> Rank { ranks.get(&piece[lo..hi]).copied().unwrap_or(NO_MERGE) };
 
     let mut parts: Vec<(usize, Rank)> = Vec::with_capacity(piece.len() + 1);
     let mut min_rank: (Rank, usize) = (NO_MERGE, usize::MAX);
@@ -379,7 +382,10 @@ fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<Rank> {
 fn regex_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
     for c in s.chars() {
-        if matches!(c, '\\' | '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|') {
+        if matches!(
+            c,
+            '\\' | '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+        ) {
             out.push('\\');
         }
         out.push(c);
@@ -471,8 +477,9 @@ pub mod mutants {
         if piece.len() == 1 {
             return vec![ranks[piece]];
         }
-        let rank_of =
-            |lo: usize, hi: usize| -> Rank { ranks.get(&piece[lo..hi]).copied().unwrap_or(NO_MERGE) };
+        let rank_of = |lo: usize, hi: usize| -> Rank {
+            ranks.get(&piece[lo..hi]).copied().unwrap_or(NO_MERGE)
+        };
         let mut parts: Vec<(usize, Rank)> = Vec::with_capacity(piece.len() + 1);
         for i in 0..piece.len() - 1 {
             parts.push((i, rank_of(i, i + 2)));
@@ -556,7 +563,13 @@ mod tests {
     fn split_long_runs() {
         assert_eq!(split_whitespaces_or_nonwhitespaces("", 3), vec![""]);
         assert_eq!(split_whitespaces_or_nonwhitespaces("abc", 3), vec!["abc"]);
-        assert_eq!(split_whitespaces_or_nonwhitespaces("abcd", 3), vec!["abc", "d"]);
-        assert_eq!(split_whitespaces_or_nonwhitespaces("ab  cd", 3), vec!["ab  cd"]);
+        assert_eq!(
+            split_whitespaces_or_nonwhitespaces("abcd", 3),
+            vec!["abc", "d"]
+        );
+        assert_eq!(
+            split_whitespaces_or_nonwhitespaces("ab  cd", 3),
+            vec!["ab  cd"]
+        );
     }
 }

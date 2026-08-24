@@ -230,7 +230,11 @@ impl Gate {
         Self::guard(name, port, gold);
         let ref_absmax = absmax(gold);
         let max_abs = max_abs_diff(port, gold);
-        let rel = if ref_absmax > 0.0 { max_abs / ref_absmax } else { max_abs };
+        let rel = if ref_absmax > 0.0 {
+            max_abs / ref_absmax
+        } else {
+            max_abs
+        };
         // `!(rel <= tol)` and not `rel > tol`: NaN fails the former, passes the
         // latter.
         let ok = !(rel > tol) && !rel.is_nan();
@@ -356,7 +360,11 @@ impl Gate {
             }
         }
         assert!(n_open > 0, "{}: every element was masked out or NaN", name);
-        let rel = if ref_absmax > 0.0 { max_abs / ref_absmax } else { max_abs };
+        let rel = if ref_absmax > 0.0 {
+            max_abs / ref_absmax
+        } else {
+            max_abs
+        };
         let frac = same as f64 / n_open as f64;
         let ulp = 2f64.powi(-7);
         let e_port = max_abs_diff(port, reference);
@@ -386,7 +394,11 @@ impl Gate {
             lane: lane.into(),
             name: name.into(),
             oracle: oracle.into(),
-            kind: if reference_may_split_k { "split-k" } else { "bits" },
+            kind: if reference_may_split_k {
+                "split-k"
+            } else {
+                "bits"
+            },
             n: port.len(),
             n_masked,
             max_abs,
@@ -536,7 +548,11 @@ impl Gate {
             n_masked,
             port.len()
         );
-        let rel = if ref_absmax > 0.0 { max_abs / ref_absmax } else { max_abs };
+        let rel = if ref_absmax > 0.0 {
+            max_abs / ref_absmax
+        } else {
+            max_abs
+        };
         let ok = !(rel > tol) && !rel.is_nan() && !max_abs.is_nan() && mask_mismatch == 0;
         self.checks.push(Check {
             lane: lane.into(),
@@ -552,7 +568,10 @@ impl Gate {
             bitexact: None,
             min_bitexact: None,
             ok,
-            detail: format!("{} masked positions, {} of them mismatched", n_masked, mask_mismatch),
+            detail: format!(
+                "{} masked positions, {} of them mismatched",
+                n_masked, mask_mismatch
+            ),
         });
     }
 
@@ -598,7 +617,11 @@ impl Gate {
         Self::guard(name, a, b);
         let ref_absmax = absmax(b);
         let max_abs = max_abs_diff(a, b);
-        let rel = if ref_absmax > 0.0 { max_abs / ref_absmax } else { max_abs };
+        let rel = if ref_absmax > 0.0 {
+            max_abs / ref_absmax
+        } else {
+            max_abs
+        };
         // `!(rel < min_rel)` is false for NaN too, so a NaN control fails.
         let ok = rel >= min_rel;
         self.checks.push(Check {
@@ -661,7 +684,10 @@ impl Ckpt {
             .iter()
             .map(|(k, s)| (k.clone(), s.as_str().expect("shard name").to_string()))
             .collect();
-        Self { dir: dir.to_path_buf(), map }
+        Self {
+            dir: dir.to_path_buf(),
+            map,
+        }
     }
 
     /// Read one BF16 tensor, widened to f64 exactly. Refuses any other dtype
@@ -692,7 +718,12 @@ impl Ckpt {
             .chunks_exact(2)
             .map(|b| bf16::from_le_bytes([b[0], b[1]]).to_f64())
             .collect();
-        assert_eq!(v.len(), shape.iter().product::<usize>(), "{}: shape/data mismatch", name);
+        assert_eq!(
+            v.len(),
+            shape.iter().product::<usize>(),
+            "{}: shape/data mismatch",
+            name
+        );
         (v, shape)
     }
 }
@@ -721,7 +752,10 @@ fn load_weights<B: Backend>(
         ("q_a_proj", [qlora, cfg.hidden_size]),
         ("q_a_layernorm", [qlora, 0]),
         ("q_b_proj", [h * cfg.q_head_dim(), qlora]),
-        ("kv_a_proj_with_mqa", [cfg.kv_lora_rank + cfg.qk_carried_head_dim, cfg.hidden_size]),
+        (
+            "kv_a_proj_with_mqa",
+            [cfg.kv_lora_rank + cfg.qk_carried_head_dim, cfg.hidden_size],
+        ),
         ("kv_a_layernorm", [cfg.kv_lora_rank, 0]),
         ("kv_b_proj", [h * cfg.kv_b_head_dim(), cfg.kv_lora_rank]),
         ("o_proj", [cfg.hidden_size, h * cfg.v_head_dim]),
@@ -731,12 +765,22 @@ fn load_weights<B: Backend>(
     let mut shape_ok = true;
     let mut detail = String::new();
     for (part, exp) in &want {
-        let name = format!("language_model.model.layers.{}.self_attn.{}.weight", layer, part);
+        let name = format!(
+            "language_model.model.layers.{}.self_attn.{}.weight",
+            layer, part
+        );
         let (v, shape) = ck.tensor_bf16(&name);
-        let expected: Vec<usize> = if exp[1] == 0 { vec![exp[0]] } else { exp.to_vec() };
+        let expected: Vec<usize> = if exp[1] == 0 {
+            vec![exp[0]]
+        } else {
+            exp.to_vec()
+        };
         if shape != expected {
             shape_ok = false;
-            detail.push_str(&format!("{} on disk {:?} != config {:?}; ", part, shape, expected));
+            detail.push_str(&format!(
+                "{} on disk {:?} != config {:?}; ",
+                part, shape, expected
+            ));
         }
         got.insert(part, (v, shape));
     }
@@ -747,7 +791,11 @@ fn load_weights<B: Backend>(
             "safetensors headers vs config.json",
             shape_ok,
             want.len(),
-            if shape_ok { "all 8 shapes as predicted".into() } else { detail },
+            if shape_ok {
+                "all 8 shapes as predicted".into()
+            } else {
+                detail
+            },
         );
     }
     let take = |k: &str| got.get(k).unwrap().clone();
@@ -804,7 +852,11 @@ impl<'a> Lane<'a> {
     fn dims(&self, name: &str) -> Vec<usize> {
         let k = if self.bits {
             let kb = format!("{}{}_bf16bits", self.prefix, name);
-            if self.z.contains(&kb) { kb } else { format!("{}{}", self.prefix, name) }
+            if self.z.contains(&kb) {
+                kb
+            } else {
+                format!("{}{}", self.prefix, name)
+            }
         } else {
             format!("{}{}", self.prefix, name)
         };
@@ -813,7 +865,11 @@ impl<'a> Lane<'a> {
 }
 
 fn host<B: Backend, const D: usize>(t: &Tensor<B, D>) -> Vec<f64> {
-    t.clone().into_data().convert::<f64>().into_vec().expect("readback")
+    t.clone()
+        .into_data()
+        .convert::<f64>()
+        .into_vec()
+        .expect("readback")
 }
 
 // ---------------------------------------------------------------------------
@@ -846,21 +902,44 @@ fn run_subblock_lane<B: Backend>(
 
     let (in_key, hidden_v) = lane.get(&k("attn_q_a_proj_in"));
     let in_dims = lane.dims(&k("attn_q_a_proj_in"));
-    assert_eq!(in_dims.len(), 3, "layer input must be [B,T,H], got {:?}", in_dims);
+    assert_eq!(
+        in_dims.len(),
+        3,
+        "layer input must be [B,T,H], got {:?}",
+        in_dims
+    );
     let (b, t, dh) = (in_dims[0], in_dims[1], in_dims[2]);
-    assert!(b > 0 && t > 0 && dh > 0, "degenerate layer input {:?}", in_dims);
+    assert!(
+        b > 0 && t > 0 && dh > 0,
+        "degenerate layer input {:?}",
+        in_dims
+    );
 
     // Provenance of the input itself: the MLA block's input is the decoder
     // layer's `input_layernorm` output, and all three MLA projections see the
     // same tensor. Checked on the oracle so a lane that fed the port the wrong
     // array cannot pass by being self-consistent.
     let (ln_key, ln_v) = lane.get(&k("input_layernorm_out"));
-    g.cmp_exact(lane_name, "input_is_input_layernorm_out", &format!("{} vs {}", in_key, ln_key), &hidden_v, &ln_v);
+    g.cmp_exact(
+        lane_name,
+        "input_is_input_layernorm_out",
+        &format!("{} vs {}", in_key, ln_key),
+        &hidden_v,
+        &ln_v,
+    );
     let (gin_key, gin_v) = lane.get(&k("attn_g_proj_in"));
-    g.cmp_exact(lane_name, "g_proj_sees_the_same_hidden", &format!("{} vs {}", in_key, gin_key), &hidden_v, &gin_v);
+    g.cmp_exact(
+        lane_name,
+        "g_proj_sees_the_same_hidden",
+        &format!("{} vs {}", in_key, gin_key),
+        &hidden_v,
+        &gin_v,
+    );
 
-    let hidden: Tensor<B, 3> =
-        Tensor::from_data(TensorData::new(hidden_v, [b, t, dh]).convert::<B::FloatElem>(), dev);
+    let hidden: Tensor<B, 3> = Tensor::from_data(
+        TensorData::new(hidden_v, [b, t, dh]).convert::<B::FloatElem>(),
+        dev,
+    );
 
     // The mask this port builds, against the mask the oracle captured.
     let mask = MlaBlock::<B>::causal_mask(b, t, t, 0, dev);
@@ -904,34 +983,105 @@ fn run_subblock_lane<B: Backend>(
         }
     };
 
-    cmp(g, "q_a_proj_out", host(&tr.q_a_proj_out), "attn_q_a_proj_out");
-    cmp(g, "q_a_layernorm_out", host(&tr.q_a_layernorm_out), "attn_q_a_layernorm_out");
-    cmp(g, "q_b_proj_out", host(&tr.q_b_proj_out), "attn_q_b_proj_out");
-    cmp(g, "kv_a_proj_out", host(&tr.kv_a_proj_out), "attn_kv_a_proj_with_mqa_out");
-    cmp(g, "kv_a_layernorm_in", host(&tr.kv_a_layernorm_in), "attn_kv_a_layernorm_in");
-    cmp(g, "kv_a_layernorm_out", host(&tr.kv_a_layernorm_out), "attn_kv_a_layernorm_out");
-    cmp(g, "kv_b_proj_out", host(&tr.kv_b_proj_out), "attn_kv_b_proj_out");
-    cmp(g, "query_states", host(&tr.query_states), "mla_query_states");
+    cmp(
+        g,
+        "q_a_proj_out",
+        host(&tr.q_a_proj_out),
+        "attn_q_a_proj_out",
+    );
+    cmp(
+        g,
+        "q_a_layernorm_out",
+        host(&tr.q_a_layernorm_out),
+        "attn_q_a_layernorm_out",
+    );
+    cmp(
+        g,
+        "q_b_proj_out",
+        host(&tr.q_b_proj_out),
+        "attn_q_b_proj_out",
+    );
+    cmp(
+        g,
+        "kv_a_proj_out",
+        host(&tr.kv_a_proj_out),
+        "attn_kv_a_proj_with_mqa_out",
+    );
+    cmp(
+        g,
+        "kv_a_layernorm_in",
+        host(&tr.kv_a_layernorm_in),
+        "attn_kv_a_layernorm_in",
+    );
+    cmp(
+        g,
+        "kv_a_layernorm_out",
+        host(&tr.kv_a_layernorm_out),
+        "attn_kv_a_layernorm_out",
+    );
+    cmp(
+        g,
+        "kv_b_proj_out",
+        host(&tr.kv_b_proj_out),
+        "attn_kv_b_proj_out",
+    );
+    cmp(
+        g,
+        "query_states",
+        host(&tr.query_states),
+        "mla_query_states",
+    );
     cmp(g, "key_states", host(&tr.key_states), "mla_key_states");
-    cmp(g, "value_states", host(&tr.value_states), "mla_value_states");
+    cmp(
+        g,
+        "value_states",
+        host(&tr.value_states),
+        "mla_value_states",
+    );
     // `attn_probs_precast` is a float32 array in the bfloat16 lane too — it is
     // the fp32 island's output, before the cast back — so it is compared with a
     // float tolerance in every lane rather than a bfloat16 one.
     {
         let (key, gold) = lane.get(&k("mla_attn_probs_precast"));
         match tol {
-            Tol::Rel(t) => {
-                g.cmp(lane_name, "attn_probs_precast", &key, &host(&tr.probs_precast), &gold, t)
-            }
+            Tol::Rel(t) => g.cmp(
+                lane_name,
+                "attn_probs_precast",
+                &key,
+                &host(&tr.probs_precast),
+                &gold,
+                t,
+            ),
             Tol::RefRatio(r) => {
-                let rf = reference.expect("reference").get("attn_probs_precast").expect("reference");
-                g.cmp_ref(lane_name, "attn_probs_precast", &key, &host(&tr.probs_precast), &gold, rf, r)
+                let rf = reference
+                    .expect("reference")
+                    .get("attn_probs_precast")
+                    .expect("reference");
+                g.cmp_ref(
+                    lane_name,
+                    "attn_probs_precast",
+                    &key,
+                    &host(&tr.probs_precast),
+                    &gold,
+                    rf,
+                    r,
+                )
             }
         }
     }
     cmp(g, "attn_probs", host(&tr.probs), "mla_attn_probs");
-    cmp(g, "attn_out_heads", host(&tr.attn_out_heads), "mla_attn_out_heads");
-    cmp(g, "g_proj_out", host(tr.g_proj_out.as_ref().expect("output gate")), "attn_g_proj_out");
+    cmp(
+        g,
+        "attn_out_heads",
+        host(&tr.attn_out_heads),
+        "mla_attn_out_heads",
+    );
+    cmp(
+        g,
+        "g_proj_out",
+        host(tr.g_proj_out.as_ref().expect("output gate")),
+        "attn_g_proj_out",
+    );
     cmp(g, "o_proj_in", host(&tr.o_proj_in), "attn_o_proj_in");
     cmp(g, "block_out", host(&tr.out), "attn_o_proj_out");
 
@@ -939,12 +1089,25 @@ fn run_subblock_lane<B: Backend>(
     {
         let (key, gold) = lane.get(&k("mla_attn_scores_precast"));
         match tol {
-            Tol::Rel(t) => g.cmp_masked(lane_name, "attn_scores", &key, &host(&tr.scores), &gold, t),
+            Tol::Rel(t) => {
+                g.cmp_masked(lane_name, "attn_scores", &key, &host(&tr.scores), &gold, t)
+            }
             // Masked positions hold finfo(bf16).min in all three runs and so
             // contribute exactly zero to both distances; no special handling.
             Tol::RefRatio(r) => {
-                let rf = reference.expect("reference").get("attn_scores").expect("reference");
-                g.cmp_ref(lane_name, "attn_scores", &key, &host(&tr.scores), &gold, rf, r)
+                let rf = reference
+                    .expect("reference")
+                    .get("attn_scores")
+                    .expect("reference");
+                g.cmp_ref(
+                    lane_name,
+                    "attn_scores",
+                    &key,
+                    &host(&tr.scores),
+                    &gold,
+                    rf,
+                    r,
+                )
             }
         }
     }
@@ -953,14 +1116,21 @@ fn run_subblock_lane<B: Backend>(
     {
         let (key, gold) = lane.get(&k("mla_scaling"));
         let want = blk.cfg.scaling();
-        let ok = gold.len() == 1 && (gold[0] - want).abs() <= 1e-15 && (gold[0] - 128f64.powf(-0.5)).abs() > 1e-6;
+        let ok = gold.len() == 1
+            && (gold[0] - want).abs() <= 1e-15
+            && (gold[0] - 128f64.powf(-0.5)).abs() > 1e-6;
         g.fact(
             lane_name,
             "scaling_is_q_head_dim",
             &key,
             ok,
             1,
-            format!("oracle {:.17}, port {:.17} (192^-0.5); 128^-0.5 = {:.17}", gold[0], want, 128f64.powf(-0.5)),
+            format!(
+                "oracle {:.17}, port {:.17} (192^-0.5); 128^-0.5 = {:.17}",
+                gold[0],
+                want,
+                128f64.powf(-0.5)
+            ),
         );
     }
 
@@ -1005,9 +1175,27 @@ fn run_subblock_lane<B: Backend>(
                 }
             }
         }
-        g.cmp_exact(lane_name, "oracle_key_pass_is_kv_b_first_half", &format!("{} vs {}", kkey, kvb_key), &k_pass, &k_from_kvb);
-        g.cmp_exact(lane_name, "oracle_value_is_kv_b_second_half", &format!("{} vs {}", vkey, kvb_key), &vals, &v_from_kvb);
-        g.cmp_exact(lane_name, "oracle_key_carried_is_kv_a_tail_broadcast", &format!("{} vs {}", kkey, akey), &k_carried, &k_carried_src);
+        g.cmp_exact(
+            lane_name,
+            "oracle_key_pass_is_kv_b_first_half",
+            &format!("{} vs {}", kkey, kvb_key),
+            &k_pass,
+            &k_from_kvb,
+        );
+        g.cmp_exact(
+            lane_name,
+            "oracle_value_is_kv_b_second_half",
+            &format!("{} vs {}", vkey, kvb_key),
+            &vals,
+            &v_from_kvb,
+        );
+        g.cmp_exact(
+            lane_name,
+            "oracle_key_carried_is_kv_a_tail_broadcast",
+            &format!("{} vs {}", kkey, akey),
+            &k_carried,
+            &k_carried_src,
+        );
     }
 
     // The swapped-halves array is an INVARIANCE, not a negative control: with
@@ -1025,7 +1213,10 @@ fn run_subblock_lane<B: Backend>(
                 t.max(1e-3),
             ),
             Tol::RefRatio(r) => {
-                let rf = reference.expect("reference").get("attn_out_heads").expect("reference");
+                let rf = reference
+                    .expect("reference")
+                    .get("attn_out_heads")
+                    .expect("reference");
                 g.cmp_ref(
                     lane_name,
                     "swapped_halves_is_an_invariance",
@@ -1049,7 +1240,10 @@ fn oracle_t3<B: Backend>(lane: &Lane, name: &str, dev: &B::Device) -> (String, T
     assert_eq!(d.len(), 3, "{}: expected a [B,T,W] array, got {:?}", key, d);
     (
         key,
-        Tensor::from_data(TensorData::new(v, [d[0], d[1], d[2]]).convert::<B::FloatElem>(), dev),
+        Tensor::from_data(
+            TensorData::new(v, [d[0], d[1], d[2]]).convert::<B::FloatElem>(),
+            dev,
+        ),
     )
 }
 
@@ -1085,7 +1279,10 @@ fn reference_map<B: Backend>(tr: &MlaTrace<B>) -> HashMap<&'static str, Vec<f64>
     m.insert("attn_probs_precast", host(&tr.probs_precast));
     m.insert("attn_probs", host(&tr.probs));
     m.insert("attn_out_heads", host(&tr.attn_out_heads));
-    m.insert("g_proj_out", host(tr.g_proj_out.as_ref().expect("output gate")));
+    m.insert(
+        "g_proj_out",
+        host(tr.g_proj_out.as_ref().expect("output gate")),
+    );
     m.insert("o_proj_in", host(&tr.o_proj_in));
     m.insert("block_out", host(&tr.out));
     m
@@ -1135,12 +1332,48 @@ fn run_teacher_forced_lane(
             );
         }};
     }
-    op3!("q_a_proj", "attn_q_a_proj_in", "attn_q_a_proj_out", q_a_proj, false); // K=7168
-    op3!("q_a_layernorm", "attn_q_a_layernorm_in", "attn_q_a_layernorm_out", q_a_norm, false);
-    op3!("q_b_proj", "attn_q_b_proj_in", "attn_q_b_proj_out", q_b_proj, false); // K=1536
-    op3!("kv_a_proj", "attn_kv_a_proj_with_mqa_in", "attn_kv_a_proj_with_mqa_out", kv_a_proj, false); // K=7168
-    op3!("kv_a_layernorm", "attn_kv_a_layernorm_in", "attn_kv_a_layernorm_out", kv_a_norm, false);
-    op3!("kv_b_proj", "attn_kv_b_proj_in", "attn_kv_b_proj_out", kv_b_proj, false); // K=512
+    op3!(
+        "q_a_proj",
+        "attn_q_a_proj_in",
+        "attn_q_a_proj_out",
+        q_a_proj,
+        false
+    ); // K=7168
+    op3!(
+        "q_a_layernorm",
+        "attn_q_a_layernorm_in",
+        "attn_q_a_layernorm_out",
+        q_a_norm,
+        false
+    );
+    op3!(
+        "q_b_proj",
+        "attn_q_b_proj_in",
+        "attn_q_b_proj_out",
+        q_b_proj,
+        false
+    ); // K=1536
+    op3!(
+        "kv_a_proj",
+        "attn_kv_a_proj_with_mqa_in",
+        "attn_kv_a_proj_with_mqa_out",
+        kv_a_proj,
+        false
+    ); // K=7168
+    op3!(
+        "kv_a_layernorm",
+        "attn_kv_a_layernorm_in",
+        "attn_kv_a_layernorm_out",
+        kv_a_norm,
+        false
+    );
+    op3!(
+        "kv_b_proj",
+        "attn_kv_b_proj_in",
+        "attn_kv_b_proj_out",
+        kv_b_proj,
+        false
+    ); // K=512
     op3!("o_proj", "attn_o_proj_in", "attn_o_proj_out", o_proj, true); // K=12288 -- the one long reduction
     {
         let (_, x32) = oracle_t3::<F32B>(lane, &k("attn_g_proj_in"), dev32);
@@ -1163,7 +1396,13 @@ fn run_teacher_forced_lane(
         let (qb_key, qb) = oracle_t3::<F32B>(lane, &k("attn_q_b_proj_out"), dev32);
         let (q_states, _) = b32.assemble_query(qb);
         let (okey, gold) = lane.get(&k("mla_query_states"));
-        g.cmp_exact("tf", "assemble_query", &format!("{} -> {}", qb_key, okey), &host(&q_states), &gold);
+        g.cmp_exact(
+            "tf",
+            "assemble_query",
+            &format!("{} -> {}", qb_key, okey),
+            &host(&q_states),
+            &gold,
+        );
 
         let (kvb_key, kvb) = oracle_t3::<F32B>(lane, &k("attn_kv_b_proj_out"), dev32);
         let (kva_key, kva) = oracle_t3::<F32B>(lane, &k("attn_kv_a_proj_with_mqa_out"), dev32);
@@ -1177,7 +1416,13 @@ fn run_teacher_forced_lane(
             &gold,
         );
         let (okey, gold) = lane.get(&k("mla_value_states"));
-        g.cmp_exact("tf", "assemble_value", &format!("{} -> {}", kvb_key, okey), &host(&v_states), &gold);
+        g.cmp_exact(
+            "tf",
+            "assemble_value",
+            &format!("{} -> {}", kvb_key, okey),
+            &host(&v_states),
+            &gold,
+        );
     }
 
     // --- the attention core, one operation at a time -----------------------
@@ -1219,7 +1464,16 @@ fn run_teacher_forced_lane(
         );
         let _ = p64_pre;
         let (okey, gold) = lane.get(&k("mla_attn_probs"));
-        g.cmp_bf16_ref("tf", "attend_probs", &okey, &host(&p32), &gold, &host(&p64), MIN_BITEXACT, false);
+        g.cmp_bf16_ref(
+            "tf",
+            "attend_probs",
+            &okey,
+            &host(&p32),
+            &gold,
+            &host(&p64),
+            MIN_BITEXACT,
+            false,
+        );
 
         let (_, pr32) = oracle_t4::<F32B>(lane, &k("mla_attn_probs"), dev32);
         let (_, v32) = oracle_t4::<F32B>(lane, &k("mla_value_states"), dev32);
@@ -1269,7 +1523,12 @@ fn run_teacher_forced_lane(
 /// if it did, this control would be measuring the port against itself.
 fn apply_rope(x: &mut [f64], b: usize, h: usize, t: usize, d: usize, carried: usize, theta: f64) {
     let half = carried / 2;
-    assert!(half > 0 && carried <= d, "bad carried width {} in {}", carried, d);
+    assert!(
+        half > 0 && carried <= d,
+        "bad carried width {} in {}",
+        carried,
+        d
+    );
     for bi in 0..b {
         for hi in 0..h {
             for ti in 0..t {
@@ -1363,13 +1622,13 @@ fn arg_opt(name: &str) -> Option<String> {
 }
 
 fn main() {
-    let ckpt_dir = mary::paths::model(arg_opt("--ckpt").as_deref(), "kimi-k3")
-        .unwrap_or_else(|e| {
+    let ckpt_dir =
+        mary::paths::model(arg_opt("--ckpt").as_deref(), "kimi-k3").unwrap_or_else(|e| {
             eprintln!("{e}");
             std::process::exit(2)
         });
-    let vec_dir = mary::paths::model(arg_opt("--vectors").as_deref(), "k3-oracle")
-        .unwrap_or_else(|e| {
+    let vec_dir =
+        mary::paths::model(arg_opt("--vectors").as_deref(), "k3-oracle").unwrap_or_else(|e| {
             eprintln!("{e}");
             std::process::exit(2)
         });
@@ -1391,7 +1650,10 @@ fn main() {
             format!("{} (want {})", got, want),
         );
     }
-    println!("[setup] oracle sha256 checked ({:.1}s)", t_start.elapsed().as_secs_f64());
+    println!(
+        "[setup] oracle sha256 checked ({:.1}s)",
+        t_start.elapsed().as_secs_f64()
+    );
 
     // ---- 2. the config, and the layer-index base trap --------------------
     let cfg_json = std::fs::read_to_string(ckpt_dir.join("config.json")).expect("config.json");
@@ -1433,7 +1695,9 @@ fn main() {
         "setup",
         "gated_layers_are_mla",
         "config.attn_kind",
-        MLA_LAYERS.iter().all(|l| text.attn_kind(*l) == AttnKind::Mla)
+        MLA_LAYERS
+            .iter()
+            .all(|l| text.attn_kind(*l) == AttnKind::Mla)
             && text.attn_kind(4) == AttnKind::Kda,
         MLA_LAYERS.len(),
         "layers 3/7/11 are MLA and layer 4 is KDA".into(),
@@ -1465,7 +1729,8 @@ fn main() {
         "setup",
         "non_nope_config_is_refused",
         "MlaConfig::from_text_config",
-        MlaConfig::from_text_config(&not_nope).is_err() && MlaConfig::from_text_config(text).is_ok(),
+        MlaConfig::from_text_config(&not_nope).is_err()
+            && MlaConfig::from_text_config(text).is_ok(),
         1,
         "a config with mla_use_nope=false cannot build this block".into(),
     );
@@ -1488,8 +1753,21 @@ fn main() {
     let mark = g.checks.len();
     let w64 = load_weights::<F64B>(&ck, &mcfg, 3, &dev64, &mut g, true);
     let blk64 = MlaBlock::new(mcfg.clone(), w64, Precision::Exact);
-    let lane64 = Lane { z: &zlad, prefix: "mla_L03_f64pure__".into(), bits: false };
-    let tr64 = run_subblock_lane(&mut g, "f64", 3, &lane64, &blk64, &dev64, Tol::Rel(1e-11), None);
+    let lane64 = Lane {
+        z: &zlad,
+        prefix: "mla_L03_f64pure__".into(),
+        bits: false,
+    };
+    let tr64 = run_subblock_lane(
+        &mut g,
+        "f64",
+        3,
+        &lane64,
+        &blk64,
+        &dev64,
+        Tol::Rel(1e-11),
+        None,
+    );
     assert_eq!(
         g.n_since(mark),
         N_CHECKS_PER_SUBBLOCK_LANE + N_CHECKS_WEIGHT_SHAPE,
@@ -1513,7 +1791,14 @@ fn main() {
         // control's own arithmetic is not the thing that moved.
         let plain = attention_f64(&q, &kk, &v, &mask_v, b, h, t, qh, dv, mcfg.scaling());
         let (okey, gold) = lane64.get("L03_mla_attn_out_heads");
-        g.cmp("control", "independent_f64_attention_reproduces_oracle", &okey, &plain, &gold, 1e-11);
+        g.cmp(
+            "control",
+            "independent_f64_attention_reproduces_oracle",
+            &okey,
+            &plain,
+            &gold,
+            1e-11,
+        );
 
         apply_rope(&mut q, b, h, t, qh, carried, 10000.0);
         apply_rope(&mut kk, b, h, t, qh, carried, 10000.0);
@@ -1527,21 +1812,49 @@ fn main() {
             0.05,
             "same code path, RoPE applied to the carried lanes of q and k only",
         );
-        assert_eq!(g.n_since(mark), N_CHECKS_CONTROL, "control lane check count drifted");
-        println!("[ctrl] positive control done ({:.1}s)", t_start.elapsed().as_secs_f64());
+        assert_eq!(
+            g.n_since(mark),
+            N_CHECKS_CONTROL,
+            "control lane check count drifted"
+        );
+        println!(
+            "[ctrl] positive control done ({:.1}s)",
+            t_start.elapsed().as_secs_f64()
+        );
     }
 
     // ---- 6. lane f32 ------------------------------------------------------
     let mark = g.checks.len();
     let w32_l3 = load_weights::<F32B>(&ck, &mcfg, 3, &dev32, &mut g, false);
     let blk32 = MlaBlock::new(mcfg.clone(), w32_l3.clone(), Precision::Exact);
-    let lane32 = Lane { z: &zlad, prefix: "mla_L03_f32__".into(), bits: false };
-    run_subblock_lane(&mut g, "f32", 3, &lane32, &blk32, &dev32, Tol::Rel(1e-4), None);
-    assert_eq!(g.n_since(mark), N_CHECKS_PER_SUBBLOCK_LANE, "f32 lane check count drifted");
+    let lane32 = Lane {
+        z: &zlad,
+        prefix: "mla_L03_f32__".into(),
+        bits: false,
+    };
+    run_subblock_lane(
+        &mut g,
+        "f32",
+        3,
+        &lane32,
+        &blk32,
+        &dev32,
+        Tol::Rel(1e-4),
+        None,
+    );
+    assert_eq!(
+        g.n_since(mark),
+        N_CHECKS_PER_SUBBLOCK_LANE,
+        "f32 lane check count drifted"
+    );
     println!("[f32 ] lane done ({:.1}s)", t_start.elapsed().as_secs_f64());
 
     // ---- 7. teacher-forced bfloat16, all three MLA layers -----------------
-    let lane13 = Lane { z: &z13, prefix: String::new(), bits: true };
+    let lane13 = Lane {
+        z: &z13,
+        prefix: String::new(),
+        bits: true,
+    };
     let mut blk_bf16_l3: Option<MlaBlock<F32B>> = None;
     for layer in MLA_LAYERS {
         let mark = g.checks.len();
@@ -1569,7 +1882,11 @@ fn main() {
         if layer == 3 {
             blk_bf16_l3 = Some(blk);
         }
-        println!("[tf  ] L{:02} done ({:.1}s)", layer, t_start.elapsed().as_secs_f64());
+        println!(
+            "[tf  ] L{:02} done ({:.1}s)",
+            layer,
+            t_start.elapsed().as_secs_f64()
+        );
     }
     let blk_bf16 = blk_bf16_l3.expect("layer 3 bf16 block");
 
@@ -1595,11 +1912,16 @@ fn main() {
     );
     let tr64_full = blk64_full.forward(
         hid64,
-        Some(MlaBlock::<F64B>::causal_mask(d13[0], d13[1], d13[1], 0, &dev64)),
+        Some(MlaBlock::<F64B>::causal_mask(
+            d13[0], d13[1], d13[1], 0, &dev64,
+        )),
         None,
     );
     let reference = reference_map(&tr64_full);
-    println!("[ref ] float64 reference for the bf16 cascade ({:.1}s)", t_start.elapsed().as_secs_f64());
+    println!(
+        "[ref ] float64 reference for the bf16 cascade ({:.1}s)",
+        t_start.elapsed().as_secs_f64()
+    );
     run_subblock_lane(
         &mut g,
         "bf16",
@@ -1615,12 +1937,19 @@ fn main() {
         N_CHECKS_PER_SUBBLOCK_LANE,
         "bf16 cascade check count drifted"
     );
-    println!("[bf16] cascade done ({:.1}s)", t_start.elapsed().as_secs_f64());
+    println!(
+        "[bf16] cascade done ({:.1}s)",
+        t_start.elapsed().as_secs_f64()
+    );
 
     // ---- 8. lane cache: prefill 12, then continue 4, then decode 4 --------
     {
         let mark = g.checks.len();
-        let lane = Lane { z: &z13, prefix: String::new(), bits: true };
+        let lane = Lane {
+            z: &z13,
+            prefix: String::new(),
+            bits: true,
+        };
         let (in_key, hidden_v) = lane.get("L03_attn_q_a_proj_in");
         let dims = lane.dims("L03_attn_q_a_proj_in");
         let (t, dh) = (dims[1], dims[2]);
@@ -1648,10 +1977,17 @@ fn main() {
             "port-internal",
             cache.len() == 12,
             1,
-            format!("cache holds {} tokens after a 12-token prefill", cache.len()),
+            format!(
+                "cache holds {} tokens after a 12-token prefill",
+                cache.len()
+            ),
         );
         // The KV-cache arrays live in the ladder bundle, not the prefix run.
-        let clane = Lane { z: &zlad, prefix: String::new(), bits: true };
+        let clane = Lane {
+            z: &zlad,
+            prefix: String::new(),
+            bits: true,
+        };
         let (kkey, kgold) = clane.get("mla_L03_cache_prefill12_key");
         let (vkey, vgold) = clane.get("mla_L03_cache_prefill12_value");
         // Reference: the float64 run of the full 16 tokens, sliced to batch 0.
@@ -1665,16 +2001,48 @@ fn main() {
             host(&t.clone().slice([0..1, 0..hh, t0..t1, 0..w]))
         };
         let out64 = host(&tr64_full.out);
-        g.cmp_ref("cache", "prefill12_key_cache", &kkey, &host(&cache.key().unwrap()), &kgold, &slice_b0(&tr64_full.key_states, 0, 12, qh), 4.0);
-        g.cmp_ref("cache", "prefill12_value_cache", &vkey, &host(&cache.value().unwrap()), &vgold, &slice_b0(&tr64_full.value_states, 0, 12, mcfg.v_head_dim), 4.0);
-        g.cmp_ref("cache", "prefill12_out", &format!("{}[0,0:12]", out_key), &host(&pre.out), &want(0, 12), &out64[..12 * dh], 4.0);
+        g.cmp_ref(
+            "cache",
+            "prefill12_key_cache",
+            &kkey,
+            &host(&cache.key().unwrap()),
+            &kgold,
+            &slice_b0(&tr64_full.key_states, 0, 12, qh),
+            4.0,
+        );
+        g.cmp_ref(
+            "cache",
+            "prefill12_value_cache",
+            &vkey,
+            &host(&cache.value().unwrap()),
+            &vgold,
+            &slice_b0(&tr64_full.value_states, 0, 12, mcfg.v_head_dim),
+            4.0,
+        );
+        g.cmp_ref(
+            "cache",
+            "prefill12_out",
+            &format!("{}[0,0:12]", out_key),
+            &host(&pre.out),
+            &want(0, 12),
+            &out64[..12 * dh],
+            4.0,
+        );
 
         let cont = blk_bf16.forward(
             hid(12, 16),
             Some(MlaBlock::<F32B>::causal_mask(1, 4, 16, 12, &dev32)),
             Some(&mut cache),
         );
-        g.cmp_ref("cache", "continue4_out", &format!("{}[0,12:16]", out_key), &host(&cont.out), &want(12, 16), &out64[12 * dh..16 * dh], 4.0);
+        g.cmp_ref(
+            "cache",
+            "continue4_out",
+            &format!("{}[0,12:16]", out_key),
+            &host(&cont.out),
+            &want(12, 16),
+            &out64[12 * dh..16 * dh],
+            4.0,
+        );
 
         let mut c2 = MlaKvCache::<F32B>::new();
         let _ = blk_bf16.forward(
@@ -1691,8 +2059,20 @@ fn main() {
             );
             steps.extend(host(&s.out));
         }
-        g.cmp_ref("cache", "stepwise4_out", &format!("{}[0,12:16]", out_key), &steps, &want(12, 16), &out64[12 * dh..16 * dh], 4.0);
-        assert_eq!(g.n_since(mark), N_CHECKS_CACHE, "cache lane check count drifted");
+        g.cmp_ref(
+            "cache",
+            "stepwise4_out",
+            &format!("{}[0,12:16]", out_key),
+            &steps,
+            &want(12, 16),
+            &out64[12 * dh..16 * dh],
+            4.0,
+        );
+        assert_eq!(
+            g.n_since(mark),
+            N_CHECKS_CACHE,
+            "cache lane check count drifted"
+        );
         let _ = in_key;
         println!("[cach] lane done ({:.1}s)", t_start.elapsed().as_secs_f64());
     }
@@ -1706,7 +2086,7 @@ fn main() {
         + N_CHECKS_CACHE
         + N_CHECKS_PER_SUBBLOCK_LANE * 3      // f64, f32, bf16 cascade
         + N_CHECKS_TEACHER_FORCED * 3         // bf16 per-operation, L03/L07/L11
-        + N_CHECKS_WEIGHT_SHAPE * 3;          // one per distinct layer loaded
+        + N_CHECKS_WEIGHT_SHAPE * 3; // one per distinct layer loaded
     assert_eq!(
         g.checks.len(),
         expected,
@@ -1715,7 +2095,10 @@ fn main() {
         expected
     );
 
-    println!("\n{:<6} {:<44} {:>10} {:>11} {:>11} {:>9} {:>6}", "lane", "check", "n", "max|d|", "rel", "bitexact", "ok");
+    println!(
+        "\n{:<6} {:<44} {:>10} {:>11} {:>11} {:>9} {:>6}",
+        "lane", "check", "n", "max|d|", "rel", "bitexact", "ok"
+    );
     for c in &g.checks {
         println!(
             "{:<6} {:<44} {:>10} {:>11.3e} {:>11.3e} {:>9} {:>6}",
@@ -1724,7 +2107,9 @@ fn main() {
             c.n,
             c.max_abs,
             c.rel,
-            c.bitexact.map(|f| format!("{:.5}", f)).unwrap_or_else(|| "-".into()),
+            c.bitexact
+                .map(|f| format!("{:.5}", f))
+                .unwrap_or_else(|| "-".into()),
             if c.ok { "PASS" } else { "FAIL" }
         );
     }
@@ -1737,7 +2122,8 @@ fn main() {
         t_start.elapsed().as_secs_f64()
     );
     if !json_out.is_empty() {
-        std::fs::write(&json_out, serde_json::to_string_pretty(&g.checks).unwrap()).expect("write json");
+        std::fs::write(&json_out, serde_json::to_string_pretty(&g.checks).unwrap())
+            .expect("write json");
         println!("wrote {}", json_out);
     }
     if !failed.is_empty() {
@@ -1752,11 +2138,17 @@ fn main() {
     }
 
     // Only now, after every check has passed, is a timing number meaningful.
-    let lane = Lane { z: &z13, prefix: String::new(), bits: true };
+    let lane = Lane {
+        z: &z13,
+        prefix: String::new(),
+        bits: true,
+    };
     let (_, hv) = lane.get("L03_attn_q_a_proj_in");
     let d = lane.dims("L03_attn_q_a_proj_in");
-    let hidden: Tensor<F32B, 3> =
-        Tensor::from_data(TensorData::new(hv, [d[0], d[1], d[2]]).convert::<f32>(), &dev32);
+    let hidden: Tensor<F32B, 3> = Tensor::from_data(
+        TensorData::new(hv, [d[0], d[1], d[2]]).convert::<f32>(),
+        &dev32,
+    );
     let mask = MlaBlock::<F32B>::causal_mask(d[0], d[1], d[1], 0, &dev32);
     let blk_plain = MlaBlock::new(mcfg.clone(), blk_bf16.w.clone(), Precision::Exact);
     let t0 = Instant::now();

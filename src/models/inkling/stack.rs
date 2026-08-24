@@ -28,7 +28,10 @@ pub fn embed(ids: &[usize], table: &[f32], vocab: usize, hidden: usize) -> Vec<f
     assert_eq!(table.len(), vocab * hidden);
     let mut out = vec![0f32; ids.len() * hidden];
     for (i, &id) in ids.iter().enumerate() {
-        assert!(id < vocab, "token id {id} is past the vocabulary of {vocab}");
+        assert!(
+            id < vocab,
+            "token id {id} is past the vocabulary of {vocab}"
+        );
         out[i * hidden..(i + 1) * hidden].copy_from_slice(&table[id * hidden..(id + 1) * hidden]);
     }
     out
@@ -42,8 +45,15 @@ pub fn embed(ids: &[usize], table: &[f32], vocab: usize, hidden: usize) -> Vec<f
 /// 2.4 GiB of stored weight becoming 4.8 GB of host `Vec<f32>` on a box chosen
 /// because the working set only just fits.
 pub fn embed_row_bf16(table: &[u8], id: usize, vocab: usize, hidden: usize) -> Vec<f32> {
-    assert_eq!(table.len(), vocab * hidden * 2, "table is not [{vocab}, {hidden}] BF16");
-    assert!(id < vocab, "token id {id} is past the vocabulary of {vocab}");
+    assert_eq!(
+        table.len(),
+        vocab * hidden * 2,
+        "table is not [{vocab}, {hidden}] BF16"
+    );
+    assert!(
+        id < vocab,
+        "token id {id} is past the vocabulary of {vocab}"
+    );
     table[id * hidden * 2..(id + 1) * hidden * 2]
         .chunks_exact(2)
         .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
@@ -101,7 +111,10 @@ pub fn head(
 ) -> Vec<f32> {
     assert_eq!(hidden_states.len(), tokens * hidden);
     assert_eq!(unembed.len(), vocab * hidden);
-    assert!(unpadded_vocab <= vocab, "unpadded vocabulary exceeds the table");
+    assert!(
+        unpadded_vocab <= vocab,
+        "unpadded vocabulary exceeds the table"
+    );
 
     let normed = rms_norm(hidden_states, final_norm_gain, eps, tokens, hidden);
     let mut out = vec![0f32; tokens * unpadded_vocab];

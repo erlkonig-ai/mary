@@ -79,7 +79,10 @@ fn main() {
     );
 
     println!("block-scaled MMA combinations with 4-bit (E2M1) operands:");
-    println!("{:<10} {:>4} {:>4} {:>4} {:>8} {:>16}", "scales", "m", "n", "k", "scale_vec", "elems/scale");
+    println!(
+        "{:<10} {:>4} {:>4} {:>4} {:>8} {:>16}",
+        "scales", "m", "n", "k", "scale_vec", "elems/scale"
+    );
     let mut mx = false;
     let mut nv = false;
     for c in &features.matmul.scaled_mma {
@@ -111,6 +114,11 @@ fn main() {
     println!(
         "{} scaled-MMA combinations total, {} of them 4-bit.",
         features.matmul.scaled_mma.len(),
-        features.matmul.scaled_mma.iter().filter(|c| is_fp4(&c.a_type) && is_fp4(&c.b_type)).count()
+        features
+            .matmul
+            .scaled_mma
+            .iter()
+            .filter(|c| is_fp4(&c.a_type) && is_fp4(&c.b_type))
+            .count()
     );
 }

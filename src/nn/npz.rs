@@ -191,7 +191,10 @@ fn zip_stored_members<'a>(buf: &'a [u8], path: &Path) -> io::Result<Vec<(String,
     let mut p = cd_off;
     for _ in 0..n_entries {
         if le32(buf, p) != 0x0201_4b50 {
-            return Err(bad(format!("{}: corrupt central directory", path.display())));
+            return Err(bad(format!(
+                "{}: corrupt central directory",
+                path.display()
+            )));
         }
         let method = le16(buf, p + 10);
         let csize = le32(buf, p + 20);
@@ -244,17 +247,37 @@ fn parse_npy(bytes: &[u8], name: &str) -> NpyArray {
     let shape = parse_shape(&header);
     let raw = &bytes[hstart + hlen..];
     let data = if header.contains("'<f8'") {
-        NpyData::F64(chunks(raw, 8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect())
+        NpyData::F64(
+            chunks(raw, 8)
+                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                .collect(),
+        )
     } else if header.contains("'<f4'") {
-        NpyData::F32(chunks(raw, 4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+        NpyData::F32(
+            chunks(raw, 4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect(),
+        )
     } else if header.contains("'<i8'") {
-        NpyData::I64(chunks(raw, 8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect())
+        NpyData::I64(
+            chunks(raw, 8)
+                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .collect(),
+        )
     } else if header.contains("'<u2'") || header.contains("'|u2'") {
-        NpyData::U16(chunks(raw, 2).map(|c| u16::from_le_bytes(c.try_into().unwrap())).collect())
+        NpyData::U16(
+            chunks(raw, 2)
+                .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+                .collect(),
+        )
     } else if header.contains("'|u1'") || header.contains("'<u1'") {
         NpyData::U8(raw.to_vec())
     } else {
-        panic!("member '{}': unsupported dtype in header: {}", name, header.trim())
+        panic!(
+            "member '{}': unsupported dtype in header: {}",
+            name,
+            header.trim()
+        )
     };
 
     let n: usize = shape.iter().product();
@@ -265,7 +288,11 @@ fn parse_npy(bytes: &[u8], name: &str) -> NpyArray {
         NpyData::U16(v) => v.len(),
         NpyData::U8(v) => v.len(),
     };
-    assert_eq!(got, n, "member '{}': shape {:?} vs {} elements", name, shape, got);
+    assert_eq!(
+        got, n,
+        "member '{}': shape {:?} vs {} elements",
+        name, shape, got
+    );
     NpyArray { shape, data }
 }
 

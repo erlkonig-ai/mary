@@ -55,11 +55,11 @@
 
 use burn::backend::NdArray;
 use burn::prelude::*;
-use mary::models::k3::{K3Config, K3TextConfig};
 use mary::models::k3::moe::{
     ActRound, ExpertWeights, LatentMoe, LatentMoeWeights, MoeDims, RouterWeights, Routing,
     SharedExpertWeights,
 };
+use mary::models::k3::{K3Config, K3TextConfig};
 use mary::nn::mxfp4::decode_mxfp4;
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
@@ -277,10 +277,15 @@ impl Npz {
         let mut entries = BTreeMap::new();
         let mut p = 0usize;
         for _ in 0..n_entries {
-            assert_eq!(&cd[p..p + 4], &[0x50, 0x4b, 0x01, 0x02], "central header sig");
+            assert_eq!(
+                &cd[p..p + 4],
+                &[0x50, 0x4b, 0x01, 0x02],
+                "central header sig"
+            );
             let method = u16::from_le_bytes([cd[p + 10], cd[p + 11]]);
             assert_eq!(
-                method, 0,
+                method,
+                0,
                 "{}: member is compressed (method {method}); np.savez writes ZIP_STORED",
                 path.display()
             );
@@ -336,7 +341,10 @@ impl Npz {
         };
         let header = std::str::from_utf8(&raw[hstart..hstart + hlen]).expect("npy header");
         let field = |k: &str| -> String {
-            let i = header.find(k).unwrap_or_else(|| panic!("no {k} in {header}")) + k.len();
+            let i = header
+                .find(k)
+                .unwrap_or_else(|| panic!("no {k} in {header}"))
+                + k.len();
             let rest = &header[i..];
             let s = rest.find(|c: char| c != ':' && c != ' ').unwrap();
             let rest = &rest[s..];
@@ -379,7 +387,11 @@ fn load_inventory(path: &Path) -> (Inventory, String) {
         arrays: HashMap<String, Decl>,
     }
     let inv: Inv = serde_json::from_slice(&bytes).expect("inventory json");
-    assert!(!inv.arrays.is_empty(), "{}: empty inventory", path.display());
+    assert!(
+        !inv.arrays.is_empty(),
+        "{}: empty inventory",
+        path.display()
+    );
     (
         inv.arrays
             .into_iter()
@@ -406,7 +418,11 @@ impl Oracle {
             .inv
             .get(name)
             .unwrap_or_else(|| panic!("{name} is not declared in the {} inventory", self.tag));
-        assert_eq!(a.shape, d.0, "{name}: shape {:?} != declared {:?}", a.shape, d.0);
+        assert_eq!(
+            a.shape, d.0,
+            "{name}: shape {:?} != declared {:?}",
+            a.shape, d.0
+        );
         assert_eq!(a.dt.numpy_name(), d.1, "{name}: dtype != declared {}", d.1);
         assert!(a.len() > 0, "{name} is EMPTY");
         self.seen.borrow_mut().insert(name.to_string());
@@ -582,7 +598,11 @@ impl Ckpt {
 }
 
 fn t2(v: Vec<f32>, shape: [usize; 2], dev: &Dev) -> Tensor<B, 2> {
-    assert_eq!(v.len(), shape[0] * shape[1], "tensor data length vs {shape:?}");
+    assert_eq!(
+        v.len(),
+        shape[0] * shape[1],
+        "tensor data length vs {shape:?}"
+    );
     Tensor::<B, 2>::from_data(TensorData::new(v, shape), dev)
 }
 
@@ -600,7 +620,10 @@ fn vec_of<const D: usize>(t: Tensor<B, D>) -> Vec<f32> {
 /// Deliberately the dumbest possible loop: this is the independent reference,
 /// so it must not share an implementation with anything it checks.
 fn host_f64_matmul(x: &[f32], m: usize, k: usize, w: &[f32], cols: usize) -> Vec<f64> {
-    assert!(x.len() >= m * k && w.len() >= cols * k, "host matmul operands");
+    assert!(
+        x.len() >= m * k && w.len() >= cols * k,
+        "host matmul operands"
+    );
     let mut out = vec![0f64; m * cols];
     for i in 0..m {
         let xr = &x[i * k..i * k + k];
@@ -774,7 +797,10 @@ impl Report {
     }
 
     fn bytes_eq(&mut self, id: &str, what: &str, a: &[u8], b: &[u8]) {
-        assert!(!a.is_empty() && !b.is_empty(), "{id}: empty byte comparison");
+        assert!(
+            !a.is_empty() && !b.is_empty(),
+            "{id}: empty byte comparison"
+        );
         let ok = a == b;
         let diff = if a.len() == b.len() {
             a.iter().zip(b).filter(|(x, y)| x != y).count()
@@ -822,18 +848,22 @@ impl Report {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let oracle_arg = args.get(1).cloned().or_else(|| std::env::var("K3_ORACLE_DIR").ok());
-    let oracle_dir = mary::paths::model(oracle_arg.as_deref(), "k3-oracle")
-        .unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(2)
-        });
-    let model_arg = args.get(2).cloned().or_else(|| std::env::var("K3_MODEL_DIR").ok());
-    let model_dir = mary::paths::model(model_arg.as_deref(), "kimi-k3")
-        .unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(2)
-        });
+    let oracle_arg = args
+        .get(1)
+        .cloned()
+        .or_else(|| std::env::var("K3_ORACLE_DIR").ok());
+    let oracle_dir = mary::paths::model(oracle_arg.as_deref(), "k3-oracle").unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
+    let model_arg = args
+        .get(2)
+        .cloned()
+        .or_else(|| std::env::var("K3_MODEL_DIR").ok());
+    let model_dir = mary::paths::model(model_arg.as_deref(), "kimi-k3").unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
     let fast = std::env::var("K3MOE_FAST").is_ok();
 
     println!("k3_moe_gate — mary::models::k3::moe against the whole-layer oracle");
@@ -1160,8 +1190,18 @@ fn main() {
         let out = p.get(&format!("{tag}_out_bf16bits")).bf16_as_f32();
 
         // The oracle's own wiring first, before anything is leaned on.
-        r.exact(&format!("E1a/{e}"), "oracle wiring: w1_in == expert_in", &w1_in, &x);
-        r.exact(&format!("E1b/{e}"), "oracle wiring: w3_in == expert_in", &w3_in, &x);
+        r.exact(
+            &format!("E1a/{e}"),
+            "oracle wiring: w1_in == expert_in",
+            &w1_in,
+            &x,
+        );
+        r.exact(
+            &format!("E1b/{e}"),
+            "oracle wiring: w3_in == expert_in",
+            &w3_in,
+            &x,
+        );
         r.exact(
             &format!("E1c/{e}"),
             "oracle wiring: w2_in == situ_out",
@@ -1203,7 +1243,11 @@ fn main() {
             Some(BF16_EXACT_FRAC_MIN),
         );
         // situ driven from the CAPTURED situ input, so this is situ alone.
-        let si = t2(situ_in.clone(), [rows, 2 * dims.moe_intermediate_size], &dev);
+        let si = t2(
+            situ_in.clone(),
+            [rows, 2 * dims.moe_intermediate_size],
+            &dev,
+        );
         r.close(
             &format!("E4/{e}"),
             "situ(captured situ_in) == the shipped SituAndMul output",
@@ -1255,8 +1299,7 @@ fn main() {
         {
             let g = si.clone().narrow(1, 0, dims.moe_intermediate_size);
             let u = si.narrow(1, dims.moe_intermediate_size, dims.moe_intermediate_size);
-            let swiglu =
-                ActRound::Bf16.apply(g.clone() * burn::tensor::activation::sigmoid(g) * u);
+            let swiglu = ActRound::Bf16.apply(g.clone() * burn::tensor::activation::sigmoid(g) * u);
             r.must_differ(
                 &format!("E9/{e}"),
                 "NEGATIVE: plain SwiGLU in place of situ must NOT reproduce the activation",
@@ -1269,7 +1312,11 @@ fn main() {
 
     // ------------------------------------------ router / latent / shared sweep
     println!("\n== R/L/S: router, latent projections, shared experts — 32 tokens ==");
-    let layers: Vec<usize> = if fast { vec![1, 4, 12] } else { (1..=12).collect() };
+    let layers: Vec<usize> = if fast {
+        vec![1, 4, 12]
+    } else {
+        (1..=12).collect()
+    };
     if fast {
         r.skip("R/L/S sweep restricted to layers 1, 4, 12 (K3MOE_FAST)");
     }
@@ -1283,7 +1330,9 @@ fn main() {
             .map(|&v| half::bf16::from_f32(v).to_f32())
             .collect();
         let bias_oracle = p
-            .get(&format!("{tag}_moe_router_e_score_correction_bias_bf16bits"))
+            .get(&format!(
+                "{tag}_moe_router_e_score_correction_bias_bf16bits"
+            ))
             .bf16_as_f32();
         r.exact(
             &format!("R1/{tag}"),
@@ -1464,14 +1513,28 @@ fn main() {
         }
 
         // ------------------------------------------------------------ latent
-        let ldi = p.get(&format!("{tag}_moe_latent_down_in_bf16bits")).bf16_as_f32();
-        let ldo = p.get(&format!("{tag}_moe_latent_down_out_bf16bits")).bf16_as_f32();
-        let lni = p.get(&format!("{tag}_moe_latent_norm_in_bf16bits")).bf16_as_f32();
-        let lno = p.get(&format!("{tag}_moe_latent_norm_out_bf16bits")).bf16_as_f32();
-        let lui = p.get(&format!("{tag}_moe_latent_up_in_bf16bits")).bf16_as_f32();
-        let luo = p.get(&format!("{tag}_moe_latent_up_out_bf16bits")).bf16_as_f32();
+        let ldi = p
+            .get(&format!("{tag}_moe_latent_down_in_bf16bits"))
+            .bf16_as_f32();
+        let ldo = p
+            .get(&format!("{tag}_moe_latent_down_out_bf16bits"))
+            .bf16_as_f32();
+        let lni = p
+            .get(&format!("{tag}_moe_latent_norm_in_bf16bits"))
+            .bf16_as_f32();
+        let lno = p
+            .get(&format!("{tag}_moe_latent_norm_out_bf16bits"))
+            .bf16_as_f32();
+        let lui = p
+            .get(&format!("{tag}_moe_latent_up_in_bf16bits"))
+            .bf16_as_f32();
+        let luo = p
+            .get(&format!("{tag}_moe_latent_up_out_bf16bits"))
+            .bf16_as_f32();
         let moe_in = p.get(&format!("{tag}_moe_in_bf16bits")).bf16_as_f32();
-        let shared_in = p.get(&format!("{tag}_moe_shared_in_bf16bits")).bf16_as_f32();
+        let shared_in = p
+            .get(&format!("{tag}_moe_shared_in_bf16bits"))
+            .bf16_as_f32();
         r.exact(
             &format!("L1a/{tag}"),
             "oracle wiring: moe_in (flattened) IS routed_expert_down_proj's input",
@@ -1543,8 +1606,8 @@ fn main() {
                 hi / lo > 1.5 && lo.is_finite(),
                 format!("per-token RMS {lo:.4}..{hi:.4}, ratio {:.2}", hi / lo),
             );
-            let scaled = t2(lni.clone(), [ntok, dims.moe_hidden_size], &dev)
-                * nwt.clone().unsqueeze::<2>();
+            let scaled =
+                t2(lni.clone(), [ntok, dims.moe_hidden_size], &dev) * nwt.clone().unsqueeze::<2>();
             r.must_differ(
                 &format!("L6/{tag}"),
                 "NEGATIVE: applying the norm weight BEFORE normalising must not reproduce it",
@@ -1560,13 +1623,27 @@ fn main() {
         // single-expert lane is, so a compensating pair of errors cannot hide
         // inside the composition. The composition is then checked separately.
         let sw = w.shared.clone().unwrap();
-        let fw = dims.shared_intermediate_size.expect("K3 has shared experts");
-        let sgo = p.get(&format!("{tag}_moe_shared_gate_proj_out_bf16bits")).bf16_as_f32();
-        let suo = p.get(&format!("{tag}_moe_shared_up_proj_out_bf16bits")).bf16_as_f32();
-        let ssi = p.get(&format!("{tag}_moe_shared_situ_in_bf16bits")).bf16_as_f32();
-        let sso = p.get(&format!("{tag}_moe_shared_situ_out_bf16bits")).bf16_as_f32();
-        let sdo = p.get(&format!("{tag}_moe_shared_down_proj_out_bf16bits")).bf16_as_f32();
-        let sout = p.get(&format!("{tag}_moe_shared_out_bf16bits")).bf16_as_f32();
+        let fw = dims
+            .shared_intermediate_size
+            .expect("K3 has shared experts");
+        let sgo = p
+            .get(&format!("{tag}_moe_shared_gate_proj_out_bf16bits"))
+            .bf16_as_f32();
+        let suo = p
+            .get(&format!("{tag}_moe_shared_up_proj_out_bf16bits"))
+            .bf16_as_f32();
+        let ssi = p
+            .get(&format!("{tag}_moe_shared_situ_in_bf16bits"))
+            .bf16_as_f32();
+        let sso = p
+            .get(&format!("{tag}_moe_shared_situ_out_bf16bits"))
+            .bf16_as_f32();
+        let sdo = p
+            .get(&format!("{tag}_moe_shared_down_proj_out_bf16bits"))
+            .bf16_as_f32();
+        let sout = p
+            .get(&format!("{tag}_moe_shared_out_bf16bits"))
+            .bf16_as_f32();
         let sin_t = t2(shared_in.clone(), [ntok, dims.hidden_size], &dev);
         r.close(
             &format!("S1/{tag}"),
@@ -1605,9 +1682,7 @@ fn main() {
         r.close(
             &format!("S4/{tag}"),
             "shared situ, from the captured situ input",
-            &vec_of(ActRound::Bf16.apply(
-                dims.situ.forward(t2(ssi.clone(), [ntok, 2 * fw], &dev)),
-            )),
+            &vec_of(ActRound::Bf16.apply(dims.situ.forward(t2(ssi.clone(), [ntok, 2 * fw], &dev)))),
             &sso,
             bf16_budget(1, absmax(&sso)),
             Some(BF16_EXACT_FRAC_MIN),
@@ -1660,8 +1735,7 @@ fn main() {
         // first 256 output columns, to keep a scalar f64 GEMM cheap.
         if layer == 4 {
             let cols = 256usize;
-            let (dp_shape, dp_raw) =
-                ckpt.bf16(&format!("{pre}.routed_expert_down_proj.weight"));
+            let (dp_shape, dp_raw) = ckpt.bf16(&format!("{pre}.routed_expert_down_proj.weight"));
             assert_eq!(dp_shape, vec![dims.moe_hidden_size, dims.hidden_size]);
             let exact = host_f64_matmul(&ldi, ntok, dims.hidden_size, &dp_raw, cols);
             let shipped: Vec<f32> = (0..ntok)
@@ -1711,7 +1785,10 @@ fn main() {
         run_bf16_block(&mut r, &p, &ckpt, &dims, &dev, 4, "L04");
     }
     check_combination_rounds_once(&mut r, &dims, &dev);
-    for (lane, layer, tag) in [("kda_L04_f32", 4usize, "L04"), ("mla_L03_f32", 3usize, "L03")] {
+    for (lane, layer, tag) in [
+        ("kda_L04_f32", 4usize, "L04"),
+        ("mla_L03_f32", 3usize, "L03"),
+    ] {
         run_f32_lane(&mut r, &l, &ckpt, &dims, &dev, lane, layer, tag);
     }
     run_f64_lane(&mut r, &l, &ckpt, &dims, &dev, "mla_L03_f64pure", 3, "L03");
@@ -1747,7 +1824,11 @@ fn main() {
             );
         }
     } else {
-        println!("\nGATE: FAIL ({} of {} checks)", fails.len(), r.checks.len());
+        println!(
+            "\nGATE: FAIL ({} of {} checks)",
+            fails.len(),
+            r.checks.len()
+        );
         std::process::exit(1);
     }
 }
@@ -1849,7 +1930,9 @@ fn run_bf16_block(
         ),
     );
 
-    let lni = p.get(&format!("{tag}_moe_latent_norm_in_bf16bits")).bf16_as_f32();
+    let lni = p
+        .get(&format!("{tag}_moe_latent_norm_in_bf16bits"))
+        .bf16_as_f32();
     r.close(
         "G2",
         "moe_infer: the top-16 combination over every selected expert == the shipped \
@@ -1872,8 +1955,12 @@ fn run_bf16_block(
 
     // C10 as an identity on the oracle's own arrays: the shared experts are
     // added in the ORIGINAL hidden space, and the bf16 add rounds once.
-    let luo = p.get(&format!("{tag}_moe_latent_up_out_bf16bits")).bf16_as_f32();
-    let sho = p.get(&format!("{tag}_moe_shared_out_bf16bits")).bf16_as_f32();
+    let luo = p
+        .get(&format!("{tag}_moe_latent_up_out_bf16bits"))
+        .bf16_as_f32();
+    let sho = p
+        .get(&format!("{tag}_moe_shared_out_bf16bits"))
+        .bf16_as_f32();
     let sum: Vec<f32> = luo
         .iter()
         .zip(sho.iter())
@@ -2049,7 +2136,10 @@ fn check_combination_rounds_once(r: &mut Report, real: &MoeDims, dev: &Dev) {
         "the two accumulation rules are DISTINGUISHABLE on this block — round-once and \
          round-every-expert give different bf16 answers, so the check below can fail",
         differ > 0,
-        format!("{differ} of {} elements differ between the two rules", once.len()),
+        format!(
+            "{differ} of {} elements differ between the two rules",
+            once.len()
+        ),
     );
     r.exact(
         "G4b",

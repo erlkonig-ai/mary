@@ -161,10 +161,18 @@ impl KdaCache {
     pub fn zeros<B: Backend>(block: &KdaAttention<B>, batch: usize) -> Self {
         assert!(batch > 0, "KdaCache over zero sequences");
         Self {
-            conv_q: (0..batch).map(|_| ShortConvState::zeros(&block.q_conv)).collect(),
-            conv_k: (0..batch).map(|_| ShortConvState::zeros(&block.k_conv)).collect(),
-            conv_v: (0..batch).map(|_| ShortConvState::zeros(&block.v_conv)).collect(),
-            state: (0..batch).map(|_| KdaState::zeros(&block.cfg.kda)).collect(),
+            conv_q: (0..batch)
+                .map(|_| ShortConvState::zeros(&block.q_conv))
+                .collect(),
+            conv_k: (0..batch)
+                .map(|_| ShortConvState::zeros(&block.k_conv))
+                .collect(),
+            conv_v: (0..batch)
+                .map(|_| ShortConvState::zeros(&block.v_conv))
+                .collect(),
+            state: (0..batch)
+                .map(|_| KdaState::zeros(&block.cfg.kda))
+                .collect(),
         }
     }
 
@@ -234,11 +242,20 @@ pub struct KdaAttention<B: Backend> {
 }
 
 fn vec2<B: Backend>(t: &Tensor<B, 2>) -> Vec<f32> {
-    t.clone().into_data().convert::<f32>().to_vec().expect("tensor -> f32")
+    t.clone()
+        .into_data()
+        .convert::<f32>()
+        .to_vec()
+        .expect("tensor -> f32")
 }
 
 fn t2<B: Backend>(v: Vec<f32>, rows: usize, cols: usize, device: &B::Device) -> Tensor<B, 2> {
-    assert_eq!(v.len(), rows * cols, "t2: {} values into [{rows}, {cols}]", v.len());
+    assert_eq!(
+        v.len(),
+        rows * cols,
+        "t2: {} values into [{rows}, {cols}]",
+        v.len()
+    );
     Tensor::from_data(TensorData::new(v, [rows, cols]), device)
 }
 
@@ -261,11 +278,23 @@ impl<B: Backend> KdaAttention<B> {
         assert_eq!(w.b_proj.dims(), [nh, h], "b_proj");
         assert_eq!(w.g_proj.dims(), [p, h], "g_proj: full-rank output gate");
         assert_eq!(w.o_proj.dims(), [h, p], "o_proj");
-        assert_eq!(w.a_log.len(), nh, "A_log must be the {nh} LIVE heads, not the padded parameter");
+        assert_eq!(
+            w.a_log.len(),
+            nh,
+            "A_log must be the {nh} LIVE heads, not the padded parameter"
+        );
         assert_eq!(w.dt_bias.len(), p, "dt_bias");
-        assert_eq!(w.o_norm.len(), hd, "o_norm gain is per-channel within a head");
+        assert_eq!(
+            w.o_norm.len(),
+            hd,
+            "o_norm gain is per-channel within a head"
+        );
         for (name, c) in [("q", &w.q_conv1d), ("k", &w.k_conv1d), ("v", &w.v_conv1d)] {
-            assert_eq!(c.len(), p * cw, "{name}_conv1d must be [D, 1, W] = [{p}, 1, {cw}]");
+            assert_eq!(
+                c.len(),
+                p * cw,
+                "{name}_conv1d must be [D, 1, W] = [{p}, 1, {cw}]"
+            );
         }
         assert!(
             cfg.use_full_rank_gate,
@@ -276,7 +305,15 @@ impl<B: Backend> KdaAttention<B> {
         let q_conv = ShortConv::new(p, cw, &w.q_conv1d);
         let k_conv = ShortConv::new(p, cw, &w.k_conv1d);
         let v_conv = ShortConv::new(p, cw, &w.v_conv1d);
-        Self { cfg, w, round, core, q_conv, k_conv, v_conv }
+        Self {
+            cfg,
+            w,
+            round,
+            core,
+            q_conv,
+            k_conv,
+            v_conv,
+        }
     }
 
     /// Run the sublayer over `[tokens, hidden]`, where `tokens = batch · seq`
@@ -320,16 +357,30 @@ impl<B: Backend> KdaAttention<B> {
         let vp = vec2(&v_proj_out);
         for b in 0..batch {
             let r = b * seq * p..(b + 1) * seq * p;
-            self.q_conv.forward(&mut cache.conv_q[b], seq, &qp[r.clone()], &mut qc[r.clone()]);
-            self.k_conv.forward(&mut cache.conv_k[b], seq, &kp[r.clone()], &mut kc[r.clone()]);
-            self.v_conv.forward(&mut cache.conv_v[b], seq, &vp[r.clone()], &mut vc[r]);
+            self.q_conv.forward(
+                &mut cache.conv_q[b],
+                seq,
+                &qp[r.clone()],
+                &mut qc[r.clone()],
+            );
+            self.k_conv.forward(
+                &mut cache.conv_k[b],
+                seq,
+                &kp[r.clone()],
+                &mut kc[r.clone()],
+            );
+            self.v_conv
+                .forward(&mut cache.conv_v[b], seq, &vp[r.clone()], &mut vc[r]);
         }
         // The convolution output is a module output, so it is stored at the
         // model dtype like every other one.
         let bf = |v: Vec<f32>| -> Vec<f32> {
             match self.round {
                 ActRound::None => v,
-                ActRound::Bf16 => v.into_iter().map(|x| half::bf16::from_f32(x).to_f32()).collect(),
+                ActRound::Bf16 => v
+                    .into_iter()
+                    .map(|x| half::bf16::from_f32(x).to_f32())
+                    .collect(),
             }
         };
         let (qc, kc, vc) = (bf(qc), bf(kc), bf(vc));

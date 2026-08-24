@@ -140,8 +140,7 @@ pub fn fp4_linear<AB: Scalar, S: Scalar, NA: Size, NC: Size>(
         let (row, col) = def.position_of_nth(lane, (i * vs_c) as u32, MatrixIdent::Accumulator);
         let gr = row as usize + m_base;
         let gc = col as usize + n_base;
-        out[(gr * size_n + gc) / out.vector_size()] =
-            acc[i] * Vector::<f32, NC>::cast_from(scale);
+        out[(gr * size_n + gc) / out.vector_size()] = acc[i] * Vector::<f32, NC>::cast_from(scale);
     }
 }
 
@@ -201,7 +200,11 @@ pub fn fp4_linear_launch<R: Runtime>(
     n: usize,
     scale: f32,
 ) -> Handle {
-    assert_eq!(m_pad % MTILE, 0, "m_pad {m_pad} is not a multiple of {MTILE}");
+    assert_eq!(
+        m_pad % MTILE,
+        0,
+        "m_pad {m_pad} is not a multiple of {MTILE}"
+    );
     assert_eq!(n % NTILE, 0, "n {n} is not a multiple of {NTILE}");
     assert_eq!(k % KTILE, 0, "k {k} is not a multiple of {KTILE}");
 
@@ -271,7 +274,9 @@ fn gate_up_silu_launch_as<I: Scalar + Cast, O: Scalar + Cast + CubeElement, R: R
     inter: usize,
 ) -> Handle {
     // INK_W13_HALVED=1 selects the contiguous reading, for the A/B.
-    let halved = std::env::var("INK_W13_HALVED").map(|v| v == "1").unwrap_or(false);
+    let halved = std::env::var("INK_W13_HALVED")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     let n = m_pad * inter;
     let act = client.empty(n * core::mem::size_of::<O>());
     let threads = 256u32;
@@ -281,7 +286,11 @@ fn gate_up_silu_launch_as<I: Scalar + Cast, O: Scalar + Cast + CubeElement, R: R
             client,
             CubeCount::Static(blocks, 1, 1),
             CubeDim::new_1d(threads),
-            TensorArg::from_raw_parts(both.clone(), [2 * inter, 1].into(), [m_pad, 2 * inter].into()),
+            TensorArg::from_raw_parts(
+                both.clone(),
+                [2 * inter, 1].into(),
+                [m_pad, 2 * inter].into(),
+            ),
             TensorArg::from_raw_parts(act.clone(), [inter, 1].into(), [m_pad, inter].into()),
             inter,
             halved,
@@ -608,7 +617,10 @@ impl BindStats {
                 .map(|i| format!("{} at addr%4=={i}", self.unaligned[i]))
                 .collect();
             if !residues.is_empty() {
-                s.push_str(&format!("    copied because UNALIGNED: {}\n", residues.join(", ")));
+                s.push_str(&format!(
+                    "    copied because UNALIGNED: {}\n",
+                    residues.join(", ")
+                ));
             }
             if self.unmapped > 0 {
                 s.push_str(&format!(
@@ -626,7 +638,11 @@ impl Aliases {
     /// host memory directly.
     pub fn register<R: Runtime>(
         client: &ComputeClient<R>,
-        mappings: Vec<(usize, usize, std::sync::Arc<dyn core::any::Any + Send + Sync>)>,
+        mappings: Vec<(
+            usize,
+            usize,
+            std::sync::Arc<dyn core::any::Any + Send + Sync>,
+        )>,
     ) -> Option<Self> {
         if !cubecl::cuda::supports_zero_copy_host(0) {
             return None;
@@ -646,7 +662,10 @@ impl Aliases {
             };
             maps.push((base, len, h));
         }
-        Some(Aliases { maps, stats: BindCounters::default() })
+        Some(Aliases {
+            maps,
+            stats: BindCounters::default(),
+        })
     }
 
     /// An `Aliases` that aliases NOTHING, so the copying lane is still counted.
@@ -655,7 +674,10 @@ impl Aliases {
     /// spelled `None` at the call site and neither reports what it moved — the
     /// A/B has a measured side and an unmeasured one, which is not an A/B.
     pub fn disabled() -> Self {
-        Aliases { maps: Vec::new(), stats: BindCounters::default() }
+        Aliases {
+            maps: Vec::new(),
+            stats: BindCounters::default(),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -867,7 +889,11 @@ mod bind_tests {
     #[test]
     fn an_empty_run_has_no_alias_rate() {
         assert_eq!(BindStats::default().alias_fraction(), None);
-        let s = BindStats { alias_calls: 3, copy_calls: 1, ..Default::default() };
+        let s = BindStats {
+            alias_calls: 3,
+            copy_calls: 1,
+            ..Default::default()
+        };
         assert_eq!(s.alias_fraction(), Some(0.75));
     }
 }

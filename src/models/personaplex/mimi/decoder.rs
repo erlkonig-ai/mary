@@ -802,8 +802,8 @@ mod gpu {
 
         let mut k = i;
         while k < d {
-            y[(row + k) as usize] = (x[(row + k) as usize] - mean) * inv * w[k as usize]
-                + b[k as usize];
+            y[(row + k) as usize] =
+                (x[(row + k) as usize] - mean) * inv * w[k as usize] + b[k as usize];
             k += cube_dim;
         }
     }
@@ -1143,7 +1143,9 @@ mod gpu {
         fn upload(client: &q4::Client, c: &CpuTransConv) -> Self {
             assert_eq!(c.groups, 1, "dense transconv only");
             assert_eq!(c.k, 2 * c.stride, "SEANet transconvs are k = 2·stride");
-            let wt = c.wt.as_ref().expect("dense transconv keeps the [out·k, in] re-layout");
+            let wt =
+                c.wt.as_ref()
+                    .expect("dense transconv keeps the [out·k, in] re-layout");
             let b = c.b.as_ref().expect("SEANet transconvs are biased");
             Self {
                 wt: client.create_from_slice(as_bytes(&wt[..])),
@@ -1289,8 +1291,14 @@ mod gpu {
                 })
                 .collect();
 
-            let head = GpuConv::upload(&client, &CpuConv::load(loader, "decoder.model.0.conv.conv", 1));
-            let tail = GpuConv::upload(&client, &CpuConv::load(loader, "decoder.model.14.conv.conv", 1));
+            let head = GpuConv::upload(
+                &client,
+                &CpuConv::load(loader, "decoder.model.0.conv.conv", 1),
+            );
+            let tail = GpuConv::upload(
+                &client,
+                &CpuConv::load(loader, "decoder.model.14.conv.conv", 1),
+            );
 
             Self {
                 cos: client.create_from_slice(as_bytes(&cos)),
@@ -1320,7 +1328,10 @@ mod gpu {
             let t = codes.len();
             assert!(t > 0, "decode needs at least one frame");
             let n = 2 * t; // transformer positions (upsample doubles 12.5 → 25 Hz)
-            assert!(n <= MAX_POS, "RoPE table holds {MAX_POS} positions, got {n}");
+            assert!(
+                n <= MAX_POS,
+                "RoPE table holds {MAX_POS} positions, got {n}"
+            );
             let c = &self.client;
             let arr = |h: &Handle, len: usize| unsafe { ArrayArg::from_raw_parts(h.clone(), len) };
             let elems = |n: usize| c.empty(n * 4);
@@ -1461,7 +1472,14 @@ mod gpu {
             read_f32(&self.client, h, l)
         }
 
-        fn transpose(&self, src: &Handle, dst: &Handle, l: usize, ch: usize, to_channel_major: bool) {
+        fn transpose(
+            &self,
+            src: &Handle,
+            dst: &Handle,
+            l: usize,
+            ch: usize,
+            to_channel_major: bool,
+        ) {
             let total = (l * ch) as u32;
             unsafe {
                 transpose_kernel::launch_unchecked::<Rt>(
@@ -1477,8 +1495,20 @@ mod gpu {
             }
         }
 
-        fn conv1d(&self, conv: &GpuConv, x: &Handle, y: &Handle, l: usize, elu_in: bool, clamp: bool) {
-            let rows = if conv.out % ROWS as usize == 0 { ROWS } else { 1 };
+        fn conv1d(
+            &self,
+            conv: &GpuConv,
+            x: &Handle,
+            y: &Handle,
+            l: usize,
+            elu_in: bool,
+            clamp: bool,
+        ) {
+            let rows = if conv.out % ROWS as usize == 0 {
+                ROWS
+            } else {
+                1
+            };
             unsafe {
                 conv1d_kernel::launch_unchecked::<Rt>(
                     &self.client,
@@ -1501,7 +1531,8 @@ mod gpu {
 
         fn transformer(&self, h: &Handle, n: usize) {
             let c = &self.client;
-            let arr = |hh: &Handle, len: usize| unsafe { ArrayArg::from_raw_parts(hh.clone(), len) };
+            let arr =
+                |hh: &Handle, len: usize| unsafe { ArrayArg::from_raw_parts(hh.clone(), len) };
             let hd = HIDDEN;
             let xin = c.empty(n * hd * 4);
             let qkv = c.empty(n * 3 * hd * 4);
@@ -1742,9 +1773,7 @@ mod gpu_tests {
             s ^= s << 17;
             (s % CODEBOOK_SIZE as u64) as u32
         };
-        (0..t)
-            .map(|_| std::array::from_fn(|_| next()))
-            .collect()
+        (0..t).map(|_| std::array::from_fn(|_| next())).collect()
     }
 
     /// In-place iterative radix-2 FFT (magnitude spectrum is all we need).
@@ -1791,9 +1820,7 @@ mod gpu_tests {
     fn log_spectral_distance(a: &[f32], b: &[f32]) -> f64 {
         const N: usize = 512;
         let win: Vec<f32> = (0..N)
-            .map(|i| {
-                0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / N as f64).cos() as f32
-            })
+            .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / N as f64).cos() as f32)
             .collect();
         let (mut acc, mut cnt) = (0f64, 0usize);
         let mut off = 0;
@@ -1820,7 +1847,13 @@ mod gpu_tests {
     }
 
     pub(super) fn report(name: &str, cpu: &[f32], gpu: &[f32]) {
-        assert_eq!(cpu.len(), gpu.len(), "{name}: length {} vs {}", cpu.len(), gpu.len());
+        assert_eq!(
+            cpu.len(),
+            gpu.len(),
+            "{name}: length {} vs {}",
+            cpu.len(),
+            gpu.len()
+        );
         let (mut dot, mut na, mut nb, mut sd, mut maxabs) = (0f64, 0f64, 0f64, 0f64, 0f64);
         for (&x, &y) in cpu.iter().zip(gpu) {
             let (x, y) = (x as f64, y as f64);
@@ -1837,21 +1870,34 @@ mod gpu_tests {
             "  {name:14} n={:6}  cos={cos:.9}  relRMS={rel_rms:.3e}  max|Δ|={maxabs:.3e}  LSD={lsd:.4} dB",
             cpu.len()
         );
-        assert!(cos > 0.9999_9, "{name}: cosine {cos} — not the same waveform");
+        assert!(
+            cos > 0.9999_9,
+            "{name}: cosine {cos} — not the same waveform"
+        );
         assert!(rel_rms < 1e-3, "{name}: relative RMS {rel_rms} too large");
-        assert!(lsd < 0.5, "{name}: log-spectral distance {lsd} dB too large");
+        assert!(
+            lsd < 0.5,
+            "{name}: log-spectral distance {lsd} dB too large"
+        );
     }
 
     #[test]
     fn mimi_gpu_matches_cpu() {
         let Some(loader) = loader() else {
-            println!("SKIP mimi_gpu_matches_cpu: {}", crate::paths::skip_reason("personaplex.pile"));
+            println!(
+                "SKIP mimi_gpu_matches_cpu: {}",
+                crate::paths::skip_reason("personaplex.pile")
+            );
             return;
         };
         let cpu = MimiDecoder::load(&loader);
         let gpu = MimiDecoderGpu::load(&loader);
         println!("mimi decoder GPU vs CPU (f32 both; order-of-summation differences only):");
-        for (name, t, seed) in [("1 frame", 1usize, 12345u64), ("5 frames", 5, 999), ("25 frames", 25, 7)] {
+        for (name, t, seed) in [
+            ("1 frame", 1usize, 12345u64),
+            ("5 frames", 5, 999),
+            ("25 frames", 25, 7),
+        ] {
             let c = codes(t, seed);
             report(name, &cpu.decode(&c), &gpu.decode(&c));
         }
@@ -1863,7 +1909,10 @@ mod gpu_tests {
     #[test]
     fn mimi_gpu_bench() {
         let Some(loader) = loader() else {
-            println!("SKIP mimi_gpu_bench: {}", crate::paths::skip_reason("personaplex.pile"));
+            println!(
+                "SKIP mimi_gpu_bench: {}",
+                crate::paths::skip_reason("personaplex.pile")
+            );
             return;
         };
         let cpu = MimiDecoder::load(&loader);
@@ -1881,7 +1930,13 @@ mod gpu_tests {
         );
         println!(
             "  {:>6}  {:>24} {:>7}  {:>24} {:>7} {:>7}  {:>7}",
-            "frames", "CPU wall p50 [min..max]", "cpu-s", "GPU wall p50 [min..max]", "cpu-s", "submit", "speedup"
+            "frames",
+            "CPU wall p50 [min..max]",
+            "cpu-s",
+            "GPU wall p50 [min..max]",
+            "cpu-s",
+            "submit",
+            "speedup"
         );
         for t in [1usize, 5, 25] {
             let c = codes(t, 4242);
@@ -1990,7 +2045,10 @@ mod gpu_synth_tests {
         let mut m = Weights::new();
         let mut r = Rng(0x1234_5678_9abc_def0);
 
-        for (prefix, n_q) in [("quantizer.rvq_first", 1), ("quantizer.rvq_rest", N_ACOUSTIC)] {
+        for (prefix, n_q) in [
+            ("quantizer.rvq_first", 1),
+            ("quantizer.rvq_rest", N_ACOUSTIC),
+        ] {
             for q in 0..n_q {
                 put(
                     &mut m,
@@ -2014,7 +2072,13 @@ mod gpu_synth_tests {
                 fan(CODE_DIM),
             );
         }
-        put(&mut m, &mut r, "upsample.convtr.convtr.convtr.weight", &[HIDDEN, 1, 4], 0.5);
+        put(
+            &mut m,
+            &mut r,
+            "upsample.convtr.convtr.convtr.weight",
+            &[HIDDEN, 1, 4],
+            0.5,
+        );
 
         for i in 0..TR_LAYERS {
             let p = format!("decoder_transformer.transformer.layers.{i}");
@@ -2022,31 +2086,121 @@ mod gpu_synth_tests {
             put(&mut m, &mut r, &format!("{p}.norm1.bias"), &[HIDDEN], 0.05);
             put_const(&mut m, &format!("{p}.norm2.weight"), &[HIDDEN], 1.0);
             put(&mut m, &mut r, &format!("{p}.norm2.bias"), &[HIDDEN], 0.05);
-            put(&mut m, &mut r, &format!("{p}.self_attn.in_proj_weight"), &[3 * HIDDEN, HIDDEN], fan(HIDDEN));
-            put(&mut m, &mut r, &format!("{p}.self_attn.out_proj.weight"), &[HIDDEN, HIDDEN], fan(HIDDEN));
-            put(&mut m, &mut r, &format!("{p}.linear1.weight"), &[TR_INTER, HIDDEN], fan(HIDDEN));
-            put(&mut m, &mut r, &format!("{p}.linear2.weight"), &[HIDDEN, TR_INTER], fan(TR_INTER));
-            put(&mut m, &mut r, &format!("{p}.layer_scale_1.scale"), &[HIDDEN], 0.1);
-            put(&mut m, &mut r, &format!("{p}.layer_scale_2.scale"), &[HIDDEN], 0.1);
+            put(
+                &mut m,
+                &mut r,
+                &format!("{p}.self_attn.in_proj_weight"),
+                &[3 * HIDDEN, HIDDEN],
+                fan(HIDDEN),
+            );
+            put(
+                &mut m,
+                &mut r,
+                &format!("{p}.self_attn.out_proj.weight"),
+                &[HIDDEN, HIDDEN],
+                fan(HIDDEN),
+            );
+            put(
+                &mut m,
+                &mut r,
+                &format!("{p}.linear1.weight"),
+                &[TR_INTER, HIDDEN],
+                fan(HIDDEN),
+            );
+            put(
+                &mut m,
+                &mut r,
+                &format!("{p}.linear2.weight"),
+                &[HIDDEN, TR_INTER],
+                fan(TR_INTER),
+            );
+            put(
+                &mut m,
+                &mut r,
+                &format!("{p}.layer_scale_1.scale"),
+                &[HIDDEN],
+                0.1,
+            );
+            put(
+                &mut m,
+                &mut r,
+                &format!("{p}.layer_scale_2.scale"),
+                &[HIDDEN],
+                0.1,
+            );
         }
 
-        put(&mut m, &mut r, "decoder.model.0.conv.conv.weight", &[2 * HIDDEN, HIDDEN, 7], fan(HIDDEN * 7));
-        put(&mut m, &mut r, "decoder.model.0.conv.conv.bias", &[2 * HIDDEN], 0.01);
+        put(
+            &mut m,
+            &mut r,
+            "decoder.model.0.conv.conv.weight",
+            &[2 * HIDDEN, HIDDEN, 7],
+            fan(HIDDEN * 7),
+        );
+        put(
+            &mut m,
+            &mut r,
+            "decoder.model.0.conv.conv.bias",
+            &[2 * HIDDEN],
+            0.01,
+        );
         let mut dim = 2 * HIDDEN;
         for (i, &ratio) in DEC_RATIOS.iter().enumerate() {
             let (k, half, quarter) = (2 * ratio, dim / 2, dim / 4);
             let up = format!("decoder.model.{}.convtr.convtr", 3 * i + 2);
-            put(&mut m, &mut r, &format!("{up}.weight"), &[dim, half, k], fan(dim * k));
+            put(
+                &mut m,
+                &mut r,
+                &format!("{up}.weight"),
+                &[dim, half, k],
+                fan(dim * k),
+            );
             put(&mut m, &mut r, &format!("{up}.bias"), &[half], 0.01);
             let res = format!("decoder.model.{}", 3 * i + 3);
-            put(&mut m, &mut r, &format!("{res}.block.1.conv.conv.weight"), &[quarter, half, 3], fan(half * 3));
-            put(&mut m, &mut r, &format!("{res}.block.1.conv.conv.bias"), &[quarter], 0.01);
-            put(&mut m, &mut r, &format!("{res}.block.3.conv.conv.weight"), &[half, quarter, 1], fan(quarter));
-            put(&mut m, &mut r, &format!("{res}.block.3.conv.conv.bias"), &[half], 0.01);
+            put(
+                &mut m,
+                &mut r,
+                &format!("{res}.block.1.conv.conv.weight"),
+                &[quarter, half, 3],
+                fan(half * 3),
+            );
+            put(
+                &mut m,
+                &mut r,
+                &format!("{res}.block.1.conv.conv.bias"),
+                &[quarter],
+                0.01,
+            );
+            put(
+                &mut m,
+                &mut r,
+                &format!("{res}.block.3.conv.conv.weight"),
+                &[half, quarter, 1],
+                fan(quarter),
+            );
+            put(
+                &mut m,
+                &mut r,
+                &format!("{res}.block.3.conv.conv.bias"),
+                &[half],
+                0.01,
+            );
             dim = half;
         }
-        put(&mut m, &mut r, "decoder.model.14.conv.conv.weight", &[1, dim, 3], fan(dim * 3));
-        put(&mut m, &mut r, "decoder.model.14.conv.conv.bias", &[1], 0.01);
+        put(
+            &mut m,
+            &mut r,
+            "decoder.model.14.conv.conv.weight",
+            &[1, dim, 3],
+            fan(dim * 3),
+        );
+        put(
+            &mut m,
+            &mut r,
+            "decoder.model.14.conv.conv.bias",
+            &[1],
+            0.01,
+        );
 
         WeightLoader::Pile(m)
     }
@@ -2057,12 +2211,19 @@ mod gpu_synth_tests {
         let cpu = MimiDecoder::load(&loader);
         let gpu = MimiDecoderGpu::load(&loader);
         println!("mimi decoder GPU vs CPU on SYNTHETIC weights (device-portability gate):");
-        for (name, t, seed) in [("1 frame", 1usize, 5u64), ("3 frames", 3, 77), ("9 frames", 9, 31337)] {
+        for (name, t, seed) in [
+            ("1 frame", 1usize, 5u64),
+            ("3 frames", 3, 77),
+            ("9 frames", 9, 31337),
+        ] {
             let c = codes(t, seed);
             let a = cpu.decode(&c);
             // a decoder that emitted silence would pass any comparison
             let peak = a.iter().fold(0f32, |m, v| m.max(v.abs()));
-            assert!(peak > 1e-3, "{name}: CPU reference is silent (peak {peak}) — vacuous gate");
+            assert!(
+                peak > 1e-3,
+                "{name}: CPU reference is silent (peak {peak}) — vacuous gate"
+            );
             report(name, &a, &gpu.decode(&c));
         }
     }

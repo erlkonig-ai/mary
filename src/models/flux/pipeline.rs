@@ -123,7 +123,10 @@ impl FluxWeights {
         self.variant
     }
 
-    fn materialize(&self, index: &HashMap<String, Leaf>) -> HashMap<String, (Vec<f32>, Vec<usize>)> {
+    fn materialize(
+        &self,
+        index: &HashMap<String, Leaf>,
+    ) -> HashMap<String, (Vec<f32>, Vec<usize>)> {
         index
             .iter()
             .map(|(name, leaf)| (name.clone(), leaf.to_f32_shape()))
@@ -202,9 +205,7 @@ impl Flux2Pipeline {
         eprintln!("Phase 1: Text encoding...");
 
         let (prompt_embeds, seq_len) = match variant {
-            ModelVariant::Klein => {
-                Self::encode_text_klein::<B>(prompt, model_dir, weights, device)
-            }
+            ModelVariant::Klein => Self::encode_text_klein::<B>(prompt, model_dir, weights, device),
             ModelVariant::Dev => Self::encode_text_dev::<B>(prompt, model_dir, weights, device),
         };
 
@@ -855,8 +856,9 @@ mod tests {
             ],
         );
 
-        let snapshot = crate::model_collection::load_model_collection_local_latest(file.path(), test_team())
-            .expect("freeze native FLUX snapshot");
+        let snapshot =
+            crate::model_collection::load_model_collection_local_latest(file.path(), test_team())
+                .expect("freeze native FLUX snapshot");
         let weights = FluxWeights::from_snapshot(snapshot, ModelVariant::Klein)
             .expect("index all FLUX components");
 
@@ -886,8 +888,9 @@ mod tests {
                 9.0,
             )],
         );
-        let widened = crate::model_collection::load_model_collection_local_latest(file.path(), test_team())
-            .expect("load widened native FLUX snapshot");
+        let widened =
+            crate::model_collection::load_model_collection_local_latest(file.path(), test_team())
+                .expect("load widened native FLUX snapshot");
         let error = FluxWeights::from_snapshot(widened, ModelVariant::Klein)
             .err()
             .expect("a shadowed tensor must fail closed");

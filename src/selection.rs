@@ -630,7 +630,9 @@ mod tests {
         let leaf = match form {
             LeafForm::Typed => crate::format::put_raw(blobs, &[value], &[1]).unwrap(),
             LeafForm::TwoBlob => {
-                let data = blobs.put::<crate::format::F32Array, _>(vec![value]).unwrap();
+                let data = blobs
+                    .put::<crate::format::F32Array, _>(vec![value])
+                    .unwrap();
                 let shape = blobs.put::<crate::format::U64Array, _>(vec![1]).unwrap();
                 entity! { _ @ attrs::data: data, attrs::shape: shape }
             }

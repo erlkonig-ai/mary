@@ -294,8 +294,10 @@ mod imp {
             arg_str("--out").ok_or_else(|| anyhow::anyhow!("--out <dir> required with --lane"))?,
         );
         std::fs::create_dir_all(&out)?;
-        let pile =
-            mary::paths::model(std::env::var("QWEN3TTS_PILE").ok().as_deref(), "qwen3tts.pile")?;
+        let pile = mary::paths::model(
+            std::env::var("QWEN3TTS_PILE").ok().as_deref(),
+            "qwen3tts.pile",
+        )?;
         let pile = pile.as_path();
         let (prefill, steps) = (arg_usize("--prefill", 154), arg_usize("--steps", 32));
 
