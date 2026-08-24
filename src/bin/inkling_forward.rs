@@ -2235,7 +2235,37 @@ fn routed_experts_fp4(
     // to the same bits over a whole run; `INK_GROUPED=2` runs BOTH per layer
     // and prints where they part company, which is how a disagreement gets
     // located instead of argued about.
+    //
+    // Mode 2 REFUSES the narrow activation lane, and the refusal is the whole
+    // point of it. `3614c11` gave [`grouped_experts_fp4`] a BF16 staging arm
+    // under [`act_bf16`] and defaulted it ON; `per_expert_fp4` never grew one
+    // and still widens to f32. So at the default the A/B compared a BF16 lane
+    // against an f32 lane and printed 20480 of 20480 elements differing at rel
+    // ~1.99 -- the FP4 re-quantization of BF16-rounded activations, not a
+    // defect in either lane. Diagnosed 2026-08-24: forced wide, the two arms
+    // are ulp-equal at all 29 routed NVFP4 layers measured.
+    //
+    // An instrument that reads as "checked" while comparing two different
+    // precisions is worse than no instrument, and this is the only one left
+    // that can see a wrong expert selection or accumulation order -- the
+    // output-level gates were retired 2026-08-18 and this binary disagrees
+    // with ITSELF on 8.55% of argmax positions run to run. So it fails loud
+    // rather than printing a number nobody can interpret.
+    //
+    // NOTE the BF16-expert lane needs no such guard: `grouped_experts_bf16`
+    // has no `narrow` branch, so both its arms stay in one precision. That is
+    // why layer 2 was the only clean one, and it is a consequence of this same
+    // cause rather than a coincidence.
     let mode = std::env::var("INK_GROUPED").unwrap_or_else(|_| "1".to_string());
+    anyhow::ensure!(
+        mode != "2" || !mary::models::inkling::burn::act_bf16(),
+        "INK_GROUPED=2 compares the grouped lane against per_expert_fp4, but \
+         INK_ACT_BF16 is on, so the grouped arm stages activations in BF16 while \
+         the reference widens to f32. The comparison would be between two \
+         precisions and its output is meaningless. Re-run with INK_ACT_BF16=0 to \
+         put both arms on the wide lane. Note this certifies the WIDE lane only; \
+         the shipped narrow kernels still have no bit-exact reference arm."
+    );
     if mode != "0" {
         if let Some(al) = aliases {
             if let Some(acc) = grouped_experts_fp4(

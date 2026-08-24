@@ -111,6 +111,32 @@
 //! selection, the gather, the GEMM operand order and the accumulation ORDER are
 //! not approximations of anything, so a difference in any of them would be a
 //! defect. Only WHERE the two lanes round is exempt, and only by argument.
+//!
+//! **That claim carries a precondition, added 2026-08-24 after the two drifted
+//! apart unnoticed.** It holds against `per_expert_fp4` on the WIDE activation
+//! lane, i.e. `INK_ACT_BF16=0`. `3614c11` (2026-08-22) gave the grouped chain a
+//! BF16 staging arm under [`burn::act_bf16`] and defaulted it ON, four days
+//! after this paragraph was written, and never gave `per_expert_fp4` the
+//! matching arm — it still widens to f32 unconditionally. So at the default
+//! `INK_GROUPED=2` compared BF16 against f32 and reported 20480 of 20480
+//! elements differing at rel ~1.99: the FP4 re-quantization of BF16-rounded
+//! activations, NOT a defect. Forced wide, the arms are ulp-equal at all 29
+//! routed NVFP4 layers measured. The invariant was true when written and is
+//! true today — it was incomplete, not wrong — and `routed_experts_fp4` now
+//! refuses mode 2 unless the wide lane is selected.
+//!
+//! The BF16-expert lane needs no such precondition: [`grouped_experts_bf16`]
+//! has no `narrow` branch, so both its arms stay in one precision. That is why
+//! it stayed clean while every NVFP4 layer saturated.
+//!
+//! **What this does NOT cover, and it is the standing gap:** the kernels the
+//! DEFAULT lane actually runs — `gather_grouped_bf16_from_bf16`,
+//! `quantize_nvfp4_bf16`, `fp4_linear_grouped_bf16_launch`,
+//! `gate_up_silu_narrow_launch`, `scatter_weighted_bf16` — have no bit-exact
+//! reference arm at all. A wrong accumulation order *in the narrow branch
+//! specifically* is still undetectable. Closing that means giving
+//! `per_expert_fp4` a mirrored narrow arm, built so the wide arm still passes
+//! bit-clean as a control.
 
 use cubecl::ir::MatrixIdent;
 use cubecl::prelude::*;
