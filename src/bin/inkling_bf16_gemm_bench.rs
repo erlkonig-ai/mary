@@ -33,7 +33,7 @@ use cubecl::prelude::*;
 use half::bf16;
 
 use mary::models::inkling::bf16gemm::{
-    bf16_linear_launch, try_bf16_linear_cubek_launch, Lane, KTILE, MTILE, NTILE,
+    KTILE, Lane, MTILE, NTILE, bf16_linear_launch, try_bf16_linear_cubek_launch,
 };
 
 type Rt = cubecl::cuda::CudaRuntime;

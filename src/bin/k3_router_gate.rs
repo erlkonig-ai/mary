@@ -46,7 +46,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use mary::models::k3::router::{
-    bf16_bits_to_f32, Accum, Router, RouterActivation, RouterConfig, Scores, ScoresForChoice,
+    Accum, Router, RouterActivation, RouterConfig, Scores, ScoresForChoice, bf16_bits_to_f32,
 };
 use mary::nn::npz::{NpyArray, NpyData, Npz};
 use sha2::{Digest, Sha256};

@@ -28,8 +28,8 @@ use std::time::Instant;
 use anyhow::Result;
 use cubecl::prelude::*;
 
-use mary::models::inkling::fp4gemm::{fp4_linear_launch, upload_quantized_act, Aliases};
-use mary::models::inkling::nvfp4::{e4m3_to_f32, FP4_E2M1};
+use mary::models::inkling::fp4gemm::{Aliases, fp4_linear_launch, upload_quantized_act};
+use mary::models::inkling::nvfp4::{FP4_E2M1, e4m3_to_f32};
 use mary::models::inkling::source::Weights;
 
 type Rt = cubecl::cuda::CudaRuntime;

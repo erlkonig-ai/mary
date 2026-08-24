@@ -39,12 +39,14 @@ fn main() {
          st.save_file({{'w': w}}, {st:?})\n",
         st = st.to_str().unwrap()
     );
-    assert!(Command::new("python3")
-        .arg("-c")
-        .arg(&py)
-        .status()
-        .unwrap()
-        .success());
+    assert!(
+        Command::new("python3")
+            .arg("-c")
+            .arg(&py)
+            .status()
+            .unwrap()
+            .success()
+    );
 
     // 2. Import as f16 leaves under one signed native collection root.
     let pile = dir.join("tiny.pile");

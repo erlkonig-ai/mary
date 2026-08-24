@@ -21,11 +21,11 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use mary::models::inkling::attn::{causal_mask, AttnDims, AttnWeights, LogScaling};
+use mary::models::inkling::attn::{AttnDims, AttnWeights, LogScaling, causal_mask};
 use mary::models::inkling::block::rms_norm;
 use mary::models::inkling::config::AttnKind;
-use mary::models::inkling::layer::{decoder_layer, LayerMlp, LayerWeights};
-use mary::models::inkling::load::{split_gate_up, Checkpoint};
+use mary::models::inkling::layer::{LayerMlp, LayerWeights, decoder_layer};
+use mary::models::inkling::load::{Checkpoint, split_gate_up};
 use mary::models::inkling::stack::{embed_and_norm, head};
 
 const BUDGET: f32 = 1e-5;

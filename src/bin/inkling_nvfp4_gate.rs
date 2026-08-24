@@ -28,7 +28,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use mary::models::inkling::nvfp4::{
-    decode_stacked, e4m3_to_f32, split_byte, E4M3_MAX, FP4_E2M1, FP4_MAX, GROUP,
+    E4M3_MAX, FP4_E2M1, FP4_MAX, GROUP, decode_stacked, e4m3_to_f32, split_byte,
 };
 
 fn read_bytes(dir: &Path, name: &str) -> Result<Vec<u8>> {

@@ -65,9 +65,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use mary::nn::mxfp4::{
-    decode_mxfp4, decode_mxfp4_f16, decode_nvfp4, e4m3_from_pow2, e4m3_to_f32, e8m0_to_f32,
-    scale_exponent_range, transcode_to_nvfp4, Nvfp4, E2M1, E4M3_POW2_MAX, E4M3_POW2_MIN, MX_BLOCK,
-    NV_BLOCK,
+    E2M1, E4M3_POW2_MAX, E4M3_POW2_MIN, MX_BLOCK, NV_BLOCK, Nvfp4, decode_mxfp4, decode_mxfp4_f16,
+    decode_nvfp4, e4m3_from_pow2, e4m3_to_f32, e8m0_to_f32, scale_exponent_range,
+    transcode_to_nvfp4,
 };
 use sha2::{Digest, Sha256};
 

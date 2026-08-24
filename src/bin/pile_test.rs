@@ -9,7 +9,7 @@ use mary::ingest::{load_keymap, save_safetensors};
 use mary::models::f5::config::F5Config;
 use mary::models::f5::model::F5Transformer;
 use mary::nn::backend::B;
-use mary::nn::weight_loader::{read_safetensors_file, SingleFileLoader, WeightLoader};
+use mary::nn::weight_loader::{SingleFileLoader, WeightLoader, read_safetensors_file};
 use std::path::Path;
 use triblespace::prelude::*;
 

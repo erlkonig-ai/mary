@@ -9,13 +9,13 @@
 
 use burn::prelude::*;
 use burn::tensor::TensorData;
-use mary::ingest::{load_keymap, save_safetensors, LeafDtype};
+use mary::ingest::{LeafDtype, load_keymap, save_safetensors};
 use mary::models::qwen3tts::codec::CodecDecoder;
 use mary::models::qwen3tts::config::*;
 use mary::models::qwen3tts::talker::Talker;
 use mary::nn::backend::BFused as B;
 use mary::nn::npy;
-use mary::nn::weight_loader::{read_safetensors_file, SingleFileLoader, WeightLoader};
+use mary::nn::weight_loader::{SingleFileLoader, WeightLoader, read_safetensors_file};
 use std::path::Path;
 use triblespace::prelude::*;
 

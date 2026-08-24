@@ -38,8 +38,8 @@
 //!
 //! Build: `--features cuda-backend,mxfp4`.
 
-use cubecl::ir::{ElemType, FloatKind, StorageType};
 use cubecl::Runtime;
+use cubecl::ir::{ElemType, FloatKind, StorageType};
 
 use mary::nn::mxfp4::{MX_BLOCK, NV_BLOCK};
 

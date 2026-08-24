@@ -19,7 +19,7 @@
 //!     --test nomic_mm7b_preprocess_parity -- --nocapture
 
 use burn_ndarray::NdArray;
-use mary::models::qwen2_5_vl::preprocess::{build_image_prompt, preprocess_image, PATCH_DIM};
+use mary::models::qwen2_5_vl::preprocess::{PATCH_DIM, build_image_prompt, preprocess_image};
 use mary::nn::npy;
 use std::path::{Path, PathBuf};
 

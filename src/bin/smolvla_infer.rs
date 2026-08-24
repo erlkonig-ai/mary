@@ -13,8 +13,8 @@
 
 use burn::prelude::*;
 use burn::tensor::{Distribution, TensorData};
-use mary::models::smolvla::pipeline::{preprocess_image, SmolVla};
-use mary::nn::backend::{WgpuDevice, B};
+use mary::models::smolvla::pipeline::{SmolVla, preprocess_image};
+use mary::nn::backend::{B, WgpuDevice};
 use mary::nn::weight_loader::WeightLoader;
 
 const TOKENIZER: &str = concat!(

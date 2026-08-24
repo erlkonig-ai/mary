@@ -12,8 +12,8 @@
 //! Run: cargo run --release --features burn-cuda-bench --bin backend_matmul_probe
 
 use burn::prelude::*;
-use burn::tensor::backend::{Backend, BackendTypes};
 use burn::tensor::Distribution;
+use burn::tensor::backend::{Backend, BackendTypes};
 use std::time::Instant;
 
 const LAYERS: usize = 32;

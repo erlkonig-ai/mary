@@ -11,7 +11,7 @@
 use anyhow::{Context, Result};
 use burn::prelude::*;
 
-use mary::models::k3::attn_res::{round_bf16, stack_candidates, AttnResParams, DepthMixer};
+use mary::models::k3::attn_res::{AttnResParams, DepthMixer, round_bf16, stack_candidates};
 use mary::models::k3::config::K3Config;
 use mary::nn::npz::Npz;
 
@@ -59,11 +59,7 @@ fn max_abs_diff(what: &str, a: &[f32], b: &[f32]) -> f64 {
             m = d.abs();
         }
     }
-    if nan {
-        f64::NAN
-    } else {
-        m
-    }
+    if nan { f64::NAN } else { m }
 }
 
 fn max_abs(what: &str, a: &[f32]) -> f64 {
@@ -84,11 +80,7 @@ fn max_abs(what: &str, a: &[f32]) -> f64 {
 fn max_rel_diff(what: &str, got: &[f32], want: &[f32]) -> f64 {
     let s = max_abs(what, want);
     let d = max_abs_diff(what, got, want);
-    if s == 0.0 {
-        d
-    } else {
-        d / s
-    }
+    if s == 0.0 { d } else { d / s }
 }
 
 fn bits_equal(a: &[f32], b: &[f32]) -> bool {

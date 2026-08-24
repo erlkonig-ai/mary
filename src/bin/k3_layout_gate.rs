@@ -35,9 +35,9 @@ use anyhow::{Context, Result};
 use memmap2::Mmap;
 use safetensors::SafeTensors;
 
-use mary::models::k3::config::AttnKind;
-use mary::models::k3::layout::{for_each_slot, Dtype, LayerPart, MoePart, Shape, Slot};
 use mary::models::k3::K3Config;
+use mary::models::k3::config::AttnKind;
+use mary::models::k3::layout::{Dtype, LayerPart, MoePart, Shape, Slot, for_each_slot};
 
 /// Everything the gate needs about one checkpoint tensor.
 struct HeaderEntry {
@@ -262,11 +262,7 @@ fn negative_control(cfg: &K3Config, headers: &HashMap<String, HeaderEntry>) -> u
 }
 
 fn plural(n: usize) -> &'static str {
-    if n == 1 {
-        ""
-    } else {
-        "s"
-    }
+    if n == 1 { "" } else { "s" }
 }
 
 fn report(label: &str, problems: &[String]) -> usize {

@@ -27,8 +27,8 @@ use burn::prelude::*;
 use mary::models::gemma::gemma4::config::Gemma4Config;
 use mary::models::gemma::gemma4::weights::load_gemma4;
 use mary::models::gemma::lora::LoraWeights;
-use mary::nn::backend::BTrain as B;
 use mary::nn::backend::B as Inner;
+use mary::nn::backend::BTrain as B;
 use tokenizers::Tokenizer;
 
 fn try_hf_file(model_id: &str, filename: &str) -> Option<String> {

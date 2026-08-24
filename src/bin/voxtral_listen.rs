@@ -32,7 +32,7 @@ use mary::models::voxtral::fast::RealtimeTranscriber;
 use mary::models::voxtral::pipeline::{
     StreamedToken, StreamingTranscriber, SttPipeline, Transcriber,
 };
-use mary::nn::backend::{BFused, BFusedHalf, BHalf, B};
+use mary::nn::backend::{B, BFused, BFusedHalf, BHalf};
 use std::io::Write;
 use std::path::PathBuf;
 

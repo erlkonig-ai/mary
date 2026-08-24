@@ -50,7 +50,7 @@ use anyhow::{Context, Result};
 use cubecl::prelude::*;
 use half::bf16;
 
-use mary::models::inkling::bf16gemm::{bf16_linear_launch, upload_bf16_act, MTILE};
+use mary::models::inkling::bf16gemm::{MTILE, bf16_linear_launch, upload_bf16_act};
 use mary::models::inkling::fp4gemm::gate_up_silu_bf16_launch;
 
 type Rt = cubecl::cuda::CudaRuntime;

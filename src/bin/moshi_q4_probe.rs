@@ -30,12 +30,12 @@
 //! Env: Q4_ROUNDS (default 5), Q4_STEPS (default 8).
 
 use burn::prelude::*;
-use burn::tensor::backend::BackendTypes;
 use burn::tensor::Distribution;
-use cubecl::server::Handle;
+use burn::tensor::backend::BackendTypes;
 use cubecl::CubeElement;
+use cubecl::server::Handle;
 use mary::nn::backend::BHalf;
-use mary::nn::q4::{self, dequantize_q4, f16_matvec, quantize_q4, Q4Linear};
+use mary::nn::q4::{self, Q4Linear, dequantize_q4, f16_matvec, quantize_q4};
 use std::time::Instant;
 
 /// Deterministic pseudo-random f32 in (-scale, scale) — same generator as the

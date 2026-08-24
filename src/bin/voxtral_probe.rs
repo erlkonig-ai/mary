@@ -36,9 +36,9 @@ use mary::models::voxtral::config::*;
 use mary::models::voxtral::decoder::time_embedding;
 use mary::models::voxtral::fast::RealtimeTranscriber;
 use mary::models::voxtral::pipeline::{
-    pad_audio, prompt_ids, transcribe, SttPipeline, Transcriber,
+    SttPipeline, Transcriber, pad_audio, prompt_ids, transcribe,
 };
-use mary::nn::backend::{BFused, BFusedHalf, BHalf, B};
+use mary::nn::backend::{B, BFused, BFusedHalf, BHalf};
 use mary::nn::npy;
 use std::path::{Path, PathBuf};
 

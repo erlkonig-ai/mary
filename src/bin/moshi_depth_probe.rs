@@ -25,7 +25,7 @@
 //! f16 NEON pool, `MARY_PRED_THREADS` for the f32 Accelerate pool).
 
 use mary::models::personaplex::config as cfg;
-use mary::models::personaplex::depth::{argmax, DepthTransformer};
+use mary::models::personaplex::depth::{DepthTransformer, argmax};
 use mary::models::personaplex::depth_fast::DepthFast;
 use mary::models::personaplex::lmgen::StreamCache;
 use mary::models::personaplex::pipeline::{SILENCE, SINE};

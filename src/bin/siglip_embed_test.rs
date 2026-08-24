@@ -10,7 +10,7 @@
 //!    (the image's best-matching text is the true caption, "a cartoon mouse").
 //! 4. Print every cosine + PASS/FAIL.
 
-use mary::embed::{load_siglip_from_hf, LocalEmbedder, SIGLIP_DIM};
+use mary::embed::{LocalEmbedder, SIGLIP_DIM, load_siglip_from_hf};
 use mary::nn::backend::WgpuDevice;
 use std::process::Command;
 
@@ -157,9 +157,5 @@ fn main() {
 }
 
 fn mark(ok: bool) -> &'static str {
-    if ok {
-        "OK"
-    } else {
-        "<-- FAIL"
-    }
+    if ok { "OK" } else { "<-- FAIL" }
 }

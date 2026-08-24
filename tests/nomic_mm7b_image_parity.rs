@@ -25,7 +25,7 @@ use burn::prelude::*;
 use burn::tensor::TensorData;
 use burn_ndarray::{NdArray, NdArrayDevice};
 use mary::models::qwen2_5_vl::config::{Qwen2_5VlTextConfig, Qwen2_5VlVisionConfig};
-use mary::models::qwen2_5_vl::layers::{get_rope_index, QwenTextModel, QwenWeights};
+use mary::models::qwen2_5_vl::layers::{QwenTextModel, QwenWeights, get_rope_index};
 use mary::models::qwen2_5_vl::vision::{VisionTransformer, VisionWeights};
 use mary::nn::npy;
 use std::collections::HashMap;

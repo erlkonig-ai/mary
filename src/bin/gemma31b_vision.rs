@@ -16,10 +16,10 @@ use mary::models::gemma::gemma4::preprocess::pil_resize_bicubic;
 use std::path::Path;
 use std::process::Command;
 
-#[cfg(feature = "f16gen")]
-use mary::nn::backend::BHalf as B;
 #[cfg(not(feature = "f16gen"))]
 use mary::nn::backend::B;
+#[cfg(feature = "f16gen")]
+use mary::nn::backend::BHalf as B;
 
 fn find_hf_file(model_id: &str, filename: &str) -> String {
     let o = Command::new("python3")

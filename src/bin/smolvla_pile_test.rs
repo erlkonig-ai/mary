@@ -12,9 +12,9 @@ use burn::prelude::*;
 use burn::tensor::TensorData;
 use mary::ingest::{load_keymap, save_safetensors};
 use mary::models::smolvla::pipeline::SmolVla;
-use mary::nn::backend::{WgpuDevice, B};
+use mary::nn::backend::{B, WgpuDevice};
 use mary::nn::npy;
-use mary::nn::weight_loader::{read_safetensors_file, WeightLoader};
+use mary::nn::weight_loader::{WeightLoader, read_safetensors_file};
 use std::path::Path;
 use triblespace::prelude::*;
 

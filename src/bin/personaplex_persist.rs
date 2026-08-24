@@ -34,9 +34,9 @@
 //! shapes — the config file stays mechanically verified, not just documented.
 
 use mary::ingest::LeafDtype;
-use mary::models::personaplex::{config as cfg, PersonaPlexWeights, SOURCE};
-use safetensors::tensor::{Dtype, TensorView};
+use mary::models::personaplex::{PersonaPlexWeights, SOURCE, config as cfg};
 use safetensors::SafeTensors;
+use safetensors::tensor::{Dtype, TensorView};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Instant;

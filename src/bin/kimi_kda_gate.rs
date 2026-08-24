@@ -38,8 +38,8 @@
 use std::process::ExitCode;
 
 use mary::models::k3::kda::{
-    decay_gate, l2_normalize, rms_norm_gated, sigmoid, Elem, Kda, KdaConfig, KdaParams, KdaScratch,
-    KdaState, KdaToken, ShortConv, ShortConvState,
+    Elem, Kda, KdaConfig, KdaParams, KdaScratch, KdaState, KdaToken, ShortConv, ShortConvState,
+    decay_gate, l2_normalize, rms_norm_gated, sigmoid,
 };
 use mary::nn::npz::{NpyArray, Npz};
 

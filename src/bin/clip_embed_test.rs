@@ -10,7 +10,7 @@
 //!    (the image's best-matching text is the true caption).
 //! 4. Print every cosine + PASS/FAIL.
 
-use mary::embed::{load_clip_from_hf, LocalEmbedder, CLIP_DIM};
+use mary::embed::{CLIP_DIM, LocalEmbedder, load_clip_from_hf};
 use mary::nn::backend::WgpuDevice;
 use std::process::Command;
 
@@ -159,9 +159,5 @@ fn main() {
 }
 
 fn mark(ok: bool) -> &'static str {
-    if ok {
-        "OK"
-    } else {
-        "<-- FAIL"
-    }
+    if ok { "OK" } else { "<-- FAIL" }
 }

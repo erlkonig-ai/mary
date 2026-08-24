@@ -14,10 +14,10 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
-#[cfg(feature = "f16gen")]
-use mary::nn::backend::BHalf as B;
 #[cfg(not(feature = "f16gen"))]
 use mary::nn::backend::B;
+#[cfg(feature = "f16gen")]
+use mary::nn::backend::BHalf as B;
 
 const PROMPT: &str = "What is the capital of France? Answer in one word.";
 

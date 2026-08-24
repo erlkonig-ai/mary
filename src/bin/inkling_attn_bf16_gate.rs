@@ -54,11 +54,11 @@ use cubecl::cuda::CudaRuntime;
 use cubecl::prelude::ComputeClient;
 use half::bf16;
 
-use mary::models::inkling::attn::{attention, causal_mask, AttnDims, AttnWeights, LogScaling};
+use mary::models::inkling::attn::{AttnDims, AttnWeights, LogScaling, attention, causal_mask};
 use mary::models::inkling::bf16gemm::Bf16W;
 use mary::models::inkling::burn as dev_lane;
 use mary::models::inkling::config::AttnKind;
-use mary::models::inkling::seam::{client_of, Bk};
+use mary::models::inkling::seam::{Bk, client_of};
 
 /// Relative L2 budget for the BF16 lane against the f32 reference.
 ///

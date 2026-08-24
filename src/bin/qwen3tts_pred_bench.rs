@@ -31,7 +31,7 @@
 //! sets the pool width as usual.
 
 use mary::models::qwen3tts::config::*;
-use mary::models::qwen3tts::predictor::{set_down_serial, CodePredictor};
+use mary::models::qwen3tts::predictor::{CodePredictor, set_down_serial};
 #[cfg(feature = "predictor-gpu")]
 use mary::models::qwen3tts::predictor_gpu::{PredictorEngine, WeightMode};
 use mary::nn::weight_loader::WeightLoader;

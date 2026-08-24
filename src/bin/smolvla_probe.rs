@@ -11,7 +11,7 @@ use burn::prelude::*;
 use burn::tensor::TensorData;
 use mary::models::smolvla::config::SmolVlaConfig;
 use mary::models::smolvla::denoiser::ExpertDenoiser;
-use mary::models::smolvla::layers::{eager_gqa_attention, ExpertLayer, ROPE_MAX_WAVELENGTH};
+use mary::models::smolvla::layers::{ExpertLayer, ROPE_MAX_WAVELENGTH, eager_gqa_attention};
 use mary::models::smolvla::projections::Projections;
 use mary::models::smolvla::rope::apply_rope;
 use mary::models::smolvla::sampler::sample_actions;
@@ -19,8 +19,8 @@ use mary::models::smolvla::suffix::embed_suffix;
 use mary::models::smolvla::time::sinusoidal_time_embedding;
 use mary::models::smolvla::vision::VisionEncoder;
 use mary::models::smolvla::vlm::VlmTower;
-use mary::nn::backend::WgpuDevice;
 use mary::nn::backend::B;
+use mary::nn::backend::WgpuDevice;
 use mary::nn::npy;
 use mary::nn::weight_loader::{SingleFileLoader, WeightLoader};
 use std::path::{Path, PathBuf};
@@ -120,7 +120,7 @@ fn main() {
         let pk = loadt::<4>(&g.join("golden/prefix_kv0_key.npy"), &dev); // [1,Lp,5,64]
         let pv = loadt::<4>(&g.join("golden/prefix_kv0_value.npy"), &dev);
         let pos = loadt::<2>(&g.join("golden/denoise_position_ids.npy"), &dev); // [1,50]
-                                                                                // mask npy stored as 0/1; rebuild a Bool [1,50,Lp+50]
+        // mask npy stored as 0/1; rebuild a Bool [1,50,Lp+50]
         let (md, ms) = npy::load_npy(&g.join("golden/denoise_attn_mask.npy")).unwrap();
         let mask = Tensor::<B, 3>::from_data(TensorData::new(md, ms), &dev).greater_elem(0.5);
         // attention output (pre-o_proj) — isolates attn from the residual tail

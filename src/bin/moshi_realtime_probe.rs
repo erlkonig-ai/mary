@@ -33,7 +33,7 @@
 use burn::prelude::*;
 use burn::tensor::backend::BackendTypes;
 use mary::models::qwen3tts::layers::{AttnConfig, DecoderLayer, KvCache, RopeTable};
-use mary::nn::backend::{BFused, BFusedHalf, BHalf, B as BMetal};
+use mary::nn::backend::{B as BMetal, BFused, BFusedHalf, BHalf};
 use mary::nn::weight_loader::WeightLoader;
 use std::collections::HashMap;
 use std::time::Instant;

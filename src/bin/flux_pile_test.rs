@@ -7,10 +7,10 @@
 
 use burn::prelude::*;
 use mary::ingest::{load_keymap, save_safetensors};
-use mary::models::flux::transformer::config::Flux2TransformerConfig;
 use mary::models::flux::transformer::Flux2Transformer2DModel;
+use mary::models::flux::transformer::config::Flux2TransformerConfig;
 use mary::nn::backend::B;
-use mary::nn::weight_loader::{read_safetensors_file, WeightLoader};
+use mary::nn::weight_loader::{WeightLoader, read_safetensors_file};
 use std::path::PathBuf;
 use triblespace::prelude::*;
 

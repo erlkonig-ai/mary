@@ -253,9 +253,11 @@ mod tests {
         let bytes: Vec<u8> = (0..192).map(|index| index as u8).collect();
         let encoded = lowercase_hex(&bytes);
         assert_eq!(encoded.len(), 384);
-        assert!(encoded
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        assert!(
+            encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
         assert_eq!(&encoded[..8], "00010203");
         assert_eq!(&encoded[encoded.len() - 8..], "bcbdbebf");
     }

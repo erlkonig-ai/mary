@@ -36,7 +36,7 @@
 
 use std::path::PathBuf;
 
-use mary::tiktoken::{Rank, Tiktoken, KIMI_K3_PAT_STR};
+use mary::tiktoken::{KIMI_K3_PAT_STR, Rank, Tiktoken};
 use mary::tokenizer;
 use serde_json::Value;
 use triblespace::prelude::*;

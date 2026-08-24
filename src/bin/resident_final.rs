@@ -24,8 +24,8 @@
 use burn::backend::Cuda;
 use burn::prelude::*;
 use burn::tensor::FloatDType;
-use mary::models::k3::ckpt::Ckpt;
 use mary::models::k3::K3Config;
+use mary::models::k3::ckpt::Ckpt;
 
 type B = Cuda<f32>;
 

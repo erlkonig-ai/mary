@@ -17,8 +17,8 @@ mod native_embedding_collection;
 
 use ed25519_dalek::SigningKey;
 use mary::embed::{
-    hf_cache_main_snapshot, load_nomic_text_from_files, nomic_text_from_parts,
-    EmbeddingArchitecture, LocalEmbedder, NOMIC_TEXT_DIM,
+    EmbeddingArchitecture, LocalEmbedder, NOMIC_TEXT_DIM, hf_cache_main_snapshot,
+    load_nomic_text_from_files, nomic_text_from_parts,
 };
 use mary::nn::backend::WgpuDevice;
 use mary::selection::{ModelSelector, TokenizerSelector};
@@ -58,11 +58,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn mark(ok: bool) -> &'static str {
-    if ok {
-        "OK"
-    } else {
-        "<-- FAIL"
-    }
+    if ok { "OK" } else { "<-- FAIL" }
 }
 
 fn gib(bytes: u64) -> f64 {

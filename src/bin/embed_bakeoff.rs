@@ -10,7 +10,7 @@
 //! Point IMAGES at any three local test images with matching descriptions.
 
 use mary::embed::{
-    load_nomic_text_from_hf, load_nomic_vision_from_hf, load_siglip_from_hf, LocalEmbedder,
+    LocalEmbedder, load_nomic_text_from_hf, load_nomic_vision_from_hf, load_siglip_from_hf,
 };
 use mary::nn::backend::WgpuDevice;
 

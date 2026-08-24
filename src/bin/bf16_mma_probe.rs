@@ -21,11 +21,11 @@
 //! Build: `--features inkling-cuda,cuda-backend,import`
 //! Run:   `bf16_mma_probe [<checkpoint dir>]`
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use cubecl::prelude::*;
 use half::bf16;
 
-use mary::models::inkling::bf16gemm::{bf16_linear_launch, KTILE, MTILE, NTILE};
+use mary::models::inkling::bf16gemm::{KTILE, MTILE, NTILE, bf16_linear_launch};
 
 type Rt = cubecl::cuda::CudaRuntime;
 

@@ -32,9 +32,9 @@ use anyhow::Result;
 use cubecl::prelude::*;
 
 use mary::models::inkling::fp4gemm::{
-    fp4_linear_launch, gate_up_silu_launch, quantize_act_host, upload_quantized_act, GROUP, MTILE,
+    GROUP, MTILE, fp4_linear_launch, gate_up_silu_launch, quantize_act_host, upload_quantized_act,
 };
-use mary::models::inkling::nvfp4::{e4m3_to_f32, FP4_E2M1};
+use mary::models::inkling::nvfp4::{FP4_E2M1, e4m3_to_f32};
 
 type Rt = cubecl::cuda::CudaRuntime;
 

@@ -34,7 +34,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use mary::nn::mxfp4::{scale_exponent_range, E4M3_POW2_MAX, E4M3_POW2_MIN, E4M3_POW2_MIN_NORMAL};
+use mary::nn::mxfp4::{E4M3_POW2_MAX, E4M3_POW2_MIN, E4M3_POW2_MIN_NORMAL, scale_exponent_range};
 
 /// Octaves E4M3FN can hold exactly, and the narrower budget that also keeps
 /// every block scale a *normal* E4M3 (no subnormal-flush hazard).

@@ -23,7 +23,7 @@
 
 use mary::ingest::LeafDtype;
 use mary::leaf::Elem;
-use mary::models::voxtral::{VoxtralWeights, QUANTIZATION_F16, SOURCE};
+use mary::models::voxtral::{QUANTIZATION_F16, SOURCE, VoxtralWeights};
 use mary::selection::{ModelSelector, SelectedModelIndex};
 use safetensors::{Dtype, SafeTensors};
 use std::collections::BTreeSet;

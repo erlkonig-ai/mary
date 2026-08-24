@@ -57,14 +57,14 @@ use std::collections::{BTreeSet, HashMap};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use burn::prelude::*;
 use memmap2::Mmap;
 use safetensors::SafeTensors;
 
-use mary::models::k3::attn_res::{round_bf16, stack_candidates, AttnResParams, DepthMixer};
+use mary::models::k3::attn_res::{AttnResParams, DepthMixer, round_bf16, stack_candidates};
 use mary::models::k3::layout::LayerPart;
-use mary::models::k3::{describe, Dtype, K3Config, Slot};
+use mary::models::k3::{Dtype, K3Config, Slot, describe};
 use mary::nn::npz::Npz;
 
 // ---------------------------------------------------------------------------
@@ -181,11 +181,7 @@ fn max_abs_diff(what: &str, a: &[f32], b: &[f32]) -> f64 {
             m = d.abs();
         }
     }
-    if nan {
-        f64::NAN
-    } else {
-        m
-    }
+    if nan { f64::NAN } else { m }
 }
 
 /// Largest magnitude in an array — the scale a relative budget is taken against.
@@ -201,11 +197,7 @@ fn max_abs(what: &str, a: &[f32]) -> f64 {
             m = v;
         }
     }
-    if nan {
-        f64::NAN
-    } else {
-        m
-    }
+    if nan { f64::NAN } else { m }
 }
 
 /// Smallest non-zero magnitude — the low end of the rounding domain check.
@@ -256,11 +248,7 @@ fn bf16_to_f32(b: u16) -> f32 {
 /// is "adjacent integers" across the sign boundary as well as within a sign.
 fn bf16_key(b: u16) -> i32 {
     let mag = (b & 0x7FFF) as i32;
-    if b & 0x8000 != 0 {
-        -mag
-    } else {
-        mag
-    }
+    if b & 0x8000 != 0 { -mag } else { mag }
 }
 
 /// Max distance in bfloat16 ulp, and how many elements are not bit-identical.

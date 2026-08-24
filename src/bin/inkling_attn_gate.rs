@@ -32,7 +32,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use mary::models::inkling::attn::{attention, causal_mask, AttnDims, AttnWeights, LogScaling};
+use mary::models::inkling::attn::{AttnDims, AttnWeights, LogScaling, attention, causal_mask};
 use mary::models::inkling::config::AttnKind;
 
 const BUDGET: f32 = 1e-6;

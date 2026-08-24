@@ -157,7 +157,7 @@ mod tests {
     use super::*;
     use crate::native_embedding_collection::publish_embedding_candidate_with_contract as publish_embedding_candidate;
     use mary::selection::{ModelSelector, TokenizerSelector};
-    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+    use safetensors::tensor::{Dtype, TensorView, serialize_to_file};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
 

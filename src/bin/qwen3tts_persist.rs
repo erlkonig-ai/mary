@@ -29,7 +29,7 @@ mod imp {
     use mary::nn::backend::{BFusedHalf, WgpuDevice};
     use mary::nn::weight_loader::{AliasedPile, WeightLoader};
     use mary::selection::ModelSelector;
-    use mary::speak::{Qwen3TtsVariant, Qwen3TtsWeights, QUANTIZATION_F16};
+    use mary::speak::{QUANTIZATION_F16, Qwen3TtsVariant, Qwen3TtsWeights};
     use std::path::Path;
     use std::time::Instant;
     use triblespace::core::repo::pile::Pile;

@@ -40,7 +40,7 @@ use safetensors::SafeTensors;
 
 use mary::models::inkling::config::{AttnKind, InklingConfig};
 use mary::models::inkling::layout::{
-    describe, for_each_slot, Dtype, ExpertMat, QuantPart, Shape, Slot,
+    Dtype, ExpertMat, QuantPart, Shape, Slot, describe, for_each_slot,
 };
 
 struct HeaderEntry {

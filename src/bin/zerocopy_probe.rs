@@ -10,9 +10,9 @@
 //!
 //! macOS / Metal only (unified memory).
 
-use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 use cubecl::Runtime;
-use std::alloc::{alloc, dealloc, Layout};
+use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+use std::alloc::{Layout, alloc, dealloc};
 
 const PAGE: usize = 16384; // Apple Silicon page size
 const N: usize = 256; // f32 values

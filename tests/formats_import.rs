@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ed25519_dalek::SigningKey;
 use mary::selection::ModelSelector;
-use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+use safetensors::tensor::{Dtype, TensorView, serialize_to_file};
 use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::repo::pile::Pile;
 

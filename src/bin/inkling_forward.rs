@@ -1100,14 +1100,14 @@ use anyhow::{Context, Result};
 
 use mary::models::inkling::attn::{AttnDims, AttnWeights, LogScaling};
 use mary::models::inkling::bf16gemm::Bf16W;
-use mary::models::inkling::block::{rms_norm, route_from_logits, Routing};
+use mary::models::inkling::block::{Routing, rms_norm, route_from_logits};
 use mary::models::inkling::budget;
 use mary::models::inkling::config::{AttnKind, InklingConfig};
 use mary::models::inkling::fatal;
 use mary::models::inkling::layer::{LayerMlp, LayerWeights};
-use mary::models::inkling::load::{split_gate_up, Held};
+use mary::models::inkling::load::{Held, split_gate_up};
 use mary::models::inkling::mtp::{
-    mtp_block, mtp_block_prefill, mtp_block_step, Concat as MtpConcat, MtpCache, MtpHead,
+    Concat as MtpConcat, MtpCache, MtpHead, mtp_block, mtp_block_prefill, mtp_block_step,
 };
 use mary::models::inkling::pile::Elem;
 use mary::models::inkling::source::Weights;
@@ -1446,11 +1446,7 @@ impl MtpOwned {
     /// and grow its cache without bound, which is the kind of bug that only
     /// ever shows up as a memory graph.
     fn window(&self, sliding: usize) -> Option<usize> {
-        if self.local {
-            Some(sliding)
-        } else {
-            None
-        }
+        if self.local { Some(sliding) } else { None }
     }
 
     /// Borrow this head in the shape `mtp_block` wants.
@@ -3369,7 +3365,7 @@ fn per_expert_fp4(
     inter: usize,
     host: &mut HostT,
 ) -> Result<T2> {
-    use mary::models::inkling::fp4gemm::{fp4_linear_launch, gate_up_silu_launch, MTILE};
+    use mary::models::inkling::fp4gemm::{MTILE, fp4_linear_launch, gate_up_silu_launch};
     use mary::models::inkling::fp4quant::quantize_nvfp4;
     use mary::models::inkling::pad::gather_rows_pad;
     use mary::models::inkling::seam::{handle_of, int_handle_of, tensor_of};
@@ -3676,7 +3672,7 @@ fn per_expert_bf16(
     inter: usize,
     host: &mut HostT,
 ) -> Result<T2> {
-    use mary::models::inkling::bf16gemm::{bf16_linear_launch, to_bf16_launch, MTILE};
+    use mary::models::inkling::bf16gemm::{MTILE, bf16_linear_launch, to_bf16_launch};
     use mary::models::inkling::fp4gemm::gate_up_silu_bf16_launch;
     use mary::models::inkling::pad::gather_rows_pad;
     use mary::models::inkling::seam::{handle_of, int_handle_of, tensor_of};
@@ -5134,9 +5130,10 @@ fn main() -> Result<()> {
             // drafts for the positions after it. `drafts_in` is empty unless this
             // is a speculating head, so the non-speculative shape is the same one
             // row it always was.
-            let mut f = vec![*ids
-                .last()
-                .expect("a step past the prefill has produced a token")];
+            let mut f = vec![
+                *ids.last()
+                    .expect("a step past the prefill has produced a token"),
+            ];
             f.extend(drafts_in.iter().copied());
             // The width probe's filler. Drawn from a counter rather than from the
             // sequence: a batch of the same token routes to the same eight experts

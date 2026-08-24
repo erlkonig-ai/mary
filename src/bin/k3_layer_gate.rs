@@ -79,14 +79,14 @@
 
 use burn::backend::NdArray;
 use burn::prelude::*;
-use mary::models::k3::attn_res::{stack_candidates, AttnResParams, DepthMixer};
+use mary::models::k3::attn_res::{AttnResParams, DepthMixer, stack_candidates};
 use mary::models::k3::ckpt::Ckpt;
 use mary::models::k3::kda::{Kda, KdaParams, KdaScratch, KdaState, KdaToken};
 use mary::models::k3::kda_attn::{KdaAttnConfig, KdaCache};
 use mary::models::k3::layer::{K3Attn, K3DecoderLayer, K3Ffn, K3FfnTrace};
 use mary::models::k3::mla::{MlaBlock, MlaConfig, MlaKvCache, Precision};
 use mary::models::k3::moe::{BlockTrace, LatentMoe, MoeDims, Routing as MoeRouting};
-use mary::models::k3::ops::{linear, rms_norm, ActRound};
+use mary::models::k3::ops::{ActRound, linear, rms_norm};
 use mary::models::k3::router::{Accum, Router, RouterConfig};
 use mary::models::k3::{AttnKind, K3Config, KdaAttention};
 use mary::nn::npz::{NpyData, Npz};

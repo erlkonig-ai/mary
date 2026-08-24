@@ -70,13 +70,13 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use cubecl::cuda::CudaRuntime;
 use cubecl::prelude::*;
 
-use mary::models::inkling::fp4quant::{quantize_nvfp4, E4M3_MAX, FP4_MAX, GROUP};
-use mary::models::inkling::nvfp4::{decode_row, e4m3_to_f32, FP4_E2M1};
+use mary::models::inkling::fp4quant::{E4M3_MAX, FP4_MAX, GROUP, quantize_nvfp4};
+use mary::models::inkling::nvfp4::{FP4_E2M1, decode_row, e4m3_to_f32};
 
 // ---------------------------------------------------------------------------
 // safetensors: header parse + positioned reads (same shape as nvfp4_mma_probe;

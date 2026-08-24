@@ -21,7 +21,7 @@ mod native_model_fixture;
 use crate::native_model_fixture::import_native_model_fixture;
 use mary::models::gemma::gemma4::config::Gemma4Config;
 use mary::models::gemma::gemma4::lm::GemmaLM;
-use mary::nn::backend::{WgpuDevice, B};
+use mary::nn::backend::{B, WgpuDevice};
 use mary::selection::ModelSelector;
 use std::path::Path;
 use std::process::Command;

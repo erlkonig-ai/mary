@@ -63,14 +63,14 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use cubecl::cuda::CudaRuntime;
 use cubecl::ir::MatrixIdent;
 use cubecl::prelude::*;
 use cubecl::{e2m1x2, e4m3};
 
-use mary::models::inkling::nvfp4::{e4m3_to_f32, FP4_E2M1, GROUP};
+use mary::models::inkling::nvfp4::{FP4_E2M1, GROUP, e4m3_to_f32};
 
 /// NVFP4 block-scaled MMA, m16n8k64, accumulating over `k_tiles` tiles of k=64.
 ///

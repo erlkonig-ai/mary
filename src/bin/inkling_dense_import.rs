@@ -28,10 +28,10 @@
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use mary::models::inkling::load::Checkpoint;
-use mary::models::inkling::pile::{attrs, layer_of, PileSource};
-use triblespace::core::blob::encodings::tensor::elements::{BF16, F32};
-use triblespace::core::blob::encodings::tensor::{tensor_blob, TensorView};
+use mary::models::inkling::pile::{PileSource, attrs, layer_of};
 use triblespace::core::blob::TryFromBlob;
+use triblespace::core::blob::encodings::tensor::elements::{BF16, F32};
+use triblespace::core::blob::encodings::tensor::{TensorView, tensor_blob};
 use triblespace::core::metadata;
 use triblespace::macros::entity;
 use triblespace::prelude::*;
