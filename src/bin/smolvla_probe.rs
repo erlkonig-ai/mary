@@ -25,7 +25,10 @@ use mary::nn::npy;
 use mary::nn::weight_loader::{SingleFileLoader, WeightLoader};
 use std::path::{Path, PathBuf};
 
-const CKPT: &str = concat!(env!("HOME"), "/.cache/huggingface/hub/models--lerobot--smolvla_base/snapshots/c83c3163b8ca9b7e67c509fffd9121e66cb96205/model.safetensors");
+const CKPT: &str = concat!(
+    env!("HOME"),
+    "/.cache/huggingface/hub/models--lerobot--smolvla_base/snapshots/c83c3163b8ca9b7e67c509fffd9121e66cb96205/model.safetensors"
+);
 const MIN_PERIOD: f64 = 4e-3;
 const MAX_PERIOD: f64 = 4.0;
 

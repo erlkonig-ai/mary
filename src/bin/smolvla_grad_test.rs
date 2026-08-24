@@ -14,7 +14,10 @@ use mary::nn::backend::BTrain as B;
 use mary::nn::weight_loader::{SingleFileLoader, WeightLoader};
 use std::path::Path;
 
-const CKPT: &str = concat!(env!("HOME"), "/.cache/huggingface/hub/models--lerobot--smolvla_base/snapshots/c83c3163b8ca9b7e67c509fffd9121e66cb96205/model.safetensors");
+const CKPT: &str = concat!(
+    env!("HOME"),
+    "/.cache/huggingface/hub/models--lerobot--smolvla_base/snapshots/c83c3163b8ca9b7e67c509fffd9121e66cb96205/model.safetensors"
+);
 
 fn main() {
     let dev = Default::default();
@@ -53,5 +56,7 @@ fn main() {
         gw_norm > 0.0 && gb_norm > 0.0,
         "no gradient flowed — autodiff path broken"
     );
-    println!("✓ gradients flow into the expert weights under Autodiff<Metal> — retarget autodiff path is viable.");
+    println!(
+        "✓ gradients flow into the expert weights under Autodiff<Metal> — retarget autodiff path is viable."
+    );
 }

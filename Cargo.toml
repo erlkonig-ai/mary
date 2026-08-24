@@ -1,7 +1,7 @@
 [package]
 name = "mary"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "Neural-network models as content-addressed graphs in TribleSpace. A tensor is a self-describing Array<F32> leaf; a module is an entity; composition is role-edges. Named for Mary — both Mary Wollstonecraft Shelley, who wrote the creature into being, and her mother Mary Wollstonecraft. The format in which dead weights become a living, recomposable model-graph; the franken-stitch is the spark."
 license = "MIT OR Apache-2.0"
 

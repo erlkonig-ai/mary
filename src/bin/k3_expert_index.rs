@@ -181,7 +181,9 @@ fn main() {
         fail += 1;
     }
     if fail > 0 {
-        println!("\nNO BANDWIDTH NUMBER IS REPORTED: the address book did not reproduce the known invariants.");
+        println!(
+            "\nNO BANDWIDTH NUMBER IS REPORTED: the address book did not reproduce the known invariants."
+        );
         std::process::exit(1);
     }
     println!("GATE PASS: {n_experts} experts, every one exactly {EXPERT_BYTES} bytes\n");

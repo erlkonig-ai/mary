@@ -224,7 +224,7 @@ fn import(a: ImportArgs) -> anyhow::Result<()> {
         (Err(error), Err(close_error)) => {
             return Err(error.context(format!(
                 "import also failed to close the pile: {close_error}"
-            )))
+            )));
         }
     };
     eprintln!(

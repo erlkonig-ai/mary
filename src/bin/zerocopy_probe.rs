@@ -66,7 +66,11 @@ fn main() {
     let bytes2 = client.read_one(handle).expect("re-read aliased handle");
     let got2 = as_f32(&bytes2);
     let ok2 = (got2[0] - 999.0).abs() < 1e-3 && (got2[N - 1] + 999.0).abs() < 1e-3;
-    println!("[alias] host mutation visible on GPU (true zero-copy alias): {ok2}  (got2[0]={}, got2[last]={})", got2[0], got2[N - 1]);
+    println!(
+        "[alias] host mutation visible on GPU (true zero-copy alias): {ok2}  (got2[0]={}, got2[last]={})",
+        got2[0],
+        got2[N - 1]
+    );
 
     // SAFETY: all GPU reads done; release the host allocation.
     unsafe { dealloc(ptr as *mut u8, layout) };

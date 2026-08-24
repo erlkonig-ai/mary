@@ -102,93 +102,79 @@ fn run<B: Backend>(args: &Args) {
     // t_start is set when generation begins (after prefill assembly starts);
     // TTFA is measured from there — model load excluded, prefill included.
     let t_start = Instant::now();
-    let codec_thread =
-        std::thread::spawn(move || {
-            mary::models::qwen3tts::cpu::set_interactive_qos();
-            let cdev = WgpuDevice::default();
-            // the main thread is done with the pile keymap — it moves in here
-            let codec = CodecDecoder::<BFused>::load(&loader, &cdev);
-            // warm the decode path at the steady-state chunk shape (shader
-            // compile + autotune land here, not in the first real chunk — the
-            // first decode was measured ~0.8 s cold vs ~40 ms warm)
-            let _ = codec.decode(&vec![[0u32; NUM_CODE_GROUPS]; ctx + hop], &cdev);
-            let mut stdout = std::io::stdout();
-            let emit_pcm = pcm && !std::io::stdout().is_terminal();
+    let codec_thread = std::thread::spawn(move || {
+        mary::models::qwen3tts::cpu::set_interactive_qos();
+        let cdev = WgpuDevice::default();
+        // the main thread is done with the pile keymap — it moves in here
+        let codec = CodecDecoder::<BFused>::load(&loader, &cdev);
+        // warm the decode path at the steady-state chunk shape (shader
+        // compile + autotune land here, not in the first real chunk — the
+        // first decode was measured ~0.8 s cold vs ~40 ms warm)
+        let _ = codec.decode(&vec![[0u32; NUM_CODE_GROUPS]; ctx + hop], &cdev);
+        let mut stdout = std::io::stdout();
+        let emit_pcm = pcm && !std::io::stdout().is_terminal();
 
-            // history = ref codes ++ generated codes; decode windows slide over it
-            let mut history = ref_codes;
-            let mut decoded_upto = history.len(); // frame index of first undecoded frame
-            let mut out_samples: Vec<f32> = Vec::new();
-            let mut ttfa = 0f64;
-            let (mut min_margin, mut underruns, mut chunks) = (f64::MAX, 0usize, 0usize);
+        // history = ref codes ++ generated codes; decode windows slide over it
+        let mut history = ref_codes;
+        let mut decoded_upto = history.len(); // frame index of first undecoded frame
+        let mut out_samples: Vec<f32> = Vec::new();
+        let mut ttfa = 0f64;
+        let (mut min_margin, mut underruns, mut chunks) = (f64::MAX, 0usize, 0usize);
 
-            let mut flush =
-                |history: &[[u32; NUM_CODE_GROUPS]],
-                 from: usize,
-                 to: usize,
-                 out_samples: &mut Vec<f32>,
-                 ttfa: &mut f64,
-                 min_margin: &mut f64,
-                 underruns: &mut usize,
-                 chunks: &mut usize| {
-                    let c = ctx.min(from);
-                    let td = Instant::now();
-                    let wav = codec.decode(&history[from - c..to], &cdev);
-                    let pcm = &wav[c * SAMPLES_PER_FRAME..];
-                    let ready = t_start.elapsed().as_secs_f64();
-                    if *chunks == 0 {
-                        *ttfa = ready;
-                        eprintln!(
-                            "TTFA: {:.2}s (decode {:.0}ms)",
-                            ready,
-                            td.elapsed().as_secs_f64() * 1e3
-                        );
-                    } else {
-                        // playback clock starts at TTFA; this chunk's audio starts at
-                        // its first sample's position in the output stream
-                        let audio_pos = out_samples.len() as f64 / SAMPLE_RATE as f64;
-                        let margin = *ttfa + audio_pos - ready;
-                        *min_margin = min_margin.min(margin);
-                        if margin < 0.0 {
-                            *underruns += 1;
-                        }
-                        eprintln!(
-                    "chunk {:3}: frames {}..{} ready {:.2}s margin {:+.2}s (decode {:.0}ms)",
-                    chunks, from, to, ready, margin,
+        let mut flush = |history: &[[u32; NUM_CODE_GROUPS]],
+                         from: usize,
+                         to: usize,
+                         out_samples: &mut Vec<f32>,
+                         ttfa: &mut f64,
+                         min_margin: &mut f64,
+                         underruns: &mut usize,
+                         chunks: &mut usize| {
+            let c = ctx.min(from);
+            let td = Instant::now();
+            let wav = codec.decode(&history[from - c..to], &cdev);
+            let pcm = &wav[c * SAMPLES_PER_FRAME..];
+            let ready = t_start.elapsed().as_secs_f64();
+            if *chunks == 0 {
+                *ttfa = ready;
+                eprintln!(
+                    "TTFA: {:.2}s (decode {:.0}ms)",
+                    ready,
                     td.elapsed().as_secs_f64() * 1e3
                 );
-                    }
-                    *chunks += 1;
-                    if emit_pcm {
-                        let bytes: Vec<u8> = pcm
-                            .iter()
-                            .flat_map(|&s| (((s.clamp(-1.0, 1.0)) * 32767.0) as i16).to_le_bytes())
-                            .collect();
-                        let _ = stdout.write_all(&bytes);
-                        let _ = stdout.flush();
-                    }
-                    out_samples.extend_from_slice(pcm);
-                };
-
-            while let Ok(frame) = rx.recv() {
-                history.push(frame);
-                if history.len() - decoded_upto >= hop {
-                    let (from, to) = (decoded_upto, history.len());
-                    flush(
-                        &history,
-                        from,
-                        to,
-                        &mut out_samples,
-                        &mut ttfa,
-                        &mut min_margin,
-                        &mut underruns,
-                        &mut chunks,
-                    );
-                    decoded_upto = to;
+            } else {
+                // playback clock starts at TTFA; this chunk's audio starts at
+                // its first sample's position in the output stream
+                let audio_pos = out_samples.len() as f64 / SAMPLE_RATE as f64;
+                let margin = *ttfa + audio_pos - ready;
+                *min_margin = min_margin.min(margin);
+                if margin < 0.0 {
+                    *underruns += 1;
                 }
+                eprintln!(
+                    "chunk {:3}: frames {}..{} ready {:.2}s margin {:+.2}s (decode {:.0}ms)",
+                    chunks,
+                    from,
+                    to,
+                    ready,
+                    margin,
+                    td.elapsed().as_secs_f64() * 1e3
+                );
             }
-            // final partial chunk
-            if history.len() > decoded_upto {
+            *chunks += 1;
+            if emit_pcm {
+                let bytes: Vec<u8> = pcm
+                    .iter()
+                    .flat_map(|&s| (((s.clamp(-1.0, 1.0)) * 32767.0) as i16).to_le_bytes())
+                    .collect();
+                let _ = stdout.write_all(&bytes);
+                let _ = stdout.flush();
+            }
+            out_samples.extend_from_slice(pcm);
+        };
+
+        while let Ok(frame) = rx.recv() {
+            history.push(frame);
+            if history.len() - decoded_upto >= hop {
                 let (from, to) = (decoded_upto, history.len());
                 flush(
                     &history,
@@ -200,19 +186,35 @@ fn run<B: Backend>(args: &Args) {
                     &mut underruns,
                     &mut chunks,
                 );
+                decoded_upto = to;
             }
-            StreamStats {
-                samples: out_samples,
-                ttfa,
-                min_margin: if min_margin == f64::MAX {
-                    0.0
-                } else {
-                    min_margin
-                },
-                underruns,
-                chunks,
-            }
-        });
+        }
+        // final partial chunk
+        if history.len() > decoded_upto {
+            let (from, to) = (decoded_upto, history.len());
+            flush(
+                &history,
+                from,
+                to,
+                &mut out_samples,
+                &mut ttfa,
+                &mut min_margin,
+                &mut underruns,
+                &mut chunks,
+            );
+        }
+        StreamStats {
+            samples: out_samples,
+            ttfa,
+            min_margin: if min_margin == f64::MAX {
+                0.0
+            } else {
+                min_margin
+            },
+            underruns,
+            chunks,
+        }
+    });
 
     // ── generation (main thread) ──
     let (prefill, trailing, tts_pad) = pipeline::build_prefill(

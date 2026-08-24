@@ -208,7 +208,9 @@ fn one(
         kv_heads * head_dim
     );
 
-    println!("\n=== {tag} : heads {heads} kv {kv_heads} head_dim {head_dim} d_rel {d_rel} rel_extent {rel_extent} ===");
+    println!(
+        "\n=== {tag} : heads {heads} kv {kv_heads} head_dim {head_dim} d_rel {d_rel} rel_extent {rel_extent} ==="
+    );
 
     let dims = AttnDims {
         hidden,
@@ -279,7 +281,9 @@ fn one(
     println!(
         "  f32 host lane   vs reference   : rel L2 {h_l2:e}   worst abs {h_worst:e}   <- control"
     );
-    println!("  BF16 device lane vs reference  : rel L2 {d_l2:e}   worst abs {d_worst:e}   <- the criterion");
+    println!(
+        "  BF16 device lane vs reference  : rel L2 {d_l2:e}   worst abs {d_worst:e}   <- the criterion"
+    );
     println!("  BF16 device lane vs f32 host   : rel L2 {gap_l2:e}   (what the change moved)");
     println!("  budget                         : {BUDGET:e}");
 

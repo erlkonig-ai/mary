@@ -205,7 +205,9 @@ fn temporal_gate(pile: &str) {
     let phase = |name: &str, lo: usize, hi: usize| {
         let hmin = per_step[lo..hi].iter().map(|p| p.0).fold(1f64, f64::min);
         let lmin = per_step[lo..hi].iter().map(|p| p.1).fold(1f64, f64::min);
-        println!("  phase {name:<22} steps {lo:3}..{hi:3}  min hidden cos={hmin:.9}  min logits cos={lmin:.9}");
+        println!(
+            "  phase {name:<22} steps {lo:3}..{hi:3}  min hidden cos={hmin:.9}  min logits cos={lmin:.9}"
+        );
     };
     println!("phases:");
     phase("voice prompt (embed)", 0, 50);

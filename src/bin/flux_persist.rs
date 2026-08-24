@@ -71,7 +71,7 @@ fn main() -> anyhow::Result<()> {
         (Err(error), Ok(())) => return Err(error),
         (Ok(()), Err(error)) => return Err(error),
         (Err(error), Err(close_error)) => {
-            return Err(error.context(format!("import also failed to close pile: {close_error}")))
+            return Err(error.context(format!("import also failed to close pile: {close_error}")));
         }
     }
 

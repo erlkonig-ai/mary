@@ -51,7 +51,10 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
-    anyhow::ensure!(pos.len() == 4, "usage: speak_check <pile> <ref_wav> <ref_text_file> <ref_codes.npy> [--xvec-out p] [--out p] [--text s]");
+    anyhow::ensure!(
+        pos.len() == 4,
+        "usage: speak_check <pile> <ref_wav> <ref_text_file> <ref_codes.npy> [--xvec-out p] [--out p] [--text s]"
+    );
     let (pile, ref_wav, ref_text_file, ref_codes) = (&pos[0], &pos[1], &pos[2], &pos[3]);
     let ref_text = std::fs::read_to_string(ref_text_file)?.trim().to_string();
 

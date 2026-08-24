@@ -118,7 +118,9 @@ fn main() -> Result<()> {
 
     let cp = Checkpoint::open(&ckpt)?;
     println!("=== towers ===");
-    println!("  vision: patch {patch}, temporal {tpatch}, layers {n_layers}, channels {n_ch} -> {text_h}");
+    println!(
+        "  vision: patch {patch}, temporal {tpatch}, layers {n_layers}, channels {n_ch} -> {text_h}"
+    );
     println!("  audio : {bins} bins x {levels} levels -> {text_h}");
     println!("  tensors in index: {}", cp.len());
 

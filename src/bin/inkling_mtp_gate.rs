@@ -122,7 +122,9 @@ fn main() -> Result<()> {
         let is_local = tag == "local";
         kinds.push((tag.to_string(), rel_extent));
 
-        println!("\n=== MTP layer {idx} ({tag}): heads {heads}/{kv_heads}x{head_dim}, rel_extent {rel_extent} ===");
+        println!(
+            "\n=== MTP layer {idx} ({tag}): heads {heads}/{kv_heads}x{head_dim}, rel_extent {rel_extent} ==="
+        );
         let p = format!("model.mtp.layers.{idx}.transformer_block.");
         let g = |n: &str| -> Result<Vec<f32>> { Ok(cp.tensor(&format!("{p}{n}"))?.data) };
 

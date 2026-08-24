@@ -187,7 +187,9 @@ fn main() -> Result<()> {
         "  worst RELATIVE  : {:e} at [{}], mine {:e} vs ref {:e}",
         d.worst_rel, d.at, d.mine_at, d.ref_at
     );
-    println!("    (a near-zero reference makes relative error meaningless there;\n     x + conv(x) cancels, so this is reported, not gated on)");
+    println!(
+        "    (a near-zero reference makes relative error meaningless there;\n     x + conv(x) cancels, so this is reported, not gated on)"
+    );
     if d.scaled() > BUDGET_SCONV {
         println!("  FAIL  over budget");
         fails += 1;

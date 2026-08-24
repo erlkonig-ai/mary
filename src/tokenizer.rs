@@ -325,7 +325,7 @@ pub fn save_tokenizer_json(
     let mut memo: HashMap<String, Inline<inlineencodings::Handle<blobencodings::UTF8String>>> =
         HashMap::with_capacity(1 << 18);
     macro_rules! intern {
-        ($blobs:expr, $s:expr) => {{
+        ($blobs:expr_2021, $s:expr_2021) => {{
             let s: &str = $s;
             match memo.get(s) {
                 Some(h) => *h,

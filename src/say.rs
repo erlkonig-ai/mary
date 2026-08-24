@@ -105,11 +105,11 @@ fn synth_chunk(
     let (rb, gb) = (ref_text.len() as f64, chunk.len() as f64);
     let local_speed = if chunk.len() < 10 { 0.3 } else { 1.0 };
     let duration = ref_len + (ref_len as f64 / rb * gb / local_speed) as usize;
-    let gen = duration - ref_len;
+    let r#gen = duration - ref_len;
     let cond = Tensor::cat(
         vec![
             ref_mel.clone(),
-            Tensor::<B, 3>::zeros([1, gen, 100], device),
+            Tensor::<B, 3>::zeros([1, r#gen, 100], device),
         ],
         1,
     );

@@ -1030,7 +1030,9 @@ fn pipeline_gate(pile: &str, fmt: WeightFmt, depth_f16: bool) {
     let pre = pre_frames * mimi_cfg::SAMPLES_PER_FRAME;
     let mut ok_audio = true;
     if pre == 0 {
-        println!("  -- audio prefix empty (divergence at out frame 0) — no pre-divergence audio to compare");
+        println!(
+            "  -- audio prefix empty (divergence at out frame 0) — no pre-divergence audio to compare"
+        );
     } else {
         let (cos_g, maxd_g) = cos_maxd(&pcm[..pre], &gaudio[..pre]);
         ok_audio = cos_g >= AUDIO_GATE;
@@ -1281,16 +1283,24 @@ fn main() {
         "framebench" => framebench(&pile, fmt, depth_f16),
         "reset" => reset_gate(&pile, fmt, depth_f16),
         _ => {
-            eprintln!("usage: personaplex_rt_probe <gate|bench|quantcheck|pipeline|framebench|reset> [q4|q8|f16] [--depth-f16] [pile-path]");
-            eprintln!("  gate        113-step golden stream: cos + argmax vs tt_text_logits (per-format bars)");
+            eprintln!(
+                "usage: personaplex_rt_probe <gate|bench|quantcheck|pipeline|framebench|reset> [q4|q8|f16] [--depth-f16] [pile-path]"
+            );
+            eprintln!(
+                "  gate        113-step golden stream: cos + argmax vs tt_text_logits (per-format bars)"
+            );
             eprintln!("  bench       ms/step at cache fill 256/1024/3000, f16 vs q4 logit head");
-            eprintln!("  framebench  ms per EMITTED FRAME on the LM critical path (temporal + depformer +");
+            eprintln!(
+                "  framebench  ms per EMITTED FRAME on the LM critical path (temporal + depformer +"
+            );
             eprintln!(
                 "              overhead; mimi decode on its own thread, worker cost reported) at"
             );
             eprintln!("              cache fill 256/1024/2999 via a long synthetic free-run");
             eprintln!("  quantcheck  per-matvec q4 error, raw vs norm-alpha-folded weights");
-            eprintln!("  pipeline    assembled realtime pipeline free-run: WAV → encode → LM → decode → WAV,");
+            eprintln!(
+                "  pipeline    assembled realtime pipeline free-run: WAV → encode → LM → decode → WAV,"
+            );
             eprintln!(
                 "              agreement % + first divergence + near-tie check + prefix audio cos"
             );

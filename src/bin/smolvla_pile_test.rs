@@ -18,7 +18,10 @@ use mary::nn::weight_loader::{read_safetensors_file, WeightLoader};
 use std::path::Path;
 use triblespace::prelude::*;
 
-const CKPT: &str = concat!(env!("HOME"), "/.cache/huggingface/hub/models--lerobot--smolvla_base/snapshots/c83c3163b8ca9b7e67c509fffd9121e66cb96205/model.safetensors");
+const CKPT: &str = concat!(
+    env!("HOME"),
+    "/.cache/huggingface/hub/models--lerobot--smolvla_base/snapshots/c83c3163b8ca9b7e67c509fffd9121e66cb96205/model.safetensors"
+);
 const G: &str = "/tmp/codex_outputs/smolvla_probe";
 
 fn loadt<const D: usize>(rel: &str, dev: &WgpuDevice) -> Tensor<B, D> {

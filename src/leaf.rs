@@ -234,7 +234,7 @@ pub fn read_leaf<T: TensorElement, const RANK: usize>(
 /// compare. `tensor_blob` copies the payload anyway, so the comparison is one
 /// more pass over bytes that are already hot — cheap next to writing them.
 macro_rules! leaf_entity {
-    ($blobs:expr, $head:tt, $elem:ty, $rank:literal, $dims:expr, $payload:expr, $what:expr) => {{
+    ($blobs:expr_2021, $head:tt, $elem:ty, $rank:literal, $dims:expr_2021, $payload:expr_2021, $what:expr_2021) => {{
         let dims: [u64; $rank] = $dims
             .as_ref()
             .try_into()
@@ -268,7 +268,7 @@ macro_rules! leaf_entity {
 /// Beyond rank 6 it still refuses. The encoding allows up to 32; the arms stop
 /// where the evidence stops.
 macro_rules! leaf_by_rank {
-    ($blobs:expr, $head:tt, $elem:expr, $dims:expr, $payload:expr, $what:expr) => {{
+    ($blobs:expr_2021, $head:tt, $elem:expr_2021, $dims:expr_2021, $payload:expr_2021, $what:expr_2021) => {{
         let dims: &[u64] = $dims;
         match ($elem, dims.len()) {
             (Elem::F32, 0) => leaf_entity!($blobs, $head, F32, 0, dims, $payload, $what),
@@ -336,7 +336,7 @@ pub fn resolve(tribles: &TribleSet, blobs: &impl BlobStoreGet, weight: Id) -> Re
     let mut found: Option<Leaf> = None;
 
     macro_rules! typed {
-        ($elem:ty, $rank:literal, $tag:expr) => {{
+        ($elem:ty, $rank:literal, $tag:expr_2021) => {{
             if let Some((h,)) = triblespace::macros::find!(
                 (h: Inline<Handle<Tensor<$elem, $rank>>>),
                 triblespace::macros::pattern!(tribles, [{ weight @ leaf::<$elem, $rank>(): ?h }])
@@ -508,7 +508,7 @@ pub fn index_typed_all(
     let mut map = std::collections::HashMap::new();
 
     macro_rules! sweep_all {
-        ($elem:ty, $rank:literal, $tag:expr) => {{
+        ($elem:ty, $rank:literal, $tag:expr_2021) => {{
             for (e, h) in triblespace::macros::find!(
                 (e: Id, h: Inline<Handle<Tensor<$elem, $rank>>>),
                 triblespace::macros::pattern!(tribles, [
@@ -550,7 +550,7 @@ pub fn typed_leaf_attrs() -> Vec<(String, Id)> {
     let mut out = Vec::new();
 
     macro_rules! name_all {
-        ($elem:ty, $rank:literal, $tag:expr) => {{
+        ($elem:ty, $rank:literal, $tag:expr_2021) => {{
             out.push((
                 format!("leaf.{}.{}", $tag, $rank),
                 leaf::<$elem, $rank>().id(),

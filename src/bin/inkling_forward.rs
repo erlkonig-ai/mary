@@ -2560,7 +2560,9 @@ fn grouped_experts_core(
         }
         (true, _) => gather_grouped_bf16(client, hn_h, h_rowtok, n, m_total, h),
         (false, burn::tensor::DType::BF16) => {
-            panic!("a BF16 residual stream with INK_ACT_BF16=0: set INK_RESID_BF16=0 for the wide lane")
+            panic!(
+                "a BF16 residual stream with INK_ACT_BF16=0: set INK_RESID_BF16=0 for the wide lane"
+            )
         }
         (false, _) => gather_grouped(client, hn_h, h_rowtok, n, m_total, h),
     };
@@ -4601,7 +4603,9 @@ fn main() -> Result<()> {
         .map(|v| v == "1")
         .unwrap_or(false);
     if router_diff {
-        println!("  router diff        : ON -- selection compared against the f32 [rows,hidden] lane, this pass IS slower");
+        println!(
+            "  router diff        : ON -- selection compared against the f32 [rows,hidden] lane, this pass IS slower"
+        );
     }
     println!(
         "  kv cache           : {}",
@@ -5413,11 +5417,11 @@ fn main() -> Result<()> {
                             let s = Instant::now();
                             let leaf = cp.stored(&format!("{p}mlp.gate.weight"))?;
                             anyhow::ensure!(
-                            leaf.elem == Elem::Bf16,
-                            "{p}mlp.gate.weight is {:?}; INK_ROUTER=bf16 multiplies the STORED \
+                                leaf.elem == Elem::Bf16,
+                                "{p}mlp.gate.weight is {:?}; INK_ROUTER=bf16 multiplies the STORED \
                              BF16 and will not widen to reach an element type",
-                            leaf.elem
-                        );
+                                leaf.elem
+                            );
                             // Six zero rows so 258 tiles as n8. They produce logits
                             // the host slices off; they are a pad, not a widening.
                             let pad = rows.div_ceil(NTILE) * NTILE;
@@ -5692,10 +5696,10 @@ fn main() -> Result<()> {
                         host_t.slice += t_s.elapsed().as_secs_f64();
                         if tb.is_none() {
                             println!(
-                            "  INK_DEV_PLAN: {p} keeps the host lane (no single aligned mapping \
+                                "  INK_DEV_PLAN: {p} keeps the host lane (no single aligned mapping \
                              for all {} routed experts)",
-                            t.n_routed_experts
-                        );
+                                t.n_routed_experts
+                            );
                         }
                         dr.tabs.insert(layer, tb);
                     }
@@ -5853,9 +5857,9 @@ fn main() -> Result<()> {
                                 }
                             }
                             println!(
-                        "ROUTEGATE layer {layer}: {n} rows examined, {bad} selections differ, \
+                                "ROUTEGATE layer {layer}: {n} rows examined, {bad} selections differ, \
                          max |dev-host| weight {worst_w:.3e}"
-                    );
+                            );
                         }
                         t_rt_host += t_rh.elapsed().as_secs_f64();
                     }
@@ -7361,10 +7365,10 @@ fn main() -> Result<()> {
                 let t_c = Instant::now();
                 let whole = draft_whole(&mtp_main, seq, &ids, best);
                 println!(
-                "  MTP cache check ({:.2}s): cached {drafts:?} vs whole-sequence {whole:?} -- {}",
-                t_c.elapsed().as_secs_f32(),
-                if whole == drafts { "agree" } else { "DISAGREE" }
-            );
+                    "  MTP cache check ({:.2}s): cached {drafts:?} vs whole-sequence {whole:?} -- {}",
+                    t_c.elapsed().as_secs_f32(),
+                    if whole == drafts { "agree" } else { "DISAGREE" }
+                );
                 // Asserted for the HOST cached lane, which is the same arithmetic
                 // summed in the same order and therefore has no licence to differ;
                 // REPORTED for the device one, where an argmax over a 200k row can
@@ -7443,14 +7447,19 @@ fn main() -> Result<()> {
             ms(t_rt_host)
         );
         println!("      mlp short_conv  {:9.1}", ms(t_h_sconv));
-        println!("      first-touch uploads: read+widen {:9.1}, transfer {:9.1}   (once per layer, not per token)",
-             ms(t_attn_read), ms(t_attn_up));
+        println!(
+            "      first-touch uploads: read+widen {:9.1}, transfer {:9.1}   (once per layer, not per token)",
+            ms(t_attn_read),
+            ms(t_attn_up)
+        );
         println!(
             "    DEVICE, one sync for this node's whole stack: {:9.1}",
             ms(t_stack_sync)
         );
         if stage_sync {
-            println!("    DEVICE per stage (INK_STAGE_SYNC=1 -- {stage_syncs} extra syncs, this pass IS slower for them):");
+            println!(
+                "    DEVICE per stage (INK_STAGE_SYNC=1 -- {stage_syncs} extra syncs, this pass IS slower for them):"
+            );
             println!("      attention half  {:9.1}", ms(d_attn));
             println!("      router matmul   {:9.1}", ms(d_router));
             println!("      routed experts  {:9.1}", ms(d_expert));
@@ -7682,9 +7691,13 @@ fn main() -> Result<()> {
             } else {
                 String::new()
             };
-            println!("  step {step}{coh_tag}: +{new_toks:?}   [pass {:.1}s, total {:.1}s, ctx {}, pass_ms {:.1}]",
-                 pass.elapsed().as_secs_f32(), started.elapsed().as_secs_f32(), ids.len(),
-                 pass.elapsed().as_secs_f64() * 1e3);
+            println!(
+                "  step {step}{coh_tag}: +{new_toks:?}   [pass {:.1}s, total {:.1}s, ctx {}, pass_ms {:.1}]",
+                pass.elapsed().as_secs_f32(),
+                started.elapsed().as_secs_f32(),
+                ids.len(),
+                pass.elapsed().as_secs_f64() * 1e3
+            );
             // The tail already pushed all but the last, when it answered its peer.
             if !is_tail && !repeat {
                 // Not in the slot lane: `new_toks` is one token per SLOT there, not
@@ -7960,7 +7973,9 @@ fn main() -> Result<()> {
             mw = mw.max(d.max_abs_weight);
         }
         if ex == 0 {
-            println!("  nothing examined: this node's slice has no MoE layer, so there was no router to compare.");
+            println!(
+                "  nothing examined: this node's slice has no MoE layer, so there was no router to compare."
+            );
         } else {
             println!("  TOTAL   {ex:8}   {sd:5}   {od:7}   {sl:7}   {ml:11.3e}   {mw:12.3e}");
             println!(

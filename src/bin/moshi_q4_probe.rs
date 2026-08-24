@@ -481,7 +481,9 @@ fn main() {
         } else {
             format!("OVER by {:.1} ms", total - 80.0)
         };
-        println!("    ctx {ctx:>4}: temporal {temporal:6.1} + depth {DEPTH_MS} + mimi {MIMI_MS} = {total:6.1} ms  ->  {verdict}");
+        println!(
+            "    ctx {ctx:>4}: temporal {temporal:6.1} + depth {DEPTH_MS} + mimi {MIMI_MS} = {total:6.1} ms  ->  {verdict}"
+        );
     }
     println!("  with-levers floor: q4 matmuls + true KV reads at measured bandwidth +");
     println!(

@@ -17,7 +17,10 @@ use mary::models::smolvla::pipeline::{preprocess_image, SmolVla};
 use mary::nn::backend::{WgpuDevice, B};
 use mary::nn::weight_loader::WeightLoader;
 
-const TOKENIZER: &str = concat!(env!("HOME"), "/.cache/huggingface/hub/models--HuggingFaceTB--SmolVLM2-500M-Video-Instruct/snapshots/7b375e1b73b11138ff12fe22c8f2822d8fe03467/tokenizer.json");
+const TOKENIZER: &str = concat!(
+    env!("HOME"),
+    "/.cache/huggingface/hub/models--HuggingFaceTB--SmolVLM2-500M-Video-Instruct/snapshots/7b375e1b73b11138ff12fe22c8f2822d8fe03467/tokenizer.json"
+);
 const JOINTS: [&str; 9] = [
     "head_x", "head_y", "head_z", "roll", "pitch", "yaw", "body_yaw", "ant_l", "ant_r",
 ];

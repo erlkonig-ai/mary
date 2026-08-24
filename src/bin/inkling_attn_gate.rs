@@ -125,7 +125,9 @@ fn run_layer(
     let n_floor = num(man, "log_scaling_n_floor")? as f32;
     let alpha = num(man, "log_scaling_alpha")? as f32;
 
-    println!("\n=== {tag} layer: heads {heads}, kv {kv_heads}, head_dim {head_dim}, rel_extent {rel_extent} ===");
+    println!(
+        "\n=== {tag} layer: heads {heads}, kv {kv_heads}, head_dim {head_dim}, rel_extent {rel_extent} ==="
+    );
 
     let p = |n: &str| format!("attn_{tag}_{n}");
     let wq = read_f32(dir, &p("wq.bin"))?;
@@ -263,7 +265,9 @@ fn run_layer(
     // ---- check 3: is the out-of-range relative branch reached? ------------
     *checks += 1;
     if tokens <= rel_extent {
-        println!("  FAIL  tokens {tokens} <= rel_extent {rel_extent}: the out-of-range bias branch never fires");
+        println!(
+            "  FAIL  tokens {tokens} <= rel_extent {rel_extent}: the out-of-range bias branch never fires"
+        );
         *fails += 1;
     } else {
         println!(
@@ -325,7 +329,9 @@ fn main() -> Result<()> {
     println!("\n=== is log scaling under test? ===");
     println!("  global tau_max reported by the capture: {tau_max}");
     if tau_max <= 1.0 + 1e-6 {
-        println!("  FAIL  tau is 1 everywhere — log scaling is inert and the global gate does not test it");
+        println!(
+            "  FAIL  tau is 1 everywhere — log scaling is inert and the global gate does not test it"
+        );
         fails += 1;
     } else {
         println!("  tau varies, so log scaling is genuinely exercised");

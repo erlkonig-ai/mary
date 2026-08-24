@@ -271,7 +271,7 @@ fn read_string(
 /// not an `Attribute` value — the same reason `tokenizer.rs` spells its field
 /// readers as macros.
 macro_rules! long_field {
-    ($tribles:expr, $blobs:expr, $node:expr, $attr:path) => {
+    ($tribles:expr_2021, $blobs:expr_2021, $node:expr_2021, $attr:path) => {
         find!(
             (h: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
             pattern!($tribles, [{ ($node) @ $attr: ?h }])

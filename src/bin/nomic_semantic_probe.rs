@@ -31,12 +31,30 @@ fn main() -> Result<()> {
     // Note-sized prose docs — distinct themes, deliberately NOT sharing the
     // query keywords, so a hit can only be semantic.
     let docs: Vec<(&str, &str)> = vec![
-        ("gpu", "A scattered-read kernel ran 14x faster than a 16-thread CPU by hiding the memory latency the host processor stalls on."),
-        ("database", "The engine answers lookups by walking a compact on-disk index instead of scanning; each record resolves in near-constant time as the table grows."),
-        ("compression", "Entropy coders model how often each symbol appears and spend fewer bits on the common ones; the original stream reconstructs exactly from the table."),
-        ("networking", "Routers forward each packet hop by hop toward its destination, and senders back off when queues fill so shared links do not collapse under load."),
-        ("cryptography", "Two parties who have never met agree on a shared secret over an open line, protected by math an eavesdropper cannot reverse in practice."),
-        ("weather", "Simulations advance the equations of moving air on a planet-sized grid; tiny errors in the starting state grow until forecasts lose skill after two weeks."),
+        (
+            "gpu",
+            "A scattered-read kernel ran 14x faster than a 16-thread CPU by hiding the memory latency the host processor stalls on.",
+        ),
+        (
+            "database",
+            "The engine answers lookups by walking a compact on-disk index instead of scanning; each record resolves in near-constant time as the table grows.",
+        ),
+        (
+            "compression",
+            "Entropy coders model how often each symbol appears and spend fewer bits on the common ones; the original stream reconstructs exactly from the table.",
+        ),
+        (
+            "networking",
+            "Routers forward each packet hop by hop toward its destination, and senders back off when queues fill so shared links do not collapse under load.",
+        ),
+        (
+            "cryptography",
+            "Two parties who have never met agree on a shared secret over an open line, protected by math an eavesdropper cannot reverse in practice.",
+        ),
+        (
+            "weather",
+            "Simulations advance the equations of moving air on a planet-sized grid; tiny errors in the starting state grow until forecasts lose skill after two weeks.",
+        ),
     ];
     let doc_vecs: Vec<(&str, Vec<f32>)> = docs
         .iter()

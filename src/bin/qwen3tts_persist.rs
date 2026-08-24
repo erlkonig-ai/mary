@@ -217,7 +217,7 @@ mod imp {
             (Err(error), Err(close_error)) => {
                 return Err(
                     error.context(format!("import also failed to close pile: {close_error}"))
-                )
+                );
             }
         }
 

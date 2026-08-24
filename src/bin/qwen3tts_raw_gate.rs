@@ -312,9 +312,9 @@ mod imp {
             "folded" => {
                 let folded = mary::persist::qwen3tts_folded_sibling_path(pile);
                 anyhow::ensure!(
-                folded.exists(),
-                "folded sibling {folded:?} missing — derive it first: qwen3tts_persist --fold-derive {pile:?}"
-            );
+                    folded.exists(),
+                    "folded sibling {folded:?} missing — derive it first: qwen3tts_persist --fold-derive {pile:?}"
+                );
                 let talker = mary::persist::load_qwen3tts_talker_folded(pile, &folded)?;
                 let dev = Default::default();
                 dump(&talker, "folded", &out, prefill, steps, &dev)?;

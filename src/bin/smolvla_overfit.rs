@@ -16,7 +16,10 @@ use mary::nn::backend::BTrain as B;
 use mary::nn::weight_loader::{SingleFileLoader, WeightLoader};
 use std::path::Path;
 
-const CKPT: &str = concat!(env!("HOME"), "/.cache/huggingface/hub/models--lerobot--smolvla_base/snapshots/c83c3163b8ca9b7e67c509fffd9121e66cb96205/model.safetensors");
+const CKPT: &str = concat!(
+    env!("HOME"),
+    "/.cache/huggingface/hub/models--lerobot--smolvla_base/snapshots/c83c3163b8ca9b7e67c509fffd9121e66cb96205/model.safetensors"
+);
 
 fn main() {
     let dev = Default::default();
@@ -78,5 +81,7 @@ fn main() {
         final_loss < first * 0.01,
         "loss did not collapse — optimizer loop broken"
     );
-    println!("✓ the finetune loop learns: forward → loss → backward → SGD drives the real expert head to fit. T3 mechanics are de-risked; only demos remain.");
+    println!(
+        "✓ the finetune loop learns: forward → loss → backward → SGD drives the real expert head to fit. T3 mechanics are de-risked; only demos remain."
+    );
 }

@@ -187,7 +187,11 @@ fn main() {
             ", greedy".into()
         }
     );
-    println!("prompt: {n_vp} voice-replay + {n_silence} silence + {} text + {n_silence} silence = {} steps", text.len(), sched.len());
+    println!(
+        "prompt: {n_vp} voice-replay + {n_silence} silence + {} text + {n_silence} silence = {} steps",
+        text.len(),
+        sched.len()
+    );
 
     let t0 = Instant::now();
     let source = mary::persist::personaplex_bundle(Path::new(&pile))
@@ -318,7 +322,9 @@ fn main() {
             println!("      as text: {}", decode_run(&spm, &forced_shadow));
 
             // Q1: the release continuation
-            println!("    release continuation (committed stream-0 for {RELEASE} frames after force stops):");
+            println!(
+                "    release continuation (committed stream-0 for {RELEASE} frames after force stops):"
+            );
             let rel_toks: Vec<String> = released_text.iter().map(|&t| tok_str(&spm, t)).collect();
             println!("      tokens: {}", rel_toks.join(" "));
             println!("      as text: {}", decode_run(&spm, &released_text));
@@ -334,7 +340,10 @@ fn main() {
                         || t == 2)
                 })
                 .count();
-            println!("      leading pad/epad frames: {pad_run}/{}   non-pad (word) tokens in window: {n_word}", released_text.len());
+            println!(
+                "      leading pad/epad frames: {pad_run}/{}   non-pad (word) tokens in window: {n_word}",
+                released_text.len()
+            );
 
             // Q2: agent audio during the forced window
             let fr = rms(&forced_agent_pcm);
@@ -345,7 +354,9 @@ fn main() {
             } else {
                 f64::INFINITY
             };
-            println!("    agent audio during FORCED text: rms={fr:.5} (×{ratio:.1} vs SILENCE_TOKENS baseline)  peak={fp:.5}");
+            println!(
+                "    agent audio during FORCED text: rms={fr:.5} (×{ratio:.1} vs SILENCE_TOKENS baseline)  peak={fp:.5}"
+            );
             if !forced_frame_rms.is_empty() {
                 let per: Vec<String> = forced_frame_rms.iter().map(|r| format!("{r:.4}")).collect();
                 println!("      per-frame agent rms: [{}]", per.join(", "));
@@ -492,7 +503,9 @@ fn main() {
         }
 
         println!("    forced-token rank in the model's own logits (0 = model's own top pick):");
-        println!("      mean {mean_rank:.0}   median {med_rank}   (huge = the packed token is off-distribution / model fighting)");
+        println!(
+            "      mean {mean_rank:.0}   median {med_rank}   (huge = the packed token is off-distribution / model fighting)"
+        );
         println!("    shadow during force (model's own argmax each frame):");
         println!("      {}", decode_run(&spm, &shadow));
         println!("    release continuation ({RB_RELEASE} frames after force stops):");
@@ -500,7 +513,9 @@ fn main() {
         println!("      tokens: {}", rtoks.join(" "));
         println!("      as text: {}", decode_run(&spm, &released));
         let agent_rms = rms(&agent_pcm);
-        println!("    agent audio during force: rms={agent_rms:.5} (baseline {sil_rms:.5}) — confirms the thought stayed silent");
+        println!(
+            "    agent audio during force: rms={agent_rms:.5} (baseline {sil_rms:.5}) — confirms the thought stayed silent"
+        );
     }
 
     println!("\n=== surface probe complete ===");
