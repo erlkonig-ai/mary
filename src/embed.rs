@@ -26,14 +26,14 @@
 
 use anyhow::{Context, Result};
 use burn::prelude::*;
+use burn::tensor::TensorData;
 use burn::tensor::activation::{silu, softmax};
 use burn::tensor::module::conv2d;
 use burn::tensor::ops::ConvOptions;
-use burn::tensor::TensorData;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use crate::nn::backend::{WgpuDevice, B};
+use crate::nn::backend::{B, WgpuDevice};
 #[cfg(feature = "import")]
 use crate::nn::weight_loader::SingleFileLoader;
 use crate::nn::weight_loader::WeightLoader;
@@ -383,27 +383,33 @@ mod embedding_contract_tests {
 
         let mut missing = complete.clone();
         missing.remove("emb_ln.bias");
-        assert!(architecture
-            .validate_tensor_shapes(&missing)
-            .unwrap_err()
-            .to_string()
-            .contains("missing required tensor"));
+        assert!(
+            architecture
+                .validate_tensor_shapes(&missing)
+                .unwrap_err()
+                .to_string()
+                .contains("missing required tensor")
+        );
 
         let mut extra = complete.clone();
         extra.insert("unused.weight".to_owned(), vec![1]);
-        assert!(architecture
-            .validate_tensor_shapes(&extra)
-            .unwrap_err()
-            .to_string()
-            .contains("unexpected tensor"));
+        assert!(
+            architecture
+                .validate_tensor_shapes(&extra)
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected tensor")
+        );
 
         let mut wrong = complete;
         wrong.insert("emb_ln.bias".to_owned(), vec![767]);
-        assert!(architecture
-            .validate_tensor_shapes(&wrong)
-            .unwrap_err()
-            .to_string()
-            .contains("expected [768]"));
+        assert!(
+            architecture
+                .validate_tensor_shapes(&wrong)
+                .unwrap_err()
+                .to_string()
+                .contains("expected [768]")
+        );
     }
 
     #[test]
@@ -721,7 +727,7 @@ impl<B: Backend> TextTower<B> {
         let eot = ids
             .iter()
             .enumerate()
-            .max_by_key(|(_, &v)| v)
+            .max_by_key(|&(_, &v)| v)
             .map(|(i, _)| i)
             .unwrap_or(s - 1);
         let pooled = x.narrow(1, eot, 1).reshape([1, d]); // [1,512]
@@ -1292,7 +1298,7 @@ impl<B: Backend> AttnPoolHead<B> {
         let probs = softmax(scores, 3);
         let att = probs.matmul(v).swap_dims(1, 2).reshape([b, 1, dim]); // [b,1,dim]
         let hidden = self.out.forward(att); // out_proj
-                                            // residual LN + MLP block
+        // residual LN + MLP block
         let residual = hidden.clone();
         let h2 = self.ln.forward(hidden);
         let mlp = self.fc2.forward(gelu_tanh(self.fc1.forward(h2)));
@@ -1356,7 +1362,7 @@ impl<B: Backend> SiglipVisionTower<B> {
         let [_, c, gh, gw] = patch.dims();
         let np = gh * gw; // 729
         let patches = patch.reshape([b, c, np]).swap_dims(1, 2); // [b,729,1152]
-                                                                 // NO CLS token: just add learned position embedding.
+        // NO CLS token: just add learned position embedding.
         let mut x = patches.add(self.position_embedding.clone().reshape([1, np, c]));
         for layer in &self.layers {
             x = layer.forward(x);
@@ -1634,11 +1640,7 @@ fn bicubic_kernel(x: f64) -> f64 {
 /// PIL BILINEAR triangle kernel (support 1.0). PIL resample code = 2.
 fn bilinear_kernel(x: f64) -> f64 {
     let x = x.abs();
-    if x < 1.0 {
-        1.0 - x
-    } else {
-        0.0
-    }
+    if x < 1.0 { 1.0 - x } else { 0.0 }
 }
 
 /// A separable resampling filter: kernel fn + its support radius.
@@ -2427,7 +2429,7 @@ impl<B: Backend> NomicSelector<B> {
         let probs = softmax(scores, 3);
         let att = probs.matmul(v).swap_dims(1, 2).reshape([b, 1, d]); // [b,1,d]
         let attn_out = self.out_proj.forward(att); // [b,1,d]
-                                                   // residual gated-SwiGLU (no inner norm): out = attn_out + fc2(fc11(n)*silu(fc12(n))).
+        // residual gated-SwiGLU (no inner norm): out = attn_out + fc2(fc11(n)*silu(fc12(n))).
         let normed = self.norm1.forward(attn_out.clone());
         let gated = self
             .fc11
@@ -2495,7 +2497,7 @@ impl<B: Backend> NomicVisionModel<B> {
         let patches = patch.reshape([b, c, np]).swap_dims(1, 2); // [b,196,768]
         let cls = self.cls_token.clone().repeat_dim(0, b); // [b,1,768]
         let x = Tensor::cat(vec![cls, patches], 1); // [b,197,768]
-                                                    // add learned absolute position embedding (over CLS+patch sequence).
+        // add learned absolute position embedding (over CLS+patch sequence).
         let mut x = x.add(self.position_embedding.clone());
 
         let (cos, sin) = nomic_vision_rope_tables::<B>(NOMIC_VISION_GRID, self.head_dim, device);

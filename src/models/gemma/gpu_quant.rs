@@ -440,11 +440,7 @@ impl<B: Backend<IntElem = i32>> GpuTurboQuantCtx<B> {
         let signs_data: Vec<f32> = (0..padded_dim)
             .map(|_| {
                 state = xorshift64(state);
-                if state & 1 == 0 {
-                    1.0f32
-                } else {
-                    -1.0f32
-                }
+                if state & 1 == 0 { 1.0f32 } else { -1.0f32 }
             })
             .collect();
         let signs = Tensor::<B, 1>::from_floats(&signs_data[..], device);
@@ -462,11 +458,7 @@ impl<B: Backend<IntElem = i32>> GpuTurboQuantCtx<B> {
             let qjl_data: Vec<f32> = (0..m * dim)
                 .map(|_| {
                     qjl_state = xorshift64(qjl_state);
-                    if qjl_state & 1 == 0 {
-                        1.0f32
-                    } else {
-                        -1.0f32
-                    }
+                    if qjl_state & 1 == 0 { 1.0f32 } else { -1.0f32 }
                 })
                 .collect();
             Some(Tensor::<B, 1>::from_floats(&qjl_data[..], device).reshape([m, dim]))
@@ -664,10 +656,10 @@ impl<B: Backend<IntElem = i32>> GpuTurboQuantCtx<B> {
         // we compute it via arithmetic:
         //   mask = (x_expanded - boundaries) as sign, clamp to 0..1
         let diff = x_expanded - boundaries; // [n_groups, dim, n_boundaries]
-                                            // step function: 1 where diff > 0, 0 otherwise
-                                            // Use: (sign(diff) + 1) / 2, clamped. sign gives -1, 0, 1.
-                                            // For diff=0, we want bin index to round up (match CPU: boundary hit -> upper bin)
-                                            // So use >= 0: (sign(diff + epsilon) + 1) / 2
+        // step function: 1 where diff > 0, 0 otherwise
+        // Use: (sign(diff) + 1) / 2, clamped. sign gives -1, 0, 1.
+        // For diff=0, we want bin index to round up (match CPU: boundary hit -> upper bin)
+        // So use >= 0: (sign(diff + epsilon) + 1) / 2
         let step = diff.add_scalar(1e-7).sign().add_scalar(1.0).div_scalar(2.0);
         // Sum along boundaries dimension to get bin index
         let bin_index = step.sum_dim(2).reshape([n_groups, dim]); // float in [0, n_boundaries]
@@ -856,7 +848,7 @@ impl<B: Backend<IntElem = i32>> GpuTurboQuantCtx<B> {
             let deq_normalized = self.rotate_inv(deq_rotated);
             // Compute residual
             let residual = normalized - deq_normalized; // [n_groups, dim]
-                                                        // Compute residual norms
+            // Compute residual norms
             let rnorms = (residual.clone() * residual.clone())
                 .sum_dim(1)
                 .sqrt()
@@ -864,8 +856,8 @@ impl<B: Backend<IntElem = i32>> GpuTurboQuantCtx<B> {
 
             // Project: projected = residual @ qjl_matrix^T -> [n_groups, m]
             let projected = residual.matmul(qjl_matrix.clone().transpose()); // [n_groups, m]
-                                                                             // Store sign bits: 1 where projected >= 0, 0 elsewhere
-                                                                             // Pack into i32: 32 sign bits per i32
+            // Store sign bits: 1 where projected >= 0, 0 elsewhere
+            // Pack into i32: 32 sign bits per i32
             let sign_float = projected.sign().add_scalar(1.0).div_scalar(2.0); // 0 or 1
             let sign_int = sign_float.add_scalar(0.5).int(); // [n_groups, m]
 
@@ -929,7 +921,7 @@ impl<B: Backend<IntElem = i32>> GpuTurboQuantCtx<B> {
         let mut deq_normalized = self.rotate_inv(deq_rotated);
 
         // 4. Optional QJL correction
-        if let (Some(ref qjl_matrix), Some(ref qjl_packed), Some(ref rnorms)) =
+        if let (Some(qjl_matrix), Some(qjl_packed), Some(rnorms)) =
             (&self.qjl_signs, &qt.qjl_packed, &qt.qjl_residual_norms)
         {
             let m = self.residual_bits;

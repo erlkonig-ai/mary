@@ -146,11 +146,7 @@ impl QuantConfig {
             QuantBits::Int8 => 8.0,
             QuantBits::Int4 => 4.0,
         };
-        if self.residual_bits {
-            base + 1.0
-        } else {
-            base
-        }
+        if self.residual_bits { base + 1.0 } else { base }
     }
 }
 
@@ -354,8 +350,7 @@ impl QuantizedTensor {
                 let mut val = q_val * scale + zero;
 
                 // Apply residual sign correction
-                if let (Some(ref signs), Some(ref rscales)) = (&self.residual, &self.residual_scale)
-                {
+                if let (Some(signs), Some(rscales)) = (&self.residual, &self.residual_scale) {
                     let flat_idx = g * head_dim + d;
                     let sign_bit = (signs[flat_idx / 8] >> (flat_idx % 8)) & 1;
                     let correction = rscales[g];

@@ -111,11 +111,7 @@ impl Rademacher {
         let signs: Vec<f64> = (0..dim)
             .map(|_| {
                 state = xorshift64(state);
-                if state & 1 == 0 {
-                    1.0
-                } else {
-                    -1.0
-                }
+                if state & 1 == 0 { 1.0 } else { -1.0 }
             })
             .collect();
         Self { signs }
@@ -256,11 +252,7 @@ impl QjlCtx {
         let matrix: Vec<i8> = (0..total)
             .map(|_| {
                 state = xorshift64(state);
-                if state & 1 == 0 {
-                    1i8
-                } else {
-                    -1i8
-                }
+                if state & 1 == 0 { 1i8 } else { -1i8 }
             })
             .collect();
         Self { matrix, m, d }
@@ -595,7 +587,7 @@ impl TurboQuantCtx {
             let mut deq_normalized = self.rotation.rotate_inv(&deq_rotated);
 
             // 4. If QJL, add the correction
-            if let (Some(ref qjl), Some(ref qjl_signs), Some(ref rnorms)) =
+            if let (Some(qjl), Some(qjl_signs), Some(rnorms)) =
                 (&self.qjl, &qt.qjl_signs, &qt.residual_norm)
             {
                 let sign_offset = g * qjl_bytes_per_group;
