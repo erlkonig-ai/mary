@@ -2,9 +2,11 @@
 //!
 //! ## Why pages, when a contiguous tensor already works
 //!
-//! Not for speed at the read: [`PageStore::materialize`] concatenates, so a
-//! decode step pays what the contiguous cache paid. Pages buy three things the
-//! contiguous form cannot express.
+//! [`PageStore::materialize`] concatenates, so a decode step that reads through
+//! it pays what the contiguous cache paid — which is why the attention read
+//! does not: [`KvStore::parts`] hands the pages over as they are and the score
+//! and output products decompose over them. Beyond that, pages buy three things
+//! the contiguous form cannot express.
 //!
 //! * *A prefix becomes shareable.* Burn tensors clone by handle, so
 //!   [`PageStore::share_prefix`] hands a second cache the same device buffers
@@ -49,6 +51,17 @@ use burn::tensor::Tensor;
 /// means a later FP4 store is a change of element type rather than of geometry.
 pub const PAGE: usize = 128;
 
+/// How many pages a store keeps before merging the settled ones into one.
+///
+/// The read costs launches per PAGE and the merge costs a copy per MERGE, so
+/// this is the one knob between them. At `8`, a store never hands the attention
+/// more than four chunks (the merged run, up to two whole pages, the partial
+/// tail), and a merge copies the retained context once every `7 * PAGE = 896`
+/// appends — against the once-per-append copy `gather` used to do. Both ends of
+/// that trade get cheaper as the context grows, which is why it is a constant
+/// and not a tuning parameter.
+pub const MAX_PAGES: usize = 8;
+
 /// What a page is made of: fixed-width rows that can be cut and rejoined.
 ///
 /// Three operations and no arithmetic. That is deliberate — [`Pages`] must not
@@ -72,10 +85,29 @@ pub trait PageRows: Clone {
 /// The page-boundary arithmetic, over any [`PageRows`].
 ///
 /// Invariants, checked by [`Pages::assert_sound`]:
-/// * every page but the last holds exactly [`PAGE`] rows;
+/// * a page is never empty, and every page but the last holds a whole number
+///   of [`PAGE`]s — except page 0, which [`Pages::drop_front`] may have cut;
 /// * `head < PAGE`, and `head` counts rows already dropped from page 0;
 /// * `len` is the LOGICAL row count, excluding `head`;
 /// * `head + len` equals the total rows actually stored.
+///
+/// ## Why a page may be BIGGER than [`PAGE`]
+///
+/// Because the read is per page, and one launch per page is the cost that
+/// grows. `Tensor::cat` on this backend is one `slice_assign` kernel per input
+/// (`burn-backend`'s `cat_with_slice_assign`), so a 64-page cache paid 64
+/// launches AND a full copy on every [`Pages::gather`] — that is, on every
+/// layer of every decode step. Reading the pages directly removes the copy but
+/// leaves the launch count, which at 8k of context is worse than the copy it
+/// saved.
+///
+/// So [`Pages::append`] merges the settled pages into one whenever the count
+/// passes [`MAX_PAGES`]. The merge is the same `cat` the read used to do, but
+/// it happens once per `(MAX_PAGES - 1) * PAGE` appends instead of once per
+/// append — at 8k of context that is a copy every 896 steps rather than every
+/// step, and the read is then three or four chunks whatever the context length
+/// is. Nothing else in this file cared about a page's size: every operation
+/// below walks ROWS, not page indices.
 #[derive(Clone, Debug)]
 pub struct Pages<R: PageRows> {
     pages: Vec<R>,
@@ -119,6 +151,28 @@ impl<R: PageRows> Pages<R> {
         self.pages.first()
     }
 
+    /// Rows already dropped from the front of page 0.
+    ///
+    /// Part of the paged read's contract: the pages are handed over WHOLE, so
+    /// the first `head` rows of chunk 0 are keys the sliding window has already
+    /// forgotten and the reader must mask them. Slicing them off instead would
+    /// cost a copy and — worse — make chunk 0's shape walk `1..=PAGE` as the
+    /// window advances, which is a fresh kernel compilation per step.
+    pub fn head(&self) -> usize {
+        self.head
+    }
+
+    /// The pages themselves, whole and in order — the read that does NOT
+    /// concatenate.
+    ///
+    /// Covers `head + len` rows: `head` dead ones at the front, then the
+    /// retained context. Clones are handle clones, so this moves no bytes.
+    /// [`Pages::gather`] is this followed by a `cat`; the point of having both
+    /// is that the `cat` is what a decode step should not be paying.
+    pub fn parts(&self) -> Vec<R> {
+        self.pages.clone()
+    }
+
     /// Append `rows`, filling the last partial page before starting a new one.
     ///
     /// Takes the whole batch at once rather than row by row: a speculative
@@ -131,7 +185,12 @@ impl<R: PageRows> Pages<R> {
         }
         let mut written = 0usize;
         // Fill the tail page first, if it has room.
-        let tail = self.stored() % PAGE;
+        //
+        // Asked of the LAST PAGE rather than of `stored() % PAGE`: those agreed
+        // while every page was exactly `PAGE` rows, and they stop agreeing the
+        // moment `drop_front` cuts page 0 or `truncate` cuts a merged one. The
+        // last page is the thing being filled, so it is the thing to ask.
+        let tail = self.pages.last().map(|p| p.rows() % PAGE).unwrap_or(0);
         if tail != 0 {
             let room = PAGE - tail;
             let take = room.min(n);
@@ -146,6 +205,25 @@ impl<R: PageRows> Pages<R> {
             written += take;
         }
         self.len += n;
+        if self.pages.len() > MAX_PAGES {
+            self.merge_settled();
+        }
+    }
+
+    /// Join every page but the last into one, so the read stays a handful of
+    /// chunks however long the context gets.
+    ///
+    /// Row content and row order are untouched — this is `cat` of adjacent runs
+    /// — so `head` still counts from the same first row and every offset below
+    /// still resolves by walking rows. The last page is left alone because it is
+    /// the one [`Pages::append`] is still filling.
+    fn merge_settled(&mut self) {
+        if self.pages.len() < 3 {
+            return;
+        }
+        let last = self.pages.pop().expect("at least three pages");
+        let settled = R::concat(std::mem::take(&mut self.pages));
+        self.pages = vec![settled, last];
     }
 
     /// Drop `n` rows from the FRONT — the sliding window advancing.
@@ -155,15 +233,31 @@ impl<R: PageRows> Pages<R> {
     /// until it crosses a page boundary.
     pub fn drop_front(&mut self, n: usize) {
         assert!(n <= self.len, "dropping {n} of {} rows", self.len);
-        let head = self.head + n;
-        let whole = head / PAGE;
-        if whole > 0 {
-            self.pages.drain(0..whole.min(self.pages.len()));
-        }
-        self.head = head % PAGE;
         self.len -= n;
         if self.len == 0 {
             self.pages.clear();
+            self.head = 0;
+            return;
+        }
+        // Release whole pages by ROWS, not by dividing through `PAGE`: a merged
+        // page is many pages' worth and page 0 may already have been cut.
+        let mut head = self.head + n;
+        let mut release = 0usize;
+        while release < self.pages.len() && head >= self.pages[release].rows() {
+            head -= self.pages[release].rows();
+            release += 1;
+        }
+        if release > 0 {
+            self.pages.drain(0..release);
+        }
+        self.head = head;
+        // Keep `head < PAGE`, which bounds the dead rows the paged read carries
+        // to less than one page whatever page 0's size is. Cutting page 0 costs
+        // a copy of what survives it, and it happens at most once per `PAGE`
+        // rows dropped.
+        if self.head >= PAGE {
+            let rows = self.pages[0].rows();
+            self.pages[0] = self.pages[0].slice_rows(self.head, rows);
             self.head = 0;
         }
     }
@@ -175,17 +269,24 @@ impl<R: PageRows> Pages<R> {
             return;
         }
         self.len = keep;
-        let stored = self.stored();
-        let full = stored.div_ceil(PAGE);
-        self.pages.truncate(full);
-        let tail = stored % PAGE;
-        if tail != 0 {
-            let last = self.pages.len() - 1;
-            self.pages[last] = self.pages[last].slice_rows(0, tail);
-        }
         if self.len == 0 {
             self.pages.clear();
             self.head = 0;
+            return;
+        }
+        // By rows, for the same reason `drop_front` is: pages are not all the
+        // same size once the settled ones have been merged.
+        let stored = self.stored();
+        let mut before = 0usize;
+        let mut last = 0usize;
+        while last < self.pages.len() && before + self.pages[last].rows() < stored {
+            before += self.pages[last].rows();
+            last += 1;
+        }
+        self.pages.truncate(last + 1);
+        let tail = stored - before;
+        if tail < self.pages[last].rows() {
+            self.pages[last] = self.pages[last].slice_rows(0, tail);
         }
     }
 
@@ -232,8 +333,27 @@ impl<R: PageRows> Pages<R> {
         if self.head != 0 || rows > self.len || rows % PAGE != 0 {
             return None;
         }
+        // Walk rows: a merged page spans several page boundaries, so a prefix
+        // that is a whole number of PAGEs may still land inside one. The pages
+        // it covers WHOLE are still shared by handle, which is the promise; only
+        // the one it splits is copied, and only that one.
+        let mut pages = Vec::new();
+        let mut left = rows;
+        for p in &self.pages {
+            if left == 0 {
+                break;
+            }
+            let n = p.rows();
+            if n <= left {
+                pages.push(p.clone());
+                left -= n;
+            } else {
+                pages.push(p.slice_rows(0, left));
+                left = 0;
+            }
+        }
         Some(Self {
-            pages: self.pages[..rows / PAGE].to_vec(),
+            pages,
             head: 0,
             len: rows,
         })
@@ -243,23 +363,39 @@ impl<R: PageRows> Pages<R> {
     pub fn assert_sound(&self, width: usize) {
         assert!(self.head < PAGE, "head {} is a whole page", self.head);
         let stored = self.stored();
-        assert_eq!(
-            self.pages.len(),
-            stored.div_ceil(PAGE),
-            "{} pages for {stored} stored rows",
+        assert!(
+            self.pages.len() <= MAX_PAGES,
+            "{} pages, over the {MAX_PAGES} the read is sized for",
             self.pages.len()
         );
+        let mut total = 0usize;
         for (i, p) in self.pages.iter().enumerate() {
             let (n, w) = (p.rows(), p.width());
             assert_eq!(w, width, "page {i} is {w} wide");
-            let want = if i + 1 == self.pages.len() {
-                let t = stored % PAGE;
-                if t == 0 { PAGE } else { t }
-            } else {
-                PAGE
-            };
-            assert_eq!(n, want, "page {i} holds {n} rows, wanted {want}");
+            assert!(n > 0, "page {i} is empty");
+            // The appends fill before they grow, so only the page being filled
+            // may be a partial one — plus page 0, which `drop_front` cuts to
+            // keep the read's dead prefix under one page.
+            if i + 1 != self.pages.len() && i != 0 {
+                assert!(
+                    n.is_multiple_of(PAGE),
+                    "settled page {i} holds {n} rows, not a whole number of pages"
+                );
+            }
+            total += n;
         }
+        assert_eq!(
+            total,
+            stored,
+            "{} pages hold {total} rows against {stored} stored",
+            self.pages.len()
+        );
+        assert!(
+            self.pages.is_empty() || self.head < self.pages[0].rows(),
+            "head {} is past page 0's {} rows",
+            self.head,
+            self.pages[0].rows()
+        );
     }
 }
 
@@ -351,6 +487,18 @@ impl<B: Backend> PageStore<B> {
         self.pages
             .gather()
             .unwrap_or_else(|| Tensor::zeros([0, self.width], dev))
+    }
+
+    /// Rows already dropped from the front of chunk 0 — see [`Pages::head`].
+    pub fn head(&self) -> usize {
+        self.pages.head()
+    }
+
+    /// The pages whole and in order, covering `head() + len()` rows.
+    ///
+    /// The read that does not concatenate; see [`Pages::parts`].
+    pub fn parts(&self) -> Vec<Tensor<B, 2>> {
+        self.pages.parts()
     }
 
     /// Share the first `rows` logical rows with a new store, without copying.
@@ -688,13 +836,42 @@ impl Fp4PageStore {
                 _ => empty,
             };
         };
-        let n = all.rows();
+        self.dequantize(all, dev)
+    }
+
+    /// Rows already dropped from the front of chunk 0 — see [`Pages::head`].
+    pub fn head(&self) -> usize {
+        self.pages.head()
+    }
+
+    /// The pages whole and in order, each dequantized on its own.
+    ///
+    /// One dequant launch per page instead of one over the whole context, and
+    /// the packed `cat` [`Fp4PageStore::materialize`] does first goes away
+    /// entirely. It also changes what the dequant's OUTPUT costs: a page is
+    /// `PAGE * width` values — 256 KB at Inkling's 1024-wide BF16 KV row —
+    /// which the score product consumes immediately, where the whole-context
+    /// form wrote tens of megabytes to DRAM and read them straight back. That
+    /// is the read path this arm needs to be worth its rounding: as
+    /// [`fp4_kv`] says, materializing turns 4.5 bits a value into a 16-bit
+    /// round trip, i.e. MORE traffic than the BF16 cache it replaces.
+    pub fn parts(&self, dev: &burn::backend::cuda::CudaDevice) -> Vec<Tensor<Bk, 2>> {
+        self.pages
+            .parts()
+            .into_iter()
+            .map(|p| self.dequantize(p, dev))
+            .collect()
+    }
+
+    /// One run of packed rows back to the dtype it was appended in.
+    fn dequantize(&self, rows: Fp4Rows, dev: &burn::backend::cuda::CudaDevice) -> Tensor<Bk, 2> {
+        let n = rows.rows();
         let client = self
             .client
             .clone()
             .expect("a non-empty NVFP4 store was filled, so it has a client");
-        let codes = seam::int_handle_of(all.codes);
-        let scales = seam::int_handle_of(all.scales);
+        let codes = seam::int_handle_of(rows.codes);
+        let scales = seam::int_handle_of(rows.scales);
         let out = match self.dtype {
             DType::BF16 => dequantize_nvfp4_bf16(&client, &codes, &scales, n, self.width),
             _ => dequantize_nvfp4(&client, &codes, &scales, n, self.width),
@@ -837,6 +1014,32 @@ impl KvStore<Bk> {
             Self::Fp4(s) => s.materialize(dev),
         }
     }
+
+    /// The retained context as CHUNKS the attention products consume directly,
+    /// in order, covering `head() + len()` rows.
+    ///
+    /// The same rows [`KvStore::materialize`] returns, minus the copy that
+    /// joined them and plus `head()` dead rows at the front — the reader masks
+    /// those, and [`Pages::head`] says why they are not sliced off here.
+    /// Attention is a sum over key positions, so both products decompose:
+    /// `q @ k^T` per chunk concatenated on the key axis, and `p @ v` per chunk
+    /// summed. The softmax between them still sees the whole key axis, so this
+    /// is not an approximation of the materialized read — it is the same
+    /// arithmetic with the intermediate copy removed.
+    pub fn parts(&self, dev: &burn::backend::cuda::CudaDevice) -> Vec<Tensor<Bk, 2>> {
+        match self {
+            Self::Wide(s) => s.parts(),
+            Self::Fp4(s) => s.parts(dev),
+        }
+    }
+
+    /// Rows already dropped from the front of chunk 0 — see [`Pages::head`].
+    pub fn head(&self) -> usize {
+        match self {
+            Self::Wide(s) => s.head(),
+            Self::Fp4(s) => s.head(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -954,6 +1157,125 @@ mod tests {
         // once the front has moved, page 0 is not the prefix's first row
         s.drop_front(1);
         assert!(s.share_prefix(PAGE).is_none(), "offset store cannot share");
+    }
+
+    /// The rows a PAGED read hands over, as indices, and where the live ones
+    /// start.
+    ///
+    /// Deliberately not routed through `materialize`: this is the read the
+    /// attention actually does, and if it agreed with `contents` only because
+    /// both went through the same `gather` the agreement would be worth
+    /// nothing.
+    fn parts_contents(s: &PageStore<B>) -> (usize, Vec<usize>) {
+        let flat: Vec<f32> = Tensor::cat(s.parts(), 0).into_data().to_vec().unwrap();
+        let rows = flat
+            .chunks(W)
+            .map(|c| {
+                assert!(c.iter().all(|x| *x == c[0]), "a row was torn: {c:?}");
+                c[0] as usize
+            })
+            .collect();
+        (s.head(), rows)
+    }
+
+    /// A cache long enough to merge, read the paged way, is the materialized
+    /// read exactly — same rows, same order, once the dead prefix is dropped.
+    ///
+    /// The failure this is aimed at is not "the numbers moved": it is a page
+    /// dropped, duplicated or swapped with its neighbour, which a shape check
+    /// cannot see and a tolerance would hide. So every row carries its own
+    /// index and the comparison is `==`.
+    #[test]
+    fn the_paged_read_is_the_materialized_read() {
+        let mut s = PageStore::<B>::new(W);
+        // Past MAX_PAGES twice over, in batches that do not divide PAGE, so
+        // merges happen with a partial tail page outstanding.
+        let mut at = 0usize;
+        while at < 3 * MAX_PAGES * PAGE {
+            let n = 37.min(3 * MAX_PAGES * PAGE - at);
+            s.append(rows(at, n));
+            at += n;
+        }
+        // Crossing PAGE cuts page 0 and takes the head back to zero...
+        s.drop_front(PAGE + 5);
+        s.assert_sound();
+        assert_eq!(s.head(), 0, "a drop past PAGE should have cut page 0");
+        // ...and the next drop leaves a head that is neither zero nor a page
+        // boundary, which is the case the paged read carries as dead columns
+        // instead of slicing off.
+        s.drop_front(7);
+        s.assert_sound();
+        assert_eq!(s.head(), 7);
+
+        let live = PAGE + 12;
+        let (head, paged) = parts_contents(&s);
+        assert_eq!(
+            &paged[head..head + s.len()],
+            contents(&s).as_slice(),
+            "the paged read and the materialized read disagree"
+        );
+        assert_eq!(
+            &paged[head..head + s.len()],
+            (live..at).collect::<Vec<_>>().as_slice(),
+            "and neither of them is the sequence that went in"
+        );
+    }
+
+    /// Merging the settled pages is a `cat` of adjacent runs and nothing else:
+    /// the rows, their order, and both trims all survive it.
+    #[test]
+    fn merging_settled_pages_changes_nothing_a_reader_can_see() {
+        let mut s = PageStore::<B>::new(W);
+        for i in 0..(MAX_PAGES + 4) {
+            s.append(rows(i * PAGE, PAGE));
+            s.assert_sound();
+        }
+        let total = (MAX_PAGES + 4) * PAGE;
+        assert!(
+            s.parts().len() <= MAX_PAGES,
+            "{} chunks after {} pages' worth",
+            s.parts().len(),
+            MAX_PAGES + 4
+        );
+        assert_eq!(contents(&s), (0..total).collect::<Vec<_>>());
+
+        // Both ends, on a store whose page 0 is now many pages wide. The front
+        // drop crosses PAGE, which is what cuts page 0 rather than releasing it.
+        s.drop_front(2 * PAGE + 9);
+        s.assert_sound();
+        assert!(s.head() < PAGE, "head {} is a whole page", s.head());
+        s.truncate(s.len() - 11);
+        s.assert_sound();
+        assert_eq!(
+            contents(&s),
+            (2 * PAGE + 9..total - 11).collect::<Vec<_>>(),
+            "a merged store lost or reordered rows under a trim"
+        );
+
+        // And it is still a store: the next token appends onto the kept rows.
+        s.append(rows(total - 11, 3));
+        s.assert_sound();
+        assert_eq!(
+            contents(&s).last().copied(),
+            Some(total - 9),
+            "an append after a merge and a trim did not land at the end"
+        );
+    }
+
+    /// A prefix that is a whole number of PAGEs but lands INSIDE a merged page
+    /// is still shared, and still does not follow the parent.
+    #[test]
+    fn a_shared_prefix_survives_a_merge() {
+        let mut s = PageStore::<B>::new(W);
+        for i in 0..(MAX_PAGES + 2) {
+            s.append(rows(i * PAGE, PAGE));
+        }
+        let shared = s.share_prefix(3 * PAGE).expect("page-aligned prefix");
+        shared.assert_sound();
+        assert_eq!(contents(&shared), (0..3 * PAGE).collect::<Vec<_>>());
+        s.append(rows((MAX_PAGES + 2) * PAGE, 5));
+        assert_eq!(shared.len(), 3 * PAGE);
+        assert_eq!(contents(&shared), (0..3 * PAGE).collect::<Vec<_>>());
     }
 
     #[test]
@@ -1095,6 +1417,43 @@ mod tests {
         // dense store makes, and the one a Vec of handles could easily break.
         shared.assert_sound();
         assert_eq!(fcontents(&shared), (0..2 * PAGE).collect::<Vec<_>>());
+    }
+
+    /// Per-page dequantization is BIT-identical to dequantizing the joined
+    /// context, and still in order, on a store long enough to have merged.
+    ///
+    /// Exact, with no tolerance: NVFP4 quantizes per row and per 16 features,
+    /// so how the rows are GROUPED when they are decoded cannot change one
+    /// output element. If it ever does, the grouping is reaching across a block
+    /// boundary, which is the bug worth failing for — and a tolerance sized for
+    /// four bits would swallow it whole.
+    #[test]
+    fn fp4_paged_read_is_the_materialized_read_bit_for_bit() {
+        let mut s = Fp4PageStore::new(FW, DType::F32);
+        let mut at = 0usize;
+        while at < 2 * MAX_PAGES * PAGE {
+            let n = 37.min(2 * MAX_PAGES * PAGE - at);
+            s.append(frows(at, n));
+            at += n;
+        }
+        s.drop_front(PAGE + 5);
+        s.drop_front(7);
+        s.assert_sound();
+        let head = s.head();
+        assert_eq!(head, 7, "the head the read has to mask");
+
+        let want: Vec<f32> = s.materialize(&fp4_dev()).into_data().to_vec().unwrap();
+        let paged: Vec<f32> = Tensor::cat(s.parts(&fp4_dev()), 0)
+            .into_data()
+            .to_vec()
+            .unwrap();
+        assert_eq!(paged.len(), (head + s.len()) * FW);
+        assert_eq!(
+            &paged[head * FW..],
+            want.as_slice(),
+            "per-page dequantization disagrees with the whole-context one"
+        );
+        assert_eq!(fcontents(&s), (PAGE + 12..at).collect::<Vec<_>>());
     }
 
     #[test]
