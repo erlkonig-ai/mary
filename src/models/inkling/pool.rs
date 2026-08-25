@@ -638,7 +638,13 @@ mod tests {
         }
     }
 
+    /// Linux only, and for the same reason the next test is: `at_layer` reads
+    /// `MemAvailable` BEFORE it calls `stranded`, and a node with no
+    /// `/proc/meminfo` takes the cheap branch without ever asking. On macOS
+    /// this counted zero polls where it wanted forty-two, so a green main was
+    /// red on every developer machine that is not a Spark.
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_quiet_pass_drops_to_one_poll_and_the_last_layer_keeps_it_honest() {
         let mut gate = CleanupGate::with_schedule(CleanupPolicy::WhenStranded, false);
         let seen = drive(&mut gate, 4, 42, 0);
