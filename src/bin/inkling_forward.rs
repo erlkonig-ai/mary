@@ -1472,21 +1472,30 @@ enum HeadLane {
 /// English prompt, tail node, p50 of 24 warm passes of the `head / unembed`
 /// stage timer (device time, one sync). ALL THREE FIGURES ARE PER TAIL PASS:
 ///
-/// | lane  | table    | head stage | achieved  |
-/// |-------|----------|-----------:|----------:|
-/// | BF16  | 1.53 GiB |    10.1 ms | 163 GB/s  |
-/// | W4A16 | 0.43 GiB |     6.7 ms |  69 GB/s  |
-/// | W4A4  | 0.43 GiB |     6.1 ms |  76 GB/s  |
+/// | lane  | table    | kernel        | head stage | achieved  |
+/// |-------|----------|---------------|-----------:|----------:|
+/// | BF16  | 1.53 GiB | cubek, TUNED  |    10.1 ms | 163 GB/s  |
+/// | W4A16 | 0.43 GiB | hand mma      |     6.2 ms |  74 GB/s  |
+/// | W4A4  | 0.43 GiB | hand mma      |     6.1 ms |  76 GB/s  |
 ///
-/// So the bytes fell by 3.56x and the TIME by 1.51x. The format is not the
-/// thing that failed to deliver -- the kernel is: at BF16 the head runs at 67%
-/// of this box's measured 242.9 GB/s, and at four bits at 28%. One warp per
-/// `(m_tile, n_tile)` has eight times less work to hide latency behind when
-/// each row is 2 KB instead of 8, and the grid did not change. Roughly 3.8 ms
-/// a pass is still on the table INSIDE the four-bit lane, which is larger than
-/// everything the switch has won so far, and any narrower code (a 1-bit
-/// sketch, a prefix-K scan) inherits the same limiter before it inherits the
-/// same win.
+/// The bytes fell by 3.56x and the TIME by 1.63x, and THE ARMS DO NOT SHARE A
+/// KERNEL. `hand BF16 lane: 0 launches` in both logs: every plain-BF16 GEMM in
+/// this run went to `cubek::matmul::launch_ref`, because the unembed table
+/// aliases the pile at `align >= MIN_TUNED_ALIGN`. The four-bit lanes have no
+/// tuned equivalent and run `w4a16gemm` / `fp4gemm`, one warp per
+/// `(m_tile, n_tile)`. So the 163-against-74 GB/s gap is a TUNED-VERSUS-HAND
+/// comparison wearing a bits-per-weight label, and this measurement cannot
+/// separate the two. What it does establish is the ceiling: a four-bit head
+/// that reached the BF16 lane's 163 GB/s would be 2.84 ms, so ~3.4 ms a pass
+/// is unclaimed inside the four-bit lane -- more than the switch has won so
+/// far.
+///
+/// One piece of it was measured directly. The B-fragment load used to fetch
+/// the packed `u32` and the E4M3 scale once per ELEMENT rather than once per
+/// pair; hoisting both out of the `j` loop (same bytes, quarter the memory
+/// instructions, bit-identical output -- the lane-parity test's rel RMS is
+/// 0.0091 either way) moved the stage 6.7 -> 6.2 ms. Worth having, and small
+/// enough to say that instruction count is not where the rest of the gap is.
 ///
 /// Output: 24 greedy tokens, one differed from the BF16 arm, and it differed
 /// at a 0.08-logit gap (`26500` at 18.59 against `306` at 18.51, which W4A16
