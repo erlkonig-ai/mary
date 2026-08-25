@@ -224,7 +224,7 @@ impl AllocatorConfig {
         match self {
             Self::SubSlices | Self::ExclusivePages => {
                 let full = machine / 4 + machine / 16;
-                let scaled = full.saturating_mul(prefill_tokens as u64) / PREFILL_REFERENCE;
+                let scaled = full.saturating_mul(prefill_tokens as u64) / Self::PREFILL_REFERENCE;
                 scaled.clamp(machine / 16, full)
             }
         }
@@ -351,11 +351,11 @@ mod tests {
     fn allocator_floor_stays_conservative_for_both_strategies() {
         let machine = 128 << 30;
         assert_eq!(
-            AllocatorConfig::SubSlices.admission_floor(machine),
+            AllocatorConfig::SubSlices.admission_floor(machine, 16_384),
             40 << 30
         );
         assert_eq!(
-            AllocatorConfig::ExclusivePages.admission_floor(machine),
+            AllocatorConfig::ExclusivePages.admission_floor(machine, 16_384),
             40 << 30
         );
     }
@@ -371,7 +371,7 @@ mod tests {
         let live = 971 * GIB / 100;
         let reserved = 3012 * GIB / 100;
         let retained = reserved - live;
-        let floor = AllocatorConfig::ExclusivePages.admission_floor(machine);
+        let floor = AllocatorConfig::ExclusivePages.admission_floor(machine, 16_384);
         assert!(floor >= retained);
         assert!(live + floor >= reserved);
     }
