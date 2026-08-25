@@ -1534,6 +1534,37 @@ pub fn swizzleable(n: usize, k: usize) -> bool {
 /// read runs last), not the routed lane, which is enqueued early and finishes
 /// under the host.
 ///
+/// ## Where it DOES show: the WIDE pass
+///
+/// Same worktree, same three arms, `INK_SLOTS=32` on the 3732-token file,
+/// `INK_LAYERS=0:16`, `--gen 8`, gated (0% util, 208-227 MHz idle clocks, no
+/// compute process at the pre-run gate). That run has two regimes in one
+/// series and they must not be medianed together — 31 SLOT-PREFILL passes
+/// (one 116-token chunk each) and then 6 BATCHED-DECODE passes (32 rows).
+/// Per-rep medians, three reps:
+///
+/// ```text
+///                        rowmajor            PRE-PERM            staged(1)
+///   slot-prefill pass  282.4 281.9 280.4  275.7 273.0 272.8  291.4 289.3 292.9
+///   batched-decode     152.4 156.3 153.7  153.3 155.1 156.2  154.3 160.1 154.3
+/// ```
+///
+/// On the WIDE pass the arms do not overlap: **281.9 -> 273.0 ms, -3.2% a
+/// pass**, against a within-arm spread of 0.7% and 1.1%, and staging is
+/// consistently WORSE at +3.4% — which is the prefill column of this module's
+/// probe table showing up end to end, where `staged` at one plane collapses.
+/// On the batched-decode pass all three overlap, and the same breakdown says
+/// why: `DEVICE, one sync` is **0.5-1.4 ms of a 153 ms pass** there, with 93.7
+/// ms of the host's mlp half spent enqueueing.
+///
+/// So the honest end-to-end summary is one line: **the permutation is worth
+/// ~3% on a pass wide enough to have device work exposed, and nothing on a
+/// pass this runtime spends enqueueing.** Token output was identical in every
+/// arm of both runs — 9 reps at 32 slots share one digest over every emitted
+/// token of every slot, and every printed top-5 logit agrees to the printed
+/// two decimals. That is an observation, not a gate; nothing in this lane
+/// tests for it.
+///
 /// That does not refute the 2x; it locates it. The routed lane is not grid-
 /// starved at decode either — one stage launches `n / NTILE = 512` cubes over
 /// `blocks` = the active-expert count with `nrep = 1`, i.e. ~3072 working
