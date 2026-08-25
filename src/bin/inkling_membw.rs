@@ -421,28 +421,37 @@ pub fn axis_frag_b(
     #[comptime] size_n: usize,
     #[comptime] sc_mode: u32,
     #[comptime] ut: usize,
+    #[comptime] tpw: usize,
 ) {
     let warp = ABSOLUTE_POS as usize / 32;
     let lane = ABSOLUTE_POS as usize % 32;
     // Four lanes per weight row, eight rows per plane -- the n tile is 8 wide.
-    let row = warp * 8 + lane / 4;
     let sub = lane % 4;
     let cw = comptime!(size_k / 8); // u32 words in one row of codes
     let sw = comptime!(size_k / 64); // u32 words in one row of scales
     let steps = comptime!(size_k / 64 / ut);
     let mut acc = u32::new(0i64);
-    for s in 0..steps {
-        #[unroll]
-        for u in 0..ut {
-            let t = s * ut + u;
-            let base = row * cw + t * 8 + sub;
-            acc += codes[base];
-            acc += codes[base + 4];
-            if comptime![sc_mode == 1] {
-                acc += scales[row * sw + t];
-            }
-            if comptime![sc_mode == 2] {
-                acc += scales[t * size_n + row];
+    // `tpw` consecutive n tiles per plane. It reads exactly the same addresses
+    // in a different ORDER and, crucially, with `tpw` times fewer resident
+    // planes -- which is the one thing separating this model from the kernel
+    // it models. `fp4_linear` launches `CubeDim::new_1d(32)`, one plane to a
+    // cube, so its occupancy is capped by the per-SM CUBE limit; this model's
+    // 256-thread cubes put eight planes on that same budget.
+    for g in 0..tpw {
+        let row = (warp * tpw + g) * 8 + lane / 4;
+        for s in 0..steps {
+            #[unroll]
+            for u in 0..ut {
+                let t = s * ut + u;
+                let base = row * cw + t * 8 + sub;
+                acc += codes[base];
+                acc += codes[base + 4];
+                if comptime![sc_mode == 1] {
+                    acc += scales[row * sw + t];
+                }
+                if comptime![sc_mode == 2] {
+                    acc += scales[t * size_n + row];
+                }
             }
         }
     }
@@ -647,8 +656,7 @@ fn run_axes() -> Result<()> {
     }
 
     // ---- rows 7-9: the GEMM's own B footprint ------------------------------
-    let threads = n * 4; // 32 lanes per n tile of 8 rows
-    let blocks = (threads as u32).div_ceil(BLOCK);
+    let threads0 = n * 4; // 32 lanes per n tile of 8 rows
     for (label, mode, with_sc, ut) in [
         ("7  m16n8k64 B footprint, codes only", 0u32, false, 1usize),
         (
@@ -669,6 +677,8 @@ fn run_axes() -> Result<()> {
         ("13 row 9, 8 k tiles per iteration", 2u32, true, 8usize),
         ("14 row 7, 8 k tiles per iteration", 0u32, false, 8usize),
     ] {
+        let threads = threads0 / tpw;
+        let blocks = (threads as u32).div_ceil(BLOCK);
         let bytes = if with_sc { codes_b + scales_b } else { codes_b };
         let (b, f) = best_first(
             || {
@@ -685,6 +695,7 @@ fn run_axes() -> Result<()> {
                         n,
                         mode,
                         ut,
+                        tpw,
                     )
                 };
                 let _ = cubecl::future::block_on(client.sync());
