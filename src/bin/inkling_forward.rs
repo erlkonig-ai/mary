@@ -446,6 +446,29 @@
 //! 20-token run)"; on 2048 positions the two are 0.2310 and 0.2266, which is
 //! inside the interval. A twenty-step difference was a twenty-step difference.
 //!
+//! ### Why three of these readings could never have mattered
+//!
+//! Entry raw vs final-normed, the ceiling normed once vs twice, and
+//! `INK_MTP_OUTNORM=0` vs on all came back inside their intervals. That is one
+//! fact, and it is a property of the checkpoint rather than a coincidence:
+//!
+//!     model.llm.norm.weight       mean 5.6379  sd 0.3184   sd/mean 0.056
+//!     model.mtp.0.embed_norm      mean 0.8388  sd 0.4408   sd/mean 0.526
+//!
+//! **The backbone's final norm is a near-SCALAR** -- a 4096-vector whose gain
+//! varies by 5.6% about 5.64. RMS norm is scale-invariant, so applying it, not
+//! applying it, or applying it twice moves the vector by something very close to
+//! a global factor, and a global factor cannot move an argmax. The reasoning in
+//! the `entry` comment -- "the two differ ONLY by the final norm's learned
+//! weight vector" -- is right, and the weight vector turns out to be nearly
+//! constant.
+//!
+//! The MTP heads' own `embed_norm` is NOT: sd/mean 0.526, a real per-channel
+//! gain. Which is exactly the one whose ablation moves the rate, by 26%. The
+//! norms that are shaped like a scalar do nothing; the norm that is shaped like
+//! a function does something. Worth knowing before the next reading of the
+//! wrapper gets measured on twenty steps.
+//!
 //! ## The cached step lane is not the bug (`INK_MTP_STEPCHECK`)
 //!
 //! The teacher-forced rate is measured in the drafting PREFILL and the decode
