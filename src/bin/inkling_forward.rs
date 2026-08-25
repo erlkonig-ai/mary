@@ -5969,6 +5969,31 @@ fn main() -> Result<()> {
                 // over the same two arms puts GPU kernel time at 41.2 ms of the
                 // pass, so the device is busy 74% of a blocking pass and 80% of a
                 // probe pass, and 41 ms is the floor either way.
+                //
+                // Reproduced 2026-08-25 at commit 56c1ebbcdff6, same box, same
+                // lane, `bench-decode.sh -n 3 --gen 12 --layers 0:16` on the
+                // 3732-token cover, four arms interleaved, medians over 33 warm
+                // passes. It also settles what `INK_DEV_PLAN=1` is worth, which
+                // the probe alone could not say -- the probe is not a lane:
+                //
+                //   arm                 ms/step   `router + group`   BLOCKING read
+                //   base                   58.0             23.8            23.5
+                //   INK_ROUTE_STALE=1      54.5              0.4             0.0
+                //   INK_DEV_PLAN=1         54.5              0.3             0.0
+                //
+                // The two non-base arms land on the SAME 54.5, which is the
+                // result: `INK_DEV_PLAN` captures all of what removing the read
+                // can capture, and there is nothing further in the router. So the
+                // 23.8 ms bucket is 3.5 ms of serialisation, 0.2 ms of describing
+                // the router matmul, 0.0 ms of host top-k, and ~20 ms of GPU work
+                // the host would have waited for somewhere. Under `INK_DEV_PLAN`
+                // that 20 ms reappears as attention-half ENQUEUE (11.6 -> 22.8 ms,
+                // back-pressure, not work) and at the one sync (1.3 -> 5.4).
+                //
+                // `INK_DEV_PLAN=1` emitted a token stream identical to base --
+                // same md5 over all twelve steps, all three reps -- and raised no
+                // fault flag, and its rep-to-rep spread is 0.4% against base's
+                // 5.5%, because the removed sync is the jittery part.
                 let rows = t.n_routed_experts + t.n_shared_experts;
                 let t_rt = Instant::now();
                 // `cols` is what comes BACK, which is `rows` except on the BF16 arm,
