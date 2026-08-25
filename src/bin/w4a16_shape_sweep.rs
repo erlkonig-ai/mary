@@ -104,13 +104,19 @@ fn launch_into(
 }
 
 /// Operands for one shape, allocated once and reused across every round.
+///
+/// `rot` holds SEVERAL distinct weight tables and the repeats cycle through
+/// them. Without that, `REPS` back-to-back launches over one buffer let any
+/// working set under the 24 MiB L2 be served from L2 on repeats 2..REPS — which
+/// flatters exactly the small shapes this is trying to judge, and is why v2 read
+/// a 9 MiB table at 100 GB/s and a 36 MiB one at 45. Enough copies are made to
+/// exceed 2x L2, so every launch reads memory the previous one evicted.
 struct Shape {
     m_pad: usize,
     k: usize,
     n: usize,
     a: Handle,
-    b: Handle,
-    sc: Handle,
+    rot: Vec<(Handle, Handle)>,
     out: Handle,
     pipe: f64,
     solo: f64,
@@ -118,13 +124,18 @@ struct Shape {
 
 impl Shape {
     fn new(client: &ComputeClient<Rt>, m_pad: usize, k: usize, n: usize) -> Self {
+        let bytes = table_bytes(n, k);
+        // 2x the 24 MiB L2, so a repeat cannot be served from what the previous
+        // launch left behind. Capped so the big shapes do not allocate 7 GiB.
+        let rot = ((48usize << 20).div_ceil(bytes.max(1))).clamp(1, 12);
         Shape {
             m_pad,
             k,
             n,
             a: client.empty(m_pad * k * 2),
-            b: client.empty(n * (k / 8) * 4),
-            sc: client.empty(n * (k / 16)),
+            rot: (0..rot)
+                .map(|_| (client.empty(n * (k / 8) * 4), client.empty(n * (k / 16))))
+                .collect(),
             out: client.empty(m_pad * n * 4),
             pipe: f64::MAX,
             solo: f64::MAX,
@@ -138,16 +149,18 @@ impl Shape {
     }
     fn round(&mut self, client: &ComputeClient<Rt>, keep: bool) {
         let t0 = Instant::now();
-        for _ in 0..REPS {
+        for r in 0..REPS {
+            let (b, sc) = &self.rot[r % self.rot.len()];
             launch_into(
-                client, &self.a, &self.b, &self.sc, &self.out, self.m_pad, self.k, self.n,
+                client, &self.a, b, sc, &self.out, self.m_pad, self.k, self.n,
             );
         }
         let _ = future::block_on(client.sync());
         let dt = t0.elapsed().as_secs_f64() / REPS as f64;
+        let (b0, sc0) = &self.rot[0];
         let t1 = Instant::now();
         launch_into(
-            client, &self.a, &self.b, &self.sc, &self.out, self.m_pad, self.k, self.n,
+            client, &self.a, b0, sc0, &self.out, self.m_pad, self.k, self.n,
         );
         let _ = future::block_on(client.sync());
         let ds = t1.elapsed().as_secs_f64();
@@ -169,17 +182,18 @@ fn sweep(client: &ComputeClient<Rt>, title: &str, mut shapes: Vec<Shape>) -> Vec
         }
     }
     println!(
-        "{:>7} {:>7} {:>7} {:>7} {:>9} {:>9} {:>9} {:>8} {:>8}",
-        "m_pad", "k", "n", "cubes", "MiB", "pipe ms", "solo ms", "GB/s", "ovh us"
+        "{:>7} {:>7} {:>7} {:>7} {:>9} {:>4} {:>9} {:>9} {:>8} {:>8}",
+        "m_pad", "k", "n", "cubes", "MiB", "rot", "pipe ms", "solo ms", "GB/s", "ovh us"
     );
     for s in &shapes {
         println!(
-            "{:>7} {:>7} {:>7} {:>7} {:>9.2} {:>9.4} {:>9.4} {:>8.1} {:>8.1}",
+            "{:>7} {:>7} {:>7} {:>7} {:>9.2} {:>4} {:>9.4} {:>9.4} {:>8.1} {:>8.1}",
             s.m_pad,
             s.k,
             s.n,
             s.cubes(),
             s.bytes() as f64 / (1u64 << 20) as f64,
+            s.rot.len(),
             s.pipe * 1e3,
             s.solo * 1e3,
             s.bytes() as f64 / s.pipe / 1e9,
@@ -243,6 +257,17 @@ fn main() {
             .collect(),
     );
 
+    // A grid sweep at the DOWN k, where the per-cube trip count is halved and
+    // the ramp is therefore a larger share of the launch.
+    sweep(
+        &client,
+        "n sweep (k=2048, m_pad=16): the down GEMM's own k",
+        [2048usize, 4096, 8192, 16384, 32768, 65536, 114688]
+            .iter()
+            .map(|&n| Shape::new(&client, 16, 2048, n))
+            .collect(),
+    );
+
     // ---- 3. the real sink shapes and the head, side by side ----------------
     sweep(
         &client,
@@ -277,6 +302,9 @@ fn main() {
         let mut fused = Shape::new(&client, 16, k, big_n);
         let bytes = table_bytes(per_n, k) * count;
         let mut split = f64::MAX;
+        // The THIRD arm is what the real stack runs: the library launcher, which
+        // calls client.empty for its own output on every one of the 42 calls.
+        let mut lib = f64::MAX;
         for r in 0..ROUNDS + 2 {
             let t0 = Instant::now();
             for (b, sc, out) in &parts {
@@ -284,9 +312,18 @@ fn main() {
             }
             let _ = future::block_on(client.sync());
             let dt = t0.elapsed().as_secs_f64();
+            let t1 = Instant::now();
+            let outs: Vec<Handle> = parts
+                .iter()
+                .map(|(b, sc, _)| w4a16_linear_launch::<Rt>(&client, &a, b, sc, 16, k, per_n, 1.0))
+                .collect();
+            let _ = future::block_on(client.sync());
+            let dl = t1.elapsed().as_secs_f64();
+            drop(outs);
             fused.round(&client, r >= 2);
             if r >= 2 {
                 split = split.min(dt);
+                lib = lib.min(dl);
             }
         }
         println!(
@@ -306,6 +343,16 @@ fn main() {
             fused.pipe * 1e3,
             bytes as f64 / fused.pipe / 1e9,
             split / fused.pipe
+        );
+        println!(
+            "    split, LIBRARY launcher (allocates out per call) : {:>8.4} ms   {:>6.1} GB/s",
+            lib * 1e3,
+            bytes as f64 / lib / 1e9
+        );
+        println!(
+            "      the allocation tax alone: {:>7.4} ms over {count} calls = {:.1} us each",
+            (lib - split) * 1e3,
+            (lib - split) / count as f64 * 1e6
         );
     }
 }
