@@ -5138,6 +5138,31 @@ fn main() -> Result<()> {
          INK_MTP_PROB and read acceptance.",
         draft_topk
     );
+    // And the same refusal against the approximate head, for the same reason
+    // one step removed.
+    //
+    // The aNN lane returns a full-width row, so nothing here would SHAPE-fail --
+    // which is exactly why it needs saying. Only the shortlist carries exact
+    // scores; every other entry is a sketch estimate, so a softmax over that row
+    // has a denominator built partly out of estimates. The argmax does not care
+    // (the top is exact and the measurement says so), and a per-token
+    // PROBABILITY does. `INK_MTP_PROB` is the one consumer that reads the row as
+    // a distribution rather than as a ranking.
+    //
+    // Nothing else in the pass has this exposure. The per-position top-5 report
+    // and `INK_DRAFT_TOPK`'s gather both read the row as a RANKING and both stop
+    // far inside the shortlist -- 5 and 512 against 8192 -- so every row they
+    // touch was rescored exactly.
+    anyhow::ensure!(
+        !(mtp_prob && ann_budget() > 0),
+        "INK_MTP_PROB reads the head's row as a DISTRIBUTION, and the approximate head \
+         (INK_ANN_HEAD={}) returns exact scores only for the {} rows it shortlisted -- \
+         the rest of the row is the sketch's estimate, so the softmax denominator would \
+         be part estimate and the probabilities would look ordinary while being wrong. \
+         Set INK_ANN_HEAD=0 for probability scoring.",
+        ann_budget(),
+        ann_budget()
+    );
     // The draft head's distribution, kept from the step that issued it until
     // the step it names arrives with the target's. 800 KB a draft at f32 and
     // at most k(k+1)/2 alive at once.
