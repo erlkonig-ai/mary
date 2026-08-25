@@ -38,9 +38,9 @@ const BLOCK: u32 = 256;
 /// covers 512 consecutive bytes, which is the fully-coalesced case the hand
 /// lanes are being measured against.
 #[cube(launch)]
-pub fn stream_packed(
-    w: &Tensor<Vector<u32, 4>>,
-    sc: &Tensor<Vector<u32, 4>>,
+pub fn stream_packed<NW: Size>(
+    w: &Tensor<Vector<u32, NW>>,
+    sc: &Tensor<Vector<u32, NW>>,
     out: &mut Tensor<u32>,
     #[comptime] threads: usize,
     #[comptime] per: usize,
@@ -50,11 +50,11 @@ pub fn stream_packed(
     #[unroll]
     for i in 0..per {
         let v = w[t + i * threads];
-        acc += v[0] ^ v[1] ^ v[2] ^ v[3];
+        acc += v[0];
     }
     // The scale plane is 1/8 the words; one step over it is the right ratio.
     let s = sc[t % sc.len()];
-    acc += s[0] ^ s[1] ^ s[2] ^ s[3];
+    acc += s[0];
     if t < out.len() {
         out[t] = acc;
     }
@@ -111,7 +111,6 @@ fn main() {
                 &client,
                 CubeCount::Static(blocks, 1, 1),
                 CubeDim::new_1d(BLOCK),
-                4,
                 4,
                 TensorArg::from_raw_parts(b.clone(), [1].into(), [words / 4].into()),
                 TensorArg::from_raw_parts(b_sc.clone(), [1].into(), [scales / 16].into()),
