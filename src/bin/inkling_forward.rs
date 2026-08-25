@@ -201,8 +201,16 @@
 //! the N tokens the main model just ranked highest at this position — gathered
 //! once per step, shared by every depth, 4 MiB at N = 512 against 1.65 GiB. A
 //! token outside that set can no longer be drafted, so drafts and acceptance
-//! both move; the flag is default-off precisely so the trade is an ablation and
-//! not a silent change to what the runtime predicts. It is refused together with
+//! both move.
+//!
+//! **This paragraph said "default-off" until 2026-08-25 and the switch table at
+//! the top said 512, and the table was right.** The default flipped without the
+//! sweep the code's own comment says would settle it, and the two halves of this
+//! file then disagreed about what a bare run does — which matters because it is
+//! exactly the kind of number that gets quoted across runs. Worth knowing when
+//! reading older acceptance figures: `mary-measure` (160848d) and everything
+//! before the flip measured the UNPRUNED head, so those figures do not transfer
+//! to a bare run of current main. It is refused together with
 //! `INK_MTP_PROB`, which scores the draft's distribution by full-vocabulary token
 //! index and would otherwise be handed 512 numbers about a different index space.
 //!
@@ -8223,11 +8231,81 @@ fn main() -> Result<()> {
                                 mtp_order,
                             ));
                         }
-                        if made.len() == 1 {
+                        let stepped = if made.len() == 1 {
                             made.pop().expect("one row")
                         } else {
                             BT::cat(made, 0)
+                        };
+                        // `INK_MTP_STEPCHECK=1`: the cached STEP against a fresh
+                        // whole-sequence PREFILL of the same head over the same
+                        // rows. Nothing else checks this pair.
+                        //
+                        // `INK_MTP_CHECK` compares the cached lane to the host
+                        // whole-sequence one, and is ASSERTED only for the host
+                        // cached lane -- the device one it merely reports. So the
+                        // lane every speculative run actually drafts on has never
+                        // had its step path checked against its own prefill, and a
+                        // step path that diverges does not error: it shows up as an
+                        // acceptance rate, months later, indistinguishable from a
+                        // model that simply drafts badly.
+                        //
+                        // Expensive by construction (a full prefill per head per
+                        // pass), so: short prompt, few steps.
+                        if std::env::var("INK_MTP_STEPCHECK")
+                            .map(|val| val == "1")
+                            .unwrap_or(false)
+                        {
+                            let mut embeds = vec![0f32; want * h];
+                            for j in 0..want {
+                                let tok = if j + d + 1 < seq {
+                                    ids[j + d + 1]
+                                } else {
+                                    best
+                                };
+                                embeds[j * h..(j + 1) * h].copy_from_slice(&mtp_embed_row(
+                                    e_w,
+                                    e_bn,
+                                    tok,
+                                    t.rms_norm_eps,
+                                    t.vocab_size,
+                                    h,
+                                ));
+                            }
+                            let ed = up2::<Bk>(embeds, want, h, &dev);
+                            let hin = if d == 0 {
+                                main_dev.clone().slice([0..want, 0..h])
+                            } else {
+                                row_of(&mtp_stage_dev[d - 1], 0, want)
+                            };
+                            let (fresh, _) = mtp_block_prefill_dev(
+                                hin,
+                                ed,
+                                &mtp_devs[d],
+                                &hd,
+                                Some(ls),
+                                window,
+                                t.sconv_kernel_size,
+                                t.rms_norm_eps,
+                                mtp_order,
+                            );
+                            let a = fresh.slice([want - 1..want, 0..h]);
+                            let b = stepped.clone().slice([adv - 1..adv, 0..h]);
+                            let diff = (a.clone() - b.clone()).abs().max().into_scalar();
+                            let scale = a.clone().abs().max().into_scalar();
+                            let (ta, tb) = (draft_argmax_dev(a), draft_argmax_dev(b));
+                            println!(
+                                "  MTP STEPCHECK depth {} pos {}: max|prefill-step| {:.4e}                                  against |prefill|max {:.4e} ({:.2}%); token {} vs {} -- {}",
+                                d + 1,
+                                want - 1,
+                                diff,
+                                scale,
+                                100.0 * diff as f64 / (scale as f64).max(1e-30),
+                                ta,
+                                tb,
+                                if ta == tb { "agree" } else { "DISAGREE" }
+                            );
                         }
+                        stepped
                     };
                     mtp_stage_dev[d] = Some(match mtp_stage_dev[d].take() {
                         None => stable,
