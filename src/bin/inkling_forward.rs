@@ -420,6 +420,34 @@
 //! 20-token run)"; on 2048 positions the two are 0.2310 and 0.2266, which is
 //! inside the interval. A twenty-step difference was a twenty-step difference.
 //!
+//! ## The binding constraint is c(2), not acceptance
+//!
+//! It is worth writing the break-even down, because it decides what work is
+//! worth doing and it is not the work the acceptance rate points at.
+//!
+//! Speculation at width `k` pays iff `E(k) > c(k+1)`, where `c(m)` is what an
+//! `m`-row verify pass costs against a one-row pass. On the REAL 42-layer
+//! configuration -- two nodes, layers 0:21 and 21:42 over the direct link,
+//! `INK_KV=1`, a 3732-token document, warm p50, both reps of a two-rep run:
+//!
+//!     spec0   117.7 ms/step   8.499 tok/s   E 1.000
+//!     spec1   212.0 ms/step   7.942 tok/s   E 1.681   ->  0.934x
+//!
+//!   c(2) = 212.0 / 117.7 = **1.801**
+//!
+//! So the loop needs `p1 > 0.801` merely to break even, and it has 0.681. That
+//! is a 7% shortfall -- and the number that makes it a shortfall is c(2), not
+//! p1. At the reference's own quoted 0.85 the same machine would return
+//! 1.85 / 1.801 = **1.03x**: a three-percent win. There is no acceptance rate
+//! this configuration can be handed that makes speculation worth the risk while
+//! the second row of a verify pass costs 80% of a whole pass.
+//!
+//! The same arithmetic run the other way: at c(2) = 1.2 -- what a second row
+//! ought to cost when the lane is a real batched GEMM -- today's 1.681 would be
+//! **1.40x**. The drafter is not what is between this stack and a speculative
+//! win; the `m > 1` lane is. See "The width cost is a STEP" below, which found
+//! half of it and named the rest.
+//!
 //! ## Three acceptance rates that are all correct
 //!
 //! This file has quoted 22.0%, 50.0% and 71.2% for depth-1 acceptance and they
