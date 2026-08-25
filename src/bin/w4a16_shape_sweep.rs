@@ -45,8 +45,12 @@ fn table_bytes(n: usize, k: usize) -> usize {
 /// grid onto the device, and nothing else.
 #[cube(launch)]
 pub fn null_kernel(out: &mut Tensor<u32>) {
-    if ABSOLUTE_POS == u32::new(0xFFFF_FFFFi64) {
-        out[0] = ABSOLUTE_POS;
+    let t = ABSOLUTE_POS as usize;
+    let acc = u32::cast_from(t);
+    // Sentinel-guarded: the launch pays for no traffic at all, which is the
+    // point — this row is the fixed cost of a grid, not of a memory access.
+    if acc == u32::new(0x5AFE_5AFEi64) {
+        out[t % out.len()] = acc;
     }
 }
 
