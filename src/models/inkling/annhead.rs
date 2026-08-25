@@ -168,6 +168,19 @@ pub const AUX_UNITS: u32 = 256;
 /// Lanes in a rescore plane. One plane rescores one candidate row.
 pub const PLANE: u32 = 32;
 
+/// The three words [`ann_logits`] reads back, in one buffer.
+///
+/// One buffer and not three, because each `read_one` is a SYNC. Three of them
+/// is three host-device round trips on the critical path of a decode step, for
+/// twelve bytes that are all sitting in device memory at the same instant. The
+/// slots are shared across four kernels that bind the same handle as an atomic
+/// array or a plain one depending on what they do to it.
+const META_PEAK: usize = 0;
+const META_COUNT: usize = 1;
+const META_FLOOR: usize = 2;
+/// Words in that buffer.
+const META_WORDS: usize = 3;
+
 /// A large finite negative, not `-inf`: this value reaches a softmax downstream
 /// and `-inf` there produces a NaN if it is ever the row maximum.
 const VERY_LOW: f32 = -3.0e38;
@@ -601,15 +614,39 @@ fn ann_scan_kernel(
     }
     sync_cube();
 
+    // FOUR words issued before any is consumed. A unit's successive words are
+    // `n * 4` bytes apart -- 804 KiB at the head's shape -- so a warp that loads
+    // one, consumes it, then loads the next has exactly one read in flight and
+    // eats the full DRAM latency 128 times. The warp's 32 lanes coalesce into
+    // one 128-byte transaction either way; what this adds is memory-level
+    // PARALLELISM, which is the other half of covering latency and the half a
+    // scalar loop cannot express.
     let words = comptime!(k / 32);
+    let group = comptime!(words / 4);
     let mut acc = f32::new(0.0);
     if row < n {
-        for w in 0..words {
-            let word = bits[(w * n + row) as usize];
-            let base = (w * 32) as usize;
+        for t in 0..group {
+            let w0 = t * 4;
+            let d0 = bits[(w0 * n + row) as usize];
+            let d1 = bits[((w0 + 1) * n + row) as usize];
+            let d2 = bits[((w0 + 2) * n + row) as usize];
+            let d3 = bits[((w0 + 3) * n + row) as usize];
+            let base = (w0 * 32) as usize;
             #[unroll]
             for j in 0..32u32 {
-                acc += f32::reinterpret(qs[base + j as usize] ^ (((word >> j) & 1u32) << 31u32));
+                acc += f32::reinterpret(qs[base + j as usize] ^ (((d0 >> j) & 1u32) << 31u32));
+            }
+            #[unroll]
+            for j in 0..32u32 {
+                acc += f32::reinterpret(qs[base + 32 + j as usize] ^ (((d1 >> j) & 1u32) << 31u32));
+            }
+            #[unroll]
+            for j in 0..32u32 {
+                acc += f32::reinterpret(qs[base + 64 + j as usize] ^ (((d2 >> j) & 1u32) << 31u32));
+            }
+            #[unroll]
+            for j in 0..32u32 {
+                acc += f32::reinterpret(qs[base + 96 + j as usize] ^ (((d3 >> j) & 1u32) << 31u32));
             }
         }
     }
@@ -637,7 +674,7 @@ fn ann_scan_kernel(
         stride /= 2;
     }
     if u == 0 {
-        peak[0].fetch_max(red[0]);
+        peak[META_PEAK].fetch_max(red[0]);
     }
 }
 
@@ -662,7 +699,7 @@ fn ann_hist_kernel(
 ) {
     let i = ABSOLUTE_POS as u32;
     if i < n {
-        let m = from_ordered_dev(peak[0]);
+        let m = from_ordered_dev(peak[META_PEAK]);
         let v = est[i as usize];
         let d = m - v;
         if d >= 0.0 && d < range {
@@ -686,13 +723,13 @@ fn ann_hist_kernel(
 fn ann_floor_kernel(
     hist: &Array<u32>,
     peak: &Array<u32>,
-    floor: &mut Array<f32>,
+    meta: &mut Array<u32>,
     budget: u32,
     range: f32,
     #[comptime] bins: u32,
 ) {
     if UNIT_POS == 0 {
-        let m = from_ordered_dev(peak[0]);
+        let m = from_ordered_dev(peak[META_PEAK]);
         let w = range / f32::cast_from(bins);
         let mut acc = u32::new(0);
         let mut b = u32::new(0);
@@ -720,7 +757,7 @@ fn ann_floor_kernel(
         if chosen >= bins {
             chosen = bins - 1;
         }
-        floor[0] = m - w * f32::cast_from(chosen + 1);
+        meta[META_FLOOR] = u32::reinterpret(m - w * f32::cast_from(chosen + 1));
     }
 }
 
@@ -733,15 +770,15 @@ fn ann_floor_kernel(
 #[allow(clippy::too_many_arguments)]
 fn ann_compact_kernel(
     est: &Array<f32>,
-    floor: &Array<f32>,
+    floor: &Array<u32>,
     cand: &mut Array<u32>,
     count: &mut Array<Atomic<u32>>,
     live: u32,
     cap: u32,
 ) {
     let i = ABSOLUTE_POS as u32;
-    if i < live && est[i as usize] >= floor[0] {
-        let slot = count[0].fetch_add(1u32);
+    if i < live && est[i as usize] >= f32::reinterpret(floor[META_FLOOR]) {
+        let slot = count[META_COUNT].fetch_add(1u32);
         if slot < cap {
             cand[slot as usize] = i;
         }
@@ -779,7 +816,7 @@ fn ann_rescore_kernel<E: Scalar>(
     #[comptime] k: u32,
 ) {
     let c = CUBE_POS_X;
-    if c < count[0] {
+    if c < count[META_COUNT] {
         let row = cand[c as usize];
         let l = UNIT_POS_PLANE;
         let wpr = comptime!(k / 8);
@@ -862,10 +899,9 @@ pub fn ann_logits<R: Runtime, E: Scalar>(
     };
 
     let est = client.empty(n * core::mem::size_of::<f32>());
-    // `to_ordered(VERY_LOW)` would be the honest identity; 0 is below it and is
-    // what an empty buffer is anyway, so the max starts from the floor of the
-    // ordering and the first real row wins.
-    let peak = client.create_from_slice(&0u32.to_ne_bytes());
+    // Zeroed: `to_ordered` maps every float above `0u32`, so an atomic max that
+    // starts here is beaten by the first real row, and the count starts empty.
+    let meta = client.create_from_slice(&vec![0u8; META_WORDS * 4]);
     unsafe {
         ann_scan_kernel::launch_unchecked::<R>(
             client,
@@ -875,7 +911,7 @@ pub fn ann_logits<R: Runtime, E: Scalar>(
             ArrayArg::from_raw_parts(sketch.alpha.clone(), n),
             ArrayArg::from_raw_parts(qrot.clone(), k),
             ArrayArg::from_raw_parts(est.clone(), n),
-            ArrayArg::from_raw_parts(peak.clone(), 1),
+            ArrayArg::from_raw_parts(meta.clone(), META_WORDS),
             n as u32,
             sketch.live_rows as u32,
             k as u32,
@@ -890,7 +926,7 @@ pub fn ann_logits<R: Runtime, E: Scalar>(
             CubeCount::Static((n as u32).div_ceil(AUX_UNITS), 1, 1),
             CubeDim::new_1d(AUX_UNITS),
             ArrayArg::from_raw_parts(est.clone(), n),
-            ArrayArg::from_raw_parts(peak.clone(), 1),
+            ArrayArg::from_raw_parts(meta.clone(), META_WORDS),
             ArrayArg::from_raw_parts(hist.clone(), HIST_BINS),
             n as u32,
             range,
@@ -898,15 +934,14 @@ pub fn ann_logits<R: Runtime, E: Scalar>(
         )
     };
 
-    let floor = client.empty(core::mem::size_of::<f32>());
     unsafe {
         ann_floor_kernel::launch_unchecked::<R>(
             client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new_1d(1),
             ArrayArg::from_raw_parts(hist.clone(), HIST_BINS),
-            ArrayArg::from_raw_parts(peak.clone(), 1),
-            ArrayArg::from_raw_parts(floor.clone(), 1),
+            ArrayArg::from_raw_parts(meta.clone(), META_WORDS),
+            ArrayArg::from_raw_parts(meta.clone(), META_WORDS),
             budget as u32,
             range,
             HIST_BINS as u32,
@@ -914,16 +949,15 @@ pub fn ann_logits<R: Runtime, E: Scalar>(
     };
 
     let cand = client.empty(cap * core::mem::size_of::<u32>());
-    let count = client.create_from_slice(&0u32.to_ne_bytes());
     unsafe {
         ann_compact_kernel::launch_unchecked::<R>(
             client,
             CubeCount::Static((n as u32).div_ceil(AUX_UNITS), 1, 1),
             CubeDim::new_1d(AUX_UNITS),
             ArrayArg::from_raw_parts(est.clone(), n),
-            ArrayArg::from_raw_parts(floor.clone(), 1),
+            ArrayArg::from_raw_parts(meta.clone(), META_WORDS),
             ArrayArg::from_raw_parts(cand.clone(), cap),
-            ArrayArg::from_raw_parts(count.clone(), 1),
+            ArrayArg::from_raw_parts(meta.clone(), META_WORDS),
             sketch.live_rows as u32,
             cap as u32,
         )
@@ -937,7 +971,7 @@ pub fn ann_logits<R: Runtime, E: Scalar>(
             ArrayArg::from_raw_parts(codes.clone(), n * k / 8),
             ArrayArg::from_raw_parts(scales.clone(), n * k / 16),
             ArrayArg::from_raw_parts(cand.clone(), cap),
-            ArrayArg::from_raw_parts(count.clone(), 1),
+            ArrayArg::from_raw_parts(meta.clone(), META_WORDS),
             ArrayArg::from_raw_parts(q.clone(), k),
             ArrayArg::from_raw_parts(est.clone(), n),
             scale2,
@@ -945,27 +979,16 @@ pub fn ann_logits<R: Runtime, E: Scalar>(
         )
     };
 
-    // Two 4-byte reads. They are a SYNC, and they are the reason this returns a
-    // stat at all: without them the lane could not report its own shortlist and
-    // an overflow would be silent. Both are already-computed values sitting in
-    // device memory when the rescore ends, so this is the pass's existing
-    // readback and not a second one.
+    // ONE read of twelve bytes, and it is a SYNC. It is the pass's only stall
+    // before the logits readback that follows immediately anyway, so it costs a
+    // pipeline bubble and not a round trip -- but it was three stalls before
+    // these three words shared a buffer, and three is a round trip.
+    let raw = client.read_one_unchecked(meta);
+    let m: &[u32] = u32::from_bytes(&raw);
     let stat = AnnStat {
-        shortlist: u32::from_ne_bytes(
-            client.read_one_unchecked(count)[..4]
-                .try_into()
-                .expect("the shortlist counter is one u32"),
-        ) as usize,
-        floor: f32::from_ne_bytes(
-            client.read_one_unchecked(floor)[..4]
-                .try_into()
-                .expect("the floor is one f32"),
-        ),
-        est_max: from_ordered(u32::from_ne_bytes(
-            client.read_one_unchecked(peak)[..4]
-                .try_into()
-                .expect("the peak is one ordered u32"),
-        )),
+        shortlist: m[META_COUNT] as usize,
+        floor: f32::from_bits(m[META_FLOOR]),
+        est_max: from_ordered(m[META_PEAK]),
     };
     (est, stat)
 }
