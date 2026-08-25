@@ -52,7 +52,9 @@ use cubecl::future;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 use half::bf16;
-use mary::models::inkling::w4a16gemm::{CODES_PER_WORD, GROUP, MTILE, NTILE, w4a16_linear};
+use mary::models::inkling::w4a16gemm::{
+    CODES_PER_WORD, GROUP, MTILE, NTILE, w4a16_linear, w4a16_linear_launch,
+};
 
 type Rt = cubecl::cuda::CudaRuntime;
 
