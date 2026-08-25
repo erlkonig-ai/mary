@@ -7642,8 +7642,39 @@ fn main() -> Result<()> {
             // than once per pending draft. `logits` holds the argmax's row and only
             // that row unless a reporter asked for more, which is exactly the row
             // every rule below reads.
+            // WHICH ROW OF `logits` the step's answer came off, and it is not
+            // always the last one. A verify pass computes a row per DRAFT it was
+            // fed and keeps the leading run that agreed; `best` is the argmax of
+            // row `new_toks.len() - 1`, and every row past that is a function of
+            // tokens the model did not choose.
+            //
+            // This used to read `n - 1 - logit_row0` -- the LAST row -- and the
+            // comment under `draft_cand` asserted the invariant it breaks:
+            // "`best` is always in it (it is the top-1)". Under INK_SPEC=1 that
+            // is false on every pass that accepts nothing, which is 31.9% of
+            // them on the document corpus, and `INK_DRAFT_TOPK` now DEFAULTS to
+            // 512 -- so the default speculative configuration was gathering its
+            // draft candidates from the distribution of a rejected row, and
+            // could gather one that does not even contain the token just
+            // confirmed. It cannot produce a wrong token (the verifier is exact
+            // argmax) and it cannot raise a flag. It can only lower acceptance,
+            // silently, which is this file's recurring failure mode.
+            //
+            // `logits` starts at row `logit_row0`, so the index is relative.
+            // Written as the three cases rather than as one expression, because
+            // the probe lane's answer is row 0 and an arithmetic identity that
+            // happens to be right for two of the three is how this went wrong the
+            // first time.
+            let answer_abs = if verify_rows > 1 {
+                new_toks.len() - 1
+            } else if probe_rows > 1 {
+                0
+            } else {
+                n - 1
+            };
+            let answer_row = answer_abs - logit_row0;
             let p_t: Vec<f32> = if mtp_prob && !logits.is_empty() {
-                softmax_row(&logits[(n - 1 - logit_row0) * v..(n - logit_row0) * v])
+                softmax_row(&logits[answer_row * v..(answer_row + 1) * v])
             } else {
                 Vec::new()
             };
@@ -7813,7 +7844,7 @@ fn main() -> Result<()> {
             let draft_cand: Option<(Vec<usize>, mary::models::inkling::bf16gemm::Bf16W)> =
                 if draft_topk > 0 && !logits.is_empty() {
                     use mary::models::inkling::bf16gemm::NTILE;
-                    let row = &logits[(n - 1 - logit_row0) * v..(n - logit_row0) * v];
+                    let row = &logits[answer_row * v..(answer_row + 1) * v];
                     // Rounded DOWN to the MMA's n-tile: the gemm tiles its output
                     // by `NTILE` and a remainder is not a shape it has. Down rather
                     // than up so the result is a width the vocabulary can supply.
