@@ -134,6 +134,21 @@ fn main() {
         }
     }
 
+    // What a launch pays before it has read a byte: the output allocation the
+    // two GEMM launchers do internally, plus the sync. Subtract it and the
+    // remainder is the read.
+    let mut alloc_s = f64::MAX;
+    for i in 0..6 {
+        let t3 = Instant::now();
+        let h = client.empty(m_pad * n * 4);
+        let _ = future::block_on(client.sync());
+        let dt = t3.elapsed().as_secs_f64();
+        drop(h);
+        if i >= 2 {
+            alloc_s = alloc_s.min(dt);
+        }
+    }
+
     let gib = (codes + scales) as f64 / (1u64 << 30) as f64;
     let gbs = |s: f64| (codes + scales) as f64 / s / 1e9;
     println!("table                {gib:.3} GiB (codes + scales)");
