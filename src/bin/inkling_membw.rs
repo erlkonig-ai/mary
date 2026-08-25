@@ -1267,6 +1267,126 @@ fn run_axes() -> Result<()> {
             );
         }
 
+        // ---- the shootout: the three arms INTERLEAVED -------------------
+        //
+        // Rows 15, 35-39 and 40-41 are measured in blocks, one kernel's five
+        // reps before the next kernel's, and this part drifts: two runs of this
+        // binary minutes apart, one with a sibling on the GPU and one on an
+        // idle one, put row 15 at 102.6 and 94.5 GB/s and the coalesced control
+        // (row 5) at 247.7 and 237.4. The whole table moves together, so the
+        // ratios survive — but rows 40-41 are always LAST, which on a drifting
+        // part is a systematic handicap and not noise.
+        //
+        // So: alternate the three arms inside one loop, so each sees the same
+        // clocks on average and position cannot favour any of them. Min over
+        // rounds, as everywhere else here.
+        {
+            use mary::models::inkling::fp4gemm::fp4_linear_swz_launch;
+            let rounds = 9usize;
+            let (mut u, mut g, mut z) = (f64::MAX, f64::MAX, f64::MAX);
+            let mut time = |f: &mut dyn FnMut()| {
+                let t0 = Instant::now();
+                f();
+                let _ = cubecl::future::block_on(client.sync());
+                t0.elapsed().as_secs_f64()
+            };
+            for _ in 0..rounds {
+                u = u.min(time(&mut || {
+                    drop(fp4_linear_launch::<Rt>(
+                        &client, &qa, &qa_sc, &big, &sc, m_pad, k, n, 1.0,
+                    ))
+                }));
+                g = g.min(time(&mut || {
+                    drop(fp4_linear_smem_launch::<Rt>(
+                        &client, &qa, &qa_sc, &big, &sc, m_pad, k, n, 1.0, 8, 0, true,
+                    ))
+                }));
+                z = z.min(time(&mut || {
+                    drop(fp4_linear_swz_launch::<Rt>(
+                        &client, &qa, &qa_sc, &big, &sc, m_pad, k, n, 1.0, true,
+                    ))
+                }));
+            }
+            let gbs = |t: f64| bytes as f64 / t / 1e9;
+            println!("\n  === the three arms interleaved, {rounds} rounds, min each ===");
+            println!(
+                "  A  unstaged  (fp4_linear)          {:8.1} GB/s  {:7.3} ms   1.00x",
+                gbs(u),
+                u * 1e3
+            );
+            println!(
+                "  B  STAGED    (fp4_linear_smem)     {:8.1} GB/s  {:7.3} ms   {:.2}x",
+                gbs(g),
+                g * 1e3,
+                u / g
+            );
+            println!(
+                "  C  PRE-PERM  (fp4_linear_swz)      {:8.1} GB/s  {:7.3} ms   {:.2}x   \
+                 (C/B = {:.3}x)",
+                gbs(z),
+                z * 1e3,
+                u / z,
+                g / z
+            );
+        }
+
+        // ---- row 42: what the permutation COSTS, on the host ------------
+        //
+        // The only price option (b) — permute once at load — actually pays.
+        // `PileSource::copy_share` already memcpys every routed expert into an
+        // anonymous arena at startup and the GPU handles alias THAT, not the
+        // pile mmap, so permuting during a copy that already happens replaces
+        // a `copy_from_slice` with this. The question is therefore not "what
+        // does a copy cost" but "what does this copy cost against a plain one",
+        // which is what the two figures below are.
+        //
+        // Sized as one NVFP4 expert's `w13` — [4096, 4096], 8.4 MB of codes and
+        // 1.05 MB of scales — because that is the granularity `copy_share`
+        // moves and the working set it moves it in.
+        {
+            use mary::models::inkling::fp4gemm::{swizzle_b_codes, swizzle_b_scales};
+            let (en, ek) = (4096usize, 4096usize);
+            let src = vec![0x5Au8; en * ek / 2];
+            let ssc = vec![0x38u8; en * (ek / 16)];
+            let total = src.len() + ssc.len();
+            let mut best = f64::MAX;
+            let mut best_cp = f64::MAX;
+            for _ in 0..5 {
+                let t0 = Instant::now();
+                let c = swizzle_b_codes(&src, en, ek);
+                let d = swizzle_b_scales(&ssc, en, ek);
+                best = best.min(t0.elapsed().as_secs_f64());
+                std::hint::black_box((&c, &d));
+                let t1 = Instant::now();
+                let c2 = src.clone();
+                let d2 = ssc.clone();
+                best_cp = best_cp.min(t1.elapsed().as_secs_f64());
+                std::hint::black_box((&c2, &d2));
+            }
+            println!(
+                "\n  42 HOST permutation of one expert w13 ({:.1} MB): {:.2} ms = {:.1} GB/s",
+                total as f64 / 1e6,
+                best * 1e3,
+                total as f64 / best / 1e9
+            );
+            println!(
+                "     the plain copy it replaces:              {:.2} ms = {:.1} GB/s  ({:.2}x)",
+                best_cp * 1e3,
+                total as f64 / best_cp / 1e9,
+                best / best_cp
+            );
+            // 39 NVFP4 routed layers x 256 experts x (w13 + w2) is the whole
+            // model; a process holds its layer share of that.
+            let model = 39.0 * 256.0 * (14_155_784.0);
+            println!(
+                "     extrapolated over all 39 NVFP4 routed layers ({:.0} GiB): {:.1} s of startup, \
+                 against {:.1} s for the copy already paid",
+                model / GIB,
+                model / (total as f64 / best) / 1.0,
+                model / (total as f64 / best_cp)
+            );
+        }
+
         // Bit equality against row 15. The staged kernel changes WHERE the B
         // fragment is read from and nothing else, so anything but identical
         // output is a defect in the staging rather than a rounding difference.
