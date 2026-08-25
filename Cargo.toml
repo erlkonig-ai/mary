@@ -1007,3 +1007,16 @@ required-features = ["inkling-cuda"]
 [[bin]]
 name = "backend_matmul_probe"
 required-features = ["burn-cuda-bench"]
+
+# Why the same hand w4a16 kernel reads ~98 GB/s at the head shape and ~64 at the
+# sink shapes: n / k / m_pad sweeps, null-launch cost, and a split-vs-fused run
+# of the real sink GEMMs. One process, one worktree.
+[[bin]]
+name = "w4a16_shape_sweep"
+required-features = ["inkling-cuda"]
+
+# Does the pre-permuted weight layout help a SMALL launch as much as a big one?
+# Sweeps the grid on both fp4 lanes; the column that matters is the ratio.
+[[bin]]
+name = "swz_grid_scaling"
+required-features = ["inkling-cuda"]

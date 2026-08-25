@@ -44,10 +44,18 @@
 //! their output was not bit-identical to the arm they replaced. That bar is
 //! retired, for a reason worth writing down rather than re-deriving:
 //!
-//! **This runtime is not bit-identical to itself.** `devplan_verify_layer`
-//! records it disagreeing on 8.55% of argmax positions between two runs of the
-//! SAME BINARY. A bar the baseline fails is not a bar, it is an argument for
-//! never changing anything.
+//! **This runtime is not bit-identical to itself IN THE CACHED DECODE LANE.**
+//! `devplan_verify_layer` records it disagreeing on 8.55% of argmax positions
+//! between two runs of the same binary. A bar the baseline fails is not a bar.
+//!
+//! CORRECTION, 2026-08-25, measured after this was written: that is lane-
+//! specific and was over-generalised here. In the UNCACHED PREFILL lane the
+//! runtime is perfectly reproducible -- 3988/3988 identical argmax positions
+//! and identical logits across two genuinely independent runs. So a change's
+//! output difference in that lane is REAL and reproducible, not noise, and it
+//! cannot be waved away by citing nondeterminism. The conclusion survives on
+//! its own merits (capability, not identity) -- but the premise as stated is
+//! only true of one lane.
 //!
 //! And it rejected things that work. The `INK_FP4_KV` gate refused NVFP4 KV
 //! because it perturbs 91% of dense RMS -- while the reference implementation
@@ -4935,7 +4943,19 @@ fn main() -> Result<()> {
         // the verifier, so this cannot change an output, only an acceptance
         // rate. It stays a tunable because N is a real knob; 0 disables the
         // pruning for the sweep and for `INK_MTP_PROB`.
-        .unwrap_or(512);
+        .unwrap_or_else(|| {
+            // `INK_MTP_PROB` scores the draft head's distribution BY TOKEN INDEX
+            // over the whole vocabulary, which a pruned head cannot emit -- the
+            // two are refused together below. Before the prune became the
+            // default that refusal was unreachable; now an `INK_MTP_PROB=1`
+            // command line that worked yesterday hard-errors. An explicit
+            // `INK_MTP_PROB` therefore IMPLIES the unpruned head.
+            if std::env::var("INK_MTP_PROB").is_ok() {
+                0
+            } else {
+                512
+            }
+        });
     // The two are exclusive rather than silently one-sided. `INK_MTP_PROB`
     // scores the draft head's distribution against the target's BY TOKEN INDEX
     // over the whole vocabulary, and a pruned head emits a distribution over
