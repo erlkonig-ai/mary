@@ -1523,15 +1523,42 @@ pub fn swizzleable(n: usize, k: usize) -> bool {
 /// in the same runs' own breakdown and it is not a defect in the kernel — at
 /// this shape **the pass is HOST-ENQUEUE-BOUND**: 34.3 ms in the layer loop
 /// plus 4.7 ms after the sync against **3.9 ms blocked on the device**, of a
-/// 46 ms pass. A device kernel that is not on the critical path cannot move
-/// `pass_ms` however fast it gets, and this one did not.
+/// 46 ms pass.
 ///
-/// That does not refute the 2x; it locates it. The regime the routed GEMM
-/// dominates is the BATCHED one this module's header measures — `INK_SLOTS=32`,
-/// where `fp4_linear_grouped` is 52.7% of GPU time and the head's GPU is busy
-/// 93% of the time it is not blocked. A single-row decode of sixteen layers
-/// reads 1.31 GiB of expert weight a pass, which is ~13 ms of device time
-/// hidden under 39 ms of host enqueue.
+/// State that as a bound, because it is the useful form: **exposed device time
+/// is 3.9 ms, so the headroom for ANY device-side change at this configuration
+/// is at most 8% of the step**, whatever the change is and however large the
+/// kernel win. The 2.7-4 ms a step this work was scoped against sits at the
+/// very top of that bound — and it is not reachable here, because the exposed
+/// 3.9 ms is the tail nothing can overlap (the head's own 1.53 GiB unembed
+/// read runs last), not the routed lane, which is enqueued early and finishes
+/// under the host.
+///
+/// That does not refute the 2x; it locates it. The routed lane is not grid-
+/// starved at decode either — one stage launches `n / NTILE = 512` cubes over
+/// `blocks` = the active-expert count with `nrep = 1`, i.e. ~3072 working
+/// warps, well past the ~1150-cube knee where this part's achieved rate is
+/// still climbing. The regime the routed GEMM dominates is the BATCHED one
+/// this module's header measures — `INK_SLOTS=32`, where `fp4_linear_grouped`
+/// is 52.7% of GPU time and the head's GPU is busy 93% of the time it is not
+/// blocked. A single-row decode of sixteen layers reads 1.31 GiB of expert
+/// weight a pass, which is ~13 ms of device time hidden under 39 ms of host
+/// enqueue.
+///
+/// ## What is NOT permuted, and why it is not an oversight
+///
+/// The head. `head_lane()` is `W4a16` with no switch, so the unembedding is
+/// multiplied by [`super::w4a16gemm::w4a16_linear`] — `MTILE 16, NTILE 8,
+/// KTILE 16`, `MmaDefinition::new`, i.e. **`m16n8k16` with a BF16 activation**,
+/// against this file's `m16n8k64` `new_scaled`. [`swz_word`] was derived from
+/// `position_of_nth(.., MatrixIdent::B)` for the second of those and describes
+/// only it; the W4A16 B fragment is a different map and there is no
+/// `w4a16_linear_swz` to read one. So permuting `quantized_bf16`'s output
+/// would need its own derivation and its own device check against
+/// `fp4_frag_b_map`'s W4A16 twin, which does not exist yet. That is a separate
+/// piece of work, not a line of wiring — and it is where the remaining win is,
+/// since the head's 25128-cube launch is the one shape already at both its
+/// grid ceiling and its access-pattern ceiling.
 ///
 /// The output is identical: 18 reps across three arms and two prompts emitted
 /// the SAME 13 tokens each, and `gemm_grid_parity` reproduces pristine main's
