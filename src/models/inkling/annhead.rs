@@ -89,8 +89,24 @@
 //! ```
 //!
 //! Thirty-four points of recall, and the estimator's error at the winner is 36x
-//! smaller. The rotation is not a refinement; without it a one-bit sketch of
-//! this table is not usable at a budget worth having.
+//! smaller.
+//!
+//! **But read that against the budget it was taken at.** Every miss this lane
+//! has is a shortlist miss, so a bigger shortlist buys back a worse estimator,
+//! and the two mitigations are substitutes at the margin. On the synthetic table
+//! (128 queries) the same ablation gives:
+//!
+//! ```text
+//!   budget 1024    rotated 1.0000    raw 0.9115     9.9 points
+//!   budget 8192    rotated 1.0000    raw 0.9844     1.6 points
+//! ```
+//!
+//! So the rotation is what makes a SMALL budget viable, and at the budget this
+//! lane actually ships (8192) most of its value has been bought back by the
+//! shortlist. That does not make it optional — it is free, it needs no budget,
+//! and the real table's anisotropy is worse than the synthetic one's, so its
+//! 8192 arm is untested — but "34 points" is a statement about `S = 1024` and
+//! carrying it to the default configuration would overstate it.
 //!
 //! ## The same ablation on a synthetic table
 //!
