@@ -157,6 +157,7 @@ done
 # ---------------------------------------------------------------------------
 
 GATE_FINDINGS=()
+GATE_CLK="?"
 GATE_HARD=0     # another user, or something we must not shove aside
 GATE_SOFT=0     # our own contention: --allow-busy may proceed, loudly
 
@@ -174,12 +175,15 @@ gate() {
   # gate built on `utilization.gpu` alone would have said "idle" and handed back
   # a poisoned number. The process list is what caught it. That is why this
   # function has four signals and refuses on any of them.
-  local util_max_seen=0 mem_note="" i line util mem
+  local util_max_seen=0 mem_note="" i line util mem clk clk_lo="" clk_hi=""
   for ((i = 0; i < SAMPLES; i++)); do
-    line=$(nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader 2>/dev/null | head -1)
+    line=$(nvidia-smi --query-gpu=utilization.gpu,memory.used,clocks.sm --format=csv,noheader 2>/dev/null | head -1)
     util=$(printf '%s' "$line" | awk -F, '{gsub(/[^0-9]/,"",$1); print ($1==""?0:$1)}')
     mem=$(printf '%s' "$line" | awk -F, '{gsub(/^ +| +$/,"",$2); print $2}')
+    clk=$(printf '%s' "$line" | awk -F, '{gsub(/[^0-9]/,"",$3); print ($3==""?0:$3)}')
     [ "$util" -gt "$util_max_seen" ] 2>/dev/null && util_max_seen=$util
+    { [ -z "$clk_lo" ] || [ "$clk" -lt "$clk_lo" ]; } 2>/dev/null && clk_lo=$clk
+    { [ -z "$clk_hi" ] || [ "$clk" -gt "$clk_hi" ]; } 2>/dev/null && clk_hi=$clk
     case "$mem" in
       *N/A*) mem_note="memory.used is [N/A] on this part (unified memory); the gate is utilisation and process list only";;
       *) mem_note="memory.used $mem";;
@@ -187,6 +191,12 @@ gate() {
     [ $((i + 1)) -lt "$SAMPLES" ] && sleep 1
   done
   GATE_FINDINGS+=("GPU utilisation, worst of $SAMPLES samples 1 s apart: ${util_max_seen}%  ($mem_note)")
+  # Clocks are part of the framing, not trivia. This part idles near 200 MHz and
+  # ramps under load, so a run that starts cold is measuring the ramp in its
+  # early passes -- which is most of what the cold discard is for, and it is
+  # worth being able to see that the discard had something to do.
+  GATE_CLK="${clk_lo:-?}-${clk_hi:-?} MHz"
+  GATE_FINDINGS+=("GPU SM clock across those samples: $GATE_CLK")
   if [ "$util_max_seen" -gt "$UTIL_MAX" ]; then
     GATE_FINDINGS+=("  CONTENDED: ${util_max_seen}% > --util-max ${UTIL_MAX}%")
     GATE_SOFT=1
@@ -576,6 +586,7 @@ for spec in "${ARMS[@]}"; do
   echo "                    arm '$name' -> ${BIN_SHA[$abin]:-unknown}  ${BIN_MTIME[$abin]:-unknown}  $abin"
 done
 echo "  gate            : $GATED   (util-max ${UTIL_MAX}%, load-max $LOAD_MAX, ${SAMPLES} samples)"
+echo "  SM clock        : $GATE_CLK at the post-run gate; this part idles near 200 MHz and ramps"
 echo "  started         : $STARTED"
 [ -n "$NOTE" ] && echo "  note            : $NOTE"
 echo "  raw             : $TSV"
