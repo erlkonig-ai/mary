@@ -461,13 +461,14 @@ run_rep() {
                              if (match($0, /ctx ([0-9]+)/, cx)) ctx = cx[1] }
     END {
       if (step_ms == "" || toks == "") { print "    !! could not parse the WARM lines -- did the run produce decode steps?"; exit 3 }
-      asort(v); med = (k % 2) ? v[int(k/2)+1] : (v[int(k/2)] + v[int(k/2)+1]) / 2
+      if (k > 0) { asort(v); med = (k % 2) ? v[int(k/2)+1] : (v[int(k/2)] + v[int(k/2)+1]) / 2 }
+      else med = -1   # every pass was discarded: --cold is >= the passes there were
       e_warm = (wsteps > 0) ? wtokens / wsteps : 0
       # THE GOVERNING IDENTITY. tok/s = E * 1000 / step_ms, on the same
       # population. Three numbers that do not close are not three numbers.
       pred = e_warm * 1000.0 / step_ms
       err  = (toks > 0) ? 100.0 * (pred - toks) / toks : 999
-      printf "%.3f tok/s, %.1f ms/step over %d warm passes (harness median %.1f ms)\n", toks, step_ms, wsteps, med
+      printf "%.3f tok/s, %.1f ms/step over %d warm passes (harness median %s)\n", toks, step_ms, wsteps, (med < 0 ? "n/a -- --cold discarded every pass" : sprintf("%.1f ms", med))
       # A median over three or four passes is a median in name only. This is a
       # warning and not a refusal because a short run is sometimes exactly what
       # you want -- but it must not be quoted as if it were a distribution.
@@ -480,13 +481,18 @@ run_rep() {
       # and a figure that mixed them would be wrong.
       if (e_all != "" && e_warm > 0 && (e_all/e_warm > 1.01 || e_all/e_warm < 0.99))
         printf "    -- note: tokens/pass is %.3f over all passes and %.3f over the warm ones; the cold discard matters here.\n", e_all, e_warm
-      hm = 100.0 * (med - step_ms) / step_ms
+      # Cross-check of the two definitions of "warm". On a SINGLE-NODE run these
+      # measure the same thing and must agree; on a two-node pipe they do not,
+      # by construction -- the per-step line excludes the receive and the WARM
+      # figure includes it -- so a pipe run is expected to trip this and the
+      # message says so rather than pretending to have found something.
+      hm = (med > 0) ? 100.0 * (med - step_ms) / step_ms : 0
       if (hm > 2 || hm < -2)
-        printf "    !! the harness median (%.1f ms, first %d discarded) and the binary WARM figure (%.1f ms) disagree by %.1f%%.\n       The two definitions of \"warm\" have drifted; the number is not safe until they agree.\n", med, cold, step_ms, hm
+        printf "    !! the harness median (%.1f ms, first %d discarded) and the binary WARM figure (%.1f ms) disagree by %.1f%%.\n       Single-node: the two definitions of \"warm\" have drifted and the number is not safe.\n       Two-node pipe: expected -- the step line excludes the receive, the WARM figure includes it.\n", med, cold, step_ms, hm
       printf "%s\t%d\t%.4f\t%.3f\t%.4f\t%s\t%d\t%.3f\t%s\t%.3f\t%s\t%s\t%s\n", arm, rep, toks, step_ms, e_warm, e_all, wsteps, med, ctx, err, bsha, bmt, bpath >> tsv
     }
   ' "$log" || printf '    !! parse failed for %s\n' "$log"
-  echo "    ($((t1 - t0)) s wall, $log)" >/dev/null
+  printf '    %ds wall, %s\n' "$((t1 - t0))" "$log"
   return 0
 }
 
