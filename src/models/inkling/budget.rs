@@ -499,8 +499,8 @@ pub fn activation_bytes(heads: usize, head_dim: usize, tokens: usize, dtype: Sto
 /// runtime derives from the device, which is why it is a fraction of the
 /// machine and not a constant: the two nodes this runs on differ by 2 GiB and
 /// their page ladders differ with them.
-pub fn pool_page_floor(policy: AdmissionPolicy, machine: u64) -> u64 {
-    policy.allocator.admission_floor(machine)
+pub fn pool_page_floor(policy: AdmissionPolicy, machine: u64, prefill_tokens: usize) -> u64 {
+    policy.allocator.admission_floor(machine, prefill_tokens)
 }
 
 /// What ONE attention layer holds in activations at this sequence length.
@@ -1128,9 +1128,45 @@ mod tests {
 
         let machine = 128 << 30;
         assert_eq!(
-            super::pool_page_floor(wide(), machine),
+            super::pool_page_floor(wide(), machine, 16_384),
             machine / 4 + machine / 16
         );
+    }
+
+    /// The floor is sized for a 16,384-token PREFILL; a decode step must not
+    /// be charged it.
+    ///
+    /// Measured 2026-08-25 on spark-zt at INK_LAYERS=0:16 with a 256-token
+    /// prompt and cleanup OFF -- the worst arm -- the pool reserved 1.88 GiB
+    /// while admission charged 45.20 GiB of context/activations. The floor was
+    /// roughly 20x the high-water and refused ranges that ran.
+    #[test]
+    fn the_pool_floor_scales_with_the_prefill_and_never_below_a_cushion() {
+        let machine: u64 = 128 << 30;
+        let full = machine / 4 + machine / 16;
+
+        // Unchanged at and above the length it was measured for. This is the
+        // property the two older assertions pin, and it must not move.
+        assert_eq!(super::pool_page_floor(wide(), machine, 16_384), full);
+        assert_eq!(super::pool_page_floor(wide(), machine, 81_920), full);
+
+        // A decode step lands on the cushion, not the prefill figure.
+        let decode = super::pool_page_floor(wide(), machine, 1);
+        assert_eq!(decode, machine / 16);
+        assert!(decode < full / 4);
+
+        // The cushion is still far above the measured high-water: 1.88 GiB was
+        // observed on a 119.63 GiB box, and machine/16 there is ~7.48 GiB.
+        assert!(machine / 16 > 4 * (188 * (1 << 30) / 100));
+
+        // Monotone, and bounded at both ends.
+        let mut prev = 0;
+        for n in [1usize, 256, 1024, 4096, 8192, 16_384, 100_623] {
+            let f = super::pool_page_floor(wide(), machine, n);
+            assert!(f >= prev, "floor went backwards at {n}");
+            assert!(f >= machine / 16 && f <= full, "floor out of bounds at {n}");
+            prev = f;
+        }
     }
 
     #[test]
@@ -1156,7 +1192,10 @@ mod tests {
             prefill_activation_bytes(&t, 0..8, n, narrow())
                 < prefill_activation_bytes(&t, 0..8, n, wide())
         );
-        assert_eq!(super::pool_page_floor(narrow(), 128 << 30), 40 << 30);
+        assert_eq!(
+            super::pool_page_floor(narrow(), 128 << 30, 16_384),
+            40 << 30
+        );
     }
 
     #[test]

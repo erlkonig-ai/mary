@@ -203,9 +203,30 @@ impl AllocatorConfig {
     /// marks (30.12 GiB without explicit cleanup and 15.63 GiB with per-layer
     /// cleanup on a 121.6 GiB node), rather than turning those one-workload
     /// observations into an unsafe universal coefficient.
-    pub fn admission_floor(self, machine: u64) -> u64 {
+    /// The prefill length the un-scaled floor was sized for.
+    ///
+    /// `machine / 4 + machine / 16` is not a fitted coefficient -- it is two
+    /// page sizes off a ladder the runtime derives from the device -- but it
+    /// was measured against a 16,384-token PREFILL. Charging it to a decode
+    /// step is charging a constant for something linear in the sequence, which
+    /// is the exact error `Checkpoint::copy_share` documents itself against:
+    /// "folding one into the other is how the gate came to charge a constant
+    /// for something linear in the sequence".
+    ///
+    /// Measured 2026-08-25, spark-zt, INK_LAYERS=0:16, 256-token prompt,
+    /// decode, cleanup OFF (the worst arm): admission charged 45.20 GiB of
+    /// context/activations while the pool reserved 1.88 GiB -- 1.42 live, 0.46
+    /// stranded. The floor was ~20x the high-water, and that is what refuses
+    /// ranges that would run.
+    const PREFILL_REFERENCE: u64 = 16_384;
+
+    pub fn admission_floor(self, machine: u64, prefill_tokens: usize) -> u64 {
         match self {
-            Self::SubSlices | Self::ExclusivePages => machine / 4 + machine / 16,
+            Self::SubSlices | Self::ExclusivePages => {
+                let full = machine / 4 + machine / 16;
+                let scaled = full.saturating_mul(prefill_tokens as u64) / PREFILL_REFERENCE;
+                scaled.clamp(machine / 16, full)
+            }
         }
     }
 }

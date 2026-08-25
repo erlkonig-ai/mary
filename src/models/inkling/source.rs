@@ -289,9 +289,15 @@ impl Weights {
         global_dense: &[&str],
         attention_bytes: u64,
         policy: super::budget::AdmissionPolicy,
+        prefill_tokens: usize,
     ) -> Result<(usize, usize, u64, u64)> {
-        self.src
-            .copy_share(layers, global_dense, attention_bytes, policy)
+        self.src.copy_share(
+            layers,
+            global_dense,
+            attention_bytes,
+            policy,
+            prefill_tokens,
+        )
     }
 
     // ---- what the source SAYS about itself --------------------------------

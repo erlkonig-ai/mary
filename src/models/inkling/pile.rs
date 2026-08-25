@@ -449,6 +449,7 @@ fn run_overhead_bytes(
     attention_bytes: u64,
     machine: u64,
     policy: super::budget::AdmissionPolicy,
+    prefill_tokens: usize,
 ) -> u64 {
     const CUDA_CONTEXT: u64 = GIB / 5;
     const ACTIVATIONS_PER_LAYER: u64 = 41 * GIB / 200;
@@ -456,7 +457,7 @@ fn run_overhead_bytes(
     CUDA_CONTEXT
         + ACTIVATIONS_PER_LAYER * layers as u64
         + OS_FLOOR
-        + super::budget::pool_page_floor(policy, machine)
+        + super::budget::pool_page_floor(policy, machine, prefill_tokens)
         + attention_bytes
 }
 
@@ -1417,6 +1418,7 @@ impl PileSource {
         global_dense: &[&str],
         attention_bytes: u64,
         policy: super::budget::AdmissionPolicy,
+        prefill_tokens: usize,
     ) -> Result<(usize, usize, u64, u64)> {
         anyhow::ensure!(self.copied.is_none(), "the weight share was already copied");
 
@@ -1571,7 +1573,8 @@ impl PileSource {
         let available = mem_available_bytes()?;
         let machine = mem_total_bytes()?;
         let n_layers = layers.len();
-        let overhead = run_overhead_bytes(n_layers, attention_bytes, machine, policy);
+        let overhead =
+            run_overhead_bytes(n_layers, attention_bytes, machine, policy, prefill_tokens);
         // The arena, PLUS the weights the binding lane holds a second time in
         // the device pool. A correct comparison against a number that omits a
         // term is still wrong; see [`device_weight_bytes`].
@@ -1592,8 +1595,9 @@ impl PileSource {
                 acc += *bytes as u64;
                 acc_dev += per_layer_dev.get(layer).copied().unwrap_or(0);
                 let k = k + 1;
-                let fits_here =
-                    acc + acc_dev + run_overhead_bytes(k, attention_bytes, machine, policy);
+                let fits_here = acc
+                    + acc_dev
+                    + run_overhead_bytes(k, attention_bytes, machine, policy, prefill_tokens);
                 // The WHOLE requirement against both numbers, exactly as the
                 // gate above tests it. Comparing the bare share against
                 // `available` here is the same half-measurement that admitted
@@ -2121,11 +2125,11 @@ mod tests {
         );
         let base = GIB / 5 + 41 * GIB / 200 * 8 + 4 * GIB + attention;
         assert_eq!(
-            run_overhead_bytes(8, attention, machine, subslices),
+            run_overhead_bytes(8, attention, machine, subslices, 16_384),
             base + 40 * GIB
         );
         assert_eq!(
-            run_overhead_bytes(8, attention, machine, exclusive),
+            run_overhead_bytes(8, attention, machine, exclusive, 16_384),
             base + 40 * GIB
         );
     }
