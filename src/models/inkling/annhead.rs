@@ -689,6 +689,18 @@ fn ann_floor_kernel(
         // taken over clears it. Overshoot is one bin's worth of rows, which at
         // 1024 bins over a range the top of the vocabulary occupies is small,
         // and the compaction's cap catches it either way.
+        //
+        // `chosen` is clamped to the last bin when the window holds FEWER than
+        // `budget` rows. Without the clamp the floor fell one bin BELOW the
+        // window, which admits every row in the table -- the shortlist went from
+        // "the budget" to "the whole vocabulary" precisely when the top was
+        // sparse enough that a shortlist was easiest, and the rescore then cost
+        // more than the exact head. The semantics this lane wants are
+        // `candidates_above(m - range)`: a budget is a ceiling on the answer,
+        // never a reason to widen it.
+        if chosen >= bins {
+            chosen = bins - 1;
+        }
         floor[0] = m - w * f32::cast_from(chosen + 1);
     }
 }

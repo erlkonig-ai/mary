@@ -158,14 +158,19 @@ fn main() {
     // not test a wider range, it saturates the histogram at its bottom bin and
     // measures nothing. `||q|| = target / mean_row_norm` puts a well-aligned row
     // at roughly `target`.
+    //
+    // The direction is a random one with a SMALL component along one table row,
+    // not the mean of two rows. Averaging two rows makes those two rows outliers
+    // by a dozen logits, which is not a near-tie -- it is the easiest possible
+    // query -- and it produced a logit distribution nothing like an LM's, where
+    // thousands of tokens sit within a few logits of the top.
     let target = 20.0f32;
     let qnorm = target / sketch.mean_norm;
     let mut queries = Vec::with_capacity(q_count * K);
     for _ in 0..q_count {
         let a = (splitmix(&mut z) % n as u64) as usize;
-        let b = (splitmix(&mut z) % n as u64) as usize;
         let mut row: Vec<f32> = (0..K)
-            .map(|d| 0.5 * (w[a * K + d].to_f32() + w[b * K + d].to_f32()) + normal(&mut z) * 1e-4)
+            .map(|d| normal(&mut z) / (K as f32).sqrt() + 0.10 * w[a * K + d].to_f32())
             .collect();
         let l2 = row.iter().map(|v| v * v).sum::<f32>().sqrt();
         let g = qnorm / l2.max(1e-20);
