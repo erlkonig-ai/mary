@@ -20,7 +20,7 @@
 //!
 //! Read-only, one 8-byte buffer, no sweeps: safe on a contended box.
 
-use cubecl::ir::TypeUsage;
+use cubecl::features::TypeUsage;
 use cubecl::prelude::*;
 use cubecl::{e2m1, e2m1x2, e2m3, e3m2, e4m3, e5m2, ue8m0};
 
