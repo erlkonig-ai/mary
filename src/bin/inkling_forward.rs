@@ -6726,6 +6726,11 @@ fn main() -> Result<()> {
         // 40.6% under 1-TV), because when the draft is the argmax the target agrees
         // strongly and when it is not the target puts little mass there either.
         let new_toks: Vec<usize>;
+        // The host argmax, which is a scalar loop over a 200058-wide f32 row and
+        // is run once per confirmed row. It is the largest piece of pure host
+        // arithmetic left in a decode pass and nothing has ever timed it, so it
+        // has been inside the unexplained bucket the whole time.
+        let t_am = std::cell::Cell::new(0f64);
         let best = if !answered {
             // An interleaved head, on the pass that opened a cohort. The answer is
             // still on the tail; it is read one pass later and committed there.
@@ -6738,6 +6743,7 @@ fn main() -> Result<()> {
             let mut accepted = 0usize;
             let rows = n - logit_row0;
             let argmax_of = |i: usize| -> usize {
+                let t_a0 = Instant::now();
                 let row = &logits[i * v..(i + 1) * v];
                 let mut b = 0usize;
                 for (j, &val) in row.iter().enumerate() {
@@ -6745,6 +6751,7 @@ fn main() -> Result<()> {
                         b = j;
                     }
                 }
+                t_am.set(t_am.get() + t_a0.elapsed().as_secs_f64());
                 b
             };
             if verify_rows > 1 {
@@ -6781,6 +6788,7 @@ fn main() -> Result<()> {
                 .last()
                 .expect("at least one row is always confirmed")
         };
+        let t_argmax = t_am.get();
         // `ids`, the MTP scoring and the per-position report were all written about
         // ONE sequence, and slot 0 is the one they follow. `best` is therefore slot
         // 0's token and not the last row's, which is what it means everywhere else.
@@ -7709,6 +7717,21 @@ fn main() -> Result<()> {
                 "device"
             }
         );
+        if best_wire.is_none() && unembed_w.is_some() {
+            // Why the head is worth reading as PHYSICS and not as overhead: the
+            // unembed table is read WHOLE on every pass. `[vocab_size, hidden]`
+            // BF16 is a fixed number of bytes per step, independent of context
+            // length and of how many layers this node holds, so it lands in the
+            // per-step INTERCEPT rather than the per-layer slope -- and no
+            // launch-side change (fusion, graph capture, a deeper queue) can move
+            // a byte of it. Printed as bytes rather than as a predicted
+            // millisecond because the millisecond needs a bandwidth figure, and a
+            // bandwidth figure quoted without its own measurement is not evidence.
+            println!(
+                "      unembed table {:9.2} GiB of BF16, read whole every pass (a per-step FLOOR: bytes / achievable bandwidth)",
+                (t.vocab_size * h * 2) as f64 / GIB
+            );
+        }
         println!(
             "    residual to the host{:9.1}   (the [n, hidden] the wire and the draft path read)",
             ms(t_x_down)
@@ -7757,6 +7780,11 @@ fn main() -> Result<()> {
             ms(t_draft),
             ms(t_wait_peer),
             ms(t_tail_host - t_named_after)
+        );
+        println!(
+            "        of which host argmax {:9.1}   ({} row(s) x {v} f32 on one core)",
+            ms(t_argmax),
+            new_toks.len().max(1)
         );
         {
             let named = t_prep + t_embed + t_layers + t_stack_sync + t_tail_host;
