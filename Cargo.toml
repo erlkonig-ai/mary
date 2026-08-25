@@ -334,6 +334,13 @@ required-features = ["inkling-cuda"]
 name = "inkling_bf16_gemm_bench"
 required-features = ["inkling-cuda"]
 
+# Whether TIMING the lane order picks a different lane than WALKING it, at the
+# verify widths. Prints both picks per shape; it answers a question, and the
+# end-to-end harness answers whether the answer is worth anything.
+[[bin]]
+name = "inkling_gemm_autotune_gate"
+required-features = ["inkling-cuda"]
+
 # The attention layer with its five projections as the BF16 the pile stores,
 # against the transformers f32 reference at the real widths -- a DELTA inside a
 # stated budget, which is the check a non-bit-exact numerics change needs.

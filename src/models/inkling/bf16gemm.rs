@@ -956,6 +956,393 @@ fn lane_cache(shape: (usize, usize, usize), set: Option<Lane>) -> Option<Lane> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The TIMED lane choice, and the recorded negative it has to answer for.
+//
+// The walk above caches the first lane that does not ERROR. That is a
+// correctness filter wearing a performance filter's name: nothing in it
+// measures, so `bf16_gemm`'s own claim to run "on the fastest lane this box has
+// for the shape" was true only where the static order happened to be right.
+//
+// [`PREFERENCE_NARROW`]'s doc records a per-shape auto-tuner that was built and
+// measured WORSE end to end, and this one is not a retry of it -- it is built
+// around the three things that table says went wrong:
+//
+//   * It cost 10.2 ms a pass at m = 1, where it abandoned `gemv plane par` for
+//     seven of nine shapes. So [`Autotune::Narrow`] -- what `INK_GEMM_AUTOTUNE=1`
+//     turns on -- does not tune m = 1 at all. The m = 1 order is the one width
+//     [`PREFERENCE`] was actually measured for; there is nothing to find there
+//     and a recorded 10.2 ms to lose. `INK_GEMM_AUTOTUNE=all` opens it anyway,
+//     for whoever wants to re-measure that claim rather than inherit it.
+//   * "In isolation the lanes come out within a percent of each other and the
+//     pass says otherwise." So a win under [`AUTOTUNE_MARGIN`] is not a win: the
+//     static head is kept unless the timer beats it by more than the isolated
+//     timer's own credibility. A tuner that switches lanes on a 1% isolated
+//     margin is reporting its noise floor as a decision.
+//   * "A GEMM timed alone is a GEMM that had the whole device, and four of a
+//     layer's projections are independent and overlap." That one is NOT fixed
+//     here and cannot be from inside a single call. It is why this is default
+//     OFF and ablatable: the arbiter is `scripts/bench-decode.sh` with an
+//     `INK_GEMM_AUTOTUNE=1` arm against a bare one, not this file.
+//
+// ## The L2 hazard, which `inkling_bf16_gemm_bench` warns about by name
+//
+// That binary's doc: "Looping one weight buffer makes anything under a few tens
+// of MB L2-resident ... so exactly the shapes with the least grid parallelism --
+// the ones an access-pattern change is aimed at -- are the ones this harness
+// hands a warm cache." This loop has the same shape and therefore the same
+// hazard, and it is worse here because the bias is not uniform across lanes: a
+// bandwidth-bound lane gains more from a resident weight than a compute-bound
+// one, so a warm cache does not merely inflate every candidate, it REORDERS
+// them. Three things narrow it and none of them closes it:
+//
+//   * Round-robin, not all-iters-of-A-then-B. Every candidate is timed once per
+//     round, so whatever the cache and the clocks are doing across the tune is
+//     common-mode instead of accruing to whoever went first.
+//   * The MEDIAN of the rounds, never the minimum. The minimum sample is the
+//     most cache-flattered one by construction.
+//   * Round 0 is discarded: it is the round that compiles the kernel.
+//
+// What survives is that every candidate is judged on a weight the previous
+// candidate just streamed. In a real pass 4 GiB of other weights cycle through
+// between two touches of the same one, and no timer that runs inside one call
+// can reproduce that. So the pick is a WARM-CACHE pick, it is labelled as one,
+// and it is only evidence once an end-to-end A/B agrees with it.
+
+// ## What it found, and what that is worth
+//
+// `inkling_gemm_autotune_gate 2,3,4,5,8 --core`, DGX Spark GB10, 2026-08-25.
+// Per shape and width: which lane the static walk takes, which lane a timed
+// walk takes. Three shapes that dominate a pass, the five verify widths.
+//
+// FRAMING: per-GEMM ISOLATED timings, microseconds per call, on a looped
+// weight, on a box with no other GPU compute but other agents' build load.
+// They rank lanes at one shape. They are NOT a throughput claim, and nothing
+// below says a pass gets faster.
+//
+//     run   rotation  iters  disagreeing pairs   spread of the deltas
+//       1   no            2      12 of 15            10% .. 66%
+//       2   no            2      15 of 15            12% .. 67%
+//       4   YES           8      10 of 15             4% .. 52%
+//       5   YES           8       6 of 15             4% .. 14%
+//
+// Runs 1 and 2 said the static head is wrong everywhere by a wide margin. Runs
+// 4 and 5 are the same code as each other and say something much weaker. The
+// difference between the two pairs is not the GEMMs, it is TWO INSTRUMENT
+// BIASES that runs 1 and 2 contained:
+//
+//   * Fixed position. The head of the list was always the first candidate
+//     timed in a round, and this part idles at 208 MHz and ramps to 2411 --
+//     first-in-round is a seat, not a coincidence. Rotating removed it.
+//   * A sync divided by two. The timed region ends in a sync whose cost is
+//     charged to whatever it closes; over two iterations that overhead sits
+//     inside the 45-350 us these GEMMs take. Over eight it does not.
+//
+// Neither bias was visible in runs 1 and 2. Both produced a large, consistent,
+// entirely quotable effect. That is the whole reason this file now carries a
+// plausibility guard, a margin, and a doc paragraph instead of a lane swap.
+//
+// ## Run 4 against run 5: the same code, twice
+//
+// The honest reading is the INTERSECTION, because 4 and 5 are replicates:
+//
+//     shape            m   run 4 pick               run 5 pick
+//     attn wq          5   ordered double mma       double hybrid mma
+//     attn wq          8   double hybrid mma        double tma mma spec
+//     shared gate+up   8   double hybrid mma        specialized cyclic cmma
+//     shared down      4   double hybrid mma        specialized cyclic cmma
+//     shared down      5   ordered double mma       specialized cyclic cmma
+//     shared down      8   specialized cyclic cmma  specialized cyclic cmma
+//
+// Six of fifteen pairs disagree with the static order in BOTH runs. In ONE of
+// those six do the two runs name the same replacement. So:
+//
+//   * That the static head is not the timed winner at some verify widths
+//     reproduces -- `shared down` at m = 4, 5, 8 and `attn wq` at m = 5, 8.
+//   * WHICH lane should replace it does not reproduce at all. The challengers
+//     are within a few percent of each other and of the run-to-run noise,
+//     which is precisely what `PREFERENCE_NARROW`'s doc recorded about the
+//     previous tuner: "in isolation the lanes come out within a percent of
+//     each other and the pass says otherwise".
+//   * The margins that survive are 4% to 14%, against 10% to 67% before the
+//     instrument was fixed. An effect that shrinks fivefold when you correct
+//     the timer is mostly timer.
+//
+// So a CHANGED row means "the isolated timer disagrees with the order here",
+// not "the order is wrong here". `PREFERENCE_NARROW`'s end-to-end table
+// measured the `pk4` head BEST at w = 2, 3 and 5 (101.0 / 102.0 / 116.3 ms
+// against 109.2 / 115.8 / 125.8 for the list as written), and a lane that
+// loses alone and wins in a pass is exactly what that doc predicted: "a GEMM
+// timed alone is a GEMM that had the whole device, and four of a layer's
+// projections are independent and overlap." Nothing here refutes that table.
+// The arbiter is `scripts/bench-decode.sh` with an `INK_GEMM_AUTOTUNE=1` arm
+// against a bare one, and until that runs this feature stays off.
+
+/// What `INK_GEMM_AUTOTUNE` turns on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Autotune {
+    /// The static orders decide everything. The default, and what every number
+    /// recorded in this file was taken on.
+    Off,
+    /// Time the candidates in the verify band only, `2 <= m < MTILE` --
+    /// [`PREFERENCE_NARROW`]'s band, which is the width a speculative verify
+    /// feeds and the one nobody measured a per-shape order for.
+    Narrow,
+    /// Time them at every width, `m = 1` included. Re-opens the case the table
+    /// in [`PREFERENCE_NARROW`] closed against.
+    All,
+}
+
+/// `INK_GEMM_AUTOTUNE`, parsed once.
+fn autotune() -> Autotune {
+    use std::sync::OnceLock;
+    static A: OnceLock<Autotune> = OnceLock::new();
+    *A.get_or_init(
+        || match std::env::var("INK_GEMM_AUTOTUNE").ok().as_deref() {
+            None | Some("") | Some("0") | Some("off") => Autotune::Off,
+            Some("1") | Some("on") | Some("narrow") => Autotune::Narrow,
+            Some("all") => Autotune::All,
+            Some(other) => {
+                panic!("INK_GEMM_AUTOTUNE={other}: want 0/off, 1/on/narrow, or all")
+            }
+        },
+    )
+}
+
+/// A `usize` knob read straight from the environment.
+///
+/// Not cached: every caller here runs once per distinct shape in a process, so
+/// a `getenv` is free and a `OnceLock` per knob is three lines that buy nothing.
+///
+/// Zero is a VALUE, not an absence: `INK_GEMM_AUTOTUNE_MARGIN=0` means "take
+/// whatever the timer says", which is the ablation that shows what the margin
+/// is worth. Filtering it out would have silently substituted the default and
+/// made the ablation report the un-ablated arm.
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Round-robin rounds, of which the first is discarded. `INK_GEMM_AUTOTUNE_ROUNDS`.
+const AUTOTUNE_ROUNDS: usize = 4;
+/// Launches per candidate per round. `INK_GEMM_AUTOTUNE_ITERS`.
+///
+/// Eight and not two, because the timed region ends in a SYNC and the sync's
+/// own cost is charged to whatever it closes. The narrow-width GEMMs here run
+/// 45-350 us; a fixed sync overhead divided by two iterations sits inside that
+/// range and compresses the differences the tune exists to see. Divided by
+/// eight it does not.
+///
+/// It is the wrong direction for the L2 hazard -- eight consecutive touches of
+/// one weight are more resident than two -- and that is the trade this knob
+/// exists to let the next person re-take. The compression is symmetric and
+/// cannot invert a ranking; the cache bias can.
+const AUTOTUNE_ITERS: usize = 8;
+/// How far under the static head's time a challenger must land to take the
+/// shape, as a fraction. `INK_GEMM_AUTOTUNE_MARGIN` (in percent).
+///
+/// 3% because the recorded failure of the previous tuner was believing a 1%
+/// isolated margin. This is not a tuning parameter, it is the isolated timer's
+/// declared credibility, and a candidate that cannot clear it has told us
+/// nothing the static order did not already say.
+const AUTOTUNE_MARGIN: f64 = 0.03;
+
+/// The most weight bandwidth a sample may imply before it is not a sample.
+///
+/// DRAM on this part tops out near 273 GB/s and L2 is faster than DRAM, so a
+/// real number is allowed to exceed the DRAM figure -- that is the whole L2
+/// hazard above. Nothing is allowed to exceed SEVEN TIMES it: a sample there
+/// means the timer closed before the work did, i.e. the sync did not sync, and
+/// the entire tune is measuring enqueue. The autotune declines the shape rather
+/// than ranking noise.
+const AUTOTUNE_MAX_GBS: f64 = 2000.0;
+
+/// `INK_GEMM_AUTOTUNE_LOG=1`: print the ranking per shape on stderr.
+fn autotune_log() -> bool {
+    std::env::var("INK_GEMM_AUTOTUNE_LOG").is_ok_and(|v| v == "1" || v == "on")
+}
+
+/// The tune's settings as they will actually be used: rounds, iters, margin.
+///
+/// Exists because a report that states its framing from the ENV -- "or the
+/// default, which is 2" -- states the framing of a build it is not running.
+/// `inkling_gemm_autotune_gate` printed exactly that: "iters 2 per round" on a
+/// run doing eight, on the day the default changed. A framing rule read off a
+/// literal in a format string is not a framing rule, it is a guess that looks
+/// like one, and it is worse than none because it is quotable.
+pub fn autotune_params() -> (usize, usize, f64) {
+    (
+        env_usize("INK_GEMM_AUTOTUNE_ROUNDS", AUTOTUNE_ROUNDS).max(2),
+        env_usize("INK_GEMM_AUTOTUNE_ITERS", AUTOTUNE_ITERS).max(1),
+        env_usize(
+            "INK_GEMM_AUTOTUNE_MARGIN",
+            (AUTOTUNE_MARGIN * 100.0) as usize,
+        ) as f64
+            / 100.0,
+    )
+}
+
+/// The candidates for a shape: the static order, minus the lanes that decline it.
+///
+/// The order is preserved, so `.first()` is exactly what the static walk in
+/// [`bf16_gemm`] would have cached.
+fn candidates<R: Runtime>(
+    client: &ComputeClient<R>,
+    a: &Handle,
+    b: &Handle,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Vec<Lane> {
+    preference(m)
+        .into_iter()
+        .filter(|&lane| try_bf16_linear_cubek_launch(client, a, b, m, k, n, lane).is_ok())
+        .collect()
+}
+
+/// The lane the STATIC order takes for this shape: the first one that accepts it.
+///
+/// Exposed so a gate can print the two picks side by side without re-deriving
+/// the walk and without the two derivations being able to drift apart.
+pub fn static_lane<R: Runtime>(
+    client: &ComputeClient<R>,
+    a: &Handle,
+    b: &Handle,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Option<Lane> {
+    candidates(client, a, b, m, k, n).first().copied()
+}
+
+/// The lane a TIMED walk picks, and every candidate's median seconds, ranked.
+///
+/// `None` means the tune declined: no candidate accepted the shape, only one
+/// did (nothing to choose), or a sample implied more bandwidth than the machine
+/// has, which says the timing loop is not measuring the work. Every `None`
+/// leaves the caller on the static order, which is the arm all the recorded
+/// numbers were taken on.
+///
+/// Ignores `INK_GEMM_AUTOTUNE` -- the gate decides who calls this, so a gate
+/// binary can ask for the tuned pick without turning it on for the forward.
+pub fn tuned_lane<R: Runtime>(
+    client: &ComputeClient<R>,
+    a: &Handle,
+    b: &Handle,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Option<(Lane, Vec<(Lane, f64)>)> {
+    let cands = candidates(client, a, b, m, k, n);
+    let head = *cands.first()?;
+    if cands.len() == 1 {
+        return Some((head, vec![(head, f64::NAN)]));
+    }
+    let (rounds, iters, margin) = autotune_params();
+
+    let mut samples: Vec<Vec<f64>> = vec![Vec::new(); cands.len()];
+    for round in 0..rounds {
+        // ROTATE the starting candidate every round. Round-robin alone still
+        // pins each lane to a fixed POSITION, and position is not neutral: this
+        // part idles at 208 MHz and ramps, so whoever is timed first in a round
+        // is timed at a lower clock than whoever is timed last. The static head
+        // heads the list, so it was always in that seat -- and the first run of
+        // `inkling_gemm_autotune_gate` duly reported it losing 12 of 15
+        // shape/width pairs, which is exactly what a position bias looks like
+        // when the list has a fixed head. Rotating makes position common-mode
+        // the same way round-robin makes cache state common-mode.
+        for step in 0..cands.len() {
+            let slot = (step + round) % cands.len();
+            let lane = cands[slot];
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                let h = launch_lane(client, a, b, m, k, n, lane);
+                core::hint::black_box(&h);
+            }
+            // THE SYNC. Without it this times the enqueue, which is the failure
+            // the plausibility guard below exists to catch rather than trust.
+            // A four-byte read rather than the output: `read_one` copies the
+            // whole buffer back, and the unembed's output is 3.2 MB that would
+            // be charged to the GEMM. The read is ordered behind the launches
+            // on this thread's stream, which is what makes it a barrier -- the
+            // same idiom `inkling_membw` uses to close its upload timer.
+            let _ = client.read_one(client.empty(4));
+            let secs = t0.elapsed().as_secs_f64() / iters as f64;
+            // Round 0 compiled the kernels. It is not a measurement of them.
+            if round > 0 {
+                samples[slot].push(secs);
+            }
+        }
+    }
+
+    let mut ranked: Vec<(Lane, f64)> = cands
+        .iter()
+        .zip(samples.iter())
+        .map(|(&lane, s)| {
+            let mut v = s.clone();
+            v.sort_by(|x, y| x.partial_cmp(y).expect("no NaN in a duration"));
+            (lane, v[v.len() / 2])
+        })
+        .collect();
+
+    // The plausibility guard. A weight bandwidth the machine cannot reach is
+    // not a fast lane, it is a broken timer, and ranking on it would cache a
+    // decision made out of noise for the life of the process.
+    let weight_bytes = (n * k * 2) as f64;
+    for &(lane, secs) in &ranked {
+        let gbs = weight_bytes / secs / 1e9;
+        if !secs.is_finite() || secs <= 0.0 || gbs > AUTOTUNE_MAX_GBS {
+            eprintln!(
+                "  INK_GEMM_AUTOTUNE: [{m},{k}]x[{n},{k}]^T on {} implies {gbs:.0} GB/s of \
+                 weight, above the {AUTOTUNE_MAX_GBS:.0} GB/s ceiling -- the timer is not \
+                 measuring the work. Falling back to the static order.",
+                lane.name()
+            );
+            return None;
+        }
+    }
+
+    ranked.sort_by(|x, y| x.1.partial_cmp(&y.1).expect("no NaN in a duration"));
+    let (best, best_s) = ranked[0];
+    let head_s = ranked
+        .iter()
+        .find(|(l, _)| *l == head)
+        .map(|(_, s)| *s)
+        .expect("the head is a candidate");
+    // Under the margin the timer has not said anything the static order did not.
+    let pick = if best != head && (head_s - best_s) / head_s > margin {
+        best
+    } else {
+        head
+    };
+
+    if autotune_log() {
+        eprintln!(
+            "  INK_GEMM_AUTOTUNE m {m} k {k} n {n}: static `{}` {:.1} us, best `{}` {:.1} us \
+             ({:+.1}%), margin {:.0}% -> `{}`{}",
+            head.name(),
+            head_s * 1e6,
+            best.name(),
+            best_s * 1e6,
+            100.0 * (best_s - head_s) / head_s,
+            margin * 100.0,
+            pick.name(),
+            if pick == head { "" } else { "  CHANGED" },
+        );
+        for (lane, secs) in &ranked {
+            eprintln!(
+                "      {:<24} {:>9.1} us   {:>7.1} GB/s of weight",
+                lane.name(),
+                secs * 1e6,
+                weight_bytes / secs / 1e9
+            );
+        }
+    }
+    Some((pick, ranked))
+}
+
 /// Launch one lane, which must be known to accept the shape.
 fn launch_lane<R: Runtime>(
     client: &ComputeClient<R>,
@@ -972,8 +1359,18 @@ fn launch_lane<R: Runtime>(
     }
 }
 
-/// `out = a @ b^T` for BF16 operands and an f32 accumulator, on the fastest
-/// lane this box has for the shape.
+/// `out = a @ b^T` for BF16 operands and an f32 accumulator, on the first lane
+/// of the measured ORDER for the shape that accepts it.
+///
+/// Not "the fastest lane this box has for the shape", which is what this said
+/// until 2026-08-25 and was never what it did: [`preference`] is a list whose
+/// ORDER was measured end to end at m = 1, m = 2..8 and m = 512, and the walk
+/// below caches the first entry that does not return a setup error. That is the
+/// right default -- it is the only selection an end-to-end A/B has ever ratified
+/// -- but a shape whose right answer differs from the order's is a shape this
+/// gets wrong, silently and for the life of the process. `INK_GEMM_AUTOTUNE=1`
+/// times the candidates instead; see [`Autotune`] for what that buys and, more
+/// to the point, for what it has already been measured to cost.
 ///
 /// `a` is `[m, k]`, `b` is `[n, k]` (the checkpoint's own orientation) and the
 /// result is `[m, n]` f32.
@@ -1003,6 +1400,22 @@ pub fn bf16_gemm<R: Runtime>(
     let shape = (m, k, n);
     if let Some(lane) = lane_cache(shape, None) {
         return launch_lane(client, a, b, m, k, n, lane);
+    }
+    // First sight of this shape. With `INK_GEMM_AUTOTUNE` on, TIME the order
+    // rather than walking it -- see the block above for what that does and does
+    // not establish, and for why the band is the verify band by default. The
+    // tune costs one burst of launches per distinct `(m, k, n)` in a process and
+    // is cached exactly like the static pick, on the same map.
+    let tune = match autotune() {
+        Autotune::Off => false,
+        Autotune::Narrow => (2..MTILE).contains(&m),
+        Autotune::All => true,
+    };
+    if tune {
+        if let Some((lane, _ranked)) = tuned_lane(client, a, b, m, k, n) {
+            lane_cache(shape, Some(lane));
+            return launch_lane(client, a, b, m, k, n, lane);
+        }
     }
     for lane in preference(m) {
         if let Ok(h) = try_bf16_linear_cubek_launch(client, a, b, m, k, n, lane) {
