@@ -435,7 +435,7 @@
 //! `num_nextn_predict_layers`, `chain_hidden_post_norm` and `local_layer_ids`.
 //! The default was right; it was right on a guess, and now it is measured.
 //!
-Every other reading of the wrapper, priced the same way on the same corpus
+//! Every other reading of the wrapper, priced the same way on the same corpus
 //! (depth 1, 2048 positions each):
 //!
 //!     THE DEFAULT                   0.2266
