@@ -1209,13 +1209,22 @@ pub fn attention_step(
         .mul_scalar(tau);
     let bias = rel.gather(2, idx) * valid;
 
-    let qh = q.reshape([1, heads, head_dim]).swap_dims(0, 1);
-    let expand = |t: Tensor<Bk, 2>| -> Tensor<Bk, 3> {
-        t.reshape([padded, kv_heads, head_dim])
-            .swap_dims(0, 1)
-            .reshape([kv_heads, 1, padded, head_dim])
-            .repeat_dim(1, groups)
-            .reshape([heads, padded, head_dim])
+    // GQA WITHOUT MATERIALISING THE EXPANSION.
+    //
+    // Head `i` reads KV head `i / groups`, so the old `repeat_dim(1, groups)`
+    // built a `[heads, padded, head_dim]` copy of a `[kv_heads, ..]` cache --
+    // on this model 32 heads from 8, a 4x materialisation of the largest
+    // tensor in the step, every layer, every token. The same product is a
+    // batched matmul over `kv_heads` if the QUERIES are grouped instead: the
+    // `groups` queries that share a KV head become that batch entry's rows.
+    //
+    // `q` is `[1, heads * head_dim]` with heads contiguous, and the ordering
+    // the repeat produced was exactly kv-head-major -- head `k * groups + g`
+    // read KV head `k` -- so the reshape below is the same correspondence read
+    // the other way round, not a new convention.
+    let qg = q.reshape([kv_heads, groups, head_dim]);
+    let headwise_kv = |t: Tensor<Bk, 2>| -> Tensor<Bk, 3> {
+        t.reshape([padded, kv_heads, head_dim]).swap_dims(0, 1)
     };
     // Zeros, not uninitialized rows: the padded keys score 0 against any query
     // (harmless, the mask removes them) but the padded VALUES are multiplied by
@@ -1227,17 +1236,26 @@ pub fn attention_step(
         let dim = t.dims()[1];
         Tensor::cat(vec![t, as_kv(Tensor::zeros([padded - len, dim], &dev))], 0)
     };
-    let kh = expand(pad_rows(cache.k.materialize(&dev)));
-    let vh = expand(pad_rows(cache.v.materialize(&dev)));
+    let kh = headwise_kv(pad_rows(cache.k.materialize(&dev)));
+    let vh = headwise_kv(pad_rows(cache.v.materialize(&dev)));
 
     // Narrow on both sides of each product and wide again immediately after, so
     // the bias, the mask and the softmax are the same arithmetic the f32 lane
     // runs. The scores are `[heads, 1, padded]`; the cache is the megabytes.
-    let scores =
-        from_kv(as_kv(qh).matmul(kh.swap_dims(1, 2))).mul_scalar(d.scaling()) + bias + wmask;
+    //
+    // The grouped product is `[kv_heads, groups, head_dim] @ [kv_heads,
+    // head_dim, padded]` -> `[kv_heads, groups, padded]`, and that reshapes to
+    // `[heads, 1, padded]` because `kv_heads * groups == heads` in this order.
+    // Everything after the reshape is the arithmetic that was here before,
+    // element for element -- the bias, the mask and the softmax never saw the
+    // expansion.
+    let scores = from_kv(as_kv(qg).matmul(kh.swap_dims(1, 2)))
+        .reshape([heads, 1, padded])
+        .mul_scalar(d.scaling())
+        + bias
+        + wmask;
     let probs = burn::tensor::activation::softmax(scores, 2);
-    let out = from_kv(as_kv(probs).matmul(vh))
-        .swap_dims(0, 1)
+    let out = from_kv(as_kv(probs.reshape([kv_heads, groups, padded])).matmul(vh))
         .reshape([1, heads * head_dim]);
     linear_bf16(out, &w.wo)
 }
