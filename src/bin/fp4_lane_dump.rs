@@ -70,7 +70,15 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(201024);
-    let (m_pad, k) = (16usize, 4096usize);
+    // The head decodes at m = 1 padded to 16, i.e. ONE m-tile, so every weight
+    // row has exactly one consumer and nothing re-reads it out of L2. Raising
+    // m_pad adds m-tiles that share the same rows; if the achieved rate climbs
+    // with it, the shortfall is missing reuse rather than a bad kernel.
+    let m_pad: usize = std::env::var("INK_HEAD_M")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16);
+    let k = 4096usize;
     let codes = n * (k / 8) * 4;
     let scales = n * (k / 16);
     println!("head shape m_pad={m_pad} k={k} n={n}: codes {codes} B, scales {scales} B");
