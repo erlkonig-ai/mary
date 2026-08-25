@@ -658,6 +658,106 @@ pub fn swizzleable(n: usize, k: usize) -> bool {
     n % NTILE == 0 && k % KTILE == 0
 }
 
+/// Permute a `[n, k/8]` packed-code plane on the DEVICE, into a fresh handle.
+///
+/// The head's codes are produced on the device by
+/// [`super::fp4quant::quantize_nvfp4_bf16`], not copied out of the pile, so
+/// there is no host memcpy for the permutation to ride inside the way the
+/// routed experts' has. A device pass is the cheap alternative: one linear
+/// write of the destination with a gathered read, 0.43 GiB at the head's shape,
+/// once per process at startup.
+///
+/// Written destination-linear on purpose. The gather side is the scattered one,
+/// and a scattered READ of a resident table is what this whole permutation
+/// exists to make the GEMM stop doing per step — paying it once is the trade.
+#[cube(launch)]
+pub fn swizzle_codes_dev(src: &Tensor<u32>, dst: &mut Tensor<u32>, #[comptime] k_tiles: usize) {
+    let d = ABSOLUTE_POS as usize;
+    if d < dst.len() {
+        let wpb = comptime!(SWZ_BLOCK_CODES / 4);
+        let per_row = comptime!(KTILE / CODES_PER_WORD);
+        let blk = d / wpb;
+        let j = d % wpb;
+        let w = j / NTILE;
+        let col = j % NTILE;
+        let nt = blk / k_tiles;
+        let t = blk % k_tiles;
+        dst[d] = src[(nt * NTILE + col) * (k_tiles * per_row) + t * per_row + w];
+    }
+}
+
+/// Permute a `[n, k/16]` E4M3 scale plane on the DEVICE. See
+/// [`swizzle_codes_dev`].
+#[cube(launch)]
+pub fn swizzle_scales_dev<S: Scalar>(
+    src: &Tensor<S>,
+    dst: &mut Tensor<S>,
+    #[comptime] k_tiles: usize,
+) {
+    let d = ABSOLUTE_POS as usize;
+    if d < dst.len() {
+        let blk = d / NTILE;
+        let col = d % NTILE;
+        let nt = blk / k_tiles;
+        let t = blk % k_tiles;
+        dst[d] = src[(nt * NTILE + col) * k_tiles + t];
+    }
+}
+
+/// Permute both planes of an already-quantised `[n, k]` weight on the device.
+///
+/// Returns fresh handles; the caller drops the row-major ones. Panics rather
+/// than silently declining on a shape the layout cannot express — a weight that
+/// half-permuted would be a kernel reading the wrong bytes and producing
+/// NUMBERS, which is the one failure mode this must not have.
+pub fn swizzle_w4a16_device<R: Runtime>(
+    client: &ComputeClient<R>,
+    codes: &Handle,
+    scales: &Handle,
+    n: usize,
+    k: usize,
+) -> (Handle, Handle) {
+    assert!(swizzleable(n, k), "[{n}, {k}] is not swizzleable");
+    let k_tiles = k / KTILE;
+    let words = n * k / CODES_PER_WORD;
+    let sc = n * (k / GROUP);
+    let dc = client.empty(words * 4);
+    let ds = client.empty(sc);
+    let threads = 256u32;
+    unsafe {
+        swizzle_codes_dev::launch::<R>(
+            client,
+            CubeCount::Static(words.div_ceil(threads as usize) as u32, 1, 1),
+            CubeDim::new_1d(threads),
+            TensorArg::from_raw_parts(codes.clone(), [1].into(), [words].into()),
+            TensorArg::from_raw_parts(dc.clone(), [1].into(), [words].into()),
+            k_tiles,
+        )
+    };
+    unsafe {
+        swizzle_scales_dev::launch::<e4m3, R>(
+            client,
+            CubeCount::Static(sc.div_ceil(threads as usize) as u32, 1, 1),
+            CubeDim::new_1d(threads),
+            TensorArg::from_raw_parts(scales.clone(), [1].into(), [sc].into()),
+            TensorArg::from_raw_parts(ds.clone(), [1].into(), [sc].into()),
+            k_tiles,
+        )
+    };
+    (dc, ds)
+}
+
+/// Whether the head/sink W4A16 weights are written in MMA-fragment order.
+///
+/// On by default: it is bit-identical (`w4a16_swz_probe` reports max deviation
+/// 0.000e0 over 1024 outputs) and it measured faster on every rep of every run.
+/// `INK_W4A16_SWZ=0` is the A/B arm.
+pub fn swizzle_w4a16() -> bool {
+    std::env::var("INK_W4A16_SWZ")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
 /// [`w4a16_linear`] reading a B operand written by [`swizzle_w4a16_codes_into`].
 ///
 /// The ONLY difference is the two global indices. Everything else — the

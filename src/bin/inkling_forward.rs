@@ -1870,7 +1870,54 @@ fn quantized_bf16(
         n: rows,
         k: cols,
         scale2: 1.0,
+        swizzled: false,
     }
+}
+
+/// Bind a quantised weight to the W4A16 lane, in MMA-fragment order where the
+/// shape allows it.
+///
+/// The routed experts get their permutation free, inside the startup memcpy out
+/// of the pile. These weights have no such memcpy -- they are QUANTISED on the
+/// device by [`quantized_bf16`] -- so it is its own pass: one linear write with
+/// a gathered read, 0.43 GiB at the head's shape, once per process. The gather
+/// is the scattered side, and moving it here is the entire trade: it is what
+/// the GEMM stops doing on every step, of every pass, forever.
+///
+/// It is applied HERE and not inside the quantiser because the quantiser is
+/// lane-agnostic: `HeadLane::W4a4` binds the identical `PackedW` to
+/// [`dev_lane::linear_fp4`], which is `m16n8k64` and would read k16-permuted
+/// bytes as if they were row-major. `linear_fp4` refuses such a weight, so that
+/// mistake is an error rather than a plausible-looking logit -- but the right
+/// place to not make it is here.
+///
+/// `swizzled` reports whether the pass RAN, never whether it was requested.
+fn w4a16_bind(
+    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+    mut p: dev_lane::PackedW,
+) -> dev_lane::ProjW {
+    use mary::models::inkling::w4a16gemm as k16;
+    if k16::swizzle_w4a16() && k16::swizzleable(p.n, p.k) {
+        let (c, s) = k16::swizzle_w4a16_device(client, &p.codes, &p.scales, p.n, p.k);
+        p.codes = c;
+        p.scales = s;
+        p.swizzled = true;
+    }
+    // Once a process, not once a weight: the sink experts come through here
+    // several times a layer and the line is about the LAYOUT, which is one
+    // decision.
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        println!(
+            "  W4A16 weights written in {} order",
+            if p.swizzled {
+                "MMA-FRAGMENT (m16n8k16)"
+            } else {
+                "row-major [n, k/8]"
+            }
+        );
+    }
+    dev_lane::ProjW::W4a16(p)
 }
 
 fn bind_bf16(
@@ -2037,7 +2084,7 @@ impl DeviceDense {
                     // W4A16 and NOT `Fp4`: four-bit weights against a BF16
                     // activation, because nothing calibrated an input
                     // quantiser for this tensor. See [`sink_w4a16`].
-                    dev_lane::ProjW::W4a16(quantized_bf16(client, &gu, 2 * n_shared * inter, h))
+                    w4a16_bind(client, quantized_bf16(client, &gu, 2 * n_shared * inter, h))
                 } else {
                     dev_lane::ProjW::Bf16(bind_bf16(client, aliases, &gu, 2 * n_shared * inter, h))
                 },
@@ -2046,7 +2093,7 @@ impl DeviceDense {
             for e in 0..n_shared {
                 let raw = &d.bytes[e * per_d..(e + 1) * per_d];
                 sd.down.push(if sink_w4a16() {
-                    dev_lane::ProjW::W4a16(quantized_bf16(client, raw, h, inter))
+                    w4a16_bind(client, quantized_bf16(client, raw, h, inter))
                 } else {
                     // `w2` is NOT de-interleaved, so this one is a view of the
                     // pile and aliases outright.
@@ -5426,7 +5473,7 @@ fn main() -> Result<()> {
                 // so this tensor has none.
                 let p = quantized_bf16(&fp4_client, &leaf.bytes, rows, cols);
                 let w = match head_lane() {
-                    HeadLane::W4a16 => dev_lane::ProjW::W4a16(p),
+                    HeadLane::W4a16 => w4a16_bind(&fp4_client, p),
                     HeadLane::W4a4 => dev_lane::ProjW::Fp4(p),
                     HeadLane::Bf16 => unreachable!("guarded by head_lane() != Bf16"),
                 };
