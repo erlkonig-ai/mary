@@ -2993,6 +2993,72 @@ mod tests {
     /// computed alone. Nothing cached, nothing speculative — just
     /// [`linear_bf16`] at two widths on identical operands, at the real
     /// checkpoint's `[4096, 4096]`.
+    /// [`linear_fp4`] against [`linear_bf16`] on the SAME weight bytes.
+    ///
+    /// The question this answers is "is my lane wired right", not "is NVFP4
+    /// accurate enough" -- a layout or `scale2` mistake moves the result by
+    /// order one, and honest four-bit quantisation moves it by a few percent.
+    /// So the bound is deliberately loose: it is a bug detector, and the
+    /// quality question is `golden/paired/`'s to answer.
+    #[test]
+    fn linear_fp4_tracks_linear_bf16_on_the_same_weight() {
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let (n, k) = (512usize, 256usize);
+        let m = 3usize;
+        let probe: Tensor<B, 2> = Tensor::from_data(TensorData::new(vec![0f32], [1, 1]), &dev);
+        let client = client_of(&probe);
+
+        // One weight, two bindings of the same bytes.
+        let wf: Vec<f32> = fill(n * k, 0.17).map(|x| x * 0.05).collect();
+        let mut bytes = Vec::with_capacity(n * k * 2);
+        for x in &wf {
+            bytes.extend_from_slice(&half::bf16::from_f32(*x).to_le_bytes());
+        }
+        let bw = Bf16W {
+            h: client.create_from_slice(&bytes),
+            n,
+            k,
+            align: 16,
+        };
+        let src = client.create_from_slice(&bytes);
+        let (codes, scales) =
+            crate::models::inkling::fp4quant::quantize_nvfp4_bf16(&client, &src, n, k);
+        let pw = PackedW {
+            codes,
+            scales,
+            n,
+            k,
+            scale2: 1.0,
+        };
+
+        let xv: Vec<f32> = fill(m * k, 0.31).collect();
+        let x: Tensor<B, 2> = Tensor::from_data(TensorData::new(xv, [m, k]), &dev);
+
+        let a = linear_bf16(x.clone(), &bw).into_data().convert::<f32>();
+        let b = linear_fp4(x, &pw).into_data().convert::<f32>();
+        let (av, bv) = (a.as_slice::<f32>().unwrap(), b.as_slice::<f32>().unwrap());
+        assert_eq!(av.len(), m * n);
+
+        let num: f64 = av
+            .iter()
+            .zip(bv)
+            .map(|(p, q)| ((p - q) as f64).powi(2))
+            .sum();
+        let den: f64 = av.iter().map(|p| (*p as f64).powi(2)).sum();
+        let rel = (num / den).sqrt();
+        assert!(
+            rel < 0.15,
+            "relative RMS {rel:.4} between the BF16 and NVFP4 lanes on the same weight \
+             is a wiring fault, not quantisation error"
+        );
+        // And it must not be suspiciously EXACT either -- that would mean the
+        // FP4 lane never ran and something handed back the BF16 result.
+        assert!(
+            rel > 1e-6,
+            "the two lanes agree exactly; the FP4 lane did not run"
+        );
+    }
+
     #[test]
     fn linear_bf16_row0_matches_across_width() {
         let dev = burn::backend::cuda::CudaDevice::default();
