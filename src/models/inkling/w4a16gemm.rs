@@ -536,3 +536,95 @@ pub fn w4a16_linear_wide_launch<R: Runtime>(
     };
     out
 }
+
+// ---------------------------------------------------------------------------
+// The m16n8k16 B fragment map, off the device
+// ---------------------------------------------------------------------------
+
+/// Dump `position_of_nth` for the `m16n8k16` fragment, as the DEVICE answers it.
+///
+/// [`super::fp4gemm::fp4_frag_b_map`] does this for `m16n8k64`
+/// (`new_scaled::<e4m3>`); this is its twin for the shape BOTH four-bit-head and
+/// BF16 lanes actually issue. It is a separate dump and not a re-read of the
+/// other because the two are different instructions: a different `k`, a
+/// different operand width, a different constructor. The FP4 permutation was
+/// derived from the first map, and nothing about that derivation transfers.
+///
+/// One `MmaDefinition` serves both consumers here:
+/// [`w4a16_linear`] and [`super::bf16gemm::bf16_linear`] both construct
+/// `MmaDefinition::<bf16, bf16, f32>::new(16, 8, 16)` — same types, same
+/// constructor, same shape — so one dump settles the layout for 3.70 GiB/step
+/// of BF16 traffic and the 0.43 GiB/step head at once.
+///
+/// Layout of `out` (u32 words):
+///
+/// ```text
+///   0   .. 256   B:   [lane * 4 + i] -> (row, col)      i < 4
+///   256 .. 512   A:   same indexing
+///   512 .. 768   Acc: same indexing
+///   768 ..       counts: see the writes below
+/// ```
+#[cube(launch)]
+pub fn mma16_frag_map<AB: Scalar>(out: &mut Tensor<u32>) {
+    let def = cmma::MmaDefinition::<AB, AB, f32>::new(MTILE, NTILE, KTILE);
+    let lane = UNIT_POS_PLANE;
+    let pack = AB::packing_factor();
+
+    let ec_a = def.elems_per_lane(MatrixIdent::A);
+    let vs_a = def.vector_size(MatrixIdent::A);
+    let vc_a = comptime!(ec_a / vs_a);
+    let ec_b = def.elems_per_lane(MatrixIdent::B);
+    let vs_b = def.vector_size(MatrixIdent::B);
+    let vc_b = comptime!(ec_b / vs_b);
+    let ec_c = def.elems_per_lane(MatrixIdent::Accumulator);
+    let vs_c = def.vector_size(MatrixIdent::Accumulator);
+    let vc_c = comptime!(ec_c / vs_c);
+
+    // B is indexed EXACTLY as `w4a16_linear` indexes it -- `i * vs_b`, no
+    // packing factor -- so this dumps the addresses that kernel computes and
+    // not a neighbouring convention.
+    #[unroll]
+    for i in 0..vc_b {
+        let (row, col) = def.position_of_nth(lane, (i * vs_b) as u32, MatrixIdent::B);
+        out[(lane as usize * 4 + i) * 2] = row;
+        out[(lane as usize * 4 + i) * 2 + 1] = col;
+    }
+    #[unroll]
+    for i in 0..vc_a {
+        let (row, col) = def.position_of_nth(lane, (i * vs_a * pack) as u32, MatrixIdent::A);
+        out[256 + (lane as usize * 4 + i) * 2] = row;
+        out[256 + (lane as usize * 4 + i) * 2 + 1] = col;
+    }
+    #[unroll]
+    for i in 0..vc_c {
+        let (row, col) = def.position_of_nth(lane, (i * vs_c) as u32, MatrixIdent::Accumulator);
+        out[512 + (lane as usize * 4 + i) * 2] = row;
+        out[512 + (lane as usize * 4 + i) * 2 + 1] = col;
+    }
+    if lane == 0 {
+        out[768] = vc_b as u32;
+        out[769] = vs_b as u32;
+        out[770] = ec_b as u32;
+        out[771] = vc_a as u32;
+        out[772] = vs_a as u32;
+        out[773] = ec_a as u32;
+        out[774] = vc_c as u32;
+        out[775] = vs_c as u32;
+        out[776] = ec_c as u32;
+        out[777] = pack as u32;
+    }
+}
+
+/// Launch [`mma16_frag_map`] and return the raw `u32` dump.
+pub fn mma16_frag_map_launch<R: Runtime>(client: &ComputeClient<R>) -> Handle {
+    let out = client.empty(1024 * 4);
+    unsafe {
+        mma16_frag_map::launch::<bf16, R>(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(32),
+            TensorArg::from_raw_parts(out.clone(), [1].into(), [1024].into()),
+        )
+    };
+    out
+}
