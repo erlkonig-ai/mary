@@ -364,7 +364,7 @@
 //!
 //!   3732-token document, 2048 scored positions per depth, concat hidden-first
 //!
-//!     depth 0 (THE MAIN STACK)   0.2988   [0.2794, 0.3190]
+//!     depth 0 (THE MAIN STACK)   0.2988   [0.2794, 0.3190]   (see the note below)
 //!     depth 1                    0.2266   [0.2090, 0.2452]
 //!     depth 2                    0.1929
 //!     depth 3                    0.2085
@@ -374,6 +374,13 @@
 //! binary: a sibling's teacher-forced top-5 dump gives the main stack 1309/3987
 //! = **0.3283** top-1 and 0.5179 top-5. So ~0.30 is what this checkpoint scores
 //! on real text, and it is not an artefact of this instrument.
+//!
+//! The first depth-0 figure was measured through the final norm TWICE -- the
+//! rows it scores are `entry`, which is already final-normed, and `teach_rows`
+//! normed them again. That is not idempotent: `rms_norm(normalise(x) * g)` is
+//! `normalise(x) * g^2 / c`, so the ceiling was read through the learned gain
+//! SQUARED. The `norm` argument is the fix, and it moved the number by the
+//! amount the table records.
 //!
 //! Which means the draft head reaches **76% of the main stack's own accuracy on
 //! the equivalent task**, and the per-depth table being FLAT is not a symptom:
@@ -7942,9 +7949,14 @@ fn main() -> Result<()> {
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(0);
-            let teach_rows = |rows: T2| -> Vec<usize> {
+            // `norm` is FALSE for a row that has already taken the final norm.
+            // `mtp_main` holds `entry`, which IS final-normed unless INK_MTP_RAW
+            // is set, and norming it again is not idempotent: rms_norm of
+            // (normalise(x) * g) is normalise(x) * g^2 / c, so the ceiling would
+            // be measured through the final norm's learned gain SQUARED.
+            let teach_rows = |rows: T2, norm: bool| -> Vec<usize> {
                 let rows_n = rows.dims()[0];
-                let hs = if mtp_out_norm() {
+                let hs = if norm {
                     dev_lane::rms_norm(
                         rows,
                         fnorm_dev
@@ -8191,7 +8203,14 @@ fn main() -> Result<()> {
                                 if hi <= lo {
                                     continue;
                                 }
-                                let picks = teach_rows(main_dev.clone().slice([lo..hi, 0..h]));
+                                // `main_dev` is `entry`: normed already, unless
+                                // INK_MTP_RAW asked for the stack's raw output.
+                                let picks = teach_rows(
+                                    main_dev.clone().slice([lo..hi, 0..h]),
+                                    std::env::var("INK_MTP_RAW")
+                                        .map(|val| val == "1")
+                                        .unwrap_or(false),
+                                );
                                 for (i, &pick) in picks.iter().enumerate() {
                                     if pick == ids[lo + i + 1] {
                                         hits += 1;
@@ -8242,7 +8261,8 @@ fn main() -> Result<()> {
                                 if hi <= lo {
                                     continue;
                                 }
-                                let picks = teach_rows(y.clone().slice([lo..hi, 0..h]));
+                                let picks =
+                                    teach_rows(y.clone().slice([lo..hi, 0..h]), mtp_out_norm());
                                 for (i, &pick) in picks.iter().enumerate() {
                                     if pick == ids[lo + i + d + 2] {
                                         hits += 1;
