@@ -3271,12 +3271,29 @@ mod tests {
     /// framing, and asserts only what it can see: that the lane produced
     /// finite, non-degenerate output.
     ///
-    /// As measured, and read carefully: **max-abs error over the 4096-wide
-    /// output divided by max-abs of the dense output, worst over 16 decode
-    /// steps, one local layer, window 512, 5-token prefill, synthetic
-    /// sinusoidal input — 4.9e-1.** That is a single worst ELEMENT against the
-    /// largest element, not a typical one; the RMS beside it is the number to
-    /// compare against anything else, and neither is a figure about the model.
+    /// ## What it prints, and the control that makes it readable
+    ///
+    /// One local layer, window 512, 5-token prefill, 16 decode steps, synthetic
+    /// sinusoidal input and weights, `[1, 4096]` output per step; worst over
+    /// the sixteen steps, against the BF16 dense cache:
+    ///
+    /// ```text
+    /// NVFP4 cache : max-abs 4.9e-1 of the dense max-abs, RMS 9.1e-1 of the dense RMS
+    /// f32   cache : max-abs 6.2e-3                     , RMS 1.0e-2
+    /// ```
+    ///
+    /// The second row is why the first is worth printing. This probe cancels
+    /// heavily in `wo`, so it amplifies ANY cache perturbation, and the FP4
+    /// figure alone cannot tell an amplifying probe from a ruinous codec. The
+    /// control is the trade [`attn_bf16`] already ships, measured the identical
+    /// way on the identical input — 1% where NVFP4 is 91%. So the probe
+    /// discriminates, and the ~88x is a real difference in kind and not an
+    /// artifact of the harness.
+    ///
+    /// Neither figure is a statement about the model. Both are one synthetic
+    /// layer, and the max-abs one is a single worst ELEMENT against the largest
+    /// element rather than a typical one — which is exactly why the RMS is
+    /// printed beside it and neither travels alone.
     #[test]
     fn the_fp4_cache_engages_at_real_width() {
         let dev = burn::backend::cuda::CudaDevice::default();

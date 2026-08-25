@@ -399,9 +399,37 @@ use cubecl::prelude::ComputeClient;
 /// for memory it did not need. Above it, and for the contexts that do not fit
 /// at all today, it is the only thing that helps.
 ///
-/// A switch rather than an unconditional change for the reason [`super::burn::attn_bf16`]
-/// is one: what it trades is precision, and the honest way to price precision
-/// is to run both arms of the same binary against the same harness.
+/// ## What it costs, measured
+///
+/// A switch rather than an unconditional change for the reason
+/// [`super::burn::attn_bf16`] is one: what it trades is precision, and the
+/// honest way to price precision is to run both arms of the same binary
+/// against the same harness. Unlike `attn_bf16`, this one has not won that
+/// comparison, which is why it is off by default.
+///
+/// The codec itself is tight: a real-width BF16 row round-trips to within
+/// `amax / 6` of every 16-element block, which IS the theoretical worst case
+/// for NVFP4 — half the gap between the two widest E2M1 magnitudes. There is
+/// no slack left in this file to recover.
+///
+/// What that costs downstream is another question, and on the one probe that
+/// exists here it is not small. `the_fp4_cache_engages_at_real_width` runs a
+/// single local layer — window 512, 5-token prefill, 16 decode steps,
+/// synthetic sinusoidal input and weights, `[1, 4096]` output per step — and
+/// reports, against the BF16 dense cache and worst over the sixteen steps:
+///
+/// ```text
+/// NVFP4 cache : max-abs 4.9e-1 of the dense max-abs, RMS 9.1e-1 of the dense RMS
+/// f32   cache : max-abs 6.2e-3                     , RMS 1.0e-2
+/// ```
+///
+/// The second row is the control and it is the load-bearing part: it is the
+/// trade `attn_bf16` already ships, measured the identical way on the
+/// identical input. So the probe is NOT merely hypersensitive — it moves 1% for
+/// BF16 and 91% for NVFP4, an ~88x larger perturbation. Both figures are one
+/// synthetic layer and neither is a statement about the model; `golden/paired/`
+/// is where that question is asked. But nobody should read "3.56x more context"
+/// without also reading this.
 pub fn fp4_kv() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
