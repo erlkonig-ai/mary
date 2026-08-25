@@ -1392,6 +1392,23 @@ struct SharedOnDevice {
 /// measured: the same operation on the same shapes runs 65.08 ms on the BF16
 /// grouped lane against 18.44 ms on the NVFP4 one, and the shared experts are
 /// 100.7 MB of a 275.8 MB layer-step.
+/// `INK_FUSE_QKVR=1`: bind `wq|wk|wv|wr` as one `[6656, hidden]` weight.
+///
+/// A SCHEDULING change -- every output element is the same k-loop over the
+/// same row -- but it costs a COPY, because a concatenation is not a span of
+/// the mapping and `bind_bf16` can only alias what already lies there. That is
+/// 54.5 MB a layer of device memory bought against four launches of 512, 128,
+/// 128 and 64 cubes becoming one of 832. Off by default until the arms are
+/// compared end to end, since the fused shape may also pick a different lane.
+fn fuse_qkvr() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("INK_FUSE_QKVR")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 fn shared_fp4() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -4372,6 +4389,7 @@ fn main() -> Result<()> {
                 wk: g("attn.wk_dv.weight")?,
                 wv: g("attn.wv_dv.weight")?,
                 wr: g("attn.wr_du.weight")?,
+                wqkvr: None,
                 wo: g("attn.wo_ud.weight")?,
                 q_norm: g("attn.q_norm.weight")?,
                 k_norm: g("attn.k_norm.weight")?,
@@ -5474,11 +5492,29 @@ fn main() -> Result<()> {
                         cols,
                     ))
                 };
+                // The concatenation reads the same four leaves `pw` binds, in
+                // the output order [`dev_lane::project_qkvr`] slices back.
+                let fused_qkvr = if fuse_qkvr() {
+                    let mut b: Vec<u8> = Vec::new();
+                    for nm in [
+                        "attn.wq_du.weight",
+                        "attn.wk_dv.weight",
+                        "attn.wv_dv.weight",
+                        "attn.wr_du.weight",
+                    ] {
+                        b.extend_from_slice(&cp.stored(&format!("{p}{nm}"))?.bytes);
+                    }
+                    let rows = (heads * head_dim) + 2 * (kv_heads * head_dim) + heads * t.d_rel;
+                    Some(bind_bf16(&fp4_client, fp4_aliases.as_ref(), &b, rows, h))
+                } else {
+                    None
+                };
                 let attn = dev_lane::AttnWeightsDev {
                     wq: pw("attn.wq_du.weight", heads * head_dim, h)?,
                     wk: pw("attn.wk_dv.weight", kv_heads * head_dim, h)?,
                     wv: pw("attn.wv_dv.weight", kv_heads * head_dim, h)?,
                     wr: pw("attn.wr_du.weight", heads * t.d_rel, h)?,
+                    wqkvr: fused_qkvr,
                     wo: pw("attn.wo_ud.weight", h, heads * head_dim)?,
                     k_sconv: up2(
                         gv("attn.k_sconv.weight")?,
@@ -7143,6 +7179,7 @@ fn main() -> Result<()> {
                                 wk: pw("attn.wk_dv.weight", hd.kv_heads * hd.head_dim, h)?,
                                 wv: pw("attn.wv_dv.weight", hd.kv_heads * hd.head_dim, h)?,
                                 wr: pw("attn.wr_du.weight", hd.heads * hd.d_rel, h)?,
+                                wqkvr: None,
                                 wo: pw("attn.wo_ud.weight", h, hd.heads * hd.head_dim)?,
                                 k_sconv: up2(
                                     gv(&format!("{p}attn.k_sconv.weight"))?,

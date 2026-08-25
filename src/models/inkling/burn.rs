@@ -483,6 +483,9 @@ pub struct AttnWeightsDev {
     pub wk: Bf16W,
     pub wv: Bf16W,
     pub wr: Bf16W,
+    /// `wq|wk|wv|wr` concatenated along the OUTPUT axis, when `INK_FUSE_QKVR`
+    /// bound it. See [`project_qkvr`].
+    pub wqkvr: Option<Bf16W>,
     pub wo: Bf16W,
     pub k_sconv: Tensor<Bk, 2>,
     pub v_sconv: Tensor<Bk, 2>,
@@ -608,6 +611,48 @@ fn trim<B: Backend>(c: &mut AttnCache<B>, window: Option<usize>) {
     c.base += drop;
 }
 
+/// `wq`, `wk`, `wv` and `wr` against the same activation — as ONE matmul when
+/// the fused weight is bound.
+///
+/// All four read the residual stream and all four have `k = hidden`, so they
+/// differ only in output width: 4096, 1024, 1024 and `heads * d_rel` = 512.
+/// Issued separately that is four grids of 512, 128, 128 and 64 cubes, and
+/// [`AttnWeightsDev`]'s own doc already records what that costs — "256 cubes of
+/// one warp cannot cover DRAM latency on this part ... the unembed, same kernel
+/// same instruction, 25128 cubes, ran at 175". The shared experts were fused
+/// along `n` for exactly this reason and reach 195 GB/s of a measured 242.9;
+/// these four were left split and reach 59.
+///
+/// Concatenating along the output axis is a SCHEDULING change and not a
+/// numerical one: every output element is still the same `k`-loop over the same
+/// row. What it can change is which lane [`bf16_gemm`] picks, since that is
+/// chosen by shape — so this is a switch, and the arms are compared end to end
+/// rather than assumed equal.
+///
+/// [`bf16_gemm`]: crate::models::inkling::bf16gemm::bf16_gemm
+fn project_qkvr(
+    x: Tensor<Bk, 2>,
+    w: &AttnWeightsDev,
+) -> (Tensor<Bk, 2>, Tensor<Bk, 2>, Tensor<Bk, 2>, Tensor<Bk, 2>) {
+    let Some(fused) = w.wqkvr.as_ref() else {
+        return (
+            linear_bf16(x.clone(), &w.wq),
+            linear_bf16(x.clone(), &w.wk),
+            linear_bf16(x.clone(), &w.wv),
+            linear_bf16(x, &w.wr),
+        );
+    };
+    let rows = x.dims()[0];
+    let y = linear_bf16(x, fused);
+    let (a, b, c) = (w.wq.n, w.wq.n + w.wk.n, w.wq.n + w.wk.n + w.wv.n);
+    (
+        y.clone().slice([0..rows, 0..a]),
+        y.clone().slice([0..rows, a..b]),
+        y.clone().slice([0..rows, b..c]),
+        y.slice([0..rows, c..c + w.wr.n]),
+    )
+}
+
 /// One attention layer over a whole sequence, on the device, no cache.
 ///
 /// The device twin of [`crate::models::inkling::attn::attention`] and gated
@@ -705,12 +750,9 @@ fn attention_prefill_lane(
     // K and V pass through their short convolutions; Q does not. The
     // pre-convolution projections are kept: they are the convolution's memory,
     // and a decode step cannot reconstruct them from the cached K and V.
-    let q = linear_bf16(x.clone(), &w.wq);
-    let k_pre = linear_bf16(x.clone(), &w.wk);
-    let v_pre = linear_bf16(x.clone(), &w.wv);
+    let (q, k_pre, v_pre, r) = project_qkvr(x, w);
     let k = short_conv(k_pre.clone(), w.k_sconv.clone());
     let v = short_conv(v_pre.clone(), w.v_sconv.clone());
-    let r = linear_bf16(x, &w.wr);
 
     let q = head_rms_norm(q, w.q_norm.clone(), heads, head_dim, d.rms_eps);
     let k = head_rms_norm(k, w.k_norm.clone(), kv_heads, head_dim, d.rms_eps);
@@ -1214,20 +1256,11 @@ pub fn attention_step(
         "{heads} heads do not divide into {kv_heads} kv heads"
     );
 
-    let q = linear_bf16(x.clone(), &w.wq);
-    let (k_new, k_hist) = short_conv_step(
-        cache.k_pre.clone(),
-        linear_bf16(x.clone(), &w.wk),
-        w.k_sconv.clone(),
-    );
-    let (v_new, v_hist) = short_conv_step(
-        cache.v_pre.clone(),
-        linear_bf16(x.clone(), &w.wv),
-        w.v_sconv.clone(),
-    );
+    let (q, k_proj, v_proj, r) = project_qkvr(x, w);
+    let (k_new, k_hist) = short_conv_step(cache.k_pre.clone(), k_proj, w.k_sconv.clone());
+    let (v_new, v_hist) = short_conv_step(cache.v_pre.clone(), v_proj, w.v_sconv.clone());
     cache.k_pre = k_hist;
     cache.v_pre = v_hist;
-    let r = linear_bf16(x, &w.wr);
 
     let q = head_rms_norm(q, w.q_norm.clone(), heads, head_dim, d.rms_eps);
     let k_new = head_rms_norm(k_new, w.k_norm.clone(), kv_heads, head_dim, d.rms_eps);
@@ -1417,14 +1450,14 @@ pub fn attention_steps(
         "{heads} heads do not divide into {kv_heads} kv heads"
     );
 
-    let q = linear_bf16(x.clone(), &w.wq);
+    let (q, k_proj, v_proj, r) = project_qkvr(x, w);
     // The convolution over the batch, taps and all: the `kernel - 1` history
     // rows the cache carries, then this batch's own projections. Rows
     // `kernel - 1 ..` of that see a full window of real inputs, which is
     // exactly the rows this batch is asking for — the front-padding
     // [`short_conv`] applies is never reached.
-    let k_all = Tensor::cat(vec![cache.k_pre.clone(), linear_bf16(x.clone(), &w.wk)], 0);
-    let v_all = Tensor::cat(vec![cache.v_pre.clone(), linear_bf16(x.clone(), &w.wv)], 0);
+    let k_all = Tensor::cat(vec![cache.k_pre.clone(), k_proj], 0);
+    let v_all = Tensor::cat(vec![cache.v_pre.clone(), v_proj], 0);
     let hist = d.kernel - 1;
     let kdim = k_all.dims()[1];
     let vdim = v_all.dims()[1];
@@ -1434,7 +1467,6 @@ pub fn attention_steps(
     // a one-row one.
     let k_new = short_conv_window(k_all.clone(), w.k_sconv.clone(), rows);
     let v_new = short_conv_window(v_all.clone(), w.v_sconv.clone(), rows);
-    let r = linear_bf16(x, &w.wr);
 
     let q = head_rms_norm(q, w.q_norm.clone(), heads, head_dim, d.rms_eps);
     let k_new = head_rms_norm(k_new, w.k_norm.clone(), kv_heads, head_dim, d.rms_eps);
@@ -2071,20 +2103,11 @@ pub fn attention_slots(
         "this cache was built at a different layer shape"
     );
 
-    let q = linear_bf16(x.clone(), &w.wq);
-    let (k_new, k_hist) = short_conv_slot_step(
-        cache.k_pre.clone(),
-        linear_bf16(x.clone(), &w.wk),
-        w.k_sconv.clone(),
-    );
-    let (v_new, v_hist) = short_conv_slot_step(
-        cache.v_pre.clone(),
-        linear_bf16(x.clone(), &w.wv),
-        w.v_sconv.clone(),
-    );
+    let (q, k_proj, v_proj, r) = project_qkvr(x, w);
+    let (k_new, k_hist) = short_conv_slot_step(cache.k_pre.clone(), k_proj, w.k_sconv.clone());
+    let (v_new, v_hist) = short_conv_slot_step(cache.v_pre.clone(), v_proj, w.v_sconv.clone());
     cache.k_pre = k_hist;
     cache.v_pre = v_hist;
-    let r = linear_bf16(x, &w.wr);
 
     let q = head_rms_norm(q, w.q_norm.clone(), heads, head_dim, d.rms_eps);
     let k_new = head_rms_norm(k_new, w.k_norm.clone(), kv_heads, head_dim, d.rms_eps);
@@ -2348,6 +2371,7 @@ mod tests {
         let (q_w, kv_w) = (d.heads * d.head_dim, d.kv_heads * d.head_dim);
         AttnWeightsDev {
             wq: w16(q_w, d.hidden, 0.1),
+            wqkvr: None,
             wk: w16(kv_w, d.hidden, 0.2),
             wv: w16(kv_w, d.hidden, 0.3),
             wr: w16(d.heads * d.d_rel, d.hidden, 0.4),
