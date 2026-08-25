@@ -7813,6 +7813,21 @@ fn main() -> Result<()> {
             let teach = std::env::var("INK_MTP_TEACH")
                 .map(|v| v == "1")
                 .unwrap_or(false);
+            // The first row to score. Zero for a plain corpus; set it to the
+            // PROMPT length when the ids file is a seed followed by this model's
+            // own greedy continuation, so the rate is measured on the sequence a
+            // decode loop actually verifies.
+            //
+            // That distinction is not a detail. Teacher forcing on a human
+            // document asks the draft head to predict a token the MAIN STACK
+            // itself only gets right 30% of the time; at decode the target IS the
+            // main stack's argmax, which the head was trained to anticipate. So a
+            // corpus rate is a LOWER BOUND on the decode rate, and the two should
+            // never be quoted as the same number.
+            let teach_from = std::env::var("INK_MTP_TEACH_FROM")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
             let teach_rows = |rows: T2| -> Vec<usize> {
                 let rows_n = rows.dims()[0];
                 let hs = if mtp_out_norm() {
@@ -8046,16 +8061,18 @@ fn main() -> Result<()> {
                             // a stack at 0.9 and unremarkable against a stack at
                             // 0.3, and nothing in a per-depth table says which.
                             let last = seq.saturating_sub(1);
+                            let first = teach_from.min(last);
                             let mut hits = 0usize;
                             let mut scored = 0usize;
-                            let nblk = (last / 256).max(1);
+                            let nblk = ((last - first) / 256).max(1);
                             let take = nblk.min(8);
                             for b in 0..take {
-                                let lo = if take == 1 {
-                                    0
-                                } else {
-                                    (b * (nblk - 1) / (take - 1).max(1)) * 256
-                                };
+                                let lo = first
+                                    + if take == 1 {
+                                        0
+                                    } else {
+                                        (b * (nblk - 1) / (take - 1).max(1)) * 256
+                                    };
                                 let hi = (lo + 256).min(last);
                                 if hi <= lo {
                                     continue;
@@ -8095,16 +8112,18 @@ fn main() -> Result<()> {
                                 .ok()
                                 .and_then(|v| v.parse::<usize>().ok())
                                 .unwrap_or(2048);
-                            let nblk = (last / TEACH_BLOCK).max(1);
+                            let first = teach_from.min(last);
+                            let nblk = ((last - first) / TEACH_BLOCK).max(1);
                             let take = nblk.min((cap / TEACH_BLOCK).max(1));
                             let mut hits = 0usize;
                             let mut scored = 0usize;
                             for b in 0..take {
-                                let lo = if take == 1 {
-                                    0
-                                } else {
-                                    (b * (nblk - 1) / (take - 1).max(1)) * TEACH_BLOCK
-                                };
+                                let lo = first
+                                    + if take == 1 {
+                                        0
+                                    } else {
+                                        (b * (nblk - 1) / (take - 1).max(1)) * TEACH_BLOCK
+                                    };
                                 let hi = (lo + TEACH_BLOCK).min(last);
                                 if hi <= lo {
                                     continue;
