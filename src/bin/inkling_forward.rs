@@ -4648,13 +4648,8 @@ fn main() -> Result<()> {
             globals.push("model.llm.unembed.weight");
         }
         let t0 = Instant::now();
-        let (experts, dense, bytes, device_weights) = cp.copy_share(
-            lo..hi,
-            &globals,
-            attention_bytes + slot_kv_bytes,
-            admission,
-            n,
-        )?;
+        let (experts, dense, bytes, device_weights) =
+            cp.copy_share(lo..hi, &globals, attention_bytes + slot_kv_bytes, admission)?;
         println!(
             "  startup weight copy: {experts} expert + {dense} dense views, {:.2} GiB anonymous in {:.1}s",
             bytes as f64 / GIB,

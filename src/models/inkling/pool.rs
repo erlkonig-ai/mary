@@ -190,45 +190,80 @@ impl AllocatorConfig {
         }
     }
 
-    /// Allocator reservation charged before the startup copy.
+    /// What the allocator holds BEYOND the live set, in bytes.
     ///
-    /// SubSlices allocates the two largest ladder pages for this workload.
-    /// ExclusivePages removes that fixed ladder, but it does not remove
-    /// retention: its 24 first-fit buckets keep one request-sized page per
-    /// allocation, round new pages to a per-bucket moving average, and reclaim
-    /// them only after their handles are free. The aggregate admission model
-    /// does not carry the ordered allocation trace needed to prove a smaller
-    /// bound, so it retains the existing conservative charge. This is
-    /// intentionally stricter than the measured ExclusivePages high-water
-    /// marks (30.12 GiB without explicit cleanup and 15.63 GiB with per-layer
-    /// cleanup on a 121.6 GiB node), rather than turning those one-workload
-    /// observations into an unsafe universal coefficient.
-    /// The prefill length the un-scaled floor was sized for.
+    /// The two strategies need two different answers because they retain for
+    /// two different reasons, and only one of them is a property of the
+    /// machine.
     ///
-    /// `machine / 4 + machine / 16` is not a fitted coefficient -- it is two
-    /// page sizes off a ladder the runtime derives from the device -- but it
-    /// was measured against a 16,384-token PREFILL. Charging it to a decode
-    /// step is charging a constant for something linear in the sequence, which
-    /// is the exact error `Checkpoint::copy_share` documents itself against:
-    /// "folding one into the other is how the gate came to charge a constant
-    /// for something linear in the sequence".
+    /// # SubSlices: a fraction of the device, because the ladder is
     ///
-    /// Measured 2026-08-25, spark-zt, INK_LAYERS=0:16, 256-token prompt,
-    /// decode, cleanup OFF (the worst arm): admission charged 45.20 GiB of
-    /// context/activations while the pool reserved 1.88 GiB -- 1.42 live, 0.46
-    /// stranded. The floor was ~20x the high-water, and that is what refuses
-    /// ranges that would run.
-    const PREFILL_REFERENCE: u64 = 16_384;
-
-    pub fn admission_floor(self, machine: u64, prefill_tokens: usize) -> u64 {
+    /// `MemoryConfiguration::SubSlices` quarters `max_page_size` down to 32 MB
+    /// and hands out slices of a page it allocates WHOLE, returning it only
+    /// when every slice on it is free. This workload always holds the top two
+    /// rungs (the score blocks are 3.75-4.00 GiB at every sequence
+    /// [`super::budget::query_block`] admits, and past about 40,000 tokens the
+    /// routed gather is larger still), so `machine / 4 + machine / 16` is not a
+    /// fitted coefficient -- it is two page sizes off a ladder the runtime
+    /// derives from the device. It is flat in the sequence because the ladder
+    /// is. Measured: 41.74 GiB reserved to hold 1.14 GiB live at 16,384 tokens.
+    ///
+    /// # ExclusivePages: a factor on the LIVE SET, because the buckets are
+    ///
+    /// There is no ladder here and nothing about the device decides the
+    /// retention. `MemoryManagement::from_configuration` builds
+    /// `generate_bucket_sizes(32 KiB, max_page_size, 24, alignment)` -- 24
+    /// log-spaced buckets -- and an allocation goes to the FIRST bucket whose
+    /// `max_alloc_size` accepts it. `ExclusiveMemoryPool::alloc_page` then
+    /// takes `max(cur_avg_size, size)`, and `cur_avg_size` is an EMA over that
+    /// bucket's own requests, so it never exceeds the bucket's ceiling. A
+    /// request of `s` bytes therefore occupies a page of at most `s * r`, where
+    /// `r` is the ratio between adjacent buckets:
+    ///
+    /// ```text
+    /// r = (max_page_size / 32 KiB) ^ (1 / 23)
+    /// ```
+    ///
+    /// which is 1.823 on both of the nodes this runs on. That is the whole
+    /// charge: `live * (r - 1)`, derived from the allocator's construction, not
+    /// fitted to a run. It is deliberately loose against what the allocator
+    /// actually does -- the model's allocations repeat identically every layer,
+    /// so `cur_avg_size` converges ON the request and the measured ratio is
+    /// 1.017 (9.21 GiB reserved against 9.06 live, exclusive + per-stage
+    /// cleanup) -- but it is loose by a factor of the ALLOCATOR, on the size of
+    /// the WORKLOAD.
+    ///
+    /// # What is deliberately NOT charged here
+    ///
+    /// Free pages the pool is holding for reuse. They are not part of the live
+    /// set, they are reclaimable by definition, and
+    /// [`CleanupPolicy::WhenStranded`] already bounds them at runtime against
+    /// the memory the node actually has -- which is the same hazard measured
+    /// exactly instead of predicted crudely. Charging both is charging twice,
+    /// and the second charge is the one that refuses runs: on a 121.63 GiB node
+    /// the old floor was 32.87 GiB at a 14,169-token prefill against a modelled
+    /// live set of 9.65 GiB, three and a half times the whole thing it was a
+    /// cushion for, and it refused a 20-layer share that needs 100.88.
+    ///
+    /// So the split is by RECLAIMABILITY: admission prices what the run cannot
+    /// give back, the cleanup policy bounds what it can.
+    pub fn admission_overhead(self, machine: u64, live: u64) -> u64 {
         match self {
-            Self::SubSlices | Self::ExclusivePages => {
-                let full = machine / 4 + machine / 16;
-                let scaled = full.saturating_mul(prefill_tokens as u64) / Self::PREFILL_REFERENCE;
-                scaled.clamp(machine / 16, full)
+            Self::SubSlices => machine / 4 + machine / 16,
+            Self::ExclusivePages => {
+                let max_page = (machine / 4).max(Self::MIN_BUCKET);
+                let r = ((max_page as f64 / Self::MIN_BUCKET as f64).ln()
+                    / (Self::NUM_POOLS - 1) as f64)
+                    .exp();
+                ((live as f64) * (r - 1.0)) as u64
             }
         }
     }
+
+    /// `MIN_BUCKET_SIZE` in `MemoryManagement::from_configuration`.
+    const MIN_BUCKET: u64 = 32 * 1024;
+    /// `NUM_POOLS` in the same function.
+    const NUM_POOLS: u32 = 24;
 }
 
 /// Select the cubecl memory configuration, unless the operator already has.
@@ -348,32 +383,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allocator_floor_stays_conservative_for_both_strategies() {
+    fn subslices_charges_its_two_largest_pages_and_nothing_about_the_run() {
         let machine = 128 << 30;
+        // The ladder is a property of the device, so the charge cannot move
+        // with the live set. Both of these are the same two rungs.
         assert_eq!(
-            AllocatorConfig::SubSlices.admission_floor(machine, 16_384),
+            AllocatorConfig::SubSlices.admission_overhead(machine, 1 << 30),
             40 << 30
         );
         assert_eq!(
-            AllocatorConfig::ExclusivePages.admission_floor(machine, 16_384),
+            AllocatorConfig::SubSlices.admission_overhead(machine, 40 << 30),
             40 << 30
         );
     }
 
     #[test]
-    fn exclusive_floor_dominates_the_recorded_within_layer_peak() {
+    fn exclusive_charges_the_bucket_ratio_of_the_live_set() {
         const GIB: u64 = 1 << 30;
-        // The probe documented above: 121.6 GiB machine, 9.71 GiB live and
-        // 30.12 GiB reserved before an explicit cleanup boundary. Admission
-        // adds its allocator floor to its independently modelled live set, so
-        // compare the floor with the adversarial retained portion.
         let machine = 1216 * GIB / 10;
-        let live = 971 * GIB / 100;
-        let reserved = 3012 * GIB / 100;
-        let retained = reserved - live;
-        let floor = AllocatorConfig::ExclusivePages.admission_floor(machine, 16_384);
-        assert!(floor >= retained);
-        assert!(live + floor >= reserved);
+        // r - 1 = 0.823 on this node, so ten gibibytes of live tensors are
+        // charged rather more than eight of allocator rounding.
+        let ten = AllocatorConfig::ExclusivePages.admission_overhead(machine, 10 * GIB);
+        let lo = (8.2 * GIB as f64) as u64;
+        let hi = (8.3 * GIB as f64) as u64;
+        assert!(ten > lo && ten < hi, "10 GiB live charged {ten} bytes");
+        // Linear in the live set and NOT in the machine: doubling the workload
+        // doubles the charge, and a node 2 GiB larger changes it by a rounding.
+        let twenty = AllocatorConfig::ExclusivePages.admission_overhead(machine, 20 * GIB);
+        assert!(twenty.abs_diff(2 * ten) <= 2, "{twenty} vs {}", 2 * ten);
+        // The two nodes this runs on differ by 2 GiB. The bucket ratio is the
+        // 23rd root of a page size, so that difference reaches the charge
+        // divided by 23: 13 MiB on a 10 GiB live set, against the 0.62 GiB the
+        // old floor moved by between the same two nodes.
+        let other = AllocatorConfig::ExclusivePages.admission_overhead(1196 * GIB / 10, 10 * GIB);
+        assert!(ten.abs_diff(other) < GIB / 50, "{ten} vs {other}");
+        // A decode step is charged a decode step's worth. The old floor's
+        // failure was exactly this: `machine / 16` = 7.60 GiB whatever ran.
+        let decode = AllocatorConfig::ExclusivePages.admission_overhead(machine, GIB / 16);
+        assert!(decode < GIB / 8, "a 64 MiB live set charged {decode} bytes");
+    }
+
+    #[test]
+    fn exclusive_charge_dominates_the_measured_bucket_rounding() {
+        const GIB: u64 = 1 << 30;
+        // The per-stage row of the table above: 9.21 GiB reserved against 9.06
+        // live is 0.15 GiB of pages held for slices that are live -- which is
+        // the only part of retention this charge is responsible for. The free
+        // pages of the no-cleanup row (30.12 against 9.71) are
+        // `CleanupPolicy::WhenStranded`'s, not admission's.
+        let machine = 1216 * GIB / 10;
+        let live = 906 * GIB / 100;
+        let measured = 921 * GIB / 100 - live;
+        let charge = AllocatorConfig::ExclusivePages.admission_overhead(machine, live);
+        assert!(charge > measured, "charge {charge} <= measured {measured}");
     }
 
     #[test]

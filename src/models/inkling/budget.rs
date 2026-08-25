@@ -152,11 +152,12 @@ impl DenseWeights {
 /// That refusal would not be a true one. The same run's measured peak is 75.70
 /// GiB (`MemTotal - MemAvailable`, sampled every 2 s, 0:16 aliased) and 75.17
 /// at 0:15 in this arm, so the estimate stands about 37 GiB above the truth --
-/// which is [`pool_page_floor`], flat in the sequence length and sized for a
-/// 16,384-token prefill while a decode step's pool reserves 1.43 GiB. Until
-/// that term stops being flat, the honest arithmetic and the fast arm cannot
-/// both be had at this range, and the arithmetic is the one that has to be
-/// right.
+/// which WAS the allocator floor -- a fraction of the device, flat in the
+/// sequence length and sized for a 16,384-token prefill while a decode step's
+/// pool reserves 1.43 GiB. That term is now
+/// [`allocator_overhead_bytes`], a factor on the live set, so this
+/// paragraph's arithmetic is stale: re-measure the two arms before quoting the
+/// 37 GiB gap again.
 ///
 /// `INK_ZEROCOPY=0` forces the copying arm for every bind including the routed
 /// experts, so it implies this placement. It does NOT make admission correct
@@ -452,69 +453,39 @@ pub fn activation_bytes(heads: usize, head_dim: usize, tokens: usize, dtype: Sto
     heads as u64 * tokens as u64 * head_dim as u64 * dtype.bytes()
 }
 
-/// The floor cubecl's SubSlices page ladder puts under this workload.
+/// What the device allocator holds BEYOND the live set this range asks for.
 ///
-/// SubSlices derives this charge directly from its two largest page-ladder
-/// rungs. ExclusivePages has no fixed ladder, but its reservation is
-/// path-dependent and the aggregate model here does not carry the ordered
-/// request trace needed to prove a smaller bound, so admission conservatively
-/// retains the same charge. The measurements below are historical SubSlices
-/// evidence; [`super::pool`] records the smaller ExclusivePages measurements
-/// and why they are not yet a safe bound.
+/// See [`super::pool::AllocatorConfig::admission_overhead`] for the derivation:
+/// SubSlices is charged the two ladder pages this workload always occupies,
+/// ExclusivePages the bucket-rounding ratio of its own construction applied to
+/// `live`. Free pages the pool is holding for reuse are charged NOTHING here
+/// and bounded at runtime by [`super::pool::CleanupPolicy::WhenStranded`].
 ///
-/// # A pool hands out slices of a WHOLE page, and keeps the page
+/// # What this replaced, and what it cost
 ///
-/// `MemoryConfiguration::SubSlices` builds its pools by quartering
-/// `max_page_size` down to 32 MB, so on a 119.6 GiB device the page sizes are
-/// 29.91 GiB, 7.48, 1.87, 0.47 and 0.12, and each pool takes only slices up to
-/// `page_size / 2^k` -- 3.74 GiB for the 7.48 GiB pool, 0.47 for the 1.87 one.
-/// A request larger than a pool's slice limit falls through to the next pool
-/// up, and the last one has no limit below its own 29.91 GiB page.
+/// It used to be `machine * (1/4 + 1/16) * prefill_tokens / 16_384`, clamped
+/// to `[machine/16, machine*5/16]` -- a fraction of the DEVICE, scaled by the
+/// prompt. It had no term for the live set at all, so no memory saving
+/// anywhere in the model could widen what it admitted: not the narrow
+/// activation lane, not the BF16 residual, not the cache dtype. The two
+/// figures the run itself printed said so.
 ///
-/// The pool allocates that page whole, and `SlicedPool::cleanup` returns a page
-/// only when EVERY slice of it is free. So one allocation over 3.74 GiB takes a
-/// 29.91 GiB page and holds it for as long as anything on it is live.
-///
-/// This model always has one. The score blocks are 3.75 to 4.00 GiB at every
-/// sequence [`query_block`] admits -- that is what the 4 GiB budget means --
-/// and past about 40,000 tokens the routed lane's gather is larger still. So
-/// the largest page is always out, and the 7.48 GiB one under it goes the same
-/// way to the next size class down.
-///
-/// # Measured
-///
-/// `INK_LAYERS=0:8`, `INK_REPEAT=1`, node peak as `MemTotal - MemAvailable`
-/// sampled every second, against the 38.08 GiB weight share plus the terms
-/// [`super::pile`] already charged plus [`prefill_activation_bytes`]:
-///
-/// | tokens | activations charged | pool reserved | node peak | swap |
+/// | node | tokens | live model | old floor | new charge |
 /// |---|---|---|---|---|
-/// | 16,384 | 10.61 GiB | 41.74 | 89.02 | 0.34 |
-/// | 32,768 | 13.20 | 42.20 | 89.68 | 0.34 |
-/// | 65,536 | 25.53 | 50.15 | 104.62 | 0.34 |
-/// | 81,920 | 31.91 | 50.50 | 100.29 | 0.34 |
-/// | 100,623 | 39.19 | 68.02 | 113.26 | 6.65 |
+/// | 121.63 GiB, 0:21 | 1 (decode) | 0.00 GiB | 7.60 | 0.00 |
+/// | 121.63 GiB, 0:21 | 8,192 | 9.08 | 19.00 | 7.47 |
+/// | 121.63 GiB, 0:21 | 14,169 | 9.65 | 32.87 | 7.94 |
+/// | 121.63 GiB, 0:21 | 60,000 | 15.03 | 38.01 | 12.37 |
+/// | 119.63 GiB, 21:42 | 14,169 | 9.70 | 32.33 | 7.98 |
 ///
-/// The node peak is not monotone -- 81,920 tokens peak 4.3 GiB BELOW 65,536 --
-/// which is the page ladder and not the tensors, and is why nothing fitted to
-/// this curve would stay true. The pool reserves 41.74 GiB to hold 1.14 GiB of
-/// live tensors at 16,384 tokens, 40.60 GiB of it STRANDED over 104 slices.
-///
-/// Charging the two largest pages is what closes the gap. With it the estimate
-/// is 91.91 GiB against a measured 89.02 at 16,384, 106.83 against 104.62 at
-/// 65,536, and 113.21 against 100.29 at 81,920 -- above the truth everywhere,
-/// which is what a gate has to be -- and 120.49 at 100,623, over the 119.63 GiB
-/// machine. So 81,920 is admitted with 6.4 GiB of nominal headroom and runs at
-/// 100.29 GiB touching no swap, and 100,623 is refused: it runs at 113.26 GiB
-/// with 6.7 GiB of swap and takes 296.7 s for a pass that costs 137.9 s when
-/// the same input is not thrashing.
-///
-/// It is NOT a fitted coefficient. It is two page sizes off a ladder the
-/// runtime derives from the device, which is why it is a fraction of the
-/// machine and not a constant: the two nodes this runs on differ by 2 GiB and
-/// their page ladders differ with them.
-pub fn pool_page_floor(policy: AdmissionPolicy, machine: u64, prefill_tokens: usize) -> u64 {
-    policy.allocator.admission_floor(machine, prefill_tokens)
+/// The 14,169-token row is the one that mattered: `INK_LAYERS=22:42` on the
+/// 121.63 GiB node was refused at 125.77 GiB needed, and 32.87 of that 125.77
+/// was a cushion for an allocator holding a modelled 9.65 GiB of tensors.
+/// Measured 2026-08-25, spark-zt, `INK_LAYERS=0:16`, 256-token prompt, decode,
+/// cleanup off: admission charged 45.20 GiB while the pool reserved 1.88 --
+/// 1.42 live, 0.46 stranded. The floor was ~20x the high-water.
+pub fn allocator_overhead_bytes(policy: AdmissionPolicy, machine: u64, live: u64) -> u64 {
+    policy.allocator.admission_overhead(machine, live)
 }
 
 /// What ONE attention layer holds in activations at this sequence length.
@@ -644,7 +615,13 @@ pub fn mlp_activation_bytes(
     } else {
         let actb = policy.routed(layer).bytes();
         let i = t.intermediate_size as u64;
-        let m = n * t.num_experts_per_tok as u64;
+        // `RowPlan::build` stacks each expert's rows and pads that expert up to
+        // the 16-row MMA tile, so the buffer is `Sum_e ceil(rows_e/16)*16` and
+        // not `n * top_k`. This charged the unpadded figure, which is an
+        // UNDER-charge in the lane that actually runs -- 4.5% at a
+        // 14,169-token prefill, and sixteenfold at a decode step, where the
+        // true row count is `top_k * 16` against the six it charged.
+        let m = max_padded_routed_rows(t, tokens);
         let gathered = m * hidden * actb;
         // Gate and up arrive in one buffer, so `2 * i` wide.
         let w13 = m * 2 * i * actb;
@@ -887,7 +864,7 @@ mod tests {
     /// Parsed rather than built field by field, so a field this module reads
     /// that the checkpoint renames fails HERE instead of silently reverting to
     /// a default and making the charge small again.
-    fn small() -> InklingTextConfig {
+    pub(super) fn small() -> InklingTextConfig {
         serde_json::from_str(
             r#"{
               "hidden_size": 4096, "num_hidden_layers": 42,
@@ -1107,7 +1084,13 @@ mod tests {
         );
         let old_dense = nu * (4 * i + 2 * t.hidden_size as u64) * f32b;
 
-        let m = nu * t.num_experts_per_tok as u64;
+        // Not `nu * top_k` any more: the packed lane is priced from the same
+        // padded maximum the plain-BF16 one already used, because
+        // `RowPlan::build` pads each expert to the 16-row MMA tile and the
+        // buffer it allocates is the padded total. This control moved on
+        // 2026-08-25 by +1.9% at this length, deliberately, in the direction
+        // of charging what the lane allocates.
+        let m = super::max_padded_routed_rows(&t, n);
         let i = t.intermediate_size as u64;
         let h = t.hidden_size as u64;
         let packed = (m * h + m * i) / 2 + (m * h + m * i) / 16;
@@ -1140,47 +1123,59 @@ mod tests {
             .max(m * 2 * i * f32b);
         assert_eq!(largest_buffer(&t, 0..8, n, wide()), old_largest);
 
+        // The SubSlices ladder is a property of the device and does not move
+        // with the live set; this control is unchanged.
         let machine = 128 << 30;
         assert_eq!(
-            super::pool_page_floor(wide(), machine, 16_384),
+            super::allocator_overhead_bytes(wide(), machine, old_prefill),
             machine / 4 + machine / 16
         );
     }
 
-    /// The floor is sized for a 16,384-token PREFILL; a decode step must not
-    /// be charged it.
+    /// The allocator charge is a factor on the LIVE SET, not a fraction of the
+    /// device -- which is what lets a memory saving anywhere in the model widen
+    /// what the gate admits.
     ///
     /// Measured 2026-08-25 on spark-zt at INK_LAYERS=0:16 with a 256-token
     /// prompt and cleanup OFF -- the worst arm -- the pool reserved 1.88 GiB
-    /// while admission charged 45.20 GiB of context/activations. The floor was
-    /// roughly 20x the high-water and refused ranges that ran.
+    /// while admission charged 45.20 GiB of context/activations. The old floor
+    /// was roughly 20x the high-water and refused ranges that ran.
     #[test]
-    fn the_pool_floor_scales_with_the_prefill_and_never_below_a_cushion() {
+    fn the_allocator_charge_follows_the_workload_and_not_the_machine() {
+        let t = small();
         let machine: u64 = 128 << 30;
-        let full = machine / 4 + machine / 16;
 
-        // Unchanged at and above the length it was measured for. This is the
-        // property the two older assertions pin, and it must not move.
-        assert_eq!(super::pool_page_floor(wide(), machine, 16_384), full);
-        assert_eq!(super::pool_page_floor(wide(), machine, 81_920), full);
+        // A decode step is charged a decode step's worth. The old floor's
+        // cushion was `machine / 16` = 8 GiB here, whatever ran.
+        let decode = prefill_activation_bytes(&t, 0..16, 1, narrow());
+        assert!(
+            super::allocator_overhead_bytes(narrow(), machine, decode) < machine / 1024,
+            "a decode step is still charged a cushion"
+        );
 
-        // A decode step lands on the cushion, not the prefill figure.
-        let decode = super::pool_page_floor(wide(), machine, 1);
-        assert_eq!(decode, machine / 16);
-        assert!(decode < full / 4);
-
-        // The cushion is still far above the measured high-water: 1.88 GiB was
-        // observed on a 119.63 GiB box, and machine/16 there is ~7.48 GiB.
-        assert!(machine / 16 > 4 * (188 * (1 << 30) / 100));
-
-        // Monotone, and bounded at both ends.
+        // Monotone in the sequence, and never above the live set it is charged
+        // against -- the bucket ratio is 1.823, so `r - 1` is below one.
         let mut prev = 0;
         for n in [1usize, 256, 1024, 4096, 8192, 16_384, 100_623] {
-            let f = super::pool_page_floor(wide(), machine, n);
-            assert!(f >= prev, "floor went backwards at {n}");
-            assert!(f >= machine / 16 && f <= full, "floor out of bounds at {n}");
+            let live = prefill_activation_bytes(&t, 0..16, n, narrow());
+            let f = super::allocator_overhead_bytes(narrow(), machine, live);
+            assert!(f >= prev, "charge went backwards at {n}");
+            assert!(f < live.max(1), "charge exceeded the live set at {n}");
             prev = f;
         }
+
+        // And it responds to the lane. The whole complaint against the floor
+        // was that NVFP4 KV, the BF16 residual and the narrow activation lane
+        // could not widen what it admitted, because it had no term for any of
+        // them.
+        let n = 16_384usize;
+        let w = prefill_activation_bytes(&t, 0..16, n, wide());
+        let nw = prefill_activation_bytes(&t, 0..16, n, narrow());
+        assert!(
+            super::allocator_overhead_bytes(narrow(), machine, nw)
+                < super::allocator_overhead_bytes(narrow(), machine, w),
+            "the narrow lane is charged the same allocator overhead as the wide one"
+        );
     }
 
     #[test]
@@ -1206,9 +1201,21 @@ mod tests {
             prefill_activation_bytes(&t, 0..8, n, narrow())
                 < prefill_activation_bytes(&t, 0..8, n, wide())
         );
-        assert_eq!(
-            super::pool_page_floor(narrow(), 128 << 30, 16_384),
-            40 << 30
+        // ExclusivePages charges the bucket ratio of the live set, so the
+        // narrow lane's smaller working set is charged less allocator overhead
+        // as well -- unlike the floor it replaced, which was the same 40 GiB
+        // for both.
+        let machine = 128u64 << 30;
+        assert!(
+            super::allocator_overhead_bytes(
+                narrow(),
+                machine,
+                prefill_activation_bytes(&t, 0..8, n, narrow())
+            ) < super::allocator_overhead_bytes(
+                narrow(),
+                machine,
+                prefill_activation_bytes(&t, 0..8, n, wide())
+            )
         );
     }
 
@@ -1347,6 +1354,93 @@ mod tests {
         assert!(
             dense_only > n,
             "a dense-only range bisected to {dense_only}, under {n}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod admission_breakdown {
+    use super::tests::small;
+    use super::*;
+
+    const GIBU: u64 = 1 << 30;
+
+    fn gib(b: u64) -> f64 {
+        b as f64 / GIBU as f64
+    }
+
+    /// The three constants `pile::run_overhead_bytes` adds beside the allocator
+    /// charge and the activation model.
+    fn fixed_overhead(layers: usize) -> u64 {
+        GIBU / 5 + 41 * GIBU / 200 * layers as u64 + 4 * GIBU
+    }
+
+    fn old_floor(machine: u64, prefill_tokens: usize) -> u64 {
+        let full = machine / 4 + machine / 16;
+        let scaled = full.saturating_mul(prefill_tokens as u64) / 16_384;
+        scaled.clamp(machine / 16, full)
+    }
+
+    fn policy() -> AdmissionPolicy {
+        AdmissionPolicy::new(
+            AllocatorConfig::ExclusivePages,
+            StorageDType::Bf16,
+            StorageDType::Bf16,
+            StorageDType::Bf16,
+        )
+        .with_fused_qkvr(true)
+    }
+
+    #[test]
+    fn breakdown() {
+        let t = small();
+        let p = policy();
+        // (label, machine GiB, layer range, weight arena GiB, device-pool GiB)
+        // -- the weight figures are the ones these two nodes' own admission
+        // lines printed.
+        let nodes: [(&str, f64, core::ops::Range<usize>, f64, f64); 3] = [
+            ("head 121.63 GiB 0:21", 121.63, 0..21, 82.73, 2.79),
+            ("tail 119.63 GiB 21:42", 119.63, 21..42, 76.14, 2.42),
+            ("the refusal: 121.63 GiB 22:42", 121.63, 22..42, 72.59, 2.30),
+        ];
+        for (name, machine_gib, range, w_gib, dw_gib) in nodes {
+            let machine = (machine_gib * GIBU as f64) as u64;
+            let weights = ((w_gib + dw_gib) * GIBU as f64) as u64;
+            println!("\n=== {name}  weights+device {:.2} GiB", w_gib + dw_gib);
+            println!(
+                "{:>8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>9} {:>9}",
+                "tokens", "live", "OLDfloor", "NEWchg", "fixed", "OLDneed", "NEWneed", "verdict"
+            );
+            for n in [
+                1usize, 2048, 8192, 14169, 16384, 20000, 32768, 60000, 130000,
+            ] {
+                let live = prefill_activation_bytes(&t, range.clone(), n, p);
+                let old = old_floor(machine, n);
+                let new = allocator_overhead_bytes(p, machine, live);
+                let fixed = fixed_overhead(range.len());
+                let need_old = weights + fixed + old + live;
+                let need_new = weights + fixed + new + live;
+                println!(
+                    "{n:>8} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>9.2} {:>9}",
+                    gib(live),
+                    gib(old),
+                    gib(new),
+                    gib(fixed),
+                    gib(need_old),
+                    gib(need_new),
+                    match (need_old <= machine, need_new <= machine) {
+                        (true, true) => "both",
+                        (false, true) => "NEW only",
+                        (true, false) => "OLD only",
+                        (false, false) => "neither",
+                    }
+                );
+            }
+        }
+        let probe = prefill_activation_bytes(&t, 0..8, 42_000, p);
+        println!(
+            "\nprobe 0:8 @42,000: live model {:.2} GiB (measured bytes_in_use 9.06 at BF16 residual)",
+            gib(probe)
         );
     }
 }
