@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use memmap2::Mmap;
 use safetensors::SafeTensors;
 
-use crate::models::inkling::nvfp4::{decode_stacked, GROUP};
+use crate::models::inkling::nvfp4::{GROUP, decode_stacked};
 
 /// Where one tensor's bytes sit inside its shard's mapping.
 ///

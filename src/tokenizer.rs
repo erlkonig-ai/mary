@@ -183,7 +183,7 @@ mod flag {
 }
 
 pub mod attrs {
-    use triblespace::prelude::inlineencodings::{Boolean, GenId, Handle, ShortString, F64, U256BE};
+    use triblespace::prelude::inlineencodings::{Boolean, F64, GenId, Handle, ShortString, U256BE};
     use triblespace::prelude::*;
 
     attributes! {
@@ -1022,7 +1022,7 @@ fn load_added_strict(
 
 #[cfg(feature = "tokenizer")]
 macro_rules! short_field {
-    ($tribles:expr, $node:expr, $attr:path) => {
+    ($tribles:expr_2021, $node:expr_2021, $attr:path) => {
         optional_one(
             find!((s: String), pattern!($tribles, [{ ($node) @ $attr: ?s }]))
                 .map(|(s,)| s),
@@ -1035,7 +1035,7 @@ macro_rules! short_field {
 /// Read a node's optional `UTF8String`-handle field back to a `String`.
 #[cfg(feature = "tokenizer")]
 macro_rules! long_field {
-    ($tribles:expr, $blobs:expr, $node:expr, $attr:path) => {
+    ($tribles:expr_2021, $blobs:expr_2021, $node:expr_2021, $attr:path) => {
         optional_one(
             find!((h,), pattern!($tribles, [{ ($node) @ $attr: ?h }]))
                 .map(|(h,)| read_piece($blobs, h)),
@@ -1048,7 +1048,7 @@ macro_rules! long_field {
 /// Read a node's optional `GenId` edge.
 #[cfg(feature = "tokenizer")]
 macro_rules! edge_field {
-    ($tribles:expr, $node:expr, $attr:path) => {
+    ($tribles:expr_2021, $node:expr_2021, $attr:path) => {
         optional_one(
             find!((e: Id), pattern!($tribles, [{ ($node) @ $attr: ?e }]))
                 .map(|(e,)| e),
@@ -1679,9 +1679,11 @@ mod tests {
 
         assert_eq!(find_tokenizer(&historical), None);
         let projection = crate::model_collection::project_legacy_model_attributes(&historical);
-        assert!(historical
-            .iter()
-            .all(|fact| projection.facts.contains(fact)));
+        assert!(
+            historical
+                .iter()
+                .all(|fact| projection.facts.contains(fact))
+        );
         assert_eq!(find_tokenizer(&projection.facts), Some(root));
 
         let graph = build_tokenizer(&projection.facts, &reader, root)

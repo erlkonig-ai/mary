@@ -78,11 +78,7 @@ fn fp8_e4m3_to_f32(bits: u8) -> f32 {
         (1.0 + mant as f32 / 8.0) * 2.0f32.powi(exp as i32 - 7)
     };
 
-    if sign == 1 {
-        -value
-    } else {
-        value
-    }
+    if sign == 1 { -value } else { value }
 }
 
 /// Load a tensor from safetensors, converting to f32 and optionally transposing.
@@ -195,7 +191,9 @@ fn find_tensor<'a, 'b>(
             return (st, leak_str(&prefixed2));
         }
     }
-    panic!("Tensor not found in any shard: {name} (tried model.{name}, language_model.model.{name}, language_model.{name})");
+    panic!(
+        "Tensor not found in any shard: {name} (tried model.{name}, language_model.model.{name}, language_model.{name})"
+    );
 }
 
 /// Leak a string to get a &'static str. Used for tensor name lookups.

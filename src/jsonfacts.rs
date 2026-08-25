@@ -68,7 +68,7 @@ pub mod ty {
 }
 
 pub mod attrs {
-    use triblespace::prelude::inlineencodings::{Boolean, GenId, Handle, F64, I256BE, U256BE};
+    use triblespace::prelude::inlineencodings::{Boolean, F64, GenId, Handle, I256BE, U256BE};
     use triblespace::prelude::*;
 
     attributes! {

@@ -43,8 +43,8 @@ use std::time::Instant;
 use mary::models::f5::wav;
 use mary::models::personaplex::config as cfg;
 use mary::models::personaplex::mimi::config as mimi_cfg;
-use mary::models::personaplex::pipeline::{agent_codes, RealtimePipeline, SILENCE};
-use mary::models::personaplex::prompt::{wrap_with_system_tags, Prompt};
+use mary::models::personaplex::pipeline::{RealtimePipeline, SILENCE, agent_codes};
+use mary::models::personaplex::prompt::{Prompt, wrap_with_system_tags};
 use mary::models::personaplex::sampling::SamplingConfig;
 use mary::models::personaplex::temporal_metal::WeightFmt;
 
@@ -205,7 +205,7 @@ fn main() {
             None => skipped += 1,
         }
     }
-    let gen = t1.elapsed().as_secs_f64();
+    let r#gen = t1.elapsed().as_secs_f64();
 
     // DIAGNOSTIC: identical rms across different user input means the input is
     // not reaching the model, or the agent is emitting a constant. Check both.
@@ -229,9 +229,9 @@ fn main() {
     }
     println!(
         "gen    : {:.2}s for {} frames ({:.1} ms/frame, realtime budget 80 ms){}",
-        gen,
+        r#gen,
         agent.len(),
-        gen / agent.len().max(1) as f64 * 1e3,
+        r#gen / agent.len().max(1) as f64 * 1e3,
         if skipped > 0 {
             format!(", {skipped} pre-horizon frames skipped")
         } else {

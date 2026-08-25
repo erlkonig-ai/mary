@@ -32,7 +32,7 @@ use burn::prelude::*;
 use burn::tensor::{Int, Tensor, TensorData};
 
 use crate::models::inkling::bf16gemm::Bf16W;
-use crate::models::inkling::seam::{client_of, handle_of, tensor_of, tensor_of3, Bk};
+use crate::models::inkling::seam::{Bk, client_of, handle_of, tensor_of, tensor_of3};
 
 /// `x * sigmoid(x)`, elementwise.
 pub fn silu<B: Backend>(x: Tensor<B, 2>) -> Tensor<B, 2> {
@@ -2569,7 +2569,9 @@ mod tests {
             }
         }
         let rel = worst / scale;
-        println!("f32 matmul worst absolute error {worst:e} against a largest term of {scale:e} -> {rel:e}");
+        println!(
+            "f32 matmul worst absolute error {worst:e} against a largest term of {scale:e} -> {rel:e}"
+        );
         assert!(
             rel > 1e-5,
             "Burn's f32 matmul now agrees with f64 to {rel:e}: it is a real f32 product, and \

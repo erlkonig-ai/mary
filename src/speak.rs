@@ -49,7 +49,7 @@
 //! emitted between passes. The Qwen2 BPE builds from the tokenizer files
 //! committed under `<mary>/assets/qwen3tts/`.
 
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::{HashMap, hash_map::Entry};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Instant;
@@ -63,7 +63,7 @@ use crate::leaf::{Elem, Leaf};
 use crate::models::f5::wav;
 use crate::models::qwen3tts::codec::CodecDecoder;
 use crate::models::qwen3tts::config::{
-    LANG_ENGLISH, NUM_CODE_GROUPS, SAMPLES_PER_FRAME, SAMPLE_RATE,
+    LANG_ENGLISH, NUM_CODE_GROUPS, SAMPLE_RATE, SAMPLES_PER_FRAME,
 };
 use crate::models::qwen3tts::pipeline::{self, ClonePrompt, SamplingParams};
 use crate::models::qwen3tts::predictor::CodePredictor;
@@ -296,7 +296,7 @@ impl Qwen3TtsWeights {
     pub fn validate_runtime_cohort(self) -> anyhow::Result<()> {
         use crate::nn::backend::BHalf;
         use std::any::Any;
-        use std::panic::{catch_unwind, AssertUnwindSafe};
+        use std::panic::{AssertUnwindSafe, catch_unwind};
 
         fn panic_text(payload: &(dyn Any + Send)) -> &str {
             payload
@@ -416,7 +416,7 @@ fn env_f64(name: &str, default: f64) -> f64 {
 /// generation once the codec next tries to emit a PCM chunk.
 pub struct SpeakStream {
     rx: mpsc::Receiver<Vec<f32>>,
-    gen: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+    r#gen: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
 }
 
 impl Iterator for SpeakStream {
@@ -434,7 +434,7 @@ impl SpeakStream {
     /// chunks the caller didn't consume.
     pub fn finish(mut self) -> anyhow::Result<()> {
         while self.rx.recv().is_ok() {}
-        match self.gen.take() {
+        match self.r#gen.take() {
             Some(h) => h
                 .join()
                 .map_err(|_| anyhow::anyhow!("speak generation thread panicked"))?,
@@ -524,7 +524,7 @@ fn synthesize_stream_impl<B: Backend + 'static>(
     // warmup, prompt build and prefill: the honest speak-to-first-audio.
     let t_call = Instant::now();
     let (tx_pcm, rx_pcm) = mpsc::channel::<Vec<f32>>();
-    let gen = std::thread::Builder::new()
+    let r#gen = std::thread::Builder::new()
         .name("speak-gen".into())
         .spawn(move || -> anyhow::Result<()> {
             crate::models::qwen3tts::cpu::set_interactive_qos();
@@ -772,7 +772,7 @@ fn synthesize_stream_impl<B: Backend + 'static>(
 
     Ok(SpeakStream {
         rx: rx_pcm,
-        gen: Some(gen),
+        r#gen: Some(r#gen),
     })
 }
 
@@ -794,7 +794,7 @@ pub fn synthesize_to_wav(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{attrs, F32Array, U64Array};
+    use crate::format::{F32Array, U64Array, attrs};
     use ed25519_dalek::SigningKey;
     use std::fs::OpenOptions;
     use std::sync::atomic::{AtomicU64, Ordering};

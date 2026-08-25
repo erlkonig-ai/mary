@@ -6,7 +6,7 @@ use burn::nn::{Linear, LinearConfig, RmsNorm, RmsNormConfig};
 use burn::prelude::*;
 
 use super::config::{Gemma4TextConfig, LayerType};
-use crate::models::gemma::lora::{maybe_lora, LoraWeights};
+use crate::models::gemma::lora::{LoraWeights, maybe_lora};
 use crate::models::gemma::rope::RopeTable;
 
 // ---------------------------------------------------------------------------
@@ -388,7 +388,7 @@ impl<B: Backend> Gemma4Experts<B> {
                 .reshape([2 * i, h])
                 .swap_dims(0, 1); // [H, 2I]
             let gu_out = src_t.matmul(gu); // [t, 2I]
-                                           // Chunk into (gate, up) along last dim.
+            // Chunk into (gate, up) along last dim.
             let gate = gu_out.clone().slice([0..t, 0..i]);
             let up = gu_out.slice([0..t, i..2 * i]);
             let acted = burn::tensor::activation::gelu_approximate(gate) * up;

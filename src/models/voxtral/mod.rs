@@ -7,7 +7,7 @@
 
 use crate::leaf::{Elem, Leaf};
 use crate::nn::weight_loader::WeightLoader;
-use crate::selection::{index_keymap_for_root, select_model_root, ModelSelector};
+use crate::selection::{ModelSelector, index_keymap_for_root, select_model_root};
 use std::collections::HashMap;
 use triblespace::core::collection::CollectionSnapshot;
 use triblespace::core::repo::pile::PileReader;
@@ -196,7 +196,7 @@ pub mod tokenizer;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{attrs, F32Array, U64Array};
+    use crate::format::{F32Array, U64Array, attrs};
     use ed25519_dalek::SigningKey;
     use std::fs::OpenOptions;
     use std::path::{Path, PathBuf};

@@ -22,7 +22,7 @@ use burn::tensor::TensorData;
 use tokenizers::Tokenizer;
 
 use super::config::{Qwen2_5VlTextConfig, Qwen2_5VlVisionConfig};
-use super::layers::{get_rope_index, QwenTextModel, QwenWeights};
+use super::layers::{QwenTextModel, QwenWeights, get_rope_index};
 use super::vision::{VisionTransformer, VisionWeights};
 
 /// The `<|endoftext|>` token, used 10× as the ColQwen query-augmentation suffix.
@@ -222,7 +222,7 @@ impl<B: Backend> NomicMultimodalEmbedder<B> {
     /// image prompt → vision tower → multimodal splice → backbone → pool + L2.
     /// Requires a vision tower (see [`Self::load_with_vision`]).
     pub fn embed_image(&self, bytes: &[u8]) -> anyhow::Result<Vec<f32>> {
-        use super::preprocess::{build_image_prompt, preprocess_image, PATCH_DIM};
+        use super::preprocess::{PATCH_DIM, build_image_prompt, preprocess_image};
         let (pixels, grid) = preprocess_image(bytes)?;
         let (gt, gh, gw) = grid;
         let seq = gt * gh * gw;

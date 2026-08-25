@@ -103,7 +103,7 @@ impl<B: Backend> VisionLayer<B> {
         let probs = burn::tensor::activation::softmax(scores, 3);
         let att = probs.matmul(v).swap_dims(1, 2).reshape([b, s, d]);
         let x = x.add(self.out.forward(att)); // residual 1
-                                              // MLP
+        // MLP
         let h2 = self.ln2.forward(x.clone());
         let mlp = self.fc2.forward(gelu_tanh(self.fc1.forward(h2)));
         x.add(mlp) // residual 2

@@ -75,7 +75,7 @@ use cubecl::prelude::*;
 use cubecl::server::Handle;
 
 use super::config::*;
-use crate::nn::q4::{client_for_default_device, Client, Rt};
+use crate::nn::q4::{Client, Rt, client_for_default_device};
 use crate::nn::weight_loader::WeightLoader;
 
 /// Threads per cube for every kernel that reduces cooperatively.
@@ -1156,7 +1156,7 @@ impl MimiEncoderGpu {
         let arr = |h: &Handle, n: usize| unsafe { ArrayArg::from_raw_parts(h.clone(), n) };
         let bias = c.b.as_ref().unwrap_or(&self.dummy);
         macro_rules! go {
-            ($pe:expr, $ha:expr, $hb:expr, $rp:expr, $pg:expr) => {
+            ($pe:expr_2021, $ha:expr_2021, $hb:expr_2021, $rp:expr_2021, $pg:expr_2021) => {
                 unsafe {
                     conv_kernel::launch_unchecked::<Rt>(
                         cl,

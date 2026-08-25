@@ -14,7 +14,7 @@ use super::dit::Linear;
 use crate::nn::weight_loader::WeightLoader;
 use burn::prelude::*;
 use burn::tensor::activation::gelu;
-use burn::tensor::module::{conv1d, conv_transpose1d};
+use burn::tensor::module::{conv_transpose1d, conv1d};
 use burn::tensor::ops::{ConvOptions, ConvTransposeOptions};
 
 /// Affine LayerNorm over the last dim.

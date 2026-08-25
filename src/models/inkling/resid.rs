@@ -101,7 +101,7 @@
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 
-use super::seam::{client_of, dtype_of, handle_of_any, tensor_of_dt, Bk};
+use super::seam::{Bk, client_of, dtype_of, handle_of_any, tensor_of_dt};
 use burn::tensor::{DType, Tensor};
 
 /// Threads per cube in [`rms_norm_kernel`]. One cube per token; each unit walks

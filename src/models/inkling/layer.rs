@@ -21,7 +21,7 @@
 //! complete and be wrong from the first decode step.
 
 use crate::models::inkling::attn::{
-    attention_prefill, attention_step, AttnCache, AttnDims, AttnWeights, LogScaling,
+    AttnCache, AttnDims, AttnWeights, LogScaling, attention_prefill, attention_step,
 };
 use crate::models::inkling::block::{conv_history, rms_norm, short_conv, short_conv_step};
 use crate::models::inkling::mlp::dense_mlp;

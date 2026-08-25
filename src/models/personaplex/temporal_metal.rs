@@ -101,7 +101,7 @@ use half::f16;
 use crate::nn::q4::Rt;
 
 use super::config as cfg;
-use crate::nn::q4::{self, f16_matvec, quantize_q4, Q4Linear};
+use crate::nn::q4::{self, Q4Linear, f16_matvec, quantize_q4};
 use crate::nn::weight_loader::{HostF32, WeightLoader};
 
 const DIM: usize = cfg::DIM; // 4096

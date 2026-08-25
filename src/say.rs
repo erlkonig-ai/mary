@@ -21,7 +21,7 @@ use crate::models::f5::model::F5Transformer;
 use crate::models::f5::tokenizer::Tokenizer;
 use crate::models::f5::vocos::Vocos;
 use crate::models::f5::wav;
-use crate::nn::backend::{WgpuDevice, B};
+use crate::nn::backend::{B, WgpuDevice};
 use crate::nn::weight_loader::WeightLoader;
 use burn::prelude::*;
 use burn::tensor::Distribution;

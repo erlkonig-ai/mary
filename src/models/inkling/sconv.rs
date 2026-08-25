@@ -378,7 +378,7 @@ pub fn short_conv_slots<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::inkling::seam::{client_of, handle_of, tensor_of, Bk};
+    use crate::models::inkling::seam::{Bk, client_of, handle_of, tensor_of};
     use burn::tensor::{Tensor, TensorData};
 
     fn fill(n: usize, seed: f32) -> Vec<f32> {

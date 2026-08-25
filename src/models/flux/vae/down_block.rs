@@ -1,6 +1,6 @@
 use burn::prelude::*;
 
-use super::resnet::{conv2d_forward, ResnetBlock2D};
+use super::resnet::{ResnetBlock2D, conv2d_forward};
 use crate::nn::weight_loader::WeightLoader;
 
 /// Stride-2 Conv2d downsampler with asymmetric padding (matches diffusers Downsample2D).

@@ -13,9 +13,9 @@ use super::vision::VisionEncoder;
 use super::vlm::VlmTower;
 use crate::models::smolvla::projections::Projections;
 use crate::nn::weight_loader::WeightLoader;
+use burn::tensor::TensorData;
 use burn::tensor::module::interpolate;
 use burn::tensor::ops::{InterpolateMode, InterpolateOptions};
-use burn::tensor::TensorData;
 
 /// SmolVLA image preprocessing (`prepare_images`): resize-with-pad to
 /// `target×target` keeping aspect ratio (pad on left/top with 0), then map

@@ -40,7 +40,7 @@
 use anyhow::{Context, Result};
 use triblespace::core::attribute::Attribute;
 use triblespace::core::blob::encodings::tensor::elements::{F16, F32};
-use triblespace::core::blob::encodings::tensor::{tensor_blob, Tensor, TensorElement, TensorView};
+use triblespace::core::blob::encodings::tensor::{Tensor, TensorElement, TensorView, tensor_blob};
 use triblespace::core::blob::{Blob, TryFromBlob};
 use triblespace::core::id_hex;
 use triblespace::core::inline::encodings::hash::Handle;
@@ -779,7 +779,7 @@ mod tests {
     /// leaves decodes perfectly well and is still malformed.
     #[test]
     fn a_leaf_with_two_payloads_is_refused_in_either_form() {
-        use crate::format::{attrs, F32Array, U64Array};
+        use crate::format::{F32Array, U64Array, attrs};
         let mut blobs = MemoryBlobStore::new();
 
         // Typed: one entity, an f32 leaf AND an f16 leaf.
@@ -831,7 +831,7 @@ mod tests {
     /// and the shape check that used to live in every reader lives here.
     #[test]
     fn the_two_blob_form_still_resolves_and_is_still_checked() {
-        use crate::format::{attrs, F32Array, U64Array};
+        use crate::format::{F32Array, U64Array, attrs};
         let mut blobs = MemoryBlobStore::new();
         let data = blobs
             .put::<F32Array, _>(vec![1.0f32, 2.0, 3.0, 4.0])

@@ -2,7 +2,7 @@ use burn::prelude::*;
 use burn::tensor::module::interpolate;
 use burn::tensor::ops::{InterpolateMode, InterpolateOptions};
 
-use super::resnet::{conv2d_forward, ResnetBlock2D};
+use super::resnet::{ResnetBlock2D, conv2d_forward};
 use crate::nn::weight_loader::WeightLoader;
 
 /// Nearest-neighbor 2x upsampling followed by a Conv2d.

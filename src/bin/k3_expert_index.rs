@@ -156,7 +156,7 @@ fn main() {
     let n_experts = by_expert.len();
     let wrong: Vec<(&String, &u64)> = by_expert
         .iter()
-        .filter(|(_, &b)| b != EXPERT_BYTES)
+        .filter(|&(_, &b)| b != EXPERT_BYTES)
         .collect();
     println!("routed experts found: {n_experts}");
     println!(

@@ -32,7 +32,7 @@ pub fn flux2_rope<B: Backend>(
     for (axis_idx, &dim) in axes_dims.iter().enumerate() {
         // Extract positions for this axis: [S, 1] -> [S]
         let pos_2d = ids.clone().slice([0..seq_len, axis_idx..axis_idx + 1]); // [S, 1]
-                                                                              // Squeeze from [S, 1] to [S] by reshaping
+        // Squeeze from [S, 1] to [S] by reshaping
         let pos = pos_2d.reshape([seq_len]); // [S]
 
         // Compute 1D rotary embedding for this axis

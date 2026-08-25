@@ -21,7 +21,7 @@ use mary::models::f5::model::F5Transformer;
 use mary::models::f5::tokenizer::Tokenizer;
 use mary::models::f5::vocos::Vocos;
 use mary::models::f5::wav;
-use mary::nn::backend::{WgpuDevice, B};
+use mary::nn::backend::{B, WgpuDevice};
 use mary::nn::weight_loader::WeightLoader;
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -47,11 +47,11 @@ fn synth(
     let (rb, gb) = (ref_text.len() as f64, text.len() as f64);
     let local_speed = if text.len() < 10 { 0.3 } else { 1.0 };
     let duration = ref_len + (ref_len as f64 / rb * gb / local_speed) as usize;
-    let gen = duration - ref_len;
+    let r#gen = duration - ref_len;
     let cond = Tensor::cat(
         vec![
             ref_mel.clone(),
-            Tensor::<B, 3>::zeros([1, gen, 100], device),
+            Tensor::<B, 3>::zeros([1, r#gen, 100], device),
         ],
         1,
     );

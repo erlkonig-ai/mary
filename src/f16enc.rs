@@ -9,7 +9,7 @@
 
 use triblespace::core::metadata;
 use triblespace::prelude::blobencodings::{Array, ArrayElement};
-use triblespace::prelude::{entity, id_hex, ExclusiveId, Fragment, MetaDescribe};
+use triblespace::prelude::{ExclusiveId, Fragment, MetaDescribe, entity, id_hex};
 
 /// Zero-sized marker: an IEEE-754 half-precision element (`half::f16`, 2 bytes).
 pub struct F16;

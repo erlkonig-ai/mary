@@ -430,13 +430,13 @@ fn parse_block(tail: &str) -> Option<BlockPart> {
         "mlp.gate.weight" => return Some(BlockPart::Mlp(MlpPart::Moe(MoePart::GateWeight))),
         "mlp.gate.bias" => return Some(BlockPart::Mlp(MlpPart::Moe(MoePart::GateBias))),
         "mlp.gate.global_scale" => {
-            return Some(BlockPart::Mlp(MlpPart::Moe(MoePart::GateGlobalScale)))
+            return Some(BlockPart::Mlp(MlpPart::Moe(MoePart::GateGlobalScale)));
         }
         "mlp.shared_experts.shared_w13_weight" => {
-            return Some(BlockPart::Mlp(MlpPart::Moe(MoePart::SharedW13)))
+            return Some(BlockPart::Mlp(MlpPart::Moe(MoePart::SharedW13)));
         }
         "mlp.shared_experts.shared_w2_weight" => {
-            return Some(BlockPart::Mlp(MlpPart::Moe(MoePart::SharedW2)))
+            return Some(BlockPart::Mlp(MlpPart::Moe(MoePart::SharedW2)));
         }
         _ => {}
     }

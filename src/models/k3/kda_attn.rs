@@ -38,10 +38,10 @@ use burn::prelude::*;
 
 use super::config::K3TextConfig;
 use super::kda::{
-    rms_norm_gated, Kda, KdaConfig, KdaParams, KdaScratch, KdaState, KdaToken, ShortConv,
-    ShortConvState,
+    Kda, KdaConfig, KdaParams, KdaScratch, KdaState, KdaToken, ShortConv, ShortConvState,
+    rms_norm_gated,
 };
-use super::ops::{linear, ActRound};
+use super::ops::{ActRound, linear};
 
 /// Shape and hyper-parameters of one KDA sublayer.
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -2060,7 +2060,7 @@ fn check_combination_rounds_once(r: &mut Report, real: &MoeDims, dev: &Dev) {
     };
     let moe = LatentMoe::new(dims.clone());
     // Deterministic, sign-varied, and scaled so `situ` is in its live region.
-    let gen = |n: usize, salt: usize| -> Vec<f32> {
+    let r#gen = |n: usize, salt: usize| -> Vec<f32> {
         (0..n)
             .map(|i| {
                 let z = ((i * 2654435761 + salt * 40503) % 4093) as f32 / 4093.0;
@@ -2070,12 +2070,12 @@ fn check_combination_rounds_once(r: &mut Report, real: &MoeDims, dev: &Dev) {
     };
     let experts: Vec<ExpertWeights<B>> = (0..n_experts)
         .map(|e| ExpertWeights {
-            w1: t2(gen(fw * hm, e * 3 + 1), [fw, hm], dev),
-            w2: t2(gen(hm * fw, e * 3 + 2), [hm, fw], dev),
-            w3: t2(gen(fw * hm, e * 3 + 3), [fw, hm], dev),
+            w1: t2(r#gen(fw * hm, e * 3 + 1), [fw, hm], dev),
+            w2: t2(r#gen(hm * fw, e * 3 + 2), [hm, fw], dev),
+            w3: t2(r#gen(fw * hm, e * 3 + 3), [fw, hm], dev),
         })
         .collect();
-    let latent = t2(gen(tokens * hm, 97), [tokens, hm], dev);
+    let latent = t2(r#gen(tokens * hm, 97), [tokens, hm], dev);
     let mut topk_idx = Vec::new();
     let mut topk_weight = Vec::new();
     for t in 0..tokens {

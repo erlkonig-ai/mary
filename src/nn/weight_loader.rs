@@ -343,9 +343,9 @@ impl AliasedPile {
         let want_raw_f32 = TypeId::of::<B>() == TypeId::of::<crate::nn::backend::B>();
 
         let dev = &self.device; // concretely WgpuDevice, the device of all four backends
-                                // Each arm picks its index, insists on the width that index is for,
-                                // and takes the leaf's own bytes. There is no shape blob to fetch:
-                                // the dims came out of the tensor header the payload is attached to.
+        // Each arm picks its index, insists on the width that index is for,
+        // and takes the leaf's own bytes. There is no shape blob to fetch:
+        // the dims came out of the tensor header the payload is attached to.
         let (flat, shape): (Tensor<B, 1>, Vec<usize>) = if want_f16 {
             let leaf = self.f16.get(name)?;
             let bytes = (leaf.elem() == Elem::F16).then(|| leaf.payload().clone())?;
@@ -631,7 +631,7 @@ impl WeightLoader {
 #[cfg(all(test, feature = "import"))]
 mod tests {
     use super::*;
-    use safetensors::tensor::{serialize, Dtype, TensorView};
+    use safetensors::tensor::{Dtype, TensorView, serialize};
 
     #[test]
     fn f64_is_widened_through_the_supported_float_path() {

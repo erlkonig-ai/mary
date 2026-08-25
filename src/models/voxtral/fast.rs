@@ -36,11 +36,11 @@
 //! `voxtral_listen` de_short@480 ms 13/13.
 
 use burn::prelude::*;
-use burn::tensor::activation::{gelu, silu, softmax};
 use burn::tensor::FloatDType;
+use burn::tensor::activation::{gelu, silu, softmax};
 
 use super::config::*;
-use super::decoder::{time_embedding, AdaScales};
+use super::decoder::{AdaScales, time_embedding};
 use super::encoder::CausalConv;
 use super::layers::{Embedding, Linear, RopeTable};
 use super::mel::VoxtralMel;

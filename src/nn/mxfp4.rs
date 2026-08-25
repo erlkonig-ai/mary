@@ -425,8 +425,8 @@ mod tests {
         assert_eq!(e8m0_to_f32(127), 1.0);
         assert_eq!(e8m0_to_f32(122), 0.03125); // 2^-5, the checkpoint's usual scale
         assert_eq!(e8m0_to_f32(112), 3.0517578125e-05); // 2^-15
-                                                        // 0x01 is 2^-126 = f32's smallest normal, so 0x00 is one exact halving
-                                                        // below it — the subnormal branch, checked without a decimal literal.
+        // 0x01 is 2^-126 = f32's smallest normal, so 0x00 is one exact halving
+        // below it — the subnormal branch, checked without a decimal literal.
         assert_eq!(e8m0_to_f32(1), f32::MIN_POSITIVE);
         assert_eq!(e8m0_to_f32(0) * 2.0, f32::MIN_POSITIVE);
         assert_eq!(e8m0_to_f32(254), pow2_f32(127).unwrap());

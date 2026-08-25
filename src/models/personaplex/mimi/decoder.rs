@@ -25,7 +25,7 @@
 //!   see its docs for the exact numerics difference and the dispatch shape.
 
 use super::config::*;
-use super::encoder::{transformer_forward, TrLayer as MimiTrLayer};
+use super::encoder::{TrLayer as MimiTrLayer, transformer_forward};
 use crate::models::qwen3tts::cpu::{sgemm, sgemm_nt};
 use crate::nn::weight_loader::{HostF32, WeightLoader};
 
@@ -1972,8 +1972,15 @@ mod gpu_tests {
             let f = t as f64;
             println!(
                 "  {t:>6}  {:>7.2} [{:>6.2}..{:>6.2}] {:>7.2}  {:>7.2} [{:>6.2}..{:>6.2}] {:>7.2} {:>7.2}  {:>6.2}x",
-                cp / f, cmin / f, cmax / f, ccpu / f,
-                gp / f, gmin / f, gmax / f, gcpu / f, sp / (8.0 * f),
+                cp / f,
+                cmin / f,
+                cmax / f,
+                ccpu / f,
+                gp / f,
+                gmin / f,
+                gmax / f,
+                gcpu / f,
+                sp / (8.0 * f),
                 cp / gp
             );
         }

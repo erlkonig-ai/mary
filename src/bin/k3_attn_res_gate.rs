@@ -990,7 +990,7 @@ fn section_boundary(g: &mut Gate, o: &Oracle, ck: &Checkpoint) {
     let checkpoints: Vec<usize> = schedule
         .iter()
         .enumerate()
-        .filter(|(_, &b)| b)
+        .filter(|&(_, &b)| b)
         .map(|(i, _)| i)
         .collect();
     g.truth(

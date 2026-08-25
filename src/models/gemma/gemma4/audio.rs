@@ -9,9 +9,9 @@
 //! and chunked attention instead of ViT.
 
 use burn::nn::{
-    conv::{Conv1d, Conv1dConfig, Conv2d, Conv2dConfig},
     LayerNorm, LayerNormConfig, Linear, LinearConfig, PaddingConfig1d, PaddingConfig2d, RmsNorm,
     RmsNormConfig,
+    conv::{Conv1d, Conv1dConfig, Conv2d, Conv2dConfig},
 };
 use burn::prelude::*;
 use burn::tensor::Tensor;
@@ -286,7 +286,7 @@ impl<B: Backend> AudioLightConv1d<B> {
         let residual = x.clone();
         let h = self.pre_layer_norm.forward(x);
         let h = self.linear_start.forward(h); // [B, T, 2*hidden]
-                                              // GLU along last dim: split (a, b), y = a * sigmoid(b)
+        // GLU along last dim: split (a, b), y = a * sigmoid(b)
         let [b_, t, two_h] = h.dims();
         let half = two_h / 2;
         let a = h.clone().slice([0..b_, 0..t, 0..half]);
@@ -533,7 +533,7 @@ impl<B: Backend> AudioAttention<B> {
         };
 
         let attn_weights = burn::tensor::activation::softmax(attn, 4); // softmax over context dim
-                                                                       // out = attn_weights @ v.permute(0, 3, 1, 2, 4) = [B, H, nb, cs, ctx] @ [B, H, nb, ctx, D]
+        // out = attn_weights @ v.permute(0, 3, 1, 2, 4) = [B, H, nb, cs, ctx] @ [B, H, nb, ctx, D]
         let values = v_ctx.permute([0, 3, 1, 2, 4]); // [B, H, nb, ctx, D]
         let aw4 = attn_weights.reshape([b * h * nb, cs, ctx]);
         let v4 = values.reshape([b * h * nb, ctx, d]);

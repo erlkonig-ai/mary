@@ -66,7 +66,7 @@ impl<B: Backend> VaeAttention<B> {
         let [_batch, _seq, _c_in] = x.dims();
         let [c_out, _] = weight.dims();
         let out = x.matmul(weight.transpose().unsqueeze::<3>()); // [B, S, C_out]
-                                                                 // Add bias: [C_out] -> [1, 1, C_out]
+        // Add bias: [C_out] -> [1, 1, C_out]
         out + bias.reshape([1, 1, c_out])
     }
 

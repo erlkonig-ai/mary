@@ -26,7 +26,7 @@ pub fn rms_norm_3d<B: Backend>(x: Tensor<B, 3>, weight: Tensor<B, 1>, eps: f64) 
     let variance = x.clone().powf_scalar(2.0).mean_dim(2); // [B, L, 1]
     let inv_rms = (variance + eps).sqrt().recip(); // [B, L, 1]
     let normed = x * inv_rms; // [B, L, D]
-                              // Broadcast multiply with weight [D] -> [1, 1, D]
+    // Broadcast multiply with weight [D] -> [1, 1, D]
     let w = weight.reshape([1, 1, d]);
     normed * w
 }

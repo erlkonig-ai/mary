@@ -66,7 +66,7 @@ use cubecl::server::Handle;
 use half::f16;
 
 use super::config::*;
-use crate::nn::q4::{Client, Rt, GROUP};
+use crate::nn::q4::{Client, GROUP, Rt};
 
 /// Threads per cube. Fixed; [`PredictorEngine::lanes`] splits it into rows.
 const CUBE: u32 = 256;

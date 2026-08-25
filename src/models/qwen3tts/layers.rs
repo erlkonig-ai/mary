@@ -22,8 +22,8 @@
 //!   ([B,H,1,D] ≅ [B,Hkv,G,D]) so k/v need no expand and causality no mask.
 
 use burn::prelude::*;
-use burn::tensor::activation::{silu, softmax};
 use burn::tensor::FloatDType;
+use burn::tensor::activation::{silu, softmax};
 
 use crate::nn::weight_loader::WeightLoader;
 
@@ -346,7 +346,7 @@ impl<B: Backend> Attention<B> {
         let offset = cache.seq_len();
 
         let qkv = x.matmul(self.wide_t.clone()); // [B,L,(2(H+Hkv)+Hkv)·D]
-                                                 // [B,L,heads·D] → [B,heads,L,D]; for L=1 the reshape alone is exact.
+        // [B,L,heads·D] → [B,heads,L,D]; for L=1 the reshape alone is exact.
         let heads = |t: Tensor<B, 3>, n: usize| -> Tensor<B, 4> {
             if l == 1 {
                 t.reshape([b, n, 1, d])

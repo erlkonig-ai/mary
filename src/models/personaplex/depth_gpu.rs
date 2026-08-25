@@ -79,7 +79,7 @@ use cubecl::prelude::*;
 use cubecl::server::Handle;
 
 use super::config as cfg;
-use super::temporal_metal::{as_bytes, encode, QLinear, WeightFmt};
+use super::temporal_metal::{QLinear, WeightFmt, as_bytes, encode};
 use crate::nn::q4::{self, Rt};
 use crate::nn::weight_loader::WeightLoader;
 

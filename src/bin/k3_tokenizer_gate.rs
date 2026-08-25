@@ -227,7 +227,7 @@ fn main() {
 
     let mut fail = 0usize;
     macro_rules! check {
-        ($ok:expr, $($arg:tt)*) => {
+        ($ok:expr_2021, $($arg:tt)*) => {
             if $ok { println!("  PASS  {}", format!($($arg)*)); }
             else   { println!("  FAIL  {}", format!($($arg)*)); fail += 1; }
         };

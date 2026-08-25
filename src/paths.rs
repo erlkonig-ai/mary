@@ -11,7 +11,7 @@
 //! So: pass the path explicitly, or set `MARY_MODELS` to the directory holding
 //! them. With neither, these functions fail loudly and say both ways to fix it.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 
 /// The directory holding model files, from `$MARY_MODELS`. No fallback.

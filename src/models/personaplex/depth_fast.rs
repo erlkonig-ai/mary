@@ -65,57 +65,59 @@ const WINDOW: usize = cfg::WEIGHTS_PER_STEP - 1;
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn hdot(w: *const u16, x: *const f32, n: usize) -> f32 {
-    debug_assert!(n >= 32 && n % 32 == 0);
-    let out: f32;
-    core::arch::asm!(
-        "movi v0.16b, #0",
-        "movi v1.16b, #0",
-        "movi v2.16b, #0",
-        "movi v3.16b, #0",
-        "2:",
-        "ldp  q4, q5, [{w}]",
-        "ldp  q6, q7, [{w}, #32]",
-        "add  {w}, {w}, #64",
-        "ldp  q16, q17, [{x}]",
-        "ldp  q18, q19, [{x}, #32]",
-        "ldp  q20, q21, [{x}, #64]",
-        "ldp  q22, q23, [{x}, #96]",
-        "add  {x}, {x}, #128",
-        "fcvtl  v24.4s, v4.4h",
-        "fcvtl2 v25.4s, v4.8h",
-        "fcvtl  v26.4s, v5.4h",
-        "fcvtl2 v27.4s, v5.8h",
-        "fmla v0.4s, v24.4s, v16.4s",
-        "fmla v1.4s, v25.4s, v17.4s",
-        "fmla v2.4s, v26.4s, v18.4s",
-        "fmla v3.4s, v27.4s, v19.4s",
-        "fcvtl  v24.4s, v6.4h",
-        "fcvtl2 v25.4s, v6.8h",
-        "fcvtl  v26.4s, v7.4h",
-        "fcvtl2 v27.4s, v7.8h",
-        "fmla v0.4s, v24.4s, v20.4s",
-        "fmla v1.4s, v25.4s, v21.4s",
-        "fmla v2.4s, v26.4s, v22.4s",
-        "fmla v3.4s, v27.4s, v23.4s",
-        "subs {n}, {n}, #32",
-        "b.ne 2b",
-        "fadd v0.4s, v0.4s, v1.4s",
-        "fadd v2.4s, v2.4s, v3.4s",
-        "fadd v0.4s, v0.4s, v2.4s",
-        "faddp v0.4s, v0.4s, v0.4s",
-        "faddp s0, v0.2s",
-        w = inout(reg) w => _,
-        x = inout(reg) x => _,
-        n = inout(reg) n => _,
-        out("v0") out,
-        out("v1") _, out("v2") _, out("v3") _,
-        out("v4") _, out("v5") _, out("v6") _, out("v7") _,
-        out("v16") _, out("v17") _, out("v18") _, out("v19") _,
-        out("v20") _, out("v21") _, out("v22") _, out("v23") _,
-        out("v24") _, out("v25") _, out("v26") _, out("v27") _,
-        options(nostack, readonly),
-    );
-    out
+    unsafe {
+        debug_assert!(n >= 32 && n % 32 == 0);
+        let out: f32;
+        core::arch::asm!(
+            "movi v0.16b, #0",
+            "movi v1.16b, #0",
+            "movi v2.16b, #0",
+            "movi v3.16b, #0",
+            "2:",
+            "ldp  q4, q5, [{w}]",
+            "ldp  q6, q7, [{w}, #32]",
+            "add  {w}, {w}, #64",
+            "ldp  q16, q17, [{x}]",
+            "ldp  q18, q19, [{x}, #32]",
+            "ldp  q20, q21, [{x}, #64]",
+            "ldp  q22, q23, [{x}, #96]",
+            "add  {x}, {x}, #128",
+            "fcvtl  v24.4s, v4.4h",
+            "fcvtl2 v25.4s, v4.8h",
+            "fcvtl  v26.4s, v5.4h",
+            "fcvtl2 v27.4s, v5.8h",
+            "fmla v0.4s, v24.4s, v16.4s",
+            "fmla v1.4s, v25.4s, v17.4s",
+            "fmla v2.4s, v26.4s, v18.4s",
+            "fmla v3.4s, v27.4s, v19.4s",
+            "fcvtl  v24.4s, v6.4h",
+            "fcvtl2 v25.4s, v6.8h",
+            "fcvtl  v26.4s, v7.4h",
+            "fcvtl2 v27.4s, v7.8h",
+            "fmla v0.4s, v24.4s, v20.4s",
+            "fmla v1.4s, v25.4s, v21.4s",
+            "fmla v2.4s, v26.4s, v22.4s",
+            "fmla v3.4s, v27.4s, v23.4s",
+            "subs {n}, {n}, #32",
+            "b.ne 2b",
+            "fadd v0.4s, v0.4s, v1.4s",
+            "fadd v2.4s, v2.4s, v3.4s",
+            "fadd v0.4s, v0.4s, v2.4s",
+            "faddp v0.4s, v0.4s, v0.4s",
+            "faddp s0, v0.2s",
+            w = inout(reg) w => _,
+            x = inout(reg) x => _,
+            n = inout(reg) n => _,
+            out("v0") out,
+            out("v1") _, out("v2") _, out("v3") _,
+            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+            options(nostack, readonly),
+        );
+        out
+    }
 }
 
 #[cfg(not(target_arch = "aarch64"))]
@@ -177,12 +179,12 @@ unsafe impl Send for HPool {}
 
 const CHUNK_BITS: u32 = 20;
 
-fn hsteal(pool: &HPool, job: &HJob, gen: usize) {
+fn hsteal(pool: &HPool, job: &HJob, r#gen: usize) {
     let n_chunks = job.m.div_ceil(job.chunk);
     loop {
         let v = pool.next.load(Ordering::Acquire);
         let (g, i) = (v >> CHUNK_BITS, v & ((1 << CHUNK_BITS) - 1));
-        if g != gen || i >= n_chunks {
+        if g != r#gen || i >= n_chunks {
             return;
         }
         if pool
@@ -302,16 +304,16 @@ fn hgemv_mt(w: &[u16], m: usize, n: usize, x: &[f32], y: &mut [f32]) {
             chunk,
         };
     }
-    let gen = pool.epoch.load(Ordering::Relaxed) + 1;
+    let r#gen = pool.epoch.load(Ordering::Relaxed) + 1;
     pool.done.store(0, Ordering::Release);
-    pool.next.store(gen << CHUNK_BITS, Ordering::Release);
-    pool.epoch.store(gen, Ordering::Release);
+    pool.next.store(r#gen << CHUNK_BITS, Ordering::Release);
+    pool.epoch.store(r#gen, Ordering::Release);
     {
         let _g = pool.lock.lock().unwrap();
         pool.cv.notify_all();
     }
     let job = unsafe { *pool.job.get() };
-    hsteal(pool, &job, gen);
+    hsteal(pool, &job, r#gen);
     while pool.done.load(Ordering::Acquire) < n_chunks {
         std::hint::spin_loop();
     }

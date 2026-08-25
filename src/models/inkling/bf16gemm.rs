@@ -571,7 +571,7 @@ impl Lane {
             Lane::DoubleTmaMmaSpec => {
                 use cubek::matmul::components::tile::TileMatmulKind;
                 use cubek::matmul::routines::{
-                    double_buffering::DoubleBufferingArgs, BlueprintStrategy,
+                    BlueprintStrategy, double_buffering::DoubleBufferingArgs,
                 };
                 Strategy::DoubleTmaMma(BlueprintStrategy::Inferred(DoubleBufferingArgs {
                     tile_matmul: TileMatmulKind::Mma,
@@ -580,7 +580,7 @@ impl Lane {
             }
             Lane::SimpleTmaMmaMulti => {
                 use cubek::matmul::components::tile::TileMatmulKind;
-                use cubek::matmul::routines::{simple::SimpleArgs, BlueprintStrategy};
+                use cubek::matmul::routines::{BlueprintStrategy, simple::SimpleArgs};
                 Strategy::SimpleTmaMma(BlueprintStrategy::Inferred(SimpleArgs {
                     tile_matmul: TileMatmulKind::Mma,
                     multi_rows: true,
@@ -588,7 +588,7 @@ impl Lane {
             }
             Lane::SimpleCyclicMmaMulti => {
                 use cubek::matmul::components::tile::TileMatmulKind;
-                use cubek::matmul::routines::{simple::SimpleArgs, BlueprintStrategy};
+                use cubek::matmul::routines::{BlueprintStrategy, simple::SimpleArgs};
                 Strategy::SimpleCyclicMma(BlueprintStrategy::Inferred(SimpleArgs {
                     tile_matmul: TileMatmulKind::Mma,
                     multi_rows: true,
@@ -597,7 +597,7 @@ impl Lane {
             Lane::OrderedDoubleMmaPk2 | Lane::OrderedDoubleMmaPk4 => {
                 use cubek::matmul::components::tile::TileMatmulKind;
                 use cubek::matmul::routines::{
-                    ordered_double_buffering::OrderedSelectionArgs, BlueprintStrategy,
+                    BlueprintStrategy, ordered_double_buffering::OrderedSelectionArgs,
                 };
                 Strategy::OrderedDoubleMma(BlueprintStrategy::Inferred(OrderedSelectionArgs {
                     tile_matmul: TileMatmulKind::Mma,

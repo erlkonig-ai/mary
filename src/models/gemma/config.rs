@@ -131,11 +131,7 @@ impl MistralConfig {
             other => {
                 // Fallback: take after last '/', truncate to 31 bytes
                 let s = other.rsplit('/').next().unwrap_or(other);
-                if s.len() <= 31 {
-                    s
-                } else {
-                    &s[..31]
-                }
+                if s.len() <= 31 { s } else { &s[..31] }
             }
         }
     }

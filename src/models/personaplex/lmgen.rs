@@ -28,7 +28,7 @@
 use burn::prelude::*;
 
 use super::config as cfg;
-use super::depth::{argmax, DepthTransformer};
+use super::depth::{DepthTransformer, argmax};
 use super::sampling::{Sampler, SamplingConfig};
 use super::temporal::TemporalTransformer;
 

@@ -6,7 +6,7 @@
 //! normalization. Produces the same `input_features` + `input_features_mask`
 //! numpy arrays Python does.
 
-use rustfft::{num_complex::Complex32, FftPlanner};
+use rustfft::{FftPlanner, num_complex::Complex32};
 
 /// Fixed Gemma 4 audio feature extractor parameters.
 #[derive(Debug, Clone)]

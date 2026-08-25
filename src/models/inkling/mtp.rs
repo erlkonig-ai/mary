@@ -44,10 +44,10 @@
 //! commitment the exception, because a rejected draft that left K and V behind
 //! shows up as a slowly falling acceptance rate rather than as an error.
 
-use crate::models::inkling::attn::{causal_mask, AttnDims, AttnWeights, LogScaling};
+use crate::models::inkling::attn::{AttnDims, AttnWeights, LogScaling, causal_mask};
 use crate::models::inkling::block::rms_norm;
 use crate::models::inkling::layer::{
-    decoder_layer_prefill, decoder_layer_step, LayerCache, LayerMlp, LayerWeights,
+    LayerCache, LayerMlp, LayerWeights, decoder_layer_prefill, decoder_layer_step,
 };
 
 /// Which operand occupies the first `hidden` columns of `input_proj`'s input.

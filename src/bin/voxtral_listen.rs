@@ -37,7 +37,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 #[cfg(target_os = "macos")]
-extern "C" {
+unsafe extern "C" {
     fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
 }
 

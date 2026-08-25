@@ -3,7 +3,7 @@ use burn::tensor::activation::silu;
 
 use super::attention::VaeAttention;
 use super::config::VaeConfig;
-use super::resnet::{conv2d_forward, group_norm_4d, ResnetBlock2D};
+use super::resnet::{ResnetBlock2D, conv2d_forward, group_norm_4d};
 use super::up_block::UpDecoderBlock2D;
 use crate::nn::weight_loader::WeightLoader;
 

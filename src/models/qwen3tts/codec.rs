@@ -135,7 +135,7 @@ impl<B: Backend> CausalTransConv<B> {
         let [_, _, t] = x.dims();
         let (o, k, s) = (self.out_ch, self.k, self.stride);
         let z = self.w2.clone().unsqueeze::<3>().matmul(x); // [1, k·o, T]
-                                                            // out[t·s + j] = Σ_b z[j + s·b, ·, t − b]  (b < k/s), trimmed to T·s
+        // out[t·s + j] = Σ_b z[j + s·b, ·, t − b]  (b < k/s), trimmed to T·s
         let z = z.reshape([k, o, t]);
         let mut acc = z.clone().narrow(0, 0, s); // b = 0 block [s, o, T]
         if k == 2 * s {
@@ -210,7 +210,7 @@ impl<B: Backend> ConvNeXt<B> {
     fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         let input = x.clone();
         let h = self.dw.forward(x).swap_dims(1, 2); // [B,T,C]
-                                                    // LayerNorm eps 1e-6 over channels
+        // LayerNorm eps 1e-6 over channels
         let d = self.norm_w.dims()[0];
         let mean = h.clone().mean_dim(2);
         let var = (h.clone() - mean.clone()).powf_scalar(2.0).mean_dim(2);

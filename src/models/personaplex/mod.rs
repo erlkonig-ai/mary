@@ -28,7 +28,7 @@ use triblespace::core::blob::{Blob, TryFromBlob};
 use triblespace::core::collection::{CollectionCommit, CollectionData, CollectionSnapshot};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileReader;
-use triblespace::prelude::{blobencodings, inlineencodings, BlobStoreGet, Id, Inline, TribleSet};
+use triblespace::prelude::{BlobStoreGet, Id, Inline, TribleSet, blobencodings, inlineencodings};
 
 /// Canonical source coordinate of the complete PersonaPlex LM + Mimi model.
 pub const SOURCE: &str = "nvidia/personaplex-7b-v1";
@@ -155,7 +155,7 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
     where
         R: Clone,
     {
-        use anyhow::{anyhow, Context};
+        use anyhow::{Context, anyhow};
         use std::collections::BTreeSet;
 
         let (_, ticket, reader) = snapshot.into_parts();
@@ -386,7 +386,7 @@ pub mod voice_prompt;
 #[cfg(test)]
 mod native_authority_tests {
     use super::*;
-    use crate::format::{attrs, F32Array, U64Array};
+    use crate::format::{F32Array, U64Array, attrs};
     use ed25519_dalek::SigningKey;
     use std::fs::OpenOptions;
     use std::path::{Path, PathBuf};

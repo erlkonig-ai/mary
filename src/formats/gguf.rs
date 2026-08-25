@@ -18,7 +18,7 @@
 
 use std::path::Path;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use half::{bf16, f16};
 
 use gguf_rs_lib::prelude::GGUFTensorType;

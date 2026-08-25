@@ -86,11 +86,7 @@ impl StorageDType {
     }
 
     const fn from_bf16(on: bool) -> Self {
-        if on {
-            Self::Bf16
-        } else {
-            Self::F32
-        }
+        if on { Self::Bf16 } else { Self::F32 }
     }
 }
 
@@ -846,10 +842,10 @@ pub fn check<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::{
-        activation_bytes, attention_activation_bytes, largest_buffer, longest_sequence,
-        mlp_activation_bytes, prefill_activation_bytes, prefill_peak_bytes, query_block,
-        score_block_bytes, score_matrix_bytes, AdmissionPolicy, RoutedLane, StorageDType,
-        QUERY_BLOCK_BYTES,
+        AdmissionPolicy, QUERY_BLOCK_BYTES, RoutedLane, StorageDType, activation_bytes,
+        attention_activation_bytes, largest_buffer, longest_sequence, mlp_activation_bytes,
+        prefill_activation_bytes, prefill_peak_bytes, query_block, score_block_bytes,
+        score_matrix_bytes,
     };
     use crate::models::inkling::config::{AttnKind, InklingTextConfig};
     use crate::models::inkling::pool::AllocatorConfig;

@@ -17,9 +17,9 @@
 //! [`crate::ingest::load_keymap`]. The f32 blobs store weights exactly, so the
 //! round-trip is lossless.
 
-use crate::ingest::load_keymap;
 #[cfg(feature = "import")]
 use crate::ingest::LeafDtype;
+use crate::ingest::load_keymap;
 #[cfg(feature = "import")]
 use crate::nn::weight_loader::read_safetensors_file;
 #[cfg(any(
@@ -421,7 +421,7 @@ pub fn ingest_weight_file_filtered_fragment(
 mod filtered_native_import_tests {
     use super::*;
     use crate::selection::ModelSelector;
-    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+    use safetensors::tensor::{Dtype, TensorView, serialize_to_file};
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -673,9 +673,11 @@ mod filtered_native_import_tests {
             |_| false,
         )
         .unwrap_err();
-        assert!(empty
-            .to_string()
-            .contains("selected no supported float tensors"));
+        assert!(
+            empty
+                .to_string()
+                .contains("selected no supported float tensors")
+        );
         pile.close().unwrap();
 
         let latest =
@@ -1306,7 +1308,7 @@ pub fn load_qwen3tts_talker_folded_from_indexes(
     use crate::models::qwen3tts::layers::{
         Attention, DecoderLayer, Embedding, Linear, RmsNorm, RopeTable,
     };
-    use crate::models::qwen3tts::talker::{talker_attn_config, Talker};
+    use crate::models::qwen3tts::talker::{Talker, talker_attn_config};
     use crate::nn::backend::BHalf;
     use burn::prelude::*;
 
@@ -1464,7 +1466,7 @@ pub const QUANTIZATION_NATIVE: &str = "native";
 mod legacy_spelling_tests {
     use super::*;
     use crate::model_collection::{
-        legacy_model_attribute_aliases, project_legacy_model_attributes, ModelAttributeAlias,
+        ModelAttributeAlias, legacy_model_attribute_aliases, project_legacy_model_attributes,
     };
     use triblespace::core::id_hex;
 
@@ -2181,7 +2183,7 @@ pub fn load_gemma4_aliased_from_index(
     config: crate::models::gemma::gemma4::config::Gemma4Config,
     device: burn::backend::wgpu::WgpuDevice,
 ) -> anyhow::Result<crate::models::gemma::gemma4::decoder::Gemma4Model<crate::nn::backend::BHalf>> {
-    use crate::models::gemma::gemma4::weights::{load_gemma4_from_source, WeightCtx};
+    use crate::models::gemma::gemma4::weights::{WeightCtx, load_gemma4_from_source};
     use crate::nn::backend::BHalf;
     use burn::backend::wgpu::{CubeTensor, WgpuDevice, WgpuRuntime};
     use burn::tensor::{DType, Tensor, TensorPrimitive};
@@ -2206,7 +2208,7 @@ pub fn load_gemma4_aliased_from_index(
             let blob_ptr = bytes.as_ptr() as u64;
             let nbytes = bytes.len() as u64;
             let n = (nbytes / 2) as usize; // f16 element count
-                                           // The owner downcast = capability check (mmap?) + region bounds + keepalive.
+            // The owner downcast = capability check (mmap?) + region bounds + keepalive.
             let mmap = bytes.downcast_to_owner::<MmapRaw>().ok()?;
             let region_end = mmap.as_ptr() as u64 + mmap.len() as u64;
             let page_start = blob_ptr & !(PAGE - 1);
@@ -2287,7 +2289,7 @@ fn alias_f16_leaf(
     let blob_ptr = bytes.as_ptr() as u64;
     let nbytes = bytes.len() as u64;
     let n = (nbytes / 2) as usize; // f16 element count
-                                   // The owner downcast = capability check (mmap?) + region bounds + keepalive.
+    // The owner downcast = capability check (mmap?) + region bounds + keepalive.
     let mmap = bytes
         .downcast_to_owner::<MmapRaw>()
         .expect("aliased path requires an mmap-backed pile blob");

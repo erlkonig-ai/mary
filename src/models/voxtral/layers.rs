@@ -11,8 +11,8 @@
 //! post-attention norm and the MLP).
 
 use burn::prelude::*;
-use burn::tensor::activation::{silu, softmax};
 use burn::tensor::FloatDType;
+use burn::tensor::activation::{silu, softmax};
 
 use crate::nn::weight_loader::WeightLoader;
 

@@ -42,9 +42,9 @@ fn main() {
         .encode_tensor::<B>(&format!("{REF} {GEN}"), &device);
 
     // cond = ref_mel padded with zeros to `duration`
-    let gen = duration - ref_len;
+    let r#gen = duration - ref_len;
     let cond = Tensor::cat(
-        vec![ref_mel, Tensor::<B, 3>::zeros([1, gen, 100], &device)],
+        vec![ref_mel, Tensor::<B, 3>::zeros([1, r#gen, 100], &device)],
         1,
     );
     // text padded to `duration` with -1 (→ +1 = 0 = filler, matches F5 padding)

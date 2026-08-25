@@ -9,7 +9,7 @@
 
 use crate::format::attrs;
 use crate::leaf::Leaf;
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
 use std::collections::{BTreeSet, HashMap};
 use triblespace::core::collection::CollectionSnapshot;
 use triblespace::prelude::*;
@@ -905,15 +905,17 @@ mod tests {
             select_model_roots(&facts, &reader, ModelSelector::Root(only.root)).unwrap(),
             vec![only.root]
         );
-        assert!(select_model_roots(
-            &facts,
-            &reader,
-            ModelSelector::Source {
-                source: "vendor/absent",
-                quantization: "native",
-            }
-        )
-        .is_err());
+        assert!(
+            select_model_roots(
+                &facts,
+                &reader,
+                ModelSelector::Source {
+                    source: "vendor/absent",
+                    quantization: "native",
+                }
+            )
+            .is_err()
+        );
 
         let selected =
             SelectedModelIndex::from_graph(&facts, reader, ModelSelector::Root(only.root)).unwrap();

@@ -271,14 +271,16 @@ pub fn pool_line(client: &ComputeClient<CudaRuntime>, at: &str) -> String {
     match client.memory_usage() {
         Ok(u) => {
             format!(
-            "    pool[{at}]: {:.2} GiB reserved, {:.2} live, {:.2} padding, {:.2} GiB STRANDED \
+                "    pool[{at}]: {:.2} GiB reserved, {:.2} live, {:.2} padding, {:.2} GiB STRANDED \
              over {} slices",
-            u.bytes_reserved as f64 / GIB,
-            u.bytes_in_use as f64 / GIB,
-            u.bytes_padding as f64 / GIB,
-            u.bytes_reserved.saturating_sub(u.bytes_in_use + u.bytes_padding) as f64 / GIB,
-            u.number_allocs,
-        )
+                u.bytes_reserved as f64 / GIB,
+                u.bytes_in_use as f64 / GIB,
+                u.bytes_padding as f64 / GIB,
+                u.bytes_reserved
+                    .saturating_sub(u.bytes_in_use + u.bytes_padding) as f64
+                    / GIB,
+                u.number_allocs,
+            )
         }
         Err(e) => format!("    pool[{at}]: unavailable ({e:?})"),
     }

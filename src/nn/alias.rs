@@ -23,8 +23,8 @@
 
 use burn::backend::wgpu::{CubeTensor, WgpuDevice, WgpuRuntime};
 use burn::tensor::{Tensor, TensorPrimitive};
-use burn_cubecl::cubecl::Runtime;
 use burn_cubecl::CubeBackend;
+use burn_cubecl::cubecl::Runtime;
 use memmap2::MmapRaw;
 use std::sync::Arc;
 

@@ -27,7 +27,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use half::{bf16, f16};
 
 /// Read a PyTorch pickle `.bin`/`.pth` and return every float tensor as

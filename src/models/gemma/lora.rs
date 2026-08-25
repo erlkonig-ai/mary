@@ -34,7 +34,7 @@ use crate::format::F32Array;
 pub mod attrs {
     use crate::format::F32Array;
     use triblespace::prelude::blobencodings::UTF8String;
-    use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString, F64, U256BE};
+    use triblespace::prelude::inlineencodings::{F64, GenId, Handle, ShortString, U256BE};
     use triblespace::prelude::*;
 
     attributes! {

@@ -21,7 +21,7 @@
 //! being, and her mother Mary Wollstonecraft. She gives the assembled parts life.
 
 use burn::prelude::*;
-use triblespace::prelude::blobencodings::{elements, Array};
+use triblespace::prelude::blobencodings::{Array, elements};
 use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString, U256BE};
 use triblespace::prelude::*;
 

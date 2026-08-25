@@ -31,8 +31,9 @@
 use anybytes::Bytes;
 use anyhow::{Context, Result};
 use triblespace::core::blob::encodings::tensor::{
+    Tensor, TensorElement, TensorView,
     elements::{BF16, F32, NVFP4, NVFP4_BLOCK},
-    tensor_blob, Tensor, TensorElement, TensorView,
+    tensor_blob,
 };
 use triblespace::core::blob::{Blob, TryFromBlob};
 use triblespace::prelude::BlobStoreGet;

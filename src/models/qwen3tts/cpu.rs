@@ -9,7 +9,7 @@
 
 #[cfg(target_os = "macos")]
 #[link(name = "Accelerate", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
     fn cblas_sgemv(
         order: i32,
         trans: i32,
@@ -44,7 +44,7 @@ extern "C" {
 }
 
 #[cfg(target_os = "macos")]
-extern "C" {
+unsafe extern "C" {
     fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
 }
 
@@ -276,14 +276,14 @@ const CHUNK_BITS: u32 = 20;
 
 /// Steal chunks off `pool.next` for generation `gen` and compute them until
 /// the grid is empty or the pool has moved to a newer generation.
-fn steal(pool: &Pool, job: &Job, gen: usize) {
+fn steal(pool: &Pool, job: &Job, r#gen: usize) {
     let n_chunks = job.m.div_ceil(job.chunk);
     loop {
         // claim by CAS: a stale thread (gen mismatch) must not consume an
         // index from the new job's grid.
         let v = pool.next.load(Ordering::Acquire);
         let (g, i) = (v >> CHUNK_BITS, v & ((1 << CHUNK_BITS) - 1));
-        if g != gen || i >= n_chunks {
+        if g != r#gen || i >= n_chunks {
             return;
         }
         if pool
@@ -426,16 +426,16 @@ pub fn sgemv_mt(w: &[f32], m: usize, n: usize, x: &[f32], y: &mut [f32]) {
             chunk,
         };
     }
-    let gen = pool.epoch.load(Ordering::Relaxed) + 1;
+    let r#gen = pool.epoch.load(Ordering::Relaxed) + 1;
     pool.done.store(0, Ordering::Release);
-    pool.next.store(gen << CHUNK_BITS, Ordering::Release);
-    pool.epoch.store(gen, Ordering::Release);
+    pool.next.store(r#gen << CHUNK_BITS, Ordering::Release);
+    pool.epoch.store(r#gen, Ordering::Release);
     {
         let _g = pool.lock.lock().unwrap();
         pool.cv.notify_all();
     }
     let job = unsafe { *pool.job.get() };
-    steal(pool, &job, gen);
+    steal(pool, &job, r#gen);
     while pool.done.load(Ordering::Acquire) < n_chunks {
         std::hint::spin_loop();
     }

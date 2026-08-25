@@ -6,7 +6,7 @@
 //! blocks, a final AdaLN, and proj_out → n_mel.
 
 use super::config::F5Config;
-use super::dit::{f5_rope, F5Block, Linear};
+use super::dit::{F5Block, Linear, f5_rope};
 use super::text::TextEmbed;
 use crate::nn::norm::layer_norm_no_affine;
 use crate::nn::weight_loader::WeightLoader;

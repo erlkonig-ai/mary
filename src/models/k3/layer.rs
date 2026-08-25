@@ -55,7 +55,7 @@ use super::moe::{
     BlockTrace, ExpertWeights, LatentMoe, LatentMoeWeights, MoeDims, SharedExpertWeights,
     SharedTrace,
 };
-use super::ops::{rms_norm, ActRound};
+use super::ops::{ActRound, rms_norm};
 
 /// The attention sublayer: 69 layers run KDA, 24 run MLA.
 ///

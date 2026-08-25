@@ -287,9 +287,11 @@ mod route_finite_tests {
             .sum::<usize>();
         println!("examined {examined} routing weights");
         assert_eq!(examined, 6);
-        assert!(routes
-            .iter()
-            .flat_map(|r| r.weights.iter().chain(&r.shared_gammas))
-            .all(|v| v.is_finite()));
+        assert!(
+            routes
+                .iter()
+                .flat_map(|r| r.weights.iter().chain(&r.shared_gammas))
+                .all(|v| v.is_finite())
+        );
     }
 }

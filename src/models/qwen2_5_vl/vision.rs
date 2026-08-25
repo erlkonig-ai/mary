@@ -282,7 +282,7 @@ impl<B: Backend> VisionTransformer<B> {
         }
 
         let merged = self.merger.forward(x); // [n_units, out_hidden], window order
-                                             // scatter back to raster order: out[raster] = merged[argsort(unit_index)]
+        // scatter back to raster order: out[raster] = merged[argsort(unit_index)]
         let back: Vec<i64> = argsort(&unit_index);
         gather_rows(merged, &back, &self.device)
     }

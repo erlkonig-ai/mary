@@ -12,8 +12,8 @@ use burn::prelude::*;
 
 use config::Flux2TransformerConfig;
 use double_stream_block::Flux2TransformerBlock;
-use embeddings::{linear3d, Flux2TimestepGuidanceEmbeddings};
-use modulation::{split_modulation, Flux2Modulation};
+use embeddings::{Flux2TimestepGuidanceEmbeddings, linear3d};
+use modulation::{Flux2Modulation, split_modulation};
 use norm::AdaLayerNormContinuous;
 use rope::flux2_rope;
 use single_stream_block::Flux2SingleTransformerBlock;

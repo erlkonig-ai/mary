@@ -76,7 +76,7 @@ impl CpuConv {
     fn forward(&self, x: &[f32], l: usize) -> (Vec<f32>, usize) {
         let (k, s) = (self.k, self.stride);
         let pad_left = k - s; // padding_total, all left (causal)
-                              // extra right padding to a whole number of frames
+        // extra right padding to a whole number of frames
         let n_frames =
             ((l + pad_left).saturating_sub(k) as f64 / s as f64 + 1.0).ceil() as usize - 1;
         let ideal = n_frames * s + k - pad_left;
