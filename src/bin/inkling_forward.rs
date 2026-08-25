@@ -5871,11 +5871,16 @@ fn main() -> Result<()> {
         // read and from the cleanup's own sync, because the three have different
         // fixes and were being reported as one number.
         let mut t_pool_poll = 0f64;
-        // What the hand-back COSTS, beside how often it happened. It is a device
-        // DRAIN plus the pool's free/alloc churn plus a `/proc/meminfo` poll, and
-        // it lands between `t_other` stopping and the next layer starting -- so
-        // until it was timed it collected the device time of the layer that had
-        // just been enqueued and charged it to nothing.
+        // What the hand-back COSTS, beside how often it happened. It lands between
+        // `t_other` stopping and the next layer starting, so until it was timed it
+        // charged its own cost to nothing.
+        //
+        // The naming was wrong for four months and the wrong name is what hid it:
+        // on the DEFAULT policy with room to spare this line never reaches a
+        // device drain or a free, because the cleanup is inside the `if` and the
+        // `if` is false. Everything it measured was the QUESTION -- the
+        // `memory_usage` round trip and a `/proc/meminfo` read -- charged to a
+        // bracket named after the answer.
         let mut t_cleanup = 0f64;
         let (mut d_attn, mut d_router, mut d_expert, mut d_shared, mut d_tail) =
             (0f64, 0f64, 0f64, 0f64, 0f64);

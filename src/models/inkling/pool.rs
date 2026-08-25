@@ -391,9 +391,19 @@ impl CleanupGate {
     /// The gate for this run. Starts armed, so the first pass polls per layer
     /// and nothing has to be assumed about what state the pool woke up in.
     pub fn new(policy: CleanupPolicy) -> Self {
+        Self::with_schedule(
+            policy,
+            matches!(std::env::var("INK_POOL_POLL").as_deref(), Ok("layer")),
+        )
+    }
+
+    /// [`CleanupGate::new`] with the `INK_POOL_POLL` reading supplied rather
+    /// than read, so a test can pin the schedule without touching the
+    /// process-wide environment two other tests are also reading.
+    pub fn with_schedule(policy: CleanupPolicy, always_poll: bool) -> Self {
         Self {
             policy,
-            always_poll: matches!(std::env::var("INK_POOL_POLL").as_deref(), Ok("layer")),
+            always_poll,
             per_layer: true,
             acted: false,
         }
@@ -503,6 +513,98 @@ mod tests {
         let floor = AllocatorConfig::ExclusivePages.admission_floor(machine, 16_384);
         assert!(floor >= retained);
         assert!(live + floor >= reserved);
+    }
+
+    /// Run `passes` passes of `layers` layers each and report, per pass, how
+    /// many times the gate asked for `stranded` and how many layers cleaned.
+    fn drive(
+        gate: &mut CleanupGate,
+        passes: usize,
+        layers: usize,
+        stranded: u64,
+    ) -> Vec<(usize, usize)> {
+        (0..passes)
+            .map(|_| {
+                gate.begin_pass();
+                let mut polls = 0usize;
+                let mut cleaned = 0usize;
+                for l in 0..layers {
+                    if gate.at_layer(l + 1 == layers, || {
+                        polls += 1;
+                        stranded
+                    }) {
+                        cleaned += 1;
+                    }
+                }
+                (polls, cleaned)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_policy_that_ignores_stranded_never_asks_for_it() {
+        // The defect this type exists for: the loop read the pool once a layer
+        // in EVERY arm, so `INK_POOL_CLEANUP=0` measured +0.00% because both
+        // sides of the A/B were paying for a number neither of them used.
+        for policy in [
+            CleanupPolicy::Never,
+            CleanupPolicy::PerLayer,
+            CleanupPolicy::PerStage,
+        ] {
+            let mut gate = CleanupGate::with_schedule(policy, false);
+            let want = policy != CleanupPolicy::Never;
+            for (polls, cleaned) in drive(&mut gate, 3, 8, u64::MAX) {
+                assert_eq!(
+                    polls, 0,
+                    "{policy:?} asked the pool for a number it does not read"
+                );
+                assert_eq!(
+                    cleaned,
+                    if want { 8 } else { 0 },
+                    "{policy:?} changed its answer"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_quiet_pass_drops_to_one_poll_and_the_last_layer_keeps_it_honest() {
+        let mut gate = CleanupGate::with_schedule(CleanupPolicy::WhenStranded, false);
+        let seen = drive(&mut gate, 4, 42, 0);
+        // The first pass is polled per layer -- nothing is assumed about the
+        // state the pool woke up in. It cleans nothing, so every pass after it
+        // asks once, at the layer that re-arms the next one.
+        assert!(seen[0].0 <= 42);
+        assert_eq!(seen[0].1, 0);
+        for (polls, cleaned) in &seen[1..] {
+            assert!(*polls <= 1, "a quiet pass asked {polls} times, not once");
+            assert_eq!(*cleaned, 0);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_pass_that_hands_pages_back_is_polled_at_every_layer() {
+        // `u64::MAX` stranded is more than any node has spare, so the policy
+        // answers yes at the first layer it is asked and the gate must stay on
+        // per-layer polling for the rest of that pass and the next one.
+        let mut gate = CleanupGate::with_schedule(CleanupPolicy::WhenStranded, false);
+        for (polls, cleaned) in drive(&mut gate, 3, 20, u64::MAX) {
+            assert_eq!(polls, 20, "a stranding pass must be asked every layer");
+            assert_eq!(cleaned, 20, "and must hand back at every layer");
+        }
+    }
+
+    #[test]
+    fn ink_pool_poll_layer_restores_the_unconditional_poll() {
+        let mut gate = CleanupGate::with_schedule(CleanupPolicy::Never, true);
+        for (polls, cleaned) in drive(&mut gate, 2, 12, 0) {
+            assert_eq!(
+                polls, 12,
+                "the A/B arm must reproduce the old per-layer cost"
+            );
+            assert_eq!(cleaned, 0);
+        }
     }
 
     #[test]
