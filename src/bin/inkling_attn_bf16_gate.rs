@@ -257,6 +257,7 @@ fn one(
         wk: bf16w(&client, &wk, kv_heads * head_dim, hidden),
         wv: bf16w(&client, &wv, kv_heads * head_dim, hidden),
         wr: bf16w(&client, &wr, heads * d_rel, hidden),
+        wqkvr: None,
         wo: bf16w(&client, &wo, hidden, heads * head_dim),
         k_sconv: t2(&ks, kv_heads * head_dim, kernel),
         v_sconv: t2(&vs, kv_heads * head_dim, kernel),
