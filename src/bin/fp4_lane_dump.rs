@@ -25,7 +25,7 @@ use cubecl::future;
 
 use cubecl::prelude::*;
 use mary::models::inkling::fp4gemm::fp4_linear_launch;
-use mary::models::inkling::w4a16gemm::w4a16_linear_launch;
+use mary::models::inkling::w4a16gemm::{w4a16_linear_launch, w4a16_linear_wide_launch};
 
 type Rt = cubecl::cuda::CudaRuntime;
 
@@ -88,6 +88,19 @@ fn main() {
         drop(out);
         if i >= 2 {
             w4a16_s = w4a16_s.min(dt);
+        }
+    }
+
+    // The same product, four planes a cube and a 16-byte B load.
+    let mut wide_s = f64::MAX;
+    for i in 0..6 {
+        let tw = Instant::now();
+        let out = w4a16_linear_wide_launch::<Rt>(&client, &a, &b, &b_sc, m_pad, k, n, 1.0);
+        let _ = future::block_on(client.sync());
+        let dt = tw.elapsed().as_secs_f64();
+        drop(out);
+        if i >= 2 {
+            wide_s = wide_s.min(dt);
         }
     }
 
@@ -156,6 +169,11 @@ fn main() {
         "w4a16_linear (hand)  {:8.3} ms   {:6.1} GB/s",
         w4a16_s * 1e3,
         gbs(w4a16_s)
+    );
+    println!(
+        "w4a16 wide   (hand)  {:8.3} ms   {:6.1} GB/s",
+        wide_s * 1e3,
+        gbs(wide_s)
     );
     println!(
         "fp4_linear   (hand)  {:8.3} ms   {:6.1} GB/s",
