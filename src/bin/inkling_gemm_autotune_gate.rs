@@ -51,6 +51,11 @@ fn slab(n: usize, seed: f32) -> Vec<u8> {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let all = args.iter().any(|a| a == "--all");
+    // `--core` is the SHORT run: the three shapes that dominate a pass, for a
+    // box that is shared. Four agents build and measure on this machine, and a
+    // forty-pair sweep is not a short correctness run -- it is a sweep, and it
+    // lands in the middle of somebody's p50.
+    let core = args.iter().any(|a| a == "--core");
     let widths: Vec<usize> = args
         .iter()
         .find(|a| !a.starts_with("--"))
@@ -68,6 +73,11 @@ fn main() -> Result<()> {
         ("dense w13     ", 4096, 16384),
         ("dense down    ", 8192, 4096),
     ];
+    if core {
+        shapes.retain(|&(name, _, _)| {
+            matches!(name.trim(), "attn wq" | "shared gate+up" | "shared down")
+        });
+    }
     if all {
         shapes.push(("unembed       ", 4096, 201024));
     }
