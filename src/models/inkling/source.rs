@@ -191,6 +191,16 @@ impl Weights {
         self.src.is_nvfp4(base)
     }
 
+    /// Whether this source's NVFP4 expert planes are in MMA-FRAGMENT ORDER.
+    ///
+    /// Threaded to every consumer of [`Weights::expert_packed`] that MULTIPLIES
+    /// the bytes rather than merely counting or binding them, because the two
+    /// layouts are the same bytes in a different order: a kernel reading the
+    /// wrong one produces numbers, not an error.
+    pub fn experts_swizzled(&self) -> bool {
+        self.src.experts_swizzled()
+    }
+
     /// One expert's packed planes, borrowed, undecoded.
     pub fn expert_packed(&self, base: &str, e: usize) -> Result<PackedSlab> {
         let t0 = Instant::now();
@@ -289,15 +299,9 @@ impl Weights {
         global_dense: &[&str],
         attention_bytes: u64,
         policy: super::budget::AdmissionPolicy,
-        prefill_tokens: usize,
     ) -> Result<(usize, usize, u64, u64)> {
-        self.src.copy_share(
-            layers,
-            global_dense,
-            attention_bytes,
-            policy,
-            prefill_tokens,
-        )
+        self.src
+            .copy_share(layers, global_dense, attention_bytes, policy)
     }
 
     // ---- what the source SAYS about itself --------------------------------

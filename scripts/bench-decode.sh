@@ -272,9 +272,34 @@ gate() {
   # A process that has just started, or one that is between kernels, is invisible
   # to --query-compute-apps and will still ruin the run. The name list is the
   # things in this repo that take the GPU for minutes at a time.
+  #
+  # The last filter is load-bearing and was added 2026-08-25 after this gate
+  # refused a genuinely idle box. `pgrep -f` matches the WHOLE command line, so a
+  # shell that merely NAMES one of these binaries counts as one running -- and
+  # and such shells are spawned here constantly, in the form
+  #
+  #     bash -c "until ! pgrep -f 'inkling_forward'; do sleep 20; done; <work>"
+  #
+  # which has a second defect that makes it fatal here: that shell's own argv
+  # contains its own pattern, so its `pgrep` matches ITSELF and it waits forever.
+  # Nine of them had accumulated at 0% CPU, one every few minutes, and each one
+  # was a permanent veto on every measurement anyone tried to take afterwards.
+  # The population only grows, so this was on its way to refusing every run in
+  # the repo, forever, on a completely idle machine.
+  #
+  # Dropping shells loses NOTHING. A wrapper that has actually launched a
+  # measurement has a CHILD process, and that child matches on its own argv[0].
+  # What is excluded is precisely the case where no measurement is running yet.
+  # `$2` is argv[0] as `pgrep -a` prints it, so this asks "is the PROGRAM one of
+  # these" instead of "does the command line mention one".
+  #
+  # The other two checks are untouched, and they are the ones that matter for a
+  # foreign contender: another user's compute app is still a HARD refusal, and
+  # host loadavg is still a soft one.
   local mine
   mine=$(pgrep -a -f 'inkling_forward|inkling_[a-z0-9_]*gate|inkling_bf16_gemm_bench|inkling_membw|inkling_device_ceiling|nsys|ncu|cuda-gdb' 2>/dev/null \
-         | grep -v "^$$ " | grep -v 'bench-decode.sh' | grep -v 'pgrep -a -f')
+         | grep -v "^$$ " | grep -v 'bench-decode.sh' | grep -v 'pgrep -a -f' \
+         | awk '$2 !~ /(^|\/)(ba|z|k|da)?sh$/')
   if [ -n "$mine" ]; then
     GATE_FINDINGS+=("measurement-shaped processes already running:")
     while IFS= read -r line; do

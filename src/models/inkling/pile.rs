@@ -440,12 +440,16 @@ fn device_weight_bytes(name: &str, leaf: &Leaf, policy: super::budget::Admission
 /// * 4 GiB is left for the kernel, the shell and the page-cache working window,
 ///   and that number is not a guess either. It is where the measured cliff is;
 /// * when SubSlices is selected, cubecl's two largest pool PAGES, from
-///   [`super::budget::pool_page_floor`]. That allocator reserves 41.74 GiB to
-///   hold 1.14 GiB of live tensors at 16,384 tokens, because a page is allocated
-///   whole and returned only when every slice of it is free. ExclusivePages
-///   sizes pages to requests, but its retained pages are request-history
-///   dependent; until admission carries that trace it keeps the same safe
-///   floor rather than treating a smaller measured high-water mark as a bound;
+///   what the ALLOCATOR holds beyond the live set, from
+///   [`super::budget::allocator_overhead_bytes`]. Under SubSlices that is the
+///   two largest ladder pages -- it reserves 41.74 GiB to hold 1.14 GiB of live
+///   tensors at 16,384 tokens, because a page is allocated whole and returned
+///   only when every slice of it is free. Under ExclusivePages, which is the
+///   default, it is the bucket-rounding ratio of the allocator's own
+///   construction applied to `attention_bytes`. Pages the pool is holding FREE
+///   for reuse are charged nothing here and bounded at runtime by
+///   [`super::pool::CleanupPolicy::WhenStranded`], which is the same hazard
+///   compared exactly instead of predicted;
 /// * `attention_bytes` is everything that scales with the SEQUENCE, and it is
 ///   the term this function did not have. See
 ///   [`super::budget::prefill_activation_bytes`]. It was briefly the score
@@ -482,7 +486,6 @@ fn run_overhead_bytes(
     attention_bytes: u64,
     machine: u64,
     policy: super::budget::AdmissionPolicy,
-    prefill_tokens: usize,
 ) -> u64 {
     const CUDA_CONTEXT: u64 = GIB / 5;
     const ACTIVATIONS_PER_LAYER: u64 = 41 * GIB / 200;
@@ -490,7 +493,7 @@ fn run_overhead_bytes(
     CUDA_CONTEXT
         + ACTIVATIONS_PER_LAYER * layers as u64
         + OS_FLOOR
-        + super::budget::pool_page_floor(policy, machine, prefill_tokens)
+        + super::budget::allocator_overhead_bytes(policy, machine, attention_bytes)
         + attention_bytes
 }
 
@@ -958,6 +961,15 @@ pub struct PileSource {
     /// never into the reclaimable pile mapping.
     copied: Option<anybytes::Bytes>,
     copied_experts: std::collections::HashMap<(String, i64), CopiedExpert>,
+    /// Whether the startup copy wrote the NVFP4 expert planes down in
+    /// MMA-FRAGMENT ORDER rather than row-major `[n, k]`.
+    ///
+    /// A property of the BYTES, not a preference: it is false until
+    /// [`PileSource::copy_share`] has actually permuted them, so the one path
+    /// that skips the copy (`INK_STARTUP_COPY=0`, which leaves the experts
+    /// aliasing the pile mapping in place) reports false and every consumer
+    /// reads the row-major lane, which is the only lane those bytes support.
+    swizzled: bool,
 }
 
 #[derive(Clone)]
@@ -1159,6 +1171,7 @@ impl PileSource {
             stacked,
             copied: None,
             copied_experts: std::collections::HashMap::new(),
+            swizzled: false,
         })
     }
 
@@ -1379,6 +1392,15 @@ impl PileSource {
         )])
     }
 
+    /// Whether the NVFP4 expert planes are in MMA-fragment order.
+    ///
+    /// The question a GEMM launcher has to ask before it picks an index
+    /// expression, and it is about bytes rather than configuration: see
+    /// [`PileSource::swizzled`]'s field docs.
+    pub fn experts_swizzled(&self) -> bool {
+        self.swizzled
+    }
+
     /// Everything the model collection asserts.
     pub fn facts(&self) -> &triblespace::prelude::TribleSet {
         &self.facts
@@ -1445,13 +1467,18 @@ impl PileSource {
     /// sequence length is a fact about the RUN and the weight share is a fact
     /// about the checkpoint, and folding one into the other is how the gate
     /// came to charge a constant for something linear in the sequence.
+    ///
+    /// It is also what the ALLOCATOR charge is now computed from, so there is
+    /// no longer a `prefill_tokens` parameter beside it: the sequence reaches
+    /// admission once, as the live set it implies, and every term downstream is
+    /// a function of that. A second, independent path from the token count to a
+    /// byte count is exactly how the two came to disagree.
     pub fn copy_share(
         &mut self,
         layers: std::ops::Range<usize>,
         global_dense: &[&str],
         attention_bytes: u64,
         policy: super::budget::AdmissionPolicy,
-        prefill_tokens: usize,
     ) -> Result<(usize, usize, u64, u64)> {
         anyhow::ensure!(self.copied.is_none(), "the weight share was already copied");
 
@@ -1512,6 +1539,35 @@ impl PileSource {
             shapes.insert(name.clone(), shape);
         }
         let probe_secs = t_probe.elapsed().as_secs_f64();
+
+        // Write the routed experts down in MMA-FRAGMENT ORDER, or don't -- one
+        // decision, taken here, for the whole share.
+        //
+        // It belongs in this copy and nowhere else. The bytes have to be
+        // permuted somewhere, and every other candidate is worse: the PILE
+        // cannot carry the layout (the tensor blob header is dimensions only
+        // and `weight_nvfp4_2` is anchored on element format and rank, not byte
+        // order, so a permuted blob decodes cleanly and is silently misread --
+        // see the module header) and a separate device or host pass would be a
+        // second traversal of 70+ GiB. Here it is a change of DESTINATION INDEX
+        // inside a memcpy that already happens.
+        //
+        // All-or-nothing across the share, because the consumer's flag is a
+        // comptime one per kernel and a mixture would need it per expert. The
+        // shapes are the stacks', so this is 2-3 questions, not 9 216.
+        //
+        // WHAT IT COSTS, measured rather than argued. Nine `bench-decode.sh`
+        // reps at `INK_LAYERS=0:16` (66.50 GiB of share, 20 threads) on a DGX
+        // Spark GB10: `fetch+verify+copy` was 14.6 / 14.7 / 14.8 s permuting
+        // against 15.0 / 15.1 / 15.9 s not permuting -- the permuting arm is
+        // FASTER by the spread, which is to say the difference is nil. This
+        // pass runs at 4.4-4.5 GiB/s and is bound by the memory system, not by
+        // the address arithmetic, so re-indexing 256-byte blocks inside it is
+        // free. Per STARTUP, once, not per token.
+        let swz = super::moegroup::swizzle_weights()
+            && shapes
+                .values()
+                .all(|s| !s.nvfp4 || super::fp4gemm::swizzleable(s.rows, s.logical));
 
         let globals: std::collections::HashSet<&str> = global_dense.iter().copied().collect();
         for name in &globals {
@@ -1606,8 +1662,7 @@ impl PileSource {
         let available = mem_available_bytes()?;
         let machine = mem_total_bytes()?;
         let n_layers = layers.len();
-        let overhead =
-            run_overhead_bytes(n_layers, attention_bytes, machine, policy, prefill_tokens);
+        let overhead = run_overhead_bytes(n_layers, attention_bytes, machine, policy);
         // The arena, PLUS the weights the binding lane holds a second time in
         // the device pool. A correct comparison against a number that omits a
         // term is still wrong; see [`device_weight_bytes`].
@@ -1628,9 +1683,8 @@ impl PileSource {
                 acc += *bytes as u64;
                 acc_dev += per_layer_dev.get(layer).copied().unwrap_or(0);
                 let k = k + 1;
-                let fits_here = acc
-                    + acc_dev
-                    + run_overhead_bytes(k, attention_bytes, machine, policy, prefill_tokens);
+                let fits_here =
+                    acc + acc_dev + run_overhead_bytes(k, attention_bytes, machine, policy);
                 // The WHOLE requirement against both numbers, exactly as the
                 // gate above tests it. Comparing the bare share against
                 // `available` here is the same half-measurement that admitted
@@ -1906,7 +1960,36 @@ impl PileSource {
                                 }
                                 Job::Dense(name) => dense[*name].bytes.clone(),
                             };
-                            buf[start - base..end - base].copy_from_slice(&src);
+                            let dst = &mut buf[start - base..end - base];
+                            match job {
+                                // The permutation rides inside the copy. The
+                                // three planes keep their lengths and their
+                                // order within the payload, so every byte
+                                // offset the alias seam computes -- and the
+                                // `scale2` tail -- is exactly where it was.
+                                Job::Expert(_, shape) if swz && shape.nvfp4 => {
+                                    let elems = shape.rows * shape.logical;
+                                    let codes_len = elems / 2;
+                                    let scales_len = elems / NVFP4_BLOCK;
+                                    let (c, sc, _) = split_payload(&src, elems)?;
+                                    let (dc, rest) = dst.split_at_mut(codes_len);
+                                    let (dsc, dtail) = rest.split_at_mut(scales_len);
+                                    super::fp4gemm::swizzle_b_codes_into(
+                                        c,
+                                        dc,
+                                        shape.rows,
+                                        shape.logical,
+                                    );
+                                    super::fp4gemm::swizzle_b_scales_into(
+                                        sc,
+                                        dsc,
+                                        shape.rows,
+                                        shape.logical,
+                                    );
+                                    dtail.copy_from_slice(&src[codes_len + scales_len..]);
+                                }
+                                _ => dst.copy_from_slice(&src),
+                            }
                             release.release(&src);
                         }
                         Ok(())
@@ -1919,6 +2002,15 @@ impl PileSource {
             r?;
         }
         let copy_secs = t_copy.elapsed().as_secs_f64();
+        self.swizzled = swz;
+        println!(
+            "    startup copy: NVFP4 experts written in {} order",
+            if swz {
+                "MMA-FRAGMENT"
+            } else {
+                "row-major [n, k]"
+            }
+        );
         println!(
             "    startup copy: {} shape probe{} {:.1}s, fetch+verify+copy {:.1}s ({:.2} GiB/s, {threads} thread{})",
             shapes.len(),
@@ -2214,8 +2306,10 @@ mod tests {
         }
     }
 
+    /// SubSlices keeps its two-ladder-page charge; ExclusivePages is charged
+    /// the bucket ratio of the live set instead of the same device fraction.
     #[test]
-    fn admission_overhead_preserves_the_conservative_allocator_floor() {
+    fn the_allocator_charge_is_per_strategy_and_not_one_device_fraction() {
         let machine = 128 * GIB;
         let attention = 7 * GIB;
         let storage = (StorageDType::F32, StorageDType::F32, StorageDType::Bf16);
@@ -2229,13 +2323,13 @@ mod tests {
         );
         let base = GIB / 5 + 41 * GIB / 200 * 8 + 4 * GIB + attention;
         assert_eq!(
-            run_overhead_bytes(8, attention, machine, subslices, 16_384),
+            run_overhead_bytes(8, attention, machine, subslices),
             base + 40 * GIB
         );
-        assert_eq!(
-            run_overhead_bytes(8, attention, machine, exclusive, 16_384),
-            base + 40 * GIB
-        );
+        // 0.823 * 7 GiB, not 40: the ladder is the device's, the buckets are
+        // the workload's.
+        let excl = run_overhead_bytes(8, attention, machine, exclusive);
+        assert!(excl > base + 5 * GIB && excl < base + 6 * GIB, "{excl}");
     }
 
     /// The 2026-08-23 spark incident, in the numbers its own logs printed.

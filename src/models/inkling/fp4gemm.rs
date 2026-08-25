@@ -1278,12 +1278,30 @@ fn swz_word(c: usize, w: usize) -> usize {
 /// `((n_tile * k/64) + k_tile) * 256`, and inside it word `32 * i + lane` is
 /// exactly what lane `lane`'s load `i` reads. See [`swz_word`].
 pub fn swizzle_b_codes(src: &[u8], n: usize, k: usize) -> Vec<u8> {
+    let mut dst = vec![0u8; src.len()];
+    swizzle_b_codes_into(src, &mut dst, n, k);
+    dst
+}
+
+/// [`swizzle_b_codes`] writing into a caller-owned destination.
+///
+/// The form the LOAD PATH uses. `PileSource::copy_share` already memcpys every
+/// expert plane out of the pile mapping into the anonymous arena, so permuting
+/// there is a change of destination index inside a copy that already happens —
+/// the alternative, `swizzle_b_codes` followed by `copy_from_slice`, would
+/// allocate and touch the bytes a second time for nothing. `src` and `dst` must
+/// not overlap.
+pub fn swizzle_b_codes_into(src: &[u8], dst: &mut [u8], n: usize, k: usize) {
     assert_eq!(n % NTILE, 0, "n {n} is not a multiple of {NTILE}");
     assert_eq!(k % KTILE, 0, "k {k} is not a multiple of {KTILE}");
     assert_eq!(src.len(), n * k / 2, "codes are not [n, k/2]");
+    assert_eq!(
+        dst.len(),
+        src.len(),
+        "destination is not the source's length"
+    );
     let kt = k / KTILE;
     let row_w = k / 8; // 32-bit words in one weight row
-    let mut dst = vec![0u8; src.len()];
     for nt in 0..n / NTILE {
         for t in 0..kt {
             let blk = (nt * kt + t) * 256;
@@ -1296,7 +1314,6 @@ pub fn swizzle_b_codes(src: &[u8], n: usize, k: usize) -> Vec<u8> {
             }
         }
     }
-    dst
 }
 
 /// Permute `[n, k/16]` E4M3 block scales to match [`swizzle_b_codes`].
@@ -1312,15 +1329,27 @@ pub fn swizzle_b_codes(src: &[u8], n: usize, k: usize) -> Vec<u8> {
 /// still the same byte for the same 16 elements. Only where it is written
 /// moves, which is why the output is bit-identical rather than close.
 pub fn swizzle_b_scales(src: &[u8], n: usize, k: usize) -> Vec<u8> {
+    let mut dst = vec![0u8; src.len()];
+    swizzle_b_scales_into(src, &mut dst, n, k);
+    dst
+}
+
+/// [`swizzle_b_scales`] writing into a caller-owned destination; see
+/// [`swizzle_b_codes_into`] for why the load path wants this form.
+pub fn swizzle_b_scales_into(src: &[u8], dst: &mut [u8], n: usize, k: usize) {
     assert_eq!(n % NTILE, 0);
     assert_eq!(k % KTILE, 0);
     assert_eq!(src.len(), n * (k / GROUP), "scales are not [n, k/16]");
+    assert_eq!(
+        dst.len(),
+        src.len(),
+        "destination is not the source's length"
+    );
     let kt = k / KTILE;
     let spr = k / GROUP;
     // E4M3 scales one MMA consumes per weight row: `scales_count()`, which for
     // this instruction is `KTILE / GROUP`.
     let per = KTILE / GROUP;
-    let mut dst = vec![0u8; src.len()];
     for nt in 0..n / NTILE {
         for t in 0..kt {
             let blk = (nt * kt + t) * NTILE * per;
@@ -1330,7 +1359,93 @@ pub fn swizzle_b_scales(src: &[u8], n: usize, k: usize) -> Vec<u8> {
             }
         }
     }
-    dst
+}
+
+#[cfg(test)]
+mod swizzle_tests {
+    use super::*;
+
+    /// Every source byte lands somewhere, exactly once.
+    ///
+    /// The permutation's whole claim is that it MOVES bytes and drops none, so
+    /// the failure it has to exclude is a destination formula that collides —
+    /// which loses one byte and duplicates another, and which no bit-identity
+    /// check against a same-shaped output would call an error. Tested on a
+    /// non-square shape so a transposed `n`/`k` cannot pass.
+    #[test]
+    fn the_permutation_is_a_bijection_on_both_planes() {
+        let (n, k) = (16usize, 128usize);
+        let codes: Vec<u8> = (0..n * k / 2).map(|i| (i % 251) as u8).collect();
+        let mut seen = vec![false; codes.len()];
+        // Re-derive the destination of every source byte and mark it.
+        let kt = k / KTILE;
+        for nt in 0..n / NTILE {
+            for t in 0..kt {
+                for c in 0..NTILE {
+                    for w in 0..8 {
+                        let d = (nt * kt + t) * 256 + swz_word(c, w) * 4;
+                        for b in 0..4 {
+                            assert!(!seen[d + b], "destination {} written twice", d + b);
+                            seen[d + b] = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            seen.iter().all(|v| *v),
+            "some destination was never written"
+        );
+        // and the same byte multiset comes out
+        let mut a = swizzle_b_codes(&codes, n, k);
+        let mut b = codes.clone();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b);
+
+        let scales: Vec<u8> = (0..n * (k / GROUP)).map(|i| (i % 241) as u8).collect();
+        let mut a = swizzle_b_scales(&scales, n, k);
+        let mut b = scales.clone();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b);
+    }
+
+    /// The load path's form agrees with the allocating one, byte for byte.
+    ///
+    /// `PileSource::copy_share` uses `*_into` against a slice of the arena, so
+    /// the two must not be able to drift; this is the only place they meet.
+    #[test]
+    fn the_in_place_form_matches_the_allocating_one() {
+        let (n, k) = (24usize, 192usize);
+        let codes: Vec<u8> = (0..n * k / 2).map(|i| (i % 253) as u8).collect();
+        let scales: Vec<u8> = (0..n * (k / GROUP)).map(|i| (i % 239) as u8).collect();
+        let mut dc = vec![0u8; codes.len()];
+        let mut ds = vec![0u8; scales.len()];
+        swizzle_b_codes_into(&codes, &mut dc, n, k);
+        swizzle_b_scales_into(&scales, &mut ds, n, k);
+        assert_eq!(dc, swizzle_b_codes(&codes, n, k));
+        assert_eq!(ds, swizzle_b_scales(&scales, n, k));
+    }
+
+    /// The shapes the routed lane actually runs, and the ones it cannot.
+    #[test]
+    fn swizzleable_answers_for_the_shapes_that_tile() {
+        assert!(swizzleable(4096, 4096));
+        assert!(!swizzleable(4, 4096), "4 rows is half an n tile");
+        assert!(!swizzleable(4096, 32), "32 k elements is half a k tile");
+    }
+}
+
+/// Whether an `[n, k]` NVFP4 weight can be written down in fragment order.
+///
+/// The permutation is a re-indexing of whole `(n_tile, k_tile)` blocks, so it
+/// exists exactly when the matrix tiles: `NTILE` rows and `KTILE` k elements.
+/// Every shape the grouped lane accepts already satisfies this — the launcher
+/// asserts it — but the LOAD path runs before any launcher and has to answer
+/// for weights the run may never multiply, so it asks rather than assumes.
+pub fn swizzleable(n: usize, k: usize) -> bool {
+    n % NTILE == 0 && k % KTILE == 0
 }
 
 /// [`fp4_linear`] reading a B operand that is ALREADY in fragment order.
@@ -1383,6 +1498,102 @@ pub fn swizzle_b_scales(src: &[u8], n: usize, k: usize) -> Vec<u8> {
 /// The grouped lane is where they separate, because there the staged arm has a
 /// schedule to get right and this one does not; see
 /// [`super::moegroup::fp4_linear_grouped`]'s `swz` flag.
+///
+/// ## Wired, 2026-08-25 — and what that bought END TO END
+///
+/// The permutation is applied by [`super::pile::PileSource::copy_share`] (see
+/// [`swizzle_b_codes_into`]) and every routed-lane consumer reads it; this
+/// kernel is the per-expert FALLBACK lane's reader. So the 2x above is no
+/// longer a benchmark's property. What it is worth to a decode STEP, which
+/// nobody had measured, is a different question and the answer is: **at the
+/// single-row decode this repo benches, nothing.**
+///
+/// `scripts/bench-decode.sh -n 3 --layers 0:16 --gen 12`, DGX Spark GB10 /
+/// sm_121a, three arms in ONE worktree (`mary-swzload`) differing only by
+/// environment, interleaved, first two passes discarded, median over reps.
+/// PER DECODE STEP of a 16-layer range, ONE row wide:
+///
+/// ```text
+///   prompt          rowmajor   PRE-PERM   staged(smem,1 plane)   spread
+///   p256 (268 ctx)    48.2       47.8            47.4           0.6-1.0%
+///   cover (3744 ctx)  47.7       48.3            48.0           0.6-18%
+/// ```
+///
+/// +0.84% and -1.24%: both under the spread, i.e. not results. The reason is
+/// in the same runs' own breakdown and it is not a defect in the kernel — at
+/// this shape **the pass is HOST-ENQUEUE-BOUND**: 34.3 ms in the layer loop
+/// plus 4.7 ms after the sync against **3.9 ms blocked on the device**, of a
+/// 46 ms pass.
+///
+/// State that as a bound, because it is the useful form: **exposed device time
+/// is 3.9 ms, so the headroom for ANY device-side change at this configuration
+/// is at most 8% of the step**, whatever the change is and however large the
+/// kernel win. The 2.7-4 ms a step this work was scoped against sits at the
+/// very top of that bound — and it is not reachable here, because the exposed
+/// 3.9 ms is the tail nothing can overlap (the head's own 1.53 GiB unembed
+/// read runs last), not the routed lane, which is enqueued early and finishes
+/// under the host.
+///
+/// ## Where it DOES show: the WIDE pass
+///
+/// Same worktree, same three arms, `INK_SLOTS=32` on the 3732-token file,
+/// `INK_LAYERS=0:16`, `--gen 8`, gated (0% util, 208-227 MHz idle clocks, no
+/// compute process at the pre-run gate). That run has two regimes in one
+/// series and they must not be medianed together — 31 SLOT-PREFILL passes
+/// (one 116-token chunk each) and then 6 BATCHED-DECODE passes (32 rows).
+/// Per-rep medians, three reps:
+///
+/// ```text
+///                        rowmajor            PRE-PERM            staged(1)
+///   slot-prefill pass  282.4 281.9 280.4  275.7 273.0 272.8  291.4 289.3 292.9
+///   batched-decode     152.4 156.3 153.7  153.3 155.1 156.2  154.3 160.1 154.3
+/// ```
+///
+/// On the WIDE pass the arms do not overlap: **281.9 -> 273.0 ms, -3.2% a
+/// pass**, against a within-arm spread of 0.7% and 1.1%, and staging is
+/// consistently WORSE at +3.4% — which is the prefill column of this module's
+/// probe table showing up end to end, where `staged` at one plane collapses.
+/// On the batched-decode pass all three overlap, and the same breakdown says
+/// why: `DEVICE, one sync` is **0.5-1.4 ms of a 153 ms pass** there, with 93.7
+/// ms of the host's mlp half spent enqueueing.
+///
+/// So the honest end-to-end summary is one line: **the permutation is worth
+/// ~3% on a pass wide enough to have device work exposed, and nothing on a
+/// pass this runtime spends enqueueing.** Token output was identical in every
+/// arm of both runs — 9 reps at 32 slots share one digest over every emitted
+/// token of every slot, and every printed top-5 logit agrees to the printed
+/// two decimals. That is an observation, not a gate; nothing in this lane
+/// tests for it.
+///
+/// That does not refute the 2x; it locates it. The routed lane is not grid-
+/// starved at decode either — one stage launches `n / NTILE = 512` cubes over
+/// `blocks` = the active-expert count with `nrep = 1`, i.e. ~3072 working
+/// warps, well past the ~1150-cube knee where this part's achieved rate is
+/// still climbing. The regime the routed GEMM dominates is the BATCHED one
+/// this module's header measures — `INK_SLOTS=32`, where `fp4_linear_grouped`
+/// is 52.7% of GPU time and the head's GPU is busy 93% of the time it is not
+/// blocked. A single-row decode of sixteen layers reads 1.31 GiB of expert
+/// weight a pass, which is ~13 ms of device time hidden under 39 ms of host
+/// enqueue.
+///
+/// ## What is NOT permuted, and why it is not an oversight
+///
+/// The head. `head_lane()` is `W4a16` with no switch, so the unembedding is
+/// multiplied by [`super::w4a16gemm::w4a16_linear`] — `MTILE 16, NTILE 8,
+/// KTILE 16`, `MmaDefinition::new`, i.e. **`m16n8k16` with a BF16 activation**,
+/// against this file's `m16n8k64` `new_scaled`. [`swz_word`] was derived from
+/// `position_of_nth(.., MatrixIdent::B)` for the second of those and describes
+/// only it; the W4A16 B fragment is a different map and there is no
+/// `w4a16_linear_swz` to read one. So permuting `quantized_bf16`'s output
+/// would need its own derivation and its own device check against
+/// `fp4_frag_b_map`'s W4A16 twin, which does not exist yet. That is a separate
+/// piece of work, not a line of wiring — and it is where the remaining win is,
+/// since the head's 25128-cube launch is the one shape already at both its
+/// grid ceiling and its access-pattern ceiling.
+///
+/// The output is identical: 18 reps across three arms and two prompts emitted
+/// the SAME 13 tokens each, and `gemm_grid_parity` reproduces pristine main's
+/// digests in all 20 cells.
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 pub fn fp4_linear_swz<AB: Scalar, S: Scalar, NA: Size, NC: Size>(
