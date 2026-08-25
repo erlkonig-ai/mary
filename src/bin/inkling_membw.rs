@@ -657,12 +657,19 @@ fn run_axes() -> Result<()> {
 
     // ---- rows 7-9: the GEMM's own B footprint ------------------------------
     let threads0 = n * 4; // 32 lanes per n tile of 8 rows
-    for (label, mode, with_sc, ut) in [
-        ("7  m16n8k64 B footprint, codes only", 0u32, false, 1usize),
+    for (label, mode, with_sc, ut, tpw) in [
+        (
+            "7  m16n8k64 B footprint, codes only",
+            0u32,
+            false,
+            1usize,
+            1usize,
+        ),
         (
             "8  m16n8k64 B footprint + row-major scales",
             1u32,
             true,
+            1usize,
             1usize,
         ),
         (
@@ -670,12 +677,66 @@ fn run_axes() -> Result<()> {
             2u32,
             true,
             1usize,
+            1usize,
         ),
-        ("10 row 8, 2 k tiles per iteration", 1u32, true, 2usize),
-        ("11 row 8, 4 k tiles per iteration", 1u32, true, 4usize),
-        ("12 row 8, 8 k tiles per iteration", 1u32, true, 8usize),
-        ("13 row 9, 8 k tiles per iteration", 2u32, true, 8usize),
-        ("14 row 7, 8 k tiles per iteration", 0u32, false, 8usize),
+        (
+            "10 row 8, 2 k tiles per iteration",
+            1u32,
+            true,
+            2usize,
+            1usize,
+        ),
+        (
+            "11 row 8, 4 k tiles per iteration",
+            1u32,
+            true,
+            4usize,
+            1usize,
+        ),
+        (
+            "12 row 8, 8 k tiles per iteration",
+            1u32,
+            true,
+            8usize,
+            1usize,
+        ),
+        (
+            "13 row 9, 8 k tiles per iteration",
+            2u32,
+            true,
+            8usize,
+            1usize,
+        ),
+        (
+            "14 row 7, 8 k tiles per iteration",
+            0u32,
+            false,
+            8usize,
+            1usize,
+        ),
+        (
+            "16 row 8, 2 n tiles per plane (half the planes)",
+            1u32,
+            true,
+            1usize,
+            2usize,
+        ),
+        ("17 row 8, 4 n tiles per plane", 1u32, true, 1usize, 4usize),
+        ("18 row 8, 8 n tiles per plane", 1u32, true, 1usize, 8usize),
+        (
+            "19 row 8, 16 n tiles per plane",
+            1u32,
+            true,
+            1usize,
+            16usize,
+        ),
+        (
+            "20 row 7, 16 n tiles per plane",
+            0u32,
+            false,
+            1usize,
+            16usize,
+        ),
     ] {
         let threads = threads0 / tpw;
         let blocks = (threads as u32).div_ceil(BLOCK);
