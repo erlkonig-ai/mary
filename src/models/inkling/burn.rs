@@ -3042,8 +3042,17 @@ mod tests {
             "\ndecode, one global layer, GB10, INK_FLASH={}, NVFP4 KV",
             if flash_lane() { 1 } else { 0 }
         );
-        println!("  context       ms");
-        for context in [4096usize, 16_384, 65_536, 262_144] {
+        println!("  context   window       ms");
+        for (context, window) in [
+            (4096usize, None),
+            (16_384, None),
+            (65_536, None),
+            (262_144, None),
+            // A LOCAL layer, which is thirty-five of the forty-two: the window
+            // trims the cache to its last 512 keys on the first step, so what
+            // this row measures is a 512-key read whatever `context` says.
+            (16_384, Some(512usize)),
+        ] {
             let fill_store = || {
                 let mut st = KvStore::<Bk>::new(kv_w, burn::tensor::DType::BF16);
                 let mut done = 0usize;
@@ -3074,19 +3083,23 @@ mod tests {
             // Two warm steps, then five timed. The first compiles; the second
             // pays for a page boundary if the first crossed one.
             for i in 0..2 {
-                let o = attention_step(x.clone(), &w, &d, ls, context + i, None, &mut cache);
+                let o = attention_step(x.clone(), &w, &d, ls, context + i, window, &mut cache);
                 core::hint::black_box(&o);
             }
             barrier(&client);
             let iters = 5usize;
             let t0 = std::time::Instant::now();
             for i in 0..iters {
-                let o = attention_step(x.clone(), &w, &d, ls, context + 2 + i, None, &mut cache);
+                let o = attention_step(x.clone(), &w, &d, ls, context + 2 + i, window, &mut cache);
                 core::hint::black_box(&o);
             }
             barrier(&client);
             let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
-            println!("  {context:>7}  {ms:>7.2}");
+            let wl = match window {
+                Some(n) => n.to_string(),
+                None => "-".to_string(),
+            };
+            println!("  {context:>7}  {wl:>7}  {ms:>7.2}");
         }
     }
 

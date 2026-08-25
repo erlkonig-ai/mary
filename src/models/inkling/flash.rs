@@ -607,9 +607,12 @@ const TARGET_CUBES: usize = 1024;
 
 /// The fewest keys worth giving a split.
 ///
-/// Below this the per-split fixed cost — the query tile load, the partial
-/// write, and the combine's extra column — outweighs the parallelism.
-const MIN_KEYS_PER_SPLIT: usize = 512;
+/// Four key tiles. Below that the per-split fixed cost — the query tile load,
+/// the partial write, and the combine's extra column — outweighs the
+/// parallelism. It matters most at the SHORT end: a local layer's decode step
+/// reads a 512-key window, and at 512 keys a split floor of 512 would give the
+/// whole layer eight cubes.
+const MIN_KEYS_PER_SPLIT: usize = 128;
 
 /// Whether a layer's shape is one this kernel handles.
 ///
