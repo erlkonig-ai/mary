@@ -402,8 +402,8 @@ pub struct AttnWeightsDev {
 /// position and every distance must be computed through `base`.
 #[derive(Clone)]
 pub struct AttnCache<B: Backend> {
-    k: Tensor<B, 2>,
-    v: Tensor<B, 2>,
+    k: super::kvpages::PageStore<B>,
+    v: super::kvpages::PageStore<B>,
     k_pre: Tensor<B, 2>,
     v_pre: Tensor<B, 2>,
     base: usize,
@@ -433,7 +433,7 @@ impl<B: Backend> AttnCache<B> {
     /// Keys retained — *not* the sequence length, because a windowed layer
     /// forgets.
     pub fn len(&self) -> usize {
-        self.k.dims()[0]
+        self.k.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -466,10 +466,10 @@ impl<B: Backend> AttnCache<B> {
             assert!(keep <= p.rows, "kept {keep} of a {}-row batch", p.rows);
             let drop = p.rows - keep;
             if drop > 0 {
-                let [len, dim] = self.k.dims();
-                self.k = self.k.clone().slice([0..len - drop, 0..dim]);
-                let [vlen, vdim] = self.v.dims();
-                self.v = self.v.clone().slice([0..vlen - drop, 0..vdim]);
+                let keep_k = self.k.len() - drop;
+                self.k.truncate(keep_k);
+                let keep_v = self.v.len() - drop;
+                self.v.truncate(keep_v);
             }
             // `k_pre` holds `kernel - 1` history rows followed by the batch's
             // own pre-convolution projections, so the history ending at the
@@ -493,13 +493,13 @@ impl<B: Backend> AttnCache<B> {
 /// correct, and quadratic in a layer that was chosen to be linear.
 fn trim<B: Backend>(c: &mut AttnCache<B>, window: Option<usize>) {
     let Some(w) = window else { return };
-    let [len, dim] = c.k.dims();
+    let len = c.k.len();
     if len <= w {
         return;
     }
     let drop = len - w;
-    c.k = c.k.clone().slice([drop..len, 0..dim]);
-    c.v = c.v.clone().slice([drop..len, 0..dim]);
+    c.k.drop_front(drop);
+    c.v.drop_front(drop);
     c.base += drop;
 }
 
@@ -823,9 +823,21 @@ fn attention_prefill_lane(
         }
     };
 
+    // The prefill's whole K and V go in as one append, so the store cuts them
+    // into pages once rather than growing a page at a time.
+    let (mut ks, mut vs) = {
+        let kk = as_kv(k);
+        let vv = as_kv(v);
+        let mut ks = super::kvpages::PageStore::new(kk.dims()[1]);
+        let mut vs = super::kvpages::PageStore::new(vv.dims()[1]);
+        ks.append(kk);
+        vs.append(vv);
+        (ks, vs)
+    };
+    let _ = (&mut ks, &mut vs);
     let mut cache = AttnCache {
-        k: as_kv(k),
-        v: as_kv(v),
+        k: ks,
+        v: vs,
         k_pre: conv_history(k_pre, d.kernel),
         v_pre: conv_history(v_pre, d.kernel),
         base: 0,
@@ -1115,8 +1127,8 @@ pub fn attention_step(
     let q = head_rms_norm(q, w.q_norm.clone(), heads, head_dim, d.rms_eps);
     let k_new = head_rms_norm(k_new, w.k_norm.clone(), kv_heads, head_dim, d.rms_eps);
 
-    cache.k = Tensor::cat(vec![cache.k.clone(), as_kv(k_new)], 0);
-    cache.v = Tensor::cat(vec![cache.v.clone(), as_kv(v_new)], 0);
+    cache.k.append(as_kv(k_new));
+    cache.v.append(as_kv(v_new));
     trim(cache, window);
     let len = cache.len();
     let base = cache.base;
@@ -1215,8 +1227,8 @@ pub fn attention_step(
         let dim = t.dims()[1];
         Tensor::cat(vec![t, as_kv(Tensor::zeros([padded - len, dim], &dev))], 0)
     };
-    let kh = expand(pad_rows(cache.k.clone()));
-    let vh = expand(pad_rows(cache.v.clone()));
+    let kh = expand(pad_rows(cache.k.materialize(&dev)));
+    let vh = expand(pad_rows(cache.v.materialize(&dev)));
 
     // Narrow on both sides of each product and wide again immediately after, so
     // the bias, the mask and the softmax are the same arithmetic the f32 lane
@@ -1304,8 +1316,8 @@ pub fn attention_steps(
     let q = head_rms_norm(q, w.q_norm.clone(), heads, head_dim, d.rms_eps);
     let k_new = head_rms_norm(k_new, w.k_norm.clone(), kv_heads, head_dim, d.rms_eps);
 
-    cache.k = Tensor::cat(vec![cache.k.clone(), as_kv(k_new)], 0);
-    cache.v = Tensor::cat(vec![cache.v.clone(), as_kv(v_new)], 0);
+    cache.k.append(as_kv(k_new));
+    cache.v.append(as_kv(v_new));
     cache.k_pre = k_all.clone().slice([rows..rows + hist, 0..kdim]);
     cache.v_pre = v_all.clone().slice([rows..rows + hist, 0..vdim]);
     cache.pending = Some(Pending {
@@ -1395,8 +1407,8 @@ pub fn attention_steps(
         let dim = t.dims()[1];
         Tensor::cat(vec![t, as_kv(Tensor::zeros([padded - len, dim], &dev))], 0)
     };
-    let kh = expand(pad_rows(cache.k.clone()));
-    let vh = expand(pad_rows(cache.v.clone()));
+    let kh = expand(pad_rows(cache.k.materialize(&dev)));
+    let vh = expand(pad_rows(cache.v.materialize(&dev)));
 
     let scores =
         from_kv(as_kv(qh).matmul(kh.swap_dims(1, 2))).mul_scalar(d.scaling()) + bias + wmask;
@@ -1640,7 +1652,9 @@ impl SlotCache<Bk> {
         let base = first.base();
         let kernel_hist = first.k_pre.dims()[0];
         let kv_width = kv_heads * head_dim;
-        let dev = first.k.device();
+        // `k_pre` rather than `k`: same cache, same device, and it is still a
+        // plain tensor now that K and V are paged.
+        let dev = first.k_pre.device();
         let rows = slots * kv_heads;
         let rec = recent_rows();
         let kcap = (len + 1).next_multiple_of(kv_pad_bucket());
@@ -1692,11 +1706,11 @@ impl SlotCache<Bk> {
             (self.kv_heads, self.head_dim, self.kcap, self.frozen);
         let kv_width = kv_heads * head_dim;
         assert_eq!(
-            c.k.dims()[1],
+            c.k.width(),
             kv_width,
             "slot {s} was built at a different layer shape"
         );
-        let dev = c.k.device();
+        let dev = c.k_pre.device();
         let kernel_hist = c.k_pre.dims()[0];
 
         // `[len, kv_heads * head_dim]` -> `[kv_heads, kcap, head_dim]`. Every
@@ -1720,9 +1734,15 @@ impl SlotCache<Bk> {
         };
         let r0 = s * kv_heads;
         let k = take3(&mut self.k, &dev);
-        self.k = k.slice_assign([r0..r0 + kv_heads, 0..kcap, 0..head_dim], headwise(c.k));
+        self.k = k.slice_assign(
+            [r0..r0 + kv_heads, 0..kcap, 0..head_dim],
+            headwise(c.k.materialize(&dev)),
+        );
         let v = take3(&mut self.v, &dev);
-        self.v = v.slice_assign([r0..r0 + kv_heads, 0..kcap, 0..head_dim], headwise(c.v));
+        self.v = v.slice_assign(
+            [r0..r0 + kv_heads, 0..kcap, 0..head_dim],
+            headwise(c.v.materialize(&dev)),
+        );
         seat_row3(
             &mut self.k_pre,
             s,

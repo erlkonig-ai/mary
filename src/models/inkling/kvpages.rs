@@ -77,6 +77,20 @@ impl<B: Backend> PageStore<B> {
         self.head + self.len
     }
 
+    /// Columns per row, fixed at construction.
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    /// The device the pages live on, or `None` while the store is empty.
+    ///
+    /// Empty is a real state — a fresh cache, or one a rejection emptied — and
+    /// a store with no pages has no device to report, so the caller says what
+    /// to do rather than being handed a default that might be the wrong GPU.
+    pub fn device(&self) -> Option<B::Device> {
+        self.pages.first().map(|p| p.device())
+    }
+
     /// Append `rows`, filling the last partial page before starting a new one.
     ///
     /// Takes the whole batch at once rather than row by row: a speculative
