@@ -1011,48 +1011,72 @@ fn lane_cache(shape: (usize, usize, usize), set: Option<Lane>) -> Option<Lane> {
 
 // ## What it found, and what that is worth
 //
-// `inkling_gemm_autotune_gate 2,3,4,5,8 --core`, DGX Spark GB10, commits
-// b23e582 and 75bd251, 2026-08-25. Per shape and width: which lane the static
-// walk takes, and which lane a timed walk takes. The three shapes are the ones
-// that dominate a pass; the widths are the verify band.
+// `inkling_gemm_autotune_gate 2,3,4,5,8 --core`, DGX Spark GB10, 2026-08-25.
+// Per shape and width: which lane the static walk takes, which lane a timed
+// walk takes. Three shapes that dominate a pass, the five verify widths.
 //
-// FRAMING: these are per-GEMM ISOLATED timings, in microseconds per call, on a
-// looped weight, with the box otherwise free of GPU compute but carrying other
-// agents' build load. They rank lanes. They are NOT a throughput claim and
-// nothing here says a pass gets faster.
+// FRAMING: per-GEMM ISOLATED timings, microseconds per call, on a looped
+// weight, on a box with no other GPU compute but other agents' build load.
+// They rank lanes at one shape. They are NOT a throughput claim, and nothing
+// below says a pass gets faster.
 //
-//     run 1 (rounds 4)        12 of 15 shape/width pairs disagree
-//     run 2 (rounds 6)        15 of 15
+//     run   rotation  iters  disagreeing pairs   spread of the deltas
+//       1   no            2      12 of 15            10% .. 66%
+//       2   no            2      15 of 15            12% .. 67%
+//       4   YES           8      10 of 15             4% .. 52%
+//       5   YES           8       6 of 15             4% .. 14%
 //
-// In both runs the static head -- `ordered double mma pk4` -- was the pick the
-// timer rejected, at every shape, by 10% to 67%. In neither run was the WINNER
-// stable: run 1 and run 2 name different lanes for the same shape and width,
-// and the winners cluster inside a few percent of each other while the head
-// sits well outside. Read that as one finding and not two: the ORDER's head is
-// wrong for these shapes in isolation, and WHICH lane should replace it is
-// below this instrument's resolution.
+// Runs 1 and 2 said the static head is wrong everywhere by a wide margin. Runs
+// 4 and 5 are the same code as each other and say something much weaker. The
+// difference between the two pairs is not the GEMMs, it is TWO INSTRUMENT
+// BIASES that runs 1 and 2 contained:
 //
-// Two live explanations, and this instrument cannot separate them:
+//   * Fixed position. The head of the list was always the first candidate
+//     timed in a round, and this part idles at 208 MHz and ramps to 2411 --
+//     first-in-round is a seat, not a coincidence. Rotating removed it.
+//   * A sync divided by two. The timed region ends in a sync whose cost is
+//     charged to whatever it closes; over two iterations that overhead sits
+//     inside the 45-350 us these GEMMs take. Over eight it does not.
 //
-//   * The L2 hazard above. A looped weight favours whatever streams best from
-//     cache, and `pk4` partitions k four ways -- a shape whose whole argument
-//     is about how the k-loop meets memory.
-//   * `PREFERENCE_NARROW`'s own end-to-end table, which measured the `pk4` head
-//     BEST at w = 2, 3 and 5 (101.0 / 102.0 / 116.3 ms against 109.2 / 115.8 /
-//     125.8 for the list as written). A lane that loses alone and wins in a
-//     pass is exactly the case that doc predicted: "a GEMM timed alone is a
-//     GEMM that had the whole device, and four of a layer's projections are
-//     independent and overlap."
+// Neither bias was visible in runs 1 and 2. Both produced a large, consistent,
+// entirely quotable effect. That is the whole reason this file now carries a
+// plausibility guard, a margin, and a doc paragraph instead of a lane swap.
 //
-// The second explanation is the one the repo already has evidence for, so the
-// honest reading of a CHANGED row is "the isolated timer disagrees with the
-// order", not "the order is wrong". That is why the default is off, why the
-// margin exists, and why the arbiter is `scripts/bench-decode.sh`.
+// ## Run 4 against run 5: the same code, twice
 //
-// One confound WAS found and removed rather than argued about: in runs 1 and 2
-// the static head was always the FIRST candidate timed in each round, and this
-// part idles at 208 MHz and ramps to 2411 MHz -- so first-in-round is a seat,
-// not a coincidence. The tune now rotates the start every round (75bd251).
+// The honest reading is the INTERSECTION, because 4 and 5 are replicates:
+//
+//     shape            m   run 4 pick               run 5 pick
+//     attn wq          5   ordered double mma       double hybrid mma
+//     attn wq          8   double hybrid mma        double tma mma spec
+//     shared gate+up   8   double hybrid mma        specialized cyclic cmma
+//     shared down      4   double hybrid mma        specialized cyclic cmma
+//     shared down      5   ordered double mma       specialized cyclic cmma
+//     shared down      8   specialized cyclic cmma  specialized cyclic cmma
+//
+// Six of fifteen pairs disagree with the static order in BOTH runs. In ONE of
+// those six do the two runs name the same replacement. So:
+//
+//   * That the static head is not the timed winner at some verify widths
+//     reproduces -- `shared down` at m = 4, 5, 8 and `attn wq` at m = 5, 8.
+//   * WHICH lane should replace it does not reproduce at all. The challengers
+//     are within a few percent of each other and of the run-to-run noise,
+//     which is precisely what `PREFERENCE_NARROW`'s doc recorded about the
+//     previous tuner: "in isolation the lanes come out within a percent of
+//     each other and the pass says otherwise".
+//   * The margins that survive are 4% to 14%, against 10% to 67% before the
+//     instrument was fixed. An effect that shrinks fivefold when you correct
+//     the timer is mostly timer.
+//
+// So a CHANGED row means "the isolated timer disagrees with the order here",
+// not "the order is wrong here". `PREFERENCE_NARROW`'s end-to-end table
+// measured the `pk4` head BEST at w = 2, 3 and 5 (101.0 / 102.0 / 116.3 ms
+// against 109.2 / 115.8 / 125.8 for the list as written), and a lane that
+// loses alone and wins in a pass is exactly what that doc predicted: "a GEMM
+// timed alone is a GEMM that had the whole device, and four of a layer's
+// projections are independent and overlap." Nothing here refutes that table.
+// The arbiter is `scripts/bench-decode.sh` with an `INK_GEMM_AUTOTUNE=1` arm
+// against a bare one, and until that runs this feature stays off.
 
 /// What `INK_GEMM_AUTOTUNE` turns on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
