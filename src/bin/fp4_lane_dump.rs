@@ -92,9 +92,9 @@ fn main() {
         let ab: Vec<u8> = (0..cm * ck)
             .flat_map(|i| half::bf16::from_f32((i % 13) as f32 * 0.25 - 1.5).to_le_bytes())
             .collect();
-        let ha = client.create(&ab);
-        let hb = client.create(&wb);
-        let hs = client.create(&sb);
+        let ha = client.create_from_slice(&ab);
+        let hb = client.create_from_slice(&wb);
+        let hs = client.create_from_slice(&sb);
         let o1 = w4a16_linear_launch::<Rt>(&client, &ha, &hb, &hs, cm, ck, cn, 0.75);
         let o2 = w4a16_linear_wide_launch::<Rt>(&client, &ha, &hb, &hs, cm, ck, cn, 0.75);
         let r1 = client.read_one(o1).unwrap();
