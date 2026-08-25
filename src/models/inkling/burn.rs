@@ -2980,8 +2980,14 @@ mod tests {
             };
             println!(
                 "  cache k {:.2e}  v {:.2e}  k_pre {:.2e}  v_pre {:.2e}",
-                rel2(c2.k.clone(), c1.k.clone()),
-                rel2(c2.v.clone(), c1.v.clone()),
+                rel2(
+                    c2.k.materialize(&c2.k_pre.device()),
+                    c1.k.materialize(&c1.k_pre.device())
+                ),
+                rel2(
+                    c2.v.materialize(&c2.v_pre.device()),
+                    c1.v.materialize(&c1.v_pre.device())
+                ),
                 rel2(c2.k_pre.clone(), c1.k_pre.clone()),
                 rel2(c2.v_pre.clone(), c1.v_pre.clone()),
             );
