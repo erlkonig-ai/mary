@@ -3594,12 +3594,32 @@ impl PlanArm {
     /// `INK_DEV_PLAN`: unset or `0` is the host lane, `1`/`on` the device one,
     /// `ab:<r>` the interleave.
     ///
-    /// Default OFF, unlike `INK_DEV_ROUTE`: this lane is newer than its
-    /// measurement and the arm that has run for months is the one a run that
-    /// says nothing should get.
+    /// **Default ON as of 2026-08-25.** It was off on the rule that "this lane
+    /// is newer than its measurement, and the arm that has run for months is
+    /// the one a run that says nothing should get". It now HAS its
+    /// measurement, so the rule points the other way.
+    ///
+    /// spark-zt (GB10), cached decode lane (one row a step), `INK_LAYERS=0:16`,
+    /// 3732-token cover, `INK_GEN=12`, first two passes of each rep discarded,
+    /// arms INTERLEAVED, median over reps:
+    ///
+    /// * **5 of 5** interleaved pairs favour it, by 2.8-5.5 ms
+    /// * 59.8 -> 55.2 ms a step, **+8.33%**, against base's own 4.3% spread
+    /// * it HALVES the spread, to 1.6%, because the sync it removes is the
+    ///   jittery part -- corroboration independent of the median
+    /// * token stream IDENTICAL: one md5 over all twelve steps, eight runs of
+    ///   each arm across two rounds, no fault flag in any run
+    ///
+    /// What it removes is 3.5 ms of true serialisation, and that figure is
+    /// bounded rather than inferred: `INK_ROUTE_STALE=1` (a probe) and this
+    /// lane remove the read by different means and land on the SAME 54.5 ms a
+    /// step. Their agreeing is the result -- there is nothing further in the
+    /// router. The `router + group` bracket is 84% genuine GPU work waited on,
+    /// not stall, which is why a bracket that reads as 41% of the wall step is
+    /// worth 3.5 ms and not 24.
     fn from_env() -> Result<PlanArm> {
         match std::env::var("INK_DEV_PLAN") {
-            Err(_) => Ok(PlanArm::Host),
+            Err(_) => Ok(PlanArm::Dev),
             Ok(v) if v == "0" => Ok(PlanArm::Host),
             Ok(v) if v == "1" || v == "on" => Ok(PlanArm::Dev),
             Ok(v) => match v.strip_prefix("ab:").and_then(|r| r.parse::<usize>().ok()) {
