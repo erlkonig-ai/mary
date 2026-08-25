@@ -2993,10 +2993,13 @@ mod tests {
                 burn::tensor::Distribution::Uniform(-1.0, 1.0),
                 &dev,
             );
-            // One warm run: the first call at a shape compiles kernels and
-            // resolves autotune, and neither is what this measures.
-            let (_, c) = attention_prefill(xs.clone(), &w, &d, ls, None, None);
-            drop(c);
+            // Two warm runs: the first call at a shape compiles kernels and
+            // resolves autotune, and the first call at ANY shape also pays for
+            // the pool growing under it. Neither is what this measures.
+            for _ in 0..2 {
+                let (o, c) = attention_prefill(xs.clone(), &w, &d, ls, None, None);
+                drop((o, c));
+            }
             barrier(&client);
             let t0 = std::time::Instant::now();
             let (out, c) = attention_prefill(xs, &w, &d, ls, None, None);
@@ -3080,21 +3083,32 @@ mod tests {
                 burn::tensor::Distribution::Uniform(-1.0, 1.0),
                 &dev,
             );
-            // Two warm steps, then five timed. The first compiles; the second
-            // pays for a page boundary if the first crossed one.
-            for i in 0..2 {
-                let o = attention_step(x.clone(), &w, &d, ls, context + i, window, &mut cache);
-                core::hint::black_box(&o);
+            // Warm, then time, then WARM AND TIME AGAIN, and report the
+            // second. Two warm steps at the head are not enough: the first
+            // context in the loop pays for the pool growing under it as well
+            // as for compilation, and it showed — 4,096 measured 3.6 ms as the
+            // first row and 1.1 ms as the last, on both arms. Timing the same
+            // context twice inside one run is what distinguishes "this length
+            // is slow" from "this row was first".
+            let mut ms = 0f64;
+            let mut at = context;
+            for _ in 0..2 {
+                for _ in 0..2 {
+                    let o = attention_step(x.clone(), &w, &d, ls, at, window, &mut cache);
+                    core::hint::black_box(&o);
+                    at += 1;
+                }
+                barrier(&client);
+                let iters = 5usize;
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters {
+                    let o = attention_step(x.clone(), &w, &d, ls, at, window, &mut cache);
+                    core::hint::black_box(&o);
+                    at += 1;
+                }
+                barrier(&client);
+                ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
             }
-            barrier(&client);
-            let iters = 5usize;
-            let t0 = std::time::Instant::now();
-            for i in 0..iters {
-                let o = attention_step(x.clone(), &w, &d, ls, context + 2 + i, window, &mut cache);
-                core::hint::black_box(&o);
-            }
-            barrier(&client);
-            let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
             let wl = match window {
                 Some(n) => n.to_string(),
                 None => "-".to_string(),
