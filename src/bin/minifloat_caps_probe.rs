@@ -20,6 +20,7 @@
 //!
 //! Read-only, one 8-byte buffer, no sweeps: safe on a contended box.
 
+use cubecl::ir::TypeUsage;
 use cubecl::prelude::*;
 use cubecl::{e2m1, e2m1x2, e2m3, e3m2, e4m3, e5m2, ue8m0};
 
@@ -42,10 +43,10 @@ fn uses<T: CubePrimitive>(name: &str, client: &cubecl::client::ComputeClient<Rt>
     let mut named: Vec<&str> = Vec::new();
     for use_ in set.iter() {
         named.push(match use_ {
-            cubecl::ir::TypeUsage::Conversion => "Conversion",
-            cubecl::ir::TypeUsage::Arithmetic => "Arithmetic",
-            cubecl::ir::TypeUsage::DotProduct => "DotProduct",
-            cubecl::ir::TypeUsage::Buffer => "Buffer",
+            TypeUsage::Conversion => "Conversion",
+            TypeUsage::Arithmetic => "Arithmetic",
+            TypeUsage::DotProduct => "DotProduct",
+            TypeUsage::Buffer => "Buffer",
         });
     }
     if named.is_empty() {
@@ -77,18 +78,18 @@ fn main() {
     // nearer 0.5. Both answers are round-to-nearest, so a wrong lowering (a
     // truncating emulation, say) shows up immediately.
     let input: [f32; 2] = [1.3, -0.4];
-    let x = client.create(f32::as_bytes(&input));
+    let x = client.create_from_slice(f32::as_bytes(&input));
     let out = client.empty(2 * core::mem::size_of::<f32>());
     unsafe {
         e2m1_roundtrip::launch_unchecked::<Rt>(
             &client,
             CubeCount::new_1d(1),
             CubeDim::new_1d(1),
-            ArrayArg::from_raw_parts::<f32>(&x, 2, 1),
-            ArrayArg::from_raw_parts::<f32>(&out, 2, 1),
+            ArrayArg::from_raw_parts(x.clone(), 2),
+            ArrayArg::from_raw_parts(out.clone(), 2),
         );
     }
-    let bytes = client.read_one(out.binding());
+    let bytes = client.read_one(out).expect("read the round-tripped pair");
     let got = f32::from_bytes(&bytes);
     println!("\nexecuted f32 -> e2m1 -> f32");
     println!("  1.3  -> {}   (round-to-nearest E2M1 is 1.5)", got[0]);
