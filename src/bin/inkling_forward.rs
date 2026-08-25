@@ -5990,10 +5990,17 @@ fn main() -> Result<()> {
                 // that 20 ms reappears as attention-half ENQUEUE (11.6 -> 22.8 ms,
                 // back-pressure, not work) and at the one sync (1.3 -> 5.4).
                 //
-                // `INK_DEV_PLAN=1` emitted a token stream identical to base --
-                // same md5 over all twelve steps, all three reps -- and raised no
-                // fault flag, and its rep-to-rep spread is 0.4% against base's
-                // 5.5%, because the removed sync is the jittery part.
+                // A second run the same day, base against `INK_DEV_PLAN=1` alone
+                // and five reps interleaved, is the decision-grade one: 59.8 ->
+                // 55.2 ms/step median, +8.33%, and all FIVE pairs favour the
+                // device plan by 2.8-5.5 ms, which is the part a median cannot
+                // say. Base's spread is 4.3%, the device plan's 1.6% -- the
+                // removed sync is the jittery part.
+                //
+                // `INK_DEV_PLAN=1` emitted a token stream identical to base in
+                // every one of those runs -- one md5 over all twelve steps, eight
+                // runs of each arm across the two rounds -- and raised no fault
+                // flag in any of them.
                 let rows = t.n_routed_experts + t.n_shared_experts;
                 let t_rt = Instant::now();
                 // `cols` is what comes BACK, which is `rows` except on the BF16 arm,
