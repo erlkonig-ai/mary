@@ -2984,8 +2984,20 @@ mod tests {
     /// The tests above hold the slot lane to the UNCACHED lane, which is the
     /// right oracle for "did the cache work" and a loose one — the two build
     /// their scores differently. This one holds it to the lane it is a batch
-    /// of, where the only difference is a leading dimension of size one, so the
-    /// bar is rounding rather than tolerance.
+    /// of, where the only difference is a leading dimension of size one.
+    ///
+    /// That used to be read as "so the bar is rounding rather than tolerance",
+    /// and the bar was 1e-5. A leading dimension of size one is not nothing: it
+    /// is the `m` of the score matmul, so the two lanes key DIFFERENT autotune
+    /// entries and can win different kernels, which is the same mechanism
+    /// [`CACHE_TOLERANCE`] documents. Measured 1.97e-3 in one autotune state
+    /// and under 1e-5 in three others, same binary.
+    ///
+    /// 1e-2 is five times the worst of those and still five times tighter than
+    /// [`CACHE_TOLERANCE`], which is the point of keeping it separate: both
+    /// lanes here are cached, over the same retained keys, so this comparison
+    /// really is stricter than cached-against-uncached and should stay able to
+    /// say so.
     #[test]
     fn one_slot_is_the_one_row_lane() {
         // The WIDE cache, explicitly. What follows compares the cached lane
@@ -3019,7 +3031,7 @@ mod tests {
         }
         println!("one slot against the one-row lane: worst {worst:e}");
         assert!(
-            worst < 1e-5,
+            worst < 1e-2,
             "a one-slot batch is not the one-row lane: {worst:e}"
         );
     }
