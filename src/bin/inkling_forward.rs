@@ -435,7 +435,7 @@
 //! `num_nextn_predict_layers`, `chain_hidden_post_norm` and `local_layer_ids`.
 //! The default was right; it was right on a guess, and now it is measured.
 //!
-Every other reading of the wrapper, priced the same way on the same corpus
+//! Every other reading of the wrapper, priced the same way on the same corpus
 //! (depth 1, 2048 positions each):
 //!
 //!     THE DEFAULT                   0.2266
@@ -1831,6 +1831,72 @@ fn argmax_row_dev(row: T2) -> usize {
         .iter::<i64>()
         .next()
         .expect("device argmax readback") as usize
+}
+
+/// The five largest elements of a logit row, by value, ties broken by the
+/// SMALLER index.
+///
+/// # Why this is not a sort
+///
+/// It was one: `(0..v).collect()` then `sort_unstable_by` over the whole row.
+/// That is a 1.6 MB index allocation and ~3.5 M comparisons across a 200058-wide
+/// f32 row — per CONFIRMED ROW, per pass — to read five numbers, and it is the
+/// REPORT's, not the model's. Measured on the two-node tail (spark, layers
+/// 21..42, `INK_SPEC=0`, `INK_KV=1`, ctx ~3732, 58 warm passes, one row per
+/// pass): the gap between `whole_pass` — sampled before the report — and the
+/// `pass_ms` the harness records was 3.20 ms p50 (min 3.10, max 3.30) on a 51.5
+/// ms p50 pass, 6.2% of it. On the HEAD the same gap is 0.10 ms, and the head
+/// is the only difference: it has no logits, so it never ranks a row. The sort
+/// was the whole of it.
+///
+/// A five-slot insertion sweep is one pass over the row, allocates nothing but
+/// the five-element answer, and skips on a single failed compare for all but a
+/// handful of elements.
+///
+/// # What it costs the pipeline right now, which is nothing
+///
+/// Said plainly so nobody quotes this as a step-time win: at the config above
+/// the tail replies to its peer BEFORE it prints, and the head then spends ~40
+/// ms in its own layer loop, so the tail's 3.20 ms was already hidden. This
+/// removes a real per-pass cost from the tail's budget; it does not move the
+/// two-node ms/step, and a measurement that claims it did is measuring drift.
+///
+/// # Ties
+///
+/// `sort_unstable` does not say where equal keys land, so a flat row could print
+/// a different top-5 ORDER on two runs of the same binary — on a model this file
+/// already documents as disagreeing with itself on 8.55% of argmax positions,
+/// that is one more source nobody needs. The rule here is the argmax's own:
+/// strictly greater wins, so an equal value never displaces an earlier index.
+/// Non-finite values are skipped by the same `>` that the host argmax skips them
+/// with, rather than panicking in a `partial_cmp().unwrap()` inside a report.
+fn top5_desc(row: &[f32]) -> Vec<usize> {
+    let k = 5.min(row.len());
+    let mut best: Vec<(f32, usize)> = Vec::with_capacity(k + 1);
+    for (i, &val) in row.iter().enumerate() {
+        // A NaN is not ranked, and it is dropped HERE rather than compared
+        // away. `partition_point` below needs `!(val > v)` to hold on a prefix
+        // and fail after it; one NaN admitted into `best` makes that predicate
+        // true again past the split and the binary search returns a position
+        // that means nothing. Caught by `a_nan_does_not_kill_the_report`, which
+        // is the whole reason that test exists.
+        if val.is_nan() {
+            continue;
+        }
+        // The overwhelmingly common case: a value that cannot displace the
+        // fifth. One comparison and nothing else.
+        if best.len() == k && !(val > best[k - 1].0) {
+            continue;
+        }
+        // `best` is sorted descending, so `!(val > v)` holds on a prefix and
+        // `at` is the first slot `val` outranks. Inserting there leaves an
+        // equal value already present ahead of this one, which is the
+        // smaller-index rule.
+        let at = best.partition_point(|&(v, _)| !(val > v));
+        best.insert(at, (val, i));
+        best.truncate(k);
+    }
+    best.into_iter().map(|(_, i)| i).collect()
 }
 
 /// Host seconds inside the routed-expert lane, split by WHAT THE HOST DID.
@@ -9827,9 +9893,7 @@ fn main() -> Result<()> {
             for ti in logit_row0..valid_to {
                 let pos = pos0 + ti;
                 let row = &logits[(ti - logit_row0) * v..(ti - logit_row0 + 1) * v];
-                let mut idx: Vec<usize> = (0..v).collect();
-                idx.sort_unstable_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap());
-                let top: Vec<usize> = idx[..5].to_vec();
+                let top = top5_desc(row);
                 println!(
                     "  after token {pos} (id {}): top5 {:?}  logits {:?}",
                     ids[pos],
@@ -10629,5 +10693,75 @@ mod ann_temp_tests {
         let c = normals(0x5EED_1107, 7, 64);
         assert_eq!(a, c, "the same (seed, step) drew differently");
         assert_ne!(a, b, "consecutive steps drew the same noise");
+    }
+}
+
+#[cfg(test)]
+mod top5_tests {
+    use super::top5_desc;
+
+    /// The reference this replaced, spelled out: rank every index by value,
+    /// descending, ties by the smaller index. Written here rather than reused
+    /// from the file because a test that shares an implementation with the
+    /// thing it checks checks nothing.
+    fn reference(row: &[f32]) -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..row.len()).collect();
+        idx.sort_by(|&a, &b| {
+            row[b]
+                .partial_cmp(&row[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+        idx.truncate(5);
+        idx
+    }
+
+    #[test]
+    fn the_five_slot_sweep_agrees_with_a_full_sort_on_random_rows() {
+        // A real vocabulary width, because the failure mode worth catching is a
+        // truncation bug that a ten-element row cannot express.
+        let v = 200_058usize;
+        let mut state = 0x243F_6A88_85A3_08D3u64;
+        let mut row = vec![0f32; v];
+        for x in row.iter_mut() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *x = ((state >> 40) as f32 / 1024.0) - 12.0;
+        }
+        assert_eq!(top5_desc(&row), reference(&row));
+    }
+
+    /// The case the old `sort_unstable` left undefined and this one pins: a row
+    /// flat enough that the top five are all ties.
+    #[test]
+    fn ties_go_to_the_smaller_index() {
+        let mut row = vec![-1.0f32; 100];
+        for i in [7, 3, 40, 11, 90, 2] {
+            row[i] = 5.0;
+        }
+        assert_eq!(top5_desc(&row), vec![2, 3, 7, 11, 40]);
+        // Every element equal: the answer is the first five positions, and it
+        // is the same on every run.
+        assert_eq!(top5_desc(&vec![0.5f32; 50]), vec![0, 1, 2, 3, 4]);
+    }
+
+    /// A row narrower than five, and one exactly five wide. The old code
+    /// indexed `idx[..5]` and would have panicked on the first.
+    #[test]
+    fn a_short_row_returns_what_it_has() {
+        assert_eq!(top5_desc(&[1.0, 3.0, 2.0]), vec![1, 2, 0]);
+        assert_eq!(top5_desc(&[]), Vec::<usize>::new());
+        assert_eq!(top5_desc(&[1.0, 2.0, 3.0, 4.0, 5.0]), vec![4, 3, 2, 1, 0]);
+    }
+
+    /// A NaN in the row is skipped rather than panicking. The host argmax
+    /// beside this already skips them -- `val > row[b]` is false for NaN -- so
+    /// a report that killed the run where the token pick did not was the odd
+    /// one out.
+    #[test]
+    fn a_nan_does_not_kill_the_report() {
+        let row = [1.0f32, f32::NAN, 9.0, 4.0, f32::NAN, 7.0, 2.0];
+        assert_eq!(top5_desc(&row), vec![2, 5, 3, 6, 0]);
     }
 }
