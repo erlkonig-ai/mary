@@ -335,6 +335,37 @@ fn main() {
         );
     }
 
+    // ---- 3c. SPLIT-K, emulated exactly ---------------------------------------
+    // If the shortfall is that the grid is too small, the fix is not a better
+    // layout -- it is more cubes over the SAME bytes, which is what split-k buys:
+    // each cube takes a k-slice and a cheap f32 reduction adds the partials.
+    //
+    // A split-k of S over [n, k] launches S*n/8 cubes that each walk k/S. That is
+    // shape-identical to ONE launch at [S*n, k/S]: same total cubes, same
+    // per-cube trip count, byte-for-byte the same table. So these rows price the
+    // fix without writing the reduction, and the pairs below hold BYTES EXACTLY
+    // constant -- only the grid moves.
+    sweep(
+        &client,
+        "split-k emulation for down [4096,2048]: 4.5 MiB in every row",
+        vec![
+            Shape::new(&client, 16, 2048, 4096), // S=1, as shipped: 512 cubes
+            Shape::new(&client, 16, 1024, 8192), // S=2: 1024 cubes
+            Shape::new(&client, 16, 512, 16384), // S=4: 2048 cubes
+            Shape::new(&client, 16, 256, 32768), // S=8: 4096 cubes
+        ],
+    );
+    sweep(
+        &client,
+        "split-k emulation for gate_up [8192,4096]: 18 MiB in every row",
+        vec![
+            Shape::new(&client, 16, 4096, 8192), // S=1, as shipped: 1024 cubes
+            Shape::new(&client, 16, 2048, 16384), // S=2: 2048 cubes
+            Shape::new(&client, 16, 1024, 32768), // S=4: 4096 cubes
+            Shape::new(&client, 16, 512, 65536), // S=8: 8192 cubes
+        ],
+    );
+
     // ---- 4. split vs fused, identical bytes and identical total cubes ------
     // 14 (28) launches of a sink shape against ONE launch covering the same n.
     // Both pipelined, both with pre-allocated outputs, so the only difference
