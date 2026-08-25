@@ -1437,6 +1437,80 @@ struct SharedOnDevice {
 /// measured: the same operation on the same shapes runs 65.08 ms on the BF16
 /// grouped lane against 18.44 ms on the NVFP4 one, and the shared experts are
 /// 100.7 MB of a 275.8 MB layer-step.
+/// Which lane the unembed table is bound to.
+///
+/// The head is the single largest term in the per-step INTERCEPT, and it is
+/// physics rather than overhead: `[vocab_size, hidden]` BF16 is 1.53 GiB read
+/// WHOLE on every pass, measured at 10.3 ms = 159 GB/s = 65% of this box's
+/// measured 242.9 GB/s. It does not scale with context or with how many layers
+/// this node holds, and no launch-side change moves a byte of it -- only fewer
+/// bytes do. At NVFP4 the same table is 0.43 GiB.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HeadLane {
+    /// The stored BF16, aliased out of the pile's own mapping.
+    Bf16,
+    /// NVFP4 codes against a BF16 activation.
+    W4a16,
+    /// The same NVFP4 codes against a quantised activation -- the routed
+    /// experts' native lane, here only so the two can be compared.
+    W4a4,
+}
+
+/// `INK_W4A16_HEAD=1`: hold the unembed table as NVFP4 and multiply it with a
+/// BF16 activation. `INK_W4A16_HEAD=4` binds the identical codes to the W4A4
+/// lane instead, which is a comparison arm and not a recommendation.
+///
+/// W4A16 is the default of the two: the checkpoint quantised the ROUTED
+/// EXPERTS and nothing else, so there is no calibrated input quantiser for
+/// this tensor, and these are the logits that top-k and sampling read
+/// directly. The whole switch is off by default because quantising the head is
+/// a model-quality decision, not an engineering one.
+///
+/// ## First measurement, 2026-08-25
+///
+/// Two Spark boxes, `INK_SPLIT=21`, `INK_KV=1`, `INK_GEN=24`, a 14-token
+/// English prompt, tail node, p50 of 24 warm passes of the `head / unembed`
+/// stage timer (device time, one sync). ALL THREE FIGURES ARE PER TAIL PASS:
+///
+/// | lane  | table    | kernel        | head stage | achieved  |
+/// |-------|----------|---------------|-----------:|----------:|
+/// | BF16  | 1.53 GiB | cubek, TUNED  |    10.1 ms | 163 GB/s  |
+/// | W4A16 | 0.43 GiB | hand mma      |     6.2 ms |  74 GB/s  |
+/// | W4A4  | 0.43 GiB | hand mma      |     6.1 ms |  76 GB/s  |
+///
+/// The bytes fell by 3.56x and the TIME by 1.63x, and THE ARMS DO NOT SHARE A
+/// KERNEL. `hand BF16 lane: 0 launches` in both logs: every plain-BF16 GEMM in
+/// this run went to `cubek::matmul::launch_ref`, because the unembed table
+/// aliases the pile at `align >= MIN_TUNED_ALIGN`. The four-bit lanes have no
+/// tuned equivalent and run `w4a16gemm` / `fp4gemm`, one warp per
+/// `(m_tile, n_tile)`. So the 163-against-74 GB/s gap is a TUNED-VERSUS-HAND
+/// comparison wearing a bits-per-weight label, and this measurement cannot
+/// separate the two. What it does establish is the ceiling: a four-bit head
+/// that reached the BF16 lane's 163 GB/s would be 2.84 ms, so ~3.4 ms a pass
+/// is unclaimed inside the four-bit lane -- more than the switch has won so
+/// far.
+///
+/// One piece of it was measured directly. The B-fragment load used to fetch
+/// the packed `u32` and the E4M3 scale once per ELEMENT rather than once per
+/// pair; hoisting both out of the `j` loop (same bytes, quarter the memory
+/// instructions, bit-identical output -- the lane-parity test's rel RMS is
+/// 0.0091 either way) moved the stage 6.7 -> 6.2 ms. Worth having, and small
+/// enough to say that instruction count is not where the rest of the gap is.
+///
+/// Output: 24 greedy tokens, one differed from the BF16 arm, and it differed
+/// at a 0.08-logit gap (`26500` at 18.59 against `306` at 18.51, which W4A16
+/// scored 18.32 against 18.32). Both continuations read as English. W4A4
+/// produced the SAME 24 tokens as W4A16 on this prompt, so the activation
+/// quantiser cost nothing here that the weight quantiser had not already cost.
+fn head_lane() -> HeadLane {
+    static ON: std::sync::OnceLock<HeadLane> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("INK_W4A16_HEAD").as_deref() {
+        Ok("1") => HeadLane::W4a16,
+        Ok("4") => HeadLane::W4a4,
+        _ => HeadLane::Bf16,
+    })
+}
+
 /// `INK_FUSE_QKVR=1`: bind `wq|wk|wv|wr` as one `[6656, hidden]` weight.
 ///
 /// A SCHEDULING change -- every output element is the same k-loop over the
@@ -5016,11 +5090,39 @@ fn main() -> Result<()> {
             2.0 * leaf.bytes.len() as f64 / GIB
         );
         (
-            Some(Bf16W {
-                h: hnd,
-                n: rows,
-                k: cols,
-                align: if copy_to_align { 16 } else { align },
+            Some(if head_lane() != HeadLane::Bf16 {
+                // Quantise once, here, and let the BF16 upload die with `hnd`:
+                // what the run then holds is 0.43 GiB, not 1.53.
+                //
+                // `quantized_bf16` hands back the routed experts' `Fp4`
+                // variant, which is the W4A4 lane -- the one the publisher
+                // calibrated an input quantiser for and this tensor has none.
+                // Re-tagging the SAME `PackedW` as `W4a16` changes nothing on
+                // the device (identical codes, identical scales); it changes
+                // only whether the activation gets quantised on the way in.
+                let w = match (
+                    quantized_bf16(&fp4_client, &leaf.bytes, rows, cols),
+                    head_lane(),
+                ) {
+                    (dev_lane::ProjW::Fp4(p), HeadLane::W4a16) => dev_lane::ProjW::W4a16(p),
+                    (w, _) => w,
+                };
+                println!(
+                    "  unembed RE-BOUND as NVFP4 / {:?} (INK_W4A16_HEAD): {:.2} GiB -> {:.2} GiB, \
+                     a per-step FLOOR cut by the same ratio",
+                    head_lane(),
+                    leaf.bytes.len() as f64 / GIB,
+                    leaf.bytes.len() as f64 * 4.5 / 16.0 / GIB
+                );
+                drop(hnd);
+                w
+            } else {
+                dev_lane::ProjW::Bf16(Bf16W {
+                    h: hnd,
+                    n: rows,
+                    k: cols,
+                    align: if copy_to_align { 16 } else { align },
+                })
             }),
             // The same stored bytes, kept reachable from the HOST as well, for
             // `INK_DRAFT_TOPK`. Pruning the draft's unembedding is a row gather
@@ -6808,7 +6910,7 @@ fn main() -> Result<()> {
             let uw = unembed_w
                 .as_ref()
                 .expect("the tail binds the unembed table");
-            down(dev_lane::linear_bf16(hs, uw).slice([0..n - logit_row0, 0..v]))
+            down(dev_lane::linear_w(hs, uw).slice([0..n - logit_row0, 0..v]))
         };
         let t_head = t_h.elapsed().as_secs_f64();
 
@@ -7222,14 +7324,9 @@ fn main() -> Result<()> {
             // default. Nothing else ever looked at the row, so nothing else has to
             // pay for it.
             let draft_pick = |row: T2| -> usize {
-                let (ud, width) = match draft_cand.as_ref() {
-                    Some((_, w)) => (w, w.n),
-                    None => (
-                        unembed_w
-                            .as_ref()
-                            .expect("drafting needs the unembed table"),
-                        v,
-                    ),
+                let width = match draft_cand.as_ref() {
+                    Some((_, w)) => w.n,
+                    None => v,
                 };
                 let hs = dev_lane::rms_norm(
                     row,
@@ -7237,7 +7334,18 @@ fn main() -> Result<()> {
                     t.rms_norm_eps,
                 )
                 .div_scalar(t.logits_mup_width_multiplier as f32);
-                let lg = dev_lane::linear_bf16(hs, ud).slice([0..1, 0..width]);
+                // The pruned table is a gathered BF16 slab; the full one takes
+                // whichever lane `INK_W4A16_HEAD` bound.
+                let lg = match draft_cand.as_ref() {
+                    Some((_, w)) => dev_lane::linear_bf16(hs, w),
+                    None => dev_lane::linear_w(
+                        hs,
+                        unembed_w
+                            .as_ref()
+                            .expect("drafting needs the unembed table"),
+                    ),
+                }
+                .slice([0..1, 0..width]);
                 let b = if mtp_prob {
                     // The one caller that wants the row itself. Startup refuses
                     // this together with a pruned table, so `width` is `v` here.
