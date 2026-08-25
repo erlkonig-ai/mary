@@ -420,6 +420,46 @@
 //! 20-token run)"; on 2048 positions the two are 0.2310 and 0.2266, which is
 //! inside the interval. A twenty-step difference was a twenty-step difference.
 //!
+//! ## The mid-run stall, and where the evidence points
+//!
+//! Every `INK_SPEC>0` run over a long context has two or three passes that take
+//! **8 to 24 seconds** while its neighbours take 0.21. The unspeculated arm on
+//! the same prompt has none over one second after the two cold passes. It drags
+//! a 212 ms/step arm to 541, and the harness prints the honest verdict:
+//! `spread 87.4% <- SMALLER THAN THE SPREAD. Not a result.`
+//!
+//! What the logs already settle:
+//!
+//!  - **Both ends stall on the SAME pass, by different amounts.** Pass 30: the
+//!    head's own layer loop 7.88 s, the tail's whole pass 7.78 s. Pass 106:
+//!    12.24 s and 10.79 s. So it is not one box and it is not the wire; it is
+//!    the same trigger arriving at two processes running the same shapes.
+//!  - **It is not the pool.** `pool[after stack]` reads 12.44 GiB reserved /
+//!    3.11 live / 9.34 GiB stranded over 503 slices on the passes either side of
+//!    a stall and on the stall itself, and `pool cleanups: 0 of 21 layers`.
+//!    Nothing was reserved, freed or drained.
+//!  - **It is not extra work.** Both reps of `spec1` accept an identical
+//!    81/119 and differ by 2.5x in wall time.
+//!  - **It shows up in a HOST-ONLY bracket** -- 7.77 s of the head's
+//!    "attention half", which the report labels "enqueue only (nothing in the
+//!    loop synchronises)". Something inside an enqueue blocked.
+//!
+//! And what the autotune cache says. `~/.cache/cubecl/autotune/0.10.0/` keys
+//! matmuls by shape ANCHORED TO POWERS OF TWO, and the live cache holds 247
+//! entries whose `m` histogram is `{1: 28, 2: 19, 4: 36, 8: 33, 16: 30, ...}`.
+//! So **`m = 2` and `m = 4` are their own keys**: every shape a verify pass
+//! makes is a shape the `m == 1` lane never tunes, and the first process to see
+//! one pays a timing race over every candidate kernel. `n` and `k` anchor too,
+//! which is why a context growing 3732 -> 3930 does not itself trigger anything
+//! -- it stays in the 4096 bucket.
+//!
+//! That leaves the question of what new shape appears at pass 30 and not at
+//! pass 3, and the routed experts are the obvious candidate: an expert's GEMM
+//! is `[rows on this expert, ...]`, a verify pass has two or three rows that can
+//! CO-ROUTE, and how many land together is a property of the token, not of the
+//! pass number. `CUBECL_DEBUG_LOG=<file>` makes cubecl name what it tunes and
+//! when, which is the instrument that would close this.
+//!
 //! ## The binding constraint is c(2), not acceptance
 //!
 //! It is worth writing the break-even down, because it decides what work is
