@@ -2919,9 +2919,31 @@ fn grouped_experts_fp4(
     let h_sc2 = client.create_from_slice(bytes_of(&sc2));
     host.plan_up_routed += t_ur.elapsed().as_secs_f64();
     Ok(Some(grouped_experts_core(
-        client, dev, prefix, &wmap, wmap_bytes, &blk, &hn_h, hn_dt, &h_rowtok, &h_rowwgt,
-        &h_tokrows, &h_tokcnt, &h_off13, &h_off2, &h_sc13, &h_sc2, slots, m_total, plan.kmax, n, h,
-        inter, t_g, host,
+        client,
+        dev,
+        prefix,
+        &wmap,
+        wmap_bytes,
+        &blk,
+        &hn_h,
+        hn_dt,
+        &h_rowtok,
+        &h_rowwgt,
+        &h_tokrows,
+        &h_tokcnt,
+        &h_off13,
+        &h_off2,
+        &h_sc13,
+        &h_sc2,
+        slots,
+        m_total,
+        plan.kmax,
+        n,
+        h,
+        inter,
+        src.experts_swizzled(),
+        t_g,
+        host,
     )))
 }
 
@@ -2960,6 +2982,11 @@ fn grouped_experts_core(
     n: usize,
     h: usize,
     inter: usize,
+    // Whether the bound expert planes are in MMA-fragment order; see
+    // `Weights::experts_swizzled`. The two layouts are the same bytes, so this
+    // cannot be inferred here and a wrong answer is silently wrong numbers
+    // rather than a failure.
+    swz: bool,
     t_g: Instant,
     host: &mut HostT,
 ) -> T2 {
@@ -3018,6 +3045,7 @@ fn grouped_experts_core(
             m_total,
             h,
             2 * inter,
+            swz,
         )
     } else {
         fp4_linear_grouped_launch(
@@ -3033,6 +3061,7 @@ fn grouped_experts_core(
             m_total,
             h,
             2 * inter,
+            swz,
         )
     };
     // Retain the activation handle until both quantization launches have been
@@ -3049,11 +3078,11 @@ fn grouped_experts_core(
     };
     let y_h = if narrow {
         fp4_linear_grouped_bf16_launch(
-            client, &a2, &asc2, wmap, wmap_bytes, blk, h_off2, h_sc2, slots, m_total, inter, h,
+            client, &a2, &asc2, wmap, wmap_bytes, blk, h_off2, h_sc2, slots, m_total, inter, h, swz,
         )
     } else {
         fp4_linear_grouped_launch(
-            client, &a2, &asc2, wmap, wmap_bytes, blk, h_off2, h_sc2, slots, m_total, inter, h,
+            client, &a2, &asc2, wmap, wmap_bytes, blk, h_off2, h_sc2, slots, m_total, inter, h, swz,
         )
     };
     host.enqueue += t_w.elapsed().as_secs_f64();
@@ -3479,6 +3508,7 @@ fn routed_experts_fp4_dev(
     n: usize,
     h: usize,
     inter: usize,
+    swz: bool,
     t_g: Instant,
     host: &mut HostT,
 ) -> T2 {
@@ -3519,6 +3549,7 @@ fn routed_experts_fp4_dev(
         n,
         h,
         inter,
+        swz,
         t_g,
         host,
     )
@@ -3819,10 +3850,16 @@ fn per_expert_fp4(
     inter: usize,
     host: &mut HostT,
 ) -> Result<T2> {
-    use mary::models::inkling::fp4gemm::{MTILE, fp4_linear_launch, gate_up_silu_launch};
+    use mary::models::inkling::fp4gemm::{
+        MTILE, fp4_linear_launch, fp4_linear_swz_launch, gate_up_silu_launch,
+    };
     use mary::models::inkling::fp4quant::quantize_nvfp4;
     use mary::models::inkling::pad::gather_rows_pad;
     use mary::models::inkling::seam::{handle_of, int_handle_of, tensor_of};
+
+    // Which layout the arena holds. Read ONCE: it is a fact about the startup
+    // copy, and a per-expert question would suggest it could differ per expert.
+    let swz = src.experts_swizzled();
 
     // Zero copy where the hardware allows it: the GPU reads the source's own
     // mapped pages in place. The mappings were registered ONCE at startup, so
@@ -3866,14 +3903,40 @@ fn per_expert_fp4(
         // two GEMMs purely to requantise it; `act_h` never leaves the device.
         let (a, asc) = quantize_nvfp4(client, &x_h, m_pad, h);
 
+        // The FALLBACK lane reads the same arena the grouped one does, so it
+        // reads whatever layout the startup copy wrote. `fp4_linear_swz` is
+        // `fp4_linear` with one index expression changed and is bit-identical
+        // given the permuted operand -- which is what makes this a choice of
+        // READER rather than a second implementation to keep in step.
         let (b, bsc) = (bind(&w13.codes), bind(&w13.scales));
-        let both = fp4_linear_launch(client, &a, &asc, &b, &bsc, m_pad, h, 2 * inter, w13.scale2);
+        let both = if swz {
+            fp4_linear_swz_launch(
+                client,
+                &a,
+                &asc,
+                &b,
+                &bsc,
+                m_pad,
+                h,
+                2 * inter,
+                w13.scale2,
+                true,
+            )
+        } else {
+            fp4_linear_launch(client, &a, &asc, &b, &bsc, m_pad, h, 2 * inter, w13.scale2)
+        };
 
         let act_h = gate_up_silu_launch(client, &both, m_pad, inter);
         let (a2, asc2) = quantize_nvfp4(client, &act_h, m_pad, inter);
 
         let (b2, bsc2) = (bind(&w2.codes), bind(&w2.scales));
-        let y_h = fp4_linear_launch(client, &a2, &asc2, &b2, &bsc2, m_pad, inter, h, w2.scale2);
+        let y_h = if swz {
+            fp4_linear_swz_launch(
+                client, &a2, &asc2, &b2, &bsc2, m_pad, inter, h, w2.scale2, true,
+            )
+        } else {
+            fp4_linear_launch(client, &a2, &asc2, &b2, &bsc2, m_pad, inter, h, w2.scale2)
+        };
         host.enqueue += t_w.elapsed().as_secs_f64();
 
         let t_c = Instant::now();
@@ -6669,6 +6732,7 @@ fn main() -> Result<()> {
                             n,
                             h,
                             inter,
+                            cp.experts_swizzled(),
                             t_g,
                             &mut host_t,
                         )

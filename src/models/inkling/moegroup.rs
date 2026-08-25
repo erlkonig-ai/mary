@@ -622,14 +622,16 @@ pub fn fp4_linear_grouped_launch<R: Runtime>(
     m_total: usize,
     k: usize,
     n: usize,
+    swz: bool,
 ) -> Handle {
     if grouped_smem() {
+        assert!(!swz, "the staged kernel reads the row-major layout");
         return fp4_linear_grouped_smem_launch_as::<f32, R>(
             client, a, a_sc, wmap, wmap_bytes, blk, off, scale2, slots, m_total, k, n,
         );
     }
     fp4_linear_grouped_launch_as::<f32, R>(
-        client, false, a, a_sc, wmap, wmap_bytes, blk, off, scale2, slots, m_total, k, n,
+        client, swz, a, a_sc, wmap, wmap_bytes, blk, off, scale2, slots, m_total, k, n,
     )
 }
 
@@ -656,14 +658,16 @@ pub fn fp4_linear_grouped_bf16_launch<R: Runtime>(
     m_total: usize,
     k: usize,
     n: usize,
+    swz: bool,
 ) -> Handle {
     if grouped_smem() {
+        assert!(!swz, "the staged kernel reads the row-major layout");
         return fp4_linear_grouped_smem_launch_as::<half::bf16, R>(
             client, a, a_sc, wmap, wmap_bytes, blk, off, scale2, slots, m_total, k, n,
         );
     }
     fp4_linear_grouped_launch_as::<half::bf16, R>(
-        client, false, a, a_sc, wmap, wmap_bytes, blk, off, scale2, slots, m_total, k, n,
+        client, swz, a, a_sc, wmap, wmap_bytes, blk, off, scale2, slots, m_total, k, n,
     )
 }
 
@@ -1212,6 +1216,35 @@ pub fn grouped_smem() -> bool {
         std::env::var("INK_MOE_SMEM")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(false)
+    })
+}
+
+/// Whether the LOAD PATH writes routed-expert weights down in MMA-fragment
+/// order, from `INK_SWZ`.
+///
+/// **On by default**, and it is the reason [`grouped_smem`] still exists.
+/// The two are the same fix to the same defect — the `m16n8k64` B fragment is
+/// eight weight rows `k / 2` bytes apart, so a plane's load issues eight sector
+/// requests for 128 useful bytes — and they are mutually exclusive by
+/// construction, because the staged kernel reads the ROW-MAJOR layout the
+/// permutation destroys. So this asks `grouped_smem` first and yields to it:
+/// setting `INK_MOE_SMEM=1` selects staging AND leaves the arena unpermuted,
+/// which is one decision and not two that have to agree.
+///
+/// This is a decision about BYTES ON THE HOST, taken once at startup by
+/// `PileSource::copy_share`, so it cannot be re-taken per layer and the truth
+/// of whether it happened lives on the source rather than in this function —
+/// `INK_STARTUP_COPY=0` skips the copy entirely and no permutation occurs no
+/// matter what this returns. Ask `Weights::experts_swizzled` for what the bytes
+/// actually are; ask this only for what to attempt.
+pub fn swizzle_weights() -> bool {
+    use std::sync::OnceLock;
+    static S: OnceLock<bool> = OnceLock::new();
+    *S.get_or_init(|| {
+        !grouped_smem()
+            && std::env::var("INK_SWZ")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(true)
     })
 }
 

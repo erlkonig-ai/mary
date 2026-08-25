@@ -1278,12 +1278,30 @@ fn swz_word(c: usize, w: usize) -> usize {
 /// `((n_tile * k/64) + k_tile) * 256`, and inside it word `32 * i + lane` is
 /// exactly what lane `lane`'s load `i` reads. See [`swz_word`].
 pub fn swizzle_b_codes(src: &[u8], n: usize, k: usize) -> Vec<u8> {
+    let mut dst = vec![0u8; src.len()];
+    swizzle_b_codes_into(src, &mut dst, n, k);
+    dst
+}
+
+/// [`swizzle_b_codes`] writing into a caller-owned destination.
+///
+/// The form the LOAD PATH uses. `PileSource::copy_share` already memcpys every
+/// expert plane out of the pile mapping into the anonymous arena, so permuting
+/// there is a change of destination index inside a copy that already happens —
+/// the alternative, `swizzle_b_codes` followed by `copy_from_slice`, would
+/// allocate and touch the bytes a second time for nothing. `src` and `dst` must
+/// not overlap.
+pub fn swizzle_b_codes_into(src: &[u8], dst: &mut [u8], n: usize, k: usize) {
     assert_eq!(n % NTILE, 0, "n {n} is not a multiple of {NTILE}");
     assert_eq!(k % KTILE, 0, "k {k} is not a multiple of {KTILE}");
     assert_eq!(src.len(), n * k / 2, "codes are not [n, k/2]");
+    assert_eq!(
+        dst.len(),
+        src.len(),
+        "destination is not the source's length"
+    );
     let kt = k / KTILE;
     let row_w = k / 8; // 32-bit words in one weight row
-    let mut dst = vec![0u8; src.len()];
     for nt in 0..n / NTILE {
         for t in 0..kt {
             let blk = (nt * kt + t) * 256;
@@ -1296,7 +1314,6 @@ pub fn swizzle_b_codes(src: &[u8], n: usize, k: usize) -> Vec<u8> {
             }
         }
     }
-    dst
 }
 
 /// Permute `[n, k/16]` E4M3 block scales to match [`swizzle_b_codes`].
@@ -1312,15 +1329,27 @@ pub fn swizzle_b_codes(src: &[u8], n: usize, k: usize) -> Vec<u8> {
 /// still the same byte for the same 16 elements. Only where it is written
 /// moves, which is why the output is bit-identical rather than close.
 pub fn swizzle_b_scales(src: &[u8], n: usize, k: usize) -> Vec<u8> {
+    let mut dst = vec![0u8; src.len()];
+    swizzle_b_scales_into(src, &mut dst, n, k);
+    dst
+}
+
+/// [`swizzle_b_scales`] writing into a caller-owned destination; see
+/// [`swizzle_b_codes_into`] for why the load path wants this form.
+pub fn swizzle_b_scales_into(src: &[u8], dst: &mut [u8], n: usize, k: usize) {
     assert_eq!(n % NTILE, 0);
     assert_eq!(k % KTILE, 0);
     assert_eq!(src.len(), n * (k / GROUP), "scales are not [n, k/16]");
+    assert_eq!(
+        dst.len(),
+        src.len(),
+        "destination is not the source's length"
+    );
     let kt = k / KTILE;
     let spr = k / GROUP;
     // E4M3 scales one MMA consumes per weight row: `scales_count()`, which for
     // this instruction is `KTILE / GROUP`.
     let per = KTILE / GROUP;
-    let mut dst = vec![0u8; src.len()];
     for nt in 0..n / NTILE {
         for t in 0..kt {
             let blk = (nt * kt + t) * NTILE * per;
@@ -1330,7 +1359,93 @@ pub fn swizzle_b_scales(src: &[u8], n: usize, k: usize) -> Vec<u8> {
             }
         }
     }
-    dst
+}
+
+#[cfg(test)]
+mod swizzle_tests {
+    use super::*;
+
+    /// Every source byte lands somewhere, exactly once.
+    ///
+    /// The permutation's whole claim is that it MOVES bytes and drops none, so
+    /// the failure it has to exclude is a destination formula that collides —
+    /// which loses one byte and duplicates another, and which no bit-identity
+    /// check against a same-shaped output would call an error. Tested on a
+    /// non-square shape so a transposed `n`/`k` cannot pass.
+    #[test]
+    fn the_permutation_is_a_bijection_on_both_planes() {
+        let (n, k) = (16usize, 128usize);
+        let codes: Vec<u8> = (0..n * k / 2).map(|i| (i % 251) as u8).collect();
+        let mut seen = vec![false; codes.len()];
+        // Re-derive the destination of every source byte and mark it.
+        let kt = k / KTILE;
+        for nt in 0..n / NTILE {
+            for t in 0..kt {
+                for c in 0..NTILE {
+                    for w in 0..8 {
+                        let d = (nt * kt + t) * 256 + swz_word(c, w) * 4;
+                        for b in 0..4 {
+                            assert!(!seen[d + b], "destination {} written twice", d + b);
+                            seen[d + b] = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            seen.iter().all(|v| *v),
+            "some destination was never written"
+        );
+        // and the same byte multiset comes out
+        let mut a = swizzle_b_codes(&codes, n, k);
+        let mut b = codes.clone();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b);
+
+        let scales: Vec<u8> = (0..n * (k / GROUP)).map(|i| (i % 241) as u8).collect();
+        let mut a = swizzle_b_scales(&scales, n, k);
+        let mut b = scales.clone();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b);
+    }
+
+    /// The load path's form agrees with the allocating one, byte for byte.
+    ///
+    /// `PileSource::copy_share` uses `*_into` against a slice of the arena, so
+    /// the two must not be able to drift; this is the only place they meet.
+    #[test]
+    fn the_in_place_form_matches_the_allocating_one() {
+        let (n, k) = (24usize, 192usize);
+        let codes: Vec<u8> = (0..n * k / 2).map(|i| (i % 253) as u8).collect();
+        let scales: Vec<u8> = (0..n * (k / GROUP)).map(|i| (i % 239) as u8).collect();
+        let mut dc = vec![0u8; codes.len()];
+        let mut ds = vec![0u8; scales.len()];
+        swizzle_b_codes_into(&codes, &mut dc, n, k);
+        swizzle_b_scales_into(&scales, &mut ds, n, k);
+        assert_eq!(dc, swizzle_b_codes(&codes, n, k));
+        assert_eq!(ds, swizzle_b_scales(&scales, n, k));
+    }
+
+    /// The shapes the routed lane actually runs, and the ones it cannot.
+    #[test]
+    fn swizzleable_answers_for_the_shapes_that_tile() {
+        assert!(swizzleable(4096, 4096));
+        assert!(!swizzleable(4, 4096), "4 rows is half an n tile");
+        assert!(!swizzleable(4096, 32), "32 k elements is half a k tile");
+    }
+}
+
+/// Whether an `[n, k]` NVFP4 weight can be written down in fragment order.
+///
+/// The permutation is a re-indexing of whole `(n_tile, k_tile)` blocks, so it
+/// exists exactly when the matrix tiles: `NTILE` rows and `KTILE` k elements.
+/// Every shape the grouped lane accepts already satisfies this — the launcher
+/// asserts it — but the LOAD path runs before any launcher and has to answer
+/// for weights the run may never multiply, so it asks rather than assumes.
+pub fn swizzleable(n: usize, k: usize) -> bool {
+    n % NTILE == 0 && k % KTILE == 0
 }
 
 /// [`fp4_linear`] reading a B operand that is ALREADY in fragment order.
