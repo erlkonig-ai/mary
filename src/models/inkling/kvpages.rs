@@ -914,12 +914,12 @@ mod tests {
     // would be asserting a theorem about lossless quantization that is false.
     // -----------------------------------------------------------------------
 
-    /// Widest thing NVFP4 can be off by, as a fraction.
+    /// Widest thing NVFP4 can be off by, as a fraction, for a value that is not
+    /// tiny inside its own block.
     ///
-    /// Not a fudge factor picked by running the test: a row that is CONSTANT has
-    /// one amax, so its scale is `E4M3(v / 6)` and every code lands on 7 (the
-    /// only magnitude within a half-step of `v / s`). The reconstruction is then
-    /// `6 * E4M3(v / 6)`, and E4M3 carries three mantissa bits, so
+    /// Not a fudge factor picked by running the test: a block's scale is
+    /// `E4M3(amax / 6)` and a value at the amax lands on code 7, so what it
+    /// recovers is `6 * E4M3(amax / 6)`. E4M3 carries three mantissa bits, so
     /// round-to-nearest is off by at most half of the 1/8 relative spacing.
     const FP4_TOL: f32 = 1.0 / 16.0;
 
@@ -932,40 +932,64 @@ mod tests {
         Default::default()
     }
 
-    /// Rows whose every element is the row's absolute index + 1. The `+ 1` is
-    /// load-bearing: row 0 as all-zeros quantizes exactly and would be the one
-    /// row a relative tolerance cannot say anything about.
+    /// Rows carrying their own absolute index — in the SIGN BITS, not in the
+    /// magnitude.
+    ///
+    /// The dense tests write the index into every element and read it straight
+    /// back. That trick does not survive four bits and it should not be made to:
+    /// a constant row recovers as `6 * E4M3(v / 6)`, whose granularity is 1/16
+    /// relative, so consecutive indices above ~16 land on the same value. A test
+    /// that "fixed" this with a tolerance would stop being able to tell rows
+    /// apart at all, which is exactly the property it exists to check.
+    ///
+    /// So the index goes where NVFP4 is exact. Every element is `±1`, so every
+    /// 16-element block has `amax = 1`, one scale, and code 7 with a sign; the
+    /// SIGN survives quantization bit for bit while the magnitude does not.
+    /// Feature `j` carries bit `j % 16` of the index, repeated across all eight
+    /// blocks of the row — so a block that was dropped, duplicated or swapped
+    /// with a neighbour's shows up as a disagreement WITHIN the row, on top of
+    /// the row order the caller is checking.
     fn frows(from: usize, n: usize) -> Tensor<B, 2> {
         let data: Vec<f32> = (from..from + n)
-            .flat_map(|i| std::iter::repeat_n((i + 1) as f32, FW))
+            .flat_map(|i| (0..FW).map(move |j| if (i >> (j % 16)) & 1 == 1 { 1.0 } else { -1.0 }))
             .collect();
         Tensor::<B, 1>::from_floats(data.as_slice(), &fp4_dev()).reshape([n, FW])
     }
 
-    /// The index each stored row is carrying, recovered through the quantizer.
+    /// The index each stored row is carrying, read back out of the sign bits.
     ///
-    /// Checks two things on the way: that a row did not TEAR (every element of a
-    /// constant row shares one block scale and one code, so the reconstruction is
-    /// bit-identical across the row — this stays an exact assertion), and that
-    /// the value it recovered is the index it went in with, within [`FP4_TOL`].
+    /// Exact, with no tolerance anywhere: the claim being made is about which
+    /// rows are where, and that claim is not approximate just because their
+    /// contents are.
     fn fcontents(s: &Fp4PageStore) -> Vec<usize> {
         if s.is_empty() {
             return Vec::new();
         }
         let flat: Vec<f32> = s.materialize(&fp4_dev()).into_data().to_vec().unwrap();
         flat.chunks(FW)
-            .map(|c| {
+            .map(|row| {
+                let bits = |o: usize| -> usize {
+                    (0..16).filter(|j| row[o + j] > 0.0).map(|j| 1 << j).sum()
+                };
+                let idx = bits(0);
+                for b in 1..FW / 16 {
+                    assert_eq!(
+                        bits(b * 16),
+                        idx,
+                        "block {b} of a row disagrees with block 0 — the row was torn"
+                    );
+                }
+                // All sixteen magnitudes in a block are equal by construction,
+                // so the reconstruction is one value repeated. Say so, since a
+                // scale applied to the wrong block would show up here first.
+                let m = row[0].abs();
                 assert!(
-                    c.iter().all(|x| *x == c[0]),
-                    "a constant row was torn by the quantizer: {:?}..",
-                    &c[..8]
+                    row.iter().all(|x| x.abs() == m),
+                    "a ±1 row came back with unequal magnitudes"
                 );
-                let idx = (c[0].round() as usize).saturating_sub(1);
-                let want = (idx + 1) as f32;
                 assert!(
-                    (c[0] - want).abs() <= FP4_TOL * want,
-                    "row recovered {} for index {idx}",
-                    c[0]
+                    (m - 1.0).abs() <= FP4_TOL,
+                    "a ±1 row recovered magnitude {m}"
                 );
                 idx
             })
