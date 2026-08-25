@@ -1215,3 +1215,333 @@ mod bind_tests {
         assert_eq!(s.alias_fraction(), Some(0.75));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Pre-permuted ("swizzled") B layout
+// ---------------------------------------------------------------------------
+
+/// Where lane `l`'s `i`-th 32-bit B load lands in a swizzled block — and the
+/// reason this file's whole staging apparatus may be unnecessary.
+///
+/// ## The layout, derived rather than drawn
+///
+/// [`fp4_linear`] gets its B addresses from
+/// `def.position_of_nth(lane, i * vs_b * pack, MatrixIdent::B)`, which on
+/// sm_121a for `m16n8k64` returns, for `i` in `0..2`:
+///
+/// ```text
+///   col = lane >> 2                     the n column, 0..8
+///   row = (lane & 3) * 8 + i * 32       the k element, 0..64
+/// ```
+///
+/// `fp4_lane_map` dumps that table off the device so it is a measurement and
+/// not a diagram. Feed it through the kernel's own index arithmetic
+/// (`byte = row_n * k/2 + k_elem / 2`) and one MMA's B operand is:
+///
+/// * eight weight rows, `n_base .. n_base + 8`;
+/// * 32 contiguous bytes of each — the k tile — so 256 bytes in all;
+/// * the rows `k / 2` bytes apart, which at `k = 4096` is 2048.
+///
+/// Within one row's 32 bytes, lane `4c + s` takes word `s` on load 0 and word
+/// `s + 4` on load 1. So load `i` across the warp touches 32 four-byte pieces
+/// scattered over EIGHT 128-byte lines, using 16 bytes of each. That is the 2x:
+/// eight sector requests where a coalesced warp issues four.
+///
+/// The permutation that fixes it is therefore forced, not chosen — write the
+/// bytes down in the order the loads want them:
+///
+/// ```text
+///   dst_word(c, w) = (w / 4) * 32 + c * 4 + (w % 4)
+/// ```
+///
+/// for weight row `c` of the tile (`0..8`) and 32-bit word `w` of that row's k
+/// tile (`0..8`). Substituting `c = lane >> 2`, `w = (lane & 3) + 4 * i` gives
+/// `dst_word = 32 * i + lane` exactly: load `i` is 128 CONTIGUOUS bytes, in
+/// lane order, which is the fully-coalesced case. No staging, no shared
+/// memory, no barrier — the only cost is that the bytes were written down
+/// differently, once, and the weights are static.
+///
+/// The block is 256 bytes and blocks run `(n_tile, k_tile)` row-major, so a
+/// k loop still walks forward through memory and consecutive n tiles stay
+/// `k / 2` bytes apart, i.e. the outer locality is unchanged.
+#[inline]
+fn swz_word(c: usize, w: usize) -> usize {
+    // 4 = words a row contributes to ONE load (8 words / 2 loads); 32 = the
+    // words one load takes across the warp (NTILE rows x 4).
+    (w / 4) * 32 + c * 4 + (w % 4)
+}
+
+/// Permute `[n, k/2]` packed E2M1 codes into MMA-fragment order.
+///
+/// Output is the same length and the same bytes; only their order changes.
+/// Block `(n_tile, k_tile)` occupies 256 consecutive bytes at
+/// `((n_tile * k/64) + k_tile) * 256`, and inside it word `32 * i + lane` is
+/// exactly what lane `lane`'s load `i` reads. See [`swz_word`].
+pub fn swizzle_b_codes(src: &[u8], n: usize, k: usize) -> Vec<u8> {
+    assert_eq!(n % NTILE, 0, "n {n} is not a multiple of {NTILE}");
+    assert_eq!(k % KTILE, 0, "k {k} is not a multiple of {KTILE}");
+    assert_eq!(src.len(), n * k / 2, "codes are not [n, k/2]");
+    let kt = k / KTILE;
+    let row_w = k / 8; // 32-bit words in one weight row
+    let mut dst = vec![0u8; src.len()];
+    for nt in 0..n / NTILE {
+        for t in 0..kt {
+            let blk = (nt * kt + t) * 256;
+            for c in 0..NTILE {
+                for w in 0..8 {
+                    let s = ((nt * NTILE + c) * row_w + t * 8 + w) * 4;
+                    let d = blk + swz_word(c, w) * 4;
+                    dst[d..d + 4].copy_from_slice(&src[s..s + 4]);
+                }
+            }
+        }
+    }
+    dst
+}
+
+/// Permute `[n, k/16]` E4M3 block scales to match [`swizzle_b_codes`].
+///
+/// One MMA consumes four scale bytes per weight row — `scales_count() = 4`,
+/// one per 16 k elements of the 64 the instruction covers — so a fragment's
+/// scales are 8 rows x 4 bytes = 32 bytes, and unpermuted those are eight
+/// separate sectors for 32 useful bytes: the same defect as the codes, at an
+/// eighth the volume and the SAME sector count. Blocked as `[n_tile][k_tile][8
+/// rows][4]` they are 32 contiguous bytes, i.e. one sector for the whole warp.
+///
+/// The scale grouping is unchanged — still one E4M3 per 16 elements along k,
+/// still the same byte for the same 16 elements. Only where it is written
+/// moves, which is why the output is bit-identical rather than close.
+pub fn swizzle_b_scales(src: &[u8], n: usize, k: usize) -> Vec<u8> {
+    assert_eq!(n % NTILE, 0);
+    assert_eq!(k % KTILE, 0);
+    assert_eq!(src.len(), n * (k / GROUP), "scales are not [n, k/16]");
+    let kt = k / KTILE;
+    let spr = k / GROUP;
+    // E4M3 scales one MMA consumes per weight row: `scales_count()`, which for
+    // this instruction is `KTILE / GROUP`.
+    let per = KTILE / GROUP;
+    let mut dst = vec![0u8; src.len()];
+    for nt in 0..n / NTILE {
+        for t in 0..kt {
+            let blk = (nt * kt + t) * NTILE * per;
+            for c in 0..NTILE {
+                let s = (nt * NTILE + c) * spr + t * per;
+                dst[blk + c * per..blk + c * per + per].copy_from_slice(&src[s..s + per]);
+            }
+        }
+    }
+    dst
+}
+
+/// [`fp4_linear`] reading a B operand that is ALREADY in fragment order.
+///
+/// Line for line [`fp4_linear`] with one expression changed — the B index — so
+/// the k order, the operands, the accumulator and the output store are
+/// identical and so is the output, bit for bit, given
+/// [`swizzle_b_codes`]/[`swizzle_b_scales`] of the same weights.
+///
+/// The point of contrast is [`fp4_linear_smem`], which recovers the same
+/// bandwidth by STAGING the scattered read through shared memory at runtime.
+/// This kernel needs no shared memory, no `sync_plane`, no row padding to dodge
+/// bank conflicts and no chunk-size knob — the load is coalesced by
+/// construction, so nothing about it depends on how many planes are resident.
+/// That last part is not a bandwidth claim and is worth checking separately:
+/// the staged arm wants `INK_MOE_PLANES=1` at decode and 4 at prefill, and a
+/// kernel with no smem has no such preference to have.
+///
+/// `swz_sc` says whether the scale plane was permuted too. Separate knob for
+/// the same reason [`fp4_linear_smem`]'s `stage_sc` is separate: they are two
+/// defects, and leaving it off measures the code permutation against an
+/// otherwise unchanged baseline.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn fp4_linear_swz<AB: Scalar, S: Scalar, NA: Size, NC: Size>(
+    a: &Tensor<Vector<AB, NA>>,
+    a_sc: &Tensor<S>,
+    b: &Tensor<Vector<AB, NA>>,
+    b_sc: &Tensor<S>,
+    out: &mut Tensor<Vector<f32, NC>>,
+    #[comptime] size_k: usize,
+    #[comptime] size_n: usize,
+    #[comptime] swz_sc: bool,
+    scale: f32,
+) {
+    let def = cmma::MmaDefinition::<AB, AB, f32>::new_scaled::<S>(MTILE, NTILE, KTILE, 4usize);
+    let lane = UNIT_POS_PLANE;
+    let pack = AB::packing_factor();
+
+    let m_tile = CUBE_POS_X as usize;
+    let n_tile = CUBE_POS_Y as usize;
+    let n_base = n_tile * NTILE;
+    let m_base = m_tile * MTILE;
+
+    let ec_a = def.elems_per_lane(MatrixIdent::A);
+    let vs_a = def.vector_size(MatrixIdent::A);
+    let vc_a = comptime!(ec_a / vs_a);
+    let ec_b = def.elems_per_lane(MatrixIdent::B);
+    let vs_b = def.vector_size(MatrixIdent::B);
+    let vc_b = comptime!(ec_b / vs_b);
+    let ec_c = def.elems_per_lane(MatrixIdent::Accumulator);
+    let vs_c = def.vector_size(MatrixIdent::Accumulator);
+    let vc_c = comptime!(ec_c / vs_c);
+
+    let mut reg_a = Array::<Vector<AB, NA>>::new(vc_a);
+    let mut reg_b = Array::<Vector<AB, NA>>::new(vc_b);
+    let mut acc = Array::<Vector<f32, NC>>::new(vc_c);
+    #[unroll]
+    for i in 0..vc_c {
+        acc[i] = Vector::<f32, NC>::cast_from(0.0f32);
+    }
+
+    let scales_count = def.scales_count();
+    let size!(NS) = def.scales_vector_size();
+    let sia = def.scales_index(lane, MatrixIdent::A) as usize;
+    let sib = def.scales_index(lane, MatrixIdent::B) as usize;
+    let spr = comptime!(size_k / GROUP);
+    let k_tiles = comptime!(size_k / KTILE);
+
+    for t in 0..k_tiles {
+        let kbase = t * KTILE;
+        #[unroll]
+        for i in 0..vc_a {
+            let (row, col) = def.position_of_nth(lane, (i * vs_a * pack) as u32, MatrixIdent::A);
+            let gr = row as usize + m_base;
+            let gc = col as usize + kbase;
+            reg_a[i] = a[(gr * size_k / 2 + gc / 2) / a.vector_size()];
+        }
+        // The B block for this `(n_tile, t)` is 256 contiguous bytes and word
+        // `32 * i + lane` of it is this lane's `i`-th load, so the warp's load
+        // is 128 consecutive bytes in lane order. Written out of
+        // `position_of_nth` rather than assumed, so it tracks the target's own
+        // fragment layout: `row` is the k element, `col` the n column, and
+        // `swz_word`'s `(c, w)` are `col` and `row / 8`.
+        #[unroll]
+        for i in 0..vc_b {
+            let (row, col) = def.position_of_nth(lane, (i * vs_b * pack) as u32, MatrixIdent::B);
+            let w = row as usize / 8;
+            let blk = (n_tile * k_tiles + t) * 256;
+            let off = (w / 4) * 32 + col as usize * 4 + (w % 4);
+            reg_b[i] = b[(blk + off * 4) / b.vector_size()];
+        }
+
+        let mut sa = Vector::<S, NS>::empty();
+        let mut sb = Vector::<S, NS>::empty();
+        #[unroll]
+        for i in 0..scales_count {
+            sa[i] = a_sc[(sia + m_base) * spr + t * 4 + i];
+            sb[i] = if comptime![swz_sc] {
+                b_sc[((n_tile * k_tiles + t) * NTILE + sib) * 4 + i]
+            } else {
+                b_sc[(sib + n_base) * spr + t * 4 + i]
+            };
+        }
+
+        let d = def.execute_scaled(&reg_a, &reg_b, &acc, sa, sb);
+        #[unroll]
+        for i in 0..vc_c {
+            acc[i] = d[i];
+        }
+    }
+
+    #[unroll]
+    for i in 0..vc_c {
+        let (row, col) = def.position_of_nth(lane, (i * vs_c) as u32, MatrixIdent::Accumulator);
+        let gr = row as usize + m_base;
+        let gc = col as usize + n_base;
+        out[(gr * size_n + gc) / out.vector_size()] = acc[i] * Vector::<f32, NC>::cast_from(scale);
+    }
+}
+
+/// Launch [`fp4_linear_swz`]; [`fp4_linear_launch`]'s arguments, with `b` (and
+/// `b_sc`, if `swz_sc`) already permuted.
+#[allow(clippy::too_many_arguments)]
+pub fn fp4_linear_swz_launch<R: Runtime>(
+    client: &ComputeClient<R>,
+    a: &Handle,
+    a_sc: &Handle,
+    b: &Handle,
+    b_sc: &Handle,
+    m_pad: usize,
+    k: usize,
+    n: usize,
+    scale: f32,
+    swz_sc: bool,
+) -> Handle {
+    assert_eq!(m_pad % MTILE, 0);
+    assert_eq!(n % NTILE, 0);
+    assert_eq!(k % KTILE, 0);
+    assert!(n / NTILE <= 65535);
+
+    let out = client.empty(m_pad * n * core::mem::size_of::<f32>());
+    let vs = 32 / e2m1x2::cube_type().size_bits();
+    let spr = k / GROUP;
+
+    unsafe {
+        fp4_linear_swz::launch::<e2m1x2, e4m3, R>(
+            client,
+            CubeCount::Static((m_pad / MTILE) as u32, (n / NTILE) as u32, 1),
+            CubeDim::new_1d(32),
+            vs,
+            2,
+            TensorArg::from_raw_parts(a.clone(), [k / 2, 1].into(), [m_pad, k / 2].into()),
+            TensorArg::from_raw_parts(a_sc.clone(), [spr, 1].into(), [m_pad, spr].into()),
+            TensorArg::from_raw_parts(b.clone(), [k / 2, 1].into(), [n, k / 2].into()),
+            TensorArg::from_raw_parts(b_sc.clone(), [spr, 1].into(), [n, spr].into()),
+            TensorArg::from_raw_parts(out.clone(), [n, 1].into(), [m_pad, n].into()),
+            k,
+            n,
+            swz_sc,
+            scale,
+        )
+    };
+    out
+}
+
+/// Dump the MMA fragment map off the device, so the permutation above is a
+/// measurement rather than a diagram.
+///
+/// One plane. Lane `l` writes `out[(l * 4 + i) * 2 + {0,1}] = {row, col}` of
+/// `def.position_of_nth(l, i * vs * pack, MatrixIdent::B)` — i.e. the same call
+/// [`fp4_linear`] uses to build its B address, asked for its answer instead of
+/// for an address. `out` must hold `32 * 4 * 2` u32; entries past `vc_b` stay
+/// at whatever the caller put there and should be ignored (`vc_b` is printed
+/// alongside as `out[256]`).
+#[cube(launch)]
+pub fn fp4_frag_b_map<AB: Scalar, S: Scalar>(out: &mut Tensor<u32>) {
+    let def = cmma::MmaDefinition::<AB, AB, f32>::new_scaled::<S>(MTILE, NTILE, KTILE, 4usize);
+    let lane = UNIT_POS_PLANE;
+    let pack = AB::packing_factor();
+    let ec_b = def.elems_per_lane(MatrixIdent::B);
+    let vs_b = def.vector_size(MatrixIdent::B);
+    let vc_b = comptime!(ec_b / vs_b);
+    #[unroll]
+    for i in 0..vc_b {
+        let (row, col) = def.position_of_nth(lane, (i * vs_b * pack) as u32, MatrixIdent::B);
+        out[(lane as usize * 4 + i) * 2] = row;
+        out[(lane as usize * 4 + i) * 2 + 1] = col;
+    }
+    if lane == 0 {
+        out[256] = vc_b as u32;
+        out[257] = vs_b as u32;
+        out[258] = ec_b as u32;
+        out[259] = def.scales_count() as u32;
+        out[260] = def.scales_index(lane, MatrixIdent::B);
+    }
+    // Every lane's scale row, so the `[n_tile][k_tile][8][4]` claim about the
+    // scale plane is checkable too and not inferred from lane 0 alone.
+    out[261 + lane as usize] = def.scales_index(lane, MatrixIdent::B);
+}
+
+/// Launch [`fp4_frag_b_map`] and return the raw `u32` dump.
+pub fn fp4_frag_b_map_launch<R: Runtime>(client: &ComputeClient<R>) -> Handle {
+    let out = client.empty(300 * 4);
+    unsafe {
+        fp4_frag_b_map::launch::<e2m1x2, e4m3, R>(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(32),
+            TensorArg::from_raw_parts(out.clone(), [1].into(), [300].into()),
+        )
+    };
+    out
+}

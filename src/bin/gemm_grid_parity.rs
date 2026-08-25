@@ -13,7 +13,9 @@
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 
-use mary::models::inkling::fp4gemm::fp4_linear_launch;
+use mary::models::inkling::fp4gemm::{
+    fp4_linear_launch, fp4_linear_swz_launch, swizzle_b_codes, swizzle_b_scales,
+};
 use mary::models::inkling::w4a16gemm::{w4a16_linear_launch, w4a16_linear_wide_launch};
 
 type Rt = cubecl::cuda::CudaRuntime;
@@ -83,13 +85,50 @@ fn main() {
         // W4A4: both operands packed E2M1 with E4M3 block scales.
         let qa = client.create_from_slice(&bytes(m_pad * k / 2, 0x2b91));
         let qa_sc = client.create_from_slice(&scales(m_pad * (k / 16)));
-        let qb = client.create_from_slice(&bytes(n * k / 2, 0x77c3));
-        let qb_sc = client.create_from_slice(&scales(n * (k / 16)));
+        let b_raw = bytes(n * k / 2, 0x77c3);
+        let b_sc_raw = scales(n * (k / 16));
+        let qb = client.create_from_slice(&b_raw);
+        let qb_sc = client.create_from_slice(&b_sc_raw);
         let d_fp4 = read_digest(
             &client,
             fp4_linear_launch::<Rt>(&client, &qa, &qa_sc, &qb, &qb_sc, m_pad, k, n, 0.75),
         );
 
-        println!("m_pad {m_pad:>4}  w4a16 {d_w4:016x}  wide {d_wide:016x}  fp4 {d_fp4:016x}");
+        // W4A4 again with B PRE-PERMUTED into MMA fragment order. The bytes are
+        // the same bytes in a different order and the kernel undoes the order,
+        // so this digest has to equal `d_fp4` exactly -- and the three columns
+        // to its left have to equal what this harness printed at the revision
+        // BEFORE the permutation existed, or something other than the layout
+        // moved. Those columns are unchanged code; the check is that they are
+        // also unchanged output.
+        let qbz = client.create_from_slice(&swizzle_b_codes(&b_raw, n, k));
+        let qbz_sc = client.create_from_slice(&swizzle_b_scales(&b_sc_raw, n, k));
+        let d_swz = read_digest(
+            &client,
+            fp4_linear_swz_launch::<Rt>(
+                &client, &qa, &qa_sc, &qbz, &qbz_sc, m_pad, k, n, 0.75, true,
+            ),
+        );
+        // And with the SCALE plane left in row-major order, which is the
+        // half-permuted variant `fp4_linear_swz`'s `swz_sc = false` reads.
+        let d_swz_c = read_digest(
+            &client,
+            fp4_linear_swz_launch::<Rt>(
+                &client, &qa, &qa_sc, &qbz, &qb_sc, m_pad, k, n, 0.75, false,
+            ),
+        );
+
+        println!(
+            "m_pad {m_pad:>4}  w4a16 {d_w4:016x}  wide {d_wide:016x}  fp4 {d_fp4:016x}  \
+             swz {d_swz:016x}  swz(codes only) {d_swz_c:016x}"
+        );
+        assert_eq!(
+            d_swz, d_fp4,
+            "pre-permuted B is NOT bit-identical at m_pad {m_pad}"
+        );
+        assert_eq!(
+            d_swz_c, d_fp4,
+            "pre-permuted codes with row-major scales are NOT bit-identical at m_pad {m_pad}"
+        );
     }
 }

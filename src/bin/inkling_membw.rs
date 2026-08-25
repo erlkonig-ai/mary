@@ -1172,6 +1172,108 @@ fn run_axes() -> Result<()> {
             report(label, bytes, sb, sf);
         }
 
+        // ---- rows 40+: the same kernel on a PRE-PERMUTED weight ---------
+        //
+        // The third arm, and the one that costs nothing at runtime. Rows 35-39
+        // recover the coalesced rate by moving the scattered read into shared
+        // memory; `fp4_linear_swz` recovers it by having the bytes already be
+        // in fragment order, which for a STATIC weight is a property of how it
+        // was written down rather than of what the kernel does. Same 1 GiB
+        // handle, same output allocation, same store — so the only difference
+        // from row 15 is the B address expression.
+        //
+        // Reusing `big`/`sc` is deliberate: the swizzled kernel reads exactly
+        // the same volume out of exactly the same pages, so an address-pattern
+        // difference cannot be an allocator or placement artefact. Its CONTENTS
+        // would have to be permuted for the arithmetic to agree, which is why
+        // bit-identity is proved in `gemm_grid_parity` on host-created bytes
+        // and not here on an uninitialised handle.
+        //
+        // First: the fragment map itself, off the device, because every claim
+        // about the permutation rests on it.
+        {
+            use mary::models::inkling::fp4gemm::fp4_frag_b_map_launch;
+            let h = fp4_frag_b_map_launch::<Rt>(&client);
+            let raw = client.read_one(h).expect("frag map");
+            let w: Vec<u32> = raw
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let (vc, vs, ec, scn) = (w[256], w[257], w[258], w[259]);
+            println!(
+                "\n  m16n8k64 B fragment, from position_of_nth: elems/lane {ec}, vector {vs}, \
+                 loads/lane {vc}, scales/lane {scn}"
+            );
+            let mut closed = true;
+            for l in 0..32usize {
+                for i in 0..vc as usize {
+                    let (row, col) = (w[(l * 4 + i) * 2], w[(l * 4 + i) * 2 + 1]);
+                    closed &= col as usize == l >> 2 && row as usize == (l & 3) * 8 + i * 32;
+                }
+                closed &= w[261 + l] as usize == l >> 2;
+            }
+            println!(
+                "  lanes 0..4:  {}",
+                (0..4)
+                    .flat_map(|l: usize| (0..vc as usize).map(move |i| format!(
+                        "l{l}/{i} k={} n={}",
+                        w[(l * 4 + i) * 2],
+                        w[(l * 4 + i) * 2 + 1]
+                    )))
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            );
+            println!(
+                "  lanes 4..8:  {}",
+                (4..8)
+                    .flat_map(|l: usize| (0..vc as usize).map(move |i| format!(
+                        "l{l}/{i} k={} n={}",
+                        w[(l * 4 + i) * 2],
+                        w[(l * 4 + i) * 2 + 1]
+                    )))
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            );
+            println!(
+                "  closed form col = lane>>2, k = (lane&3)*8 + 32*i, scale row = lane>>2: {}",
+                if closed {
+                    "HOLDS for all 32 lanes"
+                } else {
+                    "DOES NOT HOLD -- the swizzle is wrong"
+                }
+            );
+            assert!(
+                closed,
+                "the fragment map is not what swizzle_b_codes assumes"
+            );
+        }
+
+        use mary::models::inkling::fp4gemm::fp4_linear_swz_launch;
+        for (label, swz_sc) in [
+            ("40 PRE-PERMUTED codes (scales untouched)", false),
+            ("41 PRE-PERMUTED codes + scales", true),
+        ] {
+            let (zb, zf) = best_first(
+                || {
+                    let t0 = Instant::now();
+                    let o = fp4_linear_swz_launch::<Rt>(
+                        &client, &qa, &qa_sc, &big, &sc, m_pad, k, n, 1.0, swz_sc,
+                    );
+                    let _ = cubecl::future::block_on(client.sync());
+                    let dt = t0.elapsed().as_secs_f64();
+                    drop(o);
+                    dt
+                },
+                reps,
+            );
+            report(label, bytes, zb, zf);
+            println!(
+                "     net of the {:.3} ms output alloc: {:.1} GB/s",
+                ab * 1e3,
+                bytes as f64 / (zb - ab) / 1e9
+            );
+        }
+
         // Bit equality against row 15. The staged kernel changes WHERE the B
         // fragment is read from and nothing else, so anything but identical
         // output is a defect in the staging rather than a rounding difference.
