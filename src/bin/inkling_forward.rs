@@ -5282,6 +5282,10 @@ fn main() -> Result<()> {
         // The tail is handed the stream the head already embedded and ran; it takes
         // `n` and `pos0` from the wire rather than from `ids`, because those are
         // facts about the pass and only the head owns the token loop.
+        // Everything this pass does BEFORE the embedding -- the feed
+        // construction above. Named so that "it is small" is a number in the log
+        // rather than a belief about the log.
+        let t_prep = pass.elapsed().as_secs_f64();
         let t_emb = Instant::now();
         let (n, pos0, x_in) = match incoming {
             Some((n, p, _c, x)) => (n, p, x),
@@ -5319,6 +5323,13 @@ fn main() -> Result<()> {
         // and this is the one cast that pays for the whole stack staying narrow.
         let mut xd: T2 = dev_lane_resid::as_resid(up2::<Bk>(x_in, n, h, &dev));
         let t_embed = t_emb.elapsed().as_secs_f64();
+        // The layer loop AND its setup, bracketed WHOLE.
+        //
+        // `t_attn`, `t_other`, the first-touch uploads and the pool hand-back all
+        // sit inside this bracket, so `t_layers` minus their sum is in-loop work
+        // that no bucket names -- which is precisely what UNATTRIBUTED used to
+        // swallow without saying so. A partition needs an outer edge; this is it.
+        let t_ly = Instant::now();
 
         let ls = LogScaling {
             n_floor: t.log_scaling_n_floor as f32,
@@ -5387,6 +5398,12 @@ fn main() -> Result<()> {
         // that "the policy took the cheap branch" is a number in the log rather
         // than an inference from the absence of one.
         let mut cleanups = 0usize;
+        // What the hand-back COSTS, beside how often it happened. It is a device
+        // DRAIN plus the pool's free/alloc churn plus a `/proc/meminfo` poll, and
+        // it lands between `t_other` stopping and the next layer starting -- so
+        // until it was timed it collected the device time of the layer that had
+        // just been enqueued and charged it to nothing.
+        let mut t_cleanup = 0f64;
         let (mut d_attn, mut d_router, mut d_expert, mut d_shared, mut d_tail) =
             (0f64, 0f64, 0f64, 0f64, 0f64);
         let mut stage_syncs = 0usize;
@@ -6399,6 +6416,10 @@ fn main() -> Result<()> {
             // asking an operator to remember a variable.
             // `memory_usage` is the pool's own host-side bookkeeping and needs no
             // sync to read; the sync below belongs to the cleanup.
+            // Timed from BEFORE `memory_usage`, so the policy's own question --
+            // `at_layer` reads `/proc/meminfo` and two cgroup files, once per
+            // layer -- is inside the number and not beside it.
+            let t_cl = Instant::now();
             let stranded = match fp4_client.memory_usage() {
                 Ok(u) => mary::models::inkling::pool::stranded_bytes(
                     u.bytes_reserved,
@@ -6412,7 +6433,9 @@ fn main() -> Result<()> {
                 fp4_client.memory_cleanup();
                 cleanups += 1;
             }
+            t_cleanup += t_cl.elapsed().as_secs_f64();
         }
+        let t_layers = t_ly.elapsed().as_secs_f64();
 
         // This slot is prefilled; seat it in the batch and let go of it. The next
         // slot starts from an empty `caches`.
@@ -6527,6 +6550,12 @@ fn main() -> Result<()> {
             down(BT::cat(std::mem::take(&mut layer_rms), 0))
         };
         let t_stack_sync = t_sy.elapsed().as_secs_f64();
+        // Everything from the stack sync to the report: the per-layer RMS lines,
+        // the residual readback, the head, the argmax, the KV commit, the MTP
+        // draft and the peer wait. `t_x_down`, `t_head`, `t_draft` and
+        // `t_wait_peer` are NESTED inside this bracket and are printed as parts
+        // of it -- never added to `named` a second time.
+        let t_tl = Instant::now();
         for (i, &(layer, is_local)) in layer_kind.iter().enumerate() {
             println!(
                 "  layer {layer:2} [{}] rms {:.4}",
@@ -6612,6 +6641,9 @@ fn main() -> Result<()> {
             n - verify_rows
         };
         let (mut t_send, mut t_wait_peer) = (0f64, 0f64);
+        // THIS pass's drafting. `acc_draft` is the run's, and a per-pass report
+        // cannot be a partition using a run-scoped total.
+        let mut t_draft = 0f64;
         let mut wire_toks: Vec<usize> = Vec::new();
         // Which cohort the answer read on THIS pass belongs to. The pass's own
         // cohort everywhere except an interleaved head, where it is the cohort sent
@@ -7521,7 +7553,9 @@ fn main() -> Result<()> {
                     mtp_pending.push((step + d + 1, d, b));
                 }
             }
-            acc_draft += t_mtp.elapsed().as_secs_f64();
+            let d_mtp = t_mtp.elapsed().as_secs_f64();
+            acc_draft += d_mtp;
+            t_draft += d_mtp;
             // The drafts go to the head, which is the only process that can embed
             // them. Sent HERE and not with the answer, so the head was blocked on
             // the verify pass alone and this drafting overlaps its commit.
@@ -7574,6 +7608,12 @@ fn main() -> Result<()> {
             ids.push(best);
         }
 
+        let t_tail_host = t_tl.elapsed().as_secs_f64();
+        // The pass as it stands BEFORE the report prints a line. Sampling it
+        // inside the report -- which is what this used to do -- charged the
+        // report's own hundred-odd `println!`s to the pass it was describing,
+        // and stdout to a pipe is not free.
+        let whole_pass = pass.elapsed().as_secs_f64();
         println!("\n=== predictions ===");
         println!("  expert slabs decoded: {expert_loads}");
         // Which branch the cleanup policy took, as a count and not as an inference
@@ -7673,16 +7713,57 @@ fn main() -> Result<()> {
             "    residual to the host{:9.1}   (the [n, hidden] the wire and the draft path read)",
             ms(t_x_down)
         );
-        // The report is a partition or it is decoration. Everything above is a
-        // stage; this is the pass MINUS the stages, and a run that grows it is a
-        // run doing work no line here names.
+        // The report is a partition or it is decoration.
+        //
+        // It was decoration. `named` summed six stage timers that between them
+        // covered maybe two thirds of a pass: the first-touch uploads were
+        // MEASURED and then left out of the sum, the per-layer pool hand-back was
+        // never timed at all, and everything from the head to here -- the argmax
+        // over a 200k-wide row, the KV commit, the MTP draft -- was in no bucket.
+        // Worse, `whole` was read INSIDE the report, so the report's own hundred
+        // `println!`s were charged to UNATTRIBUTED as well.
+        //
+        // So the partition is now cut at four OUTER brackets that tile the pass
+        // by construction -- prologue, layer loop, stack sync, everything after
+        // it -- and every stage above is a part of one of them. A number that
+        // grows here is now genuinely work no line names, which is the only
+        // reading that was ever worth printing.
+        let t_named_in_loop = t_attn + t_other + t_attn_read + t_attn_up + t_cleanup;
+        let t_named_after = t_x_down + t_head + t_draft + t_wait_peer;
+        println!(
+            "    pass prologue   {:9.1}   (feed construction, before the embedding)",
+            ms(t_prep)
+        );
+        println!(
+            "    layer loop      {:9.1}   (outer bracket; the HOST lines above are its parts)",
+            ms(t_layers)
+        );
+        println!(
+            "      pool hand-back{:9.1}   ({} of {} layers -- a device DRAIN, plus free/alloc churn and a /proc/meminfo poll)",
+            ms(t_cleanup),
+            cleanups,
+            hi - lo
+        );
+        println!(
+            "      unnamed in-loop{:8.1}   (loop total less attention + mlp + first-touch + hand-back)",
+            ms(t_layers - t_named_in_loop)
+        );
+        println!(
+            "    after the sync  {:9.1}   (outer bracket: RMS lines, residual, head, argmax, commit, draft)",
+            ms(t_tail_host)
+        );
+        println!(
+            "      MTP draft     {:9.1}, peer wait {:9.1}, sampling + commit {:9.1}",
+            ms(t_draft),
+            ms(t_wait_peer),
+            ms(t_tail_host - t_named_after)
+        );
         {
-            let named = t_embed + t_attn + t_other + t_stack_sync + t_head + t_x_down;
-            let whole = pass.elapsed().as_secs_f64();
+            let named = t_prep + t_embed + t_layers + t_stack_sync + t_tail_host;
             println!(
-                "    UNATTRIBUTED    {:9.1}   (this pass, {:.1} ms, less every stage above)",
-                ms(whole - named),
-                ms(whole)
+                "    UNATTRIBUTED    {:9.1}   (this pass, {:.1} ms, less the four outer brackets)",
+                ms(whole_pass - named),
+                ms(whole_pass)
             );
         }
         println!(
