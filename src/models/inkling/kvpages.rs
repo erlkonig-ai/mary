@@ -605,7 +605,7 @@ impl Fp4PageStore {
     /// One dequant launch over the whole retained context, after the pages have
     /// been joined — not one per page. The join is `cat` on the PACKED buffers,
     /// so it moves 4.5 bits a value where the dense store moved sixteen.
-    pub fn materialize(&self, dev: &<Bk as Backend>::Device) -> Tensor<Bk, 2> {
+    pub fn materialize(&self, dev: &burn::backend::cuda::CudaDevice) -> Tensor<Bk, 2> {
         let Some(all) = self.pages.gather() else {
             let empty = Tensor::<Bk, 2>::zeros([0, self.width], dev);
             return match self.dtype {
@@ -756,7 +756,7 @@ impl KvStore<Bk> {
 
     /// The rows as one contiguous dense tensor, in order — what the attention
     /// read wants, on either arm.
-    pub fn materialize(&self, dev: &<Bk as Backend>::Device) -> Tensor<Bk, 2> {
+    pub fn materialize(&self, dev: &burn::backend::cuda::CudaDevice) -> Tensor<Bk, 2> {
         match self {
             Self::Wide(s) => s.materialize(dev),
             Self::Fp4(s) => s.materialize(dev),
@@ -928,7 +928,7 @@ mod tests {
     /// smallest slice of a real KV row that has the same block geometry.
     const FW: usize = 128;
 
-    fn fp4_dev() -> <B as Backend>::Device {
+    fn fp4_dev() -> burn::backend::cuda::CudaDevice {
         Default::default()
     }
 
