@@ -1771,6 +1771,49 @@ struct MtpDevCache {
 /// residual add would want one. The concat order is the whole open question the
 /// acceptance rate answers, so it is a parameter here exactly as it is on the
 /// host.
+/// `INK_MTP_BACKBONE_NORM=0` restores the pre-2026-08-24 behaviour: a drafted
+/// token's embedding goes to the depth head RAW, without the backbone
+/// `embed_norm`. It exists so the change can be A/B'd in one binary against the
+/// arm it replaces, which is the only honest way to price it -- not as a
+/// fallback. Default on.
+fn backbone_embed_norm() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("INK_MTP_BACKBONE_NORM")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// One embedding row as an MTP depth layer must see it.
+///
+/// The depth layers were trained on the embeddings the BACKBONE consumes, so
+/// the chain is `depth_embed_norm(backbone_embed_norm(embed(id)))`. Their own
+/// `embed_norm` weights are near-identity trims; the backbone's is a whitening
+/// norm, and skipping it hands the head a differently-scaled vector. vLLM's
+/// implementation states the cost outright: "feeding raw embeddings drops MTP1
+/// acceptance from ~0.85 to ~0.70".
+///
+/// `backbone_norm` is `None` when the model declares no `use_embed_norm`, or
+/// under `INK_MTP_BACKBONE_NORM=0`; then this is exactly [`embed_row_bf16`].
+///
+/// Speculation is self-verifying, so getting this wrong never produced wrong
+/// text -- only a low acceptance rate, which is why it survived so long.
+fn mtp_embed_row(
+    table: &[u8],
+    backbone_norm: Option<&[f32]>,
+    id: usize,
+    eps: f64,
+    vocab: usize,
+    hidden: usize,
+) -> Vec<f32> {
+    match backbone_norm {
+        Some(gain) => embed_and_norm_bf16(&[id], table, gain, eps, vocab, hidden),
+        None => embed_row_bf16(table, id, vocab, hidden),
+    }
+}
+
 fn mtp_input_dev(hidden: T2, embeds: T2, w: &MtpDev, eps: f64, order: MtpConcat) -> T2 {
     let hn = dev_lane::rms_norm(hidden, w.hidden_norm.clone(), eps);
     let en = dev_lane::rms_norm(embeds, w.embed_norm.clone(), eps);
@@ -4158,7 +4201,9 @@ fn main() -> Result<()> {
     }
 
     let want_embed = !is_tail || mtp_k > 0;
-    let want_embed_norm = !is_tail;
+    // A drafting tail needs it too: the MTP depth layers consume the
+    // BACKBONE-normed embedding, not the raw one. See `e_bn` at the draft site.
+    let want_embed_norm = !is_tail || mtp_k > 0;
     let want_head = !is_head;
     // The supported lane copies every weight this process can alias into one
     // anonymous allocation before registration. `INK_STARTUP_COPY=0` exists
@@ -4214,9 +4259,15 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    // `want_embed_norm`, NOT `want_embed`: a drafting tail takes the embedding
-    // table and leaves the norm behind, because every MTP head norms its own
-    // embeddings with its own `embed_norm`.
+    // A drafting tail takes BOTH the table and the norm. It used to take only
+    // the table, on the reasoning that "every MTP head norms its own embeddings
+    // with its own `embed_norm`" -- which is true and not sufficient. vLLM's
+    // implementation (vllm/models/inkling/.../mtp.py), the oracle this lane did
+    // not have when it was written, says the depth layers consume
+    // `embed_norm(embed(ids))`: the BACKBONE norm first, the depth norm second,
+    // "mtp embed_norm weights are near-identity (trained on already-normalized
+    // inputs), and feeding raw embeddings drops MTP1 acceptance from ~0.85 to
+    // ~0.70".
     let embed_n = if want_embed_norm {
         Some(cp.held("model.llm.embed_norm.weight")?)
     } else {
@@ -6767,6 +6818,22 @@ fn main() -> Result<()> {
             let e_w = embed_w
                 .as_ref()
                 .expect("drafting needs the embedding table");
+            // The BACKBONE embed_norm, applied to a drafted token's embedding
+            // BEFORE the depth head's own near-identity `embed_norm`. Gated on
+            // `use_embed_norm` exactly as vLLM gates its `backbone_embed_norm`;
+            // `None` reproduces the old raw-embedding behaviour exactly, which
+            // is what `INK_MTP_BACKBONE_NORM=0` is for.
+            let e_bn: Option<&[f32]> = if t.use_embed_norm && backbone_embed_norm() {
+                Some(
+                    embed_n
+                        .as_ref()
+                        .expect("a drafting tail loads the backbone embed_norm")
+                        .data
+                        .as_slice(),
+                )
+            } else {
+                None
+            };
             let fnorm_d = fnorm.as_ref().expect("drafting needs the final norm");
             // Which hidden state head 0 is fed. `x` is the stack's RAW output, which
             // `head` norms on its way to logits. Feeding the FINAL-NORMED one
@@ -6889,9 +6956,11 @@ fn main() -> Result<()> {
                         debug_assert_eq!(ahead.len(), seq, "one shifted token per position");
                         let mut embeds = vec![0f32; seq * h];
                         for (j, &tok) in ahead.iter().enumerate() {
-                            embeds[j * h..(j + 1) * h].copy_from_slice(&embed_row_bf16(
+                            embeds[j * h..(j + 1) * h].copy_from_slice(&mtp_embed_row(
                                 e_w,
+                                e_bn,
                                 tok,
+                                t.rms_norm_eps,
                                 t.vocab_size,
                                 h,
                             ));
@@ -7110,9 +7179,11 @@ fn main() -> Result<()> {
                             } else {
                                 best
                             };
-                            embeds[j * h..(j + 1) * h].copy_from_slice(&embed_row_bf16(
+                            embeds[j * h..(j + 1) * h].copy_from_slice(&mtp_embed_row(
                                 e_w,
+                                e_bn,
                                 tok,
+                                t.rms_norm_eps,
                                 t.vocab_size,
                                 h,
                             ));
@@ -7156,8 +7227,12 @@ fn main() -> Result<()> {
                             };
                             let ahead = pos + d + 1;
                             let tok = if ahead < seq { ids[ahead] } else { best };
-                            let ed =
-                                up2::<Bk>(embed_row_bf16(e_w, tok, t.vocab_size, h), 1, h, &dev);
+                            let ed = up2::<Bk>(
+                                mtp_embed_row(e_w, e_bn, tok, t.rms_norm_eps, t.vocab_size, h),
+                                1,
+                                h,
+                                &dev,
+                            );
                             made.push(mtp_block_step_dev(
                                 hin,
                                 ed,
@@ -7189,7 +7264,14 @@ fn main() -> Result<()> {
                         let mut scratch = mtp_dev_caches[d].as_ref().expect("prefilled").clone();
                         for i in 0..d {
                             let ed = up2::<Bk>(
-                                embed_row_bf16(e_w, drafts[i], t.vocab_size, h),
+                                mtp_embed_row(
+                                    e_w,
+                                    e_bn,
+                                    drafts[i],
+                                    t.rms_norm_eps,
+                                    t.vocab_size,
+                                    h,
+                                ),
                                 1,
                                 h,
                                 &dev,
@@ -7241,9 +7323,11 @@ fn main() -> Result<()> {
                             } else {
                                 best
                             };
-                            embeds[j * h..(j + 1) * h].copy_from_slice(&embed_row_bf16(
+                            embeds[j * h..(j + 1) * h].copy_from_slice(&mtp_embed_row(
                                 e_w,
+                                e_bn,
                                 tok,
+                                t.rms_norm_eps,
                                 t.vocab_size,
                                 h,
                             ));
@@ -7278,7 +7362,7 @@ fn main() -> Result<()> {
                         };
                         mtp_block_step(
                             hin,
-                            &embed_row_bf16(e_w, best, t.vocab_size, h),
+                            &mtp_embed_row(e_w, e_bn, best, t.rms_norm_eps, t.vocab_size, h),
                             &hw,
                             &headw.dims,
                             Some(ls),
@@ -7303,7 +7387,14 @@ fn main() -> Result<()> {
                         for i in 0..d {
                             last = mtp_block_step(
                                 &prev_rows[i],
-                                &embed_row_bf16(e_w, drafts[i], t.vocab_size, h),
+                                &mtp_embed_row(
+                                    e_w,
+                                    e_bn,
+                                    drafts[i],
+                                    t.rms_norm_eps,
+                                    t.vocab_size,
+                                    h,
+                                ),
                                 &hw,
                                 &headw.dims,
                                 Some(ls),
