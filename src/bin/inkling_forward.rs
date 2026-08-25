@@ -1654,9 +1654,28 @@ struct SharedOnDevice {
 /// branch-to-collection migration and cannot be opened. A truncated stack is a
 /// real model on a real prompt, but its final hidden states are not the ones
 /// the shipped model produces, and the logit geometry — how crowded the top of
-/// the vocabulary is — is exactly what the budget is sized against. So this
-/// number is evidence and not proof, and re-running `INK_ANN_VERIFY=1` on the
-/// two-node stack is owed before anyone quotes it as a property of the model.
+/// the vocabulary is — is exactly what the budget is sized against.
+///
+/// **How much that matters is itself measured, and it is a lot.** The same
+/// budget of 1024 that scores 0.9231 at layers 0:4 scores 0.0370 at layers 0:2.
+/// Most of that collapse is the SAMPLE and not the lane — the two-layer stump
+/// loops on a single token, so all 81 steps are one hidden state and the "rate"
+/// is one query's luck (the report now says so out loud; see
+/// [`mary::models::inkling::annhead::VERIFY_WINNERS`]). But it settles the
+/// direction of the caveat: recall here is a property of the hidden-state
+/// DISTRIBUTION, the 0:4 table is 65 correlated steps from one prompt, and
+/// extrapolating it to a 42-layer stack is an extrapolation.
+///
+/// So this number is evidence and not proof. Re-running `INK_ANN_VERIFY=1` on
+/// the two-node stack, on more than one prompt, is owed before anyone quotes it
+/// as a property of the model.
+///
+/// It is nevertheless ON, because the cost of being wrong here is bounded and
+/// visible: a shortlist miss produces a different-but-fluent token, the way the
+/// W4A16 head this sits on already does (one token in 24, at a 0.08-logit gap),
+/// and this runtime disagrees with ITSELF on 8.55% of argmax positions between
+/// two runs of the same binary. `INK_ANN_HEAD=0` is the exact lane, unchanged,
+/// one environment variable away.
 const ANN_BUDGET_DEFAULT: usize = 8192;
 
 /// The seed of the sketch's random rotation.

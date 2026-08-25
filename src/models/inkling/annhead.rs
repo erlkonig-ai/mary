@@ -1143,6 +1143,25 @@ pub fn ann_logits<R: Runtime, E: Scalar>(
 pub static VERIFY: [core::sync::atomic::AtomicU64; 5] =
     [const { core::sync::atomic::AtomicU64::new(0) }; 5];
 
+/// The distinct tokens the EXACT head picked over the verified steps.
+///
+/// Not a statistic about the lane — a statistic about whether the SAMPLE means
+/// anything, and it exists because a recall rate taken without it fooled me.
+///
+/// A rate needs independent draws. These are not independent: every step's
+/// hidden state is produced by the sequence the previous steps chose, so a model
+/// that falls into a fixed point hands the same query to the head over and over
+/// and the "rate" is one query's luck printed to four decimal places. That is
+/// not hypothetical. On layers 0:2 the stack looped on a SINGLE token for all 81
+/// steps and reported `recall@1 0.0370 (3/81)`; the ablation arm beside it fell
+/// into a DIFFERENT loop (13 tokens) and reported 0.2346, so the two arms were
+/// not even scored on the same queries. Both numbers looked like measurements.
+///
+/// So the report prints this beside the rate and every reader can see the
+/// denominator that actually matters.
+pub static VERIFY_WINNERS: std::sync::Mutex<std::collections::BTreeSet<usize>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
 /// Compare one approximate logit row against the exact one and fold the result
 /// into [`VERIFY`].
 ///
@@ -1174,6 +1193,9 @@ pub fn verify_row(exact: &[f32], approx: &[f32], floor: f32) {
     }
     let scale = 1.0e6f64;
     VERIFY[0].fetch_add(1, Relaxed);
+    if let Ok(mut w) = VERIFY_WINNERS.lock() {
+        w.insert(best);
+    }
     if abest == best {
         VERIFY[1].fetch_add(1, Relaxed);
     }
@@ -1209,12 +1231,22 @@ pub fn verify_report() -> Option<String> {
     let seen = VERIFY[2].load(Relaxed);
     let err = VERIFY[3].load(Relaxed) as f64 / 1.0e6 / n as f64;
     let gap = VERIFY[4].load(Relaxed) as f64 / 1.0e6 / n as f64;
+    let distinct = VERIFY_WINNERS.lock().map(|w| w.len()).unwrap_or(0);
     Some(format!(
         "aNN recall@1 {:.4} ({agree}/{n}), exact winner shortlisted {:.4} ({seen}/{n}), \
          mean |exact - approx| at the winner {err:.4} logits, mean exact top1-top2 gap \
-         {gap:.4} logits",
+         {gap:.4} logits\n  over {distinct} DISTINCT winning tokens in {n} steps{}",
         agree as f64 / n as f64,
         seen as f64 / n as f64,
+        // The steps are not independent draws -- each one's hidden state comes
+        // out of the tokens the earlier ones chose -- so a collapsed sample is
+        // one query counted n times, and the rate above is that query's luck.
+        if (distinct as u64) * 4 < n {
+            "  <-- COLLAPSED SAMPLE: the rate above is close to one query's luck, \
+             not a recall estimate"
+        } else {
+            ""
+        }
     ))
 }
 
