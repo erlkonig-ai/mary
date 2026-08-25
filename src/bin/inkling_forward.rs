@@ -1622,9 +1622,21 @@ struct SharedOnDevice {
 ///
 /// The mean exact top1-top2 gap over those steps was 0.37-0.40 logits, so these
 /// are genuinely tight decisions and not a distribution where anything would
-/// win. Every arm's "exact winner shortlisted" rate EQUALS its recall to four
-/// places: every miss is a shortlist miss, never a rescore miss, so the budget
-/// is the only lever and raising it is the only fix.
+/// win.
+///
+/// Every arm's "exact winner shortlisted" rate EQUALS its recall to four places,
+/// and that equality is doing more work than it looks. This lane has exactly two
+/// ways to pick the wrong token, and the equality measures BOTH at zero:
+///
+///  1. the winner never cleared the floor, so it was never rescored. That is
+///     `1 - shortlisted`, and it accounts for every miss in the table.
+///  2. the winner WAS rescored, and an unrescored row's ESTIMATE still beat its
+///     exact score. The returned row is a blend, so this is possible in
+///     principle. It would show as recall BELOW the shortlisted rate, and it
+///     never does -- in any arm, at any budget, including the ones where a
+///     third of the shortlists missed.
+///
+/// So the budget is the only lever, and raising it is the only fix.
 ///
 /// And raising it is nearly free, which is what makes 8192 the right point
 /// rather than a cautious one. At the head's own shape (`n = 201024`, `k =
