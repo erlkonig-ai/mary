@@ -1621,7 +1621,10 @@ struct SharedOnDevice {
 ///    16384      1.0000   0.0000
 /// ```
 ///
-/// The mean exact top1-top2 gap over those steps was 0.37-0.40 logits, so these
+/// A second truncated stack agrees: layers 0:3, one prompt, 91 steps, 26
+/// distinct winners, budget 1024 gives **0.9890** against 0:4's 0.9231.
+///
+/// The mean exact top1-top2 gap over those steps was 0.37-0.43 logits, so these
 /// are genuinely tight decisions and not a distribution where anything would
 /// win.
 ///

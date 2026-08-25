@@ -74,7 +74,25 @@
 //! seeded random sign diagonal is `O(D log D)` — twelve butterfly stages on 4096
 //! elements, microseconds against the scan's milliseconds.
 //!
-//! ## What the rotation is worth, measured
+//! ## What the rotation is worth, measured on the REAL table
+//!
+//! `INK_ANN_VERIFY=1` on the real unembedding, layers 0:3, budget 1024, one
+//! prompt, 91 decode steps, `INK_ANN_ROT` selecting the basis. Both arms follow
+//! the EXACT head, so they are scored on the same 91 hidden states — which the
+//! report proves rather than asserts: both print a mean top1-top2 gap of 0.4299
+//! and 26 distinct winning tokens.
+//!
+//! ```text
+//!                    recall@1      mean |exact - approx| at the winner
+//!   rotated          0.9890        0.0363 logits
+//!   raw coordinates  0.6484        1.3040 logits
+//! ```
+//!
+//! Thirty-four points of recall, and the estimator's error at the winner is 36x
+//! smaller. The rotation is not a refinement; without it a one-bit sketch of
+//! this table is not usable at a budget worth having.
+//!
+//! ## The same ablation on a synthetic table
 //!
 //! `inkling_ann_gate`, `n = 201024`, `k = 4096`, **192 near-tie queries per
 //! arm**, GB10. Recall@1 against the exact `w4a16` lane on the same NVFP4 bytes,
@@ -86,17 +104,13 @@
 //!     1024     1.0000    0.9115
 //! ```
 //!
-//! Twenty points of recall at `S = 256` and nine at `S = 1024` — the rotation is
-//! not a refinement, it is most of what makes a one-bit sketch usable at a
-//! budget worth having.
-//!
-//! **The framing that limits this number:** that table is SYNTHETIC, and it was
-//! built with rogue dimensions on purpose (`ROGUE = 24` coordinates at ten times
-//! the mass, row norms spread over a decade). So it demonstrates that the
-//! mechanism works on the structure it is designed for; it does NOT establish
-//! that the real unembedding has that structure. `INK_ANN_ROT=0` exists on the
-//! forward pass for exactly that reason, and running it on the real table under
-//! `INK_ANN_VERIFY=1` is the measurement that would settle it.
+//! Twenty points at `S = 256` and nine at `S = 1024`, in the same direction and
+//! smaller. That table is SYNTHETIC and was built with rogue dimensions on
+//! purpose (`ROGUE = 24` coordinates at ten times the mass, row norms spread
+//! over a decade), so on its own it would only have shown that the mechanism
+//! works on a structure someone planted for it. It is kept because the real
+//! measurement above now agrees with it, and more strongly — which is evidence
+//! that the real unembedding's anisotropy is worse than what was planted.
 //!
 //! `D_s` is essential and not decoration. `H` alone is a fixed, highly
 //! structured map: its first row is all-ones, so `(Hw)_0` is just the coordinate
