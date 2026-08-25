@@ -1059,7 +1059,18 @@ fn env_usize(name: &str, default: usize) -> usize {
 /// Round-robin rounds, of which the first is discarded. `INK_GEMM_AUTOTUNE_ROUNDS`.
 const AUTOTUNE_ROUNDS: usize = 4;
 /// Launches per candidate per round. `INK_GEMM_AUTOTUNE_ITERS`.
-const AUTOTUNE_ITERS: usize = 2;
+///
+/// Eight and not two, because the timed region ends in a SYNC and the sync's
+/// own cost is charged to whatever it closes. The narrow-width GEMMs here run
+/// 45-350 us; a fixed sync overhead divided by two iterations sits inside that
+/// range and compresses the differences the tune exists to see. Divided by
+/// eight it does not.
+///
+/// It is the wrong direction for the L2 hazard -- eight consecutive touches of
+/// one weight are more resident than two -- and that is the trade this knob
+/// exists to let the next person re-take. The compression is symmetric and
+/// cannot invert a ranking; the cache bias can.
+const AUTOTUNE_ITERS: usize = 8;
 /// How far under the static head's time a challenger must land to take the
 /// shape, as a fraction. `INK_GEMM_AUTOTUNE_MARGIN` (in percent).
 ///
