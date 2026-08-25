@@ -321,6 +321,16 @@ pub struct Sketch {
 
 impl Sketch {
     /// Bytes the sketch occupies on the device.
+    ///
+    /// **Not priced by [`super::budget`]'s admission check.** This is a plain
+    /// client allocation, not a weight the loader charges for, so on a box
+    /// "chosen because the working set only just fits" it is 0.097 GiB that
+    /// admission does not know about. It is small next to the 0.43 GiB of codes
+    /// it sits beside and next to the 1.53 GiB of BF16 the rebind already
+    /// dropped -- but this repo has been bitten by unpriced device memory
+    /// before (`INK_ZEROCOPY=0`'s 60+ GiB of expert duplication is "priced
+    /// nowhere"), so the size is printed at build and named here rather than
+    /// left for someone to find in an OOM.
     pub fn bytes(&self) -> usize {
         self.n * self.k / 8 + self.n * 4
     }

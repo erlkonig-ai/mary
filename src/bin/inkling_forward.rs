@@ -5671,7 +5671,8 @@ fn main() -> Result<()> {
                     println!(
                         "  unembed SIGN SKETCH built in {:.2} s, basis {}: {} x {} bits = \
                          {:.3} GiB ({:.2}x under the NVFP4 codes), {} live rows of {}, \
-                         mean row norm {:.4}",
+                         mean row norm {:.4}. NOT in the admission accounting: this \
+                         buffer is a client allocation, not a charged weight",
                         t0.elapsed().as_secs_f64(),
                         if sk.rotated {
                             "ROTATED"
