@@ -430,6 +430,36 @@ use cubecl::prelude::ComputeClient;
 /// synthetic layer and neither is a statement about the model; `golden/paired/`
 /// is where that question is asked. But nobody should read "3.56x more context"
 /// without also reading this.
+///
+/// ## That RMS figure is the WRONG GATE, and this is what should replace it
+///
+/// The 91% above is why this switch is off, and it should not be. It measures
+/// PERTURBATION of a dense RMS on one synthetic layer, and nobody wants an
+/// unperturbed RMS — what a long-context KV cache is FOR is retrieving
+/// something from far back in the prompt. Those are different properties, and
+/// the second does not follow from the first in either direction.
+///
+/// The direct evidence that it does not: the reference implementation SHIPS an
+/// FP4 KV pool (`fp4_mx_block16`, the same 0.5625 bytes an element this file
+/// stores) and retrieves a needle EXACTLY from a 307,581-token prompt, with a
+/// natural stop. So the capability survives the numerics this probe rejects,
+/// and the probe is rejecting a lane on a criterion its own users do not hold.
+///
+/// The replacement gate is a retrieval-on-long-context probe -- the reference's
+/// `bench/probe_longctx.py` lifts directly -- run on both arms of one binary,
+/// the same pairing every other comparison in this file uses. Pass is
+/// "retrieves the needle at a context BF16 cannot hold at all", which is the
+/// claim, rather than "perturbs an RMS by less than X", which is not.
+///
+/// ## Why it is still off TODAY, which is a third reason again
+///
+/// Neither the RMS figure nor the retrieval question is currently the binding
+/// constraint. [`KvStore::materialize`] copies a page per layer, so this arm's
+/// read path is "read 4.5 bits, write 16, read 16" -- MORE bandwidth than the
+/// BF16 arm it replaces, not less. Until that copy goes, an on-by-default FP4
+/// KV would be slower for the contexts that already fit and would prove nothing
+/// about the ones that do not. Flip it when the copy is gone AND the retrieval
+/// probe has run; not on the strength of either alone.
 pub fn fp4_kv() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {

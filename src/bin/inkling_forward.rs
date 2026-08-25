@@ -6,6 +6,42 @@
 //! a wrong mapping — a transposed projection or a swapped gate/up half
 //! produces noise, not English.
 //!
+//! # What a bare run measures, and the rule that keeps it honest
+//!
+//! Every switch below started life default-OFF, because a switch is written the
+//! day its lane is newer than its measurement and the arm that has run for
+//! months is the one a run that says nothing should get. Left alone, that rule
+//! has a failure mode with a name: the DEFAULT CONFIGURATION BECOMES THE
+//! UN-IMPROVED BASELINE, so every run measures the thing we did not build, and
+//! the features accumulate untested beside it.
+//!
+//! So the rule has a second half. **A lane whose output is bit-identical or
+//! better, at no admission cost, goes ON by default, and the switch survives
+//! only as its ABLATION -- same name, inverted default.** A lane that changes
+//! what the model SAYS stays off until someone has measured what it changes,
+//! and no argument from bandwidth or grid occupancy substitutes for that
+//! measurement.
+//!
+//! Which side of the line each switch is on:
+//!
+//! | switch | default | why |
+//! |---|---|---|
+//! | `INK_FUSE_QKVR` | **ON** | output measured bit-identical; 52 MiB/layer, charged at admission |
+//! | `INK_DEV_ROUTE` | **ON** | same decision, computed where the logits already are |
+//! | `INK_ACT_BF16` | **ON** | the reference's own operand dtype |
+//! | `INK_DEV_PLAN` | off | zero memory cost and +5.3..8.5% measured, but its byte-exact `INK_DEVPLAN_CHECK` has not been re-run on this lineage |
+//! | `INK_W4A16_HEAD` | off | model-quality change: quantises the logits the sampler reads |
+//! | `INK_W4A16_SINKS` | off | model-quality change: overrides the publisher's choice of what to quantise |
+//! | `INK_FP4_KV` | off | blocked on `KvStore::materialize`'s copy, which makes its read path cost MORE than BF16; its RMS justification is the wrong gate (see `kvpages::fp4_kv`) |
+//! | `INK_DRAFT_TOPK` | off | cannot change the output (exact-argmax acceptance), only the acceptance RATE -- which is the variable speculation's verdict already turns on. Wants a sweep, and is the switch most likely to move that verdict |
+//! | `INK_GEMM_AUTOTUNE` | off | times a GEMM that had the whole device, which four overlapping projections do not |
+//! | `INK_DENSE_WEIGHTS=device` | off | faster, but costs 3.42 GiB at 0:15 and REFUSES ranges that run today |
+//! | `INK_ZEROCOPY=0` | off | diagnostic; its 60+ GiB of expert duplication is priced nowhere |
+//!
+//! A switch that is merely UNMEASURED does not get a default flip on the
+//! strength of an argument, however good the argument is. That is the same
+//! discipline the rest of this file applies to numbers.
+//!
 //! # There is no single-node mode, and that is deliberate
 //!
 //! One box cannot hold this model: 144 GiB of weights against 119 GiB of RAM.
@@ -4631,6 +4667,41 @@ fn main() -> Result<()> {
     // the drafts change and the acceptance rate with them. Off by default for
     // that reason -- the flag exists so the trade can be ablated, and the name
     // says what it does to the model rather than what it does to the clock.
+    //
+    // ## It cannot change the OUTPUT, and that is not the reason it is off
+    //
+    // `INK_SPEC` accepts on EXACT ARGMAX MATCH, so a draft the target does not
+    // agree with is discarded and the target's own token is kept. Pruning the
+    // candidate set can therefore only lower the ACCEPTANCE RATE; it cannot
+    // produce a token the unspeculated run would not have produced. (The one
+    // rule where that would be false is `INK_MTP_PROB`'s sampled acceptance,
+    // and the two flags already refuse each other, three paragraphs down.)
+    //
+    // So the risk is not correctness. It is that acceptance is precisely the
+    // variable this file measures speculation's whole verdict against, and that
+    // verdict is ALREADY negative on text that is not a template: 0.977x at
+    // `INK_SPEC=1` and 0.798x at `INK_SPEC=2` on the 3732-token document, at
+    // 42.9% depth-1 acceptance against the short prompt's 71.2%. Turning on a
+    // switch whose only direction is DOWN on that variable, unmeasured, would
+    // make the losing arm lose more.
+    //
+    // ## Why it is nevertheless the switch most worth sweeping
+    //
+    // The other half of the trade is large enough to move the verdict rather
+    // than the margin. Two thirds of a ~15.5 ms draft depth is the unembed
+    // matmul alone, and every depth pays it again: 1.65 GiB streamed to keep
+    // ONE index. At N = 512 the gather is 4 MiB, done once per step and shared
+    // by every depth. For scale, the reference implementation's own best
+    // remaining draft-path idea is quantising the draft LM head to W4A16, which
+    // takes it from 785 MiB to about 200 MiB PER DEPTH -- this is 4 MiB, once.
+    //
+    // That is the shape of a trade that can flip a losing loop: the width cost
+    // c(k) falls by most of the draft's cost while acceptance falls by however
+    // much the top-N bet costs. Which is why the sweep has to measure END-TO-END
+    // tok/s on the DOCUMENT corpus and not acceptance alone -- acceptance alone
+    // can only make this look bad, and tok/s is the number the trade is about.
+    // N in {256, 512, 1024, 2048, 0} against `INK_SPEC=1` and `=2`, both
+    // corpora, is the run that would settle the default.
     let draft_topk: usize = std::env::var("INK_DRAFT_TOPK")
         .ok()
         .map(|v| v.parse())
