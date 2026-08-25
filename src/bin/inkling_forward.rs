@@ -4578,6 +4578,10 @@ fn main() -> Result<()> {
     // at f32, and the reason the cached lane can draft at all -- see the draft
     // block for why a row, once produced, never changes.
     let mut mtp_main: Vec<f32> = Vec::new();
+    // Whether the pruned-unembed line has been printed. Once per process, not
+    // once per step: the shape does not change and 100 identical lines would
+    // bury the report the run exists to produce.
+    let mut drafted_pruned = false;
     // Per head: its STABLE hidden rows, which are what the NEXT head reads,
     // and its own K/V cache. Ragged by one row per depth, because head d's
     // stable rows stop at position seq-1-d.
@@ -7120,6 +7124,21 @@ fn main() -> Result<()> {
                             .unwrap_or(std::cmp::Ordering::Equal)
                     });
                     idx.truncate(want);
+                    // Once, on the first step that prunes. The unembed BIND prints
+                    // what it bound and how, and a table that silently becomes 512
+                    // rows wide for half the matmuls in the process is a bigger
+                    // change than that -- a run whose log does not say it happened
+                    // cannot be told apart from one where the flag was ignored.
+                    if !drafted_pruned {
+                        drafted_pruned = true;
+                        println!(
+                            "  draft unembed PRUNED to {want} of {v} rows ({:.2} MiB gathered per \
+                             step against {:.2} GiB streamed per depth); INK_DRAFT_TOPK={draft_topk} \
+                             -- DRAFTS AND ACCEPTANCE CHANGE, this is not the unpruned model",
+                            (want * h * 2) as f64 / (1024.0 * 1024.0),
+                            (t.vocab_size * h * 2) as f64 / GIB,
+                        );
+                    }
                     let ub = unembed_bytes
                         .as_ref()
                         .expect("drafting needs the unembed table");
