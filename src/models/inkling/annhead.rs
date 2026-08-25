@@ -292,7 +292,11 @@ fn sketch_build_kernel(
     // does not run at all. A runtime bound rather than a comptime flag because
     // the two arms differ only in how many butterfly stages happen, and one
     // kernel that can do zero of them is less code than two kernels.
-    let mut len = 1u32;
+    // `u32::new` and not `1u32`: a literal is a COMPTIME value in a cube, and
+    // assigning to one inside a runtime loop is the "mutable operation on a
+    // const variable" the expander refuses. The same reason `stride` below
+    // comes off `CUBE_DIM_X` rather than off the comptime `units`.
+    let mut len = u32::new(1);
     while len < hlim {
         let half = comptime!(k / 2);
         let bper = comptime!(half / units);
@@ -326,7 +330,7 @@ fn sketch_build_kernel(
     red[u as usize] = l1;
     red[(units + u) as usize] = l2;
     sync_cube();
-    let mut stride = comptime!(units / 2);
+    let mut stride = CUBE_DIM_X / 2;
     while stride > 0 {
         if u < stride {
             red[u as usize] += red[(u + stride) as usize];
@@ -490,7 +494,7 @@ fn rotate_query_kernel<E: Scalar>(
     }
     sync_cube();
 
-    let mut len = 1u32;
+    let mut len = u32::new(1);
     while len < hlim {
         let bper = comptime!(k / 2 / units);
         for t in 0..bper {
@@ -602,7 +606,7 @@ fn ann_scan_kernel(
     // One atomic per CUBE, not per row: the cube maxes in shared memory first.
     red[u as usize] = to_ordered(v);
     sync_cube();
-    let mut stride = comptime!(units / 2);
+    let mut stride = CUBE_DIM_X / 2;
     while stride > 0 {
         if u < stride {
             let o = red[(u + stride) as usize];

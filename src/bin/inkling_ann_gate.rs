@@ -151,14 +151,28 @@ fn main() {
     );
 
     // ---- queries: near-ties between two rows -------------------------------
+    //
+    // Normalised so the logits they produce land where the MODEL's do. That is
+    // not cosmetic: the floor is chosen inside a window `INK_ANN_RANGE` logits
+    // wide, so a query scale that puts the top logit at 1000 instead of 20 does
+    // not test a wider range, it saturates the histogram at its bottom bin and
+    // measures nothing. `||q|| = target / mean_row_norm` puts a well-aligned row
+    // at roughly `target`.
+    let target = 20.0f32;
+    let qnorm = target / sketch.mean_norm;
     let mut queries = Vec::with_capacity(q_count * K);
     for _ in 0..q_count {
         let a = (splitmix(&mut z) % n as u64) as usize;
         let b = (splitmix(&mut z) % n as u64) as usize;
-        for d in 0..K {
-            let mix = 0.5 * (w[a * K + d].to_f32() + w[b * K + d].to_f32());
-            queries.push(mix * 400.0 + normal(&mut z) * 0.05);
+        let mut row: Vec<f32> = (0..K)
+            .map(|d| 0.5 * (w[a * K + d].to_f32() + w[b * K + d].to_f32()) + normal(&mut z) * 1e-4)
+            .collect();
+        let l2 = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let g = qnorm / l2.max(1e-20);
+        for v in row.iter_mut() {
+            *v *= g;
         }
+        queries.extend_from_slice(&row);
     }
     drop(w);
 
