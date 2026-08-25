@@ -33,6 +33,8 @@
 //! | *(the head lane)* | **gone** | was `INK_W4A16_HEAD`. No switch: the lane is W4A16 |
 //! | *(the sink lane)* | **gone** | was `INK_W4A16_SINKS`. No switch: the sinks are W4A16 |
 //! | *(the KV lane)* | **gone** | was `INK_FP4_KV`. No switch: the pages are NVFP4 |
+//! | `INK_ANN_HEAD` | **8192** | the approximate head, on. `0` is the exact-lane ablation |
+//! | `INK_TEMP` | 0.0 | sampling, as noise on the query. `0.0` is today's greedy decode exactly |
 //! | `INK_DRAFT_TOPK` | **512** | pruned by default; `0` disables, for the sweep and for `INK_MTP_PROB` |
 //! | `INK_GEMM_AUTOTUNE` | off | times a GEMM that had the whole device, which four overlapping projections do not |
 //! | `INK_DENSE_WEIGHTS=device` | off | faster, but costs 3.42 GiB at 0:15 and REFUSES ranges that run today |
@@ -1603,13 +1605,46 @@ struct SharedOnDevice {
 /// Shortlist rows the approximate head rescores exactly when `INK_ANN_HEAD` is
 /// not set.
 ///
-/// `0` -- the exact lane -- while the recall and the end-to-end timing are being
-/// measured. This repo has a standing rule against a permanently-off lane (a
-/// switch left off makes the default configuration the un-improved baseline, so
-/// every run measures the thing nobody built), and this constant is where that
-/// decision gets made: it flips to the measured budget, and `INK_ANN_HEAD=0`
-/// survives as the ablation.
-const ANN_BUDGET_DEFAULT: usize = 0;
+/// # Why 8192, and what was measured to pick it
+///
+/// Recall against the EXACT head, on the hidden states a real prompt produced,
+/// 65 decode steps per arm, `INK_ANN_VERIFY=1`, layers 0:4, spark-zt:
+///
+/// ```text
+///   budget    recall@1   mean |exact - approx| at the winner
+///       64      0.6615   0.5198 logits
+///      256      0.8923   0.2612
+///     1024      0.9231   0.2719
+///     4096      0.9846   0.0616
+///     8192      1.0000   0.0000
+///    16384      1.0000   0.0000
+/// ```
+///
+/// The mean exact top1-top2 gap over those steps was 0.37-0.40 logits, so these
+/// are genuinely tight decisions and not a distribution where anything would
+/// win. Every arm's "exact winner shortlisted" rate EQUALS its recall to four
+/// places: every miss is a shortlist miss, never a rescore miss, so the budget
+/// is the only lever and raising it is the only fix.
+///
+/// And raising it is nearly free, which is what makes 8192 the right point
+/// rather than a cautious one. At the head's own shape (`n = 201024`, `k =
+/// 4096`, min of 18 warm launches, launch + sync, GPU idle, spark-zt) the whole
+/// lane costs 0.742 ms at budget 64 and 0.838 ms at budget 8192 — the scan is
+/// 0.74 ms of it and the rescore is the rest, because 8192 rows of NVFP4 is 20
+/// MB against the sketch's 103. Buying the last 8% of recall costs 12% of a lane
+/// that is itself 6x cheaper than the head it replaces.
+///
+/// # What is NOT measured yet
+///
+/// Those 65 steps ran on a FOUR-LAYER stack, because the full 42 needs both
+/// Sparks and the second one's copy of the checkpoint predates the
+/// branch-to-collection migration and cannot be opened. A truncated stack is a
+/// real model on a real prompt, but its final hidden states are not the ones
+/// the shipped model produces, and the logit geometry — how crowded the top of
+/// the vocabulary is — is exactly what the budget is sized against. So this
+/// number is evidence and not proof, and re-running `INK_ANN_VERIFY=1` on the
+/// two-node stack is owed before anyone quotes it as a property of the model.
+const ANN_BUDGET_DEFAULT: usize = 8192;
 
 /// The seed of the sketch's random rotation.
 ///
