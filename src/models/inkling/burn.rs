@@ -3137,13 +3137,21 @@ mod tests {
     /// file's read path. This is the same failure at a longer context, so it
     /// inherits it: 2.353859e-2 over 421 tokens.
     ///
-    /// The number is the evidence that it is ONLY that. Measured 2026-08-25 on
-    /// the GB10, `cargo test --release --lib --features inkling-cuda`: the
-    /// paged read reports 2.353859e-2 and the materialized read it replaced
-    /// reports 2.353859e-2 — the same digits, on the same tokens, on the same
-    /// machine. Four chunks summed give what one contiguous buffer gave. Any
-    /// future change to the read that moves this number is a real regression;
-    /// the bar it is currently held to is not this change's to meet.
+    /// The number is the evidence that it is ONLY that, and it is a PAIRED
+    /// figure — which is the only kind that means anything here. Measured
+    /// 2026-08-25 on the GB10, `cargo test --release --lib --features
+    /// inkling-cuda`, this test against the identical comparison run on the
+    /// materialized read it replaces: 2.3562431e-2 both ways, three runs each,
+    /// every run identical to the last digit. Four chunks summed give exactly
+    /// what one contiguous buffer gave.
+    ///
+    /// It is paired because the ABSOLUTE value is not stable across autotune
+    /// states: an earlier pass of the same two arms, on a GB10 whose autotune
+    /// cache had been filled while another job held the GPU, reported
+    /// 2.353859e-2 — again both ways, again identical. The two arms move
+    /// TOGETHER when the winning matmul changes, which is itself the claim.
+    /// So compare this against a same-session run of the other arm, never
+    /// against the digits written here.
     #[test]
     fn cached_global_matches_full_across_pages() {
         let tokens = 3 * super::super::kvpages::PAGE + 37;
@@ -3177,7 +3185,8 @@ mod tests {
         );
         // Green, and at the same number the materialized read gave:
         // 1.1367798e-2 both ways, 384 tokens through a 147-key window, GB10,
-        // 2026-08-25.
+        // 2026-08-25. Paired, like the global twin above — read its note before
+        // comparing anything to these digits.
         println!("local, 3 pages with a head, {worst:e}");
         assert!(
             worst < CACHE_TOLERANCE_LOCAL,
