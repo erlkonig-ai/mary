@@ -74,6 +74,30 @@
 //! seeded random sign diagonal is `O(D log D)` — twelve butterfly stages on 4096
 //! elements, microseconds against the scan's milliseconds.
 //!
+//! ## What the rotation is worth, measured
+//!
+//! `inkling_ann_gate`, `n = 201024`, `k = 4096`, **192 near-tie queries per
+//! arm**, GB10. Recall@1 against the exact `w4a16` lane on the same NVFP4 bytes,
+//! `INK_ANN_ROT` selecting the basis:
+//!
+//! ```text
+//!   budget    rotated    raw coordinates
+//!      256     0.9740    0.7812
+//!     1024     1.0000    0.9115
+//! ```
+//!
+//! Twenty points of recall at `S = 256` and nine at `S = 1024` — the rotation is
+//! not a refinement, it is most of what makes a one-bit sketch usable at a
+//! budget worth having.
+//!
+//! **The framing that limits this number:** that table is SYNTHETIC, and it was
+//! built with rogue dimensions on purpose (`ROGUE = 24` coordinates at ten times
+//! the mass, row norms spread over a decade). So it demonstrates that the
+//! mechanism works on the structure it is designed for; it does NOT establish
+//! that the real unembedding has that structure. `INK_ANN_ROT=0` exists on the
+//! forward pass for exactly that reason, and running it on the real table under
+//! `INK_ANN_VERIFY=1` is the measurement that would settle it.
+//!
 //! `D_s` is essential and not decoration. `H` alone is a fixed, highly
 //! structured map: its first row is all-ones, so `(Hw)_0` is just the coordinate
 //! sum and a sketch of `Hw` would have its own privileged directions. Seeding
