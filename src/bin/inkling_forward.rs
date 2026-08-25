@@ -4214,6 +4214,9 @@ fn main() -> Result<()> {
     fatal::arm();
     let allocator = mary::models::inkling::pool::choose_memory_config();
     let cleanup = mary::models::inkling::pool::CleanupPolicy::choose();
+    // How often the policy is ASKED, which is a separate question from what it
+    // answers and was costing more than the answer. See `pool::CleanupGate`.
+    let mut cleanup_gate = mary::models::inkling::pool::CleanupGate::new(cleanup);
     anyhow::ensure!(
         dev_lane::act_bf16() || !dev_lane_resid::resid_bf16(),
         "INK_RESID_BF16=1 requires the narrow activation lane; either leave \
@@ -5247,6 +5250,7 @@ fn main() -> Result<()> {
         allocator.env_value(),
         cleanup.name(),
     );
+    println!("  pool polled        : {}", cleanup_gate.schedule());
     // The one number that decides whether this sequence length is runnable at
     // all, asked of the device rather than modelled. It is checked HERE and not
     // beside the admission gate because this is the first client in the
@@ -5828,6 +5832,10 @@ fn main() -> Result<()> {
         // swallow without saying so. A partition needs an outer edge; this is it.
         let t_ly = Instant::now();
 
+        // A new pass: re-arm per-layer polling if the last pass handed anything
+        // back, and drop to one poll a pass if it did not.
+        cleanup_gate.begin_pass();
+
         let ls = LogScaling {
             n_floor: t.log_scaling_n_floor as f32,
             alpha: t.log_scaling_alpha as f32,
@@ -5895,11 +5903,25 @@ fn main() -> Result<()> {
         // that "the policy took the cheap branch" is a number in the log rather
         // than an inference from the absence of one.
         let mut cleanups = 0usize;
-        // What the hand-back COSTS, beside how often it happened. It is a device
-        // DRAIN plus the pool's free/alloc churn plus a `/proc/meminfo` poll, and
-        // it lands between `t_other` stopping and the next layer starting -- so
-        // until it was timed it collected the device time of the layer that had
-        // just been enqueued and charged it to nothing.
+        // How many times the pass ASKED the pool what it was stranding. Printed
+        // beside the cleanup count because the two used to be the same number by
+        // construction and are not any more: the question is what cost, not the
+        // answer. See `pool::CleanupGate`.
+        let mut pool_polls = 0usize;
+        // The `memory_usage` barrier alone, separated from the `/proc/meminfo`
+        // read and from the cleanup's own sync, because the three have different
+        // fixes and were being reported as one number.
+        let mut t_pool_poll = 0f64;
+        // What the hand-back COSTS, beside how often it happened. It lands between
+        // `t_other` stopping and the next layer starting, so until it was timed it
+        // charged its own cost to nothing.
+        //
+        // The naming was wrong for four months and the wrong name is what hid it:
+        // on the DEFAULT policy with room to spare this line never reaches a
+        // device drain or a free, because the cleanup is inside the `if` and the
+        // `if` is false. Everything it measured was the QUESTION -- the
+        // `memory_usage` round trip and a `/proc/meminfo` read -- charged to a
+        // bracket named after the answer.
         let mut t_cleanup = 0f64;
         let (mut d_attn, mut d_router, mut d_expert, mut d_shared, mut d_tail) =
             (0f64, 0f64, 0f64, 0f64, 0f64);
@@ -6943,21 +6965,37 @@ fn main() -> Result<()> {
             // step would pay it once a layer PER TOKEN for nothing. Which is why
             // the policy asks how many positions the pass computes rather than
             // asking an operator to remember a variable.
-            // `memory_usage` is the pool's own host-side bookkeeping and needs no
-            // sync to read; the sync below belongs to the cleanup.
-            // Timed from BEFORE `memory_usage`, so the policy's own question --
-            // `at_layer` reads `/proc/meminfo` and two cgroup files, once per
-            // layer -- is inside the number and not beside it.
+            // `memory_usage` was documented here as the pool's own host-side
+            // bookkeeping, free to read. It is not, and that sentence is what hid
+            // 18% of a decode step. On this cubecl lineage the compute server has
+            // its own thread and `memory_usage` is a `submit_blocking`: it queues
+            // a closure behind everything this layer just enqueued, wakes the
+            // runner, and blocks until the runner has drained down to it -- a HOST
+            // launch-queue barrier -- and then walks every page of twenty-four
+            // pools and every slice of the persistent one. Which is why it is now
+            // behind a closure the gate calls only when the answer needs it.
+            //
+            // Timed from BEFORE the gate, so the policy's own question -- the
+            // `/proc/meminfo` and two cgroup reads -- is inside the number and not
+            // beside it. `t_pool_poll` is the barrier alone, so the two halves can
+            // be read apart.
             let t_cl = Instant::now();
-            let stranded = match fp4_client.memory_usage() {
-                Ok(u) => mary::models::inkling::pool::stranded_bytes(
-                    u.bytes_reserved,
-                    u.bytes_in_use,
-                    u.bytes_padding,
-                ),
-                Err(_) => 0,
-            };
-            if cleanup.at_layer(stranded) {
+            let last_layer = layer + 1 == hi;
+            let want_cleanup = cleanup_gate.at_layer(last_layer, || {
+                pool_polls += 1;
+                let t_pl = Instant::now();
+                let usage = fp4_client.memory_usage();
+                t_pool_poll += t_pl.elapsed().as_secs_f64();
+                match usage {
+                    Ok(u) => mary::models::inkling::pool::stranded_bytes(
+                        u.bytes_reserved,
+                        u.bytes_in_use,
+                        u.bytes_padding,
+                    ),
+                    Err(_) => 0,
+                }
+            });
+            if want_cleanup {
                 <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync before cleanup");
                 fp4_client.memory_cleanup();
                 cleanups += 1;
@@ -8379,10 +8417,13 @@ fn main() -> Result<()> {
             ms(t_layers)
         );
         println!(
-            "      pool hand-back{:9.1}   ({} of {} layers -- a device DRAIN, plus free/alloc churn and a /proc/meminfo poll)",
+            "      pool hand-back{:9.1}   ({} of {} layers cleaned; {} pool polls costing {:.1} ms -- \
+             each poll is a blocking round trip to the compute-server thread, not free bookkeeping)",
             ms(t_cleanup),
             cleanups,
-            hi - lo
+            hi - lo,
+            pool_polls,
+            ms(t_pool_poll)
         );
         println!(
             "      unnamed in-loop{:8.1}   (loop total less attention + mlp + first-touch + hand-back)",
