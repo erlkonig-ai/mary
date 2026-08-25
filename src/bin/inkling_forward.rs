@@ -386,15 +386,20 @@
 //! = **0.3283** top-1 and 0.5179 top-5. So ~0.30 is what this checkpoint scores
 //! on real text, and it is not an artefact of this instrument.
 //!
-//! The first depth-0 figure was measured through the final norm TWICE -- the
-//! rows it scores are `entry`, which is already final-normed, and `teach_rows`
-//! normed them again. That is not idempotent: `rms_norm(normalise(x) * g)` is
-//! `normalise(x) * g^2 / c`, so the ceiling was read through the learned gain
-//! SQUARED. The `norm` argument is the fix, and it moved the number by the
-//! amount the table records.
+//! CAVEAT on the depth-0 row above, kept rather than quietly restated: it was
+//! measured through the final norm TWICE. The rows it scores are `entry`, which
+//! is already final-normed, and `teach_rows` normed them again -- and that is
+//! not idempotent, since `rms_norm(normalise(x) * g)` is `normalise(x) * g^2 /
+//! c`, so the ceiling was read through the learned gain SQUARED. The `norm`
+//! argument on `teach_rows` is the fix. It makes 0.2988 a LOWER bound on the
+//! ceiling; the sibling's 0.3283 on its own corpus, measured through the model's
+//! ordinary logits path and not through this instrument at all, is what says the
+//! true figure is near it. Every DEPTH row is unaffected -- those rows are the
+//! MTP heads' output, which had not been normed before.
 //!
-//! Which means the draft head reaches **76% of the main stack's own accuracy on
-//! the equivalent task**, and the per-depth table being FLAT is not a symptom:
+//! Which means the draft head reaches **roughly three quarters of the main
+//! stack's own accuracy on the equivalent task** (0.2266 against a ceiling of
+//! 0.2988-0.3283, so 69-76% depending on which ceiling you take), and the per-depth table being FLAT is not a symptom:
 //! as `d` grows the head gets more true-token context through the chained
 //! embeddings and a staler hidden state, and the two roughly cancel.
 //!
