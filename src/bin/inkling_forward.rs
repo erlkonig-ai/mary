@@ -9028,3 +9028,84 @@ fn main() -> Result<()> {
     println!("  wrote top-5 ids per position to {}", out_path.display());
     Ok(())
 }
+
+#[cfg(test)]
+mod pipe_tests {
+    use super::{pipe_accept, pipe_connect};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    /// A port nothing is bound to, taken by binding one and dropping it.
+    ///
+    /// Not a hardcoded number: these run in parallel with whatever else the
+    /// test binary is doing, and a fixed port is a test that fails on somebody
+    /// else's machine for a reason that has nothing to do with the code.
+    fn free_port() -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        l.local_addr().expect("bound").port()
+    }
+
+    /// The rank-order hazard itself: the head reaches the rendezvous while the
+    /// tail is still loading, and connects anyway once the tail arrives.
+    ///
+    /// This is the whole fix. Before it, the `connect` below happened once,
+    /// got `ECONNREFUSED` from a port with no listener, and killed the run —
+    /// so the two commands had to be started tail-first and far enough apart,
+    /// a rule that lived only in the launch scripts and in the reference
+    /// implementation's prose.
+    #[test]
+    fn the_head_waits_for_a_tail_that_is_not_listening_yet() {
+        let port = free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let late = addr.clone();
+        let bind_at = Instant::now() + Duration::from_millis(400);
+        let tail = std::thread::spawn(move || {
+            std::thread::sleep(bind_at.saturating_duration_since(Instant::now()));
+            let l = TcpListener::bind(&late).expect("binding late");
+            pipe_accept(&l, &late, Duration::from_secs(10)).expect("the head should arrive")
+        });
+        let t0 = Instant::now();
+        let sock = pipe_connect(&addr, Duration::from_secs(10))
+            .expect("the head should have waited for the late tail");
+        assert!(
+            t0.elapsed() >= Duration::from_millis(300),
+            "the connect did not actually wait: {:?}",
+            t0.elapsed()
+        );
+        let (peer, _) = tail.join().expect("the tail thread");
+        drop((sock, peer));
+    }
+
+    /// And it is a BOUND, not an infinite wait: a port nobody will ever listen
+    /// on still fails, naming the end that was waiting and how to change it.
+    #[test]
+    fn a_head_with_no_tail_fails_legibly_rather_than_forever() {
+        let addr = format!("127.0.0.1:{}", free_port());
+        let t0 = Instant::now();
+        let err = pipe_connect(&addr, Duration::from_millis(400))
+            .expect_err("nothing is listening there");
+        let msg = format!("{err:#}");
+        assert!(t0.elapsed() >= Duration::from_millis(400), "gave up early");
+        assert!(t0.elapsed() < Duration::from_secs(10), "overshot the bound");
+        assert!(msg.contains("the head waited"), "unhelpful: {msg}");
+        assert!(msg.contains(&addr), "does not name the address: {msg}");
+        assert!(msg.contains("INK_PIPE_WAIT"), "no way out named: {msg}");
+    }
+
+    /// The other end of the same hazard: a head that died while loading its
+    /// weights used to leave the tail holding a GPU forever.
+    #[test]
+    fn a_tail_with_no_head_fails_legibly_rather_than_forever() {
+        let l = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let addr = l.local_addr().expect("bound").to_string();
+        let t0 = Instant::now();
+        let err =
+            pipe_accept(&l, &addr, Duration::from_millis(400)).expect_err("nobody will connect");
+        let msg = format!("{err:#}");
+        assert!(t0.elapsed() >= Duration::from_millis(400), "gave up early");
+        assert!(t0.elapsed() < Duration::from_secs(10), "overshot the bound");
+        assert!(msg.contains("the tail listened"), "unhelpful: {msg}");
+        assert!(msg.contains(&addr), "does not name the address: {msg}");
+        assert!(msg.contains("INK_PIPE_WAIT"), "no way out named: {msg}");
+    }
+}
