@@ -327,6 +327,92 @@
 //! accepted 0 times in 49 verify passes, so `k = 3` pays a wider pass for the
 //! same 2.082 tokens and lands back at 1.007x.
 //!
+//! ## `INK_MTP_TEACH`: acceptance measured where there is enough of it to measure
+//!
+//! Every acceptance figure above is taken over tens of GENERATED steps, and
+//! the section below is about how badly that number moves with the sequence.
+//! `INK_MTP_TEACH=1` takes the same measurement a different way: head `d`'s row
+//! `j` is fed `(stage[d-1][j], embed(ids[j + d + 1]))` and predicts
+//! `ids[j + d + 2]`, which for every row but the last few is a token the PROMPT
+//! ALREADY CONTAINS. So the drafting prefill scores two thousand positions in
+//! one pass, against real text rather than against the model's own
+//! continuation.
+//!
+//! It is the exact conditional rate the expected-prefix arithmetic wants:
+//! `E = 1 + p1 + p1 p2 + ...` with `p_d = P(draft d right | drafts 1..d-1
+//! right)`, and "drafts 1..d-1 right" is precisely the state teacher forcing
+//! puts head `d` in -- the token head `d-1` was fed IS the token the verifier
+//! would have accepted.
+//!
+//! Two warnings come with it, and both are load-bearing:
+//!
+//!  - It scores the PREFILL lane. `INK_MTP_STEPCHECK=1` is what says whether
+//!    the cached STEP lane -- the one a decode loop drafts on -- computes the
+//!    same rows.
+//!  - A rate on a human document is a LOWER BOUND on the decode rate. On a
+//!    document the head is asked for a token the MAIN STACK ITSELF only gets
+//!    right 30% of the time; at decode the target IS the main stack's argmax.
+//!    `INK_MTP_TEACH_FROM=<n>` points the same instrument at a seed followed by
+//!    this model's own greedy continuation, which is the sequence a decode loop
+//!    actually verifies.
+//!
+//! ## The ceiling, and why it changes what a low rate means
+//!
+//! `INK_MTP_TEACH` also scores DEPTH 0 -- the main stack's own next-token
+//! argmax, on the same rows, through the same unembedding. That row is the one
+//! that makes the rest readable, and it had never been measured:
+//!
+//!   3732-token document, 2048 scored positions per depth, concat hidden-first
+//!
+//!     depth 0 (THE MAIN STACK)   0.2988   [0.2794, 0.3190]
+//!     depth 1                    0.2266   [0.2090, 0.2452]
+//!     depth 2                    0.1929
+//!     depth 3                    0.2085
+//!     depth 4                    0.2319
+//!
+//! An independent check, on a different 3988-token document and a different
+//! binary: a sibling's teacher-forced top-5 dump gives the main stack 1309/3987
+//! = **0.3283** top-1 and 0.5179 top-5. So ~0.30 is what this checkpoint scores
+//! on real text, and it is not an artefact of this instrument.
+//!
+//! Which means the draft head reaches **76% of the main stack's own accuracy on
+//! the equivalent task**, and the per-depth table being FLAT is not a symptom:
+//! as `d` grows the head gets more true-token context through the chained
+//! embeddings and a staler hidden state, and the two roughly cancel.
+//!
+//! So a reference quoting "MTP1 acceptance ~0.85" is not quoting this quantity.
+//! No drafter can score 0.85 against real text when the model it drafts for
+//! scores 0.33; that figure has to be agreement with the target's ARGMAX on the
+//! model's own decode stream, and the two must never be compared directly.
+//!
+//! ## What the wrapper composition turned out to be
+//!
+//! `transformers` defines no MTP composition, so [`MtpConcat`] kept both concat
+//! orders reachable and said the acceptance rate would decide. With 2048
+//! positions instead of twenty generated steps, it decides unambiguously:
+//!
+//!     concat hidden-first    depth 1  0.2266
+//!     concat embed-first     depth 1  0.0010    <- 226x worse, below chance
+//!
+//! `mtp_hidden_states_first` is ALSO ABSENT from this checkpoint's
+//! `mtp_config` -- the flag the default was named for is not there, only
+//! `num_nextn_predict_layers`, `chain_hidden_post_norm` and `local_layer_ids`.
+//! The default was right; it was right on a guess, and now it is measured.
+//!
+//! Three more readings, priced the same way on the same corpus:
+//!
+//!     backbone embed_norm ON        0.2266     the 2026-08-24 fix, confirmed
+//!     backbone embed_norm OFF       0.1675     -26%, so the fix is real
+//!     entry final-normed            0.2266
+//!     entry RAW (INK_MTP_RAW=1)     0.2310     INDISTINGUISHABLE
+//!     ablate the hidden operand     0.0869     both operands carry the rate
+//!     ablate the embed operand      0.0347
+//!
+//! The entry row corrects this file. The comment on `entry` says feeding the
+//! final-normed hidden "measured twice as well (25% -> 50% on a matched
+//! 20-token run)"; on 2048 positions the two are 0.2310 and 0.2266, which is
+//! inside the interval. A twenty-step difference was a twenty-step difference.
+//!
 //! ## Three acceptance rates that are all correct
 //!
 //! This file has quoted 22.0%, 50.0% and 71.2% for depth-1 acceptance and they
