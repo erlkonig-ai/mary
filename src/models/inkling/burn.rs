@@ -1567,6 +1567,105 @@ pub fn from_act<const D: usize>(t: Tensor<Bk, D>) -> Tensor<Bk, D> {
     }
 }
 
+/// Whether a layer's cached lanes take [`super::flash`].
+///
+/// One predicate rather than three copies of the same three arguments, because
+/// the three cached entry points ([`attention_step`], [`attention_steps`] and
+/// the prefill's own arm) must not be able to disagree about it: a batch of one
+/// that took a different lane from a step of one would show up as drift in
+/// [`drift_table_at_real_width`] and be blamed on the cache.
+fn flash_cached_applies(d: &crate::models::inkling::attn::AttnDims) -> bool {
+    flash_lane()
+        && crate::models::inkling::flash::applies(
+            d.heads,
+            d.kv_heads,
+            d.head_dim,
+            crate::models::inkling::flash::decode_rows(d.groups()),
+        )
+}
+
+/// `nq` query rows at absolute positions `q0 ..` against the cache's PAGES.
+///
+/// `q` is `[nq, heads * head_dim]` with log scaling already applied, and `rel`
+/// is `[nq, heads, eff]` likewise. The pages go in as pages, at the dtype the
+/// store holds them in — a dense store hands over slices of its own buffers, an
+/// NVFP4 store dequantises one page at a time — so nothing here rebuilds a
+/// contiguous cache, and nothing pads the key axis to a shape bucket: a fused
+/// kernel takes its lengths as scalars and cubecl does not recompile on a
+/// scalar.
+fn flash_cached(
+    q: Tensor<Bk, 2>,
+    rel: Tensor<Bk, 3>,
+    cache: &AttnCache<Bk>,
+    dev: &burn::backend::cuda::CudaDevice,
+    d: &crate::models::inkling::attn::AttnDims,
+    nq: usize,
+    q0: usize,
+    eff: usize,
+    window: Option<usize>,
+) -> Tensor<Bk, 2> {
+    use crate::models::inkling::flash::{self, KeyRun, KvElem, flash_attention_launch};
+    use crate::models::inkling::seam::{client_of, handle_of, handle_of_any, tensor_of};
+
+    let (heads, kv_heads, head_dim) = (d.heads, d.kv_heads, d.head_dim);
+    let (len, base) = (cache.len(), cache.base);
+    let head = cache.k.head();
+    let kparts = cache.k.parts(dev);
+    let vparts = cache.v.parts(dev);
+    debug_assert_eq!(kparts.len(), vparts.len(), "the two stores drifted apart");
+    let client = client_of(&q);
+    let q_h = handle_of(q);
+    let rel_h = handle_of(rel);
+    let mut held: Vec<(cubecl::server::Handle, cubecl::server::Handle, usize)> =
+        Vec::with_capacity(kparts.len());
+    let mut kv_dt = burn::tensor::DType::F32;
+    for (kp, vp) in kparts.into_iter().zip(vparts) {
+        let rows = kp.dims()[0];
+        let (kh, dt) = handle_of_any(kp);
+        let (vh, _) = handle_of_any(vp);
+        kv_dt = dt;
+        held.push((kh, vh, rows));
+    }
+    // Stored row `off + i` of page `p` is logical key `off + i - head`, at
+    // absolute position `base + off + i - head`. `head` is the prefix a window
+    // has dropped but the page still carries, and it never exceeds `base` —
+    // every dropped row was counted into `base` first — so the subtraction
+    // cannot go under.
+    let mut off = 0usize;
+    let mut runs: Vec<KeyRun<'_>> = Vec::with_capacity(held.len());
+    for (kh, vh, rows) in &held {
+        runs.push(KeyRun {
+            k: kh,
+            v: vh,
+            rows: *rows,
+            base: base + off - head,
+            lo: head.saturating_sub(off).min(*rows),
+            hi: (head + len).saturating_sub(off).min(*rows),
+        });
+        off += rows;
+    }
+    let out = flash_attention_launch(
+        &client,
+        &q_h,
+        &runs,
+        &rel_h,
+        match kv_dt {
+            burn::tensor::DType::BF16 => KvElem::Bf16,
+            _ => KvElem::F32,
+        },
+        nq,
+        q0,
+        heads,
+        kv_heads,
+        head_dim,
+        eff,
+        window,
+        d.scaling(),
+        flash::decode_rows(d.groups()),
+    );
+    tensor_of(client, dev.clone(), out, nq, heads * head_dim)
+}
+
 /// One generated token through one attention layer, reading the cache.
 ///
 /// The whole point of the cache: `x` is the single new position, `pos` is its
@@ -1654,24 +1753,13 @@ pub fn attention_step(
     // Everything below this block builds a `[heads, 1, slots]` score row and
     // walks it five more times — the epilogue's bias and mask, the softmax's
     // max, its sum, its divide — before `p @ v` reads it a sixth. At 1M tokens
-    // of context that row is 128 MB per global layer and the walking of it is
-    // ~19% of what the layer moves. The fused kernel never writes it: it reads
-    // each page once, keeps the softmax's running max and sum in registers, and
-    // accumulates `p @ v` as it goes. The pages go in AS PAGES, at the dtype
-    // the cache holds them in, so the shape-bucketing this function does below
-    // is not needed either — a fused kernel takes its lengths as scalars and
-    // cubecl does not recompile on a scalar.
-    if flash_lane()
-        && crate::models::inkling::flash::applies(
-            heads,
-            kv_heads,
-            head_dim,
-            crate::models::inkling::flash::decode_rows(groups),
-        )
-    {
-        use crate::models::inkling::flash::{self, KeyRun, KvElem, flash_attention_launch};
-        use crate::models::inkling::seam::{client_of, handle_of, handle_of_any, tensor_of};
-
+    // of context that row is 128 MB per global layer. The fused kernel never
+    // writes it: it reads each page once, keeps the softmax's running max and
+    // sum in registers, and accumulates `p @ v` as it goes. Measured on a GB10
+    // at the release's global shape, one layer, one step, NVFP4 KV: 2.5 ms
+    // against 4.2 at 16k of context, 7.8 against 33.2 at 64k, and 28.5 against
+    // 143.8 at 256k.
+    if flash_cached_applies(d) {
         let tau = match (d.kind, log_scaling) {
             (AttnKind::Global, Some(ls)) => ls.tau(pos),
             _ => 1.0,
@@ -1692,68 +1780,7 @@ pub fn attention_step(
             .matmul(w.rel_proj.clone().slice([0..d.d_rel, 0..eff]))
             .reshape([1, heads, eff])
             .mul_scalar(tau);
-
-        // The pages, whole and in order, at the dtype they are stored in. A
-        // dense store hands over slices of its own buffers; an NVFP4 store
-        // dequantises a page at a time. Either way nothing here rebuilds a
-        // contiguous cache.
-        let head = cache.k.head();
-        let kparts = cache.k.parts(&dev);
-        let vparts = cache.v.parts(&dev);
-        debug_assert_eq!(kparts.len(), vparts.len(), "the two stores drifted apart");
-        let client = client_of(&q);
-        let q_h = handle_of(q);
-        let rel_h = handle_of(rel);
-        let mut held: Vec<(cubecl::server::Handle, cubecl::server::Handle, usize)> =
-            Vec::with_capacity(kparts.len());
-        let mut kv_dt = burn::tensor::DType::F32;
-        for (kp, vp) in kparts.into_iter().zip(vparts) {
-            let rows = kp.dims()[0];
-            let (kh, dt) = handle_of_any(kp);
-            let (vh, _) = handle_of_any(vp);
-            kv_dt = dt;
-            held.push((kh, vh, rows));
-        }
-        // Stored row `off + i` of page `p` is logical key `off + i - head`, at
-        // absolute position `base + off + i - head`. `head` is the prefix a
-        // window has dropped but the page still carries, and it never exceeds
-        // `base` — every dropped row was counted into `base` first — so the
-        // subtraction cannot go under.
-        let mut off = 0usize;
-        let mut runs: Vec<KeyRun<'_>> = Vec::with_capacity(held.len());
-        for (kh, vh, rows) in &held {
-            let lo = head.saturating_sub(off).min(*rows);
-            let hi = (head + len).saturating_sub(off).min(*rows);
-            runs.push(KeyRun {
-                k: kh,
-                v: vh,
-                rows: *rows,
-                base: base + off - head,
-                lo,
-                hi,
-            });
-            off += rows;
-        }
-        let out = flash_attention_launch(
-            &client,
-            &q_h,
-            &runs,
-            &rel_h,
-            match kv_dt {
-                burn::tensor::DType::BF16 => KvElem::Bf16,
-                _ => KvElem::F32,
-            },
-            1,
-            pos,
-            heads,
-            kv_heads,
-            head_dim,
-            eff,
-            window,
-            d.scaling(),
-            flash::decode_rows(groups),
-        );
-        let out = tensor_of(client, dev.clone(), out, 1, heads * head_dim);
+        let out = flash_cached(q, rel, cache, &dev, d, 1, pos, eff, window);
         return linear_bf16(out, &w.wo);
     }
 
@@ -1947,6 +1974,42 @@ pub fn attention_steps(
 
     let len = cache.len();
     let base = cache.base;
+
+    // The fused lane, the `rows > 1` twin of [`attention_step`]'s. It is the
+    // SAME kernel with `nq = rows`: a draft row is a query at its own absolute
+    // position, and the rows of the batch are keys the later rows can see
+    // because they were appended above. Causality inside the batch is
+    // therefore the same predicate as causality against the prefix, which is
+    // what makes one kernel enough.
+    //
+    // Wired here and not only on the single step because a batch of one and a
+    // step of one must be the same arithmetic. While this function was on the
+    // dense lane and [`attention_step`] was fused, they were not, and
+    // [`drift_table_at_real_width`]'s batch=1 column — which had been exactly
+    // zero — moved to 4e-3.
+    if flash_cached_applies(d) {
+        let eff = d
+            .rel_extent
+            .min(pos0 + rows - base)
+            .next_multiple_of(kv_pad_bucket())
+            .min(d.rel_extent);
+        let taus: Vec<f32> = (0..rows)
+            .map(|i| match (d.kind, log_scaling) {
+                (AttnKind::Global, Some(ls)) => ls.tau(pos0 + i),
+                _ => 1.0,
+            })
+            .collect();
+        let tau: Tensor<Bk, 1> = Tensor::from_data(TensorData::new(taus, [rows]), &dev);
+        let q = q * tau.clone().reshape([rows, 1]);
+        let rel = r
+            .reshape([rows * heads, d.d_rel])
+            .matmul(w.rel_proj.clone().slice([0..d.d_rel, 0..eff]))
+            .reshape([rows, heads, eff])
+            * tau.reshape([rows, 1, 1]);
+        let out = flash_cached(q, rel, cache, &dev, d, rows, pos0, eff, window);
+        return linear_bf16(out, &w.wo);
+    }
+
     let bucket = kv_pad_bucket();
     // The paged read, the `rows > 1` twin of [`attention_step`]'s. See
     // [`PagedKv`] for what `head` and the tail padding are and why the mask
