@@ -4619,6 +4619,32 @@ fn main() -> Result<()> {
         );
     }
 
+    // Every row's logits, when a reader has asked for them. `INK_ALL_LOGITS=1`
+    // and `INK_DUMP_DIR` both mean `[n, effective_vocab]` f32 instead of the one
+    // row a forward needs, which on this model is 764 KiB a TOKEN -- 11.34 GiB
+    // at a 14,169-token prefill, larger than the whole modelled activation
+    // working set. Only the node that owns the unembedding pays it.
+    //
+    // It went unpriced for as long as the allocator floor was a third of the
+    // machine and covered it by accident. It is not covered by accident any
+    // more, and a term that big cannot be left to luck.
+    let all_logits = std::env::var("INK_DUMP_DIR").is_ok()
+        || std::env::var("INK_ALL_LOGITS")
+            .map(|val| val == "1")
+            .unwrap_or(false);
+    let logits_bytes: u64 = if all_logits && !is_head {
+        n as u64 * t.effective_vocab() as u64 * core::mem::size_of::<f32>() as u64
+    } else {
+        0
+    };
+    if logits_bytes > 0 {
+        println!(
+            "  all logits         : {:.2} GiB for {n} rows of {} (INK_ALL_LOGITS)",
+            logits_bytes as f64 / GIB,
+            t.effective_vocab(),
+        );
+    }
+
     let want_embed = !is_tail || mtp_k > 0;
     // A drafting tail needs it too: the MTP depth layers consume the
     // BACKBONE-normed embedding, not the raw one. See `e_bn` at the draft site.
@@ -7105,10 +7131,8 @@ fn main() -> Result<()> {
         // across the bus, on top of a 4096-wide GEMM over 512 rows instead of 16.
         // So they are computed when a reader has asked for them and not otherwise.
         // `INK_ALL_LOGITS=1` is that ask; a dump implies it.
-        let all_logits = dump_dir.is_some()
-            || std::env::var("INK_ALL_LOGITS")
-                .map(|val| val == "1")
-                .unwrap_or(false);
+        // The same predicate admission priced, above; see `logits_bytes`.
+        let all_logits = dump_dir.is_some() || all_logits;
 
         // ---- head, or the wire in its place ------------------------------------
         let v = t.effective_vocab();
