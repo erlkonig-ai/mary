@@ -695,14 +695,17 @@ echo
 echo
 echo "=== the framing rule (this is part of the number, not a footnote) ==="
 echo "  what varied     : the arms, and nothing else -- ${ARMS[*]}"
-if [ "$LANE_WIDTH" = "1" ]; then
+if [ -z "$LANE_WIDTH" ]; then
+  echo "  per what        : NOTHING -- no rep produced a log to read the lane off. If the"
+  echo "                    table above is empty, every rep failed; read the logs."
+elif [ "$LANE_WIDTH" = "1" ]; then
   echo "  per what        : per DECODE STEP (one pass of the layer range below, ONE row"
   echo "                    wide), and per SECOND of decode wall. Not per token unless E = 1."
 else
   echo "  per what        : per PREFILL PASS, NOT per decode step -- the pass is $LANE_WIDTH rows"
   echo "                    wide. Do not quote this as decode throughput."
 fi
-echo "  lane            : $LANE"
+echo "  lane            : ${LANE:-not determined}"
 echo "  layer range     : INK_LAYERS=$LAYERS"
 echo "  context length  : $("$AWK" -F'\t' 'NR==2{print $9}' "$TSV") tokens at the last step (INK_GEN=$GEN$( [ "$REPEAT" = 1 ] && echo ", INK_REPEAT=1: the context does not grow because every pass re-runs the WHOLE prompt"))"
 echo "  reps            : $REPS per arm, INTERLEAVED; first $COLD decode passes of each rep discarded"
