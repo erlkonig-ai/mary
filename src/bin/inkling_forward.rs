@@ -7128,7 +7128,11 @@ fn main() -> Result<()> {
     // replay, so it is not the cost of running the region. This holds the last
     // clean decode step's `t_layers`, which is the number the replay is
     // actually being compared against.
-    let mut eager_layers: Option<f64> = None;
+    // EVERY clean decode step's `t_layers`, not just the last one. A single
+    // step is one sample and a ratio quoted off one sample has no spread to
+    // show; the replay arm reports its own per-rep values and the eager arm
+    // owes the same.
+    let mut eager_layers_all: Vec<f64> = Vec::new();
     // Where a capture died. A capture that has been invalidated keeps ACCEPTING
     // work in silence and only says so at `end`, so without a probe at each
     // stage boundary the failure names no call.
@@ -8655,7 +8659,7 @@ fn main() -> Result<()> {
         // the replay against a number that is not the cost of running the
         // region normally.
         if is_decode && !capture_now && !prewarm_now {
-            eager_layers = Some(t_layers);
+            eager_layers_all.push(t_layers);
         }
 
         // This slot is prefilled; seat it in the batch and let go of it. The next
@@ -10960,16 +10964,35 @@ fn main() -> Result<()> {
                 sd / 1e3,
                 per_rep.len()
             );
-            match eager_layers {
-                Some(eager) => {
+            // Discard the first two decode steps: they still carry first-touch
+            // weight upload and first-sight kernel compilation, which are not
+            // what a warm layer loop costs.
+            const COLD: usize = 2;
+            let kept: Vec<f64> = eager_layers_all.iter().skip(COLD).copied().collect();
+            let eager_stat = if kept.is_empty() {
+                None
+            } else {
+                let k = kept.len() as f64;
+                let m = kept.iter().sum::<f64>() / k;
+                let sd = (kept.iter().map(|x| (x - m).powi(2)).sum::<f64>() / k).sqrt();
+                Some((m, sd, kept.len()))
+            };
+            match eager_stat {
+                Some((eager, eager_sd, nkept)) => {
                     println!(
                         "      per node      {:9.4}   us host replay   vs {:.3} us/node eager",
                         mu / *nodes as f64,
                         eager * 1e6 / *nodes as f64
                     );
                     println!(
-                        "      EAGER layer loop, last clean decode step: {:.1} ms",
-                        eager * 1e3
+                        "      EAGER layer loop: {:.3} ms  (+/- {:.3}, {nkept} clean decode steps, \
+                         first {COLD} discarded)",
+                        eager * 1e3,
+                        eager_sd * 1e3
+                    );
+                    println!(
+                        "      per-step eager ms: {:.3?}",
+                        kept.iter().map(|x| x * 1e3).collect::<Vec<_>>()
                     );
                     println!(
                         "      host time the replay removes: {:.2} ms of {:.2} ms  ({:.0}x)",
@@ -10979,8 +11002,9 @@ fn main() -> Result<()> {
                     );
                 }
                 None => println!(
-                    "      no clean decode step ran before the capture -- no eager baseline, \
-                     so no ratio is quoted"
+                    "      fewer than {} clean decode steps ran before the capture -- no warm \
+                     eager baseline, so no ratio is quoted",
+                    COLD + 1
                 ),
             }
             println!("      per-rep replay us: {per_rep:.3?}");
