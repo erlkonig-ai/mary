@@ -23,6 +23,35 @@
 //! 3. **The permutation the map forces**, if any, printed as a destination
 //!    formula plus a bijection check on the host.
 //!
+//! ## Two results worth reading before building on this
+//!
+//! **The bytes were never the problem.** Per warp LOAD INSTRUCTION the
+//! row-major form is as bad as the hypothesis says -- eight 32-byte sectors for
+//! 32 useful bytes on the W4A16 codes (12.5%), eight for 128 on BF16 (50%).
+//! Over a whole k loop both reach **100% sector and 100% line utilisation**,
+//! because the k loop walks each of the eight weight rows FORWARD and a
+//! half-used sector is finished by the next few k tiles out of L1 (reuse
+//! distance: eight sectors). So this permutation cannot be sold as a bandwidth
+//! fix and a DRAM-traffic model will predict nothing from it. What it removes
+//! is REQUESTS -- 4096 sector requests per warp k loop against 512 distinct
+//! sectors on the W4A16 codes, an 8x amplification -- and on this part that
+//! turned out to be worth 17.5% of the head GEMM anyway. Right effect, wrong
+//! reason: see `w4a16gemm::swizzle_w4a16` for the numbers and their framing.
+//!
+//! **Most of the traffic does not read through this map at all.** The map is
+//! `bf16_linear`'s and `w4a16_linear`'s, and of the four weight streams a
+//! decode step of layers 21..42 pulls, only the 0.43 GiB unembedding runs one
+//! of those kernels. The 1.73 GiB of attention and 1.97 GiB of shared/dense MLP
+//! are plain BF16 and go through `bf16_gemm`, which sends every weight aligned
+//! at `MIN_TUNED_ALIGN` to a `cubek` tuned lane -- and since the startup copy
+//! pads views to 16 bytes, that is all of them. Any real run says so in one
+//! line: `hand BF16 lane: 0 launches -- every plain-BF16 GEMM went to a tuned
+//! lane`. Those lanes stage through shared memory with their own loader layout,
+//! and which lane a shape gets is decided at runtime per `(m, k, n)`, so
+//! permuting their weights into fragment order would be permuting them for a
+//! kernel they do not run. That is separate work with a separate derivation,
+//! and it is not this map.
+//!
 //! `INK_DUMP_K` / `INK_DUMP_N` set the shape the counting uses (default the
 //! unembedding's `k = 4096`, and `n = 64` — n only sets the row stride's
 //! multiple, and the counts are per warp, so a small n keeps this instant).
