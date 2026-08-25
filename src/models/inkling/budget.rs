@@ -202,6 +202,11 @@ pub struct AdmissionPolicy {
     /// range as the LLM's and are copied into the arena either way, but they
     /// are only BOUND when drafting is on.
     pub drafts: bool,
+    /// Whether `wq|wk|wv|wr` are ALSO bound as one concatenated weight. A
+    /// concatenation is not a span of the pile's mapping, so that bind is a
+    /// copy in both placement arms and it is 52 MiB a layer. See
+    /// [`super::burn::fuse_qkvr`].
+    pub fused_qkvr: bool,
     wide_routed_layers: u128,
     plain_bf16_layers: u128,
 }
@@ -224,6 +229,7 @@ impl AdmissionPolicy {
             dense_weights: DenseWeights::Aliased,
             router_bf16: false,
             drafts: false,
+            fused_qkvr: false,
             wide_routed_layers: 0,
             plain_bf16_layers: 0,
         }
@@ -233,6 +239,7 @@ impl AdmissionPolicy {
     pub fn runtime(allocator: AllocatorConfig) -> Self {
         Self {
             dense_weights: dense_weights(),
+            fused_qkvr: super::burn::fuse_qkvr(),
             ..Self::new(
                 allocator,
                 StorageDType::from_bf16(super::burn::act_bf16()),
@@ -245,6 +252,13 @@ impl AdmissionPolicy {
     /// Record the router arm, which decides whether `mlp.gate.weight` is bound.
     pub const fn with_router_bf16(mut self, on: bool) -> Self {
         self.router_bf16 = on;
+        self
+    }
+
+    /// Record whether the fused QKVR weight is bound. Tests set it explicitly;
+    /// a run gets it from [`Self::runtime`].
+    pub const fn with_fused_qkvr(mut self, on: bool) -> Self {
+        self.fused_qkvr = on;
         self
     }
 

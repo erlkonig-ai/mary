@@ -1246,6 +1246,49 @@ pub fn act_bf16() -> bool {
     })
 }
 
+/// Whether `wq|wk|wv|wr` are bound as ONE `[6656, hidden]` weight.
+/// `INK_FUSE_QKVR=0` is the ablation.
+///
+/// # Why this is the default arm
+///
+/// A SCHEDULING change and nothing else: every output element is the same
+/// k-loop over the same row of the same weight, in the same order, and
+/// [`project_qkvr`] slices the one output back into the four the caller
+/// expects. Its output was measured **BIT-IDENTICAL** to the four-launch arm,
+/// which is the bar this project's default-on policy names -- so it is on, and
+/// the switch survives only so the two can be priced against each other.
+///
+/// What it buys is grid occupancy. The `m16n8k16` kernel gives one warp each
+/// `(m_tile, n_tile)`, so with `m` padded to one tile the grid IS `n / 8`:
+/// four launches of 512, 128, 128 and 64 cubes become one of 832. Four grids
+/// that small cannot cover DRAM latency on this part -- the same argument the
+/// shared experts' `gate_up` concatenation rests on, measured there at 79 GB/s
+/// for 256 cubes against 175 for 25128.
+///
+/// # What it costs, and who charges it
+///
+/// A concatenation is not a span of the pile's mapping, so `bind_bf16` cannot
+/// alias it and this is a REAL 54.5 MB (52 MiB) a layer of device memory. That
+/// is why this function lives here and not in `inkling_forward`: it is a
+/// process-global lane switch that changes admission arithmetic, and
+/// [`super::budget::AdmissionPolicy::runtime`] reads it so the gate and the
+/// binding lane cannot disagree about it -- the same one-reader rule
+/// [`super::budget::dense_weights`] documents, and for the same reason.
+/// [`super::pile::device_weight_bytes`] charges those bytes in BOTH placement
+/// arms, because the copy happens in both.
+///
+/// At the production split it clears with room: `INK_LAYERS=21:42` admits at
+/// 95.09 GiB of a 119.63 GiB node with 19.68 GiB of headroom, and 21 layers of
+/// this is 1.07 GiB -- 5.4% of that headroom.
+pub fn fuse_qkvr() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("INK_FUSE_QKVR")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
 /// `t` in the dtype a prefill holds its attention operands in. The identity on
 /// the wide lane.
 pub fn as_act<const D: usize>(t: Tensor<Bk, D>) -> Tensor<Bk, D> {

@@ -337,6 +337,13 @@ fn mem_total_bytes() -> Result<u64> {
 fn device_weight_bytes(name: &str, leaf: &Leaf, policy: super::budget::AdmissionPolicy) -> u64 {
     use super::budget::DenseWeights;
 
+    /// The four the fused bind concatenates, in its output order.
+    const QKVR: [&str; 4] = [
+        "attn.wq_du.weight",
+        "attn.wk_dv.weight",
+        "attn.wv_dv.weight",
+        "attn.wr_du.weight",
+    ];
     /// The matrices the BF16 GEMM lane binds, by the suffix that names them.
     /// Shared with nothing: the loader constructs these names inline at its
     /// binding sites, and the run's own bind census is what proves the two
@@ -357,6 +364,32 @@ fn device_weight_bytes(name: &str, leaf: &Leaf, policy: super::budget::Admission
         return 0;
     }
     let bytes = leaf.bytes.len() as u64;
+
+    // `INK_FUSE_QKVR`: the four attention projections are ALSO bound as one
+    // concatenated `[6656, hidden]` weight. A concatenation is a fresh host
+    // buffer and not a span of any registered mapping, so `bind_bf16` cannot
+    // alias it -- it is a pool copy in BOTH placement arms, exactly like the
+    // two checkpoint-fused matrices below. It is charged ON TOP of whatever the
+    // placement arm charges for the four separate binds, not instead of them:
+    // the fused weight does not replace them, `AttnWeightsDev` holds both and
+    // `project_qkvr` picks. The MTP heads do NOT fuse (`MtpOwned` carries no
+    // fused field) and their names end with the same four suffixes, so they are
+    // excluded by prefix rather than by suffix.
+    //
+    // None of these four is a `mlp.gate`, a host-split matrix, an
+    // `input_proj` or the unembedding, so this returns rather than falling
+    // through: the branches below cannot also claim the name.
+    if policy.fused_qkvr
+        && !name.starts_with("model.mtp.")
+        && QKVR.iter().any(|s| name.ends_with(s))
+    {
+        return bytes
+            + if policy.dense_weights == DenseWeights::Aliased {
+                0
+            } else {
+                bytes
+            };
+    }
 
     // Bound row-padded out of a fresh host buffer, so it is a pool copy in
     // BOTH arms -- and the pad is part of the allocation, not a rounding.
@@ -2095,6 +2128,77 @@ mod tests {
         // Drafting binds the MTP heads that the range already pays arena for.
         let drafting = sum(placed(DenseWeights::DevicePool).with_drafting(true));
         assert_eq!(drafting - device, 8 * (67_108_864 + 33_554_432));
+    }
+
+    /// `INK_FUSE_QKVR` costs 52 MiB a layer in BOTH placement arms, and the
+    /// MTP heads do not pay it.
+    ///
+    /// The four projections are `[4096, 4096]`, `[1024, 4096]`, `[1024, 4096]`
+    /// and `[512, 4096]` BF16 -- 32 + 8 + 8 + 4 = 52 MiB, which is the 54.5 MB
+    /// `burn::fuse_qkvr` names. This is the term that was MISSING while the
+    /// switch existed: under the default aliased placement every one of these
+    /// four charged zero, so a concatenation admission could not see was
+    /// allocated on every layer.
+    ///
+    /// The MTP clause is not decoration. `model.mtp.layers.N.
+    /// transformer_block.attn.wq_du.weight` ends with the same suffix the LLM's
+    /// does, and `MtpOwned` carries no fused field, so a suffix-only test would
+    /// charge a bind that never happens.
+    #[test]
+    fn the_fused_qkvr_bind_is_charged_in_both_placement_arms() {
+        use super::super::budget::DenseWeights;
+        const MIB: u64 = 1 << 20;
+        let share: Vec<(String, Leaf)> = vec![
+            (
+                "model.llm.layers.0.attn.wq_du.weight".into(),
+                leaf(&[4096, 4096], Some(0)),
+            ),
+            (
+                "model.llm.layers.0.attn.wk_dv.weight".into(),
+                leaf(&[1024, 4096], Some(0)),
+            ),
+            (
+                "model.llm.layers.0.attn.wv_dv.weight".into(),
+                leaf(&[1024, 4096], Some(0)),
+            ),
+            (
+                "model.llm.layers.0.attn.wr_du.weight".into(),
+                leaf(&[512, 4096], Some(0)),
+            ),
+            // Same suffix, never fused.
+            (
+                "model.mtp.layers.0.transformer_block.attn.wq_du.weight".into(),
+                leaf(&[4096, 4096], Some(0)),
+            ),
+        ];
+        let sum = |policy: AdmissionPolicy| -> u64 {
+            share
+                .iter()
+                .map(|(n, l)| device_weight_bytes(n, l, policy))
+                .sum()
+        };
+
+        // Aliased: the four separate binds are views of the arena and cost
+        // nothing; the concatenation is the whole charge.
+        let alias_off = placed(DenseWeights::Aliased);
+        assert_eq!(sum(alias_off), 0);
+        assert_eq!(sum(alias_off.with_fused_qkvr(true)), 52 * MIB);
+
+        // Device pool: the separate binds are already charged, and the
+        // concatenation is a SECOND residency on top of them.
+        let dev_off = placed(DenseWeights::DevicePool);
+        assert_eq!(sum(dev_off), 52 * MIB);
+        assert_eq!(sum(dev_off.with_fused_qkvr(true)), 104 * MIB);
+
+        // Drafting binds the MTP head; fusing still does not fuse it.
+        let drafting = placed(DenseWeights::DevicePool).with_drafting(true);
+        assert_eq!(sum(drafting), 52 * MIB + 32 * MIB);
+        assert_eq!(sum(drafting.with_fused_qkvr(true)), 104 * MIB + 32 * MIB);
+
+        // 21 layers on the production split, against the 19.68 GiB of headroom
+        // the tail node's own admission line printed at INK_LAYERS=21:42.
+        assert_eq!(21 * 52 * MIB, 1092 * MIB);
+        assert!(21 * 52 * MIB < 19 * (1 << 30));
     }
 
     /// A synthetic expert with the real checkpoint's proportions, scaled down.
