@@ -54,12 +54,17 @@ pub const PAGE: usize = 128;
 /// How many pages a store keeps before merging the settled ones into one.
 ///
 /// The read costs launches per PAGE and the merge costs a copy per MERGE, so
-/// this is the one knob between them. At `8`, a store never hands the attention
-/// more than four chunks (the merged run, up to two whole pages, the partial
-/// tail), and a merge copies the retained context once every `7 * PAGE = 896`
-/// appends — against the once-per-append copy `gather` used to do. Both ends of
-/// that trade get cheaper as the context grows, which is why it is a constant
-/// and not a tuning parameter.
+/// this is the one knob between them. A merge leaves two pages — the merged run
+/// and the tail being filled — so the count oscillates between 2 and this, and
+/// the read is never more than [`MAX_PAGES`] chunks HOWEVER LONG the context
+/// is. Getting back from 2 to 9 takes `(MAX_PAGES - 1) * PAGE = 896` rows, so a
+/// merge copies the retained context once every 896 appends, against the
+/// once-per-append copy `gather` used to do.
+///
+/// Both ends of that trade get cheaper as the context grows — the launch count
+/// stops growing and the copy is amortized over more rows — which is why it is
+/// a constant and not a tuning parameter. Below `MAX_PAGES * PAGE = 1024` rows
+/// nothing merges at all and the read is simply the pages, one chunk each.
 pub const MAX_PAGES: usize = 8;
 
 /// What a page is made of: fixed-width rows that can be cut and rejoined.
@@ -105,9 +110,9 @@ pub trait PageRows: Clone {
 /// passes [`MAX_PAGES`]. The merge is the same `cat` the read used to do, but
 /// it happens once per `(MAX_PAGES - 1) * PAGE` appends instead of once per
 /// append — at 8k of context that is a copy every 896 steps rather than every
-/// step, and the read is then three or four chunks whatever the context length
-/// is. Nothing else in this file cared about a page's size: every operation
-/// below walks ROWS, not page indices.
+/// step, and the read is then at most [`MAX_PAGES`] chunks whatever the context
+/// length is. Nothing else in this file cared about a page's size: every
+/// operation below walks ROWS, not page indices.
 #[derive(Clone, Debug)]
 pub struct Pages<R: PageRows> {
     pages: Vec<R>,
