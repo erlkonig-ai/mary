@@ -157,6 +157,17 @@ pub struct PackedW {
 pub enum ProjW {
     Bf16(Bf16W),
     Fp4(PackedW),
+    /// The same NVFP4 bytes as [`Self::Fp4`], multiplied against a BF16
+    /// activation instead of a quantised one.
+    ///
+    /// Not a third weight format -- the payload is the identical [`PackedW`],
+    /// and moving a tensor between these two variants changes nothing on the
+    /// device. What it changes is whose numerics the ACTIVATION follows. The
+    /// checkpoint asks for a 4-bit activation on the routed experts and says
+    /// nothing about anything else, so `Fp4` is right there and this is right
+    /// everywhere the publisher left BF16: the sink experts, the attention
+    /// projections, and the unembedding.
+    W4a16(PackedW),
 }
 
 impl ProjW {
@@ -164,7 +175,7 @@ impl ProjW {
     pub fn n(&self) -> usize {
         match self {
             Self::Bf16(w) => w.n,
-            Self::Fp4(w) => w.n,
+            Self::Fp4(w) | Self::W4a16(w) => w.n,
         }
     }
 
@@ -172,16 +183,17 @@ impl ProjW {
     pub fn k(&self) -> usize {
         match self {
             Self::Bf16(w) => w.k,
-            Self::Fp4(w) => w.k,
+            Self::Fp4(w) | Self::W4a16(w) => w.k,
         }
     }
 }
 
-/// `x @ w^T` for a weight in either precision.
+/// `x @ w^T` for a weight in whichever lane it is bound to.
 pub fn linear_w(x: Tensor<Bk, 2>, w: &ProjW) -> Tensor<Bk, 2> {
     match w {
         ProjW::Bf16(b) => linear_bf16(x, b),
         ProjW::Fp4(p) => linear_fp4(x, p),
+        ProjW::W4a16(p) => linear_w4a16(x, p),
     }
 }
 
@@ -223,6 +235,40 @@ pub fn linear_fp4(x: Tensor<Bk, 2>, w: &PackedW) -> Tensor<Bk, 2> {
     let out = fp4_linear_launch(
         &client, &a, &asc, &w.codes, &w.scales, m_pad, k, w.n, w.scale2,
     );
+    tensor_of(client, dev, out, m_pad, w.n).slice([0..m, 0..w.n])
+}
+
+/// `x @ w^T` against an NVFP4 weight with the activation left BF16.
+///
+/// [`linear_fp4`] minus the activation quantiser. The weight is the same
+/// [`PackedW`] and reaches the MMA as the same four bits; what does not happen
+/// is the `quantize_nvfp4*` launch and the `input_quantizer` numerics it
+/// implies, which the publisher only calibrated for the routed experts.
+///
+/// The activation arrives f32 (the wide residual stream) or BF16 (the narrow
+/// one). Either way the M padding is done by the same kernel that does the
+/// cast, so the padding rows never exist as a separate buffer -- the hazard
+/// [`linear_fp4`] pays with a `Tensor::cat`.
+pub fn linear_w4a16(x: Tensor<Bk, 2>, w: &PackedW) -> Tensor<Bk, 2> {
+    use crate::models::inkling::bf16gemm::{pad_bf16_launch, to_bf16_launch};
+    use crate::models::inkling::w4a16gemm::{MTILE, w4a16_linear_launch};
+    let [m, k] = x.dims();
+    assert_eq!(
+        k, w.k,
+        "linear_w4a16: x is [_, {k}] but the weight is [_, {}]",
+        w.k
+    );
+    let m_pad = m.div_ceil(MTILE) * MTILE;
+    let client = client_of(&x);
+    let dev = x.device();
+    let (xh, xdt) = crate::models::inkling::seam::handle_of_any(x);
+    let a = match xdt {
+        burn::tensor::DType::BF16 if m_pad == m => xh,
+        burn::tensor::DType::BF16 => pad_bf16_launch(&client, &xh, m * k, m_pad * k),
+        burn::tensor::DType::F32 => to_bf16_launch(&client, &xh, m * k, m_pad * k),
+        other => panic!("linear_w4a16: no lane for a {other:?} activation"),
+    };
+    let out = w4a16_linear_launch(&client, &a, &w.codes, &w.scales, m_pad, k, w.n, w.scale2);
     tensor_of(client, dev, out, m_pad, w.n).slice([0..m, 0..w.n])
 }
 
@@ -3080,6 +3126,70 @@ mod tests {
         assert!(
             rel > 1e-6,
             "the two lanes agree exactly; the FP4 lane did not run"
+        );
+    }
+
+    /// [`linear_w4a16`] against [`linear_bf16`] on the SAME weight bytes.
+    ///
+    /// The twin of the test above and the same question: is my lane wired
+    /// right. A nibble-order, scale-index or fragment-layout mistake moves the
+    /// result by order one; honest four-bit WEIGHT quantisation moves it by a
+    /// few percent, and less than the W4A4 lane does because the activation
+    /// keeps its eight mantissa bits. The bound is the same loose one for the
+    /// same reason -- it is a bug detector, not a quality gate.
+    #[test]
+    fn linear_w4a16_tracks_linear_bf16_on_the_same_weight() {
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let (n, k) = (512usize, 256usize);
+        let m = 3usize;
+        let probe: Tensor<B, 2> = Tensor::from_data(TensorData::new(vec![0f32], [1, 1]), &dev);
+        let client = client_of(&probe);
+
+        let wf: Vec<f32> = fill(n * k, 0.17).into_iter().map(|x| x * 0.05).collect();
+        let mut bytes = Vec::with_capacity(n * k * 2);
+        for x in &wf {
+            bytes.extend_from_slice(&half::bf16::from_f32(*x).to_le_bytes());
+        }
+        let bw = Bf16W {
+            h: client.create_from_slice(&bytes),
+            n,
+            k,
+            align: 16,
+        };
+        let src = client.create_from_slice(&bytes);
+        let (codes, scales) =
+            crate::models::inkling::fp4quant::quantize_nvfp4_bf16(&client, &src, n, k);
+        let pw = PackedW {
+            codes,
+            scales,
+            n,
+            k,
+            scale2: 1.0,
+        };
+
+        let xv: Vec<f32> = fill(m * k, 0.31);
+        let x: Tensor<B, 2> = Tensor::from_data(TensorData::new(xv, [m, k]), &dev);
+
+        let a = linear_bf16(x.clone(), &bw).into_data().convert::<f32>();
+        let b = linear_w4a16(x, &pw).into_data().convert::<f32>();
+        let (av, bv) = (a.as_slice::<f32>().unwrap(), b.as_slice::<f32>().unwrap());
+        assert_eq!(av.len(), m * n);
+
+        let num: f64 = av
+            .iter()
+            .zip(bv)
+            .map(|(p, q)| ((p - q) as f64).powi(2))
+            .sum();
+        let den: f64 = av.iter().map(|p| (*p as f64).powi(2)).sum();
+        let rel = (num / den).sqrt();
+        assert!(
+            rel < 0.15,
+            "relative RMS {rel:.4} between the BF16 and W4A16 lanes on the same weight \
+             is a wiring fault, not quantisation error"
+        );
+        assert!(
+            rel > 1e-6,
+            "the two lanes agree exactly; the W4A16 lane did not run"
         );
     }
 

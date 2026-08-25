@@ -90,6 +90,12 @@ pub use config::InklingConfig;
 // device residency, the unscaled sibling of the instruction.
 pub mod bf16gemm;
 pub mod fp4gemm;
+// The half of NVFP4 that costs no calibration: the WEIGHT stays four bits and
+// the activation stays BF16, dequantised in registers inside the B-fragment
+// load. For every tensor the publisher left BF16 and never gave an
+// `input_quantizer` -- the sink experts, the attention projections, and the
+// 1.65 GB unembedding.
+pub mod w4a16gemm;
 // The same lane as `fp4gemm`, but the loop over a layer's active experts moved
 // off the host and into the grid: one launch per stage per layer, with the
 // block index selecting the expert. Same kernels, same order, same bits.
