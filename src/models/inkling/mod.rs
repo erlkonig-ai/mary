@@ -119,6 +119,15 @@ pub mod moegroup;
 // the readback and the expert launch at prefill.
 pub mod routetopk;
 
+// WHICH SLICE of each tensor a rank owns, for the split that cuts WITHIN a
+// layer rather than between layers. `INK_LAYERS` divides where the bytes live;
+// this divides how many bytes a token has to traverse, which at batch one is
+// the difference between `M / B` and `M / (2B)`. The header carries the
+// interconnect arithmetic that decides whether the per-layer all-reduce it
+// costs is affordable -- on this fabric it is 2.54 ms against a measured
+// 105.2 ms token, so it is not close.
+pub mod tp;
+
 // The routed-expert ROW PLAN on the device, from a top-k answer that is never
 // read back. `routetopk` moved the decision; this moves everything downstream
 // of it that the host used to need the decision's VALUE for.

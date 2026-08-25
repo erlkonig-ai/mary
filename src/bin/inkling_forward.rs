@@ -1040,10 +1040,20 @@
 //! * **A within-layer split.** 84 all-reduces a token at the measured 26.84 us
 //!   is 2.25 ms, **0.26% of an 866 ms pass** at `b = 64`; bandwidth is four
 //!   orders of magnitude clear. It halves the bytes each node reads AND runs
-//!   both GPUs on the same token, so the bound is 2x -- ~148 aggregate tok/s at
-//!   64 -- and it halves per-node weight residency, which is the thing that ran
-//!   out at 96. It needs every weight resharded, NCCL inside the loop, and the
-//!   KV cache split by head.
+//!   both GPUs on the same token. It needs the weights resharded, NCCL inside
+//!   the loop, and the KV cache split by head. The shard arithmetic and the
+//!   full costing are in `mary::models::inkling::tp`.
+//!
+//!   **Two claims this bullet used to make are wrong and are corrected there.**
+//!   (1) "the bound is 2x" ignores the term that does NOT halve: each node
+//!   issues 42 layers of kernels instead of 21, and at batch one the true
+//!   enqueue cost is ~1.25 ms/layer against ~49 ms of halved device streaming,
+//!   so **host enqueue becomes the binding constraint** and the projection is
+//!   1.5-1.9x rather than 2x. (2) "it halves per-node weight residency" is not
+//!   a gain over what is already here -- the LAYER split already halves it, and
+//!   an expert-parallel within-layer split lands within a few GiB of the same
+//!   ~76 GiB share. What it halves that the layer split does not is the KV and
+//!   ACTIVATION working set, which is the thing that actually ran out at 96.
 //! * **A two-cohort pipeline interleave.** BUILT -- `INK_COHORTS`, the section
 //!   after next. It predicted `p50(2c) / p50(c)` at a fixed slot budget:
 //!   866.3 / 585.7 = 1.48x at 64 slots, 1.45x at 96. Measured, **1.49x at 64
