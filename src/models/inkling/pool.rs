@@ -206,7 +206,18 @@ impl AllocatorConfig {
     /// routed gather is larger still), so `machine / 4 + machine / 16` is not a
     /// fitted coefficient -- it is two page sizes off a ladder the runtime
     /// derives from the device. It is flat in the sequence because the ladder
-    /// is. Measured: 41.74 GiB reserved to hold 1.14 GiB live at 16,384 tokens.
+    /// is. Measured: 41.74 GiB reserved to hold 1.14 GiB live at 16,384 tokens
+    /// -- thirty-six times the live set, which is why nothing about `live`
+    /// bounds it and a device fraction is the right shape here.
+    ///
+    /// That flatness is restored deliberately. The floor this replaces scaled
+    /// the same figure by `prefill_tokens / 16_384` and clamped it at
+    /// `machine / 16`, so a decode step under `CUBECL_MEMORY_CONFIG=subslices`
+    /// used to be charged 7.60 GiB and is now charged 38.01. That is a real
+    /// tightening of one arm, and it is the arm nothing runs on: SubSlices is
+    /// selected only by an explicit operator override,
+    /// [`choose_memory_config`] picks ExclusivePages, and the scaling was a
+    /// fudge for a ladder whose rungs do not move with the sequence.
     ///
     /// # ExclusivePages: a factor on the LIVE SET, because the buckets are
     ///
