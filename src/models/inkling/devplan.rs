@@ -65,6 +65,47 @@
 //! the host lane, and that is a property of the shape rather than a limitation
 //! to be lifted.
 //!
+//! # `n > 1`: what the `n == 1` restriction actually was
+//!
+//! It was DEDUPLICATION, not width. The sentence above is true of a plan that
+//! gives each DISTINCT expert one tile, and at `n == 1` that is automatic
+//! because one token's `top_k` picks are distinct by construction. The moment
+//! two rows can pick the same expert, the distinct count is data and the shape
+//! follows it.
+//!
+//! So this lane stopped deduplicating. `devroute_new` builds `n * top_k` SLOTS
+//! of one token each -- slot `s` is row `s / top_k`'s `s % top_k`-th pick --
+//! and every field of `RowPlan` is a function of `n` and `top_k` again, at
+//! every width up to [`super::fp4gemm::MTILE`]. Above `MTILE` a slot would need
+//! more than one tile and the count would be data-dependent once more, which is
+//! where a prefill lives and where the host lane still belongs.
+//!
+//! **What it costs and what it buys, both measured on spark2-zt (GB10), one
+//! node, layers 0:21, a 3772-token prompt grown by 12 cached decode steps,
+//! interleaved arms, idle- and memory-gated.** The cost is re-reading a shared
+//! expert's plane: the log's own `expert slabs decoded` counter reads 114 a
+//! pass at `n = 1`, ~200 at `n = 2` as the router actually routes, and 228
+//! without dedup -- so the charge is 28 slabs, about 0.40 GiB a pass, ~2 ms at
+//! this part's achievable bandwidth. The purchase is the readback, and its
+//! ceiling is what `INK_ROUTE_STALE=1` measures against an interleaved control:
+//!
+//! ```text
+//!   width   base ms/step   probe ms/step   the readback is worth
+//!     1         50.7            50.5              0.2 ms
+//!     2         72.2            64.1              8.1 ms
+//!     3         76.4            70.4              6.0 ms
+//! ```
+//!
+//! Width 1 is 0.2 ms because this lane was ALREADY on there -- there is no
+//! readback left to delete, which is the control that says the probe measures
+//! what it claims. And note what the 8.1 ms is NOT: the per-layer `BLOCKING
+//! read` bucket reads 22.6 ms at width 2, so the bucket overstates the prize by
+//! 2.8x for exactly the reason this module already records at `n == 1`. Most of
+//! a blocking read is device time the host would have waited for somewhere.
+//!
+//! `INK_DEV_PLAN_MAXN=1` restores the old gate exactly, which is what makes the
+//! widening an A/B rather than a replacement.
+//!
 //! # The sort, which is the part to get right
 //!
 //! The host lane's expert order is `BTreeMap` order — ASCENDING expert id — and
@@ -191,6 +232,7 @@ fn plan_from_topk(
     #[comptime] mtile: u32,
     #[comptime] width: u32,
     #[comptime] stride: u32,
+    #[comptime] rows: u32,
 ) {
     // One unit, so no guard and no barrier: the cube is one wide (see
     // [`plan_from_topk_launch`]) and everything below is a plain sequence.
@@ -198,27 +240,34 @@ fn plan_from_topk(
     // The pad rows first, so the scatter below writes over a known field rather
     // than into whatever the allocator last held. `row_wgt` is `top_k * mtile`
     // floats, 96 of them at the shape this lane runs in.
-    let m_total = comptime!(top_k * mtile);
+    let m_total = comptime!(rows * top_k * mtile);
     for i in 0..m_total {
         row_wgt[i as usize] = 0.0f32;
     }
 
     let mut bad = fault[0];
-    let flag = u32::cast_from(topk[comptime!((width - 1) as usize)]);
-    if flag != 0u32 {
-        bad = flag;
-    }
 
     // ASCENDING EXPERT ID, by rank rather than by swaps. `routetopk` hands the
     // picks over in descending score order and the accumulation order is
     // defined by the id, so this is the whole correctness of the module in a
     // dozen lines. See the module doc.
-    for j in 0..top_k {
-        let e = u32::cast_from(topk[j as usize]);
-        let w = topk[(top_k + j) as usize];
+    for row in 0..rows {
+        // The row's own window of `routetopk`'s output, and the row's own run of
+        // `top_k` slots. Row `t` owns slots `t * top_k .. (t + 1) * top_k` and no
+        // other row's, which is what keeps every SHAPE below a function of `rows`
+        // and `top_k` alone -- see the module doc's `n > 1` section.
+        let rb = row * comptime!(width);
+        let sb = row * comptime!(top_k);
+        let flag = u32::cast_from(topk[(rb + comptime!(width - 1)) as usize]);
+        if flag != 0u32 {
+            bad = flag;
+        }
+        for j in 0..top_k {
+        let e = u32::cast_from(topk[(rb + j) as usize]);
+        let w = topk[(rb + comptime!(top_k) + j) as usize];
         let mut r = u32::new(0);
         for q in 0..top_k {
-            let o = u32::cast_from(topk[q as usize]);
+            let o = u32::cast_from(topk[(rb + q) as usize]);
             if o < e {
                 r += 1u32;
             }
@@ -234,7 +283,7 @@ fn plan_from_topk(
             }
         }
         let es = e as usize;
-        let rs = r as usize;
+        let rs = (sb + r) as usize;
         // One entry an expert on a BF16 layer, two on an NVFP4 one. See
         // [`ExpertTable::stride`].
         for q in 0..stride {
@@ -246,6 +295,7 @@ fn plan_from_topk(
         sc2[rs] = tab_sc2[es];
         ids[rs] = e;
         row_wgt[rs * mtile as usize] = w;
+        }
     }
     fault[0] = bad;
 }
@@ -263,36 +313,39 @@ pub fn plan_from_topk_launch<R: Runtime>(
     top_k: usize,
     mtile: usize,
     width: usize,
+    rows: usize,
 ) -> DevRowPlan {
-    let m_total = top_k * mtile;
+    let slots = rows * top_k;
+    let m_total = slots * mtile;
     let st = tab.stride;
     let row_wgt = client.empty(m_total * core::mem::size_of::<f32>());
-    let off13 = client.empty(st * top_k * core::mem::size_of::<u64>());
-    let off2 = client.empty(st * top_k * core::mem::size_of::<u64>());
-    let sc13 = client.empty(top_k * core::mem::size_of::<f32>());
-    let sc2 = client.empty(top_k * core::mem::size_of::<f32>());
-    let ids = client.empty(top_k * core::mem::size_of::<u32>());
+    let off13 = client.empty(st * slots * core::mem::size_of::<u64>());
+    let off2 = client.empty(st * slots * core::mem::size_of::<u64>());
+    let sc13 = client.empty(slots * core::mem::size_of::<f32>());
+    let sc2 = client.empty(slots * core::mem::size_of::<f32>());
+    let ids = client.empty(slots * core::mem::size_of::<u32>());
     unsafe {
         plan_from_topk::launch_unchecked::<R>(
             client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new_1d(1),
-            ArrayArg::from_raw_parts(topk.clone(), width),
+            ArrayArg::from_raw_parts(topk.clone(), rows * width),
             ArrayArg::from_raw_parts(tab.off13.clone(), st * tab.n_routed),
             ArrayArg::from_raw_parts(tab.off2.clone(), st * tab.n_routed),
             ArrayArg::from_raw_parts(tab.sc13.clone(), tab.n_routed),
             ArrayArg::from_raw_parts(tab.sc2.clone(), tab.n_routed),
             ArrayArg::from_raw_parts(row_wgt.clone(), m_total),
-            ArrayArg::from_raw_parts(off13.clone(), st * top_k),
-            ArrayArg::from_raw_parts(off2.clone(), st * top_k),
-            ArrayArg::from_raw_parts(sc13.clone(), top_k),
-            ArrayArg::from_raw_parts(sc2.clone(), top_k),
-            ArrayArg::from_raw_parts(ids.clone(), top_k),
+            ArrayArg::from_raw_parts(off13.clone(), st * slots),
+            ArrayArg::from_raw_parts(off2.clone(), st * slots),
+            ArrayArg::from_raw_parts(sc13.clone(), slots),
+            ArrayArg::from_raw_parts(sc2.clone(), slots),
+            ArrayArg::from_raw_parts(ids.clone(), slots),
             ArrayArg::from_raw_parts(fault.clone(), 1),
             top_k as u32,
             mtile as u32,
             width as u32,
             st as u32,
+            rows as u32,
         )
     };
     DevRowPlan {
