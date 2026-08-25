@@ -292,19 +292,20 @@ impl CleanupPolicy {
         }
     }
 
-    /// Whether to clean up at the end of a layer, asking the pool and the node
-    /// when the policy is [`CleanupPolicy::WhenStranded`].
+    /// Whether to clean up at the end of a layer, given the pool's stranded
+    /// bytes, when the policy is [`CleanupPolicy::WhenStranded`].
     ///
     /// For [`CleanupPolicy::PerStage`] this is the tail-stage hand-back. The
     /// caller defers it until after the layer's RMS diagnostic so that the
     /// diagnostic's full-width temporary is released too; the four internal
     /// routed-stage hand-backs happen at their own boundaries.
     ///
-    /// `stranded` comes from `ComputeClient::memory_usage`, which is host-side
-    /// bookkeeping and needs no sync to read; the sync belongs to the cleanup
-    /// itself and is the caller's. A node whose `MemAvailable` cannot be read
-    /// gets the cheap branch: an unreadable `/proc/meminfo` is not a reason to
-    /// start paying nine percent.
+    /// A node whose `MemAvailable` cannot be read gets the cheap branch: an
+    /// unreadable `/proc/meminfo` is not a reason to start paying nine percent.
+    ///
+    /// Prefer [`CleanupGate`] at a call site inside the layer loop: this
+    /// function's `stranded` argument is not free to produce, and the two
+    /// policies that ignore it should not be paying for it.
     pub fn at_layer(self, stranded: u64) -> bool {
         match self {
             CleanupPolicy::Never => false,
@@ -330,6 +331,134 @@ impl CleanupPolicy {
             }
             CleanupPolicy::PerLayer => "between layers, always",
             CleanupPolicy::PerStage => "between stages",
+        }
+    }
+}
+
+/// How often the policy's question is ASKED, which is not the same question as
+/// what it answers.
+///
+/// [`CleanupPolicy::at_layer`] takes `stranded` as an argument and says nothing
+/// about where it comes from. It comes from `ComputeClient::memory_usage`, and
+/// that call is not the free host-side bookkeeping the comment on it used to
+/// claim. On this cubecl lineage the compute server lives on its own thread and
+/// `memory_usage` is `submit_blocking`: it enqueues a closure behind everything
+/// the layer has already submitted, wakes the runner, and blocks the caller on a
+/// oneshot until the runner has drained down to it. So the call is a HOST
+/// LAUNCH-QUEUE BARRIER, and once it arrives at the runner it walks every page
+/// of all twenty-four `ExclusivePages` buckets and every slice of the persistent
+/// pool, allocating a `Vec` of the live ones per pool as it goes.
+///
+/// That was being paid once per layer, in every arm, under every policy --
+/// including [`CleanupPolicy::Never`] and [`CleanupPolicy::PerLayer`], neither
+/// of which reads `stranded` at all. It is the reason an `INK_POOL_CLEANUP=0`
+/// A/B measured +0.00%: the switch it flips is downstream of the cost.
+///
+/// The gate fixes both halves without moving the policy:
+///
+/// * A policy that does not read `stranded` never asks for it. `Never` and
+///   `PerLayer`/`PerStage` are decided from the policy alone.
+/// * [`CleanupPolicy::WhenStranded`] asks per LAYER while the answer is yes and
+///   once per PASS while it is no. The two regimes the policy was confirmed in
+///   are both constant across a pass -- `0 of 42` on a decode step, `20 of 20`
+///   and `22 of 22` on the two-node prefill at 130,000 tokens -- so the sample
+///   that is dropped is a sample whose answer the neighbouring samples already
+///   carried. The pass's LAST layer always polls, so a pass that has gone quiet
+///   still re-arms per-layer polling for the next one, and the first answer of
+///   `yes` re-arms it for the rest of the current one.
+///
+/// What that trades is exactly one pass of latency on a transition from "not
+/// stranding" to "stranding", and the bound on it is the pass's own
+/// allocations: a decode step whose per-layer activations are megabytes cannot
+/// cross a gibibyte-scale margin inside one pass, and a prefill that can is a
+/// pass the previous poll already answered yes for.
+///
+/// `INK_POOL_POLL=layer` restores the unconditional per-layer poll, in every
+/// policy, so the cost of the poll can be A/B'd against its absence inside ONE
+/// binary and one worktree rather than across two.
+#[derive(Clone, Copy, Debug)]
+pub struct CleanupGate {
+    policy: CleanupPolicy,
+    /// `INK_POOL_POLL=layer`: poll unconditionally, as the loop used to.
+    always_poll: bool,
+    /// Poll at every layer of the pass now running.
+    per_layer: bool,
+    /// Some poll in the pass now running answered yes.
+    acted: bool,
+}
+
+impl CleanupGate {
+    /// The gate for this run. Starts armed, so the first pass polls per layer
+    /// and nothing has to be assumed about what state the pool woke up in.
+    pub fn new(policy: CleanupPolicy) -> Self {
+        Self {
+            policy,
+            always_poll: matches!(std::env::var("INK_POOL_POLL").as_deref(), Ok("layer")),
+            per_layer: true,
+            acted: false,
+        }
+    }
+
+    /// What the run's header should say about the sampling schedule.
+    pub fn schedule(&self) -> &'static str {
+        if self.always_poll {
+            "every layer (INK_POOL_POLL=layer)"
+        } else {
+            match self.policy {
+                CleanupPolicy::Never | CleanupPolicy::PerLayer | CleanupPolicy::PerStage => {
+                    "never -- this policy does not read the pool"
+                }
+                CleanupPolicy::WhenStranded => {
+                    "every layer while it is handing pages back, once a pass while it is not"
+                }
+            }
+        }
+    }
+
+    /// Call at the top of every pass, before its first layer.
+    pub fn begin_pass(&mut self) {
+        self.per_layer = self.acted;
+        self.acted = false;
+    }
+
+    /// Whether this layer hands the pool's pages back.
+    ///
+    /// `last` marks the pass's final layer, which always polls. `stranded` is a
+    /// closure and not a value because calling it is the cost this type exists
+    /// to stop paying: it is invoked only on a layer whose answer can depend on
+    /// it.
+    pub fn at_layer(&mut self, last: bool, stranded: impl FnOnce() -> u64) -> bool {
+        if self.always_poll {
+            // The old shape, kept callable for the A/B: read the pool first and
+            // unconditionally, then ask the policy.
+            let s = stranded();
+            let yes = self.policy.at_layer(s);
+            if yes {
+                self.acted = true;
+            }
+            return yes;
+        }
+        match self.policy {
+            CleanupPolicy::Never => false,
+            CleanupPolicy::PerLayer | CleanupPolicy::PerStage => {
+                self.acted = true;
+                true
+            }
+            CleanupPolicy::WhenStranded => {
+                if !self.per_layer && !last {
+                    return false;
+                }
+                let avail = match super::pile::mem_available_bytes() {
+                    Ok(avail) => avail,
+                    Err(_) => return false,
+                };
+                let yes = stranded() > avail;
+                if yes {
+                    self.acted = true;
+                    self.per_layer = true;
+                }
+                yes
+            }
         }
     }
 }
