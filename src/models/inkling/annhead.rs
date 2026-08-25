@@ -185,17 +185,21 @@
 //! `quantize_nvfp4_bf16`, so these are the codes a real bind produces.
 //!
 //! ```text
-//!   exact w4a16   4.84 - 5.29 ms      0.431 GiB of codes + scales
-//!   aNN           0.755 ms            0.097 GiB of signs + alpha
+//!   exact w4a16   4.33 - 5.29 ms      0.431 GiB of codes + scales
+//!   aNN           0.78 - 0.83 ms      0.097 GiB of signs + alpha
 //! ```
 //!
-//! The exact arm is quoted as a RANGE because two runs of the same binary on the
-//! same box gave 4.838 and 5.289 — a 9% spread — so any single ratio taken
-//! against it carries that spread. Roughly SIX times, not "7.01x".
+//! Both arms are quoted as RANGES over the runs taken, because that is what the
+//! instrument delivers: six runs of the same binary on the same box put the
+//! exact arm anywhere from 4.334 to 5.289 ms, a 22% spread. So the ratio is
+//! **roughly six times**, and a single-run "7.01x" — which one of these runs
+//! genuinely printed — would be quoting the noise as the result.
 //!
-//! The two GB/s figures those bytes imply (88-96 against 137) are over DIFFERENT
-//! TABLES and are not a like-for-like efficiency comparison. What they do say is
-//! that neither lane is at this part's ~248 GB/s coalesced ceiling.
+//! The GB/s those bytes imply are over DIFFERENT TABLES and are not a
+//! like-for-like efficiency comparison. The like-for-like number is against a
+//! coalesced read of the same bytes, and it is in its own section below: the
+//! scan reaches 59% of this part's streaming ceiling where the exact head
+//! reaches 49%.
 //!
 //! ## End to end, in a decode step
 //!
