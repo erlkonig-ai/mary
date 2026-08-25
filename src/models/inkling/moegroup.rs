@@ -90,9 +90,63 @@
 //! * blocks adjacent in `block` may belong to DIFFERENT experts, so adjacency
 //!   along that axis is not weight-row adjacency the way it is in a dense lane.
 //!
-//! And there is nothing left to buy: `fp4_linear_grouped` measures 171 GB/s
-//! against a 170.4 GB/s coalesced ceiling on this box. The dense head lanes sit
-//! at 92-104 GB/s against the same ceiling, which is where the room was.
+//! ## "Nothing left to buy" — retracted, and what the ceiling actually is
+//!
+//! This said `fp4_linear_grouped` measures 171 GB/s against a 170.4 GB/s
+//! coalesced ceiling and so had nothing left to buy. **The 170.4 was wrong.**
+//! The control that produced it (`fp4_lane_dump`'s `stream_packed`) computed
+//! its thread stride from the u32 WORD count of a table CubeCL indexes in
+//! 16-byte VECTORS, so every thread strode four times past the buffer, and its
+//! store was unconditional — a 12.5% write tax charged to a read figure.
+//!
+//! Measured properly — `inkling_membw` with `INK_BW_AXES=1`, every row back to
+//! back in ONE process, rows 1-6 reading the SAME 1 GiB device handle bound at
+//! different element types, best of 5 timed launches after 2 warmups, stores
+//! sentinel-guarded so no row pays write traffic, spark-zt (GB10, sm_121a, 48
+//! SMs, 24 MiB L2, 256-bit LPDDR5X at 8533 MT/s = 273 GB/s of bus), GPU
+//! verified idle:
+//!
+//! ```text
+//!   f32 coalesced, 128-bit / 32-bit loads          247.5 / 259.3 GB/s
+//!   BF16 coalesced, 128-bit loads                          247.8
+//!   NVFP4 codes coalesced, 128-bit / 32-bit loads  247.2 / 259.4
+//!   NVFP4 codes + E4M3 scales, both coalesced              259.1
+//!   the m16n8k64 B footprint, mma deleted           111.8 to 134.2
+//!   fp4_linear ITSELF, m_pad = 16, same 1 GiB table         105.8
+//! ```
+//!
+//! So there is ONE bus ceiling here, ~250-260 GB/s, and it does not depend on
+//! element width: f32, BF16 and packed NVFP4 read the same bytes at the same
+//! rate, and adding the E4M3 scale plane as a second coalesced stream at
+//! NVFP4's own 8:1 ratio costs nothing. There is no four-bit read penalty on
+//! this part.
+//!
+//! What DOES cost is this kernel's access pattern, and it costs a factor of
+//! two. The `m16n8k64` B fragment is 8 columns of `[n, k]`, so a plane's B load
+//! spans EIGHT weight rows `k/2` bytes apart: one instruction issues eight
+//! sector requests where a coalesced 32-bit stream issues four. Deleting the
+//! `mma` and reading only that footprint gives 111.8-134.2 GB/s, and
+//! `fp4_linear` — this kernel minus the expert offset — gives 105.8 on the same
+//! table seconds later. Neither the scale stream nor the loop structure is the
+//! cause: unrolling 2, 4 and 8 k tiles into one iteration moves nothing
+//! (109-111), and laying the scales k-tile-major so a plane's eight scale reads
+//! are one contiguous segment moves nothing either (111.2 against 113.9).
+//! Resident planes do matter — 32-thread cubes (24 planes an SM, the cube limit
+//! on this part) read 134.2 where 256-thread cubes (48 planes) read 113.9,
+//! which is 24 x 16 lines x 128 B = 48 KiB against 96 KiB of a 128 KiB L1 — and
+//! that is the whole spread between the numbers in circulation, not a
+//! disagreement about the bus.
+//!
+//! The dense `matmul_entry` control that reads 232-247 GB/s in the same decode
+//! pass is therefore not a rebuke of this lane's dtype; it is a staged matmul
+//! reaching the coalesced ceiling because it stages. Judged against ~250 GB/s
+//! rather than against a broken 170.4, this lane's 1.083 GB of weights at
+//! 7.05 ms/pass has roughly 2.7 ms/pass of headroom, and the mechanism that
+//! would capture it is exactly the one that is missing: staging B through
+//! shared memory so the global read is a per-row coalesced stream and only the
+//! smem read is fragment-shaped. Whether an smem round trip keeps enough of
+//! that 2x is not settled here — it is the experiment this retraction makes
+//! worth running.
 //!
 //! # How the scatter sums
 //!
