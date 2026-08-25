@@ -75,47 +75,6 @@ fn main() {
     let scales = n * (k / 16);
     println!("head shape m_pad={m_pad} k={k} n={n}: codes {codes} B, scales {scales} B");
 
-    // Correctness first: the wide lane has to be the SAME product as the one it
-    // is being timed against, or the timing is a measurement of a bug. Small
-    // shape, real bytes, exact equality — both kernels accumulate the same
-    // products in the same order, so anything but bit-identity is a defect.
-    {
-        let (cm, ck, cn) = (16usize, 256usize, 64usize);
-        let mut wb = Vec::with_capacity(cn * (ck / 8) * 4);
-        for i in 0..cn * (ck / 8) {
-            wb.extend_from_slice(&(0x1234_5678u32.wrapping_mul(i as u32 + 1)).to_le_bytes());
-        }
-        // E4M3 1.0 is 0x38; a couple of other exponents keep the scale path live.
-        let sb: Vec<u8> = (0..cn * (ck / 16))
-            .map(|i| [0x38u8, 0x40, 0x30][i % 3])
-            .collect();
-        let ab: Vec<u8> = (0..cm * ck)
-            .flat_map(|i| half::bf16::from_f32((i % 13) as f32 * 0.25 - 1.5).to_le_bytes())
-            .collect();
-        let ha = client.create_from_slice(&ab);
-        let hb = client.create_from_slice(&wb);
-        let hs = client.create_from_slice(&sb);
-        let o1 = w4a16_linear_launch::<Rt>(&client, &ha, &hb, &hs, cm, ck, cn, 0.75);
-        let o2 = w4a16_linear_wide_launch::<Rt>(&client, &ha, &hb, &hs, cm, ck, cn, 0.75);
-        let r1 = client.read_one(o1).unwrap();
-        let r2 = client.read_one(o2).unwrap();
-        let f = |b: &[u8]| -> Vec<f32> {
-            b.chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect()
-        };
-        let (v1, v2) = (f(&r1), f(&r2));
-        let bad = v1
-            .iter()
-            .zip(&v2)
-            .enumerate()
-            .find(|(_, (x, y))| (**x - **y).abs() > 1e-4 * x.abs().max(1.0));
-        match bad {
-            Some((i, (x, y))) => panic!("wide lane differs at {i}: {x} vs {y}"),
-            None => println!("wide lane matches the original over {} outputs", v1.len()),
-        }
-    }
-
     // W4A16: BF16 activation, packed-u32 weight, e4m3 scales.
     let a = client.empty(m_pad * k * 2);
     let b = client.empty(codes);
@@ -236,4 +195,45 @@ fn main() {
         gbs(fp4_s - alloc_s),
         gbs(stream_s)
     );
+
+    // The wide lane has to be the SAME product as the one it is timed against,
+    // or the timing is a measurement of a bug. Run LAST: the check's own
+    // create/read_one traffic moved the timings above by up to 30% when it ran
+    // first, which is a measurement of the allocator, not of the kernels.
+    {
+        let (cm, ck, cn) = (16usize, 256usize, 64usize);
+        let mut wb = Vec::with_capacity(cn * (ck / 8) * 4);
+        for i in 0..cn * (ck / 8) {
+            wb.extend_from_slice(&(0x1234_5678u32.wrapping_mul(i as u32 + 1)).to_le_bytes());
+        }
+        // E4M3 1.0 is 0x38; a couple of other exponents keep the scale path live.
+        let sb: Vec<u8> = (0..cn * (ck / 16))
+            .map(|i| [0x38u8, 0x40, 0x30][i % 3])
+            .collect();
+        let ab: Vec<u8> = (0..cm * ck)
+            .flat_map(|i| half::bf16::from_f32((i % 13) as f32 * 0.25 - 1.5).to_le_bytes())
+            .collect();
+        let ha = client.create_from_slice(&ab);
+        let hb = client.create_from_slice(&wb);
+        let hs = client.create_from_slice(&sb);
+        let o1 = w4a16_linear_launch::<Rt>(&client, &ha, &hb, &hs, cm, ck, cn, 0.75);
+        let o2 = w4a16_linear_wide_launch::<Rt>(&client, &ha, &hb, &hs, cm, ck, cn, 0.75);
+        let r1 = client.read_one(o1).unwrap();
+        let r2 = client.read_one(o2).unwrap();
+        let f = |b: &[u8]| -> Vec<f32> {
+            b.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        let (v1, v2) = (f(&r1), f(&r2));
+        let bad = v1
+            .iter()
+            .zip(&v2)
+            .enumerate()
+            .find(|(_, (x, y))| (**x - **y).abs() > 1e-4 * x.abs().max(1.0));
+        match bad {
+            Some((i, (x, y))) => panic!("wide lane differs at {i}: {x} vs {y}"),
+            None => println!("wide lane matches the original over {} outputs", v1.len()),
+        }
+    }
 }
