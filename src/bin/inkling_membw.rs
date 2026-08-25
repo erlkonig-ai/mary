@@ -1212,28 +1212,21 @@ fn run_axes() -> Result<()> {
                 }
                 closed &= w[261 + l] as usize == l >> 2;
             }
-            println!(
-                "  lanes 0..4:  {}",
-                (0..4)
-                    .flat_map(|l: usize| (0..vc as usize).map(move |i| format!(
-                        "l{l}/{i} k={} n={}",
-                        w[(l * 4 + i) * 2],
-                        w[(l * 4 + i) * 2 + 1]
-                    )))
-                    .collect::<Vec<_>>()
-                    .join("  ")
-            );
-            println!(
-                "  lanes 4..8:  {}",
-                (4..8)
-                    .flat_map(|l: usize| (0..vc as usize).map(move |i| format!(
-                        "l{l}/{i} k={} n={}",
-                        w[(l * 4 + i) * 2],
-                        w[(l * 4 + i) * 2 + 1]
-                    )))
-                    .collect::<Vec<_>>()
-                    .join("  ")
-            );
+            let show = |lo: usize, hi: usize| -> String {
+                let mut parts = Vec::new();
+                for l in lo..hi {
+                    for i in 0..vc as usize {
+                        parts.push(format!(
+                            "l{l}/{i} k={} n={}",
+                            w[(l * 4 + i) * 2],
+                            w[(l * 4 + i) * 2 + 1]
+                        ));
+                    }
+                }
+                parts.join("  ")
+            };
+            println!("  lanes 0..4:  {}", show(0, 4));
+            println!("  lanes 4..8:  {}", show(4, 8));
             println!(
                 "  closed form col = lane>>2, k = (lane&3)*8 + 32*i, scale row = lane>>2: {}",
                 if closed {
