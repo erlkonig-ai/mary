@@ -393,16 +393,25 @@ pub fn axis_u32<NW: Size>(
 /// The B-operand footprint of [`mary::models::inkling::moegroup::fp4_linear_grouped`]
 /// with the `mma` deleted and nothing else changed.
 ///
-/// One plane per n tile. Per k tile the plane's 32 lanes cover 8 weight rows x
-/// 32 contiguous bytes — four lanes to a row, 8 bytes each in TWO 32-bit
-/// loads, which is the width `vs = 32 / e2m1x2::size_bits()` gives the real
-/// kernel. Rows are `k/2` bytes apart; `t` walks along k, so each 128-byte
-/// line is consumed over four consecutive iterations out of L1.
+/// One plane per n tile. The PTX B layout for `m16n8k64` is `col = lane >> 2`,
+/// `row = (lane & 3) * 8 + i` with a second group 32 k-elements on — so the
+/// plane's 32 lanes cover EIGHT weight rows, four lanes to a row, and each
+/// lane's two 32-bit loads sit 16 bytes apart inside one 32-byte segment. Per
+/// k tile the plane therefore touches 8 rows x 32 contiguous bytes, the rows
+/// `k/2` bytes apart, and `t` walks along k so each 128-byte line is consumed
+/// over four consecutive iterations out of L1. 32-bit is the width the real
+/// kernel issues: `vs = 32 / e2m1x2::size_bits()` = 4 packed bytes.
 ///
 /// `sc_mode`: 0 = codes only (isolates the pattern from the second stream),
 /// 1 = row-major `[n][k/16]` scales, one 32-bit load per row per k tile,
 /// 2 = k-tile-major `[k/64][n][4]` scales, where the plane's eight scale reads
 /// are eight consecutive words instead of eight scattered sectors.
+///
+/// `ut` k tiles are unrolled into one iteration. At `ut = 1` that is exactly
+/// the real loop, which leaves a warp with three loads in flight; raising it
+/// raises memory-level parallelism WITHOUT changing a single address, so a
+/// figure that climbs with `ut` says the pattern is latency-bound and a figure
+/// that does not says the pattern itself is the ceiling.
 #[cube(launch)]
 pub fn axis_frag_b(
     codes: &Tensor<u32>,
@@ -411,25 +420,30 @@ pub fn axis_frag_b(
     #[comptime] size_k: usize,
     #[comptime] size_n: usize,
     #[comptime] sc_mode: u32,
+    #[comptime] ut: usize,
 ) {
     let warp = ABSOLUTE_POS as usize / 32;
     let lane = ABSOLUTE_POS as usize % 32;
-    // Four lanes per weight row, eight rows per plane — the n tile is 8 wide.
+    // Four lanes per weight row, eight rows per plane -- the n tile is 8 wide.
     let row = warp * 8 + lane / 4;
     let sub = lane % 4;
     let cw = comptime!(size_k / 8); // u32 words in one row of codes
     let sw = comptime!(size_k / 64); // u32 words in one row of scales
-    let k_tiles = comptime!(size_k / 64);
+    let steps = comptime!(size_k / 64 / ut);
     let mut acc = u32::new(0i64);
-    for t in 0..k_tiles {
-        let base = row * cw + t * 8 + sub * 2;
-        acc += codes[base];
-        acc += codes[base + 1];
-        if comptime![sc_mode == 1] {
-            acc += scales[row * sw + t];
-        }
-        if comptime![sc_mode == 2] {
-            acc += scales[t * size_n + row];
+    for s in 0..steps {
+        #[unroll]
+        for u in 0..ut {
+            let t = s * ut + u;
+            let base = row * cw + t * 8 + sub;
+            acc += codes[base];
+            acc += codes[base + 4];
+            if comptime![sc_mode == 1] {
+                acc += scales[row * sw + t];
+            }
+            if comptime![sc_mode == 2] {
+                acc += scales[t * size_n + row];
+            }
         }
     }
     if acc == u32::new(0x5AFE_5AFEi64) {
@@ -631,10 +645,25 @@ fn run_axes() -> Result<()> {
     // ---- rows 7-9: the GEMM's own B footprint ------------------------------
     let threads = n * 4; // 32 lanes per n tile of 8 rows
     let blocks = (threads as u32).div_ceil(BLOCK);
-    for (label, mode, with_sc) in [
-        ("7  m16n8k64 B footprint, codes only", 0u32, false),
-        ("8  m16n8k64 B footprint + row-major scales", 1u32, true),
-        ("9  m16n8k64 B footprint + k-tile-major scales", 2u32, true),
+    for (label, mode, with_sc, ut) in [
+        ("7  m16n8k64 B footprint, codes only", 0u32, false, 1usize),
+        (
+            "8  m16n8k64 B footprint + row-major scales",
+            1u32,
+            true,
+            1usize,
+        ),
+        (
+            "9  m16n8k64 B footprint + k-tile-major scales",
+            2u32,
+            true,
+            1usize,
+        ),
+        ("10 row 8, 2 k tiles per iteration", 1u32, true, 2usize),
+        ("11 row 8, 4 k tiles per iteration", 1u32, true, 4usize),
+        ("12 row 8, 8 k tiles per iteration", 1u32, true, 8usize),
+        ("13 row 9, 8 k tiles per iteration", 2u32, true, 8usize),
+        ("14 row 7, 8 k tiles per iteration", 0u32, false, 8usize),
     ] {
         let bytes = if with_sc { codes_b + scales_b } else { codes_b };
         let (b, f) = best_first(
@@ -651,6 +680,7 @@ fn run_axes() -> Result<()> {
                         k,
                         n,
                         mode,
+                        ut,
                     )
                 };
                 let _ = cubecl::future::block_on(client.sync());
