@@ -1410,13 +1410,22 @@ pub fn attention_steps(
         * tau.reshape([1, rows, 1]);
     let bias = rel.gather(2, idx) * valid;
 
-    let qh = q.reshape([rows, heads, head_dim]).swap_dims(0, 1);
-    let expand = |t: Tensor<Bk, 2>| -> Tensor<Bk, 3> {
-        t.reshape([padded, kv_heads, head_dim])
-            .swap_dims(0, 1)
-            .reshape([kv_heads, 1, padded, head_dim])
-            .repeat_dim(1, groups)
-            .reshape([heads, padded, head_dim])
+    // GQA without materialising the expansion, the `rows > 1` twin of the same
+    // change in [`attention_step`]. Here it matters more: this is the shape a
+    // speculative VERIFY runs in, so the expanded copy was `rows` queries
+    // against a 4x copy of the cache.
+    //
+    // `q` is `[rows, heads * head_dim]` and head `k * groups + g` reads KV head
+    // `k`, so the permutation below gathers the (group, row) pairs that share a
+    // KV head into that batch entry's rows. It permutes `q`, which is
+    // `rows * heads * head_dim`; the expansion permuted the CACHE.
+    let qg = q
+        .reshape([rows, kv_heads, groups, head_dim])
+        .swap_dims(0, 1)
+        .swap_dims(1, 2)
+        .reshape([kv_heads, groups * rows, head_dim]);
+    let headwise_kv = |t: Tensor<Bk, 2>| -> Tensor<Bk, 3> {
+        t.reshape([padded, kv_heads, head_dim]).swap_dims(0, 1)
     };
     let pad_rows = |t: Tensor<Bk, 2>| -> Tensor<Bk, 2> {
         if padded == len {
@@ -1425,13 +1434,21 @@ pub fn attention_steps(
         let dim = t.dims()[1];
         Tensor::cat(vec![t, as_kv(Tensor::zeros([padded - len, dim], &dev))], 0)
     };
-    let kh = expand(pad_rows(cache.k.materialize(&dev)));
-    let vh = expand(pad_rows(cache.v.materialize(&dev)));
+    let kh = headwise_kv(pad_rows(cache.k.materialize(&dev)));
+    let vh = headwise_kv(pad_rows(cache.v.materialize(&dev)));
 
-    let scores =
-        from_kv(as_kv(qh).matmul(kh.swap_dims(1, 2))).mul_scalar(d.scaling()) + bias + wmask;
+    // `[kv_heads, groups * rows, padded]` back to `[heads, rows, padded]`:
+    // `kv_heads` and `groups` collapse to `heads` in that order, which is the
+    // correspondence the old repeat produced.
+    let scores = from_kv(as_kv(qg).matmul(kh.swap_dims(1, 2)))
+        .reshape([heads, rows, padded])
+        .mul_scalar(d.scaling())
+        + bias
+        + wmask;
     let probs = burn::tensor::activation::softmax(scores, 2);
-    let out = from_kv(as_kv(probs).matmul(vh))
+    let out = from_kv(as_kv(probs.reshape([kv_heads, groups * rows, padded])).matmul(vh))
+        .reshape([kv_heads, groups, rows, head_dim])
+        .swap_dims(1, 2)
         .swap_dims(0, 1)
         .reshape([rows, heads * head_dim]);
     linear_bf16(out, &w.wo)
