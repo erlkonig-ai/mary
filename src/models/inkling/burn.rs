@@ -3128,10 +3128,27 @@ mod tests {
     /// The oracle is the uncached whole-sequence lane, which never touches the
     /// KV store at all, so it cannot share a paging mistake with the thing it
     /// is checking.
+    ///
+    /// ## This test is RED, and not because of paging
+    ///
+    /// [`cached_global_matches_full`] — eleven tokens, one chunk, the same
+    /// comparison — already fails on `main` at 1.4341354e-2 against a
+    /// [`CACHE_TOLERANCE_GLOBAL`] of 2e-5, and has nothing to do with this
+    /// file's read path. This is the same failure at a longer context, so it
+    /// inherits it: 2.353859e-2 over 421 tokens.
+    ///
+    /// The number is the evidence that it is ONLY that. Measured 2026-08-25 on
+    /// the GB10, `cargo test --release --lib --features inkling-cuda`: the
+    /// paged read reports 2.353859e-2 and the materialized read it replaced
+    /// reports 2.353859e-2 — the same digits, on the same tokens, on the same
+    /// machine. Four chunks summed give what one contiguous buffer gave. Any
+    /// future change to the read that moves this number is a real regression;
+    /// the bar it is currently held to is not this change's to meet.
     #[test]
     fn cached_global_matches_full_across_pages() {
         let tokens = 3 * super::super::kvpages::PAGE + 37;
         let worst = compare(AttnKind::Global, 5, None, None, tokens, 4, false);
+        println!("global, {tokens} tokens, {worst:e}");
         assert!(
             worst < CACHE_TOLERANCE_GLOBAL,
             "cached global attention over {tokens} tokens drifts by {worst}"
@@ -3158,6 +3175,10 @@ mod tests {
             4,
             false,
         );
+        // Green, and at the same number the materialized read gave:
+        // 1.1367798e-2 both ways, 384 tokens through a 147-key window, GB10,
+        // 2026-08-25.
+        println!("local, 3 pages with a head, {worst:e}");
         assert!(
             worst < CACHE_TOLERANCE_LOCAL,
             "cached windowed attention over 3 pages drifts by {worst}"
