@@ -74,6 +74,26 @@
 //! kernels read the run length out of the plan, so it is tunable without a
 //! recompile.
 //!
+//! ## Why the grid axes here are NOT the ones swapped in the dense lanes
+//!
+//! `fp4_linear` and `w4a16_linear` had N in grid x, which put the consumers of
+//! one weight row `n / 8` cubes apart and cost them all their B reuse; swapping
+//! M into x bought 1.15x to 2.41x at `m_pad` 32-128 (numbers in `fp4gemm`'s
+//! header). The same swap is checked here and DECLINED, for two reasons:
+//!
+//! * this grid is `(n_cube, block)` on purpose. A block is already `MPLANES`
+//!   consecutive m tiles inside ONE cube, so B is shared through L1 rather than
+//!   through launch order — that is what the section above is about — which
+//!   leaves the x axis free to give A the L2 locality instead, and A is the
+//!   larger half of this kernel's traffic at the grouped shape. The dense lanes
+//!   had no such second mechanism, so their x axis had to carry B.
+//! * blocks adjacent in `block` may belong to DIFFERENT experts, so adjacency
+//!   along that axis is not weight-row adjacency the way it is in a dense lane.
+//!
+//! And there is nothing left to buy: `fp4_linear_grouped` measures 171 GB/s
+//! against a 170.4 GB/s coalesced ceiling on this box. The dense head lanes sit
+//! at 92-104 GB/s against the same ceiling, which is where the room was.
+//!
 //! # How the scatter sums
 //!
 //! (continued) An atomic arm was measured and removed: it was indistinguishable

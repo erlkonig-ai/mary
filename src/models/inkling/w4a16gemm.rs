@@ -140,8 +140,14 @@ pub fn w4a16_linear<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size>(
     // kernel as its two parents rather than a third dialect of it.
     let pack = AB::packing_factor();
 
-    let n_tile = CUBE_POS_X as usize;
-    let m_tile = CUBE_POS_Y as usize;
+    // M in x, N in y. Grid x varies fastest, so the cubes that share a weight
+    // row — the whole n-tile's `[8, k]` of codes and scales — are the ones
+    // launched adjacently, and one DRAM read of that row serves all
+    // `m_pad / 16` of them out of L2. The other order puts consumers of the
+    // same row `n / 8` cubes apart, which at the head shape is the whole
+    // weight table between them, so every m-tile re-reads from DRAM.
+    let m_tile = CUBE_POS_X as usize;
+    let n_tile = CUBE_POS_Y as usize;
     let n_base = n_tile * NTILE;
     let m_base = m_tile * MTILE;
 
@@ -251,6 +257,14 @@ pub fn w4a16_linear_launch<R: Runtime>(
     );
     assert_eq!(n % NTILE, 0, "n {n} is not a multiple of {NTILE}");
     assert_eq!(k % KTILE, 0, "k {k} is not a multiple of {KTILE}");
+    // N rides grid y, which CUDA caps at 65535 (x is 2^31-1). The largest N in
+    // the model is the unembedding's 201024 = 25128 tiles, well inside it, but
+    // the cap is silent if it is ever exceeded so it is checked here.
+    assert!(
+        n / NTILE <= 65535,
+        "{} n-tiles exceed the 65535 grid-y limit",
+        n / NTILE
+    );
 
     let out = client.empty(m_pad * n * core::mem::size_of::<f32>());
     // Two BF16 per `.b32`, which is what `contiguous_elements` reports for A
@@ -262,7 +276,7 @@ pub fn w4a16_linear_launch<R: Runtime>(
     unsafe {
         w4a16_linear::launch::<bf16, e4m3, R>(
             client,
-            CubeCount::Static((n / NTILE) as u32, (m_pad / MTILE) as u32, 1),
+            CubeCount::Static((m_pad / MTILE) as u32, (n / NTILE) as u32, 1),
             CubeDim::new_1d(32),
             vs,
             2,
@@ -330,6 +344,27 @@ pub fn w4a16_linear_launch<R: Runtime>(
 //
 // A is left alone throughout: at `m_pad = 16` it is 128 KiB, L2-resident, and
 // re-read by every cube.
+//
+// One thing above IS occupancy-shaped after all, and it is not in the kernel:
+// the GRID ORDER. See `fp4gemm`'s module header for the full sweep. The short
+// version, same harness and same framing (head shape `k = 4096`, `n = 201024`,
+// min of four warm launches, launch + sync, GB10, GPU idle, kernel time):
+//
+// ```text
+//   m_pad   N in x     M in x     ratio        wide, N in x -> M in x
+//      16   4.98 ms    4.88 ms    1.02         4.83 -> 4.87   (unchanged)
+//      32   9.87       6.99       1.41         9.83 -> 5.90
+//      64  18.92      16.43       1.15        19.27 -> 14.38
+//     128  38.59      33.33       1.16        40.96 -> 29.82
+// ```
+//
+// Both lanes gain, and BOTH gain less than `fp4_linear` does at the same shapes
+// (1.97-2.41x). The obvious difference is A: this lane's activation is BF16, so
+// its A traffic is four times the NVFP4 lane's over the same `m_pad`, and A is
+// the operand the other launch order was serving out of L2. Obvious is not
+// measured, though — that is a hypothesis, and this timer cannot separate it
+// from the instruction count the block above already showed this lane is
+// carrying.
 
 /// Planes per cube. At 4 the block limit stops binding and the register budget
 /// takes over — 40 x 128 = 5120 registers a cube, 12 cubes an SM, all 48 warp
@@ -359,9 +394,10 @@ pub fn w4a16_linear_wide<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size, NB: S
     let lane = UNIT_POS_PLANE;
     let pack = AB::packing_factor();
 
-    // One plane per n-tile; the cube covers `PLANES` of them.
-    let n_tile = CUBE_POS_X as usize * comptime!(PLANES as usize) + UNIT_POS_Y as usize;
-    let m_tile = CUBE_POS_Y as usize;
+    // One plane per n-tile; the cube covers `PLANES` of them. M in x for the
+    // same reason as `w4a16_linear` above: weight-row sharers launch adjacent.
+    let m_tile = CUBE_POS_X as usize;
+    let n_tile = CUBE_POS_Y as usize * comptime!(PLANES as usize) + UNIT_POS_Y as usize;
     let n_base = n_tile * NTILE;
     let m_base = m_tile * MTILE;
 
@@ -470,6 +506,11 @@ pub fn w4a16_linear_wide_launch<R: Runtime>(
         "{ntiles} n-tiles do not divide into cubes of {PLANES} planes"
     );
     assert_eq!(k % KSTEP, 0, "k {k} is not a multiple of {KSTEP}");
+    assert!(
+        ntiles / PLANES as usize <= 65535,
+        "{} n-cubes exceed the 65535 grid-y limit",
+        ntiles / PLANES as usize
+    );
 
     let out = client.empty(m_pad * n * core::mem::size_of::<f32>());
     let vs = 32 / bf16::cube_type().size_bits();
@@ -479,7 +520,7 @@ pub fn w4a16_linear_wide_launch<R: Runtime>(
     unsafe {
         w4a16_linear_wide::launch::<bf16, e4m3, R>(
             client,
-            CubeCount::Static((ntiles / PLANES as usize) as u32, (m_pad / MTILE) as u32, 1),
+            CubeCount::Static((m_pad / MTILE) as u32, (ntiles / PLANES as usize) as u32, 1),
             CubeDim::new_2d(32, PLANES),
             vs,
             2,

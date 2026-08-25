@@ -70,6 +70,41 @@
 //! one: measured against base in the same interleaved run it is no better, and
 //! `grouped_nrep`'s header records the same negative at 128 tokens. The idle
 //! planes are not the 3.2 ms.
+//!
+//! ## What the grid order is worth, at the shapes where M is not 1
+//!
+//! "The weights are read exactly once" was true only of the ONE m-tile decode
+//! runs. Every extra m-tile wants the same weight rows, and whether it gets
+//! them out of L2 or out of DRAM is decided by the launch order alone. With N
+//! in grid x — which is what this was until the axes were swapped — the
+//! consumers of one weight row sat `n / 8` cubes apart, so time scaled exactly
+//! linearly with `m_pad`: no reuse whatever.
+//!
+//! `fp4_lane_dump` at the head shape (`k = 4096`, `n = 201024`, 0.431 GiB of
+//! codes + scales, `INK_SKIP_BF16=1`, min of four warm launches, launch + sync
+//! with no host readback, DGX Spark GB10 / sm_121a, GPU otherwise idle). These
+//! are KERNEL times, not stage times, and they include the launcher's own
+//! output `client.empty` — which the same harness reports separately at 0.01 to
+//! 0.3 ms, i.e. beneath the differences below:
+//!
+//! ```text
+//!   m_pad   N in x     M in x     ratio
+//!      16   4.55 ms    4.53 ms    1.00   one m-tile: nothing to share, as expected
+//!      32   8.95       4.54       1.97   the second m-tile becomes FREE
+//!      64  18.57       7.71       2.41
+//!     128  34.97      15.31       2.28
+//! ```
+//!
+//! The linearity is broken but not gone: from `m_pad` 32 up the cost still
+//! roughly doubles per doubling, so a wave's worth of m-tiles is being served
+//! and the rest is not. What sets that ceiling is NOT settled here — the
+//! candidates (resident-cube count, L2 capacity against the concurrent n-tile
+//! span, the output write, which grows from 12.9 MB to 103 MB across this
+//! sweep) are not separable with a launch-and-sync timer.
+//!
+//! At `n <= 16384` the whole weight table is L2-sized already and the sweep
+//! shows no reliable difference; below ~1 ms the harness is measuring host
+//! jitter, not the kernel. The win is a LARGE-N property.
 
 use cubecl::ir::MatrixIdent;
 use cubecl::prelude::*;
@@ -111,8 +146,14 @@ pub fn fp4_linear<AB: Scalar, S: Scalar, NA: Size, NC: Size>(
     let lane = UNIT_POS_PLANE;
     let pack = AB::packing_factor();
 
-    let n_tile = CUBE_POS_X as usize;
-    let m_tile = CUBE_POS_Y as usize;
+    // M in x, N in y. Grid x varies fastest, so the cubes that share a weight
+    // row — the whole n-tile's `[8, k]` of codes and scales — are the ones
+    // launched adjacently, and one DRAM read of that row serves all
+    // `m_pad / 16` of them out of L2. The other order puts consumers of the
+    // same row `n / 8` cubes apart, which at the head shape is the whole
+    // weight table between them, so every m-tile re-reads from DRAM.
+    let m_tile = CUBE_POS_X as usize;
+    let n_tile = CUBE_POS_Y as usize;
     let n_base = n_tile * NTILE;
     let m_base = m_tile * MTILE;
 
@@ -245,6 +286,14 @@ pub fn fp4_linear_launch<R: Runtime>(
     );
     assert_eq!(n % NTILE, 0, "n {n} is not a multiple of {NTILE}");
     assert_eq!(k % KTILE, 0, "k {k} is not a multiple of {KTILE}");
+    // N rides grid y, which CUDA caps at 65535 (x is 2^31-1). The largest N in
+    // the model is the unembedding's 201024 = 25128 tiles, well inside it, but
+    // the cap is silent if it is ever exceeded so it is checked here.
+    assert!(
+        n / NTILE <= 65535,
+        "{} n-tiles exceed the 65535 grid-y limit",
+        n / NTILE
+    );
 
     let out = client.empty(m_pad * n * core::mem::size_of::<f32>());
     let vs = 32 / e2m1x2::cube_type().size_bits();
@@ -253,7 +302,7 @@ pub fn fp4_linear_launch<R: Runtime>(
     unsafe {
         fp4_linear::launch::<e2m1x2, e4m3, R>(
             client,
-            CubeCount::Static((n / NTILE) as u32, (m_pad / MTILE) as u32, 1),
+            CubeCount::Static((m_pad / MTILE) as u32, (n / NTILE) as u32, 1),
             CubeDim::new_1d(32),
             vs,
             2,
