@@ -29,6 +29,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use cubecl::prelude::*;
+use half::bf16;
 use memmap2::Mmap;
 
 use mary::models::inkling::fp4gemm::Aliases;
@@ -106,6 +107,11 @@ fn time_read(
 }
 
 fn main() -> Result<()> {
+    // The element-width / access-pattern matrix is a different question from
+    // the device-vs-host-mapped one below and needs no checkpoint on disk.
+    if std::env::var("INK_BW_AXES").is_ok() {
+        return run_axes();
+    }
     let gib: f64 = std::env::var("INK_BW_GIB")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -247,5 +253,413 @@ fn main() -> Result<()> {
 
     println!("\n  device vs host-mapped warm : {:.2}x", warm / dev);
     println!("  device vs host-mapped cold : {:.2}x", cold / dev);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The axis matrix: is there ONE ceiling, or one per element width and pattern?
+// ---------------------------------------------------------------------------
+//
+// Two agents measured this box's achievable read bandwidth and disagreed: a
+// BF16/f32 in-pass control read 232-247 GB/s, a `stream_packed` four-bit
+// control read 168-172 GB/s, and each was used to judge the SAME kernel
+// (`fp4_linear_grouped`, 154-171 GB/s) — once as "3 ms of headroom", once as
+// "at the ceiling". A ceiling is only a ceiling if the thing it bounds and the
+// thing that measured it ran on the same bus under the same conditions, so
+// every row below runs BACK TO BACK IN ONE PROCESS, and rows 1-5 read the
+// SAME 1 GiB handle bound at different element types: identical physical
+// pages, so a gap between them cannot be placement.
+//
+// What actually varies, and therefore what the answer can be about:
+//
+// * element type at a fixed 128-bit load (f32 / BF16 / packed u32). The memory
+//   system does not see types, so these MUST agree; they are here to prove the
+//   232-vs-172 gap is not "four-bit reads are slower".
+// * LOAD WIDTH (128-bit vs 32-bit), which the memory system very much does
+//   see. `fp4_linear_grouped` issues 32-bit loads: `vs = 32 / e2m1x2 bits` = 4
+//   packed bytes per load, `SCALE_VEC` = 4 E4M3 bytes per load.
+// * ACCESS PATTERN: a flat coalesced stream versus the `m16n8k64` B-operand
+//   footprint the GEMM actually walks — a warp covering 8 weight rows, 32
+//   contiguous bytes of each per k tile, the rows `k/2` bytes apart, stepping
+//   along k for `k/64` iterations.
+// * the SECOND stream. NVFP4 is two planes, not one: `k/2` bytes of codes and
+//   `k/16` bytes of E4M3 scales per row, read alternately inside the k loop.
+// * the scale plane's LAYOUT: row-major `[n][k/16]`, where a warp's eight
+//   4-byte scale reads land in eight different 32-byte sectors, against a
+//   k-tile-major `[k/64][n][4]`, where the same eight reads are one contiguous
+//   32-byte segment. That is the separable half of the previous bullet.
+//
+// Cache discipline: every buffer is >= 1 GiB against a 24 MiB L2 (two
+// asymmetric instances on this part), i.e. ~42x, so nothing here can be served
+// warm; each row is timed five times after two warmups and the FIRST timed
+// pass is printed beside the best, because a best that beats its own first
+// pass by more than jitter would mean the set was small enough to cache. No
+// row loops a small weight buffer — the trap this repo already documents,
+// which flatters exactly the shapes with the least grid parallelism.
+//
+// Stores are sentinel-guarded (`if acc == <never>`) rather than unconditional,
+// so write traffic is zero in every row and the figures are pure read. Without
+// that the 32-bit-load rows would carry a 1/8 write tax the 128-bit rows do
+// not, which is itself a way to manufacture this disagreement.
+//
+// `INK_BW_AXES=1` runs it; `INK_BW_AXIS_GIB` sizes the buffer (default 1).
+
+/// A coalesced stream at a chosen vector width, reading `f32`.
+#[cube(launch)]
+pub fn axis_f32<NW: Size>(
+    src: &Tensor<Vector<f32, NW>>,
+    out: &mut Tensor<f32>,
+    #[comptime] threads: usize,
+    #[comptime] per: usize,
+    #[comptime] nw: usize,
+) {
+    let t = ABSOLUTE_POS as usize;
+    let mut acc = 0.0f32;
+    #[unroll]
+    for i in 0..per {
+        let v = src[t + i * threads];
+        #[unroll]
+        for j in 0..nw {
+            acc += v[j];
+        }
+    }
+    if acc == -1.234_567_9e-31f32 {
+        out[t % out.len()] = acc;
+    }
+}
+
+/// The same stream reading BF16 — same bytes, same addresses, half the width
+/// per element and twice the elements per load.
+#[cube(launch)]
+pub fn axis_bf16<NW: Size>(
+    src: &Tensor<Vector<bf16, NW>>,
+    out: &mut Tensor<f32>,
+    #[comptime] threads: usize,
+    #[comptime] per: usize,
+    #[comptime] nw: usize,
+) {
+    let t = ABSOLUTE_POS as usize;
+    let mut acc = 0.0f32;
+    #[unroll]
+    for i in 0..per {
+        let v = src[t + i * threads];
+        #[unroll]
+        for j in 0..nw {
+            acc += f32::cast_from(v[j]);
+        }
+    }
+    if acc == -1.234_567_9e-31f32 {
+        out[t % out.len()] = acc;
+    }
+}
+
+/// The same stream reading raw words — what a packed-4-bit plane is to the
+/// memory system. `with_sc` adds the E4M3 scale plane at NVFP4's own 8:1 byte
+/// ratio, also coalesced, which is the "scales laid out contiguously" arm.
+#[cube(launch)]
+pub fn axis_u32<NW: Size>(
+    src: &Tensor<Vector<u32, NW>>,
+    sc: &Tensor<Vector<u32, NW>>,
+    out: &mut Tensor<u32>,
+    #[comptime] threads: usize,
+    #[comptime] per: usize,
+    #[comptime] nw: usize,
+    #[comptime] with_sc: bool,
+) {
+    let t = ABSOLUTE_POS as usize;
+    let mut acc = u32::new(0i64);
+    #[unroll]
+    for i in 0..per {
+        let v = src[t + i * threads];
+        #[unroll]
+        for j in 0..nw {
+            acc += v[j];
+        }
+    }
+    if comptime![with_sc] {
+        // One scale vector per `per` code vectors is exactly NVFP4's ratio when
+        // `per` = 8: `k/2` code bytes against `k/16` scale bytes.
+        let s = sc[t];
+        #[unroll]
+        for j in 0..nw {
+            acc += s[j];
+        }
+    }
+    if acc == u32::new(0x5AFE_5AFEi64) {
+        out[t % out.len()] = acc;
+    }
+}
+
+/// The B-operand footprint of [`mary::models::inkling::moegroup::fp4_linear_grouped`]
+/// with the `mma` deleted and nothing else changed.
+///
+/// One plane per n tile. Per k tile the plane's 32 lanes cover 8 weight rows x
+/// 32 contiguous bytes — four lanes to a row, 8 bytes each in TWO 32-bit
+/// loads, which is the width `vs = 32 / e2m1x2::size_bits()` gives the real
+/// kernel. Rows are `k/2` bytes apart; `t` walks along k, so each 128-byte
+/// line is consumed over four consecutive iterations out of L1.
+///
+/// `sc_mode`: 0 = codes only (isolates the pattern from the second stream),
+/// 1 = row-major `[n][k/16]` scales, one 32-bit load per row per k tile,
+/// 2 = k-tile-major `[k/64][n][4]` scales, where the plane's eight scale reads
+/// are eight consecutive words instead of eight scattered sectors.
+#[cube(launch)]
+pub fn axis_frag_b(
+    codes: &Tensor<u32>,
+    scales: &Tensor<u32>,
+    out: &mut Tensor<u32>,
+    #[comptime] size_k: usize,
+    #[comptime] size_n: usize,
+    #[comptime] sc_mode: u32,
+) {
+    let warp = ABSOLUTE_POS as usize / 32;
+    let lane = ABSOLUTE_POS as usize % 32;
+    // Four lanes per weight row, eight rows per plane — the n tile is 8 wide.
+    let row = warp * 8 + lane / 4;
+    let sub = lane % 4;
+    let cw = comptime!(size_k / 8); // u32 words in one row of codes
+    let sw = comptime!(size_k / 64); // u32 words in one row of scales
+    let k_tiles = comptime!(size_k / 64);
+    let mut acc = u32::new(0i64);
+    for t in 0..k_tiles {
+        let base = row * cw + t * 8 + sub * 2;
+        acc += codes[base];
+        acc += codes[base + 1];
+        if comptime![sc_mode == 1] {
+            acc += scales[row * sw + t];
+        }
+        if comptime![sc_mode == 2] {
+            acc += scales[t * size_n + row];
+        }
+    }
+    if acc == u32::new(0x5AFE_5AFEi64) {
+        out[warp % out.len()] = acc;
+    }
+}
+
+/// Best and first-pass seconds over `reps` timed launches after two warmups.
+fn best_first(mut run: impl FnMut() -> f64, reps: usize) -> (f64, f64) {
+    for _ in 0..2 {
+        run();
+    }
+    let mut best = f64::MAX;
+    let mut first = 0.0;
+    for i in 0..reps {
+        let dt = run();
+        if i == 0 {
+            first = dt;
+        }
+        best = best.min(dt);
+    }
+    (best, first)
+}
+
+fn run_axes() -> Result<()> {
+    let gib: f64 = std::env::var("INK_BW_AXIS_GIB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0);
+    let client = Rt::client(&Default::default());
+    let reps: usize = 5;
+
+    // The GEMM's own shape. `k` is Inkling's hidden width; `n` is chosen so the
+    // code plane is the requested size, and is a multiple of 64 so that the
+    // fragment grid is a whole number of 256-thread blocks.
+    let k = 4096usize;
+    let n = (((gib * GIB) as usize / (k / 2)) / 64) * 64;
+    let codes_b = n * (k / 2);
+    let scales_b = n * (k / 16);
+
+    // ONE handle serves rows 1-5. Same pages, same placement, only the binding
+    // changes — so an element-width difference cannot be an allocator artefact.
+    let big = client.empty(codes_b);
+    let sc = client.empty(scales_b);
+    let sink = client.empty(4096);
+
+    println!("=== achievable read bandwidth, one process, back to back ===");
+    println!(
+        "  code plane      {:.3} GiB  ({n} rows x {} B)",
+        codes_b as f64 / GIB,
+        k / 2
+    );
+    println!(
+        "  scale plane     {:.3} GiB  ({n} rows x {} B)",
+        scales_b as f64 / GIB,
+        k / 16
+    );
+    println!(
+        "  L2 is 24 MiB in 2 asymmetric instances: the code plane is {:.0}x it",
+        codes_b as f64 / (24.0 * 1024.0 * 1024.0)
+    );
+    println!("  rows 1-5 read the SAME handle, bound at different element types");
+    println!("  the LPDDR5X bus here is ~273 GB/s; anything above it is cache, not memory\n");
+    println!("  {:<46} {:>9} {:>9} {:>9}", "row", "GB/s", "ms", "1st ms");
+
+    let report = |label: &str, bytes: usize, best: f64, first: f64| {
+        println!(
+            "  {:<46} {:>9.1} {:>9.3} {:>9.3}",
+            label,
+            bytes as f64 / best / 1e9,
+            best * 1e3,
+            first * 1e3
+        );
+    };
+
+    // ---- rows 1-5: flat coalesced streams over the same 1 GiB -------------
+    let per = 8usize;
+    for (label, nw) in [("1  f32   coalesced, 128-bit loads", 4usize)] {
+        let words = codes_b / (4 * nw);
+        let threads = words / per;
+        let blocks = (threads as u32).div_ceil(BLOCK);
+        let (b, f) = best_first(
+            || {
+                let t0 = Instant::now();
+                unsafe {
+                    axis_f32::launch::<Rt>(
+                        &client,
+                        CubeCount::Static(blocks, 1, 1),
+                        CubeDim::new_1d(BLOCK),
+                        nw as u8,
+                        TensorArg::from_raw_parts(big.clone(), [1].into(), [words].into()),
+                        TensorArg::from_raw_parts(sink.clone(), [1].into(), [1024].into()),
+                        threads,
+                        per,
+                        nw,
+                    )
+                };
+                let _ = cubecl::future::block_on(client.sync());
+                t0.elapsed().as_secs_f64()
+            },
+            reps,
+        );
+        report(label, codes_b, b, f);
+    }
+    for (label, nw) in [("2  f32   coalesced,  32-bit loads", 1usize)] {
+        let words = codes_b / (4 * nw);
+        let threads = words / per;
+        let blocks = (threads as u32).div_ceil(BLOCK);
+        let (b, f) = best_first(
+            || {
+                let t0 = Instant::now();
+                unsafe {
+                    axis_f32::launch::<Rt>(
+                        &client,
+                        CubeCount::Static(blocks, 1, 1),
+                        CubeDim::new_1d(BLOCK),
+                        nw as u8,
+                        TensorArg::from_raw_parts(big.clone(), [1].into(), [words].into()),
+                        TensorArg::from_raw_parts(sink.clone(), [1].into(), [1024].into()),
+                        threads,
+                        per,
+                        nw,
+                    )
+                };
+                let _ = cubecl::future::block_on(client.sync());
+                t0.elapsed().as_secs_f64()
+            },
+            reps,
+        );
+        report(label, codes_b, b, f);
+    }
+    for (label, nw) in [("3  BF16  coalesced, 128-bit loads", 8usize)] {
+        let words = codes_b / (2 * nw);
+        let threads = words / per;
+        let blocks = (threads as u32).div_ceil(BLOCK);
+        let (b, f) = best_first(
+            || {
+                let t0 = Instant::now();
+                unsafe {
+                    axis_bf16::launch::<Rt>(
+                        &client,
+                        CubeCount::Static(blocks, 1, 1),
+                        CubeDim::new_1d(BLOCK),
+                        nw as u8,
+                        TensorArg::from_raw_parts(big.clone(), [1].into(), [words].into()),
+                        TensorArg::from_raw_parts(sink.clone(), [1].into(), [1024].into()),
+                        threads,
+                        per,
+                        nw,
+                    )
+                };
+                let _ = cubecl::future::block_on(client.sync());
+                t0.elapsed().as_secs_f64()
+            },
+            reps,
+        );
+        report(label, codes_b, b, f);
+    }
+    for (label, nw, with_sc) in [
+        ("4  NVFP4 codes only, 128-bit loads", 4usize, false),
+        ("5  NVFP4 codes only,  32-bit loads", 1usize, false),
+        (
+            "6  NVFP4 codes + scales, both coalesced, 32-bit",
+            1usize,
+            true,
+        ),
+    ] {
+        let words = codes_b / (4 * nw);
+        let threads = words / per;
+        let blocks = (threads as u32).div_ceil(BLOCK);
+        let sc_words = scales_b / (4 * nw);
+        let bytes = if with_sc { codes_b + scales_b } else { codes_b };
+        let (b, f) = best_first(
+            || {
+                let t0 = Instant::now();
+                unsafe {
+                    axis_u32::launch::<Rt>(
+                        &client,
+                        CubeCount::Static(blocks, 1, 1),
+                        CubeDim::new_1d(BLOCK),
+                        nw as u8,
+                        TensorArg::from_raw_parts(big.clone(), [1].into(), [words].into()),
+                        TensorArg::from_raw_parts(sc.clone(), [1].into(), [sc_words].into()),
+                        TensorArg::from_raw_parts(sink.clone(), [1].into(), [1024].into()),
+                        threads,
+                        per,
+                        nw,
+                        with_sc,
+                    )
+                };
+                let _ = cubecl::future::block_on(client.sync());
+                t0.elapsed().as_secs_f64()
+            },
+            reps,
+        );
+        report(label, bytes, b, f);
+    }
+
+    // ---- rows 7-9: the GEMM's own B footprint ------------------------------
+    let threads = n * 4; // 32 lanes per n tile of 8 rows
+    let blocks = (threads as u32).div_ceil(BLOCK);
+    for (label, mode, with_sc) in [
+        ("7  m16n8k64 B footprint, codes only", 0u32, false),
+        ("8  m16n8k64 B footprint + row-major scales", 1u32, true),
+        ("9  m16n8k64 B footprint + k-tile-major scales", 2u32, true),
+    ] {
+        let bytes = if with_sc { codes_b + scales_b } else { codes_b };
+        let (b, f) = best_first(
+            || {
+                let t0 = Instant::now();
+                unsafe {
+                    axis_frag_b::launch::<Rt>(
+                        &client,
+                        CubeCount::Static(blocks, 1, 1),
+                        CubeDim::new_1d(BLOCK),
+                        TensorArg::from_raw_parts(big.clone(), [1].into(), [codes_b / 4].into()),
+                        TensorArg::from_raw_parts(sc.clone(), [1].into(), [scales_b / 4].into()),
+                        TensorArg::from_raw_parts(sink.clone(), [1].into(), [1024].into()),
+                        k,
+                        n,
+                        mode,
+                    )
+                };
+                let _ = cubecl::future::block_on(client.sync());
+                t0.elapsed().as_secs_f64()
+            },
+            reps,
+        );
+        report(label, bytes, b, f);
+    }
+
     Ok(())
 }
