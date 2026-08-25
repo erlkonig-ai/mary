@@ -3299,11 +3299,16 @@ mod tests {
             &dev,
         );
 
-        let run = |fp4: bool| -> (bool, Vec<Tensor<B, 2>>, AttnCache<Bk>) {
+        let run = |fp4: bool, wide: bool| -> (bool, Vec<Tensor<B, 2>>, AttnCache<Bk>) {
             let _lane = if fp4 {
                 super::super::kvpages::Fp4Lane::on()
             } else {
                 super::super::kvpages::Fp4Lane::off()
+            };
+            let _dt = if wide {
+                CacheLane::wide()
+            } else {
+                CacheLane::narrow()
             };
             let (_, mut cache) = attention_prefill(
                 xs.clone().slice([0..prefill, 0..d.hidden]),
@@ -3329,8 +3334,15 @@ mod tests {
             (on, outs, cache)
         };
 
-        let (dense_on, dense, dc) = run(false);
-        let (fp4_on, narrow, nc) = run(true);
+        let (dense_on, dense, dc) = run(false, false);
+        let (fp4_on, narrow, nc) = run(true, false);
+        // The control. Without it the FP4 number below has no yardstick: this
+        // probe cancels heavily in `wo`, so it amplifies ANY cache
+        // perturbation, and a reader shown only the FP4 figure cannot tell an
+        // amplifying probe from a ruinous codec. This is the SHIPPED trade --
+        // f32 cache against the BF16 one `attn_bf16` turns on by default --
+        // measured the identical way, on the identical input.
+        let (_, f32_kv, _) = run(false, true);
         assert!(!dense_on, "the dense arm built an NVFP4 store");
         assert!(
             fp4_on,
@@ -3378,20 +3390,26 @@ mod tests {
             );
         }
 
-        let mut worst = 0f32;
-        let mut worst_rms = 0f32;
-        for (a, b) in dense.iter().zip(narrow.iter()) {
-            let scale = a.clone().abs().max().into_scalar().max(1e-6);
-            let diff = b.clone() - a.clone();
-            worst = worst.max(diff.clone().abs().max().into_scalar() / scale);
-            let rms = diff.powf_scalar(2.0).mean().sqrt().into_scalar();
-            let arms = a.clone().powf_scalar(2.0).mean().sqrt().into_scalar();
-            worst_rms = worst_rms.max(rms / arms.max(1e-6));
-        }
+        let spread = |base: &[Tensor<B, 2>], other: &[Tensor<B, 2>]| -> (f32, f32) {
+            let (mut worst, mut worst_rms) = (0f32, 0f32);
+            for (a, b) in base.iter().zip(other.iter()) {
+                let scale = a.clone().abs().max().into_scalar().max(1e-6);
+                let diff = b.clone() - a.clone();
+                worst = worst.max(diff.clone().abs().max().into_scalar() / scale);
+                let rms = diff.powf_scalar(2.0).mean().sqrt().into_scalar();
+                let arms = a.clone().powf_scalar(2.0).mean().sqrt().into_scalar();
+                worst_rms = worst_rms.max(rms / arms.max(1e-6));
+            }
+            (worst, worst_rms)
+        };
+        let (worst, worst_rms) = spread(&dense, &narrow);
+        let (cw, crms) = spread(&dense, &f32_kv);
         println!(
-            "fp4 KV vs dense KV, one local layer (window 512, {prefill}-token prefill, \
-             {} decode steps, synthetic sinusoidal input): worst max-abs {worst:e} of the \
-             dense max-abs, worst RMS {worst_rms:e} of the dense RMS",
+            "one local layer, window 512, {prefill}-token prefill, {} decode steps, \
+             synthetic sinusoidal input, against the BF16 dense cache:\n  \
+             NVFP4 cache : worst max-abs {worst:e}, worst RMS {worst_rms:e}\n  \
+             f32 cache   : worst max-abs {cw:e}, worst RMS {crms:e}   (the SHIPPED \
+             bf16-vs-f32 trade, same probe)",
             tokens - prefill
         );
 
