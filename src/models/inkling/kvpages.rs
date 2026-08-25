@@ -242,18 +242,22 @@ mod tests {
     /// Rows whose every element is the row's absolute index, so `materialize`
     /// can be checked for CONTENT and ORDER rather than only for shape — a
     /// store that returns the right number of wrong rows passes a shape test.
-    fn rows(from: usize, n: usize, dev: &B::Device) -> Tensor<B, 2> {
+    fn rows(from: usize, n: usize) -> Tensor<B, 2> {
         let data: Vec<f32> = (from..from + n)
             .flat_map(|i| std::iter::repeat_n(i as f32, W))
             .collect();
-        Tensor::<B, 1>::from_floats(data.as_slice(), dev).reshape([n, W])
+        Tensor::<B, 1>::from_floats(data.as_slice(), &Default::default()).reshape([n, W])
     }
 
-    fn contents(s: &PageStore<B>, dev: &B::Device) -> Vec<usize> {
+    fn contents(s: &PageStore<B>) -> Vec<usize> {
         if s.is_empty() {
             return Vec::new();
         }
-        let flat: Vec<f32> = s.materialize(dev).into_data().to_vec().unwrap();
+        let flat: Vec<f32> = s
+            .materialize(&Default::default())
+            .into_data()
+            .to_vec()
+            .unwrap();
         flat.chunks(W)
             .map(|c| {
                 assert!(c.iter().all(|x| *x == c[0]), "a row was torn: {c:?}");
@@ -264,80 +268,74 @@ mod tests {
 
     #[test]
     fn append_spans_page_boundaries_and_keeps_order() {
-        let dev = Default::default();
         let mut s = PageStore::<B>::new(W);
         // deliberately unaligned batches, crossing PAGE more than once
         for (from, n) in [(0, 5), (5, PAGE), (5 + PAGE, 1), (6 + PAGE, 2 * PAGE)] {
-            s.append(rows(from, n, &dev));
+            s.append(rows(from, n));
             s.assert_sound();
         }
         let want: Vec<usize> = (0..6 + 3 * PAGE).collect();
-        assert_eq!(contents(&s, &dev), want);
+        assert_eq!(contents(&s), want);
     }
 
     #[test]
     fn front_drop_is_the_sliding_window_and_may_land_mid_page() {
-        let dev = Default::default();
         let mut s = PageStore::<B>::new(W);
-        s.append(rows(0, 3 * PAGE, &dev));
+        s.append(rows(0, 3 * PAGE));
         s.drop_front(1); // mid-page, releases nothing
         s.assert_sound();
-        assert_eq!(contents(&s, &dev).first().copied(), Some(1));
+        assert_eq!(contents(&s).first().copied(), Some(1));
         s.drop_front(PAGE); // now crosses a boundary
         s.assert_sound();
-        assert_eq!(contents(&s, &dev).first().copied(), Some(1 + PAGE));
+        assert_eq!(contents(&s).first().copied(), Some(1 + PAGE));
         assert_eq!(s.len(), 3 * PAGE - 1 - PAGE);
-        assert_eq!(contents(&s, &dev).last().copied(), Some(3 * PAGE - 1));
+        assert_eq!(contents(&s).last().copied(), Some(3 * PAGE - 1));
     }
 
     #[test]
     fn truncate_is_a_rejected_draft_and_survives_a_later_append() {
-        let dev = Default::default();
         let mut s = PageStore::<B>::new(W);
-        s.append(rows(0, PAGE + 10, &dev));
+        s.append(rows(0, PAGE + 10));
         s.truncate(PAGE + 4); // reject 6 drafted rows
         s.assert_sound();
         assert_eq!(s.len(), PAGE + 4);
         // the accepted token then continues from where the kept rows end
-        s.append(rows(PAGE + 4, 3, &dev));
+        s.append(rows(PAGE + 4, 3));
         s.assert_sound();
         let want: Vec<usize> = (0..PAGE + 7).collect();
-        assert_eq!(contents(&s, &dev), want);
+        assert_eq!(contents(&s), want);
     }
 
     #[test]
     fn both_ends_compose() {
-        let dev = Default::default();
         let mut s = PageStore::<B>::new(W);
-        s.append(rows(0, 2 * PAGE + 7, &dev));
+        s.append(rows(0, 2 * PAGE + 7));
         s.drop_front(PAGE + 3);
         s.truncate(s.len() - 5);
         s.assert_sound();
         let want: Vec<usize> = (PAGE + 3..2 * PAGE + 2).collect();
-        assert_eq!(contents(&s, &dev), want);
+        assert_eq!(contents(&s), want);
     }
 
     #[test]
     fn a_shared_prefix_is_the_same_rows_and_does_not_move_when_the_parent_grows() {
-        let dev = Default::default();
         let mut s = PageStore::<B>::new(W);
-        s.append(rows(0, 2 * PAGE + 40, &dev));
+        s.append(rows(0, 2 * PAGE + 40));
         let shared = s.share_prefix(2 * PAGE).expect("page-aligned prefix");
         shared.assert_sound();
-        assert_eq!(contents(&shared, &dev), (0..2 * PAGE).collect::<Vec<_>>());
+        assert_eq!(contents(&shared), (0..2 * PAGE).collect::<Vec<_>>());
 
         // The parent keeps generating. The share must not follow it — that is
         // the whole promise, and a Vec of handles could easily alias.
-        s.append(rows(2 * PAGE + 40, 200, &dev));
+        s.append(rows(2 * PAGE + 40, 200));
         assert_eq!(shared.len(), 2 * PAGE);
-        assert_eq!(contents(&shared, &dev), (0..2 * PAGE).collect::<Vec<_>>());
+        assert_eq!(contents(&shared), (0..2 * PAGE).collect::<Vec<_>>());
     }
 
     #[test]
     fn an_unaligned_or_offset_prefix_is_refused_rather_than_silently_copied() {
-        let dev = Default::default();
         let mut s = PageStore::<B>::new(W);
-        s.append(rows(0, 3 * PAGE, &dev));
+        s.append(rows(0, 3 * PAGE));
         // not a page boundary: the last page would be written through by
         // whichever store appended next
         assert!(s.share_prefix(PAGE + 1).is_none());
@@ -349,10 +347,9 @@ mod tests {
 
     #[test]
     fn emptying_by_either_end_leaves_a_reusable_store() {
-        let dev = Default::default();
         for by_front in [true, false] {
             let mut s = PageStore::<B>::new(W);
-            s.append(rows(0, PAGE + 3, &dev));
+            s.append(rows(0, PAGE + 3));
             if by_front {
                 s.drop_front(PAGE + 3)
             } else {
@@ -360,9 +357,9 @@ mod tests {
             }
             s.assert_sound();
             assert!(s.is_empty());
-            s.append(rows(0, 2, &dev));
+            s.append(rows(0, 2));
             s.assert_sound();
-            assert_eq!(contents(&s, &dev), vec![0, 1]);
+            assert_eq!(contents(&s), vec![0, 1]);
         }
     }
 }
