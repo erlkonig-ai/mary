@@ -1428,15 +1428,6 @@ struct SharedOnDevice {
     down: Vec<dev_lane::ProjW>,
 }
 
-/// `INK_SHARED_FP4=1`: quantise the shared experts to NVFP4 at bind.
-///
-/// Off by default because it is a MODEL-QUALITY change and not only an
-/// engineering one. The publisher quantised the routed experts and nothing
-/// else, so these two tensors a layer are BF16 by the checkpoint's choice; this
-/// switch overrides that choice with our own quantiser. What it buys is
-/// measured: the same operation on the same shapes runs 65.08 ms on the BF16
-/// grouped lane against 18.44 ms on the NVFP4 one, and the shared experts are
-/// 100.7 MB of a 275.8 MB layer-step.
 /// Which lane the unembed table is bound to.
 ///
 /// The head is the single largest term in the per-step INTERCEPT, and it is
@@ -1528,10 +1519,47 @@ fn fuse_qkvr() -> bool {
     })
 }
 
-fn shared_fp4() -> bool {
+/// `INK_W4A16_SINKS=1`: hold the shared/sink experts as NVFP4 codes and
+/// multiply them against a BF16 activation.
+///
+/// # Why W4A16 and not the routed experts' lane
+///
+/// This switch used to be `INK_SHARED_FP4` and it bound
+/// [`dev_lane::ProjW::Fp4`] -- the W4A4 lane, which quantises the ACTIVATION as
+/// well. That was wrong for these tensors specifically, and wrong for the same
+/// reason it was wrong on the unembedding. The checkpoint's
+/// `hf_quant_config.json` enables an input quantiser only for the layers it
+/// quantised, which is the ROUTED experts; the sinks have no calibrated
+/// activation quantiser at all, so W4A4 was inventing one. The reference
+/// implementation this project is chasing calls `flashinfer.mm_bf16_fp4` for
+/// exactly this tensor: four-bit weights, BF16 activations. That is
+/// [`dev_lane::ProjW::W4a16`], and it is measurably the closer lane -- the
+/// weight-only parity test
+/// (`linear_w4a16_tracks_linear_bf16_on_the_same_weight`) puts W4A16 at 0.0091
+/// rel RMS against the BF16 reference where W4A4 is at 0.0155.
+///
+/// The W4A4 arm is GONE rather than kept beside it. Two arms on one switch is
+/// how the wrong one got bound in the first place.
+///
+/// # What it buys, and what it costs
+///
+/// Per decode layer-step this model streams two sink experts at **100.7 MB of
+/// BF16** against six routed experts at 84.9 MB of NVFP4: the sinks cost more
+/// bandwidth than the six experts that do the routing, purely because the
+/// publisher quantised the routed experts and left these alone. At four bits
+/// the same two tensors are ~28 MB. On the operation itself, the same shapes
+/// run 65.08 ms on the BF16 grouped lane against 18.44 ms on the NVFP4 one.
+///
+/// Still off by default, and NOT for the reason the fused-QKVR switch is off.
+/// This one is a MODEL-QUALITY change: it overrides the publisher's choice with
+/// our own quantiser, and unlike the fused concatenation its output is not
+/// bit-identical to the arm it replaces. It defaults on when someone has
+/// measured what it does to the tokens, the way [`head_lane`] documents its
+/// own.
+fn sink_w4a16() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("INK_SHARED_FP4")
+        std::env::var("INK_W4A16_SINKS")
             .map(|v| v == "1")
             .unwrap_or(false)
     })
@@ -1652,12 +1680,19 @@ impl MtpOwned {
 /// publisher did not quantise these tensors, so there is no `scale2` to carry
 /// and the quantiser folds the range into the block scales -- the same
 /// arrangement the activation quantiser has always used on this lane.
+///
+/// Returns the bare [`dev_lane::PackedW`] and NOT a [`dev_lane::ProjW`], which
+/// is the whole point of the signature. It used to hand back
+/// `ProjW::Fp4` -- the W4A4 lane -- and every caller that wanted W4A16 got W4A4
+/// instead and COMPILED, because the two variants carry the same payload. That
+/// mistake shipped twice: once on the unembedding and once on the sink experts.
+/// A caller that must now NAME the lane cannot make it a third time.
 fn quantized_bf16(
     client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
     bytes: &[u8],
     rows: usize,
     cols: usize,
-) -> dev_lane::ProjW {
+) -> dev_lane::PackedW {
     assert_eq!(
         bytes.len(),
         rows * cols * 2,
@@ -1667,13 +1702,13 @@ fn quantized_bf16(
     let src = client.create_from_slice(bytes);
     let (codes, scales) =
         mary::models::inkling::fp4quant::quantize_nvfp4_bf16(client, &src, rows, cols);
-    dev_lane::ProjW::Fp4(dev_lane::PackedW {
+    dev_lane::PackedW {
         codes,
         scales,
         n: rows,
         k: cols,
         scale2: 1.0,
-    })
+    }
 }
 
 fn bind_bf16(
@@ -1836,8 +1871,11 @@ impl DeviceDense {
             // well would keep the 100.7 MB a layer this exists to stop
             // streaming, and the admission gate prices what is held.
             let mut sd = SharedOnDevice {
-                gate_up: if shared_fp4() {
-                    quantized_bf16(client, &gu, 2 * n_shared * inter, h)
+                gate_up: if sink_w4a16() {
+                    // W4A16 and NOT `Fp4`: four-bit weights against a BF16
+                    // activation, because nothing calibrated an input
+                    // quantiser for this tensor. See [`sink_w4a16`].
+                    dev_lane::ProjW::W4a16(quantized_bf16(client, &gu, 2 * n_shared * inter, h))
                 } else {
                     dev_lane::ProjW::Bf16(bind_bf16(client, aliases, &gu, 2 * n_shared * inter, h))
                 },
@@ -1845,8 +1883,8 @@ impl DeviceDense {
             };
             for e in 0..n_shared {
                 let raw = &d.bytes[e * per_d..(e + 1) * per_d];
-                sd.down.push(if shared_fp4() {
-                    quantized_bf16(client, raw, h, inter)
+                sd.down.push(if sink_w4a16() {
+                    dev_lane::ProjW::W4a16(quantized_bf16(client, raw, h, inter))
                 } else {
                     // `w2` is NOT de-interleaved, so this one is a view of the
                     // pile and aliases outright.
@@ -5094,18 +5132,17 @@ fn main() -> Result<()> {
                 // Quantise once, here, and let the BF16 upload die with `hnd`:
                 // what the run then holds is 0.43 GiB, not 1.53.
                 //
-                // `quantized_bf16` hands back the routed experts' `Fp4`
-                // variant, which is the W4A4 lane -- the one the publisher
-                // calibrated an input quantiser for and this tensor has none.
-                // Re-tagging the SAME `PackedW` as `W4a16` changes nothing on
-                // the device (identical codes, identical scales); it changes
-                // only whether the activation gets quantised on the way in.
-                let w = match (
-                    quantized_bf16(&fp4_client, &leaf.bytes, rows, cols),
-                    head_lane(),
-                ) {
-                    (dev_lane::ProjW::Fp4(p), HeadLane::W4a16) => dev_lane::ProjW::W4a16(p),
-                    (w, _) => w,
+                // The SAME `PackedW` either way -- identical codes, identical
+                // scales, nothing moves on the device. The variant chooses only
+                // whether the ACTIVATION is quantised on the way in, and W4A4
+                // is here as a comparison arm: the publisher calibrated an
+                // input quantiser for the routed experts and for nothing else,
+                // so this tensor has none.
+                let p = quantized_bf16(&fp4_client, &leaf.bytes, rows, cols);
+                let w = match head_lane() {
+                    HeadLane::W4a16 => dev_lane::ProjW::W4a16(p),
+                    HeadLane::W4a4 => dev_lane::ProjW::Fp4(p),
+                    HeadLane::Bf16 => unreachable!("guarded by head_lane() != Bf16"),
                 };
                 println!(
                     "  unembed RE-BOUND as NVFP4 / {:?} (INK_W4A16_HEAD): {:.2} GiB -> {:.2} GiB, \
