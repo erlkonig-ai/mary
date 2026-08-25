@@ -3324,6 +3324,159 @@ mod tests {
         }
     }
 
+    /// DIAGNOSTIC, not a gate. The one oracle that can tell an ALGORITHM
+    /// defect from ARITHMETIC: the host transcription in
+    /// [`crate::models::inkling::attn`], which shares no kernel, no matmul and
+    /// no accumulation order with either device lane.
+    ///
+    /// Three numbers per decoded position, all against the host uncached run:
+    ///
+    /// * `C = |host cached - host uncached|` — the cache's ALGORITHM, in plain
+    ///   f32 on the CPU. If the paged read, the GQA regrouping, the
+    ///   `k_pre`/`v_pre` history, `tau` or the window were wrong, the same
+    ///   mistake is transcribed here and this number is large. If this is at
+    ///   f32 rounding, the cached lane is a correct algorithm and nothing the
+    ///   device does can be blamed on it.
+    /// * `A = |device uncached - host uncached|` — what the ORACLE side of the
+    ///   comparison is itself worth on this runtime.
+    /// * `B = |device cached - host uncached|` — the same for the lane under
+    ///   test.
+    ///
+    /// `A` is the number the tolerance forgot. If `A` is already the size of
+    /// the drift the tests fail by, then the two device lanes are each about
+    /// that far from the truth and neither is wrong — the 2e-5 is a bound on a
+    /// difference that no longer cancels.
+    #[test]
+    fn diag_cpu_oracle_splits_algorithm_from_arithmetic() {
+        use crate::models::inkling::attn as cpu;
+        let _lane = CacheLane::wide();
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let (kind, rel_extent, window) = (AttnKind::Global, 5usize, None::<usize>);
+        let ls = Some(LogScaling {
+            n_floor: 4.0,
+            alpha: 0.5,
+        });
+        let d = dims(kind, rel_extent);
+        let (tokens, prefill) = (11usize, 4usize);
+        let hid = d.hidden;
+
+        // The SAME operand bits the device sees: the five projections are BF16
+        // there, so the host copy is those values put through the identical
+        // round-to-nearest-even. Everything else is f32 on both sides.
+        let bf = |n: usize, seed: f32| -> Vec<f32> {
+            fill(n, seed)
+                .into_iter()
+                .map(|x| half::bf16::from_f32(x).to_f32())
+                .collect()
+        };
+        let (q_w, kv_w) = (d.heads * d.head_dim, d.kv_heads * d.head_dim);
+        let wq = bf(q_w * hid, 0.1);
+        let wk = bf(kv_w * hid, 0.2);
+        let wv = bf(kv_w * hid, 0.3);
+        let wr = bf(d.heads * d.d_rel * hid, 0.4);
+        let wo = bf(hid * q_w, 0.5);
+        let ks = fill(kv_w * d.kernel, 0.6);
+        let vs = fill(kv_w * d.kernel, 0.7);
+        let qn = fill(d.head_dim, 0.8);
+        let kn = fill(d.head_dim, 0.9);
+        let rp = fill(d.d_rel * d.rel_extent, 1.0);
+        let hw = cpu::AttnWeights {
+            wq: &wq,
+            wk: &wk,
+            wv: &wv,
+            wr: &wr,
+            wo: &wo,
+            k_sconv: &ks,
+            v_sconv: &vs,
+            q_norm: &qn,
+            k_norm: &kn,
+            rel_proj: &rp,
+        };
+
+        let xs_v = fill(tokens * hid, 2.5);
+        let xs: Tensor<B, 2> =
+            Tensor::from_data(TensorData::new(xs_v.clone(), [tokens, hid]), &dev);
+        let w = weights(&d, &dev);
+
+        let host_full = cpu::attention(
+            &xs_v,
+            &hw,
+            &d,
+            ls,
+            &cpu::causal_mask(tokens, window),
+            tokens,
+        );
+        let (_, mut hcache) = cpu::attention_prefill(
+            &xs_v[..prefill * hid],
+            &hw,
+            &d,
+            ls,
+            &cpu::causal_mask(prefill, window),
+            prefill,
+            window,
+        );
+
+        let dev_full = attention(xs.clone(), &w, &d, ls, window);
+        let (_, mut dcache) = attention_prefill(
+            xs.clone().slice([0..prefill, 0..hid]),
+            &w,
+            &d,
+            ls,
+            window,
+            window,
+        );
+
+        let row = |t: &Tensor<B, 2>, r: usize| -> Vec<f32> {
+            t.clone()
+                .slice([r..r + 1, 0..hid])
+                .into_data()
+                .convert::<f32>()
+                .into_vec::<f32>()
+                .expect("f32 row")
+        };
+        let worst = |a: &[f32], b: &[f32]| -> f32 {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max)
+        };
+
+        let (mut wa, mut wb, mut wc) = (0f32, 0f32, 0f32);
+        for pos in prefill..tokens {
+            let hstep = cpu::attention_step(
+                &xs_v[pos * hid..(pos + 1) * hid],
+                &hw,
+                &d,
+                ls,
+                pos,
+                window,
+                &mut hcache,
+            );
+            let dstep = attention_step(
+                xs.clone().slice([pos..pos + 1, 0..hid]),
+                &w,
+                &d,
+                ls,
+                pos,
+                window,
+                &mut dcache,
+            );
+            let truth = &host_full[pos * hid..(pos + 1) * hid];
+            let c = worst(&hstep, truth);
+            let a = worst(&row(&dev_full, pos), truth);
+            let b = worst(&row(&dstep, 0), truth);
+            wc = wc.max(c);
+            wa = wa.max(a);
+            wb = wb.max(b);
+            println!(
+                "  pos {pos:>2}: C(host cached)={c:e}  A(dev uncached)={a:e}  B(dev cached)={b:e}"
+            );
+        }
+        println!(
+            "WORST  C(host cached, the ALGORITHM)={wc:e}  A(dev uncached)={wa:e}  B(dev cached)={wb:e}"
+        );
+    }
+
     /// A local layer whose window is shorter than the sequence, so the cache
     /// must forget: 11 tokens through a window of 5 drops six keys.
     #[test]
