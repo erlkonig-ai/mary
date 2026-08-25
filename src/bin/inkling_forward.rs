@@ -6453,6 +6453,12 @@ fn main() -> Result<()> {
         // keeping it is the right policy inside a loop. With nothing of this slot
         // left alive there is a whole page to hand back, which is exactly what
         // `memory_cleanup` could not do while the b caches were pinning it.
+        // The last gap in the partition. Zero on a decode pass -- the block below
+        // is prefill-only -- but it holds a `Backend::sync` and a
+        // `memory_cleanup`, so on a slot prefill it is not small, and a bracket
+        // that is only correct on the pass you happened to look at is not a
+        // partition.
+        let t_st = Instant::now();
         if slot_lane && !is_decode {
             // Which row of THIS cohort's batch is being seated. Cohort `coh` was
             // prefilled by steps `coh * nslots .. (coh + 1) * nslots`, so row zero
@@ -6498,6 +6504,7 @@ fn main() -> Result<()> {
                 )
             );
         }
+        let t_seat = t_st.elapsed().as_secs_f64();
 
         // ---- the one sync for this node's whole stack --------------------------
         //
@@ -7771,6 +7778,12 @@ fn main() -> Result<()> {
             "      unnamed in-loop{:8.1}   (loop total less attention + mlp + first-touch + hand-back)",
             ms(t_layers - t_named_in_loop)
         );
+        if t_seat > 0.0005 {
+            println!(
+                "    slot seating    {:9.1}   (prefill only: seat + sync + pool hand-back)",
+                ms(t_seat)
+            );
+        }
         println!(
             "    after the sync  {:9.1}   (outer bracket: RMS lines, residual, head, argmax, commit, draft)",
             ms(t_tail_host)
@@ -7787,7 +7800,7 @@ fn main() -> Result<()> {
             new_toks.len().max(1)
         );
         {
-            let named = t_prep + t_embed + t_layers + t_stack_sync + t_tail_host;
+            let named = t_prep + t_embed + t_layers + t_seat + t_stack_sync + t_tail_host;
             println!(
                 "    UNATTRIBUTED    {:9.1}   (this pass, {:.1} ms, less the four outer brackets)",
                 ms(whole_pass - named),
