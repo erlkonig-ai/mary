@@ -24,7 +24,9 @@ use std::time::Instant;
 use cubecl::future;
 
 use cubecl::prelude::*;
-use mary::models::inkling::bf16gemm::{Lane, try_w4a16_linear_cubek_launch};
+use mary::models::inkling::bf16gemm::{
+    Lane, try_bf16_linear_cubek_launch, try_w4a16_linear_cubek_launch,
+};
 use mary::models::inkling::fp4gemm::fp4_linear_launch;
 use mary::models::inkling::w4a16gemm::{w4a16_linear_launch, w4a16_linear_wide_launch};
 
@@ -111,6 +113,52 @@ fn main() {
         if i >= 2 {
             wide_s = wide_s.min(dt);
         }
+    }
+
+    // The control. Same tuned lanes, same m and n, but a plain BF16 weight —
+    // 4x the bytes. If these are fast and the quantised ones are not, the cost
+    // is the dequantising read and not the shape; if BOTH are slow, the tuned
+    // tiling simply does not like m = 16 against n = 201024 and the comparison
+    // says nothing about quantisation. `INK_SKIP_BF16=1` skips the 1.5 GiB
+    // allocation.
+    if std::env::var("INK_SKIP_BF16").is_err() {
+        let bbf = client.empty(n * k * 2);
+        for lane in [Lane::Auto, Lane::SimpleCyclicMma, Lane::DoubleTmaMma] {
+            let mut best = f64::MAX;
+            let mut err = None;
+            for i in 0..6 {
+                let tb = Instant::now();
+                match try_bf16_linear_cubek_launch::<Rt>(&client, &a, &bbf, m_pad, k, n, lane) {
+                    Ok(o) => {
+                        let _ = future::block_on(client.sync());
+                        let dt = tb.elapsed().as_secs_f64();
+                        drop(o);
+                        if i >= 2 {
+                            best = best.min(dt);
+                        }
+                    }
+                    Err(e) => {
+                        err = Some(format!("{e:?}"));
+                        break;
+                    }
+                }
+            }
+            match err {
+                Some(e) => println!(
+                    "cubek bf16 {:<16} declined: {}",
+                    lane.name(),
+                    e.chars().take(80).collect::<String>()
+                ),
+                None => println!(
+                    "cubek bf16 {:<16} {:8.3} ms   {:6.1} GB/s over its own {:.2} GiB",
+                    lane.name(),
+                    best * 1e3,
+                    (n * k * 2) as f64 / best / 1e9,
+                    (n * k * 2) as f64 / (1u64 << 30) as f64
+                ),
+            }
+        }
+        drop(bbf);
     }
 
     // The tuned lane with a four-bit RHS: cubek dequantises on the global read,
