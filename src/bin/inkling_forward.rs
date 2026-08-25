@@ -7931,6 +7931,19 @@ fn main() -> Result<()> {
                             .unwrap_or(std::cmp::Ordering::Equal)
                     });
                     idx.truncate(want);
+                    // The invariant the comment above states, CHECKED. `best` is
+                    // the argmax of the row this set was selected from, so it is
+                    // in the top-`want` by construction -- and that is exactly
+                    // what stopped being true when the row was the wrong one.
+                    // 512 comparisons a step against a 3.7 GiB weight stream:
+                    // the reason this was not caught is that nothing looked, not
+                    // that looking was expensive.
+                    anyhow::ensure!(
+                        idx.contains(&(best as u32)),
+                        "the draft candidate set was gathered from a row whose argmax is not \
+                         `best` ({best}): the pruned head cannot draft the token the step just \
+                         confirmed, which shows up only as acceptance"
+                    );
                     // Once, on the first step that prunes. The unembed BIND prints
                     // what it bound and how, and a table that silently becomes 512
                     // rows wide for half the matmuls in the process is a bigger
