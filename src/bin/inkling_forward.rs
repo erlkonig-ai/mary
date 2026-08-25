@@ -7352,11 +7352,19 @@ fn main() -> Result<()> {
         // Without it the capture dies partway through the third layer, on the
         // first `cuMemAllocHost` the pinned staging pool is forced into --
         // measured, not supposed: 28 such allocations before the failure.
+        //
+        // TWO passes, not one. The KV tail page grows by a row every step, so
+        // the pass after a pre-warm can still want a page the pre-warm never
+        // asked for -- measured at 21 layers: exactly one allocation escaped
+        // into the capture on a single-pass warm. A second warm carries the
+        // pool past the step after it as well.
+        const PREWARM_PASSES: usize = 2;
         let prewarm_now = graph_on
             && is_decode
             && graph_report.is_none()
-            && graph_step > 0
-            && step - prefill_passes == graph_step - 1;
+            && graph_step >= PREWARM_PASSES
+            && step - prefill_passes >= graph_step - PREWARM_PASSES
+            && step - prefill_passes < graph_step;
         if prewarm_now {
             fp4_client.graph_defer_frees(true);
         }
