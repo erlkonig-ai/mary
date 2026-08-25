@@ -431,6 +431,27 @@
 //! 20-token run)"; on 2048 positions the two are 0.2310 and 0.2266, which is
 //! inside the interval. A twenty-step difference was a twenty-step difference.
 //!
+//! ## The cached step lane is not the bug (`INK_MTP_STEPCHECK`)
+//!
+//! The teacher-forced rate is measured in the drafting PREFILL and the decode
+//! rate in the cached STEP, and nothing had ever checked that the two compute
+//! the same rows -- `INK_MTP_CHECK` asserts only for the HOST cached lane and
+//! merely reports for the device one, which is the lane every speculative run
+//! drafts on. So a step path that quietly diverged would have looked exactly
+//! like a model that drafts badly.
+//!
+//! `INK_MTP_STEPCHECK=1` reruns the head's whole-sequence prefill beside the
+//! step and compares the row they share. Ten checks, two depths, a 256-token
+//! seed:
+//!
+//!     max|prefill - step| 0.82% to 3.95% of |prefill|max
+//!     drafted token: agree, 10 of 10
+//!
+//! The residual is two different attention kernels in BF16 -- the prefill takes
+//! the fused/banded lane and the step the decode one -- and it never moved an
+//! argmax. So the step lane is sound, and the prefill and decode measurements
+//! are measurements of the same head.
+//!
 //! ## The mid-run stall, and where the evidence points
 //!
 //! Every `INK_SPEC>0` run over a long context has two or three passes that take
