@@ -384,8 +384,9 @@
 //!
 //!     depth 1 / depth 0            76%              77%
 //!
-//! Corpus A's depth-0 row is the pre-fix one (see the caveat below) and is a
-//! lower bound; corpus B's is the corrected instrument.
+//! Corpus A's depth-0 row was first taken before the double-norm fix; the
+//! corrected instrument reads the SAME 612/2048 on the same rows, for the reason
+//! given under "why three of these readings could never have mattered".
 //!
 //! **And corpus B's ceiling is independently confirmed.** A sibling ran the same
 //! 3988 tokens teacher-forced through the model's ORDINARY logits path with a
@@ -396,16 +397,14 @@
 //! So ~0.33 is what this checkpoint scores on real text, and the ratio the
 //! draft head holds against it is 76-77% on BOTH corpora.
 //!
-//! CAVEAT on the depth-0 row above, kept rather than quietly restated: it was
-//! measured through the final norm TWICE. The rows it scores are `entry`, which
-//! is already final-normed, and `teach_rows` normed them again -- and that is
-//! not idempotent, since `rms_norm(normalise(x) * g)` is `normalise(x) * g^2 /
-//! c`, so the ceiling was read through the learned gain SQUARED. The `norm`
-//! argument on `teach_rows` is the fix. It makes 0.2988 a LOWER bound on the
-//! ceiling; the sibling's 0.3283 on its own corpus, measured through the model's
-//! ordinary logits path and not through this instrument at all, is what says the
-//! true figure is near it. Every DEPTH row is unaffected -- those rows are the
-//! MTP heads' output, which had not been normed before.
+//! A defect in the instrument, fixed, and worth keeping because the fix turned
+//! out to change nothing and the reason it changed nothing is the interesting
+//! part. `teach_rows` scored `main_dev`, which holds `entry` -- already
+//! final-normed -- and normed it again. That is not idempotent:
+//! `rms_norm(normalise(x) * g)` is `normalise(x) * g^2 / c`, so the ceiling was
+//! being read through the learned gain SQUARED. The `norm` argument is the fix,
+//! and the corrected run returns the identical 612/2048, because that gain is a
+//! near-scalar. The bug was real; the bias it could introduce was not.
 //!
 //! Which means the draft head reaches **roughly three quarters of the main
 //! stack's own accuracy on the equivalent task** -- 76% and 77% on the two
