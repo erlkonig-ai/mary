@@ -657,13 +657,23 @@ fn run_axes() -> Result<()> {
 
     // ---- rows 7-9: the GEMM's own B footprint ------------------------------
     let threads0 = n * 4; // 32 lanes per n tile of 8 rows
-    for (label, mode, with_sc, ut, tpw) in [
+    // `bd` is the cube width, and on this part it IS the occupancy knob: 48 SMs
+    // with maxThreadsPerSM 1536 and maxBlocksPerSM 24, so a 256-thread cube
+    // puts 6 cubes x 8 planes = 48 planes on an SM while a 32-thread cube --
+    // which is what `fp4_linear` launches -- is capped by the cube limit at 24.
+    // Each plane holds eight 128-byte code lines and eight scale lines it must
+    // keep across four k iterations or refetch them, so 48 planes want 96 KiB
+    // of a 128 KiB L1 and 24 planes want 48 KiB. That is the one axis the model
+    // did not share with the kernel, and `tpw` does NOT test it: giving a plane
+    // more n tiles launches fewer planes but leaves the SM just as full.
+    for (label, mode, with_sc, ut, tpw, bd) in [
         (
             "7  m16n8k64 B footprint, codes only",
             0u32,
             false,
             1usize,
             1usize,
+            256u32,
         ),
         (
             "8  m16n8k64 B footprint + row-major scales",
@@ -671,6 +681,7 @@ fn run_axes() -> Result<()> {
             true,
             1usize,
             1usize,
+            256u32,
         ),
         (
             "9  m16n8k64 B footprint + k-tile-major scales",
@@ -678,6 +689,7 @@ fn run_axes() -> Result<()> {
             true,
             1usize,
             1usize,
+            256u32,
         ),
         (
             "10 row 8, 2 k tiles per iteration",
@@ -685,6 +697,7 @@ fn run_axes() -> Result<()> {
             true,
             2usize,
             1usize,
+            256u32,
         ),
         (
             "11 row 8, 4 k tiles per iteration",
@@ -692,6 +705,7 @@ fn run_axes() -> Result<()> {
             true,
             4usize,
             1usize,
+            256u32,
         ),
         (
             "12 row 8, 8 k tiles per iteration",
@@ -699,6 +713,7 @@ fn run_axes() -> Result<()> {
             true,
             8usize,
             1usize,
+            256u32,
         ),
         (
             "13 row 9, 8 k tiles per iteration",
@@ -706,6 +721,7 @@ fn run_axes() -> Result<()> {
             true,
             8usize,
             1usize,
+            256u32,
         ),
         (
             "14 row 7, 8 k tiles per iteration",
@@ -713,33 +729,75 @@ fn run_axes() -> Result<()> {
             false,
             8usize,
             1usize,
+            256u32,
         ),
         (
-            "16 row 8, 2 n tiles per plane (half the planes)",
+            "16 row 8, 2 n tiles per plane",
             1u32,
             true,
             1usize,
             2usize,
+            256u32,
         ),
-        ("17 row 8, 4 n tiles per plane", 1u32, true, 1usize, 4usize),
-        ("18 row 8, 8 n tiles per plane", 1u32, true, 1usize, 8usize),
         (
-            "19 row 8, 16 n tiles per plane",
+            "17 row 8, 8 n tiles per plane",
             1u32,
             true,
             1usize,
-            16usize,
+            8usize,
+            256u32,
         ),
         (
-            "20 row 7, 16 n tiles per plane",
+            "18 row 8, 32-thread cubes (24 planes/SM, as fp4_linear)",
+            1u32,
+            true,
+            1usize,
+            1usize,
+            32u32,
+        ),
+        (
+            "19 row 7, 32-thread cubes",
             0u32,
             false,
             1usize,
-            16usize,
+            1usize,
+            32u32,
+        ),
+        (
+            "20 row 9, 32-thread cubes",
+            2u32,
+            true,
+            1usize,
+            1usize,
+            32u32,
+        ),
+        (
+            "21 row 8, 64-thread cubes",
+            1u32,
+            true,
+            1usize,
+            1usize,
+            64u32,
+        ),
+        (
+            "22 row 8, 128-thread cubes",
+            1u32,
+            true,
+            1usize,
+            1usize,
+            128u32,
+        ),
+        (
+            "23 row 8, 512-thread cubes",
+            1u32,
+            true,
+            1usize,
+            1usize,
+            512u32,
         ),
     ] {
         let threads = threads0 / tpw;
-        let blocks = (threads as u32).div_ceil(BLOCK);
+        let blocks = (threads as u32).div_ceil(bd);
         let bytes = if with_sc { codes_b + scales_b } else { codes_b };
         let (b, f) = best_first(
             || {
@@ -748,7 +806,7 @@ fn run_axes() -> Result<()> {
                     axis_frag_b::launch::<Rt>(
                         &client,
                         CubeCount::Static(blocks, 1, 1),
-                        CubeDim::new_1d(BLOCK),
+                        CubeDim::new_1d(bd),
                         TensorArg::from_raw_parts(big.clone(), [1].into(), [codes_b / 4].into()),
                         TensorArg::from_raw_parts(sc.clone(), [1].into(), [scales_b / 4].into()),
                         TensorArg::from_raw_parts(sink.clone(), [1].into(), [1024].into()),
