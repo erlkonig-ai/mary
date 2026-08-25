@@ -210,7 +210,18 @@
 //! exactly the kind of number that gets quoted across runs. Worth knowing when
 //! reading older acceptance figures: `mary-measure` (160848d) and everything
 //! before the flip measured the UNPRUNED head, so those figures do not transfer
-//! to a bare run of current main. It is refused together with
+//! to a bare run of current main.
+//!
+//! And the pruning had a defect that only the SPECULATIVE lane could reach: the
+//! candidate rows were gathered from the LAST row of the pass rather than from
+//! the row the answer came off. A verify pass keeps the leading run of drafts
+//! that agreed, so the answer is row `new_toks.len() - 1`, and on the 31.9% of
+//! `INK_SPEC=1` passes that accept nothing the last row is a distribution over a
+//! token the model rejected -- one that need not even contain `best`, which the
+//! comment there asserted it always would. Fixed 2026-08-25. Exact-argmax
+//! verification means it could never emit a wrong token and never raise a flag;
+//! it could only lower acceptance, silently, on the configuration that had just
+//! become the default. It is refused together with
 //! `INK_MTP_PROB`, which scores the draft's distribution by full-vocabulary token
 //! index and would otherwise be handed 512 numbers about a different index space.
 //!
