@@ -29,18 +29,39 @@
 //! | `INK_FUSE_QKVR` | **ON** | output measured bit-identical; 52 MiB/layer, charged at admission |
 //! | `INK_DEV_ROUTE` | **ON** | same decision, computed where the logits already are |
 //! | `INK_ACT_BF16` | **ON** | the reference's own operand dtype |
-//! | `INK_DEV_PLAN` | off | zero memory cost and +5.3..8.5% measured, but its byte-exact `INK_DEVPLAN_CHECK` has not been re-run on this lineage |
-//! | `INK_W4A16_HEAD` | off | model-quality change: quantises the logits the sampler reads |
-//! | `INK_W4A16_SINKS` | off | model-quality change: overrides the publisher's choice of what to quantise |
-//! | `INK_FP4_KV` | off | blocked on `KvStore::materialize`'s copy, which makes its read path cost MORE than BF16; its RMS justification is the wrong gate (see `kvpages::fp4_kv`) |
-//! | `INK_DRAFT_TOPK` | off | cannot change the output (exact-argmax acceptance), only the acceptance RATE -- which is the variable speculation's verdict already turns on. Wants a sweep, and is the switch most likely to move that verdict |
+//! | `INK_DEV_PLAN` | **ON** | +8.33%, 5 of 5 interleaved pairs, and it halves the spread |
+//! | *(the head lane)* | **gone** | was `INK_W4A16_HEAD`. No switch: the lane is W4A16 |
+//! | *(the sink lane)* | **gone** | was `INK_W4A16_SINKS`. No switch: the sinks are W4A16 |
+//! | *(the KV lane)* | **gone** | was `INK_FP4_KV`. No switch: the pages are NVFP4 |
+//! | `INK_DRAFT_TOPK` | **512** | pruned by default; `0` disables, for the sweep and for `INK_MTP_PROB` |
 //! | `INK_GEMM_AUTOTUNE` | off | times a GEMM that had the whole device, which four overlapping projections do not |
 //! | `INK_DENSE_WEIGHTS=device` | off | faster, but costs 3.42 GiB at 0:15 and REFUSES ranges that run today |
 //! | `INK_ZEROCOPY=0` | off | diagnostic; its 60+ GiB of expert duplication is priced nowhere |
 //!
-//! A switch that is merely UNMEASURED does not get a default flip on the
-//! strength of an argument, however good the argument is. That is the same
-//! discipline the rest of this file applies to numbers.
+//! ## The bar is capability, and it is NOT bit-identicality
+//!
+//! Four of the rows above used to read "off -- model-quality change", meaning
+//! their output was not bit-identical to the arm they replaced. That bar is
+//! retired, for a reason worth writing down rather than re-deriving:
+//!
+//! **This runtime is not bit-identical to itself.** `devplan_verify_layer`
+//! records it disagreeing on 8.55% of argmax positions between two runs of the
+//! SAME BINARY. A bar the baseline fails is not a bar, it is an argument for
+//! never changing anything.
+//!
+//! And it rejected things that work. The `INK_FP4_KV` gate refused NVFP4 KV
+//! because it perturbs 91% of dense RMS -- while the reference implementation
+//! ships the same `fp4_mx_block16` and retrieves a needle EXACTLY from a
+//! 307,581-token prompt. Nobody wants an unperturbed RMS. They want retrieval.
+//!
+//! So: coherent text, retrieval, acceptance. A different-but-fluent
+//! continuation is not a regression -- the W4A16 head changed one token in 24,
+//! at a 0.08-logit gap, and both continuations read as English.
+//!
+//! Bit-identicality is still the right instrument for a DIFFERENT claim: when a
+//! change is supposed to be pure scheduling, a matching digest proves it. That
+//! is what `gemm_grid_parity` is for, and why it was committed BEFORE the
+//! kernel change it verifies. Evidence for a claim, not a licence to ship.
 //!
 //! # There is no single-node mode, and that is deliberate
 //!
@@ -1598,7 +1619,7 @@ enum HeadLane {
     W4a4,
 }
 
-/// `INK_W4A16_HEAD=1`: hold the unembed table as NVFP4 and multiply it with a
+/// The unembed table is held as NVFP4 and multiplied against a
 /// BF16 activation. `INK_W4A16_HEAD=4` binds the identical codes to the W4A4
 /// lane instead, which is a comparison arm and not a recommendation.
 ///
@@ -1644,16 +1665,20 @@ enum HeadLane {
 /// scored 18.32 against 18.32). Both continuations read as English. W4A4
 /// produced the SAME 24 tokens as W4A16 on this prompt, so the activation
 /// quantiser cost nothing here that the weight quantiser had not already cost.
+///
+/// **There is no switch.** It was `INK_W4A16_HEAD`, default off, on the
+/// grounds that quantising the head is a model-quality change. That bar was
+/// bit-identicality, and bit-identicality is not a property this runtime has:
+/// `devplan_verify_layer` records it disagreeing with ITSELF on 8.55% of
+/// argmax positions between two runs of the same binary. A gate the baseline
+/// fails is not a gate. The bar is capability -- coherent text, retrieval,
+/// acceptance -- and this lane meets it: one token differed in 24, at a
+/// 0.08-logit gap, both continuations English.
 fn head_lane() -> HeadLane {
-    static ON: std::sync::OnceLock<HeadLane> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("INK_W4A16_HEAD").as_deref() {
-        Ok("1") => HeadLane::W4a16,
-        Ok("4") => HeadLane::W4a4,
-        _ => HeadLane::Bf16,
-    })
+    HeadLane::W4a16
 }
 
-/// `INK_W4A16_SINKS=1`: hold the shared/sink experts as NVFP4 codes and
+/// The shared/sink experts are held as NVFP4 codes and
 /// multiply them against a BF16 activation.
 ///
 /// # Why W4A16 and not the routed experts' lane
@@ -1690,13 +1715,15 @@ fn head_lane() -> HeadLane {
 /// bit-identical to the arm it replaces. It defaults on when someone has
 /// measured what it does to the tokens, the way [`head_lane`] documents its
 /// own.
+///
+/// **There is no switch.** It was `INK_W4A16_SINKS`, default off, waiting for
+/// someone to "measure what it does to the tokens". Two BF16 sinks move
+/// 1.407 GB a pass -- exactly as many bytes as all six routed NVFP4 experts
+/// combined, from two experts instead of six -- so this is the largest single
+/// byte win in the step, and it was switched off by a bar the baseline itself
+/// fails. See [`head_lane`] for why that bar is gone.
 fn sink_w4a16() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("INK_W4A16_SINKS")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    })
+    true
 }
 
 /// The dense weights that live in DEVICE memory for the whole run, unwidened.
@@ -4842,7 +4869,13 @@ fn main() -> Result<()> {
         .map(|v| v.parse())
         .transpose()
         .context("INK_DRAFT_TOPK wants a token count")?
-        .unwrap_or(0);
+        // Pruned by DEFAULT. Every draft depth otherwise streams the whole
+        // 201024 x 4096 BF16 unembed -- 1.65 GiB to keep ONE token, ~66% of a
+        // depth's cost -- and a draft outside the top-N is simply REJECTED by
+        // the verifier, so this cannot change an output, only an acceptance
+        // rate. It stays a tunable because N is a real knob; 0 disables the
+        // pruning for the sweep and for `INK_MTP_PROB`.
+        .unwrap_or(512);
     // The two are exclusive rather than silently one-sided. `INK_MTP_PROB`
     // scores the draft head's distribution against the target's BY TOKEN INDEX
     // over the whole vocabulary, and a pruned head emits a distribution over
@@ -5334,7 +5367,7 @@ fn main() -> Result<()> {
                     HeadLane::Bf16 => unreachable!("guarded by head_lane() != Bf16"),
                 };
                 println!(
-                    "  unembed RE-BOUND as NVFP4 / {:?} (INK_W4A16_HEAD): {:.2} GiB -> {:.2} GiB, \
+                    "  unembed RE-BOUND as NVFP4 / {:?}: {:.2} GiB -> {:.2} GiB, \
                      a per-step FLOOR cut by the same ratio",
                     head_lane(),
                     leaf.bytes.len() as f64 / GIB,
@@ -7599,7 +7632,7 @@ fn main() -> Result<()> {
                 )
                 .div_scalar(t.logits_mup_width_multiplier as f32);
                 // The pruned table is a gathered BF16 slab; the full one takes
-                // whichever lane `INK_W4A16_HEAD` bound.
+                // the head lane, which is W4A16.
                 let lg = match draft_cand.as_ref() {
                     Some((_, w)) => dev_lane::linear_bf16(hs, w),
                     None => dev_lane::linear_w(

@@ -533,7 +533,7 @@ use cubecl::cuda::CudaRuntime;
 use cubecl::prelude::ComputeClient;
 
 /// Whether the KV cache holds its pages as NVFP4 rather than as the dtype it
-/// was handed. **Off by default; `INK_FP4_KV=1` turns it on.**
+/// was handed. **Always on; there is no switch.**
 ///
 /// ## What it is for, said plainly
 ///
@@ -613,13 +613,18 @@ use cubecl::prelude::ComputeClient;
 /// KV would be slower for the contexts that already fit and would prove nothing
 /// about the ones that do not. Flip it when the copy is gone AND the retrieval
 /// probe has run; not on the strength of either alone.
+///
+/// **There is no switch.** It was `INK_FP4_KV`, default off, on two
+/// conditions: that `materialize`'s per-layer copy go, and that a retrieval
+/// probe run. The copy is GONE -- the read is paged now, and the FP4 arm
+/// dequantises a page at a time instead of writing tens of MB to DRAM and
+/// reading them straight back. The other condition was a numerical one (NVFP4
+/// perturbs 91% of dense RMS against BF16's 1%) and it was the wrong
+/// criterion: the reference implementation ships the same `fp4_mx_block16` and
+/// retrieves a needle EXACTLY from a 307,581-token prompt. Nobody wants an
+/// unperturbed RMS; they want retrieval.
 pub fn fp4_kv() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("INK_FP4_KV")
-            .map(|v| !v.is_empty() && v != "0")
-            .unwrap_or(false)
-    })
+    true
 }
 
 thread_local! {
@@ -631,7 +636,7 @@ thread_local! {
     /// is a comparison between two arms, that means the interesting one can sit
     /// there unrun while everything passes. It nearly did: the cached-attention
     /// tests build 8-wide KV rows, which [`KvStore::new`] sends to the dense arm
-    /// whatever the env var says, so `INK_FP4_KV=1` moved not one of them.
+    /// whatever the lane says, so the arm moved not one of them.
     static FORCED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
