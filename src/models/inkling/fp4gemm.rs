@@ -73,8 +73,14 @@ pub fn fp4_linear<AB: Scalar, S: Scalar, NA: Size, NC: Size>(
     let lane = UNIT_POS_PLANE;
     let pack = AB::packing_factor();
 
-    let n_tile = CUBE_POS_X as usize;
-    let m_tile = CUBE_POS_Y as usize;
+    // M in x, N in y. Grid x varies fastest, so the cubes that share a weight
+    // row — the whole n-tile's `[8, k]` of codes and scales — are the ones
+    // launched adjacently, and one DRAM read of that row serves all
+    // `m_pad / 16` of them out of L2. The other order puts consumers of the
+    // same row `n / 8` cubes apart, which at the head shape is the whole
+    // weight table between them, so every m-tile re-reads from DRAM.
+    let m_tile = CUBE_POS_X as usize;
+    let n_tile = CUBE_POS_Y as usize;
     let n_base = n_tile * NTILE;
     let m_base = m_tile * MTILE;
 
@@ -207,6 +213,14 @@ pub fn fp4_linear_launch<R: Runtime>(
     );
     assert_eq!(n % NTILE, 0, "n {n} is not a multiple of {NTILE}");
     assert_eq!(k % KTILE, 0, "k {k} is not a multiple of {KTILE}");
+    // N rides grid y, which CUDA caps at 65535 (x is 2^31-1). The largest N in
+    // the model is the unembedding's 201024 = 25128 tiles, well inside it, but
+    // the cap is silent if it is ever exceeded so it is checked here.
+    assert!(
+        n / NTILE <= 65535,
+        "{} n-tiles exceed the 65535 grid-y limit",
+        n / NTILE
+    );
 
     let out = client.empty(m_pad * n * core::mem::size_of::<f32>());
     let vs = 32 / e2m1x2::cube_type().size_bits();
@@ -215,7 +229,7 @@ pub fn fp4_linear_launch<R: Runtime>(
     unsafe {
         fp4_linear::launch::<e2m1x2, e4m3, R>(
             client,
-            CubeCount::Static((n / NTILE) as u32, (m_pad / MTILE) as u32, 1),
+            CubeCount::Static((m_pad / MTILE) as u32, (n / NTILE) as u32, 1),
             CubeDim::new_1d(32),
             vs,
             2,
