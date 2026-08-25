@@ -197,6 +197,37 @@
 //! TABLES and are not a like-for-like efficiency comparison. What they do say is
 //! that neither lane is at this part's ~248 GB/s coalesced ceiling.
 //!
+//! ## End to end, in a decode step
+//!
+//! `bench-decode.sh`, 3 INTERLEAVED reps per arm, `INK_KV=1`, first two decode
+//! passes of each rep discarded, median over reps, spark-zt (GB10), the only
+//! thing varied being `INK_ANN_HEAD`:
+//!
+//! ```text
+//!   arm     median tok/s   median ms/step   spread
+//!   exact         54.348             18.4     2.8%
+//!   aNN           69.930             14.3     3.4%
+//! ```
+//!
+//! **4.1 ms a step, and THAT is the number that transfers.** The harness also
+//! prints `+28.67%`, and quoting that percentage anywhere else would be wrong:
+//! the layer range was `0:3`, which is almost no stack, so the head is a
+//! quarter of the denominator. On the shipped 42-layer split the head is 4.6 ms
+//! of a ~69 ms tail pass, where the same 4.1 ms is about 6% — and of a ~125 ms
+//! two-node step, about 3%. The head is a fixed INTERCEPT: it does not scale
+//! with layers, so its absolute cost is constant and its percentage is a
+//! statement about whatever else is in the pass.
+//!
+//! It cross-checks the isolated figure, which is the reason to trust either:
+//! 4.334 ms exact against 0.808 ms aNN at the head shape is a 3.5 ms saving,
+//! and the whole decode step moved 4.1. Two instruments, one number.
+//!
+//! **This run is stamped UNGATED and that stamp is the honest part.** The gate
+//! passed at loadavg 0.56 and contention arrived partway through (loadavg 4.00
+//! by the end), which the harness detected and said so. Both arms were
+//! interleaved so the drift lands on both equally, and the effect is ten times
+//! the spread — but it is not a gated number and should not be quoted as one.
+//!
 //! ## The sketch is cheap to build
 //!
 //! 201024 rows of the real unembedding in **0.31 s**, inside the process load
@@ -233,9 +264,23 @@
 //!
 //! # The scan is not at the ceiling, and here is the specific suspicion
 //!
-//! 0.097 GiB at this part's measured 248 GB/s coalesced read rate
-//! (`fp4_lane_dump`'s `stream_packed`, corrected 2026-08-25) is **0.42 ms**. The
-//! scan takes 0.74. Roughly 0.3 ms is unclaimed, and it is worth writing down
+//! `fp4_lane_dump`'s `stream_packed` reads the SAME 0.431 GiB of codes and
+//! scales with 128-bit fully coalesced loads and no arithmetic. Run in this
+//! session on spark2-zt it gives **218.4 GB/s** — not the 248 an earlier note
+//! records, which was a different box, and the difference is why a bandwidth
+//! ceiling has to be measured beside the thing it is a ceiling for.
+//!
+//! Against that ceiling, on the same box and in the same session:
+//!
+//! ```text
+//!   stream_packed (no arithmetic)   218.4 GB/s   100%
+//!   this scan                       128.4         59%
+//!   w4a16_linear (the exact head)   106.9         49%
+//! ```
+//!
+//! So the scan is already the more efficient of the two lanes, and 0.097 GiB at
+//! 218.4 GB/s would be **0.478 ms** against the 0.808 it takes. Roughly 0.33 ms
+//! is unclaimed, and it is worth writing down
 //! what it is probably NOT: it is not coalescing, because the bit-plane layout
 //! makes every global read a full 128-byte transaction by construction, and it
 //! is not latency-hiding alone, because issuing four words before consuming any
@@ -244,11 +289,16 @@
 //! The remaining suspicion is that the lane is partly ALU-BOUND. Each weight
 //! dimension costs about four instructions — one shared load, a shift, a
 //! mask-and-xor, an add — and there are 4096 of them per row and 201024 rows, so
-//! roughly 1.0e8 warp-instructions. Whether that is the same order as 0.42 ms
+//! roughly 1.0e8 warp-instructions. Whether that is the same order as 0.478 ms
 //! depends on this part's issue rate, which I have NOT measured; at an assumed
 //! 48 SMs x 4 schedulers x 1.5 GHz it would be ~0.36 ms, i.e. comparable, and
 //! that assumption is the weak step. **This is a hypothesis with a named
 //! weakness, not a finding.**
+//!
+//! There is a cheap way to REFUTE it before building anything: `stream_packed`
+//! above reads four times these bytes with no arithmetic at all, so a variant of
+//! the scan that reads the sketch and discards it would separate the read from
+//! the work in one number. That experiment has not been run.
 //!
 //! If it holds, the fix is a shared-memory table over PAIRS of query
 //! coordinates: 2048 pairs x 4 precomputed sign combinations = 32 KiB, turning
