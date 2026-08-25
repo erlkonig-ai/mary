@@ -7724,6 +7724,53 @@ fn main() -> Result<()> {
             // draft for the privilege of handing the value straight back.
             let draft_argmax_dev = |row: T2| -> usize { draft_pick(row) };
 
+            // `INK_MTP_TEACH=1`: the TEACHER-FORCED per-depth acceptance, taken
+            // over the whole PROMPT in the drafting prefill rather than over a
+            // generated continuation.
+            //
+            // Why this and not the generated measurement: head `d`'s row `j` is
+            // fed `(stage[d-1][j], embed(ids[j + d + 1]))` and predicts the token
+            // at `j + d + 2`, which for every row but the last `d + 2` is a token
+            // the prompt ALREADY CONTAINS. So one prefill scores ~3700 positions
+            // at once, where a 40-step generation scores 40 -- and it scores them
+            // against real text rather than against the model's own continuation,
+            // which is the confound that makes the generated rate corpus-shaped
+            // (this file has quoted 22.0%, 50.0% and 71.2% for the same head).
+            //
+            // It is exactly the conditional rate the expected-prefix arithmetic
+            // wants. `E = 1 + p1 + p1 p2 + ...` where `p_d = P(draft d right |
+            // drafts 1..d-1 right)`, and "drafts 1..d-1 right" is precisely the
+            // state teacher forcing puts head `d` in: the token head `d-1` was
+            // fed IS the token the verifier would have accepted.
+            //
+            // FULL vocabulary, never the pruned candidate table -- the pruning is
+            // a property of the drafting step's candidate gather and not of the
+            // head, and mixing the two would price two changes with one number.
+            let teach = std::env::var("INK_MTP_TEACH")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            let teach_rows = |rows: T2| -> Vec<usize> {
+                let hs = dev_lane::rms_norm(
+                    rows,
+                    fnorm_dev
+                        .clone()
+                        .expect("teacher forcing needs the final norm"),
+                    t.rms_norm_eps,
+                )
+                .div_scalar(t.logits_mup_width_multiplier as f32);
+                dev_lane::linear_w(
+                    hs,
+                    unembed_w
+                        .as_ref()
+                        .expect("teacher forcing needs the unembed table"),
+                )
+                .argmax(1)
+                .into_data()
+                .iter::<i64>()
+                .map(|x| x as usize)
+                .collect()
+            };
+
             draft_probs.borrow_mut().clear();
             let t_mtp = Instant::now();
             let drafts: Vec<usize> = if kv && mtp_dev_on {
@@ -7916,6 +7963,52 @@ fn main() -> Result<()> {
                             mtp_order,
                         );
                         mtp_dev_caches[d] = Some(c);
+                        if teach {
+                            // Row `j` predicts `ids[j + d + 2]`, so the last row
+                            // with an answer in the prompt is `seq - d - 3`.
+                            let last = seq.saturating_sub(d + 2);
+                            let mut hits = 0usize;
+                            let mut scored = 0usize;
+                            // 128 rows a call: the unembed streams 1.65 GiB of
+                            // weight per call whatever the row count, and a
+                            // [128, 201024] f32 logits block is 103 MiB.
+                            let mut j = 0usize;
+                            while j < last {
+                                let hi = (j + 128).min(last);
+                                let picks = teach_rows(y.clone().slice([j..hi, 0..h]));
+                                for (i, &pick) in picks.iter().enumerate() {
+                                    if pick == ids[j + i + d + 2] {
+                                        hits += 1;
+                                    }
+                                    scored += 1;
+                                }
+                                j = hi;
+                            }
+                            let (lo, hi) = wilson95(hits, scored);
+                            println!(
+                                "  MTP TEACH depth {}: {hits}/{scored} = {:.4} (95% CI {:.4}-{:.4}) \
+                                 -- teacher-forced over the prompt, FULL vocab, concat {}, \
+                                 entry {}, backbone embed_norm {}",
+                                d + 1,
+                                hits as f64 / scored.max(1) as f64,
+                                lo,
+                                hi,
+                                mtp_order.name(),
+                                if std::env::var("INK_MTP_RAW")
+                                    .map(|v| v == "1")
+                                    .unwrap_or(false)
+                                {
+                                    "raw"
+                                } else {
+                                    "final-normed"
+                                },
+                                if t.use_embed_norm && backbone_embed_norm() {
+                                    "on"
+                                } else {
+                                    "off"
+                                },
+                            );
+                        }
                         y
                     } else {
                         // ONE row per CONFIRMED TOKEN, not one per pass. That used
