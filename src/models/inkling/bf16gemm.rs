@@ -1044,11 +1044,15 @@ fn autotune() -> Autotune {
 ///
 /// Not cached: every caller here runs once per distinct shape in a process, so
 /// a `getenv` is free and a `OnceLock` per knob is three lines that buy nothing.
+///
+/// Zero is a VALUE, not an absence: `INK_GEMM_AUTOTUNE_MARGIN=0` means "take
+/// whatever the timer says", which is the ablation that shows what the margin
+/// is worth. Filtering it out would have silently substituted the default and
+/// made the ablation report the un-ablated arm.
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
         .and_then(|v| v.parse().ok())
-        .filter(|&v: &usize| v > 0)
         .unwrap_or(default)
 }
 
@@ -1137,8 +1141,11 @@ pub fn tuned_lane<R: Runtime>(
         return Some((head, vec![(head, f64::NAN)]));
     }
     let rounds = env_usize("INK_GEMM_AUTOTUNE_ROUNDS", AUTOTUNE_ROUNDS).max(2);
-    let iters = env_usize("INK_GEMM_AUTOTUNE_ITERS", AUTOTUNE_ITERS);
-    let margin = env_usize("INK_GEMM_AUTOTUNE_MARGIN", (AUTOTUNE_MARGIN * 100.0) as usize) as f64
+    let iters = env_usize("INK_GEMM_AUTOTUNE_ITERS", AUTOTUNE_ITERS).max(1);
+    let margin = env_usize(
+        "INK_GEMM_AUTOTUNE_MARGIN",
+        (AUTOTUNE_MARGIN * 100.0) as usize,
+    ) as f64
         / 100.0;
 
     let mut samples: Vec<Vec<f64>> = vec![Vec::new(); cands.len()];
