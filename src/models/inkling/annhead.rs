@@ -476,7 +476,20 @@ pub fn build_sketch<R: Runtime>(
         k as u32 >= BUILD_UNITS * 2,
         "k = {k} is too narrow for a {BUILD_UNITS}-unit build cube"
     );
-    assert_eq!(k % 32, 0, "k = {k} does not pack into 32-bit sign words");
+    // ONE divisibility condition, checked here, covering four comptime loop
+    // bounds that would each truncate SILENTLY rather than fail: the build's
+    // `k / BUILD_UNITS` elements per unit, the scan's `k / 32 / 4` four-word
+    // groups, the rescore's `k / 8 / 32` steps per lane, and the sign packing's
+    // `k / 32` words. `k % 256 == 0` implies all four, and every model this runs
+    // on has a hidden size that is a large power of two anyway -- so the check
+    // costs nothing and the failure it prevents is a scan that reads three
+    // quarters of a row and reports a confident wrong answer.
+    assert_eq!(
+        k % 256,
+        0,
+        "k = {k} is not a multiple of 256; the build, scan, rescore and pack loops \
+         would each silently cover a prefix of the row"
+    );
 
     let words = k / BITS_PER_WORD;
     let bits = client.empty(words * n * core::mem::size_of::<u32>());
