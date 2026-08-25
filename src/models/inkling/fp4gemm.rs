@@ -58,6 +58,18 @@
 //! again for the BF16 sibling, which is what rules out latency and dtype and
 //! leaves the schedule.
 //!
+//! That reading is **confirmed**, and the competing one — that a packed
+//! four-bit read simply cannot go faster on this part, so 171 GB/s was already
+//! the ceiling — is **refuted**. `inkling_membw` with `INK_BW_AXES=1` puts both
+//! candidate ceilings and this kernel in ONE process on ONE 1 GiB handle:
+//! f32, BF16 and packed NVFP4 all read 247-259 GB/s, the E4M3 scale plane
+//! alongside them is free, and `fp4_linear` at `m_pad = 16` on that same table
+//! reads 105.8. The gap is the `m16n8k64` B fragment's access pattern — a
+//! plane's B load spans eight weight rows `k/2` bytes apart, eight sector
+//! requests an instruction against a coalesced stream's four — and NOT the
+//! dtype. `moegroup`'s header carries the full table and the retraction of the
+//! 170.4 GB/s figure that supported the other reading.
+//!
 //! So of the 8.95 ms a decode pass spends in the grouped expert GEMM, 5.7 ms is
 //! bytes / bus and **3.2 ms is not** — 5.5% of a 58.3 ms decode step, sitting in
 //! the kernel rather than in the router or the host. A fancier tiling is

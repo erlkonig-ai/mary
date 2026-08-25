@@ -16,6 +16,15 @@
 //! is the number the hand lanes' 74 GB/s should be read against — not the BF16
 //! lane's 163 GB/s, which is a different table and a different kernel.
 //!
+//! It read 168-172 GB/s until 2026-08-25 and that figure was WRONG in both
+//! directions at once: the thread stride was a u32-word count applied to a
+//! tensor CubeCL indexes in 16-byte vectors, so every thread strode four times
+//! past the end of the buffer, and the store was unconditional, so the control
+//! also paid a 12.5% write tax it charged to a read figure. Corrected it reads
+//! ~248 GB/s — the SAME as f32 and BF16 over the same bytes. There is no
+//! four-bit read penalty on this part; see `inkling_membw` with
+//! `INK_BW_AXES=1`, which puts all of those side by side in one process.
+//!
 //! `INK_HEAD_N` sets `n` (default 201024, the unembedding's own). Set it to
 //! something small to make this a compile-only dump.
 
@@ -60,8 +69,12 @@ pub fn stream_packed<NW: Size>(
     // The scale plane is 1/8 the words; one step over it is the right ratio.
     let s = sc[t % sc.len()];
     acc += s[0];
-    if t < out.len() {
-        out[t] = acc;
+    // Sentinel-guarded, so the control pays NO write traffic. Unconditional it
+    // stored one word per eight 16-byte loads -- a 12.5% write tax the kernels
+    // it is a ceiling for do not pay, charged to a figure that counts only
+    // reads.
+    if acc == u32::new(0x5AFE_5AFEi64) {
+        out[t % out.len()] = acc;
     }
 }
 
@@ -222,10 +235,19 @@ fn main() {
     }
 
     // The ceiling: the same bytes, read coalesced, with no work on them.
-    let words = codes / 4;
-    let threads = words / PER;
+    // `codes / 4` is the count of u32 WORDS; the tensor is bound as
+    // `Vector<u32, 4>`, and CubeCL indexes a vectorised tensor in VECTORS, so
+    // the thread stride has to be the vector count. It was the word count,
+    // which strode `t + i * threads` four times past the end of a 0.431 GiB
+    // buffer -- so the control issued four times the traffic it charged itself
+    // for, over addresses it did not own, and the 168-172 GB/s it reported was
+    // an artefact of that and not a property of reading four-bit data. The
+    // corrected control reads ~248 GB/s, the same as f32 and BF16 over the same
+    // bytes (`inkling_membw`, INK_BW_AXES=1, rows 1-5).
+    let vectors = codes / 16;
+    let threads = vectors / PER;
     let blocks = (threads as u32).div_ceil(BLOCK);
-    let dst = client.empty(threads * 4);
+    let dst = client.empty(4096);
     let mut stream_s = f64::MAX;
     for i in 0..6 {
         let t2 = Instant::now();
@@ -235,9 +257,9 @@ fn main() {
                 CubeCount::Static(blocks, 1, 1),
                 CubeDim::new_1d(BLOCK),
                 4,
-                TensorArg::from_raw_parts(b.clone(), [1].into(), [words / 4].into()),
+                TensorArg::from_raw_parts(b.clone(), [1].into(), [vectors].into()),
                 TensorArg::from_raw_parts(b_sc.clone(), [1].into(), [scales / 16].into()),
-                TensorArg::from_raw_parts(dst.clone(), [1].into(), [threads].into()),
+                TensorArg::from_raw_parts(dst.clone(), [1].into(), [1024].into()),
                 threads,
                 PER,
             )
