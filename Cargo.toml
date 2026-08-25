@@ -413,6 +413,12 @@ required-features = ["tokenizer", "inkling-cuda"]
 name = "inkling_device_ceiling"
 required-features = ["inkling-cuda"]
 
+# Compile-only dump of the hand 4-bit GEMM lanes at the head's own k, so the
+# generated CUDA can be disassembled offline. Touches the GPU for microseconds.
+[[bin]]
+name = "fp4_lane_dump"
+required-features = ["inkling-cuda"]
+
 # Read bandwidth for device-allocated vs host-mapped memory, on a working set
 # far larger than L2. Any figure above this part's ~273 GB/s bus is a cache
 # measurement, which is how a 992 GB/s number got into circulation.
