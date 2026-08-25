@@ -167,4 +167,14 @@ fn main() {
         stream_s * 1e3,
         gbs(stream_s)
     );
+    println!(
+        "output alloc + sync  {:8.3} ms   (paid by both GEMM rows, not by the ceiling)",
+        alloc_s * 1e3
+    );
+    println!(
+        "net of alloc:  w4a16 {:6.1} GB/s   fp4 {:6.1} GB/s   ceiling {:6.1} GB/s",
+        gbs(w4a16_s - alloc_s),
+        gbs(fp4_s - alloc_s),
+        gbs(stream_s)
+    );
 }
