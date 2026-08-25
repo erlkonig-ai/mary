@@ -3130,7 +3130,7 @@ mod tests {
     /// is checking.
     #[test]
     fn cached_global_matches_full_across_pages() {
-        let tokens = 3 * super::kvpages::PAGE + 37;
+        let tokens = 3 * super::super::kvpages::PAGE + 37;
         let worst = compare(AttnKind::Global, 5, None, None, tokens, 4, false);
         assert!(
             worst < CACHE_TOLERANCE_GLOBAL,
@@ -3148,7 +3148,7 @@ mod tests {
     /// exactly what this comparison sees.
     #[test]
     fn cached_local_matches_full_with_a_head_across_pages() {
-        let page = super::kvpages::PAGE;
+        let page = super::super::kvpages::PAGE;
         let worst = compare(
             AttnKind::Local,
             5,
