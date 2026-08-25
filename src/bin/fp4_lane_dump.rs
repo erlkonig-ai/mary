@@ -28,7 +28,7 @@ fn main() {
     let b = client.empty(n * (k / 8) * 4);
     let b_sc = client.empty(n * (k / 16));
     let out = w4a16_linear_launch::<Rt>(&client, &a, &b, &b_sc, m_pad, k, n, 1.0);
-    client.read_one(out.binding());
+    let _ = client.read_one(out.clone());
     println!("w4a16_linear launched at m_pad={m_pad} k={k} n={n}");
 
     // W4A4: both operands packed E2M1 with e4m3 block scales.
@@ -37,6 +37,6 @@ fn main() {
     let qb = client.empty(n * k / 2);
     let qb_sc = client.empty(n * (k / 16));
     let out2 = fp4_linear_launch::<Rt>(&client, &qa, &qa_sc, &qb, &qb_sc, m_pad, k, n, 1.0);
-    client.read_one(out2.binding());
+    let _ = client.read_one(out2.clone());
     println!("fp4_linear launched at m_pad={m_pad} k={k} n={n}");
 }
