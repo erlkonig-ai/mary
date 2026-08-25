@@ -124,6 +124,82 @@
 //! nothing next to the key axis at the lengths this file is for, and one code
 //! path instead of two.
 //!
+//! # What it measured
+//!
+//! **Framing rule for every number in this section.** Milliseconds for ONE
+//! attention layer at the 42-layer release's global shape (hidden 4096, 32
+//! heads over 8 KV heads, `head_dim` 128, `d_rel` 16, `rel_extent` 1024), on a
+//! GB10, with the projections and the two short convolutions INCLUDED — these
+//! time `attention_prefill` and `attention_step`, not the kernel alone. The
+//! model has SEVEN global layers, so multiply by seven for a step's global
+//! attention. Both arms of each pair are the same binary in the same working
+//! directory, switched by `INK_FLASH`, because cubecl's autotune cache lives at
+//! `$CWD/target/autotune` and a cross-worktree comparison measures the cache.
+//! `reserved` is what the cubecl pool holds afterwards — a high-water mark
+//! within a process, so a row inherits every row above it.
+//! [`super::burn::flash_prefill_cost_at_length`] and
+//! `flash_decode_cost_at_context` are the two benchmarks; both are `#[ignore]`d.
+//!
+//! DECODE, one step, NVFP4 KV:
+//!
+//! ```text
+//!   context   window     fused    dense
+//!      4 096        -      1.17     1.58   1.35x
+//!     16 384        -      2.60     4.01   1.54x
+//!     65 536        -      7.76    29.94   3.86x
+//!    262 144        -     28.79   120.17   4.17x
+//!     16 384      512      0.76     1.01   1.33x
+//! ```
+//!
+//! The last row is a LOCAL layer — the window trims the cache to its last 512
+//! keys, so it measures a 512-key read whatever the context says — and it is
+//! there because [`super::burn::attention_step`] does not check `kind`: all
+//! forty-two layers take this kernel at decode, not just the seven.
+//!
+//! PREFILL, whole sequence:
+//!
+//! ```text
+//!    tokens     fused    dense      fused MiB   dense MiB
+//!     1 024      14.4     15.3           2542        2542
+//!     4 096      90.2    159.6           3021       10199
+//!     8 192     283.3    583.1           3051       40824
+//!    16 384    1206.5   2210.7           3051       40824
+//!    32 768    5515.2   8728.5          11186       41303
+//! ```
+//!
+//! So it pays everywhere, and the answer to "at what N does it start to pay"
+//! is "at the shortest length either benchmark runs" — which is not what I
+//! expected to find, and the reason is that the arm it replaces was never
+//! compute-bound. Its cost is the `[heads, rows, tokens]` score block written
+//! by the matmul and walked five more times, plus a GQA expansion of K and V
+//! that is linear in the sequence with no knob on it. The memory column is the
+//! sharper result: 3.0 GiB at 16k tokens against 40.8, and the fused figure is
+//! flat from 4k to 16k where the dense one is not.
+//!
+//! ## What it does NOT reach, and why, and what would
+//!
+//! 5.5 s for one layer at 32,768 tokens is 8.8 TFLOP of arithmetic in 5.5 s,
+//! i.e. **1.6 TFLOP/s** — under 1% of what this part's tensor cores can do.
+//! That is not a mystery and it is not headroom that tuning recovers. One key
+//! tile costs `2 * PLANE * head_dim * 4` bytes of K and V and buys
+//! `ROWS * PLANE * head_dim * 2` flops, so the kernel's arithmetic intensity is
+//! `ROWS / 4` flops a byte — 8 at [`ROWS_PREFILL`] — and 8 flops a byte against
+//! this box's ~273 GB/s is a **2.2 TFLOP/s ceiling**. The measurement is at 73%
+//! of it. The kernel is at its intensity limit, not at its instruction limit.
+//!
+//! Two things raise that ceiling and neither is a tuning knob:
+//!
+//! * **More rows per cube.** Intensity is `ROWS / 4` and nothing else. 64 rows
+//!   would double it; what stops it is the 48 KiB a static `__shared__` gets,
+//!   since the query tile alone would be 32 KiB at f32. Holding the query tile
+//!   in BF16 — which the arm this replaces already does for its matmul — fits
+//!   64 rows in 40.5 KiB. That is a change to the kernel's operand precision
+//!   and wants its own pairing against `golden/paired/`.
+//! * **MMA.** At prefill `m` is large and `mma.sync.aligned.m16n8k16` is what
+//!   the score product should be running on; [`super::bf16gemm`] already uses
+//!   it in this tree. At DECODE it buys nothing — `m` is 1, the product is a
+//!   GEMV, and the decode numbers above are bandwidth-bound already.
+//!
 //! # Burn already has a flash kernel, and it was rejected on evidence
 //!
 //! `cubek-attention` 0.2.0 is in our `Cargo.lock` and already compiled into
