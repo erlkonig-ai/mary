@@ -242,14 +242,14 @@ mod tests {
     /// Rows whose every element is the row's absolute index, so `materialize`
     /// can be checked for CONTENT and ORDER rather than only for shape — a
     /// store that returns the right number of wrong rows passes a shape test.
-    fn rows(from: usize, n: usize, dev: &<B as Backend>::Device) -> Tensor<B, 2> {
+    fn rows(from: usize, n: usize, dev: &B::Device) -> Tensor<B, 2> {
         let data: Vec<f32> = (from..from + n)
             .flat_map(|i| std::iter::repeat_n(i as f32, W))
             .collect();
         Tensor::<B, 1>::from_floats(data.as_slice(), dev).reshape([n, W])
     }
 
-    fn contents(s: &PageStore<B>, dev: &<B as Backend>::Device) -> Vec<usize> {
+    fn contents(s: &PageStore<B>, dev: &B::Device) -> Vec<usize> {
         if s.is_empty() {
             return Vec::new();
         }
