@@ -3137,6 +3137,135 @@ mod tests {
         );
     }
 
+    /// DIAGNOSTIC, not a gate. Decomposes the cached-vs-uncached drift so the
+    /// question "arithmetic or defect" can be answered from numbers rather
+    /// than from reading. Prints the ABSOLUTE worst, the magnitude of the
+    /// answer it is worst against, and the per-position series -- a defect in
+    /// the cache is structured in `pos`, accumulated rounding is not.
+    #[test]
+    fn diag_global_drift_decomposition() {
+        let _lane = CacheLane::wide();
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let lson = Some(LogScaling {
+            n_floor: 4.0,
+            alpha: 0.5,
+        });
+        for (label, kind, rel_extent, window, ls, tokens, prefill) in [
+            (
+                "G re=16 ls=off pf=4 ",
+                AttnKind::Global,
+                16usize,
+                None::<usize>,
+                None,
+                11usize,
+                4usize,
+            ),
+            (
+                "G re=16 ls=on  pf=4 ",
+                AttnKind::Global,
+                16,
+                None,
+                lson,
+                11,
+                4,
+            ),
+            (
+                "G re=5  ls=off pf=4 ",
+                AttnKind::Global,
+                5,
+                None,
+                None,
+                11,
+                4,
+            ),
+            (
+                "G re=5  ls=on  pf=4 ",
+                AttnKind::Global,
+                5,
+                None,
+                lson,
+                11,
+                4,
+            ),
+            (
+                "G re=5  ls=on  pf=10",
+                AttnKind::Global,
+                5,
+                None,
+                lson,
+                11,
+                10,
+            ),
+            (
+                "G re=16 ls=off pf=10",
+                AttnKind::Global,
+                16,
+                None,
+                None,
+                11,
+                10,
+            ),
+            (
+                "G re=16 ls=off pf=1 ",
+                AttnKind::Global,
+                16,
+                None,
+                None,
+                11,
+                1,
+            ),
+            (
+                "G re=64 ls=off pf=4 t=40",
+                AttnKind::Global,
+                64,
+                None,
+                None,
+                40,
+                4,
+            ),
+            (
+                "L re=5  win=5  pf=4 ",
+                AttnKind::Local,
+                5,
+                Some(5),
+                None,
+                11,
+                4,
+            ),
+        ] {
+            let d = dims(kind, rel_extent);
+            let w = weights(&d, &dev);
+            let xs: Tensor<B, 2> = Tensor::from_data(
+                TensorData::new(fill(tokens * d.hidden, 2.5), [tokens, d.hidden]),
+                &dev,
+            );
+            let full = attention(xs.clone(), &w, &d, ls, window);
+            let head = xs.clone().slice([0..prefill, 0..d.hidden]);
+            let (_, mut cache) = attention_prefill(head, &w, &d, ls, window, window);
+            let mut per = Vec::new();
+            let mut scale = 0f32;
+            for pos in prefill..tokens {
+                let step = attention_step(
+                    xs.clone().slice([pos..pos + 1, 0..d.hidden]),
+                    &w,
+                    &d,
+                    ls,
+                    pos,
+                    window,
+                    &mut cache,
+                );
+                let want = full.clone().slice([pos..pos + 1, 0..d.hidden]);
+                per.push((step - want.clone()).abs().max().into_scalar());
+                scale = scale.max(want.abs().max().into_scalar());
+            }
+            let worst = per.iter().cloned().fold(0f32, f32::max);
+            println!(
+                "{label} worst {worst:e} scale {scale:e} rel {:e} per-pos {per:?}",
+                worst / scale
+            );
+        }
+    }
+
     /// A local layer whose window is shorter than the sequence, so the cache
     /// must forget: 11 tokens through a window of 5 drops six keys.
     #[test]
