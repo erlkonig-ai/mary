@@ -390,6 +390,12 @@ pub struct CleanupGate {
 impl CleanupGate {
     /// The gate for this run. Starts armed, so the first pass polls per layer
     /// and nothing has to be assumed about what state the pool woke up in.
+    ///
+    /// The first pass is the one that matters most for this: with `INK_KV=1` it
+    /// is the PREFILL, which is the pass the policy exists for. A unit test pins
+    /// it, and earned its keep immediately -- `acted` was `false` here at first,
+    /// so the very first `begin_pass` disarmed the gate before the prefill's
+    /// first layer and the arming in this constructor did nothing at all.
     pub fn new(policy: CleanupPolicy) -> Self {
         Self::with_schedule(
             policy,
@@ -404,8 +410,11 @@ impl CleanupGate {
         Self {
             policy,
             always_poll,
+            // `acted`, not `per_layer`: `begin_pass` derives one from the other
+            // and runs before the first layer, so arming has to be expressed in
+            // the field `begin_pass` READS.
             per_layer: true,
-            acted: false,
+            acted: true,
         }
     }
 
@@ -574,7 +583,10 @@ mod tests {
         // The first pass is polled per layer -- nothing is assumed about the
         // state the pool woke up in. It cleans nothing, so every pass after it
         // asks once, at the layer that re-arms the next one.
-        assert!(seen[0].0 <= 42);
+        assert_eq!(
+            seen[0].0, 42,
+            "the first pass -- the PREFILL -- must be polled per layer"
+        );
         assert_eq!(seen[0].1, 0);
         for (polls, cleaned) in &seen[1..] {
             assert!(*polls <= 1, "a quiet pass asked {polls} times, not once");
