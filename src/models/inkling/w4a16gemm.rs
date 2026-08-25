@@ -277,3 +277,221 @@ pub fn w4a16_linear_launch<R: Runtime>(
     };
     out
 }
+
+// ---------------------------------------------------------------------------
+// The same product with more warps and wider loads — kept because it MEASURED
+// SLOWER, which is the useful part.
+//
+// The starting suspicion was residency and memory-level parallelism.
+// `w4a16_linear` above is one 32-thread cube per 16x8 output tile; on GB10
+// `cudaDevAttrMaxBlocksPerMultiprocessor` is 24 against 48 warp slots, so a
+// one-warp cube caps residency at 50% and no register budget can recover it (it
+// uses 40 registers; 51 blocks' worth would fit). Its K loop is not unrolled
+// either, so a warp has one k-tile of weight fetch outstanding at a time behind
+// 154 SASS instructions of address arithmetic, bounds clamping and nibble
+// expansion.
+//
+// This variant changes three things: `PLANES` planes per cube instead of one, a
+// single 16-byte `LDG.E.128` covering both k-tiles of a step (a lane's two B
+// words for k-tile `t` are packed indices `kbase/8` and `kbase/8 + 1`, and the
+// next k-tile's are `+2` and `+3`, which at a 32-aligned `kbase` are four
+// contiguous aligned words), and one scale byte per k-tile where the original
+// loads the same byte twice. It is 269 SASS instructions per two k-tiles
+// against 154 per one — 13% fewer per k-tile — at the same 40 registers.
+//
+// Measured at the head's own shape (m_pad 16, k 4096, n 201024, 0.431 GiB of
+// codes + scales, min of four warm launches, launch + sync, GB10, GPU
+// otherwise idle), against `w4a16_linear` in the same process:
+//
+// ```text
+//   PLANES   wide         original    verdict
+//   1        4.95 ms      4.97 ms     wider loads and 13% fewer instructions: nothing
+//   4        5.27-5.35    4.66-4.74   more warps: 13% WORSE
+//   8        5.32-6.76    4.81-4.91   more warps still: 10-38% WORSE
+// ```
+//
+// So this lane is not instruction-bound and not occupancy-bound. The
+// corroborating measurement is `fp4gemm::fp4_linear`, which runs the hardware
+// block-scaled MMA and needs no software dequantisation at all: 12 416
+// instructions per warp over the head's K against this kernel's 39 424, 3.2x
+// fewer, for 4.53 ms against 4.66. Instruction count moved 3.2x and time moved
+// 3%.
+//
+// What is left is the access pattern itself. Every warp owns eight weight rows
+// and consumes 32 bytes from each before advancing, so the memory system sees
+// 32-byte reads 2048 bytes apart, thousands of warps deep — and adding warps
+// adds streams, which is why more planes made it worse. A fully coalesced read
+// of the SAME 0.431 GiB in the same process runs at 158-172 GB/s against these
+// kernels' 98-106. The gap is coalescing, and coalescing needs a cooperative
+// stage through shared memory, which is exactly what one warp per output tile
+// forecloses. `fp4gemm`'s module header says "a fancier tiling would not change
+// that"; at the ROUTED-EXPERT shape it measures right (`fp4_linear_grouped`
+// reaches 171 GB/s, at the ceiling), and at THIS shape it does not.
+//
+// A is left alone throughout: at `m_pad = 16` it is 128 KiB, L2-resident, and
+// re-read by every cube.
+
+/// Planes per cube. At 4 the block limit stops binding and the register budget
+/// takes over — 40 x 128 = 5120 registers a cube, 12 cubes an SM, all 48 warp
+/// slots — and the lane gets 13% SLOWER for it. Left at 1 because that is what
+/// measured best; the constant stays so the experiment can be re-run by
+/// changing one character.
+pub const PLANES: u32 = 1;
+/// K covered by one loop iteration: two `m16n8k16` steps, one 16-byte B load.
+pub const KSTEP: usize = 2 * KTILE;
+/// Packed `u32` words one lane fetches per iteration.
+pub const WORDS_PER_STEP: usize = 4;
+
+/// `out = (a @ b^T) * scale`, `a` BF16 and `b` NVFP4 — same contract as
+/// [`w4a16_linear`], same numerics, different residency.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_linear_wide<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size, NB: Size>(
+    a: &Tensor<Vector<AB, NA>>,
+    b: &Tensor<Vector<u32, NB>>,
+    b_sc: &Tensor<S>,
+    out: &mut Tensor<Vector<f32, NC>>,
+    #[comptime] size_k: usize,
+    #[comptime] size_n: usize,
+    scale: f32,
+) {
+    let def = cmma::MmaDefinition::<AB, AB, f32>::new(MTILE, NTILE, KTILE);
+    let lane = UNIT_POS_PLANE;
+    let pack = AB::packing_factor();
+
+    // One plane per n-tile; the cube covers `PLANES` of them.
+    let n_tile = CUBE_POS_X as usize * comptime!(PLANES as usize) + UNIT_POS_Y as usize;
+    let m_tile = CUBE_POS_Y as usize;
+    let n_base = n_tile * NTILE;
+    let m_base = m_tile * MTILE;
+
+    let ec_a = def.elems_per_lane(MatrixIdent::A);
+    let vs_a = def.vector_size(MatrixIdent::A);
+    let vc_a = comptime!(ec_a / vs_a);
+    let ec_b = def.elems_per_lane(MatrixIdent::B);
+    let vs_b = def.vector_size(MatrixIdent::B);
+    let vc_b = comptime!(ec_b / vs_b);
+    let ec_c = def.elems_per_lane(MatrixIdent::Accumulator);
+    let vs_c = def.vector_size(MatrixIdent::Accumulator);
+    let vc_c = comptime!(ec_c / vs_c);
+
+    let mut reg_a = Array::<Vector<AB, NA>>::new(vc_a);
+    let mut reg_b = Array::<Vector<AB, NA>>::new(vc_b);
+    let mut acc = Array::<Vector<f32, NC>>::new(vc_c);
+    #[unroll]
+    for i in 0..vc_c {
+        acc[i] = Vector::<f32, NC>::cast_from(0.0f32);
+    }
+
+    // `b` is indexed in 16-byte vectors, so a row is `size_k / 8 / 4` of them.
+    let vpr = comptime!(size_k / CODES_PER_WORD / WORDS_PER_STEP);
+    let spr = comptime!(size_k / GROUP);
+    let steps = comptime!(size_k / KSTEP);
+
+    // The lane's own k offset inside a tile, hoisted: it does not depend on the
+    // step, and the original recomputed it from `UNIT_POS_PLANE` six times an
+    // iteration.
+    let (b_row0, b_col0) = def.position_of_nth(lane, 0u32, MatrixIdent::B);
+    let gr = b_col0 as usize + n_base;
+    let klane = b_row0 as usize;
+
+    for s in 0..steps {
+        let kbase = s * KSTEP;
+        // ONE 16-byte load: the four packed words covering both k-tiles.
+        let quad = b[gr * vpr + kbase / (CODES_PER_WORD * WORDS_PER_STEP)];
+
+        #[unroll]
+        for half in 0..2usize {
+            let khalf = kbase + half * KTILE;
+            #[unroll]
+            for i in 0..vc_a {
+                let (row, col) =
+                    def.position_of_nth(lane, (i * vs_a * pack) as u32, MatrixIdent::A);
+                let ga = row as usize + m_base;
+                let gc = col as usize + khalf;
+                reg_a[i] = a[(ga * size_k + gc) / a.vector_size()];
+            }
+            // Both fragment halves of a k-tile share this scale byte, because
+            // `klane` is at most 6 and a 16-element block starts at a multiple
+            // of 16. The original read it twice.
+            let sc = f32::cast_from(b_sc[gr * spr + khalf / GROUP]);
+            #[unroll]
+            for i in 0..vc_b {
+                // Fragment element `i` sits `i * 8` further along k, which is
+                // exactly one packed word: word `2 * half + i` of the quad.
+                let word = quad[2 * half + i];
+                let mut v = Vector::<AB, NA>::empty();
+                #[unroll]
+                for j in 0..vs_b {
+                    let code = (word >> (4 * (klane + j)) as u32) & 15u32;
+                    v[j] = AB::cast_from(e2m1_value(code) * sc);
+                }
+                reg_b[i] = v;
+            }
+            let d = def.execute(&reg_a, &reg_b, &acc);
+            #[unroll]
+            for i in 0..vc_c {
+                acc[i] = d[i];
+            }
+        }
+    }
+
+    #[unroll]
+    for i in 0..vc_c {
+        let (row, col) = def.position_of_nth(lane, (i * vs_c) as u32, MatrixIdent::Accumulator);
+        let go = row as usize + m_base;
+        let gc = col as usize + n_base;
+        out[(go * size_n + gc) / out.vector_size()] = acc[i] * Vector::<f32, NC>::cast_from(scale);
+    }
+}
+
+/// Launch [`w4a16_linear_wide`]; same signature as [`w4a16_linear_launch`].
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_linear_wide_launch<R: Runtime>(
+    client: &ComputeClient<R>,
+    a: &Handle,
+    b: &Handle,
+    b_sc: &Handle,
+    m_pad: usize,
+    k: usize,
+    n: usize,
+    scale: f32,
+) -> Handle {
+    assert_eq!(
+        m_pad % MTILE,
+        0,
+        "m_pad {m_pad} is not a multiple of {MTILE}"
+    );
+    let ntiles = n / NTILE;
+    assert_eq!(n % NTILE, 0, "n {n} is not a multiple of {NTILE}");
+    assert_eq!(
+        ntiles % PLANES as usize,
+        0,
+        "{ntiles} n-tiles do not divide into cubes of {PLANES} planes"
+    );
+    assert_eq!(k % KSTEP, 0, "k {k} is not a multiple of {KSTEP}");
+
+    let out = client.empty(m_pad * n * core::mem::size_of::<f32>());
+    let vs = 32 / bf16::cube_type().size_bits();
+    let vpr = k / CODES_PER_WORD / WORDS_PER_STEP;
+    let spr = k / GROUP;
+
+    unsafe {
+        w4a16_linear_wide::launch::<bf16, e4m3, R>(
+            client,
+            CubeCount::Static((ntiles / PLANES as usize) as u32, (m_pad / MTILE) as u32, 1),
+            CubeDim::new_2d(32, PLANES),
+            vs,
+            2,
+            WORDS_PER_STEP,
+            TensorArg::from_raw_parts(a.clone(), [k, 1].into(), [m_pad, k].into()),
+            TensorArg::from_raw_parts(b.clone(), [vpr, 1].into(), [n, vpr].into()),
+            TensorArg::from_raw_parts(b_sc.clone(), [spr, 1].into(), [n, spr].into()),
+            TensorArg::from_raw_parts(out.clone(), [n, 1].into(), [m_pad, n].into()),
+            k,
+            n,
+            scale,
+        )
+    };
+    out
+}

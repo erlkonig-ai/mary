@@ -1425,3 +1425,151 @@ pub fn bf16_gemm<R: Runtime>(
     }
     unreachable!("every order ends with `simple unit`, which takes every shape")
 }
+
+/// `out = a @ b^T` through `cubek`'s tuned matmul with `b` an **NVFP4** weight.
+///
+/// The hand 4-bit lanes ([`super::w4a16gemm::w4a16_linear`],
+/// [`super::fp4gemm::fp4_linear`]) are one warp per 16x8 output tile, so every
+/// warp streams its own eight weight rows and the memory system sees 32-byte
+/// reads 2048 bytes apart. At the head's shape that measures ~100 GB/s against
+/// 170 for a fully coalesced read of the same bytes, and neither occupancy,
+/// instruction count nor load width moves it — the record is in
+/// `w4a16gemm`'s own header. What moves it is coalescing, and coalescing needs
+/// a cooperative stage through shared memory.
+///
+/// `cubek` already has one, and it already takes a quantised operand:
+/// `InputBinding::Quantized` dequantises on the GLOBAL READ, inside the tuned
+/// tiling, and writes BF16 into the stage. So the weight crosses DRAM at four
+/// bits and the MMA is the ordinary `bf16 x bf16 -> f32` one. There is no
+/// four-bit tensor-core math on this path and no shared-memory saving; the win
+/// is the DRAM read, which is the whole of decode's cost.
+///
+/// **Not every lane accepts it.** The TMA and async-copy loaders reject a
+/// quantised operand outright ("TMA doesn't support dequantizing on global
+/// read"), which retires `double tma mma` — the lane that wins both ends of the
+/// plain-BF16 bench. The sync loaders take it: `SimpleCyclicMma`,
+/// `DoubleCyclicMma`, `OrderedDoubleMma`, the tilewise and hybrid families, and
+/// the unit lanes. `GemvUnitPerpendicular` must be avoided: it wants a
+/// contiguous batch layout, a packed weight is not one, and it will silently
+/// `into_contiguous` the entire 392 MiB table on every call.
+///
+/// ## The layout, which is where this goes wrong quietly
+///
+/// `b` is the checkpoint's own `[n, k/8]` row-major `u32` and `b_sc` its
+/// `[n, k/16]` E4M3 — unchanged, uncopied. They are re-described as the
+/// column-major `[k, n]` B operand the product wants:
+///
+/// * `QuantStore::PackedU32(1)` — the argument is a REVERSE dim index, so 1 is
+///   the `k` axis of the logical `[k, n]`, and it also *decides* the matrix
+///   layout (0 row-major, 1 column-major) rather than the strides deciding it.
+/// * `QuantLevel::block([16, 1])` — `[block_row, block_col]` over `[k, n]`. A
+///   one-element `block([16])` unsqueezes at the FRONT and means "16 along n",
+///   which is the wrong axis and fails silently.
+/// * `data` carries the PACKED shape and strides in `u32` words; `scale` the
+///   BLOCK shape and strides in E4M3 elements. No fractional stride is needed
+///   because the layout divides the logical coordinate by the packing factor
+///   before multiplying by the stride.
+/// * `MatmulElems` still names `rhs: bf16` — that is the DEQUANTISED type, and
+///   it is what makes the stage and the MMA BF16.
+///
+/// The nibble order matches: `e2m1x2`'s low nibble is the lowest index, which
+/// is [`super::nvfp4`]'s convention and the checkpoint's.
+///
+/// ## What it measures, which is why nothing calls it
+///
+/// At the head's own shape — `m_pad = 16`, `k = 4096`, `n = 201024`, min of
+/// four warm launches, launch + sync, GB10, GPU otherwise idle — in one
+/// process, with the hand lanes and a plain-BF16 control on the same tuned
+/// strategies:
+///
+/// ```text
+///   lane                              ms      over its own bytes
+///   cubek bf16  double tma mma       9.52     173.1 GB/s  (1.53 GiB)
+///   cubek bf16  simple cyclic mma   18.19      90.5 GB/s  (1.53 GiB)
+///   cubek bf16  auto                17.52      94.0 GB/s  (1.53 GiB)
+///   cubek q4    simple cyclic mma   52.32       8.9 GB/s  (0.43 GiB)
+///   cubek q4    auto                56.83       8.2 GB/s  (0.43 GiB)
+///   cubek q4    double cyclic mma   91.17       5.1 GB/s  (0.43 GiB)
+///   cubek q4    double tma mma      DECLINED: "TMA doesn't support dequantizing on global read"
+///   hand w4a16_linear                4.70      98.5 GB/s  (0.43 GiB)
+///   hand fp4_linear                  4.70      98.5 GB/s  (0.43 GiB)
+///   coalesced read, no math          2.72     170.4 GB/s  (0.43 GiB)
+/// ```
+///
+/// Three things fall out and they compound.
+///
+/// 1. **The tuned lane's 173 GB/s is TMA's**, not the tiling's. The best
+///    non-TMA lane on the SAME BF16 weight is 90.5 GB/s — below what the hand
+///    four-bit kernel already reaches.
+/// 2. **A quantised operand disqualifies TMA**, by an explicit rejection in
+///    `cubek`'s loader validation. So the 173 GB/s lane is unreachable with a
+///    four-bit weight, by construction, not by tuning.
+/// 3. **The dequantising read costs a further 2.9x in wall time** for a quarter
+///    of the bytes: 52.3 ms against the BF16 sync lane's 18.2 on the same
+///    strategy and shape. `cubek`'s own comment says why — it forces the RHS
+///    vector size to 1 because "the large vector size resulting from
+///    dequantizing ends up slower", which is a correctness patch, not a tuning.
+///
+/// So the honest reading of "163 GB/s BF16 against 74 GB/s four-bit" is not
+/// that the hand kernels are leaving half the bandwidth on the floor to a lane
+/// they could borrow. The hand four-bit head is **2.0x faster in wall time than
+/// the tuned BF16 head** (4.70 ms against 9.52) and **11x faster than the best
+/// tuned lane that will take its operand**. What it is leaving is the 1.7x
+/// between its ~100 GB/s and the 170 GB/s a coalesced read of the same table
+/// reaches — and that needs a staged, coalesced four-bit kernel written here,
+/// with TMA and shared memory, not a `cubek` strategy.
+///
+/// Kept, not deleted, because "the tuned path is closed and here is the
+/// measurement" is the expensive half of that finding.
+///
+/// `scale2` is applied by the caller, as it is on the hand lanes.
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+pub fn try_w4a16_linear_cubek_launch<R: Runtime>(
+    client: &ComputeClient<R>,
+    a: &Handle,
+    b: &Handle,
+    b_sc: &Handle,
+    m_pad: usize,
+    k: usize,
+    n: usize,
+    lane: Lane,
+) -> Result<Handle, cubek::matmul::definition::MatmulSetupError> {
+    use cubecl::ir::{ElemType, FloatKind, StorageType, UIntKind};
+    use cubecl::quant::scheme::{
+        QuantLevel, QuantMode, QuantParam, QuantScheme, QuantStore, QuantValue,
+    };
+    use cubek::matmul::definition::{MatmulElems, MatmulGlobalElems};
+    use cubek::std::InputBinding;
+
+    let bf = StorageType::Scalar(ElemType::Float(FloatKind::BF16));
+    let f32s = StorageType::Scalar(ElemType::Float(FloatKind::F32));
+
+    let out = client.empty(m_pad * n * core::mem::size_of::<f32>());
+
+    let scheme = QuantScheme::default()
+        .with_value(QuantValue::E2M1)
+        .with_param(QuantParam::UE4M3)
+        .with_store(QuantStore::PackedU32(1))
+        .with_level(QuantLevel::block([16u8, 1u8]))
+        .with_mode(QuantMode::Symmetric);
+
+    let lhs = InputBinding::new(binding::<R>(a, [m_pad, k], [k, 1]), bf);
+    let rhs = InputBinding::Quantized {
+        data: binding::<R>(b, [k / 8, n], [1, k / 8]),
+        data_dtype: StorageType::Scalar(ElemType::UInt(UIntKind::U32)),
+        scale: binding::<R>(b_sc, [k / 16, n], [1, k / 16]),
+        scale_dtype: StorageType::Scalar(ElemType::Float(FloatKind::E4M3)),
+        shape: [k, n].into(),
+        scheme,
+    };
+    let outb = binding::<R>(&out, [m_pad, n], [n, 1]);
+
+    let mut dtypes = MatmulElems::from_globals(&MatmulGlobalElems {
+        lhs: bf,
+        rhs: bf,
+        out: f32s,
+    });
+    cubek::matmul::launch::launch_ref::<R>(&lane.strategy(), client, lhs, rhs, outb, &mut dtypes)?;
+    Ok(out)
+}
