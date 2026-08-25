@@ -431,14 +431,24 @@
 //! `num_nextn_predict_layers`, `chain_hidden_post_norm` and `local_layer_ids`.
 //! The default was right; it was right on a guess, and now it is measured.
 //!
-//! Three more readings, priced the same way on the same corpus:
+Every other reading of the wrapper, priced the same way on the same corpus
+//! (depth 1, 2048 positions each):
 //!
-//!     backbone embed_norm ON        0.2266     the 2026-08-24 fix, confirmed
-//!     backbone embed_norm OFF       0.1675     -26%, so the fix is real
-//!     entry final-normed            0.2266
-//!     entry RAW (INK_MTP_RAW=1)     0.2310     INDISTINGUISHABLE
+//!     THE DEFAULT                   0.2266
+//!     concat embed-first            0.0010     226x worse -- settled
+//!     swap the two norms            0.1650     -27%, so the NAMES are right
+//!     backbone embed_norm OFF       0.1675     -26%, so the 08-24 fix is real
+//!     entry RAW (INK_MTP_RAW=1)     0.2310     indistinguishable
+//!     no output norm (OUTNORM=0)    0.2329     indistinguishable
 //!     ablate the hidden operand     0.0869     both operands carry the rate
 //!     ablate the embed operand      0.0347
+//!
+//! Which is the whole space of readings this wrapper has: which operand goes in
+//! which half of `input_proj`, which gain norms which operand, whether the
+//! backbone's embed norm precedes the depth head's, whether the entry and the
+//! output take the final norm, and whether either operand matters at all. The
+//! default wins or ties every one of them. **The composition is not the reason
+//! acceptance is what it is.**
 //!
 //! The entry row corrects this file. The comment on `entry` says feeding the
 //! final-normed hidden "measured twice as well (25% -> 50% on a matched
