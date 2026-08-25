@@ -2205,7 +2205,34 @@ fn mtp_embed_row(
     }
 }
 
+/// Which operand of the MTP wrapper to ZERO, for the ablation that says whether
+/// a head is using it at all.
+///
+/// The teacher-forced rate came out FLAT across depths -- 0.227, 0.193, 0.209,
+/// 0.232 for depths 1..4 on a document -- and flat is the shape of a predictor
+/// whose accuracy does not depend on how far ahead it is asked to see. A head
+/// reading its hidden state cannot behave that way; a head reading only the
+/// embedding it was handed can, because "the token after this token" is the
+/// same task at every depth. So: zero one operand and see which one the rate
+/// was living on. `INK_MTP_ABLATE=hidden` or `=embed`.
+fn mtp_ablate() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static A: OnceLock<Option<String>> = OnceLock::new();
+    A.get_or_init(|| std::env::var("INK_MTP_ABLATE").ok())
+        .as_deref()
+        .map(|v| match v {
+            "hidden" => "hidden",
+            "embed" => "embed",
+            other => panic!("INK_MTP_ABLATE wants hidden|embed, got {other:?}"),
+        })
+}
+
 fn mtp_input_dev(hidden: T2, embeds: T2, w: &MtpDev, eps: f64, order: MtpConcat) -> T2 {
+    let (hidden, embeds) = match mtp_ablate() {
+        Some("hidden") => (hidden.zeros_like(), embeds),
+        Some("embed") => (hidden, embeds.zeros_like()),
+        _ => (hidden, embeds),
+    };
     let hn = dev_lane::rms_norm(hidden, w.hidden_norm.clone(), eps);
     let en = dev_lane::rms_norm(embeds, w.embed_norm.clone(), eps);
     let cat = match order {
@@ -7963,6 +7990,46 @@ fn main() -> Result<()> {
                             mtp_order,
                         );
                         mtp_dev_caches[d] = Some(c);
+                        if teach && d == 0 {
+                            // The CEILING, and the number every depth below is
+                            // meaningless without: the main stack's own
+                            // teacher-forced next-token accuracy on these same
+                            // rows. A draft head at 0.227 is a catastrophe against
+                            // a stack at 0.9 and unremarkable against a stack at
+                            // 0.3, and nothing in a per-depth table says which.
+                            let last = seq.saturating_sub(1);
+                            let mut hits = 0usize;
+                            let mut scored = 0usize;
+                            let nblk = (last / 256).max(1);
+                            let take = nblk.min(8);
+                            for b in 0..take {
+                                let lo = if take == 1 {
+                                    0
+                                } else {
+                                    (b * (nblk - 1) / (take - 1).max(1)) * 256
+                                };
+                                let hi = (lo + 256).min(last);
+                                if hi <= lo {
+                                    continue;
+                                }
+                                let picks = teach_rows(main_dev.clone().slice([lo..hi, 0..h]));
+                                for (i, &pick) in picks.iter().enumerate() {
+                                    if pick == ids[lo + i + 1] {
+                                        hits += 1;
+                                    }
+                                    scored += 1;
+                                }
+                            }
+                            let (clo, chi) = wilson95(hits, scored);
+                            println!(
+                                "  MTP TEACH depth 0 (THE MAIN STACK): {hits}/{scored} = {:.4} \
+                                 (95% CI {:.4}-{:.4}) -- the same rows, the same unembedding, \
+                                 argmax against the token the prompt actually has next",
+                                hits as f64 / scored.max(1) as f64,
+                                clo,
+                                chi,
+                            );
+                        }
                         if teach {
                             // Row `j` predicts `ids[j + d + 2]`, so the last row
                             // with an answer in the prompt is `seq - d - 3`.
