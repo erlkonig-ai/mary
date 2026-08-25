@@ -859,8 +859,11 @@ mod tests {
         // Rows that do not fill four planes: three of them would idle and the
         // fourth would own rows that do not exist.
         assert!(!applies(32, 8, 128, 6));
-        // Rows that do not split into head groups.
-        assert!(!applies(32, 8, 128, 12));
+        // Rows that do not split into head groups. At 32/8 every multiple of
+        // the planes is also a multiple of `groups`, so this needs a geometry
+        // where the two do not divide each other: 24 heads over 4 KV heads is
+        // `groups = 6`, and a four-row cube cannot hold whole groups of six.
+        assert!(!applies(24, 4, 128, 4));
         // Heads that do not divide into KV heads: `h / groups` would alias.
         assert!(!applies(32, 7, 128, 32));
         // A head_dim whose tile does not fit the 48 KiB a static `__shared__`
