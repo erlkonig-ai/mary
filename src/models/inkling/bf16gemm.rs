@@ -1475,6 +1475,53 @@ pub fn bf16_gemm<R: Runtime>(
 /// The nibble order matches: `e2m1x2`'s low nibble is the lowest index, which
 /// is [`super::nvfp4`]'s convention and the checkpoint's.
 ///
+/// ## What it measures, which is why nothing calls it
+///
+/// At the head's own shape — `m_pad = 16`, `k = 4096`, `n = 201024`, min of
+/// four warm launches, launch + sync, GB10, GPU otherwise idle — in one
+/// process, with the hand lanes and a plain-BF16 control on the same tuned
+/// strategies:
+///
+/// ```text
+///   lane                              ms      over its own bytes
+///   cubek bf16  double tma mma       9.52     173.1 GB/s  (1.53 GiB)
+///   cubek bf16  simple cyclic mma   18.19      90.5 GB/s  (1.53 GiB)
+///   cubek bf16  auto                17.52      94.0 GB/s  (1.53 GiB)
+///   cubek q4    simple cyclic mma   52.32       8.9 GB/s  (0.43 GiB)
+///   cubek q4    auto                56.83       8.2 GB/s  (0.43 GiB)
+///   cubek q4    double cyclic mma   91.17       5.1 GB/s  (0.43 GiB)
+///   cubek q4    double tma mma      DECLINED: "TMA doesn't support dequantizing on global read"
+///   hand w4a16_linear                4.70      98.5 GB/s  (0.43 GiB)
+///   hand fp4_linear                  4.70      98.5 GB/s  (0.43 GiB)
+///   coalesced read, no math          2.72     170.4 GB/s  (0.43 GiB)
+/// ```
+///
+/// Three things fall out and they compound.
+///
+/// 1. **The tuned lane's 173 GB/s is TMA's**, not the tiling's. The best
+///    non-TMA lane on the SAME BF16 weight is 90.5 GB/s — below what the hand
+///    four-bit kernel already reaches.
+/// 2. **A quantised operand disqualifies TMA**, by an explicit rejection in
+///    `cubek`'s loader validation. So the 173 GB/s lane is unreachable with a
+///    four-bit weight, by construction, not by tuning.
+/// 3. **The dequantising read costs a further 2.9x in wall time** for a quarter
+///    of the bytes: 52.3 ms against the BF16 sync lane's 18.2 on the same
+///    strategy and shape. `cubek`'s own comment says why — it forces the RHS
+///    vector size to 1 because "the large vector size resulting from
+///    dequantizing ends up slower", which is a correctness patch, not a tuning.
+///
+/// So the honest reading of "163 GB/s BF16 against 74 GB/s four-bit" is not
+/// that the hand kernels are leaving half the bandwidth on the floor to a lane
+/// they could borrow. The hand four-bit head is **2.0x faster in wall time than
+/// the tuned BF16 head** (4.70 ms against 9.52) and **11x faster than the best
+/// tuned lane that will take its operand**. What it is leaving is the 1.7x
+/// between its ~100 GB/s and the 170 GB/s a coalesced read of the same table
+/// reaches — and that needs a staged, coalesced four-bit kernel written here,
+/// with TMA and shared memory, not a `cubek` strategy.
+///
+/// Kept, not deleted, because "the tuned path is closed and here is the
+/// measurement" is the expensive half of that finding.
+///
 /// `scale2` is applied by the caller, as it is on the hand lanes.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
