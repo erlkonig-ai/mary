@@ -1094,3 +1094,226 @@ pub fn verify_report() -> Option<String> {
         seen as f64 / n as f64,
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::inkling::fp4quant::quantize_nvfp4_bf16;
+    use crate::models::inkling::w4a16gemm::w4a16_linear_launch;
+    use half::bf16;
+
+    type Rt = cubecl::cuda::CudaRuntime;
+
+    /// The total-order embedding and its host inverse, on the values that break
+    /// a naive one: both zeros, both infinities, and a sign change.
+    ///
+    /// A pure host test because it is pure host arithmetic, and because getting
+    /// it wrong is silent — the device read the ordered word as a float for one
+    /// revision, and every number the lane produced stayed plausible while the
+    /// shortlist was quietly the entire vocabulary.
+    #[test]
+    fn the_ordered_embedding_round_trips_and_orders() {
+        let vals = [
+            f32::NEG_INFINITY,
+            -3.0e38,
+            -1.0,
+            -f32::MIN_POSITIVE,
+            -0.0,
+            0.0,
+            f32::MIN_POSITIVE,
+            1.0,
+            3.0e38,
+            f32::INFINITY,
+        ];
+        let mut last = 0u32;
+        for (i, v) in vals.iter().enumerate() {
+            let o = ordered_host(*v);
+            assert_eq!(from_ordered(o), *v, "{v} did not survive the round trip");
+            if i > 0 {
+                assert!(o >= last, "the embedding is not monotone at {v}");
+            }
+            last = o;
+        }
+    }
+
+    /// The host twin of the device [`to_ordered`], for the test above only.
+    ///
+    /// Written out rather than shared with the kernel because a `#[cube]`
+    /// function is not callable from host code, and a test that re-derived the
+    /// mapping from the inverse would agree with itself no matter what either
+    /// one said.
+    fn ordered_host(v: f32) -> u32 {
+        let b = v.to_bits();
+        if b >= 0x8000_0000 {
+            !b
+        } else {
+            b ^ 0x8000_0000
+        }
+    }
+
+    /// Deterministic pseudo-data, the same shape the neighbouring lane tests use.
+    fn fill(n: usize, seed: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| ((i as f32 * seed).sin() * 0.5 + (i as f32 * 0.013).cos() * 0.5) * 0.05)
+            .collect()
+    }
+
+    /// The whole lane against the exact one, on the same NVFP4 bytes.
+    ///
+    /// The assertion is on the ARGMAX and on the winner's score, not on the row:
+    /// the row is a blend by construction and asserting on the estimates would
+    /// be asserting that the approximation does not approximate. What must hold
+    /// is that the token the head picks is the token the exact head picks, and
+    /// that the score it picked it by is the exact one — a rescore that quietly
+    /// returned its estimate would pass an argmax check on easy queries and fail
+    /// this.
+    ///
+    /// `budget` is the full table here. That is deliberate: this test is a
+    /// WIRING detector — a wrong bit order, a wrong `alpha`, a rotation applied
+    /// to one side only — and a shortlist that happened to be big enough would
+    /// let a wiring fault through on a lucky query. Recall as a function of
+    /// budget is measured in `inkling_ann_gate` and on real prompts under
+    /// `INK_ANN_VERIFY`, where it belongs.
+    #[test]
+    fn the_ann_head_picks_the_exact_head_s_token() {
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let probe: burn::tensor::Tensor<crate::models::inkling::seam::Bk, 2> =
+            burn::tensor::Tensor::from_data(
+                burn::tensor::TensorData::new(vec![0f32], [1, 1]),
+                &dev,
+            );
+        let client = crate::models::inkling::seam::client_of(&probe);
+
+        let (n, k) = (1024usize, 512usize);
+        let wf = fill(n * k, 0.17);
+        let mut bytes = Vec::with_capacity(n * k * 2);
+        for x in &wf {
+            bytes.extend_from_slice(&bf16::from_f32(*x).to_le_bytes());
+        }
+        let src = client.create_from_slice(&bytes);
+        let (codes, scales) = quantize_nvfp4_bf16(&client, &src, n, k);
+
+        for rotated in [true, false] {
+            let sk = build_sketch(&client, &codes, &scales, n, k, 1.0, 0x51E7, rotated);
+            assert_eq!(sk.live_rows, n, "no row of this table is zero");
+
+            for (qi, seed) in [0.31f32, 0.71, 1.13].iter().enumerate() {
+                let qf = fill(k, *seed);
+                let qb: Vec<bf16> = qf.iter().map(|v| bf16::from_f32(*v)).collect();
+                let mut pad = vec![bf16::ZERO; 16 * k];
+                pad[..k].copy_from_slice(&qb);
+                let ah = client.create_from_slice(bf16::as_bytes(&pad));
+                let qh = client.create_from_slice(bf16::as_bytes(&qb));
+
+                let ex = w4a16_linear_launch::<Rt>(&client, &ah, &codes, &scales, 16, k, n, 1.0);
+                let exr = client.read_one_unchecked(ex);
+                let exact: &[f32] = f32::from_bytes(&exr);
+
+                let (ap, stat) =
+                    ann_logits::<Rt, bf16>(&client, &sk, &codes, &scales, &qh, 1.0, n, 1.0e9);
+                let apr = client.read_one_unchecked(ap);
+                let approx: &[f32] = f32::from_bytes(&apr);
+
+                assert_eq!(
+                    stat.shortlist,
+                    n,
+                    "an all-inclusive floor left {} of {n} rows out",
+                    n - stat.shortlist
+                );
+                let best = (0..n)
+                    .max_by(|a, b| exact[*a].total_cmp(&exact[*b]))
+                    .unwrap();
+                let abest = (0..n)
+                    .max_by(|a, b| approx[*a].total_cmp(&approx[*b]))
+                    .unwrap();
+                assert_eq!(
+                    abest, best,
+                    "query {qi} (rotated={rotated}): the aNN head picked {abest} \
+                     ({}) where the exact head picked {best} ({})",
+                    approx[abest], exact[best]
+                );
+                // The rescore reduces in a different order than the MMA does, so
+                // this is a closeness bound and not an equality — but it is
+                // TIGHT, because the two are the same arithmetic on the same
+                // four bits and nothing but the summation order differs.
+                let rel = (exact[best] - approx[best]).abs() / exact[best].abs().max(1e-6);
+                assert!(
+                    rel < 1e-3,
+                    "query {qi} (rotated={rotated}): the rescore returned {} where the \
+                     exact lane says {} (rel {rel:.2e}) -- that is not a reduction-order \
+                     difference, it is a different computation",
+                    approx[best],
+                    exact[best]
+                );
+            }
+        }
+    }
+
+    /// The rotation preserves length, which is what makes `alpha` mean anything.
+    ///
+    /// `H` is `sqrt(k)` times orthogonal and the kernel divides by `sqrt(k)` to
+    /// fix that. Drop the division and every logit is scaled by 64 at
+    /// `k = 4096`: invisible in an argmax, and a silent 64x temperature change
+    /// in anything that reads the row. So the invariant is asserted rather than
+    /// asserted-about-in-a-comment.
+    #[test]
+    fn the_rotation_preserves_length() {
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let probe: burn::tensor::Tensor<crate::models::inkling::seam::Bk, 2> =
+            burn::tensor::Tensor::from_data(
+                burn::tensor::TensorData::new(vec![0f32], [1, 1]),
+                &dev,
+            );
+        let client = crate::models::inkling::seam::client_of(&probe);
+
+        let k = 512usize;
+        // One row of zeros would make `build_sketch` report a dead row; the
+        // sketch is not what this test is about, so the table is minimal and
+        // only the rotation handle it produces is used.
+        let bytes = vec![0u8; 8 * k * 2];
+        let src = client.create_from_slice(&bytes);
+        let (codes, scales) = quantize_nvfp4_bf16(&client, &src, 8, k);
+        let sk = build_sketch(&client, &codes, &scales, 8, k, 1.0, 0x9271, true);
+
+        let qf = fill(k, 0.41);
+        let before: f32 = qf.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let qh = client.create_from_slice(f32::as_bytes(&qf));
+        let out = client.empty(k * core::mem::size_of::<f32>());
+        unsafe {
+            rotate_query_kernel::launch_unchecked::<f32, Rt>(
+                &client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_1d(BUILD_UNITS),
+                ArrayArg::from_raw_parts(qh, k),
+                ArrayArg::from_raw_parts(sk.dsign.clone(), k),
+                ArrayArg::from_raw_parts(out.clone(), k),
+                1.0f32 / (k as f32).sqrt(),
+                k as u32,
+                k as u32,
+                BUILD_UNITS,
+            )
+        };
+        let raw = client.read_one_unchecked(out);
+        let rot: &[f32] = f32::from_bytes(&raw);
+        let after: f32 = rot.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let rel = (after - before).abs() / before;
+        assert!(
+            rel < 1e-4,
+            "the rotation changed the query's length by {rel:.2e} ({before} -> {after}); \
+             it is supposed to be orthogonal"
+        );
+        // And it must actually MOVE the vector -- an identity would preserve
+        // length too, and is what a rotation with no butterfly stages is.
+        let moved: f32 = rot
+            .iter()
+            .zip(&qf)
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum::<f32>()
+            .sqrt()
+            / before;
+        assert!(
+            moved > 0.1,
+            "the rotation moved the query by {moved:.2e} of its length; it did not run"
+        );
+    }
+}
