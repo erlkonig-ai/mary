@@ -4842,3 +4842,53 @@ mod tests {
         );
     }
 }
+
+/// `x @ w^T` for ONE row, by approximate maximum-inner-product search.
+///
+/// The exact twin is [`linear_w4a16`] and the contract is deliberately the
+/// same: a `[1, w.n]` f32 tensor, no `-inf` anywhere, ready for the host argmax
+/// and the top-5 report that already read it. What differs is that only the
+/// shortlist carries an exact score; see [`crate::models::inkling::annhead`].
+///
+/// `m > 1` is a caller error rather than a fallback here, because the caller is
+/// the one that knows whether the exact lane is available and this function
+/// silently doing something else at verify width is exactly the class of
+/// mistake this repo keeps finding.
+pub fn linear_ann(
+    x: Tensor<Bk, 2>,
+    w: &PackedW,
+    sketch: &crate::models::inkling::annhead::Sketch,
+    budget: usize,
+    range: f32,
+) -> (Tensor<Bk, 2>, crate::models::inkling::annhead::AnnStat) {
+    use crate::models::inkling::annhead::ann_logits;
+    let [m, k] = x.dims();
+    assert_eq!(m, 1, "linear_ann scans one query row, not {m}");
+    assert_eq!(
+        k, w.k,
+        "linear_ann: x is [_, {k}] but the weight is [_, {}]",
+        w.k
+    );
+    assert_eq!(
+        (sketch.n, sketch.k),
+        (w.n, w.k),
+        "the sketch is [{}, {}] and the weight is [{}, {}]",
+        sketch.n,
+        sketch.k,
+        w.n,
+        w.k
+    );
+    let client = client_of(&x);
+    let dev = x.device();
+    let (xh, xdt) = crate::models::inkling::seam::handle_of_any(x);
+    let (out, stat) = match xdt {
+        burn::tensor::DType::BF16 => ann_logits::<_, half::bf16>(
+            &client, sketch, &w.codes, &w.scales, &xh, w.scale2, budget, range,
+        ),
+        burn::tensor::DType::F32 => ann_logits::<_, f32>(
+            &client, sketch, &w.codes, &w.scales, &xh, w.scale2, budget, range,
+        ),
+        other => panic!("linear_ann: no lane for a {other:?} activation"),
+    };
+    (tensor_of(client, dev, out, 1, w.n), stat)
+}

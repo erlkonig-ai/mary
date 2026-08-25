@@ -322,7 +322,7 @@ fn quantize_nvfp4_as<E: Scalar + Cast, R: Runtime>(
 /// device memory is an indexed load per element. Sign last, so a code that
 /// rounded to magnitude zero comes back as `-0.0` exactly as it was stored.
 #[cube]
-fn e2m1_value(code: u32) -> f32 {
+pub(crate) fn e2m1_value(code: u32) -> f32 {
     let a = f32::cast_from(code & 7);
     let mut m = f32::new(0.0f32);
     if a >= 0.5 {
