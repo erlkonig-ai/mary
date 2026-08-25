@@ -425,6 +425,12 @@ required-features = ["inkling-cuda"]
 name = "mma16_lane_dump"
 required-features = ["inkling-cuda"]
 
+# Does the m16n8k16 B permutation buy anything, and on which plane? Interleaved
+# arms against a coalesced ceiling, in one process. No model load.
+[[bin]]
+name = "w4a16_swz_probe"
+required-features = ["inkling-cuda"]
+
 # Read bandwidth for device-allocated vs host-mapped memory, on a working set
 # far larger than L2. Any figure above this part's ~273 GB/s bus is a cache
 # measurement, which is how a 992 GB/s number got into circulation.
