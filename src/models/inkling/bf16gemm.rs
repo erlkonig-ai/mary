@@ -1150,7 +1150,18 @@ pub fn tuned_lane<R: Runtime>(
 
     let mut samples: Vec<Vec<f64>> = vec![Vec::new(); cands.len()];
     for round in 0..rounds {
-        for (slot, &lane) in cands.iter().enumerate() {
+        // ROTATE the starting candidate every round. Round-robin alone still
+        // pins each lane to a fixed POSITION, and position is not neutral: this
+        // part idles at 208 MHz and ramps, so whoever is timed first in a round
+        // is timed at a lower clock than whoever is timed last. The static head
+        // heads the list, so it was always in that seat -- and the first run of
+        // `inkling_gemm_autotune_gate` duly reported it losing 12 of 15
+        // shape/width pairs, which is exactly what a position bias looks like
+        // when the list has a fixed head. Rotating makes position common-mode
+        // the same way round-robin makes cache state common-mode.
+        for step in 0..cands.len() {
+            let slot = (step + round) % cands.len();
+            let lane = cands[slot];
             let t0 = std::time::Instant::now();
             for _ in 0..iters {
                 let h = launch_lane(client, a, b, m, k, n, lane);
