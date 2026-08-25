@@ -2512,9 +2512,48 @@ mod tests {
     type B = burn::backend::Cuda<f32>;
 
     /// How far the cached lane may differ from the uncached one on a GLOBAL
-    /// layer, where both sides build their scores with the same Burn matmul and
-    /// the only difference is the order of the additions.
-    const CACHE_TOLERANCE_GLOBAL: f32 = 2e-5;
+    /// layer.
+    ///
+    /// This was 2e-5 until 2026-08-25, on the premise that "both sides build
+    /// their scores with the same Burn matmul and the only difference is the
+    /// order of the additions". That premise is false, and nothing enforces
+    /// it. Burn's matmul is AUTOTUNED PER SHAPE, and the two lanes are not the
+    /// same shape: the cached side multiplies `[kv_heads, groups, head_dim]`
+    /// against the retained keys, the uncached side `[heads, tokens,
+    /// head_dim]` over the whole square. Different shape, different autotune
+    /// entry, different winning kernel, different accumulation order. 2e-5
+    /// held only while the two entries happened to name kernels whose TF32
+    /// error cancelled -- and WHICH kernel wins is decided by a timing
+    /// measurement cached under `target/autotune/`, which is per worktree and
+    /// different in each. That is why these tests passed in one checkout and
+    /// failed in another with identical source: 58 of the 64 matmul shapes two
+    /// such caches shared named a different winner.
+    ///
+    /// The size is not a guess, and it is not the drift. It is what the
+    /// UNCACHED lane -- the side this comparison treats as ground truth -- is
+    /// itself worth. [`the_cache_algorithm_is_right_on_the_host`] measures both
+    /// device lanes against the host transcription in
+    /// [`crate::models::inkling::attn`], which shares no kernel, no matmul and
+    /// no accumulation order with either: the uncached lane is 1.15e-2 away
+    /// from it and the cached lane 1.19e-2. Neither is the accurate one, and
+    /// their mutual disagreement of 1.43e-2 is two comparably-wrong numbers
+    /// landing on opposite sides. Measured 2026-08-25 on the GB10, `cargo test
+    /// --release --lib --features inkling-cuda`, global layer, 11 tokens,
+    /// prefill 4, `rel_extent` 5, log scaling on -- identical to the last digit
+    /// over five independent from-empty autotune states.
+    ///
+    /// So this is now [`CACHE_TOLERANCE_LOCAL`]'s number for
+    /// [`CACHE_TOLERANCE_LOCAL`]'s reason -- TF32 through a softmax on these
+    /// deliberately small synthetic weights -- and the global/local distinction
+    /// it used to encode does not survive contact with an autotuned matmul.
+    ///
+    /// What these tests exist to catch is untouched:
+    /// [`dropping_the_conv_history_is_caught`] moves the answer by 1.156,
+    /// twenty-three times this bound. And the exact equivalence the 2e-5 was
+    /// reaching for is not given up, it moved somewhere it can actually be
+    /// asserted -- [`the_cache_algorithm_is_right_on_the_host`], where it holds
+    /// to the last bit and no kernel choice can reach it.
+    const CACHE_TOLERANCE_GLOBAL: f32 = 5e-2;
 
     /// The same for a LOCAL layer, where the two sides no longer share an
     /// implementation.
@@ -3021,9 +3060,15 @@ mod tests {
     /// sequence -- an off-by-one in the last, short block reads the same as a
     /// correct one when the blocks are even.
     ///
-    /// Both arms are the same kernels on the same weights, so the tolerance is
-    /// the tight one and not the cross-implementation `CACHE_TOLERANCE_LOCAL`:
-    /// only the matmul tiling differs, and TF32 accumulation order with it.
+    /// Both arms are the same weights through the same lane, and the tolerance
+    /// is still [`CACHE_TOLERANCE_GLOBAL`] rather than something tighter,
+    /// because "only the matmul tiling differs" is not the small statement it
+    /// reads as. The query block IS the `m` of the score matmul, so each block
+    /// size draws its own autotune entry and can win a different kernel from
+    /// the unblocked arm; TF32 accumulation order goes with it. This test held
+    /// at 2e-5 in one worktree and failed at 3.9e-2 in another, on the same
+    /// binary and the same second -- the whole of that difference was the two
+    /// `target/autotune/` caches disagreeing about which kernel is fastest.
     #[test]
     fn query_blocks_agree_with_one_block() {
         let dev = burn::backend::cuda::CudaDevice::default();
@@ -3068,7 +3113,7 @@ mod tests {
                         .map(|(a, b)| (a - b).abs())
                         .fold(0f32, f32::max);
                     assert!(
-                        worst < 2e-5,
+                        worst < CACHE_TOLERANCE_GLOBAL,
                         "{kind:?}, {tokens} tokens, block {block}: worst {worst:e}"
                     );
                 }
@@ -3137,195 +3182,8 @@ mod tests {
         );
     }
 
-    /// DIAGNOSTIC, not a gate. Decomposes the cached-vs-uncached drift so the
-    /// question "arithmetic or defect" can be answered from numbers rather
-    /// than from reading. Prints the ABSOLUTE worst, the magnitude of the
-    /// answer it is worst against, and the per-position series -- a defect in
-    /// the cache is structured in `pos`, accumulated rounding is not.
-    #[test]
-    fn diag_global_drift_decomposition() {
-        let _lane = CacheLane::wide();
-        let dev = burn::backend::cuda::CudaDevice::default();
-        let lson = Some(LogScaling {
-            n_floor: 4.0,
-            alpha: 0.5,
-        });
-        for (label, kind, rel_extent, window, ls, tokens, prefill) in [
-            (
-                "G re=16 ls=off pf=4 ",
-                AttnKind::Global,
-                16usize,
-                None::<usize>,
-                None,
-                11usize,
-                4usize,
-            ),
-            (
-                "G re=16 ls=on  pf=4 ",
-                AttnKind::Global,
-                16,
-                None,
-                lson,
-                11,
-                4,
-            ),
-            (
-                "G re=5  ls=off pf=4 ",
-                AttnKind::Global,
-                5,
-                None,
-                None,
-                11,
-                4,
-            ),
-            (
-                "G re=5  ls=on  pf=4 ",
-                AttnKind::Global,
-                5,
-                None,
-                lson,
-                11,
-                4,
-            ),
-            (
-                "G re=5  ls=on  pf=10",
-                AttnKind::Global,
-                5,
-                None,
-                lson,
-                11,
-                10,
-            ),
-            (
-                "G re=16 ls=off pf=10",
-                AttnKind::Global,
-                16,
-                None,
-                None,
-                11,
-                10,
-            ),
-            (
-                "G re=16 ls=off pf=1 ",
-                AttnKind::Global,
-                16,
-                None,
-                None,
-                11,
-                1,
-            ),
-            (
-                "G re=64 ls=off pf=4 t=40",
-                AttnKind::Global,
-                64,
-                None,
-                None,
-                40,
-                4,
-            ),
-            (
-                "L re=5  win=5  pf=4 ",
-                AttnKind::Local,
-                5,
-                Some(5),
-                None,
-                11,
-                4,
-            ),
-        ] {
-            let d = dims(kind, rel_extent);
-            let w = weights(&d, &dev);
-            let xs: Tensor<B, 2> = Tensor::from_data(
-                TensorData::new(fill(tokens * d.hidden, 2.5), [tokens, d.hidden]),
-                &dev,
-            );
-            let full = attention(xs.clone(), &w, &d, ls, window);
-            let head = xs.clone().slice([0..prefill, 0..d.hidden]);
-            let (_, mut cache) = attention_prefill(head, &w, &d, ls, window, window);
-            let mut per = Vec::new();
-            let mut scale = 0f32;
-            for pos in prefill..tokens {
-                let step = attention_step(
-                    xs.clone().slice([pos..pos + 1, 0..d.hidden]),
-                    &w,
-                    &d,
-                    ls,
-                    pos,
-                    window,
-                    &mut cache,
-                );
-                let want = full.clone().slice([pos..pos + 1, 0..d.hidden]);
-                per.push((step - want.clone()).abs().max().into_scalar());
-                scale = scale.max(want.abs().max().into_scalar());
-            }
-            let worst = per.iter().cloned().fold(0f32, f32::max);
-            println!(
-                "{label} worst {worst:e} scale {scale:e} rel {:e} per-pos {per:?}",
-                worst / scale
-            );
-        }
-    }
-
-    /// DIAGNOSTIC, not a gate. Isolates the GQA regrouping as the cause.
-    ///
-    /// `b3cd5e5` made the CACHED score product a `[kv_heads, groups, head_dim]`
-    /// batched matmul while the UNCACHED lane still expands to
-    /// `[heads, tokens, head_dim]`. If that shape divergence is what the drift
-    /// is, then at `groups == 1` the regroup is a no-op and the two sides go
-    /// back to agreeing: `kv_heads == heads` is the control, and the only thing
-    /// it changes is whether the regroup does anything.
-    #[test]
-    fn diag_gqa_groups_isolation() {
-        let _lane = CacheLane::wide();
-        let dev = burn::backend::cuda::CudaDevice::default();
-        for kv_heads in [2usize, 4] {
-            let d = AttnDims {
-                hidden: 16,
-                heads: 4,
-                kv_heads,
-                head_dim: 4,
-                d_rel: 4,
-                rel_extent: 16,
-                kernel: 4,
-                rms_eps: 1e-6,
-                kind: AttnKind::Global,
-            };
-            let w = weights(&d, &dev);
-            let (tokens, prefill) = (11usize, 4usize);
-            let xs: Tensor<B, 2> = Tensor::from_data(
-                TensorData::new(fill(tokens * d.hidden, 2.5), [tokens, d.hidden]),
-                &dev,
-            );
-            let full = attention(xs.clone(), &w, &d, None, None);
-            let head = xs.clone().slice([0..prefill, 0..d.hidden]);
-            let (_, mut cache) = attention_prefill(head, &w, &d, None, None, None);
-            let mut per = Vec::new();
-            let mut scale = 0f32;
-            for pos in prefill..tokens {
-                let step = attention_step(
-                    xs.clone().slice([pos..pos + 1, 0..d.hidden]),
-                    &w,
-                    &d,
-                    None,
-                    pos,
-                    None,
-                    &mut cache,
-                );
-                let want = full.clone().slice([pos..pos + 1, 0..d.hidden]);
-                per.push((step - want.clone()).abs().max().into_scalar());
-                scale = scale.max(want.abs().max().into_scalar());
-            }
-            let worst = per.iter().cloned().fold(0f32, f32::max);
-            println!(
-                "groups={} (heads=4 kv_heads={kv_heads}) worst {worst:e} scale {scale:e} rel {:e} per-pos {per:?}",
-                4 / kv_heads,
-                worst / scale
-            );
-        }
-    }
-
-    /// DIAGNOSTIC, not a gate. The one oracle that can tell an ALGORITHM
-    /// defect from ARITHMETIC: the host transcription in
+    /// The one oracle that can tell an ALGORITHM defect from ARITHMETIC: the
+    /// host transcription in
     /// [`crate::models::inkling::attn`], which shares no kernel, no matmul and
     /// no accumulation order with either device lane.
     ///
@@ -3347,7 +3205,7 @@ mod tests {
     /// that far from the truth and neither is wrong — the 2e-5 is a bound on a
     /// difference that no longer cancels.
     #[test]
-    fn diag_cpu_oracle_splits_algorithm_from_arithmetic() {
+    fn the_cache_algorithm_is_right_on_the_host() {
         use crate::models::inkling::attn as cpu;
         let _lane = CacheLane::wide();
         let dev = burn::backend::cuda::CudaDevice::default();
@@ -3474,6 +3332,18 @@ mod tests {
         }
         println!(
             "WORST  C(host cached, the ALGORITHM)={wc:e}  A(dev uncached)={wa:e}  B(dev cached)={wb:e}"
+        );
+        // The ONLY assertion here, and the only one in this module that an
+        // autotune cache cannot reach. `A` and `B` are printed rather than
+        // gated on purpose: they are properties of the runtime, they are the
+        // evidence behind [`CACHE_TOLERANCE_GLOBAL`], and gating on them would
+        // re-create exactly the bound that has been failing.
+        assert!(
+            wc < 1e-5,
+            "the cached lane's ALGORITHM disagrees with the uncached one by {wc:e} in plain host \
+             f32, where no kernel choice and no autotune cache can explain it. This is the paged \
+             read, the GQA regrouping, the k_pre/v_pre history, tau or the window being WRONG -- \
+             not rounding, and not a tolerance that needs widening."
         );
     }
 
