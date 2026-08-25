@@ -756,13 +756,15 @@ pub fn attention_prefill(
     attention_prefill_lane(x, w, d, log_scaling, mask_window, window, true, None)
 }
 
-/// The same layer with the banded lane REFUSED, so a test can hold the two
+/// The same layer with the FUSED lanes REFUSED, so a test can hold the two
 /// implementations side by side.
 ///
-/// Exists because the only check that catches a band which disagrees with the
-/// dense triangle is one that runs both on the same weights: a banded kernel
-/// checked against a banded reference proves the two share an author, not that
-/// either is right.
+/// Exists because the only check that catches a fused kernel which disagrees
+/// with the dense triangle is one that runs both on the same weights: a banded
+/// kernel checked against a banded reference proves the two share an author,
+/// not that either is right. It refuses BOTH fused lanes — the band on a local
+/// layer and [`super::flash`] on a global one — because both are the same kind
+/// of claim about the same dense arm.
 #[cfg(test)]
 pub(crate) fn attention_prefill_dense(
     x: Tensor<Bk, 2>,
@@ -784,7 +786,7 @@ fn attention_prefill_lane(
     log_scaling: Option<crate::models::inkling::attn::LogScaling>,
     mask_window: Option<usize>,
     window: Option<usize>,
-    banded_ok: bool,
+    fused_ok: bool,
     block: Option<usize>,
 ) -> (Tensor<Bk, 2>, AttnCache<Bk>) {
     use crate::models::inkling::config::AttnKind;
@@ -839,7 +841,7 @@ fn attention_prefill_lane(
         // binding that shadowed them would silently reach the window wherever a
         // projection was meant.
         Some(win)
-            if banded_ok
+            if fused_ok
                 && crate::models::inkling::banded::applies(heads, kv_heads, head_dim, win) =>
         {
             use crate::models::inkling::banded::banded_attention_launch;
@@ -895,6 +897,101 @@ fn attention_prefill_lane(
                 d.scaling(),
             );
             tensor_of(client, dev.clone(), o, tokens, heads * head_dim)
+        }
+        // THE OTHER SEVEN. A global layer reads every key, so there is no band
+        // to exploit -- but there is no need to write the square down either.
+        // [`super::flash`] tiles the key axis and carries the softmax's running
+        // max and sum across the tiles, so the peak working set of a global
+        // layer stops being `[heads, rows, tokens]` and becomes the
+        // relative-bias table for one query block. The GQA expansion goes with
+        // it: a cube holds all `groups` query heads of one KV head, so K and V
+        // are read once for the four heads that share them rather than once
+        // each off a materialised copy.
+        _ if fused_ok
+            && flash_lane()
+            && crate::models::inkling::flash::applies(
+                heads,
+                kv_heads,
+                head_dim,
+                crate::models::inkling::flash::prefill_rows(groups),
+            ) =>
+        {
+            use crate::models::inkling::flash::{
+                self, KeyRun, KvElem, flash_attention_launch, query_block as flash_block,
+            };
+            use crate::models::inkling::seam::{client_of, handle_of, handle_of_any, tensor_of};
+
+            let rows_tile = flash::prefill_rows(groups);
+            let client = client_of(&q);
+            // K and V exactly as the convolutions left them --
+            // `[tokens, kv_heads * head_dim]`, token-major, narrowed to the
+            // operand dtype. No transpose (the kernel stages the key tile
+            // through shared memory instead, which is what lets the decode lane
+            // read the same buffers straight out of the cache) and no repeat
+            // (the kernel indexes `h / groups`).
+            let (k_h, k_dt) = handle_of_any(as_act(k.clone()));
+            let (v_h, _) = handle_of_any(as_act(v.clone()));
+            let kv_elem = match k_dt {
+                burn::tensor::DType::BF16 => KvElem::Bf16,
+                _ => KvElem::F32,
+            };
+            let rel_proj = w.rel_proj.clone().slice([0..d.d_rel, 0..eff]);
+            // The query block is sized by the RELATIVE TABLE now, not by the
+            // score block, because the score block no longer exists. That is
+            // the whole change in one line: what used to be
+            // `rows * heads * tokens` is `rows * heads * eff`, and `eff` is at
+            // most `rel_extent` however long the sequence is.
+            let block = block
+                .unwrap_or_else(|| flash_block(heads, eff, head_dim, tokens))
+                .clamp(1, tokens);
+            let mut parts: Vec<Tensor<Bk, 2>> = Vec::with_capacity(tokens.div_ceil(block));
+            for lo in (0..tokens).step_by(block) {
+                let hi = (lo + block).min(tokens);
+                let rows = hi - lo;
+                let rel = r
+                    .clone()
+                    .slice([lo..hi, 0..heads * d.d_rel])
+                    .reshape([rows * heads, d.d_rel])
+                    .matmul(rel_proj.clone())
+                    .reshape([rows, heads, eff])
+                    * tau.clone().slice([lo..hi]).reshape([rows, 1, 1]);
+                let rel_h = handle_of(rel);
+                let q_h = handle_of(q.clone().slice([lo..hi, 0..heads * head_dim]));
+                let o = flash_attention_launch(
+                    &client,
+                    &q_h,
+                    &[KeyRun {
+                        k: &k_h,
+                        v: &v_h,
+                        rows: tokens,
+                        base: 0,
+                        lo: 0,
+                        hi: tokens,
+                    }],
+                    &rel_h,
+                    kv_elem,
+                    rows,
+                    lo,
+                    heads,
+                    kv_heads,
+                    head_dim,
+                    eff,
+                    mask_window,
+                    d.scaling(),
+                    rows_tile,
+                );
+                parts.push(tensor_of(
+                    client.clone(),
+                    dev.clone(),
+                    o,
+                    rows,
+                    heads * head_dim,
+                ));
+            }
+            match parts.len() {
+                1 => parts.pop().expect("one block"),
+                _ => Tensor::cat(parts, 0),
+            }
         }
         _ => {
             // A global layer reads every key, so there is a square to compute.
@@ -1377,6 +1474,27 @@ impl PagedKv {
 /// the cached lane since the BF16 cache landed, priced there against
 /// `golden/paired/` rather than against a tolerance, and this is the same
 /// arithmetic on the other lane.
+/// Whether the GLOBAL attention layers take the fused lane. **On by default;
+/// `INK_FLASH=0` is the old dense-blocked arm.**
+///
+/// A switch and not a silent replacement, for the reason [`act_bf16`] is one:
+/// the two arms differ in numerics as well as in memory — the fused lane keeps
+/// Q and the scores in f32 where the dense lane narrows them to BF16 for the
+/// matmul — and the only honest way to price that is to run both arms of the
+/// same binary against the same harness. It is also the only way to measure
+/// them at all on this box, where a cross-worktree comparison is meaningless
+/// because cubecl's autotune cache is per working directory.
+///
+/// It is ON rather than OFF because what it changes is not a trade: the dense
+/// arm cannot express a long context at all. It GQA-expands K and V to
+/// `[heads, tokens, head_dim]` before it starts, which is two buffers linear in
+/// the sequence with no knob on them, and then holds `[heads, rows, tokens]`
+/// of scores on top.
+pub fn flash_lane() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INK_FLASH").map(|v| v != "0").unwrap_or(true))
+}
+
 pub fn act_bf16() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -1531,6 +1649,114 @@ pub fn attention_step(
     // one shape, and the padded keys are masked to `-inf` so the softmax gives
     // them exactly zero weight. `INK_KV_PAD=1` is the unpadded arm, which is
     // what this function did before.
+    // THE FUSED LANE, on the layers that have one.
+    //
+    // Everything below this block builds a `[heads, 1, slots]` score row and
+    // walks it five more times — the epilogue's bias and mask, the softmax's
+    // max, its sum, its divide — before `p @ v` reads it a sixth. At 1M tokens
+    // of context that row is 128 MB per global layer and the walking of it is
+    // ~19% of what the layer moves. The fused kernel never writes it: it reads
+    // each page once, keeps the softmax's running max and sum in registers, and
+    // accumulates `p @ v` as it goes. The pages go in AS PAGES, at the dtype
+    // the cache holds them in, so the shape-bucketing this function does below
+    // is not needed either — a fused kernel takes its lengths as scalars and
+    // cubecl does not recompile on a scalar.
+    if flash_lane()
+        && crate::models::inkling::flash::applies(
+            heads,
+            kv_heads,
+            head_dim,
+            crate::models::inkling::flash::decode_rows(groups),
+        )
+    {
+        use crate::models::inkling::flash::{self, KeyRun, KvElem, flash_attention_launch};
+        use crate::models::inkling::seam::{client_of, handle_of, handle_of_any, tensor_of};
+
+        let tau = match (d.kind, log_scaling) {
+            (AttnKind::Global, Some(ls)) => ls.tau(pos),
+            _ => 1.0,
+        };
+        let q = q.mul_scalar(tau);
+        // Only the distances that can occur are worth projecting: the oldest
+        // retained key is `pos - base` back and the table stops at
+        // `rel_extent`. Rounded up to the pad bucket for the same reason the
+        // lane below rounds — this is the width of a matmul, and a width that
+        // moves every step is a kernel compiled every step.
+        let eff = d
+            .rel_extent
+            .min(pos - base + 1)
+            .next_multiple_of(kv_pad_bucket())
+            .min(d.rel_extent);
+        let rel = r
+            .reshape([heads, d.d_rel])
+            .matmul(w.rel_proj.clone().slice([0..d.d_rel, 0..eff]))
+            .reshape([1, heads, eff])
+            .mul_scalar(tau);
+
+        // The pages, whole and in order, at the dtype they are stored in. A
+        // dense store hands over slices of its own buffers; an NVFP4 store
+        // dequantises a page at a time. Either way nothing here rebuilds a
+        // contiguous cache.
+        let head = cache.k.head();
+        let kparts = cache.k.parts(&dev);
+        let vparts = cache.v.parts(&dev);
+        debug_assert_eq!(kparts.len(), vparts.len(), "the two stores drifted apart");
+        let client = client_of(&q);
+        let q_h = handle_of(q);
+        let rel_h = handle_of(rel);
+        let mut held: Vec<(cubecl::server::Handle, cubecl::server::Handle, usize)> =
+            Vec::with_capacity(kparts.len());
+        let mut kv_dt = burn::tensor::DType::F32;
+        for (kp, vp) in kparts.into_iter().zip(vparts) {
+            let rows = kp.dims()[0];
+            let (kh, dt) = handle_of_any(kp);
+            let (vh, _) = handle_of_any(vp);
+            kv_dt = dt;
+            held.push((kh, vh, rows));
+        }
+        // Stored row `off + i` of page `p` is logical key `off + i - head`, at
+        // absolute position `base + off + i - head`. `head` is the prefix a
+        // window has dropped but the page still carries, and it never exceeds
+        // `base` — every dropped row was counted into `base` first — so the
+        // subtraction cannot go under.
+        let mut off = 0usize;
+        let mut runs: Vec<KeyRun<'_>> = Vec::with_capacity(held.len());
+        for (kh, vh, rows) in &held {
+            let lo = head.saturating_sub(off).min(*rows);
+            let hi = (head + len).saturating_sub(off).min(*rows);
+            runs.push(KeyRun {
+                k: kh,
+                v: vh,
+                rows: *rows,
+                base: base + off - head,
+                lo,
+                hi,
+            });
+            off += rows;
+        }
+        let out = flash_attention_launch(
+            &client,
+            &q_h,
+            &runs,
+            &rel_h,
+            match kv_dt {
+                burn::tensor::DType::BF16 => KvElem::Bf16,
+                _ => KvElem::F32,
+            },
+            1,
+            pos,
+            heads,
+            kv_heads,
+            head_dim,
+            eff,
+            window,
+            d.scaling(),
+            flash::decode_rows(groups),
+        );
+        let out = tensor_of(client, dev.clone(), out, 1, heads * head_dim);
+        return linear_bf16(out, &w.wo);
+    }
+
     let bucket = kv_pad_bucket();
     // THE PAGED READ. `slots` is the key axis this function builds every shape
     // at, and it is `head + len + tail padding` rather than `len` rounded up:

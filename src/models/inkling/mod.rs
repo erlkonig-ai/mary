@@ -65,6 +65,12 @@ pub mod scorebias;
 // of the forty-two attention layers are local, and they were computing the
 // full n^2 and masking it away.
 pub mod banded;
+// The OTHER seven layers: global attention fused the same way, with an online
+// softmax so the key axis is never materialised either. The band's trick does
+// not transfer -- a global layer really does read every key -- so this one
+// tiles the key axis and carries the softmax's running max and sum across the
+// tiles, which is the one part flash attention genuinely invented.
+pub mod flash;
 // What one attention layer asks the allocator for, and whether this device
 // will give it: the `[heads, n, n]` score matrix against the per-buffer cap
 // cubecl sets at `cuDeviceTotalMem / 4`.
