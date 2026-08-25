@@ -32,6 +32,41 @@
 //! not change that. `inkling_forward`'s own per-pass report breaks the lane
 //! into slice / bind+enqueue+sync / remainder, which is where that number comes
 //! from now that the lane-comparison bench is gone with the lanes it compared.
+//!
+//! ## What the grid order is worth, at the shapes where M is not 1
+//!
+//! "The weights are read exactly once" was true only of the ONE m-tile decode
+//! runs. Every extra m-tile wants the same weight rows, and whether it gets
+//! them out of L2 or out of DRAM is decided by the launch order alone. With N
+//! in grid x — which is what this was until the axes were swapped — the
+//! consumers of one weight row sat `n / 8` cubes apart, so time scaled exactly
+//! linearly with `m_pad`: no reuse whatever.
+//!
+//! `fp4_lane_dump` at the head shape (`k = 4096`, `n = 201024`, 0.431 GiB of
+//! codes + scales, `INK_SKIP_BF16=1`, min of four warm launches, launch + sync
+//! with no host readback, DGX Spark GB10 / sm_121a, GPU otherwise idle). These
+//! are KERNEL times, not stage times, and they include the launcher's own
+//! output `client.empty` — which the same harness reports separately at 0.01 to
+//! 0.3 ms, i.e. beneath the differences below:
+//!
+//! ```text
+//!   m_pad   N in x     M in x     ratio
+//!      16   4.55 ms    4.53 ms    1.00   one m-tile: nothing to share, as expected
+//!      32   8.95       4.54       1.97   the second m-tile becomes FREE
+//!      64  18.57       7.71       2.41
+//!     128  34.97      15.31       2.28
+//! ```
+//!
+//! The linearity is broken but not gone: from `m_pad` 32 up the cost still
+//! roughly doubles per doubling, so a wave's worth of m-tiles is being served
+//! and the rest is not. What sets that ceiling is NOT settled here — the
+//! candidates (resident-cube count, L2 capacity against the concurrent n-tile
+//! span, the output write, which grows from 12.9 MB to 103 MB across this
+//! sweep) are not separable with a launch-and-sync timer.
+//!
+//! At `n <= 16384` the whole weight table is L2-sized already and the sweep
+//! shows no reliable difference; below ~1 ms the harness is measuring host
+//! jitter, not the kernel. The win is a LARGE-N property.
 
 use cubecl::ir::MatrixIdent;
 use cubecl::prelude::*;

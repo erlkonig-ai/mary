@@ -344,6 +344,27 @@ pub fn w4a16_linear_launch<R: Runtime>(
 //
 // A is left alone throughout: at `m_pad = 16` it is 128 KiB, L2-resident, and
 // re-read by every cube.
+//
+// One thing above IS occupancy-shaped after all, and it is not in the kernel:
+// the GRID ORDER. See `fp4gemm`'s module header for the full sweep. The short
+// version, same harness and same framing (head shape `k = 4096`, `n = 201024`,
+// min of four warm launches, launch + sync, GB10, GPU idle, kernel time):
+//
+// ```text
+//   m_pad   N in x     M in x     ratio        wide, N in x -> M in x
+//      16   4.98 ms    4.88 ms    1.02         4.83 -> 4.87   (unchanged)
+//      32   9.87       6.99       1.41         9.83 -> 5.90
+//      64  18.92      16.43       1.15        19.27 -> 14.38
+//     128  38.59      33.33       1.16        40.96 -> 29.82
+// ```
+//
+// Both lanes gain, and BOTH gain less than `fp4_linear` does at the same shapes
+// (1.97-2.41x). The obvious difference is A: this lane's activation is BF16, so
+// its A traffic is four times the NVFP4 lane's over the same `m_pad`, and A is
+// the operand the other launch order was serving out of L2. Obvious is not
+// measured, though — that is a hypothesis, and this timer cannot separate it
+// from the instruction count the block above already showed this lane is
+// carrying.
 
 /// Planes per cube. At 4 the block limit stops binding and the register budget
 /// takes over — 40 x 128 = 5120 registers a cube, 12 cubes an SM, all 48 warp
