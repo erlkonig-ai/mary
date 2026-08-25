@@ -88,15 +88,25 @@ fn main() -> Result<()> {
 
     let mut changed = 0usize;
     let mut rows = 0usize;
-    for &m in &widths {
-        println!("  --- m = {m} ---");
+    // Shape outer, width inner. The WEIGHT slab does not depend on `m`, and it
+    // is the expensive one -- `dense w13` is 134 MB of host `sin` -- so hoisting
+    // it out of the width loop is the difference between one generation per
+    // shape and one per shape and width. It also puts the question this binary
+    // exists to answer on adjacent lines: for ONE shape, does the pick move as
+    // the verify width moves?
+    for &(name, k, n) in &shapes {
+        let b = client.create_from_slice(&slab(n * k, 1.7));
         println!(
-            "  {:<15} {:<24} {:<24} {:>9}  {:>9}  {:>7}",
-            "shape", "static walk", "timed walk", "static us", "timed us", "delta"
+            "  --- {} k {k} n {n}   ({:.1} MB of weight) ---",
+            name.trim(),
+            (n * k * 2) as f64 / 1e6
         );
-        for &(name, k, n) in &shapes {
+        println!(
+            "  {:>3}  {:<24} {:<24} {:>9}  {:>9}  {:>7}",
+            "m", "static walk", "timed walk", "static us", "timed us", "delta"
+        );
+        for &m in &widths {
             let a = client.create_from_slice(&slab(m * k, 0.3));
-            let b = client.create_from_slice(&slab(n * k, 1.7));
             let stat: Option<Lane> = static_lane::<Rt>(&client, &a, &b, m, k, n);
             let tuned = tuned_lane::<Rt>(&client, &a, &b, m, k, n);
             match (stat, tuned) {
@@ -114,16 +124,16 @@ fn main() -> Result<()> {
                         changed += 1;
                     }
                     println!(
-                        "  {name} {:<24} {:<24} {ss:>9.1}  {ts:>9.1}  {:>6.1}%{}",
+                        "  {m:>3}  {:<24} {:<24} {ss:>9.1}  {ts:>9.1}  {:>6.1}%{}",
                         s.name(),
                         t.name(),
                         100.0 * (ts - ss) / ss,
                         if s == t { "" } else { "   CHANGED" },
                     );
                 }
-                (s, t) => println!(
-                    "  {name} static {s:?}, timed {t:?}  (the tune declined this shape)"
-                ),
+                (s, t) => {
+                    println!("  {m:>3}  static {s:?}, timed {t:?}  (the tune declined this shape)")
+                }
             }
         }
         println!();
