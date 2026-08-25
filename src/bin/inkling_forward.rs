@@ -1465,6 +1465,34 @@ enum HeadLane {
 /// this tensor, and these are the logits that top-k and sampling read
 /// directly. The whole switch is off by default because quantising the head is
 /// a model-quality decision, not an engineering one.
+///
+/// ## First measurement, 2026-08-25
+///
+/// Two Spark boxes, `INK_SPLIT=21`, `INK_KV=1`, `INK_GEN=24`, a 14-token
+/// English prompt, tail node, p50 of 24 warm passes of the `head / unembed`
+/// stage timer (device time, one sync). ALL THREE FIGURES ARE PER TAIL PASS:
+///
+/// | lane  | table    | head stage | achieved  |
+/// |-------|----------|-----------:|----------:|
+/// | BF16  | 1.53 GiB |    10.1 ms | 163 GB/s  |
+/// | W4A16 | 0.43 GiB |     6.7 ms |  69 GB/s  |
+/// | W4A4  | 0.43 GiB |     6.1 ms |  76 GB/s  |
+///
+/// So the bytes fell by 3.56x and the TIME by 1.51x. The format is not the
+/// thing that failed to deliver -- the kernel is: at BF16 the head runs at 67%
+/// of this box's measured 242.9 GB/s, and at four bits at 28%. One warp per
+/// `(m_tile, n_tile)` has eight times less work to hide latency behind when
+/// each row is 2 KB instead of 8, and the grid did not change. Roughly 3.8 ms
+/// a pass is still on the table INSIDE the four-bit lane, which is larger than
+/// everything the switch has won so far, and any narrower code (a 1-bit
+/// sketch, a prefix-K scan) inherits the same limiter before it inherits the
+/// same win.
+///
+/// Output: 24 greedy tokens, one differed from the BF16 arm, and it differed
+/// at a 0.08-logit gap (`26500` at 18.59 against `306` at 18.51, which W4A16
+/// scored 18.32 against 18.32). Both continuations read as English. W4A4
+/// produced the SAME 24 tokens as W4A16 on this prompt, so the activation
+/// quantiser cost nothing here that the weight quantiser had not already cost.
 fn head_lane() -> HeadLane {
     static ON: std::sync::OnceLock<HeadLane> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("INK_W4A16_HEAD").as_deref() {

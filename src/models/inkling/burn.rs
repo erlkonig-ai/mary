@@ -3130,6 +3130,13 @@ mod tests {
             .sum();
         let den: f64 = av.iter().map(|p| (*p as f64).powi(2)).sum();
         let rel = (num / den).sqrt();
+        // PRINTED, not just asserted. The bound is loose on purpose (it is a
+        // wiring detector), so the assert throws away the one number the test
+        // actually measured -- and that number is the only per-lane fidelity
+        // figure this tree has. Measured 2026-08-25 on the Spark: 0.0155 for
+        // the W4A4 lane, 0.0091 for W4A16, on THIS synthetic 512x256 weight
+        // with structured inputs. It is not a claim about the real logits.
+        println!("MEASURED rel RMS = {rel:.4}");
         assert!(
             rel < 0.15,
             "relative RMS {rel:.4} between the BF16 and NVFP4 lanes on the same weight \
@@ -3196,6 +3203,13 @@ mod tests {
             .sum();
         let den: f64 = av.iter().map(|p| (*p as f64).powi(2)).sum();
         let rel = (num / den).sqrt();
+        // PRINTED, not just asserted. The bound is loose on purpose (it is a
+        // wiring detector), so the assert throws away the one number the test
+        // actually measured -- and that number is the only per-lane fidelity
+        // figure this tree has. Measured 2026-08-25 on the Spark: 0.0155 for
+        // the W4A4 lane, 0.0091 for W4A16, on THIS synthetic 512x256 weight
+        // with structured inputs. It is not a claim about the real logits.
+        println!("MEASURED rel RMS = {rel:.4}");
         assert!(
             rel < 0.15,
             "relative RMS {rel:.4} between the BF16 and W4A16 lanes on the same weight \
