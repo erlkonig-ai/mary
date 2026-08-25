@@ -3009,7 +3009,7 @@ mod tests {
         let client = client_of(&probe);
 
         // One weight, two bindings of the same bytes.
-        let wf: Vec<f32> = fill(n * k, 0.17).map(|x| x * 0.05).collect();
+        let wf: Vec<f32> = fill(n * k, 0.17).into_iter().map(|x| x * 0.05).collect();
         let mut bytes = Vec::with_capacity(n * k * 2);
         for x in &wf {
             bytes.extend_from_slice(&half::bf16::from_f32(*x).to_le_bytes());
@@ -3031,7 +3031,7 @@ mod tests {
             scale2: 1.0,
         };
 
-        let xv: Vec<f32> = fill(m * k, 0.31).collect();
+        let xv: Vec<f32> = fill(m * k, 0.31);
         let x: Tensor<B, 2> = Tensor::from_data(TensorData::new(xv, [m, k]), &dev);
 
         let a = linear_bf16(x.clone(), &bw).into_data().convert::<f32>();
