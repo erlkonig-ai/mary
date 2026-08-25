@@ -39,6 +39,19 @@
 #      per pass) to 1% on every throughput figure it prints, and says so loudly
 #      when it does not hold. Three numbers that do not close are not three
 #      numbers, they are a parse error or a population mismatch.
+#   7. Gates on BUILD PROVENANCE, which is the same class of failure as the
+#      idle gate and has already bitten this project twice. It refuses unless
+#      the tree the binary was built in is the tree the script is being run
+#      from, at the same commit; it refuses if any source file is newer than
+#      the binary, because a binary that predates its source is measuring
+#      whatever was there last time; and it records the binary's sha256, size
+#      and mtime beside every result, so a stale binary cannot be mistaken for
+#      a rebuilt one. On a box where several agents share a checkout, a
+#      `git checkout` under your feet turns an A/B into two runs of somebody
+#      else's commit and NOTHING in the output would have said so. When two
+#      arms name different binaries it also refuses if the two are
+#      byte-identical -- a two-arm A/B of one binary against itself has
+#      happened here, and it produced a difference.
 #
 # USAGE
 #
@@ -66,6 +79,15 @@
 #     --samples N     idle samples, 1 s apart (default 3)
 #     --allow-busy    downgrade OUR OWN contention to a warning. Never lifts the
 #                     other-user refusal, and stamps every result UNGATED.
+#     --allow-stale   downgrade the build-provenance refusals to warnings, and
+#                     stamp every result STALE. Does not lift the two-arms-are-
+#                     the-same-binary refusal.
+#
+#   An arm may name its own binary with `BENCH_BIN=<path>` inside its env
+#   string, which is how you A/B two BUILDS rather than two environments:
+#
+#     scripts/bench-decode.sh -n 3 'before:BENCH_BIN=/tmp/a/inkling_forward' \
+#                                  'after:BENCH_BIN=/tmp/b/inkling_forward'
 #     --out DIR       where the logs and the TSV go (default /tmp/bench-decode-<ts>)
 #     --gate-only     run the gate, print what it found, exit
 #     -h|--help       this text
@@ -86,6 +108,7 @@ UTIL_MAX=5
 LOAD_MAX=2.0
 SAMPLES=3
 ALLOW_BUSY=0
+ALLOW_STALE=0
 GATE_ONLY=0
 OUT=""
 ARMS=()
@@ -115,6 +138,7 @@ while [ $# -gt 0 ]; do
     --load-max) LOAD_MAX=$2; shift 2;;
     --samples) SAMPLES=$2; shift 2;;
     --allow-busy) ALLOW_BUSY=1; shift;;
+    --allow-stale) ALLOW_STALE=1; shift;;
     --gate-only) GATE_ONLY=1; shift;;
     --out) OUT=$2; shift 2;;
     -h|--help) usage;;
@@ -141,8 +165,15 @@ gate() {
 
   # -- what the driver says the GPU is doing, over a WINDOW ------------------
   # `memory.used` is [N/A] on unified-memory parts (GB10), which is not a
-  # failure and must not be read as 0. utilization.gpu is the load signal;
-  # memory.used is only ever corroborating.
+  # failure and must not be read as 0.
+  #
+  # And utilisation is NOT sufficient on its own, measured: on 2026-08-25 this
+  # gate sampled 0% three times a second apart on a GB10 that had a live
+  # `inkling_forward` holding a CUDA context the whole time. A decode process
+  # spends long stretches in host-side phases and the counter is coarse, so a
+  # gate built on `utilization.gpu` alone would have said "idle" and handed back
+  # a poisoned number. The process list is what caught it. That is why this
+  # function has four signals and refuses on any of them.
   local util_max_seen=0 mem_note="" i line util mem
   for ((i = 0; i < SAMPLES; i++)); do
     line=$(nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader 2>/dev/null | head -1)
@@ -207,7 +238,9 @@ gate() {
       [ -z "$line" ] && continue
       pid=${line%% *}
       owner=$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')
-      GATE_FINDINGS+=("    [$owner] $line")
+      # Truncated: a rustc invocation is 3 kB of -L flags and the pid and the
+      # program are the whole point of the line.
+      GATE_FINDINGS+=("    [$owner] $(printf '%.140s' "$line")")
       if [ -n "$owner" ] && [ "$owner" != "$me" ]; then GATE_HARD=1; else GATE_SOFT=1; fi
     done <<< "$mine"
   fi
@@ -230,7 +263,7 @@ print_gate() { printf '%s\n' "--- idle gate ---" "${GATE_FINDINGS[@]}"; }
 gate
 GATED="gated"
 if [ "$GATE_HARD" = "1" ]; then
-  print_gate
+  print_gate >&2
   die "REFUSING TO MEASURE: another user's process holds this GPU. --allow-busy does not lift this."
 fi
 if [ "$GATE_SOFT" = "1" ]; then
@@ -240,24 +273,134 @@ if [ "$GATE_SOFT" = "1" ]; then
     printf '\n!! --allow-busy: proceeding on a CONTENDED box. Every number below is stamped\n'
     printf '!! UNGATED and is not comparable with a gated one. Do not quote it as evidence.\n\n'
   else
-    print_gate
+    print_gate >&2
     die "REFUSING TO MEASURE: the box is not idle (see above). Wait, or fix it, or --allow-busy and wear the UNGATED stamp."
   fi
 fi
 
 [ "$GATE_ONLY" = "1" ] && { print_gate; echo; echo "gate: clear"; exit 0; }
 [ ${#ARMS[@]} -eq 0 ] && die "no arms given. Try: $0 -n 3 base: 'tuned:INK_GEMM_AUTOTUNE=1'"
-[ -x "$BIN" ] || die "no binary at $BIN (--bin, or build it)"
 
+# ---------------------------------------------------------------------------
+# BUILD PROVENANCE
+#
+# The idle gate answers "was the box quiet?". This answers the question that
+# comes first and is asked less often: "is the binary the code I think it is?"
+# Both failures are silent, both produce a plausible number, and this one is
+# worse because the number is reproducible -- it will come out the same on the
+# next run and on the run after that, and it is still measuring the wrong tree.
+#
+# Two recorded ways it has gone wrong on this project:
+#   * A shared checkout with several agents in it, where one agent's
+#     `git checkout` reverted another's between two commands. The second agent
+#     built, benchmarked and reported a commit it never wrote.
+#   * A two-arm A/B where both arms were byte-identical binaries. It reported a
+#     difference, because two runs of the same thing always do.
+# ---------------------------------------------------------------------------
+
+sha_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  else shasum -a 256 "$1" | awk '{print $1}'; fi
+}
+mtime_of() { date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || stat -c %y "$1"; }
+
+PROV_HARD=0
+declare -A BIN_SHA BIN_MTIME
+
+RUN_TREE=$(git -C "$(cd "$(dirname "$0")" && pwd)" rev-parse --show-toplevel 2>/dev/null)
+RUN_HEAD=$(git -C "${RUN_TREE:-.}" rev-parse HEAD 2>/dev/null || echo unknown)
+RUN_DIRTY=$(git -C "${RUN_TREE:-.}" status --porcelain 2>/dev/null | head -1)
+
+provenance() {
+  local bin=$1 label=$2 abs tree head dirty newer
+  [ -x "$bin" ] || { echo "  !! $label: no executable at $bin"; PROV_HARD=1; return; }
+  abs=$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")
+  BIN_SHA[$abs]=$(sha_of "$abs")
+  BIN_MTIME[$abs]=$(mtime_of "$abs")
+  echo "  $label: $abs"
+  echo "      sha256 ${BIN_SHA[$abs]}"
+  echo "      built  ${BIN_MTIME[$abs]}   $(wc -c < "$abs" | tr -d ' ') bytes"
+
+  tree=$(git -C "$(dirname "$abs")" rev-parse --show-toplevel 2>/dev/null)
+  if [ -z "$tree" ]; then
+    echo "      !! not inside a git tree, so nothing can say what it was built from"
+    PROV_HARD=1
+    return
+  fi
+  head=$(git -C "$tree" rev-parse HEAD 2>/dev/null)
+  dirty=$(git -C "$tree" status --porcelain 2>/dev/null | head -1)
+  echo "      tree   $tree"
+  echo "      HEAD   ${head:0:12}$([ -n "$dirty" ] && echo '  (DIRTY -- the commit does not identify what ran; the sha256 above does)')"
+
+  # The tree the binary was built in must be the tree this script is being run
+  # from. On a box where several checkouts of the same repo exist, "the binary
+  # in target/release" is not a location, it is whichever tree you happened to
+  # be standing in.
+  if [ -n "$RUN_TREE" ] && [ "$tree" != "$RUN_TREE" ]; then
+    echo "      !! BUILT IN A DIFFERENT TREE than this script is running from:"
+    echo "         script: $RUN_TREE"
+    echo "         binary: $tree"
+    PROV_HARD=1
+  elif [ -n "$RUN_HEAD" ] && [ "$head" != "$RUN_HEAD" ] && [ "$RUN_HEAD" != unknown ]; then
+    echo "      !! HEAD MISMATCH: script at ${RUN_HEAD:0:12}, binary's tree at ${head:0:12}"
+    PROV_HARD=1
+  fi
+
+  # A binary older than its source is a binary of the previous source. This is
+  # the cheap check that a rebuild actually happened, and it is the one an
+  # A/B skips when it is in a hurry.
+  newer=$(find "$tree/src" "$tree/Cargo.toml" "$tree/Cargo.lock" -newer "$abs" -print -quit 2>/dev/null)
+  if [ -n "$newer" ]; then
+    echo "      !! STALE: $newer is newer than the binary. Rebuild, or you are"
+    echo "         measuring the tree as it was before your edit."
+    PROV_HARD=1
+  fi
+}
+
+echo "--- build provenance ---"
+echo "  script tree : ${RUN_TREE:-<not a git tree>} @ ${RUN_HEAD:0:12}$([ -n "$RUN_DIRTY" ] && echo ' (DIRTY)')"
+declare -A ARM_BIN
+for spec in "${ARMS[@]}"; do
+  name=${spec%%:*}; aenv=${spec#*:}; [ "$aenv" = "$spec" ] && aenv=""
+  abin=$BIN
+  for kv in $aenv; do case "$kv" in BENCH_BIN=*) abin=${kv#BENCH_BIN=};; esac; done
+  ARM_BIN[$name]=$(cd "$(dirname "$abin")" 2>/dev/null && pwd)/$(basename "$abin")
+  provenance "$abin" "arm '$name'"
+done
+
+# Two arms, one binary: fine when they differ by ENVIRONMENT, which is the
+# normal case here. Not fine when they were given DIFFERENT PATHS, because then
+# the whole point was two builds and there is only one.
+for a in "${!ARM_BIN[@]}"; do
+  for b in "${!ARM_BIN[@]}"; do
+    [ "$a" = "$b" ] && continue
+    pa=${ARM_BIN[$a]}; pb=${ARM_BIN[$b]}
+    [ "$pa" = "$pb" ] && continue
+    if [ "${BIN_SHA[$pa]:-x}" = "${BIN_SHA[$pb]:-y}" ]; then
+      echo "  !! arms '$a' and '$b' name DIFFERENT paths holding BYTE-IDENTICAL binaries."
+      echo "     $pa"
+      echo "     $pb"
+      die "REFUSING: that A/B compares a binary with itself. It will report a difference and the difference will be noise."
+    fi
+  done
+done
+
+if [ "$PROV_HARD" = "1" ]; then
+  if [ "$ALLOW_STALE" = "1" ]; then
+    printf '\n!! --allow-stale: proceeding with unverified build provenance. Every number\n'
+    printf '!! below is stamped STALE and does not identify the code that produced it.\n\n'
+    GATED="$GATED / STALE (--allow-stale)"
+  else
+    die "REFUSING TO MEASURE: the binary cannot be tied to this tree at this commit (see above). Rebuild here, or --allow-stale and wear the stamp."
+  fi
+fi
+echo
 [ -z "$OUT" ] && OUT="/tmp/bench-decode-$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$OUT" || die "cannot make $OUT"
 TSV="$OUT/results.tsv"
-printf 'arm\trep\ttok_s\tstep_ms\tE_warm\tE_all\twarm_steps\tharness_median_ms\tctx\tidentity_err_pct\n' > "$TSV"
+printf 'arm\trep\ttok_s\tstep_ms\tE_warm\tE_all\twarm_steps\tharness_median_ms\tctx\tidentity_err_pct\tbin_sha256\tbin_mtime\tbin\n' > "$TSV"
 
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
-SHA=$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
-DIRTY=$(git status --porcelain 2>/dev/null | head -1)
-[ -n "$DIRTY" ] && SHA="$SHA+dirty"
 STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 print_gate
@@ -280,23 +423,28 @@ echo
 # ---------------------------------------------------------------------------
 
 run_rep() {
-  local arm_name=$1 arm_env=$2 rep=$3 log
+  local arm_name=$1 arm_env=$2 rep=$3 log abin
   log="$OUT/${arm_name}.rep${rep}.log"
+  abin=${ARM_BIN[$arm_name]}
   local envs=()
   [ "$REPEAT" = "1" ] && envs+=("INK_REPEAT=1")
   envs+=("INK_GEN=$GEN" "INK_LAYERS=$LAYERS")
   # shellcheck disable=SC2206
   [ -n "$COMMON_ENV" ] && envs+=($COMMON_ENV)
-  # shellcheck disable=SC2206
-  [ -n "$arm_env" ] && envs+=($arm_env)
+  # `BENCH_BIN` selects the arm's binary; it is not an environment variable the
+  # binary should see, so it does not travel with the rest.
+  local kv
+  for kv in $arm_env; do
+    case "$kv" in BENCH_BIN=*) ;; *) envs+=("$kv");; esac
+  done
 
   printf '  %-12s rep %d ... ' "$arm_name" "$rep"
   {
-    printf '# %s\n' "arm=$arm_name env=${envs[*]} bin=$BIN args=${PASSTHRU[*]:-}"
+    printf '# %s\n' "arm=$arm_name env=${envs[*]} bin=$abin sha256=${BIN_SHA[$abin]} args=${PASSTHRU[*]:-}"
   } > "$log"
   local t0 t1
   t0=$(date +%s)
-  env "${envs[@]}" "$BIN" ${PASSTHRU[@]+"${PASSTHRU[@]}"} >> "$log" 2>&1
+  env "${envs[@]}" "$abin" ${PASSTHRU[@]+"${PASSTHRU[@]}"} >> "$log" 2>&1
   local rc=$?
   t1=$(date +%s)
   if [ $rc -ne 0 ]; then
@@ -304,7 +452,8 @@ run_rep() {
     return 1
   fi
 
-  "$AWK" -v arm="$arm_name" -v rep="$rep" -v cold="$COLD" -v tsv="$TSV" '
+  "$AWK" -v arm="$arm_name" -v rep="$rep" -v cold="$COLD" -v tsv="$TSV" \
+       -v bsha="${BIN_SHA[$abin]}" -v bmt="${BIN_MTIME[$abin]}" -v bpath="$abin" '
     /WARM steps only/      { if (match($0, /\(([0-9.]+) ms\/step over ([0-9]+) steps/, mm)) { step_ms = mm[1]; wsteps = mm[2] } }
     /WARM per TOKEN/       { if (match($0, /\(([0-9.]+) tok\/s over ([0-9]+) tokens/, tt)) { toks = tt[1]; wtokens = tt[2] } }
     /tokens per pass/      { e_all = $NF }
@@ -329,7 +478,7 @@ run_rep() {
       hm = 100.0 * (med - step_ms) / step_ms
       if (hm > 2 || hm < -2)
         printf "    !! the harness median (%.1f ms, first %d discarded) and the binary WARM figure (%.1f ms) disagree by %.1f%%.\n       The two definitions of \"warm\" have drifted; the number is not safe until they agree.\n", med, cold, step_ms, hm
-      printf "%s\t%d\t%.4f\t%.3f\t%.4f\t%s\t%d\t%.3f\t%s\t%.3f\n", arm, rep, toks, step_ms, e_warm, e_all, wsteps, med, ctx, err >> tsv
+      printf "%s\t%d\t%.4f\t%.3f\t%.4f\t%s\t%d\t%.3f\t%s\t%.3f\t%s\t%s\t%s\n", arm, rep, toks, step_ms, e_warm, e_all, wsteps, med, ctx, err, bsha, bmt, bpath >> tsv
     }
   ' "$log" || printf '    !! parse failed for %s\n' "$log"
   echo "    ($((t1 - t0)) s wall, $log)" >/dev/null
@@ -355,7 +504,7 @@ if [ "$GATE_HARD" = "1" ] || [ "$GATE_SOFT" = "1" ]; then
   echo "!! THE BOX DID NOT STAY IDLE. Something arrived during the run:"
   print_gate
   echo "!! The numbers below were taken across that. Treat them as UNGATED."
-  GATED="UNGATED (contention appeared mid-run)"
+  GATED="$GATED / UNGATED (contention appeared mid-run)"
 fi
 
 # ---- the report -----------------------------------------------------------
@@ -410,7 +559,11 @@ echo "  reps            : $REPS per arm, INTERLEAVED; first $COLD decode passes 
 echo "  statistic       : median over reps; peak reported separately; mean not reported"
 echo "  identity        : tok/s = E * 1000 / step_ms checked to 1% on every rep"
 echo "  box             : $(hostname)  $GPU_NAME"
-echo "  build           : $SHA   binary $BIN"
+echo "  build           : tree $RUN_TREE @ ${RUN_HEAD:0:12}$([ -n "$RUN_DIRTY" ] && echo " (DIRTY -- the commit does not identify what ran)")"
+for spec in "${ARMS[@]}"; do
+  name=${spec%%:*}; abin=${ARM_BIN[$name]}
+  echo "                    arm '$name' -> ${BIN_SHA[$abin]:0:16}  ${BIN_MTIME[$abin]}  $abin"
+done
 echo "  gate            : $GATED   (util-max ${UTIL_MAX}%, load-max $LOAD_MAX, ${SAMPLES} samples)"
 echo "  started         : $STARTED"
 [ -n "$NOTE" ] && echo "  note            : $NOTE"
