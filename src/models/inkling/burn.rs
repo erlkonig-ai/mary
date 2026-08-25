@@ -2853,6 +2853,180 @@ mod tests {
             .collect()
     }
 
+    /// The 42-layer release's GLOBAL attention shape, from its own
+    /// `config.json` — the one [`super::super::budget`]'s `small()` parses.
+    ///
+    /// The tests above run a four-head toy because what they check is
+    /// structural. The two benchmarks below run THIS, because what they check
+    /// is a cost, and a cost at a shape the model does not have is a number
+    /// about nothing.
+    fn real_global_dims() -> AttnDims {
+        AttnDims {
+            hidden: 4096,
+            heads: 32,
+            kv_heads: 8,
+            head_dim: 128,
+            d_rel: 16,
+            rel_extent: 1024,
+            kernel: 4,
+            rms_eps: 1e-6,
+            kind: AttnKind::Global,
+        }
+    }
+
+    /// The device barrier the timings below close on.
+    ///
+    /// A four-byte read rather than the output: it is ordered behind the
+    /// launches on this thread's stream, which is what makes it a barrier,
+    /// and it charges the measurement nothing. Without it these functions time
+    /// the ENQUEUE. Lifted from [`super::super::bf16gemm`]'s bench, which says
+    /// the same thing at more length.
+    fn barrier(client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>) {
+        let _ = client.read_one(client.empty(4));
+    }
+
+    /// One global PREFILL layer, timed at lengths, on whichever arm the binary
+    /// was started with.
+    ///
+    /// **Framing rule.** Every number this prints is milliseconds for ONE
+    /// attention layer over the whole prefill, at the 42-layer release's global
+    /// shape (hidden 4096, 32 heads over 8 KV heads, head_dim 128, d_rel 16,
+    /// rel_extent 1024), on a GB10, with the projections and the two short
+    /// convolutions INCLUDED — it times `attention_prefill`, not the kernel.
+    /// The model has seven such layers. `reserved` is what the cubecl pool is
+    /// holding afterwards, which is the closest thing to a peak working set
+    /// this seam exposes.
+    ///
+    /// Both arms must be run from THIS directory, because cubecl's autotune
+    /// cache lives at `$CWD/target/autotune` and stores which kernel won a
+    /// timing race — two worktrees name different winners for most shapes, so a
+    /// cross-worktree comparison measures the cache and not the change:
+    ///
+    /// ```text
+    /// INK_FLASH=1 cargo test --release --features inkling-cuda -- \
+    ///     --ignored --nocapture flash_prefill_cost
+    /// INK_FLASH=0 cargo test --release --features inkling-cuda -- \
+    ///     --ignored --nocapture flash_prefill_cost
+    /// ```
+    #[test]
+    #[ignore = "a benchmark, not a check"]
+    fn flash_prefill_cost_at_length() {
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let d = real_global_dims();
+        let w = weights(&d, &dev);
+        let ls = Some(LogScaling {
+            n_floor: 128000.0,
+            alpha: 0.1,
+        });
+        let client = client_of(&Tensor::<B, 2>::zeros([1, 1], &dev));
+        println!(
+            "\nprefill, one global layer, GB10, INK_FLASH={}",
+            if flash_lane() { 1 } else { 0 }
+        );
+        println!("  tokens        ms   reserved MiB");
+        for tokens in [1024usize, 4096, 8192, 16_384, 32_768] {
+            let xs: Tensor<B, 2> = Tensor::random(
+                [tokens, d.hidden],
+                burn::tensor::Distribution::Uniform(-1.0, 1.0),
+                &dev,
+            );
+            // One warm run: the first call at a shape compiles kernels and
+            // resolves autotune, and neither is what this measures.
+            let (_, c) = attention_prefill(xs.clone(), &w, &d, ls, None, None);
+            drop(c);
+            barrier(&client);
+            let t0 = std::time::Instant::now();
+            let (out, c) = attention_prefill(xs, &w, &d, ls, None, None);
+            core::hint::black_box(&out);
+            barrier(&client);
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            let reserved = crate::models::inkling::seam::pool_reserved(&client);
+            drop((out, c));
+            println!(
+                "  {tokens:>6}  {ms:>8.1}   {:>12.0}",
+                reserved as f64 / (1 << 20) as f64
+            );
+        }
+    }
+
+    /// One global DECODE step, timed against the context behind it.
+    ///
+    /// **Framing rule.** Milliseconds for ONE `attention_step` — one generated
+    /// token through ONE global attention layer, projections and short
+    /// convolutions included — at the release's global shape on a GB10, against
+    /// a synthetic NVFP4 KV cache of `context` keys. The model has seven such
+    /// layers, so multiply by seven for the per-step attention cost of a decode
+    /// and compare it against the ~46 ms the rest of a step takes. The cache is
+    /// built by appending random rows rather than by prefilling, because a
+    /// prefill at 262,144 would allocate 4.3 GB of activations to produce a
+    /// cache this test only wants the SIZE of.
+    ///
+    /// Same two-run protocol as [`flash_prefill_cost_at_length`], same reason.
+    #[test]
+    #[ignore = "a benchmark, not a check"]
+    fn flash_decode_cost_at_context() {
+        use crate::models::inkling::kvpages::KvStore;
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let d = real_global_dims();
+        let w = weights(&d, &dev);
+        let ls = Some(LogScaling {
+            n_floor: 128000.0,
+            alpha: 0.1,
+        });
+        let kv_w = d.kv_heads * d.head_dim;
+        let client = client_of(&Tensor::<B, 2>::zeros([1, 1], &dev));
+        println!(
+            "\ndecode, one global layer, GB10, INK_FLASH={}, NVFP4 KV",
+            if flash_lane() { 1 } else { 0 }
+        );
+        println!("  context       ms");
+        for context in [4096usize, 16_384, 65_536, 262_144] {
+            let fill_store = || {
+                let mut st = KvStore::<Bk>::new(kv_w, burn::tensor::DType::BF16);
+                let mut done = 0usize;
+                while done < context {
+                    let n = (context - done).min(8192);
+                    st.append(as_kv(Tensor::<B, 2>::random(
+                        [n, kv_w],
+                        burn::tensor::Distribution::Uniform(-1.0, 1.0),
+                        &dev,
+                    )));
+                    done += n;
+                }
+                st
+            };
+            let mut cache = AttnCache {
+                k: fill_store(),
+                v: fill_store(),
+                k_pre: Tensor::zeros([d.kernel - 1, kv_w], &dev),
+                v_pre: Tensor::zeros([d.kernel - 1, kv_w], &dev),
+                base: 0,
+                pending: None,
+            };
+            let x: Tensor<B, 2> = Tensor::random(
+                [1, d.hidden],
+                burn::tensor::Distribution::Uniform(-1.0, 1.0),
+                &dev,
+            );
+            // Two warm steps, then five timed. The first compiles; the second
+            // pays for a page boundary if the first crossed one.
+            for i in 0..2 {
+                let o = attention_step(x.clone(), &w, &d, ls, context + i, None, &mut cache);
+                core::hint::black_box(&o);
+            }
+            barrier(&client);
+            let iters = 5usize;
+            let t0 = std::time::Instant::now();
+            for i in 0..iters {
+                let o = attention_step(x.clone(), &w, &d, ls, context + 2 + i, None, &mut cache);
+                core::hint::black_box(&o);
+            }
+            barrier(&client);
+            let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+            println!("  {context:>7}  {ms:>7.2}");
+        }
+    }
+
     /// Small, but no longer arbitrary.
     ///
     /// These were `hidden 8, head_dim 2, d_rel 3`, which is the smallest thing
