@@ -118,6 +118,29 @@
 //! Set `INK_MTP` on the TAIL process only. It is refused on a head, which holds
 //! neither the final hidden state nor a way to turn one into a token.
 //!
+//! ## What a draft costs, and `INK_DRAFT_TOPK`
+//!
+//! A draft is one MTP block and one unembedding, and the second of those is the
+//! expensive half: the table is `201024 x 4096` BF16, 1.65 GiB, and every draft
+//! DEPTH streams all of it to keep one token. That is the same weight stream the
+//! stage timer charges to `head / unembed`, paid again per depth, and it is why
+//! speculation on this stack has to be argued rather than assumed.
+//!
+//! Two of the three costs there were pure overhead and are gone unconditionally:
+//! the full logits row is no longer read back to the host (only the winning index
+//! is, via [`argmax_row_dev`]), and the readback that `INK_MTP_PROB` needs now
+//! happens only when `INK_MTP_PROB` is set. Neither changes a token.
+//!
+//! The weight stream itself is not overhead, and shrinking it means drafting
+//! against fewer tokens. `INK_DRAFT_TOPK=N` restricts the DRAFT's unembedding to
+//! the N tokens the main model just ranked highest at this position — gathered
+//! once per step, shared by every depth, 4 MiB at N = 512 against 1.65 GiB. A
+//! token outside that set can no longer be drafted, so drafts and acceptance
+//! both move; the flag is default-off precisely so the trade is an ablation and
+//! not a silent change to what the runtime predicts. It is refused together with
+//! `INK_MTP_PROB`, which scores the draft's distribution by full-vocabulary token
+//! index and would otherwise be handed 512 numbers about a different index space.
+//!
 //! # The decode baseline, and the exact configuration that produced it
 //!
 //! Two rates get quoted for this model and they are not the same number, so
@@ -1311,6 +1334,28 @@ fn down<B: Backend>(t: BT<B, 2>) -> Vec<f32> {
 /// A device tensor of this run's backend, named once so the residency types
 /// below do not have to repeat it.
 type T2 = burn::tensor::Tensor<Bk, 2>;
+
+/// The index of the largest element of a `[1, cols]` device tensor, reduced
+/// where the data already is.
+///
+/// The twin of [`down`] for the one case that wants a single integer and not a
+/// row. A draft head's unembedding produces 201024 f32 and the caller keeps
+/// exactly one index off it; reading the row back to find that index cost 804
+/// KB over the bus per DRAFT DEPTH, plus a 201k-iteration host loop, to deliver
+/// eight bytes.
+///
+/// Bit-identical to the loop it replaces, ties included: `cubek`'s `ArgMax`
+/// documents "the smallest coordinate in case of equality", which is what
+/// `val > dl[b]` selected as well.
+fn argmax_row_dev(row: T2) -> usize {
+    let [rows, _] = row.dims();
+    debug_assert_eq!(rows, 1, "argmax_row_dev reads exactly one row");
+    row.argmax(1)
+        .into_data()
+        .iter::<i64>()
+        .next()
+        .expect("device argmax readback") as usize
+}
 
 /// Host seconds inside the routed-expert lane, split by WHAT THE HOST DID.
 ///
@@ -4478,6 +4523,37 @@ fn main() -> Result<()> {
     let mtp_prob = std::env::var("INK_MTP_PROB")
         .map(|val| val == "1")
         .unwrap_or(false);
+    // `INK_DRAFT_TOPK=N` prunes the DRAFT's unembedding to the N tokens the
+    // main model just ranked highest at this position; 0, the default, is the
+    // full vocabulary.
+    //
+    // The full table is 201024 x 4096 BF16 = 1.65 GiB and every draft depth
+    // streams all of it to keep one index. N = 512 streams 4 MiB, gathered once
+    // per step and shared by every depth.
+    //
+    // It is a bet on a CANDIDATE SET, not a cheaper way to compute the same
+    // thing: a token outside the target's top N cannot be drafted at all, so
+    // the drafts change and the acceptance rate with them. Off by default for
+    // that reason -- the flag exists so the trade can be ablated, and the name
+    // says what it does to the model rather than what it does to the clock.
+    let draft_topk: usize = std::env::var("INK_DRAFT_TOPK")
+        .ok()
+        .map(|v| v.parse())
+        .transpose()
+        .context("INK_DRAFT_TOPK wants a token count")?
+        .unwrap_or(0);
+    // The two are exclusive rather than silently one-sided. `INK_MTP_PROB`
+    // scores the draft head's distribution against the target's BY TOKEN INDEX
+    // over the whole vocabulary, and a pruned head emits a distribution over
+    // candidates -- 512 numbers about a different index space. Ignoring one
+    // flag would hand back numbers that look like the usual ones.
+    anyhow::ensure!(
+        !(mtp_prob && draft_topk > 0),
+        "INK_MTP_PROB scores the draft's FULL-vocabulary distribution and INK_DRAFT_TOPK={} \
+         removes it. Run the probability scoring against the unpruned head, or drop \
+         INK_MTP_PROB and read acceptance.",
+        draft_topk
+    );
     // The draft head's distribution, kept from the step that issued it until
     // the step it names arrives with the target's. 800 KB a draft at f32 and
     // at most k(k+1)/2 alive at once.
@@ -4502,6 +4578,10 @@ fn main() -> Result<()> {
     // at f32, and the reason the cached lane can draft at all -- see the draft
     // block for why a row, once produced, never changes.
     let mut mtp_main: Vec<f32> = Vec::new();
+    // Whether the pruned-unembed line has been printed. Once per process, not
+    // once per step: the shape does not change and 100 identical lines would
+    // bury the report the run exists to produce.
+    let mut drafted_pruned = false;
     // Per head: its STABLE hidden rows, which are what the NEXT head reads,
     // and its own K/V cache. Ragged by one row per depth, because head d's
     // stable rows stop at position seq-1-d.
@@ -4897,7 +4977,7 @@ fn main() -> Result<()> {
     // does. The extra rows are the checkpoint's own padding and the argmax
     // slices them off, exactly as the f32 path sliced them off after uploading
     // them.
-    let unembed_w = if want_head {
+    let (unembed_w, unembed_bytes) = if want_head {
         use mary::models::inkling::bf16gemm::Bf16W;
         use mary::models::inkling::pile::Elem;
         let leaf = cp.stored("model.llm.unembed.weight")?;
@@ -4935,14 +5015,23 @@ fn main() -> Result<()> {
             leaf.bytes.len() as f64 / GIB,
             2.0 * leaf.bytes.len() as f64 / GIB
         );
-        Some(Bf16W {
-            h: hnd,
-            n: rows,
-            k: cols,
-            align: if copy_to_align { 16 } else { align },
-        })
+        (
+            Some(Bf16W {
+                h: hnd,
+                n: rows,
+                k: cols,
+                align: if copy_to_align { 16 } else { align },
+            }),
+            // The same stored bytes, kept reachable from the HOST as well, for
+            // `INK_DRAFT_TOPK`. Pruning the draft's unembedding is a row gather
+            // and the rows to gather are not known until a step has run, so the
+            // gather reads the pile's mapping rather than the device buffer.
+            // `Bytes` is a handle over that mapping: this clone is a refcount,
+            // not 1.65 GiB.
+            Some(leaf.bytes.clone()),
+        )
     } else {
-        None
+        (None, None)
     };
     // The final norm's gain, uploaded once for the same reason -- it used to be
     // re-uploaded from the host copy on every pass, and on every MTP draft.
@@ -7052,30 +7141,130 @@ fn main() -> Result<()> {
             // contribute.
             let draft_probs: std::cell::RefCell<Vec<Vec<f32>>> =
                 std::cell::RefCell::new(Vec::new());
-            let draft_argmax = |row: &[f32]| -> usize {
-                debug_assert_eq!(row.len(), h, "the draft head unembeds exactly one position");
-                let dl = {
-                    let ud = unembed_w
+
+            // The rows of the unembedding this step's drafts are allowed to pick
+            // from, gathered ONCE and shared by every depth, or `None` for the
+            // whole table.
+            //
+            // The candidate set is the main model's own top-`INK_DRAFT_TOPK` at
+            // this position -- the distribution the drafts are trying to
+            // anticipate, read off the row the argmax above was taken from. It is
+            // a defensible source and not a cheap one to fake: it costs a partial
+            // selection over a vector the step already had on the host.
+            //
+            // `best` is always in it (it is the top-1), so the set is never empty
+            // of the token the step just confirmed.
+            let draft_cand: Option<(Vec<usize>, mary::models::inkling::bf16gemm::Bf16W)> =
+                if draft_topk > 0 && !logits.is_empty() {
+                    use mary::models::inkling::bf16gemm::NTILE;
+                    let row = &logits[(n - 1 - logit_row0) * v..(n - logit_row0) * v];
+                    // Rounded DOWN to the MMA's n-tile: the gemm tiles its output
+                    // by `NTILE` and a remainder is not a shape it has. Down rather
+                    // than up so the result is a width the vocabulary can supply.
+                    let want = (draft_topk.min(v) / NTILE).max(1) * NTILE;
+                    // Partial selection, not a sort: the ORDER of the candidates is
+                    // never read, only their membership and their row index.
+                    let mut idx: Vec<u32> = (0..v as u32).collect();
+                    idx.select_nth_unstable_by(want - 1, |&a, &b| {
+                        row[b as usize]
+                            .partial_cmp(&row[a as usize])
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    idx.truncate(want);
+                    // Once, on the first step that prunes. The unembed BIND prints
+                    // what it bound and how, and a table that silently becomes 512
+                    // rows wide for half the matmuls in the process is a bigger
+                    // change than that -- a run whose log does not say it happened
+                    // cannot be told apart from one where the flag was ignored.
+                    if !drafted_pruned {
+                        drafted_pruned = true;
+                        println!(
+                            "  draft unembed PRUNED to {want} of {v} rows ({:.2} MiB gathered per \
+                             step against {:.2} GiB streamed per depth); INK_DRAFT_TOPK={draft_topk} \
+                             -- DRAFTS AND ACCEPTANCE CHANGE, this is not the unpruned model",
+                            (want * h * 2) as f64 / (1024.0 * 1024.0),
+                            (t.vocab_size * h * 2) as f64 / GIB,
+                        );
+                    }
+                    let ub = unembed_bytes
                         .as_ref()
                         .expect("drafting needs the unembed table");
-                    let hs = dev_lane::rms_norm(
-                        up2::<Bk>(row.to_vec(), 1, h, &dev),
-                        fnorm_dev.clone().expect("drafting needs the final norm"),
-                        t.rms_norm_eps,
-                    )
-                    .div_scalar(t.logits_mup_width_multiplier as f32);
-                    down(dev_lane::linear_bf16(hs, ud).slice([0..1, 0..v]))
-                };
-                let mut b = 0usize;
-                for (i, &val) in dl.iter().take(v).enumerate() {
-                    if val > dl[b] {
-                        b = i;
+                    let mut buf = Vec::with_capacity(want * h * 2);
+                    for &tok in &idx {
+                        let o = tok as usize * h * 2;
+                        buf.extend_from_slice(&ub[o..o + h * 2]);
                     }
+                    Some((
+                        idx.iter().map(|&i| i as usize).collect(),
+                        mary::models::inkling::bf16gemm::Bf16W {
+                            h: fp4_client.create_from_slice(&buf),
+                            n: want,
+                            k: h,
+                            // A buffer this process just created, not a view into
+                            // the pile's 4-aligned arena -- the same thing
+                            // `INK_ALIGN_COPY` copies for.
+                            align: 16,
+                        },
+                    ))
+                } else {
+                    None
+                };
+
+            // One draft head's unembedding, from a row that is already on the
+            // device. Both draft lanes end here, so the two wastes below were paid
+            // once per draft DEPTH on every pass that drafted.
+            //
+            // The readback: `down` used to pull the whole 201024-wide logits row
+            // (804 KB) to the host so a `for` loop could find one index in it.
+            // `argmax_row_dev` reduces where the data is and returns the index.
+            //
+            // The readback's only real consumer: `INK_MTP_PROB`, which is off by
+            // default. Nothing else ever looked at the row, so nothing else has to
+            // pay for it.
+            let draft_pick = |row: T2| -> usize {
+                let (ud, width) = match draft_cand.as_ref() {
+                    Some((_, w)) => (w, w.n),
+                    None => (
+                        unembed_w
+                            .as_ref()
+                            .expect("drafting needs the unembed table"),
+                        v,
+                    ),
+                };
+                let hs = dev_lane::rms_norm(
+                    row,
+                    fnorm_dev.clone().expect("drafting needs the final norm"),
+                    t.rms_norm_eps,
+                )
+                .div_scalar(t.logits_mup_width_multiplier as f32);
+                let lg = dev_lane::linear_bf16(hs, ud).slice([0..1, 0..width]);
+                let b = if mtp_prob {
+                    // The one caller that wants the row itself. Startup refuses
+                    // this together with a pruned table, so `width` is `v` here.
+                    let dl = down(lg);
+                    let mut b = 0usize;
+                    for (i, &val) in dl.iter().take(width).enumerate() {
+                        if val > dl[b] {
+                            b = i;
+                        }
+                    }
+                    draft_probs.borrow_mut().push(softmax_row(&dl[..width]));
+                    b
+                } else {
+                    argmax_row_dev(lg)
+                };
+                // A pruned table's outputs are candidates, not tokens.
+                match draft_cand.as_ref() {
+                    Some((ids, _)) => ids[b],
+                    None => b,
                 }
-                if mtp_prob {
-                    draft_probs.borrow_mut().push(softmax_row(&dl[..v]));
-                }
-                b
+            };
+
+            // The host draft lane's entry: a `&[f32]` row, uploaded and handed to
+            // the same unembedding.
+            let draft_argmax = |row: &[f32]| -> usize {
+                debug_assert_eq!(row.len(), h, "the draft head unembeds exactly one position");
+                draft_pick(up2::<Bk>(row.to_vec(), 1, h, &dev))
             };
 
             // The whole-sequence draft: every head over every position. This is what
@@ -7128,30 +7317,7 @@ fn main() -> Result<()> {
             // host twin above exists for the host draft lane and reads a `&[f32]`;
             // this one would otherwise pay a 16 KB readback and a 16 KB upload per
             // draft for the privilege of handing the value straight back.
-            let draft_argmax_dev = |row: T2| -> usize {
-                let dl = {
-                    let ud = unembed_w
-                        .as_ref()
-                        .expect("drafting needs the unembed table");
-                    let hs = dev_lane::rms_norm(
-                        row,
-                        fnorm_dev.clone().expect("drafting needs the final norm"),
-                        t.rms_norm_eps,
-                    )
-                    .div_scalar(t.logits_mup_width_multiplier as f32);
-                    down(dev_lane::linear_bf16(hs, ud).slice([0..1, 0..v]))
-                };
-                let mut b = 0usize;
-                for (i, &val) in dl.iter().take(v).enumerate() {
-                    if val > dl[b] {
-                        b = i;
-                    }
-                }
-                if mtp_prob {
-                    draft_probs.borrow_mut().push(softmax_row(&dl[..v]));
-                }
-                b
-            };
+            let draft_argmax_dev = |row: T2| -> usize { draft_pick(row) };
 
             draft_probs.borrow_mut().clear();
             let t_mtp = Instant::now();
