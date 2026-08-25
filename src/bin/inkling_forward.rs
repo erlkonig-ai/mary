@@ -373,18 +373,28 @@
 //! argmax, on the same rows, through the same unembedding. That row is the one
 //! that makes the rest readable, and it had never been measured:
 //!
-//!   3732-token document, 2048 scored positions per depth, concat hidden-first
+//! 2048 scored positions per depth, concat hidden-first, both corpora:
 //!
-//!     depth 0 (THE MAIN STACK)   0.2988   [0.2794, 0.3190]   (see the note below)
-//!     depth 1                    0.2266   [0.2090, 0.2452]
-//!     depth 2                    0.1929
-//!     depth 3                    0.2085
-//!     depth 4                    0.2319
+//!                          corpus A (3732)   corpus B (3988)
+//!     depth 0 (MAIN STACK)      0.2988           0.3369  [0.3168, 0.3577]
+//!     depth 1                   0.2266           0.2593  [0.2408, 0.2787]
+//!     depth 2                   0.1929           0.2358
+//!     depth 3                   0.2085           0.2383
+//!     depth 4                   0.2319           0.2495
 //!
-//! An independent check, on a different 3988-token document and a different
-//! binary: a sibling's teacher-forced top-5 dump gives the main stack 1309/3987
-//! = **0.3283** top-1 and 0.5179 top-5. So ~0.30 is what this checkpoint scores
-//! on real text, and it is not an artefact of this instrument.
+//!     depth 1 / depth 0            76%              77%
+//!
+//! Corpus A's depth-0 row is the pre-fix one (see the caveat below) and is a
+//! lower bound; corpus B's is the corrected instrument.
+//!
+//! **And corpus B's ceiling is independently confirmed.** A sibling ran the same
+//! 3988 tokens teacher-forced through the model's ORDINARY logits path with a
+//! different binary and dumped top-5 per position: 1309/3987 = **0.3283** top-1,
+//! 0.5179 top-5. This instrument reads 0.3369 on the same file, whose interval
+//! [0.3168, 0.3577] contains it. Two implementations, two paths, one number.
+//!
+//! So ~0.33 is what this checkpoint scores on real text, and the ratio the
+//! draft head holds against it is 76-77% on BOTH corpora.
 //!
 //! CAVEAT on the depth-0 row above, kept rather than quietly restated: it was
 //! measured through the final norm TWICE. The rows it scores are `entry`, which
@@ -398,8 +408,8 @@
 //! MTP heads' output, which had not been normed before.
 //!
 //! Which means the draft head reaches **roughly three quarters of the main
-//! stack's own accuracy on the equivalent task** (0.2266 against a ceiling of
-//! 0.2988-0.3283, so 69-76% depending on which ceiling you take), and the per-depth table being FLAT is not a symptom:
+//! stack's own accuracy on the equivalent task** -- 76% and 77% on the two
+//! corpora, which is a steadier number than either rate alone --, and the per-depth table being FLAT is not a symptom:
 //! as `d` grows the head gets more true-token context through the chained
 //! embeddings and a staler hidden state, and the two roughly cancel.
 //!
