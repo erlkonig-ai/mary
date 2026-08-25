@@ -7,33 +7,59 @@
 //! x at `MTILE = 16`, with `CubeDim = 32` — ONE WARP per output tile. So at
 //! decode (`m_pad = 16`, one m-tile) the launch is exactly `n / 8` warps:
 //!
-//!   head    n = 201024  ->  25128 cubes
-//!   gate_up n =   8192  ->   1024 cubes
-//!   down    n =   4096  ->    512 cubes
+//!   head    n = 201024  ->  25128 cubes      (523 per SM, ~22 full waves)
+//!   gate_up n =   8192  ->   1024 cubes      (21 per SM, under one wave)
+//!   down    n =   4096  ->    512 cubes      (11 per SM, under half a wave)
 //!
-//! against 48 SMs. That is the shape difference stated as a number, and this
-//! binary is the four probes that decide whether it is the CAUSE.
+//! against 48 SMs. That is the shape difference stated as a number.
 //!
-//! * `n` sweep at fixed `k`  — cubes vary, bytes vary with them.
-//! * `k` sweep at fixed `n`  — **cubes held FIXED at 512**, bytes vary. This is
-//!   the discriminator. A fixed per-launch overhead `t = t0 + B/BW` must show
-//!   GB/s CLIMBING as `k` grows (the same `t0` amortised over more bytes). A
-//!   concurrency limit must show it FLAT (512 warps pull what 512 warps pull,
-//!   whatever the trip count).
-//! * `m_pad` sweep at fixed `n, k` — cubes vary, weight bytes held fixed.
-//! * a null launch at the same grids, and a fused-vs-split run of the REAL sink
-//!   shapes: 42 launches against one launch of identical total cubes and bytes.
+//! # Instrument
 //!
-//! Every store is sentinel-guarded so no probe charges write traffic to a read
-//! figure. Min-of-N warm launches, launch + sync, no host readback.
+//! Two things contaminated the first version of this sweep and both are fixed
+//! here.
+//!
+//! * **The output allocation.** `w4a16_linear_launch` calls `client.empty` for
+//!   its own `out` on every call, and that measures ~20 us — which is 15% of a
+//!   9 MiB sink GEMM and invisible at the head. [`launch_into`] is the same
+//!   launch against a PRE-ALLOCATED output, so nothing in a timing loop
+//!   allocates.
+//! * **Drift.** Sweeping shapes in sequential blocks lets a clock ramp or a
+//!   neighbouring process land entirely on one end of a curve. Every sweep here
+//!   is ROUND-ROBIN: round `r` touches every shape once, and each shape keeps
+//!   the min over rounds.
+//!
+//! Each measurement is reported two ways, and the pair is the point:
+//!
+//! * `pipe` — `REPS` launches back to back with ONE sync at the end, divided by
+//!   `REPS`. Host-side launch cost overlaps the device, so this is the device's
+//!   steady-state cost for that grid.
+//! * `solo` — one launch, one sync. `solo - pipe` is what a launch costs that a
+//!   pipelined launch does not pay.
+//!
+//! # Probes
+//!
+//! * `n` sweep at fixed `k` — cubes vary, bytes vary with them. The curve.
+//! * `k` sweep at fixed `n` — **cubes held FIXED**, bytes vary. The
+//!   discriminator between a fixed per-launch overhead (`t = t0 + B/BW`, which
+//!   must show GB/s CLIMBING as `k` grows) and a concurrency limit (flat).
+//! * split vs fused on the REAL sink shapes: 14 and 28 launches against one
+//!   launch of identical total cubes and identical total bytes.
 
 use std::time::Instant;
 
+use cubecl::e4m3;
 use cubecl::future;
 use cubecl::prelude::*;
-use mary::models::inkling::w4a16gemm::w4a16_linear_launch;
+use cubecl::server::Handle;
+use half::bf16;
+use mary::models::inkling::w4a16gemm::{CODES_PER_WORD, GROUP, MTILE, NTILE, w4a16_linear};
 
 type Rt = cubecl::cuda::CudaRuntime;
+
+/// Repeats inside one pipelined burst.
+const REPS: usize = 20;
+/// Round-robin rounds over a sweep; each shape keeps its min.
+const ROUNDS: usize = 6;
 
 /// Bytes the weight side of a `[n, k]` W4A16 operand occupies: `k/2` packed
 /// code bytes plus `k/16` E4M3 scale bytes per row.
@@ -41,244 +67,245 @@ fn table_bytes(n: usize, k: usize) -> usize {
     n * (k / 8) * 4 + n * (k / 16)
 }
 
-/// A launch that reads nothing and writes nothing — the fixed cost of getting a
-/// grid onto the device, and nothing else.
-#[cube(launch)]
-pub fn null_kernel(out: &mut Tensor<u32>) {
-    let t = ABSOLUTE_POS as usize;
-    let acc = u32::cast_from(t);
-    // Sentinel-guarded: the launch pays for no traffic at all, which is the
-    // point — this row is the fixed cost of a grid, not of a memory access.
-    if acc == u32::new(0x5AFE_5AFEi64) {
-        out[t % out.len()] = acc;
-    }
+/// [`w4a16_linear_launch`] with the output handed IN.
+///
+/// Byte-identical launch to the library's, minus the `client.empty` — which is
+/// the whole reason this exists. See the module header.
+#[allow(clippy::too_many_arguments)]
+fn launch_into(
+    client: &ComputeClient<Rt>,
+    a: &Handle,
+    b: &Handle,
+    b_sc: &Handle,
+    out: &Handle,
+    m_pad: usize,
+    k: usize,
+    n: usize,
+) {
+    let vs = 32 / bf16::cube_type().size_bits();
+    let wpr = k / CODES_PER_WORD;
+    let spr = k / GROUP;
+    unsafe {
+        w4a16_linear::launch::<bf16, e4m3, Rt>(
+            client,
+            CubeCount::Static((m_pad / MTILE) as u32, (n / NTILE) as u32, 1),
+            CubeDim::new_1d(32),
+            vs,
+            2,
+            TensorArg::from_raw_parts(a.clone(), [k, 1].into(), [m_pad, k].into()),
+            TensorArg::from_raw_parts(b.clone(), [wpr, 1].into(), [n, wpr].into()),
+            TensorArg::from_raw_parts(b_sc.clone(), [spr, 1].into(), [n, spr].into()),
+            TensorArg::from_raw_parts(out.clone(), [n, 1].into(), [m_pad, n].into()),
+            k,
+            n,
+            1.0f32,
+        )
+    };
 }
 
-struct Timed {
-    ms: f64,
-    gbs: f64,
-    cubes: u32,
+/// Operands for one shape, allocated once and reused across every round.
+struct Shape {
+    m_pad: usize,
+    k: usize,
+    n: usize,
+    a: Handle,
+    b: Handle,
+    sc: Handle,
+    out: Handle,
+    pipe: f64,
+    solo: f64,
 }
 
-/// Time `w4a16_linear_launch` at one shape. Allocates its own operands, warms
-/// twice, keeps the min of the rest.
-fn time_shape(client: &ComputeClient<Rt>, m_pad: usize, k: usize, n: usize, iters: usize) -> Timed {
-    let bytes = table_bytes(n, k);
-    let a = client.empty(m_pad * k * 2);
-    let b = client.empty(n * (k / 8) * 4);
-    let b_sc = client.empty(n * (k / 16));
-    let mut best = f64::MAX;
-    for i in 0..iters {
-        let t0 = Instant::now();
-        let out = w4a16_linear_launch::<Rt>(client, &a, &b, &b_sc, m_pad, k, n, 1.0);
-        let _ = future::block_on(client.sync());
-        let dt = t0.elapsed().as_secs_f64();
-        drop(out);
-        if i >= 2 {
-            best = best.min(dt);
+impl Shape {
+    fn new(client: &ComputeClient<Rt>, m_pad: usize, k: usize, n: usize) -> Self {
+        Shape {
+            m_pad,
+            k,
+            n,
+            a: client.empty(m_pad * k * 2),
+            b: client.empty(n * (k / 8) * 4),
+            sc: client.empty(n * (k / 16)),
+            out: client.empty(m_pad * n * 4),
+            pipe: f64::MAX,
+            solo: f64::MAX,
         }
     }
-    Timed {
-        ms: best * 1e3,
-        gbs: bytes as f64 / best / 1e9,
-        cubes: ((m_pad / 16) * (n / 8)) as u32,
+    fn cubes(&self) -> usize {
+        (self.m_pad / MTILE) * (self.n / NTILE)
     }
+    fn bytes(&self) -> usize {
+        table_bytes(self.n, self.k)
+    }
+    fn round(&mut self, client: &ComputeClient<Rt>, keep: bool) {
+        let t0 = Instant::now();
+        for _ in 0..REPS {
+            launch_into(
+                client, &self.a, &self.b, &self.sc, &self.out, self.m_pad, self.k, self.n,
+            );
+        }
+        let _ = future::block_on(client.sync());
+        let dt = t0.elapsed().as_secs_f64() / REPS as f64;
+        let t1 = Instant::now();
+        launch_into(
+            client, &self.a, &self.b, &self.sc, &self.out, self.m_pad, self.k, self.n,
+        );
+        let _ = future::block_on(client.sync());
+        let ds = t1.elapsed().as_secs_f64();
+        if keep {
+            self.pipe = self.pipe.min(dt);
+            self.solo = self.solo.min(ds);
+        }
+    }
+}
+
+/// Run a set of shapes round-robin and print one table.
+fn sweep(client: &ComputeClient<Rt>, title: &str, mut shapes: Vec<Shape>) -> Vec<Shape> {
+    println!("\n--- {title} ---");
+    // Two unkept rounds: compile every kernel and let the clock settle before
+    // any shape is charged for it.
+    for r in 0..ROUNDS + 2 {
+        for s in shapes.iter_mut() {
+            s.round(client, r >= 2);
+        }
+    }
+    println!(
+        "{:>7} {:>7} {:>7} {:>7} {:>9} {:>9} {:>9} {:>8} {:>8}",
+        "m_pad", "k", "n", "cubes", "MiB", "pipe ms", "solo ms", "GB/s", "ovh us"
+    );
+    for s in &shapes {
+        println!(
+            "{:>7} {:>7} {:>7} {:>7} {:>9.2} {:>9.4} {:>9.4} {:>8.1} {:>8.1}",
+            s.m_pad,
+            s.k,
+            s.n,
+            s.cubes(),
+            s.bytes() as f64 / (1u64 << 20) as f64,
+            s.pipe * 1e3,
+            s.solo * 1e3,
+            s.bytes() as f64 / s.pipe / 1e9,
+            (s.solo - s.pipe) * 1e6
+        );
+    }
+    shapes.clear();
+    shapes
 }
 
 fn main() {
     let client = Rt::client(&Default::default());
-    let iters: usize = std::env::var("INK_ITERS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8);
-
     println!("=== w4a16_linear: one 32-thread cube per (m_tile 16, n_tile 8) ===");
-    println!("48 SMs on GB10. cubes = (m_pad/16) * (n/8).\n");
+    println!("48 SMs on GB10.  cubes = (m_pad/16) * (n/8).");
+    println!("pipe = {REPS} launches, one sync, divided.  solo = 1 launch + 1 sync.");
+    println!("GB/s is over the WEIGHT table (codes + E4M3 scales) at pipe.");
 
     // ---- 1. n sweep at k = 4096, m_pad = 16 --------------------------------
-    // Cubes and bytes move together. This is the curve: where does 64 become 98?
-    println!("--- n sweep   (k=4096, m_pad=16)  cubes = n/8 ---");
-    println!(
-        "{:>8}  {:>8}  {:>10}  {:>9}  {:>8}",
-        "n", "cubes", "bytes MiB", "ms", "GB/s"
+    // Cubes and bytes move together. Where does 64 become 98?
+    let ns = [
+        1024usize, 2048, 3072, 4096, 6144, 8192, 10240, 12288, 16384, 20480, 24576, 32768, 49152,
+        65536, 98304, 131072, 201024,
+    ];
+    sweep(
+        &client,
+        "n sweep (k=4096, m_pad=16): cubes = n/8",
+        ns.iter()
+            .map(|&n| Shape::new(&client, 16, 4096, n))
+            .collect(),
     );
-    for n in [
-        512usize, 1024, 2048, 3072, 4096, 6144, 8192, 10240, 12288, 16384, 20480, 24576, 32768,
-        49152, 65536, 98304, 131072, 201024,
-    ] {
-        let t = time_shape(&client, 16, 4096, n, iters);
-        println!(
-            "{:>8}  {:>8}  {:>10.2}  {:>9.4}  {:>8.1}",
-            n,
-            t.cubes,
-            table_bytes(n, 4096) as f64 / (1u64 << 20) as f64,
-            t.ms,
-            t.gbs
-        );
-    }
 
-    // ---- 2. k sweep at n = 4096, m_pad = 16 --------------------------------
-    // THE DISCRIMINATOR. 512 cubes at every row; only the k-trip count moves.
-    println!("\n--- k sweep   (n=4096, m_pad=16)  cubes FIXED at 512 ---");
-    println!(
-        "{:>8}  {:>8}  {:>10}  {:>9}  {:>8}",
-        "k", "cubes", "bytes MiB", "ms", "GB/s"
+    // ---- 2. k sweep, cubes held fixed --------------------------------------
+    // THE DISCRIMINATOR. If a fixed per-launch cost t0 were the shortfall, GB/s
+    // must climb toward the asymptote as k (and so the bytes) grow at constant
+    // grid. If it is a concurrency limit, it must not.
+    sweep(
+        &client,
+        "k sweep (n=4096, m_pad=16): cubes FIXED at 512",
+        [1024usize, 2048, 4096, 8192, 16384, 32768, 65536]
+            .iter()
+            .map(|&k| Shape::new(&client, 16, k, 4096))
+            .collect(),
     );
-    for k in [1024usize, 2048, 4096, 8192, 16384, 32768, 65536] {
-        let t = time_shape(&client, 16, k, 4096, iters);
-        println!(
-            "{:>8}  {:>8}  {:>10.2}  {:>9.4}  {:>8.1}",
-            k,
-            t.cubes,
-            table_bytes(4096, k) as f64 / (1u64 << 20) as f64,
-            t.ms,
-            t.gbs
-        );
-    }
-
-    // Same at the gate_up n, so the discriminator is not a property of n=4096.
-    println!("\n--- k sweep   (n=8192, m_pad=16)  cubes FIXED at 1024 ---");
-    println!(
-        "{:>8}  {:>8}  {:>10}  {:>9}  {:>8}",
-        "k", "cubes", "bytes MiB", "ms", "GB/s"
+    sweep(
+        &client,
+        "k sweep (n=8192, m_pad=16): cubes FIXED at 1024",
+        [1024usize, 2048, 4096, 8192, 16384, 32768]
+            .iter()
+            .map(|&k| Shape::new(&client, 16, k, 8192))
+            .collect(),
     );
-    for k in [1024usize, 2048, 4096, 8192, 16384, 32768] {
-        let t = time_shape(&client, 16, k, 8192, iters);
-        println!(
-            "{:>8}  {:>8}  {:>10.2}  {:>9.4}  {:>8.1}",
-            k,
-            t.cubes,
-            table_bytes(8192, k) as f64 / (1u64 << 20) as f64,
-            t.ms,
-            t.gbs
-        );
-    }
-
-    // ---- 3. m_pad sweep at n = 4096, k = 4096 ------------------------------
-    // Cubes rise; the weight table does NOT. GB/s below counts the weight only,
-    // so a rise means the extra cubes are being served without extra DRAM.
-    println!(
-        "\n--- m_pad sweep  (n=4096, k=4096)  weight bytes FIXED at {:.2} MiB ---",
-        table_bytes(4096, 4096) as f64 / (1u64 << 20) as f64
+    // And at a grid that DOES fill the device, as the control: here the same
+    // k axis should be flat and high, because concurrency is not the binding
+    // constraint any more.
+    sweep(
+        &client,
+        "k sweep (n=65536, m_pad=16): cubes FIXED at 8192 (fills the device)",
+        [1024usize, 2048, 4096, 8192]
+            .iter()
+            .map(|&k| Shape::new(&client, 16, k, 65536))
+            .collect(),
     );
-    println!(
-        "{:>8}  {:>8}  {:>9}  {:>10}",
-        "m_pad", "cubes", "ms", "GB/s wt"
+
+    // ---- 3. the real sink shapes and the head, side by side ----------------
+    sweep(
+        &client,
+        "the real shapes",
+        vec![
+            Shape::new(&client, 16, 2048, 4096),   // down
+            Shape::new(&client, 16, 4096, 8192),   // gate_up
+            Shape::new(&client, 16, 4096, 201024), // head
+        ],
     );
-    for m in [16usize, 32, 64, 128, 256, 512] {
-        let t = time_shape(&client, m, 4096, 4096, iters);
-        println!("{:>8}  {:>8}  {:>9.4}  {:>10.1}", m, t.cubes, t.ms, t.gbs);
-    }
 
-    // ---- 4. fixed per-launch cost ------------------------------------------
-    // Back-to-back null launches with ONE sync at the end: the amortised cost of
-    // a launch with no memory traffic under it, which is what candidate 2 needs.
-    println!("\n--- null launch cost (no traffic) ---");
-    let dst = client.empty(4096);
-    for cubes in [512u32, 1024, 25128] {
-        let reps = 200usize;
-        let mut best = f64::MAX;
-        for i in 0..6 {
-            let t0 = Instant::now();
-            for _ in 0..reps {
-                unsafe {
-                    null_kernel::launch::<Rt>(
-                        &client,
-                        CubeCount::Static(1, cubes, 1),
-                        CubeDim::new_1d(32),
-                        TensorArg::from_raw_parts(dst.clone(), [1].into(), [1024].into()),
-                    )
-                };
-            }
-            let _ = future::block_on(client.sync());
-            let dt = t0.elapsed().as_secs_f64();
-            if i >= 2 {
-                best = best.min(dt);
-            }
-        }
-        println!(
-            "  grid y = {:>6} cubes : {:>7.2} us per launch  ({reps} back to back, one sync)",
-            cubes,
-            best / reps as f64 * 1e6
-        );
-    }
-    // And the output allocation the GEMM launcher does per call.
-    {
-        let mut best = f64::MAX;
-        for i in 0..8 {
-            let t0 = Instant::now();
-            let h = client.empty(16 * 8192 * 4);
-            let _ = future::block_on(client.sync());
-            let dt = t0.elapsed().as_secs_f64();
-            drop(h);
-            if i >= 2 {
-                best = best.min(dt);
-            }
-        }
-        println!(
-            "  out alloc + sync (m_pad=16, n=8192) : {:>7.2} us",
-            best * 1e6
-        );
-    }
-
-    // ---- 5. the real sink pass: 42 split launches vs 1 fused ---------------
-    // Identical total cubes and identical total bytes. If splitting is the cost,
-    // the fused row is faster by exactly that much.
-    println!("\n--- real sink shapes: split vs fused (same bytes, same total cubes) ---");
-    let n_moe = 14usize;
+    // ---- 4. split vs fused, identical bytes and identical total cubes ------
+    // 14 (28) launches of a sink shape against ONE launch covering the same n.
+    // Both pipelined, both with pre-allocated outputs, so the only difference
+    // is where the kernel boundaries fall.
+    println!("\n--- split vs fused (same bytes, same total cubes, no allocation in the loop) ---");
     for (label, per_n, k, count) in [
-        ("gate_up [8192,4096]", 8192usize, 4096usize, n_moe),
-        ("down    [4096,2048]", 4096usize, 2048usize, n_moe * 2),
+        ("gate_up [8192,4096]", 8192usize, 4096usize, 14usize),
+        ("down    [4096,2048]", 4096usize, 2048usize, 28usize),
     ] {
-        // split: `count` independent launches of `per_n`.
         let a = client.empty(16 * k * 2);
-        let bs: Vec<_> = (0..count)
+        let parts: Vec<(Handle, Handle, Handle)> = (0..count)
             .map(|_| {
                 (
                     client.empty(per_n * (k / 8) * 4),
                     client.empty(per_n * (k / 16)),
+                    client.empty(16 * per_n * 4),
                 )
             })
             .collect();
+        let big_n = per_n * count;
+        let mut fused = Shape::new(&client, 16, k, big_n);
+        let bytes = table_bytes(per_n, k) * count;
         let mut split = f64::MAX;
-        for i in 0..6 {
+        for r in 0..ROUNDS + 2 {
             let t0 = Instant::now();
-            let outs: Vec<_> = bs
-                .iter()
-                .map(|(b, sc)| w4a16_linear_launch::<Rt>(&client, &a, b, sc, 16, k, per_n, 1.0))
-                .collect();
+            for (b, sc, out) in &parts {
+                launch_into(&client, &a, b, sc, out, 16, k, per_n);
+            }
             let _ = future::block_on(client.sync());
             let dt = t0.elapsed().as_secs_f64();
-            drop(outs);
-            if i >= 2 {
+            fused.round(&client, r >= 2);
+            if r >= 2 {
                 split = split.min(dt);
             }
         }
-        drop(bs);
-        // fused: one launch, n = per_n * count.
-        let big_n = per_n * count;
-        let t = time_shape(&client, 16, k, big_n, 6);
-        let bytes = table_bytes(per_n, k) * count;
         println!(
-            "{label}  x{count}   bytes {:.1} MiB   cubes {:>6}",
+            "{label}  x{count}   {:.1} MiB   {} cubes total",
             bytes as f64 / (1u64 << 20) as f64,
             (per_n / 8) * count
         );
         println!(
-            "    split  {count} launches : {:>8.4} ms   {:>6.1} GB/s",
+            "    split {count:>2} launches of {:>5} cubes : {:>8.4} ms   {:>6.1} GB/s",
+            per_n / 8,
             split * 1e3,
             bytes as f64 / split / 1e9
         );
         println!(
-            "    fused  1 launch n={big_n:<7}: {:>8.4} ms   {:>6.1} GB/s",
-            t.ms, t.gbs
+            "    fused  1 launch  of {:>5} cubes : {:>8.4} ms   {:>6.1} GB/s   ({:.2}x)",
+            big_n / 8,
+            fused.pipe * 1e3,
+            bytes as f64 / fused.pipe / 1e9,
+            split / fused.pipe
         );
     }
-
-    // ---- 6. the head row, last, for the anchor -----------------------------
-    let h = time_shape(&client, 16, 4096, 201024, iters);
-    println!(
-        "\nhead  n=201024 k=4096 m_pad=16 : {:.4} ms  {:.1} GB/s  ({} cubes)",
-        h.ms, h.gbs, h.cubes
-    );
 }
