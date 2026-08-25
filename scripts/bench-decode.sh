@@ -74,7 +74,7 @@
 #     --no-repeat     do not set INK_REPEAT=1 (you are measuring a growing
 #                     sequence on purpose; say so in the notes)
 #     --note TEXT     free text carried into the framing rule
-#     --util-max N    max GPU utilisation %% to call idle (default 5)
+#     --util-max N    max GPU utilisation percent to call idle (default 5)
 #     --load-max N    max 1-minute loadavg to call the host idle (default 2.0)
 #     --samples N     idle samples, 1 s apart (default 3)
 #     --allow-busy    downgrade OUR OWN contention to a warning. Never lifts the
@@ -82,15 +82,23 @@
 #     --allow-stale   downgrade the build-provenance refusals to warnings, and
 #                     stamp every result STALE. Does not lift the two-arms-are-
 #                     the-same-binary refusal.
+#     --out DIR       where the logs and the TSV go (default /tmp/bench-decode-<ts>)
+#     --gate-only     run the gate, print what it found, exit
+#     --              everything after this is passed to the binary (pile,
+#                     prompt ids, output path)
+#     -h|--help       this text
 #
 #   An arm may name its own binary with `BENCH_BIN=<path>` inside its env
 #   string, which is how you A/B two BUILDS rather than two environments:
 #
 #     scripts/bench-decode.sh -n 3 'before:BENCH_BIN=/tmp/a/inkling_forward' \
 #                                  'after:BENCH_BIN=/tmp/b/inkling_forward'
-#     --out DIR       where the logs and the TSV go (default /tmp/bench-decode-<ts>)
-#     --gate-only     run the gate, print what it found, exit
-#     -h|--help       this text
+#
+# A WORKED CALL
+#
+#   scripts/bench-decode.sh -n 3 --gen 16 --layers 0:21 \
+#     base: 'tuned:INK_GEMM_AUTOTUNE=1' \
+#     -- ~/converted/inkling-small-complete.pile /tmp/prompt.ids /tmp/out.bin
 #
 # WHERE IT RUNS: on the box with the GPU. It reads `nvidia-smi` locally.
 
