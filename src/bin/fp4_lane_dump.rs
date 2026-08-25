@@ -24,6 +24,7 @@ use std::time::Instant;
 use cubecl::future;
 
 use cubecl::prelude::*;
+use mary::models::inkling::bf16gemm::{Lane, try_w4a16_linear_cubek_launch};
 use mary::models::inkling::fp4gemm::fp4_linear_launch;
 use mary::models::inkling::w4a16gemm::{w4a16_linear_launch, w4a16_linear_wide_launch};
 
@@ -109,6 +110,51 @@ fn main() {
         drop(out);
         if i >= 2 {
             wide_s = wide_s.min(dt);
+        }
+    }
+
+    // The tuned lane with a four-bit RHS: cubek dequantises on the global read,
+    // inside its own staged tiling. The TMA lanes decline a quantised operand,
+    // so only the sync ones are worth asking.
+    for lane in [
+        Lane::Auto,
+        Lane::SimpleCyclicMma,
+        Lane::DoubleCyclicMma,
+        Lane::OrderedDoubleMma,
+        Lane::SimpleCyclicCmma,
+        Lane::DoubleTmaMma,
+    ] {
+        let mut best = f64::MAX;
+        let mut err = None;
+        for i in 0..6 {
+            let tq = Instant::now();
+            match try_w4a16_linear_cubek_launch::<Rt>(&client, &a, &b, &b_sc, m_pad, k, n, lane) {
+                Ok(o) => {
+                    let _ = future::block_on(client.sync());
+                    let dt = tq.elapsed().as_secs_f64();
+                    drop(o);
+                    if i >= 2 {
+                        best = best.min(dt);
+                    }
+                }
+                Err(e) => {
+                    err = Some(format!("{e:?}"));
+                    break;
+                }
+            }
+        }
+        match err {
+            Some(e) => println!(
+                "cubek q4 {:<18} declined: {}",
+                lane.name(),
+                e.chars().take(90).collect::<String>()
+            ),
+            None => println!(
+                "cubek q4 {:<18} {:8.3} ms   {:6.1} GB/s",
+                lane.name(),
+                best * 1e3,
+                (codes + scales) as f64 / best / 1e9
+            ),
         }
     }
 
