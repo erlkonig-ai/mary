@@ -118,6 +118,29 @@
 //! Set `INK_MTP` on the TAIL process only. It is refused on a head, which holds
 //! neither the final hidden state nor a way to turn one into a token.
 //!
+//! ## What a draft costs, and `INK_DRAFT_TOPK`
+//!
+//! A draft is one MTP block and one unembedding, and the second of those is the
+//! expensive half: the table is `201024 x 4096` BF16, 1.65 GiB, and every draft
+//! DEPTH streams all of it to keep one token. That is the same weight stream the
+//! stage timer charges to `head / unembed`, paid again per depth, and it is why
+//! speculation on this stack has to be argued rather than assumed.
+//!
+//! Two of the three costs there were pure overhead and are gone unconditionally:
+//! the full logits row is no longer read back to the host (only the winning index
+//! is, via [`argmax_row_dev`]), and the readback that `INK_MTP_PROB` needs now
+//! happens only when `INK_MTP_PROB` is set. Neither changes a token.
+//!
+//! The weight stream itself is not overhead, and shrinking it means drafting
+//! against fewer tokens. `INK_DRAFT_TOPK=N` restricts the DRAFT's unembedding to
+//! the N tokens the main model just ranked highest at this position — gathered
+//! once per step, shared by every depth, 4 MiB at N = 512 against 1.65 GiB. A
+//! token outside that set can no longer be drafted, so drafts and acceptance
+//! both move; the flag is default-off precisely so the trade is an ablation and
+//! not a silent change to what the runtime predicts. It is refused together with
+//! `INK_MTP_PROB`, which scores the draft's distribution by full-vocabulary token
+//! index and would otherwise be handed 512 numbers about a different index space.
+//!
 //! # The decode baseline, and the exact configuration that produced it
 //!
 //! Two rates get quoted for this model and they are not the same number, so
