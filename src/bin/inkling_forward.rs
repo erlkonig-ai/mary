@@ -8675,7 +8675,7 @@ fn main() -> Result<()> {
                 // wrong answer -- the rows that were rescored are exact -- it is
                 // a step whose top was flat enough that the budget did not cover
                 // it, and it is worth seeing rather than averaging away.
-                if a.shortlist > ann_budget() * 4 {
+                if a.shortlist > ann_budget() + ann_budget() / 4 + 1024 {
                     "  OVERFLOW: only the first budget*4 were rescored"
                 } else {
                     ""

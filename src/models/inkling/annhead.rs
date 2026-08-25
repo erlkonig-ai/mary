@@ -876,7 +876,12 @@ pub fn ann_logits<R: Runtime, E: Scalar>(
     let n = sketch.n;
     let k = sketch.k;
     let words = k / BITS_PER_WORD;
-    let cap = budget * 4;
+    // The shortlist can only OVERSHOOT the budget by the rows in the histogram
+    // bin the floor landed in, because the floor is that bin's bottom edge.
+    // Measured on the real unembedding at `budget = 8192`: 8297 rows, a 1.3%
+    // overshoot. A quarter is ample and it is not free -- `cap` is the rescore's
+    // grid, so every slot past the count is an empty cube launched and retired.
+    let cap = budget + budget / 4 + 1024;
 
     let qrot = client.empty(k * core::mem::size_of::<f32>());
     unsafe {
