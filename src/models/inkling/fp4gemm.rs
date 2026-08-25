@@ -235,6 +235,225 @@ pub fn fp4_linear<AB: Scalar, S: Scalar, NA: Size, NC: Size>(
     }
 }
 
+/// [`fp4_linear`] with the B operand staged through shared memory.
+///
+/// The dense sibling of
+/// [`super::moegroup::fp4_linear_grouped_smem`], and the same argument: the
+/// `m16n8k64` B fragment is 8 columns of `[n, k]`, so a plane's B load spans
+/// eight weight rows `k / 2` bytes apart and spends eight sector requests on
+/// 128 useful bytes where a coalesced 32-bit stream spends four. The global
+/// read becomes a per-row contiguous stream, the plane fills shared memory, and
+/// only the smem read keeps the fragment's shape. Nothing about the k order,
+/// the operands or the accumulator changes, so this is bit-identical to
+/// [`fp4_linear`].
+///
+/// A cube here is ONE plane ([`fp4_linear_launch`] launches `CubeDim(32)`), so
+/// the fill is not cooperative across planes and there is no barrier to pay:
+/// the warp stages its own eight rows and reads them back. `sync_plane` is
+/// still needed — shared memory written by one lane and read by another is not
+/// ordered by the lockstep the fragment layout otherwise relies on.
+///
+/// `stage_sc` extends the staging to the block scales, and it is a separate
+/// knob because the two are separate defects. This kernel reads its four E4M3
+/// scales as four INDIVIDUAL `Tensor<S>` bytes — four instructions, each
+/// spanning the same eight rows, i.e. 32 sector requests a k tile against the
+/// codes' 16 — where the grouped kernel already reads them as one 32-bit
+/// vector. Staging them collapses that; leaving it off measures the code
+/// staging alone against an unchanged baseline.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn fp4_linear_smem<AB: Scalar, S: Scalar, NA: Size, NC: Size>(
+    a: &Tensor<Vector<AB, NA>>,
+    a_sc: &Tensor<S>,
+    b: &Tensor<Vector<AB, NA>>,
+    b_sc: &Tensor<S>,
+    out: &mut Tensor<Vector<f32, NC>>,
+    #[comptime] size_k: usize,
+    #[comptime] size_n: usize,
+    #[comptime] kc: usize,
+    #[comptime] pad: usize,
+    #[comptime] stage_sc: bool,
+    scale: f32,
+) {
+    let def = cmma::MmaDefinition::<AB, AB, f32>::new_scaled::<S>(MTILE, NTILE, KTILE, 4usize);
+    let lane = UNIT_POS_PLANE;
+    let pack = AB::packing_factor();
+
+    let m_tile = CUBE_POS_X as usize;
+    let n_tile = CUBE_POS_Y as usize;
+    let n_base = n_tile * NTILE;
+    let m_base = m_tile * MTILE;
+
+    let ec_a = def.elems_per_lane(MatrixIdent::A);
+    let vs_a = def.vector_size(MatrixIdent::A);
+    let vc_a = comptime!(ec_a / vs_a);
+    let ec_b = def.elems_per_lane(MatrixIdent::B);
+    let vs_b = def.vector_size(MatrixIdent::B);
+    let vc_b = comptime!(ec_b / vs_b);
+    let ec_c = def.elems_per_lane(MatrixIdent::Accumulator);
+    let vs_c = def.vector_size(MatrixIdent::Accumulator);
+    let vc_c = comptime!(ec_c / vs_c);
+
+    let cs = comptime!(kc * 8 + pad);
+    let ss = comptime!(kc * 4 + pad);
+    let chunks = comptime!(size_k / KTILE / kc);
+    let words = comptime!(NTILE * kc * 8);
+    let words_s = comptime!(NTILE * kc * 4);
+    let per_c = comptime!(words.div_ceil(32));
+    let per_s = comptime!(words_s.div_ceil(32));
+
+    let mut sm = SharedMemory::<Vector<AB, NA>>::new(comptime!(NTILE * cs));
+    let mut sm_sc = SharedMemory::<S>::new(comptime!(if stage_sc { NTILE * ss } else { 1usize }));
+
+    let mut reg_a = Array::<Vector<AB, NA>>::new(vc_a);
+    let mut reg_b = Array::<Vector<AB, NA>>::new(vc_b);
+    let mut acc = Array::<Vector<f32, NC>>::new(vc_c);
+    #[unroll]
+    for i in 0..vc_c {
+        acc[i] = Vector::<f32, NC>::cast_from(0.0f32);
+    }
+
+    let size!(NS) = def.scales_vector_size();
+    let scales_count = def.scales_count();
+    let sia = def.scales_index(lane, MatrixIdent::A) as usize;
+    let sib = def.scales_index(lane, MatrixIdent::B) as usize;
+    let spr = comptime!(size_k / GROUP);
+    let u = lane as usize;
+
+    for c in 0..chunks {
+        // The fill. A warp covers `kc * 32` consecutive bytes of ONE weight row
+        // per pass, which at `kc >= 4` is whole 128-byte lines fully used.
+        #[unroll]
+        for j in 0..per_c {
+            let f = u + j * 32;
+            if f < words {
+                let r = f / comptime!(kc * 8);
+                let o = f % comptime!(kc * 8);
+                let gi = ((n_base + r) * size_k / 2 + c * comptime!(kc * KTILE / 2))
+                    / b.vector_size()
+                    + o;
+                sm[r * cs + o] = b[gi];
+            }
+        }
+        if comptime![stage_sc] {
+            #[unroll]
+            for j in 0..per_s {
+                let f = u + j * 32;
+                if f < words_s {
+                    let r = f / comptime!(kc * 4);
+                    let o = f % comptime!(kc * 4);
+                    sm_sc[r * ss + o] = b_sc[(n_base + r) * spr + c * comptime!(kc * 4) + o];
+                }
+            }
+        }
+        sync_plane();
+
+        #[unroll]
+        for tl in 0..kc {
+            let t = c * kc + tl;
+            let kbase = t * KTILE;
+            #[unroll]
+            for i in 0..vc_a {
+                let (row, col) =
+                    def.position_of_nth(lane, (i * vs_a * pack) as u32, MatrixIdent::A);
+                let gr = row as usize + m_base;
+                let gc = col as usize + kbase;
+                reg_a[i] = a[(gr * size_k / 2 + gc / 2) / a.vector_size()];
+            }
+            #[unroll]
+            for i in 0..vc_b {
+                let (row, col) =
+                    def.position_of_nth(lane, (i * vs_b * pack) as u32, MatrixIdent::B);
+                // `col` picks the weight row inside the staged tile, `row` the
+                // k element; `row` is a multiple of 8 for every fragment
+                // element, so the word inside the chunk is exact.
+                reg_b[i] = sm[col as usize * cs + row as usize / 8 + tl * 8];
+            }
+
+            let mut sa = Vector::<S, NS>::empty();
+            let mut sb = Vector::<S, NS>::empty();
+            #[unroll]
+            for i in 0..scales_count {
+                sa[i] = a_sc[(sia + m_base) * spr + t * 4 + i];
+                if comptime![stage_sc] {
+                    sb[i] = sm_sc[sib * ss + tl * 4 + i];
+                } else {
+                    sb[i] = b_sc[(sib + n_base) * spr + t * 4 + i];
+                }
+            }
+
+            let d = def.execute_scaled(&reg_a, &reg_b, &acc, sa, sb);
+            #[unroll]
+            for i in 0..vc_c {
+                acc[i] = d[i];
+            }
+        }
+        sync_plane();
+    }
+
+    #[unroll]
+    for i in 0..vc_c {
+        let (row, col) = def.position_of_nth(lane, (i * vs_c) as u32, MatrixIdent::Accumulator);
+        let gr = row as usize + m_base;
+        let gc = col as usize + n_base;
+        out[(gr * size_n + gc) / out.vector_size()] = acc[i] * Vector::<f32, NC>::cast_from(scale);
+    }
+}
+
+/// Launch [`fp4_linear_smem`]; the arguments of [`fp4_linear_launch`] plus the
+/// staging parameters.
+#[allow(clippy::too_many_arguments)]
+pub fn fp4_linear_smem_launch<R: Runtime>(
+    client: &ComputeClient<R>,
+    a: &Handle,
+    a_sc: &Handle,
+    b: &Handle,
+    b_sc: &Handle,
+    m_pad: usize,
+    k: usize,
+    n: usize,
+    scale: f32,
+    kc: usize,
+    pad: usize,
+    stage_sc: bool,
+) -> Handle {
+    assert_eq!(m_pad % MTILE, 0);
+    assert_eq!(n % NTILE, 0);
+    assert_eq!(k % KTILE, 0);
+    assert_eq!(
+        (k / KTILE) % kc,
+        0,
+        "k tiles are not a whole number of chunks"
+    );
+    assert!(n / NTILE <= 65535);
+
+    let out = client.empty(m_pad * n * core::mem::size_of::<f32>());
+    let vs = 32 / e2m1x2::cube_type().size_bits();
+    let spr = k / GROUP;
+
+    unsafe {
+        fp4_linear_smem::launch::<e2m1x2, e4m3, R>(
+            client,
+            CubeCount::Static((m_pad / MTILE) as u32, (n / NTILE) as u32, 1),
+            CubeDim::new_1d(32),
+            vs,
+            2,
+            TensorArg::from_raw_parts(a.clone(), [k / 2, 1].into(), [m_pad, k / 2].into()),
+            TensorArg::from_raw_parts(a_sc.clone(), [spr, 1].into(), [m_pad, spr].into()),
+            TensorArg::from_raw_parts(b.clone(), [k / 2, 1].into(), [n, k / 2].into()),
+            TensorArg::from_raw_parts(b_sc.clone(), [spr, 1].into(), [n, spr].into()),
+            TensorArg::from_raw_parts(out.clone(), [n, 1].into(), [m_pad, n].into()),
+            k,
+            n,
+            kc,
+            pad,
+            stage_sc,
+            scale,
+        )
+    };
+    out
+}
+
 /// De-interleave the fused gate/up result and apply the gate, in one pass.
 ///
 /// The checkpoint stores w13's output rows alternating `g0, u0, g1, u1, …`, so

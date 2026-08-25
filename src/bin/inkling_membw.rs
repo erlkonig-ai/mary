@@ -1131,6 +1131,62 @@ fn run_axes() -> Result<()> {
             bytes as f64 / (b - ab) / 1e9
         );
         let _ = af;
+
+        // ---- rows 35+: the same kernel with B staged --------------------
+        //
+        // `fp4_linear_smem` is row 15's kernel with the B fragment read out of
+        // shared memory, and the cube is ONE plane here, so the fill is the
+        // warp's own eight rows and there is no cross-plane barrier. It reads
+        // the same table, allocates the same output, pays the same store, and
+        // is bit-identical — so the difference from row 15 is the staging and
+        // nothing else.
+        //
+        // `stage_sc` is separate because the two defects are separate: this
+        // kernel reads its four E4M3 block scales as four INDIVIDUAL bytes,
+        // four instructions each spanning the same eight rows, i.e. 32 sector
+        // requests a k tile against the codes' 16. The grouped kernel already
+        // reads them as one 32-bit vector; this one does not, so leaving the
+        // staging off measures the code staging against an unchanged baseline
+        // and turning it on says what the scale plane was costing.
+        use mary::models::inkling::fp4gemm::fp4_linear_smem_launch;
+        for (label, kc, pad, st) in [
+            ("35 STAGED codes, kc=4 pad=0", 4usize, 0usize, false),
+            ("36 STAGED codes, kc=4 pad=4", 4usize, 4usize, false),
+            ("37 STAGED codes, kc=8 pad=0", 8usize, 0usize, false),
+            ("38 STAGED codes + scales, kc=4 pad=0", 4usize, 0usize, true),
+            ("39 STAGED codes + scales, kc=8 pad=0", 8usize, 0usize, true),
+        ] {
+            let (sb, sf) = best_first(
+                || {
+                    let t0 = Instant::now();
+                    let o = fp4_linear_smem_launch::<Rt>(
+                        &client, &qa, &qa_sc, &big, &sc, m_pad, k, n, 1.0, kc, pad, st,
+                    );
+                    let _ = cubecl::future::block_on(client.sync());
+                    let dt = t0.elapsed().as_secs_f64();
+                    drop(o);
+                    dt
+                },
+                reps,
+            );
+            report(label, bytes, sb, sf);
+        }
+
+        // Bit equality against row 15. The staged kernel changes WHERE the B
+        // fragment is read from and nothing else, so anything but identical
+        // output is a defect in the staging rather than a rounding difference.
+        let o_base = fp4_linear_launch::<Rt>(&client, &qa, &qa_sc, &big, &sc, m_pad, k, n, 1.0);
+        let o_smem = fp4_linear_smem_launch::<Rt>(
+            &client, &qa, &qa_sc, &big, &sc, m_pad, k, n, 1.0, 4, 0, true,
+        );
+        let vb = client.read_one(o_base).expect("baseline output");
+        let vs = client.read_one(o_smem).expect("staged output");
+        let diff = vb.iter().zip(vs.iter()).filter(|(x, y)| x != y).count();
+        println!(
+            "     bit equality against row 15: {diff} of {} output bytes differ",
+            vb.len()
+        );
+        assert_eq!(diff, 0, "the staged head lane is NOT bit-identical");
     }
 
     Ok(())
