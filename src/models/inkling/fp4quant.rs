@@ -30,18 +30,29 @@
 //! * **The E4M3 scale** rounds to nearest, ties to **even** significand — that
 //!   is what `__nv_cvt_float_to_fp8` does, and `fp4quant_gate` reproduces it on
 //!   the host by bracketing the 127 non-negative E4M3 patterns.
-//! * **The E2M1 code** is chosen by seven `>=` comparisons against the
-//!   midpoints between the eight representable magnitudes
-//!   (`0.25 0.75 1.25 1.75 2.5 3.5 5.0`). `>=` means an exact tie rounds
-//!   **away from zero** (up in magnitude). All seven midpoints are exactly
-//!   representable in f32 *and* f64, so a host reference in either precision
-//!   applies the identical test with no rounding step of its own.
+//! * **The E2M1 code** is chosen by the GB10's own
+//!   `cvt.rn.satfinite.e2m1x2.f32`, which rounds to nearest with ties to the
+//!   **even code**. That is not the same rule the seven-comparison `>=` ladder
+//!   this kernel used to run applied — that one sent an exact tie *away from
+//!   zero* — and the two part on four of the seven midpoints (`0.25 -> 0` vs
+//!   `1`, `1.25 -> 2` vs `3`, `2.5 -> 4` vs `5`, `5.0 -> 6` vs `7`; on `0.75`,
+//!   `1.75` and `3.5` rounding up already *is* the even code). Ties-to-even is
+//!   what the hardware, `cuda_fp4.hpp`, and every NVFP4 producer built on them
+//!   do, so it is the rule to be identical to. An exact midpoint requires the
+//!   quotient `x/s` to land on a dyadic value with ≤3 significant bits, which
+//!   is measure-zero for activation-shaped input: over 1,048,576 real elements
+//!   zero codes differ between the two rules. On input drawn from a coarse
+//!   dyadic grid 2.2% differ, every one by exactly one E2M1 step.
+//! * The instruction also **saturates**: `|x/s| > 6` clamps to `±6.0` rather
+//!   than overflowing, and NaN saturates to `±6.0` instead of failing every
+//!   comparison and falling out as zero.
 //! * A negative input that rounds to magnitude zero keeps its sign and becomes
-//!   code `0x8` (`-0.0`), not code `0x0`. `-0.0` itself is *not* negative under
-//!   `< 0.0` and becomes code `0x0`.
-//! * An all-zero block emits a zero scale byte and sixteen zero codes; the
-//!   `s > 0` guard makes that explicit rather than relying on `0/0` producing a
-//!   NaN that fails every comparison.
+//!   code `0x8` (`-0.0`), not code `0x0` — including a `-0.0` input, which the
+//!   old ladder mapped to `0x0` because `-0.0 < 0.0` is false. Both codes
+//!   decode to the same number.
+//! * An all-zero block emits a zero scale byte and a zero reciprocal, so every
+//!   element becomes `±0.0` and its code is `0x0`/`0x8` — no per-element `s > 0`
+//!   guard, and no reliance on `0/0` producing a NaN.
 //!
 //! ## Output layout
 //!
@@ -53,13 +64,41 @@
 //! `nvfp4_mma_probe`) without a repack. `scales` is `[rows, k/16]` `e4m3`, one
 //! byte per block, in the same row-major order.
 //!
+//! ## What the GB10 rewrite cost, measured
+//!
+//! Framing rule: **static** SASS instruction counts for one thread = one
+//! 16-element NVFP4 block, `NOP`/`BRA` excluded. The source is the CUDA CubeCL
+//! itself generated for `quantize_nvfp4_kernel` (captured by running
+//! `minifloat_caps_probe` under `CUBECL_DEBUG_LOG`), assembled with CUDA 13.0
+//! V13.0.88 `nvcc --gpu-architecture=sm_121a -lineinfo -cubin`. *Static*, not
+//! wall time — nothing here was timed, and the box was shared. "body" is the
+//! straight-line kernel through its last `EXIT`; "helper" is the out-of-line
+//! correctly-rounded-division routine `ptxas` plants behind an `FCHK`, which
+//! costs I-cache but is not executed on the normal path. The two must not be
+//! added and quoted as one number.
+//!
+//! | lane | | body | helper | loads per block |
+//! | ---- | -------- | ---: | ---: | --------------- |
+//! | f32  | before   |  660 |   87 | 16 × `LDG.E`     |
+//! | f32  | **after**|**170**| 132 | 2 × `LDG.E.256`  |
+//! | BF16 | before   |  741 |   87 | 16 × `LDG.E.U16` |
+//! | BF16 | **after**|**195**| 133 | 2 × `LDG.E.128`  |
+//!
+//! Three levers, all of them landing in the default path because each is either
+//! free or measured bit-identical: the hardware `F2FP` conversion in place of
+//! the ladder (−130 `FSETP`, −110 `SEL`), one hoisted reciprocal in place of
+//! sixteen correctly-rounded divides (−16 `FCHK`/`CALL` pairs, −11 `MUFU`), and
+//! an eight-wide line in place of scalar loads. The helper column grows because
+//! `amax / 6` and `1.0 / s` are two differently-shaped divides where the old
+//! kernel's seventeen were all the same shape and shared one routine.
+//!
 //! Behind the `q4` feature, which is what pulls the `cubecl` dependency in
 //! (`cuda-backend` enables it). Gated by `fp4quant_gate`.
 
 use cubecl::client::ComputeClient;
-use cubecl::e4m3;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
+use cubecl::{e2m1x2, e4m3};
 
 /// Logical elements covered by one E4M3 block scale (NVFP4's `group_size`).
 pub const GROUP: usize = 16;
@@ -70,83 +109,113 @@ pub const E4M3_MAX: f32 = 448.0;
 /// Elements per packed `u32` word (eight nibbles).
 pub const CODES_PER_WORD: usize = 8;
 
+/// Elements per vectorized activation load, and the width of one output word.
+///
+/// Eight is not a compromise between the two element types — it is the widest
+/// load each one has: for f32 the eight elements are 32 B and `ptxas` issues one
+/// `LDG.E.256`, for BF16 they are 16 B and it issues one `LDG.E.128`. A block is
+/// two loads either way, where sixteen scalar `LDG.E` used to be four times that
+/// on the f32 lane and eight times on the BF16 one. The block base is 64 B (f32)
+/// or 32 B (BF16) aligned, so every one of them is naturally aligned.
+///
+/// Eight is also exactly one output `u32`, which is why nothing has to be
+/// shifted or or-ed together afterwards: eight scaled f32 cast straight to a
+/// four-byte `Vector<e2m1x2, 4>` *is* the word.
+pub const LINE: usize = 8;
+
 /// One thread per 16-element block, this many threads per cube.
 const CUBE_SIZE: u32 = 256;
-
-/// Nearest E2M1 code to `v / s`, as a 4-bit value in a `u32`.
-///
-/// `s == 0` (an all-zero block) yields code 0 without dividing.
-#[cube]
-fn e2m1_code(v: f32, s: f32) -> u32 {
-    let mut m = u32::new(0);
-    if s > 0.0 {
-        let t = v / s;
-        let mut a = t;
-        if t < 0.0 {
-            a = -t;
-        }
-        // Seven midpoints, ascending; `>=` sends an exact tie away from zero.
-        if a >= 0.25 {
-            m = u32::new(1);
-        }
-        if a >= 0.75 {
-            m = u32::new(2);
-        }
-        if a >= 1.25 {
-            m = u32::new(3);
-        }
-        if a >= 1.75 {
-            m = u32::new(4);
-        }
-        if a >= 2.5 {
-            m = u32::new(5);
-        }
-        if a >= 3.5 {
-            m = u32::new(6);
-        }
-        if a >= 5.0 {
-            m = u32::new(7);
-        }
-        if t < 0.0 {
-            m += u32::new(8);
-        }
-    }
-    m
-}
 
 /// One thread per 16-element block: reduce `amax`, emit the E4M3 scale byte and
 /// the block's two packed `u32` code words.
 ///
 /// A block is exactly two output words, so no two threads ever touch the same
 /// word — the pack needs no atomics and no shared memory.
+///
+/// ## The encode is the hardware's, not a comparison ladder
+///
+/// `Vector::<e2m1x2, 4>::cast_from` of eight f32 lowers, through CubeCL's
+/// `__nv_cvt_float2_to_fp4x2`, to four `cvt.rn.satfinite.e2m1x2.f32` — SASS
+/// `F2FP.SATFINITE.E2M1.F32.PACK_AB_MERGE_C`, two f32 in and one byte holding
+/// two E2M1 codes out. Eight of them cover the block's sixteen elements, in
+/// place of the 130 `FSETP` + 110 `SEL` the seven-midpoint ladder cost. The
+/// header's inline-PTX path is gated on `__CUDA_ARCH_FAMILY_SPECIFIC__`, which
+/// only `sm_121a` defines; CubeCL passes `--gpu-architecture=sm_{arch}a` for
+/// every arch ≥ 90, so this lane gets it. On plain `sm_121` the same header
+/// silently *emulates* the conversion at ~88 SASS instructions, i.e. the `a`
+/// suffix is the difference between a 3× win and a loss.
+///
+/// The pair packing is little-endian — the first f32 of a pair lands in the LOW
+/// nibble — which is exactly the order [`super::nvfp4`] settled against
+/// `compressed_tensors`, so the four bytes reinterpret straight to the `u32`.
+///
+/// ## Why the block is *one* divide and sixteen multiplies
+///
+/// The obvious spelling, `x_i / s` per element, is what this kernel used to be,
+/// and it was the single most expensive thing in it: CUDA's `/` is correctly
+/// rounded, so `ptxas` plants an `FCHK` + `CALL` slow-path pair *per element* —
+/// seventeen of them counting `amax / 6` — plus eighteen `MUFU`. Hoisting one
+/// reciprocal deletes all sixteen element divides in favour of sixteen `FMUL`.
+///
+/// `amax / 6.0` **stays a real divide**. It runs once per block rather than once
+/// per element, so it is a sixteenth of the cost, and it is the one rounding the
+/// whole block hangs on: the E4M3 scale byte is a bit-checked output, and
+/// `amax * (1/6)` rounds twice and can land on the other side of an E4M3
+/// midpoint. Exactness is cheap here and expensive per element, so it is bought
+/// where it is cheap. (Measured, `sm_121a`: spending it costs 93 static SASS
+/// instructions, all but ~12 of them in a never-executed out-of-line helper.)
+///
+/// The per-element reciprocal is not free of that concern either — `x * fl(1/s)`
+/// rounds twice where `x / s` rounds once, so a quotient within ~1e-7 relative
+/// of an E2M1 midpoint can fall the other way. `fp4quant_gate` counts those
+/// near-boundary elements explicitly and checks every code bitwise against an
+/// f64 host reference, so the claim is measured on real Inkling data rather than
+/// assumed.
+///
+/// ## The block amax has no hardware assist on this chip, and does not need one
+///
+/// Probed against `ptxas` 13.0.88 rather than the ISA docs, which disagree with
+/// it here: `redux.sync.max.f32` is a *die-family* gap, not a suffix gap — it
+/// assembles to `CREDUX.MAX.F32` on `sm_100a`/`sm_103a` and is rejected
+/// identically on `sm_120a`, `sm_121`, `sm_121a` and `sm_121f`. Nor is there an
+/// f16 door around it: `redux` is 32-bit-integer-only on every architecture, and
+/// while `red.global.max.noftz.v2.bf16` and
+/// `cp.reduce.async.bulk…max.bf16` *do* exist where their f32 forms are
+/// rejected, both are element-wise memory reductions, not horizontal ones. Every
+/// reduction unit on GB10 is cross-*lane* (`REDUX`, `SHFL`, `ATOM`, `UBLKRED`);
+/// none of them reduces a thread's own registers.
+///
+/// That is not a limitation to work around — it is why this layout is cheap. A
+/// `redux` is one instruction for 32 elements; one `FMNMX` here is one
+/// instruction for 32 independent *blocks*. Re-laying the kernel out as sixteen
+/// threads per block to reach `redux` costs ~10× more warp-instruction slots per
+/// block and drops the loads from `LDG.E.256` to `LDG.E.32`.
+///
+/// So the amax is software, written to cost as little as software can: `FMNMX`
+/// takes an `|src|` operand modifier, so `max(|a|, |b|)` is one instruction and
+/// the `abs` is free — where the old `if v < 0 { a = -v }` / `if a > amax` pair
+/// spent an `FSETP` and a `SEL` each. Sixteen elements, fifteen `FMNMX`, as a
+/// tree rather than a chain so the dependency depth is 4 instead of 16.
 #[cube(launch_unchecked)]
 fn quantize_nvfp4_kernel<E: Scalar + Cast>(
-    x: &Array<E>,
+    x: &Array<Vector<E, Const<8>>>,
     codes: &mut Array<u32>,
     scales: &mut Array<e4m3>,
     blocks: usize,
 ) {
     let blk = ABSOLUTE_POS;
     if blk < blocks {
-        let base = blk * 16;
+        let base = blk * 2;
 
-        let mut amax = f32::new(0.0f32);
-        #[unroll]
-        for i in 0..16usize {
-            let v = f32::cast_from(x[base + i]);
-            let mut a = v;
-            if v < 0.0 {
-                a = -v;
-            }
-            if a > amax {
-                amax = a;
-            }
-        }
+        let l0 = Vector::<f32, Const<8>>::cast_from(x[base]);
+        let l1 = Vector::<f32, Const<8>>::cast_from(x[base + 1]);
 
-        let mut sf = amax / 6.0;
-        if sf > 448.0 {
-            sf = f32::new(448.0f32);
-        }
+        let hi = max(l0.abs(), l1.abs());
+        let a01 = max(max(hi[0], hi[1]), max(hi[2], hi[3]));
+        let a23 = max(max(hi[4], hi[5]), max(hi[6], hi[7]));
+        let amax = max(a01, a23);
+
+        let sf = min(amax / 6.0, f32::new(448.0f32));
         let se = e4m3::cast_from(sf);
         // Round-trip through the stored byte: the codes must be chosen against
         // the scale the consumer will actually read back, not the f32 that was
@@ -154,18 +223,17 @@ fn quantize_nvfp4_kernel<E: Scalar + Cast>(
         let s = f32::cast_from(se);
         scales[blk] = se;
 
-        let mut w0 = u32::new(0);
-        #[unroll]
-        for i in 0..8usize {
-            w0 |= e2m1_code(f32::cast_from(x[base + i]), s) << (4 * i) as u32;
+        // An all-zero block stores a zero scale byte; `r = 0` then sends every
+        // element to `±0.0`, which is code `0x0`/`0x8` — the same number either
+        // way — with no per-element guard and no `0/0`.
+        let mut r = f32::new(0.0f32);
+        if s > 0.0 {
+            r = 1.0 / s;
         }
-        let mut w1 = u32::new(0);
-        #[unroll]
-        for i in 0..8usize {
-            w1 |= e2m1_code(f32::cast_from(x[base + 8 + i]), s) << (4 * i) as u32;
-        }
-        codes[blk * 2] = w0;
-        codes[blk * 2 + 1] = w1;
+        let rv = Vector::<f32, Const<8>>::new(r);
+
+        codes[blk * 2] = u32::reinterpret(Vector::<e2m1x2, Const<4>>::cast_from(l0 * rv));
+        codes[blk * 2 + 1] = u32::reinterpret(Vector::<e2m1x2, Const<4>>::cast_from(l1 * rv));
     }
 }
 
@@ -236,7 +304,8 @@ fn quantize_nvfp4_as<E: Scalar + Cast, R: Runtime>(
             client,
             CubeCount::new_1d(cubes),
             CubeDim::new_1d(CUBE_SIZE),
-            ArrayArg::from_raw_parts(x.clone(), n),
+            // Length in LINES, not elements: `k % 64 == 0` makes `n % 4 == 0`.
+            ArrayArg::from_raw_parts(x.clone(), n / LINE),
             ArrayArg::from_raw_parts(codes.clone(), words),
             ArrayArg::from_raw_parts(scales.clone(), blocks),
             blocks,
@@ -246,14 +315,12 @@ fn quantize_nvfp4_as<E: Scalar + Cast, R: Runtime>(
     (codes, scales)
 }
 
-/// The exact inverse of [`e2m1_code`]'s magnitude ladder.
+/// The eight representable E2M1 magnitudes, indexed by the code's low three
+/// bits — the exact inverse of what [`quantize_nvfp4_kernel`] encodes.
 ///
-/// Written as seven `>=` tests against the eight representable magnitudes
-/// rather than as a lookup table, for the same reason the quantizer is: a table
-/// in device memory is an indexed load per element, and the ladder is the same
-/// comparison chain the encoder already runs, read the other way round. Sign
-/// last, so a code that rounded to magnitude zero comes back as `-0.0` exactly
-/// as it was stored.
+/// Written as seven `>=` tests rather than as a lookup table because a table in
+/// device memory is an indexed load per element. Sign last, so a code that
+/// rounded to magnitude zero comes back as `-0.0` exactly as it was stored.
 #[cube]
 fn e2m1_value(code: u32) -> f32 {
     let a = f32::cast_from(code & 7);
