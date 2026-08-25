@@ -46,7 +46,7 @@ pub fn stream_packed<NW: Size>(
     #[comptime] per: usize,
 ) {
     let t = ABSOLUTE_POS as usize;
-    let mut acc = u32::new(0u32);
+    let mut acc = u32::new(0i64);
     #[unroll]
     for i in 0..per {
         let v = w[t + i * threads];
