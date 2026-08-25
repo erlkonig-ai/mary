@@ -440,7 +440,7 @@ run_rep() {
 
   printf '  %-12s rep %d ... ' "$arm_name" "$rep"
   {
-    printf '# %s\n' "arm=$arm_name env=${envs[*]} bin=$abin sha256=${BIN_SHA[$abin]} args=${PASSTHRU[*]:-}"
+    printf '# %s\n' "arm=$arm_name env=${envs[*]} bin=$abin sha256=${BIN_SHA[$abin]:-unknown} args=${PASSTHRU[*]:-}"
   } > "$log"
   local t0 t1
   t0=$(date +%s)
@@ -453,7 +453,7 @@ run_rep() {
   fi
 
   "$AWK" -v arm="$arm_name" -v rep="$rep" -v cold="$COLD" -v tsv="$TSV" \
-       -v bsha="${BIN_SHA[$abin]}" -v bmt="${BIN_MTIME[$abin]}" -v bpath="$abin" '
+       -v bsha="${BIN_SHA[$abin]:-unknown}" -v bmt="${BIN_MTIME[$abin]:-unknown}" -v bpath="$abin" '
     /WARM steps only/      { if (match($0, /\(([0-9.]+) ms\/step over ([0-9]+) steps/, mm)) { step_ms = mm[1]; wsteps = mm[2] } }
     /WARM per TOKEN/       { if (match($0, /\(([0-9.]+) tok\/s over ([0-9]+) tokens/, tt)) { toks = tt[1]; wtokens = tt[2] } }
     /tokens per pass/      { e_all = $NF }
@@ -468,6 +468,11 @@ run_rep() {
       pred = e_warm * 1000.0 / step_ms
       err  = (toks > 0) ? 100.0 * (pred - toks) / toks : 999
       printf "%.3f tok/s, %.1f ms/step over %d warm passes (harness median %.1f ms)\n", toks, step_ms, wsteps, med
+      # A median over three or four passes is a median in name only. This is a
+      # warning and not a refusal because a short run is sometimes exactly what
+      # you want -- but it must not be quoted as if it were a distribution.
+      if (wsteps < 5)
+        printf "    -- note: only %d warm passes in this rep (INK_GEN minus the %d discarded). A median over that is thin; raise --gen before quoting it.\n", wsteps, cold
       if (err > 1 || err < -1)
         printf "    !! IDENTITY FAILS: E*1000/step_ms = %.3f but the binary says %.3f tok/s (%.2f%%).\n       One of the three is from a different population. Do not quote this rep.\n", pred, toks, err
       # A drift between E over all passes and E over the warm ones means the
@@ -562,7 +567,7 @@ echo "  box             : $(hostname)  $GPU_NAME"
 echo "  build           : tree $RUN_TREE @ ${RUN_HEAD:0:12}$([ -n "$RUN_DIRTY" ] && echo " (DIRTY -- the commit does not identify what ran)")"
 for spec in "${ARMS[@]}"; do
   name=${spec%%:*}; abin=${ARM_BIN[$name]}
-  echo "                    arm '$name' -> ${BIN_SHA[$abin]:0:16}  ${BIN_MTIME[$abin]}  $abin"
+  echo "                    arm '$name' -> ${BIN_SHA[$abin]:-unknown}  ${BIN_MTIME[$abin]:-unknown}  $abin"
 done
 echo "  gate            : $GATED   (util-max ${UTIL_MAX}%, load-max $LOAD_MAX, ${SAMPLES} samples)"
 echo "  started         : $STARTED"
