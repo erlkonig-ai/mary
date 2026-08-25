@@ -4389,7 +4389,6 @@ fn main() -> Result<()> {
                 wk: g("attn.wk_dv.weight")?,
                 wv: g("attn.wv_dv.weight")?,
                 wr: g("attn.wr_du.weight")?,
-                wqkvr: None,
                 wo: g("attn.wo_ud.weight")?,
                 q_norm: g("attn.q_norm.weight")?,
                 k_norm: g("attn.k_norm.weight")?,
