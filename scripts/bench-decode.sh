@@ -22,12 +22,24 @@
 #   2. INTERLEAVES the arms: rep 1 of every arm, then rep 2 of every arm. Drift
 #      over the run -- clocks, thermals, page cache, another tenant arriving --
 #      lands on every arm equally instead of on whichever went last.
-#   3. Discards the COLD passes. `INK_REPEAT=1` is set by default (the project
-#      rule) so every step re-runs the identical pass, and the binary's own
-#      WARM figures already exclude its first COLD_DECODE_STEPS=2 passes; this
-#      script re-derives the same median from the per-step lines and cross-checks
-#      the two, so a change to either definition shows up as a disagreement
-#      rather than as a silently different number.
+#   3. Runs the CACHED DECODE LANE (`INK_KV=1`), because that is the only lane
+#      in which a "step" is one token. This script used to set `INK_REPEAT=1`
+#      instead, and that was wrong by 5.9x, measured: `INK_REPEAT` pins the feed
+#      to the WHOLE PROMPT and requires the cache off, so with a 256-token
+#      prompt every "decode step" was a 256-row full re-prefill -- 2114 expert
+#      slabs and 34.07 GiB of weight reads per pass against 84 slabs and 1.31
+#      GiB for a real one-row decode. Same binary, same prompt, same layers
+#      0:16, back to back on an idle GB10: 343.0 ms/step under `INK_REPEAT=1`,
+#      58.4 ms/step under `INK_KV=1`. `INK_REPEAT` is a WARM-UP CONTROL for
+#      width probes (compare a 1-row pass with a 2-row one without comparing
+#      two warm-up states) and it is only a decode configuration when the prompt
+#      is ONE token. `--repeat` still selects it, and the refusal below stops it
+#      being quoted as decode by accident.
+#   3b. Discards the COLD passes. The binary's own WARM figures exclude its first
+#      COLD_DECODE_STEPS=2 passes; this script re-derives the same median from
+#      the per-step lines and cross-checks the two, so a change to either
+#      definition shows up as a disagreement rather than as a silently
+#      different number.
 #   4. Reports PEAK and MEDIAN separately. The peak is the best rep, which is
 #      what a machine can do; the median is what it does. Only the median is
 #      honest about a run, and the mean is not reported at all because a single
@@ -71,8 +83,17 @@
 #     --layers R      INK_LAYERS (default 0:21). Recorded in the framing rule.
 #     --bin PATH      the binary (default target/release/inkling_forward)
 #     --env 'K=V ..'  environment applied to EVERY arm, before the arm's own
-#     --no-repeat     do not set INK_REPEAT=1 (you are measuring a growing
-#                     sequence on purpose; say so in the notes)
+#     --repeat        measure the UNCACHED IDENTICAL-PASS lane (`INK_REPEAT=1`,
+#                     cache off) instead of the cached decode lane. Every pass
+#                     re-runs the whole prompt, so a step is one token only when
+#                     the prompt is one token; with a longer prompt this is a
+#                     PREFILL width probe and the script refuses to call it
+#                     decode unless --prefill-lane says you meant it.
+#     --prefill-lane  acknowledge that the pass is wider than one row, and stamp
+#                     every number "PER PREFILL PASS, not per decode step".
+#     --no-kv         do not set INK_KV=1. Almost never what you want: without
+#                     the cache and without --repeat the feed is the whole
+#                     GROWING prefix, and a "step" costs more every time.
 #     --note TEXT     free text carried into the framing rule
 #     --util-max N    max GPU utilisation percent to call idle (default 5)
 #     --load-max N    max 1-minute loadavg to call the host idle (default 2.0)
@@ -110,7 +131,9 @@ GEN=12
 LAYERS="0:21"
 BIN="target/release/inkling_forward"
 COMMON_ENV=""
-REPEAT=1
+REPEAT=0
+KV=1
+PREFILL_LANE=0
 NOTE=""
 UTIL_MAX=5
 LOAD_MAX=2.0
@@ -140,7 +163,9 @@ while [ $# -gt 0 ]; do
     --layers) LAYERS=$2; shift 2;;
     --bin) BIN=$2; shift 2;;
     --env) COMMON_ENV=$2; shift 2;;
-    --no-repeat) REPEAT=0; shift;;
+    --repeat) REPEAT=1; shift;;
+    --no-kv) KV=0; shift;;
+    --prefill-lane) PREFILL_LANE=1; shift;;
     --note) NOTE=$2; shift 2;;
     --util-max) UTIL_MAX=$2; shift 2;;
     --load-max) LOAD_MAX=$2; shift 2;;
@@ -440,12 +465,53 @@ echo
 #   - `tokens per pass`, over ALL passes, which is the E in the identity.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# WHAT IS A "STEP" IN THIS LOG?
+#
+# Exactly one thing decides it, and it is not the flags this script was given --
+# it is what the binary printed. `kv cache : on` is the ONLY lane in which the
+# feed is one row; with the cache off the feed is `ids.clone()`, i.e. the WHOLE
+# prefix, every pass. So a run with the cache off is a PREFILL pass repeated,
+# and its ms/step is per `ctx` rows of work, not per token.
+#
+# This is checked against the log rather than inferred from the flags because
+# that is the boundary the 5.9x error crossed: the flags said INK_REPEAT (a
+# warm-up control), the log said `kv cache: off` and `ctx 256`, and the report
+# said "per DECODE STEP". Two of those three were reading the flags.
+# ---------------------------------------------------------------------------
+LANE=""
+LANE_WIDTH=""
+check_lane() {
+  local log=$1 kvline
+  kvline=$(grep -m1 '^  kv cache ' "$log" 2>/dev/null)
+  case "$kvline" in
+    *": on"*) LANE="cached decode (kv on): the feed is ONE row per step"; LANE_WIDTH=1; return 0;;
+    *": off"*) LANE="UNCACHED (kv off): the feed is the whole prefix, so a pass is ctx rows"; LANE_WIDTH="ctx";;
+    *) LANE="unknown -- the binary printed no 'kv cache' line"; LANE_WIDTH="?";;
+  esac
+  [ "$PREFILL_LANE" = "1" ] && return 0
+  echo
+  echo "!! REFUSING TO CALL THIS DECODE."
+  echo "   The binary says: ${kvline:-<no kv cache line>}"
+  echo "   With the cache off the feed is \`ids.clone()\` -- the WHOLE prompt -- on"
+  echo "   every pass, so what this would report as \"ms per decode step\" is ms per"
+  echo "   FULL RE-PREFILL of the context. Measured on this box, one binary, one"
+  echo "   256-token prompt, layers 0:16: 343.0 ms that way against 58.4 ms for the"
+  echo "   cached one-row decode -- 5.9x, and none of it a timer disagreement."
+  echo
+  echo "   Either drop --repeat/--no-kv so the cached lane runs, or pass"
+  echo "   --prefill-lane to say you meant the width probe and wear the stamp."
+  echo
+  exit 2
+}
+
 run_rep() {
   local arm_name=$1 arm_env=$2 rep=$3 log abin
   log="$OUT/${arm_name}.rep${rep}.log"
   abin=${ARM_BIN[$arm_name]}
   local envs=()
   [ "$REPEAT" = "1" ] && envs+=("INK_REPEAT=1")
+  [ "$KV" = "1" ] && envs+=("INK_KV=1")
   envs+=("INK_GEN=$GEN" "INK_LAYERS=$LAYERS")
   # shellcheck disable=SC2206
   [ -n "$COMMON_ENV" ] && envs+=($COMMON_ENV)
@@ -469,6 +535,9 @@ run_rep() {
     printf 'FAILED rc=%d (see %s)\n' "$rc" "$log"
     return 1
   fi
+  # The cheapest point at which the lane is knowable is the first log. Checking
+  # here costs one rep; checking at the report costs the whole run.
+  [ -z "$LANE" ] && check_lane "$log"
 
   "$AWK" -v arm="$arm_name" -v rep="$rep" -v cold="$COLD" -v tsv="$TSV" \
        -v bsha="${BIN_SHA[$abin]:-unknown}" -v bmt="${BIN_MTIME[$abin]:-unknown}" -v bpath="$abin" '
@@ -626,10 +695,16 @@ echo
 echo
 echo "=== the framing rule (this is part of the number, not a footnote) ==="
 echo "  what varied     : the arms, and nothing else -- ${ARMS[*]}"
-echo "  per what        : per DECODE STEP (one pass of the layer range below), and"
-echo "                    per SECOND of decode wall. Not per token unless E = 1."
+if [ "$LANE_WIDTH" = "1" ]; then
+  echo "  per what        : per DECODE STEP (one pass of the layer range below, ONE row"
+  echo "                    wide), and per SECOND of decode wall. Not per token unless E = 1."
+else
+  echo "  per what        : per PREFILL PASS, NOT per decode step -- the pass is $LANE_WIDTH rows"
+  echo "                    wide. Do not quote this as decode throughput."
+fi
+echo "  lane            : $LANE"
 echo "  layer range     : INK_LAYERS=$LAYERS"
-echo "  context length  : $("$AWK" -F'\t' 'NR==2{print $9}' "$TSV") tokens at the last step (INK_GEN=$GEN$( [ "$REPEAT" = 1 ] && echo ", INK_REPEAT=1 so the context does not grow"))"
+echo "  context length  : $("$AWK" -F'\t' 'NR==2{print $9}' "$TSV") tokens at the last step (INK_GEN=$GEN$( [ "$REPEAT" = 1 ] && echo ", INK_REPEAT=1: the context does not grow because every pass re-runs the WHOLE prompt"))"
 echo "  reps            : $REPS per arm, INTERLEAVED; first $COLD decode passes of each rep discarded"
 echo "  statistic       : median over reps; peak reported separately; mean not reported"
 echo "  identity        : tok/s = E * 1000 / step_ms checked to 1% on every rep"
