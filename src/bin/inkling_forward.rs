@@ -507,6 +507,32 @@
 //! win; the `m > 1` lane is. See "The width cost is a STEP" below, which found
 //! half of it and named the rest.
 //!
+//! ### And at k = 1 the DRAFT is free, so pruning it cannot help
+//!
+//! Worth separating, because "the draft costs 1.65 GiB of unembed a depth" is
+//! true and reads like a reason to prune, and on this configuration it is not.
+//! The tail's own report splits its pass:
+//!
+//!     spec0   answered the head at  75.9 ms/step   drafting   0.0 ms/step
+//!     spec1   answered the head at 123.0 ms/step   drafting  35.6 ms/step
+//!
+//! and the round trips are 117.7 and 212.0. So:
+//!
+//!     spec0   41.8 (head half) + 75.9 (tail to answer) = 117.7
+//!     spec1   89.0 (head half) + 123.0 (tail to answer) = 212.0
+//!
+//! The 35.6 ms of drafting falls OUTSIDE both sums: the tail answers first and
+//! drafts afterwards, into the window where the head is computing its own 89 ms.
+//! One MTP head fits in that window and is invisible in the round trip. (Four do
+//! not -- this file already measured `INK_MTP=4` pushing 25 ms past it.)
+//!
+//! Which means the whole 1.80x is the VERIFY PASS, and it is split across both
+//! nodes: the head's half goes 41.8 -> 89.0 (2.13x) and the tail's 75.9 -> 123.0
+//! (1.62x) for ONE extra row. `INK_DRAFT_TOPK` shrinks a cost that is already
+//! hidden at k = 1, so it should move tok/s by approximately nothing there --
+//! which is a prediction the sweep can refute, and the reason to read tok/s and
+//! not acceptance.
+//!
 //! ## Three acceptance rates that are all correct
 //!
 //! This file has quoted 22.0%, 50.0% and 71.2% for depth-1 acceptance and they
