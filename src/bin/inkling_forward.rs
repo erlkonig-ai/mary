@@ -473,6 +473,14 @@
 //!     spec0   117.7 ms/step   8.499 tok/s   E 1.000
 //!     spec1   212.0 ms/step   7.942 tok/s   E 1.681   ->  0.934x
 //!
+//! Read `E 1.681` with its caveat: `INK_GEN=200` from this prompt, and the
+//! continuation REPEATS near the end (`... 185338 314 17284 185338 314 ...`).
+//! Repetition is easy to draft, so a degenerate tail inflates acceptance, and
+//! the same file's `INK_MTP` section documents the opposite failure on the
+//! five-token prompt -- a stack stuck on one id while the head proposed sensible
+//! English, which DEFLATES it. Neither is a fact about the drafter. The
+//! teacher-forced rate is the one that carries no such tail.
+//!
 //!   c(2) = 212.0 / 117.7 = **1.801**
 //!
 //! So the loop needs `p1 > 0.801` merely to break even, and it has 0.681. That
