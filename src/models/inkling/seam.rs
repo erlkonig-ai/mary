@@ -155,6 +155,32 @@ pub fn tensor_of_dt(
     Tensor::from_primitive(TensorPrimitive::Float(c))
 }
 
+/// The inverse of [`int_handle_of`]: a `[rows, cols]` i32 device buffer, as a
+/// Burn `Int` tensor.
+///
+/// The FP4 KV cache is the caller. Its payload is packed `u32` code words and
+/// its scales are packed E4M3 bytes, and neither is a dtype Burn names — but
+/// both are FIXED-WIDTH ROWS, and what the cache needs from Burn is exactly
+/// `cat` and `slice` over rows, which move bytes and do no arithmetic. Wearing
+/// an `Int` tensor is how the paging code gets those two operations without a
+/// buffer copy written by hand; nothing ever reads these as integers.
+pub fn int_tensor_of(
+    client: ComputeClient<CudaRuntime>,
+    device: burn::backend::cuda::CudaDevice,
+    handle: Handle,
+    rows: usize,
+    cols: usize,
+) -> Tensor<Bk, 2, burn::tensor::Int> {
+    let c = CubeTensor::<CudaRuntime>::new_contiguous(
+        client,
+        device,
+        [rows, cols].into(),
+        handle,
+        DType::I32,
+    );
+    Tensor::from_primitive(c)
+}
+
 /// A rank-3 f32 tensor as `(handle, strides)`, WITHOUT making it contiguous.
 ///
 /// [`handle_of`] copies when a tensor is not contiguous, and it is right to: a

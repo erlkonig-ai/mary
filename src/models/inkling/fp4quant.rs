@@ -245,3 +245,143 @@ fn quantize_nvfp4_as<E: Scalar + Cast, R: Runtime>(
 
     (codes, scales)
 }
+
+/// The exact inverse of [`e2m1_code`]'s magnitude ladder.
+///
+/// Written as seven `>=` tests against the eight representable magnitudes
+/// rather than as a lookup table, for the same reason the quantizer is: a table
+/// in device memory is an indexed load per element, and the ladder is the same
+/// comparison chain the encoder already runs, read the other way round. Sign
+/// last, so a code that rounded to magnitude zero comes back as `-0.0` exactly
+/// as it was stored.
+#[cube]
+fn e2m1_value(code: u32) -> f32 {
+    let a = f32::cast_from(code & 7);
+    let mut m = f32::new(0.0f32);
+    if a >= 0.5 {
+        m = f32::new(0.5f32);
+    }
+    if a >= 1.5 {
+        m = f32::new(1.0f32);
+    }
+    if a >= 2.5 {
+        m = f32::new(1.5f32);
+    }
+    if a >= 3.5 {
+        m = f32::new(2.0f32);
+    }
+    if a >= 4.5 {
+        m = f32::new(3.0f32);
+    }
+    if a >= 5.5 {
+        m = f32::new(4.0f32);
+    }
+    if a >= 6.5 {
+        m = f32::new(6.0f32);
+    }
+    if f32::cast_from(code & 8) > 0.0 {
+        m = -m;
+    }
+    m
+}
+
+/// One thread per 16-element block, mirroring [`quantize_nvfp4_kernel`]: read
+/// the block's E4M3 scale and its two packed `u32` code words, write sixteen
+/// dense values.
+///
+/// The same one-block-is-two-words property that let the pack skip atomics lets
+/// the unpack skip bounds arithmetic: a thread owns a contiguous sixteen and no
+/// two threads share a word or a scale.
+#[cube(launch_unchecked)]
+fn dequantize_nvfp4_kernel<O: Scalar + Cast>(
+    codes: &Array<u32>,
+    scales: &Array<e4m3>,
+    out: &mut Array<O>,
+    blocks: usize,
+) {
+    let blk = ABSOLUTE_POS;
+    if blk < blocks {
+        let s = f32::cast_from(scales[blk]);
+        let base = blk * 16;
+        let w0 = codes[blk * 2];
+        let w1 = codes[blk * 2 + 1];
+        #[unroll]
+        for i in 0..8usize {
+            out[base + i] = O::cast_from(e2m1_value((w0 >> (4 * i) as u32) & 15) * s);
+        }
+        #[unroll]
+        for i in 0..8usize {
+            out[base + 8 + i] = O::cast_from(e2m1_value((w1 >> (4 * i) as u32) & 15) * s);
+        }
+    }
+}
+
+/// Undo [`quantize_nvfp4`]: `[rows, k/8]` codes plus `[rows, k/16]` E4M3 scales
+/// back to a dense `[rows, k]` f32 buffer.
+///
+/// This is not a *lossless* inverse and cannot be — four bits went in. What it
+/// is is the DEFINITION of what the stored codes mean, and the reason it exists
+/// as a kernel rather than as a host loop is that the FP4 KV cache reads its
+/// whole retained context back on every decode step. A host round trip there
+/// would cost more than the four bits saved.
+pub fn dequantize_nvfp4<R: Runtime>(
+    client: &ComputeClient<R>,
+    codes: &Handle,
+    scales: &Handle,
+    rows: usize,
+    k: usize,
+) -> Handle {
+    dequantize_nvfp4_as::<f32, R>(client, codes, scales, rows, k)
+}
+
+/// The same, writing a BF16 buffer.
+///
+/// The KV cache's consumer holds its operands BF16 (see `attn_bf16`), so
+/// widening to f32 on the way out only to narrow again at the matmul would
+/// double what the dequant writes for nothing. The arithmetic inside the kernel
+/// is f32 either way; only the store narrows.
+pub fn dequantize_nvfp4_bf16<R: Runtime>(
+    client: &ComputeClient<R>,
+    codes: &Handle,
+    scales: &Handle,
+    rows: usize,
+    k: usize,
+) -> Handle {
+    dequantize_nvfp4_as::<half::bf16, R>(client, codes, scales, rows, k)
+}
+
+/// [`dequantize_nvfp4`] at a named output element type.
+fn dequantize_nvfp4_as<O: Scalar + Cast, R: Runtime>(
+    client: &ComputeClient<R>,
+    codes: &Handle,
+    scales: &Handle,
+    rows: usize,
+    k: usize,
+) -> Handle {
+    assert!(
+        k > 0 && k % 64 == 0,
+        "k must be a positive multiple of 64, got {k}"
+    );
+    assert!(rows > 0, "rows must be non-zero");
+
+    let n = rows * k;
+    let blocks = n / GROUP;
+    let words = n / CODES_PER_WORD;
+
+    let out = client.empty(n * core::mem::size_of::<O>());
+
+    let cubes = blocks.div_ceil(CUBE_SIZE as usize) as u32;
+    unsafe {
+        dequantize_nvfp4_kernel::launch_unchecked::<O, R>(
+            client,
+            CubeCount::new_1d(cubes),
+            CubeDim::new_1d(CUBE_SIZE),
+            ArrayArg::from_raw_parts(codes.clone(), words),
+            ArrayArg::from_raw_parts(scales.clone(), blocks),
+            ArrayArg::from_raw_parts(out.clone(), n),
+            blocks,
+        );
+    }
+
+    out
+}

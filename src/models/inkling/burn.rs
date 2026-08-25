@@ -510,8 +510,8 @@ pub struct AttnWeightsDev {
 /// position and every distance must be computed through `base`.
 #[derive(Clone)]
 pub struct AttnCache<B: Backend> {
-    k: super::kvpages::PageStore<B>,
-    v: super::kvpages::PageStore<B>,
+    k: super::kvpages::KvStore<B>,
+    v: super::kvpages::KvStore<B>,
     k_pre: Tensor<B, 2>,
     v_pre: Tensor<B, 2>,
     base: usize,
@@ -975,8 +975,11 @@ fn attention_prefill_lane(
     let (mut ks, mut vs) = {
         let kk = as_kv(k);
         let vv = as_kv(v);
-        let mut ks = super::kvpages::PageStore::new(kk.dims()[1]);
-        let mut vs = super::kvpages::PageStore::new(vv.dims()[1]);
+        // The dtype is asked of the tensor rather than of `narrow_now()`: an
+        // NVFP4 store promises to hand back what it was given, and the only
+        // authority on what that is is the buffer itself.
+        let mut ks = super::kvpages::KvStore::new(kk.dims()[1], super::seam::dtype_of(&kk));
+        let mut vs = super::kvpages::KvStore::new(vv.dims()[1], super::seam::dtype_of(&vv));
         ks.append(kk);
         vs.append(vv);
         (ks, vs)
