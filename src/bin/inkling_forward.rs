@@ -7625,10 +7625,32 @@ fn main() -> Result<()> {
                     let (lg, st) = dev_lane::linear_ann(hs, p, sk, ann_budget(), ann_range());
                     ann_stat = Some(st);
                     let approx = down(lg.slice([0..1, 0..v]));
-                    if let Some(e) = exact.as_ref() {
-                        mary::models::inkling::annhead::verify_row(e, &approx, st.floor);
+                    match exact {
+                        // Verify mode FOLLOWS THE EXACT HEAD. The approximate
+                        // row is scored and then discarded, and the sequence
+                        // continues from the token the exact lane picked.
+                        //
+                        // Without this the instrument cannot compare anything.
+                        // One disagreement rewrites every later hidden state, so
+                        // two arms of an ablation walk into different
+                        // continuations and their recall rates are computed over
+                        // DIFFERENT queries -- measured: at layers 0:2 the
+                        // rotated arm looped on one token and scored 0.0370
+                        // while the raw arm found a 13-token loop and scored
+                        // 0.2346, and neither number was about the other's
+                        // queries. Pinning the trajectory to the exact head
+                        // makes every arm of every ablation see the same states.
+                        //
+                        // What this run therefore does NOT measure is error
+                        // COMPOUNDING over a generation. That is what a plain
+                        // run without `INK_ANN_VERIFY` shows, and the two
+                        // questions want different instruments.
+                        Some(e) => {
+                            mary::models::inkling::annhead::verify_row(&e, &approx, st.floor);
+                            e
+                        }
+                        None => approx,
                     }
-                    approx
                 }
                 _ => down(dev_lane::linear_w(hs, uw).slice([0..n - logit_row0, 0..v])),
             }
