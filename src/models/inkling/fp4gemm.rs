@@ -28,10 +28,48 @@
 //! once and the activation (a few KB) is re-read per plane out of L2. For the
 //! shape this lane actually runs — M is the handful of tokens that routed to
 //! one expert, against N=4096, K=4096 — the arithmetic intensity is so low that
-//! the kernel is bound by streaming the weights in, and a fancier tiling would
-//! not change that. `inkling_forward`'s own per-pass report breaks the lane
-//! into slice / bind+enqueue+sync / remainder, which is where that number comes
-//! from now that the lane-comparison bench is gone with the lanes it compared.
+//! the kernel is bound by streaming the weights in. `inkling_forward`'s own
+//! per-pass report breaks the lane into slice / bind+enqueue+sync / remainder,
+//! which is where that number comes from now that the lane-comparison bench is
+//! gone with the lanes it compared.
+//!
+//! ### "and a fancier tiling would not change that" — measured, and it is wrong
+//!
+//! Bound by streaming is right. Bound AT THE BUS is not, and the two are the
+//! same sentence only if you never put a number on it.
+//!
+//! `nsys -t cuda` over the DECODE lane alone — spark-zt (GB10), commit
+//! 56c1ebbcdff6, `INK_KV=1 INK_LAYERS=0:16`, the 3732-token cover, 39 decode
+//! passes inside the capture window and no prefill in it — attributes, PER
+//! DECODE PASS:
+//!
+//! ```text
+//!   kernel                          launches   ms/pass   weight bytes   GB/s
+//!   fp4_linear_grouped (13 layers)      26.6     7.052       1.083 GB    154
+//!   bf16_linear_grouped (layer 2)        2.0     1.897       0.302 GB    159
+//!   matmul_entry, dense gate/up          4.0     2.176       0.537 GB    247
+//!   matmul_entry, shared gate_up        14.3     4.128       0.958 GB    232
+//! ```
+//!
+//! The last two rows are the SAME PASS on the SAME BUS, so they are the
+//! control: 247 GB/s is reachable here, and a microbenchmark independently puts
+//! achievable streaming read at 242.9 GB/s. This lane gets 154-159 — and it
+//! gets the same 154-159 for w13 (56.6 MB a layer) as for w2 (28.3 MB), and
+//! again for the BF16 sibling, which is what rules out latency and dtype and
+//! leaves the schedule.
+//!
+//! So of the 8.95 ms a decode pass spends in the grouped expert GEMM, 5.7 ms is
+//! bytes / bus and **3.2 ms is not** — 5.5% of a 58.3 ms decode step, sitting in
+//! the kernel rather than in the router or the host. A fancier tiling is
+//! exactly where it would have to come from.
+//!
+//! What it is NOT, checked before writing this: plane fill. At decode every
+//! expert has one 16-row tile, so [`super::moegroup::RowPlan`] gives every cube
+//! `blk_cnt = 1` and three of a four-plane cube's planes `terminate!()` at the
+//! first branch. `INK_MOE_PLANES=1` is therefore the obvious fix and it is not
+//! one: measured against base in the same interleaved run it is no better, and
+//! `grouped_nrep`'s header records the same negative at 128 tokens. The idle
+//! planes are not the 3.2 ms.
 
 use cubecl::ir::MatrixIdent;
 use cubecl::prelude::*;
