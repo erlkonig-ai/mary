@@ -78,6 +78,9 @@ pub mod pad;
 // One interface over the two places a running model's weights can come from —
 // a safetensors checkpoint or a pile — plus the residency cache and the byte
 // counters, which belong to the asking rather than to either storage.
+/// A paged store for one layer's keys or values — see the module docs for
+/// why pages rather than a contiguous tensor.
+pub mod kvpages;
 pub mod source;
 pub mod stack;
 pub mod vision;
