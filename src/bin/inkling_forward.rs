@@ -1200,6 +1200,7 @@ use mary::models::inkling::mtp::{
 use mary::models::inkling::pile::Elem;
 use mary::models::inkling::source::Weights;
 use mary::models::inkling::stack::{embed_and_norm_bf16, embed_row_bf16};
+use mary::models::inkling::stepstat;
 
 /// One gibibyte, as the divisor every byte count here is printed against.
 const GIB: f64 = (1u64 << 30) as f64;
@@ -5629,6 +5630,16 @@ fn main() -> Result<()> {
     let mut gen_tokens = 0usize;
     let mut spec_hist = vec![0usize; spec_k + 2];
     let mut pass_ms: Vec<f64> = Vec::new();
+    // The machine under the pass, sampled per pass, for the intermittent
+    // multi-second stall. Off unless `INK_STEPSTAT=1`; see
+    // [`mary::models::inkling::stepstat`] for what each field decides and what
+    // the sample costs.
+    let stepstat_on = stepstat::enabled();
+    let mut stepstat_prev = if stepstat_on {
+        stepstat::StepStat::sample()
+    } else {
+        stepstat::StepStat::default()
+    };
     let mut acc_recv = 0f64;
     let mut acc_pass = 0f64;
     let mut acc_draft = 0f64;
@@ -8670,6 +8681,21 @@ fn main() -> Result<()> {
             acc_steps += 1;
             pass_ms.push((pass.elapsed().as_secs_f64() + t_recv) * 1e3);
             pass_ms_arm.push((dev_plan_now, (pass.elapsed().as_secs_f64() + t_recv) * 1e3));
+        }
+        // On its OWN line, never folded into the `step N:` line above, because
+        // `bench-decode.sh` and `pipe-bench.sh` both parse that line and an
+        // instrument that changes what it is measuring is not an instrument.
+        // The prefill gets a line too: it is where the anonymous arena's huge
+        // pages are decided, and the first decode pass's deltas are read
+        // against it. `pass_ms` here is the same quantity the `step N:` line
+        // prints, so the two can be joined on it.
+        if stepstat_on {
+            let now = stepstat::StepStat::sample();
+            println!(
+                "{}",
+                now.line(&stepstat_prev, step, pass.elapsed().as_secs_f64() * 1e3)
+            );
+            stepstat_prev = now;
         }
         if is_decode && step - prefill_passes >= COLD_DECODE_STEPS {
             warm_wall += pass.elapsed().as_secs_f64() + t_recv;
