@@ -507,31 +507,41 @@
 //! win; the `m > 1` lane is. See "The width cost is a STEP" below, which found
 //! half of it and named the rest.
 //!
-//! ### And at k = 1 the DRAFT is free, so pruning it cannot help
+//! ### The draft is NOT free, and that is what the prune can buy
 //!
-//! Worth separating, because "the draft costs 1.65 GiB of unembed a depth" is
-//! true and reads like a reason to prune, and on this configuration it is not.
-//! The tail's own report splits its pass:
+//! Worth separating carefully, because both this file and the tail's own report
+//! say the opposite. The `ANSWERED the head at` line reads "everything after
+//! that (report, drafting) overlaps the head's next pass and the head never
+//! waits for it". Without speculation that is true. **With `INK_SPEC` it is
+//! false**, and the reason is one line further down: the drafts are sent
+//! separately, AFTER drafting -- and the head cannot build its next feed without
+//! them, because that feed IS `[best, draft0, ...]`.
 //!
-//!     spec0   answered the head at  75.9 ms/step   drafting   0.0 ms/step
-//!     spec1   answered the head at 123.0 ms/step   drafting  35.6 ms/step
+//! The pooled per-pass split says so directly:
 //!
-//! and the round trips are 117.7 and 212.0. So:
+//!             head compute   head BLOCKED    tail to answer   tail drafting
+//!     spec0      66.7 ms        77.2 ms          75.9 ms          0.0 ms
+//!     spec1     124.7 ms       152.7 ms         123.0 ms         35.6 ms
 //!
-//!     spec0   41.8 (head half) + 75.9 (tail to answer) = 117.7
-//!     spec1   89.0 (head half) + 123.0 (tail to answer) = 212.0
+//! On spec0 the head's blocked time is the tail's answer time, 77.2 against
+//! 75.9. On spec1 it is the tail's answer time PLUS its drafting, 152.7 against
+//! 123.0 + 35.6 = 158.6. Were the draft hidden, the head would block for ~123.
 //!
-//! The 35.6 ms of drafting falls OUTSIDE both sums: the tail answers first and
-//! drafts afterwards, into the window where the head is computing its own 89 ms.
-//! One MTP head fits in that window and is invisible in the round trip. (Four do
-//! not -- this file already measured `INK_MTP=4` pushing 25 ms past it.)
+//! So of the 1.80x, roughly 0.30 of a pass is the drafter sitting on the
+//! critical path, and it is the part that is cheap to attack:
 //!
-//! Which means the whole 1.80x is the VERIFY PASS, and it is split across both
-//! nodes: the head's half goes 41.8 -> 89.0 (2.13x) and the tail's 75.9 -> 123.0
-//! (1.62x) for ONE extra row. `INK_DRAFT_TOPK` shrinks a cost that is already
-//! hidden at k = 1, so it should move tok/s by approximately nothing there --
-//! which is a prediction the sweep can refute, and the reason to read tok/s and
-//! not acceptance.
+//!  - `INK_DRAFT_TOPK` cuts the draft's unembedding, which this file measures as
+//!    about two thirds of a depth's cost. 35.6 -> ~13 ms takes the round trip to
+//!    ~189 ms, `c_eff(2)` to ~1.61, and E = 1.681 from **0.93x to ~1.04x** --
+//!    from losing to winning. That is a prediction; the sweep is what settles it,
+//!    and it has to read tok/s, because acceptance can only fall.
+//!  - Or take the draft off the critical path altogether: the head could start
+//!    its own row 0 (`best`, which arrives first) while the drafts are still
+//!    being computed. That keeps the full-vocabulary head AND the 35 ms.
+//!
+//! The other 1.50 is the verify pass itself, split across both nodes -- the
+//! head's compute goes 66.7 -> 124.7 and the tail's answer 75.9 -> 123.0 for ONE
+//! extra row -- and that is the `m > 1` lane, which is a bigger piece of work.
 //!
 //! ## Three acceptance rates that are all correct
 //!
