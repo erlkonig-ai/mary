@@ -2191,6 +2191,26 @@ fn backbone_embed_norm() -> bool {
 ///
 /// Speculation is self-verifying, so getting this wrong never produced wrong
 /// text -- only a low acceptance rate, which is why it survived so long.
+/// Whether a draft's hidden state takes the BACKBONE's final norm on its way to
+/// the unembedding. Default on, and `INK_MTP_OUTNORM=0` is the ablation.
+///
+/// The reason it is a question: DeepSeek-style MTP gives every depth module its
+/// OWN `shared_head.norm` before the shared unembedding, and this checkpoint
+/// ships no such tensor -- only `embed_norm`, `hidden_norm` and `input_proj`
+/// per depth. So either the backbone's `model.llm.norm` is reused (what this
+/// does) or there is no norm at all, and the absent tensor is equally
+/// consistent with both. An RMS norm is not a scale, so the choice moves the
+/// argmax.
+fn mtp_out_norm() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("INK_MTP_OUTNORM")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
 fn mtp_embed_row(
     table: &[u8],
     backbone_norm: Option<&[f32]>,
@@ -2233,8 +2253,21 @@ fn mtp_input_dev(hidden: T2, embeds: T2, w: &MtpDev, eps: f64, order: MtpConcat)
         Some("embed") => (hidden, embeds.zeros_like()),
         _ => (hidden, embeds),
     };
-    let hn = dev_lane::rms_norm(hidden, w.hidden_norm.clone(), eps);
-    let en = dev_lane::rms_norm(embeds, w.embed_norm.clone(), eps);
+    // `INK_MTP_SWAPNORM=1`: apply `embed_norm` to the hidden operand and
+    // `hidden_norm` to the embedding. The names say otherwise and nothing else
+    // does -- `transformers` discards these tensors and no reference consumes
+    // them -- so which gain belongs to which operand is a READING, in the same
+    // class as the concat order that turned out to matter by a factor of 200.
+    let (gh, ge) = if std::env::var("INK_MTP_SWAPNORM")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        (w.embed_norm.clone(), w.hidden_norm.clone())
+    } else {
+        (w.hidden_norm.clone(), w.embed_norm.clone())
+    };
+    let hn = dev_lane::rms_norm(hidden, gh, eps);
+    let en = dev_lane::rms_norm(embeds, ge, eps);
     let cat = match order {
         MtpConcat::HiddenFirst => BT::cat(vec![hn, en], 1),
         MtpConcat::EmbedFirst => BT::cat(vec![en, hn], 1),
@@ -7652,11 +7685,15 @@ fn main() -> Result<()> {
                     Some((_, w)) => w.n,
                     None => v,
                 };
-                let hs = dev_lane::rms_norm(
-                    row,
-                    fnorm_dev.clone().expect("drafting needs the final norm"),
-                    t.rms_norm_eps,
-                )
+                let hs = if mtp_out_norm() {
+                    dev_lane::rms_norm(
+                        row,
+                        fnorm_dev.clone().expect("drafting needs the final norm"),
+                        t.rms_norm_eps,
+                    )
+                } else {
+                    row
+                }
                 .div_scalar(t.logits_mup_width_multiplier as f32);
                 // The pruned table is a gathered BF16 slab; the full one takes
                 // the head lane, which is W4A16.
@@ -7777,20 +7814,31 @@ fn main() -> Result<()> {
                 .map(|v| v == "1")
                 .unwrap_or(false);
             let teach_rows = |rows: T2| -> Vec<usize> {
-                let hs = dev_lane::rms_norm(
-                    rows,
-                    fnorm_dev
-                        .clone()
-                        .expect("teacher forcing needs the final norm"),
-                    t.rms_norm_eps,
-                )
+                let rows_n = rows.dims()[0];
+                let hs = if mtp_out_norm() {
+                    dev_lane::rms_norm(
+                        rows,
+                        fnorm_dev
+                            .clone()
+                            .expect("teacher forcing needs the final norm"),
+                        t.rms_norm_eps,
+                    )
+                } else {
+                    rows
+                }
                 .div_scalar(t.logits_mup_width_multiplier as f32);
+                // SLICED to the effective vocabulary before the argmax, exactly
+                // as the tail's own logits path and `draft_pick` are. The bound
+                // table is `vocab_size` rows wide and the model only uses
+                // `effective_vocab()` of them; the rest are padding, and an argmax
+                // that can land in the padding is not measuring the model.
                 dev_lane::linear_w(
                     hs,
                     unembed_w
                         .as_ref()
                         .expect("teacher forcing needs the unembed table"),
                 )
+                .slice([0..rows_n, 0..v])
                 .argmax(1)
                 .into_data()
                 .iter::<i64>()
