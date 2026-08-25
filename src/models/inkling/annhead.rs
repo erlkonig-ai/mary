@@ -535,6 +535,25 @@ fn to_ordered(v: f32) -> u32 {
     o
 }
 
+/// The DEVICE-side inverse of [`to_ordered`].
+///
+/// It exists because both the histogram and the floor kernel read the peak, and
+/// both of them read it as `f32::reinterpret(peak[0])` at first -- which is the
+/// ORDERED word, not the float. The failure was silent and total: the histogram
+/// binned against a nonsense maximum, no bin ever reached the budget, the floor
+/// clamped to the bottom of the window, and the "shortlist" became the entire
+/// vocabulary. Every number the lane produced was still plausible, because
+/// rescoring everything is CORRECT -- just slower than the head it replaces.
+/// A total-order embedding needs its inverse written down beside it.
+#[cube]
+fn from_ordered_dev(o: u32) -> f32 {
+    let mut b = !o;
+    if o >= 0x8000_0000u32 {
+        b = o ^ 0x8000_0000u32;
+    }
+    f32::reinterpret(b)
+}
+
 /// The host-side inverse of [`to_ordered`].
 fn from_ordered(o: u32) -> f32 {
     let b = if o >= 0x8000_0000 {
@@ -643,7 +662,7 @@ fn ann_hist_kernel(
 ) {
     let i = ABSOLUTE_POS as u32;
     if i < n {
-        let m = f32::reinterpret(peak[0]);
+        let m = from_ordered_dev(peak[0]);
         let v = est[i as usize];
         let d = m - v;
         if d >= 0.0 && d < range {
@@ -673,7 +692,7 @@ fn ann_floor_kernel(
     #[comptime] bins: u32,
 ) {
     if UNIT_POS == 0 {
-        let m = f32::reinterpret(peak[0]);
+        let m = from_ordered_dev(peak[0]);
         let w = range / f32::cast_from(bins);
         let mut acc = u32::new(0);
         let mut b = u32::new(0);

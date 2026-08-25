@@ -8663,13 +8663,23 @@ fn main() -> Result<()> {
             // enough to overflow the budget is exactly the step whose token is
             // worth doubting, and an average would hide it.
             println!(
-                "        aNN head: {} rescored of {} (floor {:.3}, best estimate {:.3}, \
-                 budget {})",
+                "        aNN head: {} above the floor of {} (floor {:.3}, best estimate \
+                 {:.3}, budget {}){}",
                 a.shortlist,
                 t.vocab_size,
                 a.floor,
                 a.est_max,
-                ann_budget()
+                ann_budget(),
+                // The counter is uncapped and the rescore is not, so this is the
+                // one line that can say the shortlist did not fit. It is not a
+                // wrong answer -- the rows that were rescored are exact -- it is
+                // a step whose top was flat enough that the budget did not cover
+                // it, and it is worth seeing rather than averaging away.
+                if a.shortlist > ann_budget() * 4 {
+                    "  OVERFLOW: only the first budget*4 were rescored"
+                } else {
+                    ""
+                }
             );
         }
         {
