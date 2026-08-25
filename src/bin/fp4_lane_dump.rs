@@ -21,6 +21,8 @@
 
 use std::time::Instant;
 
+use cubecl::future;
+
 use cubecl::prelude::*;
 use mary::models::inkling::fp4gemm::fp4_linear_launch;
 use mary::models::inkling::w4a16gemm::w4a16_linear_launch;
@@ -77,26 +79,32 @@ fn main() {
     let a = client.empty(m_pad * k * 2);
     let b = client.empty(codes);
     let b_sc = client.empty(scales);
-    for _ in 0..3 {
+    let mut w4a16_s = f64::MAX;
+    for i in 0..6 {
+        let t0 = Instant::now();
         let out = w4a16_linear_launch::<Rt>(&client, &a, &b, &b_sc, m_pad, k, n, 1.0);
-        let _ = client.read_one(out.clone());
+        let _ = future::block_on(client.sync());
+        let dt = t0.elapsed().as_secs_f64();
+        drop(out);
+        if i >= 2 {
+            w4a16_s = w4a16_s.min(dt);
+        }
     }
-    let t0 = Instant::now();
-    let out = w4a16_linear_launch::<Rt>(&client, &a, &b, &b_sc, m_pad, k, n, 1.0);
-    let _ = client.read_one(out.clone());
-    let w4a16_s = t0.elapsed().as_secs_f64();
 
     // W4A4: both operands packed E2M1 with e4m3 block scales.
     let qa = client.empty(m_pad * k / 2);
     let qa_sc = client.empty(m_pad * (k / 16));
-    for _ in 0..3 {
+    let mut fp4_s = f64::MAX;
+    for i in 0..6 {
+        let t1 = Instant::now();
         let o = fp4_linear_launch::<Rt>(&client, &qa, &qa_sc, &b, &b_sc, m_pad, k, n, 1.0);
-        let _ = client.read_one(o.clone());
+        let _ = future::block_on(client.sync());
+        let dt = t1.elapsed().as_secs_f64();
+        drop(o);
+        if i >= 2 {
+            fp4_s = fp4_s.min(dt);
+        }
     }
-    let t1 = Instant::now();
-    let out2 = fp4_linear_launch::<Rt>(&client, &qa, &qa_sc, &b, &b_sc, m_pad, k, n, 1.0);
-    let _ = client.read_one(out2.clone());
-    let fp4_s = t1.elapsed().as_secs_f64();
 
     // The ceiling: the same bytes, read coalesced, with no work on them.
     let words = codes / 4;
@@ -104,7 +112,7 @@ fn main() {
     let blocks = (threads as u32).div_ceil(BLOCK);
     let dst = client.empty(threads * 4);
     let mut stream_s = f64::MAX;
-    for _ in 0..4 {
+    for i in 0..6 {
         let t2 = Instant::now();
         unsafe {
             stream_packed::launch::<Rt>(
@@ -119,8 +127,11 @@ fn main() {
                 PER,
             )
         };
-        let _ = client.read_one(dst.clone());
-        stream_s = stream_s.min(t2.elapsed().as_secs_f64());
+        let _ = future::block_on(client.sync());
+        let dt = t2.elapsed().as_secs_f64();
+        if i >= 2 {
+            stream_s = stream_s.min(dt);
+        }
     }
 
     let gib = (codes + scales) as f64 / (1u64 << 30) as f64;
