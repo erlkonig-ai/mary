@@ -31,6 +31,8 @@
 use burn::prelude::*;
 use burn::tensor::{Int, Tensor, TensorData};
 
+use cubecl::server::Handle;
+
 use crate::models::inkling::bf16gemm::Bf16W;
 use crate::models::inkling::seam::{Bk, client_of, handle_of, tensor_of, tensor_of3};
 
@@ -119,6 +121,109 @@ pub fn linear_bf16(x: Tensor<Bk, 2>, w: &Bf16W) -> Tensor<Bk, 2> {
         other => panic!("linear_bf16: no lane for a {other:?} activation"),
     };
     tensor_of(client, dev, out, rows, w.n).slice([0..m, 0..w.n])
+}
+
+/// An NVFP4 weight: E2M1 codes, one E4M3 scale per [`fp4quant::GROUP`], and the
+/// single f32 that scales the whole tensor.
+///
+/// The twin of [`Bf16W`], and it exists for the same reason that one does. The
+/// published checkpoint quantises `mlp.experts.w13_weight` and `w2_weight` and
+/// NOTHING else -- 39 layers of routed experts carry `.scale` tensors, and the
+/// attention projections and the shared experts do not. So the shared experts
+/// are 100.7 MB of BF16 a layer against the six ROUTED experts' 84.9 MB of
+/// NVFP4: two tensors that cost more bandwidth than the six that do the
+/// routing. A decode step on this part is bound on streaming weights, and
+/// `scale2` is `1.0` for anything quantised here rather than by the publisher,
+/// because [`fp4quant::quantize_nvfp4_bf16`] folds the whole range into the
+/// per-16 E4M3 scales the way the activation quantiser already does.
+pub struct PackedW {
+    pub codes: Handle,
+    pub scales: Handle,
+    /// Output rows.
+    pub n: usize,
+    /// Input columns.
+    pub k: usize,
+    /// The tensor-wide scale. `1.0` unless the checkpoint supplied one.
+    pub scale2: f32,
+}
+
+/// One projection's weight, in whichever precision it is held.
+///
+/// The dispatch is on the WEIGHT and not on the call site, so that moving a
+/// tensor between lanes is a change at the bind and nowhere else. That is the
+/// property that matters here: the same move is wanted for the five attention
+/// projections, and a second copy of the shared-expert plumbing is exactly what
+/// this avoids.
+pub enum ProjW {
+    Bf16(Bf16W),
+    Fp4(PackedW),
+}
+
+impl ProjW {
+    /// Output rows.
+    pub fn n(&self) -> usize {
+        match self {
+            Self::Bf16(w) => w.n,
+            Self::Fp4(w) => w.n,
+        }
+    }
+
+    /// Input columns.
+    pub fn k(&self) -> usize {
+        match self {
+            Self::Bf16(w) => w.k,
+            Self::Fp4(w) => w.k,
+        }
+    }
+}
+
+/// `x @ w^T` for a weight in either precision.
+pub fn linear_w(x: Tensor<Bk, 2>, w: &ProjW) -> Tensor<Bk, 2> {
+    match w {
+        ProjW::Bf16(b) => linear_bf16(x, b),
+        ProjW::Fp4(p) => linear_fp4(x, p),
+    }
+}
+
+/// `x @ w^T` against an NVFP4 weight, quantising the activation on the device.
+///
+/// The activation is padded to [`fp4gemm::MTILE`] and sliced back afterwards.
+/// That padding is fifteen rows of zeros on a decode step and it is NOT the
+/// hazard [`crate::models::inkling::bf16gemm::rows_for`] documents for the hand
+/// lane: this lane is bound on the WEIGHT stream, which a wider `m` reads
+/// exactly once either way, and the routed experts already run this shape at
+/// 198 GB/s of a measured 242.9 GB/s bus.
+pub fn linear_fp4(x: Tensor<Bk, 2>, w: &PackedW) -> Tensor<Bk, 2> {
+    use crate::models::inkling::fp4gemm::{MTILE, fp4_linear_launch};
+    use crate::models::inkling::fp4quant::{quantize_nvfp4, quantize_nvfp4_bf16};
+    let [m, k] = x.dims();
+    assert_eq!(
+        k, w.k,
+        "linear_fp4: x is [_, {k}] but the weight is [_, {}]",
+        w.k
+    );
+    let m_pad = m.div_ceil(MTILE) * MTILE;
+    let client = client_of(&x);
+    let dev = x.device();
+    let x = if m_pad == m {
+        x
+    } else {
+        Tensor::cat(vec![x, Tensor::zeros([m_pad - m, k], &dev)], 0)
+    };
+    // Same two arrivals the BF16 lane handles: the narrow lane's normed
+    // residual stream reaches a projection as BF16, the wide one as f32.
+    // Quantising from BF16 costs nothing the destination was not already
+    // paying -- four bits with one E4M3 scale per sixteen.
+    let (xh, xdt) = crate::models::inkling::seam::handle_of_any(x);
+    let (a, asc) = match xdt {
+        burn::tensor::DType::BF16 => quantize_nvfp4_bf16(&client, &xh, m_pad, k),
+        burn::tensor::DType::F32 => quantize_nvfp4(&client, &xh, m_pad, k),
+        other => panic!("linear_fp4: no lane for a {other:?} activation"),
+    };
+    let out = fp4_linear_launch(
+        &client, &a, &asc, &w.codes, &w.scales, m_pad, k, w.n, w.scale2,
+    );
+    tensor_of(client, dev, out, m_pad, w.n).slice([0..m, 0..w.n])
 }
 
 /// RMS normalization with a per-feature gain.

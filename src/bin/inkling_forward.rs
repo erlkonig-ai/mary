@@ -1379,8 +1379,26 @@ struct HostT {
 /// touching the arithmetic: each warp still computes the same output tile by
 /// the same k-loop, so this is a scheduling change and not a numerical one.
 struct SharedOnDevice {
-    gate_up: Bf16W,
-    down: Vec<Bf16W>,
+    gate_up: dev_lane::ProjW,
+    down: Vec<dev_lane::ProjW>,
+}
+
+/// `INK_SHARED_FP4=1`: quantise the shared experts to NVFP4 at bind.
+///
+/// Off by default because it is a MODEL-QUALITY change and not only an
+/// engineering one. The publisher quantised the routed experts and nothing
+/// else, so these two tensors a layer are BF16 by the checkpoint's choice; this
+/// switch overrides that choice with our own quantiser. What it buys is
+/// measured: the same operation on the same shapes runs 65.08 ms on the BF16
+/// grouped lane against 18.44 ms on the NVFP4 one, and the shared experts are
+/// 100.7 MB of a 275.8 MB layer-step.
+fn shared_fp4() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("INK_SHARED_FP4")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
 }
 
 /// The dense weights that live in DEVICE memory for the whole run, unwidened.
@@ -1490,6 +1508,38 @@ impl MtpOwned {
 /// pointer, not a transfer — or a de-interleaved copy, which cannot be aliased
 /// because it is not IN the mapping. `Aliases::slice_or_copy` decides by
 /// pointer containment and counts which happened, so the report can say.
+/// Upload BF16 weight bytes, quantise them to NVFP4, and keep only the codes.
+///
+/// The BF16 upload is a scratch buffer whose handle dies with this call, so
+/// what the run holds afterwards is the packed form: `[rows, cols]` at four
+/// bits plus one E4M3 scale per sixteen, against two bytes an element. The
+/// publisher did not quantise these tensors, so there is no `scale2` to carry
+/// and the quantiser folds the range into the block scales -- the same
+/// arrangement the activation quantiser has always used on this lane.
+fn quantized_bf16(
+    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+    bytes: &[u8],
+    rows: usize,
+    cols: usize,
+) -> dev_lane::ProjW {
+    assert_eq!(
+        bytes.len(),
+        rows * cols * 2,
+        "{rows}x{cols} BF16 is not {} bytes",
+        bytes.len()
+    );
+    let src = client.create_from_slice(bytes);
+    let (codes, scales) =
+        mary::models::inkling::fp4quant::quantize_nvfp4_bf16(client, &src, rows, cols);
+    dev_lane::ProjW::Fp4(dev_lane::PackedW {
+        codes,
+        scales,
+        n: rows,
+        k: cols,
+        scale2: 1.0,
+    })
+}
+
 fn bind_bf16(
     client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
     aliases: Option<&mary::models::inkling::fp4gemm::Aliases>,
@@ -1646,20 +1696,26 @@ impl DeviceDense {
             // is what `shared_experts_bf16` slices the result by.
             let mut gu = g;
             gu.extend_from_slice(&u);
+            // One bind or the other, never both: holding the BF16 twin as
+            // well would keep the 100.7 MB a layer this exists to stop
+            // streaming, and the admission gate prices what is held.
             let mut sd = SharedOnDevice {
-                gate_up: bind_bf16(client, aliases, &gu, 2 * n_shared * inter, h),
+                gate_up: if shared_fp4() {
+                    quantized_bf16(client, &gu, 2 * n_shared * inter, h)
+                } else {
+                    dev_lane::ProjW::Bf16(bind_bf16(client, aliases, &gu, 2 * n_shared * inter, h))
+                },
                 down: Vec::new(),
             };
             for e in 0..n_shared {
-                // `w2` is NOT de-interleaved, so this one is a view of the pile
-                // and aliases outright.
-                sd.down.push(bind_bf16(
-                    client,
-                    aliases,
-                    &d.bytes[e * per_d..(e + 1) * per_d],
-                    h,
-                    inter,
-                ));
+                let raw = &d.bytes[e * per_d..(e + 1) * per_d];
+                sd.down.push(if shared_fp4() {
+                    quantized_bf16(client, raw, h, inter)
+                } else {
+                    // `w2` is NOT de-interleaved, so this one is a view of the
+                    // pile and aliases outright.
+                    dev_lane::ProjW::Bf16(bind_bf16(client, aliases, raw, h, inter))
+                });
             }
             self.bytes += (gu.len() + n_shared * per_d) as u64;
             self.shared.insert(p.to_string(), sd);
@@ -1911,8 +1967,8 @@ fn shared_experts_bf16(
     // ONE projection for every gate and every up in the layer. See
     // [`SharedOnDevice`] for why: four GEMMs against the same activation are
     // four grids of 256 cubes, and this is one of 1024.
-    let inter = sw.gate_up.n / (2 * n_shared);
-    let gu = dev_lane::linear_bf16(x, &sw.gate_up);
+    let inter = sw.gate_up.n() / (2 * n_shared);
+    let gu = dev_lane::linear_w(x, &sw.gate_up);
     let mut out: Option<T2> = None;
     for s in 0..n_shared {
         let g = gu.clone().slice([0..n, s * inter..(s + 1) * inter]);
@@ -1921,7 +1977,7 @@ fn shared_experts_bf16(
             .slice([0..n, (n_shared + s) * inter..(n_shared + s + 1) * inter]);
         let col: Vec<f32> = (0..n).map(|tk| gammas[tk * n_shared + s]).collect();
         let gam = BT::<Bk, 2>::from_data(BTD::new(col, [n, 1]), dev);
-        let c = dev_lane::linear_bf16(dev_lane::silu(g) * u * gam, &sw.down[s]);
+        let c = dev_lane::linear_w(dev_lane::silu(g) * u * gam, &sw.down[s]);
         out = Some(match out {
             Some(o) => o + c,
             None => c,
@@ -3193,8 +3249,8 @@ fn routed_experts_bf16_dev(
 /// between them.
 fn shared_experts_dev(x: T2, sw: &SharedOnDevice, topk: T2, top_k: usize, n_shared: usize) -> T2 {
     let [n, _] = x.dims();
-    let inter = sw.gate_up.n / (2 * n_shared);
-    let gu = dev_lane::linear_bf16(x, &sw.gate_up);
+    let inter = sw.gate_up.n() / (2 * n_shared);
+    let gu = dev_lane::linear_w(x, &sw.gate_up);
     let mut out: Option<T2> = None;
     for s in 0..n_shared {
         let g = gu.clone().slice([0..n, s * inter..(s + 1) * inter]);
@@ -3202,7 +3258,7 @@ fn shared_experts_dev(x: T2, sw: &SharedOnDevice, topk: T2, top_k: usize, n_shar
             .clone()
             .slice([0..n, (n_shared + s) * inter..(n_shared + s + 1) * inter]);
         let gam = topk.clone().slice([0..n, 2 * top_k + s..2 * top_k + s + 1]);
-        let c = dev_lane::linear_bf16(dev_lane::silu(g) * u * gam, &sw.down[s]);
+        let c = dev_lane::linear_w(dev_lane::silu(g) * u * gam, &sw.down[s]);
         out = Some(match out {
             Some(o) => o + c,
             None => c,
