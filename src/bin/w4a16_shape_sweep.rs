@@ -127,9 +127,16 @@ struct Shape {
 impl Shape {
     fn new(client: &ComputeClient<Rt>, m_pad: usize, k: usize, n: usize) -> Self {
         let bytes = table_bytes(n, k);
-        // 2x the 24 MiB L2, so a repeat cannot be served from what the previous
-        // launch left behind. Capped so the big shapes do not allocate 7 GiB.
-        let rot = ((48usize << 20).div_ceil(bytes.max(1))).clamp(1, 12);
+        // What has to exceed L2 is the GAP between two reads of the SAME buffer,
+        // which is (rot - 1) * bytes, not rot * bytes. v3 targeted 48 MiB of
+        // total rotation and so left a 9 MiB table with a 45 MiB gap -- under 2x
+        // L2, i.e. still partly resident, and the inflation lands on exactly the
+        // small shapes under judgement. In situ there is NO reuse at all: GBs of
+        // model stream past between one pass's sink read and the next. 256 MiB
+        // of gap is ~11x L2 and models that.
+        let rot = (1 + (256usize << 20).div_ceil(bytes.max(1))).clamp(2, 130);
+        // ... but never allocate more than 4 GiB for one shape.
+        let rot = rot.min(((4usize << 30) / bytes.max(1)).max(1));
         Shape {
             m_pad,
             k,
@@ -270,6 +277,21 @@ fn main() {
             .collect(),
     );
 
+    // Fine sweep across the low end at the down k. A pure WAVE-QUANTISATION
+    // effect must saturate once the launch covers one resident wave (48 SMs x
+    // ~24 single-warp cubes = ~1152) and sawtooth around multiples of it. A
+    // latency/occupancy fill must be smooth and keep climbing well past it.
+    sweep(
+        &client,
+        "fine cube sweep (k=2048, m_pad=16): is there wave structure near 1152?",
+        [
+            384usize, 768, 1152, 1536, 2304, 3072, 4608, 6144, 9216, 12288, 18432, 24576,
+        ]
+        .iter()
+        .map(|&c| Shape::new(&client, 16, 2048, c * 8))
+        .collect(),
+    );
+
     // ---- 3. the real sink shapes and the head, side by side ----------------
     sweep(
         &client,
@@ -280,6 +302,38 @@ fn main() {
             Shape::new(&client, 16, 4096, 201024), // head
         ],
     );
+
+    // ---- 3b. what a launch of THIS kernel costs the host ---------------------
+    // The n=2048,k=2048 fit implies a fixed ~35 us per launch that is NOT the
+    // output allocation (the library arm below prices that at ~0). Either it is
+    // an on-device ramp, or it is cubecl's launch path -- which calls
+    // cuFuncSetAttribute before EVERY launch and takes four tensor args here
+    // against the null kernel's one. This shape is 8 cubes and 4.5 KiB: there is
+    // no device work left to hide behind, so whatever this costs is the host.
+    {
+        let s = Shape::new(&client, 16, 1024, 64);
+        let (b0, sc0) = &s.rot[0];
+        let reps = 300usize;
+        let mut best = f64::MAX;
+        for r in 0..8 {
+            let t0 = Instant::now();
+            for _ in 0..reps {
+                launch_into(&client, &s.a, b0, sc0, &s.out, 16, 1024, 64);
+            }
+            let _ = future::block_on(client.sync());
+            let dt = t0.elapsed().as_secs_f64() / reps as f64;
+            if r >= 2 {
+                best = best.min(dt);
+            }
+        }
+        println!(
+            "\n--- host launch cost of w4a16_linear itself (n=64, k=1024: 8 cubes, 4.5 KiB) ---"
+        );
+        println!(
+            "  {:.2} us per launch, {reps} back to back, one sync",
+            best * 1e6
+        );
+    }
 
     // ---- 4. split vs fused, identical bytes and identical total cubes ------
     // 14 (28) launches of a sink shape against ONE launch covering the same n.
