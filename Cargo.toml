@@ -949,6 +949,11 @@ required-features = ["inkling-cuda"]
 name = "fp4quant_gate"
 required-features = ["inkling-cuda"]
 
+# What narrow-float conversions does the device itself report and execute?
+[[bin]]
+name = "minifloat_caps_probe"
+required-features = ["cuda-backend"]
+
 [[bin]]
 name = "inkling_zerocopy_gate"
 required-features = ["inkling-cuda"]
