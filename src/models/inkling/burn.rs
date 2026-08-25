@@ -553,6 +553,17 @@ impl<B: Backend> AttnCache<B> {
         self.base
     }
 
+    /// Whether this cache is holding its keys and values as NVFP4.
+    ///
+    /// The arm is chosen inside [`super::kvpages::KvStore::new`] from a switch
+    /// and a width, and neither is visible from here — so without this a test
+    /// asserting "the FP4 lane still agrees" can pass while never having built
+    /// an FP4 store at all. It is the difference between checking the claim and
+    /// checking something adjacent to it.
+    pub fn kv_is_fp4(&self) -> bool {
+        self.k.is_fp4() && self.v.is_fp4()
+    }
+
     /// Keep the first `keep` of the rows the last [`attention_steps`] appended
     /// and discard the rest.
     ///
@@ -3225,6 +3236,100 @@ mod tests {
                 rel2(c2.v_pre.clone(), c1.v_pre.clone()),
             );
         }
+    }
+
+    /// The NVFP4 KV cache against the dense one, at the real checkpoint's
+    /// attention width — and, first, the assertion that it IS the NVFP4 one.
+    ///
+    /// `kv_is_fp4` is not decoration. Every other cached test in this module
+    /// builds an 8-wide KV row (`kv_heads: 2, head_dim: 4`), and `KvStore::new`
+    /// sends anything that is not a multiple of 64 to the dense arm whatever
+    /// the switch says — so running the whole module under `INK_FP4_KV=1` moved
+    /// not one of them, and every one of them "passed on the FP4 lane" without
+    /// an FP4 store ever existing. This test is the only place the four-bit
+    /// path runs at all, so it says so out loud before it measures anything.
+    ///
+    /// What it then measures is a REGRESSION guard, not a correctness claim.
+    /// NVFP4 stores 4.5 bits a value where BF16 stores 16; the two lanes are
+    /// not implementations of the same arithmetic and no tolerance here can
+    /// make them one. What decides whether a run should take this lane is
+    /// `golden/paired/`, the same authority [`attn_bf16`] is held to. What this
+    /// bound catches is the day the gap stops being quantization and starts
+    /// being a wrong row.
+    #[test]
+    fn the_fp4_cache_engages_at_real_width_and_tracks_the_dense_one() {
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let d = AttnDims {
+            hidden: 4096,
+            heads: 32,
+            kv_heads: 8,
+            head_dim: 128,
+            d_rel: 16,
+            rel_extent: 1024,
+            kernel: 4,
+            rms_eps: 1e-6,
+            kind: AttnKind::Local,
+        };
+        let w = weights(&d, &dev);
+        let window = Some(512usize);
+        let (prefill, tokens) = (5usize, 21usize);
+        let xs: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(fill(tokens * d.hidden, 2.5), [tokens, d.hidden]),
+            &dev,
+        );
+
+        let run = |fp4: bool| -> (bool, Vec<Tensor<B, 2>>) {
+            let _lane = if fp4 {
+                super::super::kvpages::Fp4Lane::on()
+            } else {
+                super::super::kvpages::Fp4Lane::off()
+            };
+            let (_, mut cache) = attention_prefill(
+                xs.clone().slice([0..prefill, 0..d.hidden]),
+                &w,
+                &d,
+                None,
+                window,
+                window,
+            );
+            let on = cache.kv_is_fp4();
+            let mut outs = Vec::new();
+            for pos in prefill..tokens {
+                outs.push(attention_step(
+                    xs.clone().slice([pos..pos + 1, 0..d.hidden]),
+                    &w,
+                    &d,
+                    None,
+                    pos,
+                    window,
+                    &mut cache,
+                ));
+            }
+            (on, outs)
+        };
+
+        let (dense_on, dense) = run(false);
+        let (fp4_on, narrow) = run(true);
+        assert!(!dense_on, "the dense arm built an NVFP4 store");
+        assert!(
+            fp4_on,
+            "the FP4 arm was forced on at a 1024-wide KV row and the cache is \
+             still dense - this test measures nothing"
+        );
+
+        // Relative to the dense lane's own magnitude, so the bound means the
+        // same thing at every position rather than tracking how big the
+        // activations happen to be.
+        let mut worst = 0f32;
+        for (a, b) in dense.iter().zip(narrow.iter()) {
+            let scale = a.clone().abs().max().into_scalar().max(1e-6);
+            worst = worst.max((b.clone() - a.clone()).abs().max().into_scalar() / scale);
+        }
+        println!("fp4 KV against dense KV at real width: worst relative {worst:e}");
+        assert!(
+            worst < 5e-2,
+            "the NVFP4 cache drifts from the dense one by {worst}"
+        );
     }
 
     /// The BATCHED cached lane against the SINGLE-ROW cached lane, at the real

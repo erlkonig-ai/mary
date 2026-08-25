@@ -411,6 +411,53 @@ pub fn fp4_kv() -> bool {
     })
 }
 
+thread_local! {
+    /// A per-thread override of [`fp4_kv`], for tests only.
+    ///
+    /// Exactly [`super::burn::CacheLane`]'s problem and exactly its answer. The
+    /// env switch is a process-global `OnceLock`, so a test binary gets ONE arm
+    /// and the other is never exercised — and for a change whose whole subject
+    /// is a comparison between two arms, that means the interesting one can sit
+    /// there unrun while everything passes. It nearly did: the cached-attention
+    /// tests build 8-wide KV rows, which [`KvStore::new`] sends to the dense arm
+    /// whatever the env var says, so `INK_FP4_KV=1` moved not one of them.
+    static FORCED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether THIS thread's new stores are NVFP4: the override if one is set, the
+/// process default otherwise.
+fn fp4_kv_now() -> bool {
+    FORCED.with(|c| c.get()).unwrap_or_else(fp4_kv)
+}
+
+/// Force the KV element type for as long as this value lives. Tests only.
+///
+/// A guard rather than a closure for the reason [`super::burn::CacheLane`] is
+/// one: it is a one-line addition at the top of a function body, where wrapping
+/// the body would reindent it and hide the change in the diff.
+#[cfg(test)]
+pub(crate) struct Fp4Lane(Option<bool>);
+
+#[cfg(test)]
+impl Fp4Lane {
+    /// NVFP4 pages, whatever the environment says.
+    pub(crate) fn on() -> Self {
+        Fp4Lane(FORCED.with(|c| c.replace(Some(true))))
+    }
+
+    /// Dense pages, whatever the environment says.
+    pub(crate) fn off() -> Self {
+        Fp4Lane(FORCED.with(|c| c.replace(Some(false))))
+    }
+}
+
+#[cfg(test)]
+impl Drop for Fp4Lane {
+    fn drop(&mut self) {
+        FORCED.with(|c| c.set(self.0));
+    }
+}
+
 /// The narrowest logical row an NVFP4 page can hold.
 ///
 /// Not a property of this file: [`quantize_nvfp4`] requires `k % 64 == 0`, and
@@ -729,7 +776,7 @@ impl KvStore<Bk> {
     /// process-wide env var should not be able to turn an unrelated width into
     /// a crash.
     pub fn new(width: usize, dtype: DType) -> Self {
-        if fp4_kv() && width > 0 && width.is_multiple_of(FP4_ROW_ALIGN) {
+        if fp4_kv_now() && width > 0 && width.is_multiple_of(FP4_ROW_ALIGN) {
             Self::Fp4(Fp4PageStore::new(width, dtype))
         } else {
             Self::Wide(PageStore::new(width))
