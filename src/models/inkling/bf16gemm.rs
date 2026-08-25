@@ -1009,6 +1009,51 @@ fn lane_cache(shape: (usize, usize, usize), set: Option<Lane>) -> Option<Lane> {
 // can reproduce that. So the pick is a WARM-CACHE pick, it is labelled as one,
 // and it is only evidence once an end-to-end A/B agrees with it.
 
+// ## What it found, and what that is worth
+//
+// `inkling_gemm_autotune_gate 2,3,4,5,8 --core`, DGX Spark GB10, commits
+// b23e582 and 75bd251, 2026-08-25. Per shape and width: which lane the static
+// walk takes, and which lane a timed walk takes. The three shapes are the ones
+// that dominate a pass; the widths are the verify band.
+//
+// FRAMING: these are per-GEMM ISOLATED timings, in microseconds per call, on a
+// looped weight, with the box otherwise free of GPU compute but carrying other
+// agents' build load. They rank lanes. They are NOT a throughput claim and
+// nothing here says a pass gets faster.
+//
+//     run 1 (rounds 4)        12 of 15 shape/width pairs disagree
+//     run 2 (rounds 6)        15 of 15
+//
+// In both runs the static head -- `ordered double mma pk4` -- was the pick the
+// timer rejected, at every shape, by 10% to 67%. In neither run was the WINNER
+// stable: run 1 and run 2 name different lanes for the same shape and width,
+// and the winners cluster inside a few percent of each other while the head
+// sits well outside. Read that as one finding and not two: the ORDER's head is
+// wrong for these shapes in isolation, and WHICH lane should replace it is
+// below this instrument's resolution.
+//
+// Two live explanations, and this instrument cannot separate them:
+//
+//   * The L2 hazard above. A looped weight favours whatever streams best from
+//     cache, and `pk4` partitions k four ways -- a shape whose whole argument
+//     is about how the k-loop meets memory.
+//   * `PREFERENCE_NARROW`'s own end-to-end table, which measured the `pk4` head
+//     BEST at w = 2, 3 and 5 (101.0 / 102.0 / 116.3 ms against 109.2 / 115.8 /
+//     125.8 for the list as written). A lane that loses alone and wins in a
+//     pass is exactly the case that doc predicted: "a GEMM timed alone is a
+//     GEMM that had the whole device, and four of a layer's projections are
+//     independent and overlap."
+//
+// The second explanation is the one the repo already has evidence for, so the
+// honest reading of a CHANGED row is "the isolated timer disagrees with the
+// order", not "the order is wrong". That is why the default is off, why the
+// margin exists, and why the arbiter is `scripts/bench-decode.sh`.
+//
+// One confound WAS found and removed rather than argued about: in runs 1 and 2
+// the static head was always the FIRST candidate timed in each round, and this
+// part idles at 208 MHz and ramps to 2411 MHz -- so first-in-round is a seat,
+// not a coincidence. The tune now rotates the start every round (75bd251).
+
 /// What `INK_GEMM_AUTOTUNE` turns on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Autotune {
