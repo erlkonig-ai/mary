@@ -460,6 +460,128 @@ pub fn axis_frag_b(
     }
 }
 
+/// [`axis_frag_b`]'s footprint again — the SAME addresses, the same bytes, the
+/// same fragment shape at the consumer — with the global read STAGED THROUGH
+/// SHARED MEMORY.
+///
+/// This is the whole experiment. `axis_frag_b` reads the B fragment straight
+/// out of global, and a warp instruction there spans eight weight rows `k/2`
+/// bytes apart: eight sector requests for 128 useful bytes, where a coalesced
+/// 32-bit stream issues four for the same 128. No instruction can be a
+/// contiguous read while lanes map onto eight separate rows, so the only way
+/// to recover the coalesced rate is to break that correspondence — which is
+/// what this does. The GLOBAL read becomes a per-row contiguous stream (a warp
+/// covers `kc * 32` consecutive bytes of ONE row), shared memory is filled
+/// cooperatively, and only the SMEM read keeps the fragment's eight-row shape.
+///
+/// What is NOT settled going in, and is the reason this row exists next to the
+/// unstaged one rather than replacing it: how much of that 2x survives the
+/// round trip. The staged arm pays two `sync_cube` per chunk, an smem write
+/// and an smem read per word, and — unless the row stride is padded — an
+/// eight-way bank conflict on every fragment read.
+///
+/// `kc` k tiles are staged per chunk, so a row contributes `kc * 32` bytes to
+/// each cooperative pass. `kc = 4` makes that exactly one 128-byte line per row
+/// per pass, which is the smallest chunk that reads whole lines; `kc = 8` makes
+/// it two, and also makes the SCALE row long enough (32 B) to fill a sector.
+///
+/// `pad` is the padding, in words, added to the code row stride, and it is the
+/// bank-conflict knob. A fragment read has lane `l` at row `l / 4` and word
+/// `(l & 3)` of that row, so its bank is `(l / 4) * cs + (l & 3)` mod 32 for a
+/// row stride of `cs` words. At `pad = 0`, `cs = kc * 8` is a multiple of 32
+/// and all eight rows collapse onto banks 0-3: an eight-way conflict. At
+/// `pad = 4`, `cs = 4 * (2 * kc + 1)` is four times an ODD number, so the eight
+/// row offsets are eight distinct multiples of four and lane `l` lands in bank
+/// `l`. Conflict-free, for 4 words a row of extra shared memory. Both are
+/// measured, because "what the re-layout costs" is exactly the open question.
+///
+/// `stage_sc` extends the staging to the E4M3 scale plane. Its cost per row per
+/// k tile is one word, so a chunk stages `kc` words a row — 16 B at `kc = 4`,
+/// which is still half a sector, and 32 B at `kc = 8`, which is a whole one.
+/// Left unstaged (`with_sc` alone) the scale read keeps the eight-row shape it
+/// has in the kernel: eight sector requests for 32 useful bytes, i.e. the same
+/// sector count as the codes for an eighth of the bytes.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn axis_frag_b_smem(
+    codes: &Tensor<u32>,
+    scales: &Tensor<u32>,
+    out: &mut Tensor<u32>,
+    #[comptime] size_k: usize,
+    #[comptime] with_sc: bool,
+    #[comptime] stage_sc: bool,
+    #[comptime] kc: usize,
+    #[comptime] pad: usize,
+    #[comptime] pad_s: usize,
+    #[comptime] threads: usize,
+) {
+    // Weight rows a cube stages: one n tile of 8 per plane, as in `axis_frag_b`.
+    let rows = comptime!(threads / 32 * 8);
+    let cs = comptime!(kc * 8 + pad);
+    let ss = comptime!(kc + pad_s);
+    let cw = comptime!(size_k / 8); // u32 words in one row of codes
+    let sw = comptime!(size_k / 64); // u32 words in one row of scales
+    let chunks = comptime!(size_k / 64 / kc);
+    // Words a thread moves per cooperative pass: `rows * kc * 8 / threads`,
+    // which is `2 * kc` for any cube width — the cube grows with the rows it
+    // has to fill.
+    let per_c = comptime!(rows * kc * 8 / threads);
+    let per_s = comptime!(rows * kc / threads);
+
+    let mut sm = SharedMemory::<u32>::new(comptime!(rows * cs));
+    let mut sm_sc = SharedMemory::<u32>::new(comptime!(if stage_sc { rows * ss } else { 1usize }));
+
+    let unit = UNIT_POS as usize;
+    let row0 = CUBE_POS as usize * rows;
+    // The consumer's fragment shape, unchanged: four lanes to a weight row,
+    // eight rows to a plane, two 32-bit reads 16 bytes apart.
+    let rl = unit / 32 * 8 + (unit % 32) / 4;
+    let sub = unit % 4;
+
+    let mut acc = u32::new(0i64);
+    for c in 0..chunks {
+        // The cooperative load. Thread `t` takes flat word `t + j * threads` of
+        // the chunk, and the chunk is laid out row-major, so a warp covers
+        // `min(kc * 8, 32)` consecutive words of one row — 128 consecutive
+        // bytes at `kc >= 4`, which is the fully-coalesced case.
+        #[unroll]
+        for j in 0..per_c {
+            let f = unit + j * threads;
+            let r = f / comptime!(kc * 8);
+            let o = f % comptime!(kc * 8);
+            sm[r * cs + o] = codes[(row0 + r) * cw + c * comptime!(kc * 8) + o];
+        }
+        if comptime![stage_sc] {
+            #[unroll]
+            for j in 0..per_s {
+                let f = unit + j * threads;
+                let r = f / kc;
+                let o = f % kc;
+                sm_sc[r * ss + o] = scales[(row0 + r) * sw + c * kc + o];
+            }
+        }
+        sync_cube();
+        #[unroll]
+        for t in 0..kc {
+            let base = rl * cs + t * 8 + sub;
+            acc += sm[base];
+            acc += sm[base + 4];
+            if comptime![stage_sc] {
+                acc += sm_sc[rl * ss + t];
+            } else if comptime![with_sc] {
+                acc += scales[(row0 + rl) * sw + c * kc + t];
+            }
+        }
+        // The chunk is overwritten on the next pass, so the readers have to be
+        // done with it. This is the second of the two barriers a single-buffered
+        // stage pays, and it is part of what the figure below is measuring.
+        sync_cube();
+    }
+    if acc == u32::new(0x5AFE_5AFEi64) {
+        out[unit % out.len()] = acc;
+    }
+}
+
 /// Best and first-pass seconds over `reps` timed launches after two warmups.
 fn best_first(mut run: impl FnMut() -> f64, reps: usize) -> (f64, f64) {
     for _ in 0..2 {
@@ -520,11 +642,11 @@ fn run_axes() -> Result<()> {
     );
     println!("  rows 1-5 read the SAME handle, bound at different element types");
     println!("  the LPDDR5X bus here is ~273 GB/s; anything above it is cache, not memory\n");
-    println!("  {:<46} {:>9} {:>9} {:>9}", "row", "GB/s", "ms", "1st ms");
+    println!("  {:<62} {:>9} {:>9} {:>9}", "row", "GB/s", "ms", "1st ms");
 
     let report = |label: &str, bytes: usize, best: f64, first: f64| {
         println!(
-            "  {:<46} {:>9.1} {:>9.3} {:>9.3}",
+            "  {:<62} {:>9.1} {:>9.3} {:>9.3}",
             label,
             bytes as f64 / best / 1e9,
             best * 1e3,
@@ -825,6 +947,138 @@ fn run_axes() -> Result<()> {
         report(label, bytes, b, f);
     }
 
+    // ---- rows 24+: the same footprint, STAGED THROUGH SHARED MEMORY --------
+    //
+    // These are the experiment the retraction in `moegroup`'s header asks for.
+    // They read the SAME 1 GiB handle rows 1-23 read, seconds later, in the
+    // same process, and they present the consumer with the SAME eight-row
+    // fragment shape — the only thing that changes is that the GLOBAL read is
+    // a per-row contiguous stream and the eight-row scatter happens in shared
+    // memory instead. Each is printed next to the unstaged row it replaces:
+    // 24 against 7, 25 against 8, 26 against 8 with the scale plane staged too.
+    //
+    // The `pad = 0` rows are not an oversight. `pad` is the bank-conflict knob
+    // (see the kernel's header) and its two settings are the measured price of
+    // the re-layout, which is half of what "how much of the 2x survives" means.
+    // The smem-per-cube column is the other half: this part gives an SM 1536
+    // threads and ~100 KiB of shared memory, so a 256-thread cube can have six
+    // residents on the thread budget and `100 KiB / smem` on the other, and
+    // once the second is the smaller number the stage has bought coalescing
+    // with occupancy.
+    for (label, with_sc, stage_sc, kc, pad, pad_s, bd) in [
+        (
+            "24 STAGED codes only, kc=4, padded",
+            false,
+            false,
+            4usize,
+            4usize,
+            1usize,
+            256u32,
+        ),
+        (
+            "25 STAGED codes, kc=4, padded + row-major scales",
+            true,
+            false,
+            4,
+            4,
+            1,
+            256,
+        ),
+        (
+            "26 STAGED codes + scales, kc=8, padded",
+            true,
+            true,
+            8,
+            4,
+            1,
+            256,
+        ),
+        (
+            "27 STAGED codes only, kc=8, padded",
+            false,
+            false,
+            8,
+            4,
+            1,
+            256,
+        ),
+        (
+            "28 STAGED codes, kc=8, padded + row-major scales",
+            true,
+            false,
+            8,
+            4,
+            1,
+            256,
+        ),
+        (
+            "29 row 24 with pad=0 (8-way bank conflict)",
+            false,
+            false,
+            4,
+            0,
+            1,
+            256,
+        ),
+        (
+            "30 row 26 with pad=0 (8-way bank conflict)",
+            true,
+            true,
+            8,
+            0,
+            0,
+            256,
+        ),
+        (
+            "31 row 26, kc=16 (twice the smem, half the cubes)",
+            true,
+            true,
+            16,
+            4,
+            1,
+            256,
+        ),
+        ("32 row 26, 128-thread cubes", true, true, 8, 4, 1, 128),
+        ("33 row 26, 64-thread cubes", true, true, 8, 4, 1, 64),
+        ("34 row 26, 32-thread cubes", true, true, 8, 4, 1, 32),
+    ] {
+        let rows_per_cube = bd as usize / 4;
+        let blocks = (n / rows_per_cube) as u32;
+        let bytes = if with_sc { codes_b + scales_b } else { codes_b };
+        let smem = rows_per_cube * (kc * 8 + pad) * 4
+            + if stage_sc {
+                rows_per_cube * (kc + pad_s) * 4
+            } else {
+                4
+            };
+        let (b, f) = best_first(
+            || {
+                let t0 = Instant::now();
+                unsafe {
+                    axis_frag_b_smem::launch::<Rt>(
+                        &client,
+                        CubeCount::Static(blocks, 1, 1),
+                        CubeDim::new_1d(bd),
+                        TensorArg::from_raw_parts(big.clone(), [1].into(), [codes_b / 4].into()),
+                        TensorArg::from_raw_parts(sc.clone(), [1].into(), [scales_b / 4].into()),
+                        TensorArg::from_raw_parts(sink.clone(), [1].into(), [1024].into()),
+                        k,
+                        with_sc,
+                        stage_sc,
+                        kc,
+                        pad,
+                        pad_s,
+                        bd as usize,
+                    )
+                };
+                let _ = cubecl::future::block_on(client.sync());
+                t0.elapsed().as_secs_f64()
+            },
+            reps,
+        );
+        report(&format!("{label}  [{smem} B smem/cube]"), bytes, b, f);
+    }
+
     // ---- row 15: the kernel itself, on the same table, in the same process --
     //
     // Rows 7-14 are a MODEL of what `fp4_linear_grouped` reads, and a model is
@@ -877,6 +1131,62 @@ fn run_axes() -> Result<()> {
             bytes as f64 / (b - ab) / 1e9
         );
         let _ = af;
+
+        // ---- rows 35+: the same kernel with B staged --------------------
+        //
+        // `fp4_linear_smem` is row 15's kernel with the B fragment read out of
+        // shared memory, and the cube is ONE plane here, so the fill is the
+        // warp's own eight rows and there is no cross-plane barrier. It reads
+        // the same table, allocates the same output, pays the same store, and
+        // is bit-identical — so the difference from row 15 is the staging and
+        // nothing else.
+        //
+        // `stage_sc` is separate because the two defects are separate: this
+        // kernel reads its four E4M3 block scales as four INDIVIDUAL bytes,
+        // four instructions each spanning the same eight rows, i.e. 32 sector
+        // requests a k tile against the codes' 16. The grouped kernel already
+        // reads them as one 32-bit vector; this one does not, so leaving the
+        // staging off measures the code staging against an unchanged baseline
+        // and turning it on says what the scale plane was costing.
+        use mary::models::inkling::fp4gemm::fp4_linear_smem_launch;
+        for (label, kc, pad, st) in [
+            ("35 STAGED codes, kc=4 pad=0", 4usize, 0usize, false),
+            ("36 STAGED codes, kc=4 pad=4", 4usize, 4usize, false),
+            ("37 STAGED codes, kc=8 pad=0", 8usize, 0usize, false),
+            ("38 STAGED codes + scales, kc=4 pad=0", 4usize, 0usize, true),
+            ("39 STAGED codes + scales, kc=8 pad=0", 8usize, 0usize, true),
+        ] {
+            let (sb, sf) = best_first(
+                || {
+                    let t0 = Instant::now();
+                    let o = fp4_linear_smem_launch::<Rt>(
+                        &client, &qa, &qa_sc, &big, &sc, m_pad, k, n, 1.0, kc, pad, st,
+                    );
+                    let _ = cubecl::future::block_on(client.sync());
+                    let dt = t0.elapsed().as_secs_f64();
+                    drop(o);
+                    dt
+                },
+                reps,
+            );
+            report(label, bytes, sb, sf);
+        }
+
+        // Bit equality against row 15. The staged kernel changes WHERE the B
+        // fragment is read from and nothing else, so anything but identical
+        // output is a defect in the staging rather than a rounding difference.
+        let o_base = fp4_linear_launch::<Rt>(&client, &qa, &qa_sc, &big, &sc, m_pad, k, n, 1.0);
+        let o_smem = fp4_linear_smem_launch::<Rt>(
+            &client, &qa, &qa_sc, &big, &sc, m_pad, k, n, 1.0, 4, 0, true,
+        );
+        let vb = client.read_one(o_base).expect("baseline output");
+        let vs = client.read_one(o_smem).expect("staged output");
+        let diff = vb.iter().zip(vs.iter()).filter(|(x, y)| x != y).count();
+        println!(
+            "     bit equality against row 15: {diff} of {} output bytes differ",
+            vb.len()
+        );
+        assert_eq!(diff, 0, "the staged head lane is NOT bit-identical");
     }
 
     Ok(())
