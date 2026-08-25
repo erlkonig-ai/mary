@@ -1097,8 +1097,14 @@ pub fn fp4_linear_grouped_smem_launch_tuned<O: Scalar + Cast + CubeElement, R: R
 /// K tiles staged per chunk, from `INK_MOE_KC`, clamped to something `k` admits.
 ///
 /// A chunk is `kc * 32` bytes of each staged weight row, and the cooperative
-/// load wants that to be a whole number of 128-byte lines, so `kc >= 4`. Above
-/// that it is a shared-memory-against-chunk-count trade the caller measures.
+/// load wants that to be a whole number of 128-byte lines, so `kc >= 4`.
+///
+/// Four is the default because four MEASURED best at every plane count tried,
+/// not because it is the smallest legal value: 4 / 8 / 16 read 194.0 / 154.8 /
+/// 101.6 GB/s at one plane and 151.2 / 116.6 / 60.6 at four. A bigger chunk
+/// stages more per barrier and it does not pay for itself — the tile is already
+/// far below the shared-memory budget, so the only thing extra depth buys is a
+/// longer stretch with no loads in flight.
 pub fn grouped_kc(k: usize) -> usize {
     use std::sync::OnceLock;
     static C: OnceLock<usize> = OnceLock::new();
@@ -1107,7 +1113,7 @@ pub fn grouped_kc(k: usize) -> usize {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&v| (4..=64).contains(&v))
-            .unwrap_or(8)
+            .unwrap_or(4)
     });
     let tiles = k / KTILE;
     let mut kc = want.min(tiles);
@@ -1134,11 +1140,21 @@ pub fn grouped_smem() -> bool {
     })
 }
 
-/// Padding words on the staged row stride, from `INK_MOE_PAD` (default 4).
+/// Padding words on the staged row stride, from `INK_MOE_PAD`.
 ///
-/// Four is the conflict-free setting; zero is the eight-way-conflicted one, and
-/// it is a knob rather than a constant because the difference is the measured
-/// price of the re-layout.
+/// Four is the conflict-free setting: a fragment read puts lane `l` at row
+/// `l / 4` and word `l & 3`, so with a stride of `4 * (2 * kc + 1)` words the
+/// eight rows land on eight distinct multiples of four and lane `l` gets bank
+/// `l`. Zero leaves all eight rows on banks 0-3, an eight-way conflict.
+///
+/// **The default is ZERO, and that is a measurement rather than an oversight.**
+/// At the winning decode configuration the conflicted stride read 194.0 GB/s
+/// against the conflict-free one's 170.2. The arm is bandwidth-bound, so the
+/// conflict costs nothing — the isolated model in `inkling_membw` rows 24/29
+/// and 26/30 shows the same two settings within 2% of each other with the `mma`
+/// deleted — while a stride that is not a power of two turns every smem index
+/// into a multiply. The knob stays because that trade is a property of THIS
+/// kernel being memory-bound, and a future arm that is not would want four.
 pub fn grouped_pad() -> usize {
     use std::sync::OnceLock;
     static P: OnceLock<usize> = OnceLock::new();
@@ -1147,7 +1163,7 @@ pub fn grouped_pad() -> usize {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&v| v <= 32)
-            .unwrap_or(4)
+            .unwrap_or(0)
     })
 }
 
