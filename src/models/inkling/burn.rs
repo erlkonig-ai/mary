@@ -756,13 +756,15 @@ pub fn attention_prefill(
     attention_prefill_lane(x, w, d, log_scaling, mask_window, window, true, None)
 }
 
-/// The same layer with the banded lane REFUSED, so a test can hold the two
+/// The same layer with the FUSED lanes REFUSED, so a test can hold the two
 /// implementations side by side.
 ///
-/// Exists because the only check that catches a band which disagrees with the
-/// dense triangle is one that runs both on the same weights: a banded kernel
-/// checked against a banded reference proves the two share an author, not that
-/// either is right.
+/// Exists because the only check that catches a fused kernel which disagrees
+/// with the dense triangle is one that runs both on the same weights: a banded
+/// kernel checked against a banded reference proves the two share an author,
+/// not that either is right. It refuses BOTH fused lanes — the band on a local
+/// layer and [`super::flash`] on a global one — because both are the same kind
+/// of claim about the same dense arm.
 #[cfg(test)]
 pub(crate) fn attention_prefill_dense(
     x: Tensor<Bk, 2>,
@@ -784,7 +786,7 @@ fn attention_prefill_lane(
     log_scaling: Option<crate::models::inkling::attn::LogScaling>,
     mask_window: Option<usize>,
     window: Option<usize>,
-    banded_ok: bool,
+    fused_ok: bool,
     block: Option<usize>,
 ) -> (Tensor<Bk, 2>, AttnCache<Bk>) {
     use crate::models::inkling::config::AttnKind;
@@ -839,7 +841,7 @@ fn attention_prefill_lane(
         // binding that shadowed them would silently reach the window wherever a
         // projection was meant.
         Some(win)
-            if banded_ok
+            if fused_ok
                 && crate::models::inkling::banded::applies(heads, kv_heads, head_dim, win) =>
         {
             use crate::models::inkling::banded::banded_attention_launch;
@@ -895,6 +897,101 @@ fn attention_prefill_lane(
                 d.scaling(),
             );
             tensor_of(client, dev.clone(), o, tokens, heads * head_dim)
+        }
+        // THE OTHER SEVEN. A global layer reads every key, so there is no band
+        // to exploit -- but there is no need to write the square down either.
+        // [`super::flash`] tiles the key axis and carries the softmax's running
+        // max and sum across the tiles, so the peak working set of a global
+        // layer stops being `[heads, rows, tokens]` and becomes the
+        // relative-bias table for one query block. The GQA expansion goes with
+        // it: a cube holds all `groups` query heads of one KV head, so K and V
+        // are read once for the four heads that share them rather than once
+        // each off a materialised copy.
+        _ if fused_ok
+            && flash_lane()
+            && crate::models::inkling::flash::applies(
+                heads,
+                kv_heads,
+                head_dim,
+                crate::models::inkling::flash::prefill_rows(groups),
+            ) =>
+        {
+            use crate::models::inkling::flash::{
+                self, KeyRun, KvElem, flash_attention_launch, query_block as flash_block,
+            };
+            use crate::models::inkling::seam::{client_of, handle_of, handle_of_any, tensor_of};
+
+            let rows_tile = flash::prefill_rows(groups);
+            let client = client_of(&q);
+            // K and V exactly as the convolutions left them --
+            // `[tokens, kv_heads * head_dim]`, token-major, narrowed to the
+            // operand dtype. No transpose (the kernel stages the key tile
+            // through shared memory instead, which is what lets the decode lane
+            // read the same buffers straight out of the cache) and no repeat
+            // (the kernel indexes `h / groups`).
+            let (k_h, k_dt) = handle_of_any(as_act(k.clone()));
+            let (v_h, _) = handle_of_any(as_act(v.clone()));
+            let kv_elem = match k_dt {
+                burn::tensor::DType::BF16 => KvElem::Bf16,
+                _ => KvElem::F32,
+            };
+            let rel_proj = w.rel_proj.clone().slice([0..d.d_rel, 0..eff]);
+            // The query block is sized by the RELATIVE TABLE now, not by the
+            // score block, because the score block no longer exists. That is
+            // the whole change in one line: what used to be
+            // `rows * heads * tokens` is `rows * heads * eff`, and `eff` is at
+            // most `rel_extent` however long the sequence is.
+            let block = block
+                .unwrap_or_else(|| flash_block(heads, eff, head_dim, tokens))
+                .clamp(1, tokens);
+            let mut parts: Vec<Tensor<Bk, 2>> = Vec::with_capacity(tokens.div_ceil(block));
+            for lo in (0..tokens).step_by(block) {
+                let hi = (lo + block).min(tokens);
+                let rows = hi - lo;
+                let rel = r
+                    .clone()
+                    .slice([lo..hi, 0..heads * d.d_rel])
+                    .reshape([rows * heads, d.d_rel])
+                    .matmul(rel_proj.clone())
+                    .reshape([rows, heads, eff])
+                    * tau.clone().slice([lo..hi]).reshape([rows, 1, 1]);
+                let rel_h = handle_of(rel);
+                let q_h = handle_of(q.clone().slice([lo..hi, 0..heads * head_dim]));
+                let o = flash_attention_launch(
+                    &client,
+                    &q_h,
+                    &[KeyRun {
+                        k: &k_h,
+                        v: &v_h,
+                        rows: tokens,
+                        base: 0,
+                        lo: 0,
+                        hi: tokens,
+                    }],
+                    &rel_h,
+                    kv_elem,
+                    rows,
+                    lo,
+                    heads,
+                    kv_heads,
+                    head_dim,
+                    eff,
+                    mask_window,
+                    d.scaling(),
+                    rows_tile,
+                );
+                parts.push(tensor_of(
+                    client.clone(),
+                    dev.clone(),
+                    o,
+                    rows,
+                    heads * head_dim,
+                ));
+            }
+            match parts.len() {
+                1 => parts.pop().expect("one block"),
+                _ => Tensor::cat(parts, 0),
+            }
         }
         _ => {
             // A global layer reads every key, so there is a square to compute.
@@ -1377,6 +1474,27 @@ impl PagedKv {
 /// the cached lane since the BF16 cache landed, priced there against
 /// `golden/paired/` rather than against a tolerance, and this is the same
 /// arithmetic on the other lane.
+/// Whether the GLOBAL attention layers take the fused lane. **On by default;
+/// `INK_FLASH=0` is the old dense-blocked arm.**
+///
+/// A switch and not a silent replacement, for the reason [`act_bf16`] is one:
+/// the two arms differ in numerics as well as in memory — the fused lane keeps
+/// Q and the scores in f32 where the dense lane narrows them to BF16 for the
+/// matmul — and the only honest way to price that is to run both arms of the
+/// same binary against the same harness. It is also the only way to measure
+/// them at all on this box, where a cross-worktree comparison is meaningless
+/// because cubecl's autotune cache is per working directory.
+///
+/// It is ON rather than OFF because what it changes is not a trade: the dense
+/// arm cannot express a long context at all. It GQA-expands K and V to
+/// `[heads, tokens, head_dim]` before it starts, which is two buffers linear in
+/// the sequence with no knob on them, and then holds `[heads, rows, tokens]`
+/// of scores on top.
+pub fn flash_lane() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INK_FLASH").map(|v| v != "0").unwrap_or(true))
+}
+
 pub fn act_bf16() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -1447,6 +1565,105 @@ pub fn from_act<const D: usize>(t: Tensor<Bk, D>) -> Tensor<Bk, D> {
     } else {
         t
     }
+}
+
+/// Whether a layer's cached lanes take [`super::flash`].
+///
+/// One predicate rather than three copies of the same three arguments, because
+/// the three cached entry points ([`attention_step`], [`attention_steps`] and
+/// the prefill's own arm) must not be able to disagree about it: a batch of one
+/// that took a different lane from a step of one would show up as drift in
+/// [`drift_table_at_real_width`] and be blamed on the cache.
+fn flash_cached_applies(d: &crate::models::inkling::attn::AttnDims) -> bool {
+    flash_lane()
+        && crate::models::inkling::flash::applies(
+            d.heads,
+            d.kv_heads,
+            d.head_dim,
+            crate::models::inkling::flash::decode_rows(d.groups()),
+        )
+}
+
+/// `nq` query rows at absolute positions `q0 ..` against the cache's PAGES.
+///
+/// `q` is `[nq, heads * head_dim]` with log scaling already applied, and `rel`
+/// is `[nq, heads, eff]` likewise. The pages go in as pages, at the dtype the
+/// store holds them in — a dense store hands over slices of its own buffers, an
+/// NVFP4 store dequantises one page at a time — so nothing here rebuilds a
+/// contiguous cache, and nothing pads the key axis to a shape bucket: a fused
+/// kernel takes its lengths as scalars and cubecl does not recompile on a
+/// scalar.
+fn flash_cached(
+    q: Tensor<Bk, 2>,
+    rel: Tensor<Bk, 3>,
+    cache: &AttnCache<Bk>,
+    dev: &burn::backend::cuda::CudaDevice,
+    d: &crate::models::inkling::attn::AttnDims,
+    nq: usize,
+    q0: usize,
+    eff: usize,
+    window: Option<usize>,
+) -> Tensor<Bk, 2> {
+    use crate::models::inkling::flash::{self, KeyRun, KvElem, flash_attention_launch};
+    use crate::models::inkling::seam::{client_of, handle_of, handle_of_any, tensor_of};
+
+    let (heads, kv_heads, head_dim) = (d.heads, d.kv_heads, d.head_dim);
+    let (len, base) = (cache.len(), cache.base);
+    let head = cache.k.head();
+    let kparts = cache.k.parts(dev);
+    let vparts = cache.v.parts(dev);
+    debug_assert_eq!(kparts.len(), vparts.len(), "the two stores drifted apart");
+    let client = client_of(&q);
+    let q_h = handle_of(q);
+    let rel_h = handle_of(rel);
+    let mut held: Vec<(cubecl::server::Handle, cubecl::server::Handle, usize)> =
+        Vec::with_capacity(kparts.len());
+    let mut kv_dt = burn::tensor::DType::F32;
+    for (kp, vp) in kparts.into_iter().zip(vparts) {
+        let rows = kp.dims()[0];
+        let (kh, dt) = handle_of_any(kp);
+        let (vh, _) = handle_of_any(vp);
+        kv_dt = dt;
+        held.push((kh, vh, rows));
+    }
+    // Stored row `off + i` of page `p` is logical key `off + i - head`, at
+    // absolute position `base + off + i - head`. `head` is the prefix a window
+    // has dropped but the page still carries, and it never exceeds `base` —
+    // every dropped row was counted into `base` first — so the subtraction
+    // cannot go under.
+    let mut off = 0usize;
+    let mut runs: Vec<KeyRun<'_>> = Vec::with_capacity(held.len());
+    for (kh, vh, rows) in &held {
+        runs.push(KeyRun {
+            k: kh,
+            v: vh,
+            rows: *rows,
+            base: base + off - head,
+            lo: head.saturating_sub(off).min(*rows),
+            hi: (head + len).saturating_sub(off).min(*rows),
+        });
+        off += rows;
+    }
+    let out = flash_attention_launch(
+        &client,
+        &q_h,
+        &runs,
+        &rel_h,
+        match kv_dt {
+            burn::tensor::DType::BF16 => KvElem::Bf16,
+            _ => KvElem::F32,
+        },
+        nq,
+        q0,
+        heads,
+        kv_heads,
+        head_dim,
+        eff,
+        window,
+        d.scaling(),
+        flash::decode_rows(d.groups()),
+    );
+    tensor_of(client, dev.clone(), out, nq, heads * head_dim)
 }
 
 /// One generated token through one attention layer, reading the cache.
@@ -1531,6 +1748,42 @@ pub fn attention_step(
     // one shape, and the padded keys are masked to `-inf` so the softmax gives
     // them exactly zero weight. `INK_KV_PAD=1` is the unpadded arm, which is
     // what this function did before.
+    // THE FUSED LANE, on the layers that have one.
+    //
+    // Everything below this block builds a `[heads, 1, slots]` score row and
+    // walks it five more times — the epilogue's bias and mask, the softmax's
+    // max, its sum, its divide — before `p @ v` reads it a sixth. At 1M tokens
+    // of context that row is 128 MB per global layer. The fused kernel never
+    // writes it: it reads each page once, keeps the softmax's running max and
+    // sum in registers, and accumulates `p @ v` as it goes. Measured on a GB10
+    // at the release's global shape, one layer, one step, NVFP4 KV: 2.5 ms
+    // against 4.2 at 16k of context, 7.8 against 33.2 at 64k, and 28.5 against
+    // 143.8 at 256k.
+    if flash_cached_applies(d) {
+        let tau = match (d.kind, log_scaling) {
+            (AttnKind::Global, Some(ls)) => ls.tau(pos),
+            _ => 1.0,
+        };
+        let q = q.mul_scalar(tau);
+        // Only the distances that can occur are worth projecting: the oldest
+        // retained key is `pos - base` back and the table stops at
+        // `rel_extent`. Rounded up to the pad bucket for the same reason the
+        // lane below rounds — this is the width of a matmul, and a width that
+        // moves every step is a kernel compiled every step.
+        let eff = d
+            .rel_extent
+            .min(pos - base + 1)
+            .next_multiple_of(kv_pad_bucket())
+            .min(d.rel_extent);
+        let rel = r
+            .reshape([heads, d.d_rel])
+            .matmul(w.rel_proj.clone().slice([0..d.d_rel, 0..eff]))
+            .reshape([1, heads, eff])
+            .mul_scalar(tau);
+        let out = flash_cached(q, rel, cache, &dev, d, 1, pos, eff, window);
+        return linear_bf16(out, &w.wo);
+    }
+
     let bucket = kv_pad_bucket();
     // THE PAGED READ. `slots` is the key axis this function builds every shape
     // at, and it is `head + len + tail padding` rather than `len` rounded up:
@@ -1721,6 +1974,42 @@ pub fn attention_steps(
 
     let len = cache.len();
     let base = cache.base;
+
+    // The fused lane, the `rows > 1` twin of [`attention_step`]'s. It is the
+    // SAME kernel with `nq = rows`: a draft row is a query at its own absolute
+    // position, and the rows of the batch are keys the later rows can see
+    // because they were appended above. Causality inside the batch is
+    // therefore the same predicate as causality against the prefix, which is
+    // what makes one kernel enough.
+    //
+    // Wired here and not only on the single step because a batch of one and a
+    // step of one must be the same arithmetic. While this function was on the
+    // dense lane and [`attention_step`] was fused, they were not, and
+    // [`drift_table_at_real_width`]'s batch=1 column — which had been exactly
+    // zero — moved to 4e-3.
+    if flash_cached_applies(d) {
+        let eff = d
+            .rel_extent
+            .min(pos0 + rows - base)
+            .next_multiple_of(kv_pad_bucket())
+            .min(d.rel_extent);
+        let taus: Vec<f32> = (0..rows)
+            .map(|i| match (d.kind, log_scaling) {
+                (AttnKind::Global, Some(ls)) => ls.tau(pos0 + i),
+                _ => 1.0,
+            })
+            .collect();
+        let tau: Tensor<Bk, 1> = Tensor::from_data(TensorData::new(taus, [rows]), &dev);
+        let q = q * tau.clone().reshape([rows, 1]);
+        let rel = r
+            .reshape([rows * heads, d.d_rel])
+            .matmul(w.rel_proj.clone().slice([0..d.d_rel, 0..eff]))
+            .reshape([rows, heads, eff])
+            * tau.reshape([rows, 1, 1]);
+        let out = flash_cached(q, rel, cache, &dev, d, rows, pos0, eff, window);
+        return linear_bf16(out, &w.wo);
+    }
+
     let bucket = kv_pad_bucket();
     // The paged read, the `rows > 1` twin of [`attention_step`]'s. See
     // [`PagedKv`] for what `head` and the tail padding are and why the mask
@@ -2625,6 +2914,207 @@ mod tests {
         (0..n)
             .map(|i| (i as f32 * 0.7919 + seed).sin() * 0.5 + (i as f32 * 0.1237).cos() * 0.25)
             .collect()
+    }
+
+    /// The 42-layer release's GLOBAL attention shape, from its own
+    /// `config.json` — the one [`super::super::budget`]'s `small()` parses.
+    ///
+    /// The tests above run a four-head toy because what they check is
+    /// structural. The two benchmarks below run THIS, because what they check
+    /// is a cost, and a cost at a shape the model does not have is a number
+    /// about nothing.
+    fn real_global_dims() -> AttnDims {
+        AttnDims {
+            hidden: 4096,
+            heads: 32,
+            kv_heads: 8,
+            head_dim: 128,
+            d_rel: 16,
+            rel_extent: 1024,
+            kernel: 4,
+            rms_eps: 1e-6,
+            kind: AttnKind::Global,
+        }
+    }
+
+    /// The device barrier the timings below close on.
+    ///
+    /// A four-byte read rather than the output: it is ordered behind the
+    /// launches on this thread's stream, which is what makes it a barrier,
+    /// and it charges the measurement nothing. Without it these functions time
+    /// the ENQUEUE. Lifted from [`super::super::bf16gemm`]'s bench, which says
+    /// the same thing at more length.
+    fn barrier(client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>) {
+        let _ = client.read_one(client.empty(4));
+    }
+
+    /// One global PREFILL layer, timed at lengths, on whichever arm the binary
+    /// was started with.
+    ///
+    /// **Framing rule.** Every number this prints is milliseconds for ONE
+    /// attention layer over the whole prefill, at the 42-layer release's global
+    /// shape (hidden 4096, 32 heads over 8 KV heads, head_dim 128, d_rel 16,
+    /// rel_extent 1024), on a GB10, with the projections and the two short
+    /// convolutions INCLUDED — it times `attention_prefill`, not the kernel.
+    /// The model has seven such layers. `reserved` is what the cubecl pool is
+    /// holding afterwards, which is the closest thing to a peak working set
+    /// this seam exposes.
+    ///
+    /// Both arms must be run from THIS directory, because cubecl's autotune
+    /// cache lives at `$CWD/target/autotune` and stores which kernel won a
+    /// timing race — two worktrees name different winners for most shapes, so a
+    /// cross-worktree comparison measures the cache and not the change:
+    ///
+    /// ```text
+    /// INK_FLASH=1 cargo test --release --features inkling-cuda -- \
+    ///     --ignored --nocapture flash_prefill_cost
+    /// INK_FLASH=0 cargo test --release --features inkling-cuda -- \
+    ///     --ignored --nocapture flash_prefill_cost
+    /// ```
+    #[test]
+    #[ignore = "a benchmark, not a check"]
+    fn flash_prefill_cost_at_length() {
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let d = real_global_dims();
+        let w = weights(&d, &dev);
+        let ls = Some(LogScaling {
+            n_floor: 128000.0,
+            alpha: 0.1,
+        });
+        let client = client_of(&Tensor::<B, 2>::zeros([1, 1], &dev));
+        println!(
+            "\nprefill, one global layer, GB10, INK_FLASH={}",
+            if flash_lane() { 1 } else { 0 }
+        );
+        println!("  tokens        ms   reserved MiB");
+        for tokens in [1024usize, 4096, 8192, 16_384, 32_768] {
+            let xs: Tensor<B, 2> = Tensor::random(
+                [tokens, d.hidden],
+                burn::tensor::Distribution::Uniform(-1.0, 1.0),
+                &dev,
+            );
+            // Two warm runs: the first call at a shape compiles kernels and
+            // resolves autotune, and the first call at ANY shape also pays for
+            // the pool growing under it. Neither is what this measures.
+            for _ in 0..2 {
+                let (o, c) = attention_prefill(xs.clone(), &w, &d, ls, None, None);
+                drop((o, c));
+            }
+            barrier(&client);
+            let t0 = std::time::Instant::now();
+            let (out, c) = attention_prefill(xs, &w, &d, ls, None, None);
+            core::hint::black_box(&out);
+            barrier(&client);
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            let reserved = crate::models::inkling::seam::pool_reserved(&client);
+            drop((out, c));
+            println!(
+                "  {tokens:>6}  {ms:>8.1}   {:>12.0}",
+                reserved as f64 / (1 << 20) as f64
+            );
+        }
+    }
+
+    /// One global DECODE step, timed against the context behind it.
+    ///
+    /// **Framing rule.** Milliseconds for ONE `attention_step` — one generated
+    /// token through ONE global attention layer, projections and short
+    /// convolutions included — at the release's global shape on a GB10, against
+    /// a synthetic NVFP4 KV cache of `context` keys. The model has seven such
+    /// layers, so multiply by seven for the per-step attention cost of a decode
+    /// and compare it against the ~46 ms the rest of a step takes. The cache is
+    /// built by appending random rows rather than by prefilling, because a
+    /// prefill at 262,144 would allocate 4.3 GB of activations to produce a
+    /// cache this test only wants the SIZE of.
+    ///
+    /// Same two-run protocol as [`flash_prefill_cost_at_length`], same reason.
+    #[test]
+    #[ignore = "a benchmark, not a check"]
+    fn flash_decode_cost_at_context() {
+        use crate::models::inkling::kvpages::KvStore;
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let d = real_global_dims();
+        let w = weights(&d, &dev);
+        let ls = Some(LogScaling {
+            n_floor: 128000.0,
+            alpha: 0.1,
+        });
+        let kv_w = d.kv_heads * d.head_dim;
+        let client = client_of(&Tensor::<B, 2>::zeros([1, 1], &dev));
+        println!(
+            "\ndecode, one global layer, GB10, INK_FLASH={}, NVFP4 KV",
+            if flash_lane() { 1 } else { 0 }
+        );
+        println!("  context   window       ms");
+        for (context, window) in [
+            (4096usize, None),
+            (16_384, None),
+            (65_536, None),
+            (262_144, None),
+            // A LOCAL layer, which is thirty-five of the forty-two: the window
+            // trims the cache to its last 512 keys on the first step, so what
+            // this row measures is a 512-key read whatever `context` says.
+            (16_384, Some(512usize)),
+        ] {
+            let fill_store = || {
+                let mut st = KvStore::<Bk>::new(kv_w, burn::tensor::DType::BF16);
+                let mut done = 0usize;
+                while done < context {
+                    let n = (context - done).min(8192);
+                    st.append(as_kv(Tensor::<B, 2>::random(
+                        [n, kv_w],
+                        burn::tensor::Distribution::Uniform(-1.0, 1.0),
+                        &dev,
+                    )));
+                    done += n;
+                }
+                st
+            };
+            let mut cache = AttnCache {
+                k: fill_store(),
+                v: fill_store(),
+                k_pre: Tensor::zeros([d.kernel - 1, kv_w], &dev),
+                v_pre: Tensor::zeros([d.kernel - 1, kv_w], &dev),
+                base: 0,
+                pending: None,
+            };
+            let x: Tensor<B, 2> = Tensor::random(
+                [1, d.hidden],
+                burn::tensor::Distribution::Uniform(-1.0, 1.0),
+                &dev,
+            );
+            // Warm, then time, then WARM AND TIME AGAIN, and report the
+            // second. Two warm steps at the head are not enough: the first
+            // context in the loop pays for the pool growing under it as well
+            // as for compilation, and it showed — 4,096 measured 3.6 ms as the
+            // first row and 1.1 ms as the last, on both arms. Timing the same
+            // context twice inside one run is what distinguishes "this length
+            // is slow" from "this row was first".
+            let mut ms = 0f64;
+            let mut at = context;
+            for _ in 0..2 {
+                for _ in 0..2 {
+                    let o = attention_step(x.clone(), &w, &d, ls, at, window, &mut cache);
+                    core::hint::black_box(&o);
+                    at += 1;
+                }
+                barrier(&client);
+                let iters = 5usize;
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters {
+                    let o = attention_step(x.clone(), &w, &d, ls, at, window, &mut cache);
+                    core::hint::black_box(&o);
+                    at += 1;
+                }
+                barrier(&client);
+                ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+            }
+            let wl = match window {
+                Some(n) => n.to_string(),
+                None => "-".to_string(),
+            };
+            println!("  {context:>7}  {wl:>7}  {ms:>7.2}");
+        }
     }
 
     /// Small, but no longer arbitrary.
