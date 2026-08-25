@@ -1443,4 +1443,41 @@ mod admission_breakdown {
             gib(probe)
         );
     }
+
+    /// The capability this change was for, as an assertion rather than a table.
+    ///
+    /// `INK_LAYERS=22:42` at 14,169 tokens on the 121.63 GiB node. The old
+    /// floor refused it -- the node's own log says "that is 125.77 GiB, and
+    /// this machine has 121.63" -- and the arithmetic here reproduces that
+    /// figure to the hundredth. Under the allocator charge the same run is
+    /// admitted, and the node printed 100.88 GiB against the 100.87 modelled
+    /// below before it ran.
+    #[test]
+    fn the_fourteen_thousand_token_needle_is_admissible() {
+        let t = small();
+        let p = policy();
+        let machine = (121.63 * GIBU as f64) as u64;
+        let weights = ((72.59 + 2.31) * GIBU as f64) as u64;
+        let n = 14_169usize;
+        let live = prefill_activation_bytes(&t, 22..42, n, p);
+        let fixed = fixed_overhead(20);
+        let need_old = weights + fixed + old_floor(machine, n) + live;
+        let need_new = weights + fixed + allocator_overhead_bytes(p, machine, live) + live;
+        assert!(need_old > machine, "the old floor admitted it after all");
+        assert!(
+            (125.6..125.9).contains(&gib(need_old)),
+            "modelled {:.2} GiB against the 125.77 the node printed",
+            gib(need_old)
+        );
+        assert!(
+            need_new < machine,
+            "still refused: {:.2} GiB",
+            gib(need_new)
+        );
+        assert!(
+            (100.7..101.0).contains(&gib(need_new)),
+            "modelled {:.2} GiB against the 100.88 the node printed",
+            gib(need_new)
+        );
+    }
 }
