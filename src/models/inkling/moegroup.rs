@@ -443,6 +443,7 @@ pub fn fp4_linear_grouped<AB: Scalar, S: Scalar, O: Scalar + Cast, NA: Size, NC:
     #[comptime] size_k: usize,
     #[comptime] size_n: usize,
     #[comptime] nrep: usize,
+    #[comptime] swz: bool,
 ) {
     let def = cmma::MmaDefinition::<AB, AB, f32>::new_scaled::<S>(MTILE, NTILE, KTILE, 4usize);
     let lane = UNIT_POS_PLANE;
@@ -529,9 +530,21 @@ pub fn fp4_linear_grouped<AB: Scalar, S: Scalar, O: Scalar + Cast, NA: Size, NC:
             for i in 0..vc_b {
                 let (row, col) =
                     def.position_of_nth(lane, (i * vs_b * pack) as u32, MatrixIdent::B);
-                let gr = col as usize + n_base + j * NTILE;
-                let gc = row as usize + kbase;
-                rb[i] = b[(b_base + gr * size_k / 2 + gc / 2) / b.vector_size()];
+                // Same fragment, two layouts. Row-major `[n, k/2]` puts this
+                // lane's four bytes at `row_n * k/2 + k_elem/2`, so the warp's
+                // load spans eight weight rows `k/2` bytes apart. Pre-permuted
+                // (`fp4gemm::swizzle_b_codes`, applied per EXPERT PLANE so
+                // `b_base` and the mapping's shape are unchanged) it is word
+                // `32 * i + lane` of a 256-byte block: 128 contiguous bytes in
+                // lane order, which is the fully-coalesced case.
+                let byte = if comptime![swz] {
+                    let nt = (n_base + j * NTILE) / NTILE;
+                    let w = row as usize / 8;
+                    (nt * k_tiles + t) * 256 + ((w / 4) * 32 + col as usize * 4 + (w % 4)) * 4
+                } else {
+                    (col as usize + n_base + j * NTILE) * size_k / 2 + (row as usize + kbase) / 2
+                };
+                rb[i] = b[(b_base + byte) / b.vector_size()];
             }
         }
 
@@ -550,8 +563,15 @@ pub fn fp4_linear_grouped<AB: Scalar, S: Scalar, O: Scalar + Cast, NA: Size, NC:
 
         #[unroll]
         for j in 0..nrep {
-            let vb =
-                b_sc[(bsc_base + (sib + n_base + j * NTILE) * spr + t * 4) / b_sc.vector_size()];
+            // The scale plane moves with the codes: `[n_tile][k_tile][8][4]`,
+            // so a warp's eight scale vectors are 32 CONTIGUOUS bytes -- one
+            // sector -- instead of eight sectors `k/16` bytes apart.
+            let sbyte = if comptime![swz] {
+                (((n_base + j * NTILE) / NTILE) * k_tiles + t) * NTILE * SCALE_VEC + sib * SCALE_VEC
+            } else {
+                (sib + n_base + j * NTILE) * spr + t * 4
+            };
+            let vb = b_sc[(bsc_base + sbyte) / b_sc.vector_size()];
             let mut sb = Vector::<S, NS>::empty();
             #[unroll]
             for i in 0..SCALE_VEC {
@@ -609,7 +629,7 @@ pub fn fp4_linear_grouped_launch<R: Runtime>(
         );
     }
     fp4_linear_grouped_launch_as::<f32, R>(
-        client, a, a_sc, wmap, wmap_bytes, blk, off, scale2, slots, m_total, k, n,
+        client, false, a, a_sc, wmap, wmap_bytes, blk, off, scale2, slots, m_total, k, n,
     )
 }
 
@@ -643,7 +663,7 @@ pub fn fp4_linear_grouped_bf16_launch<R: Runtime>(
         );
     }
     fp4_linear_grouped_launch_as::<half::bf16, R>(
-        client, a, a_sc, wmap, wmap_bytes, blk, off, scale2, slots, m_total, k, n,
+        client, false, a, a_sc, wmap, wmap_bytes, blk, off, scale2, slots, m_total, k, n,
     )
 }
 
@@ -656,6 +676,7 @@ pub fn fp4_linear_grouped_bf16_launch<R: Runtime>(
 #[allow(clippy::too_many_arguments)]
 pub fn fp4_linear_grouped_launch_as<O: Scalar + Cast + CubeElement, R: Runtime>(
     client: &ComputeClient<R>,
+    swz: bool,
     a: &Handle,
     a_sc: &Handle,
     wmap: &Handle,
@@ -719,6 +740,7 @@ pub fn fp4_linear_grouped_launch_as<O: Scalar + Cast + CubeElement, R: Runtime>(
             k,
             n,
             nrep,
+            swz,
         )
     };
     out

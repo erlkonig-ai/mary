@@ -42,6 +42,7 @@
 use std::time::Instant;
 
 use cubecl::prelude::*;
+use mary::models::inkling::fp4gemm::{swizzle_b_codes, swizzle_b_scales};
 use mary::models::inkling::moegroup::{
     BlockPlanDev, RowPlan, fp4_linear_grouped_launch_as, fp4_linear_grouped_smem_launch_tuned,
     grouped_nrep,
@@ -127,7 +128,25 @@ fn main() {
         };
     }
     let wmap = client.create_from_slice(&w);
+    // The SAME weights, pre-permuted into MMA fragment order, one expert plane
+    // at a time -- so `per_expert`, the plane split and every byte offset in
+    // `off` below are unchanged and the swizzled arm reads an identically
+    // shaped mapping. This is what a `copy_share` that permuted while it copied
+    // would hand the kernel; here it is done in the harness so both layouts are
+    // resident in ONE process and the arms differ by the layout alone.
+    let mut wz = vec![0u8; wmap_bytes];
+    for e in 0..experts {
+        let base = e * per_expert;
+        wz[base..base + codes].copy_from_slice(&swizzle_b_codes(&w[base..base + codes], n, k));
+        wz[base + codes..base + per_expert].copy_from_slice(&swizzle_b_scales(
+            &w[base + codes..base + per_expert],
+            n,
+            k,
+        ));
+    }
+    let wmapz = client.create_from_slice(&wz);
     drop(w);
+    drop(wz);
 
     // The routing: `experts` distinct experts, `rows` real rows each. One
     // expert contributes one block at `rows <= 16`.
@@ -181,6 +200,7 @@ fn main() {
 
     let mut best_base = (0.0f64, String::new());
     let mut best_smem = (0.0f64, String::new());
+    let mut best_swz = (0.0f64, String::new());
     let mut checked: Option<(usize, usize, usize)> = None;
 
     for &planes in &planes_list {
@@ -230,8 +250,8 @@ fn main() {
             || {
                 let t0 = Instant::now();
                 let o = fp4_linear_grouped_launch_as::<f32, Rt>(
-                    &client, &a, &a_sc, &wmap, wmap_bytes, &blk, &off_h, &sc2_h, experts, m_total,
-                    k, n,
+                    &client, false, &a, &a_sc, &wmap, wmap_bytes, &blk, &off_h, &sc2_h, experts,
+                    m_total, k, n,
                 );
                 let _ = cubecl::future::block_on(client.sync());
                 let dt = t0.elapsed().as_secs_f64();
@@ -247,6 +267,37 @@ fn main() {
         );
         if g > best_base.0 {
             best_base = (g, format!("{planes} planes"));
+        }
+
+        // The third arm: the same kernel, the same launch, the same plan, on
+        // the PRE-PERMUTED mapping. It is the baseline's own code path with one
+        // comptime flag flipped, so it has no shared memory, no barrier, no
+        // `kc` and no padding -- and therefore nothing whose best value could
+        // depend on the plane count. Whether that shows up as a flat line
+        // across `planes` is the question this arm exists to answer, and it is
+        // asked in the same loop as the other two so the plan, the weights and
+        // the clocks are shared.
+        let (zb, zf) = best_first(
+            || {
+                let t0 = Instant::now();
+                let o = fp4_linear_grouped_launch_as::<f32, Rt>(
+                    &client, true, &a, &a_sc, &wmapz, wmap_bytes, &blk, &off_h, &sc2_h, experts,
+                    m_total, k, n,
+                );
+                let _ = cubecl::future::block_on(client.sync());
+                let dt = t0.elapsed().as_secs_f64();
+                drop(o);
+                dt
+            },
+            reps,
+        );
+        let z = report(
+            &format!("PRE-PERM  B already in fragment order, {planes} planes"),
+            zb,
+            zf,
+        );
+        if z > best_swz.0 {
+            best_swz = (z, format!("{planes} planes"));
         }
 
         for &kc in &kc_list {
@@ -289,6 +340,13 @@ fn main() {
         best_smem.1,
         best_smem.0 / best_base.0
     );
+    println!(
+        "  best PRE-PERM {:.1} GB/s ({}): {:.3}x over baseline, {:.3}x over the best staged",
+        best_swz.0,
+        best_swz.1,
+        best_swz.0 / best_base.0,
+        best_swz.0 / best_smem.0
+    );
 
     // ---- the bit comparison, at the winning configuration ------------------
     //
@@ -323,7 +381,10 @@ fn main() {
     let a_sc = client.create_from_slice(&av[a_bytes..]);
     drop(av);
     let o_base = fp4_linear_grouped_launch_as::<f32, Rt>(
-        &client, &a, &a_sc, &wmap, wmap_bytes, &blk, &off_h, &sc2_h, experts, m_total, k, n,
+        &client, false, &a, &a_sc, &wmap, wmap_bytes, &blk, &off_h, &sc2_h, experts, m_total, k, n,
+    );
+    let o_swz = fp4_linear_grouped_launch_as::<f32, Rt>(
+        &client, true, &a, &a_sc, &wmapz, wmap_bytes, &blk, &off_h, &sc2_h, experts, m_total, k, n,
     );
     let o_smem = fp4_linear_grouped_smem_launch_tuned::<f32, Rt>(
         &client, &a, &a_sc, &wmap, wmap_bytes, &blk, &off_h, &sc2_h, experts, m_total, k, n, kc,
@@ -341,6 +402,19 @@ fn main() {
     assert_eq!(
         diff, 0,
         "the staged arm is NOT bit-identical to the baseline"
+    );
+    let vz = client
+        .read_one(o_swz)
+        .expect("read the pre-permuted output");
+    let dz = vb.iter().zip(vz.iter()).filter(|(x, y)| x != y).count();
+    println!(
+        "  bit equality, pre-permuted arm: {} of {} output bytes differ",
+        dz,
+        vb.len()
+    );
+    assert_eq!(
+        dz, 0,
+        "the pre-permuted arm is NOT bit-identical to the baseline"
     );
     println!("  OK: bit-identical");
 }
