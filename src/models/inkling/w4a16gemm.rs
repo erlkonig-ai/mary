@@ -464,7 +464,7 @@ pub fn w4a16_linear_wide_launch<R: Runtime>(
             CubeDim::new_2d(32, PLANES),
             vs,
             2,
-            WORDS_PER_STEP as u32,
+            WORDS_PER_STEP,
             TensorArg::from_raw_parts(a.clone(), [k, 1].into(), [m_pad, k].into()),
             TensorArg::from_raw_parts(b.clone(), [vpr, 1].into(), [n, vpr].into()),
             TensorArg::from_raw_parts(b_sc.clone(), [spr, 1].into(), [n, spr].into()),
