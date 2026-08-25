@@ -94,4 +94,20 @@ fn main() {
     println!("\nexecuted f32 -> e2m1 -> f32");
     println!("  1.3  -> {}   (round-to-nearest E2M1 is 1.5)", got[0]);
     println!("  -0.4 -> {}   (round-to-nearest E2M1 is -0.5)", got[1]);
+
+    // Launch the production quantizer once, so a `CUBECL_DEBUG_OPTION=source`
+    // run of this binary emits the CUDA that `fp4quant` actually compiles.
+    // Reading the re-creation of a kernel is not reading the kernel.
+    let rows = 1usize;
+    let k = 64usize;
+    let dense: Vec<f32> = (0..rows * k).map(|i| (i as f32) * 0.01 - 0.3).collect();
+    let xh = client.create_from_slice(f32::as_bytes(&dense));
+    let (codes, scales) = mary::models::inkling::fp4quant::quantize_nvfp4(&client, &xh, rows, k);
+    let cb = client.read_one(codes).expect("read the codes");
+    let sb = client.read_one(scales).expect("read the scale bytes");
+    println!(
+        "\nfp4quant::quantize_nvfp4 on {rows}x{k}: {} code words, {} scale bytes",
+        cb.len() / 4,
+        sb.len()
+    );
 }
