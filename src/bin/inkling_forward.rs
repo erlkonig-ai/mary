@@ -201,8 +201,27 @@
 //! the N tokens the main model just ranked highest at this position — gathered
 //! once per step, shared by every depth, 4 MiB at N = 512 against 1.65 GiB. A
 //! token outside that set can no longer be drafted, so drafts and acceptance
-//! both move; the flag is default-off precisely so the trade is an ablation and
-//! not a silent change to what the runtime predicts. It is refused together with
+//! both move.
+//!
+//! **This paragraph said "default-off" until 2026-08-25 and the switch table at
+//! the top said 512, and the table was right.** The default flipped without the
+//! sweep the code's own comment says would settle it, and the two halves of this
+//! file then disagreed about what a bare run does — which matters because it is
+//! exactly the kind of number that gets quoted across runs. Worth knowing when
+//! reading older acceptance figures: `mary-measure` (160848d) and everything
+//! before the flip measured the UNPRUNED head, so those figures do not transfer
+//! to a bare run of current main.
+//!
+//! And the pruning had a defect that only the SPECULATIVE lane could reach: the
+//! candidate rows were gathered from the LAST row of the pass rather than from
+//! the row the answer came off. A verify pass keeps the leading run of drafts
+//! that agreed, so the answer is row `new_toks.len() - 1`, and on the 31.9% of
+//! `INK_SPEC=1` passes that accept nothing the last row is a distribution over a
+//! token the model rejected -- one that need not even contain `best`, which the
+//! comment there asserted it always would. Fixed 2026-08-25. Exact-argmax
+//! verification means it could never emit a wrong token and never raise a flag;
+//! it could only lower acceptance, silently, on the configuration that had just
+//! become the default. It is refused together with
 //! `INK_MTP_PROB`, which scores the draft's distribution by full-vocabulary token
 //! index and would otherwise be handed 512 numbers about a different index space.
 //!
@@ -318,6 +337,279 @@
 //! Widening past `k = 2` buys nothing on either corpus: the depth-3 draft was
 //! accepted 0 times in 49 verify passes, so `k = 3` pays a wider pass for the
 //! same 2.082 tokens and lands back at 1.007x.
+//!
+//! ## `INK_MTP_TEACH`: acceptance measured where there is enough of it to measure
+//!
+//! Every acceptance figure above is taken over tens of GENERATED steps, and
+//! the section below is about how badly that number moves with the sequence.
+//! `INK_MTP_TEACH=1` takes the same measurement a different way: head `d`'s row
+//! `j` is fed `(stage[d-1][j], embed(ids[j + d + 1]))` and predicts
+//! `ids[j + d + 2]`, which for every row but the last few is a token the PROMPT
+//! ALREADY CONTAINS. So the drafting prefill scores two thousand positions in
+//! one pass, against real text rather than against the model's own
+//! continuation.
+//!
+//! It is the exact conditional rate the expected-prefix arithmetic wants:
+//! `E = 1 + p1 + p1 p2 + ...` with `p_d = P(draft d right | drafts 1..d-1
+//! right)`, and "drafts 1..d-1 right" is precisely the state teacher forcing
+//! puts head `d` in -- the token head `d-1` was fed IS the token the verifier
+//! would have accepted.
+//!
+//! Two warnings come with it, and both are load-bearing:
+//!
+//!  - It scores the PREFILL lane. `INK_MTP_STEPCHECK=1` is what says whether
+//!    the cached STEP lane -- the one a decode loop drafts on -- computes the
+//!    same rows.
+//!  - A rate on a human document is a LOWER BOUND on the decode rate. On a
+//!    document the head is asked for a token the MAIN STACK ITSELF only gets
+//!    right 30% of the time; at decode the target IS the main stack's argmax.
+//!    `INK_MTP_TEACH_FROM=<n>` points the same instrument at a seed followed by
+//!    this model's own greedy continuation, which is the sequence a decode loop
+//!    actually verifies.
+//!
+//! ## The ceiling, and why it changes what a low rate means
+//!
+//! `INK_MTP_TEACH` also scores DEPTH 0 -- the main stack's own next-token
+//! argmax, on the same rows, through the same unembedding. That row is the one
+//! that makes the rest readable, and it had never been measured:
+//!
+//! 2048 scored positions per depth, concat hidden-first, both corpora:
+//!
+//!                          corpus A (3732)   corpus B (3988)
+//!     depth 0 (MAIN STACK)      0.2988           0.3369  [0.3168, 0.3577]
+//!     depth 1                   0.2266           0.2593  [0.2408, 0.2787]
+//!     depth 2                   0.1929           0.2358
+//!     depth 3                   0.2085           0.2383
+//!     depth 4                   0.2319           0.2495
+//!
+//!     depth 1 / depth 0            76%              77%
+//!
+//! Corpus A's depth-0 row was first taken before the double-norm fix; the
+//! corrected instrument reads the SAME 612/2048 on the same rows, for the reason
+//! given under "why three of these readings could never have mattered".
+//!
+//! **And corpus B's ceiling is independently confirmed.** A sibling ran the same
+//! 3988 tokens teacher-forced through the model's ORDINARY logits path with a
+//! different binary and dumped top-5 per position: 1309/3987 = **0.3283** top-1,
+//! 0.5179 top-5. This instrument reads 0.3369 on the same file, whose interval
+//! [0.3168, 0.3577] contains it. Two implementations, two paths, one number.
+//!
+//! So ~0.33 is what this checkpoint scores on real text, and the ratio the
+//! draft head holds against it is 76-77% on BOTH corpora.
+//!
+//! A defect in the instrument, fixed, and worth keeping because the fix turned
+//! out to change nothing and the reason it changed nothing is the interesting
+//! part. `teach_rows` scored `main_dev`, which holds `entry` -- already
+//! final-normed -- and normed it again. That is not idempotent:
+//! `rms_norm(normalise(x) * g)` is `normalise(x) * g^2 / c`, so the ceiling was
+//! being read through the learned gain SQUARED. The `norm` argument is the fix,
+//! and the corrected run returns the identical 612/2048, because that gain is a
+//! near-scalar. The bug was real; the bias it could introduce was not.
+//!
+//! Which means the draft head reaches **roughly three quarters of the main
+//! stack's own accuracy on the equivalent task** -- 76% and 77% on the two
+//! corpora, which is a steadier number than either rate alone --, and the per-depth table being FLAT is not a symptom:
+//! as `d` grows the head gets more true-token context through the chained
+//! embeddings and a staler hidden state, and the two roughly cancel.
+//!
+//! So a reference quoting "MTP1 acceptance ~0.85" is not quoting this quantity.
+//! No drafter can score 0.85 against real text when the model it drafts for
+//! scores 0.33; that figure has to be agreement with the target's ARGMAX on the
+//! model's own decode stream, and the two must never be compared directly.
+//!
+//! ## What the wrapper composition turned out to be
+//!
+//! `transformers` defines no MTP composition, so [`MtpConcat`] kept both concat
+//! orders reachable and said the acceptance rate would decide. With 2048
+//! positions instead of twenty generated steps, it decides unambiguously:
+//!
+//!     concat hidden-first    depth 1  0.2266
+//!     concat embed-first     depth 1  0.0010    <- 226x worse, below chance
+//!
+//! `mtp_hidden_states_first` is ALSO ABSENT from this checkpoint's
+//! `mtp_config` -- the flag the default was named for is not there, only
+//! `num_nextn_predict_layers`, `chain_hidden_post_norm` and `local_layer_ids`.
+//! The default was right; it was right on a guess, and now it is measured.
+//!
+Every other reading of the wrapper, priced the same way on the same corpus
+//! (depth 1, 2048 positions each):
+//!
+//!     THE DEFAULT                   0.2266
+//!     concat embed-first            0.0010     226x worse -- settled
+//!     swap the two norms            0.1650     -27%, so the NAMES are right
+//!     backbone embed_norm OFF       0.1675     -26%, so the 08-24 fix is real
+//!     entry RAW (INK_MTP_RAW=1)     0.2310     indistinguishable
+//!     no output norm (OUTNORM=0)    0.2329     indistinguishable
+//!     ablate the hidden operand     0.0869     both operands carry the rate
+//!     ablate the embed operand      0.0347
+//!
+//! Which is the whole space of readings this wrapper has: which operand goes in
+//! which half of `input_proj`, which gain norms which operand, whether the
+//! backbone's embed norm precedes the depth head's, whether the entry and the
+//! output take the final norm, and whether either operand matters at all. The
+//! default wins or ties every one of them. **The composition is not the reason
+//! acceptance is what it is.**
+//!
+//! The entry row corrects this file. The comment on `entry` says feeding the
+//! final-normed hidden "measured twice as well (25% -> 50% on a matched
+//! 20-token run)"; on 2048 positions the two are 0.2310 and 0.2266, which is
+//! inside the interval. A twenty-step difference was a twenty-step difference.
+//!
+//! ### Why three of these readings could never have mattered
+//!
+//! Entry raw vs final-normed, the ceiling normed once vs twice, and
+//! `INK_MTP_OUTNORM=0` vs on all came back inside their intervals. That is one
+//! fact, and it is a property of the checkpoint rather than a coincidence:
+//!
+//!     model.llm.norm.weight       mean 5.6379  sd 0.3184   sd/mean 0.056
+//!     model.mtp.0.embed_norm      mean 0.8388  sd 0.4408   sd/mean 0.526
+//!
+//! **The backbone's final norm is a near-SCALAR** -- a 4096-vector whose gain
+//! varies by 5.6% about 5.64. RMS norm is scale-invariant, so applying it, not
+//! applying it, or applying it twice moves the vector by something very close to
+//! a global factor, and a global factor cannot move an argmax. The reasoning in
+//! the `entry` comment -- "the two differ ONLY by the final norm's learned
+//! weight vector" -- is right, and the weight vector turns out to be nearly
+//! constant.
+//!
+//! The MTP heads' own `embed_norm` is NOT: sd/mean 0.526, a real per-channel
+//! gain. Which is exactly the one whose ablation moves the rate, by 26%. The
+//! norms that are shaped like a scalar do nothing; the norm that is shaped like
+//! a function does something. Worth knowing before the next reading of the
+//! wrapper gets measured on twenty steps.
+//!
+//! ## The cached step lane is not the bug (`INK_MTP_STEPCHECK`)
+//!
+//! The teacher-forced rate is measured in the drafting PREFILL and the decode
+//! rate in the cached STEP, and nothing had ever checked that the two compute
+//! the same rows -- `INK_MTP_CHECK` asserts only for the HOST cached lane and
+//! merely reports for the device one, which is the lane every speculative run
+//! drafts on. So a step path that quietly diverged would have looked exactly
+//! like a model that drafts badly.
+//!
+//! `INK_MTP_STEPCHECK=1` reruns the head's whole-sequence prefill beside the
+//! step and compares the row they share. Ten checks, two depths, a 256-token
+//! seed:
+//!
+//!     max|prefill - step| 0.82% to 3.95% of |prefill|max
+//!     drafted token: agree, 10 of 10
+//!
+//! The residual is two different attention kernels in BF16 -- the prefill takes
+//! the fused/banded lane and the step the decode one -- and it never moved an
+//! argmax. So the step lane is sound, and the prefill and decode measurements
+//! are measurements of the same head.
+//!
+//! ## The mid-run stall, and where the evidence points
+//!
+//! Every `INK_SPEC>0` run over a long context has two or three passes that take
+//! **8 to 24 seconds** while its neighbours take 0.21. The unspeculated arm on
+//! the same prompt has none over one second after the two cold passes. It drags
+//! a 212 ms/step arm to 541, and the harness prints the honest verdict:
+//! `spread 87.4% <- SMALLER THAN THE SPREAD. Not a result.`
+//!
+//! What the logs already settle:
+//!
+//!  - **Both ends stall on the SAME pass, by different amounts.** Pass 30: the
+//!    head's own layer loop 7.88 s, the tail's whole pass 7.78 s. Pass 106:
+//!    12.24 s and 10.79 s. So it is not one box and it is not the wire; it is
+//!    the same trigger arriving at two processes running the same shapes.
+//!  - **It is not the pool.** `pool[after stack]` reads 12.44 GiB reserved /
+//!    3.11 live / 9.34 GiB stranded over 503 slices on the passes either side of
+//!    a stall and on the stall itself, and `pool cleanups: 0 of 21 layers`.
+//!    Nothing was reserved, freed or drained.
+//!  - **It is not extra work.** Both reps of `spec1` accept an identical
+//!    81/119 and differ by 2.5x in wall time.
+//!  - **It shows up in a HOST-ONLY bracket** -- 7.77 s of the head's
+//!    "attention half", which the report labels "enqueue only (nothing in the
+//!    loop synchronises)". Something inside an enqueue blocked.
+//!
+//! And what the autotune cache says. `~/.cache/cubecl/autotune/0.10.0/` keys
+//! matmuls by shape ANCHORED TO POWERS OF TWO, and the live cache holds 247
+//! entries whose `m` histogram is `{1: 28, 2: 19, 4: 36, 8: 33, 16: 30, ...}`.
+//! So **`m = 2` and `m = 4` are their own keys**: every shape a verify pass
+//! makes is a shape the `m == 1` lane never tunes, and the first process to see
+//! one pays a timing race over every candidate kernel. `n` and `k` anchor too,
+//! which is why a context growing 3732 -> 3930 does not itself trigger anything
+//! -- it stays in the 4096 bucket.
+//!
+//! That leaves the question of what new shape appears at pass 30 and not at
+//! pass 3, and the routed experts are the obvious candidate: an expert's GEMM
+//! is `[rows on this expert, ...]`, a verify pass has two or three rows that can
+//! CO-ROUTE, and how many land together is a property of the token, not of the
+//! pass number. `CUBECL_DEBUG_LOG=<file>` makes cubecl name what it tunes and
+//! when, which is the instrument that would close this.
+//!
+//! ## The binding constraint is c(2), not acceptance
+//!
+//! It is worth writing the break-even down, because it decides what work is
+//! worth doing and it is not the work the acceptance rate points at.
+//!
+//! Speculation at width `k` pays iff `E(k) > c(k+1)`, where `c(m)` is what an
+//! `m`-row verify pass costs against a one-row pass. On the REAL 42-layer
+//! configuration -- two nodes, layers 0:21 and 21:42 over the direct link,
+//! `INK_KV=1`, a 3732-token document, warm p50, both reps of a two-rep run:
+//!
+//!     spec0   117.7 ms/step   8.499 tok/s   E 1.000
+//!     spec1   212.0 ms/step   7.942 tok/s   E 1.681   ->  0.934x
+//!
+//! Read `E 1.681` with its caveat: `INK_GEN=200` from this prompt, and the
+//! continuation REPEATS near the end (`... 185338 314 17284 185338 314 ...`).
+//! Repetition is easy to draft, so a degenerate tail inflates acceptance, and
+//! the same file's `INK_MTP` section documents the opposite failure on the
+//! five-token prompt -- a stack stuck on one id while the head proposed sensible
+//! English, which DEFLATES it. Neither is a fact about the drafter. The
+//! teacher-forced rate is the one that carries no such tail.
+//!
+//!   c(2) = 212.0 / 117.7 = **1.801**
+//!
+//! So the loop needs `p1 > 0.801` merely to break even, and it has 0.681. That
+//! is a 7% shortfall -- and the number that makes it a shortfall is c(2), not
+//! p1. At the reference's own quoted 0.85 the same machine would return
+//! 1.85 / 1.801 = **1.03x**: a three-percent win. There is no acceptance rate
+//! this configuration can be handed that makes speculation worth the risk while
+//! the second row of a verify pass costs 80% of a whole pass.
+//!
+//! The same arithmetic run the other way: at c(2) = 1.2 -- what a second row
+//! ought to cost when the lane is a real batched GEMM -- today's 1.681 would be
+//! **1.40x**. The drafter is not what is between this stack and a speculative
+//! win; the `m > 1` lane is. See "The width cost is a STEP" below, which found
+//! half of it and named the rest.
+//!
+//! ### The draft is NOT free, and that is what the prune can buy
+//!
+//! Worth separating carefully, because both this file and the tail's own report
+//! say the opposite. The `ANSWERED the head at` line reads "everything after
+//! that (report, drafting) overlaps the head's next pass and the head never
+//! waits for it". Without speculation that is true. **With `INK_SPEC` it is
+//! false**, and the reason is one line further down: the drafts are sent
+//! separately, AFTER drafting -- and the head cannot build its next feed without
+//! them, because that feed IS `[best, draft0, ...]`.
+//!
+//! The pooled per-pass split says so directly:
+//!
+//!             head compute   head BLOCKED    tail to answer   tail drafting
+//!     spec0      66.7 ms        77.2 ms          75.9 ms          0.0 ms
+//!     spec1     124.7 ms       152.7 ms         123.0 ms         35.6 ms
+//!
+//! On spec0 the head's blocked time is the tail's answer time, 77.2 against
+//! 75.9. On spec1 it is the tail's answer time PLUS its drafting, 152.7 against
+//! 123.0 + 35.6 = 158.6. Were the draft hidden, the head would block for ~123.
+//!
+//! So of the 1.80x, roughly 0.30 of a pass is the drafter sitting on the
+//! critical path, and it is the part that is cheap to attack:
+//!
+//!  - `INK_DRAFT_TOPK` cuts the draft's unembedding, which this file measures as
+//!    about two thirds of a depth's cost. 35.6 -> ~13 ms takes the round trip to
+//!    ~189 ms, `c_eff(2)` to ~1.61, and E = 1.681 from **0.93x to ~1.04x** --
+//!    from losing to winning. That is a prediction; the sweep is what settles it,
+//!    and it has to read tok/s, because acceptance can only fall.
+//!  - Or take the draft off the critical path altogether: the head could start
+//!    its own row 0 (`best`, which arrives first) while the drafts are still
+//!    being computed. That keeps the full-vocabulary head AND the 35 ms.
+//!
+//! The other 1.50 is the verify pass itself, split across both nodes -- the
+//! head's compute goes 66.7 -> 124.7 and the tail's answer 75.9 -> 123.0 for ONE
+//! extra row -- and that is the `m > 1` lane, which is a bigger piece of work.
 //!
 //! ## Three acceptance rates that are all correct
 //!
@@ -2199,6 +2491,26 @@ fn backbone_embed_norm() -> bool {
 ///
 /// Speculation is self-verifying, so getting this wrong never produced wrong
 /// text -- only a low acceptance rate, which is why it survived so long.
+/// Whether a draft's hidden state takes the BACKBONE's final norm on its way to
+/// the unembedding. Default on, and `INK_MTP_OUTNORM=0` is the ablation.
+///
+/// The reason it is a question: DeepSeek-style MTP gives every depth module its
+/// OWN `shared_head.norm` before the shared unembedding, and this checkpoint
+/// ships no such tensor -- only `embed_norm`, `hidden_norm` and `input_proj`
+/// per depth. So either the backbone's `model.llm.norm` is reused (what this
+/// does) or there is no norm at all, and the absent tensor is equally
+/// consistent with both. An RMS norm is not a scale, so the choice moves the
+/// argmax.
+fn mtp_out_norm() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("INK_MTP_OUTNORM")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
 fn mtp_embed_row(
     table: &[u8],
     backbone_norm: Option<&[f32]>,
@@ -2213,9 +2525,49 @@ fn mtp_embed_row(
     }
 }
 
+/// Which operand of the MTP wrapper to ZERO, for the ablation that says whether
+/// a head is using it at all.
+///
+/// The teacher-forced rate came out FLAT across depths -- 0.227, 0.193, 0.209,
+/// 0.232 for depths 1..4 on a document -- and flat is the shape of a predictor
+/// whose accuracy does not depend on how far ahead it is asked to see. A head
+/// reading its hidden state cannot behave that way; a head reading only the
+/// embedding it was handed can, because "the token after this token" is the
+/// same task at every depth. So: zero one operand and see which one the rate
+/// was living on. `INK_MTP_ABLATE=hidden` or `=embed`.
+fn mtp_ablate() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static A: OnceLock<Option<String>> = OnceLock::new();
+    A.get_or_init(|| std::env::var("INK_MTP_ABLATE").ok())
+        .as_deref()
+        .map(|v| match v {
+            "hidden" => "hidden",
+            "embed" => "embed",
+            other => panic!("INK_MTP_ABLATE wants hidden|embed, got {other:?}"),
+        })
+}
+
 fn mtp_input_dev(hidden: T2, embeds: T2, w: &MtpDev, eps: f64, order: MtpConcat) -> T2 {
-    let hn = dev_lane::rms_norm(hidden, w.hidden_norm.clone(), eps);
-    let en = dev_lane::rms_norm(embeds, w.embed_norm.clone(), eps);
+    let (hidden, embeds) = match mtp_ablate() {
+        Some("hidden") => (hidden.zeros_like(), embeds),
+        Some("embed") => (hidden, embeds.zeros_like()),
+        _ => (hidden, embeds),
+    };
+    // `INK_MTP_SWAPNORM=1`: apply `embed_norm` to the hidden operand and
+    // `hidden_norm` to the embedding. The names say otherwise and nothing else
+    // does -- `transformers` discards these tensors and no reference consumes
+    // them -- so which gain belongs to which operand is a READING, in the same
+    // class as the concat order that turned out to matter by a factor of 200.
+    let (gh, ge) = if std::env::var("INK_MTP_SWAPNORM")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        (w.embed_norm.clone(), w.hidden_norm.clone())
+    } else {
+        (w.hidden_norm.clone(), w.embed_norm.clone())
+    };
+    let hn = dev_lane::rms_norm(hidden, gh, eps);
+    let en = dev_lane::rms_norm(embeds, ge, eps);
     let cat = match order {
         MtpConcat::HiddenFirst => BT::cat(vec![hn, en], 1),
         MtpConcat::EmbedFirst => BT::cat(vec![en, hn], 1),
@@ -7462,8 +7814,39 @@ fn main() -> Result<()> {
             // than once per pending draft. `logits` holds the argmax's row and only
             // that row unless a reporter asked for more, which is exactly the row
             // every rule below reads.
+            // WHICH ROW OF `logits` the step's answer came off, and it is not
+            // always the last one. A verify pass computes a row per DRAFT it was
+            // fed and keeps the leading run that agreed; `best` is the argmax of
+            // row `new_toks.len() - 1`, and every row past that is a function of
+            // tokens the model did not choose.
+            //
+            // This used to read `n - 1 - logit_row0` -- the LAST row -- and the
+            // comment under `draft_cand` asserted the invariant it breaks:
+            // "`best` is always in it (it is the top-1)". Under INK_SPEC=1 that
+            // is false on every pass that accepts nothing, which is 31.9% of
+            // them on the document corpus, and `INK_DRAFT_TOPK` now DEFAULTS to
+            // 512 -- so the default speculative configuration was gathering its
+            // draft candidates from the distribution of a rejected row, and
+            // could gather one that does not even contain the token just
+            // confirmed. It cannot produce a wrong token (the verifier is exact
+            // argmax) and it cannot raise a flag. It can only lower acceptance,
+            // silently, which is this file's recurring failure mode.
+            //
+            // `logits` starts at row `logit_row0`, so the index is relative.
+            // Written as the three cases rather than as one expression, because
+            // the probe lane's answer is row 0 and an arithmetic identity that
+            // happens to be right for two of the three is how this went wrong the
+            // first time.
+            let answer_abs = if verify_rows > 1 {
+                new_toks.len() - 1
+            } else if probe_rows > 1 {
+                0
+            } else {
+                n - 1
+            };
+            let answer_row = answer_abs - logit_row0;
             let p_t: Vec<f32> = if mtp_prob && !logits.is_empty() {
-                softmax_row(&logits[(n - 1 - logit_row0) * v..(n - logit_row0) * v])
+                softmax_row(&logits[answer_row * v..(answer_row + 1) * v])
             } else {
                 Vec::new()
             };
@@ -7633,7 +8016,7 @@ fn main() -> Result<()> {
             let draft_cand: Option<(Vec<usize>, mary::models::inkling::bf16gemm::Bf16W)> =
                 if draft_topk > 0 && !logits.is_empty() {
                     use mary::models::inkling::bf16gemm::NTILE;
-                    let row = &logits[(n - 1 - logit_row0) * v..(n - logit_row0) * v];
+                    let row = &logits[answer_row * v..(answer_row + 1) * v];
                     // Rounded DOWN to the MMA's n-tile: the gemm tiles its output
                     // by `NTILE` and a remainder is not a shape it has. Down rather
                     // than up so the result is a width the vocabulary can supply.
@@ -7647,6 +8030,19 @@ fn main() -> Result<()> {
                             .unwrap_or(std::cmp::Ordering::Equal)
                     });
                     idx.truncate(want);
+                    // The invariant the comment above states, CHECKED. `best` is
+                    // the argmax of the row this set was selected from, so it is
+                    // in the top-`want` by construction -- and that is exactly
+                    // what stopped being true when the row was the wrong one.
+                    // 512 comparisons a step against a 3.7 GiB weight stream:
+                    // the reason this was not caught is that nothing looked, not
+                    // that looking was expensive.
+                    anyhow::ensure!(
+                        idx.contains(&(best as u32)),
+                        "the draft candidate set was gathered from a row whose argmax is not \
+                         `best` ({best}): the pruned head cannot draft the token the step just \
+                         confirmed, which shows up only as acceptance"
+                    );
                     // Once, on the first step that prunes. The unembed BIND prints
                     // what it bound and how, and a table that silently becomes 512
                     // rows wide for half the matmuls in the process is a bigger
@@ -7702,11 +8098,15 @@ fn main() -> Result<()> {
                     Some((_, w)) => w.n,
                     None => v,
                 };
-                let hs = dev_lane::rms_norm(
-                    row,
-                    fnorm_dev.clone().expect("drafting needs the final norm"),
-                    t.rms_norm_eps,
-                )
+                let hs = if mtp_out_norm() {
+                    dev_lane::rms_norm(
+                        row,
+                        fnorm_dev.clone().expect("drafting needs the final norm"),
+                        t.rms_norm_eps,
+                    )
+                } else {
+                    row
+                }
                 .div_scalar(t.logits_mup_width_multiplier as f32);
                 // The pruned table is a gathered BF16 slab; the full one takes
                 // the head lane, which is W4A16.
@@ -7800,6 +8200,84 @@ fn main() -> Result<()> {
             // this one would otherwise pay a 16 KB readback and a 16 KB upload per
             // draft for the privilege of handing the value straight back.
             let draft_argmax_dev = |row: T2| -> usize { draft_pick(row) };
+
+            // `INK_MTP_TEACH=1`: the TEACHER-FORCED per-depth acceptance, taken
+            // over the whole PROMPT in the drafting prefill rather than over a
+            // generated continuation.
+            //
+            // Why this and not the generated measurement: head `d`'s row `j` is
+            // fed `(stage[d-1][j], embed(ids[j + d + 1]))` and predicts the token
+            // at `j + d + 2`, which for every row but the last `d + 2` is a token
+            // the prompt ALREADY CONTAINS. So one prefill scores ~3700 positions
+            // at once, where a 40-step generation scores 40 -- and it scores them
+            // against real text rather than against the model's own continuation,
+            // which is the confound that makes the generated rate corpus-shaped
+            // (this file has quoted 22.0%, 50.0% and 71.2% for the same head).
+            //
+            // It is exactly the conditional rate the expected-prefix arithmetic
+            // wants. `E = 1 + p1 + p1 p2 + ...` where `p_d = P(draft d right |
+            // drafts 1..d-1 right)`, and "drafts 1..d-1 right" is precisely the
+            // state teacher forcing puts head `d` in: the token head `d-1` was
+            // fed IS the token the verifier would have accepted.
+            //
+            // FULL vocabulary, never the pruned candidate table -- the pruning is
+            // a property of the drafting step's candidate gather and not of the
+            // head, and mixing the two would price two changes with one number.
+            let teach = std::env::var("INK_MTP_TEACH")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            // The first row to score. Zero for a plain corpus; set it to the
+            // PROMPT length when the ids file is a seed followed by this model's
+            // own greedy continuation, so the rate is measured on the sequence a
+            // decode loop actually verifies.
+            //
+            // That distinction is not a detail. Teacher forcing on a human
+            // document asks the draft head to predict a token the MAIN STACK
+            // itself only gets right 30% of the time; at decode the target IS the
+            // main stack's argmax, which the head was trained to anticipate. So a
+            // corpus rate is a LOWER BOUND on the decode rate, and the two should
+            // never be quoted as the same number.
+            let teach_from = std::env::var("INK_MTP_TEACH_FROM")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            // `norm` is FALSE for a row that has already taken the final norm.
+            // `mtp_main` holds `entry`, which IS final-normed unless INK_MTP_RAW
+            // is set, and norming it again is not idempotent: rms_norm of
+            // (normalise(x) * g) is normalise(x) * g^2 / c, so the ceiling would
+            // be measured through the final norm's learned gain SQUARED.
+            let teach_rows = |rows: T2, norm: bool| -> Vec<usize> {
+                let rows_n = rows.dims()[0];
+                let hs = if norm {
+                    dev_lane::rms_norm(
+                        rows,
+                        fnorm_dev
+                            .clone()
+                            .expect("teacher forcing needs the final norm"),
+                        t.rms_norm_eps,
+                    )
+                } else {
+                    rows
+                }
+                .div_scalar(t.logits_mup_width_multiplier as f32);
+                // SLICED to the effective vocabulary before the argmax, exactly
+                // as the tail's own logits path and `draft_pick` are. The bound
+                // table is `vocab_size` rows wide and the model only uses
+                // `effective_vocab()` of them; the rest are padding, and an argmax
+                // that can land in the padding is not measuring the model.
+                dev_lane::linear_w(
+                    hs,
+                    unembed_w
+                        .as_ref()
+                        .expect("teacher forcing needs the unembed table"),
+                )
+                .slice([0..rows_n, 0..v])
+                .argmax(1)
+                .into_data()
+                .iter::<i64>()
+                .map(|x| x as usize)
+                .collect()
+            };
 
             draft_probs.borrow_mut().clear();
             let t_mtp = Instant::now();
@@ -7993,6 +8471,122 @@ fn main() -> Result<()> {
                             mtp_order,
                         );
                         mtp_dev_caches[d] = Some(c);
+                        if teach && d == 0 {
+                            // The CEILING, and the number every depth below is
+                            // meaningless without: the main stack's own
+                            // teacher-forced next-token accuracy on these same
+                            // rows. A draft head at 0.227 is a catastrophe against
+                            // a stack at 0.9 and unremarkable against a stack at
+                            // 0.3, and nothing in a per-depth table says which.
+                            let last = seq.saturating_sub(1);
+                            let first = teach_from.min(last);
+                            let mut hits = 0usize;
+                            let mut scored = 0usize;
+                            let nblk = ((last - first) / 256).max(1);
+                            let take = nblk.min(8);
+                            for b in 0..take {
+                                let lo = first
+                                    + if take == 1 {
+                                        0
+                                    } else {
+                                        (b * (nblk - 1) / (take - 1).max(1)) * 256
+                                    };
+                                let hi = (lo + 256).min(last);
+                                if hi <= lo {
+                                    continue;
+                                }
+                                // `main_dev` is `entry`: normed already, unless
+                                // INK_MTP_RAW asked for the stack's raw output.
+                                let picks = teach_rows(
+                                    main_dev.clone().slice([lo..hi, 0..h]),
+                                    std::env::var("INK_MTP_RAW")
+                                        .map(|val| val == "1")
+                                        .unwrap_or(false),
+                                );
+                                for (i, &pick) in picks.iter().enumerate() {
+                                    if pick == ids[lo + i + 1] {
+                                        hits += 1;
+                                    }
+                                    scored += 1;
+                                }
+                            }
+                            let (clo, chi) = wilson95(hits, scored);
+                            println!(
+                                "  MTP TEACH depth 0 (THE MAIN STACK): {hits}/{scored} = {:.4} \
+                                 (95% CI {:.4}-{:.4}) -- the same rows, the same unembedding, \
+                                 argmax against the token the prompt actually has next",
+                                hits as f64 / scored.max(1) as f64,
+                                clo,
+                                chi,
+                            );
+                        }
+                        if teach {
+                            // Row `j` predicts `ids[j + d + 2]`, so the last row
+                            // with an answer in the prompt is `seq - d - 3`.
+                            let last = seq.saturating_sub(d + 2);
+                            // Scored in contiguous blocks of `TEACH_BLOCK` rows,
+                            // spread EVENLY over the prompt rather than taken from
+                            // one end: acceptance is a property of the text, and a
+                            // document's first 2048 tokens are not its last 2048.
+                            // The cap exists because the cost is per CALL -- the
+                            // unembedding streams its whole table however many rows
+                            // it is handed -- so 8 blocks of 256 is 8 streams, and
+                            // scoring every row would be 15.
+                            const TEACH_BLOCK: usize = 256;
+                            let cap = std::env::var("INK_MTP_TEACH_MAX")
+                                .ok()
+                                .and_then(|v| v.parse::<usize>().ok())
+                                .unwrap_or(2048);
+                            let first = teach_from.min(last);
+                            let nblk = ((last - first) / TEACH_BLOCK).max(1);
+                            let take = nblk.min((cap / TEACH_BLOCK).max(1));
+                            let mut hits = 0usize;
+                            let mut scored = 0usize;
+                            for b in 0..take {
+                                let lo = first
+                                    + if take == 1 {
+                                        0
+                                    } else {
+                                        (b * (nblk - 1) / (take - 1).max(1)) * TEACH_BLOCK
+                                    };
+                                let hi = (lo + TEACH_BLOCK).min(last);
+                                if hi <= lo {
+                                    continue;
+                                }
+                                let picks =
+                                    teach_rows(y.clone().slice([lo..hi, 0..h]), mtp_out_norm());
+                                for (i, &pick) in picks.iter().enumerate() {
+                                    if pick == ids[lo + i + d + 2] {
+                                        hits += 1;
+                                    }
+                                    scored += 1;
+                                }
+                            }
+                            let (clo, chi) = wilson95(hits, scored);
+                            println!(
+                                "  MTP TEACH depth {}: {hits}/{scored} = {:.4} (95% CI \
+                                 {:.4}-{:.4}) -- teacher-forced over the prompt, FULL vocab, \
+                                 concat {}, entry {}, backbone embed_norm {}",
+                                d + 1,
+                                hits as f64 / scored.max(1) as f64,
+                                clo,
+                                chi,
+                                mtp_order.name(),
+                                if std::env::var("INK_MTP_RAW")
+                                    .map(|v| v == "1")
+                                    .unwrap_or(false)
+                                {
+                                    "raw"
+                                } else {
+                                    "final-normed"
+                                },
+                                if t.use_embed_norm && backbone_embed_norm() {
+                                    "on"
+                                } else {
+                                    "off"
+                                },
+                            );
+                        }
                         y
                     } else {
                         // ONE row per CONFIRMED TOKEN, not one per pass. That used
@@ -8035,11 +8629,81 @@ fn main() -> Result<()> {
                                 mtp_order,
                             ));
                         }
-                        if made.len() == 1 {
+                        let stepped = if made.len() == 1 {
                             made.pop().expect("one row")
                         } else {
                             BT::cat(made, 0)
+                        };
+                        // `INK_MTP_STEPCHECK=1`: the cached STEP against a fresh
+                        // whole-sequence PREFILL of the same head over the same
+                        // rows. Nothing else checks this pair.
+                        //
+                        // `INK_MTP_CHECK` compares the cached lane to the host
+                        // whole-sequence one, and is ASSERTED only for the host
+                        // cached lane -- the device one it merely reports. So the
+                        // lane every speculative run actually drafts on has never
+                        // had its step path checked against its own prefill, and a
+                        // step path that diverges does not error: it shows up as an
+                        // acceptance rate, months later, indistinguishable from a
+                        // model that simply drafts badly.
+                        //
+                        // Expensive by construction (a full prefill per head per
+                        // pass), so: short prompt, few steps.
+                        if std::env::var("INK_MTP_STEPCHECK")
+                            .map(|val| val == "1")
+                            .unwrap_or(false)
+                        {
+                            let mut embeds = vec![0f32; want * h];
+                            for j in 0..want {
+                                let tok = if j + d + 1 < seq {
+                                    ids[j + d + 1]
+                                } else {
+                                    best
+                                };
+                                embeds[j * h..(j + 1) * h].copy_from_slice(&mtp_embed_row(
+                                    e_w,
+                                    e_bn,
+                                    tok,
+                                    t.rms_norm_eps,
+                                    t.vocab_size,
+                                    h,
+                                ));
+                            }
+                            let ed = up2::<Bk>(embeds, want, h, &dev);
+                            let hin = if d == 0 {
+                                main_dev.clone().slice([0..want, 0..h])
+                            } else {
+                                row_of(&mtp_stage_dev[d - 1], 0, want)
+                            };
+                            let (fresh, _) = mtp_block_prefill_dev(
+                                hin,
+                                ed,
+                                &mtp_devs[d],
+                                &hd,
+                                Some(ls),
+                                window,
+                                t.sconv_kernel_size,
+                                t.rms_norm_eps,
+                                mtp_order,
+                            );
+                            let a = fresh.slice([want - 1..want, 0..h]);
+                            let b = stepped.clone().slice([adv - 1..adv, 0..h]);
+                            let diff = (a.clone() - b.clone()).abs().max().into_scalar();
+                            let scale = a.clone().abs().max().into_scalar();
+                            let (ta, tb) = (draft_argmax_dev(a), draft_argmax_dev(b));
+                            println!(
+                                "  MTP STEPCHECK depth {} pos {}: max|prefill-step| {:.4e}                                  against |prefill|max {:.4e} ({:.2}%); token {} vs {} -- {}",
+                                d + 1,
+                                want - 1,
+                                diff,
+                                scale,
+                                100.0 * diff as f64 / (scale as f64).max(1e-30),
+                                ta,
+                                tb,
+                                if ta == tb { "agree" } else { "DISAGREE" }
+                            );
                         }
+                        stepped
                     };
                     mtp_stage_dev[d] = Some(match mtp_stage_dev[d].take() {
                         None => stable,
