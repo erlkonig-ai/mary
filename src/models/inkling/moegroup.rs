@@ -1217,9 +1217,13 @@ pub fn grouped_kc(k: usize) -> usize {
 /// prefill against the best staging can do at a fixed one), it needs no `kc`
 /// and no `pad`, and it keeps the unstaged kernel's own plane preference
 /// instead of inverting it. End to end at `INK_LAYERS=0:16` the three arms tie
-/// inside the spread — 48.2 / 47.8 / 47.4 ms a step, row-major / pre-permuted /
-/// staged-at-one-plane — because that pass is host-enqueue-bound; see
-/// [`super::fp4gemm::fp4_linear_swz`].
+/// inside the spread on a ONE-ROW step — 48.2 / 47.8 / 47.4 ms, row-major /
+/// pre-permuted / staged-at-one-plane — because that pass is host-enqueue-
+/// bound. On the WIDE pass, where there is exposed device work, they separate
+/// and staging is the arm that LOSES: 281.9 / 273.0 / 291.4 ms a slot-prefill
+/// pass at `INK_SLOTS=32`, i.e. pre-permuting -3.2% and staging +3.4% against
+/// row-major — which is this module's own prefill column showing up end to end.
+/// See [`super::fp4gemm::fp4_linear_swz`] for both runs and their framing.
 ///
 /// What keeps this flag alive is **`INK_STARTUP_COPY=0`**. There the experts
 /// alias the pile's own file-backed mapping and are never copied, so there is
