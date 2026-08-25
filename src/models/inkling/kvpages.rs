@@ -1110,6 +1110,72 @@ mod tests {
         }
     }
 
+    /// The store's own contract, at the geometry and the dtype the runtime
+    /// actually uses: `kv_heads * head_dim` = 1024-wide rows, held BF16.
+    ///
+    /// The tests above are 128 wide and f32, which is one head and the wide
+    /// lane — neither is what a decode step holds. This one is, and it is the
+    /// test that says whether a drift measured further downstream belongs to
+    /// this file or to what reads it.
+    ///
+    /// The bound is per 16-element BLOCK and scaled by that block's amax, which
+    /// is the only yardstick NVFP4 supports: a block's scale is `amax / 6`, so
+    /// the absolute error an element can carry is set by the block it is in and
+    /// not by its own size. An element near zero inside a block with a large
+    /// amax is allowed to be wrong by a lot in relative terms, and a test that
+    /// demanded otherwise would be demanding something four bits cannot do.
+    #[test]
+    fn a_real_width_bf16_row_round_trips_within_the_nvfp4_block_bound() {
+        const KW: usize = 1024;
+        let n = 40usize;
+        // Structured rather than constant, and spanning a wide dynamic range
+        // within each block, so the per-block scale is actually doing work.
+        let data: Vec<f32> = (0..n * KW)
+            .map(|i| {
+                let t = ((i * 2_654_435_761usize) % 2003) as f32 / 1001.5 - 1.0;
+                t * t * t * 8.0
+            })
+            .collect();
+        let src = Tensor::<B, 1>::from_floats(data.as_slice(), &fp4_dev())
+            .reshape([n, KW])
+            .cast(burn::tensor::FloatDType::BF16);
+
+        let mut s = Fp4PageStore::new(KW, DType::BF16);
+        s.append(src.clone());
+        s.assert_sound();
+        assert_eq!(s.len(), n);
+
+        let a: Vec<f32> = src
+            .cast(burn::tensor::FloatDType::F32)
+            .into_data()
+            .to_vec()
+            .unwrap();
+        let b: Vec<f32> = s
+            .materialize(&fp4_dev())
+            .cast(burn::tensor::FloatDType::F32)
+            .into_data()
+            .to_vec()
+            .unwrap();
+        assert_eq!(a.len(), b.len());
+
+        let mut worst = 0f32;
+        for blk in 0..a.len() / 16 {
+            let lo = blk * 16;
+            let amax = a[lo..lo + 16].iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            for i in lo..lo + 16 {
+                worst = worst.max((a[i] - b[i]).abs() / amax.max(1e-6));
+            }
+        }
+        println!("real-width bf16 KV round trip: worst {worst:e} of block amax");
+        // Half the widest gap between adjacent E2M1 magnitudes is `2 / 6` of
+        // the amax (between 4 and 6), plus the E4M3 scale's own 1/16. Anything
+        // under that is the codec; anything over it is a bug in this file.
+        assert!(
+            worst < 1.0 / 3.0 + 1.0 / 16.0,
+            "a real-width BF16 row lost {worst} of its block amax"
+        );
+    }
+
     #[test]
     fn the_switch_picks_an_arm_and_both_arms_hold_the_same_rows() {
         // `fp4_kv()` is a process-global `OnceLock`, so a test binary gets ONE
