@@ -186,13 +186,27 @@ pub fn w4a16_linear<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size>(
             let gr = col as usize + n_base;
             let gc = row as usize + kbase;
 
+            // ONE word and ONE scale for the whole fragment element group,
+            // not one of each per element. The two facts in the module header
+            // say they are the same word and the same scale byte -- `gc` is
+            // even and a 16-element scale block starts at a multiple of 16 --
+            // so the per-element form was issuing four memory instructions
+            // where the BF16 lane issues one, for a quarter of the bytes. That
+            // is why the four-bit head measured 69 GB/s against the BF16
+            // head's 163: at 2 KB a row the lane is instruction-bound in this
+            // load, not bandwidth-bound.
+            //
+            // This DOES now depend on the fragment layout the header describes.
+            // The detector is `linear_w4a16_tracks_linear_bf16_on_the_same_weight`:
+            // a wrong nibble or a wrong scale is an order-one error and blows
+            // straight past that test's bound, which is what it is for.
+            let word = b[gr * wpr + gc / CODES_PER_WORD];
+            let s = f32::cast_from(b_sc[gr * spr + gc / GROUP]);
             let mut v = Vector::<AB, NA>::empty();
             #[unroll]
             for j in 0..vs_b {
                 let kk = gc + j;
-                let word = b[gr * wpr + kk / CODES_PER_WORD];
                 let code = (word >> (4 * (kk % CODES_PER_WORD)) as u32) & 15u32;
-                let s = f32::cast_from(b_sc[gr * spr + kk / GROUP]);
                 // The one widening in the lane, and it stops at the register.
                 v[j] = AB::cast_from(e2m1_value(code) * s);
             }
