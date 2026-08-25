@@ -32,7 +32,7 @@ use anyhow::Result;
 use cubecl::prelude::*;
 use half::bf16;
 
-use mary::models::inkling::bf16gemm::{Lane, static_lane, tuned_lane};
+use mary::models::inkling::bf16gemm::{Lane, autotune_params, static_lane, tuned_lane};
 
 type Rt = cubecl::cuda::CudaRuntime;
 
@@ -84,12 +84,14 @@ fn main() -> Result<()> {
 
     let client = Rt::client(&Default::default());
     println!("=== static walk vs timed walk, per shape, per width ===");
+    // From the tune itself, never from the env-or-a-literal: a literal in this
+    // format string is a framing rule for a build that may not be the one
+    // running, and this line printed "iters 2" on a run doing eight.
+    let (rounds, iters, margin) = autotune_params();
     println!(
-        "  rounds {} (first discarded), iters {} per round, margin {}%; \
-         round-robin so the cache state is common-mode.",
-        std::env::var("INK_GEMM_AUTOTUNE_ROUNDS").unwrap_or_else(|_| "4".into()),
-        std::env::var("INK_GEMM_AUTOTUNE_ITERS").unwrap_or_else(|_| "2".into()),
-        std::env::var("INK_GEMM_AUTOTUNE_MARGIN").unwrap_or_else(|_| "3".into()),
+        "  rounds {rounds} (first discarded), iters {iters} per round, margin {:.0}%; \
+         round-robin with a rotating start, so cache state AND position are common-mode.",
+        margin * 100.0
     );
     println!(
         "  The weight is looped and therefore L2-warm. A CHANGED row is a \

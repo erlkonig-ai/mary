@@ -1140,6 +1140,26 @@ fn autotune_log() -> bool {
     std::env::var("INK_GEMM_AUTOTUNE_LOG").is_ok_and(|v| v == "1" || v == "on")
 }
 
+/// The tune's settings as they will actually be used: rounds, iters, margin.
+///
+/// Exists because a report that states its framing from the ENV -- "or the
+/// default, which is 2" -- states the framing of a build it is not running.
+/// `inkling_gemm_autotune_gate` printed exactly that: "iters 2 per round" on a
+/// run doing eight, on the day the default changed. A framing rule read off a
+/// literal in a format string is not a framing rule, it is a guess that looks
+/// like one, and it is worse than none because it is quotable.
+pub fn autotune_params() -> (usize, usize, f64) {
+    (
+        env_usize("INK_GEMM_AUTOTUNE_ROUNDS", AUTOTUNE_ROUNDS).max(2),
+        env_usize("INK_GEMM_AUTOTUNE_ITERS", AUTOTUNE_ITERS).max(1),
+        env_usize(
+            "INK_GEMM_AUTOTUNE_MARGIN",
+            (AUTOTUNE_MARGIN * 100.0) as usize,
+        ) as f64
+            / 100.0,
+    )
+}
+
 /// The candidates for a shape: the static order, minus the lanes that decline it.
 ///
 /// The order is preserved, so `.first()` is exactly what the static walk in
@@ -1196,13 +1216,7 @@ pub fn tuned_lane<R: Runtime>(
     if cands.len() == 1 {
         return Some((head, vec![(head, f64::NAN)]));
     }
-    let rounds = env_usize("INK_GEMM_AUTOTUNE_ROUNDS", AUTOTUNE_ROUNDS).max(2);
-    let iters = env_usize("INK_GEMM_AUTOTUNE_ITERS", AUTOTUNE_ITERS).max(1);
-    let margin = env_usize(
-        "INK_GEMM_AUTOTUNE_MARGIN",
-        (AUTOTUNE_MARGIN * 100.0) as usize,
-    ) as f64
-        / 100.0;
+    let (rounds, iters, margin) = autotune_params();
 
     let mut samples: Vec<Vec<f64>> = vec![Vec::new(); cands.len()];
     for round in 0..rounds {
