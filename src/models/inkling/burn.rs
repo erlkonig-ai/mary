@@ -3266,6 +3266,64 @@ mod tests {
         }
     }
 
+    /// DIAGNOSTIC, not a gate. Isolates the GQA regrouping as the cause.
+    ///
+    /// `b3cd5e5` made the CACHED score product a `[kv_heads, groups, head_dim]`
+    /// batched matmul while the UNCACHED lane still expands to
+    /// `[heads, tokens, head_dim]`. If that shape divergence is what the drift
+    /// is, then at `groups == 1` the regroup is a no-op and the two sides go
+    /// back to agreeing: `kv_heads == heads` is the control, and the only thing
+    /// it changes is whether the regroup does anything.
+    #[test]
+    fn diag_gqa_groups_isolation() {
+        let _lane = CacheLane::wide();
+        let dev = burn::backend::cuda::CudaDevice::default();
+        for kv_heads in [2usize, 4] {
+            let d = AttnDims {
+                hidden: 16,
+                heads: 4,
+                kv_heads,
+                head_dim: 4,
+                d_rel: 4,
+                rel_extent: 16,
+                kernel: 4,
+                rms_eps: 1e-6,
+                kind: AttnKind::Global,
+            };
+            let w = weights(&d, &dev);
+            let (tokens, prefill) = (11usize, 4usize);
+            let xs: Tensor<B, 2> = Tensor::from_data(
+                TensorData::new(fill(tokens * d.hidden, 2.5), [tokens, d.hidden]),
+                &dev,
+            );
+            let full = attention(xs.clone(), &w, &d, None, None);
+            let head = xs.clone().slice([0..prefill, 0..d.hidden]);
+            let (_, mut cache) = attention_prefill(head, &w, &d, None, None, None);
+            let mut per = Vec::new();
+            let mut scale = 0f32;
+            for pos in prefill..tokens {
+                let step = attention_step(
+                    xs.clone().slice([pos..pos + 1, 0..d.hidden]),
+                    &w,
+                    &d,
+                    None,
+                    pos,
+                    None,
+                    &mut cache,
+                );
+                let want = full.clone().slice([pos..pos + 1, 0..d.hidden]);
+                per.push((step - want.clone()).abs().max().into_scalar());
+                scale = scale.max(want.abs().max().into_scalar());
+            }
+            let worst = per.iter().cloned().fold(0f32, f32::max);
+            println!(
+                "groups={} (heads=4 kv_heads={kv_heads}) worst {worst:e} scale {scale:e} rel {:e} per-pos {per:?}",
+                4 / kv_heads,
+                worst / scale
+            );
+        }
+    }
+
     /// A local layer whose window is shorter than the sequence, so the cache
     /// must forget: 11 tokens through a window of 5 drops six keys.
     #[test]
