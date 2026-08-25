@@ -643,6 +643,366 @@ fn fp4_linear_grouped_launch_as<O: Scalar + Cast + CubeElement, R: Runtime>(
 }
 
 // ---------------------------------------------------------------------------
+// The grouped GEMM, B staged through shared memory
+// ---------------------------------------------------------------------------
+
+/// [`fp4_linear_grouped`] with the B operand STAGED THROUGH SHARED MEMORY, and
+/// nothing else changed.
+///
+/// # Why
+///
+/// The retraction in this module's header names one mechanism for the factor of
+/// two between this lane and the bus: the `m16n8k64` B fragment is 8 columns of
+/// `[n, k]`, so one plane's B load spans eight weight rows `k / 2` bytes apart
+/// and issues eight sector requests where a coalesced 32-bit stream issues four
+/// for the same 128 useful bytes. No warp instruction can be a contiguous read
+/// while its lanes map onto eight separate rows, so recovering the coalesced
+/// rate means breaking that correspondence — which is what this does. The
+/// GLOBAL read becomes a per-row contiguous stream, the cube fills shared
+/// memory cooperatively, and only the SMEM read keeps the fragment's shape.
+///
+/// `inkling_membw --INK_BW_AXES=1` rows 24-34 measure that mechanism on its own
+/// (the same footprint, the `mma` deleted): 115.2 GB/s unstaged against 209-226
+/// staged, i.e. 1.8-1.96x of a 2x ceiling, with the bank-conflict padding worth
+/// nothing because the arm is bandwidth-bound rather than smem-bound.
+///
+/// # What this kernel gets that the model does not
+///
+/// A cube here is `planes` planes sharing ONE n tile and ONE expert — that is
+/// what [`RowPlan`]'s block plan is for — so all of them want the SAME B. The
+/// model gave each plane its own n tile. So the cooperative load is issued once
+/// for what was `planes` separate sets of requests, and the staged tile is
+/// `planes` times smaller: at decode (`nrep = 1`, `kc = 8`) it is 8 rows x 68
+/// words = 2176 B of codes and 288 B of scales a cube, which costs no occupancy
+/// at all against this part's ~100 KiB an SM.
+///
+/// # The differences from the kernel it mirrors, all three of them
+///
+/// * the k loop is split into `size_k / 64 / kc` chunks; each chunk stages
+///   `kc` k tiles of B and then runs the same `kc` `execute_scaled` calls out of
+///   shared memory. The A operand, the block scales' arithmetic, the
+///   accumulator and the store are untouched, which is why this is bit-identical
+///   to [`fp4_linear_grouped`] and not merely close.
+/// * spare planes do NOT `terminate!()`. A cube-wide barrier with exited threads
+///   is undefined, so a short run's spare planes stay in and help fill shared
+///   memory — useful work, not a spin — and only the `mma` and the store are
+///   guarded. The barriers sit OUTSIDE that guard, so every thread reaches every
+///   one of them.
+/// * `pad` words of padding on the smem row stride. A fragment read puts lane
+///   `l` at row `l / 4`, word `l & 3`, so its bank is `(l / 4) * cs + (l & 3)`
+///   mod 32; at `pad = 4` the stride `cs = 4 * (2 * kc + 1)` is four times an
+///   odd number, the eight rows land on eight distinct multiples of four, and
+///   lane `l` gets bank `l`. It measured free either way — see above — and is
+///   kept because four words a row is not a price worth thinking about twice.
+#[cube(launch, address_type = "dynamic")]
+#[allow(clippy::too_many_arguments)]
+pub fn fp4_linear_grouped_smem<
+    AB: Scalar,
+    S: Scalar,
+    O: Scalar + Cast,
+    NA: Size,
+    NC: Size,
+    NS: Size,
+>(
+    a: &Tensor<Vector<AB, NA>>,
+    a_sc: &Tensor<Vector<S, NS>>,
+    b: &Tensor<Vector<AB, NA>>,
+    b_sc: &Tensor<Vector<S, NS>>,
+    blk_slot: &Tensor<u32>,
+    blk_tile0: &Tensor<u32>,
+    blk_cnt: &Tensor<u32>,
+    off: &Tensor<u64>,
+    scale2: &Tensor<f32>,
+    out: &mut Tensor<Vector<O, NC>>,
+    #[comptime] size_k: usize,
+    #[comptime] size_n: usize,
+    #[comptime] nrep: usize,
+    #[comptime] kc: usize,
+    #[comptime] pad: usize,
+    #[comptime] pad_s: usize,
+    #[comptime] threads: usize,
+) {
+    let def = cmma::MmaDefinition::<AB, AB, f32>::new_scaled::<S>(MTILE, NTILE, KTILE, 4usize);
+    let lane = UNIT_POS_PLANE;
+    let pack = AB::packing_factor();
+
+    let n_tile = CUBE_POS_X as usize;
+    let blk = CUBE_POS_Y as usize;
+    let plane = PLANE_POS;
+    // NOT `terminate!()`: see this function's header. A spare plane stays in for
+    // the barriers and the cooperative fill, and skips only the arithmetic.
+    let active = plane < blk_cnt[blk];
+    let m_tile = blk_tile0[blk] as usize + plane as usize;
+    let n_base = n_tile * NTILE * nrep;
+    let m_base = m_tile * MTILE;
+
+    let slot = blk_slot[blk] as usize;
+    let b_base = usize::cast_from(off[2 * slot]);
+    let bsc_base = usize::cast_from(off[2 * slot + 1]);
+    let scale = scale2[slot];
+
+    let ec_a = def.elems_per_lane(MatrixIdent::A);
+    let vs_a = def.vector_size(MatrixIdent::A);
+    let vc_a = comptime!(ec_a / vs_a);
+    let ec_b = def.elems_per_lane(MatrixIdent::B);
+    let vs_b = def.vector_size(MatrixIdent::B);
+    let vc_b = comptime!(ec_b / vs_b);
+    let ec_c = def.elems_per_lane(MatrixIdent::Accumulator);
+    let vs_c = def.vector_size(MatrixIdent::Accumulator);
+    let vc_c = comptime!(ec_c / vs_c);
+
+    // Weight rows the cube stages: the n tile it is on, `nrep` wide. Every
+    // plane in the cube reads exactly these.
+    let rows = comptime!(NTILE * nrep);
+    // Row stride in `NA`-wide vectors (one vector is 32 bits of packed codes,
+    // which is the width the fragment load issues).
+    let cs = comptime!(kc * 8 + pad);
+    let ss = comptime!(kc + pad_s);
+    let chunks = comptime!(size_k / KTILE / kc);
+    let words = comptime!(rows * kc * 8);
+    let words_s = comptime!(rows * kc);
+    let per_c = comptime!(words.div_ceil(threads));
+    let per_s = comptime!(words_s.div_ceil(threads));
+
+    let mut sm = SharedMemory::<Vector<AB, NA>>::new(comptime!(rows * cs));
+    let mut sm_sc = SharedMemory::<Vector<S, NS>>::new(comptime!(rows * ss));
+
+    let unit = UNIT_POS as usize;
+
+    let mut reg_a = Array::<Vector<AB, NA>>::new(vc_a);
+    let mut regs_b = Sequence::<Array<Vector<AB, NA>>>::new();
+    let mut accs = Sequence::<Array<Vector<f32, NC>>>::new();
+    #[unroll]
+    for _ in 0..nrep {
+        regs_b.push(Array::<Vector<AB, NA>>::new(vc_b));
+        let mut acc = Array::<Vector<f32, NC>>::new(vc_c);
+        #[unroll]
+        for i in 0..vc_c {
+            acc[i] = Vector::<f32, NC>::cast_from(0.0f32);
+        }
+        accs.push(acc);
+    }
+
+    let sia = def.scales_index(lane, MatrixIdent::A) as usize;
+    let sib = def.scales_index(lane, MatrixIdent::B) as usize;
+    let spr = comptime!(size_k / GROUP);
+
+    for c in 0..chunks {
+        // ---- the cooperative fill ----------------------------------------
+        //
+        // Thread `t` takes flat word `t + j * threads` of the chunk, and the
+        // chunk is row-major with `kc * 8` words a row, so at `kc >= 4` a warp
+        // covers 128 consecutive bytes of ONE weight row. That is the whole
+        // point: four sector requests per 128 useful bytes instead of eight.
+        #[unroll]
+        for j in 0..per_c {
+            let f = unit + j * threads;
+            if f < words {
+                let r = f / comptime!(kc * 8);
+                let o = f % comptime!(kc * 8);
+                let gi = (b_base + (n_base + r) * size_k / 2 + c * comptime!(kc * KTILE / 2))
+                    / b.vector_size()
+                    + o;
+                sm[r * cs + o] = b[gi];
+            }
+        }
+        // The scale plane is `kc` words a row per chunk — 32 B at `kc = 8`,
+        // which is a whole sector, where the fragment-shaped read spends a
+        // sector request on each of eight rows for four bytes of each.
+        #[unroll]
+        for j in 0..per_s {
+            let f = unit + j * threads;
+            if f < words_s {
+                let r = f / kc;
+                let o = f % kc;
+                let gi = (bsc_base + (n_base + r) * spr + (c * kc + o) * 4) / b_sc.vector_size();
+                sm_sc[r * ss + o] = b_sc[gi];
+            }
+        }
+        sync_cube();
+
+        if active {
+            #[unroll]
+            for tl in 0..kc {
+                let t = c * kc + tl;
+                let kbase = t * KTILE;
+                #[unroll]
+                for i in 0..vc_a {
+                    let (row, col) =
+                        def.position_of_nth(lane, (i * vs_a * pack) as u32, MatrixIdent::A);
+                    let gr = row as usize + m_base;
+                    let gc = col as usize + kbase;
+                    reg_a[i] = a[(gr * size_k / 2 + gc / 2) / a.vector_size()];
+                }
+                #[unroll]
+                for j in 0..nrep {
+                    let rb = regs_b.index_mut(j);
+                    #[unroll]
+                    for i in 0..vc_b {
+                        let (row, col) =
+                            def.position_of_nth(lane, (i * vs_b * pack) as u32, MatrixIdent::B);
+                        // The same operand, out of shared memory: `col` picks
+                        // the weight row inside the staged tile and `row` the
+                        // k element, whose word inside the chunk is
+                        // `row / 8 + tl * 8` — `row` is a multiple of 8 for
+                        // every fragment element, so the division is exact.
+                        rb[i] = sm[(col as usize + j * NTILE) * cs + row as usize / 8 + tl * 8];
+                    }
+                }
+
+                let va = a_sc[((sia + m_base) * spr + t * 4) / a_sc.vector_size()];
+                let mut sa = Vector::<S, NS>::empty();
+                #[unroll]
+                for i in 0..SCALE_VEC {
+                    sa[i] = va[i];
+                }
+
+                #[unroll]
+                for j in 0..nrep {
+                    let vb = sm_sc[(sib + j * NTILE) * ss + tl];
+                    let mut sb = Vector::<S, NS>::empty();
+                    #[unroll]
+                    for i in 0..SCALE_VEC {
+                        sb[i] = vb[i];
+                    }
+                    let d = def.execute_scaled(&reg_a, regs_b.index(j), accs.index(j), sa, sb);
+                    let ac = accs.index_mut(j);
+                    #[unroll]
+                    for i in 0..vc_c {
+                        ac[i] = d[i];
+                    }
+                }
+            }
+        }
+        // The next chunk overwrites the tile, so the readers have to be done.
+        sync_cube();
+    }
+
+    if active {
+        #[unroll]
+        for j in 0..nrep {
+            let ac = accs.index(j);
+            #[unroll]
+            for i in 0..vc_c {
+                let (row, col) =
+                    def.position_of_nth(lane, (i * vs_c) as u32, MatrixIdent::Accumulator);
+                let gr = row as usize + m_base;
+                let gc = col as usize + n_base + j * NTILE;
+                out[(gr * size_n + gc) / out.vector_size()] =
+                    Vector::<O, NC>::cast_from(ac[i] * Vector::<f32, NC>::cast_from(scale));
+            }
+        }
+    }
+}
+
+/// [`fp4_linear_grouped_launch_as`] against the staged kernel.
+///
+/// `kc` k tiles are staged per chunk (`INK_MOE_KC`, default 8) and `pad` words
+/// pad the smem row stride (`INK_MOE_PAD`, default 4). Both have to divide the
+/// shape: `size_k / 64` must be a whole number of `kc`.
+#[allow(clippy::too_many_arguments)]
+pub fn fp4_linear_grouped_smem_launch_as<O: Scalar + Cast + CubeElement, R: Runtime>(
+    client: &ComputeClient<R>,
+    a: &Handle,
+    a_sc: &Handle,
+    wmap: &Handle,
+    wmap_bytes: usize,
+    blk: &BlockPlanDev,
+    off: &Handle,
+    scale2: &Handle,
+    slots: usize,
+    m_total: usize,
+    k: usize,
+    n: usize,
+) -> Handle {
+    assert_eq!(m_total % MTILE, 0);
+    assert_eq!(n % NTILE, 0);
+    assert_eq!(k % KTILE, 0);
+
+    let nrep = grouped_nrep(n, m_total, blk.rows_real);
+    let n_cubes = n / (NTILE * nrep);
+    let kc = grouped_kc(k);
+    let pad = grouped_pad();
+    let threads = 32 * blk.planes;
+
+    let out = client.empty(m_total * n * core::mem::size_of::<O>());
+    let vs = 32 / e2m1x2::cube_type().size_bits();
+    let spr = k / GROUP;
+    let flat = wmap_bytes - wmap_bytes % vs;
+    let flat_sc = wmap_bytes - wmap_bytes % SCALE_VEC;
+
+    unsafe {
+        fp4_linear_grouped_smem::launch::<e2m1x2, e4m3, O, R>(
+            client,
+            CubeCount::Static(n_cubes as u32, blk.blocks as u32, 1),
+            CubeDim::new_1d(threads as u32),
+            AddressType::U64,
+            vs,
+            2,
+            SCALE_VEC,
+            TensorArg::from_raw_parts(a.clone(), [k / 2, 1].into(), [m_total, k / 2].into()),
+            TensorArg::from_raw_parts(a_sc.clone(), [spr, 1].into(), [m_total, spr].into()),
+            TensorArg::from_raw_parts(wmap.clone(), [1].into(), [flat].into()),
+            TensorArg::from_raw_parts(wmap.clone(), [1].into(), [flat_sc].into()),
+            TensorArg::from_raw_parts(blk.slot.clone(), [1].into(), [blk.blocks].into()),
+            TensorArg::from_raw_parts(blk.tile0.clone(), [1].into(), [blk.blocks].into()),
+            TensorArg::from_raw_parts(blk.cnt.clone(), [1].into(), [blk.blocks].into()),
+            TensorArg::from_raw_parts(off.clone(), [1].into(), [2 * slots].into()),
+            TensorArg::from_raw_parts(scale2.clone(), [1].into(), [slots].into()),
+            TensorArg::from_raw_parts(out.clone(), [n, 1].into(), [m_total, n].into()),
+            k,
+            n,
+            nrep,
+            kc,
+            pad,
+            1usize,
+            threads,
+        )
+    };
+    out
+}
+
+/// K tiles staged per chunk, from `INK_MOE_KC`, clamped to something `k` admits.
+///
+/// A chunk is `kc * 32` bytes of each staged weight row, and the cooperative
+/// load wants that to be a whole number of 128-byte lines, so `kc >= 4`. Above
+/// that it is a shared-memory-against-chunk-count trade the caller measures.
+pub fn grouped_kc(k: usize) -> usize {
+    use std::sync::OnceLock;
+    static C: OnceLock<usize> = OnceLock::new();
+    let want = *C.get_or_init(|| {
+        std::env::var("INK_MOE_KC")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| (4..=64).contains(&v))
+            .unwrap_or(8)
+    });
+    let tiles = k / KTILE;
+    let mut kc = want.min(tiles);
+    while kc > 4 && tiles % kc != 0 {
+        kc -= 1;
+    }
+    kc
+}
+
+/// Padding words on the staged row stride, from `INK_MOE_PAD` (default 4).
+///
+/// Four is the conflict-free setting; zero is the eight-way-conflicted one, and
+/// it is a knob rather than a constant because the difference is the measured
+/// price of the re-layout.
+pub fn grouped_pad() -> usize {
+    use std::sync::OnceLock;
+    static P: OnceLock<usize> = OnceLock::new();
+    *P.get_or_init(|| {
+        std::env::var("INK_MOE_PAD")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v <= 32)
+            .unwrap_or(4)
+    })
+}
+
+// ---------------------------------------------------------------------------
 // The grouped GEMM, unscaled — layer 2
 // ---------------------------------------------------------------------------
 

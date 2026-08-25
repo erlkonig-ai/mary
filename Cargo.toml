@@ -426,6 +426,14 @@ required-features = ["inkling-cuda"]
 name = "inkling_membw"
 required-features = ["inkling-cuda", "cuda-backend"]
 
+# The routed-expert GEMM with its B operand staged through shared memory,
+# against the same GEMM reading B straight out of global. Both arms in one
+# process on one table, because a cross-worktree comparison on this box is a
+# comparison of two autotune caches.
+[[bin]]
+name = "fp4_smem_probe"
+required-features = ["inkling-cuda", "cuda-backend"]
+
 # KDA parity gate: mary::models::kimi_k3::kda against the flash-linear-attention
 # oracle vectors (Triton kernels + fla's own float64 references). Reads .npz
 # only — no checkpoint, no safetensors — so it does not ride `dev-tools`.
