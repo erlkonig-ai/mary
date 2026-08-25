@@ -1437,6 +1437,43 @@ struct SharedOnDevice {
 /// measured: the same operation on the same shapes runs 65.08 ms on the BF16
 /// grouped lane against 18.44 ms on the NVFP4 one, and the shared experts are
 /// 100.7 MB of a 275.8 MB layer-step.
+/// Which lane the unembed table is bound to.
+///
+/// The head is the single largest term in the per-step INTERCEPT, and it is
+/// physics rather than overhead: `[vocab_size, hidden]` BF16 is 1.53 GiB read
+/// WHOLE on every pass, measured at 10.3 ms = 159 GB/s = 65% of this box's
+/// measured 242.9 GB/s. It does not scale with context or with how many layers
+/// this node holds, and no launch-side change moves a byte of it -- only fewer
+/// bytes do. At NVFP4 the same table is 0.43 GiB.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HeadLane {
+    /// The stored BF16, aliased out of the pile's own mapping.
+    Bf16,
+    /// NVFP4 codes against a BF16 activation.
+    W4a16,
+    /// The same NVFP4 codes against a quantised activation -- the routed
+    /// experts' native lane, here only so the two can be compared.
+    W4a4,
+}
+
+/// `INK_W4A16_HEAD=1`: hold the unembed table as NVFP4 and multiply it with a
+/// BF16 activation. `INK_W4A16_HEAD=4` binds the identical codes to the W4A4
+/// lane instead, which is a comparison arm and not a recommendation.
+///
+/// W4A16 is the default of the two: the checkpoint quantised the ROUTED
+/// EXPERTS and nothing else, so there is no calibrated input quantiser for
+/// this tensor, and these are the logits that top-k and sampling read
+/// directly. The whole switch is off by default because quantising the head is
+/// a model-quality decision, not an engineering one.
+fn head_lane() -> HeadLane {
+    static ON: std::sync::OnceLock<HeadLane> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("INK_W4A16_HEAD").as_deref() {
+        Ok("1") => HeadLane::W4a16,
+        Ok("4") => HeadLane::W4a4,
+        _ => HeadLane::Bf16,
+    })
+}
+
 /// `INK_FUSE_QKVR=1`: bind `wq|wk|wv|wr` as one `[6656, hidden]` weight.
 ///
 /// A SCHEDULING change -- every output element is the same k-loop over the
@@ -1445,29 +1482,6 @@ struct SharedOnDevice {
 /// 54.5 MB a layer of device memory bought against four launches of 512, 128,
 /// 128 and 64 cubes becoming one of 832. Off by default until the arms are
 /// compared end to end, since the fused shape may also pick a different lane.
-/// `INK_W4A16_HEAD=1`: hold the unembed table as NVFP4 and multiply it with a
-/// BF16 activation.
-///
-/// The head is the single largest term in the per-step INTERCEPT, and it is
-/// physics rather than overhead: `[vocab_size, hidden]` BF16 is 1.53 GiB read
-/// WHOLE on every pass, measured at 10.3 ms = 159 GB/s = 65% of this box's
-/// measured 242.9 GB/s. It does not scale with context or with how many layers
-/// this node holds, and no launch-side change moves a byte of it -- only fewer
-/// bytes do. At NVFP4 the same table is 0.43 GiB.
-///
-/// W4A16 and not W4A4: the checkpoint quantised the ROUTED EXPERTS and nothing
-/// else, so there is no calibrated input quantiser for this tensor, and these
-/// are the logits that top-k and sampling read directly. Off by default because
-/// that is a model-quality decision, not an engineering one.
-fn w4a16_head() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("INK_W4A16_HEAD")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    })
-}
-
 fn fuse_qkvr() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -5039,13 +5053,27 @@ fn main() -> Result<()> {
             2.0 * leaf.bytes.len() as f64 / GIB
         );
         (
-            Some(if w4a16_head() {
+            Some(if head_lane() != HeadLane::Bf16 {
                 // Quantise once, here, and let the BF16 upload die with `hnd`:
                 // what the run then holds is 0.43 GiB, not 1.53.
-                let w = quantized_bf16(&fp4_client, &leaf.bytes, rows, cols);
+                //
+                // `quantized_bf16` hands back the routed experts' `Fp4`
+                // variant, which is the W4A4 lane -- the one the publisher
+                // calibrated an input quantiser for and this tensor has none.
+                // Re-tagging the SAME `PackedW` as `W4a16` changes nothing on
+                // the device (identical codes, identical scales); it changes
+                // only whether the activation gets quantised on the way in.
+                let w = match (
+                    quantized_bf16(&fp4_client, &leaf.bytes, rows, cols),
+                    head_lane(),
+                ) {
+                    (dev_lane::ProjW::Fp4(p), HeadLane::W4a16) => dev_lane::ProjW::W4a16(p),
+                    (w, _) => w,
+                };
                 println!(
-                    "  unembed RE-BOUND as NVFP4 (INK_W4A16_HEAD=1): {:.2} GiB -> {:.2} GiB, \
+                    "  unembed RE-BOUND as NVFP4 / {:?} (INK_W4A16_HEAD): {:.2} GiB -> {:.2} GiB, \
                      a per-step FLOOR cut by the same ratio",
+                    head_lane(),
                     leaf.bytes.len() as f64 / GIB,
                     leaf.bytes.len() as f64 * 4.5 / 16.0 / GIB
                 );
