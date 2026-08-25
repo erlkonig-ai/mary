@@ -292,19 +292,20 @@ impl CleanupPolicy {
         }
     }
 
-    /// Whether to clean up at the end of a layer, asking the pool and the node
-    /// when the policy is [`CleanupPolicy::WhenStranded`].
+    /// Whether to clean up at the end of a layer, given the pool's stranded
+    /// bytes, when the policy is [`CleanupPolicy::WhenStranded`].
     ///
     /// For [`CleanupPolicy::PerStage`] this is the tail-stage hand-back. The
     /// caller defers it until after the layer's RMS diagnostic so that the
     /// diagnostic's full-width temporary is released too; the four internal
     /// routed-stage hand-backs happen at their own boundaries.
     ///
-    /// `stranded` comes from `ComputeClient::memory_usage`, which is host-side
-    /// bookkeeping and needs no sync to read; the sync belongs to the cleanup
-    /// itself and is the caller's. A node whose `MemAvailable` cannot be read
-    /// gets the cheap branch: an unreadable `/proc/meminfo` is not a reason to
-    /// start paying nine percent.
+    /// A node whose `MemAvailable` cannot be read gets the cheap branch: an
+    /// unreadable `/proc/meminfo` is not a reason to start paying nine percent.
+    ///
+    /// Prefer [`CleanupGate`] at a call site inside the layer loop: this
+    /// function's `stranded` argument is not free to produce, and the two
+    /// policies that ignore it should not be paying for it.
     pub fn at_layer(self, stranded: u64) -> bool {
         match self {
             CleanupPolicy::Never => false,
@@ -330,6 +331,153 @@ impl CleanupPolicy {
             }
             CleanupPolicy::PerLayer => "between layers, always",
             CleanupPolicy::PerStage => "between stages",
+        }
+    }
+}
+
+/// How often the policy's question is ASKED, which is not the same question as
+/// what it answers.
+///
+/// [`CleanupPolicy::at_layer`] takes `stranded` as an argument and says nothing
+/// about where it comes from. It comes from `ComputeClient::memory_usage`, and
+/// that call is not the free host-side bookkeeping the comment on it used to
+/// claim. On this cubecl lineage the compute server lives on its own thread and
+/// `memory_usage` is `submit_blocking`: it enqueues a closure behind everything
+/// the layer has already submitted, wakes the runner, and blocks the caller on a
+/// oneshot until the runner has drained down to it. So the call is a HOST
+/// LAUNCH-QUEUE BARRIER, and once it arrives at the runner it walks every page
+/// of all twenty-four `ExclusivePages` buckets and every slice of the persistent
+/// pool, allocating a `Vec` of the live ones per pool as it goes.
+///
+/// That was being paid once per layer, in every arm, under every policy --
+/// including [`CleanupPolicy::Never`] and [`CleanupPolicy::PerLayer`], neither
+/// of which reads `stranded` at all. It is the reason an `INK_POOL_CLEANUP=0`
+/// A/B measured +0.00%: the switch it flips is downstream of the cost.
+///
+/// The gate fixes both halves without moving the policy:
+///
+/// * A policy that does not read `stranded` never asks for it. `Never` and
+///   `PerLayer`/`PerStage` are decided from the policy alone.
+/// * [`CleanupPolicy::WhenStranded`] asks per LAYER while the answer is yes and
+///   once per PASS while it is no. The two regimes the policy was confirmed in
+///   are both constant across a pass -- `0 of 42` on a decode step, `20 of 20`
+///   and `22 of 22` on the two-node prefill at 130,000 tokens -- so the sample
+///   that is dropped is a sample whose answer the neighbouring samples already
+///   carried. The pass's LAST layer always polls, so a pass that has gone quiet
+///   still re-arms per-layer polling for the next one, and the first answer of
+///   `yes` re-arms it for the rest of the current one.
+///
+/// What that trades is exactly one pass of latency on a transition from "not
+/// stranding" to "stranding", and the bound on it is the pass's own
+/// allocations: a decode step whose per-layer activations are megabytes cannot
+/// cross a gibibyte-scale margin inside one pass, and a prefill that can is a
+/// pass the previous poll already answered yes for.
+///
+/// `INK_POOL_POLL=layer` restores the unconditional per-layer poll, in every
+/// policy, so the cost of the poll can be A/B'd against its absence inside ONE
+/// binary and one worktree rather than across two.
+#[derive(Clone, Copy, Debug)]
+pub struct CleanupGate {
+    policy: CleanupPolicy,
+    /// `INK_POOL_POLL=layer`: poll unconditionally, as the loop used to.
+    always_poll: bool,
+    /// Poll at every layer of the pass now running.
+    per_layer: bool,
+    /// Some poll in the pass now running answered yes.
+    acted: bool,
+}
+
+impl CleanupGate {
+    /// The gate for this run. Starts armed, so the first pass polls per layer
+    /// and nothing has to be assumed about what state the pool woke up in.
+    ///
+    /// The first pass is the one that matters most for this: with `INK_KV=1` it
+    /// is the PREFILL, which is the pass the policy exists for. A unit test pins
+    /// it, and earned its keep immediately -- `acted` was `false` here at first,
+    /// so the very first `begin_pass` disarmed the gate before the prefill's
+    /// first layer and the arming in this constructor did nothing at all.
+    pub fn new(policy: CleanupPolicy) -> Self {
+        Self::with_schedule(
+            policy,
+            matches!(std::env::var("INK_POOL_POLL").as_deref(), Ok("layer")),
+        )
+    }
+
+    /// [`CleanupGate::new`] with the `INK_POOL_POLL` reading supplied rather
+    /// than read, so a test can pin the schedule without touching the
+    /// process-wide environment two other tests are also reading.
+    pub fn with_schedule(policy: CleanupPolicy, always_poll: bool) -> Self {
+        Self {
+            policy,
+            always_poll,
+            // `acted`, not `per_layer`: `begin_pass` derives one from the other
+            // and runs before the first layer, so arming has to be expressed in
+            // the field `begin_pass` READS.
+            per_layer: true,
+            acted: true,
+        }
+    }
+
+    /// What the run's header should say about the sampling schedule.
+    pub fn schedule(&self) -> &'static str {
+        if self.always_poll {
+            "every layer (INK_POOL_POLL=layer)"
+        } else {
+            match self.policy {
+                CleanupPolicy::Never | CleanupPolicy::PerLayer | CleanupPolicy::PerStage => {
+                    "never -- this policy does not read the pool"
+                }
+                CleanupPolicy::WhenStranded => {
+                    "every layer while it is handing pages back, once a pass while it is not"
+                }
+            }
+        }
+    }
+
+    /// Call at the top of every pass, before its first layer.
+    pub fn begin_pass(&mut self) {
+        self.per_layer = self.acted;
+        self.acted = false;
+    }
+
+    /// Whether this layer hands the pool's pages back.
+    ///
+    /// `last` marks the pass's final layer, which always polls. `stranded` is a
+    /// closure and not a value because calling it is the cost this type exists
+    /// to stop paying: it is invoked only on a layer whose answer can depend on
+    /// it.
+    pub fn at_layer(&mut self, last: bool, stranded: impl FnOnce() -> u64) -> bool {
+        if self.always_poll {
+            // The old shape, kept callable for the A/B: read the pool first and
+            // unconditionally, then ask the policy.
+            let s = stranded();
+            let yes = self.policy.at_layer(s);
+            if yes {
+                self.acted = true;
+            }
+            return yes;
+        }
+        match self.policy {
+            CleanupPolicy::Never => false,
+            CleanupPolicy::PerLayer | CleanupPolicy::PerStage => {
+                self.acted = true;
+                true
+            }
+            CleanupPolicy::WhenStranded => {
+                if !self.per_layer && !last {
+                    return false;
+                }
+                let avail = match super::pile::mem_available_bytes() {
+                    Ok(avail) => avail,
+                    Err(_) => return false,
+                };
+                let yes = stranded() > avail;
+                if yes {
+                    self.acted = true;
+                    self.per_layer = true;
+                }
+                yes
+            }
         }
     }
 }
@@ -374,6 +522,101 @@ mod tests {
         let floor = AllocatorConfig::ExclusivePages.admission_floor(machine, 16_384);
         assert!(floor >= retained);
         assert!(live + floor >= reserved);
+    }
+
+    /// Run `passes` passes of `layers` layers each and report, per pass, how
+    /// many times the gate asked for `stranded` and how many layers cleaned.
+    fn drive(
+        gate: &mut CleanupGate,
+        passes: usize,
+        layers: usize,
+        stranded: u64,
+    ) -> Vec<(usize, usize)> {
+        (0..passes)
+            .map(|_| {
+                gate.begin_pass();
+                let mut polls = 0usize;
+                let mut cleaned = 0usize;
+                for l in 0..layers {
+                    if gate.at_layer(l + 1 == layers, || {
+                        polls += 1;
+                        stranded
+                    }) {
+                        cleaned += 1;
+                    }
+                }
+                (polls, cleaned)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_policy_that_ignores_stranded_never_asks_for_it() {
+        // The defect this type exists for: the loop read the pool once a layer
+        // in EVERY arm, so `INK_POOL_CLEANUP=0` measured +0.00% because both
+        // sides of the A/B were paying for a number neither of them used.
+        for policy in [
+            CleanupPolicy::Never,
+            CleanupPolicy::PerLayer,
+            CleanupPolicy::PerStage,
+        ] {
+            let mut gate = CleanupGate::with_schedule(policy, false);
+            let want = policy != CleanupPolicy::Never;
+            for (polls, cleaned) in drive(&mut gate, 3, 8, u64::MAX) {
+                assert_eq!(
+                    polls, 0,
+                    "{policy:?} asked the pool for a number it does not read"
+                );
+                assert_eq!(
+                    cleaned,
+                    if want { 8 } else { 0 },
+                    "{policy:?} changed its answer"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_quiet_pass_drops_to_one_poll_and_the_last_layer_keeps_it_honest() {
+        let mut gate = CleanupGate::with_schedule(CleanupPolicy::WhenStranded, false);
+        let seen = drive(&mut gate, 4, 42, 0);
+        // The first pass is polled per layer -- nothing is assumed about the
+        // state the pool woke up in. It cleans nothing, so every pass after it
+        // asks once, at the layer that re-arms the next one.
+        assert_eq!(
+            seen[0].0, 42,
+            "the first pass -- the PREFILL -- must be polled per layer"
+        );
+        assert_eq!(seen[0].1, 0);
+        for (polls, cleaned) in &seen[1..] {
+            assert!(*polls <= 1, "a quiet pass asked {polls} times, not once");
+            assert_eq!(*cleaned, 0);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_pass_that_hands_pages_back_is_polled_at_every_layer() {
+        // `u64::MAX` stranded is more than any node has spare, so the policy
+        // answers yes at the first layer it is asked and the gate must stay on
+        // per-layer polling for the rest of that pass and the next one.
+        let mut gate = CleanupGate::with_schedule(CleanupPolicy::WhenStranded, false);
+        for (polls, cleaned) in drive(&mut gate, 3, 20, u64::MAX) {
+            assert_eq!(polls, 20, "a stranding pass must be asked every layer");
+            assert_eq!(cleaned, 20, "and must hand back at every layer");
+        }
+    }
+
+    #[test]
+    fn ink_pool_poll_layer_restores_the_unconditional_poll() {
+        let mut gate = CleanupGate::with_schedule(CleanupPolicy::Never, true);
+        for (polls, cleaned) in drive(&mut gate, 2, 12, 0) {
+            assert_eq!(
+                polls, 12,
+                "the A/B arm must reproduce the old per-layer cost"
+            );
+            assert_eq!(cleaned, 0);
+        }
     }
 
     #[test]
