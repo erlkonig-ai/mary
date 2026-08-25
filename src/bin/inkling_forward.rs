@@ -34,6 +34,7 @@
 //! | *(the sink lane)* | **gone** | was `INK_W4A16_SINKS`. No switch: the sinks are W4A16 |
 //! | *(the KV lane)* | **gone** | was `INK_FP4_KV`. No switch: the pages are NVFP4 |
 //! | `INK_ANN_HEAD` | **8192** | the approximate head, on. `0` is the exact-lane ablation |
+//! | `INK_ANN_ROT` | on | the sketch's random rotation. `0` is the raw-coordinate ablation |
 //! | `INK_TEMP` | 0.0 | sampling, as noise on the query. `0.0` is today's greedy decode exactly |
 //! | `INK_DRAFT_TOPK` | **512** | pruned by default; `0` disables, for the sweep and for `INK_MTP_PROB` |
 //! | `INK_GEMM_AUTOTUNE` | off | times a GEMM that had the whole device, which four overlapping projections do not |
@@ -1789,6 +1790,23 @@ fn ann_range() -> f32 {
                     .unwrap_or_else(|_| panic!("INK_ANN_RANGE={v:?} wants a logit window"))
             })
             .unwrap_or(12.0)
+    })
+}
+
+/// Build the sketch on RAW coordinates instead of in the rotated basis.
+///
+/// The ablation for the claim that the rotation is not optional, and it has to
+/// exist on the real table rather than only in `inkling_ann_gate`: the whole
+/// argument for rotating is about the structure of a real embedding matrix —
+/// rogue dimensions carrying disproportionate mass, error pooling on whichever
+/// tokens load them — and a synthetic table can only show that the mechanism
+/// works on a structure someone planted there on purpose.
+fn ann_rotated() -> bool {
+    static CHOSEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CHOSEN.get_or_init(|| {
+        std::env::var("INK_ANN_ROT")
+            .map(|v| v != "0")
+            .unwrap_or(true)
     })
 }
 
@@ -5623,12 +5641,18 @@ fn main() -> Result<()> {
                         p.k,
                         p.scale2,
                         ANN_SKETCH_SEED,
-                        true,
+                        ann_rotated(),
                     );
                     println!(
-                        "  unembed SIGN SKETCH built in {:.2} s: {} x {} bits = {:.3} GiB \
-                         ({:.2}x under the NVFP4 codes), {} live rows of {}, mean row norm {:.4}",
+                        "  unembed SIGN SKETCH built in {:.2} s, basis {}: {} x {} bits = \
+                         {:.3} GiB ({:.2}x under the NVFP4 codes), {} live rows of {}, \
+                         mean row norm {:.4}",
                         t0.elapsed().as_secs_f64(),
+                        if sk.rotated {
+                            "ROTATED"
+                        } else {
+                            "RAW (ablation)"
+                        },
                         sk.n,
                         sk.k,
                         sk.bytes() as f64 / GIB,
