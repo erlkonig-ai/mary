@@ -749,9 +749,53 @@ pub fn swizzle_w4a16_device<R: Runtime>(
 
 /// Whether the head/sink W4A16 weights are written in MMA-fragment order.
 ///
-/// On by default: it is bit-identical (`w4a16_swz_probe` reports max deviation
-/// 0.000e0 over 1024 outputs) and it measured faster on every rep of every run.
-/// `INK_W4A16_SWZ=0` is the A/B arm.
+/// On by default. `INK_W4A16_SWZ=0` is the A/B arm.
+///
+/// ## What it measured
+///
+/// **The kernel, alone.** `w4a16_swz_probe`, one process, four interleaved
+/// arms, first two reps discarded, per LAUNCH of one `[16, 4096] x
+/// [201024, 4096]^T` product (the unembedding's own shape at decode, `m = 1`
+/// padded to one m-tile), one GB10 box, GB/s over the weight planes only
+/// (0.431 GiB) and not over a step:
+///
+/// | arm              | p50      | GB/s  |
+/// |------------------|---------:|------:|
+/// | row-major        | 4.832 ms |  95.9 |
+/// | both planes swz  | 3.984 ms | 116.3 |
+/// | codes only swz   | 4.069 ms | 113.8 |
+/// | coalesced ceiling| 2.172 ms | 213.2 |
+///
+/// 12 warm reps of 14. The two swizzled arms are indistinguishable within
+/// their spread, so this does not establish that the scale plane's permutation
+/// is worth anything on its own; both are permuted because keeping one plane
+/// row-major would be a second layout for no measured gain.
+///
+/// **End to end.** `bench-decode.sh -n 4 --gen 12 --layers 21:42`, `INK_KV=1`,
+/// a 3720-token prompt, ctx 3732, ONE GB10 box holding layers 21..42 and the
+/// head (not the two-node pipe), arms interleaved, per DECODE STEP, p50 of 11
+/// warm passes a rep:
+///
+/// | arm       | reps (p50 each)        | p50      |
+/// |-----------|------------------------|---------:|
+/// | swz       | 55.9, 56.1, 56.1 ms    | 56.1 ms  |
+/// | row-major | 57.1, 57.2, 57.3 ms    | 57.2 ms  |
+///
+/// 1.1 ms a step, 1.9%, and the two arms' rep bands do not overlap. Eight reps
+/// were run and TWO were discarded as contended -- `swz` rep 1 and `row-major`
+/// rep 4, identified by their PREFILL, 165.5 s and 95.5 s against 14.2-15.3 s
+/// for the other six; another agent's job arrived on the box mid-run. One
+/// discard fell on each arm.
+///
+/// The gap between 17.5% on the kernel and 1.9% on the step is not a
+/// discrepancy: the head is one term of a step that also streams 5.36 GiB of
+/// attention, dense-MLP and routed-expert weight, and 1.1 ms of a 57.2 ms step
+/// is most of what a 0.85 ms kernel saving can be worth once it is enqueued
+/// against a host that is also doing everything else.
+///
+/// **Numerics.** Bit-identical, as a permutation must be: max deviation
+/// 0.000e0 over 1024 outputs of a `[16, 256] x [64, 256]^T` product against the
+/// row-major lane. Reported as an observation; there is no gate on it.
 pub fn swizzle_w4a16() -> bool {
     std::env::var("INK_W4A16_SWZ")
         .map(|v| v != "0")
