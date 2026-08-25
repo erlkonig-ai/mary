@@ -3299,7 +3299,7 @@ mod tests {
             &dev,
         );
 
-        let run = |fp4: bool| -> (bool, Vec<Tensor<B, 2>>) {
+        let run = |fp4: bool| -> (bool, Vec<Tensor<B, 2>>, AttnCache<Bk>) {
             let _lane = if fp4 {
                 super::super::kvpages::Fp4Lane::on()
             } else {
@@ -3326,17 +3326,57 @@ mod tests {
                     &mut cache,
                 ));
             }
-            (on, outs)
+            (on, outs, cache)
         };
 
-        let (dense_on, dense) = run(false);
-        let (fp4_on, narrow) = run(true);
+        let (dense_on, dense, dc) = run(false);
+        let (fp4_on, narrow, nc) = run(true);
         assert!(!dense_on, "the dense arm built an NVFP4 store");
         assert!(
             fp4_on,
             "the FP4 arm was forced on at a 1024-wide KV row and the cache is \
              still dense - this test measures nothing"
         );
+
+        // FIRST, the only comparison in this test whose bound means anything:
+        // the KV the two lanes actually END UP HOLDING, after a prefill,
+        // sixteen single-row appends into a growing page, and a materialize.
+        // If a page were reordered, or a scale read against the wrong block,
+        // this is where it shows -- and it is a statement about THIS code,
+        // unlike anything measured past the softmax.
+        for (name, a, b) in [
+            ("k", dc.k.materialize(&dev), nc.k.materialize(&dev)),
+            ("v", dc.v.materialize(&dev), nc.v.materialize(&dev)),
+        ] {
+            let a: Vec<f32> = a
+                .cast(burn::tensor::FloatDType::F32)
+                .into_data()
+                .to_vec()
+                .unwrap();
+            let b: Vec<f32> = b
+                .cast(burn::tensor::FloatDType::F32)
+                .into_data()
+                .to_vec()
+                .unwrap();
+            assert_eq!(
+                a.len(),
+                b.len(),
+                "{name}: the two lanes hold different sizes"
+            );
+            let mut w = 0f32;
+            for blk in 0..a.len() / 16 {
+                let lo = blk * 16;
+                let amax = a[lo..lo + 16].iter().fold(0.0f32, |m, x| m.max(x.abs()));
+                for i in lo..lo + 16 {
+                    w = w.max((a[i] - b[i]).abs() / amax.max(1e-6));
+                }
+            }
+            println!("cached {name} through the real path: worst {w:e} of block amax");
+            assert!(
+                w < 1.0 / 3.0 + 1.0 / 16.0,
+                "cached {name} lost {w} of its block amax - that is not the codec"
+            );
+        }
 
         let mut worst = 0f32;
         let mut worst_rms = 0f32;
