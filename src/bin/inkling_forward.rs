@@ -7967,32 +7967,50 @@ fn main() -> Result<()> {
                             // Row `j` predicts `ids[j + d + 2]`, so the last row
                             // with an answer in the prompt is `seq - d - 3`.
                             let last = seq.saturating_sub(d + 2);
+                            // Scored in contiguous blocks of `TEACH_BLOCK` rows,
+                            // spread EVENLY over the prompt rather than taken from
+                            // one end: acceptance is a property of the text, and a
+                            // document's first 2048 tokens are not its last 2048.
+                            // The cap exists because the cost is per CALL -- the
+                            // unembedding streams its whole table however many rows
+                            // it is handed -- so 8 blocks of 256 is 8 streams, and
+                            // scoring every row would be 15.
+                            const TEACH_BLOCK: usize = 256;
+                            let cap = std::env::var("INK_MTP_TEACH_MAX")
+                                .ok()
+                                .and_then(|v| v.parse::<usize>().ok())
+                                .unwrap_or(2048);
+                            let nblk = (last / TEACH_BLOCK).max(1);
+                            let take = nblk.min((cap / TEACH_BLOCK).max(1));
                             let mut hits = 0usize;
                             let mut scored = 0usize;
-                            // 128 rows a call: the unembed streams 1.65 GiB of
-                            // weight per call whatever the row count, and a
-                            // [128, 201024] f32 logits block is 103 MiB.
-                            let mut j = 0usize;
-                            while j < last {
-                                let hi = (j + 128).min(last);
-                                let picks = teach_rows(y.clone().slice([j..hi, 0..h]));
+                            for b in 0..take {
+                                let lo = if take == 1 {
+                                    0
+                                } else {
+                                    (b * (nblk - 1) / (take - 1).max(1)) * TEACH_BLOCK
+                                };
+                                let hi = (lo + TEACH_BLOCK).min(last);
+                                if hi <= lo {
+                                    continue;
+                                }
+                                let picks = teach_rows(y.clone().slice([lo..hi, 0..h]));
                                 for (i, &pick) in picks.iter().enumerate() {
-                                    if pick == ids[j + i + d + 2] {
+                                    if pick == ids[lo + i + d + 2] {
                                         hits += 1;
                                     }
                                     scored += 1;
                                 }
-                                j = hi;
                             }
-                            let (lo, hi) = wilson95(hits, scored);
+                            let (clo, chi) = wilson95(hits, scored);
                             println!(
-                                "  MTP TEACH depth {}: {hits}/{scored} = {:.4} (95% CI {:.4}-{:.4}) \
-                                 -- teacher-forced over the prompt, FULL vocab, concat {}, \
-                                 entry {}, backbone embed_norm {}",
+                                "  MTP TEACH depth {}: {hits}/{scored} = {:.4} (95% CI \
+                                 {:.4}-{:.4}) -- teacher-forced over the prompt, FULL vocab, \
+                                 concat {}, entry {}, backbone embed_norm {}",
                                 d + 1,
                                 hits as f64 / scored.max(1) as f64,
-                                lo,
-                                hi,
+                                clo,
+                                chi,
                                 mtp_order.name(),
                                 if std::env::var("INK_MTP_RAW")
                                     .map(|v| v == "1")
