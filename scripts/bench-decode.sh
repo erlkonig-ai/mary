@@ -147,6 +147,57 @@ PASSTHRU=()
 
 die() { printf '\n!! %s\n\n' "$*" >&2; exit 2; }
 
+# ---------------------------------------------------------------------------
+# THE MEMORY SETTLE, which is the idle gate's other half.
+#
+# The GPU gate answers "is anything else computing". On a UNIFIED-MEMORY part
+# that is only half the question: the weights are mmapped and the resident set
+# of one arm is most of the box, so the arm that starts while the PREVIOUS
+# arm's pages are still being reclaimed does not get a slower GPU, it gets page
+# faults -- and they land on the steady-state steps, not on the cold ones the
+# --cold discard removes. Measured on spark2-zt while writing this: an arm whose
+# twin ran at a flat 52.4 ms/step came out at 614.9 ms/step with per-step values
+# of 140, 249, 262, 298, 472, 724 and 982 ms. Nothing in the report said why,
+# and the A/B it was half of would have read as a 12x regression.
+#
+# The threshold is not a constant, because the right one is a property of the
+# model and the box: it is MemAvailable AS THE GATE FOUND IT, before any arm
+# ran. Waiting for the box to give back what it had then is the same claim as
+# "start every arm from the same state", which is what interleaving is for.
+# Linux only -- /proc/meminfo is the instrument; elsewhere it is a no-op and
+# says so once.
+MEM_BASE=""
+MEM_WARNED=0
+MEM_WAIT_MAX=${MEM_WAIT_MAX:-180}
+
+mem_avail_gib() {
+  [ -r /proc/meminfo ] || return 1
+  awk '/^MemAvailable:/ {printf "%d", int($2/1048576)}' /proc/meminfo
+}
+
+mem_settle() {
+  local arm=$1 rep=$2 have want waited=0
+  if ! have=$(mem_avail_gib); then
+    if [ "$MEM_WARNED" = "0" ]; then
+      echo "  (no /proc/meminfo: the memory settle is a no-op on this host)"
+      MEM_WARNED=1
+    fi
+    return 0
+  fi
+  [ -z "$MEM_BASE" ] && MEM_BASE=$have
+  want=$(( MEM_BASE * 95 / 100 ))
+  while [ "$have" -lt "$want" ] && [ "$waited" -lt "$MEM_WAIT_MAX" ]; do
+    sleep 5; waited=$((waited + 5)); have=$(mem_avail_gib)
+  done
+  if [ "$have" -lt "$want" ]; then
+    echo "  !! $arm rep $rep starts at ${have} GiB available against a ${MEM_BASE} GiB baseline"
+    echo "     after ${waited}s of waiting -- its steps may be paging. NOT gated."
+    GATE_FINDINGS+=("$arm rep $rep started at ${have}/${MEM_BASE} GiB available")
+  elif [ "$waited" -gt 0 ]; then
+    echo "  (waited ${waited}s for ${have} GiB of a ${MEM_BASE} GiB baseline)"
+  fi
+}
+
 # gawk, not any awk: the parsing below uses 3-argument `match` and `asort`, and
 # a mawk box would not fail loudly enough for a measurement script.
 AWK=$(command -v gawk || command -v awk)
@@ -547,6 +598,7 @@ run_rep() {
     case "$kv" in BENCH_BIN=*) ;; *) envs+=("$kv");; esac
   done
 
+  mem_settle "$arm_name" "$rep"
   printf '  %-12s rep %d ... ' "$arm_name" "$rep"
   {
     printf '# %s\n' "arm=$arm_name env=${envs[*]} bin=$abin sha256=${BIN_SHA[$abin]:-unknown} args=${PASSTHRU[*]:-}"
