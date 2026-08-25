@@ -1153,7 +1153,7 @@ use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
@@ -1182,6 +1182,121 @@ const GIB: f64 = (1u64 << 30) as f64;
 /// median. Two is not a fit: it is how many steps report a pass an order of
 /// magnitude off the median, and the third is already within 6% of it.
 const COLD_DECODE_STEPS: usize = 2;
+
+/// How long each end of an `INK_PIPE` waits for the other at the rendezvous.
+///
+/// The wire is opened AFTER the weights, and building the index takes about a
+/// minute, so whichever end arrives first is talking to a process that is not
+/// listening yet. Without a wait that is a RANK-ORDER HAZARD: the head's
+/// `connect` got `ECONNREFUSED` and the run died, so the two commands had to be
+/// started in one specific order and far enough apart. The launch scripts hide
+/// it by polling for the tail's `pipe: listening` line; a hand launch does not,
+/// and the reference implementation carries the same rule in prose ("worker
+/// rank 1 must start BEFORE head rank 0, or rank 0 exits before the
+/// rendezvous"). A minute of slack costs nothing and removes the ordering
+/// constraint entirely.
+///
+/// It is a BOUND and not an infinite wait. A wrong host, a wrong port or a
+/// firewall are misconfigurations and must still fail — the fix here is that
+/// they fail legibly, naming which end was waiting and for how long, instead of
+/// a bare "Connection refused" on one side and a process that never returns on
+/// the other. `INK_PIPE_WAIT=<seconds>` overrides it.
+fn pipe_wait() -> Duration {
+    Duration::from_secs(
+        std::env::var("INK_PIPE_WAIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(180),
+    )
+}
+
+/// Connect to the tail, retrying while it is still loading its weights.
+///
+/// Backs off 50 ms doubling to 2 s, so an immediate rendezvous costs one
+/// syscall and a slow one costs a handful of attempts a minute rather than a
+/// spin. Only the errors that mean "nobody is listening THERE YET" are retried;
+/// a name that does not resolve or an address that cannot be used fails on the
+/// first try, because waiting three minutes to repeat a typo helps nobody.
+fn pipe_connect(addr: &str, wait: Duration) -> Result<TcpStream> {
+    let t0 = Instant::now();
+    let mut backoff = Duration::from_millis(50);
+    let mut tries = 0usize;
+    loop {
+        tries += 1;
+        let err = match TcpStream::connect(addr) {
+            Ok(sock) => return Ok(sock),
+            Err(e) => e,
+        };
+        let retry = matches!(
+            err.kind(),
+            std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::TimedOut
+        );
+        let waited = t0.elapsed();
+        if !retry {
+            return Err(err).with_context(|| format!("connecting to the tail at {addr}"));
+        }
+        if waited >= wait {
+            anyhow::bail!(
+                "the head waited {:.0}s ({tries} attempts) for the tail to listen on {addr} \
+                 and it never did: {err}. Start the tail too \
+                 (INK_LAYERS=<lo>:<hi> INK_PIPE=tail:0.0.0.0:<port>), check the host and port \
+                 match, or raise INK_PIPE_WAIT (currently {}s).",
+                waited.as_secs_f32(),
+                wait.as_secs()
+            );
+        }
+        std::thread::sleep(backoff.min(wait - waited));
+        backoff = (backoff * 2).min(Duration::from_secs(2));
+    }
+}
+
+/// Accept the head, giving up rather than wedging if it never arrives.
+///
+/// `TcpListener::accept` has no deadline of its own, so the listener is put in
+/// non-blocking mode and polled. Without this a head that crashed while loading
+/// its weights left the tail sitting on a GPU forever, which on a shared box is
+/// worse than the failure it was waiting through.
+fn pipe_accept(
+    l: &TcpListener,
+    addr: &str,
+    wait: Duration,
+) -> Result<(TcpStream, std::net::SocketAddr)> {
+    let t0 = Instant::now();
+    l.set_nonblocking(true)
+        .with_context(|| format!("polling for the head on {addr}"))?;
+    loop {
+        match l.accept() {
+            Ok((sock, peer)) => {
+                // Explicitly, and not by trusting inheritance: the accepted
+                // socket's blocking mode is a platform detail and every read
+                // and write after this assumes it blocks.
+                sock.set_nonblocking(false)
+                    .with_context(|| format!("accepting the head on {addr}"))?;
+                l.set_nonblocking(false)
+                    .with_context(|| format!("accepting the head on {addr}"))?;
+                return Ok((sock, peer));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                let waited = t0.elapsed();
+                if waited >= wait {
+                    anyhow::bail!(
+                        "the tail listened on {addr} for {:.0}s and the head never connected. \
+                         Start the head too \
+                         (INK_LAYERS=<lo>:<hi> INK_PIPE=head:<this-host>:<port>), check it is \
+                         pointed at this host and port, or raise INK_PIPE_WAIT (currently {}s).",
+                        waited.as_secs_f32(),
+                        wait.as_secs()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(e).with_context(|| format!("accepting the head on {addr}")),
+        }
+    }
+}
 
 /// Bytes this process has actually pulled off the block device.
 ///
@@ -5331,13 +5446,15 @@ fn main() -> Result<()> {
 
     // The wire, opened AFTER the weights so a connection is never left hanging
     // while the other end spends a minute building its index. The tail binds and
-    // waits; the head connects, so the tail must be started first.
+    // waits; the head connects and retries while it waits. Both ends are
+    // bounded by `INK_PIPE_WAIT` — see [`pipe_wait`] for why the order the two
+    // commands are started in used to matter and no longer does.
+    let wait = pipe_wait();
     let mut pipe = match pipe_spec.as_deref() {
         Some(s) if is_head => {
             let addr = &s["head:".len()..];
             let t0 = Instant::now();
-            let sock = TcpStream::connect(addr)
-                .with_context(|| format!("connecting to the tail at {addr}"))?;
+            let sock = pipe_connect(addr, wait)?;
             sock.set_nodelay(true)?;
             println!(
                 "  pipe: connected to the tail at {addr} in {:.1}s",
@@ -5349,9 +5466,13 @@ fn main() -> Result<()> {
             let addr = &s["tail:".len()..];
             let l = TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
             println!("  pipe: listening on {addr}");
-            let (sock, peer) = l.accept()?;
+            let t0 = Instant::now();
+            let (sock, peer) = pipe_accept(&l, addr, wait)?;
             sock.set_nodelay(true)?;
-            println!("  pipe: head connected from {peer}");
+            println!(
+                "  pipe: head connected from {peer} in {:.1}s",
+                t0.elapsed().as_secs_f32()
+            );
             Some(Pipe::Tail(sock))
         }
         _ => None,
@@ -9049,4 +9170,85 @@ fn main() -> Result<()> {
     }
     println!("  wrote top-5 ids per position to {}", out_path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod pipe_tests {
+    use super::{pipe_accept, pipe_connect};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    /// A port nothing is bound to, taken by binding one and dropping it.
+    ///
+    /// Not a hardcoded number: these run in parallel with whatever else the
+    /// test binary is doing, and a fixed port is a test that fails on somebody
+    /// else's machine for a reason that has nothing to do with the code.
+    fn free_port() -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        l.local_addr().expect("bound").port()
+    }
+
+    /// The rank-order hazard itself: the head reaches the rendezvous while the
+    /// tail is still loading, and connects anyway once the tail arrives.
+    ///
+    /// This is the whole fix. Before it, the `connect` below happened once,
+    /// got `ECONNREFUSED` from a port with no listener, and killed the run —
+    /// so the two commands had to be started tail-first and far enough apart,
+    /// a rule that lived only in the launch scripts and in the reference
+    /// implementation's prose.
+    #[test]
+    fn the_head_waits_for_a_tail_that_is_not_listening_yet() {
+        let port = free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let late = addr.clone();
+        let bind_at = Instant::now() + Duration::from_millis(400);
+        let tail = std::thread::spawn(move || {
+            std::thread::sleep(bind_at.saturating_duration_since(Instant::now()));
+            let l = TcpListener::bind(&late).expect("binding late");
+            pipe_accept(&l, &late, Duration::from_secs(10)).expect("the head should arrive")
+        });
+        let t0 = Instant::now();
+        let sock = pipe_connect(&addr, Duration::from_secs(10))
+            .expect("the head should have waited for the late tail");
+        assert!(
+            t0.elapsed() >= Duration::from_millis(300),
+            "the connect did not actually wait: {:?}",
+            t0.elapsed()
+        );
+        let (peer, _) = tail.join().expect("the tail thread");
+        drop((sock, peer));
+    }
+
+    /// And it is a BOUND, not an infinite wait: a port nobody will ever listen
+    /// on still fails, naming the end that was waiting and how to change it.
+    #[test]
+    fn a_head_with_no_tail_fails_legibly_rather_than_forever() {
+        let addr = format!("127.0.0.1:{}", free_port());
+        let t0 = Instant::now();
+        let err = pipe_connect(&addr, Duration::from_millis(400))
+            .expect_err("nothing is listening there");
+        let msg = format!("{err:#}");
+        assert!(t0.elapsed() >= Duration::from_millis(400), "gave up early");
+        assert!(t0.elapsed() < Duration::from_secs(10), "overshot the bound");
+        assert!(msg.contains("the head waited"), "unhelpful: {msg}");
+        assert!(msg.contains(&addr), "does not name the address: {msg}");
+        assert!(msg.contains("INK_PIPE_WAIT"), "no way out named: {msg}");
+    }
+
+    /// The other end of the same hazard: a head that died while loading its
+    /// weights used to leave the tail holding a GPU forever.
+    #[test]
+    fn a_tail_with_no_head_fails_legibly_rather_than_forever() {
+        let l = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let addr = l.local_addr().expect("bound").to_string();
+        let t0 = Instant::now();
+        let err =
+            pipe_accept(&l, &addr, Duration::from_millis(400)).expect_err("nobody will connect");
+        let msg = format!("{err:#}");
+        assert!(t0.elapsed() >= Duration::from_millis(400), "gave up early");
+        assert!(t0.elapsed() < Duration::from_secs(10), "overshot the bound");
+        assert!(msg.contains("the tail listened"), "unhelpful: {msg}");
+        assert!(msg.contains(&addr), "does not name the address: {msg}");
+        assert!(msg.contains("INK_PIPE_WAIT"), "no way out named: {msg}");
+    }
 }

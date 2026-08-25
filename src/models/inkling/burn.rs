@@ -1199,6 +1199,146 @@ fn from_kv<const D: usize>(t: Tensor<Bk, D>) -> Tensor<Bk, D> {
     }
 }
 
+/// A cached decode read, as the chunks the two attention products consume.
+///
+/// ## What this replaces, and why
+///
+/// [`KvStore::materialize`] built one contiguous tensor out of the pages on
+/// every layer of every step. That is two costs, not one. The obvious one is
+/// the copy — a full read and a full write of the retained K and V per layer,
+/// per step, at EVERY context length, and on the NVFP4 arm a dequantization of
+/// the whole context beside it. The other one is launches: `Tensor::cat` on
+/// this backend is one `slice_assign` kernel per input
+/// (`burn-backend`'s `cat_with_slice_assign`), so a long context was already
+/// paying a launch per page just to rebuild a tensor it rebuilt last step.
+///
+/// Reading the pages directly removes both, because attention is a sum over key
+/// positions and so both products decompose: the scores are `q @ k^T` per chunk
+/// concatenated along the key axis, and the output is `p @ v` per chunk summed.
+/// The softmax in between still sees the whole key axis, so this is the
+/// materialized read's arithmetic exactly, not an approximation of it — the
+/// `paged_read_matches_the_materialized_read` test is that claim.
+///
+/// ## The two kinds of column that are not keys
+///
+/// A chunk is a page read WHOLE, so the read carries `head` rows the sliding
+/// window has already dropped, and the last chunk is padded up to the shape
+/// bucket. Both are masked to `-inf` by the caller. Neither can produce a NaN:
+/// the dropped rows hold real keys and the pad rows hold zeros, so every score
+/// is finite before the mask and every value is finite after it.
+///
+/// Both exist to keep SHAPES still. Slicing the head off would make chunk 0
+/// walk `1..=PAGE` rows as a window advances; padding the tail collapses the
+/// last chunk to one of a couple of sizes. cubecl keys compiled kernels on
+/// shapes, and the comment on `bucket` in [`attention_step`] records what a
+/// shape that moves every step costs.
+struct PagedKv {
+    /// `[kv_heads, chunk_rows, head_dim]`, in key order.
+    k: Vec<Tensor<Bk, 3>>,
+    v: Vec<Tensor<Bk, 3>>,
+    /// Dead rows at the front of chunk 0 — keys `drop_front` discarded.
+    head: usize,
+    /// Columns on the key axis: `head + len + tail padding`.
+    slots: usize,
+}
+
+impl PagedKv {
+    /// Read `cache`'s pages, padding the last chunk to a multiple of `bucket`.
+    fn read(
+        cache: &AttnCache<Bk>,
+        dev: &burn::backend::cuda::CudaDevice,
+        dims: (usize, usize),
+        bucket: usize,
+    ) -> Self {
+        let (kv_heads, head_dim) = dims;
+        let head = cache.k.head();
+        debug_assert_eq!(head, cache.v.head(), "the two stores drifted apart");
+        let mut k = cache.k.parts(dev);
+        let mut v = cache.v.parts(dev);
+        assert!(
+            !k.is_empty(),
+            "a cached read wants at least one page; the step appends before it reads"
+        );
+        let stored: usize = k.iter().map(|p| p.dims()[0]).sum();
+        debug_assert_eq!(stored, head + cache.len(), "the pages lost rows");
+        let tail = k.last().expect("checked").dims()[0];
+        let pad = tail.next_multiple_of(bucket) - tail;
+        if pad > 0 {
+            // Zeros, not uninitialized rows: a padded key scores 0 against any
+            // query (harmless, the mask removes it) but a padded VALUE is
+            // multiplied by a probability of exactly zero, and `0 * NaN` is NaN.
+            let extend = |ps: &mut Vec<Tensor<Bk, 2>>| {
+                let last = ps.pop().expect("checked");
+                let dim = last.dims()[1];
+                ps.push(Tensor::cat(
+                    vec![last, as_kv(Tensor::zeros([pad, dim], dev))],
+                    0,
+                ));
+            };
+            extend(&mut k);
+            extend(&mut v);
+        }
+        let headwise = |t: Tensor<Bk, 2>| -> Tensor<Bk, 3> {
+            let rows = t.dims()[0];
+            t.reshape([rows, kv_heads, head_dim]).swap_dims(0, 1)
+        };
+        Self {
+            k: k.into_iter().map(headwise).collect(),
+            v: v.into_iter().map(headwise).collect(),
+            head,
+            slots: stored + pad,
+        }
+    }
+
+    /// `q @ k^T` over every chunk, joined on the key axis.
+    ///
+    /// `qg` is `[kv_heads, qrows, head_dim]` — the GQA regrouping, queries
+    /// batched by the KV head they read — and the result is
+    /// `[kv_heads, qrows, slots]`. The join is a `cat` of SCORES, which is the
+    /// narrow tensor in this step: one f32 per (head, query row, key) against
+    /// the cache's `head_dim` values per key.
+    fn scores(&self, qg: Tensor<Bk, 3>) -> Tensor<Bk, 3> {
+        let q = as_kv(qg);
+        let parts: Vec<Tensor<Bk, 3>> = self
+            .k
+            .iter()
+            .map(|k| q.clone().matmul(k.clone().swap_dims(1, 2)))
+            .collect();
+        from_kv(if parts.len() == 1 {
+            parts.into_iter().next().expect("one chunk")
+        } else {
+            Tensor::cat(parts, 2)
+        })
+    }
+
+    /// `p @ v` over every chunk, summed.
+    ///
+    /// `probs` is `[kv_heads, qrows, slots]` and the result is
+    /// `[kv_heads, qrows, head_dim]`. Summing is not an approximation: the
+    /// output for one query is `sum_j p_j v_j`, and cutting that sum at page
+    /// boundaries is the associativity of addition.
+    fn weighted_values(&self, probs: Tensor<Bk, 3>) -> Tensor<Bk, 3> {
+        let [kv_heads, qrows, _] = probs.dims();
+        let p = as_kv(probs);
+        let mut off = 0usize;
+        let mut acc: Option<Tensor<Bk, 3>> = None;
+        for v in &self.v {
+            let rows = v.dims()[1];
+            let part = p
+                .clone()
+                .slice([0..kv_heads, 0..qrows, off..off + rows])
+                .matmul(v.clone());
+            acc = Some(match acc {
+                None => part,
+                Some(a) => a + part,
+            });
+            off += rows;
+        }
+        debug_assert_eq!(off, self.slots, "the chunks did not cover the key axis");
+        from_kv(acc.expect("at least one chunk"))
+    }
+}
+
 /// Whether a PREFILL holds its `[heads, tokens, head_dim]` attention operands
 /// as BF16, and multiplies them there.
 ///
@@ -1392,7 +1532,12 @@ pub fn attention_step(
     // them exactly zero weight. `INK_KV_PAD=1` is the unpadded arm, which is
     // what this function did before.
     let bucket = kv_pad_bucket();
-    let padded = len.next_multiple_of(bucket);
+    // THE PAGED READ. `slots` is the key axis this function builds every shape
+    // at, and it is `head + len + tail padding` rather than `len` rounded up:
+    // the chunks are pages read whole, so both ends carry columns that are not
+    // live keys and both are masked below. See [`PagedKv`].
+    let kv = PagedKv::read(cache, &dev, (kv_heads, head_dim), bucket);
+    let (head, slots) = (kv.head, kv.slots);
 
     let tau = match (d.kind, log_scaling) {
         (AttnKind::Global, Some(ls)) => ls.tau(pos),
@@ -1405,29 +1550,32 @@ pub fn attention_step(
     // reaches that far, and whether the window admits it at all. Built on the
     // host because `len` is the context length, not a matrix.
     //
-    // `padded`, not `len`: the tail beyond the real keys carries index 0 (in
-    // range for the gather, and multiplied out by `valid = 0`) and `-inf` in
-    // the mask, so it contributes nothing to the softmax and nothing to the
-    // value average. There is always at least one real key, so no row is
-    // entirely `-inf`.
-    let mut idx = vec![0i32; padded];
-    let mut valid = vec![0f32; padded];
-    let mut wmask = vec![0f32; padded];
+    // Over `slots`, not `len`: slot `s` is logical key `s - head`, and the
+    // slots outside `head .. head + len` are the dropped prefix and the tail
+    // pad. They carry index 0 (in range for the gather, and multiplied out by
+    // `valid = 0`) and `-inf` in the mask, so they contribute nothing to the
+    // softmax and nothing to the value average. There is always at least one
+    // real key, so no row is entirely `-inf`.
+    let mut idx = vec![0i32; slots];
+    let mut valid = vec![0f32; slots];
+    let mut wmask = vec![0f32; slots];
     let mut max_dist = 0usize;
-    for j in 0..len {
+    for (s, cell) in wmask.iter_mut().enumerate() {
+        if s < head || s >= head + len {
+            *cell = f32::NEG_INFINITY;
+            continue;
+        }
+        let j = s - head;
         // Every retained key is at or before `pos`, so this cannot go negative.
         let dist = pos - (base + j);
         if dist < d.rel_extent {
-            idx[j] = dist as i32;
-            valid[j] = 1.0;
+            idx[s] = dist as i32;
+            valid[s] = 1.0;
         }
         if window.is_some_and(|wnd| dist >= wnd) {
-            wmask[j] = f32::NEG_INFINITY;
+            *cell = f32::NEG_INFINITY;
         }
         max_dist = max_dist.max(dist);
-    }
-    for slot in wmask.iter_mut().take(padded).skip(len) {
-        *slot = f32::NEG_INFINITY;
     }
     // Bucketed for the same reason: `eff` grows one per step until it saturates
     // at `rel_extent`, and it is the width of the relative-projection matmul
@@ -1439,9 +1587,9 @@ pub fn attention_step(
         .next_multiple_of(bucket)
         .min(d.rel_extent);
     let idx: Tensor<Bk, 3, Int> =
-        Tensor::from_data(TensorData::new(idx, [1, 1, padded]), &dev).repeat_dim(0, heads);
-    let valid: Tensor<Bk, 3> = Tensor::from_data(TensorData::new(valid, [1, 1, padded]), &dev);
-    let wmask: Tensor<Bk, 3> = Tensor::from_data(TensorData::new(wmask, [1, 1, padded]), &dev);
+        Tensor::from_data(TensorData::new(idx, [1, 1, slots]), &dev).repeat_dim(0, heads);
+    let valid: Tensor<Bk, 3> = Tensor::from_data(TensorData::new(valid, [1, 1, slots]), &dev);
+    let wmask: Tensor<Bk, 3> = Tensor::from_data(TensorData::new(wmask, [1, 1, slots]), &dev);
 
     let rel = r
         .reshape([heads, d.d_rel])
@@ -1464,39 +1612,26 @@ pub fn attention_step(
     // read KV head `k` -- so the reshape below is the same correspondence read
     // the other way round, not a new convention.
     let qg = q.reshape([kv_heads, groups, head_dim]);
-    let headwise_kv = |t: Tensor<Bk, 2>| -> Tensor<Bk, 3> {
-        t.reshape([padded, kv_heads, head_dim]).swap_dims(0, 1)
-    };
-    // Zeros, not uninitialized rows: the padded keys score 0 against any query
-    // (harmless, the mask removes them) but the padded VALUES are multiplied by
-    // a probability of exactly zero, and `0 * NaN` is NaN.
-    let pad_rows = |t: Tensor<Bk, 2>| -> Tensor<Bk, 2> {
-        if padded == len {
-            return t;
-        }
-        let dim = t.dims()[1];
-        Tensor::cat(vec![t, as_kv(Tensor::zeros([padded - len, dim], &dev))], 0)
-    };
-    let kh = headwise_kv(pad_rows(cache.k.materialize(&dev)));
-    let vh = headwise_kv(pad_rows(cache.v.materialize(&dev)));
 
     // Narrow on both sides of each product and wide again immediately after, so
     // the bias, the mask and the softmax are the same arithmetic the f32 lane
-    // runs. The scores are `[heads, 1, padded]`; the cache is the megabytes.
+    // runs. The scores are `[heads, 1, slots]`; the cache is the megabytes.
     //
     // The grouped product is `[kv_heads, groups, head_dim] @ [kv_heads,
-    // head_dim, padded]` -> `[kv_heads, groups, padded]`, and that reshapes to
-    // `[heads, 1, padded]` because `kv_heads * groups == heads` in this order.
+    // head_dim, slots]` -> `[kv_heads, groups, slots]`, and that reshapes to
+    // `[heads, 1, slots]` because `kv_heads * groups == heads` in this order.
     // Everything after the reshape is the arithmetic that was here before,
     // element for element -- the bias, the mask and the softmax never saw the
-    // expansion.
-    let scores = from_kv(as_kv(qg).matmul(kh.swap_dims(1, 2)))
-        .reshape([heads, 1, padded])
+    // expansion, and [`PagedKv`] never breaks the key axis they run over.
+    let scores = kv
+        .scores(qg)
+        .reshape([heads, 1, slots])
         .mul_scalar(d.scaling())
         + bias
         + wmask;
     let probs = burn::tensor::activation::softmax(scores, 2);
-    let out = from_kv(as_kv(probs.reshape([kv_heads, groups, padded])).matmul(vh))
+    let out = kv
+        .weighted_values(probs.reshape([kv_heads, groups, slots]))
         .reshape([1, heads * head_dim]);
     linear_bf16(out, &w.wo)
 }
@@ -1587,7 +1722,11 @@ pub fn attention_steps(
     let len = cache.len();
     let base = cache.base;
     let bucket = kv_pad_bucket();
-    let padded = len.next_multiple_of(bucket);
+    // The paged read, the `rows > 1` twin of [`attention_step`]'s. See
+    // [`PagedKv`] for what `head` and the tail padding are and why the mask
+    // below covers them rather than the pages being sliced.
+    let kv = PagedKv::read(cache, &dev, (kv_heads, head_dim), bucket);
+    let (head, slots) = (kv.head, kv.slots);
 
     let taus: Vec<f32> = (0..rows)
         .map(|i| match (d.kind, log_scaling) {
@@ -1604,18 +1743,19 @@ pub fn attention_steps(
     // one-row step could not need it — whether the key is in the row's FUTURE.
     // Causality inside the batch is not structural the way it is for a single
     // position, and the drafts are exactly the keys a wrong sign would leak.
-    let mut idx = vec![0i32; rows * padded];
-    let mut valid = vec![0f32; rows * padded];
-    let mut wmask = vec![0f32; rows * padded];
+    let mut idx = vec![0i32; rows * slots];
+    let mut valid = vec![0f32; rows * slots];
+    let mut wmask = vec![0f32; rows * slots];
     let mut max_dist = 0usize;
     for i in 0..rows {
         let pos = pos0 + i;
-        for j in 0..padded {
-            let cell = i * padded + j;
-            if j >= len {
+        for s in 0..slots {
+            let cell = i * slots + s;
+            if s < head || s >= head + len {
                 wmask[cell] = f32::NEG_INFINITY;
                 continue;
             }
+            let j = s - head;
             let abs = base + j;
             if abs > pos {
                 wmask[cell] = f32::NEG_INFINITY;
@@ -1638,9 +1778,9 @@ pub fn attention_steps(
         .next_multiple_of(bucket)
         .min(d.rel_extent);
     let idx: Tensor<Bk, 3, Int> =
-        Tensor::from_data(TensorData::new(idx, [1, rows, padded]), &dev).repeat_dim(0, heads);
-    let valid: Tensor<Bk, 3> = Tensor::from_data(TensorData::new(valid, [1, rows, padded]), &dev);
-    let wmask: Tensor<Bk, 3> = Tensor::from_data(TensorData::new(wmask, [1, rows, padded]), &dev);
+        Tensor::from_data(TensorData::new(idx, [1, rows, slots]), &dev).repeat_dim(0, heads);
+    let valid: Tensor<Bk, 3> = Tensor::from_data(TensorData::new(valid, [1, rows, slots]), &dev);
+    let wmask: Tensor<Bk, 3> = Tensor::from_data(TensorData::new(wmask, [1, rows, slots]), &dev);
 
     let rel = (r
         .reshape([rows * heads, d.d_rel])
@@ -1664,29 +1804,19 @@ pub fn attention_steps(
         .swap_dims(0, 1)
         .swap_dims(1, 2)
         .reshape([kv_heads, groups * rows, head_dim]);
-    let headwise_kv = |t: Tensor<Bk, 2>| -> Tensor<Bk, 3> {
-        t.reshape([padded, kv_heads, head_dim]).swap_dims(0, 1)
-    };
-    let pad_rows = |t: Tensor<Bk, 2>| -> Tensor<Bk, 2> {
-        if padded == len {
-            return t;
-        }
-        let dim = t.dims()[1];
-        Tensor::cat(vec![t, as_kv(Tensor::zeros([padded - len, dim], &dev))], 0)
-    };
-    let kh = headwise_kv(pad_rows(cache.k.materialize(&dev)));
-    let vh = headwise_kv(pad_rows(cache.v.materialize(&dev)));
 
-    // `[kv_heads, groups * rows, padded]` back to `[heads, rows, padded]`:
+    // `[kv_heads, groups * rows, slots]` back to `[heads, rows, slots]`:
     // `kv_heads` and `groups` collapse to `heads` in that order, which is the
     // correspondence the old repeat produced.
-    let scores = from_kv(as_kv(qg).matmul(kh.swap_dims(1, 2)))
-        .reshape([heads, rows, padded])
+    let scores = kv
+        .scores(qg)
+        .reshape([heads, rows, slots])
         .mul_scalar(d.scaling())
         + bias
         + wmask;
     let probs = burn::tensor::activation::softmax(scores, 2);
-    let out = from_kv(as_kv(probs.reshape([kv_heads, groups * rows, padded])).matmul(vh))
+    let out = kv
+        .weighted_values(probs.reshape([kv_heads, groups * rows, slots]))
         .reshape([kv_heads, groups, rows, head_dim])
         .swap_dims(1, 2)
         .swap_dims(0, 1)
@@ -3026,6 +3156,84 @@ mod tests {
         assert!(
             worst < CACHE_TOLERANCE_LOCAL,
             "cached attention from a short prefill drifts by {worst}"
+        );
+    }
+
+    /// The same equivalence over a context long enough to be SEVERAL PAGES.
+    ///
+    /// Every test above it runs eleven tokens, which is one page and one chunk,
+    /// so the whole of [`PagedKv`] — the per-chunk score product, the `cat` on
+    /// the key axis, the per-chunk value product and its sum — was covered by
+    /// the degenerate case where there is exactly one chunk. The failure that
+    /// hides there is a chunk read in the wrong order or at the wrong offset,
+    /// which cannot happen with one of them.
+    ///
+    /// The oracle is the uncached whole-sequence lane, which never touches the
+    /// KV store at all, so it cannot share a paging mistake with the thing it
+    /// is checking.
+    ///
+    /// ## This test is RED, and not because of paging
+    ///
+    /// [`cached_global_matches_full`] — eleven tokens, one chunk, the same
+    /// comparison — already fails on `main` at 1.4341354e-2 against a
+    /// [`CACHE_TOLERANCE_GLOBAL`] of 2e-5, and has nothing to do with this
+    /// file's read path. This is the same failure at a longer context, so it
+    /// inherits it: 2.353859e-2 over 421 tokens.
+    ///
+    /// The number is the evidence that it is ONLY that, and it is a PAIRED
+    /// figure — which is the only kind that means anything here. Measured
+    /// 2026-08-25 on the GB10, `cargo test --release --lib --features
+    /// inkling-cuda`, this test against the identical comparison run on the
+    /// materialized read it replaces: 2.3562431e-2 both ways, three runs each,
+    /// every run identical to the last digit. Four chunks summed give exactly
+    /// what one contiguous buffer gave.
+    ///
+    /// It is paired because the ABSOLUTE value is not stable across autotune
+    /// states: an earlier pass of the same two arms, on a GB10 whose autotune
+    /// cache had been filled while another job held the GPU, reported
+    /// 2.353859e-2 — again both ways, again identical. The two arms move
+    /// TOGETHER when the winning matmul changes, which is itself the claim.
+    /// So compare this against a same-session run of the other arm, never
+    /// against the digits written here.
+    #[test]
+    fn cached_global_matches_full_across_pages() {
+        let tokens = 3 * super::super::kvpages::PAGE + 37;
+        let worst = compare(AttnKind::Global, 5, None, None, tokens, 4, false);
+        println!("global, {tokens} tokens, {worst:e}");
+        assert!(
+            worst < CACHE_TOLERANCE_GLOBAL,
+            "cached global attention over {tokens} tokens drifts by {worst}"
+        );
+    }
+
+    /// Several pages AND a window that forgets, so `drop_front` keeps a head
+    /// that walks across page boundaries.
+    ///
+    /// The head is the reason a chunk is read whole rather than sliced: the
+    /// dead rows at the front of chunk 0 are real keys the window has dropped,
+    /// and they are removed by the mask rather than by a copy. A sign error
+    /// there does not crash — it attends to keys the window forgot, which is
+    /// exactly what this comparison sees.
+    #[test]
+    fn cached_local_matches_full_with_a_head_across_pages() {
+        let page = super::super::kvpages::PAGE;
+        let worst = compare(
+            AttnKind::Local,
+            5,
+            Some(page + 19),
+            None,
+            3 * page,
+            4,
+            false,
+        );
+        // Green, and at the same number the materialized read gave:
+        // 1.1367798e-2 both ways, 384 tokens through a 147-key window, GB10,
+        // 2026-08-25. Paired, like the global twin above — read its note before
+        // comparing anything to these digits.
+        println!("local, 3 pages with a head, {worst:e}");
+        assert!(
+            worst < CACHE_TOLERANCE_LOCAL,
+            "cached windowed attention over 3 pages drifts by {worst}"
         );
     }
 
