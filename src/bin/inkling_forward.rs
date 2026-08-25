@@ -1642,13 +1642,14 @@ struct SharedOnDevice {
 ///
 /// So the budget is the only lever, and raising it is the only fix.
 ///
-/// And raising it is nearly free, which is what makes 8192 the right point
-/// rather than a cautious one. At the head's own shape (`n = 201024`, `k =
-/// 4096`, min of 18 warm launches, launch + sync, GPU idle, spark-zt) the whole
-/// lane costs 0.742 ms at budget 64 and 0.838 ms at budget 8192 — the scan is
-/// 0.74 ms of it and the rescore is the rest, because 8192 rows of NVFP4 is 20
-/// MB against the sketch's 103. Buying the last 8% of recall costs 12% of a lane
-/// that is itself 6x cheaper than the head it replaces.
+/// And raising it is FREE, which is what makes 8192 an easy choice rather than
+/// a brave one. At the head's own shape (`n = 201024`, `k = 4096`, 24 queries,
+/// min of the warm launches in one process, launch + sync, GPU idle) the whole
+/// lane costs 0.779 ms at budget 64 and 0.808 ms at budget 8192 — a 0.03 ms
+/// spread across a 128x range, against a 0.54 ms spread on the exact arm over
+/// the same four runs. The scan is the entire cost; 8192 rows of NVFP4 is 20 MB
+/// of contiguous 2 KiB rows against the sketch's 103 MB, and it vanishes into
+/// it. So the recall curve above can simply be bought outright.
 ///
 /// # What is NOT measured yet
 ///

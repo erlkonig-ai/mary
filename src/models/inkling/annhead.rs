@@ -204,19 +204,32 @@
 //! the same process. Against a load that already spends seconds opening a 171 GB
 //! pile and warming expert slabs, it does not appear.
 //!
-//! ## What the budget costs
+//! ## What the budget costs: nothing measurable
 //!
-//! Same harness and framing as the table above:
+//! Same harness and framing as the table above, 24 queries per point:
 //!
 //! ```text
-//!   budget      64   0.742 ms
-//!             1024   0.788 ms
-//!             8192   0.838 ms
+//!   budget      64   0.779 ms      (exact arm, same runs: 4.616 ms)
+//!             1024   0.829                            4.571
+//!             8192   0.808                            5.111
+//!            16384   0.816                            4.951
 //! ```
 //!
-//! So the SCAN is ~0.74 ms and the shortlist is the rest. Rescoring 8192 rows
-//! moves 20 MB of NVFP4 against the sketch's 103, and it costs what that ratio
-//! says it should.
+//! FLAT. The spread across a 256x range of budget is 0.05 ms, which is smaller
+//! than the spread on the exact arm across the same four runs (0.54 ms), so it
+//! is noise and not a trend. **The scan is the entire cost and the rescore
+//! disappears into it**, which is what the byte ratio predicts: 8192 rows of
+//! NVFP4 is 20 MB against the sketch's 103, gathered as whole contiguous 2 KiB
+//! rows.
+//!
+//! That is what makes the default budget an easy choice — the recall curve can
+//! be bought outright.
+//!
+//! An earlier version of this table read 0.742 / 0.788 / 0.838 and showed a
+//! real slope. It was measured when `cap` was `budget * 4`, so the rescore
+//! launched four times the cubes it could ever use and the "cost of the budget"
+//! was mostly the cost of retiring EMPTY ones. Sizing `cap` to the measured 1.3%
+//! overshoot removed both the slope and about 0.15 ms.
 //!
 //! # The scan is not at the ceiling, and here is the specific suspicion
 //!
