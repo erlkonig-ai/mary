@@ -472,42 +472,88 @@ run_rep() {
 
   "$AWK" -v arm="$arm_name" -v rep="$rep" -v cold="$COLD" -v tsv="$TSV" \
        -v bsha="${BIN_SHA[$abin]:-unknown}" -v bmt="${BIN_MTIME[$abin]:-unknown}" -v bpath="$abin" '
-    /WARM steps only/      { if (match($0, /\(([0-9.]+) ms\/step over ([0-9]+) steps/, mm)) { step_ms = mm[1]; wsteps = mm[2] } }
-    /WARM per TOKEN/       { if (match($0, /\(([0-9.]+) tok\/s over ([0-9]+) tokens/, tt)) { toks = tt[1]; wtokens = tt[2] } }
-    /tokens per pass/      { e_all = $NF }
-    /pass_ms [0-9]/        { if (match($0, /pass_ms ([0-9.]+)/, pm)) { n++; if (n > cold) v[++k] = pm[1] };
-                             if (match($0, /ctx ([0-9]+)/, cx)) ctx = cx[1] }
+    # TWO SOURCES, and which one exists depends on how the binary was run.
+    #
+    # `inkling_forward` prints its summary -- TOKENS/SEC, the WARM lines,
+    # tokens per pass -- inside `if acc_steps > 0 && pipe.is_some()`. A
+    # SINGLE-NODE run prints none of it. Only the per-step lines are always
+    # there, so those are the primary source and the summary is the corroborator
+    # when a pipe run supplies one. Reading only the summary would have made
+    # this script silently unable to measure the single-node lane at all.
+    /WARM steps only/ { if (match($0, /\(([0-9.]+) ms\/step over ([0-9]+) steps/, mm)) { b_step_ms = mm[1]; b_wsteps = mm[2] } }
+    /WARM per TOKEN/  { if (match($0, /\(([0-9.]+) tok\/s over ([0-9]+) tokens/, tt)) { b_toks = tt[1]; b_wtokens = tt[2] } }
+    /tokens per pass/ { e_all = $NF }
+    # `  step 7: +[42, 43]   [pass 0.1s, total 4.2s, ctx 3792, pass_ms 128.4]`
+    /pass_ms [0-9]/ {
+      n++
+      if (match($0, /pass_ms ([0-9.]+)/, pm) && n > cold) {
+        v[++k] = pm[1]; sum += pm[1]
+        # How many tokens THIS pass produced -- E is a per-pass quantity and on
+        # a speculative lane it is not 1.
+        if (match($0, /\+\[([^]]*)\]/, tk)) {
+          if (tk[1] == "") t_this = 0
+          else { t_this = split(tk[1], parts, ","); }
+          toks_sum += t_this
+        }
+      }
+      if (match($0, /ctx ([0-9]+)/, cx)) ctx = cx[1]
+    }
     END {
-      if (step_ms == "" || toks == "") { print "    !! could not parse the WARM lines -- did the run produce decode steps?"; exit 3 }
-      if (k > 0) { asort(v); med = (k % 2) ? v[int(k/2)+1] : (v[int(k/2)] + v[int(k/2)+1]) / 2 }
-      else med = -1   # every pass was discarded: --cold is >= the passes there were
-      e_warm = (wsteps > 0) ? wtokens / wsteps : 0
-      # THE GOVERNING IDENTITY. tok/s = E * 1000 / step_ms, on the same
-      # population. Three numbers that do not close are not three numbers.
-      pred = e_warm * 1000.0 / step_ms
-      err  = (toks > 0) ? 100.0 * (pred - toks) / toks : 999
-      printf "%.3f tok/s, %.1f ms/step over %d warm passes (harness median %s)\n", toks, step_ms, wsteps, (med < 0 ? "n/a -- --cold discarded every pass" : sprintf("%.1f ms", med))
-      # A median over three or four passes is a median in name only. This is a
-      # warning and not a refusal because a short run is sometimes exactly what
-      # you want -- but it must not be quoted as if it were a distribution.
+      if (k == 0) {
+        printf "    !! no warm decode passes in this rep: %d passes seen, --cold %d discards them all.\n", n, cold
+        exit 3
+      }
+      asort(v)
+      med  = (k % 2) ? v[int(k/2)+1] : (v[int(k/2)] + v[int(k/2)+1]) / 2
+      mean = sum / k
+      e_obs = toks_sum / k
+
+      if (b_step_ms != "") {
+        # Pipe run: the binary reported its own warm figures, which include the
+        # receive that the per-step line excludes. They are authoritative for
+        # this arm, and the per-step median is the corroborator.
+        src = "binary WARM lines"
+        step_ms = b_step_ms; wsteps = b_wsteps
+        toks = b_toks; e = (b_wsteps > 0) ? b_wtokens / b_wsteps : e_obs
+        checked = 1
+      } else {
+        # Single-node run: derive from the per-step lines, and be explicit that
+        # the identity is then TRUE BY CONSTRUCTION rather than checked. A check
+        # that cannot fail is not a check, and printing it as one would be the
+        # exact dishonesty the rest of this script is against.
+        src = "per-step lines (single-node: the binary prints no summary)"
+        step_ms = med; wsteps = k
+        e = e_obs; toks = e * 1000.0 / step_ms
+        checked = 0
+      }
+
+      printf "%.3f tok/s, %.1f ms/step over %d warm passes  [%s]\n", toks, step_ms, wsteps, src
       if (wsteps < 5)
-        printf "    -- note: only %d warm passes in this rep (INK_GEN minus the %d discarded). A median over that is thin; raise --gen before quoting it.\n", wsteps, cold
-      if (err > 1 || err < -1)
+        printf "    -- note: only %d warm passes (INK_GEN minus the %d discarded). A median over that is thin; raise --gen before quoting it.\n", wsteps, cold
+
+      # THE GOVERNING IDENTITY: tok/s = E * 1000 / step_ms, on one population.
+      pred = e * 1000.0 / step_ms
+      err  = (toks > 0) ? 100.0 * (pred - toks) / toks : 999
+      if (!checked)
+        printf "    -- identity: tok/s = %.3f * 1000 / %.1f = %.3f, DERIVED not checked -- this lane reports no independent tok/s.\n", e, step_ms, toks
+      else if (err > 1 || err < -1)
         printf "    !! IDENTITY FAILS: E*1000/step_ms = %.3f but the binary says %.3f tok/s (%.2f%%).\n       One of the three is from a different population. Do not quote this rep.\n", pred, toks, err
-      # A drift between E over all passes and E over the warm ones means the
-      # cold passes carried different tokens -- the discard is doing real work
-      # and a figure that mixed them would be wrong.
-      if (e_all != "" && e_warm > 0 && (e_all/e_warm > 1.01 || e_all/e_warm < 0.99))
-        printf "    -- note: tokens/pass is %.3f over all passes and %.3f over the warm ones; the cold discard matters here.\n", e_all, e_warm
-      # Cross-check of the two definitions of "warm". On a SINGLE-NODE run these
-      # measure the same thing and must agree; on a two-node pipe they do not,
-      # by construction -- the per-step line excludes the receive and the WARM
-      # figure includes it -- so a pipe run is expected to trip this and the
-      # message says so rather than pretending to have found something.
-      hm = (med > 0) ? 100.0 * (med - step_ms) / step_ms : 0
-      if (hm > 2 || hm < -2)
-        printf "    !! the harness median (%.1f ms, first %d discarded) and the binary WARM figure (%.1f ms) disagree by %.1f%%.\n       Single-node: the two definitions of \"warm\" have drifted and the number is not safe.\n       Two-node pipe: expected -- the step line excludes the receive, the WARM figure includes it.\n", med, cold, step_ms, hm
-      printf "%s\t%d\t%.4f\t%.3f\t%.4f\t%s\t%d\t%.3f\t%s\t%.3f\t%s\t%s\t%s\n", arm, rep, toks, step_ms, e_warm, e_all, wsteps, med, ctx, err, bsha, bmt, bpath >> tsv
+
+      # Mean against median over the warm passes. They differ when the
+      # distribution is skewed, which on this box means one pass got interrupted
+      # -- the thing the idle gate is for, seen from inside the run.
+      sk = 100.0 * (mean - med) / med
+      if (sk > 5 || sk < -5)
+        printf "    !! SKEW: warm passes mean %.1f ms vs median %.1f ms (%+.1f%%). At least one pass was interrupted; the gate did not see it.\n", mean, med, sk
+
+      if (e_all != "" && e > 0 && (e_all/e > 1.01 || e_all/e < 0.99))
+        printf "    -- note: tokens/pass is %.3f over all passes and %.3f over the warm ones; the cold discard matters here.\n", e_all, e
+      if (checked) {
+        hm = 100.0 * (med - step_ms) / step_ms
+        if (hm > 2 || hm < -2)
+          printf "    !! harness median %.1f ms (first %d discarded) vs binary WARM %.1f ms: %+.1f%%.\n       Two-node pipe: expected -- the step line excludes the receive, the WARM figure includes it.\n       Single node: the two definitions of \"warm\" have drifted and the number is not safe.\n", med, cold, step_ms, hm
+      }
+      printf "%s\t%d\t%.4f\t%.3f\t%.4f\t%s\t%d\t%.3f\t%s\t%.3f\t%s\t%s\t%s\n", arm, rep, toks, step_ms, e, (e_all == "" ? "-" : e_all), wsteps, med, ctx, (checked ? err : 0), bsha, bmt, bpath >> tsv
     }
   ' "$log" || printf '    !! parse failed for %s\n' "$log"
   printf '    %ds wall, %s\n' "$((t1 - t0))" "$log"
