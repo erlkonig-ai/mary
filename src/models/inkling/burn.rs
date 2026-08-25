@@ -556,8 +556,8 @@ pub struct AttnWeightsDev {
 /// position and every distance must be computed through `base`.
 #[derive(Clone)]
 pub struct AttnCache<B: Backend> {
-    k: super::kvpages::PageStore<B>,
-    v: super::kvpages::PageStore<B>,
+    k: super::kvpages::KvStore<B>,
+    v: super::kvpages::KvStore<B>,
     k_pre: Tensor<B, 2>,
     v_pre: Tensor<B, 2>,
     base: usize,
@@ -597,6 +597,17 @@ impl<B: Backend> AttnCache<B> {
     /// Absolute position of row 0.
     pub fn base(&self) -> usize {
         self.base
+    }
+
+    /// Whether this cache is holding its keys and values as NVFP4.
+    ///
+    /// The arm is chosen inside [`super::kvpages::KvStore::new`] from a switch
+    /// and a width, and neither is visible from here — so without this a test
+    /// asserting "the FP4 lane still agrees" can pass while never having built
+    /// an FP4 store at all. It is the difference between checking the claim and
+    /// checking something adjacent to it.
+    pub fn kv_is_fp4(&self) -> bool {
+        self.k.is_fp4() && self.v.is_fp4()
     }
 
     /// Keep the first `keep` of the rows the last [`attention_steps`] appended
@@ -1021,8 +1032,11 @@ fn attention_prefill_lane(
     let (mut ks, mut vs) = {
         let kk = as_kv(k);
         let vv = as_kv(v);
-        let mut ks = super::kvpages::PageStore::new(kk.dims()[1]);
-        let mut vs = super::kvpages::PageStore::new(vv.dims()[1]);
+        // The dtype is asked of the tensor rather than of `narrow_now()`: an
+        // NVFP4 store promises to hand back what it was given, and the only
+        // authority on what that is is the buffer itself.
+        let mut ks = super::kvpages::KvStore::new(kk.dims()[1], super::seam::dtype_of(&kk));
+        let mut vs = super::kvpages::KvStore::new(vv.dims()[1], super::seam::dtype_of(&vv));
         ks.append(kk);
         vs.append(vv);
         (ks, vs)
@@ -3330,6 +3344,213 @@ mod tests {
                 ),
                 rel2(c2.k_pre.clone(), c1.k_pre.clone()),
                 rel2(c2.v_pre.clone(), c1.v_pre.clone()),
+            );
+        }
+    }
+
+    /// That the NVFP4 KV path RUNS, end to end, at the real checkpoint's
+    /// attention width — and what it costs on a synthetic input.
+    ///
+    /// ## Why the engagement assertion is the load-bearing one
+    ///
+    /// Every other cached test in this module builds an 8-wide KV row
+    /// (`kv_heads: 2, head_dim: 4`), and `KvStore::new` sends anything that is
+    /// not a multiple of 64 to the DENSE arm whatever the switch says. So
+    /// running the whole module under `INK_FP4_KV=1` moved not one of them:
+    /// same failures, same drift to the last digit, every test "passing on the
+    /// FP4 lane" without an FP4 store ever being constructed. This is the only
+    /// place the four-bit path runs at all, so it says which arm it got out
+    /// loud, before it looks at a single number.
+    ///
+    /// ## Why the drift is PRINTED and not asserted
+    ///
+    /// The codec's own contract is gated where it belongs, in
+    /// `kvpages::a_real_width_bf16_row_round_trips_within_the_nvfp4_block_bound`,
+    /// and it holds at exactly the theoretical worst case: `amax / 6`, half the
+    /// gap between the two widest E2M1 magnitudes. There is nothing left for a
+    /// bound here to catch that is a property of this code.
+    ///
+    /// What a bound here WOULD encode is a claim about how far four-bit keys
+    /// and values move an attention output, and this test cannot make that
+    /// claim honestly. The input is two summed sinusoids and the weights are
+    /// more of the same; the softmax over sixteen positions of a synthetic
+    /// sequence is not the softmax over a real one, and a perturbed logit
+    /// reshuffles it by an amount that is a property of THAT distribution.
+    /// `golden/paired/` is where the question is asked, exactly as
+    /// [`attn_bf16`] says for the same reason. So this prints, with its
+    /// framing, and asserts only what it can see: that the lane produced
+    /// finite, non-degenerate output.
+    ///
+    /// ## What it prints, and the control that makes it readable
+    ///
+    /// One local layer, window 512, 5-token prefill, 16 decode steps, synthetic
+    /// sinusoidal input and weights, `[1, 4096]` output per step; worst over
+    /// the sixteen steps, against the BF16 dense cache:
+    ///
+    /// ```text
+    /// NVFP4 cache : max-abs 4.9e-1 of the dense max-abs, RMS 9.1e-1 of the dense RMS
+    /// f32   cache : max-abs 6.2e-3                     , RMS 1.0e-2
+    /// ```
+    ///
+    /// The second row is why the first is worth printing. This probe cancels
+    /// heavily in `wo`, so it amplifies ANY cache perturbation, and the FP4
+    /// figure alone cannot tell an amplifying probe from a ruinous codec. The
+    /// control is the trade [`attn_bf16`] already ships, measured the identical
+    /// way on the identical input — 1% where NVFP4 is 91%. So the probe
+    /// discriminates, and the ~88x is a real difference in kind and not an
+    /// artifact of the harness.
+    ///
+    /// Neither figure is a statement about the model. Both are one synthetic
+    /// layer, and the max-abs one is a single worst ELEMENT against the largest
+    /// element rather than a typical one — which is exactly why the RMS is
+    /// printed beside it and neither travels alone.
+    #[test]
+    fn the_fp4_cache_engages_at_real_width() {
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let d = AttnDims {
+            hidden: 4096,
+            heads: 32,
+            kv_heads: 8,
+            head_dim: 128,
+            d_rel: 16,
+            rel_extent: 1024,
+            kernel: 4,
+            rms_eps: 1e-6,
+            kind: AttnKind::Local,
+        };
+        let w = weights(&d, &dev);
+        let window = Some(512usize);
+        let (prefill, tokens) = (5usize, 21usize);
+        let xs: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(fill(tokens * d.hidden, 2.5), [tokens, d.hidden]),
+            &dev,
+        );
+
+        let run = |fp4: bool, wide: bool| -> (bool, Vec<Tensor<B, 2>>, AttnCache<Bk>) {
+            let _lane = if fp4 {
+                super::super::kvpages::Fp4Lane::on()
+            } else {
+                super::super::kvpages::Fp4Lane::off()
+            };
+            let _dt = if wide {
+                CacheLane::wide()
+            } else {
+                CacheLane::narrow()
+            };
+            let (_, mut cache) = attention_prefill(
+                xs.clone().slice([0..prefill, 0..d.hidden]),
+                &w,
+                &d,
+                None,
+                window,
+                window,
+            );
+            let on = cache.kv_is_fp4();
+            let mut outs = Vec::new();
+            for pos in prefill..tokens {
+                outs.push(attention_step(
+                    xs.clone().slice([pos..pos + 1, 0..d.hidden]),
+                    &w,
+                    &d,
+                    None,
+                    pos,
+                    window,
+                    &mut cache,
+                ));
+            }
+            (on, outs, cache)
+        };
+
+        let (dense_on, dense, dc) = run(false, false);
+        let (fp4_on, narrow, nc) = run(true, false);
+        // The control. Without it the FP4 number below has no yardstick: this
+        // probe cancels heavily in `wo`, so it amplifies ANY cache
+        // perturbation, and a reader shown only the FP4 figure cannot tell an
+        // amplifying probe from a ruinous codec. This is the SHIPPED trade --
+        // f32 cache against the BF16 one `attn_bf16` turns on by default --
+        // measured the identical way, on the identical input.
+        let (_, f32_kv, _) = run(false, true);
+        assert!(!dense_on, "the dense arm built an NVFP4 store");
+        assert!(
+            fp4_on,
+            "the FP4 arm was forced on at a 1024-wide KV row and the cache is \
+             still dense - this test measures nothing"
+        );
+
+        // FIRST, the only comparison in this test whose bound means anything:
+        // the KV the two lanes actually END UP HOLDING, after a prefill,
+        // sixteen single-row appends into a growing page, and a materialize.
+        // If a page were reordered, or a scale read against the wrong block,
+        // this is where it shows -- and it is a statement about THIS code,
+        // unlike anything measured past the softmax.
+        for (name, a, b) in [
+            ("k", dc.k.materialize(&dev), nc.k.materialize(&dev)),
+            ("v", dc.v.materialize(&dev), nc.v.materialize(&dev)),
+        ] {
+            let a: Vec<f32> = a
+                .cast(burn::tensor::FloatDType::F32)
+                .into_data()
+                .to_vec()
+                .unwrap();
+            let b: Vec<f32> = b
+                .cast(burn::tensor::FloatDType::F32)
+                .into_data()
+                .to_vec()
+                .unwrap();
+            assert_eq!(
+                a.len(),
+                b.len(),
+                "{name}: the two lanes hold different sizes"
+            );
+            let mut w = 0f32;
+            for blk in 0..a.len() / 16 {
+                let lo = blk * 16;
+                let amax = a[lo..lo + 16].iter().fold(0.0f32, |m, x| m.max(x.abs()));
+                for i in lo..lo + 16 {
+                    w = w.max((a[i] - b[i]).abs() / amax.max(1e-6));
+                }
+            }
+            println!("cached {name} through the real path: worst {w:e} of block amax");
+            assert!(
+                w < 1.0 / 3.0 + 1.0 / 16.0,
+                "cached {name} lost {w} of its block amax - that is not the codec"
+            );
+        }
+
+        let spread = |base: &[Tensor<B, 2>], other: &[Tensor<B, 2>]| -> (f32, f32) {
+            let (mut worst, mut worst_rms) = (0f32, 0f32);
+            for (a, b) in base.iter().zip(other.iter()) {
+                let scale = a.clone().abs().max().into_scalar().max(1e-6);
+                let diff = b.clone() - a.clone();
+                worst = worst.max(diff.clone().abs().max().into_scalar() / scale);
+                let rms = diff.powf_scalar(2.0).mean().sqrt().into_scalar();
+                let arms = a.clone().powf_scalar(2.0).mean().sqrt().into_scalar();
+                worst_rms = worst_rms.max(rms / arms.max(1e-6));
+            }
+            (worst, worst_rms)
+        };
+        let (worst, worst_rms) = spread(&dense, &narrow);
+        let (cw, crms) = spread(&dense, &f32_kv);
+        println!(
+            "one local layer, window 512, {prefill}-token prefill, {} decode steps, \
+             synthetic sinusoidal input, against the BF16 dense cache:\n  \
+             NVFP4 cache : worst max-abs {worst:e}, worst RMS {worst_rms:e}\n  \
+             f32 cache   : worst max-abs {cw:e}, worst RMS {crms:e}   (the SHIPPED \
+             bf16-vs-f32 trade, same probe)",
+            tokens - prefill
+        );
+
+        // What this test can actually see: the lane ran and produced usable
+        // numbers. A dequant that read the wrong scale, or a page the store
+        // reordered, does not come out slightly off — it comes out as NaN, as
+        // zeros, or as something orders of magnitude adrift.
+        for (i, b) in narrow.iter().enumerate() {
+            let m = b.clone().abs().max().into_scalar();
+            assert!(m.is_finite() && m > 0.0, "fp4 step {i} produced {m}");
+            let a = dense[i].clone().abs().max().into_scalar();
+            assert!(
+                m > a / 4.0 && m < a * 4.0,
+                "fp4 step {i} is {m} against a dense {a} — not a quantization gap"
             );
         }
     }
