@@ -1352,7 +1352,37 @@ pub fn swizzle_b_scales(src: &[u8], n: usize, k: usize) -> Vec<u8> {
 /// `swz_sc` says whether the scale plane was permuted too. Separate knob for
 /// the same reason [`fp4_linear_smem`]'s `stage_sc` is separate: they are two
 /// defects, and leaving it off measures the code permutation against an
-/// otherwise unchanged baseline.
+/// otherwise unchanged baseline. At the head shape it is worth ~2%, so the
+/// codes are nearly all of it.
+///
+/// ## Measured, against the staged arm, in one process
+///
+/// `inkling_membw INK_BW_AXES=1`, DGX Spark GB10 / sm_121a, one 1.208 GB handle
+/// (`n = 524224`, `k = 4096`, codes + scales), `m_pad = 16`, the three arms
+/// INTERLEAVED over 9 rounds and min of each — interleaved because two runs of
+/// the block-measured table minutes apart put the unstaged arm at 102.6 and
+/// 94.5 GB/s with the coalesced control at 247.7 and 237.4, i.e. the part
+/// drifts and whatever is measured last is handicapped. GB/s is the B-operand
+/// bytes over the whole kernel time, which includes the `[m_pad, n]` f32 output
+/// allocation and store; it is a per-KERNEL-LAUNCH figure, not per token or per
+/// layer.
+///
+/// ```text
+///   A  unstaged  fp4_linear            96.9 GB/s   12.461 ms   1.00x
+///   B  STAGED    fp4_linear_smem      193.2 GB/s    6.253 ms   1.99x
+///   C  PRE-PERM  fp4_linear_swz       193.6 GB/s    6.239 ms   2.00x   C/B 1.002x
+/// ```
+///
+/// So on the DENSE head the two are a tie, and the premise that a pre-permuted
+/// layout should reach the coalesced ceiling where staging reaches 87% of it is
+/// **refuted**: the coalesced control in that same run reads 222.5 GB/s and BOTH
+/// arms land at 87% of it. Whatever the remaining 13% is, it is not the B access
+/// pattern — a one-plane 32-thread cube, the MMA's own dependency chain and the
+/// output store are all still there in both.
+///
+/// The grouped lane is where they separate, because there the staged arm has a
+/// schedule to get right and this one does not; see
+/// [`super::moegroup::fp4_linear_grouped`]'s `swz` flag.
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 pub fn fp4_linear_swz<AB: Scalar, S: Scalar, NA: Size, NC: Size>(

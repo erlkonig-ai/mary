@@ -765,6 +765,59 @@ pub fn fp4_linear_grouped_launch_as<O: Scalar + Cast + CubeElement, R: Runtime>(
 /// GLOBAL read becomes a per-row contiguous stream, the cube fills shared
 /// memory cooperatively, and only the SMEM read keeps the fragment's shape.
 ///
+/// ## The third arm: don't fix the layout at runtime, store it fixed
+///
+/// The weights are STATIC, so the scattered fragment is a property of how the
+/// bytes were written down, not of what the kernel has to do. `swz` on
+/// [`fp4_linear_grouped`] reads a B operand already permuted into fragment
+/// order (`fp4gemm::swizzle_b_codes`, applied per EXPERT PLANE, so `per_expert`
+/// and every byte offset in the mapping are unchanged and the aliasing is
+/// untouched). No shared memory, no barrier, no `kc` and no `pad`.
+///
+/// `fp4_smem_probe`, DGX Spark GB10 / sm_121a, `k = n = 4096`, 114 experts,
+/// 1.002 GiB of weights = 42.8x L2, all three arms in ONE process on the same
+/// plan, min of 5. GB/s is the whole expert table over one kernel launch — per
+/// LAUNCH, not per token or per decode step. A sibling held the GPU throughout;
+/// the arms share it, and the same configuration re-measured across three runs
+/// moved by up to 14%, so treat single-cell differences under ~15% as noise and
+/// the SHAPE of each column as the result.
+///
+/// DECODE structure (1 real row an expert, one m tile each, `nrep = 1`) and
+/// PREFILL structure (64 real rows, `m_total = 7296`, `nrep = 8`), staged shown
+/// at its best `(kc, pad)` for that cell:
+///
+/// ```text
+///           ------- decode, nrep=1 -------   ------ prefill, nrep=8 ------
+///   planes   baseline  PRE-PERM    staged     baseline  PRE-PERM   staged
+///        1       93.1     190.9     195.6        100.4     158.4     38.1
+///        2      108.1     195.9     189.2         98.2     127.0     81.8
+///        4      106.9     208.6     153.5         64.7     123.6    142.7
+///        8      109.9     209.3     107.8         55.2      82.7    143.9
+/// ```
+///
+/// Peak against peak is 209.3 vs 195.6 at decode and 158.4 vs 143.9 at prefill,
+/// i.e. 1.07x and 1.10x — at that size, a tie plus drift. **The result is not
+/// the peak, it is which SCHEDULE each arm needs to reach it**, and the honest
+/// reading is narrower than "pre-permuting removes the sensitivity", which the
+/// prefill column refutes: the pre-permuted arm ranges 82.7 to 209.3 over these
+/// eight cells and is plainly not flat.
+///
+/// What it does is keep the UNSTAGED kernel's own preference instead of
+/// inverting it. Read the columns as shapes: `baseline` and `PRE-PERM` fall
+/// together as planes rise at prefill (100.4 -> 55.2 and 158.4 -> 82.7), so the
+/// pre-permuted arm is the baseline's plan, uniformly 1.3-1.9x faster. `staged`
+/// runs the other way — it needs planes to fill shared memory with, so it wants
+/// 8 where the baseline wants 1, and at 1 plane and `nrep = 8` it collapses to
+/// 38.1, which is 2.6x SLOWER than doing nothing at all.
+///
+/// The consequence is a single number rather than a schedule. Pick one plane
+/// count for both regimes and the best staging can do is 4 planes, worth
+/// (153.5, 142.7); the best pre-permuting can do is 1 plane, worth
+/// (190.9, 158.4) — ahead in BOTH, by 1.24x at decode and 1.11x at prefill.
+/// There is no fixed plane count at which staging is competitive, which is
+/// exactly why [`grouped_smem`] is off by default, and there is no need to pick
+/// a regime-dependent one for the pre-permuted arm.
+///
 /// `inkling_membw --INK_BW_AXES=1` rows 24-34 measure that mechanism on its own
 /// (the same footprint, the `mma` deleted): 115.2 GB/s unstaged against 209-226
 /// staged, i.e. 1.8-1.96x of a 2x ceiling, with the bank-conflict padding worth
