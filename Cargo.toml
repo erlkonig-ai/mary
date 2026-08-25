@@ -827,9 +827,9 @@ burn-wgpu = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a
 # Forked to add a zero-copy "register an externally-created GPU buffer as a
 # tensor handle" seam (mmap'd f16 pile pages -> Metal newBufferWithBytesNoCopy ->
 # wgpu buffer -> cubecl handle). Unmodified baseline first; patched below.
-cubecl-runtime = { path = "../cubecl-fork/cubecl-runtime" }
-cubecl-cuda = { path = "../cubecl-fork/cubecl-cuda" }
-cubecl-wgpu = { path = "../cubecl-fork/cubecl-wgpu" }
+cubecl-runtime = { path = "../cubecl-graph/cubecl-runtime" }
+cubecl-cuda = { path = "../cubecl-graph/cubecl-cuda" }
+cubecl-wgpu = { path = "../cubecl-graph/cubecl-wgpu" }
 # Local triblespace-core: V3 uniform 256-byte headers — every record 256-aligned,
 # so mmap'd blobs sit at GPU-ready offsets for zero-copy aliasing (cat-merge safe).
 triblespace-core = { path = "../triblespace-rs/triblespace-core" }
@@ -1031,4 +1031,10 @@ required-features = ["inkling-cuda"]
 # Sweeps the grid on both fp4 lanes; the column that matters is the ratio.
 [[bin]]
 name = "swz_grid_scaling"
+required-features = ["inkling-cuda"]
+
+# Does a CUDA graph capture survive cubecl's dispatch path, and what does a
+# replay cost per node? Feasibility gate for the decode-loop capture.
+[[bin]]
+name = "graph_capture_probe"
 required-features = ["inkling-cuda"]

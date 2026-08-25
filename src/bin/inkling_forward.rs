@@ -7089,6 +7089,50 @@ fn main() -> Result<()> {
     // passes would make the run's LENGTH a function of how well the drafts did.
     // The break at the bottom counts tokens and reproduces the old count
     // exactly when nothing is speculated.
+    // --- CUDA graph capture of the layer loop (`INK_GRAPH=1`) ---
+    //
+    // WHAT THIS MEASURES, and per what. On decode step `INK_GRAPH_STEP` of this
+    // run, the whole `lo..hi` layer loop is captured into a CUDA graph instead
+    // of being executed, then replayed once -- so that step's arithmetic is the
+    // ordinary arithmetic, done by the graph, into the buffers THIS PASS just
+    // allocated. `INK_GRAPH_REPS` further replays are then timed. The
+    // comparison is `t_layers` (host, enqueue-only, one node, this run) against
+    // the host cost of one replay of the identical region, measured in the same
+    // pass and against the graph's own node count. Nothing is compared across
+    // runs and no figure here is paired with one from another process.
+    //
+    // The extra replays are safe because every kernel in the region writes to a
+    // buffer distinct from its inputs -- there is no read-modify-write on the
+    // decode path -- so replaying with unchanged inputs recomputes the same
+    // values into the same places. It is idempotent, not merely harmless.
+    //
+    // WHAT IT DOES NOT SHOW: that the graph is replayable on a LATER step. It
+    // is not. A graph pins the exact device pointers seen at capture, and this
+    // pass's intermediates go back to the pool when the pass ends. Worse, the
+    // attention half is not even shape-stable: `Pages::append` re-`concat`s the
+    // KV tail page into a bigger buffer every step. Making the region
+    // replayable across steps is a separate piece of work; this measures what
+    // that work would be worth.
+    let graph_on = std::env::var("INK_GRAPH").ok().as_deref() == Some("1");
+    let graph_step: usize = std::env::var("INK_GRAPH_STEP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    let graph_reps: usize = std::env::var("INK_GRAPH_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    let mut graph_report: Option<(usize, f64, Vec<f64>)> = None;
+    // The eager baseline must come from a step that did NOT capture: on the
+    // capture step `t_layers` brackets the recording, the instantiate and every
+    // replay, so it is not the cost of running the region. This holds the last
+    // clean decode step's `t_layers`, which is the number the replay is
+    // actually being compared against.
+    let mut eager_layers: Option<f64> = None;
+    // Where a capture died. A capture that has been invalidated keeps ACCEPTING
+    // work in silence and only says so at `end`, so without a probe at each
+    // stage boundary the failure names no call.
+    let mut graph_broke: Option<(usize, &'static str)> = None;
     let mut step = 0usize;
     loop {
         // A tail's step BEGINS on the wire, and it waits before its own timers
@@ -7291,6 +7335,33 @@ fn main() -> Result<()> {
         // that no bucket names -- which is precisely what UNATTRIBUTED used to
         // swallow without saying so. A partition needs an outer edge; this is it.
         let t_ly = Instant::now();
+
+        // Capture this pass's layer loop? Only on a decode step, only once, and
+        // only after the shapes have been seen -- a first-sight pass compiles
+        // kernels (NVRTC + `cuModuleLoadData`) and tunes them, and both block
+        // the host, which is exactly what a capture cannot contain.
+        let capture_now =
+            graph_on && is_decode && graph_report.is_none() && step - prefill_passes == graph_step;
+        // The pass before the capture runs the same region with frees deferred
+        // and NO capture open, so the pools reach the region's simultaneous
+        // high-water mark by allocating in a pass where allocating is legal.
+        // Without it the capture dies partway through the third layer, on the
+        // first `cuMemAllocHost` the pinned staging pool is forced into --
+        // measured, not supposed: 28 such allocations before the failure.
+        let prewarm_now = graph_on
+            && is_decode
+            && graph_report.is_none()
+            && graph_step > 0
+            && step - prefill_passes == graph_step - 1;
+        if prewarm_now {
+            fp4_client.graph_defer_frees(true);
+        }
+        if capture_now {
+            // Drain the drop queue BEFORE the region opens. Inside a capture its
+            // flush is suppressed (it waits on a fence), so it must not be due.
+            fp4_client.flush();
+            fp4_client.graph_capture_begin();
+        }
 
         // A new pass: re-arm per-layer polling if the last pass handed anything
         // back, and drop to one poll a pass if it did not.
@@ -7739,6 +7810,12 @@ fn main() -> Result<()> {
             xd = dev_lane_resid::add_resid(xd, a);
 
             stage_sync!(d_attn, layer, "attn");
+            if capture_now
+                && graph_broke.is_none()
+                && fp4_client.graph_capture_status() != 1
+            {
+                graph_broke = Some((layer, "attn"));
+            }
             // ---- MLP ----------------------------------------------------------
             t_attn += t_a.elapsed().as_secs_f64();
             let t_o = Instant::now();
@@ -7828,6 +7905,12 @@ fn main() -> Result<()> {
                 };
                 t_rt_mm += t_rt.elapsed().as_secs_f64();
                 stage_sync!(d_router, layer, "router");
+            if capture_now
+                && graph_broke.is_none()
+                && fp4_client.graph_capture_status() != 1
+            {
+                graph_broke = Some((layer, "router"));
+            }
                 // Two lanes, and the difference is WHERE the top-k runs, not what
                 // it decides. The host lane reads `[n, rows]` f32 back and sorts;
                 // the device lane runs `routetopk` on the logits where they already
@@ -8334,6 +8417,12 @@ fn main() -> Result<()> {
                 // misattributed to whichever bucket happened to hold the readback.
                 t_expert += t_d.elapsed().as_secs_f64();
                 stage_sync!(d_expert, layer, "expert");
+            if capture_now
+                && graph_broke.is_none()
+                && fp4_client.graph_capture_status() != 1
+            {
+                graph_broke = Some((layer, "expert"));
+            }
 
                 let ns = t.n_shared_experts;
                 let t_s = Instant::now();
@@ -8377,6 +8466,12 @@ fn main() -> Result<()> {
                     }
                 };
                 stage_sync!(d_shared, layer, "shared");
+            if capture_now
+                && graph_broke.is_none()
+                && fp4_client.graph_capture_status() != 1
+            {
+                graph_broke = Some((layer, "shared"));
+            }
                 t_shared += t_s.elapsed().as_secs_f64();
                 acc + sh
             };
@@ -8427,6 +8522,12 @@ fn main() -> Result<()> {
             t_h_sconv += t_sc.elapsed().as_secs_f64();
             xd = dev_lane_resid::add_resid(xd, y);
             stage_sync!(d_tail, layer, "tail");
+            if capture_now
+                && graph_broke.is_none()
+                && fp4_client.graph_capture_status() != 1
+            {
+                graph_broke = Some((layer, "tail"));
+            }
 
             // A debug dump is a SYNC, and it is the one place left in the loop that
             // costs one. That is the trade: this path exists to compare against a
@@ -8508,8 +8609,54 @@ fn main() -> Result<()> {
                 cleanups += 1;
             }
             t_cleanup += t_cl.elapsed().as_secs_f64();
+            if capture_now && graph_broke.is_none() && fp4_client.graph_capture_status() != 1 {
+                graph_broke = Some((layer, "layer-end"));
+            }
+        }
+        if prewarm_now {
+            // Stop deferring and hand the slices back. The PAGES stay in the
+            // pool, which is the whole point: the capture that follows finds
+            // them free instead of asking CUDA for more.
+            fp4_client.graph_defer_frees(false);
+            fp4_client.flush();
+        }
+        if capture_now {
+            if let Some((l, tag)) = graph_broke {
+                println!("  GRAPH: capture invalidated at layer {l}, stage `{tag}`");
+            }
+            let g = fp4_client.graph_capture_end();
+            let nodes = fp4_client.graph_node_count(g);
+
+            // Replay ONCE, unmeasured: the capture recorded the work instead of
+            // running it, and this is what runs it. The pass is correct from
+            // here on because the pointers the graph holds are the ones this
+            // pass allocated and still owns.
+            fp4_client.graph_replay(g);
+            <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync after the first replay");
+
+            // Now the measurement: `graph_reps` further replays, each timed on
+            // its own so the spread is visible rather than averaged away. This
+            // is HOST time -- the cost of asking for the region -- which is the
+            // quantity `t_layers` also reports.
+            let mut per_rep = Vec::with_capacity(graph_reps);
+            for _ in 0..graph_reps {
+                let t = Instant::now();
+                fp4_client.graph_replay(g);
+                per_rep.push(t.elapsed().as_secs_f64() * 1e6);
+            }
+            <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync after the timed replays");
+            graph_report = Some((nodes, t_ly.elapsed().as_secs_f64(), per_rep));
         }
         let t_layers = t_ly.elapsed().as_secs_f64();
+        // The baseline must be a CLEAN decode step: not the capture pass, whose
+        // bracket holds the recording and the replays, and not the pre-warm
+        // pass either, which runs the region with frees deferred and is slower
+        // than an ordinary step by construction. Taking either would compare
+        // the replay against a number that is not the cost of running the
+        // region normally.
+        if is_decode && !capture_now && !prewarm_now {
+            eager_layers = Some(t_layers);
+        }
 
         // This slot is prefilled; seat it in the batch and let go of it. The next
         // slot starts from an empty `caches`.
@@ -10787,6 +10934,57 @@ fn main() -> Result<()> {
             "    layer loop      {:9.1}   (outer bracket; the HOST lines above are its parts)",
             ms(t_layers)
         );
+        if let Some((nodes, capture_ms, per_rep)) = graph_report.as_ref() {
+            // The framing, in the same breath as the numbers: ONE decode step of
+            // THIS run, layers `lo..hi` on THIS node, one box. `layer loop` above
+            // is the eager host cost of the region on the steps that ran it
+            // normally; `graph replay` is the host cost of asking for the SAME
+            // region once, measured in the pass that captured it. Both are host
+            // enqueue time and neither includes the device work, which surfaces
+            // in the stack sync. Per-rep values are printed because a mean
+            // without its spread is not a measurement.
+            let n = per_rep.len() as f64;
+            let mu = per_rep.iter().sum::<f64>() / n;
+            let sd = (per_rep.iter().map(|x| (x - mu).powi(2)).sum::<f64>() / n).sqrt();
+            println!(
+                "      graph nodes   {nodes:9}   (captured from this pass's {} layers)",
+                hi - lo
+            );
+            println!(
+                "      capture pass  {:9.1}   ms -- record + instantiate + one replay, paid ONCE",
+                capture_ms * 1e3
+            );
+            println!(
+                "      graph replay  {:9.4}   ms host for the whole region  (+/- {:.4}, {} reps)",
+                mu / 1e3,
+                sd / 1e3,
+                per_rep.len()
+            );
+            match eager_layers {
+                Some(eager) => {
+                    println!(
+                        "      per node      {:9.4}   us host replay   vs {:.3} us/node eager",
+                        mu / *nodes as f64,
+                        eager * 1e6 / *nodes as f64
+                    );
+                    println!(
+                        "      EAGER layer loop, last clean decode step: {:.1} ms",
+                        eager * 1e3
+                    );
+                    println!(
+                        "      host time the replay removes: {:.2} ms of {:.2} ms  ({:.0}x)",
+                        (eager * 1e3) - (mu / 1e3),
+                        eager * 1e3,
+                        (eager * 1e6) / mu.max(1e-9)
+                    );
+                }
+                None => println!(
+                    "      no clean decode step ran before the capture -- no eager baseline, \
+                     so no ratio is quoted"
+                ),
+            }
+            println!("      per-rep replay us: {per_rep:.3?}");
+        }
         println!(
             "      pool hand-back{:9.1}   ({} of {} layers cleaned; {} pool polls costing {:.1} ms -- \
              each poll is a blocking round trip to the compute-server thread, not free bookkeeping)",
