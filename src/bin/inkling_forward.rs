@@ -9728,3 +9728,52 @@ mod pipe_tests {
         assert!(msg.contains("INK_PIPE_WAIT"), "no way out named: {msg}");
     }
 }
+
+#[cfg(test)]
+mod ann_temp_tests {
+    use super::*;
+
+    /// [`normals`] really is standard normal, and really does depend on the step.
+    ///
+    /// Worth a test because `INK_TEMP` claims a PRECISE calibration — a
+    /// temperature in logit units times `pi/sqrt(6)` divided by the mean row
+    /// norm — and every term of that is exact arithmetic on the assumption that
+    /// what comes out of here has unit variance. A Box-Muller with a dropped
+    /// factor of two would still look like noise, still produce fluent text, and
+    /// silently make every stated temperature wrong by 1.41x. Nothing downstream
+    /// could catch that; this can.
+    #[test]
+    fn the_query_noise_is_standard_normal_and_moves_with_the_step() {
+        let n = 200_000;
+        let v = normals(0x5EED_1107, 7, n);
+        assert_eq!(v.len(), n);
+        let mean = v.iter().map(|x| *x as f64).sum::<f64>() / n as f64;
+        let var = v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>() / n as f64 - mean * mean;
+        // 4 standard errors at n = 200k: the mean's is 1/sqrt(n) = 0.0022 and
+        // the variance's is sqrt(2/n) = 0.0032. Loose enough not to flake,
+        // tight enough that a factor of sqrt(2) is nowhere near it.
+        assert!(mean.abs() < 0.01, "mean {mean} is not zero");
+        assert!((var - 1.0).abs() < 0.02, "variance {var} is not one");
+        // Both halves of each Box-Muller pair must be used and used correctly;
+        // a bug that returned the cosine twice would pass the moments above.
+        let odd: f64 = v
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .map(|x| (*x as f64) * (*x as f64))
+            .sum::<f64>()
+            / (n / 2) as f64;
+        assert!((odd - 1.0).abs() < 0.03, "the sine half has variance {odd}");
+
+        // Counter-based: a different step is a different draw, and the SAME
+        // step is the same draw. Both directions, because a generator that
+        // ignored `step` would give a reproducible run that never re-rolls the
+        // sketch's error -- which is the entire reason the noise is on the
+        // query.
+        let a = normals(0x5EED_1107, 7, 64);
+        let b = normals(0x5EED_1107, 8, 64);
+        let c = normals(0x5EED_1107, 7, 64);
+        assert_eq!(a, c, "the same (seed, step) drew differently");
+        assert_ne!(a, b, "consecutive steps drew the same noise");
+    }
+}
