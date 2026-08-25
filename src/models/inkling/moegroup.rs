@@ -144,9 +144,76 @@
 //! 7.05 ms/pass has roughly 2.7 ms/pass of headroom, and the mechanism that
 //! would capture it is exactly the one that is missing: staging B through
 //! shared memory so the global read is a per-row coalesced stream and only the
-//! smem read is fragment-shaped. Whether an smem round trip keeps enough of
-//! that 2x is not settled here — it is the experiment this retraction makes
-//! worth running.
+//! smem read is fragment-shaped.
+//!
+//! ## The staging, measured
+//!
+//! [`fp4_linear_grouped_smem`] is that kernel, and it survives the round trip.
+//! Every figure below is a WITHIN-PROCESS pair — this box points cubecl's
+//! autotune cache at `$CWD/target/autotune` and 58 of 64 shapes common to two
+//! worktrees name a different winner there, so a cross-worktree before/after is
+//! a comparison of two caches — spark-zt, GB10, sm_121a, best of 5 timed
+//! launches after 2 warmups, a sibling's decode benchmark sharing the GPU
+//! throughout. That last part is why the RATIOS are the claim and the levels
+//! are not: two runs of the same table came out 10% apart in absolute GB/s and
+//! within 1% on every ratio.
+//!
+//! First the mechanism alone, `inkling_membw` with `INK_BW_AXES=1` (the B
+//! footprint, `mma` deleted, rows 7 and 24-34), on one 1 GiB handle:
+//!
+//! ```text
+//!   the m16n8k64 B footprint, straight out of global      102.7-115.2 GB/s
+//!   the same footprint staged, kc=4                       209.4-211.0
+//!   staged, kc=16                                         211.9-235.1
+//!   coalesced ceiling, same bytes, same process           218.8-247.5
+//! ```
+//!
+//! Then the kernels themselves, each against its own unstaged arm:
+//!
+//! ```text
+//!                                    unstaged   staged   ratio  bit-identical
+//!   fp4_linear, head shape             95.6      189.4    1.98x   yes
+//!   (k=4096, n=201024, m_pad=16)      106.6      210.0    1.97x
+//!   fp4_linear_grouped, decode        110.5      194.6    1.76x   yes
+//!   (114 experts x 1 row, k=n=4096)
+//!   fp4_linear_grouped, prefill         84.7     112.5    1.33x   yes
+//!   (47 experts x 65 rows)
+//! ```
+//!
+//! So most of the factor of two is there. What it costs, and both answers are
+//! the opposite of what was expected:
+//!
+//! * **Shared memory costs no occupancy.** A cube stages ONE n tile — every
+//!   plane in it wants the same B, which is what the block plan is for — so at
+//!   decode the tile is 1184 B a cube against this part's ~100 KiB an SM. The
+//!   residency limit stays the thread and cube one it already was.
+//! * **The bank-conflict padding is a LOSS, not a price.** `pad = 0` leaves the
+//!   eight fragment rows on banks 0-3, an eight-way conflict, and it measured
+//!   194.0 against the conflict-free `pad = 4`'s 170.2 at the winning decode
+//!   config. The arm is bandwidth-bound, so the conflict is free and the
+//!   non-power-of-two row stride is not.
+//!
+//! What it does cost is a RETUNE of the plane count, and that is the real
+//! finding hiding under a first measurement that said 1.055x. A decode block is
+//! one m tile, so `planes - 1` of every cube's planes have no `mma`; the
+//! baseline exits them and an SM's working warps are `1536 / (32 * planes)`
+//! capped at 24. The staged arm tracks that number and the unstaged one does
+//! not:
+//!
+//! ```text
+//!   planes   working warps/SM   unstaged   staged (kc=4)
+//!      1           24            107.4       194.0
+//!      2           24            110.5       186.5
+//!      4           12            107.0       151.2
+//!      8            6             95.0        ~60
+//! ```
+//!
+//! At the shipped `INK_MOE_PLANES=4` the change is worth 1.4x; at 1 it is worth
+//! 1.8x. A prefill inverts it — `nrep = 8` makes the staged tile 64 rows and one
+//! warp cannot fill it, so 4 planes wins there (112.5 against 35.9 at one). The
+//! knob is therefore regime-dependent in a way it was not before, which is why
+//! [`grouped_smem`] is OFF by default: the kernel is ready and the schedule that
+//! goes with it is a separate decision.
 //!
 //! # How the scatter sums
 //!
@@ -536,6 +603,11 @@ pub fn fp4_linear_grouped_launch<R: Runtime>(
     k: usize,
     n: usize,
 ) -> Handle {
+    if grouped_smem() {
+        return fp4_linear_grouped_smem_launch_as::<f32, R>(
+            client, a, a_sc, wmap, wmap_bytes, blk, off, scale2, slots, m_total, k, n,
+        );
+    }
     fp4_linear_grouped_launch_as::<f32, R>(
         client, a, a_sc, wmap, wmap_bytes, blk, off, scale2, slots, m_total, k, n,
     )
@@ -565,14 +637,24 @@ pub fn fp4_linear_grouped_bf16_launch<R: Runtime>(
     k: usize,
     n: usize,
 ) -> Handle {
+    if grouped_smem() {
+        return fp4_linear_grouped_smem_launch_as::<half::bf16, R>(
+            client, a, a_sc, wmap, wmap_bytes, blk, off, scale2, slots, m_total, k, n,
+        );
+    }
     fp4_linear_grouped_launch_as::<half::bf16, R>(
         client, a, a_sc, wmap, wmap_bytes, blk, off, scale2, slots, m_total, k, n,
     )
 }
 
 /// [`fp4_linear_grouped_launch`] at a named output element type.
+///
+/// Public because it is the UNSTAGED arm by name: `fp4_linear_grouped_launch`
+/// routes through [`grouped_smem`], so a harness that wants to compare the two
+/// has to be able to ask for this one specifically or its baseline moves with
+/// an environment variable.
 #[allow(clippy::too_many_arguments)]
-fn fp4_linear_grouped_launch_as<O: Scalar + Cast + CubeElement, R: Runtime>(
+pub fn fp4_linear_grouped_launch_as<O: Scalar + Cast + CubeElement, R: Runtime>(
     client: &ComputeClient<R>,
     a: &Handle,
     a_sc: &Handle,
@@ -1033,6 +1115,23 @@ pub fn grouped_kc(k: usize) -> usize {
         kc -= 1;
     }
     kc
+}
+
+/// Whether the routed-expert lane uses the shared-memory-staged GEMM, from
+/// `INK_MOE_SMEM`.
+///
+/// Off by default. The kernel is bit-identical and measurably faster at both
+/// regimes — see the module header — but its best plane count is not the
+/// unstaged one's, and picking that per regime is a scheduling decision this
+/// flag deliberately does not make on anybody's behalf.
+pub fn grouped_smem() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var("INK_MOE_SMEM")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+    })
 }
 
 /// Padding words on the staged row stride, from `INK_MOE_PAD` (default 4).

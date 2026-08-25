@@ -43,7 +43,7 @@ use std::time::Instant;
 
 use cubecl::prelude::*;
 use mary::models::inkling::moegroup::{
-    BlockPlanDev, RowPlan, fp4_linear_grouped_launch, fp4_linear_grouped_smem_launch_tuned,
+    BlockPlanDev, RowPlan, fp4_linear_grouped_launch_as, fp4_linear_grouped_smem_launch_tuned,
     grouped_nrep,
 };
 
@@ -229,7 +229,7 @@ fn main() {
         let (bb, bf) = best_first(
             || {
                 let t0 = Instant::now();
-                let o = fp4_linear_grouped_launch::<Rt>(
+                let o = fp4_linear_grouped_launch_as::<f32, Rt>(
                     &client, &a, &a_sc, &wmap, wmap_bytes, &blk, &off_h, &sc2_h, experts, m_total,
                     k, n,
                 );
@@ -322,7 +322,7 @@ fn main() {
     let a = client.create_from_slice(&av[..a_bytes]);
     let a_sc = client.create_from_slice(&av[a_bytes..]);
     drop(av);
-    let o_base = fp4_linear_grouped_launch::<Rt>(
+    let o_base = fp4_linear_grouped_launch_as::<f32, Rt>(
         &client, &a, &a_sc, &wmap, wmap_bytes, &blk, &off_h, &sc2_h, experts, m_total, k, n,
     );
     let o_smem = fp4_linear_grouped_smem_launch_tuned::<f32, Rt>(
