@@ -30,6 +30,7 @@
 //! | `INK_DEV_ROUTE` | **ON** | same decision, computed where the logits already are |
 //! | `INK_ACT_BF16` | **ON** | the reference's own operand dtype |
 //! | `INK_DEV_PLAN` | **ON** | +8.33%, 5 of 5 interleaved pairs, and it halves the spread |
+//! | `INK_SWZ` | **ON** | the routed experts are written in MMA-fragment order by the startup copy; output identical, startup cost nil |
 //! | *(the head lane)* | **gone** | was `INK_W4A16_HEAD`. No switch: the lane is W4A16 |
 //! | *(the sink lane)* | **gone** | was `INK_W4A16_SINKS`. No switch: the sinks are W4A16 |
 //! | *(the KV lane)* | **gone** | was `INK_FP4_KV`. No switch: the pages are NVFP4 |

@@ -1498,6 +1498,44 @@ pub fn swizzleable(n: usize, k: usize) -> bool {
 /// The grouped lane is where they separate, because there the staged arm has a
 /// schedule to get right and this one does not; see
 /// [`super::moegroup::fp4_linear_grouped`]'s `swz` flag.
+///
+/// ## Wired, 2026-08-25 — and what that bought END TO END
+///
+/// The permutation is applied by [`super::pile::PileSource::copy_share`] (see
+/// [`swizzle_b_codes_into`]) and every routed-lane consumer reads it; this
+/// kernel is the per-expert FALLBACK lane's reader. So the 2x above is no
+/// longer a benchmark's property. What it is worth to a decode STEP, which
+/// nobody had measured, is a different question and the answer is: **at the
+/// single-row decode this repo benches, nothing.**
+///
+/// `scripts/bench-decode.sh -n 3 --layers 0:16 --gen 12`, DGX Spark GB10 /
+/// sm_121a, three arms in ONE worktree (`mary-swzload`) differing only by
+/// environment, interleaved, first two passes discarded, median over reps.
+/// PER DECODE STEP of a 16-layer range, ONE row wide:
+///
+/// ```text
+///   prompt          rowmajor   PRE-PERM   staged(smem,1 plane)   spread
+///   p256 (268 ctx)    48.2       47.8            47.4           0.6-1.0%
+///   cover (3744 ctx)  47.7       48.3            48.0           0.6-18%
+/// ```
+///
+/// +0.84% and -1.24%: both under the spread, i.e. not results. The reason is
+/// in the same runs' own breakdown and it is not a defect in the kernel — at
+/// this shape **the pass is HOST-ENQUEUE-BOUND**: 34.3 ms in the layer loop
+/// plus 4.7 ms after the sync against **3.9 ms blocked on the device**, of a
+/// 46 ms pass. A device kernel that is not on the critical path cannot move
+/// `pass_ms` however fast it gets, and this one did not.
+///
+/// That does not refute the 2x; it locates it. The regime the routed GEMM
+/// dominates is the BATCHED one this module's header measures — `INK_SLOTS=32`,
+/// where `fp4_linear_grouped` is 52.7% of GPU time and the head's GPU is busy
+/// 93% of the time it is not blocked. A single-row decode of sixteen layers
+/// reads 1.31 GiB of expert weight a pass, which is ~13 ms of device time
+/// hidden under 39 ms of host enqueue.
+///
+/// The output is identical: 18 reps across three arms and two prompts emitted
+/// the SAME 13 tokens each, and `gemm_grid_parity` reproduces pristine main's
+/// digests in all 20 cells.
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 pub fn fp4_linear_swz<AB: Scalar, S: Scalar, NA: Size, NC: Size>(

@@ -1209,6 +1209,30 @@ pub fn grouped_kc(k: usize) -> usize {
 /// regimes — see the module header — but its best plane count is not the
 /// unstaged one's, and picking that per regime is a scheduling decision this
 /// flag deliberately does not make on anybody's behalf.
+///
+/// # Does it survive [`swizzle_weights`]? Yes, for exactly one reason
+///
+/// Both fix the same defect and the pre-permuted arm wins on the merits: it is
+/// ahead in BOTH regimes at a single plane count (1.24x at decode, 1.11x at
+/// prefill against the best staging can do at a fixed one), it needs no `kc`
+/// and no `pad`, and it keeps the unstaged kernel's own plane preference
+/// instead of inverting it. End to end at `INK_LAYERS=0:16` the three arms tie
+/// inside the spread — 48.2 / 47.8 / 47.4 ms a step, row-major / pre-permuted /
+/// staged-at-one-plane — because that pass is host-enqueue-bound; see
+/// [`super::fp4gemm::fp4_linear_swz`].
+///
+/// What keeps this flag alive is **`INK_STARTUP_COPY=0`**. There the experts
+/// alias the pile's own file-backed mapping and are never copied, so there is
+/// nothing to permute — permuting would force the copy that flag exists to
+/// avoid — and `Weights::experts_swizzled` correctly reports false. Staging is
+/// then the ONLY way to recover the coalesced rate on that path, and it stays
+/// manual rather than being switched on automatically, because that arm is a
+/// memory-pressure reproducer and not a lane anyone should be fast on by
+/// accident.
+///
+/// It is also still the ablation: [`swizzle_weights`] yields to this function,
+/// so `INK_MOE_SMEM=1` selects staging AND leaves the arena row-major in one
+/// decision rather than two that have to agree.
 pub fn grouped_smem() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();

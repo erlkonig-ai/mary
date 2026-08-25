@@ -1547,6 +1547,15 @@ impl PileSource {
         // All-or-nothing across the share, because the consumer's flag is a
         // comptime one per kernel and a mixture would need it per expert. The
         // shapes are the stacks', so this is 2-3 questions, not 9 216.
+        //
+        // WHAT IT COSTS, measured rather than argued. Nine `bench-decode.sh`
+        // reps at `INK_LAYERS=0:16` (66.50 GiB of share, 20 threads) on a DGX
+        // Spark GB10: `fetch+verify+copy` was 14.6 / 14.7 / 14.8 s permuting
+        // against 15.0 / 15.1 / 15.9 s not permuting -- the permuting arm is
+        // FASTER by the spread, which is to say the difference is nil. This
+        // pass runs at 4.4-4.5 GiB/s and is bound by the memory system, not by
+        // the address arithmetic, so re-indexing 256-byte blocks inside it is
+        // free. Per STARTUP, once, not per token.
         let swz = super::moegroup::swizzle_weights()
             && shapes
                 .values()
