@@ -919,10 +919,60 @@ pub fn fp4_linear_grouped_smem_launch_as<O: Scalar + Cast + CubeElement, R: Runt
     assert_eq!(n % NTILE, 0);
     assert_eq!(k % KTILE, 0);
 
+    fp4_linear_grouped_smem_launch_tuned::<O, R>(
+        client,
+        a,
+        a_sc,
+        wmap,
+        wmap_bytes,
+        blk,
+        off,
+        scale2,
+        slots,
+        m_total,
+        k,
+        n,
+        grouped_kc(k),
+        grouped_pad(),
+    )
+}
+
+/// [`fp4_linear_grouped_smem_launch_as`] with the staging parameters given
+/// explicitly rather than read from the environment.
+///
+/// The tuning surface is real — `kc` and the plane count interact, and the best
+/// setting at decode is not the best at a prefill — so a harness that wants to
+/// map it needs to vary them WITHIN one process. Across processes it would be
+/// varying the autotune cache too.
+#[allow(clippy::too_many_arguments)]
+pub fn fp4_linear_grouped_smem_launch_tuned<O: Scalar + Cast + CubeElement, R: Runtime>(
+    client: &ComputeClient<R>,
+    a: &Handle,
+    a_sc: &Handle,
+    wmap: &Handle,
+    wmap_bytes: usize,
+    blk: &BlockPlanDev,
+    off: &Handle,
+    scale2: &Handle,
+    slots: usize,
+    m_total: usize,
+    k: usize,
+    n: usize,
+    kc: usize,
+    pad: usize,
+) -> Handle {
+    assert_eq!(m_total % MTILE, 0);
+    assert_eq!(n % NTILE, 0);
+    assert_eq!(k % KTILE, 0);
+    assert_eq!(
+        (k / KTILE) % kc,
+        0,
+        "k tiles {} is not a whole number of {kc}-tile chunks",
+        k / KTILE
+    );
+
     let nrep = grouped_nrep(n, m_total, blk.rows_real);
     let n_cubes = n / (NTILE * nrep);
-    let kc = grouped_kc(k);
-    let pad = grouped_pad();
     let threads = 32 * blk.planes;
 
     let out = client.empty(m_total * n * core::mem::size_of::<O>());

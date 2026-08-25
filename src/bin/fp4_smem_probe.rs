@@ -43,8 +43,8 @@ use std::time::Instant;
 
 use cubecl::prelude::*;
 use mary::models::inkling::moegroup::{
-    BlockPlanDev, RowPlan, fp4_linear_grouped_launch, fp4_linear_grouped_smem_launch_as,
-    grouped_kc, grouped_nrep, grouped_pad,
+    BlockPlanDev, RowPlan, fp4_linear_grouped_launch, fp4_linear_grouped_smem_launch_tuned,
+    grouped_nrep,
 };
 
 type Rt = cubecl::cuda::CudaRuntime;
@@ -134,21 +134,6 @@ fn main() {
     let toks: Vec<Vec<(usize, f32)>> = (0..experts)
         .map(|e| (0..rows).map(|r| (e * rows + r, 0.5f32)).collect())
         .collect();
-    let planes = RowPlan::planes();
-    let plan = RowPlan::build(toks.iter(), experts * rows, planes);
-    let m_total = plan.m_total();
-    let rows_real = plan.rows_real();
-    let blocks = plan.blk_slot.len();
-
-    let blk = BlockPlanDev {
-        slot: client.create_from_slice(&le32(&plan.blk_slot)),
-        tile0: client.create_from_slice(&le32(&plan.blk_tile0)),
-        cnt: client.create_from_slice(&le32(&plan.blk_cnt)),
-        blocks,
-        planes,
-        rows_real,
-    };
-
     // Byte offsets into the mapping, `[codes, scales]` a slot, and the
     // second-level constants.
     let off: Vec<u64> = (0..experts)
@@ -158,8 +143,172 @@ fn main() {
     let sc2: Vec<f32> = (0..experts).map(|_| 1.0f32).collect();
     let sc2_h = client.create_from_slice(&lef32(&sc2));
 
-    // The activations. Their content does not matter to a bandwidth figure and
-    // does matter to the bit comparison, so they are filled the same way.
+    let bytes = experts * per_expert;
+    println!("=== fp4_linear_grouped: global B against staged B, one process ===");
+    println!("  shape        k={k} n={n}, {experts} experts x {rows} real rows");
+    println!(
+        "  weights      {:.3} GiB, {:.1}x a 24 MiB L2",
+        bytes as f64 / (1 << 30) as f64,
+        bytes as f64 / (24.0 * 1024.0 * 1024.0)
+    );
+    println!(
+        "  every arm below reads THAT table, in this process, seconds apart; GB/s is over it\n"
+    );
+    println!("  {:<50} {:>9} {:>9} {:>9}", "arm", "GB/s", "ms", "1st ms");
+
+    let report = |label: &str, best: f64, first: f64| {
+        println!(
+            "  {:<50} {:>9.1} {:>9.3} {:>9.3}",
+            label,
+            bytes as f64 / best / 1e9,
+            best * 1e3,
+            first * 1e3
+        );
+        bytes as f64 / best / 1e9
+    };
+
+    // The plane count is a HOST-side plan parameter -- it decides how many m
+    // tiles share a cube -- so each value needs its own uploaded block plan.
+    // Every other axis is a launch parameter and varies inside one plan.
+    let planes_list: Vec<usize> = std::env::var("INK_PROBE_PLANES")
+        .ok()
+        .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![1, 2, 4, 8]);
+    let kc_list: Vec<usize> = std::env::var("INK_PROBE_KC")
+        .ok()
+        .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![4, 8, 16]);
+
+    let mut best_base = (0.0f64, String::new());
+    let mut best_smem = (0.0f64, String::new());
+    let mut checked: Option<(usize, usize, usize)> = None;
+
+    for &planes in &planes_list {
+        let plan = RowPlan::build(toks.iter(), experts * rows, planes);
+        let m_total = plan.m_total();
+        let rows_real = plan.rows_real();
+        let blocks = plan.blk_slot.len();
+        let blk = BlockPlanDev {
+            slot: client.create_from_slice(&le32(&plan.blk_slot)),
+            tile0: client.create_from_slice(&le32(&plan.blk_tile0)),
+            cnt: client.create_from_slice(&le32(&plan.blk_cnt)),
+            blocks,
+            planes,
+            rows_real,
+        };
+        let nrep = grouped_nrep(n, m_total, rows_real);
+        // The stacked A, at this plan's height. `m_total` does not actually
+        // depend on the plane count -- padding is per expert, not per cube --
+        // but deriving it here rather than assuming that is one fewer thing to
+        // be wrong about.
+        let a_bytes = m_total * (k / 2);
+        let asc_bytes = m_total * (k / 16);
+        let mut av = vec![0u8; a_bytes + asc_bytes];
+        for (i, b) in av.iter_mut().enumerate() {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let byte = (s >> 33) as u8;
+            *b = if i >= a_bytes { byte & 0x6f } else { byte };
+        }
+        let a = client.create_from_slice(&av[..a_bytes]);
+        let a_sc = client.create_from_slice(&av[a_bytes..]);
+        drop(av);
+
+        // How many warps an SM can actually put to work. This part gives an SM
+        // 1536 threads and at most 24 cubes, and a decode block is ONE m tile,
+        // so `planes - 1` of every cube's planes have no `mma` to do: the
+        // baseline exits them and the staged arm keeps them for the fill. It is
+        // the axis the numbers below turn out to move with, so it is printed.
+        let cubes_sm = (1536 / (32 * planes)).min(24);
+        println!(
+            "  -- {planes} planes/cube: m_total {m_total} ({rows_real} real), {blocks} blocks, nrep {nrep}, {cubes_sm} cubes/SM, {} working warps/SM",
+            cubes_sm
+        );
+
+        let (bb, bf) = best_first(
+            || {
+                let t0 = Instant::now();
+                let o = fp4_linear_grouped_launch::<Rt>(
+                    &client, &a, &a_sc, &wmap, wmap_bytes, &blk, &off_h, &sc2_h, experts, m_total,
+                    k, n,
+                );
+                let _ = cubecl::future::block_on(client.sync());
+                let dt = t0.elapsed().as_secs_f64();
+                drop(o);
+                dt
+            },
+            reps,
+        );
+        let g = report(
+            &format!("baseline  B out of global, {planes} planes"),
+            bb,
+            bf,
+        );
+        if g > best_base.0 {
+            best_base = (g, format!("{planes} planes"));
+        }
+
+        for &kc in &kc_list {
+            if (k / 64) % kc != 0 {
+                continue;
+            }
+            for &pad in &[4usize, 0usize] {
+                let staged_rows = 8 * nrep;
+                let smem = staged_rows * (kc * 8 + pad) * 4 + staged_rows * (kc + 1) * 4;
+                let (sb, sf) = best_first(
+                    || {
+                        let t0 = Instant::now();
+                        let o = fp4_linear_grouped_smem_launch_tuned::<f32, Rt>(
+                            &client, &a, &a_sc, &wmap, wmap_bytes, &blk, &off_h, &sc2_h, experts,
+                            m_total, k, n, kc, pad,
+                        );
+                        let _ = cubecl::future::block_on(client.sync());
+                        let dt = t0.elapsed().as_secs_f64();
+                        drop(o);
+                        dt
+                    },
+                    reps,
+                );
+                let tag = format!("staged    kc={kc} pad={pad}, {planes} planes  [{smem} B smem]");
+                let g = report(&tag, sb, sf);
+                if g > best_smem.0 {
+                    best_smem = (g, format!("kc={kc} pad={pad} {planes} planes"));
+                    checked = Some((planes, kc, pad));
+                }
+            }
+        }
+        println!();
+    }
+
+    println!(
+        "  best baseline {:.1} GB/s ({}), best staged {:.1} GB/s ({}): {:.3}x",
+        best_base.0,
+        best_base.1,
+        best_smem.0,
+        best_smem.1,
+        best_smem.0 / best_base.0
+    );
+
+    // ---- the bit comparison, at the winning configuration ------------------
+    //
+    // The staged kernel changes WHERE the B fragment is read from and nothing
+    // else -- the same `execute_scaled` calls, in the same k order, on the same
+    // operands -- so the two arms must agree BIT FOR BIT. Anything less is a
+    // defect in the staging, not a rounding difference.
+    let (planes, kc, pad) = checked.expect("no staged configuration ran");
+    let plan = RowPlan::build(toks.iter(), experts * rows, planes);
+    let m_total = plan.m_total();
+    let rows_real = plan.rows_real();
+    let blocks = plan.blk_slot.len();
+    let blk = BlockPlanDev {
+        slot: client.create_from_slice(&le32(&plan.blk_slot)),
+        tile0: client.create_from_slice(&le32(&plan.blk_tile0)),
+        cnt: client.create_from_slice(&le32(&plan.blk_cnt)),
+        blocks,
+        planes,
+        rows_real,
+    };
     let a_bytes = m_total * (k / 2);
     let asc_bytes = m_total * (k / 16);
     let mut av = vec![0u8; a_bytes + asc_bytes];
@@ -173,90 +322,21 @@ fn main() {
     let a = client.create_from_slice(&av[..a_bytes]);
     let a_sc = client.create_from_slice(&av[a_bytes..]);
     drop(av);
-
-    let nrep = grouped_nrep(n, m_total, rows_real);
-    let kc = grouped_kc(k);
-    let pad = grouped_pad();
-    let staged_rows = 8 * nrep;
-    let smem = staged_rows * (kc * 8 + pad) * 4 + staged_rows * (kc + 1) * 4;
-    // The weight bytes ONE pass over the layer reads: every active expert's
-    // whole plane, once. That is the denominator every GB/s below uses.
-    let bytes = experts * per_expert;
-
-    println!("=== fp4_linear_grouped: global B against staged B, one process ===");
-    println!("  shape        k={k} n={n}, {experts} experts x {rows} real rows");
-    println!(
-        "  stacked      m_total {m_total} ({rows_real} real), {blocks} blocks, {planes} planes/cube, nrep {nrep}"
-    );
-    println!(
-        "  weights      {:.3} GiB, {:.1}x a 24 MiB L2",
-        bytes as f64 / (1 << 30) as f64,
-        bytes as f64 / (24.0 * 1024.0 * 1024.0)
-    );
-    println!("  staging      kc={kc} k tiles, pad={pad} words, {smem} B smem/cube");
-    println!("  {:<44} {:>9} {:>9} {:>9}", "arm", "GB/s", "ms", "1st ms");
-
-    let report = |label: &str, best: f64, first: f64| {
-        println!(
-            "  {:<44} {:>9.1} {:>9.3} {:>9.3}",
-            label,
-            bytes as f64 / best / 1e9,
-            best * 1e3,
-            first * 1e3
-        );
-    };
-
-    let (bb, bf) = best_first(
-        || {
-            let t0 = Instant::now();
-            let o = fp4_linear_grouped_launch::<Rt>(
-                &client, &a, &a_sc, &wmap, wmap_bytes, &blk, &off_h, &sc2_h, experts, m_total, k, n,
-            );
-            let _ = cubecl::future::block_on(client.sync());
-            let dt = t0.elapsed().as_secs_f64();
-            drop(o);
-            dt
-        },
-        reps,
-    );
-    report("baseline   B straight out of global", bb, bf);
-
-    let (sb, sf) = best_first(
-        || {
-            let t0 = Instant::now();
-            let o = fp4_linear_grouped_smem_launch_as::<f32, Rt>(
-                &client, &a, &a_sc, &wmap, wmap_bytes, &blk, &off_h, &sc2_h, experts, m_total, k, n,
-            );
-            let _ = cubecl::future::block_on(client.sync());
-            let dt = t0.elapsed().as_secs_f64();
-            drop(o);
-            dt
-        },
-        reps,
-    );
-    report("staged     B through shared memory", sb, sf);
-
-    println!("\n  staged / baseline: {:.3}x", bb / sb);
-
-    // ---- the bit comparison ------------------------------------------------
     let o_base = fp4_linear_grouped_launch::<Rt>(
         &client, &a, &a_sc, &wmap, wmap_bytes, &blk, &off_h, &sc2_h, experts, m_total, k, n,
     );
-    let o_smem = fp4_linear_grouped_smem_launch_as::<f32, Rt>(
-        &client, &a, &a_sc, &wmap, wmap_bytes, &blk, &off_h, &sc2_h, experts, m_total, k, n,
+    let o_smem = fp4_linear_grouped_smem_launch_tuned::<f32, Rt>(
+        &client, &a, &a_sc, &wmap, wmap_bytes, &blk, &off_h, &sc2_h, experts, m_total, k, n, kc,
+        pad,
     );
     let vb = client.read_one(o_base).expect("read the baseline output");
     let vs = client.read_one(o_smem).expect("read the staged output");
     assert_eq!(vb.len(), vs.len(), "the two arms disagree on output size");
     let diff = vb.iter().zip(vs.iter()).filter(|(x, y)| x != y).count();
-    // Padding rows are not part of the answer -- the scatter never reads them --
-    // but they ARE written by both arms, so they are compared too and a
-    // difference there would still be a defect in the staging.
     println!(
-        "  bit equality: {} of {} output bytes differ ({} f32 elements over {m_total} x {n})",
+        "  bit equality at kc={kc} pad={pad} {planes} planes: {} of {} output bytes differ",
         diff,
-        vb.len(),
-        vb.len() / 4
+        vb.len()
     );
     assert_eq!(
         diff, 0,
