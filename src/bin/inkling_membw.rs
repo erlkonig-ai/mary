@@ -480,7 +480,11 @@ fn run_axes() -> Result<()> {
     // code plane is the requested size, and is a multiple of 64 so that the
     // fragment grid is a whole number of 256-thread blocks.
     let k = 4096usize;
-    let n = (((gib * GIB) as usize / (k / 2)) / 64) * 64;
+    // A multiple of 64 so the fragment grid is a whole number of 256-thread
+    // blocks, and `n / NTILE <= 65535` so the real kernel below accepts the
+    // same table -- it has to be the SAME table, or the row that anchors this
+    // whole matrix is measuring a different problem.
+    let n = ((((gib * GIB) as usize / (k / 2)) / 64) * 64).min(524224);
     let codes_b = n * (k / 2);
     let scales_b = n * (k / 16);
 
@@ -689,6 +693,60 @@ fn run_axes() -> Result<()> {
             reps,
         );
         report(label, bytes, b, f);
+    }
+
+    // ---- row 15: the kernel itself, on the same table, in the same process --
+    //
+    // Rows 7-14 are a MODEL of what `fp4_linear_grouped` reads, and a model is
+    // only worth its agreement with the thing modelled. `fp4_linear` is that
+    // thing: the grouped kernel is line for line this one plus an expert
+    // offset, so its B loads and its k loop are identical, and at `m_pad = 16`
+    // it is the decode case -- one m tile, no reuse to find. It reads the SAME
+    // 1 GiB handle rows 1-14 read, on the same bus, seconds apart.
+    //
+    // Its time includes the launcher's own `[m_pad, n]` f32 output allocation
+    // and the store into it, which rows 7-14 do not pay; both are printed
+    // below so the comparison can be made net of them.
+    {
+        use mary::models::inkling::fp4gemm::fp4_linear_launch;
+        let m_pad = 16usize;
+        let qa = client.empty(m_pad * k / 2);
+        let qa_sc = client.empty(m_pad * (k / 16));
+        let bytes = codes_b + scales_b;
+        let (b, f) = best_first(
+            || {
+                let t0 = Instant::now();
+                let o = fp4_linear_launch::<Rt>(&client, &qa, &qa_sc, &big, &sc, m_pad, k, n, 1.0);
+                let _ = cubecl::future::block_on(client.sync());
+                let dt = t0.elapsed().as_secs_f64();
+                drop(o);
+                dt
+            },
+            reps,
+        );
+        report(
+            "15 fp4_linear ITSELF, m_pad=16 (the decode case)",
+            bytes,
+            b,
+            f,
+        );
+        let (ab, af) = best_first(
+            || {
+                let t0 = Instant::now();
+                let h = client.empty(m_pad * n * 4);
+                let _ = cubecl::future::block_on(client.sync());
+                let dt = t0.elapsed().as_secs_f64();
+                drop(h);
+                dt
+            },
+            reps,
+        );
+        println!(
+            "     of which output alloc + sync {:.3} ms, so the read alone is {:.1} GB/s",
+            ab * 1e3,
+            bytes as f64 / (b - ab) / 1e9
+        );
+        let _ = af;
     }
 
     Ok(())
