@@ -27,6 +27,33 @@
 //! Timing only: the kernels read the same bytes in a different ORDER, so an
 //! uninitialised table exercises the identical access pattern. Correctness of
 //! the permutation is `fp4gemm`'s own gate, not this one's.
+//!
+//! # What it measured (GB10, sm_121a, 2026-08-25, `m_pad = 16`, weight table
+//! # only, pipelined over rotating buffers — same framing rule as
+//! # `w4a16_shape_sweep`)
+//!
+//! The answer is BOTH, and the ratio degrades exactly where the grid is worst:
+//!
+//!   k=4096   512 cubes   88.4 -> 143.2 GB/s   1.62x
+//!            1024 cubes  98.7 -> 178.5        1.81x
+//!           25128 cubes 111.9 -> 205.2        1.83x
+//!   k=2048   512 cubes   87.0 -> 118.8        1.37x   <- the down shape
+//!           25128 cubes 117.1 -> 206.2        1.76x
+//!
+//! So the permutation is NOT wasted on a small launch — it is worth 1.37-1.62x
+//! there. But it is worth less than the 1.83x it is worth at the head, and it
+//! does not close the grid gap: after permuting, the down shape sits at 118.8
+//! against the head's 206.2, still 1.74x short, because 512 warps is 512 warps
+//! whatever layout they read. The two axes are largely independent and they
+//! MULTIPLY. Fixing either alone leaves most of the other on the table.
+//!
+//! CAVEAT, and it is not small: this sweeps the W4A4 `fp4_linear` pair, because
+//! that is where the permutation is implemented. The sinks run the W4A16
+//! `w4a16gemm` lane, which loads one `u32` word plus one E4M3 scale per fragment
+//! element group rather than a packed pair. The GRID conclusion transfers
+//! unchanged — identical `CubeCount`, identical `CubeDim`, so identical warp
+//! count — but the permutation MULTIPLIER for w4a16 has not been measured and
+//! should not be assumed to be these numbers.
 
 use std::time::Instant;
 

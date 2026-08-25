@@ -44,6 +44,47 @@
 //!   must show GB/s CLIMBING as `k` grows) and a concurrency limit (flat).
 //! * split vs fused on the REAL sink shapes: 14 and 28 launches against one
 //!   launch of identical total cubes and identical total bytes.
+//!
+//! # What it measured (GB10, sm_121a, 2026-08-25; two runs, 4-5 sibling
+//! # processes on the GPU throughout)
+//!
+//! FRAMING RULE for every figure below: GB/s is over the WEIGHT TABLE ONLY
+//! (packed codes + E4M3 block scales) of ONE GEMM, at `m_pad = 16` — the decode
+//! case, one m-tile — timed as `REPS` pipelined launches over rotating buffers
+//! and divided. It is not per decode step and not per pass. Absolute rates moved
+//! ~10% between the two runs because the box was shared; every RATIO below
+//! reproduced, and ratios are what the conclusions rest on.
+//!
+//! The rate is a smooth saturating function of CUBE COUNT and of almost nothing
+//! else. At `k = 2048`: 384 cubes 62, 768 cubes 86, 1152 cubes 94, 2304 cubes
+//! 102, 6144 cubes 101-110, 24576 cubes 107-120 GB/s. No sawtooth at any
+//! multiple of a resident wave (~1152 single-warp cubes on 48 SMs) and still
+//! climbing at 21 waves, so this is NOT wave quantisation — it is a fill.
+//!
+//! The `split-k emulation` rows are the proof, because they hold the bytes
+//! EXACTLY constant and move only the grid:
+//!
+//!   down    4.5 MiB:   512 cubes  67-73 GB/s  ->  4096 cubes  97-110  (1.34-1.57x)
+//!   gate_up  18 MiB:  1024 cubes  78-88 GB/s  ->  8192 cubes 113-118  (1.34-1.46x)
+//!
+//! Identical bytes, up to 1.57x less time. That is the exact converse of the
+//! result this investigation started from.
+//!
+//! Two candidates died here:
+//!
+//! * **Per-launch overhead is not it.** At FIXED cube count the rate does not
+//!   climb with `k` — 512 cubes reads 58, 71, 74, 58, 46, 45, 45 GB/s as `k`
+//!   goes 1024..65536, i.e. flat then falling. A fixed `t0` would force it to
+//!   climb toward the asymptote over a 64x range of bytes. Independently, the
+//!   LIBRARY arm — which calls `client.empty` on every one of the 42 calls, as
+//!   the real stack does — is not slower than the pre-allocated arm at all; the
+//!   allocator is pooled and the tax is at or below zero.
+//! * **The host launch path is real but small.** `w4a16_linear` at 8 cubes and
+//!   4.5 KiB, where no device work is left to hide behind, costs 23.68-23.76 us
+//!   per launch (very stable across runs) against the null kernel's 7.2 us —
+//!   four tensor args instead of one. 42 of those is ~1.0 ms, and it is hidden
+//!   whenever launches are pipelined, which is why `split` and `fused` differ by
+//!   1.5x rather than by 42 x 24 us.
 
 use std::time::Instant;
 
