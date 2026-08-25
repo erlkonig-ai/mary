@@ -13,11 +13,25 @@
 //! on that element and invisible in an aggregate norm.
 //!
 //! The only place the two lanes can legitimately part is a *tie*: the device
-//! divides in f32, the host in f64, so a quotient that lands within ~6e-8 of
-//! an E2M1 decision boundary (or a scale within ~6e-8 of an E4M3 midpoint) can
-//! fall either way. This binary counts those near-boundary cases explicitly, so
-//! a mismatch can be attributed rather than papered over. It does not loosen
-//! the gate.
+//! forms the quotient in f32 as `x * fl(1/s)` — one multiply against a hoisted
+//! reciprocal, so two roundings — where the host divides in f64, so a quotient
+//! that lands within ~1e-7 of an E2M1 decision boundary (or a scale within
+//! ~6e-8 of an E4M3 midpoint) can fall either way. This binary counts those
+//! near-boundary cases explicitly, so a mismatch can be attributed rather than
+//! papered over. It does not loosen the gate. On the real rows below the count
+//! is **zero**, which is what makes the hoisted reciprocal a free win rather
+//! than a traded one.
+//!
+//! ## The reference is the hardware's rounding rule, not ours
+//!
+//! The codes come from the GB10's `cvt.rn.satfinite.e2m1x2.f32`, so this host
+//! reference implements *its* rule and not the one the seven-comparison ladder
+//! used to run: round to nearest with **ties to the even code** (where `>=`
+//! sent a tie away from zero), and the **sign bit** carries the sign (where
+//! `t < 0.0` dropped the sign of `-0.0`). Both are the format's own semantics —
+//! E2M1 has a signed zero, code `0x8`, and the checkpoint's own rows are full
+//! of it — so matching the instruction is matching every other producer in this
+//! format, not accommodating ours.
 //!
 //! ## Bit-identity is not the whole claim
 //!
@@ -58,10 +72,9 @@
 //!   That is what actually gates the packing claim ("byte-identical on
 //!   little-endian to the checkpoint's `e2m1x2` rows"): comparing this kernel's
 //!   packer against this gate's unpacker would agree even if both had the
-//!   nibble order backwards. Blocks containing the `0x8` (`-0.0`) code are
-//!   excluded and counted — `-0.0` is not negative under `< 0.0`, so the
-//!   quantizer emits `0x0` for it, which is the same number and a different
-//!   byte.
+//!   nibble order backwards. Blocks containing the `0x8` (`-0.0`) code used to
+//!   be excluded, because the old ladder emitted `0x0` for `-0.0`; the hardware
+//!   conversion keeps the sign, so they are now compared like any other.
 //!
 //! Build: `--features cuda-backend,inkling`
 //! Run:   `fp4quant_gate [<checkpoint dir>]`
@@ -338,16 +351,27 @@ fn host_quantize(x: &[f32], ladder: &[f64]) -> HostOut {
                 let t = v / s;
                 let a = t.abs();
                 for (j, &thr) in E2M1_MIDPOINTS.iter().enumerate() {
-                    if a >= thr {
-                        m = j as u32 + 1;
+                    let hi = j as u32 + 1;
+                    // Ties to the EVEN code, which is what
+                    // `cvt.rn.satfinite.e2m1x2.f32` does. Only four of the
+                    // seven midpoints actually discriminate: at `0.75`, `1.75`
+                    // and `3.5` the higher code is already the even one, so
+                    // `>` and `>=` agree there.
+                    if a > thr || (a == thr && hi.is_multiple_of(2)) {
+                        m = hi;
                     }
                     if ((a - thr) / thr).abs() < 1e-6 {
                         code_near_ties += 1;
                     }
                 }
-                if t < 0.0 {
-                    m += 8;
-                }
+            }
+            // Sign from the SIGN BIT, not from `t < 0.0`: E2M1 has a signed
+            // zero (code `0x8`) and the instruction keeps it, so `-0.0` encodes
+            // to `0x8` rather than `0x0`. This is not a detail of ours — the
+            // checkpoint's own rows carry `0x8` codes, so it is what every
+            // producer in this format does.
+            if (x[base + i]).is_sign_negative() {
+                m += 8;
             }
             let g = base + i;
             codes[g / 8] |= m << (4 * (g % 8));
@@ -798,14 +822,21 @@ fn sweep(src: &[f32], ladder: &[f64], client: &cubecl::client::ComputeClient<Cud
 /// largest code is `±6` (`6*bs` fits in f32, `(6*bs)/6` is exactly `bs`, `bs`
 /// is already an E4M3 value, `x/bs` is exactly an E2M1 value), so the eight
 /// packed bytes the kernel writes must be the eight bytes the checkpoint
-/// stores, and the scale byte must be the checkpoint's scale byte. Blocks whose
-/// largest code is smaller (the quantizer legitimately rescales those) and
-/// blocks containing the `0x8` negative-zero code are skipped, and counted.
+/// stores, and the scale byte must be the checkpoint's scale byte. Only blocks
+/// whose largest code is smaller are skipped, and counted — the quantizer
+/// legitimately rescales those.
+///
+/// Blocks containing the `0x8` negative-zero code used to be skipped too,
+/// because the seven-comparison ladder this quantizer ran encoded `-0.0` as
+/// `0x0` (`-0.0 < 0.0` is false) and so could not reproduce the checkpoint's
+/// byte. `cvt.rn.satfinite.e2m1x2.f32` keeps the sign of zero, as the
+/// checkpoint's own producer did, so those blocks now qualify: the exclusion was
+/// a symptom of our encoder, not a property of the data, and dropping it makes
+/// this a strictly stronger check.
 fn check_layout_against_checkpoint(w: &[Row], rows: usize, k: usize, v: &Verdict) -> bool {
     let per_row = k / GROUP;
     let mut checked = 0usize;
     let mut skipped_range = 0usize;
-    let mut skipped_negzero = 0usize;
     let mut byte_mismatch = 0usize;
     let mut scale_mismatch = 0usize;
     let mut first: Option<String> = None;
@@ -814,12 +845,8 @@ fn check_layout_against_checkpoint(w: &[Row], rows: usize, k: usize, v: &Verdict
         for b in 0..per_row {
             let src = &w[i].packed[b * 8..b * 8 + 8];
             let mut maxmag = 0u8;
-            let mut has_negzero = false;
             for &byte in src {
                 for c in [byte & 0x0F, byte >> 4] {
-                    if c == 0x8 {
-                        has_negzero = true;
-                    }
                     let mag = c & 0x7;
                     if mag > maxmag {
                         maxmag = mag;
@@ -829,10 +856,6 @@ fn check_layout_against_checkpoint(w: &[Row], rows: usize, k: usize, v: &Verdict
             if maxmag != 7 {
                 // 7 is the code for magnitude 6.0 — the top of the E2M1 range.
                 skipped_range += 1;
-                continue;
-            }
-            if has_negzero {
-                skipped_negzero += 1;
                 continue;
             }
             let blk = i * per_row + b;
@@ -861,9 +884,8 @@ fn check_layout_against_checkpoint(w: &[Row], rows: usize, k: usize, v: &Verdict
          peak is code 7, which is exactly why the bytes cannot match and why the block is \
          excluded here; the peak-code distribution of the quantizer's own output is the \
          `block-scale invariant` line in each case above).\n  \
-         skipped {skipped_negzero}: contain the 0x8 negative-zero code.\n  \
          packed 8-byte groups differing: {byte_mismatch}   scale bytes differing: {scale_mismatch}",
-        checked + skipped_range + skipped_negzero
+        checked + skipped_range
     );
     if let Some(f) = first {
         println!("    first: {f}");

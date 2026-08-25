@@ -59,6 +59,68 @@
 //! `ptxas` solely as a modifier of the block-scaled MMA that *consumes* a
 //! scale. The E4M3 scale byte is already one `F2FP.SATFINITE.E4M3`.
 //!
+//! #### "…not for f16, or through a different instruction family?"
+//!
+//! Asked and answered against `ptxas` 13.0.88 rather than the ISA doc, which
+//! disagrees with it on this chip. **No** — and the reason is structural, not a
+//! missing spelling.
+//!
+//! * `redux` is 32-bit-**integer**-only on every architecture:
+//!   `redux.sync.max.{u16,u64,f16,bf16}` all give "Unexpected instruction types
+//!   specified for 'redux'". Even where the float form exists it is `.f32`.
+//! * `redux.sync.max.f32` is a **die-family** gap, not a suffix gap. It
+//!   assembles on `sm_100a`/`sm_103a` (→ `CREDUX.MAX.F32`) and is rejected with
+//!   the identical string on `sm_120a`, `sm_121`, `sm_121a` *and* `sm_121f`.
+//!   GB10 does not have the unit. (The `a`/`f`/plain suffix turned out to be
+//!   load-bearing for *nothing* in this probe set — unlike the block-scaled MMA
+//!   above, every instruction tested behaved the same on all three.)
+//! * `redux`'s SASS form has **no member-mask operand**, so it cannot be cheaply
+//!   restricted to 16 lanes: a non-constant mask makes `ptxas` wrap it in
+//!   `BSSY.RECONVERGENT`/`WARPSYNC.EXCLUSIVE`/`BSYNC`, and two constant
+//!   half-masks produce full warp divergence plus duplicated out-of-line
+//!   `WARPSYNC.COLLECTIVE … ENDCOLLECTIVE` blocks. The right tool for a 16-lane
+//!   subgroup is `shfl.sync.bfly.b32` with `c = 0x101f`, which encodes directly.
+//! * There **are** two families with an f16/bf16 max where the f32 form is
+//!   flatly rejected — `red/atom.global.max.noftz.v2.{f16,bf16}` →
+//!   `REDG.E.MAX.{F16x2,BF16x2}.RN`, and
+//!   `cp.reduce.async.bulk…bulk_group.max.{f16,bf16}` →
+//!   `UBLKRED.G.S.MAX.{F16,BF16}.RN` (where `.add.f32` is accepted and
+//!   `.max.f32` is not). Both are **element-wise memory** reductions,
+//!   `dst[i] = max(dst[i], src[i])`, not horizontal ones. They are the right
+//!   primitive for a cross-CTA running amax — a tensor-wide scale — and cannot
+//!   collapse a 16-element block to a scalar.
+//! * The SIMD video family is emulated and worse: `vmax2` is 7 SASS
+//!   instructions, `vmax4` 19–28. The one near-native member is
+//!   `vabsdiff4.u32` (3). `max.{s16x2,u16x2}` *is* native (`VIMNMX.S16x2`), but
+//!   needs a sign-clear per operand and loses to `FMNMX`.
+//!
+//! **Every reduction unit on GB10 is cross-lane** (`REDUX`, `SHFL`, `ATOM`,
+//! `UBLKRED`); none of them reduces one thread's own registers. A thread
+//! reducing its own sixteen is always a tree of two-input ops — and that is a
+//! feature of this layout, not a tax on it. A `redux` is one instruction per 32
+//! *elements*; one `FMNMX` in the one-thread-per-block layout is one
+//! instruction per 32 independent *blocks*. Costed in warp-instruction slots
+//! per 16-element block: the f32 `FMNMX` tree is 0.47 and a bf16
+//! `HMNMX2.XORSIGN` tree 0.34, against 4.5 for a 16-thread `shfl.bfly` tree and
+//! ~13.5 for split-mask `redux` — **~10× worse**, before counting that the
+//! loads drop from `LDG.E.256` to `LDG.E.32`.
+//!
+//! The one real SIMD win is `max.xorsign.abs.{f16x2,bf16x2}` →
+//! `HMNMX2[.BF16_V2].XORSIGN R, |Ra|, |Rb|`, a genuine one-instruction max of
+//! two absolute-value pairs: 11 instructions for a 16-element bf16 amax against
+//! 15 for the f32 tree, and bit-exact (the max of a set of bf16 values is one of
+//! them). It is **not** reachable for `quantize_nvfp4_bf16` as written, because
+//! that kernel must widen all sixteen elements to f32 anyway to form the
+//! quotients the E2M1 conversion consumes — the widening is shared with the
+//! amax, so keeping the amax in bf16 would save only the 15→11 on the tree, not
+//! the widening. Multiplying in bf16 to avoid it would put ~2^-9 of relative
+//! error on a quotient compared against E2M1 midpoints, which is three orders of
+//! magnitude too coarse.
+//!
+//! In f32 the abs is free regardless: `FMNMX` takes an `|src|` operand modifier
+//! on **both** inputs, which is why writing the amax as `max(|a|, |b|)` rather
+//! than a compare-and-select is worth ~16 instructions on its own.
+//!
 //! ### Measured against the kernel itself
 //!
 //! Framing rule: static SASS instruction count for one thread = one 16-element
@@ -70,18 +132,32 @@
 //!
 //! | variant                                            | instr | regs |
 //! | -------------------------------------------------- | ----- | ---- |
-//! | as generated today                                 |   747 |   33 |
-//! | + hoisted reciprocal, `__nv_cvt_float_to_fp4`      |   397 |   32 |
-//! | + amax as `fmaxf(a, fabsf(v))` instead of two `if` |   350 |   32 |
+//! | as generated before the rewrite                    |   747 |   33 |
+//! | projected: hoisted reciprocal + `__nv_cvt_float_to_fp4` | 397 | 32 |
+//! | projected: + amax as `fmaxf(a, fabsf(v))`          |   350 |   32 |
+//! | **landed** (all three, plus vectorized loads)      | **302** |   |
 //!
 //! The 397 line replaces 17 `FCHK`+`CALL` pairs (the full-precision divide
 //! slow path — CubeCL emits `x / scale` per element *and* `amax / 6.0`) and
 //! 130 of 166 `FSETP` plus 110 of 115 `SEL` (the seven-midpoint ladder) with
 //! 16 more `F2FP`. The 350 line is not a hardware win at all: it is the amax
 //! written as a max rather than a compare-and-select, worth 47 instructions.
-//! A packed `__nv_cvt_float2_to_fp4x2` would fold the 16 `F2FP` into 8 and
-//! needs CubeCL's `Vector<e2m1x2, N>`; the 16 scalar `LDG` are untouched by
-//! any of this and are the obvious next lever.
+//!
+//! All three landed in `fp4quant` and beat the projection, because the packed
+//! `__nv_cvt_float2_to_fp4x2` folds those 16 `F2FP` into 8 and the 16 scalar
+//! `LDG` — the lever this survey named and did not pull — collapse into 2
+//! `LDG.E.256`. **Split the landed number before quoting it**: 170 of the 302
+//! are the straight-line body and 132 are the out-of-line correctly-rounded
+//! division helper `ptxas` plants behind an `FCHK`, which is I-cache and not
+//! issue slots. Body only: **660 → 170** on the f32 lane and **741 → 195** on
+//! the BF16 one. The helper *grew* (87 → 132) because `amax / 6` and `1.0 / s`
+//! are two differently-shaped divides, where the old kernel's seventeen were all
+//! the same shape and shared one routine.
+//!
+//! CubeCL reaches the packed instruction as
+//! `Vector::reinterpret(Vector::<e2m1x2, N>::cast_from(v))` — the spelling its
+//! own `runtime_tests::minifloat` uses — and the pair order is little-endian,
+//! first element in the low nibble, which is already the NVFP4 packing order.
 //!
 //! ### The tie difference, measured
 //!
@@ -98,6 +174,16 @@
 //! On data deliberately drawn from a coarse dyadic grid, so quotients land on
 //! midpoints often, 2.211% of codes differ, every one of them by exactly one
 //! E2M1 step, and the scale byte never differs.
+//!
+//! Landing it made the `-0.0` line the interesting one, not the ties: on the
+//! real `w13_weight` rows `fp4quant_gate` reported **zero** tie divergences and
+//! ~2500 sign-of-zero ones, because those rows are full of the `0x8` code. The
+//! resolution was to move the host reference to the hardware's rule rather than
+//! the reverse — E2M1 *has* a signed zero, the checkpoint's own producer emits
+//! it, and our ladder was the outlier. The gate then went bit-identical, and
+//! **stronger**: the layout case had been skipping 1010 blocks precisely because
+//! they contained `0x8` codes our encoder could not reproduce, so the comparison
+//! against the checkpoint's own bytes went from 1429 blocks to 2439.
 
 use cubecl::features::TypeUsage;
 use cubecl::prelude::*;
@@ -174,9 +260,12 @@ fn main() {
     println!("  1.3  -> {}   (round-to-nearest E2M1 is 1.5)", got[0]);
     println!("  -0.4 -> {}   (round-to-nearest E2M1 is -0.5)", got[1]);
 
-    // Launch the production quantizer once, so a `CUBECL_DEBUG_OPTION=source`
-    // run of this binary emits the CUDA that `fp4quant` actually compiles.
-    // Reading the re-creation of a kernel is not reading the kernel.
+    // Launch the production quantizer once at EACH element type, so a
+    // `CUBECL_DEBUG_OPTION=source` run of this binary emits the CUDA that
+    // `fp4quant` actually compiles. Reading the re-creation of a kernel is not
+    // reading the kernel — and the BF16 entry point is not the f32 one
+    // recompiled: its load is half as wide, so the instruction the memory side
+    // costs is a different instruction.
     let rows = 1usize;
     let k = 64usize;
     let dense: Vec<f32> = (0..rows * k).map(|i| (i as f32) * 0.01 - 0.3).collect();
@@ -188,5 +277,19 @@ fn main() {
         "\nfp4quant::quantize_nvfp4 on {rows}x{k}: {} code words, {} scale bytes",
         cb.len() / 4,
         sb.len()
+    );
+
+    let dense_bf: Vec<half::bf16> = dense.iter().map(|v| half::bf16::from_f32(*v)).collect();
+    let xbh = client.create_from_slice(half::bf16::as_bytes(&dense_bf));
+    let (codes_b, scales_b) =
+        mary::models::inkling::fp4quant::quantize_nvfp4_bf16(&client, &xbh, rows, k);
+    let cbb = client.read_one(codes_b).expect("read the BF16 codes");
+    let sbb = client
+        .read_one(scales_b)
+        .expect("read the BF16 scale bytes");
+    println!(
+        "fp4quant::quantize_nvfp4_bf16 on {rows}x{k}: {} code words, {} scale bytes",
+        cbb.len() / 4,
+        sbb.len()
     );
 }
