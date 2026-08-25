@@ -279,45 +279,64 @@ pub fn w4a16_linear_launch<R: Runtime>(
 }
 
 // ---------------------------------------------------------------------------
-// The same product, with the three things the SASS said were wrong.
+// The same product with more warps and wider loads — kept because it MEASURED
+// SLOWER, which is the useful part.
 //
-// `w4a16_linear` above is one 32-thread cube per 16x8 output tile. On GB10
-// `cudaDevAttrMaxBlocksPerMultiprocessor` is 24 and a warp slot count of 48, so
-// a one-warp cube caps residency at 24 warps of 48 -- 50% occupancy that no
-// register budget can recover (it uses 40 registers; 51 blocks' worth would
-// fit). And its K loop is not unrolled, so a warp has exactly one k-tile of
-// weight fetch outstanding at a time, behind which sit 154 SASS instructions of
-// address arithmetic, bounds clamping and nibble expansion.
+// The starting suspicion was residency and memory-level parallelism.
+// `w4a16_linear` above is one 32-thread cube per 16x8 output tile; on GB10
+// `cudaDevAttrMaxBlocksPerMultiprocessor` is 24 against 48 warp slots, so a
+// one-warp cube caps residency at 50% and no register budget can recover it (it
+// uses 40 registers; 51 blocks' worth would fit). Its K loop is not unrolled
+// either, so a warp has one k-tile of weight fetch outstanding at a time behind
+// 154 SASS instructions of address arithmetic, bounds clamping and nibble
+// expansion.
 //
-// The evidence that the 154 is NOT the binding constraint is `fp4gemm`'s
-// `fp4_linear`: it runs the hardware block-scaled MMA, needs no software
-// dequantisation at all, and executes 12 416 instructions per warp over the
-// head's K against this kernel's 39 424 -- 3.2x fewer -- for 4.31 ms against
-// 4.53. Instruction count moved by 3.2x and time moved by 5%. So the fix is
-// not fewer instructions; it is more warps and more fetches in flight.
+// This variant changes three things: `PLANES` planes per cube instead of one, a
+// single 16-byte `LDG.E.128` covering both k-tiles of a step (a lane's two B
+// words for k-tile `t` are packed indices `kbase/8` and `kbase/8 + 1`, and the
+// next k-tile's are `+2` and `+3`, which at a 32-aligned `kbase` are four
+// contiguous aligned words), and one scale byte per k-tile where the original
+// loads the same byte twice. It is 269 SASS instructions per two k-tiles
+// against 154 per one — 13% fewer per k-tile — at the same 40 registers.
 //
-// Three changes, each independently checkable:
+// Measured at the head's own shape (m_pad 16, k 4096, n 201024, 0.431 GiB of
+// codes + scales, min of four warm launches, launch + sync, GB10, GPU
+// otherwise idle), against `w4a16_linear` in the same process:
 //
-// * **Planes per cube.** `CubeDim::new_2d(32, PLANES)` with a plane per n-tile.
-//   At `PLANES = 4` the block limit stops binding and the register budget takes
-//   over: 40 x 128 = 5120 registers a cube, 12 cubes an SM, 48 warps -- full
-//   residency.
-// * **Two k-tiles per iteration, one 16-byte load.** A lane's two B words for
-//   k-tile `t` are at packed indices `kbase/8` and `kbase/8 + 1`, and the next
-//   k-tile's are `+2` and `+3`. When `kbase` is a multiple of 32 those four
-//   words are 16 aligned contiguous bytes, so ONE `LDG.E.128` replaces four
-//   `LDG.E.32` and the second k-tile's fetch is already in a register when the
-//   first MMA issues.
-// * **One scale byte per k-tile, not two.** Both fragment halves of a k-tile
-//   resolve to the same `gc / GROUP`, which the original loads twice.
+// ```text
+//   PLANES   wide         original    verdict
+//   1        4.95 ms      4.97 ms     wider loads and 13% fewer instructions: nothing
+//   4        5.27-5.35    4.66-4.74   more warps: 13% WORSE
+//   8        5.32-6.76    4.81-4.91   more warps still: 10-38% WORSE
+// ```
 //
-// A is left alone deliberately: at `m_pad = 16` it is 128 KiB, L2-resident, and
-// re-read by every cube. It is 4 of the 8 loads and the reason to fix it is
-// tile reuse, not width -- a separate change with a separate measurement.
+// So this lane is not instruction-bound and not occupancy-bound. The
+// corroborating measurement is `fp4gemm::fp4_linear`, which runs the hardware
+// block-scaled MMA and needs no software dequantisation at all: 12 416
+// instructions per warp over the head's K against this kernel's 39 424, 3.2x
+// fewer, for 4.53 ms against 4.66. Instruction count moved 3.2x and time moved
+// 3%.
+//
+// What is left is the access pattern itself. Every warp owns eight weight rows
+// and consumes 32 bytes from each before advancing, so the memory system sees
+// 32-byte reads 2048 bytes apart, thousands of warps deep — and adding warps
+// adds streams, which is why more planes made it worse. A fully coalesced read
+// of the SAME 0.431 GiB in the same process runs at 158-172 GB/s against these
+// kernels' 98-106. The gap is coalescing, and coalescing needs a cooperative
+// stage through shared memory, which is exactly what one warp per output tile
+// forecloses. `fp4gemm`'s module header says "a fancier tiling would not change
+// that"; at the ROUTED-EXPERT shape it measures right (`fp4_linear_grouped`
+// reaches 171 GB/s, at the ceiling), and at THIS shape it does not.
+//
+// A is left alone throughout: at `m_pad = 16` it is 128 KiB, L2-resident, and
+// re-read by every cube.
 
-/// Planes per cube. 4 x 32 = 128 threads, which at 40 registers a thread is 12
-/// cubes and all 48 warp slots on an SM.
-pub const PLANES: u32 = 4;
+/// Planes per cube. At 4 the block limit stops binding and the register budget
+/// takes over — 40 x 128 = 5120 registers a cube, 12 cubes an SM, all 48 warp
+/// slots — and the lane gets 13% SLOWER for it. Left at 1 because that is what
+/// measured best; the constant stays so the experiment can be re-run by
+/// changing one character.
+pub const PLANES: u32 = 1;
 /// K covered by one loop iteration: two `m16n8k16` steps, one 16-byte B load.
 pub const KSTEP: usize = 2 * KTILE;
 /// Packed `u32` words one lane fetches per iteration.
