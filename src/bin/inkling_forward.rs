@@ -33,6 +33,9 @@
 //! | *(the head lane)* | **gone** | was `INK_W4A16_HEAD`. No switch: the lane is W4A16 |
 //! | *(the sink lane)* | **gone** | was `INK_W4A16_SINKS`. No switch: the sinks are W4A16 |
 //! | *(the KV lane)* | **gone** | was `INK_FP4_KV`. No switch: the pages are NVFP4 |
+//! | `INK_ANN_HEAD` | **8192** | the approximate head, on. `0` is the exact-lane ablation |
+//! | `INK_ANN_ROT` | on | the sketch's random rotation. `0` is the raw-coordinate ablation |
+//! | `INK_TEMP` | 0.0 | sampling, as noise on the query. `0.0` is today's greedy decode exactly |
 //! | `INK_DRAFT_TOPK` | **512** | pruned by default; `0` disables, for the sweep and for `INK_MTP_PROB` |
 //! | `INK_GEMM_AUTOTUNE` | off | times a GEMM that had the whole device, which four overlapping projections do not |
 //! | `INK_DENSE_WEIGHTS=device` | off | faster, but costs 3.42 GiB at 0:15 and REFUSES ranges that run today |
@@ -1900,6 +1903,94 @@ struct SharedOnDevice {
     down: Vec<dev_lane::ProjW>,
 }
 
+/// Shortlist rows the approximate head rescores exactly when `INK_ANN_HEAD` is
+/// not set.
+///
+/// # Why 8192, and what was measured to pick it
+///
+/// Recall against the EXACT head, on the hidden states a real prompt produced,
+/// 65 decode steps per arm, `INK_ANN_VERIFY=1`, layers 0:4, spark-zt:
+///
+/// ```text
+///   budget    recall@1   mean |exact - approx| at the winner
+///       64      0.6615   0.5198 logits
+///      256      0.8923   0.2612
+///     1024      0.9231   0.2719
+///     4096      0.9846   0.0616
+///     8192      1.0000   0.0000
+///    16384      1.0000   0.0000
+/// ```
+///
+/// A second truncated stack agrees: layers 0:3, one prompt, 91 steps, 26
+/// distinct winners, budget 1024 gives **0.9890** against 0:4's 0.9231.
+///
+/// The mean exact top1-top2 gap over those steps was 0.37-0.43 logits, so these
+/// are genuinely tight decisions and not a distribution where anything would
+/// win.
+///
+/// Every arm's "exact winner shortlisted" rate EQUALS its recall to four places,
+/// and that equality is doing more work than it looks. This lane has exactly two
+/// ways to pick the wrong token, and the equality measures BOTH at zero:
+///
+///  1. the winner never cleared the floor, so it was never rescored. That is
+///     `1 - shortlisted`, and it accounts for every miss in the table.
+///  2. the winner WAS rescored, and an unrescored row's ESTIMATE still beat its
+///     exact score. The returned row is a blend, so this is possible in
+///     principle. It would show as recall BELOW the shortlisted rate, and it
+///     never does -- in any arm, at any budget, including the ones where a
+///     third of the shortlists missed.
+///
+/// So the budget is the only lever, and raising it is the only fix.
+///
+/// And raising it is FREE, which is what makes 8192 an easy choice rather than
+/// a brave one. At the head's own shape (`n = 201024`, `k = 4096`, 24 queries,
+/// min of the warm launches in one process, launch + sync, GPU idle) the whole
+/// lane costs 0.779 ms at budget 64 and 0.808 ms at budget 8192 — a 0.03 ms
+/// spread across a 128x range, against a 0.54 ms spread on the exact arm over
+/// the same four runs. The scan is the entire cost; 8192 rows of NVFP4 is 20 MB
+/// of contiguous 2 KiB rows against the sketch's 103 MB, and it vanishes into
+/// it. So the recall curve above can simply be bought outright.
+///
+/// # What is NOT measured yet
+///
+/// Those 65 steps ran on a FOUR-LAYER stack, because the full 42 needs both
+/// Sparks and the second one's copy of the checkpoint predates the
+/// branch-to-collection migration and cannot be opened. A truncated stack is a
+/// real model on a real prompt, but its final hidden states are not the ones
+/// the shipped model produces, and the logit geometry — how crowded the top of
+/// the vocabulary is — is exactly what the budget is sized against.
+///
+/// **How much that matters is itself measured, and it is a lot.** The same
+/// budget of 1024 that scores 0.9231 at layers 0:4 scores 0.0370 at layers 0:2.
+/// Most of that collapse is the SAMPLE and not the lane — the two-layer stump
+/// loops on a single token, so all 81 steps are one hidden state and the "rate"
+/// is one query's luck (the report now says so out loud; see
+/// [`mary::models::inkling::annhead::VERIFY_WINNERS`]). But it settles the
+/// direction of the caveat: recall here is a property of the hidden-state
+/// DISTRIBUTION, the 0:4 table is 65 correlated steps from one prompt, and
+/// extrapolating it to a 42-layer stack is an extrapolation.
+///
+/// So this number is evidence and not proof. Re-running `INK_ANN_VERIFY=1` on
+/// the two-node stack, on more than one prompt, is owed before anyone quotes it
+/// as a property of the model.
+///
+/// It is nevertheless ON, because the cost of being wrong here is bounded and
+/// visible: a shortlist miss produces a different-but-fluent token, the way the
+/// W4A16 head this sits on already does (one token in 24, at a 0.08-logit gap),
+/// and this runtime disagrees with ITSELF on 8.55% of argmax positions between
+/// two runs of the same binary. `INK_ANN_HEAD=0` is the exact lane, unchanged,
+/// one environment variable away.
+const ANN_BUDGET_DEFAULT: usize = 8192;
+
+/// The seed of the sketch's random rotation.
+///
+/// Fixed rather than drawn, because the rotation has to be the same one on
+/// every process that reads the same table: it is a property of the SKETCH, and
+/// a sketch built under a different rotation than the query is rotated by is not
+/// a worse estimate, it is noise. It is a constant and not a switch for the same
+/// reason -- there is nothing a caller could usefully vary it to.
+const ANN_SKETCH_SEED: u64 = 0x414E_4E5F_5545_3031;
+
 /// Which lane the unembed table is bound to.
 ///
 /// The head is the single largest term in the per-step INTERCEPT, and it is
@@ -1976,6 +2067,188 @@ enum HeadLane {
 /// 0.08-logit gap, both continuations English.
 fn head_lane() -> HeadLane {
     HeadLane::W4a16
+}
+
+/// The shortlist budget for the approximate head, and the switch that selects
+/// it. `0` runs the exact `w4a16` lane.
+///
+/// The head is an exhaustive maximum-inner-product search: 0.43 GiB of NVFP4
+/// read whole to produce one integer. `INK_ANN_HEAD=N` replaces the exhaustive
+/// scan with a 1-bit sign sketch over the same rows (0.103 GiB, a quarter of
+/// the bytes) and an EXACT rescore of the `N` rows whose estimates come out on
+/// top. See [`mary::models::inkling::annhead`] for why narrower codes and not
+/// fewer rows, and for the rotation and the unbiasing scalar that make a
+/// one-bit estimate rank correctly at all.
+///
+/// `N` is a budget rather than a threshold because the lane's own question is a
+/// threshold — every row that could still win — and a budget is how a caller
+/// says what it will pay to answer it.
+fn ann_budget() -> usize {
+    static CHOSEN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CHOSEN.get_or_init(|| {
+        std::env::var("INK_ANN_HEAD")
+            .ok()
+            .map(|v| {
+                v.parse::<usize>()
+                    .unwrap_or_else(|_| panic!("INK_ANN_HEAD={v:?} wants a shortlist size, or 0"))
+            })
+            .unwrap_or(ANN_BUDGET_DEFAULT)
+    })
+}
+
+/// The logit window the shortlist floor is chosen inside.
+///
+/// The floor comes from a histogram over `[max - range, max]`; a row further
+/// than `range` below the best estimate is not a candidate under any budget.
+/// Twelve logits is far wider than any near-tie this model produces (the W4A16
+/// head's worst measured disagreement was a 0.08-logit gap) and narrow enough
+/// that 1024 bins resolve to 0.012 logits, which is finer than that gap.
+fn ann_range() -> f32 {
+    static CHOSEN: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *CHOSEN.get_or_init(|| {
+        std::env::var("INK_ANN_RANGE")
+            .ok()
+            .map(|v| {
+                v.parse::<f32>()
+                    .unwrap_or_else(|_| panic!("INK_ANN_RANGE={v:?} wants a logit window"))
+            })
+            .unwrap_or(12.0)
+    })
+}
+
+/// Build the sketch on RAW coordinates instead of in the rotated basis.
+///
+/// The ablation for the claim that the rotation is not optional, and it has to
+/// exist on the real table rather than only in `inkling_ann_gate`: the whole
+/// argument for rotating is about the structure of a real embedding matrix —
+/// rogue dimensions carrying disproportionate mass, error pooling on whichever
+/// tokens load them — and a synthetic table can only show that the mechanism
+/// works on a structure someone planted there on purpose.
+fn ann_rotated() -> bool {
+    static CHOSEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CHOSEN.get_or_init(|| {
+        std::env::var("INK_ANN_ROT")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// Run BOTH head lanes on the same hidden state and count how often they agree.
+///
+/// The paired-run instrument, and the only honest one: recall is a property of
+/// the pair, so measuring it on synthetic queries would answer a question about
+/// synthetic queries. This runs the exact `w4a16` GEMM beside the approximate
+/// lane on the SAME normed, perturbed, muP-divided hidden state a real prompt
+/// produced, and folds the comparison into
+/// [`mary::models::inkling::annhead::VERIFY`].
+///
+/// It roughly doubles the head stage, so it is a gate and not a default.
+fn ann_verify() -> bool {
+    static CHOSEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CHOSEN.get_or_init(|| {
+        std::env::var("INK_ANN_VERIFY")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// Sampling temperature, applied as noise on the QUERY.
+///
+/// `0.0` is greedy decode and is bit-identical to a run with no sampling path at
+/// all: the perturbation is not built, not uploaded and not added. That is the
+/// property the switch is written around — this is the first sampling mechanism
+/// in this codebase, and it has to reduce EXACTLY to what shipped before it.
+///
+/// # Why the noise goes on the hidden state and not on the logits
+///
+/// The textbook mechanism is Gumbel-max: add `Gumbel(0, T)` to every logit and
+/// take the argmax. It is exact, and it presupposes a SCAN — it is only defined
+/// if you visit every row — so it silently constrains the head to be linear in
+/// the vocabulary, which is the thing an approximate head exists to escape.
+/// Query noise perturbs the INPUT, so it composes with whatever retrieval
+/// structure the head grows.
+///
+/// It also does a second job that score noise cannot do at all. An approximate
+/// head's error is DETERMINISTIC given the hidden state: a row this sketch
+/// under-estimates is under-estimated every time, excluded from the shortlist
+/// every time, and never rescored — so it can never be emitted, ever. Adding
+/// `g_i` to a biased estimate does not fix that, because `argmax(est_i + g_i)`
+/// still under-selects a row whose estimate is biased low; the noise rides on
+/// top of the bias. Perturbing the query changes `sign(Rq)`, which changes which
+/// bits agree, which RE-ROLLS the error for every row at once.
+///
+/// # What it costs, stated rather than discovered later
+///
+/// This does not reproduce a softmax exactly, and it is not meant to.
+/// `<h + eps, w_i> = <h, w_i> + <eps, w_i>`: symmetric `eps` induces symmetric
+/// logit noise where Gumbel is skewed, and `Var = sigma^2 ||w_i||^2` makes the
+/// effective temperature PER TOKEN, scaled by that token's embedding-row norm.
+/// The bar here is capability — coherent text, retrieval, acceptance — and not
+/// numerical identity with a softmax; this runtime disagrees with ITSELF on
+/// 8.55% of argmax positions between two runs of the same binary, so a bar of
+/// distributional identity is one nothing on this stack meets.
+///
+/// The value is a temperature in LOGIT units. It is divided by the mean
+/// embedding-row norm to become a hidden-state sigma, and multiplied by
+/// `pi/sqrt(6)` so that the induced logit noise has the standard deviation a
+/// Gumbel of the same temperature would have. Both conversions are exact
+/// statements about the first two moments and neither claims the shapes match.
+fn head_temp() -> f32 {
+    static CHOSEN: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *CHOSEN.get_or_init(|| {
+        std::env::var("INK_TEMP")
+            .ok()
+            .map(|v| {
+                v.parse::<f32>()
+                    .unwrap_or_else(|_| panic!("INK_TEMP={v:?} wants a temperature"))
+            })
+            .unwrap_or(0.0)
+    })
+}
+
+/// Seed for the query perturbation. Fixed so a temperature run reproduces.
+fn head_temp_seed() -> u64 {
+    static CHOSEN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CHOSEN.get_or_init(|| {
+        std::env::var("INK_TEMP_SEED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0x5EED_1107)
+    })
+}
+
+/// `count` standard normals from a counter-based generator.
+///
+/// Counter-based rather than stateful because the noise has to be a function of
+/// `(seed, step)` and nothing else: a stateful RNG makes the perturbation depend
+/// on how many times the process happened to draw, which is exactly the kind of
+/// hidden dependence that makes a sampling run irreproducible for reasons nobody
+/// can find. Splitmix64 for the bits, Box-Muller for the shape.
+fn normals(seed: u64, step: u64, count: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(count);
+    let mut i = 0u64;
+    while out.len() < count {
+        let mix = |mut z: u64| -> u64 {
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let a = mix(seed
+            ^ step
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(i.wrapping_mul(0xD1B5_4A32_D192_ED03)));
+        // Open on both ends: `ln(0)` is the one input Box-Muller cannot take.
+        let u1 = ((a >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+        let u2 = ((mix(a) >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+        let r = (-2.0 * u1.ln()).sqrt();
+        let th = std::f64::consts::TAU * u2;
+        out.push((r * th.cos()) as f32);
+        if out.len() < count {
+            out.push((r * th.sin()) as f32);
+        }
+        i += 1;
+    }
+    out
 }
 
 /// The shared/sink experts are held as NVFP4 codes and
@@ -5284,6 +5557,31 @@ fn main() -> Result<()> {
          INK_MTP_PROB and read acceptance.",
         draft_topk
     );
+    // And the same refusal against the approximate head, for the same reason
+    // one step removed.
+    //
+    // The aNN lane returns a full-width row, so nothing here would SHAPE-fail --
+    // which is exactly why it needs saying. Only the shortlist carries exact
+    // scores; every other entry is a sketch estimate, so a softmax over that row
+    // has a denominator built partly out of estimates. The argmax does not care
+    // (the top is exact and the measurement says so), and a per-token
+    // PROBABILITY does. `INK_MTP_PROB` is the one consumer that reads the row as
+    // a distribution rather than as a ranking.
+    //
+    // Nothing else in the pass has this exposure. The per-position top-5 report
+    // and `INK_DRAFT_TOPK`'s gather both read the row as a RANKING and both stop
+    // far inside the shortlist -- 5 and 512 against 8192 -- so every row they
+    // touch was rescored exactly.
+    anyhow::ensure!(
+        !(mtp_prob && ann_budget() > 0),
+        "INK_MTP_PROB reads the head's row as a DISTRIBUTION, and the approximate head \
+         (INK_ANN_HEAD={}) returns exact scores only for the {} rows it shortlisted -- \
+         the rest of the row is the sketch's estimate, so the softmax denominator would \
+         be part estimate and the probabilities would look ordinary while being wrong. \
+         Set INK_ANN_HEAD=0 for probability scoring.",
+        ann_budget(),
+        ann_budget()
+    );
     // The draft head's distribution, kept from the step that issued it until
     // the step it names arrives with the target's. 800 KB a draft at f32 and
     // at most k(k+1)/2 alive at once.
@@ -5708,6 +6006,10 @@ fn main() -> Result<()> {
     // does. The extra rows are the checkpoint's own padding and the argmax
     // slices them off, exactly as the f32 path sliced them off after uploading
     // them.
+    // Filled inside the bind below, where the codes exist. Declared out here
+    // because the bind is an expression and the sketch is the third thing it
+    // produces.
+    let mut head_sketch: Option<mary::models::inkling::annhead::Sketch> = None;
     let (unembed_w, unembed_bytes) = if want_head {
         use mary::models::inkling::bf16gemm::Bf16W;
         use mary::models::inkling::pile::Elem;
@@ -5758,6 +6060,55 @@ fn main() -> Result<()> {
                 // input quantiser for the routed experts and for nothing else,
                 // so this tensor has none.
                 let p = quantized_bf16(&fp4_client, &leaf.bytes, rows, cols);
+                // The sign sketch, from the codes that are already here.
+                //
+                // Built on the DEVICE and from the NVFP4, not from `leaf.bytes`,
+                // for the reason the rebind above exists: the BF16 is 1.53 GiB
+                // and reading it a second time to derive 0.103 GiB of signs
+                // would cost more than the sketch saves in its first three
+                // hundred tokens. What the sketch approximates is therefore what
+                // the exact lane computes -- the same four-bit codes -- so the
+                // rescore agrees with the lane it shortlists for rather than
+                // with a BF16 reference neither of them runs.
+                // Built for the TEMPERATURE too, not only for the aNN lane. The
+                // knob is a temperature in logit units and it becomes a
+                // hidden-state sigma by dividing by the mean embedding-row norm,
+                // which is computed here and nowhere else -- so without this the
+                // same `INK_TEMP` would mean two different temperatures
+                // depending on an unrelated switch, and the run would not say so.
+                if ann_budget() > 0 || head_temp() > 0.0 {
+                    let t0 = Instant::now();
+                    let sk = mary::models::inkling::annhead::build_sketch(
+                        &fp4_client,
+                        &p.codes,
+                        &p.scales,
+                        p.n,
+                        p.k,
+                        p.scale2,
+                        ANN_SKETCH_SEED,
+                        ann_rotated(),
+                    );
+                    println!(
+                        "  unembed SIGN SKETCH built in {:.2} s, basis {}: {} x {} bits = \
+                         {:.3} GiB ({:.2}x under the NVFP4 codes), {} live rows of {}, \
+                         mean row norm {:.4}. NOT in the admission accounting: this \
+                         buffer is a client allocation, not a charged weight",
+                        t0.elapsed().as_secs_f64(),
+                        if sk.rotated {
+                            "ROTATED"
+                        } else {
+                            "RAW (ablation)"
+                        },
+                        sk.n,
+                        sk.k,
+                        sk.bytes() as f64 / GIB,
+                        (leaf.bytes.len() as f64 * 4.5 / 16.0) / sk.bytes() as f64,
+                        sk.live_rows,
+                        sk.n,
+                        sk.mean_norm,
+                    );
+                    head_sketch = Some(sk);
+                }
                 let w = match head_lane() {
                     HeadLane::W4a16 => dev_lane::ProjW::W4a16(p),
                     HeadLane::W4a4 => dev_lane::ProjW::Fp4(p),
@@ -5791,6 +6142,7 @@ fn main() -> Result<()> {
     } else {
         (None, None)
     };
+    let head_sketch = head_sketch;
     // The final norm's gain, uploaded once for the same reason -- it used to be
     // re-uploaded from the host copy on every pass, and on every MTP draft.
     let fnorm_dev = fnorm.as_ref().map(|f| up1r::<Bk>(&f.data, h, &dev));
@@ -7533,6 +7885,9 @@ fn main() -> Result<()> {
         // slot the head/unembed occupies on a whole-stack run — which is what makes
         // the two reports read against each other line for line.
         let mut best_wire = None;
+        // What the approximate head did this pass, if it ran. `None` is the
+        // exact lane, and the report says so rather than printing zeros.
+        let mut ann_stat: Option<mary::models::inkling::annhead::AnnStat> = None;
         // Which position `logits[0]` is. The head computes `logit_row0..n`, so this
         // is 0 when everything was asked for and `n - 1` when only the argmax's row
         // was. A head computes nothing and the value is unread there.
@@ -7633,10 +7988,105 @@ fn main() -> Result<()> {
                 t.rms_norm_eps,
             )
             .div_scalar(t.logits_mup_width_multiplier as f32);
+            // Query-space noise: the sampling temperature, and -- when the
+            // approximate head is on -- the thing that stops any row being
+            // PERMANENTLY invisible to the shortlist. Applied to the normed,
+            // muP-divided hidden state, so the induced logit noise is
+            // `sigma * ||w_i||` in the same units the argmax below compares.
+            //
+            // At `INK_TEMP=0` nothing is built, uploaded or added: greedy decode
+            // is the same arithmetic it was before this existed.
+            let hs = if head_temp() > 0.0 {
+                let rows = n - logit_row0;
+                // A REFUSAL and not a fallback. `unwrap_or(1.0)` here would make
+                // `INK_TEMP=0.8` a different temperature on a table whose rows
+                // average 5.6 -- seven times colder -- and nothing in the run
+                // would say so. A knob that silently means something else is
+                // worse than a knob that is not there.
+                let sk = head_sketch.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "INK_TEMP needs the mean embedding-row norm to turn a temperature \
+                         in logit units into a hidden-state sigma, and only the sign \
+                         sketch computes it. This build bound the head to {:?}, which \
+                         builds no sketch.",
+                        head_lane()
+                    )
+                })?;
+                // A temperature in logit units becomes a hidden-state sigma by
+                // dividing by the row norm the logit noise gets multiplied by.
+                // `pi/sqrt(6)` is Gumbel's standard deviation at unit
+                // temperature, so the two mechanisms agree on the second moment
+                // -- which is the most that can be claimed, since one is skewed
+                // and the other is not.
+                let sigma = head_temp() * std::f32::consts::PI / 6f32.sqrt() / sk.mean_norm;
+                let e = normals(head_temp_seed(), step as u64, rows * h);
+                let noise = burn::tensor::Tensor::<Bk, 2>::from_data(
+                    burn::tensor::TensorData::new(
+                        e.iter().map(|v| v * sigma).collect::<Vec<f32>>(),
+                        [rows, h],
+                    ),
+                    &dev,
+                );
+                let dt = mary::models::inkling::seam::dtype_of(&hs);
+                let noise = if dt == burn::tensor::DType::BF16 {
+                    noise.cast(burn::tensor::FloatDType::BF16)
+                } else {
+                    noise
+                };
+                hs + noise
+            } else {
+                hs
+            };
             let uw = unembed_w
                 .as_ref()
                 .expect("the tail binds the unembed table");
-            down(dev_lane::linear_w(hs, uw).slice([0..n - logit_row0, 0..v]))
+            // The approximate lane, when it is on and the pass is one row wide.
+            //
+            // The `m > 1` fallback is not a gap. The exact GEMM amortises ONE
+            // read of the table over all `m` rows, so a verify pass already gets
+            // most of what narrower codes would buy it; the decode step is
+            // `m = 1` and is where the 4.6 ms lives.
+            match (head_sketch.as_ref(), uw) {
+                (Some(sk), dev_lane::ProjW::W4a16(p))
+                    if ann_budget() > 0 && n - logit_row0 == 1 =>
+                {
+                    let exact = if ann_verify() {
+                        Some(down(dev_lane::linear_w(hs.clone(), uw).slice([0..1, 0..v])))
+                    } else {
+                        None
+                    };
+                    let (lg, st) = dev_lane::linear_ann(hs, p, sk, ann_budget(), ann_range());
+                    ann_stat = Some(st);
+                    let approx = down(lg.slice([0..1, 0..v]));
+                    match exact {
+                        // Verify mode FOLLOWS THE EXACT HEAD. The approximate
+                        // row is scored and then discarded, and the sequence
+                        // continues from the token the exact lane picked.
+                        //
+                        // Without this the instrument cannot compare anything.
+                        // One disagreement rewrites every later hidden state, so
+                        // two arms of an ablation walk into different
+                        // continuations and their recall rates are computed over
+                        // DIFFERENT queries -- measured: at layers 0:2 the
+                        // rotated arm looped on one token and scored 0.0370
+                        // while the raw arm found a 13-token loop and scored
+                        // 0.2346, and neither number was about the other's
+                        // queries. Pinning the trajectory to the exact head
+                        // makes every arm of every ablation see the same states.
+                        //
+                        // What this run therefore does NOT measure is error
+                        // COMPOUNDING over a generation. That is what a plain
+                        // run without `INK_ANN_VERIFY` shows, and the two
+                        // questions want different instruments.
+                        Some(e) => {
+                            mary::models::inkling::annhead::verify_row(&e, &approx, st.floor);
+                            e
+                        }
+                        None => approx,
+                    }
+                }
+                _ => down(dev_lane::linear_w(hs, uw).slice([0..n - logit_row0, 0..v])),
+            }
         };
         let t_head = t_h.elapsed().as_secs_f64();
 
@@ -9114,6 +9564,31 @@ fn main() -> Result<()> {
             ms(t_argmax),
             new_toks.len().max(1)
         );
+        if let Some(a) = ann_stat {
+            // The shortlist is the lane's own account of what it did, and it is
+            // printed every pass rather than summarised: a step whose top is flat
+            // enough to overflow the budget is exactly the step whose token is
+            // worth doubting, and an average would hide it.
+            println!(
+                "        aNN head: {} above the floor of {} (floor {:.3}, best estimate \
+                 {:.3}, budget {}){}",
+                a.shortlist,
+                t.vocab_size,
+                a.floor,
+                a.est_max,
+                ann_budget(),
+                // The counter is uncapped and the rescore is not, so this is the
+                // one line that can say the shortlist did not fit. It is not a
+                // wrong answer -- the rows that were rescored are exact -- it is
+                // a step whose top was flat enough that the budget did not cover
+                // it, and it is worth seeing rather than averaging away.
+                if a.shortlist > ann_budget() + ann_budget() / 4 + 1024 {
+                    "  OVERFLOW: only the first budget*4 were rescored"
+                } else {
+                    ""
+                }
+            );
+        }
         {
             let named = t_prep + t_embed + t_layers + t_seat + t_stack_sync + t_tail_host;
             println!(
@@ -9862,6 +10337,19 @@ fn main() -> Result<()> {
         bytes.extend_from_slice(&i.to_le_bytes());
     }
     std::fs::write(&out_path, &bytes)?;
+    // ---- the approximate head, against the exact one -----------------------
+    //
+    // Printed at the end and not per pass because recall is a rate: a single
+    // step either agreed or did not, and the interesting number is over a
+    // generation. The mean top1-top2 gap prints beside it so a disagreement
+    // rate can be read at all -- losing a 0.001-logit tie and losing a
+    // 2-logit one are not the same event, and the rate alone cannot tell them
+    // apart.
+    if let Some(r) = mary::models::inkling::annhead::verify_report() {
+        println!("\n=== approximate head ===");
+        println!("  {r}");
+    }
+
     // ---- the device row plan: the fault flag and the two arms --------------
     //
     // Outside the pipe report on purpose. Both of these are statements about
@@ -10027,5 +10515,54 @@ mod pipe_tests {
         assert!(msg.contains("the tail listened"), "unhelpful: {msg}");
         assert!(msg.contains(&addr), "does not name the address: {msg}");
         assert!(msg.contains("INK_PIPE_WAIT"), "no way out named: {msg}");
+    }
+}
+
+#[cfg(test)]
+mod ann_temp_tests {
+    use super::*;
+
+    /// [`normals`] really is standard normal, and really does depend on the step.
+    ///
+    /// Worth a test because `INK_TEMP` claims a PRECISE calibration — a
+    /// temperature in logit units times `pi/sqrt(6)` divided by the mean row
+    /// norm — and every term of that is exact arithmetic on the assumption that
+    /// what comes out of here has unit variance. A Box-Muller with a dropped
+    /// factor of two would still look like noise, still produce fluent text, and
+    /// silently make every stated temperature wrong by 1.41x. Nothing downstream
+    /// could catch that; this can.
+    #[test]
+    fn the_query_noise_is_standard_normal_and_moves_with_the_step() {
+        let n = 200_000;
+        let v = normals(0x5EED_1107, 7, n);
+        assert_eq!(v.len(), n);
+        let mean = v.iter().map(|x| *x as f64).sum::<f64>() / n as f64;
+        let var = v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>() / n as f64 - mean * mean;
+        // 4 standard errors at n = 200k: the mean's is 1/sqrt(n) = 0.0022 and
+        // the variance's is sqrt(2/n) = 0.0032. Loose enough not to flake,
+        // tight enough that a factor of sqrt(2) is nowhere near it.
+        assert!(mean.abs() < 0.01, "mean {mean} is not zero");
+        assert!((var - 1.0).abs() < 0.02, "variance {var} is not one");
+        // Both halves of each Box-Muller pair must be used and used correctly;
+        // a bug that returned the cosine twice would pass the moments above.
+        let odd: f64 = v
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .map(|x| (*x as f64) * (*x as f64))
+            .sum::<f64>()
+            / (n / 2) as f64;
+        assert!((odd - 1.0).abs() < 0.03, "the sine half has variance {odd}");
+
+        // Counter-based: a different step is a different draw, and the SAME
+        // step is the same draw. Both directions, because a generator that
+        // ignored `step` would give a reproducible run that never re-rolls the
+        // sketch's error -- which is the entire reason the noise is on the
+        // query.
+        let a = normals(0x5EED_1107, 7, 64);
+        let b = normals(0x5EED_1107, 8, 64);
+        let c = normals(0x5EED_1107, 7, 64);
+        assert_eq!(a, c, "the same (seed, step) drew differently");
+        assert_ne!(a, b, "consecutive steps drew the same noise");
     }
 }

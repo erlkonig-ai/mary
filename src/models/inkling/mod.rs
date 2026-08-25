@@ -102,6 +102,10 @@ pub mod fp4gemm;
 // `input_quantizer` -- the sink experts, the attention projections, and the
 // 1.65 GB unembedding.
 pub mod w4a16gemm;
+// The head as an approximate maximum-inner-product search rather than an
+// exhaustive one: a 1-bit sign sketch in a rotated basis, scanned at a tenth of
+// the NVFP4 table's bytes, and an exact rescore of the shortlist it names.
+pub mod annhead;
 // The same lane as `fp4gemm`, but the loop over a layer's active experts moved
 // off the host and into the grid: one launch per stage per layer, with the
 // block index selecting the expert. Same kernels, same order, same bits.
