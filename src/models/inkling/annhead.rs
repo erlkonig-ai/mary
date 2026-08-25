@@ -137,6 +137,77 @@
 //! there would be a stronger claim than the lane can support (and would break
 //! any softmax that reads the row). The rows that decide the argmax are exact.
 //!
+//! # What it measures, and the framing that makes those numbers evidence
+//!
+//! ## At the head's own shape, in isolation
+//!
+//! `inkling_ann_gate`, GB10, GPU otherwise idle, `n = 201024`, `k = 4096`, one
+//! query per launch, **minimum of the warm launches within one process**,
+//! launch + sync. The synthetic table is quantised by the runtime's own
+//! `quantize_nvfp4_bf16`, so these are the codes a real bind produces.
+//!
+//! ```text
+//!   exact w4a16   4.84 - 5.29 ms      0.431 GiB of codes + scales
+//!   aNN           0.755 ms            0.097 GiB of signs + alpha
+//! ```
+//!
+//! The exact arm is quoted as a RANGE because two runs of the same binary on the
+//! same box gave 4.838 and 5.289 — a 9% spread — so any single ratio taken
+//! against it carries that spread. Roughly SIX times, not "7.01x".
+//!
+//! The two GB/s figures those bytes imply (88-96 against 137) are over DIFFERENT
+//! TABLES and are not a like-for-like efficiency comparison. What they do say is
+//! that neither lane is at this part's ~248 GB/s coalesced ceiling.
+//!
+//! ## The sketch is cheap to build
+//!
+//! 201024 rows of the real unembedding in **0.31 s**, inside the process load
+//! and including this kernel's first compilation; 0.05 s on a second table in
+//! the same process. Against a load that already spends seconds opening a 171 GB
+//! pile and warming expert slabs, it does not appear.
+//!
+//! ## What the budget costs
+//!
+//! Same harness and framing as the table above:
+//!
+//! ```text
+//!   budget      64   0.742 ms
+//!             1024   0.788 ms
+//!             8192   0.838 ms
+//! ```
+//!
+//! So the SCAN is ~0.74 ms and the shortlist is the rest. Rescoring 8192 rows
+//! moves 20 MB of NVFP4 against the sketch's 103, and it costs what that ratio
+//! says it should.
+//!
+//! # The scan is not at the ceiling, and here is the specific suspicion
+//!
+//! 0.097 GiB at this part's measured 248 GB/s coalesced read rate
+//! (`fp4_lane_dump`'s `stream_packed`, corrected 2026-08-25) is **0.42 ms**. The
+//! scan takes 0.74. Roughly 0.3 ms is unclaimed, and it is worth writing down
+//! what it is probably NOT: it is not coalescing, because the bit-plane layout
+//! makes every global read a full 128-byte transaction by construction, and it
+//! is not latency-hiding alone, because issuing four words before consuming any
+//! of them moved it 0.819 -> 0.755 and no further.
+//!
+//! The remaining suspicion is that the lane is partly ALU-BOUND. Each weight
+//! dimension costs about four instructions — one shared load, a shift, a
+//! mask-and-xor, an add — and there are 4096 of them per row and 201024 rows, so
+//! roughly 1.0e8 warp-instructions. Whether that is the same order as 0.42 ms
+//! depends on this part's issue rate, which I have NOT measured; at an assumed
+//! 48 SMs x 4 schedulers x 1.5 GHz it would be ~0.36 ms, i.e. comparable, and
+//! that assumption is the weak step. **This is a hypothesis with a named
+//! weakness, not a finding.**
+//!
+//! If it holds, the fix is a shared-memory table over PAIRS of query
+//! coordinates: 2048 pairs x 4 precomputed sign combinations = 32 KiB, turning
+//! two dimensions into one indexed load and one add instead of eight
+//! instructions. The four entries of a pair are four consecutive banks, so a
+//! warp reading different combinations conflicts on none of them. It costs half
+//! the occupancy (32 KiB of shared against 16), which is exactly why it has to
+//! be measured rather than assumed — the neighbouring `w4a16gemm` has a whole
+//! comment block about a variant that was cleverer and slower.
+//!
 //! # Scope: one row
 //!
 //! [`ann_logits`] handles `m == 1`. A verify pass with `m > 1` falls back to the

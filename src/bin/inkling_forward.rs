@@ -5595,7 +5595,13 @@ fn main() -> Result<()> {
                 // the exact lane computes -- the same four-bit codes -- so the
                 // rescore agrees with the lane it shortlists for rather than
                 // with a BF16 reference neither of them runs.
-                if ann_budget() > 0 {
+                // Built for the TEMPERATURE too, not only for the aNN lane. The
+                // knob is a temperature in logit units and it becomes a
+                // hidden-state sigma by dividing by the mean embedding-row norm,
+                // which is computed here and nowhere else -- so without this the
+                // same `INK_TEMP` would mean two different temperatures
+                // depending on an unrelated switch, and the run would not say so.
+                if ann_budget() > 0 || head_temp() > 0.0 {
                     let t0 = Instant::now();
                     let sk = mary::models::inkling::annhead::build_sketch(
                         &fp4_client,
@@ -7478,14 +7484,27 @@ fn main() -> Result<()> {
             // is the same arithmetic it was before this existed.
             let hs = if head_temp() > 0.0 {
                 let rows = n - logit_row0;
+                // A REFUSAL and not a fallback. `unwrap_or(1.0)` here would make
+                // `INK_TEMP=0.8` a different temperature on a table whose rows
+                // average 5.6 -- seven times colder -- and nothing in the run
+                // would say so. A knob that silently means something else is
+                // worse than a knob that is not there.
+                let sk = head_sketch.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "INK_TEMP needs the mean embedding-row norm to turn a temperature \
+                         in logit units into a hidden-state sigma, and only the sign \
+                         sketch computes it. This build bound the head to {:?}, which \
+                         builds no sketch.",
+                        head_lane()
+                    )
+                })?;
                 // A temperature in logit units becomes a hidden-state sigma by
                 // dividing by the row norm the logit noise gets multiplied by.
                 // `pi/sqrt(6)` is Gumbel's standard deviation at unit
                 // temperature, so the two mechanisms agree on the second moment
                 // -- which is the most that can be claimed, since one is skewed
                 // and the other is not.
-                let mean_norm = head_sketch.as_ref().map(|s| s.mean_norm).unwrap_or(1.0);
-                let sigma = head_temp() * std::f32::consts::PI / 6f32.sqrt() / mean_norm;
+                let sigma = head_temp() * std::f32::consts::PI / 6f32.sqrt() / sk.mean_norm;
                 let e = normals(head_temp_seed(), step as u64, rows * h);
                 let noise = burn::tensor::Tensor::<Bk, 2>::from_data(
                     burn::tensor::TensorData::new(
@@ -7514,7 +7533,9 @@ fn main() -> Result<()> {
             // most of what narrower codes would buy it; the decode step is
             // `m = 1` and is where the 4.6 ms lives.
             match (head_sketch.as_ref(), uw) {
-                (Some(sk), dev_lane::ProjW::W4a16(p)) if n - logit_row0 == 1 => {
+                (Some(sk), dev_lane::ProjW::W4a16(p))
+                    if ann_budget() > 0 && n - logit_row0 == 1 =>
+                {
                     let exact = if ann_verify() {
                         Some(down(dev_lane::linear_w(hs.clone(), uw).slice([0..1, 0..v])))
                     } else {
