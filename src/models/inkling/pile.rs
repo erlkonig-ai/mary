@@ -961,6 +961,15 @@ pub struct PileSource {
     /// never into the reclaimable pile mapping.
     copied: Option<anybytes::Bytes>,
     copied_experts: std::collections::HashMap<(String, i64), CopiedExpert>,
+    /// Whether the startup copy wrote the NVFP4 expert planes down in
+    /// MMA-FRAGMENT ORDER rather than row-major `[n, k]`.
+    ///
+    /// A property of the BYTES, not a preference: it is false until
+    /// [`PileSource::copy_share`] has actually permuted them, so the one path
+    /// that skips the copy (`INK_STARTUP_COPY=0`, which leaves the experts
+    /// aliasing the pile mapping in place) reports false and every consumer
+    /// reads the row-major lane, which is the only lane those bytes support.
+    swizzled: bool,
 }
 
 #[derive(Clone)]
@@ -1162,6 +1171,7 @@ impl PileSource {
             stacked,
             copied: None,
             copied_experts: std::collections::HashMap::new(),
+            swizzled: false,
         })
     }
 
@@ -1382,6 +1392,15 @@ impl PileSource {
         )])
     }
 
+    /// Whether the NVFP4 expert planes are in MMA-fragment order.
+    ///
+    /// The question a GEMM launcher has to ask before it picks an index
+    /// expression, and it is about bytes rather than configuration: see
+    /// [`PileSource::swizzled`]'s field docs.
+    pub fn experts_swizzled(&self) -> bool {
+        self.swizzled
+    }
+
     /// Everything the model collection asserts.
     pub fn facts(&self) -> &triblespace::prelude::TribleSet {
         &self.facts
@@ -1520,6 +1539,35 @@ impl PileSource {
             shapes.insert(name.clone(), shape);
         }
         let probe_secs = t_probe.elapsed().as_secs_f64();
+
+        // Write the routed experts down in MMA-FRAGMENT ORDER, or don't -- one
+        // decision, taken here, for the whole share.
+        //
+        // It belongs in this copy and nowhere else. The bytes have to be
+        // permuted somewhere, and every other candidate is worse: the PILE
+        // cannot carry the layout (the tensor blob header is dimensions only
+        // and `weight_nvfp4_2` is anchored on element format and rank, not byte
+        // order, so a permuted blob decodes cleanly and is silently misread --
+        // see the module header) and a separate device or host pass would be a
+        // second traversal of 70+ GiB. Here it is a change of DESTINATION INDEX
+        // inside a memcpy that already happens.
+        //
+        // All-or-nothing across the share, because the consumer's flag is a
+        // comptime one per kernel and a mixture would need it per expert. The
+        // shapes are the stacks', so this is 2-3 questions, not 9 216.
+        //
+        // WHAT IT COSTS, measured rather than argued. Nine `bench-decode.sh`
+        // reps at `INK_LAYERS=0:16` (66.50 GiB of share, 20 threads) on a DGX
+        // Spark GB10: `fetch+verify+copy` was 14.6 / 14.7 / 14.8 s permuting
+        // against 15.0 / 15.1 / 15.9 s not permuting -- the permuting arm is
+        // FASTER by the spread, which is to say the difference is nil. This
+        // pass runs at 4.4-4.5 GiB/s and is bound by the memory system, not by
+        // the address arithmetic, so re-indexing 256-byte blocks inside it is
+        // free. Per STARTUP, once, not per token.
+        let swz = super::moegroup::swizzle_weights()
+            && shapes
+                .values()
+                .all(|s| !s.nvfp4 || super::fp4gemm::swizzleable(s.rows, s.logical));
 
         let globals: std::collections::HashSet<&str> = global_dense.iter().copied().collect();
         for name in &globals {
@@ -1912,7 +1960,36 @@ impl PileSource {
                                 }
                                 Job::Dense(name) => dense[*name].bytes.clone(),
                             };
-                            buf[start - base..end - base].copy_from_slice(&src);
+                            let dst = &mut buf[start - base..end - base];
+                            match job {
+                                // The permutation rides inside the copy. The
+                                // three planes keep their lengths and their
+                                // order within the payload, so every byte
+                                // offset the alias seam computes -- and the
+                                // `scale2` tail -- is exactly where it was.
+                                Job::Expert(_, shape) if swz && shape.nvfp4 => {
+                                    let elems = shape.rows * shape.logical;
+                                    let codes_len = elems / 2;
+                                    let scales_len = elems / NVFP4_BLOCK;
+                                    let (c, sc, _) = split_payload(&src, elems)?;
+                                    let (dc, rest) = dst.split_at_mut(codes_len);
+                                    let (dsc, dtail) = rest.split_at_mut(scales_len);
+                                    super::fp4gemm::swizzle_b_codes_into(
+                                        c,
+                                        dc,
+                                        shape.rows,
+                                        shape.logical,
+                                    );
+                                    super::fp4gemm::swizzle_b_scales_into(
+                                        sc,
+                                        dsc,
+                                        shape.rows,
+                                        shape.logical,
+                                    );
+                                    dtail.copy_from_slice(&src[codes_len + scales_len..]);
+                                }
+                                _ => dst.copy_from_slice(&src),
+                            }
                             release.release(&src);
                         }
                         Ok(())
@@ -1925,6 +2002,15 @@ impl PileSource {
             r?;
         }
         let copy_secs = t_copy.elapsed().as_secs_f64();
+        self.swizzled = swz;
+        println!(
+            "    startup copy: NVFP4 experts written in {} order",
+            if swz {
+                "MMA-FRAGMENT"
+            } else {
+                "row-major [n, k]"
+            }
+        );
         println!(
             "    startup copy: {} shape probe{} {:.1}s, fetch+verify+copy {:.1}s ({:.2} GiB/s, {threads} thread{})",
             shapes.len(),

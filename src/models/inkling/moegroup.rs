@@ -622,14 +622,16 @@ pub fn fp4_linear_grouped_launch<R: Runtime>(
     m_total: usize,
     k: usize,
     n: usize,
+    swz: bool,
 ) -> Handle {
     if grouped_smem() {
+        assert!(!swz, "the staged kernel reads the row-major layout");
         return fp4_linear_grouped_smem_launch_as::<f32, R>(
             client, a, a_sc, wmap, wmap_bytes, blk, off, scale2, slots, m_total, k, n,
         );
     }
     fp4_linear_grouped_launch_as::<f32, R>(
-        client, false, a, a_sc, wmap, wmap_bytes, blk, off, scale2, slots, m_total, k, n,
+        client, swz, a, a_sc, wmap, wmap_bytes, blk, off, scale2, slots, m_total, k, n,
     )
 }
 
@@ -656,14 +658,16 @@ pub fn fp4_linear_grouped_bf16_launch<R: Runtime>(
     m_total: usize,
     k: usize,
     n: usize,
+    swz: bool,
 ) -> Handle {
     if grouped_smem() {
+        assert!(!swz, "the staged kernel reads the row-major layout");
         return fp4_linear_grouped_smem_launch_as::<half::bf16, R>(
             client, a, a_sc, wmap, wmap_bytes, blk, off, scale2, slots, m_total, k, n,
         );
     }
     fp4_linear_grouped_launch_as::<half::bf16, R>(
-        client, false, a, a_sc, wmap, wmap_bytes, blk, off, scale2, slots, m_total, k, n,
+        client, swz, a, a_sc, wmap, wmap_bytes, blk, off, scale2, slots, m_total, k, n,
     )
 }
 
@@ -1205,6 +1209,34 @@ pub fn grouped_kc(k: usize) -> usize {
 /// regimes — see the module header — but its best plane count is not the
 /// unstaged one's, and picking that per regime is a scheduling decision this
 /// flag deliberately does not make on anybody's behalf.
+///
+/// # Does it survive [`swizzle_weights`]? Yes, for exactly one reason
+///
+/// Both fix the same defect and the pre-permuted arm wins on the merits: it is
+/// ahead in BOTH regimes at a single plane count (1.24x at decode, 1.11x at
+/// prefill against the best staging can do at a fixed one), it needs no `kc`
+/// and no `pad`, and it keeps the unstaged kernel's own plane preference
+/// instead of inverting it. End to end at `INK_LAYERS=0:16` the three arms tie
+/// inside the spread on a ONE-ROW step — 48.2 / 47.8 / 47.4 ms, row-major /
+/// pre-permuted / staged-at-one-plane — because that pass is host-enqueue-
+/// bound. On the WIDE pass, where there is exposed device work, they separate
+/// and staging is the arm that LOSES: 281.9 / 273.0 / 291.4 ms a slot-prefill
+/// pass at `INK_SLOTS=32`, i.e. pre-permuting -3.2% and staging +3.4% against
+/// row-major — which is this module's own prefill column showing up end to end.
+/// See [`super::fp4gemm::fp4_linear_swz`] for both runs and their framing.
+///
+/// What keeps this flag alive is **`INK_STARTUP_COPY=0`**. There the experts
+/// alias the pile's own file-backed mapping and are never copied, so there is
+/// nothing to permute — permuting would force the copy that flag exists to
+/// avoid — and `Weights::experts_swizzled` correctly reports false. Staging is
+/// then the ONLY way to recover the coalesced rate on that path, and it stays
+/// manual rather than being switched on automatically, because that arm is a
+/// memory-pressure reproducer and not a lane anyone should be fast on by
+/// accident.
+///
+/// It is also still the ablation: [`swizzle_weights`] yields to this function,
+/// so `INK_MOE_SMEM=1` selects staging AND leaves the arena row-major in one
+/// decision rather than two that have to agree.
 pub fn grouped_smem() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -1212,6 +1244,35 @@ pub fn grouped_smem() -> bool {
         std::env::var("INK_MOE_SMEM")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(false)
+    })
+}
+
+/// Whether the LOAD PATH writes routed-expert weights down in MMA-fragment
+/// order, from `INK_SWZ`.
+///
+/// **On by default**, and it is the reason [`grouped_smem`] still exists.
+/// The two are the same fix to the same defect — the `m16n8k64` B fragment is
+/// eight weight rows `k / 2` bytes apart, so a plane's load issues eight sector
+/// requests for 128 useful bytes — and they are mutually exclusive by
+/// construction, because the staged kernel reads the ROW-MAJOR layout the
+/// permutation destroys. So this asks `grouped_smem` first and yields to it:
+/// setting `INK_MOE_SMEM=1` selects staging AND leaves the arena unpermuted,
+/// which is one decision and not two that have to agree.
+///
+/// This is a decision about BYTES ON THE HOST, taken once at startup by
+/// `PileSource::copy_share`, so it cannot be re-taken per layer and the truth
+/// of whether it happened lives on the source rather than in this function —
+/// `INK_STARTUP_COPY=0` skips the copy entirely and no permutation occurs no
+/// matter what this returns. Ask `Weights::experts_swizzled` for what the bytes
+/// actually are; ask this only for what to attempt.
+pub fn swizzle_weights() -> bool {
+    use std::sync::OnceLock;
+    static S: OnceLock<bool> = OnceLock::new();
+    *S.get_or_init(|| {
+        !grouped_smem()
+            && std::env::var("INK_SWZ")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(true)
     })
 }
 
