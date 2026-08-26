@@ -78,6 +78,10 @@ pub mod budget;
 // A panic on any thread ends the process. Without it, a refused allocation
 // panics a cubecl worker and the run exits 0 with a plausible wrong answer.
 pub mod fatal;
+// Per-pass system state for the intermittent multi-second decode stall: the
+// host CPU, faults, huge pages and pressure that a timer inside the process
+// cannot see. Off unless `INK_STEPSTAT=1`.
+pub mod stepstat;
 // The MMA's M padding, written by the kernel that was already producing the
 // buffer instead of by a `zeros` and a `cat` beside it.
 pub mod pad;
