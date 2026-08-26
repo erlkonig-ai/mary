@@ -4227,26 +4227,10 @@ mod tests {
             }
             let a = client.create_from_slice(&xb);
 
-            let hg = try_bf16_linear_cubek_launch(
-                &client,
-                &a,
-                &w,
-                m,
-                k,
-                n,
-                Lane::GemvRows,
-            )
-            .expect("the gemv-rows lane declined a shape it is meant to take");
-            let ht = try_bf16_linear_cubek_launch(
-                &client,
-                &a,
-                &w,
-                m,
-                k,
-                n,
-                Lane::DoubleCyclicMma,
-            )
-            .expect("the tiled reference declined the shape");
+            let hg = try_bf16_linear_cubek_launch(&client, &a, &w, m, k, n, Lane::GemvRows)
+                .expect("the gemv-rows lane declined a shape it is meant to take");
+            let ht = try_bf16_linear_cubek_launch(&client, &a, &w, m, k, n, Lane::DoubleCyclicMma)
+                .expect("the tiled reference declined the shape");
 
             let g: Vec<f32> =
                 f32::from_bytes(&client.read_one(hg).expect("read the gemv lane")).to_vec();
@@ -4987,6 +4971,19 @@ pub fn linear_ann(
     use crate::models::inkling::annhead::ann_logits;
     let [m, k] = x.dims();
     assert_eq!(m, 1, "linear_ann scans one query row, not {m}");
+    // `ann_logits` reads codes/scales as row-major [n, k/8]. A fragment-order
+    // weight read that way produces PLAUSIBLE LOGITS, not an error -- which is
+    // exactly the failure the m>1 assert above exists to prevent, in the other
+    // dimension. Both siblings already guard it: `linear_fp4` asserts the same
+    // thing and `linear_w4a16` branches on it. This one did not, and the gap
+    // between two independently-correct branches broke greedy decode on main:
+    // the head emitted 164247, 60701, 9927 ... where the exact lane emits
+    // 15009, 24075, 314 ..., and k=1 collapsed into one token repeated 46 times.
+    assert!(
+        !w.swizzled,
+        "linear_ann reads row-major [n, k/8] but this weight is in MMA-fragment \
+         order; permuting the head is incompatible with the approximate lane"
+    );
     assert_eq!(
         k, w.k,
         "linear_ann: x is [_, {k}] but the weight is [_, {}]",

@@ -2537,7 +2537,18 @@ fn w4a16_bind(
     mut p: dev_lane::PackedW,
 ) -> dev_lane::ProjW {
     use mary::models::inkling::w4a16gemm as k16;
-    if k16::swizzle_w4a16() && k16::swizzleable(p.n, p.k) {
+    // THE APPROXIMATE HEAD OWNS m=1, AND IT CANNOT READ FRAGMENT ORDER.
+    // `linear_ann` -> `ann_logits` reads codes/scales as row-major [n, k/8] and
+    // has no fragment path, so permuting the head while the aNN lane is on makes
+    // every exact rescore read permuted bytes as row-major. Neither branch is
+    // wrong alone; the seam between them is.
+    //
+    // Skipping the permutation costs almost nothing here: with the aNN lane on,
+    // m=1 never reaches `linear_w4a16` at all, so the head swizzle only ever
+    // benefited verify passes (m>=2). Teaching `ann_logits` the fragment layout
+    // would recover that and is the better fix; this is the correct one.
+    let ann_owns_m1 = ann_budget() > 0;
+    if !ann_owns_m1 && k16::swizzle_w4a16() && k16::swizzleable(p.n, p.k) {
         let (c, s) = k16::swizzle_w4a16_device(client, &p.codes, &p.scales, p.n, p.k);
         p.codes = c;
         p.scales = s;
@@ -2552,6 +2563,8 @@ fn w4a16_bind(
             "  W4A16 weights written in {} order",
             if p.swizzled {
                 "MMA-FRAGMENT (m16n8k16)"
+            } else if ann_owns_m1 {
+                "row-major [n, k/8] (the approximate head owns m=1)"
             } else {
                 "row-major [n, k/8]"
             }
