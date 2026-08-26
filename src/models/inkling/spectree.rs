@@ -133,6 +133,66 @@
 //! assuming a three-row tree somehow cost no more than a two-row pass
 //! (1.492x), b = 2 still returns 0.942x.
 //!
+//! # THE GATE, and why it is a smaller lever than it looks
+//!
+//! The verdict table says the chain wins on code and counting and LOSES on
+//! prose, so an always-on lane ships the mean of a win and a loss. Gating
+//! should recover the difference. Measured (prose, 3584 rows, same pipe run),
+//! head 0's own top-1 probability as the signal:
+//!
+//! ```text
+//! T      kept    p_kept   p_dropped   gated
+//! 0.00   1.000   0.2969   -           0.843x   (= always)
+//! 0.20   0.361   0.5379   0.1607      0.975x
+//! 0.40   0.202   0.6841   0.1987      0.993x   <- best
+//! 0.60   0.136   0.7684   0.2225      0.992x
+//! 0.90   0.068   0.8689   0.2551      0.980x
+//! ```
+//!
+//! **The signal works and the gate still loses.** p_kept 0.684 against
+//! p_dropped 0.199 is enormous separation — the drafter emphatically knows
+//! when it is right. But never-speculate is 1.000x and pays NO DRAFT AT ALL,
+//! while a gate reading the DRAFT's confidence must draft first and therefore
+//! pays `d` on every pass including the ones it declines. The criterion is
+//!
+//! ```text
+//! f * (p_kept - (c2 - 1)) > d        [c2 - 1 = 0.492, d = 0.047]
+//! ```
+//!
+//! and its maximum over the whole sweep is 0.0388 — **short by 0.008, which
+//! is 17% of the required margin.** The gate converts a 0.843x loss into a
+//! 0.993x near-miss and never crosses.
+//!
+//! What blocks it is the always-paid draft, not the acceptance. So the design
+//! that could work is a gate on a signal the pass ALREADY HAS — the main
+//! stack's own top-1 probability at the current row, available BEFORE the
+//! draft is made, which moves the draft inside the gate and turns `d` into
+//! `f * d`. Then the criterion is just `p_kept > d + c2 - 1 = 0.539` with no
+//! constant to overcome.
+//!
+//! Substituting the measured head-confidence buckets into that model bounds
+//! what such a gate could pay on prose:
+//!
+//! ```text
+//! T=0.40  f=0.202  p=0.684 -> 1.026x
+//! T=0.60  f=0.136  p=0.768 -> 1.029x   <- ceiling
+//! T=0.70  f=0.112  p=0.800 -> 1.028x
+//! ```
+//!
+//! **About 1.03x on prose.** That is a real win where the always-on lane
+//! loses 16%, and it is not a large one. Note what it is NOT: a proof. It
+//! substitutes head-0's confidence for the free signal, on the assumption
+//! that no cheaper signal predicts head 0's correctness BETTER than head 0's
+//! own probability does. That is plausible and unproven, and it is the one
+//! measurement still owed — `INK_MTP_TOPK` now emits the `stackp1` sweep that
+//! settles it.
+//!
+//! On a mixed workload the gate's value is not that it beats the best arm
+//! anywhere; it is that it removes the worst arm's downside. Equal token
+//! counts across the three corpora, aggregating as time (`3 / sum(1/s)`):
+//! never 1.000x, always 1.046x, gate about 1.13x — and essentially all of the
+//! difference is prose.
+//!
 //! # What a SINGLE BOX can and cannot measure
 //!
 //! `INK_TREE` runs on one box, and measured there (GB10, layers 0:21, ctx512,
