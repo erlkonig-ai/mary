@@ -476,6 +476,11 @@ pub enum Lane {
     OrderedDoubleMmaPk2,
     /// ...and four.
     OrderedDoubleMmaPk4,
+    /// [`bf16_gemv_rows`]: the m = 1 gemv's structure with `m` accumulators.
+    ///
+    /// The only lane here that is not a `cubek` strategy other than
+    /// [`Lane::Hand`], and the only one written for the verify band.
+    GemvRows,
 }
 
 impl Lane {
@@ -508,6 +513,7 @@ impl Lane {
         Lane::SimpleCyclicMmaMulti,
         Lane::OrderedDoubleMmaPk2,
         Lane::OrderedDoubleMmaPk4,
+        Lane::GemvRows,
     ];
 
     /// The name the bench prints.
@@ -540,6 +546,7 @@ impl Lane {
             Lane::SimpleCyclicMmaMulti => "simple cyclic mma multi",
             Lane::OrderedDoubleMmaPk2 => "ordered double mma pk2",
             Lane::OrderedDoubleMmaPk4 => "ordered double mma pk4",
+            Lane::GemvRows => "gemv rows",
         }
     }
 
@@ -547,6 +554,7 @@ impl Lane {
         use cubek::matmul::launch::Strategy;
         match self {
             Lane::Hand => unreachable!("the hand lane is not a cubek strategy"),
+            Lane::GemvRows => unreachable!("the gemv-rows lane is not a cubek strategy"),
             Lane::Auto => Strategy::Auto,
             Lane::SimpleCyclicCmma => Strategy::SimpleCyclicCmma(Default::default()),
             Lane::SimpleCyclicMma => Strategy::SimpleCyclicMma(Default::default()),
@@ -685,6 +693,22 @@ pub fn try_bf16_linear_cubek_launch<R: Runtime>(
     n: usize,
     lane: Lane,
 ) -> Result<Handle, cubek::matmul::definition::MatmulSetupError> {
+    // The one lane here that is not a `cubek` strategy. It declines the same
+    // way they do -- with a setup error -- so the walk in `bf16_gemm` and the
+    // bench's enum sweep both see it as just another candidate rather than as
+    // a special case each has to know about.
+    if lane == Lane::GemvRows {
+        if !gemv_rows_takes(m_pad, k, n) {
+            return Err(cubek::matmul::definition::MatmulSetupError::InvalidConfig(
+                Box::new(format!(
+                    "gemv rows takes 2..={GEMV_ROWS_MAX} rows and a k that divides {}, got \
+                     (m,k,n)=({m_pad},{k},{n})",
+                    GEMV_PLANE * gemv_vec()
+                )),
+            ));
+        }
+        return Ok(bf16_gemv_rows_launch(client, a, b, m_pad, k, n));
+    }
     use cubecl::ir::{ElemType, FloatKind, StorageType};
     use cubek::matmul::definition::{MatmulElems, MatmulGlobalElems};
     use cubek::std::InputBinding;
@@ -702,6 +726,192 @@ pub fn try_bf16_linear_cubek_launch<R: Runtime>(
     });
     cubek::matmul::launch::launch_ref::<R>(&lane.strategy(), client, lhs, rhs, outb, &mut dtypes)?;
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// The multi-row GEMV, which is the lane the verify band never had.
+//
+// `gemv plane par` reaches this part's memory roofline on one row (229 GB/s on
+// `attn wq` against 149 for the best tiled lane, 240 on the 1.65 GB unembed
+// against 168) and `GemvKind::from_problem` DECLINES m > 1. Everything below it
+// is an MMA-tiled lane whose grid is `n / 8` cubes, which at `attn wr`'s n = 512
+// is 64 cubes of one warp — not enough memory-level parallelism to stream a
+// weight at roofline no matter how the tile is shaped. So the band `2 <= m < 16`
+// had no lane that reads the weight ONCE at full bandwidth, and a second row
+// cost what a whole second pass costs. That is not physics: a decode step is
+// bound on WEIGHT BYTES, and a second row does not add any.
+//
+// This is `gemv plane par`'s own structure with `rows` accumulators instead of
+// one. One plane per output column `n`, the plane's 32 units striding the weight
+// row in 16-byte vectors so the read coalesces exactly as the gemv's does, and
+// the SAME `bv` multiplied into every row of the activation before it is
+// dropped. The weight crosses DRAM once for all `rows` rows; the activation is
+// `rows * k * 2` bytes — 16 KiB at k = 4096, m = 2 — and is L2-resident for the
+// whole launch, so the extra rows cost L2 traffic and FMAs, neither of which is
+// the binding constraint.
+//
+// Arithmetic intensity at rows = 2, vec = 8: 16 FMAs per 16 bytes of DRAM, i.e.
+// 0.5 FLOP/byte against a part that does 95.9 TFLOP/s on 273 GB/s (350
+// FLOP/byte). It is bandwidth-bound by three orders of magnitude, which is the
+// whole claim: row 2 is free if and only if it does not re-read the weight.
+
+/// Units per plane. The hardware's warp on this part.
+pub const GEMV_PLANE: usize = 32;
+
+/// The widest `m` this lane will take.
+///
+/// [`MTILE`] is where [`PREFERENCE`]'s own measurement starts, so the band this
+/// answers for is the same one [`PREFERENCE_NARROW`] answers for. Above it the
+/// activation stops being L2-resident against the weight and a tiled lane's
+/// m-tile reuse is the right structure again.
+pub const GEMV_ROWS_MAX: usize = MTILE - 1;
+
+/// `INK_GEMV_PLANES`, planes per cube. Default measured on this box.
+fn gemv_planes() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("INK_GEMV_PLANES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8)
+    })
+}
+
+/// `INK_GEMV_VEC`, BF16 elements per load. 8 is a 16-byte vector.
+fn gemv_vec() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("INK_GEMV_VEC")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8)
+    })
+}
+
+/// `INK_GEMV_ROWS=0` takes this lane out of [`PREFERENCE_NARROW`] entirely.
+///
+/// The A/B handle. It is the arm `scripts/bench-decode.sh` runs against a bare
+/// one, and it is deliberately a removal rather than a reordering: the claim
+/// being tested is that this lane exists, not that it is first.
+fn gemv_rows_on() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("INK_GEMV_ROWS").as_deref() != Ok("0"))
+}
+
+/// Whether [`bf16_gemv_rows`] can take this shape.
+///
+/// `k` must divide the plane's stride because the k loop is not bounds-checked:
+/// a decode step's k is 2048, 4096 or 8192 and every one of them is a multiple
+/// of 256, so a check would cost an instruction per segment to protect a case
+/// the model does not have. `n` needs nothing — the plane bounds-checks its own
+/// column, which is what lets `n = 258` (the router) through.
+pub fn gemv_rows_takes(m: usize, k: usize, _n: usize) -> bool {
+    gemv_rows_on() && (2..=GEMV_ROWS_MAX).contains(&m) && k % (GEMV_PLANE * gemv_vec()) == 0
+}
+
+/// `out = a @ b^T` for `rows` rows, one plane per output column.
+///
+/// `a` is `[rows, k]` BF16, `b` is `[n, k]` BF16 (the checkpoint's own
+/// `[out, in]`), `out` is `[rows, n]` f32.
+///
+/// The accumulation order is the gemv's: a `Vector<f32, NA>` per row carried
+/// across the k segments, summed within the vector, then summed across the
+/// plane. It is NOT the MMA lanes' order — those accumulate 16 k at a time in a
+/// tensor-core accumulator — so the two disagree in the last bits of the
+/// mantissa. There is no exactness requirement between BF16 lanes here and
+/// never was; what is checked is that this tracks the tiled lane to the
+/// tolerance BF16 inputs allow, in `gemv_rows_tracks_the_tiled_lane`.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_gemv_rows<AB: Scalar + Cast, NA: Size>(
+    a: &Tensor<Vector<AB, NA>>,
+    b: &Tensor<Vector<AB, NA>>,
+    out: &mut Tensor<f32>,
+    #[comptime] size_k: usize,
+    #[comptime] size_n: usize,
+    #[comptime] rows: usize,
+    #[comptime] vec: usize,
+    #[comptime] planes: usize,
+) {
+    let lane = UNIT_POS_PLANE as usize;
+    let plane = UNIT_POS_Y as usize;
+    let n_pos = CUBE_POS_X as usize * planes + plane;
+
+    if n_pos < size_n {
+        let segs = comptime!(size_k / (32 * vec));
+        let mut acc = Array::<Vector<f32, NA>>::new(rows);
+        #[unroll]
+        for r in 0..rows {
+            acc[r] = Vector::<f32, NA>::cast_from(0.0f32);
+        }
+
+        let brow = n_pos * size_k;
+        for s in 0..segs {
+            // The planes of a cube start at different k. Without it all eight
+            // ask for the same activation vector in the same cycle and the
+            // weight rows they stream are `k` apart, which is the access
+            // pattern the gemv already swizzles away from.
+            let seg = (s + plane) % segs;
+            let kpos = (seg * 32 + lane) * vec;
+            let bv = Vector::<f32, NA>::cast_from(b[(brow + kpos) / vec]);
+            #[unroll]
+            for r in 0..rows {
+                let av = Vector::<f32, NA>::cast_from(a[(r * size_k + kpos) / vec]);
+                acc[r] += av * bv;
+            }
+        }
+
+        #[unroll]
+        for r in 0..rows {
+            // `vector_sum` is scalar-out at the IR level even though its
+            // Rust type is still a `Vector`; the cast is what `cubek`s own
+            // gemv does with the same pair of calls.
+            let total = f32::cast_from(plane_sum(Vector::vector_sum(acc[r])));
+            if lane == 0 {
+                out[r * size_n + n_pos] = total;
+            }
+        }
+    }
+}
+
+/// Launch [`bf16_gemv_rows`] for a `[m, k] x [n, k]^T` product.
+pub fn bf16_gemv_rows_launch<R: Runtime>(
+    client: &ComputeClient<R>,
+    a: &Handle,
+    b: &Handle,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Handle {
+    let vec = gemv_vec();
+    let planes = gemv_planes();
+    assert_eq!(
+        k % (GEMV_PLANE * vec),
+        0,
+        "k {k} is not a multiple of the plane stride {}",
+        GEMV_PLANE * vec
+    );
+    let out = client.empty(m * n * core::mem::size_of::<f32>());
+    unsafe {
+        bf16_gemv_rows::launch::<bf16, R>(
+            client,
+            CubeCount::Static(n.div_ceil(planes) as u32, 1, 1),
+            CubeDim::new_2d(GEMV_PLANE as u32, planes as u32),
+            vec,
+            TensorArg::from_raw_parts(a.clone(), [k, 1].into(), [m, k].into()),
+            TensorArg::from_raw_parts(b.clone(), [k, 1].into(), [n, k].into()),
+            TensorArg::from_raw_parts(out.clone(), [n, 1].into(), [m, n].into()),
+            k,
+            n,
+            m,
+            vec,
+            planes,
+        )
+    };
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -834,6 +1044,7 @@ const PREFERENCE: &[Lane] = &[
 /// measurement starts (its comment reports m = 512 and m = 16), and starts at 2
 /// because m = 1 is the one width [`PREFERENCE`] was written for.
 const PREFERENCE_NARROW: &[Lane] = &[
+    Lane::GemvRows,
     Lane::OrderedDoubleMmaPk4,
     Lane::DoubleCyclicMma,
     Lane::DoubleHybridMma,
@@ -1355,6 +1566,7 @@ fn launch_lane<R: Runtime>(
 ) -> Handle {
     match lane {
         Lane::Hand => bf16_linear_launch(client, a, b, m, k, n),
+        Lane::GemvRows => bf16_gemv_rows_launch(client, a, b, m, k, n),
         _ => bf16_linear_cubek_launch(client, a, b, m, k, n, lane),
     }
 }

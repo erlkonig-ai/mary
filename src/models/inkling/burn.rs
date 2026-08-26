@@ -4156,6 +4156,100 @@ mod tests {
         );
     }
 
+    /// [`bf16gemm::bf16_gemv_rows`] against the tiled lane on the same bytes.
+    ///
+    /// The multi-row GEMV accumulates the way a GEMV does — a per-row f32
+    /// vector carried across the k segments, summed within the vector and then
+    /// across the plane — and the tiled lanes accumulate 16 k at a time in a
+    /// tensor-core accumulator. Two orders over the same BF16 products, so they
+    /// disagree in the last bits and NOT by more than that. There is no
+    /// bit-exactness requirement between BF16 lanes here; what this detects is
+    /// wiring — a wrong plane index, a wrong k stride, a row read from the
+    /// wrong place — every one of which is an order-one error.
+    ///
+    /// It sweeps the whole band rather than one width, because the failure this
+    /// lane could plausibly have is per-row: m = 1 is not on the band at all,
+    /// and a row-indexing bug that is invisible at m = 2 is not invisible at
+    /// m = 5.
+    #[test]
+    fn gemv_rows_tracks_the_tiled_lane() {
+        use crate::models::inkling::bf16gemm::{Lane, try_bf16_linear_cubek_launch};
+        use cubecl::CubeElement;
+        let dev = burn::backend::cuda::CudaDevice::default();
+        // k must divide the plane stride (32 units x 8 BF16) and n need not
+        // divide anything — 520 is deliberately not a multiple of the eight
+        // planes a cube carries, which is the case the column bounds-check is
+        // there for.
+        let (n, k) = (520usize, 512usize);
+        let probe: Tensor<B, 2> = Tensor::from_data(TensorData::new(vec![0f32], [1, 1]), &dev);
+        let client = client_of(&probe);
+
+        let wf: Vec<f32> = fill(n * k, 0.17).into_iter().map(|x| x * 0.05).collect();
+        let mut wb = Vec::with_capacity(n * k * 2);
+        for x in &wf {
+            wb.extend_from_slice(&half::bf16::from_f32(*x).to_le_bytes());
+        }
+        let w = client.create_from_slice(&wb);
+
+        for m in 2..=5usize {
+            let xf: Vec<f32> = fill(m * k, 0.31);
+            let mut xb = Vec::with_capacity(m * k * 2);
+            for x in &xf {
+                xb.extend_from_slice(&half::bf16::from_f32(*x).to_le_bytes());
+            }
+            let a = client.create_from_slice(&xb);
+
+            let hg = try_bf16_linear_cubek_launch(
+                &client,
+                &a,
+                &w,
+                m,
+                k,
+                n,
+                Lane::GemvRows,
+            )
+            .expect("the gemv-rows lane declined a shape it is meant to take");
+            let ht = try_bf16_linear_cubek_launch(
+                &client,
+                &a,
+                &w,
+                m,
+                k,
+                n,
+                Lane::DoubleCyclicMma,
+            )
+            .expect("the tiled reference declined the shape");
+
+            let g: Vec<f32> =
+                f32::from_bytes(&client.read_one(hg).expect("read the gemv lane")).to_vec();
+            let t: Vec<f32> =
+                f32::from_bytes(&client.read_one(ht).expect("read the tiled lane")).to_vec();
+            assert_eq!(g.len(), m * n);
+            assert_eq!(t.len(), m * n);
+
+            let num: f64 = g
+                .iter()
+                .zip(&t)
+                .map(|(p, q)| ((p - q) as f64).powi(2))
+                .sum();
+            let den: f64 = t.iter().map(|p| (*p as f64).powi(2)).sum();
+            let rel = (num / den).sqrt();
+            println!("gemv rows vs double cyclic mma, m = {m}: relative L2 {rel:.3e}");
+            // Two f32 accumulation orders over identical BF16 products. 1e-3 is
+            // three orders above what that costs and three orders below what a
+            // wiring mistake costs, which is the whole span a detector needs.
+            assert!(
+                rel < 1e-3,
+                "m = {m}: the gemv-rows lane is {rel:.3e} from the tiled lane, \
+                 which is a wiring difference and not an accumulation one"
+            );
+            assert!(
+                den > 0.0,
+                "m = {m}: the reference produced all zeros, so nothing was compared"
+            );
+        }
+    }
+
     /// [`linear_w4a16`] against [`linear_bf16`] on the SAME weight bytes.
     ///
     /// The twin of the test above and the same question: is my lane wired
