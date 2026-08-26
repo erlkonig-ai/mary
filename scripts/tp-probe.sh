@@ -147,8 +147,13 @@ $SSH "cat $RLOG" > "$OUT/rank1.log" 2>/dev/null
 # --- the transport verdict, which outranks the numbers ---------------------
 verdict() {  # verdict <label> <logfile>
   local label=$1 f=$2 ib sock
-  ib=$(grep -c "NET/IB" "$f" 2>/dev/null || echo 0)
-  sock=$(grep -c "NET/Socket" "$f" 2>/dev/null || echo 0)
+  # Count only NCCL's OWN banner lines. The probe prints advice naming both
+  # transports ("grep NET/IB vs NET/Socket"), and counting the whole file
+  # scores that sentence as a socket channel -- which reported a clean
+  # 709-IB/0-socket RoCE run as "MIXED" and would have sent every future run
+  # looking for a fallback that was never there.
+  ib=$(grep "NCCL INFO" "$f" 2>/dev/null | grep -c "NET/IB" || echo 0)
+  sock=$(grep "NCCL INFO" "$f" 2>/dev/null | grep -c "NET/Socket" || echo 0)
   if [ "$ib" -gt 0 ] && [ "$sock" -eq 0 ]; then
     echo "  $label: NET/IB  ($ib lines) — RDMA, the path the costing assumes"
   elif [ "$sock" -gt 0 ] && [ "$ib" -eq 0 ]; then
@@ -159,7 +164,16 @@ verdict() {  # verdict <label> <logfile>
   else
     echo "  $label: transport UNKNOWN — no NET/ line. Was NCCL_DEBUG=INFO set?"
   fi
-  grep -E "NET/(IB|Socket)" "$f" 2>/dev/null | head -4 | sed 's/^/        /'
+  grep "NCCL INFO" "$f" 2>/dev/null | grep -E "NET/(IB|Socket)" | head -4 | sed 's/^/        /'
+  # GPU Direct RDMA is the difference between the HCA reading GPU memory
+  # directly and staging every collective through host memory. NCCL says so
+  # once per HCA and then never again, and a run that does not report it will
+  # be read as if RDMA were end-to-end when it is not.
+  if grep -q "GPU Direct RDMA Disabled" "$f" 2>/dev/null; then
+    echo "        !! GPUDirect RDMA DISABLED — collectives stage through host memory."
+  elif grep -q "GPU Direct RDMA Enabled" "$f" 2>/dev/null; then
+    echo "        GPUDirect RDMA enabled."
+  fi
 }
 echo
 echo "--- transport ---"
