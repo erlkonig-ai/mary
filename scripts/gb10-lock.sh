@@ -35,6 +35,23 @@
 #   gb10-lock.sh release <host> <tag>  -> releases only if <tag> holds it
 #   gb10-lock.sh check <host>          -> prints the holder, rc 0 free, rc 3 held
 #
+# WHAT THIS DOES NOT DO: THERE IS NO QUEUE. It is mutual exclusion and nothing
+# more. A caller refused with rc 3 is not remembered, is not owed the next slot,
+# and will not be handed anything when the lock frees -- it has to come back and
+# ask again. Two consequences, both seen within an hour of this landing:
+#
+#   - A waiter that gives up on the first refusal simply does not run. If your
+#     work matters, POLL with a bounded backoff and a long ceiling, and report
+#     "never got a slot" rather than reporting nothing.
+#   - With several agents and long holds, an unlucky waiter can STARVE. Nothing
+#     here prevents it. If that starts happening, the fix is a real queue (a
+#     ticket file, taken in order), not a longer timeout and not politeness.
+#
+# It is deliberately this simple because the failure it was built for -- two
+# runs overlapping and OOM-killing each other -- needs only exclusion, and a
+# queue that is wrong is worse than no queue. Revisit when starvation is
+# observed, not before.
+#
 # NEVER `pkill -f` ON A SHARED BOX, and never kill a lock holder's processes to
 # take a lock. If a box is held, WAIT or exit cleanly and say so. The lock tells
 # you who to ask, not who to kill.
