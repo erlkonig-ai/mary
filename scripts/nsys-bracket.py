@@ -1,53 +1,62 @@
 #!/usr/bin/env python3
-"""nsys-bracket.py -- bracket a decode step into HOST ENQUEUE, DEVICE BUSY and
-EXPOSED DEVICE TIME, by DIFFERENCING two nsys profiles of the same config that
-differ only in INK_GEN.
+"""nsys-bracket.py -- bracket a WARM DECODE STEP into device busy, device idle
+and host driver time, from ONE nsys profile, by cutting the timeline at a kernel
+that fires exactly once per step.
 
-WHY A DIFFERENCE AND NOT A TOTAL. A single profile of one run is dominated by
-setup: index build, the 82.7 GiB weight copy, kernel JIT, arena warm-up. On the
-head-only config `cuMemcpy2DAsync_v2` alone is 1.30 s of a profile whose entire
-decode is 0.6 s. Nothing per-step can be read off it. Two runs of the SAME
-binary, SAME prompt, SAME layers and DIFFERENT INK_GEN share that setup exactly,
-so (g_hi - g_lo) / (hi - lo) is a per-decode-step figure with every fixed cost
-subtracted. This is the method the graph lane used to derive its per-node device
-figures; this script is that method written down so the next reader runs it
-rather than re-deriving it.
+WHY NOT THE OBVIOUS METHOD. The tempting way to get a per-step figure out of a
+profile whose totals are dominated by setup is to run the same config twice at
+two INK_GEN values and difference them: the index build, the 82.7 GiB weight
+copy and the kernel JIT are identical, so (hi - lo) / (gen_hi - gen_lo) should
+be per-step with every fixed cost removed. IT IS NOT RELIABLE HERE, measured:
+the PREFILL pass is 3732 rows wide and costs ~1.3 s of `w4a16_linear` on its
+own, and it does not reproduce between two runs of the same binary to better
+than ~10%. On the head-only config that irreproducibility was 51 ms (off arm)
+and 130 ms (rule arm) on one kernel; spread over 20 steps that is 2.5 and 6.5
+ms/step of ERROR on a quantity whose true value is ~6 and ~5 ms/step. The
+difference reported the swizzled kernel as 2.9x SLOWER when a warm-window count
+on the same two profiles shows it 1.30x FASTER. A difference of two numbers each
+carrying an unreproducible 1.3 s term is not a small-number measurement.
 
-WHAT EACH NUMBER IS PER. Every figure this prints is PER DECODE STEP, for ONE
-PROCESS (one node), on the config named in the profile's own metadata (which it
-echoes, so a figure can never be separated from the layer range and INK_KV that
-produced it). It is NOT per token unless tokens/pass is 1, and NOT per layer.
+SO CUT THE TIMELINE INSTEAD. `--anchor` names a kernel that launches exactly
+once per decode step (`ann_scan_kernel`, the approximate head's scan, is the
+default and is one per step on any node that owns the unembed). Consecutive
+anchor starts bound one whole step, device-side. The last `--last N` such
+intervals are warm by construction -- they are the end of the run, past every
+cold pass -- and the median over them is reported with its spread, so no figure
+here rests on one step.
 
-  device busy    the UNION of GPU activity intervals (kernels + memcpy), so
-                 concurrent streams are counted once. This is what the device
+WHAT EACH NUMBER IS PER. PER DECODE STEP, ONE PROCESS (one node), on the config
+the profile's own metadata names (echoed below, so a figure cannot be separated
+from its layer range). Not per token unless tokens/pass is 1, and not per layer.
+
+  step period    anchor to anchor. The device-side step; it agrees with the
+                 binary's own ms/step when the run is not stalled.
+  device busy    UNION of GPU activity intervals inside the step (kernels +
+                 memcpy), so concurrent streams count once. What the device
                  would take with a zero-cost host.
-  kernel sum     the SUM of kernel durations. Above `device busy` only when
-                 streams overlap; on this decode lane they are within 1%.
-  host enqueue   wall time the launching thread spends inside CUDA driver calls
-                 (cuLaunchKernel, cuMemcpy*Async, cuMemAlloc*, ...). It excludes
-                 blocking waits (cuEventSynchronize, cuCtxSynchronize,
-                 cuStreamSynchronize) -- those are the host WAITING FOR the
-                 device, not enqueueing, and folding them in would double-count
-                 device time as host cost.
-  host wait      the blocking waits, reported separately for exactly that reason.
-  step           the run's own reported ms/step, if given with --step-lo/--step-hi.
-
-  exposed device = step - host enqueue - host wait.  The device time that is NOT
-                 hidden behind the host. It is the ONLY part of a device-side
-                 win that a step can see, which is the whole point of the
-                 bracket.
+  device idle    step period - device busy. Time the GPU had nothing to run,
+                 i.e. the room a host-side saving has to move into.
+  driver calls   wall time the LAUNCHER thread spends inside CUDA driver calls,
+                 split into enqueue-ish calls and BLOCKING waits. A blocking
+                 wait on the launcher thread is device time inside whatever
+                 host bracket happens to be open -- which is why the binary's
+                 "HOST, enqueue only" lines move when only a memory LAYOUT
+                 changed.
 
 USAGE
-  scripts/nsys-bracket.py LO.sqlite HI.sqlite [--top N] [--step-lo MS --step-hi MS]
+  scripts/nsys-bracket.py PROFILE.sqlite [PROFILE.sqlite ...]
+        [--anchor KERNEL] [--last N] [--top K]
 
-The two .sqlite files come from `nsys export --type sqlite <rep>.nsys-rep`.
+  .sqlite comes from `nsys export --type sqlite <rep>.nsys-rep`.
+  Several profiles may be given; each is bracketed and the table is comparable
+  row to row ONLY when the profiles differ in one thing and say so.
 """
 
 import sqlite3
 import sys
 import argparse
+import statistics
 
-# Driver calls that are the host WAITING on the device, not enqueueing work.
 WAIT_CALLS = {
     "cuEventSynchronize",
     "cuCtxSynchronize",
@@ -57,23 +66,21 @@ WAIT_CALLS = {
 }
 
 
-def meta(db):
-    cur = db.execute(
-        "SELECT name, value FROM META_DATA_CAPTURE "
-        "WHERE name LIKE 'PROCESS_0:ARGUMENT%' OR name='PROCESS_0:COMMAND' "
-        "ORDER BY name"
-    )
-    return [v for _, v in cur.fetchall()]
-
-
-def union_ms(rows):
-    """Total length of the union of [start, end) intervals, in ms."""
-    if not rows:
+def union_ms(rows, lo=None, hi=None):
+    """Union length of [start,end) intervals clipped to [lo,hi), in ms."""
+    iv = []
+    for s, e in rows:
+        if lo is not None:
+            s = max(s, lo)
+            e = min(e, hi)
+        if e > s:
+            iv.append((s, e))
+    if not iv:
         return 0.0
-    rows = sorted(rows)
+    iv.sort()
     total = 0
-    cs, ce = rows[0]
-    for s, e in rows[1:]:
+    cs, ce = iv[0]
+    for s, e in iv[1:]:
         if s > ce:
             total += ce - cs
             cs, ce = s, e
@@ -83,158 +90,131 @@ def union_ms(rows):
     return total / 1e6
 
 
-def profile(path):
+def analyse(path, anchor, last, top):
     db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    out = {"meta": meta(db)}
+    meta = [
+        v
+        for _, v in db.execute(
+            "SELECT name, value FROM META_DATA_CAPTURE "
+            "WHERE name LIKE 'PROCESS_0:ARGUMENT%' ORDER BY name"
+        ).fetchall()
+    ]
 
-    iv = db.execute("SELECT start, end FROM CUPTI_ACTIVITY_KIND_KERNEL").fetchall()
-    try:
-        iv += db.execute("SELECT start, end FROM CUPTI_ACTIVITY_KIND_MEMCPY").fetchall()
-    except sqlite3.OperationalError:
-        pass
-    try:
-        iv += db.execute("SELECT start, end FROM CUPTI_ACTIVITY_KIND_MEMSET").fetchall()
-    except sqlite3.OperationalError:
-        pass
-    out["device_busy"] = union_ms(iv)
+    anchors = [
+        r[0]
+        for r in db.execute(
+            "SELECT k.start FROM CUPTI_ACTIVITY_KIND_KERNEL k "
+            "JOIN StringIds s ON k.shortName=s.id WHERE s.value=? ORDER BY k.start",
+            (anchor,),
+        ).fetchall()
+    ]
+    if len(anchors) < last + 1:
+        sys.exit(
+            f"!! {path}: only {len(anchors)} launches of anchor '{anchor}'; "
+            f"--last {last} needs {last + 1}. Name a kernel that fires once per step."
+        )
+    anchors = anchors[-(last + 1):]
+    t0, t1 = anchors[0], anchors[-1]
 
-    krows = db.execute(
-        "SELECT s.value, count(*), sum(k.end-k.start)/1e6 "
-        "FROM CUPTI_ACTIVITY_KIND_KERNEL k JOIN StringIds s ON k.shortName=s.id "
-        "GROUP BY 1"
+    kern = db.execute(
+        "SELECT k.start, k.end, s.value FROM CUPTI_ACTIVITY_KIND_KERNEL k "
+        "JOIN StringIds s ON k.shortName=s.id WHERE k.start>=? AND k.start<?",
+        (t0, t1),
     ).fetchall()
-    out["kernels"] = {n: (c, ms) for n, c, ms in krows}
-    out["kernel_sum"] = sum(ms for _, ms in out["kernels"].values())
-    out["kernel_n"] = sum(c for c, _ in out["kernels"].values())
+    try:
+        cpy = db.execute(
+            "SELECT start, end FROM CUPTI_ACTIVITY_KIND_MEMCPY "
+            "WHERE start>=? AND start<?",
+            (t0, t1),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        cpy = []
 
-    rrows = db.execute(
-        "SELECT s.value, count(*), sum(r.end-r.start)/1e6 "
-        "FROM CUPTI_ACTIVITY_KIND_RUNTIME r JOIN StringIds s ON r.nameId=s.id "
-        "GROUP BY 1"
-    ).fetchall()
-    out["api"] = {n: (c, ms) for n, c, ms in rrows}
-
-    # WHICH THREAD BLOCKS MATTERS, and it is the difference between two
-    # completely different readings of the same total. A blocking wait on the
-    # thread that also issues `cuLaunchKernel` is the model's own enqueue loop
-    # stopping dead -- device time showing up inside a bracket labelled "host,
-    # enqueue only". The same wait on any other thread is a helper the enqueue
-    # never sees. So the launcher thread is identified by what it does, not by
-    # its id (ids differ between runs and cannot be paired), and the wait time is
-    # split on that.
     lt = db.execute(
         "SELECT r.globalTid, count(*) FROM CUPTI_ACTIVITY_KIND_RUNTIME r "
         "JOIN StringIds s ON r.nameId=s.id WHERE s.value='cuLaunchKernel' "
         "GROUP BY 1 ORDER BY 2 DESC LIMIT 1"
     ).fetchone()
     launcher = lt[0] if lt else None
-    out["launcher_tid"] = launcher
-    wl = wo = 0.0
-    for name, tid, ms in db.execute(
-        "SELECT s.value, r.globalTid, sum(r.end-r.start)/1e6 "
-        "FROM CUPTI_ACTIVITY_KIND_RUNTIME r JOIN StringIds s ON r.nameId=s.id "
-        "GROUP BY 1,2"
-    ).fetchall():
-        if name not in WAIT_CALLS:
-            continue
-        if tid == launcher:
-            wl += ms
-        else:
-            wo += ms
-    out["wait_launcher"] = wl
-    out["wait_other"] = wo
-    out["host_enqueue"] = sum(
-        ms for n, (_, ms) in out["api"].items() if n not in WAIT_CALLS
-    )
-    out["host_wait"] = sum(
-        ms for n, (_, ms) in out["api"].items() if n in WAIT_CALLS
-    )
-    out["api_n"] = sum(c for c, _ in out["api"].values())
+    api = db.execute(
+        "SELECT r.start, r.end, s.value, r.globalTid FROM CUPTI_ACTIVITY_KIND_RUNTIME r "
+        "JOIN StringIds s ON r.nameId=s.id WHERE r.start>=? AND r.start<?",
+        (t0, t1),
+    ).fetchall()
     db.close()
-    return out
+
+    periods, busy, enq, wait, waito = [], [], [], [], []
+    kacc = {}
+    for i in range(last):
+        a, b = anchors[i], anchors[i + 1]
+        periods.append((b - a) / 1e6)
+        iv = [(s, e) for s, e, _ in kern if s < b and e > a] + [
+            (s, e) for s, e in cpy if s < b and e > a
+        ]
+        busy.append(union_ms(iv, a, b))
+        q = w = wo = 0.0
+        for s, e, n, tid in api:
+            if s < a or s >= b:
+                continue
+            d = (e - s) / 1e6
+            if n in WAIT_CALLS:
+                if tid == launcher:
+                    w += d
+                else:
+                    wo += d
+            elif tid == launcher:
+                q += d
+        enq.append(q)
+        wait.append(w)
+        waito.append(wo)
+        for s, e, n in kern:
+            if a <= s < b:
+                kacc.setdefault(n, [0, 0.0])
+                kacc[n][0] += 1
+                kacc[n][1] += (e - s) / 1e6
+
+    def med(v):
+        return statistics.median(v)
+
+    def spread(v):
+        return 100.0 * (max(v) - min(v)) / med(v) if med(v) else 0.0
+
+    print(f"=== {path} ===")
+    print(f"  config : {' '.join(meta)}")
+    print(
+        f"  window : the last {last} intervals between consecutive '{anchor}' "
+        f"launches (one decode step each)"
+    )
+    print(f"  {'step period':<14} {med(periods):8.3f} ms/step   (spread {spread(periods):.1f}% over {last} steps)")
+    print(f"  {'device busy':<14} {med(busy):8.3f} ms/step   ({100*med(busy)/med(periods):.0f}% of the step; union of kernel+memcpy)")
+    print(f"  {'device idle':<14} {med(periods)-med(busy):8.3f} ms/step   (the GPU had nothing to run)")
+    print(f"  {'driver enqueue':<14} {med(enq):8.3f} ms/step   (launcher thread, non-blocking calls)")
+    print(f"  {'driver BLOCK':<14} {med(wait):8.3f} ms/step   (launcher thread, blocking waits = device time")
+    print(f"  {'':<14} {'':8}              inside whatever host bracket is open)")
+    print(f"  {'other threads':<14} {med(waito):8.3f} ms/step   (blocking waits the enqueue never sees)")
+    print(f"  --- top {top} kernels, per decode step ---")
+    rows = sorted(((v[1] / last, v[0] / last, n) for n, v in kacc.items()), reverse=True)
+    for ms, cnt, n in rows[:top]:
+        print(f"  {ms:8.3f} ms/step  {cnt:7.1f} launches/step  {n[:66]}")
+    print()
+    return {
+        "period": med(periods),
+        "busy": med(busy),
+        "enq": med(enq),
+        "wait": med(wait),
+        "kern": {n: (v[0] / last, v[1] / last) for n, v in kacc.items()},
+    }
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("lo")
-    ap.add_argument("hi")
-    ap.add_argument("--gen-lo", type=int, default=None)
-    ap.add_argument("--gen-hi", type=int, default=None)
-    ap.add_argument("--top", type=int, default=12)
-    ap.add_argument("--step-lo", type=float, default=None,
-                    help="ms/step the LO run reported (optional, for `exposed`)")
-    ap.add_argument("--step-hi", type=float, default=None)
+    ap.add_argument("profiles", nargs="+")
+    ap.add_argument("--anchor", default="ann_scan_kernel")
+    ap.add_argument("--last", type=int, default=8)
+    ap.add_argument("--top", type=int, default=8)
     a = ap.parse_args()
-
-    lo, hi = profile(a.lo), profile(a.hi)
-
-    def gen_of(p, fallback):
-        for v in p["meta"]:
-            if v.startswith("INK_GEN="):
-                return int(v.split("=", 1)[1])
-        return fallback
-
-    glo = a.gen_lo if a.gen_lo else gen_of(lo, 0)
-    ghi = a.gen_hi if a.gen_hi else gen_of(hi, 0)
-    n = ghi - glo
-    if n <= 0:
-        sys.exit(f"!! INK_GEN must differ and hi>lo (got {glo} and {ghi})")
-
-    print(f"=== per-decode-step bracket, ONE PROCESS, by (GEN {ghi} - GEN {glo}) / {n} ===")
-    print(f"  lo : {a.lo}")
-    print(f"       {' '.join(lo['meta'][1:])}")
-    print(f"  hi : {a.hi}")
-    print(f"       {' '.join(hi['meta'][1:])}")
-    if lo["meta"][1:] != hi["meta"][1:]:
-        diff = [x for x in lo["meta"] if x not in hi["meta"]] + [
-            x for x in hi["meta"] if x not in lo["meta"]
-        ]
-        nong = [x for x in diff if not x.startswith("INK_GEN=") and not x.endswith(".bin")]
-        if nong:
-            print(f"  !! THE TWO RUNS DIFFER IN MORE THAN INK_GEN: {nong}")
-            print("     A difference is only a per-step figure when everything else is shared.")
-    print()
-
-    def d(k):
-        return (hi[k] - lo[k]) / n
-
-    print(f"  {'device busy':<16} {d('device_busy'):8.3f} ms/step   (union of kernel+memcpy intervals)")
-    print(f"  {'kernel sum':<16} {d('kernel_sum'):8.3f} ms/step   ({(hi['kernel_n']-lo['kernel_n'])/n:.0f} kernels/step)")
-    print(f"  {'host enqueue':<16} {d('host_enqueue'):8.3f} ms/step   ({(hi['api_n']-lo['api_n'])/n:.0f} driver calls/step)")
-    print(f"  {'host wait':<16} {d('host_wait'):8.3f} ms/step   (blocking sync, host waiting ON the device)")
-    print(f"  {'  on launcher':<16} {d('wait_launcher'):8.3f} ms/step   (the SAME thread that issues cuLaunchKernel:")
-    print(f"  {'':<16} {'':8}              this is device time inside the enqueue bracket)")
-    print(f"  {'  on others':<16} {d('wait_other'):8.3f} ms/step   (helper threads; the enqueue never sees these)")
-    if a.step_lo and a.step_hi:
-        step = (a.step_hi * ghi - a.step_lo * glo) / n
-        print(f"  {'step':<16} {step:8.3f} ms/step   (from the runs' own WARM medians, same difference)")
-        exposed = step - d("host_enqueue") - d("host_wait")
-        print(f"  {'EXPOSED device':<16} {exposed:8.3f} ms/step   = step - host enqueue - host wait")
-        print(f"  {'hidden device':<16} {d('device_busy')-exposed:8.3f} ms/step   = device busy - exposed")
-        print(f"  {'host-bound frac':<16} {100*(d('host_enqueue')+d('host_wait'))/step:7.1f}%    of the step is host")
-    print()
-
-    print(f"  --- top {a.top} kernels, per decode step ---")
-    rows = []
-    for name in set(hi["kernels"]) | set(lo["kernels"]):
-        c1, m1 = hi["kernels"].get(name, (0, 0.0))
-        c0, m0 = lo["kernels"].get(name, (0, 0.0))
-        rows.append((( m1 - m0) / n, (c1 - c0) / n, name))
-    rows.sort(reverse=True)
-    for ms, cnt, name in rows[: a.top]:
-        print(f"  {ms:8.3f} ms/step  {cnt:7.1f} launches/step  {name[:70]}")
-    print()
-
-    print(f"  --- top driver calls, per decode step ---")
-    rows = []
-    for name in set(hi["api"]) | set(lo["api"]):
-        c1, m1 = hi["api"].get(name, (0, 0.0))
-        c0, m0 = lo["api"].get(name, (0, 0.0))
-        rows.append(((m1 - m0) / n, (c1 - c0) / n, name))
-    rows.sort(reverse=True)
-    for ms, cnt, name in rows[:10]:
-        tag = "  [WAIT]" if name in WAIT_CALLS else ""
-        print(f"  {ms:8.3f} ms/step  {cnt:7.1f} calls/step  {name}{tag}")
+    for p in a.profiles:
+        analyse(p, a.anchor, a.last, a.top)
 
 
 if __name__ == "__main__":
