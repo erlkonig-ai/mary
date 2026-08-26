@@ -850,8 +850,29 @@ fn attention_prefill_lane(
             _ => 1.0,
         })
         .collect();
-    let tau: Tensor<Bk, 1> = Tensor::from_data(TensorData::new(taus, [tokens]), &dev);
-    let q = q * tau.clone().reshape([tokens, 1]);
+    // AND ONLY WHEN IT SCALES ANYTHING. On a LOCAL layer -- thirty-five of this
+    // model's forty-two -- the match above returns 1.0 for every token, and so
+    // does a global layer the caller handed no `LogScaling`. Building the vector
+    // anyway cost a host->device upload and a broadcast multiply per layer per
+    // step to compute `x * 1.0`: ~42 launches a node a step, ~0.8 ms of pure
+    // host enqueue, on a pass this file's own brackets show is host-enqueue-
+    // bound. In a captured-graph world it is 42 fewer nodes to record and patch.
+    //
+    // The skip is BIT-IDENTICAL rather than approximately so, which is why it is
+    // a guard and not a fast path: multiplying by exactly 1.0 is the identity on
+    // every finite value, on both signed zeros, on the infinities and on NaN, so
+    // an arm that skips it cannot differ from one that does not. The comparison
+    // is against exactly 1.0 for the same reason -- a tau that is 1.0 to six
+    // places is not 1.0, and it takes the multiply.
+    // `None` when every tau is exactly 1.0, and then NOTHING below multiplies.
+    let tau: Option<Tensor<Bk, 1>> = taus
+        .iter()
+        .any(|&t| t != 1.0)
+        .then(|| Tensor::from_data(TensorData::new(taus, [tokens]), &dev));
+    let q = match &tau {
+        Some(t) => q * t.clone().reshape([tokens, 1]),
+        None => q,
+    };
 
     // Only distances that can occur are worth projecting: a distance is at most
     // `tokens - 1` and the table stops at `rel_extent`.
@@ -886,8 +907,11 @@ fn attention_prefill_lane(
             let rel = r
                 .reshape([tokens * heads, d.d_rel])
                 .matmul(w.rel_proj.clone().slice([0..d.d_rel, 0..eff]))
-                .reshape([tokens, heads, eff])
-                * tau.reshape([tokens, 1, 1]);
+                .reshape([tokens, heads, eff]);
+            let rel = match &tau {
+                Some(t) => rel * t.clone().reshape([tokens, 1, 1]),
+                None => rel,
+            };
             let client = client_of(&q);
             // Q, K, V and the relative table exactly as the projections left
             // them: `[tokens, heads * head_dim]` and `[tokens, kv_heads *
@@ -980,8 +1004,11 @@ fn attention_prefill_lane(
                     .slice([lo..hi, 0..heads * d.d_rel])
                     .reshape([rows * heads, d.d_rel])
                     .matmul(rel_proj.clone())
-                    .reshape([rows, heads, eff])
-                    * tau.clone().slice([lo..hi]).reshape([rows, 1, 1]);
+                    .reshape([rows, heads, eff]);
+                let rel = match &tau {
+                    Some(t) => rel * t.clone().slice([lo..hi]).reshape([rows, 1, 1]),
+                    None => rel,
+                };
                 let rel_h = handle_of(rel);
                 let q_h = handle_of(q.clone().slice([lo..hi, 0..heads * head_dim]));
                 let o = flash_attention_launch(
@@ -1094,8 +1121,11 @@ fn attention_prefill_lane(
                     .slice([lo..hi, 0..heads * d.d_rel])
                     .reshape([rows * heads, d.d_rel])
                     .matmul(rel_proj.clone())
-                    .reshape([rows, heads, eff])
-                    * tau.clone().slice([lo..hi]).reshape([rows, 1, 1]);
+                    .reshape([rows, heads, eff]);
+                let rel = match &tau {
+                    Some(t) => rel * t.clone().slice([lo..hi]).reshape([rows, 1, 1]),
+                    None => rel,
+                };
 
                 // `q_block @ k^T` raw, then scaled, biased and masked IN PLACE
                 // by one kernel. `handle_of` consumes the tensor, so after that
