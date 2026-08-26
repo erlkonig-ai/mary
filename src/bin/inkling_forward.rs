@@ -2628,30 +2628,54 @@ fn w4a16_bind(
     for_ann: bool,
 ) -> dev_lane::ProjW {
     use mary::models::inkling::w4a16gemm as k16;
-    // THE APPROXIMATE HEAD OWNS m=1, AND IT CANNOT READ FRAGMENT ORDER.
-    // `linear_ann` -> `ann_logits` reads codes/scales as row-major [n, k/8] and
-    // has no fragment path, so permuting the head while the aNN lane is on makes
-    // every exact rescore read permuted bytes as row-major. Neither branch is
-    // wrong alone; the seam between them is.
+    // TWO REASONS NOT TO PERMUTE, and they are not the same reason. Only the
+    // HEAD is ever permuted here, and only when the approximate lane is off.
     //
-    // `for_ann` IS THE WHOLE POINT OF THE PARAMETER, and it is worth saying why
-    // it is not simply `ann_budget() > 0`. This function is the single entry
-    // point for TWO unrelated weights: the unembedding, which `linear_ann` may
-    // read, and the SINK experts, which it never can -- `shared_experts_dev`
-    // goes to `linear_w` -> `linear_w4a16`, which branches on `p.swizzled` and
-    // has read fragment order correctly all along. Between df175e5 and this
-    // commit the guard was global, so turning the aNN lane on (its default)
-    // silently took the permutation off forty layers of sink weights that had
-    // nothing to do with the seam. The head lost nothing by it -- with the aNN
-    // lane on, m=1 never reaches `linear_w4a16` -- but the sinks lost the whole
-    // of it, on every layer of every step.
+    // 1. CORRECTNESS, the head. `linear_ann` -> `ann_logits` reads codes/scales
+    //    as row-major [n, k/8] and has no fragment path, so permuting the head
+    //    while the aNN lane is on makes every exact rescore read permuted bytes
+    //    as row-major. Neither branch is wrong alone; the seam between them is,
+    //    and it produced plausible logits rather than an error. `for_ann` names
+    //    the weight `linear_ann` might read, which is why this is not simply
+    //    `ann_budget() > 0`: the SINK experts come through this same function
+    //    and can never reach `ann_logits` at all.
     //
-    // Teaching `ann_logits` the fragment layout would let the head keep its
-    // permutation too (worth it only on verify passes, m>=2). That is still the
-    // better fix and this is still the correct one; it is now merely scoped to
-    // the weight that needs it.
+    // 2. SPEED, the sinks -- and this one is MEASURED and went the other way
+    //    from what everybody predicted. The sinks are correct in either layout,
+    //    so this is purely a performance choice. Permuting them is a LOSS:
+    //
+    //      a109514 -> e30f22a, ctx 3732, split 21, 7 reps, 441 warm passes a
+    //      side, identical binary on both nodes, `for_ann` 0 -> 5 refs:
+    //
+    //        w4a16_linear, both nodes   6.84 -> 8.55 ms   (+1.71, +25%)
+    //          head 3.30 -> 4.05, tail 3.54 -> 4.50
+    //        device busy, both nodes   73.42 -> 75.23 ms  (+1.81)
+    //
+    //      The kernel name changed `w4a16_linear_ab` -> `w4a16_linear_swz_ab`,
+    //      so the permuted path is unambiguously what ran, and it accounts for
+    //      94% of the device regression.
+    //
+    //    WHY, and it is a lesson about quoting a figure outside its shape. The
+    //    permutation was measured at the HEAD's shape -- 201024 x 4096, ~25128
+    //    cubes -- where it is worth 95.9 -> 116.3 GB/s. The sinks are 8192x4096
+    //    and 4096x2048, which are 1024 and 512 cubes. That is a different point
+    //    on the cube-count curve, and `swz_grid_scaling` already said the
+    //    multiplier shrinks there. It does not merely shrink; at this shape it
+    //    inverts. A permutation trades a coalesced read for a gathered one at
+    //    the WRITE side of the staging, and with too few warps in flight to
+    //    hide it there is nothing left to pay for it.
+    //
+    // So the head keeps its correctness guard and the sinks are never permuted.
+    // `INK_W4A16_SWZ` remains the ablation, and it now only reaches the head.
+    //
+    // WHAT THIS A/B COULD NOT SEPARATE: `de482cb` bundled the sink permutation
+    // WITH moving the pool `memory_usage` barrier off the decode path, and the
+    // same run shows non-device residue falling 21.38 -> 17.67 ms. The two
+    // halves are disentangled by this commit, which reverts only the first.
     let ann_owns_m1 = for_ann && ann_budget() > 0;
-    if !ann_owns_m1 && k16::swizzle_w4a16() && k16::swizzleable(p.n, p.k) {
+    // Reason 2 above: never for the sinks, at any budget.
+    let grid_too_small = !for_ann;
+    if !ann_owns_m1 && !grid_too_small && k16::swizzle_w4a16() && k16::swizzleable(p.n, p.k) {
         let (c, s) = k16::swizzle_w4a16_device(client, &p.codes, &p.scales, p.n, p.k);
         p.codes = c;
         p.scales = s;

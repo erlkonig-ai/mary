@@ -796,6 +796,40 @@ pub fn swizzle_w4a16_device<R: Runtime>(
 /// **Numerics.** Bit-identical, as a permutation must be: max deviation
 /// 0.000e0 over 1024 outputs of a `[16, 256] x [64, 256]^T` product against the
 /// row-major lane. Reported as an observation; there is no gate on it.
+///
+/// # RETRACTED FOR THE SINKS, 2026-08-26. Do not quote the table above at any
+/// # shape but the head's.
+///
+/// The end-to-end row (`swz` 56.1 against `row-major` 57.2 ms/step) was taken
+/// with `ANN_BUDGET_DEFAULT` already at 8192, so the head went through
+/// `linear_ann` in BOTH arms and read identical bytes -- meaning the 1.1 ms was
+/// attributed to the SINKS. Two things were wrong with that. It was confounded:
+/// the `swz` arm of that A/B was the one carrying the `linear_ann` seam bug, so
+/// the two arms generated different token streams and routed to different
+/// experts. And when the unconfounded A/B was finally run -- a109514 against
+/// e30f22a, ctx 3732, split 21, 7 reps, 441 warm passes a side -- it came back
+/// the other way:
+///
+/// ```text
+///   w4a16_linear, both nodes   6.84 -> 8.55 ms   (+1.71, +25% SLOWER permuted)
+///     head 3.30 -> 4.05, tail 3.54 -> 4.50
+/// ```
+///
+/// The kernel name changed `w4a16_linear_ab` -> `w4a16_linear_swz_ab`, so the
+/// permuted path is unambiguously what ran.
+///
+/// The KERNEL table at the top stands -- it is the head's shape, 201024 x 4096,
+/// ~25128 cubes, and 95.9 -> 116.3 GB/s there is real. The sinks are 8192x4096
+/// and 4096x2048, i.e. 1024 and 512 cubes. `swz_grid_scaling` had already shown
+/// the multiplier shrinking as the grid starves; at the sink shapes it inverts.
+///
+/// So `w4a16_bind` now permutes the HEAD only, and only when the approximate
+/// lane is off. The sinks are correct in either layout -- they never touch
+/// `ann_logits` -- so leaving them row-major costs nothing but the speed it
+/// buys back. THE LESSON, which is the reason this retraction is written out
+/// rather than deleted: a bandwidth figure is a property of a SHAPE, and this
+/// one was carried across a 25x difference in cube count without anybody
+/// noticing that the framing rule had been dropped.
 pub fn swizzle_w4a16() -> bool {
     std::env::var("INK_W4A16_SWZ")
         .map(|v| v != "0")
