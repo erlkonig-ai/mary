@@ -1101,10 +1101,20 @@
 //! * **A within-layer split.** 84 all-reduces a token at the measured 26.84 us
 //!   is 2.25 ms, **0.26% of an 866 ms pass** at `b = 64`; bandwidth is four
 //!   orders of magnitude clear. It halves the bytes each node reads AND runs
-//!   both GPUs on the same token, so the bound is 2x -- ~148 aggregate tok/s at
-//!   64 -- and it halves per-node weight residency, which is the thing that ran
-//!   out at 96. It needs every weight resharded, NCCL inside the loop, and the
-//!   KV cache split by head.
+//!   both GPUs on the same token. It needs the weights resharded, NCCL inside
+//!   the loop, and the KV cache split by head. The shard arithmetic and the
+//!   full costing are in `mary::models::inkling::tp`.
+//!
+//!   **Two claims this bullet used to make are wrong and are corrected there.**
+//!   (1) "the bound is 2x" ignores the term that does NOT halve: each node
+//!   issues 42 layers of kernels instead of 21, and at batch one the true
+//!   enqueue cost is ~1.25 ms/layer against ~49 ms of halved device streaming,
+//!   so **host enqueue becomes the binding constraint** and the projection is
+//!   1.5-1.9x rather than 2x. (2) "it halves per-node weight residency" is not
+//!   a gain over what is already here -- the LAYER split already halves it, and
+//!   an expert-parallel within-layer split lands within a few GiB of the same
+//!   ~76 GiB share. What it halves that the layer split does not is the KV and
+//!   ACTIVATION working set, which is the thing that actually ran out at 96.
 //! * **A two-cohort pipeline interleave.** BUILT -- `INK_COHORTS`, the section
 //!   after next. It predicted `p50(2c) / p50(c)` at a fixed slot budget:
 //!   866.3 / 585.7 = 1.48x at 64 slots, 1.45x at 96. Measured, **1.49x at 64
@@ -3467,6 +3477,25 @@ fn drop_pad_cols(v: Vec<f32>, n: usize, cols: usize, keep: usize) -> Vec<f32> {
 /// token per layer for the whole run, so the orientation the matmul wants is
 /// the orientation to store it in. This is that permutation, paid once on the
 /// host at upload, where the device lane paid it on every call.
+/// This rank's rows of a row-major `[rows, cols]` f32 weight.
+///
+/// The f32 twin of `tpshard::rows`, for the handful of small per-head tensors
+/// that reach the device through `gv` (which widens on the way out of the
+/// mapping) rather than through a BF16 bind. Copying is not a cost worth
+/// avoiding here: the two short convolutions are `kv_heads * head_dim` by
+/// `kernel`, which is kilobytes, and they are read once per layer for the run.
+fn shard_rows_f32(v: &[f32], cols: usize, r: std::ops::Range<usize>) -> Vec<f32> {
+    assert!(
+        r.end * cols <= v.len(),
+        "rows {}..{} of a {}-element weight {} wide runs off the end",
+        r.start,
+        r.end,
+        v.len(),
+        cols
+    );
+    v[r.start * cols..r.end * cols].to_vec()
+}
+
 fn transpose_rows(v: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     assert_eq!(
         v.len(),
@@ -5455,6 +5484,22 @@ fn main() -> Result<()> {
     let (a, b) = spec.split_once(':').context("INK_LAYERS wants LO:HI")?;
     let (lo, hi) = (a.parse::<usize>()?, b.parse::<usize>()?);
     anyhow::ensure!(lo < hi, "INK_LAYERS wants LO < HI, got {lo}:{hi}");
+    // The same refusal the split lane makes below, asked here where it costs a
+    // second instead of after 70 GiB of pile has been mapped. Env only: the
+    // group is not formed this early, and the question does not need it.
+    if std::env::var("INK_TP").is_ok()
+        && !std::env::var("INK_TP_UNSAFE_PARTIAL")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    {
+        anyhow::bail!(
+            "INK_TP is set, but only the ATTENTION half of the within-layer split is wired; \
+             the dense MLP, the shared experts, the 256 routed experts and the unembedding are \
+             still bound WHOLE on both ranks, so the reduce would sum two complete copies of \
+             the MLP -- 2x the correct value, fluent and wrong. Set INK_TP_UNSAFE_PARTIAL=1 \
+             only to develop the remaining shards; such a run is not a result."
+        );
+    }
     anyhow::ensure!(
         hi <= t.num_hidden_layers,
         "INK_LAYERS {lo}:{hi} runs past the {}-layer stack",
@@ -7104,6 +7149,116 @@ fn main() -> Result<()> {
     let mut warm_wall = 0f64;
     let mut warm_steps = 0usize;
     let mut warm_tokens = 0usize;
+    // ---- tensor parallelism: form the group before the first token ---------
+    //
+    // `INK_TP=rank:world` names this rank; `INK_TP_ADDR` is RANK 0's address on
+    // the fast fabric, which rank 0 binds and every other rank dials. Absent
+    // `INK_TP` this is a single-node run and every reduce below is the identity.
+    //
+    // Formed HERE, after the weights are on the device and before the first
+    // token, for two reasons. `Group::form` is a TCP rendezvous and `warm` is a
+    // collective that BLOCKS -- both are free at this point and neither is free
+    // inside the loop. And `warm` is the correctness gate: it proves the two
+    // ranks actually paired, because a group that did not pair reduces a rank
+    // against itself, returns a finite number, and goes on to generate fluent
+    // text that is wrong.
+    let tp_group = {
+        let tp = mary::models::inkling::tp::Tp::from_env()?;
+        if tp.is_split() {
+            let addr = std::env::var("INK_TP_ADDR").map_err(|_| {
+                anyhow::anyhow!(
+                    "INK_TP={}:{} asks for a {}-rank group, so INK_TP_ADDR must name rank 0's \
+                     address on the fast fabric (rank 0 binds it, everyone else dials it)",
+                    tp.rank(),
+                    tp.world(),
+                    tp.world()
+                )
+            })?;
+            println!(
+                "  tensor parallel   : rank {} of {}, rendezvous {addr}",
+                tp.rank(),
+                tp.world()
+            );
+            let g = mary::models::inkling::tpcomm::Group::form(tp, fp4_client.clone(), &addr)?;
+            let t0 = Instant::now();
+            g.warm()?;
+            println!(
+                "  tp group          : paired and verified in {:.1} ms  ({})",
+                t0.elapsed().as_secs_f64() * 1e3,
+                mary::models::inkling::tpcomm::transport_note()
+            );
+            Some(g)
+        } else {
+            None
+        }
+    };
+    // The forward's only contact with the network. Issued on the stream and
+    // never waited on; see `tpcomm::reduce_activation` for the one ordering
+    // rule that makes it correct (it must precede the short convolution).
+    // How many collectives this layer has issued. Host-side, free, and reset at
+    // the top of every layer.
+    //
+    // What it catches: a reduce DELETED or DUPLICATED. Every layer must issue
+    // exactly two -- one for attention, one for the MLP half, whether that half
+    // is dense or MoE -- and the attention block has five arms of which exactly
+    // one runs, so an arm that lost its reduce during an edit shows up here on
+    // the first token instead of as slightly-wrong text a day later.
+    //
+    // What it does NOT catch, said plainly: a reduce on the WRONG SIDE of the
+    // short convolution. That is still two collectives and this count is still
+    // two. Ordering is guarded by the comments at each site and, properly, by
+    // the token-agreement gate against a single-node run on the same commit --
+    // a count is not a substitute for either.
+    // WHICH SLICE this rank owns, as arithmetic, separate from the group that
+    // reduces it. `None` on a single-node run, and then every shard below is
+    // the whole tensor and every reduce is the identity.
+    let tp_shard: Option<mary::models::inkling::tp::Tp> = tp_group.as_ref().map(|g| g.tp());
+    // ---- REFUSE A HALF-SHARDED SPLIT --------------------------------------
+    //
+    // Attention is sharded by head and reduced. The MLP half is NOT sharded
+    // yet: both ranks still bind every expert and the whole dense MLP, so each
+    // computes the WHOLE MLP output and the reduce below sums two complete
+    // copies. That is exactly 2x the correct contribution -- finite, stable,
+    // and fluent, which is the failure mode that costs a day rather than a
+    // minute. There is no partial credit available here: an unsharded operand
+    // under a reduce is not "less parallel", it is wrong.
+    //
+    // So this refuses rather than warns. `INK_TP_UNSAFE_PARTIAL=1` is for
+    // bringing the remaining shards up against this scaffolding and its output
+    // is not a result.
+    if tp_shard.is_some()
+        && !std::env::var("INK_TP_UNSAFE_PARTIAL")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    {
+        anyhow::bail!(
+            "INK_TP is set, but only the ATTENTION half of the within-layer split is wired.\n\
+             \n\
+             Sharded and correct : q/k/v/r by head (16 q, 4 kv a rank), wo by column, the two\n\
+             \x20                     attention short convolutions by KV head, the KV cache by\n\
+             \x20                     head (it follows kv_heads), and the attention all-reduce.\n\
+             NOT sharded yet     : the dense MLP, the shared experts, the 256 routed experts,\n\
+             \x20                     and the unembedding.\n\
+             \n\
+             Both ranks therefore compute the WHOLE MLP, and the reduce sums two complete\n\
+             copies of it -- 2x the correct value, with no NaN and no crash. The tokens would\n\
+             be wrong and would still read fluently.\n\
+             \n\
+             Set INK_TP_UNSAFE_PARTIAL=1 only to develop the remaining shards against this\n\
+             scaffolding. Do not quote a number from such a run."
+        );
+    }
+    let tp_calls = std::cell::Cell::new(0usize);
+    let tp_reduce = |x: T2| -> T2 {
+        match tp_group.as_ref() {
+            Some(g) => {
+                tp_calls.set(tp_calls.get() + 1);
+                mary::models::inkling::tpcomm::reduce_activation(g, &dev, x)
+            }
+            None => x,
+        }
+    };
+
     let loop_started = Instant::now();
     let mut top_all: Vec<i64> = Vec::new();
     // A `for step in 0..=gen_steps` used to bound this, and it cannot any more:
@@ -7741,9 +7896,23 @@ fn main() -> Result<()> {
             // and its first layer is its slot 0 — indexing by the absolute layer
             // would walk off the end of a Vec that only ever holds this node's half.
             let slot = layer - lo;
+            tp_calls.set(0);
             let kind = t.attn_kind(layer);
             let is_local = kind == AttnKind::Local;
-            let (heads, kv_heads, head_dim) = t.heads(kind);
+            // The GLOBAL shape, which is what the pile stores and what the shard
+            // arithmetic divides.
+            let (g_heads, g_kv_heads, head_dim) = t.heads(kind);
+            // ...and this rank's share, which is what every kernel below sees.
+            // 32 q / 8 kv becomes 16 q / 4 kv, so the GQA grouping (4 queries a
+            // key head) is preserved exactly -- the split is along whole KV
+            // groups, never through one.
+            let (heads, kv_heads) = match tp_shard {
+                Some(tp) => (
+                    tp.share("q_heads", g_heads)?,
+                    tp.share("kv_heads", g_kv_heads)?,
+                ),
+                None => (g_heads, g_kv_heads),
+            };
             let p = format!("model.llm.layers.{layer}.");
             // ONE accessor now. `g` used to exist beside it, holding an f32 copy on
             // the host for the host lanes to read; there are no host lanes left in
@@ -7805,33 +7974,165 @@ fn main() -> Result<()> {
                 } else {
                     None
                 };
-                let attn = dev_lane::AttnWeightsDev {
-                    wq: pw("attn.wq_du.weight", heads * head_dim, h)?,
-                    wk: pw("attn.wk_dv.weight", kv_heads * head_dim, h)?,
-                    wv: pw("attn.wv_dv.weight", kv_heads * head_dim, h)?,
-                    wr: pw("attn.wr_du.weight", heads * t.d_rel, h)?,
-                    wqkvr: fused_qkvr,
-                    wo: pw("attn.wo_ud.weight", h, heads * head_dim)?,
-                    k_sconv: up2(
-                        gv("attn.k_sconv.weight")?,
-                        kv_heads * head_dim,
-                        t.sconv_kernel_size,
-                        &dev,
-                    ),
-                    v_sconv: up2(
-                        gv("attn.v_sconv.weight")?,
-                        kv_heads * head_dim,
-                        t.sconv_kernel_size,
-                        &dev,
-                    ),
-                    q_norm: up1(gv("attn.q_norm.weight")?, head_dim, &dev),
-                    k_norm: up1(gv("attn.k_norm.weight")?, head_dim, &dev),
-                    rel_proj: up2(
-                        gv("attn.rel_logits_proj.proj")?,
-                        t.d_rel,
-                        t.rel_span(kind),
-                        &dev,
-                    ),
+                // ---- this rank's slice of the five projections -------------
+                //
+                // Four of them are OUTPUT-parallel: the split is along rows, a
+                // row of a `[*, hidden]` BF16 weight is `hidden * 2` bytes, and
+                // every offset is a multiple of that -- so the shard is a
+                // SUBSLICE of the mapping and still aliases the pile. Binding
+                // this rank's half costs nothing it did not already cost.
+                //
+                // `wo` is the one that inverts. It is INPUT-parallel: its
+                // columns match the heads this rank computed, so its shard is a
+                // column range of a row-major matrix, which is `hidden` separate
+                // runs and cannot be expressed as an offset. It is gathered into
+                // a fresh allocation -- 4096 x 2048 BF16 = 16 MiB a layer -- and
+                // that copy is what buys the partial product this rank's
+                // all-reduce contributes. `tpshard::cols` is the only binder
+                // here that allocates, and it is deliberately the only one whose
+                // signature says so.
+                let pw_rows = |nm: &str,
+                               g_rows: usize,
+                               cols: usize,
+                               r: std::ops::Range<usize>|
+                 -> Result<Bf16W> {
+                    let s = Instant::now();
+                    let leaf = cp.stored(&format!("{p}{nm}"))?;
+                    anyhow::ensure!(
+                        leaf.elem == Elem::Bf16,
+                        "{p}{nm} is {:?}; this lane multiplies BF16 by BF16",
+                        leaf.elem
+                    );
+                    t_read.set(t_read.get() + s.elapsed().as_secs_f64());
+                    let slab =
+                        mary::models::inkling::tpshard::Slab::new(&leaf.bytes, g_rows, cols, 2)?;
+                    let n = r.len();
+                    let bytes = mary::models::inkling::tpshard::rows(&slab, r)?;
+                    Ok(bind_bf16(&fp4_client, fp4_aliases.as_ref(), bytes, n, cols))
+                };
+                let pw_cols = |nm: &str,
+                               rows: usize,
+                               g_cols: usize,
+                               c: std::ops::Range<usize>|
+                 -> Result<Bf16W> {
+                    let s = Instant::now();
+                    let leaf = cp.stored(&format!("{p}{nm}"))?;
+                    anyhow::ensure!(
+                        leaf.elem == Elem::Bf16,
+                        "{p}{nm} is {:?}; this lane multiplies BF16 by BF16",
+                        leaf.elem
+                    );
+                    t_read.set(t_read.get() + s.elapsed().as_secs_f64());
+                    let slab =
+                        mary::models::inkling::tpshard::Slab::new(&leaf.bytes, rows, g_cols, 2)?;
+                    let n = c.len();
+                    let bytes = mary::models::inkling::tpshard::cols(&slab, c)?;
+                    Ok(bind_bf16(
+                        &fp4_client,
+                        fp4_aliases.as_ref(),
+                        &bytes,
+                        rows,
+                        n,
+                    ))
+                };
+                let attn = match tp_shard {
+                    None => dev_lane::AttnWeightsDev {
+                        wq: pw("attn.wq_du.weight", heads * head_dim, h)?,
+                        wk: pw("attn.wk_dv.weight", kv_heads * head_dim, h)?,
+                        wv: pw("attn.wv_dv.weight", kv_heads * head_dim, h)?,
+                        wr: pw("attn.wr_du.weight", heads * t.d_rel, h)?,
+                        wqkvr: fused_qkvr,
+                        wo: pw("attn.wo_ud.weight", h, heads * head_dim)?,
+                        k_sconv: up2(
+                            gv("attn.k_sconv.weight")?,
+                            kv_heads * head_dim,
+                            t.sconv_kernel_size,
+                            &dev,
+                        ),
+                        v_sconv: up2(
+                            gv("attn.v_sconv.weight")?,
+                            kv_heads * head_dim,
+                            t.sconv_kernel_size,
+                            &dev,
+                        ),
+                        q_norm: up1(gv("attn.q_norm.weight")?, head_dim, &dev),
+                        k_norm: up1(gv("attn.k_norm.weight")?, head_dim, &dev),
+                        rel_proj: up2(
+                            gv("attn.rel_logits_proj.proj")?,
+                            t.d_rel,
+                            t.rel_span(kind),
+                            &dev,
+                        ),
+                    },
+                    Some(tp) => {
+                        let qr = tp.q_heads(g_heads)?;
+                        let kr = tp.kv_heads(g_kv_heads)?;
+                        let rr = tp.rel_rows(g_heads, t.d_rel)?;
+                        // Head ranges scaled into ROW ranges of each weight.
+                        let q_rows = qr.start * head_dim..qr.end * head_dim;
+                        let kv_rows = kr.start * head_dim..kr.end * head_dim;
+                        dev_lane::AttnWeightsDev {
+                            wq: pw_rows(
+                                "attn.wq_du.weight",
+                                g_heads * head_dim,
+                                h,
+                                q_rows.clone(),
+                            )?,
+                            wk: pw_rows(
+                                "attn.wk_dv.weight",
+                                g_kv_heads * head_dim,
+                                h,
+                                kv_rows.clone(),
+                            )?,
+                            wv: pw_rows(
+                                "attn.wv_dv.weight",
+                                g_kv_heads * head_dim,
+                                h,
+                                kv_rows.clone(),
+                            )?,
+                            wr: pw_rows("attn.wr_du.weight", g_heads * t.d_rel, h, rr)?,
+                            // The fused concatenation reads four WHOLE leaves and
+                            // would hand this rank the other rank's heads as well.
+                            // Sharding it means concatenating four already-sliced
+                            // runs, which is a different function; until it exists
+                            // the split lane takes the unfused path.
+                            wqkvr: None,
+                            wo: pw_cols("attn.wo_ud.weight", h, g_heads * head_dim, q_rows)?,
+                            // Per-KV-head state, so it splits with the KV heads.
+                            k_sconv: up2(
+                                shard_rows_f32(
+                                    &gv("attn.k_sconv.weight")?,
+                                    t.sconv_kernel_size,
+                                    kv_rows.clone(),
+                                ),
+                                kv_heads * head_dim,
+                                t.sconv_kernel_size,
+                                &dev,
+                            ),
+                            v_sconv: up2(
+                                shard_rows_f32(
+                                    &gv("attn.v_sconv.weight")?,
+                                    t.sconv_kernel_size,
+                                    kv_rows,
+                                ),
+                                kv_heads * head_dim,
+                                t.sconv_kernel_size,
+                                &dev,
+                            ),
+                            // Per-HEAD-DIM, not per head: the same 128 gains apply
+                            // to every head, so both ranks hold all of them.
+                            q_norm: up1(gv("attn.q_norm.weight")?, head_dim, &dev),
+                            k_norm: up1(gv("attn.k_norm.weight")?, head_dim, &dev),
+                            // `[d_rel, rel_span]` -- indexed by neither head nor
+                            // hidden, so it is replicated whole.
+                            rel_proj: up2(
+                                gv("attn.rel_logits_proj.proj")?,
+                                t.d_rel,
+                                t.rel_span(kind),
+                                &dev,
+                            ),
+                        }
+                    }
                 };
                 let router = if t.is_dense(layer) {
                     None
@@ -7958,6 +8259,15 @@ fn main() -> Result<()> {
                     window,
                     &mut slots_dev[coh][slot].attn,
                 );
+                // REDUCE BEFORE THE CONVOLUTION, not after it. This rank
+                // computed only its own heads, so `y` is a PARTIAL sum of the
+                // hidden vector. The short convolution mixes it with cached
+                // history that is already whole, and `conv(a) + conv(b)` is not
+                // `conv(a + b)` once that history is non-zero -- so a reduce
+                // moved below, next to the residual add where it reads more
+                // naturally, returns a finite and completely wrong hidden
+                // state, with no NaN and no crash to notice it by.
+                let y = tp_reduce(y);
                 let (out, hist) = dev_lane::short_conv_slot_step(
                     slots_dev[coh][slot].attn_sconv.clone(),
                     y,
@@ -7980,6 +8290,19 @@ fn main() -> Result<()> {
                     &mut caches[slot].attn,
                     pass_tree,
                 );
+                // REDUCE BEFORE THE CONVOLUTION, not after it. This rank
+                // computed only its own heads, so `y` is a PARTIAL sum of the
+                // hidden vector. The short convolution mixes it with cached
+                // history that is already whole, and `conv(a) + conv(b)` is not
+                // `conv(a + b)` once that history is non-zero -- so a reduce
+                // moved below, next to the residual add where it reads more
+                // naturally, returns a finite and completely wrong hidden
+                // state, with no NaN and no crash to notice it by.
+                //
+                // With INK_TP unset this is the identity, so the tree lane below
+                // is unaffected. The two hazards documented here are independent
+                // and both silent, which is why this one line carries both notes.
+                let y = tp_reduce(y);
                 // Two of the FOUR short convolutions a widened pass runs are
                 // inside the attention above; these are the block's own, and
                 // they need the same taps for the same reason. The batched
@@ -8013,6 +8336,15 @@ fn main() -> Result<()> {
                     window,
                     &mut caches[slot].attn,
                 );
+                // REDUCE BEFORE THE CONVOLUTION, not after it. This rank
+                // computed only its own heads, so `y` is a PARTIAL sum of the
+                // hidden vector. The short convolution mixes it with cached
+                // history that is already whole, and `conv(a) + conv(b)` is not
+                // `conv(a + b)` once that history is non-zero -- so a reduce
+                // moved below, next to the residual add where it reads more
+                // naturally, returns a finite and completely wrong hidden
+                // state, with no NaN and no crash to notice it by.
+                let y = tp_reduce(y);
                 let (out, hist) = dev_lane::short_conv_step(
                     caches[slot].attn_sconv.clone(),
                     y,
@@ -8023,6 +8355,15 @@ fn main() -> Result<()> {
             } else if kv {
                 let (y, attn) =
                     dev_lane::attention_prefill(hn, &ld.attn, &dims, Some(ls), window, window);
+                // REDUCE BEFORE THE CONVOLUTION, not after it. This rank
+                // computed only its own heads, so `y` is a PARTIAL sum of the
+                // hidden vector. The short convolution mixes it with cached
+                // history that is already whole, and `conv(a) + conv(b)` is not
+                // `conv(a + b)` once that history is non-zero -- so a reduce
+                // moved below, next to the residual add where it reads more
+                // naturally, returns a finite and completely wrong hidden
+                // state, with no NaN and no crash to notice it by.
+                let y = tp_reduce(y);
                 let hist = dev_lane::conv_history(y.clone(), t.sconv_kernel_size);
                 let out = dev_lane::short_conv(y, ld.attn_sconv.clone());
                 caches.push(LayerCache {
@@ -8035,6 +8376,15 @@ fn main() -> Result<()> {
                 out
             } else {
                 let y = dev_lane::attention(hn, &ld.attn, &dims, Some(ls), window);
+                // REDUCE BEFORE THE CONVOLUTION, not after it. This rank
+                // computed only its own heads, so `y` is a PARTIAL sum of the
+                // hidden vector. The short convolution mixes it with cached
+                // history that is already whole, and `conv(a) + conv(b)` is not
+                // `conv(a + b)` once that history is non-zero -- so a reduce
+                // moved below, next to the residual add where it reads more
+                // naturally, returns a finite and completely wrong hidden
+                // state, with no NaN and no crash to notice it by.
+                let y = tp_reduce(y);
                 dev_lane::short_conv(y, ld.attn_sconv.clone())
             };
             xd = dev_lane_resid::add_resid(xd, a);
@@ -8056,7 +8406,11 @@ fn main() -> Result<()> {
                 // 276 B model has any use for, and being selectable is how it got
                 // run by accident.
                 let w = ddense.dense_for(&cp, &fp4_client, fp4_aliases.as_ref(), &p, h)?;
-                dense_mlp_bf16(hn, w)
+                // The two dense layers reduce for the same reason the 40 MoE
+                // layers do: `dense_inter` is split across ranks, so this is a
+                // partial sum over the intermediate axis. Same placement rule --
+                // before the MLP short convolution, which is below.
+                tp_reduce(dense_mlp_bf16(hn, w))
             } else {
                 let inter = t.intermediate_size;
                 let r = ld.router.as_ref().expect("a MoE layer has a router");
@@ -8691,7 +9045,14 @@ fn main() -> Result<()> {
                     graph_broke = Some((layer, "shared"));
                 }
                 t_shared += t_s.elapsed().as_secs_f64();
-                acc + sh
+                // The MoE half's reduce, and the same rule as attention's: this
+                // rank owns half of every expert's INTERMEDIATE axis, so `acc`
+                // and `sh` are both partial sums over that axis and only their
+                // cross-rank sum is the layer's output. It happens HERE, at the
+                // end of the MoE block, and NOT below beside `add_resid`,
+                // because the MLP short convolution sits between the two and is
+                // not commutable with a partial sum (see `reduce_activation`).
+                tp_reduce(acc + sh)
             };
 
             // The MLP half's own short convolution carries state across generated
@@ -8739,6 +9100,16 @@ fn main() -> Result<()> {
             };
             t_h_sconv += t_sc.elapsed().as_secs_f64();
             xd = dev_lane_resid::add_resid(xd, y);
+            if tp_group.is_some() {
+                assert_eq!(
+                    tp_calls.get(),
+                    2,
+                    "layer {layer} issued {} collectives, not 2 (one for attention, one for \
+                     the MLP half). A reduce was dropped or added -- see the placement rule in \
+                     `tpcomm::reduce_activation`.",
+                    tp_calls.get()
+                );
+            }
             stage_sync!(d_tail, layer, "tail");
             if capture_now && graph_broke.is_none() && fp4_client.graph_capture_status() != 1 {
                 graph_broke = Some((layer, "tail"));
