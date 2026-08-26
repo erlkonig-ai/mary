@@ -63,13 +63,29 @@
 //! speculative decoding's correctness lives entirely in the accept step
 //! ([`accept_tree`]). Which candidates get proposed is free.
 //!
-//! # What is NOT here
+//! # Where the tensor side stands
 //!
-//! Tree attention in the VERIFY pass. [`ancestor_mask`] builds the mask; wiring
-//! it into the trunk's attention is a separate, larger change and is held
-//! deliberately. So is the trunk-side rollback: a linear speculation keeps a
-//! PREFIX of the verify batch and truncates, but a tree keeps a SCATTERED
-//! subset ([`TreeAccept::kept_rows`]) and needs a gather-compaction of K/V.
+//! The layer is done: `dev_lane::attention_steps_tree` takes a [`TreeAttn`]
+//! and handles all three of the things a tree changes at once (visibility,
+//! position, and the two convolutions inside the attention);
+//! `dev_lane::short_conv_tree` is the gathered convolution; `commit_rows` and
+//! `conv_history_rows` are the rollback, which for a tree is a GATHER out of
+//! the accepted path rather than a truncation of a prefix. A tree row measures
+//! bit-identical to the row it would have been in a linear batch holding only
+//! its own path (`a_tree_row_is_its_own_branch_local`, GB10, 0e0).
+//!
+//! What is NOT here is the DECODE LOOP. `inkling_forward.rs` still builds a
+//! chain, and three things stand between it and a tree:
+//!
+//! 1. `INK_SPEC` is gated on `pipe_spec.is_some()` — today's speculation is a
+//!    two-machine arrangement where only the tail can draft and only the head
+//!    can embed. A single-box tree run needs its own entry, not a widened one.
+//! 2. the drafting side needs a device top-`b`, where `draft_pick` is a device
+//!    unembed-and-argmax. [`top_b`] is the host twin and the specification.
+//! 3. the block's own `attn_sconv` and `mlp_sconv` are the caller's — they
+//!    take the same [`TreeAttn::taps`] through `short_conv_tree_steps` and the
+//!    same rollback through `conv_history_rows`, but the call sites are in the
+//!    decode loop, not in the layer.
 
 use std::fmt;
 
