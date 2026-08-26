@@ -7380,16 +7380,24 @@ fn main() -> Result<()> {
         // written in place, the region's allocation sequence repeats, and
         // whether the pool is warm becomes an ordinary question with an
         // answerable number.
-        let prewarm_passes: usize = std::env::var("INK_GRAPH_WARM")
+        //
+        // CLAMPED to `graph_step`, because there are only that many decode
+        // passes before the capture and asking for more used to turn the whole
+        // pre-warm OFF -- the guard read `graph_step >= PREWARM_PASSES`, so
+        // `INK_GRAPH_WARM=8 INK_GRAPH_STEP=4` warmed nothing at all and the
+        // capture died on a `malloc_async` failure fifteen hundred allocations
+        // in. A knob whose out-of-range setting disables the thing it tunes is
+        // a trap; the honest reading of "warm more than there is room for" is
+        // "warm everything there is room for".
+        #[allow(non_snake_case)]
+        let PREWARM_PASSES: usize = std::env::var("INK_GRAPH_WARM")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(2);
-        #[allow(non_snake_case)]
-        let PREWARM_PASSES: usize = prewarm_passes;
+            .unwrap_or(2)
+            .min(graph_step);
         let prewarm_now = graph_on
             && is_decode
             && graph_report.is_none()
-            && graph_step >= PREWARM_PASSES
             && step - prefill_passes >= graph_step - PREWARM_PASSES
             && step - prefill_passes < graph_step;
         if prewarm_now {
