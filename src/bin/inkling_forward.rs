@@ -9727,7 +9727,7 @@ fn main() -> Result<()> {
                             let take = nblk.min((cap / BLK).max(1));
                             let mut hit_corpus = vec![0usize; topk_k];
                             let mut hit_stack = vec![0usize; topk_k];
-                            let mut gate_rows: Vec<(f32, f32, bool)> = Vec::new();
+                            let mut gate_rows: Vec<(f32, f32, f32, bool)> = Vec::new();
                             let mut scored = 0usize;
                             let raw = std::env::var("INK_MTP_RAW")
                                 .map(|val| val == "1")
@@ -9753,6 +9753,11 @@ fn main() -> Result<()> {
                                 // row does.
                                 let stack =
                                     teach_rows(main_dev.clone().slice([lo + 1..hi + 1, 0..h]), raw);
+                                // The stack's OWN confidence at row j, which is
+                                // available BEFORE the draft for row j is made
+                                // and therefore gates it for FREE.
+                                let (_, sconf, _) =
+                                    teach_topk(main_dev.clone().slice([lo..hi, 0..h]), raw, 1);
                                 for (i, cand) in head.iter().enumerate() {
                                     let truth = ids[lo + i + 2];
                                     let want = stack[i];
@@ -9765,7 +9770,7 @@ fn main() -> Result<()> {
                                         }
                                     }
                                     // (confidence, was the top-1 draft right)
-                                    gate_rows.push((p1[i], margin[i], cand[0] == want));
+                                    gate_rows.push((p1[i], margin[i], sconf[i], cand[0] == want));
                                     scored += 1;
                                 }
                             }
@@ -9830,39 +9835,57 @@ fn main() -> Result<()> {
                                     .and_then(|x| x.parse().ok())
                                     .unwrap_or(0.047);
                                 let n = gate_rows.len() as f64;
-                                let all_hits = gate_rows.iter().filter(|r| r.2).count() as f64;
-                                let speed = |f: f64, p: f64| -> f64 {
-                                    (1.0 + f * p) / (1.0 + dcost + f * (c2 - 1.0))
+                                let all_hits = gate_rows.iter().filter(|r| r.3).count() as f64;
+                                // `always_draft`: the gate reads the DRAFT's
+                                // own confidence, so the draft is paid on every
+                                // pass whether or not the speculation happens.
+                                // A gate on a signal the pass ALREADY has pays
+                                // it only when it speculates, turning `d` from a
+                                // constant into `f * d` -- which is the whole
+                                // difference between losing and winning here.
+                                let speed = |f: f64, p: f64, always_draft: bool| -> f64 {
+                                    let d = if always_draft { dcost } else { f * dcost };
+                                    (1.0 + f * p) / (1.0 + d + f * (c2 - 1.0))
                                 };
                                 println!(
                                     "  MTP GATE sweep, c2={c2} d={dcost}; never=1.000x, \
                                      always={:.3}x (f=1.000, p={:.4})",
-                                    speed(1.0, all_hits / n),
+                                    speed(1.0, all_hits / n, true),
                                     all_hits / n
                                 );
-                                for (sig, label) in [(0usize, "p1    "), (1, "margin")] {
+                                for (sig, label) in
+                                    [(0usize, "head p1"), (1, "margin "), (2, "stackp1")]
+                                {
                                     println!(
                                         "    by {label}   T      kept     p_kept   \
                                          p_dropped   gate"
                                     );
-                                    let ts: Vec<f64> = if sig == 0 {
-                                        vec![0.0, 0.2, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
-                                    } else {
+                                    let ts: Vec<f64> = if sig == 1 {
                                         vec![0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0]
+                                    } else {
+                                        vec![0.0, 0.2, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
                                     };
+                                    // Only the stack's own confidence is free.
+                                    let free = sig == 2;
                                     let mut best = (0.0f64, 0.0f64);
                                     for tt in ts {
-                                        let keep: Vec<&(f32, f32, bool)> = gate_rows
+                                        let keep: Vec<&(f32, f32, f32, bool)> = gate_rows
                                             .iter()
                                             .filter(|r| {
-                                                (if sig == 0 { r.0 } else { r.1 }) as f64 >= tt
+                                                (match sig {
+                                                    0 => r.0,
+                                                    1 => r.1,
+                                                    _ => r.2,
+                                                })
+                                                    as f64
+                                                    >= tt
                                             })
                                             .collect();
                                         let k = keep.len() as f64;
                                         if k == 0.0 {
                                             continue;
                                         }
-                                        let hk = keep.iter().filter(|r| r.2).count() as f64;
+                                        let hk = keep.iter().filter(|r| r.3).count() as f64;
                                         let f = k / n;
                                         let pk = hk / k;
                                         let pd = if n > k {
@@ -9870,7 +9893,7 @@ fn main() -> Result<()> {
                                         } else {
                                             f64::NAN
                                         };
-                                        let sp = speed(f, pk);
+                                        let sp = speed(f, pk, !free);
                                         if sp > best.0 {
                                             best = (sp, tt);
                                         }
@@ -9881,8 +9904,14 @@ fn main() -> Result<()> {
                                         );
                                     }
                                     println!(
-                                        "              BEST {:.3}x at T={:.2}",
-                                        best.0, best.1
+                                        "              BEST {:.3}x at T={:.2}{}",
+                                        best.0,
+                                        best.1,
+                                        if free {
+                                            "   (draft paid only when speculating)"
+                                        } else {
+                                            "   (draft paid every pass)"
+                                        }
                                     );
                                 }
                             }
