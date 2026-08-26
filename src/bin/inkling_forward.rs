@@ -7170,22 +7170,38 @@ fn main() -> Result<()> {
     //     `Backend::sync`; the pool REPORT was a second, separate barrier inside
     //     the same region and nobody had connected it to capture.
     //
-    // WHAT ELSE COULD PUT A SYNC IN HERE, audited 2026-08-26 rather than assumed.
-    // On the shipped configuration nothing does: with `INK_DEV_PLAN` on, the
-    // router takes the `!need_routing` arm and leaves its answer on the device
-    // (see the comment there -- "nothing on the host waits for the device in this
-    // layer"), and no other blocking read is reachable from the region. Five
-    // things would break that, and the stage probes below would report the layer
-    // and stage rather than leaving it silent:
+    // WHAT ELSE COULD PUT A SYNC IN HERE. Audited line by line 2026-08-26, not
+    // assumed. ON THE SHIPPED CONFIGURATION THE REGION CONTAINS NO BLOCKING
+    // READ AND NO `submit_blocking`. In particular the router does NOT read its
+    // decision back: with `INK_DEV_PLAN` on, `need_routing` is false and the
+    // top-k answer stays on the device for `plan_from_topk_launch` to read with
+    // a kernel. The `[n, 15] top-k DECISION ... back` the report prints is the
+    // OTHER arm, and it is the first thing that would break a capture outright.
     //
-    //   * `INK_DEV_PLAN=0`, `INK_GROUPED=2` or `INK_DEVPLAN_CHECK=1` -- each sets
-    //     `need_routing` and reads the top-k decision back to the host.
-    //   * `INK_ROUTER` selecting the host arm -- `down(lg)` unconditionally.
-    //   * A layer whose weights CANNOT BE TABLED. `plan_dev_ok` has eight terms,
-    //     and a layer that fails to table caches its `None` and takes the host
-    //     lane on every pass thereafter. That is the one which needs no operator
-    //     mistake, is per-layer rather than per-run, and is the reason the stage
-    //     probes are worth keeping.
+    // The region holds exactly six reachable syncs and every one is behind a
+    // switch that is off by default. Listed so the next reader checks a list
+    // instead of re-deriving it:
+    //
+    //   * the host-router arm, `down(lg)`            -- `INK_ROUTER` host arm
+    //   * the top-k readback                          -- `INK_DEV_PLAN=0`, or
+    //     `INK_GROUPED=2`, or `INK_DEVPLAN_CHECK=1` (any sets `need_routing`)
+    //   * the router-logit dump                       -- `INK_ROUTE_DBG`
+    //   * the f32 reference logits                    -- `INK_ROUTER_DIFF=1`
+    //   * the per-layer hidden-state dump             -- `--dump` (`dump_dir`),
+    //     which this file already calls "the one place left in the loop that
+    //     costs one"
+    //   * the cleanup gate`s `memory_usage`           -- `INK_POOL_CLEANUP != 0`,
+    //     already mandatory-off for this lane
+    //
+    // And ONE hazard that needs no operator mistake: a layer whose weights
+    // cannot be TABLED. `plan_dev_ok` has eight terms, and a layer that fails to
+    // table caches its `None` and takes the host lane -- with its readback -- on
+    // every pass thereafter. It is per-layer rather than per-run, it is silent,
+    // and it is the reason the stage probes below report which LAYER and which
+    // STAGE invalidated a capture rather than only that one did.
+    //
+    // `layer_rms` is not on this list on purpose: it is enqueued here and read
+    // after the stack, so it costs the region nothing.
     let graph_on = std::env::var("INK_GRAPH").ok().as_deref() == Some("1");
     let graph_step: usize = std::env::var("INK_GRAPH_STEP")
         .ok()
