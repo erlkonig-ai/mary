@@ -74,6 +74,65 @@
 //! bit-identical to the row it would have been in a linear batch holding only
 //! its own path (`a_tree_row_is_its_own_branch_local`, GB10, 0e0).
 //!
+//! # THE VERDICT: breadth does not pay on this architecture
+//!
+//! Measured 2026-08-26, the two-machine pipe (head 0:21 on zgx-0d6e, tail
+//! 21:42 on zgx-16ec, so the drafter sees the REAL final hidden state),
+//! `INK_MTP_TOPK=4`, teacher-forced over each corpus, full vocab. "vs STACK"
+//! is head 0's hit rate against the main stack's OWN argmax at that position,
+//! which is what a verifier accepts; Wilson 95% intervals:
+//!
+//! ```text
+//! corpus                rows   hit@1            hit@2            breadth gain
+//! technical prose       3584   0.2969 ±.015     0.3895 ±.016     +0.0926
+//! Rust source           4096   0.6956 ±.014     0.7915 ±.012     +0.0959
+//! counting (1 2 3 ...)  3328   0.9892 ±.004     0.9961 ±.002     +0.0069
+//! ```
+//!
+//! Acceptance is enormously corpus-dependent — 30% to 99% — and that is not
+//! the finding. **The finding is the last column.** Breadth buys about +9.5
+//! points wherever there is room, and nothing at all where there is not, and
+//! it always costs ONE EXTRA ROW.
+//!
+//! Priced against `inkling_forward`'s own published `c(2) = 1.492` (a two-row
+//! pass) and a measured three-row width probe at 1.60x, with the identity this
+//! project already uses, `speedup = (1 + p) / cost`:
+//!
+//! ```text
+//! corpus            chain k=1        tree b=2        tree b=2
+//!                   (2 rows, 1.492)  (3 rows, 1.60)  (3 rows, measured 2.11)
+//! technical prose   0.869x           0.868x          0.659x
+//! Rust source       1.136x           1.120x          0.849x
+//! counting          1.333x           1.248x          0.946x
+//! ```
+//!
+//! **The tree never beats the chain — on any corpus, at the most generous
+//! tree cost that is even arguable.** +9.5 points of acceptance and one extra
+//! row are the same size, so the trade is a wash where it is available and a
+//! loss where it is not. Where acceptance is low, +9.5 points is not enough to
+//! cover a row; where acceptance is high there is nothing left to win (+0.7
+//! points) and the row is still paid. There is no corpus in between where the
+//! two separate.
+//!
+//! Nor do wider trees escape it: hit@3 and hit@4 add +5.0 and +4.2 points on
+//! prose, +3.4 and +2.3 on code, for a row each. The marginal acceptance
+//! falls while the marginal cost does not.
+//!
+//! So: this module is a NEGATIVE RESULT, and the thing it rules out is worth
+//! the ruling. What the same table says positively is that the CHAIN pays
+//! handsomely on predictable text (1.14x on code, 1.33x on counting) and loses
+//! on prose — which is an argument for gating the existing `INK_SPEC` lane on
+//! the draft head's confidence, not for widening it.
+//!
+//! CAVEATS, because these numbers are a product of two runs and the framing
+//! rule applies: acceptance is from the FULL stack over the pipe; the cost
+//! ratios are `c(2) = 1.492` from this project's earlier pipe measurement and
+//! a 1.60x three-row width probe measured on a HALF stack (layers 0:21,
+//! ctx512) that was not idle-gated. The verdict does not rest on the fragile
+//! half: at the TOP of the hit@2 confidence interval on prose (0.4056), and
+//! assuming a three-row tree somehow cost no more than a two-row pass
+//! (1.492x), b = 2 still returns 0.942x.
+//!
 //! # What a SINGLE BOX can and cannot measure
 //!
 //! `INK_TREE` runs on one box, and measured there (GB10, layers 0:21, ctx512,
@@ -311,10 +370,13 @@ impl TreeSpec {
     /// between two readings of one unstated assumption, which is exactly why a
     /// number carries its framing or is not evidence.
     ///
-    /// So do not quote 57% as a measurement. `INK_TREE` exists to replace it
-    /// with one: an idle-gated interleaved run of `b = 2` against the
-    /// unspeculated baseline on one box measures the ratio directly, and that
-    /// number supersedes every derivation here including this one.
+    /// So do not quote 57% as a measurement. It has since been replaced by
+    /// one, and the answer is that breadth does not pay: the marginal
+    /// candidate buys about +9.5 points of acceptance and costs a whole extra
+    /// row, everywhere, on every corpus. See the module header's VERDICT
+    /// section for the table and the arithmetic. Neither my 57% nor the 1.050x
+    /// that the row-invariant reading gives was close; both were cost models
+    /// standing in for a measurement.
     ///
     /// The corollary is the reason breadth is worth building at all: breadth
     /// and depth price two DIFFERENT axes. Breadth raises the probability of
