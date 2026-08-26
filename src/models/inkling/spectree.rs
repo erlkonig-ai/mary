@@ -133,6 +133,46 @@
 //! assuming a three-row tree somehow cost no more than a two-row pass
 //! (1.492x), b = 2 still returns 0.942x.
 //!
+//! # WHAT WOULD REVIVE THE TREE, stated as a threshold
+//!
+//! The verdict above is a MARGINAL identity — breadth buys about +0.095
+//! tokens per pass and costs one row — and that form is robust. The NUMBERS
+//! in it are not equally robust, and one of them is about to move.
+//!
+//! What a row costs today: `c(2) = 1.492` and a measured three-row probe at
+//! 1.60x, so the marginal row is about **0.11 of a step**. Breadth buys
+//! **0.095**. Those are the two quantities, and the gap between them is 15%
+//! — which is why breadth is a wash rather than an obvious loss.
+//!
+//! So the verdict has an explicit revival threshold:
+//!
+//! ```text
+//! breadth pays when   marginal row cost < 0.095 of a step
+//! today               marginal row cost ~ 0.11
+//! ```
+//!
+//! It is closer than "dead" suggests, and the step it is denominated in has
+//! just been re-measured as **78% host enqueue** (73.6 ms of 93.9, both nodes
+//! serialised). If CUDA graphs collapse that region — the unmerged capture
+//! measured 35.4 ms of enqueue going to ~112 µs at production layer count —
+//! then `c2`, the marginal row, and `d` are all quantities measured against a
+//! step that no longer exists, and **every speedup in this module must be
+//! re-derived before it is quoted again.**
+//!
+//! Which way it moves is not obvious and should not be guessed. If the
+//! marginal row is mostly host enqueue it becomes nearly free and breadth
+//! revives; if enqueue is per-KERNEL rather than per-ROW then a widened pass
+//! never paid much enqueue in the first place, the marginal row is already
+//! device-bound, and the verdict stands unchanged. Today's numbers cannot
+//! distinguish those cases — `c(2)` and the 78% were measured in different
+//! runs at different configs, and multiplying them would be exactly the
+//! framing error this file has already made once.
+//!
+//! **The verdict is therefore: dead at today's row cost, with a stated price
+//! at which it is not.** File it that way rather than as "dead", because the
+//! second form invites re-deriving it badly from stale constants and the
+//! first says precisely which constant to re-measure.
+//!
 //! # THE GATE, and why it is a smaller lever than it looks
 //!
 //! The verdict table says the chain wins on code and counting and LOSES on
@@ -192,6 +232,14 @@
 //! counts across the three corpora, aggregating as time (`3 / sum(1/s)`):
 //! never 1.000x, always 1.046x, gate about 1.13x — and essentially all of the
 //! difference is prose.
+//!
+//! SIZE THIS HONESTLY BEFORE BUILDING IT. ~1.03x on prose and ~1.13x mixed is
+//! a real lever and a small one. The same decode step is 78% host enqueue, and
+//! an unmerged graph capture measured that region collapsing 316x. Speculation
+//! attacks acceptance economics and graphs attack host enqueue, so the two
+//! compose rather than compete — but they are not the same size, and the
+//! gate's threshold is denominated in a step graphs would redefine. Measure,
+//! do not build, until that lands.
 //!
 //! # What a SINGLE BOX can and cannot measure
 //!
