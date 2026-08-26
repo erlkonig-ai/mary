@@ -1038,3 +1038,7 @@ required-features = ["inkling-cuda"]
 [[bin]]
 name = "graph_capture_probe"
 required-features = ["inkling-cuda"]
+
+[[bin]]
+name = "graph_patch_probe"
+required-features = ["inkling-cuda"]

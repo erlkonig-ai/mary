@@ -7134,6 +7134,25 @@ fn main() -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8);
+    // `INK_GRAPH_DIFF=1`: capture TWO CONSECUTIVE decode steps and diff them
+    // launch by launch.
+    //
+    // Cross-step replay is blocked by two things and this measures both of them
+    // exactly rather than estimating either. A region is replayable on a later
+    // step when every launch binds the same ADDRESSES and carries the same
+    // ARGUMENTS as it did at capture; the launches that fail the first test are
+    // the pinning work list, and the ones that fail only the second are the
+    // patch list. `graph_launch_params` reports what each launch was recorded
+    // with, so the two lists are a diff of two captures rather than an
+    // inventory assembled by reading the forward pass and hoping it is
+    // complete -- which is the same argument that put the buffer-hold fix in
+    // the allocator instead of in a list of cache fields here.
+    //
+    // The diff is a STRUCTURAL measurement and reports no time.
+    let graph_diff = std::env::var("INK_GRAPH_DIFF").ok().as_deref() == Some("1");
+    let want_captures = if graph_diff { 2 } else { 1 };
+    let mut graphs_captured: Vec<u64> = Vec::new();
+    let mut graph_diff_done = false;
     let mut graph_report: Option<(usize, f64, Vec<f64>)> = None;
     // The eager baseline must come from a step that did NOT capture: on the
     // capture step `t_layers` brackets the recording, the instantiate and every
@@ -7356,8 +7375,11 @@ fn main() -> Result<()> {
         // only after the shapes have been seen -- a first-sight pass compiles
         // kernels (NVRTC + `cuModuleLoadData`) and tunes them, and both block
         // the host, which is exactly what a capture cannot contain.
-        let capture_now =
-            graph_on && is_decode && graph_report.is_none() && step - prefill_passes == graph_step;
+        let capture_now = graph_on
+            && is_decode
+            && graphs_captured.len() < want_captures
+            && step >= prefill_passes + graph_step
+            && step < prefill_passes + graph_step + want_captures;
         // The pass before the capture runs the same region with frees deferred
         // and NO capture open, so the pools reach the region's simultaneous
         // high-water mark by allocating in a pass where allocating is legal.
@@ -7397,7 +7419,7 @@ fn main() -> Result<()> {
             .min(graph_step);
         let prewarm_now = graph_on
             && is_decode
-            && graph_report.is_none()
+            && graphs_captured.is_empty()
             && step - prefill_passes >= graph_step - PREWARM_PASSES
             && step - prefill_passes < graph_step;
         if prewarm_now {
@@ -8692,7 +8714,102 @@ fn main() -> Result<()> {
                 per_rep.push(t.elapsed().as_secs_f64() * 1e6);
             }
             <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync after the timed replays");
-            graph_report = Some((nodes, t_ly.elapsed().as_secs_f64(), per_rep));
+            // The FIRST capture is the one the eager arm is compared against.
+            // A second capture's pass is not an ordinary step -- it follows a
+            // pass that captured -- so timing it would be pairing a figure with
+            // one taken under different conditions.
+            if graph_report.is_none() {
+                graph_report = Some((nodes, t_ly.elapsed().as_secs_f64(), per_rep));
+            }
+            graphs_captured.push(g);
+        }
+
+        // The diff, once both captures exist.
+        if graph_diff && graphs_captured.len() == 2 && !graph_diff_done {
+            graph_diff_done = true;
+            let (a, b) = (graphs_captured[0], graphs_captured[1]);
+            let (na, nb) = (
+                fp4_client.graph_launch_count(a),
+                fp4_client.graph_launch_count(b),
+            );
+            println!(
+                "  GRAPHDIFF: step {} vs step {}, {na} launches vs {nb}",
+                graph_step,
+                graph_step + 1
+            );
+            if na != nb {
+                println!(
+                    "  GRAPHDIFF: the launch sequence is NOT periodic -- a cross-step graph \
+                     cannot be indexed by launch and nothing below applies"
+                );
+            } else {
+                // Four disjoint buckets, because they are four different pieces
+                // of work: a launch whose addresses moved needs PINNING, one
+                // whose blob moved needs PATCHING, one whose grid moved needs a
+                // cube count patch, and one that moved in nothing is already
+                // replayable.
+                let (mut same, mut only_info, mut only_ptr, mut both) = (0usize, 0, 0, 0);
+                let mut grid_moved = 0usize;
+                let mut info_words_total = 0usize;
+                let mut info_words_moved = 0usize;
+                let mut ptrs_total = 0usize;
+                let mut ptrs_moved = 0usize;
+                let mut shown = 0usize;
+                for i in 0..na {
+                    let pa = fp4_client.graph_launch_params(a, i);
+                    let pb = fp4_client.graph_launch_params(b, i);
+                    assert_eq!(
+                        pa.block, pb.block,
+                        "launch {i} changed its cube DIM between steps, which is a different \
+                         kernel, not a different argument"
+                    );
+                    assert_eq!(
+                        pa.info.len(),
+                        pb.info.len(),
+                        "launch {i} changed its argument COUNT between steps"
+                    );
+                    assert_eq!(
+                        pa.ptrs.len(),
+                        pb.ptrs.len(),
+                        "launch {i} changed its buffer COUNT between steps"
+                    );
+                    info_words_total += pa.info.len();
+                    ptrs_total += pa.ptrs.len();
+                    let iw: Vec<usize> = (0..pa.info.len())
+                        .filter(|&w| pa.info[w] != pb.info[w])
+                        .collect();
+                    let pw: Vec<usize> = (0..pa.ptrs.len())
+                        .filter(|&w| pa.ptrs[w] != pb.ptrs[w])
+                        .collect();
+                    info_words_moved += iw.len();
+                    ptrs_moved += pw.len();
+                    if pa.grid != pb.grid {
+                        grid_moved += 1;
+                    }
+                    match (iw.is_empty(), pw.is_empty()) {
+                        (true, true) => same += 1,
+                        (false, true) => only_info += 1,
+                        (true, false) => only_ptr += 1,
+                        (false, false) => both += 1,
+                    }
+                    if (!iw.is_empty() || !pw.is_empty() || pa.grid != pb.grid) && shown < 24 {
+                        shown += 1;
+                        println!(
+                            "    launch {i:4}: grid {:?}->{:?} info words {iw:?} ptr slots {pw:?}",
+                            pa.grid, pb.grid
+                        );
+                    }
+                }
+                println!(
+                    "  GRAPHDIFF: {same} launches already replayable, {only_info} need only a \
+                     scalar patch, {only_ptr} need only pinning, {both} need both; {grid_moved} \
+                     moved their cube count"
+                );
+                println!(
+                    "  GRAPHDIFF: {info_words_moved} of {info_words_total} packed argument words \
+                     moved, {ptrs_moved} of {ptrs_total} bound addresses moved"
+                );
+            }
         }
         // DEBUG (`INK_GRAPH_HASH=1`): the absolute sums of every buffer a
         // decode step hands to the next one. Printed AFTER the replays, so a
