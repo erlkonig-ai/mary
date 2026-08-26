@@ -97,6 +97,12 @@
 #     --note TEXT     free text carried into the framing rule
 #     --util-max N    max GPU utilisation percent to call idle (default 5)
 #     --load-max N    max 1-minute loadavg to call the host idle (default 2.0)
+#     --prompts LIST  comma-separated corpora to sweep, each `label=path.ids`
+#                     (a bare path is labelled by its basename). The arm matrix
+#                     runs once per corpus and the report adds a per-corpus
+#                     table plus the ACROSS-CORPUS spread. Omitting it measures
+#                     the single prompt in the passthrough args and stamps the
+#                     result CORPUS-UNBOUNDED -- see the header note.
 #     --samples N     idle samples, 1 s apart (default 3)
 #     --allow-busy    downgrade OUR OWN contention to a warning. Never lifts the
 #                     other-user refusal, and stamps every result UNGATED.
@@ -121,6 +127,39 @@
 #     base: 'tuned:INK_GEMM_AUTOTUNE=1' \
 #     -- ~/converted/inkling-small-complete.pile /tmp/prompt.ids /tmp/out.bin
 #
+# WHY A SINGLE PROMPT IS NOT A MEASUREMENT
+#
+#   Everything above gates the BOX. Nothing above gates the TEXT, and on a
+#   speculative lane the text is the dominant variable -- larger than any arm
+#   this script has ever been used to compare.
+#
+#   This repo has already quoted 22.0%, 50.0% and 71.2% for depth-1 MTP
+#   acceptance and all three are correct: they are the same instrument on three
+#   different SEQUENCES. `inkling_forward`'s own doc settles it -- "none of the
+#   three is a corpus-independent acceptance rate for this draft head". The
+#   end-to-end verdict moves with it and changes SIGN: `INK_SPEC=1` reads 1.089x
+#   on a five-token English prompt whose continuation is a repeating list
+#   template, and 0.977x on a 3732-token document. Same binary, same pipe, same
+#   layers, same commit. A run that had measured only the first would have
+#   landed speculation on by default on the strength of a template.
+#
+#   The reference implementation reached this the same way and says so: its
+#   prompt suite is "deliberately spans predictable -> diverse, since MTP
+#   acceptance is prompt-dependent and a single easy prompt overstates real
+#   throughput". Its headline peak (E = 3.98 of a 4.0 ceiling) is the value on
+#   its most predictable prompt; its own median across the suite is E ~ 3.1, and
+#   its per-position acceptance falls to 40%/30% on explanatory text.
+#
+#   So `--prompts` sweeps the arm matrix over several corpora and reports the
+#   ACROSS-CORPUS spread beside the across-rep one. When the corpus spread is
+#   the larger of the two -- which is the normal case on this lane -- an arm
+#   difference smaller than it is not a result, and the script says so.
+#
+#   Without `--prompts` the run is stamped CORPUS-UNBOUNDED. That is not a
+#   refusal: one corpus is the right shape for a question about a KERNEL, whose
+#   cost does not read the text. It is a refusal to let a one-prompt number be
+#   quoted as though it bounded a question about ACCEPTANCE, which it cannot.
+#
 # WHERE IT RUNS: on the box with the GPU. It reads `nvidia-smi` locally.
 
 set -uo pipefail
@@ -128,6 +167,10 @@ set -uo pipefail
 REPS=3
 COLD=2
 GEN=12
+# Corpora to sweep, as `label=path-to-prompt-ids`. Empty means "whatever prompt
+# the passthrough args name", i.e. the single-prompt behaviour this script had
+# before. See WHY A SINGLE PROMPT IS NOT A MEASUREMENT, below.
+CORPORA=()
 LAYERS="0:21"
 BIN="target/release/inkling_forward"
 COMMON_ENV=""
@@ -146,6 +189,57 @@ ARMS=()
 PASSTHRU=()
 
 die() { printf '\n!! %s\n\n' "$*" >&2; exit 2; }
+
+# ---------------------------------------------------------------------------
+# THE MEMORY SETTLE, which is the idle gate's other half.
+#
+# The GPU gate answers "is anything else computing". On a UNIFIED-MEMORY part
+# that is only half the question: the weights are mmapped and the resident set
+# of one arm is most of the box, so the arm that starts while the PREVIOUS
+# arm's pages are still being reclaimed does not get a slower GPU, it gets page
+# faults -- and they land on the steady-state steps, not on the cold ones the
+# --cold discard removes. Measured on spark2-zt while writing this: an arm whose
+# twin ran at a flat 52.4 ms/step came out at 614.9 ms/step with per-step values
+# of 140, 249, 262, 298, 472, 724 and 982 ms. Nothing in the report said why,
+# and the A/B it was half of would have read as a 12x regression.
+#
+# The threshold is not a constant, because the right one is a property of the
+# model and the box: it is MemAvailable AS THE GATE FOUND IT, before any arm
+# ran. Waiting for the box to give back what it had then is the same claim as
+# "start every arm from the same state", which is what interleaving is for.
+# Linux only -- /proc/meminfo is the instrument; elsewhere it is a no-op and
+# says so once.
+MEM_BASE=""
+MEM_WARNED=0
+MEM_WAIT_MAX=${MEM_WAIT_MAX:-180}
+
+mem_avail_gib() {
+  [ -r /proc/meminfo ] || return 1
+  awk '/^MemAvailable:/ {printf "%d", int($2/1048576)}' /proc/meminfo
+}
+
+mem_settle() {
+  local arm=$1 rep=$2 have want waited=0
+  if ! have=$(mem_avail_gib); then
+    if [ "$MEM_WARNED" = "0" ]; then
+      echo "  (no /proc/meminfo: the memory settle is a no-op on this host)"
+      MEM_WARNED=1
+    fi
+    return 0
+  fi
+  [ -z "$MEM_BASE" ] && MEM_BASE=$have
+  want=$(( MEM_BASE * 95 / 100 ))
+  while [ "$have" -lt "$want" ] && [ "$waited" -lt "$MEM_WAIT_MAX" ]; do
+    sleep 5; waited=$((waited + 5)); have=$(mem_avail_gib)
+  done
+  if [ "$have" -lt "$want" ]; then
+    echo "  !! $arm rep $rep starts at ${have} GiB available against a ${MEM_BASE} GiB baseline"
+    echo "     after ${waited}s of waiting -- its steps may be paging. NOT gated."
+    GATE_FINDINGS+=("$arm rep $rep started at ${have}/${MEM_BASE} GiB available")
+  elif [ "$waited" -gt 0 ]; then
+    echo "  (waited ${waited}s for ${have} GiB of a ${MEM_BASE} GiB baseline)"
+  fi
+}
 
 # gawk, not any awk: the parsing below uses 3-argument `match` and `asort`, and
 # a mawk box would not fail loudly enough for a measurement script.
@@ -166,6 +260,16 @@ while [ $# -gt 0 ]; do
     --repeat) REPEAT=1; shift;;
     --no-kv) KV=0; shift;;
     --prefill-lane) PREFILL_LANE=1; shift;;
+    --prompts)
+      # `--prompts a=/p/a.ids,b=/p/b.ids` or bare paths (labelled by basename).
+      IFS=',' read -r -a _cs <<< "$2"
+      for _c in "${_cs[@]}"; do
+        case "$_c" in
+          *=*) CORPORA+=("$_c");;
+          *)   CORPORA+=("$(basename "$_c" .ids)=$_c");;
+        esac
+      done
+      shift 2;;
     --note) NOTE=$2; shift 2;;
     --util-max) UTIL_MAX=$2; shift 2;;
     --load-max) LOAD_MAX=$2; shift 2;;
@@ -180,6 +284,21 @@ while [ $# -gt 0 ]; do
     *) ARMS+=("$1"); shift;;
   esac
 done
+
+# --- what --prompts promises, checked before anything is measured ----------
+if [ ${#CORPORA[@]} -gt 0 ]; then
+  [ ${#PASSTHRU[@]} -ge 2 ] || die "--prompts substitutes the SECOND passthrough argument (pile, prompt-ids, out), but only ${#PASSTHRU[@]} argument(s) were given after --"
+  for cspec in "${CORPORA[@]}"; do
+    cpath=${cspec#*=}
+    [ -r "$cpath" ] || die "--prompts names ${cspec%%=*} at $cpath, which is not readable"
+  done
+  # Two corpora is the minimum that can produce a spread at all. One would run
+  # the whole matrix and then report an across-corpus spread of exactly 0%,
+  # which reads as "the corpus does not matter" -- the precise false conclusion
+  # this option exists to prevent.
+  [ ${#CORPORA[@]} -ge 2 ] || die "--prompts with a single corpus cannot bound corpus sensitivity; give two or more, or omit --prompts and wear the CORPUS-UNBOUNDED stamp"
+fi
+
 
 # ---------------------------------------------------------------------------
 # THE GATE
@@ -466,7 +585,10 @@ echo
 [ -z "$OUT" ] && OUT="/tmp/bench-decode-$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$OUT" || die "cannot make $OUT"
 TSV="$OUT/results.tsv"
-printf 'arm\trep\ttok_s\tstep_ms\tE_warm\tE_all\twarm_steps\tharness_median_ms\tctx\tidentity_err_pct\tbin_sha256\tbin_mtime\tbin\n' > "$TSV"
+# `corpus` is APPENDED, not inserted: the report's awk reads $1/$3/$4/$9/$10 by
+# position, and a new column in the middle would silently re-point every one of
+# them. A trailing column is the only kind that cannot.
+printf 'arm\trep\ttok_s\tstep_ms\tE_warm\tE_all\twarm_steps\tharness_median_ms\tctx\tidentity_err_pct\tbin_sha256\tbin_mtime\tbin\tcorpus\n' > "$TSV"
 
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
 STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -475,6 +597,11 @@ print_gate
 echo
 echo "--- plan ---"
 echo "  arms      : ${ARMS[*]}"
+if [ ${#CORPORA[@]} -eq 0 ]; then
+  echo "  corpora   : ONE (from the passthrough args) -- results are CORPUS-UNBOUNDED"
+else
+  echo "  corpora   : ${#CORPORA[@]} -- ${CORPORA[*]}"
+fi
 echo "  reps      : $REPS, INTERLEAVED (rep 1 of every arm, then rep 2 of every arm)"
 echo "  discarding: the first $COLD decode passes of every rep"
 echo "  logs      : $OUT"
@@ -531,9 +658,22 @@ check_lane() {
 }
 
 run_rep() {
-  local arm_name=$1 arm_env=$2 rep=$3 log abin
-  log="$OUT/${arm_name}.rep${rep}.log"
+  local arm_name=$1 arm_env=$2 rep=$3 corpus=${4:-} prompt=${5:-} log abin
+  if [ -n "$corpus" ]; then
+    log="$OUT/${arm_name}.${corpus}.rep${rep}.log"
+  else
+    log="$OUT/${arm_name}.rep${rep}.log"
+  fi
   abin=${ARM_BIN[$arm_name]}
+  # The prompt-ids path is the SECOND passthrough argument (pile, prompt, out).
+  # Substituted by position because that is the binary's own argument order; if
+  # the caller passed fewer args there is nothing to substitute and the refusal
+  # below has already fired.
+  local args=()
+  if [ ${#PASSTHRU[@]} -gt 0 ]; then
+    args=("${PASSTHRU[@]}")
+    [ -n "$prompt" ] && args[1]="$prompt"
+  fi
   local envs=()
   [ "$REPEAT" = "1" ] && envs+=("INK_REPEAT=1")
   [ "$KV" = "1" ] && envs+=("INK_KV=1")
@@ -547,13 +687,18 @@ run_rep() {
     case "$kv" in BENCH_BIN=*) ;; *) envs+=("$kv");; esac
   done
 
-  printf '  %-12s rep %d ... ' "$arm_name" "$rep"
+  mem_settle "$arm_name" "$rep"
+  if [ -n "$corpus" ]; then
+    printf '  %-12s %-10s rep %d ... ' "$arm_name" "$corpus" "$rep"
+  else
+    printf '  %-12s rep %d ... ' "$arm_name" "$rep"
+  fi
   {
-    printf '# %s\n' "arm=$arm_name env=${envs[*]} bin=$abin sha256=${BIN_SHA[$abin]:-unknown} args=${PASSTHRU[*]:-}"
+    printf '# %s\n' "arm=$arm_name corpus=${corpus:-<single>} env=${envs[*]} bin=$abin sha256=${BIN_SHA[$abin]:-unknown} args=${args[*]:-}"
   } > "$log"
   local t0 t1
   t0=$(date +%s)
-  env "${envs[@]}" "$abin" ${PASSTHRU[@]+"${PASSTHRU[@]}"} >> "$log" 2>&1
+  env "${envs[@]}" "$abin" ${args[@]+"${args[@]}"} >> "$log" 2>&1
   local rc=$?
   t1=$(date +%s)
   if [ $rc -ne 0 ]; then
@@ -564,7 +709,7 @@ run_rep() {
   # here costs one rep; checking at the report costs the whole run.
   [ -z "$LANE" ] && check_lane "$log"
 
-  "$AWK" -v arm="$arm_name" -v rep="$rep" -v cold="$COLD" -v tsv="$TSV" \
+  "$AWK" -v arm="$arm_name" -v rep="$rep" -v cold="$COLD" -v tsv="$TSV" -v corpus="${corpus:--}" \
        -v bsha="${BIN_SHA[$abin]:-unknown}" -v bmt="${BIN_MTIME[$abin]:-unknown}" -v bpath="$abin" '
     # TWO SOURCES, and which one exists depends on how the binary was run.
     #
@@ -647,7 +792,7 @@ run_rep() {
         if (hm > 2 || hm < -2)
           printf "    !! harness median %.1f ms (first %d discarded) vs binary WARM %.1f ms: %+.1f%%.\n       Two-node pipe: expected -- the step line excludes the receive, the WARM figure includes it.\n       Single node: the two definitions of \"warm\" have drifted and the number is not safe.\n", med, cold, step_ms, hm
       }
-      printf "%s\t%d\t%.4f\t%.3f\t%.4f\t%s\t%d\t%.3f\t%s\t%.3f\t%s\t%s\t%s\n", arm, rep, toks, step_ms, e, (e_all == "" ? "-" : e_all), wsteps, med, ctx, (checked ? err : 0), bsha, bmt, bpath >> tsv
+      printf "%s\t%d\t%.4f\t%.3f\t%.4f\t%s\t%d\t%.3f\t%s\t%.3f\t%s\t%s\t%s\t%s\n", arm, rep, toks, step_ms, e, (e_all == "" ? "-" : e_all), wsteps, med, ctx, (checked ? err : 0), bsha, bmt, bpath, corpus >> tsv
     }
   ' "$log" || printf '    !! parse failed for %s\n' "$log"
   printf '    %ds wall, %s\n' "$((t1 - t0))" "$log"
@@ -655,14 +800,32 @@ run_rep() {
 }
 
 # ---- the interleave -------------------------------------------------------
+# Corpus sits OUTSIDE the arm loop and INSIDE the rep loop, so the arms stay
+# interleaved within a corpus -- drift over the run still lands on every arm
+# equally, which is the property the interleave exists for. Putting corpus
+# outside `rep` instead would give corpus A the cold box and corpus B the warm
+# one, and the across-corpus spread would then be measuring the clock ramp.
 for ((rep = 1; rep <= REPS; rep++)); do
   echo "--- rep $rep of $REPS ---"
-  for spec in "${ARMS[@]}"; do
-    name=${spec%%:*}
-    aenv=${spec#*:}
-    [ "$aenv" = "$spec" ] && aenv=""
-    run_rep "$name" "$aenv" "$rep"
-  done
+  if [ ${#CORPORA[@]} -eq 0 ]; then
+    for spec in "${ARMS[@]}"; do
+      name=${spec%%:*}
+      aenv=${spec#*:}
+      [ "$aenv" = "$spec" ] && aenv=""
+      run_rep "$name" "$aenv" "$rep"
+    done
+  else
+    for cspec in "${CORPORA[@]}"; do
+      clabel=${cspec%%=*}
+      cpath=${cspec#*=}
+      for spec in "${ARMS[@]}"; do
+        name=${spec%%:*}
+        aenv=${spec#*:}
+        [ "$aenv" = "$spec" ] && aenv=""
+        run_rep "$name" "$aenv" "$rep" "$clabel" "$cpath"
+      done
+    done
+  fi
 done
 
 # ---- did the box stay idle? ----------------------------------------------
@@ -717,9 +880,104 @@ echo
     }
   }' "$TSV"
 
+
+if [ ${#CORPORA[@]} -gt 0 ]; then
+echo
+echo "=== per corpus (the variable the arms do not control) ==="
+echo
+"$AWK" -F'\t' 'NR>1 {
+    a=$1; c=$14; k=a SUBSEP c
+    n[k]++; v[k,n[k]]=$3
+    if (!(a in sa)) { sa[a]=1; arm[++na]=a }
+    if (!(c in sc)) { sc[c]=1; cor[++nc]=c }
+  }
+  function med(k, cnt,   i, x) {
+    for (i=1;i<=cnt;i++) x[i]=v[k,i]; asort(x)
+    return (cnt%2) ? x[int(cnt/2)+1] : (x[int(cnt/2)]+x[int(cnt/2)+1])/2
+  }
+  function spr(k, cnt,   i, lo, hi, m) {
+    lo=""; hi=""
+    for (i=1;i<=cnt;i++) { m=v[k,i]; if (lo==""||m<lo) lo=m; if (hi==""||m>hi) hi=m }
+    return (lo>0) ? 100.0*(hi-lo)/lo : 0
+  }
+  END {
+    printf "  %-14s", "arm (MEDIAN tok/s)"
+    for (j=1;j<=nc;j++) printf " %13s", cor[j]
+    printf " %12s %12s\n", "corpus sprd", "max rep sprd"
+    for (i=1;i<=na;i++) {
+      a=arm[i]; lo=""; hi=""; mrs=0
+      printf "  %-14s", a
+      for (j=1;j<=nc;j++) {
+        k = a SUBSEP cor[j]
+        if (n[k]) {
+          m = med(k, n[k]); mm[a,cor[j]] = m
+          printf " %13.3f", m
+          if (lo==""||m<lo) lo=m; if (hi==""||m>hi) hi=m
+          rs = spr(k, n[k]); if (rs > mrs) mrs = rs
+        } else printf " %13s", "-"
+      }
+      cs = (lo>0) ? 100.0*(hi-lo)/lo : 0
+      csv[a] = cs; mrsv[a] = mrs
+      printf " %11.1f%% %11.1f%%\n", cs, mrs
+    }
+    print ""
+    print "  corpus sprd  = how much this arm moves when only the TEXT changes."
+    print "  max rep sprd = the largest rep-to-rep spread within any one corpus."
+    print "  When the first is larger than the second -- the normal case on the"
+    print "  speculative lane -- the text is the dominant variable in this run and"
+    print "  no arm difference smaller than it has been measured."
+    print ""
+    print "  --- does the arm ordering survive the corpus? ---"
+    print ""
+    b = arm[1]
+    flipped = 0
+    for (j=1;j<=nc;j++) {
+      c = cor[j]
+      printf "  %-12s", c
+      for (i=2;i<=na;i++) {
+        a = arm[i]
+        if (mm[b,c] > 0 && (a SUBSEP c) in mm) {
+          d = 100.0*(mm[a,c]-mm[b,c])/mm[b,c]
+          printf "  %s vs %s %+7.2f%%", a, b, d
+          sign[a] = (sign[a] == "") ? (d >= 0 ? 1 : -1) : sign[a]
+          if ((d >= 0 ? 1 : -1) != sign[a]) flipped = 1
+        }
+      }
+      printf "\n"
+    }
+    print ""
+    if (na < 2) {
+      print "  (one arm: nothing to order. The corpus spread above is still the"
+      print "   bound on any change this run could have detected.)"
+    } else if (flipped) {
+      print "  !! THE ORDERING FLIPS BETWEEN CORPORA. This run does not have a winner;"
+      print "     it has a winner PER CORPUS. Quote both, or say which corpus the"
+      print "     default is being chosen for. A single-prompt run would have reported"
+      print "     one of these signs and hidden the other."
+    } else {
+      print "  The sign is the same on every corpus, which is the only condition under"
+      print "  which a single number describes this change. The magnitude still varies;"
+      print "  quote the range, not the best corpus."
+    }
+  }' "$TSV"
+fi
+
 echo
 echo "=== the framing rule (this is part of the number, not a footnote) ==="
-echo "  what varied     : the arms, and nothing else -- ${ARMS[*]}"
+if [ ${#CORPORA[@]} -eq 0 ]; then
+  echo "  what varied     : the arms, and nothing else -- ${ARMS[*]}"
+  echo "  corpus          : ONE, from the passthrough args -- CORPUS-UNBOUNDED. On a"
+  echo "                    speculative arm this is not a bound at all: this repo has"
+  echo "                    measured depth-1 acceptance at 22.0%, 50.0% and 71.2% with"
+  echo "                    the same instrument on three sequences, and INK_SPEC=1 at"
+  echo "                    1.089x and 0.977x on two corpora. Use --prompts before"
+  echo "                    quoting this as a verdict on acceptance."
+else
+  echo "  what varied     : the arms (${ARMS[*]}) ACROSS ${#CORPORA[@]} corpora"
+  echo "  corpora         : ${CORPORA[*]}"
+  echo "                    The arms are interleaved WITHIN each corpus, so drift lands"
+  echo "                    on every arm equally; corpus is the outer loop."
+fi
 if [ -z "$LANE_WIDTH" ]; then
   echo "  per what        : NOTHING -- no rep produced a log to read the lane off. If the"
   echo "                    table above is empty, every rep failed; read the logs."

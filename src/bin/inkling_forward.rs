@@ -1496,6 +1496,7 @@ use mary::models::inkling::mtp::{
 use mary::models::inkling::pile::Elem;
 use mary::models::inkling::source::Weights;
 use mary::models::inkling::stack::{embed_and_norm_bf16, embed_row_bf16};
+use mary::models::inkling::stepstat;
 
 /// One gibibyte, as the divisor every byte count here is printed against.
 const GIB: f64 = (1u64 << 30) as f64;
@@ -1831,6 +1832,72 @@ fn argmax_row_dev(row: T2) -> usize {
         .iter::<i64>()
         .next()
         .expect("device argmax readback") as usize
+}
+
+/// The five largest elements of a logit row, by value, ties broken by the
+/// SMALLER index.
+///
+/// # Why this is not a sort
+///
+/// It was one: `(0..v).collect()` then `sort_unstable_by` over the whole row.
+/// That is a 1.6 MB index allocation and ~3.5 M comparisons across a 200058-wide
+/// f32 row — per CONFIRMED ROW, per pass — to read five numbers, and it is the
+/// REPORT's, not the model's. Measured on the two-node tail (spark, layers
+/// 21..42, `INK_SPEC=0`, `INK_KV=1`, ctx ~3732, 58 warm passes, one row per
+/// pass): the gap between `whole_pass` — sampled before the report — and the
+/// `pass_ms` the harness records was 3.20 ms p50 (min 3.10, max 3.30) on a 51.5
+/// ms p50 pass, 6.2% of it. On the HEAD the same gap is 0.10 ms, and the head
+/// is the only difference: it has no logits, so it never ranks a row. The sort
+/// was the whole of it.
+///
+/// A five-slot insertion sweep is one pass over the row, allocates nothing but
+/// the five-element answer, and skips on a single failed compare for all but a
+/// handful of elements.
+///
+/// # What it costs the pipeline right now, which is nothing
+///
+/// Said plainly so nobody quotes this as a step-time win: at the config above
+/// the tail replies to its peer BEFORE it prints, and the head then spends ~40
+/// ms in its own layer loop, so the tail's 3.20 ms was already hidden. This
+/// removes a real per-pass cost from the tail's budget; it does not move the
+/// two-node ms/step, and a measurement that claims it did is measuring drift.
+///
+/// # Ties
+///
+/// `sort_unstable` does not say where equal keys land, so a flat row could print
+/// a different top-5 ORDER on two runs of the same binary — on a model this file
+/// already documents as disagreeing with itself on 8.55% of argmax positions,
+/// that is one more source nobody needs. The rule here is the argmax's own:
+/// strictly greater wins, so an equal value never displaces an earlier index.
+/// Non-finite values are skipped by the same `>` that the host argmax skips them
+/// with, rather than panicking in a `partial_cmp().unwrap()` inside a report.
+fn top5_desc(row: &[f32]) -> Vec<usize> {
+    let k = 5.min(row.len());
+    let mut best: Vec<(f32, usize)> = Vec::with_capacity(k + 1);
+    for (i, &val) in row.iter().enumerate() {
+        // A NaN is not ranked, and it is dropped HERE rather than compared
+        // away. `partition_point` below needs `!(val > v)` to hold on a prefix
+        // and fail after it; one NaN admitted into `best` makes that predicate
+        // true again past the split and the binary search returns a position
+        // that means nothing. Caught by `a_nan_does_not_kill_the_report`, which
+        // is the whole reason that test exists.
+        if val.is_nan() {
+            continue;
+        }
+        // The overwhelmingly common case: a value that cannot displace the
+        // fifth. One comparison and nothing else.
+        if best.len() == k && !(val > best[k - 1].0) {
+            continue;
+        }
+        // `best` is sorted descending, so `!(val > v)` holds on a prefix and
+        // `at` is the first slot `val` outranks. Inserting there leaves an
+        // equal value already present ahead of this one, which is the
+        // smaller-index rule.
+        let at = best.partition_point(|&(v, _)| !(val > v));
+        best.insert(at, (val, i));
+        best.truncate(k);
+    }
+    best.into_iter().map(|(_, i)| i).collect()
 }
 
 /// Host seconds inside the routed-expert lane, split by WHAT THE HOST DID.
@@ -2443,7 +2510,54 @@ fn quantized_bf16(
         n: rows,
         k: cols,
         scale2: 1.0,
+        swizzled: false,
     }
+}
+
+/// Bind a quantised weight to the W4A16 lane, in MMA-fragment order where the
+/// shape allows it.
+///
+/// The routed experts get their permutation free, inside the startup memcpy out
+/// of the pile. These weights have no such memcpy -- they are QUANTISED on the
+/// device by [`quantized_bf16`] -- so it is its own pass: one linear write with
+/// a gathered read, 0.43 GiB at the head's shape, once per process. The gather
+/// is the scattered side, and moving it here is the entire trade: it is what
+/// the GEMM stops doing on every step, of every pass, forever.
+///
+/// It is applied HERE and not inside the quantiser because the quantiser is
+/// lane-agnostic: `HeadLane::W4a4` binds the identical `PackedW` to
+/// [`dev_lane::linear_fp4`], which is `m16n8k64` and would read k16-permuted
+/// bytes as if they were row-major. `linear_fp4` refuses such a weight, so that
+/// mistake is an error rather than a plausible-looking logit -- but the right
+/// place to not make it is here.
+///
+/// `swizzled` reports whether the pass RAN, never whether it was requested.
+fn w4a16_bind(
+    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+    mut p: dev_lane::PackedW,
+) -> dev_lane::ProjW {
+    use mary::models::inkling::w4a16gemm as k16;
+    if k16::swizzle_w4a16() && k16::swizzleable(p.n, p.k) {
+        let (c, s) = k16::swizzle_w4a16_device(client, &p.codes, &p.scales, p.n, p.k);
+        p.codes = c;
+        p.scales = s;
+        p.swizzled = true;
+    }
+    // Once a process, not once a weight: the sink experts come through here
+    // several times a layer and the line is about the LAYOUT, which is one
+    // decision.
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        println!(
+            "  W4A16 weights written in {} order",
+            if p.swizzled {
+                "MMA-FRAGMENT (m16n8k16)"
+            } else {
+                "row-major [n, k/8]"
+            }
+        );
+    }
+    dev_lane::ProjW::W4a16(p)
 }
 
 fn bind_bf16(
@@ -2610,7 +2724,7 @@ impl DeviceDense {
                     // W4A16 and NOT `Fp4`: four-bit weights against a BF16
                     // activation, because nothing calibrated an input
                     // quantiser for this tensor. See [`sink_w4a16`].
-                    dev_lane::ProjW::W4a16(quantized_bf16(client, &gu, 2 * n_shared * inter, h))
+                    w4a16_bind(client, quantized_bf16(client, &gu, 2 * n_shared * inter, h))
                 } else {
                     dev_lane::ProjW::Bf16(bind_bf16(client, aliases, &gu, 2 * n_shared * inter, h))
                 },
@@ -2619,7 +2733,7 @@ impl DeviceDense {
             for e in 0..n_shared {
                 let raw = &d.bytes[e * per_d..(e + 1) * per_d];
                 sd.down.push(if sink_w4a16() {
-                    dev_lane::ProjW::W4a16(quantized_bf16(client, raw, h, inter))
+                    w4a16_bind(client, quantized_bf16(client, raw, h, inter))
                 } else {
                     // `w2` is NOT de-interleaved, so this one is a view of the
                     // pile and aliases outright.
@@ -3934,8 +4048,19 @@ struct DevRoute {
     /// The `None` is cached too — a layer that refused once refuses every pass,
     /// and re-deriving that costs 1024 lookups.
     tabs: std::collections::HashMap<usize, Option<mary::models::inkling::devplan::ExpertTable>>,
-    /// `top_k`, which at `n == 1` is also the block count and the slot count.
+    /// Expert SLOTS in the plan, which is also the block count: `n * top_k`.
+    ///
+    /// It was called `k` while it could only be `top_k`, and the rename is the
+    /// whole `n > 1` change stated once. At `n == 1` it is still `top_k` and the
+    /// lane is byte-identical to what it was.
     k: usize,
+    /// `top_k`: the number of experts ONE token routes to, which is `RowPlan`'s
+    /// `kmax` and is NOT the slot count once `n > 1`.
+    kmax: usize,
+    /// The row count these invariants were derived at. They are a function of
+    /// `n` and `top_k` alone (see [`devroute_new`]), so a pass at a different
+    /// width needs a different set and this is what notices.
+    n: usize,
     /// `k * MTILE`.
     m_total: usize,
     /// What `RowPlan::planes()` said, carried so the launch shape matches the
@@ -3951,21 +4076,48 @@ struct DevRoute {
 fn devroute_new(
     client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
     k: usize,
+    n: usize,
 ) -> DevRoute {
     use mary::models::inkling::moegroup::RowPlan;
-    // `k` experts of one token each — token 0, weight irrelevant, because the
-    // weights are exactly the field this does NOT hoist.
-    let one = vec![(0usize, 0.0f32)];
-    let each: Vec<&Vec<(usize, f32)>> = (0..k).map(|_| &one).collect();
-    let plan = RowPlan::build(each.into_iter(), 1, RowPlan::planes());
+    // `n * k` SLOTS of one token each: slot `s` carries row `s / k`'s
+    // `s % k`-th pick. Token index, not weight -- the weights are exactly the
+    // field this does NOT hoist.
+    //
+    // ## Why one slot per (token, pick) and not one per DISTINCT expert
+    //
+    // The host lane dedups: two tokens that pick the same expert share a tile,
+    // and the expert's plane is read once. That saves bandwidth and it makes
+    // the plan's SHAPE data-dependent -- `blk_slot` changes length with the
+    // number of distinct experts, and the module doc records exactly that
+    // happening at `n == 5`, where it moved between 17 and 24 from one layer to
+    // the next. A shape that changes per layer cannot be hoisted, and hoisting
+    // is the entire lane: it is what lets six of `RowPlan`'s seven fields be
+    // uploaded once instead of read back every layer.
+    //
+    // Not deduping restores the property at every `n`: `n * k` slots, one token
+    // each, every field but `row_wgt` and the offsets a function of `n` and `k`.
+    // It costs the re-read of a shared expert's plane. MEASURED on this box at
+    // `n = 2`, the log's own counter: 114 slabs a pass deduped, ~200 as the
+    // router actually routes, 228 without dedup -- so the charge is the 28-slab
+    // difference, about 0.40 GiB a pass and ~2 ms at this part's achievable
+    // bandwidth, against a readback whose removal is worth 8.1 ms at the same
+    // width (`INK_ROUTE_STALE=1` against base, 72.2 -> 64.1 ms/step, two
+    // interleaved reps, layers 0:21, ctx 3784).
+    //
+    // The per-token ACCUMULATION ORDER is unchanged, which is the part that is
+    // not a trade: a token's picks land in its own `k` slots in ascending
+    // expert id, so `tok_rows` walks them in the same order the host's
+    // `BTreeMap` did.
+    let each: Vec<Vec<(usize, f32)>> = (0..n * k).map(|s| vec![(s / k, 0.0f32)]).collect();
+    let plan = RowPlan::build(each.iter(), n, RowPlan::planes());
     assert_eq!(
         plan.kmax, k,
-        "one token routed to {k} distinct experts has kmax {k}"
+        "a token routed to {k} picks has kmax {k}, whatever {n} is"
     );
     assert_eq!(
         plan.blk_slot.len(),
-        k,
-        "one tile an expert is one block an expert"
+        n * k,
+        "one tile a slot is one block a slot"
     );
     DevRoute {
         row_tok: client.create_from_slice(bytes_of(&plan.row_tok)),
@@ -3976,7 +4128,9 @@ fn devroute_new(
         tok_cnt: client.create_from_slice(bytes_of(&plan.tok_cnt)),
         fault: client.create_from_slice(&0u32.to_le_bytes()),
         tabs: std::collections::HashMap::new(),
-        k,
+        k: n * k,
+        kmax: k,
+        n,
         m_total: plan.m_total(),
         planes: RowPlan::planes(),
     }
@@ -4179,7 +4333,7 @@ fn routed_experts_fp4_dev(
         &dp.sc2,
         dr.k,
         dr.m_total,
-        dr.k,
+        dr.kmax,
         n,
         h,
         inter,
@@ -4232,7 +4386,7 @@ fn routed_experts_bf16_dev(
         &dp.off2,
         dr.k,
         dr.m_total,
-        dr.k,
+        dr.kmax,
         n,
         h,
         inter,
@@ -4285,19 +4439,60 @@ fn devplan_verify_layer(
     al: &mary::models::inkling::fp4gemm::Aliases,
     client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
     prefix: &str,
-    by_expert: &BTreeMap<usize, Vec<(usize, f32)>>,
+    routing: &[Routing],
     dp: &mary::models::inkling::devplan::DevRowPlan,
     dr: &DevRoute,
     scaled: bool,
 ) -> Result<()> {
-    use mary::models::inkling::moegroup::RowPlan;
+    use mary::models::inkling::fp4gemm::MTILE;
+    // The expected plan, from the ROUTING rather than from `by_expert`.
+    //
+    // It used to be built from the host's `BTreeMap`, which is the deduplicated
+    // expert set, and that is the same thing as "each row's picks, ascending"
+    // only while there is one row. `devroute_new` no longer dedups, so the two
+    // part company at `n > 1` and the routing is the one that still says what
+    // the plan must be. At `n == 1` this builds exactly what the `BTreeMap`
+    // form built, so the check did not get weaker where it already worked.
+    let k = dr.kmax;
+    anyhow::ensure!(
+        routing.len() == dr.n,
+        "{prefix}: the plan was derived at {} rows and the pass routed {}",
+        dr.n,
+        routing.len()
+    );
+    let mut want_ids: Vec<u32> = Vec::with_capacity(dr.n * k);
+    let mut want_wgt: Vec<f32> = vec![0.0f32; dr.n * k * MTILE];
+    let mut picks: Vec<usize> = Vec::with_capacity(dr.n * k);
+    for (t, rt) in routing.iter().enumerate() {
+        anyhow::ensure!(
+            rt.experts.len() == k,
+            "{prefix}: row {t} routed to {} experts and the plan holds {k} a row",
+            rt.experts.len()
+        );
+        let mut row: Vec<(usize, f32)> = rt
+            .experts
+            .iter()
+            .copied()
+            .zip(rt.weights.iter().copied())
+            .collect();
+        // ASCENDING EXPERT ID, which is the order the scatter accumulates this
+        // token's contributions in and therefore the order the sum is defined
+        // by. `sort_by_key` is stable and the ids within a row are distinct, so
+        // there is no tie to break.
+        row.sort_by_key(|&(e, _)| e);
+        for (j, &(e, w)) in row.iter().enumerate() {
+            want_ids.push(e as u32);
+            want_wgt[(t * k + j) * MTILE] = w;
+            picks.push(e);
+        }
+    }
     let n13 = format!("{prefix}mlp.experts.w13_weight");
     let n2 = format!("{prefix}mlp.experts.w2_weight");
     let mut off13: Vec<u64> = Vec::new();
     let mut off2: Vec<u64> = Vec::new();
     let mut sc13: Vec<f32> = Vec::new();
     let mut sc2: Vec<f32> = Vec::new();
-    for &e in by_expert.keys() {
+    for &e in picks.iter() {
         if scaled {
             let w13 = src.expert_packed(&n13, e)?;
             let w2 = src.expert_packed(&n2, e)?;
@@ -4326,7 +4521,6 @@ fn devplan_verify_layer(
             off2.push(b2 / 2);
         }
     }
-    let plan = RowPlan::build(by_expert.values(), 1, RowPlan::planes());
     let rd = |hnd: &cubecl::server::Handle| -> Vec<u8> {
         client
             .read_one(hnd.clone())
@@ -4342,16 +4536,15 @@ fn devplan_verify_layer(
         anyhow::ensure!(
             host == got,
             "DEVPLAN MISMATCH at {prefix}: {what} differs between the host plan and the device \
-             plan. host {host:02x?} device {got:02x?}. The experts the host chose, ascending, \
-             were {:?}.",
-            by_expert.keys().collect::<Vec<_>>()
+             plan. host {host:02x?} device {got:02x?}. The picks the routing made, row by row \
+             and ascending within a row, were {picks:?}."
         );
         Ok(())
     };
     anyhow::ensure!(
-        by_expert.len() == dr.k,
-        "{prefix} routed to {} distinct experts, and the device plan is built for exactly {}",
-        by_expert.len(),
+        picks.len() == dr.k,
+        "{prefix} routed {} (row, pick) pairs, and the device plan is built for exactly {}",
+        picks.len(),
         dr.k
     );
     // THE ORDER, as integers, before anything derived from it. A mis-sorted
@@ -4365,15 +4558,14 @@ fn devplan_verify_layer(
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes(c.try_into().expect("four bytes")))
         .collect();
-    let want_ids: Vec<u32> = by_expert.keys().map(|&e| e as u32).collect();
     anyhow::ensure!(
         got_ids == want_ids,
         "DEVPLAN ORDER MISMATCH at {prefix}: the device plan stacked the experts as {got_ids:?} \
-         and the host's BTreeMap order is {want_ids:?}. These must be identical -- the order is \
-         the order the scatter accumulates a token's contributions in, and floating-point \
-         addition is not associative."
+         and the routing, row by row and ascending within a row, is {want_ids:?}. These must be \
+         identical -- the order is the order the scatter accumulates a token's contributions in, \
+         and floating-point addition is not associative."
     );
-    bad("row_wgt", bytes_of(&plan.row_wgt), &d_wgt)?;
+    bad("row_wgt", bytes_of(&want_wgt), &d_wgt)?;
     bad("off13", bytes_of(&off13), &d_o13)?;
     bad("off2", bytes_of(&off2), &d_o2)?;
     if scaled {
@@ -6174,7 +6366,7 @@ fn main() -> Result<()> {
                     head_sketch = Some(sk);
                 }
                 let w = match head_lane() {
-                    HeadLane::W4a16 => dev_lane::ProjW::W4a16(p),
+                    HeadLane::W4a16 => w4a16_bind(&fp4_client, p),
                     HeadLane::W4a4 => dev_lane::ProjW::Fp4(p),
                     HeadLane::Bf16 => unreachable!("guarded by head_lane() != Bf16"),
                 };
@@ -6382,6 +6574,39 @@ fn main() -> Result<()> {
     let devplan_verify = std::env::var("INK_DEVPLAN_CHECK")
         .map(|v| v == "1")
         .unwrap_or(false);
+    // `INK_DEV_PLAN_MAXN`: the widest pass the device plan will take.
+    //
+    // **It defaults to 1, and that is a MEASURED default rather than the old
+    // restriction left in place.** The plan can now be built at any width up to
+    // `MTILE` (see `devplan.rs`), and doing so removes the per-layer blocking
+    // readback -- but only by giving up the deduplication of experts across
+    // rows, and on this model those two are worth about the same. One node,
+    // spark2-zt (GB10), layers 0:21, a 3772-token prompt, 12 cached decode
+    // steps, two INTERLEAVED reps, medians, one binary:
+    //
+    //     arm                                    w = 2     w = 3
+    //     MAXN=1   (dedup, readback)              69.0      75.6
+    //     MAXN=16  (no dedup, no readback)        67.9      78.2
+    //     INK_ROUTE_STALE=1 (dedup, no readback)  64.0        --
+    //
+    // At w = 2 the two cancel to within the spread; at w = 3 dedup wins by
+    // 2.6 ms, because a third row duplicates more experts while the readback is
+    // worth less. The log's own counter says the same thing in slabs: 193 a
+    // pass deduplicated at w = 2 against 228 without.
+    //
+    // The probe row is the one that matters for whoever picks this up. A plan
+    // that dedups AND stays on the device is worth 5.0 ms at w = 2 against
+    // MAXN=1, and none of that is reachable without moving `row_tok`,
+    // `blk_slot`, `blk_tile0`, `blk_cnt`, `tok_rows` and `tok_cnt` onto the
+    // device too -- because dedup is exactly what turns them into data.
+    // `MAXN=16` stays because it is the half of that which is already built and
+    // checked (`INK_DEVPLAN_CHECK=1` passes at width 2 over 19 layers x 4
+    // steps), not because it wins.
+    let dev_plan_maxn: usize = std::env::var("INK_DEV_PLAN_MAXN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+        .min(mary::models::inkling::fp4gemm::MTILE);
     let mut devroute: Option<DevRoute> = None;
     // Per decode pass: which arm it ran and what it cost. The arms are
     // interleaved inside one process, so this is the only pairing that is not
@@ -6418,6 +6643,16 @@ fn main() -> Result<()> {
     let mut gen_tokens = 0usize;
     let mut spec_hist = vec![0usize; spec_k + 2];
     let mut pass_ms: Vec<f64> = Vec::new();
+    // The machine under the pass, sampled per pass, for the intermittent
+    // multi-second stall. Off unless `INK_STEPSTAT=1`; see
+    // [`mary::models::inkling::stepstat`] for what each field decides and what
+    // the sample costs.
+    let stepstat_on = stepstat::enabled();
+    let mut stepstat_prev = if stepstat_on {
+        stepstat::StepStat::sample()
+    } else {
+        stepstat::StepStat::default()
+    };
     let mut acc_recv = 0f64;
     let mut acc_pass = 0f64;
     let mut acc_draft = 0f64;
@@ -7133,14 +7368,22 @@ fn main() -> Result<()> {
                 // Can this layer's plan stay on the device this pass? Every clause
                 // is a separate reason and none of them is a preference:
                 //
-                // * `n == 1` is the shape the invariants hold at, and only that one.
+                // * `n <= MTILE` is the shape the invariants hold at. It was
+                //   `n == 1`, which is where they hold when the plan DEDUPS
+                //   experts; `devroute_new` no longer does, so they hold for
+                //   every width whose tokens still fit one tile an expert --
+                //   i.e. every `n` up to `MTILE`. Above it a slot would need
+                //   more than one tile and the count would be data-dependent
+                //   again, which is a prefill and keeps the host lane.
+                //   `INK_DEV_PLAN_MAXN` narrows the band without a rebuild, and
+                //   `=1` restores the old behaviour exactly.
                 // * the diagnostics below read `routing`, which this lane does not
                 //   produce -- so they select the host lane rather than being
                 //   silently wrong.
                 // * `INK_GROUPED=0` is the per-expert loop, which has no plan.
                 // * a BF16-expert layer goes through a different lane entirely.
                 let plan_dev_ok = dev_plan_now
-                    && n == 1
+                    && n <= dev_plan_maxn
                     && dev_route
                     && !route_stale
                     && grouped_mode != "0"
@@ -7151,8 +7394,19 @@ fn main() -> Result<()> {
                 // and held for the run. A layer that cannot be tabled caches its
                 // `None` and takes the host lane every pass thereafter.
                 let plan_dev = if plan_dev_ok {
+                    // Keyed by `n`: the invariants are derived at a width and
+                    // are wrong at any other. A decode run holds one width, so
+                    // this fires once -- and it carries the weight TABLES over,
+                    // because those are per-layer facts about the checkpoint and
+                    // have nothing to do with how many rows the pass feeds.
+                    if devroute.as_ref().is_some_and(|d| d.n != n) {
+                        let old = devroute.take().expect("checked");
+                        let mut fresh = devroute_new(&fp4_client, t.num_experts_per_tok, n);
+                        fresh.tabs = old.tabs;
+                        devroute = Some(fresh);
+                    }
                     let dr = devroute
-                        .get_or_insert_with(|| devroute_new(&fp4_client, t.num_experts_per_tok));
+                        .get_or_insert_with(|| devroute_new(&fp4_client, t.num_experts_per_tok, n));
                     if !dr.tabs.contains_key(&layer) {
                         let t_s = Instant::now();
                         // Which table the layer's own bytes ask for. Both lanes
@@ -7401,9 +7655,10 @@ fn main() -> Result<()> {
                         &th,
                         tb,
                         &dr.fault,
-                        dr.k,
+                        dr.kmax,
                         MTILE,
                         topk_width,
+                        n,
                     ))
                 } else {
                     None
@@ -7463,7 +7718,7 @@ fn main() -> Result<()> {
                             al,
                             &fp4_client,
                             &p,
-                            &by_expert,
+                            &routing,
                             dp,
                             dr,
                             tb.scaled,
@@ -9827,9 +10082,7 @@ fn main() -> Result<()> {
             for ti in logit_row0..valid_to {
                 let pos = pos0 + ti;
                 let row = &logits[(ti - logit_row0) * v..(ti - logit_row0 + 1) * v];
-                let mut idx: Vec<usize> = (0..v).collect();
-                idx.sort_unstable_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap());
-                let top: Vec<usize> = idx[..5].to_vec();
+                let top = top5_desc(row);
                 println!(
                     "  after token {pos} (id {}): top5 {:?}  logits {:?}",
                     ids[pos],
@@ -9893,6 +10146,21 @@ fn main() -> Result<()> {
             acc_steps += 1;
             pass_ms.push((pass.elapsed().as_secs_f64() + t_recv) * 1e3);
             pass_ms_arm.push((dev_plan_now, (pass.elapsed().as_secs_f64() + t_recv) * 1e3));
+        }
+        // On its OWN line, never folded into the `step N:` line above, because
+        // `bench-decode.sh` and `pipe-bench.sh` both parse that line and an
+        // instrument that changes what it is measuring is not an instrument.
+        // The prefill gets a line too: it is where the anonymous arena's huge
+        // pages are decided, and the first decode pass's deltas are read
+        // against it. `pass_ms` here is the same quantity the `step N:` line
+        // prints, so the two can be joined on it.
+        if stepstat_on {
+            let now = stepstat::StepStat::sample();
+            println!(
+                "{}",
+                now.line(&stepstat_prev, step, pass.elapsed().as_secs_f64() * 1e3)
+            );
+            stepstat_prev = now;
         }
         if is_decode && step - prefill_passes >= COLD_DECODE_STEPS {
             warm_wall += pass.elapsed().as_secs_f64() + t_recv;
@@ -10629,5 +10897,75 @@ mod ann_temp_tests {
         let c = normals(0x5EED_1107, 7, 64);
         assert_eq!(a, c, "the same (seed, step) drew differently");
         assert_ne!(a, b, "consecutive steps drew the same noise");
+    }
+}
+
+#[cfg(test)]
+mod top5_tests {
+    use super::top5_desc;
+
+    /// The reference this replaced, spelled out: rank every index by value,
+    /// descending, ties by the smaller index. Written here rather than reused
+    /// from the file because a test that shares an implementation with the
+    /// thing it checks checks nothing.
+    fn reference(row: &[f32]) -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..row.len()).collect();
+        idx.sort_by(|&a, &b| {
+            row[b]
+                .partial_cmp(&row[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+        idx.truncate(5);
+        idx
+    }
+
+    #[test]
+    fn the_five_slot_sweep_agrees_with_a_full_sort_on_random_rows() {
+        // A real vocabulary width, because the failure mode worth catching is a
+        // truncation bug that a ten-element row cannot express.
+        let v = 200_058usize;
+        let mut state = 0x243F_6A88_85A3_08D3u64;
+        let mut row = vec![0f32; v];
+        for x in row.iter_mut() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *x = ((state >> 40) as f32 / 1024.0) - 12.0;
+        }
+        assert_eq!(top5_desc(&row), reference(&row));
+    }
+
+    /// The case the old `sort_unstable` left undefined and this one pins: a row
+    /// flat enough that the top five are all ties.
+    #[test]
+    fn ties_go_to_the_smaller_index() {
+        let mut row = vec![-1.0f32; 100];
+        for i in [7, 3, 40, 11, 90, 2] {
+            row[i] = 5.0;
+        }
+        assert_eq!(top5_desc(&row), vec![2, 3, 7, 11, 40]);
+        // Every element equal: the answer is the first five positions, and it
+        // is the same on every run.
+        assert_eq!(top5_desc(&vec![0.5f32; 50]), vec![0, 1, 2, 3, 4]);
+    }
+
+    /// A row narrower than five, and one exactly five wide. The old code
+    /// indexed `idx[..5]` and would have panicked on the first.
+    #[test]
+    fn a_short_row_returns_what_it_has() {
+        assert_eq!(top5_desc(&[1.0, 3.0, 2.0]), vec![1, 2, 0]);
+        assert_eq!(top5_desc(&[]), Vec::<usize>::new());
+        assert_eq!(top5_desc(&[1.0, 2.0, 3.0, 4.0, 5.0]), vec![4, 3, 2, 1, 0]);
+    }
+
+    /// A NaN in the row is skipped rather than panicking. The host argmax
+    /// beside this already skips them -- `val > row[b]` is false for NaN -- so
+    /// a report that killed the run where the token pick did not was the odd
+    /// one out.
+    #[test]
+    fn a_nan_does_not_kill_the_report() {
+        let row = [1.0f32, f32::NAN, 9.0, 4.0, f32::NAN, 7.0, 2.0];
+        assert_eq!(top5_desc(&row), vec![2, 5, 3, 6, 0]);
     }
 }
