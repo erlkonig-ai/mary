@@ -1542,6 +1542,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use cubecl::server::GraphLaunchPatch;
 
 use mary::models::inkling::attn::{AttnDims, AttnWeights, LogScaling};
 use mary::models::inkling::bf16gemm::Bf16W;
@@ -7150,6 +7151,50 @@ fn main() -> Result<()> {
     //
     // The diff is a STRUCTURAL measurement and reports no time.
     let graph_diff = std::env::var("INK_GRAPH_DIFF").ok().as_deref() == Some("1");
+    // `INK_GRAPH_XSTEP=1`: run the SECOND capture's step with the FIRST
+    // capture's graph, rewritten to the second step's parameters.
+    //
+    // This is the cross-step question with one half held constant. A real
+    // cross-step lane has to KNOW the new parameters without capturing
+    // anything; this one learns them by capturing the step it is about to
+    // replace, which is useless as a lane and exact as an experiment. It
+    // answers the part that has to be true first: is a rewritten graph the
+    // graph it was rewritten to? Everything the region touches that a kernel
+    // parameter cannot reach -- its memcpy nodes, its allocation nodes -- stays
+    // the FIRST step's, and if any of it matters the step comes out wrong.
+    //
+    // The verdict is the run's own emitted token and logits, against a pure
+    // eager run of the same binary on the same prompt. Not a spot check of one
+    // buffer: a wrong answer here is wrong in what the step CARRIES, and the
+    // carried sums are printed by `INK_GRAPH_HASH=1` alongside.
+    let graph_xstep = std::env::var("INK_GRAPH_XSTEP").ok().as_deref() == Some("1");
+    // REPEATED REPLAY AND AN ADVANCING CARRY ARE MUTUALLY EXCLUSIVE, and the
+    // combination has to refuse rather than run, because what it produces is a
+    // plausible wrong token and nothing else.
+    //
+    // `INK_GRAPH_REPS` measures the host cost of replaying the region N times,
+    // and it is only a measurement of the same region N times if the region is
+    // IDEMPOTENT. It was, and e3cceca verified that through 64 replays. With
+    // `INK_GRAPH_CARRY=1` it deliberately is not: the point of the carry is
+    // that a replay advances the history it will next read, so replay 2 runs
+    // from state replay 1 wrote. Measured on one GB10 at `INK_LAYERS=0:21` with
+    // `INK_GRAPH_REPS=8`, that emits `after token 19 (id 16335): top5 [1555,
+    // 143607, 43022, 20063, 29592]` where the eager arm of the same binary
+    // emits `(id 1500): top5 [48361, 179231, 109594, 9084, 146754]` -- fluent,
+    // confident, and wrong, with no error anywhere. That is the same failure
+    // shape as `CUBECL_GRAPH_HOLD=0`, and the reason it gets a refusal here
+    // rather than a warning.
+    anyhow::ensure!(
+        !(graph_on
+            && graph_reps > 0
+            && mary::models::inkling::sconv::carry_in_place()
+            && !graph_xstep),
+        "INK_GRAPH_REPS={graph_reps} with INK_GRAPH_CARRY=1 measures nothing: the carry makes \
+         a replay ADVANCE the history it next reads, so repeated replay is not the same region \
+         run twice and the run emits a plausible wrong token. Use INK_GRAPH_REPS=0 with the \
+         carry, or drop the carry to time repeated replay."
+    );
+    let graph_diff = graph_diff || graph_xstep;
     let want_captures = if graph_diff { 2 } else { 1 };
     let mut graphs_captured: Vec<u64> = Vec::new();
     let mut graph_diff_done = false;
@@ -8700,7 +8745,130 @@ fn main() -> Result<()> {
             // running it, and this is what runs it. The pass is correct from
             // here on because the pointers the graph holds are the ones this
             // pass allocated and still owns.
-            fp4_client.graph_replay(g);
+            //
+            // Unless this is the cross-step arm, in which case the step is run
+            // by the FIRST graph rewritten to this step's parameters, and this
+            // capture exists only to say what those parameters are.
+            let xstep_now = graph_xstep && !graphs_captured.is_empty();
+            if xstep_now {
+                let a = graphs_captured[0];
+                let na = fp4_client.graph_launch_count(a);
+                let nb = fp4_client.graph_launch_count(g);
+                assert_eq!(
+                    na, nb,
+                    "the two steps recorded different launch counts, so one cannot stand in \
+                     for the other"
+                );
+                // The memory THIS graph owns. A capture that could not avoid
+                // allocating turned each allocation into a memory node, and a
+                // graph-owned address is fixed by the exec: the same on every
+                // launch of A, and unrelated to whatever B's exec chose. Those
+                // addresses are already pinned, and re-pointing them at B's is
+                // not a harmless no-op -- it aims A's kernels at memory A never
+                // allocates. So they are excluded, and the count of exclusions
+                // is reported, because it is the size of the region that pinning
+                // does not have to reach.
+                let owned = fp4_client.graph_alloc_regions(a);
+                let graph_owned = |p: u64| -> bool {
+                    match owned.binary_search_by(|(base, _)| base.cmp(&p)) {
+                        Ok(_) => true,
+                        Err(0) => false,
+                        Err(k) => {
+                            let (base, len) = owned[k - 1];
+                            p < base + len
+                        }
+                    }
+                };
+                let mut plan: Vec<GraphLaunchPatch> = Vec::new();
+                let mut idx: Vec<usize> = Vec::new();
+                let mut words = 0usize;
+                let mut addrs = 0usize;
+                let mut skipped = 0usize;
+                for i in 0..na {
+                    let pa = fp4_client.graph_launch_params(a, i);
+                    let pb = fp4_client.graph_launch_params(g, i);
+                    let moved: Vec<(usize, u64)> = (0..pa.ptrs.len())
+                        .filter(|&w| pa.ptrs[w] != pb.ptrs[w])
+                        .filter(|&w| {
+                            let own = graph_owned(pa.ptrs[w]);
+                            if own {
+                                skipped += 1;
+                            }
+                            !own
+                        })
+                        .map(|w| (w, pb.ptrs[w]))
+                        .collect();
+                    let info_moved = pa.info != pb.info;
+                    let grid_moved = pa.grid != pb.grid;
+                    if !info_moved && !grid_moved && moved.is_empty() {
+                        continue;
+                    }
+                    words += (0..pa.info.len()).filter(|&w| pa.info[w] != pb.info[w]).count();
+                    addrs += moved.len();
+                    idx.push(i);
+                    plan.push(GraphLaunchPatch {
+                        grid: grid_moved.then_some(pb.grid),
+                        info: info_moved.then_some(pb.info.clone()),
+                        ptrs: moved,
+                    });
+                }
+                // Do the addresses being patched TO belong to B's own graph
+                // memory? If they do, A's kernels are being aimed at memory
+                // only B's exec allocates, and the rewrite is wrong in the same
+                // way excluding A's owned addresses fixes.
+                let owned_b = fp4_client.graph_alloc_regions(g);
+                let b_owned = |p: u64| -> bool {
+                    match owned_b.binary_search_by(|(base, _)| base.cmp(&p)) {
+                        Ok(_) => true,
+                        Err(0) => false,
+                        Err(k) => {
+                            let (base, len) = owned_b[k - 1];
+                            p < base + len
+                        }
+                    }
+                };
+                let into_b_owned: usize = plan
+                    .iter()
+                    .map(|p| p.ptrs.iter().filter(|(_, a)| b_owned(*a)).count())
+                    .sum();
+                // And what does the region COPY? A memcpy node is not a kernel
+                // and no rewrite reaches it.
+                let (ma, mb) = (
+                    fp4_client.graph_memcpy_specs(a),
+                    fp4_client.graph_memcpy_specs(g),
+                );
+                let same_copies = ma == mb;
+                let host_src = ma.iter().filter(|(_, _, _, k)| *k == 1).count();
+                println!(
+                    "  GRAPHCOPY: {} memcpy nodes, {host_src} of them from HOST memory; \
+                     identical between the two steps: {same_copies}",
+                    ma.len()
+                );
+                println!(
+                    "  GRAPHCOPY: {into_b_owned} of the rewritten addresses point into the \
+                     OTHER graph's owned memory"
+                );
+                let n_patched = plan.len();
+                let batch: Vec<(usize, GraphLaunchPatch)> =
+                    idx.into_iter().zip(plan.into_iter()).collect();
+                let t = Instant::now();
+                fp4_client.graph_patch_launches(a, batch);
+                let patch_us = t.elapsed().as_secs_f64() * 1e6;
+                let t = Instant::now();
+                fp4_client.graph_replay(a);
+                let replay_us = t.elapsed().as_secs_f64() * 1e6;
+                println!(
+                    "  GRAPHXSTEP: step {} run by step {}'s graph -- {n_patched} of {na} launches \
+                     rewritten ({words} argument words, {addrs} pool addresses; {skipped} \
+                     graph-owned addresses left alone, over {} owned regions) in {patch_us:.1} \
+                     us host, replay {replay_us:.3} us host",
+                    graph_step + 1,
+                    graph_step,
+                    owned.len()
+                );
+            } else {
+                fp4_client.graph_replay(g);
+            }
             <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync after the first replay");
 
             // Now the measurement: `graph_reps` further replays, each timed on
@@ -8737,6 +8905,39 @@ fn main() -> Result<()> {
                 graph_step,
                 graph_step + 1
             );
+            // What the region is MADE OF. A kernel-parameter rewrite reaches
+            // kernel nodes and nothing else, so the share of the graph that is
+            // not a kernel launch is a ceiling on what patching can fix.
+            for (g, name) in [
+                (a, format!("step {graph_step}")),
+                (b, format!("step {}", graph_step + 1)),
+            ] {
+                let kinds = fp4_client.graph_node_kinds(g);
+                let total: usize = kinds.iter().map(|(_, c)| c).sum();
+                let named: Vec<String> = kinds
+                    .iter()
+                    .map(|(k, c)| {
+                        let n = match k {
+                            0 => "kernel",
+                            1 => "memcpy",
+                            2 => "memset",
+                            3 => "host",
+                            4 => "child-graph",
+                            5 => "empty",
+                            6 => "wait-event",
+                            7 => "event-record",
+                            10 => "mem-alloc",
+                            11 => "mem-free",
+                            _ => "other",
+                        };
+                        format!("{n}({k}) {c}")
+                    })
+                    .collect();
+                println!(
+                    "  GRAPHNODES: {name}: {total} nodes -- {}",
+                    named.join(", ")
+                );
+            }
             if na != nb {
                 println!(
                     "  GRAPHDIFF: the launch sequence is NOT periodic -- a cross-step graph \
@@ -8809,6 +9010,150 @@ fn main() -> Result<()> {
                     "  GRAPHDIFF: {info_words_moved} of {info_words_total} packed argument words \
                      moved, {ptrs_moved} of {ptrs_total} bound addresses moved"
                 );
+
+                // ---- what a patch COSTS ----
+                //
+                // Skipped under the cross-step arm, which has already rewritten
+                // A and timed it. Measuring the same rewrite twice would price
+                // the second one, where every node is already where it is being
+                // put.
+                if !graph_xstep {
+                // ---- what a patch COSTS, and whether it is the right answer ----
+                //
+                // Graph A was captured on step `graph_step` and graph B on the
+                // step after it. Rewriting A's parameters to B's makes the two
+                // executables identical launch for launch, so this measures the
+                // real work on the real region rather than a microbenchmark's
+                // stand-in: the values are the ones the model actually moved,
+                // at the count it actually moved them.
+                //
+                // Two arms, because they price the two halves of the design
+                // separately. The SCALAR arm rewrites only the launches whose
+                // packed blob moved -- what a region with pinned buffers would
+                // have to do every step. The FULL arm also rewrites every
+                // address that moved -- what patching would cost INSTEAD of
+                // pinning, which is the alternative pinning has to beat.
+                //
+                // Each rewrite is timed on its own so the spread is visible.
+                // These are HOST times: a patch touches the executable, not the
+                // device.
+                // The plan is BUILT first and TIMED second. Reading a
+                // launch's captured parameters is a round trip of its own and
+                // is not part of what a patch costs -- a real cross-step lane
+                // holds its plan from the capture, not from a query per step.
+                let mut scalar_plan: Vec<(usize, GraphLaunchPatch)> = Vec::new();
+                let mut addr_plan: Vec<(usize, GraphLaunchPatch)> = Vec::new();
+                for i in 0..na {
+                    let pa = fp4_client.graph_launch_params(a, i);
+                    let pb = fp4_client.graph_launch_params(b, i);
+                    if pa.info != pb.info || pa.grid != pb.grid {
+                        scalar_plan.push((
+                            i,
+                            GraphLaunchPatch {
+                                grid: (pa.grid != pb.grid).then_some(pb.grid),
+                                info: Some(pb.info.clone()),
+                                ptrs: Vec::new(),
+                            },
+                        ));
+                    }
+                    let moved: Vec<(usize, u64)> = (0..pa.ptrs.len())
+                        .filter(|&w| pa.ptrs[w] != pb.ptrs[w])
+                        .map(|w| (w, pb.ptrs[w]))
+                        .collect();
+                    if !moved.is_empty() {
+                        addr_plan.push((
+                            i,
+                            GraphLaunchPatch {
+                                grid: None,
+                                info: None,
+                                ptrs: moved,
+                            },
+                        ));
+                    }
+                }
+                let (scalar_n, full_n) = (scalar_plan.len(), addr_plan.len());
+                let addr_words: usize = addr_plan.iter().map(|(_, p)| p.ptrs.len()).sum();
+                // EIGHT batches, each timed on its own. One sample of a host
+                // cost has no spread to show, and the first one is not like the
+                // others -- it is the one that finds the driver's paths cold.
+                let mut scalar_us = Vec::new();
+                for _ in 0..8 {
+                    let t = Instant::now();
+                    fp4_client.graph_patch_launches(a, scalar_plan.clone());
+                    scalar_us.push(t.elapsed().as_secs_f64() * 1e6);
+                }
+                let mut addr_us = Vec::new();
+                for _ in 0..8 {
+                    let t = Instant::now();
+                    fp4_client.graph_patch_launches(a, addr_plan.clone());
+                    addr_us.push(t.elapsed().as_secs_f64() * 1e6);
+                }
+                let show = |v: &[f64]| -> String {
+                    v.iter()
+                        .map(|x| format!("{x:.1}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                println!(
+                    "  GRAPHPATCH: scalars+geometry, {scalar_n} launches per batch, us per \
+                     batch: [{}]",
+                    show(&scalar_us)
+                );
+                println!(
+                    "  GRAPHPATCH: addresses, {full_n} launches ({addr_words} addresses) per \
+                     batch, us per batch: [{}]",
+                    show(&addr_us)
+                );
+
+                // ---- and is the rewritten graph the RIGHT graph ----
+                //
+                // A is now B, parameter for parameter. B has already been
+                // replayed once, which is what made this step correct, and the
+                // region is idempotent under repeated replay -- so replaying
+                // the rewritten A must leave every carried buffer exactly where
+                // B's own replay left it. Not approximately: these are the same
+                // kernels writing the same addresses from the same inputs.
+                //
+                // The carried sums are checked rather than the logits, because
+                // a region that computes its own step correctly while
+                // corrupting what it hands the next one looks perfect from the
+                // logits. That is the shape of the bug 6c5d780 and e3cceca
+                // chased, and it is the shape this one would take too.
+                let carry_sums = |caches: &Vec<LayerCache>| -> Vec<f64> {
+                    let mut v = Vec::new();
+                    for c in caches.iter() {
+                        v.extend_from_slice(&c.attn.debug_carry_sums(&dev));
+                    }
+                    v
+                };
+                <Bk as burn::tensor::backend::Backend>::sync(&dev)
+                    .expect("sync before the reference carry read");
+                let before = carry_sums(&caches);
+                let t_replay = Instant::now();
+                fp4_client.graph_replay(a);
+                let replay_us = t_replay.elapsed().as_secs_f64() * 1e6;
+                <Bk as burn::tensor::backend::Backend>::sync(&dev)
+                    .expect("sync after the rewritten replay");
+                let after = carry_sums(&caches);
+                let worst = before
+                    .iter()
+                    .zip(after.iter())
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0f64, f64::max);
+                println!(
+                    "  GRAPHPATCH: replay of the rewritten graph {replay_us:.3} us host; \
+                     {} carried buffers, worst absolute-sum difference {worst:.6}",
+                    before.len()
+                );
+                if worst != 0.0 {
+                    println!(
+                        "  GRAPHPATCH: replaying the rewritten graph MOVED the carry. With \
+                         `INK_GRAPH_CARRY=1` that is expected and is not a patch failure: a \
+                         region that advances its own history is not idempotent, and those \
+                         are the same property. Use `INK_GRAPH_XSTEP=1` for the honest test."
+                    );
+                }
+                }
             }
         }
         // DEBUG (`INK_GRAPH_HASH=1`): the absolute sums of every buffer a

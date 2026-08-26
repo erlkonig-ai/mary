@@ -451,9 +451,32 @@ pub fn short_conv_step(
     let (h_hist, h_x, h_w) = (handle_of(hist), handle_of(x), handle_of(weight));
     let (out, next) =
         crate::models::inkling::sconv::short_conv_decode(&client, &h_hist, &h_x, &h_w, dim, kernel);
+    // Where the carried history ENDS UP. See `sconv::carry_in_place`: a
+    // captured region records addresses, so a history that lands in a fresh
+    // buffer every step is a history a replayed step can never advance.
+    //
+    // The returned tensor is built from the handle actually WRITTEN, not from
+    // the caller's `hist` object. Those are the same buffer whenever `hist` was
+    // contiguous, which is the case this is for -- but `handle_of` silently
+    // makes a non-contiguous tensor contiguous into a NEW buffer, and returning
+    // the caller's object then would hand back the one that was not written.
+    // Correctness must not depend on that accident; only pointer STABILITY
+    // does, and stability is what `INK_GRAPH_DIFF` measures.
+    let carried = match crate::models::inkling::sconv::carry_in_place() {
+        true => {
+            crate::models::inkling::sconv::carry_into(
+                &client,
+                &h_hist,
+                &next,
+                (kernel - 1) * dim,
+            );
+            h_hist
+        }
+        false => next,
+    };
     (
         tensor_of(client.clone(), dev.clone(), out, 1, dim),
-        tensor_of(client, dev, next, kernel - 1, dim),
+        tensor_of(client, dev, carried, kernel - 1, dim),
     )
 }
 
