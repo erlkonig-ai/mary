@@ -836,6 +836,27 @@ pub fn swizzle_w4a16() -> bool {
         .unwrap_or(true)
 }
 
+/// Does `INK_W4A16_SWZ=1` explicitly ask for the permutation where the shipped
+/// policy declines it?
+///
+/// [`swizzle_w4a16`] answers "is it allowed"; this answers "is it demanded". The
+/// distinction exists because the shipped policy never permutes a sink, on a
+/// measurement (25% slower at 512-1024 cubes) that has no counterpart at any
+/// other shape -- we know 25128 cubes wins and 512-1024 loses and NOTHING in
+/// between. Without a way to turn it back on, that crossover cannot be measured
+/// without a rebuild, and an unmeasurable policy hardens into folklore, which is
+/// exactly how the original figure came to be applied 25x outside its range.
+///
+/// This never overrides the CORRECTNESS guard. `ann_owns_m1` stays absolute:
+/// `linear_ann` reads row-major and permuting the head while the approximate
+/// lane owns m=1 makes every exact rescore read permuted bytes, which produced
+/// plausible logits rather than an error. Forcing is a speed knob only.
+pub fn swizzle_w4a16_forced() -> bool {
+    std::env::var("INK_W4A16_SWZ")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 /// [`w4a16_linear`] reading a B operand written by [`swizzle_w4a16_codes_into`].
 ///
 /// The ONLY difference is the two global indices. Everything else — the

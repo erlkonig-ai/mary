@@ -2735,8 +2735,14 @@ fn w4a16_bind(
     // same run shows non-device residue falling 21.38 -> 17.67 ms. The two
     // halves are disentangled by this commit, which reverts only the first.
     let ann_owns_m1 = for_ann && ann_budget() > 0;
-    // Reason 2 above: never for the sinks, at any budget.
-    let grid_too_small = !for_ann;
+    // Reason 2 above: never for the sinks, at any budget -- UNLESS explicitly
+    // demanded. `INK_W4A16_SWZ=1` forces the permutation on where the shipped
+    // policy declines it, so the cube-count crossover can be measured without a
+    // rebuild. We know ~25128 cubes wins and 512-1024 loses and nothing between;
+    // a policy that cannot be A/B'd is a policy that hardens into folklore, and
+    // folklore carried 25x outside its range is what caused this in the first
+    // place. It cannot override `ann_owns_m1`, which is correctness, not speed.
+    let grid_too_small = !for_ann && !k16::swizzle_w4a16_forced();
     if !ann_owns_m1 && !grid_too_small && k16::swizzle_w4a16() && k16::swizzleable(p.n, p.k) {
         let (c, s) = k16::swizzle_w4a16_device(client, &p.codes, &p.scales, p.n, p.k);
         p.codes = c;
