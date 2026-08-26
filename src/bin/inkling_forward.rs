@@ -9962,13 +9962,22 @@ fn main() -> Result<()> {
                         .filter(|&w| pb.info[w] != pc.info[w] || pa.info[w] != pb.info[w])
                         .map(|w| (w, pc.info[w].wrapping_sub(pb.info[w])))
                         .collect();
-                    // AFFINENESS, CHECKED. The lane extrapolates `v + n * d`,
-                    // which is right exactly when the two consecutive
-                    // differences agree. Anything else -- a bucketed quantity
-                    // stepping, a value that saturates, a counter that wraps --
-                    // shows up here as a second difference that is not zero,
-                    // and the lane must not arm over it.
-                    for (w, d) in moving.iter() {
+                    // AFFINENESS, CHECKED -- BUT ONLY WHEN THERE ARE THREE
+                    // CAPTURES TO CHECK IT WITH.
+                    //
+                    // The lane extrapolates `v + n * d`, which is right exactly
+                    // when the two consecutive differences agree. Anything else
+                    // -- a bucketed quantity stepping, a value that saturates,
+                    // a counter that wraps -- shows up as a second difference
+                    // that is not zero, and the lane must not arm over it.
+                    //
+                    // With two captures `a` IS `b`, so `b - a` is zero for
+                    // every word and the test degenerates to "the delta must be
+                    // zero", which is false for exactly the words that move.
+                    // Running it there does not check anything; it rejects
+                    // every real lane. It cost one run to find out, and the
+                    // comment is here so it costs nobody a second one.
+                    for (w, d) in moving.iter().filter(|_| want_captures >= 3) {
                         if pb.info[*w].wrapping_sub(pa.info[*w]) != *d {
                             nonaffine.push((i, pb.name.clone(), *w));
                         }
