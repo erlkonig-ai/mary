@@ -67,7 +67,8 @@
 #     as a FILE (so no pattern crosses a shell), and it reports an unreachable
 #     box as BUSY. If either box is busy this script EXITS CLEANLY (rc 3) and
 #     records nothing. It does not wait for hours: `FRONTIER_WAIT_S` (default 0)
-#     is the only wait and it is bounded.
+#     is the only wait there and it is bounded (default 300 s, which covers a box
+#     that has just been released and is still winding a run down).
 #
 #  2. AN ADVISORY LOCK ON EACH BOX -- `scripts/gb10-lock.sh`, the SHARED one,
 #     taken by every agent that runs on these boxes. This script had its own
@@ -80,6 +81,16 @@
 #     checked the box was idle and both were right when they looked. AN IDLE
 #     CHECK IS NOT A RESERVATION -- the gate below cannot close that window, and
 #     the lock is what does.
+#
+#     A REFUSAL IS A WAIT, NOT AN EXIT. There is no queue behind the lock, so an
+#     agent that walks away on the first refusal is simply never handed the box
+#     -- and for a nightly benchmark that means the row does not exist. It polls
+#     every FRONTIER_LOCK_POLL_S to a ceiling of FRONTIER_LOCK_WAIT_S (default
+#     2 h), logs every refusal with the holder's tag and how long they have had
+#     it, gives the head box BACK between attempts (holding half of what you
+#     need is how two agents deadlock), and gives up loudly rather than
+#     silently. It never overrides a holder: a lock you can be talked out of is
+#     not a lock.
 #
 #     Taken from the CONTROL box, because a box cannot ssh to itself here (host
 #     key verification fails) and gb10-lock.sh reaches a box over ssh. Held for
@@ -192,11 +203,13 @@ FRONTIER_GEN=${FRONTIER_GEN:-64}
 FRONTIER_SPLIT=${FRONTIER_SPLIT:-21}
 GB10_LOCK_TIMEOUT_S=${GB10_LOCK_TIMEOUT_S:-5400}   # gb10-lock.sh reads this
 FRONTIER_REFRESH_S=${FRONTIER_REFRESH_S:-300}      # heartbeat while we hold the boxes
+FRONTIER_LOCK_WAIT_S=${FRONTIER_LOCK_WAIT_S:-7200} # ceiling on waiting for the reservation
+FRONTIER_LOCK_POLL_S=${FRONTIER_LOCK_POLL_S:-180}  # how often to re-ask for it
 FRONTIER_LOCK_TAG=${FRONTIER_LOCK_TAG:-}
 FRONTIER_COOLDOWN_S=${FRONTIER_COOLDOWN_S:-60}
 FRONTIER_RUN_TIMEOUT_S=${FRONTIER_RUN_TIMEOUT_S:-3600}
 FRONTIER_HEARTBEAT_H=${FRONTIER_HEARTBEAT_H:-24}
-FRONTIER_WAIT_S=${FRONTIER_WAIT_S:-0}
+FRONTIER_WAIT_S=${FRONTIER_WAIT_S:-300}   # idle-gate wait AFTER we hold the reservation
 FRONTIER_EXTRA_ARM=${FRONTIER_EXTRA_ARM:-}
 FRONTIER_PUSH=${FRONTIER_PUSH:-1}
 RESULTS_REL=bench/frontier.tsv
@@ -627,21 +640,53 @@ release_all() {
 }
 trap release_all EXIT INT TERM
 
-out=$(GB10_LOCK_TIMEOUT_S=$GB10_LOCK_TIMEOUT_S bash "$LOCK" take "$FRONTIER_HEAD" "$FRONTIER_LOCK_TAG")
-if [ $? -ne 0 ]; then
-  say "The head box is reserved: $out"
-  say "Exiting cleanly. A held box means WAIT or come back -- never kill the holder."
-  exit 3
-fi
-HELD_H=1
-out=$(GB10_LOCK_TIMEOUT_S=$GB10_LOCK_TIMEOUT_S bash "$LOCK" take "$FRONTIER_TAIL" "$FRONTIER_LOCK_TAG")
-if [ $? -ne 0 ]; then
-  say "The tail box is reserved: $out"
-  say "Exiting cleanly, and giving the head box back."
-  exit 3
-fi
-HELD_T=1
-say "gb10 box lock held on $FRONTIER_HEAD and $FRONTIER_TAIL as '$FRONTIER_LOCK_TAG'"
+# WAIT AND RETRY, DO NOT GIVE UP ON THE FIRST REFUSAL. There is no queue behind
+# gb10-lock.sh: if we walk away when a box is held, nobody hands it back to us
+# and the night simply has no frontier row -- which is the one outcome this
+# whole script exists to prevent. So poll to a CEILING
+# (FRONTIER_LOCK_WAIT_S, default 2 h) and then give up loudly, because a poll
+# with no deadline is how this project has produced waiters that spun for days.
+#
+# BOTH BOXES OR NEITHER, and the head is given back between attempts. Holding
+# one box while waiting for the other is how two agents deadlock each other,
+# each sitting on half of what the other needs.
+#
+# Every refusal is logged with the holder's tag and how long they have had it.
+# That record is the evidence for whether one shared lock with no queue is
+# enough, or whether this eventually needs a real queue.
+take_both() {
+  local out rc
+  out=$(GB10_LOCK_TIMEOUT_S=$GB10_LOCK_TIMEOUT_S bash "$LOCK" take "$FRONTIER_HEAD" "$FRONTIER_LOCK_TAG"); rc=$?
+  if [ "$rc" -ne 0 ]; then LOCK_WHY="head $FRONTIER_HEAD: $out"; return 1; fi
+  HELD_H=1
+  out=$(GB10_LOCK_TIMEOUT_S=$GB10_LOCK_TIMEOUT_S bash "$LOCK" take "$FRONTIER_TAIL" "$FRONTIER_LOCK_TAG"); rc=$?
+  if [ "$rc" -ne 0 ]; then
+    LOCK_WHY="tail $FRONTIER_TAIL: $out"
+    GB10_LOCK_TIMEOUT_S=$GB10_LOCK_TIMEOUT_S bash "$LOCK" release "$FRONTIER_HEAD" "$FRONTIER_LOCK_TAG" >/dev/null 2>&1
+    HELD_H=0
+    return 1
+  fi
+  HELD_T=1
+  return 0
+}
+LOCK_WHY=""
+lock_waited=0
+until take_both; do
+  if [ "$lock_waited" -ge "$FRONTIER_LOCK_WAIT_S" ]; then
+    say ""
+    say "NEVER GOT A SLOT. The boxes stayed reserved for the whole ${FRONTIER_LOCK_WAIT_S}s ceiling."
+    say "  last refusal: $LOCK_WHY"
+    say "No row was recorded, and nothing was killed or overridden. A lock you can be"
+    say "talked out of is not a lock; report the wait, do not defeat it."
+    exit 3
+  fi
+  say "[$(date -u +%H:%M:%SZ)] reserved -- $LOCK_WHY  (waited ${lock_waited}s of ${FRONTIER_LOCK_WAIT_S}s, retrying in ${FRONTIER_LOCK_POLL_S}s)"
+  sleep "$FRONTIER_LOCK_POLL_S"
+  lock_waited=$((lock_waited + FRONTIER_LOCK_POLL_S))
+done
+WAITED_NOTE=""
+[ "$lock_waited" -gt 0 ] && WAITED_NOTE=" (after ${lock_waited}s of waiting)"
+say "gb10 box lock held on $FRONTIER_HEAD and $FRONTIER_TAIL as '$FRONTIER_LOCK_TAG'$WAITED_NOTE"
 
 # Staleness is SILENCE, so a long holder has to keep speaking. Every
 # FRONTIER_REFRESH_S until we are done; killed by PID in release_all.
