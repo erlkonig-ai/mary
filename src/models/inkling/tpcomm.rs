@@ -80,6 +80,8 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
+use burn::tensor::Tensor;
+
 use super::tp::Tp;
 
 /// How long a rank waits for its peer at the rendezvous before giving up.
@@ -360,4 +362,53 @@ pub fn transport_note() -> String {
     let hca = std::env::var("NCCL_IB_HCA").unwrap_or_else(|_| "<unset>".into());
     let dbg = std::env::var("NCCL_DEBUG").unwrap_or_else(|_| "<unset>".into());
     format!("NCCL_SOCKET_IFNAME={ifname} NCCL_IB_HCA={hca} NCCL_DEBUG={dbg}")
+}
+
+// ---------------------------------------------------------------------------
+// The activation-level reduce the forward actually calls.
+// ---------------------------------------------------------------------------
+
+/// Sum a `[rows, cols]` activation across every rank, on the stream.
+///
+/// This is the whole TP2 forward's contact with the network, and it is issued
+/// and forgotten: [`Group::all_reduce_f32`] enqueues NCCL on the comm stream
+/// between two device-side fences and returns immediately. Nothing here reads
+/// the buffer, and nothing here may be made to — see the module header.
+///
+/// # Where this may be called, and where it may NOT
+///
+/// A column-then-row split leaves each rank holding a PARTIAL sum of the whole
+/// hidden vector: rank 0's contribution from its heads, rank 1's from its own.
+/// The partials are only meaningful once added, so this must run before the
+/// first operation that is not linear in that sum -- and in this stack there is
+/// one immediately downstream of both reduce sites, which is the trap:
+///
+/// **The short convolution is NOT commutable with a partial sum.** It mixes a
+/// rank's partial with CACHED HISTORY from previous tokens, which is already
+/// whole. `conv(a) + conv(b) != conv(a + b)` the moment the history term is
+/// non-zero, so a reduce placed after the convolution -- which is where it
+/// looks like it belongs, next to the residual add -- convolves each rank's
+/// half against the full history, sums two wrong answers, and returns a finite,
+/// plausible, WRONG hidden state. There is no crash and no NaN to notice.
+///
+/// So the order is fixed and is not a preference:
+///
+/// ```text
+///   attention (this rank's heads)  ->  REDUCE  ->  short conv  ->  residual
+///   MoE       (this rank's half)   ->  REDUCE  ->  short conv  ->  residual
+/// ```
+pub fn reduce_activation(
+    g: &Group,
+    device: &burn::backend::cuda::CudaDevice,
+    x: Tensor<crate::models::inkling::seam::Bk, 2>,
+) -> Tensor<crate::models::inkling::seam::Bk, 2> {
+    use crate::models::inkling::seam;
+    let [rows, cols] = x.dims();
+    let client = seam::client_of(&x);
+    // `handle_of` contiguises and asserts f32, which is what NCCL is told the
+    // buffer is. A BF16 activation reaching here is a loud panic rather than a
+    // reduce of reinterpreted bytes.
+    let h = seam::handle_of(x);
+    g.all_reduce_f32(&h);
+    seam::tensor_of(client, device.clone(), h, rows, cols)
 }
