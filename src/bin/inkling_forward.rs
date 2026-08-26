@@ -10576,7 +10576,13 @@ fn main() -> Result<()> {
     }
 
     // ---- how much of the wall clock this node spent waiting for the other --
-    if acc_steps > 0 && pipe.is_some() {
+    // `|| tree_b > 0`: the whole summary -- the accepted-prefix table, the
+    // per-rank table, the tok/s gate -- was written for the PIPE, because until
+    // now speculation only existed there. A single-box tree run needs exactly
+    // these numbers and would otherwise print none of them, which is how the
+    // first tree run reported its acceptance by making me count `ctx` deltas in
+    // the step lines.
+    if acc_steps > 0 && (pipe.is_some() || tree_b > 0) {
         let ms = |v: f64| v * 1e3;
         let wall = acc_pass + acc_recv;
         println!("\n=== pipe utilisation over {acc_steps} decode steps (prefill excluded) ===");
