@@ -2761,22 +2761,35 @@ fn w4a16_bind(
     // CORRECTNESS and the sinks for SPEED -- and a line that prints only the
     // layout invites someone to "fix" the sinks back to fragment order, which is
     // measured at +25% on that kernel.
-    static SAID_ANN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    static SAID_OTHER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let said = if for_ann { &SAID_ANN } else { &SAID_OTHER };
-    if !said.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    //
+    // Keyed on (kind, REASON) and not on kind alone, because since `swizzle_pays`
+    // replaced the weight-kind rule the two sink weights can DISAGREE: `gate_up`
+    // is 1024 cubes and permuted, `down` is 512 at k=2048 and is not. A
+    // once-per-kind line would print whichever bound first and silently claim it
+    // for both -- which is the exact failure the paragraph above describes,
+    // recurring one level down. Each (kind, reason) says itself once, with the
+    // shape that earned it, so the startup log shows the rule actually applied.
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let (reason, idx) = if p.swizzled {
+        ("MMA-FRAGMENT (m16n8k16)", 0u32)
+    } else if ann_owns_m1 {
+        ("row-major [n, k/8] (the approximate head owns m=1)", 1)
+    } else if grid_too_small {
+        (
+            "row-major [n, k/8] (too few cubes at this k -- see swizzle_pays)",
+            2,
+        )
+    } else {
+        ("row-major [n, k/8]", 3)
+    };
+    let bit = 1u32 << (idx + if for_ann { 4 } else { 0 });
+    if SAID.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0 {
         println!(
-            "  W4A16 {} weights written in {} order",
+            "  W4A16 {} weights [{}, {}] ({} cubes at m=1) written in {reason} order",
             if for_ann { "head" } else { "sink" },
-            if p.swizzled {
-                "MMA-FRAGMENT (m16n8k16)"
-            } else if ann_owns_m1 {
-                "row-major [n, k/8] (the approximate head owns m=1)"
-            } else if grid_too_small {
-                "row-major [n, k/8] (too few cubes at this k -- see swizzle_pays)"
-            } else {
-                "row-major [n, k/8]"
-            }
+            p.n,
+            p.k,
+            p.n / 8,
         );
     }
     dev_lane::ProjW::W4a16(p)
