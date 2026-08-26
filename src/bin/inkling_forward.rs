@@ -9405,31 +9405,45 @@ fn main() -> Result<()> {
             // On device, because the alternative is reading back `rows * 200058`
             // f32 to sort on the host: at the 2048-row cap that is 1.6 GB per
             // block per depth, which is not a measurement, it is a bus.
-            let teach_topk = |rows: T2, norm: bool, k: usize| -> Vec<Vec<usize>> {
-                let rows_n = rows.dims()[0];
-                let hs = if norm {
-                    dev_lane::rms_norm(
-                        rows,
-                        fnorm_dev
-                            .clone()
-                            .expect("teacher forcing needs the final norm"),
-                        t.rms_norm_eps,
+            #[allow(clippy::type_complexity)]
+            let teach_topk =
+                |rows: T2, norm: bool, k: usize| -> (Vec<Vec<usize>>, Vec<f32>, Vec<f32>) {
+                    let rows_n = rows.dims()[0];
+                    let hs = if norm {
+                        dev_lane::rms_norm(
+                            rows,
+                            fnorm_dev
+                                .clone()
+                                .expect("teacher forcing needs the final norm"),
+                            t.rms_norm_eps,
+                        )
+                    } else {
+                        rows
+                    }
+                    .div_scalar(t.logits_mup_width_multiplier as f32);
+                    let lg = dev_lane::linear_w(
+                        hs,
+                        unembed_w
+                            .as_ref()
+                            .expect("teacher forcing needs the unembed table"),
                     )
-                } else {
-                    rows
-                }
-                .div_scalar(t.logits_mup_width_multiplier as f32);
-                let lg = dev_lane::linear_w(
-                    hs,
-                    unembed_w
-                        .as_ref()
-                        .expect("teacher forcing needs the unembed table"),
-                )
-                .slice([0..rows_n, 0..v]);
-                let (_, idx) = lg.topk_with_indices(k, 1);
-                let flat: Vec<usize> = idx.into_data().iter::<i64>().map(|x| x as usize).collect();
-                flat.chunks(k).map(|c| c.to_vec()).collect()
-            };
+                    .slice([0..rows_n, 0..v]);
+                    // LOG-SOFTMAX first, so the same `topk` yields the ids AND a
+                    // calibrated confidence in one pass. `exp(v0)` is the top-1
+                    // probability and `v0 - v1` is the log-odds margin, which are
+                    // the two cheapest confidence signals a drafter can offer and
+                    // the only two a gate could afford per position.
+                    let ls = burn::tensor::activation::log_softmax(lg, 1);
+                    let (val, idx) = ls.topk_with_indices(k.max(2), 1);
+                    let flat: Vec<usize> =
+                        idx.into_data().iter::<i64>().map(|x| x as usize).collect();
+                    let lv: Vec<f32> = val.into_data().iter::<f32>().collect();
+                    let kk = k.max(2);
+                    let ids: Vec<Vec<usize>> = flat.chunks(kk).map(|c| c[..k].to_vec()).collect();
+                    let p1: Vec<f32> = lv.chunks(kk).map(|c| c[0].exp()).collect();
+                    let margin: Vec<f32> = lv.chunks(kk).map(|c| c[0] - c[1]).collect();
+                    (ids, p1, margin)
+                };
 
             draft_probs.borrow_mut().clear();
             let t_mtp = Instant::now();
@@ -9713,6 +9727,7 @@ fn main() -> Result<()> {
                             let take = nblk.min((cap / BLK).max(1));
                             let mut hit_corpus = vec![0usize; topk_k];
                             let mut hit_stack = vec![0usize; topk_k];
+                            let mut gate_rows: Vec<(f32, f32, bool)> = Vec::new();
                             let mut scored = 0usize;
                             let raw = std::env::var("INK_MTP_RAW")
                                 .map(|val| val == "1")
@@ -9728,7 +9743,7 @@ fn main() -> Result<()> {
                                 if hi <= lo {
                                     continue;
                                 }
-                                let head = teach_topk(
+                                let (head, p1, margin) = teach_topk(
                                     y.clone().slice([lo..hi, 0..h]),
                                     mtp_out_norm(),
                                     topk_k,
@@ -9749,6 +9764,8 @@ fn main() -> Result<()> {
                                             hit_stack[j] += 1;
                                         }
                                     }
+                                    // (confidence, was the top-1 draft right)
+                                    gate_rows.push((p1[i], margin[i], cand[0] == want));
                                     scored += 1;
                                 }
                             }
@@ -9772,6 +9789,102 @@ fn main() -> Result<()> {
                                     ));
                                 }
                                 println!("    {label}:{line}");
+                            }
+                            // ---- THE CONFIDENCE GATE ------------------------
+                            //
+                            // The table above says the chain pays 1.33x on
+                            // counting and LOSES on prose, so an always-on lane
+                            // ships the mean of a win and a loss. A gate
+                            // recovers the difference without widening
+                            // anything -- IF the drafter knows when it is
+                            // right. If hit@1 is flat in confidence, it does
+                            // not, and gating cannot work either.
+                            //
+                            // The cost structure is what makes a per-position
+                            // gate affordable: the DRAFT is cheap (~5% of a
+                            // step) and the expensive part is the extra verify
+                            // ROW, so the gate runs AFTER drafting. A skipped
+                            // speculation wastes only the draft.
+                            //
+                            //   tokens/pass = 1 + f * p_kept
+                            //   cost/pass   = 1 + d + f * (c2 - 1)
+                            //
+                            // `f` is the retained fraction, `p_kept` the hit
+                            // rate on the retained set, `c2` the measured
+                            // two-row width cost, `d` the always-paid draft.
+                            //
+                            // NEVER-speculate is 1.0 and pays no draft at all,
+                            // which sets the bar: a gate must earn `d` back
+                            // before it earns anything. Algebraically it needs
+                            // `f * (p_kept - (c2 - 1)) > d`, so the retained set
+                            // must beat `c2 - 1` (0.492 here) and there must be
+                            // enough of it. That is a much harder test than
+                            // beating the always-on arm.
+                            if !gate_rows.is_empty() {
+                                let c2: f64 = std::env::var("INK_GATE_C2")
+                                    .ok()
+                                    .and_then(|x| x.parse().ok())
+                                    .unwrap_or(1.492);
+                                let dcost: f64 = std::env::var("INK_GATE_D")
+                                    .ok()
+                                    .and_then(|x| x.parse().ok())
+                                    .unwrap_or(0.047);
+                                let n = gate_rows.len() as f64;
+                                let all_hits = gate_rows.iter().filter(|r| r.2).count() as f64;
+                                let speed = |f: f64, p: f64| -> f64 {
+                                    (1.0 + f * p) / (1.0 + dcost + f * (c2 - 1.0))
+                                };
+                                println!(
+                                    "  MTP GATE sweep, c2={c2} d={dcost}; never=1.000x, \
+                                     always={:.3}x (f=1.000, p={:.4})",
+                                    speed(1.0, all_hits / n),
+                                    all_hits / n
+                                );
+                                for (sig, label) in [(0usize, "p1    "), (1, "margin")] {
+                                    println!(
+                                        "    by {label}   T      kept     p_kept   \
+                                         p_dropped   gate"
+                                    );
+                                    let ts: Vec<f64> = if sig == 0 {
+                                        vec![0.0, 0.2, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
+                                    } else {
+                                        vec![0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0]
+                                    };
+                                    let mut best = (0.0f64, 0.0f64);
+                                    for tt in ts {
+                                        let keep: Vec<&(f32, f32, bool)> = gate_rows
+                                            .iter()
+                                            .filter(|r| {
+                                                (if sig == 0 { r.0 } else { r.1 }) as f64 >= tt
+                                            })
+                                            .collect();
+                                        let k = keep.len() as f64;
+                                        if k == 0.0 {
+                                            continue;
+                                        }
+                                        let hk = keep.iter().filter(|r| r.2).count() as f64;
+                                        let f = k / n;
+                                        let pk = hk / k;
+                                        let pd = if n > k {
+                                            (all_hits - hk) / (n - k)
+                                        } else {
+                                            f64::NAN
+                                        };
+                                        let sp = speed(f, pk);
+                                        if sp > best.0 {
+                                            best = (sp, tt);
+                                        }
+                                        println!(
+                                            "              {tt:6.2}  {:6.3}   {pk:6.4}   \
+                                             {pd:9.4}   {sp:6.3}x",
+                                            f
+                                        );
+                                    }
+                                    println!(
+                                        "              BEST {:.3}x at T={:.2}",
+                                        best.0, best.1
+                                    );
+                                }
                             }
                             if topk_k >= 2 && hit_stack[0] > 0 {
                                 println!(
