@@ -2213,8 +2213,10 @@ pub fn attention_steps_tree(
     let q = head_rms_norm(q, w.q_norm.clone(), heads, head_dim, d.rms_eps);
     let k_new = head_rms_norm(k_new, w.k_norm.clone(), kv_heads, head_dim, d.rms_eps);
 
-    cache.k.append(as_kv(k_new));
-    cache.v.append(as_kv(v_new));
+    // Cloned rather than moved: `Pending` keeps these rows so a TREE rollback
+    // can put a scattered subset of them back. A tensor clone is a handle.
+    cache.k.append(as_kv(k_new.clone()));
+    cache.v.append(as_kv(v_new.clone()));
     cache.k_pre = k_all.clone().slice([rows..rows + hist, 0..kdim]);
     cache.v_pre = v_all.clone().slice([rows..rows + hist, 0..vdim]);
     cache.pending = Some(Pending {
