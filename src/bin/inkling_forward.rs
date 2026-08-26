@@ -8127,6 +8127,36 @@ fn main() -> Result<()> {
                 .all(|slot| caches[slot].attn.step_is_replayable(1, lane_window(slot)));
         if lane_ready && !lane_replay_now {
             // A page boundary. RETIRE rather than fall back silently: a lane
+            //
+            // AND THIS RETIREMENT IS A V1 SHAPE, NOT THE DESIGN. The boundary
+            // exists because the KV pages GROW: at 128 rows the eager path
+            // pushes a new page, releases an old one or cuts page 0, each of
+            // which moves a buffer a graph node points at. Pre-allocating the
+            // KV to the maximum context removes it outright -- and the memory
+            // objection to doing that does not survive contact with the tree.
+            // Measured at 1,048,576 tokens, whole model, all 42 layers, K and V
+            // together: 7.894 GiB. Two facts make it that small and both are
+            // read off the source. NVFP4 KV is unconditional (`kvpages::fp4_kv`
+            // returns true with "Always on; there is no switch"), 0.5625 bytes
+            // an element. And only 7 of 42 layers are global; the other 35 are
+            // local with a 512 window that `burn::trim` actually enforces, so
+            // the retained rows at 1M are 7*1048576 + 35*512 = 7,357,952 rather
+            // than 42M. Anything that multiplies 1M by 42 is wrong by 5.98x.
+            //
+            // NOTHING HERE HARD-CODES THE BOUNDARY. `step_is_replayable` asks
+            // the caches rather than a rule written here, so on a
+            // pre-allocated cache it simply keeps answering yes and the lane
+            // runs indefinitely. This block would then never fire. That is
+            // deliberate, and it is why the predicate is a question to the
+            // caches instead of an arithmetic on `PAGE`.
+            //
+            // What the boundary costs today, so the trade is priced: a
+            // re-capture every 128 steps at 62-101 ms is 0.5-0.8 ms a step
+            // amortised, which is the same order as the entire remaining host
+            // residue outside the captured region. This lane does not even pay
+            // that -- it retires instead of re-capturing, which is cheaper and
+            // less useful.
+            //
             // that quietly stops being a lane makes every number after it
             // unattributable, and this one cannot resume -- re-entering would
             // need a fresh pre-warm, a fresh capture and a fresh calibration,
