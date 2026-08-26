@@ -7488,6 +7488,38 @@ fn main() -> Result<()> {
          was captured with -- so every step after the capture would convolve from the capture \
          step's history, forever, and emit a fluent wrong token with no error anywhere."
     );
+    // A REPLAYED STEP RUNS NO HOST CODE IN THE REGION, AND `tp_reduce` IS HOST
+    // CODE IN THE REGION.
+    //
+    // The layer loop makes seven `tp_reduce` calls, and on a replay step the
+    // loop does not run -- so unless the collective is in the GRAPH, the
+    // cross-node reduction simply stops happening on every replayed step. It
+    // would not error and it would not NaN; each rank would carry its own
+    // partial sum forward, which is the fluent-and-wrong failure this file
+    // warns about everywhere else. The `tp_calls == 2` assertion that would
+    // catch it is INSIDE the loop, so it does not run either.
+    //
+    // And the collective almost certainly is NOT in the graph. cubecl issues it
+    // on a separate `comm_stream`, reached by a `cuEventRecord` /
+    // `cuStreamWaitEvent` fork and returned by the matching join, bypassing
+    // `Command`/`execute_task` entirely -- so it creates no `CapturedLaunch`,
+    // takes no `capture_hold` on the buffers it reduces, and is invisible to
+    // the launch index every patch here is written against. A capture is
+    // per-stream; whether anything of it lands in the graph at all is a
+    // property of the linked NCCL, not of this tree.
+    //
+    // So: refuse. This is the cheap half of a question that needs a two-rank
+    // probe to answer properly, and until it is answered a refusal is the only
+    // safe reading.
+    anyhow::ensure!(
+        !(graph_lane && tp_group.is_some()),
+        "INK_GRAPH_LANE=1 with a tensor-parallel group is refused. A replayed step runs no host \
+         code in the layer loop, so the seven `tp_reduce` calls never happen -- and the \
+         collective is issued on cubecl's separate `comm_stream`, bypassing the capture \
+         bookkeeping, so it is very likely not in the graph either. Each rank would then carry \
+         its own partial sum forward with no error anywhere, and the `tp_calls == 2` assertion \
+         that would catch it lives inside the loop the lane skips."
+    );
     anyhow::ensure!(
         !(graph_lane && graph_diff),
         "INK_GRAPH_LANE=1 is exclusive with INK_GRAPH_DIFF / INK_GRAPH_XSTEP: those arms own the \
