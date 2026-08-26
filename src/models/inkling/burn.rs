@@ -1654,8 +1654,18 @@ impl PagedKv {
             !k.is_empty(),
             "a cached read wants at least one page; the step appends before it reads"
         );
+        // PHYSICAL rows, which is what the key axis is built at. It is `head +
+        // len` plus whatever of the page being written is not yet real: a page
+        // is allocated at its full capacity and filled in place, so the last
+        // chunk carries dead rows at its BACK exactly as chunk 0 carries them
+        // at its front. Both are masked below, over `slots` rather than over
+        // `len`, which is why nothing here has to know which is which.
         let stored: usize = k.iter().map(|p| p.dims()[0]).sum();
-        debug_assert_eq!(stored, head + cache.len(), "the pages lost rows");
+        debug_assert!(
+            stored >= head + cache.len(),
+            "the pages lost rows: {stored} stored against {} live",
+            head + cache.len()
+        );
         let tail = k.last().expect("checked").dims()[0];
         let pad = tail.next_multiple_of(bucket) - tail;
         if pad > 0 {

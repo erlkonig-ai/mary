@@ -7358,7 +7358,22 @@ fn main() -> Result<()> {
         // asked for -- measured at 21 layers: exactly one allocation escaped
         // into the capture on a single-pass warm. A second warm carries the
         // pool past the step after it as well.
-        const PREWARM_PASSES: usize = 2;
+        // TWO by default, and `INK_GRAPH_WARM` to ask for more.
+        //
+        // It is a knob rather than a constant because what the right number is
+        // depends on a property of the region that has just changed. While the
+        // KV tail page grew by a row every step, NO number was right -- every
+        // pass wanted a buffer no earlier pass had asked for, so a warm could
+        // not cover the pass after it. With the page allocated at capacity and
+        // written in place, the region's allocation sequence repeats, and
+        // whether the pool is warm becomes an ordinary question with an
+        // answerable number.
+        let prewarm_passes: usize = std::env::var("INK_GRAPH_WARM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+        #[allow(non_snake_case)]
+        let PREWARM_PASSES: usize = prewarm_passes;
         let prewarm_now = graph_on
             && is_decode
             && graph_report.is_none()
