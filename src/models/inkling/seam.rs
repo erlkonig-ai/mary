@@ -312,6 +312,41 @@ pub fn pool_line(client: &ComputeClient<CudaRuntime>, at: &str) -> String {
     }
 }
 
+/// [`pool_line`] and [`pool_reserved`] from ONE `memory_usage` call.
+///
+/// The two were written independently and both callers wanted both numbers, so
+/// every report paid the barrier TWICE back to back. That is not a formatting
+/// detail: `memory_usage` on this cubecl lineage is a `submit_blocking` -- it
+/// queues a closure behind everything the pass has enqueued, wakes the runner,
+/// blocks until it drains, and only then walks every page of twenty-four pools.
+/// Two of them is two full launch-queue barriers to print two adjacent lines
+/// about the same instant, and the second cannot even disagree with the first
+/// in any way a reader could act on.
+///
+/// Returns `(line, bytes_reserved)`; `bytes_reserved` is zero when the runtime
+/// will not answer, which reads as "nothing to compare against" at the call
+/// site rather than as a suspiciously small run.
+pub fn pool_line_and_reserved(client: &ComputeClient<CudaRuntime>, at: &str) -> (String, u64) {
+    const GIB: f64 = (1u64 << 30) as f64;
+    match client.memory_usage() {
+        Ok(u) => (
+            format!(
+                "    pool[{at}]: {:.2} GiB reserved, {:.2} live, {:.2} padding, {:.2} GiB STRANDED \
+             over {} slices",
+                u.bytes_reserved as f64 / GIB,
+                u.bytes_in_use as f64 / GIB,
+                u.bytes_padding as f64 / GIB,
+                u.bytes_reserved
+                    .saturating_sub(u.bytes_in_use + u.bytes_padding) as f64
+                    / GIB,
+                u.number_allocs,
+            ),
+            u.bytes_reserved,
+        ),
+        Err(e) => (format!("    pool[{at}]: unavailable ({e:?})"), 0),
+    }
+}
+
 /// `t` with a unit-stride layout, at whatever float dtype it already carries.
 ///
 /// [`handle_of`] does this on the way out to a raw kernel, and it is the only

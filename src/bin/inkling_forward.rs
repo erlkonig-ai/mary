@@ -2544,6 +2544,7 @@ fn quantized_bf16(
 fn w4a16_bind(
     client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
     mut p: dev_lane::PackedW,
+    for_ann: bool,
 ) -> dev_lane::ProjW {
     use mary::models::inkling::w4a16gemm as k16;
     // THE APPROXIMATE HEAD OWNS m=1, AND IT CANNOT READ FRAGMENT ORDER.
@@ -2552,11 +2553,23 @@ fn w4a16_bind(
     // every exact rescore read permuted bytes as row-major. Neither branch is
     // wrong alone; the seam between them is.
     //
-    // Skipping the permutation costs almost nothing here: with the aNN lane on,
-    // m=1 never reaches `linear_w4a16` at all, so the head swizzle only ever
-    // benefited verify passes (m>=2). Teaching `ann_logits` the fragment layout
-    // would recover that and is the better fix; this is the correct one.
-    let ann_owns_m1 = ann_budget() > 0;
+    // `for_ann` IS THE WHOLE POINT OF THE PARAMETER, and it is worth saying why
+    // it is not simply `ann_budget() > 0`. This function is the single entry
+    // point for TWO unrelated weights: the unembedding, which `linear_ann` may
+    // read, and the SINK experts, which it never can -- `shared_experts_dev`
+    // goes to `linear_w` -> `linear_w4a16`, which branches on `p.swizzled` and
+    // has read fragment order correctly all along. Between df175e5 and this
+    // commit the guard was global, so turning the aNN lane on (its default)
+    // silently took the permutation off forty layers of sink weights that had
+    // nothing to do with the seam. The head lost nothing by it -- with the aNN
+    // lane on, m=1 never reaches `linear_w4a16` -- but the sinks lost the whole
+    // of it, on every layer of every step.
+    //
+    // Teaching `ann_logits` the fragment layout would let the head keep its
+    // permutation too (worth it only on verify passes, m>=2). That is still the
+    // better fix and this is still the correct one; it is now merely scoped to
+    // the weight that needs it.
+    let ann_owns_m1 = for_ann && ann_budget() > 0;
     if !ann_owns_m1 && k16::swizzle_w4a16() && k16::swizzleable(p.n, p.k) {
         let (c, s) = k16::swizzle_w4a16_device(client, &p.codes, &p.scales, p.n, p.k);
         p.codes = c;
@@ -2566,10 +2579,19 @@ fn w4a16_bind(
     // Once a process, not once a weight: the sink experts come through here
     // several times a layer and the line is about the LAYOUT, which is one
     // decision.
-    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    // Once per KIND, not once a process. It used to be one flag for both, which
+    // was right only while the two kinds could not disagree -- and the whole
+    // reason this commit exists is that they could, and did, and the single line
+    // reported whichever one happened to bind first. A run where the head is
+    // row-major and the sinks are permuted now says both, which is the state
+    // this file's defaults actually produce.
+    static SAID_ANN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static SAID_OTHER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let said = if for_ann { &SAID_ANN } else { &SAID_OTHER };
+    if !said.swap(true, std::sync::atomic::Ordering::Relaxed) {
         println!(
-            "  W4A16 weights written in {} order",
+            "  W4A16 {} weights written in {} order",
+            if for_ann { "head" } else { "sink" },
             if p.swizzled {
                 "MMA-FRAGMENT (m16n8k16)"
             } else if ann_owns_m1 {
@@ -2746,7 +2768,12 @@ impl DeviceDense {
                     // W4A16 and NOT `Fp4`: four-bit weights against a BF16
                     // activation, because nothing calibrated an input
                     // quantiser for this tensor. See [`sink_w4a16`].
-                    w4a16_bind(client, quantized_bf16(client, &gu, 2 * n_shared * inter, h))
+                    w4a16_bind(
+                        client,
+                        quantized_bf16(client, &gu, 2 * n_shared * inter, h),
+                        // Never read by `linear_ann`. See `w4a16_bind`.
+                        false,
+                    )
                 } else {
                     dev_lane::ProjW::Bf16(bind_bf16(client, aliases, &gu, 2 * n_shared * inter, h))
                 },
@@ -2755,7 +2782,7 @@ impl DeviceDense {
             for e in 0..n_shared {
                 let raw = &d.bytes[e * per_d..(e + 1) * per_d];
                 sd.down.push(if sink_w4a16() {
-                    w4a16_bind(client, quantized_bf16(client, raw, h, inter))
+                    w4a16_bind(client, quantized_bf16(client, raw, h, inter), false)
                 } else {
                     // `w2` is NOT de-interleaved, so this one is a view of the
                     // pile and aliases outright.
@@ -6392,7 +6419,7 @@ fn main() -> Result<()> {
                     head_sketch = Some(sk);
                 }
                 let w = match head_lane() {
-                    HeadLane::W4a16 => w4a16_bind(&fp4_client, p),
+                    HeadLane::W4a16 => w4a16_bind(&fp4_client, p, true),
                     HeadLane::W4a4 => dev_lane::ProjW::Fp4(p),
                     HeadLane::Bf16 => unreachable!("guarded by head_lane() != Bf16"),
                 };
@@ -8146,27 +8173,43 @@ fn main() -> Result<()> {
         // part the pool is node memory, so everything in it beyond the weight arena
         // IS the activation working set at this sequence length -- and unlike
         // `MemAvailable` it is not polluted by whatever else the box is doing.
-        println!(
-            "{}",
-            mary::models::inkling::seam::pool_line(&fp4_client, "after stack")
-        );
         // The admission gate's prediction beside what the run actually reserved, on
-        // the same line, every pass. The gate is the only thing standing between a
+        // the same line. The gate is the only thing standing between a
         // long input and a node in swap, and the way it failed before was not that
         // it was noisy -- it was FLAT, charging 13.5 GiB whether the input was
         // 16,384 tokens or 100,623, and nothing printed by the run said otherwise.
         // Printing the outcome next to the estimate makes every run a measurement
         // of its own gate: a reserved figure above the charge is a run that was
         // admitted and should not have been.
-        let reserved = mary::models::inkling::seam::pool_reserved(&fp4_client);
-        if reserved > 0 {
-            println!(
-                "    activations: {:.2} GiB charged at admission, {:.2} GiB reserved by the pool \
-             ({:+.0}%)",
-                attention_bytes as f64 / GIB,
-                reserved as f64 / GIB,
-                100.0 * (reserved as f64 / attention_bytes.max(1) as f64 - 1.0),
-            );
+        //
+        // ON THE PREFILL, AND NOT ON EVERY DECODE STEP. This block used to run
+        // unconditionally and cost TWO `memory_usage` calls, which this file
+        // documents thirty lines up as `submit_blocking`: a host launch-queue
+        // barrier plus a walk of twenty-four pools, and the reason a per-layer
+        // version of the same call "hid 18% of a decode step". Inside the decode
+        // loop that is a barrier per step, forever, to print a number that cannot
+        // move: the gate predicts the ACTIVATION working set, which is a function
+        // of the sequence, and the pass that establishes it is the prefill. A
+        // decode step adds one position to a cache the prefill already sized.
+        //
+        // So the gate keeps its self-check in full -- the prefill is where the
+        // peak it is predicting actually happens -- and the decode loop stops
+        // paying for a line whose value it cannot change. `INK_MEM_TRACE=1`
+        // restores it everywhere, which is the arm to use when the question is
+        // growth ACROSS steps rather than the gate's own accuracy.
+        if !is_decode || mem_trace {
+            let (line, reserved) =
+                mary::models::inkling::seam::pool_line_and_reserved(&fp4_client, "after stack");
+            println!("{line}");
+            if reserved > 0 {
+                println!(
+                    "    activations: {:.2} GiB charged at admission, {:.2} GiB reserved by the \
+                 pool ({:+.0}%)",
+                    attention_bytes as f64 / GIB,
+                    reserved as f64 / GIB,
+                    100.0 * (reserved as f64 / attention_bytes.max(1) as f64 - 1.0),
+                );
+            }
         }
         let rms_col: Vec<f32> = if layer_rms.is_empty() {
             Vec::new()
