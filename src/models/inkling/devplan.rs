@@ -263,38 +263,38 @@ fn plan_from_topk(
             bad = flag;
         }
         for j in 0..top_k {
-        let e = u32::cast_from(topk[(rb + j) as usize]);
-        let w = topk[(rb + comptime!(top_k) + j) as usize];
-        let mut r = u32::new(0);
-        for q in 0..top_k {
-            let o = u32::cast_from(topk[(rb + q) as usize]);
-            if o < e {
-                r += 1u32;
-            }
-            if q != j {
-                if o == e {
-                    // Two picks on one expert would land on one rank and leave
-                    // a slot unwritten. It cannot happen -- `routetopk` takes
-                    // the next-largest score `top_k` times and masks each pick
-                    // out -- and "cannot happen" is exactly the class of thing
-                    // worth a comparison and a flag.
-                    bad = 0xdu32;
+            let e = u32::cast_from(topk[(rb + j) as usize]);
+            let w = topk[(rb + comptime!(top_k) + j) as usize];
+            let mut r = u32::new(0);
+            for q in 0..top_k {
+                let o = u32::cast_from(topk[(rb + q) as usize]);
+                if o < e {
+                    r += 1u32;
+                }
+                if q != j {
+                    if o == e {
+                        // Two picks on one expert would land on one rank and leave
+                        // a slot unwritten. It cannot happen -- `routetopk` takes
+                        // the next-largest score `top_k` times and masks each pick
+                        // out -- and "cannot happen" is exactly the class of thing
+                        // worth a comparison and a flag.
+                        bad = 0xdu32;
+                    }
                 }
             }
-        }
-        let es = e as usize;
-        let rs = (sb + r) as usize;
-        // One entry an expert on a BF16 layer, two on an NVFP4 one. See
-        // [`ExpertTable::stride`].
-        for q in 0..stride {
-            let qs = q as usize;
-            off13[stride as usize * rs + qs] = tab_off13[stride as usize * es + qs];
-            off2[stride as usize * rs + qs] = tab_off2[stride as usize * es + qs];
-        }
-        sc13[rs] = tab_sc13[es];
-        sc2[rs] = tab_sc2[es];
-        ids[rs] = e;
-        row_wgt[rs * mtile as usize] = w;
+            let es = e as usize;
+            let rs = (sb + r) as usize;
+            // One entry an expert on a BF16 layer, two on an NVFP4 one. See
+            // [`ExpertTable::stride`].
+            for q in 0..stride {
+                let qs = q as usize;
+                off13[stride as usize * rs + qs] = tab_off13[stride as usize * es + qs];
+                off2[stride as usize * rs + qs] = tab_off2[stride as usize * es + qs];
+            }
+            sc13[rs] = tab_sc13[es];
+            sc2[rs] = tab_sc2[es];
+            ids[rs] = e;
+            row_wgt[rs * mtile as usize] = w;
         }
     }
     fault[0] = bad;
