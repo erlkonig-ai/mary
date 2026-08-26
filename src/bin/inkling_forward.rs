@@ -9335,6 +9335,15 @@ fn main() -> Result<()> {
             let teach = std::env::var("INK_MTP_TEACH")
                 .map(|v| v == "1")
                 .unwrap_or(false);
+            // `INK_MTP_TOPK=k`: head 0's hit@1..hit@k, teacher-forced, against
+            // BOTH references. The one number that decides whether a depth-1
+            // token tree is worth building a kernel for -- see the report block
+            // below for why hit@2/hit@1 is the whole question and why the two
+            // references are not interchangeable.
+            let topk_k: usize = std::env::var("INK_MTP_TOPK")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
             // The first row to score. Zero for a plain corpus; set it to the
             // PROMPT length when the ids file is a seed followed by this model's
             // own greedy continuation, so the rate is measured on the sequence a
@@ -9386,6 +9395,40 @@ fn main() -> Result<()> {
                 .iter::<i64>()
                 .map(|x| x as usize)
                 .collect()
+            };
+
+            // [`teach_rows`]'s top-K twin: the `k` best tokens per row, best
+            // first, through the SAME unembedding and the same effective-vocab
+            // slice -- so `teach_topk(.., 1)` is `teach_rows` and the two
+            // numbers below are comparable by construction.
+            //
+            // On device, because the alternative is reading back `rows * 200058`
+            // f32 to sort on the host: at the 2048-row cap that is 1.6 GB per
+            // block per depth, which is not a measurement, it is a bus.
+            let teach_topk = |rows: T2, norm: bool, k: usize| -> Vec<Vec<usize>> {
+                let rows_n = rows.dims()[0];
+                let hs = if norm {
+                    dev_lane::rms_norm(
+                        rows,
+                        fnorm_dev
+                            .clone()
+                            .expect("teacher forcing needs the final norm"),
+                        t.rms_norm_eps,
+                    )
+                } else {
+                    rows
+                }
+                .div_scalar(t.logits_mup_width_multiplier as f32);
+                let lg = dev_lane::linear_w(
+                    hs,
+                    unembed_w
+                        .as_ref()
+                        .expect("teacher forcing needs the unembed table"),
+                )
+                .slice([0..rows_n, 0..v]);
+                let (_, idx) = lg.topk_with_indices(k, 1);
+                let flat: Vec<usize> = idx.into_data().iter::<i64>().map(|x| x as usize).collect();
+                flat.chunks(k).map(|c| c.to_vec()).collect()
             };
 
             draft_probs.borrow_mut().clear();
@@ -9632,6 +9675,112 @@ fn main() -> Result<()> {
                                 clo,
                                 chi,
                             );
+                        }
+                        // `INK_MTP_TOPK=k`: does BREADTH buy acceptance?
+                        //
+                        // A depth-1 token tree proposes head 0's best `b`
+                        // continuations instead of its best one, and accepts if
+                        // the verifier's choice is among them. Whether that is
+                        // worth anything is one ratio -- hit@2 over hit@1 -- and
+                        // nothing in this binary measured it, because until now
+                        // nothing proposed more than one.
+                        //
+                        // Two references, because they answer different
+                        // questions and only one of them is acceptance:
+                        //
+                        //   vs CORPUS  the token the prompt actually has next.
+                        //              Extends the TEACH number above and is
+                        //              directly comparable to it.
+                        //   vs STACK   the main stack's OWN argmax at that
+                        //              position, which is what a verifier would
+                        //              have accepted. THIS is acceptance.
+                        //
+                        // The alignment is the fiddly part and it is not the
+                        // same for the two. Head 0's row `j` proposes the token
+                        // at `j + 2`; the stack's row `j` proposes the token at
+                        // `j + 1`. So head 0's row `j` must be read against the
+                        // stack's row `j + 1`, and an off-by-one here would read
+                        // as a low acceptance rate rather than as a mistake.
+                        if d == 0 && topk_k > 0 {
+                            let last = seq.saturating_sub(3);
+                            let first = teach_from.min(last);
+                            const BLK: usize = 256;
+                            let nblk = ((last - first) / BLK).max(1);
+                            let cap = std::env::var("INK_MTP_TEACH_MAX")
+                                .ok()
+                                .and_then(|val| val.parse::<usize>().ok())
+                                .unwrap_or(2048);
+                            let take = nblk.min((cap / BLK).max(1));
+                            let mut hit_corpus = vec![0usize; topk_k];
+                            let mut hit_stack = vec![0usize; topk_k];
+                            let mut scored = 0usize;
+                            let raw = std::env::var("INK_MTP_RAW")
+                                .map(|val| val == "1")
+                                .unwrap_or(false);
+                            for b in 0..take {
+                                let lo = first
+                                    + if take == 1 {
+                                        0
+                                    } else {
+                                        (b * (nblk - 1) / (take - 1).max(1)) * BLK
+                                    };
+                                let hi = (lo + BLK).min(last);
+                                if hi <= lo {
+                                    continue;
+                                }
+                                let head = teach_topk(
+                                    y.clone().slice([lo..hi, 0..h]),
+                                    mtp_out_norm(),
+                                    topk_k,
+                                );
+                                // The stack's rows ONE further on, which is the
+                                // row that proposes the same position head 0's
+                                // row does.
+                                let stack =
+                                    teach_rows(main_dev.clone().slice([lo + 1..hi + 1, 0..h]), raw);
+                                for (i, cand) in head.iter().enumerate() {
+                                    let truth = ids[lo + i + 2];
+                                    let want = stack[i];
+                                    for j in 0..topk_k {
+                                        if cand[..=j].contains(&truth) {
+                                            hit_corpus[j] += 1;
+                                        }
+                                        if cand[..=j].contains(&want) {
+                                            hit_stack[j] += 1;
+                                        }
+                                    }
+                                    scored += 1;
+                                }
+                            }
+                            println!(
+                                "  MTP TOP-K depth 1, {scored} teacher-forced rows, full vocab, \
+                                 concat {}:",
+                                mtp_order.name()
+                            );
+                            for (label, hits) in
+                                [("vs CORPUS", &hit_corpus), ("vs STACK ", &hit_stack)]
+                            {
+                                let mut line = String::new();
+                                for j in 0..topk_k {
+                                    let (clo, chi) = wilson95(hits[j], scored);
+                                    line.push_str(&format!(
+                                        "  hit@{}: {:.4} [{:.4}-{:.4}]",
+                                        j + 1,
+                                        hits[j] as f64 / scored.max(1) as f64,
+                                        clo,
+                                        chi
+                                    ));
+                                }
+                                println!("    {label}:{line}");
+                            }
+                            if topk_k >= 2 && hit_stack[0] > 0 {
+                                println!(
+                                    "    BREADTH GAIN vs STACK: hit@2/hit@1 = {:.3}x, \
+                                     +{:.4} absolute -- this is the whole question",
+                                    hit_stack[1] as f64 / hit_stack[0] as f64,
+                                    (hit_stack[1] - hit_stack[0]) as f64 / scored.max(1) as f64
+                                );
+                            }
                         }
                         if teach {
                             // Row `j` predicts `ids[j + d + 2]`, so the last row
