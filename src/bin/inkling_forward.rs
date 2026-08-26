@@ -7470,6 +7470,25 @@ fn main() -> Result<()> {
         if prewarm_now {
             fp4_client.graph_defer_frees(true);
         }
+        // Open the CAPTURE ARENA around the region, on the warm passes as well
+        // as on the capture itself.
+        //
+        // What a warm pass is FOR changes with the arena. Before it, warming
+        // pushed the ordinary pools to the region's high-water mark -- and no
+        // number of passes ever helped, because a capture HOLDS every buffer it
+        // binds and so cannot recycle one, which is precisely why the region
+        // allocated 1803 times inside the capture whether it was warmed twice
+        // or six times. The arena recycles instead, so a warm pass now teaches
+        // it the region's LIVE SET rather than its allocation count, and the
+        // capture that follows finds its slices already there.
+        //
+        // Opening it per pass rather than once across all of them is
+        // deliberate: the window is then the region, so the request sequence
+        // the arena signs is the region's and not the whole step's. Reopening
+        // frees nothing -- the slices are the point and they persist.
+        if prewarm_now || capture_now {
+            fp4_client.graph_arena_begin();
+        }
         if capture_now {
             // Drain the drop queue BEFORE the region opens. Inside a capture its
             // flush is suppressed (it waits on a fence), so it must not be due.
@@ -8734,12 +8753,61 @@ fn main() -> Result<()> {
             fp4_client.graph_defer_frees(false);
             fp4_client.flush();
         }
+        // Everything after the layer loop -- the unembed, the argmax, the
+        // sampler -- is not part of the captured region and must not be given
+        // arena memory, which is reserved for the graph's whole life. Closing
+        // the arena ends allocation from it, not its record: `graph_capture_end`
+        // still reads the window that just closed.
+        let arena_stats = if prewarm_now || capture_now {
+            let st = fp4_client.graph_arena_stats();
+            fp4_client.graph_arena_end();
+            Some(st)
+        } else {
+            None
+        };
+        if let (true, Some(st)) = (prewarm_now, arena_stats) {
+            println!(
+                "  GRAPHARENA: warm pass {}: {} requests, {} of them driver allocations; \
+                 arena holds {} slices / {:.3} GiB reserved",
+                st.generation,
+                st.served,
+                st.misses,
+                st.slices,
+                st.bytes_reserved as f64 / (1024.0 * 1024.0 * 1024.0),
+            );
+            fp4_client.graph_arena_reset_counters();
+        }
         if capture_now {
             if let Some((l, tag)) = graph_broke {
                 println!("  GRAPH: capture invalidated at layer {l}, stage `{tag}`");
             }
             let g = fp4_client.graph_capture_end();
             let nodes = fp4_client.graph_node_count(g);
+            // The number the arena exists to move. A request the arena could
+            // not serve from a slice it already owned is a driver allocation
+            // made while the stream was capturing, which is a graph MEMORY node
+            // -- an address fixed per-exec, unrelated to any other exec's, and
+            // so an address no cross-step patch may either keep or rewrite.
+            // Misses and mem-alloc nodes are one quantity counted from two
+            // sides; printing both is the check, not the report.
+            if let Some(st) = arena_stats {
+                println!(
+                    "  GRAPHARENA: capture: {} requests, {} of them driver allocations; \
+                     arena holds {} slices / {:.3} GiB reserved, {:.3} GiB live at close",
+                    st.served,
+                    st.misses,
+                    st.slices,
+                    st.bytes_reserved as f64 / (1024.0 * 1024.0 * 1024.0),
+                    st.bytes_in_use as f64 / (1024.0 * 1024.0 * 1024.0),
+                );
+                // Reset here too, not only after a warm pass. A run that
+                // captures TWICE reports the second capture's counters as the
+                // running total otherwise, and the running total hides the
+                // number that matters most: whether the second capture asked
+                // the driver for anything at all. Zero there is the
+                // deterministic-base property, stated as a measurement.
+                fp4_client.graph_arena_reset_counters();
+            }
 
             // Replay ONCE, unmeasured: the capture recorded the work instead of
             // running it, and this is what runs it. The pass is correct from
