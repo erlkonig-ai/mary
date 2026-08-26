@@ -36,6 +36,14 @@
 #    indefinitely. All four zombies above were this. -> `wait_until_idle`
 #    REQUIRES a deadline argument. There is deliberately no default.
 #
+# 5. SOURCED FROM THE WRONG SHELL. zsh does not set BASH_SOURCE, so the
+#    run-directly guard at the bottom (`[ "${BASH_SOURCE[0]:-$0}" = "$0" ]`)
+#    fires even when sourced -- and the script then self-matches on local
+#    processes, which is failure 1 wearing a shell-portability costume.
+#    -> Source it under bash: `bash -c '. scripts/lib/box-busy.sh; wait_until_idle 600 host'`.
+#    The guard below now also requires BASH_VERSION, so a zsh source is inert
+#    rather than wrong.
+#
 # Exit codes: 0 = BUSY, 1 = idle, 2 = unknown (treat as busy).
 
 set -uo pipefail
@@ -110,7 +118,7 @@ wait_until_idle() {
 }
 
 # Run directly: report and exit with the code.
-if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then
+if [ -n "${BASH_VERSION:-}" ] && [ "${BASH_SOURCE[0]:-}" = "$0" ]; then
   if [ "${1:-}" = "--remote" ]; then
     shift; box_busy_remote "$@"; rc=$?
   else
