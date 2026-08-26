@@ -139,8 +139,8 @@ impl Group {
         );
 
         let (id, socks) = if tp.rank() == 0 {
-            let id = cubecl::cuda::collective::mint_unique_id()
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let id =
+                cubecl::cuda::collective::mint_unique_id().map_err(|e| anyhow::anyhow!("{e}"))?;
             let l = TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
             // Every peer gets the same 128 bytes. `world - 1` of them, in any
             // order; NCCL sorts out who is who from the rank we each install.
@@ -156,7 +156,8 @@ impl Group {
             let mut s = connect_with_deadline(addr, RENDEZVOUS)?;
             s.set_nodelay(true).ok();
             let mut id = [0u8; 128];
-            s.read_exact(&mut id).context("receiving the communicator id")?;
+            s.read_exact(&mut id)
+                .context("receiving the communicator id")?;
             (id, vec![s])
         };
 

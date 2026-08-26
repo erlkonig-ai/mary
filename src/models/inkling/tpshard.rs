@@ -292,7 +292,11 @@ mod tests {
         assert_eq!(mine.len(), 8 * 4 * 2);
         // Gate rows 0..4 then UP rows 8..12.
         assert_eq!(at(&mine, 0), 0);
-        assert_eq!(at(&mine, 4 * 4), 8000, "the second block must be the UP rows");
+        assert_eq!(
+            at(&mine, 4 * 4),
+            8000,
+            "the second block must be the UP rows"
+        );
         // The wrong answer, pinned: rows 0..8 is the whole gate block and no up.
         let wrong = rows(&s, 0..8).unwrap();
         assert_eq!(at(wrong, 4 * 4), 4000);
