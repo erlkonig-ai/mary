@@ -7126,6 +7126,66 @@ fn main() -> Result<()> {
     // capture. Making the region replayable across steps means making every one
     // of them a value a kernel dereferences; this measures what that work would
     // be worth.
+    //
+    // REBASED ONTO MAIN 2026-08-26, AND FOUR THINGS MOVED UNDER IT. This branch
+    // forked at `0abd665` and sat unbuilt for 29 commits of main; the rebase was
+    // conflict-free, which is exactly why the semantic changes below are easy to
+    // miss. None of them is a defect in the capture. All four change what a
+    // RE-RUN will print, so read them before comparing against any number in
+    // this branch's commit messages.
+    //
+    //  1. THE CORRECTNESS EVIDENCE DOES NOT TRANSFER, and must be regathered.
+    //     The commit messages here report the captured arm's carried buffers
+    //     agreeing with eager to 4.431e-07 against a 4.132e-07 eager-vs-eager
+    //     control. Those runs had the SINK experts bound row-major, because
+    //     `w4a16_bind` was skipping the m16n8k16 permutation for every W4A16
+    //     weight whenever the approximate head was on. Main now scopes that skip
+    //     to the head alone (`for_ann`), so the sinks are permuted and their
+    //     bytes are in a different ORDER. Shapes, launch structure and node
+    //     count across the sink lane are unchanged, so the capture should be
+    //     indifferent -- but the buffers are not the same buffers, and a
+    //     numerical agreement measured on the other layout is not evidence about
+    //     this one. Re-run the token-stream comparison; do not quote 4.431e-07.
+    //
+    //  2. THE NODE COUNT DROPS, and a smaller one is not a regression. The
+    //     cross-step figure here is "107 of 1825 launches rewritten" at
+    //     `INK_LAYERS=0:21`. Main since removed the log-scaling `tau` upload and
+    //     its broadcast multiply wherever every tau is exactly 1.0 -- which is
+    //     every LOCAL layer, thirty-five of this model's forty-two -- so the
+    //     same region now records roughly forty fewer nodes. Expect ~1783, not
+    //     1825, and expect the rewritten count to move with it.
+    //
+    //  3. AND THAT DELETES ONE OF THE FOUR BLOCKERS NAMED ABOVE. `tau` is listed
+    //     four paragraphs up as a per-step host constant baked into the region's
+    //     launches. On a local layer there is now no tau tensor, no upload and no
+    //     multiply at all, so on thirty-five of forty-two layers that blocker is
+    //     not deferred or patched -- it is absent. It still applies to a global
+    //     layer under log scaling, which is where it always mattered.
+    //
+    //  4. THE REGION LOST TWO `submit_blocking` CALLS, which is the favourable
+    //     direction and worth stating because this lane's viability depends on
+    //     it. Main moved the per-pass `pool_line` / `pool_reserved` pair to the
+    //     prefill only and merged them into one `memory_usage`. On this branch
+    //     `INK_POOL_CLEANUP=0` is already mandatory because the hand-back holds a
+    //     `Backend::sync`; the pool REPORT was a second, separate barrier inside
+    //     the same region and nobody had connected it to capture.
+    //
+    // WHAT ELSE COULD PUT A SYNC IN HERE, audited 2026-08-26 rather than assumed.
+    // On the shipped configuration nothing does: with `INK_DEV_PLAN` on, the
+    // router takes the `!need_routing` arm and leaves its answer on the device
+    // (see the comment there -- "nothing on the host waits for the device in this
+    // layer"), and no other blocking read is reachable from the region. Five
+    // things would break that, and the stage probes below would report the layer
+    // and stage rather than leaving it silent:
+    //
+    //   * `INK_DEV_PLAN=0`, `INK_GROUPED=2` or `INK_DEVPLAN_CHECK=1` -- each sets
+    //     `need_routing` and reads the top-k decision back to the host.
+    //   * `INK_ROUTER` selecting the host arm -- `down(lg)` unconditionally.
+    //   * A layer whose weights CANNOT BE TABLED. `plan_dev_ok` has eight terms,
+    //     and a layer that fails to table caches its `None` and takes the host
+    //     lane on every pass thereafter. That is the one which needs no operator
+    //     mistake, is per-layer rather than per-run, and is the reason the stage
+    //     probes are worth keeping.
     let graph_on = std::env::var("INK_GRAPH").ok().as_deref() == Some("1");
     let graph_step: usize = std::env::var("INK_GRAPH_STEP")
         .ok()
@@ -7943,10 +8003,7 @@ fn main() -> Result<()> {
             xd = dev_lane_resid::add_resid(xd, a);
 
             stage_sync!(d_attn, layer, "attn");
-            if capture_now
-                && graph_broke.is_none()
-                && fp4_client.graph_capture_status() != 1
-            {
+            if capture_now && graph_broke.is_none() && fp4_client.graph_capture_status() != 1 {
                 graph_broke = Some((layer, "attn"));
             }
             // ---- MLP ----------------------------------------------------------
@@ -8038,12 +8095,9 @@ fn main() -> Result<()> {
                 };
                 t_rt_mm += t_rt.elapsed().as_secs_f64();
                 stage_sync!(d_router, layer, "router");
-            if capture_now
-                && graph_broke.is_none()
-                && fp4_client.graph_capture_status() != 1
-            {
-                graph_broke = Some((layer, "router"));
-            }
+                if capture_now && graph_broke.is_none() && fp4_client.graph_capture_status() != 1 {
+                    graph_broke = Some((layer, "router"));
+                }
                 // Two lanes, and the difference is WHERE the top-k runs, not what
                 // it decides. The host lane reads `[n, rows]` f32 back and sorts;
                 // the device lane runs `routetopk` on the logits where they already
@@ -8550,12 +8604,9 @@ fn main() -> Result<()> {
                 // misattributed to whichever bucket happened to hold the readback.
                 t_expert += t_d.elapsed().as_secs_f64();
                 stage_sync!(d_expert, layer, "expert");
-            if capture_now
-                && graph_broke.is_none()
-                && fp4_client.graph_capture_status() != 1
-            {
-                graph_broke = Some((layer, "expert"));
-            }
+                if capture_now && graph_broke.is_none() && fp4_client.graph_capture_status() != 1 {
+                    graph_broke = Some((layer, "expert"));
+                }
 
                 let ns = t.n_shared_experts;
                 let t_s = Instant::now();
@@ -8599,12 +8650,9 @@ fn main() -> Result<()> {
                     }
                 };
                 stage_sync!(d_shared, layer, "shared");
-            if capture_now
-                && graph_broke.is_none()
-                && fp4_client.graph_capture_status() != 1
-            {
-                graph_broke = Some((layer, "shared"));
-            }
+                if capture_now && graph_broke.is_none() && fp4_client.graph_capture_status() != 1 {
+                    graph_broke = Some((layer, "shared"));
+                }
                 t_shared += t_s.elapsed().as_secs_f64();
                 acc + sh
             };
@@ -8655,10 +8703,7 @@ fn main() -> Result<()> {
             t_h_sconv += t_sc.elapsed().as_secs_f64();
             xd = dev_lane_resid::add_resid(xd, y);
             stage_sync!(d_tail, layer, "tail");
-            if capture_now
-                && graph_broke.is_none()
-                && fp4_client.graph_capture_status() != 1
-            {
+            if capture_now && graph_broke.is_none() && fp4_client.graph_capture_status() != 1 {
                 graph_broke = Some((layer, "tail"));
             }
 
@@ -8871,7 +8916,9 @@ fn main() -> Result<()> {
                     if !info_moved && !grid_moved && moved.is_empty() {
                         continue;
                     }
-                    words += (0..pa.info.len()).filter(|&w| pa.info[w] != pb.info[w]).count();
+                    words += (0..pa.info.len())
+                        .filter(|&w| pa.info[w] != pb.info[w])
+                        .count();
                     addrs += moved.len();
                     idx.push(i);
                     plan.push(GraphLaunchPatch {
@@ -8977,7 +9024,8 @@ fn main() -> Result<()> {
             } else {
                 fp4_client.graph_replay(g);
             }
-            <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync after the first replay");
+            <Bk as burn::tensor::backend::Backend>::sync(&dev)
+                .expect("sync after the first replay");
 
             // Now the measurement: `graph_reps` further replays, each timed on
             // its own so the spread is visible rather than averaged away. This
@@ -8989,7 +9037,8 @@ fn main() -> Result<()> {
                 fp4_client.graph_replay(g);
                 per_rep.push(t.elapsed().as_secs_f64() * 1e6);
             }
-            <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync after the timed replays");
+            <Bk as burn::tensor::backend::Backend>::sync(&dev)
+                .expect("sync after the timed replays");
             // The FIRST capture is the one the eager arm is compared against.
             // A second capture's pass is not an ordinary step -- it follows a
             // pass that captured -- so timing it would be pairing a figure with
@@ -9126,141 +9175,141 @@ fn main() -> Result<()> {
                 // the second one, where every node is already where it is being
                 // put.
                 if !graph_xstep {
-                // ---- what a patch COSTS, and whether it is the right answer ----
-                //
-                // Graph A was captured on step `graph_step` and graph B on the
-                // step after it. Rewriting A's parameters to B's makes the two
-                // executables identical launch for launch, so this measures the
-                // real work on the real region rather than a microbenchmark's
-                // stand-in: the values are the ones the model actually moved,
-                // at the count it actually moved them.
-                //
-                // Two arms, because they price the two halves of the design
-                // separately. The SCALAR arm rewrites only the launches whose
-                // packed blob moved -- what a region with pinned buffers would
-                // have to do every step. The FULL arm also rewrites every
-                // address that moved -- what patching would cost INSTEAD of
-                // pinning, which is the alternative pinning has to beat.
-                //
-                // Each rewrite is timed on its own so the spread is visible.
-                // These are HOST times: a patch touches the executable, not the
-                // device.
-                // The plan is BUILT first and TIMED second. Reading a
-                // launch's captured parameters is a round trip of its own and
-                // is not part of what a patch costs -- a real cross-step lane
-                // holds its plan from the capture, not from a query per step.
-                let mut scalar_plan: Vec<(usize, GraphLaunchPatch)> = Vec::new();
-                let mut addr_plan: Vec<(usize, GraphLaunchPatch)> = Vec::new();
-                for i in 0..na {
-                    let pa = fp4_client.graph_launch_params(a, i);
-                    let pb = fp4_client.graph_launch_params(b, i);
-                    if pa.info != pb.info || pa.grid != pb.grid {
-                        scalar_plan.push((
-                            i,
-                            GraphLaunchPatch {
-                                grid: (pa.grid != pb.grid).then_some(pb.grid),
-                                info: Some(pb.info.clone()),
-                                ptrs: Vec::new(),
-                            },
-                        ));
+                    // ---- what a patch COSTS, and whether it is the right answer ----
+                    //
+                    // Graph A was captured on step `graph_step` and graph B on the
+                    // step after it. Rewriting A's parameters to B's makes the two
+                    // executables identical launch for launch, so this measures the
+                    // real work on the real region rather than a microbenchmark's
+                    // stand-in: the values are the ones the model actually moved,
+                    // at the count it actually moved them.
+                    //
+                    // Two arms, because they price the two halves of the design
+                    // separately. The SCALAR arm rewrites only the launches whose
+                    // packed blob moved -- what a region with pinned buffers would
+                    // have to do every step. The FULL arm also rewrites every
+                    // address that moved -- what patching would cost INSTEAD of
+                    // pinning, which is the alternative pinning has to beat.
+                    //
+                    // Each rewrite is timed on its own so the spread is visible.
+                    // These are HOST times: a patch touches the executable, not the
+                    // device.
+                    // The plan is BUILT first and TIMED second. Reading a
+                    // launch's captured parameters is a round trip of its own and
+                    // is not part of what a patch costs -- a real cross-step lane
+                    // holds its plan from the capture, not from a query per step.
+                    let mut scalar_plan: Vec<(usize, GraphLaunchPatch)> = Vec::new();
+                    let mut addr_plan: Vec<(usize, GraphLaunchPatch)> = Vec::new();
+                    for i in 0..na {
+                        let pa = fp4_client.graph_launch_params(a, i);
+                        let pb = fp4_client.graph_launch_params(b, i);
+                        if pa.info != pb.info || pa.grid != pb.grid {
+                            scalar_plan.push((
+                                i,
+                                GraphLaunchPatch {
+                                    grid: (pa.grid != pb.grid).then_some(pb.grid),
+                                    info: Some(pb.info.clone()),
+                                    ptrs: Vec::new(),
+                                },
+                            ));
+                        }
+                        let moved: Vec<(usize, u64)> = (0..pa.ptrs.len())
+                            .filter(|&w| pa.ptrs[w] != pb.ptrs[w])
+                            .map(|w| (w, pb.ptrs[w]))
+                            .collect();
+                        if !moved.is_empty() {
+                            addr_plan.push((
+                                i,
+                                GraphLaunchPatch {
+                                    grid: None,
+                                    info: None,
+                                    ptrs: moved,
+                                },
+                            ));
+                        }
                     }
-                    let moved: Vec<(usize, u64)> = (0..pa.ptrs.len())
-                        .filter(|&w| pa.ptrs[w] != pb.ptrs[w])
-                        .map(|w| (w, pb.ptrs[w]))
-                        .collect();
-                    if !moved.is_empty() {
-                        addr_plan.push((
-                            i,
-                            GraphLaunchPatch {
-                                grid: None,
-                                info: None,
-                                ptrs: moved,
-                            },
-                        ));
+                    let (scalar_n, full_n) = (scalar_plan.len(), addr_plan.len());
+                    let addr_words: usize = addr_plan.iter().map(|(_, p)| p.ptrs.len()).sum();
+                    // EIGHT batches, each timed on its own. One sample of a host
+                    // cost has no spread to show, and the first one is not like the
+                    // others -- it is the one that finds the driver's paths cold.
+                    let mut scalar_us = Vec::new();
+                    for _ in 0..8 {
+                        let t = Instant::now();
+                        fp4_client.graph_patch_launches(a, scalar_plan.clone());
+                        scalar_us.push(t.elapsed().as_secs_f64() * 1e6);
                     }
-                }
-                let (scalar_n, full_n) = (scalar_plan.len(), addr_plan.len());
-                let addr_words: usize = addr_plan.iter().map(|(_, p)| p.ptrs.len()).sum();
-                // EIGHT batches, each timed on its own. One sample of a host
-                // cost has no spread to show, and the first one is not like the
-                // others -- it is the one that finds the driver's paths cold.
-                let mut scalar_us = Vec::new();
-                for _ in 0..8 {
-                    let t = Instant::now();
-                    fp4_client.graph_patch_launches(a, scalar_plan.clone());
-                    scalar_us.push(t.elapsed().as_secs_f64() * 1e6);
-                }
-                let mut addr_us = Vec::new();
-                for _ in 0..8 {
-                    let t = Instant::now();
-                    fp4_client.graph_patch_launches(a, addr_plan.clone());
-                    addr_us.push(t.elapsed().as_secs_f64() * 1e6);
-                }
-                let show = |v: &[f64]| -> String {
-                    v.iter()
-                        .map(|x| format!("{x:.1}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                println!(
-                    "  GRAPHPATCH: scalars+geometry, {scalar_n} launches per batch, us per \
-                     batch: [{}]",
-                    show(&scalar_us)
-                );
-                println!(
-                    "  GRAPHPATCH: addresses, {full_n} launches ({addr_words} addresses) per \
-                     batch, us per batch: [{}]",
-                    show(&addr_us)
-                );
-
-                // ---- and is the rewritten graph the RIGHT graph ----
-                //
-                // A is now B, parameter for parameter. B has already been
-                // replayed once, which is what made this step correct, and the
-                // region is idempotent under repeated replay -- so replaying
-                // the rewritten A must leave every carried buffer exactly where
-                // B's own replay left it. Not approximately: these are the same
-                // kernels writing the same addresses from the same inputs.
-                //
-                // The carried sums are checked rather than the logits, because
-                // a region that computes its own step correctly while
-                // corrupting what it hands the next one looks perfect from the
-                // logits. That is the shape of the bug 6c5d780 and e3cceca
-                // chased, and it is the shape this one would take too.
-                let carry_sums = |caches: &Vec<LayerCache>| -> Vec<f64> {
-                    let mut v = Vec::new();
-                    for c in caches.iter() {
-                        v.extend_from_slice(&c.attn.debug_carry_sums(&dev));
+                    let mut addr_us = Vec::new();
+                    for _ in 0..8 {
+                        let t = Instant::now();
+                        fp4_client.graph_patch_launches(a, addr_plan.clone());
+                        addr_us.push(t.elapsed().as_secs_f64() * 1e6);
                     }
-                    v
-                };
-                <Bk as burn::tensor::backend::Backend>::sync(&dev)
-                    .expect("sync before the reference carry read");
-                let before = carry_sums(&caches);
-                let t_replay = Instant::now();
-                fp4_client.graph_replay(a);
-                let replay_us = t_replay.elapsed().as_secs_f64() * 1e6;
-                <Bk as burn::tensor::backend::Backend>::sync(&dev)
-                    .expect("sync after the rewritten replay");
-                let after = carry_sums(&caches);
-                let worst = before
-                    .iter()
-                    .zip(after.iter())
-                    .map(|(x, y)| (x - y).abs())
-                    .fold(0.0f64, f64::max);
-                println!(
-                    "  GRAPHPATCH: replay of the rewritten graph {replay_us:.3} us host; \
-                     {} carried buffers, worst absolute-sum difference {worst:.6}",
-                    before.len()
-                );
-                if worst != 0.0 {
+                    let show = |v: &[f64]| -> String {
+                        v.iter()
+                            .map(|x| format!("{x:.1}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
                     println!(
-                        "  GRAPHPATCH: replaying the rewritten graph MOVED the carry. With \
+                        "  GRAPHPATCH: scalars+geometry, {scalar_n} launches per batch, us per \
+                     batch: [{}]",
+                        show(&scalar_us)
+                    );
+                    println!(
+                        "  GRAPHPATCH: addresses, {full_n} launches ({addr_words} addresses) per \
+                     batch, us per batch: [{}]",
+                        show(&addr_us)
+                    );
+
+                    // ---- and is the rewritten graph the RIGHT graph ----
+                    //
+                    // A is now B, parameter for parameter. B has already been
+                    // replayed once, which is what made this step correct, and the
+                    // region is idempotent under repeated replay -- so replaying
+                    // the rewritten A must leave every carried buffer exactly where
+                    // B's own replay left it. Not approximately: these are the same
+                    // kernels writing the same addresses from the same inputs.
+                    //
+                    // The carried sums are checked rather than the logits, because
+                    // a region that computes its own step correctly while
+                    // corrupting what it hands the next one looks perfect from the
+                    // logits. That is the shape of the bug 6c5d780 and e3cceca
+                    // chased, and it is the shape this one would take too.
+                    let carry_sums = |caches: &Vec<LayerCache>| -> Vec<f64> {
+                        let mut v = Vec::new();
+                        for c in caches.iter() {
+                            v.extend_from_slice(&c.attn.debug_carry_sums(&dev));
+                        }
+                        v
+                    };
+                    <Bk as burn::tensor::backend::Backend>::sync(&dev)
+                        .expect("sync before the reference carry read");
+                    let before = carry_sums(&caches);
+                    let t_replay = Instant::now();
+                    fp4_client.graph_replay(a);
+                    let replay_us = t_replay.elapsed().as_secs_f64() * 1e6;
+                    <Bk as burn::tensor::backend::Backend>::sync(&dev)
+                        .expect("sync after the rewritten replay");
+                    let after = carry_sums(&caches);
+                    let worst = before
+                        .iter()
+                        .zip(after.iter())
+                        .map(|(x, y)| (x - y).abs())
+                        .fold(0.0f64, f64::max);
+                    println!(
+                        "  GRAPHPATCH: replay of the rewritten graph {replay_us:.3} us host; \
+                     {} carried buffers, worst absolute-sum difference {worst:.6}",
+                        before.len()
+                    );
+                    if worst != 0.0 {
+                        println!(
+                            "  GRAPHPATCH: replaying the rewritten graph MOVED the carry. With \
                          `INK_GRAPH_CARRY=1` that is expected and is not a patch failure: a \
                          region that advances its own history is not idempotent, and those \
                          are the same property. Use `INK_GRAPH_XSTEP=1` for the honest test."
-                    );
-                }
+                        );
+                    }
                 }
             }
         }
