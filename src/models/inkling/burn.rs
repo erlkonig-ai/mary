@@ -815,6 +815,23 @@ impl AttnCache<Bk> {
     /// `kept = 0..keep` reduces to `commit(keep, window)` — see the equality
     /// test — so a chain run through this function is the same cache it was.
     pub fn commit_rows(&mut self, kept: &[usize], window: Option<usize>) {
+        // A contiguous accepted set is a PREFIX, and a prefix is what
+        // [`AttnCache::commit`] already does -- by TRUNCATION, leaving the kept
+        // rows exactly where they were written. Delegating is not just an
+        // optimisation: re-appending rows the store already holds sends them
+        // through `as_kv` and the store's own packing a second time, and an
+        // NVFP4 store computes its scales over the block it is handed, so three
+        // rows re-appended as one can quantise differently from the same row
+        // appended as one of three. Identical only on a WIDE cache -- which is
+        // precisely what the unit test pins, so the unit test could not have
+        // seen it.
+        //
+        // Rank 0 and total rejection are both contiguous, so the common tree
+        // pass now takes the same path a chain does, bit for bit.
+        if kept.iter().copied().eq(0..kept.len()) {
+            self.commit(kept.len(), window);
+            return;
+        }
         if let Some(p) = self.pending.take() {
             assert!(
                 kept.windows(2).all(|w| w[0] < w[1]),
@@ -827,32 +844,18 @@ impl AttnCache<Bk> {
                 p.rows
             );
             let dev = p.k_new.device();
-            let contiguous = kept.iter().copied().eq(0..kept.len());
             self.k.truncate(self.k.len() - p.rows);
             self.v.truncate(self.v.len() - p.rows);
             if !kept.is_empty() {
-                let (k_sel, v_sel) = if contiguous {
-                    let kd = p.k_new.dims()[1];
-                    let vd = p.v_new.dims()[1];
-                    (
-                        p.k_new.clone().slice([0..kept.len(), 0..kd]),
-                        p.v_new.clone().slice([0..kept.len(), 0..vd]),
-                    )
-                } else {
-                    let idx: Tensor<Bk, 1, Int> = Tensor::from_data(
-                        TensorData::new(
-                            kept.iter().map(|&r| r as i32).collect::<Vec<_>>(),
-                            [kept.len()],
-                        ),
-                        &dev,
-                    );
-                    (
-                        p.k_new.clone().select(0, idx.clone()),
-                        p.v_new.clone().select(0, idx),
-                    )
-                };
-                self.k.append(as_kv(k_sel));
-                self.v.append(as_kv(v_sel));
+                let idx: Tensor<Bk, 1, Int> = Tensor::from_data(
+                    TensorData::new(
+                        kept.iter().map(|&r| r as i32).collect::<Vec<_>>(),
+                        [kept.len()],
+                    ),
+                    &dev,
+                );
+                self.k.append(as_kv(p.k_new.clone().select(0, idx.clone())));
+                self.v.append(as_kv(p.v_new.clone().select(0, idx)));
             }
             // The next position's convolution memory: the tail of
             // `history ++ accepted path`, gathered out of the window this
