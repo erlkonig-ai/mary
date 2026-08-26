@@ -338,6 +338,40 @@ pub fn conv_history<B: Backend>(x: Tensor<B, 2>, kernel: usize) -> Tensor<B, 2> 
     }
 }
 
+/// [`conv_history`] after a TREE verify pass: the `kernel - 1` window rows the
+/// next position must carry, given the batch rows the verifier kept.
+///
+/// The block's own two convolutions (`attn_sconv`, `mlp_sconv`) roll back the
+/// same way the attention's do, and for the same reason: their memory is a
+/// function of the last KEPT row and the rows before it ALONG THE ACCEPTED
+/// PATH. On a chain that path is a prefix and this is
+/// `conv_history(all.slice([0..hist + keep]), kernel)`, the slice the loop
+/// takes today. On a tree it is a gather, because the accepted rows are not
+/// contiguous.
+///
+/// `all` is the `kernel - 1 + rows` window `short_conv_steps` handed back.
+pub fn conv_history_rows<B: Backend>(
+    all: Tensor<B, 2>,
+    kernel: usize,
+    kept: &[usize],
+) -> Tensor<B, 2> {
+    let [len, _] = all.dims();
+    let take = crate::models::inkling::spectree::conv_next_history(kernel, kept);
+    assert!(
+        take.iter().all(|&r| r < len),
+        "a {len}-row window cannot supply history {take:?}"
+    );
+    let dev = all.device();
+    let idx: Tensor<B, 1, Int> = Tensor::from_data(
+        TensorData::new(
+            take.iter().map(|&r| r as i32).collect::<Vec<_>>(),
+            [take.len()],
+        ),
+        &dev,
+    );
+    all.select(0, idx)
+}
+
 /// One position of the short convolution, given the `kernel - 1` inputs before
 /// it. Returns the output row and the history to carry to the next position.
 ///
@@ -4390,6 +4424,41 @@ mod tests {
         println!("tree/local: worst {worst:e}, branch gap {gap:e}");
         assert!(gap > 1e-3, "the two branches collapsed, gap {gap}");
         assert!(worst < CACHE_TOLERANCE, "a tree row drifts by {worst}");
+    }
+
+    /// The block convolutions' rollback, gathered, is the slice it replaces.
+    ///
+    /// Same equality as `commit_rows` versus `commit`, one operator down: on a
+    /// contiguous accepted set `conv_history_rows` must return exactly what
+    /// `conv_history(all.slice([0..hist + keep]))` returns, which is what the
+    /// decode loop takes today for `attn_sconv` and `mlp_sconv`.
+    #[test]
+    fn gathered_conv_history_on_a_prefix_is_the_slice() {
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let (dim, kernel, rows) = (16usize, 4usize, 4usize);
+        let hist = kernel - 1;
+        let all: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(fill((hist + rows) * dim, 0.9), [hist + rows, dim]),
+            &dev,
+        );
+        for keep in 0..=rows {
+            let want = conv_history(all.clone().slice([0..hist + keep, 0..dim]), kernel);
+            let got = conv_history_rows(all.clone(), kernel, &(0..keep).collect::<Vec<_>>());
+            assert_eq!(got.dims(), want.dims(), "keep={keep}");
+            let diff = (got - want).abs().max().into_scalar();
+            assert!(diff == 0.0, "keep={keep} differs by {diff}");
+        }
+        // ...and a scattered path takes the rows the path actually named.
+        let got = conv_history_rows(all.clone(), kernel, &[0, 2]);
+        let want = Tensor::cat(
+            vec![
+                all.clone().slice([2..3, 0..dim]),
+                all.clone().slice([3..4, 0..dim]),
+                all.slice([5..6, 0..dim]),
+            ],
+            0,
+        );
+        assert!((got - want).abs().max().into_scalar() == 0.0);
     }
 
     /// [`AttnCache::commit_rows`] on a contiguous set IS [`AttnCache::commit`].
