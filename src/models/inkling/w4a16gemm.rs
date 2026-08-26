@@ -980,14 +980,32 @@ pub fn swizzle_w4a16_device<R: Runtime>(
 /// do, but this run cannot distinguish it from `off`; it is a direction, not a
 /// measurement, and it landed three reps rather than four.
 ///
-/// TWO STAMPS THIS RUN CARRIES, because a number is its framing. The harness
-/// marked it UNGATED -- contention appeared mid-run, and the likeliest source is
-/// the author's own polling of the box while it ran, which is a lesson about
-/// watching a gated benchmark, not about the kernel. And the tree was DIRTY at
-/// `20a0b06`, so the commit does not identify what ran; the shared binary is
-/// what makes the comparison internally valid. A clean re-run would strengthen
-/// it. The kernel-level table above, where the mechanism comes from, does not
-/// depend on this run.
+/// RE-MEASURED at the shipped load depth of 4, after [`swz_unroll`] landed and
+/// `swizzle_pays` relaxed to permute BOTH sinks. Same harness, same corpus, same
+/// layers, one binary across both arms:
+///
+/// ```text
+///   arm    reps (ms/step)              median    spread
+///   off    47.5 47.7 47.5 46.6         47.500     2.4%
+///   rule   46.4 46.2 45.8 45.8         46.000     1.3%
+/// ```
+///
+/// +3.26%, up from +2.16% before the load-ahead, and again the bands do not
+/// overlap -- `rule`'s worst rep (46.4) beats `off`'s best (46.6). The startup
+/// log confirms what was bound: `rule` writes both sinks MMA-FRAGMENT, `off`
+/// writes both row-major.
+///
+/// A STAMP BOTH RUNS CARRY, and a correction to what the first one blamed. The
+/// harness marks these UNGATED because its POST-run gate reads `loadavg 6.65`
+/// against a limit of 2.0 -- but that load is the benchmark's OWN decode process
+/// decaying on a 20-core box, and it appears identically in the second run,
+/// where the box was not touched from outside at all. So it is a property of
+/// measuring decode on this part, not evidence of a contender; an earlier
+/// version of this paragraph blamed the author's polling, and the second run
+/// falsified that. The tree was also DIRTY at `20a0b06`, so the commit does not
+/// identify what ran; the shared binary sha256 across arms is what makes each
+/// comparison internally valid. The kernel-level tables, where the mechanism
+/// comes from, do not depend on either run.
 ///
 /// ## What it says about the four consumers
 ///
