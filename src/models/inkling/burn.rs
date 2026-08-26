@@ -464,12 +464,7 @@ pub fn short_conv_step(
     // does, and stability is what `INK_GRAPH_DIFF` measures.
     let carried = match crate::models::inkling::sconv::carry_in_place() {
         true => {
-            crate::models::inkling::sconv::carry_into(
-                &client,
-                &h_hist,
-                &next,
-                (kernel - 1) * dim,
-            );
+            crate::models::inkling::sconv::carry_into(&client, &h_hist, &next, (kernel - 1) * dim);
             h_hist
         }
         false => next,
