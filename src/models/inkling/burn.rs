@@ -357,6 +357,43 @@ pub fn conv_history<B: Backend>(x: Tensor<B, 2>, kernel: usize) -> Tensor<B, 2> 
 /// That costs nothing: this file's own tests already say "the only backend
 /// there is", and [`short_conv`] — the prefill form, which runs once — stays
 /// generic.
+///
+/// # This is NOT commutable with a partial sum
+///
+/// A property of the architecture, recorded here because the place it bites is
+/// a long way from here and the branch that found it may never ship.
+///
+/// Any scheme that computes the residual stream in PIECES and adds them up —
+/// tensor parallelism across nodes, a split across devices, a hand-written
+/// accumulation over head groups — must complete that addition BEFORE calling
+/// this. The convolution mixes `x` with `hist`, which carries state from
+/// previous tokens and is already whole. So for partials `a` and `b`:
+///
+/// ```text
+///   conv(a, hist) + conv(b, hist)  !=  conv(a + b, hist)
+/// ```
+///
+/// The two sides differ by exactly one extra application of the history term,
+/// and they coincide only when `hist` is zero — i.e. on the very first token,
+/// which is why a naive implementation looks correct in a one-token test and
+/// drifts from the second token on.
+///
+/// The dangerous part is where it reads naturally. In a decoder layer the
+/// obvious place to combine partials is beside the residual add, one line
+/// BELOW this call:
+///
+/// ```text
+///   WRONG:  attention(partial) -> conv -> combine -> residual
+///   RIGHT:  attention(partial) -> combine -> conv -> residual
+/// ```
+///
+/// The wrong order does not crash, does not produce NaN, and does not fail a
+/// shape check. It returns a finite hidden state that goes on to generate
+/// fluent, wrong text. Same rule for the MLP half, whose own short convolution
+/// sits in the same position relative to the MoE and dense outputs.
+///
+/// Found while wiring TP2 (`tp2-within-layer-split`, parked); the reasoning
+/// applies to any within-layer split, not to that branch.
 pub fn short_conv_step(
     hist: Tensor<Bk, 2>,
     x: Tensor<Bk, 2>,
@@ -418,6 +455,8 @@ pub fn short_conv_step(
 /// so `rows == 1` through here is BIT-IDENTICAL to the one-row lane. Under the
 /// slice form it was not, and that difference was one more thing separating a
 /// widened pass's arithmetic from a narrow one's.
+/// Carries [`short_conv_step`]'s partial-sum rule: a residual computed in
+/// PIECES must be summed BEFORE this call, never after it. See that function.
 pub fn short_conv_steps(
     hist: Tensor<Bk, 2>,
     x: Tensor<Bk, 2>,
@@ -484,6 +523,8 @@ pub fn short_conv_window(all: Tensor<Bk, 2>, weight: Tensor<Bk, 2>, rows: usize)
 /// convolution kernel, because `k` is 4 and the shift is exactly what the
 /// formula says. Returning only `conv` — dropping the module's own residual —
 /// is the mistake this shape makes hard to hide.
+/// Carries [`short_conv_step`]'s partial-sum rule: a residual computed in
+/// PIECES must be summed BEFORE this call, never after it. See that function.
 pub fn short_conv<B: Backend>(x: Tensor<B, 2>, weight: Tensor<B, 2>) -> Tensor<B, 2> {
     let [tokens, dim] = x.dims();
     let [wdim, kernel] = weight.dims();
@@ -2181,6 +2222,8 @@ pub fn attention_steps(
 /// would convolve slot `s`'s output out of slot `s - 1`'s inputs. The result
 /// still reads as fluent text, which is exactly why the two shapes need
 /// different functions rather than one function and a comment.
+/// Carries [`short_conv_step`]'s partial-sum rule: a residual computed in
+/// PIECES must be summed BEFORE this call, never after it. See that function.
 pub fn short_conv_slot_step(
     hist: Tensor<Bk, 3>,
     x: Tensor<Bk, 2>,
