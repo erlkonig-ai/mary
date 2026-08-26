@@ -70,7 +70,26 @@ gate_one() {  # gate_one <label> <ssh-prefix-or-empty>
   # quotes and ssh hands `pgrep -a -f a|b|c` to the REMOTE shell, which parses the
   # bars as PIPES -- so this check had never once fired on the tail side (visible
   # in any log: HEAD prints "measurement-shaped processes", TAIL never does).
-  mine=$($pre pgrep -a -f "'inkling_forward|inkling_membw|nsys|ncu'" 2>/dev/null | grep -v pgrep || true)
+  # THE PATTERN MUST SURVIVE EXACTLY AS MANY SHELLS AS IT CROSSES, and the two
+  # sides cross a different number. Remote ($pre set) goes through the local shell
+  # AND the remote one, so the quotes must be doubled or the remote shell parses
+  # the bars as PIPES. Local ($pre empty) crosses ONE shell, so those same doubled
+  # quotes arrive as literal characters and pgrep searches for a pattern
+  # containing apostrophes, which never matches anything.
+  #
+  # Both mistakes have now been made here in sequence: the original unquoted form
+  # silently disabled the TAIL check, and the 2026-08-25 fix for it silently
+  # disabled the HEAD check. Verified on Linux from a script file, so the pattern
+  # was not in the invoking command line and could not self-match: with a target
+  # process alive, the doubled-quote form matched NOTHING while the bare form
+  # matched it. Branch explicitly rather than trying to find one string that works
+  # for both -- a single clever string is what produced two unfailable checks.
+  local _pat='inkling_forward|inkling_membw|nsys|ncu'
+  if [ -z "$pre" ]; then
+    mine=$(pgrep -a -f "$_pat" 2>/dev/null | grep -v pgrep || true)
+  else
+    mine=$($pre "pgrep -a -f '$_pat'" 2>/dev/null | grep -v pgrep || true)
+  fi
   echo "  $label: util ${util}%  load $load  compute-apps: ${procs:-none}"
   [ -n "$mine" ] && echo "      measurement-shaped processes: $mine"
   local bad=0
