@@ -2702,9 +2702,9 @@ fn w4a16_bind(
     //    `ann_budget() > 0`: the SINK experts come through this same function
     //    and can never reach `ann_logits` at all.
     //
-    // 2. SPEED, the sinks -- and this one is MEASURED and went the other way
-    //    from what everybody predicted. The sinks are correct in either layout,
-    //    so this is purely a performance choice. Permuting them is a LOSS:
+    // 2. SPEED, and it is per SHAPE, not per weight-kind. The sinks are correct
+    //    in either layout, so this is purely a performance choice. The original
+    //    measurement said permuting them is a LOSS:
     //
     //      a109514 -> e30f22a, ctx 3732, split 21, 7 reps, 441 warm passes a
     //      side, identical binary on both nodes, `for_ann` 0 -> 5 refs:
@@ -2720,15 +2720,21 @@ fn w4a16_bind(
     //    WHY, and it is a lesson about quoting a figure outside its shape. The
     //    permutation was measured at the HEAD's shape -- 201024 x 4096, ~25128
     //    cubes -- where it is worth 95.9 -> 116.3 GB/s. The sinks are 8192x4096
-    //    and 4096x2048, which are 1024 and 512 cubes. That is a different point
-    //    on the cube-count curve, and `swz_grid_scaling` already said the
-    //    multiplier shrinks there. It does not merely shrink; at this shape it
-    //    inverts. A permutation trades a coalesced read for a gathered one at
-    //    the WRITE side of the staging, and with too few warps in flight to
-    //    hide it there is nothing left to pay for it.
+    //    and 4096x2048, which are 1024 and 512 cubes.
     //
-    // So the head keeps its correctness guard and the sinks are never permuted.
-    // `INK_W4A16_SWZ` remains the ablation, and it now only reaches the head.
+    //    CORRECTED 2026-08-26, and the correction is the same mistake one level
+    //    down: "the sinks" is not a shape either. Measured across the range by
+    //    `w4a16_swz_grid`, 8192x4096 (1024 cubes) WINS 1.13-1.22x and only
+    //    4096x2048 (512 cubes at k=2048) loses, 0.88x. The mechanism is not the
+    //    "gathered write at the staging" guessed here -- this kernel has no
+    //    staging. A 32-byte sector holds four k-tiles of one weight row, so the
+    //    row-major form's eight-sector burst is an incidental 4-deep L1
+    //    prefetch; permuting trades 8x fewer requests for losing it, and which
+    //    side pays depends on having enough resident warps to hide the latency
+    //    the prefetch was covering. See `swizzle_pays`, which carries the table.
+    //
+    // So the head keeps its correctness guard and the sinks are judged by shape.
+    // `INK_W4A16_SWZ=0` remains the ablation; `=1` forces past the predicate.
     //
     // WHAT THIS A/B COULD NOT SEPARATE: `de482cb` bundled the sink permutation
     // WITH moving the pool `memory_usage` barrier off the decode path, and the
