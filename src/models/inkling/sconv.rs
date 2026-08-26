@@ -40,6 +40,55 @@ use cubecl::server::Handle;
 /// Threads per cube. One thread per channel; the channels are independent.
 const CUBE_SIZE: u32 = 256;
 
+/// Whether a short convolution's carried history lands back in the buffer it
+/// was read from (`INK_GRAPH_CARRY=1`), rather than in a fresh one.
+///
+/// This is a MEMORY-MANAGEMENT switch, not a numerics one: the same kernel
+/// computes the same history either way, and all this decides is where it ends
+/// up. It exists for cross-step graph replay. A captured region records
+/// ADDRESSES, so a replayed step reads whatever address the capture read --
+/// and a convolution that writes its new history to a FRESH buffer leaves the
+/// next replay reading the history from the step before it, forever. That is
+/// the same property as the region being idempotent under repeated replay,
+/// seen from the other side.
+///
+/// Off by default, because on the ordinary decode path it is pure cost: one
+/// extra copy of `(kernel - 1) * dim` floats per convolution, four per layer.
+/// Inside a captured region that copy is a graph node and costs no host time at
+/// all, which is the case it is for.
+pub fn carry_in_place() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INK_GRAPH_CARRY").as_deref() == Ok("1"))
+}
+
+/// `dst <- src`, elementwise.
+///
+/// Two DISTINCT buffers, always. cubecl compiles a read-only binding to
+/// `const T* __restrict__`, so a kernel handed the same buffer twice is telling
+/// nvcc a lie it is entitled to optimize against -- which is exactly why the
+/// history is copied back rather than written in place by the convolution
+/// itself.
+#[cube(launch_unchecked)]
+fn carry_kernel(src: &Array<f32>, dst: &mut Array<f32>) {
+    if ABSOLUTE_POS < dst.len() {
+        dst[ABSOLUTE_POS] = src[ABSOLUTE_POS];
+    }
+}
+
+/// Copy `n` f32 from `src` over `dst`.
+pub fn carry_into<R: Runtime>(client: &ComputeClient<R>, dst: &Handle, src: &Handle, n: usize) {
+    let cubes = n.div_ceil(CUBE_SIZE as usize) as u32;
+    unsafe {
+        carry_kernel::launch_unchecked::<R>(
+            client,
+            CubeCount::new_1d(cubes),
+            CubeDim::new_1d(CUBE_SIZE),
+            ArrayArg::from_raw_parts(src.clone(), n),
+            ArrayArg::from_raw_parts(dst.clone(), n),
+        );
+    }
+}
+
 /// The convolution and the slid history, in one kernel and one pass.
 ///
 /// One thread per channel. The taps are accumulated **in registers**, in

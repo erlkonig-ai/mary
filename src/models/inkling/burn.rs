@@ -451,9 +451,32 @@ pub fn short_conv_step(
     let (h_hist, h_x, h_w) = (handle_of(hist), handle_of(x), handle_of(weight));
     let (out, next) =
         crate::models::inkling::sconv::short_conv_decode(&client, &h_hist, &h_x, &h_w, dim, kernel);
+    // Where the carried history ENDS UP. See `sconv::carry_in_place`: a
+    // captured region records addresses, so a history that lands in a fresh
+    // buffer every step is a history a replayed step can never advance.
+    //
+    // The returned tensor is built from the handle actually WRITTEN, not from
+    // the caller's `hist` object. Those are the same buffer whenever `hist` was
+    // contiguous, which is the case this is for -- but `handle_of` silently
+    // makes a non-contiguous tensor contiguous into a NEW buffer, and returning
+    // the caller's object then would hand back the one that was not written.
+    // Correctness must not depend on that accident; only pointer STABILITY
+    // does, and stability is what `INK_GRAPH_DIFF` measures.
+    let carried = match crate::models::inkling::sconv::carry_in_place() {
+        true => {
+            crate::models::inkling::sconv::carry_into(
+                &client,
+                &h_hist,
+                &next,
+                (kernel - 1) * dim,
+            );
+            h_hist
+        }
+        false => next,
+    };
     (
         tensor_of(client.clone(), dev.clone(), out, 1, dim),
-        tensor_of(client, dev, next, kernel - 1, dim),
+        tensor_of(client, dev, carried, kernel - 1, dim),
     )
 }
 
@@ -767,6 +790,31 @@ struct Pending<B: Backend> {
     k_new: Tensor<B, 2>,
     v_new: Tensor<B, 2>,
     rows: usize,
+}
+
+impl AttnCache<Bk> {
+    /// DEBUG: host-side absolute sums of everything this cache carries to the
+    /// next decode step, in the order (K pages, V pages, k_pre, v_pre).
+    ///
+    /// Exists to name WHICH carried buffer a repeated graph replay moves. It
+    /// syncs and reads back, so it belongs behind a flag and nowhere near a
+    /// timed path.
+    pub fn debug_carry_sums(&self, dev: &burn::backend::cuda::CudaDevice) -> [f64; 4] {
+        fn s(t: Tensor<Bk, 2>) -> f64 {
+            t.abs()
+                .sum()
+                .into_data()
+                .convert::<f32>()
+                .to_vec::<f32>()
+                .expect("device readback")[0] as f64
+        }
+        [
+            s(self.k.materialize(dev)),
+            s(self.v.materialize(dev)),
+            s(self.k_pre.clone()),
+            s(self.v_pre.clone()),
+        ]
+    }
 }
 
 impl<B: Backend> AttnCache<B> {
@@ -1654,8 +1702,18 @@ impl PagedKv {
             !k.is_empty(),
             "a cached read wants at least one page; the step appends before it reads"
         );
+        // PHYSICAL rows, which is what the key axis is built at. It is `head +
+        // len` plus whatever of the page being written is not yet real: a page
+        // is allocated at its full capacity and filled in place, so the last
+        // chunk carries dead rows at its BACK exactly as chunk 0 carries them
+        // at its front. Both are masked below, over `slots` rather than over
+        // `len`, which is why nothing here has to know which is which.
         let stored: usize = k.iter().map(|p| p.dims()[0]).sum();
-        debug_assert_eq!(stored, head + cache.len(), "the pages lost rows");
+        debug_assert!(
+            stored >= head + cache.len(),
+            "the pages lost rows: {stored} stored against {} live",
+            head + cache.len()
+        );
         let tail = k.last().expect("checked").dims()[0];
         let pad = tail.next_multiple_of(bucket) - tail;
         if pad > 0 {

@@ -85,6 +85,23 @@ pub trait PageRows: Clone {
     fn concat(parts: Vec<Self>) -> Self
     where
         Self: Sized;
+    /// `rows` rows of zeros, of this value's width and element type.
+    ///
+    /// Zeros and not uninitialised memory, and the reason is the same one
+    /// `PagedKv`'s tail pad gives: a page is read WHOLE, so the rows past
+    /// [`Pages::fill`] reach the attention products. They are masked to `-inf`
+    /// in the scores, which makes their probability exactly zero, and `0 * NaN`
+    /// is NaN. A dead row has to be FINITE; zero is the cheapest finite thing.
+    fn zeroed(&self, rows: usize) -> Self;
+    /// Overwrite rows `at .. at + src.rows()` with `src`, IN PLACE.
+    ///
+    /// In place is the whole point of the capacity page: the alternative is the
+    /// `concat` that used to grow the tail by a row a step, which allocates a
+    /// buffer of a size never seen before on every single decode step. An
+    /// implementation must take the buffer out of `self` before writing it
+    /// (`std::mem::replace`), because a clone leaves two live references and
+    /// Burn answers that by copying the whole page to write one row of it.
+    fn write_rows(&mut self, at: usize, src: Self);
 }
 
 /// The page-boundary arithmetic, over any [`PageRows`].
@@ -113,11 +130,35 @@ pub trait PageRows: Clone {
 /// step, and the read is then at most [`MAX_PAGES`] chunks whatever the context
 /// length is. Nothing else in this file cared about a page's size: every
 /// operation below walks ROWS, not page indices.
+///
+/// ## The last page is a CAPACITY, and `fill` is what is real in it
+///
+/// [`Pages::append`] used to `concat` the page being written with the row
+/// arriving, which allocates a buffer one row bigger than any that has existed
+/// before on EVERY decode step. That is shape drift at its narrowest, and it is
+/// what stops a captured CUDA graph being replayed on a later step: measured at
+/// 21 Inkling layers, 589 allocations escaped a capture and exactly one of them
+/// was on the GPU -- this `concat`.
+///
+/// So the page being written is allocated at its full [`PAGE`] rows once and
+/// written into, and `fill` counts the rows of it that are real. The shape of
+/// every page is then constant for as long as the page lives. It is the same
+/// layout `dev_lane::SlotCache` already uses for the slot batch -- `cap`
+/// against `len`, a `slice_assign` of one row instead of a `cat` of everything
+/// -- and this is that layout brought to the single-sequence cache.
+///
+/// The rows between `fill` and the page's capacity are DEAD, and every reader
+/// already carries them, because a page has always been read whole: the
+/// `PagedKv` mask marks every slot outside `head .. head + len` as `-inf`, and
+/// the fused lane clamps each run to `hi = head + len`. That is why this
+/// change is confined to this file.
 #[derive(Clone, Debug)]
 pub struct Pages<R: PageRows> {
     pages: Vec<R>,
     head: usize,
     len: usize,
+    /// Real rows in the LAST page. Every earlier page is full.
+    fill: usize,
 }
 
 impl<R: PageRows> Default for Pages<R> {
@@ -133,6 +174,21 @@ impl<R: PageRows> Pages<R> {
             pages: Vec::new(),
             head: 0,
             len: 0,
+            fill: 0,
+        }
+    }
+
+    /// Real rows in page `i`: [`Pages::fill`] for the page being written, the
+    /// whole page for every settled one.
+    ///
+    /// Every row walk below goes through this rather than through
+    /// `pages[i].rows()`, because those two agree for every page but the one
+    /// that matters.
+    fn rows_at(&self, i: usize) -> usize {
+        if i + 1 == self.pages.len() {
+            self.fill
+        } else {
+            self.pages[i].rows()
         }
     }
 
@@ -183,31 +239,46 @@ impl<R: PageRows> Pages<R> {
     /// Takes the whole batch at once rather than row by row: a speculative
     /// verify appends `k + 1` rows and splitting them into `k + 1` slice
     /// assignments would copy the tail page that many times.
+    /// Three paths, and the FIRST one is the decode step.
+    ///
+    /// * Room in the page being written: a `write_rows` into it, in place, at
+    ///   a shape that does not move. A decode step is this and nothing else,
+    ///   127 times out of 128.
+    /// * Whole pages: pushed as they are. A prefill is mostly these, and an
+    ///   exact-size page needs no capacity and no copy.
+    /// * A remainder: opens a fresh [`PAGE`]-row page and writes into it.
     pub fn append(&mut self, rows: R) {
         let n = rows.rows();
         if n == 0 {
             return;
         }
         let mut written = 0usize;
-        // Fill the tail page first, if it has room.
+        // Room in the page being written?
         //
-        // Asked of the LAST PAGE rather than of `stored() % PAGE`: those agreed
-        // while every page was exactly `PAGE` rows, and they stop agreeing the
-        // moment `drop_front` cuts page 0 or `truncate` cuts a merged one. The
-        // last page is the thing being filled, so it is the thing to ask.
-        let tail = self.pages.last().map(|p| p.rows() % PAGE).unwrap_or(0);
-        if tail != 0 {
-            let room = PAGE - tail;
-            let take = room.min(n);
-            let last = self.pages.len() - 1;
-            let part = rows.slice_rows(0, take);
-            self.pages[last] = R::concat(vec![self.pages[last].clone(), part]);
-            written = take;
+        // Asked of the LAST PAGE's capacity against `fill`, rather than of
+        // `stored() % PAGE`: those agreed while every page was exactly `PAGE`
+        // rows, and they stop agreeing the moment `drop_front` cuts page 0 or
+        // `truncate` re-opens a merged one.
+        if let Some(cap) = self.pages.last().map(|p| p.rows()) {
+            if self.fill < cap {
+                let take = (cap - self.fill).min(n);
+                let last = self.pages.len() - 1;
+                let at = self.fill;
+                self.pages[last].write_rows(at, rows.slice_rows(0, take));
+                self.fill += take;
+                written = take;
+            }
         }
-        while written < n {
-            let take = PAGE.min(n - written);
-            self.pages.push(rows.slice_rows(written, written + take));
-            written += take;
+        while n - written >= PAGE {
+            self.pages.push(rows.slice_rows(written, written + PAGE));
+            self.fill = PAGE;
+            written += PAGE;
+        }
+        if written < n {
+            let mut page = rows.zeroed(PAGE);
+            page.write_rows(0, rows.slice_rows(written, n));
+            self.pages.push(page);
+            self.fill = n - written;
         }
         self.len += n;
         if self.pages.len() > MAX_PAGES {
@@ -242,14 +313,16 @@ impl<R: PageRows> Pages<R> {
         if self.len == 0 {
             self.pages.clear();
             self.head = 0;
+            self.fill = 0;
             return;
         }
-        // Release whole pages by ROWS, not by dividing through `PAGE`: a merged
-        // page is many pages' worth and page 0 may already have been cut.
+        // Release whole pages by REAL rows, not by dividing through `PAGE`: a
+        // merged page is many pages' worth, page 0 may already have been cut,
+        // and the page being written holds `fill` of its capacity.
         let mut head = self.head + n;
         let mut release = 0usize;
-        while release < self.pages.len() && head >= self.pages[release].rows() {
-            head -= self.pages[release].rows();
+        while release < self.pages.len() && head >= self.rows_at(release) {
+            head -= self.rows_at(release);
             release += 1;
         }
         if release > 0 {
@@ -261,8 +334,14 @@ impl<R: PageRows> Pages<R> {
         // a copy of what survives it, and it happens at most once per `PAGE`
         // rows dropped.
         if self.head >= PAGE {
+            let cut = self.head;
             let rows = self.pages[0].rows();
-            self.pages[0] = self.pages[0].slice_rows(self.head, rows);
+            self.pages[0] = self.pages[0].slice_rows(cut, rows);
+            // If page 0 is also the page being written, the cut took `cut` real
+            // rows off the front of it as well as `cut` of its capacity.
+            if self.pages.len() == 1 {
+                self.fill -= cut;
+            }
             self.head = 0;
         }
     }
@@ -277,22 +356,38 @@ impl<R: PageRows> Pages<R> {
         if self.len == 0 {
             self.pages.clear();
             self.head = 0;
+            self.fill = 0;
             return;
         }
-        // By rows, for the same reason `drop_front` is: pages are not all the
-        // same size once the settled ones have been merged.
+        // By REAL rows, for the same reason `drop_front` is: pages are not all
+        // the same size once the settled ones have been merged.
         let stored = self.stored();
         let mut before = 0usize;
         let mut last = 0usize;
-        while last < self.pages.len() && before + self.pages[last].rows() < stored {
-            before += self.pages[last].rows();
+        while last < self.pages.len() && before + self.rows_at(last) < stored {
+            before += self.rows_at(last);
             last += 1;
         }
         self.pages.truncate(last + 1);
         let tail = stored - before;
-        if tail < self.pages[last].rows() {
-            self.pages[last] = self.pages[last].slice_rows(0, tail);
+        // The rejected rows are not cut out of the page; `fill` simply stops
+        // ahead of them and they become dead. They hold real keys rather than
+        // zeros, which is sound for the same reason the zero rows are: a dead
+        // row is masked to `-inf`, so it is multiplied by a probability of
+        // exactly zero, and the only thing that turns that into a NaN is an
+        // infinity, which a key is not.
+        //
+        // The capacity is re-opened to a whole number of `PAGE`s, because when
+        // this page settles it must satisfy the invariant that every page but
+        // the first and the last is one. That is also what keeps a MERGED page
+        // from being carried as thousands of dead columns after a rollback into
+        // it: `next_multiple_of` cuts it back to just past the kept rows.
+        let cap = self.pages[last].rows();
+        let want = tail.next_multiple_of(PAGE).max(PAGE).min(cap);
+        if want < cap {
+            self.pages[last] = self.pages[last].slice_rows(0, want);
         }
+        self.fill = tail;
     }
 
     /// The rows as one value, in order, or `None` while empty.
@@ -344,23 +439,29 @@ impl<R: PageRows> Pages<R> {
         // the one it splits is copied, and only that one.
         let mut pages = Vec::new();
         let mut left = rows;
-        for p in &self.pages {
+        for (i, p) in self.pages.iter().enumerate() {
             if left == 0 {
                 break;
             }
-            let n = p.rows();
-            if n <= left {
-                pages.push(p.clone());
-                left -= n;
+            // REAL rows: the page being written is a capacity, and sharing its
+            // dead half would hand the other store rows that are not keys.
+            let take = self.rows_at(i).min(left);
+            pages.push(if take == p.rows() {
+                p.clone()
             } else {
-                pages.push(p.slice_rows(0, left));
-                left = 0;
-            }
+                p.slice_rows(0, take)
+            });
+            left -= take;
         }
+        // Every page the share holds is exactly its real rows, so the share
+        // starts with no capacity: its first append opens a fresh page rather
+        // than writing into a buffer the parent may also be writing.
+        let fill = pages.last().map(|p| p.rows()).unwrap_or(0);
         Some(Self {
             pages,
             head: 0,
             len: rows,
+            fill,
         })
     }
 
@@ -373,9 +474,14 @@ impl<R: PageRows> Pages<R> {
             "{} pages, over the {MAX_PAGES} the read is sized for",
             self.pages.len()
         );
+        assert!(
+            self.pages.is_empty() || self.fill <= self.pages[self.pages.len() - 1].rows(),
+            "fill {} is past the page being written",
+            self.fill
+        );
         let mut total = 0usize;
         for (i, p) in self.pages.iter().enumerate() {
-            let (n, w) = (p.rows(), p.width());
+            let (n, w) = (self.rows_at(i), p.width());
             assert_eq!(w, width, "page {i} is {w} wide");
             assert!(n > 0, "page {i} is empty");
             // The appends fill before they grow, so only the page being filled
@@ -392,14 +498,14 @@ impl<R: PageRows> Pages<R> {
         assert_eq!(
             total,
             stored,
-            "{} pages hold {total} rows against {stored} stored",
+            "{} pages hold {total} REAL rows against {stored} stored",
             self.pages.len()
         );
         assert!(
-            self.pages.is_empty() || self.head < self.pages[0].rows(),
-            "head {} is past page 0's {} rows",
+            self.pages.is_empty() || self.head < self.rows_at(0),
+            "head {} is past page 0's {} real rows",
             self.head,
-            self.pages[0].rows()
+            self.rows_at(0)
         );
     }
 }
@@ -420,6 +526,38 @@ impl<B: Backend> PageRows for Tensor<B, 2> {
 
     fn concat(parts: Vec<Self>) -> Self {
         Tensor::cat(parts, 0)
+    }
+
+    fn zeroed(&self, rows: usize) -> Self {
+        // Built from a row of THIS tensor rather than from `Tensor::zeros`, so
+        // the page keeps the dtype the lane holds its cache at. A BF16 cache
+        // that grew an f32 page would be a widening the narrow lane spent a
+        // whole change removing, and it would not show up as a type error.
+        let w = self.dims()[1];
+        self.clone()
+            .slice([0..1, 0..w])
+            .zeros_like()
+            .repeat_dim(0, rows)
+    }
+
+    fn write_rows(&mut self, at: usize, src: Self) {
+        let [n, w] = src.dims();
+        // Out of the field first: `self.clone().slice_assign(..)` leaves two
+        // live references to the same buffer and Burn answers that by copying
+        // the whole page to write one row of it -- which is the allocation this
+        // whole layout exists to remove.
+        //
+        // The placeholder is a HANDLE CLONE of `src` and not `Tensor::empty`,
+        // and that is not a style choice. `Tensor::empty` is an allocation, and
+        // an allocation is precisely what a graph capture cannot contain: the
+        // one GPU page that escaped a 21-layer capture came out of exactly this
+        // call, through `ComputeClient::empty` -> `Command::reserve`, at a size
+        // that was not even stable between runs (32768 bytes, then 16384 --
+        // it is a POOL page, so its size says nothing about the tensor that
+        // asked for it). Cloning a tensor that is already alive moves no bytes
+        // and takes no page. It is overwritten on the next line.
+        let dst = std::mem::replace(self, src.clone());
+        *self = dst.slice_assign([at..at + n, 0..w], src);
     }
 }
 
@@ -745,6 +883,49 @@ impl PageRows for Fp4Rows {
             scales: Tensor::cat(parts.iter().map(|p| p.scales.clone()).collect(), 0),
             width,
         }
+    }
+
+    fn zeroed(&self, rows: usize) -> Self {
+        // Zero codes and zero scales dequantize to zero: E2M1 code 0 is +0.0
+        // and an E4M3 scale byte of 0 is 0.0, so a dead row reaches the
+        // attention products as zeros whichever half of the pair is read. That
+        // is exactly what `PagedKv`'s tail pad used to build with a `cat`.
+        let cw = self.codes.dims()[1];
+        let sw = self.scales.dims()[1];
+        Self {
+            codes: self
+                .codes
+                .clone()
+                .slice([0..1, 0..cw])
+                .zeros_like()
+                .repeat_dim(0, rows),
+            scales: self
+                .scales
+                .clone()
+                .slice([0..1, 0..sw])
+                .zeros_like()
+                .repeat_dim(0, rows),
+            width: self.width,
+        }
+    }
+
+    fn write_rows(&mut self, at: usize, src: Self) {
+        assert_eq!(
+            src.width, self.width,
+            "a {}-wide NVFP4 row into a {}-wide page",
+            src.width, self.width
+        );
+        let n = src.codes.dims()[0];
+        let cw = self.codes.dims()[1];
+        let sw = self.scales.dims()[1];
+        // Both halves, and both taken out of the struct first -- see the dense
+        // implementation for why a clone would copy the page, and for why the
+        // placeholder is a handle clone of the incoming rows rather than
+        // `Tensor::empty`, which allocates.
+        let codes = std::mem::replace(&mut self.codes, src.codes.clone());
+        self.codes = codes.slice_assign([at..at + n, 0..cw], src.codes);
+        let scales = std::mem::replace(&mut self.scales, src.scales.clone());
+        self.scales = scales.slice_assign([at..at + n, 0..sw], src.scales);
     }
 }
 
