@@ -769,6 +769,31 @@ struct Pending<B: Backend> {
     rows: usize,
 }
 
+impl AttnCache<Bk> {
+    /// DEBUG: host-side absolute sums of everything this cache carries to the
+    /// next decode step, in the order (K pages, V pages, k_pre, v_pre).
+    ///
+    /// Exists to name WHICH carried buffer a repeated graph replay moves. It
+    /// syncs and reads back, so it belongs behind a flag and nowhere near a
+    /// timed path.
+    pub fn debug_carry_sums(&self, dev: &burn::backend::cuda::CudaDevice) -> [f64; 4] {
+        fn s(t: Tensor<Bk, 2>) -> f64 {
+            t.abs()
+                .sum()
+                .into_data()
+                .convert::<f32>()
+                .to_vec::<f32>()
+                .expect("device readback")[0] as f64
+        }
+        [
+            s(self.k.materialize(dev)),
+            s(self.v.materialize(dev)),
+            s(self.k_pre.clone()),
+            s(self.v_pre.clone()),
+        ]
+    }
+}
+
 impl<B: Backend> AttnCache<B> {
     /// Keys retained — *not* the sequence length, because a windowed layer
     /// forgets.

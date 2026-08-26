@@ -7101,18 +7101,30 @@ fn main() -> Result<()> {
     // pass and against the graph's own node count. Nothing is compared across
     // runs and no figure here is paired with one from another process.
     //
-    // The extra replays are safe because every kernel in the region writes to a
-    // buffer distinct from its inputs -- there is no read-modify-write on the
-    // decode path -- so replaying with unchanged inputs recomputes the same
-    // values into the same places. It is idempotent, not merely harmless.
+    // The extra replays are idempotent, and that took a fix in the ALLOCATOR
+    // rather than in this file. A kernel here does write to a buffer distinct
+    // from its inputs -- there is no read-modify-write on the decode path --
+    // but that is a statement about tensors and a graph records POINTERS. A
+    // buffer that is live when the region opens and dies inside it went back to
+    // the pool mid-region, and the pool handed the same slice to a later node
+    // of the SAME region; so replay 2 read what replay 1 had written over its
+    // own input. Measured at `INK_LAYERS=0:2`, one extra replay moved layer 0's
+    // `k_pre` from 971.4 to 27207.1 (an absolute sum, 27x) while the capture
+    // step's own logits stayed identical to the digit -- the damage is invisible
+    // until the NEXT step reads the state this one was supposed to carry.
+    // `CudaServer::capture_hold` holds every bound buffer for the graph's life,
+    // which is what a recorded pointer requires, and repeated replay agrees with
+    // the eager arm to the printed digit at 0:2 and 0:21 through 16 replays.
     //
-    // WHAT IT DOES NOT SHOW: that the graph is replayable on a LATER step. It
-    // is not. A graph pins the exact device pointers seen at capture, and this
-    // pass's intermediates go back to the pool when the pass ends. Worse, the
-    // attention half is not even shape-stable: `Pages::append` re-`concat`s the
-    // KV tail page into a bigger buffer every step. Making the region
-    // replayable across steps is a separate piece of work; this measures what
-    // that work would be worth.
+    // WHAT IT STILL DOES NOT SHOW: that the graph is replayable on a LATER step.
+    // The shapes no longer drift -- `Pages::append` writes the tail page in
+    // place now -- but the region still bakes per-step VALUES into its launches:
+    // the KV write row (`kvpages::Pages::append`'s `slice_assign` offset), the
+    // fused attention's `q0`/`lo`/`hi`/`base` scalars and the `eff` width of the
+    // relative projection, and the log-scaling `tau`. Each is a host constant at
+    // capture. Making the region replayable across steps means making every one
+    // of them a value a kernel dereferences; this measures what that work would
+    // be worth.
     let graph_on = std::env::var("INK_GRAPH").ok().as_deref() == Some("1");
     let graph_step: usize = std::env::var("INK_GRAPH_STEP")
         .ok()
@@ -8673,6 +8685,32 @@ fn main() -> Result<()> {
             }
             <Bk as burn::tensor::backend::Backend>::sync(&dev).expect("sync after the timed replays");
             graph_report = Some((nodes, t_ly.elapsed().as_secs_f64(), per_rep));
+        }
+        // DEBUG (`INK_GRAPH_HASH=1`): the absolute sums of every buffer a
+        // decode step hands to the next one. Printed AFTER the replays, so a
+        // run at `INK_GRAPH_REPS=0` and one at `INK_GRAPH_REPS=1` differ in
+        // exactly the buffer a repeated replay moves -- which is the question,
+        // and it is not answerable from the logits, which only say that
+        // something downstream changed.
+        if std::env::var("INK_GRAPH_HASH").ok().as_deref() == Some("1") && is_decode {
+            for (l, c) in caches.iter().enumerate() {
+                let s = c.attn.debug_carry_sums(&dev);
+                let f = |t: &BT<Bk, 2>| -> f64 {
+                    t.clone()
+                        .abs()
+                        .sum()
+                        .into_data()
+                        .convert::<f32>()
+                        .to_vec::<f32>()
+                        .expect("device readback")[0] as f64
+                };
+                let a = f(&c.attn_sconv);
+                let m = c.mlp_sconv.as_ref().map(f).unwrap_or(0.0);
+                println!(
+                    "  HASH step {step} layer {l}: k {:.4} v {:.4} kpre {:.4} vpre {:.4} asc {:.4} msc {:.4}",
+                    s[0], s[1], s[2], s[3], a, m
+                );
+            }
         }
         let t_layers = t_ly.elapsed().as_secs_f64();
         // The baseline must be a CLEAN decode step: not the capture pass, whose
