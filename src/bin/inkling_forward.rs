@@ -12525,12 +12525,44 @@ fn main() -> Result<()> {
         // "0.4 0.4 0.0" and every question worth asking of it is unanswerable.
         let ms = |v: f64| v * 1e3;
         // Two kinds of number, kept apart, because with the residual stream on the
-        // device they no longer measure the same thing. Everything above the sync
-        // line is the HOST describing work; the device time is the sync line. A
-        // per-stage "seconds" column would now report how fast the CPU can enqueue,
-        // and it would look wonderful.
+        // device they no longer measure the same thing.
+        //
+        // THIS COLUMN IS NOT ENQUEUE. It said "HOST, enqueue only (nothing in the
+        // loop synchronises)" until 2026-08-27, and that was measurably false in
+        // the direction that flatters the numbers. An anchored nsys measurement
+        // -- median over the last 12 warm intervals, cut at `ann_scan_kernel`,
+        // head-only 0:21, per decode step, one node -- puts about 22.7 ms of the
+        // ~37 ms layer-loop bracket in `cuEventSynchronize` ON THE LAUNCHING
+        // THREAD, at six points spread through the loop at 5.4, 12.3, 17.2, 22.6,
+        // 28.9 and 34.1 ms, each 2.7-4.9 ms. So the bracket is roughly 61%
+        // BLOCKED DEVICE WAIT and 39% actual enqueue, and the same measurement
+        // puts device busy at 38.4 ms of a 47.3 ms step -- 81%, not the 25% the
+        // old label implied.
+        //
+        // ITS OWN TELL WAS VISIBLE FOR MONTHS. The bracket moved 0.6-0.7 ms on
+        // both nodes when only a memory LAYOUT changed, and a bracket that
+        // responds to a layout change is not measuring how fast a CPU can
+        // describe work. Anybody who noticed that could have caught this.
+        //
+        // WHERE THE SIX BLOCKS COME FROM, and it is not a data dependency:
+        // cubecl's drop queue. `Command::kernel` calls
+        // `drop_queue.flush(|| Fence::new(...))` whenever `should_flush()`, and
+        // `PendingDropQueue::flush` syncs the fence from the PREVIOUS cycle --
+        // so the host stalls until the device has drained to a point one batch
+        // back, needing no value from it, purely so staging buffers two batches
+        // old can be freed. The policy's count threshold is 64 staged
+        // allocations and a decode step stages about 483 of them (one per launch
+        // binding a ranked tensor, carrying its shapes and strides), which is
+        // about seven flushes a step against the six the profile found. That is
+        // queue-depth SERIALISATION, not dependency, and therefore recoverable:
+        // `CUBECL_DROP_FLUSH_COUNT` raises the threshold, and a captured region
+        // suppresses the flush outright while a replayed one makes no launches
+        // to trigger it.
         println!("  where the time went, ms:");
-        println!("    HOST, enqueue only (nothing in the loop synchronises):");
+        println!(
+            "    HOST-THREAD time in the loop -- enqueue AND blocked device wait \
+             (~61% of this bracket was the second when last measured; see the comment):"
+        );
         println!(
             "      embed + upload  {:9.1}   (the one host->device crossing per pass)",
             ms(t_embed)
