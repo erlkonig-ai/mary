@@ -1827,6 +1827,29 @@ type T2 = burn::tensor::Tensor<Bk, 2>;
 fn argmax_row_dev(row: T2) -> usize {
     let [rows, _] = row.dims();
     debug_assert_eq!(rows, 1, "argmax_row_dev reads exactly one row");
+    // `INK_TOPB=b` prints this row's b most likely token ids. Instrument only,
+    // and deliberately the expensive way (read the whole row back): it exists to
+    // supply the SAME-POSITION candidate set for the token-tree union arm, which
+    // is a handful of passes, not a serving path. The doc above explains why the
+    // model itself must never do this.
+    if let Some(b) = std::env::var("INK_TOPB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        if b > 0 {
+            let d = row.clone().into_data();
+            let vals: Vec<f32> = d.iter::<f32>().collect();
+            let mut idx: Vec<usize> = (0..vals.len()).collect();
+            idx.sort_unstable_by(|&x, &y| {
+                vals[y]
+                    .partial_cmp(&vals[x])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(x.cmp(&y))
+            });
+            idx.truncate(b);
+            println!("  INK_TOPB {idx:?}");
+        }
+    }
     row.argmax(1)
         .into_data()
         .iter::<i64>()
@@ -5950,6 +5973,33 @@ fn main() -> Result<()> {
     let repeat = std::env::var("INK_REPEAT")
         .map(|v| v == "1" || v == "on")
         .unwrap_or(false);
+    // `INK_FORCE_IDS=<file>` makes the decode loop CONSUME a fixed token list
+    // instead of its own argmax. It exists because this runtime disagrees with
+    // ITSELF on 8.55% of argmax positions between two runs of the same binary,
+    // and a different token routes to different experts, so byte counts and
+    // expert-union counts were not comparable run to run. With the sequence
+    // pinned, routing is a function of the input alone and a measurement can be
+    // repeated. The tokens are i64 little-endian, the same format the prompt
+    // files use, so a document's own continuation can be its forced sequence.
+    //
+    // MEASUREMENT ONLY. The generated text is whatever the file says, so this
+    // lane produces no continuation of the model's own and its acceptance
+    // statistics are meaningless -- which is why it refuses INK_SPEC below.
+    let force_ids: Vec<usize> = match std::env::var("INK_FORCE_IDS").ok() {
+        None => Vec::new(),
+        Some(path) => {
+            let raw =
+                std::fs::read(&path).with_context(|| format!("INK_FORCE_IDS: reading {path}"))?;
+            anyhow::ensure!(
+                raw.len() % 8 == 0 && !raw.is_empty(),
+                "INK_FORCE_IDS wants i64 little-endian tokens; {path} is {} bytes",
+                raw.len()
+            );
+            raw.chunks_exact(8)
+                .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as usize)
+                .collect()
+        }
+    };
     anyhow::ensure!(
         !repeat || !kv,
         "INK_REPEAT wants the uncached lane: with a KV cache a \
@@ -5980,6 +6030,22 @@ fn main() -> Result<()> {
         !repeat || spec_k == 0,
         "INK_REPEAT and INK_SPEC measure different things"
     );
+    anyhow::ensure!(
+        force_ids.is_empty() || spec_k == 0,
+        "INK_FORCE_IDS and INK_SPEC are exclusive: speculation accepts on argmax \
+         match, and a forced commit makes that comparison meaningless"
+    );
+    anyhow::ensure!(
+        force_ids.is_empty() || !repeat,
+        "INK_FORCE_IDS and INK_REPEAT are exclusive: one pins the sequence, the \
+         other refuses to grow it"
+    );
+    if !force_ids.is_empty() {
+        println!(
+            "  forced sequence    : INK_FORCE_IDS -- {} tokens, decode is DETERMINISTIC",
+            force_ids.len()
+        );
+    }
     anyhow::ensure!(
         spec_k == 0 || pipe_spec.is_some(),
         "INK_SPEC needs the pipe: the drafts are made on the tail and fed by the head"
@@ -6798,12 +6864,29 @@ fn main() -> Result<()> {
             // sequence: a batch of the same token routes to the same eight experts
             // and would price the expert stream once for the whole batch, which is
             // the one thing the probe exists to find out.
-            let mut lcg = 0x9E3779B97F4A7C15u64 ^ (step as u64).wrapping_mul(0x100000001B3);
-            for _ in 1..width {
-                lcg = lcg
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                f.push(((lcg >> 33) as usize) % t.vocab_size);
+            // `INK_WIDTH_TOKENS=id,id,...` replaces the LCG filler with CHOSEN
+            // tokens, which is what turns one mechanism into three arms:
+            //   unset            -> LCG, independent routing, the UPPER bound
+            //   next real tokens -> what linear depth costs (sequential positions)
+            //   top-b candidates -> what a token TREE costs (one position, alternatives)
+            // The LCG default is unchanged, so the existing width probe is untouched.
+            let chosen: Option<Vec<usize>> = std::env::var("INK_WIDTH_TOKENS").ok().map(|v| {
+                v.split(',')
+                    .filter_map(|x| x.trim().parse::<usize>().ok())
+                    .collect()
+            });
+            if let Some(c) = chosen.filter(|c| !c.is_empty()) {
+                for j in 1..width {
+                    f.push(c[(j - 1) % c.len()] % t.vocab_size);
+                }
+            } else {
+                let mut lcg = 0x9E3779B97F4A7C15u64 ^ (step as u64).wrapping_mul(0x100000001B3);
+                for _ in 1..width {
+                    lcg = lcg
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    f.push(((lcg >> 33) as usize) % t.vocab_size);
+                }
             }
             (f, ids.len() - 1)
         } else {
@@ -9728,7 +9811,11 @@ fn main() -> Result<()> {
         // the argmax, so pushing it here keeps its `ids` identical to the head's
         // without a second thing on the wire to get out of step.
         if is_tail && gen_steps > 0 && !repeat {
-            ids.push(best);
+            ids.push(if force_ids.is_empty() {
+                best
+            } else {
+                force_ids[(step - 1) % force_ids.len()]
+            });
         }
 
         let t_tail_host = t_tl.elapsed().as_secs_f64();
@@ -10169,7 +10256,11 @@ fn main() -> Result<()> {
                 // read as a plausible context length rather than as a failure,
                 // which is the same trap the slot batch already sprang once.
                 if !slot_lane || (answered && (ncohorts == 1 || answer_coh == 0)) {
-                    ids.push(best);
+                    ids.push(if force_ids.is_empty() || step == 0 {
+                        best
+                    } else {
+                        force_ids[(step - 1) % force_ids.len()]
+                    });
                 }
             }
         }
