@@ -955,11 +955,45 @@ pub fn swizzle_w4a16_device<R: Runtime>(
 /// only its COUNTERS above are usable. Every time figure here comes from
 /// `w4a16_swz_grid`, not from `ncu`.
 ///
+/// ## Confirmed IN-MODEL, not only on the probe
+///
+/// `bench-decode.sh -n 4 --gen 12 --layers 0:21`, `INK_KV=1`, `ctx3732.ids`
+/// (3744 ctx), one GB10 holding layers 0..21, arms INTERLEAVED, per DECODE STEP,
+/// 11 warm passes a rep, CORPUS-UNBOUNDED (the right shape for a question about a
+/// kernel -- its cost does not read the text). One binary throughout, identical
+/// sha256 on all three arms; they differ only by environment:
+///
+/// ```text
+///   arm      reps (ms/step)             median     min
+///   off      47.0 47.2 48.0 47.4        47.300    47.000   both sinks row-major
+///   rule     46.1 46.4 46.2 46.8        46.300    46.100   `swizzle_pays`
+///   forced   46.5 48.0 47.1             47.100    46.500   both sinks permuted
+/// ```
+///
+/// The rule is worth 1.0 ms a step; the harness scores it +2.16% and the two
+/// bands do NOT overlap -- `rule`'s worst rep (46.8) beats `off`'s best (47.0).
+/// That is the claim.
+///
+/// `forced` is NOT a second claim. The harness scores it +0.32% against `off`
+/// and says so itself: "SMALLER THAN THE SPREAD. Not a result." It is consistent
+/// with permuting `down` giving the gain back, which is what a 0.88x arm should
+/// do, but this run cannot distinguish it from `off`; it is a direction, not a
+/// measurement, and it landed three reps rather than four.
+///
+/// TWO STAMPS THIS RUN CARRIES, because a number is its framing. The harness
+/// marked it UNGATED -- contention appeared mid-run, and the likeliest source is
+/// the author's own polling of the box while it ran, which is a lesson about
+/// watching a gated benchmark, not about the kernel. And the tree was DIRTY at
+/// `20a0b06`, so the commit does not identify what ran; the shared binary is
+/// what makes the comparison internally valid. A clean re-run would strengthen
+/// it. The kernel-level table above, where the mechanism comes from, does not
+/// depend on this run.
+///
 /// ## What it says about the four consumers
 ///
 /// * sink `gate_up` `[8192, 4096]`, 1024 cubes: the permutation WINS 1.13-1.22x.
-///   `w4a16_bind` currently declines it. That is the one place this file is
-///   leaving measured speed on the table.
+///   `w4a16_bind` used to decline it, on the weight-kind rule; `swizzle_pays`
+///   now takes it.
 /// * sink `down` `[4096, 2048]`, 512 cubes: LOSES 0.88x. Declining it is right.
 /// * the head `[201024, 4096]`, 25128 cubes: WINS 1.24x, and is declined for a
 ///   CORRECTNESS reason (the `ann_logits` seam), not this one.
