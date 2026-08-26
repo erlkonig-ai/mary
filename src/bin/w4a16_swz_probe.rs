@@ -25,6 +25,23 @@
 //! over the run lands on all of them equally; the first two reps are discarded;
 //! every rep is printed, and the spread with it.
 //!
+//! # DO NOT RUN THIS AT A SINK SHAPE. It measures the L2 there, not the kernel.
+//!
+//! The four arms SHARE BUFFERS: `stream ceiling` reads the same `b_row` /
+//! `bs_row` that `row-major` reads, immediately before it, and the two plane
+//! sets together are 36 MiB against a 24 MiB L2. So at a shape whose table fits
+//! in L2 the row-major arm runs L2-WARM every rep and the two swizzled arms run
+//! L2-COLD every rep, and the gap between them is an artifact of the arm ORDER.
+//! At `[8192, 4096]` it duly reports 0.176 against 0.306 ms -- a 74% "loss"
+//! that reverses under any harness that treats the arms alike. `main` refuses
+//! such a shape rather than printing it; `INK_SWZ_FORCE=1` overrides, and then
+//! the number is a cache measurement and must be labelled one.
+//!
+//! At the head's 463 MiB nothing is resident, the confound cannot occur, and the
+//! table this probe produced there stands. For anything smaller use
+//! `w4a16_swz_grid`, which rotates buffers and pipelines launches for exactly
+//! this reason.
+//!
 //! `INK_SWZ_N` / `INK_SWZ_K` set the shape (default the unembedding's
 //! `[201024, 4096]`), `INK_SWZ_M` the padded row count (default 16, one m-tile,
 //! which is decode), `INK_SWZ_REPS` the rep count (default 8).
@@ -91,6 +108,23 @@ fn main() {
     let codes = n * k / 2;
     let scales = n * (k / 16);
     let bytes = codes + scales;
+
+    // See the header. Both plane sets must exceed L2 by a margin or the arm
+    // ORDER decides the answer. GB10's L2 is 24 MiB and this holds two of them,
+    // so the table has to clear it on its own before the interleave is honest.
+    const L2_BYTES: usize = 24 << 20;
+    if 2 * bytes < 3 * L2_BYTES && std::env::var("INK_SWZ_FORCE").as_deref() != Ok("1") {
+        eprintln!(
+            "w4a16_swz_probe: REFUSING [{n}, {k}] -- its two plane sets are {:.1} MiB against a \n\
+             {} MiB L2, so `stream ceiling` leaves the row-major arm warm and the swizzled arms \n\
+             cold, and the interleave measures the arm order. Use `w4a16_swz_grid` at this shape \n\
+             (rotating buffers, pipelined launches). `INK_SWZ_FORCE=1` overrides, and then the \n\
+             result is a CACHE measurement and must be labelled one.",
+            2.0 * bytes as f64 / (1u64 << 20) as f64,
+            L2_BYTES >> 20,
+        );
+        std::process::exit(2);
+    }
 
     println!(
         "shape [{n}, {k}] m_pad {m_pad}: codes {:.3} GiB, scales {:.3} GiB, total {:.3} GiB",

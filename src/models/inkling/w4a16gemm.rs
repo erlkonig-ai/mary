@@ -830,10 +830,244 @@ pub fn swizzle_w4a16_device<R: Runtime>(
 /// rather than deleted: a bandwidth figure is a property of a SHAPE, and this
 /// one was carried across a 25x difference in cube count without anybody
 /// noticing that the framing rule had been dropped.
+///
+/// # WHY the multiplier is shape-dependent, and what the shape actually is
+/// # (2026-08-26)
+///
+/// The retraction above is right that it lost and right about the lesson. It is
+/// wrong about the UNIT: "the sinks" is not a shape, it is two shapes, and they
+/// fall on opposite sides of the line. `w4a16_swz_grid` is the A/B neither
+/// earlier measurement had -- rotating buffers so neither arm is the L2-warm
+/// one, 20 pipelined launches to ONE sync so the host round trip is not the
+/// floor, arms round-robined, min of 6 rounds after 2 discarded, `m_pad` 16,
+/// one GB10 box, GB/s over the weight planes only, `ratio` = row-major time /
+/// swizzled time:
+///
+/// ```text
+///   k=2048     512 cubes   70.7 ->  62.0 GB/s   0.88   <- sink `down`, ACTUAL
+///             1024         92.6 -> 100.5        1.09
+///            25128        116.7 -> 133.0        1.14
+///   k=4096     256         49.0 ->  34.3        0.70
+///              512         77.9 ->  65.7        0.84
+///              768         90.7 ->  93.0        1.03   <- crossover
+///             1024         94.3 -> 106.6        1.13   <- sink `gate_up`, ACTUAL
+///             2048         90.9 -> 113.5        1.25   <- dense `g`/`u`
+///            25128        107.3 -> 132.6        1.24   <- the head
+///   k=16384    512         46.9 ->  58.4        1.25   <- dense `down`, ACTUAL
+///             1024         66.4 ->  95.1        1.43
+///             2048         67.8 ->  98.3        1.45
+/// ```
+///
+/// TWO knobs, not one. The multiplier rises monotonically with CUBE COUNT and
+/// crosses 1.0 near 750 cubes -- 0.65 of a wave, a wave being 48 SMs x 24 blocks
+/// = 1152 single-warp cubes -- and the value it saturates to is set by K:
+/// ~1.10 at k=2048, ~1.24 at k=4096, ~1.45 at k=16384. Cube count alone does not
+/// decide it, which is why `down` at 512 cubes LOSES for the sinks (k=2048) and
+/// WINS for the dense MLP (k=16384) at the identical cube count.
+///
+/// That cube count is the cause and not a correlate is the one thing a sweep
+/// over `n` cannot show, so it was isolated: same `[4096, 4096]` table, same
+/// bytes, only the m-tile count varied, so only the warps moved.
+///
+/// ```text
+///   m_pad  16 ->  512 cubes  0.86       m_pad  64 -> 2048 cubes  1.15
+///   m_pad  32 -> 1024 cubes  1.09       m_pad 128 -> 4096 cubes  1.20
+/// ```
+///
+/// ## The mechanism, off `ncu`
+///
+/// Load sectors and requests per warp per k-tile, at both sink shapes, from
+/// `l1tex__t_{requests,sectors}_pipe_lsu_mem_global_op_ld.sum` over
+/// `cubes * k_tiles`. The decomposition closes to the integer on all three
+/// arms and both shapes, which is why it can be read as a mechanism and not as
+/// a correlation:
+///
+/// ```text
+///                             requests   sectors   =    A  + codes + scales
+///   row-major                     8         64        4x8=32   2x8    2x8
+///   swizzled, scales permuted     7         35        4x8=32   2x1    1x1
+///   swizzled, scales row-major    7         42        4x8=32   2x1    1x8
+/// ```
+///
+/// So the permutation is worth 8x on each B stream -- 32 sectors of B become 3
+/// -- and only **1.83x on the kernel**, because A is 32 of the 64 sectors and
+/// the permutation does not touch it. After permuting B, A is 32 of the
+/// remaining 35: **91% of the swizzled kernel's sector traffic is now the
+/// activation.** PARKED, not a task, and it wants this rule shipped and measured
+/// in-model first: A's floor is 16 sectors per warp-k-tile (one k-tile of A is
+/// 16 rows x 16 k x 2 B = 512 B), so a fragment-ordered A would cut 35 -> 19, a
+/// further 1.84x, on top of B's 1.83x. At decode there is ONE m-tile, so every
+/// cube reads the identical A -- 16 x k x 2 bytes, 128 KiB at k = 4096 -- and a
+/// per-step permutation of that is ~0.5 us against a 0.2 ms kernel. It is the
+/// largest single number here and it is deliberately not being acted on yet.
+///
+/// And the row-major form's "wasted" seven-eighths is not waste, which is the
+/// part that decides the sign. A 32-byte sector holds eight packed words = FOUR
+/// k-tiles of one weight row, so row-major's burst of 8 parallel sector requests
+/// is an incidental 4-deep PREFETCH: it misses once and then hits L1 for three
+/// k-tiles (`l1tex__t_sector_hit_rate` 93.9-94.7% against the swizzled form's
+/// 89.0-91.3%). The swizzled 64-byte block is consumed by the k-tile that
+/// fetched it, so it exposes a fresh 2-sector miss EVERY k-tile instead of an
+/// 8-sector burst every fourth -- four times as many exposed latencies at a
+/// quarter of the per-warp memory-level parallelism, on a k loop that is not
+/// unrolled and so has one k-tile of fetch outstanding at a time.
+///
+/// With enough resident warps the machine hides that with thread-level
+/// parallelism and the 8x request saving is all that is left, so the permutation
+/// wins. Below ~0.65 waves there is nothing to hide it with and the lost
+/// prefetch dominates. `smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active`
+/// says exactly that: at 1024 cubes the swizzled kernel stalls LESS on memory
+/// (13.2-13.8 against 16.7-17.1), and at 512 cubes that advantage is gone
+/// (16.6-18.7 against 16.7-17.0).
+///
+/// THREE candidates die here, and all three had been stated confidently.
+///
+/// * It is NOT occupancy. Both lanes report the identical achieved occupancy
+///   (44.4% at 1024 cubes, 22.1% at 512), both are capped by
+///   `launch__occupancy_limit_blocks` = 24 -- one warp per cube against 48 warp
+///   slots -- and below that by the grid itself.
+/// * It is NOT register pressure. The swizzled kernel uses FEWER registers, 36
+///   against 44 (38 with the scales left row-major).
+/// * It is NOT "a separate kernel tuned for the head's regime", which is what
+///   `20a0b06`'s commit message says and what this doc has to outlive, because a
+///   commit message cannot be corrected. Strip the comments and the two kernels
+///   differ by SIX LINES, all of them index arithmetic: same `CubeCount`, same
+///   `CubeDim::new_1d(32)`, same tile, same unrolls, same accumulator, same
+///   output store, 74 code lines against 79 (the permuted one is the LONGER).
+///   There is no tuning knob that differs, so there is nothing to re-tune; the
+///   whole difference in behaviour is the access pattern above.
+///
+/// One inference to retire with them, because it is the intuitive one and it is
+/// backwards: "at low occupancy there is less to hide latency with, so halving
+/// the request count matters MORE". Fewer requests is not more latency hiding.
+/// At low occupancy what is scarce is outstanding requests PER WARP, and the
+/// permutation removes them -- eight sectors in flight from one instruction
+/// become one. That is why the sign inverts downward and not upward.
+///
+/// A measurement caveat that belongs with the numbers: `ncu`'s CYCLE counts are
+/// inflated 2-7x for this kernel under kernel replay and reverse the ranking, so
+/// only its COUNTERS above are usable. Every time figure here comes from
+/// `w4a16_swz_grid`, not from `ncu`.
+///
+/// ## What it says about the four consumers
+///
+/// * sink `gate_up` `[8192, 4096]`, 1024 cubes: the permutation WINS 1.13-1.22x.
+///   `w4a16_bind` currently declines it. That is the one place this file is
+///   leaving measured speed on the table.
+/// * sink `down` `[4096, 2048]`, 512 cubes: LOSES 0.88x. Declining it is right.
+/// * the head `[201024, 4096]`, 25128 cubes: WINS 1.24x, and is declined for a
+///   CORRECTNESS reason (the `ann_logits` seam), not this one.
+/// * the dense MLP, which is the next candidate and the reason this was chased:
+///   `g`/`u` `[16384, 4096]` at 2048 cubes WINS 1.25x, and `down`
+///   `[4096, 16384]` at 512 cubes WINS 1.25x. Reasoning from the sinks as a
+///   proxy would have got the second one backwards -- it is at the same starved
+///   cube count that loses for the sinks, and it wins anyway because k is 8x
+///   longer.
+///
+/// A NOTE ON THE +25% ABOVE, which this does not reproduce for `gate_up`:
+/// `a109514 -> e30f22a` spans `de482cb`, which the comment in `w4a16_bind`
+/// already flags as bundling the sink permutation with moving the pool
+/// `memory_usage` barrier off the decode path; and at `a109514`
+/// `ann_owns_m1` was `ann_budget() > 0` with no `for_ann` gate, so NOTHING was
+/// permuted in that arm. The kernel-level A/B above varies the layout and
+/// nothing else.
+///
+/// Finally, the reason `w4a16_swz_probe` must not be run at a sink shape: its
+/// four arms share buffers -- the `stream ceiling` arm reads the same `b_row` /
+/// `bs_row` the row-major arm reads, immediately before it -- and the two plane
+/// sets are 36 MiB against a 24 MiB L2, so the row-major arm is L2-warm every
+/// rep and the swizzled arms are L2-cold every rep. It reports 0.176 against
+/// 0.306 ms there, a 74% "loss" that is an artifact of the arm ORDER. At the
+/// head's 463 MiB nothing is resident and the confound does not exist, which is
+/// why the table at the top of this doc stands.
 pub fn swizzle_w4a16() -> bool {
     std::env::var("INK_W4A16_SWZ")
         .map(|v| v != "0")
         .unwrap_or(true)
+}
+
+/// Does the `m16n8k16` permutation PAY at a `[n, k]` weight's decode grid?
+///
+/// The shipped policy used to be a WEIGHT-KIND rule -- `!for_ann`, i.e. never a
+/// sink -- derived from one shape. It is a CUBE-COUNT-AND-K rule, because that
+/// is what the crossover is a function of. Measured by `w4a16_swz_grid`
+/// (rotating buffers so neither arm is the L2-warm one, 20 pipelined launches to
+/// one sync so the host round trip is not the floor, arms round-robined, min of
+/// 6 rounds after 2 discarded, `m_pad` 16, one GB10 box, GB/s over the weight
+/// planes only). `ratio` is row-major time / swizzled time; above 1 it pays:
+///
+/// ```text
+///                 cubes    row -> swz GB/s   ratio      this predicate
+///   k=2048          512     70.7 ->  62.0     0.88   no   <- sink `down`
+///                  1024     92.6 -> 100.5     1.09   YES
+///                 25128    116.7 -> 133.0     1.14   YES
+///   k=4096          256     49.0 ->  34.3     0.70   no
+///                   512     77.9 ->  65.7     0.84   no
+///                   768     90.7 ->  93.0     1.03   no   (crossover, declined)
+///                  1024     94.3 -> 106.6     1.13   YES  <- sink `gate_up`
+///                  2048     90.9 -> 113.5     1.25   YES  <- dense `g`/`u`
+///                 25128    107.3 -> 132.6     1.24   YES  <- the head
+///   k=16384         512     46.9 ->  58.4     1.25   YES  <- dense `down`
+///                  1024     66.4 ->  95.1     1.43   YES
+///                  2048     67.8 ->  98.3     1.45   YES
+/// ```
+///
+/// MEASURED vs INTERPOLATED, because a threshold whose provenance is lost is a
+/// threshold nobody can revise:
+///
+/// * `cubes >= 1024` is measured to pay at every k measured (1.09, 1.13, 1.43).
+///   The bound is placed at 1024 and not at the ~750-cube crossover on purpose:
+///   1.03 is not worth a layout, and the crossover moves with k.
+/// * `cubes >= 512 && k >= 16384` is the single measured point at 1.25. It is
+///   NOT extrapolated downward -- k = 8192 at 512 cubes has never been measured,
+///   and the predicate declines it.
+/// * `k < 2048` is below the measured floor entirely and is declined.
+/// * 512..1024 cubes below k = 16384 is measured to LOSE (0.84-0.88).
+///
+/// WHY it is a function of these two things, since a threshold without its
+/// mechanism becomes folklore -- which is how the +25% came to be applied 25x
+/// outside its range in the first place:
+///
+/// A 32-byte sector holds eight packed words = FOUR k-tiles of one weight row,
+/// so the row-major form's burst of eight sector requests is an incidental
+/// 4-deep L1 PREFETCH: it misses once and then hits L1 for three k-tiles
+/// (`l1tex__t_sector_hit_rate` 94.7% against the permuted form's 89.0-91.3%).
+/// Its "wasted seven-eighths" was never waste, which is why every framing built
+/// on sector efficiency alone was going to mislead. The permuted form's 64-byte
+/// block is consumed by the k-tile that fetched it, so it exposes a fresh
+/// 2-sector miss EVERY k-tile instead of an 8-sector burst every fourth -- four
+/// times the exposed latencies at a quarter of the per-warp memory-level
+/// parallelism, on a k loop that is not unrolled.
+///
+/// So the trade is 8x fewer requests against a lost prefetch, and which side
+/// pays depends on whether there are enough resident warps to hide the latency
+/// the prefetch was covering. Cube count is that warp count: each cube is ONE
+/// warp, `launch__occupancy_limit_blocks` is 24, and 48 SMs x 24 = a 1152-cube
+/// wave, so the ~750-cube crossover is 0.65 of a wave. K is the second knob
+/// because a longer k loop spreads the L1 working set and makes the row-major
+/// form's reuse less viable, so the saturated multiplier grows with it: ~1.10 at
+/// k=2048, ~1.24 at k=4096, ~1.45 at k=16384. That is why dense `down` at 512
+/// cubes WINS 1.25x where sink `down` at 512 cubes LOSES 0.88x -- same starved
+/// geometry, opposite sign, because k is 8x longer.
+///
+/// ## Judged at the DECODE grid, deliberately
+///
+/// The layout is chosen once per weight at bind time and cannot vary per call,
+/// so it must be judged at one `m_pad`, and that one is decode's `MTILE`. This
+/// is safe in the direction that matters: cubes are `(m_pad / MTILE) * (n /
+/// NTILE)`, so a prefill has strictly MORE cubes than the decode this was
+/// judged at, and more cubes only moves further into the region where the
+/// permutation pays. A layout that is right for decode cannot be wrong for
+/// prefill on this axis.
+pub fn swizzle_pays(n: usize, k: usize) -> bool {
+    let cubes = n / NTILE;
+    if k < 2048 {
+        return false;
+    }
+    if cubes >= 1024 {
+        return true;
+    }
+    cubes >= 512 && k >= 16384
 }
 
 /// Does `INK_W4A16_SWZ=1` explicitly ask for the permutation where the shipped
@@ -1015,6 +1249,35 @@ mod swizzle_k16_tests {
     /// loses one byte and duplicates another and which no same-shaped output
     /// check would call an error. A non-square shape, so a transposed n/k
     /// cannot pass.
+    /// The predicate agrees with the measured table at the four real consumers.
+    ///
+    /// The pair that matters is the last two: the SAME 512 cubes, opposite
+    /// answers, because k differs 8x. A predicate that keyed on cube count alone
+    /// would get one of them wrong, and the sink is the one that was used as the
+    /// dense MLP's proxy.
+    #[test]
+    fn swizzle_pays_matches_the_measured_shapes() {
+        // head [201024, 4096], 25128 cubes, measured 1.24x.
+        assert!(swizzle_pays(201024, 4096));
+        // sink gate_up [8192, 4096], 1024 cubes, measured 1.13-1.22x.
+        assert!(swizzle_pays(8192, 4096));
+        // dense g/u [16384, 4096], 2048 cubes, measured 1.25x.
+        assert!(swizzle_pays(16384, 4096));
+
+        // sink down [4096, 2048], 512 cubes, measured 0.88x -- LOSES.
+        assert!(!swizzle_pays(4096, 2048));
+        // dense down [4096, 16384], the SAME 512 cubes, measured 1.25x -- WINS.
+        assert!(swizzle_pays(4096, 16384));
+
+        // Declined below the measured floor rather than extrapolated into it.
+        assert!(
+            !swizzle_pays(4096, 8192),
+            "512 cubes at k=8192 is unmeasured"
+        );
+        assert!(!swizzle_pays(2048, 4096), "256 cubes measured 0.70x");
+        assert!(!swizzle_pays(201024, 1024), "k below the measured floor");
+    }
+
     #[test]
     fn the_k16_permutation_is_a_bijection_on_both_planes() {
         let (n, k) = (16usize, 128usize);

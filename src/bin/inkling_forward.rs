@@ -2735,14 +2735,16 @@ fn w4a16_bind(
     // same run shows non-device residue falling 21.38 -> 17.67 ms. The two
     // halves are disentangled by this commit, which reverts only the first.
     let ann_owns_m1 = for_ann && ann_budget() > 0;
-    // Reason 2 above: never for the sinks, at any budget -- UNLESS explicitly
-    // demanded. `INK_W4A16_SWZ=1` forces the permutation on where the shipped
-    // policy declines it, so the cube-count crossover can be measured without a
-    // rebuild. We know ~25128 cubes wins and 512-1024 loses and nothing between;
-    // a policy that cannot be A/B'd is a policy that hardens into folklore, and
-    // folklore carried 25x outside its range is what caused this in the first
-    // place. It cannot override `ann_owns_m1`, which is correctness, not speed.
-    let grid_too_small = !for_ann && !k16::swizzle_w4a16_forced();
+    // Reason 2 above, now measured across the range instead of at one end.
+    // `swizzle_pays` is a CUBE-COUNT-AND-K predicate carrying its own table; the
+    // old `!for_ann` here was a weight-kind rule standing in for it, and it was
+    // wrong in both directions -- it declined sink `gate_up`, which wins
+    // 1.13-1.22x, and it would have been read across to the dense MLP, whose
+    // `down` wins 1.25x at the very cube count where the sink's `down` loses.
+    // `INK_W4A16_SWZ=1` still forces it on regardless, which is how the
+    // predicate itself gets A/B'd. It cannot override `ann_owns_m1`, which is
+    // correctness, not speed.
+    let grid_too_small = !k16::swizzle_pays(p.n, p.k) && !k16::swizzle_w4a16_forced();
     if !ann_owns_m1 && !grid_too_small && k16::swizzle_w4a16() && k16::swizzleable(p.n, p.k) {
         let (c, s) = k16::swizzle_w4a16_device(client, &p.codes, &p.scales, p.n, p.k);
         p.codes = c;
@@ -2771,7 +2773,7 @@ fn w4a16_bind(
             } else if ann_owns_m1 {
                 "row-major [n, k/8] (the approximate head owns m=1)"
             } else if grid_too_small {
-                "row-major [n, k/8] (permuting measured +25% at this shape)"
+                "row-major [n, k/8] (too few cubes at this k -- see swizzle_pays)"
             } else {
                 "row-major [n, k/8]"
             }
