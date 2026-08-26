@@ -1,5 +1,38 @@
 //! Token-TREE speculative decoding over Inkling's CHAINED MTP heads.
 //!
+//! # STATUS: NOT SHIPPED, AND THE LOGIC IS UNVERIFIED
+//!
+//! The measurement this module exists to make came back NEGATIVE — see the
+//! VERDICT section below — so nothing here is on any decode path and the
+//! tensor lane it drives (`INK_TREE`) is not a production configuration.
+//!
+//! What was actually established, stated exactly:
+//!
+//! * 35 host tests pass (topology, top-b, the drafting plan, the ancestor
+//!   masks, the accept walk, the rollback indices);
+//! * 5 device tests pass on the GB10, including a tree row measuring
+//!   bit-identical (`0e0`) to the row it would have been in a linear batch
+//!   holding only its own path;
+//! * three real bugs were found and fixed by that testing.
+//!
+//! What was NOT established: **the same-width numerics gate was never run.**
+//! An end-to-end run of `INK_TREE=b` against an `INK_WIDTH=n` reference on the
+//! same forced sequence — the comparison that holds the arithmetic fixed and
+//! varies only the tree — has not happened. It was skipped deliberately, on
+//! the grounds that verifying a path nobody is shipping is not worth contended
+//! GPU time, and that is a defensible trade only while it is written down.
+//!
+//! So the honest summary is **"showed no evidence of a bug"**, which is not
+//! the same as "verified", and the distinction is the whole reason this
+//! section exists. An unverified path that LOOKS tested — 40 green tests, a
+//! `0e0`, and a confident module header — is worse than one that looks
+//! untested, because the next reader trusts it.
+//!
+//! **Anyone reviving this must run that gate FIRST**, before trusting a line
+//! of it. `INK_FORCE_IDS` is the fixed reference it needs; the invocation is
+//! recorded in `inkling_forward.rs`'s header next to the note explaining why a
+//! one-row baseline cannot serve.
+//!
 //! Everything in this module is pure `std` arithmetic over indices and tokens:
 //! no backend, no tensors, no CUDA. That is deliberate. The parts of tree
 //! speculation that are easy to get subtly wrong — which head reads which row,
