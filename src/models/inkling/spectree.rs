@@ -77,6 +77,15 @@ use std::fmt;
 /// parent.
 pub const NO_PARENT: usize = usize::MAX;
 
+/// The widest depth-1 tree the expert-union measurement supports.
+///
+/// Not a hard limit — nothing enforces it — but the number to argue with
+/// before exceeding it. Past `b = 3` the marginal candidate costs more distinct
+/// experts than an extra SEQUENTIAL token does, and by `b = 6` the pass costs
+/// more than the 2.0 tokens a depth-1 tree can possibly accept. See
+/// [`TreeSpec::breadth`] for the table.
+pub const MAX_MEASURED_BREADTH: usize = 3;
+
 /// What can be wrong with a topology or a plan request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TreeError {
@@ -224,6 +233,48 @@ impl TreeSpec {
             return Err(TreeError::Empty);
         }
         TreeSpec::from_paths(&[vec![0; depth]])
+    }
+
+    /// The measured shape: `b` candidates for the NEXT token and nothing else.
+    ///
+    /// # Why this is narrow, and must stay narrow
+    ///
+    /// Measured on this checkpoint (layers 21:31, ctx 512, 8 warm passes), the
+    /// DISTINCT experts a verify pass gathers grow very differently for
+    /// same-position candidates than for sequential ones:
+    ///
+    /// ```text
+    /// width           2       3       4       6
+    /// linear      11.55   15.25   19.80   26.55
+    /// tree         8.55   11.00   16.70   21.05
+    /// marginal, per ADDED token:
+    /// linear      +3.95   +4.05   +3.65   +1.80
+    /// tree        +0.55   +2.45   +5.70   +2.18
+    /// ```
+    ///
+    /// The tree's whole advantage is the FIRST added candidate: +0.55 experts
+    /// against +3.95, a 7.2x saving. The second still wins (+2.45); the THIRD
+    /// costs +5.70, which is worse than adding a sequential token. The
+    /// cheapness lives in the top of head 0's distribution and is exhausted
+    /// almost immediately as you walk down it.
+    ///
+    /// There is also a ceiling, and it is the one-line argument against ever
+    /// widening this "as an optimisation". Breadth at depth 1 accepts AT MOST
+    /// one drafted token plus the free bonus, so the expected tokens per pass
+    /// cannot exceed 2.0 no matter how good the drafts are. At MoE = 72.7% of
+    /// step bytes the same measurement prices `b = 6` at 2.286x a plain step —
+    /// ABOVE that ceiling, so width 6 cannot pay even with perfect acceptance.
+    /// `b = 4` needs 95% of the ceiling to break even; `b = 2` needs 57%.
+    ///
+    /// The corollary is the reason breadth is worth building at all: breadth
+    /// and depth price two DIFFERENT axes. Breadth raises the probability of
+    /// reaching the ceiling; only depth raises the ceiling. So breadth exists
+    /// to PROTECT depth — to hedge the chained heads' inability to reconsider
+    /// a token they have already conditioned on — not to replace it.
+    ///
+    /// See [`MAX_MEASURED_BREADTH`].
+    pub fn breadth(b: usize) -> Result<TreeSpec, TreeError> {
+        TreeSpec::balanced(&[b])
     }
 
     /// `breadths[j]` children for every node at depth `j`.
@@ -465,11 +516,19 @@ pub struct StepOp {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlanOp {
     /// Clone head `head`'s committed cache into a fresh working lane.
-    OpenLane { lane: usize, head: usize },
+    OpenLane {
+        lane: usize,
+        head: usize,
+    },
     /// Clone an existing working lane — a branch point.
-    ForkLane { lane: usize, from: usize },
+    ForkLane {
+        lane: usize,
+        from: usize,
+    },
     /// The lane will not be written again.
-    CloseLane { lane: usize },
+    CloseLane {
+        lane: usize,
+    },
     Step(StepOp),
 }
 
@@ -654,7 +713,14 @@ pub fn draft_plan(
                     continue;
                 }
                 emit_shared(
-                    tree, d, seq, &targets, &path, &mut ops, &mut lanes, &mut row_of,
+                    tree,
+                    d,
+                    seq,
+                    &targets,
+                    &path,
+                    &mut ops,
+                    &mut lanes,
+                    &mut row_of,
                     &mut draft_from,
                 );
             }
@@ -742,7 +808,10 @@ fn emit_exact(
     for _ in 0..kids.len() - 1 {
         let l = *lanes;
         *lanes += 1;
-        ops.push(PlanOp::ForkLane { lane: l, from: lane });
+        ops.push(PlanOp::ForkLane {
+            lane: l,
+            from: lane,
+        });
         child_lanes.push(l);
     }
     child_lanes.push(lane);
@@ -799,7 +868,10 @@ fn emit_shared(
         } else {
             let l = *lanes;
             *lanes += 1;
-            ops.push(PlanOp::ForkLane { lane: l, from: base });
+            ops.push(PlanOp::ForkLane {
+                lane: l,
+                from: base,
+            });
             l
         };
         let hin = hin_for(tree, d, seq, v, row_of);
@@ -983,6 +1055,146 @@ pub fn accept_linear(drafts: &[usize], preds: &[usize]) -> (usize, Vec<usize>) {
 }
 
 // ---------------------------------------------------------------------------
+// what the VERIFY pass needs
+// ---------------------------------------------------------------------------
+
+/// Everything the device-side verify pass has to be told about a tree batch.
+///
+/// # Why this is not just a mask
+///
+/// A tree's rows are not consecutive positions of one sequence, and Inkling's
+/// decoder layer depends on that in FOUR places per layer, not one:
+///
+/// 1. attention's own visibility — the mask, the obvious one;
+/// 2. the relative-position bias and the log-scaling `tau`, which read a row's
+///    POSITION, and siblings share a position rather than occupying two;
+/// 3. the depthwise SHORT CONVOLUTIONS. There are four of them in a widened
+///    pass (`k_sconv` and `v_sconv` inside the attention, then `attn_sconv`
+///    and `mlp_sconv` around it), every one with `sconv_kernel_size = 4`, and
+///    every one reads `all[i ..= i + kernel - 1]` — the three rows physically
+///    preceding row `i` in the batch. For a chain those ARE row `i`'s
+///    ancestors. For a tree they are whatever the layout happens to put there,
+///    which for the very simplest tree (`b = 2` at depth 1) means the second
+///    candidate is convolved out of the first one's projections.
+///
+/// That third item is the one to be careful about, because it does not look
+/// like an error: masked attention still runs, the numbers stay finite, and
+/// the text stays fluent. It shows up as a verify pass that quietly scores a
+/// candidate the model was never asked about.
+///
+/// [`TreeAttn::taps`] fixes it without a new kernel or a new mask: the taps of
+/// row `i` are gathered along `i`'s ANCESTRY instead of along the batch
+/// layout, and for a chain they reduce to exactly the contiguous window the
+/// existing kernel already reads ([`TreeAttn::is_linear`] says so, and the
+/// device path can keep today's arithmetic untouched when it holds).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeAttn {
+    pub rows: usize,
+    pub kernel: usize,
+    /// Row `i`'s depth. Its absolute position is `pos0 + depth[i]`, NOT
+    /// `pos0 + i`, and its cache slot is still `i`.
+    pub depth: Vec<usize>,
+    /// `visible[i][j]` — may batch row `i` attend to batch row `j`? The cached
+    /// PREFIX is visible to every row and is not described here.
+    pub visible: Vec<Vec<bool>>,
+    /// `taps[i][t]` indexes the `kernel - 1 + rows` window the short
+    /// convolutions consume: `0 .. kernel-1` is the carried history and
+    /// `kernel-1 + j` is batch row `j`.
+    pub taps: Vec<Vec<usize>>,
+}
+
+impl TreeAttn {
+    /// The degenerate descriptor: `rows` consecutive positions of one
+    /// sequence. Exactly what the verify pass does today.
+    pub fn linear(rows: usize, kernel: usize) -> TreeAttn {
+        let depth: Vec<usize> = (0..rows).collect();
+        let visible = (0..rows)
+            .map(|i| (0..rows).map(|j| j <= i).collect())
+            .collect();
+        let taps = (0..rows)
+            .map(|i| (0..kernel).map(|t| i + t).collect())
+            .collect();
+        TreeAttn {
+            rows,
+            kernel,
+            depth,
+            visible,
+            taps,
+        }
+    }
+
+    /// True when this descriptor asks for nothing the existing contiguous
+    /// path does not already do — one chain, consecutive positions, taps in a
+    /// row. The device lane may then take its fast path unchanged, which is
+    /// what keeps a non-tree run bit-identical.
+    pub fn is_linear(&self) -> bool {
+        *self == TreeAttn::linear(self.rows, self.kernel)
+    }
+
+    /// Absolute positions, for the relative-bias table and the log scaling.
+    pub fn positions(&self, pos0: usize) -> Vec<usize> {
+        self.depth.iter().map(|&d| pos0 + d).collect()
+    }
+}
+
+/// Derive the verify-pass descriptor from a topology.
+///
+/// `kernel` is `sconv_kernel_size`. The tap rule is one line: row `i` at depth
+/// `j` wants, for tap `t`, the sequence element `j - (kernel - 1 - t)` ALONG
+/// ITS OWN PATH — an ancestor when that is non-negative, and the carried
+/// history when it is not. On a chain, `j == i` and the rule collapses to
+/// `i + t`, which is what the batched convolution kernel already reads.
+pub fn tree_attn(tree: &TreeSpec, kernel: usize) -> TreeAttn {
+    assert!(
+        kernel >= 2,
+        "a short convolution with kernel {kernel} has no history"
+    );
+    let rows = tree.len();
+    let depth: Vec<usize> = tree.nodes().iter().map(|nd| nd.depth).collect();
+    let visible = ancestor_mask(tree);
+    let mut taps = Vec::with_capacity(rows);
+    for i in 0..rows {
+        // `path[d]` is row `i`'s ancestor at depth `d`.
+        let path = tree.path_to(i);
+        let j = depth[i] as isize;
+        let mut row = Vec::with_capacity(kernel);
+        for t in 0..kernel {
+            let off = j - (kernel as isize - 1 - t as isize);
+            let idx = if off >= 0 {
+                kernel - 1 + path[off as usize]
+            } else {
+                // The carried history: `all[kernel-1]` is batch row 0, so
+                // `all[kernel-1 + off]` is the committed row `off` places
+                // before it. `off > -(kernel-1)` always, since `t < kernel`.
+                (kernel as isize - 1 + off) as usize
+            };
+            row.push(idx);
+        }
+        taps.push(row);
+    }
+    TreeAttn {
+        rows,
+        kernel,
+        depth,
+        visible,
+        taps,
+    }
+}
+
+/// The absolute position of every slot a tree verify pass can attend to.
+///
+/// `base` is the cache's first absolute position and `len_before` the rows it
+/// held before this batch, so slot `s < len_before` sits at `base + s` and
+/// batch row `j` sits at `pos0 + depth[j]` — which is NOT `base + len_before +
+/// j`, and is the whole reason this helper exists rather than the arithmetic
+/// being inlined at the mask.
+pub fn slot_positions(attn: &TreeAttn, base: usize, len_before: usize, pos0: usize) -> Vec<usize> {
+    let mut out: Vec<usize> = (0..len_before).map(|s| base + s).collect();
+    out.extend(attn.positions(pos0));
+    out
+}
+
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -997,7 +1209,11 @@ mod tests {
         // [0,1,2] pulled in [0] and [0,1]; [1] is a fourth.
         assert_eq!(t.drafts(), 4);
         for (id, nd) in t.nodes().iter().enumerate().skip(1) {
-            assert!(nd.parent < id, "node {id}'s parent {} is not earlier", nd.parent);
+            assert!(
+                nd.parent < id,
+                "node {id}'s parent {} is not earlier",
+                nd.parent
+            );
             assert_eq!(nd.depth, t.node(nd.parent).depth + 1);
         }
         assert_eq!(t.node(0).parent, NO_PARENT);
@@ -1065,7 +1281,9 @@ mod tests {
             let n = 1 + (trial * 7) % 97;
             let logits: Vec<f32> = (0..n)
                 .map(|_| {
-                    x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    x = x
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
                     ((x >> 33) as f32 / (1u64 << 31) as f32) - 0.5
                 })
                 .collect();
@@ -1121,7 +1339,10 @@ mod tests {
                 }
                 PlanOp::ForkLane { lane, from } => {
                     let src = lanes.get(from).expect("fork of a live lane").clone();
-                    assert!(lanes.insert(*lane, src).is_none(), "lane {lane} opened twice");
+                    assert!(
+                        lanes.insert(*lane, src).is_none(),
+                        "lane {lane} opened twice"
+                    );
                     outputs.push(false);
                 }
                 PlanOp::CloseLane { lane } => {
@@ -1137,7 +1358,8 @@ mod tests {
                     // committed cache already covers 0..seq-head.
                     let want = (plan.seq - s.head) + rows.len();
                     assert_eq!(
-                        s.pos, want,
+                        s.pos,
+                        want,
                         "head {} lane {} would append at {} with {} rows cached",
                         s.head,
                         s.lane,
@@ -1202,7 +1424,12 @@ mod tests {
     fn a_chain_needs_no_forks() {
         let plan = draft_plan(&TreeSpec::chain(6).unwrap(), 6, 256, CacheFill::Exact).unwrap();
         assert_eq!(plan.clones(), 5, "one lane per head, no branch to fork");
-        assert!(!plan.ops.iter().any(|o| matches!(o, PlanOp::ForkLane { .. })));
+        assert!(
+            !plan
+                .ops
+                .iter()
+                .any(|o| matches!(o, PlanOp::ForkLane { .. }))
+        );
     }
 
     #[test]
@@ -1384,11 +1611,122 @@ mod tests {
         let t = TreeSpec::balanced(&[2]).unwrap();
         assert_eq!(
             verify_batch(&t, &[9, 7, 7], 64),
-            Err(TreeError::DuplicateSibling { parent: 0, token: 7 })
+            Err(TreeError::DuplicateSibling {
+                parent: 0,
+                token: 7
+            })
         );
         assert_eq!(
             verify_batch(&t, &[9, 7], 64),
             Err(TreeError::BadArity { got: 2, want: 3 })
+        );
+    }
+
+    // ---- the verify-pass descriptor -------------------------------------
+
+    #[test]
+    fn a_chain_descriptor_is_exactly_todays_contiguous_window() {
+        for k in 1..=6usize {
+            let t = TreeSpec::chain(k).unwrap();
+            let a = tree_attn(&t, 4);
+            assert!(
+                a.is_linear(),
+                "a chain must ask the device for nothing new (k={k})"
+            );
+            assert_eq!(a, TreeAttn::linear(k + 1, 4));
+            // The batched convolution kernel reads all[i ..= i + kernel - 1].
+            for i in 0..a.rows {
+                assert_eq!(a.taps[i], vec![i, i + 1, i + 2, i + 3]);
+            }
+            assert_eq!(a.positions(100), (100..=100 + k).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn breadth_two_taps_never_cross_the_branch() {
+        let t = TreeSpec::breadth(2).unwrap();
+        let a = tree_attn(&t, 4);
+        assert!(!a.is_linear(), "a tree is not the contiguous case");
+        // Window layout: 0,1,2 are the carried history, 3/4/5 are rows 0/1/2.
+        assert_eq!(a.taps[0], vec![0, 1, 2, 3], "the root is a normal row");
+        assert_eq!(a.taps[1], vec![1, 2, 3, 4]);
+        assert_eq!(
+            a.taps[2],
+            vec![1, 2, 3, 5],
+            "candidate 2 must convolve out of the ROOT, never out of candidate 1"
+        );
+        for i in 0..a.rows {
+            assert!(
+                !a.taps[i].contains(&4) || i == 1,
+                "row {i} reached into row 1"
+            );
+        }
+        assert_eq!(
+            a.positions(64),
+            vec![64, 65, 65],
+            "siblings share a position"
+        );
+    }
+
+    #[test]
+    fn taps_only_ever_name_ancestors_or_history() {
+        let t = TreeSpec::balanced(&[3, 2]).unwrap();
+        let kernel = 4;
+        let a = tree_attn(&t, kernel);
+        for i in 0..a.rows {
+            for (t_i, &idx) in a.taps[i].iter().enumerate() {
+                assert!(idx < kernel - 1 + a.rows, "tap out of the window");
+                if idx >= kernel - 1 {
+                    let j = idx - (kernel - 1);
+                    assert!(
+                        a.visible[i][j],
+                        "row {i} tap {t_i} reads row {j}, which it may not even attend to"
+                    );
+                    assert_eq!(
+                        a.depth[j] as isize,
+                        a.depth[i] as isize - (kernel as isize - 1 - t_i as isize),
+                        "a tap must sit at its own sequence offset"
+                    );
+                }
+            }
+            assert_eq!(
+                *a.taps[i].last().unwrap(),
+                kernel - 1 + i,
+                "the last tap is always the row itself"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shallow_tree_reaches_into_the_carried_history() {
+        // Depth 1 with kernel 4: the root's taps are three history rows, and a
+        // candidate's are two history rows plus the root.
+        let a = tree_attn(&TreeSpec::breadth(3).unwrap(), 4);
+        assert_eq!(a.taps[0][..3], [0, 1, 2]);
+        for c in 1..=3 {
+            assert_eq!(a.taps[c][..2], [1, 2], "row {c}");
+            assert_eq!(a.taps[c][2], 3, "row {c} taps the confirmed token");
+        }
+    }
+
+    #[test]
+    fn slot_positions_place_siblings_together() {
+        let a = tree_attn(&TreeSpec::breadth(2).unwrap(), 4);
+        // A cache based at 0 holding 10 rows, this batch starting at 10.
+        let p = slot_positions(&a, 0, 10, 10);
+        assert_eq!(p.len(), 13);
+        assert_eq!(&p[..10], &(0..10).collect::<Vec<_>>()[..]);
+        assert_eq!(&p[10..], &[10, 11, 11]);
+    }
+
+    #[test]
+    fn the_descriptor_and_the_mask_agree() {
+        let t = TreeSpec::balanced(&[2, 2]).unwrap();
+        let a = tree_attn(&t, 4);
+        assert_eq!(a.visible, ancestor_mask(&t));
+        assert_eq!(
+            a.depth,
+            t.nodes().iter().map(|n| n.depth).collect::<Vec<_>>()
         );
     }
 
@@ -1432,7 +1770,11 @@ mod tests {
         // The target says t+1 is 21 (the SECOND candidate), then 33.
         let preds = vec![21, 77, 33, 0, 0, 0, 88];
         let got = accept_tree(&t, &toks, &preds);
-        assert_eq!(got.kept_rows, vec![0, 2, 6], "a scattered, non-contiguous set");
+        assert_eq!(
+            got.kept_rows,
+            vec![0, 2, 6],
+            "a scattered, non-contiguous set"
+        );
         assert_eq!(got.new_toks, vec![21, 33, 88]);
         assert_eq!(got.accepted, 2);
     }
