@@ -1607,6 +1607,34 @@ pub const NREP_TILES: usize = 16;
 /// one rounding per term where the lane this replaces takes two. That is the
 /// module doc's subject and it is not an accident of codegen — a `scale_rows`
 /// launch that forced the second rounding was written, measured, and reverted.
+///
+/// # The other shape of this kernel, which was measured and does not pay
+///
+/// The same product can be written the other way round: one thread per INPUT
+/// element, reading its element once (coalesced with its whole warp) and paying
+/// an atomic per term, instead of writing each output element once and reading
+/// `cnt` rows `h` apart to do it. Which wins is a property of `kmax`, `h` and
+/// how many rows collide on one output element — of the ROUTING, not of the
+/// model — so it was measured rather than argued. Layers 0:8,
+/// `INK_ALIGN_COPY=1`, p50 of `pass_ms` over 24 warm passes:
+///
+/// ```text
+/// 512-token prefill    gather 339.8 ms   atomic 339.7 ms
+/// decode, INK_KV=1     gather  46.4 ms   atomic  46.9 ms
+/// ```
+///
+/// Both differences are far inside the 2-3 ms run-to-run drift of one binary,
+/// so the atomic arm buys nothing, and it costs a zeroing pass and a
+/// reassociated sum — an atomic float add reorders the terms, so the two arms
+/// disagree on some argmax positions. (That last is not what decides it: this
+/// runtime already disagrees with itself on 8.55% of argmax positions between
+/// two runs of the same binary, per the module doc above.)
+///
+/// The arm was written on the archived `perf/prefill-resid-pool` lineage and
+/// deliberately not carried across. This note is here so the idea is not
+/// re-proposed as untried. It would be worth re-measuring only if `kmax` grew
+/// or `h` narrowed; the gather arm has since gained the `fma.rn.f32`
+/// contraction above, which widens the gap rather than closing it.
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 fn scatter_weighted_kernel<E: Scalar + Cast>(

@@ -35,6 +35,45 @@
 //! token at f32 on this model and half that on its BF16 storage lane. A local
 //! layer's relative table remains f32 at 64 KiB a token. [`check`] tests every
 //! configured candidate rather than naming one historical dtype as universal.
+//!
+//! # Where a real run actually stops, which is not this cap
+//!
+//! The cap is per-buffer and it is exact, and it is NOT what a two-node prefill
+//! meets. [`largest_buffer`] puts the per-buffer ceiling near 326,000 tokens;
+//! the pair runs out of node long before that. Bisected at both ends on one
+//! binary, `INK_QBLOCK=64`, 42 layers, two Spark boxes -- 121.63 GiB + 16 of
+//! swap on the head's, 119.63 + 16 on the tail's:
+//!
+//! | lane | split | passes | dies |
+//! |---|---|---|---|
+//! | f32 activations, subslices, no cleanup | 21/21 | 39,000 | 42,000 |
+//! | BF16 operands, subslices + cleanup | 21/21 | 61,000 | 65,000 |
+//! | + BF16 residual, exclusive + cleanup | 20/22 | **140,000** | 150,000 |
+//!
+//! 61,000 runs in 528 s with the head at 120.19 GiB and 13.86 of its 16 GiB of
+//! swap; 65,000 is OOM-killed with both saturated. 140,000 runs in 2056 s with
+//! the head at 117.47 and all sixteen gibibytes of swap; 150,000 is OOM-killed
+//! 157 s in, before it finishes a layer.
+//!
+//! The FAILURE MODE changed along the way, and that is the half worth keeping.
+//! The 65,000 row's original death was a REFUSED pool page --
+//! `cubecl-cuda/src/compute/server.rs:125: can't allocate buffer of size:
+//! 8162261504`, 7.60 GiB, which is a page CLASS off the `SubSlices` ladder and
+//! not a shape the model ever asked for. [`AllocatorConfig::ExclusivePages`]
+//! has no such class, so that death cannot recur; what both ends die of now is
+//! the OOM killer, which is a fact about the machine rather than about the
+//! allocator's ladder.
+//!
+//! Measured on the archived `perf/prefill-resid-pool` lineage through
+//! `4d6d15f8` and retained here as historical evidence -- the same stamp the
+//! paired results under `golden/paired/results/` carry, and for the same
+//! reason. The bottom row's lane is this module's default TODAY (BF16 residual,
+//! `ExclusivePages`, `CleanupPolicy::WhenStranded`, split 20), but the
+//! admission arithmetic below was rewritten after the run was taken. So 140,000
+//! is the last MEASURED ground truth for where the pair stops, not a current
+//! guarantee, and re-bisecting it is the cheapest check on whether the new gate
+//! is calibrated at the top end -- which is the end its own doc warns the old
+//! one was permissive at.
 
 use crate::models::inkling::config::{AttnKind, InklingTextConfig};
 use crate::models::inkling::pool::AllocatorConfig;
