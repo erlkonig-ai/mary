@@ -6776,6 +6776,12 @@ fn main() -> Result<()> {
     // ceiling itself.
     let tree_depth = spec_tree.as_ref().map(|tr| tr.max_depth()).unwrap_or(0);
     let mut spec_hist = vec![0usize; spec_k.max(tree_depth) + 2];
+    // WHICH candidate the verifier took, by rank, with the last bucket meaning
+    // it took none. This is the number the whole tree exists to produce: a
+    // rank-0 acceptance is one a plain chain would also have got, and only the
+    // rank>0 column is a token breadth WON. Without it an acceptance rate says
+    // the tree is working and not whether it is worth anything.
+    let mut tree_rank_hist = vec![0usize; tree_b + 1];
     let mut pass_ms: Vec<f64> = Vec::new();
     // The machine under the pass, sampled per pass, for the intermittent
     // multi-second stall. Off unless `INK_STEPSTAT=1`; see
@@ -8819,6 +8825,13 @@ fn main() -> Result<()> {
             let bucket = new_toks.len().min(spec_hist.len() - 1);
             spec_hist[bucket] += 1;
         }
+        if is_decode && tree_b > 0 && verify_rows > 1 {
+            let tr = spec_tree.as_ref().expect("the tree lane has a topology");
+            match tree_kept.get(1) {
+                Some(&node) => tree_rank_hist[tr.node(node).rank] += 1,
+                None => tree_rank_hist[tree_b] += 1,
+            }
+        }
 
         // ---- MTP: score the drafts that named this step, then draft afresh -----
         if mtp_k > 0 {
@@ -10678,6 +10691,31 @@ fn main() -> Result<()> {
         );
         let tpp = decode_toks as f64 / acc_steps as f64;
         println!("  tokens per pass      : {tpp:.3}");
+        if tree_b > 0 {
+            let passes: usize = tree_rank_hist.iter().sum();
+            let won: usize = tree_rank_hist[1..tree_b].iter().sum();
+            println!("  which candidate the verifier took, over {passes} tree passes:");
+            for (r, &c) in tree_rank_hist.iter().enumerate() {
+                let what = if r == tree_b {
+                    "none  ".to_string()
+                } else {
+                    format!("rank {r}")
+                };
+                println!(
+                    "    {what}: {c:5}   ({:5.1}%){}",
+                    100.0 * c as f64 / passes.max(1) as f64,
+                    if r > 0 && r < tree_b {
+                        "   <- a token the chain would have missed"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            println!(
+                "    breadth WON {won} of {passes} passes ({:.1}%); the rest a chain would have                  got too, or not at all",
+                100.0 * won as f64 / passes.max(1) as f64
+            );
+        }
         if spec_k > 0 || tree_b > 0 {
             let sets: usize = spec_hist.iter().sum();
             let lane = if tree_b > 0 {
