@@ -9861,9 +9861,23 @@ fn main() -> Result<()> {
         // then finishes eagerly and correct, and the log says which assumption
         // was false. That is the difference between an instrument that reports
         // a negative result and one that just stops.
-        if graph_lane && lane_plan.is_none() && lane_retired.is_none() && graphs_captured.len() == 3
+        if graph_lane
+            && lane_plan.is_none()
+            && lane_retired.is_none()
+            && graphs_captured.len() == want_captures
         {
-            let (a, b, c) = (graphs_captured[0], graphs_captured[1], graphs_captured[2]);
+            // With only two captures there is no second difference, so `a` IS
+            // `b`: every comparison of A against B becomes trivially true, the
+            // affineness test cannot fail, and the address test still runs on
+            // the pair that exists. The arming line says which arm it was, so
+            // "verified affine" is never printed for a run that only assumed
+            // it.
+            let last = graphs_captured.len() - 1;
+            let (a, b, c) = (
+                graphs_captured[last.saturating_sub(2)],
+                graphs_captured[last - 1],
+                graphs_captured[last],
+            );
             let (na, nb) = (
                 fp4_client.graph_launch_count(b),
                 fp4_client.graph_launch_count(c),
@@ -9893,9 +9907,9 @@ fn main() -> Result<()> {
                 std::env::var("INK_GRAPH_LANE_ALLOW_ALLOC").ok().as_deref() == Some("1");
             if na != nb || n_first != na {
                 lane_retired = Some(format!(
-                    "the three calibration captures recorded {n_first}, {na} and {nb} launches, \
-                     so the region is not periodic across them and no launch index names the same \
-                     node twice"
+                    "the calibration captures recorded {n_first}, {na} and {nb} launches, so the \
+                     region is not periodic across them and no launch index names the same node \
+                     twice"
                 ));
             } else if allocs > 0 && !allow_alloc {
                 lane_retired = Some(format!(
