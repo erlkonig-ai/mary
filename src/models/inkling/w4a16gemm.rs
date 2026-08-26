@@ -800,6 +800,12 @@ pub fn swizzle_w4a16_device<R: Runtime>(
 /// # RETRACTED FOR THE SINKS, 2026-08-26. Do not quote the table above at any
 /// # shape but the head's.
 ///
+/// SUPERSEDED IN SCOPE by the section below it, which measured the range this
+/// one inferred from two points. The +25% is real and the lesson is right; what
+/// is wrong here is the UNIT. "The sinks" is not a shape -- it is two shapes,
+/// and only one of them loses. Read both sections, and take the rule from the
+/// second: `swizzle_pays`.
+///
 /// The end-to-end row (`swz` 56.1 against `row-major` 57.2 ms/step) was taken
 /// with `ANN_BUDGET_DEFAULT` already at 8192, so the head went through
 /// `linear_ann` in BOTH arms and read identical bytes -- meaning the 1.1 ms was
