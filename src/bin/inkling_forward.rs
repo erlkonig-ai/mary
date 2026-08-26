@@ -2684,12 +2684,13 @@ fn w4a16_bind(
     // Once a process, not once a weight: the sink experts come through here
     // several times a layer and the line is about the LAYOUT, which is one
     // decision.
-    // Once per KIND, not once a process. It used to be one flag for both, which
-    // was right only while the two kinds could not disagree -- and the whole
-    // reason this commit exists is that they could, and did, and the single line
-    // reported whichever one happened to bind first. A run where the head is
-    // row-major and the sinks are permuted now says both, which is the state
-    // this file's defaults actually produce.
+    // Once per KIND, not once a process, and each says WHY it is in the layout
+    // it is in. It used to be one flag for both, which was right only while the
+    // two kinds could not disagree; they did, and the single line reported
+    // whichever bound first. The reasons differ now -- the head is row-major for
+    // CORRECTNESS and the sinks for SPEED -- and a line that prints only the
+    // layout invites someone to "fix" the sinks back to fragment order, which is
+    // measured at +25% on that kernel.
     static SAID_ANN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     static SAID_OTHER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let said = if for_ann { &SAID_ANN } else { &SAID_OTHER };
@@ -2701,6 +2702,8 @@ fn w4a16_bind(
                 "MMA-FRAGMENT (m16n8k16)"
             } else if ann_owns_m1 {
                 "row-major [n, k/8] (the approximate head owns m=1)"
+            } else if grid_too_small {
+                "row-major [n, k/8] (permuting measured +25% at this shape)"
             } else {
                 "row-major [n, k/8]"
             }
