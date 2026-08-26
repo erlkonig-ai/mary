@@ -536,3 +536,557 @@ pub fn w4a16_linear_wide_launch<R: Runtime>(
     };
     out
 }
+
+// ---------------------------------------------------------------------------
+// Pre-permuted ("swizzled") B layout for m16n8k16
+// ---------------------------------------------------------------------------
+
+/// Bytes one `(n_tile, k_tile)` block of codes occupies: `NTILE` rows x
+/// `KTILE / 2` packed bytes.
+pub const SWZ_BLOCK_CODES: usize = NTILE * KTILE / 2;
+/// Bytes one `(n_tile, k_tile)` block of scales occupies: one E4M3 per row.
+pub const SWZ_BLOCK_SCALES: usize = NTILE;
+
+/// Where lane `l`'s `i`-th B load lands in a swizzled block.
+///
+/// `mma16_frag_map` dumps the map off the device and it holds the closed form
+///
+/// ```text
+///   col = lane >> 2                  the n column, 0..8
+///   row = 2 * (lane & 3) + 8 * i     the k element, 0..16
+/// ```
+///
+/// exactly, on sm_121a, for all 32 lanes. So a lane's `i`-th load wants the
+/// packed word covering k elements `[8i, 8i+8)` of weight row `col`, and the
+/// warp's `i`-th load wants eight such words — one per row.
+///
+/// Row-major that is eight addresses `k/2` bytes apart: eight 32-byte sector
+/// requests for 32 useful bytes. Written down as
+///
+/// ```text
+///   dst_word(col, w) = w * NTILE + col        w = row / 8, in 0..2
+/// ```
+///
+/// load `i` is words `[8i, 8i+8)` of the block, i.e. **32 contiguous bytes** —
+/// one sector where the row-major form takes eight.
+///
+/// ## What this does and does not buy
+///
+/// It does not save DRAM bytes. Over a whole k loop the row-major form already
+/// reaches 100% sector and 100% line utilisation, because the k loop walks each
+/// of the eight rows FORWARD and a half-used sector is finished by the next few
+/// k tiles out of L1 — `mma16_lane_dump` prints both counts side by side. What
+/// it saves is REQUESTS: 4096 sector requests per warp k loop against 512
+/// distinct sectors, an 8x amplification that the permutation removes.
+#[inline]
+fn swz_word_k16(col: usize, w: usize) -> usize {
+    w * NTILE + col
+}
+
+/// Permute `[n, k/8]` packed E2M1 codes into `m16n8k16` B-fragment order.
+///
+/// Block `(n_tile, k_tile)` occupies [`SWZ_BLOCK_CODES`] consecutive bytes at
+/// `((n_tile * k/KTILE) + k_tile) * SWZ_BLOCK_CODES`. Same length, same bytes,
+/// different order. `src` and `dst` must not overlap.
+pub fn swizzle_w4a16_codes_into(src: &[u8], dst: &mut [u8], n: usize, k: usize) {
+    assert_eq!(n % NTILE, 0, "n {n} is not a multiple of {NTILE}");
+    assert_eq!(k % KTILE, 0, "k {k} is not a multiple of {KTILE}");
+    assert_eq!(src.len(), n * k / 2, "codes are not [n, k/2] bytes");
+    assert_eq!(
+        dst.len(),
+        src.len(),
+        "destination is not the source's length"
+    );
+    let kt = k / KTILE;
+    let row_w = k / CODES_PER_WORD;
+    for nt in 0..n / NTILE {
+        for t in 0..kt {
+            let blk = (nt * kt + t) * SWZ_BLOCK_CODES;
+            for col in 0..NTILE {
+                for w in 0..KTILE / CODES_PER_WORD {
+                    let s = ((nt * NTILE + col) * row_w + t * (KTILE / CODES_PER_WORD) + w) * 4;
+                    let d = blk + swz_word_k16(col, w) * 4;
+                    dst[d..d + 4].copy_from_slice(&src[s..s + 4]);
+                }
+            }
+        }
+    }
+}
+
+/// [`swizzle_w4a16_codes_into`] allocating its own destination.
+pub fn swizzle_w4a16_codes(src: &[u8], n: usize, k: usize) -> Vec<u8> {
+    let mut dst = vec![0u8; src.len()];
+    swizzle_w4a16_codes_into(src, &mut dst, n, k);
+    dst
+}
+
+/// Permute `[n, k/16]` E4M3 block scales to match [`swizzle_w4a16_codes_into`].
+///
+/// One `m16n8k16` covers exactly [`GROUP`] k elements, so a fragment consumes
+/// ONE scale byte per weight row: eight bytes, row-major eight separate
+/// sectors. Blocked as `[n_tile][k_tile][8]` they are eight contiguous bytes.
+pub fn swizzle_w4a16_scales_into(src: &[u8], dst: &mut [u8], n: usize, k: usize) {
+    assert_eq!(n % NTILE, 0);
+    assert_eq!(k % KTILE, 0);
+    assert_eq!(src.len(), n * (k / GROUP), "scales are not [n, k/16]");
+    assert_eq!(
+        dst.len(),
+        src.len(),
+        "destination is not the source's length"
+    );
+    let kt = k / KTILE;
+    let spr = k / GROUP;
+    for nt in 0..n / NTILE {
+        for t in 0..kt {
+            let blk = (nt * kt + t) * SWZ_BLOCK_SCALES;
+            for col in 0..NTILE {
+                dst[blk + col] = src[(nt * NTILE + col) * spr + t];
+            }
+        }
+    }
+}
+
+/// [`swizzle_w4a16_scales_into`] allocating its own destination.
+pub fn swizzle_w4a16_scales(src: &[u8], n: usize, k: usize) -> Vec<u8> {
+    let mut dst = vec![0u8; src.len()];
+    swizzle_w4a16_scales_into(src, &mut dst, n, k);
+    dst
+}
+
+/// Whether a `[n, k]` weight can be written in the swizzled layout at all.
+pub fn swizzleable(n: usize, k: usize) -> bool {
+    n % NTILE == 0 && k % KTILE == 0
+}
+
+/// Permute a `[n, k/8]` packed-code plane on the DEVICE, into a fresh handle.
+///
+/// The head's codes are produced on the device by
+/// [`super::fp4quant::quantize_nvfp4_bf16`], not copied out of the pile, so
+/// there is no host memcpy for the permutation to ride inside the way the
+/// routed experts' has. A device pass is the cheap alternative: one linear
+/// write of the destination with a gathered read, 0.43 GiB at the head's shape,
+/// once per process at startup.
+///
+/// Written destination-linear on purpose. The gather side is the scattered one,
+/// and a scattered READ of a resident table is what this whole permutation
+/// exists to make the GEMM stop doing per step — paying it once is the trade.
+#[cube(launch)]
+pub fn swizzle_codes_dev(src: &Tensor<u32>, dst: &mut Tensor<u32>, #[comptime] k_tiles: usize) {
+    let d = ABSOLUTE_POS as usize;
+    if d < dst.len() {
+        let wpb = comptime!(SWZ_BLOCK_CODES / 4);
+        let per_row = comptime!(KTILE / CODES_PER_WORD);
+        let blk = d / wpb;
+        let j = d % wpb;
+        let w = j / NTILE;
+        let col = j % NTILE;
+        let nt = blk / k_tiles;
+        let t = blk % k_tiles;
+        dst[d] = src[(nt * NTILE + col) * (k_tiles * per_row) + t * per_row + w];
+    }
+}
+
+/// Permute a `[n, k/16]` E4M3 scale plane on the DEVICE. See
+/// [`swizzle_codes_dev`].
+#[cube(launch)]
+pub fn swizzle_scales_dev<S: Scalar>(
+    src: &Tensor<S>,
+    dst: &mut Tensor<S>,
+    #[comptime] k_tiles: usize,
+) {
+    let d = ABSOLUTE_POS as usize;
+    if d < dst.len() {
+        let blk = d / NTILE;
+        let col = d % NTILE;
+        let nt = blk / k_tiles;
+        let t = blk % k_tiles;
+        dst[d] = src[(nt * NTILE + col) * k_tiles + t];
+    }
+}
+
+/// Permute both planes of an already-quantised `[n, k]` weight on the device.
+///
+/// Returns fresh handles; the caller drops the row-major ones. Panics rather
+/// than silently declining on a shape the layout cannot express — a weight that
+/// half-permuted would be a kernel reading the wrong bytes and producing
+/// NUMBERS, which is the one failure mode this must not have.
+pub fn swizzle_w4a16_device<R: Runtime>(
+    client: &ComputeClient<R>,
+    codes: &Handle,
+    scales: &Handle,
+    n: usize,
+    k: usize,
+) -> (Handle, Handle) {
+    assert!(swizzleable(n, k), "[{n}, {k}] is not swizzleable");
+    let k_tiles = k / KTILE;
+    let words = n * k / CODES_PER_WORD;
+    let sc = n * (k / GROUP);
+    let dc = client.empty(words * 4);
+    let ds = client.empty(sc);
+    let threads = 256u32;
+    unsafe {
+        swizzle_codes_dev::launch::<R>(
+            client,
+            CubeCount::Static(words.div_ceil(threads as usize) as u32, 1, 1),
+            CubeDim::new_1d(threads),
+            TensorArg::from_raw_parts(codes.clone(), [1].into(), [words].into()),
+            TensorArg::from_raw_parts(dc.clone(), [1].into(), [words].into()),
+            k_tiles,
+        )
+    };
+    unsafe {
+        swizzle_scales_dev::launch::<e4m3, R>(
+            client,
+            CubeCount::Static(sc.div_ceil(threads as usize) as u32, 1, 1),
+            CubeDim::new_1d(threads),
+            TensorArg::from_raw_parts(scales.clone(), [1].into(), [sc].into()),
+            TensorArg::from_raw_parts(ds.clone(), [1].into(), [sc].into()),
+            k_tiles,
+        )
+    };
+    (dc, ds)
+}
+
+/// Whether the head/sink W4A16 weights are written in MMA-fragment order.
+///
+/// On by default. `INK_W4A16_SWZ=0` is the A/B arm.
+///
+/// ## What it measured
+///
+/// **The kernel, alone.** `w4a16_swz_probe`, one process, four interleaved
+/// arms, first two reps discarded, per LAUNCH of one `[16, 4096] x
+/// [201024, 4096]^T` product (the unembedding's own shape at decode, `m = 1`
+/// padded to one m-tile), one GB10 box, GB/s over the weight planes only
+/// (0.431 GiB) and not over a step:
+///
+/// | arm              | p50      | GB/s  |
+/// |------------------|---------:|------:|
+/// | row-major        | 4.832 ms |  95.9 |
+/// | both planes swz  | 3.984 ms | 116.3 |
+/// | codes only swz   | 4.069 ms | 113.8 |
+/// | coalesced ceiling| 2.172 ms | 213.2 |
+///
+/// 12 warm reps of 14. The two swizzled arms are indistinguishable within
+/// their spread, so this does not establish that the scale plane's permutation
+/// is worth anything on its own; both are permuted because keeping one plane
+/// row-major would be a second layout for no measured gain.
+///
+/// **End to end.** `bench-decode.sh -n 4 --gen 12 --layers 21:42`, `INK_KV=1`,
+/// a 3720-token prompt, ctx 3732, ONE GB10 box holding layers 21..42 and the
+/// head (not the two-node pipe), arms interleaved, per DECODE STEP, p50 of 11
+/// warm passes a rep:
+///
+/// | arm       | reps (p50 each)        | p50      |
+/// |-----------|------------------------|---------:|
+/// | swz       | 55.9, 56.1, 56.1 ms    | 56.1 ms  |
+/// | row-major | 57.1, 57.2, 57.3 ms    | 57.2 ms  |
+///
+/// 1.1 ms a step, 1.9%, and the two arms' rep bands do not overlap. Eight reps
+/// were run and TWO were discarded as contended -- `swz` rep 1 and `row-major`
+/// rep 4, identified by their PREFILL, 165.5 s and 95.5 s against 14.2-15.3 s
+/// for the other six; another agent's job arrived on the box mid-run. One
+/// discard fell on each arm.
+///
+/// The gap between 17.5% on the kernel and 1.9% on the step is not a
+/// discrepancy: the head is one term of a step that also streams 5.36 GiB of
+/// attention, dense-MLP and routed-expert weight, and 1.1 ms of a 57.2 ms step
+/// is most of what a 0.85 ms kernel saving can be worth once it is enqueued
+/// against a host that is also doing everything else.
+///
+/// **Numerics.** Bit-identical, as a permutation must be: max deviation
+/// 0.000e0 over 1024 outputs of a `[16, 256] x [64, 256]^T` product against the
+/// row-major lane. Reported as an observation; there is no gate on it.
+pub fn swizzle_w4a16() -> bool {
+    std::env::var("INK_W4A16_SWZ")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
+/// [`w4a16_linear`] reading a B operand written by [`swizzle_w4a16_codes_into`].
+///
+/// The ONLY difference is the two global indices. Everything else — the
+/// dequantise, the scale application, the accumulator, the output store — is
+/// the same code, because the permutation moves bytes and changes nothing about
+/// what they mean.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_linear_swz<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size>(
+    a: &Tensor<Vector<AB, NA>>,
+    b: &Tensor<u32>,
+    b_sc: &Tensor<S>,
+    out: &mut Tensor<Vector<f32, NC>>,
+    #[comptime] size_k: usize,
+    #[comptime] size_n: usize,
+    #[comptime] swz_sc: bool,
+    scale: f32,
+) {
+    let def = cmma::MmaDefinition::<AB, AB, f32>::new(MTILE, NTILE, KTILE);
+    let lane = UNIT_POS_PLANE;
+    let pack = AB::packing_factor();
+
+    let m_tile = CUBE_POS_X as usize;
+    let n_tile = CUBE_POS_Y as usize;
+    let n_base = n_tile * NTILE;
+    let m_base = m_tile * MTILE;
+
+    let ec_a = def.elems_per_lane(MatrixIdent::A);
+    let vs_a = def.vector_size(MatrixIdent::A);
+    let vc_a = comptime!(ec_a / vs_a);
+    let ec_b = def.elems_per_lane(MatrixIdent::B);
+    let vs_b = def.vector_size(MatrixIdent::B);
+    let vc_b = comptime!(ec_b / vs_b);
+    let ec_c = def.elems_per_lane(MatrixIdent::Accumulator);
+    let vs_c = def.vector_size(MatrixIdent::Accumulator);
+    let vc_c = comptime!(ec_c / vs_c);
+
+    let mut reg_a = Array::<Vector<AB, NA>>::new(vc_a);
+    let mut reg_b = Array::<Vector<AB, NA>>::new(vc_b);
+    let mut acc = Array::<Vector<f32, NC>>::new(vc_c);
+    #[unroll]
+    for i in 0..vc_c {
+        acc[i] = Vector::<f32, NC>::cast_from(0.0f32);
+    }
+
+    let spr = comptime!(size_k / GROUP);
+    let k_tiles = comptime!(size_k / KTILE);
+    let wpb = comptime!(SWZ_BLOCK_CODES / 4);
+
+    for t in 0..k_tiles {
+        let kbase = t * KTILE;
+        #[unroll]
+        for i in 0..vc_a {
+            let (row, col) = def.position_of_nth(lane, (i * vs_a * pack) as u32, MatrixIdent::A);
+            let gr = row as usize + m_base;
+            let gc = col as usize + kbase;
+            reg_a[i] = a[(gr * size_k + gc) / a.vector_size()];
+        }
+        #[unroll]
+        for i in 0..vc_b {
+            // Written out of `position_of_nth` rather than assumed, so it
+            // tracks the target's own fragment layout: `row` is the k element,
+            // `col` the n column, and `swz_word_k16`'s `w` is `row / 8`.
+            let (row, col) = def.position_of_nth(lane, (i * vs_b) as u32, MatrixIdent::B);
+            let w = row as usize / CODES_PER_WORD;
+            let blk = (n_tile * k_tiles + t) * wpb;
+            let word = b[blk + w * NTILE + col as usize];
+            let s = if swz_sc {
+                f32::cast_from(b_sc[(n_tile * k_tiles + t) * NTILE + col as usize])
+            } else {
+                f32::cast_from(b_sc[(col as usize + n_base) * spr + (row as usize + kbase) / GROUP])
+            };
+            let mut v = Vector::<AB, NA>::empty();
+            #[unroll]
+            for j in 0..vs_b {
+                let kk = row as usize + kbase + j;
+                let code = (word >> (4 * (kk % CODES_PER_WORD)) as u32) & 15u32;
+                v[j] = AB::cast_from(e2m1_value(code) * s);
+            }
+            reg_b[i] = v;
+        }
+
+        let d = def.execute(&reg_a, &reg_b, &acc);
+        #[unroll]
+        for i in 0..vc_c {
+            acc[i] = d[i];
+        }
+    }
+
+    #[unroll]
+    for i in 0..vc_c {
+        let (row, col) = def.position_of_nth(lane, (i * vs_c) as u32, MatrixIdent::Accumulator);
+        let gr = row as usize + m_base;
+        let gc = col as usize + n_base;
+        out[(gr * size_n + gc) / out.vector_size()] = acc[i] * Vector::<f32, NC>::cast_from(scale);
+    }
+}
+
+/// Launch [`w4a16_linear_swz`]. `swz_sc` says whether `b_sc` is permuted too.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_linear_swz_launch<R: Runtime>(
+    client: &ComputeClient<R>,
+    a: &Handle,
+    b: &Handle,
+    b_sc: &Handle,
+    m_pad: usize,
+    k: usize,
+    n: usize,
+    swz_sc: bool,
+    scale: f32,
+) -> Handle {
+    assert_eq!(
+        m_pad % MTILE,
+        0,
+        "m_pad {m_pad} is not a multiple of {MTILE}"
+    );
+    assert!(swizzleable(n, k), "[{n}, {k}] is not swizzleable");
+    assert!(
+        n / NTILE <= 65535,
+        "{} n-tiles exceed the 65535 grid-y limit",
+        n / NTILE
+    );
+
+    let out = client.empty(m_pad * n * core::mem::size_of::<f32>());
+    let vs = 32 / bf16::cube_type().size_bits();
+    let wpr = k / CODES_PER_WORD;
+    let spr = k / GROUP;
+
+    unsafe {
+        w4a16_linear_swz::launch::<bf16, e4m3, R>(
+            client,
+            CubeCount::Static((m_pad / MTILE) as u32, (n / NTILE) as u32, 1),
+            CubeDim::new_1d(32),
+            vs,
+            2,
+            TensorArg::from_raw_parts(a.clone(), [k, 1].into(), [m_pad, k].into()),
+            TensorArg::from_raw_parts(b.clone(), [wpr, 1].into(), [n, wpr].into()),
+            TensorArg::from_raw_parts(b_sc.clone(), [spr, 1].into(), [n, spr].into()),
+            TensorArg::from_raw_parts(out.clone(), [n, 1].into(), [m_pad, n].into()),
+            k,
+            n,
+            swz_sc,
+            scale,
+        )
+    };
+    out
+}
+
+#[cfg(test)]
+mod swizzle_k16_tests {
+    use super::*;
+
+    /// Every source byte lands somewhere, exactly once, on both planes.
+    ///
+    /// The failure this excludes is a colliding destination formula, which
+    /// loses one byte and duplicates another and which no same-shaped output
+    /// check would call an error. A non-square shape, so a transposed n/k
+    /// cannot pass.
+    #[test]
+    fn the_k16_permutation_is_a_bijection_on_both_planes() {
+        let (n, k) = (16usize, 128usize);
+        let codes: Vec<u8> = (0..n * k / 2).map(|i| (i % 251) as u8).collect();
+        let mut a = swizzle_w4a16_codes(&codes, n, k);
+        let mut b = codes.clone();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b);
+
+        let mut seen = vec![false; codes.len()];
+        let kt = k / KTILE;
+        for nt in 0..n / NTILE {
+            for t in 0..kt {
+                for col in 0..NTILE {
+                    for w in 0..KTILE / CODES_PER_WORD {
+                        let d = (nt * kt + t) * SWZ_BLOCK_CODES + swz_word_k16(col, w) * 4;
+                        for x in 0..4 {
+                            assert!(!seen[d + x], "destination {} written twice", d + x);
+                            seen[d + x] = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            seen.iter().all(|v| *v),
+            "some destination was never written"
+        );
+
+        let scales: Vec<u8> = (0..n * (k / GROUP)).map(|i| (i % 241) as u8).collect();
+        let mut a = swizzle_w4a16_scales(&scales, n, k);
+        let mut b = scales.clone();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The m16n8k16 B fragment map, off the device
+// ---------------------------------------------------------------------------
+
+/// Dump `position_of_nth` for the `m16n8k16` fragment, as the DEVICE answers it.
+///
+/// [`super::fp4gemm::fp4_frag_b_map`] does this for `m16n8k64`
+/// (`new_scaled::<e4m3>`); this is its twin for the shape BOTH four-bit-head and
+/// BF16 lanes actually issue. It is a separate dump and not a re-read of the
+/// other because the two are different instructions: a different `k`, a
+/// different operand width, a different constructor. The FP4 permutation was
+/// derived from the first map, and nothing about that derivation transfers.
+///
+/// One `MmaDefinition` serves both consumers here:
+/// [`w4a16_linear`] and [`super::bf16gemm::bf16_linear`] both construct
+/// `MmaDefinition::<bf16, bf16, f32>::new(16, 8, 16)` — same types, same
+/// constructor, same shape — so one dump settles the layout for 3.70 GiB/step
+/// of BF16 traffic and the 0.43 GiB/step head at once.
+///
+/// Layout of `out` (u32 words):
+///
+/// ```text
+///   0   .. 256   B:   [lane * 4 + i] -> (row, col)      i < 4
+///   256 .. 512   A:   same indexing
+///   512 .. 768   Acc: same indexing
+///   768 ..       counts: see the writes below
+/// ```
+#[cube(launch)]
+pub fn mma16_frag_map<AB: Scalar>(out: &mut Tensor<u32>) {
+    let def = cmma::MmaDefinition::<AB, AB, f32>::new(MTILE, NTILE, KTILE);
+    let lane = UNIT_POS_PLANE;
+    let pack = AB::packing_factor();
+
+    let ec_a = def.elems_per_lane(MatrixIdent::A);
+    let vs_a = def.vector_size(MatrixIdent::A);
+    let vc_a = comptime!(ec_a / vs_a);
+    let ec_b = def.elems_per_lane(MatrixIdent::B);
+    let vs_b = def.vector_size(MatrixIdent::B);
+    let vc_b = comptime!(ec_b / vs_b);
+    let ec_c = def.elems_per_lane(MatrixIdent::Accumulator);
+    let vs_c = def.vector_size(MatrixIdent::Accumulator);
+    let vc_c = comptime!(ec_c / vs_c);
+
+    // B is indexed EXACTLY as `w4a16_linear` indexes it -- `i * vs_b`, no
+    // packing factor -- so this dumps the addresses that kernel computes and
+    // not a neighbouring convention.
+    #[unroll]
+    for i in 0..vc_b {
+        let (row, col) = def.position_of_nth(lane, (i * vs_b) as u32, MatrixIdent::B);
+        out[(lane as usize * 4 + i) * 2] = row;
+        out[(lane as usize * 4 + i) * 2 + 1] = col;
+    }
+    #[unroll]
+    for i in 0..vc_a {
+        let (row, col) = def.position_of_nth(lane, (i * vs_a * pack) as u32, MatrixIdent::A);
+        out[256 + (lane as usize * 4 + i) * 2] = row;
+        out[256 + (lane as usize * 4 + i) * 2 + 1] = col;
+    }
+    #[unroll]
+    for i in 0..vc_c {
+        let (row, col) = def.position_of_nth(lane, (i * vs_c) as u32, MatrixIdent::Accumulator);
+        out[512 + (lane as usize * 4 + i) * 2] = row;
+        out[512 + (lane as usize * 4 + i) * 2 + 1] = col;
+    }
+    if lane == 0 {
+        out[768] = vc_b as u32;
+        out[769] = vs_b as u32;
+        out[770] = ec_b as u32;
+        out[771] = vc_a as u32;
+        out[772] = vs_a as u32;
+        out[773] = ec_a as u32;
+        out[774] = vc_c as u32;
+        out[775] = vs_c as u32;
+        out[776] = ec_c as u32;
+        out[777] = pack as u32;
+    }
+}
+
+/// Launch [`mma16_frag_map`] and return the raw `u32` dump.
+pub fn mma16_frag_map_launch<R: Runtime>(client: &ComputeClient<R>) -> Handle {
+    let out = client.empty(1024 * 4);
+    unsafe {
+        mma16_frag_map::launch::<bf16, R>(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(32),
+            TensorArg::from_raw_parts(out.clone(), [1].into(), [1024].into()),
+        )
+    };
+    out
+}

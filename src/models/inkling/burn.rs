@@ -145,6 +145,17 @@ pub struct PackedW {
     pub k: usize,
     /// The tensor-wide scale. `1.0` unless the checkpoint supplied one.
     pub scale2: f32,
+    /// Whether `codes` and `scales` are written in `m16n8k16` MMA-fragment
+    /// order rather than row-major `[n, k/8]` / `[n, k/16]`.
+    ///
+    /// Truth about the BYTES, set only where the permutation actually ran --
+    /// never a request for it. A flag that can disagree with the bytes is how
+    /// a kernel comes to read the wrong layout and produce NUMBERS instead of
+    /// an error, so every consumer branches on this and
+    /// [`linear_fp4`] refuses a weight carrying it outright: the k16
+    /// permutation is not `fp4gemm`'s k64 one and the two are not
+    /// interchangeable.
+    pub swizzled: bool,
 }
 
 /// One projection's weight, in whichever precision it is held.
@@ -214,6 +225,12 @@ pub fn linear_fp4(x: Tensor<Bk, 2>, w: &PackedW) -> Tensor<Bk, 2> {
         "linear_fp4: x is [_, {k}] but the weight is [_, {}]",
         w.k
     );
+    assert!(
+        !w.swizzled,
+        "linear_fp4 was handed a weight in m16n8k16 fragment order. fp4_linear is m16n8k64 \
+         and would read those bytes as if they were row-major -- silently, and as numbers. \
+         The k16 permutation belongs to the W4A16 lane."
+    );
     let m_pad = m.div_ceil(MTILE) * MTILE;
     let client = client_of(&x);
     let dev = x.device();
@@ -268,7 +285,17 @@ pub fn linear_w4a16(x: Tensor<Bk, 2>, w: &PackedW) -> Tensor<Bk, 2> {
         burn::tensor::DType::F32 => to_bf16_launch(&client, &xh, m * k, m_pad * k),
         other => panic!("linear_w4a16: no lane for a {other:?} activation"),
     };
-    let out = w4a16_linear_launch(&client, &a, &w.codes, &w.scales, m_pad, k, w.n, w.scale2);
+    // The permutation is a change of LAYOUT, so the branch is on the bytes and
+    // not on a setting: `w.swizzled` is set where the permutation ran, and a
+    // weight that was never permuted takes the row-major lane here however the
+    // knob is set.
+    let out = if w.swizzled {
+        crate::models::inkling::w4a16gemm::w4a16_linear_swz_launch(
+            &client, &a, &w.codes, &w.scales, m_pad, k, w.n, true, w.scale2,
+        )
+    } else {
+        w4a16_linear_launch(&client, &a, &w.codes, &w.scales, m_pad, k, w.n, w.scale2)
+    };
     tensor_of(client, dev, out, m_pad, w.n).slice([0..m, 0..w.n])
 }
 
@@ -4119,6 +4146,7 @@ mod tests {
             n,
             k,
             scale2: 1.0,
+            swizzled: false,
         };
 
         let xv: Vec<f32> = fill(m * k, 0.31);
@@ -4286,6 +4314,7 @@ mod tests {
             n,
             k,
             scale2: 1.0,
+            swizzled: false,
         };
 
         let xv: Vec<f32> = fill(m * k, 0.31);
