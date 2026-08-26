@@ -9970,10 +9970,14 @@ fn main() -> Result<()> {
                         "  GRAPHLANE: armed on graph {c} at step {step} -- {} of {na} launches \
                          rewritten, {words} words ({staged_words} of them STAGED shapes or \
                          strides, rewritten in the graph's own pinned buffer), 0 addresses \
-                         moving between the second and third capture, 0 cube counts, and every \
-                         moving word affine. {settled_ptrs} address(es) SETTLED between the \
-                         first capture and the second and were stable after it.",
-                        plan.len()
+                         moving between the last two captures, 0 cube counts, and affineness \
+                         {}. {settled_ptrs} address(es) SETTLED between the first capture \
+                         and the second and were stable after it.",
+                        plan.len(),
+                        match want_captures >= 3 {
+                            true => "VERIFIED against a second difference",
+                            false => "ASSUMED (only two captures; INK_GRAPH_LANE_CAPTURES=2)",
+                        }
                     );
                     lane_plan = Some(LanePlan {
                         graph: c,
