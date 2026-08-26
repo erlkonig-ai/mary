@@ -1032,3 +1032,11 @@ required-features = ["inkling-cuda"]
 [[bin]]
 name = "swz_grid_scaling"
 required-features = ["inkling-cuda"]
+
+# What a token's worth of collectives costs THROUGH cubecl's stream-ordered
+# all_reduce, rather than through the hand-written .cu that measured the wire.
+# The two differ in the two ways that matter to the split: the forward does not
+# sync between collectives, and cubecl adds host work the .cu never does.
+[[bin]]
+name = "tp_allreduce_probe"
+required-features = ["inkling-cuda"]

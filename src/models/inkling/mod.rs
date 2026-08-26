@@ -128,6 +128,25 @@ pub mod routetopk;
 // 105.2 ms token, so it is not close.
 pub mod tp;
 
+// THE COLLECTIVE that puts `tp`'s slices back together, and the rendezvous that
+// forms the NCCL group across two BOXES rather than two devices in one process.
+// Split from `tp` because `tp` is arithmetic and its tests run anywhere, while
+// nothing here runs without two GPUs and a wire. The property its header
+// defends is not the 29.56 us latency but the fact that the collective is
+// STREAM-ORDERED and never blocks the calling thread: a collective that synced
+// the host would serialise the layer loop 84 times a token and turn
+// `max(enqueue, device)` back into `enqueue + device`, which is the whole win.
+pub mod tpcomm;
+
+// `tp`'s index ranges turned into BYTES, and which of them still alias the pile.
+// The arithmetic is symmetric between an output-axis cut and an input-axis cut;
+// the COST is not. A row range is a span of the mapping and binds for free; a
+// column range is a stride and must be gathered into a fresh allocation the
+// pile does not back. Every function here can be got wrong in a way that yields
+// finite numbers and fluent text, so each carries a test pinning the exact
+// wrong answer as well as the right one.
+pub mod tpshard;
+
 // The routed-expert ROW PLAN on the device, from a top-k answer that is never
 // read back. `routetopk` moved the decision; this moves everything downstream
 // of it that the host used to need the decision's VALUE for.
