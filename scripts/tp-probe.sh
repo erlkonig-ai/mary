@@ -46,11 +46,23 @@ die() { printf '\n!! %s\n\n' "$*" >&2; exit 2; }
 # --- which interface actually reaches the peer -----------------------------
 IFACE=${IFACE:-$(ip -o route get "$PEER" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)}
 [ -n "$IFACE" ] || die "no route to $PEER from here; set IFACE= and PEER="
+# THIS box's address on the fast fabric, which is what rank 1 must CONNECT to.
+# Not $PEER: that is rank 1's own address, and handing it to rank 1 as the
+# rendezvous makes it dial itself and collect a connection-refused while rank 0
+# blocks in accept() forever. The two look identical from rank 0's side -- a
+# silent hang -- so derive it from the same route lookup rather than assume.
+SELF=${SELF:-$(ip -o route get "$PEER" 2>/dev/null | sed -n 's/.*src \([^ ]*\).*/\1/p' | head -1)}
+[ -n "$SELF" ] || die "cannot determine this box's address on the fabric toward $PEER; set SELF="
 HCA=${HCA:-$(ls -1 "/sys/class/net/$IFACE/device/infiniband" 2>/dev/null | head -1)}
 # The peer's own name for the fast interface, so its NCCL_SOCKET_IFNAME is its
 # own and not a copy of ours -- the two boxes do not name the ConnectX port
 # identically (enp1s0f0np0 here, and it is not safe to assume there).
 RIFACE=${RIFACE:-$($SSH "ip -o -4 addr show | awk '/10\.55\./ {print \$2; exit}'")}
+# And the peer's own HCA, for the same reason: the ports are not named alike
+# (rocep1s0f0 here, rocep1s0f1 there). Leaving rank 1's NCCL_IB_HCA unset lets
+# NCCL pick, which is usually right and occasionally is not -- and a one-sided
+# fallback still costs the socket latency while only the socket end says so.
+RHCA=${RHCA:-$($SSH "ls -1 /sys/class/net/${RIFACE:-none}/device/infiniband 2>/dev/null | head -1")}
 
 echo "=== tp-probe $TAG ==="
 echo "  rank 0    $(hostname)   iface $IFACE   hca ${HCA:-none}"
@@ -117,14 +129,16 @@ COMMON="NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET"
 LENV="$COMMON NCCL_SOCKET_IFNAME=$IFACE"
 RENV="$COMMON NCCL_SOCKET_IFNAME=${RIFACE:-$IFACE}"
 [ -n "$HCA" ] && LENV="$LENV NCCL_IB_HCA=$HCA"
+[ -n "$RHCA" ] && RENV="$RENV NCCL_IB_HCA=$RHCA"
 
 echo "--- run ---"
+echo "  rank 0 binds $SELF:$PORT on $IFACE; rank 1 dials that address"
 echo "  rank 0 env: $LENV"
 echo "  rank 1 env: $RENV"
 env $LENV INK_TP=0:2 "$LBIN" "0.0.0.0:$PORT" "$REPS" "$NCOLL" > "$LLOG" 2>&1 &
 L0PID=$!
 sleep 1
-$SSH "setsid nohup env $RENV INK_TP=1:2 $RBIN $PEER:$PORT $REPS $NCOLL </dev/null > $RLOG 2>&1" &
+$SSH "setsid nohup env $RENV INK_TP=1:2 $RBIN $SELF:$PORT $REPS $NCOLL </dev/null > $RLOG 2>&1" &
 R1PID=$!
 wait $L0PID; LRC=$?
 wait $R1PID 2>/dev/null || true
