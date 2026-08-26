@@ -152,8 +152,15 @@ verdict() {  # verdict <label> <logfile>
   # scores that sentence as a socket channel -- which reported a clean
   # 709-IB/0-socket RoCE run as "MIXED" and would have sent every future run
   # looking for a fallback that was never there.
-  ib=$(grep "NCCL INFO" "$f" 2>/dev/null | grep -c "NET/IB" || echo 0)
-  sock=$(grep "NCCL INFO" "$f" 2>/dev/null | grep -c "NET/Socket" || echo 0)
+  # No `|| echo 0` here, and that is deliberate: `grep -c` PRINTS 0 and EXITS 1
+  # when it matches nothing, so the fallback appends a SECOND zero and the count
+  # becomes "0\n0". Every `[ -gt ]` on it then dies with "integer expression
+  # expected" and the verdict falls through to UNKNOWN -- which fires exactly
+  # when the socket count is zero, i.e. on a perfectly clean RoCE run. Command
+  # substitution captures the count whatever the exit status, so the guard was
+  # never buying anything.
+  ib=$(grep "NCCL INFO" "$f" 2>/dev/null | grep -c "NET/IB")
+  sock=$(grep "NCCL INFO" "$f" 2>/dev/null | grep -c "NET/Socket")
   if [ "$ib" -gt 0 ] && [ "$sock" -eq 0 ]; then
     echo "  $label: NET/IB  ($ib lines) — RDMA, the path the costing assumes"
   elif [ "$sock" -gt 0 ] && [ "$ib" -eq 0 ]; then
