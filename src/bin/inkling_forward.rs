@@ -12822,17 +12822,41 @@ fn main() -> Result<()> {
                     };
                     let p50 = med(&mut lane_patch_us.clone());
                     let r50 = med(&mut lane_replay_us.clone());
+                    // THE EAGER BASELINE IS NOT QUOTABLE FROM THIS RUN, and
+                    // quoting it anyway is how a 2033x lands in a report.
+                    //
+                    // `eager_layers_all` holds the CLEAN decode steps -- not
+                    // the capture passes, not the pre-warm, and not the
+                    // replays. With the lane on there are only a handful of
+                    // those and they are the run's FIRST decode steps, which
+                    // are still compiling kernels: measured here the median
+                    // came out 474 ms against a warm region cost of 35 ms, so
+                    // the ratio it produced was thirteen times too large. The
+                    // honest comparison is against a separate eager RUN, which
+                    // is what the bit-identity gate already does.
                     let mut eager = eager_layers_all.clone();
-                    let e50 = match eager.is_empty() {
-                        true => f64::NAN,
-                        false => med(&mut eager) * 1e6,
-                    };
+                    let clean = eager.len();
                     println!(
-                        "    GRAPHLANE: {lane_steps} decode steps replayed -- patch {p50:.1} us                          + replay {r50:.1} us = {:.1} us host per step, against {e50:.0} us of                          eager host enqueue for the same region ({:.0}x), over {} rewritten                          launches",
+                        "    GRAPHLANE: {lane_steps} decode steps replayed -- patch {p50:.1} us \
+                         + replay {r50:.1} us = {:.1} us host per step, over {} rewritten \
+                         launches",
                         p50 + r50,
-                        e50 / (p50 + r50),
                         lane_plan.as_ref().map(|p| p.plan.len()).unwrap_or(0),
                     );
+                    match clean >= 3 {
+                        true => println!(
+                            "    GRAPHLANE: this run's {clean} clean decode steps enqueued the \
+                             same region in {:.0} us of host time -- but they are the run's \
+                             FIRST, so read the ratio against a separate eager run, never off \
+                             this line",
+                            med(&mut eager) * 1e6,
+                        ),
+                        false => println!(
+                            "    GRAPHLANE: no eager comparison on this run -- only {clean} \
+                             clean decode step(s) ran before the lane armed, and a median over \
+                             that is the COLD region, not the warm one"
+                        ),
+                    }
                     if let Some(p) = lane_plan.as_ref() {
                         println!(
                             "    GRAPHLANE: {} of the rewritten words are STAGED shapes or                              strides -- the half a parameter rewrite cannot reach, written into                              the graph's own pinned buffer instead",
