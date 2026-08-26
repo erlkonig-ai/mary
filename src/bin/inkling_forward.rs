@@ -6460,15 +6460,38 @@ fn main() -> Result<()> {
     let devplan_verify = std::env::var("INK_DEVPLAN_CHECK")
         .map(|v| v == "1")
         .unwrap_or(false);
-    // `INK_DEV_PLAN_MAXN`: the widest pass the device plan will take. The
-    // ceiling is `MTILE`, because above it one expert slot needs more than one
-    // tile and the block count stops being a function of `n` and `top_k`.
-    // `=1` restores the behaviour this lane had before it took a band at all,
-    // which is what makes the widening an A/B rather than a replacement.
+    // `INK_DEV_PLAN_MAXN`: the widest pass the device plan will take.
+    //
+    // **It defaults to 1, and that is a MEASURED default rather than the old
+    // restriction left in place.** The plan can now be built at any width up to
+    // `MTILE` (see `devplan.rs`), and doing so removes the per-layer blocking
+    // readback -- but only by giving up the deduplication of experts across
+    // rows, and on this model those two are worth about the same. One node,
+    // spark2-zt (GB10), layers 0:21, a 3772-token prompt, 12 cached decode
+    // steps, two INTERLEAVED reps, medians, one binary:
+    //
+    //     arm                                    w = 2     w = 3
+    //     MAXN=1   (dedup, readback)              69.0      75.6
+    //     MAXN=16  (no dedup, no readback)        67.9      78.2
+    //     INK_ROUTE_STALE=1 (dedup, no readback)  64.0        --
+    //
+    // At w = 2 the two cancel to within the spread; at w = 3 dedup wins by
+    // 2.6 ms, because a third row duplicates more experts while the readback is
+    // worth less. The log's own counter says the same thing in slabs: 193 a
+    // pass deduplicated at w = 2 against 228 without.
+    //
+    // The probe row is the one that matters for whoever picks this up. A plan
+    // that dedups AND stays on the device is worth 5.0 ms at w = 2 against
+    // MAXN=1, and none of that is reachable without moving `row_tok`,
+    // `blk_slot`, `blk_tile0`, `blk_cnt`, `tok_rows` and `tok_cnt` onto the
+    // device too -- because dedup is exactly what turns them into data.
+    // `MAXN=16` stays because it is the half of that which is already built and
+    // checked (`INK_DEVPLAN_CHECK=1` passes at width 2 over 19 layers x 4
+    // steps), not because it wins.
     let dev_plan_maxn: usize = std::env::var("INK_DEV_PLAN_MAXN")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(mary::models::inkling::fp4gemm::MTILE)
+        .unwrap_or(1)
         .min(mary::models::inkling::fp4gemm::MTILE);
     let mut devroute: Option<DevRoute> = None;
     // Per decode pass: which arm it ran and what it cost. The arms are
