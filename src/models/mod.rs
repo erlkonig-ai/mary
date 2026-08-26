@@ -39,3 +39,16 @@ pub mod k3;
 // feature, and it names CUDA: every lane below is a Blackwell tensor-core lane.
 #[cfg(feature = "inkling-cuda")]
 pub mod inkling;
+
+// Inkling's speculation algebra — tree topology, top-b, the drafting schedule,
+// the ancestor masks, the accept walk — is backend-free by construction, and
+// the whole point of building it that way is that it can be TESTED where there
+// is no GPU. `models::inkling` is gated on the CUDA lane, which no laptop can
+// compile, so without that lane the module is re-formed around the one file
+// that does not need it. Same path either way:
+// `mary::models::inkling::spectree`.
+#[cfg(not(feature = "inkling-cuda"))]
+pub mod inkling {
+    #[path = "spectree.rs"]
+    pub mod spectree;
+}
