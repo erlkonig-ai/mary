@@ -2523,6 +2523,64 @@ fn quantized_bf16(
     }
 }
 
+/// `INK_DENSE_FAKEQUANT=1`: run the dense MLP's weights through the NVFP4
+/// quantiser and back, and keep multiplying them with the BF16 GEMM.
+///
+/// # Why a round trip and not simply the W4A16 lane
+///
+/// The question this answers is ONLY "what does NVFP4's error do to this
+/// model's tokens", and the way to ask it badly is to switch the dense MLP to
+/// `linear_w4a16` and read the output. That changes the quantiser AND the
+/// kernel AND the operand layout in one step, so a wiring mistake -- a
+/// transposed weight, a mis-slid scale, a fragment order the reader disagrees
+/// with -- arrives looking exactly like quantisation damage. This project has
+/// already had one of those reach a merge verification with plausible logits
+/// (see [`w4a16_bind`]), and the attention-quantisation attempt died on the
+/// same ambiguity.
+///
+/// So: quantise, dequantise, and hand the RESULT to the same `bind_bf16` and
+/// the same `dense_mlp_bf16` the baseline uses. The only thing that changes is
+/// the VALUES. If the tokens survive this, the error is acceptable and the
+/// remaining work is a kernel change whose correctness is a separate,
+/// bit-level question. If they do not, no kernel was ever written.
+///
+/// The floor to compare against is bit-identical: the same binary with the
+/// variable unset. Compare TOKENS, not logits, and compare them before any
+/// timing number is quoted -- the timing of this arm is meaningless anyway,
+/// since it reads the same BF16 bytes the baseline does and merely spent a
+/// startup pass making them worse.
+///
+/// It uses the PRODUCTION quantiser (`quantize_nvfp4_bf16`, the one the sinks
+/// and the head go through) rather than a host reimplementation, so what it
+/// measures is the error this runtime would actually commit.
+fn dense_fake_quant() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("INK_DENSE_FAKEQUANT").as_deref() == Ok("1"))
+}
+
+/// One BF16 weight through NVFP4 and back, still BF16. See [`dense_fake_quant`].
+fn fake_quant_bf16(
+    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+    bytes: &[u8],
+    rows: usize,
+    cols: usize,
+) -> Vec<u8> {
+    use mary::models::inkling::fp4quant::{dequantize_nvfp4_bf16, quantize_nvfp4_bf16};
+    assert_eq!(
+        bytes.len(),
+        rows * cols * 2,
+        "{rows}x{cols} BF16 is not {} bytes",
+        bytes.len()
+    );
+    let src = client.create_from_slice(bytes);
+    let (codes, scales) = quantize_nvfp4_bf16(client, &src, rows, cols);
+    let back = dequantize_nvfp4_bf16(client, &codes, &scales, rows, cols);
+    client
+        .read_one(back)
+        .expect("read back the round-tripped dense weight")
+        .to_vec()
+}
+
 /// Bind a quantised weight to the W4A16 lane, in MMA-fragment order where the
 /// shape allows it.
 ///
@@ -2817,10 +2875,36 @@ impl DeviceDense {
             // accessor and costs four bytes.
             let gs = cp.tensor(&format!("{p}mlp.global_scale"))?.data[0];
             self.bytes += (g.len() + u.len() + down.bytes.len()) as u64;
+            // `INK_DENSE_FAKEQUANT=1` replaces each weight with its own NVFP4
+            // round trip. Same shapes, same binds, same GEMM -- only the values
+            // move. One consequence worth naming: `w2` normally ALIASES the
+            // pile, and a round-tripped copy cannot, so this arm holds one extra
+            // resident copy of it. That is a residency difference in a
+            // diagnostic, not a lane anyone ships.
+            // Built ONLY when the probe is on, and the default arm then binds the
+            // very same slices it always did. Written as an `Option` of three
+            // owned buffers rather than as an `if/else` yielding three `Vec`s
+            // because `w2` normally ALIASES the pile -- a `to_vec()` on the
+            // default path would silently cost a resident copy of it on every
+            // run, which is precisely the kind of residency regression a
+            // diagnostic must not introduce. Under the probe that copy is
+            // unavoidable (a round-tripped buffer is not in the mapping) and is
+            // one more reason the arm's TIMING means nothing.
+            let fq = dense_fake_quant().then(|| {
+                (
+                    fake_quant_bf16(client, &g, inter, h),
+                    fake_quant_bf16(client, &u, inter, h),
+                    fake_quant_bf16(client, &down.bytes, drows, dcols),
+                )
+            });
+            let (gb, ub, db): (&[u8], &[u8], &[u8]) = match &fq {
+                Some((a, b, c)) => (a, b, c),
+                None => (&g, &u, &down.bytes),
+            };
             let trip = (
-                bind_bf16(client, aliases, &g, inter, h),
-                bind_bf16(client, aliases, &u, inter, h),
-                bind_bf16(client, aliases, &down.bytes, drows, dcols),
+                bind_bf16(client, aliases, gb, inter, h),
+                bind_bf16(client, aliases, ub, inter, h),
+                bind_bf16(client, aliases, db, drows, dcols),
                 gs,
             );
             self.dense.insert(p.to_string(), trip);
