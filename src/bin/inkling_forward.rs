@@ -335,6 +335,29 @@
 //! observed is that two arithmetically-equivalent ways of computing that
 //! distribution do not round identically.
 //!
+//! ## The fixed reference that gate needs
+//!
+//! `INK_FORCE_IDS=/path/to/tokens.ids` pins the decoded sequence: i64
+//! little-endian, the same format as a prompt `.ids`, one token consumed per
+//! decode step (index `step - 1`, wrapping if exhausted). It prints
+//! `forced sequence : INK_FORCE_IDS -- N tokens, decode is DETERMINISTIC`, so
+//! a log proves it was on rather than assumed. It REFUSES `INK_SPEC`
+//! (acceptance is an argmax match, which forcing makes meaningless) and
+//! `INK_REPEAT`. It works at any `INK_WIDTH`: row 0 takes the forced token
+//! and the filler rows are untouched.
+//!
+//! That last property is exactly what the same-width gate above asks for. Two
+//! arms at the same width, decoding the same fixed sequence, differ only in
+//! the thing under test — which is the comparison a one-row baseline cannot
+//! give, because at one row the arithmetic itself is different.
+//!
+//! Built by another window for a determinism problem that turned out not to
+//! exist, and as of 2026-08-26 it is UNCOMMITTED — a sibling scratch worktree
+//! named `mary-inkling-import` on the second box, at `0f3b414`, together with
+//! `INK_TOPB` and `INK_WIDTH_TOKENS`. Recorded here because an invocation that
+//! lives only in a scratch tree and a chat message is one `git clean` from
+//! being rediscovered the slow way.
+//!
 //! # `INK_SPEC=k`: the accept-and-skip loop, and what decides whether it pays
 //!
 //! The loop the MTP acceptance measurement was for, wired end to end. Set it on
