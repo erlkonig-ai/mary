@@ -8964,7 +8964,20 @@ fn main() -> Result<()> {
             // accepted prefix are functions of tokens the model did not choose. An
             // MTP head drafting from one of those would be drafting off a state
             // that never happened, and nothing downstream would say so.
-            let entry = if verify_rows > 1 && new_toks.len() < n {
+            let entry = if !tree_kept.is_empty() {
+                // ...and for a TREE the kept rows are a PATH, not a prefix. The
+                // slice below is right for a linear speculation, where the
+                // accepted rows are rows 0..m by construction, and silently
+                // wrong here: accepting the SECOND candidate keeps rows 0 and 2,
+                // and taking rows 0 and 1 instead would feed head 0 the hidden
+                // state of a branch the model rejected. It would draft off a
+                // state that never happened and nothing downstream would say so.
+                let mut kept = Vec::with_capacity(tree_kept.len() * h);
+                for &r in &tree_kept {
+                    kept.extend_from_slice(&entry[r * h..(r + 1) * h]);
+                }
+                kept
+            } else if verify_rows > 1 && new_toks.len() < n {
                 entry[..new_toks.len() * h].to_vec()
             } else {
                 entry
@@ -9943,7 +9956,13 @@ fn main() -> Result<()> {
             } else {
                 draft_whole(&mtp_main, seq, &ids, best)
             };
-            if spec_k == 0 {
+            // `tree_b == 0` for the same reason `spec_k == 0` is here: this
+            // bookkeeping keys a draft by the STEP it will be scored at, which
+            // is only a token index while a pass confirms exactly one token. A
+            // tree pass confirms one or two, so every key past the first
+            // acceptance would name the wrong position -- and it would read as a
+            // per-depth acceptance rate, not as an error.
+            if spec_k == 0 && tree_b == 0 {
                 mtp_issued.insert(step, vec![None; drafts.len()]);
                 if mtp_prob {
                     mtp_issued_q.insert(step, vec![None; drafts.len()]);
