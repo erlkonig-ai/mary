@@ -92,6 +92,11 @@ pub mod pad;
 /// why pages rather than a contiguous tensor.
 pub mod kvpages;
 pub mod source;
+// Token-TREE speculative decoding over the chained MTP heads: topology,
+// top-b, the drafting schedule, the ancestor masks and the accept walk. Pure
+// index algebra, no backend — so the parts that are easy to get subtly wrong
+// are tested without a GPU.
+pub mod spectree;
 pub mod stack;
 pub mod vision;
 

@@ -297,6 +297,67 @@
 //! wired accept-and-skip loop, which reads 0.916x at w = 1, 0.866x at w = 2 and
 //! 0.742x at w = 3 against an unspeculated 127.1 ms baseline -- a baseline that
 //! is also an independent confirmation of the 126.8 ms above.
+//! # A WIDENED PASS IS NOT TOKEN-IDENTICAL TO A ONE-ROW PASS
+//!
+//! Measured 2026-08-26 on the GB10, layers 0:21, ctx512 (`refprompts/ctx512`),
+//! `INK_KV=1 INK_GEN=48`, release, same binary and same commit for every arm:
+//!
+//! ```text
+//! arm                        agrees with the 1-row baseline for
+//! INK_WIDTH=2 (2 rows)       the first 18 generated tokens, then diverges
+//! INK_WIDTH=3 (3 rows)       the first 17
+//! INK_FLASH=0 (1 row, paged) the first 12
+//! ```
+//!
+//! `INK_WIDTH` is a COST PROBE. Its extra rows are random filler, it reads the
+//! argmax off ROW 0, and nothing is drafted, accepted or rolled back. Row 0 of
+//! a widened batch is the same token in the same context as the one-row pass --
+//! and it still stops agreeing after seventeen tokens.
+//!
+//! So the divergence is not speculation, not a tree, and not a bug. Row 0 of an
+//! `n`-row batch is a different summation order from a one-row step (a batched
+//! convolution kernel, a batched attention, a different reduction), the
+//! difference is ~1e-5, and this model's argmax is tight enough that ~1e-5
+//! flips a token inside twenty. The fused/paged attention lanes disagree by the
+//! same order and do the same thing sooner.
+//!
+//! **This re-specifies what a speculation numerics gate can assert.** "The
+//! speculative lane must agree token-for-token with non-speculative greedy" is
+//! not achievable by ANY widened pass on this stack, including the `INK_SPEC`
+//! lane that already ships. The gate that IS meaningful is agreement against a
+//! SAME-WIDTH reference -- `INK_WIDTH=n` against a tree of `n` rows -- because
+//! that holds the arithmetic fixed and varies only the thing under test. A gate
+//! against the one-row baseline measures the model's argmax margin, which is a
+//! fact about the checkpoint and not about the change.
+//!
+//! The theorem speculative decoding actually offers is about the DISTRIBUTION
+//! the verifier accepts from, and it is untouched by this: what is being
+//! observed is that two arithmetically-equivalent ways of computing that
+//! distribution do not round identically.
+//!
+//! ## The fixed reference that gate needs
+//!
+//! `INK_FORCE_IDS=/path/to/tokens.ids` pins the decoded sequence: i64
+//! little-endian, the same format as a prompt `.ids`, one token consumed per
+//! decode step (index `step - 1`, wrapping if exhausted). It prints
+//! `forced sequence : INK_FORCE_IDS -- N tokens, decode is DETERMINISTIC`, so
+//! a log proves it was on rather than assumed. It REFUSES `INK_SPEC`
+//! (acceptance is an argmax match, which forcing makes meaningless) and
+//! `INK_REPEAT`. It works at any `INK_WIDTH`: row 0 takes the forced token
+//! and the filler rows are untouched.
+//!
+//! That last property is exactly what the same-width gate above asks for. Two
+//! arms at the same width, decoding the same fixed sequence, differ only in
+//! the thing under test — which is the comparison a one-row baseline cannot
+//! give, because at one row the arithmetic itself is different.
+//!
+//! Built by another window for a determinism problem that turned out not to
+//! exist, and as of 2026-08-26 it is UNCOMMITTED — a sibling scratch worktree
+//! named `mary-inkling-import` on the second box, at `0f3b414`, together with
+//! `INK_TOPB` and `INK_WIDTH_TOKENS`. Recorded here because an invocation that
+//! lives only in a scratch tree and a chat message is one `git clean` from
+//! being rediscovered the slow way.
+//!
 //! # `INK_SPEC=k`: the accept-and-skip loop, and what decides whether it pays
 //!
 //! The loop the MTP acceptance measurement was for, wired end to end. Set it on
@@ -1495,6 +1556,7 @@ use mary::models::inkling::mtp::{
 };
 use mary::models::inkling::pile::Elem;
 use mary::models::inkling::source::Weights;
+use mary::models::inkling::spectree::{self, TreeSpec};
 use mary::models::inkling::stack::{embed_and_norm_bf16, embed_row_bf16};
 use mary::models::inkling::stepstat;
 
@@ -6296,6 +6358,105 @@ fn main() -> Result<()> {
         "INK_MTP={mtp_k} but the checkpoint ships {} MTP heads",
         cfg.mtp_config.num_nextn_predict_layers
     );
+
+    // ---- INK_TREE: single-box TOKEN-TREE speculation ------------------------
+    //
+    // A separate entry from `INK_SPEC` rather than a widening of it, and that is
+    // a decision rather than an accident. `INK_SPEC` is a TWO-MACHINE
+    // arrangement -- only the tail can draft, only the head can embed, and the
+    // drafts travel on the wire -- because today's parallelism is pipeline
+    // parallel. Three reasons not to teach that wire a topology:
+    //
+    //  * the tree exists to answer ONE question (does breadth pay at b = 2),
+    //    and running it over a pipe adds the wire, the pipeline fill and the
+    //    head/tail split to a number that should be about the drafter alone;
+    //  * TP2 replaces PP2, and under TP2 both ranks run all 42 layers, so
+    //    "only the tail can draft" dissolves. A wire protocol for the PP2
+    //    arrangement is an investment in a path being removed;
+    //  * the phase-3 gate is token-for-token agreement with non-speculative
+    //    greedy, which is a clean comparison on one box and a messy one across
+    //    a pipe.
+    //
+    // `b` candidates for the NEXT token and nothing else. The draft side of
+    // that is FREE: every candidate comes off head 0's newest stable row, which
+    // the decode step has already computed, so it is one top-b instead of one
+    // argmax and not a single extra head step. See
+    // [`mary::models::inkling::spectree::TreeSpec::breadth`] for the measured
+    // cost of the verify side and the 2.0-tokens-per-pass ceiling that bounds
+    // what breadth at depth 1 can ever be worth.
+    let tree_b: usize = std::env::var("INK_TREE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    anyhow::ensure!(
+        tree_b == 0 || tree_b >= 2,
+        "INK_TREE={tree_b} is not a tree: breadth 1 is the chain this already runs"
+    );
+    anyhow::ensure!(
+        tree_b == 0 || kv,
+        "INK_TREE wants INK_KV=1: speculation is about skipping sequential steps, and the \
+         uncached lane has no cache to roll back"
+    );
+    anyhow::ensure!(
+        tree_b == 0 || pipe_spec.is_none(),
+        "INK_TREE is the SINGLE-BOX lane; INK_SPEC is the pipe's. Setting both asks one \
+         process to be two arrangements at once"
+    );
+    anyhow::ensure!(
+        tree_b == 0 || spec_k == 0,
+        "INK_TREE and INK_SPEC are two speculation lanes and both widen the pass"
+    );
+    anyhow::ensure!(
+        tree_b == 0 || !slot_lane,
+        "INK_TREE follows ONE sequence and INK_SLOTS runs several"
+    );
+    anyhow::ensure!(
+        tree_b == 0 || width == 1,
+        "INK_WIDTH fills a widened pass with filler rows; INK_TREE fills it with candidates"
+    );
+    anyhow::ensure!(
+        tree_b == 0 || !repeat,
+        "INK_REPEAT and INK_TREE measure different things"
+    );
+    anyhow::ensure!(
+        tree_b == 0 || mtp_dev_on,
+        "INK_TREE wants the device draft lane (INK_MTP_DEV unset or 1)"
+    );
+    // Depth 1 needs head 0 and no other. Refusing the rest is not tidiness:
+    // heads 1..k would each run their triangle of speculative rows, and every
+    // one of those drafts a token this tree has no node for.
+    anyhow::ensure!(
+        tree_b == 0 || mtp_k == 1,
+        "INK_TREE={tree_b} is a DEPTH-1 tree and wants INK_MTP=1; INK_MTP={mtp_k} would draft \
+         {} deeper token(s) the tree has no node for and pay for them",
+        mtp_k.saturating_sub(1)
+    );
+    let spec_tree: Option<TreeSpec> = if tree_b > 0 {
+        Some(TreeSpec::breadth(tree_b)?)
+    } else {
+        None
+    };
+    // Built once: the taps, the visibility and the depths are facts about the
+    // TOPOLOGY, and the topology is fixed for the run.
+    let tree_attn = spec_tree
+        .as_ref()
+        .map(|tr| spectree::tree_attn(tr, t.sconv_kernel_size));
+    if let Some(tr) = spec_tree.as_ref() {
+        println!(
+            "  tree speculation   : INK_TREE={tree_b} -- verify pass is {} rows, {} candidate(s) \
+             for t+1, draft side costs {} extra head step(s)",
+            tr.len(),
+            tr.drafts(),
+            spectree::predicted_steps(tr, mtp_k, spectree::CacheFill::Exact),
+        );
+        if tree_b > spectree::MAX_MEASURED_BREADTH {
+            println!(
+                "  NOTE: b={tree_b} is past MAX_MEASURED_BREADTH={}; the marginal candidate \
+                 costs more distinct experts than an extra SEQUENTIAL token does",
+                spectree::MAX_MEASURED_BREADTH
+            );
+        }
+    }
     println!("  attention          : device, weights DEVICE-RESIDENT");
     let routed_layers = (lo..hi).filter(|&layer| !t.is_dense(layer)).count();
     let routed_f32 = (lo..hi)
@@ -6868,10 +7029,24 @@ fn main() -> Result<()> {
     // runs. A tail never uses it: it answers the pass it is on.
     let mut in_flight: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
     let mut last_drafts: Vec<usize> = Vec::new();
+    // The tree's candidate tokens for t+1, node order (so rank order at depth
+    // 1), root EXCLUDED -- the root is the token `ids` already ends with. Empty
+    // on the pass that has not drafted yet, which is exactly the prefill.
+    let mut tree_drafts: Vec<usize> = Vec::new();
     // Tokens, not passes: a speculative pass confirms between 1 and k+1 of
     // them, so this is what the run's length and its tok/s are counted in.
     let mut gen_tokens = 0usize;
-    let mut spec_hist = vec![0usize; spec_k + 2];
+    // A depth-1 tree confirms at most 2 tokens a pass, whatever `b` is: breadth
+    // raises the PROBABILITY of reaching that ceiling and only depth raises the
+    // ceiling itself.
+    let tree_depth = spec_tree.as_ref().map(|tr| tr.max_depth()).unwrap_or(0);
+    let mut spec_hist = vec![0usize; spec_k.max(tree_depth) + 2];
+    // WHICH candidate the verifier took, by rank, with the last bucket meaning
+    // it took none. This is the number the whole tree exists to produce: a
+    // rank-0 acceptance is one a plain chain would also have got, and only the
+    // rank>0 column is a token breadth WON. Without it an acceptance rate says
+    // the tree is working and not whether it is worth anything.
+    let mut tree_rank_hist = vec![0usize; tree_b + 1];
     let mut pass_ms: Vec<f64> = Vec::new();
     // The machine under the pass, sampled per pass, for the intermittent
     // multi-second stall. Off unless `INK_STEPSTAT=1`; see
@@ -6998,6 +7173,12 @@ fn main() -> Result<()> {
                     .expect("a step past the prefill has produced a token"),
             ];
             f.extend(drafts_in.iter().copied());
+            // The tree lane's candidates. Same shape as `drafts_in` and made on
+            // this machine rather than read off a wire, which is the whole
+            // difference between the two lanes. `f` is now the verify batch in
+            // NODE order, `f[0]` being the root, which is what `accept_tree`
+            // and the ancestor mask were both built to index.
+            f.extend(tree_drafts.iter().copied());
             // The width probe's filler. Drawn from a counter rather than from the
             // sequence: a batch of the same token routes to the same eight experts
             // and would price the expert stream once for the whole batch, which is
@@ -7038,6 +7219,11 @@ fn main() -> Result<()> {
         // rather than a belief about the log.
         let t_prep = pass.elapsed().as_secs_f64();
         let t_emb = Instant::now();
+        // Whether THIS pass is carrying a tree. A tree lane still runs ordinary
+        // one-row passes (the prefill, and any pass before the first draft), and
+        // on those the descriptor must be absent rather than merely unused --
+        // `attention_steps_tree` asserts its arity against the batch.
+        let pass_tree_ready = tree_b > 0 && !tree_drafts.is_empty();
         let (n, pos0, x_in) = match incoming {
             Some((n, p, _c, x)) => (n, p, x),
             None => {
@@ -7052,6 +7238,24 @@ fn main() -> Result<()> {
             }
         };
         fatal::note_tokens(n);
+        // The tree descriptor for THIS pass, or `None` on a pass that is a plain
+        // chain. Both conditions matter: `pass_tree_ready` says the previous pass
+        // left candidates, and `n > 1` says they are actually in this batch --
+        // the prefill has neither.
+        let pass_tree: Option<&spectree::TreeAttn> = if pass_tree_ready && kv && is_decode && n > 1
+        {
+            let tr = tree_attn
+                .as_ref()
+                .expect("the descriptor is built whenever INK_TREE is set");
+            assert_eq!(
+                tr.rows, n,
+                "the tree describes {} rows and the pass feeds {n}",
+                tr.rows
+            );
+            Some(tr)
+        } else {
+            None
+        };
 
         let dump_dir = std::env::var("INK_DUMP_DIR").ok();
         if let Some(dir) = dump_dir.as_ref() {
@@ -7459,7 +7663,7 @@ fn main() -> Result<()> {
                 // and the convolution keeps its whole window, so neither is final
                 // until the verifier below says how many rows survived. Nothing
                 // here knows that yet -- the answer is a machine away.
-                let y = dev_lane::attention_steps(
+                let y = dev_lane::attention_steps_tree(
                     hn,
                     &ld.attn,
                     &dims,
@@ -7467,12 +7671,29 @@ fn main() -> Result<()> {
                     pos0,
                     window,
                     &mut caches[slot].attn,
+                    pass_tree,
                 );
-                let (out, all) = dev_lane::short_conv_steps(
-                    caches[slot].attn_sconv.clone(),
-                    y,
-                    ld.attn_sconv.clone(),
-                );
+                // Two of the FOUR short convolutions a widened pass runs are
+                // inside the attention above; these are the block's own, and
+                // they need the same taps for the same reason. The batched
+                // kernel reads the rows physically preceding row `i`, which for
+                // a chain are its ancestors and for a tree are whatever the
+                // layout put there -- and the failure is silent, because masked
+                // attention does not reach a convolution and the numbers stay
+                // finite.
+                let (out, all) = match pass_tree {
+                    None => dev_lane::short_conv_steps(
+                        caches[slot].attn_sconv.clone(),
+                        y,
+                        ld.attn_sconv.clone(),
+                    ),
+                    Some(tr) => dev_lane::short_conv_tree_steps(
+                        caches[slot].attn_sconv.clone(),
+                        y,
+                        ld.attn_sconv.clone(),
+                        &tr.taps,
+                    ),
+                };
                 caches[slot].attn_sconv_pending = Some(all);
                 out
             } else if kv && is_decode {
@@ -8172,7 +8393,16 @@ fn main() -> Result<()> {
                         .clone()
                         .expect("a step past the prefill has a history");
                     if n > 1 {
-                        let (out, all) = dev_lane::short_conv_steps(hist, y, ld.mlp_sconv.clone());
+                        // The fourth convolution, and the same taps again.
+                        let (out, all) = match pass_tree {
+                            None => dev_lane::short_conv_steps(hist, y, ld.mlp_sconv.clone()),
+                            Some(tr) => dev_lane::short_conv_tree_steps(
+                                hist,
+                                y,
+                                ld.mlp_sconv.clone(),
+                                &tr.taps,
+                            ),
+                        };
                         caches[slot].mlp_sconv_pending = Some(all);
                         out
                     } else {
@@ -8479,7 +8709,11 @@ fn main() -> Result<()> {
         // PER ROW, and every one of them is needed: the accepted prefix is the
         // leading run where the draft and the argmax agree, so a rule that only
         // looked at the last row could not find where the agreement stopped.
-        let verify_rows = if spec_k > 0 && kv && step > 0 { n } else { 1 };
+        let verify_rows = if (spec_k > 0 || pass_tree.is_some()) && kv && step > 0 {
+            n
+        } else {
+            1
+        };
         // The width probe's rows, derived from the batch the head actually sent
         // rather than from this process's environment -- so INK_WIDTH is set on the
         // head alone and the two ends cannot disagree about it.
@@ -8487,7 +8721,7 @@ fn main() -> Result<()> {
         // Every row is unembedded, and that is deliberate: b independent sequences
         // each need their own logits, so a probe that unembedded one row would
         // leave the widest matmul in the stack out of the price.
-        let probe_rows = if spec_k == 0 && kv && is_decode && n > 1 && !slot_lane {
+        let probe_rows = if spec_k == 0 && tree_b == 0 && kv && is_decode && n > 1 && !slot_lane {
             n
         } else {
             1
@@ -8683,6 +8917,12 @@ fn main() -> Result<()> {
         // 40.6% under 1-TV), because when the draft is the argmax the target agrees
         // strongly and when it is not the target puts little mass there either.
         let new_toks: Vec<usize>;
+        // Which VERIFY ROWS this pass's accept walk kept, when the pass carried a
+        // tree. The root followed by the accepted path: ascending, but NOT
+        // contiguous, which is the whole difference from a linear rollback. Empty
+        // on every other kind of pass, and that emptiness is what selects the
+        // truncating rollback below.
+        let mut tree_kept: Vec<usize> = Vec::new();
         // The host argmax, which is a scalar loop over a 200058-wide f32 row and
         // is run once per confirmed row. It is the largest piece of pure host
         // arithmetic left in a decode pass and nothing has ever timed it, so it
@@ -8711,7 +8951,26 @@ fn main() -> Result<()> {
                 t_am.set(t_am.get() + t_a0.elapsed().as_secs_f64());
                 b
             };
-            if verify_rows > 1 {
+            if let (true, Some(tr)) = (verify_rows > 1, spec_tree.as_ref()) {
+                debug_assert_eq!(logit_row0, 0, "a verify pass reads from row 0");
+                anyhow::ensure!(
+                    n == tr.len(),
+                    "the pass fed {n} rows against a {}-node tree",
+                    tr.len()
+                );
+                // Row `i` was fed node `i`'s token and scored in a context that
+                // is exactly node `i`'s ancestry -- which is what the mask, the
+                // positions and the four gathered convolutions were all for. So
+                // walk from the root: whatever the target predicted at the
+                // current node is a confirmed token, and if some CHILD holds
+                // that token then that child's own row was scored in a context
+                // the model has now committed to and its prediction is a fact
+                // too. Reduces exactly to the linear rule on a chain.
+                let preds: Vec<usize> = (0..rows).map(argmax_of).collect();
+                let acc = spectree::accept_tree(tr, &feed, &preds);
+                tree_kept = acc.kept_rows;
+                new_toks = acc.new_toks;
+            } else if verify_rows > 1 {
                 debug_assert_eq!(logit_row0, 0, "a verify pass reads from row 0");
                 anyhow::ensure!(
                     n == 1 + last_drafts.len(),
@@ -8763,7 +9022,13 @@ fn main() -> Result<()> {
         // is `best` and is pushed where it has always been pushed, so the MTP block
         // below sees exactly the sequence-and-a-held-back-argmax it was written
         // against.
-        if is_tail && gen_steps > 0 && !repeat && new_toks.len() > 1 && !slot_lane {
+        // The tree lane joins the tail here rather than at the report below, and
+        // the ORDER is the reason: the MTP block reads `ids` and requires that
+        // it hold every confirmed token EXCEPT the last, which is `best`. Left
+        // to the report, a pass that accepted a draft would hand the drafter a
+        // sequence short by exactly the tokens it just confirmed, and the
+        // symptom would be an acceptance rate rather than an error.
+        if (is_tail || tree_b > 0) && gen_steps > 0 && !repeat && new_toks.len() > 1 && !slot_lane {
             ids.extend_from_slice(&new_toks[..new_toks.len() - 1]);
         }
         // Each slot's own stream. A prefill pass produced the first generated token
@@ -8803,18 +9068,39 @@ fn main() -> Result<()> {
                 } else {
                     None
                 };
-                c.attn.commit(keep, window);
-                if let Some(all) = c.attn_sconv_pending.take() {
-                    c.attn_sconv = dev_lane::conv_history(
-                        all.slice([0..hist + keep, 0..h]),
-                        t.sconv_kernel_size,
-                    );
-                }
-                if let Some(all) = c.mlp_sconv_pending.take() {
-                    c.mlp_sconv = Some(dev_lane::conv_history(
-                        all.slice([0..hist + keep, 0..h]),
-                        t.sconv_kernel_size,
-                    ));
+                // A linear pass keeps a PREFIX of the batch and rolls back with
+                // a truncation. A tree keeps a PATH through it, whose rows are
+                // not contiguous, so there is no slice of the cache that is
+                // those rows and the rollback is a GATHER -- of K and V, and of
+                // all three convolution windows, by the same indices.
+                if tree_kept.is_empty() {
+                    c.attn.commit(keep, window);
+                    if let Some(all) = c.attn_sconv_pending.take() {
+                        c.attn_sconv = dev_lane::conv_history(
+                            all.slice([0..hist + keep, 0..h]),
+                            t.sconv_kernel_size,
+                        );
+                    }
+                    if let Some(all) = c.mlp_sconv_pending.take() {
+                        c.mlp_sconv = Some(dev_lane::conv_history(
+                            all.slice([0..hist + keep, 0..h]),
+                            t.sconv_kernel_size,
+                        ));
+                    }
+                } else {
+                    debug_assert_eq!(tree_kept.len(), keep, "one kept row per confirmed token");
+                    c.attn.commit_rows(&tree_kept, window);
+                    if let Some(all) = c.attn_sconv_pending.take() {
+                        c.attn_sconv =
+                            dev_lane::conv_history_rows(all, t.sconv_kernel_size, &tree_kept);
+                    }
+                    if let Some(all) = c.mlp_sconv_pending.take() {
+                        c.mlp_sconv = Some(dev_lane::conv_history_rows(
+                            all,
+                            t.sconv_kernel_size,
+                            &tree_kept,
+                        ));
+                    }
                 }
             }
         }
@@ -8836,6 +9122,13 @@ fn main() -> Result<()> {
         if is_decode && !slot_lane {
             let bucket = new_toks.len().min(spec_hist.len() - 1);
             spec_hist[bucket] += 1;
+        }
+        if is_decode && tree_b > 0 && verify_rows > 1 {
+            let tr = spec_tree.as_ref().expect("the tree lane has a topology");
+            match tree_kept.get(1) {
+                Some(&node) => tree_rank_hist[tr.node(node).rank] += 1,
+                None => tree_rank_hist[tree_b] += 1,
+            }
         }
 
         // ---- MTP: score the drafts that named this step, then draft afresh -----
@@ -8982,7 +9275,20 @@ fn main() -> Result<()> {
             // accepted prefix are functions of tokens the model did not choose. An
             // MTP head drafting from one of those would be drafting off a state
             // that never happened, and nothing downstream would say so.
-            let entry = if verify_rows > 1 && new_toks.len() < n {
+            let entry = if !tree_kept.is_empty() {
+                // ...and for a TREE the kept rows are a PATH, not a prefix. The
+                // slice below is right for a linear speculation, where the
+                // accepted rows are rows 0..m by construction, and silently
+                // wrong here: accepting the SECOND candidate keeps rows 0 and 2,
+                // and taking rows 0 and 1 instead would feed head 0 the hidden
+                // state of a branch the model rejected. It would draft off a
+                // state that never happened and nothing downstream would say so.
+                let mut kept = Vec::with_capacity(tree_kept.len() * h);
+                for &r in &tree_kept {
+                    kept.extend_from_slice(&entry[r * h..(r + 1) * h]);
+                }
+                kept
+            } else if verify_rows > 1 && new_toks.len() < n {
                 entry[..new_toks.len() * h].to_vec()
             } else {
                 entry
@@ -9126,11 +9432,17 @@ fn main() -> Result<()> {
             // The readback's only real consumer: `INK_MTP_PROB`, which is off by
             // default. Nothing else ever looked at the row, so nothing else has to
             // pay for it.
-            let draft_pick = |row: T2| -> usize {
-                let width = match draft_cand.as_ref() {
-                    Some((_, w)) => w.n,
-                    None => v,
-                };
+            //
+            // Factored out of [`draft_pick`] because the tree lane needs the
+            // same row's TOP-B and the unembedding is the widest matmul in the
+            // stack: 4096 x 200058. Running it twice a step to get an argmax and
+            // then the b candidates that already contain it would be the most
+            // expensive way imaginable to learn something the first call knew.
+            let draft_width = match draft_cand.as_ref() {
+                Some((_, w)) => w.n,
+                None => v,
+            };
+            let draft_logits = |row: T2| -> T2 {
                 let hs = if mtp_out_norm() {
                     dev_lane::rms_norm(
                         row,
@@ -9143,7 +9455,7 @@ fn main() -> Result<()> {
                 .div_scalar(t.logits_mup_width_multiplier as f32);
                 // The pruned table is a gathered BF16 slab; the full one takes
                 // the head lane, which is W4A16.
-                let lg = match draft_cand.as_ref() {
+                match draft_cand.as_ref() {
                     Some((_, w)) => dev_lane::linear_bf16(hs, w),
                     None => dev_lane::linear_w(
                         hs,
@@ -9152,7 +9464,31 @@ fn main() -> Result<()> {
                             .expect("drafting needs the unembed table"),
                     ),
                 }
-                .slice([0..1, 0..width]);
+                .slice([0..1, 0..draft_width])
+            };
+            // The `b` best continuations of ONE row, which for a depth-1 tree is
+            // the whole draft. Deterministic top-b and not sampling: `b` draws
+            // from a draft distribution draw duplicates and can miss a
+            // high-probability candidate, while the row already IS the ensemble
+            // of alternatives. Temperature belongs in the target's sampling.
+            //
+            // The readback is one `draft_width` f32 row -- 800 KB, about 8 us on
+            // this part -- against a step that is tens of milliseconds. It is the
+            // same readback `INK_MTP_PROB` already makes.
+            let draft_topb = |row: T2, b: usize| -> Vec<usize> {
+                let dl = down(draft_logits(row));
+                spectree::top_b(&dl[..draft_width], b)
+                    .into_iter()
+                    .map(|c| match draft_cand.as_ref() {
+                        // A pruned table's outputs are candidates, not tokens.
+                        Some((ids, _)) => ids[c.token],
+                        None => c.token,
+                    })
+                    .collect()
+            };
+            let draft_pick = |row: T2| -> usize {
+                let width = draft_width;
+                let lg = draft_logits(row);
                 let b = if mtp_prob {
                     // The one caller that wants the row itself. Startup refuses
                     // this together with a pruned table, so `width` is `v` here.
@@ -9259,6 +9595,15 @@ fn main() -> Result<()> {
             let teach = std::env::var("INK_MTP_TEACH")
                 .map(|v| v == "1")
                 .unwrap_or(false);
+            // `INK_MTP_TOPK=k`: head 0's hit@1..hit@k, teacher-forced, against
+            // BOTH references. The one number that decides whether a depth-1
+            // token tree is worth building a kernel for -- see the report block
+            // below for why hit@2/hit@1 is the whole question and why the two
+            // references are not interchangeable.
+            let topk_k: usize = std::env::var("INK_MTP_TOPK")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
             // The first row to score. Zero for a plain corpus; set it to the
             // PROMPT length when the ids file is a seed followed by this model's
             // own greedy continuation, so the rate is measured on the sequence a
@@ -9311,6 +9656,54 @@ fn main() -> Result<()> {
                 .map(|x| x as usize)
                 .collect()
             };
+
+            // [`teach_rows`]'s top-K twin: the `k` best tokens per row, best
+            // first, through the SAME unembedding and the same effective-vocab
+            // slice -- so `teach_topk(.., 1)` is `teach_rows` and the two
+            // numbers below are comparable by construction.
+            //
+            // On device, because the alternative is reading back `rows * 200058`
+            // f32 to sort on the host: at the 2048-row cap that is 1.6 GB per
+            // block per depth, which is not a measurement, it is a bus.
+            #[allow(clippy::type_complexity)]
+            let teach_topk =
+                |rows: T2, norm: bool, k: usize| -> (Vec<Vec<usize>>, Vec<f32>, Vec<f32>) {
+                    let rows_n = rows.dims()[0];
+                    let hs = if norm {
+                        dev_lane::rms_norm(
+                            rows,
+                            fnorm_dev
+                                .clone()
+                                .expect("teacher forcing needs the final norm"),
+                            t.rms_norm_eps,
+                        )
+                    } else {
+                        rows
+                    }
+                    .div_scalar(t.logits_mup_width_multiplier as f32);
+                    let lg = dev_lane::linear_w(
+                        hs,
+                        unembed_w
+                            .as_ref()
+                            .expect("teacher forcing needs the unembed table"),
+                    )
+                    .slice([0..rows_n, 0..v]);
+                    // LOG-SOFTMAX first, so the same `topk` yields the ids AND a
+                    // calibrated confidence in one pass. `exp(v0)` is the top-1
+                    // probability and `v0 - v1` is the log-odds margin, which are
+                    // the two cheapest confidence signals a drafter can offer and
+                    // the only two a gate could afford per position.
+                    let ls = burn::tensor::activation::log_softmax(lg, 1);
+                    let (val, idx) = ls.topk_with_indices(k.max(2), 1);
+                    let flat: Vec<usize> =
+                        idx.into_data().iter::<i64>().map(|x| x as usize).collect();
+                    let lv: Vec<f32> = val.into_data().iter::<f32>().collect();
+                    let kk = k.max(2);
+                    let ids: Vec<Vec<usize>> = flat.chunks(kk).map(|c| c[..k].to_vec()).collect();
+                    let p1: Vec<f32> = lv.chunks(kk).map(|c| c[0].exp()).collect();
+                    let margin: Vec<f32> = lv.chunks(kk).map(|c| c[0] - c[1]).collect();
+                    (ids, p1, margin)
+                };
 
             draft_probs.borrow_mut().clear();
             let t_mtp = Instant::now();
@@ -9454,6 +9847,10 @@ fn main() -> Result<()> {
                 let main_dev = mtp_main_dev
                     .clone()
                     .expect("the entry states were uploaded above");
+                // The tree's candidates, filled at d == 0 and read after the
+                // loop. Head 0's newest STABLE row is the only row a depth-1
+                // tree reads, and the decode step has already computed it.
+                let mut tree_next: Vec<usize> = Vec::new();
                 let mut prev_rows: Vec<T2> = Vec::new();
                 let mut drafts: Vec<usize> = Vec::with_capacity(mtp_k);
                 for d in 0..mtp_k {
@@ -9552,6 +9949,240 @@ fn main() -> Result<()> {
                                 clo,
                                 chi,
                             );
+                        }
+                        // `INK_MTP_TOPK=k`: does BREADTH buy acceptance?
+                        //
+                        // A depth-1 token tree proposes head 0's best `b`
+                        // continuations instead of its best one, and accepts if
+                        // the verifier's choice is among them. Whether that is
+                        // worth anything is one ratio -- hit@2 over hit@1 -- and
+                        // nothing in this binary measured it, because until now
+                        // nothing proposed more than one.
+                        //
+                        // Two references, because they answer different
+                        // questions and only one of them is acceptance:
+                        //
+                        //   vs CORPUS  the token the prompt actually has next.
+                        //              Extends the TEACH number above and is
+                        //              directly comparable to it.
+                        //   vs STACK   the main stack's OWN argmax at that
+                        //              position, which is what a verifier would
+                        //              have accepted. THIS is acceptance.
+                        //
+                        // The alignment is the fiddly part and it is not the
+                        // same for the two. Head 0's row `j` proposes the token
+                        // at `j + 2`; the stack's row `j` proposes the token at
+                        // `j + 1`. So head 0's row `j` must be read against the
+                        // stack's row `j + 1`, and an off-by-one here would read
+                        // as a low acceptance rate rather than as a mistake.
+                        if d == 0 && topk_k > 0 {
+                            let last = seq.saturating_sub(3);
+                            let first = teach_from.min(last);
+                            const BLK: usize = 256;
+                            let nblk = ((last - first) / BLK).max(1);
+                            let cap = std::env::var("INK_MTP_TEACH_MAX")
+                                .ok()
+                                .and_then(|val| val.parse::<usize>().ok())
+                                .unwrap_or(2048);
+                            let take = nblk.min((cap / BLK).max(1));
+                            let mut hit_corpus = vec![0usize; topk_k];
+                            let mut hit_stack = vec![0usize; topk_k];
+                            let mut gate_rows: Vec<(f32, f32, f32, bool)> = Vec::new();
+                            let mut scored = 0usize;
+                            let raw = std::env::var("INK_MTP_RAW")
+                                .map(|val| val == "1")
+                                .unwrap_or(false);
+                            for b in 0..take {
+                                let lo = first
+                                    + if take == 1 {
+                                        0
+                                    } else {
+                                        (b * (nblk - 1) / (take - 1).max(1)) * BLK
+                                    };
+                                let hi = (lo + BLK).min(last);
+                                if hi <= lo {
+                                    continue;
+                                }
+                                let (head, p1, margin) = teach_topk(
+                                    y.clone().slice([lo..hi, 0..h]),
+                                    mtp_out_norm(),
+                                    topk_k,
+                                );
+                                // The stack's rows ONE further on, which is the
+                                // row that proposes the same position head 0's
+                                // row does.
+                                let stack =
+                                    teach_rows(main_dev.clone().slice([lo + 1..hi + 1, 0..h]), raw);
+                                // The stack's OWN confidence at row j, which is
+                                // available BEFORE the draft for row j is made
+                                // and therefore gates it for FREE.
+                                let (_, sconf, _) =
+                                    teach_topk(main_dev.clone().slice([lo..hi, 0..h]), raw, 1);
+                                for (i, cand) in head.iter().enumerate() {
+                                    let truth = ids[lo + i + 2];
+                                    let want = stack[i];
+                                    for j in 0..topk_k {
+                                        if cand[..=j].contains(&truth) {
+                                            hit_corpus[j] += 1;
+                                        }
+                                        if cand[..=j].contains(&want) {
+                                            hit_stack[j] += 1;
+                                        }
+                                    }
+                                    // (confidence, was the top-1 draft right)
+                                    gate_rows.push((p1[i], margin[i], sconf[i], cand[0] == want));
+                                    scored += 1;
+                                }
+                            }
+                            println!(
+                                "  MTP TOP-K depth 1, {scored} teacher-forced rows, full vocab, \
+                                 concat {}:",
+                                mtp_order.name()
+                            );
+                            for (label, hits) in
+                                [("vs CORPUS", &hit_corpus), ("vs STACK ", &hit_stack)]
+                            {
+                                let mut line = String::new();
+                                for j in 0..topk_k {
+                                    let (clo, chi) = wilson95(hits[j], scored);
+                                    line.push_str(&format!(
+                                        "  hit@{}: {:.4} [{:.4}-{:.4}]",
+                                        j + 1,
+                                        hits[j] as f64 / scored.max(1) as f64,
+                                        clo,
+                                        chi
+                                    ));
+                                }
+                                println!("    {label}:{line}");
+                            }
+                            // ---- THE CONFIDENCE GATE ------------------------
+                            //
+                            // The table above says the chain pays 1.33x on
+                            // counting and LOSES on prose, so an always-on lane
+                            // ships the mean of a win and a loss. A gate
+                            // recovers the difference without widening
+                            // anything -- IF the drafter knows when it is
+                            // right. If hit@1 is flat in confidence, it does
+                            // not, and gating cannot work either.
+                            //
+                            // The cost structure is what makes a per-position
+                            // gate affordable: the DRAFT is cheap (~5% of a
+                            // step) and the expensive part is the extra verify
+                            // ROW, so the gate runs AFTER drafting. A skipped
+                            // speculation wastes only the draft.
+                            //
+                            //   tokens/pass = 1 + f * p_kept
+                            //   cost/pass   = 1 + d + f * (c2 - 1)
+                            //
+                            // `f` is the retained fraction, `p_kept` the hit
+                            // rate on the retained set, `c2` the measured
+                            // two-row width cost, `d` the always-paid draft.
+                            //
+                            // NEVER-speculate is 1.0 and pays no draft at all,
+                            // which sets the bar: a gate must earn `d` back
+                            // before it earns anything. Algebraically it needs
+                            // `f * (p_kept - (c2 - 1)) > d`, so the retained set
+                            // must beat `c2 - 1` (0.492 here) and there must be
+                            // enough of it. That is a much harder test than
+                            // beating the always-on arm.
+                            if !gate_rows.is_empty() {
+                                let c2: f64 = std::env::var("INK_GATE_C2")
+                                    .ok()
+                                    .and_then(|x| x.parse().ok())
+                                    .unwrap_or(1.492);
+                                let dcost: f64 = std::env::var("INK_GATE_D")
+                                    .ok()
+                                    .and_then(|x| x.parse().ok())
+                                    .unwrap_or(0.047);
+                                let n = gate_rows.len() as f64;
+                                let all_hits = gate_rows.iter().filter(|r| r.3).count() as f64;
+                                // `always_draft`: the gate reads the DRAFT's
+                                // own confidence, so the draft is paid on every
+                                // pass whether or not the speculation happens.
+                                // A gate on a signal the pass ALREADY has pays
+                                // it only when it speculates, turning `d` from a
+                                // constant into `f * d` -- which is the whole
+                                // difference between losing and winning here.
+                                let speed = |f: f64, p: f64, always_draft: bool| -> f64 {
+                                    let d = if always_draft { dcost } else { f * dcost };
+                                    (1.0 + f * p) / (1.0 + d + f * (c2 - 1.0))
+                                };
+                                println!(
+                                    "  MTP GATE sweep, c2={c2} d={dcost}; never=1.000x, \
+                                     always={:.3}x (f=1.000, p={:.4})",
+                                    speed(1.0, all_hits / n, true),
+                                    all_hits / n
+                                );
+                                for (sig, label) in
+                                    [(0usize, "head p1"), (1, "margin "), (2, "stackp1")]
+                                {
+                                    println!(
+                                        "    by {label}   T      kept     p_kept   \
+                                         p_dropped   gate"
+                                    );
+                                    let ts: Vec<f64> = if sig == 1 {
+                                        vec![0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0]
+                                    } else {
+                                        vec![0.0, 0.2, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
+                                    };
+                                    // Only the stack's own confidence is free.
+                                    let free = sig == 2;
+                                    let mut best = (0.0f64, 0.0f64);
+                                    for tt in ts {
+                                        let keep: Vec<&(f32, f32, f32, bool)> = gate_rows
+                                            .iter()
+                                            .filter(|r| {
+                                                (match sig {
+                                                    0 => r.0,
+                                                    1 => r.1,
+                                                    _ => r.2,
+                                                })
+                                                    as f64
+                                                    >= tt
+                                            })
+                                            .collect();
+                                        let k = keep.len() as f64;
+                                        if k == 0.0 {
+                                            continue;
+                                        }
+                                        let hk = keep.iter().filter(|r| r.3).count() as f64;
+                                        let f = k / n;
+                                        let pk = hk / k;
+                                        let pd = if n > k {
+                                            (all_hits - hk) / (n - k)
+                                        } else {
+                                            f64::NAN
+                                        };
+                                        let sp = speed(f, pk, !free);
+                                        if sp > best.0 {
+                                            best = (sp, tt);
+                                        }
+                                        println!(
+                                            "              {tt:6.2}  {:6.3}   {pk:6.4}   \
+                                             {pd:9.4}   {sp:6.3}x",
+                                            f
+                                        );
+                                    }
+                                    println!(
+                                        "              BEST {:.3}x at T={:.2}{}",
+                                        best.0,
+                                        best.1,
+                                        if free {
+                                            "   (draft paid only when speculating)"
+                                        } else {
+                                            "   (draft paid every pass)"
+                                        }
+                                    );
+                                }
+                            }
+                            if topk_k >= 2 && hit_stack[0] > 0 {
+                                println!(
+                                    "    BREADTH GAIN vs STACK: hit@2/hit@1 = {:.3}x, \
+                                     +{:.4} absolute -- this is the whole question",
+                                    hit_stack[1] as f64 / hit_stack[0] as f64,
+                                    (hit_stack[1] - hit_stack[0]) as f64 / scored.max(1) as f64
+                                );
+                            }
                         }
                         if teach {
                             // Row `j` predicts `ids[j + d + 2]`, so the last row
@@ -9775,8 +10406,35 @@ fn main() -> Result<()> {
                             rows.push(last.clone());
                         }
                     }
-                    drafts.push(draft_argmax_dev(last));
+                    if tree_b > 0 && d == 0 {
+                        // ONE unembedding, read twice. The tree's candidates for
+                        // t+1 and the chain's argmax are the same row's top-b and
+                        // its top-1, and `cands[0]` IS that argmax -- so the
+                        // depth-1 tree's whole draft side is a wider read of a
+                        // matmul the step was already going to run. Not a single
+                        // extra head step.
+                        let cands = draft_topb(last.clone(), tree_b);
+                        anyhow::ensure!(
+                            cands.len() == tree_b,
+                            "the drafter offered {} candidates against INK_TREE={tree_b}",
+                            cands.len()
+                        );
+                        for (i, &a) in cands.iter().enumerate() {
+                            anyhow::ensure!(
+                                !cands[..i].contains(&a),
+                                "two candidates hold token {a}; a verifier argmax would not \
+                                 name one branch"
+                            );
+                        }
+                        drafts.push(cands[0]);
+                        tree_next = cands;
+                    } else {
+                        drafts.push(draft_argmax_dev(last));
+                    }
                     prev_rows = rows;
+                }
+                if tree_b > 0 {
+                    tree_drafts = tree_next;
                 }
                 drafts
             } else if kv {
@@ -9900,7 +10558,13 @@ fn main() -> Result<()> {
             } else {
                 draft_whole(&mtp_main, seq, &ids, best)
             };
-            if spec_k == 0 {
+            // `tree_b == 0` for the same reason `spec_k == 0` is here: this
+            // bookkeeping keys a draft by the STEP it will be scored at, which
+            // is only a token index while a pass confirms exactly one token. A
+            // tree pass confirms one or two, so every key past the first
+            // acceptance would name the wrong position -- and it would read as a
+            // per-depth acceptance rate, not as an error.
+            if spec_k == 0 && tree_b == 0 {
                 mtp_issued.insert(step, vec![None; drafts.len()]);
                 if mtp_prob {
                     mtp_issued_q.insert(step, vec![None; drafts.len()]);
@@ -10401,7 +11065,9 @@ fn main() -> Result<()> {
                 // only a report -- nothing computes off `ids` in that lane -- which
                 // is exactly why it read as a plausible context length (4052
                 // against 3780) instead of as a failure.
-                if new_toks.len() > 1 && !slot_lane {
+                // The tree lane already extended, above the MTP block, because
+                // the drafter reads `ids` and cannot wait for the report.
+                if new_toks.len() > 1 && !slot_lane && tree_b == 0 {
                     ids.extend_from_slice(&new_toks[..new_toks.len() - 1]);
                 }
                 // `ids` is ONE sequence's -- cohort 0's slot 0 -- because every
@@ -10507,7 +11173,13 @@ fn main() -> Result<()> {
     }
 
     // ---- how much of the wall clock this node spent waiting for the other --
-    if acc_steps > 0 && pipe.is_some() {
+    // `|| tree_b > 0`: the whole summary -- the accepted-prefix table, the
+    // per-rank table, the tok/s gate -- was written for the PIPE, because until
+    // now speculation only existed there. A single-box tree run needs exactly
+    // these numbers and would otherwise print none of them, which is how the
+    // first tree run reported its acceptance by making me count `ctx` deltas in
+    // the step lines.
+    if acc_steps > 0 && (pipe.is_some() || tree_b > 0) {
         let ms = |v: f64| v * 1e3;
         let wall = acc_pass + acc_recv;
         println!("\n=== pipe utilisation over {acc_steps} decode steps (prefill excluded) ===");
@@ -10622,9 +11294,39 @@ fn main() -> Result<()> {
         );
         let tpp = decode_toks as f64 / acc_steps as f64;
         println!("  tokens per pass      : {tpp:.3}");
-        if spec_k > 0 {
+        if tree_b > 0 {
+            let passes: usize = tree_rank_hist.iter().sum();
+            let won: usize = tree_rank_hist[1..tree_b].iter().sum();
+            println!("  which candidate the verifier took, over {passes} tree passes:");
+            for (r, &c) in tree_rank_hist.iter().enumerate() {
+                let what = if r == tree_b {
+                    "none  ".to_string()
+                } else {
+                    format!("rank {r}")
+                };
+                println!(
+                    "    {what}: {c:5}   ({:5.1}%){}",
+                    100.0 * c as f64 / passes.max(1) as f64,
+                    if r > 0 && r < tree_b {
+                        "   <- a token the chain would have missed"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            println!(
+                "    breadth WON {won} of {passes} passes ({:.1}%); the rest a chain would have                  got too, or not at all",
+                100.0 * won as f64 / passes.max(1) as f64
+            );
+        }
+        if spec_k > 0 || tree_b > 0 {
             let sets: usize = spec_hist.iter().sum();
-            println!("  accepted prefix over {sets} verify passes (INK_SPEC={spec_k}):");
+            let lane = if tree_b > 0 {
+                format!("INK_TREE={tree_b}")
+            } else {
+                format!("INK_SPEC={spec_k}")
+            };
+            println!("  accepted prefix over {sets} verify passes ({lane}):");
             for (l, &c) in spec_hist.iter().enumerate().skip(1) {
                 println!(
                     "    {} accepted: {c:5}   ({:5.1}%)",

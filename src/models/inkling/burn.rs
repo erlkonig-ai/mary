@@ -338,6 +338,40 @@ pub fn conv_history<B: Backend>(x: Tensor<B, 2>, kernel: usize) -> Tensor<B, 2> 
     }
 }
 
+/// [`conv_history`] after a TREE verify pass: the `kernel - 1` window rows the
+/// next position must carry, given the batch rows the verifier kept.
+///
+/// The block's own two convolutions (`attn_sconv`, `mlp_sconv`) roll back the
+/// same way the attention's do, and for the same reason: their memory is a
+/// function of the last KEPT row and the rows before it ALONG THE ACCEPTED
+/// PATH. On a chain that path is a prefix and this is
+/// `conv_history(all.slice([0..hist + keep]), kernel)`, the slice the loop
+/// takes today. On a tree it is a gather, because the accepted rows are not
+/// contiguous.
+///
+/// `all` is the `kernel - 1 + rows` window `short_conv_steps` handed back.
+pub fn conv_history_rows<B: Backend>(
+    all: Tensor<B, 2>,
+    kernel: usize,
+    kept: &[usize],
+) -> Tensor<B, 2> {
+    let [len, _] = all.dims();
+    let take = crate::models::inkling::spectree::conv_next_history(kernel, kept);
+    assert!(
+        take.iter().all(|&r| r < len),
+        "a {len}-row window cannot supply history {take:?}"
+    );
+    let dev = all.device();
+    let idx: Tensor<B, 1, Int> = Tensor::from_data(
+        TensorData::new(
+            take.iter().map(|&r| r as i32).collect::<Vec<_>>(),
+            [take.len()],
+        ),
+        &dev,
+    );
+    all.select(0, idx)
+}
+
 /// One position of the short convolution, given the `kernel - 1` inputs before
 /// it. Returns the output row and the history to carry to the next position.
 ///
@@ -510,6 +544,79 @@ pub fn short_conv_window(all: Tensor<Bk, 2>, weight: Tensor<Bk, 2>, rows: usize)
     tensor_of(client, dev, out, rows, dim)
 }
 
+/// [`short_conv_window`] for a batch whose rows are a TREE rather than
+/// consecutive positions.
+///
+/// The batched kernel reads `all[i ..= i + kernel - 1]` — the rows physically
+/// preceding row `i`. For a chain those are row `i`'s ancestors, which is why
+/// nothing has ever had to say so. For a tree they are whatever the layout put
+/// there, and the smallest tree there is (`b = 2` at depth 1) already
+/// convolves the second candidate out of the FIRST candidate's projections.
+/// Masking attention does not reach this: it is a different operator, and the
+/// contamination arrives already mixed into K, V or the residual.
+///
+/// `taps[i][t]` names the window row that tap `t` of output row `i` must read
+/// — computed once, in `spectree::tree_attn`, along each row's own ancestry.
+/// The arithmetic is otherwise the kernel's, residual included:
+/// `out[i] = all[taps[i][kernel-1]] + sum_t w[:, t] * all[taps[i][t]]`.
+///
+/// Written with `select` rather than a fourth cubecl kernel because a verify
+/// batch is three or four rows: this is `kernel` gathers of a `[rows, dim]`
+/// tensor, and a kernel would be a kernel to maintain. Take the contiguous
+/// path ([`crate::models::inkling::spectree::TreeAttn::is_linear`]) whenever
+/// the batch is a chain, so a non-tree run is untouched.
+pub fn short_conv_tree(
+    all: Tensor<Bk, 2>,
+    weight: Tensor<Bk, 2>,
+    taps: &[Vec<usize>],
+) -> Tensor<Bk, 2> {
+    let [len, dim] = all.dims();
+    let [wdim, kernel] = weight.dims();
+    assert_eq!(
+        dim, wdim,
+        "short_conv_tree: the window is [_, {dim}] but the weight is [{wdim}, _]"
+    );
+    let rows = taps.len();
+    assert_eq!(
+        len,
+        kernel - 1 + rows,
+        "a {rows}-row convolution wants {} window rows, got {len}",
+        kernel - 1 + rows
+    );
+    let dev = all.device();
+    let gather = |t: usize| -> Tensor<Bk, 2> {
+        let idx: Vec<i32> = taps
+            .iter()
+            .map(|r| {
+                assert!(r[t] < len, "tap {} is outside a {len}-row window", r[t]);
+                r[t] as i32
+            })
+            .collect();
+        let sel: Tensor<Bk, 1, Int> = Tensor::from_data(TensorData::new(idx, [rows]), &dev);
+        all.clone().select(0, sel)
+    };
+    // The residual the kernel adds is the row's OWN value, which is its last
+    // tap by construction.
+    let mut acc = gather(kernel - 1);
+    for t in 0..kernel {
+        let w = weight.clone().slice([0..dim, t..t + 1]).reshape([1, dim]);
+        acc = acc + gather(t) * w;
+    }
+    acc
+}
+
+/// [`short_conv_steps`] for a tree batch: the same concatenation, the tree's
+/// taps, and the same window handed back for the rollback to gather out of.
+pub fn short_conv_tree_steps(
+    hist: Tensor<Bk, 2>,
+    x: Tensor<Bk, 2>,
+    weight: Tensor<Bk, 2>,
+    taps: &[Vec<usize>],
+) -> (Tensor<Bk, 2>, Tensor<Bk, 2>) {
+    let all = Tensor::cat(vec![hist, x], 0);
+    (short_conv_tree(all.clone(), weight, taps), all)
+}
+
 /// Depthwise causal short convolution **plus its internal residual**, on device.
 ///
 /// The device twin of [`crate::models::inkling::block::short_conv`]:
@@ -648,6 +755,17 @@ pub struct AttnCache<B: Backend> {
 struct Pending<B: Backend> {
     k_pre: Tensor<B, 2>,
     v_pre: Tensor<B, 2>,
+    /// The rows this batch APPENDED, post-normalisation, kept so a TREE
+    /// rollback can put a scattered subset of them back.
+    ///
+    /// A linear speculation never needs them: it keeps a prefix, and a prefix
+    /// is a truncation of the store. A tree keeps the root and one PATH, whose
+    /// rows are not contiguous in the batch, and there is no slice of the store
+    /// that is those rows — so the store is truncated whole and the kept rows
+    /// re-appended. `rows * kv_width` floats, which at width 3 is noise beside
+    /// the window this struct already carries.
+    k_new: Tensor<B, 2>,
+    v_new: Tensor<B, 2>,
     rows: usize,
 }
 
@@ -712,6 +830,88 @@ impl<B: Backend> AttnCache<B> {
             self.k_pre = p.k_pre.slice([keep..keep + hist, 0..dim]);
             let vdim = p.v_pre.dims()[1];
             self.v_pre = p.v_pre.slice([keep..keep + hist, 0..vdim]);
+        }
+        trim(self, window);
+    }
+}
+
+/// The tree half of speculative rollback, on the concrete backend.
+///
+/// Separate from the generic `impl` above only because a gather has to put
+/// rows BACK into the store, and putting rows back means going through
+/// `as_kv` — the narrowing that decides whether this cache holds BF16 — which
+/// is a fact about this backend and not about `B: Backend`.
+impl AttnCache<Bk> {
+    /// [`AttnCache::commit`] for a TREE verify pass: keep the batch rows named
+    /// by `kept`, in order, and discard the rest.
+    ///
+    /// `kept` is `spectree::TreeAccept::kept_rows` — the root followed by the
+    /// accepted path. Ascending, but NOT contiguous, which is the entire
+    /// difference from [`AttnCache::commit`]: a linear speculation accepts a
+    /// PREFIX of its batch and rolls back with a truncation, while a tree
+    /// accepts a path through it and rolls back with a GATHER. The store is
+    /// therefore truncated whole and the kept rows re-appended, out of the
+    /// copy [`Pending`] holds.
+    ///
+    /// `kept = 0..keep` reduces to `commit(keep, window)` — see the equality
+    /// test — so a chain run through this function is the same cache it was.
+    pub fn commit_rows(&mut self, kept: &[usize], window: Option<usize>) {
+        // A contiguous accepted set is a PREFIX, and a prefix is what
+        // [`AttnCache::commit`] already does -- by TRUNCATION, leaving the kept
+        // rows exactly where they were written. Delegating is not just an
+        // optimisation: re-appending rows the store already holds sends them
+        // through `as_kv` and the store's own packing a second time, and an
+        // NVFP4 store computes its scales over the block it is handed, so three
+        // rows re-appended as one can quantise differently from the same row
+        // appended as one of three. Identical only on a WIDE cache -- which is
+        // precisely what the unit test pins, so the unit test could not have
+        // seen it.
+        //
+        // Rank 0 and total rejection are both contiguous, so the common tree
+        // pass now takes the same path a chain does, bit for bit.
+        if kept.iter().copied().eq(0..kept.len()) {
+            self.commit(kept.len(), window);
+            return;
+        }
+        if let Some(p) = self.pending.take() {
+            assert!(
+                kept.windows(2).all(|w| w[0] < w[1]),
+                "an accepted path is ascending"
+            );
+            assert!(
+                kept.last().is_none_or(|&r| r < p.rows),
+                "row {:?} is past the {}-row batch",
+                kept.last(),
+                p.rows
+            );
+            let dev = p.k_new.device();
+            self.k.truncate(self.k.len() - p.rows);
+            self.v.truncate(self.v.len() - p.rows);
+            if !kept.is_empty() {
+                let idx: Tensor<Bk, 1, Int> = Tensor::from_data(
+                    TensorData::new(
+                        kept.iter().map(|&r| r as i32).collect::<Vec<_>>(),
+                        [kept.len()],
+                    ),
+                    &dev,
+                );
+                self.k.append(as_kv(p.k_new.clone().select(0, idx.clone())));
+                self.v.append(as_kv(p.v_new.clone().select(0, idx)));
+            }
+            // The next position's convolution memory: the tail of
+            // `history ++ accepted path`, gathered out of the window this
+            // batch kept for exactly this purpose.
+            let hist = p.k_pre.dims()[0] - p.rows;
+            let take = crate::models::inkling::spectree::conv_next_history(hist + 1, kept);
+            let sel: Tensor<Bk, 1, Int> = Tensor::from_data(
+                TensorData::new(
+                    take.iter().map(|&r| r as i32).collect::<Vec<_>>(),
+                    [take.len()],
+                ),
+                &dev,
+            );
+            self.k_pre = p.k_pre.select(0, sel.clone());
+            self.v_pre = p.v_pre.select(0, sel);
         }
         trim(self, window);
     }
@@ -1823,8 +2023,8 @@ pub fn attention_step(
     let q = head_rms_norm(q, w.q_norm.clone(), heads, head_dim, d.rms_eps);
     let k_new = head_rms_norm(k_new, w.k_norm.clone(), kv_heads, head_dim, d.rms_eps);
 
-    cache.k.append(as_kv(k_new));
-    cache.v.append(as_kv(v_new));
+    cache.k.append(as_kv(k_new.clone()));
+    cache.v.append(as_kv(v_new.clone()));
     trim(cache, window);
     let len = cache.len();
     let base = cache.base;
@@ -2013,7 +2213,48 @@ pub fn attention_steps(
     window: Option<usize>,
     cache: &mut AttnCache<Bk>,
 ) -> Tensor<Bk, 2> {
+    attention_steps_tree(x, w, d, log_scaling, pos0, window, cache, None)
+}
+
+/// [`attention_steps`] over a TOKEN TREE instead of a chain.
+///
+/// `tree` describes what stops being structural the moment the batch's rows
+/// are not consecutive positions of one sequence, and there are three such
+/// things rather than the one the word "mask" suggests:
+///
+/// * **visibility.** Row `i` may see the cached prefix and its own ANCESTORS,
+///   and must not see a sibling. A chain's rule — every earlier row — is the
+///   special case where every earlier row is an ancestor.
+/// * **position.** Row `i` sits at `pos0 + depth[i]`, so siblings share a
+///   position. Both readers of position have to be told: the relative-bias
+///   table, whose `dist` is `pos - abs` and would otherwise place a sibling
+///   one key apart, and the log-scaling `tau`.
+/// * **the convolutions.** `k_sconv` and `v_sconv` read the rows physically
+///   preceding row `i`, which for a tree is the wrong branch. See
+///   [`short_conv_tree`], and note that this function is only two of the four
+///   short convolutions a widened pass runs — the block's `attn_sconv` and
+///   `mlp_sconv` are the caller's and need the same taps.
+///
+/// `tree: None`, or a tree that [`crate::models::inkling::spectree::TreeAttn::is_linear`]
+/// accepts, runs the arithmetic [`attention_steps`] always ran, including the
+/// fused lane. A real tree takes the paged lane: the fused kernel derives
+/// causality from positions, which is exactly the assumption a tree breaks.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_steps_tree(
+    x: Tensor<Bk, 2>,
+    w: &AttnWeightsDev,
+    d: &crate::models::inkling::attn::AttnDims,
+    log_scaling: Option<crate::models::inkling::attn::LogScaling>,
+    pos0: usize,
+    window: Option<usize>,
+    cache: &mut AttnCache<Bk>,
+    tree: Option<&crate::models::inkling::spectree::TreeAttn>,
+) -> Tensor<Bk, 2> {
     use crate::models::inkling::config::AttnKind;
+
+    // A descriptor that asks for nothing new is not a tree, and saying so here
+    // once keeps every branch below from having to ask twice.
+    let tree = tree.filter(|t| !t.is_linear());
 
     let [rows, hidden] = x.dims();
     assert!(rows >= 1, "a batched step feeds at least one token");
@@ -2030,6 +2271,18 @@ pub fn attention_steps(
         cache.pending.is_none(),
         "a speculative batch is still uncommitted"
     );
+    if let Some(t) = tree {
+        assert_eq!(
+            t.rows, rows,
+            "the tree describes {} rows and the batch has {rows}",
+            t.rows
+        );
+        assert_eq!(
+            t.kernel, d.kernel,
+            "the tree's taps were built for kernel {} and the layer's is {}",
+            t.kernel, d.kernel
+        );
+    }
     let dev = x.device();
     let (heads, kv_heads, head_dim) = (d.heads, d.kv_heads, d.head_dim);
     let groups = d.groups();
@@ -2054,19 +2307,31 @@ pub fn attention_steps(
     // the second and third of the four convolutions a widened pass runs per
     // layer, and the shifted-slice form is what made a two-row pass cost 1.6x
     // a one-row one.
-    let k_new = short_conv_window(k_all.clone(), w.k_sconv.clone(), rows);
-    let v_new = short_conv_window(v_all.clone(), w.v_sconv.clone(), rows);
+    let (k_new, v_new) = match tree {
+        None => (
+            short_conv_window(k_all.clone(), w.k_sconv.clone(), rows),
+            short_conv_window(v_all.clone(), w.v_sconv.clone(), rows),
+        ),
+        Some(t) => (
+            short_conv_tree(k_all.clone(), w.k_sconv.clone(), &t.taps),
+            short_conv_tree(v_all.clone(), w.v_sconv.clone(), &t.taps),
+        ),
+    };
 
     let q = head_rms_norm(q, w.q_norm.clone(), heads, head_dim, d.rms_eps);
     let k_new = head_rms_norm(k_new, w.k_norm.clone(), kv_heads, head_dim, d.rms_eps);
 
-    cache.k.append(as_kv(k_new));
-    cache.v.append(as_kv(v_new));
+    // Cloned rather than moved: `Pending` keeps these rows so a TREE rollback
+    // can put a scattered subset of them back. A tensor clone is a handle.
+    cache.k.append(as_kv(k_new.clone()));
+    cache.v.append(as_kv(v_new.clone()));
     cache.k_pre = k_all.clone().slice([rows..rows + hist, 0..kdim]);
     cache.v_pre = v_all.clone().slice([rows..rows + hist, 0..vdim]);
     cache.pending = Some(Pending {
         k_pre: k_all,
         v_pre: v_all,
+        k_new,
+        v_new,
         rows,
     });
 
@@ -2085,7 +2350,7 @@ pub fn attention_steps(
     // dense lane and [`attention_step`] was fused, they were not, and
     // [`drift_table_at_real_width`]'s batch=1 column — which had been exactly
     // zero — moved to 4e-3.
-    if flash_cached_applies(d) {
+    if tree.is_none() && flash_cached_applies(d) {
         let eff = d
             .rel_extent
             .min(pos0 + rows - base)
@@ -2115,9 +2380,20 @@ pub fn attention_steps(
     let kv = PagedKv::read(cache, &dev, (kv_heads, head_dim), bucket);
     let (head, slots) = (kv.head, kv.slots);
 
-    let taus: Vec<f32> = (0..rows)
-        .map(|i| match (d.kind, log_scaling) {
-            (AttnKind::Global, Some(ls)) => ls.tau(pos0 + i),
+    // Row `i`'s ABSOLUTE position. `pos0 + i` for a chain; `pos0 + depth[i]`
+    // for a tree, where siblings share one. The cache SLOT is still `i`
+    // either way — the two indices coincide for a chain and that coincidence
+    // is what a tree removes.
+    let pos_row: Vec<usize> = match tree {
+        None => (0..rows).map(|i| pos0 + i).collect(),
+        Some(t) => t.positions(pos0),
+    };
+    let first_row = len - rows;
+
+    let taus: Vec<f32> = pos_row
+        .iter()
+        .map(|&pos| match (d.kind, log_scaling) {
+            (AttnKind::Global, Some(ls)) => ls.tau(pos),
             _ => 1.0,
         })
         .collect();
@@ -2135,7 +2411,7 @@ pub fn attention_steps(
     let mut wmask = vec![0f32; rows * slots];
     let mut max_dist = 0usize;
     for i in 0..rows {
-        let pos = pos0 + i;
+        let pos = pos_row[i];
         for s in 0..slots {
             let cell = i * slots + s;
             if s < head || s >= head + len {
@@ -2143,8 +2419,17 @@ pub fn attention_steps(
                 continue;
             }
             let j = s - head;
-            let abs = base + j;
-            if abs > pos {
+            // A key that is one of THIS batch's rows is a tree node, and its
+            // position is its depth's, not its slot's. A key in the committed
+            // prefix is where it always was.
+            let (abs, admits) = match tree {
+                Some(t) if j >= first_row => {
+                    let r = j - first_row;
+                    (pos_row[r], t.visible[i][r])
+                }
+                _ => (base + j, base + j <= pos),
+            };
+            if !admits {
                 wmask[cell] = f32::NEG_INFINITY;
                 continue;
             }
@@ -4090,6 +4375,206 @@ mod tests {
             worst < CACHE_TOLERANCE,
             "cached windowed attention over 3 pages drifts by {worst}"
         );
+    }
+
+    /// A gathered convolution with LINEAR taps is the contiguous kernel.
+    ///
+    /// The cheapest possible statement that [`short_conv_tree`] did not invent
+    /// a second convolution: hand it the taps a chain produces and it must
+    /// return what [`short_conv_window`] returns, bit for bit modulo the
+    /// reassociation of a four-term sum.
+    #[test]
+    fn a_linear_tap_table_is_the_contiguous_convolution() {
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let (dim, kernel, rows) = (16usize, 4usize, 5usize);
+        let all: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(
+                fill((kernel - 1 + rows) * dim, 1.3),
+                [kernel - 1 + rows, dim],
+            ),
+            &dev,
+        );
+        let wt: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(fill(dim * kernel, 0.4), [dim, kernel]),
+            &dev,
+        );
+        let want = short_conv_window(all.clone(), wt.clone(), rows);
+        let taps = crate::models::inkling::spectree::TreeAttn::linear(rows, kernel).taps;
+        let got = short_conv_tree(all, wt, &taps);
+        let diff = (got - want).abs().max().into_scalar();
+        assert!(diff < 1e-5, "the gathered convolution drifts by {diff}");
+    }
+
+    /// The claim a tree verify pass makes, stated as an equality it can fail.
+    ///
+    /// Row `i` of a TREE batch must equal the row it would have been in a
+    /// LINEAR batch containing only its own path. That is one sentence and it
+    /// covers all three of the things a tree changes at once — the mask (a
+    /// sibling's key would show up in the softmax), the position (a sibling
+    /// shares one, so the relative bias would be gathered at the wrong
+    /// distance) and the convolutions (the second candidate would be
+    /// convolved out of the first one's projections). Any one of the three
+    /// left un-fixed moves this number, and none of them crashes.
+    ///
+    /// The branches are deliberately given very different filler, because a
+    /// leak between two similar rows is a leak this test would not see.
+    fn tree_branch_gap(kind: AttnKind, window: Option<usize>, prefill: usize) -> (f32, f32) {
+        let _lane = CacheLane::wide();
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let d = dims(kind, 5);
+        let w = weights(&d, &dev);
+        let rows = prefill + 3;
+        let xs: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(fill(rows * d.hidden, 2.5), [rows, d.hidden]),
+            &dev,
+        );
+        // The two candidates share a position and must share nothing else.
+        let alt: Tensor<B, 2> =
+            Tensor::from_data(TensorData::new(fill(d.hidden, -11.0), [1, d.hidden]), &dev);
+        let row = |i: usize| xs.clone().slice([i..i + 1, 0..d.hidden]);
+        let (_, base) = attention_prefill(
+            xs.clone().slice([0..prefill, 0..d.hidden]),
+            &w,
+            &d,
+            None,
+            window,
+            window,
+        );
+
+        let tree = crate::models::inkling::spectree::TreeSpec::breadth(2).unwrap();
+        let attn = crate::models::inkling::spectree::tree_attn(&tree, d.kernel);
+        let batch = Tensor::cat(vec![row(prefill), row(prefill + 1), alt.clone()], 0);
+        let mut c_tree = base.clone();
+        let got = attention_steps_tree(
+            batch,
+            &w,
+            &d,
+            None,
+            prefill,
+            window,
+            &mut c_tree,
+            Some(&attn),
+        );
+
+        // Each candidate's own linear world: the confirmed token followed by
+        // that candidate alone, which is a chain and takes the ordinary path.
+        let mut worst = 0f32;
+        for (r, x) in [(1usize, row(prefill + 1)), (2, alt)] {
+            let mut c = base.clone();
+            let want = attention_steps(
+                Tensor::cat(vec![row(prefill), x], 0),
+                &w,
+                &d,
+                None,
+                prefill,
+                window,
+                &mut c,
+            );
+            let diff = (got.clone().slice([r..r + 1, 0..d.hidden])
+                - want.slice([1..2, 0..d.hidden]))
+            .abs()
+            .max()
+            .into_scalar();
+            worst = worst.max(diff);
+        }
+        // ...and the two candidates must not have collapsed onto each other,
+        // which would make the equality above pass for the wrong reason.
+        let gap = (got.clone().slice([1..2, 0..d.hidden]) - got.slice([2..3, 0..d.hidden]))
+            .abs()
+            .max()
+            .into_scalar();
+        (worst, gap)
+    }
+
+    #[test]
+    fn a_tree_row_is_its_own_branch_global() {
+        let (worst, gap) = tree_branch_gap(AttnKind::Global, None, 9);
+        println!("tree/global: worst {worst:e}, branch gap {gap:e}");
+        assert!(gap > 1e-3, "the two branches collapsed, gap {gap}");
+        assert!(worst < CACHE_TOLERANCE, "a tree row drifts by {worst}");
+    }
+
+    #[test]
+    fn a_tree_row_is_its_own_branch_local() {
+        let (worst, gap) = tree_branch_gap(AttnKind::Local, Some(5), 9);
+        println!("tree/local: worst {worst:e}, branch gap {gap:e}");
+        assert!(gap > 1e-3, "the two branches collapsed, gap {gap}");
+        assert!(worst < CACHE_TOLERANCE, "a tree row drifts by {worst}");
+    }
+
+    /// The block convolutions' rollback, gathered, is the slice it replaces.
+    ///
+    /// Same equality as `commit_rows` versus `commit`, one operator down: on a
+    /// contiguous accepted set `conv_history_rows` must return exactly what
+    /// `conv_history(all.slice([0..hist + keep]))` returns, which is what the
+    /// decode loop takes today for `attn_sconv` and `mlp_sconv`.
+    #[test]
+    fn gathered_conv_history_on_a_prefix_is_the_slice() {
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let (dim, kernel, rows) = (16usize, 4usize, 4usize);
+        let hist = kernel - 1;
+        let all: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(fill((hist + rows) * dim, 0.9), [hist + rows, dim]),
+            &dev,
+        );
+        for keep in 0..=rows {
+            let want = conv_history(all.clone().slice([0..hist + keep, 0..dim]), kernel);
+            let got = conv_history_rows(all.clone(), kernel, &(0..keep).collect::<Vec<_>>());
+            assert_eq!(got.dims(), want.dims(), "keep={keep}");
+            let diff = (got - want).abs().max().into_scalar();
+            assert!(diff == 0.0, "keep={keep} differs by {diff}");
+        }
+        // ...and a scattered path takes the rows the path actually named.
+        let got = conv_history_rows(all.clone(), kernel, &[0, 2]);
+        let want = Tensor::cat(
+            vec![
+                all.clone().slice([2..3, 0..dim]),
+                all.clone().slice([3..4, 0..dim]),
+                all.slice([5..6, 0..dim]),
+            ],
+            0,
+        );
+        assert!((got - want).abs().max().into_scalar() == 0.0);
+    }
+
+    /// [`AttnCache::commit_rows`] on a contiguous set IS [`AttnCache::commit`].
+    ///
+    /// Compared through a following step rather than by reading the store,
+    /// because the thing that must match is not the bytes but what the next
+    /// position sees: K, V and the convolution memory together.
+    #[test]
+    fn commit_rows_on_a_prefix_is_commit() {
+        let _lane = CacheLane::wide();
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let d = dims(AttnKind::Global, 5);
+        let w = weights(&d, &dev);
+        let xs: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(fill(16 * d.hidden, 2.5), [16, d.hidden]),
+            &dev,
+        );
+        let row = |i: usize| xs.clone().slice([i..i + 1, 0..d.hidden]);
+        let (_, base) = attention_prefill(
+            xs.clone().slice([0..9, 0..d.hidden]),
+            &w,
+            &d,
+            None,
+            None,
+            None,
+        );
+        for keep in 0..=3usize {
+            let batch = Tensor::cat(vec![row(9), row(10), row(11)], 0);
+            let mut a = base.clone();
+            let _ = attention_steps(batch.clone(), &w, &d, None, 9, None, &mut a);
+            a.commit(keep, None);
+            let mut b = base.clone();
+            let _ = attention_steps(batch, &w, &d, None, 9, None, &mut b);
+            b.commit_rows(&(0..keep).collect::<Vec<_>>(), None);
+            assert_eq!(a.len(), b.len(), "keep={keep}");
+            let next =
+                |c: &mut AttnCache<Bk>| attention_step(row(12), &w, &d, None, 9 + keep, None, c);
+            let diff = (next(&mut a) - next(&mut b)).abs().max().into_scalar();
+            assert!(diff < 1e-5, "keep={keep} diverges by {diff}");
+        }
     }
 
     /// The batched cached step against the uncached lane, in batches of
