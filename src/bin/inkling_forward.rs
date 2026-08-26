@@ -7550,8 +7550,29 @@ fn main() -> Result<()> {
     // stable and the lane must not arm at all. Diffing only A and B cannot tell
     // those apart, and the expensive mistake is to read the first as the second
     // and give up, or the second as the first and ship.
+    // A KNOB, and it is load-bearing: three captures are NOT affordable at 21
+    // layers and the failure is not graceful.
+    //
+    // Each capture OWNS the pinned host buffers its memcpy nodes read from --
+    // that is what makes a recorded source address mean what the node says --
+    // so it takes ~483 of them permanently and the pinned pool must GROW to
+    // meet the next capture. Growing it inside a capture is a `cuMemAllocHost`
+    // on a capturing stream, which fails; the capture is then invalidated and
+    // `cuStreamEndCapture` returns a null graph. MEASURED on one GB10 at
+    // `INK_LAYERS=0:21`, `INK_KV=1`, ctx3732: captures one and two succeed (the
+    // arena reports 1 driver allocation then 0), and the THIRD dies at layer 2,
+    // stage `attn`, with CUDA_ERROR_STREAM_CAPTURE_INVALIDATED. Two is what the
+    // pool can carry.
+    //
+    // Two captures cost the affineness CHECK: with one difference there is no
+    // second difference to compare it against, so the lane assumes what three
+    // would have verified. The arming line says which of the two it did.
     let want_captures = if graph_lane {
-        3
+        std::env::var("INK_GRAPH_LANE_CAPTURES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2usize)
+            .clamp(2, 4)
     } else if graph_diff {
         2
     } else {
