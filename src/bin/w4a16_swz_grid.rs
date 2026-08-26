@@ -147,8 +147,9 @@ fn main() {
     println!("=== W4A16: pre-permuted vs row-major, swept across grid size ===");
     println!("both lanes: one 32-thread cube per (m_tile 16, n_tile 8), so cubes = n/8");
     println!(
-        "k = {k}, m_pad = {m_pad}; GB/s over the weight table only; min of {ROUNDS} rounds of \
-         {REPS} pipelined launches\n"
+        "k = {k}, m_pad = {m_pad}, swz load depth = {}; GB/s over the weight table only; min of \
+         {ROUNDS} rounds of {REPS} pipelined launches\n",
+        mary::models::inkling::w4a16gemm::swz_unroll(),
     );
     println!(
         "{:>8} {:>7} {:>9} {:>4} {:>10} {:>10} {:>10} {:>10} {:>7}",

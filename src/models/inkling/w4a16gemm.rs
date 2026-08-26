@@ -994,7 +994,8 @@ pub fn swizzle_w4a16_device<R: Runtime>(
 /// * sink `gate_up` `[8192, 4096]`, 1024 cubes: the permutation WINS 1.13-1.22x.
 ///   `w4a16_bind` used to decline it, on the weight-kind rule; `swizzle_pays`
 ///   now takes it.
-/// * sink `down` `[4096, 2048]`, 512 cubes: LOSES 0.88x. Declining it is right.
+/// * sink `down` `[4096, 2048]`, 512 cubes: LOSES 0.88x, and is declined. This is
+///   the shape a deliberate load-ahead is aimed at -- see [`swz_unroll`].
 /// * the head `[201024, 4096]`, 25128 cubes: WINS 1.24x, and is declined for a
 ///   CORRECTNESS reason (the `ann_logits` seam), not this one.
 /// * the dense MLP, which is the next candidate and the reason this was chased:
@@ -1052,17 +1053,22 @@ pub fn swizzle_w4a16() -> bool {
 ///                  2048     67.8 ->  98.3     1.45   YES
 /// ```
 ///
-/// MEASURED vs INTERPOLATED, because a threshold whose provenance is lost is a
-/// threshold nobody can revise:
+/// RELAXED 2026-08-26 once [`swz_unroll`] shipped. The table above is the
+/// UN-PIPELINED kernel; at the shipped load depth of 4 every shape in it wins,
+/// the two losing rows included (512 cubes goes 0.84 -> 1.20 at k=4096 and
+/// 0.80 -> 1.02 at k=2048). So the predicate no longer encodes a crossover, only
+/// the edge of what has been measured:
 ///
-/// * `cubes >= 1024` is measured to pay at every k measured (1.09, 1.13, 1.43).
-///   The bound is placed at 1024 and not at the ~750-cube crossover on purpose:
-///   1.03 is not worth a layout, and the crossover moves with k.
-/// * `cubes >= 512 && k >= 16384` is the single measured point at 1.25. It is
-///   NOT extrapolated downward -- k = 8192 at 512 cubes has never been measured,
-///   and the predicate declines it.
+/// * `cubes >= 512` with `k >= 2048` is the whole measured region, and every
+///   point in it pays at depth 4 -- worst case 1.02, at sink `down`.
+/// * Below 512 cubes is DECLINED as unmeasured at depth 4, not as known-bad.
+///   256 and 384 cubes measured 0.70 and 0.77 un-pipelined and have not been
+///   re-run; the model has no such weight, so nothing turns on it.
 /// * `k < 2048` is below the measured floor entirely and is declined.
-/// * 512..1024 cubes below k = 16384 is measured to LOSE (0.84-0.88).
+///
+/// The two-knob crossover below is kept because it is the MECHANISM, and because
+/// it is what a future kernel change has to be judged against. It is no longer
+/// the shipped rule.
 ///
 /// WHY it is a function of these two things, since a threshold without its
 /// mechanism becomes folklore -- which is how the +25% came to be applied 25x
@@ -1101,13 +1107,7 @@ pub fn swizzle_w4a16() -> bool {
 /// prefill on this axis.
 pub fn swizzle_pays(n: usize, k: usize) -> bool {
     let cubes = n / NTILE;
-    if k < 2048 {
-        return false;
-    }
-    if cubes >= 1024 {
-        return true;
-    }
-    cubes >= 512 && k >= 16384
+    k >= 2048 && cubes >= 512
 }
 
 /// Does `INK_W4A16_SWZ=1` explicitly ask for the permutation where the shipped
@@ -1131,6 +1131,95 @@ pub fn swizzle_w4a16_forced() -> bool {
         .unwrap_or(false)
 }
 
+/// How many k-tiles the swizzled lane loads before it consumes any of them.
+///
+/// The permutation removes 8x of B's sector REQUESTS and, with them, the
+/// row-major form's accidental 4-deep L1 prefetch -- see [`swizzle_pays`] for
+/// the measurement and the mechanism. This is the attempt to keep both: issue
+/// several k-tiles' loads up front so the warp carries them in flight
+/// deliberately, rather than inheriting depth from a wasteful access pattern.
+///
+/// Depth 4 is the number to match, because that is what one row-major 32-byte
+/// sector covers. The registers are free: `ncu` puts this lane's occupancy under
+/// `launch__occupancy_limit_blocks` = 24, not under the register limit, and the
+/// swizzled kernel sits at 36 registers against the row-major lane's 44.
+///
+/// `INK_W4A16_SWZ_UNROLL` overrides for a sweep; it must divide `k / KTILE`.
+///
+/// # What it measured (`w4a16_swz_grid`, same framing as [`swizzle_pays`])
+///
+/// `ratio` is row-major time / swizzled time. Depth 1 is the un-pipelined kernel
+/// and reproduces the table in [`swizzle_pays`], which is the regression check
+/// on this refactor:
+///
+/// ```text
+///            cubes    depth 1   depth 2   depth 4
+///   k=4096     512      0.87      0.92      1.20
+///             1024      1.23      1.23      1.48
+///             2048      1.18      1.28      1.52
+///            25128      1.22      1.30      1.49
+///   k=2048     512      0.80      0.87      1.02   <- sink `down`
+///             1024      1.03      1.14      1.22
+///            25128      1.14      1.14      1.39
+/// ```
+///
+/// AT DEPTH 4 EVERY MEASURED SHAPE WINS, including both shapes that lost at
+/// depth 1. The losing region is not a property of the permutation; it was the
+/// permutation being charged for memory-level parallelism it had removed and
+/// nobody had put back. Restoring it deliberately costs 3 registers a depth step
+/// and buys the trade outright.
+///
+/// It is also worth far more than the crossover it fixes. The head goes
+/// 107.9 -> 161.3 GB/s, against the 95.9 -> 116.3 in this module's original
+/// table: the permutation alone was collecting less than half of what was
+/// available, at EVERY cube count, because the un-pipelined loop kept one k-tile
+/// of fetch outstanding at a time whatever the layout. THAT is the correction to
+/// the mechanism in [`swizzle_pays`] -- the story there is right about which way
+/// the trade tips and wrong to imply the high-cube-count end had no latency left
+/// to hide. It did, and depth 4 collects it.
+///
+/// ## Why 4 and not 8, exactly
+///
+/// Depth 8 is measured and is WORSE: 1.17 against depth 4's 1.48 at 1024 cubes
+/// (k=4096), 1.00 against 1.22 (k=2048), 1.12 against 1.57 (k=16384). `ncu` says
+/// why, and the boundary is sharp:
+///
+/// ```text
+///   depth   registers   launch__occupancy_limit_registers   achieved occupancy
+///     1        38            48 blocks (slack)                   45.07%
+///     4        78            24 blocks (exactly co-binding)      44.77%
+///     8        86            20 blocks (BINDING)                 37.41%
+/// ```
+///
+/// `launch__occupancy_limit_blocks` is 24 on this part, so depth 4 is the
+/// largest depth whose register demand still lands at or above that cap --
+/// occupancy is untouched. Depth 8 pushes the register limit BELOW the block cap
+/// and occupancy falls with it. "The registers are free" was true, and it stops
+/// being true between 4 and 8.
+///
+/// The control that makes this a schedule effect and not a traffic one: at
+/// `[16384, 4096]` the sector count is 22020096 at depth 1, 4 AND 8, byte for
+/// byte, with `sectors_per_request` 6 throughout. Same bytes, same requests, same
+/// sectors -- only WHEN they are issued differs.
+///
+/// Bit-identical to the row-major lane at depth 4: max deviation 0.000e0 over
+/// 1024 outputs of a `[16, 256] x [64, 256]^T` product (`w4a16_swz_probe`).
+pub const SWZ_UNROLL_DEFAULT: usize = 4;
+
+/// [`SWZ_UNROLL_DEFAULT`], overridable for a sweep. Powers of two up to 8.
+pub fn swz_unroll() -> usize {
+    // Cached: this is read on every LAUNCH, which is inside the timed region of
+    // every harness that measures this lane.
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("INK_W4A16_SWZ_UNROLL")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|d| *d > 0 && d.is_power_of_two() && *d <= 8)
+            .unwrap_or(SWZ_UNROLL_DEFAULT)
+    })
+}
+
 /// [`w4a16_linear`] reading a B operand written by [`swizzle_w4a16_codes_into`].
 ///
 /// The ONLY difference is the two global indices. Everything else — the
@@ -1147,6 +1236,7 @@ pub fn w4a16_linear_swz<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size>(
     #[comptime] size_k: usize,
     #[comptime] size_n: usize,
     #[comptime] swz_sc: bool,
+    #[comptime] kunroll: usize,
     scale: f32,
 ) {
     let def = cmma::MmaDefinition::<AB, AB, f32>::new(MTILE, NTILE, KTILE);
@@ -1179,44 +1269,86 @@ pub fn w4a16_linear_swz<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size>(
     let spr = comptime!(size_k / GROUP);
     let k_tiles = comptime!(size_k / KTILE);
     let wpb = comptime!(SWZ_BLOCK_CODES / 4);
+    let groups = comptime!(k_tiles / kunroll);
 
-    for t in 0..k_tiles {
-        let kbase = t * KTILE;
+    // `kunroll` k-tiles are LOADED before any of them is consumed, so the warp
+    // carries `kunroll * 2` B sectors in flight instead of 2. That depth is what
+    // the permutation took away: a row-major 32-byte sector spans four k-tiles,
+    // so the row-major lane gets depth 4 for free out of an access pattern that
+    // costs it 8x the requests. See `swizzle_pays`.
+    //
+    // Both buffer indices below are comptime (`u` and `i` are unrolled loop
+    // variables), so these stay in registers -- a RUNTIME index would spill the
+    // array to local memory, which is the hazard `e2m1_value` is written the way
+    // it is to avoid.
+    let mut w_buf = Array::<u32>::new(comptime!(kunroll * vc_b));
+    let mut s_buf = Array::<f32>::new(kunroll);
+    let mut a_buf = Array::<Vector<AB, NA>>::new(comptime!(kunroll * vc_a));
+
+    for g in 0..groups {
         #[unroll]
-        for i in 0..vc_a {
-            let (row, col) = def.position_of_nth(lane, (i * vs_a * pack) as u32, MatrixIdent::A);
-            let gr = row as usize + m_base;
-            let gc = col as usize + kbase;
-            reg_a[i] = a[(gr * size_k + gc) / a.vector_size()];
-        }
-        #[unroll]
-        for i in 0..vc_b {
-            // Written out of `position_of_nth` rather than assumed, so it
-            // tracks the target's own fragment layout: `row` is the k element,
-            // `col` the n column, and `swz_word_k16`'s `w` is `row / 8`.
-            let (row, col) = def.position_of_nth(lane, (i * vs_b) as u32, MatrixIdent::B);
-            let w = row as usize / CODES_PER_WORD;
-            let blk = (n_tile * k_tiles + t) * wpb;
-            let word = b[blk + w * NTILE + col as usize];
-            let s = if swz_sc {
-                f32::cast_from(b_sc[(n_tile * k_tiles + t) * NTILE + col as usize])
-            } else {
-                f32::cast_from(b_sc[(col as usize + n_base) * spr + (row as usize + kbase) / GROUP])
-            };
-            let mut v = Vector::<AB, NA>::empty();
+        for u in 0..kunroll {
+            let t = g * kunroll + u;
+            let kbase = t * KTILE;
             #[unroll]
-            for j in 0..vs_b {
-                let kk = row as usize + kbase + j;
-                let code = (word >> (4 * (kk % CODES_PER_WORD)) as u32) & 15u32;
-                v[j] = AB::cast_from(e2m1_value(code) * s);
+            for i in 0..vc_a {
+                let (row, col) =
+                    def.position_of_nth(lane, (i * vs_a * pack) as u32, MatrixIdent::A);
+                let gr = row as usize + m_base;
+                let gc = col as usize + kbase;
+                a_buf[u * vc_a + i] = a[(gr * size_k + gc) / a.vector_size()];
             }
-            reg_b[i] = v;
+            #[unroll]
+            for i in 0..vc_b {
+                // Written out of `position_of_nth` rather than assumed, so it
+                // tracks the target's own fragment layout: `row` is the k
+                // element, `col` the n column, and `swz_word_k16`'s `w` is
+                // `row / 8`.
+                let (row, col) = def.position_of_nth(lane, (i * vs_b) as u32, MatrixIdent::B);
+                let w = row as usize / CODES_PER_WORD;
+                let blk = (n_tile * k_tiles + t) * wpb;
+                w_buf[u * vc_b + i] = b[blk + w * NTILE + col as usize];
+            }
+            // One scale per k-tile, not one per fragment element. Both elements
+            // of a fragment sit at `row` in 0..14 and `kbase` is a multiple of
+            // KTILE = GROUP, so `(kbase + row) / GROUP` is `t` for every row --
+            // the module header's second fact. The old form wrote it per element
+            // and let the compiler notice; this says it once.
+            let (_r0, c0) = def.position_of_nth(lane, 0u32, MatrixIdent::B);
+            s_buf[u] = if swz_sc {
+                f32::cast_from(b_sc[(n_tile * k_tiles + t) * NTILE + c0 as usize])
+            } else {
+                f32::cast_from(b_sc[(c0 as usize + n_base) * spr + kbase / GROUP])
+            };
         }
 
-        let d = def.execute(&reg_a, &reg_b, &acc);
         #[unroll]
-        for i in 0..vc_c {
-            acc[i] = d[i];
+        for u in 0..kunroll {
+            let kbase = (g * kunroll + u) * KTILE;
+            #[unroll]
+            for i in 0..vc_a {
+                reg_a[i] = a_buf[u * vc_a + i];
+            }
+            #[unroll]
+            for i in 0..vc_b {
+                let (row, _col) = def.position_of_nth(lane, (i * vs_b) as u32, MatrixIdent::B);
+                let word = w_buf[u * vc_b + i];
+                let s = s_buf[u];
+                let mut v = Vector::<AB, NA>::empty();
+                #[unroll]
+                for j in 0..vs_b {
+                    let kk = row as usize + kbase + j;
+                    let code = (word >> (4 * (kk % CODES_PER_WORD)) as u32) & 15u32;
+                    v[j] = AB::cast_from(e2m1_value(code) * s);
+                }
+                reg_b[i] = v;
+            }
+
+            let d = def.execute(&reg_a, &reg_b, &acc);
+            #[unroll]
+            for i in 0..vc_c {
+                acc[i] = d[i];
+            }
         }
     }
 
@@ -1258,6 +1390,13 @@ pub fn w4a16_linear_swz_launch<R: Runtime>(
     let vs = 32 / bf16::cube_type().size_bits();
     let wpr = k / CODES_PER_WORD;
     let spr = k / GROUP;
+    // Depth must divide the k loop exactly; a shape that does not divide takes
+    // depth 1 rather than a remainder loop, because a remainder loop would be a
+    // second code path through the dequantise for the sake of a few k-tiles.
+    let kunroll = {
+        let d = swz_unroll();
+        if (k / KTILE) % d == 0 { d } else { 1 }
+    };
 
     unsafe {
         w4a16_linear_swz::launch::<bf16, e4m3, R>(
@@ -1273,6 +1412,7 @@ pub fn w4a16_linear_swz_launch<R: Runtime>(
             k,
             n,
             swz_sc,
+            kunroll,
             scale,
         )
     };
@@ -1291,10 +1431,10 @@ mod swizzle_k16_tests {
     /// cannot pass.
     /// The predicate agrees with the measured table at the four real consumers.
     ///
-    /// The pair that matters is the last two: the SAME 512 cubes, opposite
-    /// answers, because k differs 8x. A predicate that keyed on cube count alone
-    /// would get one of them wrong, and the sink is the one that was used as the
-    /// dense MLP's proxy.
+    /// Every one of them pays at the shipped load depth of 4; the history worth
+    /// keeping is that sink `down` did NOT before it, and that the un-pipelined
+    /// table would have declined it forever. What is left in the predicate is the
+    /// edge of what has been measured, not a crossover.
     #[test]
     fn swizzle_pays_matches_the_measured_shapes() {
         // head [201024, 4096], 25128 cubes, measured 1.24x.
@@ -1304,17 +1444,16 @@ mod swizzle_k16_tests {
         // dense g/u [16384, 4096], 2048 cubes, measured 1.25x.
         assert!(swizzle_pays(16384, 4096));
 
-        // sink down [4096, 2048], 512 cubes, measured 0.88x -- LOSES.
-        assert!(!swizzle_pays(4096, 2048));
-        // dense down [4096, 16384], the SAME 512 cubes, measured 1.25x -- WINS.
+        // sink down [4096, 2048], 512 cubes: 0.88x UN-PIPELINED, 1.02x at the
+        // shipped load depth of 4. Taken now, and this is the row that flipped.
+        assert!(swizzle_pays(4096, 2048));
+        // dense down [4096, 16384], the SAME 512 cubes: 1.25x, 1.48x at depth 4.
         assert!(swizzle_pays(4096, 16384));
 
-        // Declined below the measured floor rather than extrapolated into it.
-        assert!(
-            !swizzle_pays(4096, 8192),
-            "512 cubes at k=8192 is unmeasured"
-        );
-        assert!(!swizzle_pays(2048, 4096), "256 cubes measured 0.70x");
+        // Declined as UNMEASURED at depth 4, not as known-bad. 256 cubes read
+        // 0.70x un-pipelined and has not been re-run; no weight in the model has
+        // that shape, so nothing turns on it.
+        assert!(!swizzle_pays(2048, 4096), "256 cubes not re-run at depth 4");
         assert!(!swizzle_pays(201024, 1024), "k below the measured floor");
     }
 
