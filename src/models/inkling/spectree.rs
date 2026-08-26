@@ -243,7 +243,63 @@
 //! `f * d`. Then the criterion is just `p_kept > d + c2 - 1 = 0.539` with no
 //! constant to overcome.
 //!
-//! Substituting the measured head-confidence buckets into that model bounds
+//! ## MEASURED: the free signal is nearly uninformative
+//!
+//! The `stackp1` sweep ran (2026-08-26, same pipe, three corpora) and the
+//! bound below is NOT achieved, because the assumption under it is false. The
+//! main stack's own confidence barely predicts head 0's correctness at all.
+//! Prose, at comparable retained fractions:
+//!
+//! ```text
+//! signal      kept    p_kept   p_dropped
+//! head p1     0.202   0.6841   0.1987     <- separates enormously
+//! stackp1     0.199   0.4328   0.2631     <- barely separates
+//! ```
+//!
+//! Across the whole `stackp1` sweep `p_dropped` moves only 0.205 -> 0.267,
+//! and `p_kept` tops out at 0.4622 (at f = 0.155). The free gate needs
+//! `p_kept > 0.539` and **never reaches it**: best 0.989x on prose, still
+//! under never-speculate.
+//!
+//! That is intuitive in hindsight and worth stating so nobody re-derives it:
+//! the stack being confident about token `t+1` says little about whether a
+//! DIFFERENT predictor will guess `t+2`. Head 0's own probability is about
+//! exactly the thing being gated; the stack's is about a neighbouring
+//! question. **The informative signal is the expensive one and the free
+//! signal is uninformative** — which is the whole dichotomy, and it is why no
+//! zero-cost gate exists here.
+//!
+//! ## But the PAID gate is not dead — it just helps elsewhere
+//!
+//! What the same run showed, which was not what was being looked for:
+//!
+//! ```text
+//! corpus   hit@1    never   always   gate (head p1)   gate (stackp1)
+//! prose    0.2969   1.000   0.843    0.993 @T=0.40    0.989 @T=0.95
+//! code     0.6956   1.000   1.102    1.150 @T=0.60    1.125 @T=0.80
+//! count    0.9892   1.000   1.293    1.293 @T=0.20    1.293 @T=0.00
+//! ```
+//!
+//! The gate pays in the MIDDLE of the acceptance range, not at the bottom
+//! where it was aimed. On code it beats the always-on arm by 4.4% and the
+//! never arm by 15%. On counting there is nothing to gate (`T = 0` is
+//! optimal — retain everything). On prose it removes most of a 16% loss and
+//! still cannot cross 1.000x, so the correct policy there is not to
+//! speculate at all.
+//!
+//! Mixed workload, equal token counts, aggregating as time (`3 / sum(1/s)`):
+//! never 1.000x, always 1.046x, gate about **1.13x** — and a FIXED threshold
+//! near `T = 0.6` gets essentially all of it (1.131x), so this is not an
+//! oracle-threshold artefact. The gate is worth about +8% over always-on.
+//!
+//! Every figure here is denominated in a step with `c2 = 1.492` and
+//! `d = 0.047`. Device busy is now measured at 37.11 ms/node against a
+//! 47.4 ms step, so graphs are worth 1.28x and will move both constants.
+//! These numbers are a SNAPSHOT, not a recommendation.
+//!
+//! ## The superseded bound, kept for its shape
+//!
+//! Substituting the measured head-confidence buckets into that model bounded
 //! what such a gate could pay on prose:
 //!
 //! ```text
@@ -252,13 +308,13 @@
 //! T=0.70  f=0.112  p=0.800 -> 1.028x
 //! ```
 //!
-//! **About 1.03x on prose.** That is a real win where the always-on lane
-//! loses 16%, and it is not a large one. Note what it is NOT: a proof. It
-//! substitutes head-0's confidence for the free signal, on the assumption
-//! that no cheaper signal predicts head 0's correctness BETTER than head 0's
-//! own probability does. That is plausible and unproven, and it is the one
-//! measurement still owed — `INK_MTP_TOPK` now emits the `stackp1` sweep that
-//! settles it.
+//! — about 1.03x. It was labelled a BOUND with its assumption stated, and the
+//! assumption was that a free signal would be as discriminative as head 0's
+//! own probability. Measurement says it is not, and the actual free gate
+//! reaches 0.989x. The bound was correctly DIRECTED (it was an upper bound and
+//! the truth came in under it) and the quantity it bounded was not worth
+//! having. Kept here because a bound that is later measured and found loose is
+//! the cheapest possible record of how much a stated assumption was carrying.
 //!
 //! On a mixed workload the gate's value is not that it beats the best arm
 //! anywhere; it is that it removes the worst arm's downside. Equal token
