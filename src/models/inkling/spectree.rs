@@ -277,10 +277,27 @@ impl TreeSpec {
     /// There is also a ceiling, and it is the one-line argument against ever
     /// widening this "as an optimisation". Breadth at depth 1 accepts AT MOST
     /// one drafted token plus the free bonus, so the expected tokens per pass
-    /// cannot exceed 2.0 no matter how good the drafts are. At MoE = 72.7% of
-    /// step bytes the same measurement prices `b = 6` at 2.286x a plain step —
-    /// ABOVE that ceiling, so width 6 cannot pay even with perfect acceptance.
-    /// `b = 4` needs 95% of the ceiling to break even; `b = 2` needs 57%.
+    /// cannot exceed 2.0 no matter how good the drafts are. Against that
+    /// ceiling the expert-union measurement's own cost model (MoE = 72.7% of
+    /// step bytes) prices `b = 6` at 2.286x a plain step — ABOVE it, so width 6
+    /// cannot pay even with perfect acceptance — with `b = 4` needing 95% of
+    /// the ceiling to break even and `b = 2` needing 57%.
+    ///
+    /// **Those three percentages are DERIVED, and they are not re-derivable
+    /// from the table above.** The table counts distinct EXPERTS; turning that
+    /// into a step cost needs the other 27.3% of the bytes as well, and how
+    /// that part scales with ROW COUNT is not in the table. Assume it is
+    /// row-invariant and `b = 2` prices at 1.050x (break-even at 5% of the
+    /// ceiling); take the file header's measured linear `c(2) = 1.492` as
+    /// implying it scales nearly linearly and the same `b = 2` prices at about
+    /// 1.39x (break-even near 39%). A factor of eight in the conclusion sits
+    /// between two readings of one unstated assumption, which is exactly why a
+    /// number carries its framing or is not evidence.
+    ///
+    /// So do not quote 57% as a measurement. `INK_TREE` exists to replace it
+    /// with one: an idle-gated interleaved run of `b = 2` against the
+    /// unspeculated baseline on one box measures the ratio directly, and that
+    /// number supersedes every derivation here including this one.
     ///
     /// The corollary is the reason breadth is worth building at all: breadth
     /// and depth price two DIFFERENT axes. Breadth raises the probability of
