@@ -74,6 +74,23 @@
 //! bit-identical to the row it would have been in a linear batch holding only
 //! its own path (`a_tree_row_is_its_own_branch_local`, GB10, 0e0).
 //!
+//! # What a SINGLE BOX can and cannot measure
+//!
+//! `INK_TREE` runs on one box, and measured there (GB10, layers 0:21, ctx512,
+//! `INK_GEN=48`, 2026-08-26) a `b = 2` tree accepted **0 of 48** passes. That
+//! is not a defect in the tree. A half stack unembeds a MID-STACK hidden state,
+//! while an MTP head is trained to predict the FULL model's next token from the
+//! FULL model's hidden state — so the drafter and the verifier are two
+//! different models and agreement is accidental. The 22% depth-1 acceptance in
+//! `inkling_forward`'s header was measured on the TAIL (layers 20:42), which
+//! owns the real final hidden state.
+//!
+//! The full 42 layers do not fit one GB10 (21 layers is already 84 GiB of
+//! weights on a 121 GiB box), which is why speculation is a two-machine
+//! arrangement in the first place. So: a single box prices the tree's COST and
+//! gates its arithmetic, and cannot measure its ACCEPTANCE at all. Both halves
+//! are needed to say whether breadth pays, and they come from different runs.
+//!
 //! What is NOT here is the DECODE LOOP. `inkling_forward.rs` still builds a
 //! chain, and three things stand between it and a tree:
 //!

@@ -297,6 +297,44 @@
 //! wired accept-and-skip loop, which reads 0.916x at w = 1, 0.866x at w = 2 and
 //! 0.742x at w = 3 against an unspeculated 127.1 ms baseline -- a baseline that
 //! is also an independent confirmation of the 126.8 ms above.
+//! # A WIDENED PASS IS NOT TOKEN-IDENTICAL TO A ONE-ROW PASS
+//!
+//! Measured 2026-08-26 on the GB10, layers 0:21, ctx512 (`refprompts/ctx512`),
+//! `INK_KV=1 INK_GEN=48`, release, same binary and same commit for every arm:
+//!
+//! ```text
+//! arm                        agrees with the 1-row baseline for
+//! INK_WIDTH=2 (2 rows)       the first 18 generated tokens, then diverges
+//! INK_WIDTH=3 (3 rows)       the first 17
+//! INK_FLASH=0 (1 row, paged) the first 12
+//! ```
+//!
+//! `INK_WIDTH` is a COST PROBE. Its extra rows are random filler, it reads the
+//! argmax off ROW 0, and nothing is drafted, accepted or rolled back. Row 0 of
+//! a widened batch is the same token in the same context as the one-row pass --
+//! and it still stops agreeing after seventeen tokens.
+//!
+//! So the divergence is not speculation, not a tree, and not a bug. Row 0 of an
+//! `n`-row batch is a different summation order from a one-row step (a batched
+//! convolution kernel, a batched attention, a different reduction), the
+//! difference is ~1e-5, and this model's argmax is tight enough that ~1e-5
+//! flips a token inside twenty. The fused/paged attention lanes disagree by the
+//! same order and do the same thing sooner.
+//!
+//! **This re-specifies what a speculation numerics gate can assert.** "The
+//! speculative lane must agree token-for-token with non-speculative greedy" is
+//! not achievable by ANY widened pass on this stack, including the `INK_SPEC`
+//! lane that already ships. The gate that IS meaningful is agreement against a
+//! SAME-WIDTH reference -- `INK_WIDTH=n` against a tree of `n` rows -- because
+//! that holds the arithmetic fixed and varies only the thing under test. A gate
+//! against the one-row baseline measures the model's argmax margin, which is a
+//! fact about the checkpoint and not about the change.
+//!
+//! The theorem speculative decoding actually offers is about the DISTRIBUTION
+//! the verifier accepts from, and it is untouched by this: what is being
+//! observed is that two arithmetically-equivalent ways of computing that
+//! distribution do not round identically.
+//!
 //! # `INK_SPEC=k`: the accept-and-skip loop, and what decides whether it pays
 //!
 //! The loop the MTP acceptance measurement was for, wired end to end. Set it on
