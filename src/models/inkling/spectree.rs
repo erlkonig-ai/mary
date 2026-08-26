@@ -1181,6 +1181,24 @@ pub fn tree_attn(tree: &TreeSpec, kernel: usize) -> TreeAttn {
     }
 }
 
+/// The `kernel - 1` window rows the NEXT position's convolution must carry,
+/// after a verify pass kept `kept` of its rows.
+///
+/// Indices into the same `kernel - 1 + rows` window [`TreeAttn::taps`] uses,
+/// so a rollback is a gather out of the window the batch already built —
+/// which is what lets the verifier decide late.
+///
+/// On a chain with `kept = 0..keep` this returns `keep .. keep + kernel - 1`,
+/// exactly the slice `AttnCache::commit` takes today. On a tree it is the tail
+/// of `history ++ accepted path`, which is the same sentence and a different
+/// slice, because the accepted rows are not contiguous.
+pub fn conv_next_history(kernel: usize, kept: &[usize]) -> Vec<usize> {
+    let hist = kernel - 1;
+    let mut seq: Vec<usize> = (0..hist).collect();
+    seq.extend(kept.iter().map(|&r| hist + r));
+    seq[seq.len() - hist..].to_vec()
+}
+
 /// The absolute position of every slot a tree verify pass can attend to.
 ///
 /// `base` is the cache's first absolute position and `len_before` the rows it
@@ -1707,6 +1725,34 @@ mod tests {
             assert_eq!(a.taps[c][..2], [1, 2], "row {c}");
             assert_eq!(a.taps[c][2], 3, "row {c} taps the confirmed token");
         }
+    }
+
+    #[test]
+    fn next_history_on_a_chain_is_the_slice_commit_takes_today() {
+        for kernel in [2usize, 3, 4, 5] {
+            for keep in 0..=6usize {
+                let kept: Vec<usize> = (0..keep).collect();
+                assert_eq!(
+                    conv_next_history(kernel, &kept),
+                    (keep..keep + kernel - 1).collect::<Vec<_>>(),
+                    "kernel={kernel} keep={keep}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn next_history_gathers_a_scattered_accepted_path() {
+        // b=2 at depth 1, and the SECOND candidate was accepted: rows 0 and 2.
+        let got = conv_next_history(4, &[0, 2]);
+        assert_eq!(
+            got,
+            vec![2, 3, 5],
+            "history row 2, then the root, then row 2"
+        );
+        // ...and it is exactly the taps a row appended after that path wants.
+        let a = tree_attn(&TreeSpec::breadth(2).unwrap(), 4);
+        assert_eq!(a.taps[2][1..], got[..], "the accepted row's own taps agree");
     }
 
     #[test]
