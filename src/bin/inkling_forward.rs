@@ -7447,10 +7447,132 @@ fn main() -> Result<()> {
          carry, or drop the carry to time repeated replay."
     );
     let graph_diff = graph_diff || graph_xstep;
-    let want_captures = if graph_diff { 2 } else { 1 };
+    // --- THE LANE (`INK_GRAPH_LANE=1`) ---
+    //
+    // Everything above this line is an INSTRUMENT: it captures the region once,
+    // replays it once, and measures. This is the lane -- capture twice, learn
+    // what moves between the two, then run every later decode step by
+    // rewriting those parameters and replaying, with no host enqueue of the
+    // region at all.
+    //
+    // WHY TWO CAPTURES AND NOT A TABLE OF PER-STEP CONSTANTS. An inventory
+    // assembled by reading the forward pass is complete only by luck -- the
+    // same argument that put the buffer hold in the allocator rather than in a
+    // list of cache fields here. Two captures of the same region DIFFED say
+    // what moves, at the count it actually moves, including anything a reader
+    // would have missed. What the lane assumes about that diff is exactly one
+    // thing, and it is stated as a check rather than as a belief: every moving
+    // word is AFFINE in the decode position, so word `w` of launch `i` at step
+    // `S + n` is `v_S + n * (v_{S+1} - v_S)`. That is true of every host value
+    // this region varies -- the query position, the live-row watermark, the
+    // window's dropped prefix, and the KV write row all advance by exactly one
+    // a step -- and it is false at a page boundary, which is why the lane asks
+    // the caches whether the step is replayable before it takes it.
+    //
+    // WHAT THE LANE REQUIRES, refused rather than assumed:
+    //
+    //  * `INK_GRAPH_CARRY=1`. A captured region records ADDRESSES, and with the
+    //    carry off a short convolution writes its new history to a FRESH buffer
+    //    every step -- so a replay reads step S's history forever. The carry
+    //    lands it back where it was read from, which is what makes the address
+    //    stable. It also makes the region deliberately NOT idempotent under
+    //    repeated replay, which is correct here and is why `INK_GRAPH_REPS`
+    //    must be zero: the lane replays exactly once per step, which is exactly
+    //    once per token of history.
+    //  * No `INK_GRAPH_DIFF` / `INK_GRAPH_XSTEP`. Those arms own the captures.
+    let graph_lane = std::env::var("INK_GRAPH_LANE").ok().as_deref() == Some("1");
+    anyhow::ensure!(
+        !(graph_lane && !mary::models::inkling::sconv::carry_in_place()),
+        "INK_GRAPH_LANE=1 needs INK_GRAPH_CARRY=1. Without the carry every short convolution \
+         writes its new history to a fresh buffer, and a replayed region records the address it \
+         was captured with -- so every step after the capture would convolve from the capture \
+         step's history, forever, and emit a fluent wrong token with no error anywhere."
+    );
+    anyhow::ensure!(
+        !(graph_lane && graph_diff),
+        "INK_GRAPH_LANE=1 is exclusive with INK_GRAPH_DIFF / INK_GRAPH_XSTEP: those arms own the \
+         captures and the lane needs all three of them for its own calibration."
+    );
+    // `INK_GRAPH_REPS` defaults to 8 without anybody asking for it, so refusing
+    // over the DEFAULT would make the lane unrunnable without a second flag
+    // nobody set. Forced to zero instead: the lane replays exactly once per
+    // step, which with the carry on is exactly once per token of history, and
+    // repeated replay of the same step is the one thing that is not that.
+    let graph_reps = match graph_lane {
+        true => 0,
+        false => graph_reps,
+    };
+    let graph_on = graph_on || graph_lane;
+    // THREE captures for the lane, and the third one is not redundant.
+    //
+    // Two captures give a difference. They cannot say whether that difference
+    // is a per-step DELTA or a one-off, and the whole lane rests on it being a
+    // delta. Three give a second difference, and the lane arms only if the two
+    // agree word for word -- which is the affineness assumption stated as a
+    // measurement instead of a belief.
+    //
+    // The third also separates a FIRST-CAPTURE transient from a genuine
+    // instability. Capture A follows the pre-warm passes; B and C follow a
+    // capture. If an address moves A -> B but not B -> C, that is the arena
+    // settling, and the lane can arm on C. If it moves B -> C, nothing is
+    // stable and the lane must not arm at all. Diffing only A and B cannot tell
+    // those apart, and the expensive mistake is to read the first as the second
+    // and give up, or the second as the first and ship.
+    let want_captures = if graph_lane {
+        3
+    } else if graph_diff {
+        2
+    } else {
+        1
+    };
     let mut graphs_captured: Vec<u64> = Vec::new();
     let mut graph_diff_done = false;
     let mut graph_report: Option<(usize, f64, Vec<f64>)> = None;
+    // What a replayed step rewrites, learned from the two calibration captures.
+    //
+    // `template` is the blob graph `graph` was captured with; `moving` is the
+    // words that differed between the two captures and the per-step delta each
+    // one advances by. A patch is `template[w] + n * delta`, computed from the
+    // capture rather than accumulated, so a step's parameters do not depend on
+    // the steps before it having been patched correctly.
+    struct LaneLaunch {
+        idx: usize,
+        template: Vec<u64>,
+        moving: Vec<(usize, u64)>,
+    }
+    struct LanePlan {
+        graph: u64,
+        /// The decode step whose parameters the capture recorded.
+        base_step: usize,
+        plan: Vec<LaneLaunch>,
+        /// How many of the moving words sit in the STAGED half of the blob --
+        /// shapes and strides, which reach the kernel through a memcpy node and
+        /// are rewritten in the graph's own pinned buffer rather than through a
+        /// parameter set. Reported because it is the number that says whether
+        /// the 483 host copies were ever a per-step problem.
+        staged_words: usize,
+    }
+    let mut lane_plan: Option<LanePlan> = None;
+    // The region's INPUT, pinned. `xd` is uploaded fresh every step, before the
+    // arena opens, so its address is wherever the pool put it -- and the
+    // region's first kernel reads that address out of a graph node. The lane
+    // adopts one buffer on its first decode step and copies every later step's
+    // embedding into it: one 8 KB device copy in place of one moving pointer,
+    // and the capture then records an address that is still valid on step
+    // S + 64.
+    let mut lane_input: Option<T2> = None;
+    // The region's OUTPUT, held from the capture. A replayed step runs no host
+    // code in the region, so nothing reassigns `xd`; it is whatever buffer the
+    // captured last `add_resid` writes, which the arena keeps at one address
+    // for the graph's life.
+    let mut lane_output: Option<T2> = None;
+    // Why the lane stopped, if it did. A lane that quietly falls back to the
+    // eager path is a lane whose measurements are unattributable, so this is
+    // printed once and the run says plainly which steps it covered.
+    let mut lane_retired: Option<String> = None;
+    let mut lane_steps = 0usize;
+    let mut lane_patch_us: Vec<f64> = Vec::new();
+    let mut lane_replay_us: Vec<f64> = Vec::new();
     // The eager baseline must come from a step that did NOT capture: on the
     // capture step `t_layers` brackets the recording, the instantiate and every
     // replay, so it is not the cost of running the region. This holds the last
@@ -7659,6 +7781,52 @@ fn main() -> Result<()> {
         // upload is still f32 -- the embedding is host work and the wire is f32 --
         // and this is the one cast that pays for the whole stack staying narrow.
         let mut xd: T2 = dev_lane_resid::as_resid(up2::<Bk>(x_in, n, h, &dev));
+        // THE REGION'S INPUT, PINNED (`INK_GRAPH_LANE=1`).
+        //
+        // `up2` is `Tensor::from_data` -- a fresh allocation from the ordinary
+        // pool every step -- and `as_resid` casts into another one. Both happen
+        // HERE, before `t_ly`, before the arena opens and before the capture
+        // does, so the arena's deterministic base never touches them and the
+        // region's first kernel reads whatever address the pool handed out this
+        // step. A captured region records addresses; that one would be stale on
+        // the very next step.
+        //
+        // So the lane adopts ONE buffer on its first decode step and copies
+        // every later step's embedding into it. That trades a moving pointer
+        // for an 8 KB device copy of `[1, 4096]` BF16 -- one extra launch a
+        // step, outside the captured region, against the 37 ms of enqueue the
+        // region costs. It is deliberately a copy and not a patch: patching
+        // would need the new buffer's DEVICE address, which lives on the far
+        // side of the server thread, and the copy needs nothing but a handle.
+        //
+        // Adopted rather than allocated, so the pre-warm passes see the same
+        // buffer the capture will and the pool is warmed for the shape that is
+        // actually used.
+        if graph_lane && is_decode && n == 1 {
+            match lane_input.as_ref() {
+                None => lane_input = Some(xd.clone()),
+                Some(p) => {
+                    let (dst, ddt) = mary::models::inkling::seam::handle_of_any(p.clone());
+                    let (src, sdt) = mary::models::inkling::seam::handle_of_any(xd.clone());
+                    assert_eq!(
+                        ddt, sdt,
+                        "the pinned region input is {ddt:?} and this step's embedding is {sdt:?}"
+                    );
+                    let bytes = n * h * ddt.size();
+                    assert_eq!(
+                        bytes % 4,
+                        0,
+                        "a {bytes}-byte residual row is not a whole number of 32-bit words, so                          the copy that pins it cannot be one"
+                    );
+                    // Copied through f32 lanes because the copy is a BIT copy:
+                    // the caller has already cast to the residual dtype and a
+                    // second rounding here would make the lane disagree with
+                    // the eager path in the last place anybody would look.
+                    mary::models::inkling::sconv::carry_into(&fp4_client, &dst, &src, bytes / 4);
+                    xd = p.clone();
+                }
+            }
+        }
         let t_embed = t_emb.elapsed().as_secs_f64();
         // The layer loop AND its setup, bracketed WHOLE.
         //
@@ -7891,7 +8059,64 @@ fn main() -> Result<()> {
             };
         }
 
-        for layer in lo..hi {
+        // --- CAN THIS STEP BE REPLAYED? ---
+        //
+        // Asked BEFORE the step and of the caches themselves, not of a rule
+        // written here. A replay reproduces the capture's device work exactly,
+        // shifted only by what the patch moves, so it can stand in for a step
+        // whose page STRUCTURE is the capture's: same pages, same page being
+        // written, same window prefix inside page 0. On 127 of every 128 steps
+        // that holds. On the 128th the eager path pushes a new page, releases
+        // an old one or cuts page 0 -- each of which moves a buffer a graph node
+        // points at -- and the lane has to stand aside.
+        //
+        // `step_is_replayable` is the same arithmetic `append` and `trim` use,
+        // asked without doing it, so the predicate cannot drift from the thing
+        // it predicts.
+        let lane_window = |slot: usize| -> Option<usize> {
+            match t.attn_kind(lo + slot) == AttnKind::Local {
+                true => Some(t.sliding_window_size),
+                false => None,
+            }
+        };
+        let lane_ready = graph_lane
+            && is_decode
+            && n == 1
+            // The batched-slot lane runs a different region and carries its
+            // state in a ring `note_replayed_step` knows nothing about.
+            && !slot_lane
+            && lane_plan.is_some()
+            && lane_retired.is_none()
+            && !capture_now
+            && !prewarm_now
+            && caches.len() == hi - lo;
+        let lane_replay_now = lane_ready
+            && (0..caches.len())
+                .all(|slot| caches[slot].attn.step_is_replayable(1, lane_window(slot)));
+        if lane_ready && !lane_replay_now {
+            // A page boundary. RETIRE rather than fall back silently: a lane
+            // that quietly stops being a lane makes every number after it
+            // unattributable, and this one cannot resume -- re-entering would
+            // need a fresh pre-warm, a fresh capture and a fresh calibration,
+            // which is real work and not a v1 obligation. The run continues
+            // eagerly and correct, because `note_replayed_step` has kept the
+            // host bookkeeping in step with the replays all along.
+            let which: Vec<usize> = (0..caches.len())
+                .filter(|&slot| !caches[slot].attn.step_is_replayable(1, lane_window(slot)))
+                .collect();
+            lane_retired = Some(format!(
+                "step {step}: the KV page structure changes on this step for layer slot(s) \
+                 {which:?} -- a new page, a released page or a cut of page 0 -- and a replay \
+                 records the pages it was captured with. Ran eagerly from here on."
+            ));
+        }
+        // An EMPTY range on a replay step, which skips the loop without moving
+        // thirteen hundred lines one indent to the right.
+        let eager_layers = match lane_replay_now {
+            true => lo..lo,
+            false => lo..hi,
+        };
+        for layer in eager_layers {
             // Cache slot, not layer number. A tail running 20..42 keeps 22 caches
             // and its first layer is its slot 0 — indexing by the absolute layer
             // would walk off the end of a Vec that only ever holds this node's half.
@@ -9199,6 +9424,73 @@ fn main() -> Result<()> {
                 graph_broke = Some((layer, "layer-end"));
             }
         }
+        // --- THE LANE: rewrite and replay, in place of enqueueing ---
+        //
+        // This is the whole lane in one block, and what it is worth is what is
+        // NOT here: no kernel dispatch, no metadata packing, no allocator
+        // request, no pool bookkeeping. One batched parameter rewrite and one
+        // `cuGraphLaunch`.
+        //
+        // The rewrite is ABSOLUTE, computed from the capture's own blob rather
+        // than accumulated from the last step's. A step's parameters therefore
+        // do not depend on the steps before it having been patched correctly,
+        // which is the difference between a lane that drifts and one that does
+        // not.
+        if lane_replay_now {
+            let p = lane_plan
+                .as_ref()
+                .expect("the lane checked that its plan exists");
+            let ahead = lane_steps as u64 + 1;
+            assert_eq!(
+                ahead,
+                (step - p.base_step) as u64,
+                "the lane has replayed {lane_steps} steps but is {} passes past its capture -- a \
+                 pass went by that was neither a replay nor a retirement, so the extrapolation \
+                 would be off by exactly that many tokens and the run would emit a fluent wrong \
+                 one",
+                step - p.base_step
+            );
+            let batch: Vec<(usize, GraphLaunchPatch)> = p
+                .plan
+                .iter()
+                .map(|l| {
+                    let mut info = l.template.clone();
+                    for (w, d) in l.moving.iter() {
+                        info[*w] = l.template[*w].wrapping_add(d.wrapping_mul(ahead));
+                    }
+                    (
+                        l.idx,
+                        GraphLaunchPatch {
+                            grid: None,
+                            info: Some(info),
+                            ptrs: Vec::new(),
+                        },
+                    )
+                })
+                .collect();
+            let t_p = Instant::now();
+            fp4_client.graph_patch_launches(p.graph, batch);
+            lane_patch_us.push(t_p.elapsed().as_secs_f64() * 1e6);
+            let t_r = Instant::now();
+            fp4_client.graph_replay(p.graph);
+            lane_replay_us.push(t_r.elapsed().as_secs_f64() * 1e6);
+            // The host half of the step the replay just did on the device.
+            // Without it `fill`, `len` and `base` stop advancing, and the first
+            // eager step after the lane retires writes over the row this one
+            // wrote.
+            for slot in 0..caches.len() {
+                let w = lane_window(slot);
+                caches[slot].attn.note_replayed_step(1, w);
+            }
+            // The region's output is whatever buffer the captured last
+            // `add_resid` writes, and the arena keeps it at one address for the
+            // graph's life. Nothing reassigned `xd` this pass because no host
+            // code ran in the region.
+            xd = lane_output
+                .clone()
+                .expect("a lane plan implies a capture, and a capture sets the output handle");
+            lane_steps += 1;
+        }
         if prewarm_now {
             // Stop deferring and hand the slices back. The PAGES stay in the
             // pool, which is the whole point: the capture that follows finds
@@ -9454,7 +9746,214 @@ fn main() -> Result<()> {
             if graph_report.is_none() {
                 graph_report = Some((nodes, t_ly.elapsed().as_secs_f64(), per_rep));
             }
+            // The region's OUTPUT, held. `xd` is the last `add_resid`'s buffer,
+            // arena-served and therefore at one address for the graph's life --
+            // and a replayed step reassigns nothing, because no host code runs
+            // in the region. Set on every capture so the last one wins, which
+            // is the graph the lane will replay.
+            //
+            // Set only on the LAST capture, and that is not tidiness. Holding
+            // capture A's output tensor across capture B keeps its arena slice
+            // LIVE, so B is handed a different one -- and every arena address
+            // after it shifts with it, which the calibration would then read as
+            // "hundreds of addresses moved" and retire the lane over. The
+            // deterministic base is a property of the arena being handed the
+            // same request sequence against the same free set.
+            if graph_lane && graphs_captured.len() + 1 == want_captures {
+                lane_output = Some(xd.clone());
+            }
             graphs_captured.push(g);
+        }
+
+        // --- THE LANE'S CALIBRATION, once both captures exist ---
+        //
+        // Two captures of the same region, one step apart, DIFFED. What differs
+        // is what a later step has to rewrite, and the difference itself is the
+        // per-step delta -- because a decode step advances the position by
+        // exactly one and every host value this region varies is affine in the
+        // position.
+        //
+        // Everything the lane assumes is checked here rather than believed, and
+        // a failed check RETIRES the lane instead of aborting the run: the run
+        // then finishes eagerly and correct, and the log says which assumption
+        // was false. That is the difference between an instrument that reports
+        // a negative result and one that just stops.
+        if graph_lane && lane_plan.is_none() && lane_retired.is_none() && graphs_captured.len() == 3
+        {
+            let (a, b, c) = (graphs_captured[0], graphs_captured[1], graphs_captured[2]);
+            let (na, nb) = (
+                fp4_client.graph_launch_count(b),
+                fp4_client.graph_launch_count(c),
+            );
+            let n_first = fp4_client.graph_launch_count(a);
+            // A GRAPH THAT OWNS MEMORY REALLOCATES IT ON EVERY LAUNCH.
+            //
+            // A capture that could not avoid allocating holds MEM-ALLOC nodes,
+            // and such a graph is instantiated with AUTO_FREE_ON_LAUNCH --
+            // which is what makes it relaunchable at all, and which frees and
+            // re-runs those nodes at every launch. For a buffer born and dying
+            // inside the region that is harmless. For anything the region
+            // CARRIES it is fatal, and fatal in the worst way: the launch that
+            // does it is self-consistent, so the damage shows up one step later
+            // as a fluent wrong token.
+            //
+            // The lane will not arm over one. `INK_GRAPH_LANE_ALLOW_ALLOC=1`
+            // takes the risk deliberately, which is the only way to find out
+            // what the escaping allocation actually is.
+            let allocs: usize = fp4_client
+                .graph_node_kinds(c)
+                .into_iter()
+                .filter(|(k, _)| *k == 10)
+                .map(|(_, c)| c)
+                .sum();
+            let allow_alloc =
+                std::env::var("INK_GRAPH_LANE_ALLOW_ALLOC").ok().as_deref() == Some("1");
+            if na != nb || n_first != na {
+                lane_retired = Some(format!(
+                    "the three calibration captures recorded {n_first}, {na} and {nb} launches, \
+                     so the region is not periodic across them and no launch index names the same \
+                     node twice"
+                ));
+            } else if allocs > 0 && !allow_alloc {
+                lane_retired = Some(format!(
+                    "the captured region holds {allocs} MEM-ALLOC node(s): memory the GRAPH owns, \
+                     which AUTO_FREE_ON_LAUNCH frees and re-allocates on every replay. If any of \
+                     it is state the region carries, every replay after the first computes from \
+                     memory the previous replay's contents were freed out of, and the step that \
+                     shows it is the one AFTER. Set INK_GRAPH_LANE_ALLOW_ALLOC=1 to arm anyway \
+                     and find out what it is."
+                ));
+            } else {
+                if allocs > 0 {
+                    println!(
+                        "  GRAPHLANE: arming over {allocs} MEM-ALLOC node(s) because \
+                         INK_GRAPH_LANE_ALLOW_ALLOC=1. If the token stream diverges from eager, \
+                         this is the first thing to suspect."
+                    );
+                }
+                let mut plan: Vec<LaneLaunch> = Vec::new();
+                let mut staged_words = 0usize;
+                let mut moved_ptrs: Vec<(usize, String, usize)> = Vec::new();
+                let mut moved_grids: Vec<(usize, String)> = Vec::new();
+                let mut settled_ptrs = 0usize;
+                let mut nonaffine: Vec<(usize, String, usize)> = Vec::new();
+                let mut words = 0usize;
+                for i in 0..na {
+                    let pa = fp4_client.graph_launch_params(a, i);
+                    let pb = fp4_client.graph_launch_params(b, i);
+                    let pc = fp4_client.graph_launch_params(c, i);
+                    if pb.grid != pc.grid {
+                        moved_grids.push((i, pb.name.clone()));
+                    }
+                    // Addresses are judged on B -> C, not on A -> B. A moves
+                    // between the first capture and the second because the
+                    // arena is settling; a move between the second and the
+                    // third is the region genuinely not having a stable
+                    // address, and only the second is disqualifying.
+                    for w in 0..pb.ptrs.len().min(pc.ptrs.len()) {
+                        if pb.ptrs[w] != pc.ptrs[w] {
+                            moved_ptrs.push((i, pb.name.clone(), w));
+                        } else if pa.ptrs.get(w) != Some(&pb.ptrs[w]) {
+                            settled_ptrs += 1;
+                        }
+                    }
+                    if pb.info.len() != pc.info.len() || pa.info.len() != pb.info.len() {
+                        moved_grids.push((i, format!("{} (argument count moved)", pb.name)));
+                        continue;
+                    }
+                    let moving: Vec<(usize, u64)> = (0..pb.info.len())
+                        .filter(|&w| pb.info[w] != pc.info[w] || pa.info[w] != pb.info[w])
+                        .map(|w| (w, pc.info[w].wrapping_sub(pb.info[w])))
+                        .collect();
+                    // AFFINENESS, CHECKED. The lane extrapolates `v + n * d`,
+                    // which is right exactly when the two consecutive
+                    // differences agree. Anything else -- a bucketed quantity
+                    // stepping, a value that saturates, a counter that wraps --
+                    // shows up here as a second difference that is not zero,
+                    // and the lane must not arm over it.
+                    for (w, d) in moving.iter() {
+                        if pb.info[*w].wrapping_sub(pa.info[*w]) != *d {
+                            nonaffine.push((i, pb.name.clone(), *w));
+                        }
+                    }
+                    if moving.is_empty() {
+                        continue;
+                    }
+                    staged_words += moving.iter().filter(|(w, _)| *w >= pc.dyn_offset).count();
+                    words += moving.len();
+                    plan.push(LaneLaunch {
+                        idx: i,
+                        template: pc.info.clone(),
+                        moving,
+                    });
+                }
+                if !nonaffine.is_empty() {
+                    let show: Vec<String> = nonaffine
+                        .iter()
+                        .take(8)
+                        .map(|(i, k, w)| format!("launch {i} {k} word {w}"))
+                        .collect();
+                    moved_grids.push((
+                        usize::MAX,
+                        format!(
+                            "{} word(s) are NOT affine in the decode position -- the two \
+                             consecutive differences disagree: {show:?}",
+                            nonaffine.len()
+                        ),
+                    ));
+                }
+                // AN ADDRESS THAT MOVED BETWEEN THE TWO CAPTURES is not the
+                // same claim as an address that moves between two REPLAYS -- a
+                // replayed step executes no host code and allocates nothing, so
+                // the region's intermediates cannot move. What can move is what
+                // is allocated OUTSIDE the region (the input activation, which
+                // the lane pins by copying) and what the host REBINDS across
+                // steps (the short-convolution carry, which INK_GRAPH_CARRY=1
+                // lands back in place). If anything else moved, one of those
+                // two mechanisms did not do its job and the lane must not arm.
+                if !moved_ptrs.is_empty() || !moved_grids.is_empty() {
+                    let show: Vec<String> = moved_ptrs
+                        .iter()
+                        .take(8)
+                        .map(|(i, k, w)| format!("launch {i} {k} slot {w}"))
+                        .collect();
+                    lane_retired = Some(format!(
+                        "{} bound address(es) still moved between the SECOND and THIRD \
+                         calibration captures, and {} other structural item(s) moved; the lane \
+                         rewrites neither: {show:?}{}. Every intermediate the region allocates \
+                         is arena-served and should be stable once the arena has settled, so a \
+                         move at this point means the input pin or the short-convolution carry \
+                         did not hold -- or something else in the region is allocated outside \
+                         the arena. Structural items: {:?}",
+                        moved_ptrs.len(),
+                        moved_grids.len(),
+                        match moved_ptrs.len() > 8 {
+                            true => " ...",
+                            false => "",
+                        },
+                        moved_grids.iter().take(4).collect::<Vec<_>>()
+                    ));
+                } else {
+                    println!(
+                        "  GRAPHLANE: armed on graph {c} at step {step} -- {} of {na} launches \
+                         rewritten, {words} words ({staged_words} of them STAGED shapes or \
+                         strides, rewritten in the graph's own pinned buffer), 0 addresses \
+                         moving between the second and third capture, 0 cube counts, and every \
+                         moving word affine. {settled_ptrs} address(es) SETTLED between the \
+                         first capture and the second and were stable after it.",
+                        plan.len()
+                    );
+                    lane_plan = Some(LanePlan {
+                        graph: c,
+                        base_step: step,
+                        plan,
+                        staged_words,
+                    });
+                }
+            }
+            if let Some(why) = lane_retired.as_ref() {
+                println!("  GRAPHLANE: NOT armed -- {why}");
+            }
         }
 
         // The diff, once both captures exist.
@@ -9521,6 +10020,31 @@ fn main() -> Result<()> {
                 let mut ptrs_total = 0usize;
                 let mut ptrs_moved = 0usize;
                 let mut shown = 0usize;
+                // THE SPLIT THAT DECIDES WHETHER THE 483 COPIES ARE A BLOCKER.
+                //
+                // A moved word is patchable or it is staged, and which one it is
+                // depends only on where it sits in the blob. Below
+                // `dyn_offset` are the scalars and the static metadata, which
+                // ride to the kernel BY VALUE and move with
+                // `cuGraphExecKernelNodeSetParams`. At or above it are every
+                // bound tensor's SHAPE and STRIDE lists, which are uploaded by
+                // the memcpy nodes -- so a moved word there is a copy carrying
+                // different bytes, and the count of them is the honest size of
+                // the memcpy problem. `0/483 whole specs shared` is not that
+                // count: it says the SOURCE ADDRESS moved, which it does
+                // whether or not a single byte changed.
+                let mut moved_val = 0usize;
+                let mut moved_dyn = 0usize;
+                // Launches whose staged half moved, and how many of those have
+                // a staging buffer to rewrite. The second number is the one
+                // that says whether the fix is available at all.
+                let mut dyn_launches = 0usize;
+                let mut dyn_launches_staged = 0usize;
+                // The moving launches by KERNEL, because a list of indices is
+                // not an inventory anybody can act on. Counted as
+                // (scalar-moved, dynamic-moved, address-moved) per kernel name.
+                let mut by_kernel: std::collections::BTreeMap<String, (usize, usize, usize)> =
+                    Default::default();
                 for i in 0..na {
                     let pa = fp4_client.graph_launch_params(a, i);
                     let pb = fp4_client.graph_launch_params(b, i);
@@ -9549,6 +10073,26 @@ fn main() -> Result<()> {
                         .collect();
                     info_words_moved += iw.len();
                     ptrs_moved += pw.len();
+                    let (mv, md) =
+                        iw.iter()
+                            .fold((0usize, 0usize), |(v, d), &w| match w < pa.dyn_offset {
+                                true => (v + 1, d),
+                                false => (v, d + 1),
+                            });
+                    moved_val += mv;
+                    moved_dyn += md;
+                    if md > 0 {
+                        dyn_launches += 1;
+                        if pa.has_staging {
+                            dyn_launches_staged += 1;
+                        }
+                    }
+                    if mv > 0 || md > 0 || !pw.is_empty() {
+                        let e = by_kernel.entry(pa.name.clone()).or_default();
+                        e.0 += (mv > 0) as usize;
+                        e.1 += (md > 0) as usize;
+                        e.2 += (!pw.is_empty()) as usize;
+                    }
                     if pa.grid != pb.grid {
                         grid_moved += 1;
                     }
@@ -9561,8 +10105,8 @@ fn main() -> Result<()> {
                     if (!iw.is_empty() || !pw.is_empty() || pa.grid != pb.grid) && shown < 24 {
                         shown += 1;
                         println!(
-                            "    launch {i:4}: grid {:?}->{:?} info words {iw:?} ptr slots {pw:?}",
-                            pa.grid, pb.grid
+                            "    launch {i:4} {}: grid {:?}->{:?} info words {iw:?} (dyn from                              {}) ptr slots {pw:?}",
+                            pa.name, pa.grid, pb.grid, pa.dyn_offset
                         );
                     }
                 }
@@ -9575,6 +10119,15 @@ fn main() -> Result<()> {
                     "  GRAPHDIFF: {info_words_moved} of {info_words_total} packed argument words \
                      moved, {ptrs_moved} of {ptrs_total} bound addresses moved"
                 );
+                println!(
+                    "  GRAPHDIFF: of the {info_words_moved} moved words, {moved_val} ride BY \
+                     VALUE (a parameter rewrite moves them) and {moved_dyn} are STAGED shapes or \
+                     strides, across {dyn_launches} launches of which {dyn_launches_staged} own a \
+                     staging buffer to rewrite"
+                );
+                for (k, (v, d, p)) in by_kernel.iter() {
+                    println!("    moving kernel {k}: {v} scalar, {d} staged, {p} address");
+                }
 
                 // ---- what a patch COSTS ----
                 //
@@ -9684,10 +10237,38 @@ fn main() -> Result<()> {
                     // corrupting what it hands the next one looks perfect from the
                     // logits. That is the shape of the bug 6c5d780 and e3cceca
                     // chased, and it is the shape this one would take too.
+                    // ALL SIX carried buffers, not the four `debug_carry_sums`
+                    // returns.
+                    //
+                    // This check read `attn.debug_carry_sums` alone, which
+                    // covers the K pages, the V pages and the two KV short
+                    // convolutions -- and NOT `attn_sconv` or `mlp_sconv`, the
+                    // layer-level convolution histories that sit on the
+                    // residual paths and carry state across tokens exactly as
+                    // attention does (`layer.rs`). So a rewrite that moved
+                    // either of them printed `worst 0.000000` and passed. A
+                    // check that cannot see two of the six things it is
+                    // checking is worse than no check, because it launders an
+                    // unverified rewrite into a verified-looking one.
+                    //
+                    // `INK_GRAPH_HASH=1` has printed all six per layer all
+                    // along; this is the same six, summed here rather than in
+                    // two places.
+                    let sum1 = |t: &BT<Bk, 2>| -> f64 {
+                        t.clone()
+                            .abs()
+                            .sum()
+                            .into_data()
+                            .convert::<f32>()
+                            .to_vec::<f32>()
+                            .expect("device readback")[0] as f64
+                    };
                     let carry_sums = |caches: &Vec<LayerCache>| -> Vec<f64> {
                         let mut v = Vec::new();
                         for c in caches.iter() {
                             v.extend_from_slice(&c.attn.debug_carry_sums(&dev));
+                            v.push(sum1(&c.attn_sconv));
+                            v.push(c.mlp_sconv.as_ref().map(&sum1).unwrap_or(0.0));
                         }
                         v
                     };
@@ -9748,13 +10329,52 @@ fn main() -> Result<()> {
             }
         }
         let t_layers = t_ly.elapsed().as_secs_f64();
+        // WHAT THE ALLOCATOR'S RESERVE HALF COSTS THIS PASS
+        // (`CUBECL_TIME_RESERVE=1`).
+        //
+        // The arena has reported ~1869 reservation requests per decode step per
+        // node for a while, against 1783 kernel launches -- about one request
+        // per launch, all host work, all inside the term that is 75% of the
+        // step. A COUNT is not a TIME, and the two readings lead to opposite
+        // conclusions: at 0.5 us a request this is 0.9 ms of a 37.05 ms head
+        // enqueue and marginal, at 5 us it is 9.3 ms and it is the largest item
+        // after the launches themselves.
+        //
+        // FRAMING: per decode PASS, on this node, for the WHOLE pass and not
+        // only the captured region -- the bracket is the pass, so the embed and
+        // the unembed are in it. It is the RESERVE half only; returning a slice
+        // happens on handle drop and is not counted. Timing costs two clock
+        // reads per reservation, so the arm is slower than the arm it measures
+        // and the eager `t_layers` beside it is NOT comparable to an untimed
+        // run's.
+        //
+        // Read AFTER `t_layers` is taken, because the read is a `submit_blocking`
+        // -- a host launch-queue barrier -- and putting it inside the bracket
+        // would charge the region for the question.
+        if std::env::var("CUBECL_TIME_RESERVE").ok().as_deref() == Some("1") {
+            let (calls, nanos) = fp4_client.reserve_timing();
+            if calls > 0 {
+                let us = nanos as f64 / 1000.0;
+                println!(
+                    "  RESERVE: pass {step} ({}): {calls} reservations, {us:.1} us total,                      {:.3} us each -- {:.2}% of this pass's {:.2} ms layer bracket",
+                    match is_decode {
+                        true => "decode",
+                        false => "prefill",
+                    },
+                    us / calls as f64,
+                    100.0 * (us / 1e6) / t_layers,
+                    t_layers * 1e3,
+                );
+            }
+            fp4_client.reserve_timing_reset();
+        }
         // The baseline must be a CLEAN decode step: not the capture pass, whose
         // bracket holds the recording and the replays, and not the pre-warm
         // pass either, which runs the region with frees deferred and is slower
         // than an ordinary step by construction. Taking either would compare
         // the replay against a number that is not the cost of running the
         // region normally.
-        if is_decode && !capture_now && !prewarm_now {
+        if is_decode && !capture_now && !prewarm_now && !lane_replay_now {
             eager_layers_all.push(t_layers);
         }
 
@@ -12034,6 +12654,55 @@ fn main() -> Result<()> {
             "    layer loop      {:9.1}   (outer bracket; the HOST lines above are its parts)",
             ms(t_layers)
         );
+        // --- WHAT THE LANE ACTUALLY DID, per decode step ---
+        //
+        // FRAMING, in the same breath as the numbers: per REPLAYED DECODE STEP,
+        // on THIS node, layers `lo..hi`, this run, this box. `patch` and
+        // `replay` are HOST time -- the cost of asking for the region -- which
+        // is the same quantity `layer loop` reports for a step that enqueued it
+        // eagerly. Neither includes the device work; that surfaces in the stack
+        // sync. The eager comparison is against the median of the CLEAN decode
+        // steps of this same run, so nothing here is paired with a figure from
+        // another process.
+        if graph_lane {
+            match lane_steps {
+                0 => println!(
+                    "    GRAPHLANE: armed but never replayed a step{}",
+                    match lane_retired.as_ref() {
+                        Some(w) => format!(" -- {w}"),
+                        None => String::new(),
+                    }
+                ),
+                _ => {
+                    let med = |v: &mut Vec<f64>| -> f64 {
+                        v.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in a duration"));
+                        v[v.len() / 2]
+                    };
+                    let p50 = med(&mut lane_patch_us.clone());
+                    let r50 = med(&mut lane_replay_us.clone());
+                    let mut eager = eager_layers_all.clone();
+                    let e50 = match eager.is_empty() {
+                        true => f64::NAN,
+                        false => med(&mut eager) * 1e6,
+                    };
+                    println!(
+                        "    GRAPHLANE: {lane_steps} decode steps replayed -- patch {p50:.1} us                          + replay {r50:.1} us = {:.1} us host per step, against {e50:.0} us of                          eager host enqueue for the same region ({:.0}x), over {} rewritten                          launches",
+                        p50 + r50,
+                        e50 / (p50 + r50),
+                        lane_plan.as_ref().map(|p| p.plan.len()).unwrap_or(0),
+                    );
+                    if let Some(p) = lane_plan.as_ref() {
+                        println!(
+                            "    GRAPHLANE: {} of the rewritten words are STAGED shapes or                              strides -- the half a parameter rewrite cannot reach, written into                              the graph's own pinned buffer instead",
+                            p.staged_words
+                        );
+                    }
+                }
+            }
+            if let Some(w) = lane_retired.as_ref() {
+                println!("    GRAPHLANE: retired -- {w}");
+            }
+        }
         if let Some((nodes, capture_ms, per_rep)) = graph_report.as_ref() {
             // The framing, in the same breath as the numbers: ONE decode step of
             // THIS run, layers `lo..hi` on THIS node, one box. `layer loop` above

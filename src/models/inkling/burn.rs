@@ -828,6 +828,57 @@ impl<B: Backend> AttnCache<B> {
         self.base
     }
 
+    /// Can a REPLAYED graph have done this step's whole device write?
+    ///
+    /// A captured region records the append's destination row and the window's
+    /// dropped prefix as baked-in values, so a replay reproduces exactly the
+    /// step it was captured for, shifted only by whatever the caller patches.
+    /// What it cannot reproduce is a step that changes the page STRUCTURE --
+    /// pushing a new page, releasing an old one, cutting page 0, merging the
+    /// settled ones. Each of those moves a buffer a graph node points at, and
+    /// none of them is a parameter.
+    ///
+    /// So the lane asks this first and runs the step eagerly when the answer
+    /// is no. Asked before the step and pure, because a lane that discovers
+    /// mid-write that it chose wrong has already written.
+    pub fn step_is_replayable(&self, n: usize, window: Option<usize>) -> bool {
+        if !self.k.append_is_in_place(n) || !self.v.append_is_in_place(n) {
+            return false;
+        }
+        let drop = match window {
+            Some(w) if self.k.len() + n > w => self.k.len() + n - w,
+            _ => 0,
+        };
+        // Asked of the PRE-append store, which is conservative in the only
+        // direction that matters: on a single-page store `rows_at(0)` is
+        // `fill`, so the post-append answer can only be more permissive.
+        self.k.drop_is_bookkeeping_only(drop) && self.v.drop_is_bookkeeping_only(drop)
+    }
+
+    /// Advance the bookkeeping for a step a replay already performed.
+    ///
+    /// This is [`attention_step`]'s host half with the device half removed --
+    /// the append's row counters and the window's advance -- and it exists
+    /// because a replayed step runs no host code inside the region at all. The
+    /// short-convolution histories are deliberately NOT touched: with
+    /// `INK_GRAPH_CARRY=1` the new history lands back in the buffer it was read
+    /// from, so the host rebinding the eager path does is already a no-op, and
+    /// with the carry off a replayed region would be reading step k's history
+    /// forever and no bookkeeping could fix that.
+    pub fn note_replayed_step(&mut self, n: usize, window: Option<usize>) {
+        self.k.note_appended(n);
+        self.v.note_appended(n);
+        if let Some(w) = window {
+            let len = self.k.len();
+            if len > w {
+                let drop = len - w;
+                self.k.note_dropped(drop);
+                self.v.note_dropped(drop);
+                self.base += drop;
+            }
+        }
+    }
+
     /// Whether this cache is holding its keys and values as NVFP4.
     ///
     /// The arm is chosen inside [`super::kvpages::KvStore::new`] from a switch

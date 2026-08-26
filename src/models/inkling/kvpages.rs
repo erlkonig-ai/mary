@@ -197,6 +197,77 @@ impl<R: PageRows> Pages<R> {
         self.len
     }
 
+    /// WOULD an append of `n` rows change the page STRUCTURE?
+    ///
+    /// A replayed CUDA graph re-executes the append the capture recorded, into
+    /// the address the capture recorded, at the row the capture baked in. That
+    /// is the whole write on 127 of every 128 steps -- and on the 128th the
+    /// eager path pushes a NEW page, which allocates a buffer no graph node
+    /// points at and shifts every later row. A replay cannot do that, so the
+    /// step that would do it has to run eagerly.
+    ///
+    /// Asked BEFORE the step, and pure, so the caller can choose the lane
+    /// rather than discover mid-write that it chose wrong.
+    pub fn append_is_in_place(&self, n: usize) -> bool {
+        match self.pages.last().map(|p| p.rows()) {
+            Some(cap) => self.fill + n <= cap && self.pages.len() <= MAX_PAGES,
+            None => false,
+        }
+    }
+
+    /// The same question for the sliding window's advance.
+    ///
+    /// `drop_front` releases whole pages and cuts page 0 once `head` reaches
+    /// [`PAGE`]; both move a POINTER a graph node holds. Neither happens while
+    /// the head stays inside page 0 and below [`PAGE`], which is the ordinary
+    /// step.
+    pub fn drop_is_bookkeeping_only(&self, n: usize) -> bool {
+        if n == 0 {
+            return true;
+        }
+        if n > self.len || self.len == n {
+            return false;
+        }
+        let head = self.head + n;
+        head < PAGE && !self.pages.is_empty() && head < self.rows_at(0)
+    }
+
+    /// Record an append whose device write a REPLAY already performed.
+    ///
+    /// The bytes are in the page; only the bookkeeping is behind. This is the
+    /// half of [`Pages::append`] that is not a device write, and it exists
+    /// because a replayed step runs no host code at all inside the region --
+    /// so without it `fill`, `len` and every scalar derived from them stop
+    /// advancing and the NEXT eager step writes over the row this one wrote.
+    ///
+    /// Panics rather than silently doing something else if the append would
+    /// not have been in place: the caller is supposed to have asked
+    /// [`Pages::append_is_in_place`] first, and a wrong answer here is a wrong
+    /// answer one step later with nothing to see.
+    pub fn note_appended(&mut self, n: usize) {
+        assert!(
+            self.append_is_in_place(n),
+            "note_appended({n}) on a store whose eager append would have changed its page \
+             structure (fill {}, pages {}) -- a replay cannot have done that",
+            self.fill,
+            self.pages.len()
+        );
+        self.fill += n;
+        self.len += n;
+    }
+
+    /// Record the window advance that goes with it.
+    pub fn note_dropped(&mut self, n: usize) {
+        assert!(
+            self.drop_is_bookkeeping_only(n),
+            "note_dropped({n}) would have released or cut a page (head {}, len {})",
+            self.head,
+            self.len
+        );
+        self.head += n;
+        self.len -= n;
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -637,6 +708,26 @@ impl<B: Backend> PageStore<B> {
         self.pages.head()
     }
 
+    /// See [`Pages::append_is_in_place`].
+    pub fn append_is_in_place(&self, n: usize) -> bool {
+        self.pages.append_is_in_place(n)
+    }
+
+    /// See [`Pages::drop_is_bookkeeping_only`].
+    pub fn drop_is_bookkeeping_only(&self, n: usize) -> bool {
+        self.pages.drop_is_bookkeeping_only(n)
+    }
+
+    /// See [`Pages::note_appended`].
+    pub fn note_appended(&mut self, n: usize) {
+        self.pages.note_appended(n)
+    }
+
+    /// See [`Pages::note_dropped`].
+    pub fn note_dropped(&mut self, n: usize) {
+        self.pages.note_dropped(n)
+    }
+
     /// The pages whole and in order, covering `head() + len()` rows.
     ///
     /// The read that does not concatenate; see [`Pages::parts`].
@@ -1065,6 +1156,26 @@ impl Fp4PageStore {
         self.pages.head()
     }
 
+    /// See [`Pages::append_is_in_place`].
+    pub fn append_is_in_place(&self, n: usize) -> bool {
+        self.pages.append_is_in_place(n)
+    }
+
+    /// See [`Pages::drop_is_bookkeeping_only`].
+    pub fn drop_is_bookkeeping_only(&self, n: usize) -> bool {
+        self.pages.drop_is_bookkeeping_only(n)
+    }
+
+    /// See [`Pages::note_appended`].
+    pub fn note_appended(&mut self, n: usize) {
+        self.pages.note_appended(n)
+    }
+
+    /// See [`Pages::note_dropped`].
+    pub fn note_dropped(&mut self, n: usize) {
+        self.pages.note_dropped(n)
+    }
+
     /// The pages whole and in order, each dequantized on its own.
     ///
     /// One dequant launch per page instead of one over the whole context, and
@@ -1164,6 +1275,38 @@ impl<B: Backend> KvStore<B> {
         match self {
             Self::Wide(s) => s.drop_front(n),
             Self::Fp4(s) => s.drop_front(n),
+        }
+    }
+
+    /// See [`Pages::append_is_in_place`].
+    pub fn append_is_in_place(&self, n: usize) -> bool {
+        match self {
+            Self::Wide(s) => s.append_is_in_place(n),
+            Self::Fp4(s) => s.append_is_in_place(n),
+        }
+    }
+
+    /// See [`Pages::drop_is_bookkeeping_only`].
+    pub fn drop_is_bookkeeping_only(&self, n: usize) -> bool {
+        match self {
+            Self::Wide(s) => s.drop_is_bookkeeping_only(n),
+            Self::Fp4(s) => s.drop_is_bookkeeping_only(n),
+        }
+    }
+
+    /// See [`Pages::note_appended`].
+    pub fn note_appended(&mut self, n: usize) {
+        match self {
+            Self::Wide(s) => s.note_appended(n),
+            Self::Fp4(s) => s.note_appended(n),
+        }
+    }
+
+    /// See [`Pages::note_dropped`].
+    pub fn note_dropped(&mut self, n: usize) {
+        match self {
+            Self::Wide(s) => s.note_dropped(n),
+            Self::Fp4(s) => s.note_dropped(n),
         }
     }
 
