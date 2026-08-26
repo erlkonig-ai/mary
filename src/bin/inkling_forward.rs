@@ -1927,6 +1927,15 @@ struct HostT {
     /// Layers that fell back to the per-expert loop, because their weights are
     /// not offsets into one registered mapping.
     per_expert: usize,
+    /// Summed over MoE layers: the number of DISTINCT experts this pass had to
+    /// gather. One token needs `top_k` routed plus the shared ones. A WIDER pass
+    /// needs the UNION of its tokens' expert sets, and that union is why
+    /// speculation costs real bytes here rather than being nearly free as it is
+    /// on a dense model, where verifying k+1 tokens re-reads exactly the same
+    /// weights. Divided by the layer count it reads as "distinct experts per MoE
+    /// layer", which is the quantity that decides whether a wider verify pass
+    /// pays for itself.
+    expert_slots: usize,
     /// The grouped lane's small plan uploads that DEPEND on the routing
     /// decision: the two offset tables, the two second-level scale vectors and
     /// the per-row weights. A device-resident router deletes exactly these --
@@ -3469,6 +3478,7 @@ fn routed_experts_fp4(
                     report_ab(prefix, &acc, &reference, h);
                 }
                 host.grouped += 1;
+                host.expert_slots += by_expert.len();
                 return Ok(acc);
             }
         }
@@ -3486,6 +3496,7 @@ fn routed_experts_fp4(
         );
     }
     host.per_expert += 1;
+    host.expert_slots += by_expert.len();
     per_expert_fp4(
         src, aliases, client, dev, prefix, by_expert, hn, n, h, inter, host,
     )
@@ -4830,11 +4841,13 @@ fn routed_experts_bf16(
                     report_ab(prefix, &acc, &reference, h);
                 }
                 host.grouped += 1;
+                host.expert_slots += by_expert.len();
                 return Ok(acc);
             }
         }
     }
     host.per_expert += 1;
+    host.expert_slots += by_expert.len();
     per_expert_bf16(
         src, aliases, client, dev, prefix, by_expert, hn, n, h, inter, host,
     )
@@ -9983,6 +9996,19 @@ fn main() -> Result<()> {
                 "      lanes: {} layer(s) GROUPED (one launch per stage), {} per-expert",
                 host_t.grouped, host_t.per_expert
             );
+            // The union, which is the number speculation lives or dies by. A
+            // batch-1 step gathers `top_k + shared`; anything wider gathers the
+            // UNION over its rows, and MoE is the large majority of the bytes a
+            // step reads, so this ratio lands almost undiluted on the step time.
+            let moe_layers = host_t.grouped + host_t.per_expert;
+            if moe_layers > 0 {
+                println!(
+                    "      experts gathered: {} distinct over {} MoE layer(s) = {:.2} per layer",
+                    host_t.expert_slots,
+                    moe_layers,
+                    host_t.expert_slots as f64 / moe_layers as f64
+                );
+            }
             let named = host_t.slice + host_t.gather + host_t.enqueue + host_t.drain + host_t.accum;
             println!(
                 "      remainder       {:9.1}   (whatever the four above did not cover)",
