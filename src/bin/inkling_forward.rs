@@ -7480,6 +7480,44 @@ fn main() -> Result<()> {
     //    must be zero: the lane replays exactly once per step, which is exactly
     //    once per token of history.
     //  * No `INK_GRAPH_DIFF` / `INK_GRAPH_XSTEP`. Those arms own the captures.
+    // MEASURED, 2026-08-27, and this is what the lane is worth rather than what
+    // it was projected to be worth.
+    //
+    // FRAMING: per decode step, ONE node, `INK_LAYERS=0:21`, `INK_KV=1`,
+    // `INK_POOL_CLEANUP=0`, ctx 3732 -> 3812, `INK_GEN=80`, one GB10
+    // (zgx-16ec), one run per arm, p50 over the last 60 of 80 steps.
+    //
+    //   whole pass          eager 44.4 ms   lane 41.8 ms    -5.9%
+    //   layer-loop bracket  eager 35.4 ms   lane  0.30 ms   118x
+    //
+    // Bands do not overlap on either row (eager min 43.7 > lane max 43.5), but
+    // it is ONE process per arm, so the 1.2-1.4% between-process term applies
+    // and 5.9% is about four times it.
+    //
+    // THE TWO ROWS TOGETHER ARE THE RESULT, and they say something the step
+    // alone does not. The lane removes 35.1 ms of host-thread time from the
+    // region and the step moves by 2.6 ms. So ~92% of that bracket was
+    // overlapping real device work -- it was BLOCKED DEVICE WAIT, not enqueue
+    // on the critical path. That is an independent confirmation, from a
+    // completely different instrument, of the anchored nsys finding that the
+    // bracket is roughly 61% blocked wait and that device busy is 81% of the
+    // step. It is also why the lane returns 1.06x here and not the 1.235x that
+    // was projected from "host enqueue is 75% of the step" -- a premise
+    // withdrawn the same night.
+    //
+    // The gate it had to pass: 81 token lines, top-5 ids and logits to the
+    // printed digit, IDENTICAL to a separate eager run of the same binary and
+    // prompt, and the top-5 output files byte-identical, over 74 consecutively
+    // replayed decode steps.
+    //
+    // What the calibration measured, at two captures one step apart with
+    // `INK_GRAPH_CARRY=1`: 126 of 1867 launches rewritten, 165 of 14672 packed
+    // argument words moved, ALL 165 of them by-value scalars and ZERO staged
+    // shapes or strides, 0 bound addresses moved, 0 cube counts moved. So the
+    // 483 host->device memcpy nodes carry byte-identical payloads between
+    // consecutive steps: they were never a per-step blocker, and the staged
+    // patch channel built for them has never fired. It stays as the thing that
+    // makes a KV page boundary fail loudly instead of quietly.
     let graph_lane = std::env::var("INK_GRAPH_LANE").ok().as_deref() == Some("1");
     anyhow::ensure!(
         !(graph_lane && !mary::models::inkling::sconv::carry_in_place()),
