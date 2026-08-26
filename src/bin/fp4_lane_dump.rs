@@ -106,7 +106,7 @@ fn main() {
     let mut w4a16_s = f64::MAX;
     for i in 0..6 {
         let t0 = Instant::now();
-        let out = w4a16_linear_launch::<Rt>(&client, &a, &b, &b_sc, m_pad, k, n, 1.0);
+        let out = w4a16_linear_launch::<Rt>(&client, &a, &b, &b_sc, m_pad, k, n, 1.0, None);
         let _ = future::block_on(client.sync());
         let dt = t0.elapsed().as_secs_f64();
         drop(out);
@@ -340,7 +340,7 @@ fn main() {
         let ha = client.create_from_slice(&ab);
         let hb = client.create_from_slice(&wb);
         let hs = client.create_from_slice(&sb);
-        let o1 = w4a16_linear_launch::<Rt>(&client, &ha, &hb, &hs, cm, ck, cn, 0.75);
+        let o1 = w4a16_linear_launch::<Rt>(&client, &ha, &hb, &hs, cm, ck, cn, 0.75, None);
         let o2 = w4a16_linear_wide_launch::<Rt>(&client, &ha, &hb, &hs, cm, ck, cn, 0.75);
         let r1 = client.read_one(o1).unwrap();
         let r2 = client.read_one(o2).unwrap();

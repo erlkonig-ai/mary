@@ -1351,7 +1351,7 @@ pub fn verify_report() -> Option<String> {
 mod tests {
     use super::*;
     use crate::models::inkling::fp4quant::quantize_nvfp4_bf16;
-    use crate::models::inkling::w4a16gemm::w4a16_linear_launch;
+    use crate::models::inkling::w4a16gemm::{live_row_mask, w4a16_linear_launch};
     use half::bf16;
 
     type Rt = cubecl::cuda::CudaRuntime;
@@ -1457,7 +1457,17 @@ mod tests {
                 let ah = client.create_from_slice(bf16::as_bytes(&pad));
                 let qh = client.create_from_slice(bf16::as_bytes(&qb));
 
-                let ex = w4a16_linear_launch::<Rt>(&client, &ah, &codes, &scales, 16, k, n, 1.0);
+                let ex = w4a16_linear_launch::<Rt>(
+                    &client,
+                    &ah,
+                    &codes,
+                    &scales,
+                    16,
+                    k,
+                    n,
+                    1.0,
+                    live_row_mask().then_some(1),
+                );
                 let exr = client.read_one_unchecked(ex);
                 let exact: &[f32] = f32::from_bytes(&exr);
 

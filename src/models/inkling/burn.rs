@@ -289,12 +289,21 @@ pub fn linear_w4a16(x: Tensor<Bk, 2>, w: &PackedW) -> Tensor<Bk, 2> {
     // not on a setting: `w.swizzled` is set where the permutation ran, and a
     // weight that was never permuted takes the row-major lane here however the
     // knob is set.
+    // `m` and not `m_pad`: rows `m..m_pad` are the MMA's M padding, written as
+    // zero above and sliced away below, and `w4a16gemm::live_row_mask` is the
+    // switch that lets the kernel skip loading them.
+    // `Some(m)` and not `m_pad`: rows `m..m_pad` are the MMA's own M padding,
+    // written as zero above and sliced away below, and the mask is the kernel
+    // declining to load them. `None` when the knob is off, which is the default.
+    let live = crate::models::inkling::w4a16gemm::live_row_mask().then_some(m);
     let out = if w.swizzled {
         crate::models::inkling::w4a16gemm::w4a16_linear_swz_launch(
-            &client, &a, &w.codes, &w.scales, m_pad, k, w.n, true, w.scale2,
+            &client, &a, &w.codes, &w.scales, m_pad, k, w.n, true, w.scale2, live,
         )
     } else {
-        w4a16_linear_launch(&client, &a, &w.codes, &w.scales, m_pad, k, w.n, w.scale2)
+        w4a16_linear_launch(
+            &client, &a, &w.codes, &w.scales, m_pad, k, w.n, w.scale2, live,
+        )
     };
     tensor_of(client, dev, out, m_pad, w.n).slice([0..m, 0..w.n])
 }

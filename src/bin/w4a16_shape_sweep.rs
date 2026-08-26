@@ -443,7 +443,9 @@ fn main() {
             let t1 = Instant::now();
             let outs: Vec<Handle> = parts
                 .iter()
-                .map(|(b, sc, _)| w4a16_linear_launch::<Rt>(&client, &a, b, sc, 16, k, per_n, 1.0))
+                .map(|(b, sc, _)| {
+                    w4a16_linear_launch::<Rt>(&client, &a, b, sc, 16, k, per_n, 1.0, None)
+                })
                 .collect();
             let _ = future::block_on(client.sync());
             let dl = t1.elapsed().as_secs_f64();

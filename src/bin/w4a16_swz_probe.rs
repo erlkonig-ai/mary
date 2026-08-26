@@ -45,6 +45,21 @@
 //! `INK_SWZ_N` / `INK_SWZ_K` set the shape (default the unembedding's
 //! `[201024, 4096]`), `INK_SWZ_M` the padded row count (default 16, one m-tile,
 //! which is decode), `INK_SWZ_REPS` the rep count (default 8).
+//!
+//! `INK_SWZ_MLIVE` sets how many of those `INK_SWZ_M` rows are LIVE, and with
+//! it the three GEMM arms take `w4a16gemm::live_row_mask` -- the A operand
+//! declining to load a fragment row that is M padding. Unset is "all live",
+//! which is what this probe has always measured. `INK_SWZ_MLIVE=1` against
+//! `INK_SWZ_M=16` is the real decode shape: one token, fifteen rows of padding.
+//! The mask is a REQUEST-count change on A and not a bandwidth one -- A is
+//! L2-resident at this `m_pad`, and the same "the bytes were never the problem"
+//! that `mma16_lane_dump` established for B applies -- so read it in the ncu
+//! sector counts first and in this probe's ms second.
+//!
+//! The last section is a GATE, not an observation: masked and unmasked must
+//! agree to the last bit, at four `(m_pad, live)` pairs including a multi-tile
+//! shape whose LAST tile is partly padding, and the probe exits 2 if they do
+//! not.
 
 use std::time::Instant;
 
@@ -104,6 +119,16 @@ fn main() {
     let n = env("INK_SWZ_N", 201024);
     let k = env("INK_SWZ_K", 4096);
     let m_pad = env("INK_SWZ_M", 16);
+    // How many of `m_pad`'s rows are LIVE, for the timing arms. Unset means
+    // `None` -- load every row, which is what this probe has always done and
+    // what the shipped default still does. `INK_SWZ_MLIVE=1` is decode: one real
+    // row against a 16-row tile, and the arm the A-side mask exists for.
+    let mlive: Option<usize> = std::env::var("INK_SWZ_MLIVE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    if let Some(v) = mlive {
+        assert!(v <= m_pad, "INK_SWZ_MLIVE {v} exceeds INK_SWZ_M {m_pad}");
+    }
     let reps = env("INK_SWZ_REPS", 8);
     let codes = n * k / 2;
     let scales = n * (k / 16);
@@ -180,21 +205,22 @@ fn main() {
             let t0 = Instant::now();
             match arm {
                 0 => {
-                    let o =
-                        w4a16_linear_launch::<Rt>(&client, &a, &b_row, &bs_row, m_pad, k, n, 1.0);
+                    let o = w4a16_linear_launch::<Rt>(
+                        &client, &a, &b_row, &bs_row, m_pad, k, n, 1.0, mlive,
+                    );
                     let _ = future::block_on(client.sync());
                     drop(o);
                 }
                 1 => {
                     let o = w4a16_linear_swz_launch::<Rt>(
-                        &client, &a, &b_swz, &bs_swz, m_pad, k, n, true, 1.0,
+                        &client, &a, &b_swz, &bs_swz, m_pad, k, n, true, 1.0, mlive,
                     );
                     let _ = future::block_on(client.sync());
                     drop(o);
                 }
                 2 => {
                     let o = w4a16_linear_swz_launch::<Rt>(
-                        &client, &a, &b_swz, &bs_row, m_pad, k, n, false, 1.0,
+                        &client, &a, &b_swz, &bs_row, m_pad, k, n, false, 1.0, mlive,
                     );
                     let _ = future::block_on(client.sync());
                     drop(o);
@@ -248,10 +274,15 @@ fn main() {
         );
     }
     println!(
-        "\n  framing: per LAUNCH of one [{m_pad}, {k}] x [{n}, {k}]^T product, {} warm reps of {reps} \
+        "\n  framing: per LAUNCH of one [{m_pad}, {k}] x [{n}, {k}]^T product with {} of those \
+         rows live, {} warm reps of {reps} \
          (first 2 discarded), arms interleaved, one GB10 box, one process, same buffers.\n  \
          GB/s counts the weight planes only ({:.3} GiB), which is the traffic the permutation is \
          about; it is not a step figure and not a two-node figure.",
+        match mlive {
+            Some(v) => format!("{v} (A-side live-row mask ON)"),
+            None => format!("{m_pad} (mask off)"),
+        },
         reps - 2,
         bytes as f64 / (1u64 << 30) as f64,
     );
@@ -305,5 +336,128 @@ fn main() {
             dev(&v1, &v2),
             dev(&v1, &v3),
         );
+    }
+
+    // The A-side LIVE-ROW MASK, as a GATE and not an observation.
+    //
+    // The mask makes the kernel decline to LOAD an A fragment row that is M
+    // padding and feed the MMA a register zero instead. Two independent reasons
+    // it cannot move a kept output bit -- the padding rows are zero, and
+    // `D[r][c]` reads A row `r` and no other -- so the only admissible deviation
+    // is 0.000e0 exactly, over EVERY output including the padding rows the
+    // caller slices away. Anything else is a wrong predicate, and this refuses
+    // rather than printing it.
+    //
+    // Two shapes, because the failure modes are different. `[16, ...]` is DECODE
+    // (one m-tile, `m_base` always 0). `[48, ...]` at 37 live rows is the LAST
+    // TILE case: tiles 0 and 1 are entirely live and tile 2 has five live rows
+    // and eleven padding, so a predicate that forgot `m_base` passes the first
+    // shape and fails this one.
+    {
+        let (ck, cn) = (256usize, 64usize);
+        let cc = cn * ck / 2;
+        let cs = cn * (ck / 16);
+        let wb: Vec<u8> = (0..cc).map(|i| (i.wrapping_mul(97) % 253) as u8).collect();
+        let sb: Vec<u8> = (0..cs).map(|i| [0x38u8, 0x40, 0x30][i % 3]).collect();
+        let mut pc = vec![0u8; cc];
+        let mut ps = vec![0u8; cs];
+        swizzle_w4a16_codes_into(&wb, &mut pc, cn, ck);
+        swizzle_w4a16_scales_into(&sb, &mut ps, cn, ck);
+        let hb = client.create_from_slice(&wb);
+        let hs = client.create_from_slice(&sb);
+        let hbp = client.create_from_slice(&pc);
+        let hsp = client.create_from_slice(&ps);
+
+        let read = |h| -> Vec<f32> {
+            client
+                .read_one(h)
+                .unwrap()
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        let bits = |x: &[f32], y: &[f32]| -> (f32, usize) {
+            let mut worst = 0.0f32;
+            let mut n = 0usize;
+            for (p, q) in x.iter().zip(y) {
+                if p.to_bits() != q.to_bits() {
+                    n += 1;
+                }
+                worst = worst.max((p - q).abs());
+            }
+            (worst, n)
+        };
+
+        let mut bad = 0usize;
+        println!("\n  A-side live-row mask, bit-identity (GATE):");
+        for (cm, live) in [(16usize, 1usize), (16, 8), (16, 9), (48, 37)] {
+            // The activation as the runtime hands it over: `live` real rows,
+            // then ZERO to the tile boundary. That zeroing is `pad_bf16`'s and
+            // is the thing the mask is allowed to assume.
+            let ab: Vec<u8> = (0..cm * ck)
+                .flat_map(|i| {
+                    let v = if i / ck < live {
+                        half::bf16::from_f32((i % 13) as f32 * 0.25 - 1.5)
+                    } else {
+                        half::bf16::ZERO
+                    };
+                    v.to_le_bytes()
+                })
+                .collect();
+            let ha = client.create_from_slice(&ab);
+
+            let row_off = read(w4a16_linear_launch::<Rt>(
+                &client, &ha, &hb, &hs, cm, ck, cn, 0.75, None,
+            ));
+            let row_on = read(w4a16_linear_launch::<Rt>(
+                &client,
+                &ha,
+                &hb,
+                &hs,
+                cm,
+                ck,
+                cn,
+                0.75,
+                Some(live),
+            ));
+            let swz_off = read(w4a16_linear_swz_launch::<Rt>(
+                &client, &ha, &hbp, &hsp, cm, ck, cn, true, 0.75, None,
+            ));
+            let swz_on = read(w4a16_linear_swz_launch::<Rt>(
+                &client,
+                &ha,
+                &hbp,
+                &hsp,
+                cm,
+                ck,
+                cn,
+                true,
+                0.75,
+                Some(live),
+            ));
+            let (dr, nr) = bits(&row_off, &row_on);
+            let (ds, ns) = bits(&swz_off, &swz_on);
+            bad += nr + ns;
+            println!(
+                "\x20   [{cm}, {ck}] x [{cn}, {ck}]^T, {live} live of {cm}, {} outputs: \
+                 row-major {:.3e} ({nr} bits differ)   swizzled {:.3e} ({ns} bits differ)",
+                row_off.len(),
+                dr,
+                ds,
+            );
+        }
+        println!(
+            "\x20   framing: masked vs unmasked, SAME binary and SAME kernel source, the two arms \
+             differing only in the comptime `mask_rows`; every output compared, padding rows \
+             included; deviation is max |on - off| and the count is exact f32 bit inequality."
+        );
+        if bad != 0 {
+            eprintln!(
+                "REFUSED: the live-row mask is not bit-identical ({bad} outputs differ). \
+                 That is a wrong predicate, not a rounding difference."
+            );
+            std::process::exit(2);
+        }
+        println!("\x20   0 outputs differ anywhere: the mask is bit-identical.");
     }
 }
