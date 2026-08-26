@@ -8844,6 +8844,46 @@ fn main() -> Result<()> {
                      identical between the two steps: {same_copies}",
                     ma.len()
                 );
+                // WHICH FIELD moves decides whether these are a hard blocker.
+                // A copy whose destination and size are the same and whose
+                // SOURCE address differs is carrying the same bytes from a
+                // different scratch buffer -- annoying, and fixable by staging.
+                // A copy whose destination or size moves is carrying per-step
+                // data, and no amount of pinning reaches it.
+                //
+                // Compared as SETS, because the node order `cuGraphGetNodes`
+                // returns is undefined and both lists are sorted.
+                let sa: std::collections::BTreeSet<_> = ma.iter().copied().collect();
+                let sb: std::collections::BTreeSet<_> = mb.iter().copied().collect();
+                let da: std::collections::BTreeSet<u64> =
+                    ma.iter().map(|(_, d, _, _)| *d).collect();
+                let db: std::collections::BTreeSet<u64> =
+                    mb.iter().map(|(_, d, _, _)| *d).collect();
+                let za: std::collections::BTreeMap<u64, usize> =
+                    ma.iter().fold(Default::default(), |mut m, (_, _, z, _)| {
+                        *m.entry(*z).or_default() += 1;
+                        m
+                    });
+                let zb: std::collections::BTreeMap<u64, usize> =
+                    mb.iter().fold(Default::default(), |mut m, (_, _, z, _)| {
+                        *m.entry(*z).or_default() += 1;
+                        m
+                    });
+                println!(
+                    "  GRAPHCOPY: whole specs shared {}/{}; destinations shared {}/{}; \
+                     size histogram identical: {}",
+                    sa.intersection(&sb).count(),
+                    sa.len(),
+                    da.intersection(&db).count(),
+                    da.len(),
+                    za == zb
+                );
+                let bytes_a: u64 = ma.iter().map(|(_, _, z, _)| z).sum();
+                println!(
+                    "  GRAPHCOPY: {bytes_a} bytes copied per step across {} nodes; sizes {:?}",
+                    ma.len(),
+                    za.iter().take(8).collect::<Vec<_>>()
+                );
                 println!(
                     "  GRAPHCOPY: {into_b_owned} of the rewritten addresses point into the \
                      OTHER graph's owned memory"
