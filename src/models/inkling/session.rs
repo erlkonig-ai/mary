@@ -43,6 +43,24 @@
 //! operation a serving process actually needs between conversations — it costs
 //! a deallocation, not a reload.
 //!
+//! # And the third lever: going BACK
+//!
+//! `reset` is all-or-nothing, and for a while it was the only way to un-attend
+//! to anything. That is fine for a conversation, which only ever grows, and
+//! wrong for a prompt whose SETTLED PREFIX can change underneath it — a memory
+//! cover, say, which re-refines its recent edge every time a memory is written
+//! and can move the first differing byte thousands of characters back.
+//!
+//! [`Session::checkpoint`] keeps a position and [`Session::rewind`] returns to
+//! it, so a caller that checkpoints per chunk pays, on a change, only for the
+//! chunks at or after the first one that differs. Everything before it keeps its
+//! KV and is never read again. What makes that more than a `pos` assignment is
+//! the sliding window: thirty-five of the forty-two layers have already dropped
+//! the keys a rewound position needs, so a checkpoint holds those layers'
+//! stores — bounded by the window, and therefore the same size at position
+//! 500,000 as at position 1,000. See [`Checkpoint`] and
+//! [`super::burn::AttnRewind`].
+//!
 //! # What a Session deliberately is NOT
 //!
 //! It is not the serving process, and it is not `inkling_forward`.
@@ -97,6 +115,15 @@ use super::config::{AttnKind, InklingConfig};
 use super::pile::Elem;
 use super::source::Weights;
 use super::stack::embed_and_norm_bf16;
+
+/// The next sequence id. Process-wide and monotone, so no two sequences —
+/// across sessions or across one session's resets — ever share one, and a
+/// [`Checkpoint`] can therefore be refused by the session it does not belong to
+/// rather than silently accepted because both counters happened to read 0.
+fn next_seq() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 /// How to open a model. Everything here has a default that matches what
 /// `inkling_forward` does when nothing is set.
@@ -215,6 +242,63 @@ pub struct Session {
     pos: usize,
     /// The token the last pass produced, which is what [`Session::step`] feeds.
     last: Option<usize>,
+    /// Which SEQUENCE this is. Minted per `load` and re-minted by
+    /// [`Session::reset`], so a [`Checkpoint`] cannot be handed to a session
+    /// that has since started a different conversation — or to a different
+    /// session entirely, which holds different device buffers and for which the
+    /// checkpoint's positions mean nothing.
+    seq: u64,
+}
+
+/// A position a [`Session`] can be put back to, and the state it needs to stand
+/// there.
+///
+/// # Why this is a TOKEN and not a number
+///
+/// The obvious API is `truncate_to(pos)`. It is the wrong one, because on
+/// thirty-five of this model's forty-two layers most positions cannot be
+/// truncated to at all: a sliding-window layer has released the keys before its
+/// window, and a cache cut back to a position it has already run past attends
+/// over fewer keys than the sequence has, silently and forever. See
+/// [`super::burn::AttnRewind`] for the mechanism.
+///
+/// So the position a caller may rewind to is exactly a position at which
+/// somebody kept the windowed layers' stores — and a value that IS the kept
+/// state cannot name a position where none was kept. `truncate_to(9_203)` is a
+/// number anyone can produce; a `Checkpoint` is not.
+///
+/// # What it costs
+///
+/// One clone of thirty-five bounded stores plus four small tensors a layer.
+/// Bounded is the load-bearing word: a windowed layer's store never exceeds its
+/// window, so a checkpoint at position 500,000 is the same size as one at
+/// position 1,000. The global layers keep nothing at all — a truncation puts
+/// them back exactly.
+pub struct Checkpoint {
+    /// The position the session stood at.
+    pos: usize,
+    /// The token the pass that reached `pos` produced.
+    last: Option<usize>,
+    /// The sequence this was taken from. See [`Session::seq`].
+    seq: u64,
+    /// One per cache SLOT, in the session's layer order.
+    layers: Vec<LayerRewind>,
+}
+
+/// One layer's half of a [`Checkpoint`].
+struct LayerRewind {
+    attn: dev_lane::AttnRewind<Bk>,
+    attn_sconv: BT<Bk, 2>,
+    mlp_sconv: Option<BT<Bk, 2>>,
+}
+
+impl Checkpoint {
+    /// The position this checkpoint stands at — what [`Session::position`]
+    /// returned when it was taken, and what it will return again after a
+    /// [`Session::rewind`] to it.
+    pub fn position(&self) -> usize {
+        self.pos
+    }
 }
 
 impl Session {
@@ -441,6 +525,7 @@ impl Session {
             caches: Vec::new(),
             pos: 0,
             last: None,
+            seq: next_seq(),
         })
     }
 
@@ -475,6 +560,131 @@ impl Session {
         self.caches.clear();
         self.pos = 0;
         self.last = None;
+        // A new sequence, so every [`Checkpoint`] taken from the old one stops
+        // being a rewind target. Their device buffers are still alive (a
+        // checkpoint holds handles), so without this a rewind after a reset
+        // would succeed and put the session back into the PREVIOUS
+        // conversation's cache while the caller believed it had started a fresh
+        // one.
+        self.seq = next_seq();
+    }
+
+    /// Keep where this session stands, so it can be put back here later.
+    ///
+    /// # The operation this is for
+    ///
+    /// A caller whose prompt is a chain of settled chunks — a memory cover
+    /// decomposed into recall pairs, say — takes one of these after each chunk.
+    /// When the chain changes it finds the first chunk that differs, rewinds to
+    /// the checkpoint before it, and extends with the new tail: every chunk
+    /// before the change keeps its KV and is never read again.
+    ///
+    /// That is a rewind and not a re-prefill, and the difference is the whole
+    /// point. It is also why the granularity is the caller's: a checkpoint per
+    /// chunk makes the chunk the unit at which the cache can be recovered.
+    ///
+    /// Refuses on a session with no sequence in flight — position 0 is what
+    /// [`Session::reset`] gets you, and it costs nothing to keep.
+    pub fn checkpoint(&self) -> Result<Checkpoint> {
+        anyhow::ensure!(
+            !self.caches.is_empty(),
+            "this Session holds no sequence, so there is nothing to come back to. `reset` is \
+             the way back to position 0."
+        );
+        anyhow::ensure!(
+            self.caches.len() == self.hi - self.lo,
+            "{} caches for {} layers",
+            self.caches.len(),
+            self.hi - self.lo
+        );
+        let t = &self.cfg.text_config;
+        let mut layers = Vec::with_capacity(self.caches.len());
+        for layer in self.lo..self.hi {
+            let slot = layer - self.lo;
+            // The SAME window `forward` hands the layer, derived the same way:
+            // a rewind point that disagreed with the layer about whether it
+            // forgets is the one mistake this whole type exists to prevent.
+            let window = match t.attn_kind(layer) == AttnKind::Local {
+                true => Some(t.sliding_window_size),
+                false => None,
+            };
+            let c = &self.caches[slot];
+            anyhow::ensure!(
+                c.attn_sconv_pending.is_none() && c.mlp_sconv_pending.is_none(),
+                "layer {layer} holds an uncommitted speculative convolution window; a Session \
+                 never drafts, so this cache did not come from one"
+            );
+            layers.push(LayerRewind {
+                attn: c.attn.rewind_point(window),
+                attn_sconv: c.attn_sconv.clone(),
+                mlp_sconv: c.mlp_sconv.clone(),
+            });
+        }
+        Ok(Checkpoint {
+            pos: self.pos,
+            last: self.last,
+            seq: self.seq,
+            layers,
+        })
+    }
+
+    /// Put this session back where `cp` was taken and drop everything after it.
+    ///
+    /// [`Session::position`] returns `cp.position()` afterwards, and
+    /// [`Session::extend`] continues from there — with DIFFERENT tokens if that
+    /// is what changed, which is the operation this exists for.
+    ///
+    /// # It fails loudly, and the failures are the design
+    ///
+    /// * A checkpoint from another session, or from this one before a
+    ///   [`Session::reset`], is refused by sequence id. Its handles are still
+    ///   alive, so the alternative to refusing is a session that silently
+    ///   becomes a different conversation.
+    /// * A checkpoint from AHEAD of where the session now stands is refused:
+    ///   the rows between are not in the cache to be restored, and a "rewind"
+    ///   forward would leave the position counter ahead of the keys.
+    /// * A checkpoint whose layer count is not this session's is refused.
+    ///
+    /// There is deliberately no `truncate_to(pos)` beside this. See
+    /// [`Checkpoint`] for why a position is not a thing a caller may name.
+    pub fn rewind(&mut self, cp: &Checkpoint) -> Result<()> {
+        anyhow::ensure!(
+            cp.seq == self.seq,
+            "this checkpoint was taken from a different sequence (checkpoint {}, session {}) -- \
+             either from another Session or from this one before a `reset`. Its device buffers \
+             are still alive, so rewinding to it would put this session into a conversation it \
+             is no longer having.",
+            cp.seq,
+            self.seq
+        );
+        anyhow::ensure!(
+            !self.caches.is_empty(),
+            "this Session holds no sequence to rewind"
+        );
+        anyhow::ensure!(
+            cp.pos <= self.pos,
+            "a checkpoint at position {} against a session at {}: a rewind goes BACK, and the \
+             positions between are not in this cache to be restored",
+            cp.pos,
+            self.pos
+        );
+        anyhow::ensure!(
+            cp.layers.len() == self.caches.len(),
+            "a {}-layer checkpoint against a {}-layer session",
+            cp.layers.len(),
+            self.caches.len()
+        );
+        for (slot, l) in cp.layers.iter().enumerate() {
+            let c = &mut self.caches[slot];
+            c.attn.rewind_to(&l.attn);
+            c.attn_sconv = l.attn_sconv.clone();
+            c.mlp_sconv = l.mlp_sconv.clone();
+            c.attn_sconv_pending = None;
+            c.mlp_sconv_pending = None;
+        }
+        self.pos = cp.pos;
+        self.last = cp.last;
+        Ok(())
     }
 
     /// Attend to `ids` as the start of a sequence and return the token that

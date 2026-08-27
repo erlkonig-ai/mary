@@ -796,6 +796,61 @@ struct Pending<B: Backend> {
     rows: usize,
 }
 
+/// Where one attention cache STOOD, kept so the cache can be put back there.
+///
+/// A speculative rollback undoes the rows a batch just appended, which is why
+/// [`Pending`] is taken and dropped inside a single verify pass. This is the
+/// other rewind: to a position the sequence passed *arbitrarily long ago* and
+/// went on generating past — the operation a caller needs when the PREFIX it
+/// prefilled turns out to have changed, and it wants to keep everything before
+/// the first changed token rather than re-read the whole prompt.
+///
+/// # A rewind is a truncation on seven layers and a RESTORE on thirty-five
+///
+/// On a global layer nothing is ever dropped, so row `i` is position `i`, and
+/// putting the cache back to position `n` is [`super::kvpages::KvStore::truncate`]
+/// — counters, no copy, and the rows that survive are the same device buffers
+/// they always were.
+///
+/// A LOCAL layer has already forgotten. [`trim`] drops every key outside the
+/// last `window`, so at position `p` the cache holds `[p - window, p)` and its
+/// `base` is `p - window`. Truncating that to `n < p` leaves `[p - window, n)`,
+/// which is SHORTER than a window — the keys `[n - window, p - window)` were
+/// released while the sequence ran past them, and no truncation can bring them
+/// back. Truncation on a windowed layer is therefore not a rewind at all; it is
+/// a cache that will answer the next query with too few keys and no error.
+///
+/// So this keeps the windowed layers' stores whole. That costs what a window
+/// costs and NOT what the context costs: the store is bounded by `window` rows
+/// however far into a million-token sequence the point is taken, so a rewind
+/// point is the same size at position 500,000 as at position 1,000. Burn clones
+/// a tensor by handle, so keeping one is a handle clone per page rather than a
+/// copy of the keys — the same property [`super::kvpages::Pages::share_prefix`]
+/// is built on. What it does cost is that the page the live cache is still
+/// writing into now has two references, and `write_rows` answers that by
+/// copying it (see [`super::kvpages::PageRows::write_rows`]) until the next page
+/// is opened.
+#[derive(Clone)]
+pub struct AttnRewind<B: Backend> {
+    /// Logical rows held at the point.
+    len: usize,
+    /// Absolute position of logical row 0 at the point.
+    base: usize,
+    /// The stores as they stood, for a WINDOWED layer — see above. `None` on a
+    /// global layer, where a truncation is exact and keeping a second reference
+    /// to the whole context would be the expensive way to say nothing.
+    kv: Option<(super::kvpages::KvStore<B>, super::kvpages::KvStore<B>)>,
+    k_pre: Tensor<B, 2>,
+    v_pre: Tensor<B, 2>,
+}
+
+impl<B: Backend> AttnRewind<B> {
+    /// The absolute position this point stands at — one past its last key.
+    pub fn position(&self) -> usize {
+        self.base + self.len
+    }
+}
+
 impl AttnCache<Bk> {
     /// Move this cache's KV onto PRE-ALLOCATED pages, if the run asked for
     /// them. **Off unless `INK_KV_PREALLOC` is set.**
@@ -1055,6 +1110,105 @@ impl<B: Backend> AttnCache<B> {
             self.v_pre = p.v_pre.slice([keep..keep + hist, 0..vdim]);
         }
         trim(self, window);
+    }
+
+    /// Where this cache stands, kept so [`AttnCache::rewind_to`] can put it
+    /// back.
+    ///
+    /// `window` is the layer's, and it is the same argument [`AttnCache::commit`]
+    /// takes for the same reason: whether a layer forgets is a fact about the
+    /// layer and not about the cache, and it decides here whether the point can
+    /// be a truncation or has to hold the store. Passing `None` for a layer that
+    /// is windowed produces a point that will rewind to too few keys — which is
+    /// why no caller should be deriving it; hand over the same `window` the
+    /// layer's [`attention_step`] is given.
+    ///
+    /// Refuses a cache with a speculative batch outstanding: a point taken
+    /// mid-verify would stand at a position half the model has not agreed to.
+    pub fn rewind_point(&self, window: Option<usize>) -> AttnRewind<B> {
+        assert!(
+            self.pending.is_none(),
+            "a rewind point taken while a speculative batch is uncommitted would stand at rows \
+             a verifier has not accepted yet"
+        );
+        assert_eq!(
+            self.k.len(),
+            self.v.len(),
+            "K holds {} rows and V holds {}",
+            self.k.len(),
+            self.v.len()
+        );
+        AttnRewind {
+            len: self.k.len(),
+            base: self.base,
+            kv: window.map(|_| (self.k.clone(), self.v.clone())),
+            k_pre: self.k_pre.clone(),
+            v_pre: self.v_pre.clone(),
+        }
+    }
+
+    /// Put this cache back where `r` was taken, discarding everything after it.
+    ///
+    /// After this the cache is byte-for-byte the one that existed at
+    /// `r.position()`, and the next [`attention_step`] at that position
+    /// continues from it. What is NOT guaranteed is that a later step's
+    /// arithmetic is bit-identical to the run that first passed through here:
+    /// truncation re-opens the page being written to a whole number of `PAGE`s
+    /// and leaves the settled pages as whatever [`super::kvpages::Pages`] had
+    /// merged them into, so the flash read may split the same keys into a
+    /// different set of runs. That is a different order of summation over the
+    /// same values — the same difference [`AttnCache::reserve_kv`] documents
+    /// between the reserved and grow-on-demand arms, and for exactly the same
+    /// reason.
+    ///
+    /// Every misuse below is a panic rather than a silently short cache:
+    ///
+    /// * a point from ahead of where the cache now stands (a "rewind" forward);
+    /// * a point taken with `window = None` against a cache whose window has
+    ///   since moved, which is a point that cannot restore what was dropped;
+    /// * a speculative batch outstanding on either side.
+    pub fn rewind_to(&mut self, r: &AttnRewind<B>) {
+        assert!(
+            self.pending.is_none(),
+            "rewinding a cache with an uncommitted speculative batch: commit it first"
+        );
+        let here = self.base + self.k.len();
+        let there = r.position();
+        assert!(
+            there <= here,
+            "a rewind point at position {there} against a cache that only reaches {here} -- a \
+             rewind goes BACK, and the rows between are not in this cache to be restored"
+        );
+        match &r.kv {
+            // A windowed layer: the point holds the store, because the rows
+            // this cache has dropped since are not recoverable from it.
+            Some((k, v)) => {
+                self.k = k.clone();
+                self.v = v.clone();
+            }
+            // A global layer: nothing was ever dropped, so the point's rows are
+            // this store's first `len` and a truncation is exact.
+            None => {
+                assert_eq!(
+                    self.base, r.base,
+                    "a rewind point with no store was taken as GLOBAL (nothing dropped), but \
+                     this cache's base has moved {} -> {}: it is windowed, and the keys it \
+                     forgot cannot be truncated back into existence",
+                    r.base, self.base
+                );
+                assert!(
+                    r.len <= self.k.len(),
+                    "a {}-row rewind point against a {}-row cache",
+                    r.len,
+                    self.k.len()
+                );
+                self.k.truncate(r.len);
+                self.v.truncate(r.len);
+            }
+        }
+        self.base = r.base;
+        self.k_pre = r.k_pre.clone();
+        self.v_pre = r.v_pre.clone();
     }
 }
 
@@ -4887,6 +5041,192 @@ mod tests {
             let diff = (next(&mut a) - next(&mut b)).abs().max().into_scalar();
             assert!(diff < 1e-5, "keep={keep} diverges by {diff}");
         }
+    }
+
+    /// Run a cache from a `prefill`-row prompt out to `to`, feeding row `i` of
+    /// `xs` at position `i`, and return the cache with the outputs of the steps
+    /// from `from`.
+    ///
+    /// One helper for both arms of the rewind test, so "the same schedule" is
+    /// the same code and not two transcriptions of it.
+    fn run_from(
+        cache: &mut AttnCache<Bk>,
+        w: &AttnWeightsDev,
+        d: &AttnDims,
+        window: Option<usize>,
+        xs: &Tensor<B, 2>,
+        from: usize,
+        to: usize,
+    ) -> Vec<Tensor<B, 2>> {
+        (from..to)
+            .map(|p| {
+                let row = xs.clone().slice([p..p + 1, 0..d.hidden]);
+                attention_step(row, w, d, None, p, window, cache)
+            })
+            .collect()
+    }
+
+    /// A cache rewound to a kept point and re-extended with DIFFERENT rows is
+    /// the cache that was built that way from the start.
+    ///
+    /// This is the equivalence [`AttnRewind`] exists to provide, and it is
+    /// asserted on the OUTPUT of the steps after the rewind rather than on the
+    /// store's length, because a cache of the right length holding the wrong
+    /// keys is exactly the failure a length assertion cannot see.
+    ///
+    /// Both arms, and the local one is the one that matters: with a window of
+    /// four and a rewind eight positions back, every key the rewound position
+    /// needs has been DROPPED from the live cache by [`trim`]. A truncation
+    /// cannot pass this; only a kept store can. (The dense arm both times: the
+    /// toy `kv_width` here is 8, which is not a multiple of
+    /// [`super::kvpages::FP4_ROW_ALIGN`], so [`super::kvpages::KvStore::new`]
+    /// takes the wide branch whatever the FP4 switch says. What the FP4 arm
+    /// changes is how a page stores a row, and a rewind moves pages by handle
+    /// and truncates by counter — neither reads one.)
+    #[test]
+    fn a_rewound_cache_re_extended_is_the_cache_built_that_way() {
+        let _lane = CacheLane::wide();
+        let dev = burn::backend::cuda::CudaDevice::default();
+        for (kind, window) in [(AttnKind::Global, None), (AttnKind::Local, Some(4usize))] {
+            let d = dims(kind, 5);
+            let w = weights(&d, &dev);
+            // Two streams of rows that agree up to the checkpoint and disagree
+            // after it -- which is the shape of a prefix whose tail changed.
+            let n = 20usize;
+            let stream = |seed: f32| -> Tensor<B, 2> {
+                Tensor::from_data(
+                    TensorData::new(fill(n * d.hidden, seed), [n, d.hidden]),
+                    &dev,
+                )
+            };
+            let (a, b) = (stream(2.5), stream(-1.75));
+            let (prefill, mark, end) = (6usize, 8usize, 14usize);
+
+            // The live cache: prompt, two steps to the mark, a rewind point,
+            // six steps down stream A, back to the mark, six down stream B.
+            let (_, mut live) = attention_prefill(
+                a.clone().slice([0..prefill, 0..d.hidden]),
+                &w,
+                &d,
+                None,
+                window,
+                window,
+            );
+            run_from(&mut live, &w, &d, window, &a, prefill, mark);
+            let point = live.rewind_point(window);
+            assert_eq!(
+                point.position(),
+                mark,
+                "the point stands where it was taken"
+            );
+            run_from(&mut live, &w, &d, window, &a, mark, end);
+            live.rewind_to(&point);
+            assert_eq!(
+                live.base() + live.len(),
+                mark,
+                "a rewound cache is back at the point's position"
+            );
+            let got = run_from(&mut live, &w, &d, window, &b, mark, end);
+
+            // The cache that was built that way: the same prompt, the same two
+            // steps, and then stream B without ever having seen stream A.
+            let (_, mut fresh) = attention_prefill(
+                a.clone().slice([0..prefill, 0..d.hidden]),
+                &w,
+                &d,
+                None,
+                window,
+                window,
+            );
+            run_from(&mut fresh, &w, &d, window, &a, prefill, mark);
+            let want = run_from(&mut fresh, &w, &d, window, &b, mark, end);
+
+            assert_eq!(live.len(), fresh.len(), "{kind:?}: rows");
+            assert_eq!(live.base(), fresh.base(), "{kind:?}: base");
+            for (i, (g, wnt)) in got.into_iter().zip(want).enumerate() {
+                // EXACT, and it is reachable here for a reason worth stating:
+                // the windowed arm restores handles, the global arm truncates
+                // counters, and at twenty positions there is one page, so the
+                // truncation cannot re-partition the key axis. A longer
+                // sequence CAN -- see `rewind_to` -- and would need a tolerance
+                // rather than this.
+                let diff = (g - wnt).abs().max().into_scalar();
+                assert_eq!(
+                    diff,
+                    0.0,
+                    "{kind:?}: step {} after the rewind diverges by {diff}",
+                    mark + i
+                );
+            }
+        }
+    }
+
+    /// The refutation, pinned: on a WINDOWED layer a rewind is not a
+    /// truncation, and asking for one is refused rather than served short.
+    ///
+    /// A point taken with `window = None` is the truncation-only point — it
+    /// keeps no store, because a global layer never drops a key. Take one on a
+    /// local layer, run far enough that [`trim`] moves `base`, and the rewind
+    /// has nothing to restore the dropped keys from. It says so.
+    #[test]
+    #[should_panic(expected = "it is windowed")]
+    fn a_truncation_point_cannot_rewind_a_layer_that_has_forgotten() {
+        let _lane = CacheLane::wide();
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let d = dims(AttnKind::Local, 5);
+        let w = weights(&d, &dev);
+        let window = Some(4usize);
+        let xs: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(fill(16 * d.hidden, 2.5), [16, d.hidden]),
+            &dev,
+        );
+        let (_, mut c) = attention_prefill(
+            xs.clone().slice([0..4, 0..d.hidden]),
+            &w,
+            &d,
+            None,
+            window,
+            window,
+        );
+        // Taken as if the layer were global, which is the mistake.
+        let point = c.rewind_point(None);
+        run_from(&mut c, &w, &d, window, &xs, 4, 12);
+        assert!(c.base() > point.position() - 4, "the window has moved on");
+        c.rewind_to(&point);
+    }
+
+    /// A rewind goes back. A point from ahead of the cache is refused, rather
+    /// than leaving the position counter ahead of the keys.
+    #[test]
+    #[should_panic(expected = "a rewind goes BACK")]
+    fn a_rewind_point_from_ahead_is_refused() {
+        let _lane = CacheLane::wide();
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let d = dims(AttnKind::Global, 5);
+        let w = weights(&d, &dev);
+        let xs: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(fill(16 * d.hidden, 2.5), [16, d.hidden]),
+            &dev,
+        );
+        let (_, mut c) = attention_prefill(
+            xs.clone().slice([0..6, 0..d.hidden]),
+            &w,
+            &d,
+            None,
+            None,
+            None,
+        );
+        run_from(&mut c, &w, &d, None, &xs, 6, 10);
+        let ahead = c.rewind_point(None);
+        let (_, mut behind) = attention_prefill(
+            xs.clone().slice([0..6, 0..d.hidden]),
+            &w,
+            &d,
+            None,
+            None,
+            None,
+        );
+        behind.rewind_to(&ahead);
     }
 
     /// The batched cached step against the uncached lane, in batches of
