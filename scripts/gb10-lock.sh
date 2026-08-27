@@ -24,6 +24,16 @@
 #   - the lock records a pid AND the host that pid lives on. If that host is the
 #     box we are on and the pid is gone, the lock is broken IMMEDIATELY. That is
 #     exact and needs no timeout.
+# TAKING THE LOCK OBLIGES YOU TO KEEP BEATING. Silence is indistinguishable
+# from death, by construction: a holder doing one long uninterrupted stretch
+# without calling `refresh` is treated as crashed once the timeout elapses and
+# its reservation is broken WHILE IT IS STILL RUNNING. A 7-rep two-node run is
+# ~18 min and a cold build can be 30-40, so a naive holder that takes the lock
+# once and works is inside the 90-minute window today, but not by much. The
+# second layer catches the consequence -- a breaker's idle gate immediately sees
+# the true holder's processes and refuses -- so the failure mode is a lost
+# reservation and a wasted slot rather than an OOM. Beat anyway.
+#
 #   - otherwise (the holder is a pid on the OTHER box, which is normal for a
 #     two-node run whose tail is remote) age is all we have, and GB10_LOCK_TIMEOUT_S
 #     (default 5400 s / 90 min) applies. Chosen to clear a cold build of
@@ -34,6 +44,18 @@
 #   gb10-lock.sh take <host> <tag>     -> rc 0 took it, rc 3 someone else holds it
 #   gb10-lock.sh release <host> <tag>  -> releases only if <tag> holds it
 #   gb10-lock.sh check <host>          -> prints the holder, rc 0 free, rc 3 held
+#
+# TAKING BOTH BOXES: BOTH OR NEITHER, AND NEVER WAIT WHILE HOLDING HALF.
+# A two-node run needs spark and spark2 together. If you take one, fail to get
+# the other, and then WAIT while still holding the first, you deadlock against
+# any other two-node agent doing the same thing in the opposite order -- A holds
+# spark2 waiting for spark, B holds spark waiting for spark2, and neither ever
+# yields. Nothing in this script prevents that; it is a property of how you call
+# it. So: if the second take fails, RELEASE THE FIRST before you sleep, and ask
+# for both again from scratch on the next attempt. Holding half of what you need
+# while you wait is the one usage that turns a working lock into a hang.
+# (Found by the frontier harness, which hit the half-held state and only escaped
+# it because that version exited instead of waiting.)
 #
 # WHAT THIS DOES NOT DO: THERE IS NO QUEUE. It is mutual exclusion and nothing
 # more. A caller refused with rc 3 is not remembered, is not owed the next slot,
@@ -89,7 +111,10 @@ write_info() {
 case "$ACTION" in
   take)
     mkdir -p "$HOME/gb10"
-    if mkdir "$LOCKD" 2>/dev/null; then write_info; echo "TAKEN $TAG"; exit 0; fi
+    if mkdir "$LOCKD" 2>/dev/null; then write_info
+      echo "TAKEN $TAG -- you MUST call 'refresh $TAG' at least every ${TIMEOUT}s"
+      echo "  or this lock goes stale and another agent may take the box while you run."
+      exit 0; fi
     [ -f "$INFO" ] || { echo "HELD by an unidentified holder"; exit 3; }
     hhost=$(sed -n 's/^host=//p' "$INFO")
     htag=$(sed -n 's/^tag=//p' "$INFO");  hst=$(sed -n 's/^beat=//p' "$INFO")
