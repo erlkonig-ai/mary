@@ -100,6 +100,20 @@ pub mod spectree;
 pub mod stack;
 pub mod vision;
 
+// THE ASSEMBLY, and then the thing it assembles.
+//
+// Every module above is a COMPONENT. None of them says how a model is built out
+// of them, and until 2026-08-27 nothing in the library did: the composition
+// lived in `src/bin/inkling_forward.rs`, and nothing can link against a binary.
+// So a long-lived process could not hold this model — every request meant
+// launching a program, and 144 GiB of weights meant that was never going to be
+// a serving path.
+//
+// `assembly` is that composition, moved verbatim out of the binary. `session`
+// is the handle it makes possible: weights, KV and position as ONE value that
+// survives across calls.
+pub mod assembly;
+
 pub use config::InklingConfig;
 // Layer 2's experts are BF16 and have no scales; the same tiling, the same
 // device residency, the unscaled sibling of the instruction.
