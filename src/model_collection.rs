@@ -41,9 +41,10 @@ use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::inline::encodings::ed25519::ED25519PublicKey;
 use triblespace::core::inline::encodings::shortstring::ShortString;
 use triblespace::core::metadata;
+use triblespace::core::repo::OfferCaptureInsertError;
 use triblespace::core::repo::pile::{
     CollectionInsertError, FlushError, GetBlobError, InsertError as PileInsertError, PileReader,
-    ReadError,
+    PileWriteError, ReadError,
 };
 use triblespace::core::trible::TribleSet;
 use triblespace::prelude::inlineencodings::{F64, U256BE};
@@ -75,7 +76,10 @@ pub fn mary_model_bundle_name() -> CollectionName {
 }
 
 /// Concrete failure produced by publishing one model fragment to a pile.
-pub type ModelFragmentPublicationError = PublicationError<PileInsertError, CollectionInsertError>;
+pub type ModelFragmentPublicationError = PublicationError<
+    PileInsertError,
+    OfferCaptureInsertError<PileWriteError, CollectionInsertError>,
+>;
 
 /// Concrete failure produced while exactly materializing Mary's collection
 /// from a pile.
@@ -813,12 +817,15 @@ impl Error for SoleModelBundleTeamError {
     }
 }
 
-fn local_ticket_for_collection(
-    pile: &mut Pile,
+fn local_ticket_for_collection<S>(
+    store: &mut S,
     collection: triblespace::core::collection::CollectionHandle,
-) -> Result<Vec<CollectionCommit>, ReadError> {
+) -> Result<Vec<CollectionCommit>, ReadError>
+where
+    S: CollectionStore<RecordsError = ReadError>,
+{
     let mut ticket = Vec::new();
-    for record in pile.records()? {
+    for record in store.records()? {
         if let CollectionRecord::Commit(commit) = record? {
             if commit.collection() == collection {
                 // Deliberately retain structurally decoded but
@@ -833,10 +840,13 @@ fn local_ticket_for_collection(
     Ok(ticket)
 }
 
-fn local_model_ticket(
-    pile: &mut Pile,
+fn local_model_ticket<S>(
+    store: &mut S,
     team: VerifyingKey,
-) -> Result<Vec<CollectionCommit>, ReadError> {
+) -> Result<Vec<CollectionCommit>, ReadError>
+where
+    S: CollectionStore<RecordsError = ReadError>,
+{
     // Hashing a descriptor without storing it is only safe on a read path.
     // A write that did this could name a collection whose descriptor is not
     // in the pile -- records referencing something nothing can decode -- so
@@ -846,7 +856,7 @@ fn local_model_ticket(
         model_graph_collection(team).descriptor().facts().clone(),
     )
     .get_handle();
-    local_ticket_for_collection(pile, collection)
+    local_ticket_for_collection(store, collection)
 }
 
 /// Freeze every structurally present COMMIT for this team's
@@ -873,13 +883,18 @@ pub fn local_model_bundle_ticket(
 /// native-record scan defines one observed prefix and the returned snapshot
 /// owns its immutable reader; the caller keeps responsibility for closing or
 /// further appending to `pile`. No flush, close, reopen, or repair occurs.
-pub fn snapshot_model_collection_local_latest(
-    pile: &mut Pile,
+pub fn snapshot_model_collection_local_latest<S>(
+    store: &mut S,
     team: VerifyingKey,
-) -> Result<CollectionSnapshot<PileReader>, SnapshotLocalModelCollectionError> {
+) -> Result<CollectionSnapshot<PileReader>, SnapshotLocalModelCollectionError>
+where
+    S: BlobStore<Reader = PileReader, ReaderError = ReadError>
+        + CollectionStore<RecordsError = ReadError>,
+{
     let ticket =
-        local_model_ticket(pile, team).map_err(SnapshotLocalModelCollectionError::LocalTicket)?;
-    snapshot_model_collection_exact(pile, team, &ticket)
+        local_model_ticket(store, team).map_err(SnapshotLocalModelCollectionError::LocalTicket)?;
+    model_graph_collection(team)
+        .snapshot_exact(store, &ticket)
         .map_err(SnapshotLocalModelCollectionError::Materialize)
 }
 
