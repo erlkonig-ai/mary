@@ -127,6 +127,26 @@
 #     here prevents it. If that starts happening, the fix is a real queue (a
 #     ticket file, taken in order), not a longer timeout and not politeness.
 #
+#     IT HAPPENED, AND IT IS MEASURED. 2026-08-27: one waiter polled every
+#     180 s for two hours -- 40 cycles -- and found ZERO free windows. 28
+#     refusals came from the busy gate and 12 from the lock, across three
+#     holders running back to back with no gap between them. Nobody did
+#     anything wrong: each holder took the boxes the moment they were free,
+#     correctly, and the waiter never won a race it was not trying to enter.
+#
+#     The mechanism is that RELEASE AND RE-TAKE ARE ADJACENT. A holder
+#     releases, the next agent's poll lands within seconds, and the free
+#     window never survives to the waiter's next tick. Polling faster does
+#     not fix it -- it converts a queue into a lottery with more entrants.
+#     What is missing is a TICKET: a record of 'asked at T' so the box goes
+#     to the longest waiter rather than to whoever's timer fires first.
+#
+#     Until that exists, the queue is a PERSON. An arbiter who knows the
+#     ordering can hold a released slot for the starving waiter, which is
+#     what happened this night. That is not a substitute for the ticket; it
+#     is what you do while the ticket does not exist, and it only works
+#     while someone is awake to do it.
+#
 # It is deliberately this simple because the failure it was built for -- two
 # runs overlapping and OOM-killing each other -- needs only exclusion, and a
 # queue that is wrong is worse than no queue. Revisit when starvation is
