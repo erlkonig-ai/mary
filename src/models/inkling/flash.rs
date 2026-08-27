@@ -244,14 +244,83 @@
 //! (`groups` heads by `rows / groups` queries), and it is the tidier
 //! formulation of the two.
 //!
-//! # What this does NOT do
+//! # Reading NVFP4 in registers, and why it is OFF
 //!
-//! It does not dequantise NVFP4 in registers. The paged cache hands back
-//! dequantised pages (`Fp4PageStore::parts`, one page-sized dequant launch
-//! each) and the kernel consumes those. Reading the packed codes directly would
-//! save the page-sized round trip through L2, which is real but is not the
-//! 28 GB; it is a later change and it is a change to the READER, not to this
-//! kernel's shape.
+//! `INK_FLASH_FP4=1` swaps the fetch for the packed one: the kernel reads the
+//! stored E2M1 codes and E4M3 block scales and decodes in registers, and no
+//! dequantised page is built at all. It is one comptime branch at two fetch
+//! sites; everything below them is the same code. The old note here said this
+//! would "save the page-sized round trip through L2" and called it a change to
+//! the READER, not to this kernel's shape. The second half was right. The
+//! first half was wrong about L2, and the difference is the whole result.
+//!
+//! ## The round trip is to DRAM, not through L2
+//!
+//! **Framing rule for this section.** Per DECODE STEP of `INK_LAYERS=0:21` at
+//! ctx 3732, `INK_KV=1`, NVFP4 KV, one GB10, median of six warm steps (spread
+//! under 0.5%). Bytes are `lts__d_sectors_fill_sysmem.sum * 32 B`, which is the
+//! DRAM read on this part: GB10 exposes **no `dram__` metric at all** —
+//! `ncu --query-metrics` lists none — and `lts__d_sectors_fill_device.sum` is
+//! structurally zero because the memory is unified, so there is no separate
+//! device aperture to fill from. Anything asking this part for
+//! `dram__bytes_read.sum` gets an error, not a number. (`lts__t_sectors_op_read_lookup_miss` is NOT the counter to
+//! use: it reads 3% miss on the dequant's packed input, which cannot be
+//! resident.)
+//!
+//! | kernel | launches | DRAM read | L2 read | DRAM/L2 |
+//! | --- | ---: | ---: | ---: | ---: |
+//! | `dequantize_nvfp4` | 84 | 26.5 MiB | 25.7 MiB | 1.03 |
+//! | `flash_kernel` | 42 | 82.9 MiB | 83.8 MiB | **0.99** |
+//!
+//! **99% of what flash reads back comes from memory.** The pages the dequant
+//! wrote microseconds earlier, into a 24 MiB L2, are not there any more. That
+//! also settles the write half without assuming anything: flash read those
+//! bytes from DRAM, so the lines had been evicted, and evicting a dirty line IS
+//! the write-back. Both directions are real traffic.
+//!
+//! With `INK_FLASH_FP4=1` the dequant launches disappear and `flash_kernel`'s
+//! DRAM read falls to 26.3 MiB — the codes. **166 MiB a step removed at 21
+//! layers**: 83.1 measured off the read side, and the ~82.9 of dequant write
+//! the read-back miss proves reached memory. Doubling for 42 layers gives ~332
+//! MiB, within 4% of what the shapes predict.
+//!
+//! ## And it is 1.83% SLOWER
+//!
+//! Paired, ABBA-balanced arm order inside one interleaved run, n = 7, same
+//! binary, ctx 3732, `INK_LAYERS=0:21`, `INK_GEN=40`, one GB10: **+1.83% on
+//! step time, 95% CI +1.73..+1.93**, against A/A controls of +0.19% and
+//! −0.28%. 44.9 ms/step against 45.7.
+//!
+//! The reason is in this file's own doc, four sections up. At decode the grid
+//! is `(1, kv_heads, splits)` — the launches are **32 cubes and 8 cubes on a
+//! 48-SM part**, `sm__warps_active` 8.3% of peak. "That is not a kernel, it is
+//! a queue": it is LATENCY-bound, not bandwidth-bound, so bytes removed from it
+//! are bytes it was not waiting on, while the per-element decode lands straight
+//! on the critical path. The value loop makes that worse by a factor of four —
+//! `vv` depends only on `(j, di, lane)`, so all four planes decode the same
+//! element, and what is a free L1 hit on the dense arm is four E2M1 decodes
+//! here.
+//!
+//! So it is a switch that is OFF, and the two things it is waiting for are
+//! named rather than guessed: a decode tile that does not decode V four times
+//! (one plane a cube, or a staged V tile — the shared budget allows the second
+//! only at the decode tile), and a context long enough that these kernels are
+//! bandwidth-bound. The traffic it removes is real and measured; what is
+//! missing is a shape that is waiting on that traffic.
+//!
+//! It is DECODE-only in effect: the prefill global arm reads freshly projected
+//! K and V rather than the cache, so it never reaches this flag — which is
+//! just as well, since a packed reader would turn prefill's one dequant per
+//! element into one per query tile.
+//!
+//! ## What it costs in registers
+//!
+//! `flash_kernel` at the decode tile goes **40 -> 47 registers a thread**, and
+//! `launch__occupancy_limit_registers` **12 -> 10** blocks an SM. Neither binds:
+//! `launch__occupancy_limit_shared_mem` is 5 blocks an SM on both arms. Local
+//! memory is **0 bytes loaded and 0 stored on both arms**, so nothing spilled —
+//! which is worth having measured rather than inferred, because this is the
+//! kernel where a spill would be silent.
 //!
 //! It also has no MMA path. At decode `m = 1` and tensor cores buy nothing —
 //! the product is a GEMV and the kernel is bandwidth-bound. At prefill `m` is
