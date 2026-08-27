@@ -258,7 +258,7 @@
 //! large and they would; see the measurements in the commit for where that
 //! leaves the prefill lane against burn's cmma matmul.
 
-use super::fp4quant::e2m1_value;
+use super::fp4quant::e2m1_bits;
 use cubecl::e4m3;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
@@ -320,13 +320,15 @@ pub fn shared_floats(rows: u32, head_dim: u32) -> usize {
 /// over a prefix of a reserved page by shortening a scalar.
 ///
 /// This is [`super::fp4quant::dequantize_nvfp4_kernel`]'s arithmetic for ONE
-/// element instead of for a sixteen-element block, and it is deliberately the
-/// same `e2m1_value` so the two readers cannot drift in what a code means.
+/// element instead of for a sixteen-element block. It decodes through
+/// [`super::fp4quant::e2m1_bits`] rather than the `e2m1_value` ladder the
+/// dequant kernel uses, because here it is the innermost loop -- see that
+/// function for why there are two, and for what stops them drifting.
 #[cube]
 fn nvfp4_at(codes: &Array<u32>, scales: &Array<e4m3>, idx: u32) -> f32 {
     let word = codes[(idx / 8) as usize];
     let code = (word >> ((idx % 8) * 4)) & 15;
-    e2m1_value(code) * f32::cast_from(scales[(idx / 16) as usize])
+    e2m1_bits(code) * f32::cast_from(scales[(idx / 16) as usize])
 }
 
 /// One `(query tile, KV head, key split)` of global attention, fused.
