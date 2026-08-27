@@ -702,9 +702,42 @@ pub fn prefill_activation_bytes(
 ) -> u64 {
     let n = tokens as u64;
     let carried = 2 * n * t.hidden_size as u64 * policy.residual.bytes();
+    let caches = kv_cache_bytes(t, layers.clone(), tokens, policy);
+    let widest = layers
+        .map(|l| {
+            attention_activation_bytes(t, t.attn_kind(l), tokens, policy)
+                .max(mlp_activation_bytes(t, l, tokens, policy))
+        })
+        .max()
+        .unwrap_or(0);
+    carried + caches + widest
+}
+
+/// What the KV caches of this layer range hold at this length, GROWN ON
+/// DEMAND: keys and values, retained rows only.
+///
+/// The retained-rows arithmetic in one place, because it is the term this
+/// module is most often got wrong: a windowed layer keeps
+/// `min(sliding_window_size, tokens)` rows however long the sequence gets --
+/// `super::burn::trim` really drops them rather than masking -- so charging
+/// `layers * tokens` over-counts this model by 5.98x at a million tokens.
+///
+/// Priced at `policy.cache`, which is the width the DENSE cache holds. The
+/// NVFP4 arm stores the same rows at 4.5 bits a value (`width / 8` code words
+/// plus `width / 64` scale words, 576 bytes for a 1024-wide row), i.e. 3.56x
+/// less than the BF16 charged here -- so this is deliberately the permissive
+/// direction for the arm that actually runs. [`super::kvpages::KvPlan::bytes`]
+/// is the exact figure for a RESERVED pool, and
+/// [`super::kvpages::KvPlan::report`] prints it beside this one rather than on
+/// top of it.
+pub fn kv_cache_bytes(
+    t: &InklingTextConfig,
+    layers: core::ops::Range<usize>,
+    tokens: usize,
+    policy: AdmissionPolicy,
+) -> u64 {
     let elem = policy.cache.bytes();
-    let caches: u64 = layers
-        .clone()
+    layers
         .map(|l| {
             let kind = t.attn_kind(l);
             let (_, kv_heads, head_dim) = t.heads(kind);
@@ -714,15 +747,7 @@ pub fn prefill_activation_bytes(
             } as u64;
             2 * keep * (kv_heads * head_dim) as u64 * elem
         })
-        .sum();
-    let widest = layers
-        .map(|l| {
-            attention_activation_bytes(t, t.attn_kind(l), tokens, policy)
-                .max(mlp_activation_bytes(t, l, tokens, policy))
-        })
-        .max()
-        .unwrap_or(0);
-    carried + caches + widest
+        .sum()
 }
 
 /// The largest SINGLE buffer this range asks for at this length.
@@ -864,9 +889,101 @@ pub fn check<R: Runtime>(
         t.hidden_size,
         routed_dtype.name(),
         cap as f64 / GIB,
-        longest_sequence(t, layers, cap, policy),
+        longest_sequence(t, layers.clone(), cap, policy),
     );
+    kv_reserve_check(client, t, layers, tokens, policy)?;
     Ok(())
+}
+
+/// Global and local attention layers in this node's range.
+fn attn_split(t: &InklingTextConfig, layers: core::ops::Range<usize>) -> (usize, usize) {
+    let locals = layers
+        .clone()
+        .filter(|&l| t.attn_kind(l) == AttnKind::Local)
+        .count();
+    (layers.count() - locals, locals)
+}
+
+/// What a preallocated KV pool takes on this node, and whether it can be
+/// allocated at all.
+///
+/// The gate and the pool must not be able to disagree, so this asks
+/// [`KvPlan`] rather than re-deriving the arithmetic -- the disagreement it
+/// prevents is the 5.98x one: 42 layers x context OVER-counts this model,
+/// because thirty-five of the forty-two are windowed and hold 512 rows however
+/// long the context gets, and `trim` really drops those rows rather than
+/// masking them. Retained rows at 1,048,576 tokens are `7 * 1048576 + 35 *
+/// local_rows`, not `42 * 1048576`.
+///
+/// It also tells [`KvPlan`] the checkpoint's `model_max_length`, which is what
+/// makes `INK_KV_PREALLOC=max` resolvable: this is the one place in the library
+/// that holds a config and runs once before the first token.
+fn kv_reserve_check<R: Runtime>(
+    client: &ComputeClient<R>,
+    t: &InklingTextConfig,
+    layers: core::ops::Range<usize>,
+    tokens: usize,
+    policy: AdmissionPolicy,
+) -> Result<()> {
+    use crate::models::inkling::kvpages::KvPlan;
+    crate::models::inkling::kvpages::note_model_max_length(t.model_max_length);
+    let Some(plan) = KvPlan::from_env(t.sliding_window_size) else {
+        return Ok(());
+    };
+    let (_, kv_heads, head_dim) = t.heads(AttnKind::Global);
+    let width = kv_heads * head_dim;
+    let cap = largest_allocation(client);
+    // The reservation is many buffers, and the device cap is per-buffer, so the
+    // comparison is against the LARGEST one: a global store's code words,
+    // `rows x width/8` i32.
+    let widest = plan.global_rows as u64 * (width / 8) as u64 * 4;
+    anyhow::ensure!(
+        widest <= cap,
+        "INK_KV_PREALLOC={} tokens wants a single {:.2} GiB NVFP4 code buffer per global KV \
+         store, and this device refuses any allocation over {:.2} GiB. Reserve for fewer tokens.",
+        plan.context,
+        widest as f64 / GIB,
+        cap as f64 / GIB,
+    );
+    anyhow::ensure!(
+        tokens <= plan.global_rows,
+        "a {tokens}-token prompt does not fit a KV pool reserved for {} tokens -- raise \
+         INK_KV_PREALLOC or the cache would silently stay on the grow-on-demand arm",
+        plan.context,
+    );
+    if let Some(line) = kv_reserve_line(t, layers, tokens, policy) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// The reservation beside the on-demand charge it REPLACES, so the two numbers
+/// cannot be read as additive.
+///
+/// The admission line already charges a KV term ([`kv_cache_bytes`]) against
+/// the sequence, at the dense cache's width. A reserved pool is that same
+/// cache, relocated and sized for the whole context instead of for this
+/// prompt -- so the honest report is "this instead of that", with `policy`
+/// naming which dense width the displaced charge was priced at.
+pub fn kv_reserve_line(
+    t: &InklingTextConfig,
+    layers: core::ops::Range<usize>,
+    tokens: usize,
+    policy: AdmissionPolicy,
+) -> Option<String> {
+    use crate::models::inkling::kvpages::KvPlan;
+    let plan = KvPlan::from_env(t.sliding_window_size)?;
+    let (globals, locals) = attn_split(t, layers.clone());
+    let (_, kv_heads, head_dim) = t.heads(AttnKind::Global);
+    let width = kv_heads * head_dim;
+    let displaced = kv_cache_bytes(t, layers, tokens, policy);
+    Some(format!(
+        "{}\n    it REPLACES the {:.3} GiB of {} KV this node's admission charged at \
+         {tokens} tokens -- not additive: the reservation IS the cache.",
+        plan.report(globals, locals, width),
+        displaced as f64 / GIB,
+        policy.cache.name(),
+    ))
 }
 
 #[cfg(test)]
@@ -896,6 +1013,63 @@ mod tests {
             StorageDType::Bf16,
             StorageDType::Bf16,
         )
+    }
+
+    /// The gate's KV charge and the pool's reservation must not disagree about
+    /// WHICH ROWS are retained.
+    ///
+    /// They are priced at different widths on purpose -- the charge is the
+    /// dense cache at `policy.cache`, the reservation is NVFP4 at 4.5 bits --
+    /// so the check is that the two differ by exactly that ratio and by nothing
+    /// else. A term left out of one of them shows up here as a ratio that is
+    /// not 3.56, which is the disagreement `kv_reserve_line` exists to make
+    /// unquotable.
+    #[test]
+    fn the_reservation_and_the_admission_charge_retain_the_same_rows() {
+        use super::{GIB, kv_cache_bytes};
+        use crate::models::inkling::kvpages::KvPlan;
+        let t = small();
+        const CTX: usize = 1 << 20;
+        let (_, kv_heads, head_dim) = t.heads(AttnKind::Global);
+        let width = kv_heads * head_dim;
+        assert_eq!(width, 1024, "this model's KV row");
+        assert_eq!(KvPlan::row_bytes(width), 576, "4.5 bits a value, not 16");
+
+        let plan = KvPlan::new(CTX, t.sliding_window_size);
+        // Full model, both stores. 7 global layers and 35 local ones, which is
+        // the complement of `local_layer_ids` and not 42 x anything.
+        let locals = (0..42)
+            .filter(|&l| t.attn_kind(l) == AttnKind::Local)
+            .count();
+        assert_eq!(locals, 35, "35 of the 42 layers are windowed");
+        let held = plan.bytes(42 - locals, locals, width);
+
+        // The gate's own arithmetic at the same context, at BF16.
+        let charged = kv_cache_bytes(&t, 0..42, CTX, narrow());
+        // The reservation carries `epoch` extra rows per windowed store, which
+        // is what lets a compacting store never re-allocate; everything else is
+        // the same rows at a narrower element.
+        let ratio = charged as f64 / held as f64;
+        assert!(
+            (3.4..3.6).contains(&ratio),
+            "the BF16 charge is {ratio:.2}x the NVFP4 reservation, want the 3.56 that is \
+             2 bytes against 0.5625 -- anything else means one of them is counting \
+             different rows"
+        );
+        // And the number that gets quoted, with its framing: whole model, both
+        // stores, one node, 1,048,576 tokens.
+        let gib = held as f64 / GIB;
+        assert!(
+            (7.5..8.5).contains(&gib),
+            "a 1M-token NVFP4 KV pool for all 42 layers is {gib:.3} GiB"
+        );
+        // The error this exists to prevent, named as a number.
+        let naive = 2u64 * 42 * CTX as u64 * KvPlan::row_bytes(width);
+        let over = naive as f64 / held as f64;
+        assert!(
+            (5.5..6.5).contains(&over),
+            "42 x context over-counts the retained rows by {over:.2}x, want ~5.98"
+        );
     }
 
     /// The 42-layer release, from its own `config.json`.

@@ -152,6 +152,68 @@ pub trait PageRows: Clone {
 /// `PagedKv` mask marks every slot outside `head .. head + len` as `-inf`, and
 /// the fused lane clamps each run to `hi = head + len`. That is why this
 /// change is confined to this file.
+///
+/// ## RESERVED pages: one buffer, one address, for the life of the process
+///
+/// Everything above grows on demand, and growing is the one thing a captured
+/// CUDA graph cannot survive: pushing a page allocates a buffer no graph node
+/// points at, and releasing one frees a buffer several of them do. That is the
+/// whole of the 128-step replay epoch -- a page holds [`PAGE`] rows, a decode
+/// step appends one, and on the 128th the structure moves.
+///
+/// [`Pages::reserved`] is the other arm. The store is handed ONE page at
+/// construction, sized for the longest context the run is admitted to, and
+/// after that:
+///
+/// * `append` only ever writes in place into it -- it never pushes, and
+///   [`Pages::append_is_in_place`] therefore keeps answering yes for the whole
+///   reservation rather than for the rest of a 128-row page;
+/// * `drop_front` only ever moves `head` -- it never releases a page and never
+///   cuts page 0, so [`Pages::drop_is_bookkeeping_only`] keeps answering yes
+///   for a windowed layer too;
+/// * nothing is ever freed, merged or re-allocated, so every device address
+///   this store hands out is the address it handed out on step one.
+///
+/// The `head < PAGE` bound is what the two predicates give up, and it is
+/// affordable here for a reason that is specific to the reserved arm: the dead
+/// prefix is bounded by [`Pages::compact`] instead, which copies the live rows
+/// back to row 0 once `head` reaches an epoch. That copy is `len` rows once per
+/// epoch against a page cut's `stored - head` rows once per [`PAGE`].
+///
+/// What a reservation does NOT buy on its own is an unbounded replay epoch,
+/// and the honest reason is one layer up: the FP4 arm hands the attention
+/// kernel DEQUANTIZED rows, and that buffer is allocated per step at a size
+/// [`Pages::read_rows`] chooses. Fixing the pages fixes the addresses and the
+/// allocation; the epoch is then that read window's granularity, which is a
+/// tunable rather than a page size. See [`kv_epoch`].
+///
+/// ## Why a reservation is affordable at all, which is a fact about the KERNEL
+///
+/// A reserved page is mostly dead rows -- a global store holds 1,048,576 of
+/// them and a decode step at 3732 tokens of context reads past 3732 -- and the
+/// obvious objection is that the read then costs the reservation rather than
+/// the context. It does not, and the reason is in [`super::flash`]: a
+/// `KeyRun` carries `rows` (the buffer) beside `lo .. hi` (the live keys), the
+/// launcher sizes its grid from `hi - lo`, and the kernel's own key loop runs
+/// `s_lo .. s_hi` inside that range. `rows` reaches the kernel ONLY as the
+/// binding length of an array argument. So a dead row costs nothing to score
+/// and nothing to accumulate, and the whole of what the reservation adds is
+/// the DEQUANT, which is why [`Pages::read_rows`] and not the reservation is
+/// what the epoch bounds.
+///
+/// The same paragraph is why a replay stays correct when the launcher's split
+/// count goes stale. `splits` is a grid dimension baked into a capture, but
+/// each split's range is `per = ceil((khi - klo) / splits)` computed IN the
+/// kernel from the patched bounds -- so a captured 30-way split still covers
+/// the whole live range as that range grows, at slightly larger slices. Stale
+/// there is suboptimal, never wrong.
+///
+/// The dense [`PageStore`] arm has neither property: [`PagedKv`] reads pages
+/// whole and would carry every dead row into a score matrix, and cutting the
+/// page down first is a `slice`, which allocates. That is why
+/// [`super::burn::AttnCache::reserve_kv`] refuses anything but an FP4 cache.
+///
+/// [`PagedKv`]: super::burn
 #[derive(Clone, Debug)]
 pub struct Pages<R: PageRows> {
     pages: Vec<R>,
@@ -159,6 +221,25 @@ pub struct Pages<R: PageRows> {
     len: usize,
     /// Real rows in the LAST page. Every earlier page is full.
     fill: usize,
+    /// Rows the single page was RESERVED at, or 0 on the grow-on-demand arm.
+    ///
+    /// Non-zero implies `pages.len() == 1` for the life of the store, and every
+    /// branch below that would have changed the page structure is disabled.
+    reserved: usize,
+    /// How far [`Pages::read_rows`] rounds the read window up, in the reserved
+    /// arm. Zero elsewhere.
+    epoch: usize,
+    /// Rows a reader takes from the reserved page. MONOTONE: it grows to the
+    /// next epoch when the rows do and it never shrinks again.
+    ///
+    /// Never shrinking is what makes a windowed store settle. Its stored rows
+    /// oscillate -- `head` walks out to an epoch and [`Pages::compact`] pulls it
+    /// back -- so a window derived from them afresh each step would cross an
+    /// epoch boundary TWICE a cycle, once up and once down, and each crossing
+    /// is a step no replay can stand in for. Monotone, it crosses once ever:
+    /// the store reaches `window + epoch` rows, and from then on the only thing
+    /// that ends a replay run is the compaction itself.
+    read: usize,
 }
 
 impl<R: PageRows> Default for Pages<R> {
@@ -175,7 +256,107 @@ impl<R: PageRows> Pages<R> {
             head: 0,
             len: 0,
             fill: 0,
+            reserved: 0,
+            epoch: 0,
+            read: 0,
         }
+    }
+
+    /// An empty set of pages backed by ONE page that is already allocated.
+    ///
+    /// `page` must hold `rows` rows and is the only buffer this store will ever
+    /// have. `epoch` is the granularity [`Pages::read_rows`] rounds the read
+    /// window up to, and also how far `head` is allowed to run before
+    /// [`Pages::compact`] pulls the live rows back to row 0.
+    pub fn reserved(page: R, rows: usize, epoch: usize) -> Self {
+        assert!(rows > 0, "a reservation of no rows is not a reservation");
+        assert_eq!(
+            page.rows(),
+            rows,
+            "the reserved page holds {} rows, not the {rows} it was reserved at",
+            page.rows()
+        );
+        assert!(epoch > 0 && epoch <= rows, "an epoch of {epoch} in {rows}");
+        Self {
+            pages: vec![page],
+            head: 0,
+            len: 0,
+            fill: 0,
+            reserved: rows,
+            epoch,
+            read: epoch.min(rows),
+        }
+    }
+
+    /// Rows this store reserved, or `None` on the grow-on-demand arm.
+    pub fn reservation(&self) -> Option<usize> {
+        (self.reserved > 0).then_some(self.reserved)
+    }
+
+    /// Seat `rows` at the front of an EMPTY reservation.
+    ///
+    /// The one way rows enter a reserved store other than by appending, and it
+    /// exists for exactly one caller: the prefill-to-decode handover, which
+    /// moves already-packed rows rather than re-encoding them.
+    pub fn write_reserved(&mut self, rows: R) {
+        assert!(
+            self.reserved > 0,
+            "write_reserved on a grow-on-demand store"
+        );
+        assert_eq!(self.len, 0, "write_reserved into a store holding rows");
+        let n = rows.rows();
+        assert!(
+            n <= self.reserved,
+            "seating {n} rows in a {}-row reservation",
+            self.reserved
+        );
+        if n == 0 {
+            return;
+        }
+        self.pages[0].write_rows(0, rows);
+        self.head = 0;
+        self.fill = n;
+        self.len = n;
+        self.grow_read();
+    }
+
+    /// How many rows of the reserved page a reader should take, or `None` when
+    /// the pages are handed over whole.
+    ///
+    /// `head + len` rounded up to [`Pages::reserved`]'s epoch. Rounding is what
+    /// keeps the number STILL: a reader that took exactly `head + len` would
+    /// change its shape every decode step, and a shape that moves every step is
+    /// a fresh kernel compilation and a dead graph capture. Rounding up to an
+    /// epoch changes it once per epoch instead, at the cost of carrying at most
+    /// `epoch - 1` dead rows -- which the reader masks, exactly as it already
+    /// masks the dead half of a capacity page.
+    pub fn read_rows(&self) -> Option<usize> {
+        (self.reserved > 0).then_some(self.read)
+    }
+
+    /// Pull the live rows back to row 0 of the reserved page.
+    ///
+    /// The reserved arm's answer to a dead prefix: `drop_front` never cuts, so
+    /// a windowed layer's `head` would otherwise walk the whole reservation and
+    /// take the read window with it. One copy of `len` rows resets it. The
+    /// buffer does not move and no allocation happens -- the rows are read out
+    /// of the page and written back into the front of the same page.
+    ///
+    /// Nothing about the CONTENT changes, so the caller's `base` (the absolute
+    /// position of logical row 0) is untouched. What does change is every
+    /// offset a captured region baked in, which is why the step that compacts
+    /// is not a replayable one -- see [`Pages::append_is_in_place`].
+    fn compact(&mut self) {
+        debug_assert!(self.reserved > 0 && self.pages.len() == 1);
+        if self.head == 0 {
+            return;
+        }
+        if self.len > 0 {
+            let live = self.pages[0].slice_rows(self.head, self.head + self.len);
+            self.pages[0].write_rows(0, live);
+        }
+        self.fill = self.len;
+        self.head = 0;
     }
 
     /// Real rows in page `i`: [`Pages::fill`] for the page being written, the
@@ -209,10 +390,45 @@ impl<R: PageRows> Pages<R> {
     /// Asked BEFORE the step, and pure, so the caller can choose the lane
     /// rather than discover mid-write that it chose wrong.
     pub fn append_is_in_place(&self, n: usize) -> bool {
+        if self.reserved > 0 {
+            // Two conditions, and the second one is the reserved arm's own.
+            // The write stays inside the page for the whole reservation, which
+            // is the point -- but a reader's row count is `stored` rounded up
+            // to an epoch, and a captured region baked THAT in as a shape. So
+            // the step that grows the read window is not replayable either,
+            // even though nothing was allocated and nothing moved.
+            return self.pages.len() == 1
+                && self.fill + n <= self.reserved
+                && self.read_rows() == Some(self.window_rows(self.stored() + n));
+        }
         match self.pages.last().map(|p| p.rows()) {
             Some(cap) => self.fill + n <= cap && self.pages.len() <= MAX_PAGES,
             None => false,
         }
+    }
+
+    /// What [`Pages::read_rows`] would be if the store held `stored` rows.
+    ///
+    /// Monotone in the CURRENT window, which is the whole trick -- see the
+    /// `read` field. Never zero either: an empty store still has to hand its
+    /// reader a buffer with a shape, and a zero-row dequant is not a shape any
+    /// kernel here is written for.
+    fn window_rows(&self, stored: usize) -> usize {
+        self.read
+            .max(stored.next_multiple_of(self.epoch))
+            .max(self.epoch)
+            .min(self.reserved)
+    }
+
+    /// Let the read window catch up with the rows, after an append.
+    ///
+    /// A no-op on the grow-on-demand arm, and that is a guard rather than a
+    /// nicety: `epoch` is zero there and `next_multiple_of(0)` divides by zero.
+    fn grow_read(&mut self) {
+        if self.reserved == 0 {
+            return;
+        }
+        self.read = self.window_rows(self.stored());
     }
 
     /// The same question for the sliding window's advance.
@@ -229,6 +445,14 @@ impl<R: PageRows> Pages<R> {
             return false;
         }
         let head = self.head + n;
+        if self.reserved > 0 {
+            // Neither a release nor a cut is possible here -- there is one page
+            // and it is never given up. What bounds the answer instead is
+            // `compact`, which pulls the live rows back to row 0 once the dead
+            // prefix reaches an epoch, and which is a device write rather than
+            // bookkeeping.
+            return head < self.epoch && head < self.rows_at(0);
+        }
         head < PAGE && !self.pages.is_empty() && head < self.rows_at(0)
     }
 
@@ -254,6 +478,11 @@ impl<R: PageRows> Pages<R> {
         );
         self.fill += n;
         self.len += n;
+        // A no-op by construction -- `append_is_in_place` refused the step
+        // where the window would move -- and here anyway, so the replayed
+        // path and the eager one cannot drift apart in a way only a long run
+        // would show.
+        self.grow_read();
     }
 
     /// Record the window advance that goes with it.
@@ -323,6 +552,29 @@ impl<R: PageRows> Pages<R> {
         if n == 0 {
             return;
         }
+        if self.reserved > 0 {
+            // The reserved arm has exactly one path: write in place. Reclaim
+            // the dead prefix first if the tail has reached the end of the
+            // reservation -- that is the only thing standing between a
+            // windowed layer and a page it has walked off the end of.
+            if self.fill + n > self.reserved {
+                self.compact();
+            }
+            assert!(
+                self.fill + n <= self.reserved,
+                "an append of {n} rows past a KV reservation of {} (head {}, live {}) -- the \
+                 sequence is longer than the context this run reserved for",
+                self.reserved,
+                self.head,
+                self.len
+            );
+            let at = self.fill;
+            self.pages[0].write_rows(at, rows);
+            self.fill += n;
+            self.len += n;
+            self.grow_read();
+            return;
+        }
         let mut written = 0usize;
         // Room in the page being written?
         //
@@ -381,6 +633,16 @@ impl<R: PageRows> Pages<R> {
     pub fn drop_front(&mut self, n: usize) {
         assert!(n <= self.len, "dropping {n} of {} rows", self.len);
         self.len -= n;
+        if self.reserved > 0 {
+            // No release and no cut: the page stays, and the dead prefix is
+            // bounded by a compaction rather than by cutting the buffer up.
+            // Emptying is the same -- the reservation outlives the rows in it.
+            self.head += n;
+            if self.len == 0 || self.head >= self.epoch {
+                self.compact();
+            }
+            return;
+        }
         if self.len == 0 {
             self.pages.clear();
             self.head = 0;
@@ -421,6 +683,18 @@ impl<R: PageRows> Pages<R> {
     pub fn truncate(&mut self, keep: usize) {
         assert!(keep <= self.len, "keeping {keep} of {} rows", self.len);
         if keep == self.len {
+            return;
+        }
+        if self.reserved > 0 {
+            // The rejected rows stay in the page as dead ones, exactly as they
+            // do on the grow-on-demand arm -- `fill` simply stops ahead of
+            // them. There is no capacity to re-open, because the capacity is
+            // the reservation and it does not change.
+            self.len = keep;
+            self.fill = self.head + keep;
+            if keep == 0 {
+                self.compact();
+            }
             return;
         }
         self.len = keep;
@@ -501,6 +775,12 @@ impl<R: PageRows> Pages<R> {
     /// land on a page boundary, because a shared partial page would be written
     /// through by whichever store appended next.
     pub fn share_prefix(&self, rows: usize) -> Option<Self> {
+        // A reserved store cannot share: its one page is the buffer it goes on
+        // writing into, so a second store holding a handle to it would watch
+        // its "shared prefix" be overwritten by the next append.
+        if self.reserved > 0 {
+            return None;
+        }
         if self.head != 0 || rows > self.len || rows % PAGE != 0 {
             return None;
         }
@@ -533,11 +813,56 @@ impl<R: PageRows> Pages<R> {
             head: 0,
             len: rows,
             fill,
+            reserved: 0,
+            epoch: 0,
+            read: 0,
         })
     }
 
     /// Panics unless every documented invariant holds.
     pub fn assert_sound(&self, width: usize) {
+        if self.reserved > 0 {
+            assert_eq!(
+                self.pages.len(),
+                1,
+                "a reserved store grew to {} pages",
+                self.pages.len()
+            );
+            assert!(
+                self.head < self.epoch,
+                "head {} has reached the {}-row epoch without compacting",
+                self.head,
+                self.epoch
+            );
+            assert_eq!(
+                self.pages[0].rows(),
+                self.reserved,
+                "the reserved page is {} rows against a {}-row reservation",
+                self.pages[0].rows(),
+                self.reserved
+            );
+            assert_eq!(
+                self.fill,
+                self.stored(),
+                "fill {} against head {} + len {} -- the one page holds every row",
+                self.fill,
+                self.head,
+                self.len
+            );
+            assert_eq!(
+                self.pages[0].width(),
+                width,
+                "the reserved page is not {width} wide"
+            );
+            assert!(
+                self.read >= self.stored() && self.read <= self.reserved,
+                "a read window of {} against {} stored rows in a {}-row reservation",
+                self.read,
+                self.stored(),
+                self.reserved
+            );
+            return;
+        }
         assert!(self.head < PAGE, "head {} is a whole page", self.head);
         let stored = self.stored();
         assert!(
@@ -648,6 +973,36 @@ impl<B: Backend> PageStore<B> {
         }
     }
 
+    /// An empty store whose one page is allocated NOW, at `rows` rows, and
+    /// never re-allocated. See [`Pages::reserved`].
+    pub fn reserved(width: usize, rows: usize, epoch: usize, dev: &B::Device) -> Self {
+        let page = Tensor::<B, 2>::zeros([rows, width], dev);
+        Self {
+            pages: Pages::reserved(page, rows, epoch),
+            width,
+        }
+    }
+
+    /// Rows this store reserved, or `None` on the grow-on-demand arm.
+    pub fn reservation(&self) -> Option<usize> {
+        self.pages.reservation()
+    }
+
+    /// Move this store's RETAINED rows into a fresh reservation of `rows`.
+    /// See [`Fp4PageStore::into_reserved`].
+    pub fn into_reserved(self, rows: usize, epoch: usize, dev: &B::Device) -> Self {
+        let live = self.pages.len();
+        assert!(
+            live <= rows,
+            "{live} retained rows do not fit a {rows}-row reservation"
+        );
+        let mut out = Self::reserved(self.width, rows, epoch, dev);
+        if let Some(held) = self.pages.gather() {
+            out.pages.write_reserved(held);
+        }
+        out
+    }
+
     /// Logical rows currently held.
     pub fn len(&self) -> usize {
         self.pages.len()
@@ -731,8 +1086,21 @@ impl<B: Backend> PageStore<B> {
     /// The pages whole and in order, covering `head() + len()` rows.
     ///
     /// The read that does not concatenate; see [`Pages::parts`].
+    ///
+    /// A reserved store cuts its one page down to [`Pages::read_rows`] first,
+    /// because handing over a whole reservation would make every reader walk
+    /// rows nothing has ever written. On the dense arm that cut is a COPY --
+    /// Burn's `slice` allocates -- which is one more reason the reserved arm is
+    /// scoped to the NVFP4 decode path, where the same cut is free.
     pub fn parts(&self) -> Vec<Tensor<B, 2>> {
-        self.pages.parts()
+        match self.pages.read_rows() {
+            Some(rows) => self
+                .pages
+                .first()
+                .map(|p| vec![p.slice_rows(0, rows)])
+                .unwrap_or_default(),
+            None => self.pages.parts(),
+        }
     }
 
     /// Share the first `rows` logical rows with a new store, without copying.
@@ -1071,6 +1439,94 @@ impl Fp4PageStore {
         }
     }
 
+    /// An empty store whose one NVFP4 page is allocated NOW, at `rows` rows,
+    /// and never re-allocated.
+    ///
+    /// Zeroed rather than uninitialised, for the reason [`PageRows::zeroed`]
+    /// gives: the read hands over rows past `fill`, they reach the attention
+    /// products, and a dead row has to be finite. Zero codes and zero scales
+    /// dequantize to zero.
+    ///
+    /// The two buffers are `[rows, width / 8]` and `[rows, width / 64]` `I32`,
+    /// which is 4.5 bits a value: 576 bytes for a 1024-wide row, against the
+    /// 2048 a BF16 row of the same width would take.
+    pub fn reserved(
+        width: usize,
+        dtype: DType,
+        rows: usize,
+        epoch: usize,
+        dev: &burn::backend::cuda::CudaDevice,
+    ) -> Self {
+        assert!(
+            width > 0 && width.is_multiple_of(FP4_ROW_ALIGN),
+            "an NVFP4 KV row must be a positive multiple of {FP4_ROW_ALIGN}, got {width}"
+        );
+        assert!(
+            matches!(dtype, DType::F32 | DType::BF16),
+            "an NVFP4 KV store quantizes from f32 or bf16, not {dtype:?}"
+        );
+        let codes = Tensor::<Bk, 2, Int>::zeros([rows, width / 8], dev);
+        let scales = Tensor::<Bk, 2, Int>::zeros([rows, width / 64], dev);
+        // The client comes from a tensor that is already on the device, for the
+        // reason `client` documents: two `CudaRuntime::client(&Default)` calls
+        // are MEANT to return the same one.
+        let client = seam::client_of(&Tensor::<Bk, 2>::zeros([1, 1], dev));
+        let page = Fp4Rows {
+            codes,
+            scales,
+            width,
+        };
+        Self {
+            pages: Pages::reserved(page, rows, epoch),
+            width,
+            dtype,
+            client: Some(client),
+        }
+    }
+
+    /// Rows this store reserved, or `None` on the grow-on-demand arm.
+    pub fn reservation(&self) -> Option<usize> {
+        self.pages.reservation()
+    }
+
+    /// Move this store's RETAINED rows into a fresh reservation of `rows`.
+    ///
+    /// The seam between a prefill and a reserved decode. A prefill appends the
+    /// whole prompt in one call and a windowed layer then throws most of it
+    /// away, so reserving before the prefill would size a local layer's
+    /// reservation by the PROMPT rather than by its window -- 3732 rows a store
+    /// instead of 1024, on thirty-five of forty-two layers. Reserving after the
+    /// trim sizes it by what is actually kept.
+    ///
+    /// The rows move PACKED. `gather` joins codes and scales as bytes and
+    /// `write_rows` writes them as bytes, so a row that was quantized once at
+    /// the prefill is still carrying exactly that one rounding. Nothing here
+    /// dequantizes and re-quantizes, which would be a second rounding and would
+    /// make the reserved arm numerically different from the arm it is supposed
+    /// to be a relocation of.
+    pub fn into_reserved(
+        self,
+        rows: usize,
+        epoch: usize,
+        dev: &burn::backend::cuda::CudaDevice,
+    ) -> Self {
+        let live = self.pages.len();
+        assert!(
+            live <= rows,
+            "{live} retained rows do not fit a {rows}-row reservation"
+        );
+        let mut out = Self::reserved(self.width, self.dtype, rows, epoch, dev);
+        if let Some(packed) = self.pages.gather() {
+            out.pages.write_reserved(packed);
+        }
+        // Keep the client the rows were actually allocated on, if there was
+        // one: `reserved` had to invent one from the device.
+        if let Some(c) = self.client {
+            out.client = Some(c);
+        }
+        out
+    }
+
     pub fn len(&self) -> usize {
         self.pages.len()
     }
@@ -1187,7 +1643,19 @@ impl Fp4PageStore {
     /// is the read path this arm needs to be worth its rounding: as
     /// [`fp4_kv`] says, materializing turns 4.5 bits a value into a 16-bit
     /// round trip, i.e. MORE traffic than the BF16 cache it replaces.
+    ///
+    /// A RESERVED store hands over one chunk: the first [`Pages::read_rows`]
+    /// rows of its one page. That cut costs nothing at all, and the reason is
+    /// worth saying plainly -- the dequant kernel is told its row count as a
+    /// SCALAR and indexes row-major from the base of the buffer, so reading a
+    /// prefix is a smaller `rows` argument against the same handle. No slice,
+    /// no copy, and the address it reads from is the address it read from on
+    /// step one.
     pub fn parts(&self, dev: &burn::backend::cuda::CudaDevice) -> Vec<Tensor<Bk, 2>> {
+        if let Some(rows) = self.pages.read_rows() {
+            let page = self.pages.first().expect("a reserved store has its page");
+            return vec![self.dequantize_rows(page.clone(), rows, dev)];
+        }
         self.pages
             .parts()
             .into_iter()
@@ -1198,6 +1666,25 @@ impl Fp4PageStore {
     /// One run of packed rows back to the dtype it was appended in.
     fn dequantize(&self, rows: Fp4Rows, dev: &burn::backend::cuda::CudaDevice) -> Tensor<Bk, 2> {
         let n = rows.rows();
+        self.dequantize_rows(rows, n, dev)
+    }
+
+    /// [`Fp4PageStore::dequantize`] over a PREFIX of `rows`.
+    ///
+    /// `n` may be fewer rows than the buffers hold. That is not a slice: the
+    /// codes and scales are row-major and the kernel takes its row count as a
+    /// scalar, so a shorter count reads a shorter prefix of the same bytes.
+    fn dequantize_rows(
+        &self,
+        rows: Fp4Rows,
+        n: usize,
+        dev: &burn::backend::cuda::CudaDevice,
+    ) -> Tensor<Bk, 2> {
+        assert!(
+            n <= rows.rows(),
+            "a {n}-row read of a {}-row page",
+            rows.rows()
+        );
         let client = self
             .client
             .clone()
@@ -1260,6 +1747,14 @@ impl<B: Backend> KvStore<B> {
         match self {
             Self::Wide(s) => s.width(),
             Self::Fp4(s) => s.width(),
+        }
+    }
+
+    /// Rows this store reserved, or `None` on the grow-on-demand arm.
+    pub fn reservation(&self) -> Option<usize> {
+        match self {
+            Self::Wide(s) => s.reservation(),
+            Self::Fp4(s) => s.reservation(),
         }
     }
 
@@ -1352,6 +1847,38 @@ impl KvStore<Bk> {
         }
     }
 
+    /// An empty store whose pages are allocated NOW and never re-allocated.
+    ///
+    /// Same arm choice as [`KvStore::new`], because the reservation is about
+    /// WHERE the rows live and not about what they are.
+    pub fn reserved(
+        width: usize,
+        dtype: DType,
+        rows: usize,
+        epoch: usize,
+        dev: &burn::backend::cuda::CudaDevice,
+    ) -> Self {
+        if fp4_kv_now() && width > 0 && width.is_multiple_of(FP4_ROW_ALIGN) {
+            Self::Fp4(Fp4PageStore::reserved(width, dtype, rows, epoch, dev))
+        } else {
+            Self::Wide(PageStore::reserved(width, rows, epoch, dev))
+        }
+    }
+
+    /// Move this store's RETAINED rows into a fresh reservation of `rows`.
+    /// See [`Fp4PageStore::into_reserved`].
+    pub fn into_reserved(
+        self,
+        rows: usize,
+        epoch: usize,
+        dev: &burn::backend::cuda::CudaDevice,
+    ) -> Self {
+        match self {
+            Self::Wide(s) => Self::Wide(s.into_reserved(rows, epoch, dev)),
+            Self::Fp4(s) => Self::Fp4(s.into_reserved(rows, epoch, dev)),
+        }
+    }
+
     /// An empty dense store — the arm that ignores [`fp4_kv`].
     pub fn wide(width: usize) -> Self {
         Self::Wide(PageStore::new(width))
@@ -1403,6 +1930,221 @@ impl KvStore<Bk> {
             Self::Wide(s) => s.head(),
             Self::Fp4(s) => s.head(),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The reservation policy
+// ---------------------------------------------------------------------------
+
+/// Rows a windowed store keeps beyond its window, and how far the read window
+/// is rounded up. **`INK_KV_EPOCH`, default 512 rows.**
+///
+/// This is the reserved arm's ONE knob, and it is the replay epoch measured in
+/// decode steps. Two things happen once per epoch and not otherwise:
+/// [`Pages::read_rows`] grows by one epoch, and a windowed store's
+/// [`Pages::compact`] pulls its live rows back to row 0. Both change something
+/// a captured region baked in, so both end a replay run -- and between them
+/// nothing does, which is the whole point of reserving.
+///
+/// ## What a larger epoch costs, per store per layer per decode step
+///
+/// Dead rows in the read window, and on the NVFP4 arm a dead row is a row the
+/// dequant kernel writes for nothing. At Inkling's 1024-wide KV row that is
+/// `2 KiB` of BF16 output per dead row, and the window carries at most
+/// `epoch - 1` of them.
+///
+/// * A GLOBAL store (7 of 42 layers) reads `fill` rounded up, so it carries a
+///   half-epoch on average: at 512 that is ~0.5 MiB written per store per
+///   layer-step, 7 MiB a step over both stores and all seven layers, against
+///   the ~11.6 GB of weights a 42-layer decode step reads. Under 0.1%.
+/// * A LOCAL store (35 of 42) reads `head + 512` rounded up, and `head` runs to
+///   a full epoch before compacting -- so its window is up to `window + epoch`
+///   rows against the 512 it needs. At 512 that is 1024 rows against 512, i.e.
+///   ~1 MiB extra per store per layer-step and ~70 MiB a step over both stores
+///   and all thirty-five layers. Around 0.6% of the same 11.6 GB.
+///
+/// So 512 buys a 4x longer replay epoch than the 128-row page it replaces for
+/// well under 1% of the step's traffic, and 4096 would buy 32x for something
+/// closer to 5%. It is a knob and not a constant because that trade is a
+/// property of the deployment, not of this file.
+pub fn kv_epoch() -> usize {
+    static EPOCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(|| {
+        std::env::var("INK_KV_EPOCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n: &usize| *n >= 1)
+            .unwrap_or(512)
+    })
+}
+
+/// The configured KV reservation, in TOKENS of context, or `None` when the
+/// decode path grows its pages on demand. **`INK_KV_PREALLOC`, default off.**
+///
+/// `INK_KV_PREALLOC=<n>` reserves for `n` tokens; `INK_KV_PREALLOC=max` reserves
+/// for the model's declared `model_max_length`, which reaches this module
+/// through [`note_model_max_length`] because this file does not read a
+/// checkpoint.
+///
+/// Off by default because it is a memory reservation with a real number on it
+/// and nobody should discover it by upgrading. See [`KvPlan::report`] for what
+/// that number is on this model.
+pub fn kv_prealloc() -> Option<usize> {
+    static WANT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let raw = WANT.get_or_init(|| std::env::var("INK_KV_PREALLOC").ok());
+    match raw.as_deref() {
+        None | Some("") | Some("0") | Some("off") => None,
+        Some("max") | Some("1") | Some("on") => Some(model_max_length()),
+        Some(n) => match n.parse::<usize>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => {
+                panic!("INK_KV_PREALLOC={n:?} is not a token count, \"max\", \"on\" or \"off\"")
+            }
+        },
+    }
+}
+
+/// Whether this run decodes a BATCH of sequences rather than one.
+///
+/// Read here and not passed in because the alternative is threading a flag
+/// through the prefill for one guard; see [`KvPlan::from_env`] for why the
+/// guard exists at all. `INK_SLOTS` is parsed exactly as the binary parses it,
+/// so the two cannot disagree about what "a batch" means.
+fn slot_lane() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("INK_SLOTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
+            > 1
+    })
+}
+
+static MAX_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Tell this module the checkpoint's declared `model_max_length`.
+///
+/// Called from the admission gate, which is the one place in the library that
+/// holds an `InklingTextConfig` and runs once before the first token. It is
+/// what makes `INK_KV_PREALLOC=max` mean anything.
+pub fn note_model_max_length(n: usize) {
+    MAX_LEN.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What [`note_model_max_length`] was told, panicking if nothing was.
+fn model_max_length() -> usize {
+    match MAX_LEN.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => panic!(
+            "INK_KV_PREALLOC=max wants the checkpoint's model_max_length and nothing has told \
+             this process what it is -- pass an explicit token count instead"
+        ),
+        n => n,
+    }
+}
+
+/// How many rows one KV store reserves, and how much that is in bytes.
+///
+/// One value rather than a scatter of arithmetic, because the store, the
+/// admission gate and the startup report must not be able to disagree about it
+/// -- the disagreement they would have is "the gate says 1.3 GiB and the run
+/// takes 7.9", which is the failure this type exists to prevent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvPlan {
+    /// Tokens of context the run is reserving for.
+    pub context: usize,
+    /// Rows one GLOBAL store reserves: the whole context.
+    pub global_rows: usize,
+    /// Rows one LOCAL store reserves: its window plus one epoch, which is all a
+    /// compacting store can ever hold. NOT the context -- multiplying the
+    /// context by all 42 layers over-counts this model by 5.98x.
+    pub local_rows: usize,
+    /// See [`kv_epoch`].
+    pub epoch: usize,
+}
+
+impl KvPlan {
+    /// The plan for a `context`-token run of a model with this window.
+    pub fn new(context: usize, window: usize) -> Self {
+        let epoch = kv_epoch();
+        Self {
+            context,
+            global_rows: context.next_multiple_of(epoch).max(epoch),
+            local_rows: (window + epoch).next_multiple_of(epoch),
+            epoch,
+        }
+    }
+
+    /// The configured plan, or `None` when preallocation is off -- or when the
+    /// run is on a lane this is not scoped to.
+    ///
+    /// `INK_SLOTS=b` is the one such lane. Its batch lives in
+    /// [`super::burn::SlotCache`], which is built by MATERIALISING each
+    /// prefilled [`super::burn::AttnCache`] and then dropping it -- so a
+    /// reservation taken at the end of a prefill would be allocated, copied out
+    /// of, and thrown away, once per slot per layer. That is not a correctness
+    /// problem and it IS a memory-behaviour change to a lane this was not asked
+    /// to touch, which is the same thing as a silent one. So the slot lane is
+    /// refused here rather than left to discover it.
+    pub fn from_env(window: usize) -> Option<Self> {
+        if slot_lane() {
+            return None;
+        }
+        kv_prealloc().map(|context| Self::new(context, window))
+    }
+
+    /// Rows a store reserves for a layer with this window.
+    pub fn rows_for(&self, window: Option<usize>) -> usize {
+        match window {
+            Some(w) => self
+                .local_rows
+                .max((w + self.epoch).next_multiple_of(self.epoch)),
+            None => self.global_rows,
+        }
+    }
+
+    /// Bytes one NVFP4 row of `width` logical columns occupies.
+    ///
+    /// `width / 8` code words and `width / 64` scale words, both `u32`: 576
+    /// bytes for a 1024-wide row. That is 4.5 bits a value, not 16 -- writing
+    /// it as `width * 2` would over-charge this reservation by 3.56x.
+    pub const fn row_bytes(width: usize) -> u64 {
+        ((width / 8) + (width / 64)) as u64 * 4
+    }
+
+    /// Bytes this plan reserves, over `globals` global layers and `locals`
+    /// local ones, counting BOTH stores (keys and values) of each.
+    pub fn bytes(&self, globals: usize, locals: usize, width: usize) -> u64 {
+        let per = Self::row_bytes(width);
+        2 * (globals as u64 * self.global_rows as u64 + locals as u64 * self.local_rows as u64)
+            * per
+    }
+
+    /// One line saying what was reserved, with its framing rule attached.
+    ///
+    /// The framing is the load-bearing part: the number is per RUN and per
+    /// NODE, it is the reservation and not a peak, and it counts retained rows
+    /// rather than context times layers. That last distinction is worth 5.98x
+    /// on this model and is exactly the arithmetic error this reports against.
+    pub fn report(&self, globals: usize, locals: usize, width: usize) -> String {
+        const GIB: f64 = (1u64 << 30) as f64;
+        let bytes = self.bytes(globals, locals, width);
+        let rows = globals * self.global_rows + locals * self.local_rows;
+        format!(
+            "  KV preallocated: {:.3} GiB reserved once for this NODE's {} attention layers \
+             ({globals} global x {} rows + {locals} local x {} rows = {rows} retained rows, K and \
+             V, NVFP4 at {} bytes a {width}-wide row), sized for {} tokens of context, epoch {} \
+             rows. Held for the life of the process: never freed, never moved.",
+            bytes as f64 / GIB,
+            globals + locals,
+            self.global_rows,
+            self.local_rows,
+            Self::row_bytes(width),
+            self.context,
+            self.epoch,
+        )
     }
 }
 
@@ -1974,5 +2716,472 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // The RESERVED arm
+    //
+    // What these check is not "the reservation works" -- it is the one claim
+    // the reservation is FOR: that the page structure stops moving. Every
+    // assertion below is either "this predicate keeps answering yes" or "these
+    // are the same rows the grow-on-demand arm holds", because those are the
+    // two ways preallocation can be wrong and the ways it can be wrong
+    // silently.
+    // -----------------------------------------------------------------------
+
+    /// How many decode steps a store refuses to replay across a run.
+    ///
+    /// The number the whole change is about. On the grow-on-demand arm it is
+    /// once per [`PAGE`] rows, because that is when a page is pushed; on the
+    /// reserved arm it is once per epoch, because nothing is pushed and the
+    /// only thing left that moves is the read window's row count.
+    fn refusals(reserved: Option<(usize, usize)>, steps: usize, window: Option<usize>) -> usize {
+        let mut s = match reserved {
+            Some((rows, epoch)) => PageStore::<B>::reserved(W, rows, epoch, &Default::default()),
+            None => PageStore::<B>::new(W),
+        };
+        let mut refused = 0usize;
+        for i in 0..steps {
+            let drop = match window {
+                Some(w) if s.len() + 1 > w => s.len() + 1 - w,
+                _ => 0,
+            };
+            if !s.append_is_in_place(1) || !s.drop_is_bookkeeping_only(drop) {
+                refused += 1;
+            }
+            s.append(rows(i, 1));
+            if drop > 0 {
+                s.drop_front(drop);
+            }
+            s.assert_sound();
+        }
+        refused
+    }
+
+    #[test]
+    fn a_reservation_moves_the_replay_boundary_from_a_page_to_an_epoch() {
+        const STEPS: usize = 2048;
+        const EPOCH: usize = 512;
+        // Grow-on-demand: a page is pushed every PAGE rows and every push is a
+        // buffer no graph node points at.
+        // ...plus the very first step, which has no page at all to write into.
+        let demand = refusals(None, STEPS, None);
+        assert_eq!(
+            demand,
+            STEPS / PAGE,
+            "the on-demand arm should refuse once per {PAGE}-row page"
+        );
+        // Reserved: nothing is ever pushed -- not even on step one, because the
+        // page is already there -- so the only refusal left is the step per
+        // epoch on which the READ window grows a row count.
+        let held = refusals(Some((STEPS + EPOCH, EPOCH)), STEPS, None);
+        assert_eq!(
+            held,
+            STEPS / EPOCH - 1,
+            "the reserved arm should refuse once per {EPOCH}-row epoch and never at the head"
+        );
+        assert!(
+            demand >= 5 * held,
+            "an epoch of {EPOCH} against a page of {PAGE} should be a 4x longer replay run \
+             at worst, got {demand} refusals against {held}"
+        );
+    }
+
+    #[test]
+    fn a_reserved_window_compacts_rather_than_walking_off_its_page() {
+        // A local layer: window 512, one row a step, for many epochs. The
+        // reservation is `window + epoch` and nothing more -- which is the
+        // arithmetic that keeps 35 of 42 layers from being charged the whole
+        // context.
+        const WINDOW: usize = 64;
+        const EPOCH: usize = 32;
+        let mut s = PageStore::<B>::reserved(W, WINDOW + EPOCH, EPOCH, &Default::default());
+        s.append(rows(0, WINDOW));
+        s.assert_sound();
+        for i in 0..8 * EPOCH {
+            s.append(rows(WINDOW + i, 1));
+            s.drop_front(1);
+            s.assert_sound();
+            assert_eq!(s.len(), WINDOW, "the window changed size at step {i}");
+            assert_eq!(
+                s.reservation(),
+                Some(WINDOW + EPOCH),
+                "the reservation moved at step {i}"
+            );
+        }
+        // The rows are the last WINDOW appended, in order, after eight
+        // compactions -- which is the thing a ring buffer gets wrong.
+        let n = WINDOW + 8 * EPOCH;
+        let want: Vec<usize> = (n - WINDOW..n).collect();
+        assert_eq!(contents(&s), want);
+    }
+
+    #[test]
+    fn the_reserved_arm_holds_exactly_the_rows_the_on_demand_arm_does() {
+        // Both ends and a rollback, on both arms, from the same script. A
+        // reservation is supposed to be a RELOCATION of the cache and nothing
+        // else, so any disagreement here is the change being wrong.
+        let script = |s: &mut PageStore<B>| {
+            s.append(rows(0, 3 * PAGE + 7));
+            s.drop_front(PAGE + 3);
+            s.append(rows(3 * PAGE + 7, 40));
+            s.truncate(s.len() - 5);
+            s.append(rows(9000, 2));
+            s.drop_front(11);
+        };
+        let mut demand = PageStore::<B>::new(W);
+        script(&mut demand);
+        demand.assert_sound();
+        let mut held = PageStore::<B>::reserved(W, 8 * PAGE, PAGE, &Default::default());
+        script(&mut held);
+        held.assert_sound();
+        assert_eq!(held.len(), demand.len());
+        assert_eq!(contents(&held), contents(&demand));
+        assert_eq!(held.reservation(), Some(8 * PAGE));
+        assert_eq!(demand.reservation(), None);
+    }
+
+    #[test]
+    fn the_prefill_handover_moves_packed_rows_and_does_not_round_twice() {
+        // The seam `AttnCache::reserve_kv` uses. It must be a byte move: a
+        // dequantize-and-requantize would be a SECOND rounding, and the
+        // reserved arm would then differ numerically from the arm it is
+        // supposed to be a relocation of. Exact equality is the whole test.
+        let mut s = Fp4PageStore::new(FW, DType::F32);
+        s.append(frows(0, 2 * PAGE + 17));
+        s.drop_front(5);
+        let before: Vec<f32> = s.materialize(&fp4_dev()).into_data().to_vec().unwrap();
+        let held = s.into_reserved(4 * PAGE, PAGE, &fp4_dev());
+        held.assert_sound();
+        assert_eq!(held.reservation(), Some(4 * PAGE));
+        let after: Vec<f32> = held.materialize(&fp4_dev()).into_data().to_vec().unwrap();
+        assert_eq!(before, after, "the handover re-rounded the rows");
+        let want: Vec<usize> = (5..2 * PAGE + 17).collect();
+        assert_eq!(fcontents(&held), want);
+    }
+
+    #[test]
+    fn a_reserved_fp4_read_is_one_chunk_at_a_still_row_count() {
+        // The property the graph capture actually depends on: one run, at an
+        // address and a row count that do not move between steps.
+        let mut s = Fp4PageStore::new(FW, DType::F32);
+        s.append(frows(0, 300));
+        let mut s = s.into_reserved(2048, 512, &fp4_dev());
+        let shape = |s: &Fp4PageStore| {
+            let p = s.parts(&fp4_dev());
+            assert_eq!(p.len(), 1, "a reserved store reads as one chunk");
+            p[0].dims()[0]
+        };
+        let first = shape(&s);
+        assert_eq!(first, 512, "300 rows read at the 512-row epoch");
+        for i in 0..100 {
+            s.append(frows(300 + i, 1));
+            assert_eq!(shape(&s), first, "the read row count moved at step {i}");
+        }
+        // ...and it moves exactly once, when the epoch is crossed.
+        for i in 0..120 {
+            s.append(frows(400 + i, 1));
+        }
+        assert_eq!(shape(&s), 1024, "521 rows should read at two epochs");
+    }
+
+    #[test]
+    fn a_plan_charges_retained_rows_and_not_context_times_layers() {
+        // The 5.98x this exists to avoid. Inkling: 42 layers, 7 of them global,
+        // a 512-token window, a 1024-wide KV row.
+        const CTX: usize = 1 << 20;
+        const WIDTH: usize = 1024;
+        let plan = KvPlan::new(CTX, 512);
+        assert_eq!(plan.global_rows, CTX, "a global store reserves the context");
+        assert!(
+            plan.local_rows <= 512 + plan.epoch,
+            "a local store reserves its window and one epoch, got {}",
+            plan.local_rows
+        );
+        // 4.5 bits a value, not 16.
+        assert_eq!(KvPlan::row_bytes(WIDTH), 576);
+        let held = plan.bytes(7, 35, WIDTH);
+        // What the naive arithmetic would have charged.
+        let naive = 2u64 * 42 * CTX as u64 * KvPlan::row_bytes(WIDTH);
+        let ratio = naive as f64 / held as f64;
+        assert!(
+            (5.5..6.5).contains(&ratio),
+            "42 x context over-counts the retained rows by {ratio:.2}x, want ~5.98"
+        );
+        // The headline number, on a 119 GiB part.
+        let gib = held as f64 / (1u64 << 30) as f64;
+        assert!(
+            (7.5..8.5).contains(&gib),
+            "a 1M-token NVFP4 KV pool for 42 layers is {gib:.3} GiB, want ~7.9"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The paging core, on the HOST
+    //
+    // Everything above needs a GPU, which means the page arithmetic can only be
+    // checked on a machine that has one -- and the page arithmetic is the half
+    // of this file that has nothing to do with a device. `HostRows` is
+    // `PageRows` over a `Vec<usize>` of row labels, so the boundary cases run
+    // in a second on any machine and a mistake in `drop_front` stops being
+    // something you find out about after a forty-minute queue for a box.
+    // -----------------------------------------------------------------------
+
+    /// Rows that are just their own labels. Fixed-width, cuttable, rejoinable.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct HostRows {
+        rows: Vec<usize>,
+        width: usize,
+    }
+
+    impl HostRows {
+        fn of(from: usize, n: usize, width: usize) -> Self {
+            Self {
+                rows: (from..from + n).collect(),
+                width,
+            }
+        }
+    }
+
+    impl PageRows for HostRows {
+        fn rows(&self) -> usize {
+            self.rows.len()
+        }
+        fn width(&self) -> usize {
+            self.width
+        }
+        fn slice_rows(&self, from: usize, to: usize) -> Self {
+            Self {
+                rows: self.rows[from..to].to_vec(),
+                width: self.width,
+            }
+        }
+        fn concat(parts: Vec<Self>) -> Self {
+            let width = parts[0].width;
+            Self {
+                rows: parts.iter().flat_map(|p| p.rows.clone()).collect(),
+                width,
+            }
+        }
+        fn zeroed(&self, rows: usize) -> Self {
+            Self {
+                rows: vec![usize::MAX; rows],
+                width: self.width,
+            }
+        }
+        fn write_rows(&mut self, at: usize, src: Self) {
+            self.rows[at..at + src.rows.len()].clone_from_slice(&src.rows);
+        }
+    }
+
+    const HW: usize = 3;
+
+    fn host_reserved(rows: usize, epoch: usize) -> Pages<HostRows> {
+        Pages::reserved(
+            HostRows {
+                rows: vec![usize::MAX; rows],
+                width: HW,
+            },
+            rows,
+            epoch,
+        )
+    }
+
+    fn live(p: &Pages<HostRows>) -> Vec<usize> {
+        p.gather().map(|r| r.rows).unwrap_or_default()
+    }
+
+    /// The two arms, driven by the same script, must hold the same rows.
+    ///
+    /// A reservation is a RELOCATION of the cache and nothing else. Any
+    /// disagreement here is the change being wrong, and this is the cheapest
+    /// place in the repo to find that out.
+    fn both_arms(script: impl Fn(&mut Pages<HostRows>), rows: usize, epoch: usize) {
+        let mut demand = Pages::<HostRows>::new();
+        script(&mut demand);
+        demand.assert_sound(HW);
+        let mut held = host_reserved(rows, epoch);
+        script(&mut held);
+        held.assert_sound(HW);
+        assert_eq!(
+            held.len(),
+            demand.len(),
+            "the two arms hold different counts"
+        );
+        assert_eq!(
+            live(&held),
+            live(&demand),
+            "the two arms hold different rows"
+        );
+    }
+
+    #[test]
+    fn host_reserved_and_on_demand_agree_over_both_ends_and_a_rollback() {
+        both_arms(
+            |p| {
+                p.append(HostRows::of(0, 3 * PAGE + 7, HW));
+                p.drop_front(PAGE + 3);
+                p.append(HostRows::of(3 * PAGE + 7, 40, HW));
+                p.truncate(p.len() - 5);
+                p.append(HostRows::of(9000, 2, HW));
+                p.drop_front(11);
+            },
+            8 * PAGE,
+            PAGE,
+        );
+    }
+
+    #[test]
+    fn host_reserved_and_on_demand_agree_over_a_long_sliding_window() {
+        both_arms(
+            |p| {
+                p.append(HostRows::of(0, 64, HW));
+                for i in 0..600usize {
+                    p.append(HostRows::of(64 + i, 1, HW));
+                    if p.len() > 64 {
+                        p.drop_front(p.len() - 64);
+                    }
+                }
+            },
+            64 + 32,
+            32,
+        );
+    }
+
+    #[test]
+    fn host_reserved_and_on_demand_agree_when_a_batch_is_rejected_whole() {
+        both_arms(
+            |p| {
+                p.append(HostRows::of(0, 200, HW));
+                p.append(HostRows::of(200, 5, HW));
+                p.truncate(200);
+                p.append(HostRows::of(300, 5, HW));
+                p.truncate(0);
+                p.append(HostRows::of(400, 9, HW));
+            },
+            4 * PAGE,
+            PAGE,
+        );
+    }
+
+    #[test]
+    fn host_a_reservation_moves_the_replay_boundary_from_a_page_to_an_epoch() {
+        const STEPS: usize = 2048;
+        const EPOCH: usize = 512;
+        let count = |mut p: Pages<HostRows>| {
+            let mut refused = 0usize;
+            for i in 0..STEPS {
+                if !p.append_is_in_place(1) {
+                    refused += 1;
+                }
+                p.append(HostRows::of(i, 1, HW));
+                p.assert_sound(HW);
+            }
+            refused
+        };
+        let demand = count(Pages::<HostRows>::new());
+        assert_eq!(demand, STEPS / PAGE);
+        let held = count(host_reserved(STEPS + EPOCH, EPOCH));
+        assert_eq!(held, STEPS / EPOCH - 1);
+        assert!(demand >= 5 * held, "{demand} against {held}");
+    }
+
+    #[test]
+    fn host_a_reserved_window_never_refuses_more_than_once_an_epoch() {
+        // The claim `step_is_replayable` is made of, on the layer kind that
+        // used to bound it: a windowed store, where the on-demand arm refuses
+        // because `head` reaches a page and the reserved arm refuses only when
+        // it reaches an epoch.
+        const WINDOW: usize = 512;
+        const EPOCH: usize = 512;
+        const STEPS: usize = 4096;
+        let count = |mut p: Pages<HostRows>| {
+            p.append(HostRows::of(0, WINDOW, HW));
+            let mut refused = 0usize;
+            for i in 0..STEPS {
+                let drop = (p.len() + 1).saturating_sub(WINDOW);
+                if !p.append_is_in_place(1) || !p.drop_is_bookkeeping_only(drop) {
+                    refused += 1;
+                }
+                p.append(HostRows::of(WINDOW + i, 1, HW));
+                if drop > 0 {
+                    p.drop_front(drop);
+                }
+                p.assert_sound(HW);
+            }
+            refused
+        };
+        let demand = count(Pages::<HostRows>::new());
+        let held = count(host_reserved(WINDOW + EPOCH, EPOCH));
+        // One per epoch -- the compaction -- plus exactly one at the head,
+        // where the monotone read window settles from `window` to
+        // `window + epoch` and never moves again.
+        assert_eq!(
+            held,
+            STEPS / EPOCH + 1,
+            "a reserved window should refuse once an epoch plus once at the head"
+        );
+        assert!(
+            demand >= 4 * held,
+            "the on-demand window refused {demand} times and the reserved one {held}"
+        );
+    }
+
+    #[test]
+    fn host_a_replayed_reserved_run_keeps_the_same_bookkeeping_as_an_eager_one() {
+        // The path the graph lane actually drives. A replayed step runs no host
+        // code inside the region, so `note_appended` / `note_dropped` are the
+        // ONLY things that move the counters -- and if they drift from what the
+        // eager path would have done, the next eager step writes over the row
+        // this one wrote and nothing anywhere errors.
+        const WINDOW: usize = 512;
+        const EPOCH: usize = 256;
+        const STEPS: usize = 2000;
+        let mut eager = host_reserved(WINDOW + EPOCH, EPOCH);
+        let mut lane = host_reserved(WINDOW + EPOCH, EPOCH);
+        eager.append(HostRows::of(0, WINDOW, HW));
+        lane.append(HostRows::of(0, WINDOW, HW));
+        let mut replayed = 0usize;
+        for i in 0..STEPS {
+            let row = HostRows::of(WINDOW + i, 1, HW);
+            let drop = (eager.len() + 1).saturating_sub(WINDOW);
+            eager.append(row.clone());
+            if drop > 0 {
+                eager.drop_front(drop);
+            }
+            // The lane asks FIRST and pure, exactly as `step_is_replayable`
+            // does, and only then chooses which half of the step to run.
+            let can = lane.append_is_in_place(1) && lane.drop_is_bookkeeping_only(drop);
+            if can {
+                // The device write is pretended -- what is being checked is the
+                // counters, which is all a replay leaves to the host.
+                lane.pages[0].write_rows(lane.fill, row);
+                lane.note_appended(1);
+                if drop > 0 {
+                    lane.note_dropped(drop);
+                }
+                replayed += 1;
+            } else {
+                lane.append(row);
+                if drop > 0 {
+                    lane.drop_front(drop);
+                }
+            }
+            lane.assert_sound(HW);
+            assert_eq!(
+                (lane.len(), lane.head(), lane.read_rows()),
+                (eager.len(), eager.head(), eager.read_rows()),
+                "the replayed bookkeeping drifted at step {i}"
+            );
+        }
+        assert_eq!(
+            live(&lane),
+            live(&eager),
+            "the two runs hold different rows"
+        );
+        assert!(
+            replayed > STEPS - 2 * (STEPS / EPOCH + 2),
+            "only {replayed} of {STEPS} steps replayed"
+        );
     }
 }
