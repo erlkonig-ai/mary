@@ -99,7 +99,7 @@
 //! |---|---|---|
 //! | `Session::load` → READY | 35.3 | paid ONCE, per process |
 //! | first token, turn 0 | 9.838 | 5-token prompt, cold session, every layer's first bind |
-//! | first token, turn 1 | 0.579 | a 13-token DELTA, walked one position each |
+//! | first token, turn 1 | 0.579 | a 13-token DELTA, walked one position each — SUPERSEDED, see below |
 //! | first token, turns 2–3 | 0.044, 0.045 | no delta: ONE step against a warm cache |
 //! | decode | 0.709–0.716 / 16 tok | **44.3–44.8 ms PER STEP** |
 //!
@@ -136,6 +136,47 @@
 //! serving process measured its first token at 0.015 s and the client saw that
 //! token at 0.016 s — **~1 ms per turn for the pipe, the framing and the
 //! detokenizer**, against a 44 ms step.
+//!
+//! ## What the CARRY changed, and why the turn-1 row above is superseded
+//!
+//! That row is two changes stale, and both moved the quantity it names rather
+//! than the number: `Session::extend` now appends a delta in ONE BATCHED PASS
+//! instead of walking it, and a turn's delta is now one token WIDER than the
+//! client's, because the previous turn's last token rides at its head (see
+//! [`TurnEnd::carried`]). "13 walked positions at ~44 ms" is no longer what turn
+//! 1 does.
+//!
+//! Measured 2026-08-28, same box, same lock, same pile, same 0..21 range, the
+//! same probe arguments byte for byte — an A/B of two `inkling_serve` binaries
+//! that differ by the carry commit and nothing else:
+//!
+//! | | turn 0 | turn 1 | turns 2–3 |
+//! |---|---|---|---|
+//! | position, before | 20 | 48 | 64, 80 |
+//! | position, after | 20 | **49** | 65, 81 |
+//! | first token, before | 5.372 s | 1.248 s | 0.044 s |
+//! | first token, after | 5.921 s | 0.505 s | 0.044 s |
+//! | text | **byte-identical** | diverges | diverges |
+//!
+//! Read the position row first, because it is the whole mechanism: **+1 at turn
+//! 1 and +1 thereafter, never +2.** One token per turn WITH NEW CONTEXT is what
+//! was being lost, and turns 2–3 were never losing one — an empty delta reaches
+//! `extend(&[])`, which shortcuts to `Session::step` and does feed the token
+//! back. The defect was always exactly the turns that had something new to say.
+//!
+//! And the divergence begins where the mechanism says it must: turn 0 has no
+//! previous turn to carry from, so it is byte-identical across the change, and
+//! every turn after it differs. The seconds are one sample a cell and are not a
+//! measurement of the carry — one row of a batched pass cannot be read out of a
+//! turn that also pays a first-token latency — they are here to say the change
+//! did not cost a decode step, which a `step()`-based fix would have.
+//!
+//! **Neither side's text is the model's.** Both are the degenerate output of a
+//! PARTIAL STACK unembedding through layers it did not all run, which is
+//! structural (see the TP section below), so this A/B shows WHERE the divergence
+//! starts and cannot show whether the answer got better. The token-level
+//! correctness claim lives in `inkling_session --carry`, which compares against a
+//! session fed the identical sequence with the identical pass partition.
 //!
 //! # Tensor parallelism is above this, not inside it
 //!

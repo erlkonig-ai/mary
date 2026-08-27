@@ -605,10 +605,44 @@ fn batched_gate(session: &mut Session, prompt: &[usize], steps: usize) -> Result
 /// invariant: whether one missing token of context flips a greedy argmax is a
 /// property of this model and this prompt. A run in which DROPPED also agrees
 /// has proven nothing about the defect and says so in those words — it has not
-/// shown it absent. Measured 2026-08-27 at layers 0..21, `--gen 8`: a 10-token
-/// prompt diverged at token 0 and a 128-token one did not diverge at all, which
-/// is exactly the dependence on how much OTHER context there is that makes this
-/// a report rather than an assertion.
+/// shown it absent.
+///
+/// # What it measured, 2026-08-28, and the framing rule
+///
+/// One GB10 (`spark2`), advisory box lock held, release build, features
+/// `inkling-cuda,cuda-backend,import`, `work-inkling-complete.pile`, layers
+/// **0..21 of 42** (a PARTIAL STACK, so the tokens are diagnostic and only their
+/// AGREEMENT means anything), greedy, `--gen 8`, one sample an arm, no `INK_*`
+/// switch but the layer range. Agreement is counted as the length of the
+/// matching PREFIX of the eight generated tokens; seconds are for the APPEND —
+/// the `extend` call and nothing else — stated per PASS, not per token and not
+/// per turn.
+///
+/// | prompt | head/delta | CARRIED vs WHOLE | DROPPED vs WHOLE | ONE-PASS vs WHOLE | BATCHED vs WHOLE |
+/// |---|---|---|---|---|---|
+/// | 10 tok | 6/4 | **8/8** | 0/8 | 7/8 | 1/8 |
+/// | 128 tok | 85/43 | **8/8** | 1/8 | 1/8 | 8/8 |
+/// | 1024 tok | 682/342 | **8/8** | 2/8 | 2/8 | 2/8 |
+///
+/// Read the first column as the invariant and the rest as context for it.
+/// CARRIED is EXACT at every length, which is what an identical pass partition
+/// over identical tokens has to give. DROPPED shares that partition and differs
+/// only by the missing token, and it disagreed at every length — earlier the
+/// less other context there was to dilute it, which is the dependence that makes
+/// it a report. ONE-PASS and BATCHED disagree by REPARTITIONING ALONE, on the
+/// same tokens, at the same order of magnitude — which is exactly why neither
+/// may be the reference, and why the first version of this gate (which used
+/// ONE-PASS) could not have told a dropped token from a wider GEMM.
+///
+/// The appends, same run, per pass: at 1024 tokens a walked 343-row append cost
+/// **16.487 s** and the same rows in ONE pass cost **4.716 s** (13.7 ms a row),
+/// so the carried token rides at the head of a batch for a small fraction of the
+/// ~47 ms decode step that feeding it through [`Session::step`] would have cost.
+/// At 44 rows the batched pass was SLOWER than the walk (2.871 s against
+/// 1.962 s, 65.3 against 44.6 ms a row): the width has a fixed cost that only
+/// long deltas amortise. That is a property of the batched append and not of the
+/// carry — one sample an arm, so it is a flag for [`batched_gate`] and not a
+/// measurement of anything.
 fn carry_gate(session: &mut Session, prompt: &[usize], steps: usize) -> Result<()> {
     anyhow::ensure!(
         prompt.len() >= 6,
