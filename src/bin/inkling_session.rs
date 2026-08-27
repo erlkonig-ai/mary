@@ -199,14 +199,20 @@ fn main() -> Result<()> {
 ///
 /// **And the ratio is the finding, not the saving.** Taking and using a
 /// checkpoint is free — sub-millisecond, because it is handle clones and
-/// counters. What is not free is what comes after it: `Session::extend` walks
-/// the delta ONE POSITION AT A TIME (see its own doc for why), so a re-extended
-/// token costs a DECODE step where a prefilled one costs a batched pass —
-/// 47.4 against 11.32 ms at layers 0..21, a factor of **4.19**. So against the
-/// honest alternative (`reset` + one batched `prefill` of the whole new prefix)
-/// a rewind is a win only while the CHANGED SUFFIX is under **23.9%** of the
-/// prefix, and a loss above it. That crossover is a property of `extend`, not
-/// of the rewind: batching the delta would move it to 100%.
+/// counters. What was not free is what came after it: `Session::extend` walked
+/// the delta ONE POSITION AT A TIME, so a re-extended token cost a DECODE step
+/// where a prefilled one costs a batched pass — 47.4 against 11.32 ms at layers
+/// 0..21, a factor of **4.19**. So against the honest alternative (`reset` +
+/// one batched `prefill` of the whole new prefix) a rewind was a win only while
+/// the CHANGED SUFFIX was under **23.9%** of the prefix, and a loss above it.
+///
+/// That crossover was a property of `extend` rather than of the rewind, and it
+/// has since moved: `extend` batches (see its own doc), and [`batched_gate`]
+/// measures the same 320-token delta at **10.97 ms/token** against a warm
+/// batched prefill's 10.88 at the same layer range. **The crossover is 99.2%**
+/// — a rewind is now worth taking for any change short of the whole prompt, and
+/// the number above is kept only because it is what this gate measured on the
+/// day and what the argument was built from.
 fn rewind_gate(session: &mut Session, prompt: &[usize], steps: usize) -> Result<()> {
     anyhow::ensure!(
         prompt.len() >= 6,
@@ -392,6 +398,53 @@ fn rewind_gate(session: &mut Session, prompt: &[usize], steps: usize) -> Result<
 ///
 /// With the walked extend that bound was 11.32 / 47.4 = 23.9%. What it becomes
 /// is what this prints.
+///
+/// # What it measured, 2026-08-27, and the framing rule
+///
+/// One GB10 (`spark`), advisory box lock held, release build, features
+/// `inkling-cuda`, `inkling-small-complete.pile`, the same 960-token prompt
+/// [`rewind_gate`] uses split the same 640/320, `--gen 8`, greedy, page cache
+/// dropped before the run, no `INK_*` switch but the layer range. **Every
+/// figure is per TOKEN OF THE 320-TOKEN DELTA**, on that box, for that layer
+/// range — not per turn, not per prefilled token, and not for the whole
+/// 42-layer model. "rep 2" is the second run of that arm in the same process:
+/// the width's kernels are compiled and `target/autotune/` has an entry.
+///
+/// | per token of the delta | layers 0..6 | layers 0..21 |
+/// |---|---|---|
+/// | `extend`, WALKED — 1 row a pass | 19.42 ms | 46.92 ms |
+/// | `extend`, BATCHED — 320 rows, one pass | **3.42 ms** | **10.97 ms** |
+/// | `extend`, CHUNKED — 107 rows, three passes | 3.55 ms | 11.28 ms |
+/// | `prefill`, warm, batched, 640 rows | 3.38 ms | 10.88 ms |
+/// | decode step | 19.2 ms/step | 47.1 ms/step |
+/// | speedup, walked → batched | **5.68x** | **4.28x** |
+/// | rewind crossover | 17.4% → **98.9%** | 23.2% → **99.2%** |
+///
+/// The finding is the last two rows together. A batched append costs what a
+/// PREFILLED token costs — 10.97 against 10.88 at layers 0..21, within the
+/// spread — which is the ceiling, because a prefill is the same rows through
+/// the same GEMMs with no cache to read. So re-extending a changed suffix is no
+/// longer a different price from re-reading the prefix, and the rewind
+/// crossover moves from a quarter of the prefix to essentially all of it: a
+/// rewind is now worth taking for any change that is not the whole prompt.
+///
+/// **The first pass at a WIDTH costs extra, and it is a one-off.** cubecl keys
+/// compiled kernels on shape and burn's matmul autotune keys its choice the
+/// same way, so rep 1 of an arm pays for its width and rep 2 does not: 11.66
+/// against 10.97 (one new width) and 14.37 against 11.28 (two, because
+/// `div_ceil` splits 320 into 107+107+106) at layers 0..21. An earlier run on a
+/// COLD `target/autotune/` measured that chunked arm at 47.91 ms/token — 10.7 s
+/// over the delta — against 4.6 s for the same arm once the cache had entries
+/// for those widths, and that gap is not further isolated here. It is recorded
+/// because the autotune cache is on disk and per worktree, so a fresh checkout
+/// pays it once per width and a running process pays it never again — and
+/// because it is the reason `extend_batch` defaults wide enough that a
+/// conversational delta is ONE width rather than two.
+///
+/// The token streams agreed 8/8 across all three arms at layers 0..6 and parted
+/// after 3 at layers 0..21 — which is the reading above, from the other side:
+/// the arms' arithmetic differs in the last bits, six MoE layers do not amplify
+/// it into a different expert and twenty-one do.
 fn batched_gate(session: &mut Session, prompt: &[usize], steps: usize) -> Result<()> {
     anyhow::ensure!(
         prompt.len() >= 6,

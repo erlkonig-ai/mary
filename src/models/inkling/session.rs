@@ -170,6 +170,26 @@ pub struct SessionConfig {
     /// It may not exceed [`SessionConfig::prefill_budget`]: a batched append
     /// allocates activations as a function of its width exactly as a prefill
     /// does, and that budget is what admission reserved room for.
+    ///
+    /// # Why the default is WIDE rather than a tidy small number
+    ///
+    /// Because the cost of a pass is not linear in its width, and the
+    /// non-linearity is at the FIRST pass of each width rather than at any
+    /// particular size. cubecl keys its compiled kernels on shape and burn's
+    /// matmul autotune keys its choice the same way, so a pass at a width
+    /// nothing has run before pays for that width once and never again —
+    /// measured on a GB10 at layers 0..21 as 11.66 ms/token against 10.97 for
+    /// one new width, and 14.37 against 11.28 when `div_ceil` split the same
+    /// delta into 107+107+106 and so needed TWO. A default narrow enough to
+    /// split ordinary deltas would therefore pay that twice per turn for
+    /// nothing; 4096 makes a conversational delta one pass at one width.
+    ///
+    /// What it is still for is the case a wide default does not cover: a delta
+    /// so long that one pass of it is a resource problem rather than a shape
+    /// one. A batch is not trimmed until it commits, so a local layer holds
+    /// `window + extend_batch` rows for the duration of the pass, and the
+    /// fused attention's partial-output buffer is linear in the row count.
+    /// Both are bounded by this and by nothing else.
     pub extend_batch: usize,
 }
 
@@ -847,6 +867,14 @@ impl Session {
     /// batched prefill — 4.19x, paid by every turn in which a faculty returns
     /// output, because a command result, a recalled memory and a tool response
     /// are all known multi-token deltas.
+    ///
+    /// Batched, the same 320-token delta costs **10.97 ms a token** at layers
+    /// 0..21 and **3.42 ms** at 0..6, against 46.92 and 19.42 walked — 4.28x
+    /// and 5.68x. The number that says it is DONE rather than merely improved
+    /// is the one beside it: a warm batched `prefill` of the same prompt on the
+    /// same box costs 10.88 and 3.38, so an appended token now costs a
+    /// prefilled token, which is the floor. `inkling_session --batched` carries
+    /// the framing rule and the rest of the table.
     ///
     /// So the commit path is spelled out instead of avoided, and it is short,
     /// because **a conversational delta has no verifier**: every token in it is

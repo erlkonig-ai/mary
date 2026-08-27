@@ -6373,8 +6373,13 @@ mod tests {
             worst = worst.max((a - b).abs().max().into_scalar());
         }
         println!("a store three keys short of its window moves the answer by {worst}");
+        // Against the TOLERANCE, not a constant, exactly as
+        // [`dropping_the_conv_history_is_caught`] is: what has to hold is that
+        // the bug class this comparison exists for lands far outside the band
+        // the tolerance admits. Measured 0.874 against a 5e-2 tolerance on the
+        // GB10, 2026-08-27 -- seventeen times it.
         assert!(
-            worst > 4.0 * CACHE_TOLERANCE,
+            worst > 15.0 * CACHE_TOLERANCE,
             "a store that forgot more than its window only moved the answer by {worst}, which \
              is barely outside the tolerance the comparison admits -- so the comparison is not \
              measuring what it claims"
