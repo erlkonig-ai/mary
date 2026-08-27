@@ -1015,6 +1015,63 @@ mod tests {
         )
     }
 
+    /// The gate's KV charge and the pool's reservation must not disagree about
+    /// WHICH ROWS are retained.
+    ///
+    /// They are priced at different widths on purpose -- the charge is the
+    /// dense cache at `policy.cache`, the reservation is NVFP4 at 4.5 bits --
+    /// so the check is that the two differ by exactly that ratio and by nothing
+    /// else. A term left out of one of them shows up here as a ratio that is
+    /// not 3.56, which is the disagreement `kv_reserve_line` exists to make
+    /// unquotable.
+    #[test]
+    fn the_reservation_and_the_admission_charge_retain_the_same_rows() {
+        use super::{GIB, kv_cache_bytes};
+        use crate::models::inkling::kvpages::KvPlan;
+        let t = small();
+        const CTX: usize = 1 << 20;
+        let (_, kv_heads, head_dim) = t.heads(AttnKind::Global);
+        let width = kv_heads * head_dim;
+        assert_eq!(width, 1024, "this model's KV row");
+        assert_eq!(KvPlan::row_bytes(width), 576, "4.5 bits a value, not 16");
+
+        let plan = KvPlan::new(CTX, t.sliding_window_size);
+        // Full model, both stores. 7 global layers and 35 local ones, which is
+        // the complement of `local_layer_ids` and not 42 x anything.
+        let locals = (0..42)
+            .filter(|&l| t.attn_kind(l) == AttnKind::Local)
+            .count();
+        assert_eq!(locals, 35, "35 of the 42 layers are windowed");
+        let held = plan.bytes(42 - locals, locals, width);
+
+        // The gate's own arithmetic at the same context, at BF16.
+        let charged = kv_cache_bytes(&t, 0..42, CTX, narrow());
+        // The reservation carries `epoch` extra rows per windowed store, which
+        // is what lets a compacting store never re-allocate; everything else is
+        // the same rows at a narrower element.
+        let ratio = charged as f64 / held as f64;
+        assert!(
+            (3.4..3.6).contains(&ratio),
+            "the BF16 charge is {ratio:.2}x the NVFP4 reservation, want the 3.56 that is \
+             2 bytes against 0.5625 -- anything else means one of them is counting \
+             different rows"
+        );
+        // And the number that gets quoted, with its framing: whole model, both
+        // stores, one node, 1,048,576 tokens.
+        let gib = held as f64 / GIB;
+        assert!(
+            (7.5..8.5).contains(&gib),
+            "a 1M-token NVFP4 KV pool for all 42 layers is {gib:.3} GiB"
+        );
+        // The error this exists to prevent, named as a number.
+        let naive = 2u64 * 42 * CTX as u64 * KvPlan::row_bytes(width);
+        let over = naive as f64 / held as f64;
+        assert!(
+            (5.5..6.5).contains(&over),
+            "42 x context over-counts the retained rows by {over:.2}x, want ~5.98"
+        );
+    }
+
     /// The 42-layer release, from its own `config.json`.
     ///
     /// Parsed rather than built field by field, so a field this module reads
