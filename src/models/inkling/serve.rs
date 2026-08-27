@@ -82,6 +82,61 @@
 //! (text on the wire, never ids) because drive's `Mind` seam explicitly asks for
 //! no tokenizer — the loop never teacher-forces tokens.
 //!
+//! # What this measured, and the framing rules that make the numbers evidence
+//!
+//! One GB10 (`spark2`, 121.63 GiB unified memory), idle at the time — 115 GiB
+//! available, load average 0.06, no GPU compute apps — with the box's advisory
+//! lock held on BOTH boxes. `work-inkling-complete.pile` (171 GB), the
+//! checkpoint's own `tokenizer.json`, release build, features
+//! `inkling-serve,drive-mind,cuda-backend,import`. Greedy, no `INK_*` switch
+//! set beyond the layer range. Every duration below is measured INSIDE the
+//! serving process around the `Session` calls.
+//!
+//! **Layers 0..21 of 42** — the shape the frontier benchmark's HEAD box runs,
+//! 103.88 GiB admitted of 121.63 GiB:
+//!
+//! | | seconds | what it is |
+//! |---|---|---|
+//! | `Session::load` → READY | 35.3 | paid ONCE, per process |
+//! | first token, turn 0 | 9.838 | 5-token prompt, cold session, every layer's first bind |
+//! | first token, turn 1 | 0.579 | a 13-token DELTA, walked one position each |
+//! | first token, turns 2–3 | 0.044, 0.045 | no delta: ONE step against a warm cache |
+//! | decode | 0.709–0.716 / 16 tok | **44.3–44.8 ms PER STEP** |
+//!
+//! The framing rule on the middle rows is the one that is easy to lose: those
+//! are seconds per FIRST TOKEN OF A TURN, not per token and not per turn.
+//! **A no-delta turn's first token costs 0.044 s where turn 0's cost 9.838 s —
+//! 221×** — and that ratio is what a held `Session` buys. Turn 1 shows the
+//! delta's price honestly: 0.579 s is thirteen walked positions at ~44 ms, i.e.
+//! exactly the per-step cost times the delta, and nothing for the 5 tokens
+//! before them, which is the KV cache doing its job.
+//!
+//! The per-step figure cross-checks against the project's scoreboard: the
+//! frontier measures **86.5 ms/step for the FULL 42-layer two-box pipeline**,
+//! and half that stack on one box at ~44 ms/step is the consistent half.
+//!
+//! **Layers 0..4 of 42** — the cheap gate shape, 30.96 GiB admitted:
+//! READY in 10.2–10.6 s, warm first token **0.015–0.016 s**, ~15.6 ms per step.
+//!
+//! Two cautions, both from watching the same shape twice:
+//!
+//!   - **Turn 0 is not reproducible; the warm turn is.** The same 0..4 run
+//!     measured turn-0 first token at 7.823 s and then at 2.425 s, because the
+//!     second run found the pile's pages already cached. The warm number was
+//!     0.015 s and 0.016 s across those same two runs. So quote the warm number
+//!     as a measurement and turn 0 as a range.
+//!   - **A turn occasionally stalls for seconds.** One 24-token turn at 0..4
+//!     took 4.270 s where its neighbour took 0.370 s, same delta, same shape.
+//!     That is the intermittent multi-second decode stall
+//!     [`super::stepstat`] exists to characterise; it is not introduced here and
+//!     it is not explained here, but a serving process makes it USER-VISIBLE for
+//!     the first time, because a conversation waits on it.
+//!
+//! And the protocol's own overhead, since it is the thing this file adds: the
+//! serving process measured its first token at 0.015 s and the client saw that
+//! token at 0.016 s — **~1 ms per turn for the pipe, the framing and the
+//! detokenizer**, against a 44 ms step.
+//!
 //! # Tensor parallelism is above this, not inside it
 //!
 //! `Session::load` refuses `INK_TP`, so one `inkling_serve` is one RANK and a
@@ -89,9 +144,49 @@
 //! (`hi - lo < num_hidden_layers` is enforced: 144 GiB does not fit a 121 GiB
 //! box). Its tokens are therefore DIAGNOSTIC, not the model's, and
 //! [`Ready::partial`] says so on the wire rather than leaving it to be inferred
-//! from fluent-looking wrong text. The fan-out proxy that would drive two ranks
-//! in lockstep and return rank 0's token speaks exactly this protocol on both
-//! sides; see the commit that introduced this file for what it still needs.
+//! from fluent-looking wrong text.
+//!
+//! **So a single-box serving process can never produce the model's text, and
+//! that is structural rather than a matter of effort.** The only route through a
+//! `Session` to a real token is the TP pair, because the layer split
+//! (`INK_PIPE`) is refused too and a `Session` that does not start at layer 0
+//! has no embedding table. Saying that plainly is more useful than a serving
+//! process that reads well and is wrong.
+//!
+//! ## What the FAN-OUT PROXY still needs, precisely
+//!
+//! It speaks THIS protocol on both sides — two [`ServeClient`]s upstream, an
+//! `inkling_serve`-shaped server downstream — so `drive` cannot tell the
+//! difference and [`Ready::partial`] becomes `false` for the first time. Five
+//! things are missing, and none of them is in this file:
+//!
+//! 1. **`Session::load` has to accept a group it did not form.** `Group::form`
+//!    is a rendezvous (rank 0 `accept`s with no timeout, the others dial with a
+//!    180 s deadline) and `set_external_comm` is process-global, so there is at
+//!    most one TP session per process and a library call must not block on a
+//!    peer booting elsewhere. The group is formed ABOVE and passed in.
+//! 2. **The layer-range rule INVERTS.** Single-box requires
+//!    `hi - lo < num_hidden_layers`; TP requires exactly `0:num_hidden_layers`,
+//!    because each rank holds half of EVERY tensor rather than all of some
+//!    layers. One of the two rules has to be selected by whether a group is
+//!    present, and getting it backwards is a refusal at load, not a wrong
+//!    answer — which is the good failure.
+//! 3. **Lockstep is per STEP, not per turn.** Both ranks must call `step()` the
+//!    same number of times or the other blocks in NCCL forever, and `extend`
+//!    walks a delta one position at a time — so the proxy must feed both ranks
+//!    the SAME context bytes and the same `max_tokens`, not merely the same
+//!    turns.
+//! 4. **Rank 1's stream must be DRAINED and CHECKED, not ignored.** Both ranks
+//!    produce the same token (embedding and unembedding are replicated, so both
+//!    unembed the whole table and take the same argmax). The proxy returns rank
+//!    0's tokens — but it has to read rank 1's too, or its pipe fills and the
+//!    rank blocks, and comparing them is the loudest available signal that the
+//!    all-reduce has broken.
+//! 5. **A dead rank must kill its peer.** If one rank dies mid-turn the other
+//!    blocks in NCCL with no timeout. The convention already hands the proxy
+//!    that signal for free — its fourth guarantee is that a truncated stream is
+//!    distinguishable from a finished one — so the proxy has what it needs to
+//!    act; it just has to act.
 
 use anyhow::{Context, Result};
 
