@@ -788,6 +788,71 @@ struct Pending<B: Backend> {
 }
 
 impl AttnCache<Bk> {
+    /// Move this cache's KV onto PRE-ALLOCATED pages, if the run asked for
+    /// them. **Off unless `INK_KV_PREALLOC` is set.**
+    ///
+    /// Called once, at the seam between the prefill and the first decode step,
+    /// and after the window trim so a local layer's reservation is its window
+    /// rather than the whole prompt. From here on the store never allocates,
+    /// never frees and never moves a page: the addresses the first decode step
+    /// hands the attention kernel are the addresses the ten-thousandth hands
+    /// it.
+    ///
+    /// ## What it is for, in the order the value actually falls
+    ///
+    /// 1. **Capture.** Cross-step CUDA graph replay is built and works, and the
+    ///    thing that ends a replay run is not a value -- `q0`, the mask bounds
+    ///    and the KV write row are already patched as scalars -- it is the KV
+    ///    page STRUCTURE changing, which is an address problem. A reservation
+    ///    removes the address problem outright and leaves one tunable epoch
+    ///    ([`super::kvpages::kv_epoch`]) where there used to be a hard 128-row
+    ///    page boundary.
+    /// 2. **A recurring cost removed.** A capture is 62-101 ms; taking one
+    ///    every 128 steps is 0.5-0.8 ms a step amortised, and every epoch
+    ///    multiple takes that straight down.
+    /// 3. **Control that is only possible on fixed addresses.** L2 residency
+    ///    hints, and anything else that names a buffer, cannot be asked of a
+    ///    page that may move.
+    ///
+    /// It is NOT a speed change and should not be sold as one. The host-side
+    /// allocator work it deletes is of order 0.06 ms a step (1901 reservations
+    /// at 591-918 us a pass, of which ~7% of removed host time reaches the
+    /// step, measured on GB10), and the device is busy 81% of a decode step.
+    ///
+    /// ## The boundary, said plainly
+    ///
+    /// Single-sequence NVFP4 decode only. A dense store would have to COPY to
+    /// cut its reservation down to the live rows -- Burn's `slice` allocates --
+    /// where the NVFP4 read is a smaller scalar row count against the same
+    /// handle and costs nothing, so this refuses anything but an FP4 cache. The
+    /// batched slot lane ([`SlotCache`]) is a different type on a different
+    /// path at f32/BF16 and is not touched by this at all.
+    pub fn reserve_kv(&mut self, window: Option<usize>, dev: &burn::backend::cuda::CudaDevice) {
+        let Some(plan) = super::kvpages::KvPlan::from_env(window.unwrap_or(0)) else {
+            return;
+        };
+        // The NVFP4 arm only. See the boundary above -- and refusing loudly
+        // here is better than a dense store quietly paying a `slice` per layer
+        // per step for a reservation nobody asked it to hold.
+        if !self.kv_is_fp4() {
+            return;
+        }
+        let rows = plan.rows_for(window);
+        let held = self.k.len();
+        if held > rows {
+            // A prompt longer than the reservation. Leave the cache on the
+            // grow-on-demand arm rather than truncating a context: the
+            // admission gate is what should have refused this, and it says so
+            // with the numbers.
+            return;
+        }
+        let placeholder = || super::kvpages::KvStore::wide(1);
+        let k = std::mem::replace(&mut self.k, placeholder());
+        self.k = k.into_reserved(rows, plan.epoch, dev);
+        let v = std::mem::replace(&mut self.v, placeholder());
+        self.v = v.into_reserved(rows, plan.epoch, dev);
+    }
+
     /// DEBUG: host-side absolute sums of everything this cache carries to the
     /// next decode step, in the order (K pages, V pages, k_pre, v_pre).
     ///
@@ -1540,6 +1605,9 @@ fn attention_prefill_lane(
         pending: None,
     };
     trim(&mut cache, window);
+    // AFTER the trim, so a windowed layer's reservation is sized by its window
+    // and not by the prompt. See `AttnCache::reserve_kv`.
+    cache.reserve_kv(window, &dev);
     (linear_bf16(out, &w.wo), cache)
 }
 
