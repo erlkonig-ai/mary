@@ -263,64 +263,126 @@
 //! `ncu --query-metrics` lists none — and `lts__d_sectors_fill_device.sum` is
 //! structurally zero because the memory is unified, so there is no separate
 //! device aperture to fill from. Anything asking this part for
-//! `dram__bytes_read.sum` gets an error, not a number. (`lts__t_sectors_op_read_lookup_miss` is NOT the counter to
-//! use: it reads 3% miss on the dequant's packed input, which cannot be
+//! `dram__bytes_read.sum` gets an error, not a number.
+//! (`lts__t_sectors_op_read_lookup_miss` is NOT the counter to use either: it
+//! reads 3% miss on the dequant's packed input, which cannot possibly be
 //! resident.)
 //!
 //! | kernel | launches | DRAM read | L2 read | DRAM/L2 |
 //! | --- | ---: | ---: | ---: | ---: |
 //! | `dequantize_nvfp4` | 84 | 26.5 MiB | 25.7 MiB | 1.03 |
-//! | `flash_kernel` | 42 | 82.9 MiB | 83.8 MiB | **0.99** |
+//! | `flash_kernel` (dense) | 42 | 82.9 MiB | 83.8 MiB | **0.99** |
+//! | `flash_kernel` (packed) | 42 | 26.3 MiB | 34.0 MiB | 0.77 |
 //!
-//! **99% of what flash reads back comes from memory.** The pages the dequant
-//! wrote microseconds earlier, into a 24 MiB L2, are not there any more. That
-//! also settles the write half without assuming anything: flash read those
-//! bytes from DRAM, so the lines had been evicted, and evicting a dirty line IS
-//! the write-back. Both directions are real traffic.
+//! **99% of what the dense arm reads back comes from memory.** The pages the
+//! dequant wrote microseconds earlier, into a 24 MiB L2, are not there any
+//! more. That also settles the write half without assuming anything: flash read
+//! those bytes from DRAM, so the lines had been evicted, and evicting a dirty
+//! line IS the write-back. Both directions are real traffic, and the headroom
+//! is therefore BOTH halves rather than only the one L2 residency could reach.
 //!
-//! With `INK_FLASH_FP4=1` the dequant launches disappear and `flash_kernel`'s
-//! DRAM read falls to 26.3 MiB — the codes. **166 MiB a step removed at 21
-//! layers**: 83.1 measured off the read side, and the ~82.9 of dequant write
-//! the read-back miss proves reached memory. Doubling for 42 layers gives ~332
-//! MiB, within 4% of what the shapes predict.
+//! The whole KV path, per 21-layer step: 26.5 MiB of codes read, 94.2 MiB of
+//! BF16 written (the read times the kernel's exact 3.556x expansion — there is
+//! no DRAM-write counter on this part, and flash's 82.9 MiB read-back is a
+//! floor under it), 82.9 MiB read back. **203.6 MiB, against 26.3 for the
+//! packed arm: 177 MiB a step removed at 21 layers, ~355 at 42.**
 //!
-//! ## And it is 1.83% SLOWER
+//! One counter needs its own warning. `lts__t_sectors_op_write.sum` on the
+//! dequant reads 1393 MiB a step, 16.8x its actual output, because it counts
+//! sector REQUESTS and the kernel does sixteen separate 2-byte stores per
+//! thread at a 32-byte stride — every store instruction touches 32 sectors for
+//! two bytes each. It is not bandwidth (`write_lookup_miss` is ~0, so L2's byte
+//! enables absorb it) but it is LSU instructions, and multiplying that counter
+//! by 32 gives a number 16.8x too large.
+//!
+//! ## And at ctx 3732 it is 1.8% SLOWER
 //!
 //! Paired, ABBA-balanced arm order inside one interleaved run, n = 7, same
-//! binary, ctx 3732, `INK_LAYERS=0:21`, `INK_GEN=40`, one GB10: **+1.83% on
-//! step time, 95% CI +1.73..+1.93**, against A/A controls of +0.19% and
-//! −0.28%. 44.9 ms/step against 45.7.
+//! binary, ctx 3732, `INK_LAYERS=0:21`, `INK_GEN=40`, one GB10: **+1.80% on
+//! step time, 95% CI +1.43..+2.17**, against A/A controls of -0.29% and
+//! +0.06%. 44.9 ms/step against 45.7. An earlier build that decoded through the
+//! `e2m1_value` comparison ladder rather than
+//! [`super::fp4quant::e2m1_bits`] read +1.83% (CI +1.73..+1.93) — the same
+//! number, which is itself the finding below.
 //!
-//! The reason is in this file's own doc, four sections up. At decode the grid
-//! is `(1, kv_heads, splits)` — the launches are **32 cubes and 8 cubes on a
-//! 48-SM part**, `sm__warps_active` 8.3% of peak. "That is not a kernel, it is
-//! a queue": it is LATENCY-bound, not bandwidth-bound, so bytes removed from it
-//! are bytes it was not waiting on, while the per-element decode lands straight
-//! on the critical path. The value loop makes that worse by a factor of four —
-//! `vv` depends only on `(j, di, lane)`, so all four planes decode the same
-//! element, and what is a free L1 hit on the dense arm is four E2M1 decodes
-//! here.
+//! The reason is in this file's own doc, four sections up. Split by grid, the
+//! 42 flash launches of one warm step at ctx 3732 are:
 //!
-//! So it is a switch that is OFF, and the two things it is waiting for are
-//! named rather than guessed: a decode tile that does not decode V four times
-//! (one plane a cube, or a staged V tile — the shared budget allows the second
-//! only at the decode tile), and a context long enough that these kernels are
-//! bandwidth-bound. The traffic it removes is real and measured; what is
-//! missing is a shape that is waiting on that traffic.
+//! | layers | grid | cubes | DRAM read |
+//! | --- | --- | ---: | ---: |
+//! | 3 global | `(1, 8, 29)` | 232 | 44.0 MiB |
+//! | 18 local | `(1, 8, 4)` | 32 | 36.1 MiB |
+//! | 21 tail pages | `(1, 8, 1)` | 8 | 2.9 MiB |
+//!
+//! **Nearly half the traffic moves in grids of 32 and 8 cubes on a 48-SM part**,
+//! at `sm__warps_active` 8.3% of peak. "That is not a kernel, it is a queue":
+//! it is LATENCY-bound, not bandwidth-bound, so bytes removed from it are bytes
+//! it was not waiting on, while the per-element decode lands straight on the
+//! critical path.
+//!
+//! **And the cost is not arithmetic**, which is measured rather than argued:
+//! replacing the seven-comparison ladder with the branchless bit construction
+//! roughly halved the decode's operation count and gave back every register it
+//! had cost (47 -> 39, one BELOW the dense arm), and moved the step time by
+//! nothing at all — 1.83% to 1.80%, each well inside the other's interval.
+//!
+//! What that leaves, and this part is inference rather than measurement, is the
+//! LOADS: the packed reader issues two an element (a code word and a scale
+//! byte) where the dense one issues one, in a loop each of the four planes runs
+//! redundantly — `vv` depends only on `(j, di, lane)`, so all four decode the
+//! same element. Anyone testing that should put
+//! `l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum` on both arms; it was not
+//! in the session that produced the numbers above.
+//!
+//! ## The crossover is real, and it is where the argument said it would be
+//!
+//! At ctx 14928 with `INK_LAYERS=0:8` — where the model still fits one box and
+//! one global layer carries 58.2 MiB of the step's 58.6 — the same paired ABBA
+//! design at n = 7 reads **-1.15% on step time, the packed arm FASTER**, 95% CI
+//! -1.65..-0.64, every one of the seven reps negative, against A/A controls of
+//! -0.06% and -0.38%. The grid there is `(1, 8, 116)` — **928 cubes**, a full
+//! device rather than a queue — and the sign flips because the kernel is
+//! finally waiting on the bytes this change removes.
+//!
+//! Read that beside what `bench-decode` prints for the same run, which is
+//! "+0.93% tok/s, SMALLER THAN THE SPREAD. Not a result." Both are correct and
+//! they are not the same statistic: the script compares each arm's median
+//! against the other's, and at long context the per-arm spread is 2-4%. The
+//! PAIRED difference inside each rep is what resolves 1%, which is why the
+//! arms are interleaved in the first place. An unpaired reading of this run
+//! would have concluded nothing.
+//!
+//! So it is a switch that is OFF, and what it is waiting for is named rather
+//! than guessed: a value loop that does not decode V four times and does not
+//! issue a load an element. Giving a lane a CONTIGUOUS run of dimensions would
+//! do both — one 32-bit code word would serve eight elements and one scale byte
+//! sixteen — but that is a change to the lane-to-dimension mapping, i.e. to
+//! this kernel's SHAPE, which is exactly what the old note said the packed read
+//! would not need. The note was right that the reader change is local. It was
+//! wrong that the reader change is sufficient.
 //!
 //! It is DECODE-only in effect: the prefill global arm reads freshly projected
-//! K and V rather than the cache, so it never reaches this flag — which is
-//! just as well, since a packed reader would turn prefill's one dequant per
-//! element into one per query tile.
+//! K and V rather than the cache, so it never reaches this flag — which is just
+//! as well, since a packed reader would turn prefill's one dequant an element
+//! into one per query tile.
 //!
-//! ## What it costs in registers
+//! ## What it costs in registers, and what it does not spill
 //!
-//! `flash_kernel` at the decode tile goes **40 -> 47 registers a thread**, and
-//! `launch__occupancy_limit_registers` **12 -> 10** blocks an SM. Neither binds:
-//! `launch__occupancy_limit_shared_mem` is 5 blocks an SM on both arms. Local
-//! memory is **0 bytes loaded and 0 stored on both arms**, so nothing spilled —
-//! which is worth having measured rather than inferred, because this is the
+//! `flash_kernel` at the decode tile is **39 registers a thread against the
+//! dense arm's 40**, and `launch__occupancy_limit_registers` is 12 blocks an SM
+//! on both. Neither binds: `launch__occupancy_limit_shared_mem` is 5 on both.
+//! Local memory is **0 bytes loaded and 0 stored on both arms**, so nothing
+//! spilled — worth having measured rather than inferred, because this is the
 //! kernel where a spill would be silent.
+//!
+//! ## What it removes regardless of the clock
+//!
+//! 84 dequant launches and 84 per-step allocations a step at 21 layers (168 at
+//! 42), sized by [`super::kvpages::Pages::read_rows`] and therefore re-sized
+//! whenever the read window grows. The flash partials `po` and `pml` remain and
+//! are still sized from the span, so this does not by itself make the decode
+//! path allocation-free — but it removes the buffer the KV-preallocation work
+//! named as the remaining per-step epoch.
 //!
 //! It also has no MMA path. At decode `m = 1` and tensor cores buy nothing —
 //! the product is a GEMV and the kernel is bandwidth-bound. At prefill `m` is
