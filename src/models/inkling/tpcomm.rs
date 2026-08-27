@@ -53,6 +53,44 @@
 //! barrier in [`Group::barrier`]. It is not on the token path; every collective
 //! after `form` goes through NCCL on the ConnectX pair.
 //!
+//! # If `warm` HANGS: the seam has two halves and only one of them is here
+//!
+//! [`Group::form`] calls `cubecl::cuda::collective::set_external_comm`, which
+//! only STORES the group. The half that matters is in cubecl's CUDA server:
+//! `comm_init` has to read it back and pass those three numbers to
+//! `ncclCommInitRank` instead of deriving them from the local device list. A
+//! cubecl that has the setter but not the reader COMPILES AND LINKS, accepts
+//! the group, and ignores it -- and then both ranks derive rank 0 from their
+//! own local device 0, each mints its own id, and `ncclCommInitRank` waits
+//! forever for a peer that is calling itself rank 0 too. Diagnosed 2026-08-27,
+//! having cost about forty minutes: the boxes' `cubecl-graph` was one commit
+//! short of `c8380a03 "comm_init must USE the external group, not just accept
+//! one"`, and there is no compile error and no runtime error to see.
+//!
+//! The symptom is exact and worth memorising: **both processes stop after
+//! printing their `tensor parallel : rank R of W` line, the TCP rendezvous is
+//! `ESTAB` (so `form` itself succeeded), the GPUs are at 0% and neither ever
+//! reaches `tp group : paired and verified`.**
+//!
+//! The confirmation takes one environment variable, and it is NOT `NCCL_DEBUG`
+//! alone: NCCL writes to `stdout` with libc block buffering, so when stdout is
+//! a redirected log its banner sits in a 4 KB buffer that a hung process never
+//! flushes, and `NCCL_DEBUG=INFO` looks like it produced nothing at all. Add
+//! `NCCL_DEBUG_FILE=/tmp/nccl.%h.%p.log`, which NCCL opens per rank and
+//! flushes, then read the `ncclCommInitRank` line on BOTH boxes:
+//!
+//! ```text
+//!   box A   [Rank 0] ncclCommInitRank ... rank 0 nranks 2 ... commId 0x551d98...
+//!   box B   [Rank 0] ncclCommInitRank ... rank 0 nranks 2 ... commId 0x8a5a1f...
+//!                                          ^^^^^^                    ^^^^^^^^
+//!            two rank 0s, two different ids -- the external group was ignored
+//! ```
+//!
+//! A healthy pair reads `rank 0` on one and `rank 1` on the other, with the
+//! SAME `commId`. The check [`Group::warm`] makes -- every rank contributes 1.0
+//! so the sum must be the world size -- cannot catch this one, because it
+//! catches a group that PAIRED WRONGLY and this group never pairs at all.
+//!
 //! # Sum is the only reduction, and that is not a limitation
 //!
 //! cubecl exposes `Sum` and `Mean`. Every collective this design needs is a
@@ -197,6 +235,14 @@ impl Group {
     /// perfectly finite number that would go on to produce fluent text. Check
     /// it here, once, where the check costs nothing.
     pub fn warm(&self) -> Result<()> {
+        // Said BEFORE the blocking call, because the failure this can hit is a
+        // HANG and a hang has no message. A run that stops on this line has the
+        // problem the module header describes; a run that stops on the line
+        // before it never got here. One `println!` buys that distinction.
+        println!(
+            "  tp group          : building the communicator (blocks; if this never returns, \
+             see the `warm` HANGS section of `tpcomm`)"
+        );
         let ones: Vec<u8> = (0..4).flat_map(|_| 1f32.to_le_bytes()).collect();
         let probe = self.client.create_from_slice(&ones);
         self.all_reduce_f32(&probe);
