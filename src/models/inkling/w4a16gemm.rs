@@ -374,7 +374,7 @@ pub fn w4a16_linear<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size>(
             // bit-identity argument and `live_arg` for why one of these is a
             // bool and not a row bound.
             if mask_rows {
-                if hi_dead && (i & 1) == 1 {
+                if comptime!(hi_dead && (i & 1) == 1) {
                     reg_a[i] = Vector::<AB, NA>::cast_from(0.0f32);
                 } else {
                     let mut v = Vector::<AB, NA>::cast_from(0.0f32);
@@ -1578,7 +1578,7 @@ pub fn w4a16_linear_swz<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size>(
                 // bit-identity argument; `live_arg` carries why `hi_dead` is
                 // sound and what it assumes about the fragment map.
                 if mask_rows {
-                    if hi_dead && (i & 1) == 1 {
+                    if comptime!(hi_dead && (i & 1) == 1) {
                         a_buf[u * vc_a + i] = Vector::<AB, NA>::cast_from(0.0f32);
                     } else {
                         let mut v = Vector::<AB, NA>::cast_from(0.0f32);
