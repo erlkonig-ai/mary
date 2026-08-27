@@ -543,56 +543,72 @@ fn batched_gate(session: &mut Session, prompt: &[usize], steps: usize) -> Result
 /// ids it is handed, and the token a pass produced is held in a private field
 /// that only `Session::step` ever reads — so a turn that ended and was followed
 /// by `extend(new context)` dropped its own last word, permanently, once per
-/// turn, in every conversation. Nothing caught it: the cache stayed CONSISTENT,
-/// `position()` stayed exactly `prompt + fed`, and every length assertion in
-/// this file still passed. It was one token short of the sequence it claimed to
-/// hold, and a length cannot see that. This gate is the check that would have.
+/// turn, in every conversation that had anything new to say to it. Nothing
+/// caught it: the cache stayed CONSISTENT, `position()` stayed exactly
+/// `prompt + fed`, and every length assertion in this file still passed. It was
+/// one token short of the sequence it claimed to hold, and a length cannot see
+/// that. This gate is the check that would have.
+///
+/// # Why every arm walks, and why that is the whole design
+///
+/// The obvious reference is a session handed `head ++ said ++ delta` in one
+/// batched `prefill`. **It does not work, and the failure is not small.** A
+/// prefill of `n` rows and a walk over the same `n` positions are different GEMM
+/// shapes and therefore different accumulation orders, and this model's router
+/// picks six experts of 256 on margins a last-place logit bit can flip. Measured
+/// here at layers 0..21 on 2026-08-27, a one-pass prefill parted company with
+/// the walked build of the identical 136 tokens at token 1 of 8 — by itself,
+/// with nothing missing. A gate whose reference moves that much cannot attribute
+/// a divergence to anything.
+///
+/// So every arm that is compared runs at `extend_batch = 1`, and that makes the
+/// comparison EXACT rather than approximate. [`Session::step`] is
+/// `forward(&[last])`, a one-row `extend` is `forward(&[id])` — the same call —
+/// so a reference that walks `said ++ delta` through `extend` makes literally
+/// the same sequence of forward passes as a served turn that steps through
+/// `said` and then extends: same widths, same shapes, same order of summation.
+/// The only thing left that can differ is WHICH TOKENS, which is the thing under
+/// test. Exact equality is therefore an invariant here and not a hope.
 ///
 /// # What it runs
 ///
 /// The prompt is split the way [`rewind_gate`] and [`batched_gate`] split it, so
 /// the three gates' numbers compose: two thirds the settled prefix a first turn
-/// prefills, one third the DELTA a second turn is handed. Three arms against
-/// ONE loaded session, each starting from a `reset`:
+/// prefills, one third the DELTA a second turn is handed. Five arms against ONE
+/// loaded session, each from a `reset`; `turn one` is the serving process's own
+/// generation loop, guard and all, copied rather than approximated.
 ///
 /// ```text
-///   turn one, every arm : prefill(head); generate `steps` on the SERVE
-///                         SCHEDULE -> said[0..steps], of which said[steps-1]
-///                         is emitted and NOT in the cache
-///   DROPPED : extend(delta)                     then generate   <- as it was
-///   CARRIED : extend([said.last()] ++ delta)    then generate   <- as it is
-///   WHOLE   : reset; prefill(head ++ said ++ delta); generate   <- the reference
+///   turn one   : prefill(head); generate `steps` -> said[0..steps], of which
+///                said[steps-1] is emitted and NOT fed back
+///   DROPPED    : turn one; extend(delta)                    ; generate
+///   CARRIED    : turn one; extend([said.last()] ++ delta)   ; generate
+///   WHOLE      : prefill(head); extend(said ++ delta)       ; generate
+///   ONE-PASS   : prefill(head ++ said ++ delta)             ; generate
+///   BATCHED    : turn one; extend([said.last()] ++ delta) in ONE pass; generate
 /// ```
 ///
-/// `WHOLE` is the whole point: a session fed the IDENTICAL TOKEN SEQUENCE IN ONE
-/// PASS, which is what a served conversation claims to be. So this gate is
-/// behavioural — it never reads a length and never reaches inside a `Session`,
-/// it asks the model what comes next and compares three answers.
-///
-/// The turn-one schedule below is copied from `inkling_serve`'s generation loop
-/// rather than approximated, guard and all. If one of the two changes the other
-/// must: a gate that generated on a different schedule would be checking a
-/// conversation nobody has.
+/// `WHOLE` is the reference: a session fed the identical token sequence, one
+/// position at a time, which is the same pass partition `CARRIED` uses.
+/// `ONE-PASS` is the reference that looks right and is not, kept as a CONTROL so
+/// the run says in its own numbers how far repartitioning alone moves the
+/// answer. `BATCHED` is the shape that actually ships — the carried token as one
+/// extra ROW of a pass the turn was making anyway — and it is reported against
+/// `WHOLE` under the same caveat as `ONE-PASS`.
 ///
 /// # What it asserts, and what it only reports
 ///
-/// It ASSERTS `CARRIED == WHOLE`: the served schedule answers what the one-pass
-/// session answers. That is the regression guard, and it is the property the
-/// defect broke.
+/// It ASSERTS `CARRIED == WHOLE`, exactly, for the reason above. That is the
+/// regression guard and it is the property the defect broke.
 ///
 /// It REPORTS `DROPPED vs WHOLE`, because that comparison is EVIDENCE and not an
-/// invariant. Whether one missing token of context flips a greedy argmax is a
-/// property of this model and this prompt, not of the defect; a run in which
-/// DROPPED also agrees has proven nothing about the bug and says so in those
-/// words — it has not shown the bug absent.
-///
-/// Exactness between `CARRIED` and `WHOLE` is expected for [`batched_gate`]'s
-/// reason and carries its caveat. Both build forward and neither re-opens a
-/// settled page, so this is not the rewind's situation; but they partition the
-/// same tokens into passes differently — one prefill plus `steps - 1` single
-/// rows plus one batch, against one prefill — and a pass width changes a GEMM
-/// shape and therefore an accumulation order. A LATE divergence is arithmetic,
-/// and is reported as where it starts rather than as a verdict on token 0.
+/// invariant: whether one missing token of context flips a greedy argmax is a
+/// property of this model and this prompt. A run in which DROPPED also agrees
+/// has proven nothing about the defect and says so in those words — it has not
+/// shown it absent. Measured 2026-08-27 at layers 0..21, `--gen 8`: a 10-token
+/// prompt diverged at token 0 and a 128-token one did not diverge at all, which
+/// is exactly the dependence on how much OTHER context there is that makes this
+/// a report rather than an assertion.
 fn carry_gate(session: &mut Session, prompt: &[usize], steps: usize) -> Result<()> {
     anyhow::ensure!(
         prompt.len() >= 6,
@@ -634,16 +650,23 @@ fn carry_gate(session: &mut Session, prompt: &[usize], steps: usize) -> Result<(
         Ok(said)
     };
     // TURN TWO: attend to what is new, then generate. Every arm makes the same
-    // call; the arms differ only in what "new" means.
-    let turn_two = |s: &mut Session, ids: &[usize]| -> Result<Vec<usize>> {
+    // call and the arms differ only in what "new" means. The seconds are the
+    // APPEND's alone, which is the half of a turn the carry can change.
+    let turn_two = |s: &mut Session, ids: &[usize]| -> Result<(Vec<usize>, f64)> {
+        let t = std::time::Instant::now();
         let mut tok = s.extend(ids)?;
+        let appended = t.elapsed().as_secs_f64();
         let mut out = vec![tok];
         for _ in 1..steps {
             tok = s.step()?;
             out.push(tok);
         }
-        Ok(out)
+        Ok((out, appended))
     };
+
+    // One row a pass, so that a `step` and an `extend` are the same call and the
+    // reference arm's partition is the served arm's. See this function's doc.
+    session.set_extend_batch(1)?;
 
     // ── DROPPED: the schedule as it was ─────────────────────────────────────
     let said = turn_one(session)?;
@@ -656,12 +679,10 @@ fn carry_gate(session: &mut Session, prompt: &[usize], steps: usize) -> Result<(
         head.len(),
         steps - 1,
     );
-    let t_d = std::time::Instant::now();
-    let dropped = turn_two(session, delta)?;
-    let dropped_s = t_d.elapsed().as_secs_f64();
+    let (dropped, dropped_s) = turn_two(session, delta)?;
 
-    // ── CARRIED: the same conversation, with the pending token at the head of
-    // the delta. One extra ROW on a pass the turn was making anyway.
+    // ── CARRIED: the same conversation with the pending token at the head of
+    // the delta.
     let again = turn_one(session)?;
     anyhow::ensure!(
         again == said,
@@ -669,86 +690,120 @@ fn carry_gate(session: &mut Session, prompt: &[usize], steps: usize) -> Result<(
          {said:?}); this gate compares arms by replaying turn one and cannot do that without \
          greedy determinism"
     );
-    let with_carry: Vec<usize> =
-        std::iter::once(*said.last().expect("a turn emits at least one token"))
-            .chain(delta.iter().copied())
-            .collect();
-    let t_c = std::time::Instant::now();
-    let fixed = turn_two(session, &with_carry)?;
-    let fixed_s = t_c.elapsed().as_secs_f64();
-
-    // ── WHOLE: the reference, one pass over the identical token sequence ─────
-    session.reset();
-    let whole_ids: Vec<usize> = head
-        .iter()
-        .chain(said.iter())
-        .chain(delta.iter())
-        .copied()
+    let carry = *said.last().expect("a turn emits at least one token");
+    let with_carry: Vec<usize> = std::iter::once(carry)
+        .chain(delta.iter().copied())
         .collect();
-    let mut tok = session.prefill(&whole_ids)?;
-    let mut whole = vec![tok];
+    let (fixed, fixed_s) = turn_two(session, &with_carry)?;
+
+    // ── WHOLE: the reference. Same prefill, then every token of the sequence
+    // walked through `extend` -- which is the same forward call `step` makes,
+    // over the same ids, in the same order.
+    session.reset();
+    session.prefill(head)?;
+    let forced: Vec<usize> = said.iter().chain(delta.iter()).copied().collect();
+    let (whole, whole_s) = turn_two(session, &forced)?;
+
+    // ── ONE-PASS: the reference that looks right. Kept as a CONTROL: whatever
+    // it disagrees with `WHOLE` about is repartitioning and not context.
+    session.reset();
+    let one_pass_ids: Vec<usize> = head.iter().chain(forced.iter()).copied().collect();
+    let mut tok = session.prefill(&one_pass_ids)?;
+    let mut one_pass = vec![tok];
     for _ in 1..steps {
         tok = session.step()?;
-        whole.push(tok);
+        one_pass.push(tok);
     }
+
+    // ── BATCHED: the shape that ships. The carried token is row 0 of a pass the
+    // turn was making anyway.
+    let again = turn_one(session)?;
+    anyhow::ensure!(again == said, "turn one drifted between arms");
+    session.set_extend_batch(with_carry.len())?;
+    let (batched, batched_s) = turn_two(session, &with_carry)?;
 
     // ── the report ──────────────────────────────────────────────────────────
     println!(
-        "  the sequence          : {} head + {} said + {} delta = {} tokens",
+        "  the sequence          : {} head + {} said + {} delta = {} tokens; the carried token \
+         is {carry}",
         head.len(),
         said.len(),
         delta.len(),
-        whole_ids.len()
+        one_pass_ids.len()
     );
-    println!("DROPPED: {dropped:?}");
-    println!("CARRIED: {fixed:?}");
-    println!("WHOLE  : {whole:?}");
+    println!("DROPPED : {dropped:?}");
+    println!("CARRIED : {fixed:?}");
+    println!("WHOLE   : {whole:?}");
+    println!("ONE-PASS: {one_pass:?}");
+    println!("BATCHED : {batched:?}");
 
     let agreement =
         |a: &[usize], b: &[usize]| -> usize { a.iter().zip(b).take_while(|(x, y)| x == y).count() };
-    let dw = agreement(&dropped, &whole);
-    let cw = agreement(&fixed, &whole);
-    println!(
-        "  DROPPED vs WHOLE      : {dw}/{} tokens{}",
-        whole.len(),
-        match dw == whole.len() {
-            true => " — AGREED. One missing token of context did not flip a greedy argmax at this \
-                 prompt and this length, so THIS RUN has proven nothing about the defect. It \
-                 has not shown it absent."
-                .to_string(),
-            false => format!(
-                " — diverges at {dw} ({} against {}), which is the missing token showing up in \
-                 the only place it can: the answer",
-                dropped[dw], whole[dw]
-            ),
-        }
+    let line = |what: &str, a: &[usize], b: &[usize], note: &str| {
+        let n = agreement(a, b);
+        println!(
+            "  {what:<22}: {n}/{} tokens{}",
+            b.len(),
+            match n == b.len() {
+                true => String::new(),
+                false => format!(" — diverges at {n} ({} against {}){note}", a[n], b[n]),
+            }
+        );
+        n
+    };
+    let cw = line("CARRIED vs WHOLE", &fixed, &whole, "");
+    let dw = line(
+        "DROPPED vs WHOLE",
+        &dropped,
+        &whole,
+        ", which is the missing token showing up in the only place it can: the answer",
     );
-    println!(
-        "  CARRIED vs WHOLE      : {cw}/{} tokens{}",
-        whole.len(),
-        match cw == whole.len() {
-            true => String::new(),
-            false => format!(" — diverges at {cw} ({} against {})", fixed[cw], whole[cw]),
-        }
+    if dw == whole.len() {
+        println!(
+            "      ^ AGREED. One missing token of context did not flip a greedy argmax at this \
+             prompt and this length, so THIS RUN has proven nothing about the defect. It has \
+             not shown it absent."
+        );
+    }
+    line(
+        "ONE-PASS vs WHOLE",
+        &one_pass,
+        &whole,
+        " — REPARTITIONING ALONE, same tokens; this is the scale a DROPPED divergence has to be \
+         read against",
     );
-    // FRAMING: seconds for one TURN TWO -- one `extend` pass over the delta plus
-    // `steps - 1` decode steps -- at the layer range this session runs, on one
-    // box, against each other and nothing else. The carried arm's delta is one
-    // token wider and is the same single batched pass, which is the claim.
+    line(
+        "BATCHED vs WHOLE",
+        &batched,
+        &whole,
+        " — the served shape against the walked reference, same tokens; repartitioning again",
+    );
+
+    // FRAMING: seconds for the APPEND of one turn two -- the `extend` call and
+    // nothing else -- at the layer range this session runs, on one box, one
+    // sample an arm. Per PASS, not per token, and not per turn.
     println!(
-        "  what the carry cost   : turn two {dropped_s:.3}s dropped against {fixed_s:.3}s \
-         carried ({} vs {} delta tokens, {} decode steps each) — the carried token is a ROW of \
-         a batch the turn was making anyway, not a decode step",
+        "  what the append cost  : DROPPED {dropped_s:.3}s / {} tok walked | CARRIED \
+         {fixed_s:.3}s / {} tok walked | WHOLE {whole_s:.3}s / {} tok walked | BATCHED \
+         {batched_s:.3}s / {} tok in ONE pass",
         delta.len(),
         with_carry.len(),
-        steps - 1,
+        forced.len(),
+        with_carry.len(),
+    );
+    println!(
+        "  what the carry cost   : one extra ROW of a pass the turn was making anyway — \
+         {batched_s:.3}s for {} rows, {:.1} ms a row — against a whole DECODE STEP, which is \
+         what feeding it back through `step` would have cost instead",
+        with_carry.len(),
+        1e3 * batched_s / with_carry.len() as f64,
     );
 
     anyhow::ensure!(
         cw == whole.len(),
         "a served turn that carries its last token forward diverges at token {cw} from the \
-         session fed the identical sequence in one pass — so a served conversation is not the \
-         sequence it claims to be"
+         session fed the identical sequence one position at a time — same partition, same \
+         shapes, so this is the tokens and nothing else"
     );
     println!("CARRY GATE: PASS");
     Ok(())
