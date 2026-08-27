@@ -156,10 +156,49 @@
 //! made. The full reconciliation of this ceiling is in `w4a16gemm`, above
 //! `w4a16_linear_wide`.
 //!
-//! **The projections are computed, not measured**, from the measured components
-//! above. The honest headline is **1.5–1.9x at batch one**, and the thing that
-//! decides where in that range it lands is the host enqueue path, not the
-//! interconnect. That is worth saying twice: after this change the binding
+//! **MEASURED, 2026-08-27**, and the projection held at its low end. Same
+//! binary bytes on both boxes, `INK_FORCE_IDS`-pinned 3732-token context,
+//! `INK_GEN=64 INK_KV=1`, no speculation, arms INTERLEAVED (TP, PP, TP, PP,
+//! TP, PP), both boxes locked with `scripts/gb10-lock.sh` and verified idle, a
+//! memory settle and >=60 s between reps, free-running clocks. Per DECODE
+//! STEP, warm only (the first two of 64 discarded), from each run's own
+//! `WARM steps only` line:
+//!
+//! ```text
+//!   arm  rep   WARM ms/step   p50     min
+//!   PP2   A         86.6      86.5   85.4
+//!   PP2   B         86.3      86.2   84.6
+//!   PP2   C         86.0      86.1   84.4
+//!   TP2   A        239.6     204.5   56.5
+//!   TP2   B         68.7      58.5   56.2
+//!   TP2   C         57.0      57.0   55.8
+//!
+//!   last interleaved pair, C against C     86.0 -> 57.0    1.51x
+//!   min of warm launches, either arm       84.4 -> 55.8    1.51x
+//! ```
+//!
+//! Read the TP2 column honestly: **its step is not yet as reproducible as the
+//! pipeline's.** The pipeline lands 86.6/86.3/86.0 -- a 0.7% spread -- and the
+//! split lands 239.6/68.7/57.0 while its MINIMUM sits at 55.8-56.5 in all
+//! three. The clean step is the same every time; what varies is how often the
+//! box stalls, and it falls monotonically as the machine settles between runs.
+//! That is an allocator-under-pressure story, not a split story, and the
+//! residency section below prices it.
+//!
+//! and the breakdown says it is the projected mechanism and not a coincidence:
+//! `layer loop 50.2 ms` of HOST bracket against `DEVICE still owed 5.4 ms` at
+//! the sync. **The pass is host-enqueue bound after this change**, exactly as
+//! the projection above said it would be -- so the next millisecond comes from
+//! the enqueue path (graph capture) and not from the wire.
+//!
+//! The collective term, measured through the real path rather than budgeted:
+//! `scripts/tp-probe.sh` at 84 collectives of `[1, 4096]` f32, median of 7 warm
+//! reps, **2.377 ms a token** against the 2.483 ms this header budgets -- 28.30
+//! us apiece pipelined, of which 0.810 ms is host. That is **4.2% of a 57.0 ms
+//! TP2 step**, and the trade stands as costed.
+//!
+//! The 1.9x end of the range was NOT reached and the reason is named in the
+//! residency section below: it is not the interconnect. That is worth saying twice: after this change the binding
 //! constraint moves from LPDDR to the CPU issuing kernels, and every
 //! millisecond taken out of the 1.25 ms/layer enqueue cost is then worth double
 //! what it is worth today.
@@ -307,6 +346,59 @@
 //! * **The KV and activation working set**, halved with the heads — the term
 //!   that put `MemAvailable` at 1.38 GiB and swapped 5.50 GiB of the head at 96
 //!   slots.
+//!
+//! # Is the split's output the SAME output? No, and it cannot be
+//!
+//! Gated 2026-08-27 against the pipeline arm on the same binary, same pinned
+//! 3732-token context, `INK_GEN=64 INK_KV=1`, no speculation. The verdict, in
+//! order of what each measurement rules out:
+//!
+//! * **Both configurations are bit-REPRODUCIBLE.** Two independent PP2
+//!   processes agreed on 65/65 decoded tokens, on the whole top-5 table
+//!   (identical sha256), and on every printed prefill layer-RMS. Three
+//!   independent TP2 processes agreed with each other on all of the same. So
+//!   the runtime is not the noise source here, and any difference BETWEEN the
+//!   two arms is real and systematic. (Note against the claim that circulates
+//!   in `inkling_forward`'s header: with `INK_FORCE_IDS` pinning the sequence,
+//!   the cached decode lane reproduced exactly, twice, on both arms.)
+//! * **The two TP2 ranks agree bit for bit with each other**, which is what an
+//!   all-reduce guarantees and what makes "both ranks decode the same token
+//!   without a collective" sound.
+//! * **The two ARMS do not agree**: 10 of 65 argmax positions differ, and 60
+//!   of 65 positions differ somewhere in their top FIVE.
+//!
+//! That last line is expected and is not evidence of a wrong shard, because
+//! the split RE-ASSOCIATES every reduced sum: `wo` accumulates over 16 heads
+//! on each rank instead of 32 in one accumulator, and the MoE down projection
+//! over `k = 1024` twice instead of `k = 2048` once. f32 addition is not
+//! associative, so bit-identity is not available at any level of correctness.
+//!
+//! What DOES separate "re-associated" from "wrong" is where the divergence
+//! starts. Prefill residual RMS, layer by layer, PP2 against TP2:
+//!
+//! ```text
+//!   layer  0  dense MLP, sharded + reduced      1.5674 vs 1.5674   rel 0.0e+00
+//!   layer  1  dense MLP, sharded + reduced      2.1222 vs 2.1222   rel 0.0e+00
+//!   layer  2  BF16 MoE + shared, both sharded   2.6913 vs 2.6913   rel 0.0e+00
+//!   layer  3  first NVFP4 MoE layer             3.8883 vs 3.8882   rel 2.6e-05
+//!   layer 16                                  224.85 vs 225.02     rel 7.2e-04
+//!   layer 32                                 4598.97 vs 4606.06    rel 1.5e-03
+//!   layer 41                                10041.02 vs 9905.73    rel 1.3e-02
+//! ```
+//!
+//! The first three layers agree to the printed precision -- five significant
+//! figures -- and those three exercise the sharded attention, the sharded
+//! dense MLP, the sharded shared experts, the sharded BF16 routed experts and
+//! four all-reduces. A DOUBLED MLP half would put layer 2 out by about 100%,
+//! not by less than 1e-4. Divergence starts at 2.6e-05 at the first NVFP4
+//! layer -- the size f32 re-association gives over a 2048-term sum -- and
+//! grows to 1.3e-02 by layer 41 as the residual norm itself grows 6400-fold.
+//!
+//! Both continuations are the same document continued the same way: 55 of the
+//! 65 tokens are identical, in the same slots, and the ten that differ are
+//! near-ties inside numeric fields. Neither degenerates. That is the bar
+//! `inkling_forward`'s header sets -- capability, not identity -- and it is
+//! met; what is NOT available, at any correctness, is bit-identity.
 //!
 //! # What is left REPLICATED in the arena, which is the binding residency term
 //!
