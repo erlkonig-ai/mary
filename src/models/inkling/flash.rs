@@ -258,6 +258,8 @@
 //! large and they would; see the measurements in the commit for where that
 //! leaves the prefill lane against burn's cmma matmul.
 
+use super::fp4quant::e2m1_value;
+use cubecl::e4m3;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 
@@ -307,6 +309,26 @@ pub fn shared_floats(rows: u32, head_dim: u32) -> usize {
     (rows * head_dim + PLANE * (head_dim + 1) + rows * PLANE) as usize
 }
 
+/// Element `idx` of an NVFP4 buffer, dequantised in registers.
+///
+/// `idx` is the index into the buffer's LOGICAL `[rows, kv_heads * head_dim]`
+/// extent — the same index the dense reader uses — because
+/// [`super::kvpages::Fp4Rows`] quantizes the page row-major with the block
+/// running along the feature axis. So the code lives in word `idx / 8` at
+/// nibble `idx % 8`, and its block scale is E4M3 byte `idx / 16`. Nothing here
+/// is a function of the page's row count, which is what lets the caller hand
+/// over a prefix of a reserved page by shortening a scalar.
+///
+/// This is [`super::fp4quant::dequantize_nvfp4_kernel`]'s arithmetic for ONE
+/// element instead of for a sixteen-element block, and it is deliberately the
+/// same `e2m1_value` so the two readers cannot drift in what a code means.
+#[cube]
+fn nvfp4_at(codes: &Array<u32>, scales: &Array<e4m3>, idx: u32) -> f32 {
+    let word = codes[(idx / 8) as usize];
+    let code = (word >> ((idx % 8) * 4)) & 15;
+    e2m1_value(code) * f32::cast_from(scales[(idx / 16) as usize])
+}
+
 /// One `(query tile, KV head, key split)` of global attention, fused.
 ///
 /// Writes an UNNORMALISED partial: `o = sum exp(s - m) v`, beside `m` and
@@ -318,12 +340,32 @@ pub fn shared_floats(rows: u32, head_dim: u32) -> usize {
 /// softmax touches is f32. The cast happens on the way into shared memory and
 /// into a register, which is where the reference implementation puts it as
 /// well: narrow operands, wide accumulation.
+///
+/// # The two readers, and why they are one kernel
+///
+/// `packed` swaps the reader for NVFP4: `kc`/`vc` are the packed E2M1 codes,
+/// eight to a `u32`, and `ks`/`vs` are the E4M3 block scales, one per sixteen
+/// consecutive features — the layout [`super::kvpages::Fp4Rows`] stores and
+/// [`super::fp4quant::dequantize_nvfp4_bf16`] otherwise expands into a BF16
+/// page before this kernel ever runs. The index arithmetic is the SAME
+/// `row * kv_row + kvh * head_dim + d`; only the fetch differs.
+///
+/// It is a comptime branch inside one kernel rather than a second kernel
+/// because everything below the two fetches — the causal and window trimming,
+/// the online softmax's guarded rescale, the split bookkeeping — is subtle,
+/// tested once, and must not be able to fork. The unused pair of arrays costs
+/// nothing at runtime: a bound array a kernel never reads is a constant-bank
+/// pointer, not a register.
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 fn flash_kernel<KV: Numeric>(
     q: &Array<f32>,
     k: &Array<KV>,
     v: &Array<KV>,
+    kc: &Array<u32>,
+    ks: &Array<e4m3>,
+    vc: &Array<u32>,
+    vs: &Array<e4m3>,
     rel: &Array<f32>,
     po: &mut Array<f32>,
     pml: &mut Array<f32>,
@@ -342,6 +384,7 @@ fn flash_kernel<KV: Numeric>(
     #[comptime] kv_heads: u32,
     #[comptime] head_dim: u32,
     #[comptime] rows: u32,
+    #[comptime] packed: bool,
 ) {
     let qt = CUBE_POS_X;
     let kvh = CUBE_POS_Y;
@@ -460,7 +503,12 @@ fn flash_kernel<KV: Numeric>(
             let key = t + j;
             let mut val = f32::new(0.0);
             if key < s_hi {
-                val = f32::cast_from(k[(key * kv_row + kvh * head_dim + d) as usize]);
+                let idx = key * kv_row + kvh * head_dim + d;
+                if comptime![packed] {
+                    val = nvfp4_at(kc, ks, idx);
+                } else {
+                    val = f32::cast_from(k[idx as usize]);
+                }
             }
             sk[(j * skw + d) as usize] = val;
             ki += UNITS;
@@ -546,7 +594,12 @@ fn flash_kernel<KV: Numeric>(
                 for di in 0..dpl {
                     let d = lane + di * PLANE;
                     if d < head_dim {
-                        let vv = f32::cast_from(v[(vbase + d) as usize]);
+                        let mut vv = f32::new(0.0);
+                        if comptime![packed] {
+                            vv = nvfp4_at(vc, vs, vbase + d);
+                        } else {
+                            vv = f32::cast_from(v[(vbase + d) as usize]);
+                        }
                         #[unroll]
                         for ri in 0..rpp {
                             o[(ri * dpl + di) as usize] +=
@@ -646,6 +699,10 @@ fn flash_combine_kernel(
 pub enum KvElem {
     F32,
     Bf16,
+    /// Packed NVFP4: the run's `k`/`v` are the E2M1 code words and its
+    /// `k_scales`/`v_scales` are the E4M3 block scales beside them. Nothing is
+    /// expanded before the kernel runs.
+    Nvfp4,
 }
 
 /// One run of contiguous key/value rows the kernel may read.
@@ -663,6 +720,10 @@ pub enum KvElem {
 pub struct KeyRun<'a> {
     pub k: &'a Handle,
     pub v: &'a Handle,
+    /// The E4M3 block scales, on [`KvElem::Nvfp4`] and only there — where `k`
+    /// and `v` are the packed code words rather than dense values.
+    pub k_scales: Option<&'a Handle>,
+    pub v_scales: Option<&'a Handle>,
     /// Rows in the buffer.
     pub rows: usize,
     /// Absolute sequence position of row 0.
@@ -833,6 +894,7 @@ pub fn flash_attention_launch<R: Runtime>(
     let po = client.empty(po_elems * core::mem::size_of::<f32>());
     let pml = client.empty(pml_elems * core::mem::size_of::<f32>());
 
+    let packed = kv == KvElem::Nvfp4;
     let mut slot0 = 0usize;
     for (run, splits) in runs.iter().zip(split_of.iter().copied()) {
         let kv_elems = run.rows * kv_heads * head_dim;
@@ -848,6 +910,29 @@ pub fn flash_attention_launch<R: Runtime>(
             run.hi,
             run.rows
         );
+        assert_eq!(
+            packed,
+            run.k_scales.is_some() && run.v_scales.is_some(),
+            "NVFP4 needs both block-scale handles and no other element type may carry them"
+        );
+        // THE TWO READERS' EXTENTS. Exactly one pair is live, and the other is
+        // bound to a live handle at length ONE. The kernel's comptime branch
+        // never reads the dead pair, and a length-one binding of a buffer that
+        // is certainly at least four bytes long is how you say "absent" to a
+        // launcher that has no absent. Binding it at the LIVE extent instead
+        // would be a length that is not true of those bytes, which is the kind
+        // of lie a later reader believes.
+        let (dense_elems, code_elems, scale_elems) = if packed {
+            (
+                1,
+                kv_elems / super::fp4quant::CODES_PER_WORD,
+                kv_elems / super::fp4quant::GROUP,
+            )
+        } else {
+            (kv_elems, 1, 1)
+        };
+        let ks = run.k_scales.unwrap_or(run.k).clone();
+        let vs = run.v_scales.unwrap_or(run.v).clone();
         let count = CubeCount::Static(q_tiles as u32, kv_heads as u32, splits as u32);
         let dim = CubeDim::new_1d(UNITS);
         macro_rules! go {
@@ -858,8 +943,12 @@ pub fn flash_attention_launch<R: Runtime>(
                         count.clone(),
                         dim,
                         ArrayArg::from_raw_parts(q.clone(), q_elems),
-                        ArrayArg::from_raw_parts(run.k.clone(), kv_elems),
-                        ArrayArg::from_raw_parts(run.v.clone(), kv_elems),
+                        ArrayArg::from_raw_parts(run.k.clone(), dense_elems),
+                        ArrayArg::from_raw_parts(run.v.clone(), dense_elems),
+                        ArrayArg::from_raw_parts(run.k.clone(), code_elems),
+                        ArrayArg::from_raw_parts(ks.clone(), scale_elems),
+                        ArrayArg::from_raw_parts(run.v.clone(), code_elems),
+                        ArrayArg::from_raw_parts(vs.clone(), scale_elems),
                         ArrayArg::from_raw_parts(rel.clone(), rel_elems),
                         ArrayArg::from_raw_parts(po.clone(), po_elems),
                         ArrayArg::from_raw_parts(pml.clone(), pml_elems),
@@ -878,6 +967,7 @@ pub fn flash_attention_launch<R: Runtime>(
                         kv_heads as u32,
                         head_dim as u32,
                         rows as u32,
+                        packed,
                     )
                 }
             };
@@ -885,6 +975,10 @@ pub fn flash_attention_launch<R: Runtime>(
         match kv {
             KvElem::F32 => go!(f32),
             KvElem::Bf16 => go!(half::bf16),
+            // The element type is dead on this arm — the reader is the packed
+            // one — so it names the widest thing the launcher already knows
+            // how to instantiate rather than adding a third instantiation.
+            KvElem::Nvfp4 => go!(f32),
         };
         slot0 += splits;
     }
@@ -1029,6 +1123,8 @@ mod device_tests {
             .map(|(kh, vh, rows, base)| KeyRun {
                 k: kh,
                 v: vh,
+                k_scales: None,
+                v_scales: None,
                 rows: *rows,
                 base: *base,
                 lo: 0,
