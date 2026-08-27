@@ -305,7 +305,29 @@ if [ "${1:-}" = "--due" ]; then
   row=$(last_row "$repo" frontier)
   [ -n "$row" ] || exit 0                       # no series yet: bootstrap it
   last_sha=$(printf '%s' "$row" | cut -f4)
-  [ "$last_sha" = "$head_sha" ] || exit 0       # main moved: the frontier may have
+  if [ "$last_sha" != "$head_sha" ]; then
+    # MAIN MOVING IS NOT THE SAME AS THE FRONTIER MOVING. On a busy night main
+    # takes dozens of commits, and most of them cannot change a decode step:
+    # this script itself, the results file it writes, docs, other benchmarks.
+    # Firing a 25-minute two-box run per commit would make the habit the
+    # heaviest consumer of the machines it measures, and would do it while
+    # measuring nothing new.
+    #
+    # So ask whether anything that COMPILES INTO THE BINARY changed. Still one
+    # local git call and still no network, which is the contract for a predicate
+    # `orient` re-evaluates every 60 s. If the range is not resolvable locally
+    # (the last row's sha was never fetched here) this answers DUE, because not
+    # knowing is a reason to look rather than a reason to skip.
+    if git -C "$repo" cat-file -e "$last_sha^{commit}" 2>/dev/null; then
+      changed=$(git -C "$repo" diff --name-only "$last_sha..origin/main" -- \
+                  src Cargo.toml Cargo.lock rust-toolchain.toml 2>/dev/null | head -1)
+      [ -n "$changed" ] && exit 0                # the binary can have changed
+    else
+      exit 0
+    fi
+    # main moved but only outside the binary: fall through to the heartbeat,
+    # which still fires eventually and measures box drift at a fixed sha.
+  fi
   last_at=$(iso_to_epoch "$(printf '%s' "$row" | cut -f1)")
   [ "${last_at:-0}" -gt 0 ] || exit 0           # unparseable stamp: look at it
   age_h=$(( ( $(date -u +%s) - last_at ) / 3600 ))
