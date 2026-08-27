@@ -2071,9 +2071,75 @@ struct HostT {
 /// ran at 175. Concatenating along `n` is the one axis that adds cubes without
 /// touching the arithmetic: each warp still computes the same output tile by
 /// the same k-loop, so this is a scheduling change and not a numerical one.
+///
+/// # `down` fuses along K, and NOT along `n` — the reason is the operands
+///
+/// `down` was the obvious next candidate for the same medicine and it does not
+/// take it. `gate_up`'s concatenation works because all four of its blocks
+/// multiply the SAME activation, so stacking them along `n` is free. The two
+/// `down` projections do not: expert `s` consumes
+/// `silu(gate_s) * up_s * gamma_s`, and the gate, the up and the gamma are all
+/// per-expert. An `n` concatenation of two weights against one activation would
+/// have to compute `down_0 @ a_1` and `down_1 @ a_0` as well and throw both
+/// away — 2x the weight bytes for 2x the cubes, which the constant-work control
+/// in `w4a16gemm::swizzle_pays` prices at 1.27x of rate for 2x of bytes, i.e.
+/// 1.57x the TIME. It loses on arithmetic before anything is measured.
+///
+/// The axis that exists here is **K**. `out = down_0 @ a_0 + down_1 @ a_1` is
+/// one product of a `[hidden, n_shared * inter]` weight against the
+/// `[n, n_shared * inter]` concatenation of the activations, and the sum over
+/// experts happens inside the k loop instead of as a separate tensor add. The
+/// grid does NOT change — still `hidden / NTILE` = 512 single-warp cubes — so
+/// this buys nothing from cube count. It buys two other things:
+///
+/// * **K is the second knob.** `w4a16gemm::swizzle_pays` measures the
+///   permuted lane's multiplier saturating at ~1.10 at `k = 2048`, ~1.24 at
+///   `k = 4096` and ~1.45 at `k = 16384`, at a FIXED cube count, because a
+///   longer k loop spreads the L1 working set. Doubling k moves this weight
+///   from one row of that table to the next at constant bytes.
+/// * one launch instead of two, and the `[n, hidden]` tensor add disappears.
+///
+/// It is **not** bit-identical, and that is the one way it differs from
+/// `gate_up`'s fusion. Every term is the same and the k loop visits them in
+/// the same order; what changes is the ASSOCIATION — one running f32
+/// accumulator across the expert seam where there were two accumulators and a
+/// `+` at the end, which is one rounding fewer and a different place for the
+/// rest of them. Nothing here decides whether that matters, which is what
+/// [`sink_down_diff`] is for: it binds both arms and reads the disagreement
+/// off the activations the model actually produced, rather than inferring it.
 struct SharedOnDevice {
     gate_up: dev_lane::ProjW,
-    down: Vec<dev_lane::ProjW>,
+    down: SinkDown,
+}
+
+/// The sink experts' `down` projections, in one of the two shapes they bind to.
+///
+/// Residency is identical either way — the same weight bytes, quantised by the
+/// same per-16-block quantiser, laid out in a different order — so the arms can
+/// be A/B'd inside one process without one of them paying for the other's
+/// memory. See [`SharedOnDevice`] for what the fusion is and why it is K and
+/// not `n`, and [`sink_down_fused`] for the switch.
+enum SinkDown {
+    /// One `[hidden, inter]` weight per shared expert, one GEMM each, summed
+    /// with a tensor add. What shipped before 2026-08-27.
+    Split(Vec<dev_lane::ProjW>),
+    /// One `[hidden, n_shared * inter]` weight, expert-minor along k, so that
+    /// one GEMM against the concatenated activations IS the sum.
+    Fused(dev_lane::ProjW),
+    /// `INK_SINK_DOWN_DIFF=1`: BOTH, so one pass can put the two arms on the
+    /// same activation and read the disagreement instead of arguing about it.
+    ///
+    /// The fusion moves the last ulps — one accumulator across the expert seam
+    /// instead of two summed afterwards — so "not bit-identical" is the
+    /// PREDICTION and the only useful question is how big. Neither assuming it
+    /// is negligible nor assuming it matters is a measurement, which is the
+    /// same reason [`RouteDiff`] exists.
+    ///
+    /// It holds two copies of `down` and syncs on every layer, so it is a
+    /// diagnostic and its timing means nothing. The FUSED result is what the
+    /// run continues with; the split one is computed, compared and discarded,
+    /// so the counters describe the arm under test and not some third thing.
+    Both(Vec<dev_lane::ProjW>, dev_lane::ProjW),
 }
 
 /// Shortlist rows the approximate head rescores exactly when `INK_ANN_HEAD` is
@@ -2470,6 +2536,206 @@ fn normals(seed: u64, step: u64, count: usize) -> Vec<f32> {
 /// fails. See [`head_lane`] for why that bar is gone.
 fn sink_w4a16() -> bool {
     true
+}
+
+/// Whether the sink experts' `down` projections bind as ONE weight fused along
+/// k, from `INK_SINK_DOWN_FUSE`.
+///
+/// See [`SharedOnDevice`] for the mechanism and why the axis is k and not `n`.
+/// This is a knob rather than a rewrite because the two arms differ in the last
+/// ulps — one f32 accumulator across the expert seam instead of two summed
+/// afterwards — so the split form is the reference the fused one is compared
+/// against, and keeping both in one binary is what makes that comparison a
+/// PAIRED one inside a single process rather than two runs of two binaries.
+/// Residency is identical on both arms: the same weight bytes through the same
+/// per-16-block quantiser, reordered.
+///
+/// It has no effect at `n_shared == 1`, where there is nothing to fuse.
+///
+/// `=2` selects the fused WEIGHT with the activation built by `Tensor::cat` of
+/// the per-expert gated tensors instead of by [`wide_gate`]. See
+/// [`sink_down_cat`]: it exists to tell the fusion apart from the way this
+/// binary happens to build its operand, which a single on/off flag cannot.
+fn sink_down_fused() -> bool {
+    sink_down_mode() >= 1
+}
+
+/// `INK_SINK_DOWN_FUSE`, as the three-way it actually is.
+fn sink_down_mode() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("INK_SINK_DOWN_FUSE")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(|v| v.parse::<usize>().unwrap_or(1))
+            .unwrap_or(0)
+    })
+}
+
+/// `INK_SINK_DOWN_FUSE=2`: the fused weight, but the activation concatenated
+/// with `Tensor::cat` rather than produced whole by [`wide_gate`].
+///
+/// # Why this arm exists, and it is the second time this shape has come up
+///
+/// The k-fusion measured **-1.93% on a one-row decode step and +4.26% on the
+/// shared-expert stage of a 3732-row prefill** — a win that inverts on the wide
+/// pass, which is precisely how the shared-memory-staged routed GEMM failed
+/// (see `moegroup::grouped_smem`). A flag with
+/// two positions cannot say WHICH half of the change inverted, and the two
+/// halves have opposite expected signs at prefill:
+///
+/// * the GEMM should be neutral-to-better — `ncu` puts the load sectors and
+///   requests per unit of work byte-identical on both arms, and the registers
+///   at 80 on both, so nothing about the traffic or the occupancy moved;
+/// * the tensor add the fusion DELETES is worth ~183 MB a layer at 3732 rows
+///   (two `[n, hidden]` f32 outputs written, both read back, one written), so
+///   removing it should help most exactly where the loss appeared;
+/// * [`wide_gate`]'s broadcast is the one part that is new rather than
+///   removed, and it is a THREE-dimensional broadcast where the per-expert form
+///   is two-dimensional. Whether that lowers to the same quality of kernel at
+///   30 MB an operand is an assumption, not a measurement.
+///
+/// So this arm keeps the fused weight and the fused GEMM and reverts only the
+/// operand construction, paying a `[n, n_shared * inter]` copy for it. If the
+/// prefill loss follows [`wide_gate`], it is an implementation detail and
+/// fixable; if it follows the GEMM, the fusion itself is regime-dependent and
+/// belongs behind a flag forever.
+fn sink_down_cat() -> bool {
+    sink_down_mode() == 2
+}
+
+/// `INK_SINK_DOWN_DIFF=1`: bind BOTH `down` arms and report what the k-fusion
+/// moved, per layer, on the activation the run actually produced.
+///
+/// See [`SinkDown::Both`]. It overrides [`sink_down_fused`] — a run that asks
+/// for the comparison gets both arms whichever way the speed knob is set — and
+/// it holds a second copy of the weight and syncs every layer, so its timing is
+/// meaningless by construction.
+fn sink_down_diff() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("INK_SINK_DOWN_DIFF").as_deref() == Ok("1"))
+}
+
+/// One layer's `down` projections, applied to the per-expert gated activations
+/// and summed, in whichever shape they bound to.
+///
+/// `gated(s)` produces expert `s`'s `silu(gate) * up * gamma`, as the split arm
+/// has always built it. `gated_all()` produces the same values as ONE
+/// `[n, n_shared * inter]` tensor, in expert order, for the fused arm.
+///
+/// # Why two closures and not a concatenation of the first
+///
+/// Because `Tensor::cat` would put the fusion's cost on `n` and the whole
+/// point is that it has none. `gu` holds every gate block contiguously and
+/// then every up block, so `silu(gu[.., ..n_shared * inter]) * gu[.., n_shared
+/// * inter..]` IS the concatenated activation already — one elementwise chain
+/// over the full width instead of two over half of it, and no copy. A `cat`
+/// would have cost an extra `[n, n_shared * inter]` write and read per layer,
+/// which is nothing at a one-row decode and 16 MB a layer at a 512-row
+/// prefill, i.e. more than the weight read the fusion exists to speed up. That
+/// is the exact shape of the trap the staged grouped GEMM fell into — a
+/// decode win that inverts on the wide pass — and it is avoidable here rather
+/// than merely measurable.
+///
+/// Both closures produce bit-identical VALUES; `silu` and the two multiplies
+/// are elementwise, and a `reshape` of a contiguous tensor is a stride update.
+/// The split arm keeps calling the per-expert one so that the reference arm is
+/// literally the code that shipped.
+fn sink_down_apply(
+    w2: &SinkDown,
+    layer: usize,
+    n_shared: usize,
+    gated: impl Fn(usize) -> T2,
+    gated_all: impl Fn() -> T2,
+) -> T2 {
+    // The split arm, unchanged: one GEMM an expert and a tensor add between.
+    let split = |ws: &[dev_lane::ProjW]| {
+        let mut out: Option<T2> = None;
+        for s in 0..n_shared {
+            let c = dev_lane::linear_w(gated(s), &ws[s]);
+            out = Some(match out {
+                Some(o) => o + c,
+                None => c,
+            });
+        }
+        out.expect("a MoE layer with no shared experts")
+    };
+    // The fused arm. The activations run in the SAME expert order the weight
+    // was interleaved in, so the k loop walks expert 0's `inter` columns and
+    // then expert 1's, and the accumulator IS the sum. The elementwise half is
+    // untouched and bit-identical; only where the two experts' partial sums
+    // meet has moved.
+    let fused = |w: &dev_lane::ProjW| {
+        let a = if sink_down_cat() {
+            T2::cat((0..n_shared).map(&gated).collect(), 1)
+        } else {
+            gated_all()
+        };
+        dev_lane::linear_w(a, w)
+    };
+    match w2 {
+        SinkDown::Split(ws) => split(ws.as_slice()),
+        SinkDown::Fused(w) => fused(w),
+        SinkDown::Both(ws, w) => {
+            let reference = down::<Bk>(split(ws.as_slice()));
+            let arm = fused(w);
+            sink_down_report(layer, &reference, &down::<Bk>(arm.clone()));
+            arm
+        }
+    }
+}
+
+/// Every shared expert's `silu(gate) * up * gamma` at once, as one
+/// `[n, n_shared * inter]` tensor in expert order.
+///
+/// `g` and `u` are the WHOLE gate half and the whole up half of the fused
+/// `gate_up` output — contiguous in `gu` and already expert-major — so the
+/// elementwise product is the concatenated activation without a `Tensor::cat`.
+/// `gam` is `[n, n_shared]`; the reshape to `[n, n_shared, 1]` broadcasts each
+/// expert's gamma across its own `inter` columns and nothing else.
+///
+/// A reshape of a contiguous tensor is a stride update in this backend, so the
+/// two reshapes around the multiply are free and the launch count for the whole
+/// gate is three where the per-expert form is `3 * n_shared`.
+fn wide_gate(g: T2, u: T2, gam: T2, n: usize, n_shared: usize, inter: usize) -> T2 {
+    let gated = dev_lane::silu(g) * u;
+    (gated.reshape([n, n_shared, inter]) * gam.reshape([n, n_shared, 1]))
+        .reshape([n, n_shared * inter])
+}
+
+/// Report `fused` against `split` for one layer's shared-expert output.
+///
+/// Absolute AND relative, because either alone can flatter: an absolute delta
+/// says nothing without the magnitude it sits on, and a relative one explodes
+/// on the near-zero entries every activation has. The denominator is the
+/// SPLIT arm's magnitude, i.e. the reference, and rows where it underflows are
+/// counted rather than divided by.
+fn sink_down_report(layer: usize, split: &[f32], fused: &[f32]) {
+    assert_eq!(
+        split.len(),
+        fused.len(),
+        "the two down arms differ in shape"
+    );
+    let (mut max_abs, mut max_rel, mut differ, mut tiny) = (0.0f32, 0.0f32, 0usize, 0usize);
+    let mut mag = 0.0f32;
+    for (&a, &b) in split.iter().zip(fused.iter()) {
+        mag = mag.max(a.abs());
+        if a.to_bits() != b.to_bits() {
+            differ += 1;
+        }
+        let d = (a - b).abs();
+        max_abs = max_abs.max(d);
+        if a.abs() > 1e-6 {
+            max_rel = max_rel.max(d / a.abs());
+        } else {
+            tiny += 1;
+        }
+    }
+    println!(
+        "  sink down diff L{layer}: {differ}/{} differ, max |Δ| {max_abs:.3e}, max rel {max_rel:.3e} \
+         (on |split| <= {mag:.3e}; {tiny} entries under 1e-6 excluded from rel)",
+        split.len()
+    );
 }
 
 /// The dense weights that live in DEVICE memory for the whole run, unwidened.
@@ -2971,32 +3237,115 @@ impl DeviceDense {
             // One bind or the other, never both: holding the BF16 twin as
             // well would keep the 100.7 MB a layer this exists to stop
             // streaming, and the admission gate prices what is held.
-            let mut sd = SharedOnDevice {
-                gate_up: if sink_w4a16() {
-                    // W4A16 and NOT `Fp4`: four-bit weights against a BF16
-                    // activation, because nothing calibrated an input
-                    // quantiser for this tensor. See [`sink_w4a16`].
+            let gate_up = if sink_w4a16() {
+                // W4A16 and NOT `Fp4`: four-bit weights against a BF16
+                // activation, because nothing calibrated an input
+                // quantiser for this tensor. See [`sink_w4a16`].
+                w4a16_bind(
+                    client,
+                    quantized_bf16(client, &gu, 2 * n_shared * inter, h),
+                    // Never read by `linear_ann`. See `w4a16_bind`.
+                    false,
+                )
+            } else {
+                dev_lane::ProjW::Bf16(bind_bf16(client, aliases, &gu, 2 * n_shared * inter, h))
+            };
+            let split = || {
+                (0..n_shared)
+                    .map(|e| {
+                        let raw = &d.bytes[e * per_d..(e + 1) * per_d];
+                        if sink_w4a16() {
+                            w4a16_bind(client, quantized_bf16(client, raw, h, inter), false)
+                        } else {
+                            // `w2` is NOT de-interleaved, so this one is a view
+                            // of the pile and aliases outright.
+                            dev_lane::ProjW::Bf16(bind_bf16(client, aliases, raw, h, inter))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let fused = || {
+                // EXPERT-MINOR ALONG K. The pile stores `w2` as
+                // `[n_shared][hidden][inter]`; the fused GEMM wants
+                // `[hidden][n_shared][inter]`, so that column `s * inter + c`
+                // of the weight lines up with column `s * inter + c` of the
+                // concatenated activations. That is the whole change: an outer
+                // transpose of two dims, `hidden * n_shared` contiguous runs of
+                // `inter` BF16 values, done once at bind.
+                //
+                // The 16-element NVFP4 blocks do not straddle the seam
+                // (`inter % GROUP == 0`) and `quantized_bf16` fixes `scale2` at
+                // 1.0, so the codes and scales this produces are the SAME BYTES
+                // the per-expert binds produced, merely reordered. The
+                // quantisation is not part of what changed.
+                // The split form indexes `[e * per_d ..]` and would read a
+                // prefix of a larger buffer without complaining; the interleave
+                // reads every expert's every row, so it is the one that has to
+                // say what it assumes.
+                assert_eq!(
+                    d.bytes.len(),
+                    n_shared * per_d,
+                    "shared_w2 is not {n_shared} experts x {per_d} bytes"
+                );
+                let row = inter * 2;
+                let mut il = vec![0u8; n_shared * per_d];
+                for r in 0..h {
+                    for s in 0..n_shared {
+                        let src = s * per_d + r * row;
+                        let dst = (r * n_shared + s) * row;
+                        il[dst..dst + row].copy_from_slice(&d.bytes[src..src + row]);
+                    }
+                }
+                if sink_w4a16() {
                     w4a16_bind(
                         client,
-                        quantized_bf16(client, &gu, 2 * n_shared * inter, h),
-                        // Never read by `linear_ann`. See `w4a16_bind`.
+                        quantized_bf16(client, &il, h, n_shared * inter),
                         false,
                     )
                 } else {
-                    dev_lane::ProjW::Bf16(bind_bf16(client, aliases, &gu, 2 * n_shared * inter, h))
-                },
-                down: Vec::new(),
+                    // The one thing the fusion costs the BF16 arm: the split
+                    // form ALIASES the pile, and an interleaved buffer cannot.
+                    // `sink_w4a16` is a literal `true`, so this branch is
+                    // unreachable in any shipped run; it is kept correct rather
+                    // than kept cheap.
+                    dev_lane::ProjW::Bf16(bind_bf16(client, None, &il, h, n_shared * inter))
+                }
             };
-            for e in 0..n_shared {
-                let raw = &d.bytes[e * per_d..(e + 1) * per_d];
-                sd.down.push(if sink_w4a16() {
-                    w4a16_bind(client, quantized_bf16(client, raw, h, inter), false)
-                } else {
-                    // `w2` is NOT de-interleaved, so this one is a view of the
-                    // pile and aliases outright.
-                    dev_lane::ProjW::Bf16(bind_bf16(client, aliases, raw, h, inter))
-                });
+            let down = match (sink_down_fused() && n_shared > 1, sink_down_diff()) {
+                (_, true) if n_shared > 1 => SinkDown::Both(split(), fused()),
+                (true, _) => SinkDown::Fused(fused()),
+                _ => SinkDown::Split(split()),
+            };
+            // WHICH ARM RAN, said once, because nothing else says it. The W4A16
+            // census keys its line on (kind, REASON), so `gate_up` and `down`
+            // collapse onto one line whenever they land in the same layout --
+            // which they do here, both permuted -- and the shape printed is
+            // whichever bound first. An A/B whose two arms differ only by an
+            // environment variable needs a tell in the output that is not the
+            // number being measured, and this is it: the arm's own shape.
+            static SAID_DOWN: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !SAID_DOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let (what, k) = match &down {
+                    SinkDown::Split(_) => ("SPLIT, one GEMM an expert", inter),
+                    SinkDown::Fused(_) if sink_down_cat() => {
+                        ("FUSED along k, operand by cat", n_shared * inter)
+                    }
+                    SinkDown::Fused(_) => ("FUSED along k, one GEMM", n_shared * inter),
+                    SinkDown::Both(..) => {
+                        ("BOTH (INK_SINK_DOWN_DIFF=1, diagnostic)", n_shared * inter)
+                    }
+                };
+                println!(
+                    "  sink `down`: {what} -- [{h}, {k}] x {}, {} cubes at m=1",
+                    match &down {
+                        SinkDown::Split(v) => v.len(),
+                        _ => 1,
+                    },
+                    h / 8
+                );
             }
+            let sd = SharedOnDevice { gate_up, down };
             self.bytes += (gu.len() + n_shared * per_d) as u64;
             self.shared.insert(p.to_string(), sd);
         }
@@ -3322,6 +3671,7 @@ fn shared_experts_bf16(
     sw: &SharedOnDevice,
     gammas: &[f32],
     n_shared: usize,
+    layer: usize,
 ) -> T2 {
     let [n, _] = x.dims();
     assert_eq!(
@@ -3335,21 +3685,30 @@ fn shared_experts_bf16(
     // four grids of 256 cubes, and this is one of 1024.
     let inter = sw.gate_up.n() / (2 * n_shared);
     let gu = dev_lane::linear_w(x, &sw.gate_up);
-    let mut out: Option<T2> = None;
-    for s in 0..n_shared {
-        let g = gu.clone().slice([0..n, s * inter..(s + 1) * inter]);
-        let u = gu
-            .clone()
-            .slice([0..n, (n_shared + s) * inter..(n_shared + s + 1) * inter]);
-        let col: Vec<f32> = (0..n).map(|tk| gammas[tk * n_shared + s]).collect();
-        let gam = BT::<Bk, 2>::from_data(BTD::new(col, [n, 1]), dev);
-        let c = dev_lane::linear_w(dev_lane::silu(g) * u * gam, &sw.down[s]);
-        out = Some(match out {
-            Some(o) => o + c,
-            None => c,
-        });
-    }
-    out.expect("a MoE layer with no shared experts")
+    sink_down_apply(
+        &sw.down,
+        layer,
+        n_shared,
+        |s| {
+            let g = gu.clone().slice([0..n, s * inter..(s + 1) * inter]);
+            let u = gu
+                .clone()
+                .slice([0..n, (n_shared + s) * inter..(n_shared + s + 1) * inter]);
+            let col: Vec<f32> = (0..n).map(|tk| gammas[tk * n_shared + s]).collect();
+            let gam = BT::<Bk, 2>::from_data(BTD::new(col, [n, 1]), dev);
+            dev_lane::silu(g) * u * gam
+        },
+        || {
+            let g = gu.clone().slice([0..n, 0..n_shared * inter]);
+            let u = gu
+                .clone()
+                .slice([0..n, n_shared * inter..2 * n_shared * inter]);
+            // `gammas` is already `[n, n_shared]` row-major -- the per-expert
+            // closure above is the one that has to gather a column out of it.
+            let gam = BT::<Bk, 2>::from_data(BTD::new(gammas.to_vec(), [n, n_shared]), dev);
+            wide_gate(g, u, gam, n, n_shared, inter)
+        },
+    )
 }
 
 // `lin_bf16` was here. It is `dev_lane::linear_bf16` now: once the attention
@@ -4705,24 +5064,38 @@ fn routed_experts_bf16_dev(
 /// expert; this slices the same column out of `routetopk`'s own output. Same
 /// f32 values, same multiply, same order — the readback was the only thing
 /// between them.
-fn shared_experts_dev(x: T2, sw: &SharedOnDevice, topk: T2, top_k: usize, n_shared: usize) -> T2 {
+fn shared_experts_dev(
+    x: T2,
+    sw: &SharedOnDevice,
+    topk: T2,
+    top_k: usize,
+    n_shared: usize,
+    layer: usize,
+) -> T2 {
     let [n, _] = x.dims();
     let inter = sw.gate_up.n() / (2 * n_shared);
     let gu = dev_lane::linear_w(x, &sw.gate_up);
-    let mut out: Option<T2> = None;
-    for s in 0..n_shared {
-        let g = gu.clone().slice([0..n, s * inter..(s + 1) * inter]);
-        let u = gu
-            .clone()
-            .slice([0..n, (n_shared + s) * inter..(n_shared + s + 1) * inter]);
-        let gam = topk.clone().slice([0..n, 2 * top_k + s..2 * top_k + s + 1]);
-        let c = dev_lane::linear_w(dev_lane::silu(g) * u * gam, &sw.down[s]);
-        out = Some(match out {
-            Some(o) => o + c,
-            None => c,
-        });
-    }
-    out.expect("a MoE layer with no shared experts")
+    sink_down_apply(
+        &sw.down,
+        layer,
+        n_shared,
+        |s| {
+            let g = gu.clone().slice([0..n, s * inter..(s + 1) * inter]);
+            let u = gu
+                .clone()
+                .slice([0..n, (n_shared + s) * inter..(n_shared + s + 1) * inter]);
+            let gam = topk.clone().slice([0..n, 2 * top_k + s..2 * top_k + s + 1]);
+            dev_lane::silu(g) * u * gam
+        },
+        || {
+            let g = gu.clone().slice([0..n, 0..n_shared * inter]);
+            let u = gu
+                .clone()
+                .slice([0..n, n_shared * inter..2 * n_shared * inter]);
+            let gam = topk.clone().slice([0..n, 2 * top_k..2 * top_k + n_shared]);
+            wide_gate(g, u, gam, n, n_shared, inter)
+        },
+    )
 }
 
 /// `INK_DEVPLAN_CHECK=1`: the device plan against the host plan, as BITS.
@@ -9375,14 +9748,14 @@ fn main() -> Result<()> {
                                 n,
                                 topk_width,
                             );
-                            shared_experts_dev(hn, sw, g, t.num_experts_per_tok, ns)
+                            shared_experts_dev(hn, sw, g, t.num_experts_per_tok, ns, layer)
                         }
                         _ => {
                             let gammas: Vec<f32> = routing
                                 .iter()
                                 .flat_map(|rt| rt.shared_gammas.clone())
                                 .collect();
-                            shared_experts_bf16(&dev, hn, sw, &gammas, ns)
+                            shared_experts_bf16(&dev, hn, sw, &gammas, ns, layer)
                         }
                     }
                 };
