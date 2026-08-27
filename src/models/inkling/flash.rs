@@ -1166,6 +1166,181 @@ mod device_tests {
             .fold(0f32, f32::max)
     }
 
+    /// NVFP4 code words and E4M3 block-scale bytes for `n` elements, in the
+    /// layout [`super::super::kvpages::Fp4Rows`] stores: code `i` in word
+    /// `i / 8` at nibble `i % 8`, one scale per sixteen consecutive elements.
+    ///
+    /// Built here rather than by running `quantize_nvfp4`, because a round
+    /// trip through the quantizer would agree with the reader about a layout
+    /// they had both got wrong. The scale bytes are deliberately ones with a
+    /// NONZERO mantissa — `2^(e-7) * (1 + m/8)` for `e` in 6..9 — so the test
+    /// below exercises the claim it rests on rather than only powers of two.
+    fn packed_pair(n: usize, seed: usize) -> (Vec<u32>, Vec<u8>) {
+        assert_eq!(n % 16, 0, "{n} elements is not whole NVFP4 blocks");
+        const SCALES: [u8; 6] = [0x31, 0x35, 0x39, 0x3D, 0x41, 0x45];
+        let mut words = vec![0u32; n / 8];
+        for i in 0..n {
+            words[i / 8] |= (((i * 7 + seed * 5) % 16) as u32) << (4 * (i % 8));
+        }
+        let scales = (0..n / 16)
+            .map(|b| SCALES[(b * 3 + seed) % SCALES.len()])
+            .collect();
+        (words, scales)
+    }
+
+    /// The same shape and the same key-axis cuts, read BOTH ways.
+    ///
+    /// The dense arm is production's, exactly: each cut goes through
+    /// [`super::super::fp4quant::dequantize_nvfp4_bf16`] into a BF16 page and
+    /// the kernel consumes that. The packed arm hands the kernel the very same
+    /// codes and scales. Nothing is decoded on the host, so nothing here can
+    /// be wrong about what a byte means without the device being wrong the
+    /// same way.
+    fn run_both_readers(
+        sh: &Shape,
+        q: &[f32],
+        k: &(Vec<u32>, Vec<u8>),
+        v: &(Vec<u32>, Vec<u8>),
+        rel: &[f32],
+        cuts: &[usize],
+    ) -> (Vec<f32>, Vec<f32>) {
+        let kv_row = sh.kv_heads * sh.head_dim;
+        let groups = sh.heads / sh.kv_heads;
+        let rows = if sh.nq == 1 {
+            decode_rows(groups)
+        } else {
+            prefill_rows(groups)
+        };
+        let client = <CudaRuntime as Runtime>::client(&Default::default());
+        let qh = client.create_from_slice(f32::as_bytes(q));
+        let rh = client.create_from_slice(f32::as_bytes(rel));
+        let mut bounds = vec![0usize];
+        bounds.extend_from_slice(cuts);
+        bounds.push(sh.keys);
+        // (k codes, k scales, v codes, v scales, dense k, dense v, rows, base)
+        let held: Vec<(Handle, Handle, Handle, Handle, Handle, Handle, usize, usize)> = bounds
+            .windows(2)
+            .map(|w| {
+                let (lo, hi) = (w[0], w[1]);
+                let (cw, sw) = (kv_row / 8, kv_row / 16);
+                let up = |c: &Vec<u32>, s: &Vec<u8>| {
+                    (
+                        client.create_from_slice(u32::as_bytes(&c[lo * cw..hi * cw])),
+                        client.create_from_slice(&s[lo * sw..hi * sw]),
+                    )
+                };
+                let (kc, ks) = up(&k.0, &k.1);
+                let (vc, vs) = up(&v.0, &v.1);
+                let deq = |c: &Handle, s: &Handle| {
+                    super::super::fp4quant::dequantize_nvfp4_bf16(&client, c, s, hi - lo, kv_row)
+                };
+                let (kd, vd) = (deq(&kc, &ks), deq(&vc, &vs));
+                (kc, ks, vc, vs, kd, vd, hi - lo, lo)
+            })
+            .collect();
+        let launch = |runs: &[KeyRun<'_>], elem: KvElem| {
+            let oh = flash_attention_launch(
+                &client,
+                &qh,
+                runs,
+                &rh,
+                elem,
+                sh.nq,
+                sh.q0,
+                sh.heads,
+                sh.kv_heads,
+                sh.head_dim,
+                sh.eff,
+                sh.window,
+                1.0 / sh.head_dim as f32,
+                rows,
+            );
+            f32::from_bytes(&client.read_one(oh).expect("read the fused output")).to_vec()
+        };
+        let dense: Vec<KeyRun<'_>> = held
+            .iter()
+            .map(|(_, _, _, _, kd, vd, rows, base)| KeyRun {
+                k: kd,
+                v: vd,
+                k_scales: None,
+                v_scales: None,
+                rows: *rows,
+                base: *base,
+                lo: 0,
+                hi: *rows,
+            })
+            .collect();
+        let packed: Vec<KeyRun<'_>> = held
+            .iter()
+            .map(|(kc, ks, vc, vs, _, _, rows, base)| KeyRun {
+                k: kc,
+                v: vc,
+                k_scales: Some(ks),
+                v_scales: Some(vs),
+                rows: *rows,
+                base: *base,
+                lo: 0,
+                hi: *rows,
+            })
+            .collect();
+        (launch(&dense, KvElem::Bf16), launch(&packed, KvElem::Nvfp4))
+    }
+
+    /// The packed reader is the dequantising reader to the BIT, and that is a
+    /// property of NVFP4 rather than luck.
+    ///
+    /// An E2M1 magnitude carries at most two mantissa bits (`1.1b`, i.e. 1.5
+    /// and 3 and 6) and an E4M3 scale at most four significant bits, so their
+    /// product needs at most six — and BF16 has eight. The dequantised page is
+    /// therefore EXACT in BF16, and reading the codes directly reconstructs the
+    /// same f32 the BF16 page widens to. There is no rounding to trade away
+    /// here, which is why this asserts equality and not a tolerance.
+    ///
+    /// A tolerance would also be the wrong instrument for what actually breaks:
+    /// every way of getting NVFP4 indexing wrong — the nibble order inside a
+    /// word, which sixteen features share a scale, scales indexed per row
+    /// instead of per block — is silent. Each produces finite, plausible
+    /// attention over the wrong numbers, and each moves the answer far more
+    /// than any tolerance a numerical argument would justify.
+    #[test]
+    fn the_packed_reader_is_the_dequantising_reader_to_the_bit() {
+        for (nq, keys, window) in [
+            (1usize, 700usize, None),
+            (1, 33, None),
+            (16, 200, Some(64usize)),
+            (37, 91, None),
+        ] {
+            let sh = Shape {
+                nq,
+                q0: keys - nq,
+                keys,
+                heads: 8,
+                kv_heads: 2,
+                head_dim: 32,
+                eff: 5,
+                window,
+            };
+            let n = sh.keys * sh.kv_heads * sh.head_dim;
+            let k = packed_pair(n, 1);
+            let v = packed_pair(n, 2);
+            let q = fill(sh.nq * sh.heads * sh.head_dim, 0.1);
+            let rel = fill(sh.nq * sh.heads * sh.eff, 0.7);
+            for cuts in [vec![], vec![keys / 2], vec![7, keys / 3, keys - 5]] {
+                let (dense, packed) = run_both_readers(&sh, &q, &k, &v, &rel, &cuts);
+                assert!(
+                    dense.iter().any(|x| x.abs() > 1e-6),
+                    "nq {nq}, {keys} keys: the dense arm computed nothing to compare against"
+                );
+                assert_eq!(
+                    dense,
+                    packed,
+                    "nq {nq}, {keys} keys, cuts {cuts:?}: worst |delta| {}",
+                    worst(&dense, &packed)
+                );
+            }
+        }
+    }
+
     /// THE defining property of an online softmax, and the one a two-pass
     /// implementation cannot fail: where the key axis is cut must not change
     /// the answer.
