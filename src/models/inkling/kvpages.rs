@@ -186,6 +186,34 @@ pub trait PageRows: Clone {
 /// [`Pages::read_rows`] chooses. Fixing the pages fixes the addresses and the
 /// allocation; the epoch is then that read window's granularity, which is a
 /// tunable rather than a page size. See [`kv_epoch`].
+///
+/// ## Why a reservation is affordable at all, which is a fact about the KERNEL
+///
+/// A reserved page is mostly dead rows -- a global store holds 1,048,576 of
+/// them and a decode step at 3732 tokens of context reads past 3732 -- and the
+/// obvious objection is that the read then costs the reservation rather than
+/// the context. It does not, and the reason is in [`super::flash`]: a
+/// `KeyRun` carries `rows` (the buffer) beside `lo .. hi` (the live keys), the
+/// launcher sizes its grid from `hi - lo`, and the kernel's own key loop runs
+/// `s_lo .. s_hi` inside that range. `rows` reaches the kernel ONLY as the
+/// binding length of an array argument. So a dead row costs nothing to score
+/// and nothing to accumulate, and the whole of what the reservation adds is
+/// the DEQUANT, which is why [`Pages::read_rows`] and not the reservation is
+/// what the epoch bounds.
+///
+/// The same paragraph is why a replay stays correct when the launcher's split
+/// count goes stale. `splits` is a grid dimension baked into a capture, but
+/// each split's range is `per = ceil((khi - klo) / splits)` computed IN the
+/// kernel from the patched bounds -- so a captured 30-way split still covers
+/// the whole live range as that range grows, at slightly larger slices. Stale
+/// there is suboptimal, never wrong.
+///
+/// The dense [`PageStore`] arm has neither property: [`PagedKv`] reads pages
+/// whole and would carry every dead row into a score matrix, and cutting the
+/// page down first is a `slice`, which allocates. That is why
+/// [`super::burn::AttnCache::reserve_kv`] refuses anything but an FP4 cache.
+///
+/// [`PagedKv`]: super::burn
 #[derive(Clone, Debug)]
 pub struct Pages<R: PageRows> {
     pages: Vec<R>,
