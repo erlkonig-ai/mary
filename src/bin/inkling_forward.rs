@@ -7989,6 +7989,30 @@ fn main() -> Result<()> {
     } else {
         1
     };
+    // HOW MANY CAPTURES FIT IS A PROPERTY OF THE PINNED POOL, and left alone
+    // that property is TWO -- which is one too few for the tail half.
+    //
+    // A capture owns the pinned staging its memcpy nodes read from, so each one
+    // takes a whole pass's worth of buffers out of the pool for good. The pool
+    // gets those buffers from the pre-warm passes, and the pre-warm could only
+    // ever put TWO passes' worth in, whatever `INK_GRAPH_WARM` said: the drop
+    // queue is a DOUBLE buffer, `flush` frees the batch before last, and the old
+    // code flushed at the end of every warm pass -- so pass N+1 got back exactly
+    // what pass N had taken and the pool never grew past two batches. Two
+    // batches, two captures, no margin: the head half squeaked through and the
+    // TAIL, whose region also carries the final norm, the unembed and the draft
+    // head, came up two buffers short and died at layer 41 with
+    // CUDA_ERROR_STREAM_CAPTURE_INVALIDATED on all 7 reps of the 2026-08-27
+    // production run.
+    //
+    // So the warm passes HOLD instead: the deferral stays on across all of them
+    // and is released once, after the last. Each pass then finds the previous
+    // pass's buffers still live and has to allocate its own -- outside a
+    // capture, where allocating is legal -- and the pool ends up with as many
+    // batches as there were warm passes. `INK_GRAPH_WARM` finally means what it
+    // reads as. `INK_GRAPH_WARM_HOLD=0` is the arm that goes back to releasing
+    // per pass, for a run that wants to see the old ceiling.
+    let warm_hold = std::env::var("INK_GRAPH_WARM_HOLD").ok().as_deref() != Some("0");
     let mut graphs_captured: Vec<u64> = Vec::new();
     let mut graph_diff_done = false;
     let mut graph_report: Option<(usize, f64, Vec<f64>)> = None;
@@ -8340,17 +8364,45 @@ fn main() -> Result<()> {
         // in. A knob whose out-of-range setting disables the thing it tunes is
         // a trap; the honest reading of "warm more than there is room for" is
         // "warm everything there is room for".
+        //
+        // ONE MORE PASS THAN THERE ARE CAPTURES, by default. Each capture keeps
+        // a batch of pinned staging for good and the pool only holds what the
+        // warm passes put in it, so `want_captures` batches is exactly enough
+        // and exactly no margin -- and the region is not the only thing on the
+        // stream: the unembed, the argmax and the draft head stage through the
+        // same pool between the captures. The spare batch is that margin. It
+        // costs a warm pass and a few hundred KB of pinned host memory.
         #[allow(non_snake_case)]
         let PREWARM_PASSES: usize = std::env::var("INK_GRAPH_WARM")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(2)
+            .unwrap_or((want_captures + 1).max(2))
             .min(graph_step);
         let prewarm_now = graph_on
             && is_decode
             && graphs_captured.is_empty()
             && step - prefill_passes >= graph_step - PREWARM_PASSES
             && step - prefill_passes < graph_step;
+        // The LAST warm pass, which is the only one that hands anything back --
+        // see `warm_hold`. Releasing on every pass is what capped the pool at
+        // two batches no matter how many passes were asked for.
+        let prewarm_last = prewarm_now && step - prefill_passes + 1 == graph_step;
+        // SAID OUT LOUD ON THE FIRST WARM PASS, because the clamp above turns
+        // "not enough room to warm" into a capture that dies a hundred layers
+        // later with a driver error that names none of this.
+        if prewarm_now
+            && step - prefill_passes + PREWARM_PASSES == graph_step
+            && PREWARM_PASSES <= want_captures
+        {
+            println!(
+                "  GRAPHWARM: only {PREWARM_PASSES} warm pass(es) fit before decode step \
+                 {graph_step}, and each of the {want_captures} captures keeps one pass's worth \
+                 of pinned staging for good. The last capture will have nothing left to draw on \
+                 and will die with CUDA_ERROR_STREAM_CAPTURE_INVALIDATED partway through the \
+                 region. Raise INK_GRAPH_STEP to at least {} to leave a spare batch.",
+                want_captures + 2
+            );
+        }
         if prewarm_now {
             fp4_client.graph_defer_frees(true);
         }
@@ -9985,10 +10037,15 @@ fn main() -> Result<()> {
                 .expect("a lane plan implies a capture, and a capture sets the output handle");
             lane_steps += 1;
         }
-        if prewarm_now {
+        if prewarm_last || (prewarm_now && !warm_hold) {
             // Stop deferring and hand the slices back. The PAGES stay in the
             // pool, which is the whole point: the capture that follows finds
             // them free instead of asking CUDA for more.
+            //
+            // ONCE, after the last warm pass. Doing it on every pass hands back
+            // exactly what the next pass then re-takes, which is why no number
+            // of warm passes used to grow the pool past the drop queue's own
+            // two-batch depth.
             fp4_client.graph_defer_frees(false);
             fp4_client.flush();
         }
