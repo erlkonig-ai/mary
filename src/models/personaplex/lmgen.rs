@@ -36,6 +36,10 @@ use super::temporal::TemporalTransformer;
 pub const CT: usize = cfg::MAX_DELAY + 3;
 /// moshi `ungenerated_token_id` — a slot no one has written yet.
 const UNGENERATED: i64 = -2;
+/// moshi `zero_token_id` — this stream contributes no temporal embedding.
+const ZERO: i64 = -1;
+/// First user-audio stream in `[text, agent 1..8, user 1..8]`.
+const USER_STREAM_START: usize = 1 + cfg::AUDIO_TOKENS_PER_STREAM;
 
 fn initial(k: usize) -> i64 {
     if k == 0 {
@@ -155,6 +159,33 @@ impl StreamCache {
         })
     }
 
+    /// Prepare a generation-only step with no user-audio contribution.
+    ///
+    /// This is deliberately distinct from `prepare(None, ..)`: an absent
+    /// duplex input lets the model feed its predicted user streams back into
+    /// the temporal stack. Output-only generation instead presents `-1`
+    /// (`zero_token_id`) in all eight user input slots, so those embedding
+    /// tables contribute exactly zero. It also releases any user targets
+    /// left by initial seeding or the preceding prompt frame; the user half
+    /// of [`Prepared::forced`] is therefore always `None`, never `Some(-1)`.
+    ///
+    /// Returns `None` only for the offset-0 cache-seeding call, like
+    /// [`Self::prepare`]. Agent audio and text forcing retain their ordinary
+    /// semantics.
+    pub fn prepare_output_only(
+        &mut self,
+        moshi_tokens: Option<&[i64; 8]>,
+        text_token: Option<i64>,
+    ) -> Option<Prepared> {
+        let mut prepared = self.prepare(None, moshi_tokens, text_token)?;
+        prepared.input[USER_STREAM_START..].fill(ZERO);
+        prepared.provided[USER_STREAM_START..].fill(false);
+        for stream in USER_STREAM_START..cfg::NUM_STREAMS {
+            self.provided[stream][prepared.target_pos] = false;
+        }
+        Some(prepared)
+    }
+
     /// moshi `process_transformer_output`'s bookkeeping tail: clear the
     /// `provided` flags at the consumed input position, write the sampled
     /// tokens at the target where not provided, and emit the undelayed
@@ -271,7 +302,25 @@ impl<B: Backend> LmGen<B> {
         text_token: Option<i64>,
         device: &B::Device,
     ) -> StepTrace {
-        let Some(p) = self.stream.prepare(input_tokens, moshi_tokens, text_token) else {
+        let prepared = self.stream.prepare(input_tokens, moshi_tokens, text_token);
+        self.step_prepared(prepared, device)
+    }
+
+    /// Generation-only counterpart to [`Self::step`]: every temporal input
+    /// omits all user-audio embeddings, and no user depformer step is forced.
+    /// Agent-audio and text forcing are unchanged.
+    pub fn step_output_only(
+        &mut self,
+        moshi_tokens: Option<&[i64; 8]>,
+        text_token: Option<i64>,
+        device: &B::Device,
+    ) -> StepTrace {
+        let prepared = self.stream.prepare_output_only(moshi_tokens, text_token);
+        self.step_prepared(prepared, device)
+    }
+
+    fn step_prepared(&mut self, prepared: Option<Prepared>, device: &B::Device) -> StepTrace {
+        let Some(p) = prepared else {
             return StepTrace {
                 input: None,
                 next_text: -1,
@@ -408,5 +457,42 @@ mod tests {
         b.reset();
         assert_eq!(a.offset(), b.offset());
         assert_eq!(run(&mut a, 30, 55), run(&mut b, 30, 55));
+    }
+
+    /// Output-only is a different state from an omitted duplex frame: the
+    /// temporal view must contain zero-token sentinels immediately after the
+    /// seed call, and seed/prompt leftovers must never force the user half of
+    /// the depformer chain.
+    #[test]
+    fn output_only_zeroes_user_input_without_forcing_it() {
+        let mut cache = StreamCache::new();
+        let sampled_audio = [7; cfg::DEP_Q];
+
+        assert!(
+            cache.prepare_output_only(None, None).is_none(),
+            "offset 0 is the seed-only call"
+        );
+
+        // Cross the delay horizon and one complete ring cycle. Offset 1 is
+        // the important edge: delayed streams still carry seed-provided
+        // targets there unless output-only explicitly releases them.
+        for offset in 1..=CT + cfg::MAX_DELAY {
+            let prepared = cache
+                .prepare_output_only(None, None)
+                .expect("every post-seed call prepares a model frame");
+            assert_eq!(cache.offset(), offset);
+            assert_eq!(
+                &prepared.input[USER_STREAM_START..],
+                &[ZERO; cfg::AUDIO_TOKENS_PER_STREAM],
+                "user temporal inputs at offset {offset}"
+            );
+            assert!(
+                prepared.forced()[cfg::AUDIO_TOKENS_PER_STREAM..]
+                    .iter()
+                    .all(Option::is_none),
+                "user depformer forcing at offset {offset}"
+            );
+            let _ = cache.commit(&prepared, 5, &sampled_audio);
+        }
     }
 }

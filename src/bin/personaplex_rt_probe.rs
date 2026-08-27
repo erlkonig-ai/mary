@@ -47,8 +47,9 @@
 //!   the gate verifies the divergence is an argmax near-tie flip, not
 //!   garbage: logits cos + flip margins at that step), and audio cos vs the
 //!   parity pipeline output over the pre-divergence prefix. Writes
-//!   /tmp/mary-personaplex/rt_pipeline_out.wav. `--depth-f16` stores the
-//!   depformer as f16 (f32 path is the default).
+//!   /tmp/mary-personaplex/rt_pipeline_out.wav. It also takes one final
+//!   output-only step and gates the public trace's user inputs to `-1`.
+//!   `--depth-f16` stores the depformer as f16 (f32 path is the default).
 //!
 //! Env: RT_ROUNDS (default 5), RT_STEPS (default 16),
 //! MARY_DEPTH_THREADS/MARY_PRED_THREADS (depformer pools).
@@ -1376,6 +1377,19 @@ fn pipeline_gate(pile: &str, fmt: WeightFmt, depth_f16: bool) {
         run_secs * 1e3 / steps as f64
     );
 
+    // Exercise the public generation-only seam after real user frames. The
+    // pure StreamCache test separately gates the corresponding depformer
+    // forcing view; the pipeline trace proves those prepared tokens are the
+    // ones handed to the temporal embedding path.
+    let output_only = p.step_output_only(None, None);
+    let ok_output_only = output_only
+        .input
+        .is_some_and(|input| input[9..17].iter().all(|&token| token == -1));
+    println!(
+        "  {} output-only trace has user streams 9..=16 set to zero-token -1",
+        if ok_output_only { "OK" } else { "XX" }
+    );
+
     // ── verdict ──
     // Exactness expectations are per-format: f16 must reproduce the oracle
     // token stream (wiring ablation); q8/q4 are gated on honesty-calibrated
@@ -1395,7 +1409,7 @@ fn pipeline_gate(pile: &str, fmt: WeightFmt, depth_f16: bool) {
             "a REAL numerics change (free-run divergence expected)"
         }
     );
-    if ok_enc && ok_user && ok_fmt && ok_audio {
+    if ok_enc && ok_user && ok_fmt && ok_audio && ok_output_only {
         println!("PERSONAPLEX RT PIPELINE ({fmt:?}): PASS");
     } else {
         println!("PERSONAPLEX RT PIPELINE ({fmt:?}): FAIL");

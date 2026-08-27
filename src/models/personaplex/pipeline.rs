@@ -536,15 +536,12 @@ impl RealtimePipeline {
         }
     }
 
-    /// moshi `LMGen.step` on the fast stages (see [`super::lmgen::LmGen::step`]
-    /// for the contract).
-    pub fn step(
+    fn token_step(
         &mut self,
-        input_tokens: Option<&[i64; 8]>,
-        moshi_tokens: Option<&[i64; 8]>,
-        text_token: Option<i64>,
+        prepared: Option<Prepared>,
+        arbiter: Option<&mut dyn FnMut(&[f32], i64) -> i64>,
     ) -> RtStepTrace {
-        let Some(p) = self.stream.prepare(input_tokens, moshi_tokens, text_token) else {
+        let Some(p) = prepared else {
             return RtStepTrace {
                 input: None,
                 next_text: -1,
@@ -555,7 +552,33 @@ impl RealtimePipeline {
         };
         let input = p.input;
         let x = self.temporal.embed_codes(&input);
-        self.forward(&x, p, Some(input), None)
+        self.forward(&x, p, Some(input), arbiter)
+    }
+
+    /// moshi `LMGen.step` on the fast stages (see [`super::lmgen::LmGen::step`]
+    /// for the contract).
+    pub fn step(
+        &mut self,
+        input_tokens: Option<&[i64; 8]>,
+        moshi_tokens: Option<&[i64; 8]>,
+        text_token: Option<i64>,
+    ) -> RtStepTrace {
+        let prepared = self.stream.prepare(input_tokens, moshi_tokens, text_token);
+        self.token_step(prepared, None)
+    }
+
+    /// Generation-only step: user streams `9..17` are `-1` in every
+    /// post-seed temporal input and the user half of the depformer is never
+    /// forced. Unlike passing `Some(&[-1; 8])` to [`Self::step`], this cannot
+    /// turn the zero-embedding sentinel into a forced depth token. Agent
+    /// audio and text forcing retain their ordinary semantics.
+    pub fn step_output_only(
+        &mut self,
+        moshi_tokens: Option<&[i64; 8]>,
+        text_token: Option<i64>,
+    ) -> RtStepTrace {
+        let prepared = self.stream.prepare_output_only(moshi_tokens, text_token);
+        self.token_step(prepared, None)
     }
 
     /// Step with stream 0 decided AT THE SAMPLING BOUNDARY: the model samples
@@ -579,18 +602,20 @@ impl RealtimePipeline {
         moshi_tokens: Option<&[i64; 8]>,
         decide: &mut dyn FnMut(&[f32], i64) -> i64,
     ) -> RtStepTrace {
-        let Some(p) = self.stream.prepare(input_tokens, moshi_tokens, None) else {
-            return RtStepTrace {
-                input: None,
-                next_text: -1,
-                dep_tokens: [0; cfg::DEP_Q],
-                out: None,
-                text_logits: Vec::new(),
-            };
-        };
-        let input = p.input;
-        let x = self.temporal.embed_codes(&input);
-        self.forward(&x, p, Some(input), Some(decide))
+        let prepared = self.stream.prepare(input_tokens, moshi_tokens, None);
+        self.token_step(prepared, Some(decide))
+    }
+
+    /// Generation-only counterpart to [`Self::step_arbitrated`]. The model
+    /// keeps control of text timing while the temporal user contribution is
+    /// exactly zero and the user depformer steps remain unforced.
+    pub fn step_output_only_arbitrated(
+        &mut self,
+        moshi_tokens: Option<&[i64; 8]>,
+        decide: &mut dyn FnMut(&[f32], i64) -> i64,
+    ) -> RtStepTrace {
+        let prepared = self.stream.prepare_output_only(moshi_tokens, None);
+        self.token_step(prepared, Some(decide))
     }
 
     /// Voice-prompt replay step: the cache advances with dummy initial
