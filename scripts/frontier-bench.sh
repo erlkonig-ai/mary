@@ -530,7 +530,25 @@ if [ "${1:-}" = "--run" ]; then
     tail -25 "$RUNLOG" | sed 's/^/      /'
     die "the run produced no measurement"
   fi
-  grep -q 'THE BOXES DID NOT STAY IDLE' "$RUNLOG" && note "ungated-after"
+  # `ungated-after` on its own over-reports, and the first real run proved it.
+  # pipe-bench re-gates FIVE SECONDS after the last rep exits, and one of the
+  # gate's conditions is a 1-MINUTE load average against a threshold of 2.5 --
+  # which our own seven back-to-back reps, each holding ~100 GiB, have just put
+  # well above it. The first frontier row tripped this with `util 0% load 3.40
+  # compute-apps: none`: no GPU work, no compute apps, no measurement-shaped
+  # processes, only the decay tail of the run being measured. So carry the
+  # EVIDENCE rather than the verdict, and say when it looks like our own residue
+  # rather than a neighbour -- a bare flag makes a clean run and a contaminated
+  # one indistinguishable, which is the failure this whole file is about.
+  if grep -q 'THE BOXES DID NOT STAY IDLE' "$RUNLOG"; then
+    gate_ev=$(sed -n '/gate, after the run/,$p' "$RUNLOG" \
+      | sed -n 's/.*util \([0-9]*\)%  load \([0-9.]*\)  compute-apps: \(.*\)/util=\1%,load=\2,apps=\3/p' | head -1)
+    gate_procs=$(sed -n '/gate, after the run/,$p' "$RUNLOG" | grep -c 'measurement-shaped processes')
+    case "$gate_ev" in
+      util=0%*apps=none) [ "${gate_procs:-0}" -eq 0 ] && gate_ev="$gate_ev,likely-own-decay" ;;
+    esac
+    note "ungated-after${gate_ev:+($gate_ev)}"
+  fi
   grep -q 'IDENTITY FAILS' "$RUNLOG" && note "identity-fails"
   grep -q 'may be paging' "$RUNLOG" && note "paging-suspected"
   fails=$(grep -c -E 'HEAD FAILED|TAIL FAILED' "$RUNLOG")
@@ -578,20 +596,20 @@ if [ "${1:-}" = "--run" ]; then
              printf "%+.2f %.2f %s\n", d, r, v }')
       delta=${dr%% *}; rest=${dr#* }; res=${rest%% *}; verdict=${rest##* }
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    # Accumulated, NOT written to the file here. The commit is rebuilt from
+    # scratch on top of whatever origin/main is at push time (see push_row), so
+    # the row has to survive a `reset --hard` and be re-appended.
+    ROWS="$ROWS$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
       "$UTC" "$kind" "$arm" "$MAIN_SHA" "$TSP_SHA" "$CUBECL_SHA" "$BIN_SHA" \
       "$n" "$FRONTIER_REPS" "$tok" "$ms" "$sp" "$delta" "$res" "$verdict" \
-      "${envs:--}" "$CONFIG" "${rownotes:--}" >> "$WT/$RESULTS_REL"
+      "${envs:--}" "$CONFIG" "${rownotes:--}")
+"
     ROW_TOK=$tok; ROW_MS=$ms; ROW_N=$n; ROW_SP=$sp
     ROW_DELTA=$delta; ROW_RES=$res; ROW_VERDICT=$verdict
     return 0
   }
 
-  if [ ! -f "$WT/$RESULTS_REL" ]; then
-    mkdir -p "$WT/$(dirname "$RESULTS_REL")"
-    printf 'utc\tkind\tarm\tmain_sha\ttriblespace_sha\tcubecl_graph_sha\tbin_sha256\tn\treps_req\ttok_s_med\tms_step_med\tspread_pct\tdelta_pct\tres_pct\tverdict\tenv\tconfig\tnotes\n' \
-      > "$WT/$RESULTS_REL"
-  fi
+  ROWS=""
   emit_row frontier "$KIND" "-" || die "the frontier arm recorded nothing"
   F_TOK=$ROW_TOK; F_MS=$ROW_MS; F_N=$ROW_N; F_SP=$ROW_SP
   F_DELTA=$ROW_DELTA; F_RES=$ROW_RES; F_VERDICT=$ROW_VERDICT
@@ -600,12 +618,38 @@ if [ "${1:-}" = "--run" ]; then
   fi
 
   # ---- 9. commit and push ----------------------------------------------
-  # From the frontier worktree, which is origin/main plus this one row, so the
-  # push can never carry another agent's unpushed work. The worktree shares the
-  # parent repository's hooks, so the box's pre-push leak guard runs. No
-  # --no-verify, ever.
-  git -C "$WT" add "$RESULTS_REL"
-  git -C "$WT" commit -q -m "bench: frontier at $MAIN_SHA -- $F_TOK tok/s, $F_MS ms/step, n=$F_N ($KIND)
+  # Built on top of whatever origin/main is AT PUSH TIME, from the frontier
+  # worktree, so the commit carries this row and nothing else -- never another
+  # agent's unpushed work. The worktree shares the parent repository's hooks, so
+  # the box's pre-push leak guard audits it. No --no-verify, ever.
+  #
+  # THE PUSH MUST SURVIVE main MOVING UNDER IT, and the first real run proved
+  # that it did not. Between fetching main and pushing the row there is a build
+  # plus seven process-reps -- 20 minutes on 2026-08-27 -- and on an active
+  # night main moves inside that window essentially always. It did: the row was
+  # committed, the push was rejected `(fetch first)`, and it sat unpushed on the
+  # box. For an UNATTENDED benchmark that is the whole failure: the measurement
+  # happened, the boxes were held, and the series did not gain a row.
+  #
+  # The retry does NOT rebase the commit. It rebuilds it: fetch, hard-reset to
+  # origin/main, re-append the row, commit, push. A rebase of an append-only
+  # file conflicts the moment two runs append at EOF, and the conflict
+  # resolution is not interesting -- both rows belong, in either order. Rebuild
+  # is conflict-free by construction and always appends onto the newest file,
+  # which is why emit_row accumulates into $ROWS rather than writing the file.
+  push_row() {
+    local attempt
+    for attempt in 1 2 3; do
+      git -C "$WT" fetch --quiet origin || { say "  !! cannot fetch origin"; return 1; }
+      git -C "$WT" reset -q --hard origin/main || return 1
+      if [ ! -f "$WT/$RESULTS_REL" ]; then
+        mkdir -p "$WT/$(dirname "$RESULTS_REL")"
+        printf 'utc\tkind\tarm\tmain_sha\ttriblespace_sha\tcubecl_graph_sha\tbin_sha256\tn\treps_req\ttok_s_med\tms_step_med\tspread_pct\tdelta_pct\tres_pct\tverdict\tenv\tconfig\tnotes\n' \
+          > "$WT/$RESULTS_REL"
+      fi
+      printf '%s' "$ROWS" >> "$WT/$RESULTS_REL"
+      git -C "$WT" add "$RESULTS_REL"
+      git -C "$WT" commit -q -m "bench: frontier at $MAIN_SHA -- $F_TOK tok/s, $F_MS ms/step, n=$F_N ($KIND)
 
 The scoreboard lane, run unattended by scripts/frontier-bench.sh. The figure is
 PER DECODE STEP of the 42-layer two-node pipeline at ctx 3732, INK_GEN=$FRONTIER_GEN,
@@ -613,16 +657,29 @@ INK_KV=1, split $FRONTIER_SPLIT, --overlap, --order fixed; median over $F_N proc
 $FRONTIER_REPS requested. The frontier arm sets no INK_* switch of its own, so this is
 main out of the box and not a cherry-picked arm. Binary $BIN_SHA,
 byte-identical on both boxes; floating path-deps triblespace-rs $TSP_SHA and
-cubecl-graph $CUBECL_SHA, which main's sha does not pin." \
-    || say "  !! nothing to commit -- was the row written?"
-  if [ "$FRONTIER_PUSH" = 1 ]; then
-    if git -C "$WT" push -q origin HEAD:main 2>"/tmp/frontier-push-$TAG.log"; then
-      say "  pushed $(git -C "$WT" rev-parse --short=12 HEAD) to origin/main"
-    else
-      say "  !! push refused. The row is committed locally in $WT. Reason:"
-      sed 's/^/      /' "/tmp/frontier-push-$TAG.log"
-    fi
-  fi
+cubecl-graph $CUBECL_SHA, which main's sha does not pin." || {
+        say "  !! nothing to commit -- was a row produced?"; return 1; }
+      if [ "$FRONTIER_PUSH" != 1 ]; then
+        say "  row committed in $WT (FRONTIER_PUSH=0, not pushing)"; return 0
+      fi
+      if git -C "$WT" push -q origin HEAD:main 2>"/tmp/frontier-push-$TAG.log"; then
+        say "  pushed $(git -C "$WT" rev-parse --short=12 HEAD) to origin/main"
+        return 0
+      fi
+      # Distinguish a RACE from a REFUSAL. A rejected ref means main moved and
+      # retrying is right; anything else -- a leak-guard refusal, no network, no
+      # credentials -- will fail identically three times, so stop and say so.
+      if ! grep -qE 'rejected|non-fast-forward|fetch first' "/tmp/frontier-push-$TAG.log"; then
+        say "  !! push REFUSED (not a race). The row is committed in $WT. Reason:"
+        sed 's/^/      /' "/tmp/frontier-push-$TAG.log"
+        return 1
+      fi
+      say "  push rejected on attempt $attempt: main moved during the run. Rebuilding the row on top of it."
+    done
+    say "  !! push still rejected after 3 attempts. The row is committed in $WT and needs a human."
+    return 1
+  }
+  push_row || true
 
   # ---- 10. the verdict --------------------------------------------------
   say ""
