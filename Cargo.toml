@@ -514,21 +514,6 @@ required-features = ["dev-tools"]
 [[bin]]
 name = "probe"
 required-features = ["dev-tools"]
-[[bin]]
-name = "probe_cfm"
-required-features = ["dev-tools"]
-[[bin]]
-name = "probe_mel"
-required-features = ["dev-tools"]
-[[bin]]
-name = "probe_vocos"
-required-features = ["dev-tools"]
-[[bin]]
-name = "say_serve"
-required-features = ["dev-tools"]
-[[bin]]
-name = "speak"
-required-features = ["dev-tools"]
 
 # The flux round-trip gate needs the flux feature; keep it out of the default build.
 [[bin]]

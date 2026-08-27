@@ -564,7 +564,8 @@ stability is the thing to listen for).
   isolation, min-of-medians, contention notes) was reused instead.
 - **Prefill JIT off the clock**: no cross-process shader/autotune cache in
   this burn/cubecl; the talker-prewarm race with the codec JIT is documented
-  in speak.rs. A resident `say_serve` process is the real TTFA fix.
+  in speak.rs. A resident warm-weight process is the real TTFA fix (the F5-era
+  `say_serve` prototype that demonstrated it is git-only as of 2026-08-27).
 - **f16/NEON predictor weights**: two AMX f32 streams already outrun hand
   NEON f16, and it would break byte-identity.
 

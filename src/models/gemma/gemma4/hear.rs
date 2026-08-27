@@ -5,6 +5,17 @@
 //! decoder and tokenizer into one warm handle. `gemma_hear` (one-shot file)
 //! and `gemma_listen` (live utterance loop) both call [`Hearing::understand`];
 //! neither re-implements the merge/prefill/decode dance.
+//!
+//! # Two handovers, one path
+//!
+//! [`Hearing::embed`] stops after the parity-gated part and hands back the
+//! AUDIO ROWS — exactly the rows [`Hearing::understand`] then writes over the
+//! audio-soft-token positions before prefill. Embeddings are the better
+//! handover for a consumer that has its own decoder: text throws away tone,
+//! hesitation and mood, and the throwing-away happens at the greedy argmax in
+//! `understand`, which is the last place anyone can still get them back.
+//! `understand` is now literally `embed` plus a chat frame plus a decode, so
+//! the two cannot describe different audio.
 
 use burn::prelude::*;
 use tokenizers::Tokenizer;
@@ -19,6 +30,30 @@ pub const AUDIO_SOFT_TOKEN_ID: i64 = 258881; // <audio_soft_token>
 pub const BOA_TOKEN_ID: i64 = 256000; // <|audio>
 pub const EOA_TOKEN_ID: i64 = 258883; // <audio|>
 pub const EOS_TOKEN_ID: u32 = 1;
+
+/// The audio rows for one utterance, already projected into the decoder's
+/// text width: `n_tokens` rows of `hidden` f32, row-major. These are soft
+/// tokens, not a transcript — a consumer splices them into its own token
+/// embeddings the way [`Hearing::understand`] does.
+#[derive(Debug, Clone)]
+pub struct AudioEmbeddings {
+    /// Audio soft tokens produced for this utterance.
+    pub n_tokens: usize,
+    /// Decoder hidden width (row stride).
+    pub hidden: usize,
+    /// `n_tokens * hidden` values, row-major.
+    pub rows: Vec<f32>,
+}
+
+impl AudioEmbeddings {
+    /// One row, or `None` past the end.
+    pub fn row(&self, index: usize) -> Option<&[f32]> {
+        if index >= self.n_tokens {
+            return None;
+        }
+        Some(&self.rows[index * self.hidden..(index + 1) * self.hidden])
+    }
+}
 
 /// A warm hearing stack: decoder + audio tower + embedder + tokenizer + the
 /// precomputed RoPE tables. Build once, understand many utterances.
@@ -66,6 +101,37 @@ impl<B: Backend> Hearing<B> {
         }
     }
 
+    /// The parity-gated audio path ONLY: 16 kHz mono f32 (≤ 30 s — longer
+    /// input is truncated by the feature extractor) → log-mel → audio tower →
+    /// multimodal embedder, returning the rows in the decoder's own width.
+    ///
+    /// This is the handover seam for a consumer that has its own decoder: the
+    /// rows are what [`Hearing::understand`] writes over its audio-soft-token
+    /// positions, so taking them here keeps everything a transcript discards —
+    /// tone, hesitation, mood — and costs the caller nothing downstream, since
+    /// splicing embeddings is the operation the model already performs.
+    pub fn embed(&self, wave: &[f32]) -> AudioEmbeddings {
+        let device = &self.device;
+        let (feat, _mask, n_frames) = self.fe.extract(wave);
+        let input_features = Tensor::<B, 1>::from_floats(&feat[..], device).reshape([
+            1,
+            n_frames,
+            self.fe.feature_size,
+        ]);
+        let tower_out = self.tower.forward(input_features);
+        let [_, n_tokens, multi_hidden] = tower_out.dims();
+        let projected = self
+            .embedder
+            .forward(tower_out.reshape([n_tokens, multi_hidden]));
+        let [rows_out, hidden] = projected.dims();
+        debug_assert_eq!(rows_out, n_tokens);
+        AudioEmbeddings {
+            n_tokens,
+            hidden,
+            rows: projected.to_data().to_vec().unwrap(),
+        }
+    }
+
     /// Run one utterance through stt + decoder. `wave` is 16 kHz mono f32
     /// (≤ 30 s — longer input is truncated by the feature extractor). Greedy
     /// decode up to `max_new` tokens; each decoded piece is also streamed to
@@ -81,17 +147,8 @@ impl<B: Backend> Hearing<B> {
         let device = &self.device;
 
         // --- Transcriber: log-mel → tower → embedder ---
-        let (feat, _mask, n_frames) = self.fe.extract(wave);
-        let input_features = Tensor::<B, 1>::from_floats(&feat[..], device).reshape([
-            1,
-            n_frames,
-            self.fe.feature_size,
-        ]);
-        let tower_out = self.tower.forward(input_features);
-        let [_, n_audio_tokens, multi_hidden] = tower_out.dims();
-        let audio_embeds = self
-            .embedder
-            .forward(tower_out.reshape([n_audio_tokens, multi_hidden]));
+        let audio = self.embed(wave);
+        let n_audio_tokens = audio.n_tokens;
 
         // --- Chat frame ---
         //   <bos><|turn>user\n<|audio>[audio_soft × N]<audio|>{prompt}<turn|>\n<|turn>model\n
@@ -125,10 +182,13 @@ impl<B: Backend> Hearing<B> {
         {
             let [_, _, h] = emb.dims();
             let mut d: Vec<f32> = emb.to_data().to_vec().unwrap();
-            let v: Vec<f32> = audio_embeds.to_data().to_vec().unwrap();
+            assert_eq!(
+                audio.hidden, h,
+                "audio rows must already be in the decoder's width"
+            );
             for i in 0..n_audio_tokens {
                 let off = (audio_start + i) * h;
-                d[off..off + h].copy_from_slice(&v[i * h..i * h + h]);
+                d[off..off + h].copy_from_slice(audio.row(i).expect("audio row"));
             }
             emb = Tensor::<B, 1>::from_floats(&d[..], device).reshape([1, n_chat, h]);
         }
