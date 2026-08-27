@@ -352,6 +352,23 @@ pub fn linear_bf16<R: Runtime>(
 /// padding for an activation that is BF16 already. It exists only for the M
 /// padding — when a lane needs none, [`linear_bf16_narrow`] does not call it at
 /// all and the activation is handed to the MMA where it lies.
+///
+/// **The zeros this writes are the ones a consumer may decline to read.**
+/// `w4a16gemm::live_row_mask` lets the W4A16 MMA skip the A loads whose fragment
+/// row lands in `m..m_pad` and feed the instruction a register zero instead. It
+/// is bit-identical for two reasons, and only the FIRST depends on this kernel:
+/// the rows are zero, and — independently — A row `r` reaches accumulator row
+/// `r` and no other, so the suppressed rows are ones the caller slices away.
+/// The second reason is what makes the mask safe rather than merely correct;
+/// still, anything that ever left this tail UNZEROED would be relying on the
+/// second reason alone, which is a narrower guarantee than it looks. At decode
+/// the tail is fifteen of sixteen rows.
+///
+/// `bf16_linear` has the identical A load and does NOT take the mask, because a
+/// real run reports `hand BF16 lane: 0 launches` — every plain-BF16 GEMM reaches
+/// a `cubek` tuned lane, and those bounds-check their own tiles and take the
+/// true `m` unpadded already (see [`bf16_linear_cubek_launch`]). Masking a
+/// kernel nothing launches is dead code.
 #[cube(launch)]
 pub fn pad_bf16(x: &Tensor<bf16>, y: &mut Tensor<bf16>, n_in: usize) {
     let idx = ABSOLUTE_POS as usize;
