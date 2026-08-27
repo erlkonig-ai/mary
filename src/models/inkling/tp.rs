@@ -120,21 +120,37 @@
 //!   TP2 with enqueue collapsed (graph capture)            ~52    ms/token   2.02x
 //! ```
 //!
-//! One term inside those projections is hardware and cannot be engineered
-//! away. **The two boxes are not equally fast**: `stream_packed`, the same
-//! kernel over the same 0.431 GiB of codes and scales, reads **218.4 GB/s on
-//! spark2-zt against 248 GB/s on spark-zt**. A pipeline split ADDS the two
-//! halves, so it pays the average; a within-layer split runs them at once and
-//! the step is `max`, so it pays the SLOWER box:
+//! One term inside those projections was believed to be hardware and
+//! un-engineerable. **It is not there.** This said the two boxes are not equally
+//! fast, on the evidence that `stream_packed` — the same kernel over the same
+//! 0.431 GiB of codes and scales — reads 218.4 GB/s on spark2-zt against 248 on
+//! spark-zt. **Neither reading reproduces.** Re-run 2026-08-27 with
+//! `scripts/gb10-lock.sh` held on both boxes and both verified idle, at that
+//! arm's own framing (min of four warm launches, per launch, head shape):
 //!
 //! ```text
-//!   PP2 bandwidth term   (D/2)(1/248 + 1/218.4)   =  0.00862 D
-//!   TP2 bandwidth term    (D/2)(1/218.4)          =  0.00458 D    1.88x, not 2.00x
+//!   spark  (zgx-0d6e)   240.7, 241.2, 241.3 GB/s   median 241.2
+//!   spark2 (zgx-16ec)   240.8 .. 244.2 (n=7)       median 242.9
 //! ```
 //!
-//! So ~6% of the ideal doubling is spent on the boxes disagreeing with each
-//! other, before any of this code runs. It is inside the range below rather
-//! than on top of it.
+//! The two boxes are **1.1% apart on this kernel**, not 12%. A pipeline split
+//! ADDS the two halves so it pays the average; a within-layer split runs them at
+//! once and pays the SLOWER box — the structure of the argument is right and the
+//! penalty is nearly gone:
+//!
+//! ```text
+//!   PP2 bandwidth term   (1/241.2 + 1/242.9)   =  0.00826 per D/2
+//!   TP2 bandwidth term    2 x (1/241.2)        =  0.00829 per D/2   1.993x
+//! ```
+//!
+//! So ~0.35% of the ideal doubling is lost to the boxes disagreeing, not ~6%.
+//! The TP2 projection loses a headwind it never actually had; the reason it
+//! still does not reach 2.00x is the host enqueue path below, which is the
+//! honest binding constraint. NOTE THE SCOPE: this refutes the box asymmetry
+//! **for this kernel**, which is the only evidence the claim ever rested on.
+//! Whether the two boxes differ end to end is a separate measurement and was not
+//! made. The full reconciliation of this ceiling is in `w4a16gemm`, above
+//! `w4a16_linear_wide`.
 //!
 //! **The projections are computed, not measured**, from the measured components
 //! above. The honest headline is **1.5–1.9x at batch one**, and the thing that

@@ -285,21 +285,28 @@
 //! # The scan is not at the ceiling, and here is the specific suspicion
 //!
 //! `fp4_lane_dump`'s `stream_packed` reads the SAME 0.431 GiB of codes and
-//! scales with 128-bit fully coalesced loads and no arithmetic. Run in this
-//! session on spark2-zt it gives **218.4 GB/s** — not the 248 an earlier note
-//! records, which was a different box, and the difference is why a bandwidth
-//! ceiling has to be measured beside the thing it is a ceiling for.
+//! scales with 128-bit fully coalesced loads and no arithmetic. This said
+//! **218.4 GB/s**, measured on spark2-zt, and explained the gap to an earlier
+//! 248 as a difference between boxes. **The 218.4 does not reproduce and the box
+//! explanation is wrong.** Re-run 2026-08-27 with `scripts/gb10-lock.sh` held
+//! and both boxes verified idle, the same arm at the same framing (min of four
+//! warm launches, per launch, head shape) reads 240.7-241.3 GB/s on spark and
+//! 240.8-244.2 on spark2 — the two boxes are 1.1% apart, not 12%. A second
+//! instrument (`w4a16_swz_probe`'s `stream ceiling`) agrees at 240.5-243.5.
+//! **The ceiling is 242 GB/s.** What made the old reading 10% low was not
+//! recovered; the full reconciliation is in `w4a16gemm`, above
+//! `w4a16_linear_wide`.
 //!
-//! Against that ceiling, on the same box and in the same session:
+//! Against the corrected ceiling, with this scan's own figures unchanged:
 //!
 //! ```text
-//!   stream_packed (no arithmetic)   218.4 GB/s   100%
-//!   this scan                       128.4         59%
-//!   w4a16_linear (the exact head)   106.9         49%
+//!   stream_packed (no arithmetic)   242.0 GB/s   100%
+//!   this scan                       128.4         53%
+//!   w4a16_linear (the exact head)   106.9         44%
 //! ```
 //!
 //! So the scan is already the more efficient of the two lanes, and 0.097 GiB at
-//! 218.4 GB/s would be **0.478 ms** against the 0.808 it takes. Roughly 0.33 ms
+//! 242 GB/s would be **0.430 ms** against the 0.808 it takes. Roughly 0.38 ms
 //! is unclaimed, and it is worth writing down
 //! what it is probably NOT: it is not coalescing, because the bit-plane layout
 //! makes every global read a full 128-byte transaction by construction, and it
@@ -309,7 +316,7 @@
 //! The remaining suspicion is that the lane is partly ALU-BOUND. Each weight
 //! dimension costs about four instructions — one shared load, a shift, a
 //! mask-and-xor, an add — and there are 4096 of them per row and 201024 rows, so
-//! roughly 1.0e8 warp-instructions. Whether that is the same order as 0.478 ms
+//! roughly 1.0e8 warp-instructions. Whether that is the same order as 0.430 ms
 //! depends on this part's issue rate, which I have NOT measured; at an assumed
 //! 48 SMs x 4 schedulers x 1.5 GHz it would be ~0.36 ms, i.e. comparable, and
 //! that assumption is the weak step. **This is a hypothesis with a named
@@ -383,7 +390,7 @@ const VERY_LOW: f32 = -3.0e38;
 /// transpose is the single most important decision in this module. In row order
 /// a scan cube's 256 units would read 256 words 512 bytes apart, which is the
 /// same uncoalesced 32-bytes-per-2048 pattern that holds
-/// [`super::w4a16gemm`] to 98 GB/s against a 158-172 GB/s coalesced ceiling. In
+/// [`super::w4a16gemm`] to 98 GB/s against a 242 GB/s coalesced ceiling. In
 /// bit-plane order the same 256 units read 256 CONSECUTIVE words, and the scan
 /// runs at the streaming ceiling because there is nothing else for it to do.
 pub struct Sketch {

@@ -293,16 +293,15 @@ pub const LIVE_ROW_MASK_DEFAULT: bool = false;
 /// register-neutral — it is register-POSITIVE, which was the thing most worth
 /// checking before spending a box slot on timing.
 ///
-/// **The depth-8 arm is now worth running, and this is a hypothesis.**
-/// `swz_unroll` records depth 8 at 86 registers, which puts
-/// `launch__occupancy_limit_registers` at 20 — below this part's
-/// `launch__occupancy_limit_blocks` of 24 — and that, not the depth, is why it
-/// measured 1.17 against depth 4's 1.48. Seven registers back would put a masked
-/// depth 8 near 79, which is where depth 4 already sits with the limit at 24. So
-/// the mask may make reachable a load depth the register budget has always
-/// forbidden. Nothing here measures that: it needs a depth-8 arm at
-/// `INK_W4A16_SWZ_UNROLL=8` with the mask on, read for
-/// `launch__occupancy_limit_registers` first and time second.
+/// **The depth-8 arm was run on 2026-08-27, and the hypothesis was half right.**
+/// It predicted that the mask would buy back the registers depth 8 needed, and
+/// it did — 95 -> 80, `launch__occupancy_limit_registers` 20 -> 24, achieved
+/// occupancy equal to depth 4's to within 0.02 points. The door opened. Depth 8
+/// is still slower anyway, by 5.5% at the sink grid and 16.9% at the head, at
+/// equal occupancy and byte-identical traffic. So the mask does NOT unlock a
+/// deeper load, and the register story is no longer the reason depth 8 loses.
+/// The measurement and what it retires are recorded at [`SWZ_UNROLL_DEFAULT`],
+/// beside the register table it corrects.
 ///
 /// ## Which decode work this actually reaches
 ///
@@ -648,36 +647,82 @@ pub fn w4a16_linear_launch<R: Runtime>(
 // and consumes 32 bytes from each before advancing, so the memory system sees
 // 32-byte reads 2048 bytes apart, thousands of warps deep — and adding warps
 // adds streams, which is why more planes made it worse. A fully coalesced read
-// of the SAME 0.431 GiB in the same process runs at 158-172 GB/s against these
+// of the SAME 0.431 GiB in the same process runs at 242 GB/s against these
 // kernels' 98-106. The gap is coalescing, and coalescing needs a cooperative
 // stage through shared memory, which is exactly what one warp per output tile
-// forecloses. `fp4gemm`'s module header says "a fancier tiling would not change
-// that"; at the ROUTED-EXPERT shape it measures right (`fp4_linear_grouped`
-// reaches 171 GB/s, at the ceiling), and at THIS shape it does not.
+// forecloses.
 //
-// DISPUTED, 2026-08-27, and it is a 25% dispute — DO NOT QUOTE 158-172 AS THE
-// CEILING until it is reconciled. Three controls in this tree measure the
-// coalesced read of the same 0.431 GiB of head codes and scales:
+// THE CEILING IS 242 GB/s, AND EVERY EARLIER FIGURE FOR IT WAS LOW. This
+// sentence said 158-172 until 2026-08-27, three controls in the tree disagreed
+// by 25%, and re-measuring settled it in the direction none of them predicted:
+// all three recorded numbers are low and there is only ONE ceiling.
+//
+// FRAMING RULE for the re-measurement: GB/s over the 0.431 GiB weight table
+// (codes + E4M3 scales) of ONE `[201024, 4096]` head operand, per LAUNCH, one
+// launch and one sync each, GB10 (sm_121a), `scripts/gb10-lock.sh` held on both
+// boxes and both verified idle (no compute apps, load 0.08). It is not a step
+// figure and not a two-node figure.
 //
 // ```text
-//   control                          GB/s     framed by
-//   w4a16_swz_probe `stream ceiling` 213.2    its own arm, interleaved, head shape
-//   annhead `stream_packed`          218.4    its own harness, same plane set
-//   THIS COMMENT                     158-172  not recoverable from what is written
+//   instrument / framing                                     box      GB/s
+//   fp4_lane_dump `stream_packed`, min of 4 warm launches     spark2   240.8-244.2  (n=7)
+//   fp4_lane_dump `stream_packed`, min of 4 warm launches     spark    240.7-241.3  (n=3)
+//   w4a16_swz_probe `stream ceiling`, p50 of 6 warm of 8      spark2   240.5-243.8  (n=3)
+//   w4a16_swz_probe `stream ceiling`, p50 of 12 warm of 14    spark2   243.4-243.5  (n=2)
+//   fp4_lane_dump `stream_packed`, one sibling GPU tenant     spark2   242.1-242.4  (n=2)
 // ```
 //
-// Two independently-framed controls agree within 2.4%; this one is the outlier
-// by about 25%, and what it was per — which arm, which plane set, warm or cold —
-// is exactly the framing this file's own rule says must travel WITH the number
-// and did not. That is the whole hazard: an unframed figure still looks
-// defensible.
+// Seventeen process-level readings, two instruments, two boxes, two rep counts,
+// idle and contended: 240.5-244.2 GB/s, a ±0.8% spread. This control does not
+// move. It also reconciles with `inkling_membw`'s 247-259 GB/s coalesced rows
+// over 1 GiB: those are pipelined, this one syncs per launch, and ~0.1 ms of
+// launch+sync on a 1.9 ms kernel is the whole difference.
 //
-// It matters beyond bookkeeping, because the sentence above draws a CONCLUSION
-// from it. `fp4_linear_grouped`'s 171 GB/s is "at the ceiling" against 158-172
-// and is 80.2% of it against 213.2 — so "at the ROUTED-EXPERT shape it measures
-// right" is a claim that survives only under the outlier. Re-measure before
-// repeating either. Nothing in the live-row mask depends on this: the mask
-// recovers no DRAM bytes by construction and is not a GB/s claim at all.
+// Where the three old numbers came from, in descending order of how well it is
+// understood:
+//
+// * **158-172 — a BROKEN INSTRUMENT, and the tree already says so.** The
+//   instrument was `fp4_lane_dump`'s `stream_packed` as it stood on 2026-08-25,
+//   which is the only harness that reads a coalesced stream of these bytes in
+//   the SAME PROCESS as these kernels at "min of four warm launches" — this
+//   comment's own framing, word for word. Its thread stride was a u32-word
+//   count applied to a tensor CubeCL indexes in 16-byte vectors, so every
+//   thread strode four times past the buffer, and its store was unconditional,
+//   charging a 12.5% write tax to a read figure. Fixed the same day; see
+//   `fp4_lane_dump`'s module header. The GEMM half of that old reading was
+//   sound and still reproduces exactly: 98-106 GB/s, measured again here at
+//   98.7-102.2 (`w4a16_linear`) and 101.6-106.8 (`fp4_linear`).
+// * **213.2 and 218.4 — not reproduced, and not explained.** Both are the
+//   arms measured above, at 12% and 10% below what those same arms read tonight
+//   on either box. Three explanations were tested and all three failed: it is
+//   not the box (spark and spark2 agree within 1.1%), not the rep count (the
+//   213.2 row's own "12 warm reps of 14" reads 243.4), and not a GPU tenant (a
+//   sibling process halves the GEMM arm, 101.8 -> 43.3 GB/s, and moves this arm
+//   by 0.3%). What is left is a HYPOTHESIS WITH A NAMED WEAKNESS: both readings
+//   predate `scripts/gb10-lock.sh` (2026-08-27 01:5x), so their boxes were
+//   unreserved, and the 213.2 table's own end-to-end neighbour below records
+//   another agent's job arriving mid-run. But the sibling that failed to move
+//   this arm was a short microbenchmark, not a 101 GiB decode process, so that
+//   test does not cover the case it needs to. Do not repeat 213.2 or 218.4 as
+//   the ceiling; if you need one, run either arm on a locked idle box, which
+//   takes about ninety seconds.
+//
+// WHAT THIS OVERTURNS. Two claims rested on the low figure and neither survives:
+//
+// * `fp4_linear_grouped`'s 171 GB/s was "at the ceiling" against 158-172. It is
+//   70.7% of 242. `moegroup`'s header had already retracted this from the other
+//   side ("**The 170.4 was wrong**", same instrument bug); this is the same
+//   retraction reaching the sentence above, which is why "at the ROUTED-EXPERT
+//   shape it measures right" is deleted rather than softened.
+// * The depth-4 swizzled head at 159-161 GB/s is 66% of the ceiling, not the
+//   ~95% that 158-172 implied and not the 75.7% that 213.2 implied. So the head
+//   lane has roughly a third of its traffic still unclaimed, and any candidate
+//   that was killed for having nothing left to buy at this shape — the
+//   M-padding predicate among them — was killed against a ceiling that was
+//   14-40% too low and should be re-read before it is treated as settled.
+//
+// Nothing in the live-row mask depends on this: the mask recovers no DRAM bytes
+// by construction and is not a GB/s claim at all.
 //
 // A is left alone throughout: at `m_pad = 16` it is 128 KiB, L2-resident, and
 // re-read by every cube.
@@ -1101,7 +1146,16 @@ pub fn swizzle_w4a16_device<R: Runtime>(
 /// | row-major        | 4.832 ms |  95.9 |
 /// | both planes swz  | 3.984 ms | 116.3 |
 /// | codes only swz   | 4.069 ms | 113.8 |
-/// | coalesced ceiling| 2.172 ms | 213.2 |
+/// | coalesced ceiling| 2.172 ms | 213.2 |  <- LOW, see below
+///
+/// The ceiling row does not reproduce and should not be quoted. Re-run
+/// 2026-08-27 at this exact framing (`INK_SWZ_REPS=14`, so 12 warm reps of 14,
+/// same binary, same arm, box locked and verified idle) it reads 1.903 and
+/// 1.902 ms — 243.4 and 243.5 GB/s. The other three rows are a DEPTH-1
+/// measurement, superseded by [`SWZ_UNROLL_DEFAULT`]'s table rather than wrong;
+/// the ceiling row is simply 12% low for reasons nobody has recovered. The full
+/// reconciliation, and the two conclusions it overturns, is in the ceiling block
+/// above `w4a16_linear_wide`.
 ///
 /// 12 warm reps of 14. The two swizzled arms are indistinguishable within
 /// their spread, so this does not establish that the scale plane's permutation
@@ -1552,10 +1606,82 @@ pub fn swizzle_w4a16_forced() -> bool {
 /// and occupancy falls with it. "The registers are free" was true, and it stops
 /// being true between 4 and 8.
 ///
+/// The register COLUMN has since drifted: re-read 2026-08-27 on the same kernel
+/// with the mask off, depth 4 is 80 and depth 8 is 95, not 78 and 86. The
+/// `limit_registers` column is unchanged (24 and 20) and so is the conclusion,
+/// which is why the table is annotated rather than rewritten -- but do not quote
+/// 78 or 86 as this lane's register count.
+///
 /// The control that makes this a schedule effect and not a traffic one: at
 /// `[16384, 4096]` the sector count is 22020096 at depth 1, 4 AND 8, byte for
 /// byte, with `sectors_per_request` 6 throughout. Same bytes, same requests, same
 /// sectors -- only WHEN they are issued differs.
+///
+/// ## Depth 8 reopened on the live-row mask, and closed again for a NEW reason
+///
+/// The paragraph above is the reason depth 8 was killed, and by 2026-08-27 it
+/// had MOVED: [`live_row_mask`] is register-positive, so the register budget the
+/// kill rested on was no longer the one being spent. Reopened deliberately, and
+/// the door does open -- `ncu` on `w4a16_linear_swz` launched by
+/// `w4a16_swz_grid` at `INK_M=16`, `INK_MLIVE=1`, `k=4096`, `n=8192` (1024
+/// cubes, the sink `gate_up` grid), one launch profiled, ncu 2025.3.1, spark2,
+/// box locked and idle, NO timing in this reading:
+///
+/// ```text
+///   depth  mask  registers  limit_registers  limit_blocks  achieved occ.  sectors
+///     4    off      80          24 blocks       24 blocks       --           --
+///     8    off      95          20 blocks       24 blocks       --           --
+///     4    ON       73          24 blocks       24 blocks     44.30%      1327101
+///     8    ON       80          24 blocks       24 blocks     44.28%      1327124
+/// ```
+///
+/// The mask is worth 15 registers at depth 8 and 7 at depth 4, and it lifts
+/// depth 8's register limit off 20 and back onto the 24-block cap. Masked depth
+/// 8 sits exactly where masked depth 4 sits. Achieved occupancy is 44.28%
+/// against 44.30%, `l1tex__t_requests.sum` is 1312768 for both, and the sector
+/// counts differ by 23 out of 1.33 million (0.002%). Whatever separates them, it
+/// is not occupancy and it is not traffic.
+///
+/// AND DEPTH 8 IS STILL SLOWER. `w4a16_swz_grid`, mask ON (`INK_MLIVE=1` of
+/// `INK_M=16`), five processes per depth in ALTERNATED order (4,8,8,4,4,8,8,4,4,8)
+/// with a memory settle between each, each process being min of 6 rounds of 20
+/// pipelined launches over rotating buffers with 2 rounds discarded, spark2,
+/// box locked and idle. `ratio` is row-major time / swizzled time and is PAIRED
+/// inside each process -- the row-major arm is round-robined against the
+/// swizzled one and is unaffected by depth, so it divides out anything that
+/// drifts between processes:
+///
+/// ```text
+///                             depth 4 ratio        depth 8 ratio    d4/d8
+///   k=4096  25128 cubes (head)  1.58 [1.58-1.63]   1.36 [1.34-1.38]  1.169
+///   k=4096   1024 cubes (sink)  1.42 [1.37-1.46]   1.34 [1.31-1.38]  1.055
+///   k=2048    512 cubes (sink)  1.03 [0.99-1.08]   1.05 [0.94-1.06]  0.981
+/// ```
+///
+/// Medians of five, brackets are the full range of the five. The head and the
+/// 1024-cube sink are real losses -- 16.9% and 5.5% -- and at 512 cubes it is a
+/// tie, which is what a shape where the permutation itself barely pays looks
+/// like. The unpaired process-to-process floor on this harness, measured from
+/// the same runs as the spread of the row-major arm (which depth cannot touch),
+/// is 2.3% at the 1024-cube shape; the 5.5% clears it and the ratio removes it
+/// anyway.
+///
+/// So the answer to "why 4 and not 8" is no longer the register table above. It
+/// was the true reason while depth 8 ran at 37.41% occupancy; with the mask on,
+/// occupancy is equal to two decimal places and depth 8 loses by MORE at the
+/// head than the occupancy gap could ever have explained. What is left is the
+/// schedule itself: at depth 8 the group count halves (`k_tiles / 8`), so the
+/// warp spends longer at the head of each group issuing eight k-tiles of loads
+/// before it can consume any, and the loads it is adding are ones the memory
+/// system was already keeping busy at depth 4. That is a HYPOTHESIS -- nothing
+/// here measures issue stalls -- and it is written down as the next thing to
+/// look at, not as the finding. The finding is narrower and solid: depth 8 is
+/// not register-bound any more, and it is still not worth taking.
+///
+/// This is recorded rather than merely re-killed because the previous kill was
+/// re-opened on good evidence exactly BECAUSE its stated reason had expired. A
+/// door closed without its reason gets reopened; a door closed with the wrong
+/// reason gets reopened the moment that reason moves.
 ///
 /// Bit-identical to the row-major lane at depth 4: max deviation 0.000e0 over
 /// 1024 outputs of a `[16, 256] x [64, 256]^T` product (`w4a16_swz_probe`).
