@@ -82,6 +82,12 @@
 #     CHECK IS NOT A RESERVATION -- the gate below cannot close that window, and
 #     the lock is what does.
 #
+#     IT LOOKS BEFORE IT RESERVES. A stale lock is only broken on a box that is
+#     also visibly idle, because gb10-lock reads silence as death while this
+#     caller can actually see the holder still running -- breaking a live
+#     holder's reservation wastes a slot and deletes someone's claim for
+#     nothing. Same rule covers a box busy with an unlocked run.
+#
 #     A REFUSAL IS A WAIT, NOT AN EXIT. There is no queue behind the lock, so an
 #     agent that walks away on the first refusal is simply never handed the box
 #     -- and for a nightly benchmark that means the row does not exist. It polls
@@ -669,9 +675,32 @@ take_both() {
   HELD_T=1
   return 0
 }
+# NEVER BREAK A STALE LOCK ON A BOX THAT IS VISIBLY BUSY. gb10-lock.sh treats
+# silence as death, which is the right rule for a mechanism that cannot see the
+# holder -- but this caller CAN see it. A holder doing one long uninterrupted
+# stretch without calling `refresh` goes stale while still measuring, and taking
+# its box would destroy a live reservation. The run phase's own gate would then
+# refuse and hand the box straight back, so the outcome is not an OOM; it is a
+# reservation deleted and a slot wasted for nothing. Looking first costs two ssh
+# round trips per poll and removes the whole case.
+#
+# It also covers the agent who has not adopted the lock yet: a box busy with an
+# UNLOCKED run is not one to reserve either. We wait instead, bounded by the
+# same ceiling.
+# shellcheck source=lib/box-busy.sh
+. "$REPO/scripts/lib/box-busy.sh" || die "cannot source scripts/lib/box-busy.sh"
+boxes_look_idle() {
+  local rc
+  box_busy_remote "$FRONTIER_HEAD" >/dev/null 2>&1; rc=$?
+  if [ "$rc" != 1 ]; then LOCK_WHY="head $FRONTIER_HEAD is busy or unreachable (a check that cannot fail is not a check, so this fails closed)"; return 1; fi
+  box_busy_remote "$FRONTIER_TAIL" >/dev/null 2>&1; rc=$?
+  if [ "$rc" != 1 ]; then LOCK_WHY="tail $FRONTIER_TAIL is busy or unreachable (fails closed)"; return 1; fi
+  return 0
+}
+
 LOCK_WHY=""
 lock_waited=0
-until take_both; do
+until boxes_look_idle && take_both; do
   if [ "$lock_waited" -ge "$FRONTIER_LOCK_WAIT_S" ]; then
     say ""
     say "NEVER GOT A SLOT. The boxes stayed reserved for the whole ${FRONTIER_LOCK_WAIT_S}s ceiling."

@@ -1,0 +1,15 @@
+arm	rep	tok_s	step_ms	E_warm	tpp_all	mean_acc_drafts	warm_steps	ctx	mode
+off	1	10.8910	91.800	1.0000	1.000	-	62	3796	scoreboard
+rule	1	11.4040	87.700	1.0000	1.000	-	62	3796	scoreboard
+off	2	10.7750	92.800	1.0000	1.000	-	62	3796	scoreboard
+rule	2	11.2880	88.600	1.0000	1.000	-	62	3796	scoreboard
+off	3	10.9000	91.700	1.0000	1.000	-	62	3796	scoreboard
+rule	3	11.2080	89.200	1.0000	1.000	-	62	3796	scoreboard
+off	4	10.9940	91.000	1.0000	1.000	-	62	3796	scoreboard
+rule	4	11.2180	89.100	1.0000	1.000	-	62	3796	scoreboard
+off	5	11.0500	90.500	1.0000	1.000	-	62	3796	scoreboard
+rule	5	11.1460	89.700	1.0000	1.000	-	62	3796	scoreboard
+off	6	10.9700	91.200	1.0000	1.000	-	62	3796	scoreboard
+rule	6	11.2490	88.900	1.0000	1.000	-	62	3796	scoreboard
+off	7	10.9760	91.100	1.0000	1.000	-	62	3796	scoreboard
+rule	7	11.2200	89.100	1.0000	1.000	-	62	3796	scoreboard
