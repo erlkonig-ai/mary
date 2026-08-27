@@ -77,13 +77,56 @@
 //! permutation trades it for 8x fewer requests, and which side of that trade
 //! pays depends on whether there are enough resident warps to hide the latency
 //! the prefetch was covering.
+//!
+//! # The THIRD arm: the redistributed load, across the same sweep
+//!
+//! `shf` is the swizzled lane with `w4a16gemm::swz_shuffle` on -- the weight
+//! planes read COALESCED and handed to the fragment lanes with warp shuffles.
+//! The two swizzled arms differ ONLY in the comptime `redist` and are driven
+//! from one process on the same rotating buffers, so `shf/swz` is what the
+//! redistribution is worth at that cube count and nothing else. `ratio` is
+//! unchanged: still row-major over swizzled.
+//!
+//! FRAMING RULE, this harness's own: per LAUNCH of one `[16, k] x [n, k]^T`
+//! product with ONE live row of 16, GB/s over the weight planes only, 20
+//! pipelined launches over rotating buffers divided by 20, min of 6 rounds after
+//! 2 discarded. Not a step figure and not a two-node figure. 2026-08-27, spark2
+//! and spark, `scripts/gb10-lock.sh` held on both and both verified idle; the
+//! two columns are `shf/swz` on spark2 and on spark.
+//!
+//! ```text
+//!   k=2048     512 cubes    69.0 ->  70.1 GB/s   0.99  1.02   <- sink `down`
+//!             1024         119.6 -> 141.1        1.18  1.18
+//!             2048         134.5 -> 160.6        1.19  1.19
+//!             8192         153.4 -> 178.3        1.16  1.17
+//!   k=4096     512          77.0 ->  78.9        1.03  1.06
+//!             1024         130.5 -> 144.1        1.10  1.14   <- sink `gate_up`
+//!             2048         135.1 -> 153.9        1.14  1.16   <- dense `g`/`u`
+//!             4096         142.6 -> 171.4        1.20  1.16
+//!             8192         144.8 -> 174.8        1.21  1.23
+//!            16384         141.3 -> 183.5        1.30  1.16
+//!            25128         160.7 -> 186.5        1.16  1.22   <- the head
+//!   k=16384    512          54.0 ->  58.7        1.09  1.13   <- dense `down`
+//!             1024          92.6 ->  95.9        1.04  1.04
+//!             2048          92.1 ->  97.6        1.06  1.06
+//! ```
+//!
+//! NOTHING REGRESSES, which is the property that makes this a candidate for a
+//! global flag rather than a head-only one -- including the 512-cube k=2048
+//! corner where the permutation ITSELF barely pays (`ratio` 1.02-1.04) and the
+//! redistribution is a tie. The win is largest exactly where the lane is most
+//! transaction-bound (k=4096 above 1024 cubes, 1.10-1.30) and smallest at
+//! k=16384, where the permutation has already collected most of what there was.
+//!
+//! It is off by default; `w4a16gemm::swz_shuffle` carries what it is, the ncu
+//! counters behind it, and why the default has not moved.
 
 use std::time::Instant;
 
 use cubecl::future;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
-use mary::models::inkling::w4a16gemm::{w4a16_linear_launch, w4a16_linear_swz_launch};
+use mary::models::inkling::w4a16gemm::{w4a16_linear_launch, w4a16_linear_swz_launch_redist};
 
 type Rt = cubecl::cuda::CudaRuntime;
 
@@ -165,13 +208,29 @@ fn main() {
         mary::models::inkling::w4a16gemm::swz_unroll(),
     );
     println!(
-        "{:>8} {:>7} {:>9} {:>4} {:>10} {:>10} {:>10} {:>10} {:>7}",
-        "n", "cubes", "MiB", "rot", "row ms", "swz ms", "row GB/s", "swz GB/s", "ratio"
+        "{:>8} {:>7} {:>9} {:>4} {:>10} {:>10} {:>10} {:>9} {:>9} {:>9} {:>7} {:>7}",
+        "n",
+        "cubes",
+        "MiB",
+        "rot",
+        "row ms",
+        "swz ms",
+        "shf ms",
+        "row GB/s",
+        "swz GB/s",
+        "shf GB/s",
+        "ratio",
+        "shf/swz"
     );
 
     let arms: Vec<Arm> = ns.iter().map(|&n| Arm::new(&client, m_pad, k, n)).collect();
     let mut base = vec![f64::MAX; ns.len()];
     let mut swz = vec![f64::MAX; ns.len()];
+    // The COALESCED LOAD + WARP SHUFFLE form of the swizzled lane, said
+    // explicitly rather than read from the environment, so both forms run in
+    // ONE process round-robined against the same row-major arm on the same
+    // rotating buffers. `w4a16gemm::swz_shuffle` carries what it is.
+    let mut shf = vec![f64::MAX; ns.len()];
 
     for r in 0..ROUNDS + 2 {
         for (i, (&n, arm)) in ns.iter().zip(&arms).enumerate() {
@@ -187,17 +246,29 @@ fn main() {
             let t1 = Instant::now();
             for j in 0..REPS {
                 let (b, sc) = &arm.rot[j % arm.rot.len()];
-                let o = w4a16_linear_swz_launch::<Rt>(
-                    &client, &arm.a, b, sc, m_pad, k, n, true, 1.0, mlive,
+                let o = w4a16_linear_swz_launch_redist::<Rt>(
+                    &client, &arm.a, b, sc, m_pad, k, n, true, 1.0, mlive, false,
                 );
                 drop(o);
             }
             let _ = future::block_on(client.sync());
             let ds = t1.elapsed().as_secs_f64() / REPS as f64;
 
+            let t2 = Instant::now();
+            for j in 0..REPS {
+                let (b, sc) = &arm.rot[j % arm.rot.len()];
+                let o = w4a16_linear_swz_launch_redist::<Rt>(
+                    &client, &arm.a, b, sc, m_pad, k, n, true, 1.0, mlive, true,
+                );
+                drop(o);
+            }
+            let _ = future::block_on(client.sync());
+            let dh = t2.elapsed().as_secs_f64() / REPS as f64;
+
             if r >= 2 {
                 base[i] = base[i].min(db);
                 swz[i] = swz[i].min(ds);
+                shf[i] = shf[i].min(dh);
             }
         }
     }
@@ -205,16 +276,19 @@ fn main() {
     for (i, &n) in ns.iter().enumerate() {
         let bytes = table_bytes(n, k);
         println!(
-            "{:>8} {:>7} {:>9.2} {:>4} {:>10.4} {:>10.4} {:>10.1} {:>10.1} {:>7.2}",
+            "{:>8} {:>7} {:>9.2} {:>4} {:>10.4} {:>10.4} {:>10.4} {:>9.1} {:>9.1} {:>9.1} {:>7.2} {:>7.2}",
             n,
             (m_pad / 16) * (n / 8),
             bytes as f64 / (1u64 << 20) as f64,
             arms[i].rot.len(),
             base[i] * 1e3,
             swz[i] * 1e3,
+            shf[i] * 1e3,
             bytes as f64 / base[i] / 1e9,
             bytes as f64 / swz[i] / 1e9,
-            base[i] / swz[i]
+            bytes as f64 / shf[i] / 1e9,
+            base[i] / swz[i],
+            swz[i] / shf[i]
         );
     }
     println!(
@@ -224,4 +298,8 @@ fn main() {
          and not a two-node figure."
     );
     println!("ratio > 1 -> the permutation is a win at that cube count; < 1 -> a loss.");
+    println!(
+        "shf/swz > 1 -> the coalesced load + warp shuffle is a win at that cube count; the two \
+         swizzled arms differ ONLY in the comptime `redist` and read the same buffers."
+    );
 }

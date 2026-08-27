@@ -200,9 +200,44 @@
 //! ASSUMING A RE-SWIZZLE that spreads the wanted words across components. Read
 //! row 8 as achievable today and row 9 as achievable after a format change.
 //!
+//! ## And then the rung became the kernel (2026-08-27, both boxes locked and idle)
+//!
+//! Everything above is the LOAD HALF -- rungs carrying no A operand, no
+//! accumulator and no MMA -- so none of it was a claim about the shipped lane.
+//! `real swz + shuffle` is that claim: the redistribution built into
+//! `w4a16_linear_swz` itself, behind `w4a16gemm::swz_shuffle`
+//! (`INK_W4A16_SWZ_SHUFFLE`, default off), round-robined against the flag-off
+//! lane in the SAME process so the paired ratio applies to it.
+//!
+//! ```text
+//!   arm                      spark2 p50 ms  GB/s     spark p50 ms  GB/s
+//!   coalesced (the ceiling)      1.940     238.8        2.121     218.4
+//!   real w4a16_linear_swz        3.121     148.4        3.093     149.7
+//!   real swz + shuffle           2.658     174.2        2.642     175.3
+//! ```
+//!
+//! Medians of three processes a box, same framing rule as above. Paired
+//! within-process p50 of arm 10 over arm 3, over six processes across both
+//! boxes: 0.860, range 0.818 .. 0.898. So the shipped lane's weight read is
+//! 1.16x, and the lane moves from 62% of the coalesced control to 73%.
+//!
+//! IT IS NOT THE 95% THE LOAD RUNGS REACHED, and it was never going to be: arms
+//! 8 and 9 drop the A operand, the accumulator and the MMA, and the kernel does
+//! not. What the rungs bought was the right to expect a large win rather than a
+//! small one; the size of it is only knowable by running the whole lane, which
+//! is what arm 10 is for.
+//!
+//! Registers went DOWN, 73 to 61, with `launch__occupancy_limit_blocks` still 24
+//! and the register limit moving off it (24 -> 32 blocks). L2 requests 13.454M
+//! -> 5.451M for byte-identical DRAM traffic (14.485M `lts__d_sectors_fill_
+//! sysmem` sectors either way, 0.014% apart). The L1 saving is exact rather than
+//! approximate: codes 12.866M -> 3.216M requests, scales 6.433M -> 1.608M, A
+//! untouched at 12.866M, predicted 14.475M saved and 14.474M measured.
+//!
 //! Timing only, deliberately: every arm reads the same bytes in the same order
 //! as the lane it stands in for, so an uninitialised table exercises the
-//! identical access pattern. Numerics are `w4a16_swz_probe`'s job.
+//! identical access pattern. Numerics are `w4a16_swz_probe`'s job, and it gates
+//! the flag bit-for-bit.
 //!
 //! `INK_GC_ORDER=fwd` pins the arm order to the committed protocol; the default
 //! reverses it on odd reps so no arm keeps the same slot in the rep.
@@ -221,7 +256,7 @@ use cubecl::prelude::*;
 use cubecl::server::Handle;
 use half::bf16;
 use mary::models::inkling::w4a16gemm::{
-    CODES_PER_WORD, GROUP, KTILE, MTILE, NTILE, SWZ_BLOCK_CODES, w4a16_linear_swz_launch,
+    CODES_PER_WORD, GROUP, KTILE, MTILE, NTILE, SWZ_BLOCK_CODES, w4a16_linear_swz_launch_redist,
 };
 
 type Rt = cubecl::cuda::CudaRuntime;
@@ -608,6 +643,7 @@ fn main() {
         "geom, no A no scales     ",
         "width 4 B/lane + shuffle ",
         "width 16 B/lane + shuffle",
+        "real swz + shuffle       ",
     ];
     let mut per_rep: Vec<Vec<f64>> = vec![Vec::new(); names.len()];
 
@@ -693,8 +729,12 @@ fn main() {
                     );
                     let _ = future::block_on(client.sync());
                 }
-                3 => {
-                    let o = w4a16_linear_swz_launch::<Rt>(
+                // Arms 3 and 10 are the SHIPPED lane with the weight-load form
+                // as the only variable, said explicitly rather than read from
+                // the environment, so both live in one process and the paired
+                // ratio 10/3 resolves what a two-process comparison cannot.
+                3 | 10 => {
+                    let o = w4a16_linear_swz_launch_redist::<Rt>(
                         &client,
                         &a,
                         &b,
@@ -705,6 +745,7 @@ fn main() {
                         true,
                         1.0,
                         Some(m_live),
+                        arm == 10,
                     );
                     let _ = future::block_on(client.sync());
                     drop(o);
@@ -745,6 +786,11 @@ fn main() {
     };
     println!("\n  paired within-process ratio (per rep, then p50 / min / max)");
     for (lbl, a, b) in [
+        // THE SHIPPED LANE, flag on over flag off. Everything else here is a
+        // rung; this row is the kernel.
+        ("REAL: shuffle on/off     (10/3)", 10usize, 3usize),
+        ("real+shfl vs coalesced   (10/0)", 10, 0),
+        ("real+shfl vs fragment map(10/1)", 10, 1),
         ("shuffle cost, 4 B/lane   (8/4)", 8usize, 4usize),
         ("shuffle cost, 16 B/lane  (9/5)", 9, 5),
         ("4 B+shfl vs no-A fragment(8/6)", 8, 6),

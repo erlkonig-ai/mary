@@ -1861,6 +1861,148 @@ pub fn swz_unroll() -> usize {
     })
 }
 
+/// Load the weight planes COALESCED and redistribute to the fragment lanes with
+/// warp shuffles, instead of loading them fragment-shaped. Off by default.
+///
+/// ## What it is
+///
+/// The `m16n8k16` B fragment map gives lane `l` column `l >> 2`, so FOUR LANES
+/// LAND ON THE SAME 32-BIT WORD. A fragment-shaped warp load therefore touches
+/// 8 distinct words -- 32 bytes, one sector -- where a flat load of the same
+/// instruction touches 16. That is the whole of the W4A16 head's missing third:
+/// `w4a16_geom_ceiling` shows every arm moving the same 463 MB from DRAM within
+/// 0.2% while the shipped lane spends 13.4M L2 requests against a coalesced
+/// control's 3.6M for those same bytes. The lane is short of TRANSACTIONS, not
+/// bytes.
+///
+/// This flag buys them back without touching the stored format. One warp step
+/// reads 32 consecutive words of the shipped swizzle -- two whole
+/// `(n_tile, k_tile)` blocks -- and lane `l` then pulls its own four words out
+/// of them with four `plane_shuffle`s (`__shfl_sync` on the CUDA dialect),
+/// filling the same `w_buf` the fragment-shaped loads filled. At the shipped
+/// `kunroll = 4` that is 2 loads and 8 shuffles where there were 8 loads. The
+/// scale plane gets the same treatment one granularity coarser (32 E4M3 bytes
+/// is four k-tiles), and only when it is permuted -- the row-major scale plane
+/// strides by `spr` per lane and is not a warp-contiguous read at all.
+///
+/// It is EXACT over the existing swizzle: same words, same slots, same order,
+/// no shared memory, no barrier (the lane is one warp per cube, so
+/// `stall_barrier` reads 0.00 and there is nothing to synchronise on).
+///
+/// ## What it measures on the SHIPPED lane (2026-08-27, spark2 and spark, both
+/// boxes locked and idle)
+///
+/// The rungs that motivated it are the LOAD HALF -- no A operand, no
+/// accumulator, no MMA -- and they are not a claim about this kernel. These are.
+///
+/// FRAMING RULE: GB/s over the head's 0.431 GiB weight table (0.383 GiB of
+/// codes plus 0.048 GiB of E4M3 scales) of ONE `[201024, 4096]` operand, PER
+/// LAUNCH of a `[16, 4096] x [201024, 4096]^T` product with ONE live row of 16,
+/// one launch and one sync each, p50 of 10 warm reps of 12, arms round-robined
+/// with the order reversed on odd reps (`w4a16_geom_ceiling`). Not a step
+/// figure and not a two-node figure.
+///
+/// ```text
+///   arm                        spark2 p50 ms   GB/s      spark p50 ms   GB/s
+///   coalesced (the ceiling)        1.940      238.8         2.121      218.4
+///   w4a16_linear_swz, flag OFF     3.121      148.4         3.093      149.7
+///   w4a16_linear_swz, flag ON      2.658      174.2         2.642      175.3
+/// ```
+///
+/// Medians of three processes a box. The PAIRED within-process ratio is the
+/// only figure here that resolves ~1.1% -- both flag states run in ONE process
+/// on one pair of buffers, ratioed rep by rep -- and over six processes across
+/// both boxes its p50 is
+///
+/// ```text
+///   flag ON / flag OFF   0.860   (0.818 .. 0.898 across the six)
+/// ```
+///
+/// i.e. 1.16x, and the flag-off arm is the noisier of the two by a wide margin
+/// (its p50 moves 144-155 GB/s between processes where the flag-on arm moves
+/// 174-184).
+///
+/// AND IT IS A WIN AT EVERY CUBE COUNT, which is what makes it a candidate for
+/// a global default rather than a head-only one. `w4a16_swz_grid`, which
+/// pipelines 20 launches over rotating buffers precisely so a small shape
+/// cannot be answered by the L2, min of 6 rounds after 2 discarded, k = 4096,
+/// `m_pad = 16` with one live row, both boxes:
+///
+/// ```text
+///   n         cubes    swz GB/s -> +shuffle    spark2   spark
+///   4096        512     77.0 ->  78.9           1.03    1.06
+///   8192       1024    130.5 -> 144.1           1.10    1.14
+///   16384      2048    135.1 -> 153.9           1.14    1.16
+///   32768      4096    142.6 -> 171.4           1.20    1.16
+///   65536      8192    144.8 -> 174.8           1.21    1.23
+///   131072    16384    141.3 -> 183.5           1.30    1.16
+///   201024    25128    160.7 -> 186.5           1.16    1.22   <- the head
+/// ```
+///
+/// Nothing regresses, including the 512-cube shape where the permutation itself
+/// barely pays.
+///
+/// ## Why it costs nothing, in counters rather than in time
+///
+/// `ncu` 2025.3.1 on `w4a16_linear_swz` launched by `w4a16_geom_ceiling` at the
+/// head shape, one launch profiled per arm, spark2, box locked and idle:
+///
+/// ```text
+///   flag   reg  limit_reg  limit_blk   occ.    sect/req    L1 req    L2 req   DRAM sect
+///   OFF     73     24         24      49.25%     1.00     32.164M   13.454M   14.483M
+///   ON      61     32         24      49.49%     1.55     17.690M    5.451M   14.485M
+/// ```
+///
+/// REGISTERS GO DOWN, 73 to 61. The staged coalesced words are the COMPRESSED
+/// form -- four words hold what sixteen fragment words would -- so shuffling out
+/// of a staging register just in time is a smaller live set than holding the
+/// fragments. `launch__occupancy_limit_blocks` stays 24 and the register limit
+/// moves OFF it (24 -> 32 blocks), so the ~80-register cliff that killed load
+/// depth 8 is further away than before, not closer.
+///
+/// THE TRANSACTIONS ARE THE WHOLE OF IT, and the L1 arithmetic is exact rather
+/// than approximate. Per launch the codes cost `25128 * 256 * 2` = 12.866M
+/// requests fragment-shaped and `25128 * 128` = 3.216M coalesced; the scales
+/// cost 6.433M and 1.608M; A is untouched at 12.866M. Predicted saving
+/// 14.475M, measured 14.474M. `lts__d_sectors_fill_sysmem` is 14.485M sectors
+/// (463.5 MB) either way, 0.014% apart -- the SAME BYTES in 2.47x fewer L2
+/// requests.
+///
+/// The instruction stream gets SHORTER, not longer (870.6M -> 774.2M
+/// `smsp__inst_executed.sum`), even though 19.3M warp shuffles were added: what
+/// went with the 14.5M load instructions was their address arithmetic.
+/// `stall_barrier` is 0.00 in both, `lg_throttle` 0.01 -> 0.00.
+///
+/// ## Why it is off by default anyway
+///
+/// Because every figure above is a PER-LAUNCH weight-read figure at
+/// `m_pad = 16`, and what production spends is a step. Turning it on is a
+/// decision for `scripts/frontier-bench.sh` at the frontier, which prices tok/s
+/// over the whole two-node pipeline; until that has run, the honest claim is
+/// the one measured -- this lane's weight read, 1.16x, on one box, per launch.
+/// The flag exists so that run is a `INK_W4A16_SWZ_SHUFFLE=1` away rather than
+/// a rebuild.
+///
+/// `w4a16_swz_probe` gates the numerics: flag on against flag off, four
+/// `(m_pad, live, k, swz_sc)` shapes, EVERY output compared including the
+/// padding rows, 0 bits differ. It is a pure data-movement change and anything
+/// but bit-identity would be a wrong source lane.
+///
+/// The 16 B/lane variant is worth ~3% more on the load rungs and is NOT
+/// reachable from here: the current swizzle puts all sixteen wanted words in
+/// one vector component, which sixteen shuffles cannot reach. It presumes a
+/// re-swizzle and is a separate piece of work.
+pub fn swz_shuffle() -> bool {
+    // Cached for the same reason `swz_unroll` is: read on every LAUNCH, inside
+    // the timed region of every harness that measures this lane.
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("INK_W4A16_SWZ_SHUFFLE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 /// [`w4a16_linear`] reading a B operand written by [`swizzle_w4a16_codes_into`].
 ///
 /// `m_live` is `Some(m)` to MASK the A operand's padding rows — `m` being how
@@ -1876,6 +2018,9 @@ pub fn swz_unroll() -> usize {
 /// dequantise, the scale application, the accumulator, the output store — is
 /// the same code, because the permutation moves bytes and changes nothing about
 /// what they mean.
+///
+/// `redist` selects the COALESCED LOAD + WARP SHUFFLE form of the two weight
+/// reads; [`swz_shuffle`] carries what it is for and what it costs.
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 pub fn w4a16_linear_swz<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size>(
@@ -1889,6 +2034,7 @@ pub fn w4a16_linear_swz<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size>(
     #[comptime] kunroll: usize,
     #[comptime] mask_rows: bool,
     #[comptime] hi_dead: bool,
+    #[comptime] redist: bool,
     scale: f32,
     m_live: u32,
 ) {
@@ -1923,6 +2069,20 @@ pub fn w4a16_linear_swz<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size>(
     let k_tiles = comptime!(size_k / KTILE);
     let wpb = comptime!(SWZ_BLOCK_CODES / 4);
     let groups = comptime!(k_tiles / kunroll);
+
+    // The redistributed load's step geometry, all comptime. `bps` is how many
+    // whole `(n_tile, k_tile)` blocks one 32-lane warp step of 32-bit words
+    // covers on the codes plane, `sbps` the same on the E4M3 scale plane, and
+    // the two `steps` are how many such steps one `kunroll` group needs. The
+    // scale plane needs a coarser group (`32 / NTILE` k-tiles a step against
+    // `32 / wpb`), which is why `redist_sc` carries its own divisibility test
+    // rather than riding on `redist`; the launch refuses `redist` outright when
+    // `kunroll` does not divide the codes step.
+    let bps = comptime!(32 / (SWZ_BLOCK_CODES / 4));
+    let bsteps = comptime!(kunroll / bps);
+    let sbps = comptime!(32 / NTILE);
+    let ssteps = comptime!(kunroll / sbps);
+    let redist_sc = comptime!(redist && swz_sc && kunroll % sbps == 0);
 
     // `kunroll` k-tiles are LOADED before any of them is consumed, so the warp
     // carries `kunroll * 2` B sectors in flight instead of 2. That depth is what
@@ -1972,28 +2132,81 @@ pub fn w4a16_linear_swz<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size>(
                     a_buf[u * vc_a + i] = a[(gr * size_k + gc) / a.vector_size()];
                 }
             }
-            #[unroll]
-            for i in 0..vc_b {
-                // Written out of `position_of_nth` rather than assumed, so it
-                // tracks the target's own fragment layout: `row` is the k
-                // element, `col` the n column, and `swz_word_k16`'s `w` is
-                // `row / 8`.
-                let (row, col) = def.position_of_nth(lane, (i * vs_b) as u32, MatrixIdent::B);
-                let w = row as usize / CODES_PER_WORD;
-                let blk = (n_tile * k_tiles + t) * wpb;
-                w_buf[u * vc_b + i] = b[blk + w * NTILE + col as usize];
+            if comptime!(!redist) {
+                #[unroll]
+                for i in 0..vc_b {
+                    // Written out of `position_of_nth` rather than assumed, so it
+                    // tracks the target's own fragment layout: `row` is the k
+                    // element, `col` the n column, and `swz_word_k16`'s `w` is
+                    // `row / 8`.
+                    let (row, col) = def.position_of_nth(lane, (i * vs_b) as u32, MatrixIdent::B);
+                    let w = row as usize / CODES_PER_WORD;
+                    let blk = (n_tile * k_tiles + t) * wpb;
+                    w_buf[u * vc_b + i] = b[blk + w * NTILE + col as usize];
+                }
             }
             // One scale per k-tile, not one per fragment element. Both elements
             // of a fragment sit at `row` in 0..14 and `kbase` is a multiple of
             // KTILE = GROUP, so `(kbase + row) / GROUP` is `t` for every row --
             // the module header's second fact. The old form wrote it per element
             // and let the compiler notice; this says it once.
+            if comptime!(!redist_sc) {
+                let (_r0, c0) = def.position_of_nth(lane, 0u32, MatrixIdent::B);
+                s_buf[u] = if swz_sc {
+                    f32::cast_from(b_sc[(n_tile * k_tiles + t) * NTILE + c0 as usize])
+                } else {
+                    f32::cast_from(b_sc[(c0 as usize + n_base) * spr + kbase / GROUP])
+                };
+            }
+        }
+
+        // The SAME words, in the SAME `w_buf` slots, fetched coalesced and then
+        // handed to the lanes that want them. The `m16n8k16` B map puts four
+        // lanes on one 32-bit word (`col = lane >> 2`), so the fragment-shaped
+        // load above spends a whole warp request on 8 distinct words = one
+        // 32-byte sector, where a flat one covers 16. `w4a16_geom_ceiling`
+        // prices both ends of that and the redistribution between them.
+        //
+        // One warp step reads 32 consecutive words of this n-tile's swizzled
+        // plane, which is `bps` whole `(n_tile, k_tile)` blocks; lane `l` then
+        // pulls its own `vc_b` words out of each of them by their step-local
+        // index. Each `plane_shuffle` delivers one word to one lane and each
+        // word is wanted by four lanes, so `bps * vc_b` shuffles a step is the
+        // SATURATED count, not a chosen one.
+        if comptime!(redist) {
+            #[unroll]
+            for s in 0..bsteps {
+                let t0 = g * kunroll + s * bps;
+                let v = b[(n_tile * k_tiles + t0) * wpb + lane as usize];
+                #[unroll]
+                for p in 0..bps {
+                    #[unroll]
+                    for i in 0..vc_b {
+                        let (row, col) =
+                            def.position_of_nth(lane, (i * vs_b) as u32, MatrixIdent::B);
+                        let src = col
+                            + (row / (CODES_PER_WORD as u32)) * (NTILE as u32)
+                            + (p * wpb) as u32;
+                        w_buf[(s * bps + p) * vc_b + i] = plane_shuffle(v, src);
+                    }
+                }
+            }
+        }
+        // Scales, same shape: `NTILE` E4M3 bytes a block, so one 32-byte warp
+        // step covers `32 / NTILE` k-tiles and every lane wants one byte out of
+        // each. Only reachable on the permuted scale plane -- the row-major one
+        // strides by `spr` per lane and is not a warp-contiguous read at all.
+        if comptime!(redist_sc) {
             let (_r0, c0) = def.position_of_nth(lane, 0u32, MatrixIdent::B);
-            s_buf[u] = if swz_sc {
-                f32::cast_from(b_sc[(n_tile * k_tiles + t) * NTILE + c0 as usize])
-            } else {
-                f32::cast_from(b_sc[(c0 as usize + n_base) * spr + kbase / GROUP])
-            };
+            #[unroll]
+            for s in 0..ssteps {
+                let t0 = g * kunroll + s * sbps;
+                let sv = f32::cast_from(b_sc[(n_tile * k_tiles + t0) * NTILE + lane as usize]);
+                #[unroll]
+                for p in 0..sbps {
+                    s_buf[s * sbps + p] = plane_shuffle(sv, c0 + (p * NTILE) as u32);
+                }
+            }
         }
 
         #[unroll]
@@ -2036,6 +2249,11 @@ pub fn w4a16_linear_swz<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size>(
 }
 
 /// Launch [`w4a16_linear_swz`]. `swz_sc` says whether `b_sc` is permuted too.
+///
+/// The weight-load form comes from [`swz_shuffle`], i.e. from the environment.
+/// A harness that must run BOTH forms in one process — which is the only way to
+/// resolve a few percent on this part — calls [`w4a16_linear_swz_launch_redist`]
+/// and says which one it means.
 #[allow(clippy::too_many_arguments)]
 pub fn w4a16_linear_swz_launch<R: Runtime>(
     client: &ComputeClient<R>,
@@ -2048,6 +2266,36 @@ pub fn w4a16_linear_swz_launch<R: Runtime>(
     swz_sc: bool,
     scale: f32,
     m_live: Option<usize>,
+) -> Handle {
+    w4a16_linear_swz_launch_redist(
+        client,
+        a,
+        b,
+        b_sc,
+        m_pad,
+        k,
+        n,
+        swz_sc,
+        scale,
+        m_live,
+        swz_shuffle(),
+    )
+}
+
+/// [`w4a16_linear_swz_launch`] with the weight-load form said explicitly.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_linear_swz_launch_redist<R: Runtime>(
+    client: &ComputeClient<R>,
+    a: &Handle,
+    b: &Handle,
+    b_sc: &Handle,
+    m_pad: usize,
+    k: usize,
+    n: usize,
+    swz_sc: bool,
+    scale: f32,
+    m_live: Option<usize>,
+    redist: bool,
 ) -> Handle {
     assert_eq!(
         m_pad % MTILE,
@@ -2073,6 +2321,12 @@ pub fn w4a16_linear_swz_launch<R: Runtime>(
         let d = swz_unroll();
         if (k / KTILE) % d == 0 { d } else { 1 }
     };
+    // The coalesced step is 32 words wide and a swizzled block is `wpb` of
+    // them, so one step covers `32 / wpb` k-tiles and `kunroll` has to be a
+    // whole number of steps. It is not a fallback worth writing a second load
+    // path for: the only depth that fails it is 1, which is itself the fallback
+    // for a k the group does not divide.
+    let redist = redist && kunroll % (32 / (SWZ_BLOCK_CODES / 4)) == 0;
 
     unsafe {
         w4a16_linear_swz::launch::<bf16, e4m3, R>(
@@ -2091,6 +2345,7 @@ pub fn w4a16_linear_swz_launch<R: Runtime>(
             kunroll,
             mask_rows,
             hi_dead,
+            redist,
             scale,
             live,
         )

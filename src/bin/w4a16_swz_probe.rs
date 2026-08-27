@@ -56,10 +56,23 @@
 //! that `mma16_lane_dump` established for B applies -- so read it in the ncu
 //! sector counts first and in this probe's ms second.
 //!
-//! The last section is a GATE, not an observation: masked and unmasked must
-//! agree to the last bit, at four `(m_pad, live)` pairs including a multi-tile
-//! shape whose LAST tile is partly padding, and the probe exits 2 if they do
-//! not.
+//! The last TWO sections are GATES, not observations, and the probe exits 2 if
+//! either fails.
+//!
+//! * The A-side live-row mask: masked and unmasked must agree to the last bit,
+//!   at four `(m_pad, live)` pairs including a multi-tile shape whose LAST tile
+//!   is partly padding.
+//! * The COALESCED LOAD + WARP SHUFFLE weight read
+//!   (`w4a16gemm::swz_shuffle`, `INK_W4A16_SWZ_SHUFFLE`, default off): flag on
+//!   and flag off must agree to the last bit, at four shapes that between them
+//!   cover decode, a partly-padded last tile, a ROW-MAJOR scale plane the
+//!   redistribution must decline, and a `k` whose k-tile count the load depth
+//!   does not divide, where it must fall back to the fragment-shaped load
+//!   rather than to half a warp step. Both arms are launched from ONE process
+//!   by `w4a16_linear_swz_launch_redist`, so neither the environment nor two
+//!   builds can be the difference between them. It moves the same words into
+//!   the same slots, so the only admissible deviation is zero: anything else is
+//!   a wrong source lane, which would look like plausible numbers.
 
 use std::time::Instant;
 
@@ -67,7 +80,7 @@ use cubecl::future;
 use cubecl::prelude::*;
 use mary::models::inkling::w4a16gemm::{
     swizzle_w4a16_codes_into, swizzle_w4a16_scales_into, w4a16_linear_launch,
-    w4a16_linear_swz_launch,
+    w4a16_linear_swz_launch, w4a16_linear_swz_launch_redist,
 };
 
 type Rt = cubecl::cuda::CudaRuntime;
@@ -461,5 +474,131 @@ fn main() {
             std::process::exit(2);
         }
         println!("\x20   0 outputs differ anywhere: the mask is bit-identical.");
+    }
+
+    // The COALESCED LOAD + WARP SHUFFLE weight load, as a GATE.
+    //
+    // `w4a16gemm::swz_shuffle` reads the SAME words out of the SAME swizzled
+    // planes into the SAME `w_buf` slots -- it changes which lane's load
+    // instruction fetches a word, and nothing about which word or when it is
+    // consumed. So this is a pure data-movement change and the only admissible
+    // deviation is 0.000e0 exactly, on every output. An approximation here
+    // would be a wrong source lane, which is a permutation error and would look
+    // like plausible numbers.
+    //
+    // Both arms are launched from ONE process by
+    // `w4a16_linear_swz_launch_redist`, so neither the environment nor two
+    // builds can be the difference between them.
+    //
+    // Four shapes, and the last two are the ones with teeth:
+    //   * `[16, 256]` decode and `[48, 256]` last-tile, `swz_sc` ON: the
+    //     shipped configuration, `k_tiles = 16`, load depth 4.
+    //   * `swz_sc` OFF: swizzled codes against a ROW-MAJOR scale plane, which
+    //     the redistribution must decline -- that plane strides by `spr` per
+    //     lane and is not a warp-contiguous read, so only the codes may move.
+    //   * `[16, 96]`: `k_tiles = 6`, which the load depth of 4 does not divide,
+    //     so the launch falls back to depth 1 and MUST also fall back to the
+    //     fragment-shaped load -- one 32-word step is two k-tiles and there is
+    //     no half step. A silent failure here fills `w_buf` not at all.
+    {
+        let read = |h| -> Vec<f32> {
+            client
+                .read_one(h)
+                .unwrap()
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        let mut bad = 0usize;
+        println!("\n  coalesced load + warp shuffle, bit-identity (GATE):");
+        for (cm, live, ck, sc_swz) in [
+            (16usize, 1usize, 256usize, true),
+            (48, 37, 256, true),
+            (16, 1, 256, false),
+            (16, 1, 96, true),
+        ] {
+            let cn = 64usize;
+            let cc = cn * ck / 2;
+            let cs = cn * (ck / 16);
+            let wb: Vec<u8> = (0..cc).map(|i| (i.wrapping_mul(97) % 253) as u8).collect();
+            let sb: Vec<u8> = (0..cs).map(|i| [0x38u8, 0x40, 0x30][i % 3]).collect();
+            let mut pc = vec![0u8; cc];
+            let mut ps = vec![0u8; cs];
+            swizzle_w4a16_codes_into(&wb, &mut pc, cn, ck);
+            swizzle_w4a16_scales_into(&sb, &mut ps, cn, ck);
+            let hbp = client.create_from_slice(&pc);
+            let hsc = if sc_swz {
+                client.create_from_slice(&ps)
+            } else {
+                client.create_from_slice(&sb)
+            };
+            let ab: Vec<u8> = (0..cm * ck)
+                .flat_map(|i| {
+                    let v = if i / ck < live {
+                        half::bf16::from_f32((i % 13) as f32 * 0.25 - 1.5)
+                    } else {
+                        half::bf16::ZERO
+                    };
+                    v.to_le_bytes()
+                })
+                .collect();
+            let ha = client.create_from_slice(&ab);
+
+            let off = read(w4a16_linear_swz_launch_redist::<Rt>(
+                &client,
+                &ha,
+                &hbp,
+                &hsc,
+                cm,
+                ck,
+                cn,
+                sc_swz,
+                0.75,
+                Some(live),
+                false,
+            ));
+            let on = read(w4a16_linear_swz_launch_redist::<Rt>(
+                &client,
+                &ha,
+                &hbp,
+                &hsc,
+                cm,
+                ck,
+                cn,
+                sc_swz,
+                0.75,
+                Some(live),
+                true,
+            ));
+            let mut worst = 0.0f32;
+            let mut n = 0usize;
+            for (p, q) in off.iter().zip(&on) {
+                if p.to_bits() != q.to_bits() {
+                    n += 1;
+                }
+                worst = worst.max((p - q).abs());
+            }
+            let nonzero = off.iter().filter(|v| **v != 0.0).count();
+            bad += n;
+            println!(
+                "\x20   [{cm}, {ck}] x [{cn}, {ck}]^T, {live} live of {cm}, swz_sc {sc_swz}, \
+                 {} outputs ({nonzero} nonzero): {worst:.3e} ({n} bits differ)",
+                off.len(),
+            );
+        }
+        println!(
+            "\x20   framing: shuffle off vs shuffle on, SAME binary and SAME kernel source, the \
+             two arms differing only in the comptime `redist`; every output compared, padding \
+             rows included; deviation is max |on - off| and the count is exact f32 bit inequality."
+        );
+        if bad != 0 {
+            eprintln!(
+                "REFUSED: the redistributed weight load is not bit-identical ({bad} outputs \
+                 differ). It moves the same words to the same slots, so anything but 0 is a \
+                 wrong source lane, not a rounding difference."
+            );
+            std::process::exit(2);
+        }
+        println!("\x20   0 outputs differ anywhere: the redistributed load is bit-identical.");
     }
 }
