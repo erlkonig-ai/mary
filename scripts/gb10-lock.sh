@@ -45,6 +45,18 @@
 #   gb10-lock.sh release <host> <tag>  -> releases only if <tag> holds it
 #   gb10-lock.sh check <host>          -> prints the holder, rc 0 free, rc 3 held
 #
+# IF YOU CAN SEE THE BOX, LOOK BEFORE YOU BREAK A STALE LOCK. This script reads
+# silence as death because it cannot see the holder -- that is the right rule for
+# the mechanism, and the wrong rule for a caller with ssh. A holder doing one long
+# uninterrupted stretch without calling `refresh` goes stale WHILE STILL MEASURING,
+# and taking its box destroys a live reservation. The taker's own idle gate then
+# refuses and hands the box straight back, so the outcome is not an OOM -- it is a
+# reservation deleted and a slot wasted for nothing. Two ssh round trips per poll
+# removes the whole case. It also covers the agent who has not adopted the lock at
+# all: a box busy with an UNLOCKED run is not one to reserve either.
+# (scripts/frontier-bench.sh implements this as `boxes_look_idle && take_both`,
+# and the rule is theirs.)
+#
 # TAKING BOTH BOXES: BOTH OR NEITHER, AND NEVER WAIT WHILE HOLDING HALF.
 # A two-node run needs spark and spark2 together. If you take one, fail to get
 # the other, and then WAIT while still holding the first, you deadlock against
