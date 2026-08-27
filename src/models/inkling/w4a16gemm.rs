@@ -188,7 +188,11 @@ fn live_arg(m_pad: usize, m_live: Option<usize>) -> (bool, u32) {
     match m_live {
         Some(m) => {
             assert!(m <= m_pad, "m_live {m} exceeds the padded {m_pad} rows");
-            (true, m as u32)
+            // `as u32` would TRUNCATE, and a truncated row count is a silently
+            // wrong mask rather than a crash. Unreachable at any real shape --
+            // 2^32 rows of a 4096-wide BF16 activation is 32 TiB -- which is
+            // exactly why it must not be the thing that fails quietly.
+            (true, u32::try_from(m).expect("m_live fits a u32"))
         }
         // The count the kernel never reads. `m_pad` and not 0, so a masked
         // kernel handed this by mistake would still be CORRECT, only slow.
