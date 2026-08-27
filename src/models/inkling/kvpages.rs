@@ -1978,6 +1978,23 @@ pub fn kv_prealloc() -> Option<usize> {
     }
 }
 
+/// Whether this run decodes a BATCH of sequences rather than one.
+///
+/// Read here and not passed in because the alternative is threading a flag
+/// through the prefill for one guard; see [`KvPlan::from_env`] for why the
+/// guard exists at all. `INK_SLOTS` is parsed exactly as the binary parses it,
+/// so the two cannot disagree about what "a batch" means.
+fn slot_lane() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("INK_SLOTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
+            > 1
+    })
+}
+
 static MAX_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Tell this module the checkpoint's declared `model_max_length`.
@@ -2032,8 +2049,21 @@ impl KvPlan {
         }
     }
 
-    /// The configured plan, or `None` when preallocation is off.
+    /// The configured plan, or `None` when preallocation is off -- or when the
+    /// run is on a lane this is not scoped to.
+    ///
+    /// `INK_SLOTS=b` is the one such lane. Its batch lives in
+    /// [`super::burn::SlotCache`], which is built by MATERIALISING each
+    /// prefilled [`super::burn::AttnCache`] and then dropping it -- so a
+    /// reservation taken at the end of a prefill would be allocated, copied out
+    /// of, and thrown away, once per slot per layer. That is not a correctness
+    /// problem and it IS a memory-behaviour change to a lane this was not asked
+    /// to touch, which is the same thing as a silent one. So the slot lane is
+    /// refused here rather than left to discover it.
     pub fn from_env(window: usize) -> Option<Self> {
+        if slot_lane() {
+            return None;
+        }
         kv_prealloc().map(|context| Self::new(context, window))
     }
 
