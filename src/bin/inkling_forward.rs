@@ -6278,7 +6278,13 @@ fn main() -> Result<()> {
     // twice cannot disagree, whereas a second parse of INK_ROUTER could.
     let mut admission = budget::AdmissionPolicy::runtime(allocator)
         .with_router_bf16(RouterArm::from_env() == RouterArm::Bf16)
-        .with_drafting(mtp_k > 0);
+        .with_drafting(mtp_k > 0)
+        // The within-layer split is a PRICING fact: this rank holds half the KV
+        // pages (they follow `kv_heads`) and half the MLP intermediate, so
+        // charging it for both refuses a run that fits. Measured 2026-08-27:
+        // 20.03 GiB of activations charged at 0:42 where the split holds ~11,
+        // which refused the run on the box with 2 GiB less RAM by 0.7 GiB.
+        .with_tp_world(tp.world());
     for layer in lo..hi {
         if !t.is_dense(layer) {
             let experts = format!("model.llm.layers.{layer}.mlp.experts.w13_weight");
@@ -6300,7 +6306,10 @@ fn main() -> Result<()> {
         (lo..hi)
             .map(|layer| {
                 let kind = t.attn_kind(layer);
-                let (_, kv_heads, head_dim) = t.heads(kind);
+                let (_, g_kv_heads, head_dim) = t.heads(kind);
+                // This rank's KV heads: the cache follows them, so it halves
+                // with the within-layer split exactly as `kv_cache_bytes` does.
+                let kv_heads = g_kv_heads / tp.world();
                 let keep = match kind {
                     AttnKind::Local => t.sliding_window_size.min(n + gen_steps),
                     AttnKind::Global => n + gen_steps,

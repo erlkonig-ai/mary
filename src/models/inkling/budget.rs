@@ -247,6 +247,23 @@ pub struct AdmissionPolicy {
     /// copy in both placement arms and it is 52 MiB a layer. See
     /// [`super::burn::fuse_qkvr`].
     pub fused_qkvr: bool,
+    /// How many ranks the WITHIN-LAYER split divides each tensor between --
+    /// `INK_TP`'s world, 1 when it is unset.
+    ///
+    /// It belongs in the policy and not in a parameter because it is the same
+    /// kind of fact as `activation` or `cache`: a property of the RUN that
+    /// changes what a byte count means. And it has to be here at all because
+    /// the alternative -- pricing every run as if it were replicated -- is not
+    /// conservative, it is wrong: a split run holds half the KV pages and half
+    /// the MLP intermediate, and charging it for both refuses a run that fits.
+    /// Measured 2026-08-27: 20.03 GiB charged where the split holds ~11, which
+    /// refused `INK_LAYERS=0:42 INK_TP=1:2` on one of the two boxes by 0.7 GiB.
+    ///
+    /// NOT everything divides, and the three functions below say which at each
+    /// term. The residual stream, the normed copy beside it and every
+    /// `[n, hidden]` output are REPLICATED -- a rank holds the whole hidden
+    /// vector and only its own contribution to it.
+    pub tp_world: usize,
     wide_routed_layers: u128,
     plain_bf16_layers: u128,
 }
@@ -270,9 +287,23 @@ impl AdmissionPolicy {
             router_bf16: false,
             drafts: false,
             fused_qkvr: false,
+            tp_world: 1,
             wide_routed_layers: 0,
             plain_bf16_layers: 0,
         }
+    }
+
+    /// The within-layer split this run is under. `1` is no split.
+    pub const fn with_tp_world(mut self, world: usize) -> Self {
+        self.tp_world = world;
+        self
+    }
+
+    /// `extent` divided by the split, which is what a rank actually holds on
+    /// any axis the split cuts. Rounds UP, so a shape that does not divide is
+    /// over-charged rather than under-charged.
+    const fn split(self, extent: u64) -> u64 {
+        extent.div_ceil(self.tp_world as u64)
     }
 
     /// Capture all process-global lane switches once, before admission.
@@ -552,7 +583,12 @@ pub fn attention_activation_bytes(
     tokens: usize,
     policy: AdmissionPolicy,
 ) -> u64 {
-    let (heads, kv_heads, head_dim) = t.heads(kind);
+    let (g_heads, g_kv_heads, head_dim) = t.heads(kind);
+    // THIS RANK's heads. Everything indexed by a head divides with the split;
+    // the `[n, hidden]` term below does NOT, because a rank computes its own
+    // partial of the WHOLE hidden vector and holds all of it.
+    let heads = policy.split(g_heads as u64) as usize;
+    let kv_heads = policy.split(g_kv_heads as u64) as usize;
     let n = tokens as u64;
     let f32b = core::mem::size_of::<f32>() as u64;
     let q = n * (heads * head_dim) as u64 * f32b;
@@ -627,12 +663,15 @@ pub fn mlp_activation_bytes(
     let actb = policy.activation.bytes();
     let hidden = t.hidden_size as u64;
     if t.is_dense(layer) {
-        let i = t.dense_intermediate_size as u64;
+        // THIS RANK's intermediate width. The `2 * hidden` term beside it is
+        // the down projection's output and its scaling, which are `[n, hidden]`
+        // partials -- whole on every rank -- so they do not divide.
+        let i = policy.split(t.dense_intermediate_size as u64);
         // The gate and the up projection, the activation and the gated
         // product, then the down projection's output and its scaling.
         n * (4 * i * actb + 2 * hidden * f32b)
     } else if policy.routed_lane(layer) == RoutedLane::PlainBf16 {
-        let i = t.intermediate_size as u64;
+        let i = policy.split(t.intermediate_size as u64);
         let m = max_padded_routed_rows(t, tokens);
         // `grouped_experts_bf16`: a narrow normed residual is widened for the
         // f32 gather; that gathered input is cast to the BF16 MMA operand; the
@@ -653,7 +692,11 @@ pub fn mlp_activation_bytes(
         widened + gathered + mma_input + w13 + act + down + scattered
     } else {
         let actb = policy.routed(layer).bytes();
-        let i = t.intermediate_size as u64;
+        // THIS RANK's intermediate width -- `w13`, `act` and half of `packed`
+        // ride on it. `gathered`, `down` and `scattered` are `hidden`-wide and
+        // do not divide: the gather feeds every rank the whole residual and the
+        // down projection's output is a whole-width partial.
+        let i = policy.split(t.intermediate_size as u64);
         // `RowPlan::build` stacks each expert's rows and pads that expert up to
         // the 16-row MMA tile, so the buffer is `Sum_e ceil(rows_e/16)*16` and
         // not `n * top_k`. This charged the unpadded figure, which is an
@@ -736,16 +779,22 @@ pub fn kv_cache_bytes(
     tokens: usize,
     policy: AdmissionPolicy,
 ) -> u64 {
+    // The cache follows `kv_heads`, so it divides with the within-layer split.
+    // That is the term the split shrinks that a LAYER split does not: a layer
+    // split gives each node fewer layers of a full-width cache, a within-layer
+    // split gives every node every layer at half width, and the two are the
+    // same total only because 42/2 == 42 * (1/2).
     let elem = policy.cache.bytes();
     layers
         .map(|l| {
             let kind = t.attn_kind(l);
-            let (_, kv_heads, head_dim) = t.heads(kind);
+            let (_, g_kv_heads, head_dim) = t.heads(kind);
+            let kv_heads = policy.split(g_kv_heads as u64);
             let keep = match kind {
                 AttnKind::Local => t.sliding_window_size.min(tokens),
                 AttnKind::Global => tokens,
             } as u64;
-            2 * keep * (kv_heads * head_dim) as u64 * elem
+            2 * keep * kv_heads * head_dim as u64 * elem
         })
         .sum()
 }
