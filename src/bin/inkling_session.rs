@@ -451,6 +451,15 @@ fn rewind_gate(session: &mut Session, prompt: &[usize], steps: usize) -> Result<
 /// after 3 at layers 0..21 — which is the reading above, from the other side:
 /// the arms' arithmetic differs in the last bits, six MoE layers do not amplify
 /// it into a different expert and twenty-one do.
+///
+/// And the evidence that the parting is arithmetic rather than a wrong cache is
+/// [`rewind_gate`], re-run on the same binary: it agrees **8/8 at both layer
+/// ranges** with the batched `extend` under it. Its two arms append the same
+/// tail at the same width — one after a rewind, one after a `reset` — so the
+/// comparison is exact where this one cannot be, and it says a batched delta
+/// against a REWOUND cache is token-for-token the delta against a cache built
+/// forward. A batched append that had left a layer short of keys could not
+/// produce that.
 fn batched_gate(session: &mut Session, prompt: &[usize], steps: usize) -> Result<()> {
     anyhow::ensure!(
         prompt.len() >= 6,
