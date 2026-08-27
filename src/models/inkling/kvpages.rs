@@ -393,7 +393,13 @@ impl<R: PageRows> Pages<R> {
     }
 
     /// Let the read window catch up with the rows, after an append.
+    ///
+    /// A no-op on the grow-on-demand arm, and that is a guard rather than a
+    /// nicety: `epoch` is zero there and `next_multiple_of(0)` divides by zero.
     fn grow_read(&mut self) {
+        if self.reserved == 0 {
+            return;
+        }
         self.read = self.window_rows(self.stored());
     }
 
@@ -444,6 +450,11 @@ impl<R: PageRows> Pages<R> {
         );
         self.fill += n;
         self.len += n;
+        // A no-op by construction -- `append_is_in_place` refused the step
+        // where the window would move -- and here anyway, so the replayed
+        // path and the eager one cannot drift apart in a way only a long run
+        // would show.
+        self.grow_read();
     }
 
     /// Record the window advance that goes with it.
@@ -3055,6 +3066,64 @@ mod tests {
         assert!(
             demand >= 4 * held,
             "the on-demand window refused {demand} times and the reserved one {held}"
+        );
+    }
+
+    #[test]
+    fn host_a_replayed_reserved_run_keeps_the_same_bookkeeping_as_an_eager_one() {
+        // The path the graph lane actually drives. A replayed step runs no host
+        // code inside the region, so `note_appended` / `note_dropped` are the
+        // ONLY things that move the counters -- and if they drift from what the
+        // eager path would have done, the next eager step writes over the row
+        // this one wrote and nothing anywhere errors.
+        const WINDOW: usize = 512;
+        const EPOCH: usize = 256;
+        const STEPS: usize = 2000;
+        let mut eager = host_reserved(WINDOW + EPOCH, EPOCH);
+        let mut lane = host_reserved(WINDOW + EPOCH, EPOCH);
+        eager.append(HostRows::of(0, WINDOW, HW));
+        lane.append(HostRows::of(0, WINDOW, HW));
+        let mut replayed = 0usize;
+        for i in 0..STEPS {
+            let row = HostRows::of(WINDOW + i, 1, HW);
+            let drop = (eager.len() + 1).saturating_sub(WINDOW);
+            eager.append(row.clone());
+            if drop > 0 {
+                eager.drop_front(drop);
+            }
+            // The lane asks FIRST and pure, exactly as `step_is_replayable`
+            // does, and only then chooses which half of the step to run.
+            let can = lane.append_is_in_place(1) && lane.drop_is_bookkeeping_only(drop);
+            if can {
+                // The device write is pretended -- what is being checked is the
+                // counters, which is all a replay leaves to the host.
+                lane.pages[0].write_rows(lane.fill, row);
+                lane.note_appended(1);
+                if drop > 0 {
+                    lane.note_dropped(drop);
+                }
+                replayed += 1;
+            } else {
+                lane.append(row);
+                if drop > 0 {
+                    lane.drop_front(drop);
+                }
+            }
+            lane.assert_sound(HW);
+            assert_eq!(
+                (lane.len(), lane.head(), lane.read_rows()),
+                (eager.len(), eager.head(), eager.read_rows()),
+                "the replayed bookkeeping drifted at step {i}"
+            );
+        }
+        assert_eq!(
+            live(&lane),
+            live(&eager),
+            "the two runs hold different rows"
+        );
+        assert!(
+            replayed > STEPS - 2 * (STEPS / EPOCH + 2),
+            "only {replayed} of {STEPS} steps replayed"
         );
     }
 }
