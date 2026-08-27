@@ -497,16 +497,45 @@ impl Session {
     /// Attend to tokens that are NEW since the last call, continuing the
     /// sequence, and return the token that follows them.
     ///
-    /// This is the delta form, and it is the one a conversation uses: the
-    /// caller hands over what has happened since the last turn — never a
-    /// re-rendered transcript — because the KV cache is still holding everything
-    /// before it. An empty delta is a no-op that re-answers from the current
-    /// state, which is what [`Session::step`] is.
+    /// This is the delta form, and it is the one a conversation uses: the caller
+    /// hands over what has happened since the last turn — never a re-rendered
+    /// transcript — because the KV cache is still holding everything before it.
+    /// An empty delta re-answers from the current state, which is
+    /// [`Session::step`].
+    ///
+    /// # It walks the delta one position at a time, and that is deliberate
+    ///
+    /// A cached pass over `k > 1` rows is not a small generalisation of a cached
+    /// pass over one. It is the SPECULATIVE batch: `attention_steps` leaves the
+    /// rows PENDING in the cache, because the caller is expected to come back
+    /// and say how many of them a verifier kept — rows computed from tokens the
+    /// model did not choose have to be rolled back, and leaving them behind does
+    /// not error, it shows up later as an acceptance rate that drifts down. A
+    /// conversational delta has nothing to verify (every token in it is a fact),
+    /// so it would always commit all `k`, but reaching that through the
+    /// speculation machinery means getting a commit path right that nothing
+    /// here would exercise.
+    ///
+    /// So this walks the delta through the SAME single-position path
+    /// [`Session::step`] uses, which is the one that is checked. It costs `k`
+    /// passes where a batched one would cost one, and it still never re-reads a
+    /// token the cache already holds — which is the property the session exists
+    /// for, and the one that is worth two orders of magnitude. Batching the
+    /// delta is an optimisation on top, and it wants the commit semantics
+    /// spelled out rather than inherited.
     pub fn extend(&mut self, ids: &[usize]) -> Result<usize> {
-        match ids.is_empty() {
-            true => self.step(),
-            false => self.forward(ids),
+        if ids.is_empty() {
+            return self.step();
         }
+        if self.caches.is_empty() {
+            // Nothing cached yet: this IS a prefill, and a prefill batches.
+            return self.forward(ids);
+        }
+        let mut out = 0;
+        for &id in ids {
+            out = self.forward(&[id])?;
+        }
+        Ok(out)
     }
 
     /// Advance one token: feed back what the last pass produced, and return the
@@ -524,8 +553,22 @@ impl Session {
 
     /// The one forward. `ids` are the positions being added; everything before
     /// them is in the caches.
+    ///
+    /// Two shapes only, and the refusal below is what keeps it to two: a BATCHED
+    /// pass that establishes the cache, and a ONE-POSITION pass against a cache
+    /// that already exists. The third shape — several rows against an existing
+    /// cache — is the speculative batch and it is not this; see
+    /// [`Session::extend`], which walks a delta rather than reaching for it.
     fn forward(&mut self, ids: &[usize]) -> Result<usize> {
         anyhow::ensure!(!ids.is_empty(), "a pass with no tokens would be vacuous");
+        anyhow::ensure!(
+            self.caches.is_empty() || ids.len() == 1,
+            "a pass of {} rows against an EXISTING cache is the speculative batch -- \
+             `attention_steps` leaves those rows pending for a verifier to accept or roll \
+             back, and a conversational delta has no verifier. Use `extend`, which walks the \
+             delta one position at a time through the checked path.",
+            ids.len()
+        );
         let t = &self.cfg.text_config;
         let h = t.hidden_size;
         let n = ids.len();
