@@ -75,7 +75,7 @@ fn main() {
         let hs = client.create_from_slice(&ws);
         let d_w4 = read_digest(
             &client,
-            w4a16_linear_launch::<Rt>(&client, &ha, &hb, &hs, m_pad, k, n, 0.75),
+            w4a16_linear_launch::<Rt>(&client, &ha, &hb, &hs, m_pad, k, n, 0.75, None),
         );
         let d_wide = read_digest(
             &client,

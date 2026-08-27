@@ -48,7 +48,7 @@ use half::bf16;
 
 use mary::models::inkling::annhead;
 use mary::models::inkling::fp4quant::quantize_nvfp4_bf16;
-use mary::models::inkling::w4a16gemm::w4a16_linear_launch;
+use mary::models::inkling::w4a16gemm::{live_row_mask, w4a16_linear_launch};
 
 type Rt = cubecl::cuda::CudaRuntime;
 
@@ -201,7 +201,17 @@ fn main() {
         let qh = client.create_from_slice(bf16::as_bytes(&qb));
 
         let t0 = Instant::now();
-        let ex = w4a16_linear_launch::<Rt>(&client, &ah, &packed.0, &packed.1, 16, K, n, 1.0);
+        let ex = w4a16_linear_launch::<Rt>(
+            &client,
+            &ah,
+            &packed.0,
+            &packed.1,
+            16,
+            K,
+            n,
+            1.0,
+            live_row_mask().then_some(1),
+        );
         let _ = future::block_on(client.sync());
         let dt = t0.elapsed().as_secs_f64();
         if qi >= 2 {

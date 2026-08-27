@@ -135,6 +135,15 @@ fn main() {
     // B byte is then shared by `m_pad / 16` cubes out of L2. The RATIO is what
     // it is for; the levels move for reasons that are not the permutation.
     let m_pad = env_usize("INK_M", 16);
+    // `INK_MLIVE` is how many of those rows are LIVE. Unset means all of them,
+    // which is what this probe has always measured. Set it to 1 for decode, and
+    // both arms take the A-side live-row mask.
+    let mlive: Option<usize> = std::env::var("INK_MLIVE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    if let Some(v) = mlive {
+        assert!(v <= m_pad, "INK_MLIVE {v} exceeds INK_M {m_pad}");
+    }
 
     let ns: Vec<usize> = match std::env::var("INK_NS") {
         Ok(s) => s
@@ -147,8 +156,12 @@ fn main() {
     println!("=== W4A16: pre-permuted vs row-major, swept across grid size ===");
     println!("both lanes: one 32-thread cube per (m_tile 16, n_tile 8), so cubes = n/8");
     println!(
-        "k = {k}, m_pad = {m_pad}, swz load depth = {}; GB/s over the weight table only; min of \
+        "k = {k}, m_pad = {m_pad} ({}), swz load depth = {}; GB/s over the weight table only; min of \
          {ROUNDS} rounds of {REPS} pipelined launches\n",
+        match mlive {
+            Some(v) => format!("{v} live, A-side mask ON"),
+            None => "all live, mask off".to_string(),
+        },
         mary::models::inkling::w4a16gemm::swz_unroll(),
     );
     println!(
@@ -165,7 +178,7 @@ fn main() {
             let t0 = Instant::now();
             for j in 0..REPS {
                 let (b, sc) = &arm.rot[j % arm.rot.len()];
-                let o = w4a16_linear_launch::<Rt>(&client, &arm.a, b, sc, m_pad, k, n, 1.0);
+                let o = w4a16_linear_launch::<Rt>(&client, &arm.a, b, sc, m_pad, k, n, 1.0, mlive);
                 drop(o);
             }
             let _ = future::block_on(client.sync());
@@ -174,8 +187,9 @@ fn main() {
             let t1 = Instant::now();
             for j in 0..REPS {
                 let (b, sc) = &arm.rot[j % arm.rot.len()];
-                let o =
-                    w4a16_linear_swz_launch::<Rt>(&client, &arm.a, b, sc, m_pad, k, n, true, 1.0);
+                let o = w4a16_linear_swz_launch::<Rt>(
+                    &client, &arm.a, b, sc, m_pad, k, n, true, 1.0, mlive,
+                );
                 drop(o);
             }
             let _ = future::block_on(client.sync());

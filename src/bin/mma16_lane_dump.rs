@@ -17,7 +17,10 @@
 //!    index arithmetic (`w4a16_linear`: `b[gr * k/8 + gc/8]` over `[n, k/8]`
 //!    u32; `bf16_linear`: `b[(gr * k + gc) / 2]` over `[n, k]` bf16) and count,
 //!    per warp load instruction, the distinct 32-byte sectors and 128-byte
-//!    lines touched and the bytes actually consumed out of them. Then the same
+//!    lines touched and the bytes actually consumed out of them. Section 1b
+//!    does the same for A under the M-padding mask
+//!    (`w4a16gemm::live_row_mask`), which is a REQUEST-count change and not a
+//!    bandwidth one for exactly the reason the next paragraph gives. Then the same
 //!    over a whole k loop, which is the number that says whether the scatter
 //!    costs DRAM traffic or only requests.
 //! 3. **The permutation the map forces**, if any, printed as a destination
@@ -137,6 +140,85 @@ fn main() {
             "DOES NOT HOLD -- read the table above"
         }
     );
+
+    // --- Section 1b: the A map, and what the M padding costs. ---------------
+    //
+    // This section's header has claimed since it was written that A is dumped
+    // "because a surprise in either would mean the dump is reading a different
+    // definition than the kernels do". `mma16_frag_map` did write A at offset
+    // 256 -- but nothing here ever READ it, so the claim was aspirational for as
+    // long as it stood. It is now true.
+    //
+    // A is the operand `w4a16gemm::live_row_mask` is about, and the mask's whole
+    // premise is one property of this map: HALF the loads a lane issues address
+    // rows 8..15, which at decode (`m` = 1, `m_pad` = MTILE = 16) are entirely
+    // M padding. That premise is checked here off the DEVICE rather than read
+    // out of cubecl-cpp's `row_index`, so a target whose fragment layout differs
+    // says so instead of silently making the mask wrong.
+    println!("\n  A fragment, position_of_nth(lane, i * vs_a * pack, A) -> (m row, k col):");
+    for lane in 0..32usize {
+        let mut s = String::new();
+        for i in 0..vc_a {
+            let (r, c) = (w[256 + (lane * 4 + i) * 2], w[256 + (lane * 4 + i) * 2 + 1]);
+            s.push_str(&format!(" i{i}=(m{r:>2}, k{c:>2})"));
+        }
+        println!("    lane {lane:>2}{s}");
+    }
+    let mut a_closed = true;
+    for lane in 0..32usize {
+        for i in 0..vc_a {
+            let (r, c) = (
+                w[256 + (lane * 4 + i) * 2] as usize,
+                w[256 + (lane * 4 + i) * 2 + 1] as usize,
+            );
+            if r != lane / 4 + 8 * (i & 1) || c != 2 * (lane % 4) + 8 * ((i >> 1) & 1) {
+                a_closed = false;
+            }
+        }
+    }
+    println!(
+        "\n  closed form  row = lane/4 + 8*(i&1),  col = 2*(lane%4) + 8*((i>>1)&1) : {}",
+        if a_closed {
+            "HOLDS"
+        } else {
+            "DOES NOT HOLD -- the live-row mask's premise is this map; read the table"
+        }
+    );
+
+    // The A cost, per warp per k-tile, out of the device's own map and the
+    // kernels' own index arithmetic (`a[(gr * k + gc) / 2]`, 2 bf16 per load).
+    // REQUESTS and SECTORS are kept apart on purpose: a load whose predicate is
+    // false in every lane issues no request at all, and one with four active
+    // lanes issues a request that lands in a single sector. Conflating them is
+    // how a request-count change gets resold as a bandwidth change.
+    println!("\n  A operand per warp per k-tile, m_pad = 16, k = {k} (bf16, 2 per 4 B load):");
+    for live in [16usize, 9, 8, 1] {
+        let (mut reqs, mut secs) = (0usize, 0usize);
+        for i in 0..vc_a {
+            let mut touched: Vec<(usize, usize)> = Vec::new();
+            for lane in 0..32usize {
+                let r = w[256 + (lane * 4 + i) * 2] as usize;
+                let c = w[256 + (lane * 4 + i) * 2 + 1] as usize;
+                if r >= live {
+                    continue; // the mask: this lane's row is M padding
+                }
+                touched.push((r * k * 2 + c * 2, 4));
+            }
+            if touched.is_empty() {
+                continue; // predicated off in every lane: no request reaches L1
+            }
+            reqs += 1;
+            secs += granules(&touched, 32);
+        }
+        println!(
+            "    {live:>2} live rows: {reqs} request(s), {secs} x 32B sector(s){}",
+            if live == 16 {
+                "   <- the unmasked lane"
+            } else {
+                ""
+            }
+        );
+    }
 
     // --- Section 2: what one warp's load instruction actually touches. -------
     // Both consumers, same map, their own arithmetic. `n_base = 0`, `kbase` from
