@@ -171,11 +171,13 @@
 //!    layers. One of the two rules has to be selected by whether a group is
 //!    present, and getting it backwards is a refusal at load, not a wrong
 //!    answer — which is the good failure.
-//! 3. **Lockstep is per STEP, not per turn.** Both ranks must call `step()` the
-//!    same number of times or the other blocks in NCCL forever, and `extend`
-//!    walks a delta one position at a time — so the proxy must feed both ranks
-//!    the SAME context bytes and the same `max_tokens`, not merely the same
-//!    turns.
+//! 3. **Lockstep is per PASS, not per turn.** Both ranks must make the same
+//!    forward calls in the same order or the other blocks in NCCL forever, and
+//!    a turn's passes depend on its delta: `extend` appends in chunks of
+//!    `extend_batch` rows, and the pass is one row wider than the client's delta
+//!    whenever a carried token rides at its head. So the proxy must feed both
+//!    ranks the SAME context bytes and the same `max_tokens`, not merely the
+//!    same turns.
 //! 4. **Rank 1's stream must be DRAINED and CHECKED, not ignored.** Both ranks
 //!    produce the same token (embedding and unembedding are replicated, so both
 //!    unembed the whole table and take the same argmax). The proxy returns rank
@@ -257,6 +259,17 @@ pub struct TurnEnd {
     /// context, never a re-rendered transcript. Zero on a turn whose only input
     /// is the model's own previous output.
     pub delta_tokens: usize,
+    /// Tokens of the model's OWN previous turn this pass appended BEFORE the
+    /// delta: `0` on turn 0 and `1` on every turn after it.
+    ///
+    /// A turn emits its last token and never feeds it back — the generation loop
+    /// stops one step short rather than spend a decode step on an argmax nobody
+    /// reads — so that token ends the turn in the consumer's stream and not in
+    /// the KV cache. The next pass appends it at the head of its delta, and this
+    /// counts it, so a reader can see the whole pass rather than the client's
+    /// half of it. A turn after turn 0 reporting `0` here is a turn whose model
+    /// never heard its own last word.
+    pub carried: usize,
     /// Why generation stopped: `"max_tokens"` or `"stop_token"`.
     pub stopped: String,
     /// Seconds to the FIRST token of this turn, `Session` calls only:
@@ -276,11 +289,12 @@ impl TurnEnd {
     /// One line for a report, carrying its own framing rule.
     pub fn summary(&self) -> String {
         format!(
-            "turn {}: {} token(s) after a {}-token delta, first token {:.3}s, turn {:.3}s, \
-             position {} ({})",
+            "turn {}: {} token(s) after a {}-token delta (+{} carried), first token {:.3}s, \
+             turn {:.3}s, position {} ({})",
             self.turn,
             self.tokens,
             self.delta_tokens,
+            self.carried,
             self.first_token_secs,
             self.turn_secs,
             self.position,
@@ -526,11 +540,26 @@ impl StreamProof {
 /// # What it ignores, and why that is correct
 ///
 /// `Payload::Monologue` events are the mind's OWN words from earlier turns. A
-/// stateful backend already has them: they are literally the tokens its own
-/// `step()` fed back, sitting in the KV cache. Replaying them would attend to
-/// the same words twice. They are ingested into a [`drive::mind::MonologueBuffer`]
-/// anyway — but only for their COORDINATES, so the decision's span is expressed
-/// in the same session-absolute byte space the loop verifies against.
+/// stateful backend already has them, and it takes TWO mechanisms rather than
+/// one: all but the last token of a turn were fed back by its own `step()`, and
+/// the last one — which the generation loop deliberately does not spend a decode
+/// step to feed — is appended at the head of the NEXT turn's delta (see
+/// `inkling_serve::serve_turn` and [`TurnEnd::carried`]). Between them, every
+/// token this mind has said is in the KV cache by the time it is consulted
+/// again, so replaying the text would attend to the same words twice.
+///
+/// **That sentence used to say only the first half** — "they are literally the
+/// tokens its own `step()` fed back" — and it was false by exactly one token per
+/// turn, every turn with new context, for as long as it stood: the turn's final
+/// word went to the consumer and never to the cache. It is spelled out here
+/// because the comment is the whole reason the monologue is not re-fed, and a
+/// justification whose premise nobody checks is how the defect survived. It left
+/// no other trace: the cache stayed consistent, `position()` stayed exactly
+/// right, and the only thing that disagreed was the model's answer.
+///
+/// They are ingested into a [`drive::mind::MonologueBuffer`] anyway — but only
+/// for their COORDINATES, so the decision's span is expressed in the same
+/// session-absolute byte space the loop verifies against.
 ///
 /// `Payload::Result` events are the untrusted output of a command the mind ran.
 /// They ARE the delta and they are fed to the model as context. Drive never
@@ -680,8 +709,11 @@ impl InklingMind {
         // ── read the world ──────────────────────────────────────────────────
         for event in events {
             match &event.payload {
-                // Coordinates only. The model already attended to these tokens;
-                // they are in its KV cache because its own `step` fed them back.
+                // Coordinates only. The model already attended to these tokens:
+                // its own `step` fed back all but each turn's last, and the
+                // serving process carries that last one into the next turn's
+                // delta. See this type's doc for why both halves have to be
+                // true, and what happened while only one was.
                 drive::world::Payload::Monologue(text) => self.buffer.push_free(text),
                 // The delta: untrusted text from a sandbox, in as text.
                 drive::world::Payload::Result { command, rendered } => {
@@ -768,6 +800,7 @@ mod tests {
             turn: 3,
             tokens: 10,
             delta_tokens: 4,
+            carried: 1,
             stopped: "max_tokens".to_string(),
             first_token_secs: 0.021,
             turn_secs: 0.43,
@@ -778,6 +811,14 @@ mod tests {
         // The summary carries its own framing: "first token", not "per token".
         assert!(
             back.summary().contains("first token 0.021s"),
+            "{}",
+            back.summary()
+        );
+        // And it says how wide the pass actually was, not just the client's half
+        // of it: a turn whose model did not hear its own last word is a turn
+        // that reported `+0 carried` after turn 0, and that has to be readable.
+        assert!(
+            back.summary().contains("4-token delta (+1 carried)"),
             "{}",
             back.summary()
         );

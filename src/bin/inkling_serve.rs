@@ -244,7 +244,11 @@ fn run() -> Result<()> {
     // alternation, so the two-pipe deadlock cannot arise.
     let mut delta = String::new();
     let mut turn = 0usize;
-    let mut primed = false;
+    // The token the previous turn EMITTED and never fed back, waiting for the
+    // next pass to put it in the cache. `None` is also "no turn has run yet",
+    // which is the same fact as "nothing is prefilled": every turn emits at
+    // least one token. See `serve_turn`.
+    let mut carry: Option<usize> = None;
     loop {
         match input.next_frame()? {
             framed_stream::Frame::Record(record) if record.content_type() == CONSULT_TYPE => {
@@ -259,7 +263,7 @@ fn run() -> Result<()> {
                     want,
                     &options.stop,
                     turn,
-                    &mut primed,
+                    &mut carry,
                 )?;
                 let payload = serde_json::to_vec(&end)?;
                 let extent = payload.len() as u64;
@@ -304,6 +308,26 @@ fn run() -> Result<()> {
 /// what is new, because the KV cache is still holding everything before it. That
 /// is the property the whole exercise is for, and it is why the second turn is
 /// three orders of magnitude cheaper than the first.
+///
+/// # What is NEW is not only what the client sent
+///
+/// A turn's last token is emitted and never fed back: the loop below stops one
+/// step short, because generating a successor for a token the caller will not
+/// read costs a whole decode step (~44 ms at layers 0..21) and produces nothing.
+/// That saving is real and it is kept — but it means the turn ends with one
+/// token of the sequence in the consumer's stream and NOT in the KV cache.
+///
+/// So `carry` holds it, and the next turn appends it at the HEAD of its delta.
+/// That is the only place it can go and the cheapest place it could have gone:
+/// `Session::extend` batches, so the carried token is one extra ROW of a pass
+/// the turn was making anyway rather than a decode step of its own.
+///
+/// **Until 2026-08-27 nothing carried it and every turn lost its own final
+/// word, permanently.** The failure was invisible from inside: `position()`
+/// stayed exactly `prompt + fed`, no length disagreed with any other, and the
+/// cache was perfectly CONSISTENT — one token short of the sequence it stood
+/// for. `inkling_session --carry` is the gate that catches it, and it catches it
+/// by asking the model what comes next rather than by measuring anything.
 #[allow(clippy::too_many_arguments)]
 fn serve_turn(
     session: &mut Session,
@@ -313,13 +337,13 @@ fn serve_turn(
     want: usize,
     stop: &[u32],
     turn: usize,
-    primed: &mut bool,
+    carry: &mut Option<usize>,
 ) -> Result<TurnEnd> {
     // `false`: no special tokens. The prompts this model is measured against
     // carry none, and a BOS silently prepended here would make a served turn
     // incomparable with every reference prompt in the tree while every shape
     // check still passed. (Same reasoning, same flag, as `inkling_encode`.)
-    let ids: Vec<usize> = match delta.is_empty() {
+    let delta_ids: Vec<usize> = match delta.is_empty() {
         true => Vec::new(),
         false => tokenizer
             .encode(delta.as_str(), false)
@@ -330,18 +354,29 @@ fn serve_turn(
             .collect(),
     };
     anyhow::ensure!(
-        *primed || !ids.is_empty(),
+        carry.is_some() || !delta_ids.is_empty(),
         "the first turn has nothing to attend to: a prefill with no tokens would be vacuous"
     );
 
+    // What this pass appends: the previous turn's unfed last token, then the new
+    // context. On turn 0 there is no carry and this IS the delta.
+    let ids: Vec<usize> = carry
+        .iter()
+        .copied()
+        .chain(delta_ids.iter().copied())
+        .collect();
+    let carried = ids.len() - delta_ids.len();
+
     let started = std::time::Instant::now();
-    let first = match *primed {
+    let first = match carry.is_some() {
         false => session
             .prefill(&ids)
             .context("prefill the first sequence")?,
+        // Never empty on a primed session: the carry alone is a token, so a
+        // consult with no new context is still a one-row `extend` rather than a
+        // bare `step`. Same pass, and it is the pass that closes the gap.
         true => session.extend(&ids).context("extend the sequence")?,
     };
-    *primed = true;
     let first_token_secs = started.elapsed().as_secs_f64();
 
     // ── the incremental detokenizer ─────────────────────────────────────────
@@ -393,15 +428,28 @@ fn serve_turn(
             stopped = "stop_token";
             break;
         }
+        // One step short on purpose: the successor of the last emitted token
+        // would cost a full decode step and nobody would read it. The token
+        // itself is not lost — it leaves in `carry` below and is appended by the
+        // next turn's `extend`. Break that pairing and the model stops hearing
+        // its own last word. See this function's doc.
         if step + 1 < want {
             token = session.step().context("advance one token")?;
         }
     }
 
+    // What this turn emitted and did not feed back. Both exits above land here:
+    // the `want` exit skipped the final step, and the stop-token exit broke
+    // before it. A turn always emits at least one token, so this is always
+    // `Some` afterwards — which is also what tells the next turn it is not the
+    // first.
+    *carry = generated.last().map(|&t| t as usize);
+
     Ok(TurnEnd {
         turn,
         tokens: generated.len(),
-        delta_tokens: ids.len(),
+        delta_tokens: delta_ids.len(),
+        carried,
         stopped: stopped.to_string(),
         first_token_secs,
         turn_secs: started.elapsed().as_secs_f64(),
