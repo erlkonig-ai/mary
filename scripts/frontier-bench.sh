@@ -25,8 +25,12 @@
 #            before every run), INK_GEN=64, INK_KV=1, split 21, `--overlap`,
 #            `--order fixed`, 7 process-reps; the median over the reps that
 #            COMPLETED, and the row records the true n beside the n requested.
-#   AGAINST  the previous row of the SAME arm, with the resolution this
-#            comparison can see printed beside the delta and stored in the row.
+#   AGAINST  the `frontier` arm compares to the PREVIOUS FRONTIER ROW, because
+#            that is what a frontier series IS. An EXPERIMENTAL arm compares to
+#            the `frontier` arm OF THE SAME RUN, PAIRED rep by rep -- see THE
+#            COMPARISON EACH ROW CARRIES below. Either way the resolution this
+#            particular comparison can see is printed beside the delta and
+#            stored in the row, and the `vs` column says which comparison it is.
 #
 # THE FRONTIER ARM SETS NO `INK_*` SWITCH OF ITS OWN. That is the definition:
 # the frontier is what main gives you when you run it, not the best arm anyone
@@ -51,6 +55,89 @@
 # rows from two sessions do not and resolve far worse. E.g.
 #
 #   FRONTIER_EXTRA_ARM='graph:INK_GRAPH_LANE=1 INK_GRAPH_CARRY=1|INK_GRAPH_LANE=1 INK_GRAPH_CARRY=1;shuffle:INK_W4A16_SWZ_SHUFFLE=1|INK_W4A16_SWZ_SHUFFLE=1'
+#
+# ---------------------------------------------------------------------------
+# THE COMPARISON EACH ROW CARRIES, and why it is not the same comparison
+#
+# The paragraph above says the pairing is the whole point of running several
+# arms in one session. Until 2026-08-27 the row did not carry it: every row's
+# delta/res/verdict were computed against the previous row OF THE SAME ARM, so
+# a new experimental arm's first row read `- - first` and the paired figure --
+# the strong one, the one the run was shaped to produce -- existed only in the
+# run log on the box and died with it. `192a366` is the row that proved it: the
+# `allon` arm's paired deltas against frontier were measured rep by rep and
+# discarded, while the row said `first`.
+#
+#   frontier arm     delta/res/verdict against the PREVIOUS FRONTIER ROW.
+#                    UNPAIRED -- two medians from two sessions -- so it uses
+#                    the wider of the paired and unpaired thresholds below,
+#                    which on this lane at n=7 is 1.39%. `vs=prev-row:frontier`.
+#
+#   experimental arm delta/res/verdict against the `frontier` arm OF THE SAME
+#                    RUN, PAIRED on rep number. delta is the MEAN of the
+#                    per-rep deltas 100*(exp_r - frontier_r)/frontier_r, and
+#                    the resolution beside it is derived FROM THOSE SAME
+#                    RATIOS -- t(95%, n-1) * sd/sqrt(n) -- not from the
+#                    remembered PAIRED_SD constant. A run that is quieter than
+#                    the night PAIRED_SD was measured on then resolves better
+#                    than 1.1%, and one that is noisier resolves worse, which
+#                    is the honest answer in both directions.
+#                    `vs=paired:frontier@n=<paired reps>`.
+#
+# delta IS THE MEAN OF THE PAIRED RATIOS, NOT THE DIFFERENCE OF THE TWO ROWS'
+# MEDIANS. They are different estimators and only the first has the sd printed
+# beside it; quoting one against the other's threshold is the incoherence this
+# section exists to stop. On `192a366` they differed by 0.3 points (median-to-
+# median -0.66%, paired mean -0.96%) and pointed the same way.
+#
+# STUDENT'S t, NOT 2 sem, ON THE PAIRED PATH, because there the sd is ESTIMATED
+# from this run's own handful of ratios rather than remembered from a separate
+# measurement. At df=6 that is 2.447 against 2.0, i.e. a threshold 22% wider --
+# and wider is the safe direction for a number whose only job is to refuse to
+# call noise a result. Whatever the threshold, |delta| <= res is ALWAYS
+# `inside-resolution` and NEVER `better`/`worse`; that is one comparison in one
+# awk expression on both paths, so there is no path on which a null can be
+# reported as movement.
+#
+# `vs` IS COLUMN 19 AND IT IS APPENDED AT THE END, because `bench/frontier.tsv`
+# is an append-only series that later scripts read by field position. Columns
+# 1..18 keep their exact meaning and their exact index, so the six rows written
+# before 2026-08-27 still parse -- they simply have no 19th field, and a reader
+# that finds none is looking at a row from before the comparison was recorded.
+# Inserting it anywhere but the end would have silently shifted `notes`.
+#
+# NO ROW-TO-ROW COMPARISON IS KEPT FOR AN EXPERIMENTAL ARM, deliberately. Two
+# `allon` rows from two nights differ by whatever the arm did AND by whatever
+# main did underneath it, at the 1.39% unpaired threshold -- so it would answer
+# a confounded question badly, in the columns the unconfounded answer needs.
+# What a reader actually wants across nights is how the arm's delta AGAINST THE
+# FRONTIER moved, and that is exactly what comparing two experimental rows'
+# `delta_pct` now gives, because each is a paired figure measured at that
+# night's main. The fallback exists for one case only: if an arm shares NO rep
+# with the frontier arm there is nothing to pair, and the row falls back to the
+# row-to-row comparison and says so (`vs=prev-row:<arm>`).
+#
+# ---------------------------------------------------------------------------
+# NOTES ARE PER-ARM WHEN THEY ARE ABOUT ONE ARM'S REPS
+#
+# `notes` mixes two scopes and getting that wrong writes a lie into a committed
+# file. RUN-WIDE facts -- the idle gate (`ungated-after(...)`), a dirty sibling
+# checkout, `unreserved`, a run timeout -- are true of every arm and go on every
+# row. Facts about ONE ARM'S REPS -- `rep-failures=N`, `identity-fails`,
+# `paging-suspected`, `short-run:n=` -- go only on that arm's row, attributed by
+# WHOSE REP produced the line in the run log (`pipe-bench.sh` prints
+# `  <arm>   rep <n> ... ` before each rep, and that marker is the only thing in
+# the log that names an arm, which is why the attribution is a stateful scan and
+# not a grep).
+#
+# THE TWO ROWS COMMITTED AS `192a366` PREDATE THIS AND CARRY A NOTE THAT IS NOT
+# ABOUT THEM. In that run the `graph` arm failed all 7 of its reps, and because
+# the count was global the note `rep-failures=7` was written onto the `frontier`
+# row AND the `allon` row -- both of which completed n=7 of 7 with no short-run
+# note. Those two rows are correct; their `rep-failures=7` is not, and it is
+# about an arm that recorded no row at all. They are pushed history in an
+# append-only series so they are left exactly as they are; this paragraph is the
+# only way a later reader can know. Any row after that commit means it.
 #
 # WHAT main's SHA DOES NOT PIN, and is therefore recorded per row: mary's
 # `[patch]` section points `cubecl-runtime`/`cubecl-cuda`/`cubecl-wgpu` at
@@ -385,6 +472,10 @@ if [ "${1:-}" = "--run" ]; then
   IDS=$HOME/$FRONTIER_IDS
   OUT=/tmp/pipe-$TAG
   RUNLOG=/tmp/frontier-run-$TAG.log
+  # RUN-WIDE notes only -- things true of every arm in this run, which is what
+  # makes it safe to put them on every row. Anything about ONE arm's reps is
+  # computed per arm in `arm_notes` below; see NOTES ARE PER-ARM in the header
+  # for why the difference is not cosmetic.
   NOTES=""
   note() { NOTES="${NOTES:+$NOTES;}$1"; }
 
@@ -622,60 +713,186 @@ if [ "${1:-}" = "--run" ]; then
     esac
     note "ungated-after${gate_ev:+($gate_ev)}"
   fi
-  grep -q 'IDENTITY FAILS' "$RUNLOG" && note "identity-fails"
-  grep -q 'may be paging' "$RUNLOG" && note "paging-suspected"
-  fails=$(grep -c -E 'HEAD FAILED|TAIL FAILED' "$RUNLOG")
-  [ "${fails:-0}" -gt 0 ] && note "rep-failures=$fails"
+  # THE PER-REP NOTES USED TO BE GREPPED HERE, RUN-WIDE, AND THAT WAS THE BUG.
+  # `identity-fails`, `paging-suspected` and `rep-failures=N` are each printed
+  # BY A REP, and a rep belongs to exactly one arm, so a whole-log grep put one
+  # arm's failures on every arm's row. They are computed per arm now, in
+  # `arm_notes` below, which emit_row calls for the arm it is writing.
 
   # ---- 8. the row ------------------------------------------------------
   med()    { sort -n | awk '{v[NR]=$1} END{if(NR==0){print "-";exit} if(NR%2)printf "%.4f\n",v[(NR+1)/2]; else printf "%.4f\n",(v[NR/2]+v[NR/2+1])/2}'; }
   spread() { sort -n | awk '{v[NR]=$1} END{if(NR==0){print "-";exit} m=(NR%2)?v[(NR+1)/2]:(v[NR/2]+v[NR/2+1])/2; printf "%.2f\n",100.0*(v[NR]-v[1])/m}'; }
   CONFIG="per-decode-step/2node/split$FRONTIER_SPLIT/ctx3732/GEN$FRONTIER_GEN/INK_KV=1/overlap/order-fixed/median-of-n-process-reps/features=$FRONTIER_FEATURES"
 
+  # NOT RUN-WIDE. `identity-fails`, `paging-suspected` and `rep-failures=N` are
+  # all printed BY A REP, and a rep belongs to exactly one arm -- so grepping
+  # the whole log (which is what the gate check above still correctly does, and
+  # what this used to do beside it) put one arm's failures on every arm's row.
+  # `192a366` is the row that proved it: the
+  # `graph` arm failed all 7 of its reps and `rep-failures=7` was written onto
+  # the frontier and allon rows, which had completed 7 of 7. They are computed
+  # per arm now, and the arm they belong to is the one whose rep marker they sit
+  # under.
+  #
+  # `pipe-bench.sh` prints `  <arm>       rep <n> ... ` with NO trailing newline
+  # and then whatever that rep produces, so a failure can land on the marker
+  # line itself (usual) or on a later line (when `settle` printed its paging
+  # warning in between). Both cases are the same rule -- the line belongs to the
+  # nearest marker at or above it -- which is a stateful scan, and is why this
+  # cannot be a grep. The marker is also the ONLY thing in the log that names an
+  # arm at all.
+  arm_notes() {  # arm_notes <arm>  ->  ";"-joined notes about that arm's reps
+    awk -v a="$1" '
+      /^ +[^ ]+ +rep [0-9]+ \.\.\./ { cur=$0; sub(/^ +/,"",cur); sub(/ .*$/,"",cur) }
+      cur==a {
+        if ($0 ~ /HEAD FAILED|TAIL FAILED/) f++
+        if ($0 ~ /IDENTITY FAILS/)          idf++
+        if ($0 ~ /may be paging/)           pg++
+      }
+      END{
+        s=""
+        if (f)   s = s (s?";":"") "rep-failures=" f
+        if (idf) s = s (s?";":"") "identity-fails"
+        if (pg)  s = s (s?";":"") "paging-suspected"
+        print s
+      }' "$RUNLOG"
+  }
+
+  # The first failure line belonging to ONE arm's reps, for the short-run note.
+  arm_fail_line() {  # arm_fail_line <arm>
+    awk -v a="$1" '
+      /^ +[^ ]+ +rep [0-9]+ \.\.\./ { cur=$0; sub(/^ +/,"",cur); sub(/ .*$/,"",cur) }
+      cur==a && /HEAD FAILED|TAIL FAILED/ { l=$0; sub(/^ +/,"",l); print l; exit }' "$RUNLOG" \
+      | tr -d '\t' | cut -c1-60
+  }
+
+  # --- the two comparisons a row can carry ---------------------------------
+  # See THE COMPARISON EACH ROW CARRIES in the header. Both end in the SAME
+  # decision, written the same way in both awks -- movement only when |d| > r,
+  # everything else `inside-resolution` -- so there is no path here on which a
+  # difference smaller than the resolution can be reported as a result. Both
+  # print four fields: "<delta> <res> <verdict> <npaired>".
+
+  # AGAINST THE PREVIOUS ROW OF THE SAME ARM, and NOT PAIRED. The 1.1%-at-n=7
+  # figure is the resolution of a PAIRED arm delta inside ONE interleaved run;
+  # two medians from two different runs resolve less well, and the wider of the
+  # two is the honest threshold. Both are computed; the wider one decides.
+  cmp_prev_row() {  # cmp_prev_row <arm> <tok> <n>
+    local arm=$1 tok=$2 n=$3 prev prev_tok prev_n nmin
+    prev=$(last_row "$WT" "$arm")
+    if [ -z "$prev" ]; then printf -- '- - first 0\n'; return 0; fi
+    prev_tok=$(printf '%s' "$prev" | cut -f10)
+    prev_n=$(printf '%s' "$prev" | cut -f8)
+    nmin=$n; [ "${prev_n:-0}" -lt "$nmin" ] 2>/dev/null && nmin=$prev_n
+    awk -v a="$prev_tok" -v b="$tok" -v n="$nmin" -v psd="$PAIRED_SD" -v usd="$UNPAIRED_SD" 'BEGIN{
+      if (a+0 <= 0 || n+0 <= 0) { print "- - first 0"; exit }
+      d = 100.0*(b-a)/a;
+      rp = 2*psd/sqrt(n);
+      ru = 2*usd*sqrt(2)/sqrt(n);
+      r  = (ru>rp) ? ru : rp;
+      v  = (d>r) ? "better" : ((d < -r) ? "worse" : "inside-resolution");
+      printf "%+.2f %.2f %s 0\n", d, r, v }'
+  }
+
+  # AGAINST THE FRONTIER ARM OF THIS RUN, PAIRED on rep number. This is the
+  # comparison the multi-arm feature exists to produce and the one that used to
+  # die in the run log: the arms were interleaved by `pipe-bench.sh`, so rep k
+  # of the experimental arm and rep k of the frontier arm saw the same boxes
+  # minutes apart, and differencing them removes the between-rep drift that the
+  # unpaired threshold above has to carry.
+  #
+  # The resolution comes from THESE RATIOS, not from PAIRED_SD: a remembered
+  # constant cannot know whether tonight's boxes were quiet or noisy, and this
+  # run measured its own answer seven times. t(95%, n-1) rather than 2 sem
+  # because the sd is estimated from those same few ratios -- see the header.
+  cmp_paired() {  # cmp_paired <arm>
+    awk -F'\t' -v a="$1" -v psd="$PAIRED_SD" '
+      function tcrit(df,   tt) {
+        split("12.706 4.303 3.182 2.776 2.571 2.447 2.365 2.306 2.262 2.228 " \
+              "2.201 2.179 2.160 2.145 2.131 2.120 2.110 2.101 2.093 2.086 " \
+              "2.080 2.074 2.069 2.064 2.060 2.056 2.052 2.048 2.045 2.042", tt, " ")
+        return (df >= 1 && df <= 30) ? tt[df]+0 : 1.960
+      }
+      NR>1 && $1=="frontier" { f[$2]=$3+0 }
+      NR>1 && $1==a          { x[$2]=$3+0 }
+      END{
+        n=0
+        for (k in x) if ((k in f) && f[k] > 0) { n++; d[n] = 100.0*(x[k]-f[k])/f[k] }
+        if (n == 0) { print "- - nopair 0"; exit }
+        s=0; for (i=1;i<=n;i++) s += d[i]; m = s/n
+        if (n == 1) {
+          # One pair has no sd of its own. Fall back to the remembered
+          # per-paired-rep sd rather than pretending the resolution is zero,
+          # which is the one way this could manufacture a result out of noise.
+          r = 2*psd
+        } else {
+          v=0; for (i=1;i<=n;i++) v += (d[i]-m)*(d[i]-m)
+          r = tcrit(n-1) * sqrt(v/(n-1)) / sqrt(n)
+        }
+        vd = (m > r) ? "better" : ((m < -r) ? "worse" : "inside-resolution")
+        printf "%+.2f %.2f %s %d\n", m, r, vd, n
+      }' "$RESULTS"
+  }
+
   emit_row() {  # emit_row <arm> <kind> <env>
     local arm=$1 kind=$2 envs=$3
-    local n tok ms sp prev prev_tok prev_n nmin dr rest rownotes why
-    local delta res verdict
+    local n tok ms sp rownotes anotes why cmp vs
+    local delta res verdict npair
+    anotes=$(arm_notes "$arm")
     n=$(awk -F'\t' -v a="$arm" 'NR>1 && $1==a' "$RESULTS" | wc -l | tr -d ' ')
-    if [ "${n:-0}" -eq 0 ]; then say "  !! arm $arm produced no reps -- not recorded"; return 1; fi
+    if [ "${n:-0}" -eq 0 ]; then
+      say "  !! arm $arm produced no reps -- not recorded${anotes:+ ($anotes)}"
+      return 1
+    fi
     tok=$(awk -F'\t' -v a="$arm" 'NR>1 && $1==a {print $3}' "$RESULTS" | med)
     ms=$( awk -F'\t' -v a="$arm" 'NR>1 && $1==a {print $4}' "$RESULTS" | med)
     sp=$( awk -F'\t' -v a="$arm" 'NR>1 && $1==a {print $3}' "$RESULTS" | spread)
+    # Run-wide first, then this arm's own. Nothing about another arm's reps can
+    # reach this row: `arm_notes` is keyed on the rep markers in the run log.
     rownotes=$NOTES
+    [ -n "$anotes" ] && rownotes="${rownotes:+$rownotes;}$anotes"
     if [ "$n" -lt "$FRONTIER_REPS" ]; then
       # A silently short run must NEVER report as though the short count was
-      # asked for. Say the true n, and say what the log knows about why.
-      why=$(grep -m1 -E 'HEAD FAILED|TAIL FAILED' "$RUNLOG" | tr -d '\t' | cut -c1-60)
+      # asked for. Say the true n, and say what the log knows about why -- from
+      # THIS arm's reps, so a neighbouring arm's failure cannot explain it.
+      why=$(arm_fail_line "$arm")
       rownotes="${rownotes:+$rownotes;}short-run:n=$n-of-$FRONTIER_REPS${why:+:$why}"
-      say "  !! arm $arm completed $n of $FRONTIER_REPS reps. ${why:-No failure line in the log; read $RUNLOG.}"
+      say "  !! arm $arm completed $n of $FRONTIER_REPS reps. ${why:-No failure line for this arm in the log; read $RUNLOG.}"
     fi
-    prev=$(last_row "$WT" "$arm")
-    delta=-; res=-; verdict=first
-    if [ -n "$prev" ]; then
-      prev_tok=$(printf '%s' "$prev" | cut -f10)
-      prev_n=$(printf '%s' "$prev" | cut -f8)
-      nmin=$n; [ "${prev_n:-0}" -lt "$nmin" ] 2>/dev/null && nmin=$prev_n
-      # A ROW-TO-ROW COMPARISON IS NOT PAIRED. The 1.1%-at-n=7 figure is the
-      # resolution of a PAIRED arm delta inside ONE interleaved run; two medians
-      # from two different runs resolve less well, and the wider of the two is
-      # the honest threshold. Both are computed; the wider one decides.
-      dr=$(awk -v a="$prev_tok" -v b="$tok" -v n="$nmin" -v psd="$PAIRED_SD" -v usd="$UNPAIRED_SD" 'BEGIN{
-             if (a+0 <= 0 || n+0 <= 0) { print "- - first"; exit }
-             d = 100.0*(b-a)/a;
-             rp = 2*psd/sqrt(n);
-             ru = 2*usd*sqrt(2)/sqrt(n);
-             r  = (ru>rp) ? ru : rp;
-             v  = (d>r) ? "better" : ((d < -r) ? "worse" : "inside-resolution");
-             printf "%+.2f %.2f %s\n", d, r, v }')
-      delta=${dr%% *}; rest=${dr#* }; res=${rest%% *}; verdict=${rest##* }
+    if [ "$kind" = experimental ]; then
+      cmp=$(cmp_paired "$arm")
+      npair=${cmp##* }
+      if [ "${npair:-0}" -ge 1 ]; then
+        vs="paired:frontier@n=$npair"
+        [ "$npair" -lt 2 ] && vs="$vs+res-from-constant"
+      else
+        # No rep of this arm survived beside a frontier rep, so there is nothing
+        # to pair. Fall back to the weaker row-to-row comparison and SAY so in
+        # `vs` -- an unmarked fallback is how a weak number gets read as a
+        # strong one.
+        cmp=$(cmp_prev_row "$arm" "$tok" "$n"); vs="prev-row:$arm"
+      fi
+    else
+      cmp=$(cmp_prev_row "$arm" "$tok" "$n"); vs="prev-row:$arm"
     fi
+    read -r delta res verdict npair <<<"$cmp"
+    [ "$verdict" = first ] && vs="-"
     # Accumulated, NOT written to the file here. The commit is rebuilt from
     # scratch on top of whatever origin/main is at push time (see push_row), so
     # the row has to survive a `reset --hard` and be re-appended.
-    ROWS="$ROWS$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+    ROWS="$ROWS$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
       "$UTC" "$kind" "$arm" "$MAIN_SHA" "$TSP_SHA" "$CUBECL_SHA" "$BIN_SHA" \
       "$n" "$FRONTIER_REPS" "$tok" "$ms" "$sp" "$delta" "$res" "$verdict" \
-      "${envs:--}" "$CONFIG" "${rownotes:--}")
+      "${envs:--}" "$CONFIG" "${rownotes:--}" "$vs")
+"
+    say "  arm $arm [$kind]: $tok tok/s, $ms ms/step, n=$n of $FRONTIER_REPS, spread $sp%"
+    if [ "$verdict" = first ]; then
+      say "    no comparison: nothing to compare against yet."
+    else
+      say "    $delta% vs $vs -- resolves $res% -> $verdict"
+    fi
+    say "    notes: ${rownotes:--}"
+    [ "$kind" = experimental ] && EXP_VERDICTS="$EXP_VERDICTS  $arm: $delta% vs $vs, resolves $res% -> $verdict
 "
     ROW_TOK=$tok; ROW_MS=$ms; ROW_N=$n; ROW_SP=$sp
     ROW_DELTA=$delta; ROW_RES=$res; ROW_VERDICT=$verdict
@@ -683,6 +900,7 @@ if [ "${1:-}" = "--run" ]; then
   }
 
   ROWS=""
+  EXP_VERDICTS=""
   emit_row frontier "$KIND" "-" || die "the frontier arm recorded nothing"
   F_TOK=$ROW_TOK; F_MS=$ROW_MS; F_N=$ROW_N; F_SP=$ROW_SP
   F_DELTA=$ROW_DELTA; F_RES=$ROW_RES; F_VERDICT=$ROW_VERDICT
@@ -723,7 +941,7 @@ if [ "${1:-}" = "--run" ]; then
       git -C "$WT" reset -q --hard origin/main || return 1
       if [ ! -f "$WT/$RESULTS_REL" ]; then
         mkdir -p "$WT/$(dirname "$RESULTS_REL")"
-        printf 'utc\tkind\tarm\tmain_sha\ttriblespace_sha\tcubecl_graph_sha\tbin_sha256\tn\treps_req\ttok_s_med\tms_step_med\tspread_pct\tdelta_pct\tres_pct\tverdict\tenv\tconfig\tnotes\n' \
+        printf 'utc\tkind\tarm\tmain_sha\ttriblespace_sha\tcubecl_graph_sha\tbin_sha256\tn\treps_req\ttok_s_med\tms_step_med\tspread_pct\tdelta_pct\tres_pct\tverdict\tenv\tconfig\tnotes\tvs\n' \
           > "$WT/$RESULTS_REL"
       fi
       printf '%s' "$ROWS" >> "$WT/$RESULTS_REL"
@@ -774,7 +992,15 @@ cubecl-graph $CUBECL_SHA, which main's sha does not pin." || {
     say "           from two separate runs, not an interleaved A/B -- so a difference smaller"
     say "           than $F_RES% is NOT movement and must not be read as one."
   fi
-  [ -n "$NOTES" ] && say "  notes: $NOTES"
+  if [ -n "$EXP_VERDICTS" ]; then
+    say ""
+    say "  EXPERIMENTAL ARMS, each PAIRED against the frontier arm of THIS run rep by rep,"
+    say "  with the resolution derived from this run's own paired ratios rather than a"
+    say "  remembered constant. A delta no larger than its own resolution is NOT movement,"
+    say "  whichever way it points."
+    printf '%s' "$EXP_VERDICTS"
+  fi
+  [ -n "$NOTES" ] && say "  run-wide notes: $NOTES   (per-arm notes are printed with each arm above)"
   say "  row: $WT/$RESULTS_REL   reps: $RESULTS   run log: $RUNLOG"
   exit 0
 fi
