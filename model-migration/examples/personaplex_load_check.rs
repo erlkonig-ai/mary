@@ -10,7 +10,9 @@
 use anyhow::{Context, Result};
 
 fn main() -> Result<()> {
-    let path = std::env::args().nth(1).context("usage: personaplex_load_check <pile>")?;
+    let path = std::env::args()
+        .nth(1)
+        .context("usage: personaplex_load_check <pile>")?;
     let path = std::path::PathBuf::from(path);
     println!("weights {}", path.display());
 
@@ -25,7 +27,7 @@ fn main() -> Result<()> {
         "transformer.layers.0.self_attn.in_proj_weight",
         "depformer.layers.0.gating.0.linear_in.weight",
         "encoder.model.0.conv.conv.weight",
-        "quantizer.acoustic_residual_vector_quantizer.layers.0._codebook.embedding_sum",
+        "quantizer.rvq_first.vq.layers.0._codebook.embedding_sum",
     ] {
         println!("  {:<70} {}", probe, loader.has_weight(probe));
     }
