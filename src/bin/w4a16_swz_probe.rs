@@ -309,9 +309,11 @@ fn main() {
         let hs = client.create_from_slice(&sb);
         let hbp = client.create_from_slice(&pc);
         let hsp = client.create_from_slice(&ps);
-        let o1 = w4a16_linear_launch::<Rt>(&client, &ha, &hb, &hs, cm, ck, cn, 0.75);
-        let o2 = w4a16_linear_swz_launch::<Rt>(&client, &ha, &hbp, &hsp, cm, ck, cn, true, 0.75);
-        let o3 = w4a16_linear_swz_launch::<Rt>(&client, &ha, &hbp, &hs, cm, ck, cn, false, 0.75);
+        let o1 = w4a16_linear_launch::<Rt>(&client, &ha, &hb, &hs, cm, ck, cn, 0.75, None);
+        let o2 =
+            w4a16_linear_swz_launch::<Rt>(&client, &ha, &hbp, &hsp, cm, ck, cn, true, 0.75, None);
+        let o3 =
+            w4a16_linear_swz_launch::<Rt>(&client, &ha, &hbp, &hs, cm, ck, cn, false, 0.75, None);
         let f = |h| -> Vec<f32> {
             client
                 .read_one(h)
