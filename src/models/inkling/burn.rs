@@ -818,6 +818,61 @@ impl AttnCache<Bk> {
     /// allocator work it deletes is of order 0.06 ms a step (1901 reservations
     /// at 591-918 us a pass, of which ~7% of removed host time reaches the
     /// step, measured on GB10), and the device is busy 81% of a decode step.
+    /// Measured here and quoted only as a NON-regression: warm p50 45.3 ms a
+    /// decode step on the grow-on-demand arm against 44.8 on the reserved one,
+    /// same binary, same prompt, 60 warm steps each, layers 0:21, one GB10 --
+    /// inside this repo's own 3-7% rep-to-rep spread, so it says the
+    /// reservation costs nothing and says nothing else.
+    ///
+    /// ## What it was measured to do, 2026-08-27, one GB10, layers 0:21
+    ///
+    /// The capture claim, which is the whole point, held: with
+    /// `INK_GRAPH_LANE=1 INK_GRAPH_CARRY=1 INK_GEN=300` at a 3732-token prompt,
+    /// the grow-on-demand arm replayed **102** decode steps and then retired --
+    /// "step 109: the KV page structure changes on this step for layer slot(s)
+    /// [0..20]" -- while the reserved arm replayed **294** of the same 300 and
+    /// never retired at all. [`AttnCache::step_is_replayable`] does keep
+    /// answering yes past the 128-row page, because it asks the store and the
+    /// store no longer has a page boundary to cross.
+    ///
+    /// The reservation showed up in the pool at the size it reported:
+    /// `INK_KV_PREALLOC=max` printed 3.395 GiB for this node's 21 layers, and
+    /// peak pool reserved went 11.52 -> 14.85 GiB, a delta of 3.33 GiB (the
+    /// 0.07 difference is the pool reusing slices it had already stranded).
+    /// `MemAvailable` on the box stayed at 117-118 GB throughout.
+    ///
+    /// ## Bit identity, and the one place it does NOT hold
+    ///
+    /// Where the two arms partition the key axis the same way, they agree token
+    /// for token: at a 5-token prompt -- where the grow-on-demand store has one
+    /// page, so both arms hand the kernel ONE key run -- the streams are
+    /// identical for **132 consecutive decode steps**, and diverge at exactly
+    /// the step where the on-demand arm pushes its second page.
+    ///
+    /// At a 3732-token prompt they diverge at step 8, and that is the change
+    /// rather than a fault in it. The on-demand store hands the kernel two runs
+    /// (a merged 3712-row page and a 128-row tail); a reserved store hands one.
+    /// Same keys, same order, same mask -- a different split of the same sum,
+    /// and therefore a different rounding. Four things say it is that and not a
+    /// wrong read:
+    ///
+    /// * ONE layer, local (`0:1`) and global (`5:6`), four passes each: the
+    ///   layer RMS and the top-5 logits agree to every printed digit;
+    /// * `INK_KV_EPOCH=1` (a read window with NO dead rows), `INK_KV_EPOCH=512`
+    ///   and `INK_KV_PREALLOC=4096` all produce byte-identical output, so the
+    ///   dead rows are excluded exactly;
+    /// * the disagreement over a depth ladder is non-monotone -- `0:1`, `0:2`,
+    ///   `0:3` and `0:6` identical, `0:4` differing by 0.01 in a FIFTH-place
+    ///   logit, `0:9` more -- which is the signature of a discrete flip in a
+    ///   top-6-of-256 router, not of a systematic error;
+    /// * the store's own rows are checked byte-for-byte by
+    ///   `the_prefill_handover_moves_packed_rows_and_does_not_round_twice` and
+    ///   `the_reserved_arm_holds_exactly_the_rows_the_on_demand_arm_does`.
+    ///
+    /// So bit-identity at a long prompt is not reachable by ANY correct
+    /// preallocation: removing the page boundary IS removing the split it
+    /// induced. The gate that can be met, and was, is that the two arms agree
+    /// wherever the partition agrees.
     ///
     /// ## The boundary, said plainly
     ///
