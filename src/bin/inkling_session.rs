@@ -146,6 +146,38 @@ fn main() -> Result<()> {
 /// a last-place logit bit can flip. So a disagreement here is read as: WHERE
 /// does it start? A stream that agrees for many tokens and then parts company
 /// is that; a stream that parts at the first token is a wrong cache.
+///
+/// # What it measured, 2026-08-27, and the framing rule
+///
+/// One GB10 (`spark`), advisory box lock held, release build, features
+/// `inkling-cuda`, `inkling-small-complete.pile`, a 960-token prompt split
+/// 640/320 (the head is deliberately longer than the 512 sliding window, so the
+/// local layers have genuinely FORGOTTEN keys the checkpoint needs by the time
+/// the rewind happens), `--gen 8`, greedy, no `INK_*` switch but the layer
+/// range. Every figure below is per TOKEN of the call named, on that box, for
+/// that layer range — not per turn and not for the whole 42-layer model.
+///
+/// | | layers 0..6 | layers 0..21 |
+/// |---|---|---|
+/// | `checkpoint()` | 0.0000 s | 0.0001 s |
+/// | `rewind()` | 0.0000 s | 0.0004 s |
+/// | `prefill`, warm, BATCHED | 3.39 ms/token | 11.32 ms/token |
+/// | `extend`, warm, WALKED | 19.3 ms/token | 47.4 ms/token |
+/// | decode step | 19.4 ms/step | 47.4 ms/step |
+///
+/// Both ranges agreed 8/8 tokens between the rewound session and the one built
+/// that way, so the equivalence held exactly at this length on the real weights.
+///
+/// **And the ratio is the finding, not the saving.** Taking and using a
+/// checkpoint is free — sub-millisecond, because it is handle clones and
+/// counters. What is not free is what comes after it: `Session::extend` walks
+/// the delta ONE POSITION AT A TIME (see its own doc for why), so a re-extended
+/// token costs a DECODE step where a prefilled one costs a batched pass —
+/// 47.4 against 11.32 ms at layers 0..21, a factor of **4.19**. So against the
+/// honest alternative (`reset` + one batched `prefill` of the whole new prefix)
+/// a rewind is a win only while the CHANGED SUFFIX is under **23.9%** of the
+/// prefix, and a loss above it. That crossover is a property of `extend`, not
+/// of the rewind: batching the delta would move it to 100%.
 fn rewind_gate(session: &mut Session, prompt: &[usize], steps: usize) -> Result<()> {
     anyhow::ensure!(
         prompt.len() >= 6,

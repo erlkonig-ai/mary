@@ -274,6 +274,32 @@ pub struct Session {
 /// window, so a checkpoint at position 500,000 is the same size as one at
 /// position 1,000. The global layers keep nothing at all — a truncation puts
 /// them back exactly.
+///
+/// **Framing rule for the bytes below**: derived from the tensor shapes of the
+/// 42-layer release (hidden 4096, 8 KV heads × 128 head_dim = 1024-wide KV
+/// rows, sliding window 512, `sconv_kernel_size` 4) on the NVFP4 KV lane
+/// ([`super::kvpages::fp4_kv`], 4.5 bits a value), NOT measured, and stated per
+/// CHECKPOINT — against the alternative of keeping a whole session's KV.
+///
+/// At the instant it is taken a checkpoint allocates nothing: every page it
+/// names is one the live cache also holds. What it costs is what it keeps ALIVE
+/// once the live window has slid past — at most `512 + 128` rows a store (the
+/// window plus a page of not-yet-cut dead prefix):
+///
+/// * 35 local layers × 2 stores × 640 × 1024 × 4.5 bits ≈ **25.8 MB**
+/// * 42 layers × (`k_pre`, `v_pre`, and the two convolution histories) ≈ 5.2 MB
+/// * 7 global layers: **nothing**
+///
+/// ≈ **31 MB for the whole stack, at any position** — against a live KV that is
+/// ~424 MB at position 50,000 and grows with it, because the global layers do.
+/// A single-rank session running half the stack keeps about half that (layers
+/// 0..21 hold 18 local and 3 global layers: ≈ 16 MB).
+///
+/// The TIME lives in the gate rather than here, because it is a comparison and
+/// not a constant: `checkpoint` and `rewind` measured 0.1 ms and 0.4 ms at
+/// layers 0..21 on a GB10 — free — and what actually decides whether a rewind
+/// is worth taking is the cost of re-extending afterwards. `inkling_session
+/// --rewind` prints both sides and its doc carries the framing rule.
 pub struct Checkpoint {
     /// The position the session stood at.
     pos: usize,
