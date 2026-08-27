@@ -384,6 +384,16 @@ required-features = ["inkling-cuda"]
 name = "inkling_forward"
 required-features = ["inkling-cuda"]
 
+# Drive a `Session` and print the tokens it produces. The PARITY HARNESS for the
+# seam: `inkling_forward` reaches a token through a loop inside `main`, a
+# `Session` reaches it by holding the model open, and the only claim worth making
+# about the second is that it agrees with the first. Also the demonstration that
+# a session survives turns -- `--turns` feeds each turn's output back as the next
+# turn's delta against a KV cache that is never rebuilt.
+[[bin]]
+name = "inkling_session"
+required-features = ["inkling-cuda"]
+
 # Text on stdin, an ids file out — the missing half of a forward that reads ids
 # and never text. Same `tokenizers` executor as the gate below, which is what
 # makes it one tokenizer rather than a second transcription.

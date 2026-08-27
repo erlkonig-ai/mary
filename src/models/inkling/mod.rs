@@ -113,6 +113,7 @@ pub mod vision;
 // is the handle it makes possible: weights, KV and position as ONE value that
 // survives across calls.
 pub mod assembly;
+pub mod session;
 
 pub use config::InklingConfig;
 // Layer 2's experts are BF16 and have no scales; the same tiling, the same
