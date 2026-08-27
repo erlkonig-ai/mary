@@ -1481,6 +1481,8 @@ fn attention_prefill_lane(
                     &[KeyRun {
                         k: &k_h,
                         v: &v_h,
+                        k_scales: None,
+                        v_scales: None,
                         rows: tokens,
                         base: 0,
                         lo: 0,
@@ -2029,6 +2031,38 @@ pub fn flash_lane() -> bool {
     *ON.get_or_init(|| std::env::var("INK_FLASH").map(|v| v != "0").unwrap_or(true))
 }
 
+/// Whether the fused lane reads the NVFP4 KV cache **packed**, dequantising in
+/// registers instead of consuming pages someone else expanded.
+/// **`INK_FLASH_FP4=1`; default OFF.**
+///
+/// # What it removes
+///
+/// [`flash_cached`] materialises every K and V page before the kernel launches,
+/// so a whole layer's dequantised cache is live at once. Per 42-layer decode
+/// step at ctx 3732, from the config's shapes (NVFP4 stored, BF16 consumed,
+/// 7 global layers reading the whole context and 35 local ones reading a
+/// 512-token window, `kv_heads` 8 x `head_dim` 128 x 2 = 2048 values a token a
+/// layer): 48.4 MiB of packed codes read, ~172 MiB of BF16 written by the
+/// dequant, and ~172 MiB read straight back by flash. This arm reads the 48.4
+/// and moves neither 172.
+///
+/// # Why it is a switch and not a replacement
+///
+/// It is NOT bit-identical and cannot be. Dequantising to BF16 and then
+/// multiplying rounds every value to eight mantissa bits before the product;
+/// reading the codes directly multiplies the exact E2M1 magnitude by the exact
+/// E4M3 scale in f32. Both are honest readings of the same stored bytes and
+/// they differ in the last places, so the two arms are priced against each
+/// other rather than one being asserted to be the other.
+pub fn flash_fp4() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("INK_FLASH_FP4")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
 pub fn act_bf16() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -2144,22 +2178,65 @@ fn flash_cached(
     let (heads, kv_heads, head_dim) = (d.heads, d.kv_heads, d.head_dim);
     let (len, base) = (cache.len(), cache.base);
     let head = cache.k.head();
-    let kparts = cache.k.parts(dev);
-    let vparts = cache.v.parts(dev);
-    debug_assert_eq!(kparts.len(), vparts.len(), "the two stores drifted apart");
     let client = client_of(&q);
     let q_h = handle_of(q);
     let rel_h = handle_of(rel);
-    let mut held: Vec<(cubecl::server::Handle, cubecl::server::Handle, usize)> =
-        Vec::with_capacity(kparts.len());
-    let mut kv_dt = burn::tensor::DType::F32;
-    for (kp, vp) in kparts.into_iter().zip(vparts) {
-        let rows = kp.dims()[0];
-        let (kh, dt) = handle_of_any(kp);
-        let (vh, _) = handle_of_any(vp);
-        kv_dt = dt;
-        held.push((kh, vh, rows));
+
+    /// One run's buffers, whichever reader is in play.
+    struct Held {
+        k: cubecl::server::Handle,
+        v: cubecl::server::Handle,
+        ks: Option<cubecl::server::Handle>,
+        vs: Option<cubecl::server::Handle>,
+        rows: usize,
     }
+
+    // WHICH READER. Packed hands the kernel the stored codes and their block
+    // scales and nothing is expanded at all; dense asks each store for pages,
+    // which on the NVFP4 arm is one page-sized dequant launch each. Both cut
+    // the key axis at the same page boundaries, so everything below is the
+    // same arithmetic on either arm. See [`flash_fp4`].
+    let mut held: Vec<Held>;
+    let kv_elem = if flash_fp4() && cache.k.is_fp4() && cache.v.is_fp4() {
+        let kruns = cache.k.packed_parts().expect("an NVFP4 store packs");
+        let vruns = cache.v.packed_parts().expect("an NVFP4 store packs");
+        debug_assert_eq!(kruns.len(), vruns.len(), "the two stores drifted apart");
+        held = Vec::with_capacity(kruns.len());
+        for (kp, vp) in kruns.into_iter().zip(vruns) {
+            debug_assert_eq!(kp.rows, vp.rows, "a K run and a V run of different lengths");
+            held.push(Held {
+                k: kp.codes,
+                v: vp.codes,
+                ks: Some(kp.scales),
+                vs: Some(vp.scales),
+                rows: kp.rows,
+            });
+        }
+        KvElem::Nvfp4
+    } else {
+        let kparts = cache.k.parts(dev);
+        let vparts = cache.v.parts(dev);
+        debug_assert_eq!(kparts.len(), vparts.len(), "the two stores drifted apart");
+        held = Vec::with_capacity(kparts.len());
+        let mut kv_dt = burn::tensor::DType::F32;
+        for (kp, vp) in kparts.into_iter().zip(vparts) {
+            let rows = kp.dims()[0];
+            let (kh, dt) = handle_of_any(kp);
+            let (vh, _) = handle_of_any(vp);
+            kv_dt = dt;
+            held.push(Held {
+                k: kh,
+                v: vh,
+                ks: None,
+                vs: None,
+                rows,
+            });
+        }
+        match kv_dt {
+            burn::tensor::DType::BF16 => KvElem::Bf16,
+            _ => KvElem::F32,
+        }
+    };
     // Stored row `off + i` of page `p` is logical key `off + i - head`, at
     // absolute position `base + off + i - head`. `head` is the prefix a window
     // has dropped but the page still carries, and it never exceeds `base` —
@@ -2167,26 +2244,25 @@ fn flash_cached(
     // cannot go under.
     let mut off = 0usize;
     let mut runs: Vec<KeyRun<'_>> = Vec::with_capacity(held.len());
-    for (kh, vh, rows) in &held {
+    for h in &held {
         runs.push(KeyRun {
-            k: kh,
-            v: vh,
-            rows: *rows,
+            k: &h.k,
+            v: &h.v,
+            k_scales: h.ks.as_ref(),
+            v_scales: h.vs.as_ref(),
+            rows: h.rows,
             base: base + off - head,
-            lo: head.saturating_sub(off).min(*rows),
-            hi: (head + len).saturating_sub(off).min(*rows),
+            lo: head.saturating_sub(off).min(h.rows),
+            hi: (head + len).saturating_sub(off).min(h.rows),
         });
-        off += rows;
+        off += h.rows;
     }
     let out = flash_attention_launch(
         &client,
         &q_h,
         &runs,
         &rel_h,
-        match kv_dt {
-            burn::tensor::DType::BF16 => KvElem::Bf16,
-            _ => KvElem::F32,
-        },
+        kv_elem,
         nq,
         q0,
         heads,

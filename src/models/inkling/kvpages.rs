@@ -1388,6 +1388,22 @@ impl PageRows for Fp4Rows {
     }
 }
 
+/// One run of NVFP4 rows as the device holds them: code words, block scales,
+/// and how many of the buffer's rows are being read.
+///
+/// The two handles are what [`Fp4Rows`] wears as `Int` tensors, handed over
+/// raw. Nothing here is a Burn tensor because nothing downstream wants one —
+/// the only consumer is a kernel that indexes both buffers itself, and going
+/// through a tensor would only reintroduce the dtype fiction the doc on
+/// [`Fp4Rows`] explains.
+#[derive(Clone, Debug)]
+pub struct PackedRun {
+    pub codes: cubecl::server::Handle,
+    pub scales: cubecl::server::Handle,
+    /// Rows read, which may be fewer than the buffers hold.
+    pub rows: usize,
+}
+
 /// One layer's keys or values, stored as NVFP4 pages.
 ///
 /// The same [`Pages`] core [`PageStore`] uses, over [`Fp4Rows`] instead of over
@@ -1663,6 +1679,50 @@ impl Fp4PageStore {
             .collect()
     }
 
+    /// The same retained context [`Fp4PageStore::parts`] returns, PACKED — the
+    /// stored code words and their E4M3 block scales, with no dequant launch
+    /// and no expanded page.
+    ///
+    /// This is the read for a consumer that dequantises in registers, and it
+    /// is the whole of what such a consumer needs: the runs cover the same
+    /// rows, in the same order, cut at the same page boundaries, so the reader
+    /// swaps and nothing about the geometry moves. What it removes is the
+    /// round trip — the dequant writes a BF16 page and the consumer reads it
+    /// straight back, and at Inkling's 1024-wide row those two halves are
+    /// 2 B a value each against the 0.5625 B a value this hands over instead.
+    ///
+    /// `rows` may be FEWER than the buffers hold, for [`Fp4PageStore::parts`]'s
+    /// reason: a reserved store's read is a prefix of one page, and a prefix is
+    /// a smaller count against the same handle rather than a slice.
+    pub fn packed_parts(&self) -> Vec<PackedRun> {
+        if let Some(rows) = self.pages.read_rows() {
+            let page = self.pages.first().expect("a reserved store has its page");
+            return vec![Self::packed_run(page.clone(), rows)];
+        }
+        self.pages
+            .parts()
+            .into_iter()
+            .map(|p| {
+                let n = p.rows();
+                Self::packed_run(p, n)
+            })
+            .collect()
+    }
+
+    /// One [`Fp4Rows`] as raw handles, over a prefix of `n` rows.
+    fn packed_run(rows: Fp4Rows, n: usize) -> PackedRun {
+        assert!(
+            n <= rows.rows(),
+            "a {n}-row packed read of a {}-row page",
+            rows.rows()
+        );
+        PackedRun {
+            codes: seam::int_handle_of(rows.codes),
+            scales: seam::int_handle_of(rows.scales),
+            rows: n,
+        }
+    }
+
     /// One run of packed rows back to the dtype it was appended in.
     fn dequantize(&self, rows: Fp4Rows, dev: &burn::backend::cuda::CudaDevice) -> Tensor<Bk, 2> {
         let n = rows.rows();
@@ -1921,6 +1981,20 @@ impl KvStore<Bk> {
         match self {
             Self::Wide(s) => s.parts(),
             Self::Fp4(s) => s.parts(dev),
+        }
+    }
+
+    /// The same runs [`KvStore::parts`] covers, PACKED — or `None` on the dense
+    /// arm, which has no packed form to hand over.
+    ///
+    /// `None` is the honest answer rather than a dense fallback: a caller
+    /// asking for this is choosing a reader, and a store that quietly returned
+    /// something the packed reader would misread is the failure this cannot
+    /// have. See [`Fp4PageStore::packed_parts`].
+    pub fn packed_parts(&self) -> Option<Vec<PackedRun>> {
+        match self {
+            Self::Wide(_) => None,
+            Self::Fp4(s) => Some(s.packed_parts()),
         }
     }
 

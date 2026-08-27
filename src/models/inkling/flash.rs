@@ -244,20 +244,153 @@
 //! (`groups` heads by `rows / groups` queries), and it is the tidier
 //! formulation of the two.
 //!
-//! # What this does NOT do
+//! # Reading NVFP4 in registers, and why it is OFF
 //!
-//! It does not dequantise NVFP4 in registers. The paged cache hands back
-//! dequantised pages (`Fp4PageStore::parts`, one page-sized dequant launch
-//! each) and the kernel consumes those. Reading the packed codes directly would
-//! save the page-sized round trip through L2, which is real but is not the
-//! 28 GB; it is a later change and it is a change to the READER, not to this
-//! kernel's shape.
+//! `INK_FLASH_FP4=1` swaps the fetch for the packed one: the kernel reads the
+//! stored E2M1 codes and E4M3 block scales and decodes in registers, and no
+//! dequantised page is built at all. It is one comptime branch at two fetch
+//! sites; everything below them is the same code. The old note here said this
+//! would "save the page-sized round trip through L2" and called it a change to
+//! the READER, not to this kernel's shape. The second half was right. The
+//! first half was wrong about L2, and the difference is the whole result.
+//!
+//! ## The round trip is to DRAM, not through L2
+//!
+//! **Framing rule for this section.** Per DECODE STEP of `INK_LAYERS=0:21` at
+//! ctx 3732, `INK_KV=1`, NVFP4 KV, one GB10, median of six warm steps (spread
+//! under 0.5%). Bytes are `lts__d_sectors_fill_sysmem.sum * 32 B`, which is the
+//! DRAM read on this part: GB10 exposes **no `dram__` metric at all** —
+//! `ncu --query-metrics` lists none — and `lts__d_sectors_fill_device.sum` is
+//! structurally zero because the memory is unified, so there is no separate
+//! device aperture to fill from. Anything asking this part for
+//! `dram__bytes_read.sum` gets an error, not a number.
+//! (`lts__t_sectors_op_read_lookup_miss` is NOT the counter to use either: it
+//! reads 3% miss on the dequant's packed input, which cannot possibly be
+//! resident.)
+//!
+//! | kernel | launches | DRAM read | L2 read | DRAM/L2 |
+//! | --- | ---: | ---: | ---: | ---: |
+//! | `dequantize_nvfp4` | 84 | 26.5 MiB | 25.7 MiB | 1.03 |
+//! | `flash_kernel` (dense) | 42 | 82.9 MiB | 83.8 MiB | **0.99** |
+//! | `flash_kernel` (packed) | 42 | 26.3 MiB | 34.0 MiB | 0.77 |
+//!
+//! **99% of what the dense arm reads back comes from memory.** The pages the
+//! dequant wrote microseconds earlier, into a 24 MiB L2, are not there any
+//! more. That also settles the write half without assuming anything: flash read
+//! those bytes from DRAM, so the lines had been evicted, and evicting a dirty
+//! line IS the write-back. Both directions are real traffic, and the headroom
+//! is therefore BOTH halves rather than only the one L2 residency could reach.
+//!
+//! The whole KV path, per 21-layer step: 26.5 MiB of codes read, 94.2 MiB of
+//! BF16 written (the read times the kernel's exact 3.556x expansion — there is
+//! no DRAM-write counter on this part, and flash's 82.9 MiB read-back is a
+//! floor under it), 82.9 MiB read back. **203.6 MiB, against 26.3 for the
+//! packed arm: 177 MiB a step removed at 21 layers, ~355 at 42.**
+//!
+//! One counter needs its own warning. `lts__t_sectors_op_write.sum` on the
+//! dequant reads 1393 MiB a step, 16.8x its actual output, because it counts
+//! sector REQUESTS and the kernel does sixteen separate 2-byte stores per
+//! thread at a 32-byte stride — every store instruction touches 32 sectors for
+//! two bytes each. It is not bandwidth (`write_lookup_miss` is ~0, so L2's byte
+//! enables absorb it) but it is LSU instructions, and multiplying that counter
+//! by 32 gives a number 16.8x too large.
+//!
+//! ## And at ctx 3732 it is 1.8% SLOWER
+//!
+//! Paired, ABBA-balanced arm order inside one interleaved run, n = 7, same
+//! binary, ctx 3732, `INK_LAYERS=0:21`, `INK_GEN=40`, one GB10: **+1.80% on
+//! step time, 95% CI +1.43..+2.17**, against A/A controls of -0.29% and
+//! +0.06%. 44.9 ms/step against 45.7. An earlier build that decoded through the
+//! `e2m1_value` comparison ladder rather than
+//! [`super::fp4quant::e2m1_bits`] read +1.83% (CI +1.73..+1.93) — the same
+//! number, which is itself the finding below.
+//!
+//! The reason is in this file's own doc, four sections up. Split by grid, the
+//! 42 flash launches of one warm step at ctx 3732 are:
+//!
+//! | layers | grid | cubes | DRAM read |
+//! | --- | --- | ---: | ---: |
+//! | 3 global | `(1, 8, 29)` | 232 | 44.0 MiB |
+//! | 18 local | `(1, 8, 4)` | 32 | 36.1 MiB |
+//! | 21 tail pages | `(1, 8, 1)` | 8 | 2.9 MiB |
+//!
+//! **Nearly half the traffic moves in grids of 32 and 8 cubes on a 48-SM part**,
+//! at `sm__warps_active` 8.3% of peak. "That is not a kernel, it is a queue":
+//! it is LATENCY-bound, not bandwidth-bound, so bytes removed from it are bytes
+//! it was not waiting on, while the per-element decode lands straight on the
+//! critical path.
+//!
+//! **And the cost is not arithmetic**, which is measured rather than argued:
+//! replacing the seven-comparison ladder with the branchless bit construction
+//! roughly halved the decode's operation count and gave back every register it
+//! had cost (47 -> 39, one BELOW the dense arm), and moved the step time by
+//! nothing at all — 1.83% to 1.80%, each well inside the other's interval.
+//!
+//! What that leaves, and this part is inference rather than measurement, is the
+//! LOADS: the packed reader issues two an element (a code word and a scale
+//! byte) where the dense one issues one, in a loop each of the four planes runs
+//! redundantly — `vv` depends only on `(j, di, lane)`, so all four decode the
+//! same element. Anyone testing that should put
+//! `l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum` on both arms; it was not
+//! in the session that produced the numbers above.
+//!
+//! ## The crossover is real, and it is where the argument said it would be
+//!
+//! At ctx 14928 with `INK_LAYERS=0:8` — where the model still fits one box and
+//! one global layer carries 58.2 MiB of the step's 58.6 — the same paired ABBA
+//! design at n = 7 reads **-1.15% on step time, the packed arm FASTER**, 95% CI
+//! -1.65..-0.64, every one of the seven reps negative, against A/A controls of
+//! -0.06% and -0.38%. The grid there is `(1, 8, 116)` — **928 cubes**, a full
+//! device rather than a queue — and the sign flips because the kernel is
+//! finally waiting on the bytes this change removes.
+//!
+//! Read that beside what `bench-decode` prints for the same run, which is
+//! "+0.93% tok/s, SMALLER THAN THE SPREAD. Not a result." Both are correct and
+//! they are not the same statistic: the script compares each arm's median
+//! against the other's, and at long context the per-arm spread is 2-4%. The
+//! PAIRED difference inside each rep is what resolves 1%, which is why the
+//! arms are interleaved in the first place. An unpaired reading of this run
+//! would have concluded nothing.
+//!
+//! So it is a switch that is OFF, and what it is waiting for is named rather
+//! than guessed: a value loop that does not decode V four times and does not
+//! issue a load an element. Giving a lane a CONTIGUOUS run of dimensions would
+//! do both — one 32-bit code word would serve eight elements and one scale byte
+//! sixteen — but that is a change to the lane-to-dimension mapping, i.e. to
+//! this kernel's SHAPE, which is exactly what the old note said the packed read
+//! would not need. The note was right that the reader change is local. It was
+//! wrong that the reader change is sufficient.
+//!
+//! It is DECODE-only in effect: the prefill global arm reads freshly projected
+//! K and V rather than the cache, so it never reaches this flag — which is just
+//! as well, since a packed reader would turn prefill's one dequant an element
+//! into one per query tile.
+//!
+//! ## What it costs in registers, and what it does not spill
+//!
+//! `flash_kernel` at the decode tile is **39 registers a thread against the
+//! dense arm's 40**, and `launch__occupancy_limit_registers` is 12 blocks an SM
+//! on both. Neither binds: `launch__occupancy_limit_shared_mem` is 5 on both.
+//! Local memory is **0 bytes loaded and 0 stored on both arms**, so nothing
+//! spilled — worth having measured rather than inferred, because this is the
+//! kernel where a spill would be silent.
+//!
+//! ## What it removes regardless of the clock
+//!
+//! 84 dequant launches and 84 per-step allocations a step at 21 layers (168 at
+//! 42), sized by [`super::kvpages::Pages::read_rows`] and therefore re-sized
+//! whenever the read window grows. The flash partials `po` and `pml` remain and
+//! are still sized from the span, so this does not by itself make the decode
+//! path allocation-free — but it removes the buffer the KV-preallocation work
+//! named as the remaining per-step epoch.
 //!
 //! It also has no MMA path. At decode `m = 1` and tensor cores buy nothing —
 //! the product is a GEMV and the kernel is bandwidth-bound. At prefill `m` is
 //! large and they would; see the measurements in the commit for where that
 //! leaves the prefill lane against burn's cmma matmul.
 
+use super::fp4quant::e2m1_bits;
+use cubecl::e4m3;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 
@@ -307,6 +440,28 @@ pub fn shared_floats(rows: u32, head_dim: u32) -> usize {
     (rows * head_dim + PLANE * (head_dim + 1) + rows * PLANE) as usize
 }
 
+/// Element `idx` of an NVFP4 buffer, dequantised in registers.
+///
+/// `idx` is the index into the buffer's LOGICAL `[rows, kv_heads * head_dim]`
+/// extent — the same index the dense reader uses — because
+/// [`super::kvpages::Fp4Rows`] quantizes the page row-major with the block
+/// running along the feature axis. So the code lives in word `idx / 8` at
+/// nibble `idx % 8`, and its block scale is E4M3 byte `idx / 16`. Nothing here
+/// is a function of the page's row count, which is what lets the caller hand
+/// over a prefix of a reserved page by shortening a scalar.
+///
+/// This is [`super::fp4quant::dequantize_nvfp4_kernel`]'s arithmetic for ONE
+/// element instead of for a sixteen-element block. It decodes through
+/// [`super::fp4quant::e2m1_bits`] rather than the `e2m1_value` ladder the
+/// dequant kernel uses, because here it is the innermost loop -- see that
+/// function for why there are two, and for what stops them drifting.
+#[cube]
+fn nvfp4_at(codes: &Array<u32>, scales: &Array<e4m3>, idx: u32) -> f32 {
+    let word = codes[(idx / 8) as usize];
+    let code = (word >> ((idx % 8) * 4)) & 15;
+    e2m1_bits(code) * f32::cast_from(scales[(idx / 16) as usize])
+}
+
 /// One `(query tile, KV head, key split)` of global attention, fused.
 ///
 /// Writes an UNNORMALISED partial: `o = sum exp(s - m) v`, beside `m` and
@@ -318,12 +473,32 @@ pub fn shared_floats(rows: u32, head_dim: u32) -> usize {
 /// softmax touches is f32. The cast happens on the way into shared memory and
 /// into a register, which is where the reference implementation puts it as
 /// well: narrow operands, wide accumulation.
+///
+/// # The two readers, and why they are one kernel
+///
+/// `packed` swaps the reader for NVFP4: `kc`/`vc` are the packed E2M1 codes,
+/// eight to a `u32`, and `ks`/`vs` are the E4M3 block scales, one per sixteen
+/// consecutive features — the layout [`super::kvpages::Fp4Rows`] stores and
+/// [`super::fp4quant::dequantize_nvfp4_bf16`] otherwise expands into a BF16
+/// page before this kernel ever runs. The index arithmetic is the SAME
+/// `row * kv_row + kvh * head_dim + d`; only the fetch differs.
+///
+/// It is a comptime branch inside one kernel rather than a second kernel
+/// because everything below the two fetches — the causal and window trimming,
+/// the online softmax's guarded rescale, the split bookkeeping — is subtle,
+/// tested once, and must not be able to fork. The unused pair of arrays costs
+/// nothing at runtime: a bound array a kernel never reads is a constant-bank
+/// pointer, not a register.
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 fn flash_kernel<KV: Numeric>(
     q: &Array<f32>,
     k: &Array<KV>,
     v: &Array<KV>,
+    kc: &Array<u32>,
+    ks: &Array<e4m3>,
+    vc: &Array<u32>,
+    vs: &Array<e4m3>,
     rel: &Array<f32>,
     po: &mut Array<f32>,
     pml: &mut Array<f32>,
@@ -342,6 +517,7 @@ fn flash_kernel<KV: Numeric>(
     #[comptime] kv_heads: u32,
     #[comptime] head_dim: u32,
     #[comptime] rows: u32,
+    #[comptime] packed: bool,
 ) {
     let qt = CUBE_POS_X;
     let kvh = CUBE_POS_Y;
@@ -460,7 +636,12 @@ fn flash_kernel<KV: Numeric>(
             let key = t + j;
             let mut val = f32::new(0.0);
             if key < s_hi {
-                val = f32::cast_from(k[(key * kv_row + kvh * head_dim + d) as usize]);
+                let idx = key * kv_row + kvh * head_dim + d;
+                if comptime![packed] {
+                    val = nvfp4_at(kc, ks, idx);
+                } else {
+                    val = f32::cast_from(k[idx as usize]);
+                }
             }
             sk[(j * skw + d) as usize] = val;
             ki += UNITS;
@@ -546,7 +727,12 @@ fn flash_kernel<KV: Numeric>(
                 for di in 0..dpl {
                     let d = lane + di * PLANE;
                     if d < head_dim {
-                        let vv = f32::cast_from(v[(vbase + d) as usize]);
+                        let mut vv = f32::new(0.0);
+                        if comptime![packed] {
+                            vv = nvfp4_at(vc, vs, vbase + d);
+                        } else {
+                            vv = f32::cast_from(v[(vbase + d) as usize]);
+                        }
                         #[unroll]
                         for ri in 0..rpp {
                             o[(ri * dpl + di) as usize] +=
@@ -646,6 +832,10 @@ fn flash_combine_kernel(
 pub enum KvElem {
     F32,
     Bf16,
+    /// Packed NVFP4: the run's `k`/`v` are the E2M1 code words and its
+    /// `k_scales`/`v_scales` are the E4M3 block scales beside them. Nothing is
+    /// expanded before the kernel runs.
+    Nvfp4,
 }
 
 /// One run of contiguous key/value rows the kernel may read.
@@ -663,6 +853,10 @@ pub enum KvElem {
 pub struct KeyRun<'a> {
     pub k: &'a Handle,
     pub v: &'a Handle,
+    /// The E4M3 block scales, on [`KvElem::Nvfp4`] and only there — where `k`
+    /// and `v` are the packed code words rather than dense values.
+    pub k_scales: Option<&'a Handle>,
+    pub v_scales: Option<&'a Handle>,
     /// Rows in the buffer.
     pub rows: usize,
     /// Absolute sequence position of row 0.
@@ -833,6 +1027,7 @@ pub fn flash_attention_launch<R: Runtime>(
     let po = client.empty(po_elems * core::mem::size_of::<f32>());
     let pml = client.empty(pml_elems * core::mem::size_of::<f32>());
 
+    let packed = kv == KvElem::Nvfp4;
     let mut slot0 = 0usize;
     for (run, splits) in runs.iter().zip(split_of.iter().copied()) {
         let kv_elems = run.rows * kv_heads * head_dim;
@@ -848,6 +1043,29 @@ pub fn flash_attention_launch<R: Runtime>(
             run.hi,
             run.rows
         );
+        assert_eq!(
+            packed,
+            run.k_scales.is_some() && run.v_scales.is_some(),
+            "NVFP4 needs both block-scale handles and no other element type may carry them"
+        );
+        // THE TWO READERS' EXTENTS. Exactly one pair is live, and the other is
+        // bound to a live handle at length ONE. The kernel's comptime branch
+        // never reads the dead pair, and a length-one binding of a buffer that
+        // is certainly at least four bytes long is how you say "absent" to a
+        // launcher that has no absent. Binding it at the LIVE extent instead
+        // would be a length that is not true of those bytes, which is the kind
+        // of lie a later reader believes.
+        let (dense_elems, code_elems, scale_elems) = if packed {
+            (
+                1,
+                kv_elems / super::fp4quant::CODES_PER_WORD,
+                kv_elems / super::fp4quant::GROUP,
+            )
+        } else {
+            (kv_elems, 1, 1)
+        };
+        let ks = run.k_scales.unwrap_or(run.k).clone();
+        let vs = run.v_scales.unwrap_or(run.v).clone();
         let count = CubeCount::Static(q_tiles as u32, kv_heads as u32, splits as u32);
         let dim = CubeDim::new_1d(UNITS);
         macro_rules! go {
@@ -858,8 +1076,12 @@ pub fn flash_attention_launch<R: Runtime>(
                         count.clone(),
                         dim,
                         ArrayArg::from_raw_parts(q.clone(), q_elems),
-                        ArrayArg::from_raw_parts(run.k.clone(), kv_elems),
-                        ArrayArg::from_raw_parts(run.v.clone(), kv_elems),
+                        ArrayArg::from_raw_parts(run.k.clone(), dense_elems),
+                        ArrayArg::from_raw_parts(run.v.clone(), dense_elems),
+                        ArrayArg::from_raw_parts(run.k.clone(), code_elems),
+                        ArrayArg::from_raw_parts(ks.clone(), scale_elems),
+                        ArrayArg::from_raw_parts(run.v.clone(), code_elems),
+                        ArrayArg::from_raw_parts(vs.clone(), scale_elems),
                         ArrayArg::from_raw_parts(rel.clone(), rel_elems),
                         ArrayArg::from_raw_parts(po.clone(), po_elems),
                         ArrayArg::from_raw_parts(pml.clone(), pml_elems),
@@ -878,6 +1100,7 @@ pub fn flash_attention_launch<R: Runtime>(
                         kv_heads as u32,
                         head_dim as u32,
                         rows as u32,
+                        packed,
                     )
                 }
             };
@@ -885,6 +1108,10 @@ pub fn flash_attention_launch<R: Runtime>(
         match kv {
             KvElem::F32 => go!(f32),
             KvElem::Bf16 => go!(half::bf16),
+            // The element type is dead on this arm — the reader is the packed
+            // one — so it names the widest thing the launcher already knows
+            // how to instantiate rather than adding a third instantiation.
+            KvElem::Nvfp4 => go!(f32),
         };
         slot0 += splits;
     }
@@ -1029,6 +1256,8 @@ mod device_tests {
             .map(|(kh, vh, rows, base)| KeyRun {
                 k: kh,
                 v: vh,
+                k_scales: None,
+                v_scales: None,
                 rows: *rows,
                 base: *base,
                 lo: 0,
@@ -1068,6 +1297,181 @@ mod device_tests {
             .zip(b)
             .map(|(x, y)| (x - y).abs())
             .fold(0f32, f32::max)
+    }
+
+    /// NVFP4 code words and E4M3 block-scale bytes for `n` elements, in the
+    /// layout [`super::super::kvpages::Fp4Rows`] stores: code `i` in word
+    /// `i / 8` at nibble `i % 8`, one scale per sixteen consecutive elements.
+    ///
+    /// Built here rather than by running `quantize_nvfp4`, because a round
+    /// trip through the quantizer would agree with the reader about a layout
+    /// they had both got wrong. The scale bytes are deliberately ones with a
+    /// NONZERO mantissa — `2^(e-7) * (1 + m/8)` for `e` in 6..9 — so the test
+    /// below exercises the claim it rests on rather than only powers of two.
+    fn packed_pair(n: usize, seed: usize) -> (Vec<u32>, Vec<u8>) {
+        assert_eq!(n % 16, 0, "{n} elements is not whole NVFP4 blocks");
+        const SCALES: [u8; 6] = [0x31, 0x35, 0x39, 0x3D, 0x41, 0x45];
+        let mut words = vec![0u32; n / 8];
+        for i in 0..n {
+            words[i / 8] |= (((i * 7 + seed * 5) % 16) as u32) << (4 * (i % 8));
+        }
+        let scales = (0..n / 16)
+            .map(|b| SCALES[(b * 3 + seed) % SCALES.len()])
+            .collect();
+        (words, scales)
+    }
+
+    /// The same shape and the same key-axis cuts, read BOTH ways.
+    ///
+    /// The dense arm is production's, exactly: each cut goes through
+    /// [`super::super::fp4quant::dequantize_nvfp4_bf16`] into a BF16 page and
+    /// the kernel consumes that. The packed arm hands the kernel the very same
+    /// codes and scales. Nothing is decoded on the host, so nothing here can
+    /// be wrong about what a byte means without the device being wrong the
+    /// same way.
+    fn run_both_readers(
+        sh: &Shape,
+        q: &[f32],
+        k: &(Vec<u32>, Vec<u8>),
+        v: &(Vec<u32>, Vec<u8>),
+        rel: &[f32],
+        cuts: &[usize],
+    ) -> (Vec<f32>, Vec<f32>) {
+        let kv_row = sh.kv_heads * sh.head_dim;
+        let groups = sh.heads / sh.kv_heads;
+        let rows = if sh.nq == 1 {
+            decode_rows(groups)
+        } else {
+            prefill_rows(groups)
+        };
+        let client = <CudaRuntime as Runtime>::client(&Default::default());
+        let qh = client.create_from_slice(f32::as_bytes(q));
+        let rh = client.create_from_slice(f32::as_bytes(rel));
+        let mut bounds = vec![0usize];
+        bounds.extend_from_slice(cuts);
+        bounds.push(sh.keys);
+        // (k codes, k scales, v codes, v scales, dense k, dense v, rows, base)
+        let held: Vec<(Handle, Handle, Handle, Handle, Handle, Handle, usize, usize)> = bounds
+            .windows(2)
+            .map(|w| {
+                let (lo, hi) = (w[0], w[1]);
+                let (cw, sw) = (kv_row / 8, kv_row / 16);
+                let up = |c: &Vec<u32>, s: &Vec<u8>| {
+                    (
+                        client.create_from_slice(u32::as_bytes(&c[lo * cw..hi * cw])),
+                        client.create_from_slice(&s[lo * sw..hi * sw]),
+                    )
+                };
+                let (kc, ks) = up(&k.0, &k.1);
+                let (vc, vs) = up(&v.0, &v.1);
+                let deq = |c: &Handle, s: &Handle| {
+                    super::super::fp4quant::dequantize_nvfp4_bf16(&client, c, s, hi - lo, kv_row)
+                };
+                let (kd, vd) = (deq(&kc, &ks), deq(&vc, &vs));
+                (kc, ks, vc, vs, kd, vd, hi - lo, lo)
+            })
+            .collect();
+        let launch = |runs: &[KeyRun<'_>], elem: KvElem| {
+            let oh = flash_attention_launch(
+                &client,
+                &qh,
+                runs,
+                &rh,
+                elem,
+                sh.nq,
+                sh.q0,
+                sh.heads,
+                sh.kv_heads,
+                sh.head_dim,
+                sh.eff,
+                sh.window,
+                1.0 / sh.head_dim as f32,
+                rows,
+            );
+            f32::from_bytes(&client.read_one(oh).expect("read the fused output")).to_vec()
+        };
+        let dense: Vec<KeyRun<'_>> = held
+            .iter()
+            .map(|(_, _, _, _, kd, vd, rows, base)| KeyRun {
+                k: kd,
+                v: vd,
+                k_scales: None,
+                v_scales: None,
+                rows: *rows,
+                base: *base,
+                lo: 0,
+                hi: *rows,
+            })
+            .collect();
+        let packed: Vec<KeyRun<'_>> = held
+            .iter()
+            .map(|(kc, ks, vc, vs, _, _, rows, base)| KeyRun {
+                k: kc,
+                v: vc,
+                k_scales: Some(ks),
+                v_scales: Some(vs),
+                rows: *rows,
+                base: *base,
+                lo: 0,
+                hi: *rows,
+            })
+            .collect();
+        (launch(&dense, KvElem::Bf16), launch(&packed, KvElem::Nvfp4))
+    }
+
+    /// The packed reader is the dequantising reader to the BIT, and that is a
+    /// property of NVFP4 rather than luck.
+    ///
+    /// An E2M1 magnitude carries at most two mantissa bits (`1.1b`, i.e. 1.5
+    /// and 3 and 6) and an E4M3 scale at most four significant bits, so their
+    /// product needs at most six — and BF16 has eight. The dequantised page is
+    /// therefore EXACT in BF16, and reading the codes directly reconstructs the
+    /// same f32 the BF16 page widens to. There is no rounding to trade away
+    /// here, which is why this asserts equality and not a tolerance.
+    ///
+    /// A tolerance would also be the wrong instrument for what actually breaks:
+    /// every way of getting NVFP4 indexing wrong — the nibble order inside a
+    /// word, which sixteen features share a scale, scales indexed per row
+    /// instead of per block — is silent. Each produces finite, plausible
+    /// attention over the wrong numbers, and each moves the answer far more
+    /// than any tolerance a numerical argument would justify.
+    #[test]
+    fn the_packed_reader_is_the_dequantising_reader_to_the_bit() {
+        for (nq, keys, window) in [
+            (1usize, 700usize, None),
+            (1, 33, None),
+            (16, 200, Some(64usize)),
+            (37, 91, None),
+        ] {
+            let sh = Shape {
+                nq,
+                q0: keys - nq,
+                keys,
+                heads: 8,
+                kv_heads: 2,
+                head_dim: 32,
+                eff: 5,
+                window,
+            };
+            let n = sh.keys * sh.kv_heads * sh.head_dim;
+            let k = packed_pair(n, 1);
+            let v = packed_pair(n, 2);
+            let q = fill(sh.nq * sh.heads * sh.head_dim, 0.1);
+            let rel = fill(sh.nq * sh.heads * sh.eff, 0.7);
+            for cuts in [vec![], vec![keys / 2], vec![7, keys / 3, keys - 5]] {
+                let (dense, packed) = run_both_readers(&sh, &q, &k, &v, &rel, &cuts);
+                assert!(
+                    dense.iter().any(|x| x.abs() > 1e-6),
+                    "nq {nq}, {keys} keys: the dense arm computed nothing to compare against"
+                );
+                assert_eq!(
+                    dense,
+                    packed,
+                    "nq {nq}, {keys} keys, cuts {cuts:?}: worst |delta| {}",
+                    worst(&dense, &packed)
+                );
+            }
+        }
     }
 
     /// THE defining property of an online softmax, and the one a two-pass

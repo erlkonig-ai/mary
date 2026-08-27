@@ -352,6 +352,47 @@ pub(crate) fn e2m1_value(code: u32) -> f32 {
     m
 }
 
+/// [`e2m1_value`] with the ladder replaced by bit construction.
+///
+/// The seven nonzero E2M1 magnitudes are already IEEE-754 floats, spelled in
+/// the wrong field widths: for `m = code & 7` in `1..8` the value is
+/// `2^((m >> 1) - 1) * (1 + (m & 1) / 2)`, so the f32 exponent field is
+/// `126 + (m >> 1)` and the mantissa is one bit at position 22. `m == 1` is
+/// the single exception — `0.5` is `2^-1 * 1.0`, and its low bit is not a
+/// mantissa — and `m == 0` is a signed zero. Both are selects, not branches.
+///
+/// # Why both exist
+///
+/// They compute the same eight numbers and the difference is entirely where
+/// they are called from. [`dequantize_nvfp4_kernel`] decodes each element ONCE
+/// per launch and is bound by the store, so the ladder's ~18 operations are
+/// free there and its shape is the clearer statement of what a code means.
+/// [`super::flash`]'s packed reader decodes each element once per PLANE per key
+/// tile — 160 decodes a unit a tile at the decode shape — where it is the
+/// innermost loop and ~7 operations against ~18 is the whole difference between
+/// the arms.
+///
+/// The two cannot be allowed to drift, and the thing that stops them is not
+/// this comment: `flash`'s `the_packed_reader_is_the_dequantising_reader_to_the_bit`
+/// runs a page through the ladder and the same page through this, and demands
+/// the attention outputs be equal to the bit.
+#[cube]
+pub(crate) fn e2m1_bits(code: u32) -> f32 {
+    let m = code & 7;
+    // The sign bit lands in bit 31, and on its own it is the signed zero that
+    // `m == 0` decodes to — including the `-0.0` a value that rounded to zero
+    // was stored as.
+    let mut bits = (code & 8) << 28;
+    if m > 0 {
+        let mut frac = m & 1;
+        if m == 1 {
+            frac = 0;
+        }
+        bits |= ((126 + (m >> 1)) << 23) | (frac << 22);
+    }
+    f32::reinterpret(bits)
+}
+
 /// One thread per 16-element block, mirroring [`quantize_nvfp4_kernel`]: read
 /// the block's E4M3 scale and its two packed `u32` code words, write sixteen
 /// dense values.
@@ -451,4 +492,45 @@ fn dequantize_nvfp4_as<O: Scalar + Cast, R: Runtime>(
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    /// [`e2m1_bits`]' arithmetic, on the host, so the algebra can be checked
+    /// without a GPU.
+    ///
+    /// This is not a duplicate of the device test in [`super::super::flash`]:
+    /// that one proves the two decoders agree AS LOWERED, this one proves the
+    /// bit construction is the right formula in the first place. The `m == 1`
+    /// line is the whole reason it exists — `0.5` is the one magnitude whose
+    /// low bit is not its mantissa, and a formula that forgets it returns
+    /// `0.75` and nothing else moves.
+    fn e2m1_bits_host(code: u32) -> f32 {
+        let m = code & 7;
+        let mut bits = (code & 8) << 28;
+        if m > 0 {
+            let frac = if m == 1 { 0 } else { m & 1 };
+            bits |= ((126 + (m >> 1)) << 23) | (frac << 22);
+        }
+        f32::from_bits(bits)
+    }
+
+    #[test]
+    fn the_bit_construction_is_the_e2m1_ladder() {
+        const MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+        for code in 0u32..16 {
+            let want = if code & 8 != 0 {
+                -MAG[(code & 7) as usize]
+            } else {
+                MAG[(code & 7) as usize]
+            };
+            let got = e2m1_bits_host(code);
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "code {code}: {got} is not {want} (signed zero included: \
+                 a code that rounded to zero was stored as -0.0)"
+            );
+        }
+    }
 }
