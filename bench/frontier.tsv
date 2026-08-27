@@ -1,0 +1,2 @@
+utc	kind	arm	main_sha	triblespace_sha	cubecl_graph_sha	bin_sha256	n	reps_req	tok_s_med	ms_step_med	spread_pct	delta_pct	res_pct	verdict	env	config	notes
+2026-08-27T02:54:06Z	advance	frontier	79d3c24285ac	907d44dce6b2	1dd9dfec28dc	55d55aea65fd68c243347bcdf977ba71200bc5aaef52a5a65c033915b9f622e7	7	7	11.2850	88.6000	1.60	-	-	first	-	per-decode-step/2node/split21/ctx3732/GEN64/INK_KV=1/overlap/order-fixed/median-of-n-process-reps/features=inkling-cuda,cuda-backend,import	ungated-after
