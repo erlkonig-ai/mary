@@ -493,6 +493,30 @@ pub fn w4a16_linear_launch<R: Runtime>(
 // that"; at the ROUTED-EXPERT shape it measures right (`fp4_linear_grouped`
 // reaches 171 GB/s, at the ceiling), and at THIS shape it does not.
 //
+// DISPUTED, 2026-08-27, and it is a 25% dispute — DO NOT QUOTE 158-172 AS THE
+// CEILING until it is reconciled. Three controls in this tree measure the
+// coalesced read of the same 0.431 GiB of head codes and scales:
+//
+// ```text
+//   control                          GB/s     framed by
+//   w4a16_swz_probe `stream ceiling` 213.2    its own arm, interleaved, head shape
+//   annhead `stream_packed`          218.4    its own harness, same plane set
+//   THIS COMMENT                     158-172  not recoverable from what is written
+// ```
+//
+// Two independently-framed controls agree within 2.4%; this one is the outlier
+// by about 25%, and what it was per — which arm, which plane set, warm or cold —
+// is exactly the framing this file's own rule says must travel WITH the number
+// and did not. That is the whole hazard: an unframed figure still looks
+// defensible.
+//
+// It matters beyond bookkeeping, because the sentence above draws a CONCLUSION
+// from it. `fp4_linear_grouped`'s 171 GB/s is "at the ceiling" against 158-172
+// and is 80.2% of it against 213.2 — so "at the ROUTED-EXPERT shape it measures
+// right" is a claim that survives only under the outlier. Re-measure before
+// repeating either. Nothing in the live-row mask depends on this: the mask
+// recovers no DRAM bytes by construction and is not a GB/s claim at all.
+//
 // A is left alone throughout: at `m_pad = 16` it is 128 KiB, L2-resident, and
 // re-read by every cube.
 //
