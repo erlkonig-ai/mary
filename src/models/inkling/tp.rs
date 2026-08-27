@@ -308,6 +308,35 @@
 //!   that put `MemAvailable` at 1.38 GiB and swapped 5.50 GiB of the head at 96
 //!   slots.
 //!
+//! # What is left REPLICATED in the arena, which is the binding residency term
+//!
+//! Measured 2026-08-27 at `INK_LAYERS=0:42 INK_TP=r:2`, from the run's own
+//! admission line: **87.07 GiB of weights** a node, against 84-85 GiB for a
+//! pipeline half-stack. The routed experts are cut in the startup copy, so
+//! they are ~74 GiB of that instead of ~147; what keeps the total from
+//! falling further is the set of tensors cut at BIND time rather than at COPY
+//! time, which the arena therefore still holds whole:
+//!
+//! ```text
+//!   shared experts, 40 layers          7.85 GiB whole   3.93 if cut in the copy
+//!   attention projections, 42 layers   1.85            0.93
+//!   dense MLP, 2 layers                0.79            0.40
+//!   embedding table (replicated)       1.53            --   (one row a token)
+//!   unembedding (replicated)           1.53            0.77 if cut by vocab
+//!                                      ----            ----
+//!                                     13.55            6.03      about 5.2 GiB
+//! ```
+//!
+//! None of it is a BANDWIDTH term -- every one of those is already cut before
+//! it is bound, so the device reads half either way. It is residency only, and
+//! residency is what decides whether a step is 57 ms or 600. Measured on the
+//! 119.63 GiB box: with 87.07 GiB of arena plus 5.21 GiB of device pool the
+//! admission gate passes with 1.95 GiB of headroom, and a decode step then
+//! costs 56.5 ms when the allocator is not fighting for pages and 200-670 ms
+//! when it is -- the SAME binary, the same tokens, twice in one hour. Moving
+//! those cuts from bind time into `copy_share` is the next lever, and it is
+//! worth ~5.2 GiB.
+//!
 //! # Residency, which this does NOT improve over the pipeline split
 //!
 //! Worth stating because the module doc of `inkling_forward` has claimed
