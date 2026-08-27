@@ -45,6 +45,25 @@
 #   gb10-lock.sh release <host> <tag>  -> releases only if <tag> holds it
 #   gb10-lock.sh check <host>          -> prints the holder, rc 0 free, rc 3 held
 #
+# BUILDS TAKE THE LOCK TOO. A cargo build is not a measurement, but it is 20
+# cores of CPU contention on a unified-memory part, so it perturbs a neighbour's
+# decode measurement just as surely as a second decode process would. The busy
+# gates already refuse while one is running -- `BOX_BUSY_PATTERN` matches on
+# `pgrep -f`, and `--bin inkling_forward` sits in a cargo command line, so a
+# build is caught by a pattern written for measurements. THAT IS THE RIGHT
+# ANSWER ARRIVED AT BY ACCIDENT, and it must not be "fixed" by narrowing the
+# pattern to `pgrep -x`: that would make the gate precise and wrong.
+#
+# The consequence is that the boxes are unavailable during other agents' builds
+# whether or not anyone reserved them, which makes the queue dishonest -- a
+# waiter cannot see why it is waiting. So: reserve for the BUILD as well as the
+# reps, exactly as scripts/frontier-bench.sh does, and the queue then reflects
+# what the boxes are actually spending their time on.
+#
+# The binary cannot be built off-box: it targets aarch64 Linux with CUDA and the
+# only machines that are, are the measurement machines. Building elsewhere is not
+# an available answer, which is why reserving is.
+#
 # IF YOU CAN SEE THE BOX, LOOK BEFORE YOU BREAK A STALE LOCK. This script reads
 # silence as death because it cannot see the holder -- that is the right rule for
 # the mechanism, and the wrong rule for a caller with ssh. A holder doing one long
