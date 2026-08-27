@@ -40,9 +40,14 @@
 # reason, and folding one in would make the series measure a cherry-pick that
 # nobody gets by checking out main.
 #
-# An experimental arm CAN be recorded: `FRONTIER_EXTRA_ARM='name:HEADENV|TAILENV'`
-# adds it to the same interleaved run and writes it as its OWN row with
-# kind=experimental. It is never folded into the frontier row.
+# Experimental arms CAN be recorded: `FRONTIER_EXTRA_ARM='name:HEADENV|TAILENV'`
+# adds one to the same interleaved run and writes it as its OWN row with
+# kind=experimental. It is never folded into the frontier row. SEVERAL arms are
+# separated by ';', and side by side in ONE run is the point: arms within a run
+# are interleaved and so compare PAIRED, at about this lane's 1.1%, where two
+# rows from two sessions do not and resolve far worse. E.g.
+#
+#   FRONTIER_EXTRA_ARM='graph:INK_GRAPH_LANE=1 INK_GRAPH_CARRY=1|INK_GRAPH_LANE=1 INK_GRAPH_CARRY=1;shuffle:INK_W4A16_SWZ_SHUFFLE=1|INK_W4A16_SWZ_SHUFFLE=1'
 #
 # WHAT main's SHA DOES NOT PIN, and is therefore recorded per row: mary's
 # `[patch]` section points `cubecl-runtime`/`cubecl-cuda`/`cubecl-wgpu` at
@@ -549,7 +554,29 @@ if [ "${1:-}" = "--run" ]; then
   gate_both || { say "REFUSING: a box went busy during the build. Nothing recorded."; exit 3; }
 
   ARMS=("frontier:|")
-  [ -n "$FRONTIER_EXTRA_ARM" ] && ARMS+=("$FRONTIER_EXTRA_ARM")
+  # SEVERAL experimental arms, split on ';'. This is about RESOLUTION, not
+  # convenience. Arms inside one invocation are interleaved by `pipe-bench.sh`,
+  # so comparing them is PAIRED and resolves to about the 1.1% this lane
+  # reaches; comparing two rows from two SESSIONS is not paired and resolves far
+  # worse. Measuring `graph` on Monday and `all-on` on Tuesday therefore answers
+  # a strictly weaker question than measuring them side by side, and costs two
+  # box sessions to do it. `pipe-bench.sh` already took the arms variadically --
+  # only this wrapper was narrowing them to one.
+  #
+  # ';' because ':' and '|' both already mean something INSIDE an arm
+  # ('name:HEADENV|TAILENV'). An env value containing a literal ';' cannot be
+  # expressed; nothing in this lane needs one.
+  EXTRA_ARMS=()
+  if [ -n "$FRONTIER_EXTRA_ARM" ]; then
+    OIFS=$IFS; IFS=';'
+    for _a in $FRONTIER_EXTRA_ARM; do
+      [ -n "$_a" ] && EXTRA_ARMS+=("$_a")
+    done
+    IFS=$OIFS
+    # Guarded: `set -u` is on and an empty-array expansion is an error on the
+    # bash the boxes ship.
+    [ ${#EXTRA_ARMS[@]} -gt 0 ] && ARMS+=("${EXTRA_ARMS[@]}")
+  fi
   say "  arms: ${ARMS[*]}"
   say "  scoreboard lane: reps $FRONTIER_REPS, GEN $FRONTIER_GEN, split $FRONTIER_SPLIT, ctx 3732, INK_KV=1, --overlap, --order fixed"
   HBIN="$BIN" TBIN="$BIN" HPILE="$HOME/$FRONTIER_HPILE" TPILE="$HOME/$FRONTIER_TPILE" \
@@ -656,8 +683,14 @@ if [ "${1:-}" = "--run" ]; then
   emit_row frontier "$KIND" "-" || die "the frontier arm recorded nothing"
   F_TOK=$ROW_TOK; F_MS=$ROW_MS; F_N=$ROW_N; F_SP=$ROW_SP
   F_DELTA=$ROW_DELTA; F_RES=$ROW_RES; F_VERDICT=$ROW_VERDICT
-  if [ -n "$FRONTIER_EXTRA_ARM" ]; then
-    emit_row "${FRONTIER_EXTRA_ARM%%:*}" experimental "${FRONTIER_EXTRA_ARM#*:}" || true
+  if [ ${#EXTRA_ARMS[@]} -gt 0 ]; then
+    for _a in "${EXTRA_ARMS[@]}"; do
+      # `|| true` per arm, deliberately: one experimental arm failing to record
+      # must not cost us the frontier row or the other arms. A lane that has
+      # never run on this config (INK_GRAPH_LANE on two nodes, as of this
+      # commit) is exactly the kind that may not record.
+      emit_row "${_a%%:*}" experimental "${_a#*:}" || true
+    done
   fi
 
   # ---- 9. commit and push ----------------------------------------------
