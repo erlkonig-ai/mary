@@ -1210,6 +1210,36 @@ pub fn grouped_kc(k: usize) -> usize {
 /// unstaged one's, and picking that per regime is a scheduling decision this
 /// flag deliberately does not make on anybody's behalf.
 ///
+/// # DO NOT quote the 1.4x. It is against a baseline that no longer ships
+///
+/// This is written out because the mistake has already been made once, by a
+/// review recommending the flag be turned on: it read the module header's
+/// plane table, took the `planes = 4` row — 107.0 -> 151.2 GB/s, i.e. 1.4x at
+/// the shipped [`RowPlan::planes`] — and concluded there was 1.4x sitting
+/// behind a default. There is not, and the reason is that the row's LEFT
+/// column is `baseline`, meaning row-major, and row-major stopped being what
+/// ships on 2026-08-25 when `e3c8985` wired the load-time permutation.
+/// [`swizzle_weights`] has defaulted on ever since.
+///
+/// So the comparison that decides this flag is staged against PRE-PERMUTED at
+/// one plane count, not staged against row-major, and at `planes = 4` the
+/// probe's own three-arm table reads 106.9 baseline / **208.6 pre-permuted** /
+/// 153.5 staged at decode. Turning `INK_MOE_SMEM` on at the shipped plane
+/// count therefore exchanges 208.6 for 153.5 — a **0.74x REGRESSION**, not a
+/// 1.4x win.
+///
+/// It cannot be had both ways either, and that is not a policy choice: the
+/// staged kernel reads the ROW-MAJOR layout the permutation destroys, so
+/// [`swizzle_weights`] asks this function first and yields to it. Setting the
+/// flag does not add staging to what ships; it REPLACES the permutation with
+/// staging.
+///
+/// The general lesson is this module's own, one level further on: a ratio
+/// carries the arm it was measured against, and dropping that is the same
+/// error as dropping the shape — see `super::w4a16gemm::swizzle_pays`, whose
+/// retraction is about a bandwidth figure carried across a 25x change in cube
+/// count.
+///
 /// # Does it survive [`swizzle_weights`]? Yes, for exactly one reason
 ///
 /// Both fix the same defect and the pre-permuted arm wins on the merits: it is
@@ -1218,12 +1248,34 @@ pub fn grouped_kc(k: usize) -> usize {
 /// and no `pad`, and it keeps the unstaged kernel's own plane preference
 /// instead of inverting it. End to end at `INK_LAYERS=0:16` the three arms tie
 /// inside the spread on a ONE-ROW step — 48.2 / 47.8 / 47.4 ms, row-major /
-/// pre-permuted / staged-at-one-plane — because that pass is host-enqueue-
-/// bound. On the WIDE pass, where there is exposed device work, they separate
-/// and staging is the arm that LOSES: 281.9 / 273.0 / 291.4 ms a slot-prefill
-/// pass at `INK_SLOTS=32`, i.e. pre-permuting -3.2% and staging +3.4% against
-/// row-major — which is this module's own prefill column showing up end to end.
-/// See [`super::fp4gemm::fp4_linear_swz`] for both runs and their framing.
+/// pre-permuted / staged-at-one-plane. On the WIDE pass, where the arms have
+/// more device work to separate on, they do, and staging is the arm that
+/// LOSES: 281.9 / 273.0 / 291.4 ms a slot-prefill pass at `INK_SLOTS=32`, i.e.
+/// pre-permuting -3.2% and staging +3.4% against row-major — which is this
+/// module's own prefill column showing up end to end. See
+/// [`super::fp4gemm::fp4_linear_swz`] for both runs and their framing.
+///
+/// **The REASON given for that one-row tie is retracted, 2026-08-27, and the
+/// tie itself is not.** It said "because that pass is host-enqueue-bound", and
+/// [`super::fp4gemm::fp4_linear_swz`] states the same thing as a bound —
+/// "exposed device time is 3.9 ms, so the headroom for ANY device-side change
+/// at this configuration is at most 8% of the step". Both rest on the
+/// `inkling_forward` column then labelled "HOST, enqueue only (nothing in the
+/// loop synchronises)", and an anchored nsys measurement (median over the last
+/// 12 warm intervals, cut at `ann_scan_kernel`, head-only 0:21, per decode
+/// step, one node) has since put ~22.7 ms of the ~37 ms layer-loop bracket in
+/// `cuEventSynchronize` ON THE LAUNCHING THREAD — so the bracket is ~61%
+/// blocked device wait, and device busy is 38.4 ms of a 47.3 ms step, 81%
+/// rather than the 25% the label implied. A device-side change at a one-row
+/// decode is therefore NOT capped at 8% of the step, and any argument of the
+/// form "nothing device-side can matter here" needs remaking from the
+/// corrected column.
+///
+/// None of that moves this function's verdict, and it is worth saying why:
+/// the verdict does not rest on the tie. It rests on the KERNEL ordering,
+/// where the pre-permuted arm is ahead of staging at every fixed plane count
+/// in both regimes, and on the WIDE pass, where staging is measurably worse.
+/// A larger device share makes those two facts matter MORE, not less.
 ///
 /// What keeps this flag alive is **`INK_STARTUP_COPY=0`**. There the experts
 /// alias the pile's own file-backed mapping and are never copied, so there is
