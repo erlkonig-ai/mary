@@ -1562,6 +1562,43 @@ mod tests {
     }
 
     #[test]
+    fn a_bundle_only_pile_is_readable_through_the_model_loader() {
+        let file = TempPilePath::new("bundle-only-loader");
+        let signer = SigningKey::from_bytes(&[0x71; 32]);
+        let (model, _text, _payload) = fragment_fixture("bundle-only");
+        let model_root = model.root().expect("fixture model root");
+        let model_facts = model.facts().len();
+
+        let mut pile = open_test_pile(file.as_path());
+        publish_model_bundle_fragment(&mut pile, test_team(), &signer, model_root, model)
+            .expect("publish the sole bundle");
+        pile.close().expect("close after publishing the bundle");
+
+        // No `mary-model-graph` is ever published here, which is exactly the
+        // shape the 2026-08-21 bundle migration leaves a pile in. Reading only
+        // that one name reported "no collection named `mary-model-graph` in
+        // this pile" about a pile whose complete model archive is right there,
+        // and cost two lanes a night before the loader was taught the second
+        // shape.
+        let source = crate::persist::read_model_pile(file.as_path())
+            .expect("a bundle-only pile is a readable model pile");
+        assert!(
+            source.facts.iter().any(|row| row.e() == &model_root),
+            "the bundle's model root is missing from the facts the loader returned"
+        );
+        assert!(
+            source.facts.len() >= model_facts,
+            "loader returned {} facts, fewer than the {model_facts} the bundle archive states",
+            source.facts.len()
+        );
+        assert_eq!(
+            source.collection.0,
+            test_team(),
+            "a bundle-only pile must report the bundle's own team as its authority"
+        );
+    }
+
+    #[test]
     fn model_bundle_is_one_signed_row_and_recursively_holds_the_model() {
         let file = TempPilePath::new("model-bundle-token");
         let signer = SigningKey::from_bytes(&[0x52; 32]);

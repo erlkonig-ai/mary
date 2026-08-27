@@ -1569,34 +1569,139 @@ pub struct ModelPileSource {
     ),
 }
 
-/// Read a model pile's complete facts from its signed collection.
+/// Read a model pile's complete facts from its signed collections.
+///
+/// A pile states its model in one or both of two native shapes, and which one
+/// is a fact about when the pile was written rather than about what the caller
+/// wants: `mary-model-graph` holds the facts directly, while
+/// `mary-model-bundles` holds one signed token per model whose `metadata::archive`
+/// names the complete fact archive. Reading only the first made every
+/// bundle-migrated pile unreadable here — `personaplex.pile` carries its 10195
+/// model facts under a bundle and nothing else, so a loader that asks for the
+/// graph by name reports "no collection named `mary-model-graph`" about a pile
+/// whose model is right there. Both shapes are read and unioned, which is also
+/// the only correct answer for a pile carrying both: a bundle for its weights
+/// and a graph for a tokenizer published separately is exactly the shape
+/// `personaplex.pile` has after its tokenizer was restored.
 ///
 /// There is deliberately no branch fallback. Pre-collection piles are inputs
 /// to the standalone model migration tool, not an alternate runtime truth.
 pub fn read_model_pile(path: &Path) -> anyhow::Result<ModelPileSource> {
     let mut pile = Pile::open(path).map_err(|e| anyhow::anyhow!("open {path:?}: {e:?}"))?;
-    let team = match crate::model_collection::sole_model_graph_team(&mut pile) {
-        Ok(team) => team,
-        Err(error) => {
-            let _ = pile.close();
-            anyhow::bail!("{path:?}: no unambiguous native model collection: {error}");
-        }
-    };
-
-    let snapshot = crate::model_collection::snapshot_model_collection_local_latest(&mut pile, team)
-        .map_err(|e| anyhow::anyhow!("{path:?}: snapshot model collection: {e}"))?;
-    let facts = pre_epoch_aliased(snapshot.facts());
-    let (_, commits, reader) = snapshot.into_parts();
-    let handle = commits
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("{path:?}: a model collection with no commits"))?
-        .collection();
+    let read = read_model_collections(&mut pile, path);
     let _ = pile.close();
-    Ok(ModelPileSource {
-        facts,
-        reader,
-        collection: (team, handle),
-    })
+    read
+}
+
+fn read_model_collections(pile: &mut Pile, path: &Path) -> anyhow::Result<ModelPileSource> {
+    let mut facts = TribleSet::new();
+    let mut authority = None;
+    let mut reader = None;
+    let mut graph_error = None;
+    let mut bundle_error = None;
+
+    match crate::model_collection::sole_model_graph_team(pile) {
+        Ok(team) => {
+            let snapshot =
+                crate::model_collection::snapshot_model_collection_local_latest(pile, team)
+                    .map_err(|e| anyhow::anyhow!("{path:?}: snapshot model collection: {e}"))?;
+            facts += pre_epoch_aliased(snapshot.facts());
+            let (_, commits, graph_reader) = snapshot.into_parts();
+            let handle = commits
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("{path:?}: a model collection with no commits"))?
+                .collection();
+            authority = Some((team, handle));
+            reader = Some(graph_reader);
+        }
+        Err(error) => graph_error = Some(error.to_string()),
+    }
+
+    match crate::model_collection::snapshot_sole_model_bundle_collection_local_latest(pile) {
+        Ok((team, snapshot)) => {
+            let (_, ticket, bundle_reader) = snapshot.into_parts();
+            facts += model_bundle_archive_facts(&ticket, &bundle_reader)
+                .map_err(|e| anyhow::anyhow!("{path:?}: read model bundle archives: {e}"))?;
+            if authority.is_none() {
+                let handle = ticket
+                    .first()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("{path:?}: a model bundle collection with no commits")
+                    })?
+                    .collection();
+                authority = Some((team, handle));
+            }
+            if reader.is_none() {
+                reader = Some(bundle_reader);
+            }
+        }
+        Err(error) => bundle_error = Some(error.to_string()),
+    }
+
+    match (authority, reader) {
+        (Some(collection), Some(reader)) => Ok(ModelPileSource {
+            facts,
+            reader,
+            collection,
+        }),
+        // Neither shape is present. Name BOTH, because "no collection named
+        // `mary-model-graph`" sent two lanes hunting for a graph in a pile that
+        // was never going to have one.
+        _ => anyhow::bail!(
+            "{path:?}: no unambiguous native model collection: \
+             `mary-model-graph`: {}; `mary-model-bundles`: {}",
+            graph_error.as_deref().unwrap_or("read failed"),
+            bundle_error.as_deref().unwrap_or("read failed"),
+        ),
+    }
+}
+
+/// The complete model facts every signed bundle token in a ticket points at.
+///
+/// A bundle COMMIT carries exactly one `(root, metadata::archive, H)` row; `H`
+/// is the canonical archive of the model's whole fact set. Resolving it is what
+/// turns the tiny signed union into the facts a loader can query.
+fn model_bundle_archive_facts(
+    ticket: &[triblespace::core::collection::CollectionCommit],
+    reader: &triblespace::core::repo::pile::PileReader,
+) -> anyhow::Result<TribleSet> {
+    use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+    use triblespace::core::blob::{Blob, TryFromBlob};
+    use triblespace::core::metadata;
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut facts = TribleSet::new();
+    for commit in ticket {
+        if !seen.insert(commit.data()) {
+            continue;
+        }
+        let token_blob: Blob<SimpleArchive> = reader
+            .get(inlineencodings::Handle::<SimpleArchive>::from_hash(
+                commit.data(),
+            ))
+            .map_err(|error| anyhow::anyhow!("read bundle token {}: {error}", commit.id()))?;
+        let token = TribleSet::try_from_blob(token_blob)
+            .map_err(|e| anyhow::anyhow!("decode bundle token {}: {e:?}", commit.id()))?;
+        for row in token.iter() {
+            if row.a() != &metadata::archive.id() {
+                continue;
+            }
+            let archive_blob: Blob<SimpleArchive> = reader
+                .get(inlineencodings::Handle::<SimpleArchive>::from_hash(
+                    inlineencodings::Handle::<SimpleArchive>::to_hash(
+                        *row.v::<inlineencodings::Handle<SimpleArchive>>(),
+                    ),
+                ))
+                .map_err(|error| {
+                    anyhow::anyhow!("read model archive for bundle {}: {error}", commit.id())
+                })?;
+            let archive = TribleSet::try_from_blob(archive_blob).map_err(|e| {
+                anyhow::anyhow!("decode model archive for bundle {}: {e:?}", commit.id())
+            })?;
+            facts += pre_epoch_aliased(&archive);
+        }
+    }
+    Ok(facts)
 }
 
 /// Index a pile's TYPED tensor leaves by name, without materializing any of
