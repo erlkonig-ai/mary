@@ -146,7 +146,7 @@ fn main() -> Result<()> {
 /// a last-place logit bit can flip. So a disagreement here is read as: WHERE
 /// does it start? A stream that agrees for many tokens and then parts company
 /// is that; a stream that parts at the first token is a wrong cache.
-fn rewind_gate(session: &mut Session, prompt: &[usize], gen: usize) -> Result<()> {
+fn rewind_gate(session: &mut Session, prompt: &[usize], steps: usize) -> Result<()> {
     anyhow::ensure!(
         prompt.len() >= 6,
         "the rewind gate splits the prompt in three; {} tokens is not enough",
@@ -168,7 +168,7 @@ fn rewind_gate(session: &mut Session, prompt: &[usize], gen: usize) -> Result<()
         let extended = t0.elapsed().as_secs_f64();
         let mut out = vec![tok];
         let t1 = std::time::Instant::now();
-        for _ in 1..gen {
+        for _ in 1..steps {
             tok = s.step()?;
             out.push(tok);
         }
@@ -178,8 +178,8 @@ fn rewind_gate(session: &mut Session, prompt: &[usize], gen: usize) -> Result<()
              steps in {decoded:.3}s ({:.1} ms/step)",
             tail.len(),
             extended * 1e3 / tail.len().max(1) as f64,
-            gen - 1,
-            decoded * 1e3 / (gen - 1).max(1) as f64,
+            steps - 1,
+            decoded * 1e3 / (steps - 1).max(1) as f64,
         );
         Ok(out)
     };
