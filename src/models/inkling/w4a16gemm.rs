@@ -129,21 +129,28 @@ pub const LIVE_ROW_MASK_DEFAULT: bool = false;
 ///
 /// ## Why there is anything to remove
 ///
-/// `m16n8k16` gives register `i` of lane `l` the A element at
-/// `row = l/4 + 8*(i & 1)`, `col = 2*(l%4) + 8*((i>>1) & 1)`. So of the four
-/// loads a lane issues per k-tile, the two with `i` ODD address rows 8..15 and
-/// the two with `i` even address rows 0..7. At decode `m` is 1 and `m_pad` is
-/// [`MTILE`] = 16: rows 8..15 are entirely padding, and so are rows 1..7.
-/// Fifteen of the sixteen rows the tile reads exist only because the
+/// `m16n8k16` gives LOAD `i` of lane `l` — the loop index in the A-load body,
+/// which is `position_of_nth`'s element index divided by `vs_a = 2` — the A
+/// element at `row = l/4 + 8*(i & 1)`, `col = 2*(l%4) + 8*((i>>1) & 1)`.
+/// (Derived in cubecl-cpp 0.10.0 `cuda/processors.rs`, `row_index`/`col_index`,
+/// and dumped off the device by `mma16_lane_dump`, so it is not assumed.) So of
+/// the four loads a lane issues per k-tile, the two with `i` ODD address rows
+/// 8..15 and the two with `i` even address rows 0..7. At decode `m` is 1 and
+/// `m_pad` is [`MTILE`] = 16: rows 8..15 are entirely padding, and so are rows
+/// 1..7. Fifteen of the sixteen rows the tile reads exist only because the
 /// instruction is sixteen rows tall. [`super::bf16gemm::pad_bf16`] and
 /// `to_bf16` write them as zero and `super::burn::linear_w4a16` slices them off
 /// the output again — the kernel is the only place they are ever touched.
 ///
-/// Counted per warp per k-tile at `k = 4096`, `m_pad = 16`: each of the four
-/// loads touches eight distinct 32-byte sectors — one per fragment row, 16
-/// useful bytes in each, and a row stride of `2k` bytes keeps them apart — so A
-/// costs **32** sector requests. Under the mask at `m = 1` only the `i`-even
-/// loads survive, and only for the four lanes holding row 0: **2**.
+/// Counted per warp per k-tile at `m_pad = 16`, and keeping REQUESTS and
+/// SECTORS apart because that distinction is the whole point: A is four warp
+/// load requests, and each one touches eight distinct 32-byte sectors — one per
+/// fragment row, 16 useful bytes in each, the row stride `2k` being a multiple
+/// of 32 keeping them apart. So A is **4 requests / 32 sectors**. Under the mask
+/// at `m = 1` the two `i`-odd loads are predicated off in EVERY lane and issue
+/// no request at all, and the two `i`-even ones survive with only the four lanes
+/// that hold row 0 active, landing in one sector each: **2 requests / 2
+/// sectors**.
 ///
 /// ## Why it is bit-identical
 ///
@@ -159,13 +166,14 @@ pub const LIVE_ROW_MASK_DEFAULT: bool = false;
 ///
 /// ## Why it is not the A-side fragment reorder
 ///
-/// Permuting A into fragment order would take those 32 sector requests to 16,
-/// and would cost a permuted copy of the activation on every step plus the
-/// registers to address it. This takes them to 2, and it FREES the address
-/// arithmetic of the suppressed loads rather than spending registers — which
-/// matters on a kernel that sits at 78 registers against an
-/// `launch__occupancy_limit_blocks` of 24 and measures WORSE at 86 (see
-/// [`swz_unroll`]).
+/// Permuting A into fragment order would make each of the four loads 32 lanes x
+/// 4 contiguous bytes — 128 B, 4 sectors — so 32 sectors would become 16, at the
+/// cost of a permuted copy of the activation on every step plus the registers to
+/// address it. This takes them to 2, and it FREES the address arithmetic of the
+/// suppressed loads rather than spending registers — which matters on a kernel
+/// that sits at 78 registers against a `launch__occupancy_limit_blocks` of 24
+/// and measures WORSE at 86 (see [`swz_unroll`]). The two are not exclusive, but
+/// at `m = 1` the mask strictly dominates: it removes more and costs less.
 ///
 /// ## Where it does and does not apply
 ///
@@ -178,6 +186,20 @@ pub const LIVE_ROW_MASK_DEFAULT: bool = false;
 /// the same reason — a real run reports `hand BF16 lane: 0 launches`, because
 /// every plain-BF16 GEMM reaches a `cubek` tuned lane, and those bounds-check
 /// their own tiles and take the true `m` unpadded already.
+///
+/// ## Which decode work this actually reaches
+///
+/// Not the unembedding, at the shipped default. `inkling_forward`'s
+/// `ANN_BUDGET_DEFAULT` is 8192, so a one-row decode step takes `burn::linear_ann`
+/// — a shortlist over the sketch, its own kernel — and the exact `[201024, 4096]`
+/// W4A16 head GEMM only runs at `INK_ANN_HEAD=0`, under `INK_ANN_VERIFY`, or at
+/// `m > 1`. What the mask reaches at `m = 1` is the per-layer W4A16 SINK
+/// weights, which every layer launches on both pipe halves; the binary names
+/// them at startup ("W4A16 sink weights [n, k] ... written in ... order"). At
+/// prefill `m` is 3732 against `m_pad` 3744, so 233 of 234 m-tiles are entirely
+/// live and only the last tile has anything to skip — the mask is close to a
+/// no-op there by construction, which is the point of it being a predicate and
+/// not a second kernel.
 ///
 /// `INK_W4A16_ROWMASK=1` turns it on, so one binary can run both arms.
 /// Turn a launch's `m_live` into the kernel's `(mask_rows, m_live)` pair.
