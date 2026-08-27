@@ -187,6 +187,32 @@ pub const LIVE_ROW_MASK_DEFAULT: bool = false;
 /// every plain-BF16 GEMM reaches a `cubek` tuned lane, and those bounds-check
 /// their own tiles and take the true `m` unpadded already.
 ///
+/// ## Two masks, and only one of them can free a register
+///
+/// This is worth stating precisely because the attractive version of the claim
+/// is false. The RUNTIME predicate `gr < m_live` stops a load from issuing; it
+/// does NOT free the register the load would have written, because `m_live` is a
+/// runtime scalar and the compiler cannot know the value will not be needed. At
+/// `swz_unroll`'s depth 4 that is sixteen `a_buf` slots either way.
+///
+/// The COMPTIME half, `hi_dead`, is the one that reaches the register budget:
+/// when nothing from row 8 up is live — which `live_arg` establishes from `m`
+/// alone, since `m <= 8` forces a single m-tile — the `i`-odd loads are deleted
+/// at compile time, and with them their address arithmetic and their eight
+/// `a_buf` slots. That is the version that can move
+/// `launch__registers_per_thread`, and it is the reason the flag is two
+/// comptime booleans rather than one.
+///
+/// If it does move it DOWN, the consequence is larger than the mask: `swz_unroll`
+/// records depth 8 at 86 registers, pushing `launch__occupancy_limit_registers`
+/// below the part's `launch__occupancy_limit_blocks` of 24 and costing occupancy
+/// (37.41% against depth 4's 44.77%). Depth 8 measured worse BECAUSE it was
+/// register-bound, not because the depth was wrong. Registers freed here are
+/// registers depth 8 could spend. That is a hypothesis with an obvious
+/// experiment, not a result: read `launch__registers_per_thread` for both arms
+/// before believing any of it, and note that a mask which RAISES the count would
+/// be a reason to stop, since the lane has single-digit registers of headroom.
+///
 /// ## Which decode work this actually reaches
 ///
 /// Not the unembedding, at the shipped default. `inkling_forward`'s
@@ -202,11 +228,38 @@ pub const LIVE_ROW_MASK_DEFAULT: bool = false;
 /// not a second kernel.
 ///
 /// `INK_W4A16_ROWMASK=1` turns it on, so one binary can run both arms.
-/// Turn a launch's `m_live` into the kernel's `(mask_rows, m_live)` pair.
+/// Turn a launch's `m_live` into the kernel's `(mask_rows, hi_dead, m_live)`.
 ///
 /// `None` is "load every row as before" and is the only shape in which the
 /// count can be absent, so a masked launch cannot be written without one.
-fn live_arg(m_pad: usize, m_live: Option<usize>) -> (bool, u32) {
+///
+/// `hi_dead` is the COMPTIME half of the mask and it is the half that can free
+/// a register. `m_live` is a runtime scalar, so `gr < m_live` is a runtime
+/// predicate: it stops a load from ISSUING but the compiler still has to
+/// allocate somewhere to put the result, and at depth 4 that is sixteen `a_buf`
+/// slots whatever the mask does. `hi_dead` says something the compiler can act
+/// on instead — that the `i`-odd loads, whose fragment row is `lane/4 + 8` and
+/// therefore at least 8, address nothing live — and then those loads are not
+/// emitted at all and their slots are not allocated.
+///
+/// It is one BOOL and not a row bound, deliberately: a comptime row bound would
+/// compile a kernel variant per distinct `m`, and prefill's `m` varies per
+/// prompt. The only comptime question that changes code is whether row 8 can be
+/// live, so that is the only thing passed, and the whole model needs exactly two
+/// variants — decode's and everyone else's.
+///
+/// `m <= MTILE / 2` is sufficient AND safe: `m_pad` is `m` rounded up to
+/// [`MTILE`], so any `m <= 8` has `m_pad = MTILE`, one m-tile, and `m_base = 0`
+/// — every row from 8 up is padding in the only tile there is.
+///
+/// **It depends on the fragment map**, specifically on `row = lane/4 + 8*(i&1)`
+/// making `8*(i&1)` the smallest row load `i` can touch. `mma16_lane_dump`
+/// checks that closed form against the device and says HOLDS or DOES NOT HOLD,
+/// and `w4a16_swz_probe`'s mask gate would catch a violation as a non-identical
+/// output at its `(16, 1)` and `(16, 8)` shapes — which is what those two shapes
+/// are for. This is the same dependency `swz_word_k16` already carries, declared
+/// the same way.
+fn live_arg(m_pad: usize, m_live: Option<usize>) -> (bool, bool, u32) {
     match m_live {
         Some(m) => {
             assert!(m <= m_pad, "m_live {m} exceeds the padded {m_pad} rows");
@@ -214,11 +267,15 @@ fn live_arg(m_pad: usize, m_live: Option<usize>) -> (bool, u32) {
             // wrong mask rather than a crash. Unreachable at any real shape --
             // 2^32 rows of a 4096-wide BF16 activation is 32 TiB -- which is
             // exactly why it must not be the thing that fails quietly.
-            (true, u32::try_from(m).expect("m_live fits a u32"))
+            (
+                true,
+                m <= MTILE / 2,
+                u32::try_from(m).expect("m_live fits a u32"),
+            )
         }
         // The count the kernel never reads. `m_pad` and not 0, so a masked
         // kernel handed this by mistake would still be CORRECT, only slow.
-        None => (false, m_pad as u32),
+        None => (false, false, m_pad as u32),
     }
 }
 
@@ -257,6 +314,7 @@ pub fn w4a16_linear<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size>(
     #[comptime] size_k: usize,
     #[comptime] size_n: usize,
     #[comptime] mask_rows: bool,
+    #[comptime] hi_dead: bool,
     scale: f32,
     m_live: u32,
 ) {
@@ -307,16 +365,24 @@ pub fn w4a16_linear<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size>(
             let (row, col) = def.position_of_nth(lane, (i * vs_a * pack) as u32, MatrixIdent::A);
             let gr = row as usize + m_base;
             let gc = col as usize + kbase;
-            // `gr < m_live` does not mention `kbase`, so the predicate is
-            // loop-invariant and what is left inside the loop is a predicated
-            // load. See `live_row_mask` for why the substituted zero is
-            // bit-identical and for what the mask does and does not buy.
+            // Two masks, and they are not the same mask. `hi_dead` is COMPTIME
+            // and deletes the load: `i` odd means `row = lane/4 + 8 >= 8`, and
+            // `live_arg` only sets `hi_dead` when nothing from row 8 up is live,
+            // so there is no address to compute and no register to hold. The
+            // `gr < m_live` one is RUNTIME: it stops the load issuing but the
+            // result still needs somewhere to land. See `live_row_mask` for the
+            // bit-identity argument and `live_arg` for why one of these is a
+            // bool and not a row bound.
             if mask_rows {
-                let mut v = Vector::<AB, NA>::cast_from(0.0f32);
-                if gr < m_live as usize {
-                    v = a[(gr * size_k + gc) / a.vector_size()];
+                if hi_dead && (i & 1) == 1 {
+                    reg_a[i] = Vector::<AB, NA>::cast_from(0.0f32);
+                } else {
+                    let mut v = Vector::<AB, NA>::cast_from(0.0f32);
+                    if gr < m_live as usize {
+                        v = a[(gr * size_k + gc) / a.vector_size()];
+                    }
+                    reg_a[i] = v;
                 }
-                reg_a[i] = v;
             } else {
                 reg_a[i] = a[(gr * size_k + gc) / a.vector_size()];
             }
@@ -403,7 +469,7 @@ pub fn w4a16_linear_launch<R: Runtime>(
         0,
         "m_pad {m_pad} is not a multiple of {MTILE}"
     );
-    let (mask_rows, live) = live_arg(m_pad, m_live);
+    let (mask_rows, hi_dead, live) = live_arg(m_pad, m_live);
     assert_eq!(n % NTILE, 0, "n {n} is not a multiple of {NTILE}");
     assert_eq!(k % KTILE, 0, "k {k} is not a multiple of {KTILE}");
     // N rides grid y, which CUDA caps at 65535 (x is 2^31-1). The largest N in
@@ -436,6 +502,7 @@ pub fn w4a16_linear_launch<R: Runtime>(
             k,
             n,
             mask_rows,
+            hi_dead,
             scale,
             live,
         )
@@ -1440,6 +1507,7 @@ pub fn w4a16_linear_swz<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size>(
     #[comptime] swz_sc: bool,
     #[comptime] kunroll: usize,
     #[comptime] mask_rows: bool,
+    #[comptime] hi_dead: bool,
     scale: f32,
     m_live: u32,
 ) {
@@ -1500,16 +1568,25 @@ pub fn w4a16_linear_swz<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size>(
                     def.position_of_nth(lane, (i * vs_a * pack) as u32, MatrixIdent::A);
                 let gr = row as usize + m_base;
                 let gc = col as usize + kbase;
-                // Loop-invariant predicate, predicated load; `live_row_mask`
-                // carries the derivation and the bit-identity argument. The
-                // suppressed loads also stop occupying `a_buf`'s in-flight
-                // slots with a value the MMA would multiply by nothing.
+                // `hi_dead` is the one that reaches the REGISTER BUDGET, and
+                // this is the loop where that matters: at depth 4 `a_buf` is
+                // sixteen slots, and under `hi_dead` eight of them are an
+                // immediate zero the compiler can see, so the load, its address
+                // arithmetic and its slot all go. The runtime `gr < m_live`
+                // predicate cannot do that -- it stops a load ISSUING, not the
+                // allocation of somewhere to put it. `live_row_mask` carries the
+                // bit-identity argument; `live_arg` carries why `hi_dead` is
+                // sound and what it assumes about the fragment map.
                 if mask_rows {
-                    let mut v = Vector::<AB, NA>::cast_from(0.0f32);
-                    if gr < m_live as usize {
-                        v = a[(gr * size_k + gc) / a.vector_size()];
+                    if hi_dead && (i & 1) == 1 {
+                        a_buf[u * vc_a + i] = Vector::<AB, NA>::cast_from(0.0f32);
+                    } else {
+                        let mut v = Vector::<AB, NA>::cast_from(0.0f32);
+                        if gr < m_live as usize {
+                            v = a[(gr * size_k + gc) / a.vector_size()];
+                        }
+                        a_buf[u * vc_a + i] = v;
                     }
-                    a_buf[u * vc_a + i] = v;
                 } else {
                     a_buf[u * vc_a + i] = a[(gr * size_k + gc) / a.vector_size()];
                 }
@@ -1596,7 +1673,7 @@ pub fn w4a16_linear_swz_launch<R: Runtime>(
         0,
         "m_pad {m_pad} is not a multiple of {MTILE}"
     );
-    let (mask_rows, live) = live_arg(m_pad, m_live);
+    let (mask_rows, hi_dead, live) = live_arg(m_pad, m_live);
     assert!(swizzleable(n, k), "[{n}, {k}] is not swizzleable");
     assert!(
         n / NTILE <= 65535,
@@ -1632,6 +1709,7 @@ pub fn w4a16_linear_swz_launch<R: Runtime>(
             swz_sc,
             kunroll,
             mask_rows,
+            hi_dead,
             scale,
             live,
         )
