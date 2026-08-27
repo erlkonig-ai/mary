@@ -6146,6 +6146,262 @@ mod tests {
         assert!(worst < CACHE_TOLERANCE, "a one-row batch drifts by {worst}");
     }
 
+    /// Two caches over the same `delta`, one BATCHED and one WALKED, compared
+    /// on the STEPS THAT COME AFTER.
+    ///
+    /// This is the gate for [`crate::models::inkling::session::Session::extend`]'s
+    /// batched append, and the comparison is deliberately not the one
+    /// [`compare_batched`] makes. That one holds a batch's own output against
+    /// the uncached lane, which is a statement about the rows the batch
+    /// RETURNS. What a session needs is a statement about the cache the batch
+    /// LEAVES BEHIND — because the rows it returns are thrown away (a delta is
+    /// appended for its effect on the cache, and only its last row is
+    /// unembedded), and everything the session does afterwards reads the cache.
+    ///
+    /// So both arms build a cache and are then asked the same question `probe`
+    /// times through the SAME single-position function. A batch that left the
+    /// store one row short, or with `base` one too far along, answers
+    /// differently here and identically in every length assertion.
+    ///
+    /// Returns the worst disagreement over the probe steps and each arm's
+    /// `(len, base)`. The second and third are not a substitute for the first —
+    /// they are what tells a failure apart afterwards: a numeric drift with
+    /// matching structure is arithmetic, and a structural mismatch is the
+    /// window bug.
+    #[allow(clippy::too_many_arguments)]
+    fn walked_vs_batched(
+        kind: AttnKind,
+        rel_extent: usize,
+        window: Option<usize>,
+        ls: Option<LogScaling>,
+        prefill: usize,
+        delta: usize,
+        batch: usize,
+        probe: usize,
+    ) -> (f32, (usize, usize), (usize, usize)) {
+        // The WIDE cache, explicitly: the two arms are compared to each other
+        // at a tolerance sized for two implementations of the same arithmetic,
+        // which is what they are only while the store is not requantising.
+        let _lane = CacheLane::wide();
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let d = dims(kind, rel_extent);
+        let w = weights(&d, &dev);
+        let tokens = prefill + delta + probe;
+        let xs: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(fill(tokens * d.hidden, 2.5), [tokens, d.hidden]),
+            &dev,
+        );
+        let head = xs.clone().slice([0..prefill, 0..d.hidden]);
+        let (_, mut walked) = attention_prefill(head.clone(), &w, &d, ls, window, window);
+        let (_, mut batched) = attention_prefill(head, &w, &d, ls, window, window);
+
+        // The walked arm: the delta one position at a time, which is what
+        // `extend` did before it batched.
+        for pos in prefill..prefill + delta {
+            let _ = attention_step(
+                xs.clone().slice([pos..pos + 1, 0..d.hidden]),
+                &w,
+                &d,
+                ls,
+                pos,
+                window,
+                &mut walked,
+            );
+        }
+
+        // The batched arm: the same delta in passes of `batch`, each committed
+        // whole. `commit` is where the window trim happens, and deferring it to
+        // there is the point — a row dropped mid-batch is one a later row of
+        // the same batch may still be inside the window of.
+        let mut pos = prefill;
+        while pos < prefill + delta {
+            let rows = batch.min(prefill + delta - pos);
+            let _ = attention_steps(
+                xs.clone().slice([pos..pos + rows, 0..d.hidden]),
+                &w,
+                &d,
+                ls,
+                pos,
+                window,
+                &mut batched,
+            );
+            batched.commit(rows, window);
+            pos += rows;
+        }
+
+        // And now the same question to both, through the one-row path.
+        let mut worst = 0f32;
+        for pos in prefill + delta..tokens {
+            let row = xs.clone().slice([pos..pos + 1, 0..d.hidden]);
+            let a = attention_step(row.clone(), &w, &d, ls, pos, window, &mut walked);
+            let b = attention_step(row, &w, &d, ls, pos, window, &mut batched);
+            worst = worst.max((a - b).abs().max().into_scalar());
+        }
+        (
+            worst,
+            (walked.len(), walked.base()),
+            (batched.len(), batched.base()),
+        )
+    }
+
+    /// A global layer, where nothing is ever forgotten and the only thing a
+    /// batch can get wrong is the per-row `tau` and the per-row relative
+    /// distance. Log scaling that varies per position, so a batch that used one
+    /// `tau` for all of its rows shows up here rather than in a length.
+    #[test]
+    fn a_batched_delta_leaves_the_cache_a_walked_one_leaves() {
+        let ls = Some(LogScaling {
+            n_floor: 4.0,
+            alpha: 0.5,
+        });
+        let (worst, walked, batched) = walked_vs_batched(AttnKind::Global, 5, None, ls, 4, 9, 4, 4);
+        assert_eq!(walked, batched, "global: (rows, base) after the delta");
+        assert!(
+            worst < CACHE_TOLERANCE,
+            "the steps after a batched delta drift from a walked one by {worst}"
+        );
+    }
+
+    /// THE ONE THAT MATTERS: a local layer, and a batch that crosses the
+    /// window boundary rather than stopping short of it.
+    ///
+    /// A batch is appended without trimming and the trim comes after the
+    /// commit, so a batch can carry a store from inside its window to outside
+    /// it in one go. The failure this is looking for is silent by construction
+    /// — a layer left holding too few keys raises nothing, returns finite
+    /// numbers, and goes on attending over a short window forever — so it is
+    /// asserted on the STEPS AFTER, where a missing key changes the answer,
+    /// and on `(rows, base)`, where a wrong trim changes the structure.
+    ///
+    /// Three regimes, and the third is the one no existing test reached:
+    ///
+    /// * the boundary crossed INSIDE a batch (prefill 3, batch 4, window 5);
+    /// * the boundary crossed BETWEEN two batches of a chunked delta;
+    /// * a single batch LONGER THAN THE WHOLE WINDOW (13 rows, window 5), where
+    ///   the store holds `window + 13` rows uncommitted and every row of the
+    ///   batch must be masked to its own five.
+    #[test]
+    fn a_batch_that_crosses_the_window_boundary_forgets_exactly() {
+        for (prefill, delta, batch) in [
+            (3usize, 9usize, 4usize), // the crossing happens inside batch 1
+            (3, 9, 2),                // chunked: the crossing is between two
+            (6, 13, 13),              // one batch longer than the window
+            (6, 13, 5),               // one batch exactly the window
+        ] {
+            let (worst, walked, batched) =
+                walked_vs_batched(AttnKind::Local, 5, Some(5), None, prefill, delta, batch, 4);
+            assert_eq!(
+                walked, batched,
+                "local prefill {prefill} delta {delta} batch {batch}: (rows, base) after the \
+                 delta -- a batch that skipped a trim boundary holds a different number of \
+                 keys than a walk over the same positions"
+            );
+            assert_eq!(
+                batched.0, 5,
+                "the window is 5, so a committed store holds 5 rows and not {}",
+                batched.0
+            );
+            assert!(
+                worst < CACHE_TOLERANCE,
+                "local prefill {prefill} delta {delta} batch {batch}: the steps after a \
+                 batched delta drift from a walked one by {worst}"
+            );
+        }
+    }
+
+    /// The refutation for the test above, and a fact about the layer worth
+    /// keeping: **a store left short of its window answers differently, and
+    /// that is the only way this comparison can see a window bug.**
+    ///
+    /// A gate for a silent failure is worth what its refutation is worth, and
+    /// "the window bug produces no error" cuts both ways — a test that passes
+    /// vacuously produces no error either. So leave a store three keys short of
+    /// its window, which is exactly the state a batched append that trimmed by
+    /// the wrong amount would leave, and require the comparison to notice.
+    ///
+    /// Why the sabotage is a short STORE and not a mis-timed trim: a layer's K
+    /// and V rows are a function of `x` and the convolution history ALONE — the
+    /// attention output never feeds them — so a batch whose MASK was wrong
+    /// still stores the right keys, and a trim that over-forgets and is then
+    /// re-trimmed to the same window converges to the same FIFO state. Both are
+    /// invisible to a comparison of caches, and neither is the failure mode: a
+    /// wrong mask is caught by [`compare_batched`] against the uncached lane
+    /// (which compares the batch's own OUTPUT), and what is left for a cache
+    /// comparison is precisely whether the store ends up the right length with
+    /// the right `base`. That is what [`walked_vs_batched`] asserts, and this
+    /// says it can.
+    #[test]
+    fn a_store_left_short_of_its_window_is_caught() {
+        let _lane = CacheLane::wide();
+        let dev = burn::backend::cuda::CudaDevice::default();
+        let (window, prefill, delta) = (Some(5usize), 6usize, 9usize);
+        let d = dims(AttnKind::Local, 5);
+        let w = weights(&d, &dev);
+        let tokens = prefill + delta + 3;
+        let xs: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(fill(tokens * d.hidden, 2.5), [tokens, d.hidden]),
+            &dev,
+        );
+        let head = xs.clone().slice([0..prefill, 0..d.hidden]);
+        let (_, mut good) = attention_prefill(head.clone(), &w, &d, None, window, window);
+        let (_, mut bad) = attention_prefill(head, &w, &d, None, window, window);
+
+        for c in [&mut good, &mut bad] {
+            let _ = attention_steps(
+                xs.clone().slice([prefill..prefill + delta, 0..d.hidden]),
+                &w,
+                &d,
+                None,
+                prefill,
+                window,
+                c,
+            );
+            c.commit(delta, window);
+        }
+        // The sabotage: forget more than the window says to, and never get the
+        // rows back. `commit` with nothing pending is a bare trim, which is
+        // what makes this one line.
+        bad.commit(0, Some(2));
+        assert_eq!(good.len(), 5, "the correct store holds its window");
+        assert_eq!(bad.len(), 2, "the sabotaged one holds less");
+
+        let mut worst = 0f32;
+        for pos in prefill + delta..tokens {
+            let row = xs.clone().slice([pos..pos + 1, 0..d.hidden]);
+            let a = attention_step(row.clone(), &w, &d, None, pos, window, &mut good);
+            let b = attention_step(row, &w, &d, None, pos, window, &mut bad);
+            worst = worst.max((a - b).abs().max().into_scalar());
+        }
+        println!("a store three keys short of its window moves the answer by {worst}");
+        assert!(
+            worst > 4.0 * CACHE_TOLERANCE,
+            "a store that forgot more than its window only moved the answer by {worst}, which \
+             is barely outside the tolerance the comparison admits -- so the comparison is not \
+             measuring what it claims"
+        );
+    }
+
+    /// A batch WIDER than the window against the uncached whole-sequence lane,
+    /// which is the oracle [`compare_batched`] uses and the one that cannot
+    /// share a mistake with either cached arm.
+    ///
+    /// Every existing parameterisation of that helper runs `batch < window`
+    /// (3 against 5), which is the speculative regime — a verify batch is three
+    /// or four rows. A conversational delta is hundreds, and on this model's
+    /// 512-key window the interesting case is the one where a single append
+    /// spans more positions than a local layer can remember.
+    #[test]
+    fn a_batch_wider_than_the_window_matches_the_uncached_lane() {
+        for (tokens, prefill, batch) in [(24usize, 6usize, 9usize), (24, 6, 18)] {
+            let worst =
+                compare_batched(AttnKind::Local, 5, Some(5), None, tokens, prefill, batch, 0);
+            assert!(
+                worst < CACHE_TOLERANCE,
+                "a {batch}-row batch against a 5-key window drifts by {worst}"
+            );
+        }
+    }
+
     /// A gate that cannot fail and a gate that has never failed look identical
     /// from outside. Forgetting the pre-convolution history is the plausible
     /// version of this bug — it leaves K and V cached and correct-looking — so

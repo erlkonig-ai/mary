@@ -22,8 +22,13 @@
 //! rewound to a checkpoint and re-extended with a DIFFERENT tail is the session
 //! that was built that way from the start. See [`rewind_gate`].
 //!
+//! `--batched` runs the claim that makes the rewind worth having: that
+//! appending a KNOWN multi-token delta in one pass leaves the session the walk
+//! leaves, and costs a batched pass rather than one decode step a token. See
+//! [`batched_gate`].
+//!
 //! ```text
-//! INK_LAYERS=0:4 inkling_session <pile> <ids.bin> [--gen N] [--turns T] [--rewind]
+//! INK_LAYERS=0:4 inkling_session <pile> <ids.bin> [--gen N] [--turns T] [--rewind] [--batched]
 //! ```
 
 use anyhow::{Context, Result};
@@ -40,6 +45,7 @@ fn main() -> Result<()> {
         .context("usage: inkling_session <pile> <ids.bin> [--gen N] [--turns T] [--rewind]")?;
     let (mut want, mut turns) = (8usize, 1usize);
     let mut rewind = false;
+    let mut batched = false;
     let rest: Vec<String> = args.collect();
     let mut i = 0;
     while i < rest.len() {
@@ -54,6 +60,10 @@ fn main() -> Result<()> {
             }
             "--rewind" => {
                 rewind = true;
+                i += 1;
+            }
+            "--batched" => {
+                batched = true;
                 i += 1;
             }
             other => anyhow::bail!("unknown argument {other:?}"),
@@ -81,6 +91,9 @@ fn main() -> Result<()> {
 
     if rewind {
         return rewind_gate(&mut session, &prompt, want);
+    }
+    if batched {
+        return batched_gate(&mut session, &prompt, want);
     }
 
     for turn in 0..turns {
@@ -315,5 +328,188 @@ fn rewind_gate(session: &mut Session, prompt: &[usize], steps: usize) -> Result<
          {rewind_s:.4}s to put the cache back"
     );
     println!("REWIND GATE: PASS");
+    Ok(())
+}
+
+/// The batched-append claim, on the real model: a session handed a known
+/// multi-token delta IN ONE PASS is the session that walked the same delta a
+/// position at a time — and it is not the same price.
+///
+/// # What it runs
+///
+/// The prompt is split the way [`rewind_gate`] splits it, so the two gates'
+/// numbers compose: two thirds settled prefix, one third the delta. Three arms,
+/// all against ONE loaded session, each starting from a `reset` and the same
+/// warm prefill of the same head:
+///
+/// ```text
+///   WALKED  : prefill(head)  extend_batch=1            extend(tail)  gen
+///   BATCHED : prefill(head)  extend_batch=|tail|       extend(tail)  gen
+///   CHUNKED : prefill(head)  extend_batch=ceil(|tail|/3)  extend(tail)  gen
+/// ```
+///
+/// and all three token streams must agree. The third arm is not decoration: a
+/// delta longer than `extend_batch` is appended in consecutive passes, and the
+/// claim that a chunk boundary is a COMMIT POINT AND NOTHING ELSE — which is
+/// what makes `extend_batch` a resource knob rather than a semantic one — is
+/// only true if a delta split three ways leaves the cache one pass leaves.
+///
+/// # What it asserts, and why not on `position()`
+///
+/// The tokens, for [`rewind_gate`]'s reason: a cache of the right length
+/// holding the wrong keys is exactly what a length assertion cannot see, and
+/// the window bug this path could plausibly have — a batch that carried a local
+/// layer past its 512-key window without trimming, or trimmed it by the wrong
+/// amount — leaves the position counter perfectly correct. It is also why the
+/// head is deliberately longer than the sliding window and the tail is longer
+/// than a page: at 640/320 every local layer has genuinely forgotten keys
+/// before the delta starts, and the delta itself spans more than two pages.
+///
+/// Exactness is expected here in a way it is NOT after a rewind. All three arms
+/// build their cache forward from the same prefill, so none of them re-opens a
+/// settled page the way a truncation does; what differs is only the WIDTH of
+/// the passes that append. That width does change the GEMM shape and therefore
+/// the accumulation order, so a late divergence is arithmetic and is reported
+/// as WHERE it starts rather than as a pass/fail on the first token — the same
+/// reading [`rewind_gate`] applies, for the same reason.
+///
+/// # The cost model this exists to produce
+///
+/// Three numbers on the same axis, all per TOKEN OF THE DELTA: what a walked
+/// append costs, what a batched one costs, and what the settled prefix would
+/// cost to re-read through a batched `prefill`. The third is the alternative a
+/// rewind is measured against, so the crossover falls straight out of the
+/// ratio: a rewind beats `reset` + `prefill` while
+///
+/// ```text
+///   changed suffix / prefix  <  prefill ms/token / extend ms/token
+/// ```
+///
+/// With the walked extend that bound was 11.32 / 47.4 = 23.9%. What it becomes
+/// is what this prints.
+fn batched_gate(session: &mut Session, prompt: &[usize], steps: usize) -> Result<()> {
+    anyhow::ensure!(
+        prompt.len() >= 6,
+        "the batched gate splits the prompt in two; {} tokens is not enough",
+        prompt.len()
+    );
+    anyhow::ensure!(
+        steps >= 2,
+        "--gen must be at least 2 to have a stream to compare"
+    );
+    let cut = prompt.len() * 2 / 3;
+    let (head, tail) = prompt.split_at(cut);
+
+    // The COLD pass, which binds every layer's weights. Its seconds are the
+    // upload and belong to no arm; every number below is measured after it.
+    let t_cold = std::time::Instant::now();
+    session.prefill(head)?;
+    println!(
+        "  cold prefill          : {} tokens in {:.1}s (binds the layers; not a measurement)",
+        head.len(),
+        t_cold.elapsed().as_secs_f64()
+    );
+
+    // One arm: reset, warm prefill of the head, then the delta at `rows` per
+    // pass, then `steps - 1` decode steps. Returns the tokens and the two
+    // per-token costs, so the caller compares like with like.
+    let arm = |s: &mut Session, rows: usize, what: &str| -> Result<(Vec<usize>, f64, f64)> {
+        s.reset();
+        let t_p = std::time::Instant::now();
+        s.prefill(head)?;
+        let prefill_s = t_p.elapsed().as_secs_f64();
+        s.set_extend_batch(rows)?;
+        let t_e = std::time::Instant::now();
+        let mut tok = s.extend(tail)?;
+        let extend_s = t_e.elapsed().as_secs_f64();
+        anyhow::ensure!(
+            s.position() == prompt.len(),
+            "{what}: appended {} positions but the session stands at {}",
+            tail.len(),
+            s.position()
+        );
+        let mut out = vec![tok];
+        let t_d = std::time::Instant::now();
+        for _ in 1..steps {
+            tok = s.step()?;
+            out.push(tok);
+        }
+        let decode_s = t_d.elapsed().as_secs_f64();
+        let (pf, ex) = (
+            prefill_s * 1e3 / head.len() as f64,
+            extend_s * 1e3 / tail.len() as f64,
+        );
+        println!(
+            "  {what:<22}: prefill {} tok in {prefill_s:.3}s ({pf:.2} ms/token, BATCHED) | \
+             extend {} tok in {extend_s:.3}s ({ex:.2} ms/token, {rows} rows a pass) | \
+             {} steps in {decode_s:.3}s ({:.1} ms/step)",
+            head.len(),
+            tail.len(),
+            steps - 1,
+            decode_s * 1e3 / (steps - 1) as f64,
+        );
+        Ok((out, pf, ex))
+    };
+
+    let (walked, _, walked_ms) = arm(session, 1, "WALKED (1 row a pass)")?;
+    let (batched, prefill_ms, batched_ms) = arm(session, tail.len(), "BATCHED (one pass)")?;
+    let chunk = tail.len().div_ceil(3);
+    let (chunked, _, chunked_ms) = arm(session, chunk, "CHUNKED (three passes)")?;
+
+    println!("WALKED : {walked:?}");
+    println!("BATCHED: {batched:?}");
+    println!("CHUNKED: {chunked:?}");
+
+    let agreement =
+        |a: &[usize], b: &[usize]| -> usize { a.iter().zip(b).take_while(|(x, y)| x == y).count() };
+    let ab = agreement(&batched, &walked);
+    let cb = agreement(&chunked, &batched);
+    println!(
+        "  batched vs walked     : {ab}/{} tokens{}",
+        walked.len(),
+        match ab == walked.len() {
+            true => String::new(),
+            false => format!(
+                " -- first divergence at {ab} ({} against {})",
+                batched[ab], walked[ab]
+            ),
+        }
+    );
+    println!(
+        "  chunked vs batched    : {cb}/{} tokens{}",
+        batched.len(),
+        match cb == batched.len() {
+            true => String::new(),
+            false => format!(
+                " -- first divergence at {cb} ({} against {})",
+                chunked[cb], batched[cb]
+            ),
+        }
+    );
+
+    println!(
+        "  speedup               : {:.2}x ({walked_ms:.2} -> {batched_ms:.2} ms/token of \
+         delta); chunked {chunked_ms:.2}",
+        walked_ms / batched_ms.max(f64::EPSILON)
+    );
+    // The crossover, restated from THIS run's own two numbers rather than
+    // carried over: a rewind is worth taking while re-extending the changed
+    // suffix costs less than re-prefilling the whole prefix.
+    println!(
+        "  rewind crossover      : changed suffix < {:.1}% of the prefix (was {:.1}% walked) \
+         -- prefill {prefill_ms:.2} ms/token against extend {batched_ms:.2}",
+        100.0 * prefill_ms / batched_ms.max(f64::EPSILON),
+        100.0 * prefill_ms / walked_ms.max(f64::EPSILON),
+    );
+
+    anyhow::ensure!(
+        ab == walked.len(),
+        "a batched delta diverges from a walked one at token {ab}"
+    );
+    anyhow::ensure!(
+        cb == batched.len(),
+        "a delta split into three passes diverges from one pass at token {cb}"
+    );
+    println!("BATCHED EXTEND GATE: PASS");
     Ok(())
 }
