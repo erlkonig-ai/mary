@@ -826,10 +826,15 @@ struct Pending<B: Backend> {
 /// point is the same size at position 500,000 as at position 1,000. Burn clones
 /// a tensor by handle, so keeping one is a handle clone per page rather than a
 /// copy of the keys — the same property [`super::kvpages::Pages::share_prefix`]
-/// is built on. What it does cost is that the page the live cache is still
-/// writing into now has two references, and `write_rows` answers that by
-/// copying it (see [`super::kvpages::PageRows::write_rows`]) until the next page
-/// is opened.
+/// is built on. What it costs is that the page the live cache is still writing
+/// into now has two references, and `write_rows` answers that by copying it
+/// (see [`super::kvpages::PageRows::write_rows`]).
+///
+/// That copy is not an overhead to be engineered away — it is what makes this a
+/// SNAPSHOT rather than an alias. An in-place append into a page a rewind point
+/// also holds would edit the past. It happens once per page per point (the copy
+/// leaves the live store holding a buffer nobody else references, so the append
+/// after it is in place again), and one page is 128 rows.
 #[derive(Clone)]
 pub struct AttnRewind<B: Backend> {
     /// Logical rows held at the point.
