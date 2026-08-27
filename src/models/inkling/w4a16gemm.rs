@@ -260,11 +260,49 @@ pub const LIVE_ROW_MASK_DEFAULT: bool = false;
 /// at all and the REQUEST count halves as well — and that is the same threshold
 /// at which `hi_dead` lets the compiler delete them outright.
 ///
-/// **Registers: not yet read.** `ncu` returns `ERR_NVGPUCTRPERM` for an
-/// unprivileged user on this box, so `launch__registers_per_thread` needs `sudo`
-/// and a box slot. Until it is read, treat the register claim above as the
-/// hypothesis it is: the mask is NOT known to be register-neutral, and a rise
-/// would be a reason to leave it off.
+/// **Requests, sectors and REGISTERS, from `ncu`.** One process, one binary,
+/// `n = 1024`, `k = 4096`, `m_pad = 16`, load depth 4; the mask-on arm is
+/// `m_live = 1` and the mask-off arm is the unmasked kernel, so the two differ
+/// only in the comptime flags. ncu reports whole-kernel sums; these are divided
+/// by `sm__warps_launched.sum` (128) times the k-tile count (`4096/16` = 256) to
+/// give PER WARP PER K-TILE, which is the unit the derivation above is in.
+/// `ncu` needs `sudo` here — `ERR_NVGPUCTRPERM` otherwise.
+///
+/// ```text
+///                                  requests      32B sectors      registers
+///   kernel                        off -> on      off -> on       off -> on
+///   w4a16_linear (row-major)      8.0 -> 6.0     64.0 -> 34.0      44 -> 36
+///   w4a16_linear_swz (shipped)    7.0 -> 5.0     35.0 ->  5.0      80 -> 73
+///   w4a16_linear_swz, sc row-maj  7.0 -> 5.0     42.0 -> 12.0      78 -> 73
+/// ```
+///
+/// Read the DELTAS down the column: **-2 requests and -30 sectors in every
+/// lane**, which is exactly A going from 4 requests / 32 sectors to 2 / 2 and
+/// nothing else moving. That is the derivation confirmed against the hardware
+/// rather than restated. It also answers "does the row-major lane want this
+/// too": yes, and by the same ABSOLUTE amount — 64 -> 34 is a 47% cut where the
+/// swizzled lane's 35 -> 5 is 86%, and the difference is entirely that row-major
+/// B costs more sectors to begin with, not that the mask does less.
+///
+/// **Registers FALL, in all three.** -7 on the shipped swizzled lane (80 -> 73),
+/// -5 against the 78 that [`swz_unroll`]'s table records for depth 4, and -8 on
+/// the row-major lane (44 -> 36, whose `launch__occupancy_limit_registers` rises
+/// 40 -> 48 with it). This is `hi_dead` doing what the runtime predicate cannot:
+/// the `i`-odd loads are gone at compile time, so their address arithmetic and
+/// their eight `a_buf` slots are never allocated. The mask is not
+/// register-neutral — it is register-POSITIVE, which was the thing most worth
+/// checking before spending a box slot on timing.
+///
+/// **The depth-8 arm is now worth running, and this is a hypothesis.**
+/// `swz_unroll` records depth 8 at 86 registers, which puts
+/// `launch__occupancy_limit_registers` at 20 — below this part's
+/// `launch__occupancy_limit_blocks` of 24 — and that, not the depth, is why it
+/// measured 1.17 against depth 4's 1.48. Seven registers back would put a masked
+/// depth 8 near 79, which is where depth 4 already sits with the limit at 24. So
+/// the mask may make reachable a load depth the register budget has always
+/// forbidden. Nothing here measures that: it needs a depth-8 arm at
+/// `INK_W4A16_SWZ_UNROLL=8` with the mask on, read for
+/// `launch__occupancy_limit_registers` first and time second.
 ///
 /// ## Which decode work this actually reaches
 ///
