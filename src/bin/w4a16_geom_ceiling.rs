@@ -221,7 +221,7 @@ use cubecl::prelude::*;
 use cubecl::server::Handle;
 use half::bf16;
 use mary::models::inkling::w4a16gemm::{
-    CODES_PER_WORD, GROUP, KTILE, MTILE, NTILE, SWZ_BLOCK_CODES, w4a16_linear_swz_launch,
+    CODES_PER_WORD, GROUP, KTILE, MTILE, NTILE, SWZ_BLOCK_CODES, w4a16_linear_swz_launch_redist,
 };
 
 type Rt = cubecl::cuda::CudaRuntime;
@@ -608,6 +608,7 @@ fn main() {
         "geom, no A no scales     ",
         "width 4 B/lane + shuffle ",
         "width 16 B/lane + shuffle",
+        "real swz + shuffle       ",
     ];
     let mut per_rep: Vec<Vec<f64>> = vec![Vec::new(); names.len()];
 
@@ -693,8 +694,12 @@ fn main() {
                     );
                     let _ = future::block_on(client.sync());
                 }
-                3 => {
-                    let o = w4a16_linear_swz_launch::<Rt>(
+                // Arms 3 and 10 are the SHIPPED lane with the weight-load form
+                // as the only variable, said explicitly rather than read from
+                // the environment, so both live in one process and the paired
+                // ratio 10/3 resolves what a two-process comparison cannot.
+                3 | 10 => {
+                    let o = w4a16_linear_swz_launch_redist::<Rt>(
                         &client,
                         &a,
                         &b,
@@ -705,6 +710,7 @@ fn main() {
                         true,
                         1.0,
                         Some(m_live),
+                        arm == 10,
                     );
                     let _ = future::block_on(client.sync());
                     drop(o);
@@ -745,6 +751,11 @@ fn main() {
     };
     println!("\n  paired within-process ratio (per rep, then p50 / min / max)");
     for (lbl, a, b) in [
+        // THE SHIPPED LANE, flag on over flag off. Everything else here is a
+        // rung; this row is the kernel.
+        ("REAL: shuffle on/off     (10/3)", 10usize, 3usize),
+        ("real+shfl vs coalesced   (10/0)", 10, 0),
+        ("real+shfl vs fragment map(10/1)", 10, 1),
         ("shuffle cost, 4 B/lane   (8/4)", 8usize, 4usize),
         ("shuffle cost, 16 B/lane  (9/5)", 9, 5),
         ("4 B+shfl vs no-A fragment(8/6)", 8, 6),
