@@ -52,6 +52,18 @@
 //! one `[16]` u32 array uploaded at frame start, `NO_FORCE` where the step is
 //! free.
 //!
+//! **Sampling is on the device for the same reason.** A real session decodes
+//! at temp 0.8 / top-k 250 / top-p 0.95, not greedily — greedy audio decode
+//! collapses the agent to a near-constant code — and the token a step samples
+//! is the token the next step embeds, so host-side sampling would mean 16
+//! blocking readbacks per frame, which is the whole budget.
+//! [`dep_sample_kernel`] therefore does the temperature / top-k / top-p work
+//! in the cube, finding both cuts by BISECTING A THRESHOLD instead of sorting
+//! 2048 candidates. The randomness stays host-seeded: the caller draws one
+//! uniform per step from its own [`super::sampling::Sampler`] and uploads
+//! them alongside the forcing array, so the seeded-session property is
+//! unchanged and the device contributes no entropy.
+//!
 //! ## Codebook depth is a parameter, not a constant
 //!
 //! [`DepthGpu::frame`] takes `n_q` and runs exactly that many steps. Because
@@ -79,6 +91,7 @@ use cubecl::prelude::*;
 use cubecl::server::Handle;
 
 use super::config as cfg;
+use super::sampling::SamplingConfig;
 use super::temporal_metal::{QLinear, WeightFmt, as_bytes, encode};
 use crate::nn::q4::{self, Rt};
 use crate::nn::weight_loader::WeightLoader;
@@ -99,6 +112,11 @@ pub const NO_FORCE: u32 = u32::MAX;
 
 const NORM_THREADS: u32 = 256;
 const ARGMAX_THREADS: u32 = 256;
+/// Bisection rounds per cut in [`dep_sample_kernel`]. Logits here live in
+/// roughly ±40, so 24 halvings place each threshold within ~5e-6 — well below
+/// the spacing of distinct f32 logits, which is the only precision that
+/// changes the selected SET.
+const SAMPLE_ROUNDS: u32 = 24;
 
 // ---------------------------------------------------------------------------
 // kernels
@@ -372,6 +390,290 @@ fn dep_argmax_kernel(
     }
 }
 
+/// Temperature / top-k / top-p sampling + the prev-token chain, in one cube —
+/// the sampled counterpart of [`dep_argmax_kernel`], and the thing that lets
+/// a REAL session (moshi decodes at temp 0.8 / top-k 250 / top-p 0.95) run on
+/// this port at all. Greedy audio decode is not a small quality change: it
+/// collapses the agent to a near-constant code.
+///
+/// **The randomness stays host-seeded.** `uni[step]` is one uniform drawn
+/// from the session's [`super::sampling::Sampler`] RNG at frame start, so the
+/// discipline that module states as a hard rule — the RNG is passed IN,
+/// never drawn from wall-clock or env — survives the move to the device, and
+/// a seeded session is still reproducible. The device contributes no entropy.
+///
+/// **Both cuts are found by BISECTING A THRESHOLD, not by sorting.** The host
+/// sampler sorts all 2048 candidates per step; a workgroup cannot afford that
+/// and does not need it, because neither cut needs an order — top-k is "keep
+/// values ≥ the k-th largest" and top-p is "keep probabilities ≥ q for the
+/// largest q whose mass still reaches `top_p`". Each threshold falls out of
+/// `rounds` halvings of a parallel count / sum reduction, and the SET selected
+/// is identical to the sorted formulation except for exact ties within the
+/// last halving. The multinomial draw is then a serial prefix scan on one
+/// thread over the pruned weights — 2048 adds, no `exp` (the probabilities
+/// are already in `pbuf`), which is cheaper than any parallel scan at this
+/// width.
+///
+/// `top_k <= 0` means no k cut and `top_p >= 1` no p cut; the host collapses
+/// "k ≥ vocabulary" to the former so the bisection is not run for nothing.
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn dep_sample_kernel(
+    lrow: &Array<f32>,
+    logits: &mut Array<f32>,
+    pbuf: &mut Array<f32>,
+    forced: &Array<u32>,
+    uni: &Array<f32>,
+    tok: &mut Array<u32>,
+    prev: &mut Array<u32>,
+    step: u32,
+    no_force: u32,
+    temp: f32,
+    top_k: f32,
+    top_p: f32,
+    #[comptime] card: u32,
+    #[comptime] cube_dim: u32,
+    #[comptime] rounds: u32,
+) {
+    let i = UNIT_POS_X;
+    let base = step * card;
+    let neg = f32::new(-3.40282e38);
+    let pos = f32::new(3.40282e38);
+    let mut red = SharedMemory::<f32>::new(comptime!(cube_dim as usize));
+    let mut ridx = SharedMemory::<u32>::new(comptime!(cube_dim as usize));
+
+    // ── publish the row, sanitize non-finites, and take max / first-index
+    //    argmax / min in the one pass that already touches every element ──
+    // A NaN or ±inf (a rare q8 artifact) is mapped to −MAX so it sorts to the
+    // bottom, drops out of both cuts and draws zero probability — the same
+    // rule the host sampler applies before it sorts.
+    let mut best_v = neg;
+    let mut best_i = u32::new(card as i64);
+    let mut min_v = pos;
+    let mut k = i;
+    while k < card {
+        let raw = lrow[k as usize];
+        logits[(base + k) as usize] = raw;
+        let mut v = neg;
+        if raw > neg && raw < pos {
+            v = raw;
+        }
+        pbuf[k as usize] = v;
+        if v > best_v {
+            best_v = v;
+            best_i = k;
+        }
+        if v < min_v {
+            min_v = v;
+        }
+        k += cube_dim;
+    }
+    red[i as usize] = best_v;
+    ridx[i as usize] = best_i;
+    sync_cube();
+    let mut stride = u32::new((cube_dim / 2) as i64);
+    while stride > 0 {
+        if i < stride {
+            let ov = red[(i + stride) as usize];
+            let oi = ridx[(i + stride) as usize];
+            if ov > red[i as usize] {
+                red[i as usize] = ov;
+                ridx[i as usize] = oi;
+            } else if ov == red[i as usize] {
+                if oi < ridx[i as usize] {
+                    ridx[i as usize] = oi;
+                }
+            }
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    let vmax = red[0];
+    let amax = ridx[0];
+    sync_cube();
+    red[i as usize] = min_v;
+    sync_cube();
+    let mut stride = u32::new((cube_dim / 2) as i64);
+    while stride > 0 {
+        if i < stride {
+            if red[(i + stride) as usize] < red[i as usize] {
+                red[i as usize] = red[(i + stride) as usize];
+            }
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    let vmin = red[0];
+    sync_cube();
+
+    // ── top-k: bisect for the value threshold with at most `top_k` survivors.
+    //    `top_k` is uniform across the cube, so the branch and every barrier
+    //    inside it are uniform too. ──
+    let mut tk = vmin;
+    if top_k > 0.5 {
+        let mut lo = vmin;
+        let mut hi = vmax;
+        let mut it = u32::new(0);
+        while it < rounds {
+            let mid = (lo + hi) * 0.5;
+            let mut c = f32::new(0.0);
+            let mut k = i;
+            while k < card {
+                if pbuf[k as usize] >= mid {
+                    c += 1.0;
+                }
+                k += cube_dim;
+            }
+            red[i as usize] = c;
+            sync_cube();
+            let mut stride = u32::new((cube_dim / 2) as i64);
+            while stride > 0 {
+                if i < stride {
+                    red[i as usize] = red[i as usize] + red[(i + stride) as usize];
+                }
+                sync_cube();
+                stride /= 2;
+            }
+            let cnt = red[0];
+            sync_cube();
+            if cnt > top_k {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+            it += 1;
+        }
+        // `hi` is the side that keeps AT MOST k, and it never rises above
+        // `vmax`, so the argmax always survives this cut.
+        tk = hi;
+    }
+
+    // ── temperature-scaled softmax over the k-survivors, into `pbuf` ──
+    let mut s = f32::new(0.0);
+    let mut k = i;
+    while k < card {
+        let v = pbuf[k as usize];
+        let mut p = f32::new(0.0);
+        if v >= tk {
+            p = ((v - vmax) / temp).exp();
+        }
+        pbuf[k as usize] = p;
+        s += p;
+        k += cube_dim;
+    }
+    red[i as usize] = s;
+    sync_cube();
+    let mut stride = u32::new((cube_dim / 2) as i64);
+    while stride > 0 {
+        if i < stride {
+            red[i as usize] = red[i as usize] + red[(i + stride) as usize];
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    let total = red[0];
+    sync_cube();
+
+    // ── top-p: bisect for the probability threshold whose survivors still
+    //    carry `top_p` of the mass. `exp(vmax − vmax) = 1` is the upper
+    //    bracket by construction. ──
+    let mut tp = f32::new(0.0);
+    if top_p < 1.0 {
+        let want = total * top_p;
+        let mut lo = f32::new(0.0);
+        let mut hi = f32::new(1.0);
+        let mut it = u32::new(0);
+        while it < rounds {
+            let mid = (lo + hi) * 0.5;
+            let mut m = f32::new(0.0);
+            let mut k = i;
+            while k < card {
+                let p = pbuf[k as usize];
+                if p >= mid {
+                    m += p;
+                }
+                k += cube_dim;
+            }
+            red[i as usize] = m;
+            sync_cube();
+            let mut stride = u32::new((cube_dim / 2) as i64);
+            while stride > 0 {
+                if i < stride {
+                    red[i as usize] = red[i as usize] + red[(i + stride) as usize];
+                }
+                sync_cube();
+                stride /= 2;
+            }
+            let mass = red[0];
+            sync_cube();
+            if mass >= want {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+            it += 1;
+        }
+        // `lo` always satisfies mass ≥ want (it starts at 0, where the mass is
+        // the whole total), so the nucleus is never empty.
+        tp = lo;
+    }
+
+    // ── prune to the nucleus and take the surviving mass ──
+    let mut kept = f32::new(0.0);
+    let mut k = i;
+    while k < card {
+        let p = pbuf[k as usize];
+        if p < tp {
+            pbuf[k as usize] = 0.0;
+        } else {
+            kept += p;
+        }
+        k += cube_dim;
+    }
+    red[i as usize] = kept;
+    sync_cube();
+    let mut stride = u32::new((cube_dim / 2) as i64);
+    while stride > 0 {
+        if i < stride {
+            red[i as usize] = red[i as usize] + red[(i + stride) as usize];
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    let mass = red[0];
+    sync_cube();
+
+    // ── the draw, and the chain ──
+    // One thread walks the pruned weights in index order. Any fixed order is
+    // a valid multinomial, and index order costs no sort. If the scan never
+    // crosses (every logit was non-finite, so the mass is zero) the argmax
+    // is the fallback — the same escape the host sampler takes.
+    if i == 0 {
+        let target = uni[step as usize] * mass;
+        let mut chosen = amax;
+        let mut acc = f32::new(0.0);
+        let mut done = u32::new(0);
+        let mut k = u32::new(0);
+        while k < card {
+            if done == 0 {
+                acc += pbuf[k as usize];
+                if acc > target {
+                    chosen = k;
+                    done = u32::new(1);
+                }
+            }
+            k += 1;
+        }
+        tok[step as usize] = chosen;
+        let f = forced[step as usize];
+        if f == no_force {
+            prev[0] = chosen;
+        } else {
+            prev[0] = f;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // host side
 // ---------------------------------------------------------------------------
@@ -554,7 +856,10 @@ pub struct DepthGpu {
     vc: Handle,     // [6·16·1024] f32 value slots
     lrow: Handle,   // [2048] the step's logit row
     logits: Handle, // [16·2048] the frame's logit slab
-    tok: Handle,    // [16] u32 emitted tokens
+    /// `[2048]` f32 sampling scratch — the step's sanitized logits, then its
+    /// probabilities. Only the sampled path touches it.
+    pbuf: Handle,
+    tok: Handle, // [16] u32 emitted tokens
 }
 
 /// Interleave a `[2·FH, D]` gate‖up block (moshi ships gate rows then up rows)
@@ -726,6 +1031,7 @@ impl DepthGpu {
             vc: f32s(LAYERS * STEPS * D),
             lrow: f32s(CARD),
             logits: f32s(STEPS * CARD),
+            pbuf: f32s(CARD),
             tok: client.empty(STEPS * 4),
             client,
             fmt,
@@ -765,12 +1071,66 @@ impl DepthGpu {
     /// `n_q` in-frame steps are generated (`n_q <= 16`); the weight sets are
     /// per-step, so the cost is proportional. NON-BLOCKING — read the result
     /// with [`Self::tokens`] / [`Self::logits`].
+    ///
+    /// Greedy. For a sampled session see [`Self::frame_submit_sampled`].
     pub fn frame_submit(
         &mut self,
         transformer_out: &[f32],
         text_token: u32,
         forced: &[u32],
         n_q: usize,
+    ) {
+        self.submit(transformer_out, text_token, forced, n_q, None);
+    }
+
+    /// [`Self::frame_submit`] with the per-step token drawn by
+    /// [`dep_sample_kernel`] instead of argmaxed.
+    ///
+    /// `uniforms` is one draw per step from the caller's seeded RNG, in step
+    /// order — the device's entire source of randomness, so the seeded-session
+    /// property survives sampling moving off the host. A greedy `cfg`
+    /// (`temp <= 0`) routes to the argmax kernel, so `temp -> 0` is argmax
+    /// with no second code path to drift, exactly as on the host.
+    pub fn frame_submit_sampled(
+        &mut self,
+        transformer_out: &[f32],
+        text_token: u32,
+        forced: &[u32],
+        n_q: usize,
+        cfg: &SamplingConfig,
+        uniforms: &[f32],
+    ) {
+        assert_eq!(uniforms.len(), STEPS, "one uniform per in-frame step");
+        let spec = if cfg.is_greedy() {
+            None
+        } else {
+            Some((cfg, uniforms))
+        };
+        self.submit(transformer_out, text_token, forced, n_q, spec);
+    }
+
+    /// Submit + read the emitted tokens, sampled (see
+    /// [`Self::frame_submit_sampled`]).
+    pub fn frame_sampled(
+        &mut self,
+        transformer_out: &[f32],
+        text_token: u32,
+        forced: &[u32],
+        n_q: usize,
+        cfg: &SamplingConfig,
+        uniforms: &[f32],
+    ) -> Vec<i64> {
+        self.frame_submit_sampled(transformer_out, text_token, forced, n_q, cfg, uniforms);
+        self.tokens(n_q)
+    }
+
+    fn submit(
+        &mut self,
+        transformer_out: &[f32],
+        text_token: u32,
+        forced: &[u32],
+        n_q: usize,
+        sampling: Option<(&SamplingConfig, &[f32])>,
     ) {
         assert_eq!(transformer_out.len(), cfg::DIM);
         assert!(n_q <= STEPS && n_q > 0, "n_q {n_q}");
@@ -783,6 +1143,9 @@ impl DepthGpu {
         let x_in = c.create_from_slice(as_bytes(transformer_out));
         let forced_d = c.create_from_slice(as_bytes(forced));
         let prev = c.create_from_slice(as_bytes(&[text_token]));
+        // The frame's uniforms ride up with the forcing array — two tiny
+        // uploads, still one sync for the whole frame.
+        let uni = sampling.map(|(_, u)| c.create_from_slice(as_bytes(u)));
         let arr = |h: &Handle, n: usize| unsafe { ArrayArg::from_raw_parts(h.clone(), n) };
 
         // All n_q conditioning projections in ONE matvec: `transformer_out` is
@@ -857,21 +1220,55 @@ impl DepthGpu {
             }
 
             step_w.head.forward(c, &self.x, &self.lrow);
-            unsafe {
-                dep_argmax_kernel::launch_unchecked::<Rt>(
-                    c,
-                    CubeCount::new_single(),
-                    CubeDim::new_1d(ARGMAX_THREADS),
-                    arr(&self.lrow, CARD),
-                    arr(&self.logits, STEPS * CARD),
-                    arr(&forced_d, STEPS),
-                    arr(&self.tok, STEPS),
-                    arr(&prev, 1),
-                    s as u32,
-                    NO_FORCE,
-                    CARD as u32,
-                    ARGMAX_THREADS,
-                );
+            match (sampling, uni.as_ref()) {
+                (Some((scfg, _)), Some(uni)) => {
+                    // "k at or above the vocabulary" is no cut at all, and
+                    // collapsing it here keeps the kernel from bisecting for
+                    // a threshold it would only find at the minimum.
+                    let top_k = if scfg.top_k == 0 || scfg.top_k >= CARD {
+                        0.0
+                    } else {
+                        scfg.top_k as f32
+                    };
+                    unsafe {
+                        dep_sample_kernel::launch_unchecked::<Rt>(
+                            c,
+                            CubeCount::new_single(),
+                            CubeDim::new_1d(ARGMAX_THREADS),
+                            arr(&self.lrow, CARD),
+                            arr(&self.logits, STEPS * CARD),
+                            arr(&self.pbuf, CARD),
+                            arr(&forced_d, STEPS),
+                            arr(uni, STEPS),
+                            arr(&self.tok, STEPS),
+                            arr(&prev, 1),
+                            s as u32,
+                            NO_FORCE,
+                            scfg.temp,
+                            top_k,
+                            scfg.top_p,
+                            CARD as u32,
+                            ARGMAX_THREADS,
+                            SAMPLE_ROUNDS,
+                        );
+                    }
+                }
+                _ => unsafe {
+                    dep_argmax_kernel::launch_unchecked::<Rt>(
+                        c,
+                        CubeCount::new_single(),
+                        CubeDim::new_1d(ARGMAX_THREADS),
+                        arr(&self.lrow, CARD),
+                        arr(&self.logits, STEPS * CARD),
+                        arr(&forced_d, STEPS),
+                        arr(&self.tok, STEPS),
+                        arr(&prev, 1),
+                        s as u32,
+                        NO_FORCE,
+                        CARD as u32,
+                        ARGMAX_THREADS,
+                    );
+                },
             }
         }
     }

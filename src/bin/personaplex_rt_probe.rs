@@ -485,10 +485,25 @@ fn loadavg() -> f64 {
 fn depth_ab(pile: &str, fmt: WeightFmt) {
     use mary::models::personaplex::depth_gpu::DepthFmt;
     use mary::models::personaplex::pipeline::{DepthChoice, load_depth_arm};
+    use mary::models::personaplex::sampling::{Sampler, SamplingConfig};
     use mary::models::personaplex::temporal_metal::MAX_SEQ;
     const WINDOW: usize = 80;
     const BUDGET_MS: f64 = 80.0;
     let targets = [256usize, 1024, MAX_SEQ - 1];
+    // RT_AB_SAMPLE runs both arms in the SHIPPING decode config instead of
+    // greedy. It is not cosmetic: the host arm pays a 2048-wide sort per step
+    // for sampling and the device arm pays two threshold bisections in the
+    // kernel, so the greedy ratio is not a stand-in for the sampled one.
+    let sampled = std::env::var("RT_AB_SAMPLE").is_ok();
+    let scfg = SamplingConfig {
+        temp: 0.8,
+        top_k: 250,
+        top_p: 0.95,
+    };
+    // One sampler per arm, same seed: neither arm consumes the other's RNG,
+    // so the pairing does not change either arm's token stream.
+    let mut cpu_smp = sampled.then(|| Sampler::new(scfg, 1234_5678));
+    let mut gpu_smp = sampled.then(|| Sampler::new(scfg, 1234_5678));
     let gpu_fmt = std::env::var("RT_AB_FMT")
         .ok()
         .map(|s| DepthFmt::parse(&s).unwrap_or_else(|| panic!("bad RT_AB_FMT {s}")))
@@ -502,6 +517,17 @@ fn depth_ab(pile: &str, fmt: WeightFmt) {
         "depth A/B ({fmt:?} temporal + f16 head + CPU mimi): {} vs {}",
         p.depth.label(),
         gpu.label()
+    );
+    println!(
+        "decode: {}",
+        if sampled {
+            format!(
+                "sampled temp {} top_k {} top_p {} (the shipping config)",
+                scfg.temp, scfg.top_k, scfg.top_p
+            )
+        } else {
+            "greedy".to_string()
+        }
     );
     println!(
         "loaded both arms in {:.1}s (load {:.1})",
@@ -560,17 +586,17 @@ fn depth_ab(pile: &str, fmt: WeightFmt) {
             let (t_cpu, t_gpu, dep);
             if frame_no % 2 == 0 {
                 let t = Instant::now();
-                dep = p.depth.frame(&hidden, next_text, &forced, None);
+                dep = p.depth.frame(&hidden, next_text, &forced, cpu_smp.as_mut());
                 t_cpu = t.elapsed().as_secs_f64() * 1e3;
                 let t = Instant::now();
-                let _ = gpu.frame(&hidden, next_text, &forced, None);
+                let _ = gpu.frame(&hidden, next_text, &forced, gpu_smp.as_mut());
                 t_gpu = t.elapsed().as_secs_f64() * 1e3;
             } else {
                 let t = Instant::now();
-                let _ = gpu.frame(&hidden, next_text, &forced, None);
+                let _ = gpu.frame(&hidden, next_text, &forced, gpu_smp.as_mut());
                 t_gpu = t.elapsed().as_secs_f64() * 1e3;
                 let t = Instant::now();
-                dep = p.depth.frame(&hidden, next_text, &forced, None);
+                dep = p.depth.frame(&hidden, next_text, &forced, cpu_smp.as_mut());
                 t_cpu = t.elapsed().as_secs_f64() * 1e3;
             }
             frame_no += 1;

@@ -45,6 +45,7 @@
 use mary::models::personaplex::config as cfg;
 use mary::models::personaplex::depth_fast::DepthFast;
 use mary::models::personaplex::depth_gpu::{DepthFmt, DepthGpu, NO_FORCE};
+use mary::models::personaplex::sampling::{Sampler, SamplingConfig};
 use mary::models::personaplex::temporal_metal::WeightFmt;
 use mary::nn::q4;
 use mary::nn::weight_loader::WeightLoader;
@@ -60,7 +61,7 @@ fn pile_arg(args: &[String]) -> Option<&str> {
                 assert!(i + 1 < args.len(), "{} requires a value", args[i]);
                 i += 2;
             }
-            "--synth" | "--skip-cpu" => i += 1,
+            "--synth" | "--skip-cpu" | "--sample" => i += 1,
             flag if flag.starts_with("--") => panic!("unknown flag {flag}"),
             path => {
                 assert!(
@@ -110,10 +111,20 @@ fn main() {
             if synth {
                 assert!(pile.is_none(), "bench --synth does not accept a pile path");
             }
-            bench(fmt, nq, frames, rounds, synth, pile, flag("--skip-cpu"));
+            bench(
+                fmt,
+                nq,
+                frames,
+                rounds,
+                synth,
+                pile,
+                flag("--skip-cpu"),
+                flag("--sample"),
+            );
         }
         "gate" => gate(fmt, frames, require_pile("gate", pile)),
-        m => panic!("unknown mode {m} (dispatch | bench | gate)"),
+        "sample" => sample_gate(fmt, frames, require_pile("sample", pile)),
+        m => panic!("unknown mode {m} (dispatch | bench | gate | sample)"),
     }
 }
 
@@ -209,6 +220,7 @@ fn bench(
     synth: bool,
     pile: Option<&str>,
     skip_cpu: bool,
+    sample: bool,
 ) {
     let t0 = Instant::now();
     let (mut gpu, mut cpu, alpha) = if synth {
@@ -236,6 +248,20 @@ fn bench(
         .collect();
     let free = vec![NO_FORCE; cfg::DEP_Q];
     let none = [None; cfg::DEP_Q];
+    // `--sample` benches the SHIPPING decode config (moshi's temp 0.8 /
+    // top-k 250 / top-p 0.95) rather than greedy. It is not a footnote on the
+    // timing: the host arm pays a 2048-wide sort per step for it and the
+    // device arm pays two threshold bisections, so the arms move by different
+    // amounts and the greedy figure is not a stand-in for either.
+    let scfg = SamplingConfig {
+        temp: 0.8,
+        top_k: 250,
+        top_p: 0.95,
+    };
+    let mut gpu_smp = Sampler::new(scfg, 1234_5678);
+    let mut cpu_smp = Sampler::new(scfg, 1234_5678);
+    let mut uni = [0f32; cfg::DEP_Q];
+    let mode = if sample { "sampled" } else { "greedy" };
 
     // ── GPU ──
     let mut per_frame: Vec<f64> = Vec::new();
@@ -243,7 +269,12 @@ fn bench(
         let mut round: Vec<f64> = Vec::with_capacity(frames);
         for h in &hiddens {
             let t = Instant::now();
-            gpu.frame_submit(h, 0, &free, nq);
+            if sample {
+                gpu_smp.uniforms(&mut uni);
+                gpu.frame_submit_sampled(h, 0, &free, nq, &scfg, &uni);
+            } else {
+                gpu.frame_submit(h, 0, &free, nq);
+            }
             let _ = gpu.tokens(nq); // the frame's single sync
             round.push(t.elapsed().as_secs_f64() * 1e3);
         }
@@ -256,7 +287,7 @@ fn bench(
     let (p50, lo, hi) = stats(per_frame.clone());
     let bytes = gpu.frame_weight_bytes() as f64 * (nq as f64 / cfg::DEP_Q as f64);
     println!(
-        "RESULT depth_gpu {} n_q={nq} : p50 {p50:.2} ms/frame  (min {lo:.2}, max {hi:.2}, n={})  \
+        "RESULT depth_gpu {} {mode} n_q={nq} : p50 {p50:.2} ms/frame  (min {lo:.2}, max {hi:.2}, n={})  \
          {:.2} GB/frame, {:.0} GB/s effective",
         fmt.label(),
         per_frame.len(),
@@ -271,7 +302,8 @@ fn bench(
             let mut round: Vec<f64> = Vec::with_capacity(frames);
             for h in &hiddens {
                 let t = Instant::now();
-                cpu.frame(h, 0, &none, None, None);
+                let smp = if sample { Some(&mut cpu_smp) } else { None };
+                cpu.frame(h, 0, &none, None, smp);
                 round.push(t.elapsed().as_secs_f64() * 1e3);
             }
             if r == 0 {
@@ -281,7 +313,7 @@ fn bench(
         }
         let (c50, clo, chi) = stats(per_frame.clone());
         println!(
-            "RESULT depth_fast cpu-f16 n_q=16 : p50 {c50:.2} ms/frame  (min {clo:.2}, max {chi:.2}, n={})",
+            "RESULT depth_fast cpu-f16 {mode} n_q=16 : p50 {c50:.2} ms/frame  (min {clo:.2}, max {chi:.2}, n={})",
             per_frame.len()
         );
         println!(
@@ -394,6 +426,149 @@ fn gate(fmt: DepthFmt, frames: usize, pile: &str) {
         "RESULT gate {} : codebook-token agreement free-running {free_agree}/{free_total} ({:.2}%)",
         fmt.label(),
         100.0 * free_agree as f64 / free_total as f64
+    );
+}
+
+// ---------------------------------------------------------------------------
+
+/// The host's nucleus for one logit row, exactly as `sampling::sample`
+/// computes it: descending sort, top-k truncation, temperature softmax over
+/// the survivors, then the smallest prefix whose mass reaches `top_p`.
+/// Returns the surviving ids in descending-logit order and their
+/// probabilities renormalized over the kept set.
+fn host_nucleus(logits: &[f32], cfg: &SamplingConfig) -> (Vec<usize>, Vec<f64>) {
+    let mut idx: Vec<usize> = (0..logits.len()).collect();
+    idx.sort_by(|&a, &b| {
+        logits[b]
+            .partial_cmp(&logits[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if cfg.top_k > 0 && cfg.top_k < idx.len() {
+        idx.truncate(cfg.top_k);
+    }
+    let t = cfg.temp as f64;
+    let scaled: Vec<f64> = idx.iter().map(|&i| logits[i] as f64 / t).collect();
+    let m = scaled.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let exps: Vec<f64> = scaled.iter().map(|&x| (x - m).exp()).collect();
+    let sum: f64 = exps.iter().sum();
+    let mut probs: Vec<f64> = exps.iter().map(|&e| e / sum).collect();
+    if (cfg.top_p as f64) < 1.0 {
+        let p = cfg.top_p as f64;
+        let mut cum = 0.0;
+        let mut keep = probs.len();
+        for (n, &pr) in probs.iter().enumerate() {
+            cum += pr;
+            if cum >= p {
+                keep = n + 1;
+                break;
+            }
+        }
+        idx.truncate(keep);
+        probs.truncate(keep);
+    }
+    let kept: f64 = probs.iter().sum();
+    for pr in probs.iter_mut() {
+        *pr /= kept;
+    }
+    (idx, probs)
+}
+
+/// Gate for the DEVICE sampler (`dep_sample_kernel`) against the host
+/// sampler's own definition of the nucleus.
+///
+/// The two cannot be compared draw-for-draw: the host scans its candidates in
+/// descending-probability order and the device scans them in index order, so
+/// the same uniform legitimately selects different ids. Both are valid
+/// multinomials over the SAME distribution, and that distribution is what a
+/// gate can check. Two properties, both cheap and both decisive:
+///
+/// 1. **containment** — every drawn token must lie in the host's top-k ∩
+///    nucleus set. This is the whole of both cuts: a wrong top-k threshold,
+///    a wrong top-p threshold, or a prefix scan that walks off the pruned
+///    weights all break it immediately.
+/// 2. **calibration** — the observed rate of drawing the top-1 token against
+///    the summed host probability of the top-1 token. Argmax-in-disguise
+///    drives this to 1.00, a uniform-over-the-nucleus sampler drives it to
+///    the reciprocal of the mean nucleus size, and only a correctly weighted
+///    draw lands on the expectation.
+fn sample_gate(fmt: DepthFmt, frames: usize, pile: &str) {
+    let scfg = SamplingConfig {
+        temp: std::env::var("TEMP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.8),
+        top_k: std::env::var("TOP_K")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(250),
+        top_p: std::env::var("TOP_P")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.95),
+    };
+    eprintln!(
+        "loading depth_gpu ({}) from {pile} … (temp {} top_k {} top_p {})",
+        fmt.label(),
+        scfg.temp,
+        scfg.top_k,
+        scfg.top_p
+    );
+    let loader = pile_loader(pile);
+    let alpha = out_norm_alpha(&loader);
+    let mut gpu = DepthGpu::load(&loader, fmt);
+    drop(loader);
+
+    let mut smp = Sampler::new(scfg, 1234_5678);
+    let mut rnd = Rnd(0x5A3D);
+    let nq = cfg::DEP_Q;
+    let free = vec![NO_FORCE; cfg::DEP_Q];
+    let mut uni = [0f32; cfg::DEP_Q];
+
+    let (mut contained, mut draws) = (0usize, 0usize);
+    let (mut top1_hits, mut top1_expect) = (0usize, 0f64);
+    let mut size_sum = 0usize;
+    let mut distinct = std::collections::HashSet::new();
+
+    for _ in 0..frames {
+        let h = hidden_like(&mut rnd, Some(&alpha));
+        let text_token = (rnd.next().abs() * 2.0 * cfg::TEXT_CARD as f32) as usize % cfg::TEXT_CARD;
+        smp.uniforms(&mut uni);
+        let toks = gpu.frame_sampled(&h, text_token as u32, &free, nq, &scfg, &uni);
+        let rows = gpu.logits(nq);
+        for s in 0..nq {
+            let row = &rows[s * cfg::CARD..(s + 1) * cfg::CARD];
+            let (idx, probs) = host_nucleus(row, &scfg);
+            let t = toks[s] as usize;
+            contained += idx.contains(&t) as usize;
+            top1_hits += (t == idx[0]) as usize;
+            top1_expect += probs[0];
+            size_sum += idx.len();
+            distinct.insert((s, t));
+            draws += 1;
+        }
+    }
+
+    println!(
+        "RESULT sample {} temp {} top_k {} top_p {} : in-nucleus {contained}/{draws} ({:.2}%), mean nucleus {:.1} of {}",
+        fmt.label(),
+        scfg.temp,
+        scfg.top_k,
+        scfg.top_p,
+        100.0 * contained as f64 / draws as f64,
+        size_sum as f64 / draws as f64,
+        cfg::CARD
+    );
+    println!(
+        "RESULT sample {} : top-1 drawn {top1_hits}/{draws} ({:.1}%) against host expectation {:.1}%  — uniform-over-nucleus would be {:.1}%",
+        fmt.label(),
+        100.0 * top1_hits as f64 / draws as f64,
+        100.0 * top1_expect / draws as f64,
+        100.0 * draws as f64 / size_sum as f64
+    );
+    println!(
+        "RESULT sample {} : {} distinct (step, token) pairs over {draws} draws",
+        fmt.label(),
+        distinct.len()
     );
 }
 

@@ -13,6 +13,13 @@
 //! [`super::depth_fast`] is where the argmax sites become "sample when a
 //! [`SamplingConfig`] is present, else argmax".
 //!
+//! [`super::depth_gpu`] is the exception that proves the RNG rule below: its
+//! argmax lives in a kernel and the token a step draws feeds the next step's
+//! embedding on-device, so it cannot call [`Sampler::token`] at all without
+//! 16 readbacks a frame. It calls [`Sampler::uniforms`] instead — the RNG
+//! still lives here, on the host, and the device only consumes the numbers it
+//! draws.
+//!
 //! **RNG discipline (hard rule):** the RNG is passed IN as `&mut StdRng` seeded
 //! by the caller (`StdRng::seed_from_u64(seed)`), never drawn from wall-clock
 //! or env here. Two runs with the same seed and the same logit stream produce
@@ -168,6 +175,25 @@ impl Sampler {
     /// Sample one token id from a logit row (greedy iff `cfg.is_greedy()`).
     pub fn token(&mut self, logits: &[f32]) -> usize {
         sample(logits, &self.cfg, &mut self.rng)
+    }
+
+    /// Draw one uniform in `[0, 1)` per element of `out`, in order — the
+    /// randomness a DEVICE-side sampler needs, without the RNG leaving the
+    /// host.
+    ///
+    /// [`super::depth_gpu`] does its temperature / top-k / top-p draw in a
+    /// kernel, because reading 16 logit rows back per frame to sample them on
+    /// the host would cost the whole reason for being on the device. This is
+    /// the seam that keeps the module's hard rule intact anyway: the device
+    /// contributes no entropy, it only consumes these numbers, so a seeded
+    /// session is still reproducible and `reseed` still restarts the same
+    /// stream. Drawing them all at frame start (rather than per step) is what
+    /// keeps the frame at one host->device upload.
+    pub fn uniforms(&mut self, out: &mut [f32]) {
+        use rand::Rng;
+        for u in out.iter_mut() {
+            *u = self.rng.r#gen::<f32>();
+        }
     }
 
     /// Restore the RNG to its original seed, so the next session samples the

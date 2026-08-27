@@ -277,15 +277,14 @@ impl DepthArm {
     /// [`NO_FORCE`]-sentinel `[16]` u32 upload on the device — and this is
     /// where that translation lives.
     ///
-    /// **The GPU arm is greedy-only.** Its argmax and the prev-token chain it
-    /// feeds both run on the device (that is what keeps a frame at ONE sync),
-    /// so a host `Sampler` has nowhere to attach: sampling it would need
-    /// either a device-side sampler with host-supplied uniforms or a
-    /// per-step readback, and the readback costs the whole win. Passing a
-    /// sampler here panics rather than silently decoding greedily, because
-    /// greedy audio decode is not a small quality change — it collapses the
-    /// agent to a near-constant code (measured: 3 distinct codebook-0 values
-    /// across 125 frames, rms −74 dB; see `personaplex_listen`).
+    /// Both arms sample. The GPU arm cannot hand its logits to a host
+    /// `Sampler` — its argmax and the prev-token chain live on the device, and
+    /// that is exactly what keeps a frame at ONE sync — so it draws the 16
+    /// uniforms here, from the same seeded RNG, and does the
+    /// temperature/top-k/top-p work in `dep_sample_kernel`. Greedy audio
+    /// decode is not an acceptable substitute: it collapses the agent to a
+    /// near-constant code (measured: 3 distinct codebook-0 values across 125
+    /// frames, rms −74 dB; see `personaplex_listen`).
     pub fn frame(
         &mut self,
         transformer_out: &[f32],
@@ -296,16 +295,27 @@ impl DepthArm {
         match self {
             Self::Cpu(d) => d.frame(transformer_out, text_token, forced, None, sampler),
             Self::Gpu(d) => {
-                assert!(
-                    sampler.is_none(),
-                    "the GPU depth arm (PERSONAPLEX_DEPTH=gpu) is greedy-only: its argmax and \
-                     prev-token chain live on the device. Use the CPU arm for a sampled session \
-                     until depth_gpu grows a device-side sampler."
-                );
                 assert!(text_token >= 0, "text token {text_token}");
                 let forced: [u32; cfg::DEP_Q] =
                     std::array::from_fn(|s| forced[s].map_or(NO_FORCE, |t| t as u32));
-                let out = d.frame(transformer_out, text_token as u32, &forced, cfg::DEP_Q);
+                let out = match sampler {
+                    None => d.frame(transformer_out, text_token as u32, &forced, cfg::DEP_Q),
+                    Some(smp) => {
+                        // The RNG never leaves the host: 16 uniforms are drawn
+                        // here, in step order, and ride up with the frame.
+                        let scfg = *smp.config();
+                        let mut u = [0f32; cfg::DEP_Q];
+                        smp.uniforms(&mut u);
+                        d.frame_sampled(
+                            transformer_out,
+                            text_token as u32,
+                            &forced,
+                            cfg::DEP_Q,
+                            &scfg,
+                            &u,
+                        )
+                    }
+                };
                 std::array::from_fn(|s| out[s])
             }
         }

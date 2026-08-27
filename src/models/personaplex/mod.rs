@@ -8,9 +8,13 @@
 //! input WAV → Mimi encode → LM free-run → agent streams 1..=8 → Mimi decode
 //! → 24 kHz audio out. Realtime lane A: the [`temporal_metal`] q4/Metal
 //! decode build (feature `q4`; gated by `personaplex_rt_probe`). Realtime
-//! lane B: [`depth_fast`] — the Accelerate/NEON CPU depformer predictor
-//! (preloaded per-step weight sets, fixed buffers, optional f16 storage with
-//! f32 accumulate; gate+bench `moshi_depth_probe`). Phase 5: the prompt
+//! lane B: the depformer on either arm — [`depth_fast`], the Accelerate/NEON
+//! CPU predictor (preloaded per-step weight sets, fixed buffers, optional f16
+//! storage with f32 accumulate; gate+bench `moshi_depth_probe`), and [`depth_gpu`], the
+//! cubecl port of the same math with the autoregressive chain AND the sampler
+//! on the device (gate+bench `depth_gpu_probe`, paired against the CPU arm by
+//! `personaplex_rt_probe depthab`). [`pipeline`] picks one via
+//! `PERSONAPLEX_DEPTH`. Phase 5: the prompt
 //! machinery — [`spm`] (pure-Rust SentencePiece unigram text tokenizer, encode
 //! + decode), [`voice_prompt`] (packaged voice `.pt` reader) and [`prompt`]
 //! (system prompts assembled from primary sources instead of golden npys;
