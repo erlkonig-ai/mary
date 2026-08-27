@@ -318,6 +318,43 @@ pub const LIVE_ROW_MASK_DEFAULT: bool = false;
 /// not a second kernel.
 ///
 /// `INK_W4A16_ROWMASK=1` turns it on, so one binary can run both arms.
+///
+/// ## Measured on this part, 2026-08-27: it costs nothing and buys nothing
+///
+/// [`LIVE_ROW_MASK_DEFAULT`] says "OFF until it is measured on this part". It is
+/// measured. `w4a16_swz_grid` free-running at `INK_M=16`, depth 4, four
+/// processes per arm in ALTERNATED order with a memory settle between each, box
+/// locked and idle, GB/s over the weight table per launch:
+///
+/// ```text
+///   grid                    masked   unmasked   delta   threshold
+///   head  [201024, 4096]    163.0     161.8     +0.8%     1.39%
+///   sink  [8192, 4096]      121.6     123.4     -1.5%     1.39%
+/// ```
+///
+/// Both inside the unpaired process-to-process threshold, in opposite
+/// directions. The mask is FREE and it is WORTH NOTHING at either shape, and
+/// that is consistent with everything above rather than a surprise: it removes
+/// 12.9M of 45.1M L1 requests (-28.5%) and 26.5M L2 sectors, and the requests it
+/// removes are the ones that HIT — `l1tex__t_sector_hit_rate` is 82.75% unmasked
+/// against 53.31% masked — so they never reach the path this lane is short of.
+/// The "NOT a bandwidth fix ... recovers no DRAM bytes by construction" above is
+/// confirmed to the sector: `lts__d_sectors_fill_sysmem.sum` is 14486323 masked
+/// against 14481795 unmasked, 0.03% apart.
+///
+/// This is the RE-READ the ceiling correction asked for, and the answer is that
+/// the ceiling correction does not reach it. "A third of the traffic is
+/// unclaimed, so re-read the candidates killed for having nothing left to buy"
+/// assumed the third was BYTES; it is transactions (see the ceiling block), and
+/// the mask does not remove the transactions that count. The kill stands, on the
+/// grounds it always had rather than on the retracted ones.
+///
+/// One methodological note worth more than the result: `ncu` puts the mask at
+/// 6.9% at the head and 5.9% at the sink. That delta does not survive a
+/// free-running clock — under clock-lock the extra L1-hitting requests cost
+/// issue slots, and at full clock they hide inside a memory shadow that is there
+/// either way. Read `ncu` for COUNTS, which are exact, and a free-running box
+/// for TIME.
 /// Turn a launch's `m_live` into the kernel's `(mask_rows, hi_dead, m_live)`.
 ///
 /// `None` is "load every row as before" and is the only shape in which the
@@ -723,6 +760,82 @@ pub fn w4a16_linear_launch<R: Runtime>(
 //
 // Nothing in the live-row mask depends on this: the mask recovers no DRAM bytes
 // by construction and is not a GB/s claim at all.
+//
+// WHERE THE THIRD GOES, MEASURED 2026-08-27. Not to DRAM bytes, not to the
+// arithmetic, and not to occupancy. `w4a16_geom_ceiling` builds the rungs this
+// paragraph was missing — the SAME load stream and the SAME grid with the
+// dequantise and the MMA removed, and the same 25128 per-warp streams read flat
+// instead of through the fragment map — all in one process on the same buffers,
+// same framing as the table above:
+//
+// ```text
+//   arm                         ms     GB/s   % ceil   sect/req    L2 req
+//   coalesced (the 242)      1.831    252.9   100.0          16    3.624M
+//   geom width 16 B/lane     1.853    249.9    98.8          12    3.624M
+//   geom width 4 B/lane      2.021    229.2    90.6           3    4.524M
+//   geom, no A no scales     2.337    176.2    69.7           1    9.495M
+//   geom, no A               2.766    167.4    66.2           1   10.717M
+//   geom, 1 warp/cube        2.934    157.9    62.4           1   11.089M
+//   geom, 8 warps/cube       3.233    143.2    56.6           1   12.676M
+//   real w4a16_linear_swz    2.854    162.3    64.2           1   13.462M
+// ```
+//
+// Four back-to-back processes, and the two BANDS are what to quote rather than
+// any single row: the flat/wide arms land at 90-104% of the coalesced control
+// and the fragment-shaped ones at 56-68%, and the bands do not overlap in any
+// process.
+//
+// Every row moves the SAME 463 MB from DRAM (`lts__d_sectors_fill_sysmem.sum`
+// within 0.1%, the codes-only row excepted and charged only for its codes), so
+// the numerator was never wrong and there is no over-fetch anywhere. What
+// differs is how many TRANSACTIONS carry those bytes, and the `m16n8k16` B
+// fragment map is what multiplies them: it puts four lanes on the same 32-bit
+// word, so a warp-wide load fetches exactly ONE 32-byte sector
+// (`l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld` is 1 for
+// every fragment-shaped arm and 16 for the control), and the lane spends 11.1M
+// L2 requests where the control spends 3.6M for identical bytes.
+//
+// Two candidate explanations die here and both were plausible:
+//
+// * THE ARITHMETIC IS FREE. The last two rows differ by the entire E2M1 ladder,
+//   the scale multiply, the BF16 cast and the MMA — 525 million instructions a
+//   launch, 60% of the stream (`smsp__inst_executed.sum` 870.6M against 345.8M).
+//   The real lane is 2.7% FASTER than the control that does none of it on mins
+//   and 0.4% slower on p50, i.e. inside the ~1.1% paired resolution. Do not read
+//   `sm__throughput` 65.6% as "compute bound": the arithmetic sits inside a
+//   memory shadow that is already there without it.
+// * OCCUPANCY IS WORTH LESS THAN NOTHING. One warp per cube against this part's
+//   24-block-per-SM cap is 24 of 48 warp slots, structurally, whatever the
+//   register file does — and the lane already achieves 98% of that cap.
+//   Widening the cube to 8 warps lifts achieved occupancy 49.3% -> 91.0% at
+//   byte-identical L1 requests and is 10% SLOWER. The request path is saturated
+//   at 24 warps an SM.
+//
+// So the direction this header already pointed at is the one the numbers
+// support — "coalescing needs a cooperative stage through shared memory, which
+// is exactly what one warp per output tile forecloses" — and the width rows put
+// an upper bound on it: 90-99% of the ceiling for the LOAD half. They are not a
+// proposed kernel. They read the right bytes in the right order and hand them to
+// the WRONG LANES; putting them where `m16n8k16` needs them costs shuffles or a
+// shared-memory stage that nothing here measures.
+//
+// AND THE M-PADDING PREDICATE SURVIVES THE RE-READ WITHOUT MOVING. Re-measured
+// free-running at the head, `w4a16_swz_grid` at `INK_M=16`, depth 4, four
+// processes per arm in alternated order with a memory settle between each:
+// 163.0 GB/s masked against 161.8 unmasked (+0.8%), and at the 1024-cube sink
+// 121.6 against 123.4 (-1.5%) — both inside the 1.39% unpaired threshold. The
+// mask removes 12.9M of 45.1M L1 requests (-28.5%) and 26.5M L2 sectors and
+// buys nothing, which is consistent rather than contradictory: the requests it
+// removes are the ones that HIT (L1 sector hit rate 82.75% unmasked against
+// 53.31% masked) and never reach the saturated path. Its own doc said it "is
+// NOT a bandwidth fix" and "recovers no DRAM bytes by construction", and that is
+// confirmed to the sector — 14486323 masked against 14481795 unmasked, 0.03%
+// apart. What the ceiling correction implied — that a third of the BYTES were
+// available and a byte-recovering candidate should be re-read — does not reach
+// it, because the third is transactions and the mask does not remove the
+// transactions that count. (`ncu` shows the mask worth 6.9% at the head and 5.9%
+// at the sink; that delta does not survive a free-running clock, and the free
+// clock is the one production runs at.)
 //
 // A is left alone throughout: at `m_pad = 16` it is 128 KiB, L2-resident, and
 // re-read by every cube.
@@ -1669,14 +1782,61 @@ pub fn swizzle_w4a16_forced() -> bool {
 /// So the answer to "why 4 and not 8" is no longer the register table above. It
 /// was the true reason while depth 8 ran at 37.41% occupancy; with the mask on,
 /// occupancy is equal to two decimal places and depth 8 loses by MORE at the
-/// head than the occupancy gap could ever have explained. What is left is the
-/// schedule itself: at depth 8 the group count halves (`k_tiles / 8`), so the
-/// warp spends longer at the head of each group issuing eight k-tiles of loads
-/// before it can consume any, and the loads it is adding are ones the memory
-/// system was already keeping busy at depth 4. That is a HYPOTHESIS -- nothing
-/// here measures issue stalls -- and it is written down as the next thing to
-/// look at, not as the finding. The finding is narrower and solid: depth 8 is
-/// not register-bound any more, and it is still not worth taking.
+/// head than the occupancy gap could ever have explained.
+///
+/// ## The schedule hypothesis, measured 2026-08-27: half right, and the half
+/// that was wrong was the mechanism
+///
+/// This paragraph used to read "the warp spends longer at the head of each group
+/// issuing eight k-tiles of loads before it can consume any, and the loads it is
+/// adding are ones the memory system was already keeping busy at depth 4",
+/// flagged as a HYPOTHESIS because nothing measured issue stalls. They are
+/// measured now, and the ISSUE half is refuted while the MEMORY half is
+/// confirmed with a mechanism it did not have.
+///
+/// `ncu` 2025.3.1 on `w4a16_linear_swz` launched by `w4a16_swz_grid` at
+/// `INK_M=16`, `INK_MLIVE=1`, `k=4096`, `n=201024` (25128 cubes, the head grid),
+/// one launch profiled, spark2, box locked and idle:
+///
+/// ```text
+///   depth  L1 requests   L2 requests   sect/L2 req   DRAM sectors   long_sb   mio_thr
+///     1     32163840      14961432        1.013        14485808      --        --
+///     4     32163840      13465439        1.145        14482982      4.07      0.00
+///     8     32163840      14963365        1.024        14484408      5.80      0.00
+/// ```
+///
+/// `long_sb` and `mio_thr` are
+/// `smsp__average_warps_issue_stalled_{long_scoreboard,mio_throttle}_per_issue_active`.
+///
+/// THE ISSUE BURST IS NOT WHAT COSTS. `mio_throttle` is 0.00 at both depths,
+/// `lg_throttle` 0.01 against 0.07, `barrier` 0 (one warp per cube has nothing
+/// to sync on), and the instruction counts are within 0.6%. A longer burst of
+/// load instructions at the head of a group does not back the memory-IO queue up
+/// at all on this part.
+///
+/// WHAT COSTS IS LOST MISS-MERGING. The L1 request count is BYTE-IDENTICAL at
+/// all three depths -- 32163840, not approximately -- and so is the DRAM traffic.
+/// What depth 4 buys, and depth 8 gives straight back, is the merging of those
+/// single-sector L1 misses into shared 128-byte L2 requests: depth 4 issues
+/// 13.465M L2 requests against depth 1's 14.961M, and depth 8 lands on 14.963M,
+/// which is depth 1's number to within 0.01%. Depth 8 asks for exactly the same
+/// bytes in 11.1% more transactions, and transactions are the currency this lane
+/// is short of -- see the ceiling block above, where the whole missing third is
+/// denominated in them. Time follows: free-running at the head, four alternated
+/// processes per depth, 161.8 GB/s at depth 4 against 140.6 at depth 8 (-13.1%),
+/// paired row/swz ratios 1.58-1.60 against 1.36-1.39.
+///
+/// Depth 4 therefore buys TWO different things and depth 8 keeps only one: the
+/// memory-level parallelism that depth 1 lacks (depth 1 stalls hardest of the
+/// three despite merging no worse than depth 8), and the miss-merging that
+/// depth 8 loses. Why 8 loses it is not measured here; the shape of the answer
+/// is a finite per-L1 pending-request window, since 8 k-tiles x 5 requests x 24
+/// resident warps is 960 outstanding sector requests an SM against depth 4's
+/// 480. That is the next hypothesis, and it is labelled as one.
+///
+/// The finding is narrower and solid: depth 8 is not register-bound any more, it
+/// is not issue-throttled, it moves identical bytes in identical L1 requests, and
+/// it is still not worth taking.
 ///
 /// This is recorded rather than merely re-killed because the previous kill was
 /// re-opened on good evidence exactly BECAUSE its stated reason had expired. A
