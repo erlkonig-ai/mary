@@ -141,6 +141,13 @@
 #     What is missing is a TICKET: a record of 'asked at T' so the box goes
 #     to the longest waiter rather than to whoever's timer fires first.
 #
+#     AND IT WILL RECUR, because the density is a CONSEQUENCE OF SUCCESS.
+#     Those three agents finished back to back precisely BECAUSE the lock
+#     made them serialise cleanly -- the mechanism that prevents the OOM is
+#     the mechanism that produces the convoy. So starvation is not an
+#     anomaly to be waited out; it is what a busy night looks like when this
+#     file is doing its job, and it will happen again every time it does.
+#
 #     Until that exists, the queue is a PERSON. An arbiter who knows the
 #     ordering can hold a released slot for the starving waiter, which is
 #     what happened this night. That is not a substitute for the ticket; it
@@ -218,6 +225,17 @@ case "$ACTION" in
     hhost=$(sed -n 's/^host=//p' "$INFO")
     htag=$(sed -n 's/^tag=//p' "$INFO");  hst=$(sed -n 's/^beat=//p' "$INFO")
     age=$(( NOW - ${hst:-0} ))
+    # TAKING A LOCK YOU ALREADY HOLD SUCCEEDS. `mkdir` fails when the directory
+    # exists, so without this a caller is refused BY ITSELF -- which breaks the
+    # two cases that matter most for unattended work: a crashed run relaunched
+    # with the same tag (exactly what a restartable job does), and a third party
+    # taking it on your behalf. It is safe because it succeeds only when the
+    # holder IS you, so it can never put two tags on one box. Beat while we are
+    # here, since a re-take is proof of life.
+    if [ "$htag" = "$TAG" ]; then
+      sed -i "s/^beat=.*/beat=$NOW/" "$INFO" 2>/dev/null
+      echo "TAKEN $TAG (already held by you; beat refreshed)"; exit 0
+    fi
     # THERE IS DELIBERATELY NO PID-LIVENESS TEST, and the reason is worth keeping.
     # The first version had one: "a dead pid on this box is a dead lock, no
     # timeout needed", which reads as the more exact answer. It is the more exact
