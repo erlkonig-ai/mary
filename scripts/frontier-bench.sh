@@ -207,6 +207,33 @@ FRONTIER_TPILE=${FRONTIER_TPILE:-converted/inkling-small-complete.pile}
 FRONTIER_REPS=${FRONTIER_REPS:-7}
 FRONTIER_GEN=${FRONTIER_GEN:-64}
 FRONTIER_SPLIT=${FRONTIER_SPLIT:-21}
+# THE CARGO FEATURES ARE NOT OPTIONAL AND NOT A DETAIL. `inkling_forward`
+# declares `required-features = ["inkling-cuda"]`, and the first version of this
+# script built it without them. Verified rather than assumed, because the two
+# possible behaviours differ enormously and only one of them is survivable:
+#
+#   cargo build --release --bin inkling_forward
+#   error: target `inkling_forward` in package `mary` requires the features: `inkling-cuda`
+#
+# An explicitly NAMED `--bin` errors and exits nonzero, which this script would
+# have reported as a build failure -- a wasted reservation, but a loud one. The
+# silent form is `--bins` / `--all-targets`, where cargo SKIPS a target whose
+# required features are unmet and exits 0, producing a build that "succeeds"
+# with no binary. This uses the named form and additionally demands the artifact
+# below, so neither shape can pass for success.
+#
+# The set matches what every other build of this binary on these boxes uses
+# (the boxes' own build.sh, and the other agents' build lines), because a
+# frontier row has to be comparable to the project's other scoreboard numbers
+# and a differently-featured binary is a different binary. `inkling-cuda`
+# already implies `import`; both are named anyway so the row's config column
+# reads as the command someone would actually type.
+#
+# Note what this is NOT: it is not an INK_* switch. Cargo features decide what
+# COMPILES, and the frontier's "no switch set" rule is about what the binary
+# is TOLD AT RUNTIME. Choosing features so the thing links is not cherry-picking
+# an arm.
+FRONTIER_FEATURES=${FRONTIER_FEATURES:-inkling-cuda,cuda-backend,import}
 GB10_LOCK_TIMEOUT_S=${GB10_LOCK_TIMEOUT_S:-5400}   # gb10-lock.sh reads this
 FRONTIER_REFRESH_S=${FRONTIER_REFRESH_S:-300}      # heartbeat while we hold the boxes
 FRONTIER_LOCK_WAIT_S=${FRONTIER_LOCK_WAIT_S:-7200} # ceiling on waiting for the reservation
@@ -440,12 +467,18 @@ if [ "${1:-}" = "--run" ]; then
   if [ "$(cat "$BIN.key" 2>/dev/null)" = "$BUILD_KEY" ] && [ -x "$BIN" ]; then
     say "  build: the staged binary is already keyed $BUILD_KEY -- not rebuilding"
   else
-    say "  build: cargo build --release --bin inkling_forward   (key $BUILD_KEY)"
-    if ! ( cd "$WT" && PATH="$HOME/.cargo/bin:$PATH" cargo build --release --bin inkling_forward ) > "$BUILDLOG" 2>&1; then
+    say "  build: cargo build --release --bin inkling_forward --features $FRONTIER_FEATURES   (key $BUILD_KEY)"
+    if ! ( cd "$WT" && PATH="$HOME/.cargo/bin:$PATH" cargo build --release --bin inkling_forward --features "$FRONTIER_FEATURES" ) > "$BUILDLOG" 2>&1; then
       say "  BUILD FAILED -- tail of $BUILDLOG:"
       tail -25 "$BUILDLOG" | sed 's/^/      /'
       die "build failed; nothing measured, nothing recorded"
     fi
+    # A zero exit code is not evidence that anything was built -- under
+    # `--bins`/`--all-targets` cargo skips unbuildable targets and exits 0, and
+    # a future edit to this line is one word away from that form. Demand the
+    # artifact itself rather than trusting the status.
+    [ -x "$WT/target/release/inkling_forward" ] \
+      || die "cargo exited 0 but produced no binary at $WT/target/release/inkling_forward -- check --features $FRONTIER_FEATURES against the [[bin]] required-features in Cargo.toml"
     cp -f "$WT/target/release/inkling_forward" "$BIN" || die "cannot stage the built binary"
     printf '%s\n' "$BUILD_KEY" > "$BIN.key"
     say "  build: ok ($BUILDLOG)"
@@ -506,7 +539,7 @@ if [ "${1:-}" = "--run" ]; then
   # ---- 8. the row ------------------------------------------------------
   med()    { sort -n | awk '{v[NR]=$1} END{if(NR==0){print "-";exit} if(NR%2)printf "%.4f\n",v[(NR+1)/2]; else printf "%.4f\n",(v[NR/2]+v[NR/2+1])/2}'; }
   spread() { sort -n | awk '{v[NR]=$1} END{if(NR==0){print "-";exit} m=(NR%2)?v[(NR+1)/2]:(v[NR/2]+v[NR/2+1])/2; printf "%.2f\n",100.0*(v[NR]-v[1])/m}'; }
-  CONFIG="per-decode-step/2node/split$FRONTIER_SPLIT/ctx3732/GEN$FRONTIER_GEN/INK_KV=1/overlap/order-fixed/median-of-n-process-reps"
+  CONFIG="per-decode-step/2node/split$FRONTIER_SPLIT/ctx3732/GEN$FRONTIER_GEN/INK_KV=1/overlap/order-fixed/median-of-n-process-reps/features=$FRONTIER_FEATURES"
 
   emit_row() {  # emit_row <arm> <kind> <env>
     local arm=$1 kind=$2 envs=$3
