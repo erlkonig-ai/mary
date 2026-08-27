@@ -88,18 +88,124 @@
 //! bytes are not the problem and the arithmetic is not the problem: the lane
 //! spends 11.1M L2 requests where the control spends 3.6M for the same bytes.
 //!
-//! WHAT THIS DOES NOT SAY. `geom width` is not a proposed kernel. It reads the
-//! right bytes in the right order and hands them to the WRONG LANES — putting
-//! them where `m16n8k16` needs them costs shuffles or a shared-memory stage that
-//! nothing here measures. Read the width rows as an upper bound on what a
-//! cooperative stage could reach for the LOAD half, which is the direction
-//! `w4a16gemm`'s own header pointed at ("coalescing needs a cooperative stage
-//! through shared memory, which is exactly what one warp per output tile
-//! forecloses") and which this prices for the first time.
+//! ## What the shuffle rungs measured (spark2 AND spark, 2026-08-27, both boxes
+//! locked and idle)
+//!
+//! Same framing as above -- GB/s over the 0.431 GiB weight table THAT ARM READS,
+//! PER LAUNCH, one launch and one sync each, `m_pad = 16` with one live row, p50
+//! of 10 warm reps of 12, arms round-robined with the order reversed on odd
+//! reps. Three processes a box; the ms/GB/s columns are the spark2 median of
+//! three, and spark agrees on every ratio while sitting ~8% slower in absolute
+//! terms (its coalesced control is 218-223 GB/s against spark2's 239-240).
+//!
+//! ```text
+//!   arm                          ms     GB/s   % of coalesced   sect/req    L2 req   reg
+//!   coalesced (the 242)       1.928    240.2       100.0            16      3.623M    30
+//!   geom width 16 B/lane      2.044    226.6        94.3            12      3.625M    80
+//!   geom width 4 B/lane       2.021    229.1        95.4             3      4.530M    48
+//!   width 16 B/lane + shuffle 1.953    237.1        98.7            12      3.628M    44
+//!   width 4 B/lane + shuffle  2.010    230.4        95.9             3      4.636M    38
+//!   geom, no A                2.918    158.7        66.1             1     10.539M    37
+//!   geom, 1 warp/cube         3.001    154.3        64.2             1     11.097M    48
+//!   real w4a16_linear_swz     3.216    144.0        60.0             1     13.406M    73
+//! ```
+//!
+//! The `real` row is the noisiest here: its p50 moves 2.98-3.31 ms between
+//! processes while its min sits at 2.86-3.01. Nothing below is quoted against
+//! it -- the ratios are against `geom, 1 warp/cube`, which is the same load
+//! stream without the math, and against the coalesced control.
+//!
+//! THE REDISTRIBUTION IS FREE, and that is the whole answer. The paired
+//! within-process ratio -- every arm run in one process on one pair of buffers,
+//! ratioed rep by rep, which is the only figure here that resolves ~1.1% -- is
+//! the p50 of nine processes across both boxes:
+//!
+//! ```text
+//!   shuffle cost, 4 B/lane   (arm 8 / arm 4)   1.011   (0.994 .. 1.052)
+//!   shuffle cost, 16 B/lane  (arm 9 / arm 5)   1.001   (0.940 .. 1.028)
+//! ```
+//!
+//! Both sit ON the harness's resolution, not above it. The saturated shuffle
+//! count is 768 warp-shuffles a lane per n-tile in BOTH arms (19.3M warp
+//! instructions a launch, `smsp__inst_executed.sum` 67.1M against the flat arm's
+//! 39.7M at 4 B/lane and 48.4M against 9.7M at 16 B/lane) and it buys no time
+//! back and costs none. It lands in the same memory shadow the entire
+//! dequantise and MMA already live in.
+//!
+//! IT COSTS NO TRANSACTIONS EITHER, which is the part an instruction count would
+//! have missed. `l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum` and `sect/req`
+//! are IDENTICAL between each flat arm and its shuffle arm (4.825M at 3.00,
+//! 1.206M at 12.00) and `lts__d_sectors_fill_sysmem.sum` is 463.7 MB for every
+//! arm within 0.2%. The shuffle moves bytes that are already in registers.
+//!
+//! AND IT COSTS NO REGISTERS. `launch__registers_per_thread` is 38 for the 4
+//! B/lane shuffle arm and 44 for the 16 B/lane one, against 48 for the
+//! fragment-shaped arm and 73 for the shipped lane; `launch__occupancy_limit_
+//! blocks` stays 24 and achieved occupancy 49.6%, unchanged. The staged
+//! coalesced words are the COMPRESSED form -- four words hold what sixteen
+//! fragment words would -- so shuffling out of a staging register just-in-time
+//! is a smaller live set than holding the fragments, not a larger one. That is
+//! evidence about the MACHINERY, not a measurement of the shipped lane: these
+//! rungs carry no A operand, no accumulator and no MMA. What it says is that
+//! the shuffle path costs fewer registers than the fragment-shaped load path it
+//! would replace (38 against 48, like for like), so the ~80-register ceiling is
+//! not the thing that stops this.
+//!
+//! NOR DOES IT SERIALISE AGAINST THE LOADS. `lg_throttle` per issue-active
+//! COLLAPSES when the shuffles are added -- 18.33 to 0.24 at 4 B/lane and 176.98
+//! to 0.27 at 16 B/lane -- with `barrier` 0.00 everywhere and
+//! `math_pipe_throttle` 0.05 and 0.01. The shuffles give the warp something to
+//! issue instead of queueing loads.
+//!
+//! WHAT IT BUYS, same paired p50 across the nine processes: the 4 B/lane
+//! redistributed arm runs at 0.70 of the fragment-shaped arm and the 16 B/lane
+//! one at 0.66 -- 1.43x and 1.52x. Against the coalesced control they are 1.07
+//! and 1.01, so the wide redistributed arm is within 1% of the 242 ceiling
+//! while reading the same bytes the lane reads.
+//!
+//! THIS IS THE OPPOSITE OF THE DEPTH EXPERIMENT, and the two must not be
+//! conflated. Load DEPTH issues MORE requests EARLIER, and depth 8 failed by
+//! losing miss-merging (14.96M L2 requests against depth 4's 13.47M, landing on
+//! depth 1's number). Width issues FEWER, WIDER requests: the 16 B/lane shuffle
+//! arm's 3.628M L2 requests are the lowest of any arm here and equal the
+//! coalesced control's 3.625M, for the same DRAM bytes.
+//!
+//! WHAT THE WIDTH ROWS DID NOT SAY, AND THE SHUFFLE ROWS DO. `geom width` is not
+//! a proposed kernel: it reads the right bytes in the right order and hands them
+//! to the WRONG LANES. The `+ shuffle` arms add exactly the missing step and
+//! nothing else — the coalesced load, then a warp shuffle per fragment word, then
+//! discard — so `+ shuffle` over `width` is the PRICE OF THE REDISTRIBUTION and
+//! `+ shuffle` over `geom, 1 warp/cube` is what it BUYS.
+//!
+//! No shared memory and no barrier, because the lane runs ONE WARP PER CUBE:
+//! there is nothing to synchronise on (the stall decomposition reads `barrier`
+//! 0), so a warp that loads coalesced can redistribute to its own lanes with
+//! register-to-register shuffles. `cubecl` lowers `plane_shuffle` to
+//! `__shfl_sync` on the CUDA dialect; `MmaDefinition::load_matrix` (`ldmatrix`)
+//! is also reachable but requires the operand to be in SHARED memory, so it
+//! would need the stage the shuffle path avoids.
+//!
+//! THE SHUFFLE COUNT IS EXACTLY SATURATED, not a guess. One warp step at
+//! `words` u32 per lane covers `2 * words` `(n_tile, k_tile)` blocks; the
+//! `m16n8k16` B map gives lane `l` column `l >> 2` and elements
+//! `2 * (l & 3) + 8 * i`, so lane `l` wants two words out of each block —
+//! `4 * words` words a step. Each shuffle instruction delivers one word to one
+//! lane and each word is wanted by four lanes, so `4 * words` shuffles a step is
+//! the floor and the arms issue exactly that. At `words = 1` the source lanes
+//! are the true ones (`col`, `col + 8`, `col + 16`, `col + 24`) and the arm is
+//! the real redistribution over the SHIPPED swizzle. At `words = 4` the current
+//! swizzle puts all sixteen wanted words in one vector component, which sixteen
+//! shuffles cannot reach; that arm issues the saturated count over a
+//! representative source-lane pattern, so it prices a 16 B/lane redistribution
+//! ASSUMING A RE-SWIZZLE that spreads the wanted words across components. Read
+//! row 8 as achievable today and row 9 as achievable after a format change.
 //!
 //! Timing only, deliberately: every arm reads the same bytes in the same order
 //! as the lane it stands in for, so an uninitialised table exercises the
 //! identical access pattern. Numerics are `w4a16_swz_probe`'s job.
+//!
+//! `INK_GC_ORDER=fwd` pins the arm order to the committed protocol; the default
+//! reverses it on odd reps so no arm keeps the same slot in the rep.
 //!
 //! `INK_GC_N` / `INK_GC_K` set the shape (default the head's `[201024, 4096]`),
 //! `INK_GC_M` the padded rows (default 16), `INK_GC_MLIVE` the live ones
@@ -285,9 +391,15 @@ pub fn swz_width_stream<S: Scalar, NB: Size, NS: Size>(
     #[comptime] planes: usize,
     #[comptime] words: usize,
     #[comptime] selems: usize,
+    #[comptime] redist: bool,
 ) {
     let lane = UNIT_POS_PLANE as usize;
     let n_tile = CUBE_POS_Y as usize * comptime!(planes) + UNIT_POS_Y as usize;
+
+    // The n column this lane's B fragment sits in: `col = lane >> 2`, the closed
+    // form `mma16_frag_map` dumped off sm_121a. It is the whole reason four lanes
+    // land on one word, and it is also what makes the redistribution a shuffle.
+    let col = UNIT_POS_PLANE / 4;
 
     // Codes: `SWZ_BLOCK_CODES / 4` words per k-tile block, `k_tiles` of them
     // contiguous for this n-tile.
@@ -298,7 +410,24 @@ pub fn swz_width_stream<S: Scalar, NB: Size, NS: Size>(
 
     let mut acc = u32::new(0i64);
     for j in 0..steps {
-        acc += b[base + j * 32 + lane][0];
+        let v = b[base + j * 32 + lane];
+        if comptime!(redist) {
+            // One warp step covers `32 * words` words = `2 * words` k-tile
+            // blocks, and every lane needs two words out of each of them
+            // (`i = 0, 1` of the m16n8k16 B fragment). That is `4 * words`
+            // words a lane, so `4 * words` shuffles a step -- exactly
+            // saturated, because each shuffle instruction delivers one word to
+            // one lane and each word is wanted by four lanes.
+            #[unroll]
+            for comp in 0..words {
+                #[unroll]
+                for r in 0..4usize {
+                    acc += plane_shuffle(v[comp], col + (8 * r) as u32);
+                }
+            }
+        } else {
+            acc += v[0];
+        }
     }
 
     // Scales: `NTILE` E4M3 bytes per k-tile block, likewise contiguous.
@@ -306,7 +435,21 @@ pub fn swz_width_stream<S: Scalar, NB: Size, NS: Size>(
     let ssteps = comptime!(svecs / 32);
     let sbase = n_tile * svecs;
     for j in 0..ssteps {
-        acc += u32::cast_from(f32::cast_from(b_sc[sbase + j * 32 + lane][0]));
+        let sv = b_sc[sbase + j * 32 + lane];
+        if comptime!(redist) {
+            // One step covers `4 * selems` k-tile blocks and every lane needs
+            // one scale out of each: `4 * selems` shuffles, same shape.
+            #[unroll]
+            for comp in 0..selems {
+                let s = u32::cast_from(f32::cast_from(sv[comp]));
+                #[unroll]
+                for r in 0..4usize {
+                    acc += plane_shuffle(s, col + (8 * r) as u32);
+                }
+            }
+        } else {
+            acc += u32::cast_from(f32::cast_from(sv[0]));
+        }
     }
 
     if acc == u32::new(0x5AFE_5AFEi64) {
@@ -314,6 +457,7 @@ pub fn swz_width_stream<S: Scalar, NB: Size, NS: Size>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn swz_width_launch(
     client: &ComputeClient<Rt>,
     b: &Handle,
@@ -323,6 +467,7 @@ fn swz_width_launch(
     n: usize,
     words: usize,
     scale_elems: usize,
+    redist: bool,
 ) {
     let k_tiles = k / KTILE;
     let wpb = SWZ_BLOCK_CODES / 4;
@@ -342,6 +487,7 @@ fn swz_width_launch(
             1,
             words,
             scale_elems,
+            redist,
         )
     };
 }
@@ -452,19 +598,38 @@ fn main() {
     );
 
     let names = [
-        "coalesced (242 control)",
-        "geom, 1 warp/cube      ",
-        "geom, N warps/cube     ",
-        "real w4a16_linear_swz  ",
-        "geom width 4 B/lane    ",
-        "geom width 16 B/lane   ",
-        "geom, no A             ",
-        "geom, no A no scales   ",
+        "coalesced (242 control)  ",
+        "geom, 1 warp/cube        ",
+        "geom, N warps/cube       ",
+        "real w4a16_linear_swz    ",
+        "geom width 4 B/lane      ",
+        "geom width 16 B/lane     ",
+        "geom, no A               ",
+        "geom, no A no scales     ",
+        "width 4 B/lane + shuffle ",
+        "width 16 B/lane + shuffle",
     ];
     let mut per_rep: Vec<Vec<f64>> = vec![Vec::new(); names.len()];
 
+    // Arm ORDER is alternated rep to rep unless `INK_GC_ORDER=fwd` pins it. The
+    // committed table was taken in a fixed order, which leaves every arm's
+    // position in the rep confounded with the arm; reversing on odd reps
+    // balances that out without giving up the paired within-process delta,
+    // which is where this harness's ~1.1% resolution lives. `fwd` reproduces
+    // the committed protocol exactly.
+    let order_fwd = std::env::var("INK_GC_ORDER")
+        .map(|v| v == "fwd")
+        .unwrap_or(false);
+    let fwd: Vec<usize> = (0..names.len()).collect();
+    let rev: Vec<usize> = (0..names.len()).rev().collect();
+
     for _rep in 0..reps {
-        for arm in [0usize, 1, 2, 3, 4, 5, 6, 7] {
+        let sched: &[usize] = if order_fwd || _rep % 2 == 0 {
+            &fwd
+        } else {
+            &rev
+        };
+        for &arm in sched {
             let t0 = Instant::now();
             match arm {
                 0 => {
@@ -501,11 +666,19 @@ fn main() {
                     let _ = future::block_on(client.sync());
                 }
                 4 => {
-                    swz_width_launch(&client, &b, &b_sc, &dst, k, n, 1, 1);
+                    swz_width_launch(&client, &b, &b_sc, &dst, k, n, 1, 1, false);
                     let _ = future::block_on(client.sync());
                 }
                 5 => {
-                    swz_width_launch(&client, &b, &b_sc, &dst, k, n, 4, 4);
+                    swz_width_launch(&client, &b, &b_sc, &dst, k, n, 4, 4, false);
+                    let _ = future::block_on(client.sync());
+                }
+                8 => {
+                    swz_width_launch(&client, &b, &b_sc, &dst, k, n, 1, 1, true);
+                    let _ = future::block_on(client.sync());
+                }
+                9 => {
+                    swz_width_launch(&client, &b, &b_sc, &dst, k, n, 4, 4, true);
                     let _ = future::block_on(client.sync());
                 }
                 6 => {
@@ -520,7 +693,7 @@ fn main() {
                     );
                     let _ = future::block_on(client.sync());
                 }
-                _ => {
+                3 => {
                     let o = w4a16_linear_swz_launch::<Rt>(
                         &client,
                         &a,
@@ -536,12 +709,15 @@ fn main() {
                     let _ = future::block_on(client.sync());
                     drop(o);
                 }
+                _ => unreachable!("arm {arm} has no launch"),
             }
             per_rep[arm].push(t0.elapsed().as_secs_f64());
         }
     }
 
-    println!("  arm                        p50 ms      min      max      GB/s     % of coalesced");
+    println!(
+        "  arm                          p50 ms      min      max      GB/s     % of coalesced"
+    );
     let warm: Vec<Vec<f64>> = per_rep.iter().map(|v| v[2..].to_vec()).collect();
     let (base, _, _) = stats(&warm[0]);
     for (i, nm) in names.iter().enumerate() {
@@ -555,6 +731,36 @@ fn main() {
             100.0 * base / p50
         );
     }
+    // THE PAIRED DELTA, which is the only figure here that resolves ~1.1%.
+    // Every rep runs every arm inside one process on one pair of buffers, so a
+    // rep-by-rep ratio cancels the drift that makes the absolute rows move 5-10%
+    // between processes. `a / b` is the cost of what `a` does and `b` does not.
+    let pair = |a: usize, b: usize| -> (f64, f64, f64) {
+        let r: Vec<f64> = warm[a]
+            .iter()
+            .zip(warm[b].iter())
+            .map(|(x, y)| x / y)
+            .collect();
+        stats(&r)
+    };
+    println!("\n  paired within-process ratio (per rep, then p50 / min / max)");
+    for (lbl, a, b) in [
+        ("shuffle cost, 4 B/lane   (8/4)", 8usize, 4usize),
+        ("shuffle cost, 16 B/lane  (9/5)", 9, 5),
+        ("4 B+shfl vs no-A fragment(8/6)", 8, 6),
+        ("16 B+shfl vs no-A frag   (9/6)", 9, 6),
+        ("4 B+shfl vs coalesced    (8/0)", 8, 0),
+        ("16 B+shfl vs coalesced   (9/0)", 9, 0),
+        ("4 B+shfl vs fragment map (8/1)", 8, 1),
+        ("16 B+shfl vs fragment map(9/1)", 9, 1),
+        ("4 B+shfl vs real lane    (8/3)", 8, 3),
+        ("width 4 B vs fragment map(4/1)", 4, 1),
+        ("width 16 B vs coalesced  (5/0)", 5, 0),
+    ] {
+        let (p50, lo, hi) = pair(a, b);
+        println!("    {lbl}   {p50:7.4}   {lo:7.4}   {hi:7.4}");
+    }
+
     println!(
         "\nframing: GB/s over the {:.3} GiB weight table of ONE [{n}, {k}] operand, per LAUNCH, \
          one launch and one sync each, p50 of {} warm reps of {reps}, GB10. Not a step figure.",
