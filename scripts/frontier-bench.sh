@@ -255,6 +255,27 @@ PAIRED_SD=1.45
 # two independent medians from two different runs -- so its resolution is the
 # wider one, and that is the one the verdict uses.
 UNPAIRED_SD=1.30
+# MEASURED, and the series produced it by accident on its first night. The
+# first three rows -- 79d3c24, 0c333b3, 60b703b -- all measure decode code
+# that is SEMANTICALLY IDENTICAL: `git diff <a> <b> -- src` is zero
+# non-comment lines across both hops. They read 11.2850, 11.3460 and 11.2200
+# tok/s, a range of 1.12% of the minimum, and the middle one verdicted
+# +0.54% while the last verdicted -1.11%, both inside-resolution.
+#
+# So the EMPIRICAL noise floor across separate runs of unchanged code is
+# ~1.12%, and the derived threshold of 1.39% sits just above it. That is the
+# validation this number could not otherwise get: a threshold derived from a
+# per-rep sd is a model, and three rows of unchanged code is the model being
+# checked against the world. Keep taking `kind=repeat` rows -- they are the
+# only thing in the series that can separate a real gain from box drift.
+#
+# ONE EXPECTATION THAT WAS WRONG, recorded so nobody plans around it: a
+# comment-only change to src does NOT produce a byte-identical binary. All
+# three rows carry different bin_sha256 (55d55aea, 317c341e, 516ec3fe)
+# despite zero semantic change, because line numbers reach the binary through
+# panic locations and debug info even in release. A drift row cannot be
+# identified by matching the binary hash; it has to be identified by diffing
+# the source, which is what the paragraph above does.
 
 die() { printf '\n!! %s\n\n' "$*" >&2; exit 2; }
 say() { printf '%s\n' "$*"; }
