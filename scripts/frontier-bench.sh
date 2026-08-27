@@ -81,8 +81,11 @@
 #                    remembered PAIRED_SD constant. A run that is quieter than
 #                    the night PAIRED_SD was measured on then resolves better
 #                    than 1.1%, and one that is noisier resolves worse, which
-#                    is the honest answer in both directions.
-#                    `vs=paired:frontier@n=<paired reps>`.
+#                    is the honest answer in both directions. The VERDICT is
+#                    gated on the run's arm order -- see the next section -- so
+#                    under this script's `--order fixed` it reads
+#                    `order-confounded` rather than a direction.
+#                    `vs=paired:frontier@n=<paired reps>[+order-<order>]`.
 #
 # delta IS THE MEAN OF THE PAIRED RATIOS, NOT THE DIFFERENCE OF THE TWO ROWS'
 # MEDIANS. They are different estimators and only the first has the sd printed
@@ -98,6 +101,90 @@
 # `inside-resolution` and NEVER `better`/`worse`; that is one comparison in one
 # awk expression on both paths, so there is no path on which a null can be
 # reported as movement.
+#
+# ---------------------------------------------------------------------------
+# A `fixed`-ORDER PAIRED COMPARISON IS BIASED AGAINST THE LATER ARM, AND THAT
+# IS WHY AN EXPERIMENTAL VERDICT HERE READS `order-confounded`
+#
+# `pipe-bench.sh`'s own header says it, lines 48-50:
+#
+#     --order abba      reverse the arm order on even reps, so linear box drift
+#                       cancels between the arms instead of landing on the one
+#                       that always goes second. `fixed` is the old behaviour.
+#
+# This script runs `--order fixed` (see THE ORDER THIS SCRIPT RUNS below), so in
+# a multi-arm run the frontier arm goes first in EVERY rep and the experimental
+# arm goes second in EVERY rep. Whatever drift accumulates inside a rep lands on
+# the experimental arm, every time, in the same direction. That is a systematic
+# bias sitting inside every one of the paired ratios.
+#
+# AND A TIGHTER RESOLUTION MAKES IT WORSE, NOT BETTER. This is the part worth
+# naming, because it will keep happening. A systematic bias shifts the MEAN
+# without inflating the SD -- a consistent bias is consistent -- so t = mean /
+# (sd/sqrt(n)) gets LARGER, not smaller. Deriving the resolution from the run's
+# own ratios made this instrument more sensitive, and the first thing the extra
+# sensitivity detected was the confound rather than the effect. Tightening a
+# resolution against an unrandomised design converts bias into significance.
+#
+# It nearly shipped that way. On `192a366` -- `--order fixed`, `allon` second in
+# all 7 reps -- the paired mean was -0.96% against a derived 0.69%, i.e. t =
+# -3.37 at df 6, p ~ 0.015, and the first version of this code verdicted `worse`.
+# It is not a regression: its sign cannot be separated from the order bias, and
+# the three flags that arm carried (INK_FLASH_FP4, INK_SINK_DOWN_FUSE,
+# INK_W4A16_ROWMASK) each have prior measurements and none of them predicts a
+# step-level loss. Separating the two needs an `abba` run, not a re-reading of
+# this one.
+#
+# SO THE GATE IS ON THE VERDICT, NOT ON THE NUMBER. Under any order but `abba`,
+# an experimental row still carries its delta and its derived resolution -- both
+# are real, both are useful, and the delta is exactly what an `abba` run would
+# be compared against -- but `verdict` reads `order-confounded` and `vs` carries
+# `+order-fixed`. It is set in the same awk expression that would otherwise
+# decide `better`/`worse`, so there is no path that can assert a direction from
+# an unbalanced design.
+#
+# `order-confounded` REPLACES `inside-resolution` TOO, deliberately. A bias can
+# mask a real difference as easily as it can manufacture one, so under `fixed`
+# the null is no more assertable than the direction. The row still carries
+# delta and res, so a reader who wants |delta| <= res can see it.
+#
+# AND IT IS SYMMETRIC EVEN THOUGH THE BIAS IS BELIEVED TO POINT ONE WAY. The
+# tempting shortcut is "the bias only hurts a positive delta, so let `better`
+# through" -- refused, because what is established is that the later arm carries
+# the within-rep drift, not that the drift's SIGN is the same on every night.
+# A one-sided allowance is right until the night it is not, and that night looks
+# exactly like a result.
+#
+# THE ORDER IS READ OUT OF THE RUN, NOT ASSUMED FROM THE INVOCATION BELOW:
+# `pipe-bench.sh` prints `order=<x>` in the CONFIG line of its own output, which
+# is this script's run log, and that is what actually governed the reps. An
+# unparseable one is `order-unknown` and gates exactly as `fixed` does, because
+# an order we cannot read is an order we cannot certify as balanced.
+#
+# ---------------------------------------------------------------------------
+# THE ORDER THIS SCRIPT RUNS, AND WHY IT IS NOT `abba`
+#
+# `abba` is what would produce an unconfounded experimental verdict, and this
+# script deliberately does NOT use it, because switching would silently change
+# what the FRONTIER row means -- and the scoreboard series' comparability across
+# rows is worth more than one experimental arm's verdict.
+#
+# Under `fixed` the frontier arm is first in every rep of every run, single-arm
+# or multi-arm. That is the constant the series is built on. `pipe-bench.sh`
+# implements `abba` by reversing the whole arm list on even reps, so in a 2-arm
+# run it would put the FRONTIER arm second on reps 2, 4 and 6 -- giving it the
+# within-rep drift on half its reps, in exactly the way this section says biases
+# an arm. Every frontier row before that was measured frontier-first, and the
+# row-to-row comparison that the series IS would then straddle the change with
+# nothing in the row to show it. Rows measured under different orders are not
+# one series.
+#
+# So: `fixed` stays, and a multi-arm run's experimental verdict is gated instead.
+# TO GET AN UNCONFOUNDED ARM COMPARISON, run `pipe-bench.sh` directly with
+# `--order abba` -- that is the tool for a deliberate A/B, it has no series to
+# keep comparable, and its summary prints the delta with the resolution beside
+# it. This script is the scoreboard, and the scoreboard's job is one arm
+# measured the same way every time.
 #
 # `vs` IS COLUMN 19 AND IT IS APPENDED AT THE END, because `bench/frontier.tsv`
 # is an append-only series that later scripts read by field position. Columns
@@ -647,6 +734,14 @@ if [ "${1:-}" = "--run" ]; then
   sleep "$FRONTIER_COOLDOWN_S"
   gate_both || { say "REFUSING: a box went busy during the build. Nothing recorded."; exit 3; }
 
+  # THE ORDER, IN ONE PLACE, AND DELIBERATELY NOT A PARAMETER. `abba` would
+  # give a multi-arm run an unconfounded experimental verdict and would ALSO
+  # move the frontier arm to second on half its reps, which changes what the
+  # frontier row means and breaks the series' comparability with every row
+  # before it -- see THE ORDER THIS SCRIPT RUNS in the header. It is written
+  # `FRONTIER_ORDER=fixed`, not `${FRONTIER_ORDER:-fixed}`, so an exported
+  # variable cannot quietly redefine the scoreboard from outside.
+  FRONTIER_ORDER=fixed
   ARMS=("frontier:|")
   # SEVERAL experimental arms, split on ';'. This is about RESOLUTION, not
   # convenience. Arms inside one invocation are interleaved by `pipe-bench.sh`,
@@ -672,11 +767,11 @@ if [ "${1:-}" = "--run" ]; then
     [ ${#EXTRA_ARMS[@]} -gt 0 ] && ARMS+=("${EXTRA_ARMS[@]}")
   fi
   say "  arms: ${ARMS[*]}"
-  say "  scoreboard lane: reps $FRONTIER_REPS, GEN $FRONTIER_GEN, split $FRONTIER_SPLIT, ctx 3732, INK_KV=1, --overlap, --order fixed"
+  say "  scoreboard lane: reps $FRONTIER_REPS, GEN $FRONTIER_GEN, split $FRONTIER_SPLIT, ctx 3732, INK_KV=1, --overlap, --order $FRONTIER_ORDER"
   HBIN="$BIN" TBIN="$BIN" HPILE="$HOME/$FRONTIER_HPILE" TPILE="$HOME/$FRONTIER_TPILE" \
   TAILHOST="$FRONTIER_TAIL_IP" REMOTE_USER="$FRONTIER_USER" SPLIT="$FRONTIER_SPLIT" \
     timeout --foreground -k 30 "$FRONTIER_RUN_TIMEOUT_S" \
-    bash "$WT/scripts/pipe-bench.sh" --overlap --order fixed \
+    bash "$WT/scripts/pipe-bench.sh" --overlap --order "$FRONTIER_ORDER" \
       "$TAG" "$FRONTIER_REPS" "$FRONTIER_GEN" "$IDS" "${ARMS[@]}" > "$RUNLOG" 2>&1
   RUNRC=$?
   if [ "$RUNRC" = 124 ] || [ "$RUNRC" = 137 ]; then
@@ -719,10 +814,27 @@ if [ "${1:-}" = "--run" ]; then
   # arm's failures on every arm's row. They are computed per arm now, in
   # `arm_notes` below, which emit_row calls for the arm it is writing.
 
+  # THE ORDER THE RUN ACTUALLY USED, read out of `pipe-bench.sh`'s own CONFIG
+  # line (`... overlap=1 order=fixed settle=1 ...`) rather than assumed from the
+  # invocation above. The invocation is what we asked for; this is what governed
+  # the reps, and it is the one that decides whether a paired verdict is
+  # assertable. FAILS CLOSED: an unparseable order is `unknown`, which gates
+  # exactly as `fixed` does, because an order we cannot read is an order we
+  # cannot certify as balanced.
+  RUN_ORDER=$(sed -n 's/.*[[:space:]]order=\([A-Za-z]*\).*/\1/p' "$RUNLOG" | head -1)
+  [ -n "$RUN_ORDER" ] || RUN_ORDER=unknown
+  if [ "$RUN_ORDER" != "$FRONTIER_ORDER" ]; then
+    say "  !! the run reports order=$RUN_ORDER but this script asked for $FRONTIER_ORDER."
+  fi
+
   # ---- 8. the row ------------------------------------------------------
   med()    { sort -n | awk '{v[NR]=$1} END{if(NR==0){print "-";exit} if(NR%2)printf "%.4f\n",v[(NR+1)/2]; else printf "%.4f\n",(v[NR/2]+v[NR/2+1])/2}'; }
   spread() { sort -n | awk '{v[NR]=$1} END{if(NR==0){print "-";exit} m=(NR%2)?v[(NR+1)/2]:(v[NR/2]+v[NR/2+1])/2; printf "%.2f\n",100.0*(v[NR]-v[1])/m}'; }
-  CONFIG="per-decode-step/2node/split$FRONTIER_SPLIT/ctx3732/GEN$FRONTIER_GEN/INK_KV=1/overlap/order-fixed/median-of-n-process-reps/features=$FRONTIER_FEATURES"
+  # `order-$RUN_ORDER`, not a literal: the config column must describe the run
+  # that happened. It reads `order-fixed` exactly as every previous row does,
+  # so comparability is unchanged -- but it can no longer claim an order the
+  # run did not use.
+  CONFIG="per-decode-step/2node/split$FRONTIER_SPLIT/ctx3732/GEN$FRONTIER_GEN/INK_KV=1/overlap/order-$RUN_ORDER/median-of-n-process-reps/features=$FRONTIER_FEATURES"
 
   # NOT RUN-WIDE. `identity-fails`, `paging-suspected` and `rep-failures=N` are
   # all printed BY A REP, and a rep belongs to exactly one arm -- so grepping
@@ -805,8 +917,17 @@ if [ "${1:-}" = "--run" ]; then
   # constant cannot know whether tonight's boxes were quiet or noisy, and this
   # run measured its own answer seven times. t(95%, n-1) rather than 2 sem
   # because the sd is estimated from those same few ratios -- see the header.
-  cmp_paired() {  # cmp_paired <arm>
-    awk -F'\t' -v a="$1" -v psd="$PAIRED_SD" '
+  #
+  # AND THE VERDICT IS GATED ON THE ARM ORDER, HERE, IN THE SAME EXPRESSION THAT
+  # WOULD OTHERWISE DECIDE IT. Under anything but `abba` the arms were not
+  # order-balanced: the experimental arm went second in every rep and carries
+  # the within-rep drift every time, which is a systematic bias sitting inside
+  # every ratio above. A bias shifts the mean without inflating the sd, so it
+  # makes t LARGER -- the tighter resolution derived here would convert it into
+  # significance. delta and res are still real and still recorded; the direction
+  # is not assertable and is not asserted. See the header for the full argument.
+  cmp_paired() {  # cmp_paired <arm> <order>
+    awk -F'\t' -v a="$1" -v ord="$2" -v psd="$PAIRED_SD" '
       function tcrit(df,   tt) {
         split("12.706 4.303 3.182 2.776 2.571 2.447 2.365 2.306 2.262 2.228 " \
               "2.201 2.179 2.160 2.145 2.131 2.120 2.110 2.101 2.093 2.086 " \
@@ -830,6 +951,13 @@ if [ "${1:-}" = "--run" ]; then
           r = tcrit(n-1) * sqrt(v/(n-1)) / sqrt(n)
         }
         vd = (m > r) ? "better" : ((m < -r) ? "worse" : "inside-resolution")
+        # The gate. It replaces `inside-resolution` as well as the directions:
+        # an order bias can MASK a real difference as easily as manufacture one,
+        # so under an unbalanced order the null is no more assertable than the
+        # direction. Deliberately symmetric -- "the bias only hurts a positive
+        # delta, so let better through" assumes the SIGN of the drift is fixed
+        # across nights, and only its EXISTENCE is established.
+        if (ord != "abba") vd = "order-confounded"
         printf "%+.2f %.2f %s %d\n", m, r, vd, n
       }' "$RESULTS"
   }
@@ -860,11 +988,14 @@ if [ "${1:-}" = "--run" ]; then
       say "  !! arm $arm completed $n of $FRONTIER_REPS reps. ${why:-No failure line for this arm in the log; read $RUNLOG.}"
     fi
     if [ "$kind" = experimental ]; then
-      cmp=$(cmp_paired "$arm")
+      cmp=$(cmp_paired "$arm" "$RUN_ORDER")
       npair=${cmp##* }
       if [ "${npair:-0}" -ge 1 ]; then
         vs="paired:frontier@n=$npair"
         [ "$npair" -lt 2 ] && vs="$vs+res-from-constant"
+        # The order rides in `vs` because a reader who sees only the row must be
+        # able to tell a balanced paired delta from an order-confounded one.
+        [ "$RUN_ORDER" = abba ] || vs="$vs+order-$RUN_ORDER"
       else
         # No rep of this arm survived beside a frontier rep, so there is nothing
         # to pair. Fall back to the weaker row-to-row comparison and SAY so in
@@ -999,6 +1130,17 @@ cubecl-graph $CUBECL_SHA, which main's sha does not pin." || {
     say "  remembered constant. A delta no larger than its own resolution is NOT movement,"
     say "  whichever way it points."
     printf '%s' "$EXP_VERDICTS"
+    if [ "$RUN_ORDER" != abba ]; then
+      say "  THESE VERDICTS ARE order-confounded AND THAT IS NOT A HEDGE. This run was"
+      say "  --order $RUN_ORDER, so every experimental arm went SECOND in every rep and carries"
+      say "  the within-rep drift each time -- a systematic bias inside every paired ratio."
+      say "  A bias shifts the mean without inflating the sd, so it makes t LARGER: the"
+      say "  tighter resolution above would turn it into a result. The deltas are real and"
+      say "  are what an abba run would be compared against, but no direction follows from"
+      say "  them. For an unconfounded answer run scripts/pipe-bench.sh directly with"
+      say "  --order abba; this script keeps --order $FRONTIER_ORDER so the frontier arm stays"
+      say "  first in every rep, which is what makes the scoreboard series one series."
+    fi
   fi
   [ -n "$NOTES" ] && say "  run-wide notes: $NOTES   (per-arm notes are printed with each arm above)"
   say "  row: $WT/$RESULTS_REL   reps: $RESULTS   run log: $RUNLOG"
