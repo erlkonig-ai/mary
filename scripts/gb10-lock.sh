@@ -144,8 +144,13 @@
 #     Until that exists, the queue is a PERSON. An arbiter who knows the
 #     ordering can hold a released slot for the starving waiter, which is
 #     what happened this night. That is not a substitute for the ticket; it
-#     is what you do while the ticket does not exist, and it only works
-#     while someone is awake to do it.
+#     is what you do while the ticket does not exist.
+#
+#     AND THE TWO FAIL DIFFERENTLY, which is the part worth carrying: a
+#     ticket fails by going STALE, a person fails by going to SLEEP. Both
+#     are recoverable and only one of them announces itself. A stale ticket
+#     sits there to be found; an absent arbiter leaves no trace at all, and
+#     the next person to read this at 3am will BE the failure mode.
 #
 # It is deliberately this simple because the failure it was built for -- two
 # runs overlapping and OOM-killing each other -- needs only exclusion, and a
