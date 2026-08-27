@@ -1,0 +1,410 @@
+//! `inkling_serve` — the SERVING PROCESS: one `Session`, held open, answering
+//! turns over the framed-stream convention.
+//!
+//! ```text
+//! INK_LAYERS=0:4 inkling_serve --pile <model.pile> --tokenizer <tokenizer.json>
+//! ```
+//!
+//! # What this is, against what came before
+//!
+//! `inkling_forward` is a measurement harness that runs the model inside `main`
+//! and exits. `mary::models::inkling::session::Session` made the model a value
+//! that survives across calls, and `inkling_session` drives one and prints
+//! tokens. Neither is reachable by another PROGRAM: a `Session` lives in one
+//! address space, and the program that wants it — `drive` — deliberately does
+//! not link `mary`, because drive must keep building GPU-free in seconds.
+//!
+//! This is the process that closes that gap. It loads once, holds the weights,
+//! the KV cache and the position, and serves turns on stdin/stdout. The protocol
+//! is `mary::models::inkling::serve`, which is the framed-stream convention with
+//! three control content-types on it — not a new format.
+//!
+//! # It streams, and that is the whole point
+//!
+//! Every token is written and FLUSHED as it is decoded, one framed record each.
+//! A consumer can therefore start speaking on the first word of a sentence
+//! instead of waiting for the last. Buffering the turn and sending it at the end
+//! would be a legal framed stream and would throw away the only property that
+//! makes a pipe better than a function call.
+//!
+//! # stdout is the PROTOCOL, so nothing else may write to it
+//!
+//! `Session::load` and everything under it print load diagnostics with
+//! `println!`. A single stray line in the middle of a framed stream is not a
+//! cosmetic problem: it is a corrupt record, and the reader would report a
+//! continuity violation somewhere downstream of the actual cause. So the very
+//! first thing this program does is `dup` the real stdout to a private fd and
+//! point fd 1 at stderr. After that, every `println!` in every library this
+//! links lands on stderr where it belongs, and the protocol owns a descriptor
+//! nothing else can reach. This is a guard, not a convention: it holds for code
+//! that has never heard of it.
+//!
+//! # Tokenizing is on THIS side
+//!
+//! Text on the wire, never ids. Drive's `Mind` seam asks for no tokenizer — the
+//! loop never teacher-forces tokens — so the tokenizer belongs to whoever owns
+//! the model. The tokenizer is the checkpoint's own `tokenizer.json`, read by
+//! the same `tokenizers::Tokenizer::from_file` that `inkling_encode` and
+//! `inkling_tokenizer_gate` use, so there is one tokenizer in this tree and not
+//! a second transcription of one. (`mary::persist::load_tokenizer_from_pile`
+//! reads the same thing out of a pile's facts, which is where this should read
+//! it from once a model pile carries the tokenizer graph. `--tokenizer` is an
+//! explicit path rather than a silent fallback so it is visible which one ran.)
+//!
+//! # One process is one RANK, and on one box that is a PARTIAL STACK
+//!
+//! `Session::load` refuses `INK_TP` (the rendezvous is a collective that would
+//! block this call on a peer starting up elsewhere) and enforces
+//! `hi - lo < num_hidden_layers` (144 GiB of weights do not fit a 121 GiB box).
+//! Both are right and together they mean a SINGLE-BOX serving process
+//! necessarily runs a strict subrange, unembeds through layers it did not all
+//! run, and produces DIAGNOSTIC tokens rather than the model's. That is said on
+//! the wire, in the READY record's `partial` flag, rather than left to be
+//! inferred from fluent-looking wrong text. The fan-out proxy that drives two
+//! TP ranks in lockstep and returns rank 0's token speaks this same protocol;
+//! it is the next lane, not this one.
+
+use std::io::Write as _;
+
+use anyhow::{Context, Result};
+
+use mary::models::inkling::serve::{
+    CONSULT_TYPE, CONTENT_TYPE, Consult, READY_TYPE, Ready, TURN_TYPE, TurnEnd, UNIT,
+};
+use mary::models::inkling::session::{Session, SessionConfig};
+
+fn usage() -> &'static str {
+    "\
+inkling_serve — one Session, held open, answering turns on stdin/stdout
+
+USAGE:
+    inkling_serve --pile <model.pile> --tokenizer <tokenizer.json> [OPTIONS]
+
+OPTIONS:
+    --pile <path>        The model collection: weights AND config.json
+    --tokenizer <path>   The checkpoint's tokenizer.json
+    --layers <lo:hi>     Layers this rank runs (default: $INK_LAYERS)
+    --gen <n>            Default tokens per turn when a consult does not say
+    --stop-id <id>       Stop generating on this token id; repeatable
+    --prefill-budget <n> Tokens the arena reserves activation headroom for
+    -h, --help           This text
+
+The protocol is the framed-stream convention with three control content-types;
+see `mary::models::inkling::serve`.
+"
+}
+
+struct Options {
+    pile: std::path::PathBuf,
+    tokenizer: std::path::PathBuf,
+    layers: Option<std::ops::Range<usize>>,
+    tokens: usize,
+    stop: Vec<u32>,
+    prefill_budget: Option<usize>,
+}
+
+fn parse() -> Result<Option<Options>> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (mut pile, mut tokenizer, mut layers, mut prefill_budget) = (None, None, None, None);
+    let mut tokens = 32usize;
+    let mut stop = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let need = |i: usize| -> Result<&String> {
+            args.get(i + 1)
+                .with_context(|| format!("{} wants a value", args[i]))
+        };
+        match args[i].as_str() {
+            "-h" | "--help" => return Ok(None),
+            "--pile" => {
+                pile = Some(std::path::PathBuf::from(need(i)?));
+                i += 2;
+            }
+            "--tokenizer" => {
+                tokenizer = Some(std::path::PathBuf::from(need(i)?));
+                i += 2;
+            }
+            "--layers" => {
+                let value = need(i)?;
+                let (lo, hi) = value
+                    .split_once(':')
+                    .with_context(|| format!("--layers wants LO:HI, got {value:?}"))?;
+                layers = Some(lo.parse()?..hi.parse()?);
+                i += 2;
+            }
+            "--gen" => {
+                tokens = need(i)?.parse().context("--gen wants a count")?;
+                i += 2;
+            }
+            "--stop-id" => {
+                stop.push(need(i)?.parse().context("--stop-id wants a token id")?);
+                i += 2;
+            }
+            "--prefill-budget" => {
+                prefill_budget = Some(need(i)?.parse().context("--prefill-budget wants a count")?);
+                i += 2;
+            }
+            other => anyhow::bail!("unknown argument {other:?}\n\n{}", usage()),
+        }
+    }
+    Ok(Some(Options {
+        pile: pile.context("--pile is required")?,
+        tokenizer: tokenizer.context("--tokenizer is required")?,
+        layers,
+        tokens,
+        stop,
+        prefill_budget,
+    }))
+}
+
+/// Take fd 1 for the protocol and point every `println!` at stderr.
+///
+/// Done before ANYTHING else runs, because the load path prints and a printed
+/// line inside a framed stream is a corrupt record. Returns the private
+/// descriptor the protocol writes to.
+fn claim_stdout() -> Result<std::fs::File> {
+    use std::os::fd::FromRawFd as _;
+    // Flush whatever Rust has buffered on stdout before the descriptor moves,
+    // so nothing written before the swap lands on the protocol's fd.
+    let _ = std::io::stdout().flush();
+    let raw = unsafe { libc::dup(libc::STDOUT_FILENO) };
+    anyhow::ensure!(raw >= 0, "could not dup stdout for the protocol stream");
+    let redirected = unsafe { libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO) };
+    anyhow::ensure!(redirected >= 0, "could not point stdout at stderr");
+    Ok(unsafe { std::fs::File::from_raw_fd(raw) })
+}
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("inkling_serve: {error:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
+    let Some(options) = parse()? else {
+        print!("{}", usage());
+        return Ok(());
+    };
+    let protocol = claim_stdout()?;
+
+    // Both preambles are written before either side reads, so the handshake
+    // cannot deadlock. Ours goes out FIRST — before the minutes of loading —
+    // which is what lets a client distinguish "starting" from "not ours".
+    let mut out = framed_stream::FramedWriter::open(protocol, CONTENT_TYPE, UNIT)
+        .context("open the protocol's output stream")?;
+    let mut input = framed_stream::FramedReader::open(std::io::stdin().lock())
+        .context("open the protocol's input stream")?;
+    input
+        .require_content_type(CONTENT_TYPE)
+        .context("this serving process is fed text, and was handed something else")?;
+
+    let tokenizer = tokenizers::Tokenizer::from_file(&options.tokenizer)
+        .map_err(|e| anyhow::anyhow!("load {}: {e}", options.tokenizer.display()))?;
+
+    let mut config = SessionConfig::new(&options.pile);
+    if let Some(layers) = options.layers.clone() {
+        config = config.layers(layers);
+    }
+    if let Some(budget) = options.prefill_budget {
+        config.prefill_budget = budget;
+    }
+    let loaded = std::time::Instant::now();
+    let mut session = Session::load(config).context("load the model")?;
+    let load_secs = loaded.elapsed().as_secs_f64();
+
+    let range = session.layer_range();
+    let ready = Ready {
+        pile: options.pile.display().to_string(),
+        layers: [range.start, range.end],
+        stack: session.config().text_config.num_hidden_layers,
+        partial: session.is_partial_stack(),
+        vocab: session.config().text_config.effective_vocab(),
+        load_secs,
+    };
+    eprintln!(
+        "inkling_serve: ready in {load_secs:.1}s — layers {}..{} of {}{}",
+        ready.layers[0],
+        ready.layers[1],
+        ready.stack,
+        match ready.partial {
+            true => " (PARTIAL STACK: diagnostic tokens, not the model's)",
+            false => "",
+        }
+    );
+    let payload = serde_json::to_vec(&ready)?;
+    let extent = payload.len() as u64;
+    out.record_as(READY_TYPE, &payload, extent)?;
+
+    // ── serve ───────────────────────────────────────────────────────────────
+    //
+    // Context accumulates as text records; a CONSULT record ends the delta and
+    // asks for a turn. Nothing here is asynchronous: the client writes, we read
+    // until the consult, we generate and write, the client reads. Strict
+    // alternation, so the two-pipe deadlock cannot arise.
+    let mut delta = String::new();
+    let mut turn = 0usize;
+    let mut primed = false;
+    loop {
+        match input.next_frame()? {
+            framed_stream::Frame::Record(record) if record.content_type() == CONSULT_TYPE => {
+                let consult: Consult =
+                    serde_json::from_slice(&record.payload).unwrap_or(Consult::new(options.tokens));
+                let want = consult.max_tokens.max(1);
+                let end = serve_turn(
+                    &mut session,
+                    &tokenizer,
+                    &mut out,
+                    std::mem::take(&mut delta),
+                    want,
+                    &options.stop,
+                    turn,
+                    &mut primed,
+                )?;
+                let payload = serde_json::to_vec(&end)?;
+                let extent = payload.len() as u64;
+                out.record_as(TURN_TYPE, &payload, extent)?;
+                eprintln!("inkling_serve: {}", end.summary());
+                turn += 1;
+            }
+            framed_stream::Frame::Record(record) if record.content_type() == CONTENT_TYPE => {
+                delta.push_str(record.text()?);
+            }
+            framed_stream::Frame::Record(record) => {
+                anyhow::bail!(
+                    "this serving process does not understand a {} record",
+                    record.content_type()
+                )
+            }
+            framed_stream::Frame::Gap(gap) => {
+                // The client declared context it could not deliver. Attending to
+                // the rest as if nothing were missing is exactly what a gap
+                // exists to prevent, so it is marked in the context itself.
+                eprintln!(
+                    "inkling_serve: client gap of {} byte(s): {}",
+                    gap.extent, gap.reason
+                );
+                delta.push_str(&format!("\n[{} bytes lost: {}]\n", gap.extent, gap.reason));
+            }
+            framed_stream::Frame::End(status) => {
+                eprintln!("inkling_serve: input stream ended ({status:?}) after {turn} turn(s)");
+                break;
+            }
+        }
+    }
+    out.finish(framed_stream::EndStatus::Complete)?;
+    Ok(())
+}
+
+/// One turn: attend to the delta, then generate, emitting each token as it is
+/// decoded.
+///
+/// The two `Session` calls that matter are here and nowhere else: `prefill` for
+/// the first sequence, `extend` for every turn after it — which attends ONLY to
+/// what is new, because the KV cache is still holding everything before it. That
+/// is the property the whole exercise is for, and it is why the second turn is
+/// three orders of magnitude cheaper than the first.
+#[allow(clippy::too_many_arguments)]
+fn serve_turn(
+    session: &mut Session,
+    tokenizer: &tokenizers::Tokenizer,
+    out: &mut framed_stream::FramedWriter<std::fs::File>,
+    delta: String,
+    want: usize,
+    stop: &[u32],
+    turn: usize,
+    primed: &mut bool,
+) -> Result<TurnEnd> {
+    // `false`: no special tokens. The prompts this model is measured against
+    // carry none, and a BOS silently prepended here would make a served turn
+    // incomparable with every reference prompt in the tree while every shape
+    // check still passed. (Same reasoning, same flag, as `inkling_encode`.)
+    let ids: Vec<usize> = match delta.is_empty() {
+        true => Vec::new(),
+        false => tokenizer
+            .encode(delta.as_str(), false)
+            .map_err(|e| anyhow::anyhow!("encode the delta: {e}"))?
+            .get_ids()
+            .iter()
+            .map(|&id| id as usize)
+            .collect(),
+    };
+    anyhow::ensure!(
+        *primed || !ids.is_empty(),
+        "the first turn has nothing to attend to: a prefill with no tokens would be vacuous"
+    );
+
+    let started = std::time::Instant::now();
+    let first = match *primed {
+        false => session
+            .prefill(&ids)
+            .context("prefill the first sequence")?,
+        true => session.extend(&ids).context("extend the sequence")?,
+    };
+    *primed = true;
+    let first_token_secs = started.elapsed().as_secs_f64();
+
+    // ── the incremental detokenizer ─────────────────────────────────────────
+    //
+    // A byte-level BPE token can be a PARTIAL UTF-8 sequence, so decoding ids
+    // one at a time produces replacement characters that a later token would
+    // have completed. Two rules keep the emitted bytes final:
+    //
+    //   1. The turn's ids are decoded as a GROWING PREFIX and only the new
+    //      suffix is emitted, so merges that rewrite earlier bytes are seen.
+    //   2. A trailing replacement character is HELD BACK until the token that
+    //      completes it arrives. Emitting U+FFFD and correcting it afterwards
+    //      is not available: a consumer that has already SPOKEN a byte cannot
+    //      unspeak it, and this is the stream whose whole purpose is that the
+    //      consumer acts before the turn is over.
+    //
+    // If the prefix property breaks anyway, the convention has exactly one
+    // legal move and it is taken: declare a GAP naming what could not be
+    // delivered, then resynchronise. Silently re-emitting is not an option the
+    // format offers.
+    let mut generated: Vec<u32> = Vec::with_capacity(want);
+    let mut emitted = String::new();
+    let mut stopped = "max_tokens";
+    let mut token = first;
+    for step in 0..want {
+        generated.push(token as u32);
+        let full = tokenizer
+            .decode(&generated, false)
+            .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+        let stable = full.trim_end_matches(char::REPLACEMENT_CHARACTER);
+        if stable.starts_with(emitted.as_str()) {
+            let new = &stable[emitted.len()..];
+            if !new.is_empty() {
+                // Written and FLUSHED here, inside the generation loop. This one
+                // call is the difference between a stream and a batch.
+                out.text(new)?;
+                emitted.push_str(new);
+            }
+        } else {
+            out.gap(
+                emitted.len() as u64,
+                "the incremental decode diverged from what was already emitted, so the \
+                 bytes sent so far this turn are void",
+            )?;
+            out.text(stable)?;
+            emitted = stable.to_string();
+        }
+        if stop.contains(&(token as u32)) {
+            stopped = "stop_token";
+            break;
+        }
+        if step + 1 < want {
+            token = session.step().context("advance one token")?;
+        }
+    }
+
+    Ok(TurnEnd {
+        turn,
+        tokens: generated.len(),
+        delta_tokens: ids.len(),
+        stopped: stopped.to_string(),
+        first_token_secs,
+        turn_secs: started.elapsed().as_secs_f64(),
+        position: session.position(),
+    })
+}

@@ -51,4 +51,13 @@ pub mod inkling;
 pub mod inkling {
     #[path = "spectree.rs"]
     pub mod spectree;
+
+    // The SERVING PROTOCOL is backend-free for the same reason and to greater
+    // effect: the client of a serving process needs no GPU, because the GPU is
+    // in the other process. That is the whole shape of the thing — a model in a
+    // process that can only run where the model runs, reached from a loop that
+    // must run anywhere.
+    #[cfg(feature = "serve")]
+    #[path = "serve.rs"]
+    pub mod serve;
 }

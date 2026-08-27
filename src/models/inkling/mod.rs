@@ -115,6 +115,15 @@ pub mod vision;
 pub mod assembly;
 pub mod session;
 
+// …and the thing that makes a held model reachable by another PROGRAM. A
+// `Session` lives in one address space, and the program that wants it — `drive`
+// — must not link mary. So the model runs in its own process and is reached
+// over the framed-stream convention. The module is backend-free (it is a
+// protocol and a client), which is why it is also compiled without the CUDA
+// lane; see the shim in `models/mod.rs`.
+#[cfg(feature = "serve")]
+pub mod serve;
+
 pub use config::InklingConfig;
 // Layer 2's experts are BF16 and have no scales; the same tiling, the same
 // device residency, the unscaled sibling of the instruction.
