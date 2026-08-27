@@ -206,7 +206,7 @@
 //! accumulator and no MMA -- so none of it was a claim about the shipped lane.
 //! `real swz + shuffle` is that claim: the redistribution built into
 //! `w4a16_linear_swz` itself, behind `w4a16gemm::swz_shuffle`
-//! (`INK_W4A16_SWZ_SHUFFLE`, default off), round-robined against the flag-off
+//! (`INK_W4A16_SWZ_SHUFFLE`, default ON; `=0` is the ablation), round-robined against the flag-off
 //! lane in the SAME process so the paired ratio applies to it.
 //!
 //! ```text

@@ -33,9 +33,12 @@
 # can assemble. So the default-ON wins are in it BECAUSE they are on by default
 # -- INK_FUSE_QKVR, INK_DEV_ROUTE, INK_ACT_BF16, INK_DEV_PLAN, INK_SWZ, the
 # W4A16 head/sink lanes and NVFP4 KV pages (which have no switch left at all),
-# INK_ANN_HEAD=8192, INK_DRAFT_TOPK=512, and the W4A16 depth-4 swizzle lane
+# INK_ANN_HEAD=8192, INK_DRAFT_TOPK=512, the W4A16 depth-4 swizzle lane
 # whose `swizzle_pays` predicate decides per shape (`INK_W4A16_SWZ=0` is its
-# ablation, and this run does not set it). The default-OFF experimental lanes
+# ablation, and this run does not set it), and that lane's coalesced-load +
+# warp-shuffle weight read, ON by default since it measured -2.31% of a step on
+# THIS config against a 0.39% resolution (`INK_W4A16_SWZ_SHUFFLE=0` is its
+# ablation, and this run does not set it either). The default-OFF experimental lanes
 # -- INK_GRAPH, INK_GRAPH_LANE, INK_TP -- are OUT of it for exactly the same
 # reason, and folding one in would make the series measure a cherry-pick that
 # nobody gets by checking out main.

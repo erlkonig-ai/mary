@@ -1973,15 +1973,74 @@ pub fn swz_unroll() -> usize {
 /// went with the 14.5M load instructions was their address arithmetic.
 /// `stall_barrier` is 0.00 in both, `lg_throttle` 0.01 -> 0.00.
 ///
-/// ## Why it is off by default anyway
+/// ## What it is worth PER STEP, which is why it is now ON by default
 ///
-/// Because every figure above is a PER-LAUNCH weight-read figure at
-/// `m_pad = 16`, and what production spends is a step. Turning it on is a
-/// decision for `scripts/frontier-bench.sh` at the frontier, which prices tok/s
-/// over the whole two-node pipeline; until that has run, the honest claim is
-/// the one measured -- this lane's weight read, 1.16x, on one box, per launch.
-/// The flag exists so that run is a `INK_W4A16_SWZ_SHUFFLE=1` away rather than
-/// a rebuild.
+/// Every figure above is a PER-LAUNCH weight-read figure at `m_pad = 16`, and
+/// what production spends is a step. So the default was held OFF until a step
+/// had been measured. It has been.
+///
+/// FRAMING RULE: PER one decode step of the 42-layer two-node pipeline -- head
+/// layers 0:21 on spark2, tail 21:42 on spark -- AT ctx 3732
+/// (`~/refprompts/ctx3732.ids`), `INK_GEN=64`, `INK_KV=1`, split 21,
+/// `--overlap`, 62 warm passes a process, AGAINST the same binary in the same
+/// rep with the flag forced off. `scripts/pipe-bench.sh --order abba`, 16 reps
+/// = 32 processes, ~77 s each, `scripts/gb10-lock.sh` held on both boxes and
+/// both idle-gated; ONE binary, staged byte-identical on both boxes, so the
+/// arms differ in the environment and in nothing else. NOT ncu, NOT nsys: a
+/// free-running locked idle pair.
+///
+/// ```text
+///   arm     reps   median ms/step   median tok/s
+///   off      16        88.8            11.262
+///   on       16        86.8            11.517
+/// ```
+///
+/// The arms run back to back inside one rep, so the PAIRED ratio is the figure
+/// and the unpaired medians are only its shadow:
+///
+/// ```text
+///   on / off, per rep, ms/step   mean 0.9769   median 0.9764   16/16 reps < 1
+///   sd of the paired ratio       0.77%   (THIS run's, over its own 16 pairs)
+///   resolution, 2 sem            0.39%
+///   95% CI                       -2.70% .. -1.92% of step time
+/// ```
+///
+/// **-2.31% of step time, i.e. 1.0236x, against a resolution of 0.39%.** The
+/// sd is quoted from this run's own 16 paired ratios rather than from
+/// `pipe-bench.sh`'s 1.45% constant, which is a between-process figure for
+/// arms that are not this tightly paired.
+///
+/// AND THE LANE ACCOUNTS FOR IT, which is what makes it a mechanism rather than
+/// a coincidence. `nsys -t cuda` on BOTH halves of the same config, 16 steps,
+/// warm passes only (the prefill pass and the two cold decode passes dropped):
+///
+/// ```text
+///   half   swz launches/pass   lane ms/pass OFF -> ON
+///   head        57  (19 MoE layers x 3)   4.433 -> 3.609   (-0.824)
+///   tail        63  (21 MoE layers x 3)   4.910 -> 3.965   (-0.945)
+///   both       120                        9.343 -> 7.574   (-1.769, -18.9%)
+/// ```
+///
+/// The launch count is IDENTICAL in both arms (969 head, 1071 tail, over 17
+/// passes) -- same shapes, same schedule, only the load form differs. The two
+/// halves are SERIAL in this pipeline, so their savings add, and -1.769 ms
+/// covers 86% of the -2.056 ms the free-running step measurement lost; the
+/// 0.29 ms residue is inside that measurement's own 0.35 ms resolution band.
+/// The step's own weights are the SINKS (`gate_up` [8192, 4096] and `down`
+/// [4096, 2048] x 2 an MoE layer) and never the head, which `w4a16_bind` keeps
+/// row-major while the approximate lane owns m = 1.
+///
+/// NOTE THE PRODUCTION LANE GAINS MORE THAN THE GRID PREDICTS: -18.9% against
+/// the 1.10 and 0.99 `shf/swz` that `w4a16_swz_grid` reads at exactly these two
+/// shapes. The grid pipelines 20 launches over rotating buffers with the SM to
+/// itself, which is the lane at its throughput ceiling; production interleaves
+/// it with `fp4_linear_grouped` and the attention lane, where the 73 -> 61
+/// register drop buys resident blocks that the isolated harness had no use for.
+/// Same change, two different currencies -- and the step is the one that is
+/// spent.
+///
+/// `INK_W4A16_SWZ_SHUFFLE=0` remains the ablation, so both arms stay runnable
+/// from one build and this measurement can be repeated without a rebuild.
 ///
 /// `w4a16_swz_probe` gates the numerics: flag on against flag off, four
 /// `(m_pad, live, k, swz_sc)` shapes, EVERY output compared including the
@@ -1997,9 +2056,13 @@ pub fn swz_shuffle() -> bool {
     // the timed region of every harness that measures this lane.
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
+        // ON by default. `=0` (or `false`) is the ablation and is the only
+        // thing that turns it off -- the arms have to stay reachable from one
+        // build, because the step measurement above is worth nothing if the
+        // next person cannot repeat it without a rebuild.
         std::env::var("INK_W4A16_SWZ_SHUFFLE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true)
     })
 }
 

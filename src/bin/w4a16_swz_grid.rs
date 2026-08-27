@@ -118,8 +118,12 @@
 //! transaction-bound (k=4096 above 1024 cubes, 1.10-1.30) and smallest at
 //! k=16384, where the permutation has already collected most of what there was.
 //!
-//! It is off by default; `w4a16gemm::swz_shuffle` carries what it is, the ncu
-//! counters behind it, and why the default has not moved.
+//! It is ON by default since the step-level A/B in `w4a16gemm::swz_shuffle`
+//! -- -2.31% of a two-node decode step against a 0.39% resolution, with the
+//! lane's own device time accounting for 86% of it. That function carries the
+//! step figures, the ncu counters, and why the two-arm reading BELOW is milder
+//! than what production sees: this harness gives the lane the SM to itself.
+//! `INK_W4A16_SWZ_SHUFFLE=0` is the ablation.
 
 use std::time::Instant;
 

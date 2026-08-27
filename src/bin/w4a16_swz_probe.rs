@@ -63,7 +63,8 @@
 //!   at four `(m_pad, live)` pairs including a multi-tile shape whose LAST tile
 //!   is partly padding.
 //! * The COALESCED LOAD + WARP SHUFFLE weight read
-//!   (`w4a16gemm::swz_shuffle`, `INK_W4A16_SWZ_SHUFFLE`, default off): flag on
+//!   (`w4a16gemm::swz_shuffle`, `INK_W4A16_SWZ_SHUFFLE`, default ON since the
+//!   step measurement in that function; `=0` is the ablation): flag on
 //!   and flag off must agree to the last bit, at four shapes that between them
 //!   cover decode, a partly-padded last tile, a ROW-MAJOR scale plane the
 //!   redistribution must decline, and a `k` whose k-tile count the load depth
