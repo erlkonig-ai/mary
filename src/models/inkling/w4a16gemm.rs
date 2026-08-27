@@ -301,9 +301,13 @@ pub const LIVE_ROW_MASK_DEFAULT: bool = false;
 /// live, so that is the only thing passed, and the whole model needs exactly two
 /// variants — decode's and everyone else's.
 ///
-/// `m <= MTILE / 2` is sufficient AND safe: `m_pad` is `m` rounded up to
-/// [`MTILE`], so any `m <= 8` has `m_pad = MTILE`, one m-tile, and `m_base = 0`
-/// — every row from 8 up is padding in the only tile there is.
+/// `m <= MTILE / 2` is sufficient AND safe, and the argument needs nothing about
+/// tiling: load `i` odd sits at within-tile row `lane/4 + 8 >= 8`, so its global
+/// row is `m_base + 8` or more, and `m_base >= 0` — so the global row is at
+/// least 8, which is at least `m`. Dead in EVERY tile of every shape. (An
+/// earlier version of this comment reasoned via "m <= 8 forces a single m-tile",
+/// which is true but is a weaker claim resting on `m_pad`; this one holds even
+/// if a caller passes an `m_pad` that does not match `m`.)
 ///
 /// **It depends on the fragment map**, specifically on `row = lane/4 + 8*(i&1)`
 /// making `8*(i&1)` the smallest row load `i` can touch. `mma16_lane_dump`
