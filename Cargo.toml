@@ -439,6 +439,14 @@ required-features = ["inkling-cuda"]
 name = "w4a16_swz_grid"
 required-features = ["inkling-cuda"]
 
+# The missing rung between the coalesced 242 GB/s control and the shipped W4A16
+# head lane: the SAME load stream and the SAME one-warp-per-tile geometry with
+# the dequantise and the MMA removed, so "66% of the ceiling" can be split into
+# what the access pattern costs and what the arithmetic costs.
+[[bin]]
+name = "w4a16_geom_ceiling"
+required-features = ["inkling-cuda"]
+
 # Read bandwidth for device-allocated vs host-mapped memory, on a working set
 # far larger than L2. Any figure above this part's ~273 GB/s bus is a cache
 # measurement, which is how a 992 GB/s number got into circulation.
