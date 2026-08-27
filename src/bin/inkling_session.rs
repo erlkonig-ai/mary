@@ -178,6 +178,12 @@ fn main() -> Result<()> {
 /// | `extend`, warm, WALKED | 19.3 ms/token | 47.4 ms/token |
 /// | decode step | 19.4 ms/step | 47.4 ms/step |
 ///
+/// The `extend` row is **historical**: it was measured while `Session::extend`
+/// walked its delta, and it does not walk any more. What this gate prints for
+/// that row now is the batched figure ([`batched_gate`] has the table), so the
+/// numbers above are kept as what the argument below was built from rather than
+/// as what a re-run reports.
+///
 /// Both ranges agreed 8/8 tokens between the rewound session and the one built
 /// that way, so the equivalence held exactly at this length on the real weights.
 ///
@@ -241,7 +247,7 @@ fn rewind_gate(session: &mut Session, prompt: &[usize], steps: usize) -> Result<
         }
         let decoded = t1.elapsed().as_secs_f64();
         println!(
-            "  extend {what:<14}: {} tokens in {extended:.3}s ({:.1} ms/token, WALKED), then {} \
+            "  extend {what:<14}: {} tokens in {extended:.3}s ({:.1} ms/token, BATCHED), then {} \
              steps in {decoded:.3}s ({:.1} ms/step)",
             tail.len(),
             extended * 1e3 / tail.len().max(1) as f64,
