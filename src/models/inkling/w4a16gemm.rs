@@ -213,6 +213,59 @@ pub const LIVE_ROW_MASK_DEFAULT: bool = false;
 /// before believing any of it, and note that a mask which RAISES the count would
 /// be a reason to stop, since the lane has single-digit registers of headroom.
 ///
+/// ## Measured
+///
+/// GB10 (spark), commit `b451912`, one box under the box lock with no other
+/// compute app on the device. Framing travels with each number.
+///
+/// **Bit-identity — the gate, and it PASSES.** `w4a16_swz_probe`'s mask section,
+/// masked against unmasked, SAME binary and same process, the two arms differing
+/// only in the comptime `mask_rows`/`hi_dead`; every output compared including
+/// the padding rows the caller slices away:
+///
+/// ```text
+///   shape                       live/m_pad   outputs   row-major   swizzled
+///   [16, 256] x [64, 256]^T          1/16       1024    0.000e0     0.000e0
+///   [16, 256] x [64, 256]^T          8/16       1024    0.000e0     0.000e0
+///   [16, 256] x [64, 256]^T          9/16       1024    0.000e0     0.000e0
+///   [48, 256] x [64, 256]^T         37/48       3072    0.000e0     0.000e0
+/// ```
+///
+/// 6144 outputs, 0 differing f32 bits anywhere. The four shapes are chosen, not
+/// convenient: `1/16` is decode; `48` is MULTI-TILE with a partly-padded LAST
+/// tile, which a predicate that forgot `m_base` would fail; and `8` against `9`
+/// straddles the `hi_dead` boundary, so the comptime-deleted-load variant and
+/// the runtime-predicate-only variant are both exercised against the same
+/// unmasked reference.
+///
+/// **The fragment map HOLDS on the device.** `mma16_lane_dump` dumps A off the
+/// device and checks `row = lane/4 + 8*(i&1)`, `col = 2*(l%4) + 8*((i>>1)&1)`:
+/// HOLDS. Loads `i1` and `i3` address rows 8..15 for every lane, exactly as
+/// `hi_dead` assumes.
+///
+/// **A's cost, per warp per k-tile, at `m_pad = 16`, `k = 4096`** — computed
+/// from that dumped map through this kernel's own index arithmetic, so it is a
+/// property of the device's layout and not of an assumption:
+///
+/// ```text
+///   live rows   requests   32B sectors   what changed
+///        16         4          32        the unmasked lane
+///         9         4          18        runtime predicate only (hi_dead off)
+///         8         2          16        hi_dead: the i-odd loads are gone
+///         1         2           2        decode
+/// ```
+///
+/// Note the two regimes. Above 8 live rows only SECTORS fall, because every load
+/// still has some live lane. At or below 8 the `i`-odd loads have no live lane
+/// at all and the REQUEST count halves as well — and that is the same threshold
+/// at which `hi_dead` lets the compiler delete them outright.
+///
+/// **Registers: not yet read.** `ncu` returns `ERR_NVGPUCTRPERM` for an
+/// unprivileged user on this box, so `launch__registers_per_thread` needs `sudo`
+/// and a box slot. Until it is read, treat the register claim above as the
+/// hypothesis it is: the mask is NOT known to be register-neutral, and a rise
+/// would be a reason to leave it off.
+///
 /// ## Which decode work this actually reaches
 ///
 /// Not the unembedding, at the shipped default. `inkling_forward`'s
