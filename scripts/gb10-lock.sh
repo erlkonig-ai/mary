@@ -95,6 +95,11 @@
 # without releasing, and left two idle GB10s reserved for the remaining 68 minutes
 # of its timeout while four agents queued behind it.
 #
+# THE COST OF NOT HAVING IT, MEASURED ONCE: 21 box-minutes. That episode ran
+# from the holder's last beat to the moment the next agent took the boxes, on a
+# night with five agents queued, and nothing in the mechanism could have
+# shortened it. The conjunction below would have caught it in under a minute.
+#
 # The better test is a CONJUNCTION rather than elapsed time: if the boxes are idle
 # AND the beat has stopped, the holder is done, and that pair is far more
 # informative than age alone. A holder mid-build is silent but its box is busy; a
