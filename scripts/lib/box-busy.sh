@@ -74,6 +74,25 @@ box_busy_local() {
     local cmd
     cmd=$(ps -o command= -p "$pid" 2>/dev/null) || continue
     [ -n "$cmd" ] || continue
+    # A SEARCHER IS NOT A WORKLOAD. Failure 1 says we must not match OURSELVES,
+    # and the ancestry filter above does that exactly. It does not cover someone
+    # ELSE'S searcher: a process whose whole job is to grep for the pattern
+    # carries the pattern in its own argv, so it reads as the workload it is
+    # waiting for. Live example, 2026-08-27 on the tail box, two of them:
+    #
+    #   bash -c until ! pgrep -f "cargo build --release --bin w4a16_swz_probe"; do sleep 20; done; ... inkling_forward ...
+    #
+    # matched here because its argv mentions `inkling_forward`, and reported the
+    # box busy for every gated measurement on it -- indefinitely, since that
+    # loop also self-matches and can never exit.
+    #
+    # This CANNOT hide a real measurement, which is why it is safe to drop.
+    # `env A=1 prog args` EXECS prog, so the process actually running a
+    # measurement always appears in its own right with its own argv; excluding a
+    # shell wrapper that merely mentions `pgrep` never removes the workload
+    # itself from the list. The change can only make this gate report busy LESS
+    # often, and only for processes that are searching rather than running.
+    case "$cmd" in *pgrep*) continue ;; esac
     hits="$hits$pid $cmd"$'\n'
   done
   if [ -n "$hits" ]; then printf '%s' "$hits"; return 0; fi
