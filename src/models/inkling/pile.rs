@@ -1473,22 +1473,51 @@ impl PileSource {
     /// admission once, as the live set it implies, and every term downstream is
     /// a function of that. A second, independent path from the token count to a
     /// byte count is exactly how the two came to disagree.
+    ///
+    /// # `shard`: the within-layer split's routed-expert cut
+    ///
+    /// `Some(tp)` copies only THIS RANK's half of every routed expert --
+    /// `w13`'s rows, `w2`'s columns, both naming the same half of the
+    /// intermediate axis (see [`super::tpshard::routed_cut`]). It is done here
+    /// and not at bind time because an expert slab is reached as a byte OFFSET
+    /// into this arena and never as a host slice: cutting it anywhere else
+    /// would mean a second traversal of 70+ GiB, and cutting it not at all
+    /// would leave both ranks computing the whole MoE under an all-reduce that
+    /// then sums two copies of it.
+    ///
+    /// The cut is a change of SOURCE index inside a memcpy that already runs,
+    /// so it costs nothing the copy was not already paying -- and it moves half
+    /// the bytes, so the arena is smaller and the pass is faster. The
+    /// `INK_SWZ` permutation below is applied to the CUT dims, which is why the
+    /// swizzleability gate reads them and not the stored ones.
     pub fn copy_share(
         &mut self,
         layers: std::ops::Range<usize>,
         global_dense: &[&str],
         attention_bytes: u64,
         policy: super::budget::AdmissionPolicy,
+        shard: Option<super::tp::Tp>,
     ) -> Result<(usize, usize, u64, u64)> {
         anyhow::ensure!(self.copied.is_none(), "the weight share was already copied");
 
-        /// The shape every expert of one stacked matrix has.
-        #[derive(Clone, Copy)]
+        /// The shape every expert of one stacked matrix has, whole and cut.
+        ///
+        /// Both, deliberately. The STORED dims are what each leaf is validated
+        /// against -- a leaf that is not the shape its stack claims is refused
+        /// -- and the CUT dims are what is written, indexed and later reported
+        /// by `expert_packed`. Keeping only one of the two is how a cut arena
+        /// comes to be read with the uncut shape, which is finite numbers from
+        /// the wrong place.
+        #[derive(Clone)]
         struct Shape {
             rows: usize,
             logical: usize,
             nvfp4: bool,
             payload: usize,
+            cut: super::tpshard::Cut,
+            cut_rows: usize,
+            cut_logical: usize,
+            cut_payload: usize,
         }
 
         let keys = self.expert_keys_in(layers.clone());
@@ -1506,7 +1535,7 @@ impl PileSource {
                 continue;
             }
             let r = &self.experts[&(name.clone(), *e)];
-            let shape = match r.handle {
+            let (rows, logical, nvfp4, payload) = match r.handle {
                 ExpertHandle::Nvfp4(h) => {
                     let blob: Blob<Tensor<NVFP4, 2>> = self
                         .reader
@@ -1514,12 +1543,12 @@ impl PileSource {
                         .map_err(|err| anyhow::anyhow!("{name}[{e}]: {err:?}"))?;
                     let view = TensorView::try_from_blob(blob)
                         .map_err(|err| anyhow::anyhow!("{name}[{e}]: decode: {err}"))?;
-                    Shape {
-                        rows: view.dims()[0] as usize,
-                        logical: view.dims()[1] as usize,
-                        nvfp4: true,
-                        payload: view.payload().len(),
-                    }
+                    (
+                        view.dims()[0] as usize,
+                        view.dims()[1] as usize,
+                        true,
+                        view.payload().len(),
+                    )
                 }
                 ExpertHandle::Bf16(h) => {
                     let blob: Blob<Tensor<BF16, 2>> = self
@@ -1528,15 +1557,42 @@ impl PileSource {
                         .map_err(|err| anyhow::anyhow!("{name}[{e}]: {err:?}"))?;
                     let view = TensorView::try_from_blob(blob)
                         .map_err(|err| anyhow::anyhow!("{name}[{e}]: decode: {err}"))?;
-                    Shape {
-                        rows: view.dims()[0] as usize,
-                        logical: view.dims()[1] as usize,
-                        nvfp4: false,
-                        payload: view.payload().len(),
-                    }
+                    (
+                        view.dims()[0] as usize,
+                        view.dims()[1] as usize,
+                        false,
+                        view.payload().len(),
+                    )
                 }
             };
-            shapes.insert(name.clone(), shape);
+            // This rank's cut of THIS stack, decided from the name and the
+            // stored dims. `None` -- a single-node run -- is the identity, and
+            // `routed_cut` REFUSES a stack it has no rule for rather than
+            // leaving it whole: an unsharded operand under the MoE all-reduce
+            // is summed twice, which is 2x, finite and fluent.
+            let cut = match shard {
+                Some(tp) if tp.is_split() => super::tpshard::routed_cut(tp, name, rows, logical)?,
+                _ => super::tpshard::Cut::Rows(0..rows),
+            };
+            let (cut_rows, cut_logical) = cut.dims(rows, logical);
+            let cut_elems = cut_rows * cut_logical;
+            let cut_payload = match nvfp4 {
+                true => NVFP4::payload_len(cut_elems),
+                false => cut_elems * 2,
+            };
+            shapes.insert(
+                name.clone(),
+                Shape {
+                    rows,
+                    logical,
+                    nvfp4,
+                    payload,
+                    cut,
+                    cut_rows,
+                    cut_logical,
+                    cut_payload,
+                },
+            );
         }
         let probe_secs = t_probe.elapsed().as_secs_f64();
 
@@ -1564,10 +1620,14 @@ impl PileSource {
         // pass runs at 4.4-4.5 GiB/s and is bound by the memory system, not by
         // the address arithmetic, so re-indexing 256-byte blocks inside it is
         // free. Per STARTUP, once, not per token.
+        // The CUT dims, not the stored ones: the permutation is applied to what
+        // is written, and a cut can leave a stack unswizzleable that the whole
+        // one was (or, at these shapes, vice versa). Reading the stored dims
+        // here would permute against a tiling the arena does not have.
         let swz = super::moegroup::swizzle_weights()
             && shapes
                 .values()
-                .all(|s| !s.nvfp4 || super::fp4gemm::swizzleable(s.rows, s.logical));
+                .all(|s| !s.nvfp4 || super::fp4gemm::swizzleable(s.cut_rows, s.cut_logical));
 
         let globals: std::collections::HashSet<&str> = global_dense.iter().copied().collect();
         for name in &globals {
@@ -1620,7 +1680,7 @@ impl PileSource {
         for key in &keys {
             let start = cursor;
             let end = start
-                .checked_add(shapes[&key.0].payload)
+                .checked_add(shapes[&key.0].cut_payload)
                 .context("weight share byte count overflow")?;
             cursor = end.next_multiple_of(VIEW_ALIGN);
             *per_layer.entry(self.experts[key].layer).or_default() += cursor - start;
@@ -1835,12 +1895,12 @@ impl PileSource {
             });
 
         enum Job<'a> {
-            Expert(&'a (String, i64), Shape),
+            Expert(&'a (String, i64), &'a Shape),
             Dense(&'a str),
         }
         let mut jobs: Vec<(usize, usize, Job)> = Vec::with_capacity(keys.len() + dense_names.len());
         for (k, &(start, end)) in keys.iter().zip(expert_offsets.iter()) {
-            jobs.push((start, end, Job::Expert(k, shapes[&k.0])));
+            jobs.push((start, end, Job::Expert(k, &shapes[&k.0])));
         }
         for (name, &(start, end)) in dense_names.iter().zip(dense_offsets.iter()) {
             jobs.push((start, end, Job::Dense(name.as_str())));
@@ -1949,12 +2009,12 @@ impl PileSource {
                                         }
                                     };
                                     anyhow::ensure!(
-                                        payload.len() == end - start,
+                                        payload.len() == shape.payload,
                                         "{}[{}] is {} bytes where its stack implies {}",
                                         k.0,
                                         k.1,
                                         payload.len(),
-                                        end - start,
+                                        shape.payload,
                                     );
                                     payload
                                 }
@@ -1962,33 +2022,67 @@ impl PileSource {
                             };
                             let dst = &mut buf[start - base..end - base];
                             match job {
-                                // The permutation rides inside the copy. The
-                                // three planes keep their lengths and their
-                                // order within the payload, so every byte
-                                // offset the alias seam computes -- and the
-                                // `scale2` tail -- is exactly where it was.
-                                Job::Expert(_, shape) if swz && shape.nvfp4 => {
+                                // BOTH transforms ride inside this one copy:
+                                // this rank's CUT of each plane, then the
+                                // MMA-fragment permutation of what the cut
+                                // kept. The three planes keep their order
+                                // within the payload -- codes, scales, the
+                                // `scale2` tail -- so every byte offset the
+                                // alias seam computes is where it was; only
+                                // the LENGTHS shrink with the cut.
+                                //
+                                // `cut_plane` borrows for a row cut (a span)
+                                // and gathers for a column cut, so `w13` costs
+                                // nothing over the old memcpy and `w2` pays a
+                                // gather into a buffer this pass was going to
+                                // write anyway.
+                                Job::Expert(_, shape) if shape.nvfp4 => {
+                                    use super::tpshard::{Plane, cut_plane};
                                     let elems = shape.rows * shape.logical;
-                                    let codes_len = elems / 2;
-                                    let scales_len = elems / NVFP4_BLOCK;
                                     let (c, sc, _) = split_payload(&src, elems)?;
+                                    let cc = cut_plane(
+                                        c,
+                                        shape.rows,
+                                        shape.logical,
+                                        Plane::NVFP4_CODES,
+                                        &shape.cut,
+                                    )?;
+                                    let cs = cut_plane(
+                                        sc,
+                                        shape.rows,
+                                        shape.logical,
+                                        Plane::NVFP4_SCALES,
+                                        &shape.cut,
+                                    )?;
+                                    let (n, k) = (shape.cut_rows, shape.cut_logical);
+                                    let codes_len = n * k / 2;
+                                    let scales_len = n * k / NVFP4_BLOCK;
                                     let (dc, rest) = dst.split_at_mut(codes_len);
                                     let (dsc, dtail) = rest.split_at_mut(scales_len);
-                                    super::fp4gemm::swizzle_b_codes_into(
-                                        c,
-                                        dc,
-                                        shape.rows,
-                                        shape.logical,
-                                    );
-                                    super::fp4gemm::swizzle_b_scales_into(
-                                        sc,
-                                        dsc,
-                                        shape.rows,
-                                        shape.logical,
-                                    );
-                                    dtail.copy_from_slice(&src[codes_len + scales_len..]);
+                                    if swz {
+                                        super::fp4gemm::swizzle_b_codes_into(&cc, dc, n, k);
+                                        super::fp4gemm::swizzle_b_scales_into(&cs, dsc, n, k);
+                                    } else {
+                                        dc.copy_from_slice(&cc);
+                                        dsc.copy_from_slice(&cs);
+                                    }
+                                    // `scale2` is a per-TENSOR constant, so the
+                                    // cut does not touch it -- half of a
+                                    // matrix quantised with a given second-level
+                                    // scale is still quantised with that scale.
+                                    dtail.copy_from_slice(&src[elems / 2 + elems / NVFP4_BLOCK..]);
                                 }
-                                _ => dst.copy_from_slice(&src),
+                                Job::Expert(_, shape) => {
+                                    let cut = super::tpshard::cut_plane(
+                                        &src,
+                                        shape.rows,
+                                        shape.logical,
+                                        super::tpshard::Plane::BF16,
+                                        &shape.cut,
+                                    )?;
+                                    dst.copy_from_slice(&cut);
+                                }
+                                Job::Dense(_) => dst.copy_from_slice(&src),
                             }
                             release.release(&src);
                         }
@@ -2011,6 +2105,28 @@ impl PileSource {
                 "row-major [n, k]"
             }
         );
+        // What was CUT, said in shapes rather than inferred from a byte count.
+        // A within-layer split that silently did not cut is the failure this
+        // whole path exists to prevent, and it is invisible in every other
+        // number the startup prints.
+        if let Some(tp) = shard.filter(|t| t.is_split()) {
+            let mut named: Vec<&String> = shapes.keys().collect();
+            named.sort();
+            for n in named {
+                let sh = &shapes[n];
+                println!(
+                    "    startup copy: rank {}/{} keeps {:?} of {} -- [{}, {}] of [{}, {}]",
+                    tp.rank(),
+                    tp.world(),
+                    sh.cut,
+                    n.rsplit('.').next().unwrap_or(n),
+                    sh.cut_rows,
+                    sh.cut_logical,
+                    sh.rows,
+                    sh.logical,
+                );
+            }
+        }
         println!(
             "    startup copy: {} shape probe{} {:.1}s, fetch+verify+copy {:.1}s ({:.2} GiB/s, {threads} thread{})",
             shapes.len(),
@@ -2031,14 +2147,17 @@ impl PileSource {
             .map_err(|e| anyhow::anyhow!("viewing the anonymous weight allocation: {e}"))?;
         let bytes = view.bytes();
         for ((key, shape), (start, end)) in
-            keys.iter().map(|k| (k, shapes[&k.0])).zip(expert_offsets)
+            keys.iter().map(|k| (k, &shapes[&k.0])).zip(expert_offsets)
         {
+            // The CUT dims. `expert_packed` derives its plane boundaries from
+            // these, so recording the stored ones would read a half-size slab
+            // with a full-size layout -- real weights, wrong places.
             self.copied_experts.insert(
                 key.clone(),
                 CopiedExpert {
                     payload: bytes.slice(skew + start..skew + end),
-                    rows: shape.rows,
-                    logical: shape.logical,
+                    rows: shape.cut_rows,
+                    logical: shape.cut_logical,
                     nvfp4: shape.nvfp4,
                 },
             );

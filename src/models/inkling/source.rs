@@ -293,15 +293,21 @@ impl Weights {
 
     /// Move this node's layer share and role-specific global tables into one
     /// anonymous startup allocation before any GPU handle can alias them.
+    ///
+    /// `shard` is the within-layer split: `Some(tp)` copies only this rank's
+    /// half of every routed expert. See
+    /// [`super::pile::PileSource::copy_share`] for why the cut belongs in this
+    /// copy and nowhere else.
     pub fn copy_share(
         &mut self,
         layers: std::ops::Range<usize>,
         global_dense: &[&str],
         attention_bytes: u64,
         policy: super::budget::AdmissionPolicy,
+        shard: Option<super::tp::Tp>,
     ) -> Result<(usize, usize, u64, u64)> {
         self.src
-            .copy_share(layers, global_dense, attention_bytes, policy)
+            .copy_share(layers, global_dense, attention_bytes, policy, shard)
     }
 
     // ---- what the source SAYS about itself --------------------------------

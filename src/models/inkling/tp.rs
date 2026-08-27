@@ -33,13 +33,17 @@
 //!
 //! A within-layer split wants two all-reduces per layer — after the attention
 //! out-projection and after the MoE down-projection — so **84 per token**, each
-//! `[1, 4096]`, 16 KB at f32, plus two at the ends (the embedding broadcast and
-//! the sharded-unembed reduce) for **86**.
+//! `[1, 4096]`, 16 KB at f32. Two more are POSSIBLE at the ends (an embedding
+//! broadcast and a sharded-unembed reduce) for 86, and this build issues
+//! **neither**: both tables are replicated instead, because neither sits under
+//! a reduce, so replicating them is correct and costs only bytes — 1.53 GiB of
+//! embedding residency and 0.103 GiB a token of head reads at the default
+//! `HeadLane::W4a16` + `INK_ANN_HEAD` shortlist, under 1% of a step.
 //!
 //! ```text
-//!   COMMS   86 x 29.56 us                             =    2.54 ms / token
-//!           86 x 16 KB                                =    1.34 MB / token
-//!           1.34 MB at the measured 13.02 GB/s        =    0.10 ms of WIRE
+//!   COMMS   84 x 29.56 us                             =    2.48 ms / token
+//!           84 x 16 KB                                =    1.31 MB / token
+//!           1.31 MB at the measured 13.02 GB/s        =    0.10 ms of WIRE
 //! ```
 //!
 //! For the record on the link's headline rate, because a wrong version of it
@@ -52,14 +56,14 @@
 //! measured the management NIC and concluded the opposite.
 //!
 //! None of that matters to the decision. The collective is latency-bound, so
-//! recovering the missing 45% of the link would move 0.10 ms of a 2.54 ms cost.
+//! recovering the missing 45% of the link would move 0.10 ms of a 2.48 ms cost.
 //!
-//! So the collective is **latency, not bandwidth** — 96% of those 2.54 ms is
+//! So the collective is **latency, not bandwidth** — 96% of those 2.48 ms is
 //! per-message overhead and only 4% is the wire. Two consequences that a
 //! bandwidth framing gets backwards:
 //!
 //! * **Do not quantise the all-reduce payload.** Sending BF16 instead of f32
-//!   halves 1.34 MB to 0.67 MB and saves ~0.05 ms of a 2.54 ms cost. It is not
+//!   halves 1.31 MB to 0.66 MB and saves ~0.05 ms of a 2.48 ms cost. It is not
 //!   worth the numerical argument.
 //! * **The only lever is FEWER messages**, and RMSNorm is nonlinear, so the two
 //!   per layer cannot be fused into one. 86 is the floor for this block shape.
@@ -83,11 +87,11 @@
 //! **105.2 ms** (`/tmp/pipe-abl` `base.rep1`, spark2 driving spark, layers 0:21
 //! and 21:42, `INK_KV=1`, batch one, 3738-token context, warm p50 over 4 steps,
 //! 9.505 tok/s). So **~94% of a batch-one step is weight bytes**, the pipeline
-//! split pays all of them in sequence, and 2.54 ms of collectives is **2.4% of
+//! split pays all of them in sequence, and 2.48 ms of collectives is **2.4% of
 //! the step** — the trade wins by roughly forty to one.
 //!
 //! Said as the comparison the objection asks for: a within-layer split buys
-//! ~49 ms a token of halved streaming and spends 2.54 ms to get it. **The
+//! ~49 ms a token of halved streaming and spends 2.48 ms to get it. **The
 //! answer to "does the per-layer all-reduce eat the bandwidth saving" is no,
 //! by a factor of nineteen.**
 //!
@@ -160,17 +164,18 @@
 //! millisecond taken out of the 1.25 ms/layer enqueue cost is then worth double
 //! what it is worth today.
 //!
-//! # Why the routed experts are split by EXPERT and not within an expert
+//! # Why the routed experts are split WITHIN an expert and not BY expert
 //!
 //! Two ways to halve a MoE layer, and they differ at batch one:
 //!
-//! * **Expert-parallel** (this module): rank `r` owns experts
-//!   `r * 128 .. (r+1) * 128`. A token's six routed experts fall wherever they
-//!   fall. Both ranks run the router (it is replicated and deterministic), each
-//!   computes the weighted sum over the experts it happens to own, and the one
-//!   all-reduce that the layer already needs sums the two partials. **No
-//!   input communication at all** — the residual is already replicated.
-//! * **Intra-expert**: every rank owns half of every expert's `w13`/`w2`.
+//! * **Intra-expert** (this module): every rank owns half of every expert's
+//!   intermediate axis -- `w13`'s rows and `w2`'s columns. Both ranks run the
+//!   router (it is replicated and deterministic), both compute every pick at
+//!   half width, and the one all-reduce the layer already needs sums the two
+//!   partials. **No input communication at all** -- the residual is already
+//!   replicated -- and the routed term halves EXACTLY.
+//! * **Expert-parallel**: rank `r` owns experts `r * 128 .. (r+1) * 128` and a
+//!   token's six picks fall wherever they fall.
 //!
 //! Expert-parallel does **not** halve the routed term at batch one, and the
 //! amount by which it misses is exactly computable. With top-6 split
@@ -182,25 +187,59 @@
 //!   P(max = k)     0.3125   0.46875  0.1875   0.03125     E = 3.9375
 //! ```
 //!
-//! So the routed term shrinks by 6 / 3.9375 = **1.52x**, where intra-expert
-//! would give a flat 2x. The gap is `(3.9375 - 3) * 13.5 MiB * 39 layers` =
-//! **0.48 GiB/token, about 3.5 ms**, which is ~5% of a projected TP2 step.
+//! So the routed term would shrink by 6 / 3.9375 = **1.52x** where this gives a
+//! flat 2x. The gap is `(3.9375 - 3) * 13.5 MiB * 39 layers` = **0.48
+//! GiB/token, about 3.5 ms**, which is ~5% of a projected TP2 step.
 //!
-//! Intra-expert sharding costs far more than 5% to build, and the reason is
-//! layout rather than arithmetic. [`super::moegroup`]'s whole design is that
-//! every expert slab is a **byte offset into one registered pile mapping**, so
-//! a layer's experts are reachable in one launch from a small offset table.
-//! `w13` is `[2*inter, hidden]` with the gate block followed by the up block,
-//! so an output-dim half is *two* disjoint ranges; `w2` is `[hidden, inter]`
-//! and a K-dim half is a stride, not a range. Neither is a span of the
-//! mapping, so intra-expert sharding means **rewriting the checkpoint** into
-//! per-rank piles — 72 GiB written per node, plus an NVFP4 scale-plane
-//! relayout — to buy 3.5 ms. Expert-parallel is a filter on
-//! `pile::expert_keys_in` and nothing else.
+//! ## The layout objection, which was WRONG about this tree
+//!
+//! This section used to argue the other way, and the argument was: every
+//! expert slab is a byte offset into one registered mapping, `w13` is two
+//! disjoint ranges and `w2`'s K-dim half is a stride, so intra-expert
+//! sharding means **rewriting the checkpoint** -- 72 GiB a node -- to buy 3.5
+//! ms. Three things in that are false here.
+//!
+//! 1. **The rewrite already happens.** [`super::pile::PileSource::copy_share`]
+//!    copies this node's whole share out of the mapping into one anonymous
+//!    arena at startup, and the offset table is built against the ARENA. The
+//!    cut is a change of source index inside a memcpy that already runs.
+//! 2. **A permutation inside that memcpy is already known to be free.** The
+//!    `INK_SWZ` MMA-fragment swizzle re-indexes 256-byte blocks in the same
+//!    pass and was measured at 14.6/14.7/14.8 s against 15.0/15.1/15.9 s NOT
+//!    permuting, on 66.50 GiB with 20 threads -- the permuting arm is faster
+//!    by the spread. The pass is bound by the memory system, not the address
+//!    arithmetic. A cut is strictly cheaper still: it moves HALF the bytes.
+//! 3. **`w13` is not two ranges.** `mlp.experts.w13_weight` is converted with
+//!    `Interleave(dim=1)` and left fused, so its output rows alternate
+//!    `g0, u0, g1, u1, ...` -- which `super::fp4gemm::gate_up_silu` reads
+//!    directly. A rank's share of the INTERMEDIATE axis is therefore one
+//!    CONTIGUOUS run of `2 * inter / world` rows, gate and up already paired.
+//!    See [`Tp::w13_interleaved_rows`]. (`w2` is still a column cut, and that
+//!    is still a gather -- but a gather into a buffer the copy was going to
+//!    write anyway costs nothing extra.)
+//!
+//! So the arena SHRINKS with the cut, the copy gets faster, and the routed
+//! term halves flat instead of by 1.52x. The remaining honest cost of
+//! intra-expert is that both ranks run all six picks, so the LAUNCH count per
+//! layer does not fall -- which is the same host-enqueue term the projection
+//! above already names as the binding constraint, and expert-parallel does not
+//! escape it either (it launches `E[max] = 3.94` picks, not 3).
+//!
+//! ## What expert-parallel would additionally have cost, which is not layout
+//!
+//! [`super::devplan`]'s hoist. Six of [`super::moegroup::RowPlan`]'s seven
+//! fields are a function of `(n, top_k)` ALONE, uploaded once for the whole
+//! run, and that is what deleted an 8.1 ms/step readback (`INK_ROUTE_STALE=1`
+//! against base, 72.2 -> 64.1 ms/step). Expert-parallel makes the number of
+//! blocks a rank runs DATA-DEPENDENT -- between 0 and 6 -- so `blk_slot`,
+//! `tok_rows` and `tok_cnt` change per layer per pass and have to come back
+//! from the device. Restoring an 8.1 ms readback to buy 3.5 ms is a loss
+//! before any of the layout question is reached.
 //!
 //! Note also that the imbalance is a batch-one artifact: at `INK_SLOTS=32` the
 //! active-expert set is ~113 of 256 and the two halves differ by a few percent,
-//! so the same code is much closer to 2x on a wide pass.
+//! so expert-parallel is much closer to 2x on a wide pass. The lane this
+//! module exists for is batch one.
 //!
 //! # Where the reduces are, and the three places that need none
 //!
@@ -423,16 +462,32 @@ impl Tp {
         Ok(h.start * d_rel..h.end * d_rel)
     }
 
-    /// Routed experts. This is the expert-parallel cut, and it is the one that
-    /// does not balance at batch one — see the module header.
-    pub fn routed_experts(self, n_routed: usize) -> Result<Range<usize>, Indivisible> {
-        self.shard("n_routed_experts", n_routed)
+    /// The ROUTED experts' intermediate axis -- the intra-expert cut.
+    ///
+    /// Every expert of every MoE layer is cut the same way and by the same
+    /// range, so a rank's `w13` rows and its `w2` columns name the same
+    /// intermediate units and the two partials add to the whole. This is the
+    /// axis, not the weight: [`Tp::w13_interleaved_rows`] turns it into `w13`'s
+    /// row range and the range itself is `w2`'s column range.
+    ///
+    /// It replaced an expert-parallel cut (`rank * 128 .. (rank+1) * 128` of
+    /// `n_routed_experts`) on 2026-08-27; the module header says why, and the
+    /// short version is that expert-parallel buys 1.52x rather than 2x at batch
+    /// one AND makes `devplan`'s block count data-dependent.
+    pub fn routed_inter(self, inter: usize) -> Result<Range<usize>, Indivisible> {
+        self.shard("intermediate_size", inter)
     }
 
-    /// Shared experts, by instance. Two experts and two ranks on this
-    /// hardware, so this is exact.
-    pub fn shared_experts(self, n_shared: usize) -> Result<Range<usize>, Indivisible> {
-        self.shard("n_shared_experts", n_shared)
+    /// The SHARED experts' intermediate axis.
+    ///
+    /// The same cut as [`Tp::routed_inter`] and deliberately not a cut by
+    /// INSTANCE. By instance is exact on this hardware (two experts, two
+    /// ranks) and stops being exact on any other, and it would need the shared
+    /// gamma column lifted by the rank at every call site -- an off-by-one that
+    /// produces finite numbers. Cutting the intermediate axis leaves
+    /// `n_shared` at 2 on both ranks, so nothing downstream of the bind moves.
+    pub fn shared_inter(self, inter: usize) -> Result<Range<usize>, Indivisible> {
+        self.shard("intermediate_size", inter)
     }
 
     /// Unembed rows. Column-parallel over the vocabulary, reduced to one
@@ -455,23 +510,45 @@ impl Tp {
     /// The dense MLP's intermediate axis, for layers below `dense_mlp_idx`.
     ///
     /// Column-parallel on `w13` and row-parallel on `w2`, which means the same
-    /// single all-reduce the MoE layers pay. Note the caveat the module header
-    /// raises for experts applies here too: `w13` is `[2 * dense_inter, hidden]`
-    /// with gate before up, so a rank's half is TWO ranges and the bind cannot
-    /// alias the mapping. That is affordable for exactly two layers — 384 MiB
-    /// each — and is the same non-aliased host concatenation
-    /// `INK_FUSE_QKVR` already performs per layer.
+    /// single all-reduce the MoE layers pay. `mlp.w13_dn.weight` is stored
+    /// INTERLEAVED and `super::load::split_gate_up_bytes` de-interleaves it into
+    /// two `[dense_inter, hidden]` buffers before anything binds, so a rank's
+    /// share is one plain row range of EACH of those -- not of the fused
+    /// weight. Two layers, so the copy is 384 MiB each and is the same
+    /// non-aliased host concatenation `INK_FUSE_QKVR` already performs.
     pub fn dense_inter(self, dense_inter: usize) -> Result<Range<usize>, Indivisible> {
         self.shard("dense_intermediate_size", dense_inter)
     }
 
-    /// The two disjoint row ranges of a rank's `w13` half: the gate block's
+    /// A rank's `w13` rows when the fused weight is stored INTERLEAVED --
+    /// `g0, u0, g1, u1, ...` -- which is how `mlp.experts.w13_weight` is
+    /// stored and how [`super::fp4gemm::gate_up_silu`] reads it.
+    ///
+    /// One CONTIGUOUS range of `2 * inter / world` rows, because interleaving
+    /// keeps each intermediate unit's gate row and up row adjacent. This is the
+    /// reason the routed cut is a span of the arena rather than a gather.
+    ///
+    /// Split out and named for the LAYOUT rather than for the weight, because
+    /// the two layouts are shape-identical and the wrong one produces finite
+    /// numbers: read as HALVED, this range is the first half of the gates and
+    /// none of the ups.
+    pub fn w13_interleaved_rows(self, inter: usize) -> Result<Range<usize>, Indivisible> {
+        let s = self.shard("intermediate_size", inter)?;
+        Ok(2 * s.start..2 * s.end)
+    }
+
+    /// A rank's `w13` rows when the fused weight is stored HALVED -- every gate
+    /// row, then every up row -- which is what `INK_SHARED_W13_HALVED=1`
+    /// selects for `shared_w13_weight`. TWO disjoint ranges: the gate block's
     /// share, then the up block's.
     ///
-    /// Split out because getting this wrong is silent — a contiguous
+    /// Split out because getting this wrong is silent -- a contiguous
     /// `[0 .. inter]` slice of `[2 * inter, hidden]` is all of the gate and
     /// none of the up, which produces finite numbers and fluent text.
-    pub fn w13_halves(self, inter: usize) -> Result<(Range<usize>, Range<usize>), Indivisible> {
+    pub fn w13_halved_rows(
+        self,
+        inter: usize,
+    ) -> Result<(Range<usize>, Range<usize>), Indivisible> {
         let g = self.shard("intermediate_size", inter)?;
         let u = g.start + inter..g.end + inter;
         Ok((g, u))
@@ -481,10 +558,20 @@ impl Tp {
 /// How many collectives one token costs at a given layer count, so the number
 /// in the header can be recomputed rather than trusted.
 ///
-/// Two per layer, plus the embedding broadcast rank 0 sends, plus the
-/// `(value, index)` reduce that closes the sharded unembedding.
-pub const fn collectives_per_token(layers: usize) -> usize {
-    2 * layers + 2
+/// Two per layer -- after `wo` and after the MoE down-projection -- and in this
+/// build that is ALL of them, so `ends` is 0. The embedding table and the
+/// unembedding are REPLICATED rather than cut: neither sits under a reduce (the
+/// final hidden state is already whole when it reaches the head, and nothing
+/// reduces the logits), so both ranks compute the same logits and take the same
+/// argmax without a collective.
+///
+/// `ends` is what cutting them WOULD add -- 1 for the embedding broadcast, 1
+/// for the `(value, index)` reduce that closes a sharded unembedding -- and it
+/// is a parameter rather than a constant `2` because a caller that assumes the
+/// ends are cut when they are not is measuring 2.4% of a collective budget that
+/// does not exist.
+pub const fn collectives_per_token(layers: usize, ends: usize) -> usize {
+    2 * layers + ends
 }
 
 /// Microseconds one token spends in collectives, at a measured per-collective
@@ -494,8 +581,8 @@ pub const fn collectives_per_token(layers: usize) -> usize {
 /// `scripts/interconnect_probe.sh` at 4096 f32 on the ConnectX pair. It is a
 /// LATENCY: at this size the wire is 4% of it, so a caller that halves the
 /// payload should not expect this number to move.
-pub fn collective_ms_per_token(layers: usize, us_each: f64) -> f64 {
-    collectives_per_token(layers) as f64 * us_each / 1000.0
+pub fn collective_ms_per_token(layers: usize, ends: usize, us_each: f64) -> f64 {
+    collectives_per_token(layers, ends) as f64 * us_each / 1000.0
 }
 
 #[cfg(test)]
@@ -522,7 +609,7 @@ mod tests {
         let t = Tp::default();
         assert!(!t.is_split());
         assert_eq!(t.q_heads(HEADS).unwrap(), 0..HEADS);
-        assert_eq!(t.routed_experts(N_ROUTED).unwrap(), 0..N_ROUTED);
+        assert_eq!(t.routed_inter(INTER).unwrap(), 0..INTER);
         assert_eq!(t.unembed_offset(VOCAB).unwrap(), 0);
     }
 
@@ -595,11 +682,56 @@ mod tests {
         }
     }
 
+    /// Every MLP-family weight is cut on the SAME axis by the SAME range, which
+    /// is what lets one all-reduce close all of them.
     #[test]
-    fn each_rank_owns_one_shared_expert() {
+    fn routed_shared_and_dense_all_cut_the_intermediate_axis() {
         let (a, b) = pair();
-        assert_eq!(a.shared_experts(N_SHARED).unwrap(), 0..1);
-        assert_eq!(b.shared_experts(N_SHARED).unwrap(), 1..2);
+        assert_eq!(a.routed_inter(INTER).unwrap(), 0..1024);
+        assert_eq!(b.routed_inter(INTER).unwrap(), 1024..2048);
+        assert_eq!(
+            a.shared_inter(INTER).unwrap(),
+            a.routed_inter(INTER).unwrap()
+        );
+        assert_eq!(
+            b.shared_inter(INTER).unwrap(),
+            b.routed_inter(INTER).unwrap()
+        );
+        assert_eq!(a.dense_inter(DENSE_INTER).unwrap(), 0..8192);
+        assert_eq!(b.dense_inter(DENSE_INTER).unwrap(), 8192..16384);
+        // `n_shared` is NOT cut: both ranks still hold both shared experts, at
+        // half width each. A cut by instance would leave `n_shared == 1` and
+        // silently shift every shared gamma column by the rank.
+        for t in [a, b] {
+            assert_eq!(t.shared_inter(INTER).unwrap().len(), INTER / 2);
+        }
+        let _ = N_SHARED;
+    }
+
+    /// The interleaved layout's whole point: one contiguous run, gate and up
+    /// already paired, and it is NOT the halved layout's first range.
+    #[test]
+    fn interleaved_w13_rows_are_one_run_and_halved_rows_are_two() {
+        let (a, b) = pair();
+        assert_eq!(a.w13_interleaved_rows(INTER).unwrap(), 0..2048);
+        assert_eq!(b.w13_interleaved_rows(INTER).unwrap(), 2048..4096);
+        // Together they tile `[0, 2 * inter)` exactly once.
+        let mut seen = vec![0u8; 2 * INTER];
+        for r in [
+            a.w13_interleaved_rows(INTER).unwrap(),
+            b.w13_interleaved_rows(INTER).unwrap(),
+        ] {
+            for i in r {
+                seen[i] += 1;
+            }
+        }
+        assert!(seen.iter().all(|&c| c == 1));
+        // The wrong reading, pinned: rank 0's interleaved run and rank 0's
+        // halved GATE range are both row ranges of the same weight and they are
+        // not the same rows. Reading one as the other is finite and fluent.
+        let (g, u) = a.w13_halved_rows(INTER).unwrap();
+        assert_eq!((g.clone(), u), (0..1024, 2048..3072));
+        assert_ne!(a.w13_interleaved_rows(INTER).unwrap(), g);
     }
 
     #[test]
@@ -638,10 +770,10 @@ mod tests {
     /// The failure this exists to make loud: a contiguous half of
     /// `[2 * inter, hidden]` is all gate and no up.
     #[test]
-    fn w13_halves_are_two_disjoint_ranges_not_one() {
+    fn w13_halved_rows_are_two_disjoint_ranges_not_one() {
         let (a, b) = pair();
-        let (ga, ua) = a.w13_halves(INTER).unwrap();
-        let (gb, ub) = b.w13_halves(INTER).unwrap();
+        let (ga, ua) = a.w13_halved_rows(INTER).unwrap();
+        let (gb, ub) = b.w13_halved_rows(INTER).unwrap();
         assert_eq!(ga, 0..1024);
         assert_eq!(ua, 2048..3072);
         assert_eq!(gb, 1024..2048);
@@ -677,15 +809,19 @@ mod tests {
     /// The header's headline number, recomputed rather than quoted.
     #[test]
     fn the_collective_budget_is_two_and_a_half_milliseconds_a_token() {
-        assert_eq!(collectives_per_token(42), 86);
-        let ms = collective_ms_per_token(42, 29.56);
+        // What this build issues: two a layer and nothing at the ends.
+        assert_eq!(collectives_per_token(42, 0), 84);
+        let ms = collective_ms_per_token(42, 0, 29.56);
         assert!(
-            (ms - 2.542).abs() < 1e-3,
-            "84 layer collectives + 2 ends at 29.56 us is {ms} ms"
+            (ms - 2.483).abs() < 1e-3,
+            "84 layer collectives at 29.56 us is {ms} ms"
         );
         // Against the measured 105.2 ms/token two-node round trip, that is
         // under 3% -- the claim the whole design rests on.
         assert!(ms / 105.2 < 0.03);
+        // What cutting the two ends WOULD add, so the 86 that circulates is
+        // recomputable rather than merely remembered.
+        assert_eq!(collectives_per_token(42, 2), 86);
     }
 
     /// Expert-parallel does not balance at batch one, and this is by how much.

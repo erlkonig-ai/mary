@@ -24,7 +24,7 @@
 set -u
 TAG=${1:-tp}
 REPS=${2:-9}
-NCOLL=${3:-86}
+NCOLL=${3:-84}
 REMOTE_USER=${REMOTE_USER:-$(id -un)}
 # The PEER on the fast fabric. This is the ConnectX pair, not the management
 # NIC and not ZeroTier: measuring the wrong NIC is the exact mistake

@@ -199,6 +199,182 @@ impl std::fmt::Display for ShardCost {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The cut the ROUTED EXPERTS take, which happens inside the startup copy.
+// ---------------------------------------------------------------------------
+
+/// Which axis of one stored `[rows, cols]` matrix a rank keeps.
+///
+/// Named for the AXIS and not for the weight, because the two matrices of one
+/// expert are cut on different axes by the same [`super::tp::Tp`] range and
+/// swapping them is the silent failure this module exists for: `w13` cut on
+/// columns and `w2` cut on rows is a real matrix of real weights, of the right
+/// shape, computing a different model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Cut {
+    /// A run of whole ROWS -- the OUTPUT axis. Contiguous in a row-major
+    /// store, so the copy is one `memcpy` per plane.
+    Rows(Range<usize>),
+    /// A run of COLUMNS -- the INPUT axis. `rows` separate runs; the copy
+    /// gathers.
+    Cols(Range<usize>),
+}
+
+impl Cut {
+    /// The dims of the cut matrix, given the whole one's.
+    pub fn dims(&self, rows: usize, cols: usize) -> (usize, usize) {
+        match self {
+            Cut::Rows(r) => (r.len(), cols),
+            Cut::Cols(c) => (rows, c.len()),
+        }
+    }
+
+    /// Whether this is the identity -- the whole matrix, uncut.
+    pub fn is_whole(&self, rows: usize, cols: usize) -> bool {
+        match self {
+            Cut::Rows(r) => *r == (0..rows),
+            Cut::Cols(c) => *c == (0..cols),
+        }
+    }
+}
+
+/// How many bytes one row-major plane spends per column: `num` bytes per `den`
+/// columns.
+///
+/// NVFP4 codes are one nibble a column (`1/2`), its E4M3 block scales are one
+/// byte per sixteen (`1/16`), and BF16 is two bytes a column (`2/1`). Stating
+/// the RATIO rather than a byte width is what lets one cutter serve all three,
+/// and it is what makes a column range that does not land on a byte boundary an
+/// error HERE rather than a half-byte shift that reads as slightly different
+/// weights.
+#[derive(Clone, Copy, Debug)]
+pub struct Plane {
+    pub num: usize,
+    pub den: usize,
+}
+
+impl Plane {
+    /// NVFP4 4-bit codes: two columns to the byte.
+    pub const NVFP4_CODES: Plane = Plane { num: 1, den: 2 };
+    /// NVFP4 E4M3 block scales: one byte per 16 columns.
+    pub const NVFP4_SCALES: Plane = Plane { num: 1, den: 16 };
+    /// BF16: two bytes a column.
+    pub const BF16: Plane = Plane { num: 2, den: 1 };
+
+    fn bytes(&self, cols: usize) -> anyhow::Result<usize> {
+        anyhow::ensure!(
+            cols % self.den == 0,
+            "a plane of {}/{} bytes per column cannot address {cols} columns: the boundary \
+             falls inside a byte, and a half-byte shift is a different weight, not a smaller one",
+            self.num,
+            self.den
+        );
+        Ok(cols / self.den * self.num)
+    }
+}
+
+/// This rank's share of one row-major plane.
+///
+/// Returns a BORROW for [`Cut::Rows`] -- a row range is a span, so the arena
+/// copy that follows is the only copy -- and an owned gather for [`Cut::Cols`].
+/// The type says which, at every call site, for the same reason [`rows`] and
+/// [`cols`] have different return types.
+pub fn cut_plane<'a>(
+    src: &'a [u8],
+    rows: usize,
+    cols: usize,
+    plane: Plane,
+    cut: &Cut,
+) -> anyhow::Result<std::borrow::Cow<'a, [u8]>> {
+    let stride = plane.bytes(cols)?;
+    anyhow::ensure!(
+        src.len() == rows * stride,
+        "a [{rows}, {cols}] plane of {}/{} bytes per column is {} bytes, got {}",
+        plane.num,
+        plane.den,
+        rows * stride,
+        src.len()
+    );
+    match cut {
+        Cut::Rows(r) => {
+            anyhow::ensure!(
+                r.end <= rows,
+                "rows {}..{} run past a [{rows}, {cols}] plane",
+                r.start,
+                r.end
+            );
+            Ok(std::borrow::Cow::Borrowed(
+                &src[r.start * stride..r.end * stride],
+            ))
+        }
+        Cut::Cols(c) => {
+            anyhow::ensure!(
+                c.end <= cols,
+                "columns {}..{} run past a [{rows}, {cols}] plane",
+                c.start,
+                c.end
+            );
+            let lo = plane.bytes(c.start)?;
+            let hi = plane.bytes(c.end)?;
+            let mut out = Vec::with_capacity(rows * (hi - lo));
+            for r in 0..rows {
+                out.extend_from_slice(&src[r * stride + lo..r * stride + hi]);
+            }
+            Ok(std::borrow::Cow::Owned(out))
+        }
+    }
+}
+
+/// This rank's cut of one routed-expert stacked matrix, chosen by NAME.
+///
+/// The two matrices are cut on DIFFERENT axes and by the SAME intermediate
+/// range, and which is which is a fact about the checkpoint rather than about
+/// the caller -- so it is decided here, once, from the name the pile stores:
+///
+/// * `mlp.experts.w13_weight` is `[2 * inter, hidden]` with its output rows
+///   INTERLEAVED `g0, u0, g1, u1, ...` (`Interleave(dim=1)` in the conversion,
+///   and what [`super::fp4gemm::gate_up_silu`] reads). A rank's share of the
+///   intermediate axis is therefore ONE contiguous run of `2 * inter / world`
+///   rows -- see [`super::tp::Tp::w13_interleaved_rows`].
+/// * `mlp.experts.w2_weight` is `[hidden, inter]`, so the same intermediate
+///   range is a COLUMN range.
+///
+/// A name this does not know is an ERROR and never "leave it whole": an
+/// unsharded operand under an all-reduce is not less parallel, it is summed
+/// twice. If a new expert stack appears, it has to be cut here or the run has
+/// to refuse.
+pub fn routed_cut(
+    tp: crate::models::inkling::tp::Tp,
+    name: &str,
+    rows: usize,
+    cols: usize,
+) -> anyhow::Result<Cut> {
+    let base = name.rsplit('.').take(3).collect::<Vec<_>>();
+    // `model.llm.layers.7.mlp.experts.w13_weight` -> ["w13_weight", "experts", "mlp"]
+    match (base.first().copied(), base.get(1).copied()) {
+        (Some("w13_weight"), Some("experts")) => {
+            anyhow::ensure!(
+                rows % 2 == 0,
+                "{name} is [{rows}, {cols}]; a fused gate/up matrix has an even row count"
+            );
+            Ok(Cut::Rows(
+                tp.w13_interleaved_rows(rows / 2)
+                    .map_err(|e| anyhow::anyhow!("{name}: {e}"))?,
+            ))
+        }
+        (Some("w2_weight"), Some("experts")) => Ok(Cut::Cols(
+            tp.routed_inter(cols)
+                .map_err(|e| anyhow::anyhow!("{name}: {e}"))?,
+        )),
+        _ => anyhow::bail!(
+            "{name} is an expert stack this split does not know how to cut. Every routed \
+             operand sits under the MoE all-reduce, so leaving one whole makes both ranks \
+             compute it and the reduce sum two copies -- 2x, finite, and fluent. Add its cut \
+             to `tpshard::routed_cut` or run without INK_TP."
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,7 +462,7 @@ mod tests {
         let b = slab(2 * INTER, 4);
         let s = Slab::new(&b, 2 * INTER, 4, 2).unwrap();
         let t = Tp::new(0, 2).unwrap();
-        let (g, u) = t.w13_halves(INTER).unwrap();
+        let (g, u) = t.w13_halved_rows(INTER).unwrap();
         assert_eq!((g.clone(), u.clone()), (0..4, 8..12));
         let mine = w13_rows(&s, g, u).unwrap();
         assert_eq!(mine.len(), 8 * 4 * 2);
@@ -304,14 +480,14 @@ mod tests {
     }
 
     #[test]
-    fn both_ranks_w13_halves_reassemble_the_whole_weight() {
+    fn both_ranks_w13_halved_rows_reassemble_the_whole_weight() {
         const INTER: usize = 8;
         let b = slab(2 * INTER, 4);
         let s = Slab::new(&b, 2 * INTER, 4, 2).unwrap();
         let mut seen: Vec<u16> = Vec::new();
         for rank in 0..2 {
             let t = Tp::new(rank, 2).unwrap();
-            let (g, u) = t.w13_halves(INTER).unwrap();
+            let (g, u) = t.w13_halved_rows(INTER).unwrap();
             let mine = w13_rows(&s, g, u).unwrap();
             for i in 0..mine.len() / 2 {
                 seen.push(at(&mine, i));
@@ -342,6 +518,135 @@ mod tests {
         assert!(w13_rows(&s, 0..8, 4..12).is_err());
         // Unequal shares are refused too.
         assert!(w13_rows(&s, 0..4, 8..14).is_err());
+    }
+
+    /// A row cut is a span and a column cut is a gather, on a plane whose
+    /// element is HALF A BYTE -- which is the case `rows`/`cols` above cannot
+    /// express and the routed experts are entirely made of.
+    #[test]
+    fn a_nibble_plane_cuts_on_both_axes() {
+        // [4, 8] NVFP4 codes: 4 bytes a row, byte `r * 4 + c/2` holds columns
+        // `2c, 2c+1`.
+        let src: Vec<u8> = (0..16u8).collect();
+        let s = &src[..];
+        let top = cut_plane(s, 4, 8, Plane::NVFP4_CODES, &Cut::Rows(2..4)).unwrap();
+        assert_eq!(&*top, &[8, 9, 10, 11, 12, 13, 14, 15]);
+        let right = cut_plane(s, 4, 8, Plane::NVFP4_CODES, &Cut::Cols(4..8)).unwrap();
+        // Columns 4..8 are bytes 2..4 of every row.
+        assert_eq!(&*right, &[2, 3, 6, 7, 10, 11, 14, 15]);
+        // and the two are not the same bytes, or this proves nothing
+        assert_ne!(&*top, &*right);
+    }
+
+    /// The half-byte boundary, refused rather than shifted.
+    #[test]
+    fn a_column_cut_that_lands_inside_a_byte_is_refused() {
+        // 4-bit codes cannot start at column 3.
+        let codes = vec![0u8; 4 * 4];
+        assert!(cut_plane(&codes, 4, 8, Plane::NVFP4_CODES, &Cut::Cols(3..7)).is_err());
+        assert!(cut_plane(&codes, 4, 8, Plane::NVFP4_CODES, &Cut::Cols(2..6)).is_ok());
+        // and E4M3 scales cannot start at column 8 of a 16-per-byte grouping.
+        // `[2, 32]` scales are one byte per 16 columns: 2 rows x 2 bytes.
+        let sc = vec![0u8; 2 * 2];
+        assert!(cut_plane(&sc, 2, 32, Plane::NVFP4_SCALES, &Cut::Cols(8..24)).is_err());
+        assert!(cut_plane(&sc, 2, 32, Plane::NVFP4_SCALES, &Cut::Cols(0..16)).is_ok());
+    }
+
+    /// The two ranks' cuts tile the plane, on both axes and at both widths.
+    #[test]
+    fn the_two_ranks_plane_cuts_tile_the_plane() {
+        let (a, b) = (Tp::new(0, 2).unwrap(), Tp::new(1, 2).unwrap());
+        let src: Vec<u8> = (0..64u8).collect();
+        // Rows: concatenation is the original.
+        let mut joined = cut_plane(
+            &src,
+            8,
+            16,
+            Plane::NVFP4_CODES,
+            &Cut::Rows(a.shard("r", 8).unwrap()),
+        )
+        .unwrap()
+        .into_owned();
+        joined.extend_from_slice(
+            &cut_plane(
+                &src,
+                8,
+                16,
+                Plane::NVFP4_CODES,
+                &Cut::Rows(b.shard("r", 8).unwrap()),
+            )
+            .unwrap(),
+        );
+        assert_eq!(joined, src);
+        // Columns: interleaving row by row is the original.
+        let l = cut_plane(
+            &src,
+            8,
+            16,
+            Plane::NVFP4_CODES,
+            &Cut::Cols(a.shard("c", 16).unwrap()),
+        )
+        .unwrap()
+        .into_owned();
+        let r = cut_plane(
+            &src,
+            8,
+            16,
+            Plane::NVFP4_CODES,
+            &Cut::Cols(b.shard("c", 16).unwrap()),
+        )
+        .unwrap()
+        .into_owned();
+        let mut back = Vec::new();
+        for row in 0..8 {
+            back.extend_from_slice(&l[row * 4..(row + 1) * 4]);
+            back.extend_from_slice(&r[row * 4..(row + 1) * 4]);
+        }
+        assert_eq!(back, src);
+    }
+
+    /// The routed cut names the axis from the WEIGHT, and gets both right.
+    #[test]
+    fn the_routed_cut_reads_w13_by_row_and_w2_by_column() {
+        const INTER: usize = 2048;
+        const H: usize = 4096;
+        let (a, b) = (Tp::new(0, 2).unwrap(), Tp::new(1, 2).unwrap());
+        let n13 = "model.llm.layers.7.mlp.experts.w13_weight";
+        let n2 = "model.llm.layers.7.mlp.experts.w2_weight";
+        assert_eq!(
+            routed_cut(a, n13, 2 * INTER, H).unwrap(),
+            Cut::Rows(0..2048)
+        );
+        assert_eq!(
+            routed_cut(b, n13, 2 * INTER, H).unwrap(),
+            Cut::Rows(2048..4096)
+        );
+        assert_eq!(routed_cut(a, n2, H, INTER).unwrap(), Cut::Cols(0..1024));
+        assert_eq!(routed_cut(b, n2, H, INTER).unwrap(), Cut::Cols(1024..2048));
+        // The shapes agree: rank r's w13 produces `inter/2` intermediate units
+        // and its w2 consumes exactly `inter/2` of them.
+        let (r13, c13) = routed_cut(b, n13, 2 * INTER, H).unwrap().dims(2 * INTER, H);
+        let (r2, c2) = routed_cut(b, n2, H, INTER).unwrap().dims(H, INTER);
+        assert_eq!(
+            r13 / 2,
+            c2,
+            "w13's rows and w2's columns must name the same units"
+        );
+        assert_eq!((c13, r2), (H, H));
+    }
+
+    /// A stack nobody taught this about is an ERROR, not a pass-through.
+    #[test]
+    fn an_unknown_expert_stack_is_refused_rather_than_left_whole() {
+        let a = Tp::new(0, 2).unwrap();
+        let e = routed_cut(a, "model.llm.layers.7.mlp.experts.w4_weight", 16, 16).unwrap_err();
+        assert!(e.to_string().contains("does not know how to cut"));
+        // and the identity world still cuts nothing
+        let one = Tp::default();
+        assert_eq!(
+            routed_cut(one, "model.llm.layers.7.mlp.experts.w2_weight", 16, 16).unwrap(),
+            Cut::Cols(0..16)
+        );
     }
 
     #[test]

@@ -3203,6 +3203,7 @@ fn report_align(charged: u64) {
 impl DeviceDense {
     /// One layer's shared experts, bound on first use.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn shared_for(
         &mut self,
         cp: &Weights,
@@ -3213,6 +3214,7 @@ impl DeviceDense {
         inter: usize,
         h: usize,
         halved: bool,
+        tp: Option<mary::models::inkling::tp::Tp>,
     ) -> Result<&SharedOnDevice> {
         if !self.shared.contains_key(p) {
             let fused = cp.stored(&format!("{p}mlp.shared_experts.shared_w13_weight"))?;
@@ -3227,6 +3229,64 @@ impl DeviceDense {
             );
             let d = cp.stored(&format!("{p}mlp.shared_experts.shared_w2_weight"))?;
             anyhow::ensure!(d.elem == Elem::Bf16, "shared_w2 is {:?}", d.elem);
+            // ---- this rank's half of the intermediate axis -----------------
+            //
+            // Cut AFTER the gate/up split and PER EXPERT, which is what makes
+            // this one line rather than a second reading of the fused layout:
+            // `split_shared_w13_bytes` has already handed back `g` and `u` as
+            // `[n_shared * inter, hidden]` with every expert contiguous, so a
+            // rank's share is rows `s * inter + r` of each, for each `s`.
+            //
+            // Cut by the INTERMEDIATE axis and deliberately not by INSTANCE.
+            // By instance is exact here (two experts, two ranks) and stops
+            // being exact anywhere else, and it would leave `n_shared == 1`
+            // locally -- which shifts every shared gamma column by the rank at
+            // three call sites, silently. This way `n_shared` is 2 on both
+            // ranks and nothing downstream of the bind moves.
+            let cut = match tp {
+                None => None,
+                Some(tp) => Some(
+                    tp.shared_inter(inter)
+                        .map_err(|e| anyhow::anyhow!("shared experts: {e}"))?,
+                ),
+            };
+            let per_expert_rows = |src: &[u8]| -> Result<Vec<u8>> {
+                let Some(r) = cut.clone() else {
+                    return Ok(src.to_vec());
+                };
+                let slab = mary::models::inkling::tpshard::Slab::new(src, n_shared * inter, h, 2)?;
+                let mut out = Vec::with_capacity(n_shared * r.len() * h * 2);
+                for e in 0..n_shared {
+                    out.extend_from_slice(mary::models::inkling::tpshard::rows(
+                        &slab,
+                        e * inter + r.start..e * inter + r.end,
+                    )?);
+                }
+                Ok(out)
+            };
+            let (g, u) = (per_expert_rows(&g)?, per_expert_rows(&u)?);
+            // `w2` is `[n_shared][hidden][inter]`, so the same range is a
+            // COLUMN range of each expert's block -- a gather, and the one
+            // place the shared cut costs a copy the whole weight did not. It
+            // is 8 MiB a layer against 100.7 MiB the layer streams, and the
+            // W4A16 bind below re-encodes it anyway, so the copy is not held.
+            let d_bytes: std::borrow::Cow<'_, [u8]> = match cut.clone() {
+                None => std::borrow::Cow::Borrowed(&d.bytes[..]),
+                Some(r) => {
+                    let mut out = Vec::with_capacity(n_shared * h * r.len() * 2);
+                    for e in 0..n_shared {
+                        let blk = &d.bytes[e * h * inter * 2..(e + 1) * h * inter * 2];
+                        let slab = mary::models::inkling::tpshard::Slab::new(blk, h, inter, 2)?;
+                        out.extend_from_slice(&mary::models::inkling::tpshard::cols(
+                            &slab,
+                            r.clone(),
+                        )?);
+                    }
+                    std::borrow::Cow::Owned(out)
+                }
+            };
+            // From here down every `inter` is THIS RANK's.
+            let inter = cut.map(|r| r.len()).unwrap_or(inter);
             let per_d = h * inter * 2;
             // Gate blocks then up blocks, one buffer. `split_shared_w13_bytes`
             // already returns each side with every expert contiguous, so this
@@ -3253,7 +3313,7 @@ impl DeviceDense {
             let split = || {
                 (0..n_shared)
                     .map(|e| {
-                        let raw = &d.bytes[e * per_d..(e + 1) * per_d];
+                        let raw = &d_bytes[e * per_d..(e + 1) * per_d];
                         if sink_w4a16() {
                             w4a16_bind(client, quantized_bf16(client, raw, h, inter), false)
                         } else {
@@ -3283,7 +3343,7 @@ impl DeviceDense {
                 // reads every expert's every row, so it is the one that has to
                 // say what it assumes.
                 assert_eq!(
-                    d.bytes.len(),
+                    d_bytes.len(),
                     n_shared * per_d,
                     "shared_w2 is not {n_shared} experts x {per_d} bytes"
                 );
@@ -3293,7 +3353,7 @@ impl DeviceDense {
                     for s in 0..n_shared {
                         let src = s * per_d + r * row;
                         let dst = (r * n_shared + s) * row;
-                        il[dst..dst + row].copy_from_slice(&d.bytes[src..src + row]);
+                        il[dst..dst + row].copy_from_slice(&d_bytes[src..src + row]);
                     }
                 }
                 if sink_w4a16() {
@@ -3360,6 +3420,7 @@ impl DeviceDense {
         aliases: Option<&mary::models::inkling::fp4gemm::Aliases>,
         p: &str,
         h: usize,
+        tp: Option<mary::models::inkling::tp::Tp>,
     ) -> Result<&(Bf16W, Bf16W, Bf16W, f32)> {
         if !self.dense.contains_key(p) {
             let fused = cp.stored(&format!("{p}mlp.w13_dn.weight"))?;
@@ -3369,11 +3430,55 @@ impl DeviceDense {
             anyhow::ensure!(down.elem == Elem::Bf16, "dense w2 is {:?}", down.elem);
             let (drows, dcols) = (down.dims[0] as usize, down.dims[1] as usize);
             let inter = g.len() / (h * 2);
+            // ---- this rank's half of the dense intermediate axis -----------
+            //
+            // `mlp.w13_dn.weight` is stored INTERLEAVED and `split_gate_up_bytes`
+            // has already de-interleaved it into two plain `[inter, hidden]`
+            // buffers, so the cut here is a row range of EACH -- not of the
+            // fused weight, where the same range would be half the gates and
+            // none of the ups. `w2` is `[hidden, inter]`, so the same range is
+            // a column range and has to be gathered.
+            //
+            // Two layers on this model, 384 MiB each, and both buffers are
+            // already owned copies (the split made them), so the cut costs one
+            // pass over what was going to be uploaded anyway.
+            // `w2` stays a BORROW when nothing is cut. It normally ALIASES the
+            // pile, and an unconditional `to_vec()` here would cost a resident
+            // 134 MiB copy of it on every single-node run -- the exact
+            // regression the `INK_DENSE_FAKEQUANT` note below is written about.
+            let (g, u, dn, inter, dcols): (Vec<u8>, Vec<u8>, std::borrow::Cow<'_, [u8]>, _, _) =
+                match tp {
+                    None => (
+                        g,
+                        u,
+                        std::borrow::Cow::Borrowed(&down.bytes[..]),
+                        inter,
+                        dcols,
+                    ),
+                    Some(tp) => {
+                        let r = tp
+                            .dense_inter(inter)
+                            .map_err(|e| anyhow::anyhow!("dense MLP: {e}"))?;
+                        let gs = mary::models::inkling::tpshard::Slab::new(&g, inter, h, 2)?;
+                        let us = mary::models::inkling::tpshard::Slab::new(&u, inter, h, 2)?;
+                        let ds = mary::models::inkling::tpshard::Slab::new(
+                            &down.bytes,
+                            drows,
+                            dcols,
+                            2,
+                        )?;
+                        let gg = mary::models::inkling::tpshard::rows(&gs, r.clone())?.to_vec();
+                        let uu = mary::models::inkling::tpshard::rows(&us, r.clone())?.to_vec();
+                        let dd = mary::models::inkling::tpshard::cols(&ds, r.clone())?;
+                        (gg, uu, std::borrow::Cow::Owned(dd), r.len(), r.len())
+                    }
+                };
+            let down_bytes: &[u8] = &dn;
             // The global scale is one f32 and is a SCALAR the product is
             // multiplied by, not a weight, so it comes through the widening
             // accessor and costs four bytes.
             let gs = cp.tensor(&format!("{p}mlp.global_scale"))?.data[0];
-            self.bytes += (g.len() + u.len() + down.bytes.len()) as u64;
+            self.bytes += (g.len() + u.len() + down_bytes.len()) as u64;
             // `INK_DENSE_FAKEQUANT=1` replaces each weight with its own NVFP4
             // round trip. Same shapes, same binds, same GEMM -- only the values
             // move. One consequence worth naming: `w2` normally ALIASES the
@@ -3393,12 +3498,12 @@ impl DeviceDense {
                 (
                     fake_quant_bf16(client, &g, inter, h),
                     fake_quant_bf16(client, &u, inter, h),
-                    fake_quant_bf16(client, &down.bytes, drows, dcols),
+                    fake_quant_bf16(client, down_bytes, drows, dcols),
                 )
             });
             let (gb, ub, db): (&[u8], &[u8], &[u8]) = match &fq {
                 Some((a, b, c)) => (a, b, c),
-                None => (&g, &u, &down.bytes),
+                None => (&g, &u, down_bytes),
             };
             let trip = (
                 bind_bf16(client, aliases, gb, inter, h),
@@ -5857,33 +5962,58 @@ fn main() -> Result<()> {
     let (a, b) = spec.split_once(':').context("INK_LAYERS wants LO:HI")?;
     let (lo, hi) = (a.parse::<usize>()?, b.parse::<usize>()?);
     anyhow::ensure!(lo < hi, "INK_LAYERS wants LO < HI, got {lo}:{hi}");
-    // The same refusal the split lane makes below, asked here where it costs a
-    // second instead of after 70 GiB of pile has been mapped. Env only: the
-    // group is not formed this early, and the question does not need it.
-    if std::env::var("INK_TP").is_ok()
-        && !std::env::var("INK_TP_UNSAFE_PARTIAL")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    {
-        anyhow::bail!(
-            "INK_TP is set, but only the ATTENTION half of the within-layer split is wired; \
-             the dense MLP, the shared experts, the 256 routed experts and the unembedding are \
-             still bound WHOLE on both ranks, so the reduce would sum two complete copies of \
-             the MLP -- 2x the correct value, fluent and wrong. Set INK_TP_UNSAFE_PARTIAL=1 \
-             only to develop the remaining shards; such a run is not a result."
-        );
-    }
+    // WHICH SLICE of every tensor this process owns, as pure arithmetic --
+    // `INK_TP=rank:world` and nothing else. Answered HERE, before 70 GiB of
+    // pile is mapped, because the STARTUP COPY needs it: the routed experts are
+    // cut as they are copied into the anonymous arena and there is no second
+    // pass that could cut them afterwards. `tpcomm::Group` is formed from the
+    // same value much later, where blocking on a rendezvous is free.
+    let tp = mary::models::inkling::tp::Tp::from_env()?;
+    let tp_shard = tp.is_split().then_some(tp);
+    // This rank's share of the MLP intermediate axis -- the routed experts, the
+    // shared experts and (via `dense_inter`) the dense MLP are all cut on it,
+    // by the same range, which is what lets ONE all-reduce close all of them.
+    let inter_local = tp
+        .share("intermediate_size", t.intermediate_size)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     anyhow::ensure!(
         hi <= t.num_hidden_layers,
         "INK_LAYERS {lo}:{hi} runs past the {}-layer stack",
         t.num_hidden_layers
     );
-    anyhow::ensure!(
-        hi - lo < t.num_hidden_layers,
-        "INK_LAYERS {lo}:{hi} is the whole {}-layer stack on one node, which does not fit. \
-         Split it: no node may run every layer, and two is the MINIMUM rather than the number.",
-        t.num_hidden_layers
-    );
+    // A LAYER split may not give any node the whole stack, because 144 GiB of
+    // weights do not fit a 120 GiB box. A WITHIN-layer split must give every
+    // node the whole stack, because that is what it is: every rank runs every
+    // layer on half of each tensor, and half of 144 does fit. So the rule
+    // inverts on `INK_TP` rather than merely relaxing.
+    if tp.is_split() {
+        anyhow::ensure!(
+            (lo, hi) == (0, t.num_hidden_layers),
+            "INK_TP={}:{} is a WITHIN-layer split: every rank runs EVERY layer on half of each \
+             tensor, so INK_LAYERS must be 0:{}, not {lo}:{hi}. (A layer split and a \
+             within-layer split compose in principle -- four boxes -- but the group here is one \
+             rendezvous for one world, so this build does not.)",
+            tp.rank(),
+            tp.world(),
+            t.num_hidden_layers,
+        );
+        anyhow::ensure!(
+            std::env::var("INK_PIPE").is_err(),
+            "INK_TP and INK_PIPE together would be a layer split INSIDE a within-layer split, \
+             which needs four processes and two rendezvous. Unset INK_PIPE: under INK_TP both \
+             ranks own the embedding, the whole stack and the unembedding, and the only thing \
+             that crosses is the all-reduce."
+        );
+    } else {
+        anyhow::ensure!(
+            hi - lo < t.num_hidden_layers,
+            "INK_LAYERS {lo}:{hi} is the whole {}-layer stack on one node, which does not fit. \
+             Split it: no node may run every layer, and two is the MINIMUM rather than the \
+             number. (INK_TP=rank:2 is the other way to make it fit -- every layer on both \
+             boxes, half of each tensor.)",
+            t.num_hidden_layers
+        );
+    }
     // A pipe end is only a pipe end if it is not the whole stack; refusing the
     // contradiction here is cheaper than debugging a head that also unembeds.
     let pipe_spec = std::env::var("INK_PIPE").ok();
@@ -6253,8 +6383,13 @@ fn main() -> Result<()> {
             globals.push("model.llm.unembed.weight");
         }
         let t0 = Instant::now();
-        let (experts, dense, bytes, device_weights) =
-            cp.copy_share(lo..hi, &globals, attention_bytes + slot_kv_bytes, admission)?;
+        let (experts, dense, bytes, device_weights) = cp.copy_share(
+            lo..hi,
+            &globals,
+            attention_bytes + slot_kv_bytes,
+            admission,
+            tp_shard,
+        )?;
         println!(
             "  startup weight copy: {experts} expert + {dense} dense views, {:.2} GiB anonymous in {:.1}s",
             bytes as f64 / GIB,
@@ -7536,7 +7671,10 @@ fn main() -> Result<()> {
     // against itself, returns a finite number, and goes on to generate fluent
     // text that is wrong.
     let tp_group = {
-        let tp = mary::models::inkling::tp::Tp::from_env()?;
+        // The SAME `tp` the startup copy cut the arena with -- read once, near
+        // the top. Re-reading `INK_TP` here would let the two disagree, and the
+        // disagreement that matters (an arena cut for rank 1 reduced as rank 0)
+        // is arithmetically silent.
         if tp.is_split() {
             let addr = std::env::var("INK_TP_ADDR").map_err(|_| {
                 anyhow::anyhow!(
@@ -7582,43 +7720,57 @@ fn main() -> Result<()> {
     // two. Ordering is guarded by the comments at each site and, properly, by
     // the token-agreement gate against a single-node run on the same commit --
     // a count is not a substitute for either.
-    // WHICH SLICE this rank owns, as arithmetic, separate from the group that
-    // reduces it. `None` on a single-node run, and then every shard below is
-    // the whole tensor and every reduce is the identity.
-    let tp_shard: Option<mary::models::inkling::tp::Tp> = tp_group.as_ref().map(|g| g.tp());
-    // ---- REFUSE A HALF-SHARDED SPLIT --------------------------------------
+    // The group's `tp` and the one the arena was cut with must be the SAME
+    // value. They are read from the same variable, so this cannot drift -- and
+    // it is asserted anyway, because the drift it would cause (an arena cut for
+    // rank 1 reduced as rank 0) is not a crash and not a NaN.
+    if let Some(g) = tp_group.as_ref() {
+        assert_eq!(
+            g.tp(),
+            tp,
+            "the collective's rank and the startup copy's rank disagree"
+        );
+    }
+    // ---- WHAT IS SHARDED, SAID ONCE, IN THE RUN'S OWN OUTPUT --------------
     //
-    // Attention is sharded by head and reduced. The MLP half is NOT sharded
-    // yet: both ranks still bind every expert and the whole dense MLP, so each
-    // computes the WHOLE MLP output and the reduce below sums two complete
-    // copies. That is exactly 2x the correct contribution -- finite, stable,
-    // and fluent, which is the failure mode that costs a day rather than a
-    // minute. There is no partial credit available here: an unsharded operand
-    // under a reduce is not "less parallel", it is wrong.
+    // This used to be a REFUSAL: only attention was cut, so both ranks computed
+    // the whole MLP and the reduce summed two copies of it -- 2x, finite, and
+    // fluent. `INK_TP_UNSAFE_PARTIAL=1` existed to develop the remaining shards
+    // against that scaffolding.
     //
-    // So this refuses rather than warns. `INK_TP_UNSAFE_PARTIAL=1` is for
-    // bringing the remaining shards up against this scaffolding and its output
-    // is not a result.
-    if tp_shard.is_some()
-        && !std::env::var("INK_TP_UNSAFE_PARTIAL")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    {
-        anyhow::bail!(
-            "INK_TP is set, but only the ATTENTION half of the within-layer split is wired.\n\
-             \n\
-             Sharded and correct : q/k/v/r by head (16 q, 4 kv a rank), wo by column, the two\n\
-             \x20                     attention short convolutions by KV head, the KV cache by\n\
-             \x20                     head (it follows kv_heads), and the attention all-reduce.\n\
-             NOT sharded yet     : the dense MLP, the shared experts, the 256 routed experts,\n\
-             \x20                     and the unembedding.\n\
-             \n\
-             Both ranks therefore compute the WHOLE MLP, and the reduce sums two complete\n\
-             copies of it -- 2x the correct value, with no NaN and no crash. The tokens would\n\
-             be wrong and would still read fluently.\n\
-             \n\
-             Set INK_TP_UNSAFE_PARTIAL=1 only to develop the remaining shards against this\n\
-             scaffolding. Do not quote a number from such a run."
+    // The MLP half is cut now, so the refusal is gone and this takes its place.
+    // The distinction it turns on is not "sharded / not sharded" but WHETHER AN
+    // OPERAND SITS UNDER A REDUCE: an unsharded operand under an all-reduce is
+    // summed twice and is wrong; an unsharded operand with no reduce after it
+    // is merely REPLICATED, which costs bytes and nothing else.
+    //
+    // The embedding and the unembedding are the second kind. The final hidden
+    // state is already whole on both ranks when it reaches the head, and
+    // nothing reduces the logits -- so both ranks unembed the whole table, take
+    // the same argmax, and append the same token. That is correct by
+    // construction and needs no `argmax_across`. It costs 0.103 GiB a token at
+    // the default `HeadLane::W4a16` + `INK_ANN_HEAD` shortlist -- under 1% of
+    // the ~12.85 GiB a token this model reads -- so cutting it is not where the
+    // next win is.
+    if tp_shard.is_some() {
+        println!(
+            "  within-layer split : REDUCED operands are all cut --\n\
+             \x20   attention   q/k/v/r by head (16 q, 4 kv a rank), wo by column, both\n\
+             \x20               attention short convolutions by KV head, the KV cache by head\n\
+             \x20   dense MLP   gate and up by row, w2 by column, on the intermediate axis\n\
+             \x20   shared exp  the same intermediate axis, n_shared unchanged at {}\n\
+             \x20   routed exp  the same intermediate axis, cut in the STARTUP COPY: w13 rows\n\
+             \x20               {}..{} of {}, w2 columns {}..{} of {}\n\
+             \x20   REPLICATED (no reduce follows, so this is bytes and not correctness):\n\
+             \x20               the embedding table, the unembedding, both RMSNorm gains, the\n\
+             \x20               MLP short convolution, the router projection and its bias.",
+            t.n_shared_experts,
+            2 * (tp.rank() * inter_local),
+            2 * ((tp.rank() + 1) * inter_local),
+            2 * t.intermediate_size,
+            tp.rank() * inter_local,
+            (tp.rank() + 1) * inter_local,
+            t.intermediate_size,
         );
     }
     let tp_calls = std::cell::Cell::new(0usize);
@@ -8730,7 +8882,11 @@ fn main() -> Result<()> {
                 };
                 // The concatenation reads the same four leaves `pw` binds, in
                 // the output order [`dev_lane::project_qkvr`] slices back.
-                let fused_qkvr = if dev_lane::fuse_qkvr() {
+                // Not under a split: the concatenation reads four WHOLE leaves
+                // and the split lane below discards it (`wqkvr: None`), so
+                // building it would be 44 MiB of host copying a layer for
+                // nothing.
+                let fused_qkvr = if dev_lane::fuse_qkvr() && tp_shard.is_none() {
                     let mut b: Vec<u8> = Vec::new();
                     for nm in [
                         "attn.wq_du.weight",
@@ -9176,14 +9332,23 @@ fn main() -> Result<()> {
                 // was a scalar f32 lane over a 537 MB weight; it is not a lane a
                 // 276 B model has any use for, and being selectable is how it got
                 // run by accident.
-                let w = ddense.dense_for(&cp, &fp4_client, fp4_aliases.as_ref(), &p, h)?;
+                let w =
+                    ddense.dense_for(&cp, &fp4_client, fp4_aliases.as_ref(), &p, h, tp_shard)?;
                 // The two dense layers reduce for the same reason the 40 MoE
                 // layers do: `dense_inter` is split across ranks, so this is a
                 // partial sum over the intermediate axis. Same placement rule --
                 // before the MLP short convolution, which is below.
                 tp_reduce(dense_mlp_bf16(hn, w))
             } else {
-                let inter = t.intermediate_size;
+                // THIS RANK's intermediate width, which on a single-node run
+                // is the whole one. Every expert slab in the arena was cut to
+                // it by the startup copy, so the two grouped GEMMs, the
+                // gate/up de-interleave between them and the NVFP4 quantiser
+                // that feeds the second all take it and nothing else has to
+                // know a split happened. `intermediate_size` itself must NOT
+                // appear below: it is the shape of a weight this process does
+                // not hold.
+                let inter = inter_local;
                 let r = ld.router.as_ref().expect("a MoE layer has a router");
                 // The router's PROJECTION is a matmul and runs on the device; its
                 // DECISION is control plane and runs here. What crosses is one row
@@ -9777,15 +9942,23 @@ fn main() -> Result<()> {
                 // here and a halved split in the gate, which is the contradiction
                 // the INTERLEAVED result closed.
                 let sh = {
+                    // The GLOBAL `t.intermediate_size` here, not `inter`: the
+                    // shared experts are still stored WHOLE in the arena (they
+                    // are read as host slices, not as device offsets, so there
+                    // is nothing to gain by cutting them at copy time) and
+                    // `split_shared_w13_bytes` has to be told the shape it is
+                    // actually looking at. `tp_shard` is what then keeps this
+                    // rank's half of each expert.
                     let sw = ddense.shared_for(
                         &cp,
                         &fp4_client,
                         fp4_aliases.as_ref(),
                         &p,
                         ns,
-                        inter,
+                        t.intermediate_size,
                         h,
                         shared_halved,
+                        tp_shard,
                     )?;
                     match (dev_plan_out.as_ref(), topk_h.as_ref()) {
                         // The shared gammas rode back in the same readback the
@@ -13806,13 +13979,37 @@ fn main() -> Result<()> {
     // these numbers and would otherwise print none of them, which is how the
     // first tree run reported its acceptance by making me count `ctx` deltas in
     // the step lines.
-    if acc_steps > 0 && (pipe.is_some() || tree_b > 0) {
+    //
+    // `|| tp_group.is_some()`, for the same reason again: a within-layer split
+    // has no pipe, so a TP run would print no ms/step and no tok/s at all and
+    // its number would have to be reassembled from the per-step lines by hand.
+    // That is exactly the comparison this lane exists to make, against a
+    // pipeline arm that DOES print them, and two numbers computed by different
+    // instruments are not a paired measurement.
+    if acc_steps > 0 && (pipe.is_some() || tree_b > 0 || tp_group.is_some()) {
         let ms = |v: f64| v * 1e3;
         let wall = acc_pass + acc_recv;
-        println!("\n=== pipe utilisation over {acc_steps} decode steps (prefill excluded) ===");
+        // A within-layer split has no wire to be blocked on -- the collective is
+        // stream-ordered and never blocks the host -- so `acc_recv` and
+        // `acc_wait_peer` are zero and the head/tail breakdown below would
+        // print six lines of 0.0% under a heading that names a pipe this run
+        // does not have. Say what it IS instead.
+        let tp_only = pipe.is_none() && tp_group.is_some();
+        println!(
+            "\n=== {} over {acc_steps} decode steps (prefill excluded) ===",
+            if tp_only {
+                "within-layer split"
+            } else {
+                "pipe utilisation"
+            }
+        );
         println!(
             "  role                 : {}",
-            if is_head { "head" } else { "tail" }
+            match (tp_only, is_head) {
+                (true, _) => format!("tp rank {} of {}", tp.rank(), tp.world()),
+                (_, true) => "head".to_string(),
+                (_, false) => "tail".to_string(),
+            }
         );
         println!(
             "  wall in the loop     : {:9.1} ms   ({:.1} ms/step)",
@@ -13834,7 +14031,15 @@ fn main() -> Result<()> {
                 );
             }
         }
-        if is_head {
+        if tp_only {
+            println!(
+                "  computing            : {:9.1} ms   {:5.1}%   (no wire to block on: the\n  \
+                 all-reduce is stream-ordered and never blocks the host, so every millisecond\n  \
+                 here is this rank's own kernels and enqueue)",
+                ms(acc_pass),
+                100.0 * acc_pass / wall
+            );
+        } else if is_head {
             // `pass` contains the wait, so compute is what is left of it.
             let compute = acc_pass - acc_wait_peer - acc_send;
             println!(

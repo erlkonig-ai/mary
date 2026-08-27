@@ -40,12 +40,14 @@
 //!   - `e2e`, issuing plus the read-back, per token. This is the whole
 //!     collective term of a decode step.
 //!
-//! `COLLECTIVES` defaults to 86, which is `tp::collectives_per_token(42)`: two
-//! per layer, plus the embedding broadcast and the sharded-unembed reduce.
+//! `COLLECTIVES` defaults to 84, which is `tp::collectives_per_token(42, 0)`:
+//! two per layer and nothing at the ends. It was 86 while the design expected
+//! to cut the embedding and the unembedding as well; neither is cut, because
+//! neither sits under a reduce -- see `tp::collectives_per_token`.
 //!
 //! # What a result means
 //!
-//! The design budgets 2.54 ms a token (86 x 29.56 us). If `token e2e` comes in
+//! The design budgets 2.48 ms a token (84 x 29.56 us). If `token e2e` comes in
 //! at or under that, the budget is confirmed through the real path and the
 //! 19:1 trade stands as costed. If `token host` is a large fraction of it, the
 //! collectives are competing with the enqueue term rather than hiding behind
@@ -103,7 +105,7 @@ fn main() -> Result<()> {
     let per_token: usize = a
         .next()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(collectives_per_token(42));
+        .unwrap_or(collectives_per_token(42, 0));
 
     let tp = Tp::from_env()?;
     anyhow::ensure!(
@@ -223,7 +225,7 @@ fn main() -> Result<()> {
     );
     println!(
         "  tp.rs budgets               {:8.3} ms a token at 29.56 us each",
-        mary::models::inkling::tp::collective_ms_per_token(42, 29.56)
+        mary::models::inkling::tp::collective_ms_per_token(42, 0, 29.56)
     );
     println!("  measured here               {m_e2e:8.3} ms a token");
     println!(
