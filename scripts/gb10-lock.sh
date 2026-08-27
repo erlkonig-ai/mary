@@ -88,6 +88,28 @@
 # (Found by the frontier harness, which hit the half-held state and only escaped
 # it because that version exited instead of waiting.)
 #
+# KNOWN GAP: THE TIMEOUT IS SIZED FOR THE WRONG FAILURE. 5400 s was chosen so a
+# healthy holder is never broken into -- a cold build plus reps -- which is the
+# right size for a SLOW holder and the wrong size for an ABSENT one. Absent is
+# what actually happens: 2026-08-27, a holder beat twice, finished its run, exited
+# without releasing, and left two idle GB10s reserved for the remaining 68 minutes
+# of its timeout while four agents queued behind it.
+#
+# The better test is a CONJUNCTION rather than elapsed time: if the boxes are idle
+# AND the beat has stopped, the holder is done, and that pair is far more
+# informative than age alone. A holder mid-build is silent but its box is busy; a
+# holder that has exited is silent and its box is idle. scripts/frontier-bench.sh
+# already computes half of it in `boxes_look_idle`.
+#
+# NOT IMPLEMENTED HERE, deliberately. Changing what "abandoned" means while five
+# agents are mid-flight is the move that turns a coordination bug into an
+# incident, and this gap costs idle machines rather than corrupted measurements.
+# The mitigation that IS available today costs nothing and belongs in every
+# caller: RELEASE FROM A TRAP on every exit path, including the error and
+# interrupt paths. Taking is deliberate, beating is printed as an obligation, and
+# releasing is the step a crash skips -- which is why silence after work looks
+# exactly like silence during it.
+#
 # WHAT THIS DOES NOT DO: THERE IS NO QUEUE. It is mutual exclusion and nothing
 # more. A caller refused with rc 3 is not remembered, is not owed the next slot,
 # and will not be handed anything when the lock frees -- it has to come back and
