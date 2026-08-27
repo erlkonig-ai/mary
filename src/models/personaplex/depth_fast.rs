@@ -609,6 +609,13 @@ impl DepthFast {
         (STEPS * (LAYERS * per_layer + cfg::CARD * D) + STEPS * D * cfg::DIM) * bpe
     }
 
+    /// Whether the matrix weights are stored f16 (the `f16` flag this was
+    /// loaded with) — read off the storage rather than kept as a second copy
+    /// of the same fact.
+    pub fn is_f16(&self) -> bool {
+        self.steps[0].layers[0].qkv.bytes_per_elem() == 2
+    }
+
     /// The 16 × 2048 logit rows of the last [`Self::frame`], row-major.
     pub fn logits(&self) -> &[f32] {
         &self.logits_buf

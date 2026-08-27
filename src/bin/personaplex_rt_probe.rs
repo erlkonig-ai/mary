@@ -6,7 +6,8 @@
 //! argmax agreement and the first-divergence step — never "token-exact".
 //!
 //!   cargo run --release --features personaplex,q4 --bin personaplex_rt_probe -- \
-//!     <gate|bench|quantcheck|pipeline> [q4|q8|f16] [--depth-f16] [pile-path]
+//!     <gate|bench|quantcheck|pipeline|framebench|depthab|reset> [q4|q8|f16] \
+//!     [--depth-f16] [pile-path]
 //!
 //! The optional format token picks the stack's [`WeightFmt`] (default q4):
 //! f16 is the pipeline-exactness ablation, q8/q4 the two quantized builds.
@@ -24,6 +25,14 @@
 //!   rounds, submit vs full split, both head variants, contention canary).
 //!   The fill cursor is pinned per step (`force_len`), so every measured
 //!   step attends over exactly the stated prefix.
+//! - `depthab` — the PAIRED depth-arm A/B. Both depth arms (`depth_fast` on
+//!   the host, `depth_gpu` on the device) are resident in one process and BOTH
+//!   run on every frame from the same temporal hidden state, alternating which
+//!   goes first; the CPU arm's tokens are the committed ones. Two sequential
+//!   `framebench` runs cannot compare the arms on a shared desktop — the
+//!   ambient load between them drifted 3x, which is larger than the effect —
+//!   so this is the mode that answers "which arm is faster HERE". Reports the
+//!   per-frame depth cost of both arms and the LM step reconstructed for each.
 //! - `quantcheck` — the why-not-fold-the-norm-alphas measurement: per-matvec
 //!   q4 relative RMS error of the raw q_proj vs the alpha-folded q_proj
 //!   (folding a high-dynamic-range column scale into a weight quantized in
@@ -436,6 +445,226 @@ fn min_of_medians(rows: &[FrameRow], round: usize, f: impl Fn(&FrameRow) -> f64)
         .fold(f64::INFINITY, f64::min)
 }
 
+/// The machine's 1-minute load average, so every window carries the
+/// contention it was measured under. A frame time without it is not evidence
+/// on a shared desktop.
+fn loadavg() -> f64 {
+    std::process::Command::new("sysctl")
+        .args(["-n", "vm.loadavg"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| {
+            s.trim()
+                .trim_start_matches('{')
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or(f64::NAN)
+}
+
+/// **Paired** depth-arm A/B on the real LM critical path: both the CPU
+/// predictor and the cubecl port resident in ONE process, driven from the
+/// SAME temporal hidden state on the SAME frame, alternating which arm goes
+/// first.
+///
+/// [`framebench`] measures one arm per run, and on this machine that is not
+/// enough to compare them: two sequential framebench runs of the two arms
+/// drifted by 3x in ambient load between them, which is larger than the
+/// effect. Pairing removes that entirely — the two numbers in a row saw the
+/// same machine at the same microsecond.
+///
+/// The CPU arm's tokens are the ones committed, so the trajectory is exactly
+/// what shipping today produces; the GPU arm's frame is computed and thrown
+/// away. Both see the same `forced` array and the same `next_text`.
+///
+/// The cost of pairing is that each arm runs with the OTHER arm's load also
+/// on the machine, so both columns are inflated relative to a solo run — the
+/// RATIO is what this mode is for, not the absolute.
+fn depth_ab(pile: &str, fmt: WeightFmt) {
+    use mary::models::personaplex::depth_gpu::DepthFmt;
+    use mary::models::personaplex::pipeline::{DepthChoice, load_depth_arm};
+    use mary::models::personaplex::temporal_metal::MAX_SEQ;
+    const WINDOW: usize = 80;
+    const BUDGET_MS: f64 = 80.0;
+    let targets = [256usize, 1024, MAX_SEQ - 1];
+    let gpu_fmt = std::env::var("RT_AB_FMT")
+        .ok()
+        .map(|s| DepthFmt::parse(&s).unwrap_or_else(|| panic!("bad RT_AB_FMT {s}")))
+        .unwrap_or(DepthFmt::uniform(WeightFmt::Q8));
+
+    let t0 = Instant::now();
+    let source = runtime_source(pile);
+    let mut p = RealtimePipeline::load_with_depth(&source, fmt, DepthChoice::Cpu { f16: true });
+    let mut gpu = load_depth_arm(&source, DepthChoice::Gpu(gpu_fmt));
+    println!(
+        "depth A/B ({fmt:?} temporal + f16 head + CPU mimi): {} vs {}",
+        p.depth.label(),
+        gpu.label()
+    );
+    println!(
+        "loaded both arms in {:.1}s (load {:.1})",
+        t0.elapsed().as_secs_f64(),
+        loadavg()
+    );
+
+    // (fill-window index) -> rows of (temporal, cpu depth, gpu depth, other)
+    let mut windows: Vec<Vec<[f64; 4]>> = targets.iter().map(|_| Vec::new()).collect();
+    let mut win_load: Vec<f64> = targets.iter().map(|_| f64::NAN).collect();
+    let skip: Option<usize> = std::env::var("RT_FB_SKIP")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let (tx, rx) = std::sync::mpsc::sync_channel::<[u32; mimi_cfg::NUM_CODEBOOKS]>(8);
+    let decoder = &p.decoder;
+    let run0 = Instant::now();
+    std::thread::scope(|sc| {
+        // The mimi decode worker is downstream-only, but it is real CPU load
+        // that the host depth arm competes with, so it stays on.
+        sc.spawn(move || {
+            while let Ok(frame) = rx.recv() {
+                let _ = decoder.decode(&[frame]);
+            }
+        });
+        let mut frame_no = 0usize;
+        loop {
+            let fill = p.temporal.len();
+            if fill >= MAX_SEQ {
+                break;
+            }
+            if let Some(target) = skip {
+                if fill > 4 && fill + WINDOW < target {
+                    p.temporal.force_len(target + 1 - WINDOW);
+                    continue;
+                }
+            }
+            let win = targets.iter().position(|&t| fill <= t && fill + WINDOW > t);
+            let Some(pr) = p.stream.prepare(Some(&SINE), None, None) else {
+                continue; // the offset-0 ring-seeding call — no model step
+            };
+            let ts = Instant::now();
+            let x = p.temporal.embed_codes(&pr.input);
+            p.temporal.step_submit(&x, p.head);
+            let (hidden, logits) = p.temporal.read_hidden_logits();
+            let temporal = ts.elapsed().as_secs_f64() * 1e3;
+            let sampled = argmax(&logits) as i64;
+            let next_text = if pr.provided[0] {
+                pr.target[0]
+            } else {
+                sampled
+            };
+            let forced = pr.forced();
+
+            // Alternate the order so neither arm keeps the second-mover's
+            // warm cache (or its cold queue) for the whole window.
+            let (t_cpu, t_gpu, dep);
+            if frame_no % 2 == 0 {
+                let t = Instant::now();
+                dep = p.depth.frame(&hidden, next_text, &forced, None);
+                t_cpu = t.elapsed().as_secs_f64() * 1e3;
+                let t = Instant::now();
+                let _ = gpu.frame(&hidden, next_text, &forced, None);
+                t_gpu = t.elapsed().as_secs_f64() * 1e3;
+            } else {
+                let t = Instant::now();
+                let _ = gpu.frame(&hidden, next_text, &forced, None);
+                t_gpu = t.elapsed().as_secs_f64() * 1e3;
+                let t = Instant::now();
+                dep = p.depth.frame(&hidden, next_text, &forced, None);
+                t_cpu = t.elapsed().as_secs_f64() * 1e3;
+            }
+            frame_no += 1;
+
+            let tc = Instant::now();
+            let out = p.stream.commit(&pr, sampled, &dep);
+            if let Some(o) = &out {
+                tx.send(agent_codes(o)).expect("decode worker alive");
+            }
+            let other = tc.elapsed().as_secs_f64() * 1e3;
+
+            if let Some(w) = win {
+                if windows[w].len() < WINDOW {
+                    if windows[w].is_empty() {
+                        win_load[w] = loadavg();
+                    }
+                    windows[w].push([temporal, t_cpu, t_gpu, other]);
+                }
+            }
+            if fill % 256 == 0 {
+                println!(
+                    "  fill {fill:4}/{}  ({:.1} min elapsed, load {:.1})",
+                    MAX_SEQ - 1,
+                    run0.elapsed().as_secs_f64() / 60.0,
+                    loadavg()
+                );
+            }
+        }
+        drop(tx);
+    });
+
+    // ── report ──
+    let stat = |v: &mut Vec<f64>| -> (f64, f64, f64) {
+        let mean = v.iter().sum::<f64>() / v.len() as f64;
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (
+            mean,
+            v[(v.len() - 1) / 2],
+            v[((v.len() as f64 - 1.0) * 0.95) as usize],
+        )
+    };
+    println!(
+        "\ndepth stage, PAIRED per frame ({WINDOW} frames per window; both arms ran on every frame, so both columns carry the other's load):"
+    );
+    println!(
+        "{:>6}  {:>5}  {:>21}  {:>21}  {:>7}",
+        "fill", "load", "cpu depth mean/p50/p95", "gpu depth mean/p50/p95", "speedup"
+    );
+    for (w, &t) in targets.iter().enumerate() {
+        if windows[w].is_empty() {
+            continue;
+        }
+        let (cm, c50, c95) = stat(&mut windows[w].iter().map(|r| r[1]).collect());
+        let (gm, g50, g95) = stat(&mut windows[w].iter().map(|r| r[2]).collect());
+        println!(
+            "{t:>6}  {:>5.1}  {cm:>6.1}/{c50:>6.1}/{c95:>6.1}  {gm:>6.1}/{g50:>6.1}/{g95:>6.1}  {:>6.2}x",
+            win_load[w],
+            cm / gm
+        );
+    }
+    println!(
+        "\nLM step reconstructed per arm (temporal + that arm's depth + commit; the other arm's time removed):"
+    );
+    println!(
+        "{:>6}  {:>8}  {:>21}  {:>13}  {:>21}  {:>13}",
+        "fill",
+        "temporal",
+        "cpu step mean/p50/p95",
+        "over 80 / rt",
+        "gpu step mean/p50/p95",
+        "over 80 / rt"
+    );
+    for (w, &t) in targets.iter().enumerate() {
+        if windows[w].is_empty() {
+            continue;
+        }
+        let (tm, _, _) = stat(&mut windows[w].iter().map(|r| r[0]).collect());
+        let mut c: Vec<f64> = windows[w].iter().map(|r| r[0] + r[1] + r[3]).collect();
+        let mut g: Vec<f64> = windows[w].iter().map(|r| r[0] + r[2] + r[3]).collect();
+        let over = |v: &[f64]| v.iter().filter(|&&x| x > BUDGET_MS).count();
+        let (co, go) = (over(&c), over(&g));
+        let (cm, c50, c95) = stat(&mut c);
+        let (gm, g50, g95) = stat(&mut g);
+        println!(
+            "{t:>6}  {tm:>8.1}  {cm:>6.1}/{c50:>6.1}/{c95:>6.1}  {co:>4}/{WINDOW} {:>5.2}x  {gm:>6.1}/{g50:>6.1}/{g95:>6.1}  {go:>4}/{WINDOW} {:>5.2}x",
+            BUDGET_MS / cm,
+            BUDGET_MS / gm
+        );
+    }
+    println!(
+        "\nbudget 80 ms @ 12.5 Hz. `rt` = 80 ms / mean step; < 1.00x means the loop falls behind and frames are skipped."
+    );
+}
+
 /// The measurement that decides whether the pipeline runs realtime: wall clock
 /// per EMITTED FRAME on the LM critical path — temporal step + 16 depformer
 /// steps + all submission/bookkeeping overhead — at temporal-cache fills
@@ -453,16 +682,18 @@ fn framebench(pile: &str, fmt: WeightFmt, depth_f16: bool) {
     let targets = [256usize, 1024, MAX_SEQ - 1];
     let spike = [47.6f64, 48.9, 52.2];
 
+    let t0 = Instant::now();
+    let source = runtime_source(pile);
+    let mut p = RealtimePipeline::load_auto(&source, fmt, depth_f16);
+    // The depth arm is the thing this bench is usually run to compare, so it
+    // goes in the header next to the numbers, not in the invocation only.
     println!(
-        "framebench ({fmt:?} temporal + f16 head + {} depformer + CPU mimi): ms per emitted frame",
-        if depth_f16 { "f16" } else { "f32" }
+        "framebench ({fmt:?} temporal + f16 head + {} + CPU mimi): ms per emitted frame",
+        p.depth.label()
     );
     println!(
         "(desktop machine — ambient contention inflates; min-of-medians + raw best/worst reported)"
     );
-    let t0 = Instant::now();
-    let source = runtime_source(pile);
-    let mut p = RealtimePipeline::load_auto(&source, fmt, depth_f16);
     println!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
 
     // ── mimi decode scaling (stateless CPU decode of t frames): the 1-frame
@@ -577,7 +808,7 @@ fn framebench(pile: &str, fmt: WeightFmt, depth_f16: bool) {
                 sampled
             };
             let td = Instant::now();
-            let dep = p.depth.frame(&hidden, next_text, &pr.forced(), None, None);
+            let dep = p.depth.frame(&hidden, next_text, &pr.forced(), None);
             let depth = td.elapsed().as_secs_f64() * 1e3;
             let out = p.stream.commit(&pr, sampled, &dep);
             if let Some(o) = &out {
@@ -686,6 +917,38 @@ fn framebench(pile: &str, fmt: WeightFmt, depth_f16: bool) {
         println!(
             "{t:>6}  {:>2} {frame:>5.1}  {temporal:>22.1} ({submit:>4.1})  {depth:>7.1}  {mimi:>8.1}  {other:>7.1}  {best:>7.1}/{worst:<7.1}",
             if ok { "OK" } else { "XX" }
+        );
+    }
+    // ── keep-up, EVERY frame counted ──
+    // `min_of_medians` is a best-case estimator: it exists to see the
+    // machine's own cost through ambient noise, which is the right lens for a
+    // port's cost. The live loop does not get the best round — a frame that
+    // misses 80 ms is a frame the caller's Ear skips — so the contention
+    // question needs the unfiltered distribution instead.
+    println!(
+        "\nkeep-up over the same {WINDOW}-frame windows, every frame counted (no best-round filter):"
+    );
+    println!(
+        "{:>6}  {:>8}  {:>8}  {:>8}  {:>13}  {:>9}",
+        "fill", "mean", "p50", "p95", "over 80 ms", "realtime"
+    );
+    for (w, &t) in targets.iter().enumerate() {
+        let rows = &windows[w];
+        if rows.is_empty() {
+            continue;
+        }
+        let mut v: Vec<f64> = rows.iter().map(|r| r.total).collect();
+        let mean = v.iter().sum::<f64>() / v.len() as f64;
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p = |q: f64| v[((v.len() as f64 - 1.0) * q) as usize];
+        let over = v.iter().filter(|&&x| x > BUDGET_MS).count();
+        println!(
+            "{t:>6}  {mean:>8.1}  {:>8.1}  {:>8.1}  {:>7}/{:<5}  {:>8.2}x",
+            p(0.5),
+            p(0.95),
+            over,
+            v.len(),
+            BUDGET_MS / mean
         );
     }
     println!(
@@ -1281,10 +1544,11 @@ fn main() {
         "quantcheck" => quantcheck(&pile),
         "pipeline" => pipeline_gate(&pile, fmt, depth_f16),
         "framebench" => framebench(&pile, fmt, depth_f16),
+        "depthab" => depth_ab(&pile, fmt),
         "reset" => reset_gate(&pile, fmt, depth_f16),
         _ => {
             eprintln!(
-                "usage: personaplex_rt_probe <gate|bench|quantcheck|pipeline|framebench|reset> [q4|q8|f16] [--depth-f16] [pile-path]"
+                "usage: personaplex_rt_probe <gate|bench|quantcheck|pipeline|framebench|depthab|reset> [q4|q8|f16] [--depth-f16] [pile-path]"
             );
             eprintln!(
                 "  gate        113-step golden stream: cos + argmax vs tt_text_logits (per-format bars)"
@@ -1297,6 +1561,15 @@ fn main() {
                 "              overhead; mimi decode on its own thread, worker cost reported) at"
             );
             eprintln!("              cache fill 256/1024/2999 via a long synthetic free-run");
+            eprintln!(
+                "  depthab     PAIRED depth-arm A/B: depth_fast and depth_gpu both resident, both run"
+            );
+            eprintln!(
+                "              on the SAME hidden state every frame (order alternated), so the two"
+            );
+            eprintln!(
+                "              numbers saw one machine state. RT_AB_FMT picks the GPU DepthFmt (q8)"
+            );
             eprintln!("  quantcheck  per-matvec q4 error, raw vs norm-alpha-folded weights");
             eprintln!(
                 "  pipeline    assembled realtime pipeline free-run: WAV → encode → LM → decode → WAV,"

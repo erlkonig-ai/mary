@@ -50,6 +50,8 @@ use super::depth::argmax;
 #[cfg(feature = "q4")]
 use super::depth_fast::DepthFast;
 #[cfg(feature = "q4")]
+use super::depth_gpu::{DepthFmt, DepthGpu, NO_FORCE};
+#[cfg(feature = "q4")]
 use super::lmgen::{Prepared, StreamCache};
 #[cfg(feature = "q4")]
 use super::temporal_metal::{Head, TemporalMetal, WeightFmt};
@@ -198,12 +200,165 @@ pub struct RtStepTrace {
     pub text_logits: Vec<f32>,
 }
 
+/// Which depth transformer [`RealtimePipeline`] drives.
+///
+/// The depformer is the last host stage of the realtime frame, and it is the
+/// one that competes with whatever else the machine is compiling: the temporal
+/// stack is already on the device ([`TemporalMetal`]) and cannot be starved by
+/// CPU load, so a build storm lands entirely on this stage. [`Self::Gpu`]
+/// selects the cubecl port ([`DepthGpu`]), which takes it off the host too.
+///
+/// **Default is [`Self::Cpu`]** until the GPU arm is measured on the machine
+/// that runs the live loop — see [`Self::from_env`].
+#[cfg(feature = "q4")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DepthChoice {
+    /// [`DepthFast`], the Accelerate/NEON CPU predictor. `f16` picks its
+    /// weight storage width (f32 accumulate either way).
+    Cpu { f16: bool },
+    /// [`DepthGpu`], the cubecl port, with each matvec at its [`DepthFmt`]
+    /// slot. Uniform q8 is the only format that gates — see [`DepthFmt`] for
+    /// the measured mixed-format table.
+    Gpu(DepthFmt),
+}
+
+#[cfg(feature = "q4")]
+impl DepthChoice {
+    /// Read the arm from `PERSONAPLEX_DEPTH`: unset or `cpu` keeps the CPU
+    /// predictor (with `depth_f16` deciding its storage), `gpu` selects the
+    /// cubecl port at uniform q8, and `gpu:SPEC` selects it at an explicit
+    /// [`DepthFmt`] spec (`gpu:f16`, `gpu:q8:qkv=f16`, …).
+    ///
+    /// An unparseable value panics rather than falling back: a typo that
+    /// silently kept the CPU arm would make a whole measurement mean the
+    /// opposite of what it says.
+    pub fn from_env(depth_f16: bool) -> Self {
+        match std::env::var("PERSONAPLEX_DEPTH") {
+            Err(_) => Self::Cpu { f16: depth_f16 },
+            Ok(v) => match v.as_str() {
+                "cpu" => Self::Cpu { f16: depth_f16 },
+                "gpu" => Self::Gpu(DepthFmt::uniform(WeightFmt::Q8)),
+                other => {
+                    let spec = other.strip_prefix("gpu:").unwrap_or_else(|| {
+                        panic!("PERSONAPLEX_DEPTH={other} (expected cpu | gpu | gpu:<fmt>)")
+                    });
+                    Self::Gpu(DepthFmt::parse(spec).unwrap_or_else(|| {
+                        panic!("PERSONAPLEX_DEPTH={other}: bad depth format {spec}")
+                    }))
+                }
+            },
+        }
+    }
+
+    /// One-line arm label for a run header — every timing this pipeline
+    /// produces is per-arm, so the arm belongs next to the number.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Cpu { f16 } => {
+                format!("cpu depth_fast ({})", if *f16 { "f16" } else { "f32" })
+            }
+            Self::Gpu(fmt) => format!("gpu depth_gpu ({})", fmt.label()),
+        }
+    }
+}
+
+/// The loaded depth transformer, either arm — the one call site in
+/// [`RealtimePipeline::forward`] goes through [`Self::frame`].
+#[cfg(feature = "q4")]
+pub enum DepthArm {
+    Cpu(DepthFast),
+    Gpu(DepthGpu),
+}
+
+#[cfg(feature = "q4")]
+impl DepthArm {
+    /// One temporal frame's depformer pass. The two arms take the forcing
+    /// rule in different shapes — `Option<i64>` per step on the host, a
+    /// [`NO_FORCE`]-sentinel `[16]` u32 upload on the device — and this is
+    /// where that translation lives.
+    ///
+    /// **The GPU arm is greedy-only.** Its argmax and the prev-token chain it
+    /// feeds both run on the device (that is what keeps a frame at ONE sync),
+    /// so a host `Sampler` has nowhere to attach: sampling it would need
+    /// either a device-side sampler with host-supplied uniforms or a
+    /// per-step readback, and the readback costs the whole win. Passing a
+    /// sampler here panics rather than silently decoding greedily, because
+    /// greedy audio decode is not a small quality change — it collapses the
+    /// agent to a near-constant code (measured: 3 distinct codebook-0 values
+    /// across 125 frames, rms −74 dB; see `personaplex_listen`).
+    pub fn frame(
+        &mut self,
+        transformer_out: &[f32],
+        text_token: i64,
+        forced: &[Option<i64>; cfg::DEP_Q],
+        sampler: Option<&mut super::sampling::Sampler>,
+    ) -> [i64; cfg::DEP_Q] {
+        match self {
+            Self::Cpu(d) => d.frame(transformer_out, text_token, forced, None, sampler),
+            Self::Gpu(d) => {
+                assert!(
+                    sampler.is_none(),
+                    "the GPU depth arm (PERSONAPLEX_DEPTH=gpu) is greedy-only: its argmax and \
+                     prev-token chain live on the device. Use the CPU arm for a sampled session \
+                     until depth_gpu grows a device-side sampler."
+                );
+                assert!(text_token >= 0, "text token {text_token}");
+                let forced: [u32; cfg::DEP_Q] =
+                    std::array::from_fn(|s| forced[s].map_or(NO_FORCE, |t| t as u32));
+                let out = d.frame(transformer_out, text_token as u32, &forced, cfg::DEP_Q);
+                std::array::from_fn(|s| out[s])
+            }
+        }
+    }
+
+    /// Which arm this is, for a run header — a depth timing without its arm
+    /// is not evidence.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Cpu(d) => format!(
+                "cpu depth_fast ({})",
+                if d.is_f16() { "f16" } else { "f32" }
+            ),
+            Self::Gpu(d) => format!("gpu depth_gpu ({})", d.fmt().label()),
+        }
+    }
+
+    /// The `[16, 2048]` logit slab of the last [`Self::frame`], row-major.
+    /// The GPU arm reads it back from the device on demand (a gate's view,
+    /// not the realtime path's — a greedy frame never needs it).
+    pub fn logits(&self) -> Vec<f32> {
+        match self {
+            Self::Cpu(d) => d.logits().to_vec(),
+            Self::Gpu(d) => d.logits(cfg::DEP_Q),
+        }
+    }
+
+    /// Weight bytes a full 16-codebook frame streams.
+    pub fn frame_weight_bytes(&self) -> usize {
+        match self {
+            Self::Cpu(d) => d.frame_weight_bytes(),
+            Self::Gpu(d) => d.frame_weight_bytes(),
+        }
+    }
+
+    /// The CPU arm's in-situ timing decomposition (frames, total, cond, stack
+    /// gemv, head, scalar-rest) in ms/frame. The GPU arm has no host-side
+    /// decomposition to drain — its stages are device kernels, so it reports
+    /// zero frames and callers must skip the breakdown rather than divide.
+    pub fn take_bench(&mut self) -> (u64, f64, f64, f64, f64, f64) {
+        match self {
+            Self::Cpu(d) => d.take_bench(),
+            Self::Gpu(_) => (0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        }
+    }
+}
+
 /// The **realtime** voice pipeline: the same step semantics as [`VoicePipeline`]
 /// (the CPU-f32 parity oracle) rebuilt on the fast stages — the Metal
 /// quantized temporal transformer ([`TemporalMetal`], q4/q8/f16 stack with
-/// the f16 logit head as the documented production choice), the
-/// Accelerate/NEON CPU depformer predictor ([`DepthFast`]), and the CPU Mimi
-/// codec.
+/// the f16 logit head as the documented production choice), the depformer on
+/// either arm ([`DepthArm`] — the CPU predictor by default, the cubecl port
+/// under `PERSONAPLEX_DEPTH=gpu`), and the CPU Mimi codec.
 ///
 /// **Numerics honesty:** with a quantized (q4/q8) temporal stack this is a
 /// REAL numerics change — free-run token streams are expected to diverge
@@ -222,7 +377,7 @@ pub struct RtStepTrace {
 #[cfg(feature = "q4")]
 pub struct RealtimePipeline {
     pub temporal: TemporalMetal,
-    pub depth: DepthFast,
+    pub depth: DepthArm,
     pub stream: StreamCache,
     pub encoder: MimiEncoder,
     pub decoder: MimiDecoder,
@@ -238,14 +393,30 @@ pub struct RealtimePipeline {
 impl RealtimePipeline {
     /// Load all components from one bundle-bound runtime source. `fmt` picks
     /// the temporal stack's weight format (q4/q8/f16); `depth_f16` stores the
-    /// depformer weights as f16 (f32 accumulate) instead of f32. Accepting the
-    /// authority/loader pair prevents a future native cache from being checked
-    /// against one bundle while its unchanged weights come from another.
+    /// CPU depformer's weights as f16 (f32 accumulate) instead of f32, and is
+    /// ignored when `PERSONAPLEX_DEPTH` selects the GPU arm (which carries its
+    /// own per-tensor [`DepthFmt`]). Accepting the authority/loader pair
+    /// prevents a future native cache from being checked against one bundle
+    /// while its unchanged weights come from another.
     pub fn load(source: &super::PersonaPlexRuntimeSource, fmt: WeightFmt, depth_f16: bool) -> Self {
+        Self::load_with_depth(source, fmt, DepthChoice::from_env(depth_f16))
+    }
+
+    /// [`Self::load`] with the depth arm named outright instead of read from
+    /// `PERSONAPLEX_DEPTH` — the form an A/B measurement wants, so both arms
+    /// can be built in one process against one machine state.
+    pub fn load_with_depth(
+        source: &super::PersonaPlexRuntimeSource,
+        fmt: WeightFmt,
+        depth: DepthChoice,
+    ) -> Self {
         let loader = source.loader();
         Self {
             temporal: TemporalMetal::load(loader, fmt),
-            depth: DepthFast::load(loader, depth_f16),
+            depth: match depth {
+                DepthChoice::Cpu { f16 } => DepthArm::Cpu(DepthFast::load(loader, f16)),
+                DepthChoice::Gpu(dfmt) => DepthArm::Gpu(DepthGpu::load(loader, dfmt)),
+            },
             stream: StreamCache::new(),
             encoder: MimiEncoder::load(loader),
             decoder: MimiDecoder::load(loader),
@@ -326,9 +497,9 @@ impl RealtimePipeline {
         } else {
             sampled_text
         };
-        let dep_tokens =
-            self.depth
-                .frame(&hidden, next_text, &p.forced(), None, self.sampler.as_mut());
+        let dep_tokens = self
+            .depth
+            .frame(&hidden, next_text, &p.forced(), self.sampler.as_mut());
         // `sampled_text` — post-arbitration — is what `commit` writes into the
         // ring, so the substituted token enters the model's own history as if
         // it had chosen it. That is the whole basis of the no-garble property:
@@ -468,6 +639,24 @@ impl RealtimePipeline {
     /// Agent frames → 24 kHz mono PCM (1920 samples per frame).
     pub fn decode(&self, frames: &[[u32; mimi_cfg::NUM_CODEBOOKS]]) -> Vec<f32> {
         self.decoder.decode(frames)
+    }
+}
+
+/// Load a depth arm on its own, from the same bundle-bound source a
+/// [`RealtimePipeline`] was loaded from.
+///
+/// This exists for the PAIRED A/B measurement, and the pairing is not
+/// fastidiousness: on a shared desktop the drift in ambient load between two
+/// sequential runs is routinely larger than the difference between the arms,
+/// so two separate runs cannot answer which arm is faster. Holding both arms
+/// in one process and driving them from the same hidden state at the same
+/// instant is the only comparison the machine will actually support.
+#[cfg(feature = "q4")]
+pub fn load_depth_arm(source: &super::PersonaPlexRuntimeSource, depth: DepthChoice) -> DepthArm {
+    let loader = source.loader();
+    match depth {
+        DepthChoice::Cpu { f16 } => DepthArm::Cpu(DepthFast::load(loader, f16)),
+        DepthChoice::Gpu(fmt) => DepthArm::Gpu(DepthGpu::load(loader, fmt)),
     }
 }
 
