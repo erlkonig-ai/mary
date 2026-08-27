@@ -1090,7 +1090,17 @@ fn pipeline_gate(pile: &str, fmt: WeightFmt, depth_f16: bool) {
     );
     let t0 = Instant::now();
     let source = runtime_source(pile);
-    let mut p = RealtimePipeline::load_auto(&source, fmt, depth_f16);
+    // Pinned to the CPU depth arm even though the pipeline's default is now
+    // the GPU one: this gate's per-format bars were calibrated against the
+    // host predictor's numerics, and re-anchoring them on the GPU arm needs
+    // the oracle goldens this gate reads, which are session scratch and are
+    // not on disk. Gating the shipping arm here is the follow-up, not a
+    // silent re-baseline.
+    let mut p = RealtimePipeline::load_with_depth(
+        &source,
+        fmt,
+        mary::models::personaplex::pipeline::DepthChoice::Cpu { f16: depth_f16 },
+    );
     println!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
 
     // ── 1. Mimi encode (CPU stage, unchanged from the parity pipeline):

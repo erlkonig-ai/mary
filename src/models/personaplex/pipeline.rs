@@ -208,8 +208,15 @@ pub struct RtStepTrace {
 /// CPU load, so a build storm lands entirely on this stage. [`Self::Gpu`]
 /// selects the cubecl port ([`DepthGpu`]), which takes it off the host too.
 ///
-/// **Default is [`Self::Cpu`]** until the GPU arm is measured on the machine
-/// that runs the live loop — see [`Self::from_env`].
+/// **Default is [`Self::Gpu`] at uniform q8**, measured — see
+/// [`Self::from_env`] for the escape hatch and the wiring commits for the
+/// numbers. The short version, on M4 Max in the shipping decode config
+/// (temp 0.8 / top-k 250 / top-p 0.95), paired so both arms saw one machine
+/// state: the depth stage goes 105.9 -> 34.1 ms per frame at temporal fill
+/// 256, and the reconstructed LM step goes from 0.56x realtime (73 of 80
+/// frames over the 80 ms budget) to 1.13x (22 of 80). The CPU arm has no
+/// headroom left to reclaim either — it is at the host's memory ceiling,
+/// where fewer weight bytes buy only more unpack work.
 #[cfg(feature = "q4")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DepthChoice {
@@ -224,17 +231,22 @@ pub enum DepthChoice {
 
 #[cfg(feature = "q4")]
 impl DepthChoice {
-    /// Read the arm from `PERSONAPLEX_DEPTH`: unset or `cpu` keeps the CPU
-    /// predictor (with `depth_f16` deciding its storage), `gpu` selects the
-    /// cubecl port at uniform q8, and `gpu:SPEC` selects it at an explicit
-    /// [`DepthFmt`] spec (`gpu:f16`, `gpu:q8:qkv=f16`, …).
+    /// Read the arm from `PERSONAPLEX_DEPTH`: unset or `gpu` selects the
+    /// cubecl port at uniform q8 (the measured default), `gpu:SPEC` selects it
+    /// at an explicit [`DepthFmt`] spec (`gpu:f16`, `gpu:q8:qkv=f16`, …), and
+    /// `cpu` falls back to the host predictor with `depth_f16` deciding its
+    /// storage.
+    ///
+    /// The CPU fallback exists because the GPU arm needs a working device and
+    /// the host arm does not — that is the one thing it still buys, and it is
+    /// why it is a value here rather than deleted.
     ///
     /// An unparseable value panics rather than falling back: a typo that
-    /// silently kept the CPU arm would make a whole measurement mean the
+    /// silently changed the arm would make a whole measurement mean the
     /// opposite of what it says.
     pub fn from_env(depth_f16: bool) -> Self {
         match std::env::var("PERSONAPLEX_DEPTH") {
-            Err(_) => Self::Cpu { f16: depth_f16 },
+            Err(_) => Self::Gpu(DepthFmt::uniform(WeightFmt::Q8)),
             Ok(v) => match v.as_str() {
                 "cpu" => Self::Cpu { f16: depth_f16 },
                 "gpu" => Self::Gpu(DepthFmt::uniform(WeightFmt::Q8)),
@@ -367,8 +379,8 @@ impl DepthArm {
 /// (the CPU-f32 parity oracle) rebuilt on the fast stages — the Metal
 /// quantized temporal transformer ([`TemporalMetal`], q4/q8/f16 stack with
 /// the f16 logit head as the documented production choice), the depformer on
-/// either arm ([`DepthArm`] — the CPU predictor by default, the cubecl port
-/// under `PERSONAPLEX_DEPTH=gpu`), and the CPU Mimi codec.
+/// either arm ([`DepthArm`] — the cubecl port by default, the CPU predictor
+/// under `PERSONAPLEX_DEPTH=cpu`), and the CPU Mimi codec.
 ///
 /// **Numerics honesty:** with a quantized (q4/q8) temporal stack this is a
 /// REAL numerics change — free-run token streams are expected to diverge
@@ -404,8 +416,8 @@ impl RealtimePipeline {
     /// Load all components from one bundle-bound runtime source. `fmt` picks
     /// the temporal stack's weight format (q4/q8/f16); `depth_f16` stores the
     /// CPU depformer's weights as f16 (f32 accumulate) instead of f32, and is
-    /// ignored when `PERSONAPLEX_DEPTH` selects the GPU arm (which carries its
-    /// own per-tensor [`DepthFmt`]). Accepting the authority/loader pair
+    /// ignored unless `PERSONAPLEX_DEPTH=cpu` selects that arm (the default
+    /// GPU arm carries its own per-tensor [`DepthFmt`]). Accepting the authority/loader pair
     /// prevents a future native cache from being checked against one bundle
     /// while its unchanged weights come from another.
     pub fn load(source: &super::PersonaPlexRuntimeSource, fmt: WeightFmt, depth_f16: bool) -> Self {
