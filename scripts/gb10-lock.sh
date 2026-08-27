@@ -24,6 +24,16 @@
 #   - the lock records a pid AND the host that pid lives on. If that host is the
 #     box we are on and the pid is gone, the lock is broken IMMEDIATELY. That is
 #     exact and needs no timeout.
+# TAKING THE LOCK OBLIGES YOU TO KEEP BEATING. Silence is indistinguishable
+# from death, by construction: a holder doing one long uninterrupted stretch
+# without calling `refresh` is treated as crashed once the timeout elapses and
+# its reservation is broken WHILE IT IS STILL RUNNING. A 7-rep two-node run is
+# ~18 min and a cold build can be 30-40, so a naive holder that takes the lock
+# once and works is inside the 90-minute window today, but not by much. The
+# second layer catches the consequence -- a breaker's idle gate immediately sees
+# the true holder's processes and refuses -- so the failure mode is a lost
+# reservation and a wasted slot rather than an OOM. Beat anyway.
+#
 #   - otherwise (the holder is a pid on the OTHER box, which is normal for a
 #     two-node run whose tail is remote) age is all we have, and GB10_LOCK_TIMEOUT_S
 #     (default 5400 s / 90 min) applies. Chosen to clear a cold build of
@@ -34,6 +44,104 @@
 #   gb10-lock.sh take <host> <tag>     -> rc 0 took it, rc 3 someone else holds it
 #   gb10-lock.sh release <host> <tag>  -> releases only if <tag> holds it
 #   gb10-lock.sh check <host>          -> prints the holder, rc 0 free, rc 3 held
+#
+# BUILDS TAKE THE LOCK TOO. A cargo build is not a measurement, but it is 20
+# cores of CPU contention on a unified-memory part, so it perturbs a neighbour's
+# decode measurement just as surely as a second decode process would. The busy
+# gates already refuse while one is running -- `BOX_BUSY_PATTERN` matches on
+# `pgrep -f`, and `--bin inkling_forward` sits in a cargo command line, so a
+# build is caught by a pattern written for measurements. THAT IS THE RIGHT
+# ANSWER ARRIVED AT BY ACCIDENT, and it must not be "fixed" by narrowing the
+# pattern to `pgrep -x`: that would make the gate precise and wrong.
+#
+# The consequence is that the boxes are unavailable during other agents' builds
+# whether or not anyone reserved them, which makes the queue dishonest -- a
+# waiter cannot see why it is waiting. So: reserve for the BUILD as well as the
+# reps, exactly as scripts/frontier-bench.sh does, and the queue then reflects
+# what the boxes are actually spending their time on.
+#
+# The binary cannot be built off-box: it targets aarch64 Linux with CUDA and the
+# only machines that are, are the measurement machines. Building elsewhere is not
+# an available answer, which is why reserving is.
+#
+# IF YOU CAN SEE THE BOX, LOOK BEFORE YOU BREAK A STALE LOCK. This script reads
+# silence as death because it cannot see the holder -- that is the right rule for
+# the mechanism, and the wrong rule for a caller with ssh. A holder doing one long
+# uninterrupted stretch without calling `refresh` goes stale WHILE STILL MEASURING,
+# and taking its box destroys a live reservation. The taker's own idle gate then
+# refuses and hands the box straight back, so the outcome is not an OOM -- it is a
+# reservation deleted and a slot wasted for nothing. Two ssh round trips per poll
+# removes the whole case. It also covers the agent who has not adopted the lock at
+# all: a box busy with an UNLOCKED run is not one to reserve either.
+# (scripts/frontier-bench.sh implements this as `boxes_look_idle && take_both`,
+# and the rule is theirs.)
+#
+# TAKING BOTH BOXES: BOTH OR NEITHER, AND NEVER WAIT WHILE HOLDING HALF.
+# A two-node run needs spark and spark2 together. If you take one, fail to get
+# the other, and then WAIT while still holding the first, you deadlock against
+# any other two-node agent doing the same thing in the opposite order -- A holds
+# spark2 waiting for spark, B holds spark waiting for spark2, and neither ever
+# yields. Nothing in this script prevents that; it is a property of how you call
+# it. So: if the second take fails, RELEASE THE FIRST before you sleep, and ask
+# for both again from scratch on the next attempt. Holding half of what you need
+# while you wait is the one usage that turns a working lock into a hang.
+# (Found by the frontier harness, which hit the half-held state and only escaped
+# it because that version exited instead of waiting.)
+#
+# KNOWN GAP: THE TIMEOUT IS SIZED FOR THE WRONG FAILURE. 5400 s was chosen so a
+# healthy holder is never broken into -- a cold build plus reps -- which is the
+# right size for a SLOW holder and the wrong size for an ABSENT one. Absent is
+# what actually happens: 2026-08-27, a holder beat twice, finished its run, exited
+# without releasing, and left two idle GB10s reserved for the remaining 68 minutes
+# of its timeout while four agents queued behind it.
+#
+# The better test is a CONJUNCTION rather than elapsed time: if the boxes are idle
+# AND the beat has stopped, the holder is done, and that pair is far more
+# informative than age alone. A holder mid-build is silent but its box is busy; a
+# holder that has exited is silent and its box is idle. scripts/frontier-bench.sh
+# already computes half of it in `boxes_look_idle`.
+#
+# NOT IMPLEMENTED HERE, deliberately. Changing what "abandoned" means while five
+# agents are mid-flight is the move that turns a coordination bug into an
+# incident, and this gap costs idle machines rather than corrupted measurements.
+# The mitigation that IS available today costs nothing and belongs in every
+# caller: RELEASE FROM A TRAP on every exit path, including the error and
+# interrupt paths. Taking is deliberate, beating is printed as an obligation, and
+# releasing is the step a crash skips -- which is why silence after work looks
+# exactly like silence during it.
+#
+# WHAT THIS DOES NOT DO: THERE IS NO QUEUE. It is mutual exclusion and nothing
+# more. A caller refused with rc 3 is not remembered, is not owed the next slot,
+# and will not be handed anything when the lock frees -- it has to come back and
+# ask again. Two consequences, both seen within an hour of this landing:
+#
+#   - A waiter that gives up on the first refusal simply does not run. If your
+#     work matters, POLL with a bounded backoff and a long ceiling, and report
+#     "never got a slot" rather than reporting nothing.
+#   - With several agents and long holds, an unlucky waiter can STARVE. Nothing
+#     here prevents it. If that starts happening, the fix is a real queue (a
+#     ticket file, taken in order), not a longer timeout and not politeness.
+#
+# It is deliberately this simple because the failure it was built for -- two
+# runs overlapping and OOM-killing each other -- needs only exclusion, and a
+# queue that is wrong is worse than no queue. Revisit when starvation is
+# observed, not before.
+#
+# AND WHEN YOU DO KILL BY PID, RE-VERIFY THE PID IN THE SAME ROUND TRIP.
+# "Kill by PID, never by pattern" is not the whole rule, because it treats a PID
+# as a stable identifier and it is only stable while the process lives. On a box
+# that forks constantly, a PID copied out of a report written minutes ago can name
+# something else entirely by the time the signal lands. So the two failures are
+# symmetric and both are live here: killing by PATTERN is unsafe because it can
+# match a neighbour, and killing by a STALE PID is unsafe because it can BECOME
+# one. Check /proc/<pid>/cmdline still says what you expect, in the same ssh call
+# that sends the signal -- not in a previous one, and not from a message someone
+# sent you.
+#
+# 2026-08-27: two unkillable waiters were reported and I was about to kill them on
+# the strength of the report. Verifying first showed both had already been reaped
+# by their owner, so the signals would have gone to whatever had inherited those
+# numbers on a box that had forked thousands of times since.
 #
 # NEVER `pkill -f` ON A SHARED BOX, and never kill a lock holder's processes to
 # take a lock. If a box is held, WAIT or exit cleanly and say so. The lock tells
@@ -72,7 +180,10 @@ write_info() {
 case "$ACTION" in
   take)
     mkdir -p "$HOME/gb10"
-    if mkdir "$LOCKD" 2>/dev/null; then write_info; echo "TAKEN $TAG"; exit 0; fi
+    if mkdir "$LOCKD" 2>/dev/null; then write_info
+      echo "TAKEN $TAG -- you MUST call 'refresh $TAG' at least every ${TIMEOUT}s"
+      echo "  or this lock goes stale and another agent may take the box while you run."
+      exit 0; fi
     [ -f "$INFO" ] || { echo "HELD by an unidentified holder"; exit 3; }
     hhost=$(sed -n 's/^host=//p' "$INFO")
     htag=$(sed -n 's/^tag=//p' "$INFO");  hst=$(sed -n 's/^beat=//p' "$INFO")
