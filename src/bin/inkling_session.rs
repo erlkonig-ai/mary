@@ -159,39 +159,77 @@ fn rewind_gate(session: &mut Session, prompt: &[usize], gen: usize) -> Result<()
     let (head, a) = prompt.split_at(cut);
     let b: Vec<usize> = a.iter().rev().copied().collect();
 
-    let run = |s: &mut Session, tail: &[usize]| -> Result<Vec<usize>> {
+    // Every `run` reports what its two halves cost, because the cost model this
+    // gate is here to produce is exactly the comparison between them: a rewind
+    // pays for the RE-EXTENDED tail, a reset pays for the whole prompt again.
+    let run = |s: &mut Session, tail: &[usize], what: &str| -> Result<Vec<usize>> {
+        let t0 = std::time::Instant::now();
         let mut tok = s.extend(tail)?;
+        let extended = t0.elapsed().as_secs_f64();
         let mut out = vec![tok];
+        let t1 = std::time::Instant::now();
         for _ in 1..gen {
             tok = s.step()?;
             out.push(tok);
         }
+        let decoded = t1.elapsed().as_secs_f64();
+        println!(
+            "  extend {what:<14}: {} tokens in {extended:.3}s ({:.1} ms/token, WALKED), then {} \
+             steps in {decoded:.3}s ({:.1} ms/step)",
+            tail.len(),
+            extended * 1e3 / tail.len().max(1) as f64,
+            gen - 1,
+            decoded * 1e3 / (gen - 1).max(1) as f64,
+        );
         Ok(out)
     };
 
     // ── the rewound path ────────────────────────────────────────────────────
+    // This first prefill is COLD -- it is the pass that binds every layer's
+    // weights -- so its seconds are not the number to quote. The one after the
+    // reset is.
     session.prefill(head)?;
+    let t_cp = std::time::Instant::now();
     let mark = session.checkpoint()?;
-    println!("  checkpoint         : position {}", mark.position());
-    let discarded = run(session, a)?;
+    println!(
+        "  checkpoint            : position {} in {:.4}s",
+        mark.position(),
+        t_cp.elapsed().as_secs_f64()
+    );
+    let discarded = run(session, a, "tail A")?;
     println!(
         "  ran tail A         : position {} (these {} tokens are about to be un-attended to)",
         session.position(),
         discarded.len()
     );
+    let t_rw = std::time::Instant::now();
     session.rewind(&mark)?;
+    let rewind_s = t_rw.elapsed().as_secs_f64();
+    println!("  rewind                : {rewind_s:.4}s");
     anyhow::ensure!(
         session.position() == mark.position(),
         "rewound to {} but the session says {}",
         mark.position(),
         session.position()
     );
-    let rewound = run(session, &b)?;
+    let rewound = run(session, &b, "tail B (rewound)")?;
 
     // ── the session that was built that way ─────────────────────────────────
+    // And this is the ALTERNATIVE a rewind is measured against: throwing the
+    // sequence away and re-reading the settled prefix. This prefill is WARM --
+    // every layer is bound -- so the seconds it prints are the seconds a rewind
+    // does not spend.
     session.reset();
+    let t_pf = std::time::Instant::now();
     session.prefill(head)?;
-    let fresh = run(session, &b)?;
+    let prefill_s = t_pf.elapsed().as_secs_f64();
+    println!(
+        "  reset + prefill       : {} tokens in {prefill_s:.3}s ({:.2} ms/token, BATCHED) -- \
+         this is what a rewind does not pay",
+        head.len(),
+        prefill_s * 1e3 / head.len() as f64,
+    );
+    let fresh = run(session, &b, "tail B (fresh)")?;
 
     println!("REWOUND: {rewound:?}");
     println!("FRESH  : {fresh:?}");
@@ -223,6 +261,10 @@ fn rewind_gate(session: &mut Session, prompt: &[usize], gen: usize) -> Result<()
     anyhow::ensure!(
         agree == rewound.len(),
         "the rewound session diverges from the one built that way at token {agree}"
+    );
+    println!(
+        "  saving                : {prefill_s:.3}s of settled prefix kept, against \
+         {rewind_s:.4}s to put the cache back"
     );
     println!("REWIND GATE: PASS");
     Ok(())
