@@ -168,6 +168,22 @@ fn main() -> Result<()> {
 /// Both ranges agreed 8/8 tokens between the rewound session and the one built
 /// that way, so the equivalence held exactly at this length on the real weights.
 ///
+/// A third run pushed past the case where a truncation is trivially exact.
+/// `Pages::merge_settled` joins the settled pages once their count passes
+/// [`mary::models::inkling::kvpages::MAX_PAGES`] (8), so a 960-token run never
+/// reaches it — 960 rows is exactly 8 pages, and truncating back to 640 restores
+/// the very page partition that existed there. At 1536 tokens split 1024/512 it
+/// DOES: the global stores merge to a single 1024-row page, and the truncation
+/// hands the reader ONE key run where the checkpoint's own history had eight.
+/// Different split of the same sum, which is the one place a rewind can differ
+/// arithmetically from the run that first passed through — and at layers 0..21
+/// the two still agreed **12/12 tokens** (prefill 12.32 ms/token, extend 47.3
+/// ms/token). That is evidence and not a proof of identity at every length: the
+/// same class of partition change is documented at a 3732-token prompt in
+/// [`mary::models::inkling::burn::AttnCache::reserve_kv`], where it diverges at
+/// step 8. So a rewind at long context should be read as *agrees for a while,
+/// then may part company* — never as bit-identical.
+///
 /// **And the ratio is the finding, not the saving.** Taking and using a
 /// checkpoint is free — sub-millisecond, because it is handle clones and
 /// counters. What is not free is what comes after it: `Session::extend` walks
