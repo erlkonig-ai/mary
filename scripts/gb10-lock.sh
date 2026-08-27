@@ -105,6 +105,22 @@
 # queue that is wrong is worse than no queue. Revisit when starvation is
 # observed, not before.
 #
+# AND WHEN YOU DO KILL BY PID, RE-VERIFY THE PID IN THE SAME ROUND TRIP.
+# "Kill by PID, never by pattern" is not the whole rule, because it treats a PID
+# as a stable identifier and it is only stable while the process lives. On a box
+# that forks constantly, a PID copied out of a report written minutes ago can name
+# something else entirely by the time the signal lands. So the two failures are
+# symmetric and both are live here: killing by PATTERN is unsafe because it can
+# match a neighbour, and killing by a STALE PID is unsafe because it can BECOME
+# one. Check /proc/<pid>/cmdline still says what you expect, in the same ssh call
+# that sends the signal -- not in a previous one, and not from a message someone
+# sent you.
+#
+# 2026-08-27: two unkillable waiters were reported and I was about to kill them on
+# the strength of the report. Verifying first showed both had already been reaped
+# by their owner, so the signals would have gone to whatever had inherited those
+# numbers on a box that had forked thousands of times since.
+#
 # NEVER `pkill -f` ON A SHARED BOX, and never kill a lock holder's processes to
 # take a lock. If a box is held, WAIT or exit cleanly and say so. The lock tells
 # you who to ask, not who to kill.
