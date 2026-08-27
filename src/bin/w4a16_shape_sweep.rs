@@ -141,7 +141,13 @@ fn launch_into(
             TensorArg::from_raw_parts(out.clone(), [n, 1].into(), [m_pad, n].into()),
             k,
             n,
+            // `live_arg(m_pad, None)` — this sweep measures the UNMASKED
+            // lane, so no mask, no dead-half fold, and the row count the
+            // kernel never reads.
+            false,
+            false,
             1.0f32,
+            m_pad as u32,
         )
     };
 }
