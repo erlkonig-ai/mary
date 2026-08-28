@@ -282,6 +282,12 @@ fn run() -> Result<()> {
     }
     if let Some(budget) = options.prefill_budget {
         config.prefill_budget = budget;
+        // There is one bounded-width append path, not an independently tuned
+        // second strategy. A caller narrowing prefill chunks narrows later
+        // multi-row extends to the same admitted width; single-token decode is
+        // unchanged. SessionConfig still rejects an explicitly inconsistent
+        // library caller instead of silently repairing it.
+        config.extend_batch = config.extend_batch.min(budget);
     }
     // Historically there was only one length axis. Preserve that CLI meaning:
     // setting just --prefill-budget admits that many retained positions too,
