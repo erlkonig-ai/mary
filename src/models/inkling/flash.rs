@@ -352,14 +352,30 @@
 //! arms are interleaved in the first place. An unpaired reading of this run
 //! would have concluded nothing.
 //!
-//! So it is a switch that is OFF, and what it is waiting for is named rather
-//! than guessed: a value loop that does not decode V four times and does not
-//! issue a load an element. Giving a lane a CONTIGUOUS run of dimensions would
-//! do both — one 32-bit code word would serve eight elements and one scale byte
-//! sixteen — but that is a change to the lane-to-dimension mapping, i.e. to
-//! this kernel's SHAPE, which is exactly what the old note said the packed read
-//! would not need. The note was right that the reader change is local. It was
-//! wrong that the reader change is sufficient.
+//! That was the direct-reader result. The staged-value tile below removes the
+//! duplicated work without changing the lane-to-output mapping: the 128 units
+//! cooperatively expand each 32-key V tile once, one whole sixteen-value NVFP4
+//! block per unit, into the key tile's now-dead shared memory. All four planes
+//! then consume that one expansion. Each pair of packed words and its scale is
+//! loaded once per tile rather than once per value per plane.
+//!
+//! The same-binary, four-arm ABBA gate after that change is favorable at both
+//! lengths. Each row is a median over 39 warm decode steps, and each paired
+//! sample is `mean(tile, tileB) / mean(dense, denseB) - 1` within one ABBA
+//! block; the interval is Student-t over seven samples. Both lengths use
+//! `INK_LAYERS=0:8`, `INK_GEN=40`, one GB10, and differ only in the input
+//! context and `INK_FLASH_FP4`:
+//!
+//! | input context | paired step-time delta | 95% CI | favorable blocks |
+//! | ---: | ---: | ---: | ---: |
+//! | 3732 | **-0.74%** | -1.18..-0.31% | 7 / 7 |
+//! | 14928 | **-4.85%** | -5.47..-4.23% | 7 / 7 |
+//!
+//! The generation sequence is bit-identical across all 28 processes at each
+//! length, and the device gate below still requires the packed and dequantized
+//! readers to be bit-identical over decode, prefill, page cuts, GQA and windows.
+//! Raw logs and TSVs are preserved as Files import
+//! `d6431dfa4c1e699b767e424a2785c1a4`.
 //!
 //! It is DECODE-only in effect: the prefill global arm reads freshly projected
 //! K and V rather than the cache, so it never reaches this flag — which is just
@@ -716,9 +732,56 @@ fn flash_kernel<KV: Numeric>(
         sync_cube();
 
         // --- the value average ----------------------------------------------
-        // Lane `l` owns output dimensions `l, l+32, ...`, so the V read is
-        // consecutive across the plane: one coalesced line per key per
-        // dimension group, and the four planes share it through L1.
+        // The four planes need the SAME V tile.  The dense reader leaves the
+        // old direct load alone: its one BF16 load is an L1 hit in the three
+        // planes which arrive after the first.  The packed reader cannot do
+        // that cheaply -- every apparent load is also a nibble extraction and
+        // a scale load -- so its 128 units cooperatively expand the tile ONCE
+        // into the key tile's now-dead shared memory.
+        //
+        // One unit owns one whole sixteen-value NVFP4 block at a time.  That is
+        // the storage algebra rather than merely coalesced scalar indexing:
+        // one E4M3 scale and two u32 words become sixteen consecutive values.
+        // Every packed launch admits only head dimensions that are a multiple
+        // of the sixteen-value NVFP4 group, hence a block cannot straddle
+        // either a head or a key row.
+        if comptime![packed] {
+            let blocks = comptime!(PLANE * head_dim / 16);
+            let mut block = u;
+            while block < blocks {
+                let first = block * 16;
+                let j = first / head_dim;
+                let d0 = first % head_dim;
+                let vkey = t + j;
+
+                let mut word0 = u32::new(0);
+                let mut word1 = u32::new(0);
+                let mut scale = f32::new(0.0);
+                if vkey < s_hi {
+                    let idx = vkey * kv_row + kvh * head_dim + d0;
+                    word0 = vc[(idx / 8) as usize];
+                    word1 = vc[(idx / 8 + 1) as usize];
+                    scale = f32::cast_from(vs[(idx / 16) as usize]);
+                }
+
+                #[unroll]
+                for e in 0u32..16u32 {
+                    let mut code = (word0 >> (e * 4u32)) & 15u32;
+                    if e >= 8u32 {
+                        code = (word1 >> ((e - 8u32) * 4u32)) & 15u32;
+                    }
+                    sk[(j * skw + d0 + e) as usize] = e2m1_bits(code) * scale;
+                }
+                block += UNITS;
+            }
+            // Every plane consumes every staged row below.  This barrier is
+            // absent from the dense instantiation because `packed` is comptime.
+            sync_cube();
+        }
+
+        // Lane `l` owns output dimensions `l, l+32, ...`.  Packed V now comes
+        // from the one cooperatively expanded tile; dense V keeps its direct
+        // consecutive read and L1 sharing.
         for j in 0..PLANE {
             let vkey = t + j;
             if vkey < s_hi {
@@ -729,7 +792,7 @@ fn flash_kernel<KV: Numeric>(
                     if d < head_dim {
                         let mut vv = f32::new(0.0);
                         if comptime![packed] {
-                            vv = nvfp4_at(vc, vs, vbase + d);
+                            vv = sk[(j * skw + d) as usize];
                         } else {
                             vv = f32::cast_from(v[(vbase + d) as usize]);
                         }
@@ -886,11 +949,11 @@ const MIN_KEYS_PER_SPLIT: usize = 128;
 
 /// Whether a layer's shape is one this kernel handles.
 ///
-/// Each condition is a real limit. `head_dim` must divide into the plane
-/// because a lane owns `head_dim / 32` output dimensions; `rows` must divide
-/// into both the planes and the head groups because a cube's rows are a
-/// `groups x (rows / groups)` rectangle spread over four planes; and the shared
-/// tile must fit the 48 KiB a static `__shared__` gets.
+/// Each condition is a real limit. An output dimension may end partway through
+/// a plane; the packed launcher separately requires whole NVFP4 groups. `rows`
+/// must divide into both the planes and the head groups because a cube's rows
+/// are a `groups x (rows / groups)` rectangle spread over four planes; and the
+/// shared tile must fit the 48 KiB a static `__shared__` gets.
 pub fn applies(heads: usize, kv_heads: usize, head_dim: usize, rows: usize) -> bool {
     if kv_heads == 0 || heads % kv_heads != 0 || head_dim == 0 || rows == 0 {
         return false;
@@ -900,6 +963,15 @@ pub fn applies(heads: usize, kv_heads: usize, head_dim: usize, rows: usize) -> b
         && rows % PLANES as usize == 0
         && rows % groups == 0
         && shared_floats(rows as u32, head_dim as u32) * core::mem::size_of::<f32>() <= 48 * 1024
+}
+
+/// Whether one head ends on an NVFP4 block boundary.
+///
+/// The dense reader has no such restriction. The staged packed-V reader owns
+/// one complete block per unit, so allowing a partial terminal block would
+/// make that unit cross into the next head row.
+fn packed_head_dim_applies(head_dim: usize) -> bool {
+    head_dim.is_multiple_of(super::fp4quant::GROUP)
 }
 
 /// The cube row count a DECODE step wants: the smallest multiple of [`PLANES`]
@@ -986,6 +1058,12 @@ pub fn flash_attention_launch<R: Runtime>(
         applies(heads, kv_heads, head_dim, rows),
         "this shape is not fused here: {heads}/{kv_heads} heads, head_dim {head_dim}, rows {rows}"
     );
+    let packed = kv == KvElem::Nvfp4;
+    assert!(
+        !packed || packed_head_dim_applies(head_dim),
+        "NVFP4 needs head_dim {head_dim} to end on a {}-value block boundary",
+        super::fp4quant::GROUP
+    );
     let groups = heads / kv_heads;
     let bq = rows / groups;
     let q_tiles = nq.div_ceil(bq);
@@ -1027,7 +1105,6 @@ pub fn flash_attention_launch<R: Runtime>(
     let po = client.empty(po_elems * core::mem::size_of::<f32>());
     let pml = client.empty(pml_elems * core::mem::size_of::<f32>());
 
-    let packed = kv == KvElem::Nvfp4;
     let mut slot0 = 0usize;
     for (run, splits) in runs.iter().zip(split_of.iter().copied()) {
         let kv_elems = run.rows * kv_heads * head_dim;
@@ -1175,6 +1252,16 @@ mod tests {
         // A head_dim whose tile does not fit the 48 KiB a static `__shared__`
         // gets.
         assert!(!applies(32, 8, 2048, 32));
+    }
+
+    #[test]
+    fn packed_heads_end_on_block_boundaries_but_dense_heads_need_not() {
+        assert!(packed_head_dim_applies(128));
+        assert!(packed_head_dim_applies(
+            crate::models::inkling::fp4quant::GROUP
+        ));
+        assert!(!packed_head_dim_applies(8));
+        assert!(applies(32, 8, 8, 4));
     }
 
     #[test]
