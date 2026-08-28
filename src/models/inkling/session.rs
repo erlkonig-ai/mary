@@ -115,6 +115,7 @@ use super::assembly::{
 use super::attn::{AttnDims, LogScaling};
 use super::config::{AttnKind, InklingConfig};
 use super::pile::Elem;
+use super::pool::{CleanupGate, CleanupPolicy};
 use super::source::Weights;
 use super::stack::embed_and_norm_bf16;
 use super::target::{
@@ -142,6 +143,19 @@ fn required_cache_span(kind: AttnKind, position: usize, window: usize) -> (usize
         }
         AttnKind::Global => (0, position),
     }
+}
+
+/// A Session exposes a layer boundary, but not the routed lane's internal
+/// stage boundaries. Refuse the stronger policy rather than print "stage" and
+/// quietly perform only layer cleanup.
+fn session_cleanup_policy(policy: CleanupPolicy) -> Result<CleanupPolicy> {
+    anyhow::ensure!(
+        policy != CleanupPolicy::PerStage,
+        "INK_POOL_CLEANUP=stage requires the one-shot forward's internal stage boundaries; a \
+         Session can clean between layers. Use INK_POOL_CLEANUP=1 for the strongest policy this \
+         execution path implements."
+    );
+    Ok(policy)
 }
 
 /// Validate the two placement modes without touching a GPU.
@@ -292,6 +306,14 @@ pub struct Session {
     src: Weights,
     dev: burn::backend::cuda::CudaDevice,
     client: cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+    /// Runtime bound on free pages retained by cubecl's pool. Admission charges
+    /// live tensors and relies on this gate for historical pages; it must persist
+    /// across passes so a pass that cleaned keeps the next one polling per layer.
+    /// Without it, Session memory grows with the sequence of allocation shapes:
+    /// the admission arithmetic remains true only under a cleanup assumption the
+    /// resident path did not enforce, and a long-lived server eventually fails
+    /// even when no individual request violates admission.
+    cleanup_gate: CleanupGate,
     /// Present exactly when this Session is one tensor-parallel rank. The
     /// Group owns both [`Tp`] and the client above; the client is cloned FROM
     /// this value at load rather than independently constructed.
@@ -778,6 +800,8 @@ impl Session {
             Some(group) => group.allocator()?,
             None => super::pool::choose_memory_config(),
         };
+        let cleanup = session_cleanup_policy(CleanupPolicy::choose())?;
+        let cleanup_gate = CleanupGate::new(cleanup);
         let mut admission = super::budget::AdmissionPolicy::runtime(allocator)
             .with_router_bf16(RouterArm::from_env() == RouterArm::Bf16)
             .with_drafting(false)
@@ -903,12 +927,18 @@ impl Session {
             tp.map(|tp| format!(", tensor rank {} of {}", tp.rank(), tp.world()))
                 .unwrap_or_default(),
         );
+        println!(
+            "    pool cleanup: {}; polling {}",
+            cleanup.name(),
+            cleanup_gate.schedule()
+        );
 
         Ok(Self {
             cfg: conf,
             src,
             dev,
             client,
+            cleanup_gate,
             group,
             aliases,
             lo,
@@ -1576,7 +1606,8 @@ impl Session {
         // prefill that establishes the cache.
         let cached = !self.caches.is_empty();
         debug_assert!(cached || mode == PassMode::Commit);
-        super::fatal::note_tokens(n);
+        super::fatal::note_pass(n, pos0 + n);
+        self.cleanup_gate.begin_pass();
 
         // The embedding is a host gather over the stored BF16, normed on the
         // host, and uploaded once. It is the only host arithmetic left in a pass.
@@ -1867,6 +1898,32 @@ impl Session {
                 "layer {layer} issued {tp_calls} tensor-parallel collectives, not {expected} \
                  (one after attention and one after the MLP, both before their short convolution)"
             );
+
+            // Admission deliberately charges only LIVE tensors. Free pages from
+            // earlier, differently-sized KV runs are bounded here, after this
+            // layer's temporaries have been consumed and before the next layer
+            // asks the pool for another shape. This is the same gate the one-shot
+            // forward uses; without it a chunked Session grows a history of every
+            // global-cache size it has visited.
+            let last_layer = layer + 1 == self.hi;
+            let client = &self.client;
+            let want_cleanup = self.cleanup_gate.at_layer(last_layer, || {
+                client
+                    .memory_usage()
+                    .map(|usage| {
+                        super::pool::stranded_bytes(
+                            usage.bytes_reserved,
+                            usage.bytes_in_use,
+                            usage.bytes_padding,
+                        )
+                    })
+                    .unwrap_or(0)
+            });
+            if want_cleanup {
+                <Bk as burn::tensor::backend::Backend>::sync(&self.dev)
+                    .expect("sync before Session pool cleanup");
+                self.client.memory_cleanup();
+            }
         }
 
         // ---- the head -----------------------------------------------------
@@ -1914,6 +1971,18 @@ mod tests {
             required_cache_span(AttnKind::Global, 19_175, 512),
             (0, 19_175)
         );
+    }
+
+    #[test]
+    fn session_cleanup_policy_refuses_a_stage_precision_it_cannot_deliver() {
+        assert_eq!(
+            session_cleanup_policy(CleanupPolicy::PerLayer).unwrap(),
+            CleanupPolicy::PerLayer
+        );
+        let err = session_cleanup_policy(CleanupPolicy::PerStage)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Use INK_POOL_CLEANUP=1"), "{err}");
     }
 
     /// The layer-range rules are arithmetic and testable without a GPU: they are
