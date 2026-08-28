@@ -10,8 +10,8 @@
 //! process.
 //!
 //! As it stood: above roughly 15,600 tokens the device refused one attention
-//! layer's `[heads, n, n]` f32 score matrix. The refusal is not a shortage of
-//! memory:
+//! layer's `[heads, n, n]` f32 score matrix. That PARTICULAR refusal was not a
+//! shortage of memory:
 //! cubecl's CUDA runtime sets its largest single allocation to
 //! `cuDeviceTotalMem / 4`, which is 29.9 GiB on a 119.6 GiB node, and
 //! `[32, 16384, 16384]` f32 is 32 GiB exactly. Every pool's `max_alloc_size` is
@@ -42,17 +42,28 @@ use std::io::Write as _;
 use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// The sequence length the process is working at.
+/// The last submitted pass and the logical position it reaches.
 ///
 /// A global rather than an argument because the panic that matters happens on a
 /// thread this crate never created, three crates down, with no path back to the
 /// forward's locals. It is written once per run and read once per crash.
-static TOKENS: AtomicUsize = AtomicUsize::new(0);
+static PASS_ROWS: AtomicUsize = AtomicUsize::new(0);
+static LOGICAL_END: AtomicUsize = AtomicUsize::new(0);
 static ARM: Once = Once::new();
 
-/// Record the sequence length, so a crash can name what caused it.
+/// Record a whole-sequence pass, as used by the one-shot forward binary.
 pub fn note_tokens(n: usize) {
-    TOKENS.store(n, Ordering::Relaxed);
+    note_pass(n, n);
+}
+
+/// Record the submitted rows and the logical position they end at.
+///
+/// A chunked prefill submits only a slice of the sequence at a time. Keeping
+/// these two axes separate prevents a 1024-row chunk near position 42,000 from
+/// being reported as a 1024-token sequence.
+pub fn note_pass(rows: usize, logical_end: usize) {
+    PASS_ROWS.store(rows, Ordering::Relaxed);
+    LOGICAL_END.store(logical_end, Ordering::Relaxed);
 }
 
 /// Install the hook. Call once, from `main`, before anything touches a device.
@@ -60,45 +71,58 @@ pub fn arm() {
     ARM.call_once(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-        // The default hook first: it names the thread, the file and the line,
-        // and the backtrace if one was asked for.
-        previous(info);
+            // The default hook first: it names the thread, the file and the line,
+            // and the backtrace if one was asked for.
+            previous(info);
 
-        let text = payload(info);
-        let mut err = std::io::stderr().lock();
-        let _ = writeln!(err);
-        let _ = writeln!(err, "=== FATAL: this run cannot produce an answer ===");
-        if let Some(bytes) = refused_bytes(&text) {
-            let n = TOKENS.load(Ordering::Relaxed);
-            let _ = writeln!(
-                err,
-                "  The device REFUSED a {bytes}-byte ({:.2} GiB) allocation.",
-                bytes as f64 / (1u64 << 30) as f64
-            );
-            if n > 0 {
+            let text = payload(info);
+            let mut err = std::io::stderr().lock();
+            let _ = writeln!(err);
+            let _ = writeln!(err, "=== FATAL: this run cannot produce an answer ===");
+            if let Some(bytes) = refused_bytes(&text) {
+                let rows = PASS_ROWS.load(Ordering::Relaxed);
+                let logical_end = LOGICAL_END.load(Ordering::Relaxed);
                 let _ = writeln!(
                     err,
-                    "  Sequence length: {n} tokens. One attention layer's [heads, n, n] f32 score\n  \
-                     matrix is that buffer, and it grows as n^2: every 41% more tokens doubles it."
+                    "{}",
+                    allocation_refusal(bytes, rows, logical_end)
                 );
             }
             let _ = writeln!(
                 err,
-                "  This is a CEILING, not a shortage: cubecl's CUDA runtime caps a single\n  \
-                 allocation at cuDeviceTotalMem / 4, and no amount of free memory raises it.\n  \
-                 Shorten the input, or run a lane that never materialises [heads, n, n]."
+                "  Aborting. The alternative is exiting 0 with numbers read out of a buffer that\n  \
+                 was never written, which is what this build did before."
             );
-        }
-        let _ = writeln!(
-            err,
-            "  Aborting. The alternative is exiting 0 with numbers read out of a buffer that\n  \
-             was never written, which is what this build did before."
-        );
-        let _ = err.flush();
-        let _ = std::io::stdout().flush();
+            let _ = err.flush();
+            let _ = std::io::stdout().flush();
             std::process::abort();
         }));
     });
+}
+
+/// The allocation paragraph, deliberately limited to facts this panic carries.
+///
+/// `IoError::BufferTooBig` currently names both the memory-pool size guard and
+/// a `CUDA_ERROR_OUT_OF_MEMORY` returned by `cuMemAlloc`. The text therefore
+/// cannot classify the refusal, and a byte count cannot identify its producer.
+fn allocation_refusal(bytes: u64, rows: usize, logical_end: usize) -> String {
+    let mut text = format!(
+        "  The allocator REFUSED a {bytes}-byte ({:.2} GiB) allocation.",
+        bytes as f64 / (1u64 << 30) as f64
+    );
+    if rows > 0 {
+        use std::fmt::Write as _;
+        let _ = write!(
+            text,
+            "\n  Last submitted pass: {rows} row(s), ending at logical position {logical_end}."
+        );
+    }
+    text.push_str(
+        "\n  This panic string is shared by the per-allocation size guard and CUDA out-of-memory.\n  \
+         It does not identify the buffer or its cause; distinguish them with allocator/driver\n  \
+         tracing and memory telemetry.",
+    );
+    text
 }
 
 /// The panic payload as a string, for the two shapes `panic!` produces.
@@ -128,7 +152,7 @@ fn refused_bytes(text: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::refused_bytes;
+    use super::{allocation_refusal, refused_bytes};
 
     #[test]
     fn reads_the_refused_size() {
@@ -140,5 +164,15 @@ mod tests {
     #[test]
     fn ignores_other_panics() {
         assert_eq!(refused_bytes("index out of bounds: the len is 3"), None);
+    }
+
+    #[test]
+    fn allocation_refusal_does_not_invent_a_buffer_or_a_cause() {
+        let report = allocation_refusal(42_958_848, 1024, 41_984);
+        assert!(report.contains("1024 row(s), ending at logical position 41984"));
+        assert!(report.contains("shared by the per-allocation size guard and CUDA out-of-memory"));
+        for invented in ["[heads, n, n]", "CEILING", "not a shortage"] {
+            assert!(!report.contains(invented), "invented diagnosis: {report}");
+        }
     }
 }
