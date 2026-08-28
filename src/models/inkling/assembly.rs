@@ -1705,6 +1705,123 @@ pub struct MtpDev {
     pub dense: (Bf16W, Bf16W, Bf16W, f32),
 }
 
+/// Bind one checkpoint MTP head to the device.
+///
+/// The returned byte count preserves the startup census used by
+/// `inkling_forward`: the de-interleaved dense matrices, dense down projection,
+/// and wrapper input projection. It is a census of the weights this binder
+/// handles explicitly, not a claim that every byte required a second device
+/// allocation; [`bind_bf16`] may alias an admitted startup mapping.
+///
+/// Keeping this beside [`MtpDev`] matters for callers such as [`super::session`]:
+/// a binary-local binder made the otherwise-public MTP execution functions
+/// impossible to assemble into a long-lived model without copying the entire
+/// checkpoint-name transcription.
+#[allow(clippy::too_many_arguments)]
+pub fn bind_mtp_dev(
+    src: &Weights,
+    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+    aliases: Option<&crate::models::inkling::fp4gemm::Aliases>,
+    dev: &burn::backend::cuda::CudaDevice,
+    index: usize,
+    text: &crate::models::inkling::config::InklingTextConfig,
+    dims: &AttnDims,
+) -> Result<(MtpDev, u64)> {
+    let h = text.hidden_size;
+    anyhow::ensure!(
+        dims.hidden == h,
+        "MTP head {index} declares hidden {}, text config declares {h}",
+        dims.hidden
+    );
+    let pre = format!("model.mtp.layers.{index}.");
+    let p = format!("{pre}transformer_block.");
+    let pw = |nm: &str, rows: usize, cols: usize| -> Result<Bf16W> {
+        let leaf = src.stored(&format!("{p}{nm}"))?;
+        anyhow::ensure!(
+            leaf.elem == Elem::Bf16,
+            "{p}{nm} is {:?}; this lane multiplies BF16 by BF16",
+            leaf.elem
+        );
+        Ok(bind_bf16(client, aliases, &leaf.bytes, rows, cols))
+    };
+    let input_proj = src.stored(&format!("{pre}input_proj.weight"))?;
+    anyhow::ensure!(
+        input_proj.elem == Elem::Bf16,
+        "input_proj is {:?}",
+        input_proj.elem
+    );
+    let gv = |nm: &str| -> Result<Vec<f32>> { Ok(src.tensor(nm)?.data) };
+
+    // This head is dense even when the corresponding main-stack layer is MoE.
+    // Its fused gate/up rows use the checkpoint's interleaved convention.
+    let fused = src.stored(&format!("{p}mlp.w13_dn.weight"))?;
+    anyhow::ensure!(fused.elem == Elem::Bf16, "mtp w13 is {:?}", fused.elem);
+    let (gate, up) = crate::models::inkling::load::split_gate_up_bytes(&fused.bytes, h, 2);
+    let down = src.stored(&format!("{p}mlp.w2_md.weight"))?;
+    anyhow::ensure!(down.elem == Elem::Bf16, "mtp w2 is {:?}", down.elem);
+    let (down_rows, down_cols) = (down.dims[0] as usize, down.dims[1] as usize);
+    let inter = gate.len() / (h * 2);
+    let global_scale = src.tensor(&format!("{p}mlp.global_scale"))?.data[0];
+    let mut bytes = (gate.len() + up.len() + down.bytes.len()) as u64;
+    let dense = (
+        bind_bf16(client, aliases, &gate, inter, h),
+        bind_bf16(client, aliases, &up, inter, h),
+        bind_bf16(client, aliases, &down.bytes, down_rows, down_cols),
+        global_scale,
+    );
+
+    let head = MtpDev {
+        attn: dev_lane::AttnWeightsDev {
+            wq: pw("attn.wq_du.weight", dims.heads * dims.head_dim, h)?,
+            wk: pw("attn.wk_dv.weight", dims.kv_heads * dims.head_dim, h)?,
+            wv: pw("attn.wv_dv.weight", dims.kv_heads * dims.head_dim, h)?,
+            wr: pw("attn.wr_du.weight", dims.heads * dims.d_rel, h)?,
+            wqkvr: None,
+            wo: pw("attn.wo_ud.weight", h, dims.heads * dims.head_dim)?,
+            k_sconv: up2(
+                gv(&format!("{p}attn.k_sconv.weight"))?,
+                dims.kv_heads * dims.head_dim,
+                text.sconv_kernel_size,
+                dev,
+            ),
+            v_sconv: up2(
+                gv(&format!("{p}attn.v_sconv.weight"))?,
+                dims.kv_heads * dims.head_dim,
+                text.sconv_kernel_size,
+                dev,
+            ),
+            q_norm: up1(gv(&format!("{p}attn.q_norm.weight"))?, dims.head_dim, dev),
+            k_norm: up1(gv(&format!("{p}attn.k_norm.weight"))?, dims.head_dim, dev),
+            rel_proj: up2(
+                gv(&format!("{p}attn.rel_logits_proj.proj"))?,
+                dims.d_rel,
+                dims.rel_extent,
+                dev,
+            ),
+        },
+        attn_sconv: up2(
+            gv(&format!("{p}attn_sconv.weight"))?,
+            h,
+            text.sconv_kernel_size,
+            dev,
+        ),
+        mlp_sconv: up2(
+            gv(&format!("{p}mlp_sconv.weight"))?,
+            h,
+            text.sconv_kernel_size,
+            dev,
+        ),
+        attn_norm: up1(gv(&format!("{p}attn_norm.weight"))?, h, dev),
+        mlp_norm: up1(gv(&format!("{p}mlp_norm.weight"))?, h, dev),
+        embed_norm: up1(gv(&format!("{pre}embed_norm.weight"))?, h, dev),
+        hidden_norm: up1(gv(&format!("{pre}hidden_norm.weight"))?, h, dev),
+        input_proj: bind_bf16(client, aliases, &input_proj.bytes, h, 2 * h),
+        dense,
+    };
+    bytes += input_proj.bytes.len() as u64;
+    Ok((head, bytes))
+}
+
 /// What one device MTP head retains between draft steps.
 ///
 /// The same three things a main-stack layer keeps, and for the same reasons —

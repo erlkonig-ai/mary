@@ -1555,7 +1555,6 @@ use anyhow::{Context, Result};
 use cubecl::server::GraphLaunchPatch;
 
 use mary::models::inkling::attn::{AttnDims, LogScaling};
-use mary::models::inkling::bf16gemm::Bf16W;
 use mary::models::inkling::block::{Routing, rms_norm, route_from_logits};
 use mary::models::inkling::budget;
 use mary::models::inkling::config::{AttnKind, InklingConfig};
@@ -1578,13 +1577,13 @@ use mary::models::inkling::stepstat;
 use mary::models::inkling::assembly::{
     ANN_SKETCH_SEED, BT, Bk, DevRoute, DeviceDense, GIB, HeadLane, HostT, LayerCache, LayerDev,
     MtpDev, MtpDevCache, MtpOwned, PlanArm, RouteDiff, RouterArm, RouterProj, T2, ann_budget,
-    ann_range, ann_rotated, ann_verify, argmax_row_dev, backbone_embed_norm, bind_bf16,
+    ann_range, ann_rotated, ann_verify, argmax_row_dev, backbone_embed_norm, bind_mtp_dev,
     build_expert_table, build_expert_table_bf16, bytes_of, dense_mlp_bf16, dev_lane,
     dev_lane_resid, devplan_verify_layer, devroute_new, down, drop_pad_cols, head_lane, head_temp,
     head_temp_seed, mem_trace, mtp_block_prefill_dev, mtp_block_step_dev, mtp_embed_row,
     mtp_out_norm, normals, note_align, per_expert_bf16, per_expert_fp4, quantized_bf16, report_ab,
     report_align, routed_experts_bf16, routed_experts_bf16_dev, routed_experts_fp4,
-    routed_experts_fp4_dev, shared_experts_bf16, shared_experts_dev, up1, up1r, up2, w4a16_bind,
+    routed_experts_fp4_dev, shared_experts_bf16, shared_experts_dev, up1r, up2, w4a16_bind,
 };
 
 /// How many decode steps are COLD, and excluded from the warm rate.
@@ -8106,125 +8105,14 @@ fn main() -> Result<()> {
                     let t_up = Instant::now();
                     let mut bytes = 0u64;
                     for i in 0..mtp_k {
-                        let pre = format!("model.mtp.layers.{i}.");
-                        let p = format!("{pre}transformer_block.");
                         let hd = &mtp_heads[i].dims;
-                        let pw = |nm: &str, rows: usize, cols: usize| -> Result<Bf16W> {
-                            let leaf = cp.stored(&format!("{p}{nm}"))?;
-                            anyhow::ensure!(
-                                leaf.elem == Elem::Bf16,
-                                "{p}{nm} is {:?}; this lane multiplies BF16 by BF16",
-                                leaf.elem
-                            );
-                            Ok(bind_bf16(
-                                &fp4_client,
-                                fp4_aliases.as_ref(),
-                                &leaf.bytes,
-                                rows,
-                                cols,
-                            ))
-                        };
-                        let ip = cp.stored(&format!("{pre}input_proj.weight"))?;
-                        anyhow::ensure!(ip.elem == Elem::Bf16, "input_proj is {:?}", ip.elem);
-                        let gv = |nm: &str| -> Result<Vec<f32>> { Ok(cp.tensor(nm)?.data) };
                         // Bound here rather than through [`DeviceDense`], whose map
                         // is keyed by LAYER prefix and whose byte counter feeds the
                         // per-layer report: an MTP head is not one of this node's
                         // layers and counting it there would misattribute 1 GiB.
-                        let dense = {
-                            let fused = cp.stored(&format!("{p}mlp.w13_dn.weight"))?;
-                            anyhow::ensure!(
-                                fused.elem == Elem::Bf16,
-                                "mtp w13 is {:?}",
-                                fused.elem
-                            );
-                            let (g, u) = mary::models::inkling::load::split_gate_up_bytes(
-                                &fused.bytes,
-                                h,
-                                2,
-                            );
-                            let dw = cp.stored(&format!("{p}mlp.w2_md.weight"))?;
-                            anyhow::ensure!(dw.elem == Elem::Bf16, "mtp w2 is {:?}", dw.elem);
-                            let (drows, dcols) = (dw.dims[0] as usize, dw.dims[1] as usize);
-                            let inter = g.len() / (h * 2);
-                            let gs = cp.tensor(&format!("{p}mlp.global_scale"))?.data[0];
-                            bytes += (g.len() + u.len() + dw.bytes.len()) as u64;
-                            (
-                                bind_bf16(&fp4_client, fp4_aliases.as_ref(), &g, inter, h),
-                                bind_bf16(&fp4_client, fp4_aliases.as_ref(), &u, inter, h),
-                                bind_bf16(
-                                    &fp4_client,
-                                    fp4_aliases.as_ref(),
-                                    &dw.bytes,
-                                    drows,
-                                    dcols,
-                                ),
-                                gs,
-                            )
-                        };
-                        let built = MtpDev {
-                            attn: dev_lane::AttnWeightsDev {
-                                wq: pw("attn.wq_du.weight", hd.heads * hd.head_dim, h)?,
-                                wk: pw("attn.wk_dv.weight", hd.kv_heads * hd.head_dim, h)?,
-                                wv: pw("attn.wv_dv.weight", hd.kv_heads * hd.head_dim, h)?,
-                                wr: pw("attn.wr_du.weight", hd.heads * hd.d_rel, h)?,
-                                wqkvr: None,
-                                wo: pw("attn.wo_ud.weight", h, hd.heads * hd.head_dim)?,
-                                k_sconv: up2(
-                                    gv(&format!("{p}attn.k_sconv.weight"))?,
-                                    hd.kv_heads * hd.head_dim,
-                                    t.sconv_kernel_size,
-                                    &dev,
-                                ),
-                                v_sconv: up2(
-                                    gv(&format!("{p}attn.v_sconv.weight"))?,
-                                    hd.kv_heads * hd.head_dim,
-                                    t.sconv_kernel_size,
-                                    &dev,
-                                ),
-                                q_norm: up1(
-                                    gv(&format!("{p}attn.q_norm.weight"))?,
-                                    hd.head_dim,
-                                    &dev,
-                                ),
-                                k_norm: up1(
-                                    gv(&format!("{p}attn.k_norm.weight"))?,
-                                    hd.head_dim,
-                                    &dev,
-                                ),
-                                rel_proj: up2(
-                                    gv(&format!("{p}attn.rel_logits_proj.proj"))?,
-                                    hd.d_rel,
-                                    hd.rel_extent,
-                                    &dev,
-                                ),
-                            },
-                            attn_sconv: up2(
-                                gv(&format!("{p}attn_sconv.weight"))?,
-                                h,
-                                t.sconv_kernel_size,
-                                &dev,
-                            ),
-                            mlp_sconv: up2(
-                                gv(&format!("{p}mlp_sconv.weight"))?,
-                                h,
-                                t.sconv_kernel_size,
-                                &dev,
-                            ),
-                            attn_norm: up1(gv(&format!("{p}attn_norm.weight"))?, h, &dev),
-                            mlp_norm: up1(gv(&format!("{p}mlp_norm.weight"))?, h, &dev),
-                            embed_norm: up1(gv(&format!("{pre}embed_norm.weight"))?, h, &dev),
-                            hidden_norm: up1(gv(&format!("{pre}hidden_norm.weight"))?, h, &dev),
-                            input_proj: bind_bf16(
-                                &fp4_client,
-                                fp4_aliases.as_ref(),
-                                &ip.bytes,
-                                h,
-                                2 * h,
-                            ),
-                            dense,
-                        };
-                        bytes += ip.bytes.len() as u64;
+                        let (built, bound) =
+                            bind_mtp_dev(&cp, &fp4_client, fp4_aliases.as_ref(), &dev, i, t, hd)?;
+                        bytes += bound;
                         mtp_devs.push(built);
                     }
                     <Bk as burn::tensor::backend::Backend>::sync(&dev)
