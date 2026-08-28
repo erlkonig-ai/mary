@@ -576,6 +576,9 @@ impl Drop for StartingServe {
 }
 
 impl ServeClient {
+    /// How long a normal close waits for the serving process to honour END.
+    pub const DEFAULT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
     /// Start `command` and wait for it to say it is READY.
     ///
     /// This blocks for the whole model load — minutes on a real range — because
@@ -693,12 +696,91 @@ impl ServeClient {
     /// starts the next one before this one is gone is how a unified-memory box
     /// OOM-kills a run that did nothing wrong.
     pub fn close(mut self) -> Result<std::process::ExitStatus> {
-        if let Err(error) = self.end_input() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-            return Err(error);
+        self.shutdown_with_timeout(Self::DEFAULT_SHUTDOWN_TIMEOUT)
+    }
+
+    /// [`ServeClient::close`] with an explicit bound on the clean END wait.
+    pub fn close_with_timeout(
+        mut self,
+        shutdown_timeout: std::time::Duration,
+    ) -> Result<std::process::ExitStatus> {
+        self.shutdown_with_timeout(shutdown_timeout)
+    }
+
+    /// End input and reap the serving process without moving this client.
+    ///
+    /// This is a terminal operation even though it borrows `self`: after END,
+    /// the protocol cannot carry another turn. The non-consuming shape lets an
+    /// owner call the exact same teardown from `Drop` without wrapping the
+    /// client in an `Option` merely to move it out.
+    ///
+    /// A cooperative child gets `shutdown_timeout` to exit. If END cannot be
+    /// written or that deadline expires, the child is killed and gets one
+    /// finite reap grace. A kernel that still cannot report its exit does not
+    /// make the caller unbounded: a detached thread retains the child handle
+    /// and performs the eventual blocking reap.
+    pub fn shutdown_with_timeout(
+        &mut self,
+        shutdown_timeout: std::time::Duration,
+    ) -> Result<std::process::ExitStatus> {
+        anyhow::ensure!(
+            !shutdown_timeout.is_zero(),
+            "the serving process shutdown timeout must be nonzero"
+        );
+        std::time::Instant::now()
+            .checked_add(shutdown_timeout)
+            .context("the serving process shutdown timeout is too large")?;
+
+        let primary = match self.end_input() {
+            Err(error) => error,
+            Ok(()) => match wait_child_with_timeout(&self.child, shutdown_timeout) {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => anyhow::anyhow!(
+                    "{} did not exit within {:?} after END",
+                    self.label,
+                    shutdown_timeout
+                ),
+                Err(error) => error.context(format!(
+                    "could not wait for {} after ending its input",
+                    self.label
+                )),
+            },
+        };
+        let mut teardown_errors = Vec::new();
+        if let Err(error) = self.kill() {
+            teardown_errors.push(format!("could not kill {}: {error:#}", self.label));
         }
-        self.child.wait()
+        match wait_child_with_timeout(&self.child, SINGLE_REAP_GRACE) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if let Err(error) = detach_child_reaper(self.child.clone()) {
+                    teardown_errors.push(format!(
+                        "could not start the detached reaper for {}: {error}",
+                        self.label
+                    ));
+                }
+            }
+            Err(error) => {
+                teardown_errors.push(format!(
+                    "could not poll {} after kill: {error:#}",
+                    self.label
+                ));
+                if let Err(error) = detach_child_reaper(self.child.clone()) {
+                    teardown_errors.push(format!(
+                        "could not start the detached reaper for {}: {error}",
+                        self.label
+                    ));
+                }
+            }
+        }
+        if teardown_errors.is_empty() {
+            Err(primary)
+        } else {
+            Err(primary.context(format!(
+                "forced teardown also reported: {}",
+                teardown_errors.join("; ")
+            )))
+        }
     }
 
     /// Kill the serving process. Its output stream reads as truncated, which is
@@ -712,6 +794,44 @@ impl ServeClient {
         drop(writer);
         result
     }
+}
+
+/// The post-kill grace is deliberately finite. Ten seconds matches the pair
+/// teardown's existing bound while leaving enough room for a CUDA process to
+/// release a large unified-memory arena after SIGKILL.
+const SINGLE_REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn wait_child_with_timeout(
+    child: &ChildHandle,
+    timeout: std::time::Duration,
+) -> Result<Option<std::process::ExitStatus>> {
+    anyhow::ensure!(!timeout.is_zero(), "the child wait timeout must be nonzero");
+    let deadline = std::time::Instant::now()
+        .checked_add(timeout)
+        .context("the child wait timeout is too large")?;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(
+            deadline
+                .duration_since(now)
+                .min(std::time::Duration::from_millis(5)),
+        );
+    }
+}
+
+fn detach_child_reaper(child: ChildHandle) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("inkling-serve-reaper".to_string())
+        .spawn(move || {
+            let _ = child.wait();
+        })
+        .map(drop)
 }
 
 // ── a full-stack tensor-parallel pair ──────────────────────────────────────
@@ -1779,16 +1899,13 @@ impl InklingMind {
 #[cfg(feature = "drive-mind")]
 impl Drop for InklingMind {
     fn drop(&mut self) {
-        if let Err(error) = self.client.end_input() {
-            eprintln!("inkling_serve: could not end the input stream cleanly: {error:#}");
-            if let Err(kill) = self.client.kill() {
-                eprintln!("inkling_serve: could not kill the failed serving process: {kill:#}");
-            }
-        }
-        match self.client.child.wait() {
+        match self
+            .client
+            .shutdown_with_timeout(ServeClient::DEFAULT_SHUTDOWN_TIMEOUT)
+        {
             Ok(status) => eprintln!("inkling_serve: the serving process exited: {status}"),
             Err(error) => {
-                eprintln!("inkling_serve: could not wait for the serving process: {error}")
+                eprintln!("inkling_serve: bounded serving-process shutdown failed: {error:#}")
             }
         }
     }
@@ -1925,11 +2042,11 @@ impl InklingMind {
 mod tests {
     use super::*;
 
-    #[cfg(all(feature = "drive-mind", unix))]
+    #[cfg(unix)]
     #[derive(Clone, Default)]
     struct SharedSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
-    #[cfg(all(feature = "drive-mind", unix))]
+    #[cfg(unix)]
     impl std::io::Write for SharedSink {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             self.0
@@ -1944,7 +2061,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "drive-mind", unix))]
+    #[cfg(unix)]
     impl SharedSink {
         fn len(&self) -> usize {
             self.0.lock().expect("fixture sink").len()
@@ -2020,6 +2137,115 @@ mod tests {
             vocab: 200_058,
             load_secs: 1.0,
         }
+    }
+
+    #[cfg(unix)]
+    fn spawn_shutdown_fixture(
+        name: &str,
+        hang_after_end: bool,
+    ) -> (
+        ServeClient,
+        ChildHandle,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let response = SharedSink::default();
+        let mut response_writer =
+            framed_stream::FramedWriter::open(response.clone(), CONTENT_TYPE, UNIT)
+                .expect("response preamble");
+        let ready_payload = serde_json::to_vec(&fake_ready("fixture.pile")).expect("READY json");
+        response_writer
+            .record_as(READY_TYPE, &ready_payload, ready_payload.len() as u64)
+            .expect("READY record");
+        let ready_len = response.len();
+        drop(response_writer);
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let stem = format!("mary-{name}-{}-{nonce}", std::process::id());
+        let response_path = std::env::temp_dir().join(format!("{stem}-response"));
+        let capture_path = std::env::temp_dir().join(format!("{stem}-capture"));
+        std::fs::write(&response_path, response.bytes()).expect("write fake response");
+
+        let script = if hang_after_end {
+            r#"
+dd if="$1" bs=1 count="$2" 2>/dev/null
+cat >"$3"
+exec sleep 30
+"#
+        } else {
+            r#"
+dd if="$1" bs=1 count="$2" 2>/dev/null
+cat >"$3"
+"#
+        };
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .arg("fake-inkling")
+            .arg(&response_path)
+            .arg(ready_len.to_string())
+            .arg(&capture_path);
+        let client = ServeClient::spawn(&mut command).expect("spawn fake serving process");
+        let child = client.child.clone();
+        (client, child, response_path, capture_path)
+    }
+
+    #[cfg(unix)]
+    fn assert_complete_input(path: &std::path::Path) {
+        let mut captured = framed_stream::FramedReader::open(
+            std::fs::File::open(path).expect("open captured input"),
+        )
+        .expect("captured preamble");
+        captured
+            .require_content_type(CONTENT_TYPE)
+            .expect("captured content type");
+        assert_eq!(
+            captured.next_frame().expect("captured END"),
+            framed_stream::Frame::End(framed_stream::EndStatus::Complete)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn single_shutdown_sends_complete_end_and_reaps_clean_exit() {
+        let (mut client, child, response_path, capture_path) =
+            spawn_shutdown_fixture("clean-shutdown", false);
+        let status = client
+            .shutdown_with_timeout(std::time::Duration::from_secs(1))
+            .expect("clean serving process shutdown");
+        assert!(status.success());
+        assert!(
+            child.try_wait().expect("poll reaped fixture").is_some(),
+            "shutdown must reap before returning"
+        );
+        assert_complete_input(&capture_path);
+        let _ = std::fs::remove_file(response_path);
+        let _ = std::fs::remove_file(capture_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn single_close_bounds_a_child_that_hangs_after_complete_end() {
+        let (client, child, response_path, capture_path) =
+            spawn_shutdown_fixture("hung-shutdown", true);
+        let started = std::time::Instant::now();
+        let error = client
+            .close_with_timeout(std::time::Duration::from_millis(50))
+            .expect_err("hung serving process must hit the deadline");
+        assert!(error.to_string().contains("did not exit"), "{error:#}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        let status = child
+            .try_wait()
+            .expect("poll killed fixture")
+            .expect("forced shutdown must reap before returning");
+        assert!(!status.success());
+        assert_complete_input(&capture_path);
+        let _ = std::fs::remove_file(response_path);
+        let _ = std::fs::remove_file(capture_path);
     }
 
     #[test]
@@ -2103,7 +2329,7 @@ mod tests {
 dd if="$1" bs=1 count="$2" 2>/dev/null
 dd of="$3" bs=1 count="$4" 2>/dev/null
 dd if="$1" bs=1 skip="$2" 2>/dev/null
-cat >/dev/null
+exec cat >/dev/null
 "#;
         let mut command = std::process::Command::new("sh");
         command
@@ -2141,11 +2367,6 @@ cat >/dev/null
             .terminal_error()
             .expect("backend failure is terminal");
         assert!(terminal.contains("rank divergence"), "{terminal}");
-        let status = child.wait().expect("failed fixture was reaped");
-        assert!(
-            !status.success(),
-            "observe must kill the otherwise-live fixture"
-        );
 
         // The exact request proves the model's position zero is the system
         // prompt even when the first released view already carries a result.
@@ -2180,7 +2401,14 @@ cat >/dev/null
             serde_json::from_slice(&consult_record.payload).expect("captured CONSULT");
         assert_eq!(consult.max_tokens, max_tokens);
 
+        let drop_started = std::time::Instant::now();
         drop(mind);
+        assert!(drop_started.elapsed() < std::time::Duration::from_secs(3));
+        let status = child
+            .try_wait()
+            .expect("poll failed fixture after mind drop")
+            .expect("InklingMind::drop must reap the killed fixture");
+        assert!(!status.success(), "observe must kill the live fixture");
         let _ = std::fs::remove_file(response_path);
         let _ = std::fs::remove_file(capture_path);
     }
