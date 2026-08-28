@@ -36,9 +36,10 @@ PAIR OPTIONS:
     --startup-timeout-secs <n>  Deadline for both READY records (default: 900)
     --shutdown-timeout-secs <n> Deadline for both ranks to exit (default: 60)
 
-The rank program is normally `inkling_serve`, with explicit `--tp-rank`,
-`--tp-world`, `--tp-rendezvous`, full `--layers`, pile, and tokenizer args.
-Nothing here reads INK_TP or guesses network placement.
+The rank program is normally inkling_serve, with --sealed, explicit
+--tp-rank, --tp-world, --tp-rendezvous, full --layers, pile, and tokenizer
+args. Pair startup refuses non-sealed READY records. Nothing here reads INK_TP
+or guesses network placement.
 "
 }
 

@@ -72,7 +72,8 @@ use std::io::Write as _;
 use anyhow::{Context, Result};
 
 use mary::models::inkling::serve::{
-    CONSULT_TYPE, CONTENT_TYPE, Consult, READY_TYPE, Ready, TURN_TYPE, TurnEnd, UNIT,
+    CONSULT_TYPE, CONTENT_TYPE, Consult, ExecutionManifest, READY_TYPE, Ready, TURN_TYPE, TurnEnd,
+    UNIT,
 };
 use mary::models::inkling::session::{Session, SessionConfig};
 use mary::models::inkling::tp::Tp;
@@ -96,6 +97,8 @@ OPTIONS:
     --prefill-budget <n> Maximum tokens processed in one prefill pass
     --context-budget <n> Maximum positions retained by the session (default:
                          the effective prefill budget)
+    --sealed             Reject execution-changing environment overrides and
+                         announce a sealed-v1 execution manifest
     --tp-rank <rank>     This process's tensor-parallel rank (all TP flags together)
     --tp-world <world>   Number of tensor-parallel ranks
     --tp-rendezvous <a>  Rank 0's HOST:PORT on the fast fabric
@@ -115,6 +118,7 @@ struct Options {
     prefill_budget: Option<usize>,
     context_budget: Option<usize>,
     tensor_parallel: Option<TensorParallel>,
+    sealed: bool,
 }
 
 struct TensorParallel {
@@ -129,6 +133,7 @@ fn parse() -> Result<Option<Options>> {
     let (mut tp_rank, mut tp_world, mut tp_rendezvous) = (None, None, None);
     let mut tokens = 32usize;
     let mut stop = Vec::new();
+    let mut sealed = false;
     let mut i = 0;
     while i < args.len() {
         let need = |i: usize| -> Result<&String> {
@@ -137,6 +142,10 @@ fn parse() -> Result<Option<Options>> {
         };
         match args[i].as_str() {
             "-h" | "--help" => return Ok(None),
+            "--sealed" => {
+                sealed = true;
+                i += 1;
+            }
             "--pile" => {
                 pile = Some(std::path::PathBuf::from(need(i)?));
                 i += 2;
@@ -213,7 +222,49 @@ fn parse() -> Result<Option<Options>> {
         prefill_budget,
         context_budget,
         tensor_parallel,
+        sealed,
     }))
+}
+
+/// Environment is inherited ambient authority. In sealed mode every namespace
+/// this runtime currently uses to alter kernels, numerics, scheduling,
+/// allocation, device selection, or collective transport is refused before a
+/// CUDA client exists. Explicit serving CLI settings remain allowed because
+/// they enter the manifest. Library discovery through `LD_LIBRARY_PATH` is the
+/// narrow phase-1 exception: the exact selected library bytes are hashed after
+/// load, while rejecting it would make the CUDA deployment layout unusable.
+fn reject_sealed_environment() -> Result<()> {
+    const PREFIXES: &[&str] = &[
+        "INK_",
+        "CUBECL_",
+        "CUDA_",
+        "NCCL_",
+        "NVRTC_",
+        "CUBLAS_",
+        "CUDNN_",
+        "BURN_",
+        "OMP_",
+        "MKL_",
+        "OPENBLAS_",
+        "RAYON_",
+        "MALLOC_",
+    ];
+    const EXACT: &[&str] = &["GLIBC_TUNABLES", "LD_AUDIT", "LD_PRELOAD"];
+    let mut rejected = std::env::vars_os()
+        .map(|(name, _)| name.to_string_lossy().into_owned())
+        .filter(|name| {
+            EXACT.contains(&name.as_str()) || PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+        })
+        .collect::<Vec<_>>();
+    rejected.sort();
+    anyhow::ensure!(
+        rejected.is_empty(),
+        "sealed-v1 refuses execution-changing environment overrides: {}. Express serving shape \
+         through explicit CLI arguments; library selection is witnessed by exact mapped-library \
+         hashes",
+        rejected.join(", ")
+    );
+    Ok(())
 }
 
 /// Take fd 1 for the protocol and point every `println!` at stderr.
@@ -243,6 +294,261 @@ fn hex_identity(bytes: [u8; 32]) -> String {
     text
 }
 
+struct RuntimeFacts {
+    gpu_class: String,
+    compute_capability: String,
+    cuda_version: String,
+    cuda_library_hashes: String,
+    nvrtc_version: String,
+    nvrtc_library_hashes: String,
+    nccl_version: String,
+    nccl_library_hashes: String,
+    unavailable: Vec<String>,
+}
+
+impl RuntimeFacts {
+    /// Observe only facts supplied by the loaded process and CUDA APIs. Phase 1
+    /// does not invoke nvidia-smi, nvcc, the package manager, or filesystem
+    /// heuristics that could describe a toolkit different from the one executing
+    /// kernels. `/proc/self/maps` is the exact phase-1 boundary for library
+    /// identity: it hashes mapped backing-file bytes after confirming the path
+    /// still names the mapped device/inode, not relocated in-memory pages. When
+    /// that backing file cannot be named/read, the manifest records unavailable.
+    fn observe() -> Self {
+        let mut unavailable = Vec::new();
+        let (gpu_class, compute_capability) = observe_gpu(&mut unavailable);
+        let cuda_library_hashes = observe_library("cuda.library", "libcuda.so", &mut unavailable);
+        let nvrtc_library_hashes =
+            observe_library("nvrtc.library", "libnvrtc.so", &mut unavailable);
+        let nccl_library_hashes = observe_library("nccl.library", "libnccl.so", &mut unavailable);
+
+        let cuda_version = observe_version("cuda.version", &mut unavailable, || {
+            use cudarc::driver::result::DriverError;
+
+            let mut version = 0;
+            let result: std::result::Result<(), DriverError> =
+                unsafe { cudarc::driver::sys::cuDriverGetVersion(&mut version).result() };
+            result.map_err(|error| format!("{error}"))?;
+            Ok(version.to_string())
+        });
+        let nvrtc_version = match nvrtc_library_hashes.as_str() {
+            "unavailable" => {
+                unavailable.push("nvrtc.version".to_string());
+                "unavailable".to_string()
+            }
+            _ => observe_version("nvrtc.version", &mut unavailable, || {
+                let (mut major, mut minor) = (0, 0);
+                unsafe { cudarc::nvrtc::sys::nvrtcVersion(&mut major, &mut minor).result() }
+                    .map_err(|error| format!("{error}"))?;
+                Ok(format!("{major}.{minor}"))
+            }),
+        };
+        let nccl_version = match nccl_library_hashes.as_str() {
+            "unavailable" => {
+                if !unavailable.iter().any(|fact| fact == "nccl.version") {
+                    unavailable.push("nccl.version".to_string());
+                }
+                "unavailable".to_string()
+            }
+            _ => observe_version("nccl.version", &mut unavailable, || {
+                cudarc::nccl::result::get_nccl_version()
+                    .map(|version| version.to_string())
+                    .map_err(|error| format!("{error:?}"))
+            }),
+        };
+        unavailable.sort();
+        unavailable.dedup();
+        Self {
+            gpu_class,
+            compute_capability,
+            cuda_version,
+            cuda_library_hashes,
+            nvrtc_version,
+            nvrtc_library_hashes,
+            nccl_version,
+            nccl_library_hashes,
+            unavailable,
+        }
+    }
+
+    fn add_to(&self, manifest: &mut ExecutionManifest) {
+        for (name, value) in [
+            ("gpu-class", self.gpu_class.as_str()),
+            ("gpu-compute-capability", self.compute_capability.as_str()),
+            ("cuda-driver-version", self.cuda_version.as_str()),
+            ("cuda-library-blake3", self.cuda_library_hashes.as_str()),
+            ("nvrtc-version", self.nvrtc_version.as_str()),
+            ("nvrtc-library-blake3", self.nvrtc_library_hashes.as_str()),
+            ("nccl-version", self.nccl_version.as_str()),
+            ("nccl-library-blake3", self.nccl_library_hashes.as_str()),
+        ] {
+            manifest.field(name, value.as_bytes());
+        }
+    }
+}
+
+fn observe_gpu(unavailable: &mut Vec<String>) -> (String, String) {
+    let result = std::panic::catch_unwind(|| -> Result<(String, String)> {
+        cudarc::driver::result::init().context("initialize CUDA driver observation")?;
+        let device =
+            cudarc::driver::result::device::get(0).context("open CUDA device ordinal 0")?;
+        let name =
+            cudarc::driver::result::device::get_name(device).context("read CUDA device class")?;
+        let major = unsafe {
+            cudarc::driver::result::device::get_attribute(
+                device,
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            )
+        }
+        .context("read CUDA compute-capability major")?;
+        let minor = unsafe {
+            cudarc::driver::result::device::get_attribute(
+                device,
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+            )
+        }
+        .context("read CUDA compute-capability minor")?;
+        Ok((name, format!("{major}.{minor}")))
+    });
+    match result {
+        Ok(Ok(facts)) => facts,
+        Ok(Err(error)) => {
+            eprintln!("inkling_serve: GPU manifest facts unavailable: {error:#}");
+            unavailable.extend([
+                "gpu.class".to_string(),
+                "gpu.compute-capability".to_string(),
+            ]);
+            ("unavailable".to_string(), "unavailable".to_string())
+        }
+        Err(_) => {
+            unavailable.extend([
+                "gpu.class".to_string(),
+                "gpu.compute-capability".to_string(),
+            ]);
+            ("unavailable".to_string(), "unavailable".to_string())
+        }
+    }
+}
+
+fn observe_version(
+    name: &str,
+    unavailable: &mut Vec<String>,
+    observe: impl FnOnce() -> std::result::Result<String, String>,
+) -> String {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(observe)) {
+        Ok(Ok(version)) => version,
+        Ok(Err(error)) => {
+            eprintln!("inkling_serve: {name} unavailable: {error}");
+            unavailable.push(name.to_string());
+            "unavailable".to_string()
+        }
+        Err(_) => {
+            unavailable.push(name.to_string());
+            "unavailable".to_string()
+        }
+    }
+}
+
+fn observe_library(name: &str, prefix: &str, unavailable: &mut Vec<String>) -> String {
+    match mapped_library_hashes(prefix) {
+        Ok(hashes) if !hashes.is_empty() => hashes.join(","),
+        Ok(_) => {
+            unavailable.push(name.to_string());
+            "unavailable".to_string()
+        }
+        Err(error) => {
+            eprintln!("inkling_serve: {name} unavailable: {error:#}");
+            unavailable.push(name.to_string());
+            "unavailable".to_string()
+        }
+    }
+}
+
+fn mapped_library_hashes(prefix: &str) -> Result<Vec<String>> {
+    let maps = std::fs::read_to_string("/proc/self/maps").context("read /proc/self/maps")?;
+    let mut paths = std::collections::BTreeMap::new();
+    for line in maps.lines() {
+        let mut columns = line.split_whitespace();
+        let _range = columns.next();
+        let _permissions = columns.next();
+        let _offset = columns.next();
+        let device = columns.next();
+        let inode = columns.next().and_then(|value| value.parse::<u64>().ok());
+        let Some(path_start) = line.find('/') else {
+            continue;
+        };
+        let path = line[path_start..].trim_end_matches(" (deleted)");
+        let matches = std::path::Path::new(path)
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|file| file.starts_with(prefix));
+        if matches {
+            let (Some(device), Some(inode)) = (device, inode) else {
+                anyhow::bail!("mapped library row has no device/inode witness: {line}");
+            };
+            let path = std::path::PathBuf::from(path);
+            if let Some(previous) = paths.insert(path.clone(), (device.to_string(), inode)) {
+                anyhow::ensure!(
+                    previous == (device.to_string(), inode),
+                    "mapped library {} changed identity within /proc/self/maps",
+                    path.display()
+                );
+            }
+        }
+    }
+    let mut hashes = Vec::with_capacity(paths.len());
+    for (path, (_mapped_device, _mapped_inode)) in paths {
+        let mut file = std::fs::File::open(&path)
+            .with_context(|| format!("open mapped library {}", path.display()))?;
+        // Hashing the spelling from /proc/self/maps without this check could
+        // hash a replacement installed after dlopen rather than the inode the
+        // process mapped.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let metadata = file.metadata()?;
+            let actual_device = format!(
+                "{:02x}:{:02x}",
+                libc::major(metadata.dev()),
+                libc::minor(metadata.dev())
+            );
+            anyhow::ensure!(
+                metadata.ino() == _mapped_inode && actual_device == _mapped_device,
+                "mapped library {} is device/inode {_mapped_device}/{_mapped_inode}, but its path \
+                 now names {actual_device}/{}",
+                path.display(),
+                metadata.ino()
+            );
+        }
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = std::io::Read::read(&mut file, &mut buffer)
+                .with_context(|| format!("hash mapped library {}", path.display()))?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        hashes.push(hex_identity(*hasher.finalize().as_bytes()));
+    }
+    hashes.sort();
+    hashes.dedup();
+    Ok(hashes)
+}
+
+fn begin_execution_manifest(profile: &str) -> Result<ExecutionManifest> {
+    // Linux exposes the inode this process is actually executing, even if the
+    // launch path is replaced later. current_exe() cannot make that claim.
+    let file = std::fs::File::open("/proc/self/exe")
+        .context("open /proc/self/exe for the execution manifest")?;
+    let length = file.metadata()?.len();
+    let mut manifest = ExecutionManifest::new(profile);
+    manifest.reader("executable-bytes", length, file)?;
+    Ok(manifest)
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("inkling_serve: {error:#}");
@@ -255,6 +561,14 @@ fn run() -> Result<()> {
         print!("{}", usage());
         return Ok(());
     };
+    if options.sealed {
+        reject_sealed_environment()?;
+    }
+    let execution_profile = match options.sealed {
+        true => "sealed-v1",
+        false => "observed-v1",
+    };
+    let mut execution_manifest = begin_execution_manifest(execution_profile)?;
     let protocol = claim_stdout()?;
 
     // Both preambles are written before either side reads, so the handshake
@@ -296,6 +610,16 @@ fn run() -> Result<()> {
     config.context_budget = options.context_budget.unwrap_or(config.prefill_budget);
     let prefill_budget = config.prefill_budget;
     let context_budget = config.context_budget;
+    let extend_batch = config.extend_batch;
+    // Select once before any CUDA client. Group/Session observe this same
+    // process-global value later; sealed-v1 has already refused an ambient
+    // CUBECL_MEMORY_CONFIG override, so the effective baseline is fixed.
+    let allocator = mary::models::inkling::pool::choose_memory_config();
+    let (tp_rank, tp_world) = options
+        .tensor_parallel
+        .as_ref()
+        .map(|parallel| (Some(parallel.tp.rank()), parallel.tp.world()))
+        .unwrap_or((None, 1));
     let loaded = std::time::Instant::now();
     let mut session = match options.tensor_parallel {
         None => Session::load(config).context("load the model")?,
@@ -316,6 +640,7 @@ fn run() -> Result<()> {
         }
     };
     let load_secs = loaded.elapsed().as_secs_f64();
+    let runtime_facts = RuntimeFacts::observe();
 
     // Decoder state belongs to the whole logical token sequence, not to one
     // generated turn. Byte-fallback and spacing decoders both need surrounding
@@ -331,10 +656,52 @@ fn run() -> Result<()> {
     };
 
     let range = session.layer_range();
+    let model_identity = hex_identity(session.model_identity());
+    let tokenizer_identity = hex_identity(tokenizer_identity);
+    for (name, value) in [
+        ("model-identity", model_identity.as_str()),
+        ("tokenizer-identity", tokenizer_identity.as_str()),
+        ("tp-role-schema", "rank-normalized-v1"),
+        ("allocator", allocator.env_value()),
+        // INK_POOL_CLEANUP is rejected in sealed-v1, so this is the effective
+        // default selected by CleanupPolicy::choose.
+        ("allocator-cleanup", "when-stranded"),
+        (
+            "burn-timing-autotune",
+            if cfg!(feature = "inkling-cuda-autotune") {
+                "enabled"
+            } else {
+                "disabled"
+            },
+        ),
+    ] {
+        execution_manifest.field(name, value.as_bytes());
+    }
+    execution_manifest.usize("tp-world", tp_world);
+    execution_manifest.usize("layer-lo", range.start);
+    execution_manifest.usize("layer-hi", range.end);
+    execution_manifest.usize(
+        "stack-layers",
+        session.config().text_config.num_hidden_layers,
+    );
+    execution_manifest.usize(
+        "effective-vocab",
+        session.config().text_config.effective_vocab(),
+    );
+    execution_manifest.usize("prefill-budget", prefill_budget);
+    execution_manifest.usize("context-budget", context_budget);
+    execution_manifest.usize("extend-batch", extend_batch);
+    runtime_facts.add_to(&mut execution_manifest);
+    let execution_identity = execution_manifest.finish_hex();
     let ready = Ready {
         pile: options.pile.display().to_string(),
-        model_identity: hex_identity(session.model_identity()),
-        tokenizer_identity: hex_identity(tokenizer_identity),
+        model_identity,
+        tokenizer_identity,
+        execution_profile: execution_profile.to_string(),
+        execution_identity,
+        execution_unavailable: runtime_facts.unavailable,
+        tp_rank,
+        tp_world,
         layers: [range.start, range.end],
         stack: session.config().text_config.num_hidden_layers,
         partial: session.is_partial_stack(),
@@ -344,15 +711,23 @@ fn run() -> Result<()> {
         load_secs,
     };
     eprintln!(
-        "inkling_serve: ready in {load_secs:.1}s — layers {}..{} of {}{}",
+        "inkling_serve: ready in {load_secs:.1}s — layers {}..{} of {}{}, {} {}",
         ready.layers[0],
         ready.layers[1],
         ready.stack,
         match ready.partial {
             true => " (PARTIAL STACK: diagnostic tokens, not the model's)",
             false => "",
-        }
+        },
+        ready.execution_profile,
+        ready.execution_identity,
     );
+    if !ready.execution_unavailable.is_empty() {
+        eprintln!(
+            "inkling_serve: execution manifest unavailable facts: {}",
+            ready.execution_unavailable.join(", ")
+        );
+    }
     let payload = serde_json::to_vec(&ready)?;
     let extent = payload.len() as u64;
     out.record_as(READY_TYPE, &payload, extent)?;

@@ -183,9 +183,22 @@ fn serve_client(o: &Options) -> Result<ServeClient> {
     );
     let client = ServeClient::spawn(&mut command)?;
     let ready = client.ready();
+    anyhow::ensure!(
+        matches!(
+            ready.execution_profile.as_str(),
+            "sealed-v1" | "observed-v1"
+        ) && ready.execution_identity.len() == 64
+            && ready
+                .execution_identity
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()),
+        "serve announced invalid execution manifest {:?} {:?}",
+        ready.execution_profile,
+        ready.execution_identity
+    );
     eprintln!(
         "gate: READY — layers {}..{} of {}, vocab {}, prefill chunk {}, context {}, loaded in \
-         {:.1}s{}",
+         {:.1}s{}, {} {}",
         ready.layers[0],
         ready.layers[1],
         ready.stack,
@@ -196,8 +209,16 @@ fn serve_client(o: &Options) -> Result<ServeClient> {
         match ready.partial {
             true => "  [PARTIAL STACK: the tokens are diagnostic, not the model's]",
             false => "",
-        }
+        },
+        ready.execution_profile,
+        ready.execution_identity,
     );
+    if !ready.execution_unavailable.is_empty() {
+        eprintln!(
+            "gate: execution manifest unavailable facts: {}",
+            ready.execution_unavailable.join(", ")
+        );
+    }
     Ok(client)
 }
 
@@ -468,6 +489,11 @@ fn cmd_prefix(o: &Options) -> Result<()> {
             "tokenizer identity",
             retained.ready.tokenizer_identity.as_str(),
             rebuilt.ready.tokenizer_identity.as_str(),
+        ),
+        (
+            "execution identity",
+            retained.ready.execution_identity.as_str(),
+            rebuilt.ready.execution_identity.as_str(),
         ),
     ] {
         anyhow::ensure!(

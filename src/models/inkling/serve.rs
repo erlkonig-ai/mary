@@ -246,6 +246,98 @@ pub const CONSULT_TYPE: &str = "application/vnd.mary.inkling-consult+json";
 /// Control record, serve → client: the turn is over, and here is how it went.
 pub const TURN_TYPE: &str = "application/vnd.mary.inkling-turn+json";
 
+/// Canonical BLAKE3 input for one observed execution manifest.
+///
+/// A manifest is a fixed-order sequence of `(name, value)` byte strings. Every
+/// string is preceded by its unsigned 64-bit big-endian length, including field
+/// names, so neither concatenation nor a future variable-width field can make
+/// two different manifests share an encoding. Callers choose and document the
+/// field order; this type supplies the one encoding and hash implementation.
+pub struct ExecutionManifest {
+    hasher: blake3::Hasher,
+}
+
+impl ExecutionManifest {
+    /// Begin a manifest under a named compatibility profile.
+    pub fn new(profile: &str) -> Self {
+        let mut manifest = Self {
+            hasher: blake3::Hasher::new(),
+        };
+        manifest.field(
+            "manifest-format",
+            b"mary-execution-manifest-lp64be-blake3-v1",
+        );
+        manifest.field("profile", profile.as_bytes());
+        manifest
+    }
+
+    /// Append one named byte string.
+    pub fn field(&mut self, name: &str, value: &[u8]) {
+        Self::length_prefixed(&mut self.hasher, name.as_bytes());
+        Self::length_prefixed(&mut self.hasher, value);
+    }
+
+    /// Append an unsigned integer using its canonical decimal spelling.
+    pub fn usize(&mut self, name: &str, value: usize) {
+        self.field(name, value.to_string().as_bytes());
+    }
+
+    /// Append exactly `length` bytes from a reader without retaining them.
+    ///
+    /// This is used for `/proc/self/exe`: the executable itself, not a path,
+    /// timestamp, build id, or separately defined checksum, enters the single
+    /// manifest hash.
+    pub fn reader(
+        &mut self,
+        name: &str,
+        length: u64,
+        mut reader: impl std::io::Read,
+    ) -> Result<()> {
+        Self::length_prefixed(&mut self.hasher, name.as_bytes());
+        self.hasher.update(&length.to_be_bytes());
+        let mut remaining = length;
+        let mut buffer = [0u8; 64 * 1024];
+        while remaining > 0 {
+            let want = remaining.min(buffer.len() as u64) as usize;
+            let read = reader
+                .read(&mut buffer[..want])
+                .context("read a length-prefixed execution-manifest field")?;
+            anyhow::ensure!(
+                read > 0,
+                "execution-manifest field ended {remaining} bytes early"
+            );
+            self.hasher.update(&buffer[..read]);
+            remaining -= read as u64;
+        }
+        let mut extra = [0u8; 1];
+        anyhow::ensure!(
+            reader.read(&mut extra)? == 0,
+            "execution-manifest field grew after its length was observed"
+        );
+        Ok(())
+    }
+
+    /// Finish as the protocol's uppercase 64-hex-digit identity.
+    pub fn finish_hex(self) -> String {
+        hex_32(*self.hasher.finalize().as_bytes())
+    }
+
+    fn length_prefixed(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+        hasher.update(&(bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+}
+
+fn hex_32(bytes: [u8; 32]) -> String {
+    use std::fmt::Write as _;
+
+    let mut text = String::with_capacity(64);
+    for byte in bytes {
+        write!(&mut text, "{byte:02X}").expect("writing into a String is infallible");
+    }
+    text
+}
+
 /// What the serving process is, announced once when the weights are up.
 ///
 /// Sent AFTER the load rather than in the preamble, because the load is minutes
@@ -266,6 +358,29 @@ pub struct Ready {
     /// RawBytes handle of the exact tokenizer bytes, rendered as 64
     /// hexadecimal digits.
     pub tokenizer_identity: String,
+    /// Manifest compatibility profile. `sealed-v1` rejects runtime environment
+    /// overrides before CUDA initialization; `observed-v1` records the same
+    /// facts without making that exclusion claim.
+    #[serde(default)]
+    pub execution_profile: String,
+    /// Canonical length-prefixed BLAKE3 digest of executable bytes, model and
+    /// tokenizer identities, effective execution settings, GPU identity, and
+    /// observable CUDA/NVRTC/NCCL facts.
+    #[serde(default)]
+    pub execution_identity: String,
+    /// Runtime facts this phase could not observe. Every named absence also
+    /// enters the digest as the literal `unavailable`; this list makes that
+    /// boundary visible rather than letting the digest imply evidence it lacks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub execution_unavailable: Vec<String>,
+    /// This rank's TP ordinal, absent on a non-TP process and on the pair's
+    /// synthesized downstream READY. Rank is deliberately outside the shared
+    /// digest; `tp_world` is inside it and the pair checks complementary roles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tp_rank: Option<usize>,
+    /// Effective TP world (one for a non-TP serving process).
+    #[serde(default = "default_tp_world")]
+    pub tp_world: usize,
     /// The layer range this rank runs, `[lo, hi)`.
     pub layers: [usize; 2],
     /// How many layers the whole stack has.
@@ -282,6 +397,10 @@ pub struct Ready {
     /// Wall-clock seconds `Session::load` took. The number a serving process
     /// exists to pay ONCE.
     pub load_secs: f64,
+}
+
+fn default_tp_world() -> usize {
+    1
 }
 
 /// Client → serve: stop accumulating context and produce a turn.
@@ -1409,12 +1528,25 @@ fn compatible_ready(rank0: &Ready, rank1: &Ready) -> Result<Ready> {
         for (name, identity) in [
             ("model", ready.model_identity.as_str()),
             ("tokenizer", ready.tokenizer_identity.as_str()),
+            ("execution", ready.execution_identity.as_str()),
         ] {
             anyhow::ensure!(
                 identity.len() == 64 && identity.bytes().all(|byte| byte.is_ascii_hexdigit()),
                 "rank {rank} announced an invalid {name} identity {identity:?}"
             );
         }
+        anyhow::ensure!(
+            ready.execution_profile == "sealed-v1",
+            "rank {rank} announced execution profile {:?}; a paired computation requires \
+             sealed-v1 so ambient execution overrides cannot differ between ranks",
+            ready.execution_profile
+        );
+        anyhow::ensure!(
+            ready.tp_rank == Some(rank) && ready.tp_world == 2,
+            "rank {rank} announced TP role {:?} of {}, expected rank {rank} of 2",
+            ready.tp_rank,
+            ready.tp_world
+        );
         anyhow::ensure!(
             !ready.partial && ready.layers == [0, ready.stack],
             "rank {rank} is not a full stack: layers {}..{} of {}, partial={}",
@@ -1451,6 +1583,24 @@ fn compatible_ready(rank0: &Ready, rank1: &Ready) -> Result<Ready> {
         rank1.tokenizer_identity
     );
     anyhow::ensure!(
+        rank0.execution_profile == rank1.execution_profile,
+        "rank READY execution profile mismatch: {:?} vs {:?}",
+        rank0.execution_profile,
+        rank1.execution_profile
+    );
+    anyhow::ensure!(
+        rank0.execution_identity == rank1.execution_identity,
+        "rank READY execution identity mismatch: {} vs {}",
+        rank0.execution_identity,
+        rank1.execution_identity
+    );
+    anyhow::ensure!(
+        rank0.execution_unavailable == rank1.execution_unavailable,
+        "rank READY unavailable execution facts mismatch: {:?} vs {:?}",
+        rank0.execution_unavailable,
+        rank1.execution_unavailable
+    );
+    anyhow::ensure!(
         rank0.prefill_budget == rank1.prefill_budget,
         "rank READY prefill budget mismatch: {} vs {}",
         rank0.prefill_budget,
@@ -1466,6 +1616,11 @@ fn compatible_ready(rank0: &Ready, rank1: &Ready) -> Result<Ready> {
         pile: rank0.pile.clone(),
         model_identity: rank0.model_identity.clone(),
         tokenizer_identity: rank0.tokenizer_identity.clone(),
+        execution_profile: rank0.execution_profile.clone(),
+        execution_identity: rank0.execution_identity.clone(),
+        execution_unavailable: rank0.execution_unavailable.clone(),
+        tp_rank: None,
+        tp_world: rank0.tp_world,
         layers: rank0.layers,
         stack: rank0.stack,
         partial: false,
@@ -2164,11 +2319,46 @@ mod tests {
         });
     }
 
+    #[test]
+    fn execution_manifest_is_deterministic_and_length_delimited() {
+        let mut first = ExecutionManifest::new("sealed-v1");
+        first.field("a", b"bc");
+        first.field("d", b"");
+        let first = first.finish_hex();
+
+        let mut same = ExecutionManifest::new("sealed-v1");
+        same.field("a", b"bc");
+        same.field("d", b"");
+        assert_eq!(first, same.finish_hex());
+
+        let mut different_boundary = ExecutionManifest::new("sealed-v1");
+        different_boundary.field("ab", b"c");
+        different_boundary.field("d", b"");
+        assert_ne!(first, different_boundary.finish_hex());
+    }
+
+    #[test]
+    fn execution_manifest_reader_hashes_the_exact_declared_bytes() {
+        let mut direct = ExecutionManifest::new("sealed-v1");
+        direct.field("executable-bytes", b"\0mary\xff");
+
+        let mut streamed = ExecutionManifest::new("sealed-v1");
+        streamed
+            .reader("executable-bytes", 6, std::io::Cursor::new(b"\0mary\xff"))
+            .expect("stream exact bytes");
+        assert_eq!(direct.finish_hex(), streamed.finish_hex());
+    }
+
     fn fake_ready(pile: &str) -> Ready {
         Ready {
             pile: pile.to_string(),
             model_identity: "11".repeat(32),
             tokenizer_identity: "22".repeat(32),
+            execution_profile: "sealed-v1".to_string(),
+            execution_identity: "33".repeat(32),
+            execution_unavailable: Vec::new(),
+            tp_rank: None,
+            tp_world: 1,
             layers: [0, 42],
             stack: 42,
             partial: false,
@@ -2177,6 +2367,16 @@ mod tests {
             context_budget: 65_536,
             load_secs: 1.0,
         }
+    }
+
+    fn fake_pair_ready(left_pile: &str, right_pile: &str) -> (Ready, Ready) {
+        let mut left = fake_ready(left_pile);
+        left.tp_rank = Some(0);
+        left.tp_world = 2;
+        let mut right = fake_ready(right_pile);
+        right.tp_rank = Some(1);
+        right.tp_world = 2;
+        (left, right)
     }
 
     #[cfg(unix)]
@@ -2290,8 +2490,7 @@ cat >"$3"
 
     #[test]
     fn pair_compatibility_is_content_identity_not_pile_path() {
-        let left = fake_ready("/models/left.pile");
-        let right = fake_ready("/different/host/right.pile");
+        let (left, right) = fake_pair_ready("/models/left.pile", "/different/host/right.pile");
         let ready = compatible_ready(&left, &right).expect("same runtime content");
         assert_eq!(ready.model_identity, left.model_identity);
         assert_eq!(ready.tokenizer_identity, left.tokenizer_identity);
@@ -2300,27 +2499,36 @@ cat >"$3"
 
     #[test]
     fn pair_compatibility_refuses_model_or_tokenizer_mismatch() {
-        let left = fake_ready("left");
-        let mut right = left.clone();
+        let (left, mut right) = fake_pair_ready("left", "right");
         right.model_identity = "33".repeat(32);
         let error = compatible_ready(&left, &right).expect_err("different model facts");
         assert!(error.to_string().contains("model identity mismatch"));
 
-        let mut right = left.clone();
+        let (_, mut right) = fake_pair_ready("left", "right");
         right.tokenizer_identity = "44".repeat(32);
         let error = compatible_ready(&left, &right).expect_err("different tokenizer bytes");
         assert!(error.to_string().contains("tokenizer identity mismatch"));
     }
 
     #[test]
+    fn pair_compatibility_refuses_execution_manifest_mismatch() {
+        let (left, mut right) = fake_pair_ready("left", "right");
+        right.execution_identity = "44".repeat(32);
+        let error = compatible_ready(&left, &right).expect_err("different executable/runtime");
+        assert!(
+            error.to_string().contains("execution identity mismatch"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn pair_compatibility_refuses_resource_budget_mismatch() {
-        let left = fake_ready("left");
-        let mut right = left.clone();
+        let (left, mut right) = fake_pair_ready("left", "right");
         right.prefill_budget /= 2;
         let error = compatible_ready(&left, &right).expect_err("different prefill budgets");
         assert!(error.to_string().contains("prefill budget mismatch"));
 
-        let mut right = left.clone();
+        let (_, mut right) = fake_pair_ready("left", "right");
         right.context_budget /= 2;
         let error = compatible_ready(&left, &right).expect_err("different context budgets");
         assert!(error.to_string().contains("context budget mismatch"));

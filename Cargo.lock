@@ -4971,6 +4971,7 @@ version = "0.1.0"
 dependencies = [
  "anybytes",
  "anyhow",
+ "blake3",
  "burn",
  "burn-cubecl",
  "burn-fusion",
@@ -4981,6 +4982,7 @@ dependencies = [
  "cpal",
  "cubecl",
  "cubek",
+ "cudarc",
  "drive",
  "ed25519-dalek",
  "fancy-regex 0.14.0",
