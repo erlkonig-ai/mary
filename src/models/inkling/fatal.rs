@@ -39,6 +39,7 @@
 //! `$?` and a `timeout`-wrapped harness both need.
 
 use std::io::Write as _;
+use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// The sequence length the process is working at.
@@ -47,6 +48,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// thread this crate never created, three crates down, with no path back to the
 /// forward's locals. It is written once per run and read once per crash.
 static TOKENS: AtomicUsize = AtomicUsize::new(0);
+static ARM: Once = Once::new();
 
 /// Record the sequence length, so a crash can name what caused it.
 pub fn note_tokens(n: usize) {
@@ -55,8 +57,9 @@ pub fn note_tokens(n: usize) {
 
 /// Install the hook. Call once, from `main`, before anything touches a device.
 pub fn arm() {
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
+    ARM.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
         // The default hook first: it names the thread, the file and the line,
         // and the backtrace if one was asked for.
         previous(info);
@@ -93,8 +96,9 @@ pub fn arm() {
         );
         let _ = err.flush();
         let _ = std::io::stdout().flush();
-        std::process::abort();
-    }));
+            std::process::abort();
+        }));
+    });
 }
 
 /// The panic payload as a string, for the two shapes `panic!` produces.

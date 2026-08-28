@@ -447,6 +447,12 @@ impl Session {
             group.tp().is_split(),
             "Session::load_with_group needs a split Group; use Session::load for one rank"
         );
+        anyhow::ensure!(
+            cfg.config_override.is_none(),
+            "a tensor-parallel Session requires config.json from the authoritative model \
+             collection. A per-rank config override is not covered by the model identity and \
+             could make two ranks run different numerical graphs."
+        );
         Self::load_inner(cfg, Some(group))
     }
 
@@ -524,7 +530,10 @@ impl Session {
         // BF16 lane binds, so admission has to know them before it prices the
         // arena copy. `from_env` is pure and is the same call the lane itself
         // makes, so reading it twice cannot disagree.
-        let allocator = super::pool::choose_memory_config();
+        let allocator = match group.as_ref() {
+            Some(group) => group.allocator()?,
+            None => super::pool::choose_memory_config(),
+        };
         let mut admission = super::budget::AdmissionPolicy::runtime(allocator)
             .with_router_bf16(RouterArm::from_env() == RouterArm::Bf16)
             .with_drafting(false)
@@ -696,6 +705,11 @@ impl Session {
     /// The model's configuration, as the source stated it.
     pub fn config(&self) -> &InklingConfig {
         &self.cfg
+    }
+
+    /// Canonical identity of the projected model facts backing this session.
+    pub fn model_identity(&self) -> [u8; 32] {
+        self.src.model_identity()
     }
 
     /// How many positions the KV cache holds. The next token's position, and the

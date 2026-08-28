@@ -159,6 +159,10 @@ pub struct Group {
     /// [`Group::form_default`]. The lower-level [`Group::form`] predates
     /// Session and deliberately carries no such claim.
     default_device: Option<burn::backend::cuda::CudaDevice>,
+    /// The allocator selected before `default_device` created its client.
+    /// Session uses this exact value for admission instead of independently
+    /// pricing a policy the runtime may no longer be able to adopt.
+    allocator: Option<super::pool::AllocatorConfig>,
     key: Vec<cubecl::device::DeviceId>,
     /// The rendezvous sockets, kept for [`Group::barrier`]. A star: rank 0
     /// holds one per peer, every other rank holds one, to rank 0.
@@ -175,10 +179,16 @@ impl Group {
     /// [`Group::warm`] this value before handing it to
     /// [`super::session::Session::load_with_group`].
     pub fn form_default(tp: Tp, addr: &str) -> Result<Self> {
+        // Both are process-global and must precede the very first CUDA client.
+        // `fatal::arm` is idempotent; allocator selection records the policy in
+        // the environment before CubeCL reads it once during runtime init.
+        super::fatal::arm();
+        let allocator = super::pool::choose_memory_config();
         let device = burn::backend::cuda::CudaDevice::default();
         let probe = Tensor::<super::seam::Bk, 2>::zeros([1, 1], &device);
         let mut group = Self::form(tp, super::seam::client_of(&probe), addr)?;
         group.default_device = Some(device);
+        group.allocator = Some(allocator);
         Ok(group)
     }
 
@@ -231,6 +241,7 @@ impl Group {
             tp,
             client,
             default_device: None,
+            allocator: None,
             key: group_key(tp.world()),
             socks,
         })
@@ -260,6 +271,14 @@ impl Group {
         self.default_device.clone().context(
             "this Group was formed from an arbitrary ComputeClient. A Session needs \
              Group::form_default so its Burn device and collective client are one fact",
+        )
+    }
+
+    /// The allocator CubeCL observed before this Group created its client.
+    pub(crate) fn allocator(&self) -> Result<super::pool::AllocatorConfig> {
+        self.allocator.context(
+            "this Group was formed without an allocator witness. A Session needs \
+             Group::form_default so admission and the CUDA runtime price one policy",
         )
     }
 

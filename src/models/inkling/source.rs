@@ -95,6 +95,11 @@ impl Weights {
         )
     }
 
+    /// Canonical content identity of every model fact this loader resolved.
+    pub fn model_identity(&self) -> [u8; 32] {
+        self.src.model_identity()
+    }
+
     // ---- reading ---------------------------------------------------------
 
     /// One dense tensor by name, widened to f32.

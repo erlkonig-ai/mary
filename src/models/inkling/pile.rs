@@ -30,6 +30,7 @@
 
 use anybytes::Bytes;
 use anyhow::{Context, Result};
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::tensor::{
     Tensor, TensorElement, TensorView,
     elements::{BF16, F32, NVFP4, NVFP4_BLOCK},
@@ -947,6 +948,10 @@ pub struct PileSource {
     /// them would pay the 18-second index build twice to answer a question the
     /// first open already had in hand.
     facts: triblespace::prelude::TribleSet,
+    /// Canonical content identity of the exact projected facts this runtime
+    /// indexes. It binds every weight handle and sidecar/config fact without
+    /// depending on pile path, commit authorship, or construction history.
+    model_identity: [u8; 32],
     /// Dense tensors, read as their type at index time. `Leaf` is a view, so
     /// holding all 968 of them costs kilobytes.
     dense: std::collections::HashMap<String, Leaf>,
@@ -1000,6 +1005,7 @@ impl PileSource {
                 .map_err(|e| anyhow::anyhow!("{path:?}: model collection snapshot: {e}"))?;
         let facts =
             crate::model_collection::project_legacy_model_attributes(snapshot.facts()).facts;
+        let model_identity = IntoBlob::<SimpleArchive>::to_blob(&facts).get_handle().raw;
         let (_, _, reader) = snapshot.into_parts();
         pile.close()
             .map_err(|e| anyhow::anyhow!("close {path:?}: {e:?}"))?;
@@ -1166,6 +1172,7 @@ impl PileSource {
             path: path.to_path_buf(),
             reader,
             facts,
+            model_identity,
             dense,
             experts,
             stacked,
@@ -1404,6 +1411,11 @@ impl PileSource {
     /// Everything the model collection asserts.
     pub fn facts(&self) -> &triblespace::prelude::TribleSet {
         &self.facts
+    }
+
+    /// Canonical handle bytes of the projected model facts this source uses.
+    pub fn model_identity(&self) -> [u8; 32] {
+        self.model_identity
     }
 
     /// The blob reader, so a caller can resolve handles the facts name.
