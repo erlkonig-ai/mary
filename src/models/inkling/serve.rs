@@ -99,7 +99,7 @@
 //! |---|---|---|
 //! | `Session::load` → READY | 35.3 | paid ONCE, per process |
 //! | first token, turn 0 | 9.838 | 5-token prompt, cold session, every layer's first bind |
-//! | first token, turn 1 | 0.579 | a 13-token DELTA, walked one position each |
+//! | first token, turn 1 | 0.579 | a 13-token DELTA, walked one position each — SUPERSEDED, see below |
 //! | first token, turns 2–3 | 0.044, 0.045 | no delta: ONE step against a warm cache |
 //! | decode | 0.709–0.716 / 16 tok | **44.3–44.8 ms PER STEP** |
 //!
@@ -137,6 +137,47 @@
 //! token at 0.016 s — **~1 ms per turn for the pipe, the framing and the
 //! detokenizer**, against a 44 ms step.
 //!
+//! ## What the CARRY changed, and why the turn-1 row above is superseded
+//!
+//! That row is two changes stale, and both moved the quantity it names rather
+//! than the number: `Session::extend` now appends a delta in ONE BATCHED PASS
+//! instead of walking it, and a turn's delta is now one token WIDER than the
+//! client's, because the previous turn's last token rides at its head (see
+//! [`TurnEnd::carried`]). "13 walked positions at ~44 ms" is no longer what turn
+//! 1 does.
+//!
+//! Measured 2026-08-28, same box, same lock, same pile, same 0..21 range, the
+//! same probe arguments byte for byte — an A/B of two `inkling_serve` binaries
+//! that differ by the carry commit and nothing else:
+//!
+//! | | turn 0 | turn 1 | turns 2–3 |
+//! |---|---|---|---|
+//! | position, before | 20 | 48 | 64, 80 |
+//! | position, after | 20 | **49** | 65, 81 |
+//! | first token, before | 5.372 s | 1.248 s | 0.044 s |
+//! | first token, after | 5.921 s | 0.505 s | 0.044 s |
+//! | text | **byte-identical** | diverges | diverges |
+//!
+//! Read the position row first, because it is the whole mechanism: **+1 at turn
+//! 1 and +1 thereafter, never +2.** One token per turn WITH NEW CONTEXT is what
+//! was being lost, and turns 2–3 were never losing one — an empty delta reaches
+//! `extend(&[])`, which shortcuts to `Session::step` and does feed the token
+//! back. The defect was always exactly the turns that had something new to say.
+//!
+//! And the divergence begins where the mechanism says it must: turn 0 has no
+//! previous turn to carry from, so it is byte-identical across the change, and
+//! every turn after it differs. The seconds are one sample a cell and are not a
+//! measurement of the carry — one row of a batched pass cannot be read out of a
+//! turn that also pays a first-token latency — they are here to say the change
+//! did not cost a decode step, which a `step()`-based fix would have.
+//!
+//! **Neither side's text is the model's.** Both are the degenerate output of a
+//! PARTIAL STACK unembedding through layers it did not all run, which is
+//! structural (see the TP section below), so this A/B shows WHERE the divergence
+//! starts and cannot show whether the answer got better. The token-level
+//! correctness claim lives in `inkling_session --carry`, which compares against a
+//! session fed the identical sequence with the identical pass partition.
+//!
 //! # Tensor parallelism is above this, not inside it
 //!
 //! `Session::load` refuses `INK_TP`, so one `inkling_serve` is one RANK and a
@@ -171,11 +212,13 @@
 //!    layers. One of the two rules has to be selected by whether a group is
 //!    present, and getting it backwards is a refusal at load, not a wrong
 //!    answer — which is the good failure.
-//! 3. **Lockstep is per STEP, not per turn.** Both ranks must call `step()` the
-//!    same number of times or the other blocks in NCCL forever, and `extend`
-//!    walks a delta one position at a time — so the proxy must feed both ranks
-//!    the SAME context bytes and the same `max_tokens`, not merely the same
-//!    turns.
+//! 3. **Lockstep is per PASS, not per turn.** Both ranks must make the same
+//!    forward calls in the same order or the other blocks in NCCL forever, and
+//!    a turn's passes depend on its delta: `extend` appends in chunks of
+//!    `extend_batch` rows, and the pass is one row wider than the client's delta
+//!    whenever a carried token rides at its head. So the proxy must feed both
+//!    ranks the SAME context bytes and the same `max_tokens`, not merely the
+//!    same turns.
 //! 4. **Rank 1's stream must be DRAINED and CHECKED, not ignored.** Both ranks
 //!    produce the same token (embedding and unembedding are replicated, so both
 //!    unembed the whole table and take the same argmax). The proxy returns rank
@@ -257,6 +300,17 @@ pub struct TurnEnd {
     /// context, never a re-rendered transcript. Zero on a turn whose only input
     /// is the model's own previous output.
     pub delta_tokens: usize,
+    /// Tokens of the model's OWN previous turn this pass appended BEFORE the
+    /// delta: `0` on turn 0 and `1` on every turn after it.
+    ///
+    /// A turn emits its last token and never feeds it back — the generation loop
+    /// stops one step short rather than spend a decode step on an argmax nobody
+    /// reads — so that token ends the turn in the consumer's stream and not in
+    /// the KV cache. The next pass appends it at the head of its delta, and this
+    /// counts it, so a reader can see the whole pass rather than the client's
+    /// half of it. A turn after turn 0 reporting `0` here is a turn whose model
+    /// never heard its own last word.
+    pub carried: usize,
     /// Why generation stopped: `"max_tokens"` or `"stop_token"`.
     pub stopped: String,
     /// Seconds to the FIRST token of this turn, `Session` calls only:
@@ -276,11 +330,12 @@ impl TurnEnd {
     /// One line for a report, carrying its own framing rule.
     pub fn summary(&self) -> String {
         format!(
-            "turn {}: {} token(s) after a {}-token delta, first token {:.3}s, turn {:.3}s, \
-             position {} ({})",
+            "turn {}: {} token(s) after a {}-token delta (+{} carried), first token {:.3}s, \
+             turn {:.3}s, position {} ({})",
             self.turn,
             self.tokens,
             self.delta_tokens,
+            self.carried,
             self.first_token_secs,
             self.turn_secs,
             self.position,
@@ -526,11 +581,26 @@ impl StreamProof {
 /// # What it ignores, and why that is correct
 ///
 /// `Payload::Monologue` events are the mind's OWN words from earlier turns. A
-/// stateful backend already has them: they are literally the tokens its own
-/// `step()` fed back, sitting in the KV cache. Replaying them would attend to
-/// the same words twice. They are ingested into a [`drive::mind::MonologueBuffer`]
-/// anyway — but only for their COORDINATES, so the decision's span is expressed
-/// in the same session-absolute byte space the loop verifies against.
+/// stateful backend already has them, and it takes TWO mechanisms rather than
+/// one: all but the last token of a turn were fed back by its own `step()`, and
+/// the last one — which the generation loop deliberately does not spend a decode
+/// step to feed — is appended at the head of the NEXT turn's delta (see
+/// `inkling_serve::serve_turn` and [`TurnEnd::carried`]). Between them, every
+/// token this mind has said is in the KV cache by the time it is consulted
+/// again, so replaying the text would attend to the same words twice.
+///
+/// **That sentence used to say only the first half** — "they are literally the
+/// tokens its own `step()` fed back" — and it was false by exactly one token per
+/// turn, every turn with new context, for as long as it stood: the turn's final
+/// word went to the consumer and never to the cache. It is spelled out here
+/// because the comment is the whole reason the monologue is not re-fed, and a
+/// justification whose premise nobody checks is how the defect survived. It left
+/// no other trace: the cache stayed consistent, `position()` stayed exactly
+/// right, and the only thing that disagreed was the model's answer.
+///
+/// They are ingested into a [`drive::mind::MonologueBuffer`] anyway — but only
+/// for their COORDINATES, so the decision's span is expressed in the same
+/// session-absolute byte space the loop verifies against.
 ///
 /// `Payload::Result` events are the untrusted output of a command the mind ran.
 /// They ARE the delta and they are fed to the model as context. Drive never
@@ -680,8 +750,11 @@ impl InklingMind {
         // ── read the world ──────────────────────────────────────────────────
         for event in events {
             match &event.payload {
-                // Coordinates only. The model already attended to these tokens;
-                // they are in its KV cache because its own `step` fed them back.
+                // Coordinates only. The model already attended to these tokens:
+                // its own `step` fed back all but each turn's last, and the
+                // serving process carries that last one into the next turn's
+                // delta. See this type's doc for why both halves have to be
+                // true, and what happened while only one was.
                 drive::world::Payload::Monologue(text) => self.buffer.push_free(text),
                 // The delta: untrusted text from a sandbox, in as text.
                 drive::world::Payload::Result { command, rendered } => {
@@ -768,6 +841,7 @@ mod tests {
             turn: 3,
             tokens: 10,
             delta_tokens: 4,
+            carried: 1,
             stopped: "max_tokens".to_string(),
             first_token_secs: 0.021,
             turn_secs: 0.43,
@@ -778,6 +852,14 @@ mod tests {
         // The summary carries its own framing: "first token", not "per token".
         assert!(
             back.summary().contains("first token 0.021s"),
+            "{}",
+            back.summary()
+        );
+        // And it says how wide the pass actually was, not just the client's half
+        // of it: a turn whose model did not hear its own last word is a turn
+        // that reported `+0 carried` after turn 0, and that has to be readable.
+        assert!(
+            back.summary().contains("4-token delta (+1 carried)"),
             "{}",
             back.summary()
         );

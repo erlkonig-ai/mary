@@ -43,6 +43,24 @@
 //! operation a serving process actually needs between conversations — it costs
 //! a deallocation, not a reload.
 //!
+//! # And the third lever: going BACK
+//!
+//! `reset` is all-or-nothing, and for a while it was the only way to un-attend
+//! to anything. That is fine for a conversation, which only ever grows, and
+//! wrong for a prompt whose SETTLED PREFIX can change underneath it — a memory
+//! cover, say, which re-refines its recent edge every time a memory is written
+//! and can move the first differing byte thousands of characters back.
+//!
+//! [`Session::checkpoint`] keeps a position and [`Session::rewind`] returns to
+//! it, so a caller that checkpoints per chunk pays, on a change, only for the
+//! chunks at or after the first one that differs. Everything before it keeps its
+//! KV and is never read again. What makes that more than a `pos` assignment is
+//! the sliding window: thirty-five of the forty-two layers have already dropped
+//! the keys a rewound position needs, so a checkpoint holds those layers'
+//! stores — bounded by the window, and therefore the same size at position
+//! 500,000 as at position 1,000. See [`Checkpoint`] and
+//! [`super::burn::AttnRewind`].
+//!
 //! # What a Session deliberately is NOT
 //!
 //! It is not the serving process, and it is not `inkling_forward`.
@@ -98,6 +116,15 @@ use super::pile::Elem;
 use super::source::Weights;
 use super::stack::embed_and_norm_bf16;
 
+/// The next sequence id. Process-wide and monotone, so no two sequences —
+/// across sessions or across one session's resets — ever share one, and a
+/// [`Checkpoint`] can therefore be refused by the session it does not belong to
+/// rather than silently accepted because both counters happened to read 0.
+fn next_seq() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How to open a model. Everything here has a default that matches what
 /// `inkling_forward` does when nothing is set.
 #[derive(Debug, Clone)]
@@ -129,6 +156,21 @@ pub struct SessionConfig {
     /// later and less legibly, which is why raising it is the fix rather than
     /// catching the failure.
     pub prefill_budget: usize,
+
+    /// How many positions one [`Session::extend`] pass appends to an existing
+    /// cache at once.
+    ///
+    /// A delta longer than this is appended in consecutive passes of this
+    /// width, each committed whole, which is the same sequence of states a
+    /// single pass would leave — a chunk boundary is a commit point and nothing
+    /// else. `1` is the WALKED arm: one decode step a token, the shape
+    /// [`Session::extend`] had before it batched, kept because the equivalence
+    /// gate has to be able to build the same cache both ways on one session.
+    ///
+    /// It may not exceed [`SessionConfig::prefill_budget`]: a batched append
+    /// allocates activations as a function of its width exactly as a prefill
+    /// does, and that budget is what admission reserved room for.
+    pub extend_batch: usize,
 }
 
 impl SessionConfig {
@@ -152,6 +194,7 @@ impl SessionConfig {
             layers,
             warm_experts: true,
             prefill_budget: 4096,
+            extend_batch: 4096,
         }
     }
 
@@ -215,6 +258,113 @@ pub struct Session {
     pos: usize,
     /// The token the last pass produced, which is what [`Session::step`] feeds.
     last: Option<usize>,
+    /// How many positions one [`Session::extend`] pass appends. See
+    /// [`SessionConfig::extend_batch`].
+    extend_batch: usize,
+    /// The widest pass admission reserved activation headroom for, kept so
+    /// [`Session::set_extend_batch`] can hold to the same bound `load` did.
+    prefill_budget: usize,
+    /// Whether a pass FAILED PART WAY THROUGH the layer stack, leaving the
+    /// caches at two different positions.
+    ///
+    /// A pass advances every layer's cache in turn and only then advances
+    /// [`Session::pos`], so an error raised at layer `l` leaves layers below it
+    /// holding rows that layers above it do not, and the position counter
+    /// agreeing with neither. That is true of a one-row pass and of a `k`-row
+    /// one alike — batching changes how MANY positions a tear spans, not
+    /// whether one can happen — and there is no cheap undo, because the rows
+    /// the lower layers appended are already in their stores.
+    ///
+    /// So the pass is not all-or-nothing and this says so: the session is
+    /// POISONED, every later pass is refused by name, and the two ways out are
+    /// [`Session::reset`] (throw the sequence away) and [`Session::rewind`] to
+    /// a [`Checkpoint`] taken before the tear — which restores EVERY layer from
+    /// one consistent instant and is therefore a real repair rather than a
+    /// second guess.
+    torn: bool,
+    /// Which SEQUENCE this is. Minted per `load` and re-minted by
+    /// [`Session::reset`], so a [`Checkpoint`] cannot be handed to a session
+    /// that has since started a different conversation — or to a different
+    /// session entirely, which holds different device buffers and for which the
+    /// checkpoint's positions mean nothing.
+    seq: u64,
+}
+
+/// A position a [`Session`] can be put back to, and the state it needs to stand
+/// there.
+///
+/// # Why this is a TOKEN and not a number
+///
+/// The obvious API is `truncate_to(pos)`. It is the wrong one, because on
+/// thirty-five of this model's forty-two layers most positions cannot be
+/// truncated to at all: a sliding-window layer has released the keys before its
+/// window, and a cache cut back to a position it has already run past attends
+/// over fewer keys than the sequence has, silently and forever. See
+/// [`super::burn::AttnRewind`] for the mechanism.
+///
+/// So the position a caller may rewind to is exactly a position at which
+/// somebody kept the windowed layers' stores — and a value that IS the kept
+/// state cannot name a position where none was kept. `truncate_to(9_203)` is a
+/// number anyone can produce; a `Checkpoint` is not.
+///
+/// # What it costs
+///
+/// One clone of thirty-five bounded stores plus four small tensors a layer.
+/// Bounded is the load-bearing word: a windowed layer's store never exceeds its
+/// window, so a checkpoint at position 500,000 is the same size as one at
+/// position 1,000. The global layers keep nothing at all — a truncation puts
+/// them back exactly.
+///
+/// **Framing rule for the bytes below**: derived from the tensor shapes of the
+/// 42-layer release (hidden 4096, 8 KV heads × 128 head_dim = 1024-wide KV
+/// rows, sliding window 512, `sconv_kernel_size` 4) on the NVFP4 KV lane
+/// ([`super::kvpages::fp4_kv`], 4.5 bits a value), NOT measured, and stated per
+/// CHECKPOINT — against the alternative of keeping a whole session's KV.
+///
+/// At the instant it is taken a checkpoint allocates nothing: every page it
+/// names is one the live cache also holds. What it costs is what it keeps ALIVE
+/// once the live window has slid past — at most `512 + 128` rows a store (the
+/// window plus a page of not-yet-cut dead prefix):
+///
+/// * 35 local layers × 2 stores × 640 × 1024 × 4.5 bits ≈ **25.8 MB**
+/// * 42 layers × (`k_pre`, `v_pre`, and the two convolution histories) ≈ 5.2 MB
+/// * 7 global layers: **nothing**
+///
+/// ≈ **31 MB for the whole stack, at any position** — against a live KV that is
+/// ~424 MB at position 50,000 and grows with it, because the global layers do.
+/// A single-rank session running half the stack keeps about half that (layers
+/// 0..21 hold 18 local and 3 global layers: ≈ 16 MB).
+///
+/// The TIME lives in the gate rather than here, because it is a comparison and
+/// not a constant: `checkpoint` and `rewind` measured 0.1 ms and 0.4 ms at
+/// layers 0..21 on a GB10 — free — and what actually decides whether a rewind
+/// is worth taking is the cost of re-extending afterwards. `inkling_session
+/// --rewind` prints both sides and its doc carries the framing rule.
+pub struct Checkpoint {
+    /// The position the session stood at.
+    pos: usize,
+    /// The token the pass that reached `pos` produced.
+    last: Option<usize>,
+    /// The sequence this was taken from. See [`Session::seq`].
+    seq: u64,
+    /// One per cache SLOT, in the session's layer order.
+    layers: Vec<LayerRewind>,
+}
+
+/// One layer's half of a [`Checkpoint`].
+struct LayerRewind {
+    attn: dev_lane::AttnRewind<Bk>,
+    attn_sconv: BT<Bk, 2>,
+    mlp_sconv: Option<BT<Bk, 2>>,
+}
+
+impl Checkpoint {
+    /// The position this checkpoint stands at — what [`Session::position`]
+    /// returned when it was taken, and what it will return again after a
+    /// [`Session::rewind`] to it.
+    pub fn position(&self) -> usize {
+        self.pos
+    }
 }
 
 impl Session {
@@ -290,6 +440,23 @@ impl Session {
              than the number.",
             t.num_hidden_layers,
             144,
+        );
+        // A batched append is a prefill-shaped pass against an existing cache:
+        // its activations are a function of its width in exactly the same way,
+        // and `prefill_budget` is the width admission reserved headroom for.
+        // Refused here rather than at the allocator, where it would arrive as a
+        // failed buffer with nothing to say about which knob caused it.
+        anyhow::ensure!(
+            cfg.extend_batch >= 1,
+            "an extend pass appends at least one position"
+        );
+        anyhow::ensure!(
+            cfg.extend_batch <= cfg.prefill_budget,
+            "extend_batch {} is wider than the {}-token prefill budget admission reserves \
+             activations for: a batched append allocates like a prefill of the same width. \
+             Raise prefill_budget or lower extend_batch.",
+            cfg.extend_batch,
+            cfg.prefill_budget
         );
 
         // A Session is ONE process and has to be able to answer, so it always
@@ -441,7 +608,32 @@ impl Session {
             caches: Vec::new(),
             pos: 0,
             last: None,
+            extend_batch: cfg.extend_batch,
+            prefill_budget: cfg.prefill_budget,
+            torn: false,
+            seq: next_seq(),
         })
+    }
+
+    /// How many positions one [`Session::extend`] pass appends at once, after
+    /// the session is open. See [`SessionConfig::extend_batch`] for what the
+    /// number means and why `1` is a value worth having.
+    ///
+    /// A setter and not a builder because the one caller that needs to CHANGE
+    /// it is the gate that builds the same cache both ways on one session:
+    /// re-loading eighty gibibytes to move a number would make the two arms
+    /// two different processes, which is exactly what the comparison must not
+    /// be.
+    pub fn set_extend_batch(&mut self, rows: usize) -> Result<()> {
+        anyhow::ensure!(rows >= 1, "an extend pass appends at least one position");
+        anyhow::ensure!(
+            rows <= self.prefill_budget,
+            "extend_batch {rows} is wider than the {}-token prefill budget this session's \
+             admission reserved activations for",
+            self.prefill_budget
+        );
+        self.extend_batch = rows;
+        Ok(())
     }
 
     /// The model's configuration, as the source stated it.
@@ -475,6 +667,147 @@ impl Session {
         self.caches.clear();
         self.pos = 0;
         self.last = None;
+        // Throwing the caches away is what un-tears a torn session: there is
+        // nothing left for the layers to disagree about.
+        self.torn = false;
+        // A new sequence, so every [`Checkpoint`] taken from the old one stops
+        // being a rewind target. Their device buffers are still alive (a
+        // checkpoint holds handles), so without this a rewind after a reset
+        // would succeed and put the session back into the PREVIOUS
+        // conversation's cache while the caller believed it had started a fresh
+        // one.
+        self.seq = next_seq();
+    }
+
+    /// Keep where this session stands, so it can be put back here later.
+    ///
+    /// # The operation this is for
+    ///
+    /// A caller whose prompt is a chain of settled chunks — a memory cover
+    /// decomposed into recall pairs, say — takes one of these after each chunk.
+    /// When the chain changes it finds the first chunk that differs, rewinds to
+    /// the checkpoint before it, and extends with the new tail: every chunk
+    /// before the change keeps its KV and is never read again.
+    ///
+    /// That is a rewind and not a re-prefill, and the difference is the whole
+    /// point. It is also why the granularity is the caller's: a checkpoint per
+    /// chunk makes the chunk the unit at which the cache can be recovered.
+    ///
+    /// Refuses on a session with no sequence in flight — position 0 is what
+    /// [`Session::reset`] gets you, and it costs nothing to keep.
+    pub fn checkpoint(&self) -> Result<Checkpoint> {
+        anyhow::ensure!(
+            !self.torn,
+            "a pass failed part way through the layer stack, so this session's caches stand at \
+             two different positions and a checkpoint of them would be a rewind target that \
+             restores the inconsistency. `reset`, or `rewind` to a checkpoint taken before it."
+        );
+        anyhow::ensure!(
+            !self.caches.is_empty(),
+            "this Session holds no sequence, so there is nothing to come back to. `reset` is \
+             the way back to position 0."
+        );
+        anyhow::ensure!(
+            self.caches.len() == self.hi - self.lo,
+            "{} caches for {} layers",
+            self.caches.len(),
+            self.hi - self.lo
+        );
+        let t = &self.cfg.text_config;
+        let mut layers = Vec::with_capacity(self.caches.len());
+        for layer in self.lo..self.hi {
+            let slot = layer - self.lo;
+            // The SAME window `forward` hands the layer, derived the same way:
+            // a rewind point that disagreed with the layer about whether it
+            // forgets is the one mistake this whole type exists to prevent.
+            let window = match t.attn_kind(layer) == AttnKind::Local {
+                true => Some(t.sliding_window_size),
+                false => None,
+            };
+            let c = &self.caches[slot];
+            anyhow::ensure!(
+                c.attn_sconv_pending.is_none() && c.mlp_sconv_pending.is_none(),
+                "layer {layer} holds an uncommitted speculative convolution window; a Session \
+                 never drafts, so this cache did not come from one"
+            );
+            layers.push(LayerRewind {
+                attn: c.attn.rewind_point(window),
+                attn_sconv: c.attn_sconv.clone(),
+                mlp_sconv: c.mlp_sconv.clone(),
+            });
+        }
+        Ok(Checkpoint {
+            pos: self.pos,
+            last: self.last,
+            seq: self.seq,
+            layers,
+        })
+    }
+
+    /// Put this session back where `cp` was taken and drop everything after it.
+    ///
+    /// [`Session::position`] returns `cp.position()` afterwards, and
+    /// [`Session::extend`] continues from there — with DIFFERENT tokens if that
+    /// is what changed, which is the operation this exists for.
+    ///
+    /// # It fails loudly, and the failures are the design
+    ///
+    /// * A checkpoint from another session, or from this one before a
+    ///   [`Session::reset`], is refused by sequence id. Its handles are still
+    ///   alive, so the alternative to refusing is a session that silently
+    ///   becomes a different conversation.
+    /// * A checkpoint from AHEAD of where the session now stands is refused:
+    ///   the rows between are not in the cache to be restored, and a "rewind"
+    ///   forward would leave the position counter ahead of the keys.
+    /// * A checkpoint whose layer count is not this session's is refused.
+    ///
+    /// There is deliberately no `truncate_to(pos)` beside this. See
+    /// [`Checkpoint`] for why a position is not a thing a caller may name.
+    pub fn rewind(&mut self, cp: &Checkpoint) -> Result<()> {
+        anyhow::ensure!(
+            cp.seq == self.seq,
+            "this checkpoint was taken from a different sequence (checkpoint {}, session {}) -- \
+             either from another Session or from this one before a `reset`. Its device buffers \
+             are still alive, so rewinding to it would put this session into a conversation it \
+             is no longer having.",
+            cp.seq,
+            self.seq
+        );
+        anyhow::ensure!(
+            !self.caches.is_empty(),
+            "this Session holds no sequence to rewind"
+        );
+        anyhow::ensure!(
+            cp.pos <= self.pos,
+            "a checkpoint at position {} against a session at {}: a rewind goes BACK, and the \
+             positions between are not in this cache to be restored",
+            cp.pos,
+            self.pos
+        );
+        anyhow::ensure!(
+            cp.layers.len() == self.caches.len(),
+            "a {}-layer checkpoint against a {}-layer session",
+            cp.layers.len(),
+            self.caches.len()
+        );
+        for (slot, l) in cp.layers.iter().enumerate() {
+            let c = &mut self.caches[slot];
+            c.attn.rewind_to(&l.attn);
+            c.attn_sconv = l.attn_sconv.clone();
+            c.mlp_sconv = l.mlp_sconv.clone();
+            c.attn_sconv_pending = None;
+            c.mlp_sconv_pending = None;
+        }
+        self.pos = cp.pos;
+        self.last = cp.last;
+        // A rewind repairs a TORN session, and it is the only thing besides
+        // `reset` that can. The loop above restored every layer from one
+        // instant, so whatever disagreement a half-finished pass left is gone —
+        // and it is gone even for the layers that were AHEAD, because a
+        // checkpoint is a position the whole stack stood at and `rewind_to`
+        // truncates or replaces each store to reach it.
+        self.torn = false;
+        Ok(())
     }
 
     /// Attend to `ids` as the start of a sequence and return the token that
@@ -503,26 +836,60 @@ impl Session {
     /// An empty delta re-answers from the current state, which is
     /// [`Session::step`].
     ///
-    /// # It walks the delta one position at a time, and that is deliberate
+    /// # It appends the delta in ONE BATCHED PASS
     ///
-    /// A cached pass over `k > 1` rows is not a small generalisation of a cached
-    /// pass over one. It is the SPECULATIVE batch: `attention_steps` leaves the
-    /// rows PENDING in the cache, because the caller is expected to come back
-    /// and say how many of them a verifier kept — rows computed from tokens the
-    /// model did not choose have to be rolled back, and leaving them behind does
-    /// not error, it shows up later as an acceptance rate that drifts down. A
-    /// conversational delta has nothing to verify (every token in it is a fact),
-    /// so it would always commit all `k`, but reaching that through the
-    /// speculation machinery means getting a commit path right that nothing
-    /// here would exercise.
+    /// This walked the delta one position at a time until 2026-08-27, on the
+    /// reasoning that a cached pass over `k > 1` rows is the SPECULATIVE batch
+    /// and reaching for it means getting a commit path right that nothing here
+    /// would exercise. The reasoning was sound and the conclusion was
+    /// expensive: measured at layers 0..21 on a GB10, a walked delta costs
+    /// **47.4 ms a token** against **11.32 ms** for the same tokens through a
+    /// batched prefill — 4.19x, paid by every turn in which a faculty returns
+    /// output, because a command result, a recalled memory and a tool response
+    /// are all known multi-token deltas.
     ///
-    /// So this walks the delta through the SAME single-position path
-    /// [`Session::step`] uses, which is the one that is checked. It costs `k`
-    /// passes where a batched one would cost one, and it still never re-reads a
-    /// token the cache already holds — which is the property the session exists
-    /// for, and the one that is worth two orders of magnitude. Batching the
-    /// delta is an optimisation on top, and it wants the commit semantics
-    /// spelled out rather than inherited.
+    /// So the commit path is spelled out instead of avoided, and it is short,
+    /// because **a conversational delta has no verifier**: every token in it is
+    /// already a fact about the sequence. `attention_steps` leaves its rows
+    /// PENDING for a verifier to accept or roll back; this pass commits all `k`
+    /// of them in the same layer iteration that produced them, so no
+    /// uncommitted speculative state ever survives a call, and
+    /// [`Session::checkpoint`]'s refusal to stand on one is a statement about
+    /// misuse rather than about this path.
+    ///
+    /// Four questions that a batched append has and a walked one does not, and
+    /// where each is answered:
+    ///
+    /// * **The sliding window.** A batch is NOT trimmed row by row as it is
+    ///   appended, so a batch of `k` may carry a local layer past its window in
+    ///   one go. That is correct and not an oversight:
+    ///   `attention_steps` masks every (row, key) pair by the ABSOLUTE distance
+    ///   `pos - abs`, so a key outside row `i`'s window contributes `-inf`
+    ///   whether or not it is still stored, and the trim that follows the
+    ///   commit is what makes the store bounded again. Trimming DURING the
+    ///   batch would be the bug — it is why `AttnCache::commit` defers the trim
+    ///   at all — because a row that is dropped mid-batch is one a later row of
+    ///   the same batch may still need. Gated by
+    ///   `batched_and_walked_caches_answer_the_same` over batches that straddle
+    ///   the window boundary and batches LONGER than the whole window.
+    /// * **What it costs while it is uncommitted.** The flip side of the same
+    ///   fact: a local layer holds `window + k` rows for the duration of the
+    ///   pass instead of `window`, and reads all of them. That is bounded by
+    ///   `k`, which is what [`SessionConfig::extend_batch`] bounds — a delta
+    ///   longer than it is appended in consecutive passes of that width rather
+    ///   than one enormous one.
+    /// * **Partial failure.** A pass is not all-or-nothing and cannot cheaply
+    ///   be made so; see [`Session::torn`], and note that this is a property of
+    ///   the layer loop rather than of batching — a one-row pass tears the same
+    ///   way over one position instead of `k`.
+    /// * **`last`.** The pass unembeds its LAST row only, exactly as a prefill
+    ///   does, so [`Session::step`] afterwards feeds the token that follows the
+    ///   whole delta. The walked arm computed an argmax per position and threw
+    ///   away all but the last; this one does not compute them. Same answer,
+    ///   `k - 1` fewer unembeddings.
+    ///
+    /// `extend_batch = 1` puts the walked arm back, and the equivalence gate
+    /// uses it to build the same cache both ways on one session.
     pub fn extend(&mut self, ids: &[usize]) -> Result<usize> {
         if ids.is_empty() {
             return self.step();
@@ -532,8 +899,12 @@ impl Session {
             return self.forward(ids);
         }
         let mut out = 0;
-        for &id in ids {
-            out = self.forward(&[id])?;
+        // A chunk boundary is a commit point and nothing else, so a delta split
+        // into two passes leaves the same cache one pass would — which is the
+        // property that lets `extend_batch` be a resource knob rather than a
+        // semantic one.
+        for chunk in ids.chunks(self.extend_batch) {
+            out = self.forward(chunk)?;
         }
         Ok(out)
     }
@@ -554,21 +925,40 @@ impl Session {
     /// The one forward. `ids` are the positions being added; everything before
     /// them is in the caches.
     ///
-    /// Two shapes only, and the refusal below is what keeps it to two: a BATCHED
-    /// pass that establishes the cache, and a ONE-POSITION pass against a cache
-    /// that already exists. The third shape — several rows against an existing
-    /// cache — is the speculative batch and it is not this; see
-    /// [`Session::extend`], which walks a delta rather than reaching for it.
+    /// Three shapes: a BATCHED pass that establishes the cache (the prefill), a
+    /// ONE-POSITION pass against a cache that already exists (the decode step),
+    /// and a BATCHED pass against a cache that already exists (the
+    /// conversational delta). The third used to be refused as "the speculative
+    /// batch"; it is the same rows through the same functions, distinguished
+    /// only by having no verifier — so it commits unconditionally, in the layer
+    /// iteration that produced it. See [`Session::extend`].
+    ///
+    /// Refuses a session a previous pass tore. See [`Session::torn`].
     fn forward(&mut self, ids: &[usize]) -> Result<usize> {
         anyhow::ensure!(!ids.is_empty(), "a pass with no tokens would be vacuous");
         anyhow::ensure!(
-            self.caches.is_empty() || ids.len() == 1,
-            "a pass of {} rows against an EXISTING cache is the speculative batch -- \
-             `attention_steps` leaves those rows pending for a verifier to accept or roll \
-             back, and a conversational delta has no verifier. Use `extend`, which walks the \
-             delta one position at a time through the checked path.",
-            ids.len()
+            !self.torn,
+            "a previous pass failed part way through the layer stack, so this session's caches \
+             stand at two different positions and nothing this one computed would mean \
+             anything. `reset` to start over, or `rewind` to a checkpoint taken before the \
+             failure -- which restores every layer from one instant and is a real repair."
         );
+        // Everything from here MUTATES, and the mutation is per layer. An error
+        // out of the loop below leaves the stack half advanced, which no
+        // caller can detect and none should have to; poison the session and
+        // name the two ways out.
+        let out = self.forward_pass(ids);
+        if out.is_err() {
+            self.torn = true;
+        }
+        out
+    }
+
+    /// [`Session::forward`]'s mutating half, split out so that every failure
+    /// path through it lands in one place: the caller poisons the session on
+    /// any error, and it can only do that if the errors have somewhere to
+    /// return to.
+    fn forward_pass(&mut self, ids: &[usize]) -> Result<usize> {
         let t = &self.cfg.text_config;
         let h = t.hidden_size;
         let n = ids.len();
@@ -650,8 +1040,47 @@ impl Session {
                 alpha: t.log_scaling_alpha as f32,
             };
 
-            let a = match cached {
-                true => {
+            let a = match (cached, n > 1) {
+                // THE CONVERSATIONAL DELTA: `n` known positions against a cache
+                // that already holds the prefix, in one pass.
+                //
+                // `attention_steps` appends all `n` rows and leaves them
+                // PENDING, trimming nothing — which is exactly right here, and
+                // for the same reason it is right for a speculative batch: a
+                // row dropped mid-batch is one a later row of the same batch
+                // may still be inside the window of. The per-(row, key) mask it
+                // builds from absolute positions is what makes the untrimmed
+                // rows harmless, and `commit` below is what makes the store
+                // bounded again.
+                (true, true) => {
+                    let y = dev_lane::attention_steps(
+                        hn,
+                        &ld.attn,
+                        &dims,
+                        Some(ls),
+                        pos0,
+                        window,
+                        &mut self.caches[slot].attn,
+                    );
+                    let (out, all) = dev_lane::short_conv_steps(
+                        self.caches[slot].attn_sconv.clone(),
+                        y,
+                        ld.attn_sconv.clone(),
+                    );
+                    // THE COMMIT, unconditional and in the same iteration.
+                    // `keep = n` because every token of a delta is a fact: there
+                    // is no verifier to wait for, and waiting for one would be
+                    // the only way to leave uncommitted rows behind. The trim
+                    // the window needs happens inside it.
+                    self.caches[slot].attn.commit(n, window);
+                    // The block's own convolution memory, the same slice a
+                    // verifier that accepted everything would take: `all` is
+                    // `kernel - 1` history rows followed by this batch's `n`,
+                    // and the history after keeping all of them is its tail.
+                    self.caches[slot].attn_sconv = dev_lane::conv_history(all, t.sconv_kernel_size);
+                    out
+                }
+                (true, false) => {
                     let y = dev_lane::attention_step(
                         hn,
                         &ld.attn,
@@ -669,7 +1098,7 @@ impl Session {
                     self.caches[slot].attn_sconv = hist;
                     out
                 }
-                false => {
+                (false, _) => {
                     let (y, attn) =
                         dev_lane::attention_prefill(hn, &ld.attn, &dims, Some(ls), window, window);
                     let hist = dev_lane::conv_history(y.clone(), t.sconv_kernel_size);
@@ -724,8 +1153,22 @@ impl Session {
                     )?
                 }
             };
-            let (out, hist) = match cached {
-                true => {
+            let (out, hist) = match (cached, n > 1) {
+                // The fourth of the four short convolutions a widened pass runs
+                // per layer -- two are inside `attention_steps`, one is the
+                // block's `attn_sconv` above, and this is the MLP's. All four
+                // need the batched form, and a widened pass that left one of
+                // them on the single-row kernel would convolve `n` positions
+                // out of one position's history with no error at all.
+                (true, true) => {
+                    let h0 = self.caches[slot]
+                        .mlp_sconv
+                        .clone()
+                        .expect("a prefill seeds the MLP convolution");
+                    let (o, all) = dev_lane::short_conv_steps(h0, y, ld.mlp_sconv.clone());
+                    (o, dev_lane::conv_history(all, t.sconv_kernel_size))
+                }
+                (true, false) => {
                     let h0 = self.caches[slot]
                         .mlp_sconv
                         .clone()
@@ -733,7 +1176,7 @@ impl Session {
                     let (o, hi) = dev_lane::short_conv_step(h0, y, ld.mlp_sconv.clone());
                     (o, hi)
                 }
-                false => {
+                (false, _) => {
                     let hist = dev_lane::conv_history(y.clone(), t.sconv_kernel_size);
                     (dev_lane::short_conv(y, ld.mlp_sconv.clone()), hist)
                 }
@@ -776,5 +1219,21 @@ mod tests {
     #[test]
     fn warming_experts_is_on_by_default() {
         assert!(SessionConfig::new("/nowhere.pile").warm_experts);
+    }
+
+    /// The default config must satisfy the rule [`Session::load`] enforces: a
+    /// batched append allocates like a prefill of the same width, so it may not
+    /// be wider than the width admission reserved for. A default that refused
+    /// itself would only be discovered on a machine with a GPU.
+    #[test]
+    fn the_default_extend_batch_fits_the_default_prefill_budget() {
+        let c = SessionConfig::new("/nowhere.pile");
+        assert!(c.extend_batch >= 1);
+        assert!(
+            c.extend_batch <= c.prefill_budget,
+            "extend_batch {} against a prefill budget of {}",
+            c.extend_batch,
+            c.prefill_budget
+        );
     }
 }

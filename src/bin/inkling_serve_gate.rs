@@ -227,6 +227,11 @@ fn cmd_drive(o: &Options) -> Result<()> {
         }),
         // Exhaust has its own gate in drive; this run is about the seam.
         telemetry: None,
+        // No cover, so the mind wakes as nobody. That is deliberate here for the
+        // same reason the telemetry is off: this gate is proving that a real
+        // Session can be driven, and a wake-time context would put tokens in
+        // front of the model that the seam is not about.
+        memory: None,
     };
 
     let mut shell = drive::shell::Shell::open(&config, Box::new(mind))
@@ -366,6 +371,38 @@ fn cmd_probe(o: &Options) -> Result<()> {
             cold / mean.max(f64::EPSILON)
         );
     }
+
+    // THE CARRY, on the real serving process. A turn emits its last token and
+    // never feeds it back — that step is deliberately skipped — so the next pass
+    // must append it, or the model permanently stops hearing its own last word.
+    // Turn 0 has nothing to carry; every turn after it carries exactly one.
+    //
+    // This is the STRUCTURAL half of the check and it is cheap: it says the
+    // carry happened, on the binary that ships. That it is the RIGHT thing to
+    // carry is the behavioural half, and it lives in `inkling_session --carry`,
+    // which compares a served two-turn conversation against a session fed the
+    // identical token sequence in one pass.
+    let uncarried: Vec<usize> = ends
+        .iter()
+        .filter(|e| e.turn > 0 && e.carried == 0)
+        .map(|e| e.turn)
+        .collect();
+    println!(
+        "  carry: turn 0 carried {}, turns 1..{} carried {:?}",
+        ends.first().map(|e| e.carried).unwrap_or(0),
+        ends.len(),
+        ends.iter().skip(1).map(|e| e.carried).collect::<Vec<_>>(),
+    );
+    anyhow::ensure!(
+        ends.first().map(|e| e.carried).unwrap_or(0) == 0,
+        "turn 0 carried a token, and there was no previous turn for it to come from"
+    );
+    anyhow::ensure!(
+        uncarried.is_empty(),
+        "turn(s) {uncarried:?} did not carry the previous turn's last token forward, so the \
+         model never attended to its own final word of those turns"
+    );
+
     let status = client.close()?;
     println!("  serving process exited: {status}");
     Ok(())
