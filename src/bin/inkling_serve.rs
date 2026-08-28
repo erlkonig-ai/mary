@@ -557,6 +557,13 @@ fn serve_turn(
     *carry = generated.last().map(|&t| t as usize);
 
     let tokens = generated.len();
+    let local_layers = session
+        .validate_cache_completeness()
+        .context("validate every attention cache at the completed-turn seam")?;
+    eprintln!(
+        "inkling_serve: turn {turn} cache-complete at position {} ({local_layers} local layer(s))",
+        session.position()
+    );
     Ok(TurnEnd {
         turn,
         tokens,

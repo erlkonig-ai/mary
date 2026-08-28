@@ -126,6 +126,17 @@ fn next_seq() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `(base, len)` of the complete cache a layer must hold at `position`.
+fn required_cache_span(kind: AttnKind, position: usize, window: usize) -> (usize, usize) {
+    match kind {
+        AttnKind::Local => {
+            let len = position.min(window);
+            (position - len, len)
+        }
+        AttnKind::Global => (0, position),
+    }
+}
+
 /// Validate the two placement modes without touching a GPU.
 ///
 /// A layer split gives one process a strict subrange. Tensor parallelism is the
@@ -419,6 +430,62 @@ impl Checkpoint {
     /// [`Session::rewind`] to it.
     pub fn position(&self) -> usize {
         self.pos
+    }
+
+    /// Prove that every layer still holds the complete attention span its kind
+    /// requires at [`Self::position`].
+    ///
+    /// Position monotonicity is not enough: a windowed cache that accidentally
+    /// drops one extra row has a smaller `base + len`, so the guard before the
+    /// next append becomes easier to satisfy while that layer attends over too
+    /// little context forever.  The exact local invariant is therefore
+    /// `len = min(position, window)` and `base = position - len`.  Global
+    /// layers are the same statement with an unbounded window: `len = position`
+    /// and `base = 0`.
+    ///
+    /// Returns the number of local layers checked, which lets a serving seam
+    /// report that the model's windowed majority actually participated in the
+    /// proof rather than merely saying that an empty loop succeeded.
+    pub fn validate_cache_completeness(&self) -> Result<usize> {
+        anyhow::ensure!(
+            !self.torn,
+            "a torn Session cannot make a claim about cache completeness"
+        );
+        if self.pos == 0 {
+            anyhow::ensure!(
+                self.caches.is_empty(),
+                "position 0 has {} layer cache(s)",
+                self.caches.len()
+            );
+            return Ok(0);
+        }
+        anyhow::ensure!(
+            self.caches.len() == self.hi - self.lo,
+            "{} caches for {} layers at position {}",
+            self.caches.len(),
+            self.hi - self.lo,
+            self.pos
+        );
+
+        let t = &self.cfg.text_config;
+        let mut local_layers = 0usize;
+        for layer in self.lo..self.hi {
+            let cache = &self.caches[layer - self.lo].attn;
+            let kind = t.attn_kind(layer);
+            local_layers += usize::from(kind == AttnKind::Local);
+            let (expected_base, expected_len) =
+                required_cache_span(kind, self.pos, t.sliding_window_size);
+            anyhow::ensure!(
+                cache.len() == expected_len && cache.base() == expected_base,
+                "layer {layer} {:?} cache is base {} + len {} at position {}, expected base \
+                 {expected_base} + len {expected_len}",
+                kind,
+                cache.base(),
+                cache.len(),
+                self.pos
+            );
+        }
+        Ok(local_layers)
     }
 }
 
@@ -1070,7 +1137,10 @@ impl Session {
         // out of the loop below leaves the stack half advanced, which no
         // caller can detect and none should have to; poison the session and
         // name the two ways out.
-        let out = self.forward_pass(ids);
+        let out = self.forward_pass(ids).and_then(|token| {
+            self.validate_cache_completeness()?;
+            Ok(token)
+        });
         if out.is_err() {
             self.torn = true;
         }
@@ -1371,6 +1441,22 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_cache_span_is_exact_on_both_sides_of_the_window() {
+        assert_eq!(required_cache_span(AttnKind::Local, 0, 512), (0, 0));
+        assert_eq!(required_cache_span(AttnKind::Local, 511, 512), (0, 511));
+        assert_eq!(required_cache_span(AttnKind::Local, 512, 512), (0, 512));
+        assert_eq!(required_cache_span(AttnKind::Local, 513, 512), (1, 512));
+        assert_eq!(
+            required_cache_span(AttnKind::Local, 19_175, 512),
+            (18_663, 512)
+        );
+        assert_eq!(
+            required_cache_span(AttnKind::Global, 19_175, 512),
+            (0, 19_175)
+        );
+    }
 
     /// The layer-range rules are arithmetic and testable without a GPU: they are
     /// the difference between a run and a disk benchmark.
