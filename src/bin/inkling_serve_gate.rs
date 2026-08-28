@@ -305,7 +305,7 @@ fn run_drive(
 
     let client = serve_client(o)?;
     let partial = client.ready().partial;
-    let mind = InklingMind::new_gate(client, tokens, Some(o.system.clone()));
+    let mind = InklingMind::new_gate(client, tokens, Some(o.system.clone()))?;
     let voice_slot = mind.voice_slot();
     let log = mind.log().expect("the finite gate retains turn evidence");
     let proofs = mind

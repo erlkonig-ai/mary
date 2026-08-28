@@ -63,4 +63,11 @@ pub mod inkling {
     #[cfg(feature = "serve")]
     #[path = "serve.rs"]
     pub mod serve;
+
+    // Native READY/TurnEnd evidence for the GPU-free Drive client. Keep this in
+    // the same reconstructed module as `serve`, since `drive-mind` deliberately
+    // does not pull the CUDA model implementation onto the host.
+    #[cfg(feature = "drive-mind")]
+    #[path = "telemetry.rs"]
+    pub mod telemetry;
 }

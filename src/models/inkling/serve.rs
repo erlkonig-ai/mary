@@ -3142,6 +3142,10 @@ pub struct InklingMind {
     needs_generation_prompt: bool,
     turns: usize,
     label: String,
+    /// Native READY/TurnEnd evidence waiting for Drive to attach to the
+    /// causative session or turn. This is a one-slot exhaust accumulator, not a
+    /// report log: Drive drains it immediately through `Mind::take_exhaust`.
+    pending_exhaust: triblespace::prelude::Fragment,
     /// Per-turn gate evidence. A resident run leaves both sinks absent: an
     /// unbounded conversation must not quietly retain one report per turn just
     /// because the finite correctness gate wants to print them afterward.
@@ -3220,7 +3224,11 @@ impl InklingMind {
     ///
     /// Per-turn evidence belongs in Drive's ledger and optional telemetry. This
     /// constructor therefore retains no private report vector.
-    pub fn new(client: ServeClient, max_response_tokens: usize, system: Option<String>) -> Self {
+    pub fn new(
+        client: ServeClient,
+        max_response_tokens: usize,
+        system: Option<String>,
+    ) -> Result<Self> {
         Self::with_gate_evidence(client, max_response_tokens, system, false)
     }
 
@@ -3233,16 +3241,33 @@ impl InklingMind {
         client: ServeClient,
         max_response_tokens: usize,
         system: Option<String>,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::with_gate_evidence(client, max_response_tokens, system, true)
     }
 
     fn with_gate_evidence(
-        client: ServeClient,
+        mut client: ServeClient,
         max_response_tokens: usize,
         system: Option<String>,
         retain_gate_evidence: bool,
-    ) -> Self {
+    ) -> Result<Self> {
+        // This is also the validation boundary for the identities that the
+        // single-rank client previously accepted as arbitrary strings. Paired
+        // READY already checks them, but both paths now fail explicitly before
+        // a mind exists rather than panic or omit malformed native evidence.
+        let pending_exhaust = match super::telemetry::ready_fragment(client.ready()) {
+            Ok(fragment) => fragment,
+            Err(error) => {
+                if let Err(teardown) =
+                    client.shutdown_with_timeout(ServeClient::DEFAULT_SHUTDOWN_TIMEOUT)
+                {
+                    return Err(error.context(format!(
+                        "serving-process teardown after invalid READY also failed: {teardown:#}"
+                    )));
+                }
+                return Err(error);
+            }
+        };
         let label = match client.ready().partial {
             true => "inkling(partial)".to_string(),
             false => "inkling".to_string(),
@@ -3252,7 +3277,7 @@ impl InklingMind {
             retain_gate_evidence.then(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
         let proofs =
             retain_gate_evidence.then(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
-        Self {
+        Ok(Self {
             client,
             context_epoch: 0,
             position: None,
@@ -3269,9 +3294,10 @@ impl InklingMind {
             needs_generation_prompt: false,
             turns: 0,
             label,
+            pending_exhaust,
             log,
             proofs,
-        }
+        })
     }
 
     /// Check `stop_requested` between one-token collectives.
@@ -3632,6 +3658,13 @@ impl drive::mind::Mind for InklingMind {
     fn label(&self) -> &str {
         &self.label
     }
+
+    fn take_exhaust(&mut self) -> triblespace::prelude::Fragment {
+        std::mem::replace(
+            &mut self.pending_exhaust,
+            triblespace::prelude::Fragment::empty(),
+        )
+    }
 }
 
 #[cfg(feature = "drive-mind")]
@@ -3793,6 +3826,7 @@ impl InklingMind {
             Err(error) => return Err(FailedTurn { error, said }),
         };
         self.position = Some(end.position);
+        self.pending_exhaust += super::telemetry::turn_end_fragment(&end);
         let records_at_end = voice.as_ref().map(|v| v.report().records).unwrap_or(0);
         if let Some(proofs) = &self.proofs {
             proofs.lock().expect("proof log").push(StreamProof {
@@ -5315,7 +5349,8 @@ cat >"$3"
     fn pending_context_preview_is_typed_and_does_not_mutate_mind_state() {
         let (client, child, response_path, capture_path) =
             spawn_shutdown_fixture("pending-context-preview", false);
-        let mut mind = InklingMind::new(client, 8, Some("system".to_string()));
+        let mut mind =
+            InklingMind::new(client, 8, Some("system".to_string())).expect("valid READY evidence");
 
         assert_eq!(
             mind.pending_context(&[]).unwrap(),
@@ -5530,7 +5565,8 @@ exec cat >/dev/null
         let child = client.child.clone();
         assert!(child.try_wait().expect("poll fixture").is_none());
 
-        let mut mind = InklingMind::new(client, max_tokens, Some(system.to_string()));
+        let mut mind = InklingMind::new(client, max_tokens, Some(system.to_string()))
+            .expect("valid READY evidence");
         assert!(mind.log().is_none(), "resident minds retain no turn log");
         assert!(
             mind.proofs().is_none(),
@@ -5622,9 +5658,16 @@ exec cat >/dev/null
 
         let (client, child, response_path, capture_path) =
             spawn_token_sequence_fixture("semantic-response", &ready, &sequence);
-        let mut mind = InklingMind::new(client, sequence.len(), Some("system".to_string()));
+        let mut mind = InklingMind::new(client, sequence.len(), Some("system".to_string()))
+            .expect("valid READY evidence");
+        let startup = mind.take_exhaust();
+        assert_eq!(startup.exports().count(), 1, "READY has one exported root");
+        assert_eq!(mind.take_exhaust(), triblespace::prelude::Fragment::empty());
 
         let turn = mind.observe(drive::world::MergedView::EMPTY);
+        let sample = mind.take_exhaust();
+        assert_eq!(sample.exports().count(), 1, "TurnEnd has one exported root");
+        assert_eq!(mind.take_exhaust(), triblespace::prelude::Fragment::empty());
 
         let expected_reasoning = "x".repeat(64);
         assert_eq!(turn.response_state, ResponseState::Complete);
@@ -5675,7 +5718,8 @@ exec cat >/dev/null
         ];
         let (client, child, response_path, capture_path) =
             spawn_token_sequence_fixture("response-cap", &ready, &sequence);
-        let mut mind = InklingMind::new(client, sequence.len(), Some("system".to_string()));
+        let mut mind = InklingMind::new(client, sequence.len(), Some("system".to_string()))
+            .expect("valid READY evidence");
 
         let turn = mind.observe(drive::world::MergedView::EMPTY);
 
@@ -5723,6 +5767,7 @@ exec cat >/dev/null
         let checks = std::sync::Arc::new(AtomicUsize::new(0));
         let observed_checks = std::sync::Arc::clone(&checks);
         let mut mind = InklingMind::new(client, 32, Some("system".to_string()))
+            .expect("valid READY evidence")
             .with_cancellation(move || observed_checks.fetch_add(1, Ordering::SeqCst) >= 1);
 
         let turn = mind.observe(drive::world::MergedView::EMPTY);
@@ -5849,7 +5894,8 @@ exec cat >/dev/null
             .arg(&capture_path);
         let client = ServeClient::spawn(&mut command).expect("spawn fake serving process");
         let child = client.child.clone();
-        let mut mind = InklingMind::new_gate(client, 32, Some("old system".to_string()));
+        let mut mind = InklingMind::new_gate(client, 32, Some("old system".to_string()))
+            .expect("valid READY evidence");
         mind.initialized = true;
         mind.needs_generation_prompt = true;
         mind.position = Some(123);
@@ -5963,7 +6009,8 @@ exec cat >/dev/null
             .arg(&capture_path);
         let client = ServeClient::spawn(&mut command).expect("spawn fake serving process");
         let child = client.child.clone();
-        let mut mind = InklingMind::new_gate(client, 32, Some("system".to_string()));
+        let mut mind = InklingMind::new_gate(client, 32, Some("system".to_string()))
+            .expect("valid READY evidence");
         assert_eq!(
             mind.reasoning_provenance(),
             drive::reason::ReasoningProvenance::Provider

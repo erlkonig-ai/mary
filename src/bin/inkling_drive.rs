@@ -393,7 +393,7 @@ fn run(options: Options) -> Result<()> {
         options.serve_args.len(),
     );
     let client = ServeClient::spawn(&mut serve).context("start the Inkling serving process")?;
-    let mind = InklingMind::new(client, max_response_tokens, Some(options.system.clone()))
+    let mind = InklingMind::new(client, max_response_tokens, Some(options.system.clone()))?
         .with_cancellation(|| SIGINT_STOP.load(Ordering::Relaxed));
     // Validate after the client is owned by InklingMind: every refusal below
     // therefore takes the same bounded shutdown/reap path as a completed run.

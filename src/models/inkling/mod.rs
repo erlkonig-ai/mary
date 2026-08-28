@@ -127,6 +127,11 @@ pub mod session;
 // lane; see the shim in `models/mod.rs`.
 #[cfg(feature = "serve")]
 pub mod serve;
+// Durable observability is native graph exhaust. The serving wire remains free
+// to use JSON framing, but a resident Drive mind drains these typed facts after
+// startup and after every turn; there is no separate export lifecycle.
+#[cfg(feature = "drive-mind")]
+pub mod telemetry;
 
 pub use config::InklingConfig;
 // Layer 2's experts are BF16 and have no scales; the same tiling, the same
