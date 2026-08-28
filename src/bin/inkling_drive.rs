@@ -52,7 +52,6 @@ OPTIONAL FACULTIES:
     --no-telemetry          Do not write turn telemetry
     --memory-pile <path>    Durable self pile whose cover is injected at wake
     --memory-bin <path>     Memory faculty (default: memory on PATH)
-    --context-window <n>    Context window in tokens (default: 200000)
     --max-output <n>        Hard tokens per response and output reservation
                             (default: 8192)
     --context-margin <n>    Additional reserved tokens (default: 4096)
@@ -60,7 +59,9 @@ OPTIONAL FACULTIES:
 
 The runner adds no command allowlist or host-exec escape hatch. Sandbox policy
 is exactly the selected playground backend plus the explicitly supplied
---backend-arg values.
+--backend-arg values. The serving process's READY context budget is also the
+single capacity used to size Drive's memory cover; there is no second runner
+window to keep in sync.
 "
 }
 
@@ -167,11 +168,6 @@ impl Options {
                 "--memory-bin" => {
                     options.memory_bin = PathBuf::from(next(&mut index, "--memory-bin")?);
                 }
-                "--context-window" => {
-                    options.budget.context_window_tokens = next(&mut index, "--context-window")?
-                        .parse()
-                        .context("--context-window takes tokens")?;
-                }
                 "--max-output" => {
                     options.budget.max_output_tokens = next(&mut index, "--max-output")?
                         .parse()
@@ -248,7 +244,7 @@ impl Options {
         command
     }
 
-    fn shell_config(&self) -> ShellConfig {
+    fn shell_config(&self, context_window_tokens: u64) -> ShellConfig {
         let voice = self.voice.as_ref().map(|program| FacultyCommand {
             program: program.clone(),
             args: self.voice_args.clone(),
@@ -261,7 +257,10 @@ impl Options {
         let memory = self.memory_pile.as_ref().map(|pile| MemoryConfig {
             binary: self.memory_bin.clone(),
             pile: pile.clone(),
-            budget: self.budget,
+            budget: ModelBudget {
+                context_window_tokens,
+                ..self.budget
+            },
         });
         ShellConfig {
             pile: PileConfig {
@@ -413,7 +412,9 @@ fn run(options: Options) -> Result<()> {
     );
 
     let voice_slot = mind.voice_slot();
-    let shell_config = options.shell_config();
+    let context_window_tokens = u64::try_from(mind.ready().context_budget)
+        .context("the serving process context budget does not fit Drive's token budget")?;
+    let shell_config = options.shell_config(context_window_tokens);
     eprintln!(
         "inkling_drive: opening scratch ledger {} and sandbox {} mcp --backend {}",
         shell_config.pile.path.display(),
@@ -545,8 +546,6 @@ mod tests {
             "/data/self.pile",
             "--memory-bin",
             "/bin/memory",
-            "--context-window",
-            "131072",
             "--max-output",
             "4096",
             "--context-margin",
@@ -563,7 +562,7 @@ mod tests {
             ["--rank0-program", "/rank0"]
         );
 
-        let config = options.shell_config();
+        let config = options.shell_config(131_072);
         assert_eq!(config.exec.playground_bin, PathBuf::from("playground"));
         assert_eq!(config.exec.backend, "jail");
         assert_eq!(config.exec.extra_args, ["--jail-local"]);
@@ -586,7 +585,7 @@ mod tests {
     #[test]
     fn default_composition_adds_no_backend_policy_or_permission() {
         let options = Options::parse(&minimum(&[])).unwrap();
-        let config = options.shell_config();
+        let config = options.shell_config(65_536);
         assert_eq!(config.exec.backend, "lima");
         assert!(config.exec.extra_args.is_empty());
         assert_eq!(config.exec.tenant, "default");
@@ -606,6 +605,7 @@ mod tests {
             vec!["--no-telemetry", "--telemetry-pile", "/tmp/turns"],
             vec!["--exec-timeout", "0"],
             vec!["--max-output", "0"],
+            vec!["--context-window", "131072"],
             vec!["--gen", "64"],
         ] {
             Options::parse(&minimum(&extra)).expect_err("contradiction must refuse");
