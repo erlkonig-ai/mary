@@ -2800,9 +2800,11 @@ pub struct InklingMind {
     needs_generation_prompt: bool,
     turns: usize,
     label: String,
-    /// Per-turn numbers, shared so the caller can report them after the run.
-    log: std::sync::Arc<std::sync::Mutex<Vec<TurnEnd>>>,
-    proofs: std::sync::Arc<std::sync::Mutex<Vec<StreamProof>>>,
+    /// Per-turn gate evidence. A resident run leaves both sinks absent: an
+    /// unbounded conversation must not quietly retain one report per turn just
+    /// because the finite correctness gate wants to print them afterward.
+    log: Option<std::sync::Arc<std::sync::Mutex<Vec<TurnEnd>>>>,
+    proofs: Option<std::sync::Arc<std::sync::Mutex<Vec<StreamProof>>>>,
 }
 
 /// A consultation that failed after producing zero or more final text bytes.
@@ -2863,13 +2865,38 @@ fn text_result_delta(
 
 #[cfg(feature = "drive-mind")]
 impl InklingMind {
-    /// Wrap a running serving process as a mind.
+    /// Wrap a running serving process as a potentially unbounded resident mind.
+    ///
+    /// Per-turn evidence belongs in Drive's ledger and optional telemetry. This
+    /// constructor therefore retains no private report vector.
     pub fn new(client: ServeClient, max_tokens: usize, system: Option<String>) -> Self {
+        Self::with_gate_evidence(client, max_tokens, system, false)
+    }
+
+    /// Wrap a running serving process for a finite measurement gate.
+    ///
+    /// This deliberately retains a [`TurnEnd`] and [`StreamProof`] per turn so
+    /// the gate can report them after its bounded run. Resident callers should
+    /// use [`Self::new`].
+    pub fn new_gate(client: ServeClient, max_tokens: usize, system: Option<String>) -> Self {
+        Self::with_gate_evidence(client, max_tokens, system, true)
+    }
+
+    fn with_gate_evidence(
+        client: ServeClient,
+        max_tokens: usize,
+        system: Option<String>,
+        retain_gate_evidence: bool,
+    ) -> Self {
         let label = match client.ready().partial {
             true => "inkling(partial)".to_string(),
             false => "inkling".to_string(),
         };
         let output = NativeOutputParser::new(client.ready().special_ids.clone());
+        let log =
+            retain_gate_evidence.then(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let proofs =
+            retain_gate_evidence.then(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
         Self {
             client,
             voice: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -2884,8 +2911,8 @@ impl InklingMind {
             needs_generation_prompt: false,
             turns: 0,
             label,
-            log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            proofs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            log,
+            proofs,
         }
     }
 
@@ -2900,13 +2927,13 @@ impl InklingMind {
     }
 
     /// Per-turn numbers, as the serving process measured them.
-    pub fn log(&self) -> std::sync::Arc<std::sync::Mutex<Vec<TurnEnd>>> {
-        std::sync::Arc::clone(&self.log)
+    pub fn log(&self) -> Option<std::sync::Arc<std::sync::Mutex<Vec<TurnEnd>>>> {
+        self.log.as_ref().map(std::sync::Arc::clone)
     }
 
     /// What each turn proved about streaming.
-    pub fn proofs(&self) -> std::sync::Arc<std::sync::Mutex<Vec<StreamProof>>> {
-        std::sync::Arc::clone(&self.proofs)
+    pub fn proofs(&self) -> Option<std::sync::Arc<std::sync::Mutex<Vec<StreamProof>>>> {
+        self.proofs.as_ref().map(std::sync::Arc::clone)
     }
 
     /// What loaded on the far end.
@@ -3179,13 +3206,17 @@ impl InklingMind {
             Err(error) => return Err(FailedTurn { error, said }),
         };
         let records_at_end = voice.as_ref().map(|v| v.report().records).unwrap_or(0);
-        self.proofs.lock().expect("proof log").push(StreamProof {
-            turn,
-            tokens,
-            tokens_at_first_return,
-            records_at_end,
-        });
-        self.log.lock().expect("turn log").push(end);
+        if let Some(proofs) = &self.proofs {
+            proofs.lock().expect("proof log").push(StreamProof {
+                turn,
+                tokens,
+                tokens_at_first_return,
+                records_at_end,
+            });
+        }
+        if let Some(log) = &self.log {
+            log.lock().expect("turn log").push(end);
+        }
         self.turns += 1;
 
         let mut reasoning = thinking_this_turn;
@@ -4396,6 +4427,11 @@ exec cat >/dev/null
         assert!(child.try_wait().expect("poll fixture").is_none());
 
         let mut mind = InklingMind::new(client, max_tokens, Some(system.to_string()));
+        assert!(mind.log().is_none(), "resident minds retain no turn log");
+        assert!(
+            mind.proofs().is_none(),
+            "resident minds retain no streaming-proof log"
+        );
         let events = [
             drive::world::Event::monologue(1, "prior "),
             drive::world::Event::text_result(2, "cmd", "output"),
@@ -4536,7 +4572,7 @@ exec cat >/dev/null
             .arg(&capture_path);
         let client = ServeClient::spawn(&mut command).expect("spawn fake serving process");
         let child = client.child.clone();
-        let mut mind = InklingMind::new(client, 32, Some("system".to_string()));
+        let mut mind = InklingMind::new_gate(client, 32, Some("system".to_string()));
         assert_eq!(
             mind.reasoning_provenance(),
             drive::reason::ReasoningProvenance::Provider
@@ -4560,7 +4596,15 @@ exec cat >/dev/null
             turn.decision.reasoning.as_deref(),
             Some("checked exact bytes")
         );
-        assert_eq!(mind.log().lock().expect("turn log")[0].token_ids.len(), 9);
+        assert_eq!(
+            mind.log()
+                .expect("finite fixture retains turn evidence")
+                .lock()
+                .expect("turn log")[0]
+                .token_ids
+                .len(),
+            9
+        );
 
         drop(mind);
         assert!(

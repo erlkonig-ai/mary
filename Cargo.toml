@@ -1130,3 +1130,9 @@ required-features = ["serve"]
 [[bin]]
 name = "inkling_serve_gate"
 required-features = ["drive-mind"]
+
+# The resident foreground: one long-lived Inkling serving process (normally the
+# TP pair) owned by one Drive shell. GPU-free itself; the serve child owns CUDA.
+[[bin]]
+name = "inkling_drive"
+required-features = ["drive-mind"]

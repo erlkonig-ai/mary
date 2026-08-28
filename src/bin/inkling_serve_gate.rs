@@ -329,10 +329,12 @@ fn run_drive(
     let client = serve_client(o)?;
     let ready = client.ready().clone();
     let partial = ready.partial;
-    let mind = InklingMind::new(client, tokens, Some(o.system.clone()));
+    let mind = InklingMind::new_gate(client, tokens, Some(o.system.clone()));
     let voice_slot = mind.voice_slot();
-    let log = mind.log();
-    let proofs = mind.proofs();
+    let log = mind.log().expect("the finite gate retains turn evidence");
+    let proofs = mind
+        .proofs()
+        .expect("the finite gate retains streaming evidence");
 
     let config = drive::shell::ShellConfig {
         pile: drive::config::PileConfig { path: pile.clone() },
