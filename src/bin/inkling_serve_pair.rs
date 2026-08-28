@@ -581,8 +581,9 @@ fn run() -> Result<()> {
                 // fragments already emitted. Preserve those as partial speech
                 // and let dropping `output` write ABORTED on pair failure.
                 let end = pair.consult(&consult, |text| output.text(text))?;
-                // Token ids are rank-internal agreement evidence. Omitting the
-                // empty field preserves the historical downstream TURN shape.
+                // The pair already proved both ranks produced these exact ids.
+                // Keep that evidence on the downstream record so a caller can
+                // compare continuity across independent serving sessions.
                 let payload = downstream_turn_payload(end)?;
                 output.record_as(TURN_TYPE, &payload, payload.len() as u64)?;
             }
@@ -612,8 +613,7 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-fn downstream_turn_payload(mut end: mary::models::inkling::serve::TurnEnd) -> Result<Vec<u8>> {
-    end.token_ids.clear();
+fn downstream_turn_payload(end: mary::models::inkling::serve::TurnEnd) -> Result<Vec<u8>> {
     serde_json::to_vec(&end).context("encode the downstream TURN record")
 }
 
@@ -661,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn downstream_turn_shape_does_not_expose_rank_token_ids() {
+    fn downstream_turn_preserves_arbitrated_token_ids() {
         let end = TurnEnd {
             turn: 0,
             tokens: 2,
@@ -675,7 +675,7 @@ mod tests {
         };
         let payload = downstream_turn_payload(end).expect("payload");
         let json: serde_json::Value = serde_json::from_slice(&payload).expect("json");
-        assert!(json.get("token_ids").is_none());
+        assert_eq!(json["token_ids"], serde_json::json!([41, 42]));
         assert_eq!(json["tokens"], 2);
     }
 

@@ -288,6 +288,8 @@ fn run() -> Result<()> {
     // while an explicit --context-budget opts into bounded-width chunking of a
     // longer logical sequence.
     config.context_budget = options.context_budget.unwrap_or(config.prefill_budget);
+    let prefill_budget = config.prefill_budget;
+    let context_budget = config.context_budget;
     let loaded = std::time::Instant::now();
     let mut session = match options.tensor_parallel {
         None => Session::load(config).context("load the model")?,
@@ -331,6 +333,8 @@ fn run() -> Result<()> {
         stack: session.config().text_config.num_hidden_layers,
         partial: session.is_partial_stack(),
         vocab: session.config().text_config.effective_vocab(),
+        prefill_budget,
+        context_budget,
         load_secs,
     };
     eprintln!(

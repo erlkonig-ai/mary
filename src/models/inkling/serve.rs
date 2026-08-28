@@ -275,6 +275,10 @@ pub struct Ready {
     pub partial: bool,
     /// Effective vocabulary width the head is sliced to.
     pub vocab: usize,
+    /// Maximum token rows one prefill pass processes at once.
+    pub prefill_budget: usize,
+    /// Maximum positions the session may retain across all turns.
+    pub context_budget: usize,
     /// Wall-clock seconds `Session::load` took. The number a serving process
     /// exists to pay ONCE.
     pub load_secs: f64,
@@ -312,8 +316,8 @@ pub struct TurnEnd {
     /// A tensor-parallel pair compares these before it accepts a turn. Text is
     /// also compared fragment by fragment for streaming, but two different
     /// byte-level tokens can decode to the same text; ids are the unambiguous
-    /// agreement signal. The paired downstream proxy clears this field before
-    /// forwarding the historical `inkling_serve` turn shape.
+    /// agreement signal. A paired proxy forwards the already-arbitrated ids so
+    /// an end-to-end gate can compare continuations across session boundaries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub token_ids: Vec<u32>,
     /// Tokens of DELTA this turn attended to before generating — the new
@@ -339,8 +343,10 @@ pub struct TurnEnd {
     /// clients may measure their own wall clock around [`ServeClient::consult`]
     /// when those costs matter. On turn 0 this is the prompt's prefill; on every
     /// turn after it, it is what the KV cache saves. THE framing rule: seconds
-    /// per FIRST TOKEN OF A TURN, on one box, over the layer range in
-    /// [`Ready::layers`] — not per token and not per turn.
+    /// per FIRST TOKEN OF A TURN, over the layer range in [`Ready::layers`] —
+    /// not per token and not per turn. A single server reports its rank-local
+    /// wall clock; a paired proxy reports the slower rank, the distributed
+    /// critical path.
     pub first_token_secs: f64,
     /// Seconds for the whole turn, `Session` calls only.
     pub turn_secs: f64,
@@ -1390,6 +1396,16 @@ impl Drop for ServePair {
 fn compatible_ready(rank0: &Ready, rank1: &Ready) -> Result<Ready> {
     for (rank, ready) in [(0usize, rank0), (1usize, rank1)] {
         anyhow::ensure!(ready.stack > 0, "rank {rank} announced an empty stack");
+        anyhow::ensure!(
+            ready.prefill_budget > 0,
+            "rank {rank} announced a zero-token prefill budget"
+        );
+        anyhow::ensure!(
+            ready.prefill_budget <= ready.context_budget,
+            "rank {rank} announced a {}-token prefill budget wider than its {}-token context budget",
+            ready.prefill_budget,
+            ready.context_budget
+        );
         for (name, identity) in [
             ("model", ready.model_identity.as_str()),
             ("tokenizer", ready.tokenizer_identity.as_str()),
@@ -1434,6 +1450,18 @@ fn compatible_ready(rank0: &Ready, rank1: &Ready) -> Result<Ready> {
         rank0.tokenizer_identity,
         rank1.tokenizer_identity
     );
+    anyhow::ensure!(
+        rank0.prefill_budget == rank1.prefill_budget,
+        "rank READY prefill budget mismatch: {} vs {}",
+        rank0.prefill_budget,
+        rank1.prefill_budget
+    );
+    anyhow::ensure!(
+        rank0.context_budget == rank1.context_budget,
+        "rank READY context budget mismatch: {} vs {}",
+        rank0.context_budget,
+        rank1.context_budget
+    );
     Ok(Ready {
         pile: rank0.pile.clone(),
         model_identity: rank0.model_identity.clone(),
@@ -1442,6 +1470,8 @@ fn compatible_ready(rank0: &Ready, rank1: &Ready) -> Result<Ready> {
         stack: rank0.stack,
         partial: false,
         vocab: rank0.vocab,
+        prefill_budget: rank0.prefill_budget,
+        context_budget: rank0.context_budget,
         load_secs: rank0.load_secs.max(rank1.load_secs),
     })
 }
@@ -1552,10 +1582,16 @@ fn broker_rank_streams(
                         })?;
                     confirmed_extent += left.len() as u64;
                 }
-                (RankPart::End(left), RankPart::End(right)) => {
+                (RankPart::End(mut left), RankPart::End(right)) => {
                     compare_turn_ends(&left, &right).map_err(|message| {
                         ServePairError::new(ServePairFailure::Divergence, confirmed_extent, message)
                     })?;
+                    // The pair is one distributed computation. State must
+                    // agree exactly, while elapsed time is a rank-local
+                    // observation; its honest critical path is the slower
+                    // rank, not whichever rank happens to be numbered zero.
+                    left.first_token_secs = left.first_token_secs.max(right.first_token_secs);
+                    left.turn_secs = left.turn_secs.max(right.turn_secs);
                     return Ok(left);
                 }
                 (RankPart::Text(_), RankPart::End(_)) => {
@@ -2137,6 +2173,8 @@ mod tests {
             stack: 42,
             partial: false,
             vocab: 200_058,
+            prefill_budget: 4096,
+            context_budget: 65_536,
             load_secs: 1.0,
         }
     }
@@ -2272,6 +2310,20 @@ cat >"$3"
         right.tokenizer_identity = "44".repeat(32);
         let error = compatible_ready(&left, &right).expect_err("different tokenizer bytes");
         assert!(error.to_string().contains("tokenizer identity mismatch"));
+    }
+
+    #[test]
+    fn pair_compatibility_refuses_resource_budget_mismatch() {
+        let left = fake_ready("left");
+        let mut right = left.clone();
+        right.prefill_budget /= 2;
+        let error = compatible_ready(&left, &right).expect_err("different prefill budgets");
+        assert!(error.to_string().contains("prefill budget mismatch"));
+
+        let mut right = left.clone();
+        right.context_budget /= 2;
+        let error = compatible_ready(&left, &right).expect_err("different context budgets");
+        assert!(error.to_string().contains("context budget mismatch"));
     }
 
     #[cfg(all(feature = "drive-mind", unix))]
@@ -2467,8 +2519,14 @@ exec cat >/dev/null
         send.send(RankEvent::text(0, " two")).unwrap();
         send.send(RankEvent::text(1, "one")).unwrap();
         send.send(RankEvent::text(1, " two")).unwrap();
-        send.send(RankEvent::end(0, fake_end(&[41, 42]))).unwrap();
-        send.send(RankEvent::end(1, fake_end(&[41, 42]))).unwrap();
+        let mut rank0 = fake_end(&[41, 42]);
+        rank0.first_token_secs = 0.03;
+        rank0.turn_secs = 0.07;
+        let mut rank1 = fake_end(&[41, 42]);
+        rank1.first_token_secs = 0.05;
+        rank1.turn_secs = 0.06;
+        send.send(RankEvent::end(0, rank0)).unwrap();
+        send.send(RankEvent::end(1, rank1)).unwrap();
         drop(send);
         let mut streamed = Vec::new();
         let end = broker_rank_streams(receive, 4, &mut |text| {
@@ -2478,6 +2536,8 @@ exec cat >/dev/null
         .expect("matching streams");
         assert_eq!(streamed, ["one", " two"]);
         assert_eq!(end.token_ids, [41, 42]);
+        assert_eq!(end.first_token_secs, 0.05);
+        assert_eq!(end.turn_secs, 0.07);
     }
 
     #[test]
