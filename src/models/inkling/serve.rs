@@ -861,6 +861,13 @@ pub struct NativeExecCall {
 }
 
 /// Content emitted by one generated token after structural parsing.
+///
+/// Archive currently preserves the channel and exact per-slice bytes, but
+/// Drive's split `said`/`Decision::reasoning` turn shape cannot retain an
+/// arbitrary alternation of several thinking and text blocks within one slice.
+/// The clean follow-up is an ordered, provider-neutral emitted-part sequence on
+/// `Turn`, populated here from parser transitions and staged verbatim. It must
+/// not be replaced by a second accumulated-response string.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct NativeTokenDelta {
     /// User-visible model text. Only `content_text` contributes here.
@@ -2799,9 +2806,6 @@ pub struct InklingMind {
     /// Typed generated-output parser, retained when a Drive turn's token slice
     /// ends before the model's logical response does.
     output: NativeOutputParser,
-    /// Provider reasoning accumulated across Drive token slices for the
-    /// current logical assistant response.
-    response_thinking: String,
     /// The native call already present in the model's retained sequence and
     /// awaiting Drive's result. Exact command matching prevents both duplicate
     /// historical-call insertion and a result being attached to the wrong act.
@@ -2918,7 +2922,6 @@ impl InklingMind {
             system,
             initialized: false,
             output,
-            response_thinking: String::new(),
             outstanding_exec: None,
             needs_generation_prompt: false,
             turns: 0,
@@ -3192,7 +3195,6 @@ impl InklingMind {
             tokens += 1;
             said.push_str(&delta.text);
             thinking_this_turn.push_str(&delta.thinking);
-            self.response_thinking.push_str(&delta.thinking);
             if !delta.text.is_empty() {
                 if let Some(voice) = &voice {
                     if let Err(error) = voice.say(&delta.text) {
@@ -3231,13 +3233,17 @@ impl InklingMind {
         }
         self.turns += 1;
 
-        let mut reasoning = thinking_this_turn;
+        // A Drive turn is an archival slice, not a snapshot of the logical
+        // response accumulated so far. Keep only the provider reasoning bytes
+        // this slice emitted. `ResponseState::{Open, Complete, Interrupted}`
+        // supplies the lossless grouping boundary; concatenating THINKING
+        // parts within that boundary reconstructs the response exactly once.
+        let reasoning = thinking_this_turn;
         let mut decision = if completed {
             let call = match self.output.take_completed_call() {
                 Ok(call) => call,
                 Err(error) => return Err(FailedTurn { error, said }),
             };
-            reasoning = std::mem::take(&mut self.response_thinking);
             match call {
                 Some(call) => {
                     let fresh_base = self.buffer.end_offset();
@@ -4529,6 +4535,109 @@ exec cat >/dev/null
             .expect("poll failed fixture after mind drop")
             .expect("InklingMind::drop must reap the killed fixture");
         assert!(!status.success(), "observe must kill the live fixture");
+        let _ = std::fs::remove_file(response_path);
+        let _ = std::fs::remove_file(capture_path);
+    }
+
+    #[cfg(all(feature = "drive-mind", unix))]
+    #[test]
+    fn provider_reasoning_is_an_incremental_delta_across_drive_slices() {
+        use drive::mind::{Mind as _, ResponseState};
+
+        let ready = fake_ready("fixture.pile");
+        let ids = ready.special_ids.clone();
+        // Two tokens per Drive turn make one logical thinking response span
+        // three archival slices:
+        //
+        //   Open("alpha"), Open(" beta"), Complete("").
+        //
+        // The Complete slice used to repeat "alpha beta", even though the two
+        // Open slices had already made those exact provider bytes durable.
+        let sequence = vec![
+            (
+                ids.content_thinking,
+                special_fragment(&ids, ids.content_thinking, ""),
+            ),
+            (7, "alpha".to_string()),
+            (8, " beta".to_string()),
+            (ids.end_message, special_fragment(&ids, ids.end_message, "")),
+            (
+                ids.content_model_end_sampling,
+                special_fragment(&ids, ids.content_model_end_sampling, ""),
+            ),
+        ];
+
+        let response = SharedSink::default();
+        let mut writer = framed_stream::FramedWriter::open(response.clone(), CONTENT_TYPE, UNIT)
+            .expect("response preamble");
+        let ready_payload = serde_json::to_vec(&ready).expect("READY json");
+        writer
+            .record_as(READY_TYPE, &ready_payload, ready_payload.len() as u64)
+            .expect("READY record");
+        for (microturn, (id, fragment)) in sequence.iter().enumerate() {
+            writer.text(fragment).expect("token decoder fragment");
+            let mut end = fake_end(&[*id]);
+            end.turn = microturn;
+            if microturn > 0 {
+                end.delta_tokens = 0;
+                end.carried = 1;
+            }
+            if *id == ids.content_model_end_sampling {
+                end.stopped = "stop_token".to_string();
+            }
+            let payload = serde_json::to_vec(&end).expect("TURN json");
+            writer
+                .record_as(TURN_TYPE, &payload, payload.len() as u64)
+                .expect("TURN record");
+        }
+        writer
+            .finish(framed_stream::EndStatus::Complete)
+            .expect("complete response");
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let response_path =
+            std::env::temp_dir().join(format!("mary-sliced-thinking-response-{nonce}"));
+        let capture_path =
+            std::env::temp_dir().join(format!("mary-sliced-thinking-capture-{nonce}"));
+        std::fs::write(&response_path, response.bytes()).expect("write fake response");
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("cat \"$1\"; cat >\"$2\"")
+            .arg("fake-inkling")
+            .arg(&response_path)
+            .arg(&capture_path);
+        let client = ServeClient::spawn(&mut command).expect("spawn fake serving process");
+        let child = client.child.clone();
+        let mut mind = InklingMind::new(client, 2, Some("system".to_string()));
+
+        let first = mind.observe(drive::world::MergedView::EMPTY);
+        let second = mind.observe(drive::world::MergedView::EMPTY);
+        let third = mind.observe(drive::world::MergedView::EMPTY);
+
+        assert_eq!(first.response_state, ResponseState::Open);
+        assert_eq!(second.response_state, ResponseState::Open);
+        assert_eq!(third.response_state, ResponseState::Complete);
+        assert_eq!(first.decision.reasoning.as_deref(), Some("alpha"));
+        assert_eq!(second.decision.reasoning.as_deref(), Some(" beta"));
+        assert_eq!(third.decision.reasoning, None);
+        let reconstructed = [&first, &second, &third]
+            .into_iter()
+            .filter_map(|turn| turn.decision.reasoning.as_deref())
+            .collect::<String>();
+        assert_eq!(reconstructed, "alpha beta");
+
+        drop(mind);
+        assert!(
+            child
+                .try_wait()
+                .expect("poll fake server")
+                .expect("drop reaps fake server")
+                .success()
+        );
         let _ = std::fs::remove_file(response_path);
         let _ = std::fs::remove_file(capture_path);
     }
