@@ -346,6 +346,82 @@ pub struct ExecResultContext {
     pub content: String,
 }
 
+/// One ordered part of a completed historical model response.
+///
+/// Adjacent parts of the same textual kind are streaming slices of one model
+/// block. The codec concatenates them *before* content tokenization, so a
+/// response archived across several Drive turns reconstructs the same tokens
+/// as the unsliced response. An `Exec` part is instead a complete native call
+/// and is valid only as the final model part of a response.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InklingHistoryPart {
+    Thinking { content: String },
+    Text { content: String },
+    Exec { command: String },
+}
+
+/// One completed historical model response and its optional native result.
+///
+/// The parts retain model-channel order. A response either contains only text
+/// and thinking parts, or contains exactly one final `Exec` part followed by
+/// `tool_result`. This shape deliberately stores the command once: the result
+/// is structurally attached to that final call, so there is no second command
+/// string that can disagree with it.
+///
+/// The wire can retain arbitrary thinking/text alternation. Drive's current
+/// `Turn` cannot yet produce that full fidelity because it separates reasoning
+/// from speech instead of carrying one ordered emitted-part vector; callers
+/// must not infer an order from those two accumulated fields during rollover.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InklingHistoryResponse {
+    pub parts: Vec<InklingHistoryPart>,
+    pub tool_result: Option<String>,
+}
+
+impl InklingHistoryResponse {
+    /// Lift the former exec-result-only history into the ordered response
+    /// model without retaining a second compatibility representation.
+    pub fn exec(result: ExecResultContext) -> Self {
+        Self {
+            parts: vec![InklingHistoryPart::Exec {
+                command: result.command,
+            }],
+            tool_result: Some(result.content),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        let execs = self
+            .parts
+            .iter()
+            .filter(|part| matches!(part, InklingHistoryPart::Exec { .. }))
+            .count();
+        anyhow::ensure!(
+            execs <= 1,
+            "a historical response contains multiple exec calls"
+        );
+        let final_exec = matches!(self.parts.last(), Some(InklingHistoryPart::Exec { .. }));
+        anyhow::ensure!(
+            execs == 0 || final_exec,
+            "a historical exec call must be the response's final model part"
+        );
+        if final_exec {
+            anyhow::ensure!(
+                self.tool_result.is_some(),
+                "a completed historical exec response requires its tool result"
+            );
+        } else {
+            anyhow::ensure!(
+                self.tool_result.is_none(),
+                "a historical tool result has no final exec call"
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Typed context inserted into Inkling's retained conversation.
 ///
 /// Initialization is one batch because Drive's memory cover is already a
@@ -356,13 +432,14 @@ pub struct ExecResultContext {
 pub enum InklingContext {
     Initialize {
         system: String,
-        historical_exec_results: Vec<ExecResultContext>,
+        history: Vec<InklingHistoryResponse>,
     },
     /// Result of the native call already present in the retained KV sequence.
     ToolResult { result: ExecResultContext },
-    /// A result whose assistant call predates this live `InklingMind` (for
-    /// example a Drive memory-cover pair). Both sides are inserted.
-    HistoricalExecResult { result: ExecResultContext },
+    /// A complete response which predates this live `InklingMind` (for example
+    /// a Drive memory-cover response). Its model parts and optional result are
+    /// inserted together.
+    HistoricalResponse { response: InklingHistoryResponse },
     /// Start another autonomous assistant response after a completed text-only
     /// response. A tool result already carries this prompt itself.
     GenerationPrompt,
@@ -514,10 +591,7 @@ impl InklingContextCodec {
     pub fn encode(&self, context: &InklingContext) -> Result<Vec<usize>> {
         let mut ids = Vec::new();
         match context {
-            InklingContext::Initialize {
-                system,
-                historical_exec_results,
-            } => {
+            InklingContext::Initialize { system, history } => {
                 // Shipped template order: tool declaration, system message,
                 // default effort (immediately before the first non-system
                 // message, or as the all-system fallback), history, prompt.
@@ -537,8 +611,8 @@ impl InklingContextCodec {
                 self.push_content(&mut ids, DEFAULT_THINKING_EFFORT)?;
                 ids.push(self.special_ids.end_message as usize);
 
-                for result in historical_exec_results {
-                    self.push_historical_result(&mut ids, result)?;
+                for response in history {
+                    self.push_historical_response(&mut ids, response)?;
                 }
                 ids.push(self.special_ids.message_model as usize);
             }
@@ -546,8 +620,8 @@ impl InklingContextCodec {
                 self.push_tool_result(&mut ids, result)?;
                 ids.push(self.special_ids.message_model as usize);
             }
-            InklingContext::HistoricalExecResult { result } => {
-                self.push_historical_result(&mut ids, result)?;
+            InklingContext::HistoricalResponse { response } => {
+                self.push_historical_response(&mut ids, response)?;
                 ids.push(self.special_ids.message_model as usize);
             }
             InklingContext::GenerationPrompt => {
@@ -557,25 +631,73 @@ impl InklingContextCodec {
         Ok(ids)
     }
 
-    fn push_historical_result(
+    fn push_historical_response(
         &self,
         ids: &mut Vec<usize>,
-        result: &ExecResultContext,
+        response: &InklingHistoryResponse,
+    ) -> Result<()> {
+        response.validate()?;
+        let mut parts = response.parts.iter().peekable();
+        while let Some(part) = parts.next() {
+            match part {
+                InklingHistoryPart::Thinking { content } => {
+                    let mut content = content.clone();
+                    while let Some(InklingHistoryPart::Thinking { content: next }) = parts.peek() {
+                        content.push_str(next);
+                        parts.next();
+                    }
+                    self.push_historical_text_part(
+                        ids,
+                        self.special_ids.content_thinking,
+                        &content,
+                    )?;
+                }
+                InklingHistoryPart::Text { content } => {
+                    let mut content = content.clone();
+                    while let Some(InklingHistoryPart::Text { content: next }) = parts.peek() {
+                        content.push_str(next);
+                        parts.next();
+                    }
+                    self.push_historical_text_part(ids, self.special_ids.content_text, &content)?;
+                }
+                InklingHistoryPart::Exec { command } => {
+                    ids.push(self.special_ids.message_model as usize);
+                    self.push_content(ids, "exec")?;
+                    ids.push(self.special_ids.content_invoke_tool_json as usize);
+                    self.push_content(ids, &canonical_exec_call_json(command))?;
+                    ids.push(self.special_ids.end_message as usize);
+                }
+            }
+        }
+        ids.push(self.special_ids.content_model_end_sampling as usize);
+        if let Some(content) = &response.tool_result {
+            self.push_tool_result_content(ids, content)?;
+        }
+        Ok(())
+    }
+
+    fn push_historical_text_part(
+        &self,
+        ids: &mut Vec<usize>,
+        kind: u32,
+        content: &str,
     ) -> Result<()> {
         ids.push(self.special_ids.message_model as usize);
-        self.push_content(ids, "exec")?;
-        ids.push(self.special_ids.content_invoke_tool_json as usize);
-        self.push_content(ids, &canonical_exec_call_json(&result.command))?;
+        ids.push(kind as usize);
+        self.push_content(ids, content)?;
         ids.push(self.special_ids.end_message as usize);
-        ids.push(self.special_ids.content_model_end_sampling as usize);
-        self.push_tool_result(ids, result)
+        Ok(())
     }
 
     fn push_tool_result(&self, ids: &mut Vec<usize>, result: &ExecResultContext) -> Result<()> {
+        self.push_tool_result_content(ids, &result.content)
+    }
+
+    fn push_tool_result_content(&self, ids: &mut Vec<usize>, content: &str) -> Result<()> {
         ids.push(self.special_ids.message_tool as usize);
         self.push_content(ids, "exec")?;
         ids.push(self.special_ids.content_text as usize);
-        self.push_content(ids, &result.content)?;
+        self.push_content(ids, content)?;
         ids.push(self.special_ids.end_message as usize);
         Ok(())
     }
@@ -3107,7 +3229,10 @@ impl InklingMind {
             // prompt, exactly as the shipped chat template requires.
             self.client.context(&InklingContext::Initialize {
                 system: self.system.take().unwrap_or_default(),
-                historical_exec_results: results,
+                history: results
+                    .into_iter()
+                    .map(InklingHistoryResponse::exec)
+                    .collect(),
             })?;
             self.initialized = true;
             self.needs_generation_prompt = false;
@@ -3142,8 +3267,9 @@ impl InklingMind {
                             )
                             .into());
                         }
-                        self.client
-                            .context(&InklingContext::HistoricalExecResult { result })?;
+                        self.client.context(&InklingContext::HistoricalResponse {
+                            response: InklingHistoryResponse::exec(result),
+                        })?;
                         self.needs_generation_prompt = false;
                     }
                 }
@@ -3361,10 +3487,10 @@ mod tests {
 
         let context = InklingContext::Initialize {
             system: "literal <|message_model|>".to_string(),
-            historical_exec_results: vec![ExecResultContext {
+            history: vec![InklingHistoryResponse::exec(ExecResultContext {
                 command: "printf hi".to_string(),
                 content: "literal <|content_invoke_tool_json|>".to_string(),
-            }],
+            })],
         };
         let encoded = serde_json::to_vec(&context).expect("encode context");
         let decoded: InklingContext = serde_json::from_slice(&encoded).expect("decode context");
@@ -3517,10 +3643,10 @@ mod tests {
         let mut client = ServeClient::spawn(&mut command).expect("spawn fake serving process");
         let initialization = InklingContext::Initialize {
             system: "replacement system".to_string(),
-            historical_exec_results: vec![ExecResultContext {
+            history: vec![InklingHistoryResponse::exec(ExecResultContext {
                 command: "memory old..new".to_string(),
                 content: "replacement cover".to_string(),
-            }],
+            })],
         };
         assert_eq!(
             client.reinitialize(&initialization).expect("reinitialize"),
@@ -3904,17 +4030,35 @@ mod tests {
                 .all(|id| !codec.special_ids().is_special(*id as u32))
         );
 
-        let result = ExecResultContext {
-            command: format!("printf {MESSAGE_TOOL}"),
-            content: format!("hostile {CONTENT_MODEL_END_SAMPLING}"),
+        let response = InklingHistoryResponse {
+            parts: vec![
+                InklingHistoryPart::Thinking {
+                    content: format!("think {MESSAGE_MODEL}"),
+                },
+                InklingHistoryPart::Text {
+                    content: format!("say {END_MESSAGE}"),
+                },
+                InklingHistoryPart::Exec {
+                    command: format!("printf {MESSAGE_TOOL}"),
+                },
+            ],
+            tool_result: Some(format!("hostile {CONTENT_MODEL_END_SAMPLING}")),
         };
         let encoded = codec
-            .encode(&InklingContext::HistoricalExecResult { result })
+            .encode(&InklingContext::HistoricalResponse { response })
             .unwrap();
         let special = codec.special_ids();
         assert_eq!(
             encoded,
             [
+                special.message_model as usize,
+                special.content_thinking as usize,
+                0,
+                special.end_message as usize,
+                special.message_model as usize,
+                special.content_text as usize,
+                0,
+                special.end_message as usize,
                 special.message_model as usize,
                 0,
                 special.content_invoke_tool_json as usize,
@@ -3939,10 +4083,34 @@ mod tests {
         let encoded = codec
             .encode(&InklingContext::Initialize {
                 system: "system".to_string(),
-                historical_exec_results: vec![ExecResultContext {
-                    command: "true".to_string(),
-                    content: "ok".to_string(),
-                }],
+                history: vec![
+                    InklingHistoryResponse {
+                        parts: vec![
+                            InklingHistoryPart::Thinking {
+                                content: "two ".to_string(),
+                            },
+                            // One provider block may cross several Drive
+                            // slices. Adjacent parts of the same kind must be
+                            // token-identical to the unsliced block.
+                            InklingHistoryPart::Thinking {
+                                content: "slices".to_string(),
+                            },
+                            InklingHistoryPart::Text {
+                                content: "answer".to_string(),
+                            },
+                            InklingHistoryPart::Exec {
+                                command: "true".to_string(),
+                            },
+                        ],
+                        tool_result: Some("ok".to_string()),
+                    },
+                    InklingHistoryResponse {
+                        parts: vec![InklingHistoryPart::Text {
+                            content: "after".to_string(),
+                        }],
+                        tool_result: None,
+                    },
+                ],
             })
             .unwrap();
         assert_eq!(
@@ -3962,6 +4130,14 @@ mod tests {
                 0,
                 ids.end_message as usize,
                 ids.message_model as usize,
+                ids.content_thinking as usize,
+                0,
+                ids.end_message as usize,
+                ids.message_model as usize,
+                ids.content_text as usize,
+                0,
+                ids.end_message as usize,
+                ids.message_model as usize,
                 0,
                 ids.content_invoke_tool_json as usize,
                 0,
@@ -3973,7 +4149,113 @@ mod tests {
                 0,
                 ids.end_message as usize,
                 ids.message_model as usize,
+                ids.content_text as usize,
+                0,
+                ids.end_message as usize,
+                ids.content_model_end_sampling as usize,
+                ids.message_model as usize,
             ]
+        );
+    }
+
+    #[cfg(feature = "tokenizer")]
+    #[test]
+    fn adjacent_history_slices_are_token_identical_to_one_model_part() {
+        let codec = InklingContextCodec::from_json(&miniature_tokenizer_json()).unwrap();
+        let split = InklingContext::HistoricalResponse {
+            response: InklingHistoryResponse {
+                parts: vec![
+                    InklingHistoryPart::Thinking {
+                        content: "one ".to_string(),
+                    },
+                    InklingHistoryPart::Thinking {
+                        content: "thought".to_string(),
+                    },
+                    InklingHistoryPart::Text {
+                        content: "one ".to_string(),
+                    },
+                    InklingHistoryPart::Text {
+                        content: "answer".to_string(),
+                    },
+                ],
+                tool_result: None,
+            },
+        };
+        let whole = InklingContext::HistoricalResponse {
+            response: InklingHistoryResponse {
+                parts: vec![
+                    InklingHistoryPart::Thinking {
+                        content: "one thought".to_string(),
+                    },
+                    InklingHistoryPart::Text {
+                        content: "one answer".to_string(),
+                    },
+                ],
+                tool_result: None,
+            },
+        };
+        assert_eq!(codec.encode(&split).unwrap(), codec.encode(&whole).unwrap());
+    }
+
+    #[cfg(feature = "tokenizer")]
+    #[test]
+    fn historical_response_validation_rejects_unpaired_or_nonfinal_execs() {
+        let codec = InklingContextCodec::from_json(&miniature_tokenizer_json()).unwrap();
+        let encode = |response| codec.encode(&InklingContext::HistoricalResponse { response });
+
+        assert!(
+            encode(InklingHistoryResponse {
+                parts: vec![InklingHistoryPart::Exec {
+                    command: "true".to_string(),
+                }],
+                tool_result: None,
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("requires its tool result")
+        );
+        assert!(
+            encode(InklingHistoryResponse {
+                parts: vec![InklingHistoryPart::Text {
+                    content: "answer".to_string(),
+                }],
+                tool_result: Some("orphan".to_string()),
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("has no final exec call")
+        );
+        assert!(
+            encode(InklingHistoryResponse {
+                parts: vec![
+                    InklingHistoryPart::Exec {
+                        command: "true".to_string(),
+                    },
+                    InklingHistoryPart::Text {
+                        content: "too late".to_string(),
+                    },
+                ],
+                tool_result: Some("ok".to_string()),
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("final model part")
+        );
+        assert!(
+            encode(InklingHistoryResponse {
+                parts: vec![
+                    InklingHistoryPart::Exec {
+                        command: "first".to_string(),
+                    },
+                    InklingHistoryPart::Exec {
+                        command: "second".to_string(),
+                    },
+                ],
+                tool_result: Some("ambiguous".to_string()),
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("multiple exec calls")
         );
     }
 
@@ -4021,12 +4303,27 @@ mod tests {
         };
         let context = InklingContext::Initialize {
             system: "template system".to_string(),
-            historical_exec_results: vec![result.clone()],
+            history: vec![InklingHistoryResponse {
+                parts: vec![
+                    InklingHistoryPart::Thinking {
+                        content: "template thought".to_string(),
+                    },
+                    InklingHistoryPart::Text {
+                        content: "template answer".to_string(),
+                    },
+                    InklingHistoryPart::Exec {
+                        command: result.command.clone(),
+                    },
+                ],
+                tool_result: Some(result.content.clone()),
+            }],
         };
         let rendered = format!(
             "{MESSAGE_SYSTEM}tool_declare{CONTENT_XML}{EXEC_TOOL_DECLARATION}{END_MESSAGE}\
              {MESSAGE_SYSTEM}{CONTENT_TEXT}template system{END_MESSAGE}\
              {MESSAGE_SYSTEM}{CONTENT_TEXT}{DEFAULT_THINKING_EFFORT}{END_MESSAGE}\
+             {MESSAGE_MODEL}{CONTENT_THINKING}template thought{END_MESSAGE}\
+             {MESSAGE_MODEL}{CONTENT_TEXT}template answer{END_MESSAGE}\
              {MESSAGE_MODEL}exec{CONTENT_INVOKE_TOOL_JSON}{}{END_MESSAGE}\
              {CONTENT_MODEL_END_SAMPLING}{MESSAGE_TOOL}exec{CONTENT_TEXT}{}\
              {END_MESSAGE}{MESSAGE_MODEL}",
@@ -4428,10 +4725,10 @@ cat >"$3"
                 .expect("input preamble");
         let initial_context = InklingContext::Initialize {
             system: system.to_string(),
-            historical_exec_results: vec![ExecResultContext {
+            history: vec![InklingHistoryResponse::exec(ExecResultContext {
                 command: "cmd".to_string(),
                 content: result_delta.clone(),
-            }],
+            })],
         };
         let context_payload = serde_json::to_vec(&initial_context).expect("CONTEXT json");
         input_writer
@@ -4780,7 +5077,7 @@ exec cat >/dev/null
             context,
             InklingContext::Initialize {
                 system: "system".to_string(),
-                historical_exec_results: Vec::new(),
+                history: Vec::new(),
             }
         );
         for _ in &sequence {
