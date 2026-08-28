@@ -1107,6 +1107,12 @@ required-features = ["inkling-cuda"]
 name = "inkling_serve"
 required-features = ["inkling-serve"]
 
+# Two full-stack tensor-parallel serving ranks behind the same GPU-free framed
+# protocol. The ranks own CUDA; this fan-out/checking process does not.
+[[bin]]
+name = "inkling_serve_pair"
+required-features = ["serve"]
+
 # THE GATE for it: drive's own loop (Shell, world, span verification, audit,
 # pile) driven by a real Session instead of StubMind, plus a `probe` mode that
 # speaks the protocol directly so a turn with a real DELTA can be measured. No
