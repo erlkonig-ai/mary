@@ -431,62 +431,6 @@ impl Checkpoint {
     pub fn position(&self) -> usize {
         self.pos
     }
-
-    /// Prove that every layer still holds the complete attention span its kind
-    /// requires at [`Self::position`].
-    ///
-    /// Position monotonicity is not enough: a windowed cache that accidentally
-    /// drops one extra row has a smaller `base + len`, so the guard before the
-    /// next append becomes easier to satisfy while that layer attends over too
-    /// little context forever.  The exact local invariant is therefore
-    /// `len = min(position, window)` and `base = position - len`.  Global
-    /// layers are the same statement with an unbounded window: `len = position`
-    /// and `base = 0`.
-    ///
-    /// Returns the number of local layers checked, which lets a serving seam
-    /// report that the model's windowed majority actually participated in the
-    /// proof rather than merely saying that an empty loop succeeded.
-    pub fn validate_cache_completeness(&self) -> Result<usize> {
-        anyhow::ensure!(
-            !self.torn,
-            "a torn Session cannot make a claim about cache completeness"
-        );
-        if self.pos == 0 {
-            anyhow::ensure!(
-                self.caches.is_empty(),
-                "position 0 has {} layer cache(s)",
-                self.caches.len()
-            );
-            return Ok(0);
-        }
-        anyhow::ensure!(
-            self.caches.len() == self.hi - self.lo,
-            "{} caches for {} layers at position {}",
-            self.caches.len(),
-            self.hi - self.lo,
-            self.pos
-        );
-
-        let t = &self.cfg.text_config;
-        let mut local_layers = 0usize;
-        for layer in self.lo..self.hi {
-            let cache = &self.caches[layer - self.lo].attn;
-            let kind = t.attn_kind(layer);
-            local_layers += usize::from(kind == AttnKind::Local);
-            let (expected_base, expected_len) =
-                required_cache_span(kind, self.pos, t.sliding_window_size);
-            anyhow::ensure!(
-                cache.len() == expected_len && cache.base() == expected_base,
-                "layer {layer} {:?} cache is base {} + len {} at position {}, expected base \
-                 {expected_base} + len {expected_len}",
-                kind,
-                cache.base(),
-                cache.len(),
-                self.pos
-            );
-        }
-        Ok(local_layers)
-    }
 }
 
 impl Session {
@@ -811,6 +755,62 @@ impl Session {
     /// length of the sequence this session has attended to.
     pub fn position(&self) -> usize {
         self.pos
+    }
+
+    /// Prove that every layer still holds the complete attention span its kind
+    /// requires at [`Self::position`].
+    ///
+    /// Position monotonicity is not enough: a windowed cache that accidentally
+    /// drops one extra row has a smaller `base + len`, so the guard before the
+    /// next append becomes easier to satisfy while that layer attends over too
+    /// little context forever.  The exact local invariant is therefore
+    /// `len = min(position, window)` and `base = position - len`.  Global
+    /// layers are the same statement with an unbounded window: `len = position`
+    /// and `base = 0`.
+    ///
+    /// Returns the number of local layers checked, which lets a serving seam
+    /// report that the model's windowed majority actually participated in the
+    /// proof rather than merely saying that an empty loop succeeded.
+    pub fn validate_cache_completeness(&self) -> Result<usize> {
+        anyhow::ensure!(
+            !self.torn,
+            "a torn Session cannot make a claim about cache completeness"
+        );
+        if self.pos == 0 {
+            anyhow::ensure!(
+                self.caches.is_empty(),
+                "position 0 has {} layer cache(s)",
+                self.caches.len()
+            );
+            return Ok(0);
+        }
+        anyhow::ensure!(
+            self.caches.len() == self.hi - self.lo,
+            "{} caches for {} layers at position {}",
+            self.caches.len(),
+            self.hi - self.lo,
+            self.pos
+        );
+
+        let t = &self.cfg.text_config;
+        let mut local_layers = 0usize;
+        for layer in self.lo..self.hi {
+            let cache = &self.caches[layer - self.lo].attn;
+            let kind = t.attn_kind(layer);
+            local_layers += usize::from(kind == AttnKind::Local);
+            let (expected_base, expected_len) =
+                required_cache_span(kind, self.pos, t.sliding_window_size);
+            anyhow::ensure!(
+                cache.len() == expected_len && cache.base() == expected_base,
+                "layer {layer} {:?} cache is base {} + len {} at position {}, expected base \
+                 {expected_base} + len {expected_len}",
+                kind,
+                cache.base(),
+                cache.len(),
+                self.pos
+            );
+        }
+        Ok(local_layers)
     }
 
     /// Which layers this rank runs.
