@@ -1257,7 +1257,9 @@ mod tests {
     #[test]
     fn packed_heads_end_on_block_boundaries_but_dense_heads_need_not() {
         assert!(packed_head_dim_applies(128));
-        assert!(packed_head_dim_applies(super::fp4quant::GROUP));
+        assert!(packed_head_dim_applies(
+            crate::models::inkling::fp4quant::GROUP
+        ));
         assert!(!packed_head_dim_applies(8));
         assert!(applies(32, 8, 8, 4));
     }
