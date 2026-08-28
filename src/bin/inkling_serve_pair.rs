@@ -1,18 +1,19 @@
 //! `inkling_serve_pair` — make two tensor-parallel `inkling_serve` ranks look
 //! like one serving process.
 //!
-//! The downstream wire is exactly `mary::models::inkling::serve`: text and
-//! CONSULT go to both ranks, equal token fragments stream back as soon as the
-//! second rank confirms them, and one TURN closes the turn. Rank orchestration
-//! is expressed as structured program/argv/environment fields; callers never
-//! supply a shell command blob.
+//! The downstream wire is exactly `mary::models::inkling::serve`: raw text,
+//! typed context, and CONSULT go to both ranks, equal token fragments stream
+//! back as soon as the second rank confirms them, and one TURN closes the turn.
+//! Rank orchestration is expressed as structured program/argv/environment
+//! fields; callers never supply a shell command blob.
 
 use std::io::{Read, Write};
 
 use anyhow::{Context, Result};
 
 use mary::models::inkling::serve::{
-    CONSULT_TYPE, CONTENT_TYPE, Consult, READY_TYPE, RankCommand, ServePair, TURN_TYPE, UNIT,
+    CONSULT_TYPE, CONTENT_TYPE, CONTEXT_TYPE, Consult, InklingContext, READY_TYPE, RankCommand,
+    ServePair, TURN_TYPE, UNIT,
 };
 
 fn usage() -> &'static str {
@@ -574,6 +575,11 @@ fn run() -> Result<()> {
         match input.next_frame()? {
             framed_stream::Frame::Record(record) if record.content_type() == CONTENT_TYPE => {
                 pair.feed(record.text()?)?;
+            }
+            framed_stream::Frame::Record(record) if record.content_type() == CONTEXT_TYPE => {
+                let context: InklingContext = serde_json::from_slice(&record.payload)
+                    .context("parse the downstream typed context record")?;
+                pair.context(&context)?;
             }
             framed_stream::Frame::Record(record) if record.content_type() == CONSULT_TYPE => {
                 let consult: Consult = serde_json::from_slice(&record.payload)
