@@ -17,7 +17,7 @@
 //! This is the process that closes that gap. It loads once, holds the weights,
 //! the KV cache and the position, and serves turns on stdin/stdout. The protocol
 //! is `mary::models::inkling::serve`, which is the framed-stream convention with
-//! three control content-types on it — not a new format.
+//! four control content-types on it — not a new format.
 //!
 //! # It streams, and that is the whole point
 //!
@@ -41,9 +41,10 @@
 //!
 //! # Tokenizing is on THIS side
 //!
-//! Text on the wire, never ids. Drive's `Mind` seam asks for no tokenizer — the
-//! loop never teacher-forces tokens — so the tokenizer belongs to whoever owns
-//! the model. The tokenizer is the checkpoint's own `tokenizer.json`, read by
+//! Drive owns no tokenizer. Raw probe text and typed context JSON cross the
+//! wire; this process alone turns them into ids, and TURN reports generated
+//! exact ids so the client can parse structure. The tokenizer is the
+//! checkpoint's own `tokenizer.json`, read by
 //! the same `tokenizers::Tokenizer::from_file` that `inkling_encode` and
 //! `inkling_tokenizer_gate` use, so there is one tokenizer in this tree and not
 //! a second transcription of one. (`mary::persist::load_tokenizer_from_pile`
@@ -72,8 +73,8 @@ use std::io::Write as _;
 use anyhow::{Context, Result};
 
 use mary::models::inkling::serve::{
-    CONSULT_TYPE, CONTENT_TYPE, Consult, ExecutionManifest, READY_TYPE, Ready, TURN_TYPE, TurnEnd,
-    UNIT,
+    CONSULT_TYPE, CONTENT_TYPE, CONTEXT_TYPE, Consult, ExecutionManifest, InklingContext,
+    InklingContextCodec, READY_TYPE, Ready, TURN_TYPE, TurnEnd, UNIT,
 };
 use mary::models::inkling::session::{Session, SessionConfig};
 use mary::models::inkling::tp::Tp;
@@ -104,7 +105,7 @@ OPTIONS:
     --tp-rendezvous <a>  Rank 0's HOST:PORT on the fast fabric
     -h, --help           This text
 
-The protocol is the framed-stream convention with three control content-types;
+The protocol is the framed-stream convention with four control content-types;
 see `mary::models::inkling::serve`.
 "
 }
@@ -612,6 +613,8 @@ fn run() -> Result<()> {
     let tokenizer_identity = IntoBlob::<RawBytes>::to_blob(tokenizer_bytes.as_slice())
         .get_handle()
         .raw;
+    let context_codec = InklingContextCodec::from_json(&tokenizer_bytes)
+        .with_context(|| format!("build context codec from {}", options.tokenizer.display()))?;
     let tokenizer = tokenizers::Tokenizer::from_bytes(&tokenizer_bytes)
         .map_err(|e| anyhow::anyhow!("load {}: {e}", options.tokenizer.display()))?;
 
@@ -722,6 +725,7 @@ fn run() -> Result<()> {
         pile: options.pile.display().to_string(),
         model_identity,
         tokenizer_identity,
+        special_ids: context_codec.special_ids().clone(),
         execution_profile: execution_profile.to_string(),
         execution_identity,
         execution_unavailable: runtime_facts.unavailable,
@@ -759,11 +763,13 @@ fn run() -> Result<()> {
 
     // ── serve ───────────────────────────────────────────────────────────────
     //
-    // Context accumulates as text records; a CONSULT record ends the delta and
-    // asks for a turn. Nothing here is asynchronous: the client writes, we read
-    // until the consult, we generate and write, the client reads. Strict
-    // alternation, so the two-pipe deadlock cannot arise.
-    let mut delta = String::new();
+    // Context accumulates as token ids; a CONSULT record ends the delta and
+    // asks for a turn. Typed records contribute structural ids while raw probe
+    // text passes through the codec's content-only tokenizer. Nothing here is
+    // asynchronous: the client writes, we read until the consult, we generate
+    // and write, the client reads. Strict alternation, so the two-pipe deadlock
+    // cannot arise.
+    let mut delta = Vec::new();
     let mut turn = 0usize;
     // The token the previous turn EMITTED and never fed back, waiting for the
     // next pass to put it in the cache. `None` is also "no turn has run yet",
@@ -778,7 +784,6 @@ fn run() -> Result<()> {
                 let want = consult.max_tokens.max(1);
                 let end = serve_turn(
                     &mut session,
-                    &tokenizer,
                     &mut decode,
                     &mut out,
                     std::mem::take(&mut delta),
@@ -794,7 +799,20 @@ fn run() -> Result<()> {
                 turn += 1;
             }
             framed_stream::Frame::Record(record) if record.content_type() == CONTENT_TYPE => {
-                delta.push_str(record.text()?);
+                delta.extend(
+                    context_codec
+                        .encode_raw_content(record.text()?)
+                        .context("encode raw content record")?,
+                );
+            }
+            framed_stream::Frame::Record(record) if record.content_type() == CONTEXT_TYPE => {
+                let context: InklingContext = serde_json::from_slice(&record.payload)
+                    .context("parse typed Inkling context record")?;
+                delta.extend(
+                    context_codec
+                        .encode(&context)
+                        .context("encode typed Inkling context record")?,
+                );
             }
             framed_stream::Frame::Record(record) => {
                 anyhow::bail!(
@@ -810,7 +828,12 @@ fn run() -> Result<()> {
                     "inkling_serve: client gap of {} byte(s): {}",
                     gap.extent, gap.reason
                 );
-                delta.push_str(&format!("\n[{} bytes lost: {}]\n", gap.extent, gap.reason));
+                let marker = format!("\n[{} bytes lost: {}]\n", gap.extent, gap.reason);
+                delta.extend(
+                    context_codec
+                        .encode_raw_content(&marker)
+                        .context("encode client gap marker")?,
+                );
             }
             framed_stream::Frame::End(status) => {
                 eprintln!("inkling_serve: input stream ended ({status:?}) after {turn} turn(s)");
@@ -863,29 +886,14 @@ fn advance_context_decode(
 #[allow(clippy::too_many_arguments)]
 fn serve_turn(
     session: &mut Session,
-    tokenizer: &tokenizers::Tokenizer,
     decode: &mut impl FnMut(u32) -> Result<Option<String>>,
     out: &mut framed_stream::FramedWriter<std::fs::File>,
-    delta: String,
+    delta_ids: Vec<usize>,
     want: usize,
     stop: &[u32],
     turn: usize,
     carry: &mut Option<usize>,
 ) -> Result<TurnEnd> {
-    // `false`: no special tokens. The prompts this model is measured against
-    // carry none, and a BOS silently prepended here would make a served turn
-    // incomparable with every reference prompt in the tree while every shape
-    // check still passed. (Same reasoning, same flag, as `inkling_encode`.)
-    let delta_ids: Vec<usize> = match delta.is_empty() {
-        true => Vec::new(),
-        false => tokenizer
-            .encode(delta.as_str(), false)
-            .map_err(|e| anyhow::anyhow!("encode the delta: {e}"))?
-            .get_ids()
-            .iter()
-            .map(|&id| id as usize)
-            .collect(),
-    };
     // Context participates in decoding even though it is not speech. Advancing
     // and discarding here makes the next generated id see its real predecessor
     // without ever echoing a tool result. `carry` is excluded because the
