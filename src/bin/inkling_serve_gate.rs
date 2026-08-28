@@ -33,17 +33,15 @@
 //!     ARRIVES. It is what makes "the consumer produced output before the turn
 //!     ended" observable without a speaker.
 //!   - the SANDBOX is `mock_mcp_server`, drive's protocol mock. It is a
-//!     stand-in, and it is never exercised here: this backend derives no
-//!     commands, so nothing fires. It is present because `Shell::open` boots one
-//!     synchronously, and naming it as unexercised is the point of this
-//!     paragraph.
+//!     stand-in for containment, not for the loop: when Inkling emits a valid
+//!     native `exec` call, Drive really audits it, runs it through this server,
+//!     and feeds the typed result back to the retained model session.
 //!
 //! **`probe`** skips drive entirely and drives the serving process directly.
-//! It exists for the one thing the gate cannot show: a turn with a real DELTA.
-//! A `NoAction` mind never fires a command, so drive never produces a
-//! `Payload::Result`, so the `feed` → `Session::extend` path — the delta form,
-//! the thing the KV cache is FOR — has no way to be exercised through the loop
-//! today. The probe feeds text between turns and reports what each turn cost.
+//! The native Drive gate can now exercise a typed result delta, but only when a
+//! sampled response chooses to call a tool. The probe makes an arbitrary raw
+//! delta deterministic and isolates `feed` → `Session::extend` from the rest of
+//! the loop, then reports what each turn cost.
 //!
 //! # What the numbers mean
 //!
@@ -427,12 +425,6 @@ fn verify_drive_turns(turns: &[TurnEnd]) -> Result<()> {
                 end.delta_tokens > 0,
                 "the first Drive turn did not receive its system prompt and memory cover"
             );
-        } else {
-            anyhow::ensure!(
-                end.delta_tokens == 0,
-                "NoAction Drive turn {ordinal} unexpectedly received a {}-token world delta",
-                end.delta_tokens
-            );
         }
         expected_position = expected_position
             .checked_add(end.delta_tokens)
@@ -478,6 +470,13 @@ fn cmd_prefix(o: &Options) -> Result<()> {
     let [b0] = rebuilt.turns.as_slice() else {
         anyhow::bail!("uninterrupted arm did not produce exactly one turn");
     };
+    anyhow::ensure!(
+        a0.stopped == "max_tokens",
+        "the retained arm's first token completed a logical response ({:?}); crossing that \
+         boundary inserts a fresh generation prompt, so this sample cannot prove retained-prefix \
+         equivalence",
+        a0.stopped
+    );
 
     for (name, left, right) in [
         (
@@ -557,8 +556,7 @@ fn cmd_prefix(o: &Options) -> Result<()> {
     Ok(())
 }
 
-/// The protocol alone, with a real delta between turns — the one thing the
-/// drive gate cannot reach today.
+/// The protocol alone, with a deterministic raw delta between turns.
 fn cmd_probe(o: &Options) -> Result<()> {
     let mut client = serve_client(o)?;
     client.feed(&o.system)?;
@@ -666,6 +664,13 @@ mod tests {
     fn drive_position_is_the_sum_of_inputs_and_internal_decode_steps() {
         let turns = [turn(0, 3, 20, 0, 22), turn(1, 2, 0, 1, 24)];
         verify_drive_turns(&turns).expect("the exact sequence accounts for every KV row");
+    }
+
+    #[test]
+    fn typed_post_initialization_deltas_participate_in_position_accounting() {
+        let turns = [turn(0, 3, 20, 0, 22), turn(1, 2, 7, 1, 31)];
+        verify_drive_turns(&turns)
+            .expect("a tool result or generation prompt is a legitimate later delta");
     }
 
     #[test]
