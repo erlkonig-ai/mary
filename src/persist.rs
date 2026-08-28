@@ -1606,12 +1606,8 @@ fn read_model_collections(pile: &mut Pile, path: &Path) -> anyhow::Result<ModelP
                 crate::model_collection::snapshot_model_collection_local_latest(pile, team)
                     .map_err(|e| anyhow::anyhow!("{path:?}: snapshot model collection: {e}"))?;
             facts += pre_epoch_aliased(snapshot.facts());
-            let (_, commits, graph_reader) = snapshot.into_parts();
-            let handle = commits
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("{path:?}: a model collection with no commits"))?
-                .collection();
-            authority = Some((team, handle));
+            let (_, ticket, graph_reader) = snapshot.into_parts();
+            authority = Some((team, ticket.collection()));
             reader = Some(graph_reader);
         }
         Err(error) => graph_error = Some(error.to_string()),
@@ -1620,16 +1616,10 @@ fn read_model_collections(pile: &mut Pile, path: &Path) -> anyhow::Result<ModelP
     match crate::model_collection::snapshot_sole_model_bundle_collection_local_latest(pile) {
         Ok((team, snapshot)) => {
             let (_, ticket, bundle_reader) = snapshot.into_parts();
-            facts += model_bundle_archive_facts(&ticket, &bundle_reader)
+            facts += model_bundle_archive_facts(ticket.commits(), &bundle_reader)
                 .map_err(|e| anyhow::anyhow!("{path:?}: read model bundle archives: {e}"))?;
             if authority.is_none() {
-                let handle = ticket
-                    .first()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("{path:?}: a model bundle collection with no commits")
-                    })?
-                    .collection();
-                authority = Some((team, handle));
+                authority = Some((team, ticket.collection()));
             }
             if reader.is_none() {
                 reader = Some(bundle_reader);

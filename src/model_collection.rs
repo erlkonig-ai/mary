@@ -28,8 +28,6 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::attribute::Attribute;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
-use triblespace::core::collection::reach;
-use triblespace::core::collection::records::{collection_name, collection_namespace};
 use triblespace::core::collection::simplearchive_union::{
     self, PreparationError, PreparedCollectionCommit, PublicationError,
 };
@@ -37,9 +35,8 @@ use triblespace::core::collection::{
     CollectionCommit, CollectionMaterializationError, CollectionRecord, CollectionStore,
     SimpleArchiveCollection,
 };
+use triblespace::core::collection::{descriptor, reach};
 use triblespace::core::inline::encodings::UnknownInline;
-use triblespace::core::inline::encodings::ed25519::ED25519PublicKey;
-use triblespace::core::inline::encodings::shortstring::ShortString;
 use triblespace::core::metadata;
 use triblespace::core::repo::OfferCaptureInsertError;
 use triblespace::core::repo::pile::{
@@ -58,8 +55,8 @@ use triblespace::prelude::*;
 /// holding this source file. The descriptor additionally fixes
 /// `SimpleArchive` as its representation and TribleSpace's version-1
 /// trible-set union recipe as its algebra.
-pub fn mary_model_graph_name() -> CollectionName {
-    CollectionName::new("mary-model-graph").expect("`mary-model-graph` is a legal collection name")
+pub const fn mary_model_graph_name() -> &'static str {
+    "mary-model-graph"
 }
 
 /// The root collection of immutable model-bundle tokens.
@@ -70,9 +67,8 @@ pub fn mary_model_graph_name() -> CollectionName {
 /// source fragment are staged before the token COMMIT. The token signature is
 /// the model authority -- there is no second model-graph COMMIT to trust.
 /// Runtime derivations use this tiny union as their truthful source lattice.
-pub fn mary_model_bundle_name() -> CollectionName {
-    CollectionName::new("mary-model-bundles")
-        .expect("`mary-model-bundles` is a legal collection name")
+pub const fn mary_model_bundle_name() -> &'static str {
+    "mary-model-bundles"
 }
 
 /// Concrete failure produced by publishing one model fragment to a pile.
@@ -381,25 +377,16 @@ impl Error for LoadModelCollectionError {
     }
 }
 
-// `reach::private()` on both, and it is the only value that keeps these
-// working: a private descriptor is byte-identical to one built before reach
-// existed, so the collection keeps the identity it already had. Runtime
-// loading is bound to the model-bundle collection by content address, so a
-// descriptor that gained a declared reach would be a different collection and
-// every already-persisted model pile would stop resolving.
+// Name, mandatory authority, and reach all participate in descriptor identity.
+// These constructors describe only the current epoch; retired namespace/open
+// descriptors are inputs to the one-shot collection migration, not a runtime
+// compatibility path.
 fn model_graph_collection(team: VerifyingKey) -> SimpleArchiveCollection {
-    // `authority: None` is not a placeholder. It reconstructs the EXACT
-    // descriptor handle these piles were written with: a declared authority is
-    // an identity-bearing descriptor fact, so `Some(team)` would name a
-    // different, capability-anchored collection and every already-persisted
-    // model pile would stop resolving -- the same hazard the comment above
-    // states for reach. These piles declare no portable external capability
-    // root, so absence is also the honest reading.
-    SimpleArchiveCollection::new(mary_model_graph_name(), team, None, reach::private())
+    SimpleArchiveCollection::new(mary_model_graph_name(), team, reach::private())
 }
 
 fn model_bundle_collection(team: VerifyingKey) -> SimpleArchiveCollection {
-    SimpleArchiveCollection::new(mary_model_bundle_name(), team, None, reach::private())
+    SimpleArchiveCollection::new(mary_model_bundle_name(), team, reach::private())
 }
 
 /// Content identity of one team's PersonaPlex bundle source collection.
@@ -612,7 +599,7 @@ struct LocalCollectionObservation {
 /// ticket for whichever team the first scan happened to see.
 fn observe_collection(
     pile: &mut Pile,
-    wanted: &CollectionName,
+    wanted: &str,
 ) -> Result<LocalCollectionObservation, ReadError> {
     let mut seen = BTreeSet::new();
     let mut teams = Vec::new();
@@ -635,40 +622,34 @@ fn observe_collection(
         let Ok(facts) = <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(blob) else {
             continue;
         };
-        let mut name = None;
-        let mut team = None;
-        for fact in facts.iter() {
-            if *fact.a() == collection_name.id() {
-                name = fact.v::<ShortString>().try_from_inline::<String>().ok();
-            } else if *fact.a() == collection_namespace.id() {
-                team = VerifyingKey::from_bytes(&fact.v::<ED25519PublicKey>().raw).ok();
-            }
-        }
-        if name.as_deref() == Some(wanted.as_str()) {
-            if let Some(team) = team {
-                if seen.insert(team.to_bytes()) {
-                    teams.push(team);
-                }
-            }
+        let Ok(Some(name_handle)) = descriptor::name(&facts) else {
+            continue;
+        };
+        let Ok(team) = descriptor::authority(&facts) else {
+            continue;
+        };
+        let name: anybytes::View<str> = match reader.get(name_handle) {
+            Ok(name) => name,
+            Err(_) => continue,
+        };
+        if &*name == wanted && seen.insert(team.to_bytes()) {
+            teams.push(team);
         }
     }
     Ok(LocalCollectionObservation { commits, teams })
 }
 
-fn collection_teams(
-    pile: &mut Pile,
-    wanted: &CollectionName,
-) -> Result<Vec<VerifyingKey>, ReadError> {
+fn collection_teams(pile: &mut Pile, wanted: &str) -> Result<Vec<VerifyingKey>, ReadError> {
     observe_collection(pile, wanted).map(|observation| observation.teams)
 }
 
 pub fn model_graph_teams(pile: &mut Pile) -> Result<Vec<VerifyingKey>, ReadError> {
-    collection_teams(pile, &mary_model_graph_name())
+    collection_teams(pile, mary_model_graph_name())
 }
 
 /// Which teams publish a `mary-model-bundles` collection in this pile.
 pub fn model_bundle_teams(pile: &mut Pile) -> Result<Vec<VerifyingKey>, ReadError> {
-    collection_teams(pile, &mary_model_bundle_name())
+    collection_teams(pile, mary_model_bundle_name())
 }
 
 /// The single team publishing a model graph here, or an error naming the
@@ -921,7 +902,7 @@ pub fn snapshot_model_bundle_collection_local_latest(
 pub fn snapshot_sole_model_collection_local_latest(
     pile: &mut Pile,
 ) -> Result<(VerifyingKey, CollectionSnapshot<PileReader>), SnapshotSoleModelGraphError> {
-    let observation = observe_collection(pile, &mary_model_graph_name()).map_err(|source| {
+    let observation = observe_collection(pile, mary_model_graph_name()).map_err(|source| {
         SnapshotSoleModelGraphError::Team(SoleModelGraphTeamError::Read(source))
     })?;
     let team =
@@ -948,7 +929,7 @@ pub fn snapshot_sole_model_collection_local_latest(
 pub fn snapshot_sole_model_bundle_collection_local_latest(
     pile: &mut Pile,
 ) -> Result<(VerifyingKey, CollectionSnapshot<PileReader>), SnapshotSoleModelBundleError> {
-    let observation = observe_collection(pile, &mary_model_bundle_name()).map_err(|source| {
+    let observation = observe_collection(pile, mary_model_bundle_name()).map_err(|source| {
         SnapshotSoleModelBundleError::Team(SoleModelBundleTeamError::Read(source))
     })?;
     let team = sole_model_bundle_team_from(observation.teams)
@@ -1546,17 +1527,17 @@ mod tests {
         let collection = model_graph_collection(team);
         let descriptor = collection.descriptor();
 
-        assert_eq!(mary_model_graph_name().as_str(), "mary-model-graph");
-        assert_eq!(collection.name(), &mary_model_graph_name());
-        assert_eq!(collection.namespace(), team);
+        assert_eq!(mary_model_graph_name(), "mary-model-graph");
+        assert_eq!(collection.name(), mary_model_graph_name());
+        assert_eq!(collection.authority(), team);
 
         let handle = IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()).get_handle();
         assert_eq!(
             handle.raw,
             [
-                0x75, 0x8B, 0xBA, 0x4A, 0x8C, 0x01, 0x2B, 0x3B, 0xD9, 0xFB, 0xAF, 0xCA, 0x42, 0x0B,
-                0xA2, 0xD0, 0x04, 0xED, 0x7D, 0x7B, 0xAC, 0x3C, 0x23, 0x93, 0xBF, 0x32, 0x32, 0x7E,
-                0x32, 0x95, 0xFC, 0xDF,
+                0xFB, 0x88, 0x1E, 0x42, 0x6C, 0x55, 0xFA, 0x97, 0xA1, 0xB5, 0xC6, 0xEF, 0xB5, 0xB7,
+                0xA9, 0x7C, 0xE4, 0x84, 0xAE, 0xF6, 0x84, 0xEF, 0x9C, 0x76, 0x1B, 0xC1, 0xE9, 0x9D,
+                0xDC, 0x1E, 0xB2, 0x33,
             ]
         );
     }
@@ -2009,12 +1990,12 @@ mod tests {
 
         // "Foreign" now means a different name under the same team, which is
         // the shape a real unrelated collection takes.
-        let foreign_name = CollectionName::new("not-the-model-graph").unwrap();
+        let foreign_name = "not-the-model-graph";
         // Private, like both production descriptors: reach participates in a
         // descriptor's identity, so a public foreign one would differ from the
         // model graph by two things and stop isolating the one under test.
         let foreign_descriptor =
-            simplearchive_union::descriptor(&foreign_name, test_team(), None, reach::private());
+            simplearchive_union::descriptor(foreign_name, test_team(), reach::private());
         let (foreign_fragment, _, _) = fragment_fixture("foreign");
         let foreign = simplearchive_union::publish_fragment_commit(
             &mut pile,
