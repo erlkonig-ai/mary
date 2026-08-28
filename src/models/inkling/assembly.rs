@@ -2648,9 +2648,19 @@ pub fn moe_layer(
     hn: T2,
     n: usize,
     shared_halved: bool,
+    tp: Option<crate::models::inkling::tp::Tp>,
 ) -> Result<T2> {
     let h = t.hidden_size;
-    let inter = t.intermediate_size;
+    let global_inter = t.intermediate_size;
+    // Routed expert slabs were cut during the startup copy, so their kernels
+    // consume this rank's intermediate width. Shared experts are bound below
+    // from their still-global source tensors and receive `tp` explicitly.
+    let inter = match tp {
+        Some(tp) => tp
+            .share("intermediate_size", global_inter)
+            .map_err(|e| anyhow::anyhow!("routed MLP: {e}"))?,
+        None => global_inter,
+    };
     let rows = t.n_routed_experts + t.n_shared_experts;
     let k = t.num_experts_per_tok;
     let ns = t.n_shared_experts;
@@ -2776,7 +2786,17 @@ pub fn moe_layer(
     // They do NOT read the routed output. They run beside it, and the gammas
     // they are weighted by come off the same top-k buffer the plan did — so
     // nothing crosses to the host here either.
-    let sw = dense.shared_for(cp, client, aliases, p, ns, inter, h, shared_halved, None)?;
+    let sw = dense.shared_for(
+        cp,
+        client,
+        aliases,
+        p,
+        ns,
+        global_inter,
+        h,
+        shared_halved,
+        tp,
+    )?;
     let g =
         crate::models::inkling::seam::tensor_of(client.clone(), dev.clone(), topk_h, n, topk_width);
     let sh = shared_experts_dev(hn, sw, g, k, ns, layer);

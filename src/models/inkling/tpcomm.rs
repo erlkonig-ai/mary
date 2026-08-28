@@ -155,6 +155,10 @@ fn group_key(world: usize) -> Vec<cubecl::device::DeviceId> {
 pub struct Group {
     tp: Tp,
     client: ComputeClient<CudaRuntime>,
+    /// The Burn device paired with `client` when this Group was formed through
+    /// [`Group::form_default`]. The lower-level [`Group::form`] predates
+    /// Session and deliberately carries no such claim.
+    default_device: Option<burn::backend::cuda::CudaDevice>,
     key: Vec<cubecl::device::DeviceId>,
     /// The rendezvous sockets, kept for [`Group::barrier`]. A star: rank 0
     /// holds one per peer, every other rank holds one, to rank 0.
@@ -162,6 +166,22 @@ pub struct Group {
 }
 
 impl Group {
+    /// Form a group on Burn's default CUDA device.
+    ///
+    /// This is the serving entry point. It derives the raw cubecl client FROM
+    /// a Burn tensor on the same device a [`super::session::Session`] uses, so
+    /// the group cannot accidentally be formed on a second client whose
+    /// stream fences would not order the model's kernels. Form and
+    /// [`Group::warm`] this value before handing it to
+    /// [`super::session::Session::load_with_group`].
+    pub fn form_default(tp: Tp, addr: &str) -> Result<Self> {
+        let device = burn::backend::cuda::CudaDevice::default();
+        let probe = Tensor::<super::seam::Bk, 2>::zeros([1, 1], &device);
+        let mut group = Self::form(tp, super::seam::client_of(&probe), addr)?;
+        group.default_device = Some(device);
+        Ok(group)
+    }
+
     /// Form the group: mint on rank 0, ship the id, install it everywhere.
     ///
     /// `addr` is `HOST:PORT`. Rank 0 BINDS it and every other rank CONNECTS to
@@ -172,6 +192,10 @@ impl Group {
     /// collective and would block here; cubecl builds it lazily on the first
     /// collective instead. Call [`Group::warm`] once, at a point where blocking
     /// is free, so the rendezvous does not happen inside the first token.
+    ///
+    /// This is the lower-level harness API and cannot prove which Burn device
+    /// produced `client`. A Session deliberately refuses such a Group; serving
+    /// code uses [`Group::form_default`] so device and client travel together.
     pub fn form(tp: Tp, client: ComputeClient<CudaRuntime>, addr: &str) -> Result<Self> {
         anyhow::ensure!(
             tp.is_split(),
@@ -206,6 +230,7 @@ impl Group {
         Ok(Self {
             tp,
             client,
+            default_device: None,
             key: group_key(tp.world()),
             socks,
         })
@@ -213,6 +238,29 @@ impl Group {
 
     pub fn tp(&self) -> Tp {
         self.tp
+    }
+
+    /// The exact client the communicator was installed on.
+    ///
+    /// Kept crate-visible rather than making a serving caller carry a second
+    /// copy of this fact beside the group. A tensor-parallel Session takes its
+    /// client from the Group; rank, communicator and kernel stream therefore
+    /// cannot drift independently.
+    pub(crate) fn client(&self) -> ComputeClient<CudaRuntime> {
+        self.client.clone()
+    }
+
+    /// The device whose Burn client this group owns.
+    ///
+    /// A Session refuses a lower-level Group without this witness rather than
+    /// guessing that `CudaDevice::default()` names the same server. The guess
+    /// is usually true and, when false, makes every collective's stream fences
+    /// order a client other than the one running the model.
+    pub(crate) fn default_device(&self) -> Result<burn::backend::cuda::CudaDevice> {
+        self.default_device.clone().context(
+            "this Group was formed from an arbitrary ComputeClient. A Session needs \
+             Group::form_default so its Burn device and collective client are one fact",
+        )
     }
 
     /// Build the communicator and prove the wire works, somewhere it is safe to

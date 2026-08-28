@@ -79,19 +79,18 @@
 //!
 //! # Tensor parallelism: a Session is PER RANK
 //!
-//! `INK_TP=rank:2` runs this model as two processes, one per box, joined by a
-//! NCCL all-reduce inside every layer. Under it each rank runs *every* layer on
-//! *half* of each tensor, so both ranks hold the embedding, the whole stack and
-//! the unembedding, and both produce the same token.
+//! Tensor parallelism runs this model as two processes, one per box, joined by
+//! a NCCL all-reduce inside every layer. Under it each rank runs *every* layer
+//! on *half* of each tensor, so both ranks hold the embedding, the whole stack
+//! and the unembedding, and both produce the same token.
 //!
 //! A `Session` is therefore one RANK, not one model, and a caller that wants a
-//! TP pair holds two of them in two processes. [`Session::load`] refuses
-//! `INK_TP` for exactly that reason: the rendezvous
-//! ([`super::tpcomm::Group`]) is a collective, every rank must reach it, and a
-//! library call that blocks until a peer on another box starts up is not a thing
-//! a serving process can be handed without knowing it. Single rank works today;
-//! the pair needs an addressing decision that belongs to the serving layer and
-//! is written up in the commit that introduced this file.
+//! TP pair holds two of them in two processes. [`Session::load`] remains the
+//! single-rank entry point and refuses `INK_TP`; a serving process explicitly
+//! forms and warms a [`super::tpcomm::Group`] and hands that one value to
+//! [`Session::load_with_group`]. The group owns rank AND client, so the startup
+//! slice, the communicator and the stream on which its fences order kernels
+//! cannot be configured as three independent facts.
 //!
 //! # The layer split
 //!
@@ -115,6 +114,8 @@ use super::config::{AttnKind, InklingConfig};
 use super::pile::Elem;
 use super::source::Weights;
 use super::stack::embed_and_norm_bf16;
+use super::tp::Tp;
+use super::tpcomm::Group;
 
 /// The next sequence id. Process-wide and monotone, so no two sequences —
 /// across sessions or across one session's resets — ever share one, and a
@@ -123,6 +124,42 @@ use super::stack::embed_and_norm_bf16;
 fn next_seq() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Validate the two placement modes without touching a GPU.
+///
+/// A layer split gives one process a strict subrange. Tensor parallelism is the
+/// opposite: every rank runs every layer on its own within-layer slice. Keeping
+/// this as one arithmetic decision is what prevents startup copy and forward
+/// from quietly choosing different geometries.
+fn validate_layer_range(
+    layers: &std::ops::Range<usize>,
+    total: usize,
+    tp: Option<Tp>,
+) -> Result<bool> {
+    let (lo, hi) = (layers.start, layers.end);
+    anyhow::ensure!(
+        lo < hi,
+        "a Session runs LO..HI with LO < HI, got {lo}..{hi}"
+    );
+    anyhow::ensure!(hi <= total, "{lo}..{hi} runs past the {total}-layer stack");
+    match tp {
+        Some(tp) => anyhow::ensure!(
+            (lo, hi) == (0, total),
+            "tensor parallel rank {} of {} is a WITHIN-layer split: every rank runs every layer, \
+             so the range must be 0..{total}, not {lo}..{hi}",
+            tp.rank(),
+            tp.world(),
+        ),
+        None => anyhow::ensure!(
+            hi - lo < total,
+            "{lo}..{hi} is the whole {total}-layer stack on one node, which does not fit ({} \
+             GiB of weights). Split it: no node may run every layer, and two is the MINIMUM \
+             rather than the number.",
+            144,
+        ),
+    }
+    Ok(hi < total)
 }
 
 /// How to open a model. Everything here has a default that matches what
@@ -136,8 +173,9 @@ pub struct SessionConfig {
     /// written before the sidecars were ingested; an override you have to type,
     /// never a fallback you never see.
     pub config_override: Option<std::path::PathBuf>,
-    /// Which layers THIS process runs, as `lo..hi`. Required, and a strict
-    /// subrange: no node may run the whole stack.
+    /// Which layers THIS process runs, as `lo..hi`. [`Session::load`] requires
+    /// a strict subrange; [`Session::load_with_group`] requires the exact full
+    /// range because every tensor-parallel rank runs every layer.
     pub layers: std::ops::Range<usize>,
     /// Pay the storage layer's content hash for this range's experts at load
     /// rather than in whichever decode step first routes to each of them. On by
@@ -216,6 +254,10 @@ pub struct Session {
     src: Weights,
     dev: burn::backend::cuda::CudaDevice,
     client: cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+    /// Present exactly when this Session is one tensor-parallel rank. The
+    /// Group owns both [`Tp`] and the client above; the client is cloned FROM
+    /// this value at load rather than independently constructed.
+    group: Option<Group>,
     aliases: Option<super::fp4gemm::Aliases>,
 
     /// Which layers this rank runs.
@@ -377,8 +419,6 @@ impl Session {
     /// per-layer weights — those bind on the first pass that reaches each layer,
     /// which is what keeps a lane nobody takes from paying for an upload.
     pub fn load(cfg: SessionConfig) -> Result<Self> {
-        super::fatal::arm();
-
         // `INK_TP` is a WITHIN-layer split across two processes joined by a
         // per-layer collective. A `Session` is one rank of such a pair and the
         // group has to be formed by the serving layer that knows about the other
@@ -389,8 +429,39 @@ impl Session {
             "INK_TP is a within-layer split across two PROCESSES: a Session is one RANK of the \
              pair, and the NCCL rendezvous that joins them is a collective every rank must \
              reach. Forming it inside `Session::load` would block this call until a peer on \
-             another box started. Run one Session per rank and form the group above them."
+             another box started. Form and warm a `tpcomm::Group`, then pass it to \
+             `Session::load_with_group`."
         );
+        Self::load_inner(cfg, None)
+    }
+
+    /// Open one rank of a tensor-parallel model with an already formed group.
+    ///
+    /// The serving process owns rendezvous and calls [`Group::warm`] before
+    /// entering here. No environment variable is read for rank or world: the
+    /// Group is the one fact from which the startup slice, bind shapes and
+    /// collectives are all derived. Every rank must run the exact full layer
+    /// range; embedding and unembedding remain replicated.
+    pub fn load_with_group(cfg: SessionConfig, group: Group) -> Result<Self> {
+        anyhow::ensure!(
+            group.tp().is_split(),
+            "Session::load_with_group needs a split Group; use Session::load for one rank"
+        );
+        Self::load_inner(cfg, Some(group))
+    }
+
+    fn load_inner(cfg: SessionConfig, group: Option<Group>) -> Result<Self> {
+        super::fatal::arm();
+
+        // Refuse an arbitrary raw client before opening or copying a byte of
+        // the model. `form_default` records the Burn device from which the
+        // Group's client came; using that exact witness is what makes the
+        // communicator and all later tensors one device fact.
+        let dev = match group.as_ref() {
+            Some(group) => group.default_device()?,
+            None => burn::backend::cuda::CudaDevice::default(),
+        };
+
         anyhow::ensure!(
             std::env::var("INK_PIPE").is_err(),
             "INK_PIPE is the two-node LAYER split's wire, and it belongs to the process that \
@@ -418,29 +489,10 @@ impl Session {
         };
         let conf = InklingConfig::from_json(&text).context("parsing config.json")?;
         let t = &conf.text_config;
+        let tp = group.as_ref().map(Group::tp);
 
         let (lo, hi) = (cfg.layers.start, cfg.layers.end);
-        anyhow::ensure!(
-            lo < hi,
-            "a Session runs LO..HI with LO < HI, got {lo}..{hi}"
-        );
-        anyhow::ensure!(
-            hi <= t.num_hidden_layers,
-            "{lo}..{hi} runs past the {}-layer stack",
-            t.num_hidden_layers
-        );
-        // The same rule the binary enforces, and for the same measured reason:
-        // one box cannot hold this model, and a process that would run the whole
-        // stack re-reads its experts off the SSD between tokens. What that
-        // measures is a disk.
-        anyhow::ensure!(
-            hi - lo < t.num_hidden_layers,
-            "{lo}..{hi} is the whole {}-layer stack on one node, which does not fit ({} GiB of \
-             weights). Split it: no node may run every layer, and two is the MINIMUM rather \
-             than the number.",
-            t.num_hidden_layers,
-            144,
-        );
+        let partial = validate_layer_range(&cfg.layers, t.num_hidden_layers, tp)?;
         // A batched append is a prefill-shaped pass against an existing cache:
         // its activations are a function of its width in exactly the same way,
         // and `prefill_budget` is the width admission reserved headroom for.
@@ -466,7 +518,6 @@ impl Session {
         // the tokens are diagnostic rather than the model's. Said out loud
         // rather than left to be inferred from a fluent-looking wrong answer.
         let owns_embed = lo == 0;
-        let partial = hi < t.num_hidden_layers;
 
         let h = t.hidden_size;
         // The router arm and the within-layer split decide WHICH weights the
@@ -476,7 +527,8 @@ impl Session {
         let allocator = super::pool::choose_memory_config();
         let mut admission = super::budget::AdmissionPolicy::runtime(allocator)
             .with_router_bf16(RouterArm::from_env() == RouterArm::Bf16)
-            .with_drafting(false);
+            .with_drafting(false)
+            .with_tp_world(tp.map(Tp::world).unwrap_or(1));
         for layer in lo..hi {
             if !t.is_dense(layer) {
                 let experts = format!("model.llm.layers.{layer}.mlp.experts.w13_weight");
@@ -504,14 +556,16 @@ impl Session {
         // Always: a Session has to be able to answer, so it always binds the
         // unembedding.
         globals.push("model.llm.unembed.weight");
-        src.copy_share(lo..hi, &globals, attention_bytes, admission, None)?;
+        src.copy_share(lo..hi, &globals, attention_bytes, admission, tp)?;
 
-        let dev = burn::backend::cuda::CudaDevice::default();
         // The compute client taken FROM a Burn tensor rather than constructed
         // beside it: `seam::handle_of` hands a Burn allocation to a raw kernel on
         // this client, and two clients would be a wrong answer rather than an
         // error.
-        let client = super::seam::client_of(&BT::<Bk, 2>::zeros([1, 1], &dev));
+        let client = match group.as_ref() {
+            Some(group) => group.client(),
+            None => super::seam::client_of(&BT::<Bk, 2>::zeros([1, 1], &dev)),
+        };
 
         // One registration for the whole arena -- a pile is one file, so a
         // zero-copy lane registers once and every later bind aliases rather
@@ -578,7 +632,7 @@ impl Session {
         }
 
         println!(
-            "  session            : layers {lo}..{hi}{}, prefill budget {} tokens",
+            "  session            : layers {lo}..{hi}{}, prefill budget {} tokens{}",
             match partial {
                 true =>
                     " (PARTIAL STACK -- unembeds through layers it did not all run, so \
@@ -586,6 +640,8 @@ impl Session {
                 false => "",
             },
             cfg.prefill_budget,
+            tp.map(|tp| format!(", tensor rank {} of {}", tp.rank(), tp.world()))
+                .unwrap_or_default(),
         );
 
         Ok(Self {
@@ -593,6 +649,7 @@ impl Session {
             src,
             dev,
             client,
+            group,
             aliases,
             lo,
             hi,
@@ -963,6 +1020,18 @@ impl Session {
         let h = t.hidden_size;
         let n = ids.len();
         let pos0 = self.pos;
+        let tp = self.group.as_ref().map(Group::tp);
+        let group = self.group.as_ref();
+        let dev = &self.dev;
+        let tp_reduce = |x: T2, calls: &mut usize| -> T2 {
+            match group {
+                Some(group) => {
+                    *calls += 1;
+                    super::tpcomm::reduce_activation(group, dev, x)
+                }
+                None => x,
+            }
+        };
         // A pass with a cache behind it is a decode step; the first one is the
         // prefill that establishes the cache.
         let cached = !self.caches.is_empty();
@@ -987,13 +1056,23 @@ impl Session {
         let t_read = std::cell::Cell::new(0f64);
 
         for layer in self.lo..self.hi {
+            let mut tp_calls = 0usize;
             // Cache SLOT, not layer number. A rank running 20..42 keeps 22
             // caches and its first layer is slot 0 — indexing by the absolute
             // layer would walk off the end of a Vec that only holds this rank's
             // half.
             let slot = layer - self.lo;
             let kind = t.attn_kind(layer);
-            let (heads, kv_heads, head_dim) = t.heads(kind);
+            let (global_heads, global_kv_heads, head_dim) = t.heads(kind);
+            let (heads, kv_heads) = match tp {
+                Some(tp) => (
+                    tp.share("q_heads", global_heads)
+                        .map_err(|e| anyhow::anyhow!("layer {layer}: {e}"))?,
+                    tp.share("kv_heads", global_kv_heads)
+                        .map_err(|e| anyhow::anyhow!("layer {layer}: {e}"))?,
+                ),
+                None => (global_heads, global_kv_heads),
+            };
             let p = format!("model.llm.layers.{layer}.");
 
             if !self.layers.contains_key(&p) {
@@ -1005,7 +1084,7 @@ impl Session {
                     &p,
                     layer,
                     t,
-                    None,
+                    tp,
                     router_arm,
                     false,
                     &t_read,
@@ -1062,6 +1141,11 @@ impl Session {
                         window,
                         &mut self.caches[slot].attn,
                     );
+                    // This rank computed only its heads. Reduce the partial
+                    // hidden vector BEFORE mixing it with the already-whole
+                    // convolution history; moving this below the convolution
+                    // stays finite and is wrong.
+                    let y = tp_reduce(y, &mut tp_calls);
                     let (out, all) = dev_lane::short_conv_steps(
                         self.caches[slot].attn_sconv.clone(),
                         y,
@@ -1090,6 +1174,7 @@ impl Session {
                         window,
                         &mut self.caches[slot].attn,
                     );
+                    let y = tp_reduce(y, &mut tp_calls);
                     let (out, hist) = dev_lane::short_conv_step(
                         self.caches[slot].attn_sconv.clone(),
                         y,
@@ -1101,6 +1186,7 @@ impl Session {
                 (false, _) => {
                     let (y, attn) =
                         dev_lane::attention_prefill(hn, &ld.attn, &dims, Some(ls), window, window);
+                    let y = tp_reduce(y, &mut tp_calls);
                     let hist = dev_lane::conv_history(y.clone(), t.sconv_kernel_size);
                     let out = dev_lane::short_conv(y, ld.attn_sconv.clone());
                     self.caches.push(LayerCache {
@@ -1125,7 +1211,7 @@ impl Session {
                         self.aliases.as_ref(),
                         &p,
                         h,
-                        None,
+                        tp,
                     )?;
                     dense_mlp_bf16(hn, w)
                 }
@@ -1150,9 +1236,14 @@ impl Session {
                         hn,
                         n,
                         shared_halved,
+                        tp,
                     )?
                 }
             };
+            // Dense and routed MLPs are both split on their intermediate axis.
+            // As with attention, the partial sum must become whole before the
+            // stateful short convolution consumes it.
+            let y = tp_reduce(y, &mut tp_calls);
             let (out, hist) = match (cached, n > 1) {
                 // The fourth of the four short convolutions a widened pass runs
                 // per layer -- two are inside `attention_steps`, one is the
@@ -1183,6 +1274,13 @@ impl Session {
             };
             self.caches[slot].mlp_sconv = Some(hist);
             xd = dev_lane_resid::add_resid(xd, out);
+
+            let expected = if group.is_some() { 2 } else { 0 };
+            assert_eq!(
+                tp_calls, expected,
+                "layer {layer} issued {tp_calls} tensor-parallel collectives, not {expected} \
+                 (one after attention and one after the MLP, both before their short convolution)"
+            );
         }
 
         // ---- the head -----------------------------------------------------
@@ -1235,5 +1333,27 @@ mod tests {
             c.extend_batch,
             c.prefill_budget
         );
+    }
+
+    #[test]
+    fn a_single_rank_keeps_the_strict_subrange_rule() {
+        assert!(validate_layer_range(&(0..21), 42, None).unwrap());
+        assert!(validate_layer_range(&(21..42), 42, None).is_ok());
+        let err = validate_layer_range(&(0..42), 42, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("whole 42-layer stack"), "{err}");
+    }
+
+    #[test]
+    fn tensor_parallel_ranks_require_the_exact_full_stack() {
+        let tp = Tp::new(1, 2).unwrap();
+        assert!(!validate_layer_range(&(0..42), 42, Some(tp)).unwrap());
+        for range in [0..21, 21..42, 1..42] {
+            let err = validate_layer_range(&range, 42, Some(tp))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("every rank runs every layer"), "{err}");
+        }
     }
 }
