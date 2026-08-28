@@ -716,9 +716,55 @@ fn flash_kernel<KV: Numeric>(
         sync_cube();
 
         // --- the value average ----------------------------------------------
-        // Lane `l` owns output dimensions `l, l+32, ...`, so the V read is
-        // consecutive across the plane: one coalesced line per key per
-        // dimension group, and the four planes share it through L1.
+        // The four planes need the SAME V tile.  The dense reader leaves the
+        // old direct load alone: its one BF16 load is an L1 hit in the three
+        // planes which arrive after the first.  The packed reader cannot do
+        // that cheaply -- every apparent load is also a nibble extraction and
+        // a scale load -- so its 128 units cooperatively expand the tile ONCE
+        // into the key tile's now-dead shared memory.
+        //
+        // One unit owns one whole sixteen-value NVFP4 block at a time.  That is
+        // the storage algebra rather than merely coalesced scalar indexing:
+        // one E4M3 scale and two u32 words become sixteen consecutive values.
+        // `head_dim` is a multiple of PLANE for every admitted shape, hence a
+        // sixteen-value block cannot straddle either a head or a key row.
+        if comptime![packed] {
+            let blocks = comptime!(PLANE * head_dim / 16);
+            let mut block = u;
+            while block < blocks {
+                let first = block * 16;
+                let j = first / head_dim;
+                let d0 = first % head_dim;
+                let vkey = t + j;
+
+                let mut word0 = u32::new(0);
+                let mut word1 = u32::new(0);
+                let mut scale = f32::new(0.0);
+                if vkey < s_hi {
+                    let idx = vkey * kv_row + kvh * head_dim + d0;
+                    word0 = vc[(idx / 8) as usize];
+                    word1 = vc[(idx / 8 + 1) as usize];
+                    scale = f32::cast_from(vs[(idx / 16) as usize]);
+                }
+
+                #[unroll]
+                for e in 0u32..16u32 {
+                    let mut code = (word0 >> (e * 4u32)) & 15u32;
+                    if e >= 8u32 {
+                        code = (word1 >> ((e - 8u32) * 4u32)) & 15u32;
+                    }
+                    sk[(j * skw + d0 + e) as usize] = e2m1_bits(code) * scale;
+                }
+                block += UNITS;
+            }
+            // Every plane consumes every staged row below.  This barrier is
+            // absent from the dense instantiation because `packed` is comptime.
+            sync_cube();
+        }
+
+        // Lane `l` owns output dimensions `l, l+32, ...`.  Packed V now comes
+        // from the one cooperatively expanded tile; dense V keeps its direct
+        // consecutive read and L1 sharing.
         for j in 0..PLANE {
             let vkey = t + j;
             if vkey < s_hi {
@@ -729,7 +775,7 @@ fn flash_kernel<KV: Numeric>(
                     if d < head_dim {
                         let mut vv = f32::new(0.0);
                         if comptime![packed] {
-                            vv = nvfp4_at(vc, vs, vbase + d);
+                            vv = sk[(j * skw + d) as usize];
                         } else {
                             vv = f32::cast_from(v[(vbase + d) as usize]);
                         }
