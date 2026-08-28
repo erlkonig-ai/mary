@@ -6,8 +6,6 @@
 //!                           --playground <mock_mcp_server> \
 //!                           --expect-command <exact-command> --voice <stub_speech>
 //! inkling_serve_gate probe  --serve <inkling_serve> --serve-arg …
-//! inkling_serve_gate prefix --serve <inkling_serve_pair> --serve-arg … \
-//!                           --playground <mock_mcp_server> --memory-pile <self.pile>
 //! ```
 //!
 //! # Why this binary is GPU-free, and lives in `mary`
@@ -58,7 +56,7 @@ use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
 
-use mary::models::inkling::serve::{Consult, InklingMind, Ready, ServeClient, TurnEnd};
+use mary::models::inkling::serve::{Consult, InklingMind, ServeClient, TurnEnd};
 
 fn usage() -> &'static str {
     "\
@@ -67,12 +65,11 @@ inkling_serve_gate — drive's loop, driven by a real Inkling Session
 USAGE:
     inkling_serve_gate drive [OPTIONS]     # the gate: drive, with a real mind
     inkling_serve_gate probe [OPTIONS]     # the protocol alone, with a delta
-    inkling_serve_gate prefix [OPTIONS]    # retained boundary = uninterrupted run
 
 OPTIONS (both):
     --serve <path>       The inkling_serve binary [required]
     --serve-arg <arg>    Argument passed to it; repeatable
-    --gen <n>            Tokens per turn (default 24)
+    --gen <n>            Generation cap per response/consultation (default 24)
     --turns <n>          Turns to run (default 3)
     --system <text>      First delta: what the model is given to start from
 
@@ -99,11 +96,6 @@ OPTIONS (drive):
 OPTIONS (probe):
     --feed <text>        Delta fed before a turn; repeatable, one per turn after
                          the first
-
-PREFIX:
-    Runs one fresh process for two one-token Drive turns and another fresh
-    process for one two-token turn over the same real cover. It requires exact
-    token and final-position equality; --gen and --turns are ignored.
 "
 }
 
@@ -241,7 +233,6 @@ fn main() {
     let result = match args.first().map(String::as_str) {
         Some("drive") => parse(&args[1..]).and_then(|o| cmd_drive(&o)),
         Some("probe") => parse(&args[1..]).and_then(|o| cmd_probe(&o)),
-        Some("prefix") => parse(&args[1..]).and_then(|o| cmd_prefix(&o)),
         Some("-h") | Some("--help") | None => {
             print!("{}", usage());
             Ok(())
@@ -252,11 +243,6 @@ fn main() {
         eprintln!("inkling_serve_gate: {error:#}");
         std::process::exit(1);
     }
-}
-
-struct DriveRun {
-    ready: Ready,
-    turns: Vec<TurnEnd>,
 }
 
 fn cmd_drive(o: &Options) -> Result<()> {
@@ -274,35 +260,26 @@ fn cmd_drive(o: &Options) -> Result<()> {
         o.tokens,
         o.turns,
         "drive",
-        ActionPolicy::Expect {
+        ActionPolicy {
             command: expected,
             timeout_ms: o.exec_timeout_ms,
         },
     )
-    .map(|_| ())
 }
 
 #[derive(Clone, Copy)]
-enum ActionPolicy<'a> {
-    Deny,
-    Expect { command: &'a str, timeout_ms: u64 },
+struct ActionPolicy<'a> {
+    command: &'a str,
+    timeout_ms: u64,
 }
 
 impl ActionPolicy<'_> {
     fn sandbox_args(self) -> Vec<String> {
-        match self {
-            Self::Deny => vec!["--deny-exec".to_string()],
-            Self::Expect { command, .. } => {
-                vec!["--allow-command".to_string(), command.to_string()]
-            }
-        }
+        vec!["--allow-command".to_string(), self.command.to_string()]
     }
 
     fn timeout_ms(self) -> Option<u64> {
-        match self {
-            Self::Deny => Some(1),
-            Self::Expect { timeout_ms, .. } => Some(timeout_ms),
-        }
+        Some(self.timeout_ms)
     }
 }
 
@@ -313,7 +290,7 @@ fn run_drive(
     turns: usize,
     label: &str,
     action_policy: ActionPolicy<'_>,
-) -> Result<DriveRun> {
+) -> Result<()> {
     let playground = o
         .playground
         .clone()
@@ -327,8 +304,7 @@ fn run_drive(
     });
 
     let client = serve_client(o)?;
-    let ready = client.ready().clone();
-    let partial = ready.partial;
+    let partial = client.ready().partial;
     let mind = InklingMind::new_gate(client, tokens, Some(o.system.clone()));
     let voice_slot = mind.voice_slot();
     let log = mind.log().expect("the finite gate retains turn evidence");
@@ -358,7 +334,7 @@ fn run_drive(
         // Optional because the original seam gate still needs a tiny no-memory
         // form. When supplied, this is Drive's production cover path: the same
         // memory faculty, one shell-physical command/result pair per chunk, and
-        // the same hard completeness rule. That makes a large-prefix run an
+        // the same hard completeness rule. That makes a large-cover run an
         // end-to-end continuity measurement rather than a synthetic prompt.
         memory: o.memory_pile.as_ref().map(|memory_pile| {
             let mut budget = drive::context::ModelBudget::default();
@@ -386,7 +362,7 @@ fn run_drive(
     );
 
     let outcomes = shell.run(drive::shell::Extent::Turns(turns), &AtomicBool::new(false));
-    let monologue = shell.monologue().to_string();
+    let monologue = shell.monologue_window().text.to_string();
     let voice_report = shell.voice().map(|voice| voice.report());
     let finish = shell.finish();
     let outcomes = outcomes.context("run drive's loop")?;
@@ -469,17 +445,12 @@ fn run_drive(
     }
     verify_drive_turns(&turns)?;
     verify_action_policy(&outcomes, action_policy)?;
-    if let ActionPolicy::Expect {
-        command,
-        timeout_ms,
-    } = action_policy
-    {
-        println!(
-            "\n=== exact native action: PASS ===\n  one Fire for {command:?}, with a typed \
-             successful result inside the {timeout_ms}ms bound"
-        );
-    }
-    Ok(DriveRun { ready, turns })
+    println!(
+        "\n=== exact native action: PASS ===\n  one Fire for {:?}, with a typed successful \
+         result inside the {}ms bound",
+        action_policy.command, action_policy.timeout_ms
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -510,40 +481,32 @@ fn verify_action_policy(
 }
 
 fn verify_action_evidence(actions: &[ActionEvidence<'_>], policy: ActionPolicy<'_>) -> Result<()> {
-    match policy {
-        ActionPolicy::Deny => anyhow::ensure!(
-            actions.is_empty(),
-            "a no-action gate observed {} Fire decision(s)",
+    let command = policy.command;
+    let [action] = actions else {
+        anyhow::bail!(
+            "expected exactly one Fire for {command:?}, observed {}",
             actions.len()
-        ),
-        ActionPolicy::Expect { command, .. } => {
-            let [action] = actions else {
-                anyhow::bail!(
-                    "expected exactly one Fire for {command:?}, observed {}",
-                    actions.len()
-                );
-            };
-            anyhow::ensure!(
-                action.command == Some(command),
-                "the one Fire named {:?}, expected {command:?}",
-                action.command
-            );
-            anyhow::ensure!(
-                action.has_content && action.has_result_id,
-                "the Fire for {command:?} did not produce both a typed result and durable result id"
-            );
-            anyhow::ensure!(
-                action.is_error == Some(false),
-                "the Fire for {command:?} returned isError {:?}",
-                action.is_error
-            );
-            anyhow::ensure!(
-                action.exit_code == Some(0),
-                "the Fire for {command:?} returned exit {:?}",
-                action.exit_code
-            );
-        }
-    }
+        );
+    };
+    anyhow::ensure!(
+        action.command == Some(command),
+        "the one Fire named {:?}, expected {command:?}",
+        action.command
+    );
+    anyhow::ensure!(
+        action.has_content && action.has_result_id,
+        "the Fire for {command:?} did not produce both a typed result and durable result id"
+    );
+    anyhow::ensure!(
+        action.is_error == Some(false),
+        "the Fire for {command:?} returned isError {:?}",
+        action.is_error
+    );
+    anyhow::ensure!(
+        action.exit_code == Some(0),
+        "the Fire for {command:?} returned exit {:?}",
+        action.exit_code
+    );
     Ok(())
 }
 
@@ -566,7 +529,15 @@ fn verify_drive_turns(turns: &[TurnEnd]) -> Result<()> {
             end.token_ids.len(),
             end.tokens
         );
-        let expected_carried = usize::from(ordinal > 0);
+        // REINITIALIZE stages one complete replacement initialization in a
+        // reset Session. Its first turn therefore has fresh delta, no carry,
+        // and a position measured from zero again. Every ordinary turn after
+        // the first still has to carry the preceding generated token.
+        let reinitialized = ordinal > 0 && end.carried == 0 && end.delta_tokens > 0;
+        if reinitialized {
+            expected_position = 0;
+        }
+        let expected_carried = usize::from(ordinal > 0 && !reinitialized);
         anyhow::ensure!(
             end.carried == expected_carried,
             "turn {ordinal} carried {} token(s), expected {expected_carried}",
@@ -590,121 +561,6 @@ fn verify_drive_turns(turns: &[TurnEnd]) -> Result<()> {
             end.position
         );
     }
-    Ok(())
-}
-
-/// Prove that retaining a prefix across a turn boundary is the same computation
-/// as never crossing that boundary at all.
-///
-/// Arm A asks for one token twice. The first token therefore waits in `carry`
-/// and is appended by a cheap retained-context pass. Arm B starts a fresh
-/// serving process over the same Drive cover and asks for both tokens in one
-/// turn. Its internal `step` appends precisely the row Arm A carried. Equality
-/// of both exact ids and final positions is a semantic oracle; the A1/B0 timing
-/// contrast is then the retained-prefix win rather than merely a fast number.
-fn cmd_prefix(o: &Options) -> Result<()> {
-    anyhow::ensure!(
-        o.memory_pile.is_some(),
-        "prefix requires --memory-pile: a tiny synthetic prompt cannot prove real cover survival"
-    );
-    anyhow::ensure!(
-        o.pile.is_none(),
-        "prefix creates two independent scratch histories; omit --pile so neither arm can see \
-         the other's provenance"
-    );
-
-    let retained = run_drive(o, 1, 2, "ARM A — retained boundary", ActionPolicy::Deny)?;
-    let rebuilt = run_drive(o, 2, 1, "ARM B — uninterrupted rebuild", ActionPolicy::Deny)?;
-
-    let [a0, a1] = retained.turns.as_slice() else {
-        anyhow::bail!("retained arm did not produce exactly two turns");
-    };
-    let [b0] = rebuilt.turns.as_slice() else {
-        anyhow::bail!("uninterrupted arm did not produce exactly one turn");
-    };
-    anyhow::ensure!(
-        a0.stopped == "max_tokens",
-        "the retained arm's first token completed a logical response ({:?}); crossing that \
-         boundary inserts a fresh generation prompt, so this sample cannot prove retained-prefix \
-         equivalence",
-        a0.stopped
-    );
-
-    for (name, left, right) in [
-        (
-            "model identity",
-            retained.ready.model_identity.as_str(),
-            rebuilt.ready.model_identity.as_str(),
-        ),
-        (
-            "tokenizer identity",
-            retained.ready.tokenizer_identity.as_str(),
-            rebuilt.ready.tokenizer_identity.as_str(),
-        ),
-        (
-            "execution identity",
-            retained.ready.execution_identity.as_str(),
-            rebuilt.ready.execution_identity.as_str(),
-        ),
-    ] {
-        anyhow::ensure!(
-            left == right,
-            "prefix arms used different {name}: {left} vs {right}"
-        );
-    }
-    anyhow::ensure!(
-        retained.ready.layers == rebuilt.ready.layers
-            && retained.ready.prefill_budget == rebuilt.ready.prefill_budget
-            && retained.ready.context_budget == rebuilt.ready.context_budget,
-        "prefix arms announced different execution shapes"
-    );
-    anyhow::ensure!(
-        a0.delta_tokens == b0.delta_tokens,
-        "the supposedly identical Drive covers tokenised to {} and {} tokens",
-        a0.delta_tokens,
-        b0.delta_tokens
-    );
-    anyhow::ensure!(
-        a0.delta_tokens > retained.ready.prefill_budget,
-        "the {}-token cover did not exceed the {}-token prefill chunk, so this run never \
-         exercised chunked prefill",
-        a0.delta_tokens,
-        retained.ready.prefill_budget
-    );
-    anyhow::ensure!(
-        a0.delta_tokens <= retained.ready.context_budget,
-        "the {}-token cover exceeded the announced {}-token context budget",
-        a0.delta_tokens,
-        retained.ready.context_budget
-    );
-
-    let retained_ids: Vec<u32> = a0.token_ids.iter().chain(&a1.token_ids).copied().collect();
-    anyhow::ensure!(
-        retained_ids == b0.token_ids,
-        "the retained boundary produced ids {retained_ids:?}, while the uninterrupted run \
-         produced {:?}",
-        b0.token_ids
-    );
-    anyhow::ensure!(
-        a1.position == b0.position,
-        "the retained arm ended at position {}, uninterrupted at {}",
-        a1.position,
-        b0.position
-    );
-
-    println!("\n=== exact retained-prefix equivalence: PASS ===");
-    println!(
-        "  cover: {} token(s), processed in chunks of at most {}, retained capacity {}",
-        a0.delta_tokens, retained.ready.prefill_budget, retained.ready.context_budget
-    );
-    println!(
-        "  ids: {:?}; final position: {}; retained continuation {:.3}s vs fresh rebuild {:.3}s",
-        retained_ids, a1.position, a1.first_token_secs, b0.first_token_secs
-    );
-    println!(
-        "  retained/rebuild first-token ratio: {:.4}",
-        a1.first_token_secs / b0.first_token_secs.max(f64::EPSILON)
-    );
     Ok(())
 }
 
@@ -805,7 +661,7 @@ mod tests {
             token_ids: (0..tokens as u32).collect(),
             delta_tokens,
             carried,
-            stopped: "max_tokens".to_string(),
+            stopped: "content_model_end_sampling".to_string(),
             first_token_secs: 0.1,
             turn_secs: 0.2,
             position,
@@ -823,6 +679,18 @@ mod tests {
         let turns = [turn(0, 3, 20, 0, 22), turn(1, 2, 7, 1, 31)];
         verify_drive_turns(&turns)
             .expect("a tool result or generation prompt is a legitimate later delta");
+    }
+
+    #[test]
+    fn a_reinitialized_epoch_restarts_position_without_a_carry() {
+        let turns = [
+            turn(0, 3, 20, 0, 22),
+            turn(1, 2, 0, 1, 24),
+            turn(2, 2, 17, 0, 18),
+            turn(3, 1, 0, 1, 19),
+        ];
+        verify_drive_turns(&turns)
+            .expect("the replacement initialization starts one fresh Session epoch");
     }
 
     #[test]
@@ -861,7 +729,7 @@ mod tests {
 
     #[test]
     fn expected_action_requires_one_exact_successful_durable_result() {
-        let expected = ActionPolicy::Expect {
+        let expected = ActionPolicy {
             command: "printf native-tp2-ok",
             timeout_ms: 5_000,
         };
@@ -898,23 +766,5 @@ mod tests {
         verify_action_evidence(&[], expected).expect_err("no Fire must fail the gate");
         verify_action_evidence(&[good, good], expected)
             .expect_err("a second Fire must fail the gate");
-    }
-
-    #[test]
-    fn no_action_runs_deny_the_mock_and_reject_any_fire() {
-        assert_eq!(
-            ActionPolicy::Deny.sandbox_args(),
-            ["--deny-exec".to_string()]
-        );
-        verify_action_evidence(&[], ActionPolicy::Deny).expect("no action is allowed");
-        let action = ActionEvidence {
-            command: Some("true"),
-            has_content: true,
-            is_error: Some(false),
-            exit_code: Some(0),
-            has_result_id: true,
-        };
-        verify_action_evidence(&[action], ActionPolicy::Deny)
-            .expect_err("a Fire must fail a no-action gate");
     }
 }
