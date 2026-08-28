@@ -1086,19 +1086,31 @@ fn parse_native_exec(json: &str) -> Result<NativeExecCall> {
 
 /// Append a canonical, marker-free transcript projection for one typed call.
 /// The returned range is exact within `said` and can be shifted by the current
-/// session monologue extent for `Decision::fire`.
+/// session monologue extent for `Decision::fire_projected`.
 #[cfg(any(feature = "drive-mind", test))]
 fn project_native_exec(said: &mut String, command: &str) -> std::ops::Range<usize> {
+    // The separator is projection scaffold too. Naming it inside the range lets
+    // Archive remove the entire synthetic suffix without retaining a newline
+    // that the model never actually spoke.
+    let start = said.len();
     if !said.is_empty() && !said.ends_with('\n') {
         said.push('\n');
     }
-    let start = said.len();
     said.push_str("$ ");
     said.push_str(command);
     if !said.ends_with('\n') {
         said.push('\n');
     }
     start..said.len()
+}
+
+#[cfg(feature = "drive-mind")]
+fn response_state_for_slice(completed: bool) -> drive::mind::ResponseState {
+    if completed {
+        drive::mind::ResponseState::Complete
+    } else {
+        drive::mind::ResponseState::Open
+    }
 }
 
 /// Associate one arbitrated id with the fragments emitted by its one-token
@@ -3233,7 +3245,7 @@ impl InklingMind {
                     let span = said[range.clone()].to_string();
                     let _ = self.finish_coverage();
                     self.outstanding_exec = Some(call.command.clone());
-                    drive::mind::Decision::fire(
+                    drive::mind::Decision::fire_projected(
                         call.command,
                         span,
                         fresh_base + range.start as u64,
@@ -3265,7 +3277,8 @@ impl InklingMind {
         if !reasoning.is_empty() {
             decision = decision.with_reasoning(reasoning);
         }
-        Ok(drive::mind::Turn::new(said, decision))
+        Ok(drive::mind::Turn::new(said, decision)
+            .with_response_state(response_state_for_slice(completed)))
     }
 }
 
@@ -3765,10 +3778,35 @@ mod tests {
         let mut said = "I will inspect.".to_string();
         let range = project_native_exec(&mut said, "printf same-turn");
         assert_eq!(said, "I will inspect.\n$ printf same-turn\n");
-        assert_eq!(&said[range.clone()], "$ printf same-turn\n");
+        assert_eq!(&said[range.clone()], "\n$ printf same-turn\n");
         let prior_monologue_end = 73_u64;
-        assert_eq!(prior_monologue_end + range.start as u64, 89);
+        assert_eq!(prior_monologue_end + range.start as u64, 88);
         assert_eq!(prior_monologue_end + range.end as u64, 108);
+    }
+
+    #[cfg(feature = "drive-mind")]
+    #[test]
+    fn projected_calls_and_token_slices_carry_explicit_archive_semantics() {
+        let decision = drive::mind::Decision::fire_projected(
+            "printf same-turn",
+            "\n$ printf same-turn\n",
+            88,
+            108,
+            0,
+            "native call projection",
+        );
+        assert_eq!(
+            decision.command_span_origin,
+            Some(drive::mind::CommandSpanOrigin::Projected)
+        );
+        assert_eq!(
+            response_state_for_slice(false),
+            drive::mind::ResponseState::Open
+        );
+        assert_eq!(
+            response_state_for_slice(true),
+            drive::mind::ResponseState::Complete
+        );
     }
 
     #[test]
@@ -4586,6 +4624,10 @@ exec cat >/dev/null
         assert_eq!(turn.said, "$ printf same-turn\n");
         assert_eq!(turn.decision.disposition, drive::mind::Disposition::Fire);
         assert_eq!(turn.decision.command.as_deref(), Some("printf same-turn"));
+        assert_eq!(
+            turn.decision.command_span_origin,
+            Some(drive::mind::CommandSpanOrigin::Projected)
+        );
         assert_eq!(turn.decision.span, "$ printf same-turn\n");
         assert_eq!(turn.decision.span_start, "prior ".len() as u64);
         assert_eq!(
@@ -4596,6 +4638,7 @@ exec cat >/dev/null
             turn.decision.reasoning.as_deref(),
             Some("checked exact bytes")
         );
+        assert_eq!(turn.response_state, drive::mind::ResponseState::Complete);
         assert_eq!(
             mind.log()
                 .expect("finite fixture retains turn evidence")
