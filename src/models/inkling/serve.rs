@@ -1679,10 +1679,12 @@ impl ServeClient {
     /// This is deliberately not an automatic Drive policy. The caller above
     /// the wire owns the durable cognition pile and must construct the fresh
     /// cover represented by this initialization. In particular, a Drive
-    /// rollover must rebuild the cover with its fail-loud `build_cover`, take
-    /// `Cover::end_key` as the end of *contiguous* recalled coverage, and replay
-    /// every live turn after that boundary. A later isolated memory does not
-    /// make an earlier uncovered turn safe to discard.
+    /// rollover must rebuild the cover with its fail-loud `build_cover`, require
+    /// that it selects a previously observed `memory create` receipt and advances
+    /// contiguously through that memory, then replay Archive history after the
+    /// action's exact causal predecessor. Timestamps organize recalled coverage;
+    /// they never locate the omission boundary, and a later isolated memory does
+    /// not make an earlier uncovered turn safe to discard.
     ///
     /// The serving process cannot see whether Drive still has a tool execution
     /// in flight. Its completed-turn check is only the narrow mechanical
