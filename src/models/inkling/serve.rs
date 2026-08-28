@@ -31,13 +31,15 @@
 //! keyframes — needs no separate channel". That is used here rather than
 //! worked around: a record whose content type is the stream's default is
 //! CONTENT (raw probe context going in, a decoded fragment coming out), and a
-//! record that overrides it is CONTROL. Six overrides exist, and there is no
+//! record that overrides it is CONTROL. Eight overrides exist, and there is no
 //! second socket, no length-prefixed sidecar and no JSON-lines mode:
 //!
 //! | content type | direction | meaning |
 //! |---|---|---|
 //! | [`READY_TYPE`] | serve → client | the model is loaded; here is what it is |
 //! | [`CONTEXT_TYPE`] | client → serve | insert typed TML context safely |
+//! | [`CONTEXT_PREFLIGHT_TYPE`] | client → serve | measure exact typed context plus a bounded response without changing state |
+//! | [`CONTEXT_PREFLIGHTED_TYPE`] | serve → client | report exact admission evidence |
 //! | [`CONSULT_TYPE`] | client → serve | the delta is complete — produce a turn |
 //! | [`TURN_TYPE`] | serve → client | the turn is over; here is how it went |
 //! | [`REINITIALIZE_TYPE`] | client → serve | replace one completed sequence with a complete initialization |
@@ -251,6 +253,11 @@ pub const CONSULT_TYPE: &str = "application/vnd.mary.inkling-consult+json";
 /// the serving process's content-only tokenizer; it is never scanned for TML
 /// marker spellings.
 pub const CONTEXT_TYPE: &str = "application/vnd.mary.inkling-context+json";
+/// Control record, client → serve: measure one exact typed context plus a
+/// complete bounded response without changing any serving state.
+pub const CONTEXT_PREFLIGHT_TYPE: &str = "application/vnd.mary.inkling-context-preflight+json";
+/// Control record, serve → client: exact context-admission evidence.
+pub const CONTEXT_PREFLIGHTED_TYPE: &str = "application/vnd.mary.inkling-context-preflighted+json";
 /// Control record, serve → client: the turn is over, and here is how it went.
 pub const TURN_TYPE: &str = "application/vnd.mary.inkling-turn+json";
 /// Control record, client → serve: atomically replace a completed sequence
@@ -443,6 +450,120 @@ pub enum InklingContext {
     /// Start another autonomous assistant response after a completed text-only
     /// response. A tool result already carries this prompt itself.
     GenerationPrompt,
+}
+
+/// Where a typed context would be placed if its preflight succeeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextPlacement {
+    /// Extend the resident sequence, including its one unfed carry token.
+    Append,
+    /// Replace the resident sequence; admission begins at an empty Session.
+    Replace,
+}
+
+/// Client → serve: price one exact typed delta and its whole response.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextPreflight {
+    pub placement: ContextPlacement,
+    pub context: InklingContext,
+    pub max_response_tokens: usize,
+}
+
+/// Serve → client: the exact arithmetic used for context admission.
+///
+/// `required_end == None` is checked-arithmetic overflow and is necessarily a
+/// rejection. A rejected preflight has changed neither Session nor any of the
+/// serving protocol's pending context, carry, decoder, or turn state.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextPreflighted {
+    pub placement: ContextPlacement,
+    pub position: usize,
+    pub carried: usize,
+    pub delta_tokens: usize,
+    pub max_response_tokens: usize,
+    pub required_end: Option<usize>,
+    pub context_budget: usize,
+    pub fits: bool,
+}
+
+impl ContextPreflighted {
+    fn validate_for(&self, request: &ContextPreflight, context_budget: usize) -> Result<()> {
+        anyhow::ensure!(
+            self.placement == request.placement,
+            "context-preflight placement changed from {:?} to {:?}",
+            request.placement,
+            self.placement
+        );
+        anyhow::ensure!(
+            self.max_response_tokens == request.max_response_tokens,
+            "context-preflight response bound changed from {} to {}",
+            request.max_response_tokens,
+            self.max_response_tokens
+        );
+        anyhow::ensure!(
+            self.context_budget == context_budget,
+            "context-preflight budget {} disagrees with READY budget {context_budget}",
+            self.context_budget
+        );
+        anyhow::ensure!(
+            self.carried <= 1,
+            "context-preflight reported {} carry tokens",
+            self.carried
+        );
+        let recomputed = context_preflight(
+            self.placement,
+            self.position,
+            self.carried,
+            self.delta_tokens,
+            self.max_response_tokens,
+            self.context_budget,
+        )?;
+        anyhow::ensure!(
+            *self == recomputed,
+            "context-preflight evidence is not self-consistent: {self:?}"
+        );
+        Ok(())
+    }
+}
+
+/// Compute the singular response-admission inequality.
+///
+/// A response's first token is predicted by the pass which appends carry and
+/// delta, so only `R - 1` further positions have to be retained:
+/// `p + carry + D + (R - 1) <= context_budget`.
+pub fn context_preflight(
+    placement: ContextPlacement,
+    position: usize,
+    carried: usize,
+    delta_tokens: usize,
+    max_response_tokens: usize,
+    context_budget: usize,
+) -> Result<ContextPreflighted> {
+    anyhow::ensure!(
+        max_response_tokens > 0,
+        "context preflight requires a nonzero response bound"
+    );
+    let (base_position, base_carried) = match placement {
+        ContextPlacement::Append => (position, carried),
+        ContextPlacement::Replace => (0, 0),
+    };
+    let required_end = base_position
+        .checked_add(base_carried)
+        .and_then(|end| end.checked_add(delta_tokens))
+        .and_then(|end| end.checked_add(max_response_tokens - 1));
+    Ok(ContextPreflighted {
+        placement,
+        position: base_position,
+        carried: base_carried,
+        delta_tokens,
+        max_response_tokens,
+        required_end,
+        context_budget,
+        fits: required_end.is_some_and(|end| end <= context_budget),
+    })
 }
 
 /// Serve → client: one completed sequence has been replaced in the same
@@ -1509,6 +1630,41 @@ impl ServeClient {
             .with_context(|| format!("feed typed context to {}", self.label))
     }
 
+    /// Ask the tokenizer-owning process whether one exact typed context plus a
+    /// whole bounded response fits, without queueing or attending to it.
+    pub fn preflight_context(&mut self, request: &ContextPreflight) -> Result<ContextPreflighted> {
+        let payload = serde_json::to_vec(request).context("encode Inkling context preflight")?;
+        self.writer()?
+            .record_as(CONTEXT_PREFLIGHT_TYPE, &payload, payload.len() as u64)
+            .with_context(|| format!("preflight context for {}", self.label))?;
+        match self
+            .reader
+            .next_frame()
+            .with_context(|| format!("wait for {} context preflight", self.label))?
+        {
+            framed_stream::Frame::Record(record)
+                if record.content_type() == CONTEXT_PREFLIGHTED_TYPE =>
+            {
+                let evidence = serde_json::from_slice::<ContextPreflighted>(&record.payload)
+                    .context("parse the serving process's context preflight")?;
+                evidence.validate_for(request, self.ready.context_budget)?;
+                Ok(evidence)
+            }
+            framed_stream::Frame::Record(record) => anyhow::bail!(
+                "the serving process sent a {} record while preflighting context",
+                record.content_type()
+            ),
+            framed_stream::Frame::Gap(gap) => anyhow::bail!(
+                "the serving process could not report context admission: {} byte(s): {}",
+                gap.extent,
+                gap.reason
+            ),
+            framed_stream::Frame::End(status) => {
+                anyhow::bail!("the serving process ended while preflighting context: {status:?}")
+            }
+        }
+    }
+
     /// Replace one completed sequence while keeping the serving process and its
     /// warm weights alive.
     ///
@@ -2252,6 +2408,34 @@ impl ServePair {
         Ok(())
     }
 
+    /// Obtain identical, read-only admission evidence from both ranks.
+    ///
+    /// Equal rejection is an ordinary answer and leaves both sessions usable.
+    /// A transport error or unequal evidence means the pair no longer has one
+    /// trustworthy view of its context boundary and is terminal.
+    pub fn preflight_context(&mut self, request: &ContextPreflight) -> Result<ContextPreflighted> {
+        anyhow::ensure!(!self.terminated, "the serving pair is terminated");
+        let rank0 = match self.rank0.preflight_context(request) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                self.fail_and_reap();
+                return Err(error.context("preflight context on rank 0"));
+            }
+        };
+        let rank1 = match self.rank1.preflight_context(request) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                self.fail_and_reap();
+                return Err(error.context("preflight context on rank 1"));
+            }
+        };
+        if let Err(error) = matching_context_preflight(&rank0, &rank1) {
+            self.fail_and_reap();
+            return Err(error);
+        }
+        Ok(rank0)
+    }
+
     /// Reinitialize both ranks at the same completed-turn boundary.
     ///
     /// Session reset has no collective, so the requests may be acknowledged in
@@ -2398,6 +2582,17 @@ impl ServePair {
         wait_children(&children);
         self.terminated = true;
     }
+}
+
+fn matching_context_preflight(
+    rank0: &ContextPreflighted,
+    rank1: &ContextPreflighted,
+) -> Result<()> {
+    anyhow::ensure!(
+        rank0 == rank1,
+        "rank context-preflight evidence diverged: rank 0 {rank0:?}, rank 1 {rank1:?}"
+    );
+    Ok(())
 }
 
 fn concurrently<T: Send, L, R>(left: L, right: R) -> Result<(Result<T>, Result<T>)>
@@ -2964,6 +3159,14 @@ struct FailedTurn {
 }
 
 #[cfg(feature = "drive-mind")]
+#[derive(Debug, PartialEq, Eq)]
+enum PendingObservationContext {
+    Context(InklingContext),
+    WaitingForResult,
+    AlreadyStaged,
+}
+
+#[cfg(feature = "drive-mind")]
 impl From<anyhow::Error> for FailedTurn {
     fn from(error: anyhow::Error) -> Self {
         Self {
@@ -3125,24 +3328,79 @@ impl InklingMind {
         (span_start, span_end)
     }
 
-    /// Exact fixed-token headroom for beginning one more text response.
-    ///
-    /// `position` excludes the previous response's emitted final token. Starting
-    /// again appends that carry and one generation prompt; their forward pass
-    /// predicts response token one, so only `max_response_tokens - 1` more
-    /// positions are stepped. The resulting bound is `R + 1`, not a tuning
-    /// margin and not one arbitrary response slice. A pending tool result adds
-    /// its separately tokenized delta; the serving Session remains the final
-    /// exact admission boundary for that variable-width input.
-    fn replacement_due(&self) -> bool {
-        if !self.initialized || !(self.needs_generation_prompt || self.outstanding_exec.is_some()) {
-            return false;
+    /// Reconstruct the one typed delta this observation would send, without
+    /// mutating either the adapter or the serving process.
+    fn pending_context(&self, events: &[drive::world::Event]) -> Result<PendingObservationContext> {
+        let mut results = Vec::new();
+        for event in events {
+            if let drive::world::Payload::Result {
+                command,
+                content,
+                is_error,
+                exit_code,
+            } = &event.payload
+            {
+                results.push(ExecResultContext {
+                    command: command.clone(),
+                    content: text_result_content(content, *is_error, *exit_code),
+                });
+            }
         }
-        let Some(position) = self.position else {
-            return false;
-        };
-        let required = self.max_response_tokens.max(1).saturating_add(1);
-        position.saturating_add(required) > self.client.ready().context_budget
+
+        if !self.initialized {
+            return Ok(PendingObservationContext::Context(
+                InklingContext::Initialize {
+                    system: self.system.clone().unwrap_or_default(),
+                    history: results
+                        .into_iter()
+                        .map(InklingHistoryResponse::exec)
+                        .collect(),
+                },
+            ));
+        }
+        anyhow::ensure!(
+            results.len() <= 1,
+            "received {} exec results in one post-initialization view",
+            results.len()
+        );
+        if let Some(result) = results.pop() {
+            return match self.outstanding_exec.as_deref() {
+                Some(command) => {
+                    anyhow::ensure!(
+                        command == result.command,
+                        "exec result command {:?} did not match outstanding command {:?}",
+                        result.command,
+                        command
+                    );
+                    Ok(PendingObservationContext::Context(
+                        InklingContext::ToolResult { result },
+                    ))
+                }
+                None => {
+                    anyhow::ensure!(
+                        self.needs_generation_prompt,
+                        "historical exec result arrived inside an unfinished assistant response"
+                    );
+                    Ok(PendingObservationContext::Context(
+                        InklingContext::HistoricalResponse {
+                            response: InklingHistoryResponse::exec(result),
+                        },
+                    ))
+                }
+            };
+        }
+        if self.outstanding_exec.is_some() {
+            Ok(PendingObservationContext::WaitingForResult)
+        } else if self.needs_generation_prompt {
+            Ok(PendingObservationContext::Context(
+                InklingContext::GenerationPrompt,
+            ))
+        } else {
+            // A successful replacement has already staged its complete
+            // initialization. Its first observation therefore needs no second
+            // context record.
+            Ok(PendingObservationContext::AlreadyStaged)
+        }
     }
 }
 
@@ -3233,6 +3491,25 @@ impl Drop for InklingMind {
 
 #[cfg(feature = "drive-mind")]
 impl drive::mind::Mind for InklingMind {
+    fn admit_observation(
+        &mut self,
+        events: &[drive::world::Event],
+    ) -> Result<drive::mind::ObservationAdmission> {
+        let PendingObservationContext::Context(context) = self.pending_context(events)? else {
+            return Ok(drive::mind::ObservationAdmission::Ready);
+        };
+        let evidence = self.client.preflight_context(&ContextPreflight {
+            placement: ContextPlacement::Append,
+            context,
+            max_response_tokens: self.max_response_tokens.max(1),
+        })?;
+        Ok(if evidence.fits {
+            drive::mind::ObservationAdmission::Ready
+        } else {
+            drive::mind::ObservationAdmission::ReplaceContext
+        })
+    }
+
     fn observe(&mut self, view: drive::world::MergedView<'_>) -> drive::mind::Turn {
         match self.turn(view.events, view.watermark) {
             Ok(turn) => turn,
@@ -3264,20 +3541,12 @@ impl drive::mind::Mind for InklingMind {
         self.context_epoch
     }
 
-    fn context_replacement_due(&self) -> bool {
-        self.replacement_due()
-    }
-
     fn replace_context(
         &mut self,
         next_epoch: u64,
         image: &drive::mind::ContextImage,
     ) -> std::result::Result<(), drive::mind::ContextReplacementFailure> {
         let initialization = (|| -> Result<InklingContext> {
-            anyhow::ensure!(
-                self.initialized,
-                "cannot replace an uninitialized Inkling context"
-            );
             anyhow::ensure!(
                 next_epoch
                     == self
@@ -3287,19 +3556,58 @@ impl drive::mind::Mind for InklingMind {
                 "Inkling context replacement must advance by exactly one"
             );
             let history = replacement_history(image)?;
-            validate_replacement_boundary(
-                self.needs_generation_prompt,
-                self.outstanding_exec.as_deref(),
-                &history,
-            )?;
+            if self.initialized {
+                validate_replacement_boundary(
+                    self.needs_generation_prompt,
+                    self.outstanding_exec.as_deref(),
+                    &history,
+                )?;
+            }
             Ok(InklingContext::Initialize {
                 system: image.system.clone(),
                 history,
             })
         })()
         .map_err(drive::mind::ContextReplacementFailure::unchanged)?;
-        let acknowledged = match self.client.reinitialize(&initialization) {
-            Ok(acknowledged) => acknowledged,
+        let placement = if self.initialized {
+            ContextPlacement::Replace
+        } else {
+            ContextPlacement::Append
+        };
+        let evidence = self
+            .client
+            .preflight_context(&ContextPreflight {
+                placement,
+                context: initialization.clone(),
+                max_response_tokens: self.max_response_tokens.max(1),
+            })
+            .map_err(|error| {
+                let _ = self.client.kill();
+                drive::mind::ContextReplacementFailure::terminal(
+                    error.context("preflight the resident Inkling replacement"),
+                )
+            })?;
+        if !evidence.fits {
+            return Err(drive::mind::ContextReplacementFailure::unchanged(
+                anyhow::anyhow!(
+                    "the replacement needs {} token position(s), beyond the {}-token context budget",
+                    evidence.required_end.map_or_else(
+                        || "an overflowing number of".to_string(),
+                        |end| end.to_string()
+                    ),
+                    evidence.context_budget,
+                ),
+            ));
+        }
+
+        let position = match if self.initialized {
+            self.client
+                .reinitialize(&initialization)
+                .map(|acknowledged| Some(acknowledged.initialization_tokens))
+        } else {
+            self.client.context(&initialization).map(|()| None)
+        } {
+            Ok(position) => position,
             Err(error) => {
                 let _ = self.client.kill();
                 return Err(drive::mind::ContextReplacementFailure::terminal(
@@ -3308,9 +3616,13 @@ impl drive::mind::Mind for InklingMind {
             }
         };
         self.output = NativeOutputParser::new(self.client.ready().special_ids.clone());
+        self.buffer.reset_empty_at(image.monologue_end);
+        self.scanned_abs = image.monologue_end;
         self.outstanding_exec = None;
         self.needs_generation_prompt = false;
-        self.position = Some(acknowledged.initialization_tokens);
+        self.position = position;
+        self.system = None;
+        self.initialized = true;
         self.context_epoch = next_epoch;
         Ok(())
     }
@@ -3369,7 +3681,7 @@ impl InklingMind {
             return Err(anyhow::anyhow!("cannot resume an interrupted Inkling response").into());
         }
 
-        let mut results = Vec::new();
+        let pending_context = self.pending_context(events)?;
         for event in events {
             match &event.payload {
                 // Coordinates only. The model already attended to these tokens:
@@ -3378,69 +3690,25 @@ impl InklingMind {
                 // delta. See this type's doc for why both halves have to be
                 // true, and what happened while only one was.
                 drive::world::Payload::Monologue(text) => self.buffer.push_free(text),
-                drive::world::Payload::Result {
-                    command,
-                    content,
-                    is_error,
-                    exit_code,
-                } => results.push(ExecResultContext {
-                    command: command.clone(),
-                    content: text_result_content(content, *is_error, *exit_code),
-                }),
+                drive::world::Payload::Result { .. } => {}
             }
         }
 
-        if !self.initialized {
-            // Initialization is one server-composed batch so memory-cover
-            // history sits after system/effort but before the sole generation
-            // prompt, exactly as the shipped chat template requires.
-            self.client.context(&InklingContext::Initialize {
-                system: self.system.take().unwrap_or_default(),
-                history: results
-                    .into_iter()
-                    .map(InklingHistoryResponse::exec)
-                    .collect(),
-            })?;
-            self.initialized = true;
-            self.needs_generation_prompt = false;
-        } else {
-            if results.len() > 1 {
-                return Err(anyhow::anyhow!(
-                    "received {} exec results in one post-initialization view",
-                    results.len()
-                )
-                .into());
-            }
-            if let Some(result) = results.pop() {
-                match self.outstanding_exec.as_deref() {
-                    Some(command) => {
-                        if command != result.command {
-                            return Err(anyhow::anyhow!(
-                                "exec result command {:?} did not match outstanding command {:?}",
-                                result.command,
-                                command
-                            )
-                            .into());
-                        }
-                        self.client
-                            .context(&InklingContext::ToolResult { result })?;
-                        self.outstanding_exec = None;
-                        self.needs_generation_prompt = false;
+        match pending_context {
+            PendingObservationContext::Context(context) => {
+                self.client.context(&context)?;
+                match context {
+                    InklingContext::Initialize { .. } => {
+                        self.system = None;
+                        self.initialized = true;
                     }
-                    None => {
-                        if !self.needs_generation_prompt {
-                            return Err(anyhow::anyhow!(
-                                "historical exec result arrived inside an unfinished assistant response"
-                            )
-                            .into());
-                        }
-                        self.client.context(&InklingContext::HistoricalResponse {
-                            response: InklingHistoryResponse::exec(result),
-                        })?;
-                        self.needs_generation_prompt = false;
-                    }
+                    InklingContext::ToolResult { .. } => self.outstanding_exec = None,
+                    InklingContext::HistoricalResponse { .. }
+                    | InklingContext::GenerationPrompt => {}
                 }
-            } else if self.outstanding_exec.is_some() {
+                self.needs_generation_prompt = false;
+            }
+            PendingObservationContext::WaitingForResult => {
                 // A Fire's call tokens already live in KV. Generating again
                 // before its exact result arrives would create two unresolved
                 // calls and make result association ambiguous.
@@ -3451,10 +3719,8 @@ impl InklingMind {
                     watermark,
                     "inkling: waiting for the outstanding native exec result",
                 )));
-            } else if self.needs_generation_prompt {
-                self.client.context(&InklingContext::GenerationPrompt)?;
-                self.needs_generation_prompt = false;
             }
+            PendingObservationContext::AlreadyStaged => {}
         }
 
         // One-token consults are the TP-safe stop boundary. Each collective
@@ -3711,6 +3977,74 @@ mod tests {
         let decoded: Reinitialized =
             serde_json::from_slice(&serde_json::to_vec(&acknowledgement).unwrap()).unwrap();
         assert_eq!(decoded, acknowledgement);
+
+        let preflight = ContextPreflight {
+            placement: ContextPlacement::Append,
+            context: InklingContext::GenerationPrompt,
+            max_response_tokens: 8,
+        };
+        let encoded = serde_json::to_vec(&preflight).expect("encode preflight");
+        assert_eq!(
+            serde_json::from_slice::<ContextPreflight>(&encoded).expect("decode preflight"),
+            preflight
+        );
+    }
+
+    #[test]
+    fn exact_context_admission_covers_initial_generation_and_tool_deltas() {
+        let initial = context_preflight(ContextPlacement::Append, 0, 0, 7, 4, 10).unwrap();
+        assert_eq!(initial.required_end, Some(10));
+        assert!(initial.fits, "equality with the budget is admitted");
+        assert!(
+            !context_preflight(ContextPlacement::Append, 0, 0, 7, 4, 9)
+                .unwrap()
+                .fits,
+            "one position beyond the budget is refused"
+        );
+
+        let generation = context_preflight(ContextPlacement::Append, 10, 1, 1, 4, 15).unwrap();
+        assert_eq!(generation.required_end, Some(15));
+        assert!(generation.fits);
+        assert!(
+            !context_preflight(ContextPlacement::Append, 10, 1, 1, 4, 14)
+                .unwrap()
+                .fits
+        );
+
+        let tool = context_preflight(ContextPlacement::Append, 10, 1, 20, 4, 34).unwrap();
+        assert_eq!(tool.required_end, Some(34));
+        assert!(tool.fits);
+        assert!(
+            !context_preflight(ContextPlacement::Append, 10, 1, 20, 4, 33)
+                .unwrap()
+                .fits
+        );
+
+        let replacement = context_preflight(ContextPlacement::Replace, 9_999, 1, 7, 4, 10).unwrap();
+        assert_eq!(replacement.position, 0);
+        assert_eq!(replacement.carried, 0);
+        assert_eq!(replacement.required_end, Some(10));
+        assert!(replacement.fits);
+    }
+
+    #[test]
+    fn context_admission_overflow_is_a_pure_rejection() {
+        let evidence =
+            context_preflight(ContextPlacement::Append, usize::MAX, 1, 1, 1, usize::MAX).unwrap();
+        assert_eq!(evidence.required_end, None);
+        assert!(!evidence.fits);
+    }
+
+    #[test]
+    fn tensor_parallel_context_admission_requires_identical_evidence() {
+        let left = context_preflight(ContextPlacement::Append, 7, 1, 5, 3, 64).unwrap();
+        matching_context_preflight(&left, &left).expect("equal rank evidence");
+
+        let mut right = left.clone();
+        right.delta_tokens += 1;
+        let error = matching_context_preflight(&left, &right)
+            .expect_err("different tokenizer evidence must terminate the pair");
+        assert!(error.to_string().contains("evidence diverged"), "{error:#}");
     }
 
     /// The control types must be distinct from each other and from the
@@ -3721,6 +4055,8 @@ mod tests {
             READY_TYPE,
             CONSULT_TYPE,
             CONTEXT_TYPE,
+            CONTEXT_PREFLIGHT_TYPE,
+            CONTEXT_PREFLIGHTED_TYPE,
             TURN_TYPE,
             REINITIALIZE_TYPE,
             REINITIALIZED_TYPE,
@@ -3873,6 +4209,88 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<InklingContext>(&record.payload).unwrap(),
             initialization
+        );
+        assert_eq!(
+            captured.next_frame().unwrap(),
+            framed_stream::Frame::End(framed_stream::EndStatus::Complete)
+        );
+        let _ = std::fs::remove_file(response_path);
+        let _ = std::fs::remove_file(capture_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_preflight_returns_an_ordinary_exact_rejection() {
+        let response = SharedSink::default();
+        let mut writer = framed_stream::FramedWriter::open(response.clone(), CONTENT_TYPE, UNIT)
+            .expect("response preamble");
+        let ready = fake_ready("fixture.pile");
+        let ready_payload = serde_json::to_vec(&ready).expect("READY json");
+        writer
+            .record_as(READY_TYPE, &ready_payload, ready_payload.len() as u64)
+            .expect("READY record");
+        let expected = context_preflight(
+            ContextPlacement::Append,
+            ready.context_budget - 6,
+            1,
+            1,
+            8,
+            ready.context_budget,
+        )
+        .unwrap();
+        assert!(!expected.fits);
+        let evidence_payload = serde_json::to_vec(&expected).expect("PREFLIGHTED json");
+        writer
+            .record_as(
+                CONTEXT_PREFLIGHTED_TYPE,
+                &evidence_payload,
+                evidence_payload.len() as u64,
+            )
+            .expect("PREFLIGHTED record");
+        writer
+            .finish(framed_stream::EndStatus::Complete)
+            .expect("complete response");
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let response_path = std::env::temp_dir().join(format!("mary-preflight-response-{nonce}"));
+        let capture_path = std::env::temp_dir().join(format!("mary-preflight-capture-{nonce}"));
+        std::fs::write(&response_path, response.bytes()).expect("write fake response");
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("cat \"$1\"; cat >\"$2\"")
+            .arg("fake-inkling")
+            .arg(&response_path)
+            .arg(&capture_path);
+        let mut client = ServeClient::spawn(&mut command).expect("spawn fake serving process");
+        let request = ContextPreflight {
+            placement: ContextPlacement::Append,
+            context: InklingContext::GenerationPrompt,
+            max_response_tokens: 8,
+        };
+        assert_eq!(
+            client
+                .preflight_context(&request)
+                .expect("ordinary rejection evidence"),
+            expected
+        );
+        assert!(client.close().expect("close fixture").success());
+
+        let mut captured = framed_stream::FramedReader::open(
+            std::fs::File::open(&capture_path).expect("open captured input"),
+        )
+        .expect("captured preamble");
+        captured.require_content_type(CONTENT_TYPE).unwrap();
+        let framed_stream::Frame::Record(record) = captured.next_frame().unwrap() else {
+            panic!("first input frame was not CONTEXT_PREFLIGHT")
+        };
+        assert_eq!(record.content_type(), CONTEXT_PREFLIGHT_TYPE);
+        assert_eq!(
+            serde_json::from_slice::<ContextPreflight>(&record.payload).unwrap(),
+            request
         );
         assert_eq!(
             captured.next_frame().unwrap(),
@@ -4892,20 +5310,42 @@ cat >"$3"
 
     #[cfg(all(feature = "drive-mind", unix))]
     #[test]
-    fn response_admission_rolls_over_before_the_complete_cap_cannot_fit() {
+    fn pending_context_preview_is_typed_and_does_not_mutate_mind_state() {
         let (client, child, response_path, capture_path) =
-            spawn_shutdown_fixture("response-admission", false);
-        let context_budget = client.ready().context_budget;
+            spawn_shutdown_fixture("pending-context-preview", false);
         let mut mind = InklingMind::new(client, 8, Some("system".to_string()));
+
+        assert_eq!(
+            mind.pending_context(&[]).unwrap(),
+            PendingObservationContext::Context(InklingContext::Initialize {
+                system: "system".to_string(),
+                history: Vec::new(),
+            })
+        );
+        assert!(!mind.initialized);
+        assert_eq!(mind.system.as_deref(), Some("system"));
+
         mind.initialized = true;
         mind.needs_generation_prompt = true;
+        assert_eq!(
+            mind.pending_context(&[]).unwrap(),
+            PendingObservationContext::Context(InklingContext::GenerationPrompt)
+        );
+        assert!(mind.needs_generation_prompt);
 
-        // The previous final-token carry plus the generation prompt predicts
-        // token one. Exactly R + 1 positions from the reported position fit.
-        mind.position = Some(context_budget - 9);
-        assert!(!mind.replacement_due());
-        mind.position = Some(context_budget - 8);
-        assert!(mind.replacement_due());
+        mind.needs_generation_prompt = false;
+        mind.outstanding_exec = Some("printf exact".to_string());
+        let events = [drive::world::Event::text_result(7, "printf exact", "exact")];
+        assert_eq!(
+            mind.pending_context(&events).unwrap(),
+            PendingObservationContext::Context(InklingContext::ToolResult {
+                result: ExecResultContext {
+                    command: "printf exact".to_string(),
+                    content: "exact\n".to_string(),
+                },
+            })
+        );
+        assert_eq!(mind.outstanding_exec.as_deref(), Some("printf exact"));
 
         drop(mind);
         assert!(
@@ -5302,6 +5742,144 @@ exec cat >/dev/null
                 .success()
         );
         assert_one_initialization_and_microconsults(&capture_path, 2);
+        let _ = std::fs::remove_file(response_path);
+        let _ = std::fs::remove_file(capture_path);
+    }
+
+    #[cfg(all(feature = "drive-mind", unix))]
+    #[test]
+    fn replacement_resets_projection_to_the_absolute_monologue_extent() {
+        use drive::mind::Mind as _;
+
+        let ready = fake_ready("fixture.pile");
+        let ids = ready.special_ids.clone();
+        let command_text = "printf after-rollover";
+        let sequence = vec![
+            ("exec-id".len() as u32, "exec".to_string()),
+            (
+                ids.content_invoke_tool_json,
+                special_fragment(&ids, ids.content_invoke_tool_json, ""),
+            ),
+            (
+                9,
+                format!(r#"{{"name":"exec","args":{{"command":"{command_text}"}}}}"#),
+            ),
+            (ids.end_message, special_fragment(&ids, ids.end_message, "")),
+            (
+                ids.content_model_end_sampling,
+                special_fragment(&ids, ids.content_model_end_sampling, ""),
+            ),
+        ];
+
+        let response = SharedSink::default();
+        let mut writer = framed_stream::FramedWriter::open(response.clone(), CONTENT_TYPE, UNIT)
+            .expect("response preamble");
+        let ready_payload = serde_json::to_vec(&ready).expect("READY json");
+        writer
+            .record_as(READY_TYPE, &ready_payload, ready_payload.len() as u64)
+            .expect("READY record");
+        let evidence = context_preflight(
+            ContextPlacement::Replace,
+            123,
+            1,
+            12,
+            32,
+            ready.context_budget,
+        )
+        .unwrap();
+        let evidence_payload = serde_json::to_vec(&evidence).expect("PREFLIGHTED json");
+        writer
+            .record_as(
+                CONTEXT_PREFLIGHTED_TYPE,
+                &evidence_payload,
+                evidence_payload.len() as u64,
+            )
+            .expect("PREFLIGHTED record");
+        let acknowledgement = Reinitialized {
+            previous_position: 123,
+            previous_turns: 1,
+            initialization_tokens: evidence.delta_tokens,
+        };
+        let acknowledgement_payload =
+            serde_json::to_vec(&acknowledgement).expect("REINITIALIZED json");
+        writer
+            .record_as(
+                REINITIALIZED_TYPE,
+                &acknowledgement_payload,
+                acknowledgement_payload.len() as u64,
+            )
+            .expect("REINITIALIZED record");
+        for (microturn, (id, fragment)) in sequence.iter().enumerate() {
+            writer.text(fragment).expect("token decoder fragment");
+            let mut end = fake_end(&[*id]);
+            end.turn = microturn;
+            if microturn > 0 {
+                end.delta_tokens = 0;
+                end.carried = 1;
+            }
+            if *id == ids.content_model_end_sampling {
+                end.stopped = "stop_token".to_string();
+            }
+            let payload = serde_json::to_vec(&end).expect("TURN json");
+            writer
+                .record_as(TURN_TYPE, &payload, payload.len() as u64)
+                .expect("TURN record");
+        }
+        writer
+            .finish(framed_stream::EndStatus::Complete)
+            .expect("complete response");
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let response_path =
+            std::env::temp_dir().join(format!("mary-rollover-projection-response-{nonce}"));
+        let capture_path =
+            std::env::temp_dir().join(format!("mary-rollover-projection-capture-{nonce}"));
+        std::fs::write(&response_path, response.bytes()).expect("write fake response");
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("cat \"$1\"; cat >\"$2\"")
+            .arg("fake-inkling")
+            .arg(&response_path)
+            .arg(&capture_path);
+        let client = ServeClient::spawn(&mut command).expect("spawn fake serving process");
+        let child = client.child.clone();
+        let mut mind = InklingMind::new_gate(client, 32, Some("old system".to_string()));
+        mind.initialized = true;
+        mind.needs_generation_prompt = true;
+        mind.position = Some(123);
+        let monologue_end = 4_096;
+        let image = drive::mind::ContextImage {
+            system: "replacement system".to_string(),
+            responses: Vec::new(),
+            monologue_end,
+        };
+
+        mind.replace_context(1, &image)
+            .expect("replace resident context");
+        assert_eq!(mind.buffer.base_offset(), monologue_end);
+        assert_eq!(mind.buffer.end_offset(), monologue_end);
+        let turn = mind.observe(drive::world::MergedView::EMPTY);
+        assert_eq!(turn.decision.disposition, drive::mind::Disposition::Fire);
+        assert_eq!(turn.decision.command.as_deref(), Some(command_text));
+        assert_eq!(turn.decision.span_start, monologue_end);
+        assert_eq!(
+            turn.decision.span_end,
+            monologue_end + turn.said.len() as u64
+        );
+        assert_eq!(turn.decision.span, turn.said);
+
+        drop(mind);
+        assert!(
+            child
+                .try_wait()
+                .expect("poll fake server")
+                .expect("drop reaps fake server")
+                .success()
+        );
         let _ = std::fs::remove_file(response_path);
         let _ = std::fs::remove_file(capture_path);
     }
@@ -5720,6 +6298,7 @@ exec cat >/dev/null
                     }),
                 },
             ],
+            monologue_end: 0,
         };
 
         let history = replacement_history(&image).expect("lower Drive context");

@@ -12,8 +12,9 @@ use std::io::{Read, Write};
 use anyhow::{Context, Result};
 
 use mary::models::inkling::serve::{
-    CONSULT_TYPE, CONTENT_TYPE, CONTEXT_TYPE, Consult, InklingContext, READY_TYPE,
-    REINITIALIZE_TYPE, REINITIALIZED_TYPE, RankCommand, ServePair, TURN_TYPE, UNIT,
+    CONSULT_TYPE, CONTENT_TYPE, CONTEXT_PREFLIGHT_TYPE, CONTEXT_PREFLIGHTED_TYPE, CONTEXT_TYPE,
+    Consult, ContextPreflight, InklingContext, READY_TYPE, REINITIALIZE_TYPE, REINITIALIZED_TYPE,
+    RankCommand, ServePair, TURN_TYPE, UNIT,
 };
 
 fn usage() -> &'static str {
@@ -580,6 +581,16 @@ fn run() -> Result<()> {
                 let context: InklingContext = serde_json::from_slice(&record.payload)
                     .context("parse the downstream typed context record")?;
                 pair.context(&context)?;
+            }
+            framed_stream::Frame::Record(record)
+                if record.content_type() == CONTEXT_PREFLIGHT_TYPE =>
+            {
+                let request: ContextPreflight = serde_json::from_slice(&record.payload)
+                    .context("parse downstream context preflight")?;
+                let evidence = pair.preflight_context(&request)?;
+                let payload = serde_json::to_vec(&evidence)
+                    .context("encode downstream context-preflight evidence")?;
+                output.record_as(CONTEXT_PREFLIGHTED_TYPE, &payload, payload.len() as u64)?;
             }
             framed_stream::Frame::Record(record) if record.content_type() == CONSULT_TYPE => {
                 let consult: Consult = serde_json::from_slice(&record.payload)

@@ -73,9 +73,10 @@ use std::io::Write as _;
 use anyhow::{Context, Result};
 
 use mary::models::inkling::serve::{
-    CONSULT_TYPE, CONTENT_TYPE, CONTEXT_TYPE, Consult, ExecutionManifest, InklingContext,
+    CONSULT_TYPE, CONTENT_TYPE, CONTEXT_PREFLIGHT_TYPE, CONTEXT_PREFLIGHTED_TYPE, CONTEXT_TYPE,
+    Consult, ContextPlacement, ContextPreflight, ExecutionManifest, InklingContext,
     InklingContextCodec, READY_TYPE, REINITIALIZE_TYPE, REINITIALIZED_TYPE, Ready, Reinitialized,
-    TURN_TYPE, TurnEnd, UNIT,
+    TURN_TYPE, TurnEnd, UNIT, context_preflight,
 };
 use mary::models::inkling::session::{Session, SessionConfig};
 use mary::models::inkling::tp::Tp;
@@ -816,6 +817,37 @@ fn run() -> Result<()> {
                 out.record_as(TURN_TYPE, &payload, extent)?;
                 eprintln!("inkling_serve: {}", end.summary());
                 turn += 1;
+            }
+            framed_stream::Frame::Record(record)
+                if record.content_type() == CONTEXT_PREFLIGHT_TYPE =>
+            {
+                let request: ContextPreflight = serde_json::from_slice(&record.payload)
+                    .context("parse typed context preflight")?;
+                anyhow::ensure!(
+                    delta.is_empty(),
+                    "context preflight requires an empty pending delta"
+                );
+                if request.placement == ContextPlacement::Replace {
+                    anyhow::ensure!(
+                        matches!(&request.context, InklingContext::Initialize { .. }),
+                        "replacement preflight requires one complete Initialize payload"
+                    );
+                    validate_reinitialize_boundary(turn, delta.len(), carry.is_some())?;
+                }
+                let encoded = context_codec
+                    .encode(&request.context)
+                    .context("encode context preflight")?;
+                let evidence = context_preflight(
+                    request.placement,
+                    session.position(),
+                    usize::from(carry.is_some()),
+                    encoded.len(),
+                    request.max_response_tokens,
+                    context_budget,
+                )?;
+                let payload =
+                    serde_json::to_vec(&evidence).context("encode context-preflight evidence")?;
+                out.record_as(CONTEXT_PREFLIGHTED_TYPE, &payload, payload.len() as u64)?;
             }
             framed_stream::Frame::Record(record) if record.content_type() == REINITIALIZE_TYPE => {
                 let initialization: InklingContext = serde_json::from_slice(&record.payload)
