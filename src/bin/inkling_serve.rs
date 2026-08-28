@@ -226,14 +226,21 @@ fn parse() -> Result<Option<Options>> {
     }))
 }
 
-/// Environment is inherited ambient authority. In sealed mode every namespace
-/// this runtime currently uses to alter kernels, numerics, scheduling,
-/// allocation, device selection, or collective transport is refused before a
-/// CUDA client exists. Explicit serving CLI settings remain allowed because
-/// they enter the manifest. Library discovery through `LD_LIBRARY_PATH` is the
-/// narrow phase-1 exception: the exact selected library bytes are hashed after
-/// load, while rejecting it would make the CUDA deployment layout unusable.
-fn reject_sealed_environment() -> Result<()> {
+/// Environment is inherited ambient authority. Sealed mode refuses namespaces
+/// this runtime uses to alter kernels, numerics, scheduling, or allocation
+/// before a CUDA client exists. The exact exceptions below are rank-local
+/// placement, transport routing, and diagnostics: they must be able to differ
+/// across hosts and do not choose model numerics or kernels. In particular,
+/// `CUDA_VISIBLE_DEVICES` maps CUDA's logical device 0, whose effective class
+/// and compute capability are witnessed in the shared manifest; the NCCL
+/// exceptions only route the two-rank transport or report what it selected.
+/// Every other CUDA/NCCL variable remains rejected, including algorithm knobs.
+///
+/// Explicit serving CLI settings remain allowed because they enter the
+/// manifest. Library discovery through `LD_LIBRARY_PATH` is the other narrow
+/// phase-1 exception: the exact selected library bytes are hashed after load,
+/// while rejecting it would make the CUDA deployment layout unusable.
+fn sealed_environment_rejections(names: impl IntoIterator<Item = String>) -> Vec<String> {
     const PREFIXES: &[&str] = &[
         "INK_",
         "CUBECL_",
@@ -250,13 +257,31 @@ fn reject_sealed_environment() -> Result<()> {
         "MALLOC_",
     ];
     const EXACT: &[&str] = &["GLIBC_TUNABLES", "LD_AUDIT", "LD_PRELOAD"];
-    let mut rejected = std::env::vars_os()
-        .map(|(name, _)| name.to_string_lossy().into_owned())
+    const RANK_LOCAL_EXACT: &[&str] = &[
+        "CUDA_VISIBLE_DEVICES",
+        "NCCL_IB_DISABLE",
+        "NCCL_SOCKET_IFNAME",
+        "NCCL_IB_HCA",
+    ];
+    let mut rejected = names
+        .into_iter()
         .filter(|name| {
-            EXACT.contains(&name.as_str()) || PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+            let rank_local = RANK_LOCAL_EXACT.contains(&name.as_str())
+                || name == "NCCL_DEBUG"
+                || name.starts_with("NCCL_DEBUG_");
+            !rank_local
+                && (EXACT.contains(&name.as_str())
+                    || PREFIXES.iter().any(|prefix| name.starts_with(prefix)))
         })
         .collect::<Vec<_>>();
     rejected.sort();
+    rejected
+}
+
+fn reject_sealed_environment() -> Result<()> {
+    let rejected = sealed_environment_rejections(
+        std::env::vars_os().map(|(name, _)| name.to_string_lossy().into_owned()),
+    );
     anyhow::ensure!(
         rejected.is_empty(),
         "sealed-v1 refuses execution-changing environment overrides: {}. Express serving shape \
@@ -960,7 +985,7 @@ mod tests {
     use tokenizers::pre_tokenizers::byte_level::ByteLevel;
     use tokenizers::{Tokenizer, TokenizerBuilder};
 
-    use super::advance_context_decode;
+    use super::{advance_context_decode, reject_sealed_environment, sealed_environment_rejections};
 
     fn byte_fallback_tokenizer() -> Tokenizer {
         let vocab = [
@@ -982,6 +1007,48 @@ mod tests {
             .build()
             .unwrap()
             .into()
+    }
+
+    #[test]
+    fn sealed_tp_child_accepts_deployed_rank_local_environment() {
+        const CHILD: &str = "MARY_SEALED_ENVIRONMENT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            reject_sealed_environment()
+                .expect("the deployed rank-local environment passes sealed validation");
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("tests::sealed_tp_child_accepts_deployed_rank_local_environment")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env_clear()
+            .env(CHILD, "1")
+            .env("CUDA_VISIBLE_DEVICES", "0")
+            .env("NCCL_IB_DISABLE", "0")
+            .env("NCCL_SOCKET_IFNAME", "rocep1s0f0")
+            .env("NCCL_IB_HCA", "rocep1s0f0")
+            .env("NCCL_DEBUG", "INFO")
+            .env("NCCL_DEBUG_SUBSYS", "INIT,NET")
+            .env("NCCL_DEBUG_FILE", "/tmp/nccl.%h.%p.log")
+            .output()
+            .expect("launch the sealed-environment fixture child");
+        assert!(
+            output.status.success(),
+            "sealed TP child did not pass environment validation:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    fn sealed_environment_still_rejects_execution_selection() {
+        let rejected = sealed_environment_rejections(
+            ["NCCL_ALGO", "CUBECL_MEMORY_CONFIG"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        assert_eq!(rejected, ["CUBECL_MEMORY_CONFIG", "NCCL_ALGO"]);
     }
 
     #[test]
