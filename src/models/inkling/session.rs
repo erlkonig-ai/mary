@@ -67,10 +67,12 @@
 //!
 //! `inkling_forward` is a MEASUREMENT harness that happens to run the model: it
 //! carries the pipe between two nodes, the CUDA-graph capture lane, batched
-//! slots and cohorts, token-tree speculation, the MTP drafting experiment, the
-//! router and plan A/B arms and about a hundred `INK_*` reporting switches.
-//! Every one of those is a question someone is asking about the model, and none
-//! of them is something a conversation needs. They stay in the binary.
+//! slots and cohorts, the MTP drafter, token-tree construction, the router and
+//! plan A/B arms and about a hundred `INK_*` reporting switches. Every one of
+//! those is a question someone is asking about the model, and none of them is
+//! something a conversation needs. They stay in the binary. The narrow
+//! exception is [`Session::begin_target_extension`]: a cache transaction on
+//! which a future drafter can stand, not a drafter or acceptance policy itself.
 //!
 //! What is here is the lane that runs when nobody sets anything: the default
 //! configuration, which is also the one the frontier benchmark measures. Greedy
@@ -106,14 +108,16 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 
 use super::assembly::{
-    BT, Bk, DeviceDense, LayerCache, LayerDev, MoeState, RouterArm, T2, argmax_row_dev, bind_layer,
-    dense_mlp_bf16, dev_lane, dev_lane_resid, moe_layer, quantized_bf16, up1r, up2, w4a16_bind,
+    BT, Bk, DeviceDense, LayerCache, LayerDev, MoeState, RouterArm, T2, argmax_row_dev,
+    argmax_rows_dev, bind_layer, dense_mlp_bf16, dev_lane, dev_lane_resid, moe_layer,
+    quantized_bf16, up1r, up2, w4a16_bind,
 };
 use super::attn::{AttnDims, LogScaling};
 use super::config::{AttnKind, InklingConfig};
 use super::pile::Elem;
 use super::source::Weights;
 use super::stack::embed_and_norm_bf16;
+use super::target::{Boundary as TargetBoundary, PrefixCache, Settlement as TargetSettlement};
 use super::tp::Tp;
 use super::tpcomm::Group;
 
@@ -430,6 +434,192 @@ impl Checkpoint {
     /// [`Session::rewind`] to it.
     pub fn position(&self) -> usize {
         self.pos
+    }
+}
+
+/// The committed result of one [`TargetExtension`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetCommit {
+    accepted: usize,
+    position: usize,
+    next: usize,
+}
+
+impl TargetCommit {
+    /// How many leading proposed rows became facts about the sequence.
+    pub fn accepted(&self) -> usize {
+        self.accepted
+    }
+
+    /// The session position after settlement.
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    /// The target prediction after the accepted prefix, or the session's prior
+    /// prediction when zero rows were accepted.
+    pub fn next_token(&self) -> usize {
+        self.next
+    }
+}
+
+/// An uncommitted target-model extension.
+///
+/// The proposed tokens have run through every target layer, but their K/V and
+/// convolution rows remain pending and the Session's position has not moved.
+/// [`TargetExtension::base_prediction`] is the target argmax before row zero;
+/// [`TargetExtension::post_row_predictions`] gives the target argmax after each
+/// proposed row. Thus proposal zero is checked against the base prediction and
+/// proposal `i > 0` against `post_row_predictions[i - 1]`. An acceptance policy
+/// outside this module chooses a leading count and calls
+/// [`TargetExtension::commit`]. Dropping the value or calling
+/// [`TargetExtension::abort`] discards the pass.
+///
+/// This value borrows the Session mutably, so a second pass cannot begin before
+/// this one is settled. It is intentionally a linear boundary rather than a
+/// mode on ordinary [`Session::extend`], whose commit-all behavior is unchanged.
+#[must_use = "a target extension must be committed; dropping it aborts the pass"]
+pub struct TargetExtension<'a> {
+    session: &'a mut Session,
+    boundary: TargetBoundary,
+    post_row_predictions: Vec<usize>,
+    settled: bool,
+}
+
+impl TargetExtension<'_> {
+    /// Absolute position of proposed row zero.
+    pub fn base_position(&self) -> usize {
+        self.boundary.base_position()
+    }
+
+    /// Number of rows in this target pass.
+    pub fn proposed_rows(&self) -> usize {
+        self.boundary.proposed()
+    }
+
+    /// Target-model argmax immediately before proposed row zero.
+    ///
+    /// Linear speculative acceptance compares the first proposed token against
+    /// this value.
+    pub fn base_prediction(&self) -> usize {
+        self.boundary
+            .base_last()
+            .expect("begin_target_extension requires an existing prediction")
+    }
+
+    /// Target-model argmax after each proposed input row, in row order.
+    ///
+    /// Proposal `i + 1` is checked against `post_row_predictions[i]`; after
+    /// accepting `k > 0` rows, `post_row_predictions[k - 1]` is the next target
+    /// token.
+    pub fn post_row_predictions(&self) -> &[usize] {
+        &self.post_row_predictions
+    }
+
+    /// Keep exactly `accepted` leading rows and discard the remaining suffix.
+    ///
+    /// `accepted = 0` is valid and restores the pre-pass state; accepting every
+    /// row is the transactional twin of ordinary [`Session::extend`]. An invalid
+    /// count returns an error and the value's drop then aborts the pass.
+    pub fn commit(mut self, accepted: usize) -> Result<TargetCommit> {
+        let settled =
+            self.session
+                .accept_target(self.boundary, &self.post_row_predictions, accepted)?;
+        self.settled = true;
+        Ok(TargetCommit {
+            accepted: settled.accepted,
+            position: settled.position,
+            next: settled
+                .last
+                .expect("a target transaction begins from an existing prediction"),
+        })
+    }
+
+    /// Discard every proposed row and restore the pre-pass target state.
+    pub fn abort(mut self) -> Result<()> {
+        self.session
+            .abort_target(self.boundary, &self.post_row_predictions)?;
+        self.settled = true;
+        Ok(())
+    }
+}
+
+impl Drop for TargetExtension<'_> {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        // Settlement is tensor bookkeeping after the whole stack has already
+        // been validated. If an internal invariant nevertheless fails, poison
+        // the Session rather than release a value whose layer caches disagree.
+        if self
+            .session
+            .abort_target(self.boundary, &self.post_row_predictions)
+            .is_err()
+        {
+            self.session.torn = true;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassMode {
+    Commit,
+    Target,
+}
+
+enum PassOutput {
+    Committed(usize),
+    Target(Vec<usize>),
+}
+
+/// One device layer viewed through the backend-free target settlement trait.
+struct PendingTargetLayer<'a> {
+    cache: &'a mut LayerCache,
+    window: Option<usize>,
+    kernel: usize,
+}
+
+impl PrefixCache for PendingTargetLayer<'_> {
+    fn pending_rows(&self) -> Option<usize> {
+        let rows = self.cache.attn.pending_rows()?;
+        let hist = self.kernel.checked_sub(1)?;
+        let attn_rows = self.cache.attn_sconv_pending.as_ref()?.dims()[0].checked_sub(hist)?;
+        let mlp_rows = self.cache.mlp_sconv_pending.as_ref()?.dims()[0].checked_sub(hist)?;
+        (rows == attn_rows && rows == mlp_rows).then_some(rows)
+    }
+
+    fn end_position(&self) -> usize {
+        self.cache.attn.base() + self.cache.attn.len()
+    }
+
+    fn commit_prefix(&mut self, keep: usize) {
+        self.cache.attn.commit(keep, self.window);
+        let hist = self.kernel - 1;
+
+        let attn = self
+            .cache
+            .attn_sconv_pending
+            .take()
+            .expect("target settlement validated the attention convolution window");
+        if keep > 0 {
+            let dim = attn.dims()[1];
+            self.cache.attn_sconv =
+                dev_lane::conv_history(attn.slice([0..hist + keep, 0..dim]), self.kernel);
+        }
+
+        let mlp = self
+            .cache
+            .mlp_sconv_pending
+            .take()
+            .expect("target settlement validated the MLP convolution window");
+        if keep > 0 {
+            let dim = mlp.dims()[1];
+            self.cache.mlp_sconv = Some(dev_lane::conv_history(
+                mlp.slice([0..hist + keep, 0..dim]),
+                self.kernel,
+            ));
+        }
     }
 }
 
@@ -824,6 +1014,193 @@ impl Session {
         self.partial
     }
 
+    /// Run proposed tokens through the target model without committing them yet.
+    ///
+    /// This is the transaction boundary a speculative caller needs and no more:
+    /// it does not draft, choose candidates, or decide acceptance.
+    /// [`TargetExtension::base_prediction`] is the prediction for proposed row
+    /// zero, and row `i` of [`TargetExtension::post_row_predictions`] is the
+    /// prediction after proposed input row `i` (therefore the comparison for
+    /// proposal `i + 1`). The caller applies its own acceptance policy and
+    /// commits one leading count, or aborts.
+    ///
+    /// The Session must already hold a prefix. The pass width is limited by the
+    /// prefill admission because it allocates the same widened activations. No
+    /// ordinary path calls this method, so enabling a drafter above the Session
+    /// remains an explicit deployment decision.
+    pub fn begin_target_extension<'a>(
+        &'a mut self,
+        proposed: &[usize],
+    ) -> Result<TargetExtension<'a>> {
+        anyhow::ensure!(
+            !self.torn,
+            "a previous pass tore this Session; reset or rewind before beginning a target extension"
+        );
+        anyhow::ensure!(
+            !proposed.is_empty(),
+            "a target extension proposes at least one token"
+        );
+        let end = self
+            .pos
+            .checked_add(proposed.len())
+            .context("target sequence position overflow")?;
+        anyhow::ensure!(
+            end <= self.context_budget,
+            "this target extension would advance the sequence from {} to {end} positions, past \
+             the admitted {}-token context budget. Start a new session or raise context_budget \
+             so its persistent KV is priced before the model loads.",
+            self.pos,
+            self.context_budget
+        );
+        anyhow::ensure!(
+            !self.caches.is_empty(),
+            "a target extension needs an existing prefix; prefill the Session first"
+        );
+        anyhow::ensure!(
+            self.last.is_some(),
+            "the Session has caches but no target prediction; reset this inconsistent sequence"
+        );
+        anyhow::ensure!(
+            self.caches.len() == self.hi - self.lo,
+            "{} caches for {} target layers",
+            self.caches.len(),
+            self.hi - self.lo
+        );
+        anyhow::ensure!(
+            proposed.len() <= self.prefill_budget,
+            "a {}-row target extension is wider than the {}-token prefill budget this Session's \
+             admission reserved activations for",
+            proposed.len(),
+            self.prefill_budget
+        );
+        anyhow::ensure!(
+            self.caches.iter().all(|cache| {
+                cache.attn.pending_rows().is_none()
+                    && cache.attn_sconv_pending.is_none()
+                    && cache.mlp_sconv_pending.is_none()
+            }),
+            "a target extension is already pending"
+        );
+        if let Err(error) = self.validate_cache_completeness() {
+            self.torn = true;
+            return Err(error.context("the target extension found an incomplete committed cache"));
+        }
+
+        let boundary = TargetBoundary::new(self.pos, self.last, proposed.len())?;
+        let predictions = match self.forward_pass(proposed, PassMode::Target) {
+            Ok(PassOutput::Target(predictions)) => predictions,
+            Ok(PassOutput::Committed(_)) => {
+                unreachable!("a target pass returned a committed prediction")
+            }
+            Err(source) => {
+                if let Err(rollback) = self.abort_partial_target(boundary) {
+                    self.torn = true;
+                    return Err(source.context(format!(
+                        "the target pass failed and its partial cache could not be aborted: \
+                         {rollback:#}"
+                    )));
+                }
+                return Err(source.context("the target pass failed; its pending rows were aborted"));
+            }
+        };
+        debug_assert_eq!(predictions.len(), proposed.len());
+        Ok(TargetExtension {
+            session: self,
+            boundary,
+            post_row_predictions: predictions,
+            settled: false,
+        })
+    }
+
+    fn accept_target(
+        &mut self,
+        boundary: TargetBoundary,
+        predictions: &[usize],
+        accepted: usize,
+    ) -> Result<TargetSettlement> {
+        self.settle_target(boundary, predictions, Some(accepted))
+    }
+
+    fn abort_target(
+        &mut self,
+        boundary: TargetBoundary,
+        predictions: &[usize],
+    ) -> Result<TargetSettlement> {
+        self.settle_target(boundary, predictions, None)
+    }
+
+    /// Settle a complete target pass across every layer. `Some(k)` is an
+    /// acceptance decision (including accept-zero); `None` is an explicit abort.
+    fn settle_target(
+        &mut self,
+        boundary: TargetBoundary,
+        predictions: &[usize],
+        accepted: Option<usize>,
+    ) -> Result<TargetSettlement> {
+        let layer_count = self.hi - self.lo;
+        let kernel = self.cfg.text_config.sconv_kernel_size;
+        let windows: Vec<Option<usize>> = (self.lo..self.hi)
+            .map(|layer| {
+                (self.cfg.text_config.attn_kind(layer) == AttnKind::Local)
+                    .then_some(self.cfg.text_config.sliding_window_size)
+            })
+            .collect();
+        let settled = {
+            let Session {
+                caches, pos, last, ..
+            } = self;
+            let mut layers: Vec<PendingTargetLayer<'_>> = caches
+                .iter_mut()
+                .zip(windows)
+                .map(|(cache, window)| PendingTargetLayer {
+                    cache,
+                    window,
+                    kernel,
+                })
+                .collect();
+            debug_assert_eq!(layers.len(), layer_count);
+            match accepted {
+                Some(keep) => boundary.accept(&mut layers, pos, last, predictions, keep)?,
+                None => boundary.abort(&mut layers, pos, last, predictions)?,
+            }
+        };
+        if let Err(error) = self.validate_cache_completeness() {
+            self.torn = true;
+            return Err(error.context("target settlement left an incomplete committed cache"));
+        }
+        Ok(settled)
+    }
+
+    /// Undo whatever prefix of a target pass ran before an ordinary `Result`
+    /// error. Unlike normal settlement, not every layer is required to have
+    /// reached pending state: completed layers are aborted and untouched layers
+    /// are checked at the original position.
+    fn abort_partial_target(&mut self, boundary: TargetBoundary) -> Result<()> {
+        anyhow::ensure!(
+            self.pos == boundary.base_position(),
+            "the Session position moved during an uncommitted target pass"
+        );
+        let t = &self.cfg.text_config;
+        for (slot, cache) in self.caches.iter_mut().enumerate() {
+            let layer = self.lo + slot;
+            let window = (t.attn_kind(layer) == AttnKind::Local).then_some(t.sliding_window_size);
+            // Idempotent when this layer had not been reached. If attention had
+            // appended before a later operation failed, keep-zero restores its
+            // K/V projections and both attention-convolution histories.
+            cache.attn.commit(0, window);
+            cache.attn_sconv_pending = None;
+            cache.mlp_sconv_pending = None;
+            anyhow::ensure!(
+                cache.attn.base() + cache.attn.len() == boundary.base_position(),
+                "target layer {layer} did not roll back to position {}",
+                boundary.base_position()
+            );
+        }
+        self.validate_cache_completeness()
+            .context("the partial target rollback left an incomplete committed cache")?;
+        Ok(())
+    }
+
     /// Drop the sequence and start a fresh one against the SAME warm weights.
     ///
     /// This is what a serving process does between conversations. It releases
@@ -1137,10 +1514,13 @@ impl Session {
         // out of the loop below leaves the stack half advanced, which no
         // caller can detect and none should have to; poison the session and
         // name the two ways out.
-        let out = self.forward_pass(ids).and_then(|token| {
-            self.validate_cache_completeness()?;
-            Ok(token)
-        });
+        let out = match self.forward_pass(ids, PassMode::Commit) {
+            Ok(PassOutput::Committed(best)) => self.validate_cache_completeness().map(|_| best),
+            Ok(PassOutput::Target(_)) => {
+                unreachable!("an ordinary pass returned target predictions")
+            }
+            Err(error) => Err(error),
+        };
         if out.is_err() {
             self.torn = true;
         }
@@ -1151,7 +1531,7 @@ impl Session {
     /// path through it lands in one place: the caller poisons the session on
     /// any error, and it can only do that if the errors have somewhere to
     /// return to.
-    fn forward_pass(&mut self, ids: &[usize]) -> Result<usize> {
+    fn forward_pass(&mut self, ids: &[usize], mode: PassMode) -> Result<PassOutput> {
         let t = &self.cfg.text_config;
         let h = t.hidden_size;
         let n = ids.len();
@@ -1171,6 +1551,7 @@ impl Session {
         // A pass with a cache behind it is a decode step; the first one is the
         // prefill that establishes the cache.
         let cached = !self.caches.is_empty();
+        debug_assert!(cached || mode == PassMode::Commit);
         super::fatal::note_tokens(n);
 
         // The embedding is a host gather over the stored BF16, normed on the
@@ -1255,7 +1636,31 @@ impl Session {
                 alpha: t.log_scaling_alpha as f32,
             };
 
-            let a = match (cached, n > 1) {
+            let a = match (cached, mode, n > 1) {
+                // The explicit target transaction. Even one proposed row takes
+                // the widened path: unlike `attention_step`, it can be kept or
+                // discarded after the target predictions are known. Neither
+                // attention nor the block convolution advances its committed
+                // history here.
+                (true, PassMode::Target, _) => {
+                    let y = dev_lane::attention_steps(
+                        hn,
+                        &ld.attn,
+                        &dims,
+                        Some(ls),
+                        pos0,
+                        window,
+                        &mut self.caches[slot].attn,
+                    );
+                    let y = tp_reduce(y, &mut tp_calls);
+                    let (out, all) = dev_lane::short_conv_steps(
+                        self.caches[slot].attn_sconv.clone(),
+                        y,
+                        ld.attn_sconv.clone(),
+                    );
+                    self.caches[slot].attn_sconv_pending = Some(all);
+                    out
+                }
                 // THE CONVERSATIONAL DELTA: `n` known positions against a cache
                 // that already holds the prefix, in one pass.
                 //
@@ -1267,7 +1672,7 @@ impl Session {
                 // builds from absolute positions is what makes the untrimmed
                 // rows harmless, and `commit` below is what makes the store
                 // bounded again.
-                (true, true) => {
+                (true, PassMode::Commit, true) => {
                     let y = dev_lane::attention_steps(
                         hn,
                         &ld.attn,
@@ -1300,7 +1705,7 @@ impl Session {
                     self.caches[slot].attn_sconv = dev_lane::conv_history(all, t.sconv_kernel_size);
                     out
                 }
-                (true, false) => {
+                (true, PassMode::Commit, false) => {
                     let y = dev_lane::attention_step(
                         hn,
                         &ld.attn,
@@ -1319,7 +1724,7 @@ impl Session {
                     self.caches[slot].attn_sconv = hist;
                     out
                 }
-                (false, _) => {
+                (false, PassMode::Commit, _) => {
                     let (y, attn) =
                         dev_lane::attention_prefill(hn, &ld.attn, &dims, Some(ls), window, window);
                     let y = tp_reduce(y, &mut tp_calls);
@@ -1333,6 +1738,9 @@ impl Session {
                         mlp_sconv_pending: None,
                     });
                     out
+                }
+                (false, PassMode::Target, _) => {
+                    unreachable!("a target extension requires an existing prefix")
                 }
             };
             xd = dev_lane_resid::add_resid(xd, a);
@@ -1380,35 +1788,53 @@ impl Session {
             // As with attention, the partial sum must become whole before the
             // stateful short convolution consumes it.
             let y = tp_reduce(y, &mut tp_calls);
-            let (out, hist) = match (cached, n > 1) {
+            let out = match (cached, mode, n > 1) {
+                // The target half of the fourth convolution. Keep the entire
+                // window beside the committed history until one prefix count is
+                // applied to every layer.
+                (true, PassMode::Target, _) => {
+                    let h0 = self.caches[slot]
+                        .mlp_sconv
+                        .clone()
+                        .expect("a prefill seeds the MLP convolution");
+                    let (out, all) = dev_lane::short_conv_steps(h0, y, ld.mlp_sconv.clone());
+                    self.caches[slot].mlp_sconv_pending = Some(all);
+                    out
+                }
                 // The fourth of the four short convolutions a widened pass runs
                 // per layer -- two are inside `attention_steps`, one is the
                 // block's `attn_sconv` above, and this is the MLP's. All four
                 // need the batched form, and a widened pass that left one of
                 // them on the single-row kernel would convolve `n` positions
                 // out of one position's history with no error at all.
-                (true, true) => {
+                (true, PassMode::Commit, true) => {
                     let h0 = self.caches[slot]
                         .mlp_sconv
                         .clone()
                         .expect("a prefill seeds the MLP convolution");
                     let (o, all) = dev_lane::short_conv_steps(h0, y, ld.mlp_sconv.clone());
-                    (o, dev_lane::conv_history(all, t.sconv_kernel_size))
+                    self.caches[slot].mlp_sconv =
+                        Some(dev_lane::conv_history(all, t.sconv_kernel_size));
+                    o
                 }
-                (true, false) => {
+                (true, PassMode::Commit, false) => {
                     let h0 = self.caches[slot]
                         .mlp_sconv
                         .clone()
                         .expect("a prefill seeds the MLP convolution");
                     let (o, hi) = dev_lane::short_conv_step(h0, y, ld.mlp_sconv.clone());
-                    (o, hi)
+                    self.caches[slot].mlp_sconv = Some(hi);
+                    o
                 }
-                (false, _) => {
+                (false, PassMode::Commit, _) => {
                     let hist = dev_lane::conv_history(y.clone(), t.sconv_kernel_size);
-                    (dev_lane::short_conv(y, ld.mlp_sconv.clone()), hist)
+                    self.caches[slot].mlp_sconv = Some(hist);
+                    dev_lane::short_conv(y, ld.mlp_sconv.clone())
+                }
+                (false, PassMode::Target, _) => {
+                    unreachable!("a target extension requires an existing prefix")
                 }
             };
-            self.caches[slot].mlp_sconv = Some(hist);
             xd = dev_lane_resid::add_resid(xd, out);
 
             let expected = if group.is_some() { 2 } else { 0 };
@@ -1421,20 +1847,28 @@ impl Session {
 
         // ---- the head -----------------------------------------------------
         //
-        // Only the LAST row matters: the token that follows the sequence. A
-        // prefill computes `n` rows of residual stream and unembeds one of them,
-        // and slicing on the INPUT rather than on the logits is the difference
-        // between a 16 KB GEMM and an `n x 200058` one.
-        let hx = xd.slice([n - 1..n, 0..h]);
+        // Only the LAST row matters to an ordinary pass: the token that follows
+        // the sequence. A target verifier instead needs one prediction per row
+        // to find its accepted prefix. The explicit target path pays that wider
+        // head; the default path keeps slicing before the projection, where the
+        // difference is a 16 KB GEMM versus an `n x 200058` one.
+        let (hx, head_rows) = match mode {
+            PassMode::Commit => (xd.slice([n - 1..n, 0..h]), 1),
+            PassMode::Target => (xd, n),
+        };
         let hs = dev_lane_resid::rms_norm(hx, self.final_norm.clone(), t.rms_norm_eps)
             .div_scalar(t.logits_mup_width_multiplier as f32);
         let uw = &self.unembed;
-        let row = dev_lane::linear_w(hs, uw).slice([0..1, 0..t.effective_vocab()]);
-        let best = argmax_row_dev(row);
-
-        self.pos += n;
-        self.last = Some(best);
-        Ok(best)
+        let logits = dev_lane::linear_w(hs, uw).slice([0..head_rows, 0..t.effective_vocab()]);
+        match mode {
+            PassMode::Commit => {
+                let best = argmax_row_dev(logits);
+                self.pos += n;
+                self.last = Some(best);
+                Ok(PassOutput::Committed(best))
+            }
+            PassMode::Target => Ok(PassOutput::Target(argmax_rows_dev(logits))),
+        }
     }
 }
 

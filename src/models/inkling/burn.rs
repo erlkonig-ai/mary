@@ -1012,6 +1012,15 @@ impl<B: Backend> AttnCache<B> {
         self.len() == 0
     }
 
+    /// How many rows the current widened pass has appended but not settled.
+    ///
+    /// Kept crate-private because the public operation is [`AttnCache::commit`]:
+    /// this observation exists for the Session transaction boundary to validate
+    /// every layer's width before committing the first one.
+    pub(crate) fn pending_rows(&self) -> Option<usize> {
+        self.pending.as_ref().map(|p| p.rows)
+    }
+
     /// Absolute position of row 0.
     pub fn base(&self) -> usize {
         self.base

@@ -134,6 +134,21 @@ pub fn argmax_row_dev(row: T2) -> usize {
         .expect("device argmax readback") as usize
 }
 
+/// One argmax per row of a target verifier batch, reduced on the device and
+/// returned in row order.
+///
+/// Unlike calling [`argmax_row_dev`] in a loop, this performs one readback for
+/// the whole batch. A speculative caller needs every row's prediction to find
+/// the accepted prefix; an ordinary Session pass still calls the one-row helper
+/// and therefore keeps its existing head path unchanged.
+pub fn argmax_rows_dev(rows: T2) -> Vec<usize> {
+    rows.argmax(1)
+        .into_data()
+        .iter::<i64>()
+        .map(|index| index as usize)
+        .collect()
+}
+
 /// Host seconds inside the routed-expert lane, split by WHAT THE HOST DID.
 ///
 /// One bucket used to cover binding, quantising, four enqueues and the layer's
