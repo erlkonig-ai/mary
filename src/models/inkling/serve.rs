@@ -639,6 +639,41 @@ pub struct InklingMind {
 }
 
 #[cfg(feature = "drive-mind")]
+fn text_result_delta(
+    command: &str,
+    content: &drive::content::Content,
+    is_error: bool,
+    exit_code: Option<i32>,
+) -> String {
+    // Inkling's serving wire is text/plain and Session accepts token ids, so it
+    // cannot consume drive's resident image/audio parts yet. This is drive's
+    // explicit compatibility seam for a text-only mind, not a second stored
+    // representation: the typed Content stays intact in the World.
+    let projected = content.text_projection();
+    let mut delta = format!("\n$ {command}\n{projected}");
+
+    // A normal shell result already carries its `[exit 0]` line in the text
+    // projection. Preserve the structural fields when they add information the
+    // text need not carry: MCP `isError`, or a non-zero exit status.
+    match (is_error, exit_code) {
+        (true, Some(code)) => {
+            delta.push_str(&format!(
+                "\n[result status: isError=true, exit_code={code}]"
+            ));
+        }
+        (true, None) => delta.push_str("\n[result status: isError=true]"),
+        (false, Some(code)) => {
+            if code != 0 {
+                delta.push_str(&format!("\n[result status: exit_code={code}]"));
+            }
+        }
+        (false, None) => {}
+    }
+    delta.push('\n');
+    delta
+}
+
+#[cfg(feature = "drive-mind")]
 impl InklingMind {
     /// Wrap a running serving process as a mind.
     pub fn new(client: ServeClient, max_tokens: usize, system: Option<String>) -> Self {
@@ -756,9 +791,17 @@ impl InklingMind {
                 // delta. See this type's doc for why both halves have to be
                 // true, and what happened while only one was.
                 drive::world::Payload::Monologue(text) => self.buffer.push_free(text),
-                // The delta: untrusted text from a sandbox, in as text.
-                drive::world::Payload::Result { command, rendered } => {
-                    self.client.feed(&format!("\n$ {command}\n{rendered}\n"))?;
+                // The Session is text-token-only today, so drive's typed result
+                // crosses its deliberate text projection seam here. Abnormal
+                // structural status is stated rather than silently discarded.
+                drive::world::Payload::Result {
+                    command,
+                    content,
+                    is_error,
+                    exit_code,
+                } => {
+                    self.client
+                        .feed(&text_result_delta(command, content, *is_error, *exit_code))?;
                 }
             }
         }
@@ -879,5 +922,27 @@ mod tests {
             set.dedup();
             set.len()
         });
+    }
+
+    #[cfg(feature = "drive-mind")]
+    #[test]
+    fn a_typed_drive_result_crosses_the_text_only_seam_deliberately() {
+        let content = drive::content::Content::text("output\n[exit 7]");
+        assert_eq!(
+            text_result_delta("do thing", &content, false, Some(7)),
+            "\n$ do thing\noutput\n[exit 7]\n[result status: exit_code=7]\n"
+        );
+        assert_eq!(
+            text_result_delta("do thing", &content, true, Some(7)),
+            "\n$ do thing\noutput\n[exit 7]\n[result status: isError=true, exit_code=7]\n"
+        );
+
+        // The normal historical text shape stays byte-for-byte: typed results
+        // do not grow a second routine status rendering on every turn.
+        let ok = drive::content::Content::text("output\n[exit 0]");
+        assert_eq!(
+            text_result_delta("do thing", &ok, false, Some(0)),
+            "\n$ do thing\noutput\n[exit 0]\n"
+        );
     }
 }
