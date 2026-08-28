@@ -2,8 +2,9 @@
 //!
 //! This is deliberately not a daemon. It owns one serving process (normally an
 //! `inkling_serve_pair`), one Drive sandbox session, and one cognition ledger
-//! for the whole invocation. `--live` ends cooperatively at a turn boundary on
-//! the first SIGINT; a second SIGINT is the force-kill escape hatch.
+//! for the whole invocation. `--live` ends cooperatively at the next generated
+//! token boundary on the first SIGINT; a second SIGINT is the force-kill escape
+//! hatch.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,12 +30,11 @@ MODEL:
     --serve <path>          `inkling_serve`-compatible process (normally
                             `inkling_serve_pair`) [required]
     --serve-arg <arg>       Argument passed to the serving process; repeatable
-    --gen <n>               Maximum tokens per Drive consultation (default: 64)
     --system <text>         System prompt
 
 LIFETIME:
     --turns <n>             Run exactly this many Drive turns
-    --live                  Run until SIGINT, stopping at the next turn boundary
+    --live                  Run until SIGINT, stopping at the next token boundary
 
 DRIVE / SANDBOX:
     --pile <path>           Scratch cognition pile (default: unique /tmp path)
@@ -53,7 +53,8 @@ OPTIONAL FACULTIES:
     --memory-pile <path>    Durable self pile whose cover is injected at wake
     --memory-bin <path>     Memory faculty (default: memory on PATH)
     --context-window <n>    Context window in tokens (default: 200000)
-    --max-output <n>        Tokens reserved for output (default: 8192)
+    --max-output <n>        Hard tokens per response and output reservation
+                            (default: 8192)
     --context-margin <n>    Additional reserved tokens (default: 4096)
     --chars-per-token <n>   Cover sizing approximation (default: 4)
 
@@ -67,7 +68,6 @@ is exactly the selected playground backend plus the explicitly supplied
 struct Options {
     serve: Option<PathBuf>,
     serve_args: Vec<String>,
-    max_tokens: usize,
     system: String,
     turns: Option<usize>,
     live: bool,
@@ -95,7 +95,6 @@ impl Default for Options {
         Self {
             serve: None,
             serve_args: Vec::new(),
-            max_tokens: 64,
             system: DEFAULT_SYSTEM.to_string(),
             turns: None,
             live: false,
@@ -131,11 +130,6 @@ impl Options {
             match args[index].as_str() {
                 "--serve" => options.serve = Some(PathBuf::from(next(&mut index, "--serve")?)),
                 "--serve-arg" => options.serve_args.push(next(&mut index, "--serve-arg")?),
-                "--gen" => {
-                    options.max_tokens = next(&mut index, "--gen")?
-                        .parse()
-                        .context("--gen takes a token count")?;
-                }
                 "--system" => options.system = next(&mut index, "--system")?,
                 "--turns" => {
                     options.turns = Some(
@@ -201,7 +195,10 @@ impl Options {
 
         anyhow::ensure!(options.serve.is_some(), "--serve is required");
         anyhow::ensure!(options.playground.is_some(), "--playground is required");
-        anyhow::ensure!(options.max_tokens > 0, "--gen must be greater than zero");
+        anyhow::ensure!(
+            options.budget.max_output_tokens > 0,
+            "--max-output must be greater than zero"
+        );
         anyhow::ensure!(
             matches!(
                 (options.live, options.turns),
@@ -388,6 +385,8 @@ fn combine_run_and_finish(run: Result<()>, finish: Result<()>) -> Result<()> {
 fn run(options: Options) -> Result<()> {
     install_sigint_stop();
 
+    let max_response_tokens = usize::try_from(options.budget.max_output_tokens)
+        .context("--max-output does not fit this platform's token index")?;
     let mut serve = options.serve_command();
     eprintln!(
         "inkling_drive: loading one resident serving process: {} ({} argument(s))",
@@ -395,10 +394,16 @@ fn run(options: Options) -> Result<()> {
         options.serve_args.len(),
     );
     let client = ServeClient::spawn(&mut serve).context("start the Inkling serving process")?;
-    let mind = InklingMind::new(client, options.max_tokens, Some(options.system.clone()));
+    let mind = InklingMind::new(client, max_response_tokens, Some(options.system.clone()))
+        .with_cancellation(|| SIGINT_STOP.load(Ordering::Relaxed));
     // Validate after the client is owned by InklingMind: every refusal below
     // therefore takes the same bounded shutdown/reap path as a completed run.
     validate_ready(mind.ready())?;
+    anyhow::ensure!(
+        max_response_tokens.saturating_add(1) <= mind.ready().context_budget,
+        "the {max_response_tokens}-token response cap plus its one-token carry/prompt admission exceeds the model's {}-token context budget",
+        mind.ready().context_budget
+    );
     eprintln!(
         "inkling_drive: READY — {} layers, context {}, {}, {}",
         mind.ready().stack,
@@ -600,6 +605,8 @@ mod tests {
             vec!["--voice-arg", "orphan"],
             vec!["--no-telemetry", "--telemetry-pile", "/tmp/turns"],
             vec!["--exec-timeout", "0"],
+            vec!["--max-output", "0"],
+            vec!["--gen", "64"],
         ] {
             Options::parse(&minimum(&extra)).expect_err("contradiction must refuse");
         }

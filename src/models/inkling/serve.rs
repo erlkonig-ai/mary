@@ -348,11 +348,11 @@ pub struct ExecResultContext {
 
 /// One ordered part of a completed historical model response.
 ///
-/// Adjacent parts of the same textual kind are streaming slices of one model
-/// block. The codec concatenates them *before* content tokenization, so a
-/// response archived across several Drive turns reconstructs the same tokens
-/// as the unsliced response. An `Exec` part is instead a complete native call
-/// and is valid only as the final model part of a response.
+/// Adjacent parts of the same textual kind are fragments of one model block.
+/// The codec concatenates them *before* content tokenization, preserving exact
+/// tokens regardless of archival fragment boundaries. An `Exec` part is
+/// instead a complete native call and is valid only as the final model part of
+/// a response.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InklingHistoryPart {
@@ -984,9 +984,9 @@ pub struct NativeExecCall {
 
 /// Content emitted by one generated token after structural parsing.
 ///
-/// Archive currently preserves the channel and exact per-slice bytes, but
+/// Archive currently preserves the channel and exact per-part bytes, but
 /// Drive's split `said`/`Decision::reasoning` turn shape cannot retain an
-/// arbitrary alternation of several thinking and text blocks within one slice.
+/// arbitrary alternation of several thinking and text blocks within one response.
 /// The clean follow-up is an ordered, provider-neutral emitted-part sequence on
 /// `Turn`, populated here from parser transitions and staged verbatim. It must
 /// not be replaced by a second accumulated-response string.
@@ -1177,8 +1177,8 @@ impl NativeOutputParser {
     }
 
     /// Take the optional call after an exact end-of-sampling token and reset
-    /// for the next generation prompt. Calling this on a sliced/incomplete
-    /// response is a protocol error; callers instead retain the parser.
+    /// for the next generation prompt. Calling this on an incomplete response
+    /// is a protocol error.
     pub fn take_completed_call(&mut self) -> Result<Option<NativeExecCall>> {
         anyhow::ensure!(self.completed, "model response is not complete");
         self.completed = false;
@@ -1231,15 +1231,6 @@ fn project_native_exec(said: &mut String, command: &str) -> std::ops::Range<usiz
         said.push('\n');
     }
     start..said.len()
-}
-
-#[cfg(feature = "drive-mind")]
-fn response_state_for_slice(completed: bool) -> drive::mind::ResponseState {
-    if completed {
-        drive::mind::ResponseState::Complete
-    } else {
-        drive::mind::ResponseState::Open
-    }
 }
 
 /// Associate one arbitrated id with the fragments emitted by its one-token
@@ -1537,9 +1528,9 @@ impl ServeClient {
     /// every live turn after that boundary. A later isolated memory does not
     /// make an earlier uncovered turn safe to discard.
     ///
-    /// The serving process cannot see whether Drive still has a sliced response
-    /// or tool execution in flight. Its completed-turn check is only the narrow
-    /// mechanical boundary; the foreground runner owns that semantic boundary.
+    /// The serving process cannot see whether Drive still has a tool execution
+    /// in flight. Its completed-turn check is only the narrow mechanical
+    /// boundary; the foreground runner owns that semantic boundary.
     pub fn reinitialize(&mut self, initialization: &InklingContext) -> Result<Reinitialized> {
         anyhow::ensure!(
             matches!(initialization, InklingContext::Initialize { .. }),
@@ -2904,8 +2895,8 @@ impl StreamProof {
 ///
 /// A completed, strictly parsed native call is projected canonically into this
 /// same turn's `said` bytes and returned as [`drive::mind::Disposition::Fire`]
-/// over that exact fresh range. Text-only and sliced responses remain audited
-/// `NoAction` decisions.
+/// over that exact fresh range. Text-only responses remain audited `NoAction`
+/// decisions.
 #[cfg(feature = "drive-mind")]
 pub struct InklingMind {
     client: ServeClient,
@@ -2925,15 +2916,25 @@ pub struct InklingMind {
     /// Session-absolute byte offset up to which this mind has been shown its own
     /// monologue.
     scanned_abs: u64,
-    /// Tokens per turn.
-    max_tokens: usize,
+    /// Hard bound on one complete logical model response. This is the same
+    /// output reservation Drive removes from the memory-cover budget, not a
+    /// batching width exposed as extra Drive turns.
+    max_response_tokens: usize,
     /// System prompt held until the first released memory cover can be inserted
     /// in the same typed initialization record.
     system: Option<String>,
     initialized: bool,
-    /// Typed generated-output parser, retained when a Drive turn's token slice
-    /// ends before the model's logical response does.
+    /// Typed generated-output parser for the current logical response.
     output: NativeOutputParser,
+    /// Checked after every one-token collective. The ordinary constructor never
+    /// requests cancellation; the resident runner supplies its SIGINT flag.
+    stop_requested: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    /// An interrupted response cannot be resumed from Archive's completed
+    /// response representation. Cancellation itself is a graceful `Continue`
+    /// turn so Shell can observe its already-set stop flag; this guard makes an
+    /// accidental direct reuse fail terminally instead of continuing a partial
+    /// parser state.
+    response_interrupted: bool,
     /// The native call already present in the model's retained sequence and
     /// awaiting Drive's result. Exact command matching prevents both duplicate
     /// historical-call insertion and a result being attached to the wrong act.
@@ -3014,8 +3015,8 @@ impl InklingMind {
     ///
     /// Per-turn evidence belongs in Drive's ledger and optional telemetry. This
     /// constructor therefore retains no private report vector.
-    pub fn new(client: ServeClient, max_tokens: usize, system: Option<String>) -> Self {
-        Self::with_gate_evidence(client, max_tokens, system, false)
+    pub fn new(client: ServeClient, max_response_tokens: usize, system: Option<String>) -> Self {
+        Self::with_gate_evidence(client, max_response_tokens, system, false)
     }
 
     /// Wrap a running serving process for a finite measurement gate.
@@ -3023,13 +3024,17 @@ impl InklingMind {
     /// This deliberately retains a [`TurnEnd`] and [`StreamProof`] per turn so
     /// the gate can report them after its bounded run. Resident callers should
     /// use [`Self::new`].
-    pub fn new_gate(client: ServeClient, max_tokens: usize, system: Option<String>) -> Self {
-        Self::with_gate_evidence(client, max_tokens, system, true)
+    pub fn new_gate(
+        client: ServeClient,
+        max_response_tokens: usize,
+        system: Option<String>,
+    ) -> Self {
+        Self::with_gate_evidence(client, max_response_tokens, system, true)
     }
 
     fn with_gate_evidence(
         client: ServeClient,
-        max_tokens: usize,
+        max_response_tokens: usize,
         system: Option<String>,
         retain_gate_evidence: bool,
     ) -> Self {
@@ -3049,10 +3054,12 @@ impl InklingMind {
             voice: std::sync::Arc::new(std::sync::Mutex::new(None)),
             buffer: drive::mind::MonologueBuffer::with_cap(64 * 1024),
             scanned_abs: 0,
-            max_tokens,
+            max_response_tokens,
             system,
             initialized: false,
             output,
+            stop_requested: std::sync::Arc::new(|| false),
+            response_interrupted: false,
             outstanding_exec: None,
             needs_generation_prompt: false,
             turns: 0,
@@ -3060,6 +3067,21 @@ impl InklingMind {
             log,
             proofs,
         }
+    }
+
+    /// Check `stop_requested` between one-token collectives.
+    ///
+    /// Cancellation does not batch or delay output: the model still streams each
+    /// token immediately, then returns one audited interrupted response at the
+    /// next token boundary. A closure keeps the library independent of any
+    /// particular signal implementation while allowing a resident binary to
+    /// read its signal-safe atomic flag directly.
+    pub fn with_cancellation(
+        mut self,
+        stop_requested: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.stop_requested = std::sync::Arc::new(stop_requested);
+        self
     }
 
     /// The slot the shell's voice is dropped into after `Shell::open`.
@@ -3103,10 +3125,15 @@ impl InklingMind {
         (span_start, span_end)
     }
 
-    /// Exact protocol headroom for beginning one more response slice: one
-    /// carried final token, one generation-prompt token, and the configured
-    /// maximum number of generated tokens. These are protocol positions, not a
-    /// tunable safety margin.
+    /// Exact fixed-token headroom for beginning one more text response.
+    ///
+    /// `position` excludes the previous response's emitted final token. Starting
+    /// again appends that carry and one generation prompt; their forward pass
+    /// predicts response token one, so only `max_response_tokens - 1` more
+    /// positions are stepped. The resulting bound is `R + 1`, not a tuning
+    /// margin and not one arbitrary response slice. A pending tool result adds
+    /// its separately tokenized delta; the serving Session remains the final
+    /// exact admission boundary for that variable-width input.
     fn replacement_due(&self) -> bool {
         if !self.initialized || !(self.needs_generation_prompt || self.outstanding_exec.is_some()) {
             return false;
@@ -3114,7 +3141,7 @@ impl InklingMind {
         let Some(position) = self.position else {
             return false;
         };
-        let required = self.max_tokens.max(1).saturating_add(2);
+        let required = self.max_response_tokens.max(1).saturating_add(1);
         position.saturating_add(required) > self.client.ready().context_budget
     }
 }
@@ -3297,7 +3324,7 @@ impl drive::mind::Mind for InklingMind {
 fn aggregate_microturns(
     logical_turn: usize,
     microturns: &[TurnEnd],
-    completed: bool,
+    stopped: &str,
 ) -> Result<TurnEnd> {
     let first = microturns
         .first()
@@ -3323,11 +3350,7 @@ fn aggregate_microturns(
         token_ids: microturns.iter().map(|end| end.token_ids[0]).collect(),
         delta_tokens: first.delta_tokens,
         carried: first.carried,
-        stopped: if completed {
-            "content_model_end_sampling".to_string()
-        } else {
-            "max_tokens".to_string()
-        },
+        stopped: stopped.to_string(),
         first_token_secs: first.first_token_secs,
         turn_secs: microturns.iter().map(|end| end.turn_secs).sum(),
         position: last.position,
@@ -3342,6 +3365,10 @@ impl InklingMind {
         events: &[drive::world::Event],
         watermark: drive::world::Coord,
     ) -> std::result::Result<drive::mind::Turn, FailedTurn> {
+        if self.response_interrupted {
+            return Err(anyhow::anyhow!("cannot resume an interrupted Inkling response").into());
+        }
+
         let mut results = Vec::new();
         for event in events {
             match &event.payload {
@@ -3441,7 +3468,8 @@ impl InklingMind {
         let mut tokens_at_first_return = None;
         let turn = self.turns;
         let mut completed = false;
-        for _ in 0..self.max_tokens.max(1) {
+        let mut cancelled = false;
+        for _ in 0..self.max_response_tokens.max(1) {
             let mut fragments = String::new();
             let end = match self.client.consult(&Consult::new(1), |fragment| {
                 fragments.push_str(fragment);
@@ -3479,9 +3507,20 @@ impl InklingMind {
                 completed = true;
                 break;
             }
+            if (self.stop_requested)() {
+                cancelled = true;
+                break;
+            }
         }
 
-        let end = match aggregate_microturns(turn, &microturns, completed) {
+        let stopped = if completed {
+            "content_model_end_sampling"
+        } else if cancelled {
+            "cancelled"
+        } else {
+            "max_response_tokens"
+        };
+        let end = match aggregate_microturns(turn, &microturns, stopped) {
             Ok(end) => end,
             Err(error) => return Err(FailedTurn { error, said }),
         };
@@ -3500,11 +3539,9 @@ impl InklingMind {
         }
         self.turns += 1;
 
-        // A Drive turn is an archival slice, not a snapshot of the logical
-        // response accumulated so far. Keep only the provider reasoning bytes
-        // this slice emitted. `ResponseState::{Open, Complete, Interrupted}`
-        // supplies the lossless grouping boundary; concatenating THINKING
-        // parts within that boundary reconstructs the response exactly once.
+        // The one Drive turn is the complete semantic response (or its truthful
+        // interrupted prefix), even though one-token consults streamed it to
+        // the voice as it was generated.
         let reasoning = thinking_this_turn;
         let mut decision = if completed {
             let call = match self.output.take_completed_call() {
@@ -3538,20 +3575,49 @@ impl InklingMind {
                     )
                 }
             }
-        } else {
+        } else if cancelled {
+            self.response_interrupted = true;
             let (span_start, span_end) = self.finish_coverage();
             drive::mind::Decision::no_action(
                 span_start,
                 span_end,
                 watermark,
-                "inkling: assistant response continues in the next token slice",
+                "inkling: response interrupted by stop request",
+            )
+        } else {
+            self.response_interrupted = true;
+            let (span_start, span_end) = self.finish_coverage();
+            drive::mind::Decision::no_action(
+                span_start,
+                span_end,
+                watermark,
+                format!(
+                    "inkling response exceeded the configured {}-token response cap without content_model_end_sampling",
+                    self.max_response_tokens.max(1)
+                ),
             )
         };
         if !reasoning.is_empty() {
             decision = decision.with_reasoning(reasoning);
         }
-        Ok(drive::mind::Turn::new(said, decision)
-            .with_response_state(response_state_for_slice(completed)))
+        if completed {
+            Ok(drive::mind::Turn::new(said, decision))
+        } else if cancelled {
+            Ok(drive::mind::Turn {
+                said,
+                decision,
+                response_state: drive::mind::ResponseState::Interrupted,
+                continuation: drive::mind::TurnContinuation::Continue,
+            })
+        } else {
+            let error = decision.rationale.clone();
+            Ok(drive::mind::Turn {
+                said,
+                decision,
+                response_state: drive::mind::ResponseState::Interrupted,
+                continuation: drive::mind::TurnContinuation::Terminal { error },
+            })
+        }
     }
 }
 
@@ -4012,7 +4078,7 @@ mod tests {
     }
 
     #[test]
-    fn native_parser_survives_a_drive_token_slice_without_resetting() {
+    fn native_parser_preserves_state_across_one_token_microconsults() {
         let ids = fake_ready("parser").special_ids;
         let mut parser = NativeOutputParser::new(ids.clone());
         parser
@@ -4021,12 +4087,15 @@ mod tests {
                 &special_fragment(&ids, ids.content_text, ""),
             )
             .unwrap();
-        assert_eq!(parser.push(1, "first slice").unwrap().text, "first slice");
+        assert_eq!(
+            parser.push(1, "first fragment").unwrap().text,
+            "first fragment"
+        );
         assert!(parser.take_completed_call().is_err());
 
         assert_eq!(
-            parser.push(2, " second slice").unwrap().text,
-            " second slice"
+            parser.push(2, " second fragment").unwrap().text,
+            " second fragment"
         );
         parser
             .push(
@@ -4059,7 +4128,7 @@ mod tests {
 
     #[cfg(feature = "drive-mind")]
     #[test]
-    fn projected_calls_and_token_slices_carry_explicit_archive_semantics() {
+    fn projected_calls_carry_explicit_archive_semantics() {
         let decision = drive::mind::Decision::fire_projected(
             "printf same-turn",
             "\n$ printf same-turn\n",
@@ -4071,14 +4140,6 @@ mod tests {
         assert_eq!(
             decision.command_span_origin,
             Some(drive::mind::CommandSpanOrigin::Projected)
-        );
-        assert_eq!(
-            response_state_for_slice(false),
-            drive::mind::ResponseState::Open
-        );
-        assert_eq!(
-            response_state_for_slice(true),
-            drive::mind::ResponseState::Complete
         );
     }
 
@@ -4102,16 +4163,18 @@ mod tests {
         second.turn = 1;
         second.delta_tokens = 0;
         second.carried = 1;
-        let combined = aggregate_microturns(9, &[first.clone(), second.clone()], false).unwrap();
+        let combined =
+            aggregate_microturns(9, &[first.clone(), second.clone()], "max_response_tokens")
+                .unwrap();
         assert_eq!(combined.turn, 9);
         assert_eq!(combined.tokens, 2);
         assert_eq!(combined.token_ids, [41, 42]);
         assert_eq!(combined.delta_tokens, first.delta_tokens);
         assert_eq!(combined.carried, first.carried);
-        assert_eq!(combined.stopped, "max_tokens");
+        assert_eq!(combined.stopped, "max_response_tokens");
 
         second.tokens = 2;
-        assert!(aggregate_microturns(9, &[first, second], false).is_err());
+        assert!(aggregate_microturns(9, &[first, second], "cancelled").is_err());
     }
 
     #[cfg(feature = "tokenizer")]
@@ -4701,6 +4764,93 @@ cat >"$3"
         );
     }
 
+    #[cfg(all(feature = "drive-mind", unix))]
+    fn spawn_token_sequence_fixture(
+        name: &str,
+        ready: &Ready,
+        sequence: &[(u32, String)],
+    ) -> (
+        ServeClient,
+        ChildHandle,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let response = SharedSink::default();
+        let mut writer = framed_stream::FramedWriter::open(response.clone(), CONTENT_TYPE, UNIT)
+            .expect("response preamble");
+        let ready_payload = serde_json::to_vec(ready).expect("READY json");
+        writer
+            .record_as(READY_TYPE, &ready_payload, ready_payload.len() as u64)
+            .expect("READY record");
+        for (microturn, (id, fragment)) in sequence.iter().enumerate() {
+            writer.text(fragment).expect("token decoder fragment");
+            let mut end = fake_end(&[*id]);
+            end.turn = microturn;
+            if microturn > 0 {
+                end.delta_tokens = 0;
+                end.carried = 1;
+            }
+            if *id == ready.special_ids.content_model_end_sampling {
+                end.stopped = "stop_token".to_string();
+            }
+            let payload = serde_json::to_vec(&end).expect("TURN json");
+            writer
+                .record_as(TURN_TYPE, &payload, payload.len() as u64)
+                .expect("TURN record");
+        }
+        writer
+            .finish(framed_stream::EndStatus::Complete)
+            .expect("complete response");
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let stem = format!("mary-{name}-{}-{nonce}", std::process::id());
+        let response_path = std::env::temp_dir().join(format!("{stem}-response"));
+        let capture_path = std::env::temp_dir().join(format!("{stem}-capture"));
+        std::fs::write(&response_path, response.bytes()).expect("write fake response");
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("cat \"$1\"; cat >\"$2\"")
+            .arg("fake-inkling")
+            .arg(&response_path)
+            .arg(&capture_path);
+        let client = ServeClient::spawn(&mut command).expect("spawn fake serving process");
+        let child = client.child.clone();
+        (client, child, response_path, capture_path)
+    }
+
+    #[cfg(all(feature = "drive-mind", unix))]
+    fn assert_one_initialization_and_microconsults(path: &std::path::Path, expected: usize) {
+        let mut captured = framed_stream::FramedReader::open(
+            std::fs::File::open(path).expect("open captured input"),
+        )
+        .expect("captured preamble");
+        captured.require_content_type(CONTENT_TYPE).unwrap();
+        let framed_stream::Frame::Record(context) = captured.next_frame().unwrap() else {
+            panic!("first frame was not typed initialization")
+        };
+        assert_eq!(context.content_type(), CONTEXT_TYPE);
+        for _ in 0..expected {
+            let framed_stream::Frame::Record(consult) = captured.next_frame().unwrap() else {
+                panic!("microturn frame was not CONSULT")
+            };
+            assert_eq!(consult.content_type(), CONSULT_TYPE);
+            assert_eq!(
+                serde_json::from_slice::<Consult>(&consult.payload)
+                    .unwrap()
+                    .max_tokens,
+                1
+            );
+        }
+        assert_eq!(
+            captured.next_frame().unwrap(),
+            framed_stream::Frame::End(framed_stream::EndStatus::Complete)
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn single_shutdown_sends_complete_end_and_reaps_clean_exit() {
@@ -4735,6 +4885,36 @@ cat >"$3"
             .expect("poll killed fixture")
             .expect("forced shutdown must reap before returning");
         assert!(!status.success());
+        assert_complete_input(&capture_path);
+        let _ = std::fs::remove_file(response_path);
+        let _ = std::fs::remove_file(capture_path);
+    }
+
+    #[cfg(all(feature = "drive-mind", unix))]
+    #[test]
+    fn response_admission_rolls_over_before_the_complete_cap_cannot_fit() {
+        let (client, child, response_path, capture_path) =
+            spawn_shutdown_fixture("response-admission", false);
+        let context_budget = client.ready().context_budget;
+        let mut mind = InklingMind::new(client, 8, Some("system".to_string()));
+        mind.initialized = true;
+        mind.needs_generation_prompt = true;
+
+        // The previous final-token carry plus the generation prompt predicts
+        // token one. Exactly R + 1 positions from the reported position fit.
+        mind.position = Some(context_budget - 9);
+        assert!(!mind.replacement_due());
+        mind.position = Some(context_budget - 8);
+        assert!(mind.replacement_due());
+
+        drop(mind);
+        assert!(
+            child
+                .try_wait()
+                .expect("poll fake server")
+                .expect("drop reaps fake server")
+                .success()
+        );
         assert_complete_input(&capture_path);
         let _ = std::fs::remove_file(response_path);
         let _ = std::fs::remove_file(capture_path);
@@ -4979,94 +5159,39 @@ exec cat >/dev/null
 
     #[cfg(all(feature = "drive-mind", unix))]
     #[test]
-    fn provider_reasoning_is_an_incremental_delta_across_drive_slices() {
-        use drive::mind::{Mind as _, ResponseState};
+    fn one_observation_owns_one_complete_semantic_response() {
+        use drive::mind::{Mind as _, ResponseState, TurnContinuation};
 
         let ready = fake_ready("fixture.pile");
         let ids = ready.special_ids.clone();
-        // Two tokens per Drive turn make one logical thinking response span
-        // three archival slices:
-        //
-        //   Open("alpha"), Open(" beta"), Complete("").
-        //
-        // The Complete slice used to repeat "alpha beta", even though the two
-        // Open slices had already made those exact provider bytes durable.
-        let sequence = vec![
-            (
-                ids.content_thinking,
-                special_fragment(&ids, ids.content_thinking, ""),
-            ),
-            (7, "alpha".to_string()),
-            (8, " beta".to_string()),
-            (ids.end_message, special_fragment(&ids, ids.end_message, "")),
-            (
-                ids.content_model_end_sampling,
-                special_fragment(&ids, ids.content_model_end_sampling, ""),
-            ),
-        ];
+        let mut sequence = vec![(
+            ids.content_thinking,
+            special_fragment(&ids, ids.content_thinking, ""),
+        )];
+        // Cross the former 64-token Drive slice boundary. This remains one
+        // observe and one archival response while every token is still one
+        // independently arbitrated microconsult.
+        sequence.extend((0..64).map(|_| (7, "x".to_string())));
+        sequence.push((ids.end_message, special_fragment(&ids, ids.end_message, "")));
+        sequence.push((
+            ids.content_model_end_sampling,
+            special_fragment(&ids, ids.content_model_end_sampling, ""),
+        ));
 
-        let response = SharedSink::default();
-        let mut writer = framed_stream::FramedWriter::open(response.clone(), CONTENT_TYPE, UNIT)
-            .expect("response preamble");
-        let ready_payload = serde_json::to_vec(&ready).expect("READY json");
-        writer
-            .record_as(READY_TYPE, &ready_payload, ready_payload.len() as u64)
-            .expect("READY record");
-        for (microturn, (id, fragment)) in sequence.iter().enumerate() {
-            writer.text(fragment).expect("token decoder fragment");
-            let mut end = fake_end(&[*id]);
-            end.turn = microturn;
-            if microturn > 0 {
-                end.delta_tokens = 0;
-                end.carried = 1;
-            }
-            if *id == ids.content_model_end_sampling {
-                end.stopped = "stop_token".to_string();
-            }
-            let payload = serde_json::to_vec(&end).expect("TURN json");
-            writer
-                .record_as(TURN_TYPE, &payload, payload.len() as u64)
-                .expect("TURN record");
-        }
-        writer
-            .finish(framed_stream::EndStatus::Complete)
-            .expect("complete response");
+        let (client, child, response_path, capture_path) =
+            spawn_token_sequence_fixture("semantic-response", &ready, &sequence);
+        let mut mind = InklingMind::new(client, sequence.len(), Some("system".to_string()));
 
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let response_path =
-            std::env::temp_dir().join(format!("mary-sliced-thinking-response-{nonce}"));
-        let capture_path =
-            std::env::temp_dir().join(format!("mary-sliced-thinking-capture-{nonce}"));
-        std::fs::write(&response_path, response.bytes()).expect("write fake response");
-        let mut command = std::process::Command::new("sh");
-        command
-            .arg("-c")
-            .arg("cat \"$1\"; cat >\"$2\"")
-            .arg("fake-inkling")
-            .arg(&response_path)
-            .arg(&capture_path);
-        let client = ServeClient::spawn(&mut command).expect("spawn fake serving process");
-        let child = client.child.clone();
-        let mut mind = InklingMind::new(client, 2, Some("system".to_string()));
+        let turn = mind.observe(drive::world::MergedView::EMPTY);
 
-        let first = mind.observe(drive::world::MergedView::EMPTY);
-        let second = mind.observe(drive::world::MergedView::EMPTY);
-        let third = mind.observe(drive::world::MergedView::EMPTY);
-
-        assert_eq!(first.response_state, ResponseState::Open);
-        assert_eq!(second.response_state, ResponseState::Open);
-        assert_eq!(third.response_state, ResponseState::Complete);
-        assert_eq!(first.decision.reasoning.as_deref(), Some("alpha"));
-        assert_eq!(second.decision.reasoning.as_deref(), Some(" beta"));
-        assert_eq!(third.decision.reasoning, None);
-        let reconstructed = [&first, &second, &third]
-            .into_iter()
-            .filter_map(|turn| turn.decision.reasoning.as_deref())
-            .collect::<String>();
-        assert_eq!(reconstructed, "alpha beta");
+        let expected_reasoning = "x".repeat(64);
+        assert_eq!(turn.response_state, ResponseState::Complete);
+        assert_eq!(turn.continuation, TurnContinuation::Continue);
+        assert_eq!(turn.said, "");
+        assert_eq!(
+            turn.decision.reasoning.as_deref(),
+            Some(expected_reasoning.as_str())
+        );
 
         drop(mind);
         assert!(
@@ -5076,13 +5201,114 @@ exec cat >/dev/null
                 .expect("drop reaps fake server")
                 .success()
         );
+        assert_one_initialization_and_microconsults(&capture_path, sequence.len());
         let _ = std::fs::remove_file(response_path);
         let _ = std::fs::remove_file(capture_path);
     }
 
     #[cfg(all(feature = "drive-mind", unix))]
     #[test]
-    fn complete_fake_native_sequence_becomes_an_exact_same_turn_fire() {
+    fn response_cap_publishes_exact_interrupted_prefix_without_an_extra_consult() {
+        use drive::mind::{Mind as _, ResponseState};
+
+        let ready = fake_ready("fixture.pile");
+        let ids = ready.special_ids.clone();
+        let sequence = vec![
+            (
+                ids.content_thinking,
+                special_fragment(&ids, ids.content_thinking, ""),
+            ),
+            (6, "why".to_string()),
+            (ids.end_message, special_fragment(&ids, ids.end_message, "")),
+            (
+                ids.message_model,
+                special_fragment(&ids, ids.message_model, ""),
+            ),
+            (
+                ids.content_text,
+                special_fragment(&ids, ids.content_text, ""),
+            ),
+            (7, "partial".to_string()),
+            (8, " response".to_string()),
+        ];
+        let (client, child, response_path, capture_path) =
+            spawn_token_sequence_fixture("response-cap", &ready, &sequence);
+        let mut mind = InklingMind::new(client, sequence.len(), Some("system".to_string()));
+
+        let turn = mind.observe(drive::world::MergedView::EMPTY);
+
+        assert_eq!(turn.said, "partial response");
+        assert_eq!(turn.response_state, ResponseState::Interrupted);
+        let terminal = turn
+            .continuation
+            .terminal_error()
+            .expect("exhausting the semantic response cap is terminal");
+        assert!(terminal.contains("7-token response cap"), "{terminal}");
+        assert_eq!(turn.decision.reasoning.as_deref(), Some("why"));
+        assert!(mind.response_interrupted);
+
+        drop(mind);
+        assert!(
+            child
+                .try_wait()
+                .expect("poll fake server")
+                .expect("drop reaps fake server")
+                .success()
+        );
+        assert_one_initialization_and_microconsults(&capture_path, sequence.len());
+        let _ = std::fs::remove_file(response_path);
+        let _ = std::fs::remove_file(capture_path);
+    }
+
+    #[cfg(all(feature = "drive-mind", unix))]
+    #[test]
+    fn cancellation_between_microconsults_is_audited_and_gracefully_continuable() {
+        use drive::mind::{Mind as _, ResponseState, TurnContinuation};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let ready = fake_ready("fixture.pile");
+        let ids = ready.special_ids.clone();
+        let sequence = vec![
+            (
+                ids.content_thinking,
+                special_fragment(&ids, ids.content_thinking, ""),
+            ),
+            (7, "alpha".to_string()),
+            (8, " beta".to_string()),
+        ];
+        let (client, child, response_path, capture_path) =
+            spawn_token_sequence_fixture("response-cancel", &ready, &sequence);
+        let checks = std::sync::Arc::new(AtomicUsize::new(0));
+        let observed_checks = std::sync::Arc::clone(&checks);
+        let mut mind = InklingMind::new(client, 32, Some("system".to_string()))
+            .with_cancellation(move || observed_checks.fetch_add(1, Ordering::SeqCst) >= 1);
+
+        let turn = mind.observe(drive::world::MergedView::EMPTY);
+
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+        assert_eq!(turn.said, "");
+        assert_eq!(turn.decision.reasoning.as_deref(), Some("alpha"));
+        assert_eq!(turn.response_state, ResponseState::Interrupted);
+        assert_eq!(turn.continuation, TurnContinuation::Continue);
+        assert!(turn.decision.rationale.contains("stop request"));
+        assert!(mind.response_interrupted);
+
+        drop(mind);
+        assert!(
+            child
+                .try_wait()
+                .expect("poll fake server")
+                .expect("drop reaps fake server")
+                .success()
+        );
+        assert_one_initialization_and_microconsults(&capture_path, 2);
+        let _ = std::fs::remove_file(response_path);
+        let _ = std::fs::remove_file(capture_path);
+    }
+
+    #[cfg(all(feature = "drive-mind", unix))]
+    #[test]
+    fn native_call_crossing_microconsults_becomes_an_exact_same_turn_fire() {
         use drive::mind::Mind as _;
 
         let ready = fake_ready("fixture.pile");
