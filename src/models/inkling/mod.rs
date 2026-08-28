@@ -98,6 +98,10 @@ pub mod source;
 // are tested without a GPU.
 pub mod spectree;
 pub mod stack;
+// The scalar and cross-layer transaction law for a speculative target pass.
+// Pure bookkeeping: the CUDA Session supplies caches through its tiny trait,
+// while the accept/abort invariants remain testable without a model or device.
+pub(crate) mod target;
 pub mod vision;
 
 // THE ASSEMBLY, and then the thing it assembles.
