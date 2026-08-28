@@ -1240,7 +1240,12 @@ impl LaunchedServe {
 impl Drop for LaunchedServe {
     fn drop(&mut self) {
         if self.kill_on_drop {
-            let _ = self.child.kill();
+            // Keep the transport alive long enough to carry EOF to a remote
+            // supervisor. Killing `ssh` before closing its pipes can orphan
+            // the rank that the supervisor was meant to own.
+            drop(self.stdin.take());
+            drop(self.stdout.take());
+            reap_child_after_channel_close(&self.child);
         }
     }
 }
@@ -1298,7 +1303,12 @@ impl StartingServe {
 impl Drop for StartingServe {
     fn drop(&mut self) {
         if self.kill_on_drop {
-            let _ = self.child.kill();
+            // `FramedWriter::drop` emits an honest ABORTED end before closing
+            // the pipe. Let a remote supervisor observe that channel closure
+            // before forcefully terminating the local transport.
+            drop(self.writer.take());
+            drop(self.reader.take());
+            reap_child_after_channel_close(&self.child);
         }
     }
 }
@@ -1806,6 +1816,60 @@ pub struct ServePair {
     terminated: bool,
 }
 
+/// Own both rank transports from the moment the second spawn succeeds until
+/// they become a [`ServePair`].
+///
+/// READY [`ServeClient`]s live inside the guard, whose destructor explicitly
+/// closes their framed channels while SSH is still alive. That gives each
+/// remote supervisor an authoritative EOF on every `?` or panic. Only then
+/// does the guard wait, force-kill if necessary, and reap. Successful
+/// construction takes both clients and explicitly disarms the guard when
+/// ownership moves into `ServePair`.
+struct PairStartupGuard {
+    children: [ChildHandle; 2],
+    clients: [Option<ServeClient>; 2],
+    armed: bool,
+}
+
+impl PairStartupGuard {
+    fn new(children: [ChildHandle; 2]) -> Self {
+        Self {
+            children,
+            clients: [None, None],
+            armed: true,
+        }
+    }
+
+    fn ready(&mut self, rank: usize, client: ServeClient) {
+        self.clients[rank] = Some(client);
+    }
+
+    fn take(&mut self, rank: usize) -> Option<ServeClient> {
+        self.clients[rank].take()
+    }
+
+    /// Break a READY wait that cannot finish. Reaping remains the guard's one
+    /// responsibility after the startup workers and their pipes have dropped.
+    fn abort(&self) {
+        kill_children(&self.children);
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PairStartupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            for client in &mut self.clients {
+                drop(client.take());
+            }
+            reap_children_after_channel_close(&self.children);
+        }
+    }
+}
+
 impl ServePair {
     /// Long enough for the measured multi-minute model load, finite enough that
     /// a live-but-stuck rendezvous cannot occupy both boxes forever.
@@ -1848,14 +1912,9 @@ impl ServePair {
         let (launched0, launched1) = match (launched0, launched1) {
             (Ok(rank0), Ok(rank1)) => (rank0, rank1),
             (rank0, rank1) => {
-                if let Ok(rank) = &rank0 {
-                    let _ = rank.child.kill();
-                    let _ = rank.child.wait();
-                }
-                if let Ok(rank) = &rank1 {
-                    let _ = rank.child.kill();
-                    let _ = rank.child.wait();
-                }
+                // Any successfully launched side is still a `LaunchedServe`;
+                // consuming these Results below invokes its channel-first
+                // teardown rather than duplicating ownership here.
                 let error0 = rank0.err().map(|e| format!("rank 0: {e:#}"));
                 let error1 = rank1.err().map(|e| format!("rank 1: {e:#}"));
                 anyhow::bail!(
@@ -1869,7 +1928,7 @@ impl ServePair {
             }
         };
 
-        let children = [launched0.child.clone(), launched1.child.clone()];
+        let mut startup = PairStartupGuard::new([launched0.child.clone(), launched1.child.clone()]);
         let (send, receive) = std::sync::mpsc::channel();
         let send0 = send.clone();
         let worker0 = std::thread::spawn(move || {
@@ -1889,36 +1948,35 @@ impl ServePair {
         });
         drop(send);
 
-        let mut clients: [Option<ServeClient>; 2] = [None, None];
         let mut startup_error = None;
         for _ in 0..2 {
             let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
                 startup_error.get_or_insert_with(|| {
                     format!("serving pair did not become ready within {startup_timeout:?}")
                 });
-                kill_children(&children);
+                startup.abort();
                 break;
             };
             match receive.recv_timeout(remaining) {
-                Ok((rank, Ok(client))) => clients[rank] = Some(client),
+                Ok((rank, Ok(client))) => startup.ready(rank, client),
                 Ok((rank, Err(error))) => {
                     startup_error.get_or_insert_with(|| {
                         format!("rank {rank} did not become ready: {error:#}")
                     });
-                    kill_children(&children);
+                    startup.abort();
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     startup_error.get_or_insert_with(|| {
                         format!("serving pair did not become ready within {startup_timeout:?}")
                     });
-                    kill_children(&children);
+                    startup.abort();
                     break;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     startup_error.get_or_insert_with(|| {
                         "rank startup workers disappeared before READY".to_string()
                     });
-                    kill_children(&children);
+                    startup.abort();
                     break;
                 }
             }
@@ -1927,22 +1985,15 @@ impl ServePair {
         let worker1_panicked = worker1.join().is_err();
         if worker0_panicked || worker1_panicked {
             startup_error.get_or_insert_with(|| "a rank startup worker panicked".to_string());
-            kill_children(&children);
+            startup.abort();
         }
         if let Some(error) = startup_error {
-            wait_children(&children);
             anyhow::bail!(error);
         }
-        let rank0 = clients[0].take().context("rank 0 returned no client")?;
-        let rank1 = clients[1].take().context("rank 1 returned no client")?;
-        let ready = match compatible_ready(rank0.ready(), rank1.ready()) {
-            Ok(ready) => ready,
-            Err(error) => {
-                kill_children(&children);
-                wait_children(&children);
-                return Err(error);
-            }
-        };
+        let rank0 = startup.take(0).context("rank 0 returned no client")?;
+        let rank1 = startup.take(1).context("rank 1 returned no client")?;
+        let ready = compatible_ready(rank0.ready(), rank1.ready())?;
+        startup.disarm();
         Ok(Self {
             rank0,
             rank1,
@@ -2441,8 +2492,45 @@ fn kill_children(children: &[ChildHandle; 2]) {
     let _ = children[1].kill();
 }
 
+/// Give a closed serving channel one finite chance to shut its process down,
+/// then force termination and retain a reaper even if the kernel cannot report
+/// the exit within the second finite grace.
+fn reap_child_after_channel_close(child: &ChildHandle) {
+    match wait_child_with_timeout(child, SINGLE_REAP_GRACE) {
+        Ok(Some(_)) => return,
+        Ok(None) | Err(_) => {}
+    }
+    let _ = child.kill();
+    match wait_child_with_timeout(child, SINGLE_REAP_GRACE) {
+        Ok(Some(_)) => {}
+        Ok(None) | Err(_) => {
+            let _ = detach_child_reaper(child.clone());
+        }
+    }
+}
+
+/// Pair form of [`reap_child_after_channel_close`]. The first grace begins
+/// only after all later-owned protocol pipes have dropped, so remote
+/// supervisors can observe EOF before their local SSH transports are killed.
+fn reap_children_after_channel_close(children: &[ChildHandle; 2]) {
+    if wait_children_result_with_timeout(children, SINGLE_REAP_GRACE).is_ok() {
+        return;
+    }
+    force_reap_children(children);
+}
+
+fn force_reap_children(children: &[ChildHandle; 2]) {
+    kill_children(children);
+    if wait_children_result_with_timeout(children, SINGLE_REAP_GRACE).is_ok() {
+        return;
+    }
+    for child in children {
+        let _ = detach_child_reaper(child.clone());
+    }
+}
+
 fn wait_children(children: &[ChildHandle; 2]) {
-    let _ = wait_children_result_with_timeout(children, std::time::Duration::from_secs(10));
+    force_reap_children(children);
 }
 
 #[cfg(test)]
@@ -3742,6 +3830,96 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn supervised_ready_fixture(
+        ready: &Ready,
+        stem: &str,
+    ) -> (RankCommand, std::path::PathBuf, std::path::PathBuf) {
+        let response = SharedSink::default();
+        let mut writer = framed_stream::FramedWriter::open(response.clone(), CONTENT_TYPE, UNIT)
+            .expect("response preamble");
+        let payload = serde_json::to_vec(ready).expect("READY json");
+        writer
+            .record_as(READY_TYPE, &payload, payload.len() as u64)
+            .expect("READY record");
+        let ready_len = response.len();
+        drop(writer);
+        let mut bytes = response.bytes();
+        bytes.truncate(ready_len);
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let base = format!("mary-{stem}-{}-{nonce}", std::process::id());
+        let response_path = std::env::temp_dir().join(format!("{base}-response"));
+        let pid_path = std::env::temp_dir().join(format!("{base}-pids"));
+        std::fs::write(&response_path, bytes).expect("write READY fixture");
+
+        // This shell is a stand-in for the remote supervisor and its `sleep`
+        // child for the expensive rank. It can reap the rank only when the
+        // serving input reaches EOF while the supervisor is still alive. The
+        // old validation path killed this shell first and orphaned `sleep`.
+        let script = r#"
+sleep 30 &
+rank=$!
+printf '%s %s\n' "$$" "$rank" >"$1"
+dd if="$2" bs=1 count="$3" 2>/dev/null
+cat >/dev/null
+kill "$rank" 2>/dev/null || true
+wait "$rank" 2>/dev/null || true
+exit 0
+"#;
+        let command = RankCommand::local("sh")
+            .arg("-c")
+            .arg(script)
+            .arg("fake-supervisor")
+            .arg(pid_path.as_os_str())
+            .arg(response_path.as_os_str())
+            .arg(ready_len.to_string());
+        (command, pid_path, response_path)
+    }
+
+    #[cfg(unix)]
+    fn fixture_pids(path: &std::path::Path) -> [libc::pid_t; 2] {
+        let text = std::fs::read_to_string(path).expect("read fixture pids");
+        let mut pids = text
+            .split_whitespace()
+            .map(|pid| pid.parse::<libc::pid_t>().expect("numeric fixture pid"));
+        let result = [
+            pids.next().expect("supervisor pid"),
+            pids.next().expect("rank pid"),
+        ];
+        assert!(pids.next().is_none(), "unexpected extra fixture pid");
+        result
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: libc::pid_t) -> bool {
+        // SAFETY: signal 0 does not alter the target; it only probes whether
+        // this test-owned numeric pid still denotes a process.
+        let result = unsafe { libc::kill(pid, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    #[cfg(unix)]
+    struct FixtureProcessCleanup(Vec<libc::pid_t>);
+
+    #[cfg(unix)]
+    impl Drop for FixtureProcessCleanup {
+        fn drop(&mut self) {
+            for pid in &self.0 {
+                if process_exists(*pid) {
+                    // SAFETY: these pids were written by this test's live
+                    // supervisor fixtures and are retained only for cleanup.
+                    unsafe {
+                        libc::kill(*pid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
     fn spawn_shutdown_fixture(
         name: &str,
         hang_after_end: bool,
@@ -3894,6 +4072,44 @@ cat >"$3"
         right.context_budget /= 2;
         let error = compatible_ready(&left, &right).expect_err("different context budgets");
         assert!(error.to_string().contains("context budget mismatch"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_ready_rejection_closes_supervisors_then_reaps_both_rank_trees() {
+        let (mut rank0, mut rank1) = fake_pair_ready("left", "right");
+        rank0.execution_profile = "observed-v1".to_string();
+        rank1.execution_profile = "observed-v1".to_string();
+        let (command0, pids0, response0) = supervised_ready_fixture(&rank0, "reject-rank0");
+        let (command1, pids1, response1) = supervised_ready_fixture(&rank1, "reject-rank1");
+
+        let started = std::time::Instant::now();
+        let error =
+            ServePair::spawn_with_timeout([command0, command1], std::time::Duration::from_secs(2))
+                .err()
+                .expect("an observed execution profile must be rejected");
+        assert!(error.to_string().contains("execution profile"), "{error:#}");
+
+        let pids = [fixture_pids(&pids0), fixture_pids(&pids1)]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let _cleanup = FixtureProcessCleanup(pids.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while pids.iter().any(|pid| process_exists(*pid)) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        for pid in pids {
+            assert!(
+                !process_exists(pid),
+                "post-READY rejection left supervisor/rank pid {pid} alive"
+            );
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+
+        for path in [pids0, pids1, response0, response1] {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[cfg(all(feature = "drive-mind", unix))]
