@@ -848,6 +848,11 @@ burn-ndarray = "0.21.0"
 
 [patch.crates-io]
 
+# CubeCL 0.10 emitted generic aliases and registration statements by iterating
+# randomized HashMaps. Pin the deterministic macro expansion fix so independent
+# cohort builds produce the same executable code.
+cubecl-macros = { git = "https://github.com/erlkonig-ai/cubecl", rev = "8b2aa74e2514e39562df6e384a271c2ef9e53b06" }
+
 # burn, forked for a matmul defect: launch_matmul bound the non-quantized
 # rhs with the LHS dtype, so mixed-dtype matmul silently returned about half
 # the correct value (f32 x BF16) or NaN (BF16 x f32). See

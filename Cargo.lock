@@ -1928,8 +1928,7 @@ dependencies = [
 [[package]]
 name = "cubecl-macros"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77aa6df563e8e6a0926d2e9eeacb968737940a0e1ae9be819f6a65a341006e12"
+source = "git+https://github.com/erlkonig-ai/cubecl?rev=8b2aa74e2514e39562df6e384a271c2ef9e53b06#8b2aa74e2514e39562df6e384a271c2ef9e53b06"
 dependencies = [
  "cubecl-common",
  "darling 0.23.0",
