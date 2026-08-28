@@ -12,8 +12,8 @@ use std::io::{Read, Write};
 use anyhow::{Context, Result};
 
 use mary::models::inkling::serve::{
-    CONSULT_TYPE, CONTENT_TYPE, CONTEXT_TYPE, Consult, InklingContext, READY_TYPE, RankCommand,
-    ServePair, TURN_TYPE, UNIT,
+    CONSULT_TYPE, CONTENT_TYPE, CONTEXT_TYPE, Consult, InklingContext, READY_TYPE,
+    REINITIALIZE_TYPE, REINITIALIZED_TYPE, RankCommand, ServePair, TURN_TYPE, UNIT,
 };
 
 fn usage() -> &'static str {
@@ -593,6 +593,14 @@ fn run() -> Result<()> {
                 // compare continuity across independent serving sessions.
                 let payload = downstream_turn_payload(end)?;
                 output.record_as(TURN_TYPE, &payload, payload.len() as u64)?;
+            }
+            framed_stream::Frame::Record(record) if record.content_type() == REINITIALIZE_TYPE => {
+                let initialization: InklingContext = serde_json::from_slice(&record.payload)
+                    .context("parse downstream REINITIALIZE record")?;
+                let acknowledgement = pair.reinitialize(&initialization)?;
+                let payload = serde_json::to_vec(&acknowledgement)
+                    .context("encode downstream REINITIALIZED record")?;
+                output.record_as(REINITIALIZED_TYPE, &payload, payload.len() as u64)?;
             }
             framed_stream::Frame::Record(record) => anyhow::bail!(
                 "this serving proxy does not understand a {} record",

@@ -74,7 +74,8 @@ use anyhow::{Context, Result};
 
 use mary::models::inkling::serve::{
     CONSULT_TYPE, CONTENT_TYPE, CONTEXT_TYPE, Consult, ExecutionManifest, InklingContext,
-    InklingContextCodec, READY_TYPE, Ready, TURN_TYPE, TurnEnd, UNIT,
+    InklingContextCodec, READY_TYPE, REINITIALIZE_TYPE, REINITIALIZED_TYPE, Ready, Reinitialized,
+    TURN_TYPE, TurnEnd, UNIT,
 };
 use mary::models::inkling::session::{Session, SessionConfig};
 use mary::models::inkling::tp::Tp;
@@ -582,6 +583,25 @@ fn main() {
     }
 }
 
+/// A reinitialization replaces a sequence; it must not become a disguised way
+/// to discard context already queued for the next turn. The input loop itself
+/// is synchronous, so reaching this check proves no CONSULT is in flight.
+fn validate_reinitialize_boundary(
+    completed_turns: usize,
+    pending_delta_tokens: usize,
+    has_carry: bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        completed_turns > 0 && has_carry,
+        "reinitialization requires a completed turn"
+    );
+    anyhow::ensure!(
+        pending_delta_tokens == 0,
+        "reinitialization cannot discard {pending_delta_tokens} pending context token(s)"
+    );
+    Ok(())
+}
+
 fn run() -> Result<()> {
     let Some(options) = parse()? else {
         print!("{}", usage());
@@ -677,11 +697,6 @@ fn run() -> Result<()> {
     // carried token is never advanced twice: it entered this sequence when it
     // was generated, while `carry` only catches the KV cache up to that fact.
     let mut decode_stream = tokenizer.decode_stream(false);
-    let mut decode = |id: u32| {
-        decode_stream
-            .step(id)
-            .map_err(|error| anyhow::anyhow!("streaming decode: {error}"))
-    };
 
     let range = session.layer_range();
     let model_identity = hex_identity(session.model_identity());
@@ -784,7 +799,11 @@ fn run() -> Result<()> {
                 let want = consult.max_tokens.max(1);
                 let end = serve_turn(
                     &mut session,
-                    &mut decode,
+                    &mut |id| {
+                        decode_stream
+                            .step(id)
+                            .map_err(|error| anyhow::anyhow!("streaming decode: {error}"))
+                    },
                     &mut out,
                     std::mem::take(&mut delta),
                     want,
@@ -797,6 +816,50 @@ fn run() -> Result<()> {
                 out.record_as(TURN_TYPE, &payload, extent)?;
                 eprintln!("inkling_serve: {}", end.summary());
                 turn += 1;
+            }
+            framed_stream::Frame::Record(record) if record.content_type() == REINITIALIZE_TYPE => {
+                let initialization: InklingContext = serde_json::from_slice(&record.payload)
+                    .context("parse REINITIALIZE initialization")?;
+                anyhow::ensure!(
+                    matches!(initialization, InklingContext::Initialize { .. }),
+                    "REINITIALIZE requires one complete Initialize payload"
+                );
+                validate_reinitialize_boundary(turn, delta.len(), carry.is_some())?;
+
+                // Every fallible operation that can reject the replacement is
+                // above the reset. An invalid or over-wide cover leaves the old
+                // sequence byte-for-byte alive.
+                let replacement = context_codec
+                    .encode(&initialization)
+                    .context("encode REINITIALIZE initialization")?;
+                anyhow::ensure!(
+                    replacement.len() <= context_budget,
+                    "the {}-token replacement initialization exceeds this Session's \
+                     {context_budget}-token context budget",
+                    replacement.len()
+                );
+                let acknowledgement = Reinitialized {
+                    previous_position: session.position(),
+                    previous_turns: turn,
+                    initialization_tokens: replacement.len(),
+                };
+                let payload = serde_json::to_vec(&acknowledgement)
+                    .context("encode REINITIALIZED acknowledgement")?;
+
+                session.reset();
+                decode_stream = tokenizer.decode_stream(false);
+                delta = replacement;
+                carry = None;
+                turn = 0;
+
+                out.record_as(REINITIALIZED_TYPE, &payload, payload.len() as u64)?;
+                eprintln!(
+                    "inkling_serve: reinitialized after {} turn(s) at position {}; \
+                     {} replacement token(s) staged",
+                    acknowledgement.previous_turns,
+                    acknowledgement.previous_position,
+                    acknowledgement.initialization_tokens,
+                );
             }
             framed_stream::Frame::Record(record) if record.content_type() == CONTENT_TYPE => {
                 delta.extend(
@@ -993,7 +1056,10 @@ mod tests {
     use tokenizers::pre_tokenizers::byte_level::ByteLevel;
     use tokenizers::{Tokenizer, TokenizerBuilder};
 
-    use super::{advance_context_decode, reject_sealed_environment, sealed_environment_rejections};
+    use super::{
+        advance_context_decode, reject_sealed_environment, sealed_environment_rejections,
+        validate_reinitialize_boundary,
+    };
 
     fn byte_fallback_tokenizer() -> Tokenizer {
         let vocab = [
@@ -1057,6 +1123,23 @@ mod tests {
                 .map(str::to_owned),
         );
         assert_eq!(rejected, ["CUBECL_MEMORY_CONFIG", "NCCL_ALGO"]);
+    }
+
+    #[test]
+    fn reinitialization_requires_an_empty_completed_turn_boundary() {
+        let before_first = validate_reinitialize_boundary(0, 0, false)
+            .expect_err("there is no old sequence to replace");
+        assert!(
+            before_first.to_string().contains("completed turn"),
+            "{before_first:#}"
+        );
+
+        let queued = validate_reinitialize_boundary(3, 7, true)
+            .expect_err("queued context cannot be discarded");
+        assert!(queued.to_string().contains("7 pending"), "{queued:#}");
+
+        validate_reinitialize_boundary(3, 0, true)
+            .expect("a completed turn with no pending context is exact");
     }
 
     #[test]

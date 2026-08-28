@@ -31,8 +31,8 @@
 //! keyframes — needs no separate channel". That is used here rather than
 //! worked around: a record whose content type is the stream's default is
 //! CONTENT (raw probe context going in, a decoded fragment coming out), and a
-//! record that overrides it is CONTROL. Four overrides exist, and there is no second socket, no
-//! length-prefixed sidecar and no JSON-lines mode:
+//! record that overrides it is CONTROL. Six overrides exist, and there is no
+//! second socket, no length-prefixed sidecar and no JSON-lines mode:
 //!
 //! | content type | direction | meaning |
 //! |---|---|---|
@@ -40,6 +40,8 @@
 //! | [`CONTEXT_TYPE`] | client → serve | insert typed TML context safely |
 //! | [`CONSULT_TYPE`] | client → serve | the delta is complete — produce a turn |
 //! | [`TURN_TYPE`] | serve → client | the turn is over; here is how it went |
+//! | [`REINITIALIZE_TYPE`] | client → serve | replace one completed sequence with a complete initialization |
+//! | [`REINITIALIZED_TYPE`] | serve → client | the replacement prefix is staged against reset warm weights |
 //!
 //! # The two clocks mean something here
 //!
@@ -251,6 +253,12 @@ pub const CONSULT_TYPE: &str = "application/vnd.mary.inkling-consult+json";
 pub const CONTEXT_TYPE: &str = "application/vnd.mary.inkling-context+json";
 /// Control record, serve → client: the turn is over, and here is how it went.
 pub const TURN_TYPE: &str = "application/vnd.mary.inkling-turn+json";
+/// Control record, client → serve: atomically replace a completed sequence
+/// with a complete [`InklingContext::Initialize`] prefix.
+pub const REINITIALIZE_TYPE: &str = "application/vnd.mary.inkling-reinitialize+json";
+/// Control record, serve → client: the warm Session was reset and the
+/// replacement initialization is staged for its first CONSULT.
+pub const REINITIALIZED_TYPE: &str = "application/vnd.mary.inkling-reinitialized+json";
 
 #[cfg(any(feature = "tokenizer", test))]
 const MESSAGE_MODEL: &str = "<|message_model|>";
@@ -358,6 +366,21 @@ pub enum InklingContext {
     /// Start another autonomous assistant response after a completed text-only
     /// response. A tool result already carries this prompt itself.
     GenerationPrompt,
+}
+
+/// Serve → client: one completed sequence has been replaced in the same
+/// warm serving process.
+///
+/// The replacement initialization has been tokenized and staged, but has not
+/// yet been attended to: the next CONSULT performs the fresh Session prefill.
+/// `previous_*` name the sequence that was discarded. They make a rollover an
+/// observable boundary without introducing another long-lived sequence id.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Reinitialized {
+    pub previous_position: usize,
+    pub previous_turns: usize,
+    pub initialization_tokens: usize,
 }
 
 #[cfg(any(feature = "tokenizer", test))]
@@ -1354,6 +1377,63 @@ impl ServeClient {
             .with_context(|| format!("feed typed context to {}", self.label))
     }
 
+    /// Replace one completed sequence while keeping the serving process and its
+    /// warm weights alive.
+    ///
+    /// `initialization` must be [`InklingContext::Initialize`], not an
+    /// incremental context record. The server accepts it only after a completed
+    /// turn and before any context for the next turn has been queued. It first
+    /// tokenizes and validates the complete replacement, then resets Session,
+    /// tokenizer stream and carried-token state together. The acknowledgement
+    /// therefore means the next CONSULT is a fresh prefill; an error before it
+    /// leaves the old sequence untouched.
+    ///
+    /// This is deliberately not an automatic Drive policy. The caller above
+    /// the wire owns the durable cognition pile and must construct the fresh
+    /// cover represented by this initialization. In particular, a Drive
+    /// rollover must rebuild the cover with its fail-loud `build_cover`, take
+    /// `Cover::end_key` as the end of *contiguous* recalled coverage, and replay
+    /// every live turn after that boundary. A later isolated memory does not
+    /// make an earlier uncovered turn safe to discard.
+    ///
+    /// The serving process cannot see whether Drive still has a sliced response
+    /// or tool execution in flight. Its completed-turn check is only the narrow
+    /// mechanical boundary; the foreground runner owns that semantic boundary.
+    pub fn reinitialize(&mut self, initialization: &InklingContext) -> Result<Reinitialized> {
+        anyhow::ensure!(
+            matches!(initialization, InklingContext::Initialize { .. }),
+            "a serving-process reinitialization requires one complete Initialize payload"
+        );
+        let payload =
+            serde_json::to_vec(initialization).context("encode Inkling reinitialization")?;
+        let extent = payload.len() as u64;
+        self.writer()?
+            .record_as(REINITIALIZE_TYPE, &payload, extent)
+            .with_context(|| format!("reinitialize {}", self.label))?;
+        match self
+            .reader
+            .next_frame()
+            .with_context(|| format!("wait for {} to reinitialize", self.label))?
+        {
+            framed_stream::Frame::Record(record) if record.content_type() == REINITIALIZED_TYPE => {
+                serde_json::from_slice::<Reinitialized>(&record.payload)
+                    .context("parse the serving process's REINITIALIZED record")
+            }
+            framed_stream::Frame::Record(record) => anyhow::bail!(
+                "the serving process sent a {} record while reinitializing",
+                record.content_type()
+            ),
+            framed_stream::Frame::Gap(gap) => anyhow::bail!(
+                "the serving process could not acknowledge reinitialization: {} byte(s): {}",
+                gap.extent,
+                gap.reason
+            ),
+            framed_stream::Frame::End(status) => {
+                anyhow::bail!("the serving process ended while reinitializing: {status:?}")
+            }
+        }
+    }
+
     /// Ask for a turn, calling `on_token` with each token's text AS IT ARRIVES.
     ///
     /// The callback is the streaming seam: it runs while the serving process is
@@ -2038,6 +2118,36 @@ impl ServePair {
             return Err(error.context("feed typed context to rank 1"));
         }
         Ok(())
+    }
+
+    /// Reinitialize both ranks at the same completed-turn boundary.
+    ///
+    /// Session reset has no collective, so the requests may be acknowledged in
+    /// rank order. No downstream acknowledgement is valid until both ranks
+    /// report the same discarded position, turn count and replacement width;
+    /// one failure or disagreement terminates the pair instead of letting its
+    /// sequences diverge.
+    pub fn reinitialize(&mut self, initialization: &InklingContext) -> Result<Reinitialized> {
+        anyhow::ensure!(!self.terminated, "the serving pair is terminated");
+        let rank0 = match self.rank0.reinitialize(initialization) {
+            Ok(ack) => ack,
+            Err(error) => {
+                self.fail_and_reap();
+                return Err(error.context("reinitialize rank 0"));
+            }
+        };
+        let rank1 = match self.rank1.reinitialize(initialization) {
+            Ok(ack) => ack,
+            Err(error) => {
+                self.fail_and_reap();
+                return Err(error.context("reinitialize rank 1"));
+            }
+        };
+        if rank0 != rank1 {
+            self.fail_and_reap();
+            anyhow::bail!("rank reinitialization mismatch: rank 0 {rank0:?}, rank 1 {rank1:?}");
+        }
+        Ok(rank0)
     }
 
     /// Consult both ranks concurrently and stream only equal fragment pairs.
@@ -3209,13 +3319,29 @@ mod tests {
         let encoded = serde_json::to_vec(&context).expect("encode context");
         let decoded: InklingContext = serde_json::from_slice(&encoded).expect("decode context");
         assert_eq!(decoded, context);
+
+        let acknowledgement = Reinitialized {
+            previous_position: 65_000,
+            previous_turns: 41,
+            initialization_tokens: 12_345,
+        };
+        let decoded: Reinitialized =
+            serde_json::from_slice(&serde_json::to_vec(&acknowledgement).unwrap()).unwrap();
+        assert_eq!(decoded, acknowledgement);
     }
 
-    /// The four control types must be distinct from each other and from the
+    /// The control types must be distinct from each other and from the
     /// stream's own type, or a control record would read as content.
     #[test]
     fn the_control_types_are_distinct_from_content() {
-        let types = [READY_TYPE, CONSULT_TYPE, CONTEXT_TYPE, TURN_TYPE];
+        let types = [
+            READY_TYPE,
+            CONSULT_TYPE,
+            CONTEXT_TYPE,
+            TURN_TYPE,
+            REINITIALIZE_TYPE,
+            REINITIALIZED_TYPE,
+        ];
         for t in types {
             assert_ne!(t, CONTENT_TYPE);
         }
@@ -3298,6 +3424,79 @@ mod tests {
             context_budget: 65_536,
             load_secs: 1.0,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_reinitialization_is_one_initialize_request_and_one_acknowledgement() {
+        let response = SharedSink::default();
+        let mut writer = framed_stream::FramedWriter::open(response.clone(), CONTENT_TYPE, UNIT)
+            .expect("response preamble");
+        let ready_payload = serde_json::to_vec(&fake_ready("fixture.pile")).expect("READY json");
+        writer
+            .record_as(READY_TYPE, &ready_payload, ready_payload.len() as u64)
+            .expect("READY record");
+        let expected = Reinitialized {
+            previous_position: 65_000,
+            previous_turns: 41,
+            initialization_tokens: 12_345,
+        };
+        let ack_payload = serde_json::to_vec(&expected).expect("REINITIALIZED json");
+        writer
+            .record_as(REINITIALIZED_TYPE, &ack_payload, ack_payload.len() as u64)
+            .expect("REINITIALIZED record");
+        writer
+            .finish(framed_stream::EndStatus::Complete)
+            .expect("complete response");
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let response_path =
+            std::env::temp_dir().join(format!("mary-reinitialize-response-{nonce}"));
+        let capture_path = std::env::temp_dir().join(format!("mary-reinitialize-capture-{nonce}"));
+        std::fs::write(&response_path, response.bytes()).expect("write fake response");
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("cat \"$1\"; cat >\"$2\"")
+            .arg("fake-inkling")
+            .arg(&response_path)
+            .arg(&capture_path);
+        let mut client = ServeClient::spawn(&mut command).expect("spawn fake serving process");
+        let initialization = InklingContext::Initialize {
+            system: "replacement system".to_string(),
+            historical_exec_results: vec![ExecResultContext {
+                command: "memory old..new".to_string(),
+                content: "replacement cover".to_string(),
+            }],
+        };
+        assert_eq!(
+            client.reinitialize(&initialization).expect("reinitialize"),
+            expected
+        );
+        assert!(client.close().expect("close fixture").success());
+
+        let mut captured = framed_stream::FramedReader::open(
+            std::fs::File::open(&capture_path).expect("open captured input"),
+        )
+        .expect("captured preamble");
+        captured.require_content_type(CONTENT_TYPE).unwrap();
+        let framed_stream::Frame::Record(record) = captured.next_frame().unwrap() else {
+            panic!("first input frame was not REINITIALIZE")
+        };
+        assert_eq!(record.content_type(), REINITIALIZE_TYPE);
+        assert_eq!(
+            serde_json::from_slice::<InklingContext>(&record.payload).unwrap(),
+            initialization
+        );
+        assert_eq!(
+            captured.next_frame().unwrap(),
+            framed_stream::Frame::End(framed_stream::EndStatus::Complete)
+        );
+        let _ = std::fs::remove_file(response_path);
+        let _ = std::fs::remove_file(capture_path);
     }
 
     fn special_fragment(ids: &InklingSpecialIds, id: u32, pending: &str) -> String {
