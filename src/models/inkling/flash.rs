@@ -742,8 +742,9 @@ fn flash_kernel<KV: Numeric>(
         // One unit owns one whole sixteen-value NVFP4 block at a time.  That is
         // the storage algebra rather than merely coalesced scalar indexing:
         // one E4M3 scale and two u32 words become sixteen consecutive values.
-        // `head_dim` is a multiple of PLANE for every admitted shape, hence a
-        // sixteen-value block cannot straddle either a head or a key row.
+        // Every packed launch admits only head dimensions that are a multiple
+        // of the sixteen-value NVFP4 group, hence a block cannot straddle
+        // either a head or a key row.
         if comptime![packed] {
             let blocks = comptime!(PLANE * head_dim / 16);
             let mut block = u;
@@ -948,11 +949,11 @@ const MIN_KEYS_PER_SPLIT: usize = 128;
 
 /// Whether a layer's shape is one this kernel handles.
 ///
-/// Each condition is a real limit. `head_dim` must divide into the plane
-/// because a lane owns `head_dim / 32` output dimensions; `rows` must divide
-/// into both the planes and the head groups because a cube's rows are a
-/// `groups x (rows / groups)` rectangle spread over four planes; and the shared
-/// tile must fit the 48 KiB a static `__shared__` gets.
+/// Each condition is a real limit. An output dimension may end partway through
+/// a plane; the packed launcher separately requires whole NVFP4 groups. `rows`
+/// must divide into both the planes and the head groups because a cube's rows
+/// are a `groups x (rows / groups)` rectangle spread over four planes; and the
+/// shared tile must fit the 48 KiB a static `__shared__` gets.
 pub fn applies(heads: usize, kv_heads: usize, head_dim: usize, rows: usize) -> bool {
     if kv_heads == 0 || heads % kv_heads != 0 || head_dim == 0 || rows == 0 {
         return false;
@@ -962,6 +963,15 @@ pub fn applies(heads: usize, kv_heads: usize, head_dim: usize, rows: usize) -> b
         && rows % PLANES as usize == 0
         && rows % groups == 0
         && shared_floats(rows as u32, head_dim as u32) * core::mem::size_of::<f32>() <= 48 * 1024
+}
+
+/// Whether one head ends on an NVFP4 block boundary.
+///
+/// The dense reader has no such restriction. The staged packed-V reader owns
+/// one complete block per unit, so allowing a partial terminal block would
+/// make that unit cross into the next head row.
+fn packed_head_dim_applies(head_dim: usize) -> bool {
+    head_dim.is_multiple_of(super::fp4quant::GROUP)
 }
 
 /// The cube row count a DECODE step wants: the smallest multiple of [`PLANES`]
@@ -1048,6 +1058,12 @@ pub fn flash_attention_launch<R: Runtime>(
         applies(heads, kv_heads, head_dim, rows),
         "this shape is not fused here: {heads}/{kv_heads} heads, head_dim {head_dim}, rows {rows}"
     );
+    let packed = kv == KvElem::Nvfp4;
+    assert!(
+        !packed || packed_head_dim_applies(head_dim),
+        "NVFP4 needs head_dim {head_dim} to end on a {}-value block boundary",
+        super::fp4quant::GROUP
+    );
     let groups = heads / kv_heads;
     let bq = rows / groups;
     let q_tiles = nq.div_ceil(bq);
@@ -1089,7 +1105,6 @@ pub fn flash_attention_launch<R: Runtime>(
     let po = client.empty(po_elems * core::mem::size_of::<f32>());
     let pml = client.empty(pml_elems * core::mem::size_of::<f32>());
 
-    let packed = kv == KvElem::Nvfp4;
     let mut slot0 = 0usize;
     for (run, splits) in runs.iter().zip(split_of.iter().copied()) {
         let kv_elems = run.rows * kv_heads * head_dim;
@@ -1237,6 +1252,14 @@ mod tests {
         // A head_dim whose tile does not fit the 48 KiB a static `__shared__`
         // gets.
         assert!(!applies(32, 8, 2048, 32));
+    }
+
+    #[test]
+    fn packed_heads_end_on_block_boundaries_but_dense_heads_need_not() {
+        assert!(packed_head_dim_applies(128));
+        assert!(packed_head_dim_applies(super::fp4quant::GROUP));
+        assert!(!packed_head_dim_applies(8));
+        assert!(applies(32, 8, 8, 4));
     }
 
     #[test]
