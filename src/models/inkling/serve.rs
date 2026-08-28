@@ -2909,6 +2909,12 @@ impl StreamProof {
 #[cfg(feature = "drive-mind")]
 pub struct InklingMind {
     client: ServeClient,
+    /// Consecutive identity of the KV sequence currently held by the serving
+    /// process. It changes only after a complete reinitialization ACK.
+    context_epoch: u64,
+    /// Position reported by the final microturn of the latest consultation.
+    /// `None` means the initialization has not yet been prefetched.
+    position: Option<usize>,
     /// The voice, once the shell has been opened and has handed it over.
     /// `Shell::claim_voice` can only be called on a built shell, and the mind
     /// has to be built before the shell, so the handle arrives through a slot
@@ -2967,8 +2973,7 @@ impl From<anyhow::Error> for FailedTurn {
 }
 
 #[cfg(feature = "drive-mind")]
-fn text_result_delta(
-    command: &str,
+fn text_result_content(
     content: &drive::content::Content,
     is_error: bool,
     exit_code: Option<i32>,
@@ -2978,7 +2983,7 @@ fn text_result_delta(
     // explicit compatibility seam for a text-only mind, not a second stored
     // representation: the typed Content stays intact in the World.
     let projected = content.text_projection();
-    let mut delta = format!("\n$ {command}\n{projected}");
+    let mut delta = projected.into_owned();
 
     // A normal shell result already carries its `[exit 0]` line in the text
     // projection. Preserve the structural fields when they add information the
@@ -2997,7 +3002,9 @@ fn text_result_delta(
         }
         (false, None) => {}
     }
-    delta.push('\n');
+    if !delta.ends_with('\n') {
+        delta.push('\n');
+    }
     delta
 }
 
@@ -3037,6 +3044,8 @@ impl InklingMind {
             retain_gate_evidence.then(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
         Self {
             client,
+            context_epoch: 0,
+            position: None,
             voice: std::sync::Arc::new(std::sync::Mutex::new(None)),
             buffer: drive::mind::MonologueBuffer::with_cap(64 * 1024),
             scanned_abs: 0,
@@ -3093,6 +3102,82 @@ impl InklingMind {
         self.scanned_abs = span_end;
         (span_start, span_end)
     }
+
+    /// Exact protocol headroom for beginning one more response slice: one
+    /// carried final token, one generation-prompt token, and the configured
+    /// maximum number of generated tokens. These are protocol positions, not a
+    /// tunable safety margin.
+    fn replacement_due(&self) -> bool {
+        if !self.initialized || !(self.needs_generation_prompt || self.outstanding_exec.is_some()) {
+            return false;
+        }
+        let Some(position) = self.position else {
+            return false;
+        };
+        let required = self.max_tokens.max(1).saturating_add(2);
+        position.saturating_add(required) > self.client.ready().context_budget
+    }
+}
+
+#[cfg(feature = "drive-mind")]
+fn replacement_history(image: &drive::mind::ContextImage) -> Result<Vec<InklingHistoryResponse>> {
+    image
+        .responses
+        .iter()
+        .map(|response| {
+            response.validate()?;
+            let parts = response
+                .parts
+                .iter()
+                .map(|part| match part {
+                    drive::mind::ContextPart::Thinking(content) => InklingHistoryPart::Thinking {
+                        content: content.clone(),
+                    },
+                    drive::mind::ContextPart::Text(content) => InklingHistoryPart::Text {
+                        content: content.clone(),
+                    },
+                    drive::mind::ContextPart::ToolCall(command) => InklingHistoryPart::Exec {
+                        command: command.clone(),
+                    },
+                })
+                .collect::<Vec<_>>();
+            let tool_result = response.tool_result.as_ref().map(|result| {
+                text_result_content(&result.content, result.is_error, result.exit_code)
+            });
+            let response = InklingHistoryResponse { parts, tool_result };
+            response.validate()?;
+            Ok(response)
+        })
+        .collect()
+}
+
+#[cfg(feature = "drive-mind")]
+fn validate_replacement_boundary(
+    needs_generation_prompt: bool,
+    outstanding_exec: Option<&str>,
+    history: &[InklingHistoryResponse],
+) -> Result<()> {
+    anyhow::ensure!(
+        needs_generation_prompt != outstanding_exec.is_some(),
+        "cannot replace an Inkling context inside an unfinished response"
+    );
+    if let Some(command) = outstanding_exec {
+        let final_command = history.last().and_then(|response| {
+            response
+                .tool_result
+                .as_ref()
+                .and_then(|_| response.parts.last())
+                .and_then(|part| match part {
+                    InklingHistoryPart::Exec { command } => Some(command.as_str()),
+                    _ => None,
+                })
+        });
+        anyhow::ensure!(
+            final_command == Some(command),
+            "replacement history does not close outstanding exec call {command:?}"
+        );
+    }
+    Ok(())
 }
 
 /// The shell OWNS the mind (`Box<dyn Mind>`), so no caller can ever hand the
@@ -3146,6 +3231,61 @@ impl drive::mind::Mind for InklingMind {
                 )
             }
         }
+    }
+
+    fn context_epoch(&self) -> u64 {
+        self.context_epoch
+    }
+
+    fn context_replacement_due(&self) -> bool {
+        self.replacement_due()
+    }
+
+    fn replace_context(
+        &mut self,
+        next_epoch: u64,
+        image: &drive::mind::ContextImage,
+    ) -> std::result::Result<(), drive::mind::ContextReplacementFailure> {
+        let initialization = (|| -> Result<InklingContext> {
+            anyhow::ensure!(
+                self.initialized,
+                "cannot replace an uninitialized Inkling context"
+            );
+            anyhow::ensure!(
+                next_epoch
+                    == self
+                        .context_epoch
+                        .checked_add(1)
+                        .context("Inkling context epoch overflow")?,
+                "Inkling context replacement must advance by exactly one"
+            );
+            let history = replacement_history(image)?;
+            validate_replacement_boundary(
+                self.needs_generation_prompt,
+                self.outstanding_exec.as_deref(),
+                &history,
+            )?;
+            Ok(InklingContext::Initialize {
+                system: image.system.clone(),
+                history,
+            })
+        })()
+        .map_err(drive::mind::ContextReplacementFailure::unchanged)?;
+        let acknowledged = match self.client.reinitialize(&initialization) {
+            Ok(acknowledged) => acknowledged,
+            Err(error) => {
+                let _ = self.client.kill();
+                return Err(drive::mind::ContextReplacementFailure::terminal(
+                    error.context("replace the resident Inkling context"),
+                ));
+            }
+        };
+        self.output = NativeOutputParser::new(self.client.ready().special_ids.clone());
+        self.outstanding_exec = None;
+        self.needs_generation_prompt = false;
+        self.position = Some(acknowledged.initialization_tokens);
+        self.context_epoch = next_epoch;
+        Ok(())
     }
 
     fn label(&self) -> &str {
@@ -3218,7 +3358,7 @@ impl InklingMind {
                     exit_code,
                 } => results.push(ExecResultContext {
                     command: command.clone(),
-                    content: text_result_delta(command, content, *is_error, *exit_code),
+                    content: text_result_content(content, *is_error, *exit_code),
                 }),
             }
         }
@@ -3345,6 +3485,7 @@ impl InklingMind {
             Ok(end) => end,
             Err(error) => return Err(FailedTurn { error, said }),
         };
+        self.position = Some(end.position);
         let records_at_end = voice.as_ref().map(|v| v.report().records).unwrap_or(0);
         if let Some(proofs) = &self.proofs {
             proofs.lock().expect("proof log").push(StreamProof {
@@ -4690,7 +4831,7 @@ cat >"$3"
 
         let system = "system first";
         let result_delta =
-            text_result_delta("cmd", &drive::content::Content::text("output"), false, None);
+            text_result_content(&drive::content::Content::text("output"), false, None);
         let max_tokens = 7;
 
         // Complete fake server output. `ServeClient::spawn` receives only the
@@ -5310,20 +5451,87 @@ exec cat >/dev/null
     fn a_typed_drive_result_crosses_the_text_only_seam_deliberately() {
         let content = drive::content::Content::text("output\n[exit 7]");
         assert_eq!(
-            text_result_delta("do thing", &content, false, Some(7)),
-            "\n$ do thing\noutput\n[exit 7]\n[result status: exit_code=7]\n"
+            text_result_content(&content, false, Some(7)),
+            "output\n[exit 7]\n[result status: exit_code=7]\n"
         );
         assert_eq!(
-            text_result_delta("do thing", &content, true, Some(7)),
-            "\n$ do thing\noutput\n[exit 7]\n[result status: isError=true, exit_code=7]\n"
+            text_result_content(&content, true, Some(7)),
+            "output\n[exit 7]\n[result status: isError=true, exit_code=7]\n"
         );
 
-        // The normal historical text shape stays byte-for-byte: typed results
-        // do not grow a second routine status rendering on every turn.
+        // The native call already names its command structurally. Tool content
+        // does not duplicate it as a shell-looking text scaffold, and ordinary
+        // success does not grow a second status rendering.
         let ok = drive::content::Content::text("output\n[exit 0]");
         assert_eq!(
-            text_result_delta("do thing", &ok, false, Some(0)),
-            "\n$ do thing\noutput\n[exit 0]\n"
+            text_result_content(&ok, false, Some(0)),
+            "output\n[exit 0]\n"
+        );
+    }
+
+    #[cfg(feature = "drive-mind")]
+    #[test]
+    fn drive_replacement_history_preserves_parts_and_closes_the_exact_call() {
+        let image = drive::mind::ContextImage {
+            system: "system".to_string(),
+            responses: vec![
+                drive::mind::ContextResponse {
+                    parts: vec![
+                        drive::mind::ContextPart::Thinking("consider".to_string()),
+                        drive::mind::ContextPart::Text("answer".to_string()),
+                    ],
+                    tool_result: None,
+                },
+                drive::mind::ContextResponse {
+                    parts: vec![
+                        drive::mind::ContextPart::Thinking("inspect".to_string()),
+                        drive::mind::ContextPart::ToolCall("ls -la".to_string()),
+                    ],
+                    tool_result: Some(drive::mind::ContextToolResult {
+                        content: drive::content::Content::text("listing"),
+                        is_error: false,
+                        exit_code: Some(0),
+                    }),
+                },
+            ],
+        };
+
+        let history = replacement_history(&image).expect("lower Drive context");
+        assert_eq!(
+            history,
+            vec![
+                InklingHistoryResponse {
+                    parts: vec![
+                        InklingHistoryPart::Thinking {
+                            content: "consider".to_string(),
+                        },
+                        InklingHistoryPart::Text {
+                            content: "answer".to_string(),
+                        },
+                    ],
+                    tool_result: None,
+                },
+                InklingHistoryResponse {
+                    parts: vec![
+                        InklingHistoryPart::Thinking {
+                            content: "inspect".to_string(),
+                        },
+                        InklingHistoryPart::Exec {
+                            command: "ls -la".to_string(),
+                        },
+                    ],
+                    tool_result: Some("listing\n".to_string()),
+                },
+            ]
+        );
+        validate_replacement_boundary(false, Some("ls -la"), &history)
+            .expect("the exact archived result closes the outstanding call");
+        let error = validate_replacement_boundary(false, Some("pwd"), &history)
+            .expect_err("a different call must not be silently closed");
+        assert!(error.to_string().contains("pwd"), "{error:#}");
+        assert!(
+            validate_replacement_boundary(true, None, &history).is_ok(),
+            "a completed text response is also a replacement boundary"
         );
     }
 }
