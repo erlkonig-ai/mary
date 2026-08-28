@@ -352,14 +352,30 @@
 //! arms are interleaved in the first place. An unpaired reading of this run
 //! would have concluded nothing.
 //!
-//! So it is a switch that is OFF, and what it is waiting for is named rather
-//! than guessed: a value loop that does not decode V four times and does not
-//! issue a load an element. Giving a lane a CONTIGUOUS run of dimensions would
-//! do both — one 32-bit code word would serve eight elements and one scale byte
-//! sixteen — but that is a change to the lane-to-dimension mapping, i.e. to
-//! this kernel's SHAPE, which is exactly what the old note said the packed read
-//! would not need. The note was right that the reader change is local. It was
-//! wrong that the reader change is sufficient.
+//! That was the direct-reader result. The staged-value tile below removes the
+//! duplicated work without changing the lane-to-output mapping: the 128 units
+//! cooperatively expand each 32-key V tile once, one whole sixteen-value NVFP4
+//! block per unit, into the key tile's now-dead shared memory. All four planes
+//! then consume that one expansion. Each pair of packed words and its scale is
+//! loaded once per tile rather than once per value per plane.
+//!
+//! The same-binary, four-arm ABBA gate after that change is favorable at both
+//! lengths. Each row is a median over 39 warm decode steps, and each paired
+//! sample is `mean(tile, tileB) / mean(dense, denseB) - 1` within one ABBA
+//! block; the interval is Student-t over seven samples. Both lengths use
+//! `INK_LAYERS=0:8`, `INK_GEN=40`, one GB10, and differ only in the input
+//! context and `INK_FLASH_FP4`:
+//!
+//! | input context | paired step-time delta | 95% CI | favorable blocks |
+//! | ---: | ---: | ---: | ---: |
+//! | 3732 | **-0.74%** | -1.18..-0.31% | 7 / 7 |
+//! | 14928 | **-4.85%** | -5.47..-4.23% | 7 / 7 |
+//!
+//! The generation sequence is bit-identical across all 28 processes at each
+//! length, and the device gate below still requires the packed and dequantized
+//! readers to be bit-identical over decode, prefill, page cuts, GQA and windows.
+//! Raw logs and TSVs are preserved as Files import
+//! `d6431dfa4c1e699b767e424a2785c1a4`.
 //!
 //! It is DECODE-only in effect: the prefill global arm reads freshly projected
 //! K and V rather than the cache, so it never reaches this flag — which is just
