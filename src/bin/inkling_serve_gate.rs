@@ -3,7 +3,8 @@
 //!
 //! ```text
 //! inkling_serve_gate drive  --serve <inkling_serve> --serve-arg … \
-//!                           --playground <mock_mcp_server> --voice <stub_speech>
+//!                           --playground <mock_mcp_server> \
+//!                           --expect-command <exact-command> --voice <stub_speech>
 //! inkling_serve_gate probe  --serve <inkling_serve> --serve-arg …
 //! inkling_serve_gate prefix --serve <inkling_serve_pair> --serve-arg … \
 //!                           --playground <mock_mcp_server> --memory-pile <self.pile>
@@ -78,6 +79,11 @@ OPTIONS (both):
 OPTIONS (drive):
     --playground <path>  A `playground mcp`-compatible binary (mock_mcp_server)
                          [required]
+    --expect-command <command>
+                         The one exact command this gate permits and requires.
+                         `drive` refuses to start without it
+    --exec-timeout-ms <n>
+                         Finite wall-clock limit for that command (default 5000)
     --voice <path>       A streaming speech faculty (stub_speech). Without one
                          there is no consumer, and the streaming claim cannot be
                          measured — only asserted
@@ -117,6 +123,8 @@ struct Options {
     turns: usize,
     system: String,
     feeds: Vec<String>,
+    expected_command: Option<String>,
+    exec_timeout_ms: u64,
 }
 
 fn parse(args: &[String]) -> Result<Options> {
@@ -134,6 +142,8 @@ fn parse(args: &[String]) -> Result<Options> {
         turns: 3,
         system: DEFAULT_SYSTEM.to_string(),
         feeds: Vec::new(),
+        expected_command: None,
+        exec_timeout_ms: 5_000,
     };
     let mut i = 0;
     while i < args.len() {
@@ -160,6 +170,12 @@ fn parse(args: &[String]) -> Result<Options> {
             "--turns" => o.turns = need(i)?.parse().context("--turns wants a count")?,
             "--system" => o.system = need(i)?,
             "--feed" => o.feeds.push(need(i)?),
+            "--expect-command" => o.expected_command = Some(need(i)?),
+            "--exec-timeout-ms" => {
+                o.exec_timeout_ms = need(i)?
+                    .parse()
+                    .context("--exec-timeout-ms wants a millisecond count")?
+            }
             other => anyhow::bail!("unknown argument {other:?}\n\n{}", usage()),
         }
         i += 2;
@@ -244,11 +260,60 @@ struct DriveRun {
 }
 
 fn cmd_drive(o: &Options) -> Result<()> {
-    run_drive(o, o.tokens, o.turns, "drive").map(|_| ())
+    let expected = o.expected_command.as_deref().context(
+        "--expect-command is required for `drive`: the gate refuses to expose local command \
+         execution without one exact operator-declared command",
+    )?;
+    anyhow::ensure!(!expected.is_empty(), "--expect-command must not be empty");
+    anyhow::ensure!(
+        o.exec_timeout_ms > 0,
+        "--exec-timeout-ms must be greater than zero"
+    );
+    run_drive(
+        o,
+        o.tokens,
+        o.turns,
+        "drive",
+        ActionPolicy::Expect {
+            command: expected,
+            timeout_ms: o.exec_timeout_ms,
+        },
+    )
+    .map(|_| ())
+}
+
+#[derive(Clone, Copy)]
+enum ActionPolicy<'a> {
+    Deny,
+    Expect { command: &'a str, timeout_ms: u64 },
+}
+
+impl ActionPolicy<'_> {
+    fn sandbox_args(self) -> Vec<String> {
+        match self {
+            Self::Deny => vec!["--deny-exec".to_string()],
+            Self::Expect { command, .. } => {
+                vec!["--allow-command".to_string(), command.to_string()]
+            }
+        }
+    }
+
+    fn timeout_ms(self) -> Option<u64> {
+        match self {
+            Self::Deny => Some(1),
+            Self::Expect { timeout_ms, .. } => Some(timeout_ms),
+        }
+    }
 }
 
 /// THE GATE: drive's loop, with a real mind on the other end of a pipe.
-fn run_drive(o: &Options, tokens: usize, turns: usize, label: &str) -> Result<DriveRun> {
+fn run_drive(
+    o: &Options,
+    tokens: usize,
+    turns: usize,
+    label: &str,
+    action_policy: ActionPolicy<'_>,
+) -> Result<DriveRun> {
     let playground = o
         .playground
         .clone()
@@ -274,9 +339,9 @@ fn run_drive(o: &Options, tokens: usize, turns: usize, label: &str) -> Result<Dr
         exec: drive::config::ExecConfig {
             playground_bin: playground,
             backend: "mock".to_string(),
-            extra_args: Vec::new(),
+            extra_args: action_policy.sandbox_args(),
             tenant: "mary".to_string(),
-            timeout_ms: None,
+            timeout_ms: action_policy.timeout_ms(),
         },
         system_prompt: o.system.clone(),
         voice: o.voice.as_ref().map(|path| {
@@ -338,6 +403,15 @@ fn run_drive(o: &Options, tokens: usize, turns: usize, label: &str) -> Result<Dr
             outcome.decision_id,
             outcome.said.len()
         );
+        if outcome.disposition == drive::mind::Disposition::Fire {
+            println!(
+                "    action: command {:?}, result {}, isError {:?}, exit {:?}",
+                outcome.command,
+                outcome.result_id.is_some(),
+                outcome.is_error,
+                outcome.exit_code
+            );
+        }
     }
     println!("\n=== what the model cost, per turn ===");
     println!("  FRAMING: seconds per FIRST TOKEN OF A TURN and per TURN, measured inside the");
@@ -392,7 +466,83 @@ fn run_drive(o: &Options, tokens: usize, turns: usize, label: &str) -> Result<Dr
         );
     }
     verify_drive_turns(&turns)?;
+    verify_action_policy(&outcomes, action_policy)?;
+    if let ActionPolicy::Expect {
+        command,
+        timeout_ms,
+    } = action_policy
+    {
+        println!(
+            "\n=== exact native action: PASS ===\n  one Fire for {command:?}, with a typed \
+             successful result inside the {timeout_ms}ms bound"
+        );
+    }
     Ok(DriveRun { ready, turns })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActionEvidence<'a> {
+    command: Option<&'a str>,
+    has_content: bool,
+    is_error: Option<bool>,
+    exit_code: Option<i32>,
+    has_result_id: bool,
+}
+
+fn verify_action_policy(
+    outcomes: &[drive::shell::TurnOutcome],
+    policy: ActionPolicy<'_>,
+) -> Result<()> {
+    let actions: Vec<_> = outcomes
+        .iter()
+        .filter(|outcome| outcome.disposition == drive::mind::Disposition::Fire)
+        .map(|outcome| ActionEvidence {
+            command: outcome.command.as_deref(),
+            has_content: outcome.content.is_some(),
+            is_error: outcome.is_error,
+            exit_code: outcome.exit_code,
+            has_result_id: outcome.result_id.is_some(),
+        })
+        .collect();
+    verify_action_evidence(&actions, policy)
+}
+
+fn verify_action_evidence(actions: &[ActionEvidence<'_>], policy: ActionPolicy<'_>) -> Result<()> {
+    match policy {
+        ActionPolicy::Deny => anyhow::ensure!(
+            actions.is_empty(),
+            "a no-action gate observed {} Fire decision(s)",
+            actions.len()
+        ),
+        ActionPolicy::Expect { command, .. } => {
+            let [action] = actions else {
+                anyhow::bail!(
+                    "expected exactly one Fire for {command:?}, observed {}",
+                    actions.len()
+                );
+            };
+            anyhow::ensure!(
+                action.command == Some(command),
+                "the one Fire named {:?}, expected {command:?}",
+                action.command
+            );
+            anyhow::ensure!(
+                action.has_content && action.has_result_id,
+                "the Fire for {command:?} did not produce both a typed result and durable result id"
+            );
+            anyhow::ensure!(
+                action.is_error == Some(false),
+                "the Fire for {command:?} returned isError {:?}",
+                action.is_error
+            );
+            anyhow::ensure!(
+                action.exit_code == Some(0),
+                "the Fire for {command:?} returned exit {:?}",
+                action.exit_code
+            );
+        }
+    }
+    Ok(())
 }
 
 fn verify_drive_turns(turns: &[TurnEnd]) -> Result<()> {
@@ -461,8 +611,8 @@ fn cmd_prefix(o: &Options) -> Result<()> {
          the other's provenance"
     );
 
-    let retained = run_drive(o, 1, 2, "ARM A — retained boundary")?;
-    let rebuilt = run_drive(o, 2, 1, "ARM B — uninterrupted rebuild")?;
+    let retained = run_drive(o, 1, 2, "ARM A — retained boundary", ActionPolicy::Deny)?;
+    let rebuilt = run_drive(o, 2, 1, "ARM B — uninterrupted rebuild", ActionPolicy::Deny)?;
 
     let [a0, a1] = retained.turns.as_slice() else {
         anyhow::bail!("retained arm did not produce exactly two turns");
@@ -678,5 +828,91 @@ mod tests {
         let turns = [turn(0, 1, 20, 0, 20), turn(1, 1, 0, 1, 20)];
         let error = verify_drive_turns(&turns).expect_err("turn 1 forgot its carried token");
         assert!(error.to_string().contains("imply 21"), "{error:#}");
+    }
+
+    #[test]
+    fn drive_refuses_before_starting_without_an_exact_expected_command() {
+        let options = parse(&["--serve".into(), "must-not-start".into()]).expect("valid options");
+        let error = cmd_drive(&options).expect_err("an unbounded action gate must refuse");
+        assert!(
+            error.to_string().contains("--expect-command is required"),
+            "{error:#}"
+        );
+
+        let options = parse(&[
+            "--serve".into(),
+            "must-not-start".into(),
+            "--expect-command".into(),
+            "true".into(),
+            "--exec-timeout-ms".into(),
+            "0".into(),
+        ])
+        .expect("valid options");
+        let error = cmd_drive(&options).expect_err("an unbounded timeout must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("--exec-timeout-ms must be greater than zero"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn expected_action_requires_one_exact_successful_durable_result() {
+        let expected = ActionPolicy::Expect {
+            command: "printf native-tp2-ok",
+            timeout_ms: 5_000,
+        };
+        let good = ActionEvidence {
+            command: Some("printf native-tp2-ok"),
+            has_content: true,
+            is_error: Some(false),
+            exit_code: Some(0),
+            has_result_id: true,
+        };
+        verify_action_evidence(&[good], expected).expect("the exact successful Fire is the gate");
+
+        for bad in [
+            ActionEvidence {
+                command: Some("printf wrong"),
+                ..good
+            },
+            ActionEvidence {
+                is_error: Some(true),
+                ..good
+            },
+            ActionEvidence {
+                exit_code: Some(1),
+                ..good
+            },
+            ActionEvidence {
+                has_result_id: false,
+                ..good
+            },
+        ] {
+            verify_action_evidence(&[bad], expected)
+                .expect_err("a mismatched or incomplete action must fail the gate");
+        }
+        verify_action_evidence(&[], expected).expect_err("no Fire must fail the gate");
+        verify_action_evidence(&[good, good], expected)
+            .expect_err("a second Fire must fail the gate");
+    }
+
+    #[test]
+    fn no_action_runs_deny_the_mock_and_reject_any_fire() {
+        assert_eq!(
+            ActionPolicy::Deny.sandbox_args(),
+            ["--deny-exec".to_string()]
+        );
+        verify_action_evidence(&[], ActionPolicy::Deny).expect("no action is allowed");
+        let action = ActionEvidence {
+            command: Some("true"),
+            has_content: true,
+            is_error: Some(false),
+            exit_code: Some(0),
+            has_result_id: true,
+        };
+        verify_action_evidence(&[action], ActionPolicy::Deny)
+            .expect_err("a Fire must fail a no-action gate");
     }
 }
