@@ -9,6 +9,52 @@
 
 use anyhow::{Result, ensure};
 
+/// Target verification is opt-in: an ordinary Session reserves no target rows.
+pub(crate) const DEFAULT_TARGET_BUDGET: usize = 0;
+
+/// Proof that one target pass fits the Session's explicit width contract.
+///
+/// Constructed before any cache transaction begins. Keeping this arithmetic in
+/// the backend-free target module makes the default-off boundary and refusal
+/// path testable without loading a model or touching a device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WidthAdmission {
+    rows: usize,
+}
+
+impl WidthAdmission {
+    pub(crate) fn new(rows: usize, target_budget: usize, prefill_budget: usize) -> Result<Self> {
+        ensure!(rows > 0, "a target extension proposes at least one token");
+        ensure!(
+            target_budget > 0,
+            "target extensions are disabled for this Session; set an explicit target_budget"
+        );
+        ensure!(
+            target_budget <= prefill_budget,
+            "target_budget {target_budget} is wider than the {prefill_budget}-token prefill \
+             budget admission reserves activations for"
+        );
+        ensure!(
+            rows <= target_budget,
+            "a {rows}-row target extension is wider than this Session's explicit \
+             {target_budget}-row target budget"
+        );
+        // Kept as an independent invariant even though a valid SessionConfig
+        // already has target_budget <= prefill_budget. This is the last local
+        // line of defence if construction ever gains another path.
+        ensure!(
+            rows <= prefill_budget,
+            "a {rows}-row target extension is wider than the {prefill_budget}-token prefill \
+             budget this Session's admission reserved activations for"
+        );
+        Ok(Self { rows })
+    }
+
+    pub(crate) fn rows(self) -> usize {
+        self.rows
+    }
+}
+
 /// The committed session state on which one target pass was started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Boundary {
@@ -168,6 +214,56 @@ impl Boundary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_width_is_disabled_by_default() {
+        let err = WidthAdmission::new(1, DEFAULT_TARGET_BUDGET, 4096).unwrap_err();
+        assert!(err.to_string().contains("disabled"), "{err:#}");
+    }
+
+    #[test]
+    fn target_width_accepts_the_exact_configured_bound() {
+        let admission = WidthAdmission::new(4, 4, 16).unwrap();
+        assert_eq!(admission.rows(), 4);
+    }
+
+    #[test]
+    fn target_width_refuses_one_past_the_configured_bound() {
+        let err = WidthAdmission::new(5, 4, 16).unwrap_err();
+        assert!(err.to_string().contains("explicit 4-row"), "{err:#}");
+    }
+
+    #[test]
+    fn rejected_target_width_cannot_reach_state_mutation() {
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct Unstarted {
+            position: usize,
+            last: Option<usize>,
+            pending: Option<usize>,
+        }
+
+        fn begin_after_admission(
+            state: &mut Unstarted,
+            rows: usize,
+            target_budget: usize,
+            prefill_budget: usize,
+        ) -> Result<()> {
+            let admitted = WidthAdmission::new(rows, target_budget, prefill_budget)?;
+            state.pending = Some(admitted.rows());
+            Ok(())
+        }
+
+        let mut state = Unstarted {
+            position: 11,
+            last: Some(7),
+            pending: None,
+        };
+        let before = state.clone();
+        let err = begin_after_admission(&mut state, 5, 4, 16).unwrap_err();
+
+        assert!(err.to_string().contains("explicit 4-row"), "{err:#}");
+        assert_eq!(state, before);
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct Cache {

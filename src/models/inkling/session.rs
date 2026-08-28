@@ -117,7 +117,10 @@ use super::config::{AttnKind, InklingConfig};
 use super::pile::Elem;
 use super::source::Weights;
 use super::stack::embed_and_norm_bf16;
-use super::target::{Boundary as TargetBoundary, PrefixCache, Settlement as TargetSettlement};
+use super::target::{
+    Boundary as TargetBoundary, DEFAULT_TARGET_BUDGET, PrefixCache, Settlement as TargetSettlement,
+    WidthAdmission as TargetWidthAdmission,
+};
 use super::tp::Tp;
 use super::tpcomm::Group;
 
@@ -210,6 +213,15 @@ pub struct SessionConfig {
     /// equally wide activation allocation.
     pub prefill_budget: usize,
 
+    /// Maximum rows one speculative target pass may verify at once.
+    ///
+    /// `0` disables target transactions. Unlike ordinary prefill and extend,
+    /// target verification projects every row through the full vocabulary
+    /// head, so callers must opt into a concrete proposal width rather than
+    /// accidentally inheriting the much larger prefill chunk. It may not
+    /// exceed [`SessionConfig::prefill_budget`].
+    pub target_budget: usize,
+
     /// Maximum positions this session admits across its whole conversation.
     ///
     /// This is independent of [`SessionConfig::prefill_budget`]: the latter is
@@ -256,6 +268,7 @@ impl SessionConfig {
             layers,
             warm_experts: true,
             prefill_budget: 4096,
+            target_budget: DEFAULT_TARGET_BUDGET,
             context_budget: 4096,
             extend_batch: 4096,
         }
@@ -331,6 +344,9 @@ pub struct Session {
     /// The widest pass admission reserved activation headroom for, kept so
     /// [`Session::set_extend_batch`] can hold to the same bound `load` did.
     prefill_budget: usize,
+    /// Explicit maximum width of a speculative target transaction. Zero keeps
+    /// the transaction path disabled for ordinary serving Sessions.
+    target_budget: usize,
     /// Maximum number of positions this sequence may retain. Admission prices
     /// its persistent KV before the weight arena is allocated.
     context_budget: usize,
@@ -737,6 +753,13 @@ impl Session {
             cfg.prefill_budget,
             cfg.context_budget
         );
+        anyhow::ensure!(
+            cfg.target_budget <= cfg.prefill_budget,
+            "target_budget {} is wider than the {}-token prefill budget admission reserves \
+             activations for. Raise prefill_budget or lower target_budget.",
+            cfg.target_budget,
+            cfg.prefill_budget
+        );
 
         // A Session is ONE process and has to be able to answer, so it always
         // owns the final norm and the unembedding — exactly as `inkling_forward`
@@ -904,6 +927,7 @@ impl Session {
             last: None,
             extend_batch: cfg.extend_batch,
             prefill_budget: cfg.prefill_budget,
+            target_budget: cfg.target_budget,
             context_budget: cfg.context_budget,
             torn: false,
             seq: next_seq(),
@@ -1024,14 +1048,21 @@ impl Session {
     /// proposal `i + 1`). The caller applies its own acceptance policy and
     /// commits one leading count, or aborts.
     ///
-    /// The Session must already hold a prefix. The pass width is limited by the
-    /// prefill admission because it allocates the same widened activations. No
-    /// ordinary path calls this method, so enabling a drafter above the Session
-    /// remains an explicit deployment decision.
+    /// The Session must already hold a prefix. Target transactions are disabled
+    /// unless [`SessionConfig::target_budget`] explicitly admits a width, and
+    /// that width remains bounded by prefill admission because it allocates the
+    /// same widened activations. No ordinary path calls this method, so enabling
+    /// a drafter above the Session remains an explicit deployment decision.
     pub fn begin_target_extension<'a>(
         &'a mut self,
         proposed: &[usize],
     ) -> Result<TargetExtension<'a>> {
+        // Width is a pure, backend-free preflight and deliberately comes before
+        // every cache check or pending-row operation. A disabled or over-width
+        // target request cannot begin a transaction and therefore has nothing
+        // to roll back.
+        let width =
+            TargetWidthAdmission::new(proposed.len(), self.target_budget, self.prefill_budget)?;
         anyhow::ensure!(
             !self.torn,
             "a previous pass tore this Session; reset or rewind before beginning a target extension"
@@ -1042,7 +1073,7 @@ impl Session {
         );
         let end = self
             .pos
-            .checked_add(proposed.len())
+            .checked_add(width.rows())
             .context("target sequence position overflow")?;
         anyhow::ensure!(
             end <= self.context_budget,
@@ -1067,13 +1098,6 @@ impl Session {
             self.hi - self.lo
         );
         anyhow::ensure!(
-            proposed.len() <= self.prefill_budget,
-            "a {}-row target extension is wider than the {}-token prefill budget this Session's \
-             admission reserved activations for",
-            proposed.len(),
-            self.prefill_budget
-        );
-        anyhow::ensure!(
             self.caches.iter().all(|cache| {
                 cache.attn.pending_rows().is_none()
                     && cache.attn_sconv_pending.is_none()
@@ -1086,7 +1110,7 @@ impl Session {
             return Err(error.context("the target extension found an incomplete committed cache"));
         }
 
-        let boundary = TargetBoundary::new(self.pos, self.last, proposed.len())?;
+        let boundary = TargetBoundary::new(self.pos, self.last, width.rows())?;
         let predictions = match self.forward_pass(proposed, PassMode::Target) {
             Ok(PassOutput::Target(predictions)) => predictions,
             Ok(PassOutput::Committed(_)) => {
@@ -1903,6 +1927,14 @@ mod tests {
     #[test]
     fn warming_experts_is_on_by_default() {
         assert!(SessionConfig::new("/nowhere.pile").warm_experts);
+    }
+
+    #[test]
+    fn target_transactions_are_disabled_by_default() {
+        assert_eq!(
+            SessionConfig::new("/nowhere.pile").target_budget,
+            DEFAULT_TARGET_BUDGET
+        );
     }
 
     /// The default config must satisfy the rule [`Session::load`] enforces: a
