@@ -51,18 +51,21 @@
 //! it from once a model pile carries the tokenizer graph. `--tokenizer` is an
 //! explicit path rather than a silent fallback so it is visible which one ran.)
 //!
-//! # One process is one RANK, and on one box that is a PARTIAL STACK
+//! # One process is one RANK
 //!
-//! `Session::load` refuses `INK_TP` (the rendezvous is a collective that would
-//! block this call on a peer starting up elsewhere) and enforces
+//! Without explicit tensor-parallel arguments, `Session::load` enforces
 //! `hi - lo < num_hidden_layers` (144 GiB of weights do not fit a 121 GiB box).
-//! Both are right and together they mean a SINGLE-BOX serving process
-//! necessarily runs a strict subrange, unembeds through layers it did not all
-//! run, and produces DIAGNOSTIC tokens rather than the model's. That is said on
-//! the wire, in the READY record's `partial` flag, rather than left to be
-//! inferred from fluent-looking wrong text. The fan-out proxy that drives two
-//! TP ranks in lockstep and returns rank 0's token speaks this same protocol;
-//! it is the next lane, not this one.
+//! Such a SINGLE-BOX serving process necessarily runs a strict subrange,
+//! unembeds through layers it did not all run, and produces DIAGNOSTIC tokens
+//! rather than the model's. That is said on the wire, in the READY record's
+//! `partial` flag, rather than left to be inferred from fluent-looking wrong
+//! text.
+//!
+//! With `--tp-rank`, `--tp-world`, and `--tp-rendezvous`, the serving process
+//! instead forms and warms one communicator and gives that exact Group to
+//! `Session::load_with_group`. Every rank then runs the full layer range on its
+//! within-layer shard. The fan-out proxy starts two such processes in lockstep
+//! and speaks this same protocol downstream.
 
 use std::io::Write as _;
 
@@ -72,6 +75,10 @@ use mary::models::inkling::serve::{
     CONSULT_TYPE, CONTENT_TYPE, Consult, READY_TYPE, Ready, TURN_TYPE, TurnEnd, UNIT,
 };
 use mary::models::inkling::session::{Session, SessionConfig};
+use mary::models::inkling::tp::Tp;
+use mary::models::inkling::tpcomm::{Group, transport_note};
+use triblespace::core::blob::IntoBlob;
+use triblespace::core::blob::encodings::rawbytes::RawBytes;
 
 fn usage() -> &'static str {
     "\
@@ -85,8 +92,11 @@ OPTIONS:
     --tokenizer <path>   The checkpoint's tokenizer.json
     --layers <lo:hi>     Layers this rank runs (default: $INK_LAYERS)
     --gen <n>            Default tokens per turn when a consult does not say
-    --stop-id <id>       Stop generating on this token id; repeatable
+    --stop-id <id>       Stop on this token id; repeatable (single-rank only)
     --prefill-budget <n> Tokens the arena reserves activation headroom for
+    --tp-rank <rank>     This process's tensor-parallel rank (all TP flags together)
+    --tp-world <world>   Number of tensor-parallel ranks
+    --tp-rendezvous <a>  Rank 0's HOST:PORT on the fast fabric
     -h, --help           This text
 
 The protocol is the framed-stream convention with three control content-types;
@@ -101,11 +111,18 @@ struct Options {
     tokens: usize,
     stop: Vec<u32>,
     prefill_budget: Option<usize>,
+    tensor_parallel: Option<TensorParallel>,
+}
+
+struct TensorParallel {
+    tp: Tp,
+    rendezvous: String,
 }
 
 fn parse() -> Result<Option<Options>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (mut pile, mut tokenizer, mut layers, mut prefill_budget) = (None, None, None, None);
+    let (mut tp_rank, mut tp_world, mut tp_rendezvous) = (None, None, None);
     let mut tokens = 32usize;
     let mut stop = Vec::new();
     let mut i = 0;
@@ -144,9 +161,41 @@ fn parse() -> Result<Option<Options>> {
                 prefill_budget = Some(need(i)?.parse().context("--prefill-budget wants a count")?);
                 i += 2;
             }
+            "--tp-rank" => {
+                tp_rank = Some(need(i)?.parse().context("--tp-rank wants a number")?);
+                i += 2;
+            }
+            "--tp-world" => {
+                tp_world = Some(need(i)?.parse().context("--tp-world wants a count")?);
+                i += 2;
+            }
+            "--tp-rendezvous" => {
+                tp_rendezvous = Some(need(i)?.clone());
+                i += 2;
+            }
             other => anyhow::bail!("unknown argument {other:?}\n\n{}", usage()),
         }
     }
+    let tensor_parallel = match (tp_rank, tp_world, tp_rendezvous) {
+        (None, None, None) => None,
+        (Some(rank), Some(world), Some(rendezvous)) => {
+            let tp = Tp::new(rank, world)?;
+            anyhow::ensure!(
+                tp.is_split(),
+                "--tp-world must be greater than one; omit all three --tp-* flags for one rank"
+            );
+            Some(TensorParallel { tp, rendezvous })
+        }
+        _ => anyhow::bail!(
+            "--tp-rank, --tp-world, and --tp-rendezvous are one launch contract; provide all or none"
+        ),
+    };
+    anyhow::ensure!(
+        tensor_parallel.is_none() || stop.is_empty(),
+        "--stop-id cannot be decided independently by tensor ranks: one rank stopping while its \
+         peer enters the next collective would deadlock. The paired serving layer must arbitrate \
+         any early stop; use max_tokens for this rank protocol."
+    );
     Ok(Some(Options {
         pile: pile.context("--pile is required")?,
         tokenizer: tokenizer.context("--tokenizer is required")?,
@@ -154,6 +203,7 @@ fn parse() -> Result<Option<Options>> {
         tokens,
         stop,
         prefill_budget,
+        tensor_parallel,
     }))
 }
 
@@ -172,6 +222,16 @@ fn claim_stdout() -> Result<std::fs::File> {
     let redirected = unsafe { libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO) };
     anyhow::ensure!(redirected >= 0, "could not point stdout at stderr");
     Ok(unsafe { std::fs::File::from_raw_fd(raw) })
+}
+
+fn hex_identity(bytes: [u8; 32]) -> String {
+    use std::fmt::Write as _;
+
+    let mut text = String::with_capacity(64);
+    for byte in bytes {
+        write!(&mut text, "{byte:02X}").expect("writing into a String is infallible");
+    }
+    text
 }
 
 fn main() {
@@ -199,7 +259,12 @@ fn run() -> Result<()> {
         .require_content_type(CONTENT_TYPE)
         .context("this serving process is fed text, and was handed something else")?;
 
-    let tokenizer = tokenizers::Tokenizer::from_file(&options.tokenizer)
+    let tokenizer_bytes = std::fs::read(&options.tokenizer)
+        .with_context(|| format!("read {}", options.tokenizer.display()))?;
+    let tokenizer_identity = IntoBlob::<RawBytes>::to_blob(tokenizer_bytes.as_slice())
+        .get_handle()
+        .raw;
+    let tokenizer = tokenizers::Tokenizer::from_bytes(&tokenizer_bytes)
         .map_err(|e| anyhow::anyhow!("load {}: {e}", options.tokenizer.display()))?;
 
     let mut config = SessionConfig::new(&options.pile);
@@ -210,12 +275,44 @@ fn run() -> Result<()> {
         config.prefill_budget = budget;
     }
     let loaded = std::time::Instant::now();
-    let mut session = Session::load(config).context("load the model")?;
+    let mut session = match options.tensor_parallel {
+        None => Session::load(config).context("load the model")?,
+        Some(tensor_parallel) => {
+            eprintln!(
+                "inkling_serve: forming tensor rank {} of {} at {}",
+                tensor_parallel.tp.rank(),
+                tensor_parallel.tp.world(),
+                tensor_parallel.rendezvous,
+            );
+            let group = Group::form_default(tensor_parallel.tp, &tensor_parallel.rendezvous)
+                .context("form the tensor-parallel group")?;
+            group
+                .warm()
+                .context("warm and verify the tensor-parallel group")?;
+            eprintln!("inkling_serve: tensor group paired ({})", transport_note());
+            Session::load_with_group(config, group).context("load this tensor-parallel rank")?
+        }
+    };
     let load_secs = loaded.elapsed().as_secs_f64();
+
+    // Decoder state belongs to the whole logical token sequence, not to one
+    // generated turn. Byte-fallback and spacing decoders both need surrounding
+    // ids. New world-context ids advance this stream without being spoken;
+    // generated ids advance the same stream and their chunks are emitted. A
+    // carried token is never advanced twice: it entered this sequence when it
+    // was generated, while `carry` only catches the KV cache up to that fact.
+    let mut decode_stream = tokenizer.decode_stream(false);
+    let mut decode = |id: u32| {
+        decode_stream
+            .step(id)
+            .map_err(|error| anyhow::anyhow!("streaming decode: {error}"))
+    };
 
     let range = session.layer_range();
     let ready = Ready {
         pile: options.pile.display().to_string(),
+        model_identity: hex_identity(session.model_identity()),
+        tokenizer_identity: hex_identity(tokenizer_identity),
         layers: [range.start, range.end],
         stack: session.config().text_config.num_hidden_layers,
         partial: session.is_partial_stack(),
@@ -258,6 +355,7 @@ fn run() -> Result<()> {
                 let end = serve_turn(
                     &mut session,
                     &tokenizer,
+                    &mut decode,
                     &mut out,
                     std::mem::take(&mut delta),
                     want,
@@ -328,10 +426,21 @@ fn run() -> Result<()> {
 /// cache was perfectly CONSISTENT — one token short of the sequence it stood
 /// for. `inkling_session --carry` is the gate that catches it, and it catches it
 /// by asking the model what comes next rather than by measuring anything.
+fn advance_context_decode(
+    decode: &mut impl FnMut(u32) -> Result<Option<String>>,
+    ids: &[usize],
+) -> Result<()> {
+    for &id in ids {
+        let _ = decode(id as u32)?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn serve_turn(
     session: &mut Session,
     tokenizer: &tokenizers::Tokenizer,
+    decode: &mut impl FnMut(u32) -> Result<Option<String>>,
     out: &mut framed_stream::FramedWriter<std::fs::File>,
     delta: String,
     want: usize,
@@ -353,6 +462,11 @@ fn serve_turn(
             .map(|&id| id as usize)
             .collect(),
     };
+    // Context participates in decoding even though it is not speech. Advancing
+    // and discarding here makes the next generated id see its real predecessor
+    // without ever echoing a tool result. `carry` is excluded because the
+    // decoder already saw that id when the previous turn generated it.
+    advance_context_decode(decode, &delta_ids)?;
     anyhow::ensure!(
         carry.is_some() || !delta_ids.is_empty(),
         "the first turn has nothing to attend to: a prefill with no tokens would be vacuous"
@@ -381,48 +495,21 @@ fn serve_turn(
 
     // ── the incremental detokenizer ─────────────────────────────────────────
     //
-    // A byte-level BPE token can be a PARTIAL UTF-8 sequence, so decoding ids
-    // one at a time produces replacement characters that a later token would
-    // have completed. Two rules keep the emitted bytes final:
-    //
-    //   1. The turn's ids are decoded as a GROWING PREFIX and only the new
-    //      suffix is emitted, so merges that rewrite earlier bytes are seen.
-    //   2. A trailing replacement character is HELD BACK until the token that
-    //      completes it arrives. Emitting U+FFFD and correcting it afterwards
-    //      is not available: a consumer that has already SPOKEN a byte cannot
-    //      unspeak it, and this is the stream whose whole purpose is that the
-    //      consumer acts before the turn is over.
-    //
-    // If the prefix property breaks anyway, the convention has exactly one
-    // legal move and it is taken: declare a GAP naming what could not be
-    // delivered, then resynchronise. Silently re-emitting is not an option the
-    // format offers.
+    // `DecodeStream` owns the prefix needed by byte-fallback and spacing
+    // decoders. Each generated id therefore yields either one final text chunk
+    // or `None` while an incomplete sequence waits for a later logical token.
+    // No replacement character is emitted and no spoken prefix is rewritten.
     let mut generated: Vec<u32> = Vec::with_capacity(want);
-    let mut emitted = String::new();
     let mut stopped = "max_tokens";
     let mut token = first;
     for step in 0..want {
         generated.push(token as u32);
-        let full = tokenizer
-            .decode(&generated, false)
-            .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
-        let stable = full.trim_end_matches(char::REPLACEMENT_CHARACTER);
-        if stable.starts_with(emitted.as_str()) {
-            let new = &stable[emitted.len()..];
-            if !new.is_empty() {
-                // Written and FLUSHED here, inside the generation loop. This one
-                // call is the difference between a stream and a batch.
-                out.text(new)?;
-                emitted.push_str(new);
-            }
-        } else {
-            out.gap(
-                emitted.len() as u64,
-                "the incremental decode diverged from what was already emitted, so the \
-                 bytes sent so far this turn are void",
-            )?;
-            out.text(stable)?;
-            emitted = stable.to_string();
+        if let Some(text) = decode(token as u32)?
+            && !text.is_empty()
+        {
+            // Written and FLUSHED here, inside the generation loop. This one
+            // call is the difference between a stream and a batch.
+            out.text(&text)?;
         }
         if stop.contains(&(token as u32)) {
             stopped = "stop_token";
@@ -445,9 +532,11 @@ fn serve_turn(
     // first.
     *carry = generated.last().map(|&t| t as usize);
 
+    let tokens = generated.len();
     Ok(TurnEnd {
         turn,
-        tokens: generated.len(),
+        tokens,
+        token_ids: generated,
         delta_tokens: delta_ids.len(),
         carried,
         stopped: stopped.to_string(),
@@ -455,4 +544,67 @@ fn serve_turn(
         turn_secs: started.elapsed().as_secs_f64(),
         position: session.position(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use tokenizers::decoders::byte_fallback::ByteFallback;
+    use tokenizers::models::bpe::BPE;
+    use tokenizers::normalizers::unicode::NFC;
+    use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+    use tokenizers::{Tokenizer, TokenizerBuilder};
+
+    use super::advance_context_decode;
+
+    fn byte_fallback_tokenizer() -> Tokenizer {
+        let vocab = [
+            ("<0x20>".to_string(), 0),
+            ("<0xC3>".to_string(), 1),
+            ("<0xA9>".to_string(), 2),
+        ];
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, Vec::new())
+            .byte_fallback(true)
+            .build()
+            .unwrap();
+        TokenizerBuilder::default()
+            .with_model(bpe)
+            .with_decoder(Some(ByteFallback::default()))
+            .with_normalizer(Some(NFC))
+            .with_pre_tokenizer(Some(ByteLevel::default()))
+            .with_post_processor(Some(ByteLevel::default()))
+            .build()
+            .unwrap()
+            .into()
+    }
+
+    #[test]
+    fn incomplete_output_can_finish_on_the_next_turn() {
+        let tokenizer = byte_fallback_tokenizer();
+        let mut stream = tokenizer.decode_stream(false);
+        let mut decode = |id| stream.step(id).map_err(|error| anyhow::anyhow!("{error}"));
+
+        advance_context_decode(&mut decode, &[0]).unwrap();
+        assert_eq!(decode(1).unwrap(), None, "the first output byte waits");
+        assert_eq!(
+            decode(2).unwrap().as_deref(),
+            Some("é"),
+            "a no-delta next turn completes rather than loses the character"
+        );
+    }
+
+    #[test]
+    fn text_completed_by_hidden_context_stays_hidden() {
+        let tokenizer = byte_fallback_tokenizer();
+        let mut stream = tokenizer.decode_stream(false);
+        let mut decode = |id| stream.step(id).map_err(|error| anyhow::anyhow!("{error}"));
+
+        assert_eq!(decode(1).unwrap(), None, "the output byte is incomplete");
+        advance_context_decode(&mut decode, &[2]).unwrap();
+        assert_eq!(
+            decode(0).unwrap().as_deref(),
+            Some(" "),
+            "bytes completed partly by world input are consumed, not spoken later"
+        );
+    }
 }

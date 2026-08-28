@@ -254,8 +254,18 @@ pub const TURN_TYPE: &str = "application/vnd.mary.inkling-turn+json";
 /// know before it asks for a turn.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Ready {
-    /// The pile the weights came from.
+    /// The pile the weights came from, for diagnostics only.
+    ///
+    /// Two ranks may name different local paths for the same content. Runtime
+    /// compatibility is decided by [`Ready::model_identity`], never by this
+    /// spelling.
     pub pile: String,
+    /// Canonical SimpleArchive handle of the projected model facts the runtime
+    /// actually indexed, rendered as 64 hexadecimal digits.
+    pub model_identity: String,
+    /// RawBytes handle of the exact tokenizer bytes, rendered as 64
+    /// hexadecimal digits.
+    pub tokenizer_identity: String,
     /// The layer range this rank runs, `[lo, hi)`.
     pub layers: [usize; 2],
     /// How many layers the whole stack has.
@@ -694,7 +704,13 @@ impl ServeClient {
     /// Kill the serving process. Its output stream reads as truncated, which is
     /// the honest report: it was killed, it did not finish.
     pub fn kill(&mut self) -> Result<()> {
-        self.child.kill()
+        // Once killed, this protocol cannot accept a later COMPLETE end. Drop
+        // the writer now so `end_input` remains idempotent and teardown does
+        // not make a second, misleading write to a dead process.
+        let writer = self.writer.take();
+        let result = self.child.kill();
+        drop(writer);
+        result
     }
 }
 
@@ -1252,6 +1268,15 @@ impl Drop for ServePair {
 fn compatible_ready(rank0: &Ready, rank1: &Ready) -> Result<Ready> {
     for (rank, ready) in [(0usize, rank0), (1usize, rank1)] {
         anyhow::ensure!(ready.stack > 0, "rank {rank} announced an empty stack");
+        for (name, identity) in [
+            ("model", ready.model_identity.as_str()),
+            ("tokenizer", ready.tokenizer_identity.as_str()),
+        ] {
+            anyhow::ensure!(
+                identity.len() == 64 && identity.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "rank {rank} announced an invalid {name} identity {identity:?}"
+            );
+        }
         anyhow::ensure!(
             !ready.partial && ready.layers == [0, ready.stack],
             "rank {rank} is not a full stack: layers {}..{} of {}, partial={}",
@@ -1275,8 +1300,22 @@ fn compatible_ready(rank0: &Ready, rank1: &Ready) -> Result<Ready> {
         rank0.vocab,
         rank1.vocab
     );
+    anyhow::ensure!(
+        rank0.model_identity == rank1.model_identity,
+        "rank READY model identity mismatch: {} vs {}",
+        rank0.model_identity,
+        rank1.model_identity
+    );
+    anyhow::ensure!(
+        rank0.tokenizer_identity == rank1.tokenizer_identity,
+        "rank READY tokenizer identity mismatch: {} vs {}",
+        rank0.tokenizer_identity,
+        rank1.tokenizer_identity
+    );
     Ok(Ready {
         pile: rank0.pile.clone(),
+        model_identity: rank0.model_identity.clone(),
+        tokenizer_identity: rank0.tokenizer_identity.clone(),
         layers: rank0.layers,
         stack: rank0.stack,
         partial: false,
@@ -1608,6 +1647,27 @@ pub struct InklingMind {
     proofs: std::sync::Arc<std::sync::Mutex<Vec<StreamProof>>>,
 }
 
+/// A consultation that failed after producing zero or more final text bytes.
+///
+/// Keeping the partial utterance on the stack makes one failed call one value:
+/// it cannot leak into a later turn, and failures before generation naturally
+/// carry an empty string through `?`.
+#[cfg(feature = "drive-mind")]
+struct FailedTurn {
+    error: anyhow::Error,
+    said: String,
+}
+
+#[cfg(feature = "drive-mind")]
+impl From<anyhow::Error> for FailedTurn {
+    fn from(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            said: String::new(),
+        }
+    }
+}
+
 #[cfg(feature = "drive-mind")]
 fn text_result_delta(
     command: &str,
@@ -1689,6 +1749,22 @@ impl InklingMind {
     pub fn ready(&self) -> &Ready {
         self.client.ready()
     }
+
+    /// Close the audited coverage this consultation was shown.
+    ///
+    /// Success and terminal failure use the same calculation. In particular,
+    /// both clamp against `base_offset`: a bounded monologue may evict bytes
+    /// behind `scanned_abs`, but neither path may claim coordinates it no
+    /// longer holds.
+    fn finish_coverage(&mut self) -> (u64, u64) {
+        let span_end = self.buffer.end_offset();
+        let span_start = self
+            .scanned_abs
+            .max(self.buffer.base_offset())
+            .min(span_end);
+        self.scanned_abs = span_end;
+        (span_start, span_end)
+    }
 }
 
 /// The shell OWNS the mind (`Box<dyn Mind>`), so no caller can ever hand the
@@ -1705,6 +1781,9 @@ impl Drop for InklingMind {
     fn drop(&mut self) {
         if let Err(error) = self.client.end_input() {
             eprintln!("inkling_serve: could not end the input stream cleanly: {error:#}");
+            if let Err(kill) = self.client.kill() {
+                eprintln!("inkling_serve: could not kill the failed serving process: {kill:#}");
+            }
         }
         match self.client.child.wait() {
             Ok(status) => eprintln!("inkling_serve: the serving process exited: {status}"),
@@ -1720,21 +1799,26 @@ impl drive::mind::Mind for InklingMind {
     fn observe(&mut self, view: drive::world::MergedView<'_>) -> drive::mind::Turn {
         match self.turn(view.events, view.watermark) {
             Ok(turn) => turn,
-            Err(error) => {
-                // A backend that cannot answer must still leave a trace: the
-                // anti-repression invariant is not suspended because the model
-                // broke. The span is the coverage it was shown; the rationale
-                // carries the failure, so the pile records WHY a turn was empty.
+            Err(FailedTurn { error, said }) => {
+                // Equal fragments may already have escaped into the streaming
+                // voice. They remain this turn's truthful partial utterance;
+                // the backend failure is orthogonal terminal state, never an
+                // ordinary silent NoAction and never a forward `Gap` pretending
+                // it can retract bytes.
                 eprintln!("inkling_serve: {error:#}");
-                let span_end = self.buffer.end_offset();
-                let span_start = self.scanned_abs.min(span_end);
-                self.scanned_abs = span_end;
-                drive::mind::Turn::silent(drive::mind::Decision::no_action(
+                let mut rationale = format!("inkling serving process failed: {error:#}");
+                if let Err(kill) = self.client.kill() {
+                    eprintln!("inkling_serve: could not kill the failed backend: {kill:#}");
+                    rationale.push_str(&format!("; backend teardown also failed: {kill:#}"));
+                }
+                let (span_start, span_end) = self.finish_coverage();
+                drive::mind::Turn::terminal_failure(
+                    said,
                     span_start,
                     span_end,
                     view.watermark,
-                    format!("inkling serving process failed: {error:#}"),
-                ))
+                    rationale,
+                )
             }
         }
     }
@@ -1751,7 +1835,14 @@ impl InklingMind {
         &mut self,
         events: &[drive::world::Event],
         watermark: drive::world::Coord,
-    ) -> Result<drive::mind::Turn> {
+    ) -> std::result::Result<drive::mind::Turn, FailedTurn> {
+        // The system prompt is position zero of the model's logical sequence.
+        // Released command results come after it even when the first view
+        // already contains results.
+        if let Some(system) = self.system.take() {
+            self.client.feed(&system)?;
+        }
+
         // ── read the world ──────────────────────────────────────────────────
         for event in events {
             match &event.payload {
@@ -1775,9 +1866,6 @@ impl InklingMind {
                 }
             }
         }
-        if let Some(system) = self.system.take() {
-            self.client.feed(&system)?;
-        }
 
         // ── consult, streaming every token into the voice as it arrives ─────
         let voice = self.voice.lock().expect("voice slot").clone();
@@ -1785,25 +1873,26 @@ impl InklingMind {
         let mut tokens = 0usize;
         let mut tokens_at_first_return = None;
         let turn = self.turns;
-        let end = self
-            .client
-            .consult(&Consult::new(self.max_tokens), |text| {
-                said.push_str(text);
-                tokens += 1;
-                if let Some(voice) = &voice {
-                    // One record per token, flushed, into the stream the shell
-                    // opened. This is `Shell::claim_voice`'s finer grain: the
-                    // faculty starts on the first word of the sentence.
-                    voice.say(text)?;
-                    if tokens_at_first_return.is_none() && voice.report().records > 0 {
-                        // The faculty has already produced output and this turn is
-                        // demonstrably still running: that IS the streaming proof,
-                        // taken from inside the turn rather than after it.
-                        tokens_at_first_return = Some(tokens);
-                    }
+        let end = match self.client.consult(&Consult::new(self.max_tokens), |text| {
+            said.push_str(text);
+            tokens += 1;
+            if let Some(voice) = &voice {
+                // One record per token, flushed, into the stream the shell
+                // opened. This is `Shell::claim_voice`'s finer grain: the
+                // faculty starts on the first word of the sentence.
+                voice.say(text)?;
+                if tokens_at_first_return.is_none() && voice.report().records > 0 {
+                    // The faculty has already produced output and this turn is
+                    // demonstrably still running: that IS the streaming proof,
+                    // taken from inside the turn rather than after it.
+                    tokens_at_first_return = Some(tokens);
                 }
-                Ok(())
-            })?;
+            }
+            Ok(())
+        }) {
+            Ok(end) => end,
+            Err(error) => return Err(FailedTurn { error, said }),
+        };
         let records_at_end = voice.as_ref().map(|v| v.report().records).unwrap_or(0);
         self.proofs.lock().expect("proof log").push(StreamProof {
             turn,
@@ -1819,12 +1908,7 @@ impl InklingMind {
         // The span is the coverage this consultation was shown, in the loop's
         // own session-absolute monologue coordinates — which is what makes it
         // verifiable rather than self-attested.
-        let span_end = self.buffer.end_offset();
-        let span_start = self
-            .scanned_abs
-            .max(self.buffer.base_offset())
-            .min(span_end);
-        self.scanned_abs = span_end;
+        let (span_start, span_end) = self.finish_coverage();
         Ok(drive::mind::Turn::new(
             said,
             drive::mind::Decision::no_action(
@@ -1840,6 +1924,36 @@ impl InklingMind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(feature = "drive-mind", unix))]
+    #[derive(Clone, Default)]
+    struct SharedSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    #[cfg(all(feature = "drive-mind", unix))]
+    impl std::io::Write for SharedSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("fixture sink")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(all(feature = "drive-mind", unix))]
+    impl SharedSink {
+        fn len(&self) -> usize {
+            self.0.lock().expect("fixture sink").len()
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            self.0.lock().expect("fixture sink").clone()
+        }
+    }
 
     /// The control records are the protocol, so their encoding is worth pinning:
     /// a rename that a compiler cannot see would be a wire break.
@@ -1893,6 +2007,182 @@ mod tests {
             set.dedup();
             set.len()
         });
+    }
+
+    fn fake_ready(pile: &str) -> Ready {
+        Ready {
+            pile: pile.to_string(),
+            model_identity: "11".repeat(32),
+            tokenizer_identity: "22".repeat(32),
+            layers: [0, 42],
+            stack: 42,
+            partial: false,
+            vocab: 200_058,
+            load_secs: 1.0,
+        }
+    }
+
+    #[test]
+    fn pair_compatibility_is_content_identity_not_pile_path() {
+        let left = fake_ready("/models/left.pile");
+        let right = fake_ready("/different/host/right.pile");
+        let ready = compatible_ready(&left, &right).expect("same runtime content");
+        assert_eq!(ready.model_identity, left.model_identity);
+        assert_eq!(ready.tokenizer_identity, left.tokenizer_identity);
+        assert_eq!(ready.pile, left.pile, "pile is rank-0 diagnostics only");
+    }
+
+    #[test]
+    fn pair_compatibility_refuses_model_or_tokenizer_mismatch() {
+        let left = fake_ready("left");
+        let mut right = left.clone();
+        right.model_identity = "33".repeat(32);
+        let error = compatible_ready(&left, &right).expect_err("different model facts");
+        assert!(error.to_string().contains("model identity mismatch"));
+
+        let mut right = left.clone();
+        right.tokenizer_identity = "44".repeat(32);
+        let error = compatible_ready(&left, &right).expect_err("different tokenizer bytes");
+        assert!(error.to_string().contains("tokenizer identity mismatch"));
+    }
+
+    #[cfg(all(feature = "drive-mind", unix))]
+    #[test]
+    fn failed_stream_becomes_one_terminal_turn_after_system_then_results() {
+        use drive::mind::Mind as _;
+
+        let system = "system first";
+        let result_delta =
+            text_result_delta("cmd", &drive::content::Content::text("output"), false, None);
+        let max_tokens = 7;
+
+        // Complete fake server output. `ServeClient::spawn` receives only the
+        // preamble + READY prefix at first; the shell fixture releases the
+        // partial turn after it has captured the client's whole request.
+        let response = SharedSink::default();
+        let mut response_writer =
+            framed_stream::FramedWriter::open(response.clone(), CONTENT_TYPE, UNIT)
+                .expect("response preamble");
+        let ready_payload = serde_json::to_vec(&fake_ready("fixture.pile")).expect("READY json");
+        response_writer
+            .record_as(READY_TYPE, &ready_payload, ready_payload.len() as u64)
+            .expect("READY record");
+        let ready_len = response.len();
+        response_writer.text("confirmed ").expect("first fragment");
+        response_writer.text("β").expect("second fragment");
+        response_writer
+            .finish(framed_stream::EndStatus::Aborted(
+                "rank divergence".to_string(),
+            ))
+            .expect("aborted response");
+
+        // Count the exact prefix observe must send. The writer stays alive at
+        // the measurement point, so its eventual drop-only ABORTED trailer is
+        // deliberately outside `input_len`.
+        let expected_input = SharedSink::default();
+        let mut input_writer =
+            framed_stream::FramedWriter::open(expected_input.clone(), CONTENT_TYPE, UNIT)
+                .expect("input preamble");
+        input_writer.text(system).expect("system frame");
+        input_writer.text(&result_delta).expect("result frame");
+        let consult_payload = serde_json::to_vec(&Consult::new(max_tokens)).expect("CONSULT json");
+        input_writer
+            .record_as(CONSULT_TYPE, &consult_payload, consult_payload.len() as u64)
+            .expect("CONSULT record");
+        let input_len = expected_input.len();
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let response_path = std::env::temp_dir().join(format!("mary-failed-turn-response-{nonce}"));
+        let capture_path = std::env::temp_dir().join(format!("mary-failed-turn-capture-{nonce}"));
+        std::fs::write(&response_path, response.bytes()).expect("write fake response");
+
+        let script = r#"
+dd if="$1" bs=1 count="$2" 2>/dev/null
+dd of="$3" bs=1 count="$4" 2>/dev/null
+dd if="$1" bs=1 skip="$2" 2>/dev/null
+cat >/dev/null
+"#;
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .arg("fake-inkling")
+            .arg(&response_path)
+            .arg(ready_len.to_string())
+            .arg(&capture_path)
+            .arg(input_len.to_string());
+        let client = ServeClient::spawn(&mut command).expect("spawn fake serving process");
+        let child = client.child.clone();
+        assert!(child.try_wait().expect("poll fixture").is_none());
+
+        let mut mind = InklingMind::new(client, max_tokens, Some(system.to_string()));
+        let events = [
+            drive::world::Event::monologue(1, "prior "),
+            drive::world::Event::text_result(2, "cmd", "output"),
+        ];
+        let turn = mind.observe(drive::world::MergedView {
+            events: &events,
+            watermark: 3,
+        });
+
+        assert_eq!(turn.said, "confirmed β");
+        assert_eq!(
+            turn.decision.disposition,
+            drive::mind::Disposition::NoAction
+        );
+        assert_eq!(turn.decision.span_start, 0);
+        assert_eq!(turn.decision.span_end, "prior ".len() as u64);
+        assert_eq!(turn.decision.watermark, 3);
+        let terminal = turn
+            .continuation
+            .terminal_error()
+            .expect("backend failure is terminal");
+        assert!(terminal.contains("rank divergence"), "{terminal}");
+        let status = child.wait().expect("failed fixture was reaped");
+        assert!(
+            !status.success(),
+            "observe must kill the otherwise-live fixture"
+        );
+
+        // The exact request proves the model's position zero is the system
+        // prompt even when the first released view already carries a result.
+        let mut captured = framed_stream::FramedReader::open(
+            std::fs::File::open(&capture_path).expect("open captured input"),
+        )
+        .expect("captured preamble");
+        captured
+            .require_content_type(CONTENT_TYPE)
+            .expect("captured content type");
+        let framed_stream::Frame::Record(system_record) =
+            captured.next_frame().expect("system frame")
+        else {
+            panic!("first input frame was not the system record")
+        };
+        assert_eq!(system_record.content_type(), CONTENT_TYPE);
+        assert_eq!(system_record.text().expect("system text"), system);
+        let framed_stream::Frame::Record(result_record) =
+            captured.next_frame().expect("result frame")
+        else {
+            panic!("second input frame was not the result record")
+        };
+        assert_eq!(result_record.content_type(), CONTENT_TYPE);
+        assert_eq!(result_record.text().expect("result text"), result_delta);
+        let framed_stream::Frame::Record(consult_record) =
+            captured.next_frame().expect("CONSULT frame")
+        else {
+            panic!("third input frame was not CONSULT")
+        };
+        assert_eq!(consult_record.content_type(), CONSULT_TYPE);
+        let consult: Consult =
+            serde_json::from_slice(&consult_record.payload).expect("captured CONSULT");
+        assert_eq!(consult.max_tokens, max_tokens);
+
+        drop(mind);
+        let _ = std::fs::remove_file(response_path);
+        let _ = std::fs::remove_file(capture_path);
     }
 
     fn fake_end(token_ids: &[u32]) -> TurnEnd {
