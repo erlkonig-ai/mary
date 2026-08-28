@@ -334,11 +334,13 @@ pub struct TurnEnd {
     /// Why generation stopped: `"max_tokens"` or `"stop_token"`.
     pub stopped: String,
     /// Seconds to the FIRST token of this turn, `Session` calls only:
-    /// tokenising the delta, `extend`/`prefill` over it, and one forward. On
-    /// turn 0 this is the prompt's prefill; on every turn after it, it is what
-    /// the KV cache saves. THE framing rule: seconds per FIRST TOKEN OF A TURN,
-    /// on one box, over the layer range in [`Ready::layers`] — not per token and
-    /// not per turn.
+    /// `extend`/`prefill` over the already-tokenised ids and one forward.
+    /// Tokenisation and pipe transit are deliberately outside this duration;
+    /// clients may measure their own wall clock around [`ServeClient::consult`]
+    /// when those costs matter. On turn 0 this is the prompt's prefill; on every
+    /// turn after it, it is what the KV cache saves. THE framing rule: seconds
+    /// per FIRST TOKEN OF A TURN, on one box, over the layer range in
+    /// [`Ready::layers`] — not per token and not per turn.
     pub first_token_secs: f64,
     /// Seconds for the whole turn, `Session` calls only.
     pub turn_secs: f64,

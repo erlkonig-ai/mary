@@ -756,6 +756,32 @@ pub fn prefill_activation_bytes(
     carried + caches + widest
 }
 
+/// What a chunked prefill holds while building a longer logical context.
+///
+/// [`prefill_activation_bytes`] prices a single pass, so its residual stream,
+/// widest layer working set, and KV cache all use the same token count. A live
+/// session deliberately separates those axes: no pass is wider than
+/// `chunk_tokens`, while global KV rows survive for the complete
+/// `context_tokens`. Charging the whole context as one pass defeats chunking;
+/// charging only one chunk forgets the persistent state. This is the exact
+/// decomposition between them.
+pub fn chunked_prefill_activation_bytes(
+    t: &InklingTextConfig,
+    layers: core::ops::Range<usize>,
+    chunk_tokens: usize,
+    context_tokens: usize,
+    policy: AdmissionPolicy,
+) -> u64 {
+    assert!(
+        chunk_tokens <= context_tokens,
+        "a prefill chunk cannot be wider than its admitted context"
+    );
+    let one_pass = prefill_activation_bytes(t, layers.clone(), chunk_tokens, policy);
+    let chunk_kv = kv_cache_bytes(t, layers.clone(), chunk_tokens, policy);
+    let context_kv = kv_cache_bytes(t, layers, context_tokens, policy);
+    one_pass - chunk_kv + context_kv
+}
+
 /// What the KV caches of this layer range hold at this length, GROWN ON
 /// DEMAND: keys and values, retained rows only.
 ///
@@ -1039,9 +1065,9 @@ pub fn kv_reserve_line(
 mod tests {
     use super::{
         AdmissionPolicy, QUERY_BLOCK_BYTES, RoutedLane, StorageDType, activation_bytes,
-        attention_activation_bytes, largest_buffer, longest_sequence, mlp_activation_bytes,
-        prefill_activation_bytes, prefill_peak_bytes, query_block, score_block_bytes,
-        score_matrix_bytes,
+        attention_activation_bytes, chunked_prefill_activation_bytes, kv_cache_bytes,
+        largest_buffer, longest_sequence, mlp_activation_bytes, prefill_activation_bytes,
+        prefill_peak_bytes, query_block, score_block_bytes, score_matrix_bytes,
     };
     use crate::models::inkling::config::{AttnKind, InklingTextConfig};
     use crate::models::inkling::pool::AllocatorConfig;
@@ -1200,6 +1226,28 @@ mod tests {
             "the long-sequence slope is {far:.0} bytes a token, want the MoE lane's ~400k"
         );
         assert!(new(81_920) > new(65_536) && new(65_536) > new(32_768));
+    }
+
+    #[test]
+    fn one_chunk_prices_the_same_live_set_as_an_unchunked_prefill() {
+        let t = small();
+        let tokens = 16_384;
+        assert_eq!(
+            chunked_prefill_activation_bytes(&t, 0..8, tokens, tokens, wide()),
+            prefill_activation_bytes(&t, 0..8, tokens, wide())
+        );
+    }
+
+    #[test]
+    fn a_longer_chunked_context_adds_only_its_persistent_kv() {
+        let t = small();
+        let (chunk, context) = (4_096, 32_768);
+        let actual = chunked_prefill_activation_bytes(&t, 0..8, chunk, context, wide());
+        let one_pass = prefill_activation_bytes(&t, 0..8, chunk, wide());
+        let extra_kv =
+            kv_cache_bytes(&t, 0..8, context, wide()) - kv_cache_bytes(&t, 0..8, chunk, wide());
+        assert_eq!(actual, one_pass + extra_kv);
+        assert!(actual > one_pass);
     }
 
     /// The routed-expert lane is the peak, and by a wide margin.

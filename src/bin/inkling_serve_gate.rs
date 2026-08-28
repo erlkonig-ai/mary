@@ -81,6 +81,12 @@ OPTIONS (drive):
                          measured — only asserted
     --voice-arg <arg>    Argument passed to the voice; repeatable
     --pile <path>        Scratch provenance pile (default: a temp file)
+    --memory-pile <path> Durable self pile whose real cover is injected before
+                         turn 0 (default: no memory)
+    --memory-bin <path>  Memory faculty used to read that cover (default: memory)
+    --memory-window-tokens <n>
+                         Context window used to budget the cover (default 200000;
+                         output reserve and chars/token match Drive defaults)
 
 OPTIONS (probe):
     --feed <text>        Delta fed before a turn; repeatable, one per turn after
@@ -97,6 +103,9 @@ struct Options {
     voice: Option<PathBuf>,
     voice_args: Vec<String>,
     pile: Option<PathBuf>,
+    memory_pile: Option<PathBuf>,
+    memory_bin: PathBuf,
+    memory_window_tokens: u64,
     tokens: usize,
     turns: usize,
     system: String,
@@ -111,6 +120,9 @@ fn parse(args: &[String]) -> Result<Options> {
         voice: None,
         voice_args: Vec::new(),
         pile: None,
+        memory_pile: None,
+        memory_bin: PathBuf::from("memory"),
+        memory_window_tokens: 200_000,
         tokens: 24,
         turns: 3,
         system: DEFAULT_SYSTEM.to_string(),
@@ -130,6 +142,13 @@ fn parse(args: &[String]) -> Result<Options> {
             "--voice" => o.voice = Some(PathBuf::from(need(i)?)),
             "--voice-arg" => o.voice_args.push(need(i)?),
             "--pile" => o.pile = Some(PathBuf::from(need(i)?)),
+            "--memory-pile" => o.memory_pile = Some(PathBuf::from(need(i)?)),
+            "--memory-bin" => o.memory_bin = PathBuf::from(need(i)?),
+            "--memory-window-tokens" => {
+                o.memory_window_tokens = need(i)?
+                    .parse()
+                    .context("--memory-window-tokens wants a count")?
+            }
             "--gen" => o.tokens = need(i)?.parse().context("--gen wants a count")?,
             "--turns" => o.turns = need(i)?.parse().context("--turns wants a count")?,
             "--system" => o.system = need(i)?,
@@ -227,11 +246,20 @@ fn cmd_drive(o: &Options) -> Result<()> {
         }),
         // Exhaust has its own gate in drive; this run is about the seam.
         telemetry: None,
-        // No cover, so the mind wakes as nobody. That is deliberate here for the
-        // same reason the telemetry is off: this gate is proving that a real
-        // Session can be driven, and a wake-time context would put tokens in
-        // front of the model that the seam is not about.
-        memory: None,
+        // Optional because the original seam gate still needs a tiny no-memory
+        // form. When supplied, this is Drive's production cover path: the same
+        // memory faculty, one shell-physical command/result pair per chunk, and
+        // the same hard completeness rule. That makes a large-prefix run an
+        // end-to-end continuity measurement rather than a synthetic prompt.
+        memory: o.memory_pile.as_ref().map(|memory_pile| {
+            let mut budget = drive::context::ModelBudget::default();
+            budget.context_window_tokens = o.memory_window_tokens;
+            drive::context::MemoryConfig {
+                binary: o.memory_bin.clone(),
+                pile: memory_pile.clone(),
+                budget,
+            }
+        }),
     };
 
     let mut shell = drive::shell::Shell::open(&config, Box::new(mind))

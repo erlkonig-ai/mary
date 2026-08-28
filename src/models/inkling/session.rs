@@ -183,17 +183,26 @@ pub struct SessionConfig {
     /// later token, which is the one variable that used to explain a whole
     /// latency spread.
     pub warm_experts: bool,
-    /// The prefill length admission is priced at.
+    /// The widest prefill chunk admission is priced at.
     ///
     /// Admission reserves activation headroom before the arena is filled, and
     /// the size of a prefill's largest buffer is a function of how many tokens
     /// it takes at once. A session does not know its prompts in advance, so it
     /// prices a fixed budget: big enough that a conversational turn fits under
     /// it, small enough that the reservation does not eat the arena. A prompt
-    /// longer than this is not refused here — it is refused by the allocator,
-    /// later and less legibly, which is why raising it is the fix rather than
-    /// catching the failure.
+    /// longer than this is processed in consecutive chunks of this width, so
+    /// prompt length consumes KV capacity without silently demanding an
+    /// equally wide activation allocation.
     pub prefill_budget: usize,
+
+    /// Maximum positions this session admits across its whole conversation.
+    ///
+    /// This is independent of [`SessionConfig::prefill_budget`]: the latter is
+    /// transient activation width, while this one prices persistent KV and is
+    /// enforced on every pass. Keeping them separate is what lets a long memory
+    /// prefix arrive in bounded chunks without pretending its retained state is
+    /// only one chunk long.
+    pub context_budget: usize,
 
     /// How many positions one [`Session::extend`] pass appends to an existing
     /// cache at once.
@@ -232,6 +241,7 @@ impl SessionConfig {
             layers,
             warm_experts: true,
             prefill_budget: 4096,
+            context_budget: 4096,
             extend_batch: 4096,
         }
     }
@@ -306,6 +316,9 @@ pub struct Session {
     /// The widest pass admission reserved activation headroom for, kept so
     /// [`Session::set_extend_batch`] can hold to the same bound `load` did.
     prefill_budget: usize,
+    /// Maximum number of positions this sequence may retain. Admission prices
+    /// its persistent KV before the weight arena is allocated.
+    context_budget: usize,
     /// Whether a pass FAILED PART WAY THROUGH the layer stack, leaving the
     /// caches at two different positions.
     ///
@@ -516,6 +529,13 @@ impl Session {
             cfg.extend_batch,
             cfg.prefill_budget
         );
+        anyhow::ensure!(
+            cfg.prefill_budget <= cfg.context_budget,
+            "the {}-token prefill chunk is wider than the {}-token total context budget. \
+             Raise context_budget or lower prefill_budget.",
+            cfg.prefill_budget,
+            cfg.context_budget
+        );
 
         // A Session is ONE process and has to be able to answer, so it always
         // owns the final norm and the unembedding — exactly as `inkling_forward`
@@ -552,8 +572,13 @@ impl Session {
         // Price the prefill's activations before anything is copied: the arena
         // has to leave room for them, and a copy that filled the box would fail
         // later, at a buffer, with nothing to say about why.
-        let attention_bytes =
-            super::budget::prefill_activation_bytes(t, lo..hi, cfg.prefill_budget, admission);
+        let attention_bytes = super::budget::chunked_prefill_activation_bytes(
+            t,
+            lo..hi,
+            cfg.prefill_budget,
+            cfg.context_budget,
+            admission,
+        );
 
         // Move this rank's share into ONE anonymous allocation before any GPU
         // handle can alias it. The routed experts are cut here or nowhere: there
@@ -641,7 +666,8 @@ impl Session {
         }
 
         println!(
-            "  session            : layers {lo}..{hi}{}, prefill budget {} tokens{}",
+            "  session            : layers {lo}..{hi}{}, prefill chunk {} tokens, context budget \
+             {} tokens{}",
             match partial {
                 true =>
                     " (PARTIAL STACK -- unembeds through layers it did not all run, so \
@@ -649,6 +675,7 @@ impl Session {
                 false => "",
             },
             cfg.prefill_budget,
+            cfg.context_budget,
             tp.map(|tp| format!(", tensor rank {} of {}", tp.rank(), tp.world()))
                 .unwrap_or_default(),
         );
@@ -676,6 +703,7 @@ impl Session {
             last: None,
             extend_batch: cfg.extend_batch,
             prefill_budget: cfg.prefill_budget,
+            context_budget: cfg.context_budget,
             torn: false,
             seq: next_seq(),
         })
@@ -888,6 +916,13 @@ impl Session {
     /// is [`Session::extend`], and silently treating a second prefill as a
     /// continuation is the kind of state confusion that produces fluent wrong
     /// text rather than an error.
+    ///
+    /// Prompts wider than [`SessionConfig::prefill_budget`] are appended in
+    /// consecutive passes of that width. The first pass establishes the cache;
+    /// later passes use the same committed batched-append path as [`Self::extend`].
+    /// Every pass therefore stays inside the activation width admission priced,
+    /// while the KV store alone grows with the complete logical prefix. A chunk
+    /// boundary is a commit point, never a missing token or a reset.
     pub fn prefill(&mut self, ids: &[usize]) -> Result<usize> {
         anyhow::ensure!(
             self.pos == 0,
@@ -895,7 +930,12 @@ impl Session {
              or `reset` to start a new one.",
             self.pos
         );
-        self.forward(ids)
+        anyhow::ensure!(!ids.is_empty(), "a prefill with no tokens would be vacuous");
+        let mut out = 0;
+        for chunk in ids.chunks(self.prefill_budget) {
+            out = self.forward(chunk)?;
+        }
+        Ok(out)
     }
 
     /// Attend to tokens that are NEW since the last call, continuing the
@@ -1007,6 +1047,18 @@ impl Session {
     /// Refuses a session a previous pass tore. See [`Session::torn`].
     fn forward(&mut self, ids: &[usize]) -> Result<usize> {
         anyhow::ensure!(!ids.is_empty(), "a pass with no tokens would be vacuous");
+        let end = self
+            .pos
+            .checked_add(ids.len())
+            .context("sequence position overflow")?;
+        anyhow::ensure!(
+            end <= self.context_budget,
+            "this pass would advance the sequence from {} to {end} positions, past the \
+             admitted {}-token context budget. Start a new session or raise context_budget so \
+             its persistent KV is priced before the model loads.",
+            self.pos,
+            self.context_budget
+        );
         anyhow::ensure!(
             !self.torn,
             "a previous pass failed part way through the layer stack, so this session's caches \
@@ -1346,6 +1398,12 @@ mod tests {
             "extend_batch {} against a prefill budget of {}",
             c.extend_batch,
             c.prefill_budget
+        );
+        assert!(
+            c.prefill_budget <= c.context_budget,
+            "prefill budget {} against a context budget of {}",
+            c.prefill_budget,
+            c.context_budget
         );
     }
 

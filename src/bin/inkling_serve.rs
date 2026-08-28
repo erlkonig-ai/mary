@@ -93,7 +93,9 @@ OPTIONS:
     --layers <lo:hi>     Layers this rank runs (default: $INK_LAYERS)
     --gen <n>            Default tokens per turn when a consult does not say
     --stop-id <id>       Stop on this token id; repeatable (single-rank only)
-    --prefill-budget <n> Tokens the arena reserves activation headroom for
+    --prefill-budget <n> Maximum tokens processed in one prefill pass
+    --context-budget <n> Maximum positions retained by the session (default:
+                         the effective prefill budget)
     --tp-rank <rank>     This process's tensor-parallel rank (all TP flags together)
     --tp-world <world>   Number of tensor-parallel ranks
     --tp-rendezvous <a>  Rank 0's HOST:PORT on the fast fabric
@@ -111,6 +113,7 @@ struct Options {
     tokens: usize,
     stop: Vec<u32>,
     prefill_budget: Option<usize>,
+    context_budget: Option<usize>,
     tensor_parallel: Option<TensorParallel>,
 }
 
@@ -121,7 +124,8 @@ struct TensorParallel {
 
 fn parse() -> Result<Option<Options>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (mut pile, mut tokenizer, mut layers, mut prefill_budget) = (None, None, None, None);
+    let (mut pile, mut tokenizer, mut layers, mut prefill_budget, mut context_budget) =
+        (None, None, None, None, None);
     let (mut tp_rank, mut tp_world, mut tp_rendezvous) = (None, None, None);
     let mut tokens = 32usize;
     let mut stop = Vec::new();
@@ -159,6 +163,10 @@ fn parse() -> Result<Option<Options>> {
             }
             "--prefill-budget" => {
                 prefill_budget = Some(need(i)?.parse().context("--prefill-budget wants a count")?);
+                i += 2;
+            }
+            "--context-budget" => {
+                context_budget = Some(need(i)?.parse().context("--context-budget wants a count")?);
                 i += 2;
             }
             "--tp-rank" => {
@@ -203,6 +211,7 @@ fn parse() -> Result<Option<Options>> {
         tokens,
         stop,
         prefill_budget,
+        context_budget,
         tensor_parallel,
     }))
 }
@@ -274,6 +283,11 @@ fn run() -> Result<()> {
     if let Some(budget) = options.prefill_budget {
         config.prefill_budget = budget;
     }
+    // Historically there was only one length axis. Preserve that CLI meaning:
+    // setting just --prefill-budget admits that many retained positions too,
+    // while an explicit --context-budget opts into bounded-width chunking of a
+    // longer logical sequence.
+    config.context_budget = options.context_budget.unwrap_or(config.prefill_budget);
     let loaded = std::time::Instant::now();
     let mut session = match options.tensor_parallel {
         None => Session::load(config).context("load the model")?,
