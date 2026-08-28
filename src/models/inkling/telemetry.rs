@@ -8,8 +8,8 @@
 //! links their exported roots to the runtime session and the turn that caused
 //! them.
 //!
-//! Stable ids below were minted with `trible genid` on 2026-08-28. The full
-//! provenance list is also recorded in the commit that introduced this file.
+//! Stable ids below were minted with `trible genid` on 2026-08-28. Their
+//! provenance is also recorded in the commits that introduced them.
 
 use anyhow::{Context as _, Result};
 use triblespace::core::metadata;
@@ -17,7 +17,7 @@ use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::{Blake3, Boolean, F64, Handle, Hash, U256BE};
 use triblespace::prelude::*;
 
-use super::serve::{Ready, TurnEnd};
+use super::serve::{ContextPlacement, ContextPreflighted, Ready, Reinitialized, TurnEnd};
 
 /// Query vocabulary for Inkling's native runtime evidence.
 pub mod schema {
@@ -91,6 +91,31 @@ pub mod schema {
         /// Positions retained in the KV cache after the turn.
         /// Minted 2026-08-28: 42DB94B3C5C091BC292D5B8FFB56E759.
         "42DB94B3C5C091BC292D5B8FFB56E759" as pub position: U256BE;
+        /// Whether admission extends or replaces the resident context.
+        /// Minted 2026-08-28: 837E12BA128DA953C58A083BCB2A9B30.
+        "837E12BA128DA953C58A083BCB2A9B30" as pub context_placement: Handle<UTF8String>;
+        /// Complete response width reserved by context admission.
+        /// Minted 2026-08-28: 56DB15A2503039E81A5FD709F91DCDEA.
+        "56DB15A2503039E81A5FD709F91DCDEA" as pub max_response_tokens: U256BE;
+        /// Exclusive position required by the admitted context and response.
+        /// Absent when checked arithmetic overflowed.
+        /// Minted 2026-08-28: 880D7D9E72D0095AC2D71FEE7714F7E5.
+        "880D7D9E72D0095AC2D71FEE7714F7E5" as pub required_end: U256BE;
+        /// Whether the complete operation fits the resident context budget.
+        /// Minted 2026-08-28: B04E876F833D7B8ABD067098AD01A38E.
+        "B04E876F833D7B8ABD067098AD01A38E" as pub fits: Boolean;
+        /// Position discarded by a successfully acknowledged reinitialization.
+        /// Minted 2026-08-28: 4063D646983C74B47DD6F9610BC6895F.
+        "4063D646983C74B47DD6F9610BC6895F" as pub previous_position: U256BE;
+        /// Completed turns discarded by an acknowledged reinitialization.
+        /// Minted 2026-08-28: F45396CD0A59B6CD5C2F5B70511754D0.
+        "F45396CD0A59B6CD5C2F5B70511754D0" as pub previous_turns: U256BE;
+        /// Tokens staged for the replacement context.
+        /// Minted 2026-08-28: 7785C75EE5323CAF9891A0E32ACFD1B2.
+        "7785C75EE5323CAF9891A0E32ACFD1B2" as pub initialization_tokens: U256BE;
+        /// Resident context epoch installed by the acknowledged replacement.
+        /// Minted 2026-08-28: D650C79F1FC0FE6ACE0E4EA85050DB7F.
+        "D650C79F1FC0FE6ACE0E4EA85050DB7F" as pub context_epoch: U256BE;
     }
 
     /// A READY announcement from a loaded resident runtime.
@@ -102,6 +127,18 @@ pub mod schema {
     /// Minted 2026-08-28: 393BFF0B7490738059AAE5440B5DBBAB.
     #[allow(non_upper_case_globals)]
     pub const kind_turn_end: Id = triblespace::macros::id_hex!("393BFF0B7490738059AAE5440B5DBBAB");
+
+    /// One exact context-admission preflight.
+    /// Minted 2026-08-28: EFEE37F606721308DD306D1A02711294.
+    #[allow(non_upper_case_globals)]
+    pub const kind_context_preflight: Id =
+        triblespace::macros::id_hex!("EFEE37F606721308DD306D1A02711294");
+
+    /// One successfully acknowledged warm-context reinitialization.
+    /// Minted 2026-08-28: 105FB0A444658DEC45333B1BF14AC63D.
+    #[allow(non_upper_case_globals)]
+    pub const kind_reinitialized: Id =
+        triblespace::macros::id_hex!("105FB0A444658DEC45333B1BF14AC63D");
 }
 
 /// Turn one validated READY announcement into a self-contained native fragment.
@@ -166,6 +203,38 @@ pub fn turn_end_fragment(end: &TurnEnd) -> Fragment {
         schema::position: end.position as u128,
     };
     fragment
+}
+
+/// Preserve the exact validated arithmetic produced by one context preflight.
+pub fn context_preflight_fragment(evidence: &ContextPreflighted) -> Fragment {
+    let mut fragment = Fragment::empty();
+    let placement = fragment.put::<UTF8String, _>(match evidence.placement {
+        ContextPlacement::Append => "append".to_string(),
+        ContextPlacement::Replace => "replace".to_string(),
+    });
+    fragment += entity! { _ @
+        metadata::tag: schema::kind_context_preflight,
+        schema::context_placement: placement,
+        schema::position: evidence.position as u128,
+        schema::carried_tokens: evidence.carried as u128,
+        schema::delta_tokens: evidence.delta_tokens as u128,
+        schema::max_response_tokens: evidence.max_response_tokens as u128,
+        schema::required_end?: evidence.required_end.map(|end| end as u128),
+        schema::context_budget: evidence.context_budget as u128,
+        schema::fits: evidence.fits,
+    };
+    fragment
+}
+
+/// Preserve a warm-context replacement only after its server ACK succeeded.
+pub fn reinitialized_fragment(next_epoch: u64, acknowledged: &Reinitialized) -> Fragment {
+    entity! { _ @
+        metadata::tag: schema::kind_reinitialized,
+        schema::context_epoch: next_epoch as u128,
+        schema::previous_position: acknowledged.previous_position as u128,
+        schema::previous_turns: acknowledged.previous_turns as u128,
+        schema::initialization_tokens: acknowledged.initialization_tokens as u128,
+    }
 }
 
 #[cfg(test)]
@@ -254,5 +323,54 @@ mod tests {
         )
         .collect();
         assert_eq!(measurements, [(11, 1.5)]);
+    }
+
+    #[test]
+    fn context_preflight_keeps_exact_admission_arithmetic() {
+        let fragment = context_preflight_fragment(&ContextPreflighted {
+            placement: ContextPlacement::Replace,
+            position: 0,
+            carried: 0,
+            delta_tokens: 13,
+            max_response_tokens: 32,
+            required_end: Some(44),
+            context_budget: 4_096,
+            fits: true,
+        });
+        let root = fragment.root().expect("preflight root");
+        let evidence: Vec<(u128, u128, bool)> = find!(
+            (delta: u128, required_end: u128, fits: bool),
+            pattern!(&fragment, [{
+                root @
+                    schema::delta_tokens: ?delta,
+                    schema::required_end: ?required_end,
+                    schema::fits: ?fits
+            }])
+        )
+        .collect();
+        assert_eq!(evidence, [(13, 44, true)]);
+    }
+
+    #[test]
+    fn reinitialization_ack_names_the_installed_epoch() {
+        let fragment = reinitialized_fragment(
+            7,
+            &Reinitialized {
+                previous_position: 1_024,
+                previous_turns: 11,
+                initialization_tokens: 512,
+            },
+        );
+        let root = fragment.root().expect("reinitialization root");
+        let evidence: Vec<(u128, u128)> = find!(
+            (epoch: u128, tokens: u128),
+            pattern!(&fragment, [{
+                root @
+                    schema::context_epoch: ?epoch,
+                    schema::initialization_tokens: ?tokens
+            }])
+        )
+        .collect();
+        assert_eq!(evidence, [(7, 512)]);
     }
 }

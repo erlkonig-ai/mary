@@ -3531,6 +3531,7 @@ impl drive::mind::Mind for InklingMind {
             context,
             max_response_tokens: self.max_response_tokens.max(1),
         })?;
+        self.pending_exhaust += super::telemetry::context_preflight_fragment(&evidence);
         Ok(if evidence.fits {
             drive::mind::ObservationAdmission::Ready
         } else {
@@ -3615,6 +3616,7 @@ impl drive::mind::Mind for InklingMind {
                     error.context("preflight the resident Inkling replacement"),
                 )
             })?;
+        self.pending_exhaust += super::telemetry::context_preflight_fragment(&evidence);
         if !evidence.fits {
             return Err(drive::mind::ContextReplacementFailure::unchanged(
                 anyhow::anyhow!(
@@ -3628,14 +3630,14 @@ impl drive::mind::Mind for InklingMind {
             ));
         }
 
-        let position = match if self.initialized {
+        let (position, acknowledgement) = match if self.initialized {
             self.client
                 .reinitialize(&initialization)
-                .map(|acknowledged| Some(acknowledged.initialization_tokens))
+                .map(|acknowledged| (Some(acknowledged.initialization_tokens), Some(acknowledged)))
         } else {
-            self.client.context(&initialization).map(|()| None)
+            self.client.context(&initialization).map(|()| (None, None))
         } {
-            Ok(position) => position,
+            Ok(installed) => installed,
             Err(error) => {
                 let _ = self.client.kill();
                 return Err(drive::mind::ContextReplacementFailure::terminal(
@@ -3643,6 +3645,10 @@ impl drive::mind::Mind for InklingMind {
                 ));
             }
         };
+        if let Some(acknowledged) = acknowledgement {
+            self.pending_exhaust +=
+                super::telemetry::reinitialized_fragment(next_epoch, &acknowledged);
+        }
         self.output = NativeOutputParser::new(self.client.ready().special_ids.clone());
         self.buffer.reset_empty_at(image.monologue_end);
         self.scanned_abs = image.monologue_end;
@@ -5896,6 +5902,8 @@ exec cat >/dev/null
         let child = client.child.clone();
         let mut mind = InklingMind::new_gate(client, 32, Some("old system".to_string()))
             .expect("valid READY evidence");
+        let startup = mind.take_exhaust();
+        assert_eq!(startup.exports().count(), 1, "READY has one exported root");
         mind.initialized = true;
         mind.needs_generation_prompt = true;
         mind.position = Some(123);
@@ -5908,6 +5916,13 @@ exec cat >/dev/null
 
         mind.replace_context(1, &image)
             .expect("replace resident context");
+        let replacement = mind.take_exhaust();
+        assert_eq!(
+            replacement.exports().count(),
+            2,
+            "replacement emits its preflight and successful ACK"
+        );
+        assert_eq!(mind.take_exhaust(), triblespace::prelude::Fragment::empty());
         assert_eq!(mind.buffer.base_offset(), monologue_end);
         assert_eq!(mind.buffer.end_offset(), monologue_end);
         let turn = mind.observe(drive::world::MergedView::EMPTY);
@@ -5928,6 +5943,90 @@ exec cat >/dev/null
                 .expect("drop reaps fake server")
                 .success()
         );
+        let _ = std::fs::remove_file(response_path);
+        let _ = std::fs::remove_file(capture_path);
+    }
+
+    #[cfg(all(feature = "drive-mind", unix))]
+    #[test]
+    fn failed_reinitialization_does_not_emit_an_installed_context() {
+        use drive::mind::Mind as _;
+
+        let ready = fake_ready("fixture.pile");
+        let response = SharedSink::default();
+        let mut writer = framed_stream::FramedWriter::open(response.clone(), CONTENT_TYPE, UNIT)
+            .expect("response preamble");
+        let ready_payload = serde_json::to_vec(&ready).expect("READY json");
+        writer
+            .record_as(READY_TYPE, &ready_payload, ready_payload.len() as u64)
+            .expect("READY record");
+        let evidence = context_preflight(
+            ContextPlacement::Replace,
+            123,
+            1,
+            12,
+            32,
+            ready.context_budget,
+        )
+        .unwrap();
+        let evidence_payload = serde_json::to_vec(&evidence).expect("PREFLIGHTED json");
+        writer
+            .record_as(
+                CONTEXT_PREFLIGHTED_TYPE,
+                &evidence_payload,
+                evidence_payload.len() as u64,
+            )
+            .expect("PREFLIGHTED record");
+        writer
+            .finish(framed_stream::EndStatus::Complete)
+            .expect("complete response without a false ACK");
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let response_path =
+            std::env::temp_dir().join(format!("mary-failed-reinit-response-{nonce}"));
+        let capture_path = std::env::temp_dir().join(format!("mary-failed-reinit-capture-{nonce}"));
+        std::fs::write(&response_path, response.bytes()).expect("write fake response");
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("cat \"$1\"; cat >\"$2\"")
+            .arg("fake-inkling")
+            .arg(&response_path)
+            .arg(&capture_path);
+        let client = ServeClient::spawn(&mut command).expect("spawn fake serving process");
+        let mut mind = InklingMind::new_gate(client, 32, Some("old system".to_string()))
+            .expect("valid READY evidence");
+        let _ready = mind.take_exhaust();
+        mind.initialized = true;
+        mind.needs_generation_prompt = true;
+        mind.position = Some(123);
+        let image = drive::mind::ContextImage {
+            system: "replacement system".to_string(),
+            responses: Vec::new(),
+            monologue_end: 4_096,
+        };
+
+        let failure = mind
+            .replace_context(1, &image)
+            .expect_err("missing REINITIALIZED must fail");
+        assert!(failure.is_terminal());
+        assert_eq!(
+            mind.context_epoch(),
+            0,
+            "failed replacement keeps the epoch"
+        );
+        let exhaust = mind.take_exhaust();
+        assert_eq!(
+            exhaust.exports().count(),
+            1,
+            "the successful preflight is evidence, but no ACK was received"
+        );
+        assert_eq!(mind.take_exhaust(), triblespace::prelude::Fragment::empty());
+
+        drop(mind);
         let _ = std::fs::remove_file(response_path);
         let _ = std::fs::remove_file(capture_path);
     }
