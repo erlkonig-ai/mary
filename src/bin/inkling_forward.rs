@@ -3798,12 +3798,14 @@ fn main() -> Result<()> {
     // next win is.
     if tp_shard.is_some() {
         println!(
-            "  within-layer split : REDUCED operands are all cut --\n\
+            "  within-layer split : REDUCED operands are all cut, in the STARTUP COPY (the\n\
+             \x20               arena holds this rank's share and never the whole; INK_STARTUP_COPY=0\n\
+             \x20               cuts the dense leaves at bind time instead) --\n\
              \x20   attention   q/k/v/r by head (16 q, 4 kv a rank), wo by column, both\n\
              \x20               attention short convolutions by KV head, the KV cache by head\n\
              \x20   dense MLP   gate and up by row, w2 by column, on the intermediate axis\n\
              \x20   shared exp  the same intermediate axis, n_shared unchanged at {}\n\
-             \x20   routed exp  the same intermediate axis, cut in the STARTUP COPY: w13 rows\n\
+             \x20   routed exp  the same intermediate axis: w13 rows\n\
              \x20               {}..{} of {}, w2 columns {}..{} of {}\n\
              \x20   REPLICATED (no reduce follows, so this is bytes and not correctness):\n\
              \x20               the embedding table, the unembedding, both RMSNorm gains, the\n\

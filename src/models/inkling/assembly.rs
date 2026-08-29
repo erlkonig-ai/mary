@@ -1231,6 +1231,32 @@ pub fn w4a16_bind(
     dev_lane::ProjW::W4a16(p)
 }
 
+/// Which cut a binder still OWES, given what the startup copy already did.
+///
+/// `tp` is the split the run is under. The answer is `Some(tp)` when the
+/// binder has to cut the leaf itself -- no startup copy ran
+/// (`INK_STARTUP_COPY=0`) -- and `None` when [`Weights::precut`] says the copy
+/// already holds this rank's share at the cut dims, in which case the binder
+/// reads the leaf as a whole weight of the LOCAL width. A copy cut for a
+/// different split than the one this binder is under is a contradiction and
+/// is refused: the leaf would be the wrong half at the right shape, which is
+/// finite and fluent.
+fn cut_owed(
+    cp: &Weights,
+    tp: Option<crate::models::inkling::tp::Tp>,
+) -> Result<Option<crate::models::inkling::tp::Tp>> {
+    match (cp.precut(), tp) {
+        (None, tp) => Ok(tp),
+        (Some(pre), Some(tp)) if pre == tp => Ok(None),
+        (Some(pre), tp) => anyhow::bail!(
+            "the startup copy cut the dense leaves for rank {}/{}, but this bind is under {:?}",
+            pre.rank(),
+            pre.world(),
+            tp
+        ),
+    }
+}
+
 pub fn bind_bf16(
     client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
     aliases: Option<&crate::models::inkling::fp4gemm::Aliases>,
@@ -1372,14 +1398,6 @@ impl DeviceDense {
         if !self.shared.contains_key(p) {
             let fused = cp.stored(&format!("{p}mlp.shared_experts.shared_w13_weight"))?;
             anyhow::ensure!(fused.elem == Elem::Bf16, "shared_w13 is {:?}", fused.elem);
-            let (g, u) = crate::models::inkling::load::split_shared_w13_bytes(
-                &fused.bytes,
-                n_shared,
-                inter,
-                h,
-                halved,
-                2,
-            );
             let d = cp.stored(&format!("{p}mlp.shared_experts.shared_w2_weight"))?;
             anyhow::ensure!(d.elem == Elem::Bf16, "shared_w2 is {:?}", d.elem);
             // ---- this rank's half of the intermediate axis -----------------
@@ -1396,13 +1414,36 @@ impl DeviceDense {
             // locally -- which shifts every shared gamma column by the rank at
             // three call sites, silently. This way `n_shared` is 2 on both
             // ranks and nothing downstream of the bind moves.
-            let cut = match tp {
-                None => None,
-                Some(tp) => Some(
-                    tp.shared_inter(inter)
+            //
+            // Cut HERE only when the startup copy did not. Under a split the
+            // copy already holds this rank's share of BOTH leaves at the cut
+            // dims (`tpshard::dense_cut`, reported by `Weights::precut`), so
+            // this reads them as whole weights of the LOCAL width and cuts
+            // nothing -- the same bytes, out of an arena that never held the
+            // other half. `INK_STARTUP_COPY=0` is the arm that still cuts here.
+            let (cut, inter) = match (tp, cut_owed(cp, tp)?) {
+                (Some(tp), None) => (
+                    None,
+                    tp.share("intermediate_size", inter)
                         .map_err(|e| anyhow::anyhow!("shared experts: {e}"))?,
                 ),
+                (_, Some(tp)) => (
+                    Some(
+                        tp.shared_inter(inter)
+                            .map_err(|e| anyhow::anyhow!("shared experts: {e}"))?,
+                    ),
+                    inter,
+                ),
+                (None, None) => (None, inter),
             };
+            let (g, u) = crate::models::inkling::load::split_shared_w13_bytes(
+                &fused.bytes,
+                n_shared,
+                inter,
+                h,
+                halved,
+                2,
+            );
             let per_expert_rows = |src: &[u8]| -> Result<Vec<u8>> {
                 let Some(r) = cut.clone() else {
                     return Ok(src.to_vec());
@@ -1599,8 +1640,14 @@ impl DeviceDense {
             // pile, and an unconditional `to_vec()` here would cost a resident
             // 134 MiB copy of it on every single-node run -- the exact
             // regression the `INK_DENSE_FAKEQUANT` note below is written about.
+            //
+            // Under a split whose startup copy already cut both leaves
+            // (`Weights::precut`), this takes the `None` arm on purpose: the
+            // fused weight de-interleaves to this rank's `[inter / world,
+            // hidden]` halves by itself and `down.dims` already names the
+            // local width, so there is nothing left to cut.
             let (g, u, dn, inter, dcols): (Vec<u8>, Vec<u8>, std::borrow::Cow<'_, [u8]>, _, _) =
-                match tp {
+                match cut_owed(cp, tp)? {
                     None => (
                         g,
                         u,
@@ -2390,7 +2437,12 @@ pub fn bind_layer(
             let bytes = crate::models::inkling::tpshard::cols(&slab, c)?;
             Ok(bind_bf16(fp4_client, fp4_aliases, &bytes, rows, n))
         };
-    let attn = match tp_shard {
+    // `cut_owed`, not `tp_shard`: under a split whose startup copy already
+    // cut these leaves (`Weights::precut`) the arena holds this rank's heads
+    // and nothing else, so the whole-weight arm binds them at the LOCAL head
+    // counts computed above -- and `fused_qkvr` is still `None` there, because
+    // it is gated on `tp_shard` and not on who did the cutting.
+    let attn = match cut_owed(cp, tp_shard)? {
         None => dev_lane::AttnWeightsDev {
             wq: pw("attn.wq_du.weight", heads * head_dim, h)?,
             wk: pw("attn.wk_dv.weight", kv_heads * head_dim, h)?,

@@ -425,9 +425,17 @@
 //! 119.63 GiB box: with 87.07 GiB of arena plus 5.21 GiB of device pool the
 //! admission gate passes with 1.95 GiB of headroom, and a decode step then
 //! costs 56.5 ms when the allocator is not fighting for pages and 200-670 ms
-//! when it is -- the SAME binary, the same tokens, twice in one hour. Moving
-//! those cuts from bind time into `copy_share` is the next lever, and it is
-//! worth ~5.2 GiB.
+//! when it is -- the SAME binary, the same tokens, twice in one hour.
+//!
+//! The first three rows of that table are now cut IN THE COPY:
+//! [`super::tpshard::dense_cut`] gives `copy_share` the binders' own rule per
+//! tensor, the arena is laid out at the cut sizes, and the binders read each
+//! leaf as a whole weight of the local width (`Weights::precut` is what tells
+//! them to). The bytes that reach `bind_bf16` are the same bytes in the same
+//! order -- pinned per tensor in `tpshard`'s tests -- so this is a copy-order
+//! change, not an arithmetic one. The unembedding stays replicated: it is not
+//! cut at bind time either (no reduce follows it), and cutting it by vocab
+//! would be the `argmax_across` design, which is a different change.
 //!
 //! # Residency, which this does NOT improve over the pipeline split
 //!

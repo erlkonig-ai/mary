@@ -135,6 +135,19 @@ impl Weights {
         Ok(leaf)
     }
 
+    /// The within-layer split whose DENSE cuts the startup copy already
+    /// applied, if any.
+    ///
+    /// `Some(tp)` means every leaf [`super::tpshard::dense_cut`] knows -- the
+    /// attention projections and convolution state, the dense MLP, the shared
+    /// experts -- is held as THIS RANK's share at its cut dims, and a binder
+    /// reads it as a whole weight of the local width and cuts nothing. `None`
+    /// is a single-node run or `INK_STARTUP_COPY=0`, where the binders cut at
+    /// bind time as they always did.
+    pub fn precut(&self) -> Option<super::tp::Tp> {
+        self.src.dense_precut()
+    }
+
     /// One dense weight — widened once and then KEPT, when residency is on.
     ///
     /// Off, this is [`Weights::tensor`] with an `Arc` around it and nothing

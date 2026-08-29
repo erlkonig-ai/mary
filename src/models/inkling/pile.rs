@@ -335,7 +335,16 @@ fn mem_total_bytes() -> Result<u64> {
 /// the arena whether or not they are used, but they are only BOUND when
 /// drafting is on -- so they are charged on `policy.drafts` and not on the
 /// range.
-fn device_weight_bytes(name: &str, leaf: &Leaf, policy: super::budget::AdmissionPolicy) -> u64 {
+///
+/// `dims` and `bytes` are the leaf AS THE ARENA WILL HOLD IT -- under a
+/// within-layer split that is this rank's cut, not the stored whole, because
+/// the pool copy the binder takes is of what it is handed.
+fn device_weight_bytes(
+    name: &str,
+    dims: &[u64],
+    bytes: u64,
+    policy: super::budget::AdmissionPolicy,
+) -> u64 {
     use super::budget::DenseWeights;
 
     /// The four the fused bind concatenates, in its output order.
@@ -364,7 +373,6 @@ fn device_weight_bytes(name: &str, leaf: &Leaf, policy: super::budget::Admission
     if name.starts_with("model.mtp.") && !policy.drafts {
         return 0;
     }
-    let bytes = leaf.bytes.len() as u64;
 
     // `INK_FUSE_QKVR`: the four attention projections are ALSO bound as one
     // concatenated `[6656, hidden]` weight. A concatenation is a fresh host
@@ -395,11 +403,11 @@ fn device_weight_bytes(name: &str, leaf: &Leaf, policy: super::budget::Admission
     // Bound row-padded out of a fresh host buffer, so it is a pool copy in
     // BOTH arms -- and the pad is part of the allocation, not a rounding.
     if name.ends_with("mlp.gate.weight") {
-        if !policy.router_bf16 || leaf.dims.len() != 2 {
+        if !policy.router_bf16 || dims.len() != 2 {
             return 0;
         }
-        let rows = leaf.dims[0].next_multiple_of(super::bf16gemm::NTILE as u64);
-        return rows * leaf.dims[1] * 2;
+        let rows = dims[0].next_multiple_of(super::bf16gemm::NTILE as u64);
+        return rows * dims[1] * 2;
     }
     // Fused in the checkpoint, split on the host: the halves are not in any
     // mapping, so aliasing them is not on offer.
@@ -975,6 +983,15 @@ pub struct PileSource {
     /// aliasing the pile mapping in place) reports false and every consumer
     /// reads the row-major lane, which is the only lane those bytes support.
     swizzled: bool,
+    /// The within-layer split whose DENSE cuts the startup copy applied.
+    ///
+    /// `Some(tp)` means every dense leaf [`super::tpshard::dense_cut`] knows
+    /// now holds THIS RANK's share at its cut dims, and a binder must not cut
+    /// it again. `None` until [`PileSource::copy_share`] has run under a split
+    /// -- so `INK_STARTUP_COPY=0` and single-node runs report `None` and the
+    /// binders cut at bind time as they always did. A property of the bytes,
+    /// like `swizzled`, and for the same reason.
+    dense_cut: Option<super::tp::Tp>,
 }
 
 #[derive(Clone)]
@@ -1179,7 +1196,14 @@ impl PileSource {
             copied: None,
             copied_experts: std::collections::HashMap::new(),
             swizzled: false,
+            dense_cut: None,
         })
+    }
+
+    /// The split whose dense cuts the startup copy already applied, if any.
+    /// See the field.
+    pub fn dense_precut(&self) -> Option<super::tp::Tp> {
+        self.dense_cut
     }
 
     /// One dense tensor by checkpoint name, as a view.
@@ -1502,6 +1526,16 @@ impl PileSource {
     /// the bytes, so the arena is smaller and the pass is faster. The
     /// `INK_SWZ` permutation below is applied to the CUT dims, which is why the
     /// swizzleability gate reads them and not the stored ones.
+    ///
+    /// The same `Some(tp)` cuts the DENSE leaves the split shards -- the
+    /// attention projections and their convolution state, the dense MLP, the
+    /// shared experts -- by [`super::tpshard::dense_cut`]'s per-tensor rule,
+    /// which is the binders' own rule restated. Those used to be cut at BIND
+    /// time out of an arena that held them whole: correct, the device read
+    /// half either way, and ~5.2 GiB of residency on a box that had 1.95 GiB
+    /// to spare. After this copy each such leaf's `dims` are its cut dims and
+    /// [`PileSource::dense_precut`] says so, which is what tells a binder not
+    /// to cut it again.
     pub fn copy_share(
         &mut self,
         layers: std::ops::Range<usize>,
@@ -1698,14 +1732,45 @@ impl PileSource {
             *per_layer.entry(self.experts[key].layer).or_default() += cursor - start;
             expert_offsets.push((start, end));
         }
-        let mut dense_offsets = Vec::with_capacity(dense_names.len());
+        // This rank's cut of each DENSE leaf, decided here for the reason the
+        // routed cut is: the arena is allocated from this layout, so a leaf
+        // cut anywhere later is a leaf the arena already holds whole. `None`
+        // is a leaf the split replicates (or no split at all), copied as it
+        // is. See [`super::tpshard::dense_cut`] for the per-tensor rule, and
+        // `shared_w13_halved` is read here because the cut of the shared
+        // `w13` depends on which reading of its fused block the binder will
+        // take -- the same switch, read the same way.
+        let halved = super::load::shared_w13_halved();
+        let mut dense_cuts: Vec<Option<super::tpshard::DenseCut>> =
+            Vec::with_capacity(dense_names.len());
         for name in &dense_names {
+            dense_cuts.push(match shard {
+                Some(tp) if tp.is_split() => {
+                    super::tpshard::dense_cut(tp, name, &self.dense[name].dims, halved)?
+                }
+                _ => None,
+            });
+        }
+        let mut dense_offsets = Vec::with_capacity(dense_names.len());
+        let mut dense_cut_stored = 0u64;
+        let mut dense_cut_kept = 0u64;
+        for (name, cut) in dense_names.iter().zip(&dense_cuts) {
+            let leaf = &self.dense[name];
+            let (len, dims): (usize, &[u64]) = match cut {
+                Some(c) => {
+                    let len = c.bytes(leaf.elem.width());
+                    dense_cut_stored += leaf.bytes.len() as u64;
+                    dense_cut_kept += len as u64;
+                    (len, &c.dims)
+                }
+                None => (leaf.bytes.len(), &leaf.dims),
+            };
             let start = cursor;
             let end = start
-                .checked_add(self.dense[name].bytes.len())
+                .checked_add(len)
                 .context("weight share byte count overflow")?;
             cursor = end.next_multiple_of(VIEW_ALIGN);
-            let dev = device_weight_bytes(name, &self.dense[name], policy);
+            let dev = device_weight_bytes(name, dims, len as u64, policy);
             match self.dense[name]
                 .layer
                 .filter(|l| layers.contains(&(*l as usize)))
@@ -1908,14 +1973,19 @@ impl PileSource {
 
         enum Job<'a> {
             Expert(&'a (String, i64), &'a Shape),
-            Dense(&'a str),
+            /// A dense leaf, and this rank's cut of it when the split cuts it.
+            Dense(&'a str, Option<&'a super::tpshard::DenseCut>),
         }
         let mut jobs: Vec<(usize, usize, Job)> = Vec::with_capacity(keys.len() + dense_names.len());
         for (k, &(start, end)) in keys.iter().zip(expert_offsets.iter()) {
             jobs.push((start, end, Job::Expert(k, &shapes[&k.0])));
         }
-        for (name, &(start, end)) in dense_names.iter().zip(dense_offsets.iter()) {
-            jobs.push((start, end, Job::Dense(name.as_str())));
+        for ((name, cut), &(start, end)) in dense_names
+            .iter()
+            .zip(&dense_cuts)
+            .zip(dense_offsets.iter())
+        {
+            jobs.push((start, end, Job::Dense(name.as_str(), cut.as_ref())));
         }
 
         // Split by BYTES, not by leaf count: the leaves are not the same size
@@ -2030,7 +2100,7 @@ impl PileSource {
                                     );
                                     payload
                                 }
-                                Job::Dense(name) => dense[*name].bytes.clone(),
+                                Job::Dense(name, _) => dense[*name].bytes.clone(),
                             };
                             let dst = &mut buf[start - base..end - base];
                             match job {
@@ -2094,7 +2164,17 @@ impl PileSource {
                                     )?;
                                     dst.copy_from_slice(&cut);
                                 }
-                                Job::Dense(_) => dst.copy_from_slice(&src),
+                                Job::Dense(_, None) => dst.copy_from_slice(&src),
+                                // The dense leaves' cut rides inside the
+                                // same copy as the experts': spans are
+                                // memcpys of a subrange, a column cut is a
+                                // gather straight into the arena slot. The
+                                // leaf's recorded dims become the cut dims
+                                // below, so nothing downstream sees the
+                                // stored shape.
+                                Job::Dense(name, Some(cut)) => cut
+                                    .copy_into(&src, dense[*name].elem.width(), dst)
+                                    .map_err(|e| anyhow::anyhow!("{name}: {e}"))?,
                             }
                             release.release(&src);
                         }
@@ -2138,6 +2218,20 @@ impl PileSource {
                     sh.logical,
                 );
             }
+            // The DENSE cuts, as one line: how many leaves, and the residency
+            // the copy did not spend. Per-leaf shapes would be 42 layers of
+            // the same seven lines; the count and the two byte totals are
+            // what an admission line can be checked against.
+            let n_cut = dense_cuts.iter().filter(|c| c.is_some()).count();
+            println!(
+                "    startup copy: rank {}/{} cut {n_cut} dense leaves in the copy -- {:.2} GiB \
+                 stored, {:.2} GiB kept ({:.2} GiB of arena the bind-time cut used to hold whole)",
+                tp.rank(),
+                tp.world(),
+                dense_cut_stored as f64 / GIB as f64,
+                dense_cut_kept as f64 / GIB as f64,
+                (dense_cut_stored - dense_cut_kept) as f64 / GIB as f64,
+            );
         }
         println!(
             "    startup copy: {} shape probe{} {:.1}s, fetch+verify+copy {:.1}s ({:.2} GiB/s, {threads} thread{})",
@@ -2174,11 +2268,18 @@ impl PileSource {
                 },
             );
         }
-        for (name, (start, end)) in dense_names.iter().zip(dense_offsets) {
-            self.dense.get_mut(name).expect("selected dense leaf").bytes =
-                bytes.slice(skew + start..skew + end);
+        for ((name, cut), (start, end)) in dense_names.iter().zip(&dense_cuts).zip(dense_offsets) {
+            let leaf = self.dense.get_mut(name).expect("selected dense leaf");
+            leaf.bytes = bytes.slice(skew + start..skew + end);
+            // The CUT dims, for the same reason `copied_experts` records the
+            // cut shape: a binder that reads this leaf's `dims` has to read
+            // the matrix the bytes are, not the one the checkpoint stored.
+            if let Some(c) = cut {
+                leaf.dims = c.dims.clone();
+            }
         }
         self.copied = Some(bytes);
+        self.dense_cut = shard.filter(|t| t.is_split());
         Ok((
             self.copied_experts.len(),
             dense_names.len(),
@@ -2332,7 +2433,7 @@ mod tests {
         let sum = |policy: AdmissionPolicy| -> u64 {
             share
                 .iter()
-                .map(|(n, l)| device_weight_bytes(n, l, policy))
+                .map(|(n, l)| device_weight_bytes(n, &l.dims, l.bytes.len() as u64, policy))
                 .sum()
         };
 
@@ -2397,7 +2498,7 @@ mod tests {
         let sum = |policy: AdmissionPolicy| -> u64 {
             share
                 .iter()
-                .map(|(n, l)| device_weight_bytes(n, l, policy))
+                .map(|(n, l)| device_weight_bytes(n, &l.dims, l.bytes.len() as u64, policy))
                 .sum()
         };
 

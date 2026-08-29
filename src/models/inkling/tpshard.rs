@@ -375,6 +375,305 @@ pub fn routed_cut(
     }
 }
 
+// ---------------------------------------------------------------------------
+// The cuts the DENSE leaves take, which ALSO happen inside the startup copy.
+// ---------------------------------------------------------------------------
+
+/// What one dense leaf KEEPS under the split, with the leaf read as a
+/// row-major `[rows, cols]` matrix.
+///
+/// Row runs are a LIST because the shared experts' fused `w13` is
+/// `[n_shared, 2 * inter, hidden]` and a rank's share of the intermediate axis
+/// appears once per expert block (twice, when the blocks are stored halved) --
+/// several spans of one leaf, in order. Every other row cut is a list of one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Keep {
+    /// Whole-row runs, concatenated in order: spans, one `memcpy` each.
+    Rows(Vec<Range<usize>>),
+    /// One column range of every row: a gather.
+    Cols(Range<usize>),
+}
+
+/// This rank's cut of one DENSE leaf, as the startup copy applies it.
+///
+/// # Why the dense cuts moved into the copy
+///
+/// Until this existed the binders in `assembly` cut these leaves at BIND time
+/// -- a row range of the arena for `wq`, a gather for `wo`, the de-interleave
+/// and then a row range for the fused `w13`s -- and every one of those cuts
+/// was applied to a leaf the startup copy had already written into the arena
+/// WHOLE. The device read half either way, so it was never a bandwidth term;
+/// it was ~5.2 GiB of residency on a 119.63 GiB box that admitted 87.07 GiB of
+/// arena plus 5.21 GiB of pool with 1.95 GiB to spare, and a decode step on
+/// that box cost 56.5 ms when the allocator was not fighting for pages and
+/// 200-670 ms when it was (`tp.rs`, "What is left REPLICATED in the arena").
+///
+/// Here the cut is a change of SOURCE index inside the copy that already
+/// runs, exactly as [`routed_cut`] is for the experts: the arena is allocated
+/// at the cut size, the leaf's `dims` become the cut dims, and the binder is
+/// handed this rank's share as if it were the whole leaf. The bytes that
+/// reach `bind_bf16` are the SAME bytes the bind-time cut produced, in the
+/// same order -- the tests below pin that per tensor -- so this is a
+/// copy-order change and not an arithmetic one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DenseCut {
+    /// The leaf as a matrix: the leading dim, then the product of the rest.
+    pub rows: usize,
+    pub cols: usize,
+    pub keep: Keep,
+    /// The leaf's dims AFTER the cut, in the checkpoint's own rank -- so a
+    /// `[n_shared, 2 * inter, hidden]` leaf stays rank 3 and the binder that
+    /// reads `dims[1]` reads this rank's width.
+    pub dims: Vec<u64>,
+}
+
+impl DenseCut {
+    fn rows_kept(&self) -> usize {
+        match &self.keep {
+            Keep::Rows(runs) => runs.iter().map(|r| r.len()).sum(),
+            Keep::Cols(_) => self.rows,
+        }
+    }
+
+    fn cols_kept(&self) -> usize {
+        match &self.keep {
+            Keep::Rows(_) => self.cols,
+            Keep::Cols(c) => c.len(),
+        }
+    }
+
+    /// Bytes the cut leaf occupies at `width` bytes an element -- what the
+    /// arena layout reserves for it.
+    pub fn bytes(&self, width: usize) -> usize {
+        self.rows_kept() * self.cols_kept() * width
+    }
+
+    /// Copy what is kept out of `src`, the WHOLE leaf, into `dst`, which must
+    /// be exactly [`DenseCut::bytes`] long. Spans are `memcpy`s; a column cut
+    /// gathers row by row straight into the arena, with no transient buffer.
+    pub fn copy_into(&self, src: &[u8], width: usize, dst: &mut [u8]) -> anyhow::Result<()> {
+        let stride = self.cols * width;
+        anyhow::ensure!(
+            src.len() == self.rows * stride,
+            "a [{}, {}] leaf of {width}-byte elements is {} bytes, got {}",
+            self.rows,
+            self.cols,
+            self.rows * stride,
+            src.len()
+        );
+        anyhow::ensure!(
+            dst.len() == self.bytes(width),
+            "the cut of a [{}, {}] leaf is {} bytes, but its arena slot is {}",
+            self.rows,
+            self.cols,
+            self.bytes(width),
+            dst.len()
+        );
+        match &self.keep {
+            Keep::Rows(runs) => {
+                let mut at = 0usize;
+                for r in runs {
+                    anyhow::ensure!(
+                        r.end <= self.rows,
+                        "rows {}..{} run past a [{}, {}] leaf",
+                        r.start,
+                        r.end,
+                        self.rows,
+                        self.cols
+                    );
+                    let n = r.len() * stride;
+                    dst[at..at + n].copy_from_slice(&src[r.start * stride..r.end * stride]);
+                    at += n;
+                }
+            }
+            Keep::Cols(c) => {
+                anyhow::ensure!(
+                    c.end <= self.cols,
+                    "columns {}..{} run past a [{}, {}] leaf",
+                    c.start,
+                    c.end,
+                    self.rows,
+                    self.cols
+                );
+                let (lo, hi) = (c.start * width, c.end * width);
+                for (r, out) in dst.chunks_exact_mut(hi - lo).enumerate() {
+                    out.copy_from_slice(&src[r * stride + lo..r * stride + hi]);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// This rank's cut of one dense leaf, chosen by NAME and stored dims -- or
+/// `None` for a leaf the split REPLICATES.
+///
+/// The rule per tensor is the binder's own, restated once here so the two
+/// cannot drift: `assembly::bind_layer` cuts the four output-parallel
+/// projections and both attention short convolutions by row and `wo` by
+/// column; `DeviceDense::dense_for` cuts the interleaved `w13_dn` by row (one
+/// contiguous run, because interleaving keeps each unit's gate and up
+/// adjacent -- [`super::tp::Tp::w13_interleaved_rows`]) and `w2_md` by column;
+/// `DeviceDense::shared_for` cuts the shared `w13` per expert block in
+/// whichever of its two readings `shared_w13_halved` selects, and the shared
+/// `w2` per expert block by column, which over the stacked
+/// `[n_shared * hidden, inter]` matrix is ONE column range.
+///
+/// Only `model.llm.layers.*`: the MTP heads wear the same suffixes and are
+/// bound whole by a binder that knows no split. Everything else -- the norm
+/// gains, the router projection, the MLP short convolution, the embedding and
+/// unembedding tables -- is replicated, so `None` is the correct answer and
+/// not a pass-through: none of it sits under a reduce.
+///
+/// A leaf this DOES know, at dims it does not expect, is an ERROR rather than
+/// left whole, for the reason [`routed_cut`] gives: the binder will trust that
+/// the copy cut it, and an uncut operand under the all-reduce is summed twice.
+pub fn dense_cut(
+    tp: crate::models::inkling::tp::Tp,
+    name: &str,
+    dims: &[u64],
+    shared_w13_halved: bool,
+) -> anyhow::Result<Option<DenseCut>> {
+    let Some(rest) = name
+        .strip_prefix("model.llm.layers.")
+        .and_then(|s| s.split_once('.'))
+        .map(|(_, rest)| rest)
+    else {
+        return Ok(None);
+    };
+    let d: Vec<usize> = dims.iter().map(|&x| x as usize).collect();
+    let lift = |e: crate::models::inkling::tp::Indivisible| anyhow::anyhow!("{name}: {e}");
+    let as_u64 = |v: &[usize]| v.iter().map(|&x| x as u64).collect::<Vec<u64>>();
+    // The leaf as a matrix: the leading dim by the product of the rest.
+    let matrix = || -> anyhow::Result<(usize, usize)> {
+        anyhow::ensure!(
+            d.len() >= 2,
+            "{name} is {dims:?}; this split cuts it as a matrix"
+        );
+        Ok((d[0], d[1..].iter().product()))
+    };
+    // A run of whole rows, on whichever head axis `axis` names.
+    let rows_on = |axis: &'static str| -> anyhow::Result<DenseCut> {
+        let (rows, cols) = matrix()?;
+        let r = tp.shard(axis, rows).map_err(lift)?;
+        let mut dims = d.clone();
+        dims[0] = r.len();
+        Ok(DenseCut {
+            rows,
+            cols,
+            keep: Keep::Rows(vec![r]),
+            dims: as_u64(&dims),
+        })
+    };
+    let cut = match rest {
+        // Output-parallel: whole rows of `[out, hidden]`, and the per-KV-head
+        // convolution state that follows the same head cut.
+        "attn.wq_du.weight" | "attn.wr_du.weight" => rows_on("num_attention_heads * head_dim")?,
+        "attn.wk_dv.weight"
+        | "attn.wv_dv.weight"
+        | "attn.k_sconv.weight"
+        | "attn.v_sconv.weight" => rows_on("num_key_value_heads * head_dim")?,
+        // Input-parallel: the columns matching the heads this rank computed.
+        "attn.wo_ud.weight" => {
+            anyhow::ensure!(
+                d.len() == 2,
+                "{name} is {dims:?}, not [hidden, heads * head_dim]"
+            );
+            let (rows, cols) = (d[0], d[1]);
+            let c = tp
+                .shard("num_attention_heads * head_dim", cols)
+                .map_err(lift)?;
+            DenseCut {
+                rows,
+                cols,
+                dims: vec![rows as u64, c.len() as u64],
+                keep: Keep::Cols(c),
+            }
+        }
+        // The dense MLP, stored INTERLEAVED `g0, u0, g1, u1, ...`: a rank's
+        // units are one contiguous run of `2 * inter / world` rows.
+        "mlp.w13_dn.weight" => {
+            anyhow::ensure!(d.len() == 2, "{name} is {dims:?}, not [2 * inter, hidden]");
+            let (rows, cols) = (d[0], d[1]);
+            anyhow::ensure!(
+                rows % 2 == 0,
+                "{name} is [{rows}, {cols}]; a fused gate/up matrix has an even row count"
+            );
+            let r = tp.w13_interleaved_rows(rows / 2).map_err(lift)?;
+            DenseCut {
+                rows,
+                cols,
+                dims: vec![r.len() as u64, cols as u64],
+                keep: Keep::Rows(vec![r]),
+            }
+        }
+        "mlp.w2_md.weight" => {
+            anyhow::ensure!(d.len() == 2, "{name} is {dims:?}, not [hidden, inter]");
+            let (rows, cols) = (d[0], d[1]);
+            let c = tp.dense_inter(cols).map_err(lift)?;
+            DenseCut {
+                rows,
+                cols,
+                dims: vec![rows as u64, c.len() as u64],
+                keep: Keep::Cols(c),
+            }
+        }
+        // The shared experts' fused `w13`, `[n_shared, 2 * inter, hidden]`:
+        // the same share of the intermediate axis out of EVERY expert block,
+        // laid out the way `split_shared_w13_bytes` will read the result.
+        "mlp.shared_experts.shared_w13_weight" => {
+            anyhow::ensure!(
+                d.len() == 3,
+                "{name} is {dims:?}, not [n_shared, 2 * inter, hidden]"
+            );
+            let (n_shared, two_inter, h) = (d[0], d[1], d[2]);
+            anyhow::ensure!(
+                two_inter % 2 == 0,
+                "{name} is {dims:?}; a fused gate/up block has an even row count"
+            );
+            let inter = two_inter / 2;
+            let mut runs = Vec::with_capacity(2 * n_shared);
+            for s in 0..n_shared {
+                let base = s * two_inter;
+                if shared_w13_halved {
+                    let (g, u) = tp.w13_halved_rows(inter).map_err(lift)?;
+                    runs.push(base + g.start..base + g.end);
+                    runs.push(base + u.start..base + u.end);
+                } else {
+                    let r = tp.w13_interleaved_rows(inter).map_err(lift)?;
+                    runs.push(base + r.start..base + r.end);
+                }
+            }
+            let kept = 2 * tp.share("intermediate_size", inter).map_err(lift)?;
+            DenseCut {
+                rows: n_shared * two_inter,
+                cols: h,
+                keep: Keep::Rows(runs),
+                dims: vec![n_shared as u64, kept as u64, h as u64],
+            }
+        }
+        // `[n_shared, hidden, inter]`: the blocks stack row-wise, so one column
+        // range of the `[n_shared * hidden, inter]` matrix is every block's
+        // column range, in block order -- what the bind-time gather produced.
+        "mlp.shared_experts.shared_w2_weight" => {
+            anyhow::ensure!(
+                d.len() == 3,
+                "{name} is {dims:?}, not [n_shared, hidden, inter]"
+            );
+            let (n_shared, h, inter) = (d[0], d[1], d[2]);
+            let c = tp.shared_inter(inter).map_err(lift)?;
+            DenseCut {
+                rows: n_shared * h,
+                cols: inter,
+                dims: vec![n_shared as u64, h as u64, c.len() as u64],
+                keep: Keep::Cols(c),
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(cut))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,5 +961,277 @@ mod tests {
             }
         );
         assert_eq!(c.to_string(), "2.0 MiB aliased + 1.0 MiB copied");
+    }
+
+    // ---- the dense cuts, byte for byte against the bind-time path ---------
+    //
+    // Each of these runs the cut the binder USED to make on a synthetic leaf,
+    // runs `dense_cut` + `copy_into` on the same leaf, and demands the same
+    // bytes. Small shapes, every element its own address, both ranks.
+
+    /// Apply a `DenseCut` the way `copy_share` does: into a slot of exactly
+    /// its size.
+    fn apply(cut: &DenseCut, src: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; cut.bytes(2)];
+        cut.copy_into(src, 2, &mut out).unwrap();
+        out
+    }
+
+    fn l(name: &str) -> String {
+        format!("model.llm.layers.3.{name}")
+    }
+
+    #[test]
+    fn the_projections_cut_by_row_exactly_as_the_binder_did() {
+        // wq [heads * head_dim, hidden] = [8, 4]; wo [hidden, heads * head_dim].
+        let b = slab(8, 4);
+        let s = Slab::new(&b, 8, 4, 2).unwrap();
+        for rank in 0..2 {
+            let t = Tp::new(rank, 2).unwrap();
+            let r = t.shard("rows", 8).unwrap();
+            let want = rows(&s, r.clone()).unwrap();
+            for nm in [
+                "attn.wq_du.weight",
+                "attn.wk_dv.weight",
+                "attn.wr_du.weight",
+            ] {
+                let c = dense_cut(t, &l(nm), &[8, 4], false).unwrap().unwrap();
+                assert_eq!(c.dims, vec![4, 4]);
+                assert_eq!(apply(&c, &b), want, "{nm} rank {rank}");
+            }
+            // The convolution state is rank 3 in the pile and cuts on its
+            // leading axis with the rest flattened.
+            let c = dense_cut(t, &l("attn.k_sconv.weight"), &[8, 1, 4], false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(c.dims, vec![4, 1, 4]);
+            assert_eq!(apply(&c, &b), want);
+        }
+    }
+
+    #[test]
+    fn wo_cuts_by_column_exactly_as_the_binder_did() {
+        let b = slab(4, 8);
+        let s = Slab::new(&b, 4, 8, 2).unwrap();
+        for rank in 0..2 {
+            let t = Tp::new(rank, 2).unwrap();
+            let want = cols(&s, t.shard("cols", 8).unwrap()).unwrap();
+            let c = dense_cut(t, &l("attn.wo_ud.weight"), &[4, 8], false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(c.dims, vec![4, 4]);
+            assert_eq!(apply(&c, &b), want, "rank {rank}");
+            // and NOT the row reading of the same numbers
+            assert_ne!(apply(&c, &b), rows(&s, t.shard("r", 4).unwrap()).unwrap());
+        }
+    }
+
+    /// The dense MLP: the binder de-interleaved the fused weight and THEN took
+    /// a row range of each half. The copy takes one contiguous run of the
+    /// interleaved weight, and de-interleaving THAT has to give the same two
+    /// halves.
+    #[test]
+    fn the_dense_w13_cut_deinterleaves_to_the_binders_halves() {
+        use crate::models::inkling::load::split_gate_up_bytes;
+        const INTER: usize = 8;
+        const H: usize = 4;
+        let fused = slab(2 * INTER, H);
+        for rank in 0..2 {
+            let t = Tp::new(rank, 2).unwrap();
+            // bind time
+            let (g, u) = split_gate_up_bytes(&fused, H, 2);
+            let r = t.dense_inter(INTER).unwrap();
+            let gs = Slab::new(&g, INTER, H, 2).unwrap();
+            let us = Slab::new(&u, INTER, H, 2).unwrap();
+            let want_g = rows(&gs, r.clone()).unwrap().to_vec();
+            let want_u = rows(&us, r.clone()).unwrap().to_vec();
+            // copy time
+            let c = dense_cut(
+                t,
+                &l("mlp.w13_dn.weight"),
+                &[2 * INTER as u64, H as u64],
+                false,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(c.dims, vec![INTER as u64, H as u64]);
+            let cut = apply(&c, &fused);
+            let (got_g, got_u) = split_gate_up_bytes(&cut, H, 2);
+            assert_eq!(got_g, want_g, "gate, rank {rank}");
+            assert_eq!(got_u, want_u, "up, rank {rank}");
+            // and w2 by column
+            let w2 = slab(H, INTER);
+            let ds = Slab::new(&w2, H, INTER, 2).unwrap();
+            let c2 = dense_cut(t, &l("mlp.w2_md.weight"), &[H as u64, INTER as u64], false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(apply(&c2, &w2), cols(&ds, r).unwrap());
+        }
+    }
+
+    /// The shared experts, in BOTH readings of the fused block: the binder
+    /// split the whole weight and then took rows `e * inter + r` of each half
+    /// for each expert `e`; the copy takes the runs and the split of the cut
+    /// weight at the LOCAL width has to agree.
+    #[test]
+    fn the_shared_w13_cut_splits_to_the_binders_per_expert_rows() {
+        use crate::models::inkling::load::split_shared_w13_bytes;
+        const NS: usize = 2;
+        const INTER: usize = 8;
+        const H: usize = 4;
+        let fused = slab(NS * 2 * INTER, H);
+        for halved in [false, true] {
+            for rank in 0..2 {
+                let t = Tp::new(rank, 2).unwrap();
+                let r = t.shared_inter(INTER).unwrap();
+                // bind time: `DeviceDense::shared_for`'s `per_expert_rows`
+                let (g, u) = split_shared_w13_bytes(&fused, NS, INTER, H, halved, 2);
+                let per = |src: &[u8]| -> Vec<u8> {
+                    let s = Slab::new(src, NS * INTER, H, 2).unwrap();
+                    let mut out = Vec::new();
+                    for e in 0..NS {
+                        out.extend_from_slice(
+                            rows(&s, e * INTER + r.start..e * INTER + r.end).unwrap(),
+                        );
+                    }
+                    out
+                };
+                let (want_g, want_u) = (per(&g), per(&u));
+                // copy time
+                let c = dense_cut(
+                    t,
+                    &l("mlp.shared_experts.shared_w13_weight"),
+                    &[NS as u64, 2 * INTER as u64, H as u64],
+                    halved,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(c.dims, vec![NS as u64, INTER as u64, H as u64]);
+                let cut = apply(&c, &fused);
+                let (got_g, got_u) = split_shared_w13_bytes(&cut, NS, INTER / 2, H, halved, 2);
+                assert_eq!(got_g, want_g, "gate, halved={halved} rank {rank}");
+                assert_eq!(got_u, want_u, "up, halved={halved} rank {rank}");
+                // The two readings cut DIFFERENT rows of the same leaf, or
+                // the flag is not doing anything here.
+                let other = dense_cut(
+                    t,
+                    &l("mlp.shared_experts.shared_w13_weight"),
+                    &[NS as u64, 2 * INTER as u64, H as u64],
+                    !halved,
+                )
+                .unwrap()
+                .unwrap();
+                assert_ne!(apply(&other, &fused), cut);
+            }
+        }
+    }
+
+    #[test]
+    fn the_shared_w2_cut_is_the_binders_per_expert_column_gather() {
+        const NS: usize = 2;
+        const INTER: usize = 8;
+        const H: usize = 4;
+        let w2 = slab(NS * H, INTER);
+        for rank in 0..2 {
+            let t = Tp::new(rank, 2).unwrap();
+            let r = t.shared_inter(INTER).unwrap();
+            // bind time: per expert block, a column gather
+            let mut want = Vec::new();
+            for e in 0..NS {
+                let blk = &w2[e * H * INTER * 2..(e + 1) * H * INTER * 2];
+                let s = Slab::new(blk, H, INTER, 2).unwrap();
+                want.extend_from_slice(&cols(&s, r.clone()).unwrap());
+            }
+            let c = dense_cut(
+                t,
+                &l("mlp.shared_experts.shared_w2_weight"),
+                &[NS as u64, H as u64, INTER as u64],
+                false,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(c.dims, vec![NS as u64, H as u64, INTER as u64 / 2]);
+            assert_eq!(apply(&c, &w2), want, "rank {rank}");
+        }
+    }
+
+    /// Both ranks' dense cuts TILE every leaf they cut: no byte twice, none
+    /// dropped. The row cuts concatenate back; the column cuts interleave.
+    #[test]
+    fn both_ranks_dense_cuts_tile_every_leaf() {
+        let cases: [(&str, Vec<u64>); 6] = [
+            ("attn.wq_du.weight", vec![8, 4]),
+            ("attn.wo_ud.weight", vec![4, 8]),
+            ("mlp.w13_dn.weight", vec![16, 4]),
+            ("mlp.w2_md.weight", vec![4, 8]),
+            ("mlp.shared_experts.shared_w13_weight", vec![2, 16, 4]),
+            ("mlp.shared_experts.shared_w2_weight", vec![2, 4, 8]),
+        ];
+        for (nm, dims) in cases {
+            let n: usize = dims.iter().product::<u64>() as usize;
+            let src: Vec<u8> = (0..n * 2).map(|i| (i % 251) as u8).collect();
+            let (a, b) = (Tp::new(0, 2).unwrap(), Tp::new(1, 2).unwrap());
+            let ca = dense_cut(a, &l(nm), &dims, false).unwrap().unwrap();
+            let cb = dense_cut(b, &l(nm), &dims, false).unwrap().unwrap();
+            let (pa, pb) = (apply(&ca, &src), apply(&cb, &src));
+            assert_eq!(pa.len() + pb.len(), src.len(), "{nm}");
+            let mut seen: Vec<u8> = pa.iter().chain(pb.iter()).copied().collect();
+            let mut all = src.clone();
+            seen.sort();
+            all.sort();
+            assert_eq!(seen, all, "{nm}: the two shares are not the whole leaf");
+        }
+    }
+
+    /// What is NOT cut: the MTP heads (same suffixes, a binder that knows no
+    /// split), and every replicated leaf. And a known leaf at the wrong rank
+    /// is refused rather than left whole.
+    #[test]
+    fn replicated_leaves_and_the_mtp_heads_are_left_whole_and_wrong_dims_refuse() {
+        let t = Tp::new(0, 2).unwrap();
+        assert_eq!(
+            dense_cut(
+                t,
+                "model.mtp.layers.0.transformer_block.attn.wq_du.weight",
+                &[8, 4],
+                false
+            )
+            .unwrap(),
+            None
+        );
+        for nm in [
+            "attn.q_norm.weight",
+            "attn.rel_logits_proj.proj",
+            "attn_norm.weight",
+            "mlp.gate.weight",
+            "mlp.sconv.weight",
+            "mlp.global_scale",
+        ] {
+            assert_eq!(dense_cut(t, &l(nm), &[8, 4], false).unwrap(), None, "{nm}");
+        }
+        assert_eq!(
+            dense_cut(t, "model.llm.unembed.weight", &[16, 4], false).unwrap(),
+            None
+        );
+        // A shared w13 that is not rank 3 is not a leaf this knows how to
+        // cut, and the binder would trust that it had been.
+        assert!(
+            dense_cut(
+                t,
+                &l("mlp.shared_experts.shared_w13_weight"),
+                &[32, 4],
+                false
+            )
+            .is_err()
+        );
+        assert!(dense_cut(t, &l("attn.wo_ud.weight"), &[4, 2, 4], false).is_err());
+        // The identity world cuts everything to itself.
+        let one = Tp::default();
+        let c = dense_cut(one, &l("attn.wq_du.weight"), &[8, 4], false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.dims, vec![8, 4]);
+        let b = slab(8, 4);
+        assert_eq!(apply(&c, &b), b);
     }
 }
