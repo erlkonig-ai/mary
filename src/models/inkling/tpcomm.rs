@@ -536,7 +536,8 @@ impl Group {
     /// never while a collective is in flight.
     pub fn agree(&mut self, digest: [u8; 32]) -> Result<()> {
         for peer in self.socks.iter_mut() {
-            peer.write_all(&digest).context("send the sequence digest")?;
+            peer.write_all(&digest)
+                .context("send the sequence digest")?;
             peer.flush().ok();
         }
         for (index, peer) in self.socks.iter_mut().enumerate() {
@@ -991,10 +992,12 @@ mod tests {
         assert_eq!(Pass::Extend(vec![9]).encode().len(), 13);
 
         let error = Pass::decode(0xFE, Vec::new()).expect_err("an unknown tag must refuse");
-        assert!(error.to_string().contains("not the same build"), "{error:#}");
+        assert!(
+            error.to_string().contains("not the same build"),
+            "{error:#}"
+        );
 
-        let error =
-            Pass::decode(0x03, vec![1]).expect_err("a Step pass carries no ids");
+        let error = Pass::decode(0x03, vec![1]).expect_err("a Step pass carries no ids");
         assert!(error.to_string().contains("no token ids"), "{error:#}");
     }
 }

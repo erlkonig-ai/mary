@@ -74,6 +74,11 @@ MODEL:
     --prefill-budget <n>    Maximum tokens processed in one prefill pass
     --context-budget <n>    Maximum positions retained (default: the prefill budget)
     --sealed                Reject execution-changing environment overrides
+    --allow-partial         Run against a STRICT SUBRANGE of the stack, whose
+                            tokens are diagnostic and NOT the model's. The only
+                            way to exercise this loop on one box, and the
+                            replacement for the deleted inkling_serve_gate.
+                            Never for a real run.
     --system <text>         System prompt
 
 TENSOR PARALLELISM (both flags together, or neither):
@@ -127,6 +132,7 @@ struct Options {
     prefill_budget: Option<usize>,
     context_budget: Option<usize>,
     sealed: bool,
+    allow_partial: bool,
     tp_world: Option<usize>,
     tp_rendezvous: Option<String>,
     system: String,
@@ -160,6 +166,7 @@ impl Default for Options {
             prefill_budget: None,
             context_budget: None,
             sealed: false,
+            allow_partial: false,
             tp_world: None,
             tp_rendezvous: None,
             system: DEFAULT_SYSTEM.to_string(),
@@ -221,6 +228,7 @@ impl Options {
                     );
                 }
                 "--sealed" => options.sealed = true,
+                "--allow-partial" => options.allow_partial = true,
                 "--tp-world" => {
                     options.tp_world = Some(
                         next(&mut index, "--tp-world")?
@@ -453,13 +461,31 @@ impl RunObservations {
     }
 }
 
-fn validate_ready(ready: &Ready) -> Result<()> {
-    anyhow::ensure!(
-        !ready.partial,
-        "this rank loaded a partial stack; its tokens are diagnostic, not the model's. A \
-         full-stack resident run needs --layers 0:<stack> with --tp-world/--tp-rendezvous, \
-         because 144 GiB of weights do not fit one 121 GiB box"
-    );
+/// Refuse a load that cannot produce the model's own tokens, and check that the
+/// execution identity is one.
+///
+/// `allow_partial` is the one escape, and it is loud rather than silent because
+/// a partial stack unembeds through layers it did not all run: the text is
+/// fluent and WRONG, which is the failure mode a flag has to shout about. It
+/// exists because the deleted `inkling_serve_gate` was the only way to drive
+/// this loop on one box, and losing that would mean every smoke test costs both
+/// Sparks and a 171 GB load.
+fn validate_ready(ready: &Ready, allow_partial: bool) -> Result<()> {
+    if ready.partial {
+        anyhow::ensure!(
+            allow_partial,
+            "this rank loaded a partial stack; its tokens are diagnostic, not the model's. A \
+             full-stack resident run needs --layers 0:<stack> with --tp-world/--tp-rendezvous, \
+             because 144 GiB of weights do not fit one 121 GiB box. Pass --allow-partial only \
+             to exercise the LOOP, never to read the answer."
+        );
+        eprintln!(
+            "inkling_drive: WARNING — PARTIAL STACK (layers {}..{} of {}). Every token this run \
+             produces is diagnostic: the head unembeds through layers that did not run, so the \
+             text will be fluent and wrong. --allow-partial exercises the loop, not the model.",
+            ready.layers[0], ready.layers[1], ready.stack,
+        );
+    }
     anyhow::ensure!(
         matches!(
             ready.execution_profile.as_str(),
@@ -565,7 +591,11 @@ fn report_turns(log: &[TurnEnd], proofs: &[StreamProof]) {
 
 /// Rank 1: no Drive, no pile, no sandbox, no tokenizer. Replay rank 0's passes.
 fn run_follower(mut follower: engine::Follower) -> Result<()> {
-    validate_ready(follower.ready())?;
+    // A tensor-parallel rank always runs the full range, so this can never fire
+    // — but a follower that somehow loaded a subrange would be a rank silently
+    // computing a different model than its leader, which is the worst failure
+    // available. It is checked, not assumed.
+    validate_ready(follower.ready(), false)?;
     eprintln!(
         "inkling_drive: FOLLOWER — rank {:?} of {}, layers {}..{}, {} {}. This box owns no \
          cognition pile and makes no decisions; it replays rank 0's passes.",
@@ -595,7 +625,7 @@ fn run(options: Options) -> Result<()> {
 
     let max_response_tokens = usize::try_from(options.budget.max_output_tokens)
         .context("--max-output does not fit this platform's token index")?;
-    validate_ready(engine.ready())?;
+    validate_ready(engine.ready(), options.allow_partial)?;
     anyhow::ensure!(
         max_response_tokens.saturating_add(1) <= engine.ready().context_budget,
         "the {max_response_tokens}-token response cap plus its one-token carry/prompt admission \

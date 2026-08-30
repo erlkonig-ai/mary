@@ -1261,7 +1261,6 @@ fn one_token_association(end: &TurnEnd, fragments: String) -> Result<(u32, Strin
     Ok((end.token_ids[0], fragments))
 }
 
-
 // ── the model seam ──────────────────────────────────────────────────────────
 
 /// What [`InklingMind`] needs of the model, and nothing more.
@@ -2433,9 +2432,9 @@ mod tests {
         expected: usize,
     ) {
         let calls = calls(log);
-        let mut calls = calls.iter().filter(|call| {
-            !matches!(call, ModelCall::Preflight(_) | ModelCall::Shutdown)
-        });
+        let mut calls = calls
+            .iter()
+            .filter(|call| !matches!(call, ModelCall::Preflight(_) | ModelCall::Shutdown));
         assert!(
             matches!(
                 calls.next(),
@@ -2462,10 +2461,7 @@ mod tests {
             Ok(())
         }
 
-        fn preflight_context(
-            &mut self,
-            request: &ContextPreflight,
-        ) -> Result<ContextPreflighted> {
+        fn preflight_context(&mut self, request: &ContextPreflight) -> Result<ContextPreflighted> {
             self.record(ModelCall::Preflight(request.placement));
             if let Some(evidence) = &self.preflight_override {
                 return Ok(evidence.clone());
@@ -2553,7 +2549,10 @@ mod tests {
         sequence: &[(u32, &str)],
         max_response_tokens: usize,
         system: &str,
-    ) -> (InklingMind, std::sync::Arc<std::sync::Mutex<Vec<ModelCall>>>) {
+    ) -> (
+        InklingMind,
+        std::sync::Arc<std::sync::Mutex<Vec<ModelCall>>>,
+    ) {
         let model = ScriptedModel::new(fake_ready("scripted.pile"), sequence);
         let log = model.log();
         let mind = InklingMind::new_gate(
@@ -2564,7 +2563,6 @@ mod tests {
         .expect("valid READY evidence");
         (mind, log)
     }
-
 
     #[test]
     fn exact_context_admission_covers_initial_generation_and_tool_deltas() {
@@ -2610,7 +2608,6 @@ mod tests {
         assert_eq!(evidence.required_end, None);
         assert!(!evidence.fits);
     }
-
 
     #[test]
     fn execution_manifest_is_deterministic_and_length_delimited() {
@@ -2684,7 +2681,6 @@ mod tests {
             load_secs: 1.0,
         }
     }
-
 
     fn special_fragment(ids: &InklingSpecialIds, id: u32, pending: &str) -> String {
         format!(
@@ -2978,7 +2974,6 @@ mod tests {
         second.tokens = 2;
         assert!(aggregate_microturns(9, &[first, second], "cancelled").is_err());
     }
-
 
     #[cfg(feature = "tokenizer")]
     fn miniature_tokenizer_json() -> Vec<u8> {
@@ -3397,7 +3392,6 @@ mod tests {
         assert!(!delta.text.is_empty(), "pending payload was not discarded");
     }
 
-
     fn fake_end(token_ids: &[u32]) -> TurnEnd {
         TurnEnd {
             turn: 0,
@@ -3411,7 +3405,6 @@ mod tests {
             position: 8,
         }
     }
-
 
     #[test]
     fn a_typed_drive_result_crosses_the_text_only_seam_deliberately() {
