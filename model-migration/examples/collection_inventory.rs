@@ -13,11 +13,10 @@ use anyhow::{anyhow, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::{Blob, TryFromBlob};
-use triblespace::core::collection::records::{collection_name, collection_namespace};
+use triblespace::core::collection::descriptor;
 use triblespace::core::collection::CollectionRecord;
-use triblespace::core::inline::encodings::ed25519::ED25519PublicKey;
-use triblespace::core::inline::encodings::shortstring::ShortString;
 use triblespace::core::trible::TribleSet;
 use triblespace::prelude::*;
 
@@ -72,26 +71,23 @@ fn inventory(pile: &mut Pile) -> Result<()> {
             println!("  <descriptor blob undecodable>            commits {commits}");
             continue;
         };
-        let mut name = None;
-        let mut team = None;
-        for fact in facts.iter() {
-            if *fact.a() == collection_name.id() {
-                name = fact.v::<ShortString>().try_from_inline::<String>().ok();
-            } else if *fact.a() == collection_namespace.id() {
-                team = fact
-                    .v::<ED25519PublicKey>()
-                    .raw
+        let name = descriptor::name(&facts)
+            .ok()
+            .flatten()
+            .and_then(|handle| reader.get::<Blob<UTF8String>, _>(handle).ok())
+            .and_then(|blob| std::str::from_utf8(&blob.bytes).ok().map(str::to_owned))
+            .unwrap_or_else(|| "<unnamed>".to_string());
+        let authority = descriptor::authority(&facts)
+            .map(|key| {
+                key.as_bytes()
                     .iter()
-                    .map(|b| format!("{b:02x}"))
+                    .map(|byte| format!("{byte:02x}"))
                     .collect::<String>()
-                    .into();
-            }
-        }
-        let name = name.unwrap_or_else(|| "<unnamed>".to_string());
-        let team = team.unwrap_or_else(|| "<no team>".to_string());
+            })
+            .unwrap_or_else(|_| "<no authority>".to_string());
         println!(
-            "  {name:<24} team {}…  commits {commits}",
-            &team[..16.min(team.len())]
+            "  {name:<24} authority {}…  commits {commits}",
+            &authority[..16.min(authority.len())]
         );
         named.insert(name);
     }

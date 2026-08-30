@@ -9,7 +9,7 @@ use crate::leaf::{Elem, Leaf};
 use crate::nn::weight_loader::WeightLoader;
 use crate::selection::{ModelSelector, index_keymap_for_root, select_model_root};
 use std::collections::HashMap;
-use triblespace::core::collection::CollectionSnapshot;
+use triblespace::core::collection::FactSnapshot;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::prelude::*;
 
@@ -37,9 +37,9 @@ pub struct VoxtralWeights<R> {
 
 impl<R: BlobStoreGet> VoxtralWeights<R> {
     /// Select and validate the exact/f16 pair from one already-frozen snapshot.
-    pub fn from_snapshot(snapshot: CollectionSnapshot<R>) -> anyhow::Result<Self> {
+    pub fn from_snapshot(snapshot: FactSnapshot<R>) -> anyhow::Result<Self> {
         fn select(
-            snapshot: &CollectionSnapshot<impl BlobStoreGet>,
+            snapshot: &FactSnapshot<impl BlobStoreGet>,
             quantization: &str,
         ) -> anyhow::Result<(Id, HashMap<String, Leaf>)> {
             let root = select_model_root(

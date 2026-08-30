@@ -10,7 +10,9 @@ use anyhow::{Context, Result};
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let pile = args.next().context("usage: select_check <pile> <source> <quantization> [tokenizer-name]")?;
+    let pile = args
+        .next()
+        .context("usage: select_check <pile> <source> <quantization> [tokenizer-name]")?;
     let source = args.next().context("missing <source>")?;
     let quantization = args.next().context("missing <quantization>")?;
     let tokenizer = args.next();
@@ -20,7 +22,11 @@ fn main() -> Result<()> {
         .context("load locally admitted native collection")?;
     println!("pile {}", pile.display());
     println!("team {}", hex(&team.to_bytes()));
-    println!("{} commit(s) in ticket, {} facts", snapshot.commits().len(), snapshot.facts().len());
+    println!(
+        "{} member(s) in cover, {} facts",
+        snapshot.cover().len(),
+        snapshot.facts().len()
+    );
 
     let root = mary::selection::select_model_root(
         snapshot.facts(),
@@ -33,9 +39,8 @@ fn main() -> Result<()> {
     .with_context(|| format!("select model root for ({source:?}, {quantization:?})"))?;
     println!("selected root {root}");
 
-    let keymap =
-        mary::selection::index_keymap_for_root(snapshot.facts(), snapshot.reader(), root)
-            .context("index the selected root's tensor handles")?;
+    let keymap = mary::selection::index_keymap_for_root(snapshot.facts(), snapshot.reader(), root)
+        .context("index the selected root's tensor handles")?;
     println!("{} tensor handles", keymap.len());
     let mut names: Vec<&String> = keymap.keys().collect();
     names.sort();

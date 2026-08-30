@@ -1982,8 +1982,9 @@ fn main() -> Result<()> {
             .document("config.json")
             .context(
                 "this pile carries no config.json. Ingest the checkpoint's \
-                 sidecars as facts (inkling_meta_gate <ckpt> <pile>), or point \
-                 INK_CONFIG at the file to run without them",
+                 sidecars as facts (inkling_meta_gate <ckpt> <pile> \
+                 --signing-key <existing-key>), or point INK_CONFIG at the file \
+                 to run without them",
             )?
             .to_string(),
     };

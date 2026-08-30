@@ -28,7 +28,6 @@ mod imp {
     use mary::models::qwen3tts::talker::Talker;
     use mary::nn::backend::{BFusedHalf, WgpuDevice};
     use mary::nn::weight_loader::{AliasedPile, WeightLoader};
-    use mary::selection::ModelSelector;
     use mary::speak::{QUANTIZATION_F16, Qwen3TtsVariant, Qwen3TtsWeights};
     use std::path::Path;
     use std::time::Instant;
@@ -44,20 +43,11 @@ mod imp {
     }
 
     fn select_index(
-        snapshot: &triblespace::core::collection::CollectionSnapshot<
+        snapshot: &triblespace::core::collection::FactSnapshot<
             triblespace::core::repo::pile::PileReader,
         >,
-        source: &str,
-        quantization: &str,
+        root: triblespace::prelude::Id,
     ) -> anyhow::Result<std::collections::HashMap<String, mary::leaf::Leaf>> {
-        let root = mary::selection::select_model_root(
-            snapshot.facts(),
-            snapshot.reader(),
-            ModelSelector::Source {
-                source,
-                quantization,
-            },
-        )?;
         mary::selection::index_keymap_for_root(snapshot.facts(), snapshot.reader(), root)
     }
 
@@ -72,7 +62,7 @@ mod imp {
         let folded_source = variant.folded_f16_source();
 
         eprintln!("[qwen3tts] importing exact base {base_source}");
-        let (base_root, base_commit) = mary::persist::import_model_to_collection(
+        let (base_root, _base_commit) = mary::persist::import_model_to_collection(
             pile,
             signing_key,
             model_dir,
@@ -95,7 +85,7 @@ mod imp {
         )?;
 
         eprintln!("[qwen3tts] importing filtered f16 talker {talker_source}");
-        let (talker_root, talker_commit) =
+        let (talker_root, _talker_commit) =
             mary::persist::import_safetensors_file_filtered_to_collection(
                 pile,
                 signing_key,
@@ -106,23 +96,15 @@ mod imp {
                 is_gpu_talker_tensor,
             )?;
 
-        // Freeze exactly the two roots needed to compute the fold. The shared
-        // codec is deliberately absent: Talker construction needs only the
-        // base's exact CPU stages and the filtered f16 GPU tensors.
-        // The same team the imports above published under: an existing model
-        // graph's team, or this key as a team of one on a fresh pile.
+        // Freeze one admitted collection cover, then bind the fold to the two
+        // exact content roots returned by this invocation. Other collection
+        // members, including the shared codec and stale coordinate conflicts,
+        // cannot widen root-addressed selection.
         let team = mary::model_collection::model_graph_team_or_own(pile, signing_key)?;
-        let source_snapshot = mary::model_collection::snapshot_model_collection_exact(
-            pile,
-            team,
-            &[base_commit, talker_commit],
-        )?;
-        let exact = select_index(
-            &source_snapshot,
-            &base_source,
-            mary::persist::QUANTIZATION_NATIVE,
-        )?;
-        let talker_f16 = select_index(&source_snapshot, &talker_source, QUANTIZATION_F16)?;
+        let source_snapshot =
+            mary::model_collection::snapshot_model_collection_local_latest(pile, team)?;
+        let exact = select_index(&source_snapshot, base_root)?;
+        let talker_f16 = select_index(&source_snapshot, talker_root)?;
         drop(source_snapshot);
 
         eprintln!("[qwen3tts] deriving versioned folded f16 talker {folded_source}");

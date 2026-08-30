@@ -56,7 +56,7 @@ use std::time::Instant;
 
 use burn::prelude::Backend;
 use rand::SeedableRng;
-use triblespace::core::collection::CollectionSnapshot;
+use triblespace::core::collection::FactSnapshot;
 use triblespace::prelude::BlobStoreGet;
 
 use crate::leaf::{Elem, Leaf};
@@ -179,7 +179,7 @@ pub struct Qwen3TtsWeights {
 
 impl Qwen3TtsWeights {
     pub fn from_snapshot<R: BlobStoreGet>(
-        snapshot: CollectionSnapshot<R>,
+        snapshot: FactSnapshot<R>,
         variant: Qwen3TtsVariant,
     ) -> anyhow::Result<Self> {
         fn select(

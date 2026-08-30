@@ -286,7 +286,14 @@ mod tests {
             key.verifying_key(),
         )
         .unwrap();
-        assert_eq!(snapshot.commits(), &[first]);
+        assert_eq!(snapshot.cover().len(), 1);
+        assert!(
+            snapshot
+                .cover()
+                .contains(triblespace::prelude::inlineencodings::Handle::<
+                    triblespace::prelude::blobencodings::SimpleArchive,
+                >::from_hash(first.data()))
+        );
         mary::selection::load_keymap_from_graph(
             snapshot.facts(),
             snapshot.reader(),
@@ -335,7 +342,7 @@ mod tests {
             key.verifying_key(),
         )
         .unwrap();
-        assert!(snapshot.commits().is_empty());
+        assert!(snapshot.cover().is_empty());
         pile.close().unwrap();
     }
 
@@ -384,7 +391,7 @@ mod tests {
             key.verifying_key(),
         )
         .unwrap();
-        assert!(snapshot.commits().is_empty());
+        assert!(snapshot.cover().is_empty());
         pile.close().unwrap();
     }
 
@@ -434,7 +441,7 @@ mod tests {
             key.verifying_key(),
         )
         .unwrap();
-        assert!(snapshot.commits().is_empty());
+        assert!(snapshot.cover().is_empty());
         pile.close().unwrap();
     }
 }

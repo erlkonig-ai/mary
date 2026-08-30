@@ -5,7 +5,7 @@
 //! (gated by `smolvla_pile_test`).
 //!
 //!   cargo run --release --features import --bin smolvla_persist -- \
-//!     <model-dir-or-file> <pile-path>
+//!     <model-dir-or-file> <pile-path> <signing-key>
 //!
 //! `<model-dir-or-file>` is the HF snapshot dir holding `model.safetensors`
 //! (or the file itself).
@@ -14,15 +14,17 @@ use mary::ingest::LeafDtype;
 use mary::persist::{persist_safetensors_files_to_pile, persist_safetensors_to_pile};
 use std::path::Path;
 use std::time::Instant;
+use triblespace::core::signing_key_file;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("usage: smolvla_persist <model-dir-or-file> <pile-path>");
+    if args.len() != 4 {
+        eprintln!("usage: smolvla_persist <model-dir-or-file> <pile-path> <signing-key>");
         std::process::exit(2);
     }
     let src = Path::new(&args[1]);
     let pile_path = Path::new(&args[2]);
+    let signing_key = signing_key_file::load_existing(Path::new(&args[3]))?;
 
     let t = Instant::now();
     eprintln!("Persisting SmolVLA from {src:?} → {pile_path:?} ...");
@@ -30,10 +32,11 @@ fn main() -> anyhow::Result<()> {
         persist_safetensors_files_to_pile(
             &[(src.to_path_buf(), "smolvla_base.safetensors".to_string())],
             pile_path,
+            &signing_key,
             LeafDtype::F32,
         )?;
     } else {
-        persist_safetensors_to_pile(src, pile_path, LeafDtype::F32)?;
+        persist_safetensors_to_pile(src, pile_path, &signing_key, LeafDtype::F32)?;
     }
     let secs = t.elapsed().as_secs_f64();
 

@@ -2,7 +2,7 @@
 //!
 //! This binary deliberately has no checkpoint reader or HuggingFace client.
 //! Each subcommand names an existing pile, key, and complete legacy authority;
-//! stdout is the full signed native collection ticket needed for an exact read.
+//! stdout is the full signed native collection claim produced by the migration.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -216,9 +216,8 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Machine-readable stdout: exactly the complete 192-byte signed ticket,
-    // lowercase hex plus the conventional trailing newline. An exact reader
-    // can reconstruct CollectionCommit::from_bytes from these 384 digits.
+    // Machine-readable stdout: exactly the complete 192-byte signed claim,
+    // lowercase hex plus the conventional trailing newline.
     println!("{}", lowercase_hex(&commit.to_bytes()));
     Ok(())
 }
@@ -228,7 +227,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ticket_hex_is_exact_and_lowercase() {
+    fn commit_hex_is_exact_and_lowercase() {
         let bytes: Vec<u8> = (0..192).map(|index| index as u8).collect();
         let encoded = lowercase_hex(&bytes);
         assert_eq!(encoded.len(), 384);

@@ -35,14 +35,12 @@ fn main() -> Result<()> {
         }
     };
     println!("bundle team {}", hex(&team.to_bytes()));
-    let (_, ticket, reader) = snapshot.into_parts();
-    println!("ticket commits {}", ticket.len());
+    let (_, cover, reader) = snapshot.into_parts();
+    println!("cover members {}", cover.len());
 
-    for commit in &ticket {
+    for member in cover.members() {
         let token_blob: Blob<SimpleArchive> = reader
-            .get(inlineencodings::Handle::<SimpleArchive>::from_hash(
-                commit.data(),
-            ))
+            .get(member)
             .map_err(|e| anyhow!("read bundle token: {e}"))?;
         let token = TribleSet::try_from_blob(token_blob).context("decode bundle token")?;
         println!("  token rows {}", token.len());

@@ -29,7 +29,7 @@ use crate::selection::{ModelSelector, SelectedModelIndex};
 use ed25519_dalek::VerifyingKey;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::{Blob, TryFromBlob};
-use triblespace::core::collection::{CollectionCommit, CollectionData, CollectionSnapshot};
+use triblespace::core::collection::{CollectionData, FactCover, FactSnapshot};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::prelude::{BlobStoreGet, Id, Inline, TribleSet, blobencodings, inlineencodings};
@@ -55,7 +55,7 @@ pub struct PersonaPlexAuthority {
     model_root: Id,
     model_archive_data: CollectionData,
     bundle_token_data: CollectionData,
-    ticket: Vec<CollectionCommit>,
+    cover: FactCover,
 }
 
 impl PersonaPlexAuthority {
@@ -77,9 +77,9 @@ impl PersonaPlexAuthority {
         self.bundle_token_data
     }
 
-    /// Complete exact source ticket frozen with this loader.
-    pub fn ticket(&self) -> &[CollectionCommit] {
-        &self.ticket
+    /// Exact admitted source cover frozen with this loader.
+    pub fn cover(&self) -> &FactCover {
+        &self.cover
     }
 }
 
@@ -151,49 +151,38 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
     }
 
     /// Select PersonaPlex from individually self-contained signed bundle
-    /// tokens, retaining the frozen ticket and exact `(root, H, τ)` identity.
+    /// tokens, retaining the frozen cover and exact `(root, H, τ)` identity.
     pub fn find_in_bundle_snapshot(
         team: VerifyingKey,
-        snapshot: CollectionSnapshot<R>,
+        snapshot: FactSnapshot<R>,
     ) -> anyhow::Result<Option<PersonaPlexBundle<R>>>
     where
         R: Clone,
     {
         use anyhow::{Context, anyhow};
-        use std::collections::BTreeSet;
-
-        let (_, ticket, reader) = snapshot.into_parts();
+        let (_, cover, reader) = snapshot.into_parts();
         let expected_collection = crate::model_collection::model_bundle_collection_handle(team);
         anyhow::ensure!(
-            ticket
-                .iter()
-                .all(|commit| commit.collection() == expected_collection),
-            "bundle snapshot contains a COMMIT outside the collection derived from the supplied team"
+            cover.collection().handle() == expected_collection,
+            "bundle snapshot belongs to a collection outside the supplied team"
         );
-        let mut seen_tokens = BTreeSet::new();
         let mut selected: Option<(Self, Id, CollectionData, CollectionData)> = None;
-        for commit in &ticket {
-            if !seen_tokens.insert(commit.data()) {
-                continue;
-            }
+        for token_handle in cover.members() {
+            let token_data = inlineencodings::Handle::<SimpleArchive>::to_hash(token_handle);
             let token_blob: Blob<SimpleArchive> = reader
-                .get(inlineencodings::Handle::<SimpleArchive>::from_hash(
-                    commit.data(),
-                ))
-                .map_err(|error| anyhow!("read bundle token {}: {error}", commit.id()))?;
+                .get(token_handle)
+                .map_err(|error| anyhow!("read bundle token {token_handle:?}: {error}"))?;
             let token = TribleSet::try_from_blob(token_blob)
-                .with_context(|| format!("decode bundle token {}", commit.id()))?;
+                .with_context(|| format!("decode bundle token {token_handle:?}"))?;
             anyhow::ensure!(
                 token.len() == 1,
-                "bundle COMMIT {} data must be exactly one token row, found {}",
-                commit.id(),
+                "bundle member {token_handle:?} must be exactly one token row, found {}",
                 token.len()
             );
             let fact = token.iter().next().expect("one-row bundle token");
             anyhow::ensure!(
                 fact.a() == &metadata::archive.id(),
-                "bundle COMMIT {} token does not use metadata::archive",
-                commit.id()
+                "bundle member {token_handle:?} does not use metadata::archive"
             );
             let root = *fact.e();
             let model_archive_data = inlineencodings::Handle::<SimpleArchive>::to_hash(
@@ -204,21 +193,17 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
                     model_archive_data,
                 ))
                 .map_err(|error| {
-                    anyhow!("read model archive H for bundle {}: {error}", commit.id())
+                    anyhow!("read model archive H for bundle {token_handle:?}: {error}")
                 })?;
             triblespace::core::collection::simplearchive_union::validate_element(&source_blob)
                 .map_err(|error| {
-                    anyhow!(
-                        "model archive H for bundle {} is not canonical: {error}",
-                        commit.id()
-                    )
+                    anyhow!("model archive H for bundle {token_handle:?} is not canonical: {error}")
                 })?;
             let facts = TribleSet::try_from_blob(source_blob)
-                .with_context(|| format!("decode model archive H for bundle {}", commit.id()))?;
+                .with_context(|| format!("decode model archive H for bundle {token_handle:?}"))?;
             anyhow::ensure!(
                 facts.iter().any(|row| row.e() == &root),
-                "bundle COMMIT {} asserts root {root} absent from H",
-                commit.id()
+                "bundle member {token_handle:?} asserts root {root} absent from H",
             );
 
             let native = triblespace::prelude::exists!(triblespace::prelude::pattern!(
@@ -254,7 +239,7 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
                 crate::persist::QUANTIZATION_NATIVE,
             )
             .with_context(|| {
-                format!("validate PersonaPlex coordinates in bundle {}", commit.id())
+                format!("validate PersonaPlex coordinates in bundle {token_handle:?}")
             })?;
 
             // The signed token already names the exact root. Bind selection to
@@ -265,11 +250,10 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
                 reader.clone(),
                 ModelSelector::Root(root),
             )?)
-            .with_context(|| format!("validate PersonaPlex bundle {}", commit.id()))?;
+            .with_context(|| format!("validate PersonaPlex bundle {token_handle:?}"))?;
             anyhow::ensure!(
                 weights.root() == root,
-                "bundle COMMIT {} asserts root {root}, but H selects {}",
-                commit.id(),
+                "bundle member {token_handle:?} asserts root {root}, but H selects {}",
                 weights.root()
             );
             if let Some((_, existing_root, existing_h, _)) = &selected {
@@ -278,7 +262,7 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
                     "ambiguous PersonaPlex bundle authority: ({existing_root}, {existing_h:?}) and ({root}, {model_archive_data:?})"
                 );
             } else {
-                selected = Some((weights, root, model_archive_data, commit.data()));
+                selected = Some((weights, root, model_archive_data, token_data));
             }
         }
 
@@ -292,7 +276,7 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
                 model_root,
                 model_archive_data,
                 bundle_token_data,
-                ticket,
+                cover,
             },
         }))
     }
@@ -300,13 +284,13 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
     /// Required form of [`Self::find_in_bundle_snapshot`].
     pub fn from_bundle_snapshot(
         team: VerifyingKey,
-        snapshot: CollectionSnapshot<R>,
+        snapshot: FactSnapshot<R>,
     ) -> anyhow::Result<PersonaPlexBundle<R>>
     where
         R: Clone,
     {
         Self::find_in_bundle_snapshot(team, snapshot)?
-            .ok_or_else(|| anyhow::anyhow!("no signed PersonaPlex bundle in exact ticket"))
+            .ok_or_else(|| anyhow::anyhow!("no admitted PersonaPlex bundle in exact cover"))
     }
 
     /// Content-addressed root of the complete exact model.
@@ -521,7 +505,14 @@ mod native_authority_tests {
         let authority = bundle.authority();
         assert_eq!(authority.model_root(), root);
         assert_eq!(authority.bundle_token_data(), first.data());
-        assert_eq!(authority.ticket(), &[first]);
+        assert_eq!(authority.cover().len(), 1);
+        assert!(
+            authority
+                .cover()
+                .contains(inlineencodings::Handle::<SimpleArchive>::from_hash(
+                    first.data()
+                ))
+        );
         let weights = bundle.weights();
         assert_eq!(weights.root(), root);
         assert_eq!(weights.count(), 2);
@@ -718,7 +709,7 @@ mod native_authority_tests {
         let existing_commit = crate::model_collection::publish_model_bundle_fragment(
             &mut pile,
             test_team(),
-            &SigningKey::from_bytes(&[0x51; 32]),
+            &SigningKey::from_bytes(&[0x50; 32]),
             existing_root,
             existing,
         )
@@ -733,7 +724,7 @@ mod native_authority_tests {
         let candidate_commit = crate::model_collection::publish_model_bundle_fragment(
             &mut pile,
             test_team(),
-            &SigningKey::from_bytes(&[0x52; 32]),
+            &SigningKey::from_bytes(&[0x50; 32]),
             candidate_root,
             candidate,
         )

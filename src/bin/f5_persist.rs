@@ -6,22 +6,27 @@
 //! lossless (F5's published checkpoint is f32).
 //!
 //!   cargo run --release --features import --bin f5_persist -- \
-//!     <f5.safetensors> <vocos.safetensors> <pile-path>
+//!     <f5.safetensors> <vocos.safetensors> <pile-path> <signing-key>
 
 use mary::ingest::LeafDtype;
 use mary::persist::persist_safetensors_files_to_pile;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use triblespace::core::signing_key_file;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 4 {
-        eprintln!("usage: f5_persist <f5.safetensors> <vocos.safetensors> <pile-path>");
+    if args.len() != 5 {
+        eprintln!(
+            "usage: f5_persist <f5.safetensors> <vocos.safetensors> \
+             <pile-path> <signing-key>"
+        );
         std::process::exit(2);
     }
     let f5 = PathBuf::from(&args[1]);
     let vocos = PathBuf::from(&args[2]);
     let pile_path = Path::new(&args[3]);
+    let signing_key = signing_key_file::load_existing(Path::new(&args[4]))?;
 
     let t = Instant::now();
     eprintln!("Persisting F5 + Vocos → {pile_path:?} ...");
@@ -31,6 +36,7 @@ fn main() -> anyhow::Result<()> {
             (vocos, "vocos.safetensors".to_string()),
         ],
         pile_path,
+        &signing_key,
         LeafDtype::F32,
     )?;
     let secs = t.elapsed().as_secs_f64();

@@ -100,7 +100,7 @@ fn native_import_is_exact_selectable_and_byte_idempotent() {
     )
     .unwrap();
     let bytes_after_retry = std::fs::metadata(&pile_path).unwrap().len();
-    assert_eq!(repeated, first, "stable signer must reproduce the ticket");
+    assert_eq!(repeated, first, "stable signer must reproduce the commit");
     assert_eq!(first.1.to_bytes().len(), 192);
     assert_eq!(
         bytes_after_retry, bytes_after_first,
@@ -138,7 +138,14 @@ fn native_import_is_exact_selectable_and_byte_idempotent() {
     let team = signing_key.verifying_key();
     let snapshot =
         mary::model_collection::load_model_collection_local_latest(&pile_path, team).unwrap();
-    assert_eq!(snapshot.commits(), &[first.1]);
+    assert_eq!(snapshot.cover().len(), 1);
+    assert!(
+        snapshot
+            .cover()
+            .contains(triblespace::prelude::inlineencodings::Handle::<
+                triblespace::prelude::blobencodings::SimpleArchive,
+            >::from_hash(first.1.data()))
+    );
     assert_eq!(snapshot.facts(), expected.facts());
 
     let by_source = mary::selection::load_keymap_from_graph(
@@ -209,7 +216,7 @@ fn duplicate_tensor_names_across_files_publish_no_collection_commit() {
         SigningKey::from_bytes(&[0x53; 32]).verifying_key(),
     )
     .expect("failed import must leave the native collection readable");
-    assert!(snapshot.commits().is_empty());
+    assert!(snapshot.cover().is_empty());
     pile.close().unwrap();
 }
 

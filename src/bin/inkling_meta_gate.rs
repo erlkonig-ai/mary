@@ -13,7 +13,8 @@
 //! that is checkable, because `serde_json`'s object map is sorted and
 //! re-serialising is therefore canonical.
 //!
-//!   inkling_meta_gate <ckpt-dir> [pile] [--mutate WHAT]
+//!   inkling_meta_gate <ckpt-dir> [pile --signing-key <existing-key>]
+//!       [--mutate WHAT]
 //!
 //! `--mutate drop-key|int-to-float|reorder-array` corrupts the graph on the way
 //! in so the gate can be watched failing. `int-to-float` is the one worth
@@ -25,6 +26,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use triblespace::core::signing_key_file;
 use triblespace::prelude::*;
 
 /// The sidecars a run actually needs. `config.json` is the load-bearing one;
@@ -44,15 +46,19 @@ const TEXT_DOCS: &[&str] = &["chat_template.jinja"];
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let dir = args
-        .next()
-        .map(PathBuf::from)
-        .context("usage: inkling_meta_gate <ckpt-dir> [pile] [--mutate WHAT]")?;
+    let dir = args.next().map(PathBuf::from).context(
+        "usage: inkling_meta_gate <ckpt-dir> \
+             [pile --signing-key <existing-key>] [--mutate WHAT]",
+    )?;
     let mut pile: Option<String> = None;
     let mut mutate: Option<String> = None;
+    let mut signing_key_path: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--mutate" => mutate = Some(args.next().context("--mutate needs a name")?),
+            "--signing-key" => {
+                signing_key_path = Some(args.next().context("--signing-key needs a path")?)
+            }
             other => {
                 if pile.is_none() {
                     pile = Some(other.to_string());
@@ -62,6 +68,10 @@ fn main() -> Result<()> {
             }
         }
     }
+    anyhow::ensure!(
+        pile.is_some() || signing_key_path.is_none(),
+        "--signing-key requires a destination pile"
+    );
 
     println!("checkpoint: {}", dir.display());
 
@@ -134,6 +144,11 @@ fn main() -> Result<()> {
         println!("(no pile argument — nothing was written.)");
         return Ok(());
     };
+    let signing_key_path = signing_key_path
+        .as_deref()
+        .context("--signing-key <existing-key> is required when writing a pile")?;
+    let signing_key = signing_key_file::load_existing(Path::new(signing_key_path))
+        .with_context(|| format!("load existing signing key {signing_key_path:?}"))?;
 
     println!("\n=== ingesting into {pile} ===");
     anyhow::ensure!(
@@ -143,7 +158,13 @@ fn main() -> Result<()> {
          mutation without a pile argument — the in-memory stage is where it is \
          supposed to fail."
     );
-    match mary::persist::ingest_json_documents(Path::new(&pile), &dir, DOCS, TEXT_DOCS) {
+    match mary::persist::ingest_json_documents(
+        Path::new(&pile),
+        &dir,
+        DOCS,
+        TEXT_DOCS,
+        &signing_key,
+    ) {
         Ok(n) => println!("committed : {n} facts"),
         Err(e) => {
             println!("ingest declined: {e}");

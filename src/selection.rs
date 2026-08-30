@@ -11,7 +11,7 @@ use crate::format::attrs;
 use crate::leaf::Leaf;
 use anyhow::{Context, anyhow, bail};
 use std::collections::{BTreeSet, HashMap};
-use triblespace::core::collection::CollectionSnapshot;
+use triblespace::core::collection::FactSnapshot;
 use triblespace::prelude::*;
 
 /// How to identify one model component in a consolidated graph.
@@ -50,9 +50,9 @@ pub enum TokenizerSelector<'a> {
 /// its strict tensor-handle index, and the blob reader that owns every indexed
 /// attachment.
 ///
-/// Selection consumes a frozen [`CollectionSnapshot`]. Once the roots and
-/// functional fields have been validated, the collection facts and commit
-/// ticket are no longer needed by weight loading; the reader is retained so
+/// Selection consumes a frozen [`FactSnapshot`]. Once the roots and
+/// functional fields have been validated, the collection facts and exact
+/// cover are no longer needed by weight loading; the reader is retained so
 /// the content handles remain resolvable without reopening storage. This is
 /// the storage-policy-free boundary for lazy, streaming, and mmap-aliased
 /// loaders.
@@ -501,7 +501,7 @@ impl<R: BlobStoreGet> SelectedModelIndex<R> {
     /// leaf, and duplicate tensor names all fail before the snapshot is
     /// consumed.
     pub fn from_snapshot(
-        snapshot: CollectionSnapshot<R>,
+        snapshot: FactSnapshot<R>,
         selector: ModelSelector<'_>,
     ) -> anyhow::Result<Self> {
         let (facts, _, reader) = snapshot.into_parts();

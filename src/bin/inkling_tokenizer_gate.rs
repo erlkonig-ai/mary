@@ -27,7 +27,7 @@
 //! was, so the gate can be watched failing on exactly the properties it claims
 //! to cover — a check that has never failed is not evidence.
 //!
-//!   inkling_tokenizer_gate <tokenizer.json> [pile]
+//!   inkling_tokenizer_gate <tokenizer.json> [pile --signing-key <existing-key>]
 //!                          [--mutate ignore-merges|use-regex|drop-merge]
 //!
 //! Build: `--features tokenizer` (or any build that pulls it in).
@@ -35,6 +35,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use triblespace::core::signing_key_file;
 use triblespace::prelude::*;
 
 /// Strings chosen to exercise every lane byte-level BPE has: ASCII, contractions
@@ -91,14 +92,19 @@ const PROBES: &[&str] = &[
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let json_path = args
-        .next()
-        .context("usage: inkling_tokenizer_gate <tokenizer.json> [pile] [--mutate WHAT]")?;
+    let json_path = args.next().context(
+        "usage: inkling_tokenizer_gate <tokenizer.json> \
+             [pile --signing-key <existing-key>] [--mutate WHAT]",
+    )?;
     let mut pile: Option<String> = None;
     let mut mutate: Option<String> = None;
+    let mut signing_key_path: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--mutate" => mutate = Some(args.next().context("--mutate needs a name")?),
+            "--signing-key" => {
+                signing_key_path = Some(args.next().context("--signing-key needs a path")?)
+            }
             other => {
                 if pile.is_none() {
                     pile = Some(other.to_string());
@@ -108,6 +114,10 @@ fn main() -> Result<()> {
             }
         }
     }
+    anyhow::ensure!(
+        pile.is_some() || signing_key_path.is_none(),
+        "--signing-key requires a destination pile"
+    );
 
     println!("tokenizer: {json_path}");
     let raw = std::fs::read(&json_path)?;
@@ -226,6 +236,11 @@ fn main() -> Result<()> {
         println!("(no pile argument — nothing was written. Pass one to ingest for real.)");
         return Ok(());
     };
+    let signing_key_path = signing_key_path
+        .as_deref()
+        .context("--signing-key <existing-key> is required when writing a pile")?;
+    let signing_key = signing_key_file::load_existing(Path::new(signing_key_path))
+        .with_context(|| format!("load existing signing key {signing_key_path:?}"))?;
 
     println!("\n=== ingesting into {pile} ===");
     // A mutation must not be written into a shared pile: the ingest refuses a
@@ -242,7 +257,8 @@ fn main() -> Result<()> {
         Path::new(&json_path).to_path_buf()
     };
 
-    match mary::persist::ingest_hf_tokenizer(Path::new(&pile), &src, "inkling-small") {
+    match mary::persist::ingest_hf_tokenizer(Path::new(&pile), &src, "inkling-small", &signing_key)
+    {
         Ok(r) => {
             println!("committed: {} facts", r.facts);
             println!(

@@ -36,9 +36,9 @@ use triblespace::prelude::*;
 
 use mary::format::attrs;
 use mary::model_collection::{
-    model_bundle_team_or_own, model_graph_team_or_own, prepare_model_bundle_fragment,
-    project_legacy_model_attributes, publish_model_fragment,
-    snapshot_model_bundle_collection_local_latest,
+    model_bundle_team_or_own, model_bundle_teams, model_graph_team_or_own,
+    prepare_model_bundle_fragment, project_legacy_model_attributes, publish_model_fragment,
+    snapshot_model_bundle_collection_local_latest_with_admission,
 };
 use mary::models::personaplex::{PersonaPlexWeights, SOURCE as PERSONAPLEX_SOURCE};
 use mary::selection::{select_model_root, select_tokenizer_root, ModelSelector, TokenizerSelector};
@@ -77,7 +77,7 @@ pub struct LegacyModelMigration<'a> {
 /// Exact evidence returned by one successful migration publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LegacyModelMigrationResult {
-    /// Complete signed native collection ticket, suitable for exact reads.
+    /// Signed native collection claim published by this migration.
     pub commit: CollectionCommit,
     /// Team whose native model-graph collection received the commit.
     pub team: VerifyingKey,
@@ -451,39 +451,56 @@ fn adopt_legacy_personaplex_bundle_with_policy(
         .context("prepare canonical PersonaPlex bundle token")?;
     let model_archive_data = prepared.model_archive_data();
 
-    // Freeze exactly the current same-team bundle ticket before staging any
+    // Freeze exactly the current same-team admitted cover before staging any
     // dependency. A matching `(root, H)` makes the operation a strict no-op;
     // a different PersonaPlex authority fails before a COMMIT can be exposed.
-    let existing = snapshot_model_bundle_collection_local_latest(pile, team)
-        .context("freeze existing same-team model bundles")?;
-    if let Some(existing) = PersonaPlexWeights::find_in_bundle_snapshot(team, existing)
-        .context("inspect existing same-team PersonaPlex bundle")?
+    // A collection does not exist in storage until its first COMMIT stages the
+    // descriptor. Do not ask discovery to read that absent descriptor when
+    // founding the collection; after the first claim, normal authority-driven
+    // cover discovery is mandatory.
+    let existing = if model_bundle_teams(pile)
+        .context("discover existing model-bundle authorities")?
+        .contains(&team)
     {
-        anyhow::ensure!(
-            existing.authority().model_root() == candidate.model_root
-                && existing.authority().model_archive_data() == model_archive_data,
-            "a different PersonaPlex bundle is already authoritative in this team"
-        );
-        let token_data = existing.authority().bundle_token_data();
-        let commit = existing
-            .authority()
-            .ticket()
-            .iter()
-            .copied()
-            .find(|commit| commit.data() == token_data)
-            .expect("validated bundle authority names one of its ticket commits");
-        return Ok(PersonaPlexLegacyAdoptionResult {
-            commit,
-            published: false,
-            team,
-            legacy_commit,
-            legacy_lm_root: candidate.legacy_lm_root,
-            legacy_mimi_root: candidate.legacy_mimi_root,
-            model_root: candidate.model_root,
-            model_archive_data,
-            legacy_facts: candidate.legacy_facts,
-            aliases_added: candidate.aliases_added,
-        });
+        Some(
+            snapshot_model_bundle_collection_local_latest_with_admission(pile, team)
+                .context("freeze existing same-team model bundles and admission roots")?,
+        )
+    } else {
+        None
+    };
+    if let Some((snapshot, admitted_commits)) = existing {
+        // Preserve the exact capability-admitted roots of this observation.
+        // A later broad provenance query also includes unauthorized or newly
+        // arrived duplicate claims over the same payload, which must not become
+        // the claim returned by an idempotent retry.
+        if let Some(existing) = PersonaPlexWeights::find_in_bundle_snapshot(team, snapshot)
+            .context("inspect existing same-team PersonaPlex bundle")?
+        {
+            anyhow::ensure!(
+                existing.authority().model_root() == candidate.model_root
+                    && existing.authority().model_archive_data() == model_archive_data,
+                "a different PersonaPlex bundle is already authoritative in this team"
+            );
+            let token_data = existing.authority().bundle_token_data();
+            let commit = admitted_commits
+                .iter()
+                .copied()
+                .find(|commit| commit.data() == token_data)
+                .expect("validated bundle authority has an admitted commit root");
+            return Ok(PersonaPlexLegacyAdoptionResult {
+                commit,
+                published: false,
+                team,
+                legacy_commit,
+                legacy_lm_root: candidate.legacy_lm_root,
+                legacy_mimi_root: candidate.legacy_mimi_root,
+                model_root: candidate.model_root,
+                model_archive_data,
+                legacy_facts: candidate.legacy_facts,
+                aliases_added: candidate.aliases_added,
+            });
+        }
     }
 
     let mut staged = prepared
@@ -607,8 +624,8 @@ fn quantization_coordinate_is_missing(
 
 /// Publish one frozen legacy `main` snapshot into Mary's native collection.
 ///
-/// The returned [`CollectionCommit`] is the complete signed ticket, not merely
-/// its intrinsic id. Existing facts are copied as raw tribles, which preserves
+/// The returned [`CollectionCommit`] is the exact signed claim just published.
+/// Existing facts are copied as raw tribles, which preserves
 /// entity ids, value bytes, unknown attributes, and resident attachment
 /// handles. Only canonical aliases plus the requested selector coordinates are
 /// added. The caller retains `pile` on both success and failure and must choose
@@ -729,6 +746,7 @@ mod tests {
     use ed25519_dalek::Signer;
     use triblespace::core::blob::encodings::UnknownBlob;
     use triblespace::core::blob::MemoryBlobStore;
+    use triblespace::core::collection::CollectionStoreExt;
     use triblespace::core::inline::encodings::UnknownInline;
     use triblespace::core::metadata;
     use triblespace::core::patch::Entry;
@@ -740,8 +758,9 @@ mod tests {
     use super::*;
     use mary::format::{F32Array, U64Array};
     use mary::model_collection::{
-        local_model_bundle_ticket, publish_model_bundle_fragment,
-        snapshot_model_bundle_collection_exact, snapshot_model_collection_exact,
+        local_model_bundle_cover, model_bundle_teams, publish_model_bundle_fragment,
+        snapshot_model_bundle_collection_exact, snapshot_model_bundle_collection_local_latest,
+        snapshot_model_collection_local_latest,
     };
 
     static NEXT_TEMP_PILE: AtomicU64 = AtomicU64::new(0);
@@ -1218,12 +1237,15 @@ mod tests {
         path: &Path,
         team: VerifyingKey,
         commit: CollectionCommit,
-    ) -> triblespace::core::collection::CollectionSnapshot<PileReader> {
+    ) -> triblespace::core::collection::FactSnapshot<PileReader> {
         let mut pile = Pile::open(path).expect("open pile for exact native read");
         // `team` is the exact value returned by publication; do not replace
         // that authority with a second ambient discovery pass.
-        let snapshot = snapshot_model_collection_exact(&mut pile, team, &[commit])
-            .expect("materialize exact migration ticket");
+        let snapshot = snapshot_model_collection_local_latest(&mut pile, team)
+            .expect("materialize admitted migration cover");
+        assert!(snapshot.cover().contains(
+            inlineencodings::Handle::<blobencodings::SimpleArchive>::from_hash(commit.data())
+        ));
         pile.close().expect("close exact-read pile");
         snapshot
     }
@@ -1232,10 +1254,13 @@ mod tests {
         path: &Path,
         team: VerifyingKey,
         commit: CollectionCommit,
-    ) -> triblespace::core::collection::CollectionSnapshot<PileReader> {
+    ) -> triblespace::core::collection::FactSnapshot<PileReader> {
         let mut pile = Pile::open(path).expect("open pile for exact bundle read");
-        let snapshot = snapshot_model_bundle_collection_exact(&mut pile, team, &[commit])
-            .expect("materialize exact model-bundle ticket");
+        let snapshot = snapshot_model_bundle_collection_local_latest(&mut pile, team)
+            .expect("materialize admitted model-bundle cover");
+        assert!(snapshot.cover().contains(
+            inlineencodings::Handle::<blobencodings::SimpleArchive>::from_hash(commit.data())
+        ));
         pile.close().expect("close exact bundle-read pile");
         snapshot
     }
@@ -1309,7 +1334,7 @@ mod tests {
                     quantization: QUANTIZATION,
                 },
             )
-            .expect("select migrated model from exact ticket"),
+            .expect("select migrated model from exact cover"),
             fixture.model_root
         );
         assert_eq!(
@@ -1318,7 +1343,7 @@ mod tests {
                 snapshot.reader(),
                 TokenizerSelector::Name(CANONICAL_TOKENIZER),
             )
-            .expect("select migrated tokenizer from exact ticket"),
+            .expect("select migrated tokenizer from exact cover"),
             fixture.tokenizer_root
         );
         let attachment: View<str> = snapshot
@@ -1336,7 +1361,7 @@ mod tests {
         )
         .expect("rerun migration");
         pile.close().expect("close idempotence run");
-        assert_eq!(second.commit, first.commit, "rerun changed exact ticket");
+        assert_eq!(second.commit, first.commit, "rerun changed signed commit");
         assert_eq!(
             std::fs::read(fixture.pile.path()).expect("read rerun pile"),
             after_first,
@@ -1541,9 +1566,7 @@ mod tests {
             "{error}"
         );
         assert!(
-            local_model_bundle_ticket(&mut pile, migration_key.verifying_key())
-                .unwrap()
-                .is_empty(),
+            model_bundle_teams(&mut pile).unwrap().is_empty(),
             "failed exact-head validation exposed a bundle COMMIT"
         );
         assert_eq!(
@@ -1707,11 +1730,7 @@ mod tests {
         )
         .expect_err("wrong audited LM count must fail");
         assert!(error.to_string().contains("members, expected"), "{error}");
-        assert!(
-            local_model_bundle_ticket(&mut pile, key(0x72).verifying_key())
-                .unwrap()
-                .is_empty()
-        );
+        assert!(model_bundle_teams(&mut pile).unwrap().is_empty());
         pile.close().unwrap();
         assert_eq!(std::fs::read(count_fixture.pile.path()).unwrap(), before);
 
@@ -1727,11 +1746,7 @@ mod tests {
         )
         .expect_err("shared LM/Mimi member must fail");
         assert!(error.to_string().contains("share member"), "{error}");
-        assert!(
-            local_model_bundle_ticket(&mut pile, key(0x73).verifying_key())
-                .unwrap()
-                .is_empty()
-        );
+        assert!(model_bundle_teams(&mut pile).unwrap().is_empty());
         pile.close().unwrap();
         assert_eq!(std::fs::read(overlap_fixture.pile.path()).unwrap(), before);
     }
@@ -1760,9 +1775,7 @@ mod tests {
             "the falsifier must cross the dependency-staging boundary"
         );
         assert!(
-            local_model_bundle_ticket(&mut pile, migration_key.verifying_key())
-                .unwrap()
-                .is_empty(),
+            model_bundle_teams(&mut pile).unwrap().is_empty(),
             "failed staged validation finalized a bundle COMMIT"
         );
         pile.close().unwrap();
@@ -1803,10 +1816,9 @@ mod tests {
             before,
             "conflict staged dependencies before failing"
         );
-        assert_eq!(
-            local_model_bundle_ticket(&mut pile, migration_key.verifying_key()).unwrap(),
-            vec![existing]
-        );
+        let cover = local_model_bundle_cover(&mut pile, migration_key.verifying_key()).unwrap();
+        assert_eq!(cover.len(), 1);
+        assert_eq!(pile.claims(&cover).unwrap(), vec![existing]);
         pile.close().unwrap();
     }
 
@@ -1865,10 +1877,9 @@ mod tests {
             before,
             "same-root different-H conflict staged dependencies"
         );
-        assert_eq!(
-            local_model_bundle_ticket(&mut pile, migration_key.verifying_key()).unwrap(),
-            vec![existing]
-        );
+        let cover = local_model_bundle_cover(&mut pile, migration_key.verifying_key()).unwrap();
+        assert_eq!(cover.len(), 1);
+        assert_eq!(pile.claims(&cover).unwrap(), vec![existing]);
         pile.close().unwrap();
     }
 
@@ -1894,6 +1905,7 @@ mod tests {
         );
 
         let mut retained = Pile::open(destination.path()).unwrap();
+        let cover = local_model_bundle_cover(&mut source, adopted.team).unwrap();
         source
             .rewrite_retained_into(
                 &mut retained,
@@ -1903,9 +1915,8 @@ mod tests {
             .expect("rewrite native bundle closure");
         source.close().unwrap();
 
-        let snapshot =
-            snapshot_model_bundle_collection_exact(&mut retained, adopted.team, &[adopted.commit])
-                .expect("materialize retained exact bundle");
+        let snapshot = snapshot_model_bundle_collection_exact(&mut retained, adopted.team, &cover)
+            .expect("materialize retained exact bundle");
         let token_archive: Blob<blobencodings::SimpleArchive> = snapshot
             .reader()
             .get(

@@ -31,15 +31,17 @@
 //! flag and not the open path.
 //!
 //!   inkling_expert_import <ckpt-dir> <pile> --layers A-B [--experts N]
-//!                                           [--verify] [--repair]
+//!       --signing-key <existing-key> [--repair]
+//!   inkling_expert_import <ckpt-dir> <pile> --layers A-B [--experts N]
+//!       --verify
 
 use anyhow::{Context, Result};
-use ed25519_dalek::SigningKey;
 use mary::models::inkling::load::Checkpoint;
 use mary::models::inkling::pile::{attrs, expert_blob, experts_in_layers, layer_of, split_payload};
 use triblespace::core::blob::TryFromBlob;
 use triblespace::core::blob::encodings::tensor::TensorView;
 use triblespace::core::metadata;
+use triblespace::core::signing_key_file;
 use triblespace::macros::entity;
 use triblespace::prelude::*;
 /// Confirm a pile actually holds a node's whole share, byte for byte.
@@ -63,10 +65,9 @@ fn verify_share(
 ) -> Result<()> {
     let path = std::path::Path::new(pile_path);
     let mut pile = Pile::open(path).map_err(|e| anyhow::anyhow!("open {path:?}: {e:?}"))?;
-    let team = mary::model_collection::sole_model_graph_team(&mut pile)
-        .map_err(|e| anyhow::anyhow!("{path:?}: model collection: {e}"))?;
-    let snapshot = mary::model_collection::snapshot_model_collection_local_latest(&mut pile, team)
-        .map_err(|e| anyhow::anyhow!("{path:?}: model collection snapshot: {e}"))?;
+    let (_, snapshot) =
+        mary::model_collection::snapshot_sole_model_collection_local_latest(&mut pile)
+            .map_err(|e| anyhow::anyhow!("{path:?}: model collection snapshot: {e}"))?;
     let facts = mary::model_collection::project_legacy_model_attributes(snapshot.facts()).facts;
     let (_, _, reader) = snapshot.into_parts();
     pile.close()
@@ -211,16 +212,17 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let dir = args.next().context(
         "usage: inkling_expert_import <ckpt-dir> <pile> --layers A-B \
-             [--experts N] [--verify] [--repair]",
+             [--experts N] [--verify | --signing-key KEY [--repair]]",
     )?;
     let pile_path = args.next().context(
         "usage: inkling_expert_import <ckpt-dir> <pile> --layers A-B \
-             [--experts N] [--verify] [--repair]",
+             [--experts N] [--verify | --signing-key KEY [--repair]]",
     )?;
     let mut layers: Option<(i64, i64)> = None;
     let mut experts_cap = usize::MAX;
     let mut verify = false;
     let mut repair = false;
+    let mut signing_key_path: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--layers" => {
@@ -229,6 +231,9 @@ fn main() -> Result<()> {
                 layers = Some((a.parse()?, b.parse()?));
             }
             "--experts" => experts_cap = args.next().context("--experts needs N")?.parse()?,
+            "--signing-key" => {
+                signing_key_path = Some(args.next().context("--signing-key needs a path")?)
+            }
             "--verify" => verify = true,
             "--repair" => repair = true,
             other => anyhow::bail!("unknown argument {other}"),
@@ -236,35 +241,19 @@ fn main() -> Result<()> {
     }
     let (lo, hi) = layers.context("--layers A-B is required — this imports a node's share")?;
 
-    let ck = Checkpoint::open(&dir).with_context(|| format!("opening {dir}"))?;
     if verify {
+        let ck = Checkpoint::open(&dir).with_context(|| format!("opening {dir}"))?;
         return verify_share(&ck, &pile_path, lo, hi, experts_cap);
     }
 
-    // The stacked expert matrices in range. Sidecars are reached through the
-    // index by the reader, so only the weights are enumerated here.
-    let mut bases: Vec<String> = ck
-        .names()
-        .into_iter()
-        .filter(|n| n.ends_with(".experts.w13_weight") || n.ends_with(".experts.w2_weight"))
-        .filter(|n| matches!(layer_of(n), Some(l) if l >= lo && l <= hi))
-        .collect();
-    bases.sort();
-    anyhow::ensure!(!bases.is_empty(), "no expert matrices in layers {lo}-{hi}");
-    println!("checkpoint {dir}");
-    println!("layers     {lo}..={hi}");
-    println!("matrices   {}", bases.len());
-
-    // A checkpoint holds BOTH kinds — Inkling's layer 2 experts are plain BF16
-    // while the rest are NVFP4 — and the presence of a `.scale` sidecar is what
-    // decides. Both are imported, each through its own path; neither is guessed
-    // at, because the packed path on a BF16 stack would read sidecars that do
-    // not exist and produce plausible noise.
-    let (packed, dense): (Vec<&String>, Vec<&String>) = bases.iter().partition(|b| ck.is_nvfp4(b));
-    println!("           {} NVFP4, {} BF16", packed.len(), dense.len());
-    if !dense.is_empty() {
-        println!("           BF16: {dense:?}");
-    }
+    // Import publication needs a durable identity. A fresh process-local key
+    // can only create inert commits once this pile already has an authority,
+    // so fail before reading or encoding any expert payload.
+    let signing_key_path = signing_key_path.context(
+        "--signing-key <existing-key> is required when importing; verification is read-only",
+    )?;
+    let signing_key = signing_key_file::load_existing(std::path::Path::new(&signing_key_path))
+        .with_context(|| format!("load existing signing key {signing_key_path:?}"))?;
 
     let path = std::path::Path::new(&pile_path);
     if !path.exists() {
@@ -317,21 +306,25 @@ fn main() -> Result<()> {
         })?;
     }
 
-    let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
-
     // ── what the pile already holds ─────────────────────────────────────────
     // Asked once, up front, and it is what makes a second run byte-identical.
     // Expert entities are content-derived, so their facts would deduplicate,
-    // but a fresh signing key would still append a redundant commit. One query
-    // turns that into a skip — the same resumption path used after an
+    // but a second admitted author could still append a redundant commit. One
+    // query turns that into a skip — the same resumption path used after an
     // interruption. Driven by what the pile HAS, matched against what the
     // checkpoint says should be there; nothing is inferred from a file size.
+    // Existing collections admit only the authority or a signer with a
+    // resident ACTION_WRITE proof; an empty pile is founded under this durable
+    // key. This happens before any tensor payload is read or blob appended.
+    let team = mary::model_collection::model_graph_team_or_own(&mut store, &signing_key)
+        .map_err(|e| anyhow::anyhow!("model collection writer: {e}"))?;
     let mut present: std::collections::HashSet<(String, i64)> = Default::default();
-    let team = match mary::model_collection::sole_model_graph_team(&mut store) {
-        Ok(team) => {
-            let snapshot =
-                mary::model_collection::snapshot_model_collection_local_latest(&mut store, team)
-                    .map_err(|e| anyhow::anyhow!("model collection snapshot: {e}"))?;
+    match mary::model_collection::snapshot_sole_model_collection_local_latest(&mut store) {
+        Ok((snapshot_team, snapshot)) => {
+            anyhow::ensure!(
+                snapshot_team == team,
+                "model collection authority changed during writer preflight"
+            );
             let facts =
                 mary::model_collection::project_legacy_model_attributes(snapshot.facts()).facts;
             let reader = snapshot.reader();
@@ -370,11 +363,42 @@ fn main() -> Result<()> {
                 present.insert((name.to_string(), i));
             }
             println!("resuming   {} experts already in the pile", present.len());
-            team
         }
-        Err(mary::model_collection::SoleModelGraphTeamError::None) => signing_key.verifying_key(),
+        Err(mary::model_collection::SnapshotSoleModelGraphError::Team(
+            mary::model_collection::SoleModelGraphTeamError::None,
+        )) => {}
         Err(e) => return Err(anyhow::anyhow!("model collection: {e}")),
-    };
+    }
+
+    // Admission above precedes checkpoint indexing and tensor conversion, so
+    // an unauthorized invocation cannot burn through a node's share before it
+    // learns that none of its commits would be visible.
+    let ck = Checkpoint::open(&dir).with_context(|| format!("opening {dir}"))?;
+
+    // The stacked expert matrices in range. Sidecars are reached through the
+    // index by the reader, so only the weights are enumerated here.
+    let mut bases: Vec<String> = ck
+        .names()
+        .into_iter()
+        .filter(|n| n.ends_with(".experts.w13_weight") || n.ends_with(".experts.w2_weight"))
+        .filter(|n| matches!(layer_of(n), Some(l) if l >= lo && l <= hi))
+        .collect();
+    bases.sort();
+    anyhow::ensure!(!bases.is_empty(), "no expert matrices in layers {lo}-{hi}");
+    println!("checkpoint {dir}");
+    println!("layers     {lo}..={hi}");
+    println!("matrices   {}", bases.len());
+
+    // A checkpoint holds BOTH kinds — Inkling's layer 2 experts are plain BF16
+    // while the rest are NVFP4 — and the presence of a `.scale` sidecar is what
+    // decides. Both are imported, each through its own path; neither is guessed
+    // at, because the packed path on a BF16 stack would read sidecars that do
+    // not exist and produce plausible noise.
+    let (packed, dense): (Vec<&String>, Vec<&String>) = bases.iter().partition(|b| ck.is_nvfp4(b));
+    println!("           {} NVFP4, {} BF16", packed.len(), dense.len());
+    if !dense.is_empty() {
+        println!("           BF16: {dense:?}");
+    }
 
     let mut change = Fragment::empty();
 

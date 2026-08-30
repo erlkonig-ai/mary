@@ -58,6 +58,13 @@
 //! bytes before this seam existed; it was one epoch behind the reader it has to
 //! feed.
 //!
+//! A source containing a bundle collection is rejected before the destination
+//! is opened, even when it also contains a graph collection. Bundle members
+//! are signed one-row tokens that name model archives, not the model facts
+//! themselves. Rewriting one truthfully means replacing those archives and
+//! publishing new bundle tokens; folding their decoded facts into a graph
+//! commit would silently change the source's collection shape instead.
+//!
 //! ## Collection identity is preserved, deliberately
 //!
 //! The typed leaves land as a NEW COMMIT into the SAME named collection, under
@@ -69,11 +76,13 @@
 //! moved would stop every already-persisted reference from resolving. The tool
 //! asserts it rather than trusting it.
 //!
-//! The signing key is ephemeral and that is correct. A team OWNS a collection;
-//! a key only signs one commit into it. Local admission is by descriptor, not
-//! by signer (`load_model_collection_local_latest` states this explicitly), so
-//! a converter that holds no team key can still publish into the team's
-//! collection — which is what makes an offline re-encoding possible at all.
+//! The signer is explicit and must be admitted by the source collection's
+//! authority. A fresh destination consequently needs the authority's own key;
+//! a delegated key is also valid when its exact `ACTION_WRITE` proof has
+//! already been installed in the destination. The converter checks this before
+//! doing the large rewrite. An ephemeral key would still append a structurally
+//! valid COMMIT, but that claim would be inert and the production loader would
+//! correctly ignore the converted model.
 //!
 //! # One spelling, not two
 //!
@@ -102,18 +111,19 @@
 //! comparison are shared with the write path rather than restated here, and a
 //! converted leaf is byte-for-byte what a fresh import would have written.
 //!
-//!   pile_leaf_migrate <src.pile> <dst.pile>
+//!   pile_leaf_migrate <src.pile> <dst.pile> <signing-key>
 
 use anyhow::{Context, Result};
-use ed25519_dalek::SigningKey;
 use mary::format::attrs;
 use mary::leaf;
 use std::collections::HashSet;
 use std::path::Path;
 use triblespace::core::blob::Blob;
 use triblespace::core::blob::encodings::UnknownBlob;
+use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::id::ExclusiveId;
 use triblespace::core::repo::BlobStoreList;
+use triblespace::core::signing_key_file;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
@@ -129,19 +139,49 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let src = args
         .next()
-        .context("usage: pile_leaf_migrate <src.pile> <dst.pile>")?;
+        .context("usage: pile_leaf_migrate <src.pile> <dst.pile> <signing-key>")?;
     let dst = args
         .next()
-        .context("usage: pile_leaf_migrate <src.pile> <dst.pile>")?;
+        .context("usage: pile_leaf_migrate <src.pile> <dst.pile> <signing-key>")?;
+    let key = args
+        .next()
+        .context("usage: pile_leaf_migrate <src.pile> <dst.pile> <signing-key>")?;
+    anyhow::ensure!(
+        args.next().is_none(),
+        "usage: pile_leaf_migrate <src.pile> <dst.pile> <signing-key>"
+    );
+    let signing_key = signing_key_file::load_existing(Path::new(&key))
+        .with_context(|| format!("load existing signing key {key:?}"))?;
     let (src, dst) = (Path::new(&src), Path::new(&dst));
+    migrate(src, dst, &signing_key)
+}
+
+fn migrate(src: &Path, dst: &Path, signing_key: &ed25519_dalek::SigningKey) -> Result<()> {
     anyhow::ensure!(
         src.canonicalize()? != dst.canonicalize().unwrap_or_else(|_| dst.to_path_buf()),
         "src and dst are the same pile file — refusing to write into the source"
     );
 
-    let source = mary::persist::read_model_pile(src)?;
-    let (team, expected) = source.collection;
-    let (tribles, reader) = (source.facts, source.reader);
+    let mary::persist::ModelPileSource {
+        facts: tribles,
+        reader,
+        collections,
+    } = mary::persist::read_model_pile(src)?;
+    let [source_collection] = collections.as_slice() else {
+        anyhow::bail!(
+            "pile_leaf_migrate accepts exactly one `mary-model-graph` source collection; \
+             found {} native source collections (bundle collections require a bundle-preserving \
+             rewrite)",
+            collections.len()
+        );
+    };
+    anyhow::ensure!(
+        source_collection.shape == mary::persist::ModelPileCollectionShape::Graph,
+        "pile_leaf_migrate accepts exactly one `mary-model-graph` source collection; \
+         `mary-model-bundles` requires a bundle-preserving rewrite"
+    );
+    let team = source_collection.authority;
+    let expected = source_collection.collection.clone();
     eprintln!(
         "[migrate] {src:?}: native collection, {} facts",
         tribles.len()
@@ -171,7 +211,26 @@ fn main() -> Result<()> {
     let mut pile = Pile::open(dst).map_err(|e| anyhow::anyhow!("open {dst:?}: {e:?}"))?;
     pile.refresh()
         .map_err(|e| anyhow::anyhow!("load {dst:?}: {e:?}; refusing to auto-truncate"))?;
-    let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+
+    // Make the source descriptor available before asking the destination's
+    // actual admission boundary. This is one tiny inert content-addressed
+    // write, and lets an unauthorized key fail before tensor conversion or
+    // bulk blob copying begins.
+    let descriptor: Blob<blobencodings::SimpleArchive> = reader
+        .get(expected.handle())
+        .map_err(|error| anyhow::anyhow!("read source collection descriptor: {error:?}"))?;
+    let descriptor_handle = pile
+        .put::<blobencodings::SimpleArchive, _>(descriptor)
+        .map_err(|error| anyhow::anyhow!("stage source collection descriptor: {error:?}"))?;
+    anyhow::ensure!(
+        descriptor_handle == expected.handle(),
+        "source collection descriptor changed identity while copying"
+    );
+    anyhow::ensure!(
+        pile.writer_is_admitted(expected, signing_key.verifying_key())
+            .map_err(|error| anyhow::anyhow!("check destination writer admission: {error}"))?,
+        "signing key is not admitted to the source model collection in the destination; use the authority key or install its ACTION_WRITE proof first"
+    );
 
     // ── the substitution ────────────────────────────────────────────────────
     // Carry every fact EXCEPT the three being replaced ON THE LEAVES ACTUALLY
@@ -324,14 +383,14 @@ fn main() -> Result<()> {
     // surface as a pile that simply has no model in it rather than as an
     // error. Cheap to check, expensive to discover.
     anyhow::ensure!(
-        commit.collection() == expected,
+        commit.collection() == expected.handle(),
         "collection identity moved during conversion — refusing to claim the source's name"
     );
     eprintln!(
         "[migrate] published into the source's model collection, identity unchanged\n\
          [migrate]   source commits name {}\n\
          [migrate]   this commit names   {}",
-        handle_hex(&expected),
+        handle_hex(&expected.handle()),
         handle_hex(&commit.collection())
     );
     pile.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
@@ -343,4 +402,126 @@ fn main() -> Result<()> {
         total as f64 / (1024.0 * 1024.0 * 1024.0)
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use std::fs::OpenOptions;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEMP_PILE: AtomicU64 = AtomicU64::new(0);
+
+    struct TempPilePath(PathBuf);
+
+    impl TempPilePath {
+        fn new(label: &str) -> Self {
+            let ordinal = NEXT_TEMP_PILE.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "mary-pile-leaf-migrate-{label}-{}-{nanos}-{ordinal}.pile",
+                std::process::id()
+            ));
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .expect("create isolated test pile");
+            Self(path)
+        }
+
+        fn as_path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempPilePath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn bundle_only_source_is_rejected_before_destination_mutation() {
+        let source = TempPilePath::new("bundle-source");
+        let destination = TempPilePath::new("bundle-destination");
+        let signer = SigningKey::from_bytes(&[0x61; 32]);
+        let team = signer.verifying_key();
+
+        let model = entity! {
+            _ @ attrs::data: vec![1.25_f32].to_blob(),
+                attrs::shape: vec![1_u64].to_blob()
+        };
+        let model_root = model.root().expect("fixture model root");
+        let mut pile = Pile::open(source.as_path()).expect("open source pile");
+        mary::model_collection::publish_model_bundle_fragment(
+            &mut pile, team, &signer, model_root, model,
+        )
+        .expect("publish bundle-only tensor model");
+        pile.close().expect("close source pile");
+
+        let before = std::fs::read(destination.as_path()).expect("read destination before");
+        let error = migrate(source.as_path(), destination.as_path(), &signer)
+            .expect_err("bundle-only migration must be rejected");
+        assert!(
+            error.to_string().contains("`mary-model-bundles`"),
+            "unexpected diagnostic: {error:#}"
+        );
+        let after = std::fs::read(destination.as_path()).expect("read destination after");
+        assert_eq!(
+            after, before,
+            "rejecting a bundle-only source must not stage even a descriptor"
+        );
+    }
+
+    #[test]
+    fn mixed_graph_and_bundle_source_is_rejected_before_destination_mutation() {
+        let source = TempPilePath::new("mixed-source");
+        let destination = TempPilePath::new("mixed-destination");
+        let signer = SigningKey::from_bytes(&[0x62; 32]);
+        let team = signer.verifying_key();
+
+        let graph = entity! {
+            _ @ attrs::data: vec![1.25_f32].to_blob(),
+                attrs::shape: vec![1_u64].to_blob()
+        };
+        let bundle = entity! {
+            _ @ attrs::data: vec![2.5_f32].to_blob(),
+                attrs::shape: vec![1_u64].to_blob()
+        };
+        let bundle_root = bundle.root().expect("fixture bundle root");
+        let mut pile = Pile::open(source.as_path()).expect("open source pile");
+        mary::model_collection::publish_model_fragment(&mut pile, team, &signer, graph)
+            .expect("publish graph tensor model");
+        mary::model_collection::publish_model_bundle_fragment(
+            &mut pile,
+            team,
+            &signer,
+            bundle_root,
+            bundle,
+        )
+        .expect("publish bundle tensor model");
+        pile.close().expect("close source pile");
+
+        let before = std::fs::read(destination.as_path()).expect("read destination before");
+        let error = migrate(source.as_path(), destination.as_path(), &signer)
+            .expect_err("mixed-shape migration must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("found 2 native source collections"),
+            "unexpected diagnostic: {error:#}"
+        );
+        let after = std::fs::read(destination.as_path()).expect("read destination after");
+        assert_eq!(
+            after, before,
+            "rejecting a mixed-shape source must not stage even a descriptor"
+        );
+    }
 }

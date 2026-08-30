@@ -249,7 +249,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ticket_hex_is_exact_and_lowercase() {
+    fn commit_hex_is_exact_and_lowercase() {
         let bytes: Vec<u8> = (0..192).map(|index| index as u8).collect();
         let encoded = lowercase_hex(&bytes);
         assert_eq!(encoded.len(), 384);

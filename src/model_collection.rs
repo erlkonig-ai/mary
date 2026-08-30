@@ -2,14 +2,11 @@
 //!
 //! New model fragments live in one fixed, append-only `SimpleArchive` union.
 //! Publication takes an already-open [`Pile`] and a caller-supplied signing
-//! key; exact reads take complete signed commit records as their authority.
-//! The local-latest convenience deliberately makes a different, explicit
-//! admission choice: every structurally present commit for this exact model
-//! descriptor in one locally observed pile prefix is admitted to its frozen
-//! ticket, regardless of author, and then subjected to the same strict exact
-//! verification. There is no repository, mutable head, key discovery,
-//! fallback store, repair, reopen, or implicit durability flush in this
-//! surface.
+//! key; reads first discover the authority-admitted opaque payload cover and
+//! then materialize exactly that cover. Signatures and metadata remain
+//! queryable provenance rather than coordinates of the model value. There is
+//! no repository, mutable head, fallback store, repair, reopen, or implicit
+//! durability flush in this surface.
 //!
 //! TribleSpace commit `6b65f278` changed `"hex" as attribute: Encoding` from a
 //! literal attribute id to an encoding-aware id derived from `(hex, Encoding)`.
@@ -29,19 +26,22 @@ use triblespace::core::attribute::Attribute;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace::core::collection::simplearchive_union::{
-    self, PreparationError, PreparedCollectionCommit, PublicationError,
+    self, FactViewError, PreparationError, PreparedCollectionCommit, PublicationError,
 };
 use triblespace::core::collection::{
-    CollectionCommit, CollectionMaterializationError, CollectionRecord, CollectionStore,
-    SimpleArchiveCollection,
+    CollectionAdmissionError, CollectionCommit, CollectionCoverError, CollectionRecord,
+    CollectionSnapshotError, CollectionStore, CollectionStoreExt, FactCover,
+    FactMaterializationError, FactSnapshot, SimpleArchiveCollection,
 };
 use triblespace::core::collection::{descriptor, reach};
 use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::metadata;
-use triblespace::core::repo::OfferCaptureInsertError;
 use triblespace::core::repo::pile::{
     CollectionInsertError, FlushError, GetBlobError, InsertError as PileInsertError, PileReader,
     PileWriteError, ReadError,
+};
+use triblespace::core::repo::{
+    ArtifactOfferStore, CapabilityProofStore, OfferCaptureInsertError, StoreRevision,
 };
 use triblespace::core::trible::TribleSet;
 use triblespace::prelude::inlineencodings::{F64, U256BE};
@@ -80,32 +80,149 @@ pub type ModelFragmentPublicationError = PublicationError<
 /// Concrete failure produced while exactly materializing Mary's collection
 /// from a pile.
 pub type ModelCollectionMaterializationError =
-    CollectionMaterializationError<ReadError, ReadError, Infallible, GetBlobError<Infallible>>;
+    FactMaterializationError<ReadError, ReadError, GetBlobError<Infallible>>;
+
+/// Concrete failure produced while discovering one authorized model cover.
+pub type ModelCollectionCoverError =
+    CollectionCoverError<ReadError, ReadError, ReadError, GetBlobError<Infallible>>;
+
+/// Concrete failure produced by one capability-aware model snapshot that also
+/// retains the exact admitted signed roots of that observation.
+pub type ModelCollectionSnapshotError = CollectionSnapshotError<
+    ReadError,
+    ReadError,
+    ReadError,
+    GetBlobError<Infallible>,
+    FactViewError,
+>;
+
+/// Concrete failure produced while deciding whether a signer may publish to
+/// an already-founded model collection.
+pub type ModelCollectionAdmissionError =
+    CollectionAdmissionError<ReadError, ReadError, GetBlobError<Infallible>>;
+
+/// Failure while selecting the collection authority a model writer may use.
+#[derive(Debug)]
+pub enum ModelCollectionWriterSelectionError {
+    /// Candidate collection discovery could not complete.
+    Discovery(ModelCollectionTeamDiscoveryError),
+    /// More than one authority publishes the requested collection name.
+    Several {
+        /// Canonical collection name whose authority is ambiguous.
+        collection: &'static str,
+        /// Every admitted authority found in the coherent pile prefix.
+        teams: Vec<[u8; 32]>,
+    },
+    /// The existing collection's writer policy could not be evaluated.
+    Admission(ModelCollectionAdmissionError),
+    /// The supplied signer has no resident write capability from the existing
+    /// collection authority.
+    NotAdmitted {
+        /// Canonical collection name the caller attempted to publish to.
+        collection: &'static str,
+        /// Authority fixed by the existing collection descriptor.
+        authority: [u8; 32],
+        /// Supplied signer's public key.
+        signer: [u8; 32],
+    },
+}
+
+impl fmt::Display for ModelCollectionWriterSelectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Discovery(source) => source.fmt(formatter),
+            Self::Several { collection, teams } => write!(
+                formatter,
+                "{} authorities publish `{collection}` here; name the intended collection explicitly",
+                teams.len(),
+            ),
+            Self::Admission(source) => {
+                write!(
+                    formatter,
+                    "check model collection writer admission: {source}"
+                )
+            }
+            Self::NotAdmitted {
+                collection,
+                authority,
+                signer,
+            } => write!(
+                formatter,
+                "signer {signer:02X?} is not admitted to existing `{collection}` under authority {authority:02X?}",
+            ),
+        }
+    }
+}
+
+impl Error for ModelCollectionWriterSelectionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Discovery(source) => Some(source),
+            Self::Admission(source) => Some(source),
+            Self::Several { .. } | Self::NotAdmitted { .. } => None,
+        }
+    }
+}
+
+/// Failure while discovering which authorities actually publish one of
+/// Mary's canonical collections in a pile.
+#[derive(Debug)]
+pub enum ModelCollectionTeamDiscoveryError {
+    /// The pile's structural record or blob observation failed.
+    Read(ReadError),
+    /// A matching canonical descriptor could not complete authority admission.
+    Cover(ModelCollectionCoverError),
+}
+
+impl fmt::Display for ModelCollectionTeamDiscoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(source) => write!(formatter, "read candidate model collections: {source}"),
+            Self::Cover(source) => {
+                write!(formatter, "admit a candidate model collection: {source}")
+            }
+        }
+    }
+}
+
+impl Error for ModelCollectionTeamDiscoveryError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Read(source) => Some(source),
+            Self::Cover(source) => Some(source),
+        }
+    }
+}
 
 /// Failure while freezing the locally admitted model commits from an already
 /// open pile.
 #[derive(Debug)]
 pub enum SnapshotLocalModelCollectionError {
-    /// Full native-record enumeration for the local ticket failed.
-    LocalTicket(ReadError),
-    /// The frozen exact ticket could not be verified or materialized.
+    /// The exact authorized local cover could not be discovered.
+    Cover(ModelCollectionCoverError),
+    /// The frozen exact cover could not be materialized.
     Materialize(ModelCollectionMaterializationError),
 }
 
-/// Failure while choosing the sole model-graph team and freezing its exact
-/// ticket from one observed pile prefix.
+/// Failure while choosing the sole model-graph team and freezing its cover.
 #[derive(Debug)]
 pub enum SnapshotSoleModelGraphError {
+    /// The coherent pile observation could not be opened or closed.
+    Observation(ReadError),
     /// Team discovery found no unique model-graph collection in the prefix.
     Team(SoleModelGraphTeamError),
-    /// The fixed ticket could not be verified or materialized exactly.
+    /// The exact authorized local cover could not be discovered.
+    Cover(ModelCollectionCoverError),
+    /// The fixed cover could not be materialized exactly.
     Materialize(ModelCollectionMaterializationError),
 }
 
 impl fmt::Display for SnapshotSoleModelGraphError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Observation(source) => source.fmt(f),
             Self::Team(source) => source.fmt(f),
+            Self::Cover(source) => source.fmt(f),
             Self::Materialize(source) => source.fmt(f),
         }
     }
@@ -114,7 +231,9 @@ impl fmt::Display for SnapshotSoleModelGraphError {
 impl Error for SnapshotSoleModelGraphError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Observation(source) => Some(source),
             Self::Team(source) => Some(source),
+            Self::Cover(source) => Some(source),
             Self::Materialize(source) => Some(source),
         }
     }
@@ -123,12 +242,7 @@ impl Error for SnapshotSoleModelGraphError {
 impl fmt::Display for SnapshotLocalModelCollectionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::LocalTicket(source) => {
-                write!(
-                    f,
-                    "failed to freeze the local model commit ticket: {source}"
-                )
-            }
+            Self::Cover(source) => write!(f, "failed to discover the local model cover: {source}"),
             Self::Materialize(source) => {
                 write!(f, "failed to materialize the model collection: {source}")
             }
@@ -139,26 +253,31 @@ impl fmt::Display for SnapshotLocalModelCollectionError {
 impl Error for SnapshotLocalModelCollectionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::LocalTicket(source) => Some(source),
+            Self::Cover(source) => Some(source),
             Self::Materialize(source) => Some(source),
         }
     }
 }
 
-/// Failure while choosing the sole bundle team and freezing its exact ticket
-/// from one observed pile prefix.
+/// Failure while choosing the sole bundle team and freezing its cover.
 #[derive(Debug)]
 pub enum SnapshotSoleModelBundleError {
+    /// The coherent pile observation could not be opened or closed.
+    Observation(ReadError),
     /// Team discovery found no unique bundle collection in the frozen prefix.
     Team(SoleModelBundleTeamError),
-    /// The fixed ticket could not be verified or materialized exactly.
+    /// The exact authorized local cover could not be discovered.
+    Cover(ModelCollectionCoverError),
+    /// The fixed cover could not be materialized exactly.
     Materialize(ModelCollectionMaterializationError),
 }
 
 impl fmt::Display for SnapshotSoleModelBundleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Observation(source) => source.fmt(f),
             Self::Team(source) => source.fmt(f),
+            Self::Cover(source) => source.fmt(f),
             Self::Materialize(source) => source.fmt(f),
         }
     }
@@ -167,7 +286,9 @@ impl fmt::Display for SnapshotSoleModelBundleError {
 impl Error for SnapshotSoleModelBundleError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Observation(source) => Some(source),
             Self::Team(source) => Some(source),
+            Self::Cover(source) => Some(source),
             Self::Materialize(source) => Some(source),
         }
     }
@@ -305,9 +426,9 @@ pub enum LoadModelCollectionError {
     Open(ReadError),
     /// The newly opened pile could not replay one observed prefix.
     Refresh(ReadError),
-    /// Full native-record enumeration for a local-admission ticket failed.
-    LocalTicket(ReadError),
-    /// The frozen exact ticket could not be verified or materialized.
+    /// The exact authorized local cover could not be discovered.
+    Cover(ModelCollectionCoverError),
+    /// The frozen exact cover could not be verified or materialized.
     Materialize(ModelCollectionMaterializationError),
     /// The read-only pile handle could not be closed after snapshot creation.
     Close(FlushError),
@@ -351,12 +472,7 @@ impl fmt::Display for LoadModelCollectionError {
         match self {
             Self::Open(source) => write!(f, "failed to open model pile: {source}"),
             Self::Refresh(source) => write!(f, "failed to refresh model pile: {source}"),
-            Self::LocalTicket(source) => {
-                write!(
-                    f,
-                    "failed to freeze the local model commit ticket: {source}"
-                )
-            }
+            Self::Cover(source) => write!(f, "failed to discover the local model cover: {source}"),
             Self::Materialize(source) => {
                 write!(f, "failed to materialize the model collection: {source}")
             }
@@ -370,7 +486,7 @@ impl Error for LoadModelCollectionError {
         match self {
             Self::Open(source) => Some(source),
             Self::Refresh(source) => Some(source),
-            Self::LocalTicket(source) => Some(source),
+            Self::Cover(source) => Some(source),
             Self::Materialize(source) => Some(source),
             Self::Close(source) => Some(source),
         }
@@ -389,11 +505,33 @@ fn model_bundle_collection(team: VerifyingKey) -> SimpleArchiveCollection {
     SimpleArchiveCollection::new(mary_model_bundle_name(), team, reach::private())
 }
 
+/// Evaluate one read-only operation against a single coherent pile prefix.
+///
+/// Pile read traits refresh independently so they can observe external
+/// appends. Sampling the persistent store revision on both sides turns those
+/// calls into a seqlock-style observation: if anything changed, discard the
+/// mixed result and retry. Once both revisions match, every cloned index and
+/// reader used by `observe` came from that one prefix.
+fn observe_stable_pile<T, E>(
+    pile: &mut Pile,
+    mut observe: impl FnMut(&mut Pile) -> Result<T, E>,
+    map_read: impl Fn(ReadError) -> E,
+) -> Result<T, E> {
+    loop {
+        let before = pile.store_revision().map_err(&map_read)?;
+        let result = observe(pile);
+        let after = pile.store_revision().map_err(&map_read)?;
+        if before == after {
+            return result;
+        }
+    }
+}
+
 /// Content identity of one team's PersonaPlex bundle source collection.
 pub fn model_bundle_collection_handle(
     team: VerifyingKey,
 ) -> triblespace::core::collection::CollectionHandle {
-    model_bundle_collection(team).collection()
+    model_bundle_collection(team).collection().handle()
 }
 
 /// Prepare one canonical model commit entirely in memory.
@@ -501,37 +639,32 @@ pub fn publish_model_bundle_fragment(
         .map_err(PublishModelBundleError::Publication)
 }
 
-/// Materialize exactly the supplied set of complete signed model commits from
-/// an already-open pile.
-///
-/// Ticket members may have different authors. Commits not named by the ticket
-/// remain inert, while every selected record and dependency must pass the
-/// strict `SimpleArchiveCollection` exact-ticket checks. This function does
-/// not flush or close the caller's pile.
+/// Materialize exactly the supplied opaque model cover from an already-open
+/// pile. Authorization produces the cover; exact replay consumes only its
+/// payload identity. Other commits and later provenance remain inert.
 pub fn snapshot_model_collection_exact(
     pile: &mut Pile,
     team: VerifyingKey,
-    ticket: &[CollectionCommit],
-) -> Result<CollectionSnapshot<PileReader>, ModelCollectionMaterializationError> {
-    model_graph_collection(team).snapshot_exact(pile, ticket)
+    cover: &FactCover,
+) -> Result<FactSnapshot<PileReader>, ModelCollectionMaterializationError> {
+    model_graph_collection(team).snapshot_exact(pile, cover)
 }
 
-/// Materialize exactly the supplied signed model-bundle token commits.
+/// Materialize exactly the supplied opaque model-bundle cover.
 ///
-/// As with the model graph, the caller's ticket is the complete authority
-/// boundary. No local-latest widening, flush, close, or reopen occurs.
+/// No local-latest widening, flush, close, or reopen occurs.
 pub fn snapshot_model_bundle_collection_exact(
     pile: &mut Pile,
     team: VerifyingKey,
-    ticket: &[CollectionCommit],
-) -> Result<CollectionSnapshot<PileReader>, ModelCollectionMaterializationError> {
-    model_bundle_collection(team).snapshot_exact(pile, ticket)
+    cover: &FactCover,
+) -> Result<FactSnapshot<PileReader>, ModelCollectionMaterializationError> {
+    model_bundle_collection(team).snapshot_exact(pile, cover)
 }
 
 fn close_after_snapshot(
     pile: Pile,
-    snapshot: Result<CollectionSnapshot<PileReader>, ModelCollectionMaterializationError>,
-) -> Result<CollectionSnapshot<PileReader>, LoadModelCollectionError> {
+    snapshot: Result<FactSnapshot<PileReader>, ModelCollectionMaterializationError>,
+) -> Result<FactSnapshot<PileReader>, LoadModelCollectionError> {
     match snapshot {
         Ok(snapshot) => {
             pile.close().map_err(LoadModelCollectionError::Close)?;
@@ -556,24 +689,25 @@ fn open_and_refresh_model_pile(path: &Path) -> Result<Pile, LoadModelCollectionE
     Ok(pile)
 }
 
-/// Open `path`, materialize the caller-supplied exact ticket, and close the
+/// Open `path`, materialize the caller-supplied exact cover, and close the
 /// pile while returning the owned reader snapshot.
 ///
 /// Opening and the initial replay are explicit failure stages. No missing
 /// file is created, no damaged tail is amputated, and no alternate storage or
 /// runtime path is consulted. The returned [`PileReader`] owns its immutable
 /// mapping snapshot and remains usable after the mutable [`Pile`] is closed.
-pub fn load_model_collection_from_ticket(
+pub fn load_model_collection_from_cover(
     path: impl AsRef<Path>,
     team: VerifyingKey,
-    ticket: &[CollectionCommit],
-) -> Result<CollectionSnapshot<PileReader>, LoadModelCollectionError> {
+    cover: &FactCover,
+) -> Result<FactSnapshot<PileReader>, LoadModelCollectionError> {
     let mut pile = open_and_refresh_model_pile(path.as_ref())?;
-    let snapshot = snapshot_model_collection_exact(&mut pile, team, ticket);
+    let snapshot = snapshot_model_collection_exact(&mut pile, team, cover);
     close_after_snapshot(pile, snapshot)
 }
 
-/// Which teams publish a `mary-model-graph` collection in this pile.
+/// Which authorities have at least one admitted member in a
+/// `mary-model-graph` collection in this pile.
 ///
 /// A reader does not have to be told whose collection it wants. The pile is
 /// self-describing: every commit names its collection by descriptor handle,
@@ -586,32 +720,26 @@ pub fn load_model_collection_from_ticket(
 /// -- two parties publishing under the same name -- and defaulting to whichever
 /// the record scan happened to reach first would resolve it by accident. The
 /// caller is made to decide because there is no answer here to give it.
-struct LocalCollectionObservation {
-    commits: Vec<CollectionCommit>,
-    teams: Vec<VerifyingKey>,
-}
-
-/// Freeze one record prefix and discover both its commits and matching teams.
-///
-/// Keeping these together matters to callers that choose a sole team and then
-/// construct an exact ticket: two independent `Pile::records` scans could
-/// observe different prefixes and silently turn a newly ambiguous pile into a
-/// ticket for whichever team the first scan happened to see.
-fn observe_collection(
+fn collection_teams_once(
     pile: &mut Pile,
     wanted: &str,
-) -> Result<LocalCollectionObservation, ReadError> {
+) -> Result<Vec<VerifyingKey>, ModelCollectionTeamDiscoveryError> {
     let mut seen = BTreeSet::new();
     let mut teams = Vec::new();
     let mut descriptors = BTreeSet::new();
-    let mut commits = Vec::new();
-    for record in pile.records()? {
-        if let CollectionRecord::Commit(commit) = record? {
+    for record in pile
+        .records()
+        .map_err(ModelCollectionTeamDiscoveryError::Read)?
+    {
+        if let CollectionRecord::Commit(commit) =
+            record.map_err(ModelCollectionTeamDiscoveryError::Read)?
+        {
             descriptors.insert(commit.collection());
-            commits.push(commit);
         }
     }
-    let reader = pile.reader()?;
+    let reader = pile
+        .reader()
+        .map_err(ModelCollectionTeamDiscoveryError::Read)?;
     for handle in descriptors {
         let Ok(blob) = reader.get::<Blob<SimpleArchive>, _>(handle.transmute()) else {
             // A commit naming a descriptor this pile does not hold is a
@@ -632,23 +760,50 @@ fn observe_collection(
             Ok(name) => name,
             Err(_) => continue,
         };
-        if &*name == wanted && seen.insert(team.to_bytes()) {
+        if &*name != wanted || seen.contains(&team.to_bytes()) {
+            continue;
+        }
+
+        // A descriptor-shaped blob and a structural COMMIT are only candidate
+        // discovery coordinates. Bind the handle to Mary's exact typed
+        // descriptor, then let the collection boundary verify signatures and
+        // capability admission. Otherwise an unauthorized signer could mint a
+        // second apparent authority and poison sole-team discovery.
+        let collection = SimpleArchiveCollection::new(wanted, team, reach::private()).collection();
+        if collection.handle() != handle {
+            continue;
+        }
+        let cover = pile
+            .cover(collection)
+            .map_err(ModelCollectionTeamDiscoveryError::Cover)?;
+        if !cover.is_empty() && seen.insert(team.to_bytes()) {
             teams.push(team);
         }
     }
-    Ok(LocalCollectionObservation { commits, teams })
+    Ok(teams)
 }
 
-fn collection_teams(pile: &mut Pile, wanted: &str) -> Result<Vec<VerifyingKey>, ReadError> {
-    observe_collection(pile, wanted).map(|observation| observation.teams)
+fn collection_teams(
+    pile: &mut Pile,
+    wanted: &'static str,
+) -> Result<Vec<VerifyingKey>, ModelCollectionTeamDiscoveryError> {
+    observe_stable_pile(
+        pile,
+        |pile| collection_teams_once(pile, wanted),
+        ModelCollectionTeamDiscoveryError::Read,
+    )
 }
 
-pub fn model_graph_teams(pile: &mut Pile) -> Result<Vec<VerifyingKey>, ReadError> {
+pub fn model_graph_teams(
+    pile: &mut Pile,
+) -> Result<Vec<VerifyingKey>, ModelCollectionTeamDiscoveryError> {
     collection_teams(pile, mary_model_graph_name())
 }
 
 /// Which teams publish a `mary-model-bundles` collection in this pile.
-pub fn model_bundle_teams(pile: &mut Pile) -> Result<Vec<VerifyingKey>, ReadError> {
+pub fn model_bundle_teams(
+    pile: &mut Pile,
+) -> Result<Vec<VerifyingKey>, ModelCollectionTeamDiscoveryError> {
     collection_teams(pile, mary_model_bundle_name())
 }
 
@@ -686,12 +841,13 @@ fn sole_model_graph_team_from(
 pub fn model_graph_team_or_own(
     pile: &mut Pile,
     signing_key: &SigningKey,
-) -> Result<VerifyingKey, SoleModelGraphTeamError> {
-    match sole_model_graph_team(pile) {
-        Ok(team) => Ok(team),
-        Err(SoleModelGraphTeamError::None) => Ok(signing_key.verifying_key()),
-        Err(error) => Err(error),
-    }
+) -> Result<VerifyingKey, ModelCollectionWriterSelectionError> {
+    collection_team_or_own(
+        pile,
+        signing_key,
+        mary_model_graph_name(),
+        model_graph_collection,
+    )
 }
 
 /// The single team publishing model bundles here, or an explicit ambiguity.
@@ -716,19 +872,62 @@ fn sole_model_bundle_team_from(
 pub fn model_bundle_team_or_own(
     pile: &mut Pile,
     signing_key: &SigningKey,
-) -> Result<VerifyingKey, SoleModelBundleTeamError> {
-    match sole_model_bundle_team(pile) {
-        Ok(team) => Ok(team),
-        Err(SoleModelBundleTeamError::None) => Ok(signing_key.verifying_key()),
-        Err(error) => Err(error),
-    }
+) -> Result<VerifyingKey, ModelCollectionWriterSelectionError> {
+    collection_team_or_own(
+        pile,
+        signing_key,
+        mary_model_bundle_name(),
+        model_bundle_collection,
+    )
+}
+
+fn collection_team_or_own(
+    pile: &mut Pile,
+    signing_key: &SigningKey,
+    name: &'static str,
+    collection_for: fn(VerifyingKey) -> SimpleArchiveCollection,
+) -> Result<VerifyingKey, ModelCollectionWriterSelectionError> {
+    let signer = signing_key.verifying_key();
+    observe_stable_pile(
+        pile,
+        |pile| {
+            let teams = collection_teams_once(pile, name)
+                .map_err(ModelCollectionWriterSelectionError::Discovery)?;
+            let authority = match teams.len() {
+                0 => return Ok(signer),
+                1 => teams[0],
+                _ => {
+                    return Err(ModelCollectionWriterSelectionError::Several {
+                        collection: name,
+                        teams: teams.iter().map(VerifyingKey::to_bytes).collect(),
+                    });
+                }
+            };
+            let admitted = pile
+                .writer_is_admitted(collection_for(authority).collection(), signer)
+                .map_err(ModelCollectionWriterSelectionError::Admission)?;
+            if !admitted {
+                return Err(ModelCollectionWriterSelectionError::NotAdmitted {
+                    collection: name,
+                    authority: authority.to_bytes(),
+                    signer: signer.to_bytes(),
+                });
+            }
+            Ok(authority)
+        },
+        |source| {
+            ModelCollectionWriterSelectionError::Discovery(ModelCollectionTeamDiscoveryError::Read(
+                source,
+            ))
+        },
+    )
 }
 
 /// Why a pile does not have exactly one model-graph team.
 #[derive(Debug)]
 pub enum SoleModelGraphTeamError {
     /// The pile could not be read.
-    Read(ReadError),
+    Read(ModelCollectionTeamDiscoveryError),
     /// No collection in this pile is named `mary-model-graph`.
     None,
     /// Several teams publish that name here; the caller must choose.
@@ -765,7 +964,7 @@ impl Error for SoleModelGraphTeamError {
 #[derive(Debug)]
 pub enum SoleModelBundleTeamError {
     /// The pile could not be read.
-    Read(ReadError),
+    Read(ModelCollectionTeamDiscoveryError),
     /// No collection in this pile is named `mary-model-bundles`.
     None,
     /// Several teams publish that name; the caller must choose.
@@ -798,63 +997,25 @@ impl Error for SoleModelBundleTeamError {
     }
 }
 
-fn local_ticket_for_collection<S>(
-    store: &mut S,
-    collection: triblespace::core::collection::CollectionHandle,
-) -> Result<Vec<CollectionCommit>, ReadError>
-where
-    S: CollectionStore<RecordsError = ReadError>,
-{
-    let mut ticket = Vec::new();
-    for record in store.records()? {
-        if let CollectionRecord::Commit(commit) = record? {
-            if commit.collection() == collection {
-                // Deliberately retain structurally decoded but
-                // cryptographically invalid matching commits. The exact
-                // boundary must reject them instead of silently producing a
-                // partial local view.
-                ticket.push(commit);
-            }
-        }
-    }
-    ticket.sort_unstable_by_key(CollectionCommit::id);
-    Ok(ticket)
-}
-
-fn local_model_ticket<S>(
+fn local_model_cover<S>(
     store: &mut S,
     team: VerifyingKey,
-) -> Result<Vec<CollectionCommit>, ReadError>
+) -> Result<FactCover, ModelCollectionCoverError>
 where
-    S: CollectionStore<RecordsError = ReadError>,
+    S: BlobStore<Reader = PileReader, ReaderError = ReadError>
+        + CollectionStore<RecordsError = ReadError>
+        + ArtifactOfferStore
+        + CapabilityProofStore<ProofsError = ReadError>,
 {
-    // Hashing a descriptor without storing it is only safe on a read path.
-    // A write that did this could name a collection whose descriptor is not
-    // in the pile -- records referencing something nothing can decode -- so
-    // there is deliberately no helper for it and the write paths take the
-    // handle that `put` hands back instead.
-    let collection = IntoBlob::<SimpleArchive>::to_blob(
-        model_graph_collection(team).descriptor().facts().clone(),
-    )
-    .get_handle();
-    local_ticket_for_collection(store, collection)
+    store.cover(model_graph_collection(team).collection())
 }
 
-/// Freeze every structurally present COMMIT for this team's
-/// `mary-model-bundles` descriptor.
-///
-/// Invalid matching commits are deliberately retained so the exact snapshot
-/// boundary rejects them fail-closed. Records for every other descriptor are
-/// inert. This scans one already-open pile prefix and performs no writes.
-pub fn local_model_bundle_ticket(
+/// Discover the exact authorized cover of this team's model-bundle collection.
+pub fn local_model_bundle_cover(
     pile: &mut Pile,
     team: VerifyingKey,
-) -> Result<Vec<CollectionCommit>, ReadError> {
-    let collection = IntoBlob::<SimpleArchive>::to_blob(
-        model_bundle_collection(team).descriptor().facts().clone(),
-    )
-    .get_handle();
-    local_ticket_for_collection(pile, collection)
+) -> Result<FactCover, ModelCollectionCoverError> {
+    pile.cover(model_bundle_collection(team).collection())
 }
 
 /// Freeze and materialize every locally admitted model commit from an already
@@ -867,15 +1028,16 @@ pub fn local_model_bundle_ticket(
 pub fn snapshot_model_collection_local_latest<S>(
     store: &mut S,
     team: VerifyingKey,
-) -> Result<CollectionSnapshot<PileReader>, SnapshotLocalModelCollectionError>
+) -> Result<FactSnapshot<PileReader>, SnapshotLocalModelCollectionError>
 where
     S: BlobStore<Reader = PileReader, ReaderError = ReadError>
-        + CollectionStore<RecordsError = ReadError>,
+        + CollectionStore<RecordsError = ReadError>
+        + ArtifactOfferStore
+        + CapabilityProofStore<ProofsError = ReadError>,
 {
-    let ticket =
-        local_model_ticket(store, team).map_err(SnapshotLocalModelCollectionError::LocalTicket)?;
+    let cover = local_model_cover(store, team).map_err(SnapshotLocalModelCollectionError::Cover)?;
     model_graph_collection(team)
-        .snapshot_exact(store, &ticket)
+        .snapshot_exact(store, &cover)
         .map_err(SnapshotLocalModelCollectionError::Materialize)
 }
 
@@ -884,108 +1046,98 @@ where
 pub fn snapshot_model_bundle_collection_local_latest(
     pile: &mut Pile,
     team: VerifyingKey,
-) -> Result<CollectionSnapshot<PileReader>, SnapshotLocalModelCollectionError> {
-    let ticket = local_model_bundle_ticket(pile, team)
-        .map_err(SnapshotLocalModelCollectionError::LocalTicket)?;
-    snapshot_model_bundle_collection_exact(pile, team, &ticket)
+) -> Result<FactSnapshot<PileReader>, SnapshotLocalModelCollectionError> {
+    let cover =
+        local_model_bundle_cover(pile, team).map_err(SnapshotLocalModelCollectionError::Cover)?;
+    snapshot_model_bundle_collection_exact(pile, team, &cover)
         .map_err(SnapshotLocalModelCollectionError::Materialize)
 }
 
-/// Choose the sole model-graph team and freeze its exact ticket from one record
-/// observation.
+/// Freeze one model-bundle snapshot together with only the COMMITs admitted by
+/// that exact capability observation.
 ///
-/// Team discovery and ticket selection share one [`Pile::records`] prefix.
-/// Exact materialization may inspect storage again, but commits appended after
-/// that observation remain inert because the ticket is already fixed. This is
-/// the fail-closed entry point for a caller that holds only a pile and does not
-/// already know which team it intends to trust.
+/// Normal model reads retain the much smaller payload cover alone. This
+/// opt-in form exists for migration retries that must return the original
+/// signed root rather than a later or unauthorized duplicate claim over the
+/// same payload.
+pub fn snapshot_model_bundle_collection_local_latest_with_admission(
+    pile: &mut Pile,
+    team: VerifyingKey,
+) -> Result<(FactSnapshot<PileReader>, Vec<CollectionCommit>), ModelCollectionSnapshotError> {
+    pile.snapshot_with_admission(model_bundle_collection(team).collection())
+}
+
+/// Choose the sole model-graph authority and materialize its admitted cover.
 pub fn snapshot_sole_model_collection_local_latest(
     pile: &mut Pile,
-) -> Result<(VerifyingKey, CollectionSnapshot<PileReader>), SnapshotSoleModelGraphError> {
-    let observation = observe_collection(pile, mary_model_graph_name()).map_err(|source| {
-        SnapshotSoleModelGraphError::Team(SoleModelGraphTeamError::Read(source))
-    })?;
-    let team =
-        sole_model_graph_team_from(observation.teams).map_err(SnapshotSoleModelGraphError::Team)?;
-    let collection = model_graph_collection(team).collection();
-    let mut ticket: Vec<_> = observation
-        .commits
-        .into_iter()
-        .filter(|commit| commit.collection() == collection)
-        .collect();
-    ticket.sort_unstable_by_key(CollectionCommit::id);
-    let snapshot = snapshot_model_collection_exact(pile, team, &ticket)
-        .map_err(SnapshotSoleModelGraphError::Materialize)?;
-    Ok((team, snapshot))
+) -> Result<(VerifyingKey, FactSnapshot<PileReader>), SnapshotSoleModelGraphError> {
+    observe_stable_pile(
+        pile,
+        |pile| {
+            let teams = collection_teams_once(pile, mary_model_graph_name())
+                .map_err(SoleModelGraphTeamError::Read)
+                .map_err(SnapshotSoleModelGraphError::Team)?;
+            let team =
+                sole_model_graph_team_from(teams).map_err(SnapshotSoleModelGraphError::Team)?;
+            let cover =
+                local_model_cover(pile, team).map_err(SnapshotSoleModelGraphError::Cover)?;
+            let snapshot = snapshot_model_collection_exact(pile, team, &cover)
+                .map_err(SnapshotSoleModelGraphError::Materialize)?;
+            Ok((team, snapshot))
+        },
+        SnapshotSoleModelGraphError::Observation,
+    )
 }
 
-/// Choose the sole bundle team and freeze its exact ticket from one record
-/// observation.
-///
-/// Exact materialization may inspect storage again, but its authority is the
-/// already-fixed ticket: commits appended after this observation remain inert.
-/// In particular, a concurrently appended second team cannot be hidden by
-/// discovering a team from one prefix and filtering commits from another.
+/// Choose the sole model-bundle authority and materialize its admitted cover.
 pub fn snapshot_sole_model_bundle_collection_local_latest(
     pile: &mut Pile,
-) -> Result<(VerifyingKey, CollectionSnapshot<PileReader>), SnapshotSoleModelBundleError> {
-    let observation = observe_collection(pile, mary_model_bundle_name()).map_err(|source| {
-        SnapshotSoleModelBundleError::Team(SoleModelBundleTeamError::Read(source))
-    })?;
-    let team = sole_model_bundle_team_from(observation.teams)
-        .map_err(SnapshotSoleModelBundleError::Team)?;
-    let collection = model_bundle_collection(team).collection();
-    let mut ticket: Vec<_> = observation
-        .commits
-        .into_iter()
-        .filter(|commit| commit.collection() == collection)
-        .collect();
-    ticket.sort_unstable_by_key(CollectionCommit::id);
-    let snapshot = snapshot_model_bundle_collection_exact(pile, team, &ticket)
-        .map_err(SnapshotSoleModelBundleError::Materialize)?;
-    Ok((team, snapshot))
+) -> Result<(VerifyingKey, FactSnapshot<PileReader>), SnapshotSoleModelBundleError> {
+    observe_stable_pile(
+        pile,
+        |pile| {
+            let teams = collection_teams_once(pile, mary_model_bundle_name())
+                .map_err(SoleModelBundleTeamError::Read)
+                .map_err(SnapshotSoleModelBundleError::Team)?;
+            let team =
+                sole_model_bundle_team_from(teams).map_err(SnapshotSoleModelBundleError::Team)?;
+            let cover = local_model_bundle_cover(pile, team)
+                .map_err(SnapshotSoleModelBundleError::Cover)?;
+            let snapshot = snapshot_model_bundle_collection_exact(pile, team, &cover)
+                .map_err(SnapshotSoleModelBundleError::Materialize)?;
+            Ok((team, snapshot))
+        },
+        SnapshotSoleModelBundleError::Observation,
+    )
 }
 
-/// Load the union of every locally admitted model commit in one observed pile
-/// prefix.
+/// Load the exact payload cover admitted by the collection authority.
 ///
-/// This is an explicit *local pile admission policy*: placing a structurally
-/// valid native commit record in this pile admits it to the next frozen
-/// ticket, regardless of signer. Records naming other descriptors are inert.
-/// Matching records are not pre-filtered by signature, so one invalid matching
-/// record makes exact verification fail closed rather than disappearing from a
-/// partial result. After the full deterministic record scan, the ticket is
-/// frozen and materialized exactly; concurrent later appends cannot widen it.
+/// Invalid or unauthorized claims remain inert provenance. Once discovery
+/// returns, the opaque cover fixes the model value consumed by materialization.
 /// The pile is never repaired, reopened, or implicitly flushed.
 pub fn load_model_collection_local_latest(
     path: impl AsRef<Path>,
     team: VerifyingKey,
-) -> Result<CollectionSnapshot<PileReader>, LoadModelCollectionError> {
-    // `Pile::records` performs the one bounded replay that defines the local
-    // admission prefix. Do not refresh separately here: a second pre-ticket
-    // replay would move that boundary for no semantic benefit.
+) -> Result<FactSnapshot<PileReader>, LoadModelCollectionError> {
     let mut pile = Pile::open(path.as_ref()).map_err(LoadModelCollectionError::Open)?;
     let snapshot = match snapshot_model_collection_local_latest(&mut pile, team) {
         Ok(snapshot) => Ok(snapshot),
-        Err(SnapshotLocalModelCollectionError::LocalTicket(source)) => {
+        Err(SnapshotLocalModelCollectionError::Cover(source)) => {
             let _ = pile.close();
-            return Err(LoadModelCollectionError::LocalTicket(source));
+            return Err(LoadModelCollectionError::Cover(source));
         }
         Err(SnapshotLocalModelCollectionError::Materialize(source)) => Err(source),
     };
     close_after_snapshot(pile, snapshot)
 }
 
-/// Open `path`, choose the sole model-graph team, and freeze its exact local
-/// ticket from one observed record prefix.
-///
-/// Team discovery and ticket selection deliberately happen in this one
-/// operation: two independent opens can observe different prefixes and hide a
-/// newly ambiguous second team. The returned reader owns its immutable mapping
-/// after the read-only pile handle is closed.
+/// Open `path`, choose the sole model-graph authority, and materialize its
+/// admitted cover. The returned reader owns its immutable mapping after the
+/// read-only pile handle is closed.
 pub fn load_sole_model_collection_local_latest(
     path: impl AsRef<Path>,
-) -> Result<(VerifyingKey, CollectionSnapshot<PileReader>), LoadSoleModelCollectionError> {
+) -> Result<(VerifyingKey, FactSnapshot<PileReader>), LoadSoleModelCollectionError> {
     let mut pile = Pile::open(path.as_ref()).map_err(LoadSoleModelCollectionError::Open)?;
     let result = snapshot_sole_model_collection_local_latest(&mut pile);
     match result {
@@ -1437,7 +1589,12 @@ mod tests {
 
     use super::*;
     use anybytes::{Bytes, View};
-    use triblespace::core::collection::ExactTicketError;
+    use triblespace::core::capability::{
+        CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
+        CapabilityResource,
+    };
+    use triblespace::core::collection::ACTION_WRITE;
+    use triblespace::core::collection::CollectionStoreExt;
     use triblespace::core::repo::pile::WantRewritePolicy;
     use triblespace::core::repo::{BlobStoreGet, RetentionRoots};
     use triblespace::macros::id_hex;
@@ -1506,13 +1663,50 @@ mod tests {
     /// collection, which is exactly what having a team distinct from the
     /// signer is for.
     fn test_team() -> VerifyingKey {
-        SigningKey::from_bytes(&[0x11; 32]).verifying_key()
+        test_authority().verifying_key()
+    }
+
+    fn test_authority() -> SigningKey {
+        SigningKey::from_bytes(&[0x11; 32])
+    }
+
+    fn grant_writer(
+        pile: &mut Pile,
+        collection: triblespace::core::collection::CollectionHandle,
+        writer: &SigningKey,
+    ) {
+        if writer.verifying_key() == test_team() {
+            return;
+        }
+        let claim = CapabilityClaim::root(
+            CapabilityAtom::new(
+                CapabilityAction::new(ACTION_WRITE),
+                CapabilityResource::from(collection),
+            ),
+            CapabilityMode::Invoke,
+            None,
+        );
+        let bundle =
+            CapabilityProofBundle::issue_root(&test_authority(), claim, writer.verifying_key())
+                .expect("issue test writer grant");
+        for claim in bundle.claims() {
+            pile.put::<SimpleArchive, _>(claim.clone())
+                .expect("store test grant claim");
+        }
+        pile.insert_proof(bundle.proof().clone())
+            .expect("store test writer grant");
     }
 
     fn open_test_pile(path: &Path) -> Pile {
         let mut pile = Pile::open(path).expect("open test pile");
         pile.refresh().expect("refresh test pile");
         pile
+    }
+
+    fn claims_for(pile: &mut Pile, cover: &FactCover) -> Vec<CollectionCommit> {
+        let mut claims = pile.claims(cover).expect("query cover provenance");
+        claims.sort_unstable_by_key(CollectionCommit::id);
+        claims
     }
 
     /// The identity of the model-graph collection must not drift silently.
@@ -1535,9 +1729,9 @@ mod tests {
         assert_eq!(
             handle.raw,
             [
-                0xFB, 0x88, 0x1E, 0x42, 0x6C, 0x55, 0xFA, 0x97, 0xA1, 0xB5, 0xC6, 0xEF, 0xB5, 0xB7,
-                0xA9, 0x7C, 0xE4, 0x84, 0xAE, 0xF6, 0x84, 0xEF, 0x9C, 0x76, 0x1B, 0xC1, 0xE9, 0x9D,
-                0xDC, 0x1E, 0xB2, 0x33,
+                0x17, 0x52, 0xC1, 0xAE, 0xC0, 0xE5, 0x39, 0x12, 0xA8, 0xE3, 0x77, 0x07, 0xC0, 0x63,
+                0xEC, 0xDA, 0xA1, 0xB6, 0x9B, 0x08, 0xBC, 0x40, 0x5D, 0x82, 0xD9, 0x8A, 0x67, 0xAF,
+                0xCD, 0xDE, 0xEA, 0x18,
             ]
         );
     }
@@ -1551,6 +1745,11 @@ mod tests {
         let model_facts = model.facts().len();
 
         let mut pile = open_test_pile(file.as_path());
+        grant_writer(
+            &mut pile,
+            model_bundle_collection(test_team()).collection().handle(),
+            &signer,
+        );
         publish_model_bundle_fragment(&mut pile, test_team(), &signer, model_root, model)
             .expect("publish the sole bundle");
         pile.close().expect("close after publishing the bundle");
@@ -1573,9 +1772,137 @@ mod tests {
             source.facts.len()
         );
         assert_eq!(
-            source.collection.0,
+            source.collections.len(),
+            1,
+            "a bundle-only pile must report exactly its bundle collection"
+        );
+        assert_eq!(
+            source.collections[0].shape,
+            crate::persist::ModelPileCollectionShape::Bundle,
+        );
+        assert_eq!(
+            source.collections[0].authority,
             test_team(),
             "a bundle-only pile must report the bundle's own team as its authority"
+        );
+        assert_eq!(
+            source.collections[0].collection.handle(),
+            model_bundle_collection(test_team()).collection().handle(),
+        );
+    }
+
+    #[test]
+    fn mixed_graph_and_bundle_shapes_share_one_complete_reader() {
+        let file = TempPilePath::new("mixed-shape-loader");
+        let graph_writer = SigningKey::from_bytes(&[0x72; 32]);
+        let bundle_authority = SigningKey::from_bytes(&[0x73; 32]);
+        let bundle_team = bundle_authority.verifying_key();
+        let (graph, graph_text, _) = fragment_fixture("mixed-graph");
+        let graph_root = graph.root().expect("graph root");
+        let (bundle, bundle_text, _) = fragment_fixture("mixed-bundle");
+        let bundle_root = bundle.root().expect("bundle root");
+
+        let mut pile = open_test_pile(file.as_path());
+        grant_writer(
+            &mut pile,
+            model_graph_collection(test_team()).collection().handle(),
+            &graph_writer,
+        );
+        publish_model_fragment(&mut pile, test_team(), &graph_writer, graph)
+            .expect("publish graph shape");
+        publish_model_bundle_fragment(
+            &mut pile,
+            bundle_team,
+            &bundle_authority,
+            bundle_root,
+            bundle,
+        )
+        .expect("publish bundle shape");
+        pile.close().expect("close mixed-shape pile");
+
+        let source = crate::persist::read_model_pile(file.as_path())
+            .expect("both independently authorized shapes are readable together");
+        assert!(source.facts.iter().any(|row| row.e() == &graph_root));
+        assert!(source.facts.iter().any(|row| row.e() == &bundle_root));
+        assert_eq!(
+            source
+                .collections
+                .iter()
+                .map(|source| (source.shape, source.authority))
+                .collect::<Vec<_>>(),
+            vec![
+                (crate::persist::ModelPileCollectionShape::Graph, test_team(),),
+                (
+                    crate::persist::ModelPileCollectionShape::Bundle,
+                    bundle_team,
+                ),
+            ],
+            "the read must retain both independently authorized collection identities"
+        );
+        assert_eq!(
+            source.collections[0].collection.handle(),
+            model_graph_collection(test_team()).collection().handle(),
+        );
+        assert_eq!(
+            source.collections[1].collection.handle(),
+            model_bundle_collection(bundle_team).collection().handle(),
+        );
+
+        let graph_label: View<str> = source.reader.get(graph_text).expect("graph attachment");
+        let bundle_label: View<str> = source
+            .reader
+            .get(bundle_text)
+            .expect("bundle attachment through the same reader");
+        assert_eq!(&*graph_label, "model attachment mixed-graph");
+        assert_eq!(&*bundle_label, "model attachment mixed-bundle");
+    }
+
+    #[test]
+    fn one_valid_shape_does_not_mask_ambiguity_in_the_other() {
+        let file = TempPilePath::new("mixed-shape-ambiguity");
+        let graph_writer = SigningKey::from_bytes(&[0x74; 32]);
+        let bundle_authority = SigningKey::from_bytes(&[0x75; 32]);
+        let other_bundle_authority = SigningKey::from_bytes(&[0x76; 32]);
+        let (graph, _, _) = fragment_fixture("unambiguous-graph");
+        let (first_bundle, _, _) = fragment_fixture("first-bundle-team");
+        let first_root = first_bundle.root().expect("first bundle root");
+        let (second_bundle, _, _) = fragment_fixture("second-bundle-team");
+        let second_root = second_bundle.root().expect("second bundle root");
+
+        let mut pile = open_test_pile(file.as_path());
+        grant_writer(
+            &mut pile,
+            model_graph_collection(test_team()).collection().handle(),
+            &graph_writer,
+        );
+        publish_model_fragment(&mut pile, test_team(), &graph_writer, graph)
+            .expect("publish unambiguous graph");
+        publish_model_bundle_fragment(
+            &mut pile,
+            bundle_authority.verifying_key(),
+            &bundle_authority,
+            first_root,
+            first_bundle,
+        )
+        .expect("publish first bundle authority");
+        publish_model_bundle_fragment(
+            &mut pile,
+            other_bundle_authority.verifying_key(),
+            &other_bundle_authority,
+            second_root,
+            second_bundle,
+        )
+        .expect("publish second bundle authority");
+        pile.close().expect("close ambiguous mixed-shape pile");
+
+        let error = crate::persist::read_model_pile(file.as_path())
+            .err()
+            .expect("bundle ambiguity must not be hidden by the valid graph");
+        assert!(
+            error
+                .to_string()
+                .contains("2 teams publish `mary-model-bundles`"),
+            "unexpected diagnostic: {error}"
         );
     }
 
@@ -1594,6 +1921,9 @@ mod tests {
         let model_archive_data = prepared.model_archive_data();
 
         let mut pile = open_test_pile(file.as_path());
+        let bundle_collection = model_bundle_collection(test_team()).collection().handle();
+        grant_writer(&mut pile, bundle_collection, &signer);
+        grant_writer(&mut pile, bundle_collection, &other_signer);
         let first = publish_model_bundle_fragment(
             &mut pile,
             test_team(),
@@ -1622,22 +1952,17 @@ mod tests {
                 .unwrap();
         assert_ne!(first.id(), other_author.id());
         assert_eq!(first.data(), other_author.data());
-        assert!(
-            local_model_ticket(&mut pile, test_team())
-                .unwrap()
-                .is_empty()
-        );
+        assert!(model_graph_teams(&mut pile).unwrap().is_empty());
 
-        let snapshot = snapshot_model_bundle_collection_exact(
-            &mut pile,
-            test_team(),
-            &[other_author, repeated, first],
-        )
-        .unwrap();
+        let cover = local_model_bundle_cover(&mut pile, test_team()).unwrap();
+        let snapshot =
+            snapshot_model_bundle_collection_exact(&mut pile, test_team(), &cover).unwrap();
         assert_eq!(snapshot.facts().len(), 1);
         let mut expected_commits = vec![first, other_author];
         expected_commits.sort_unstable_by_key(CollectionCommit::id);
-        assert_eq!(snapshot.commits(), expected_commits);
+        assert_eq!(snapshot.cover(), &cover);
+        assert_eq!(snapshot.cover().len(), 1);
+        assert_eq!(claims_for(&mut pile, &cover), expected_commits);
         let fact = snapshot.facts().iter().next().unwrap();
         assert_eq!(fact.e(), &model_root);
         assert_eq!(fact.a(), &metadata::archive.id());
@@ -1672,13 +1997,13 @@ mod tests {
         snapshot.reader().get::<Bytes, _>(payload_handle).unwrap();
 
         assert_eq!(
-            local_model_bundle_ticket(&mut pile, test_team()).unwrap(),
-            expected_commits
+            local_model_bundle_cover(&mut pile, test_team()).unwrap(),
+            cover
         );
         let (observed_team, observed) =
             snapshot_sole_model_bundle_collection_local_latest(&mut pile).unwrap();
         assert_eq!(observed_team, test_team());
-        assert_eq!(observed.commits(), expected_commits);
+        assert_eq!(observed.cover(), &cover);
         drop(observed);
         drop(snapshot);
         pile.close().unwrap();
@@ -1688,13 +2013,20 @@ mod tests {
     fn sole_bundle_snapshot_rejects_multiple_teams_in_its_frozen_prefix() {
         let file = TempPilePath::new("model-bundle-team-ambiguity");
         let signer = SigningKey::from_bytes(&[0x54; 32]);
-        let other_team = SigningKey::from_bytes(&[0x55; 32]).verifying_key();
+        let other_authority = SigningKey::from_bytes(&[0x55; 32]);
+        let other_team = other_authority.verifying_key();
         let (model, _, _) = fragment_fixture("team-ambiguity");
         let model_root = model.root().unwrap();
         let mut pile = open_test_pile(file.as_path());
+        grant_writer(
+            &mut pile,
+            model_bundle_collection(test_team()).collection().handle(),
+            &signer,
+        );
         publish_model_bundle_fragment(&mut pile, test_team(), &signer, model_root, model.clone())
             .unwrap();
-        publish_model_bundle_fragment(&mut pile, other_team, &signer, model_root, model).unwrap();
+        publish_model_bundle_fragment(&mut pile, other_team, &other_authority, model_root, model)
+            .unwrap();
 
         let error = match snapshot_sole_model_bundle_collection_local_latest(&mut pile) {
             Ok(_) => panic!("two bundle teams must be ambiguous"),
@@ -1711,6 +2043,108 @@ mod tests {
     }
 
     #[test]
+    fn unauthorized_foreign_bundle_claim_does_not_poison_team_discovery() {
+        let file = TempPilePath::new("model-bundle-unauthorized-team");
+        let signer = SigningKey::from_bytes(&[0x56; 32]);
+        let foreign_authority = SigningKey::from_bytes(&[0x57; 32]).verifying_key();
+        let (model, _, _) = fragment_fixture("unauthorized-team");
+        let model_root = model.root().unwrap();
+        let mut pile = open_test_pile(file.as_path());
+
+        grant_writer(
+            &mut pile,
+            model_bundle_collection(test_team()).collection().handle(),
+            &signer,
+        );
+        publish_model_bundle_fragment(&mut pile, test_team(), &signer, model_root, model.clone())
+            .unwrap();
+
+        // Local publication is deliberately unconditional. This validly
+        // signed claim names another authority's collection, but without a
+        // capability from that authority it is inert at the read boundary.
+        publish_model_bundle_fragment(&mut pile, foreign_authority, &signer, model_root, model)
+            .unwrap();
+
+        assert_eq!(model_bundle_teams(&mut pile).unwrap(), vec![test_team()]);
+        assert!(
+            local_model_bundle_cover(&mut pile, foreign_authority)
+                .unwrap()
+                .is_empty()
+        );
+        let (team, snapshot) =
+            snapshot_sole_model_bundle_collection_local_latest(&mut pile).unwrap();
+        assert_eq!(team, test_team());
+        assert_eq!(snapshot.cover().len(), 1);
+        drop(snapshot);
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn existing_collection_requires_an_admitted_writer_before_selection() {
+        let file = TempPilePath::new("model-writer-preflight");
+        let authority = test_authority();
+        let delegate = SigningKey::from_bytes(&[0x58; 32]);
+        let outsider = SigningKey::from_bytes(&[0x59; 32]);
+        let (model, _, _) = fragment_fixture("writer-preflight");
+        let mut pile = open_test_pile(file.as_path());
+        publish_model_fragment(&mut pile, test_team(), &authority, model).unwrap();
+
+        let len_before = std::fs::metadata(file.as_path()).unwrap().len();
+        let error = model_graph_team_or_own(&mut pile, &outsider).unwrap_err();
+        assert!(matches!(
+            error,
+            ModelCollectionWriterSelectionError::NotAdmitted {
+                authority,
+                signer,
+                ..
+            } if authority == test_team().to_bytes()
+                && signer == outsider.verifying_key().to_bytes()
+        ));
+        assert_eq!(
+            std::fs::metadata(file.as_path()).unwrap().len(),
+            len_before,
+            "writer selection must not publish an inert claim"
+        );
+
+        grant_writer(
+            &mut pile,
+            model_graph_collection(test_team()).collection().handle(),
+            &delegate,
+        );
+        assert_eq!(
+            model_graph_team_or_own(&mut pile, &delegate).unwrap(),
+            test_team()
+        );
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn stable_pile_observation_retries_after_an_interleaved_append() {
+        let file = TempPilePath::new("stable-observation");
+        let mut pile = open_test_pile(file.as_path());
+        let mut appender = open_test_pile(file.as_path());
+        let mut attempts = 0usize;
+
+        let observed: Result<usize, ReadError> = observe_stable_pile(
+            &mut pile,
+            |_| {
+                attempts += 1;
+                if attempts == 1 {
+                    appender
+                        .put::<RawBytes, _>(b"interleaved".to_vec().to_blob())
+                        .unwrap();
+                }
+                Ok(attempts)
+            },
+            |source| source,
+        );
+
+        assert_eq!(observed.unwrap(), 2);
+        appender.close().unwrap();
+        pile.close().unwrap();
+    }
+
+    #[test]
     fn retained_rewrite_follows_bundle_token_into_model_archive_and_attachments() {
         let source_file = TempPilePath::new("model-bundle-rewrite-source");
         let destination_file = TempPilePath::new("model-bundle-rewrite-destination");
@@ -1722,9 +2156,13 @@ mod tests {
         let model_archive_data = prepared.model_archive_data();
 
         let mut source = open_test_pile(source_file.as_path());
-        let commit =
-            publish_model_bundle_fragment(&mut source, test_team(), &signer, model_root, model)
-                .unwrap();
+        grant_writer(
+            &mut source,
+            model_bundle_collection(test_team()).collection().handle(),
+            &signer,
+        );
+        publish_model_bundle_fragment(&mut source, test_team(), &signer, model_root, model)
+            .unwrap();
         let orphan: Blob<RawBytes> = b"deliberate orphan".to_vec().to_blob();
         let orphan_handle = source.put::<RawBytes, _>(orphan).unwrap();
 
@@ -1739,10 +2177,10 @@ mod tests {
 
         // The signed COMMIT recursively owns T, T names H, and H's facts name
         // both fixture attachments. None is an explicit rewrite root.
+        let cover = local_model_bundle_cover(&mut source, test_team()).unwrap();
         let snapshot =
-            snapshot_model_bundle_collection_exact(&mut destination, test_team(), &[commit])
-                .unwrap();
-        assert_eq!(snapshot.commits(), &[commit]);
+            snapshot_model_bundle_collection_exact(&mut destination, test_team(), &cover).unwrap();
+        assert_eq!(snapshot.cover(), &cover);
         assert_eq!(snapshot.facts().len(), 1);
         let token = snapshot.facts().iter().next().unwrap();
         assert_eq!(token.e(), &model_root);
@@ -1779,11 +2217,7 @@ mod tests {
         let error = prepare_model_bundle_fragment(test_team(), false_root, fragment).unwrap_err();
         assert!(matches!(error, PrepareModelBundleError::RootAbsent(root) if root == false_root));
         assert_eq!(std::fs::metadata(file.as_path()).unwrap().len(), len_before);
-        assert!(
-            local_model_bundle_ticket(&mut pile, test_team())
-                .unwrap()
-                .is_empty()
-        );
+        assert!(model_bundle_teams(&mut pile).unwrap().is_empty());
         pile.close().unwrap();
     }
 
@@ -1803,11 +2237,7 @@ mod tests {
         let withheld = *staged.commit();
         drop(staged);
 
-        assert!(
-            local_model_bundle_ticket(&mut pile, test_team())
-                .unwrap()
-                .is_empty()
-        );
+        assert!(model_bundle_teams(&mut pile).unwrap().is_empty());
         let reader = pile.reader().unwrap();
         reader
             .get::<Blob<SimpleArchive>, _>(inlineencodings::Handle::<SimpleArchive>::from_hash(
@@ -1833,6 +2263,11 @@ mod tests {
         let expected_metafacts = fragment.metafacts().clone();
 
         let mut pile = open_test_pile(file.as_path());
+        grant_writer(
+            &mut pile,
+            model_graph_collection(test_team()).collection().handle(),
+            &signing_key,
+        );
         let first =
             publish_model_fragment(&mut pile, test_team(), &signing_key, fragment.clone()).unwrap();
         let repeated =
@@ -1844,12 +2279,13 @@ mod tests {
         );
         first.verify_strict().unwrap();
 
-        // Snapshot directly from the same still-open pile. A duplicate ticket
-        // is a mathematical set and therefore returns one canonical commit.
-        let snapshot =
-            snapshot_model_collection_exact(&mut pile, test_team(), &[repeated, first]).unwrap();
+        // Snapshot directly from the same still-open pile. Duplicate claims
+        // over one payload collapse to one cover member.
+        let cover = local_model_cover(&mut pile, test_team()).unwrap();
+        let snapshot = snapshot_model_collection_exact(&mut pile, test_team(), &cover).unwrap();
         assert_eq!(snapshot.facts(), &expected_facts);
-        assert_eq!(snapshot.commits(), &[first]);
+        assert_eq!(snapshot.cover().len(), 1);
+        assert_eq!(claims_for(&mut pile, &cover), vec![first]);
 
         // The owned PileReader mapping must outlive the mutable pile handle.
         pile.close().unwrap();
@@ -1860,8 +2296,7 @@ mod tests {
         assert_eq!(&*text, "model attachment roundtrip");
         assert_eq!(&*payload, b"roundtrip");
 
-        let loaded =
-            load_model_collection_from_ticket(file.as_path(), test_team(), &[first]).unwrap();
+        let loaded = load_model_collection_from_cover(file.as_path(), test_team(), &cover).unwrap();
         assert_eq!(loaded.facts(), &expected_facts);
         let text_after_path_close: View<str> = loaded.reader().get(text_handle).unwrap();
         assert_eq!(&*text_after_path_close, "model attachment roundtrip");
@@ -1872,6 +2307,11 @@ mod tests {
         let file = TempPilePath::new("selected-model-index");
         let signing_key = SigningKey::from_bytes(&[0x19; 32]);
         let mut pile = open_test_pile(file.as_path());
+        grant_writer(
+            &mut pile,
+            model_graph_collection(test_team()).collection().handle(),
+            &signing_key,
+        );
 
         let leaf = crate::format::put_raw(&mut pile, &[1.25], &[1]).unwrap();
         let leaf_id = leaf.root().expect("tensor leaf root");
@@ -1896,14 +2336,15 @@ mod tests {
         let model_root = model.root().expect("model root");
         facts += model.into_facts();
 
-        let commit = publish_model_fragment(
+        publish_model_fragment(
             &mut pile,
             test_team(),
             &signing_key,
             Fragment::rooted(model_root, facts),
         )
         .unwrap();
-        let snapshot = snapshot_model_collection_exact(&mut pile, test_team(), &[commit]).unwrap();
+        let cover = local_model_cover(&mut pile, test_team()).unwrap();
+        let snapshot = snapshot_model_collection_exact(&mut pile, test_team(), &cover).unwrap();
         pile.close().unwrap();
 
         let selected = crate::selection::SelectedModelIndex::from_snapshot(
@@ -1923,44 +2364,49 @@ mod tests {
     }
 
     #[test]
-    fn exact_ticket_accepts_mixed_authors_and_keeps_unselected_commits_inert() {
+    fn exact_cover_accepts_mixed_authors_and_keeps_later_members_inert() {
         let file = TempPilePath::new("exact-mixed-authors");
         let mut pile = open_test_pile(file.as_path());
         let (first_fragment, _, _) = fragment_fixture("first");
         let first_facts = first_fragment.facts().clone();
-        let first = publish_model_fragment(
+        let first_signer = SigningKey::from_bytes(&[0x21; 32]);
+        grant_writer(
             &mut pile,
-            test_team(),
-            &SigningKey::from_bytes(&[0x21; 32]),
-            first_fragment,
-        )
-        .unwrap();
+            model_graph_collection(test_team()).collection().handle(),
+            &first_signer,
+        );
+        let first =
+            publish_model_fragment(&mut pile, test_team(), &first_signer, first_fragment).unwrap();
         let (second_fragment, _, _) = fragment_fixture("second");
         let second_facts = second_fragment.facts().clone();
-        let second = publish_model_fragment(
+        let second_signer = SigningKey::from_bytes(&[0x22; 32]);
+        grant_writer(
             &mut pile,
-            test_team(),
-            &SigningKey::from_bytes(&[0x22; 32]),
-            second_fragment,
-        )
-        .unwrap();
+            model_graph_collection(test_team()).collection().handle(),
+            &second_signer,
+        );
+        let second =
+            publish_model_fragment(&mut pile, test_team(), &second_signer, second_fragment)
+                .unwrap();
+        let cover = local_model_cover(&mut pile, test_team()).unwrap();
         let (unselected, _, _) = fragment_fixture("unselected");
-        publish_model_fragment(
+        let unselected_signer = SigningKey::from_bytes(&[0x23; 32]);
+        grant_writer(
             &mut pile,
-            test_team(),
-            &SigningKey::from_bytes(&[0x23; 32]),
-            unselected,
-        )
-        .unwrap();
+            model_graph_collection(test_team()).collection().handle(),
+            &unselected_signer,
+        );
+        publish_model_fragment(&mut pile, test_team(), &unselected_signer, unselected).unwrap();
 
-        let snapshot =
-            snapshot_model_collection_exact(&mut pile, test_team(), &[second, first]).unwrap();
+        let snapshot = snapshot_model_collection_exact(&mut pile, test_team(), &cover).unwrap();
         let mut expected = first_facts;
         expected += second_facts;
         let mut expected_commits = vec![first, second];
         expected_commits.sort_unstable_by_key(CollectionCommit::id);
         assert_eq!(snapshot.facts(), &expected);
-        assert_eq!(snapshot.commits(), expected_commits);
+        assert_eq!(snapshot.cover(), &cover);
+        assert_eq!(snapshot.cover().len(), 2);
+        assert_eq!(claims_for(&mut pile, &cover), expected_commits);
         assert_ne!(first.public_key(), second.public_key());
         pile.close().unwrap();
     }
@@ -1971,22 +2417,25 @@ mod tests {
         let mut pile = open_test_pile(file.as_path());
         let (first_fragment, _, _) = fragment_fixture("local-first");
         let first_facts = first_fragment.facts().clone();
-        let first = publish_model_fragment(
+        let first_signer = SigningKey::from_bytes(&[0x31; 32]);
+        grant_writer(
             &mut pile,
-            test_team(),
-            &SigningKey::from_bytes(&[0x31; 32]),
-            first_fragment,
-        )
-        .unwrap();
+            model_graph_collection(test_team()).collection().handle(),
+            &first_signer,
+        );
+        let first =
+            publish_model_fragment(&mut pile, test_team(), &first_signer, first_fragment).unwrap();
         let (second_fragment, _, _) = fragment_fixture("local-second");
         let second_facts = second_fragment.facts().clone();
-        let second = publish_model_fragment(
+        let second_signer = SigningKey::from_bytes(&[0x32; 32]);
+        grant_writer(
             &mut pile,
-            test_team(),
-            &SigningKey::from_bytes(&[0x32; 32]),
-            second_fragment,
-        )
-        .unwrap();
+            model_graph_collection(test_team()).collection().handle(),
+            &second_signer,
+        );
+        let second =
+            publish_model_fragment(&mut pile, test_team(), &second_signer, second_fragment)
+                .unwrap();
 
         // "Foreign" now means a different name under the same team, which is
         // the shape a real unrelated collection takes.
@@ -2017,36 +2466,39 @@ mod tests {
         let mut expected_commits = vec![first, second];
         expected_commits.sort_unstable_by_key(CollectionCommit::id);
         assert_eq!(in_place.facts(), &expected);
-        assert_eq!(in_place.commits(), expected_commits);
+        assert_eq!(claims_for(&mut pile, in_place.cover()), expected_commits);
+        assert_eq!(in_place.cover().collection().handle(), first.collection());
+        assert_ne!(in_place.cover().collection().handle(), foreign.collection());
+        let expected_cover = in_place.cover().clone();
         pile.close().unwrap();
 
         let snapshot = load_model_collection_local_latest(file.as_path(), test_team()).unwrap();
         assert_eq!(snapshot.facts(), &expected);
-        assert_eq!(snapshot.commits(), expected_commits);
-        assert!(
-            snapshot
-                .commits()
-                .iter()
-                .all(|commit| commit.collection() != foreign.collection())
-        );
+        assert_eq!(snapshot.cover(), &expected_cover);
 
         let (team, sole_snapshot) =
             load_sole_model_collection_local_latest(file.as_path()).unwrap();
         assert_eq!(team, test_team());
         assert_eq!(sole_snapshot.facts(), &expected);
-        assert_eq!(sole_snapshot.commits(), expected_commits);
+        assert_eq!(sole_snapshot.cover(), &expected_cover);
     }
 
     #[test]
     fn sole_model_snapshot_rejects_multiple_teams_in_its_frozen_prefix() {
         let file = TempPilePath::new("model-graph-team-ambiguity");
         let signer = SigningKey::from_bytes(&[0x34; 32]);
-        let other_team = SigningKey::from_bytes(&[0x35; 32]).verifying_key();
+        let other_authority = SigningKey::from_bytes(&[0x35; 32]);
+        let other_team = other_authority.verifying_key();
         let (first, _, _) = fragment_fixture("first-team");
         let (second, _, _) = fragment_fixture("second-team");
         let mut pile = open_test_pile(file.as_path());
+        grant_writer(
+            &mut pile,
+            model_graph_collection(test_team()).collection().handle(),
+            &signer,
+        );
         publish_model_fragment(&mut pile, test_team(), &signer, first).unwrap();
-        publish_model_fragment(&mut pile, other_team, &signer, second).unwrap();
+        publish_model_fragment(&mut pile, other_team, &other_authority, second).unwrap();
 
         let error = match snapshot_sole_model_collection_local_latest(&mut pile) {
             Ok(_) => panic!("two model-graph teams must be ambiguous"),
@@ -2063,17 +2515,17 @@ mod tests {
     }
 
     #[test]
-    fn local_latest_retains_invalid_matching_commits_so_exact_read_fails() {
+    fn local_cover_ignores_invalid_matching_claims() {
         let file = TempPilePath::new("local-invalid-matching");
         let mut pile = open_test_pile(file.as_path());
         let (fragment, _, _) = fragment_fixture("invalid-matching");
-        let valid = publish_model_fragment(
+        let signer = SigningKey::from_bytes(&[0x41; 32]);
+        grant_writer(
             &mut pile,
-            test_team(),
-            &SigningKey::from_bytes(&[0x41; 32]),
-            fragment,
-        )
-        .unwrap();
+            model_graph_collection(test_team()).collection().handle(),
+            &signer,
+        );
+        let valid = publish_model_fragment(&mut pile, test_team(), &signer, fragment).unwrap();
         let mut invalid_bytes = valid.to_bytes();
         *invalid_bytes.last_mut().unwrap() ^= 1;
         let invalid = CollectionCommit::from_bytes(invalid_bytes);
@@ -2082,18 +2534,11 @@ mod tests {
         pile.insert(CollectionRecord::Commit(invalid)).unwrap();
         pile.close().unwrap();
 
-        let error = match load_model_collection_local_latest(file.as_path(), test_team()) {
-            Ok(_) => panic!("invalid matching commit unexpectedly materialized"),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            error,
-            LoadModelCollectionError::Materialize(
-                CollectionMaterializationError::ExactTicket(
-                    ExactTicketError::MissingOrInvalidCommit { commit }
-                )
-            ) if commit == invalid.id()
-        ));
+        let snapshot = load_model_collection_local_latest(file.as_path(), test_team()).unwrap();
+        assert_eq!(snapshot.cover().len(), 1);
+        let mut pile = open_test_pile(file.as_path());
+        assert_eq!(claims_for(&mut pile, snapshot.cover()), vec![valid]);
+        pile.close().unwrap();
     }
 
     #[test]
@@ -2112,10 +2557,7 @@ mod tests {
             Ok(_) => panic!("corrupt pile unexpectedly loaded"),
             Err(error) => error,
         };
-        assert!(matches!(
-            error,
-            LoadModelCollectionError::LocalTicket(ReadError::CorruptPile { valid_length: 0 })
-        ));
+        assert!(matches!(error, LoadModelCollectionError::Cover(_)));
         assert_eq!(std::fs::metadata(file.as_path()).unwrap().len(), before);
     }
 

@@ -3,7 +3,7 @@ use std::path::Path;
 
 use burn::prelude::*;
 use burn::tensor::TensorData;
-use triblespace::core::collection::CollectionSnapshot;
+use triblespace::core::collection::FactSnapshot;
 use triblespace::prelude::BlobStoreGet;
 
 use crate::leaf::Leaf;
@@ -85,7 +85,7 @@ impl FluxWeights {
     /// immutable native model-collection snapshot. A component may span
     /// several real roots (the Klein text encoder has two weight shards).
     pub fn from_snapshot<R: BlobStoreGet>(
-        snapshot: CollectionSnapshot<R>,
+        snapshot: FactSnapshot<R>,
         variant: ModelVariant,
     ) -> anyhow::Result<Self> {
         fn select_component(

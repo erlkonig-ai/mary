@@ -23,16 +23,17 @@
 //! does the encoding and the check — it answers "would this import cleanly"
 //! without committing to it.
 //!
-//!   inkling_dense_import <checkpoint-dir> [pile] [--limit N]
+//!   inkling_dense_import <checkpoint-dir> [pile --signing-key <existing-key>]
+//!       [--limit N]
 
 use anyhow::{Context, Result};
-use ed25519_dalek::SigningKey;
 use mary::models::inkling::load::Checkpoint;
 use mary::models::inkling::pile::{PileSource, attrs, layer_of};
 use triblespace::core::blob::TryFromBlob;
 use triblespace::core::blob::encodings::tensor::elements::{BF16, F32};
 use triblespace::core::blob::encodings::tensor::{TensorView, tensor_blob};
 use triblespace::core::metadata;
+use triblespace::core::signing_key_file;
 use triblespace::macros::entity;
 use triblespace::prelude::*;
 
@@ -182,16 +183,21 @@ fn verify_pile(dir: &str, pile_path: &str, limit: usize) -> Result<()> {
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let dir = args
-        .next()
-        .context("usage: inkling_dense_import <checkpoint-dir> [pile] [--limit N]")?;
+    let dir = args.next().context(
+        "usage: inkling_dense_import <checkpoint-dir> \
+             [pile --signing-key <existing-key>] [--limit N]",
+    )?;
     let mut pile_path: Option<String> = None;
     let mut limit = usize::MAX;
     let mut verify: Option<String> = None;
     let mut repair = false;
+    let mut signing_key_path: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--limit" => limit = args.next().context("--limit needs a value")?.parse()?,
+            "--signing-key" => {
+                signing_key_path = Some(args.next().context("--signing-key needs a path")?)
+            }
             "--verify" => verify = Some(args.next().context("--verify needs a pile")?),
             "--repair" => repair = true,
             other => pile_path = Some(other.to_string()),
@@ -201,23 +207,6 @@ fn main() -> Result<()> {
     if let Some(v) = verify {
         return verify_pile(&dir, &v, limit);
     }
-
-    let ck = Checkpoint::open(&dir).with_context(|| format!("opening {dir}"))?;
-    let names = ck.names();
-    println!("checkpoint {dir}");
-    println!("tensors    {} in the index", names.len());
-
-    // A packed expert needs its sidecars and a different encoding entirely, so
-    // it is skipped here rather than half-handled. The skip is REPORTED with a
-    // count: a silent skip in an importer is how a model arrives missing a
-    // third of itself and nothing says so.
-    let (dense, experts): (Vec<&String>, Vec<&String>) =
-        names.iter().partition(|n| !n.contains(".experts."));
-    println!(
-        "           {} dense, {} expert (skipped here — see inkling_pile_import)",
-        dense.len(),
-        experts.len()
-    );
 
     // Names the collection already holds. Entities are content-derived, but a
     // scan still turns a re-run into a byte-identical no-op instead of adding a
@@ -229,6 +218,12 @@ fn main() -> Result<()> {
             None
         }
         Some(p) => {
+            let signing_key_path = signing_key_path
+                .as_deref()
+                .context("--signing-key <existing-key> is required when a pile path is supplied")?;
+            let signing_key =
+                signing_key_file::load_existing(std::path::Path::new(signing_key_path))
+                    .with_context(|| format!("load existing signing key {signing_key_path:?}"))?;
             let path = std::path::Path::new(p);
             if !path.exists() {
                 println!("creating a new pile at {p}");
@@ -260,13 +255,16 @@ fn main() -> Result<()> {
                     )
                 })?;
             }
-            let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
-            let team = match mary::model_collection::sole_model_graph_team(&mut store) {
-                Ok(team) => {
-                    let snapshot = mary::model_collection::snapshot_model_collection_local_latest(
-                        &mut store, team,
-                    )
-                    .map_err(|e| anyhow::anyhow!("model collection snapshot: {e}"))?;
+            // Fail before checkpoint indexing or the first tensor conversion
+            // unless this durable signer can publish to the existing authority.
+            let team = mary::model_collection::model_graph_team_or_own(&mut store, &signing_key)
+                .map_err(|e| anyhow::anyhow!("model collection writer: {e}"))?;
+            match mary::model_collection::snapshot_sole_model_collection_local_latest(&mut store) {
+                Ok((snapshot_team, snapshot)) => {
+                    anyhow::ensure!(
+                        snapshot_team == team,
+                        "model collection authority changed during writer preflight"
+                    );
                     let facts =
                         mary::model_collection::project_legacy_model_attributes(snapshot.facts())
                             .facts;
@@ -303,16 +301,35 @@ fn main() -> Result<()> {
                     seen!(F32, 3);
                     seen!(F32, 4);
                     println!("resuming   {} tensors already in the pile", present.len());
-                    team
                 }
-                Err(mary::model_collection::SoleModelGraphTeamError::None) => {
-                    signing_key.verifying_key()
-                }
+                Err(mary::model_collection::SnapshotSoleModelGraphError::Team(
+                    mary::model_collection::SoleModelGraphTeamError::None,
+                )) => {}
                 Err(e) => return Err(anyhow::anyhow!("model collection: {e}")),
-            };
+            }
             Some((store, signing_key, team, Fragment::empty()))
         }
     };
+
+    // Writer admission above is deliberately earlier than opening and
+    // indexing the checkpoint: an unauthorized invocation must fail before it
+    // does useful work, not after gigabytes have been converted.
+    let ck = Checkpoint::open(&dir).with_context(|| format!("opening {dir}"))?;
+    let names = ck.names();
+    println!("checkpoint {dir}");
+    println!("tensors    {} in the index", names.len());
+
+    // A packed expert needs its sidecars and a different encoding entirely, so
+    // it is skipped here rather than half-handled. The skip is REPORTED with a
+    // count: a silent skip in an importer is how a model arrives missing a
+    // third of itself and nothing says so.
+    let (dense, experts): (Vec<&String>, Vec<&String>) =
+        names.iter().partition(|n| !n.contains(".experts."));
+    println!(
+        "           {} dense, {} expert (skipped here — see inkling_pile_import)",
+        dense.len(),
+        experts.len()
+    );
 
     let mut by_dtype: std::collections::BTreeMap<String, usize> = Default::default();
     let mut by_rank_count: std::collections::BTreeMap<usize, usize> = Default::default();

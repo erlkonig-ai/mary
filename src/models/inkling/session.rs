@@ -740,8 +740,8 @@ impl Session {
                 .document("config.json")
                 .context(
                     "this pile carries no config.json. Ingest the checkpoint's sidecars as \
-                     facts (inkling_meta_gate <ckpt> <pile>), or set SessionConfig::\
-                     config_override to run without them",
+                     facts (inkling_meta_gate <ckpt> <pile> --signing-key <existing-key>), \
+                     or set SessionConfig::config_override to run without them",
                 )?
                 .to_string(),
         };

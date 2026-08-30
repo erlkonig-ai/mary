@@ -12,6 +12,7 @@
 use std::path::Path;
 
 use mary::models::personaplex::spm::SpmTokenizer;
+use triblespace::core::signing_key_file;
 use triblespace::prelude::*;
 
 /// Strings chosen to exercise every lane the port cares about: plain ASCII,
@@ -36,17 +37,42 @@ const PROBES: &[&str] = &[
 ];
 
 fn main() {
+    let mut args = std::env::args().skip(1);
+    let model_path = args.next();
+    let mut pile = None;
+    let mut signing_key_path = None;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--signing-key" => {
+                signing_key_path = Some(args.next().unwrap_or_else(|| {
+                    eprintln!("--signing-key needs a path");
+                    std::process::exit(2)
+                }))
+            }
+            flag if flag.starts_with('-') => {
+                eprintln!("unknown argument {flag}");
+                std::process::exit(2)
+            }
+            path if pile.is_none() => pile = Some(path.to_string()),
+            other => {
+                eprintln!("unexpected argument {other:?}");
+                std::process::exit(2)
+            }
+        }
+    }
+    if pile.is_none() && signing_key_path.is_some() {
+        eprintln!("--signing-key requires a destination pile");
+        std::process::exit(2);
+    }
+
     // argv[1], else `$MARY_MODELS/tokenizer_spm_32k_3.model`; never a guess.
-    let path = mary::paths::model(
-        std::env::args().nth(1).as_deref(),
-        "tokenizer_spm_32k_3.model",
-    )
-    .unwrap_or_else(|e| {
-        eprintln!("{e}");
-        std::process::exit(2)
-    })
-    .to_string_lossy()
-    .into_owned();
+    let path = mary::paths::model(model_path.as_deref(), "tokenizer_spm_32k_3.model")
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        })
+        .to_string_lossy()
+        .into_owned();
     println!("spm model: {path}");
 
     // ── 1. the file path (the proven one) ──
@@ -132,15 +158,25 @@ fn main() {
     // The in-memory pass proves the schema. It does NOT prove the pile: commit,
     // push, reopen and blob-resolution are all untested by it. So when a pile is
     // named, ingest and gate again through the on-disk path.
-    let Some(pile) = std::env::args().nth(2) else {
+    let Some(pile) = pile else {
         println!("\n(no pile argument — nothing was written. Pass one to ingest for real.)");
         return;
     };
+    let signing_key_path = signing_key_path.unwrap_or_else(|| {
+        eprintln!("--signing-key <existing-key> is required when writing a pile");
+        std::process::exit(2)
+    });
+    let signing_key =
+        signing_key_file::load_existing(Path::new(&signing_key_path)).unwrap_or_else(|error| {
+            eprintln!("load existing signing key {signing_key_path:?}: {error}");
+            std::process::exit(2)
+        });
     println!("\n=== ingesting into {pile} ===");
     match mary::persist::ingest_spm_tokenizer(
         Path::new(&pile),
         Path::new(&path),
         "kyutai/moshiko-pytorch-bf16 tokenizer_spm_32k_3.model",
+        &signing_key,
     ) {
         Ok(n) => println!("committed: {n} facts"),
         Err(e) => {
