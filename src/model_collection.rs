@@ -2725,7 +2725,19 @@ mod tests {
             Ok(_) => panic!("corrupt pile unexpectedly loaded"),
             Err(error) => error,
         };
-        assert!(matches!(error, LoadModelCollectionError::Cover(_)));
+        // This asserted `Cover` before the store-snapshot epoch, and the move
+        // to `Refresh` is the port showing through rather than a weakening:
+        // the damaged tail used to be met by whichever read capability the
+        // cover discovery happened to acquire first, so a storage fault was
+        // reported as a collection fault. Freezing the observation is now the
+        // first thing that touches the file, so the fault is reported where it
+        // happens. What the test is actually for — a corrupt pile is diagnosed
+        // and never repaired behind the caller's back — is unchanged and
+        // asserted below.
+        match &error {
+            LoadModelCollectionError::Refresh(ReadError::CorruptPile { .. }) => {}
+            other => panic!("expected a corrupt-tail refresh failure, got {other}"),
+        }
         assert_eq!(std::fs::metadata(file.as_path()).unwrap().len(), before);
     }
 

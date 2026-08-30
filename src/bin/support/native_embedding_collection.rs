@@ -5,6 +5,7 @@ use mary::selection::{ModelSelector, SelectedModelIndex, TokenizerSelector};
 use std::collections::BTreeMap;
 use std::path::Path;
 use triblespace::core::collection::CollectionCommit;
+use triblespace::core::repo::SnapshotSource;
 use triblespace::core::repo::pile::Pile;
 use triblespace::prelude::*;
 
@@ -120,8 +121,19 @@ fn publish_embedding_candidate_with_contract_impl(
         .stage(pile, signing_key)
         .map_err(|error| anyhow::anyhow!("stage embedding commit dependencies: {error}"))?;
 
-    let snapshot =
-        mary::model_collection::snapshot_model_collection_local_latest(staged.store_mut(), team)?;
+    // The reason `local_model_cover`'s four-trait bound could collapse to one
+    // concrete `&PileSnapshot`: `OfferCapture<&mut Pile>` freezes the SAME
+    // `PileSnapshot` the bare pile does (`SnapshotSource for OfferCapture` sets
+    // `Snapshot = S::Snapshot`). The old signature had to be generic over the
+    // mutable staging wrapper because each read capability came off the wrapper
+    // separately; the observation does not care what wrapped the writer.
+    // Taken here, after staging, so the candidate's dependencies are resident
+    // in the prefix that validates them.
+    let store = staged
+        .store_mut()
+        .snapshot()
+        .map_err(|error| anyhow::anyhow!("freeze staged embedding observation: {error}"))?;
+    let snapshot = mary::model_collection::snapshot_model_collection_in(&store, team)?;
     let (mut facts, _, reader) = snapshot.into_parts();
     facts += candidate_facts;
     let selected = SelectedModelIndex::from_graph(
@@ -141,7 +153,7 @@ fn publish_embedding_candidate_with_contract_impl(
     if tokenizer_json.is_some() {
         let tokenizer = mary::selection::load_tokenizer_from_graph(
             &facts,
-            selected.store(),
+            selected.reader(),
             TokenizerSelector::Name(source),
         )?;
         architecture.validate_tokenizer(&tokenizer)?;
