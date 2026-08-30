@@ -534,19 +534,10 @@ fn combine_run_and_finish(run: Result<()>, finish: Result<()>) -> Result<()> {
     }
 }
 
-/// One number's worth of order statistics, with the framing rule attached.
-///
-/// This is the whole point of a finite `--turns` run: it produces the AFTER
-/// number for the module header's BEFORE number, at the same granularity and
-/// measured in the same place, so the two are comparable without
-/// reconstruction.
-fn report_decode_distribution(proofs: &[StreamProof]) {
-    let mut secs: Vec<f64> = proofs
-        .iter()
-        .flat_map(|proof| proof.token_secs.iter().copied())
-        .collect();
+/// Order statistics for one per-token vector, with its framing rule attached.
+fn distribution(label: &str, framing: &str, mut secs: Vec<f64>) {
     if secs.is_empty() {
-        println!("decode: no tokens generated");
+        println!("{label}: no tokens generated");
         return;
     }
     secs.sort_by(|left, right| {
@@ -558,7 +549,7 @@ fn report_decode_distribution(proofs: &[StreamProof]) {
         secs[index] * 1_000.0
     };
     println!(
-        "decode: n={} min {:.1} p25 {:.1} p50 {:.1} p75 {:.1} p95 {:.1} max {:.1} ms",
+        "{label}: n={} min {:.1} p25 {:.1} p50 {:.1} p75 {:.1} p95 {:.1} max {:.1} ms",
         secs.len(),
         secs[0] * 1_000.0,
         quantile(0.25),
@@ -567,12 +558,69 @@ fn report_decode_distribution(proofs: &[StreamProof]) {
         quantile(0.95),
         secs[secs.len() - 1] * 1_000.0,
     );
-    println!(
-        "  framing rule: MILLISECONDS PER GENERATED TOKEN, one one-token consult each — the \
-         granularity Drive actually generates at, not a multi-token consult amortised. Measured \
-         around this process's own Session calls. The number to compare it against is the \
-         framed-stream baseline in this binary's header: p50 82 ms (n=768, min 58, p25 65, \
-         p75 114, p95 186), 42 layers, TP2, both Sparks."
+    println!("  {framing}");
+}
+
+/// The measurement this change is judged by, and it is SELF-CONTAINED.
+///
+/// Three distributions out of one finite run:
+///
+///   * what the MODEL cost (`Session` calls only) — the quantity the collapse
+///     should not have changed, previously 55.8 / 58.7 ms within one 32-token
+///     consult;
+///   * what DRIVE PAID (its own wall clock around the whole consult) — the
+///     quantity the collapse exists to move, previously p50 82 ms (n=768,
+///     min 58, p25 65, p75 114, p95 186) through the framed-stream proxy;
+///   * the DIFFERENCE, per token, which is everything that was not the model.
+///     That difference was ~26 ms — about a third of resident decode. In one
+///     process it should be a virtual call.
+///
+/// Printing all three means the before-number and the after-number for the
+/// overhead both come out of this invocation, rather than the after-number
+/// being compared against a figure remembered from another day.
+fn report_decode_distribution(proofs: &[StreamProof]) {
+    let model: Vec<f64> = proofs
+        .iter()
+        .flat_map(|proof| proof.token_secs.iter().copied())
+        .collect();
+    let consult: Vec<f64> = proofs
+        .iter()
+        .flat_map(|proof| proof.consult_secs.iter().copied())
+        .collect();
+    if model.len() != consult.len() {
+        println!(
+            "decode: {} model sample(s) against {} consult sample(s) — refusing to pair them",
+            model.len(),
+            consult.len()
+        );
+        return;
+    }
+    let overhead: Vec<f64> = consult
+        .iter()
+        .zip(&model)
+        .map(|(paid, spent)| paid - spent)
+        .collect();
+
+    distribution(
+        "decode (model)",
+        "ms PER GENERATED TOKEN, around the Session calls only, at the layer range and world \
+         size READY named. Before: 55.8 / 58.7 ms within one 32-token consult.",
+        model,
+    );
+    distribution(
+        "decode (as Drive pays it)",
+        "ms PER GENERATED TOKEN, this process's own wall clock around the whole consult, same \
+         layers and world. Before: p50 82 (n=768, min 58, p25 65, p75 114, p95 186), through \
+         the deleted framed-stream proxy.",
+        consult,
+    );
+    distribution(
+        "consult overhead",
+        "ms PER GENERATED TOKEN that was NOT the model — the difference of the two above. \
+         Before: ~26, i.e. about a third of resident decode: a framed-stream round trip through \
+         a fan-out proxy, two rank pipes, an ssh channel and two JSON TurnEnd envelopes. After \
+         the one-binary collapse this is a virtual call, and THIS ROW IS THE RESULT.",
+        overhead,
     );
 }
 

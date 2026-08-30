@@ -1386,22 +1386,42 @@ pub struct StreamProof {
     pub tokens_at_first_return: Option<usize>,
     /// Records the faculty had returned by the end of the turn.
     pub records_at_end: u64,
-    /// Seconds each of this turn's tokens cost, in generation order, as the
-    /// model measured them around its own `Session` calls.
+    /// Seconds each of this turn's tokens cost INSIDE THE MODEL, in generation
+    /// order — [`TurnEnd::turn_secs`] of each one-token consult.
     ///
-    /// **Framing rule: seconds per GENERATED TOKEN, at the granularity Drive
-    /// actually generates them** — one one-token consult each — over the layer
-    /// range [`Ready::layers`] names, on the world size [`Ready::tp_world`]
-    /// names. That is deliberately the SAME quantity the module header's third
-    /// row reports (p50 82 ms through the deleted framed-stream proxy), so the
-    /// two are comparable without reconstructing anything: run a finite
-    /// `inkling_drive --turns n` and the distribution over every element of
-    /// every turn's vector is the after-number for the before-number in that
-    /// table.
+    /// **Framing rule: seconds per GENERATED TOKEN, measured around the
+    /// `Session` calls and nothing else**, over the layer range
+    /// [`Ready::layers`] names, on the world size [`Ready::tp_world`] names.
+    /// This is the same quantity the module header's FIRST rows report
+    /// (55.8 / 58.7 ms within one 32-token consult) — the model's own time,
+    /// which the collapse should NOT have changed.
     ///
     /// Retained only under [`InklingMind::new_gate`]: an unbounded resident run
     /// must not accumulate one `f64` per token forever.
     pub token_secs: Vec<f64>,
+    /// Seconds each of this turn's tokens cost AS DRIVE PAYS FOR IT: this
+    /// mind's own wall clock around the whole [`Model::consult`], in the same
+    /// order.
+    ///
+    /// **Framing rule: seconds per GENERATED TOKEN including everything
+    /// between the mind and the model**, same layers, same world. This is the
+    /// quantity the module header's third row reports — p50 82 ms, n=768,
+    /// through the deleted framed-stream proxy — and it is the one the collapse
+    /// exists to move.
+    ///
+    /// # The pair of vectors IS the measurement
+    ///
+    /// `consult_secs[i] - token_secs[i]` is everything that was not the model:
+    /// under the deleted arrangement, a framed-stream round trip out through a
+    /// fan-out proxy, two rank pipes, an `ssh` channel to the second box, and
+    /// two JSON `TurnEnd` envelopes back — about 26 ms, a third of resident
+    /// decode. In this process it is a virtual call.
+    ///
+    /// Keeping both means a finite run is SELF-CONTAINED evidence: the
+    /// before-number and the after-number for the overhead both come out of one
+    /// invocation, rather than the after-number being compared against a
+    /// remembered figure measured on a different day with a different framing.
+    pub consult_secs: Vec<f64>,
 }
 
 impl StreamProof {
@@ -1595,7 +1615,9 @@ impl InklingMind {
     /// This deliberately retains a [`TurnEnd`] and a [`StreamProof`] — including
     /// its per-token seconds — for every turn, so a bounded run can report the
     /// decode distribution afterwards. That report is the measurement the
-    /// one-binary collapse is judged by; see [`StreamProof::token_secs`].
+    /// one-binary collapse is judged by; see [`StreamProof::consult_secs`], whose
+    /// difference from [`StreamProof::token_secs`] IS the transport this change
+    /// deletes.
     /// Resident (`--live`) callers must use [`Self::new`], which retains
     /// nothing.
     pub fn new_gate(
@@ -2156,8 +2178,15 @@ impl InklingMind {
         let turn = self.turns;
         let mut completed = false;
         let mut cancelled = false;
+        // Per-token wall clock around the WHOLE consult, against the model's own
+        // per-token measurement inside `TurnEnd::turn_secs`. The difference is
+        // everything that is not the model, which is exactly the quantity the
+        // one-binary collapse deletes. Bounded by `max_response_tokens`, like
+        // `microturns` beside it, so a resident run grows nothing new.
+        let mut consult_secs = Vec::new();
         for _ in 0..self.max_response_tokens.max(1) {
             let mut fragments = String::new();
+            let asked = std::time::Instant::now();
             let end = match self.model.consult(&Consult::new(1), &mut |fragment: &str| {
                 fragments.push_str(fragment);
                 Ok(())
@@ -2165,6 +2194,7 @@ impl InklingMind {
                 Ok(end) => end,
                 Err(error) => return Err(FailedTurn { error, said }),
             };
+            consult_secs.push(asked.elapsed().as_secs_f64());
             let (id, fragment) = match one_token_association(&end, fragments) {
                 Ok(associated) => associated,
                 Err(error) => return Err(FailedTurn { error, said }),
@@ -2231,11 +2261,12 @@ impl InklingMind {
                 tokens,
                 tokens_at_first_return,
                 records_at_end,
-                // One element per generated token, in order. `aggregate_microturns`
-                // has already checked that each microturn was exactly one
-                // arbitrated id, so these ARE per-token seconds and not per-turn
-                // ones divided by something.
+                // One element per generated token, in order, in both vectors.
+                // `aggregate_microturns` has already checked that each microturn
+                // was exactly one arbitrated id, so these ARE per-token seconds
+                // and not per-turn ones divided by something.
                 token_secs: microturns.iter().map(|end| end.turn_secs).collect(),
+                consult_secs,
             });
         }
         if let Some(log) = &self.log {
