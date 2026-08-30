@@ -120,7 +120,6 @@ use std::collections::HashSet;
 use std::path::Path;
 use triblespace::core::blob::Blob;
 use triblespace::core::blob::encodings::UnknownBlob;
-use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::id::ExclusiveId;
 use triblespace::core::repo::{BlobStoreList, SnapshotSource};
 use triblespace::core::signing_key_file;

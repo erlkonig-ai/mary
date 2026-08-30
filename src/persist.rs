@@ -698,14 +698,13 @@ mod filtered_native_import_tests {
         .unwrap();
 
         let team = signing_key.verifying_key();
-        let cover =
-            crate::model_collection::snapshot_model_collection_local_latest(&mut pile, team)
-                .unwrap()
-                .cover()
-                .clone();
+        let store = pile.snapshot().expect("freeze test observation");
+        let cover = crate::model_collection::snapshot_model_collection_in(&store, team)
+            .unwrap()
+            .cover()
+            .clone();
         let snapshot =
-            crate::model_collection::snapshot_model_collection_exact(&mut pile, team, &cover)
-                .unwrap();
+            crate::model_collection::snapshot_model_collection_exact(&store, team, &cover).unwrap();
         let keymap = crate::selection::load_keymap_from_graph(
             snapshot.facts(),
             snapshot.store(),

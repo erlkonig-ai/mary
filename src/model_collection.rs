@@ -1722,7 +1722,6 @@ mod tests {
         CapabilityResource,
     };
     use triblespace::core::collection::ACTION_WRITE;
-    use triblespace::core::collection::CollectionStoreExt;
     use triblespace::core::repo::pile::WantRewritePolicy;
     use triblespace::core::repo::{BlobStoreGet, RetentionRoots};
     use triblespace::macros::id_hex;
