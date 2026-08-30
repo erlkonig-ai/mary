@@ -1109,6 +1109,14 @@ required-features = ["inkling-cuda"]
 name = "tp_allreduce_probe"
 required-features = ["inkling-cuda"]
 
+# Does a cubecl all_reduce fork/join CAPTURE into a CUDA graph and REPLAY? One
+# GPU, a world of one, three device ops, the answer read off one buffer. The
+# cheap half of the question that decides whether INK_GRAPH_LANE may run under
+# INK_TP; the module doc says what the two-rank half is.
+[[bin]]
+name = "collective_graph_probe"
+required-features = ["inkling-cuda"]
+
 # THE SERVING PROCESS: one Session, held open, answering turns over the
 # framed-stream convention on stdin/stdout. This is what puts a real mind behind
 # `drive` without drive linking mary — the model runs here, the loop runs there,
