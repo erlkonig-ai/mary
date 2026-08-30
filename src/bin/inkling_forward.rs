@@ -41,6 +41,7 @@
 //! | `INK_GEMM_AUTOTUNE` | off | times a GEMM that had the whole device, which four overlapping projections do not |
 //! | `INK_DENSE_WEIGHTS=device` | off | faster, but costs 3.42 GiB at 0:15 and REFUSES ranges that run today |
 //! | `INK_ZEROCOPY=0` | off | diagnostic; its 60+ GiB of expert duplication is priced nowhere |
+//! | `INK_HEAD_RMS_NATIVE` | off | the QK-norm as one `Array`-bound kernel per operand with `head_dim` comptime, in place of six Burn launches each; not bit-identical (f32 sum order, `powf` vs `x*x`), so off until the frontier row has measured it |
 //!
 //! ## The bar is capability, and it is NOT bit-identicality
 //!

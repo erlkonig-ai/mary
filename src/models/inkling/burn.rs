@@ -686,19 +686,35 @@ pub fn short_conv<B: Backend>(x: Tensor<B, 2>, weight: Tensor<B, 2>) -> Tensor<B
 }
 
 /// RMS-normalize each head slice of `[tokens, heads * head_dim]`.
-fn head_rms_norm<B: Backend>(
-    v: Tensor<B, 2>,
-    gain: Tensor<B, 1>,
+///
+/// Two lanes, one switch. The Burn expression below is [`rms_norm`] over the
+/// `[tokens * heads, head_dim]` view: six launches on this unfused backend
+/// (square, mean, add, sqrt, divide, gain), twice a layer in a decode step.
+/// `INK_HEAD_RMS_NATIVE=1` sends every caller -- the prefill, the one-row
+/// step, the batched/tree step and the slot lane all come through here -- to
+/// [`super::headnorm::head_rms_norm`], one launch with `head_dim` comptime.
+/// The two are not bit-identical (f32 summation order and `powf(x, 2)` against
+/// `x * x`; see that module), which is why the switch defaults off until the
+/// frontier row has measured it.
+///
+/// Concrete on [`Bk`] now rather than generic over `B`: every caller already
+/// was, and the native lane is a raw cubecl kernel on this runtime.
+fn head_rms_norm(
+    v: Tensor<Bk, 2>,
+    gain: Tensor<Bk, 1>,
     heads: usize,
     head_dim: usize,
     eps: f64,
-) -> Tensor<B, 2> {
+) -> Tensor<Bk, 2> {
     let [tokens, width] = v.dims();
     assert_eq!(
         width,
         heads * head_dim,
         "{width} is not {heads} x {head_dim}"
     );
+    if crate::models::inkling::headnorm::head_rms_native() {
+        return crate::models::inkling::headnorm::head_rms_norm(v, gain, heads, head_dim, eps);
+    }
     rms_norm(v.reshape([tokens * heads, head_dim]), gain, eps).reshape([tokens, width])
 }
 

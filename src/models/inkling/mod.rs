@@ -52,6 +52,11 @@ pub mod pool;
 // widening back at every seam. It was the last wide storage in an otherwise
 // narrow layer: 48 KiB a token across its three f32 buffers, halved at BF16.
 pub mod resid;
+// The QK-norm as one kernel per operand: RMS over `head_dim` with the width a
+// compile-time constant and both passes unrolled, in place of the six Burn
+// launches (square, mean, add, sqrt, divide, gain) each norm cost -- twelve a
+// layer in a decode step. Behind `INK_HEAD_RMS_NATIVE`, off until measured.
+pub mod headnorm;
 // The short convolution's decode step, as one kernel instead of nineteen Burn
 // ops. Four run per layer and they were a third of every launch in a decode
 // step; the arithmetic is 16384 multiply-adds.
