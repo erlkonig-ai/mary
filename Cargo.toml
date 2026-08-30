@@ -1032,6 +1032,13 @@ required-features = ["k3-cuda"]
 name = "nvfp4_mma_probe"
 required-features = ["inkling-cuda"]
 
+# The hand-written PTX arm of the routed NVFP4 GEMM against the cubecl one, in
+# one process on the same handles: elementwise bit-identity first, then p50 per
+# arm over interleaved rotating-table rounds.
+[[bin]]
+name = "ptx_fp4_probe"
+required-features = ["inkling-cuda"]
+
 [[bin]]
 name = "bf16_mma_probe"
 required-features = ["inkling-cuda"]

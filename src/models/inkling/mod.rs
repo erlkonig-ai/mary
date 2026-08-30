@@ -66,6 +66,11 @@ pub mod rawcuda;
 // have emitted, handed to the driver as it is. Same `RawArgs`, same runtime;
 // the fork routes a `.version`-led source around NVRTC (`raw-ptx-kernel`).
 pub mod rawptx;
+// The routed lane's NVFP4 GEMM as hand-written PTX -- `fp4_linear_swz`'s
+// operands, tile decomposition, lane roles and output layout, with the K loop
+// unrolled into the text and every address a base plus an immediate. Generated
+// per shape, so the dims are literals and the kernel id keys on them.
+pub mod ptxgemm;
 // The short convolution's decode step, as one kernel instead of nineteen Burn
 // ops. Four run per layer and they were a third of every launch in a decode
 // step; the arithmetic is 16384 multiply-adds.
