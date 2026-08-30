@@ -94,6 +94,12 @@ libm = { version = "0.2", optional = true }
 burn-train = { version = "0.21.0", optional = true }
 burn-ndarray = { version = "0.21.0", optional = true }
 cubecl = { version = "0.10.0", default-features = false, features = ["wgpu", "std"], optional = true }
+# The C++ backend's kernel-description types, for ONE thing: `models::inkling::rawcuda`
+# hands the CUDA runtime a hand-written source string, and the runtime still
+# wants the `ComputeKernel` repr a generated kernel carries (it reads the
+# dynamic shared-memory size off it). The five type names that build an empty
+# one live here. Same feature shape as cubecl-cuda's own dependency on it.
+cubecl-cpp = { version = "0.10.0", default-features = false, features = ["cuda"], optional = true }
 # The tuned matmul kernels burn itself dispatches to, reached DIRECTLY. The
 # inkling lane holds raw cubecl handles rather than Burn tensors (the weights
 # are the pile's own BF16 mapping), so it cannot call `Tensor::matmul`; but
@@ -191,6 +197,7 @@ inkling-cuda = [
     "burn/cuda",
     "dep:cubecl",
     "cubecl?/cuda",
+    "dep:cubecl-cpp",
     "dep:cubek",
     "dep:cudarc",
     # `burn-cubecl` is here for ONE type: `CubeTensor`, which is what a Burn

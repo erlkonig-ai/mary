@@ -57,6 +57,11 @@ pub mod resid;
 // launches (square, mean, add, sqrt, divide, gain) each norm cost -- twelve a
 // layer in a decode step. Behind `INK_HEAD_RMS_NATIVE`, off until measured.
 pub mod headnorm;
+// Hand-written CUDA C++ kernels through the SAME cubecl runtime -- stream,
+// arena, graph capture and patch, by-value scalars, PTX cache -- with no second
+// runtime beside it. A `CubeTask` whose `compile` returns the source verbatim,
+// and the argument convention such a kernel is written against.
+pub mod rawcuda;
 // The short convolution's decode step, as one kernel instead of nineteen Burn
 // ops. Four run per layer and they were a third of every launch in a decode
 // step; the arithmetic is 16384 multiply-adds.
