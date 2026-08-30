@@ -427,6 +427,64 @@
 //! costs 56.5 ms when the allocator is not fighting for pages and 200-670 ms
 //! when it is -- the SAME binary, the same tokens, twice in one hour.
 //!
+//! # WHAT THE CUT ACTUALLY BOUGHT, AND WHAT IT DID NOT (measured 2026-08-29)
+//!
+//! The paragraph above ended "moving those cuts from bind time into
+//! `copy_share` is the next lever, and it is worth ~5.2 GiB". The move landed
+//! and the residency arrived; **the stall it was supposed to explain did not
+//! go away**, and that is the finding.
+//!
+//! Same binary lineage (a188c00 + the cut, one build, sha `f64ebb38`, staged
+//! on both boxes), same `ctx3732.ids`, `INK_GEN=64`, `INK_KV=1`, greedy, fresh
+//! process per rep, `INK_TP=r:2` over the ConnectX pair (NET/IB confirmed every
+//! rep), spark2 rank 0 / spark rank 1, one decode step of the full 42-layer
+//! model:
+//!
+//! ```text
+//!   RESIDENCY, from each run's own admission line, per NODE
+//!                              78d851f7          + dense cut in the copy
+//!     arena (weights)          87.07 GiB         83.09    -3.98
+//!     device pool charge        5.21              2.65    -2.56
+//!     context/activations      16.53             16.53     0
+//!     total need              108.80            102.27    -6.53
+//!     headroom (of 121.63)      6.56             13.14    x2.0
+//!   378 dense leaves cut a node: 7.95 GiB stored -> 3.97 kept.
+//!
+//!   THE STALL TAIL, warm steps only (first 2 excluded), >70 ms
+//!     same-session control, 78d851f7, 5 reps    0 of 5 reps (max 69.7 ms)
+//!     with the cut, 7 reps                      2 of 7 (97.1, 94.3)
+//!     with the cut, 5 more reps, no observer    3 of 5 (94.0, 97.5, 95.1)
+//!     campaign baseline, 78d851f7, 7 reps       2 of 7 (96.6/93.2, 93.3)
+//!   Per 100 warm steps: 0.69 baseline, 0.67 with the cut. Unchanged.
+//!
+//!   THE MEDIAN went the WRONG WAY, same session, hours apart
+//!     78d851f7 control       p50 57.5-57.8 ms/step, median 57.7
+//!     with the cut           p50 58.3-58.6 ms/step, median 58.5-59.3
+//! ```
+//!
+//! So: **doubling the headroom did not touch the ~95 ms stall**, which means
+//! the stall is not the allocator fighting for pages at 1.95 GiB of margin --
+//! it happens just as often at 13.14. Whatever it is, residency is not it, and
+//! the sentence this section used to end with was wrong. The stalls also pair
+//! ACROSS RANKS at adjacent step indices (rank 0 step 55 / rank 1 step 54,
+//! rank 0 step 60 / rank 1 step 61), which is one node stalling and the other
+//! blocking in the collective -- so the next place to look is what makes ONE
+//! node miss a step, not what makes both.
+//!
+//! The ~0.8 ms/step the cut COSTS has a named suspect, not yet a measurement:
+//! the bind census moved from `88 calls, 1138 MiB` copied into the device pool
+//! to `44 calls, 338 MiB` (pool live 7.67 -> 6.88 GiB). `wo` and the shared
+//! `w2` were gathered into fresh host buffers at bind time, which no mapping
+//! backed, so `slice_or_copy` could only COPY them -- and a pool copy is read
+//! at device rate. Cut in the startup copy they are spans of the arena, so they
+//! now alias and are read over the host page tables, which this lane measures
+//! at 179.0 GB/s against 226.8 (`budget::dense_weights`). That is a HYPOTHESIS
+//! with a census behind it; it has not been run either way.
+//!
+//! The change is kept because the residency is real, it is 6.53 GiB a node,
+//! and it is what makes a longer context or a third concurrent lane fit. It is
+//! not kept as a step-time improvement, and the frontier row does not move.
+//!
 //! The first three rows of that table are now cut IN THE COPY:
 //! [`super::tpshard::dense_cut`] gives `copy_share` the binders' own rule per
 //! tensor, the arena is laid out at the cut sizes, and the binders read each
