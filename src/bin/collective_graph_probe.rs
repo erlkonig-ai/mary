@@ -76,7 +76,7 @@
 use anyhow::Result;
 use cubecl::ir::{ElemType, FloatKind};
 use cubecl::prelude::*;
-use cubecl::server::ReduceOperation;
+use cubecl::server::{Handle, ReduceOperation};
 
 type Rt = cubecl::cuda::CudaRuntime;
 
