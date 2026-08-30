@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::model_collection::ModelSnapshot;
 use burn::prelude::*;
 use burn::tensor::TensorData;
-use triblespace::core::collection::FactSnapshot;
 use triblespace::prelude::BlobStoreGet;
 
 use crate::leaf::Leaf;
@@ -85,7 +85,7 @@ impl FluxWeights {
     /// immutable native model-collection snapshot. A component may span
     /// several real roots (the Klein text encoder has two weight shards).
     pub fn from_snapshot<R: BlobStoreGet>(
-        snapshot: FactSnapshot<R>,
+        snapshot: ModelSnapshot<R>,
         variant: ModelVariant,
     ) -> anyhow::Result<Self> {
         fn select_component(
@@ -106,10 +106,10 @@ impl FluxWeights {
         }
 
         let text_encoder =
-            select_component(snapshot.facts(), snapshot.reader(), variant, TEXT_ENCODER)?;
+            select_component(snapshot.facts(), snapshot.store(), variant, TEXT_ENCODER)?;
         let transformer =
-            select_component(snapshot.facts(), snapshot.reader(), variant, TRANSFORMER)?;
-        let vae = select_component(snapshot.facts(), snapshot.reader(), variant, VAE)?;
+            select_component(snapshot.facts(), snapshot.store(), variant, TRANSFORMER)?;
+        let vae = select_component(snapshot.facts(), snapshot.store(), variant, VAE)?;
         drop(snapshot);
         Ok(Self {
             variant,

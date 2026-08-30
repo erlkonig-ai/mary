@@ -141,7 +141,7 @@ fn publish_embedding_candidate_with_contract_impl(
     if tokenizer_json.is_some() {
         let tokenizer = mary::selection::load_tokenizer_from_graph(
             &facts,
-            selected.reader(),
+            selected.store(),
             TokenizerSelector::Name(source),
         )?;
         architecture.validate_tokenizer(&tokenizer)?;

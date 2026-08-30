@@ -216,7 +216,7 @@ fn main() {
         .expect("fresh-load native Nomic vision collection");
     let keymap = mary::selection::load_keymap_from_graph(
         snapshot.facts(),
-        snapshot.reader(),
+        snapshot.store(),
         ModelSelector::Source {
             source: MODEL_ID,
             quantization: mary::persist::QUANTIZATION_NATIVE,

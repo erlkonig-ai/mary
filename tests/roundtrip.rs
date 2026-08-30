@@ -28,7 +28,7 @@ fn tensor_and_linear_roundtrip() {
     tribles += tf;
     tribles += lf;
 
-    let reader = BlobStore::reader(&mut blobs).unwrap();
+    let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
 
     let t2 = load_tensor::<B, 2>(&tribles, &reader, t_id, &device);
     assert_eq!(t2.dims(), [2, 3]);

@@ -24,14 +24,15 @@
 //! [`pipeline`] step machines (a new conversation without a weight reload).
 
 use crate::leaf::{Elem, Leaf};
+use crate::model_collection::ModelSnapshot;
 use crate::nn::weight_loader::WeightLoader;
 use crate::selection::{ModelSelector, SelectedModelIndex};
 use ed25519_dalek::VerifyingKey;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::{Blob, TryFromBlob};
-use triblespace::core::collection::{CollectionData, FactCover, FactSnapshot};
+use triblespace::core::collection::{CollectionData, FactCover};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::PileReader;
+use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::prelude::{BlobStoreGet, Id, Inline, TribleSet, blobencodings, inlineencodings};
 
 /// Canonical source coordinate of the complete PersonaPlex LM + Mimi model.
@@ -154,7 +155,7 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
     /// tokens, retaining the frozen cover and exact `(root, H, τ)` identity.
     pub fn find_in_bundle_snapshot(
         team: VerifyingKey,
-        snapshot: FactSnapshot<R>,
+        snapshot: ModelSnapshot<R>,
     ) -> anyhow::Result<Option<PersonaPlexBundle<R>>>
     where
         R: Clone,
@@ -284,7 +285,7 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
     /// Required form of [`Self::find_in_bundle_snapshot`].
     pub fn from_bundle_snapshot(
         team: VerifyingKey,
-        snapshot: FactSnapshot<R>,
+        snapshot: ModelSnapshot<R>,
     ) -> anyhow::Result<PersonaPlexBundle<R>>
     where
         R: Clone,
@@ -316,7 +317,7 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
     }
 }
 
-impl PersonaPlexWeights<PileReader> {
+impl PersonaPlexWeights<PileSnapshot> {
     /// Consume the exact model into the platform's established lazy loader.
     pub fn into_loader(self) -> WeightLoader {
         let (_, exact, _reader) = self.selected.into_parts();
@@ -339,7 +340,7 @@ impl PersonaPlexWeights<PileReader> {
     }
 }
 
-impl PersonaPlexBundle<PileReader> {
+impl PersonaPlexBundle<PileSnapshot> {
     /// Split a bundle-native load into its immutable authority and runtime
     /// loader without reopening the pile or observing a wider prefix.
     pub fn into_parts(self) -> (PersonaPlexAuthority, WeightLoader) {

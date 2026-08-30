@@ -122,7 +122,7 @@ use triblespace::core::blob::Blob;
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::id::ExclusiveId;
-use triblespace::core::repo::BlobStoreList;
+use triblespace::core::repo::{BlobStoreList, SnapshotSource};
 use triblespace::core::signing_key_file;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
@@ -164,7 +164,7 @@ fn migrate(src: &Path, dst: &Path, signing_key: &ed25519_dalek::SigningKey) -> R
 
     let mary::persist::ModelPileSource {
         facts: tribles,
-        reader,
+        store: reader,
         collections,
     } = mary::persist::read_model_pile(src)?;
     let [source_collection] = collections.as_slice() else {
@@ -226,8 +226,16 @@ fn migrate(src: &Path, dst: &Path, signing_key: &ed25519_dalek::SigningKey) -> R
         descriptor_handle == expected.handle(),
         "source collection descriptor changed identity while copying"
     );
+    // Admission is now asked of one frozen destination observation rather than
+    // of the mutable pile. That matters here: the descriptor was just staged
+    // into `pile`, so this snapshot is taken deliberately AFTER that put and
+    // the answer is about the prefix that actually contains it.
+    let destination = pile
+        .snapshot()
+        .map_err(|error| anyhow::anyhow!("freeze destination observation: {error}"))?;
     anyhow::ensure!(
-        pile.writer_is_admitted(expected, signing_key.verifying_key())
+        expected
+            .writer_is_admitted(&destination, signing_key.verifying_key())
             .map_err(|error| anyhow::anyhow!("check destination writer admission: {error}"))?,
         "signing key is not admitted to the source model collection in the destination; use the authority key or install its ACTION_WRITE proof first"
     );

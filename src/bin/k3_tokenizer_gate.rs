@@ -200,7 +200,7 @@ fn main() {
     .expect("save_tiktoken");
     let tok_id = frag.root().expect("tokenizer root");
     let tribles: TribleSet = frag.into();
-    let blobs = BlobStore::reader(&mut blobs).expect("blob reader");
+    let blobs = SnapshotSource::snapshot(&mut blobs).expect("blob reader");
     println!(
         "ingest: {} tribles in {:.1}s",
         tribles.len(),

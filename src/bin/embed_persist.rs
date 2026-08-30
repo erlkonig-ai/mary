@@ -296,7 +296,7 @@ mod tests {
         );
         mary::selection::load_keymap_from_graph(
             snapshot.facts(),
-            snapshot.reader(),
+            snapshot.store(),
             ModelSelector::Source {
                 source: NOMIC_TEXT_MODEL,
                 quantization: mary::persist::QUANTIZATION_NATIVE,
@@ -305,7 +305,7 @@ mod tests {
         .unwrap();
         let tok = mary::selection::load_tokenizer_from_graph(
             snapshot.facts(),
-            snapshot.reader(),
+            snapshot.store(),
             TokenizerSelector::Name(NOMIC_TEXT_MODEL),
         )
         .unwrap();

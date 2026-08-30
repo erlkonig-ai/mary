@@ -268,7 +268,7 @@ fn main() -> Result<()> {
                     let facts =
                         mary::model_collection::project_legacy_model_attributes(snapshot.facts())
                             .facts;
-                    let reader = snapshot.reader();
+                    let reader = snapshot.store();
                     // One sweep per (dtype, rank), matching the weight handle
                     // but never fetching it — a name with no weight beside it
                     // is not an imported tensor, and reading the leaves back to

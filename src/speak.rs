@@ -54,9 +54,9 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Instant;
 
+use crate::model_collection::ModelSnapshot;
 use burn::prelude::Backend;
 use rand::SeedableRng;
-use triblespace::core::collection::FactSnapshot;
 use triblespace::prelude::BlobStoreGet;
 
 use crate::leaf::{Elem, Leaf};
@@ -179,7 +179,7 @@ pub struct Qwen3TtsWeights {
 
 impl Qwen3TtsWeights {
     pub fn from_snapshot<R: BlobStoreGet>(
-        snapshot: FactSnapshot<R>,
+        snapshot: ModelSnapshot<R>,
         variant: Qwen3TtsVariant,
     ) -> anyhow::Result<Self> {
         fn select(
@@ -223,13 +223,13 @@ impl Qwen3TtsWeights {
         let folded_source = variant.folded_f16_source();
         let mut exact = select(
             snapshot.facts(),
-            snapshot.reader(),
+            snapshot.store(),
             &base_source,
             crate::persist::QUANTIZATION_NATIVE,
         )?;
         let codec = select(
             snapshot.facts(),
-            snapshot.reader(),
+            snapshot.store(),
             Qwen3TtsVariant::codec_source(),
             crate::persist::QUANTIZATION_NATIVE,
         )?;
@@ -250,13 +250,13 @@ impl Qwen3TtsWeights {
         }
         let talker_f16 = select(
             snapshot.facts(),
-            snapshot.reader(),
+            snapshot.store(),
             &talker_source,
             QUANTIZATION_F16,
         )?;
         let folded_f16 = select(
             snapshot.facts(),
-            snapshot.reader(),
+            snapshot.store(),
             &folded_source,
             QUANTIZATION_F16,
         )?;

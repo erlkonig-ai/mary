@@ -217,8 +217,8 @@ fn main() -> Result<()> {
     );
 
     let reader = blobs
-        .reader()
-        .map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
+        .snapshot()
+        .map_err(|e| anyhow::anyhow!("snapshot: {e:?}"))?;
     let from_graph = mary::tokenizer::build_tokenizer(&tribles, &reader, tok_id)
         .map_err(|e| anyhow::anyhow!("build from graph: {e}"))?;
 

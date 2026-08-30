@@ -109,7 +109,7 @@ fn main() {
     );
 
     // ── 3. read it back out ──
-    let reader = blobs.reader().expect("reader");
+    let reader = blobs.snapshot().expect("snapshot");
     let back = mary::tokenizer::load_spm_pieces(&tribles, &reader, tok_id);
     println!("read back: {} pieces", back.len());
 

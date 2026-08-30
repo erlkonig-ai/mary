@@ -1358,7 +1358,7 @@ mod tests {
         let frag = save_tokenizer_json(WP.as_bytes(), "test/wp", &mut blobs).unwrap();
         let tok_id = frag.root().expect("root");
         let tribles: TribleSet = frag.into();
-        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
 
         let vocab = load_vocab(&tribles, &reader, tok_id);
         assert_eq!(vocab.len(), 5);
@@ -1383,7 +1383,7 @@ mod tests {
         let frag = save_tokenizer_json(BPE.as_bytes(), "test/bpe", &mut blobs).unwrap();
         let tok_id = frag.root().expect("root");
         let tribles: TribleSet = frag.into();
-        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
 
         let merges = load_merges(&tribles, &reader, tok_id);
         assert_eq!(
@@ -1416,7 +1416,7 @@ mod tests {
         let t = std::time::Instant::now();
         let tribles: TribleSet = frag.into();
         let into_ms = t.elapsed().as_millis();
-        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
 
         let t = std::time::Instant::now();
         let vocab = load_vocab(&tribles, &reader, tok_id);
@@ -1456,7 +1456,7 @@ mod tests {
         let frag = save_tokenizer_json(&json, "real", &mut blobs).unwrap();
         let tok_id = frag.root().expect("root");
         let tribles: TribleSet = frag.into();
-        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
 
         // Alternate joined (B) and point-lookup (A) across rounds to expose any
         // cache-warming / ordering effect (ingest is paid once; queries are cheap).
@@ -1583,7 +1583,7 @@ mod tests {
         .unwrap();
         let root = frag.root().expect("root");
         let tribles: TribleSet = frag.into();
-        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
 
         assert_eq!(find_tokenizer(&tribles), Some(root));
         let mut ranks = load_tiktoken_ranks(&tribles, &reader, root);
@@ -1638,7 +1638,7 @@ mod tests {
         let tok_id = frag.root().expect("root");
         let tribles: TribleSet = frag.into();
         assert_eq!(find_tokenizer(&tribles), Some(tok_id), "find_tokenizer");
-        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
 
         let graph_tok = build_tokenizer(&tribles, &reader, tok_id).expect("build from graph");
         let json_tok = tokenizers::Tokenizer::from_bytes(json.as_bytes()).expect("from_bytes");
@@ -1675,7 +1675,7 @@ mod tests {
         let root = fragment.root().expect("root");
         let current = fragment.into_facts();
         let historical = project_current_model_attributes_to_historical(&current);
-        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
 
         assert_eq!(find_tokenizer(&historical), None);
         let projection = crate::model_collection::project_legacy_model_attributes(&historical);
@@ -1752,7 +1752,7 @@ mod tests {
         let frag = save_tokenizer_json(&json, "real", &mut blobs).unwrap();
         let tok_id = frag.root().expect("root");
         let tribles: TribleSet = frag.into();
-        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
 
         let t = std::time::Instant::now();
         let graph_tok = build_tokenizer(&tribles, &reader, tok_id).expect("build from graph");

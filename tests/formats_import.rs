@@ -150,7 +150,7 @@ fn native_import_is_exact_selectable_and_byte_idempotent() {
 
     let by_source = mary::selection::load_keymap_from_graph(
         snapshot.facts(),
-        snapshot.reader(),
+        snapshot.store(),
         ModelSelector::Source {
             source: "fixture/source",
             quantization: "native",
@@ -159,7 +159,7 @@ fn native_import_is_exact_selectable_and_byte_idempotent() {
     .unwrap();
     let by_root = mary::selection::load_keymap_from_graph(
         snapshot.facts(),
-        snapshot.reader(),
+        snapshot.store(),
         ModelSelector::Root(first.0),
     )
     .unwrap();
@@ -282,7 +282,7 @@ fn pytorch_bin_import_roundtrip() {
     .unwrap();
     let km = mary::selection::load_keymap_from_graph(
         snapshot.facts(),
-        snapshot.reader(),
+        snapshot.store(),
         ModelSelector::Source {
             source: "mistral-tiny",
             quantization: "native",

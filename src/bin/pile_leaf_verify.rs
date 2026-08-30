@@ -139,8 +139,8 @@ fn main() -> Result<()> {
             .join(", ")
     );
 
-    let (src_tribles, src_reader) = (canonical_facts(&source.facts)?, source.reader);
-    let (dst_tribles, dst_reader) = (canonical_facts(&converted.facts)?, converted.reader);
+    let (src_tribles, src_reader) = (canonical_facts(&source.facts)?, source.store);
+    let (dst_tribles, dst_reader) = (canonical_facts(&converted.facts)?, converted.store);
 
     // ── 1. every non-replaced fact survived, unchanged ──────────────────────
     //

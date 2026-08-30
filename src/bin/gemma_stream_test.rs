@@ -80,7 +80,7 @@ fn main() {
         .expect("load native model collection snapshot for materialization");
     let keymap = mary::selection::load_keymap_from_graph(
         snapshot.facts(),
-        snapshot.reader(),
+        snapshot.store(),
         ModelSelector::Source {
             source: model_id,
             quantization: mary::persist::QUANTIZATION_NATIVE,

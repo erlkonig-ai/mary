@@ -189,7 +189,7 @@ fn main() -> anyhow::Result<()> {
         // H must be independently complete. Validate only the candidate facts
         // against the already-staged attachment prefix; an old broad graph
         // union is not allowed to fill holes in this bundle.
-        let reader = pile.reader()?;
+        let reader = pile.snapshot()?;
         let weights = PersonaPlexWeights::from_graph(candidate.facts(), reader)?;
         anyhow::ensure!(
             weights.root() == root,

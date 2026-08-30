@@ -360,7 +360,7 @@ mod tests {
         let mut blobs = MemoryBlobStore::new();
         let mut facts = TribleSet::new();
         let root = save_json(&v, &mut blobs, &mut facts).expect("save");
-        let reader = blobs.reader().expect("reader");
+        let reader = blobs.snapshot().expect("snapshot");
         let back = load_json(&facts, &reader, root).expect("load");
         serde_json::to_string(&back).expect("serialise")
     }
@@ -427,7 +427,7 @@ mod tests {
             &mut facts,
         )
         .expect("save");
-        let reader = blobs.reader().expect("reader");
+        let reader = blobs.snapshot().expect("snapshot");
         assert_eq!(
             documents(&facts, &reader)
                 .into_iter()

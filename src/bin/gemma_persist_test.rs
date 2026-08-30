@@ -110,11 +110,11 @@ fn main() {
         quantization: mary::persist::QUANTIZATION_NATIVE,
     };
     let selected_root =
-        mary::selection::select_model_root(snapshot.facts(), snapshot.reader(), selector)
+        mary::selection::select_model_root(snapshot.facts(), snapshot.store(), selector)
             .expect("select imported model root");
     assert_eq!(selected_root, imported_root);
     let keymap =
-        mary::selection::load_keymap_from_graph(snapshot.facts(), snapshot.reader(), selector)
+        mary::selection::load_keymap_from_graph(snapshot.facts(), snapshot.store(), selector)
             .expect("materialize selected model keymap");
     eprintln!(
         "[pile] materialized {} tensors from the native collection.",

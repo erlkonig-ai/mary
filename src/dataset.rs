@@ -213,7 +213,7 @@ mod tests {
         assert_eq!(score, 1.5f64);
 
         // blobs really landed (the multimodal sample's text resolves).
-        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
         let (txt_handle,) = find!(
             (t: Inline<Handle<UTF8String>>),
             pattern!(&tribles, [{ sample_a_id @ text: ?t }])

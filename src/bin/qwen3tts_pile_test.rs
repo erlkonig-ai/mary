@@ -30,7 +30,7 @@ fn roundtrip(bytes: &[u8], name: &str) -> WeightLoader {
     let mut tribles = TribleSet::new();
     tribles += frag;
     eprintln!("{name}: ingested → {} tribles", tribles.len());
-    let reader = BlobStore::reader(&mut blobs).expect("reader");
+    let reader = SnapshotSource::snapshot(&mut blobs).expect("reader");
     let keymap = load_keymap(&tribles, &reader, model_id);
     eprintln!("{name}: materialized {} tensors from pile", keymap.len());
     WeightLoader::Pile(keymap)

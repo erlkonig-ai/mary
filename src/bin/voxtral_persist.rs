@@ -34,7 +34,7 @@ use triblespace::core::signing_key_file;
 
 fn verify_exact_source(
     model_dir: &Path,
-    weights: &VoxtralWeights<triblespace::core::repo::pile::PileReader>,
+    weights: &VoxtralWeights<triblespace::core::repo::pile::PileSnapshot>,
 ) -> anyhow::Result<(usize, usize)> {
     let path = model_dir.join("model.safetensors");
     let file = std::fs::File::open(&path)?;
@@ -100,7 +100,7 @@ fn verify_exact_source(
 }
 
 fn verify_alignment(
-    weights: &VoxtralWeights<triblespace::core::repo::pile::PileReader>,
+    weights: &VoxtralWeights<triblespace::core::repo::pile::PileSnapshot>,
 ) -> anyhow::Result<()> {
     for (name, handles) in weights.exact().iter().chain(weights.f16()) {
         // Alignment is a property of the payload, which is where the tensor

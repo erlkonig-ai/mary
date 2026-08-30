@@ -937,7 +937,7 @@ pub struct PileSource {
     /// Where the pile is, kept only so the startup copy can reopen it: the
     /// mapping does not carry an fd and `posix_fadvise` needs one.
     path: std::path::PathBuf,
-    reader: triblespace::core::repo::pile::PileReader,
+    reader: triblespace::core::repo::pile::PileSnapshot,
     /// Everything the model collection asserts, kept rather than dropped after
     /// the index is built.
     ///
@@ -1063,7 +1063,7 @@ impl PileSource {
         // the payload and the payloads are the big ones -- the embedding table
         // is 2.40 GiB and the unembedding 1.61 -- so this sweep was 15.0 s of a
         // 23.6 s index build, on one core, for 968 leaves the queries had
-        // already located. The reads are independent: `PileReader::get` takes
+        // already located. The reads are independent: `PileSnapshot::get` takes
         // `&self` and its validation cache hashes outside its lock.
         let index_threads: usize = std::env::var("INK_INDEX_THREADS")
             .ok()
@@ -1417,7 +1417,11 @@ impl PileSource {
     }
 
     /// The blob reader, so a caller can resolve handles the facts name.
-    pub fn reader(&self) -> &triblespace::core::repo::pile::PileReader {
+    ///
+    /// This is the whole frozen store observation the facts were materialized
+    /// from, kept because it also owns the mmap; the name stays `reader`
+    /// because nothing past `open` asks it anything but "give me these bytes".
+    pub fn reader(&self) -> &triblespace::core::repo::pile::PileSnapshot {
         &self.reader
     }
 

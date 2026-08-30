@@ -154,8 +154,7 @@ fn keys(a: KeysArgs) -> anyhow::Result<()> {
         }
         _ => anyhow::bail!("mary keys: pass exactly one of --source or --root"),
     };
-    let km =
-        mary::selection::load_keymap_from_graph(snapshot.facts(), snapshot.reader(), selector)?;
+    let km = mary::selection::load_keymap_from_graph(snapshot.facts(), snapshot.store(), selector)?;
     let mut names: Vec<&String> = km.keys().collect();
     names.sort();
     eprintln!(

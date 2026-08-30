@@ -128,8 +128,8 @@ fn main() -> Result<()> {
         t0.elapsed().as_secs_f64()
     );
     let reader = blobs
-        .reader()
-        .map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
+        .snapshot()
+        .map_err(|e| anyhow::anyhow!("snapshot: {e:?}"))?;
     let bad = compare("memory", &docs, &facts, &reader)?;
     if bad == 0 {
         println!("PASS (in memory) — every sidecar round-trips exactly.");

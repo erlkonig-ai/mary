@@ -327,7 +327,7 @@ fn main() -> Result<()> {
             );
             let facts =
                 mary::model_collection::project_legacy_model_attributes(snapshot.facts()).facts;
-            let reader = snapshot.reader();
+            let reader = snapshot.store();
             // Both element types, because this binary writes both. The weight
             // handle is matched but never fetched: a name and an index with no
             // weight beside them is not an imported expert, and reading 144

@@ -48,7 +48,7 @@ fn main() {
     eprintln!("ingested → {} tribles", tribles.len());
 
     // 2. materialize back out of the pile
-    let reader = BlobStore::reader(&mut blobs).expect("reader");
+    let reader = SnapshotSource::snapshot(&mut blobs).expect("reader");
     let keymap = load_keymap(&tribles, &reader, model_id);
     eprintln!("materialized {} tensors from pile", keymap.len());
     let loader = WeightLoader::Pile(keymap);

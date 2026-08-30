@@ -9,9 +9,9 @@
 
 use crate::format::attrs;
 use crate::leaf::Leaf;
+use crate::model_collection::ModelSnapshot;
 use anyhow::{Context, anyhow, bail};
 use std::collections::{BTreeSet, HashMap};
-use triblespace::core::collection::FactSnapshot;
 use triblespace::prelude::*;
 
 /// How to identify one model component in a consolidated graph.
@@ -50,7 +50,7 @@ pub enum TokenizerSelector<'a> {
 /// its strict tensor-handle index, and the blob reader that owns every indexed
 /// attachment.
 ///
-/// Selection consumes a frozen [`FactSnapshot`]. Once the roots and
+/// Selection consumes a frozen [`ModelSnapshot`]. Once the roots and
 /// functional fields have been validated, the collection facts and exact
 /// cover are no longer needed by weight loading; the reader is retained so
 /// the content handles remain resolvable without reopening storage. This is
@@ -501,11 +501,14 @@ impl<R: BlobStoreGet> SelectedModelIndex<R> {
     /// leaf, and duplicate tensor names all fail before the snapshot is
     /// consumed.
     pub fn from_snapshot(
-        snapshot: FactSnapshot<R>,
+        snapshot: ModelSnapshot<R>,
         selector: ModelSelector<'_>,
     ) -> anyhow::Result<Self> {
-        let (facts, _, reader) = snapshot.into_parts();
-        Self::from_graph(&facts, reader, selector)
+        // `R` is now the whole frozen store observation rather than a blob
+        // reader leased separately from it, so the facts and the attachments
+        // this index will fetch are guaranteed to be the same pile prefix.
+        let (facts, _, store) = snapshot.into_parts();
+        Self::from_graph(&facts, store, selector)
             .context("select model from native collection snapshot")
     }
 }
@@ -721,7 +724,7 @@ mod tests {
             "fp4",
             &[("beta.weight", 2.0)],
         );
-        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
 
         assert!(select_model_root(&facts, &reader, ModelSelector::Only).is_err());
         assert!(select_model_roots(&facts, &reader, ModelSelector::Only).is_err());
@@ -779,14 +782,14 @@ mod tests {
             "native",
             &[("weight", 2.0)],
         );
-        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
         assert!(select_model_root(&facts, &reader, ModelSelector::Name("same")).is_err());
 
         let extra_leaf_id = add_leaf(&mut facts, &mut blobs, LeafForm::Typed, 3.0);
         let member = first.members[0];
         facts += entity! { ExclusiveId::force_ref(&member) @ attrs::weight: &extra_leaf_id }
             .into_facts();
-        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
         let error = match index_keymap_for_root(&facts, &reader, first.root) {
             Ok(_) => panic!("duplicate weight edge was accepted"),
             Err(error) => error.to_string(),
@@ -816,7 +819,7 @@ mod tests {
             "native",
             &[("model.layers.1.weight", 2.0)],
         );
-        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
         let selector = ModelSelector::Source {
             source: "google/gemma-3-1b",
             quantization: "native",
@@ -870,7 +873,7 @@ mod tests {
             "native",
             &[("model.layers.0.weight", 2.0)],
         );
-        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
         let selector = ModelSelector::Source {
             source: "vendor/model",
             quantization: "native",
@@ -899,7 +902,7 @@ mod tests {
             "native",
             &[("model.layers.0.weight", 1.0)],
         );
-        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
 
         assert_eq!(
             select_model_roots(&facts, &reader, ModelSelector::Root(only.root)).unwrap(),
@@ -954,7 +957,7 @@ mod tests {
             ],
         );
 
-        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
 
         // Neither shard alone is the component.
         assert_eq!(
@@ -1025,7 +1028,7 @@ mod tests {
             &[("model.layers.0.weight", 2.0)],
         );
 
-        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
         let error = index_keymap_for_roots(&facts, &reader, &[first.root, second.root])
             .expect_err("a shared tensor name must not merge");
         let message = error.to_string();
@@ -1061,7 +1064,7 @@ mod tests {
     fn indexing_a_component_from_zero_roots_is_an_error() {
         let facts = TribleSet::new();
         let mut blobs = MemoryBlobStore::new();
-        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
         assert!(index_keymap_for_roots(&facts, &reader, &[]).is_err());
         assert!(SelectedModelIndex::from_roots(&facts, reader, std::iter::empty::<Id>()).is_err());
     }
@@ -1079,7 +1082,7 @@ mod tests {
             "native",
             &[("model.layers.0.weight", 1.0)],
         );
-        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
         let merged = index_keymap_for_roots(&facts, &reader, &[only.root, only.root]).unwrap();
         assert_eq!(merged.len(), 1);
     }
@@ -1096,7 +1099,7 @@ mod tests {
             "native",
             &[("weight", 1.0), ("weight", 2.0)],
         );
-        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
         let error = match index_keymap_for_root(&facts, &reader, model.root) {
             Ok(_) => panic!("duplicate tensor name was accepted"),
             Err(error) => error.to_string(),
@@ -1121,7 +1124,7 @@ mod tests {
             .unwrap();
         facts +=
             entity! { ExclusiveId::force_ref(&model.root) @ attrs::model_name: alias }.into_facts();
-        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
 
         let error = select_model_root(&facts, &reader, ModelSelector::Name("primary"))
             .unwrap_err()
@@ -1144,7 +1147,7 @@ mod tests {
             "native",
             &[("a.weight", 1.5), ("b.weight", -2.5)],
         );
-        let typed_reader = BlobStore::reader(&mut typed_blobs).unwrap();
+        let typed_reader = SnapshotSource::snapshot(&mut typed_blobs).unwrap();
 
         let mut old_facts = TribleSet::new();
         let mut old_blobs = MemoryBlobStore::new();
@@ -1157,7 +1160,7 @@ mod tests {
             "native",
             &[("a.weight", 1.5), ("b.weight", -2.5)],
         );
-        let old_reader = BlobStore::reader(&mut old_blobs).unwrap();
+        let old_reader = SnapshotSource::snapshot(&mut old_blobs).unwrap();
 
         let typed_map = index_keymap_for_root(&typed_facts, &typed_reader, typed.root).unwrap();
         let old_map = index_keymap_for_root(&old_facts, &old_reader, old.root).unwrap();
@@ -1200,7 +1203,7 @@ mod tests {
         let beta_root = beta.root().unwrap();
         let mut facts = alpha.into_facts();
         facts += beta.into_facts();
-        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
 
         assert!(select_tokenizer_root(&facts, &reader, TokenizerSelector::Only).is_err());
         assert_eq!(
@@ -1236,7 +1239,7 @@ mod tests {
             crate::tokenizer::attrs::normalizer: &other_root
         }
         .into_facts();
-        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
 
         let error = load_tokenizer_from_graph(&facts, &reader, TokenizerSelector::Only)
             .unwrap_err()
@@ -1267,7 +1270,7 @@ mod tests {
             crate::tokenizer::attrs::token_id: 99_u64
         }
         .into_facts();
-        let reader = BlobStore::reader(&mut blobs).unwrap();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
 
         let error = load_tokenizer_from_graph(&facts, &reader, TokenizerSelector::Only)
             .unwrap_err()

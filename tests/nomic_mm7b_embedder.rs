@@ -118,7 +118,7 @@ fn embed_query_and_document_parity() {
             .expect("load native model collection snapshot");
     let map = mary::selection::load_keymap_from_graph(
         snapshot.facts(),
-        snapshot.reader(),
+        snapshot.store(),
         mary::selection::ModelSelector::Source {
             source: mary::models::qwen2_5_vl::NOMIC_MM7B_TEXT_SOURCE,
             quantization: mary::persist::QUANTIZATION_NATIVE,

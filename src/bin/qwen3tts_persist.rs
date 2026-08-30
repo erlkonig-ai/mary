@@ -43,12 +43,10 @@ mod imp {
     }
 
     fn select_index(
-        snapshot: &triblespace::core::collection::FactSnapshot<
-            triblespace::core::repo::pile::PileReader,
-        >,
+        snapshot: &mary::model_collection::ModelPileSnapshot,
         root: triblespace::prelude::Id,
     ) -> anyhow::Result<std::collections::HashMap<String, mary::leaf::Leaf>> {
-        mary::selection::index_keymap_for_root(snapshot.facts(), snapshot.reader(), root)
+        mary::selection::index_keymap_for_root(snapshot.facts(), snapshot.store(), root)
     }
 
     fn import_cohort(

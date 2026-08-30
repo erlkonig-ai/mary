@@ -761,7 +761,7 @@ mod tests {
         let fragment = put_leaf(&mut blobs, Elem::F32, &[2, 3], payload, "w").expect("stored");
         let id = fragment.root().expect("leaf root");
         let facts = fragment.into_facts();
-        let reader = BlobStore::reader(&mut blobs).expect("reader");
+        let reader = SnapshotSource::snapshot(&mut blobs).expect("reader");
         let leaf = resolve(&facts, &reader, id)
             .expect("resolves")
             .expect("present");
@@ -811,7 +811,7 @@ mod tests {
         let both_id = both.root().expect("root");
         facts += both.into_facts();
 
-        let reader = BlobStore::reader(&mut blobs).expect("reader");
+        let reader = SnapshotSource::snapshot(&mut blobs).expect("reader");
         let typed_error = format!(
             "{:#}",
             resolve(&facts, &reader, id).expect_err("two typed leaves must fail")
@@ -846,7 +846,7 @@ mod tests {
 
         let mut facts = good.into_facts();
         facts += bad.into_facts();
-        let reader = BlobStore::reader(&mut blobs).expect("reader");
+        let reader = SnapshotSource::snapshot(&mut blobs).expect("reader");
 
         let leaf = resolve(&facts, &reader, good_id)
             .expect("resolves")

@@ -6,11 +6,11 @@
 //! full f16 derivation.
 
 use crate::leaf::{Elem, Leaf};
+use crate::model_collection::ModelSnapshot;
 use crate::nn::weight_loader::WeightLoader;
 use crate::selection::{ModelSelector, index_keymap_for_root, select_model_root};
 use std::collections::HashMap;
-use triblespace::core::collection::FactSnapshot;
-use triblespace::core::repo::pile::PileReader;
+use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::prelude::*;
 
 /// Canonical source coordinate shared by Voxtral's exact and derived roots.
@@ -37,20 +37,20 @@ pub struct VoxtralWeights<R> {
 
 impl<R: BlobStoreGet> VoxtralWeights<R> {
     /// Select and validate the exact/f16 pair from one already-frozen snapshot.
-    pub fn from_snapshot(snapshot: FactSnapshot<R>) -> anyhow::Result<Self> {
+    pub fn from_snapshot(snapshot: ModelSnapshot<R>) -> anyhow::Result<Self> {
         fn select(
-            snapshot: &FactSnapshot<impl BlobStoreGet>,
+            snapshot: &ModelSnapshot<impl BlobStoreGet>,
             quantization: &str,
         ) -> anyhow::Result<(Id, HashMap<String, Leaf>)> {
             let root = select_model_root(
                 snapshot.facts(),
-                snapshot.reader(),
+                snapshot.store(),
                 ModelSelector::Source {
                     source: SOURCE,
                     quantization,
                 },
             )?;
-            let index = index_keymap_for_root(snapshot.facts(), snapshot.reader(), root)?;
+            let index = index_keymap_for_root(snapshot.facts(), snapshot.store(), root)?;
             Ok((root, index))
         }
 
@@ -157,7 +157,7 @@ impl<R: BlobStoreGet> VoxtralWeights<R> {
     }
 }
 
-impl VoxtralWeights<PileReader> {
+impl VoxtralWeights<PileSnapshot> {
     /// Consume the validated cohort into the platform's lazy runtime loader.
     ///
     /// macOS uses one `AliasedPile` over the shared reader. Other platforms
@@ -303,7 +303,7 @@ mod tests {
         ]
     }
 
-    fn load(path: &Path) -> anyhow::Result<VoxtralWeights<PileReader>> {
+    fn load(path: &Path) -> anyhow::Result<VoxtralWeights<PileSnapshot>> {
         let snapshot =
             crate::model_collection::load_model_collection_local_latest(path, test_team())?;
         VoxtralWeights::from_snapshot(snapshot)

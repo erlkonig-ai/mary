@@ -194,7 +194,7 @@ fn main() {
         .expect("fresh-load native Nomic text collection");
     let keymap = mary::selection::load_keymap_from_graph(
         snapshot.facts(),
-        snapshot.reader(),
+        snapshot.store(),
         ModelSelector::Source {
             source: MODEL_ID,
             quantization: mary::persist::QUANTIZATION_NATIVE,
@@ -203,7 +203,7 @@ fn main() {
     .expect("select native Nomic text weights");
     let native_tokenizer = mary::selection::load_tokenizer_from_graph(
         snapshot.facts(),
-        snapshot.reader(),
+        snapshot.store(),
         TokenizerSelector::Name(MODEL_ID),
     )
     .expect("select native Nomic text tokenizer");

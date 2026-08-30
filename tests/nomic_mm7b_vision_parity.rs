@@ -102,7 +102,7 @@ fn vision_tower_parity() {
             .expect("load native model collection snapshot");
     let map = mary::selection::load_keymap_from_graph(
         snapshot.facts(),
-        snapshot.reader(),
+        snapshot.store(),
         mary::selection::ModelSelector::Source {
             source: mary::models::qwen2_5_vl::NOMIC_MM7B_VISION_SOURCE,
             quantization: mary::persist::QUANTIZATION_NATIVE,
@@ -157,7 +157,7 @@ fn vision_tower_multiwindow_parity() {
             .expect("load native model collection snapshot");
     let map = mary::selection::load_keymap_from_graph(
         snapshot.facts(),
-        snapshot.reader(),
+        snapshot.store(),
         mary::selection::ModelSelector::Source {
             source: mary::models::qwen2_5_vl::NOMIC_MM7B_VISION_SOURCE,
             quantization: mary::persist::QUANTIZATION_NATIVE,

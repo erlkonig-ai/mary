@@ -37,7 +37,7 @@ use std::collections::HashMap;
 use std::path::Path;
 #[cfg(feature = "import")]
 use triblespace::core::collection::CollectionCommit;
-use triblespace::core::repo::StoreRevision;
+use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 
 /// Resolve the sorted `*.safetensors` shards in a model directory.
@@ -708,7 +708,7 @@ mod filtered_native_import_tests {
                 .unwrap();
         let keymap = crate::selection::load_keymap_from_graph(
             snapshot.facts(),
-            snapshot.reader(),
+            snapshot.store(),
             ModelSelector::Root(root),
         )
         .unwrap();
@@ -767,7 +767,7 @@ mod filtered_native_import_tests {
         .unwrap();
 
         let root = fragment.root().expect("filtered model root");
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         let keymap = crate::selection::load_keymap_from_graph(
             fragment.facts(),
             &reader,
@@ -833,9 +833,16 @@ fn open_preflighted_model_graph_snapshot(
 ) -> anyhow::Result<(
     Pile,
     ed25519_dalek::VerifyingKey,
-    Option<triblespace::core::collection::FactSnapshot<triblespace::core::repo::pile::PileReader>>,
+    Option<crate::model_collection::ModelPileSnapshot>,
 )> {
     let (mut pile, team) = open_preflighted_model_graph_pile(pile_path, signing_key)?;
+    // Writer selection froze one observation and this materialization freezes
+    // another, so the authority check below is a genuine cross-observation
+    // agreement test rather than the pre-snapshot version's hope that two
+    // independently refreshing reads saw the same prefix. It stays because the
+    // two freezes are still two freezes; collapsing it needs the caller to
+    // thread ONE observation through both, which is a wider refactor of the
+    // writer-preflight seam than this port takes on.
     let snapshot =
         match crate::model_collection::snapshot_sole_model_collection_local_latest(&mut pile) {
             Ok((snapshot_team, snapshot)) if snapshot_team == team => Some(snapshot),
@@ -1001,7 +1008,7 @@ pub fn strip_projected_legacy_attributes(facts: &TribleSet) -> anyhow::Result<(T
 /// Open a pile and build the leaf indexes for two families of model entities —
 /// the ones whose name starts with `f16_prefix` (half-width leaves for the fast
 /// native-width GPU load) and ALL OTHERS (the exact leaves) — plus a
-/// [`PileReader`](triblespace::core::repo::pile::PileReader) the caller may keep.
+/// [`PileSnapshot`](triblespace::core::repo::pile::PileSnapshot) the caller may keep.
 /// The first index comes back empty if no entity matches the prefix.
 ///
 /// No tensor bytes are COPIED: each leaf's payload is a slice of the pile's
@@ -1017,10 +1024,10 @@ pub fn load_split_index_from_pile(
 ) -> anyhow::Result<(
     HashMap<String, crate::leaf::Leaf>,
     HashMap<String, crate::leaf::Leaf>,
-    triblespace::core::repo::pile::PileReader,
+    triblespace::core::repo::pile::PileSnapshot,
 )> {
     let source = read_model_pile(pile_path)?;
-    let (tribles, reader) = (source.facts, source.reader);
+    let (tribles, reader) = (source.facts, source.store);
 
     let mut f16 = HashMap::new();
     let mut f32_ = HashMap::new();
@@ -1097,7 +1104,7 @@ pub fn load_aliased_loader_from_pile(
 pub fn personaplex_bundle(
     pile_path: &Path,
 ) -> anyhow::Result<
-    crate::models::personaplex::PersonaPlexBundle<triblespace::core::repo::pile::PileReader>,
+    crate::models::personaplex::PersonaPlexBundle<triblespace::core::repo::pile::PileSnapshot>,
 > {
     // Authority discovery and cover materialization stay under one open pile,
     // avoiding a second
@@ -1539,7 +1546,7 @@ pub fn load_keymap_from_pile_prefixed(
     name_prefix: &str,
 ) -> anyhow::Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
     let source = read_model_pile(pile_path)?;
-    let (tribles, reader) = (source.facts, source.reader);
+    let (tribles, reader) = (source.facts, source.store);
 
     // Every model entity (one per persisted shard) carries `attrs::model_name`.
     let model_ids: Vec<Id> = find!(
@@ -1692,8 +1699,9 @@ pub struct ModelPileCollection {
 pub struct ModelPileSource {
     /// Every fact the model is stated by, canonical aliases projected in.
     pub facts: TribleSet,
-    /// Reader over the source's immutable mapping; valid after the pile closes.
-    pub reader: triblespace::core::repo::pile::PileReader,
+    /// The frozen store observation every fact and attachment came from;
+    /// valid after the pile closes, because it owns the immutable mapping.
+    pub store: triblespace::core::repo::pile::PileSnapshot,
     /// One or two contributing collections, canonically ordered graph then
     /// bundle. Mixed shapes retain both independently authorized identities.
     pub collections: Vec<ModelPileCollection>,
@@ -1724,18 +1732,18 @@ pub fn read_model_pile(path: &Path) -> anyhow::Result<ModelPileSource> {
 }
 
 fn read_model_collections(pile: &mut Pile, path: &Path) -> anyhow::Result<ModelPileSource> {
-    loop {
-        let before = pile
-            .store_revision()
-            .map_err(|error| anyhow::anyhow!("{path:?}: observe model pile: {error}"))?;
-        let observed = read_model_collections_once(pile, path);
-        let after = pile
-            .store_revision()
-            .map_err(|error| anyhow::anyhow!("{path:?}: reobserve model pile: {error}"))?;
-        if before == after {
-            return observed;
-        }
-    }
+    // This used to be a seqlock: sample `Pile::store_revision`, read both
+    // collections, sample again, and retry the whole thing whenever an append
+    // landed in between. A model pile is 171 GB and its two shapes are read one
+    // after the other, so the window was real, not theoretical. `Pile::snapshot`
+    // freezes blobs, collection records, capability proofs, and peer evidence at
+    // one validated prefix, so the graph shape, the bundle shape, and the bytes
+    // they name cannot come from different prefixes any more. There is nothing
+    // left to retry.
+    let store = pile
+        .snapshot()
+        .map_err(|error| anyhow::anyhow!("{path:?}: observe model pile: {error}"))?;
+    read_model_collections_in(&store, path)
 }
 
 /// Read both native model shapes from one candidate pile prefix.
@@ -1745,13 +1753,16 @@ fn read_model_collections(pile: &mut Pile, path: &Path) -> anyhow::Result<ModelP
 /// ambiguity discovered in one shape cannot be hidden by successfully reading
 /// the other, and the final reader is captured only after both shapes have
 /// been resolved.
-fn read_model_collections_once(pile: &mut Pile, path: &Path) -> anyhow::Result<ModelPileSource> {
+fn read_model_collections_in(
+    store: &triblespace::core::repo::pile::PileSnapshot,
+    path: &Path,
+) -> anyhow::Result<ModelPileSource> {
     let mut facts = TribleSet::new();
     let mut collections = Vec::with_capacity(2);
     let mut graph_error = None;
     let mut bundle_error = None;
 
-    match crate::model_collection::snapshot_sole_model_collection_local_latest(pile) {
+    match crate::model_collection::sole_model_collection_in(store) {
         Ok((team, snapshot)) => {
             facts += pre_epoch_aliased(snapshot.facts());
             let (_, cover, _) = snapshot.into_parts();
@@ -1771,7 +1782,7 @@ fn read_model_collections_once(pile: &mut Pile, path: &Path) -> anyhow::Result<M
         }
     }
 
-    match crate::model_collection::snapshot_sole_model_bundle_collection_local_latest(pile) {
+    match crate::model_collection::sole_model_bundle_collection_in(store) {
         Ok((team, snapshot)) => {
             let (_, cover, bundle_reader) = snapshot.into_parts();
             facts += model_bundle_archive_facts(&cover, &bundle_reader)
@@ -1808,9 +1819,9 @@ fn read_model_collections_once(pile: &mut Pile, path: &Path) -> anyhow::Result<M
 
     Ok(ModelPileSource {
         facts,
-        reader: pile
-            .reader()
-            .map_err(|error| anyhow::anyhow!("{path:?}: freeze model blob reader: {error}"))?,
+        // No second acquisition: this is the same observation both shapes were
+        // read out of, so the reader can no longer be newer than the records.
+        store: store.clone(),
         collections,
     })
 }
@@ -1822,7 +1833,7 @@ fn read_model_collections_once(pile: &mut Pile, path: &Path) -> anyhow::Result<M
 /// turns the tiny signed union into the facts a loader can query.
 fn model_bundle_archive_facts(
     cover: &triblespace::core::collection::FactCover,
-    reader: &triblespace::core::repo::pile::PileReader,
+    reader: &triblespace::core::repo::pile::PileSnapshot,
 ) -> anyhow::Result<TribleSet> {
     use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace::core::blob::{Blob, TryFromBlob};
@@ -1872,7 +1883,7 @@ pub fn load_typed_keymap_from_pile(
     pile_path: &Path,
 ) -> anyhow::Result<std::collections::HashMap<String, crate::leaf::Leaf>> {
     let source = read_model_pile(pile_path)?;
-    crate::leaf::index_by_name(&source.facts, &source.reader)
+    crate::leaf::index_by_name(&source.facts, &source.store)
 }
 
 /// Reconstruct a SentencePiece UNIGRAM tokenizer from a pile's tokenizer graph.
@@ -1885,11 +1896,11 @@ pub fn load_spm_tokenizer_from_pile(
     let source = read_model_pile(pile_path)?;
     let tok_id = crate::selection::select_tokenizer_root(
         &source.facts,
-        &source.reader,
+        &source.store,
         crate::selection::TokenizerSelector::Only,
     )
     .with_context(|| format!("select SentencePiece tokenizer in pile {pile_path:?}"))?;
-    let pieces = crate::tokenizer::load_spm_pieces(&source.facts, &source.reader, tok_id);
+    let pieces = crate::tokenizer::load_spm_pieces(&source.facts, &source.store, tok_id);
     if pieces.is_empty() {
         anyhow::bail!("tokenizer graph in {pile_path:?} has no scored pieces — not UNIGRAM?");
     }
@@ -1969,7 +1980,7 @@ pub fn load_tokenizer_from_pile(pile_path: &Path) -> anyhow::Result<tokenizers::
     let source = read_model_pile(pile_path)?;
     crate::selection::load_tokenizer_from_graph(
         &source.facts,
-        &source.reader,
+        &source.store,
         crate::selection::TokenizerSelector::Only,
     )
     .with_context(|| format!("select tokenizer in pile {pile_path:?}"))
@@ -2086,9 +2097,9 @@ pub fn ingest_hf_tokenizer(
 /// The locally admitted native model facts and a reader for their attachments.
 pub fn pile_facts(
     pile_path: &Path,
-) -> anyhow::Result<(TribleSet, triblespace::core::repo::pile::PileReader)> {
+) -> anyhow::Result<(TribleSet, triblespace::core::repo::pile::PileSnapshot)> {
     let source = read_model_pile(pile_path)?;
-    Ok((source.facts, source.reader))
+    Ok((source.facts, source.store))
 }
 
 /// Ingest a checkpoint's JSON sidecars into a pile as facts.
@@ -2155,7 +2166,7 @@ pub fn ingest_json_documents(
         let Some(snapshot) = snapshot.as_ref() else {
             break;
         };
-        if let Ok(have) = crate::jsonfacts::load_document(snapshot.facts(), snapshot.reader(), name)
+        if let Ok(have) = crate::jsonfacts::load_document(snapshot.facts(), snapshot.store(), name)
         {
             if &have != v {
                 clash = Some(name.clone());
@@ -2260,7 +2271,7 @@ mod tokenizer_collection_tests {
             crate::tokenizer::find_tokenizer(&source.facts),
             crate::selection::select_tokenizer_root(
                 &source.facts,
-                &source.reader,
+                &source.store,
                 crate::selection::TokenizerSelector::Only,
             )
             .ok()
@@ -2298,7 +2309,7 @@ mod tokenizer_collection_tests {
 fn select_native_model_index(
     pile_path: &Path,
     selector: crate::selection::ModelSelector<'_>,
-) -> anyhow::Result<crate::selection::SelectedModelIndex<triblespace::core::repo::pile::PileReader>>
+) -> anyhow::Result<crate::selection::SelectedModelIndex<triblespace::core::repo::pile::PileSnapshot>>
 {
     let (_, snapshot) = crate::model_collection::load_sole_model_collection_local_latest(pile_path)
         .with_context(|| format!("load local-latest native model snapshot from {pile_path:?}"))?;
@@ -2455,12 +2466,12 @@ pub fn load_gemma4_audio_from_pile<B: burn::prelude::Backend>(
 /// retains its own mmap keepalive after the selected index is consumed.
 ///
 /// Unlike the streaming loaders, this accepts the concrete
-/// [`PileReader`](triblespace::core::repo::pile::PileReader) capability: an
+/// [`PileSnapshot`](triblespace::core::repo::pile::PileSnapshot) capability: an
 /// arbitrary [`BlobStoreGet`] may return owned bytes that cannot be registered
 /// as an external Metal buffer.
 #[cfg(all(feature = "gemma", target_os = "macos"))]
 pub fn load_gemma4_aliased_from_index(
-    selected: crate::selection::SelectedModelIndex<triblespace::core::repo::pile::PileReader>,
+    selected: crate::selection::SelectedModelIndex<triblespace::core::repo::pile::PileSnapshot>,
     config: crate::models::gemma::gemma4::config::Gemma4Config,
     device: burn::backend::wgpu::WgpuDevice,
 ) -> anyhow::Result<crate::models::gemma::gemma4::decoder::Gemma4Model<crate::nn::backend::BHalf>> {
@@ -2691,7 +2702,7 @@ fn require_f16_model_index<R>(
 /// names for disjointness over the whole model and never invents a union root.
 #[cfg(feature = "gemma")]
 pub fn select_nomic_mm7b_index_from_snapshot<R: BlobStoreGet>(
-    snapshot: triblespace::core::collection::FactSnapshot<R>,
+    snapshot: crate::model_collection::ModelSnapshot<R>,
 ) -> anyhow::Result<crate::selection::SelectedModelIndex<R>> {
     let (facts, _, reader) = snapshot.into_parts();
     let mut roots = crate::selection::select_model_roots(
@@ -2718,7 +2729,7 @@ pub fn select_nomic_mm7b_index_from_snapshot<R: BlobStoreGet>(
 /// and non-aliased consumers.
 #[cfg(feature = "gemma")]
 pub fn load_nomic_mm7b_keymap_from_snapshot<R: BlobStoreGet>(
-    snapshot: triblespace::core::collection::FactSnapshot<R>,
+    snapshot: crate::model_collection::ModelSnapshot<R>,
 ) -> anyhow::Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
     let selected = select_nomic_mm7b_index_from_snapshot(snapshot)?;
     Ok(selected
@@ -2734,7 +2745,7 @@ pub fn load_nomic_mm7b_keymap_from_snapshot<R: BlobStoreGet>(
 /// Every selected f16 tensor blob is aliased straight from the snapshot's mmap
 /// onto the Metal GPU (no copy, no f32 materialization). Each GPU buffer clones
 /// the mmap owner into `register_external_aliased`'s keepalive, so the temporary
-/// key index and [`PileReader`](triblespace::core::repo::pile::PileReader) may
+/// key index and [`PileSnapshot`](triblespace::core::repo::pile::PileSnapshot) may
 /// be dropped after construction while the mappings remain valid for the
 /// embedder's life. Weights stay f16 in GPU memory; activations run in f32.
 ///
@@ -2743,9 +2754,7 @@ pub fn load_nomic_mm7b_keymap_from_snapshot<R: BlobStoreGet>(
 /// branch, and ambiguous or incompatible model selections fail closed.
 #[cfg(all(feature = "gemma", target_os = "macos"))]
 pub fn load_nomic_mm7b_aliased_from_snapshot(
-    snapshot: triblespace::core::collection::FactSnapshot<
-        triblespace::core::repo::pile::PileReader,
-    >,
+    snapshot: crate::model_collection::ModelPileSnapshot,
     tokenizer_path: &Path,
     device: burn::backend::wgpu::WgpuDevice,
 ) -> anyhow::Result<

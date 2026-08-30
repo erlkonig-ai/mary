@@ -237,7 +237,7 @@ impl Weights {
     /// # What this is actually buying, which is not what it looks like
     ///
     /// It looks like prefetching. It is not; it is paying a HASH.
-    /// `PileReader::get` verifies a blob's BLAKE3 against the handle that names
+    /// `PileSnapshot::get` verifies a blob's BLAKE3 against the handle that names
     /// it, because in a content-addressed store the name IS the hash and a read
     /// that skipped the check would be a read of something else. The result is
     /// cached per record for the life of the reader, so each blob costs it
