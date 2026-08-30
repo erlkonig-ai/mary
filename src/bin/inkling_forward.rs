@@ -3818,10 +3818,15 @@ fn main() -> Result<()> {
         );
     }
     let tp_calls = std::cell::Cell::new(0usize);
+    // The same count over the whole PASS, reset before the layer loop and read
+    // after it, on every step -- including the replayed ones, where the layer
+    // loop does not run and the per-layer count therefore never does.
+    let tp_calls_step = std::cell::Cell::new(0usize);
     let tp_reduce = |x: T2| -> T2 {
         match tp_group.as_ref() {
             Some(g) => {
                 tp_calls.set(tp_calls.get() + 1);
+                tp_calls_step.set(tp_calls_step.get() + 1);
                 mary::models::inkling::tpcomm::reduce_activation(g, &dev, x)
             }
             None => x,
@@ -4098,35 +4103,51 @@ fn main() -> Result<()> {
     // A REPLAYED STEP RUNS NO HOST CODE IN THE REGION, AND `tp_reduce` IS HOST
     // CODE IN THE REGION.
     //
-    // The layer loop makes seven `tp_reduce` calls, and on a replay step the
-    // loop does not run -- so unless the collective is in the GRAPH, the
+    // The layer loop makes two `tp_reduce` calls a layer, and on a replay step
+    // the loop does not run -- so unless the collective is in the GRAPH, the
     // cross-node reduction simply stops happening on every replayed step. It
     // would not error and it would not NaN; each rank would carry its own
     // partial sum forward, which is the fluent-and-wrong failure this file
-    // warns about everywhere else. The `tp_calls == 2` assertion that would
-    // catch it is INSIDE the loop, so it does not run either.
+    // warns about everywhere else.
     //
-    // And the collective almost certainly is NOT in the graph. cubecl issues it
-    // on a separate `comm_stream`, reached by a `cuEventRecord` /
-    // `cuStreamWaitEvent` fork and returned by the matching join, bypassing
-    // `Command`/`execute_task` entirely -- so it creates no `CapturedLaunch`,
-    // takes no `capture_hold` on the buffers it reduces, and is invisible to
-    // the launch index every patch here is written against. A capture is
-    // per-stream; whether anything of it lands in the graph at all is a
-    // property of the linked NCCL, not of this tree.
+    // This used to be a REFUSAL, on the reasoning that the collective is issued
+    // on cubecl's separate `comm_stream` and so is "very likely not in the
+    // graph". The reasoning was wrong about the mechanism, and it was checked
+    // rather than argued: cubecl's `all_reduce` is a FORK (an event recorded on
+    // the compute stream, waited on by `comm_stream`) and `sync_collective` is
+    // the JOIN (an event recorded on `comm_stream`, waited on by compute). Under
+    // stream capture that is the canonical fork/join -- the wait pulls
+    // `comm_stream` INTO the capture, the NCCL launch on it becomes nodes of the
+    // same graph, and the join returns it. The feared outcome, a graph that
+    // closed WITHOUT the collective, has no path: an unjoined fork fails
+    // `cuStreamEndCapture` with CUDA_ERROR_STREAM_CAPTURE_UNJOINED and
+    // `graph_capture_end` asserts on the null graph, and a collective NCCL
+    // cannot capture invalidates the capture, which `graph_capture_status`
+    // reports at the next stage check. `collective_graph_probe` is the one-GPU
+    // measurement of exactly that fork/join (add; reduce a -> b; add, captured
+    // and replayed, the answer read off `b`), and the two-rank run under
+    // `INK_TP=r:2` is the other half.
     //
-    // So: refuse. This is the cheap half of a question that needs a two-rank
-    // probe to answer properly, and until it is answered a refusal is the only
-    // safe reading.
-    anyhow::ensure!(
-        !(graph_lane && tp_group.is_some()),
-        "INK_GRAPH_LANE=1 with a tensor-parallel group is refused. A replayed step runs no host \
-         code in the layer loop, so the seven `tp_reduce` calls never happen -- and the \
-         collective is issued on cubecl's separate `comm_stream`, bypassing the capture \
-         bookkeeping, so it is very likely not in the graph either. Each rank would then carry \
-         its own partial sum forward with no error anywhere, and the `tp_calls == 2` assertion \
-         that would catch it lives inside the loop the lane skips."
-    );
+    // What replaces the refusal is a MEASUREMENT on every run that takes the
+    // lane under a group, in two parts, because the old `tp_calls == 2`
+    // assertion lives inside the loop and so never ran on the steps it was
+    // written for:
+    //
+    //   1. At `graph_capture_end`, a node CENSUS. Every cubecl launch in the
+    //      region is a `CapturedLaunch`; a kernel node the launch index does
+    //      not know is NCCL's. The lane arms under a group only if the graph
+    //      holds at least `2 * layers` such nodes, and prints them either way
+    //      as `GRAPHTP:`, alongside the host-function nodes NCCL adds to kick
+    //      its network proxy on each replay.
+    //   2. After the region, on EVERY step, a per-step count outside the loop:
+    //      an eager step must have issued exactly `2 * layers` collectives from
+    //      the host, and a replayed step must have issued NONE from the host
+    //      while replaying a graph whose census carried them all.
+    //
+    // Neither is the proof. The proof is the token stream: a replayed step
+    // preserves the captured arithmetic order, so the graphed and un-graphed
+    // TP2 runs on one prompt must be bit-identical, and a divergence would say
+    // the collective is not in the graph whatever the census counted.
     anyhow::ensure!(
         !(graph_lane && graph_diff),
         "INK_GRAPH_LANE=1 is exclusive with INK_GRAPH_DIFF / INK_GRAPH_XSTEP: those arms own the \
@@ -4237,6 +4258,11 @@ fn main() -> Result<()> {
         staged_words: usize,
     }
     let mut lane_plan: Option<LanePlan> = None;
+    // What the LAST capture held of the collective, from its node census:
+    // `(kernel nodes the launch index does not know, host-function nodes,
+    // collectives the host issued during the capture)`. Set only under a
+    // group; read by the per-step check on every replayed step.
+    let mut lane_collectives: Option<(usize, usize, usize)> = None;
     // The region's INPUT, pinned. `xd` is uploaded fresh every step, before the
     // arena opens, so its address is wherever the pool put it -- and the
     // region's first kernel reads that address out of a graph node. The lane
@@ -4858,6 +4884,7 @@ fn main() -> Result<()> {
             true => lo..lo,
             false => lo..hi,
         };
+        tp_calls_step.set(0);
         for layer in eager_layers {
             // Cache slot, not layer number. A tail running 20..42 keeps 22 caches
             // and its first layer is its slot 0 — indexing by the absolute layer
@@ -5977,6 +6004,44 @@ fn main() -> Result<()> {
                 .expect("a lane plan implies a capture, and a capture sets the output handle");
             lane_steps += 1;
         }
+        // THE COLLECTIVE COUNT, OUTSIDE THE LOOP, so it runs on the steps the
+        // per-layer one cannot: a replayed step runs no host code in the
+        // region, so the host count must be ZERO there, and what stands in for
+        // it is the census of the graph being replayed. An eager step -- warm,
+        // capture or plain -- must have issued exactly two a layer from the
+        // host, which is the per-layer rule summed.
+        if tp_group.is_some() {
+            let want = 2 * (hi - lo);
+            if lane_replay_now {
+                assert_eq!(
+                    tp_calls_step.get(),
+                    0,
+                    "a replayed step issued {} collectives from the host; the region ran host \
+                     code it was not supposed to run",
+                    tp_calls_step.get()
+                );
+                let (foreign, hosts, issued) = lane_collectives.expect(
+                    "a lane replaying under a group must have a collective census from its capture",
+                );
+                assert!(
+                    foreign >= want && issued == want,
+                    "step {step} replayed a graph whose census holds {foreign} kernel node(s) \
+                     the launch index does not know and {hosts} host node(s), against {want} \
+                     collectives the region must carry ({issued} were issued by the host during \
+                     the capture). The collective is NOT in the graph on this step."
+                );
+            } else {
+                assert_eq!(
+                    tp_calls_step.get(),
+                    want,
+                    "step {step} issued {} collectives, not {want} (two a layer over {} layers). \
+                     A reduce was dropped or added -- see the placement rule in \
+                     `tpcomm::reduce_activation`.",
+                    tp_calls_step.get(),
+                    hi - lo
+                );
+            }
+        }
         if prewarm_last || (prewarm_now && !warm_hold) {
             // Stop deferring and hand the slices back. The PAGES stay in the
             // pool, which is the whole point: the capture that follows finds
@@ -6019,6 +6084,51 @@ fn main() -> Result<()> {
             }
             let g = fp4_client.graph_capture_end();
             let nodes = fp4_client.graph_node_count(g);
+            // THE COLLECTIVE'S CENSUS, under a group. Every cubecl launch the
+            // region made is a `CapturedLaunch`, so a kernel node the launch
+            // index does not know was put there by something else -- and the
+            // only something else on this stream's capture is NCCL, joined in
+            // through `comm_stream`. NCCL also adds a HOST-function node per
+            // plan to kick its network proxy on every replay; it is counted
+            // and printed because a two-node collective cannot complete
+            // without it, and a census that showed kernels and no hosts would
+            // be a graph that hangs on its first replay rather than one that
+            // silently skips.
+            if tp_group.is_some() {
+                let kinds = fp4_client.graph_node_kinds(g);
+                let of = |k: u32| {
+                    kinds
+                        .iter()
+                        .find(|(x, _)| *x == k)
+                        .map(|(_, c)| *c)
+                        .unwrap_or(0)
+                };
+                let launches = fp4_client.graph_launch_count(g);
+                let kernels = of(0);
+                let foreign = kernels.saturating_sub(launches);
+                let hosts = of(3);
+                let issued = tp_calls_step.get();
+                let want = 2 * (hi - lo);
+                println!(
+                    "  GRAPHTP: capture at step {step}: {nodes} nodes, {kernels} kernel nodes of \
+                     which {launches} are cubecl launches and {foreign} are NOT (NCCL's), {hosts} \
+                     host-function node(s), {} memcpy; the host issued {issued} collectives during \
+                     the capture against {want} the region must carry",
+                    of(1)
+                );
+                if foreign < want {
+                    let why = format!(
+                        "the capture at step {step} holds {foreign} kernel node(s) the launch \
+                         index does not know, against {want} collectives the region issued: at \
+                         least {} collective(s) did not become a graph node, and a replay would \
+                         skip them silently",
+                        want - foreign
+                    );
+                    println!("  GRAPHLANE: NOT armed -- {why}");
+                    lane_retired = Some(why);
+                }
+                lane_collectives = Some((foreign, hosts, issued));
+            }
             // The number the arena exists to move. A request the arena could
             // not serve from a slice it already owned is a driver allocation
             // made while the stream was capturing, which is a graph MEMORY node
