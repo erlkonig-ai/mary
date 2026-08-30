@@ -1158,6 +1158,46 @@ SELF=$REPO/scripts/frontier-bench.sh
 [ -f "$SELF" ] || die "$SELF is missing"
 [ -f "$REPO/scripts/lib/box-busy.sh" ] || die "$REPO/scripts/lib/box-busy.sh is missing"
 
+# --- ONE CONTROL PHASE PER MACHINE -----------------------------------------
+# `--due` answers "should a row be measured?", and it is honest, but it cannot
+# see that a row is ALREADY BEING MEASURED: a run that is waiting on the box
+# lock has moved nothing yet, so main still looks unmeasured and the next
+# invocation is told to go. On 2026-08-29 that fired twice while a detached
+# waiter sat at 3600s of its 7200s ceiling. Two control phases then race for
+# the same reservation and can write two rows for one sha.
+#
+# The predicate cannot fix this -- it must stay network-free and under 50 ms,
+# so it cannot read a remote lock, and a local `pgrep` would miss a run
+# started from another shell. So exclude at the POINT OF ACTION, the way
+# gb10-lock.sh does for boxes: `mkdir` is atomic, and two callers cannot both
+# win it.
+#
+# Locally we can do better than gb10-lock's age heuristic. The marker records
+# a pid on THIS machine, so a stale marker is settled exactly -- if the pid is
+# gone the marker is broken immediately, with no timeout and no guessing. That
+# also means a run killed before its trap ran costs the next run nothing.
+RUNMARK=${FRONTIER_RUNMARK:-$HOME/.cache/frontier-bench/control.d}
+mkdir -p "$(dirname "$RUNMARK")" 2>/dev/null || true
+if ! mkdir "$RUNMARK" 2>/dev/null; then
+  omark_pid=$(sed -n 's/^pid=//p' "$RUNMARK/info" 2>/dev/null)
+  omark_tag=$(sed -n 's/^tag=//p' "$RUNMARK/info" 2>/dev/null)
+  omark_since=$(sed -n 's/^since=//p' "$RUNMARK/info" 2>/dev/null)
+  if [ -n "$omark_pid" ] && kill -0 "$omark_pid" 2>/dev/null; then
+    say "REFUSING: a frontier-bench control phase is already running on this machine."
+    say "  pid $omark_pid, tag ${omark_tag:-unknown}, since ${omark_since:-unknown}."
+    say "  It may be WAITING on the box lock rather than measuring -- that still counts,"
+    say "  because two control phases race for one reservation and can write two rows"
+    say "  for one sha. Wait for it, or kill that pid if it is wedged."
+    say "  (marker: $RUNMARK -- override the path with FRONTIER_RUNMARK)"
+    exit 4
+  fi
+  say "  breaking a stale control marker: pid ${omark_pid:-none} is gone."
+  rm -rf "$RUNMARK" 2>/dev/null
+  mkdir "$RUNMARK" 2>/dev/null || die "cannot take the control marker at $RUNMARK"
+fi
+printf 'pid=%s\ntag=%s\nsince=%s\n' "$$" "${FRONTIER_LOCK_TAG:-unset}" \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$RUNMARK/info" 2>/dev/null || true
+
 if [ "$FORCE" != 1 ]; then
   if ! bash "$SELF" --due; then
     say "Nothing to measure: main has not moved since the last frontier row and the"
@@ -1177,6 +1217,10 @@ FRONTIER_LOCK_TAG=${FRONTIER_LOCK_TAG:-frontier-$(date -u +%Y%m%dT%H%M%SZ)}
 HELD_H=0; HELD_T=0; BEATPID=""
 release_all() {
   [ -n "$BEATPID" ] && kill "$BEATPID" 2>/dev/null   # our own child, by PID, never a pattern
+  # The local control marker goes with the reservation: both are things this
+  # process took and must hand back. A leak here is survivable (the next run
+  # tests the pid and breaks it) but should not be routine.
+  [ -n "${RUNMARK:-}" ] && rm -rf "$RUNMARK" 2>/dev/null
   [ "$HELD_H" = 1 ] && GB10_LOCK_TIMEOUT_S=$GB10_LOCK_TIMEOUT_S bash "$LOCK" release "$FRONTIER_HEAD" "$FRONTIER_LOCK_TAG" >/dev/null 2>&1
   [ "$HELD_T" = 1 ] && GB10_LOCK_TIMEOUT_S=$GB10_LOCK_TIMEOUT_S bash "$LOCK" release "$FRONTIER_TAIL" "$FRONTIER_LOCK_TAG" >/dev/null 2>&1
   HELD_H=0; HELD_T=0; BEATPID=""
