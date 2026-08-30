@@ -29,6 +29,7 @@ use safetensors::{Dtype, SafeTensors};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Instant;
+use triblespace::core::repo::SnapshotSource;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::signing_key_file;
 
@@ -140,7 +141,7 @@ fn run() -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!("open model pile {pile_path:?}: {error}"))?;
     let imported = (|| -> anyhow::Result<_> {
         eprintln!("[voxtral] importing exact checkpoint {SOURCE}");
-        let (exact_root, exact_commit) = mary::persist::import_model_to_collection(
+        let (exact_root, _exact_commit) = mary::persist::import_model_to_collection(
             &mut pile,
             &signing_key,
             model_dir,
@@ -153,13 +154,22 @@ fn run() -> anyhow::Result<()> {
         // graph's team, or this key as a team of one on a fresh pile.
         let team = mary::model_collection::model_graph_team_or_own(&mut pile, &signing_key)?;
 
-        // Freeze the exact commit before deriving: later appends cannot move
-        // the source root or reader under the conversion.
-        let exact_snapshot = mary::model_collection::snapshot_model_collection_exact(
-            &mut pile,
-            team,
-            &[exact_commit],
-        )?;
+        // Freeze before deriving: later appends cannot move the source root or
+        // the bytes under the conversion. This line previously tried to say it
+        // by naming the just-published commit — `&[exact_commit]` — which never
+        // typechecked, because `FactCover` is not a slice of commits and
+        // TribleSpace exposes NO public constructor for one (every
+        // `Cover::from_data`/`from_members`/`from_patch` is `pub(crate)`, see
+        // triblespace-core/src/collection/api.rs:277-303). Freezing the
+        // observation is what the comment actually wanted, and the snapshot
+        // epoch gives it directly: this cover is discovered inside a prefix
+        // that cannot advance, so a later append cannot widen it. The
+        // subsequent selector still picks exactly this import's
+        // (SOURCE, NATIVE) root out of it.
+        let store = pile
+            .snapshot()
+            .map_err(|error| anyhow::anyhow!("freeze model pile observation: {error}"))?;
+        let exact_snapshot = mary::model_collection::snapshot_model_collection_in(&store, team)?;
         let exact = SelectedModelIndex::from_snapshot(
             exact_snapshot,
             ModelSelector::Source {
