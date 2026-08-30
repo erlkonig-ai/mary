@@ -204,9 +204,15 @@ case "$ACTION" in take|release) [ -z "$TAG" ] && usage ;; esac
 # answer that reads as "free" is the most dangerous possible failure for a
 # lock, so it is called out rather than just avoided.
 timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" \
-  "bash -s -- '$ACTION' '$TAG' '$GB10_LOCK_TIMEOUT_S'" <<'REMOTE'
+  "bash -s -- '$ACTION' '$TAG' '$GB10_LOCK_TIMEOUT_S' '$HOST'" <<'REMOTE'
 set -uo pipefail
-ACTION=$1; TAG=$2; TIMEOUT=$3
+# HOSTALIAS is the ssh alias the CALLER used. It is passed in purely so the
+# take message can print a command that actually runs: `refresh` takes
+# <host> <tag> like every other verb, and a message that says `refresh $TAG`
+# gets followed literally, fails with "Could not resolve hostname <tag>",
+# and then the lock goes stale mid-measurement while another agent takes the
+# box. Cost one round trip on 2026-08-30; the silent-stale outcome is worse.
+ACTION=$1; TAG=$2; TIMEOUT=$3; HOSTALIAS=${4:-<host>}
 LOCKD="$HOME/gb10/box.lock.d"
 INFO="$LOCKD/info"
 ME=$(hostname)
@@ -220,7 +226,7 @@ case "$ACTION" in
   take)
     mkdir -p "$HOME/gb10"
     if mkdir "$LOCKD" 2>/dev/null; then write_info
-      echo "TAKEN $TAG -- you MUST call 'refresh $TAG' at least every ${TIMEOUT}s"
+      echo "TAKEN $TAG -- you MUST call 'refresh $HOSTALIAS $TAG' at least every ${TIMEOUT}s"
       echo "  or this lock goes stale and another agent may take the box while you run."
       exit 0; fi
     [ -f "$INFO" ] || { echo "HELD by an unidentified holder"; exit 3; }
@@ -274,7 +280,7 @@ case "$ACTION" in
     tr '\n' ' ' < "$INFO" 2>/dev/null; echo
     exit 3
     ;;
-  *) echo "usage: gb10-lock.sh take|release|check <host> [tag]"; exit 2 ;;
+  *) echo "usage: gb10-lock.sh take|refresh|release|check <host> [tag]"; exit 2 ;;
 esac
 REMOTE
 rc=$?
