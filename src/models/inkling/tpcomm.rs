@@ -450,7 +450,7 @@ impl Group {
     // proxy process fanning one input stream out to two rank processes any
     // more; rank 0 owns the Drive loop and rank 1 owns nothing but a Session,
     // so rank 1 has to be TOLD which pass to make. It is told here, on the
-    // socket that already exists, in thirteen bytes.
+    // socket that already exists, in nine bytes.
     //
     // Why this is not a new wire: it carries one small message per model PASS,
     // on the fast fabric, with no JSON, no framing library and no second
@@ -654,7 +654,8 @@ impl Pass {
     ///
     /// Fixed width and self-delimiting, so a short read is an error rather than
     /// a resynchronisation problem. A one-row extend — which is what EVERY
-    /// generated token after the first costs — is thirteen bytes.
+    /// generated token after the first costs — is NINE bytes: one tag, one
+    /// u32be count, one u32be id.
     fn encode(&self) -> Vec<u8> {
         const NONE: &[usize] = &[];
         let (tag, ids): (u8, &[usize]) = match self {
@@ -987,9 +988,16 @@ mod tests {
         }
 
         // A one-row extend is what EVERY generated token after the first costs
-        // on the link. Thirteen bytes, against the framed-stream CONSULT
-        // envelope plus a JSON TurnEnd it replaced.
-        assert_eq!(Pass::Extend(vec![9]).encode().len(), 13);
+        // on the link. NINE bytes -- `[tag u8][count u32be][one id u32be]` --
+        // against the framed-stream CONSULT envelope plus a JSON TurnEnd it
+        // replaced. (This literal said 13 and the comment said "Thirteen" until
+        // 2026-08-30, when the test was first RUN: the self-delimiting
+        // assertion directly above already pins the length at `5 + 4 * count`,
+        // which is 9 for one id, so the two assertions contradicted each other
+        // and the arithmetic slip was in this one. The encoder was always
+        // right. The stale figure had already propagated into the branch's
+        // own write-up as the per-token wire cost, overstating it by 44%.)
+        assert_eq!(Pass::Extend(vec![9]).encode().len(), 9);
 
         let error = Pass::decode(0xFE, Vec::new()).expect_err("an unknown tag must refuse");
         assert!(
