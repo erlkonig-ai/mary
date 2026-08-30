@@ -2269,16 +2269,22 @@ impl ServePair {
             .checked_add(startup_timeout)
             .context("the pair startup timeout is too large")?;
         let [rank0, rank1] = commands;
-        let (launched0, launched1) = concurrently(
-            move || {
-                let mut command = rank0.command()?;
-                LaunchedServe::launch(&mut command)
-            },
-            move || {
-                let mut command = rank1.command()?;
-                LaunchedServe::launch(&mut command)
-            },
-        )?;
+        // LAUNCH ON THIS THREAD, NEVER ON A WORKER. `LaunchedServe::launch`
+        // arms PR_SET_PDEATHSIG, and Linux delivers that signal when the
+        // CREATING THREAD exits -- not when the creating process does
+        // (prctl(2): "the parent in this case is considered to be the thread
+        // that created this process"). Launching inside `concurrently`'s
+        // scoped workers therefore SIGKILLed BOTH ranks the instant those
+        // workers joined, before either could write one line of stderr; the
+        // only symptom upstream was `write the serving process's input
+        // preamble: Broken pipe`. Spawning costs microseconds and only the
+        // model LOAD is slow, and that still happens concurrently below.
+        let launched0 = rank0
+            .command()
+            .and_then(|mut command| LaunchedServe::launch(&mut command));
+        let launched1 = rank1
+            .command()
+            .and_then(|mut command| LaunchedServe::launch(&mut command));
         let (launched0, launched1) = match (launched0, launched1) {
             (Ok(rank0), Ok(rank1)) => (rank0, rank1),
             (rank0, rank1) => {
