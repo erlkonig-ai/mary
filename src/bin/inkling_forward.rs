@@ -4148,6 +4148,34 @@ fn main() -> Result<()> {
     // preserves the captured arithmetic order, so the graphed and un-graphed
     // TP2 runs on one prompt must be bit-identical, and a divergence would say
     // the collective is not in the graph whatever the census counted.
+    //
+    // MEASURED, 2026-08-30, on the pair (rank 0 on spark2, rank 1 on spark),
+    // `INK_TP=r:2 INK_LAYERS=0:42 INK_KV=1 INK_GEN=64`, ctx3732, greedy, one
+    // binary on both boxes (mary 83ff1e2d5085 on a188c00, cubecl-graph
+    // 591e5d15934c), NCCL 2.31.2 over NET/IB, capture mode THREAD_LOCAL (the
+    // default; `relaxed` was never needed), both boxes locked and idle:
+    //
+    //   census, both ranks, both captures:  4894 nodes = 3820 kernel (3736
+    //     cubecl launches + 84 NCCL) + 84 host-function + 819 memcpy + 171 other.
+    //     84 = 2 x 42: every collective is ONE NCCL kernel node plus ONE host
+    //     node (the proxy kick), and nothing was dropped.
+    //   lane: armed on the second capture at decode step 6, replayed the 58
+    //     steps after it, 343.9 us of host per replayed step (patch 343.2 +
+    //     launch 0.7) against ~52 ms of eager enqueue.
+    //   tokens: the 65-position top-5 table is BIT-IDENTICAL (sha256
+    //     510553edddce553a) across plain TP2, TP2 + INK_GRAPH_CARRY=1, TP2 +
+    //     the lane, on BOTH ranks, and against the previous day's 78d851f7
+    //     binary; the per-step token lines agree at all 65 steps.
+    //   step: replayed steps 50.4 min / 51.2 p50 / 54.5 max ms per decode step
+    //     (n = 58, one rep) against 57.3 (plain) and 58.7 (carry, one 93.5 ms
+    //     stall) for the un-graphed arms of the same binary, same hour, warm
+    //     autotune cache. That is the enqueue-bound TP2 step landing on its
+    //     device floor, which is what `tp.rs` projected for "enqueue collapsed".
+    //
+    // And the one-GPU probe: a world-of-one `all_reduce(a -> b)` captured as
+    // ONE memcpy node and replayed in order (b = 12 + N), the in-place
+    // world-of-one variant captured as nothing at all (NCCL short-circuits
+    // it), THREAD_LOCAL mode, no invalidation.
     anyhow::ensure!(
         !(graph_lane && graph_diff),
         "INK_GRAPH_LANE=1 is exclusive with INK_GRAPH_DIFF / INK_GRAPH_XSTEP: those arms own the \
