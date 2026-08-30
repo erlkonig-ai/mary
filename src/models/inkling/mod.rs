@@ -138,18 +138,30 @@ pub mod vision;
 pub mod assembly;
 pub mod session;
 
-// …and the thing that makes a held model reachable by another PROGRAM. A
-// `Session` lives in one address space, and the program that wants it — `drive`
-// — must not link mary. So the model runs in its own process and is reached
-// over the framed-stream convention. The module is backend-free (it is a
-// protocol and a client), which is why it is also compiled without the CUDA
-// lane; see the shim in `models/mod.rs`.
-#[cfg(feature = "serve")]
-pub mod serve;
-// Durable observability is native graph exhaust. The serving wire remains free
-// to use JSON framing, but a resident Drive mind drains these typed facts after
-// startup and after every turn; there is no separate export lifecycle.
-#[cfg(feature = "drive-mind")]
+// …and the MIND that a held model becomes. `resident` is the vocabulary of an
+// Inkling turn plus the `drive::mind::Mind` that produces one: typed context,
+// the native output parser, the one-token carry, the turn shaping, the coverage
+// arithmetic. It is deliberately backend-free — it talks to a `Model` trait,
+// not to a `Session` — which is why it is also compiled WITHOUT the CUDA lane
+// (see the shim in `models/mod.rs`) and is therefore tested on machines that
+// cannot compile a kernel.
+//
+// It used to be `serve`: a framed-stream protocol, a client that spawned a
+// model process, and a proxy that fanned that stream out to two ranks over
+// `ssh`. That existed because drive was not allowed to link mary. It is now,
+// and the whole wire is gone; its header records what that was measured to
+// cost.
+pub mod resident;
+// …and the model itself, in this process. `engine` is what `inkling_serve` was
+// minus the process boundary: one Session, the checkpoint's tokenizer, the
+// incremental detokenizer, and the host-side link that keeps the other rank
+// making the same passes. Needs the CUDA lane and the tokenizer, which is
+// exactly why `resident` does not.
+#[cfg(feature = "tokenizer")]
+pub mod engine;
+// Durable observability is native graph exhaust: a resident Drive mind drains
+// these typed facts after startup and after every turn, and there is no
+// separate export lifecycle.
 pub mod telemetry;
 
 pub use config::InklingConfig;

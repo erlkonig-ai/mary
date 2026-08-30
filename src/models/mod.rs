@@ -55,19 +55,21 @@ pub mod inkling {
     #[path = "target.rs"]
     pub(crate) mod target;
 
-    // The SERVING PROTOCOL is backend-free for the same reason and to greater
-    // effect: the client of a serving process needs no GPU, because the GPU is
-    // in the other process. That is the whole shape of the thing — a model in a
-    // process that can only run where the model runs, reached from a loop that
-    // must run anywhere.
-    #[cfg(feature = "serve")]
-    #[path = "serve.rs"]
-    pub mod serve;
+    // The RESIDENT MIND is backend-free for the same reason and to greater
+    // effect. The model now runs in the same process as the loop — that was the
+    // whole point of the one-binary collapse — so this is no longer "the client
+    // half of a protocol". It is the half of the mind that is ABOUT TURNS
+    // rather than about kernels: what a delta is, what a carry is, when a
+    // response is complete, which bytes a decision spans. None of that needs a
+    // GPU, all of it is where the expensive mistakes have historically been,
+    // and keeping it compilable here is what keeps it tested on a laptop
+    // against a scripted `Model`.
+    #[path = "resident.rs"]
+    pub mod resident;
 
-    // Native READY/TurnEnd evidence for the GPU-free Drive client. Keep this in
-    // the same reconstructed module as `serve`, since `drive-mind` deliberately
-    // does not pull the CUDA model implementation onto the host.
-    #[cfg(feature = "drive-mind")]
+    // Native READY/TurnEnd evidence, in the same reconstructed module as
+    // `resident` for the same reason: durable turn exhaust is a fact about a
+    // turn, not about a kernel.
     #[path = "telemetry.rs"]
     pub mod telemetry;
 }

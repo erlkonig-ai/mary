@@ -1,9 +1,10 @@
 //! Native, continuously drained evidence from the resident Inkling runtime.
 //!
 //! These fragments are exhaust of ordinary model operation, not an export
-//! format. The serving protocol may use JSON as an ephemeral wire encoding,
-//! but the durable observation surface is typed Trible facts emitted through
-//! [`drive::mind::Mind::take_exhaust`]. Each entity is intrinsic: equal READY
+//! format. `Ready` and `TurnEnd` are still serializable values, but nothing
+//! transmits them any more — the model is in this process — and the durable
+//! observation surface was never the wire in the first place: it is typed
+//! Trible facts emitted through [`drive::mind::Mind::take_exhaust`]. Each entity is intrinsic: equal READY
 //! announcements and equal turn measurements collapse naturally, while Drive
 //! links their exported roots to the runtime session and the turn that caused
 //! them.
@@ -17,7 +18,7 @@ use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::{Blake3, Boolean, F64, Handle, Hash, U256BE};
 use triblespace::prelude::*;
 
-use super::serve::{ContextPlacement, ContextPreflighted, Ready, Reinitialized, TurnEnd};
+use super::resident::{ContextPlacement, ContextPreflighted, Ready, Reinitialized, TurnEnd};
 
 /// Query vocabulary for Inkling's native runtime evidence.
 pub mod schema {
@@ -79,13 +80,13 @@ pub mod schema {
         /// Tokens carried from the model's previous turn.
         /// Minted 2026-08-28: 80F7AB2F034F53FE82C0D5242258205B.
         "80F7AB2F034F53FE82C0D5242258205B" as pub carried_tokens: U256BE;
-        /// Why generation stopped, as the serving process reported it.
+        /// Why generation stopped, as the mind judged it.
         /// Minted 2026-08-28: 6A54094F008D8C05CEC807CF1F3E321A.
         "6A54094F008D8C05CEC807CF1F3E321A" as pub stop_reason: Handle<UTF8String>;
-        /// Seconds to the first token of this turn, measured in the server.
+        /// Seconds to the first token of this turn, around the Session calls.
         /// Minted 2026-08-28: F8CF2A5C82EA89682E45F85BCA08E2A1.
         "F8CF2A5C82EA89682E45F85BCA08E2A1" as pub first_token_seconds: F64;
-        /// Seconds for the complete logical turn, measured in the server.
+        /// Seconds for the complete logical turn, around the Session calls.
         /// Minted 2026-08-28: 379776AE923C962A7DE2A6DBC03DA77F.
         "379776AE923C962A7DE2A6DBC03DA77F" as pub turn_seconds: F64;
         /// Positions retained in the KV cache after the turn.
@@ -226,7 +227,7 @@ pub fn context_preflight_fragment(evidence: &ContextPreflighted) -> Fragment {
     fragment
 }
 
-/// Preserve a warm-context replacement only after its server ACK succeeded.
+/// Preserve a warm-context replacement only after the model acknowledged it.
 pub fn reinitialized_fragment(next_epoch: u64, acknowledged: &Reinitialized) -> Fragment {
     entity! { _ @
         metadata::tag: schema::kind_reinitialized,
@@ -240,7 +241,7 @@ pub fn reinitialized_fragment(next_epoch: u64, acknowledged: &Reinitialized) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::inkling::serve::InklingSpecialIds;
+    use crate::models::inkling::resident::InklingSpecialIds;
 
     fn ready() -> Ready {
         Ready {

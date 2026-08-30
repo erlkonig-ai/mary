@@ -60,28 +60,28 @@ serde_json = "1.0"
 # and the loaders report errors via anyhow.
 anyhow = "1"
 
-# THE STREAM CONVENTION, as a crate mary merely consumes — the same one `drive`
-# reads on its end. It is std + anyhow, has no dependency on drive, and lives in
-# drive's repository only because that is where its first consumers were; its
-# own docs say a convention only one program can link is not a convention. The
-# Inkling serving process (`inkling_serve`) is the third consumer: model in one
-# process, cognition loop in another, records on a pipe between them.
-framed-stream = { version = "0.1.0", path = "../drive/framed-stream", optional = true }
-# The COGNITION LOOP, linked only by `inkling_serve_gate`. The dependency runs
-# one way and must keep doing so: drive has no `mary` dependency, because drive
-# building GPU-free in seconds is the property that lets the loop run on a
-# laptop. The adapter that makes an Inkling Session into a `drive::mind::Mind`
-# is a mary concern — mary knows what a turn of this model is; drive knows only
-# that a mind is a `&mut self` function from world to turn.
+# THE COGNITION LOOP, and it is UNCONDITIONAL as of 2026-08-30. It used to be
+# optional behind `drive-mind`, because the model ran in its own process and the
+# GPU-free client half had to keep building on a laptop in seconds. The model
+# runs in THIS process now — one binary holding the Drive loop and the weights,
+# deployed unchanged to both Sparks — so there is no build that wants
+# `models::inkling::resident` without `drive`, and a flag whose only effect is
+# to break that module is not worth its own existence (JP, 2026-08-30: "we don't
+# care about the mac anymore for drive... that flag needs to die"). The
+# dependency still runs ONE WAY and must keep doing so: drive has no `mary`
+# dependency. The adapter that makes an Inkling Session into a
+# `drive::mind::Mind` is a mary concern — mary knows what a turn of this model
+# is; drive knows only that a mind is a `&mut self` function from world to turn.
 #
-# BOTH ARE PATH DEPENDENCIES, so `../drive` must EXIST for any mary build, even
-# one that enables neither feature — cargo resolves optional path deps whether
-# or not they are activated. That is the price of the gate, and it is the same
-# arrangement `../triblespace-rs` and `../cubecl-graph` already impose: the
-# sibling checkouts are the workspace. `drive` also drags `faculties` into the
-# LOCKFILE (not into any build that leaves `drive-mind` off), which is why the
-# lockfile grew by a couple of thousand lines the day this landed.
-drive = { version = "0.1.0", path = "../drive", optional = true }
+# `../drive` must EXIST for any mary build, which was already true when this was
+# optional (cargo resolves optional path deps whether or not they are
+# activated). It is the same arrangement `../triblespace-rs` and `../cubecl-graph`
+# already impose: the sibling checkouts are the workspace.
+#
+# `framed-stream` left with the wire it framed. Nothing in mary speaks a framed
+# stream any more: the mind and the model are one process, and the two tensor
+# ranks talk over the rendezvous socket the NCCL Group already holds.
+drive = { version = "0.1.0", path = "../drive" }
 
 # Flux.2 port (mary::models::flux) deps mary's other models don't need.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
@@ -112,7 +112,9 @@ pollster = { version = "0.4", optional = true }
 memmap2 = { version = "0.9", optional = true }
 sha2 = { version = "0.10", optional = true }
 bytes = { version = "1", optional = true }
-blake3 = { version = "1", optional = true }
+# Execution identity (`resident::ExecutionManifest`) and the cross-rank sequence
+# digest both hash with it, and both are unconditional now.
+blake3 = "1"
 cudarc = { version = "0.19", default-features = false, features = [
     "std",
     "driver",
@@ -133,20 +135,18 @@ cpal = { version = "0.17", optional = true }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 
 [features]
-# THE SERVING PROTOCOL (mary::models::inkling::serve) — how a process holding a
-# `Session` is talked to, and the client half that talks to it. Backend-free on
-# purpose: the CLIENT of a serving process needs no GPU, because the GPU is in
-# the other process. That is what lets `inkling_serve_gate` build and run
-# anywhere while the model runs where the model has to.
-serve = ["dep:framed-stream", "dep:blake3"]
-# The serving PROCESS itself: the protocol, plus a Session to serve, plus the
-# checkpoint's tokenizer (text on the wire, never ids — drive's `Mind` seam asks
-# for no tokenizer, so tokenizing belongs to whoever owns the model).
-inkling-serve = ["serve", "inkling-cuda", "tokenizer"]
-# The DRIVE SEAM: `mary::models::inkling::serve::InklingMind`, a
-# `drive::mind::Mind` backed by a Session in another process, and the gate that
-# runs drive's real loop against it. GPU-free — see `serve`.
-drive-mind = ["serve", "dep:drive"]
+# THE RESIDENT MIND, whole: `models::inkling::engine` (a Session, the
+# checkpoint's tokenizer, the incremental detokenizer and the host-side rank
+# link) plus `models::inkling::resident` (the turn vocabulary and the
+# `drive::mind::Mind`). One feature, because after the one-binary collapse the
+# pieces only mean anything together — there is no build that wants the model
+# without the loop or the loop without the model.
+#
+# `serve`, `inkling-serve` and `drive-mind` were the three-process arrangement's
+# feature surface and went with it. `resident` itself is compiled
+# UNCONDITIONALLY and without the CUDA lane (see the shim in `models/mod.rs`),
+# which is what keeps the turn logic testable where a kernel cannot be compiled.
+inkling-resident = ["inkling-cuda", "tokenizer"]
 # CUDA/sm_121 lane for the PersonaPlex realtime stack. Selects cubecl-cuda for
 # the q4 + temporal kernels; deliberately does NOT touch the `burn` dep, since
 # the realtime lane never instantiates a burn backend (RealtimePipeline has no
@@ -1123,33 +1123,20 @@ required-features = ["inkling-cuda"]
 name = "tp_allreduce_probe"
 required-features = ["inkling-cuda"]
 
-# THE SERVING PROCESS: one Session, held open, answering turns over the
-# framed-stream convention on stdin/stdout. This is what puts a real mind behind
-# `drive` without drive linking mary — the model runs here, the loop runs there,
-# and records go over a pipe.
-[[bin]]
-name = "inkling_serve"
-required-features = ["inkling-serve"]
-
-# Two full-stack tensor-parallel serving ranks behind the same GPU-free framed
-# protocol. The ranks own CUDA; this fan-out/checking process does not.
-[[bin]]
-name = "inkling_serve_pair"
-required-features = ["serve"]
-
-# THE GATE for it: drive's own loop (Shell, world, span verification, audit,
-# pile) driven by a real Session instead of StubMind, plus a `probe` mode that
-# speaks the protocol directly so a turn with a real DELTA can be measured. No
-# GPU here — the GPU is in the process this one spawns.
-[[bin]]
-name = "inkling_serve_gate"
-required-features = ["drive-mind"]
-
-# The resident foreground: one long-lived Inkling serving process (normally the
-# TP pair) owned by one Drive shell. GPU-free itself; the serve child owns CUDA.
+# THE ONE BINARY. The Drive loop AND the model, in one process, deployed
+# unchanged to both DGX Sparks; the two instances discover which is which by
+# comparing their own addresses to the rendezvous address, and the only other
+# process in the deployment is the playground sandbox.
+#
+# It replaces four: `inkling_serve` (the model in its own process),
+# `inkling_serve_pair` (the two-rank fan-out proxy, which launched the second
+# rank over ssh), `inkling_serve_gate` (drive's loop against a real Session,
+# which `--turns <n>` now is), and the GPU-free `inkling_drive` that spawned
+# them. Measured motivation, per generated token, 42 layers, TP2: ~26 ms of a
+# p50 82 ms token was the protocol between the mind and the model.
 [[bin]]
 name = "inkling_drive"
-required-features = ["drive-mind"]
+required-features = ["inkling-resident"]
 
 # Parity gate for the grid-axis swap in fp4gemm/w4a16gemm: a pure scheduling
 # change, so every cube must land byte-identical output. Owns CUDA directly.

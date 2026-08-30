@@ -1,10 +1,48 @@
-//! `inkling_drive` — one resident Inkling session in Drive's foreground shell.
+//! `inkling_drive` — **ONE BINARY**: the Drive loop AND the model, in one
+//! process, deployed unchanged to both DGX Sparks.
 //!
-//! This is deliberately not a daemon. It owns one serving process (normally an
-//! `inkling_serve_pair`), one Drive sandbox session, and one cognition ledger
-//! for the whole invocation. `--live` ends cooperatively at the next generated
-//! token boundary on the first SIGINT; a second SIGINT is the force-kill escape
-//! hatch.
+//! ```text
+//!   # the SAME command line on BOTH boxes
+//!   inkling_drive --model <model.pile> --tokenizer <tokenizer.json> \
+//!                 --layers 0:42 --tp-world 2 --tp-rendezvous <rank0-fabric>:29500 \
+//!                 --playground <playground> --live
+//! ```
+//!
+//! # What this replaced
+//!
+//! Until 2026-08-30 a resident run was THREE process kinds and a protocol:
+//! `inkling_drive` (GPU-free) spawned `inkling_serve_pair`, which spawned two
+//! `inkling_serve` ranks — the second over passwordless `ssh` — and fanned one
+//! framed stream out to both, comparing their token text byte for byte.
+//!
+//! Measured on hardware, per generated token, 42 layers, TP2 across both boxes,
+//! inside the serving process: decode within one 32-token consult was
+//! 55.8 / 58.7 ms, while decode AS DRIVE ACTUALLY USED IT was p50 82 ms
+//! (n = 768, min 58, p25 65, p75 114, p95 186). **About 26 ms a token — a third
+//! of resident decode — was the protocol**, because Drive consults one token at
+//! a time and every token paid a framed-stream round trip through the proxy, a
+//! fan-out to two rank pipes and an `ssh` channel. That is what this deletes.
+//!
+//! It also deletes the `ssh` trust edge: rank 0 no longer launches rank 1, so
+//! the two boxes are independent failure domains and independent security
+//! domains. And it deletes version skew as a category — there is one binary, and
+//! its exact bytes enter the execution identity both ranks announce.
+//!
+//! # Which box is which
+//!
+//! Nothing in the invocation says. `mary::models::inkling::tpcomm::elect_rank`
+//! compares this box's own addresses to the `--tp-rendezvous` host: the box that
+//! HOLDS that address is rank 0 (it binds, owns the Drive loop, owns the
+//! cognition pile and the sandbox); the box that does not is rank 1 and runs as
+//! a pure model rank. The rendezvous address already had to name rank 0 —
+//! `Group::form` binds it on rank 0 and dials it everywhere else — so this is
+//! reading configuration that already existed rather than adding any.
+//!
+//! # Still not a daemon
+//!
+//! One model, one Drive sandbox session and one cognition ledger for the whole
+//! invocation. `--live` ends cooperatively at the next generated token boundary
+//! on the first SIGINT; a second SIGINT is the force-kill escape hatch.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,30 +52,46 @@ use drive::config::{ExecConfig, PileConfig};
 use drive::context::{MemoryConfig, ModelBudget};
 use drive::shell::{Extent, Shell, ShellConfig, TurnOutcome};
 use drive::stream::FacultyCommand;
-use mary::models::inkling::serve::{InklingMind, Ready, ServeClient};
+use mary::models::inkling::engine::{self, EngineConfig, Loaded, TensorParallel};
+use mary::models::inkling::resident::{InklingMind, Ready, StreamProof, TurnEnd};
+use mary::models::inkling::tpcomm::elect_rank;
 
 const DEFAULT_SYSTEM: &str = "You are a mind in a shell. Think out loud in your own words, and run \
 faculties when you want to know or change something. What you run comes back to you as a result.";
 
 fn usage() -> &'static str {
     "\
-inkling_drive — one resident Inkling session in Drive's foreground shell
+inkling_drive — the Drive loop and the model, one process, one binary, both boxes
 
 USAGE:
-    inkling_drive --serve <path> --playground <path> (--turns <n> | --live) [OPTIONS]
+    inkling_drive --model <model.pile> --tokenizer <tokenizer.json> \\
+                  --playground <path> (--turns <n> | --live) [OPTIONS]
 
 MODEL:
-    --serve <path>          `inkling_serve`-compatible process (normally
-                            `inkling_serve_pair`) [required]
-    --serve-arg <arg>       Argument passed to the serving process; repeatable
+    --model <path>          The model collection: weights AND config.json [required]
+    --tokenizer <path>      The checkpoint's tokenizer.json [required]
+    --layers <lo:hi>        Layers this rank runs (a TP rank runs all of them)
+    --prefill-budget <n>    Maximum tokens processed in one prefill pass
+    --context-budget <n>    Maximum positions retained (default: the prefill budget)
+    --sealed                Reject execution-changing environment overrides
     --system <text>         System prompt
 
+TENSOR PARALLELISM (both flags together, or neither):
+    --tp-world <n>          Number of ranks. Address-match election supports 2.
+    --tp-rendezvous <a>     RANK 0's HOST:PORT on the fast fabric. The box that
+                            holds this address IS rank 0 and owns the Drive
+                            loop; the box that does not is a pure model rank.
+                            There is no --tp-rank: the two invocations are
+                            identical, not merely the two binaries.
+
 LIFETIME:
-    --turns <n>             Run exactly this many Drive turns
+    --turns <n>             Run exactly this many Drive turns, then report the
+                            per-turn and per-token decode evidence
     --live                  Run until SIGINT, stopping at the next token boundary
 
-DRIVE / SANDBOX:
-    --pile <path>           Scratch cognition pile (default: unique /tmp path)
+DRIVE / SANDBOX (rank 0 only; rank 1 parses and ignores them):
+    --pile <path>           Scratch COGNITION pile (default: unique /tmp path).
+                            Not --model; this is the ledger, not the weights.
     --playground <path>     `playground` or protocol-compatible binary [required]
     --backend <name>        `playground mcp --backend <name>` (default: lima)
     --backend-arg <arg>     Backend/policy argument; repeatable and passed verbatim
@@ -59,16 +113,22 @@ OPTIONAL FACULTIES:
 
 The runner adds no command allowlist or host-exec escape hatch. Sandbox policy
 is exactly the selected playground backend plus the explicitly supplied
---backend-arg values. The serving process's READY context budget is also the
-single capacity used to size Drive's memory cover; there is no second runner
-window to keep in sync.
+--backend-arg values. The model's own context budget is also the single capacity
+used to size Drive's memory cover; there is no second runner window to keep in
+sync.
 "
 }
 
 #[derive(Clone, Debug)]
 struct Options {
-    serve: Option<PathBuf>,
-    serve_args: Vec<String>,
+    model: Option<PathBuf>,
+    tokenizer: Option<PathBuf>,
+    layers: Option<std::ops::Range<usize>>,
+    prefill_budget: Option<usize>,
+    context_budget: Option<usize>,
+    sealed: bool,
+    tp_world: Option<usize>,
+    tp_rendezvous: Option<String>,
     system: String,
     turns: Option<usize>,
     live: bool,
@@ -94,8 +154,14 @@ impl Default for Options {
             .unwrap_or_default()
             .as_nanos();
         Self {
-            serve: None,
-            serve_args: Vec::new(),
+            model: None,
+            tokenizer: None,
+            layers: None,
+            prefill_budget: None,
+            context_budget: None,
+            sealed: false,
+            tp_world: None,
+            tp_rendezvous: None,
             system: DEFAULT_SYSTEM.to_string(),
             turns: None,
             live: false,
@@ -129,8 +195,42 @@ impl Options {
 
         while index < args.len() {
             match args[index].as_str() {
-                "--serve" => options.serve = Some(PathBuf::from(next(&mut index, "--serve")?)),
-                "--serve-arg" => options.serve_args.push(next(&mut index, "--serve-arg")?),
+                "--model" => options.model = Some(PathBuf::from(next(&mut index, "--model")?)),
+                "--tokenizer" => {
+                    options.tokenizer = Some(PathBuf::from(next(&mut index, "--tokenizer")?));
+                }
+                "--layers" => {
+                    let value = next(&mut index, "--layers")?;
+                    let (lo, hi) = value
+                        .split_once(':')
+                        .with_context(|| format!("--layers wants LO:HI, got {value:?}"))?;
+                    options.layers = Some(lo.parse()?..hi.parse()?);
+                }
+                "--prefill-budget" => {
+                    options.prefill_budget = Some(
+                        next(&mut index, "--prefill-budget")?
+                            .parse()
+                            .context("--prefill-budget wants a count")?,
+                    );
+                }
+                "--context-budget" => {
+                    options.context_budget = Some(
+                        next(&mut index, "--context-budget")?
+                            .parse()
+                            .context("--context-budget wants a count")?,
+                    );
+                }
+                "--sealed" => options.sealed = true,
+                "--tp-world" => {
+                    options.tp_world = Some(
+                        next(&mut index, "--tp-world")?
+                            .parse()
+                            .context("--tp-world wants a count")?,
+                    );
+                }
+                "--tp-rendezvous" => {
+                    options.tp_rendezvous = Some(next(&mut index, "--tp-rendezvous")?);
+                }
                 "--system" => options.system = next(&mut index, "--system")?,
                 "--turns" => {
                     options.turns = Some(
@@ -189,7 +289,8 @@ impl Options {
             index += 1;
         }
 
-        anyhow::ensure!(options.serve.is_some(), "--serve is required");
+        anyhow::ensure!(options.model.is_some(), "--model is required");
+        anyhow::ensure!(options.tokenizer.is_some(), "--tokenizer is required");
         anyhow::ensure!(options.playground.is_some(), "--playground is required");
         anyhow::ensure!(
             options.budget.max_output_tokens > 0,
@@ -223,6 +324,17 @@ impl Options {
             "--memory-pile and --pile must differ: durable memory is read-only and cognition \
              provenance is scratch output"
         );
+        anyhow::ensure!(
+            options.model.as_ref() != Some(&options.pile),
+            "--model and --pile must differ: --model is the weights, --pile is this run's \
+             cognition ledger"
+        );
+        anyhow::ensure!(
+            options.tp_world.is_some() == options.tp_rendezvous.is_some(),
+            "--tp-world and --tp-rendezvous are one launch contract; provide both or neither. \
+             There is deliberately no --tp-rank: which box is rank 0 is decided by which box \
+             holds the rendezvous address."
+        );
         Ok(options)
     }
 
@@ -234,14 +346,28 @@ impl Options {
         }
     }
 
-    fn serve_command(&self) -> std::process::Command {
-        let mut command = std::process::Command::new(
-            self.serve
-                .as_ref()
-                .expect("parse enforces a serving process"),
-        );
-        command.args(&self.serve_args);
-        command
+    /// How to load this box's rank, once the election has decided which it is.
+    fn engine_config(&self) -> Result<EngineConfig> {
+        let tensor_parallel = match (&self.tp_rendezvous, self.tp_world) {
+            (Some(rendezvous), Some(world)) => Some(TensorParallel {
+                tp: elect_rank(rendezvous, world)
+                    .context("decide this box's tensor-parallel rank")?,
+                rendezvous: rendezvous.clone(),
+            }),
+            _ => None,
+        };
+        Ok(EngineConfig {
+            pile: self
+                .model
+                .clone()
+                .expect("parse enforces a model collection"),
+            tokenizer: self.tokenizer.clone().expect("parse enforces a tokenizer"),
+            layers: self.layers.clone(),
+            prefill_budget: self.prefill_budget,
+            context_budget: self.context_budget,
+            tensor_parallel,
+            sealed: self.sealed,
+        })
     }
 
     fn shell_config(&self, context_window_tokens: u64) -> ShellConfig {
@@ -330,15 +456,16 @@ impl RunObservations {
 fn validate_ready(ready: &Ready) -> Result<()> {
     anyhow::ensure!(
         !ready.partial,
-        "the serving process announced a partial stack; its tokens are diagnostic, not the \
-         model's. Use inkling_serve_gate for partial-stack experiments"
+        "this rank loaded a partial stack; its tokens are diagnostic, not the model's. A \
+         full-stack resident run needs --layers 0:<stack> with --tp-world/--tp-rendezvous, \
+         because 144 GiB of weights do not fit one 121 GiB box"
     );
     anyhow::ensure!(
         matches!(
             ready.execution_profile.as_str(),
             "sealed-v1" | "observed-v1"
         ),
-        "serving process announced unsupported execution profile {:?}",
+        "unsupported execution profile {:?}",
         ready.execution_profile
     );
     anyhow::ensure!(
@@ -347,7 +474,7 @@ fn validate_ready(ready: &Ready) -> Result<()> {
                 .execution_identity
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit()),
-        "serving process announced invalid execution identity {:?}",
+        "invalid execution identity {:?}",
         ready.execution_identity
     );
     Ok(())
@@ -381,39 +508,132 @@ fn combine_run_and_finish(run: Result<()>, finish: Result<()>) -> Result<()> {
     }
 }
 
+/// One number's worth of order statistics, with the framing rule attached.
+///
+/// This is the whole point of a finite `--turns` run: it produces the AFTER
+/// number for the module header's BEFORE number, at the same granularity and
+/// measured in the same place, so the two are comparable without
+/// reconstruction.
+fn report_decode_distribution(proofs: &[StreamProof]) {
+    let mut secs: Vec<f64> = proofs
+        .iter()
+        .flat_map(|proof| proof.token_secs.iter().copied())
+        .collect();
+    if secs.is_empty() {
+        println!("decode: no tokens generated");
+        return;
+    }
+    secs.sort_by(|left, right| {
+        left.partial_cmp(right)
+            .expect("a measured duration is never NaN")
+    });
+    let quantile = |q: f64| -> f64 {
+        let index = (((secs.len() - 1) as f64) * q).round() as usize;
+        secs[index] * 1_000.0
+    };
+    println!(
+        "decode: n={} min {:.1} p25 {:.1} p50 {:.1} p75 {:.1} p95 {:.1} max {:.1} ms",
+        secs.len(),
+        secs[0] * 1_000.0,
+        quantile(0.25),
+        quantile(0.50),
+        quantile(0.75),
+        quantile(0.95),
+        secs[secs.len() - 1] * 1_000.0,
+    );
+    println!(
+        "  framing rule: MILLISECONDS PER GENERATED TOKEN, one one-token consult each — the \
+         granularity Drive actually generates at, not a multi-token consult amortised. Measured \
+         around this process's own Session calls. The number to compare it against is the \
+         framed-stream baseline in this binary's header: p50 82 ms (n=768, min 58, p25 65, \
+         p75 114, p95 186), 42 layers, TP2, both Sparks."
+    );
+}
+
+fn report_turns(log: &[TurnEnd], proofs: &[StreamProof]) {
+    for end in log {
+        println!("{}", end.summary());
+    }
+    let streamed = proofs.iter().filter(|proof| proof.streamed()).count();
+    println!(
+        "streaming: {streamed} of {} turn(s) produced consumer output before the mind stopped \
+         generating",
+        proofs.len()
+    );
+    report_decode_distribution(proofs);
+}
+
+/// Rank 1: no Drive, no pile, no sandbox, no tokenizer. Replay rank 0's passes.
+fn run_follower(mut follower: engine::Follower) -> Result<()> {
+    validate_ready(follower.ready())?;
+    eprintln!(
+        "inkling_drive: FOLLOWER — rank {:?} of {}, layers {}..{}, {} {}. This box owns no \
+         cognition pile and makes no decisions; it replays rank 0's passes.",
+        follower.ready().tp_rank,
+        follower.ready().tp_world,
+        follower.ready().layers[0],
+        follower.ready().layers[1],
+        follower.ready().execution_profile,
+        follower.ready().execution_identity,
+    );
+    follower.follow()
+}
+
 fn run(options: Options) -> Result<()> {
+    // Armed before the load, because the load is minutes and a run interrupted
+    // during it should still be interruptible once rather than twice.
     install_sigint_stop();
+    // The election runs BEFORE the model loads, because it decides which of the
+    // two `Session::load` paths this box takes, and it must be able to refuse a
+    // rendezvous address that names neither box without first spending minutes
+    // mapping a 171 GB pile.
+    let loaded = engine::load(options.engine_config()?).context("load this box's rank")?;
+    let engine = match loaded {
+        Loaded::Follower(follower) => return run_follower(follower),
+        Loaded::Engine(engine) => engine,
+    };
 
     let max_response_tokens = usize::try_from(options.budget.max_output_tokens)
         .context("--max-output does not fit this platform's token index")?;
-    let mut serve = options.serve_command();
-    eprintln!(
-        "inkling_drive: loading one resident serving process: {} ({} argument(s))",
-        serve.get_program().to_string_lossy(),
-        options.serve_args.len(),
-    );
-    let client = ServeClient::spawn(&mut serve).context("start the Inkling serving process")?;
-    let mind = InklingMind::new(client, max_response_tokens, Some(options.system.clone()))?
-        .with_cancellation(|| SIGINT_STOP.load(Ordering::Relaxed));
-    // Validate after the client is owned by InklingMind: every refusal below
-    // therefore takes the same bounded shutdown/reap path as a completed run.
-    validate_ready(mind.ready())?;
+    validate_ready(engine.ready())?;
     anyhow::ensure!(
-        max_response_tokens.saturating_add(1) <= mind.ready().context_budget,
-        "the {max_response_tokens}-token response cap plus its one-token carry/prompt admission exceeds the model's {}-token context budget",
-        mind.ready().context_budget
+        max_response_tokens.saturating_add(1) <= engine.ready().context_budget,
+        "the {max_response_tokens}-token response cap plus its one-token carry/prompt admission \
+         exceeds the model's {}-token context budget",
+        engine.ready().context_budget
     );
+    let context_window_tokens = u64::try_from(engine.ready().context_budget)
+        .context("the model's context budget does not fit Drive's token budget")?;
     eprintln!(
-        "inkling_drive: READY — {} layers, context {}, {}, {}",
-        mind.ready().stack,
-        mind.ready().context_budget,
-        mind.ready().execution_profile,
-        mind.ready().execution_identity,
+        "inkling_drive: LEADER — {} layers, context {}, {}, {}",
+        engine.ready().stack,
+        engine.ready().context_budget,
+        engine.ready().execution_profile,
+        engine.ready().execution_identity,
     );
 
+    // A finite run retains per-turn and per-token evidence so it can report the
+    // decode distribution afterwards; an unbounded one must not accumulate one
+    // `f64` per token forever. The extent already draws that line, so there is
+    // no separate flag for it.
+    let finite = options.turns.is_some();
+    let mind = match finite {
+        true => InklingMind::new_gate(
+            Box::new(engine),
+            max_response_tokens,
+            Some(options.system.clone()),
+        ),
+        false => InklingMind::new(
+            Box::new(engine),
+            max_response_tokens,
+            Some(options.system.clone()),
+        ),
+    }?
+    .with_cancellation(|| SIGINT_STOP.load(Ordering::Relaxed));
+
     let voice_slot = mind.voice_slot();
-    let context_window_tokens = u64::try_from(mind.ready().context_budget)
-        .context("the serving process context budget does not fit Drive's token budget")?;
+    let log = mind.log();
+    let proofs = mind.proofs();
     let shell_config = options.shell_config(context_window_tokens);
     eprintln!(
         "inkling_drive: opening scratch ledger {} and sandbox {} mcp --backend {}",
@@ -440,8 +660,10 @@ fn run(options: Options) -> Result<()> {
         "resident shell loop",
     );
     // `finish` consumes Shell, finalizes/flushes both Drive ledgers, and then
-    // drops InklingMind, whose Drop sends a complete END and boundedly reaps the
-    // one serving process/pair. It is attempted after success, error, or panic.
+    // drops InklingMind, whose Drop calls `Model::shutdown` — which tells the
+    // OTHER BOX the run is over. Without that the peer sits in `follow`
+    // forever, holding its whole arena. It is attempted after success, error,
+    // or panic.
     let finish = caught(
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shell.finish())),
         "resident shell teardown",
@@ -451,6 +673,11 @@ fn run(options: Options) -> Result<()> {
         "inkling_drive: {} turn(s), {} command(s), {} error result(s), {} spoken byte(s)",
         observations.turns, observations.fired, observations.result_errors, observations.said_bytes,
     );
+    if let (Some(log), Some(proofs)) = (log, proofs) {
+        let log = log.lock().expect("turn log").clone();
+        let proofs = proofs.lock().expect("proof log").clone();
+        report_turns(&log, &proofs);
+    }
     result
 }
 
@@ -479,8 +706,10 @@ mod tests {
 
     fn minimum(extra: &[&str]) -> Vec<String> {
         let mut args = strings(&[
-            "--serve",
-            "pair",
+            "--model",
+            "/models/inkling.pile",
+            "--tokenizer",
+            "/models/tokenizer.json",
             "--playground",
             "playground",
             "--turns",
@@ -493,7 +722,14 @@ mod tests {
     #[test]
     fn parser_requires_one_explicit_lifetime() {
         for args in [
-            strings(&["--serve", "pair", "--playground", "playground"]),
+            strings(&[
+                "--model",
+                "/models/inkling.pile",
+                "--tokenizer",
+                "/models/tokenizer.json",
+                "--playground",
+                "playground",
+            ]),
             minimum(&["--live"]),
             minimum(&["--turns", "0"]),
         ] {
@@ -509,8 +745,10 @@ mod tests {
             Extent::Turns(3)
         );
         let live = Options::parse(&strings(&[
-            "--serve",
-            "pair",
+            "--model",
+            "/models/inkling.pile",
+            "--tokenizer",
+            "/models/tokenizer.json",
             "--playground",
             "playground",
             "--live",
@@ -519,13 +757,58 @@ mod tests {
         assert_eq!(live.extent(), Extent::Live);
     }
 
+    /// There is no `--tp-rank`, and that is the deployment property being
+    /// bought: the two boxes run the same COMMAND, not merely the same binary.
+    #[test]
+    fn tensor_parallelism_is_one_contract_with_no_rank_in_it() {
+        let error = Options::parse(&minimum(&["--tp-world", "2"]))
+            .expect_err("a world without a rendezvous names no rank 0");
+        assert!(
+            error.to_string().contains("one launch contract"),
+            "{error:#}"
+        );
+
+        let error = Options::parse(&minimum(&["--tp-rendezvous", "10.0.0.1:29500"]))
+            .expect_err("a rendezvous without a world sizes nothing");
+        assert!(
+            error.to_string().contains("one launch contract"),
+            "{error:#}"
+        );
+
+        Options::parse(&minimum(&[
+            "--tp-world",
+            "2",
+            "--tp-rendezvous",
+            "10.0.0.1:29500",
+        ]))
+        .expect("both together are the whole contract");
+
+        Options::parse(&minimum(&["--tp-rank", "0"]))
+            .expect_err("--tp-rank must not exist: the invocations are identical");
+    }
+
+    /// `--model` is the weights and `--pile` is the cognition ledger. They were
+    /// both spelled `--pile` in the two binaries this one replaces, in opposite
+    /// senses, so the merged surface has to keep them apart loudly.
+    #[test]
+    fn the_weights_and_the_ledger_are_different_piles() {
+        let options = Options::parse(&minimum(&["--pile", "/tmp/cognition.pile"])).unwrap();
+        assert_eq!(options.model, Some(PathBuf::from("/models/inkling.pile")));
+        assert_eq!(options.pile, PathBuf::from("/tmp/cognition.pile"));
+
+        let error = Options::parse(&minimum(&["--pile", "/models/inkling.pile"]))
+            .expect_err("the ledger must not be written over the weights");
+        assert!(
+            error.to_string().contains("--model and --pile"),
+            "{error:#}"
+        );
+    }
+
     #[test]
     fn composition_preserves_real_sandbox_and_optional_faculty_shape() {
         let options = Options::parse(&minimum(&[
-            "--serve-arg",
-            "--rank0-program",
-            "--serve-arg",
-            "/rank0",
+            "--layers",
+            "0:42",
             "--pile",
             "/tmp/cognition.pile",
             "--backend",
@@ -555,13 +838,7 @@ mod tests {
         ]))
         .unwrap();
 
-        let serve = options.serve_command();
-        assert_eq!(serve.get_program(), "pair");
-        assert_eq!(
-            serve.get_args().collect::<Vec<_>>(),
-            ["--rank0-program", "/rank0"]
-        );
-
+        assert_eq!(options.layers, Some(0..42));
         let config = options.shell_config(131_072);
         assert_eq!(config.exec.playground_bin, PathBuf::from("playground"));
         assert_eq!(config.exec.backend, "jail");
@@ -607,6 +884,10 @@ mod tests {
             vec!["--max-output", "0"],
             vec!["--context-window", "131072"],
             vec!["--gen", "64"],
+            // The deleted three-process launch surface. A stale command line
+            // must refuse rather than be silently reinterpreted.
+            vec!["--serve", "inkling_serve_pair"],
+            vec!["--serve-arg", "--rank0-program"],
         ] {
             Options::parse(&minimum(&extra)).expect_err("contradiction must refuse");
         }
