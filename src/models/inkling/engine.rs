@@ -781,6 +781,30 @@ impl Model for Engine {
     }
 }
 
+/// The last resort for releasing the peer rank.
+///
+/// `InklingMind`'s own `Drop` calls [`Model::shutdown`], which is the ordinary
+/// path and which marks this engine terminated so this does nothing. But an
+/// engine can also die BEFORE it ever reaches a mind — `validate_ready` refuses
+/// a partial stack, the response cap does not fit the context budget, the shell
+/// fails to open a sandbox — and on the other box a `Follower` is already
+/// blocked in `Group::follow` holding its whole arena.
+///
+/// Nothing else would tell it. Dropping the socket would eventually surface as
+/// an `UnexpectedEof` in the follower, which is handled and is a fine backstop,
+/// but "rank 0 said Finish" and "rank 0 vanished" are different events and only
+/// one of them is a clean exit. This makes every early return the first one.
+impl Drop for Engine {
+    fn drop(&mut self) {
+        if self.terminated {
+            return;
+        }
+        if let Err(error) = self.shutdown() {
+            eprintln!("inkling: could not release the peer rank on drop: {error:#}");
+        }
+    }
+}
+
 // ── the reinitialization boundary ───────────────────────────────────────────
 
 /// A reinitialization replaces a sequence; it must not become a disguised way
