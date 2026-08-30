@@ -3,8 +3,8 @@
 //!
 //! # The question, and why it needs a probe
 //!
-//! `inkling_forward` refuses `INK_GRAPH_LANE=1` under a tensor-parallel group
-//! on the reasoning that the NCCL collective is issued on cubecl's separate
+//! `inkling_forward` used to refuse `INK_GRAPH_LANE=1` under a tensor-parallel
+//! group on the reasoning that the NCCL collective is issued on cubecl's separate
 //! `comm_stream`, outside the launch bookkeeping, and is therefore "very likely
 //! not in the graph" — so a replayed step would silently skip the cross-node
 //! reduction and each rank would carry its own partial sum forward. That is the
@@ -58,6 +58,18 @@
 //! node) rather than a kernel, and an IN-PLACE world-of-one reduce may become
 //! nothing at all; both are reported, neither is the verdict. The verdict is
 //! `b`.
+//!
+//! # Measured, 2026-08-30, one GB10 (spark2), NCCL 2.31.2, THREAD_LOCAL mode
+//!
+//! ```text
+//!   captured graph  : 3 nodes -- kernel 2, memcpy 1; 2 of them cubecl launches
+//!   after 5 replays : a = 7, b = 17          -> IN THE GRAPH
+//!   in-place graph  : 2 nodes -- kernel 2    (world-of-one in-place: NCCL issues nothing)
+//! ```
+//!
+//! The world-of-one `a -> b` reduce is NCCL's single-rank `cudaMemcpyAsync`,
+//! and it landed in the graph as the one memcpy node, between the two launches,
+//! through the fork/join alone. No `INK_GRAPH_CAPTURE_MODE=relaxed` needed.
 //!
 //! # What it does NOT answer
 //!
