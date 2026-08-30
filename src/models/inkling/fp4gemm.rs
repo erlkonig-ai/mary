@@ -131,6 +131,15 @@ pub const NTILE: usize = 8;
 pub const KTILE: usize = 64;
 /// Logical elements per E4M3 block scale.
 pub const GROUP: usize = 16;
+/// E4M3 block scales per vector load, i.e. per `mma` operand.
+///
+/// Not a tuning knob: it is `MmaDefinition::scales_vector_size()`, which
+/// `cubecl-core`'s `frontend/cmma.rs` defines as the MMA register width over
+/// the scale element width, 32/8. It is also `KTILE / GROUP`, the number of
+/// block scales one instruction consumes per operand row
+/// (`MmaDefinition::scales_count()`), so the vector the instruction takes IS
+/// the vector the memory holds and there is nothing to pad or assemble.
+pub const SCALE_VEC: usize = KTILE / GROUP;
 
 /// `out = (a @ b^T) * scale`, with `a` and `b` both NVFP4.
 ///
@@ -1592,11 +1601,11 @@ pub fn swizzleable(n: usize, k: usize) -> bool {
 /// digests in all 20 cells.
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
-pub fn fp4_linear_swz<AB: Scalar, S: Scalar, NA: Size, NC: Size>(
+pub fn fp4_linear_swz<AB: Scalar, S: Scalar, NA: Size, NC: Size, NS: Size>(
     a: &Array<Vector<AB, NA>>,
-    a_sc: &Array<S>,
+    a_sc: &Array<Vector<S, NS>>,
     b: &Array<Vector<AB, NA>>,
-    b_sc: &Array<S>,
+    b_sc: &Array<Vector<S, NS>>,
     out: &mut Array<Vector<f32, NC>>,
     #[comptime] size_k: usize,
     #[comptime] size_n: usize,
@@ -1630,8 +1639,26 @@ pub fn fp4_linear_swz<AB: Scalar, S: Scalar, NA: Size, NC: Size>(
         acc[i] = Vector::<f32, NC>::cast_from(0.0f32);
     }
 
-    let scales_count = def.scales_count();
-    let size!(NS) = def.scales_vector_size();
+    // The instruction wants FOUR E4M3 block scales per operand per k tile, and
+    // they sit at four CONSECUTIVE addresses. Read as four `Array<S>` elements
+    // that is four one-byte loads; read as one `Vector<S, 4>` it is one 32-bit
+    // load, and 8 of the 14 loads this kernel issued per `mma` were those bytes
+    // (measured on a GB10: 8x `LDG.E.U8.CONSTANT` + 6x `LDG.E.CONSTANT`, against
+    // the hand-PTX arm's 8x `LDG.E.CONSTANT` for exactly the same operands).
+    // `scales_vector_size` is `register_size_bits / 8` = 4 here, which is the
+    // same 4 as `scales_count`, so the vector the instruction takes IS the
+    // vector the memory holds -- nothing is padded and nothing is assembled.
+    // This is the LOAD width only; the emitted `mma` string is unchanged, which
+    // is why the result stays bit-identical rather than merely close.
+    //
+    // Alignment: the row-major group of four starts at
+    // `index * spr + t * SCALE_VEC`, and `spr = k / GROUP` is a multiple of
+    // four for every `k % KTILE == 0` this kernel accepts, so a group never
+    // straddles a vector. The swizzled group starts at
+    // `(...) * NTILE * SCALE_VEC + sib * SCALE_VEC`, a multiple of four by
+    // construction. `ptxgemm`'s emitter test already asserts `% 4 == 0` on
+    // both of these addresses, for four shapes, both scale layouts, nine tile
+    // positions and all 32 lanes.
     let sia = def.scales_index(lane, MatrixIdent::A) as usize;
     let sib = def.scales_index(lane, MatrixIdent::B) as usize;
     let spr = comptime!(size_k / GROUP);
@@ -1661,16 +1688,24 @@ pub fn fp4_linear_swz<AB: Scalar, S: Scalar, NA: Size, NC: Size>(
             reg_b[i] = b[(blk + off * 4) / b.vector_size()];
         }
 
+        // One 32-bit load each, then into a MUTABLE local: the MMA intrinsic
+        // takes its scale registers by non-const reference, so a value that
+        // came straight out of a load and is never written cannot be handed to
+        // it -- NVRTC rejects the generated cast. The moves below are register
+        // traffic, not memory.
+        let sbyte = if comptime![swz_sc] {
+            ((n_tile * k_tiles + t) * NTILE + sib) * SCALE_VEC
+        } else {
+            (sib + n_base) * spr + t * SCALE_VEC
+        };
+        let va = a_sc[((sia + m_base) * spr + t * SCALE_VEC) / a_sc.vector_size()];
+        let vb = b_sc[sbyte / b_sc.vector_size()];
         let mut sa = Vector::<S, NS>::empty();
         let mut sb = Vector::<S, NS>::empty();
         #[unroll]
-        for i in 0..scales_count {
-            sa[i] = a_sc[(sia + m_base) * spr + t * 4 + i];
-            sb[i] = if comptime![swz_sc] {
-                b_sc[((n_tile * k_tiles + t) * NTILE + sib) * 4 + i]
-            } else {
-                b_sc[(sib + n_base) * spr + t * 4 + i]
-            };
+        for i in 0..SCALE_VEC {
+            sa[i] = va[i];
+            sb[i] = vb[i];
         }
 
         let d = def.execute_scaled(&reg_a, &reg_b, &acc, sa, sb);
@@ -1712,6 +1747,15 @@ pub fn fp4_linear_swz_launch<R: Runtime>(
     let out = client.empty(m_pad * n * core::mem::size_of::<f32>());
     let vs = 32 / e2m1x2::cube_type().size_bits();
     let spr = k / GROUP;
+    // The scale planes are bound `SCALE_VEC` wide, so a row has to be a whole
+    // number of vectors or a lane's group of four would straddle one. Implied
+    // by `k % KTILE == 0` above -- stated anyway, because it is the precondition
+    // of the BINDING and not of the tiling, and the two could drift apart.
+    assert_eq!(
+        spr % SCALE_VEC,
+        0,
+        "the scale row {spr} is not a whole number of {SCALE_VEC}-wide vectors"
+    );
 
     unsafe {
         fp4_linear_swz::launch::<e2m1x2, e4m3, R>(
@@ -1720,6 +1764,7 @@ pub fn fp4_linear_swz_launch<R: Runtime>(
             CubeDim::new_1d(32),
             vs,
             2,
+            SCALE_VEC,
             ArrayArg::from_raw_parts(a.clone(), m_pad * (k / 2)),
             ArrayArg::from_raw_parts(a_sc.clone(), m_pad * spr),
             ArrayArg::from_raw_parts(b.clone(), n * (k / 2)),
