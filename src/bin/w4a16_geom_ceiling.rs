@@ -651,6 +651,8 @@ fn main() {
         "real fragment, MASK OFF  ",
         "real LM 16 B, MASK OFF   ",
         "real LANE-MAJOR 8 B/lane ",
+        "real LM 16 B, A depth 4  ",
+        "real LM16 A4, MASK OFF   ",
     ];
     let mut per_rep: Vec<Vec<f64>> = vec![Vec::new(); names.len()];
 
@@ -735,6 +737,7 @@ fn main() {
                         ck,
                         cn,
                         words,
+                        if words == 4 && mask { 4 } else { 2 * words },
                         0.75,
                         if mask { Some(live) } else { None },
                     ));
@@ -854,7 +857,8 @@ fn main() {
                     let _ = future::block_on(client.sync());
                     drop(o);
                 }
-                11 | 14 | 15 => {
+                11 | 14 | 15 | 16 | 17 => {
+                    let words = if arm == 15 { 2 } else { 4 };
                     let o = w4a16_linear_lm_launch::<Rt>(
                         &client,
                         &a,
@@ -863,9 +867,10 @@ fn main() {
                         m_pad,
                         k,
                         n,
-                        if arm == 15 { 2 } else { 4 },
+                        words,
+                        if arm >= 16 { 4 } else { 2 * words },
                         1.0,
-                        if arm == 14 { None } else { Some(m_live) },
+                        if arm == 14 || arm == 17 { None } else { Some(m_live) },
                     );
                     let _ = future::block_on(client.sync());
                     drop(o);
@@ -946,6 +951,10 @@ fn main() {
         ("MASK OFF: fragment off/on(13/3)", 13, 3),
         ("MASK OFF: LM16 off/on    (14/11)", 14, 11),
         ("PROD: LM16 vs shuffle    (14/12)", 14, 12),
+        ("LM16 A-depth 4 vs 8, mask(16/11)", 16, 11),
+        ("LM16 A-depth 4 vs 8, off (17/14)", 17, 14),
+        ("PROD: LM16 A4 vs shuffle (17/12)", 17, 12),
+        ("LM16 A4 mask-on vs prod  (16/12)", 16, 12),
         ("real+shfl vs coalesced   (10/0)", 10, 0),
         ("real+shfl vs fragment map(10/1)", 10, 1),
         ("shuffle cost, 4 B/lane   (8/4)", 8usize, 4usize),

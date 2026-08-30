@@ -245,6 +245,9 @@ fn main() {
     // coalesced load IS the fragment load. Reads the same rotating buffers as
     // a lane-major plane (timing only; `w4a16_geom_ceiling` gates the bits).
     let mut lm = vec![f64::MAX; ns.len()];
+    // `INK_LM_ADEPTH` (default 4): k-tiles of A prefetched at a time inside
+    // the 8-k-tile lane-major group; 8 holds the whole group's A in registers.
+    let lm_a_depth = env_usize("INK_LM_ADEPTH", 4);
 
     for r in 0..ROUNDS + 2 {
         for (i, (&n, arm)) in ns.iter().zip(&arms).enumerate() {
@@ -282,7 +285,9 @@ fn main() {
             let t3 = Instant::now();
             for j in 0..REPS {
                 let (b, sc) = &arm.rot[j % arm.rot.len()];
-                let o = w4a16_linear_lm_launch::<Rt>(&client, &arm.a, b, sc, m_pad, k, n, 4, 1.0, mlive);
+                let o = w4a16_linear_lm_launch::<Rt>(
+                    &client, &arm.a, b, sc, m_pad, k, n, 4, lm_a_depth, 1.0, mlive,
+                );
                 drop(o);
             }
             let _ = future::block_on(client.sync());

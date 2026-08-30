@@ -2524,6 +2524,7 @@ pub fn w4a16_linear_lm<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size, NB: Siz
     #[comptime] size_k: usize,
     #[comptime] size_n: usize,
     #[comptime] words: usize,
+    #[comptime] a_depth: usize,
     #[comptime] mask_rows: bool,
     #[comptime] hi_dead: bool,
     scale: f32,
@@ -2565,35 +2566,16 @@ pub fn w4a16_linear_lm<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size, NB: Siz
     let kunroll = comptime!(2 * words);
     let groups = comptime!(k_tiles / kunroll);
     let svec = comptime!(kunroll / 4);
+    // The A operand is prefetched `a_depth` k-tiles at a time INSIDE the
+    // group (`a_depth` divides `kunroll`): the B load covers the whole group
+    // in one instruction, but holding `kunroll * vc_a` A vectors is what puts
+    // the 16 B/lane form over the register cliff with the mask off.
+    let a_steps = comptime!(kunroll / a_depth);
 
-    let mut a_buf = Array::<Vector<AB, NA>>::new(comptime!(kunroll * vc_a));
+    let mut a_buf = Array::<Vector<AB, NA>>::new(comptime!(a_depth * vc_a));
     let mut s_buf = Array::<Vector<S, NS>>::new(svec);
 
     for g in 0..groups {
-        #[unroll]
-        for u in 0..kunroll {
-            let kbase = (g * kunroll + u) * KTILE;
-            #[unroll]
-            for i in 0..vc_a {
-                let (row, c) = def.position_of_nth(lane, (i * vs_a * pack) as u32, MatrixIdent::A);
-                let gr = row as usize + m_base;
-                let gc = c as usize + kbase;
-                if mask_rows {
-                    if comptime!(hi_dead && (i & 1) == 1) {
-                        a_buf[u * vc_a + i] = Vector::<AB, NA>::cast_from(0.0f32);
-                    } else {
-                        let mut v = Vector::<AB, NA>::cast_from(0.0f32);
-                        if gr < m_live as usize {
-                            v = a[(gr * size_k + gc) / a.vector_size()];
-                        }
-                        a_buf[u * vc_a + i] = v;
-                    }
-                } else {
-                    a_buf[u * vc_a + i] = a[(gr * size_k + gc) / a.vector_size()];
-                }
-            }
-        }
-
         // ONE load: this lane's `words` words for the whole group.
         let v = b[(n_tile * groups + g) * 32 + lane as usize];
         // Scales: `kunroll` bytes at this lane's column, `svec` vectors of 4.
@@ -2603,29 +2585,59 @@ pub fn w4a16_linear_lm<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size, NB: Siz
         }
 
         #[unroll]
-        for u in 0..kunroll {
+        for st in 0..a_steps {
             #[unroll]
-            for i in 0..vc_a {
-                reg_a[i] = a_buf[u * vc_a + i];
-            }
-            let s = f32::cast_from(s_buf[u / 4][u % 4]);
-            let word = v[u / 2];
-            #[unroll]
-            for i in 0..vc_b {
-                let mut vv = Vector::<AB, NA>::empty();
+            for ua in 0..a_depth {
+                let u = st * a_depth + ua;
+                let kbase = (g * kunroll + u) * KTILE;
                 #[unroll]
-                for j in 0..vs_b {
-                    let nib = 4 * (u % 2) + 2 * i + j;
-                    let code = (word >> (4 * nib) as u32) & 15u32;
-                    vv[j] = AB::cast_from(e2m1_value(code) * s);
+                for i in 0..vc_a {
+                    let (row, c) =
+                        def.position_of_nth(lane, (i * vs_a * pack) as u32, MatrixIdent::A);
+                    let gr = row as usize + m_base;
+                    let gc = c as usize + kbase;
+                    if mask_rows {
+                        if comptime!(hi_dead && (i & 1) == 1) {
+                            a_buf[ua * vc_a + i] = Vector::<AB, NA>::cast_from(0.0f32);
+                        } else {
+                            let mut va = Vector::<AB, NA>::cast_from(0.0f32);
+                            if gr < m_live as usize {
+                                va = a[(gr * size_k + gc) / a.vector_size()];
+                            }
+                            a_buf[ua * vc_a + i] = va;
+                        }
+                    } else {
+                        a_buf[ua * vc_a + i] = a[(gr * size_k + gc) / a.vector_size()];
+                    }
                 }
-                reg_b[i] = vv;
             }
 
-            let d = def.execute(&reg_a, &reg_b, &acc);
             #[unroll]
-            for i in 0..vc_c {
-                acc[i] = d[i];
+            for ua in 0..a_depth {
+                let u = st * a_depth + ua;
+                #[unroll]
+                for i in 0..vc_a {
+                    reg_a[i] = a_buf[ua * vc_a + i];
+                }
+                let s = f32::cast_from(s_buf[u / 4][u % 4]);
+                let word = v[u / 2];
+                #[unroll]
+                for i in 0..vc_b {
+                    let mut vv = Vector::<AB, NA>::empty();
+                    #[unroll]
+                    for j in 0..vs_b {
+                        let nib = 4 * (u % 2) + 2 * i + j;
+                        let code = (word >> (4 * nib) as u32) & 15u32;
+                        vv[j] = AB::cast_from(e2m1_value(code) * s);
+                    }
+                    reg_b[i] = vv;
+                }
+
+                let d = def.execute(&reg_a, &reg_b, &acc);
+                #[unroll]
+                for i in 0..vc_c {
+                    acc[i] = d[i];
+                }
             }
         }
     }
@@ -2651,11 +2663,17 @@ pub fn w4a16_linear_lm_launch<R: Runtime>(
     k: usize,
     n: usize,
     words: usize,
+    a_depth: usize,
     scale: f32,
     m_live: Option<usize>,
 ) -> Handle {
     assert_eq!(m_pad % MTILE, 0, "m_pad {m_pad} is not a multiple of {MTILE}");
     assert!(lanemajor_ok(n, k, words), "[{n}, {k}] is not lane-major-able at {words}");
+    assert!(
+        a_depth > 0 && lm_ktiles(words) % a_depth == 0,
+        "a_depth {a_depth} does not divide the {}-k-tile group",
+        lm_ktiles(words)
+    );
     assert!(n / NTILE <= 65535, "{} n-tiles exceed the 65535 grid-y limit", n / NTILE);
     let (mask_rows, hi_dead, live) = live_arg(m_pad, m_live);
     let kunroll = lm_ktiles(words);
@@ -2680,6 +2698,7 @@ pub fn w4a16_linear_lm_launch<R: Runtime>(
             k,
             n,
             words,
+            a_depth,
             mask_rows,
             hi_dead,
             scale,
