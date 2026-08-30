@@ -438,10 +438,10 @@ pub fn live_row_mask() -> bool {
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 pub fn w4a16_linear<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size>(
-    a: &Tensor<Vector<AB, NA>>,
-    b: &Tensor<u32>,
-    b_sc: &Tensor<S>,
-    out: &mut Tensor<Vector<f32, NC>>,
+    a: &Array<Vector<AB, NA>>,
+    b: &Array<u32>,
+    b_sc: &Array<S>,
+    out: &mut Array<Vector<f32, NC>>,
     #[comptime] size_k: usize,
     #[comptime] size_n: usize,
     #[comptime] mask_rows: bool,
@@ -626,10 +626,10 @@ pub fn w4a16_linear_launch<R: Runtime>(
             CubeDim::new_1d(32),
             vs,
             2,
-            TensorArg::from_raw_parts(a.clone(), [k, 1].into(), [m_pad, k].into()),
-            TensorArg::from_raw_parts(b.clone(), [wpr, 1].into(), [n, wpr].into()),
-            TensorArg::from_raw_parts(b_sc.clone(), [spr, 1].into(), [n, spr].into()),
-            TensorArg::from_raw_parts(out.clone(), [n, 1].into(), [m_pad, n].into()),
+            ArrayArg::from_raw_parts(a.clone(), m_pad * k),
+            ArrayArg::from_raw_parts(b.clone(), n * wpr),
+            ArrayArg::from_raw_parts(b_sc.clone(), n * spr),
+            ArrayArg::from_raw_parts(out.clone(), m_pad * n),
             k,
             n,
             mask_rows,
@@ -877,10 +877,10 @@ pub const WORDS_PER_STEP: usize = 4;
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 pub fn w4a16_linear_wide<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size, NB: Size>(
-    a: &Tensor<Vector<AB, NA>>,
-    b: &Tensor<Vector<u32, NB>>,
-    b_sc: &Tensor<S>,
-    out: &mut Tensor<Vector<f32, NC>>,
+    a: &Array<Vector<AB, NA>>,
+    b: &Array<Vector<u32, NB>>,
+    b_sc: &Array<S>,
+    out: &mut Array<Vector<f32, NC>>,
     #[comptime] size_k: usize,
     #[comptime] size_n: usize,
     scale: f32,
@@ -1020,10 +1020,10 @@ pub fn w4a16_linear_wide_launch<R: Runtime>(
             vs,
             2,
             WORDS_PER_STEP,
-            TensorArg::from_raw_parts(a.clone(), [k, 1].into(), [m_pad, k].into()),
-            TensorArg::from_raw_parts(b.clone(), [vpr, 1].into(), [n, vpr].into()),
-            TensorArg::from_raw_parts(b_sc.clone(), [spr, 1].into(), [n, spr].into()),
-            TensorArg::from_raw_parts(out.clone(), [n, 1].into(), [m_pad, n].into()),
+            ArrayArg::from_raw_parts(a.clone(), m_pad * k),
+            ArrayArg::from_raw_parts(b.clone(), n * vpr),
+            ArrayArg::from_raw_parts(b_sc.clone(), n * spr),
+            ArrayArg::from_raw_parts(out.clone(), m_pad * n),
             k,
             n,
             scale,
@@ -1166,7 +1166,7 @@ pub fn swizzleable(n: usize, k: usize) -> bool {
 /// and a scattered READ of a resident table is what this whole permutation
 /// exists to make the GEMM stop doing per step — paying it once is the trade.
 #[cube(launch)]
-pub fn swizzle_codes_dev(src: &Tensor<u32>, dst: &mut Tensor<u32>, #[comptime] k_tiles: usize) {
+pub fn swizzle_codes_dev(src: &Array<u32>, dst: &mut Array<u32>, #[comptime] k_tiles: usize) {
     let d = ABSOLUTE_POS as usize;
     if d < dst.len() {
         let wpb = comptime!(SWZ_BLOCK_CODES / 4);
@@ -1185,8 +1185,8 @@ pub fn swizzle_codes_dev(src: &Tensor<u32>, dst: &mut Tensor<u32>, #[comptime] k
 /// [`swizzle_codes_dev`].
 #[cube(launch)]
 pub fn swizzle_scales_dev<S: Scalar>(
-    src: &Tensor<S>,
-    dst: &mut Tensor<S>,
+    src: &Array<S>,
+    dst: &mut Array<S>,
     #[comptime] k_tiles: usize,
 ) {
     let d = ABSOLUTE_POS as usize;
@@ -1224,8 +1224,8 @@ pub fn swizzle_w4a16_device<R: Runtime>(
             client,
             CubeCount::Static(words.div_ceil(threads as usize) as u32, 1, 1),
             CubeDim::new_1d(threads),
-            TensorArg::from_raw_parts(codes.clone(), [1].into(), [words].into()),
-            TensorArg::from_raw_parts(dc.clone(), [1].into(), [words].into()),
+            ArrayArg::from_raw_parts(codes.clone(), words),
+            ArrayArg::from_raw_parts(dc.clone(), words),
             k_tiles,
         )
     };
@@ -1234,8 +1234,8 @@ pub fn swizzle_w4a16_device<R: Runtime>(
             client,
             CubeCount::Static(sc.div_ceil(threads as usize) as u32, 1, 1),
             CubeDim::new_1d(threads),
-            TensorArg::from_raw_parts(scales.clone(), [1].into(), [sc].into()),
-            TensorArg::from_raw_parts(ds.clone(), [1].into(), [sc].into()),
+            ArrayArg::from_raw_parts(scales.clone(), sc),
+            ArrayArg::from_raw_parts(ds.clone(), sc),
             k_tiles,
         )
     };
@@ -2087,10 +2087,10 @@ pub fn swz_shuffle() -> bool {
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 pub fn w4a16_linear_swz<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size>(
-    a: &Tensor<Vector<AB, NA>>,
-    b: &Tensor<u32>,
-    b_sc: &Tensor<S>,
-    out: &mut Tensor<Vector<f32, NC>>,
+    a: &Array<Vector<AB, NA>>,
+    b: &Array<u32>,
+    b_sc: &Array<S>,
+    out: &mut Array<Vector<f32, NC>>,
     #[comptime] size_k: usize,
     #[comptime] size_n: usize,
     #[comptime] swz_sc: bool,
@@ -2398,10 +2398,10 @@ pub fn w4a16_linear_swz_launch_redist<R: Runtime>(
             CubeDim::new_1d(32),
             vs,
             2,
-            TensorArg::from_raw_parts(a.clone(), [k, 1].into(), [m_pad, k].into()),
-            TensorArg::from_raw_parts(b.clone(), [wpr, 1].into(), [n, wpr].into()),
-            TensorArg::from_raw_parts(b_sc.clone(), [spr, 1].into(), [n, spr].into()),
-            TensorArg::from_raw_parts(out.clone(), [n, 1].into(), [m_pad, n].into()),
+            ArrayArg::from_raw_parts(a.clone(), m_pad * k),
+            ArrayArg::from_raw_parts(b.clone(), n * wpr),
+            ArrayArg::from_raw_parts(b_sc.clone(), n * spr),
+            ArrayArg::from_raw_parts(out.clone(), m_pad * n),
             k,
             n,
             swz_sc,
@@ -2521,7 +2521,7 @@ mod swizzle_k16_tests {
 ///   768 ..       counts: see the writes below
 /// ```
 #[cube(launch)]
-pub fn mma16_frag_map<AB: Scalar>(out: &mut Tensor<u32>) {
+pub fn mma16_frag_map<AB: Scalar>(out: &mut Array<u32>) {
     let def = cmma::MmaDefinition::<AB, AB, f32>::new(MTILE, NTILE, KTILE);
     let lane = UNIT_POS_PLANE;
     let pack = AB::packing_factor();
@@ -2579,7 +2579,7 @@ pub fn mma16_frag_map_launch<R: Runtime>(client: &ComputeClient<R>) -> Handle {
             client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new_1d(32),
-            TensorArg::from_raw_parts(out.clone(), [1].into(), [1024].into()),
+            ArrayArg::from_raw_parts(out.clone(), 1024),
         )
     };
     out

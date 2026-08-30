@@ -145,11 +145,11 @@ pub const GROUP: usize = 16;
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 pub fn fp4_linear<AB: Scalar, S: Scalar, NA: Size, NC: Size>(
-    a: &Tensor<Vector<AB, NA>>,
-    a_sc: &Tensor<S>,
-    b: &Tensor<Vector<AB, NA>>,
-    b_sc: &Tensor<S>,
-    out: &mut Tensor<Vector<f32, NC>>,
+    a: &Array<Vector<AB, NA>>,
+    a_sc: &Array<S>,
+    b: &Array<Vector<AB, NA>>,
+    b_sc: &Array<S>,
+    out: &mut Array<Vector<f32, NC>>,
     #[comptime] size_k: usize,
     #[comptime] size_n: usize,
     scale: f32,
@@ -255,7 +255,7 @@ pub fn fp4_linear<AB: Scalar, S: Scalar, NA: Size, NC: Size>(
 ///
 /// `stage_sc` extends the staging to the block scales, and it is a separate
 /// knob because the two are separate defects. This kernel reads its four E4M3
-/// scales as four INDIVIDUAL `Tensor<S>` bytes — four instructions, each
+/// scales as four INDIVIDUAL `Array<S>` bytes — four instructions, each
 /// spanning the same eight rows, i.e. 32 sector requests a k tile against the
 /// codes' 16 — where the grouped kernel already reads them as one 32-bit
 /// vector. Staging them collapses that; leaving it off measures the code
@@ -263,11 +263,11 @@ pub fn fp4_linear<AB: Scalar, S: Scalar, NA: Size, NC: Size>(
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 pub fn fp4_linear_smem<AB: Scalar, S: Scalar, NA: Size, NC: Size>(
-    a: &Tensor<Vector<AB, NA>>,
-    a_sc: &Tensor<S>,
-    b: &Tensor<Vector<AB, NA>>,
-    b_sc: &Tensor<S>,
-    out: &mut Tensor<Vector<f32, NC>>,
+    a: &Array<Vector<AB, NA>>,
+    a_sc: &Array<S>,
+    b: &Array<Vector<AB, NA>>,
+    b_sc: &Array<S>,
+    out: &mut Array<Vector<f32, NC>>,
     #[comptime] size_k: usize,
     #[comptime] size_n: usize,
     #[comptime] kc: usize,
@@ -438,11 +438,11 @@ pub fn fp4_linear_smem_launch<R: Runtime>(
             CubeDim::new_1d(32),
             vs,
             2,
-            TensorArg::from_raw_parts(a.clone(), [k / 2, 1].into(), [m_pad, k / 2].into()),
-            TensorArg::from_raw_parts(a_sc.clone(), [spr, 1].into(), [m_pad, spr].into()),
-            TensorArg::from_raw_parts(b.clone(), [k / 2, 1].into(), [n, k / 2].into()),
-            TensorArg::from_raw_parts(b_sc.clone(), [spr, 1].into(), [n, spr].into()),
-            TensorArg::from_raw_parts(out.clone(), [n, 1].into(), [m_pad, n].into()),
+            ArrayArg::from_raw_parts(a.clone(), m_pad * (k / 2)),
+            ArrayArg::from_raw_parts(a_sc.clone(), m_pad * spr),
+            ArrayArg::from_raw_parts(b.clone(), n * (k / 2)),
+            ArrayArg::from_raw_parts(b_sc.clone(), n * spr),
+            ArrayArg::from_raw_parts(out.clone(), m_pad * n),
             k,
             n,
             kc,
@@ -462,8 +462,8 @@ pub fn fp4_linear_smem_launch<R: Runtime>(
 /// `[2*inter, hidden]` weight — 16x2048 elements touched instead of 4096x4096.
 #[cube(launch)]
 pub fn gate_up_silu<I: Scalar + Cast, O: Scalar + Cast>(
-    both: &Tensor<I>,
-    act: &mut Tensor<O>,
+    both: &Array<I>,
+    act: &mut Array<O>,
     #[comptime] inter: usize,
     #[comptime] halved: bool,
 ) {
@@ -537,11 +537,11 @@ pub fn fp4_linear_launch<R: Runtime>(
             CubeDim::new_1d(32),
             vs,
             2,
-            TensorArg::from_raw_parts(a.clone(), [k / 2, 1].into(), [m_pad, k / 2].into()),
-            TensorArg::from_raw_parts(a_sc.clone(), [spr, 1].into(), [m_pad, spr].into()),
-            TensorArg::from_raw_parts(b.clone(), [k / 2, 1].into(), [n, k / 2].into()),
-            TensorArg::from_raw_parts(b_sc.clone(), [spr, 1].into(), [n, spr].into()),
-            TensorArg::from_raw_parts(out.clone(), [n, 1].into(), [m_pad, n].into()),
+            ArrayArg::from_raw_parts(a.clone(), m_pad * (k / 2)),
+            ArrayArg::from_raw_parts(a_sc.clone(), m_pad * spr),
+            ArrayArg::from_raw_parts(b.clone(), n * (k / 2)),
+            ArrayArg::from_raw_parts(b_sc.clone(), n * spr),
+            ArrayArg::from_raw_parts(out.clone(), m_pad * n),
             k,
             n,
             scale,
@@ -604,12 +604,8 @@ fn gate_up_silu_launch_as<I: Scalar + Cast, O: Scalar + Cast + CubeElement, R: R
             client,
             CubeCount::Static(blocks, 1, 1),
             CubeDim::new_1d(threads),
-            TensorArg::from_raw_parts(
-                both.clone(),
-                [2 * inter, 1].into(),
-                [m_pad, 2 * inter].into(),
-            ),
-            TensorArg::from_raw_parts(act.clone(), [inter, 1].into(), [m_pad, inter].into()),
+            ArrayArg::from_raw_parts(both.clone(), m_pad * 2 * inter),
+            ArrayArg::from_raw_parts(act.clone(), m_pad * inter),
             inter,
             halved,
         )
@@ -634,7 +630,7 @@ fn gate_up_silu_launch_as<I: Scalar + Cast, O: Scalar + Cast + CubeElement, R: R
 /// on the `<` boundary and falls through to the larger code). An all-zero block
 /// yields a zero scale byte and zero codes.
 #[cube(launch)]
-pub fn quantize_act(x: &Tensor<f32>, codes: &mut Tensor<u32>, scales: &mut Tensor<e4m3>) {
+pub fn quantize_act(x: &Array<f32>, codes: &mut Array<u32>, scales: &mut Array<e4m3>) {
     let blk = ABSOLUTE_POS as usize;
     if blk < scales.len() {
         let base = blk * GROUP;
@@ -1597,11 +1593,11 @@ pub fn swizzleable(n: usize, k: usize) -> bool {
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 pub fn fp4_linear_swz<AB: Scalar, S: Scalar, NA: Size, NC: Size>(
-    a: &Tensor<Vector<AB, NA>>,
-    a_sc: &Tensor<S>,
-    b: &Tensor<Vector<AB, NA>>,
-    b_sc: &Tensor<S>,
-    out: &mut Tensor<Vector<f32, NC>>,
+    a: &Array<Vector<AB, NA>>,
+    a_sc: &Array<S>,
+    b: &Array<Vector<AB, NA>>,
+    b_sc: &Array<S>,
+    out: &mut Array<Vector<f32, NC>>,
     #[comptime] size_k: usize,
     #[comptime] size_n: usize,
     #[comptime] swz_sc: bool,
@@ -1724,11 +1720,11 @@ pub fn fp4_linear_swz_launch<R: Runtime>(
             CubeDim::new_1d(32),
             vs,
             2,
-            TensorArg::from_raw_parts(a.clone(), [k / 2, 1].into(), [m_pad, k / 2].into()),
-            TensorArg::from_raw_parts(a_sc.clone(), [spr, 1].into(), [m_pad, spr].into()),
-            TensorArg::from_raw_parts(b.clone(), [k / 2, 1].into(), [n, k / 2].into()),
-            TensorArg::from_raw_parts(b_sc.clone(), [spr, 1].into(), [n, spr].into()),
-            TensorArg::from_raw_parts(out.clone(), [n, 1].into(), [m_pad, n].into()),
+            ArrayArg::from_raw_parts(a.clone(), m_pad * (k / 2)),
+            ArrayArg::from_raw_parts(a_sc.clone(), m_pad * spr),
+            ArrayArg::from_raw_parts(b.clone(), n * (k / 2)),
+            ArrayArg::from_raw_parts(b_sc.clone(), n * spr),
+            ArrayArg::from_raw_parts(out.clone(), m_pad * n),
             k,
             n,
             swz_sc,
@@ -1748,7 +1744,7 @@ pub fn fp4_linear_swz_launch<R: Runtime>(
 /// at whatever the caller put there and should be ignored (`vc_b` is printed
 /// alongside as `out[256]`).
 #[cube(launch)]
-pub fn fp4_frag_b_map<AB: Scalar, S: Scalar>(out: &mut Tensor<u32>) {
+pub fn fp4_frag_b_map<AB: Scalar, S: Scalar>(out: &mut Array<u32>) {
     let def = cmma::MmaDefinition::<AB, AB, f32>::new_scaled::<S>(MTILE, NTILE, KTILE, 4usize);
     let lane = UNIT_POS_PLANE;
     let pack = AB::packing_factor();
@@ -1781,7 +1777,7 @@ pub fn fp4_frag_b_map_launch<R: Runtime>(client: &ComputeClient<R>) -> Handle {
             client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new_1d(32),
-            TensorArg::from_raw_parts(out.clone(), [1].into(), [300].into()),
+            ArrayArg::from_raw_parts(out.clone(), 300),
         )
     };
     out

@@ -63,9 +63,9 @@ pub const KTILE: usize = 16;
 /// stands.
 #[cube(launch)]
 pub fn bf16_linear<AB: Scalar, NA: Size, NC: Size>(
-    a: &Tensor<Vector<AB, NA>>,
-    b: &Tensor<Vector<AB, NA>>,
-    out: &mut Tensor<Vector<f32, NC>>,
+    a: &Array<Vector<AB, NA>>,
+    b: &Array<Vector<AB, NA>>,
+    out: &mut Array<Vector<f32, NC>>,
     #[comptime] size_k: usize,
     #[comptime] size_n: usize,
 ) {
@@ -151,7 +151,7 @@ pub fn bf16_linear<AB: Scalar, NA: Size, NC: Size>(
 /// in f32, cast to BF16, and multiplied, 127 times a token. The cast was
 /// already visiting every element; it may as well decide which ones exist.
 #[cube(launch)]
-pub fn to_bf16(x: &Tensor<f32>, y: &mut Tensor<bf16>, n_in: usize) {
+pub fn to_bf16(x: &Array<f32>, y: &mut Array<bf16>, n_in: usize) {
     let idx = ABSOLUTE_POS as usize;
     if idx < y.len() {
         let mut v = f32::new(0.0f32);
@@ -222,9 +222,9 @@ pub fn bf16_linear_launch<R: Runtime>(
             CubeDim::new_1d(32),
             vs,
             2,
-            TensorArg::from_raw_parts(a.clone(), [k, 1].into(), [m_pad, k].into()),
-            TensorArg::from_raw_parts(b.clone(), [k, 1].into(), [n, k].into()),
-            TensorArg::from_raw_parts(out.clone(), [n, 1].into(), [m_pad, n].into()),
+            ArrayArg::from_raw_parts(a.clone(), m_pad * k),
+            ArrayArg::from_raw_parts(b.clone(), n * k),
+            ArrayArg::from_raw_parts(out.clone(), m_pad * n),
             k,
             n,
         )
@@ -251,8 +251,8 @@ pub fn to_bf16_launch<R: Runtime>(
             client,
             CubeCount::Static(blocks, 1, 1),
             CubeDim::new_1d(threads),
-            TensorArg::from_raw_parts(x.clone(), [1].into(), [n_in].into()),
-            TensorArg::from_raw_parts(out.clone(), [1].into(), [n_out].into()),
+            ArrayArg::from_raw_parts(x.clone(), n_in),
+            ArrayArg::from_raw_parts(out.clone(), n_out),
             n_in,
         )
     };
@@ -370,7 +370,7 @@ pub fn linear_bf16<R: Runtime>(
 /// true `m` unpadded already (see [`bf16_linear_cubek_launch`]). Masking a
 /// kernel nothing launches is dead code.
 #[cube(launch)]
-pub fn pad_bf16(x: &Tensor<bf16>, y: &mut Tensor<bf16>, n_in: usize) {
+pub fn pad_bf16(x: &Array<bf16>, y: &mut Array<bf16>, n_in: usize) {
     let idx = ABSOLUTE_POS as usize;
     if idx < y.len() {
         let mut v = bf16::cast_from(0.0f32);
@@ -397,8 +397,8 @@ pub fn pad_bf16_launch<R: Runtime>(
             client,
             CubeCount::Static(blocks, 1, 1),
             CubeDim::new_1d(threads),
-            TensorArg::from_raw_parts(x.clone(), [1].into(), [n_in].into()),
-            TensorArg::from_raw_parts(out.clone(), [1].into(), [n_out].into()),
+            ArrayArg::from_raw_parts(x.clone(), n_in),
+            ArrayArg::from_raw_parts(out.clone(), n_out),
             n_in,
         )
     };
@@ -844,9 +844,9 @@ pub fn gemv_rows_takes(m: usize, k: usize, _n: usize) -> bool {
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 pub fn bf16_gemv_rows<AB: Scalar + Cast, NA: Size>(
-    a: &Tensor<Vector<AB, NA>>,
-    b: &Tensor<Vector<AB, NA>>,
-    out: &mut Tensor<f32>,
+    a: &Array<Vector<AB, NA>>,
+    b: &Array<Vector<AB, NA>>,
+    out: &mut Array<f32>,
     #[comptime] size_k: usize,
     #[comptime] size_n: usize,
     #[comptime] rows: usize,
@@ -918,9 +918,9 @@ pub fn bf16_gemv_rows_launch<R: Runtime>(
             CubeCount::Static(n.div_ceil(planes) as u32, 1, 1),
             CubeDim::new_2d(GEMV_PLANE as u32, planes as u32),
             vec,
-            TensorArg::from_raw_parts(a.clone(), [k, 1].into(), [m, k].into()),
-            TensorArg::from_raw_parts(b.clone(), [k, 1].into(), [n, k].into()),
-            TensorArg::from_raw_parts(out.clone(), [n, 1].into(), [m, n].into()),
+            ArrayArg::from_raw_parts(a.clone(), m * k),
+            ArrayArg::from_raw_parts(b.clone(), n * k),
+            ArrayArg::from_raw_parts(out.clone(), m * n),
             k,
             n,
             m,
