@@ -42,7 +42,7 @@ use std::path::Path;
 use std::time::Instant;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::signing_key_file;
-use triblespace::prelude::BlobStore;
+use triblespace::prelude::SnapshotSource;
 
 const LM_FILE: &str = "model.safetensors";
 const MIMI_FILE: &str = "tokenizer-e351c8d8-checkpoint125.safetensors";
