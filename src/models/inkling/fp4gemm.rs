@@ -1599,6 +1599,36 @@ pub fn swizzleable(n: usize, k: usize) -> bool {
 /// The output is identical: 18 reps across three arms and two prompts emitted
 /// the SAME 13 tokens each, and `gemm_grid_parity` reproduces pristine main's
 /// digests in all 20 cells.
+///
+/// ## What binding the scale planes 4 wide was worth, measured
+///
+/// `ptx_fp4_probe`, 6 rounds per arm alternating with >=60 s between runs, one
+/// otherwise-idle GB10 (sm_121a), the hand-written PTX arm as a fixed yardstick
+/// because this commit does not touch it:
+///
+/// ```text
+/// cubecl / PTX   BEFORE (1-wide)  1.159 1.162 1.173 1.180 1.182 1.191   median 1.1765
+/// cubecl / PTX   AFTER  (4-wide)  1.124 1.129 1.131 1.136 1.143 1.156   median 1.1335
+/// ```
+///
+/// FRAMING RULE: that ratio is PER LAUNCH of ONE [16, 4096] x [4096, 4096]^T
+/// routed-expert product -- the decode case, one 16-row tile -- p50 of 9 warm
+/// rounds of 20 pipelined launches over 30 rotating tables, arms interleaved
+/// and reversed on odd rounds. It is NOT a step figure and NOT a two-node
+/// figure, and it is a RATIO of two arms inside one process, which is the
+/// 0.23%-sd measurement rather than the 1.2-1.4% between-process one.
+///
+/// The arms separate COMPLETELY: the slowest BEFORE round (1.159) is still
+/// faster-ratioed than the fastest AFTER round (1.156). Exact permutation test
+/// on the difference of medians, p = 0.0065 one-tailed. The gap to hand-written
+/// PTX goes 17.65% -> 13.35%, i.e. 24.4% of it closed, for a 1.038x cubecl arm.
+///
+/// Output was bit-identical in all 12 runs (0 of 65536 elements differ, max abs
+/// diff 0e0), which is the predicted result rather than a lucky one: this
+/// changes the WIDTH OF A LOAD and nothing about the arithmetic.
+///
+/// The remaining 13.35% is the OTHER cause SASS named -- the one that is a
+/// redesign and not a binding -- and is not addressed here.
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 pub fn fp4_linear_swz<AB: Scalar, S: Scalar, NA: Size, NC: Size, NS: Size>(
