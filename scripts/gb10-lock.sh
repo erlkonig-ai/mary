@@ -43,7 +43,9 @@
 # USAGE, and note every call passes paths in a FILE rather than on a command line:
 #   gb10-lock.sh take <host> <tag>     -> rc 0 took it, rc 3 someone else holds it
 #   gb10-lock.sh release <host> <tag>  -> releases only if <tag> holds it
-#   gb10-lock.sh check <host>          -> prints the holder, rc 0 free, rc 3 held
+#   gb10-lock.sh check <host>          -> prints the holder, rc 0 free, rc 3 held,
+#                                        rc 4 UNREACHABLE (state unknown -- never
+#                                        treat this as free OR as held)
 #
 # BUILDS TAKE THE LOCK TOO. A cargo build is not a measurement, but it is 20
 # cores of CPU contention on a unified-memory part, so it perturbs a neighbour's
@@ -275,3 +277,23 @@ case "$ACTION" in
   *) echo "usage: gb10-lock.sh take|release|check <host> [tag]"; exit 2 ;;
 esac
 REMOTE
+rc=$?
+# UNREACHABLE IS NOT FREE, AND IT IS NOT HELD. The remote payload exits only
+# 0 (free / action succeeded), 2 (usage) or 3 (held), so any other code came
+# from ssh or timeout, i.e. we never learned the lock's state at all. Before
+# 2026-08-30 that surfaced as an ssh error on stderr and a non-matching stdout,
+# which every "wait until it says FREE" loop reads as "still held" -- so a
+# waiter sat on a box that DHCP had moved for 332 minutes, silently, because a
+# box you cannot reach and a box someone is using look identical from inside
+# the loop. Give it its own word and its own exit code so a waiter can say
+# which one it is.
+case "$rc" in
+  0|2|3) exit "$rc" ;;
+  124) echo "UNREACHABLE $HOST: ssh timed out (60s)." ;;
+  255) echo "UNREACHABLE $HOST: ssh could not connect or authenticate." ;;
+  *)   echo "UNREACHABLE $HOST: ssh exited $rc." ;;
+esac
+echo "  The box may be down, or DHCP may have moved it. Both boxes stay reachable"
+echo "  over ZeroTier regardless: ssh spark2-zt (=sky) / spark-zt (=stars), and"
+echo "  \`ip -br addr show enP7s7\` there prints the current wired address."
+exit 4
