@@ -62,6 +62,10 @@ pub mod headnorm;
 // runtime beside it. A `CubeTask` whose `compile` returns the source verbatim,
 // and the argument convention such a kernel is written against.
 pub mod rawcuda;
+// The same hatch one level down: hand-written PTX, the assembly NVRTC would
+// have emitted, handed to the driver as it is. Same `RawArgs`, same runtime;
+// the fork routes a `.version`-led source around NVRTC (`raw-ptx-kernel`).
+pub mod rawptx;
 // The short convolution's decode step, as one kernel instead of nineteen Burn
 // ops. Four run per layer and they were a third of every launch in a decode
 // step; the arithmetic is 16384 multiply-adds.
