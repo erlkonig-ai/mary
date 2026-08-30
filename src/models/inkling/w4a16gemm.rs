@@ -2416,6 +2416,330 @@ pub fn w4a16_linear_swz_launch_redist<R: Runtime>(
     out
 }
 
+
+// ---------------------------------------------------------------------------
+// LANE-MAJOR layout: the fragment order baked into the stored bytes (PROBE)
+// ---------------------------------------------------------------------------
+
+/// K-tiles one lane-major group covers at `words` u32 per lane: a lane needs
+/// 16 bits of codes per k-tile (four nibbles), so one word is two k-tiles.
+pub const fn lm_ktiles(words: usize) -> usize {
+    2 * words
+}
+
+/// Whether `[n, k]` can be written lane-major at `words` u32 per lane.
+pub fn lanemajor_ok(n: usize, k: usize, words: usize) -> bool {
+    (words == 2 || words == 4) && n % NTILE == 0 && k % (KTILE * lm_ktiles(words)) == 0
+}
+
+/// Permute `[n, k/8]` packed E2M1 codes so that ONE coalesced `4 * words`-byte
+/// load per lane lands that lane's `m16n8k16` B fragment for `2 * words`
+/// consecutive k-tiles — no shuffle, no shared memory, no duplication.
+///
+/// The `m16n8k16` B map gives lane `l` column `l >> 2` and k elements
+/// `2 * (l & 3) + 8 * i + j` (`i`, `j` in 0..2): four nibbles a k-tile, so a
+/// 32-bit word is exactly two k-tiles of one lane and the four lanes that share
+/// a word in the k16 swizzle stop sharing anything. Block `(n_tile, g)` is
+/// `32 * 4 * words` bytes at `((n_tile * groups) + g) * 128 * words`; lane `l`'s
+/// `4 * words` bytes sit at `l * 4 * words` inside it, word `q` holding k-tiles
+/// `2q` (low four nibbles) and `2q + 1` (high four), nibble `2 * i + j` within
+/// each half. Same length, same bytes, different order.
+pub fn lanemajor_w4a16_codes_into(src: &[u8], dst: &mut [u8], n: usize, k: usize, words: usize) {
+    assert!(lanemajor_ok(n, k, words), "[{n}, {k}] is not lane-major-able at {words} words");
+    assert_eq!(src.len(), n * k / 2, "codes are not [n, k/2] bytes");
+    assert_eq!(dst.len(), src.len());
+    let kunroll = lm_ktiles(words);
+    let groups = k / KTILE / kunroll;
+    let row_b = k / 2;
+    for nt in 0..n / NTILE {
+        for g in 0..groups {
+            for lane in 0..32usize {
+                let col = lane >> 2;
+                let row = nt * NTILE + col;
+                let base = ((nt * groups + g) * 32 + lane) * 4 * words;
+                for u in 0..kunroll {
+                    let kbase = (g * kunroll + u) * KTILE;
+                    for i in 0..2usize {
+                        for j in 0..2usize {
+                            let kk = kbase + 2 * (lane & 3) + 8 * i + j;
+                            let sb = src[row * row_b + kk / 2];
+                            let nib = if kk & 1 == 0 { sb & 15 } else { sb >> 4 };
+                            let dn = 4 * (u & 1) + 2 * i + j;
+                            let di = base + (u / 2) * 4 + dn / 2;
+                            if dn & 1 == 0 {
+                                dst[di] = (dst[di] & 0xF0) | nib;
+                            } else {
+                                dst[di] = (dst[di] & 0x0F) | (nib << 4);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Permute `[n, k/16]` E4M3 block scales to match
+/// [`lanemajor_w4a16_codes_into`]: block `(n_tile, g)` is `NTILE * 2 * words`
+/// bytes, COLUMN-major, so the `2 * words` scales lane `l` needs are the
+/// contiguous bytes at `col * 2 * words` and the four lanes sharing a column
+/// read the same address — one request, `NTILE * 2 * words / 32` sectors, and
+/// no shuffle. Not duplicated: the broadcast is the hardware's.
+pub fn lanemajor_w4a16_scales_into(src: &[u8], dst: &mut [u8], n: usize, k: usize, words: usize) {
+    assert!(lanemajor_ok(n, k, words));
+    assert_eq!(src.len(), n * (k / GROUP), "scales are not [n, k/16]");
+    assert_eq!(dst.len(), src.len());
+    let kunroll = lm_ktiles(words);
+    let groups = k / KTILE / kunroll;
+    let spr = k / GROUP;
+    for nt in 0..n / NTILE {
+        for g in 0..groups {
+            for col in 0..NTILE {
+                for u in 0..kunroll {
+                    dst[((nt * groups + g) * NTILE + col) * kunroll + u] =
+                        src[(nt * NTILE + col) * spr + g * kunroll + u];
+                }
+            }
+        }
+    }
+}
+
+/// [`w4a16_linear_swz`] over a LANE-MAJOR B operand: one `4 * words`-byte load
+/// per lane per `2 * words` k-tiles, straight into the fragment, no shuffle.
+///
+/// PROBE, not a shipped lane: it exists to price the third mechanism JP named
+/// for the fragment-map request gap — lay the bytes out so the coalesced load
+/// IS the fragment load — against the shipped coalesced-load-plus-shuffle form
+/// (`redist`) in one process. Everything after the load is the swizzled lane's
+/// code: same dequantise, same scale, same accumulator. Scales are read as
+/// `Vector<S, 4>` (four k-tiles a vector) from the column-major block, cast on
+/// use.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_linear_lm<AB: Scalar + Cast, S: Scalar, NA: Size, NC: Size, NB: Size, NS: Size>(
+    a: &Tensor<Vector<AB, NA>>,
+    b: &Tensor<Vector<u32, NB>>,
+    b_sc: &Tensor<Vector<S, NS>>,
+    out: &mut Tensor<Vector<f32, NC>>,
+    #[comptime] size_k: usize,
+    #[comptime] size_n: usize,
+    #[comptime] words: usize,
+    #[comptime] mask_rows: bool,
+    #[comptime] hi_dead: bool,
+    scale: f32,
+    m_live: u32,
+) {
+    let def = cmma::MmaDefinition::<AB, AB, f32>::new(MTILE, NTILE, KTILE);
+    let lane = UNIT_POS_PLANE;
+    let pack = AB::packing_factor();
+
+    let m_tile = CUBE_POS_X as usize;
+    let n_tile = CUBE_POS_Y as usize;
+    let n_base = n_tile * NTILE;
+    let m_base = m_tile * MTILE;
+
+    let ec_a = def.elems_per_lane(MatrixIdent::A);
+    let vs_a = def.vector_size(MatrixIdent::A);
+    let vc_a = comptime!(ec_a / vs_a);
+    let ec_b = def.elems_per_lane(MatrixIdent::B);
+    let vs_b = def.vector_size(MatrixIdent::B);
+    let vc_b = comptime!(ec_b / vs_b);
+    let ec_c = def.elems_per_lane(MatrixIdent::Accumulator);
+    let vs_c = def.vector_size(MatrixIdent::Accumulator);
+    let vc_c = comptime!(ec_c / vs_c);
+
+    let mut reg_a = Array::<Vector<AB, NA>>::new(vc_a);
+    let mut reg_b = Array::<Vector<AB, NA>>::new(vc_b);
+    let mut acc = Array::<Vector<f32, NC>>::new(vc_c);
+    #[unroll]
+    for i in 0..vc_c {
+        acc[i] = Vector::<f32, NC>::cast_from(0.0f32);
+    }
+
+    // The n column this lane's fragment sits in, `lane >> 2` on sm_121a
+    // (`mma16_frag_map`). The layout absorbed the k side of the map; this is
+    // the only piece of it left in the kernel, and it addresses the scales.
+    let col = lane / 4u32;
+
+    let k_tiles = comptime!(size_k / KTILE);
+    let kunroll = comptime!(2 * words);
+    let groups = comptime!(k_tiles / kunroll);
+    let svec = comptime!(kunroll / 4);
+
+    let mut a_buf = Array::<Vector<AB, NA>>::new(comptime!(kunroll * vc_a));
+    let mut s_buf = Array::<Vector<S, NS>>::new(svec);
+
+    for g in 0..groups {
+        #[unroll]
+        for u in 0..kunroll {
+            let kbase = (g * kunroll + u) * KTILE;
+            #[unroll]
+            for i in 0..vc_a {
+                let (row, c) = def.position_of_nth(lane, (i * vs_a * pack) as u32, MatrixIdent::A);
+                let gr = row as usize + m_base;
+                let gc = c as usize + kbase;
+                if mask_rows {
+                    if comptime!(hi_dead && (i & 1) == 1) {
+                        a_buf[u * vc_a + i] = Vector::<AB, NA>::cast_from(0.0f32);
+                    } else {
+                        let mut v = Vector::<AB, NA>::cast_from(0.0f32);
+                        if gr < m_live as usize {
+                            v = a[(gr * size_k + gc) / a.vector_size()];
+                        }
+                        a_buf[u * vc_a + i] = v;
+                    }
+                } else {
+                    a_buf[u * vc_a + i] = a[(gr * size_k + gc) / a.vector_size()];
+                }
+            }
+        }
+
+        // ONE load: this lane's `words` words for the whole group.
+        let v = b[(n_tile * groups + g) * 32 + lane as usize];
+        // Scales: `kunroll` bytes at this lane's column, `svec` vectors of 4.
+        #[unroll]
+        for h in 0..svec {
+            s_buf[h] = b_sc[((n_tile * groups + g) * NTILE + col as usize) * svec + h];
+        }
+
+        #[unroll]
+        for u in 0..kunroll {
+            #[unroll]
+            for i in 0..vc_a {
+                reg_a[i] = a_buf[u * vc_a + i];
+            }
+            let s = f32::cast_from(s_buf[u / 4][u % 4]);
+            let word = v[u / 2];
+            #[unroll]
+            for i in 0..vc_b {
+                let mut vv = Vector::<AB, NA>::empty();
+                #[unroll]
+                for j in 0..vs_b {
+                    let nib = 4 * (u % 2) + 2 * i + j;
+                    let code = (word >> (4 * nib) as u32) & 15u32;
+                    vv[j] = AB::cast_from(e2m1_value(code) * s);
+                }
+                reg_b[i] = vv;
+            }
+
+            let d = def.execute(&reg_a, &reg_b, &acc);
+            #[unroll]
+            for i in 0..vc_c {
+                acc[i] = d[i];
+            }
+        }
+    }
+
+    #[unroll]
+    for i in 0..vc_c {
+        let (row, c) = def.position_of_nth(lane, (i * vs_c) as u32, MatrixIdent::Accumulator);
+        let gr = row as usize + m_base;
+        let gc = c as usize + n_base;
+        out[(gr * size_n + gc) / out.vector_size()] = acc[i] * Vector::<f32, NC>::cast_from(scale);
+    }
+}
+
+/// Launch [`w4a16_linear_lm`] over planes written by
+/// [`lanemajor_w4a16_codes_into`] / [`lanemajor_w4a16_scales_into`] at `words`.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_linear_lm_launch<R: Runtime>(
+    client: &ComputeClient<R>,
+    a: &Handle,
+    b: &Handle,
+    b_sc: &Handle,
+    m_pad: usize,
+    k: usize,
+    n: usize,
+    words: usize,
+    scale: f32,
+    m_live: Option<usize>,
+) -> Handle {
+    assert_eq!(m_pad % MTILE, 0, "m_pad {m_pad} is not a multiple of {MTILE}");
+    assert!(lanemajor_ok(n, k, words), "[{n}, {k}] is not lane-major-able at {words}");
+    assert!(n / NTILE <= 65535, "{} n-tiles exceed the 65535 grid-y limit", n / NTILE);
+    let (mask_rows, hi_dead, live) = live_arg(m_pad, m_live);
+    let kunroll = lm_ktiles(words);
+    let groups = k / KTILE / kunroll;
+    let out = client.empty(m_pad * n * core::mem::size_of::<f32>());
+    let vs = 32 / bf16::cube_type().size_bits();
+    let bvecs = (n / NTILE) * groups * 32;
+    let svecs = (n / NTILE) * groups * NTILE * (kunroll / 4);
+    unsafe {
+        w4a16_linear_lm::launch::<bf16, e4m3, R>(
+            client,
+            CubeCount::Static((m_pad / MTILE) as u32, (n / NTILE) as u32, 1),
+            CubeDim::new_1d(32),
+            vs,
+            2,
+            words,
+            4,
+            TensorArg::from_raw_parts(a.clone(), [k, 1].into(), [m_pad, k].into()),
+            TensorArg::from_raw_parts(b.clone(), [1].into(), [bvecs].into()),
+            TensorArg::from_raw_parts(b_sc.clone(), [1].into(), [svecs].into()),
+            TensorArg::from_raw_parts(out.clone(), [n, 1].into(), [m_pad, n].into()),
+            k,
+            n,
+            words,
+            mask_rows,
+            hi_dead,
+            scale,
+            live,
+        )
+    };
+    out
+}
+
+#[cfg(test)]
+mod lanemajor_tests {
+    use super::*;
+
+    /// Both lane-major planes are bijections at both widths, and every nibble
+    /// lands where the kernel's `(u, i, j)` arithmetic will look for it.
+    #[test]
+    fn lanemajor_is_a_bijection_and_matches_the_kernel_index() {
+        for words in [2usize, 4] {
+            let (n, k) = (16usize, 256usize);
+            let codes: Vec<u8> = (0..n * k / 2).map(|i| (i.wrapping_mul(97) % 251) as u8).collect();
+            let mut dst = vec![0u8; codes.len()];
+            lanemajor_w4a16_codes_into(&codes, &mut dst, n, k, words);
+            let nib = |v: &[u8], idx: usize| (v[idx / 2] >> (4 * (idx & 1))) & 15;
+            let mut src_sorted: Vec<u8> = (0..n * k).map(|i| nib(&codes, i)).collect();
+            let mut dst_sorted: Vec<u8> = (0..n * k).map(|i| nib(&dst, i)).collect();
+            src_sorted.sort_unstable();
+            dst_sorted.sort_unstable();
+            assert_eq!(src_sorted, dst_sorted, "words {words}: not a nibble bijection");
+            let kunroll = lm_ktiles(words);
+            let groups = k / KTILE / kunroll;
+            for nt in 0..n / NTILE {
+                for g in 0..groups {
+                    for lane in 0..32usize {
+                        for u in 0..kunroll {
+                            for i in 0..2 {
+                                for j in 0..2 {
+                                    let kk = (g * kunroll + u) * KTILE + 2 * (lane & 3) + 8 * i + j;
+                                    let row = nt * NTILE + (lane >> 2);
+                                    let want = nib(&codes, row * k + kk);
+                                    let word_idx = ((nt * groups + g) * 32 + lane) * words + u / 2;
+                                    let got = nib(&dst, word_idx * 8 + 4 * (u % 2) + 2 * i + j);
+                                    assert_eq!(want, got, "words {words} nt {nt} g {g} lane {lane} u {u} i {i} j {j}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let scales: Vec<u8> = (0..n * (k / GROUP)).map(|i| (i % 241) as u8).collect();
+            let mut sd = vec![0u8; scales.len()];
+            lanemajor_w4a16_scales_into(&scales, &mut sd, n, k, words);
+            let mut a = sd.clone();
+            let mut b = scales.clone();
+            a.sort_unstable();
+            b.sort_unstable();
+            assert_eq!(a, b);
+        }
+    }
+}
+
 #[cfg(test)]
 mod swizzle_k16_tests {
     use super::*;

@@ -130,7 +130,9 @@ use std::time::Instant;
 use cubecl::future;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
-use mary::models::inkling::w4a16gemm::{w4a16_linear_launch, w4a16_linear_swz_launch_redist};
+use mary::models::inkling::w4a16gemm::{
+    w4a16_linear_launch, w4a16_linear_lm_launch, w4a16_linear_swz_launch_redist,
+};
 
 type Rt = cubecl::cuda::CudaRuntime;
 
@@ -212,7 +214,7 @@ fn main() {
         mary::models::inkling::w4a16gemm::swz_unroll(),
     );
     println!(
-        "{:>8} {:>7} {:>9} {:>4} {:>10} {:>10} {:>10} {:>9} {:>9} {:>9} {:>7} {:>7}",
+        "{:>8} {:>7} {:>9} {:>4} {:>10} {:>10} {:>10} {:>10} {:>9} {:>9} {:>9} {:>9} {:>7} {:>7} {:>7}",
         "n",
         "cubes",
         "MiB",
@@ -220,11 +222,14 @@ fn main() {
         "row ms",
         "swz ms",
         "shf ms",
+        "lm ms",
         "row GB/s",
         "swz GB/s",
         "shf GB/s",
+        "lm GB/s",
         "ratio",
-        "shf/swz"
+        "shf/swz",
+        "shf/lm"
     );
 
     let arms: Vec<Arm> = ns.iter().map(|&n| Arm::new(&client, m_pad, k, n)).collect();
@@ -235,6 +240,11 @@ fn main() {
     // ONE process round-robined against the same row-major arm on the same
     // rotating buffers. `w4a16gemm::swz_shuffle` carries what it is.
     let mut shf = vec![f64::MAX; ns.len()];
+    // The LANE-MAJOR probe (`w4a16gemm::w4a16_linear_lm`, 16 B/lane, 8 k-tiles
+    // a group): the fragment order baked into the stored bytes, so the
+    // coalesced load IS the fragment load. Reads the same rotating buffers as
+    // a lane-major plane (timing only; `w4a16_geom_ceiling` gates the bits).
+    let mut lm = vec![f64::MAX; ns.len()];
 
     for r in 0..ROUNDS + 2 {
         for (i, (&n, arm)) in ns.iter().zip(&arms).enumerate() {
@@ -269,10 +279,20 @@ fn main() {
             let _ = future::block_on(client.sync());
             let dh = t2.elapsed().as_secs_f64() / REPS as f64;
 
+            let t3 = Instant::now();
+            for j in 0..REPS {
+                let (b, sc) = &arm.rot[j % arm.rot.len()];
+                let o = w4a16_linear_lm_launch::<Rt>(&client, &arm.a, b, sc, m_pad, k, n, 4, 1.0, mlive);
+                drop(o);
+            }
+            let _ = future::block_on(client.sync());
+            let dl = t3.elapsed().as_secs_f64() / REPS as f64;
+
             if r >= 2 {
                 base[i] = base[i].min(db);
                 swz[i] = swz[i].min(ds);
                 shf[i] = shf[i].min(dh);
+                lm[i] = lm[i].min(dl);
             }
         }
     }
@@ -280,7 +300,7 @@ fn main() {
     for (i, &n) in ns.iter().enumerate() {
         let bytes = table_bytes(n, k);
         println!(
-            "{:>8} {:>7} {:>9.2} {:>4} {:>10.4} {:>10.4} {:>10.4} {:>9.1} {:>9.1} {:>9.1} {:>7.2} {:>7.2}",
+            "{:>8} {:>7} {:>9.2} {:>4} {:>10.4} {:>10.4} {:>10.4} {:>10.4} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>7.2} {:>7.2} {:>7.2}",
             n,
             (m_pad / 16) * (n / 8),
             bytes as f64 / (1u64 << 20) as f64,
@@ -288,11 +308,14 @@ fn main() {
             base[i] * 1e3,
             swz[i] * 1e3,
             shf[i] * 1e3,
+            lm[i] * 1e3,
             bytes as f64 / base[i] / 1e9,
             bytes as f64 / swz[i] / 1e9,
             bytes as f64 / shf[i] / 1e9,
+            bytes as f64 / lm[i] / 1e9,
             base[i] / swz[i],
-            swz[i] / shf[i]
+            swz[i] / shf[i],
+            shf[i] / lm[i]
         );
     }
     println!(

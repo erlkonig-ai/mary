@@ -256,7 +256,9 @@ use cubecl::prelude::*;
 use cubecl::server::Handle;
 use half::bf16;
 use mary::models::inkling::w4a16gemm::{
-    CODES_PER_WORD, GROUP, KTILE, MTILE, NTILE, SWZ_BLOCK_CODES, w4a16_linear_swz_launch_redist,
+    CODES_PER_WORD, GROUP, KTILE, MTILE, NTILE, SWZ_BLOCK_CODES, lanemajor_w4a16_codes_into,
+    lanemajor_w4a16_scales_into, swizzle_w4a16_codes_into, swizzle_w4a16_scales_into,
+    w4a16_linear_lm_launch, w4a16_linear_swz_launch_redist,
 };
 
 type Rt = cubecl::cuda::CudaRuntime;
@@ -644,6 +646,11 @@ fn main() {
         "width 4 B/lane + shuffle ",
         "width 16 B/lane + shuffle",
         "real swz + shuffle       ",
+        "real LANE-MAJOR 16 B/lane",
+        "real shuffle, MASK OFF   ",
+        "real fragment, MASK OFF  ",
+        "real LM 16 B, MASK OFF   ",
+        "real LANE-MAJOR 8 B/lane ",
     ];
     let mut per_rep: Vec<Vec<f64>> = vec![Vec::new(); names.len()];
 
@@ -656,8 +663,105 @@ fn main() {
     let order_fwd = std::env::var("INK_GC_ORDER")
         .map(|v| v == "fwd")
         .unwrap_or(false);
-    let fwd: Vec<usize> = (0..names.len()).collect();
-    let rev: Vec<usize> = (0..names.len()).rev().collect();
+    // `INK_GC_ONLY=3,10,11` restricts the schedule to those arms, which is how
+    // one arm is handed to `ncu` without a kernel-name filter: the arm's
+    // launches are then the only launches in the process (with `INK_GC_GATE=0`).
+    let only: Option<Vec<usize>> = std::env::var("INK_GC_ONLY").ok().map(|v| {
+        v.split(',')
+            .filter_map(|x| x.trim().parse::<usize>().ok())
+            .filter(|x| *x < names.len())
+            .collect()
+    });
+    let keep = |i: &usize| only.as_ref().map(|o| o.contains(i)).unwrap_or(true);
+    let fwd: Vec<usize> = (0..names.len()).filter(keep).collect();
+    let rev: Vec<usize> = (0..names.len()).rev().filter(keep).collect();
+
+    // THE LANE-MAJOR ARMS ARE GATED BIT-FOR-BIT before anything is timed. They
+    // move the same words into the same fragment slots by a different route,
+    // so the only admissible deviation from the fragment-shaped lane is zero;
+    // anything else is a wrong nibble, which would look like plausible numbers.
+    // Three shapes: decode, a partly-padded last tile, and the real k.
+    if std::env::var("INK_GC_GATE").as_deref() != Ok("0") {
+        let read = |h| -> Vec<f32> {
+            client
+                .read_one(h)
+                .unwrap()
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        let mut bad = 0usize;
+        println!("  lane-major bit-identity (GATE), reference = fragment-shaped swz lane:");
+        for (cm, live, ck) in [(16usize, 1usize, 256usize), (48, 37, 256), (16, 1, 4096)] {
+            let cn = 64usize;
+            let cc = cn * ck / 2;
+            let cs = cn * (ck / 16);
+            let wb: Vec<u8> = (0..cc).map(|i| (i.wrapping_mul(97) % 253) as u8).collect();
+            let sb: Vec<u8> = (0..cs).map(|i| [0x38u8, 0x40, 0x30, 0x2c][i % 4]).collect();
+            let mut pc = vec![0u8; cc];
+            let mut ps = vec![0u8; cs];
+            swizzle_w4a16_codes_into(&wb, &mut pc, cn, ck);
+            swizzle_w4a16_scales_into(&sb, &mut ps, cn, ck);
+            let ab: Vec<u8> = (0..cm * ck)
+                .flat_map(|i| {
+                    let v = if i / ck < live {
+                        half::bf16::from_f32((i % 13) as f32 * 0.25 - 1.5)
+                    } else {
+                        half::bf16::ZERO
+                    };
+                    v.to_le_bytes()
+                })
+                .collect();
+            let ha = client.create_from_slice(&ab);
+            let hbp = client.create_from_slice(&pc);
+            let hsp = client.create_from_slice(&ps);
+            let reference = read(w4a16_linear_swz_launch_redist::<Rt>(
+                &client, &ha, &hbp, &hsp, cm, ck, cn, true, 0.75, Some(live), false,
+            ));
+            for words in [2usize, 4] {
+                let mut lc = vec![0u8; cc];
+                let mut ls = vec![0u8; cs];
+                lanemajor_w4a16_codes_into(&wb, &mut lc, cn, ck, words);
+                lanemajor_w4a16_scales_into(&sb, &mut ls, cn, ck, words);
+                let hbl = client.create_from_slice(&lc);
+                let hsl = client.create_from_slice(&ls);
+                for mask in [true, false] {
+                    let got = read(w4a16_linear_lm_launch::<Rt>(
+                        &client,
+                        &ha,
+                        &hbl,
+                        &hsl,
+                        cm,
+                        ck,
+                        cn,
+                        words,
+                        0.75,
+                        if mask { Some(live) } else { None },
+                    ));
+                    let mut n = 0usize;
+                    let mut worst = 0.0f32;
+                    for (p, q) in reference.iter().zip(&got) {
+                        if p.to_bits() != q.to_bits() {
+                            n += 1;
+                        }
+                        worst = worst.max((p - q).abs());
+                    }
+                    let nonzero = reference.iter().filter(|v| **v != 0.0).count();
+                    bad += n;
+                    println!(
+                        "    [{cm}, {ck}] x [{cn}, {ck}]^T, {live} live, words {words}, mask {mask}: \
+                         {} outputs ({nonzero} nonzero): {worst:.3e} ({n} bits differ)",
+                        got.len()
+                    );
+                }
+            }
+        }
+        if bad != 0 {
+            eprintln!("REFUSED: the lane-major lane is not bit-identical ({bad} outputs differ).");
+            std::process::exit(2);
+        }
+        println!("    0 outputs differ anywhere: lane-major is bit-identical at both widths.\n");
+    }
 
     for _rep in 0..reps {
         let sched: &[usize] = if order_fwd || _rep % 2 == 0 {
@@ -750,6 +854,41 @@ fn main() {
                     let _ = future::block_on(client.sync());
                     drop(o);
                 }
+                11 | 14 | 15 => {
+                    let o = w4a16_linear_lm_launch::<Rt>(
+                        &client,
+                        &a,
+                        &b,
+                        &b_sc,
+                        m_pad,
+                        k,
+                        n,
+                        if arm == 15 { 2 } else { 4 },
+                        1.0,
+                        if arm == 14 { None } else { Some(m_live) },
+                    );
+                    let _ = future::block_on(client.sync());
+                    drop(o);
+                }
+                // The PRODUCTION configuration: `live_row_mask` defaults OFF, so
+                // the shipped step runs these two with `m_live = None`.
+                12 | 13 => {
+                    let o = w4a16_linear_swz_launch_redist::<Rt>(
+                        &client,
+                        &a,
+                        &b,
+                        &b_sc,
+                        m_pad,
+                        k,
+                        n,
+                        true,
+                        1.0,
+                        None,
+                        arm == 12,
+                    );
+                    let _ = future::block_on(client.sync());
+                    drop(o);
+                }
                 _ => unreachable!("arm {arm} has no launch"),
             }
             per_rep[arm].push(t0.elapsed().as_secs_f64());
@@ -759,9 +898,15 @@ fn main() {
     println!(
         "  arm                          p50 ms      min      max      GB/s     % of coalesced"
     );
-    let warm: Vec<Vec<f64>> = per_rep.iter().map(|v| v[2..].to_vec()).collect();
-    let (base, _, _) = stats(&warm[0]);
+    let warm: Vec<Vec<f64>> = per_rep
+        .iter()
+        .map(|v| if v.len() > 2 { v[2..].to_vec() } else { Vec::new() })
+        .collect();
+    let base = if warm[0].is_empty() { f64::NAN } else { stats(&warm[0]).0 };
     for (i, nm) in names.iter().enumerate() {
+        if warm[i].is_empty() {
+            continue;
+        }
         let (p50, lo, hi) = stats(&warm[i]);
         println!(
             "  {nm}  {:8.3} {:8.3} {:8.3}  {:8.1}   {:8.1}%",
@@ -777,6 +922,9 @@ fn main() {
     // rep-by-rep ratio cancels the drift that makes the absolute rows move 5-10%
     // between processes. `a / b` is the cost of what `a` does and `b` does not.
     let pair = |a: usize, b: usize| -> (f64, f64, f64) {
+        if warm[a].is_empty() || warm[b].is_empty() {
+            return (f64::NAN, f64::NAN, f64::NAN);
+        }
         let r: Vec<f64> = warm[a]
             .iter()
             .zip(warm[b].iter())
@@ -789,6 +937,15 @@ fn main() {
         // THE SHIPPED LANE, flag on over flag off. Everything else here is a
         // rung; this row is the kernel.
         ("REAL: shuffle on/off     (10/3)", 10usize, 3usize),
+        ("LANE-MAJOR 16B vs shuffle(11/10)", 11, 10),
+        ("LANE-MAJOR 8B vs shuffle (15/10)", 15, 10),
+        ("LANE-MAJOR 16B vs 8B     (11/15)", 11, 15),
+        ("LANE-MAJOR 16B vs coalesc(11/0)", 11, 0),
+        ("LANE-MAJOR 16B vs width16(11/5)", 11, 5),
+        ("MASK OFF: shuffle off/on (12/10)", 12, 10),
+        ("MASK OFF: fragment off/on(13/3)", 13, 3),
+        ("MASK OFF: LM16 off/on    (14/11)", 14, 11),
+        ("PROD: LM16 vs shuffle    (14/12)", 14, 12),
         ("real+shfl vs coalesced   (10/0)", 10, 0),
         ("real+shfl vs fragment map(10/1)", 10, 1),
         ("shuffle cost, 4 B/lane   (8/4)", 8usize, 4usize),
