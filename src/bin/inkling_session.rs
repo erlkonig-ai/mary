@@ -663,7 +663,7 @@ fn batched_gate(session: &mut Session, prompt: &[usize], steps: usize) -> Result
 /// A served turn generates by feeding each token back as the next one's input,
 /// and it stops one step short of that: the last token is EMITTED and never
 /// fed, because a decode step whose argmax nobody will read is 44 ms spent on
-/// nothing. That is `inkling_serve`'s `if step + 1 < want`, and it is a good
+/// nothing. That is the resident engine's `if step + 1 < want`, and it is a good
 /// saving — but it leaves the turn's own final token in the STREAM and not in
 /// the KV CACHE, which is correct only if the NEXT pass appends it.
 ///

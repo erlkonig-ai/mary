@@ -1088,6 +1088,23 @@ impl Session {
         self.partial
     }
 
+    /// The Group this Session is a rank of, if it is one.
+    ///
+    /// Exposed for exactly one caller — [`super::engine::Engine`] — and for
+    /// exactly one purpose: the HOST-SIDE rank link
+    /// ([`Group::lead`]/[`Group::follow`]/[`Group::agree`]) that tells the
+    /// other rank which pass to make. That link rides the rendezvous socket the
+    /// Group already holds for [`Group::barrier`], so there is one owner of
+    /// those sockets and not two.
+    ///
+    /// This is deliberately not a general escape hatch to the collective. The
+    /// module header's rule still stands: nothing on the token path may read a
+    /// reduced buffer back or sync the host. Use it to NAME a pass, never to
+    /// decide one.
+    pub fn group_mut(&mut self) -> Option<&mut Group> {
+        self.group.as_mut()
+    }
+
     /// Run proposed tokens through the target model without committing them yet.
     ///
     /// This is the transaction boundary a speculative caller needs and no more:

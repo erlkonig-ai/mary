@@ -437,6 +437,160 @@ impl Group {
         }
         Ok(())
     }
+
+    // ── the host-side rank link ─────────────────────────────────────────────
+    //
+    // The rendezvous socket was already kept for `barrier`, whose doc says why
+    // it exists: "the points where the two ranks must agree about something on
+    // the HOST — the end of a benchmark rep, A DECISION TO STOP GENERATING —
+    // and using a device collective for those would mean a device sync, which
+    // is the one thing the module header forbids on the token path."
+    //
+    // The one-binary collapse is exactly that use, made continuous. There is no
+    // proxy process fanning one input stream out to two rank processes any
+    // more; rank 0 owns the Drive loop and rank 1 owns nothing but a Session,
+    // so rank 1 has to be TOLD which pass to make. It is told here, on the
+    // socket that already exists, in nine bytes.
+    //
+    // Why this is not a new wire: it carries one small message per model PASS,
+    // on the fast fabric, with no JSON, no framing library and no second
+    // process in the middle. The thing it replaced carried a framed-stream
+    // CONSULT envelope per token through a fan-out proxy and an `ssh` channel
+    // — about 26 ms of a measured 82 ms p50 token. And it is STRICTLY MORE
+    // honest about lockstep: the proxy mirrored input BYTES and relied on both
+    // ranks deriving the same passes from them, while this names the passes.
+
+    /// Name the pass rank 0 is about to make, so every other rank makes it too.
+    ///
+    /// Write-and-continue: this does NOT wait for the peer. The collective
+    /// inside the pass is the synchronisation, and the kernel's socket buffer
+    /// absorbs any skew; blocking here would serialise what NCCL already
+    /// orders. Only rank 0 may call it.
+    pub fn lead(&mut self, pass: &Pass) -> Result<()> {
+        anyhow::ensure!(
+            self.tp.rank() == 0,
+            "only rank 0 leads passes; rank {} must follow",
+            self.tp.rank()
+        );
+        let frame = pass.encode();
+        for peer in self.socks.iter_mut() {
+            peer.write_all(&frame).context("send the pass command")?;
+            peer.flush().ok();
+        }
+        Ok(())
+    }
+
+    /// Block until rank 0 names the next pass. Only a non-zero rank may call it.
+    ///
+    /// An end-of-stream here is not an error to paper over: it means rank 0's
+    /// process is GONE. That is the same signal the deleted framed-stream proxy
+    /// used ("a truncated stream is distinguishable from a finished one"),
+    /// obtained from TCP for free, and it must terminate this rank rather than
+    /// leave it holding a 121 GiB arena and half a communicator.
+    pub fn follow(&mut self) -> Result<Pass> {
+        anyhow::ensure!(
+            self.tp.rank() != 0,
+            "rank 0 leads passes; it has nobody to follow"
+        );
+        let peer = self
+            .socks
+            .first_mut()
+            .context("this rank has no rendezvous socket to rank 0")?;
+        let mut header = [0u8; 5];
+        match peer.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                anyhow::bail!(
+                    "rank 0 closed the rank link without a Finish: its process is gone, so \
+                     this rank is stopping rather than blocking in NCCL forever"
+                )
+            }
+            Err(error) => return Err(error).context("read the next pass command"),
+        }
+        let count = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        let mut ids = Vec::with_capacity(count);
+        let mut word = [0u8; 4];
+        for _ in 0..count {
+            peer.read_exact(&mut word)
+                .context("read a pass command's token ids")?;
+            ids.push(u32::from_be_bytes(word) as usize);
+        }
+        Pass::decode(header[0], ids)
+    }
+
+    /// Exchange one 32-byte sequence digest with every peer and require
+    /// agreement.
+    ///
+    /// Both sides WRITE before either READS, exactly as [`Group::barrier`]
+    /// does and for the same reason: 32 bytes fit any socket buffer, so the
+    /// write phase cannot block on a peer that has not read yet, and a star of
+    /// more than two cannot deadlock.
+    ///
+    /// This is what remains of the deleted `ServePair`'s byte-for-byte
+    /// cross-rank check. It is weaker in one specific way, recorded here rather
+    /// than only in the commit that removed the old one: the proxy WITHHELD
+    /// each token fragment until the peer confirmed it, so a divergent byte was
+    /// never spoken; this compares after the fact, at a turn boundary. It is
+    /// stronger in another: the digest covers every pass, including context
+    /// passes the old check never saw. Never call it inside the layer loop, and
+    /// never while a collective is in flight.
+    pub fn agree(&mut self, digest: [u8; 32]) -> Result<()> {
+        for peer in self.socks.iter_mut() {
+            peer.write_all(&digest)
+                .context("send the sequence digest")?;
+            peer.flush().ok();
+        }
+        for (index, peer) in self.socks.iter_mut().enumerate() {
+            let mut theirs = [0u8; 32];
+            peer.read_exact(&mut theirs)
+                .context("receive a peer's sequence digest")?;
+            anyhow::ensure!(
+                theirs == digest,
+                "TENSOR RANKS DIVERGED: peer {index} holds sequence digest {} where this rank \
+                 (rank {}) holds {}. Both ranks decode from the same all-reduced logits, so a \
+                 disagreement here means the collective delivered different bytes to each rank \
+                 — a fabric or NCCL fault, not a sampling difference. {}",
+                hex32(&theirs),
+                self.tp.rank(),
+                hex32(&digest),
+                transport_note()
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether every peer's end of the rank link is still open.
+    ///
+    /// A zero-timeout `poll` for `POLLHUP`/`POLLERR`, checked at pass
+    /// boundaries. It catches a peer that died BETWEEN passes; a peer that dies
+    /// while both ranks are inside a collective still hangs the survivor,
+    /// because nothing watches the link concurrently. The deleted `ServePair`
+    /// bounded that case with a reader thread per rank. Restoring it needs
+    /// either a watchdog thread owning a `try_clone` of this socket that
+    /// force-exits on EOF, or NCCL's own `NCCL_ASYNC_ERROR_HANDLING=1` plus
+    /// `ncclCommGetAsyncError` polled from the layer loop. Neither is here.
+    pub fn peer_alive(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+
+            for peer in &self.socks {
+                let mut descriptor = libc::pollfd {
+                    fd: peer.as_raw_fd(),
+                    events: 0,
+                    revents: 0,
+                };
+                // SAFETY: `descriptor` is valid for the one-element poll array.
+                let polled = unsafe { libc::poll(&mut descriptor, 1, 0) };
+                if polled > 0
+                    && descriptor.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
 }
 
 /// Connect, retrying, because the peer is usually still loading its pile.
@@ -459,6 +613,281 @@ fn connect_with_deadline(addr: &str, wait: Duration) -> Result<TcpStream> {
             }
         }
     }
+}
+
+/// One model PASS, named by rank 0 before it makes it.
+///
+/// This is the whole vocabulary of the rank link, and it is deliberately the
+/// vocabulary of [`super::session::Session`] rather than of a conversation:
+/// every rank runs the same passes over the same ids, and nothing about turns,
+/// tokenizers, typed context or Drive crosses this socket. Rank 1 needs no
+/// tokenizer, no context codec, no detokenizer and no pile — it needs the ids
+/// and the order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pass {
+    /// `Session::prefill` over these ids: the first pass of a sequence.
+    Prefill(Vec<usize>),
+    /// `Session::extend` over these ids: carry, then whatever is new.
+    Extend(Vec<usize>),
+    /// `Session::step`: one decode, no new rows.
+    Step,
+    /// `Session::reset`: the sequence is being replaced.
+    Reset,
+    /// Exchange sequence digests and require agreement ([`Group::agree`]).
+    Agree,
+    /// The run is over. Every rank should shut down cleanly.
+    Finish,
+    /// Rank 0 failed terminally. Stop now rather than wait in a collective.
+    Abort,
+}
+
+impl Pass {
+    const PREFILL: u8 = 0x01;
+    const EXTEND: u8 = 0x02;
+    const STEP: u8 = 0x03;
+    const RESET: u8 = 0x04;
+    const AGREE: u8 = 0x05;
+    const FINISH: u8 = 0x06;
+    const ABORT: u8 = 0x07;
+
+    /// `[tag u8][count u32be][count x u32be ids]`.
+    ///
+    /// Fixed width and self-delimiting, so a short read is an error rather than
+    /// a resynchronisation problem. A one-row extend — which is what EVERY
+    /// generated token after the first costs — is NINE bytes: one tag, one
+    /// u32be count, one u32be id.
+    fn encode(&self) -> Vec<u8> {
+        const NONE: &[usize] = &[];
+        let (tag, ids): (u8, &[usize]) = match self {
+            Pass::Prefill(ids) => (Self::PREFILL, ids.as_slice()),
+            Pass::Extend(ids) => (Self::EXTEND, ids.as_slice()),
+            Pass::Step => (Self::STEP, NONE),
+            Pass::Reset => (Self::RESET, NONE),
+            Pass::Agree => (Self::AGREE, NONE),
+            Pass::Finish => (Self::FINISH, NONE),
+            Pass::Abort => (Self::ABORT, NONE),
+        };
+        let mut frame = Vec::with_capacity(5 + 4 * ids.len());
+        frame.push(tag);
+        frame.extend_from_slice(&(ids.len() as u32).to_be_bytes());
+        for id in ids {
+            frame.extend_from_slice(&(*id as u32).to_be_bytes());
+        }
+        frame
+    }
+
+    fn decode(tag: u8, ids: Vec<usize>) -> Result<Self> {
+        // Takes the ids as an argument rather than capturing them, so the
+        // arms below are free to MOVE the vector into a Prefill/Extend.
+        fn empty(ids: &[usize], what: &str) -> Result<()> {
+            anyhow::ensure!(
+                ids.is_empty(),
+                "a {what} pass carries no token ids, but {} arrived",
+                ids.len()
+            );
+            Ok(())
+        }
+        Ok(match tag {
+            Self::PREFILL => Pass::Prefill(ids),
+            Self::EXTEND => Pass::Extend(ids),
+            Self::STEP => {
+                empty(&ids, "Step")?;
+                Pass::Step
+            }
+            Self::RESET => {
+                empty(&ids, "Reset")?;
+                Pass::Reset
+            }
+            Self::AGREE => {
+                empty(&ids, "Agree")?;
+                Pass::Agree
+            }
+            Self::FINISH => {
+                empty(&ids, "Finish")?;
+                Pass::Finish
+            }
+            Self::ABORT => {
+                empty(&ids, "Abort")?;
+                Pass::Abort
+            }
+            // An unknown tag is a version skew between two boxes that are
+            // supposed to be running the SAME binary. Refusing loudly is the
+            // point: the one-binary deployment exists so this cannot happen,
+            // and if it does, the run must stop rather than desynchronise.
+            other => anyhow::bail!(
+                "unknown rank-link pass tag {other:#04x}: the two ranks are not the same build"
+            ),
+        })
+    }
+}
+
+fn hex32(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+
+    let mut text = String::with_capacity(64);
+    for byte in bytes {
+        write!(&mut text, "{byte:02X}").expect("writing into a String is infallible");
+    }
+    text
+}
+
+/// WHICH RANK THIS BOX IS, decided by comparing its own addresses to the
+/// rendezvous address the operator named.
+///
+/// # The discriminator was already here, unread
+///
+/// [`Group::form`] has rank 0 `TcpListener::bind(addr)` while every other rank
+/// `connect`s to it, and its doc already says the consequence: *"rank 0's
+/// address is the one both sides name — which is also why rank 0 should be the
+/// box whose ConnectX address is stable."* So the rendezvous address is not
+/// merely configuration that happens to differ per box; it NAMES RANK 0. A box
+/// that holds that address is rank 0. A box that does not, is not.
+///
+/// That is the whole election. It needs no new configuration (the rendezvous
+/// address is configuration that already had to exist), no new state, no
+/// consensus protocol, and no lease. And it means the two INVOCATIONS are
+/// identical, not just the two binaries — which is the actual deployment
+/// property being bought, since `--tp-rank 0` on one box and `--tp-rank 1` on
+/// the other is two commands to keep in sync forever.
+///
+/// # It fails correctly in both directions
+///
+/// A /30 has two hosts, so BOTH boxes matching is impossible. NEITHER matching
+/// means the operator named an address that lives on neither box — and that is
+/// refused here rather than discovered 180 seconds later as a rendezvous
+/// timeout on two processes that both dialled and neither bound.
+///
+/// The one case this cannot detect from inside a single box is "the other box
+/// also thinks it is rank 1", because a box knows only its own addresses. What
+/// catches that is the existing 180 s `connect` deadline in
+/// [`connect_with_deadline`], whose message already names the right cause, and
+/// then [`Group::warm`]'s all-reduce sum, which refuses a group that formed
+/// but did not pair.
+///
+/// # Alternatives, and why not
+///
+/// * **Hostname match** — adds machine names as new configuration, when the
+///   rendezvous address is configuration that already exists.
+/// * **An explicit `--tp-rank`** — today's arrangement. It is not discovery,
+///   and it makes the two invocations differ even when the binary does not.
+/// * **A lease file** — new state, and there is no shared storage between the
+///   boxes to put it on.
+/// * **The `gb10` box lock** — an advisory reservation with a 90-minute
+///   staleness timeout. Coupling model topology to a benchmark-arbitration
+///   lock makes a stale lock a WRONG MODEL, silently.
+pub fn elect_rank(rendezvous: &str, world: usize) -> Result<Tp> {
+    use std::net::ToSocketAddrs as _;
+
+    anyhow::ensure!(
+        world == 2,
+        "address-match rank election decides exactly one bit — this box either holds the \
+         rendezvous address or it does not — so it can only elect a PAIR. A world of {world} \
+         needs a launcher that assigns ranks explicitly."
+    );
+
+    let named = rendezvous
+        .to_socket_addrs()
+        .with_context(|| {
+            format!(
+                "resolve the rendezvous address {rendezvous:?}. It must be HOST:PORT on the fast \
+                 fabric, and the HOST must be rank 0's address on that fabric."
+            )
+        })?
+        .map(|addr| addr.ip())
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        !named.is_empty(),
+        "the rendezvous address {rendezvous:?} resolved to nothing"
+    );
+    for address in &named {
+        anyhow::ensure!(
+            !address.is_loopback(),
+            "the rendezvous address {rendezvous:?} resolves to loopback ({address}). Loopback \
+             names THIS box on both boxes, so the two ranks would never meet; name rank 0's \
+             address on the fabric."
+        );
+        anyhow::ensure!(
+            !address.is_unspecified(),
+            "the rendezvous address {rendezvous:?} resolves to the unspecified address \
+             ({address}), which names no box"
+        );
+    }
+
+    let local = local_addresses().context("enumerate this box's own addresses")?;
+    let matched = named.iter().find(|address| local.contains(address));
+    let rank = match matched {
+        Some(address) => {
+            println!(
+                "  rank election      : rank 0 — this box holds {address}, which is the \
+                 rendezvous address; it BINDS, owns the Drive loop and owns the pile"
+            );
+            0
+        }
+        None => {
+            println!(
+                "  rank election      : rank 1 — this box holds none of {named:?}, so rank 0 is \
+                 elsewhere; it DIALS and runs as a pure model rank"
+            );
+            1
+        }
+    };
+    Tp::new(rank, world)
+}
+
+/// Every address this box holds, on every interface, minus loopback.
+///
+/// Deliberately not "the address of the fabric interface": naming the
+/// interface would be more configuration, and the question being asked is only
+/// whether the operator's rendezvous address is one of ours. An unrelated
+/// management address matching would mean the operator named the management
+/// address, which is a real answer — rank 0 would then bind it and the
+/// rendezvous would work, slowly, and `transport_note` would say so.
+fn local_addresses() -> Result<Vec<std::net::IpAddr>> {
+    let mut addresses = Vec::new();
+    #[cfg(unix)]
+    {
+        let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+        // SAFETY: `getifaddrs` fills `list` with an allocation freed by
+        // `freeifaddrs` below on every path out of this block.
+        let got = unsafe { libc::getifaddrs(&mut list) };
+        anyhow::ensure!(
+            got == 0,
+            "getifaddrs failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut entry = list;
+        while !entry.is_null() {
+            // SAFETY: `entry` is a node of the list `getifaddrs` built.
+            let node = unsafe { &*entry };
+            if !node.ifa_addr.is_null() {
+                // SAFETY: the family tag selects which concrete sockaddr the
+                // kernel stored, and each branch reads only that type's fields.
+                let family = unsafe { (*node.ifa_addr).sa_family } as libc::c_int;
+                if family == libc::AF_INET {
+                    let raw = node.ifa_addr as *const libc::sockaddr_in;
+                    // SAFETY: family said AF_INET.
+                    let octets = unsafe { (*raw).sin_addr.s_addr };
+                    addresses.push(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                        u32::from_be(octets),
+                    )));
+                } else if family == libc::AF_INET6 {
+                    let raw = node.ifa_addr as *const libc::sockaddr_in6;
+                    // SAFETY: family said AF_INET6.
+                    let octets = unsafe { (*raw).sin6_addr.s6_addr };
+                    addresses.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets)));
+                }
+            }
+            entry = node.ifa_next;
+        }
+        // SAFETY: `list` came from the successful `getifaddrs` above.
+        unsafe { libc::freeifaddrs(list) };
+    }
+    addresses.retain(|address| !address.is_loopback() && !address.is_unspecified());
+    anyhow::ensure!(
+        !addresses.is_empty(),
+        "this box reports no non-loopback address, so it cannot decide whether it is rank 0"
+    );
+    Ok(addresses)
 }
 
 /// What NCCL chose for the wire, as far as the environment can say.
@@ -524,4 +953,59 @@ pub fn reduce_activation(
     let h = seam::handle_of(x);
     g.all_reduce_f32(&h);
     seam::tensor_of(client, device.clone(), h, rows, cols)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Pass;
+
+    /// The rank link's framing, which is the ONLY thing the two boxes now say
+    /// to each other outside NCCL.
+    ///
+    /// It round-trips because a desynchronised follower is the failure mode
+    /// with no symptom: it would make the wrong pass, block in a collective its
+    /// peer is not in, and hang both boxes with nothing in either log.
+    #[test]
+    fn every_pass_round_trips_and_an_unknown_tag_refuses() {
+        for pass in [
+            Pass::Prefill(vec![1, 2, 3]),
+            Pass::Extend(vec![7]),
+            Pass::Extend(Vec::new()),
+            Pass::Step,
+            Pass::Reset,
+            Pass::Agree,
+            Pass::Finish,
+            Pass::Abort,
+        ] {
+            let frame = pass.encode();
+            let count = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]) as usize;
+            assert_eq!(frame.len(), 5 + 4 * count, "{pass:?} is self-delimiting");
+            let ids = frame[5..]
+                .chunks_exact(4)
+                .map(|word| u32::from_be_bytes([word[0], word[1], word[2], word[3]]) as usize)
+                .collect::<Vec<_>>();
+            assert_eq!(Pass::decode(frame[0], ids).unwrap(), pass);
+        }
+
+        // A one-row extend is what EVERY generated token after the first costs
+        // on the link. NINE bytes -- `[tag u8][count u32be][one id u32be]` --
+        // against the framed-stream CONSULT envelope plus a JSON TurnEnd it
+        // replaced. (This literal said 13 and the comment said "Thirteen" until
+        // 2026-08-30, when the test was first RUN: the self-delimiting
+        // assertion directly above already pins the length at `5 + 4 * count`,
+        // which is 9 for one id, so the two assertions contradicted each other
+        // and the arithmetic slip was in this one. The encoder was always
+        // right. The stale figure had already propagated into the branch's
+        // own write-up as the per-token wire cost, overstating it by 44%.)
+        assert_eq!(Pass::Extend(vec![9]).encode().len(), 9);
+
+        let error = Pass::decode(0xFE, Vec::new()).expect_err("an unknown tag must refuse");
+        assert!(
+            error.to_string().contains("not the same build"),
+            "{error:#}"
+        );
+
+        let error = Pass::decode(0x03, vec![1]).expect_err("a Step pass carries no ids");
+        assert!(error.to_string().contains("no token ids"), "{error:#}");
+    }
 }
