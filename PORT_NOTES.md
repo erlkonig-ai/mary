@@ -1575,8 +1575,9 @@ signed model-bundle token per COMMIT:
 `H` is a canonical, self-contained archive of the exact model facts. Loading
 freezes an exact bundle ticket, validates every one-row token and its canonical
 archive independently, selects the sole Source/native PersonaPlex root, and
-keeps `(team, root, H, τ, ticket)` bound to the weight loader. A snapshot
-cannot be relabelled as another team's authority, and a broad graph union
+keeps `(collection descriptor, root, H, τ, cover)` bound to the weight
+loader. A snapshot cannot be relabelled under another collection policy, and a
+broad graph union
 cannot fill missing facts in a candidate bundle.
 
 Legacy qpile derivation, filename/sibling discovery, and model-name runtime

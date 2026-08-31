@@ -119,7 +119,7 @@ impl ModelCollectionKind {
 /// direct-policy root.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelCollectionPolicyTransferResult {
-    /// Explicit immediately-prior descriptor supplied by the caller.
+    /// Explicit supported retired descriptor supplied by the caller.
     pub source: CollectionHandle,
     /// Current policy descriptor registered even when the source is empty.
     pub collection: ModelCollection,
@@ -464,7 +464,7 @@ fn prepare_policy_transfer(
     })
 }
 
-/// Additively re-seat one exact immediately-prior Mary model collection under
+/// Additively re-seat one exact supported retired Mary model collection under
 /// the current direct READ/WRITE policy rooted at `signing_key`.
 ///
 /// The old descriptor and records remain untouched. Each successor signs the
@@ -1646,6 +1646,36 @@ mod tests {
             .expect("persist descriptor facts")
     }
 
+    fn assert_policy_transfer_fails_before_publication(
+        pile: &mut Pile,
+        path: &Path,
+        signing_key: &SigningKey,
+        source: CollectionHandle,
+        kind: ModelCollectionKind,
+        expected_error: &str,
+    ) {
+        let target = current_collection_in_memory(kind, signing_key.verifying_key()).unwrap();
+        let before = std::fs::metadata(path).unwrap().len();
+        let error = transfer_retired_model_collection(pile, signing_key, source, kind)
+            .expect_err("malformed retired collection must fail");
+        assert!(
+            format!("{error:#}").contains(expected_error),
+            "unexpected migration error: {error:#}"
+        );
+        assert_eq!(
+            std::fs::metadata(path).unwrap().len(),
+            before,
+            "failed transfer appended to the pile"
+        );
+        let snapshot = pile.snapshot().unwrap();
+        let descriptor: Result<Blob<blobencodings::SimpleArchive>, _> =
+            snapshot.get(target.handle());
+        assert!(
+            descriptor.is_err(),
+            "failed transfer published its target descriptor"
+        );
+    }
+
     #[test]
     fn preauthority_descriptor_reconstructs_the_frozen_inkling_identity() {
         let namespace = VerifyingKey::from_bytes(&bytes32(
@@ -1690,6 +1720,126 @@ mod tests {
         assert_eq!(result.appended_commits, 1);
         assert_eq!(result.commits[0].data(), retired.data());
         assert_eq!(result.commits[0].metadata(), retired.metadata());
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn policy_transfer_rejects_an_extended_preauthority_descriptor_before_publication() {
+        let path = TempPilePath::new("preauthority-extended-descriptor");
+        let old = key(0x50);
+        let new = key(0x51);
+        let mut descriptor = preauthority_collection_descriptor(
+            ModelCollectionKind::Graph.name(),
+            old.verifying_key(),
+        );
+        let root = descriptor.root().unwrap();
+        descriptor += entity! {
+            ExclusiveId::force_ref(&root) @ metadata::description: "unexpected extension",
+        };
+        let mut pile = Pile::open(path.path()).unwrap();
+        let source = put_descriptor(&mut pile, &descriptor);
+
+        assert_policy_transfer_fails_before_publication(
+            &mut pile,
+            path.path(),
+            &new,
+            source,
+            ModelCollectionKind::Graph,
+            "source is not the exact pre-authority Mary descriptor",
+        );
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn policy_transfer_rejects_the_wrong_model_kind_before_publication() {
+        let path = TempPilePath::new("preauthority-wrong-kind");
+        let old = key(0x52);
+        let new = key(0x53);
+        let descriptor = preauthority_collection_descriptor(
+            ModelCollectionKind::Graph.name(),
+            old.verifying_key(),
+        );
+        let mut pile = Pile::open(path.path()).unwrap();
+        let source = put_descriptor(&mut pile, &descriptor);
+
+        assert_policy_transfer_fails_before_publication(
+            &mut pile,
+            path.path(),
+            &new,
+            source,
+            ModelCollectionKind::Bundle,
+            "source is not the exact pre-authority Mary descriptor",
+        );
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn policy_transfer_rejects_an_invalid_source_signature_before_publication() {
+        let path = TempPilePath::new("preauthority-invalid-signature");
+        let old = key(0x54);
+        let new = key(0x55);
+        let descriptor = preauthority_collection_descriptor(
+            ModelCollectionKind::Graph.name(),
+            old.verifying_key(),
+        );
+        let mut pile = Pile::open(path.path()).unwrap();
+        let source = put_descriptor(&mut pile, &descriptor);
+        let metadata = pile
+            .put::<blobencodings::SimpleArchive, _>(TribleSet::new())
+            .unwrap();
+        let data_handle = pile
+            .put::<blobencodings::SimpleArchive, _>(entity! { metadata::tag: test_id(0x56) })
+            .unwrap();
+        let data = inlineencodings::Handle::<blobencodings::SimpleArchive>::to_hash(data_handle);
+        let mut bytes = CollectionCommit::sign(&old, source, data, metadata).to_bytes();
+        bytes[5 * 32] ^= 1;
+        pile.insert(CollectionRecord::Commit(CollectionCommit::from_bytes(
+            bytes,
+        )))
+        .unwrap();
+
+        assert_policy_transfer_fails_before_publication(
+            &mut pile,
+            path.path(),
+            &new,
+            source,
+            ModelCollectionKind::Graph,
+            "invalid signature",
+        );
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn policy_transfer_rejects_a_valid_non_root_writer_before_publication() {
+        let path = TempPilePath::new("preauthority-non-root-writer");
+        let old = key(0x57);
+        let delegated = key(0x58);
+        let new = key(0x59);
+        let descriptor = preauthority_collection_descriptor(
+            ModelCollectionKind::Graph.name(),
+            old.verifying_key(),
+        );
+        let mut pile = Pile::open(path.path()).unwrap();
+        let source = put_descriptor(&mut pile, &descriptor);
+        let metadata = pile
+            .put::<blobencodings::SimpleArchive, _>(TribleSet::new())
+            .unwrap();
+        let data_handle = pile
+            .put::<blobencodings::SimpleArchive, _>(entity! { metadata::tag: test_id(0x5A) })
+            .unwrap();
+        let data = inlineencodings::Handle::<blobencodings::SimpleArchive>::to_hash(data_handle);
+        let commit = CollectionCommit::sign(&delegated, source, data, metadata);
+        commit.verify_strict().unwrap();
+        pile.insert(CollectionRecord::Commit(commit)).unwrap();
+
+        assert_policy_transfer_fails_before_publication(
+            &mut pile,
+            path.path(),
+            &new,
+            source,
+            ModelCollectionKind::Graph,
+            "authored by a non-root writer",
+        );
         pile.close().unwrap();
     }
 
