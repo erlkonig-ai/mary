@@ -868,12 +868,6 @@ mod tests {
         fragment
     }
 
-    /// The one team these fixtures publish under; a snapshot has to name the
-    /// same team the commits were published to.
-    fn test_team() -> ed25519_dalek::VerifyingKey {
-        SigningKey::from_bytes(&[0x51; 32]).verifying_key()
-    }
-
     fn publish(path: &Path, fragments: impl IntoIterator<Item = Fragment>) {
         let mut pile = Pile::open(path).expect("open synthetic Qwen3-TTS pile");
         for fragment in fragments {

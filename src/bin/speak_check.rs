@@ -135,7 +135,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(op) = &out {
         let line = text.unwrap_or_else(|| "The quick brown fox jumps over the lazy dog.".into());
         // `synthesize_to_wav` takes a frozen cohort, not a path — the same
-        // atomic sole-team snapshot the `voice` faculty uses, so the gate
+        // atomic policy-admitted snapshot the `voice` faculty uses, so the gate
         // renders through the production selection rather than a drifting one.
         let variant = mary::speak::Qwen3TtsVariant::from_env();
         let snapshot = mary::model_collection::load_model_collection_local_latest(Path::new(pile))

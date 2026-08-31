@@ -1978,7 +1978,7 @@ mod tests {
         assert_eq!(
             std::fs::metadata(fixture.pile.path()).unwrap().len(),
             len_after_first,
-            "same-team exact `(root, H)` retry appended bytes"
+            "same-policy exact `(root, H)` retry appended bytes"
         );
         pile.close().unwrap();
 
@@ -2166,7 +2166,7 @@ mod tests {
         let mut pile = Pile::open(fixture.pile.path()).unwrap();
         let existing =
             publish_model_bundle_fragment(&mut pile, &migration_key, conflicting_root, conflicting)
-                .expect("publish conflicting same-team PersonaPlex bundle");
+                .expect("publish conflicting same-policy PersonaPlex bundle");
         let before = std::fs::metadata(fixture.pile.path()).unwrap().len();
         let error = adopt_legacy_personaplex_bundle_with_policy(
             &mut pile,

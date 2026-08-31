@@ -120,14 +120,8 @@ fn publish_embedding_candidate_with_contract_impl(
         .stage_for(pile, collection, signing_key)
         .map_err(|error| anyhow::anyhow!("stage embedding commit dependencies: {error}"))?;
 
-    // The reason `local_model_cover`'s four-trait bound could collapse to one
-    // concrete `&PileSnapshot`: `OfferCapture<&mut Pile>` freezes the SAME
-    // `PileSnapshot` the bare pile does (`SnapshotSource for OfferCapture` sets
-    // `Snapshot = S::Snapshot`). The old signature had to be generic over the
-    // mutable staging wrapper because each read capability came off the wrapper
-    // separately; the observation does not care what wrapped the writer.
-    // Taken here, after staging, so the candidate's dependencies are resident
-    // in the prefix that validates them.
+    // Freeze one coherent observation after staging, so the candidate's
+    // dependencies are resident in the exact prefix used to validate them.
     let store = staged
         .store_mut()
         .snapshot()

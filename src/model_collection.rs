@@ -3,7 +3,7 @@
 //! A model collection is its typed descriptor handle. New collections use
 //! independent direct READ and WRITE policies rooted at their founding signer;
 //! an existing descriptor keeps its own policy. Callers never reconstruct a
-//! collection from a separate team coordinate. Reads discover the sole
+//! collection from a separate group coordinate. Reads discover the sole
 //! matching descriptor in one frozen pile snapshot, admit its exact cover, and
 //! materialize that same observation. Writes either join that descriptor after
 //! checking its WRITE policy or found the deterministic direct-policy default.
