@@ -4427,6 +4427,51 @@ fn main() -> Result<()> {
                 )
             }
         };
+        // `INK_INPUT_NOISE=<sigma>` with `INK_NOISE_SEED=<u64>`: add zero-mean
+        // Gaussian noise to the embedded hidden state BEFORE layer 0. N runs with
+        // different seeds are then N LANES of one input-perturbation ensemble, and
+        // the spread of their outputs is the network's own sensitivity map. The
+        // point of perturbing HERE rather than per-layer is that the lanes diverge
+        // through the WHOLE stack, so the spread reflects the model rather than the
+        // noise injected -- per-activation dither is homogeneous by construction and
+        // measured rank corr 0.02 against error, where input noise recovers the
+        // Jacobian. Sigma is RELATIVE to the RMS of the embedded state, so it is
+        // scale-free. Costs nothing when unset.
+        let x_in = match std::env::var("INK_INPUT_NOISE")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+        {
+            Some(sigma) if sigma > 0.0 => {
+                let seed: u64 = std::env::var("INK_NOISE_SEED")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let mut st = seed ^ 0x9E37_79B9_7F4A_7C15;
+                if st == 0 {
+                    st = 1;
+                }
+                let n_el = x_in.len().max(1);
+                let rms = (x_in.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>()
+                    / n_el as f64)
+                    .sqrt() as f32;
+                fn unif(st: &mut u64) -> f32 {
+                    *st ^= *st << 13;
+                    *st ^= *st >> 7;
+                    *st ^= *st << 17;
+                    ((*st >> 11) as f64 / 9_007_199_254_740_992.0) as f32
+                }
+                let mut out = Vec::with_capacity(x_in.len());
+                for v in &x_in {
+                    let a = unif(&mut st).max(1e-7);
+                    let b = unif(&mut st);
+                    let g = (-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos();
+                    out.push(v + sigma * rms * g);
+                }
+                println!("  input noise        : sigma {sigma} x rms {rms:.5}, seed {seed}");
+                out
+            }
+            _ => x_in,
+        };
         fatal::note_tokens(n);
         // The tree descriptor for THIS pass, or `None` on a pass that is a plain
         // chain. Both conditions matter: `pass_tree_ready` says the previous pass
@@ -5369,6 +5414,67 @@ fn main() -> Result<()> {
                             });
                         }
                         routing = rs;
+                        // `INK_ROUTE_DUMP=<path>`: append one line per (layer, token)
+                        // giving the selected expert ids. It exists to measure how fast
+                        // the ENGAGED SUB-NETWORK churns between adjacent tokens, which
+                        // is what decides whether a per-step sensitivity signal can be
+                        // ACCUMULATED across steps or is averaging unrelated maps. Needs
+                        // `need_routing`, so pair it with `INK_DEVPLAN_CHECK=1`.
+                        if let Ok(dump_p) = std::env::var("INK_ROUTE_DUMP") {
+                            use std::io::Write;
+                            // THE MARGIN, and why it is the right sensitivity measure
+                            // here. This function is piecewise THREE times over -- a
+                            // top-k switch, an FP4 staircase, and SiLU -- and through a
+                            // quantiser the derivative is zero almost everywhere. So the
+                            // honest local sensitivity is DISTANCE TO THE NEAREST
+                            // BOUNDARY, not a gradient. That distance is exact and cheap
+                            // here: the gap between the k-th and (k+1)-th selection
+                            // score, i.e. how far this token sits from routing somewhere
+                            // else. One forward pass, no sampling, and no n>50 problem --
+                            // it is read, not estimated.
+                            // Selection score is sigmoid(logit)+bias; see
+                            // `block::route_from_logits`, which this must agree with.
+                            let margins: Vec<f32> = {
+                                let hl = drop_pad_cols(
+                                    down(tensor_of(
+                                        fp4_client.clone(),
+                                        dev.clone(),
+                                        lg_h.clone(),
+                                        n,
+                                        cols,
+                                    )),
+                                    n,
+                                    cols,
+                                    rows,
+                                );
+                                (0..n)
+                                    .map(|ti| {
+                                        let row = &hl[ti * rows..(ti + 1) * rows];
+                                        let mut sc: Vec<f32> = (0..t.n_routed_experts)
+                                            .map(|e| 1.0f32 / (1.0 + (-row[e]).exp()) + r.bias[e])
+                                            .collect();
+                                        sc.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                                        sc[k - 1] - sc[k]
+                                    })
+                                    .collect()
+                            };
+                            if let Ok(mut df) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&dump_p)
+                            {
+                                for (ti, rr) in routing.iter().enumerate() {
+                                    let ids: Vec<String> =
+                                        rr.experts.iter().map(|e| e.to_string()).collect();
+                                    let _ = writeln!(
+                                        df,
+                                        "{layer} {ti} {} {:.6}",
+                                        ids.join(","),
+                                        margins[ti]
+                                    );
+                                }
+                            }
+                        }
                         // `INK_ROUTE_DBG=1`: the SAME logits through the host rule, and
                         // a count of where the two lanes disagree. It reads the logits
                         // back and routes twice, so it is slower than either lane and
