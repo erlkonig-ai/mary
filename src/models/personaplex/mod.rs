@@ -91,7 +91,7 @@ pub struct PersonaPlexBundle<R> {
 /// Bundle-bound authority and loader for deterministic runtime transforms.
 ///
 /// Its fields are private so a caller cannot label weights from one bundle
-/// with another bundle's `(team, root, H, τ)` identity.
+/// with another bundle's `(collection, root, H, τ)` identity.
 pub struct PersonaPlexRuntimeSource {
     authority: PersonaPlexAuthority,
     loader: WeightLoader,

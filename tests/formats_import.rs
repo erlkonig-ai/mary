@@ -135,9 +135,7 @@ fn native_import_is_exact_selectable_and_byte_idempotent() {
     .unwrap();
     assert_eq!(expected.root(), Some(first.0));
 
-    let team = signing_key.verifying_key();
-    let snapshot =
-        mary::model_collection::load_model_collection_local_latest(&pile_path, team).unwrap();
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile_path).unwrap();
     assert_eq!(snapshot.cover().len(), 1);
     assert!(
         snapshot
@@ -211,11 +209,8 @@ fn duplicate_tensor_names_across_files_publish_no_collection_commit() {
         "{error:#}"
     );
 
-    let snapshot = mary::model_collection::snapshot_model_collection_local_latest(
-        &mut pile,
-        SigningKey::from_bytes(&[0x53; 32]).verifying_key(),
-    )
-    .expect("failed import must leave the native collection readable");
+    let snapshot = mary::model_collection::snapshot_model_collection_local_latest(&mut pile)
+        .expect("failed import must leave the native collection readable");
     assert!(snapshot.cover().is_empty());
     pile.close().unwrap();
 }
@@ -275,11 +270,7 @@ fn pytorch_bin_import_roundtrip() {
     pile.close().unwrap();
     eprintln!("imported root {root:X}");
 
-    let snapshot = mary::model_collection::load_model_collection_local_latest(
-        &tmp,
-        signing_key.verifying_key(),
-    )
-    .unwrap();
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&tmp).unwrap();
     let km = mary::selection::load_keymap_from_graph(
         snapshot.facts(),
         snapshot.store(),
