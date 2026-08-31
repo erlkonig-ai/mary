@@ -23,13 +23,13 @@ use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace::core::collection::descriptor;
 use triblespace::core::collection::simplearchive_union::PreparedCollectionCommit;
 use triblespace::core::collection::{
-    AdmissionPolicy, Collection, CollectionCommit, CollectionPolicy, CollectionRecord,
-    CollectionStoreExt, FactCover, TryFromCover,
+    AdmissionPolicy, Collection, CollectionCommit, CollectionPolicy, CollectionRead,
+    CollectionRecord, CollectionStoreExt, FactCover, TryFromCover,
 };
 use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileSnapshot;
-use triblespace::core::repo::{BlobStoreGet, CollectionRead, SnapshotSource};
+use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::core::trible::TribleSet;
 use triblespace::prelude::inlineencodings::{F64, U256BE};
 use triblespace::prelude::*;

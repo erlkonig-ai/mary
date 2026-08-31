@@ -22,12 +22,6 @@ use crate::ingest::LeafDtype;
 use crate::ingest::load_keymap;
 #[cfg(feature = "import")]
 use crate::nn::weight_loader::read_safetensors_file;
-#[cfg(any(
-    feature = "import",
-    feature = "qwen3tts",
-    feature = "tokenizer",
-    feature = "gemma"
-))]
 use anyhow::Context;
 #[cfg(any(feature = "import", feature = "qwen3tts", feature = "tokenizer"))]
 use ed25519_dalek::SigningKey;
