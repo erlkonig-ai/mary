@@ -4,7 +4,7 @@
 //! format. `Ready` and `TurnEnd` are still serializable values, but nothing
 //! transmits them any more — the model is in this process — and the durable
 //! observation surface was never the wire in the first place: it is typed
-//! Trible facts emitted through [`drive::mind::Mind::take_exhaust`]. Each entity is intrinsic: equal READY
+//! Trible facts emitted through `drive::mind::Mind::take_exhaust`. Each entity is intrinsic: equal READY
 //! announcements and equal turn measurements collapse naturally, while Drive
 //! links their exported roots to the runtime session and the turn that caused
 //! them.

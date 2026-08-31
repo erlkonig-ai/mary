@@ -60,28 +60,32 @@ serde_json = "1.0"
 # and the loaders report errors via anyhow.
 anyhow = "1"
 
-# THE COGNITION LOOP, and it is UNCONDITIONAL as of 2026-08-30. It used to be
-# optional behind `drive-mind`, because the model ran in its own process and the
-# GPU-free client half had to keep building on a laptop in seconds. The model
-# runs in THIS process now — one binary holding the Drive loop and the weights,
-# deployed unchanged to both Sparks — so there is no build that wants
-# `models::inkling::resident` without `drive`, and a flag whose only effect is
-# to break that module is not worth its own existence (JP, 2026-08-30: "we don't
-# care about the mac anymore for drive... that flag needs to die"). The
-# dependency still runs ONE WAY and must keep doing so: drive has no `mary`
-# dependency. The adapter that makes an Inkling Session into a
-# `drive::mind::Mind` is a mary concern — mary knows what a turn of this model
-# is; drive knows only that a mind is a `&mut self` function from world to turn.
+# NO COGNITION LOOP HERE, as of 2026-08-31. mary is the models and the ML; the
+# harness lives in drive. This is the direction JP fixed when the crate cycle
+# surfaced ("mary should just be the models/ML, so all the harness code should
+# move to drive"), and it is not a style preference — the one-binary collapse
+# made mary link drive, drive already links faculties, and faculties links mary,
+# so cargo refused to resolve the package graph at all. Building mary did NOT
+# catch it: the cycle only bites when faculties is the root.
 #
-# `../drive` must EXIST for any mary build, which was already true when this was
-# optional (cargo resolves optional path deps whether or not they are
-# activated). It is the same arrangement `../triblespace-rs` and `../cubecl-graph`
-# already impose: the sibling checkouts are the workspace.
+# What moved: `InklingMind` and its `drive::mind::Mind` impl (resident.rs from
+# its doc comment at former line 1435 onward) and the `inkling_drive` binary.
+# What stayed, because it is the MODEL talking about itself rather than the
+# harness talking about turns: the `Model` trait, `Ready`, `InklingContext`,
+# the codec, the native output parser — and `telemetry`, whose fragments are
+# defined over those types (JP: "telemetry can stay in mary, that's just a
+# shared dependency right?" — right; drive merely links the exported roots to
+# the turn that caused them).
+#
+# The cut was measurable rather than aesthetic: the half that stayed had FIVE
+# `drive::` occurrences and every one was a doc comment, while the half that
+# left had 82 code references. The boundary was already in the code; it was
+# only drawn in the wrong place in the crate layout. The arrows now run
+# drive -> mary, drive -> faculties, faculties -> mary, and nothing cycles.
 #
 # `framed-stream` left with the wire it framed. Nothing in mary speaks a framed
 # stream any more: the mind and the model are one process, and the two tensor
 # ranks talk over the rendezvous socket the NCCL Group already holds.
-drive = { version = "0.1.0", path = "../drive" }
 
 # Flux.2 port (mary::models::flux) deps mary's other models don't need.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
@@ -1123,23 +1127,6 @@ required-features = ["inkling-cuda"]
 name = "tp_allreduce_probe"
 required-features = ["inkling-cuda"]
 
-# THE ONE BINARY. The Drive loop AND the model, in one process, deployed
-# unchanged to both DGX Sparks; the two instances discover which is which by
-# comparing their own addresses to the rendezvous address, and the only other
-# process in the deployment is the playground sandbox.
-#
-# It replaces four: `inkling_serve` (the model in its own process),
-# `inkling_serve_pair` (the two-rank fan-out proxy, which launched the second
-# rank over ssh), `inkling_serve_gate` (drive's loop against a real Session,
-# which `--turns <n>` now is), and the GPU-free `inkling_drive` that spawned
-# them. Measured motivation, per generated token, 42 layers, TP2: ~26 ms of a
-# p50 82 ms token was the protocol between the mind and the model.
-[[bin]]
-name = "inkling_drive"
-required-features = ["inkling-resident"]
-
-# Parity gate for the grid-axis swap in fp4gemm/w4a16gemm: a pure scheduling
-# change, so every cube must land byte-identical output. Owns CUDA directly.
 [[bin]]
 name = "gemm_grid_parity"
 required-features = ["inkling-cuda"]
