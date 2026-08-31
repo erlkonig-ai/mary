@@ -281,11 +281,8 @@ mod tests {
             "unexpected conflict diagnostic: {diagnostic}"
         );
 
-        let snapshot = mary::model_collection::snapshot_model_collection_local_latest(
-            &mut pile,
-            key.verifying_key(),
-        )
-        .unwrap();
+        let snapshot =
+            mary::model_collection::snapshot_model_collection_local_latest(&mut pile).unwrap();
         assert_eq!(snapshot.cover().len(), 1);
         assert!(
             snapshot
@@ -337,11 +334,8 @@ mod tests {
             &contract,
         )
         .unwrap_err();
-        let snapshot = mary::model_collection::snapshot_model_collection_local_latest(
-            &mut pile,
-            key.verifying_key(),
-        )
-        .unwrap();
+        let snapshot =
+            mary::model_collection::snapshot_model_collection_local_latest(&mut pile).unwrap();
         assert!(snapshot.cover().is_empty());
         pile.close().unwrap();
     }
@@ -386,11 +380,8 @@ mod tests {
         assert!(format!("{spurious:#}").contains("rejects a tokenizer"));
         assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), initial_len);
 
-        let snapshot = mary::model_collection::snapshot_model_collection_local_latest(
-            &mut pile,
-            key.verifying_key(),
-        )
-        .unwrap();
+        let snapshot =
+            mary::model_collection::snapshot_model_collection_local_latest(&mut pile).unwrap();
         assert!(snapshot.cover().is_empty());
         pile.close().unwrap();
     }
@@ -436,11 +427,8 @@ mod tests {
         .unwrap_err();
         assert!(format!("{error:#}").contains("has shape [4], expected [2, 2]"));
 
-        let snapshot = mary::model_collection::snapshot_model_collection_local_latest(
-            &mut pile,
-            key.verifying_key(),
-        )
-        .unwrap();
+        let snapshot =
+            mary::model_collection::snapshot_model_collection_local_latest(&mut pile).unwrap();
         assert!(snapshot.cover().is_empty());
         pile.close().unwrap();
     }
