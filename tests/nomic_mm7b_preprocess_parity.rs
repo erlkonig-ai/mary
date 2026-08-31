@@ -136,8 +136,8 @@ fn embed_image_bytes_parity() {
     };
 
     let device = burn_ndarray::NdArrayDevice::default();
-    let (_, snapshot) =
-        mary::model_collection::load_sole_model_collection_local_latest(Path::new(&pile_path))
+    let snapshot =
+        mary::model_collection::load_model_collection_local_latest(Path::new(&pile_path))
             .expect("load native model collection snapshot");
     let map = mary::persist::load_nomic_mm7b_keymap_from_snapshot(snapshot)
         .expect("select and materialize the Nomic text + vision components");

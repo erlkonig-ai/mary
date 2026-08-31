@@ -169,7 +169,7 @@ fn text_retrieval_bakeoff() {
         pile_path.display()
     );
     let t0 = Instant::now();
-    let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(&pile_path)
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile_path)
         .expect("load native model collection snapshot");
     let nomic7b =
         mary::persist::load_nomic_mm7b_aliased_from_snapshot(snapshot, &tok_path, device.clone())

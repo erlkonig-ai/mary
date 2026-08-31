@@ -103,7 +103,7 @@ fn aliased_metal_embed_parity() {
 
     // --- cold aliased load (timed): mmap f16 -> Metal, zero copy ---
     let t0 = Instant::now();
-    let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(&pile_path)
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile_path)
         .expect("load native model collection snapshot");
     let embedder =
         mary::persist::load_nomic_mm7b_aliased_from_snapshot(snapshot, &tok_path, device.clone())
