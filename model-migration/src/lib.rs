@@ -19,16 +19,25 @@
 //! old piles. Keeping the bridge in a standalone package prevents those
 //! migration-only concepts from becoming runtime dependencies again.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, bail, Context};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
-use triblespace::core::collection::{CollectionCommit, CollectionData};
-use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::collection::records::{
+    collection_name, collection_representation, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
+};
+use triblespace::core::collection::{
+    AdmissionPolicy, CollectionCommit, CollectionData, CollectionPolicy, CollectionRead,
+    CollectionRecord, CollectionStore, CollectionStoreExt,
+};
+use triblespace::core::inline::encodings::ed25519::ED25519PublicKey;
+use triblespace::core::metadata::{self, MetaDescribe};
+use triblespace::core::repo::memoryrepo::MemoryRepo;
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{
-    self, content, parent, BlobStore, BlobStoreGet, CommitHandle, PinSnapshot, PinSnapshotSource,
+    self, content, parent, BlobStoreGet, CommitHandle, PinSnapshot, PinSnapshotSource,
+    SnapshotSource,
 };
 use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::{Handle, ShortString};
@@ -36,9 +45,9 @@ use triblespace::prelude::*;
 
 use mary::format::attrs;
 use mary::model_collection::{
-    model_bundle_team_or_own, model_bundle_teams, model_graph_team_or_own,
+    model_bundle_collection_or_create, model_graph_collection_or_create,
     prepare_model_bundle_fragment, project_legacy_model_attributes, publish_model_fragment,
-    snapshot_model_bundle_collection_local_latest_with_admission,
+    snapshot_model_bundle_collection_exact, ModelCollection,
 };
 use mary::models::personaplex::{PersonaPlexWeights, SOURCE as PERSONAPLEX_SOURCE};
 use mary::selection::{select_model_root, select_tokenizer_root, ModelSelector, TokenizerSelector};
@@ -48,6 +57,68 @@ const PERSONAPLEX_MIMI_FILE: &str = "tokenizer-e351c8d8-checkpoint125.safetensor
 const PERSONAPLEX_LM_MEMBERS: usize = 475;
 const PERSONAPLEX_MIMI_MEMBERS: usize = 318;
 const PERSONAPLEX_MEMBERS: usize = 793;
+
+mod retired_collection {
+    use super::*;
+
+    attributes! {
+        /// Mandatory authority of the descriptor epoch immediately preceding
+        /// independent READ and WRITE policies.
+        ///
+        /// This is the original safe anchored declaration: its Ed25519
+        /// encoding has always participated in the attribute identity.
+        "7C31D328E9C369CCB6049D05CC8E8C77" as pub collection_authority:
+            ED25519PublicKey;
+    }
+}
+
+/// Which one of Mary's two root model collections an additive policy transfer
+/// targets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelCollectionKind {
+    Graph,
+    Bundle,
+}
+
+impl ModelCollectionKind {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Graph => mary::model_collection::mary_model_graph_name(),
+            Self::Bundle => mary::model_collection::mary_model_bundle_name(),
+        }
+    }
+}
+
+/// Exact outcome of re-signing one retired collection's leaves under a current
+/// direct-policy root.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelCollectionPolicyTransferResult {
+    /// Explicit immediately-prior descriptor supplied by the caller.
+    pub source: CollectionHandle,
+    /// Current policy descriptor registered even when the source is empty.
+    pub collection: ModelCollection,
+    /// Authority recovered from, and covered by, the exact source descriptor.
+    pub source_authority: VerifyingKey,
+    /// Every deterministic successor COMMIT, including ones already present.
+    pub commits: Vec<CollectionCommit>,
+    /// Successor COMMITs newly appended by this invocation.
+    pub appended_commits: usize,
+    /// Old MERGE records deliberately left as rebuildable cache exhaust.
+    pub skipped_merges: usize,
+    /// Old DERIVE records deliberately left as rebuildable cache exhaust.
+    pub skipped_derives: usize,
+}
+
+#[derive(Clone)]
+struct PreparedPolicyTransfer {
+    source: CollectionHandle,
+    source_authority: VerifyingKey,
+    collection: ModelCollection,
+    commits: Vec<CollectionCommit>,
+    missing: Vec<CollectionCommit>,
+    skipped_merges: usize,
+    skipped_derives: usize,
+}
 
 /// Data needed to turn one legacy model graph into a selectable native graph.
 ///
@@ -79,8 +150,8 @@ pub struct LegacyModelMigration<'a> {
 pub struct LegacyModelMigrationResult {
     /// Signed native collection claim published by this migration.
     pub commit: CollectionCommit,
-    /// Team whose native model-graph collection received the commit.
-    pub team: VerifyingKey,
+    /// Exact policy collection that received the commit.
+    pub collection: ModelCollection,
     /// Legacy branch id whose head was frozen.
     pub legacy_branch: Id,
     /// Exact legacy commit head used for the checkout.
@@ -111,7 +182,7 @@ pub struct FrozenLegacyMain {
     /// Union of every content archive reachable from `head`.
     pub facts: TribleSet,
     /// Immutable blob view resolving facts' attachment handles.
-    pub reader: PileReader,
+    pub reader: PileSnapshot,
 }
 
 /// Result of adopting the exact legacy PersonaPlex weight commit as one bundle.
@@ -121,8 +192,8 @@ pub struct PersonaPlexLegacyAdoptionResult {
     pub commit: CollectionCommit,
     /// Whether this invocation finalized a new COMMIT.
     pub published: bool,
-    /// Team whose `mary-model-bundles` collection contains the token.
-    pub team: VerifyingKey,
+    /// Exact policy collection that contains the token.
+    pub collection: ModelCollection,
     /// Exact legacy commit-DAG node selected by the caller.
     pub legacy_commit: CommitHandle,
     /// Existing legacy LM model root selected by its exact file name.
@@ -154,8 +225,232 @@ const PERSONAPLEX_MEMBER_POLICY: PersonaPlexMemberPolicy = PersonaPlexMemberPoli
     total: PERSONAPLEX_MEMBERS,
 };
 
+fn direct_policy(root: VerifyingKey) -> CollectionPolicy {
+    CollectionPolicy::new(AdmissionPolicy::direct(root), AdmissionPolicy::direct(root))
+}
+
+fn retired_collection_descriptor(name: &str, authority: VerifyingKey) -> Fragment {
+    entity! {
+        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+        collection_name: name.to_owned(),
+        retired_collection::collection_authority: authority,
+        collection_representation*: <blobencodings::SimpleArchive as MetaDescribe>::describe(),
+    }
+}
+
+fn collection_descriptor_handle(descriptor: &Fragment) -> CollectionHandle {
+    let blob: Blob<blobencodings::SimpleArchive> = descriptor.facts().clone().to_blob();
+    blob.get_handle()
+}
+
+fn decode_exact_retired_collection(
+    snapshot: &PileSnapshot,
+    source: CollectionHandle,
+    kind: ModelCollectionKind,
+) -> anyhow::Result<VerifyingKey> {
+    let blob: Blob<blobencodings::SimpleArchive> = snapshot
+        .get(source)
+        .map_err(|error| anyhow!("read retired collection descriptor {source:?}: {error}"))?;
+    let facts = TribleSet::try_from_blob(blob)
+        .context("decode retired collection descriptor SimpleArchive")?;
+    let descriptor = triblespace::core::collection::descriptor::entity(&facts)
+        .context("find retired collection descriptor entity")?;
+    let name_handle = triblespace::core::collection::descriptor::name(&facts)
+        .context("decode retired collection name")?
+        .ok_or_else(|| anyhow!("retired collection descriptor has no name"))?;
+    let name: anybytes::View<str> = snapshot
+        .get::<anybytes::View<str>, UTF8String>(name_handle)
+        .map_err(|error| anyhow!("read retired collection name: {error}"))?;
+    anyhow::ensure!(
+        &*name == kind.name(),
+        "retired collection is named {:?}, expected {:?}",
+        &*name,
+        kind.name(),
+    );
+    anyhow::ensure!(
+        triblespace::core::collection::descriptor::representation(&facts)
+            .context("decode retired collection representation")?
+            == <blobencodings::SimpleArchive as MetaDescribe>::id(),
+        "retired collection does not carry SimpleArchive elements",
+    );
+
+    let authorities = facts
+        .iter()
+        .filter(|fact| {
+            fact.e() == &descriptor && fact.a() == &retired_collection::collection_authority.id()
+        })
+        .map(|fact| *fact.v::<ED25519PublicKey>())
+        .collect::<Vec<_>>();
+    let authority = match authorities.as_slice() {
+        [authority] => VerifyingKey::from_bytes(&authority.raw)
+            .map_err(|error| anyhow!("retired collection authority is invalid: {error}"))?,
+        [] => bail!("retired collection descriptor has no collection_authority"),
+        _ => bail!("retired collection descriptor repeats collection_authority"),
+    };
+
+    // Reconstructing the complete predecessor descriptor is the strict shape
+    // check. Any extra field, old reach/mapping row, embedded entity, or
+    // different representation changes this content address and is rejected.
+    let expected = collection_descriptor_handle(&retired_collection_descriptor(&name, authority));
+    anyhow::ensure!(
+        expected == source,
+        "source is not the exact immediately-prior Mary descriptor for {:?}",
+        kind.name(),
+    );
+    Ok(authority)
+}
+
+fn current_collection_in_memory(
+    kind: ModelCollectionKind,
+    target_root: VerifyingKey,
+) -> anyhow::Result<ModelCollection> {
+    let mut scratch = MemoryRepo::default();
+    scratch
+        .collection(kind.name(), direct_policy(target_root))
+        .map_err(|error| anyhow!("construct current {:?} descriptor: {error}", kind.name()))
+}
+
+fn prepare_policy_transfer(
+    snapshot: &PileSnapshot,
+    signing_key: &SigningKey,
+    source: CollectionHandle,
+    kind: ModelCollectionKind,
+) -> anyhow::Result<PreparedPolicyTransfer> {
+    let source_authority = decode_exact_retired_collection(snapshot, source, kind)?;
+    let collection = current_collection_in_memory(kind, signing_key.verifying_key())?;
+    let mut target_records = BTreeMap::new();
+    let mut commits = BTreeMap::new();
+    let mut skipped_merges = 0usize;
+    let mut skipped_derives = 0usize;
+
+    for record in snapshot
+        .records()
+        .context("enumerate collection records for model policy transfer")?
+    {
+        let record = record.context("read collection record for model policy transfer")?;
+        let record_collection = match record {
+            CollectionRecord::Commit(commit) => commit.collection(),
+            CollectionRecord::Merge(merge) => merge.collection(),
+            CollectionRecord::Derive(derive) => derive.collection(),
+        };
+        if record_collection == collection.handle() {
+            target_records.insert(record.id(), record);
+        }
+        if record_collection != source {
+            continue;
+        }
+        match record {
+            CollectionRecord::Commit(commit) => {
+                commit.verify_strict().map_err(|error| {
+                    anyhow!(
+                        "retired model COMMIT {} has an invalid signature: {error}",
+                        commit.id()
+                    )
+                })?;
+                anyhow::ensure!(
+                    commit.public_key().raw == source_authority.to_bytes(),
+                    "retired model COMMIT {} was authored by a non-root writer; refusing to silently adopt delegated data",
+                    commit.id(),
+                );
+                let successor = CollectionCommit::sign(
+                    signing_key,
+                    collection.handle(),
+                    commit.data(),
+                    commit.metadata(),
+                );
+                commits.insert(successor.id(), successor);
+            }
+            CollectionRecord::Merge(_) => skipped_merges += 1,
+            CollectionRecord::Derive(_) => skipped_derives += 1,
+        }
+    }
+
+    let mut missing = Vec::new();
+    for commit in commits.values() {
+        match target_records.get(&commit.id()) {
+            Some(CollectionRecord::Commit(existing)) if existing == commit => {}
+            Some(_) => bail!(
+                "collection-record id {} collides during model policy transfer",
+                commit.id(),
+            ),
+            None => missing.push(*commit),
+        }
+    }
+    Ok(PreparedPolicyTransfer {
+        source,
+        source_authority,
+        collection,
+        commits: commits.into_values().collect(),
+        missing,
+        skipped_merges,
+        skipped_derives,
+    })
+}
+
+/// Additively re-seat one exact immediately-prior Mary model collection under
+/// the current direct READ/WRITE policy rooted at `signing_key`.
+///
+/// The old descriptor and records remain untouched. Each successor signs the
+/// old COMMIT's exact data and metadata handles; no member blob is read or
+/// copied. A source with no COMMITs still registers its current descriptor.
+/// MERGE and DERIVE records are deliberately left as rebuildable cache
+/// exhaust. Replay is idempotent because successor record ids are intrinsic.
+pub fn transfer_retired_model_collection(
+    pile: &mut Pile,
+    signing_key: &SigningKey,
+    source: CollectionHandle,
+    kind: ModelCollectionKind,
+) -> anyhow::Result<ModelCollectionPolicyTransferResult> {
+    pile.refresh()
+        .context("refresh before model collection policy transfer")?;
+    let snapshot = pile
+        .snapshot()
+        .context("freeze retired model collection transfer source")?;
+    let prepared = prepare_policy_transfer(&snapshot, signing_key, source, kind)?;
+    drop(snapshot);
+
+    let collection = pile
+        .collection(kind.name(), direct_policy(signing_key.verifying_key()))
+        .map_err(|error| anyhow!("register current {:?} descriptor: {error}", kind.name()))?;
+    anyhow::ensure!(
+        collection == prepared.collection,
+        "current model descriptor changed identity between preflight and publication",
+    );
+    let appended_commits = prepared.missing.len();
+    for commit in &prepared.missing {
+        pile.insert(CollectionRecord::Commit(*commit))
+            .map_err(|error| anyhow!("append re-seated model COMMIT: {error}"))?;
+    }
+
+    // A fresh plan proves both that every deterministic successor is visible
+    // and that no predecessor writer appended an untransferred suffix between
+    // census and publication. Such a race is harmless: replay carries it.
+    let snapshot = pile
+        .snapshot()
+        .context("freeze model policy transfer verification snapshot")?;
+    let after = prepare_policy_transfer(&snapshot, signing_key, source, kind)?;
+    anyhow::ensure!(
+        after.missing.is_empty(),
+        "model policy transfer observed {} new or missing successor COMMIT(s); replay after predecessor writers are quiescent",
+        after.missing.len(),
+    );
+    let _: Blob<blobencodings::SimpleArchive> = snapshot
+        .get(collection.handle())
+        .context("read registered current model descriptor after transfer")?;
+
+    Ok(ModelCollectionPolicyTransferResult {
+        source: prepared.source,
+        collection,
+        source_authority: prepared.source_authority,
+        commits: after.commits,
+        appended_commits,
+        skipped_merges: after.skipped_merges,
+        skipped_derives: after.skipped_derives,
+    })
+}
+
 fn freeze_legacy_main_from_snapshot(
-    reader: PileReader,
+    reader: PileSnapshot,
     pins: &PinSnapshot,
 ) -> anyhow::Result<FrozenLegacyMain> {
     let wanted_name = "main".to_owned().to_blob().get_handle();
@@ -230,8 +525,8 @@ pub fn freeze_legacy_model_main(pile: &mut Pile) -> anyhow::Result<FrozenLegacyM
         .snapshot_pin_heads()
         .context("snapshot active legacy branch pins")?;
     let reader = pile
-        .reader()
-        .context("open blob reader for frozen legacy model snapshot")?;
+        .snapshot()
+        .context("freeze legacy model pile snapshot")?;
     freeze_legacy_main_from_snapshot(reader, &pins)
 }
 
@@ -293,13 +588,13 @@ fn checkout_legacy_commit_ancestors(
 fn freeze_legacy_commit(
     pile: &mut Pile,
     commit: CommitHandle,
-) -> anyhow::Result<(TribleSet, <Pile as BlobStore>::Reader)> {
+) -> anyhow::Result<(TribleSet, PileSnapshot)> {
     pile.refresh()
         .context("refresh legacy model pile before exact commit checkout")?;
 
     let reader = pile
-        .reader()
-        .context("open blob reader for exact legacy model snapshot")?;
+        .snapshot()
+        .context("freeze exact legacy model snapshot")?;
     let facts = checkout_legacy_commit_ancestors(&reader, commit)
         .with_context(|| format!("checkout exact legacy commit {commit:?}"))?;
     Ok((facts, reader))
@@ -445,67 +740,55 @@ fn adopt_legacy_personaplex_bundle_with_policy(
     let candidate = prepare_legacy_personaplex_candidate(legacy, &reader, policy)?;
     drop(reader);
 
-    let team = model_bundle_team_or_own(pile, signing_key)
-        .context("select the existing PersonaPlex bundle team or found it under this signer")?;
-    let prepared = prepare_model_bundle_fragment(team, candidate.model_root, candidate.fragment)
+    let collection = model_bundle_collection_or_create(pile, signing_key)
+        .context("select or create the PersonaPlex bundle collection")?;
+    let prepared = prepare_model_bundle_fragment(candidate.model_root, candidate.fragment)
         .context("prepare canonical PersonaPlex bundle token")?;
     let model_archive_data = prepared.model_archive_data();
 
-    // Freeze exactly the current same-team admitted cover before staging any
+    // Freeze exactly the current collection's admitted cover before staging any
     // dependency. A matching `(root, H)` makes the operation a strict no-op;
-    // a different PersonaPlex authority fails before a COMMIT can be exposed.
-    // A collection does not exist in storage until its first COMMIT stages the
-    // descriptor. Do not ask discovery to read that absent descriptor when
-    // founding the collection; after the first claim, normal authority-driven
-    // cover discovery is mandatory.
-    let existing = if model_bundle_teams(pile)
-        .context("discover existing model-bundle authorities")?
-        .contains(&team)
+    // a different PersonaPlex identity fails before a COMMIT can be exposed.
+    let observation = pile
+        .snapshot()
+        .context("freeze existing PersonaPlex bundle collection")?;
+    let (cover, admitted_commits) = collection
+        .admitted_with_commits(&observation)
+        .context("admit existing PersonaPlex bundle commits")?;
+    let snapshot = snapshot_model_bundle_collection_exact(&observation, &cover)
+        .context("materialize existing PersonaPlex bundle cover")?;
+    if let Some(existing) = PersonaPlexWeights::find_in_bundle_snapshot(snapshot)
+        .context("inspect existing PersonaPlex bundle")?
     {
-        Some(
-            snapshot_model_bundle_collection_local_latest_with_admission(pile, team)
-                .context("freeze existing same-team model bundles and admission roots")?,
-        )
-    } else {
-        None
-    };
-    if let Some((snapshot, admitted_commits)) = existing {
-        // Preserve the exact capability-admitted roots of this observation.
-        // A later broad provenance query also includes unauthorized or newly
-        // arrived duplicate claims over the same payload, which must not become
-        // the claim returned by an idempotent retry.
-        if let Some(existing) = PersonaPlexWeights::find_in_bundle_snapshot(team, snapshot)
-            .context("inspect existing same-team PersonaPlex bundle")?
-        {
-            anyhow::ensure!(
-                existing.authority().model_root() == candidate.model_root
-                    && existing.authority().model_archive_data() == model_archive_data,
-                "a different PersonaPlex bundle is already authoritative in this team"
-            );
-            let token_data = existing.authority().bundle_token_data();
-            let commit = admitted_commits
-                .iter()
-                .copied()
-                .find(|commit| commit.data() == token_data)
-                .expect("validated bundle authority has an admitted commit root");
-            return Ok(PersonaPlexLegacyAdoptionResult {
-                commit,
-                published: false,
-                team,
-                legacy_commit,
-                legacy_lm_root: candidate.legacy_lm_root,
-                legacy_mimi_root: candidate.legacy_mimi_root,
-                model_root: candidate.model_root,
-                model_archive_data,
-                legacy_facts: candidate.legacy_facts,
-                aliases_added: candidate.aliases_added,
-            });
-        }
+        anyhow::ensure!(
+            existing.authority().model_root() == candidate.model_root
+                && existing.authority().model_archive_data() == model_archive_data,
+            "a different PersonaPlex bundle is already authoritative in this collection"
+        );
+        let token_data = existing.authority().bundle_token_data();
+        let commit = admitted_commits
+            .iter()
+            .copied()
+            .find(|commit| commit.data() == token_data)
+            .expect("validated bundle authority has an admitted commit root");
+        return Ok(PersonaPlexLegacyAdoptionResult {
+            commit,
+            published: false,
+            collection,
+            legacy_commit,
+            legacy_lm_root: candidate.legacy_lm_root,
+            legacy_mimi_root: candidate.legacy_mimi_root,
+            model_root: candidate.model_root,
+            model_archive_data,
+            legacy_facts: candidate.legacy_facts,
+            aliases_added: candidate.aliases_added,
+        });
     }
+    drop(observation);
 
     let mut staged = prepared
         .into_prepared_commit()
-        .stage(pile, signing_key)
+        .stage_for(pile, collection, signing_key)
         .map_err(|error| anyhow!("stage PersonaPlex bundle dependencies: {error}"))?;
 
     // The source UTF8String is one of the just-staged dependencies, while the
@@ -515,8 +798,8 @@ fn adopt_legacy_personaplex_bundle_with_policy(
     // only inert content-addressed dependencies.
     let staged_reader = staged
         .store_mut()
-        .reader()
-        .context("open reader over staged PersonaPlex dependencies")?;
+        .snapshot()
+        .context("freeze staged PersonaPlex dependencies")?;
     let archive: Blob<blobencodings::SimpleArchive> = staged_reader
         .get(inlineencodings::Handle::<blobencodings::SimpleArchive>::from_hash(model_archive_data))
         .map_err(|error| anyhow!("read staged PersonaPlex model archive H: {error}"))?;
@@ -545,7 +828,7 @@ fn adopt_legacy_personaplex_bundle_with_policy(
     Ok(PersonaPlexLegacyAdoptionResult {
         commit,
         published: true,
-        team,
+        collection,
         legacy_commit,
         legacy_lm_root: candidate.legacy_lm_root,
         legacy_mimi_root: candidate.legacy_mimi_root,
@@ -652,8 +935,8 @@ fn migrate_legacy_model_main_from_snapshot(
     request: LegacyModelMigration<'_>,
 ) -> anyhow::Result<LegacyModelMigrationResult> {
     let reader = pile
-        .reader()
-        .context("open blob reader for frozen legacy model snapshot")?;
+        .snapshot()
+        .context("freeze legacy model pile snapshot")?;
     let frozen = freeze_legacy_main_from_snapshot(reader, pins)?;
     migrate_frozen_legacy_model(pile, signing_key, request, frozen)
 }
@@ -713,17 +996,14 @@ fn migrate_frozen_legacy_model(
         };
     }
 
-    // Join the existing model-graph team when there is one; otherwise this
-    // durable signer founds it. The result records that selected team, so
-    // exact readers never need to rediscover or restate it.
-    let team = model_graph_team_or_own(pile, signing_key)
-        .context("select the existing model-graph team or found it under this signer")?;
-    let commit = publish_model_fragment(pile, team, signing_key, fragment)
+    let collection = model_graph_collection_or_create(pile, signing_key)
+        .context("select or create the native model-graph policy collection")?;
+    let commit = publish_model_fragment(pile, signing_key, fragment)
         .context("publish migrated model graph to Mary's native collection")?;
 
     Ok(LegacyModelMigrationResult {
         commit,
-        team,
+        collection,
         legacy_branch: frozen.branch,
         legacy_head: frozen.head,
         model_root,
@@ -746,11 +1026,9 @@ mod tests {
     use ed25519_dalek::Signer;
     use triblespace::core::blob::encodings::UnknownBlob;
     use triblespace::core::blob::MemoryBlobStore;
-    use triblespace::core::collection::CollectionStoreExt;
     use triblespace::core::inline::encodings::UnknownInline;
     use triblespace::core::metadata;
     use triblespace::core::patch::Entry;
-    use triblespace::core::repo::pile::PileReader;
     use triblespace::core::repo::pile::WantRewritePolicy;
     use triblespace::core::repo::{BlobStorePut, RetentionRoots};
     use triblespace::prelude::blobencodings::RawBytes;
@@ -758,9 +1036,8 @@ mod tests {
     use super::*;
     use mary::format::{F32Array, U64Array};
     use mary::model_collection::{
-        local_model_bundle_cover, model_bundle_teams, publish_model_bundle_fragment,
-        snapshot_model_bundle_collection_exact, snapshot_model_bundle_collection_local_latest,
-        snapshot_model_collection_local_latest,
+        local_model_cover, model_bundle_collections_in, publish_model_bundle_fragment,
+        snapshot_model_bundle_collection_exact, snapshot_model_collection_for,
     };
 
     static NEXT_TEMP_PILE: AtomicU64 = AtomicU64::new(0);
@@ -869,7 +1146,7 @@ mod tests {
         parents: impl IntoIterator<Item = CommitHandle>,
     ) -> CommitHandle {
         let (facts, mut blobs) = fragment.into_facts_and_blobs();
-        for (_, blob) in blobs.reader().expect("read fixture attachment store") {
+        for (_, blob) in blobs.snapshot().expect("read fixture attachment store") {
             pile.put::<UnknownBlob, _>(blob)
                 .expect("persist legacy fixture attachment");
         }
@@ -906,7 +1183,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let signed_head = *heads.first().expect("signed branch fixture has a head");
-        let reader = pile.reader().expect("read branch fixture head");
+        let reader = pile.snapshot().expect("read branch fixture head");
         let head_blob: Blob<blobencodings::SimpleArchive> = reader
             .get(signed_head)
             .expect("resolve branch fixture head");
@@ -1225,7 +1502,7 @@ mod tests {
 
     fn read_main_identity(path: &Path, pins: &PinSnapshot) -> (Id, CommitHandle) {
         let mut pile = Pile::open(path).expect("open pile to inspect main");
-        let reader = pile.reader().expect("snapshot inspected pile");
+        let reader = pile.snapshot().expect("snapshot inspected pile");
         let frozen = freeze_legacy_main_from_snapshot(reader, pins).expect("freeze legacy main");
         let identity = (frozen.branch, frozen.head);
         drop(frozen);
@@ -1235,13 +1512,14 @@ mod tests {
 
     fn exact_snapshot(
         path: &Path,
-        team: VerifyingKey,
+        collection: ModelCollection,
         commit: CollectionCommit,
-    ) -> triblespace::core::collection::FactSnapshot<PileReader> {
+    ) -> mary::model_collection::ModelPileSnapshot {
         let mut pile = Pile::open(path).expect("open pile for exact native read");
-        // `team` is the exact value returned by publication; do not replace
-        // that authority with a second ambient discovery pass.
-        let snapshot = snapshot_model_collection_local_latest(&mut pile, team)
+        let store = pile.snapshot().expect("freeze exact native read");
+        // The typed descriptor is the exact value returned by publication; do
+        // not replace it with a second ambient name-discovery pass.
+        let snapshot = snapshot_model_collection_for(&store, collection)
             .expect("materialize admitted migration cover");
         assert!(snapshot.cover().contains(
             inlineencodings::Handle::<blobencodings::SimpleArchive>::from_hash(commit.data())
@@ -1252,17 +1530,113 @@ mod tests {
 
     fn exact_bundle_snapshot(
         path: &Path,
-        team: VerifyingKey,
+        collection: ModelCollection,
         commit: CollectionCommit,
-    ) -> triblespace::core::collection::FactSnapshot<PileReader> {
+    ) -> mary::model_collection::ModelPileSnapshot {
         let mut pile = Pile::open(path).expect("open pile for exact bundle read");
-        let snapshot = snapshot_model_bundle_collection_local_latest(&mut pile, team)
+        let store = pile.snapshot().expect("freeze exact bundle read");
+        let snapshot = snapshot_model_collection_for(&store, collection)
             .expect("materialize admitted model-bundle cover");
         assert!(snapshot.cover().contains(
             inlineencodings::Handle::<blobencodings::SimpleArchive>::from_hash(commit.data())
         ));
         pile.close().expect("close exact bundle-read pile");
         snapshot
+    }
+
+    fn bundle_collections(pile: &mut Pile) -> Vec<ModelCollection> {
+        let snapshot = pile.snapshot().expect("freeze bundle collection census");
+        model_bundle_collections_in(&snapshot).expect("enumerate bundle collections")
+    }
+
+    fn put_descriptor(pile: &mut Pile, descriptor: &Fragment) -> CollectionHandle {
+        let mut blobs = descriptor.blobs().clone();
+        for (_, blob) in blobs.snapshot().unwrap() {
+            pile.put::<UnknownBlob, _>(blob)
+                .expect("persist descriptor dependency");
+        }
+        pile.put::<blobencodings::SimpleArchive, _>(descriptor.facts().clone())
+            .expect("persist descriptor facts")
+    }
+
+    #[test]
+    fn policy_transfer_preserves_handles_registers_descriptor_and_replays_exactly() {
+        let path = TempPilePath::new("policy-transfer");
+        let old = key(0x41);
+        let new = key(0x42);
+        let descriptor =
+            retired_collection_descriptor(ModelCollectionKind::Graph.name(), old.verifying_key());
+        let mut pile = Pile::open(path.path()).unwrap();
+        let source = put_descriptor(&mut pile, &descriptor);
+        assert_eq!(source, collection_descriptor_handle(&descriptor));
+
+        let metadata = pile
+            .put::<blobencodings::SimpleArchive, _>(TribleSet::new())
+            .unwrap();
+        let data_handle = pile
+            .put::<blobencodings::SimpleArchive, _>(entity! { metadata::tag: test_id(0x43) })
+            .unwrap();
+        let data = inlineencodings::Handle::<blobencodings::SimpleArchive>::to_hash(data_handle);
+        let retired = CollectionCommit::sign(&old, source, data, metadata);
+        pile.insert(CollectionRecord::Commit(retired)).unwrap();
+
+        let first =
+            transfer_retired_model_collection(&mut pile, &new, source, ModelCollectionKind::Graph)
+                .unwrap();
+        assert_eq!(first.source_authority, old.verifying_key());
+        assert_eq!(first.appended_commits, 1);
+        assert_eq!(first.commits.len(), 1);
+        assert_eq!(first.commits[0].data(), retired.data());
+        assert_eq!(first.commits[0].metadata(), retired.metadata());
+        assert_eq!(
+            first.commits[0].public_key().raw,
+            new.verifying_key().to_bytes()
+        );
+
+        let snapshot = pile.snapshot().unwrap();
+        assert_eq!(
+            ModelCollection::open(&snapshot, first.collection.handle()).unwrap(),
+            first.collection,
+        );
+        let (_, admitted) = first.collection.admitted_with_commits(&snapshot).unwrap();
+        assert_eq!(admitted, first.commits);
+        drop(snapshot);
+
+        let len = std::fs::metadata(path.path()).unwrap().len();
+        let replay =
+            transfer_retired_model_collection(&mut pile, &new, source, ModelCollectionKind::Graph)
+                .unwrap();
+        assert_eq!(replay.commits, first.commits);
+        assert_eq!(replay.appended_commits, 0);
+        assert_eq!(std::fs::metadata(path.path()).unwrap().len(), len);
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn policy_transfer_registers_an_empty_current_collection() {
+        let path = TempPilePath::new("empty-policy-transfer");
+        let old = key(0x44);
+        let new = key(0x45);
+        let descriptor =
+            retired_collection_descriptor(ModelCollectionKind::Bundle.name(), old.verifying_key());
+        let mut pile = Pile::open(path.path()).unwrap();
+        let source = put_descriptor(&mut pile, &descriptor);
+
+        let result =
+            transfer_retired_model_collection(&mut pile, &new, source, ModelCollectionKind::Bundle)
+                .unwrap();
+        assert!(result.commits.is_empty());
+        assert_eq!(result.appended_commits, 0);
+        let snapshot = pile.snapshot().unwrap();
+        assert_eq!(
+            ModelCollection::open(&snapshot, result.collection.handle()).unwrap(),
+            result.collection,
+        );
+        let descriptor: Blob<blobencodings::SimpleArchive> =
+            snapshot.get(result.collection.handle()).unwrap();
+        assert_eq!(descriptor.get_handle(), result.collection.handle());
+        drop(snapshot);
+        pile.close().unwrap();
     }
 
     #[test]
@@ -1305,7 +1679,7 @@ mod tests {
             "legacy branch identity/head changed"
         );
 
-        let snapshot = exact_snapshot(fixture.pile.path(), first.team, first.commit);
+        let snapshot = exact_snapshot(fixture.pile.path(), first.collection, first.commit);
         let projection = project_legacy_model_attributes(&fixture.facts);
         assert_eq!(first.aliases_added, projection.aliases_added);
         let mut expected = projection.facts;
@@ -1328,7 +1702,7 @@ mod tests {
         assert_eq!(
             select_model_root(
                 snapshot.facts(),
-                snapshot.reader(),
+                snapshot.store(),
                 ModelSelector::Source {
                     source: CANONICAL_SOURCE,
                     quantization: QUANTIZATION,
@@ -1340,14 +1714,14 @@ mod tests {
         assert_eq!(
             select_tokenizer_root(
                 snapshot.facts(),
-                snapshot.reader(),
+                snapshot.store(),
                 TokenizerSelector::Name(CANONICAL_TOKENIZER),
             )
             .expect("select migrated tokenizer from exact cover"),
             fixture.tokenizer_root
         );
         let attachment: View<str> = snapshot
-            .reader()
+            .store()
             .get(fixture.attachment)
             .expect("legacy attachment remains resident through exact snapshot");
         assert_eq!(&*attachment, "resident legacy attachment");
@@ -1398,11 +1772,11 @@ mod tests {
 
         // The coordinates must land on the requested root and nowhere else, and
         // the shared name must still fail closed afterwards.
-        let snapshot = exact_snapshot(fixture.pile.path(), result.team, result.commit);
+        let snapshot = exact_snapshot(fixture.pile.path(), result.collection, result.commit);
         assert_eq!(
             select_model_root(
                 snapshot.facts(),
-                snapshot.reader(),
+                snapshot.store(),
                 ModelSelector::Source {
                     source: CANONICAL_SOURCE,
                     quantization: QUANTIZATION,
@@ -1413,7 +1787,7 @@ mod tests {
         );
         let error = select_model_root(
             snapshot.facts(),
-            snapshot.reader(),
+            snapshot.store(),
             ModelSelector::Name(LEGACY_MODEL_NAME),
         )
         .expect_err("the shared name is still ambiguous after migration")
@@ -1566,7 +1940,7 @@ mod tests {
             "{error}"
         );
         assert!(
-            model_bundle_teams(&mut pile).unwrap().is_empty(),
+            bundle_collections(&mut pile).is_empty(),
             "failed exact-head validation exposed a bundle COMMIT"
         );
         assert_eq!(
@@ -1608,9 +1982,9 @@ mod tests {
         );
         pile.close().unwrap();
 
-        let snapshot = exact_bundle_snapshot(fixture.pile.path(), first.team, first.commit);
+        let snapshot = exact_bundle_snapshot(fixture.pile.path(), first.collection, first.commit);
         let archive: Blob<blobencodings::SimpleArchive> = snapshot
-            .reader()
+            .store()
             .get(
                 inlineencodings::Handle::<blobencodings::SimpleArchive>::from_hash(
                     first.model_archive_data,
@@ -1633,7 +2007,7 @@ mod tests {
         assert_eq!(
             select_model_root(
                 &model_facts,
-                snapshot.reader(),
+                snapshot.store(),
                 ModelSelector::Source {
                     source: PERSONAPLEX_SOURCE,
                     quantization: mary::persist::QUANTIZATION_NATIVE,
@@ -1645,7 +2019,7 @@ mod tests {
         assert_eq!(
             select_model_root(
                 &model_facts,
-                snapshot.reader(),
+                snapshot.store(),
                 ModelSelector::Name(PERSONAPLEX_LM_FILE),
             )
             .unwrap(),
@@ -1654,7 +2028,7 @@ mod tests {
         assert_eq!(
             select_model_root(
                 &model_facts,
-                snapshot.reader(),
+                snapshot.store(),
                 ModelSelector::Name(PERSONAPLEX_MIMI_FILE),
             )
             .unwrap(),
@@ -1666,7 +2040,7 @@ mod tests {
             }),
             "the unified root must not acquire two values for functional model_name"
         );
-        let weights = PersonaPlexWeights::from_graph(&model_facts, snapshot.reader().clone())
+        let weights = PersonaPlexWeights::from_graph(&model_facts, snapshot.store().clone())
             .expect("load adopted PersonaPlex graph through runtime resolver");
         assert_eq!(weights.root(), first.model_root);
         assert_eq!(weights.count(), policy.total);
@@ -1699,9 +2073,10 @@ mod tests {
         assert_eq!(adopted.legacy_commit, fixture.weight_commit);
         pile.close().unwrap();
 
-        let snapshot = exact_bundle_snapshot(fixture.pile.path(), adopted.team, adopted.commit);
+        let snapshot =
+            exact_bundle_snapshot(fixture.pile.path(), adopted.collection, adopted.commit);
         let archive: Blob<blobencodings::SimpleArchive> = snapshot
-            .reader()
+            .store()
             .get(
                 inlineencodings::Handle::<blobencodings::SimpleArchive>::from_hash(
                     adopted.model_archive_data,
@@ -1709,7 +2084,7 @@ mod tests {
             )
             .unwrap();
         let model_facts = TribleSet::try_from_blob(archive).unwrap();
-        let weights = PersonaPlexWeights::from_graph(&model_facts, snapshot.reader().clone())
+        let weights = PersonaPlexWeights::from_graph(&model_facts, snapshot.store().clone())
             .expect("load branch-independent adopted PersonaPlex graph");
         assert_eq!(weights.root(), adopted.model_root);
         assert_eq!(weights.count(), policy.total);
@@ -1730,7 +2105,7 @@ mod tests {
         )
         .expect_err("wrong audited LM count must fail");
         assert!(error.to_string().contains("members, expected"), "{error}");
-        assert!(model_bundle_teams(&mut pile).unwrap().is_empty());
+        assert!(bundle_collections(&mut pile).is_empty());
         pile.close().unwrap();
         assert_eq!(std::fs::read(count_fixture.pile.path()).unwrap(), before);
 
@@ -1746,7 +2121,7 @@ mod tests {
         )
         .expect_err("shared LM/Mimi member must fail");
         assert!(error.to_string().contains("share member"), "{error}");
-        assert!(model_bundle_teams(&mut pile).unwrap().is_empty());
+        assert!(bundle_collections(&mut pile).is_empty());
         pile.close().unwrap();
         assert_eq!(std::fs::read(overlap_fixture.pile.path()).unwrap(), before);
     }
@@ -1775,7 +2150,7 @@ mod tests {
             "the falsifier must cross the dependency-staging boundary"
         );
         assert!(
-            model_bundle_teams(&mut pile).unwrap().is_empty(),
+            bundle_collections(&mut pile).is_empty(),
             "failed staged validation finalized a bundle COMMIT"
         );
         pile.close().unwrap();
@@ -1789,14 +2164,9 @@ mod tests {
         let conflicting = conflicting_personaplex_fragment();
         let conflicting_root = conflicting.root().unwrap();
         let mut pile = Pile::open(fixture.pile.path()).unwrap();
-        let existing = publish_model_bundle_fragment(
-            &mut pile,
-            migration_key.verifying_key(),
-            &migration_key,
-            conflicting_root,
-            conflicting,
-        )
-        .expect("publish conflicting same-team PersonaPlex bundle");
+        let existing =
+            publish_model_bundle_fragment(&mut pile, &migration_key, conflicting_root, conflicting)
+                .expect("publish conflicting same-team PersonaPlex bundle");
         let before = std::fs::metadata(fixture.pile.path()).unwrap().len();
         let error = adopt_legacy_personaplex_bundle_with_policy(
             &mut pile,
@@ -1816,9 +2186,12 @@ mod tests {
             before,
             "conflict staged dependencies before failing"
         );
-        let cover = local_model_bundle_cover(&mut pile, migration_key.verifying_key()).unwrap();
+        let collection = model_bundle_collection_or_create(&mut pile, &migration_key).unwrap();
+        let store = pile.snapshot().unwrap();
+        let (cover, commits) = collection.admitted_with_commits(&store).unwrap();
         assert_eq!(cover.len(), 1);
-        assert_eq!(pile.claims(&cover).unwrap(), vec![existing]);
+        assert_eq!(commits, vec![existing]);
+        drop(store);
         pile.close().unwrap();
     }
 
@@ -1830,7 +2203,7 @@ mod tests {
         let mut pile = Pile::open(fixture.pile.path()).unwrap();
 
         pile.refresh().unwrap();
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         let legacy = checkout_legacy_commit_ancestors(&reader, fixture.weight_commit).unwrap();
         let mut conflicting =
             prepare_legacy_personaplex_candidate(legacy, &reader, policy).unwrap();
@@ -1851,7 +2224,6 @@ mod tests {
         assert_eq!(conflicting.fragment.root(), Some(conflicting.model_root));
         let existing = publish_model_bundle_fragment(
             &mut pile,
-            migration_key.verifying_key(),
             &migration_key,
             conflicting.model_root,
             conflicting.fragment,
@@ -1877,9 +2249,12 @@ mod tests {
             before,
             "same-root different-H conflict staged dependencies"
         );
-        let cover = local_model_bundle_cover(&mut pile, migration_key.verifying_key()).unwrap();
+        let collection = model_bundle_collection_or_create(&mut pile, &migration_key).unwrap();
+        let store = pile.snapshot().unwrap();
+        let (cover, commits) = collection.admitted_with_commits(&store).unwrap();
         assert_eq!(cover.len(), 1);
-        assert_eq!(pile.claims(&cover).unwrap(), vec![existing]);
+        assert_eq!(commits, vec![existing]);
+        drop(store);
         pile.close().unwrap();
     }
 
@@ -1905,7 +2280,9 @@ mod tests {
         );
 
         let mut retained = Pile::open(destination.path()).unwrap();
-        let cover = local_model_bundle_cover(&mut source, adopted.team).unwrap();
+        let source_store = source.snapshot().unwrap();
+        let cover = local_model_cover(&source_store, adopted.collection).unwrap();
+        drop(source_store);
         source
             .rewrite_retained_into(
                 &mut retained,
@@ -1915,10 +2292,11 @@ mod tests {
             .expect("rewrite native bundle closure");
         source.close().unwrap();
 
-        let snapshot = snapshot_model_bundle_collection_exact(&mut retained, adopted.team, &cover)
+        let retained_store = retained.snapshot().unwrap();
+        let snapshot = snapshot_model_bundle_collection_exact(&retained_store, &cover)
             .expect("materialize retained exact bundle");
         let token_archive: Blob<blobencodings::SimpleArchive> = snapshot
-            .reader()
+            .store()
             .get(
                 inlineencodings::Handle::<blobencodings::SimpleArchive>::from_hash(
                     adopted.commit.data(),
@@ -1937,7 +2315,7 @@ mod tests {
             adopted.model_archive_data
         );
         let archive: Blob<blobencodings::SimpleArchive> = snapshot
-            .reader()
+            .store()
             .get(model_archive)
             .expect("T retained the exact model archive H");
         let facts = TribleSet::try_from_blob(archive).unwrap();
@@ -1952,18 +2330,18 @@ mod tests {
             .zip(&fixture.shapes)
             .enumerate()
         {
-            let payload: View<[f32]> = snapshot.reader().get(*data).unwrap();
-            let dimensions: View<[u64]> = snapshot.reader().get(*shape).unwrap();
+            let payload: View<[f32]> = snapshot.store().get(*data).unwrap();
+            let dimensions: View<[u64]> = snapshot.store().get(*shape).unwrap();
             assert_eq!(&*payload, &[index as f32 + 1.0]);
             assert_eq!(&*dimensions, &[1]);
-            let leaf = mary::leaf::resolve(&facts, snapshot.reader(), *leaf_id)
+            let leaf = mary::leaf::resolve(&facts, snapshot.store(), *leaf_id)
                 .unwrap()
                 .expect("legacy two-blob leaf remains resolvable");
             assert_eq!(leaf.dims(), &[1]);
             assert_eq!(&*leaf.view_f32().unwrap(), &[index as f32 + 1.0]);
         }
         assert!(
-            snapshot.reader().get::<Bytes, _>(fixture.orphan).is_err(),
+            snapshot.store().get::<Bytes, _>(fixture.orphan).is_err(),
             "unrelated later-commit attachment survived without an ownership path"
         );
         drop(snapshot);

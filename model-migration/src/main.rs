@@ -1,18 +1,22 @@
 //! Lean one-shot migration of a legacy Mary model pile.
 //!
 //! This binary deliberately has no checkpoint reader or HuggingFace client.
-//! Each subcommand names an existing pile, key, and complete legacy authority;
-//! stdout is the full signed native collection claim produced by the migration.
+//! Each subcommand names an existing pile, key, and complete legacy authority.
+//! Stdout is the complete signed native collection claim (or one claim per
+//! line for a policy transfer) produced by the migration.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use ed25519_dalek::VerifyingKey;
 use mary::selection::ModelSelector;
 use mary_model_migration::{
-    adopt_legacy_personaplex_bundle, migrate_legacy_model_main, LegacyModelMigration,
+    adopt_legacy_personaplex_bundle, migrate_legacy_model_main, transfer_retired_model_collection,
+    LegacyModelMigration, ModelCollectionKind,
 };
+use triblespace::core::collection::CollectionHandle;
 use triblespace::core::inline::encodings::hash::{Blake3, Hash};
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::CommitHandle;
@@ -70,11 +74,47 @@ enum Command {
         #[arg(long, value_parser = parse_commit_handle)]
         legacy_commit: CommitHandle,
     },
+    /// Re-sign one exact retired model collection under current policies.
+    Policy {
+        /// Existing model pile. Source records remain untouched.
+        #[arg(long)]
+        pile: PathBuf,
+        /// Existing private key for the explicit current transfer root.
+        #[arg(long)]
+        key: PathBuf,
+        /// Exact immediately-prior collection descriptor handle.
+        #[arg(long, value_parser = parse_collection_handle)]
+        source_collection: CollectionHandle,
+        /// Which canonical Mary model collection this descriptor represents.
+        #[arg(long, value_enum)]
+        collection: CollectionKindArg,
+        /// Public key of the new direct READ/WRITE root (64 hex digits).
+        /// Must correspond to `--key`; making it explicit prevents accidental
+        /// adoption under whichever ambient key happened to be available.
+        #[arg(long, value_parser = parse_verifying_key)]
+        target_root: VerifyingKey,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum CollectionKindArg {
+    Graph,
+    Bundle,
+}
+
+impl From<CollectionKindArg> for ModelCollectionKind {
+    fn from(value: CollectionKindArg) -> Self {
+        match value {
+            CollectionKindArg::Graph => Self::Graph,
+            CollectionKindArg::Bundle => Self::Bundle,
+        }
+    }
 }
 
 enum MigrationOutput {
     Model(mary_model_migration::LegacyModelMigrationResult),
     PersonaPlex(mary_model_migration::PersonaPlexLegacyAdoptionResult),
+    Policy(mary_model_migration::ModelCollectionPolicyTransferResult),
 }
 
 fn parse_commit_handle(value: &str) -> Result<CommitHandle, String> {
@@ -92,6 +132,30 @@ fn parse_commit_handle(value: &str) -> Result<CommitHandle, String> {
         )
     })?;
     Ok(Handle::<SimpleArchive>::from_hash(hash))
+}
+
+fn parse_collection_handle(value: &str) -> Result<CollectionHandle, String> {
+    parse_commit_handle(value).map_err(|error| error.replace("legacy commit", "collection"))
+}
+
+fn parse_verifying_key(value: &str) -> Result<VerifyingKey, String> {
+    let value = value.trim();
+    if value.len() != 64 || !value.is_ascii() {
+        return Err("target root must be 64 hexadecimal digits".to_owned());
+    }
+    let bytes = value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let text = std::str::from_utf8(pair).expect("ASCII was checked above");
+            u8::from_str_radix(text, 16).map_err(|_| ())
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "target root must be 64 hexadecimal digits".to_owned())?;
+    let raw: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| "target root must be 64 hexadecimal digits".to_owned())?;
+    VerifyingKey::from_bytes(&raw).map_err(|error| format!("invalid target root: {error}"))
 }
 
 fn parse_model_selector<'a>(
@@ -117,10 +181,12 @@ fn run(command: Command) -> anyhow::Result<MigrationOutput> {
             model_name.as_deref(),
             root.as_deref(),
         )?),
-        Command::Personaplex { .. } => None,
+        Command::Personaplex { .. } | Command::Policy { .. } => None,
     };
     let (pile_path, key_path) = match &command {
-        Command::Model { pile, key, .. } | Command::Personaplex { pile, key, .. } => (pile, key),
+        Command::Model { pile, key, .. }
+        | Command::Personaplex { pile, key, .. }
+        | Command::Policy { pile, key, .. } => (pile, key),
     };
 
     // No path inference, environment fallback, initialization, or generated
@@ -151,6 +217,24 @@ fn run(command: Command) -> anyhow::Result<MigrationOutput> {
             adopt_legacy_personaplex_bundle(&mut pile, &signing_key, *legacy_commit)
                 .map(MigrationOutput::PersonaPlex)
         }
+        Command::Policy {
+            source_collection,
+            collection,
+            target_root,
+            ..
+        } => {
+            anyhow::ensure!(
+                signing_key.verifying_key() == *target_root,
+                "--target-root does not correspond to --key",
+            );
+            transfer_retired_model_collection(
+                &mut pile,
+                &signing_key,
+                *source_collection,
+                (*collection).into(),
+            )
+            .map(MigrationOutput::Policy)
+        }
     };
 
     // This command, not the collection API, owns the explicit durability
@@ -178,10 +262,10 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let migration = run(args.command)?;
 
-    let commit = match migration {
+    let commits = match migration {
         MigrationOutput::Model(result) => {
             eprintln!(
-                "migrated legacy main branch {} head {:?}: model {}, tokenizer {:?}, {} legacy facts + {} aliases + {} selector facts; team {}, native commit {}",
+                "migrated legacy main branch {} head {:?}: model {}, tokenizer {:?}, {} legacy facts + {} aliases + {} selector facts; collection {}, native commit {}",
                 result.legacy_branch,
                 result.legacy_head,
                 result.model_root,
@@ -189,14 +273,14 @@ fn main() -> anyhow::Result<()> {
                 result.legacy_facts,
                 result.aliases_added,
                 result.selector_facts_added,
-                lowercase_hex(&result.team.to_bytes()),
+                lowercase_hex(&result.collection.handle().raw),
                 result.commit.id(),
             );
-            result.commit
+            vec![result.commit]
         }
         MigrationOutput::PersonaPlex(result) => {
             eprintln!(
-                "{} exact legacy PersonaPlex commit {:?}: LM {}, Mimi {}, unified root {}, H {:?}, {} legacy facts + {} aliases; team {}, bundle commit {}",
+                "{} exact legacy PersonaPlex commit {:?}: LM {}, Mimi {}, unified root {}, H {:?}, {} legacy facts + {} aliases; collection {}, bundle commit {}",
                 if result.published {
                     "adopted"
                 } else {
@@ -209,16 +293,31 @@ fn main() -> anyhow::Result<()> {
                 result.model_archive_data,
                 result.legacy_facts,
                 result.aliases_added,
-                lowercase_hex(&result.team.to_bytes()),
+                lowercase_hex(&result.collection.handle().raw),
                 result.commit.id(),
             );
-            result.commit
+            vec![result.commit]
+        }
+        MigrationOutput::Policy(result) => {
+            eprintln!(
+                "transferred retired collection {} (root {}) into current collection {}: {} successor commit(s), {} appended, {} MERGE and {} DERIVE records left as rebuildable cache exhaust",
+                lowercase_hex(&result.source.raw),
+                lowercase_hex(&result.source_authority.to_bytes()),
+                lowercase_hex(&result.collection.handle().raw),
+                result.commits.len(),
+                result.appended_commits,
+                result.skipped_merges,
+                result.skipped_derives,
+            );
+            result.commits
         }
     };
 
-    // Machine-readable stdout: exactly the complete 192-byte signed claim,
-    // lowercase hex plus the conventional trailing newline.
-    println!("{}", lowercase_hex(&commit.to_bytes()));
+    // Machine-readable stdout: complete 192-byte signed claims, one lowercase
+    // hex record per line. An empty source collection emits no claim.
+    for commit in commits {
+        println!("{}", lowercase_hex(&commit.to_bytes()));
+    }
     Ok(())
 }
 

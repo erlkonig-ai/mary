@@ -25,16 +25,14 @@ fn main() -> Result<()> {
     println!("pile {}", path.display());
 
     let mut pile = Pile::open(&path).map_err(|e| anyhow!("open {path:?}: {e:?}"))?;
-    let observed =
-        mary::model_collection::snapshot_sole_model_bundle_collection_local_latest(&mut pile);
-    let (team, snapshot) = match observed {
-        Ok(pair) => pair,
+    let observed = mary::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile);
+    let snapshot = match observed {
+        Ok(snapshot) => snapshot,
         Err(error) => {
             let _ = pile.close();
             return Err(anyhow!("freeze sole bundle snapshot: {error}"));
         }
     };
-    println!("bundle team {}", hex(&team.to_bytes()));
     let (_, cover, reader) = snapshot.into_parts();
     println!("cover members {}", cover.len());
 
@@ -87,8 +85,4 @@ fn main() -> Result<()> {
     drop(reader);
     pile.close().map_err(|e| anyhow!("close: {e:?}"))?;
     Ok(())
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

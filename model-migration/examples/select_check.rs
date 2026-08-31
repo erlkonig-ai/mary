@@ -2,7 +2,7 @@
 //! consumer makes?  `select_check <pile> <source> <quantization> [tokenizer]`
 //!
 //! Reproduces the two-step every native consumer performs — discover the sole
-//! model-graph team, load its locally-admitted latest snapshot — and then the
+//! model-graph policy collection, load its locally-admitted snapshot — and then the
 //! `ModelSelector::Source` lookup plus the strict tensor-handle index. This is
 //! the collection/selection boundary only; it does not construct a model.
 
@@ -18,10 +18,9 @@ fn main() -> Result<()> {
     let tokenizer = args.next();
     let pile = std::path::PathBuf::from(pile);
 
-    let (team, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(&pile)
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile)
         .context("load locally admitted native collection")?;
     println!("pile {}", pile.display());
-    println!("team {}", hex(&team.to_bytes()));
     println!(
         "{} member(s) in cover, {} facts",
         snapshot.cover().len(),
@@ -30,7 +29,7 @@ fn main() -> Result<()> {
 
     let root = mary::selection::select_model_root(
         snapshot.facts(),
-        snapshot.reader(),
+        snapshot.store(),
         mary::selection::ModelSelector::Source {
             source: &source,
             quantization: &quantization,
@@ -39,7 +38,7 @@ fn main() -> Result<()> {
     .with_context(|| format!("select model root for ({source:?}, {quantization:?})"))?;
     println!("selected root {root}");
 
-    let keymap = mary::selection::index_keymap_for_root(snapshot.facts(), snapshot.reader(), root)
+    let keymap = mary::selection::index_keymap_for_root(snapshot.facts(), snapshot.store(), root)
         .context("index the selected root's tensor handles")?;
     println!("{} tensor handles", keymap.len());
     let mut names: Vec<&String> = keymap.keys().collect();
@@ -51,7 +50,7 @@ fn main() -> Result<()> {
     if let Some(name) = tokenizer {
         let t = mary::selection::select_tokenizer_root(
             snapshot.facts(),
-            snapshot.reader(),
+            snapshot.store(),
             mary::selection::TokenizerSelector::Name(&name),
         )
         .with_context(|| format!("select tokenizer named {name:?}"))?;
@@ -60,8 +59,4 @@ fn main() -> Result<()> {
 
     println!("OK");
     Ok(())
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

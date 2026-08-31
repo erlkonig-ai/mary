@@ -817,7 +817,7 @@ fn open_preflighted_model_graph_snapshot(
     crate::model_collection::ModelCollection,
     Option<crate::model_collection::ModelPileSnapshot>,
 )> {
-    let (pile, collection) = open_preflighted_model_graph_pile(pile_path, signing_key)?;
+    let (mut pile, collection) = open_preflighted_model_graph_pile(pile_path, signing_key)?;
     let store = match pile.snapshot() {
         Ok(store) => store,
         Err(error) => {

@@ -47,9 +47,13 @@ fn main() -> Result<()> {
 }
 
 fn inventory(pile: &mut Pile) -> Result<()> {
+    let snapshot = pile.snapshot().map_err(|e| anyhow!("snapshot: {e}"))?;
     let mut per_descriptor: BTreeMap<[u8; 32], usize> = BTreeMap::new();
     let mut order = Vec::new();
-    for record in pile.records().map_err(|e| anyhow!("scan records: {e}"))? {
+    for record in snapshot
+        .records()
+        .map_err(|e| anyhow!("scan records: {e}"))?
+    {
         if let CollectionRecord::Commit(commit) = record.map_err(|e| anyhow!("record: {e}"))? {
             let key = commit.collection().raw;
             if per_descriptor.insert(key, 0).is_none() {
@@ -58,12 +62,11 @@ fn inventory(pile: &mut Pile) -> Result<()> {
             *per_descriptor.get_mut(&key).expect("just inserted") += 1;
         }
     }
-    let reader = pile.reader().map_err(|e| anyhow!("reader: {e}"))?;
     println!("collections ({} distinct descriptors):", order.len());
     let mut named = BTreeSet::new();
     for handle in order {
         let commits = per_descriptor[&handle.raw];
-        let Ok(blob) = reader.get::<Blob<SimpleArchive>, _>(handle.transmute()) else {
+        let Ok(blob) = snapshot.get::<Blob<SimpleArchive>, _>(handle.transmute()) else {
             println!("  <descriptor blob absent from this pile>  commits {commits}");
             continue;
         };
@@ -74,21 +77,13 @@ fn inventory(pile: &mut Pile) -> Result<()> {
         let name = descriptor::name(&facts)
             .ok()
             .flatten()
-            .and_then(|handle| reader.get::<Blob<UTF8String>, _>(handle).ok())
+            .and_then(|handle| snapshot.get::<Blob<UTF8String>, _>(handle).ok())
             .and_then(|blob| std::str::from_utf8(&blob.bytes).ok().map(str::to_owned))
             .unwrap_or_else(|| "<unnamed>".to_string());
-        let authority = descriptor::authority(&facts)
-            .map(|key| {
-                key.as_bytes()
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            })
-            .unwrap_or_else(|_| "<no authority>".to_string());
-        println!(
-            "  {name:<24} authority {}…  commits {commits}",
-            &authority[..16.min(authority.len())]
-        );
+        let policy = descriptor::policy(&facts)
+            .map(|policy| format!("{policy:?}"))
+            .unwrap_or_else(|error| format!("<invalid policy: {error}>"));
+        println!("  {name:<24} policy {policy}  commits {commits}");
         named.insert(name);
     }
     for want in ["mary-model-graph", "mary-model-bundles"] {
