@@ -82,7 +82,7 @@ enum Command {
         /// Existing private key for the explicit current transfer root.
         #[arg(long)]
         key: PathBuf,
-        /// Exact immediately-prior collection descriptor handle.
+        /// Exact supported retired collection descriptor handle.
         #[arg(long, value_parser = parse_collection_handle)]
         source_collection: CollectionHandle,
         /// Which canonical Mary model collection this descriptor represents.

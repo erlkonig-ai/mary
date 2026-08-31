@@ -72,6 +72,32 @@ mod retired_collection {
     }
 }
 
+/// Exact schema of the named-root collection epoch before descriptors carried
+/// an independent authority field.
+///
+/// These ids are migration evidence, not a runtime compatibility surface. The
+/// declarations deliberately preserve the published byte identities so the
+/// old descriptor can be reconstructed and compared by content address.
+mod preauthority_collection {
+    use super::*;
+
+    pub const TRIBLE_SET_UNION_RECIPE_V1: Id =
+        triblespace::macros::id_hex!("6D64C5F4B9E9B73F57C5F8702AB7FE45");
+    pub const KIND_COLLECTION_RECIPE: Id =
+        triblespace::macros::id_hex!("89E53D7FF204516307F0421C05E75000");
+
+    attributes! {
+        "436A04C372CBBFBD9C619CF50F59C4A1" unsafe as pub collection_name:
+            ShortString;
+        "6C1ED6495491E32FEBB9FDD4EE5E8907" unsafe as pub collection_namespace:
+            ED25519PublicKey;
+        "620FA4F2B456357DCD1882E583B85CC3" unsafe as pub collection_representation:
+            inlineencodings::GenId;
+        "5D338C58D897B969BE1AE0956CCFE301" unsafe as pub collection_recipe:
+            inlineencodings::GenId;
+    }
+}
+
 /// Which one of Mary's two root model collections an additive policy transfer
 /// targets.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -238,6 +264,28 @@ fn retired_collection_descriptor(name: &str, authority: VerifyingKey) -> Fragmen
     }
 }
 
+fn preauthority_union_recipe_description() -> Fragment {
+    let id = preauthority_collection::TRIBLE_SET_UNION_RECIPE_V1;
+    entity! {
+        ExclusiveId::force_ref(&id) @
+            metadata::name: "trible-set-union-v1",
+            metadata::description: "Set union of the tribles carried by a collection's elements. Associative, commutative and idempotent, so any two states have a least upper bound and merging is order-independent: a collection's value is the union over every element committed to it, and two replicas that have seen the same elements agree regardless of the order they arrived in. Takes no arguments.",
+            metadata::tag: preauthority_collection::KIND_COLLECTION_RECIPE,
+    }
+}
+
+fn preauthority_collection_descriptor(name: &str, namespace: VerifyingKey) -> Fragment {
+    entity! {
+        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+        preauthority_collection::collection_name: name,
+        preauthority_collection::collection_namespace: namespace,
+        preauthority_collection::collection_representation*:
+            <blobencodings::SimpleArchive as MetaDescribe>::describe(),
+        preauthority_collection::collection_recipe*:
+            preauthority_union_recipe_description(),
+    }
+}
+
 fn collection_descriptor_handle(descriptor: &Fragment) -> CollectionHandle {
     let blob: Blob<blobencodings::SimpleArchive> = descriptor.facts().clone().to_blob();
     blob.get_handle()
@@ -255,25 +303,6 @@ fn decode_exact_retired_collection(
         .context("decode retired collection descriptor SimpleArchive")?;
     let descriptor = triblespace::core::collection::descriptor::entity(&facts)
         .context("find retired collection descriptor entity")?;
-    let name_handle = triblespace::core::collection::descriptor::name(&facts)
-        .context("decode retired collection name")?
-        .ok_or_else(|| anyhow!("retired collection descriptor has no name"))?;
-    let name: anybytes::View<str> = snapshot
-        .get::<anybytes::View<str>, UTF8String>(name_handle)
-        .map_err(|error| anyhow!("read retired collection name: {error}"))?;
-    anyhow::ensure!(
-        &*name == kind.name(),
-        "retired collection is named {:?}, expected {:?}",
-        &*name,
-        kind.name(),
-    );
-    anyhow::ensure!(
-        triblespace::core::collection::descriptor::representation(&facts)
-            .context("decode retired collection representation")?
-            == <blobencodings::SimpleArchive as MetaDescribe>::id(),
-        "retired collection does not carry SimpleArchive elements",
-    );
-
     let authorities = facts
         .iter()
         .filter(|fact| {
@@ -281,23 +310,71 @@ fn decode_exact_retired_collection(
         })
         .map(|fact| *fact.v::<ED25519PublicKey>())
         .collect::<Vec<_>>();
-    let authority = match authorities.as_slice() {
-        [authority] => VerifyingKey::from_bytes(&authority.raw)
-            .map_err(|error| anyhow!("retired collection authority is invalid: {error}"))?,
-        [] => bail!("retired collection descriptor has no collection_authority"),
-        _ => bail!("retired collection descriptor repeats collection_authority"),
-    };
+    match authorities.as_slice() {
+        [authority] => {
+            let authority = VerifyingKey::from_bytes(&authority.raw)
+                .map_err(|error| anyhow!("retired collection authority is invalid: {error}"))?;
+            let name_handle = triblespace::core::collection::descriptor::name(&facts)
+                .context("decode retired collection name")?
+                .ok_or_else(|| anyhow!("retired collection descriptor has no name"))?;
+            let name: anybytes::View<str> = snapshot
+                .get::<anybytes::View<str>, UTF8String>(name_handle)
+                .map_err(|error| anyhow!("read retired collection name: {error}"))?;
+            anyhow::ensure!(
+                &*name == kind.name(),
+                "retired collection is named {:?}, expected {:?}",
+                &*name,
+                kind.name(),
+            );
 
-    // Reconstructing the complete predecessor descriptor is the strict shape
-    // check. Any extra field, old reach/mapping row, embedded entity, or
-    // different representation changes this content address and is rejected.
-    let expected = collection_descriptor_handle(&retired_collection_descriptor(&name, authority));
-    anyhow::ensure!(
-        expected == source,
-        "source is not the exact immediately-prior Mary descriptor for {:?}",
-        kind.name(),
-    );
-    Ok(authority)
+            // Reconstructing the complete predecessor descriptor is the
+            // strict shape check. Any extra field or embedded entity changes
+            // this content address and is rejected.
+            let expected =
+                collection_descriptor_handle(&retired_collection_descriptor(&name, authority));
+            anyhow::ensure!(
+                expected == source,
+                "source is not the exact authority-era Mary descriptor for {:?}",
+                kind.name(),
+            );
+            Ok(authority)
+        }
+        [] => {
+            let namespaces = facts
+                .iter()
+                .filter(|fact| {
+                    fact.e() == &descriptor
+                        && fact.a() == &preauthority_collection::collection_namespace.id()
+                })
+                .map(|fact| *fact.v::<ED25519PublicKey>())
+                .collect::<Vec<_>>();
+            let namespace = match namespaces.as_slice() {
+                [namespace] => VerifyingKey::from_bytes(&namespace.raw).map_err(|error| {
+                    anyhow!("pre-authority collection namespace is invalid: {error}")
+                })?,
+                [] => bail!("retired collection descriptor has neither authority nor namespace"),
+                _ => bail!("retired collection descriptor repeats collection_namespace"),
+            };
+
+            // In this one historical epoch the namespace key was both the
+            // root-name discriminator and the only admitted writer. Rebuild
+            // that complete descriptor—including its embedded schema and
+            // union-law descriptions—before treating the namespace as the
+            // transfer authority. This recognizes the exact old algebra; it
+            // does not loosen migration to arbitrary named archives.
+            let expected = collection_descriptor_handle(&preauthority_collection_descriptor(
+                kind.name(),
+                namespace,
+            ));
+            anyhow::ensure!(
+                expected == source,
+                "source is not the exact pre-authority Mary descriptor for {:?}",
+                kind.name(),
+            );
+            Ok(namespace)
+        }
+        _ => bail!("retired collection descriptor repeats collection_authority"),
+    }
 }
 
 fn current_collection_in_memory(
@@ -1111,6 +1188,16 @@ mod tests {
         SigningKey::from_bytes(&[byte; 32])
     }
 
+    fn bytes32(hex: &str) -> [u8; 32] {
+        assert_eq!(hex.len(), 64);
+        let mut bytes = [0_u8; 32];
+        for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+            let pair = std::str::from_utf8(pair).expect("test hex is ASCII");
+            bytes[index] = u8::from_str_radix(pair, 16).expect("test hex is valid");
+        }
+        bytes
+    }
+
     fn test_id(byte: u8) -> Id {
         Id::new([byte; 16]).expect("nonzero test id")
     }
@@ -1557,6 +1644,53 @@ mod tests {
         }
         pile.put::<blobencodings::SimpleArchive, _>(descriptor.facts().clone())
             .expect("persist descriptor facts")
+    }
+
+    #[test]
+    fn preauthority_descriptor_reconstructs_the_frozen_inkling_identity() {
+        let namespace = VerifyingKey::from_bytes(&bytes32(
+            "622f1356348389185f3bc07e04ad0de50bdb4344194522b850271d5b42a22609",
+        ))
+        .unwrap();
+        let descriptor =
+            preauthority_collection_descriptor(ModelCollectionKind::Graph.name(), namespace);
+        assert_eq!(descriptor.facts().len(), 11);
+        assert_eq!(
+            collection_descriptor_handle(&descriptor).raw,
+            bytes32("dd89e395ddc466e3ff5e9d002e4e7feef4b0055fb55c6cbdd9e9d3a3e96b0417"),
+        );
+    }
+
+    #[test]
+    fn policy_transfer_accepts_the_exact_preauthority_epoch() {
+        let path = TempPilePath::new("preauthority-policy-transfer");
+        let old = key(0x40);
+        let new = key(0x41);
+        let descriptor = preauthority_collection_descriptor(
+            ModelCollectionKind::Graph.name(),
+            old.verifying_key(),
+        );
+        let mut pile = Pile::open(path.path()).unwrap();
+        let source = put_descriptor(&mut pile, &descriptor);
+
+        let metadata = pile
+            .put::<blobencodings::SimpleArchive, _>(TribleSet::new())
+            .unwrap();
+        let data_handle = pile
+            .put::<blobencodings::SimpleArchive, _>(entity! { metadata::tag: test_id(0x42) })
+            .unwrap();
+        let data = inlineencodings::Handle::<blobencodings::SimpleArchive>::to_hash(data_handle);
+        let retired = CollectionCommit::sign(&old, source, data, metadata);
+        pile.insert(CollectionRecord::Commit(retired)).unwrap();
+
+        let result =
+            transfer_retired_model_collection(&mut pile, &new, source, ModelCollectionKind::Graph)
+                .unwrap();
+        assert_eq!(result.source_authority, old.verifying_key());
+        assert_eq!(result.appended_commits, 1);
+        assert_eq!(result.commits[0].data(), retired.data());
+        assert_eq!(result.commits[0].metadata(), retired.metadata());
+        pile.close().unwrap();
     }
 
     #[test]
