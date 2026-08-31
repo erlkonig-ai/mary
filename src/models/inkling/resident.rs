@@ -289,7 +289,7 @@ impl InklingHistoryResponse {
         }
     }
 
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         let execs = self
             .parts
             .iter()
