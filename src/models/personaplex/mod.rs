@@ -27,7 +27,6 @@ use crate::leaf::{Elem, Leaf};
 use crate::model_collection::ModelSnapshot;
 use crate::nn::weight_loader::WeightLoader;
 use crate::selection::{ModelSelector, SelectedModelIndex};
-use ed25519_dalek::VerifyingKey;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::{Blob, TryFromBlob};
 use triblespace::core::collection::{CollectionData, FactCover};
@@ -52,7 +51,6 @@ pub struct PersonaPlexWeights<R> {
 /// Exact signed bundle authority retained alongside one PersonaPlex loader.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PersonaPlexAuthority {
-    team: VerifyingKey,
     model_root: Id,
     model_archive_data: CollectionData,
     bundle_token_data: CollectionData,
@@ -60,8 +58,8 @@ pub struct PersonaPlexAuthority {
 }
 
 impl PersonaPlexAuthority {
-    pub fn team(&self) -> VerifyingKey {
-        self.team
+    pub fn collection(&self) -> crate::model_collection::ModelCollection {
+        self.cover.collection()
     }
 
     pub fn model_root(&self) -> Id {
@@ -154,7 +152,6 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
     /// Select PersonaPlex from individually self-contained signed bundle
     /// tokens, retaining the frozen cover and exact `(root, H, τ)` identity.
     pub fn find_in_bundle_snapshot(
-        team: VerifyingKey,
         snapshot: ModelSnapshot<R>,
     ) -> anyhow::Result<Option<PersonaPlexBundle<R>>>
     where
@@ -162,11 +159,6 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
     {
         use anyhow::{Context, anyhow};
         let (_, cover, reader) = snapshot.into_parts();
-        let expected_collection = crate::model_collection::model_bundle_collection_handle(team);
-        anyhow::ensure!(
-            cover.collection().handle() == expected_collection,
-            "bundle snapshot belongs to a collection outside the supplied team"
-        );
         let mut selected: Option<(Self, Id, CollectionData, CollectionData)> = None;
         for token_handle in cover.members() {
             let token_data = inlineencodings::Handle::<SimpleArchive>::to_hash(token_handle);
@@ -273,7 +265,6 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
         Ok(Some(PersonaPlexBundle {
             weights,
             authority: PersonaPlexAuthority {
-                team,
                 model_root,
                 model_archive_data,
                 bundle_token_data,
@@ -283,14 +274,11 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
     }
 
     /// Required form of [`Self::find_in_bundle_snapshot`].
-    pub fn from_bundle_snapshot(
-        team: VerifyingKey,
-        snapshot: ModelSnapshot<R>,
-    ) -> anyhow::Result<PersonaPlexBundle<R>>
+    pub fn from_bundle_snapshot(snapshot: ModelSnapshot<R>) -> anyhow::Result<PersonaPlexBundle<R>>
     where
         R: Clone,
     {
-        Self::find_in_bundle_snapshot(team, snapshot)?
+        Self::find_in_bundle_snapshot(snapshot)?
             .ok_or_else(|| anyhow::anyhow!("no admitted PersonaPlex bundle in exact cover"))
     }
 
@@ -387,12 +375,6 @@ mod native_authority_tests {
 
     static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
 
-    /// The one team these fixtures publish under. Fixed, because a snapshot
-    /// must name the same team the commit was published to.
-    fn test_team() -> ed25519_dalek::VerifyingKey {
-        SigningKey::from_bytes(&[0x50; 32]).verifying_key()
-    }
-
     struct TestPile(PathBuf);
 
     impl TestPile {
@@ -477,7 +459,6 @@ mod native_authority_tests {
         let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
         let first = crate::model_collection::publish_model_bundle_fragment(
             &mut pile,
-            test_team(),
             &signing_key,
             root,
             fragment.clone(),
@@ -486,7 +467,6 @@ mod native_authority_tests {
         let len_after_first = std::fs::metadata(file.path()).unwrap().len();
         let repeated = crate::model_collection::publish_model_bundle_fragment(
             &mut pile,
-            test_team(),
             &signing_key,
             root,
             fragment,
@@ -496,12 +476,10 @@ mod native_authority_tests {
         assert_eq!(first, repeated);
         assert_eq!(len_after_first, len_after_retry);
 
-        let snapshot = crate::model_collection::snapshot_model_bundle_collection_local_latest(
-            &mut pile,
-            test_team(),
-        )
-        .expect("freeze exact PersonaPlex prefix");
-        let bundle = PersonaPlexWeights::from_bundle_snapshot(test_team(), snapshot)
+        let snapshot =
+            crate::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile)
+                .expect("freeze exact PersonaPlex prefix");
+        let bundle = PersonaPlexWeights::from_bundle_snapshot(snapshot)
             .expect("select exact PersonaPlex bundle");
         let authority = bundle.authority();
         assert_eq!(authority.model_root(), root);
@@ -545,18 +523,15 @@ mod native_authority_tests {
         let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
         crate::model_collection::publish_model_bundle_fragment(
             &mut pile,
-            test_team(),
             &SigningKey::from_bytes(&[0x50; 32]),
             root,
             combined,
         )
         .expect("publish exact root with an ambient peer");
-        let snapshot = crate::model_collection::snapshot_model_bundle_collection_local_latest(
-            &mut pile,
-            test_team(),
-        )
-        .expect("freeze multi-root PersonaPlex bundle");
-        let bundle = PersonaPlexWeights::from_bundle_snapshot(test_team(), snapshot)
+        let snapshot =
+            crate::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile)
+                .expect("freeze multi-root PersonaPlex bundle");
+        let bundle = PersonaPlexWeights::from_bundle_snapshot(snapshot)
             .expect("signed token must select its asserted root exactly");
         assert_eq!(bundle.authority().model_root(), root);
         assert_eq!(bundle.weights().root(), root);
@@ -568,7 +543,7 @@ mod native_authority_tests {
     }
 
     #[test]
-    fn bundle_snapshot_cannot_be_relabelled_as_another_team() {
+    fn bundle_snapshot_retains_its_collection_identity() {
         let file = TestPile::new();
         let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
         let fragment = model_fragment(
@@ -579,22 +554,18 @@ mod native_authority_tests {
         let root = fragment.root().unwrap();
         crate::model_collection::publish_model_bundle_fragment(
             &mut pile,
-            test_team(),
             &SigningKey::from_bytes(&[0x50; 32]),
             root,
             fragment,
         )
         .expect("publish PersonaPlex bundle");
-        let snapshot = crate::model_collection::snapshot_model_bundle_collection_local_latest(
-            &mut pile,
-            test_team(),
-        )
-        .expect("freeze PersonaPlex bundle");
-        let foreign_team = SigningKey::from_bytes(&[0x60; 32]).verifying_key();
-        let error = PersonaPlexWeights::from_bundle_snapshot(foreign_team, snapshot)
-            .err()
-            .expect("foreign team must not be paired with the snapshot");
-        assert!(error.to_string().contains("supplied team"), "{error:#}");
+        let snapshot =
+            crate::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile)
+                .expect("freeze PersonaPlex bundle");
+        let collection = snapshot.cover().collection();
+        let bundle = PersonaPlexWeights::from_bundle_snapshot(snapshot)
+            .expect("select exact PersonaPlex bundle");
+        assert_eq!(bundle.authority().collection(), collection);
         pile.close().expect("close synthetic PersonaPlex pile");
     }
 
@@ -610,18 +581,15 @@ mod native_authority_tests {
         let root = fragment.root().unwrap();
         crate::model_collection::publish_model_bundle_fragment(
             &mut pile,
-            test_team(),
             &SigningKey::from_bytes(&[0x50; 32]),
             root,
             fragment,
         )
         .expect("publish incompatible PersonaPlex root");
-        let snapshot = crate::model_collection::snapshot_model_bundle_collection_local_latest(
-            &mut pile,
-            test_team(),
-        )
-        .expect("freeze incompatible PersonaPlex prefix");
-        let error = PersonaPlexWeights::from_bundle_snapshot(test_team(), snapshot)
+        let snapshot =
+            crate::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile)
+                .expect("freeze incompatible PersonaPlex prefix");
+        let error = PersonaPlexWeights::from_bundle_snapshot(snapshot)
             .err()
             .expect("f16 exact coordinate must fail");
         assert!(format!("{error:#}").contains("is not f32"), "{error:#}");
@@ -642,18 +610,15 @@ mod native_authority_tests {
         fragment += entity! { ExclusiveId::force_ref(&root) @ attrs::source: other_source };
         crate::model_collection::publish_model_bundle_fragment(
             &mut pile,
-            test_team(),
             &SigningKey::from_bytes(&[0x50; 32]),
             root,
             fragment,
         )
         .expect("publish malformed PersonaPlex root");
-        let snapshot = crate::model_collection::snapshot_model_bundle_collection_local_latest(
-            &mut pile,
-            test_team(),
-        )
-        .expect("freeze malformed PersonaPlex prefix");
-        let error = PersonaPlexWeights::from_bundle_snapshot(test_team(), snapshot)
+        let snapshot =
+            crate::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile)
+                .expect("freeze malformed PersonaPlex prefix");
+        let error = PersonaPlexWeights::from_bundle_snapshot(snapshot)
             .err()
             .expect("nonfunctional source coordinate must fail");
         assert!(
@@ -676,18 +641,15 @@ mod native_authority_tests {
         fragment += entity! { ExclusiveId::force_ref(&root) @ attrs::quantization: "other" };
         crate::model_collection::publish_model_bundle_fragment(
             &mut pile,
-            test_team(),
             &SigningKey::from_bytes(&[0x50; 32]),
             root,
             fragment,
         )
         .expect("publish malformed PersonaPlex root");
-        let snapshot = crate::model_collection::snapshot_model_bundle_collection_local_latest(
-            &mut pile,
-            test_team(),
-        )
-        .expect("freeze malformed PersonaPlex prefix");
-        let error = PersonaPlexWeights::from_bundle_snapshot(test_team(), snapshot)
+        let snapshot =
+            crate::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile)
+                .expect("freeze malformed PersonaPlex prefix");
+        let error = PersonaPlexWeights::from_bundle_snapshot(snapshot)
             .err()
             .expect("nonfunctional quantization coordinate must fail");
         assert!(
@@ -709,7 +671,6 @@ mod native_authority_tests {
         let existing_root = existing.root().unwrap();
         let existing_commit = crate::model_collection::publish_model_bundle_fragment(
             &mut pile,
-            test_team(),
             &SigningKey::from_bytes(&[0x50; 32]),
             existing_root,
             existing,
@@ -724,18 +685,15 @@ mod native_authority_tests {
         let candidate_root = candidate.root().unwrap();
         let candidate_commit = crate::model_collection::publish_model_bundle_fragment(
             &mut pile,
-            test_team(),
             &SigningKey::from_bytes(&[0x50; 32]),
             candidate_root,
             candidate,
         )
         .expect("publish conflicting PersonaPlex authority");
-        let snapshot = crate::model_collection::snapshot_model_bundle_collection_local_latest(
-            &mut pile,
-            test_team(),
-        )
-        .expect("freeze conflicting bundle authority");
-        let error = PersonaPlexWeights::from_bundle_snapshot(test_team(), snapshot)
+        let snapshot =
+            crate::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile)
+                .expect("freeze conflicting bundle authority");
+        let error = PersonaPlexWeights::from_bundle_snapshot(snapshot)
             .err()
             .expect("conflicting Source/native roots must fail closed");
         assert!(format!("{error:#}").contains("ambiguous"), "{error:#}");
@@ -763,18 +721,15 @@ mod native_authority_tests {
             let root = fragment.root().expect("PersonaPlex model root");
             crate::model_collection::publish_model_bundle_fragment(
                 &mut pile,
-                test_team(),
                 &SigningKey::from_bytes(&[0x50; 32]),
                 root,
                 fragment,
             )
             .expect("publish PersonaPlex root");
-            let snapshot = crate::model_collection::snapshot_model_bundle_collection_local_latest(
-                &mut pile,
-                test_team(),
-            )
-            .expect("freeze PersonaPlex prefix");
-            let bundle = PersonaPlexWeights::from_bundle_snapshot(test_team(), snapshot)
+            let snapshot =
+                crate::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile)
+                    .expect("freeze PersonaPlex prefix");
+            let bundle = PersonaPlexWeights::from_bundle_snapshot(snapshot)
                 .unwrap_or_else(|e| panic!("{} bundle must select: {e:#}", form.label()));
             let weights = bundle.weights();
             assert_eq!(weights.root(), root, "{}", form.label());

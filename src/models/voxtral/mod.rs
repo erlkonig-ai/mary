@@ -283,7 +283,6 @@ mod tests {
         for fragment in fragments {
             crate::model_collection::publish_model_fragment(
                 &mut pile,
-                test_team(),
                 &SigningKey::from_bytes(&[0x56; 32]),
                 fragment,
             )
@@ -304,8 +303,7 @@ mod tests {
     }
 
     fn load(path: &Path) -> anyhow::Result<VoxtralWeights<PileSnapshot>> {
-        let snapshot =
-            crate::model_collection::load_model_collection_local_latest(path, test_team())?;
+        let snapshot = crate::model_collection::load_model_collection_local_latest(path)?;
         VoxtralWeights::from_snapshot(snapshot)
     }
 
@@ -418,11 +416,8 @@ mod tests {
         let signing_key = SigningKey::from_bytes(&[0x56; 32]);
         let mut open = Pile::open(pile.path()).expect("open exact-only Voxtral pile");
         let derive = |open: &mut Pile| {
-            let team = crate::model_collection::model_graph_team_or_own(open, &signing_key)
-                .expect("exact Voxtral prefix names one team");
-            let snapshot =
-                crate::model_collection::snapshot_model_collection_local_latest(open, team)
-                    .expect("freeze exact Voxtral prefix");
+            let snapshot = crate::model_collection::snapshot_model_collection_local_latest(open)
+                .expect("freeze exact Voxtral prefix");
             let exact = crate::selection::SelectedModelIndex::from_snapshot(
                 snapshot,
                 ModelSelector::Source {
@@ -458,11 +453,8 @@ mod tests {
             "repeating an identical derivation appended bytes"
         );
 
-        let team = crate::model_collection::model_graph_team_or_own(&mut open, &signing_key)
-            .expect("repeated cohort names one team");
-        let complete =
-            crate::model_collection::snapshot_model_collection_local_latest(&mut open, team)
-                .expect("freeze complete repeated cohort");
+        let complete = crate::model_collection::snapshot_model_collection_local_latest(&mut open)
+            .expect("freeze complete repeated cohort");
         let weights = VoxtralWeights::from_snapshot(complete).expect("select repeated cohort");
         assert_eq!(weights.roots().1, first_root);
         assert_eq!(weights.validate_f16_parity().unwrap(), (2, 4));
@@ -478,7 +470,7 @@ mod tests {
             return;
         };
         let path = Path::new(&path);
-        let (_, snapshot) = crate::model_collection::load_sole_model_collection_local_latest(path)
+        let snapshot = crate::model_collection::load_model_collection_local_latest(path)
             .expect("load configured native Voxtral collection");
         let weights =
             VoxtralWeights::from_snapshot(snapshot).expect("select configured Voxtral cohort");

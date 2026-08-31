@@ -114,11 +114,10 @@ fn publish_embedding_candidate_with_contract_impl(
     // destination's own reader, then append the signed commit as the final
     // publication step.
     let candidate_facts = candidate.facts().clone();
-    let team = mary::model_collection::model_graph_team_or_own(pile, signing_key)?;
-    let prepared = mary::model_collection::prepare_model_fragment(team, candidate)
-        .map_err(|error| anyhow::anyhow!("prepare embedding collection commit: {error}"))?;
+    let collection = mary::model_collection::model_graph_collection_or_create(pile, signing_key)?;
+    let prepared = mary::model_collection::prepare_model_fragment(candidate);
     let mut staged = prepared
-        .stage(pile, signing_key)
+        .stage_for(pile, collection, signing_key)
         .map_err(|error| anyhow::anyhow!("stage embedding commit dependencies: {error}"))?;
 
     // The reason `local_model_cover`'s four-trait bound could collapse to one
@@ -133,7 +132,7 @@ fn publish_embedding_candidate_with_contract_impl(
         .store_mut()
         .snapshot()
         .map_err(|error| anyhow::anyhow!("freeze staged embedding observation: {error}"))?;
-    let snapshot = mary::model_collection::snapshot_model_collection_in(&store, team)?;
+    let snapshot = mary::model_collection::snapshot_model_collection_for(&store, collection)?;
     let (mut facts, _, reader) = snapshot.into_parts();
     facts += candidate_facts;
     let selected = SelectedModelIndex::from_graph(

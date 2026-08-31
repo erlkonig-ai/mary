@@ -190,7 +190,7 @@ fn main() {
         gib(pile_size)
     );
 
-    let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(&pile_path)
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile_path)
         .expect("fresh-load native Nomic text collection");
     let keymap = mary::selection::load_keymap_from_graph(
         snapshot.facts(),

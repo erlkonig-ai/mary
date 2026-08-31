@@ -81,9 +81,10 @@ fn main() -> Result<()> {
             let mut pile = Pile::open(path).map_err(|e| anyhow::anyhow!("open pile: {e:?}"))?;
             pile.refresh()
                 .map_err(|e| anyhow::anyhow!("load pile: {e:?}"))?;
-            let team = mary::model_collection::model_graph_team_or_own(&mut pile, &signing_key)
-                .map_err(|e| anyhow::anyhow!("model collection writer: {e}"))?;
-            Some((pile, signing_key, team, Fragment::empty()))
+            let _collection =
+                mary::model_collection::model_graph_collection_or_create(&mut pile, &signing_key)
+                    .map_err(|e| anyhow::anyhow!("model collection writer: {e}"))?;
+            Some((pile, signing_key, Fragment::empty()))
         }
     };
 
@@ -122,7 +123,7 @@ fn main() -> Result<()> {
         anyhow::ensure!(scales == &q.scales[..], "expert {e}: scales differ");
         anyhow::ensure!(scale2 == q.scale2, "expert {e}: global scale differs");
 
-        if let Some((pile, _, _, change)) = writing.as_mut() {
+        if let Some((pile, _, change)) = writing.as_mut() {
             // put() returns the handle the facts then name, so the blob and the
             // fact about it cannot refer to different bytes.
             let handle = pile
@@ -147,17 +148,16 @@ fn main() -> Result<()> {
         );
     }
 
-    if let Some((mut pile, signing_key, team, change)) = writing {
+    if let Some((mut pile, signing_key, change)) = writing {
         if !change.facts().is_empty() {
-            mary::model_collection::publish_model_fragment(&mut pile, team, &signing_key, change)
+            mary::model_collection::publish_model_fragment(&mut pile, &signing_key, change)
                 .map_err(|e| anyhow::anyhow!("publish model collection: {e}"))?;
         }
         println!("wrote {count} expert(s) to {}", pile_path.clone().unwrap());
 
         // Query the collection we just wrote, by layer.
-        let snapshot =
-            mary::model_collection::snapshot_model_collection_local_latest(&mut pile, team)
-                .map_err(|e| anyhow::anyhow!("snapshot model collection: {e}"))?;
+        let snapshot = mary::model_collection::snapshot_model_collection_local_latest(&mut pile)
+            .map_err(|e| anyhow::anyhow!("snapshot model collection: {e}"))?;
         let held = experts_in_layers(snapshot.facts(), 0..=20);
         let all = experts_in_layers(snapshot.facts(), i64::MIN..=i64::MAX);
         println!(

@@ -98,9 +98,7 @@ mod imp {
         // exact content roots returned by this invocation. Other collection
         // members, including the shared codec and stale coordinate conflicts,
         // cannot widen root-addressed selection.
-        let team = mary::model_collection::model_graph_team_or_own(pile, signing_key)?;
-        let source_snapshot =
-            mary::model_collection::snapshot_model_collection_local_latest(pile, team)?;
+        let source_snapshot = mary::model_collection::snapshot_model_collection_local_latest(pile)?;
         let exact = select_index(&source_snapshot, base_root)?;
         let talker_f16 = select_index(&source_snapshot, talker_root)?;
         drop(source_snapshot);
@@ -138,13 +136,13 @@ mod imp {
         .map_err(|error| anyhow::anyhow!("build folded model root: {error}"))?;
         let folded_root = folded.root().expect("folded model root");
         let _folded_commit =
-            mary::model_collection::publish_model_fragment(pile, team, signing_key, folded)
+            mary::model_collection::publish_model_fragment(pile, signing_key, folded)
                 .map_err(|error| anyhow::anyhow!("publish folded model root: {error}"))?;
 
         // Gate the same locally admitted prefix Voice will observe, not merely
         // the four commits returned by this invocation. Stale coordinate
         // conflicts and invalid matching records therefore fail here too.
-        let complete = mary::model_collection::snapshot_model_collection_local_latest(pile, team)?;
+        let complete = mary::model_collection::snapshot_model_collection_local_latest(pile)?;
         let weights = Qwen3TtsWeights::from_snapshot(complete, variant)?;
         let (exact_count, f16_count, folded_count) = weights.counts();
         weights.validate_runtime_cohort()?;

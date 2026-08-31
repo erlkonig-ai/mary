@@ -879,7 +879,6 @@ mod tests {
         for fragment in fragments {
             crate::model_collection::publish_model_fragment(
                 &mut pile,
-                test_team(),
                 &SigningKey::from_bytes(&[0x51; 32]),
                 fragment,
             )
@@ -960,11 +959,8 @@ mod tests {
             }
             publish(file.path(), fragments);
 
-            let snapshot = crate::model_collection::load_model_collection_local_latest(
-                file.path(),
-                test_team(),
-            )
-            .expect("freeze native Qwen3-TTS snapshot");
+            let snapshot = crate::model_collection::load_model_collection_local_latest(file.path())
+                .expect("freeze native Qwen3-TTS snapshot");
             let weights = Qwen3TtsWeights::from_snapshot(snapshot, variant)
                 .unwrap_or_else(|e| panic!("{} cohort must select: {e:#}", form.label()));
             assert_eq!(weights.counts(), (2, 1, 1), "{}", form.label());
@@ -995,9 +991,8 @@ mod tests {
         let variant = Qwen3TtsVariant::Base1_7B;
         publish(file.path(), cohort(variant, crate::leaf::Form::TwoBlob));
 
-        let snapshot =
-            crate::model_collection::load_model_collection_local_latest(file.path(), test_team())
-                .expect("freeze native Qwen3-TTS snapshot");
+        let snapshot = crate::model_collection::load_model_collection_local_latest(file.path())
+            .expect("freeze native Qwen3-TTS snapshot");
         let weights = Qwen3TtsWeights::from_snapshot(snapshot, variant)
             .expect("select complete native Qwen3-TTS cohort");
         assert_eq!(weights.variant(), variant);
@@ -1020,9 +1015,8 @@ mod tests {
         );
         assert_eq!(weights.counts(), (2, 1, 1));
 
-        let widened =
-            crate::model_collection::load_model_collection_local_latest(file.path(), test_team())
-                .expect("load widened native Qwen3-TTS snapshot");
+        let widened = crate::model_collection::load_model_collection_local_latest(file.path())
+            .expect("load widened native Qwen3-TTS snapshot");
         let error = Qwen3TtsWeights::from_snapshot(widened, variant)
             .err()
             .expect("same-coordinate codec roots must fail closed");

@@ -68,8 +68,8 @@
 //! ## Collection identity is preserved, deliberately
 //!
 //! The typed leaves land as a NEW COMMIT into the SAME named collection, under
-//! the SAME team the source publishes as. A `SimpleArchiveCollection` is
-//! identified by its descriptor — name, team, representation, recipe — and the
+//! the SAME descriptor the source publishes as. A typed collection is
+//! identified by its policy-bearing descriptor, and the
 //! conversion moves none of those, so the collection handle the destination
 //! commits against is byte-identical to the source's. That is load-bearing:
 //! model piles resolve by content address, and a collection identity that
@@ -179,8 +179,7 @@ fn migrate(src: &Path, dst: &Path, signing_key: &ed25519_dalek::SigningKey) -> R
         "pile_leaf_migrate accepts exactly one `mary-model-graph` source collection; \
          `mary-model-bundles` requires a bundle-preserving rewrite"
     );
-    let team = source_collection.authority;
-    let expected = source_collection.collection.clone();
+    let expected = source_collection.collection;
     eprintln!(
         "[migrate] {src:?}: native collection, {} facts",
         tribles.len()
@@ -378,13 +377,13 @@ fn migrate(src: &Path, dst: &Path, signing_key: &ed25519_dalek::SigningKey) -> R
     // ── publish, so the production loader can open what we just wrote ───────
     // Publish the converted graph through the same collection identity the
     // production loader selected from the source.
-    let commit = mary::model_collection::publish_model_fragment(
-        &mut pile,
-        team,
-        &signing_key,
-        Fragment::new(std::iter::empty(), facts),
-    )
-    .map_err(|e| anyhow::anyhow!("publish model collection commit: {e}"))?;
+    let commit = pile
+        .commit(
+            expected,
+            signing_key,
+            Fragment::new(std::iter::empty(), facts),
+        )
+        .map_err(|e| anyhow::anyhow!("publish model collection commit: {e}"))?;
     // Not a formality: if the descriptor had moved, every already-persisted
     // reference to this model would stop resolving, and the failure would
     // surface as a pile that simply has no model in it rather than as an
@@ -459,7 +458,6 @@ mod tests {
         let source = TempPilePath::new("bundle-source");
         let destination = TempPilePath::new("bundle-destination");
         let signer = SigningKey::from_bytes(&[0x61; 32]);
-        let team = signer.verifying_key();
 
         let model = entity! {
             _ @ attrs::data: vec![1.25_f32].to_blob(),
@@ -468,7 +466,7 @@ mod tests {
         let model_root = model.root().expect("fixture model root");
         let mut pile = Pile::open(source.as_path()).expect("open source pile");
         mary::model_collection::publish_model_bundle_fragment(
-            &mut pile, team, &signer, model_root, model,
+            &mut pile, &signer, model_root, model,
         )
         .expect("publish bundle-only tensor model");
         pile.close().expect("close source pile");
@@ -492,7 +490,6 @@ mod tests {
         let source = TempPilePath::new("mixed-source");
         let destination = TempPilePath::new("mixed-destination");
         let signer = SigningKey::from_bytes(&[0x62; 32]);
-        let team = signer.verifying_key();
 
         let graph = entity! {
             _ @ attrs::data: vec![1.25_f32].to_blob(),
@@ -504,11 +501,10 @@ mod tests {
         };
         let bundle_root = bundle.root().expect("fixture bundle root");
         let mut pile = Pile::open(source.as_path()).expect("open source pile");
-        mary::model_collection::publish_model_fragment(&mut pile, team, &signer, graph)
+        mary::model_collection::publish_model_fragment(&mut pile, &signer, graph)
             .expect("publish graph tensor model");
         mary::model_collection::publish_model_bundle_fragment(
             &mut pile,
-            team,
             &signer,
             bundle_root,
             bundle,

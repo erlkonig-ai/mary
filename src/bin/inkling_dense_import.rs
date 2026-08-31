@@ -66,7 +66,7 @@ macro_rules! dense_leaf {
         );
 
         let len = blob.bytes.len();
-        if let Some((pile, _, _, change)) = $writing.as_mut() {
+        if let Some((pile, _, change)) = $writing.as_mut() {
             // put() returns the handle the facts then name, so the blob and the
             // fact about it cannot refer to different bytes.
             let handle = pile
@@ -257,23 +257,23 @@ fn main() -> Result<()> {
             }
             // Fail before checkpoint indexing or the first tensor conversion
             // unless this durable signer can publish to the existing authority.
-            let team = mary::model_collection::model_graph_team_or_own(&mut store, &signing_key)
-                .map_err(|e| anyhow::anyhow!("model collection writer: {e}"))?;
-            match mary::model_collection::snapshot_sole_model_collection_local_latest(&mut store) {
-                Ok((snapshot_team, snapshot)) => {
-                    anyhow::ensure!(
-                        snapshot_team == team,
-                        "model collection authority changed during writer preflight"
-                    );
-                    let facts =
-                        mary::model_collection::project_legacy_model_attributes(snapshot.facts())
-                            .facts;
-                    let reader = snapshot.store();
-                    // One sweep per (dtype, rank), matching the weight handle
-                    // but never fetching it — a name with no weight beside it
-                    // is not an imported tensor, and reading the leaves back to
-                    // find out what is missing would defeat the point.
-                    macro_rules! seen {
+            let collection =
+                mary::model_collection::model_graph_collection_or_create(&mut store, &signing_key)
+                    .map_err(|e| anyhow::anyhow!("model collection writer: {e}"))?;
+            let observation = store
+                .snapshot()
+                .map_err(|e| anyhow::anyhow!("freeze model collection: {e}"))?;
+            let snapshot =
+                mary::model_collection::snapshot_model_collection_for(&observation, collection)
+                    .map_err(|e| anyhow::anyhow!("model collection: {e}"))?;
+            let facts =
+                mary::model_collection::project_legacy_model_attributes(snapshot.facts()).facts;
+            let reader = snapshot.store();
+            // One sweep per (dtype, rank), matching the weight handle
+            // but never fetching it — a name with no weight beside it
+            // is not an imported tensor, and reading the leaves back to
+            // find out what is missing would defeat the point.
+            macro_rules! seen {
                         ($elem:ty, $rank:literal) => {{
                             for (n, _h) in triblespace::macros::find!(
                                 (n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
@@ -290,24 +290,19 @@ fn main() -> Result<()> {
                             }
                         }};
                     }
-                    seen!(BF16, 0);
-                    seen!(BF16, 1);
-                    seen!(BF16, 2);
-                    seen!(BF16, 3);
-                    seen!(BF16, 4);
-                    seen!(F32, 0);
-                    seen!(F32, 1);
-                    seen!(F32, 2);
-                    seen!(F32, 3);
-                    seen!(F32, 4);
-                    println!("resuming   {} tensors already in the pile", present.len());
-                }
-                Err(mary::model_collection::SnapshotSoleModelGraphError::Team(
-                    mary::model_collection::SoleModelGraphTeamError::None,
-                )) => {}
-                Err(e) => return Err(anyhow::anyhow!("model collection: {e}")),
-            }
-            Some((store, signing_key, team, Fragment::empty()))
+            seen!(BF16, 0);
+            seen!(BF16, 1);
+            seen!(BF16, 2);
+            seen!(BF16, 3);
+            seen!(BF16, 4);
+            seen!(F32, 0);
+            seen!(F32, 1);
+            seen!(F32, 2);
+            seen!(F32, 3);
+            seen!(F32, 4);
+            println!("resuming   {} tensors already in the pile", present.len());
+            drop(snapshot);
+            Some((store, signing_key, Fragment::empty()))
         }
     };
 
@@ -363,10 +358,10 @@ fn main() -> Result<()> {
         total_bytes += bytes;
         done += 1;
         pending += 1;
-        if let Some((pile, signing_key, team, change)) = writing.as_mut() {
+        if let Some((pile, signing_key, change)) = writing.as_mut() {
             if pending >= FLUSH_EVERY {
                 let batch = std::mem::replace(change, Fragment::empty());
-                mary::model_collection::publish_model_fragment(pile, *team, signing_key, batch)
+                mary::model_collection::publish_model_fragment(pile, signing_key, batch)
                     .map_err(|e| anyhow::anyhow!("publish model collection: {e}"))?;
                 commits += 1;
                 pending = 0;
@@ -386,9 +381,9 @@ fn main() -> Result<()> {
     );
 
     println!("skipped    {skipped} tensors already present");
-    if let Some((mut pile, signing_key, team, change)) = writing {
+    if let Some((mut pile, signing_key, change)) = writing {
         if pending > 0 {
-            mary::model_collection::publish_model_fragment(&mut pile, team, &signing_key, change)
+            mary::model_collection::publish_model_fragment(&mut pile, &signing_key, change)
                 .map_err(|e| anyhow::anyhow!("publish model collection: {e}"))?;
             commits += 1;
         }

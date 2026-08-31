@@ -73,12 +73,8 @@ fn handle_hex(handle: &triblespace::core::collection::CollectionHandle) -> Strin
 
 fn collection_identity(
     source: &mary::persist::ModelPileCollection,
-) -> (mary::persist::ModelPileCollectionShape, [u8; 32], [u8; 32]) {
-    (
-        source.shape,
-        source.authority.to_bytes(),
-        source.collection.handle().raw,
-    )
+) -> (mary::persist::ModelPileCollectionShape, [u8; 32]) {
+    (source.shape, source.collection.handle().raw)
 }
 
 /// One spelling per fact: project the canonical aliases in, then drop the
@@ -105,7 +101,7 @@ fn main() -> Result<()> {
     let converted = mary::persist::read_model_pile(dst)?;
 
     // The collection set is the thing a converted model pile is FOR. Every
-    // shape, authority, and descriptor identity must be the source's, byte for
+    // shape and policy-bearing descriptor identity must be the source's, byte for
     // byte: model piles resolve by content address, and silently collapsing a
     // mixed graph+bundle source to one graph collection is data-model loss even
     // if the decoded union happens to contain the same facts.

@@ -836,7 +836,6 @@ mod tests {
         for fragment in fragments {
             crate::model_collection::publish_model_fragment(
                 &mut pile,
-                test_team(),
                 &SigningKey::from_bytes(&[0x46; 32]),
                 fragment,
             )
@@ -858,9 +857,8 @@ mod tests {
             ],
         );
 
-        let snapshot =
-            crate::model_collection::load_model_collection_local_latest(file.path(), test_team())
-                .expect("freeze native FLUX snapshot");
+        let snapshot = crate::model_collection::load_model_collection_local_latest(file.path())
+            .expect("freeze native FLUX snapshot");
         let weights = FluxWeights::from_snapshot(snapshot, ModelVariant::Klein)
             .expect("index all FLUX components");
 
@@ -890,9 +888,8 @@ mod tests {
                 9.0,
             )],
         );
-        let widened =
-            crate::model_collection::load_model_collection_local_latest(file.path(), test_team())
-                .expect("load widened native FLUX snapshot");
+        let widened = crate::model_collection::load_model_collection_local_latest(file.path())
+            .expect("load widened native FLUX snapshot");
         let error = FluxWeights::from_snapshot(widened, ModelVariant::Klein)
             .err()
             .expect("a shadowed tensor must fail closed");

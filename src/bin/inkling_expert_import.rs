@@ -65,9 +65,8 @@ fn verify_share(
 ) -> Result<()> {
     let path = std::path::Path::new(pile_path);
     let mut pile = Pile::open(path).map_err(|e| anyhow::anyhow!("open {path:?}: {e:?}"))?;
-    let (_, snapshot) =
-        mary::model_collection::snapshot_sole_model_collection_local_latest(&mut pile)
-            .map_err(|e| anyhow::anyhow!("{path:?}: model collection snapshot: {e}"))?;
+    let snapshot = mary::model_collection::snapshot_model_collection_local_latest(&mut pile)
+        .map_err(|e| anyhow::anyhow!("{path:?}: model collection snapshot: {e}"))?;
     let facts = mary::model_collection::project_legacy_model_attributes(snapshot.facts()).facts;
     let (_, _, reader) = snapshot.into_parts();
     pile.close()
@@ -316,23 +315,22 @@ fn main() -> Result<()> {
     // Existing collections admit only the authority or a signer with a
     // resident ACTION_WRITE proof; an empty pile is founded under this durable
     // key. This happens before any tensor payload is read or blob appended.
-    let team = mary::model_collection::model_graph_team_or_own(&mut store, &signing_key)
-        .map_err(|e| anyhow::anyhow!("model collection writer: {e}"))?;
+    let collection =
+        mary::model_collection::model_graph_collection_or_create(&mut store, &signing_key)
+            .map_err(|e| anyhow::anyhow!("model collection writer: {e}"))?;
     let mut present: std::collections::HashSet<(String, i64)> = Default::default();
-    match mary::model_collection::snapshot_sole_model_collection_local_latest(&mut store) {
-        Ok((snapshot_team, snapshot)) => {
-            anyhow::ensure!(
-                snapshot_team == team,
-                "model collection authority changed during writer preflight"
-            );
-            let facts =
-                mary::model_collection::project_legacy_model_attributes(snapshot.facts()).facts;
-            let reader = snapshot.store();
-            // Both element types, because this binary writes both. The weight
-            // handle is matched but never fetched: a name and an index with no
-            // weight beside them is not an imported expert, and reading 144
-            // GiB back to find out what is missing would defeat the point.
-            for (nh, i, _h) in triblespace::macros::find!(
+    let observation = store
+        .snapshot()
+        .map_err(|e| anyhow::anyhow!("freeze model collection: {e}"))?;
+    let snapshot = mary::model_collection::snapshot_model_collection_for(&observation, collection)
+        .map_err(|e| anyhow::anyhow!("model collection: {e}"))?;
+    let facts = mary::model_collection::project_legacy_model_attributes(snapshot.facts()).facts;
+    let reader = snapshot.store();
+    // Both element types, because this binary writes both. The weight
+    // handle is matched but never fetched: a name and an index with no
+    // weight beside them is not an imported expert, and reading 144
+    // GiB back to find out what is missing would defeat the point.
+    for (nh, i, _h) in triblespace::macros::find!(
                 (n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
                  i: i64,
                  h: Inline<inlineencodings::Handle<
@@ -342,12 +340,12 @@ fn main() -> Result<()> {
                     { _?e @ metadata::name: ?n, attrs::expert_index: ?i,
                       attrs::weight_nvfp4_2: ?h },
                 ])
-            ) {
-                let name: anybytes::View<str> =
-                    reader.get(nh).map_err(|e| anyhow::anyhow!("name: {e:?}"))?;
-                present.insert((name.to_string(), i));
-            }
-            for (nh, i, _h) in triblespace::macros::find!(
+    ) {
+        let name: anybytes::View<str> =
+            reader.get(nh).map_err(|e| anyhow::anyhow!("name: {e:?}"))?;
+        present.insert((name.to_string(), i));
+    }
+    for (nh, i, _h) in triblespace::macros::find!(
                 (n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
                  i: i64,
                  h: Inline<inlineencodings::Handle<
@@ -357,18 +355,13 @@ fn main() -> Result<()> {
                     { _?e @ metadata::name: ?n, attrs::expert_index: ?i,
                       attrs::weight::<triblespace::core::blob::encodings::tensor::elements::BF16, 2>(): ?h },
                 ])
-            ) {
-                let name: anybytes::View<str> =
-                    reader.get(nh).map_err(|e| anyhow::anyhow!("name: {e:?}"))?;
-                present.insert((name.to_string(), i));
-            }
-            println!("resuming   {} experts already in the pile", present.len());
-        }
-        Err(mary::model_collection::SnapshotSoleModelGraphError::Team(
-            mary::model_collection::SoleModelGraphTeamError::None,
-        )) => {}
-        Err(e) => return Err(anyhow::anyhow!("model collection: {e}")),
+    ) {
+        let name: anybytes::View<str> =
+            reader.get(nh).map_err(|e| anyhow::anyhow!("name: {e:?}"))?;
+        present.insert((name.to_string(), i));
     }
+    println!("resuming   {} experts already in the pile", present.len());
+    drop(snapshot);
 
     // Admission above precedes checkpoint indexing and tensor conversion, so
     // an unauthorized invocation cannot burn through a node's share before it
@@ -413,13 +406,8 @@ fn main() -> Result<()> {
         () => {
             if pending > 0 {
                 let batch = std::mem::replace(&mut change, Fragment::empty());
-                mary::model_collection::publish_model_fragment(
-                    &mut store,
-                    team,
-                    &signing_key,
-                    batch,
-                )
-                .map_err(|e| anyhow::anyhow!("publish model collection: {e}"))?;
+                mary::model_collection::publish_model_fragment(&mut store, &signing_key, batch)
+                    .map_err(|e| anyhow::anyhow!("publish model collection: {e}"))?;
                 commits += 1;
                 pending = 0;
             }

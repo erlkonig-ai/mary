@@ -138,9 +138,8 @@ fn main() -> anyhow::Result<()> {
         // atomic sole-team snapshot the `voice` faculty uses, so the gate
         // renders through the production selection rather than a drifting one.
         let variant = mary::speak::Qwen3TtsVariant::from_env();
-        let (_, snapshot) =
-            mary::model_collection::load_sole_model_collection_local_latest(Path::new(pile))
-                .with_context(|| format!("freeze native Qwen3-TTS snapshot {pile}"))?;
+        let snapshot = mary::model_collection::load_model_collection_local_latest(Path::new(pile))
+            .with_context(|| format!("freeze native Qwen3-TTS snapshot {pile}"))?;
         let weights = mary::speak::Qwen3TtsWeights::from_snapshot(snapshot, variant)
             .with_context(|| format!("select {variant:?} Qwen3-TTS cohort from {pile}"))?;
         let n = mary::speak::synthesize_to_wav(

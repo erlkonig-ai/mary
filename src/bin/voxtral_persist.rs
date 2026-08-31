@@ -150,10 +150,6 @@ fn run() -> anyhow::Result<()> {
             mary::persist::QUANTIZATION_NATIVE,
         )?;
 
-        // The same team the import above published under: an existing model
-        // graph's team, or this key as a team of one on a fresh pile.
-        let team = mary::model_collection::model_graph_team_or_own(&mut pile, &signing_key)?;
-
         // Freeze before deriving: later appends cannot move the source root or
         // the bytes under the conversion. This line previously tried to say it
         // by naming the just-published commit — `&[exact_commit]` — which never
@@ -169,7 +165,7 @@ fn run() -> anyhow::Result<()> {
         let store = pile
             .snapshot()
             .map_err(|error| anyhow::anyhow!("freeze model pile observation: {error}"))?;
-        let exact_snapshot = mary::model_collection::snapshot_model_collection_in(&store, team)?;
+        let exact_snapshot = mary::model_collection::snapshot_model_collection_in(&store)?;
         let exact = SelectedModelIndex::from_snapshot(
             exact_snapshot,
             ModelSelector::Source {
@@ -189,8 +185,7 @@ fn run() -> anyhow::Result<()> {
 
         // Gate the exact local prefix the live runtime admits, including any
         // previously published coordinate conflicts or invalid native records.
-        let complete =
-            mary::model_collection::snapshot_model_collection_local_latest(&mut pile, team)?;
+        let complete = mary::model_collection::snapshot_model_collection_local_latest(&mut pile)?;
         let weights = VoxtralWeights::from_snapshot(complete)?;
         anyhow::ensure!(
             weights.roots() == (exact_root, f16_root),

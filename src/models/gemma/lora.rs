@@ -486,16 +486,9 @@ mod tests {
             let mut pile = Pile::open(&pile_path).unwrap();
             pile.refresh().unwrap();
             let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
-            let team =
-                crate::model_collection::model_graph_team_or_own(&mut pile, &signing_key).unwrap();
             let fragment = lora.save_to_pile("gemma-4-E4B-it", &mut pile).unwrap();
-            crate::model_collection::publish_model_fragment(
-                &mut pile,
-                team,
-                &signing_key,
-                fragment,
-            )
-            .unwrap();
+            crate::model_collection::publish_model_fragment(&mut pile, &signing_key, fragment)
+                .unwrap();
             pile.close().unwrap();
         }
 

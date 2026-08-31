@@ -998,9 +998,8 @@ impl PileSource {
 
         let t_open = std::time::Instant::now();
         let mut pile = Pile::open(path).map_err(|e| anyhow::anyhow!("open {path:?}: {e:?}"))?;
-        let (_, snapshot) =
-            crate::model_collection::snapshot_sole_model_collection_local_latest(&mut pile)
-                .map_err(|e| anyhow::anyhow!("{path:?}: model collection snapshot: {e}"))?;
+        let snapshot = crate::model_collection::snapshot_model_collection_local_latest(&mut pile)
+            .map_err(|e| anyhow::anyhow!("{path:?}: model collection snapshot: {e}"))?;
         let facts =
             crate::model_collection::project_legacy_model_attributes(snapshot.facts()).facts;
         let model_identity = IntoBlob::<SimpleArchive>::to_blob(&facts).get_handle().raw;

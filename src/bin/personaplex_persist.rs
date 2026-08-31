@@ -184,7 +184,8 @@ fn main() -> anyhow::Result<()> {
         let root = candidate
             .root()
             .ok_or_else(|| anyhow::anyhow!("PersonaPlex candidate has no unique model root"))?;
-        let team = mary::model_collection::model_bundle_team_or_own(&mut pile, &signing_key)?;
+        let collection =
+            mary::model_collection::model_bundle_collection_or_create(&mut pile, &signing_key)?;
 
         // H must be independently complete. Validate only the candidate facts
         // against the already-staged attachment prefix; an old broad graph
@@ -195,11 +196,10 @@ fn main() -> anyhow::Result<()> {
             weights.root() == root,
             "staged PersonaPlex root differs from the candidate's exact Source/native root"
         );
-        let prepared =
-            mary::model_collection::prepare_model_bundle_fragment(team, root, candidate)?;
-        let existing =
-            mary::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile, team)?;
-        if let Some(existing) = PersonaPlexWeights::find_in_bundle_snapshot(team, existing)? {
+        let prepared = mary::model_collection::prepare_model_bundle_fragment(root, candidate)?;
+        let store = pile.snapshot()?;
+        let existing = mary::model_collection::snapshot_model_collection_for(&store, collection)?;
+        if let Some(existing) = PersonaPlexWeights::find_in_bundle_snapshot(existing)? {
             anyhow::ensure!(
                 existing.authority().model_root() == root
                     && existing.authority().model_archive_data() == prepared.model_archive_data(),
@@ -375,7 +375,7 @@ fn main() -> anyhow::Result<()> {
         drop(weights);
         let staged = prepared
             .into_prepared_commit()
-            .stage(&mut pile, &signing_key)
+            .stage_for(&mut pile, collection, &signing_key)
             .map_err(|error| anyhow::anyhow!("stage validated PersonaPlex bundle: {error}"))?;
         staged
             .finalize()
