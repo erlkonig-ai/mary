@@ -380,7 +380,7 @@ pub struct ContextPreflighted {
 }
 
 impl ContextPreflighted {
-    fn validate_for(&self, request: &ContextPreflight, context_budget: usize) -> Result<()> {
+    pub fn validate_for(&self, request: &ContextPreflight, context_budget: usize) -> Result<()> {
         anyhow::ensure!(
             self.placement == request.placement,
             "context-preflight placement changed from {:?} to {:?}",
@@ -1232,7 +1232,7 @@ fn parse_native_exec(json: &str) -> Result<NativeExecCall> {
 /// Append a canonical, marker-free transcript projection for one typed call.
 /// The returned range is exact within `said` and can be shifted by the current
 /// session monologue extent for `Decision::fire_projected`.
-fn project_native_exec(said: &mut String, command: &str) -> std::ops::Range<usize> {
+pub fn project_native_exec(said: &mut String, command: &str) -> std::ops::Range<usize> {
     // The separator is projection scaffold too. Naming it inside the range lets
     // Archive remove the entire synthetic suffix without retaining a newline
     // that the model never actually spoke.
@@ -1251,7 +1251,7 @@ fn project_native_exec(said: &mut String, command: &str) -> std::ops::Range<usiz
 /// Associate one arbitrated id with the fragments emitted by its one-token
 /// consult. This check is the TP-safe microturn invariant: neither rank-local
 /// stop policy nor callback record boundaries are allowed to guess the id.
-fn one_token_association(end: &TurnEnd, fragments: String) -> Result<(u32, String)> {
+pub fn one_token_association(end: &TurnEnd, fragments: String) -> Result<(u32, String)> {
     anyhow::ensure!(
         end.tokens == 1 && end.token_ids.len() == 1,
         "one-token consult returned {} token(s) and {} exact id(s)",
