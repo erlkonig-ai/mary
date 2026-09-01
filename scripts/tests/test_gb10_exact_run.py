@@ -283,25 +283,30 @@ Path(os.environ["CARGO_TARGET_DIR"], "result.json").write_text(json.dumps({
         for slot in plan.slots:
             self.assertEqual(git(stage / slot.relative, "rev-parse", "HEAD"), slot.commit)
 
-    def test_missing_siblings_and_back_edge_reuse_primary_worktree(self) -> None:
+    def test_arbitrary_primary_worktree_uses_canonical_topology(self) -> None:
         primary = self.cohort / "primary"
         isolated = (Path(self.temporary.name) / "isolated").resolve()
-        candidate = isolated / "primary"
+        candidate = isolated / "renamed-primary-candidate"
         isolated.mkdir()
         git(primary, "worktree", "add", "--detach", str(candidate), "HEAD")
         try:
             self.assertFalse((isolated / "dep").exists())
             plan = RUNNER.discover(candidate)
+            same_repository_slots = sum(
+                RUNNER.repository(slot.source) == RUNNER.repository(candidate)
+                for slot in plan.slots
+            )
         finally:
             git(primary, "worktree", "remove", "--force", str(candidate))
 
-        self.assertEqual(plan.root, isolated)
+        self.assertEqual(plan.root, self.cohort)
         self.assertEqual(plan.primary, "primary")
         selected_primary = next(slot for slot in plan.slots if slot.relative == "primary")
         self.assertEqual(selected_primary.source, candidate)
+        self.assertEqual(same_repository_slots, 1)
         dep = next(slot for slot in plan.slots if slot.relative == "dep")
         self.assertEqual(dep.source, (self.cohort / "dep").resolve())
-        self.assertEqual(dep.logical, isolated / "dep")
+        self.assertEqual(dep.logical, self.cohort / "dep")
         self.assertFalse(any("subjects" in slot.relative for slot in plan.slots))
 
 

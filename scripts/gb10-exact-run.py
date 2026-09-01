@@ -98,6 +98,11 @@ def git_root(path):
     return Path(p.stdout.strip()).resolve()
 
 
+def repository(path):
+    common = Path(git(path, "rev-parse", "--git-common-dir").stdout.strip())
+    return (common if common.is_absolute() else path / common).resolve()
+
+
 def inspect(source, logical):
     status = git(
         source,
@@ -154,14 +159,11 @@ def inspect(source, logical):
 
 
 def worktrees(source):
-    entries, current = [], None
+    entries = []
     for line in git(source, "worktree", "list", "--porcelain").stdout.splitlines():
         if line.startswith("worktree "):
-            current = [Path(line[9:]).resolve(), False]
-            entries.append(current)
-        elif current and line == "branch refs/heads/main":
-            current[1] = True
-    return [path for path, _ in sorted(entries, key=lambda item: (not item[1], str(item[0])))]
+            entries.append(Path(line[9:]).resolve())
+    return entries
 
 
 def manifests(source):
@@ -213,12 +215,16 @@ def resolve_dependency(slot, manifest_name, raw):
     inside = source_target.relative_to(owner)
     if git(owner, "ls-files", "--error-unmatch", inside.as_posix(), check=False).returncode:
         raise PlanError(f"path dependency manifest is not committed: {source_target}")
-    logical_owner = (
-        slot.logical
-        if owner == slot.source
-        else logical_target.parents[len(inside.parts) - 1]
-    )
-    return owner, logical_owner
+    logical_owner = logical_target.parents[len(inside.parts) - 1]
+    if (
+        owner == slot.source
+        or (
+            repository(owner) == repository(slot.source)
+            and logical_target.is_relative_to(slot.logical)
+        )
+    ):
+        logical_owner = slot.logical
+    return owner, logical_owner, repository(owner)
 
 
 def _discover(primary):
@@ -228,12 +234,18 @@ def _discover(primary):
         raise PlanError(f"primary repository does not exist: {primary}") from error
     if git_root(primary) != primary or not (primary / "Cargo.toml").is_file():
         raise PlanError(f"primary must be a Cargo Git top level: {primary}")
-    pending, slots, claims, count = [(primary, primary)], {}, {primary: primary}, 0
+    primary_logical = worktrees(primary)[0]
+    primary_repository = repository(primary)
+    pending = [(primary, primary_logical)]
+    # Linked worktrees may intentionally occupy distinct slots (cubecl-fork and
+    # cubecl-graph); common-dir identity only adjudicates competing slot claims.
+    slots, claims = {}, {primary_logical: primary_repository}
+    count = 0
     while pending:
         source, logical = pending.pop()
         logical = logical.resolve()
         if logical in slots:
-            if slots[logical].source != source:
+            if repository(slots[logical].source) != repository(source):
                 raise PlanError(f"two source repositories map to {logical}")
             continue
         slot = inspect(source, logical)
@@ -244,14 +256,16 @@ def _discover(primary):
         count += len(names)
         for name in names:
             for raw in path_specs(source / name):
-                owner, logical_owner = resolve_dependency(slot, name, raw)
+                owner, logical_owner, owner_repository = resolve_dependency(slot, name, raw)
                 if logical_owner in slots:
+                    if repository(slots[logical_owner].source) != owner_repository:
+                        raise PlanError(f"two source repositories map to {logical_owner}")
                     continue
                 claimed = claims.get(logical_owner)
-                if claimed is not None and claimed != owner:
+                if claimed is not None and claimed != owner_repository:
                     raise PlanError(f"two source repositories map to {logical_owner}")
                 if claimed is None:
-                    claims[logical_owner] = owner
+                    claims[logical_owner] = owner_repository
                     pending.append((owner, logical_owner))
     for slot in slots.values():
         if git(slot.source, "status", "--porcelain=v1", "--untracked-files=all").stdout:
@@ -266,7 +280,7 @@ def _discover(primary):
              Path(os.path.relpath(s.logical, root)).as_posix())
         for s in sorted(slots.values(), key=lambda item: str(item.logical))
     )
-    primary_relative = Path(os.path.relpath(primary, root)).as_posix()
+    primary_relative = Path(os.path.relpath(primary_logical, root)).as_posix()
     identity = {
         "version": 1,
         "primary": primary_relative,
