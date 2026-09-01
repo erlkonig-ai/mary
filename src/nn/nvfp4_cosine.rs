@@ -313,8 +313,6 @@ impl RowCertificate {
 /// Certifies candidate cosine uppers around one prepared query.
 pub struct CandidateCertificate<'a> {
     query: &'a PreparedQuery,
-    compact_gamma: f64,
-    division_gamma: f64,
     exact_gamma: f64,
     exact_query_norm_bound: f64,
 }
@@ -323,8 +321,6 @@ impl<'a> CandidateCertificate<'a> {
     pub fn new(query: &'a PreparedQuery, exact_dimension: usize) -> Self {
         Self {
             query,
-            compact_gamma: dot_gamma_f64(query.approximate.len()),
-            division_gamma: roundoff_gamma(1, f64::EPSILON / 2.0),
             exact_gamma: dot_gamma_f64(exact_dimension),
             exact_query_norm_bound: add_up_nonnegative(query.approximate_norm, query.error),
         }
@@ -355,30 +351,7 @@ impl<'a> CandidateCertificate<'a> {
         .fold(0.0, add_up_nonnegative)
     }
 
-    /// Certify a raw dot computed near its true value (the canonical CPU lane).
-    pub fn certify_center(&self, row: RowCertificate, raw_dot: f64) -> Result<f64, Error> {
-        if !raw_dot.is_finite() {
-            return Err(Error::new("NVFP4 raw candidate dot is not finite"));
-        }
-        let (norm, row_error, exact_row_norm_bound) = self.row_terms(row);
-        let approximate = if norm == 0.0 { 0.0 } else { raw_dot / norm };
-        if !approximate.is_finite() {
-            return Err(Error::new("NVFP4 approximate cosine is not finite"));
-        }
-        let accumulation_error =
-            multiply_up_nonnegative(self.compact_gamma, self.query.approximate_norm);
-        let division_error = multiply_up_nonnegative(self.division_gamma, approximate.abs());
-        let envelope = [
-            self.semantic_envelope(row_error, exact_row_norm_bound),
-            accumulation_error,
-            division_error,
-        ]
-        .into_iter()
-        .fold(0.0, add_up_nonnegative);
-        Ok(certified_cosine_upper(approximate, envelope))
-    }
-
-    /// Certify an already conservative raw-dot upper from an accelerator.
+    /// Complete an honest raw-dot upper from any [`UpperScanner`].
     pub fn certify_upper(&self, row: RowCertificate, raw_dot_upper: f64) -> Result<f64, Error> {
         if raw_dot_upper.is_nan() || raw_dot_upper == f64::NEG_INFINITY {
             return Err(Error::new(
@@ -386,7 +359,9 @@ impl<'a> CandidateCertificate<'a> {
             ));
         }
         let (norm, row_error, exact_row_norm_bound) = self.row_terms(row);
-        let approximate_upper = if norm == 0.0 {
+        let approximate_upper = if raw_dot_upper == f64::INFINITY {
+            f64::INFINITY
+        } else if norm == 0.0 {
             0.0
         } else {
             divide_up_by_positive(raw_dot_upper, norm)
@@ -486,7 +461,14 @@ impl<'a> ScanSegment<'a> {
         let physical_dimension = codes_per_row
             .checked_mul(2)
             .ok_or_else(|| Error::new("NVFP4 physical dimension overflows usize"))?;
-        if dimension == 0 || physical_dimension < dimension {
+        let expected_physical_dimension = dimension
+            .checked_add(ROTATION_BLOCK - 1)
+            .map(|value| value / ROTATION_BLOCK * ROTATION_BLOCK)
+            .ok_or_else(|| Error::new("NVFP4 padded dimension overflows usize"))?;
+        if dimension == 0
+            || physical_dimension != expected_physical_dimension
+            || blocks_per_row != expected_physical_dimension / QUANT_BLOCK
+        {
             return Err(Error::new("NVFP4 segment dimension is invalid"));
         }
         let floats = rows
@@ -622,7 +604,11 @@ impl UpperScanner for CpuF64UpperScanner {
                     ),
                     certificate.reconstruction_norm,
                 );
-                upper_raw_dots[output] = next_up_f64(center + roundoff);
+                upper_raw_dots[output] = if center.is_finite() {
+                    next_up_f64(center + roundoff)
+                } else {
+                    f64::INFINITY
+                };
                 output += 1;
             }
         }
@@ -1002,6 +988,9 @@ pub fn divide_up_by_positive(numerator: f64, denominator: f64) -> f64 {
 
 /// Higham's gamma bound for `operations` roundings at `unit_roundoff`.
 pub fn roundoff_gamma(operations: usize, unit_roundoff: f64) -> f64 {
+    if operations as u128 > 1u128 << f64::MANTISSA_DIGITS {
+        return f64::INFINITY;
+    }
     let numerator = multiply_up_nonnegative(operations as f64, unit_roundoff);
     if numerator >= 1.0 {
         return f64::INFINITY;
@@ -1064,6 +1053,9 @@ pub fn norm_and_cast_error(values: &[f64], cast: &[f32]) -> Result<(f64, f64), E
 pub fn read_f32(bytes: &[u8]) -> f32 {
     f32::from_le_bytes(bytes[..FLOAT_BYTES].try_into().expect("four-byte f32"))
 }
+
+#[cfg(feature = "nvfp4-cuda")]
+pub mod cuda;
 
 #[cfg(test)]
 mod tests {
@@ -1155,9 +1147,12 @@ mod tests {
             row.error_bound_bytes(),
         )
         .unwrap();
-        let center = raw_dot_f64(prepared.scan_coordinates(), segment, 0);
+        let mut raw_upper = [0.0];
+        CpuF64UpperScanner
+            .scan_upper(prepared.scan_query(), &[segment], &mut raw_upper)
+            .unwrap();
         let upper = CandidateCertificate::new(&prepared, D)
-            .certify_center(row.certificate(), center)
+            .certify_upper(row.certificate(), raw_upper[0])
             .unwrap();
         assert!(exact_cosine(&query, &source).unwrap() <= upper);
     }
@@ -1198,5 +1193,35 @@ mod tests {
     fn certified_upper_uses_exact_scorers_clamped_codomain() {
         assert_eq!(exact_cosine(&[1.0], &[-1.0]).unwrap(), -1.0);
         assert_eq!(certified_cosine_upper(-1.5, 0.25), -1.0);
+    }
+
+    #[test]
+    fn invalid_scanner_claims_fail_closed_and_infinity_fails_open() {
+        let query = PreparedQuery::new(&[1.0], 1).unwrap();
+        let row = QuantizedRow::quantize(&[1.0], 1).unwrap();
+        let zero = QuantizedRow::quantize(&[0.0], 1).unwrap();
+        let certificate = CandidateCertificate::new(&query, 1);
+        assert_eq!(
+            certificate
+                .certify_upper(row.certificate(), f64::INFINITY)
+                .unwrap(),
+            1.0
+        );
+        assert_eq!(
+            certificate
+                .certify_upper(zero.certificate(), f64::INFINITY)
+                .unwrap(),
+            1.0
+        );
+        assert!(
+            certificate
+                .certify_upper(row.certificate(), f64::NAN)
+                .is_err()
+        );
+        assert!(
+            certificate
+                .certify_upper(row.certificate(), f64::NEG_INFINITY)
+                .is_err()
+        );
     }
 }

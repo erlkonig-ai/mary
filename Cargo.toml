@@ -153,6 +153,10 @@ drive-mind = ["serve", "dep:drive"]
 # the realtime lane never instantiates a burn backend (RealtimePipeline has no
 # B: Backend generic, TemporalMetal is raw cubecl, DepthFast/Mimi are CPU).
 cuda-backend = ["q4", "cubecl?/cuda"]
+# Certified ordinary-f32 and portable-f64 CUDA candidate scans for
+# `nn::nvfp4_cosine`. This owns arithmetic only; collection assembly and exact
+# source reranking remain downstream.
+nvfp4-cuda = ["dep:cubecl", "cubecl?/cuda"]
 # Investigation-only: burn's REAL Cuda backend, for backend_matmul_probe.
 burn-cuda-bench = ["burn/cuda", "burn/autotune"]
 
