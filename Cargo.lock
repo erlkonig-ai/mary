@@ -4019,6 +4019,7 @@ dependencies = [
  "burn-ndarray",
  "burn-train",
  "bytes",
+ "ciborium",
  "clap",
  "cpal",
  "cubecl",

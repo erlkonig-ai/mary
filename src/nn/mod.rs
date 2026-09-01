@@ -14,6 +14,12 @@ pub mod mxfp4;
 pub mod norm;
 pub mod npy;
 pub mod npz;
+/// Two-stage residual NVFP4 arithmetic for exact cosine search.
+///
+/// This module is deliberately independent of TribleSpace storage. Search
+/// collections arrange its rows into blobs; accelerator backends consume its
+/// read-only plane views.
+pub mod nvfp4_cosine;
 #[cfg(feature = "q4")]
 pub mod q4;
 pub mod weight_loader;
