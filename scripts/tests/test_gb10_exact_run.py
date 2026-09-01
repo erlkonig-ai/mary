@@ -34,7 +34,11 @@ def git(path: Path, *args: str) -> str:
     return process.stdout.strip()
 
 
-def make_repo(path: Path, files: dict[str, str]) -> None:
+def make_repo(
+    path: Path,
+    files: dict[str, str],
+    symlinks: dict[str, str] | None = None,
+) -> None:
     path.mkdir(parents=True)
     subprocess.run(["git", "init", "--quiet", "--initial-branch=main", str(path)], check=True)
     git(path, "config", "user.name", "Exact Runner Test")
@@ -43,6 +47,10 @@ def make_repo(path: Path, files: dict[str, str]) -> None:
         destination = path / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(contents)
+    for relative, target in (symlinks or {}).items():
+        destination = path / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.symlink_to(target)
     git(path, "add", ".")
     git(path, "commit", "--quiet", "-m", "fixture")
 
@@ -102,15 +110,32 @@ version = "0.1.0"
         make_repo(
             self.cohort / "dep",
             {
+                "Cargo.toml": """
+[package]
+name = "dep-root"
+version = "0.1.0"
+""",
                 "crate/Cargo.toml": """
 [package]
 name = "dep"
 version = "0.1.0"
 
+[dependencies]
+primary-back-edge = { path = "../../primary" }
+
 [dev-dependencies]
 leaf = { path = "../../leaf" }
+""",
+                "bench/Cargo.toml": """
+[package]
+name = "dep-bench"
+version = "0.1.0"
+
+[dependencies]
+dep-root = { path = "subjects/current" }
 """
             },
+            symlinks={"bench/subjects/current": "../.."},
         )
         for name in ("leaf", "shared", "patched", "replacement", "target-leaf"):
             make_repo(
@@ -144,7 +169,7 @@ version = "0.1.0"
                 "target-leaf",
             },
         )
-        self.assertEqual(plan.manifests, 10)
+        self.assertEqual(plan.manifests, 12)
 
         encoded = json.dumps(
             plan.identity(), sort_keys=True, separators=(",", ":")
@@ -252,7 +277,7 @@ Path(os.environ["CARGO_TARGET_DIR"], "result.json").write_text(json.dumps({
         for slot in plan.slots:
             self.assertEqual(git(stage / slot.relative, "rev-parse", "HEAD"), slot.commit)
 
-    def test_missing_siblings_resolve_through_main_worktree(self) -> None:
+    def test_missing_siblings_and_back_edge_reuse_primary_worktree(self) -> None:
         primary = self.cohort / "primary"
         isolated = (Path(self.temporary.name) / "isolated").resolve()
         candidate = isolated / "primary"
@@ -266,9 +291,12 @@ Path(os.environ["CARGO_TARGET_DIR"], "result.json").write_text(json.dumps({
 
         self.assertEqual(plan.root, isolated)
         self.assertEqual(plan.primary, "primary")
+        selected_primary = next(slot for slot in plan.slots if slot.relative == "primary")
+        self.assertEqual(selected_primary.source, candidate)
         dep = next(slot for slot in plan.slots if slot.relative == "dep")
         self.assertEqual(dep.source, (self.cohort / "dep").resolve())
         self.assertEqual(dep.logical, isolated / "dep")
+        self.assertFalse(any("subjects" in slot.relative for slot in plan.slots))
 
 
 if __name__ == "__main__":

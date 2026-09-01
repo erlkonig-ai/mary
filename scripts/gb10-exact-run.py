@@ -213,18 +213,22 @@ def resolve_dependency(slot, manifest_name, raw):
     inside = source_target.relative_to(owner)
     if git(owner, "ls-files", "--error-unmatch", inside.as_posix(), check=False).returncode:
         raise PlanError(f"path dependency manifest is not committed: {source_target}")
-    logical_owner = logical_target.parents[len(inside.parts) - 1]
+    logical_owner = (
+        slot.logical
+        if owner == slot.source
+        else logical_target.parents[len(inside.parts) - 1]
+    )
     return owner, logical_owner
 
 
-def discover(primary):
+def _discover(primary):
     try:
         primary = primary.expanduser().resolve(strict=True)
     except OSError as error:
         raise PlanError(f"primary repository does not exist: {primary}") from error
     if git_root(primary) != primary or not (primary / "Cargo.toml").is_file():
         raise PlanError(f"primary must be a Cargo Git top level: {primary}")
-    pending, slots, count = [(primary, primary)], {}, 0
+    pending, slots, claims, count = [(primary, primary)], {}, {primary: primary}, 0
     while pending:
         source, logical = pending.pop()
         logical = logical.resolve()
@@ -241,7 +245,14 @@ def discover(primary):
         for name in names:
             for raw in path_specs(source / name):
                 owner, logical_owner = resolve_dependency(slot, name, raw)
-                pending.append((owner, logical_owner))
+                if logical_owner in slots:
+                    continue
+                claimed = claims.get(logical_owner)
+                if claimed is not None and claimed != owner:
+                    raise PlanError(f"two source repositories map to {logical_owner}")
+                if claimed is None:
+                    claims[logical_owner] = owner
+                    pending.append((owner, logical_owner))
     for slot in slots.values():
         if git(slot.source, "status", "--porcelain=v1", "--untracked-files=all").stdout:
             raise PlanError(f"repository changed while planning: {slot.source}")
@@ -265,6 +276,13 @@ def discover(primary):
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     return Plan(root, primary_relative, ordered, count, digest)
+
+
+def discover(primary):
+    try:
+        return _discover(primary)
+    except OSError as error:
+        raise PlanError(f"cannot inspect Cargo cohort path: {error}") from error
 
 
 REMOTE = r'''#!/bin/bash
