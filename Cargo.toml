@@ -301,7 +301,16 @@ k3tok = ["dep:fancy-regex"]
 # content-addressed pile.
 embed = ["dep:image", "dep:tokenizers", "tokenizer"]
 gemma = [
-    "hub",
+    # NOTE: `hub` is deliberately NOT here. It was, so that the three gemma
+    # binaries below could reach hf-hub without declaring it — but that made a
+    # model RUNTIME feature carry a model DOWNLOADER, and hf-hub 0.3 hard-wires
+    # native-tls, so every LIBRARY consumer inherited a system OpenSSL
+    # requirement. faculties takes `mary/gemma` from its DEFAULT `local-embed`
+    # feature, so a default faculties build could not compile anywhere OpenSSL
+    # dev headers were absent — including the Sparks, which is exactly where
+    # builds are supposed to happen. Nothing in the LIBRARY uses hf_hub (the
+    # one hit in src/embed.rs is a doc comment). The binaries that need it now
+    # say so in their own required-features, 2026-09-01.
     "burn/train",
     "burn/ndarray",
     "dep:burn-train",
@@ -586,7 +595,7 @@ required-features = ["flux", "import"]
 # The Gemma audio-understanding gate. Pile-only weights (like gemma_gen).
 [[bin]]
 name = "gemma_hear"
-required-features = ["gemma"]
+required-features = ["gemma", "hub"]
 
 # The live listen loop: named input device → VAD → hearing → jsonl.
 [[bin]]
@@ -617,7 +626,7 @@ required-features = ["gemma"]
 # Concurrent-fit check: PersonaPlex-7B + Gemma-4-31B resident at once (peak RSS).
 [[bin]]
 name = "gemma31b_fit"
-required-features = ["gemma", "qwen3tts"]
+required-features = ["gemma", "qwen3tts", "hub"]
 
 # Vision-encoder load + sanity-forward check for the 31B (from pile).
 [[bin]]
@@ -627,7 +636,7 @@ required-features = ["gemma"]
 # Gemma 4 E4B LoRA training smoke (overfit one sentence under Autodiff<Metal>).
 [[bin]]
 name = "gemma_train_lora"
-required-features = ["gemma", "import"]
+required-features = ["gemma", "import", "hub"]
 
 # Persist the F5-TTS + Vocos checkpoints into the durable voice-origin pile
 # (the weights `mary::say` loads from).
