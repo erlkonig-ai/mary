@@ -24,7 +24,7 @@ use triblespace::core::collection::descriptor;
 use triblespace::core::collection::simplearchive_union::PreparedCollectionCommit;
 use triblespace::core::collection::{
     AdmissionPolicy, Collection, CollectionCommit, CollectionPolicy, CollectionRead,
-    CollectionRecord, CollectionStoreExt, FactCover, TryFromCover,
+    CollectionRecord, CollectionStoreExt, FactCover,
 };
 use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::metadata;
@@ -291,9 +291,9 @@ pub fn snapshot_model_collection_exact(
     store: &PileSnapshot,
     cover: &FactCover,
 ) -> anyhow::Result<ModelPileSnapshot> {
-    let resolved = cover.resolve(store).context("resolve exact model cover")?;
-    let facts =
-        TribleSet::try_from_cover(&resolved, store).context("materialize exact model cover")?;
+    let facts = cover
+        .materialize::<TribleSet, _>(store)
+        .context("materialize exact model cover")?;
     Ok(ModelSnapshot::new(facts, cover.clone(), store.clone()))
 }
 
