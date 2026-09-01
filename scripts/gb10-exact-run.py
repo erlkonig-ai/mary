@@ -10,6 +10,10 @@ workspace and Cargo.lock may lag path edits.
 The remote command inherits the Spark's toolchain and hardware environment,
 but not ambient pile, persona, signing-key, or collection selectors. Opt into
 an application setting explicitly with `-- env NAME=value COMMAND ...`.
+
+The child receives a canonical JSON execution receipt in
+`GB10_EXACT_INVOCATION`. Its runner revision identifies the checkout while its
+runner SHA-256 identifies the bytes that actually launched the command.
 """
 
 from __future__ import annotations
@@ -67,10 +71,12 @@ class Plan:
         }
 
     def payload(self, command):
+        command = list(command)
         return {
             "identity": self.identity(),
             "digest": self.digest,
             "command": command,
+            "invocation": exact_invocation(self, command),
             "repositories": [
                 {
                     "path": s.relative,
@@ -100,6 +106,36 @@ def git_root(path):
     if p.returncode:
         raise PlanError(f"local Cargo source is not in Git: {path}")
     return Path(p.stdout.strip()).resolve()
+
+
+def canonical_json(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def runner_identity():
+    runner = Path(__file__).resolve(strict=True)
+    root = git_root(runner.parent)
+    try:
+        relative = runner.relative_to(root).as_posix()
+    except ValueError as error:
+        raise PlanError(f"runner is outside its Git repository: {runner}") from error
+    revision = git(root, "rev-parse", "HEAD^{commit}").stdout.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise PlanError(f"invalid runner Git revision: {revision!r}")
+    return {
+        "path": relative,
+        "revision": revision,
+        "sha256": hashlib.sha256(runner.read_bytes()).hexdigest(),
+    }
+
+
+def exact_invocation(plan, command):
+    return {
+        "format": 1,
+        "runner": runner_identity(),
+        "source_cohort_sha256": plan.digest,
+        "command": list(command),
+    }
 
 
 def repository(path):
@@ -290,9 +326,7 @@ def _discover(primary):
         "primary": primary_relative,
         "repositories": [{"path": s.relative, "commit": s.commit} for s in ordered],
     }
-    digest = hashlib.sha256(
-        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    digest = hashlib.sha256(canonical_json(identity).encode()).hexdigest()
     return Plan(root, primary_relative, ordered, count, digest)
 
 
@@ -346,7 +380,10 @@ scrub_names={
 scrub_prefixes=("TRIBLESPACE_COLLECTION_", "TRIBLESPACE_METADATA_", "PLAYGROUND_")
 env={k:v for k,v in os.environ.items()
      if k not in scrub_names and not any(k.startswith(prefix) for prefix in scrub_prefixes)}
-env|={"CARGO_TARGET_DIR":str(target),"GB10_EXACT_SOURCE":str(stage),"PATH":str(Path.home()/".cargo/bin")+os.pathsep+os.environ.get("PATH","")}
+invocation=p["invocation"]
+if invocation.get("format") != 1 or invocation.get("source_cohort_sha256") != p["digest"] or invocation.get("command") != p["command"]:
+  raise RuntimeError("invalid exact invocation receipt")
+env|={"CARGO_TARGET_DIR":str(target),"GB10_EXACT_SOURCE":str(stage),"GB10_EXACT_INVOCATION":json.dumps(invocation,sort_keys=True,separators=(",",":")),"PATH":str(Path.home()/".cargo/bin")+os.pathsep+os.environ.get("PATH","")}
 print(f"exact source: {stage}\nCARGO_TARGET_DIR: {target}",flush=True)
 child=None
 def forward(sig,_):

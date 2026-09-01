@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -193,6 +194,8 @@ Path(os.environ["CARGO_TARGET_DIR"], "result.json").write_text(json.dumps({{
     "cwd": os.getcwd(),
     "path": os.environ["PATH"],
     "target": os.environ["CARGO_TARGET_DIR"],
+    "exact_invocation": json.loads(os.environ["GB10_EXACT_INVOCATION"]),
+    "exact_invocation_raw": os.environ["GB10_EXACT_INVOCATION"],
     "environment": {{name: os.environ[name] for name in {observed!r} if name in os.environ}},
 }}))
 """
@@ -317,6 +320,34 @@ Path(os.environ["CARGO_TARGET_DIR"], "result.json").write_text(json.dumps({{
         self.assertEqual(Path(result["target"]), stage / "target")
         for slot in plan.slots:
             self.assertEqual(git(stage / slot.relative, "rev-parse", "HEAD"), slot.commit)
+
+    def test_remote_command_receives_exact_canonical_invocation_receipt(self) -> None:
+        marker = "argument with spaces;$(not-a-shell)"
+        plan, _, result = self.run_remote_probe(
+            {"GB10_EXACT_INVOCATION": '{"spoofed":true}'},
+            arguments=[marker],
+        )
+
+        receipt = result["exact_invocation"]
+        runner = SCRIPT.resolve()
+        root = Path(git(runner.parent, "rev-parse", "--show-toplevel"))
+        self.assertEqual(
+            receipt,
+            {
+                "format": 1,
+                "runner": {
+                    "path": runner.relative_to(root).as_posix(),
+                    "revision": git(root, "rev-parse", "HEAD^{commit}").lower(),
+                    "sha256": hashlib.sha256(runner.read_bytes()).hexdigest(),
+                },
+                "source_cohort_sha256": plan.digest,
+                "command": ["exact-path-probe", marker],
+            },
+        )
+        self.assertEqual(
+            result["exact_invocation_raw"],
+            json.dumps(receipt, sort_keys=True, separators=(",", ":")),
+        )
 
     def test_remote_command_scrubs_application_selectors_only(self) -> None:
         selectors = {
