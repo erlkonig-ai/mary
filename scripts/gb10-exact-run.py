@@ -6,6 +6,10 @@ Usage: gb10-exact-run.py [--plan] HOST PRIMARY_REPO -- COMMAND [ARG ...]
 Every tracked Cargo.toml in each discovered Git repo is scanned. This is a
 conservative superset of one package because `cargo -p` still parses the full
 workspace and Cargo.lock may lag path edits.
+
+The remote command inherits the Spark's toolchain and hardware environment,
+but not ambient pile, persona, signing-key, or collection selectors. Opt into
+an application setting explicitly with `-- env NAME=value COMMAND ...`.
 """
 
 from __future__ import annotations
@@ -330,7 +334,19 @@ else:
     (tmp/"cohort.json").write_text(json.dumps(ident,sort_keys=True)+"\n"); tmp.rename(stage)
   except BaseException: shutil.rmtree(tmp,ignore_errors=True); raise
 verify(); target=stage/"target"; target.mkdir(exist_ok=True)
-env=os.environ|{"CARGO_TARGET_DIR":str(target),"GB10_EXACT_SOURCE":str(stage),"PATH":str(Path.home()/".cargo/bin")+os.pathsep+os.environ.get("PATH","")}
+# Exact source is not an exact execution proof if a live deployment silently
+# selects its pile, identity, collection descriptors, or proc-macro metadata.
+# Retain host toolchains, GPU drivers, SSH agents, and ordinary build knobs;
+# callers can deliberately restore an application selector via `env NAME=...`.
+scrub_names={
+  "PILE", "PERSONA", "ORIENT_PILE", "ORIENT_PERSONA",
+  "TELEMETRY_PILE", "TELEMETRY_COLLECTION_NAME", "DRIVE_MEMORY_PILE",
+  "TRIBLESPACE_KEY", "TRIBLES_SIGNING_KEY", "TRIBLES_ORDER_KEY",
+}
+scrub_prefixes=("TRIBLESPACE_COLLECTION_", "TRIBLESPACE_METADATA_", "PLAYGROUND_")
+env={k:v for k,v in os.environ.items()
+     if k not in scrub_names and not any(k.startswith(prefix) for prefix in scrub_prefixes)}
+env|={"CARGO_TARGET_DIR":str(target),"GB10_EXACT_SOURCE":str(stage),"PATH":str(Path.home()/".cargo/bin")+os.pathsep+os.environ.get("PATH","")}
 print(f"exact source: {stage}\nCARGO_TARGET_DIR: {target}",flush=True)
 child=None
 def forward(sig,_):

@@ -152,6 +152,77 @@ version = "0.1.0"
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def run_remote_probe(
+        self,
+        inherited: dict[str, str] | None = None,
+        command_prefix: list[str] | None = None,
+        arguments: list[str] | None = None,
+    ) -> tuple[RUNNER.Plan, Path, dict[str, object]]:
+        plan = RUNNER.discover(self.cohort / "primary")
+        home = (Path(self.temporary.name) / "remote-home").resolve()
+        cargo_bin = home / ".cargo/bin"
+        cargo_bin.mkdir(parents=True)
+        observed = [
+            "PILE",
+            "PERSONA",
+            "ORIENT_PILE",
+            "ORIENT_PERSONA",
+            "TELEMETRY_PILE",
+            "TELEMETRY_COLLECTION_NAME",
+            "DRIVE_MEMORY_PILE",
+            "TRIBLESPACE_KEY",
+            "TRIBLES_SIGNING_KEY",
+            "TRIBLES_ORDER_KEY",
+            "TRIBLESPACE_COLLECTION_WIKI",
+            "TRIBLESPACE_COLLECTION_FUTURE_KIND",
+            "TRIBLESPACE_METADATA_PILE",
+            "PLAYGROUND_JAIL_HOST",
+            "PLAYGROUND_FUTURE_STATE",
+            "NOMIC_TEXT_PILE",
+            "RUSTFLAGS",
+            "CUDA_HOME",
+            "SSH_AUTH_SOCK",
+        ]
+        code = f"""
+import json
+import os
+from pathlib import Path
+import sys
+Path(os.environ["CARGO_TARGET_DIR"], "result.json").write_text(json.dumps({{
+    "argv": sys.argv[1:],
+    "cwd": os.getcwd(),
+    "path": os.environ["PATH"],
+    "target": os.environ["CARGO_TARGET_DIR"],
+    "environment": {{name: os.environ[name] for name in {observed!r} if name in os.environ}},
+}}))
+"""
+        probe = cargo_bin / "exact-path-probe"
+        probe.write_text(f"#!{sys.executable}\n{code.lstrip()}")
+        probe.chmod(0o755)
+        command = [*(command_prefix or []), probe.name, *(arguments or [])]
+        payload = plan.payload(command)
+        encoded = base64.urlsafe_b64encode(
+            json.dumps(payload, separators=(",", ":")).encode()
+        ).decode()
+        environment = os.environ.copy()
+        environment["HOME"] = str(home)
+        environment.update(inherited or {})
+        process = subprocess.run(
+            ["bash", "-s", "--", encoded],
+            input=RUNNER.REMOTE,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+            timeout=30,
+        )
+        self.assertEqual(process.returncode, 0, process.stderr)
+
+        stage = home / "gb10" / "exact-source" / plan.digest
+        result = json.loads((stage / "target/result.json").read_text())
+        return plan, stage, result
+
     def test_discovers_full_workspace_and_recursive_path_cohort(self) -> None:
         plan = RUNNER.discover(self.cohort / "primary")
 
@@ -236,52 +307,64 @@ version = "0.1.0"
         self.assertIn("command: cargo check -p app", process.stdout)
 
     def test_remote_runner_stages_exact_commits_and_finds_cargo_bin(self) -> None:
-        plan = RUNNER.discover(self.cohort / "primary")
         marker = "argument with spaces;$(not-a-shell)"
-        home = (Path(self.temporary.name) / "remote-home").resolve()
-        cargo_bin = home / ".cargo/bin"
-        cargo_bin.mkdir(parents=True)
-        code = """
-import json
-import os
-from pathlib import Path
-import sys
-Path(os.environ["CARGO_TARGET_DIR"], "result.json").write_text(json.dumps({
-    "argv": sys.argv[1:],
-    "cwd": os.getcwd(),
-    "path": os.environ["PATH"],
-    "target": os.environ["CARGO_TARGET_DIR"],
-}))
-"""
-        probe = cargo_bin / "exact-path-probe"
-        probe.write_text(f"#!{sys.executable}\n{code.lstrip()}")
-        probe.chmod(0o755)
-        payload = plan.payload([probe.name, marker])
-        encoded = base64.urlsafe_b64encode(
-            json.dumps(payload, separators=(",", ":")).encode()
-        ).decode()
-        environment = os.environ.copy()
-        environment["HOME"] = str(home)
-        process = subprocess.run(
-            ["bash", "-s", "--", encoded],
-            input=RUNNER.REMOTE,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=environment,
-            timeout=30,
-        )
-        self.assertEqual(process.returncode, 0, process.stderr)
-
-        stage = home / "gb10" / "exact-source" / plan.digest
-        result = json.loads((stage / "target/result.json").read_text())
+        plan, stage, result = self.run_remote_probe(arguments=[marker])
         self.assertEqual(result["argv"], [marker])
         self.assertEqual(Path(result["cwd"]), stage / "primary")
-        self.assertEqual(result["path"].split(os.pathsep)[0], str(cargo_bin))
+        self.assertEqual(
+            result["path"].split(os.pathsep)[0], str(stage.parents[2] / ".cargo/bin")
+        )
         self.assertEqual(Path(result["target"]), stage / "target")
         for slot in plan.slots:
             self.assertEqual(git(stage / slot.relative, "rev-parse", "HEAD"), slot.commit)
+
+    def test_remote_command_scrubs_application_selectors_only(self) -> None:
+        selectors = {
+            "PILE": "/live/self.pile",
+            "PERSONA": "ambient-persona",
+            "ORIENT_PILE": "/live/orient.pile",
+            "ORIENT_PERSONA": "ambient-persona",
+            "TELEMETRY_PILE": "/live/telemetry.pile",
+            "TELEMETRY_COLLECTION_NAME": "live-telemetry",
+            "DRIVE_MEMORY_PILE": "/live/memory.pile",
+            "TRIBLESPACE_KEY": "/live/self.key",
+            "TRIBLES_SIGNING_KEY": "/live/legacy.key",
+            "TRIBLES_ORDER_KEY": "live-order",
+            "TRIBLESPACE_COLLECTION_WIKI": "aa" * 32,
+            "TRIBLESPACE_COLLECTION_FUTURE_KIND": "bb" * 32,
+            "TRIBLESPACE_METADATA_PILE": "/live/metadata.pile",
+            "PLAYGROUND_JAIL_HOST": "live-jail.example.invalid",
+            "PLAYGROUND_FUTURE_STATE": "live-playground-state",
+        }
+        ordinary = {
+            "NOMIC_TEXT_PILE": "/models/nomic-text.pile",
+            "RUSTFLAGS": "--cfg exact_runner_environment_probe",
+            "CUDA_HOME": "/opt/cuda-exact-runner-probe",
+            "SSH_AUTH_SOCK": "/tmp/exact-runner-agent.sock",
+        }
+
+        _, _, result = self.run_remote_probe(selectors | ordinary)
+
+        environment = result["environment"]
+        self.assertTrue(selectors.keys().isdisjoint(environment))
+        for name, value in ordinary.items():
+            self.assertEqual(environment[name], value)
+
+    def test_remote_command_can_explicitly_restore_scrubbed_selector(self) -> None:
+        _, _, result = self.run_remote_probe(
+            {"PILE": "/ambient/must-not-win.pile"},
+            command_prefix=[
+                "env",
+                "PILE=/fixture/explicit.pile",
+                "PERSONA=fixture-persona",
+                f"TRIBLESPACE_COLLECTION_WIKI={'cc' * 32}",
+            ],
+        )
+
+        environment = result["environment"]
+        self.assertEqual(environment["PILE"], "/fixture/explicit.pile")
+        self.assertEqual(environment["PERSONA"], "fixture-persona")
+        self.assertEqual(environment["TRIBLESPACE_COLLECTION_WIKI"], "cc" * 32)
 
     def test_arbitrary_primary_worktree_uses_canonical_topology(self) -> None:
         primary = self.cohort / "primary"
