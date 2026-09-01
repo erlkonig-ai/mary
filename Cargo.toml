@@ -858,6 +858,7 @@ name = "nomic_semantic_probe"
 required-features = ["embed", "import"]
 
 [dev-dependencies]
+ciborium = "0.2"
 burn-ndarray = "0.21.0"
 
 [patch.crates-io]

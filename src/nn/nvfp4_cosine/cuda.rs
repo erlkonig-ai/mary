@@ -715,9 +715,279 @@ impl UpperScanner for CudaUpperScanner {
 #[cfg(test)]
 mod tests {
     use super::super::{
-        CandidateCertificate, PreparedQuery, QuantizedRow, ScanStage, exact_cosine, raw_dot_f64,
+        CandidateCertificate, PreparedQuery, QUANT_BLOCK, QuantizedRow, QuantizedStage,
+        ROTATION_BLOCK, ScanStage, decode_f32_reconstruction, decode_stage, exact_cosine,
+        outward_l2, outward_norm, raw_dot_f64, upward_f32,
     };
     use super::*;
+
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::io::Cursor;
+    use std::path::{Path, PathBuf};
+
+    use cubecl::config::RuntimeConfig;
+    use cubecl::config::cache::CacheConfig;
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct CachedPtxEntry {
+        #[allow(dead_code)]
+        key: ciborium::Value,
+        value: CachedPtx,
+    }
+
+    #[derive(Deserialize)]
+    struct CachedPtx {
+        entrypoint_name: String,
+        #[allow(dead_code)]
+        shared_mem_bytes: usize,
+        ptx: Vec<i8>,
+    }
+
+    fn ptx_contract(ptx: &str) -> Result<(), String> {
+        if !ptx.contains(".visible .entry decode_dot_f32(") {
+            return Err("missing decode_dot_f32 entry point".into());
+        }
+        if !ptx.contains(".target sm_121a") {
+            return Err("gate did not compile for the Spark sm_121a target".into());
+        }
+        for forbidden in [".ftz", ".approx", "--use_fast_math"] {
+            if ptx.contains(forbidden) {
+                return Err(format!("forbidden PTX arithmetic modifier {forbidden}"));
+            }
+        }
+
+        let mut fmas = 0usize;
+        let mut adds = 0usize;
+        let mut shuffles = Vec::new();
+        let mut shuffle_waiting_for_add = false;
+        let mut shuffle_adds = 0usize;
+        for line in ptx.lines() {
+            let mut words = line.trim().split_ascii_whitespace();
+            let mut opcode = words.next().unwrap_or_default();
+            if opcode.starts_with('@') {
+                opcode = words.next().unwrap_or_default();
+            }
+            opcode = opcode.trim_end_matches(';');
+            if opcode.starts_with("fma.") && opcode.ends_with(".f32") {
+                if opcode != "fma.rn.f32" {
+                    return Err(format!("non-RN f32 FMA in PTX: {opcode}"));
+                }
+                fmas += 1;
+            }
+            if opcode.starts_with("mad.") && opcode.ends_with(".f32") {
+                return Err(format!("contract-breaking f32 MAD in PTX: {opcode}"));
+            }
+            if opcode.starts_with("add.") && opcode.ends_with(".f32") {
+                // PTX spells the default RN-even form both as `add.f32` and
+                // `add.rn.f32`; every other explicit rounding mode is wrong.
+                if opcode != "add.f32" && opcode != "add.rn.f32" {
+                    return Err(format!("non-RN f32 add in PTX: {opcode}"));
+                }
+                adds += 1;
+                if shuffle_waiting_for_add {
+                    shuffle_waiting_for_add = false;
+                    shuffle_adds += 1;
+                }
+            }
+            if opcode.starts_with("mul.")
+                && opcode.ends_with(".f32")
+                && opcode != "mul.f32"
+                && opcode != "mul.rn.f32"
+            {
+                return Err(format!("non-RN f32 multiply in PTX: {opcode}"));
+            }
+            if opcode == "shfl.sync.bfly.b32" {
+                if shuffle_waiting_for_add {
+                    return Err("butterfly shuffle was not completed by an f32 add".into());
+                }
+                let fields: Vec<_> = line.split(',').map(str::trim).collect();
+                let mask = fields
+                    .get(2)
+                    .and_then(|field| field.parse::<u32>().ok())
+                    .ok_or_else(|| format!("cannot read butterfly mask from `{line}`"))?;
+                shuffles.push(mask);
+                shuffle_waiting_for_add = true;
+            }
+        }
+        if fmas < 8 {
+            return Err(format!(
+                "only {fmas} RN-even f32 FMAs remain in the decode/dot path"
+            ));
+        }
+        if adds < 5 {
+            return Err(format!(
+                "only {adds} RN-even f32 additions remain in the reduction"
+            ));
+        }
+        if shuffles != [1, 2, 4, 8, 16] {
+            return Err(format!(
+                "reduction is not the prescribed five-level XOR tree: {shuffles:?}"
+            ));
+        }
+        if shuffle_waiting_for_add || shuffle_adds != 5 {
+            return Err(format!(
+                "only {shuffle_adds} of five butterfly shuffles feed an f32 add"
+            ));
+        }
+        Ok(())
+    }
+
+    fn collect_ptx_files(root: &Path, files: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(root).unwrap_or_else(|error| {
+            panic!(
+                "cannot read CubeCL cache directory {}: {error}",
+                root.display()
+            )
+        }) {
+            let path = entry.expect("CubeCL cache directory entry").path();
+            if path.is_dir() {
+                collect_ptx_files(&path, files);
+            } else if path.file_name().is_some_and(|name| name == "chunk0.cbor") {
+                files.push(path);
+            }
+        }
+    }
+
+    fn emitted_f32_ptx(cache_root: &Path) -> String {
+        let mut files = Vec::new();
+        collect_ptx_files(cache_root, &mut files);
+        for path in files {
+            let bytes = fs::read(&path).expect("read CubeCL PTX cache chunk");
+            let mut cursor = Cursor::new(bytes);
+            while (cursor.position() as usize) < cursor.get_ref().len() {
+                let before = cursor.position();
+                let entry: CachedPtxEntry =
+                    ciborium::from_reader(&mut cursor).unwrap_or_else(|error| {
+                        panic!("decode {} at {before}: {error}", path.display())
+                    });
+                if entry.value.entrypoint_name == "decode_dot_f32" {
+                    let bytes: Vec<_> = entry
+                        .value
+                        .ptx
+                        .into_iter()
+                        .map(|byte| byte as u8)
+                        .take_while(|&byte| byte != 0)
+                        .collect();
+                    return String::from_utf8(bytes).expect("NVRTC emits ASCII PTX");
+                }
+            }
+        }
+        panic!(
+            "CubeCL cache under {} contains no decode_dot_f32 PTX",
+            cache_root.display()
+        );
+    }
+
+    fn certified_row(stages: [QuantizedStage; 2]) -> QuantizedRow {
+        let primary = decode_stage(&stages[0]);
+        let correction = decode_stage(&stages[1]);
+        let canonical: Vec<_> = primary
+            .into_iter()
+            .zip(correction)
+            .map(|(primary, correction)| primary + correction)
+            .collect();
+        let explicit_f32 = decode_f32_reconstruction(&stages[0], &stages[1]);
+        let norm = upward_f32(outward_norm(&canonical).unwrap()).unwrap();
+        let error = upward_f32(outward_l2(&canonical, &explicit_f32).unwrap()).unwrap();
+        QuantizedRow {
+            stages,
+            norm: norm.to_le_bytes(),
+            error: error.to_le_bytes(),
+        }
+    }
+
+    fn packed_codes(offset: usize) -> Vec<u8> {
+        (0..(ROTATION_BLOCK / 2))
+            .map(|index| {
+                let low = ((offset + 2 * index) & 15) as u8;
+                let high = ((offset + 2 * index + 1) & 15) as u8;
+                low | (high << 4)
+            })
+            .collect()
+    }
+
+    fn adversarial_rows() -> Vec<QuantizedRow> {
+        let globals = [
+            (1.0f32, f32::from_bits(1.0f32.to_bits() - 1)),
+            (f32::MIN_POSITIVE, f32::MIN_POSITIVE),
+            (f32::from_bits(1), f32::from_bits(1)),
+            (2.0f32.powi(-40), 2.0f32.powi(-40)),
+        ];
+        let mut rows = Vec::new();
+        for (row, (primary_global, correction_global)) in globals.into_iter().enumerate() {
+            let stages = std::array::from_fn(|stage| {
+                let block_scales = (0..(ROTATION_BLOCK / QUANT_BLOCK))
+                    .map(|block| (row * 32 + stage * 16 + block).min(0x7e) as u8)
+                    .collect();
+                QuantizedStage {
+                    global: if stage == 0 {
+                        primary_global.to_le_bytes()
+                    } else {
+                        correction_global.to_le_bytes()
+                    },
+                    block_scales,
+                    codes: packed_codes(row * 3 + stage),
+                }
+            });
+            rows.push(certified_row(stages));
+        }
+
+        let cancelling = QuantizedStage {
+            global: 1.0f32.to_le_bytes(),
+            block_scales: vec![0x7e; ROTATION_BLOCK / QUANT_BLOCK],
+            codes: vec![0x77; ROTATION_BLOCK / 2],
+        };
+        let correction = QuantizedStage {
+            global: f32::from_bits(1.0f32.to_bits() - 1).to_le_bytes(),
+            block_scales: vec![0x7e; ROTATION_BLOCK / QUANT_BLOCK],
+            codes: vec![0xff; ROTATION_BLOCK / 2],
+        };
+        rows.push(certified_row([cancelling, correction]));
+
+        let maximal_zero = QuantizedStage {
+            global: f32::MAX.to_le_bytes(),
+            block_scales: vec![0; ROTATION_BLOCK / QUANT_BLOCK],
+            codes: vec![0x77; ROTATION_BLOCK / 2],
+        };
+        let zero = QuantizedStage {
+            global: 0.0f32.to_le_bytes(),
+            block_scales: vec![0; ROTATION_BLOCK / QUANT_BLOCK],
+            codes: vec![0; ROTATION_BLOCK / 2],
+        };
+        rows.push(certified_row([maximal_zero, zero]));
+        rows
+    }
+
+    fn adversarial_queries() -> Vec<Vec<f64>> {
+        let one = f64::from(1.0f32);
+        let one_next = f64::from(f32::from_bits(1.0f32.to_bits() + 1));
+        let next_next = f64::from(f32::from_bits(1.0f32.to_bits() + 2));
+        let half_subnormal = f64::from(f32::from_bits(1)) / 2.0;
+        vec![
+            vec![0.0; ROTATION_BLOCK],
+            (0..ROTATION_BLOCK)
+                .map(|index| match index % 4 {
+                    0 => (one + one_next) / 2.0,
+                    1 => -((one_next + next_next) / 2.0),
+                    2 => 1.0,
+                    _ => -1.0,
+                })
+                .collect(),
+            (0..ROTATION_BLOCK)
+                .map(|index| match index % 4 {
+                    0 => half_subnormal,
+                    1 => -half_subnormal,
+                    2 => f64::from(f32::from_bits(1)),
+                    _ => -f64::from(f32::from_bits(1)),
+                })
+                .collect(),
+            (0..ROTATION_BLOCK)
+                .map(|index| if index == 0 { f64::from(f32::MAX) } else { 0.0 })
+                .collect(),
+        ]
+    }
 
     fn vector(row: usize, dimension: usize) -> Vec<f32> {
         (0..dimension)
@@ -743,6 +1013,178 @@ mod tests {
             }
         }
         std::array::from_fn(|stage| ScanStage::new(&globals[stage], &scales[stage], &codes[stage]))
+    }
+
+    #[test]
+    fn ptx_gate_rejects_contract_drift() {
+        let mut ptx =
+            String::from(".version 9.0\n.target sm_121a\n.visible .entry decode_dot_f32(\n");
+        for _ in 0..8 {
+            ptx.push_str("fma.rn.f32 %f1, %f2, %f3, %f4;\n");
+        }
+        for mask in [1, 2, 4, 8, 16] {
+            ptx.push_str(&format!(
+                "shfl.sync.bfly.b32 %r1|%p1, %r2, {mask}, 31, -1;\nadd.f32 %f1, %f2, %f3;\n"
+            ));
+        }
+        assert_eq!(ptx_contract(&ptx), Ok(()));
+        assert!(ptx_contract(&ptx.replace("add.f32", "add.ftz.f32")).is_err());
+        assert!(ptx_contract(&ptx.replace("fma.rn.f32", "fma.rz.f32")).is_err());
+        assert!(
+            ptx_contract(&ptx.replacen(
+                "shfl.sync.bfly.b32 %r1|%p1, %r2, 1, 31, -1;\nadd.f32",
+                "shfl.sync.bfly.b32 %r1|%p1, %r2, 1, 31, -1;\nmov.f32",
+                1,
+            ))
+            .is_err()
+        );
+        assert!(
+            ptx_contract(&ptx.replace("shfl.sync.bfly.b32 %r1|%p1, %r2, 16, 31, -1;\n", ""))
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the Spark CUDA device and inspects its emitted PTX"]
+    fn cuda_f32_adversarial_certificate_and_ptx_gate() {
+        const CHILD: &str = "MARY_NVFP4_PTX_GATE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "nn::nvfp4_cosine::cuda::tests::cuda_f32_adversarial_certificate_and_ptx_gate",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .expect("launch isolated PTX-gate test process");
+            assert!(status.success(), "isolated PTX-gate process failed");
+            return;
+        }
+
+        let cache_root =
+            std::env::temp_dir().join(format!("mary-nvfp4-ptx-contract-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&cache_root);
+        let mut config = cubecl::config::CubeClRuntimeConfig::default();
+        config.compilation.cache = Some(CacheConfig::File(cache_root.clone()));
+        cubecl::config::CubeClRuntimeConfig::set(config);
+
+        let rows = adversarial_rows();
+        let e4m3: BTreeSet<_> = rows[..4]
+            .iter()
+            .flat_map(|row| row.stages())
+            .flat_map(QuantizedStage::block_scales)
+            .copied()
+            .collect();
+        assert_eq!(e4m3, (0u8..=0x7e).collect());
+        let e2m1: BTreeSet<_> = rows
+            .iter()
+            .flat_map(|row| row.stages())
+            .flat_map(QuantizedStage::codes)
+            .flat_map(|&packed| [packed & 15, packed >> 4])
+            .collect();
+        assert_eq!(e2m1, (0u8..=15).collect());
+        assert!(rows.iter().any(|row| {
+            row.stages()
+                .iter()
+                .any(|stage| read_f32(stage.global_scale_bytes()) == f32::from_bits(1))
+        }));
+        assert!(rows.iter().any(|row| {
+            row.stages()
+                .iter()
+                .any(|stage| read_f32(stage.global_scale_bytes()) == f32::MAX)
+        }));
+
+        let mut globals = [Vec::new(), Vec::new()];
+        let mut scales = [Vec::new(), Vec::new()];
+        let mut codes = [Vec::new(), Vec::new()];
+        let stages = stage_planes(&rows, &mut globals, &mut scales, &mut codes);
+        let mut norms = Vec::with_capacity(rows.len() * FLOAT_BYTES);
+        let mut errors = Vec::with_capacity(rows.len() * FLOAT_BYTES);
+        for row in &rows {
+            norms.extend_from_slice(row.reconstruction_norm_bytes());
+            errors.extend_from_slice(row.error_bound_bytes());
+        }
+        let segment = ScanSegment::new(
+            [0xa5; 32],
+            rows.len(),
+            ROTATION_BLOCK,
+            ROTATION_BLOCK / QUANT_BLOCK,
+            ROTATION_BLOCK / 2,
+            stages,
+            &norms,
+            &errors,
+        )
+        .unwrap();
+        let scanner = CudaUpperScanner::new(&[segment]).unwrap();
+        for (query_index, coordinates) in adversarial_queries().iter().enumerate() {
+            let query = ScanQuery {
+                coordinates,
+                norm_bound: outward_norm(coordinates).unwrap(),
+            };
+            let mut uppers = vec![f64::NAN; rows.len()];
+            scanner.scan_upper(query, &[segment], &mut uppers).unwrap();
+            let mut finite = 0;
+            for (row, &upper) in uppers.iter().enumerate() {
+                assert!(!upper.is_nan(), "query {query_index}, row {row}: NaN upper");
+                if upper.is_finite() {
+                    finite += 1;
+                } else {
+                    assert_eq!(upper, f64::INFINITY);
+                }
+                let canonical = raw_dot_f64(coordinates, segment, row);
+                if canonical.is_finite() {
+                    assert!(
+                        canonical <= upper,
+                        "query {query_index}, row {row}: canonical {canonical:e} > upper {upper:e}"
+                    );
+                } else {
+                    assert_eq!(upper, f64::INFINITY);
+                }
+            }
+            assert!(finite > 0, "query {query_index} failed open for every row");
+        }
+
+        // A syntactically valid but numerically extreme plane must never turn
+        // device overflow into a finite pruning certificate.
+        let maximal = f32::MAX.to_le_bytes();
+        let zero = 0.0f32.to_le_bytes();
+        let maximal_scales = vec![0x7e; ROTATION_BLOCK / QUANT_BLOCK];
+        let zero_scales = vec![0; ROTATION_BLOCK / QUANT_BLOCK];
+        let maximal_codes = vec![0x77; ROTATION_BLOCK / 2];
+        let zero_codes = vec![0; ROTATION_BLOCK / 2];
+        let extreme_stages = [
+            ScanStage::new(&maximal, &maximal_scales, &maximal_codes),
+            ScanStage::new(&zero, &zero_scales, &zero_codes),
+        ];
+        let scalar_zero = 0.0f32.to_le_bytes();
+        let extreme = ScanSegment::new(
+            [0xee; 32],
+            1,
+            ROTATION_BLOCK,
+            ROTATION_BLOCK / QUANT_BLOCK,
+            ROTATION_BLOCK / 2,
+            extreme_stages,
+            &scalar_zero,
+            &scalar_zero,
+        )
+        .unwrap();
+        let extreme_scanner = CudaUpperScanner::new(&[extreme]).unwrap();
+        let coordinates = vec![1.0; ROTATION_BLOCK];
+        let query = ScanQuery {
+            coordinates: &coordinates,
+            norm_bound: outward_norm(&coordinates).unwrap(),
+        };
+        let mut upper = [f64::NAN];
+        extreme_scanner
+            .scan_upper(query, &[extreme], &mut upper)
+            .unwrap();
+        assert_eq!(upper, [f64::INFINITY]);
+
+        let ptx = emitted_f32_ptx(&cache_root);
+        ptx_contract(&ptx).unwrap_or_else(|error| panic!("PTX contract failed: {error}\n{ptx}"));
+        fs::remove_dir_all(&cache_root).expect("remove isolated CubeCL cache");
     }
 
     #[test]
