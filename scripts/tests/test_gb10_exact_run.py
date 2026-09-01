@@ -235,9 +235,12 @@ version = "0.1.0"
         self.assertIn("host: definitely-not-a-real-spark", process.stdout)
         self.assertIn("command: cargo check -p app", process.stdout)
 
-    def test_remote_runner_stages_exact_commits_and_preserves_argv(self) -> None:
+    def test_remote_runner_stages_exact_commits_and_finds_cargo_bin(self) -> None:
         plan = RUNNER.discover(self.cohort / "primary")
         marker = "argument with spaces;$(not-a-shell)"
+        home = (Path(self.temporary.name) / "remote-home").resolve()
+        cargo_bin = home / ".cargo/bin"
+        cargo_bin.mkdir(parents=True)
         code = """
 import json
 import os
@@ -246,15 +249,17 @@ import sys
 Path(os.environ["CARGO_TARGET_DIR"], "result.json").write_text(json.dumps({
     "argv": sys.argv[1:],
     "cwd": os.getcwd(),
+    "path": os.environ["PATH"],
     "target": os.environ["CARGO_TARGET_DIR"],
 }))
 """
-        payload = plan.payload([sys.executable, "-c", code, marker])
+        probe = cargo_bin / "exact-path-probe"
+        probe.write_text(f"#!{sys.executable}\n{code.lstrip()}")
+        probe.chmod(0o755)
+        payload = plan.payload([probe.name, marker])
         encoded = base64.urlsafe_b64encode(
             json.dumps(payload, separators=(",", ":")).encode()
         ).decode()
-        home = (Path(self.temporary.name) / "remote-home").resolve()
-        home.mkdir()
         environment = os.environ.copy()
         environment["HOME"] = str(home)
         process = subprocess.run(
@@ -273,6 +278,7 @@ Path(os.environ["CARGO_TARGET_DIR"], "result.json").write_text(json.dumps({
         result = json.loads((stage / "target/result.json").read_text())
         self.assertEqual(result["argv"], [marker])
         self.assertEqual(Path(result["cwd"]), stage / "primary")
+        self.assertEqual(result["path"].split(os.pathsep)[0], str(cargo_bin))
         self.assertEqual(Path(result["target"]), stage / "target")
         for slot in plan.slots:
             self.assertEqual(git(stage / slot.relative, "rev-parse", "HEAD"), slot.commit)

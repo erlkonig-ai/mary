@@ -316,7 +316,7 @@ else:
     (tmp/"cohort.json").write_text(json.dumps(ident,sort_keys=True)+"\n"); tmp.rename(stage)
   except BaseException: shutil.rmtree(tmp,ignore_errors=True); raise
 verify(); target=stage/"target"; target.mkdir(exist_ok=True)
-env=os.environ|{"CARGO_TARGET_DIR":str(target),"GB10_EXACT_SOURCE":str(stage)}
+env=os.environ|{"CARGO_TARGET_DIR":str(target),"GB10_EXACT_SOURCE":str(stage),"PATH":str(Path.home()/".cargo/bin")+os.pathsep+os.environ.get("PATH","")}
 print(f"exact source: {stage}\nCARGO_TARGET_DIR: {target}",flush=True)
 child=None
 def forward(sig,_):
@@ -413,6 +413,7 @@ def main(argv=None):
         print(f"primary: {plan.primary}\nmanifests scanned: {plan.manifests}")
         for s in plan.slots: print(f"  {s.relative}\t{s.commit}\t{s.origin_ref}\tfrom {s.source}")
         print(f"command: {shlex.join(args.command)}")
+        sys.stdout.flush()
         return 0 if args.plan else execute(plan,args.host,args.command,args.heartbeat_seconds)
     except PlanError as error:
         print(f"gb10-exact-run: {error}",file=sys.stderr); return 2
