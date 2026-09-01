@@ -94,7 +94,7 @@ libm = { version = "0.2", optional = true }
 # Gemma 4 multimodal port (mary::models::gemma) deps — all optional, gated behind `gemma`.
 burn-train = { version = "0.21.0", optional = true }
 burn-ndarray = { version = "0.21.0", optional = true }
-cubecl = { version = "0.10.0", default-features = false, features = ["wgpu", "std"], optional = true }
+cubecl = { version = "0.10.0", default-features = false, features = ["std"], optional = true }
 # The C++ backend's kernel-description types, for ONE thing: `models::inkling::rawcuda`
 # hands the CUDA runtime a hand-written source string, and the runtime still
 # wants the `ComputeKernel` repr a generated kernel carries (it reads the
@@ -153,9 +153,10 @@ drive-mind = ["serve", "dep:drive"]
 # the realtime lane never instantiates a burn backend (RealtimePipeline has no
 # B: Backend generic, TemporalMetal is raw cubecl, DepthFast/Mimi are CPU).
 cuda-backend = ["q4", "cubecl?/cuda"]
-# Certified ordinary-f32 and portable-f64 CUDA candidate scans for
-# `nn::nvfp4_cosine`. This owns arithmetic only; collection assembly and exact
-# source reranking remain downstream.
+# Certified ordinary-f32 CUDA candidate scans for `nn::nvfp4_cosine`. This
+# owns arithmetic only; collection assembly and exact source reranking remain
+# downstream. A portable-f64 CUDA implementation remains test-only as a proof
+# oracle.
 nvfp4-cuda = ["dep:cubecl", "cubecl?/cuda"]
 # Investigation-only: burn's REAL Cuda backend, for backend_matmul_probe.
 burn-cuda-bench = ["burn/cuda", "burn/autotune"]
@@ -257,7 +258,7 @@ qwen3tts = ["dep:tokenizers", "dep:burn-fusion", "dep:burn-cubecl", "dep:libm", 
 # Research prototype: hand-fused cubecl kernels for the talker's single-token
 # decode step (qwen3tts::megakernel) — one dispatch per fused stage instead of
 # ~18 burn ops per layer. The lever is host submission count, not FLOPs.
-megakernel = ["qwen3tts", "dep:cubecl"]
+megakernel = ["qwen3tts", "dep:cubecl", "cubecl?/wgpu"]
 # The code predictor on the GPU (qwen3tts::predictor_gpu) — hand-fused cubecl
 # kernels for the sub-talker's 16-position frame. Rides `q4`'s cubecl dep and
 # its `Rt` alias, so the same kernels build for wgpu/Metal and for CUDA.
@@ -272,7 +273,7 @@ personaplex = ["qwen3tts", "dep:burn-ndarray", "burn-ndarray/blas-accelerate"]
 # Moshi temporal transformer's 17.2 GB/step f16 stream into ~4.8 GB. Additive:
 # a cubecl kernel + host wrapper + the moshi_q4_probe spike; no model changes.
 # memmap2 backs zero-copy aliased weight loads on supported paths.
-q4 = ["dep:cubecl", "dep:memmap2"]
+q4 = ["dep:cubecl", "cubecl?/wgpu", "dep:memmap2"]
 # MXFP4 (microscaling FP4) decode + the bit-exact MXFP4 -> NVFP4 transcode
 # gate (`mxfp4_gate`). The codec itself (mary::nn::mxfp4) is dependency-free
 # and always compiled; only the gate needs sha2, to hash the full decode of
@@ -308,6 +309,7 @@ gemma = [
     "dep:burn-train",
     "dep:burn-ndarray",
     "dep:cubecl",
+    "cubecl?/wgpu",
     "dep:wgpu",
     "dep:pollster",
     "dep:memmap2",

@@ -318,7 +318,8 @@ pub struct CandidateCertificate<'a> {
 }
 
 impl<'a> CandidateCertificate<'a> {
-    pub fn new(query: &'a PreparedQuery, exact_dimension: usize) -> Self {
+    pub fn new(query: &'a PreparedQuery) -> Self {
+        let exact_dimension = query.exact_coordinates().len();
         Self {
             query,
             exact_gamma: dot_gamma_f64(exact_dimension),
@@ -381,19 +382,6 @@ pub struct ScanQuery<'a> {
 }
 
 impl<'a> ScanQuery<'a> {
-    pub fn new(coordinates: &'a [f64], norm_bound: f64) -> Result<Self, Error> {
-        if coordinates.iter().any(|value| !value.is_finite())
-            || !norm_bound.is_finite()
-            || norm_bound < 0.0
-        {
-            return Err(Error::new("NVFP4 scan query is invalid"));
-        }
-        Ok(Self {
-            coordinates,
-            norm_bound,
-        })
-    }
-
     pub fn coordinates(self) -> &'a [f64] {
         self.coordinates
     }
@@ -566,7 +554,10 @@ pub trait UpperScanner {
     ) -> Result<(), Self::Error>;
 }
 
-/// Portable canonical-f64 scanner.
+/// Portable canonical-f64 proof oracle for backend and integration tests.
+///
+/// Production callers may use it as a conservative scanner, but its purpose is
+/// to provide arithmetic independent from an accelerator implementation.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CpuF64UpperScanner;
 
@@ -1151,7 +1142,7 @@ mod tests {
         CpuF64UpperScanner
             .scan_upper(prepared.scan_query(), &[segment], &mut raw_upper)
             .unwrap();
-        let upper = CandidateCertificate::new(&prepared, D)
+        let upper = CandidateCertificate::new(&prepared)
             .certify_upper(row.certificate(), raw_upper[0])
             .unwrap();
         assert!(exact_cosine(&query, &source).unwrap() <= upper);
@@ -1200,7 +1191,7 @@ mod tests {
         let query = PreparedQuery::new(&[1.0], 1).unwrap();
         let row = QuantizedRow::quantize(&[1.0], 1).unwrap();
         let zero = QuantizedRow::quantize(&[0.0], 1).unwrap();
-        let certificate = CandidateCertificate::new(&query, 1);
+        let certificate = CandidateCertificate::new(&query);
         assert_eq!(
             certificate
                 .certify_upper(row.certificate(), f64::INFINITY)

@@ -20,6 +20,7 @@ type CudaRuntime = cubecl::cuda::CudaRuntime;
 const PLANE_SIZE: u32 = 32;
 const THREADS: u32 = 256;
 
+#[cfg(test)]
 #[cube]
 fn decode_e2m1_f64(raw: u32) -> f64 {
     let magnitude = raw & 7u32;
@@ -42,6 +43,7 @@ fn decode_e2m1_f64(raw: u32) -> f64 {
     value
 }
 
+#[cfg(test)]
 #[cube]
 fn decode_e4m3_f64(raw: u32) -> f64 {
     let exponent = (raw >> 3u32) & 15u32;
@@ -98,6 +100,7 @@ fn decode_e4m3_f32(raw: u32) -> f32 {
     }
 }
 
+#[cfg(test)]
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 fn decode_dot_f64(
@@ -412,6 +415,7 @@ fn empty_scan(resident: &Resident, upper_raw_dots: &[f64]) -> Result<bool, CudaE
     Ok(true)
 }
 
+#[cfg(test)]
 fn launch_f64(resident: &Resident, coordinates: &[f64]) -> Result<Vec<u8>, CudaError> {
     let query = resident
         .client
@@ -526,13 +530,15 @@ fn launch_f32(resident: &Resident, coordinates: &[f32]) -> Result<Vec<u8>, CudaE
         .map_err(|error| CudaError::Device(format!("{error:?}")))
 }
 
-/// Portable f64 CUDA completion for immutable NVFP4 planes.
-pub struct CudaF64UpperScanner {
+/// Test-only f64 CUDA proof oracle for immutable NVFP4 planes.
+#[cfg(test)]
+struct CudaF64UpperScanner {
     resident: Resident,
 }
 
+#[cfg(test)]
 impl CudaF64UpperScanner {
-    pub fn new(
+    fn new(
         segments: &[ScanSegment<'_>],
         device: &cubecl::cuda::CudaDevice,
     ) -> Result<Self, CudaError> {
@@ -542,6 +548,7 @@ impl CudaF64UpperScanner {
     }
 }
 
+#[cfg(test)]
 impl UpperScanner for CudaF64UpperScanner {
     type Error = CudaError;
 
@@ -603,13 +610,13 @@ impl UpperScanner for CudaF64UpperScanner {
 }
 
 /// Certified ordinary-f32 CUDA completion for immutable NVFP4 planes.
-pub struct CudaF32UpperScanner {
+pub struct CudaUpperScanner {
     resident: Resident,
     accumulation_gamma: f64,
     underflow_allowance: f64,
 }
 
-impl CudaF32UpperScanner {
+impl CudaUpperScanner {
     pub fn new(
         segments: &[ScanSegment<'_>],
         device: &cubecl::cuda::CudaDevice,
@@ -640,7 +647,7 @@ impl CudaF32UpperScanner {
     }
 }
 
-impl UpperScanner for CudaF32UpperScanner {
+impl UpperScanner for CudaUpperScanner {
     type Error = CudaError;
 
     fn scan_upper(
@@ -770,13 +777,13 @@ mod tests {
         )
         .unwrap();
         let device = cubecl::cuda::CudaDevice::default();
-        let f32_scanner = CudaF32UpperScanner::new(&[segment], &device).unwrap();
+        let f32_scanner = CudaUpperScanner::new(&[segment], &device).unwrap();
         let f64_scanner = CudaF64UpperScanner::new(&[segment], &device).unwrap();
         let scanners: [&dyn UpperScanner<Error = CudaError>; 2] = [&f32_scanner, &f64_scanner];
         for query_index in 0..8 {
             let query_source = vector(100 + query_index, DIMENSION);
             let query = PreparedQuery::new(&query_source, DIMENSION).unwrap();
-            let certificate = CandidateCertificate::new(&query, DIMENSION);
+            let certificate = CandidateCertificate::new(&query);
             for scanner in scanners {
                 let mut raw_uppers = vec![0.0; rows.len()];
                 scanner
