@@ -617,11 +617,10 @@ pub struct CudaUpperScanner {
 }
 
 impl CudaUpperScanner {
-    pub fn new(
-        segments: &[ScanSegment<'_>],
-        device: &cubecl::cuda::CudaDevice,
-    ) -> Result<Self, CudaError> {
-        let resident = Resident::new(segments, device)?;
+    /// Upload the immutable planes to the Spark's CUDA device.
+    pub fn new(segments: &[ScanSegment<'_>]) -> Result<Self, CudaError> {
+        let device = cubecl::cuda::CudaDevice::default();
+        let resident = Resident::new(segments, &device)?;
         let lane_fmas = resident.physical_dimension.div_ceil(PLANE_SIZE as usize);
         let operations = lane_fmas.saturating_add(5);
         let unit = f64::from(f32::EPSILON) / 2.0;
@@ -777,7 +776,7 @@ mod tests {
         )
         .unwrap();
         let device = cubecl::cuda::CudaDevice::default();
-        let f32_scanner = CudaUpperScanner::new(&[segment], &device).unwrap();
+        let f32_scanner = CudaUpperScanner::new(&[segment]).unwrap();
         let f64_scanner = CudaF64UpperScanner::new(&[segment], &device).unwrap();
         let scanners: [&dyn UpperScanner<Error = CudaError>; 2] = [&f32_scanner, &f64_scanner];
         for query_index in 0..8 {
