@@ -89,7 +89,10 @@ box_busy_local() {
     # not.
     local word matched=0
     for word in $cmd; do
-      case "$word" in *=*) continue ;; esac
+      # An assignment is not a program, and neither is a PATTERN: a word with
+      # a bar in it is somebody's alternation (this script's own `--remote`
+      # caller, when the remote box is this box), not a name.
+      case "$word" in *=*|*"|"*) continue ;; esac
       word=${word##*/}
       if [[ $word =~ ^($pat)([^A-Za-z0-9_]|$) ]]; then matched=1; break; fi
     done
