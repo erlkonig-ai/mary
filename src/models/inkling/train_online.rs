@@ -85,6 +85,49 @@ pub fn sr_code(v: f32, scale: f32, coin: &mut Coin) -> u8 {
     (code as u8) | if neg && code != 0 { 8 } else { 0 }
 }
 
+/// Deterministic round-to-nearest onto the E2M1 grid at a fixed scale (the control for `sr_code`:
+/// a step smaller than half a grid gap vanishes entirely, so a learner rounding this way
+/// learns nothing until its step is large).
+#[inline]
+pub fn nearest_code(v: f32, scale: f32) -> u8 {
+    if !(scale > 0.0) || !v.is_finite() { return 0; }
+    let x = v / scale;
+    let neg = x < 0.0;
+    let a = x.abs().min(6.0);
+    const G: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let mut best = 0usize;
+    for (i, g) in G.iter().enumerate() { if (a - g).abs() < (a - G[best]).abs() { best = i; } }
+    (best as u8) | if neg && best != 0 { 8 } else { 0 }
+}
+
+/// Re-encode a whole packed matrix from new f32 values, keeping every block scale.
+/// `coin: None` rounds to nearest (the deterministic control); `Some` rounds stochastically.
+pub fn encode_into(p: &mut PackedExpert, values: &[f32], mut coin: Option<&mut Coin>) -> (u64, u64) {
+    let logical = p.cols * 2;
+    let sb = logical / GROUP;
+    assert_eq!(values.len(), p.rows * logical);
+    let (mut changed, mut clipped) = (0u64, 0u64);
+    for r in 0..p.rows {
+        for b in 0..sb {
+            let scale = e4m3_to_f32(p.scales[r * sb + b]) * p.scale2;
+            for i in 0..GROUP / 2 {
+                let j = r * logical + b * GROUP + 2 * i;
+                let (v0, v1) = (values[j], values[j + 1]);
+                if scale > 0.0 && (v0.abs() > 6.0 * scale || v1.abs() > 6.0 * scale) { clipped += 1; }
+                let (c0, c1) = match coin.as_deref_mut() {
+                    Some(c) => (sr_code(v0, scale, c), sr_code(v1, scale, c)),
+                    None => (nearest_code(v0, scale), nearest_code(v1, scale)),
+                };
+                let byte = c0 | (c1 << 4);
+                let k = r * p.cols + b * (GROUP / 2) + i;
+                if p.codes[k] != byte { changed += 1; }
+                p.codes[k] = byte;
+            }
+        }
+    }
+    (changed, clipped)
+}
+
 /// Re-encode a whole packed matrix from new f32 values, keeping every block scale.
 pub fn sr_encode_into(p: &mut PackedExpert, values: &[f32], coin: &mut Coin) -> (u64, u64) {
     let logical = p.cols * 2;
@@ -122,7 +165,7 @@ pub struct Arm {
     pub codes_clipped: u64,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ArmKind { None, F32, Fp4Sr }
+pub enum ArmKind { None, F32, Fp4Sr, Fp4Nearest }
 
 impl Arm {
     pub fn new(name: &str, kind: ArmKind, lr: f32, seed: u64) -> Self {
@@ -148,15 +191,17 @@ impl Arm {
                     for (w, g) in w2.iter_mut().zip(g2) { *w -= lr * g; }
                 }
             }
-            ArmKind::Fp4Sr => {
+            ArmKind::Fp4Sr | ArmKind::Fp4Nearest => {
+                let stochastic = self.kind == ArmKind::Fp4Sr;
                 if !self.states.contains_key(&(layer, e)) { self.states.insert((layer, e), ExpertState::Fp4(fetch_fp4(cp, layer, e)?)); }
+                let coin = &mut self.coin;
                 if let Some(ExpertState::Fp4(q)) = self.states.get_mut(&(layer, e)) {
                     let mut w13 = decode_packed(&q.w13);
                     let mut w2 = decode_packed(&q.w2);
                     for (w, g) in w13.iter_mut().zip(g13) { *w -= lr * g; }
                     for (w, g) in w2.iter_mut().zip(g2) { *w -= lr * g; }
-                    let (c1, k1) = sr_encode_into(&mut q.w13, &w13, &mut self.coin);
-                    let (c2, k2) = sr_encode_into(&mut q.w2, &w2, &mut self.coin);
+                    let (c1, k1) = encode_into(&mut q.w13, &w13, if stochastic { Some(&mut *coin) } else { None });
+                    let (c2, k2) = encode_into(&mut q.w2, &w2, if stochastic { Some(&mut *coin) } else { None });
                     self.codes_changed += c1 + c2; self.codes_clipped += k1 + k2;
                 }
             }

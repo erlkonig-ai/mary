@@ -38,7 +38,7 @@ fn main() -> Result<()> {
     let layers_env = std::env::var("INK_ONLINE_LAYERS").unwrap_or_else(|_| format!("{}:{}", t.num_hidden_layers - 1, t.num_hidden_layers));
     let (l0, l1) = { let mut it = layers_env.split(':'); (it.next().unwrap().parse::<usize>()?, it.next().unwrap().parse::<usize>()?) };
     anyhow::ensure!(l0 < l1 && l1 <= t.num_hidden_layers && (l0..l1).all(|l| !t.is_dense(l)), "INK_ONLINE_LAYERS {layers_env} must be a range of MoE layers");
-    let arms_env = std::env::var("INK_ONLINE_ARMS").unwrap_or_else(|_| "none,f32,fp4sr".into());
+    let arms_env = std::env::var("INK_ONLINE_ARMS").unwrap_or_else(|_| "none,f32,fp4sr,fp4rn".into());
     let lr: f32 = env_or("INK_ONLINE_LR", 0.1);
     let seed: u64 = env_or("INK_ONLINE_SEED", 7);
     let turn0: usize = env_or("INK_STEP_TURN", 0);
@@ -79,6 +79,7 @@ fn main() -> Result<()> {
         "none" => Arm::new("none", ArmKind::None, 0.0, seed),
         "f32" => Arm::new("f32", ArmKind::F32, lr, seed),
         "fp4sr" => Arm::new("fp4sr", ArmKind::Fp4Sr, lr, seed),
+        "fp4rn" => Arm::new("fp4rn", ArmKind::Fp4Nearest, lr, seed),
         other => panic!("unknown arm {other}"),
     }).collect();
     let mut losses: Vec<Vec<f32>> = vec![Vec::new(); arms.len()];
@@ -178,7 +179,7 @@ fn main() -> Result<()> {
         let delta: f32 = losses[a].iter().zip(&none).map(|(x, y)| x - y).sum::<f32>() / none.len() as f32;
         let delta_after1: f32 = if none.len() > 1 { losses[a][1..].iter().zip(&none[1..]).map(|(x, y)| x - y).sum::<f32>() / (none.len() - 1) as f32 } else { 0.0 };
         println!("  {:<6} mean {:.4}  vs none {:+.4} (turns 1.. {:+.4})  per turn: {}{}", arm.name, mean(&losses[a]), delta, delta_after1, per.join(" "),
-            if arm.kind == ArmKind::Fp4Sr { format!("   [codes changed {}, clipped {}]", arm.codes_changed, arm.codes_clipped) } else { String::new() });
+            if matches!(arm.kind, ArmKind::Fp4Sr | ArmKind::Fp4Nearest) { format!("   [codes changed {}, clipped {}]", arm.codes_changed, arm.codes_clipped) } else { String::new() });
     }
     println!("  prequential gate: an arm WINS if its 'vs none' over turns 1.. is negative on turns it did not learn from yet");
     Ok(())
