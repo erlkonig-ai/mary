@@ -186,13 +186,14 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
         // unchanged.
         session_config.extend_batch = session_config.extend_batch.min(budget);
     }
-    // Historically there was only one length axis. Preserve that meaning:
-    // setting just the prefill budget admits that many retained positions too,
-    // while an explicit context budget opts into bounded-width chunking of a
-    // longer logical sequence.
-    session_config.context_budget = config
-        .context_budget
-        .unwrap_or(session_config.prefill_budget);
+    // The window the resident is built for, not the prefill width. Historically
+    // there was one length axis and an unset context budget admitted only as
+    // many positions as one prefill pass; that stopped a 200-turn run at turn
+    // 77, cleanly, and JP's answer was to fix the number the design already
+    // fixes: a million positions. Its KV is priced at load (7.9 GiB at NVFP4
+    // with 7 of 42 layers global, halved under tensor parallelism), which is
+    // what the budget is FOR. A caller may still name a smaller one.
+    session_config.context_budget = config.context_budget.unwrap_or(1 << 20);
     let prefill_budget = session_config.prefill_budget;
     let context_budget = session_config.context_budget;
     let extend_batch = session_config.extend_batch;

@@ -34,7 +34,7 @@ fn main() -> Result<()> {
     anyhow::ensure!(
         args.len() >= 4,
         "usage: inkling_learn <pile> <tokenizer.json> <turns.txt> [--from LINE] [--turns N] \
-         [--gen G] [--tp-rendezvous HOST:PORT] [--layers a:b] [--export] [--context N]"
+         [--gen G] [--tp-rendezvous HOST:PORT] [--layers a:b] [--export]"
     );
     let (pile, tokenizer, corpus) = (&args[1], &args[2], &args[3]);
     let mut from = 100usize;
@@ -43,17 +43,9 @@ fn main() -> Result<()> {
     let mut rendezvous: Option<String> = None;
     let mut layers: Option<std::ops::Range<usize>> = None;
     let mut export = false;
-    let mut context: Option<usize> = None;
     let mut i = 4;
     while i < args.len() {
         match args[i].as_str() {
-            // Positions the session may retain over the whole run. Unset, the
-            // engine admits 4096, which is about 77 turns at sixteen generated
-            // tokens each; a longer run has to say so before the model loads.
-            "--context" => {
-                context = Some(args[i + 1].parse().context("--context wants a position count")?);
-                i += 2;
-            }
             // After the last turn, pull every learned expert out of both
             // ranks' arenas, joined whole, and say what came back. Nothing is
             // written to a pile yet (see `inkling::learned`).
@@ -122,7 +114,8 @@ fn main() -> Result<()> {
         tokenizer: tokenizer.into(),
         layers,
         prefill_budget: None,
-        context_budget: context,
+        // The engine's default is the window the resident is built for.
+        context_budget: None,
         tensor_parallel,
         sealed: false,
     })?;
