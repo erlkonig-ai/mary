@@ -1009,6 +1009,53 @@ impl PileSource {
         let open_secs = t_open.elapsed().as_secs_f64();
         let t_experts = std::time::Instant::now();
 
+        // ── which model ─────────────────────────────────────────────────────
+        // A collection can hold more than one model root -- a checkpoint and
+        // the model learned from it, say (`super::learned`). The sweeps below
+        // key leaves by NAME and index, so read over two roots they would
+        // return one model with whichever leaf the query yielded last. So the
+        // root is chosen first, and every leaf has to be a member of it.
+        // `INK_MODEL_ROOT=<hex>` names it; otherwise a sole root is it, and
+        // several without a name is an error rather than a guess. A pile with
+        // no root entity at all (older imports) is swept whole, as before.
+        let mut roots: Vec<Id> = find!(
+            (r: Id),
+            pattern!(&facts, [{ ?r @ crate::format::attrs::member: _?m }])
+        )
+        .map(|(r,)| r)
+        .collect();
+        roots.sort();
+        roots.dedup();
+        let hex_list = |ids: &[Id]| {
+            ids.iter()
+                .map(|i| format!("{i:X}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let root: Option<Id> = match std::env::var("INK_MODEL_ROOT") {
+            Ok(hex) => {
+                let id = Id::from_hex(hex.trim())
+                    .with_context(|| format!("INK_MODEL_ROOT={hex:?} is not a 32-hex id"))?;
+                anyhow::ensure!(
+                    roots.contains(&id),
+                    "INK_MODEL_ROOT={hex}: {path:?} holds no model root with that id ({} root(s): {})",
+                    roots.len(),
+                    hex_list(&roots)
+                );
+                Some(id)
+            }
+            Err(_) => match roots.as_slice() {
+                [] => None,
+                [one] => Some(*one),
+                many => anyhow::bail!(
+                    "{path:?} holds {} model roots ({}); set INK_MODEL_ROOT=<id> to say which \
+                     one to run",
+                    many.len(),
+                    hex_list(many)
+                ),
+            },
+        };
+
         // ── the experts, as handles ─────────────────────────────────────────
         // First, because what it produces is also what tells the dense sweep
         // which entities are NOT dense. An expert entity carries an
@@ -1022,17 +1069,41 @@ impl PileSource {
         let mut expert_ids: std::collections::HashSet<Id> = Default::default();
         macro_rules! sweep_experts {
             ($ty:ty, $attr:expr, $wrap:expr) => {{
-                for (e, n, i, l, h) in find!(
-                    (e: Id,
-                     n: Inline<Handle<blobencodings::UTF8String>>,
-                     i: i64,
-                     l: i64,
-                     h: Inline<Handle<Tensor<$ty, 2>>>),
-                    pattern!(&facts, [
-                        { ?e @ metadata::name: ?n, attrs::expert_index: ?i,
-                          attrs::layer: ?l, $attr: ?h },
-                    ])
-                ) {
+                type Hit<T> = (
+                    Id,
+                    Inline<Handle<blobencodings::UTF8String>>,
+                    i64,
+                    i64,
+                    Inline<Handle<Tensor<T, 2>>>,
+                );
+                let hits: Vec<Hit<$ty>> = match root {
+                    Some(root) => find!(
+                        (e: Id,
+                         n: Inline<Handle<blobencodings::UTF8String>>,
+                         i: i64,
+                         l: i64,
+                         h: Inline<Handle<Tensor<$ty, 2>>>),
+                        pattern!(&facts, [
+                            { (root) @ crate::format::attrs::member: ?e },
+                            { ?e @ metadata::name: ?n, attrs::expert_index: ?i,
+                              attrs::layer: ?l, $attr: ?h },
+                        ])
+                    )
+                    .collect(),
+                    None => find!(
+                        (e: Id,
+                         n: Inline<Handle<blobencodings::UTF8String>>,
+                         i: i64,
+                         l: i64,
+                         h: Inline<Handle<Tensor<$ty, 2>>>),
+                        pattern!(&facts, [
+                            { ?e @ metadata::name: ?n, attrs::expert_index: ?i,
+                              attrs::layer: ?l, $attr: ?h },
+                        ])
+                    )
+                    .collect(),
+                };
+                for (e, n, i, l, h) in hits {
                     let name: anybytes::View<str> = reader
                         .get(n)
                         .map_err(|err| anyhow::anyhow!("expert name blob: {err:?}"))?;
@@ -1078,16 +1149,34 @@ impl PileSource {
                 // Located first, read second. The `find!` iterator borrows
                 // `facts` and is not something to hand to a thread; the handles
                 // it yields are plain `Copy` values that are.
-                let hits: Vec<_> = find!(
-                    (e: Id,
-                     n: Inline<Handle<blobencodings::UTF8String>>,
-                     h: Inline<Handle<Tensor<$ty, $rank>>>),
-                    pattern!(&facts, [
-                        { ?e @ metadata::name: ?n, attrs::weight::<$ty, $rank>(): ?h },
-                    ])
-                )
-                .filter(|(e, _, _)| !expert_ids.contains(e))
-                .collect();
+                type Hit<T> = (
+                    Id,
+                    Inline<Handle<blobencodings::UTF8String>>,
+                    Inline<Handle<Tensor<T, $rank>>>,
+                );
+                let hits: Vec<Hit<$ty>> = match root {
+                    Some(root) => find!(
+                        (e: Id,
+                         n: Inline<Handle<blobencodings::UTF8String>>,
+                         h: Inline<Handle<Tensor<$ty, $rank>>>),
+                        pattern!(&facts, [
+                            { (root) @ crate::format::attrs::member: ?e },
+                            { ?e @ metadata::name: ?n, attrs::weight::<$ty, $rank>(): ?h },
+                        ])
+                    )
+                    .filter(|(e, _, _)| !expert_ids.contains(e))
+                    .collect(),
+                    None => find!(
+                        (e: Id,
+                         n: Inline<Handle<blobencodings::UTF8String>>,
+                         h: Inline<Handle<Tensor<$ty, $rank>>>),
+                        pattern!(&facts, [
+                            { ?e @ metadata::name: ?n, attrs::weight::<$ty, $rank>(): ?h },
+                        ])
+                    )
+                    .filter(|(e, _, _)| !expert_ids.contains(e))
+                    .collect(),
+                };
                 if !hits.is_empty() {
                     let chunk = hits.len().div_ceil(index_threads).max(1);
                     let reader = &reader;
