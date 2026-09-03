@@ -168,7 +168,8 @@ fn main() -> Result<()> {
         let t = std::time::Instant::now();
         let learned = engine.export_learned()?;
         let secs = t.elapsed().as_secs_f64();
-        let mut per_name: std::collections::BTreeMap<&str, (usize, usize)> = Default::default();
+        let mut per_name: std::collections::BTreeMap<&str, (usize, (usize, usize))> =
+            Default::default();
         let mut blob_bytes = 0usize;
         for x in &learned {
             let blob = mary::models::inkling::pile::expert_blob(&x.packed)
@@ -176,15 +177,15 @@ fn main() -> Result<()> {
             blob_bytes += blob.bytes.len();
             let e = per_name.entry(x.name.as_str()).or_default();
             e.0 += 1;
-            e.1 = x.packed.rows * 1000 + x.packed.cols * 2;
+            e.1 = (x.packed.rows, x.packed.cols * 2);
         }
         println!(
             "=== export: {} learned experts, {:.1} MiB of leaves, in {secs:.1}s ===",
             learned.len(),
             blob_bytes as f64 / (1u64 << 20) as f64
         );
-        for (name, (count, dims)) in &per_name {
-            println!("  {name}: {count} experts, each [{}, {}]", dims / 1000, dims % 1000);
+        for (name, (count, (rows, logical))) in &per_name {
+            println!("  {name}: {count} experts, each [{rows}, {logical}]");
         }
     }
     engine.shutdown()?;
