@@ -53,10 +53,16 @@ pub fn pool_release(dev: &Dev) -> String {
 }
 /// Abort before the box does. The GB10 is unified memory: host MemAvailable is
 /// the number that matters for the device pool as well.
+/// The floor, overridable with INK_MEM_FLOOR_GIB (never below 18: the 02:55 crash was a thrash
+/// that began around 5 GiB free, and the external watchdog sits at 16).
+pub fn mem_floor_gib() -> f64 {
+    std::env::var("INK_MEM_FLOOR_GIB").ok().and_then(|s| s.parse::<f64>().ok()).map(|v| v.max(18.0)).unwrap_or(MEM_FLOOR_GIB)
+}
 pub fn mem_guard(where_: &str) {
     let a = mem_available_gib();
-    if a < MEM_FLOOR_GIB {
-        eprintln!("MEMORY GUARD: MemAvailable {a:.1} GiB < floor {MEM_FLOOR_GIB} GiB at {where_} -- aborting before the box does");
+    let floor = mem_floor_gib();
+    if a < floor {
+        eprintln!("MEMORY GUARD: MemAvailable {a:.1} GiB < floor {floor} GiB at {where_} -- aborting before the box does");
         std::process::exit(3);
     }
 }
