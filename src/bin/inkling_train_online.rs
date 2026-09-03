@@ -114,15 +114,20 @@ fn main() -> Result<()> {
             select_routing(&lg, &base.rb, &g)
         };
         load_experts(&cp, &g, &mut base, &routing)?;
+        let base_no_experts = HostW { experts: Default::default(), ..base.clone() };
         let mut touched: Vec<usize> = routing.iter().flat_map(|r| r.experts.clone()).collect();
         touched.sort_unstable(); touched.dedup();
         let mut line = format!("turn {k:>2} ({:>3} scored):", tr.n_text + 1);
         for (a, arm) in arms.iter_mut().enumerate() {
             let t_arm = Instant::now();
-            // this arm's view of the layer: checkpoint experts, overridden where the arm has learned
-            let mut hw = base.clone();
-            for &e in &touched { if let Some(w) = arm.current(e) { hw.experts.insert(e, w); } }
-            let dw: DevW<Ad> = build_dev(&dev, &hw, &g);
+            // this arm's view of the layer: the checkpoint's experts, overridden where the arm has
+            // learned. Built straight onto the device -- no host clone of the layer per arm (the
+            // clone cost ~4 GB per arm per turn and pushed turn 2 to 32 GiB free).
+            let mut dw: DevW<Ad> = build_dev(&dev, &base_no_experts, &g);
+            for &e in &touched {
+                let (w13, w2) = match arm.current(e) { Some(w) => w, None => base.experts.get(&e).unwrap().clone() };
+                dw.experts.insert(e, (t2(&dev, &w13, 2 * g.mi, g.h), t2(&dev, &w2, g.h, g.mi)));
+            }
             let xin = c2::<Ad>(&dev, x.clone(), n, h);
             let y = burn_layer(&dev, &dw, &g, xin, &routing);
             let yv: Vec<f32> = y.clone().into_data().to_vec::<f32>().unwrap();
@@ -144,9 +149,9 @@ fn main() -> Result<()> {
                 }
                 drop(grads);
             }
-            drop(dw); drop(hw);
+            drop(dw);
             pool_release(&dev);
-            line.push_str(&format!("  {} {:.4} ({:.1}s)", arm.name, loss, t_arm.elapsed().as_secs_f64()));
+            line.push_str(&format!("  {} {:.4} ({:.1}s, {:.0} GiB free)", arm.name, loss, t_arm.elapsed().as_secs_f64(), mem_available_gib()));
         }
         println!("{line}   [shared fwd {t_shared:.0}s, {} experts touched, MemAvailable {:.1} GiB]", touched.len(), mem_available_gib());
         mem_guard(&format!("after turn {k}"));
