@@ -413,10 +413,11 @@ fn env_f64(name: &str, default: f64) -> f64 {
 /// they become ready (the first chunk arrives after prefill + `HOP` frames —
 /// seconds, not the whole utterance), then call [`finish`](Self::finish) to
 /// propagate any synthesis error. Dropping it early cancels the remaining
-/// generation once the codec next tries to emit a PCM chunk.
+/// generation of THIS utterance once the codec next tries to emit a chunk;
+/// the [`Synthesizer`] it came from is untouched and serves the next one.
 pub struct SpeakStream {
     rx: mpsc::Receiver<Vec<f32>>,
-    r#gen: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+    done: mpsc::Receiver<anyhow::Result<()>>,
 }
 
 impl Iterator for SpeakStream {
@@ -430,16 +431,87 @@ impl SpeakStream {
     /// Sample rate of the emitted PCM.
     pub const SAMPLE_RATE: u32 = SAMPLE_RATE;
 
-    /// Wait for generation to end and surface its result. Also drains any
-    /// chunks the caller didn't consume.
-    pub fn finish(mut self) -> anyhow::Result<()> {
+    /// Wait for this utterance's generation to end and surface its result.
+    /// Also drains any chunks the caller didn't consume.
+    pub fn finish(self) -> anyhow::Result<()> {
         while self.rx.recv().is_ok() {}
-        match self.r#gen.take() {
-            Some(h) => h
-                .join()
-                .map_err(|_| anyhow::anyhow!("speak generation thread panicked"))?,
-            None => Ok(()),
+        match self.done.recv() {
+            Ok(result) => result,
+            Err(_) => anyhow::bail!("the speak generation thread ended without reporting this utterance"),
         }
+    }
+}
+
+/// One utterance, as the resident generation thread receives it.
+struct Request {
+    text: String,
+    /// When the caller asked, so TTFA is speak-to-first-audio as the caller
+    /// experienced it.
+    called: Instant,
+    pcm: mpsc::Sender<Vec<f32>>,
+    done: mpsc::Sender<anyhow::Result<()>>,
+}
+
+/// The resident voice: talker, code predictor, tokenizer, the reference clone
+/// prompt and the codec, loaded and warmed ONCE and kept on their own threads
+/// across utterances. [`speak`](Self::speak) queues one utterance and returns
+/// its [`SpeakStream`] at once; utterances are synthesized in order, each
+/// starting from the reference codes again (the codec history is reset at
+/// every pass end, exactly as between the passes of one long text).
+///
+/// This is what a faculty that keeps talking needs and a one-shot `say` does
+/// not care about: [`synthesize_stream`] is one session, one utterance, and
+/// the session is dropped the moment the stream is handed back — the threads
+/// finish that utterance and exit. Dropping a `Synthesizer` never blocks:
+/// in-flight utterances complete, later ones are refused.
+pub struct Synthesizer {
+    tx: mpsc::Sender<Request>,
+}
+
+impl Synthesizer {
+    /// Load everything on a fresh generation thread and return immediately.
+    /// Load errors surface on the FIRST utterance's [`SpeakStream::finish`]
+    /// (and every later one), never silently.
+    ///
+    /// - `weights` — four roots selected from one frozen native model snapshot.
+    /// - `ref_wav` — 24 kHz mono PCM16 reference clip (the conditioning identity).
+    /// - `ref_text` — the clip's exact transcript.
+    /// - `ref_codes` — f32 npy `(T, 16)`: the clip's codec frames.
+    pub fn spawn(
+        weights: Qwen3TtsWeights,
+        ref_wav: &Path,
+        ref_text: &str,
+        ref_codes: &Path,
+    ) -> anyhow::Result<Self> {
+        // The talker runs on the RAW (non-fusion) backends — the ONLY talker
+        // lane. f16 by default (halves per-step weight traffic — the realtime
+        // fast path; identity holds within the resemblyzer gate);
+        // MARY_SPEAK_F32=1 selects the full-precision talker. The CPU code
+        // predictor and the f32 codec are unaffected by the switch.
+        if std::env::var("MARY_SPEAK_F32").is_ok() {
+            spawn_impl::<crate::nn::backend::B>(weights, ref_wav, ref_text, ref_codes)
+        } else {
+            spawn_impl::<crate::nn::backend::BHalf>(weights, ref_wav, ref_text, ref_codes)
+        }
+    }
+
+    /// Queue `text` and hand back its stream. Chunks arrive while generation
+    /// runs; call `finish` on the stream for the utterance's result.
+    pub fn speak(&self, text: &str) -> anyhow::Result<SpeakStream> {
+        let (tx_pcm, rx_pcm) = mpsc::channel::<Vec<f32>>();
+        let (tx_done, rx_done) = mpsc::channel::<anyhow::Result<()>>();
+        self.tx
+            .send(Request {
+                text: text.to_string(),
+                called: Instant::now(),
+                pcm: tx_pcm,
+                done: tx_done,
+            })
+            .map_err(|_| anyhow::anyhow!("the speak generation thread has exited"))?;
+        Ok(SpeakStream {
+            rx: rx_pcm,
+            done: rx_done,
+        })
     }
 }
 
@@ -459,24 +531,11 @@ pub fn synthesize_stream(
     ref_codes: &Path,
     gen_text: &str,
 ) -> anyhow::Result<SpeakStream> {
-    // The talker runs on the RAW (non-fusion) Metal backends — the ONLY
-    // talker lane. (Fused removed 2026-07-12: an ear A/B picked raw,
-    // "better tempo", at measured perf parity — and only the raw backends
-    // can alias mmap'd pile pages straight onto the GPU; burn 0.21's fusion
-    // codegen miscompiles graphs over many externally-registered buffers.)
-    // f16 by default (halves per-step weight traffic — the realtime fast
-    // path; identity holds within the resemblyzer gate); MARY_SPEAK_F32=1
-    // selects the full-precision talker. The CPU code predictor and the f32
-    // codec are unaffected by the switch.
-    if std::env::var("MARY_SPEAK_F32").is_ok() {
-        synthesize_stream_impl::<crate::nn::backend::B>(
-            weights, ref_wav, ref_text, ref_codes, gen_text,
-        )
-    } else {
-        synthesize_stream_impl::<crate::nn::backend::BHalf>(
-            weights, ref_wav, ref_text, ref_codes, gen_text,
-        )
-    }
+    // One session for one utterance: the session is dropped here, so its
+    // threads finish this utterance and exit — the one-shot process model
+    // `voice say`/`shout` runs under, unchanged.
+    let session = Synthesizer::spawn(weights, ref_wav, ref_text, ref_codes)?;
+    session.speak(gen_text)
 }
 
 /// Speak `gen_text` in the voice of the reference kit. Returns 24 kHz mono
@@ -500,89 +559,117 @@ pub fn synthesize(
 
 /// What the generation thread hands the codec thread.
 enum CodecMsg {
+    /// A new utterance begins: its PCM goes here, its cancellation flag is
+    /// raised if the consumer stops taking chunks, and TTFA counts from
+    /// `called`.
+    Begin {
+        pcm: mpsc::Sender<Vec<f32>>,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        called: Instant,
+    },
     Frame([u32; NUM_CODE_GROUPS]),
     /// End of a text pass: flush the partial window, reset the decode history
     /// to the reference, and (between passes) emit a short silence gap.
     PassEnd {
         gap: bool,
     },
+    /// The utterance is over: close its PCM channel and report what was
+    /// emitted, so the generation thread can time it and release the caller.
+    End,
 }
 
-fn synthesize_stream_impl<B: Backend + 'static>(
+/// What the codec thread reports back per utterance: samples emitted and the
+/// TTFA it measured (0 if nothing was emitted).
+type CodecAck = (usize, f64);
+
+fn spawn_impl<B: Backend + 'static>(
     weights: Qwen3TtsWeights,
     ref_wav: &Path,
     ref_text: &str,
     ref_codes: &Path,
-    gen_text: &str,
-) -> anyhow::Result<SpeakStream> {
+) -> anyhow::Result<Synthesizer> {
     let ref_wav = ref_wav.to_path_buf();
     let ref_text = ref_text.to_string();
     let ref_codes = ref_codes.to_path_buf();
-    let gen_text = gen_text.to_string();
+    let (tx_req, rx_req) = mpsc::channel::<Request>();
 
-    // TTFA is measured from HERE — the API call — so it includes model load,
-    // warmup, prompt build and prefill: the honest speak-to-first-audio.
-    let t_call = Instant::now();
-    let (tx_pcm, rx_pcm) = mpsc::channel::<Vec<f32>>();
-    let r#gen = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("speak-gen".into())
-        .spawn(move || -> anyhow::Result<()> {
-            crate::models::qwen3tts::cpu::set_interactive_qos();
-            let dev: B::Device = Default::default();
+        .spawn(move || {
+            // Everything up to the first request is the session's load. If it
+            // fails, every utterance queued or yet to come is refused with the
+            // reason — a session that died loading must not look like one
+            // that is merely slow.
+            let loaded = (|| -> anyhow::Result<_> {
+                crate::models::qwen3tts::cpu::set_interactive_qos();
+                let dev: B::Device = Default::default();
 
-            let t_load = Instant::now();
-            let folded_talker = weights.folded_talker::<B>()?;
-            let loader = weights.into_loader();
-            let talker = folded_talker.unwrap_or_else(|| Talker::load(&loader, &dev));
-            let mut predictor = CodePredictor::load(&loader);
-            // The predictor's frame loop moves to the GPU unless explicitly
-            // held back: on the host it cost ~50 ms of an 80 ms frame and
-            // synthesis ran below realtime. `MARY_PRED_CPU=1` restores the
-            // Accelerate path, which is also what `MARY_PRED_GATE=1` compares
-            // against frame by frame.
-            #[cfg(feature = "predictor-gpu")]
-            if std::env::var("MARY_PRED_CPU").is_err() {
-                let t = Instant::now();
-                predictor.use_gpu();
-                eprintln!(
-                    "[timing] predictor → GPU: {:.2}s",
-                    t.elapsed().as_secs_f32()
+                let t_load = Instant::now();
+                let folded_talker = weights.folded_talker::<B>()?;
+                let loader = weights.into_loader();
+                let talker = folded_talker.unwrap_or_else(|| Talker::load(&loader, &dev));
+                let mut predictor = CodePredictor::load(&loader);
+                // The predictor's frame loop moves to the GPU unless explicitly
+                // held back: on the host it cost ~50 ms of an 80 ms frame and
+                // synthesis ran below realtime. `MARY_PRED_CPU=1` restores the
+                // Accelerate path, which is also what `MARY_PRED_GATE=1` compares
+                // against frame by frame.
+                #[cfg(feature = "predictor-gpu")]
+                if std::env::var("MARY_PRED_CPU").is_err() {
+                    let t = Instant::now();
+                    predictor.use_gpu();
+                    eprintln!(
+                        "[timing] predictor → GPU: {:.2}s",
+                        t.elapsed().as_secs_f32()
+                    );
+                }
+                let predictor = predictor;
+                let spk_enc = SpeakerEncoder::<B>::load(&loader, &dev);
+                let tok = TextTokenizer::load(
+                    &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/qwen3tts"),
                 );
-            }
-            let predictor = predictor;
-            let spk_enc = SpeakerEncoder::<B>::load(&loader, &dev);
-            let tok = TextTokenizer::load(
-                &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/qwen3tts"),
-            );
-            eprintln!("[timing] weight load (pile): {:.2}s", t_load.elapsed().as_secs_f32());
+                eprintln!("[timing] weight load (pile): {:.2}s", t_load.elapsed().as_secs_f32());
 
-            // ── reference kit → clone prompt ──
-            let (samples, sr) = wav::read_pcm16_mono(&ref_wav);
-            anyhow::ensure!(
-                sr == SAMPLE_RATE,
-                "reference clip must be 24 kHz mono PCM16 (got {sr} Hz): {ref_wav:?}"
-            );
-            let spk_embedding =
-                spk_enc.forward(SpeakerMel::<B>::new(&dev).forward(&samples, &dev));
-            drop(spk_enc);
-            let (rc, rcs) = npy::load_npy(&ref_codes)?;
-            anyhow::ensure!(
-                rcs.len() == 2 && rcs[1] == NUM_CODE_GROUPS,
-                "ref codes must be (T, {NUM_CODE_GROUPS}), got {rcs:?}: {ref_codes:?}"
-            );
-            let ref_code: Vec<[u32; NUM_CODE_GROUPS]> = (0..rcs[0])
-                .map(|t| {
-                    let mut f = [0u32; NUM_CODE_GROUPS];
-                    for q in 0..NUM_CODE_GROUPS {
-                        f[q] = rc[t * NUM_CODE_GROUPS + q] as u32;
+                // ── reference kit → clone prompt ──
+                let (samples, sr) = wav::read_pcm16_mono(&ref_wav);
+                anyhow::ensure!(
+                    sr == SAMPLE_RATE,
+                    "reference clip must be 24 kHz mono PCM16 (got {sr} Hz): {ref_wav:?}"
+                );
+                let spk_embedding =
+                    spk_enc.forward(SpeakerMel::<B>::new(&dev).forward(&samples, &dev));
+                drop(spk_enc);
+                let (rc, rcs) = npy::load_npy(&ref_codes)?;
+                anyhow::ensure!(
+                    rcs.len() == 2 && rcs[1] == NUM_CODE_GROUPS,
+                    "ref codes must be (T, {NUM_CODE_GROUPS}), got {rcs:?}: {ref_codes:?}"
+                );
+                let ref_code: Vec<[u32; NUM_CODE_GROUPS]> = (0..rcs[0])
+                    .map(|t| {
+                        let mut f = [0u32; NUM_CODE_GROUPS];
+                        for q in 0..NUM_CODE_GROUPS {
+                            f[q] = rc[t * NUM_CODE_GROUPS + q] as u32;
+                        }
+                        f
+                    })
+                    .collect();
+                let prompt = ClonePrompt {
+                    ref_code,
+                    ref_ids: tok.encode(&format!("<|im_start|>assistant\n{ref_text}<|im_end|>\n")),
+                    spk_embedding,
+                };
+                Ok((dev, loader, talker, predictor, tok, prompt))
+            })();
+            let (dev, loader, talker, predictor, tok, prompt) = match loaded {
+                Ok(parts) => parts,
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    eprintln!("speak: session failed to load: {message}");
+                    while let Ok(req) = rx_req.recv() {
+                        let _ = req.done.send(Err(anyhow::anyhow!("speak session failed to load: {message}")));
                     }
-                    f
-                })
-                .collect();
-            let prompt = ClonePrompt {
-                ref_code,
-                ref_ids: tok.encode(&format!("<|im_start|>assistant\n{ref_text}<|im_end|>\n")),
-                spk_embedding,
+                    return;
+                }
             };
 
             let (hop, ctx) =
@@ -592,11 +679,13 @@ fn synthesize_stream_impl<B: Backend + 'static>(
             // The codec (f32 whatever the talker precision: its im2col conv
             // GEMMs measured slower in f16, and it is cheap in f32) loads AND
             // warms here, overlapping the talker warmup on this thread — and
-            // its fused tensors live on the thread that uses them.
+            // its fused tensors live on the thread that uses them. It outlives
+            // every utterance; only the PCM channel changes hands.
             let (tx_c, rx_c) = mpsc::channel::<CodecMsg>();
+            let (tx_ack, rx_ack) = mpsc::channel::<CodecAck>();
             let ref_codes_for_codec = prompt.ref_code.clone();
-            let codec_thread = std::thread::Builder::new().name("speak-codec".into()).spawn(
-                move || -> (usize, f64) {
+            let codec_thread = match std::thread::Builder::new().name("speak-codec".into()).spawn(
+                move || {
                     crate::models::qwen3tts::cpu::set_interactive_qos();
                     let cdev = WgpuDevice::default();
                     let codec = CodecDecoder::<BFused>::load(&loader, &cdev);
@@ -610,16 +699,29 @@ fn synthesize_stream_impl<B: Backend + 'static>(
                     let ref_len = ref_codes_for_codec.len();
                     let mut history = ref_codes_for_codec;
                     let mut decoded_upto = ref_len;
-                    let mut emitted = 0usize;
-                    let mut ttfa = 0f64;
                     let bench = std::env::var("QWEN3TTS_BENCH").is_ok();
                     let codec_stats = std::cell::Cell::new((0f64, 0usize, 0usize)); // (s, chunks, frames)
 
+                    // The utterance in progress: where its PCM goes, how to
+                    // tell the generator it is no longer wanted, and its clock.
+                    struct Out {
+                        pcm: mpsc::Sender<Vec<f32>>,
+                        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+                        called: Instant,
+                        emitted: usize,
+                        ttfa: f64,
+                    }
+                    let mut out: Option<Out> = None;
+
+                    // Decode `history[from..to]` (with left context) and hand
+                    // the PCM to the current utterance. A consumer that has
+                    // dropped its stream cancels THAT utterance: its flag is
+                    // raised so generation stops early, its output is closed,
+                    // and the session goes on.
                     let flush = |history: &[[u32; NUM_CODE_GROUPS]],
                                      from: usize,
                                      to: usize,
-                                     emitted: &mut usize,
-                                     ttfa: &mut f64| -> bool {
+                                     out: &mut Option<Out>| {
                         let c = ctx.min(from);
                         let td = Instant::now();
                         let wav = codec.decode(&history[from - c..to], &cdev);
@@ -629,45 +731,75 @@ fn synthesize_stream_impl<B: Backend + 'static>(
                                 .set((s + td.elapsed().as_secs_f64(), n + 1, f + (to - from)));
                         }
                         let pcm = wav[c * SAMPLES_PER_FRAME..].to_vec();
-                        if *emitted == 0 {
-                            *ttfa = t_call.elapsed().as_secs_f64();
+                        let Some(o) = out.as_mut() else { return };
+                        if o.emitted == 0 {
+                            o.ttfa = o.called.elapsed().as_secs_f64();
                             eprintln!(
-                                "[timing] TTFA: {ttfa:.2}s (call → first PCM chunk, incl. load+warm+prefill)"
+                                "[timing] TTFA: {:.2}s (call → first PCM chunk, incl. load+warm+prefill)",
+                                o.ttfa
                             );
                         }
-                        *emitted += pcm.len();
-                        tx_pcm.send(pcm).is_ok()
+                        o.emitted += pcm.len();
+                        if o.pcm.send(pcm).is_err() {
+                            o.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                            let finished = out.take().expect("utterance in progress");
+                            // Keep the counts for the ack; the channel is gone.
+                            *out = Some(Out {
+                                pcm: mpsc::channel().0,
+                                ..finished
+                            });
+                        }
                     };
 
-                    // A failed PCM send ends this loop and drops `rx_c`; the
-                    // generation sink then sees its frame send fail and stops.
                     while let Ok(msg) = rx_c.recv() {
                         match msg {
+                            CodecMsg::Begin { pcm, cancelled, called } => {
+                                out = Some(Out {
+                                    pcm,
+                                    cancelled,
+                                    called,
+                                    emitted: 0,
+                                    ttfa: 0.0,
+                                });
+                            }
                             CodecMsg::Frame(f) => {
                                 history.push(f);
                                 if history.len() - decoded_upto >= hop {
                                     let (from, to) = (decoded_upto, history.len());
-                                    if !flush(&history, from, to, &mut emitted, &mut ttfa) {
-                                        break;
-                                    }
+                                    flush(&history, from, to, &mut out);
                                     decoded_upto = to;
                                 }
                             }
                             CodecMsg::PassEnd { gap } => {
                                 if history.len() > decoded_upto {
                                     let (from, to) = (decoded_upto, history.len());
-                                    if !flush(&history, from, to, &mut emitted, &mut ttfa) {
-                                        break;
-                                    }
+                                    flush(&history, from, to, &mut out);
                                 }
                                 history.truncate(ref_len);
                                 decoded_upto = ref_len;
                                 if gap {
-                                    let silence = vec![0.0f32; SAMPLE_RATE as usize / 6]; // ~167 ms
-                                    emitted += silence.len();
-                                    if tx_pcm.send(silence).is_err() {
-                                        break;
+                                    if let Some(o) = out.as_mut() {
+                                        let silence = vec![0.0f32; SAMPLE_RATE as usize / 6]; // ~167 ms
+                                        o.emitted += silence.len();
+                                        let _ = o.pcm.send(silence);
                                     }
+                                }
+                            }
+                            CodecMsg::End => {
+                                if history.len() > decoded_upto {
+                                    let (from, to) = (decoded_upto, history.len());
+                                    flush(&history, from, to, &mut out);
+                                }
+                                history.truncate(ref_len);
+                                decoded_upto = ref_len;
+                                let (emitted, ttfa) = out
+                                    .take()
+                                    .map(|o| (o.emitted, o.ttfa))
+                                    .unwrap_or((0, 0.0));
+                                // Dropping `out` closed the utterance's PCM
+                                // channel: its iterator ends here.
+                                if tx_ack.send((emitted, ttfa)).is_err() {
+                                    break;
                                 }
                             }
                         }
@@ -683,9 +815,17 @@ fn synthesize_stream_impl<B: Backend + 'static>(
                             f
                         );
                     }
-                    (emitted, ttfa)
                 },
-            )?;
+            ) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    let message = format!("spawn the codec thread: {error}");
+                    while let Ok(req) = rx_req.recv() {
+                        let _ = req.done.send(Err(anyhow::anyhow!("{message}")));
+                    }
+                    return;
+                }
+            };
 
             // ── generation: sentence-packed passes, one shared reference ──
             // max_frames overridable via env for empirical sweeps (mirrors MARY_NFE).
@@ -710,70 +850,105 @@ fn synthesize_stream_impl<B: Backend + 'static>(
                 Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),
                 None => rand::rngs::StdRng::from_entropy(),
             };
-            let chunks = crate::say::chunk_text(&gen_text, MAX_CHARS);
-            eprintln!("{} pass(es), ref {} frames", chunks.len(), prompt.ref_code.len());
-            let t_synth = Instant::now();
-            let mut total_frames = 0usize;
-            for (i, chunk) in chunks.iter().enumerate() {
-                let text_ids = tok.encode(&format!(
-                    "<|im_start|>assistant\n{chunk}<|im_end|>\n<|im_start|>assistant\n"
-                ));
-                let tb = Instant::now();
-                let (prefill, trailing, tts_pad) = pipeline::build_prefill(
-                    &talker,
-                    &predictor,
-                    &prompt,
-                    &text_ids,
-                    Some(LANG_ENGLISH),
-                    &dev,
-                );
-                if std::env::var("QWEN3TTS_BENCH").is_ok() {
-                    eprintln!("bench: build_prefill {:.0}ms", tb.elapsed().as_secs_f32() * 1e3);
-                }
-                let frames = pipeline::generate_streaming(
-                    &talker,
-                    &predictor,
-                    prefill,
-                    trailing,
-                    tts_pad,
-                    &params,
-                    &mut rng,
-                    &dev,
-                    |f| tx_c.send(CodecMsg::Frame(*f)).is_ok(),
-                );
-                total_frames += frames.len();
-                if tx_c.send(CodecMsg::PassEnd { gap: i + 1 < chunks.len() }).is_err() {
+
+            // One utterance at a time, in order, until the session is dropped.
+            while let Ok(req) = rx_req.recv() {
+                let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                if tx_c
+                    .send(CodecMsg::Begin {
+                        pcm: req.pcm,
+                        cancelled: cancelled.clone(),
+                        called: req.called,
+                    })
+                    .is_err()
+                {
+                    let _ = req.done.send(Err(anyhow::anyhow!("the speak codec thread has exited")));
                     break;
                 }
+                let chunks = crate::say::chunk_text(&req.text, MAX_CHARS);
+                eprintln!("{} pass(es), ref {} frames", chunks.len(), prompt.ref_code.len());
+                let t_synth = Instant::now();
+                let mut total_frames = 0usize;
+                let mut codec_gone = false;
+                for (i, chunk) in chunks.iter().enumerate() {
+                    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let text_ids = tok.encode(&format!(
+                        "<|im_start|>assistant\n{chunk}<|im_end|>\n<|im_start|>assistant\n"
+                    ));
+                    let tb = Instant::now();
+                    let (prefill, trailing, tts_pad) = pipeline::build_prefill(
+                        &talker,
+                        &predictor,
+                        &prompt,
+                        &text_ids,
+                        Some(LANG_ENGLISH),
+                        &dev,
+                    );
+                    if std::env::var("QWEN3TTS_BENCH").is_ok() {
+                        eprintln!("bench: build_prefill {:.0}ms", tb.elapsed().as_secs_f32() * 1e3);
+                    }
+                    let frames = pipeline::generate_streaming(
+                        &talker,
+                        &predictor,
+                        prefill,
+                        trailing,
+                        tts_pad,
+                        &params,
+                        &mut rng,
+                        &dev,
+                        |f| {
+                            !cancelled.load(std::sync::atomic::Ordering::Relaxed)
+                                && tx_c.send(CodecMsg::Frame(*f)).is_ok()
+                        },
+                    );
+                    total_frames += frames.len();
+                    if tx_c.send(CodecMsg::PassEnd { gap: i + 1 < chunks.len() }).is_err() {
+                        codec_gone = true;
+                        break;
+                    }
+                    eprintln!(
+                        "  pass {}/{}: {} chars → {} frames",
+                        i + 1,
+                        chunks.len(),
+                        chunk.len(),
+                        frames.len()
+                    );
+                }
+                if codec_gone || tx_c.send(CodecMsg::End).is_err() {
+                    let _ = req.done.send(Err(anyhow::anyhow!("the speak codec thread has exited")));
+                    break;
+                }
+                let Ok((emitted, ttfa)) = rx_ack.recv() else {
+                    let _ = req.done.send(Err(anyhow::anyhow!("the speak codec thread has exited")));
+                    break;
+                };
+                let synth_s = t_synth.elapsed().as_secs_f32();
+                let audio_s = emitted as f32 / SAMPLE_RATE as f32;
                 eprintln!(
-                    "  pass {}/{}: {} chars → {} frames",
-                    i + 1,
-                    chunks.len(),
-                    chunk.len(),
-                    frames.len()
+                    "[timing] synth: {:.2}s for {:.2}s audio ({:.2}x realtime, {} frames, TTFA {:.2}s{})",
+                    synth_s,
+                    audio_s,
+                    synth_s / audio_s.max(1e-6),
+                    total_frames,
+                    ttfa,
+                    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                        ", cancelled by the consumer"
+                    } else {
+                        ""
+                    }
                 );
+                let _ = req.done.send(Ok(()));
             }
             drop(tx_c);
-            let (emitted, ttfa) =
-                codec_thread.join().map_err(|_| anyhow::anyhow!("codec thread panicked"))?;
+            if codec_thread.join().is_err() {
+                eprintln!("speak: codec thread panicked");
+            }
+        })
+        .map_err(|error| anyhow::anyhow!("spawn the speak generation thread: {error}"))?;
 
-            let synth_s = t_synth.elapsed().as_secs_f32();
-            let audio_s = emitted as f32 / SAMPLE_RATE as f32;
-            eprintln!(
-                "[timing] synth: {:.2}s for {:.2}s audio ({:.2}x realtime, {} frames, TTFA {:.2}s)",
-                synth_s,
-                audio_s,
-                synth_s / audio_s.max(1e-6),
-                total_frames,
-                ttfa
-            );
-            Ok(())
-        })?;
-
-    Ok(SpeakStream {
-        rx: rx_pcm,
-        r#gen: Some(r#gen),
-    })
+    Ok(Synthesizer { tx: tx_req })
 }
 
 /// Convenience: [`synthesize`] then write the result to `out_path` as a 24 kHz
